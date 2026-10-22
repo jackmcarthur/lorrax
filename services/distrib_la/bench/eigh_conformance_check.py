@@ -4,7 +4,7 @@ Sizes n = p * m for m = n/p in {257, 389, 1144, 4576}: block sizes 1, 1, 143
 and 208, so cuSOLVERMp's block-cyclic relabel runs at every size. Families,
 built on the devices from fixed seeds:
   zero-row   [[I, M], [M^H, I]] on 3/4 of the rows, the rest exactly zero,
-             ||M||_2 ~ 0.95 (the shared-pole joint CT metric's structure)
+             ||M||_2 ~ 0.95 (the tangential joint CT metric's structure)
   small-zero-row  the same times 1e-6 (1/c-scaled transverse metrics)
   gram       B^H B with B (n/2 x n) Gaussian: half the spectrum at rounding level
   sentinel   zero-row with its zero rows replaced by the 1/n-spaced sentinels

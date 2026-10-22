@@ -1,8 +1,8 @@
-"""Ritz reduction of the shared-pole pencils.
+"""Ritz reduction of the tangential pencils.
 
 Equilibration, the normalized-Gram keep cut, the coupled Newton-Schulz metric
 correction and the Hermitian Ritz step for the even route (W 20 of
-docs/theory/shared-pole-w-model.md), and the paired basis, its second cut and
+docs/theory/tangential-w-model.md), and the paired basis, its second cut and
 the signed model for the ordered route (W 27).
 """
 
@@ -13,7 +13,7 @@ import jax.numpy as jnp
 from functools import partial
 
 from distrib_la import diagonal_like, face_sharding, hermitian_part, on_face
-from gw.shared_pole_pencil import (_matrix_layout, join_vectors, on_tiles, split_vectors, tile_adjoint,
+from gw.tangential_pencil import (_matrix_layout, join_vectors, on_tiles, split_vectors, tile_adjoint,
                                    tile_block, tile_count, tile_hermitian, tile_join, tile_split)
 
 
@@ -32,7 +32,7 @@ def _metric_inverse_root(metric, *, matmul, tolerance, matrix_sharding=None):
     radius = jnp.max(jnp.sum(jnp.abs(identity - metric), axis=-1), axis=-1)
     valid = jnp.isfinite(radius) & (radius < 1)
     if not isinstance(radius, jax.core.Tracer) and not bool(jnp.all(valid)):
-        raise ValueError(f"GATE shared_pole_metric_inverse_root: got: infinity norm {radius.tolist()}; want: finite norm < 1; why: Newton-Schulz convergence bound")
+        raise ValueError(f"GATE tangential_metric_inverse_root: got: infinity norm {radius.tolist()}; want: finite norm < 1; why: Newton-Schulz convergence bound")
     # Aim near float64 roundoff, leaving the physical residual gate intact.
     target = min(float(tolerance), 32 * jnp.finfo(metric.real.dtype).eps)
     safe_radius = jnp.where(valid & (radius > target), radius, .5)
@@ -142,7 +142,7 @@ def _within_budget(gamma, budget):
     side = gamma.shape[-1]
     if budget is None or int(budget) >= side:
         return True
-    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
+    from gw.tangential_recipe import shared_real_pole_v1_r3b
     edge = side - int(budget)
     lo, hi = gamma[:, edge - 1:-1], gamma[:, edge:]
     tied = jnp.abs(hi - lo) <= jnp.maximum(
@@ -174,7 +174,7 @@ def _validity_floor(scale, rounding, output_norm, largest, *, gates):
     return jnp.maximum(fixed, factor * bound + scale.shape[-1] * _UNIT_ROUNDOFF * jnp.maximum(largest, 0))
 
 
-def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None,
+def reduce_tangential_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None,
                               rounding=None):
     """Equilibrate the Gram matrix and compute its corrected Ritz model.
 
@@ -289,7 +289,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, ke
     return (b, poles, active), diagnostics, scale[:, :, None] * coefficients
 
 
-ORIENTATION_PAIR_REFUSAL = ("GATE shared_pole_orientation_pair: got: finite columns not in mirrored halves; want: [X(z); X(-z)] on one direction set and paired k0/k1 columns; why: the ordered cut acts in the paired basis")
+ORIENTATION_PAIR_REFUSAL = ("GATE tangential_orientation_pair: got: finite columns not in mirrored halves; want: [X(z); X(-z)] on one direction set and paired k0/k1 columns; why: the ordered cut acts in the paired basis")
 
 
 def _paired_member(a, row_inverse, column_inverse, *, half, finite, n_inf):
@@ -367,11 +367,11 @@ def _restricted_block(ww, wv, vv, matrix_sharding=None):
                           matrix_sharding)
 
 
-def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None,
+def reduce_ordered_tangential_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None,
                                      retain_span=False, matrix_sharding=None, gram_keep=None, carrier=None):
     """Paired-basis Ritz reduction of the particle-hole pencil.
 
-    ``pencil=(G,H,O,z)`` from ``assemble_ordered_shared_pole_pencil`` over paired
+    ``pencil=(G,H,O,z)`` from ``assemble_ordered_tangential_pencil`` over paired
     states: finite columns [X(z_b) ; X(-z_b)] on the same directions, then the
     infinity columns [k0 ; k1]. The congruence w_b = (X(z_b)+X(-z_b))/2,
     v_b = (X(z_b)-X(-z_b))/(2 z_b), w_inf = k1, v_inf = k0 gives H' and G'. On
@@ -423,9 +423,9 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
 
 
 # The four GEMM stages of the paired reduction, with the three eighs between them.
-# ``reduce_ordered_shared_pole_pencil`` composes them inside one program (the local
+# ``reduce_ordered_tangential_pencil`` composes them inside one program (the local
 # round, the face round); the staged face route runs each stage over a batch of
-# parents and each eigh over the round's stack (``shared_pole_execution``).
+# parents and each eigh over the round's stack (``tangential_execution``).
 # A stage takes and returns a dict of arrays; no array crosses a stage boundary
 # that the next stage does not read.
 
@@ -435,7 +435,7 @@ def paired_members(pencil, active_columns, *, gates, matrix_sharding=None):
     side, finite = int(g.shape[-1]), int(points.shape[-1])
     half, n_inf = finite // 2, (side - finite) // 2
     if finite % 2 or (side - finite) % 2:
-        raise ValueError(f"GATE shared_pole_orientation_pair: got: {finite} finite and {side - finite} infinity columns; want: even counts; why: the ordered cut acts in the paired basis")
+        raise ValueError(f"GATE tangential_orientation_pair: got: {finite} finite and {side - finite} infinity columns; want: even counts; why: the ordered cut acts in the paired basis")
     p = tile_count(matrix_sharding)
     paired, nodes, live_f, live_inf = _pairing(points, active_columns, p)
     # Traced (a round program): the caller refuses on diagnostics["orientation_paired"].
@@ -478,7 +478,7 @@ def keep_stage(stage, gamma, u, *, matmul, gates, keep_budget=None, retain_span=
     # Budget-excluded columns are exactly zero; omit them from the dense work
     # below. A rank-local pencil keeps ``carrier`` columns (default
     # ``keep_budget``); a face pencil keeps them only when its caller gives a
-    # carrier that tiles the mesh (``shared_pole_execution.face_ritz_carrier``).
+    # carrier that tiles the mesh (``tangential_execution.face_ritz_carrier``).
     width = gamma.shape[-1]
     if keep_budget is not None and (matrix_sharding is None or carrier is not None):
         width = min(width, max(1, int(keep_budget if carrier is None else carrier)))

@@ -166,7 +166,7 @@ From here:
 
 - **Production QSGW.** Change the deck to the keys of
   [production QSGW](how-to/production-qsgw.md) (`compute_mode = mpa`,
-  `sigma_w_model = shared_pole`, `qp_solver = self_consistent`) and rerun
+  `sigma_w_model = tangential`, `qp_solver = self_consistent`) and rerun
   step 4. A metal also needs [the metal keys](how-to/metals.md).
 - **Bands.** `$RUN bandstructure.htransform -i ht.in --qp-rotations
   qp_wfn_rotations.h5` interpolates the QP bands along the deck's

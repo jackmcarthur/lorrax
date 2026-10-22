@@ -11,8 +11,8 @@ for every key named here.
 
 Other pages own the neighbouring material: the Σ(ω) quadrature rules
 ([the Σ(ω) quadrature problem](theory/sigma-quadrature-problem.md)), the
-shared-pole W ([theory](theory/shared-pole-w-model.md),
-[implementation](architecture/shared_pole_model.md)), the metallic head
+tangential W ([theory](theory/tangential-w-model.md),
+[implementation](architecture/tangential_model.md)), the metallic head
 ([the metallic q → 0 head](theory/metal-q0-head.md)) and the Hartree rebuild
 ([direct Hartree field](theory/hartree.md)).
 
@@ -36,7 +36,7 @@ shared-pole W ([theory](theory/shared-pole-w-model.md),
   [the Σ(ω) quadrature problem](theory/sigma-quadrature-problem.md)).
 - GN-PPM and HL-PPM are the Godby–Needs and Hybertsen–Louie plasmon-pole
   models of W; MPA is the multipole route (`compute_mode = mpa`), whose
-  production W is the shared-pole model.
+  production W is the tangential model.
 - A bispinor (four-current) deck screens the charge and the Dirac current
   together; its W has charge–charge (CC), charge–current (CT/TC) and
   current–current (TT) **sectors** ([bispinor GW](theory/bispinor-gw.md)).
@@ -190,7 +190,7 @@ are counted. It is built once from the DFT ladder
   can only lower the floor). The rule is on energy, so a coarse state inside
   the near grid's lower pad reads the near grid.
 
-Only the MPA and shared-pole Σ, scalar or four-current sector, read coarse
+Only the MPA and tangential Σ, scalar or four-current sector, read coarse
 windows (`qp_support.semicore_patch_route`); a PPM or static Σ has no coarse
 class.
 
@@ -245,7 +245,7 @@ bias grows linearly in $\eta_{\rm semi}$. An isolated level is biased only at
 second order, through the curvature of $\mathrm{Re}\,\Sigma_{ss}$.
 
 The measured biases on AgI 6³ (FR PBE, `number_bands_protected = 64`,
-shared-pole W, P4; claim 4088) are below: Re $\Sigma_c(E^{\rm DFT}_s)$ minus a
+tangential W, P4; claim 4088) are below: Re $\Sigma_c(E^{\rm DFT}_s)$ minus a
 reference, in eV, as the mean over the 16 irreducible k. The reference is the
 near grid stretched to −95 eV, so every state is read at the deck η = 0.25 eV.
 It is converged: ε = 10⁻⁴, 10⁻⁵ and 10⁻⁶ agree to 0.15 meV, and η = 0.125 eV
@@ -371,11 +371,11 @@ and the artifact are owned by [the velocity operator](theory/qp-velocity.md).
 | `parallel_transport` | $U^\dagger (v^{\rm DFT} + D_k\Delta H) U$, with $D_k$ from finite links | `parallel_transport.h5` with links |
 | `interband_commutator` | $U^\dagger (v^{\rm DFT} + [\Delta H, \mathcal W]) U$, no links; insulators only | the velocity stage of `parallel_transport.h5`, stamped `vnl_included = 1` |
 
-**Default.** An unnamed `sc_head_update` on a shared-pole SC deck (scalar, or
-`bispinor_gw = full_shared_pole`) with the head on takes the best velocity
+**Default.** An unnamed `sc_head_update` on a tangential SC deck (scalar, or
+`bispinor_gw = full_tangential`) with the head on takes the best velocity
 the run directory supports: `parallel_transport` when `parallel_transport_file`
 exists (the dipole step writes it by default), else `dft_velocity` from
-`dipole.h5`, else `off`. A `full_shared_pole` deck with neither file takes
+`dipole.h5`, else `off`. A `full_tangential` deck with neither file takes
 `dft_velocity`: its four-current bank reads `dipole.h5` on every head route
 and refuses without it, so `off` would gain nothing. Other decks default to `off`. The choice is made once, at
 parse time, and holds for the whole run, because a velocity treatment that
@@ -420,7 +420,7 @@ $U^\dagger v\,U$, with the QP energies of the same states, to
 `dipole_qsgw.h5` beside the deck (`qsgw_head.write_qsgw_dipole`, the
 `dipole.h5` layout, `basis = "qp"`). $v$ is the head's own velocity from
 `qsgw_head.qp_velocity`, and the file's `velocity` attribute names its Σ term.
-Its states are the ones the final `WFN_qp.h5` holds. (A `full_shared_pole`
+Its states are the ones the final `WFN_qp.h5` holds. (A `full_tangential`
 deck on `dft_velocity` writes none: its four-current bank reads `dipole.h5`
 itself, §7.) The absorption consumers
 read it through `load_dipole_h5` and form $d_{cv} = v_{cv}/(E_c - E_v)$.
@@ -455,7 +455,7 @@ once and holds it (`gw/qp_support.py`).
 (`qp_support.requested_states`): the QP-matrix states, minus frozen-core and
 semicore states, that the W model treats as active
 ($\max_k E^{\rm DFT}_{nk} \ge E_F - 15$ eV,
-`shared_pole_recipe.active_band_mask`, evaluated once on the DFT ladder) and
+`tangential_recipe.active_band_mask`, evaluated once on the DFT ladder) and
 that had a quasiparticle at the previous map, $Z \in (0, 1]$. The one-shot's
 set keeps its active semicore states (§2). A state with
 $Z \notin (0, 1]$ sits within about η of a pole cluster of its $\Sigma_{nn}$
@@ -524,11 +524,11 @@ a time on an escape, with one `SC fixed quadrature recompute:` line per
 rebuilt window. The padding and the escape rules are owned by
 [Σ quadrature §9](theory/sigma-quadrature-problem.md#9-self-consistent-maps).
 
-**Held W shapes.** From map 1 the shared-pole model keeps one pole-column
-extent per sector (`file_io.shared_pole_store._k_extent`: map 1's largest
+**Held W shapes.** From map 1 the tangential model keeps one pole-column
+extent per sector (`file_io.tangential_store._k_extent`: map 1's largest
 pole count plus 3 %, grown with the same headroom only when a live count
 exceeds it), and the four-current CT round keeps each of CC and TT at its
-largest retained-span width (`shared_pole_sectors.cross_span_widths`, never
+largest retained-span width (`tangential_sectors.cross_span_widths`, never
 shrunk; the extra columns are exact zeros). Each growth is logged. A drifting
 pole count or rank therefore does not change a compiled shape.
 
@@ -670,25 +670,25 @@ good pole set, and $\Sigma_c(\omega)$ jumps by 10–20 meV somewhere on the real
 axis. No damping schedule converges this jump; resolution makes it harmless.
 On Si at 24 bands and 192 centroids the map gain is 14–18 and the loop
 plateaus; at 80 bands and 504 centroids it is 0.3 and the loop contracts. The
-shared-pole W has no such refit (§6).
+tangential W has no such refit (§6).
 
-## 6 Shared-pole W across maps {#shared-pole-w-with-retained-quadrature}
+## 6 Tangential W across maps {#tangential-w-with-retained-quadrature}
 
-With `sigma_w_model = shared_pole` every map rebuilds the whole model from its
+With `sigma_w_model = tangential` every map rebuilds the whole model from its
 rotated wavefunctions, energies and occupations: response samples, moments,
-directions, poles and factors (`shared_pole_screening.screen_shared_poles`).
+directions, poles and factors (`tangential_screening.screen_tangential_poles`).
 An SC map's model belongs to that map; `restart = true` restores only the
 invariant ISDF basis and V(q) and never skips a map's response or W. The
 model is fitted to samples of $W_c$ at fixed **supports**: line sites
 $z = \omega + ih$ on a damped line at height $h$ up to a top line endpoint,
 and an imaginary ladder $z = iu$ on $[u_{\min}, u_{\max}]$
-([shared-pole theory §5.1](theory/shared-pole-w-model.md#51-supports-and-directions)).
+([tangential theory §5.1](theory/tangential-w-model.md#51-supports-and-directions)).
 What persists across maps is this sampling geometry and the quadrature
 rules, held so that each map is the same function of its input:
 
 - **Σ rules**: held as in §4. For a four-current sector model the certificate
   also covers the pole treatment ceiling, twice the χ transition span
-  (`shared_pole_recipe._sector_treatment_ceiling`). The ceiling is held while
+  (`tangential_recipe._sector_treatment_ceiling`). The ceiling is held while
   the current span stays inside it and re-planned at twice the current span
   otherwise.
 - **Response rules** (`response_bank.response_quadrature`): the shared
@@ -702,7 +702,7 @@ rules, held so that each map is the same function of its input:
   and supports stay within the held plan. Otherwise they are rebuilt,
   with one line `Response rule rebuilt at a held map; failed reuse test: …`
   naming each failed field.
-- **Support enclosure** (`shared_pole_recipe._support_envelope`). Map 0 uses
+- **Support enclosure** (`tangential_recipe._support_envelope`). Map 0 uses
   its own supports. From map 1 the loop keeps the running maximum of the
   imaginary-ladder top $L=\omega_p+3.5$ eV and of $u_{\max}$ and the running
   minimum of $u_{\min}$, so
@@ -713,7 +713,7 @@ rules, held so that each map is the same function of its input:
   $\Sigma$ support, at $E_{\rm in}\pm2$ eV), are held while the support rule
   would place every site within
   max(3 meV, 0.1 × the previous map's max|dE|) of the held one
-  (`shared_pole_recipe.LINE_SITE_HOLD_EV`), and re-placed from the current
+  (`tangential_recipe.LINE_SITE_HOLD_EV`), and re-placed from the current
   bands otherwise (`SC W line sites re-planned`). Sites frozen for the whole
   run move the end point (Fe 4³ bispinor from DFT: 99 meV in the
   $E_F \pm 10$ eV states), and a hold far below the iterate's own error
@@ -722,9 +722,9 @@ rules, held so that each map is the same function of its input:
   re-plans in 15 maps, stalled).
 
 `head_correction = full` folds the head wings through each map's own W
-(`shared_pole_head.build_shared_pole_head`); `sc_head_update = off` keeps the
+(`tangential_head.build_tangential_head`); `sc_head_update = off` keeps the
 DFT direct response. The ordered-store and four-component head refusals are
-in [shared-pole model §8](architecture/shared_pole_model.md).
+in [tangential model §8](architecture/tangential_model.md).
 
 **Symmetry of the model.** The model is
 $W_c(q, s) = \Pi_{G_q}\big[\sum_j b_j b_j^\dagger/(s - \Lambda_j)\big]$, where
@@ -740,7 +740,7 @@ a symmetry axis.
 
 ## 7 Metals {#7-metals}
 
-- Use `compute_mode = mpa` with `sigma_w_model = shared_pole`. GN-PPM refuses
+- Use `compute_mode = mpa` with `sigma_w_model = tangential`. GN-PPM refuses
   metals (`GATE gn_ppm_refuses_metals`): its Σ splits bands by a 0/1 step at
   a derived Fermi level.
 - Occupations are Fermi–Dirac only (`GATE metal_occupations_fermi_dirac`), and
@@ -775,8 +775,8 @@ from `qsgw_head.qp_velocity` (§3); the one-shot and the fixed DFT head
 | `sc_head_update` on a metal | head on each map | admitted on |
 |---|---|---|
 | `off` | the fixed DFT response on the DFT fixed-N Fermi–Dirac state, with its Drude term and Thomas–Fermi slot (`sc_iteration._fixed_dft_head_occupation_state`) | every metal deck |
-| `dft_velocity` | the `dipole.h5` velocity rotated into each map's QP basis, the current μ and tetrahedron weights; the dynamic Drude tensor at $\omega \ne 0$, Thomas–Fermi at $\omega = 0$; `full` folds it through intraband wings and the static Γ body | shared-pole decks with `head_correction = full` (scalar, `bare_transverse`, `full_shared_pole`) |
-| `parallel_transport` | the same head on $U^\dagger(v^{\rm DFT} + D_k\Delta H)U$, so the Drude term sees the QP Fermi velocity | shared-pole scalar decks and `full_shared_pole`, `head_correction = full` |
+| `dft_velocity` | the `dipole.h5` velocity rotated into each map's QP basis, the current μ and tetrahedron weights; the dynamic Drude tensor at $\omega \ne 0$, Thomas–Fermi at $\omega = 0$; `full` folds it through intraband wings and the static Γ body | tangential decks with `head_correction = full` (scalar, `bare_transverse`, `full_tangential`) |
+| `parallel_transport` | the same head on $U^\dagger(v^{\rm DFT} + D_k\Delta H)U$, so the Drude term sees the QP Fermi velocity | tangential scalar decks and `full_tangential`, `head_correction = full` |
 | `interband_commutator` | refused (`GATE sc_head_interband_commutator_insulator_only`) | — |
 
 Any other metal combination refuses (`GATE metal_sc_head_update_disabled`,
@@ -787,7 +787,7 @@ time-reversal-even one ([metal head §5](theory/metal-q0-head.md#5-limits-of-the
 `occ_broadening > 0` next to a metal width refuses
 (`GATE metal_sc_head_update_disabled`).
 
-On `bispinor_gw = full_shared_pole` the four-current bank builds its own
+On `bispinor_gw = full_tangential` the four-current bank builds its own
 direct Γ head (`response_bank.compute_photon_bank`) from the same velocity:
 on `parallel_transport` it takes this map's `qp_velocity` through
 `photon_head_state`; on `dft_velocity` it rotates the authenticated
@@ -813,7 +813,7 @@ state that fixes the next map:
   diagnostic histories of the eqp comments;
 - the held plan of §4 and §6 without its rules: the ω grid, its envelope and
   coarse windows, each Σ window's certificate boxes and the box its rule was
-  built on, the shared-pole supports and line sites, and the K, CT-span and
+  built on, the tangential supports and line sites, and the K, CT-span and
   constructor carrier extents. No quadrature rule is stored: a continuing
   process rebuilds each held Σ rule cold on its box (the builder is
   deterministic) and plans the χ response rule cold.
@@ -845,7 +845,7 @@ stamp (`sc_iteration._sc_checkpoint_identity`). The
 continuation is implicit; to start a new trajectory from the same seed, remove
 the file. The run logs `SC resume: continuing the Anderson trajectory at map
 n`, keeps the earlier map files, and numbers its maps globally: its first map
-is $n$, writing `eqp0_iter{n}.dat` and `tmp/mpa/sc_{n}_shared_pole`, so a
+is $n$, writing `eqp0_iter{n}.dat` and `tmp/mpa/sc_{n}_tangential`, so a
 continuation never meets a committed store of another map. `sc_max_iter` counts
 maps from the first process; a checkpoint past it refuses
 (`GATE sc_resume_budget`). A checkpoint that does not authenticate is left in
@@ -863,16 +863,16 @@ held one, and eqp0 agrees within 3 µeV per map. A seed without its checkpoint
 moves states by up to 485 meV at the second map, because every process then
 takes an unmixed step on a re-planned map.
 
-A rerun reuses a map's shared-pole scratch only when that scratch
+A rerun reuses a map's tangential scratch only when that scratch
 authenticates for the same map identity (WFN fingerprint, energies,
 occupations, centroids, recipe, map index): a committed scalar `model.h5`, a
 four-current `sectors.json` with every model file it names, or a complete
 response bank, which resumes the constructor. A scalar bank must also bind
 the current bare-V digest; one built at another P, or by older code, is
-rebuilt (`shared_pole_screening._authenticated_constructor_resume`). Any
+rebuilt (`tangential_screening._authenticated_constructor_resume`). Any
 other partial directory is removed and rebuilt, with a WARNING line naming the files
-(`shared_pole_screening.screen_shared_poles`). Only the newest map's scratch
-generation is kept (`shared_pole_screening.retain_iteration_scratch`).
+(`tangential_screening.screen_tangential_poles`). Only the newest map's scratch
+generation is kept (`tangential_screening.retain_iteration_scratch`).
 
 **Seeding a new run.** `sc_initial_qp_rotations_file` imports an
 authenticated eigensystem as $H = U\,\mathrm{diag}(E)\,U^\dagger$ in the

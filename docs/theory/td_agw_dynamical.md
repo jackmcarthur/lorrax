@@ -9,7 +9,7 @@ walls, and the refactors it needs. The static-screening member is implemented
 (`tdagw.dynsig`). The GN-PPM member's two GW stages are callable per refresh
 from arrays (`gw.ppm_sigma.screening_update`, `window_sigma_c`; §9 items 4–5)
 and reproduce a GN-PPM run at t = 0 (§6.1). The collision wiring and earlier
-population-based shared-pole refreshes are described below; the corrected
+population-based tangential refreshes are described below; the corrected
 column-sampled MGKBA split is specified in §1.5. The full-density snapshot
 modules implement general lesser/greater bubbles, a reduced rational Keldysh
 interaction, and a converged material/coherent-self-energy update. The
@@ -201,7 +201,7 @@ kernel limit).
 The runtime dispatches `joint` and `joint_frozen` to the full-density
 `tdagw.snapshot_runtime.snapshot_collision` adapter described in
 [the response/noise contract](#keldysh-screening).
-Both `refreshed` and `shared_pole` refuse with
+Both `refreshed` and `tangential` refuse with
 `GATE dynsig_collision_keldysh_screening`: their population-based retarded
 refits do not supply the required nonequilibrium lesser interaction.
 The refit machinery below is retained for development and its earlier
@@ -244,24 +244,24 @@ coherences, §1.1); the operator at the instantaneous energies, Eq. (8) of §1.5
 (no Hermitian projection; [on-shell Σ](sigma-on-shell.md) for the
 evaluation), rotated back with $U$.
 
-**Shared-pole refit machinery** (`collision_screening = shared_pole`, currently
+**Tangential refit machinery** (`collision_screening = tangential`, currently
 refused by the collision entry). The retained population-based implementation
 and earlier arithmetic-operator results use
 $W^c(q,z)=\sum_j b_j(q)b_j(q)^\dagger/(z^2-\Omega_j^2)$
 with poles shared per $q$ (the even store; the ordered store pairs $q$ with
 $-q$). A refresh is a **full refit**: the GW run's own W stage
-(`gw.shared_pole_screening.screen_shared_poles`: response bank, moments,
+(`gw.tangential_screening.screen_tangential_poles`: response bank, moments,
 constructor) rerun at the instantaneous occupation table — the run's step
 occupations outside the window, diag ρ inside (dress none, §1.1) — after the
-recipe is re-resolved at that state's census (`bind_shared_pole_census` +
-`resolve_shared_pole_recipe`). $\chi_0(f(t))$ is the bank's own: it takes
+recipe is re-resolved at that state's census (`bind_tangential_census` +
+`resolve_tangential_recipe`). $\chi_0(f(t))$ is the bank's own: it takes
 fractional occupations at every complex support natively (the metallic route,
 item 3), same-side pairs exact at $z\neq0$; no support is at $z=0$, so no
 principal value enters. Eq. (6) is not used: the bank's Dyson solve is the
 run's, with $v$. The head is frozen (the refit's `head_correction = off`; the
 window Σ adds the run's head). At $\rho^{\rm eq}$ the refit is bitwise the run's
 model (§6.1). The static limit subtracted from $\Delta\Sigma^{\rm h}$ is the
-equilibrium model's own $W^c(0)$ (`gw.mpa.sigma.shared_pole_static_wc`; it
+equilibrium model's own $W^c(0)$ (`gw.mpa.sigma.tangential_static_wc`; it
 differs from the Dyson $W_0$ of the TD model's $K\delta\rho$ by the model's
 static error, $1.6\times10^{-5}$ max-relative on 516). Two support sets:
 the production ladder re-resolved at every state (V1), or an explicit set
@@ -272,7 +272,7 @@ and 0.5 eV. An imaginary site at 0.1 eV is refused at carrier states by the
 bank's rule construction (the response exponential fit, `tol 1e-8`, fails once
 the occupation interval crosses zero); at $\rho^{\rm eq}$ it is admitted. V2′ itself
 refits at $\rho^{\rm eq}$ and at the 5% hot state but is refused by
-`GATE shared_pole_gram_valid` at q = 0 at the driven 3×10⁹ V/m states (Gram
+`GATE tangential_gram_valid` at q = 0 at the driven 3×10⁹ V/m states (Gram
 min −5.8×10⁻⁷ at 1.5 fs, −7.8×10⁻⁶ at the pulse peak, against the rounding
 floor 10⁻⁷; no PSD repair), so a driven run with V2′ stops at its sixth refresh;
 V1 refits at every state measured.
@@ -419,7 +419,7 @@ derivation of a full nonequilibrium collision operator.
   subtraction above.
 * **GN-PPM.** With real pole energies the rates are sums of broadened
   $\delta$ functions at $e_n\pm\Omega$; on a 30×30 mesh they depend on the
-  regularization width. The shared-pole member gives smoother rates.
+  regularization width. The tangential member gives smoother rates.
 * **Integrator.** $\Gamma$ and the source
   $S=-\tfrac12\{\Gamma,\rho^{\rm eq}\}+D-C_{\rm diss}[\rho^{\rm eq}]$
   are held between refreshes (§7.1), like $\Delta\Sigma^{\rm dyn}$. The
@@ -509,7 +509,7 @@ baselines, not validation of the corrected column-sampled Eq. (8):
   against 1.5 ms for one ΔΣ apply; one chunk program per run, no retrace across
   15–31 refreshes; the chunk program's collectives are unchanged. Physical
   rates at band edges therefore need a smaller regularization width than the
-  Σ quadrature uses, or the shared-pole member.
+  Σ quadrature uses, or the tangential member.
 * **On origin/main (2026-10-18).** Merged onto main 6f7b2ca26 (on-shell-only Σ:
   the accumulator factory carries `keep_branches`). The GW driver on the 07 deck
   is bitwise main's (15/15 `sigma_mnk.h5` datasets); main's driver differs from
@@ -749,11 +749,11 @@ uses their full-density retarded difference with an equilibrium-like
 self-energy reference; `lossless_bath`
 selects the separate [secular transition-bath prescription](#lossless-transition-bath).
 `joint_frozen` uses the identical reduced equilibrium interaction throughout
-the run, providing a matched screening control. The passive GW shared-pole
+the run, providing a matched screening control. The passive GW tangential
 constructor retains its original contracts, owned by
-[shared-pole theory](shared-pole-w-model.md) and its
-[implementation](../architecture/shared_pole_model.md). The earlier
-population-only `refreshed` and `shared_pole` TD modes remain refused.
+[tangential theory](tangential-w-model.md) and its
+[implementation](../architecture/tangential_model.md). The earlier
+population-only `refreshed` and `tangential` TD modes remain refused.
 
 The snapshot stationary closure uses the one-sided transform
 $\bar X(z)=\int_0^\infty d\tau\,e^{iz\tau}X(\tau)$ and its inverse/full
@@ -1567,7 +1567,7 @@ energies come with the point group (partners at $k$ and $Rk$, which a
 linearly polarized drive populates differently) and with the multiplets the
 window closes. **Static ($\omega=0$) screening by non-thermal carriers is not
 a usable production model**: the carrier response must be taken at the
-frequencies it acts at (the GN-PPM or shared-pole member, with the
+frequencies it acts at (the GN-PPM or tangential member, with the
 fractional contour route for $\chi_0^{ss}$), or the carriers thermalized
 first. This is the case for the frequency-dependent push.
 
@@ -1581,8 +1581,8 @@ first. This is the case for the frequency-dependent push.
 | fractional $\chi_0$ | `gw.w_isdf.compute_chi0_contour_fractional` (:3349), `compute_chi0_direct_fractional` (:3657) | as above | $\chi_0^{ss}$ |
 | Dyson | `gw.w_isdf.solve_w` (:2114), `meta=None` route | $(q,\mu_X,\nu_Y)$ | Eq. (6), unchanged (reused by the prototype) |
 | GN-PPM fit | `gw.ppm_sigma.pole_fit_plan` (:956) + `fit_pole_model` (:993) = `fit_ppm` (:808), the driver's call; `minimax_screening.fit_gn_ppm_from_wc_pair` (:309) | $(q,\mu_X,\nu_Y)$ | `screening_update` (:1006): Eq. (6) at both supports, then the fit (§9 item 4) |
-| shared-pole W | `gw.shared_pole_screening.screen_shared_poles` (:443), `shared_pole_constructor.construct_shared_poles` (:57) | bank and model stores on disk | §9 |
-| Σ τ sweep | `gw.ppm_tau_kernel._sigma_subtile_kernel` (:283), `_get_sigma_kij_kernel` (:482); `ppm_pipeline.compute_ppm_sigma_pipeline` (:691); window entry `ppm_sigma.window_sigma_c` (:1611) | parent Greens $\times$ $W(\tau)$, window projection | GN-PPM / shared-pole Σ |
+| tangential W | `gw.tangential_screening.screen_tangential_poles` (:443), `tangential_constructor.construct_tangential_poles` (:57) | bank and model stores on disk | §9 |
+| Σ τ sweep | `gw.ppm_tau_kernel._sigma_subtile_kernel` (:283), `_get_sigma_kij_kernel` (:482); `ppm_pipeline.compute_ppm_sigma_pipeline` (:691); window entry `ppm_sigma.window_sigma_c` (:1611) | parent Greens $\times$ $W(\tau)$, window projection | GN-PPM / tangential Σ |
 | static Σ | `gw.cohsex_sigma._make_cohsex_kernels_face` (:400); `bse.bse_stack_matvec.make_w_term` (:470) | $(b,n_X,m_Y,k)$ | Eq. (7) (prototype: `make_w_term` on the full band set) |
 | static head | `gw.head_correction.static_head_terms_to_kij` (:1826), `fit_head_ppm` (:1508) | band diagonal | frozen in the prototype; §1.4 |
 | frozen-W kernel | `tdagw.model.build_td_agw_apply` | $(b,k,n_X,m_Y)$ | $K\delta\rho$, unchanged |
@@ -1662,7 +1662,7 @@ the full zone:
 | system (bands in the sums) | $N_k$, $N_\mu$ | $\chi_0$ static + probe | Dyson, full $q$ | window Σ | refresh | frozen `apply` |
 |---|---|---|---|---|---|---|
 | 516 6×6, 2v2c (160), GN-PPM (`07` replay, warm) | 36, 978 | 0.92 s (the run's χ0 stage, both supports) | 0.15 s (`screening_update`: both solves + fit) | 3.1 s (`window_sigma_c`) | **~4.2 s** | 2.95 ms |
-| 516 6×6, 2v2c (160), shared-pole (`04`), full refit (measured, below) | 36, 978 | bank 10.0 s + moments 0.7 s | in the bank | 5.1 s + rebase 4.1 s | **34.3 s** (constructor 13.8 s) | 2.95 ms |
+| 516 6×6, 2v2c (160), tangential (`04`), full refit (measured, below) | 36, 978 | bank 10.0 s + moments 0.7 s | in the bank | 5.1 s + rebase 4.1 s | **34.3 s** (constructor 13.8 s) | 2.95 ms |
 | 471 8×8 (898), N_μ 3000 (`14_bseprod_c3000`) | 64, 3000 | 1.1 + 2.4 s | 2 × 0.2 × 6.4 = 2.6 s | 16.6 + 11.7 s | **~34 s** | — |
 | 471 8×8 (898), N_μ 6000 (`15_bseprod_c6000`) | 64, 6000 | 3.7 + 8.7 s | 2 × 0.9 × 6.4 = 11.5 s | 86.4 + 12.4 s | **~123 s** | — |
 | 30×30, 42v × 14c (`34_bseprodb_df3000r8_w88_144`) | via the 8×8 parent | as 8×8 | as 8×8 | window on 30×30 | **8×8 + densify** | 95.4 ms |
@@ -1702,7 +1702,7 @@ energies (48 or 76 τ against 181–207 τ on the GW list); the active part's by
 live branches. δχ0 on the window is the bubble's change only ($\chi_0^{ff}$ is in
 $W_0$): its same-side sum grows with $n_A$ (2v2c 1.85 s, 10v14c 5.16 s).
 
-**Earlier arithmetic-operator baseline, the shared-pole collision term** (branch
+**Earlier arithmetic-operator baseline, the tangential collision term** (branch
 `feat/td-agw-dynsig-spm-2026-10-18`; 516 6×6, 160 bands, $N_\mu$ 978, K = 1761
 poles at every q, 4 × A100, warm; medians over the refreshes of the driven runs):
 
@@ -1716,7 +1716,7 @@ poles at every q, 4 × A100, warm; medians over the refreshes of the driven runs
 |   rebase: $C[\rho^{\rm eq}]$ on $W(t)$ | 4.1 s |
 | refit, V1, 3×10⁹ V/m (hot sweeps, 130 τ) | 35.6 s |
 | refit, V2′ ($\rho^{\rm eq}$; bank 18.7 s with 156 rule nodes, constructor 18.6 s) | 46.9 s |
-| frozen shared-pole W, sweep only | 2.9 s |
+| frozen tangential W, sweep only | 2.9 s |
 
 The refit is 72% of a refresh. Against the GN-PPM refresh (4.3–5.4 s) it is
 7×, against the frozen-W split (1.46 s) 23×. The constructor wall varies
@@ -1742,7 +1742,7 @@ holds the same reduced equilibrium screening. A fixed positive refresh
 interval tracks pure coherences, which may evolve with unchanged band
 populations. Fresh-state number residual and trace drift during the preceding
 held interval are reported separately. `collision_screening = refreshed` and
-`shared_pole` are refused at entry by
+`tangential` are refused at entry by
 `GATE dynsig_collision_keldysh_screening` (§1.4). The $W$-refresh policies,
 costs and trajectories described below are prior arithmetic-operator
 baselines from retained development machinery, not currently runnable
@@ -1780,19 +1780,19 @@ population model's measured tail-induced carriers (§1.5). Rebasing is an
 optional counterterm approximation, not a formal default for a future
 nonequilibrium lesser interaction.
 
-**Prior shared-pole screening baseline** (`collision_screening = shared_pole`,
+**Prior tangential screening baseline** (`collision_screening = tangential`,
 currently refused; §1.4). The retained machinery refits
 the whole W stage at each refresh and used rebased $C[\rho^{\rm eq}]$ on
 $W(t)$ by default (`collision_rebase = auto`). `on` with the admitted frozen
 screening remains refused. Its source is the GW driver on `collision_source`
-(the SPM deck; it may differ from `bundle_input` only for shared_pole). On 516
+(the SPM deck; it may differ from `bundle_input` only for tangential). On 516
 the refreshed run is one program per run (no recompiles over 15–63 refreshes);
 at $\rho^{\rm eq}$ the collision stays zero through the refreshes (max
 deviation $5\times10^{-14}$, held flow $3\times10^{-11}$ meV). Cadence
 ($\max_t|\Delta n_c|/\max n_c$, 8 fs drives, against 0.125 fs with 25 as
 samples): 0.25 fs is within 0.9% at 5×10⁸ and 3×10⁹ V/m, 0.5 fs within 2.4% and
 0.9%; P(t) within 0.35%. The refreshed W moves P(t) by 4.6% against the frozen
-shared-pole W at 3×10⁹ V/m, 0.07% at 5×10⁸ V/m; the held $\Delta\Sigma^{\rm h}$
+tangential W at 3×10⁹ V/m, 0.07% at 5×10⁸ V/m; the held $\Delta\Sigma^{\rm h}$
 jumps by at most 13.8 meV at a refresh (3×10⁹ V/m; GN-PPM refreshed screening:
 77 meV), the pole count stays K = 1761 and no gate refuses (V1).
 
@@ -1866,7 +1866,7 @@ capacity ledger per Σ evaluation. `tests/tdagw/_spm_refresh_516_case.py` (516,
 4 A100): the refit at $\rho^{\rm eq}$ is bitwise the run's model (factor,
 poles, K); $W^c(0)$ of the model against the exact $W^c$ $1.6\times10^{-5}$, and
 $V + W^c(0)$ against the COHSEX bundle's $W_0$ $2.1\times10^{-6}$ max-relative;
-with the shared-pole options off, the GW outputs of the `04` and `07` decks and
+with the tangential options off, the GW outputs of the `04` and `07` decks and
 the GN-PPM collision case are bitwise origin/main's.
 
 ## 9. Refactors for a production member {#refactors}
@@ -1894,8 +1894,8 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
    the occupation supports (`metallic-mpa-screening.md` §2.2).
 4. **Screening entry point.** `gw.screening.compute_screening_model` (:699)
    needs `config`, `meta`, the WFN loader, the head resolver and a run
-   directory; `screen_shared_poles` (:443) writes bank files and
-   `construct_shared_poles` (:57) writes the model store. Change: a
+   directory; `screen_tangential_poles` (:443) writes bank files and
+   `construct_tangential_poles` (:57) writes the model store. Change: a
    `screening_update(W0_at_supports, dchi_at_supports, plan)` returning the
    pole model as arrays; the stores stay the GW driver's. **Done for GN-PPM:**
    `gw.ppm_sigma.screening_update` (:1006) runs Eq. (6) at both supports by
@@ -1904,9 +1904,9 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
    `(PPMBuildResult, (W(0), W(iω_p)))`. The GW driver calls the same
    `pole_fit_plan` + `fit_pole_model` (`ppm_pipeline` :813, :830), so the TD
    update and the run share one fit; the run's outputs are bitwise unchanged
-   (§6.1). **Done for the shared-pole member** (branch
+   (§6.1). **Done for the tangential member** (branch
    `feat/td-agw-dynsig-spm-2026-10-18`): `tdagw.dynsig.spm_refit` reruns the
-   source's W stage (`gw.shared_pole_screening`, the entry seam of
+   source's W stage (`gw.tangential_screening`, the entry seam of
    `gw_window_source`) at the instantaneous occupation table and returns the
    model on the store the window Σ reads; the bank and constructor are the GW
    driver's, the recipe is re-resolved at the state's census.
@@ -1968,15 +1968,15 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
     part's session planned on the same envelope, so that no rule is re-fitted
     when $e(t)$ moves.
 12. **Rebased subtraction and smooth invalid modes for refreshed screening.**
-    The deck key exists (`collision_rebase`, `auto` = on for shared_pole); the
+    The deck key exists (`collision_rebase`, `auto` = on for tangential); the
     default for `refreshed` (GN-PPM) remains off pending its deck-route check. The
     invalid-mode treatment continuous in $\Omega^2$ is still open for GN-PPM; the
-    shared-pole member has no invalid modes (every pole is passive), which is the
+    tangential member has no invalid modes (every pole is passive), which is the
     route measured on 516.
 13. **Pole census.** $\max|\Delta\Omega|$ is set from the first refresh
     (δW/W0 ~ 10⁻⁹ on 516: 25 eV) by modes whose fit is ill-conditioned
     ($W^c(0)\to\mathrm{Re}\,W^c(i\omega_p)$); a residue-weighted measure would
-    report the modes that move Σ. **Done for the shared-pole member**
+    report the modes that move Σ. **Done for the tangential member**
     (`tdagw.dynsig.pole_census`: residue $|b_j|^2/2\Omega_j$ and static
     $|b_j|^2/2\Omega_j^2$ weights below 0.3 and 1 eV, $\Omega_{\min}$, q-resolved
     histograms, one line per refresh).

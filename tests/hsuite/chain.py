@@ -7,11 +7,11 @@ in the order a user runs them:
 
     kmeans -> kin_ion -> dipole -> gwjax GN-PPM one-shot
            -> BSE -> htransform
-           -> exciton bands -> restarted: COHSEX, shared-pole one-shot with
+           -> exciton bands -> restarted: COHSEX, tangential one-shot with
               W and pole exports
-           -> bispinor kin_ion, dipole -> four-current shared-pole QSGW
+           -> bispinor kin_ion, dipole -> four-current tangential QSGW
               (2 maps, fresh zeta; its map 0 is the one-shot)
-           -> bcc Na (run/na): kin_ion, dipole -> metal shared-pole QSGW
+           -> bcc Na (run/na): kin_ion, dipole -> metal tangential QSGW
               (2 maps, the production defaults)
 
 Each stage is then checked against the stored outputs in ``reference/``
@@ -60,7 +60,7 @@ REFERENCE = HERE / "reference"
 # the Sigma tolerance is the 0.5 meV rule-set budget of the old core GN cell.
 ATOL = {
     "h5": 1.0e-8,        # kin_ion / dipole members (relative + absolute)
-    "w_bank": 1.0e-6,    # exported shared-pole W samples (relative)
+    "w_bank": 1.0e-6,    # exported tangential W samples (relative)
     "eqp_ev": 5.0e-4,    # eqp0/eqp1 columns, GN-PPM and shared pole
     "bse_ev": 1.0e-4,    # BSE, exciton-band and htransform eigenvalues:
                          # P1 vs P4 agree to 1 ueV (the fH basis pivots
@@ -218,10 +218,10 @@ RESTART_DECKS = {
     "cohsex.in": _restart_deck("cohsex", """compute_mode = cohsex
 qp_solver = one_shot_dft
 """),
-    # The shared-pole file-model path: one-shot with the W bank, the folded
+    # The tangential file-model path: one-shot with the W bank, the folded
     # head and the pole model exported.
     "sp_export.in": _restart_deck("spx", """compute_mode = mpa
-sigma_w_model = shared_pole
+sigma_w_model = tangential
 mpa_n_poles = 2
 qp_solver = one_shot_dft
 sigma_regularization_ev = 0.25
@@ -232,7 +232,7 @@ write_poles = true
 
 # The four-current route, last in the chain: its fresh bispinor zeta fit
 # rewrites the tmp/ restart the scalar restarted steps read.  SP-full
-# (bispinor_gw = full_shared_pole: ordered CC/CT/TC/TT sector poles, direct
+# (bispinor_gw = full_tangential: ordered CC/CT/TC/TT sector poles, direct
 # four-current Gamma head) through the SC driver for two maps, with its own
 # kinetic-balance kin_ion, the per-map head (dft_velocity), the live
 # four-current density (density_self_consistent, required) and the default
@@ -242,9 +242,9 @@ write_poles = true
 # any point set is a legal ISDF basis for the current rows.
 _BISP_COMMON = """bispinor = true
 centroids_file_current = {centroids}
-bispinor_gw = full_shared_pole
+bispinor_gw = full_tangential
 compute_mode = mpa
-sigma_w_model = shared_pole
+sigma_w_model = tangential
 mpa_n_poles = 2
 sigma_regularization_ev = 0.25
 linalg = local
@@ -306,7 +306,7 @@ wfn_file = WFN.h5
 kin_ion_file = kin_ion.h5
 restart = false
 compute_mode = mpa
-sigma_w_model = shared_pole
+sigma_w_model = tangential
 occ_smearing_width_ry = 0.01
 fermi_reference = mp1_fixed_n
 qp_solver = self_consistent
@@ -325,9 +325,9 @@ sigma_omega_h5_file = na_sigma.h5
 NA_SC_TOL_EV = "1.5"
 
 # Scratch the lead removes before a stage.  The four-current QSGW is a
-# fresh model in a run directory that already holds the scalar shared-pole
+# fresh model in a run directory that already holds the scalar tangential
 # models (checked at sp_export), and a fresh run refuses to overwrite a
-# completed model (GATE shared_pole_output).
+# completed model (GATE tangential_output).
 _CLEAR_BEFORE = {"bisp_sc": ("tmp/mpa",), "bisp_sc3": ("tmp/mpa",)}
 # Stages that run only when --only names them, and have no reference.
 OPT_IN = ("bisp_sc3",)

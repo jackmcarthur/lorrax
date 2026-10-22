@@ -43,7 +43,7 @@ _IDENTITY_KEYS = ("iteration_id", "hamiltonian", "energies", "occupations",
 
 
 def _refuse(message):
-    raise ValueError(f"GATE shared_pole_store: {message}; want: authenticated "
+    raise ValueError(f"GATE tangential_store: {message}; want: authenticated "
                      "current-map canonical scalar model; fix: rebuild the artifact")
 
 
@@ -62,7 +62,7 @@ def charge_representation(meta):
 
 def _capacity(meta):
     """Require the map ledger; unknown caller lifetimes never mean zero."""
-    ledger = getattr(meta, "shared_pole_capacity", None)
+    ledger = getattr(meta, "tangential_capacity", None)
     if ledger is None:
         _refuse("missing map CapacityLedger before tensor I/O")
     ledger.live_stages
@@ -155,8 +155,8 @@ def _admit(ledger, stage, resident, workspace=0, *, host_payload=0,
         _refuse("payload authentication requires the map capacity ledger")
     high_water = int(device_panel)
     if io is not None:
-        high_water = max(high_water,getattr(io,"_shared_pole_host_high_water",0))
-        io._shared_pole_host_high_water = high_water
+        high_water = max(high_water,getattr(io,"_tangential_host_high_water",0))
+        io._tangential_host_high_water = high_water
     host = dict(status="PASS" if host_payload <= device_panel else "FAIL",
                 payload_copy_bytes_per_rank=int(host_payload),
                 device_panel_bytes_per_rank=int(device_panel),
@@ -180,8 +180,8 @@ def _admit(ledger, stage, resident, workspace=0, *, host_payload=0,
     memory.book(replace(ledger.price(row), operands=memory.Term(), increment=True, label=f"store.{stage}"))
     if jax.process_index() == 0:
         _receipt = _json(dict(device=row, host=host))
-        log.debug("[shared_pole_store capacity] " + _receipt,
-                  extra=log_record("file_io.shared_pole_store_capacity", json=_receipt))
+        log.debug("[tangential_store capacity] " + _receipt,
+                  extra=log_record("file_io.tangential_store_capacity", json=_receipt))
     return row
 
 
@@ -259,11 +259,11 @@ def _read_staging_header(path):
             if path.header_json is not None:
                 header = _read_header(path)
         else:
-            header = rank0_read(path, stage="shared_pole.staging_header/read",
+            header = rank0_read(path, stage="tangential.staging_header/read",
                                 read=lambda: _read_header(path) if Path(path).exists() else None)
     except BaseException as exc:
         error = exc
-    agree_io_refusal(error, path=path, stage="shared_pole.staging_header")
+    agree_io_refusal(error, path=path, stage="tangential.staging_header")
     return header
 
 
@@ -486,8 +486,8 @@ def _refuse_invalid(oks):
         _refuse("nonfinite, unsorted/nonpositive active poles or invalid inactive sentinel")
 
 
-@timing.timed("shared_pole_store.write_model")
-def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
+@timing.timed("tangential_store.write_model")
+def write_tangential_model(path, b, poles2, K, *, q_span, meta, tables,
                             recipe, receipts, ordered=False, basis=None, sector=None,
                             device_counts=None):
     """Stage a bounded q batch and finalize automatically at complete K census.
@@ -603,7 +603,7 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         def prepare_group():
             with open_h5_settled(path, "a") as f:
                 f.require_group(name)
-        rank0_transaction(path, stage="shared_pole.stage_group", write=prepare_group)
+        rank0_transaction(path, stage="tangential.stage_group", write=prepare_group)
     with SlabIO(path, mode="a", mesh=mesh) as io:
         if extent:
             with timing.section("write_slab"):
@@ -658,7 +658,7 @@ def _direct_extent(meta, header, live, *, whole):
     """
     if whole:
         return _k_extent(meta, header, live, record=True)
-    held = getattr(meta, "shared_pole_k_capacity", None)
+    held = getattr(meta, "tangential_k_capacity", None)
     extent = 0 if held is None else int(held.get(_held_key(header), 0))
     return extent if 0 < live <= extent else None
 
@@ -711,7 +711,7 @@ def _stage_direct(path, header):
             f.require_group(name)
             f.move("factor", name + "/factor")
             f.move("poles2_ry2", name + "/poles2")
-    rank0_transaction(path, stage="shared_pole.stage_direct", write=move)
+    rank0_transaction(path, stage="tangential.stage_direct", write=move)
     for batch in header["batches"]:
         if batch["name"] is None:
             batch.update(name=name, offset=batch["lo"])
@@ -730,7 +730,7 @@ _K_HEADROOM = 0.03
 def _k_extent(meta, header, live, *, record):
     """The model's pole-column extent: the live Kmax, or the SC run's held one.
 
-    An SC map past map 0 binds ``meta.shared_pole_k_capacity`` (a dict the
+    An SC map past map 0 binds ``meta.tangential_k_capacity`` (a dict the
     quadrature session keeps). Map 1 sets the extent to its live Kmax plus
     :data:`_K_HEADROOM`; later maps keep it while the live Kmax fits and grow
     it (again with headroom) only when it does not, noting the growth in
@@ -740,7 +740,7 @@ def _k_extent(meta, header, live, *, record):
     2). Columns past each parent's K are zero factors and unit poles, as
     before. No binding (a one-shot, map 0): the live Kmax.
     """
-    held = getattr(meta, "shared_pole_k_capacity", None)
+    held = getattr(meta, "tangential_k_capacity", None)
     if held is None:
         return int(live)
     key = _held_key(header)
@@ -752,7 +752,7 @@ def _k_extent(meta, header, live, *, record):
     extent = int(np.ceil(int(live) * (1.0 + _K_HEADROOM)))
     if before:
         held.setdefault("_events", []).append(
-            f"shared-pole K extent ({key}): live Kmax {int(live)} exceeds the held "
+            f"tangential K extent ({key}): live Kmax {int(live)} exceeds the held "
             f"{before}; grown to {extent}")
     held[key] = extent
     return extent
@@ -772,7 +772,7 @@ def _zeros(mesh, spec, shape):
     return jnp.zeros(shape, jnp.complex128, device=NamedSharding(mesh, spec))
 
 
-@timing.timed("shared_pole_store.finalize")
+@timing.timed("tangential_store.finalize")
 def _finalize_model(path, *, meta, header, basis=None, device_counts=None):
     """Write the final datasets and commit the census with the digest.
 
@@ -854,9 +854,9 @@ def _finalize_model(path, *, meta, header, basis=None, device_counts=None):
             f.create_dataset("final_commit", data=np.bytes_(header["digest"]))
             set_commit_state(f, True)
     with timing.section("finalisation"):
-        rank0_transaction(path, stage="shared_pole.finalize", write=finish)
+        rank0_transaction(path, stage="tangential.finalize", write=finish)
         _record_finalized_digest(path, header["digest"])
-        return _read_header_once(path, stage="shared_pole.finalize/header")
+        return _read_header_once(path, stage="tangential.finalize/header")
 
 
 #: Payload digests this process computed while finalizing a model file, keyed
@@ -910,7 +910,7 @@ def _covering_windows(total, span):
             for i, start in enumerate(starts)]
 
 
-@timing.timed("shared_pole_store.digest")
+@timing.timed("tangential_store.digest")
 def _model_digest(path, header, mesh, *, capacity, device_counts=None):
     """Grid-independent SHA256 of metadata and canonical row digests.
 
@@ -940,7 +940,7 @@ def _model_digest(path, header, mesh, *, capacity, device_counts=None):
     # Every panel's device verdict is read once, after the loop (the digest is
     # refused, never returned, if any panel is invalid).
     verdicts, reduced = [], []
-    with open_shared_pole_model(path, mesh_xy=mesh) as io:
+    with open_tangential_model(path, mesh_xy=mesh) as io:
         for q0, q_new in _covering_windows(header["n_q_irr"], batch_limit):
             q1 = q0+batch_limit
             batch = q1-q0
@@ -1003,11 +1003,11 @@ def _model_digest(path, header, mesh, *, capacity, device_counts=None):
 
 
 def _model_metadata(path, expected_identity):
-    """Every metadata check of ``validate_shared_pole_model``; return the header."""
+    """Every metadata check of ``validate_tangential_model``; return the header."""
     header = _read_header(path)
     _check_identity(header["identity"], expected_identity)
     if header["schema"] != SCHEMA or not header["finalized"] or not all(header["written_q"]):
-        _refuse("missing final shared-pole commit or incomplete q census")
+        _refuse("missing final tangential commit or incomplete q census")
     sector = header.get("sector")
     components = header.get("factor_components", 1)
     if sector is not None:
@@ -1017,7 +1017,7 @@ def _model_metadata(path, expected_identity):
             _refuse("invalid sector endpoint metadata")
     elif components != 1:
         _refuse("component factors require an explicit sector identity")
-    qt = shared_pole_qirr_tables(header)
+    qt = tangential_qirr_tables(header)
     validate_qirr_tables(qt, header["n_q_irr"], header["n_mu_logical"])
     if isinstance(path, ResidentSectorModel):
         # One in-process copy: the typed tables have no second record to
@@ -1054,7 +1054,7 @@ def _model_metadata(path, expected_identity):
     return header
 
 
-def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=None):
+def validate_tangential_model(path, *, expected_identity, mesh_xy, capacity=None):
     """Refuse partial, stale, malformed or changed payload; return header.
 
     Validation is collective and bounded to one irreducible parent face. It
@@ -1068,11 +1068,11 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=Non
     try:
         header = (_model_metadata(path, expected_identity)
                   if isinstance(path, ResidentSectorModel) else
-                  rank0_read(path, stage="shared_pole_model/metadata/read",
+                  rank0_read(path, stage="tangential_model/metadata/read",
                              read=lambda: _model_metadata(path, expected_identity)))
     except Exception as exc:
         error = exc
-    agree_io_refusal(error, path=path, stage="shared_pole_model/metadata")
+    agree_io_refusal(error, path=path, stage="tangential_model/metadata")
     if capacity is None:
         # No tensor allocation is permitted without admission. This receipt
         # must not be mistaken for payload authentication by a restart caller.
@@ -1087,7 +1087,7 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=Non
     return header
 
 
-def write_shared_pole_sector_manifest(path, *, models, bank, identity, receipts, mesh_xy):
+def write_tangential_sector_manifest(path, *, models, bank, identity, receipts, mesh_xy):
     """Publish one immutable handle only after all four endpoint stores close.
 
     ``models`` maps CC/TT/CT_C/CT_T to (path, finalized header). The bank
@@ -1110,7 +1110,7 @@ def write_shared_pole_sector_manifest(path, *, models, bank, identity, receipts,
     for key in ('K','Kmax','q_irr_full_idx','ordered'):
         if _json(left.get(key))!=_json(right.get(key)):
             _refuse(f'CT endpoint publication disagrees on {key}')
-    bank_header=validate_shared_pole_bank(bank['path'],expected_identity=identity,
+    bank_header=validate_tangential_bank(bank['path'],expected_identity=identity,
                               mesh_xy=mesh_xy,require_complete=True)
     if isinstance(bank['path'],ResidentBankPayload):
         # The resident payload is released after construction; the Sigma
@@ -1129,12 +1129,12 @@ def write_shared_pole_sector_manifest(path, *, models, bank, identity, receipts,
         if path.exists():
             _refuse('finalized sector manifests are immutable')
         path.write_text(_json(header)+'\n')
-    rank0_transaction(path,stage='shared_pole.sector_manifest',write=publish)
+    rank0_transaction(path,stage='tangential.sector_manifest',write=publish)
     return dict(path=str(path.resolve()),identity=identity,digest=digest,
                 representation=header['representation'],sectors=handles,constant=content['constant'])
 
 
-def validate_shared_pole_sector_manifest(path, *, expected_identity, mesh_xy, capacity=None,
+def validate_tangential_sector_manifest(path, *, expected_identity, mesh_xy, capacity=None,
                                          resident=None):
     """Authenticate the manifest and each bound current-map model resource.
 
@@ -1148,7 +1148,7 @@ def validate_shared_pole_sector_manifest(path, *, expected_identity, mesh_xy, ca
         header=json.loads(Path(path).read_text())
     except Exception as exc:
         error=exc
-    agree_io_refusal(error,path=path,stage='shared_pole.sector_manifest.read')
+    agree_io_refusal(error,path=path,stage='tangential.sector_manifest.read')
     _check_identity(header.get('identity'),expected_identity)
     if (header.get('schema')!=SECTOR_SCHEMA or header.get('representation')!='sector-ordered-ph'
             or header.get('operator_realization')!='raw-sector-endpoint-v1'):
@@ -1165,7 +1165,7 @@ def validate_shared_pole_sector_manifest(path, *, expected_identity, mesh_xy, ca
             if str(resident[sector])!=handle['path']:
                 _refuse(f'resident sector model is not the published {sector}')
             handle['path']=resident[sector]
-        model=validate_shared_pole_model(handle['path'],expected_identity=expected_identity,
+        model=validate_tangential_model(handle['path'],expected_identity=expected_identity,
                                         mesh_xy=mesh_xy,capacity=capacity)
         if (model.get('sector')!=sector or not model.get('ordered')
                 or model['recipe'].get('operator_realization')!='raw-sector-endpoint-v1'
@@ -1181,7 +1181,7 @@ def validate_shared_pole_sector_manifest(path, *, expected_identity, mesh_xy, ca
     return dict(header,model_headers=model_headers)
 
 
-def shared_pole_qirr_tables(header):
+def tangential_qirr_tables(header):
     """Return the existing symmetry-service table in canonical logical order.
 
     Runtime endpoint packing/locality certification stays with mu_basis and
@@ -1192,7 +1192,7 @@ def shared_pole_qirr_tables(header):
         n_sym_spatial=header["qirr"]["n_sym_spatial"]).canonical()
 
 
-def read_shared_pole_census(io, *, header, capacity=None):
+def read_tangential_census(io, *, header, capacity=None):
     """Return replicated float64 poles² [Nq,Kmax] and int64 counts [Nq].
 
     This O(Nq*Kmax) metadata is the window planner's census, not factor data.
@@ -1214,7 +1214,7 @@ def read_shared_pole_census(io, *, header, capacity=None):
     return jnp.where(active, poles, 1.0), counts
 
 
-def read_shared_pole_matrix(io, q_span, *, meta, header):
+def read_tangential_matrix(io, q_span, *, meta, header):
     """Read b[mu_X,K_Y] for bounded matrix evaluation, in packed order.
 
     Returns complex128 [q,mu,Kp], float64 poles² [q,Kp] and int64 K [q].
@@ -1231,7 +1231,7 @@ def read_shared_pole_matrix(io, q_span, *, meta, header):
         _refuse("matrix reader requires a finalized model")
     basis, ledger = _check_basis(meta, header), _capacity(meta)
     # Both guards belong to the reader this one was extracted from
-    # (:func:`read_shared_pole_faces`) and are not optional here: a packed
+    # (:func:`read_tangential_faces`) and are not optional here: a packed
     # basis is bound to the mesh it was packed on, and a dataset validated
     # as empty has no slab to read.
     if io.mesh is not basis.mesh_xy:
@@ -1248,7 +1248,7 @@ def read_shared_pole_matrix(io, q_span, *, meta, header):
         return (_zeros(io.mesh, P(None, "x", "y"), (hi-lo, basis.n_packed, 0)),
                 jnp.ones((hi-lo, 0), jnp.float64),
                 jnp.zeros(hi-lo, jnp.int64))
-    width = padded_axis(header["Kmax"], io.mesh, name="shared_pole_K",
+    width = padded_axis(header["Kmax"], io.mesh, name="tangential_K",
                         specs=((spec, 3),)).carrier
     shape = (hi-lo, basis.n_canonical, 1, width)
     arg, output, temporary = _conversion_bytes(basis, shape, spec, unpack=False)
@@ -1267,7 +1267,7 @@ def read_shared_pole_matrix(io, q_span, *, meta, header):
 
 
 def face_width(mesh, kmax, column_span=None):
-    """The pole-column carrier ``read_shared_pole_faces`` returns for one read.
+    """The pole-column carrier ``read_tangential_faces`` returns for one read.
 
     A whole-K read is the model's Kmax, which an SC run holds fixed
     (``_k_extent``), so every face consumer keyed by this width is compiled
@@ -1275,11 +1275,11 @@ def face_width(mesh, kmax, column_span=None):
     orientations tile it.
     """
     k = int(kmax) if column_span is None else int(column_span[1]) - int(column_span[0])
-    return padded_axis(k, mesh, name="shared_pole_face_K",
+    return padded_axis(k, mesh, name="tangential_face_K",
                        specs=((P(None,"x",None,"y"),3),(P(None,"y",None,"x"),3))).carrier
 
 
-def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None, basis=None,
+def read_tangential_faces(io, q_span, *, meta, header, column_span=None, basis=None,
                            orientations=("x", "y")):
     """Read canonical row faces and pack once at the I/O boundary.
 
@@ -1377,7 +1377,7 @@ def line_panel_span(plan):
 
     At such a line support the constructor reads only the directions Q selected
     from W(z) itself and the actions of W, dW and (ordered) the minus-q partner
-    W_q(-conj z) on Q and on O = W Q (``gw.shared_pole_directions``), so the
+    W_q(-conj z) on Q and on O = W Q (``gw.tangential_directions``), so the
     producer stores those and no dense matrix. A fitted sample on the imaginary
     axis (-conj z = z; its ordered conjugate direction needs O outside span(Q))
     and every held sample stay dense. The recipe lists the fitted line supports
@@ -1462,7 +1462,7 @@ class ResidentBankPayload:
     The bank is produced frequency-major (one Green/FFT stream per sample for
     every parent) and consumed parent-major by the constructor, so the file
     route writes and then re-reads the whole payload once. When that payload
-    fits (``gw.shared_pole_screening._bank_residence``) it stays here: each field is the
+    fits (``gw.tangential_screening._bank_residence``) it stays here: each field is the
     canonical-order array the file would hold, ``[nq, nsample, d_c, d_c]`` or
     ``[nq, d_c, d_c]`` complex128 at ``P(None,[None,],'x','y')`` with exact
     zeros past the logical extent, i.e. ``16 * payload / P`` bytes per rank.
@@ -1513,7 +1513,7 @@ class ResidentBankPayload:
     def __str__(self):
         tier = {"device": "device-resident", "host": "host-resident",
                 "file": "per-rank file"}[self.memory_kind]
-        return f"{tier} shared-pole bank ({self.label})"
+        return f"{tier} tangential bank ({self.label})"
 
     def __enter__(self):
         self._depth += 1
@@ -1793,7 +1793,7 @@ def _resident_slice(mesh, ndim, lead_shape):
 def _model_carrier(mesh, kmax):
     """The resident model's pole-column carrier: Kmax padded to both mesh axes."""
     return padded_axis(max(int(kmax), 1), combined_divisor(mesh.shape["x"], mesh.shape["y"]),
-                       name="shared_pole_model_K").carrier
+                       name="tangential_model_K").carrier
 
 
 def admit_resident_model(ledger, R, stage, upstream):
@@ -1818,13 +1818,13 @@ def admit_resident_model(ledger, R, stage, upstream):
 
 
 class ResidentSectorModel:
-    """One shared-pole model held on the devices instead of a file.
+    """One tangential model held on the devices instead of a file.
 
     The constructor writes the model and Sigma reads it in the same map: the
     four sector models of a photon map
-    (``gw.shared_pole_sectors._sector_model_residence``) and the scalar model
-    of an SC map (``gw.shared_pole_screening._scalar_model_residence``), each
-    when it fits. ``write_shared_pole_model`` stages each batch, finalization
+    (``gw.tangential_sectors._sector_model_residence``) and the scalar model
+    of an SC map (``gw.tangential_screening._scalar_model_residence``), each
+    when it fits. ``write_tangential_model`` stages each batch, finalization
     assembles the file's own datasets (``factor`` [nq, nmu, components,
     Kmax], exact zeros past each K; ``poles2_ry2`` [nq, Kmax], 1 past each K)
     on a mesh-divisible carrier, and every reader (census, faces, matrix,
@@ -1852,7 +1852,7 @@ class ResidentSectorModel:
         self._logical = {}
 
     def __str__(self):
-        return f"device-resident shared-pole model ({self.label})"
+        return f"device-resident tangential model ({self.label})"
 
     def __enter__(self):
         return self
@@ -1947,7 +1947,7 @@ def _model_read(mesh, logical, shape, offset, valid, spec):
     return jax.jit(take, out_shardings=NamedSharding(mesh, P(*spec)))
 
 
-def open_shared_pole_model(path, *, mesh_xy):
+def open_tangential_model(path, *, mesh_xy):
     """Read handle for a finalized model, file or device resident."""
     return path if isinstance(path, ResidentSectorModel) else SlabIO(path, mode="r", mesh=mesh_xy)
 
@@ -1957,7 +1957,7 @@ def _bank_io(path, mode, mesh):
     return path if isinstance(path, ResidentBankPayload) else SlabIO(path, mode=mode, mesh=mesh)
 
 
-def open_shared_pole_bank(path, *, mesh_xy):
+def open_tangential_bank(path, *, mesh_xy):
     """Read handle for an authenticated bank, file or device resident."""
     return _bank_io(path, "r", mesh_xy)
 
@@ -2011,7 +2011,7 @@ def line_panel_geometry(meta, *, ordered, photon_bases=None):
     return {"C": (charge, 3 * current), "T": (3 * current, charge)}, states
 
 
-def shared_pole_bank_payload_bytes(meta, *, recipe, ordered, nq, mesh_xy, line_widths=None,
+def tangential_bank_payload_bytes(meta, *, recipe, ordered, nq, mesh_xy, line_widths=None,
                                    photon_extent=None, photon_bases=None):
     """Per-rank bytes of the complete bank payload, an admission bound.
 
@@ -2088,13 +2088,13 @@ def write_bank_constant(payload, dest, *, header, mesh_xy):
 def read_bank_constant_header(resource, *, mesh_xy):
     """Authenticated bank header of a manifest ``constant`` resource (bank or published file)."""
     if resource.get("kind") != _CONSTANT_KIND:
-        return validate_shared_pole_bank(resource["path"], expected_identity=resource["identity"],
+        return validate_tangential_bank(resource["path"], expected_identity=resource["identity"],
                                          mesh_xy=mesh_xy, require_complete=True)
     def read():
         with open_h5_settled(resource["path"], "r") as f:
             raw = f["constant_json"][()]
         return raw.decode() if isinstance(raw, bytes) else str(raw)
-    header = json.loads(rank0_read(resource["path"], stage="shared_pole.constant_header",
+    header = json.loads(rank0_read(resource["path"], stage="tangential.constant_header",
                                    read=read))
     _check_identity(header["identity"], resource["identity"])
     if header.pop("commit", None) != resource.get("commit"):
@@ -2111,7 +2111,7 @@ def read_bank_constant(resource, header, *, meta, mesh_xy, q_span=None):
     lo, hi = _span(q_span or (0, nq), nq, "constant q_span")
     with SlabIO(resource["path"], mode="r", mesh=mesh_xy) as io:
         if resource.get("kind") != _CONSTANT_KIND:
-            return read_shared_pole_bank(io, (lo, hi), meta=meta, header=header,
+            return read_tangential_bank(io, (lo, hi), meta=meta, header=header,
                                          fields=("constant",))["constant"]
         return io.read_slab("constant", shape=(hi - lo, d, d), valid_shape=(hi - lo, d, d),
                             offset=(lo, 0, 0), dtype=np.complex128,
@@ -2186,7 +2186,7 @@ def _bank_nsample(plan):
     return len(np.unique(plan["distinct_id"][finite]))
 
 
-def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
+def initialize_tangential_bank(path, *, meta, tables, recipe, identity,
                                 mesh_xy, photon_layout=None, mu_bases=None):
     """Create optional construction-resume scratch with no payload marked ready.
 
@@ -2294,7 +2294,7 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
     return header
 
 
-def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
+def validate_tangential_bank(path, *, expected_identity, mesh_xy,
                               require_complete=False, expected_recipe=None, collective=True):
     """Authenticated header of a bank, read and checked once (rank 0).
 
@@ -2312,7 +2312,7 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
                               expected_recipe=expected_recipe)
     if isinstance(path, ResidentBankPayload) or not collective:
         return read()
-    return rank0_read(path, stage="shared_pole.validate_bank", read=read)
+    return rank0_read(path, stage="tangential.validate_bank", read=read)
 
 
 def _validate_bank(path, *, expected_identity, mesh_xy,
@@ -2426,7 +2426,7 @@ def _validate_bank(path, *, expected_identity, mesh_xy,
     return header
 
 
-def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
+def write_tangential_bank(path, *, q_span, sample_span=None, Wc=None,
                            dWc_ds=None, M1=None, M3=None, M0=None, M2=None, constant=None,
                            line=None, meta, expected_identity, mesh_xy):
     """Write one bounded q/sample batch and commit masks after collective close.
@@ -2438,7 +2438,7 @@ def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
     through ``meta.mu_basis``; no off-axis Hermitization or rescaling.
     Already committed fields refuse overwrite, including in partial files.
     """
-    with shared_pole_bank_writer(path, meta=meta, expected_identity=expected_identity,
+    with tangential_bank_writer(path, meta=meta, expected_identity=expected_identity,
                                  mesh_xy=mesh_xy) as (_, header, write):
         if not (all(mask.all() for mask in _bank_masks(header).values())
                 and line is None
@@ -2449,7 +2449,7 @@ def write_shared_pole_bank(path, *, q_span, sample_span=None, Wc=None,
 
 
 @contextmanager
-def shared_pole_bank_writer(path, *, meta, expected_identity, mesh_xy):
+def tangential_bank_writer(path, *, meta, expected_identity, mesh_xy):
     """One collective transaction for bounded slices of one frequency.
 
     Yield the existing read handle, authenticated header and slice writer.
@@ -2458,7 +2458,7 @@ def shared_pole_bank_writer(path, *, meta, expected_identity, mesh_xy):
     """
     error = None
     try:
-        header = validate_shared_pole_bank(path, expected_identity=expected_identity, mesh_xy=mesh_xy)
+        header = validate_tangential_bank(path, expected_identity=expected_identity, mesh_xy=mesh_xy)
         _check_basis(meta, header)
         if mesh_xy is not meta.mu_basis.mesh_xy:
             _refuse("writer mesh differs from packed basis mesh")
@@ -2467,7 +2467,7 @@ def shared_pole_bank_writer(path, *, meta, expected_identity, mesh_xy):
     except Exception as exc:
         error = exc
     # Every serial metadata reader must close before any collective writer opens.
-    agree_io_refusal(error, path=str(path), stage="shared_pole.bank_writer")
+    agree_io_refusal(error, path=str(path), stage="tangential.bank_writer")
     with _bank_io(path, "a", mesh_xy) as io:
         def write(**fields):
             prepared = _prepare_bank_write(header, meta=meta, mesh_xy=mesh_xy, **fields)
@@ -2489,7 +2489,7 @@ def _complete_bank(path, header):
     if all(mask.all() for mask in _bank_masks(header).values()):
         header["complete"] = True
         header["final_commit"] = hashlib.sha256(_json(header).encode()).hexdigest()
-        _stamp_header(path, header, "shared_pole_bank.complete")
+        _stamp_header(path, header, "tangential_bank.complete")
 
 
 def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
@@ -2774,7 +2774,7 @@ def _read_photon_bank_sector(io, name, prefix, offset, spec, header, sector, led
 
 
 def _parent_runs(ids, layout, mesh):
-    """Read runs for a parent id list: (runs, contiguous, interval); see read_shared_pole_bank."""
+    """Read runs for a parent id list: (runs, contiguous, interval); see read_tangential_bank."""
     contiguous = ids == list(range(ids[0], ids[0] + len(ids)))
     # Ordered parent rounds can permute a complete interval and pad it with
     # repeated parents. Read that interval once, then restore the round order
@@ -2824,7 +2824,7 @@ def _dense_plan(io, q_span, *, meta, header, sample_span, sample_ids, fields, q_
     per field, ``parts`` one ``(request, price)`` per parent run (``price`` is
     ``(argument, output, temporary)`` bytes; a sector read carries its
     ``prefix``/``offset`` and ``price=None``). One plan serves
-    :func:`read_shared_pole_bank` and :func:`read_round_samples`, so both
+    :func:`read_tangential_bank` and :func:`read_round_samples`, so both
     return the same arrays.
     """
     if header.get("schema") != BANK_SCHEMA:
@@ -2910,7 +2910,7 @@ def _dense_plan(io, q_span, *, meta, header, sample_span, sample_ids, fields, q_
     return ledger, entries
 
 
-def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sample_ids=None,
+def read_tangential_bank(io, q_span=None, *, meta, header, sample_span=None, sample_ids=None,
                           fields=("Wc", "dWc_ds"), q_ids=None, partition_spec=None, sector=None):
     """Read committed bounded scratch fields into packed distributed operators.
 
@@ -2968,7 +2968,7 @@ def read_round_samples(io, q_span=None, *, meta, header, fields, sample_span=Non
                        q_ids=None, partition_spec=None, line_family=None, line_samples=()):
     """A round's committed bank fields and line panels in ONE collective read.
 
-    ``(dense, line)``: ``dense`` is :func:`read_shared_pole_bank`'s dict for
+    ``(dense, line)``: ``dense`` is :func:`read_tangential_bank`'s dict for
     ``fields`` and ``line`` is :func:`read_line_panel_round`'s dict for
     ``line_samples`` of ``line_family`` (empty without samples); every value
     is exactly what those readers return (one plan each). All their parent
@@ -3078,7 +3078,7 @@ def read_line_panels(io, q_span=None, *, meta, header, family, sample, cross=Fal
     Returns ``(panels, counts)``: complex128 ``[b, 1+2S, rows, r]`` (or the
     ``[b, 2S, cross rows, r]`` cross panel) in the packed row order the
     constructor uses, face tiles ``P(None,None,'x','y')`` or batch layout as
-    in :func:`read_shared_pole_bank`, and the host int ``[b]`` retained count
+    in :func:`read_tangential_bank`, and the host int ``[b]`` retained count
     of each requested parent. The field order is the header's
     ``line_panels.fields``: Q, then output and action per state. A round's
     samples together: :func:`read_line_panel_round`.
@@ -3182,7 +3182,7 @@ def _export_spatial_header(path, source_wfn, meta, *, kind, source):
                     "physical Wc(q,z_i), s=z_Ry^2; fixed bank samples, not W+(tau); "
                     "Wc and dWc_ds[q,sample,mu,nu], M1 and M3[q,mu,nu]; "
                     "z_ry[role] and distinct_id[role] identify each sample"))
-    rank0_transaction(path, stage="shared_pole.export_headers", write=append)
+    rank0_transaction(path, stage="tangential.export_headers", write=append)
 
 
 #: The exact export names one self-consistent map owns. Used twice and only
@@ -3208,7 +3208,7 @@ def _retain_current_map_exports(targets, *, run_dir, label, identity, mesh_xy,
     and is complete. Scanning rather than unlinking only ``N-1`` also clears
     managed exports a longer earlier run left in the same scratch directory.
     This is ``gw.mpa.model.retain_iteration_artifacts``'s rule for the
-    shared-pole exports, through the same removal owner.
+    tangential exports, through the same removal owner.
     """
     import os
     import re
@@ -3219,18 +3219,18 @@ def _retain_current_map_exports(targets, *, run_dir, label, identity, mesh_xy,
         return ()
     for kind, path in targets.items():
         if kind == "poles":
-            validate_shared_pole_model(path, expected_identity=identity,
+            validate_tangential_model(path, expected_identity=identity,
                                        mesh_xy=mesh_xy)
         else:
-            validate_shared_pole_bank(path, expected_identity=identity,
+            validate_tangential_bank(path, expected_identity=identity,
                                       mesh_xy=mesh_xy, require_complete=True)
     root = os.path.abspath(os.fspath(run_dir))
     removed = remove_managed(
         root, _MANAGED_EXPORT,
         keep=[os.path.join(root, path.name) for path in targets.values()],
-        barrier_tag=f"shared_pole_store.retain.{label}", print_fn=print_fn)
+        barrier_tag=f"tangential_store.retain.{label}", print_fn=print_fn)
     if removed:
-        print_fn(f"shared-pole exports: retained {label}; released "
+        print_fn(f"tangential exports: retained {label}; released "
                  + ", ".join(sorted(removed)))
     return tuple(sorted(removed))
 
@@ -3255,7 +3255,7 @@ def _export_is_current(path, *, identity, digest):
     return stamped <= {digest, None}
 
 
-def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
+def export_tangential_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                                run_dir, label, tables, print_fn):
     """Export current-map poles and/or fixed W samples through their writers.
 
@@ -3281,7 +3281,7 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
     if source_wfn is None:
         _refuse("export requires the source WFN path for verbatim mf_header")
     ledger = _capacity(meta)
-    model = validate_shared_pole_model(source, expected_identity=handle["identity"],
+    model = validate_tangential_model(source, expected_identity=handle["identity"],
         mesh_xy=mesh_xy, capacity=ledger)
     if model["digest"] != handle["digest"]:
         _refuse("export handle differs from current model")
@@ -3313,14 +3313,14 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
         outputs[kind] = dict(path=str(path), status="retained", reason=(
             "export already written from this model identity and digest; "
             "restart rewrote nothing"))
-        print_fn(f"shared-pole export: {kind} at {path} was written from this "
+        print_fn(f"tangential export: {kind} at {path} was written from this "
                  "model; retained, not rewritten")
     bank_source = source.parent / "bank.h5"
     if "w" in pending:
         if not bank_source.is_file():
             _refuse(f"write_w needs the current-map bank {bank_source}; "
                     "a model-only restart cannot supply frequency samples")
-        bank_header = validate_shared_pole_bank(bank_source,
+        bank_header = validate_tangential_bank(bank_source,
             expected_identity=handle["identity"], mesh_xy=mesh_xy, require_complete=True)
     if "poles" in pending:
         path = pending["poles"]
@@ -3342,7 +3342,7 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                         offset=(q, 0), partition_spec=P()) if model["Kmax"] else
                         jnp.ones((1, 0), jnp.float64))
                     poles = jnp.where(jnp.arange(shape[-1])[None, :] < count, poles, 1.0)
-                    write_shared_pole_model(path, b, poles, np.asarray([count], np.int64),
+                    write_tangential_model(path, b, poles, np.asarray([count], np.int64),
                         q_span=(q, q+1), meta=meta, tables=tables,
                         recipe=model["recipe"], receipts=dict(identity=handle["identity"],
                             source_model_digest=model["digest"], source_store=str(source)),
@@ -3354,7 +3354,7 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
         outputs["poles"] = dict(path=str(path), payload_bytes=model["compact_payload_bytes"])
     if "w" in pending:
         path = pending["w"]
-        output_header = initialize_shared_pole_bank(path, meta=meta, tables=tables,
+        output_header = initialize_tangential_bank(path, meta=meta, tables=tables,
             recipe=bank_header["recipe"], identity=handle["identity"], mesh_xy=mesh_xy)
         previous = ledger.live_stages
         with SlabIO(bank_source, mode="r", mesh=mesh_xy) as io, \
@@ -3366,7 +3366,7 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                     sample = _sample_field(bank_header, field) is not None
                     for i in (dense if sample else (None,)):
                         span = (i, i+1) if sample else None
-                        values = read_shared_pole_bank(io, (q, q+1), meta=meta,
+                        values = read_tangential_bank(io, (q, q+1), meta=meta,
                             header=bank_header, sample_span=span, fields=(field,))
                         value = values[field]
                         spec = P(None, None, "x", "y") if sample else P(None, "x", "y")

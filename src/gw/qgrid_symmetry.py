@@ -9,7 +9,7 @@ WHAT THIS MODULE IS.  Two decisions, expressed by announcing adapters over
   the q axis of this deck?  The answer comes from the load-time density
   MEASUREMENT (``SymMaps.trs_allowed``), never from an assumption, and it
   arrives as one object the driver consumes rather than a branch the
-  driver takes. :func:`qgrid_trs_policy_from_shared_pole_store` adapts the
+  driver takes. :func:`qgrid_trs_policy_from_tangential_store` adapts the
   same measured reference after the model store has authenticated it.
 
 Every producer of the q-axis tables in ``gw/`` goes through here; nothing
@@ -51,11 +51,11 @@ from __future__ import annotations
 import numpy as np
 
 
-_SHARED_POLE_REALIZERS = {}
+_TANGENTIAL_REALIZERS = {}
 
 
-def shared_pole_operator_realizer(meta, header, *, q_full_idx, mesh_xy):
-    r"""Bind the versioned physical realization of packed shared-pole tiles.
+def tangential_operator_realizer(meta, header, *, q_full_idx, mesh_xy):
+    r"""Bind the versioned physical realization of packed tangential tiles.
 
     Stored factors remain the raw latent Ritz model. Physical consumers use
     ``Pi_G sum_k b_k f_k b_k^dagger`` with the complete authenticated little
@@ -79,12 +79,12 @@ def shared_pole_operator_realizer(meta, header, *, q_full_idx, mesh_xy):
     from ffi import _services
     _services.ensure_on_path()
     from symmetry_maps import project_little_group_operator
-    from .shared_pole_recipe import shared_real_pole_v1_r3b
+    from .tangential_recipe import shared_real_pole_v1_r3b
 
     expected = shared_real_pole_v1_r3b["operator_realization"]
     if header.get("recipe", {}).get("operator_realization") != expected:
         raise ValueError(
-            "GATE shared_pole_realization: missing or unsupported operator_realization; "
+            "GATE tangential_realization: missing or unsupported operator_realization; "
             f"expected {expected!r}, rebuild this model with the current recipe")
     if (header.get("representation") not in ("scalar-trs-even-s", "scalar-ordered-ph")
             # nspinor records the source; the stored operator is the
@@ -92,23 +92,23 @@ def shared_pole_operator_realizer(meta, header, *, q_full_idx, mesh_xy):
             or header.get("nspinor") not in (1, 2, 4)
             or header.get("q_order") != "canonical-full-flat"
             or not np.array_equal(header.get("q_shift"), np.zeros(3))):
-        raise ValueError("GATE shared_pole_realization: unsupported scalar q-grid representation")
+        raise ValueError("GATE tangential_realization: unsupported scalar q-grid representation")
     qt, operations = header["qirr"], header["operations"]
     nsp = int(qt["n_sym_spatial"])
     canonical_rows = np.arange(2*nsp, dtype=np.int32)
     if (not np.array_equal(operations["rows"], canonical_rows)
             or not np.array_equal(operations["antiunitary"], canonical_rows >= nsp)
             or not operations.get("typing_source")):
-        raise ValueError("GATE shared_pole_realization: unauthenticated canonical operation typing")
+        raise ValueError("GATE tangential_realization: unauthenticated canonical operation typing")
     grid, qids = np.asarray(header["grid"]), np.asarray(q_full_idx)
     if (grid.shape != (3,) or grid.dtype.kind not in "iu" or np.any(grid <= 0)
             or qids.ndim != 1 or not qids.size or qids.dtype.kind not in "iu"
             or np.any(qids < 0) or np.any(qids >= np.prod(grid))
             or np.unique(qids).size != qids.size):
-        raise ValueError("GATE shared_pole_realization: invalid full-grid q selection")
+        raise ValueError("GATE tangential_realization: invalid full-grid q selection")
     basis = meta.mu_basis
     if basis.mesh_xy != mesh_xy or int(header["n_mu_logical"]) != basis.n_logical:
-        raise ValueError("GATE shared_pole_realization: model and packed basis carrier differ")
+        raise ValueError("GATE tangential_realization: model and packed basis carrier differ")
     kwargs = dict(
         q_full_idx=qids,
         q_irr_frac=np.stack(np.unravel_index(qids, tuple(grid)), axis=1)/grid[None, :],
@@ -129,7 +129,7 @@ def shared_pole_operator_realizer(meta, header, *, q_full_idx, mesh_xy):
     key = (mesh_xy, nsp, grid, expected,
            tuple((name, value.shape, value.dtype.str, value.tobytes())
                  for name, value in kwargs.items()))
-    realize = _SHARED_POLE_REALIZERS.get(key)
+    realize = _TANGENTIAL_REALIZERS.get(key)
     if realize is None:
         def realize(operator, transposed_partner):
             return project_little_group_operator(
@@ -142,12 +142,12 @@ def shared_pole_operator_realizer(meta, header, *, q_full_idx, mesh_xy):
             kwargs["q_full_idx"], kgrid=grid, sym_mats_k=kwargs["sym_mats_k"],
             sym_perm=kwargs["sym_perm"], L_table=kwargs["L_table"],
             active_symmetry_rows=kwargs["active_symmetry_rows"], n_sym_spatial=nsp))
-        _SHARED_POLE_REALIZERS[key] = realize
+        _TANGENTIAL_REALIZERS[key] = realize
     return realize
 
 
-def shared_pole_packed_action(meta, header, *, mesh_xy):
-    """Packed centroid action of a shared-pole store's operation rows, and its locality.
+def tangential_packed_action(meta, header, *, mesh_xy):
+    """Packed centroid action of a tangential store's operation rows, and its locality.
 
     Returns ``(packed_perm, wraps, certificates)``: the authenticated canonical
     source permutation ``qirr.sym_perm`` and umklapp wraps ``qirr.L_table``
@@ -251,10 +251,10 @@ def resolve_qgrid_symmetry_tables(
     return res
 
 
-def qgrid_trs_policy_from_shared_pole_store(header, *, announce=True):
+def qgrid_trs_policy_from_tangential_store(header, *, announce=True):
     """Recover the measured reference policy from a validated model store.
 
-    The shared-pole store validator binds ``scalar-trs-even-s`` to the
+    The tangential store validator binds ``scalar-trs-even-s`` to the
     measured scalar-TRS reference and authenticates its operation tables.
     Its consumer has no live SymMaps object; adapt that sealed metadata at
     the same entry point as live references, never infer symmetry from fitted b.
@@ -269,7 +269,7 @@ def qgrid_trs_policy_from_shared_pole_store(header, *, announce=True):
     return qgrid_trs_policy_for(
         sym=reference, irr_idx_q=np.asarray(qt["irr_idx_q"]),
         sym_idx_q=np.asarray(qt["sym_idx_q"]), kgrid=tuple(header["grid"]),
-        n_sym_spatial=int(qt["n_sym_spatial"]), context="shared-pole Sigma",
+        n_sym_spatial=int(qt["n_sym_spatial"]), context="tangential Sigma",
         announce=announce)
 
 

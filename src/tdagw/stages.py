@@ -554,11 +554,11 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
 
 
 def collision_source(deck: TdDeck, mesh, *, say=None):
-    """The GW source of ``[lorrax] collision`` (None when off): a GN-PPM or shared-pole run.
+    """The GW source of ``[lorrax] collision`` (None when off): a GN-PPM or tangential run.
 
     Runs the GW driver on a copy of ``collision_source`` in
     ``outdir/collision_source`` (``tdagw.dynsig.gw_window_source``: the run's own
-    carrier, screening model and head, and with refreshed or shared-pole screening
+    carrier, screening model and head, and with refreshed or tangential screening
     the inputs of its W stage; no restart written).  Collective; call it before
     the TD driver's ``RunSession`` (the GW driver owns the timing table and
     stdout while it runs).  ``say`` gets its one line (None: kept in the
@@ -572,7 +572,7 @@ def collision_source(deck: TdDeck, mesh, *, say=None):
     work = os.path.join(os.path.abspath(str(v["control.files.outdir"])), "collision_source")
     src = gw_window_source(v["lorrax.collision_source"], mesh, workdir=work,
                            screening=v["lorrax.collision_screening"] in (
-                               "refreshed", "shared_pole", "joint", "joint_frozen"),
+                               "refreshed", "tangential", "joint", "joint_frozen"),
                            say=say or lines.append)
     src["line"] = lines[0] if lines else ""
     return src
@@ -658,7 +658,7 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
            f", {v['lorrax.collision_internal_pairing']} internal pairing")
         + ("" if v["lorrax.collision_screening"] != "refreshed" else
            f" (same-side principal value {v['lorrax.collision_screening_gamma_ev']:g} eV)")
-        + ("" if v["lorrax.collision_screening"] != "shared_pole" else
+        + ("" if v["lorrax.collision_screening"] != "tangential" else
            f" (full refit every refresh; supports "
            f"{v['lorrax.collision_spm_support_sites_ev'] or 'the production ladder'}"
            + ("" if v["lorrax.collision_spm_chi0_active"] is None else

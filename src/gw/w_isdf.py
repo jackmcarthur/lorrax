@@ -3266,7 +3266,7 @@ def chi_band_stop(meta, wfns):
     """Local end of the chi0/W band sum: ``Meta.b_id_4_chi_user - b0``.
 
     The one owner of the chi band window for the finite-occupation routes
-    (the logical top, no mesh pad; the shared-pole bank's census reads the
+    (the logical top, no mesh pad; the tangential bank's census reads the
     same edge).  None when ``meta`` carries no band edges: the whole carrier.
     """
     top = getattr(meta, "b_id_4_chi_user", None)

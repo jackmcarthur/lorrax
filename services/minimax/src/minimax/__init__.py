@@ -6,7 +6,7 @@ load optional numerical libraries only when called.
 
 The target is part of every rule contract. ``serve`` computes the static,
 imaginary-probe, and regularized crossing screening rules in process. Sigma's
-complex denominator rectangles use ``analytic_box_rule``. The shared-pole W
+complex denominator rectangles use ``analytic_box_rule``. The tangential W
 bank uses ``response_group_rules`` because it needs current-frequency value
 and derivative projections; the GN-PPM imaginary probe uses
 ``response_laplace_rule``; the CD band-windowed crossing window uses

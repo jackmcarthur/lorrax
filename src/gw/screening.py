@@ -49,8 +49,8 @@ import common.timing as timing
 from . import quadrature_log
 from .gw_config import (
     ComputeMode, ScreeningDiagrams, coerce_screening_diagrams,
-    uses_bare_transverse_shared_pole,
-    uses_full_bispinor_shared_pole,
+    uses_bare_transverse_tangential,
+    uses_full_bispinor_tangential,
 )
 
 
@@ -634,7 +634,7 @@ def compute_screening(
                 f"not supported — ω must be pure real or pure imag.")
         if on_imag:
             # GN-PPM probe: times placed by the analytic response rule the
-            # shared-pole bank uses (owner 2026-09-22), not a runtime minimax.
+            # tangential bank uses (owner 2026-09-22), not a runtime minimax.
             quad_used = build_imag_probe_response_rule(
                 quad, abs(req.omega_ry.imag),
                 config.minimax_config, print_fn=print_fn,
@@ -783,9 +783,9 @@ def compute_screening_model(
                 chi0_remote_margin_ev=float(config.sigma.cd_chi0_remote_margin_ev),
                 own_energy_band_min=int(config.sigma.cd_own_energy_band_min),
                 checkpoint=str(config.sigma.cd_checkpoint), run_dir=run_dir)}
-        if config.sigma.w_model == "shared_pole":
-            from .shared_pole_screening import screen_shared_poles
-            return screen_shared_poles(
+        if config.sigma.w_model == "tangential":
+            from .tangential_screening import screen_tangential_poles
+            return screen_tangential_poles(
                 wfns, V_q, meta, config, mesh_xy=mesh_xy, sym=sym,
                 centroid_indices=centroid_indices, run_dir=run_dir, label=label,
                 wfn=wfn, wfn_fingerprint_binding=wfn_fingerprint_binding,
@@ -916,7 +916,7 @@ def driver_persists_w0(mode, config) -> bool:
       per-element Pade fit on disk with no ω = 0 evaluator, so nothing is
       persisted; BSE reconstructs the scalar static response.
 
-    ``compute_mode = mpa`` with ``sigma_w_model = shared_pole`` (the
+    ``compute_mode = mpa`` with ``sigma_w_model = tangential`` (the
     production W) answers yes, one-shot and self-consistent alike:
     :func:`restart_static_w` evaluates the model at ω = 0 through the Σ
     synthesis owner.  A self-consistent run evaluates the accepted final
@@ -927,7 +927,7 @@ def driver_persists_w0(mode, config) -> bool:
     the charge-sector ``V + Wc(0)`` on the run's charge V.  BSE reads that
     charge W0 only; the bare TT exchange of that route never enters the
     restart, and CT/TT are unscreened there by construction.
-    The four-current sector bank (``bispinor_gw = full_shared_pole``) is
+    The four-current sector bank (``bispinor_gw = full_tangential``) is
     included too: its W0 is ``V + Wc_CC(0)`` of the CC sector
     (``mpa.sector_sigma.sector_static_wc``, the sector Σ synthesis at the
     ω = 0 coefficient); CT/TC/TT are not stored, so BSE screens with the
@@ -945,10 +945,10 @@ def driver_persists_w0(mode, config) -> bool:
         return False
     if mode is ComputeMode.MPA:
         sigma = getattr(config, "sigma", None)
-        return (getattr(sigma, "w_model", "mpa") == "shared_pole"
+        return (getattr(sigma, "w_model", "mpa") == "tangential"
                 and (not bool(getattr(config, "bispinor", False))
-                     or uses_bare_transverse_shared_pole(config)
-                     or uses_full_bispinor_shared_pole(config)))
+                     or uses_bare_transverse_tangential(config)
+                     or uses_full_bispinor_tangential(config)))
     return True
 
 
@@ -957,9 +957,9 @@ def restart_static_w(mode, W_by_role, V_q, *, config, meta, mesh_xy,
     """The static W the driver persists as ``W0_qmunu``, or ``None``.
 
     Non-MPA modes: the ``static`` role, the Dyson W(ω = 0) (``V_q`` when
-    the mode screened nothing).  MPA on the scalar shared-pole store: a
+    the mode screened nothing).  MPA on the scalar tangential store: a
     zero-argument callable that returns ``V + Wc(0)`` on ``V_q``'s own q
-    wedge, with ``Wc(0)`` from :func:`gw.mpa.sigma.shared_pole_static_wc`
+    wedge, with ``Wc(0)`` from :func:`gw.mpa.sigma.tangential_static_wc`
     (the Σ synthesis at the ω = 0 coefficient) and its pre-unfold wedge
     deposited for the restart writer exactly as the Dyson route deposits
     its own.  It is a callable so the evaluation runs only after
@@ -988,13 +988,13 @@ def restart_static_w(mode, W_by_role, V_q, *, config, meta, mesh_xy,
         log.info(f"  W0_qmunu NOT persisted: {why}.  A BSE on this restart "
                  "rebuilds the scalar static response.")
         return None
-    handle = W_by_role["shared_pole"]
+    handle = W_by_role["tangential"]
 
     def evaluate():
         from .static_screening import build_static_screened_w
         W0, _ = build_static_screened_w(
             None, V_q, config=config, meta=meta, mesh_xy=mesh_xy,
-            shared_pole=handle, head_resolver=head_source, print_fn=print_fn)
+            tangential=handle, head_resolver=head_source, print_fn=print_fn)
         return W0
 
     return evaluate
@@ -1036,19 +1036,19 @@ def refuse_w_bse_without_trs(config, sym) -> None:
             "ladder owns a general ordered-response construction.")
 
 
-def refuse_full_shared_pole_with_trs(config, sym) -> None:
-    """``GATE full_shared_pole_trs``, before any basis, zeta or V, as above.
+def refuse_full_tangential_with_trs(config, sym) -> None:
+    """``GATE full_tangential_trs``, before any basis, zeta or V, as above.
 
     With time reversal Pi_T0(q, 0) = 0: the CT/TC block is odd in omega and CC,
     TT are even. The sector store writes CC and TT only in the ordered
     representation, which needs broken time reversal
-    (``file_io.shared_pole_store._metadata``), so the run would refuse after
+    (``file_io.tangential_store._metadata``), so the run would refuse after
     the screening stage.
     """
-    from .gw_config import uses_full_bispinor_shared_pole
-    if uses_full_bispinor_shared_pole(config) and _trs_verdict(sym):
+    from .gw_config import uses_full_bispinor_tangential
+    if uses_full_bispinor_tangential(config) and _trs_verdict(sym):
         raise ValueError(
-            "GATE full_shared_pole_trs: bispinor_gw = full_shared_pole on a WFN "
+            "GATE full_tangential_trs: bispinor_gw = full_tangential on a WFN "
             "with time reversal (SymMaps.trs_allowed); the sector store holds CC "
             "and TT only in the ordered representation, which needs broken time "
             "reversal.  With time reversal the static charge-current coupling "

@@ -102,7 +102,7 @@ def _rule_digest(rule, noise_amplification):
 
 
 #: The self-consistent identity spells its Hamiltonian
-#: ``sc_map_{iteration}:{occ_hash}`` (gw/shared_pole_recipe.py), so the map
+#: ``sc_map_{iteration}:{occ_hash}`` (gw/tangential_recipe.py), so the map
 #: label lives inside a value, not only in the ``iteration_id`` key.
 _SC_MAP_LABEL = re.compile(r"^sc_map_\d+:")
 
@@ -146,7 +146,7 @@ RUN_SCOPE = "run"
 
 
 def sigma_rule_scope(identity, poles2, counts, *, eta, eps):
-    """The in-process request scope of a shared-pole Sigma call.
+    """The in-process request scope of a tangential Sigma call.
 
     ``identity`` is the model's energy/occupation/recipe provenance;
     ``poles2`` [Nq,K] in Ry**2 and ``counts`` [Nq] are the small host census.
@@ -464,7 +464,7 @@ def snap_outward(x, scale, outward):
 
     The one grid for every quantity a rule is built from or a reuse decision
     compares: Sigma build boxes (scale eta), the chi response rule support and
-    the SC shared-pole sampling envelope (scale 1). A round-off-perturbed
+    the SC tangential sampling envelope (scale 1). A round-off-perturbed
     input lands on the same grid point unless it straddles a cell edge."""
     if x == 0.0:
         return 0.0
@@ -479,7 +479,7 @@ def _build_box(box, eta, *, widen):
     ``widen`` adds 1% of the width to the far edges (|x| > 3 eta) so the
     sector calls of one map reuse by containment. The snap makes the rule a
     function of a grid cell rather than of the exact request: a request
-    moved by round-off (extreme shared-pole edges differ 1e-9-4e-8 relative
+    moved by round-off (extreme tangential edges differ 1e-9-4e-8 relative
     between two exact GEMM orders) otherwise lands on a different rule (the
     fitted builder of P2-E moved Fe 4^3 bispinor eqp1 by 0.32 meV this way,
     2026-09-24). On the 1e-4 grid a perturbed request maps to the same build
@@ -669,7 +669,7 @@ def _serve_from_plan(specs, fits, eps):
     digest), and a candidate must pass :func:`_may_serve`, the criterion the
     scope lookup applies. The result does not depend on rank timing:
     before this, whether a window saw another window's fresh rule depended on
-    how far the other rank had got (Si shared-pole ``cond:pole_tail`` took
+    how far the other rank had got (Si tangential ``cond:pole_tail`` took
     the 9-node own rule or the 7-node ``cond:bulk`` one, eqp1 0.80 ueV
     apart).
     """
@@ -871,7 +871,7 @@ def _box_escape_reasons(outer, inner):
 
 #: The far pole edge of a window whose selector has no upper bound (deep and
 #: bulk windows) is certified to this multiple of its current value.  The
-#: highest shared-pole mode moves 10-30% per SC map (Fe 4^3 charge map 2:
+#: highest tangential mode moves 10-30% per SC map (Fe 4^3 charge map 2:
 #: val:bulk 24.2 -> 28.6 Ry refit 6/12 windows under the old 10%), and a
 #: sign-definite relative rule pays about one node for a doubled far edge.
 _SC_FAR_POLE_FACTOR = 2.0
@@ -1434,7 +1434,7 @@ def support_reads_past(omega_ry, omega_group, support_window_ry):
     """Sample groups that read Sigma outside W's line support (eV records).
 
     ``support_window_ry`` is the ``(lo, hi)`` extent of the reads the W line
-    sites were placed for (``shared_pole_recipe`` ``support_reads_ev``, in the
+    sites were placed for (``tangential_recipe`` ``support_reads_ev``, in the
     ``omega_ry`` frame).  Each sample group (-1 = the near grid, else a coarse
     window) whose samples leave it reads W where the model extrapolates.
     """
@@ -1478,7 +1478,7 @@ def plan_sigma_windows(
 
     ``analytic_line`` asks the service for its fixed-height rule only when
     the box crosses zero and all poles are real. PPM supplies that request;
-    generic MPA and shared-pole W keep their box-rule contracts.
+    generic MPA and tangential W keep their box-rule contracts.
 
     Parameters
     ----------
@@ -1516,7 +1516,7 @@ def plan_sigma_windows(
         pole statistics, references and executor intervals remain unchanged.
     certificate_pole_summaries
         Optional ``summarize_*`` rows of a pole census that contains
-        ``pole_summaries`` (a shared-pole map's union over its sectors).
+        ``pole_summaries`` (a tangential map's union over its sectors).
         They set only each window's certificate box, so every sector call
         of one map requests the same boxes and reuses one set of fits; the
         executor's pole selection, factor references and window kind stay
@@ -1529,7 +1529,7 @@ def plan_sigma_windows(
         inner state pad there.  None (an insulator) leaves the 2 eta pad.
         Used only with ``fixed_rule_session``.
     support_window_ry, support_top_ev
-        A shared-pole model's line support, read from its header: the reads'
+        A tangential model's line support, read from its header: the reads'
         extent in the ``omega_ry`` frame and the top line site (eV).  A sample
         group outside the extent is warned about by name, never refused (the
         coarse semicore windows sit below it by design); recorded in the
@@ -1608,7 +1608,7 @@ def plan_sigma_windows(
         previous = fixed_rule_session.setdefault(
             "pole_support_ry", fixed_pole_support)
         # The treatment ceiling only grows (a span past it re-plans it,
-        # shared_pole_recipe._sector_treatment_ceiling); every live pole is
+        # tangential_recipe._sector_treatment_ceiling); every live pole is
         # still box-checked against its held rule.
         if fixed_pole_support < float(previous):
             raise ValueError(

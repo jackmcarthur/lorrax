@@ -136,8 +136,8 @@ COLLISION_HERMITIAN = ("dynamic", "full", "none")
 #: ``lorrax.collision_refresh_sweep``: what a refresh sweeps (``tdagw.dynsig.REFRESH_SWEEPS``).
 COLLISION_REFRESH_SWEEPS = ("full", "active")
 #: ``lorrax.collision_screening``: the W of the rates (``tdagw.dynsig.COLLISION_SCREENINGS``).
-COLLISION_SCREENINGS = ("frozen", "refreshed", "shared_pole", "joint", "joint_frozen")
-#: ``lorrax.collision_rebase``: C[rho_eq] on the refreshed W (``auto``: on for shared_pole).
+COLLISION_SCREENINGS = ("frozen", "refreshed", "tangential", "joint", "joint_frozen")
+#: ``lorrax.collision_rebase``: C[rho_eq] on the refreshed W (``auto``: on for tangential).
 COLLISION_REBASE = ("auto", "on", "off")
 #: ``lorrax.collision_in_scattering``: the rates' internal line (``tdagw.dynsig.IN_SCATTERINGS``).
 COLLISION_IN_SCATTERINGS = ("populations", "full")
@@ -245,12 +245,12 @@ def _check_collision(vals: dict) -> None:
         raise _gate("td_collision_snapshot", "joint screening without the full coherent correction",
                     "collision_hermitian = 'dynamic'",
                     "include M_H once in the material snapshot")
-    if form != "off" and vals["lorrax.collision_screening"] in ("refreshed", "shared_pole"):
+    if form != "off" and vals["lorrax.collision_screening"] in ("refreshed", "tangential"):
         raise _gate(
             "td_collision_keldysh_screening",
             f"collision_screening = {vals['lorrax.collision_screening']!r}",
             "collision_screening = 'frozen', 'joint' or 'joint_frozen'",
-            "use the equilibrium W branches; the refreshed and shared-pole paths rebuild only "
+            "use the equilibrium W branches; the refreshed and tangential paths rebuild only "
             "retarded W from populations and do not supply the nonequilibrium W< required by "
             "the column-sampled MGKBA collision operator",
         )
@@ -295,12 +295,12 @@ def _check_collision(vals: dict) -> None:
             raise _gate("td_collision", f"collision_frozen_bands = {fb!r}",
                         "[n_below, n_above], two integers >= 0",
                         "set [lorrax] collision_frozen_bands or leave it unset")
-        if (vals["lorrax.collision_screening"] not in ("refreshed", "shared_pole")
+        if (vals["lorrax.collision_screening"] not in ("refreshed", "tangential")
                 or vals["lorrax.collision_refresh_sweep"] != "active"):
             raise _gate("td_collision", "collision_frozen_bands with collision_screening = "
                         f"{vals['lorrax.collision_screening']!r}, collision_refresh_sweep = "
                         f"{vals['lorrax.collision_refresh_sweep']!r}",
-                        "collision_screening = 'refreshed' or 'shared_pole' and "
+                        "collision_screening = 'refreshed' or 'tangential' and "
                         "collision_refresh_sweep = 'active'",
                         "the truncation is of the frozen part's change under W(t); unset it")
         vals["lorrax.collision_frozen_bands"] = [int(n) for n in fb]
@@ -319,11 +319,11 @@ def _check_collision(vals: dict) -> None:
     if (vals["lorrax.collision_rebase"] == "on"
             and vals["lorrax.collision_screening"] == "frozen"):
         raise _gate("td_collision", "collision_rebase = 'on' with collision_screening = 'frozen'",
-                    "a refreshed W (refreshed or shared_pole)", "the t0 rates are rho_eq's at W0; "
+                    "a refreshed W (refreshed or tangential)", "the t0 rates are rho_eq's at W0; "
                     "unset collision_rebase")
     sites = str(vals["lorrax.collision_spm_support_sites_ev"])
     if sites.strip():
-        from gw.shared_pole_recipe import parse_support_sites
+        from gw.tangential_recipe import parse_support_sites
         try:
             vals["lorrax.collision_spm_support_sites_ev"] = parse_support_sites(sites)["text"]
         except ValueError as exc:
@@ -396,10 +396,10 @@ def _check_collision(vals: dict) -> None:
                     "system = 'bundle' (the rates are measured on the bundle's own "
                     "wavefunctions, the header's gauge)", "build the system from the bundle")
     if (vals["lorrax.collision_source"] not in ("", vals["lorrax.bundle_input"])
-            and vals["lorrax.collision_screening"] not in ("shared_pole", "joint", "joint_frozen")):
+            and vals["lorrax.collision_screening"] not in ("tangential", "joint", "joint_frozen")):
         raise _gate("td_collision_source", "collision_source differs from bundle_input",
                     "the GN-PPM GW deck of the bundle (one wavefunction gauge); a separate "
-                    "source only with collision_screening = 'shared_pole'",
+                    "source only with collision_screening = 'tangential'",
                     "leave collision_source unset")
     if not vals["lorrax.collision_source"]:
         vals["lorrax.collision_source"] = vals["lorrax.bundle_input"]
@@ -701,8 +701,8 @@ def inactive_keys(deck) -> dict:
           "lorrax.collision_internal_pairing"),
          v["lorrax.collision"] == "off", "the collision term's; collision = 'off'"),
         (("lorrax.collision_spm_support_sites_ev", "lorrax.collision_spm_chi0_active"),
-         v["lorrax.collision"] != "off" and v["lorrax.collision_screening"] != "shared_pole",
-         "collision_screening = 'shared_pole' only"),
+         v["lorrax.collision"] != "off" and v["lorrax.collision_screening"] != "tangential",
+         "collision_screening = 'tangential' only"),
         (("lorrax.collision_screening_gamma_ev",),
          v["lorrax.collision"] != "off" and v["lorrax.collision_screening"] != "refreshed",
          "collision_screening = 'refreshed' only"),
@@ -1040,7 +1040,7 @@ TD_KEY_DOCS = {
         "GN-PPM bundle; the GW driver reruns on a "
         "copy of `collision_source` (default `bundle_input`) in `outdir/collision_source` "
         "at the start (no restart written) to recover the poles or, with "
-        "`collision_screening = shared_pole`, the shared-pole model and its W stage's "
+        "`collision_screening = tangential`, the tangential model and its W stage's "
         "inputs (a run of the wrong member, or one whose window occupations differ from "
         "the TD system's, refuses there: `dynsig_gnppm_mode`, `dynsig_collision_member`, "
         "`dynsig_collision_occupations`). The log's `Collision refreshes` section has one "
@@ -1049,8 +1049,8 @@ TD_KEY_DOCS = {
     "lorrax.collision_source": (
         "= `bundle_input`", "The GW deck of the rates: the GN-PPM deck of the bundle, which "
         "it must be (or default to) for `frozen` and `refreshed` screening (one "
-        "wavefunction gauge); with `collision_screening = shared_pole` a one-shot "
-        "`sigma_w_model = shared_pole` deck on the bundle's wavefunctions and window "
+        "wavefunction gauge); with `collision_screening = tangential` a one-shot "
+        "`sigma_w_model = tangential` deck on the bundle's wavefunctions and window "
         "(`dynsig_collision_occupations` refuses another window).", ("td_collision_source",)),
     "lorrax.collision_hermitian": (
         "", "The held Hermitian part ΔΣ^h added to K δρ at each refresh: `dynamic`, "
@@ -1088,7 +1088,7 @@ TD_KEY_DOCS = {
         "`finite_lag` is the historical "
         "nonthermal statistical model; `lossless_bath` uses an explicitly secular "
         "screening bath with lossless RPA modes and weak colored-transition statistics. "
-        "`refreshed` and `shared_pole` are refused by "
+        "`refreshed` and `tangential` are refused by "
         "`td_collision_keldysh_screening`: those experimental paths reconstruct retarded W from "
         "instantaneous populations but lack the full instantaneous-energy/density snapshot "
         "adapter and declared branch prescription of the joint modes. Their earlier implementation "
@@ -1104,11 +1104,11 @@ TD_KEY_DOCS = {
         "the static and the dynamical part of δW are kept "
         "([td_agw_dynamical.md §7.1](theory/td_agw_dynamical.md)). The refresh lines add "
         "the walls (δχ0, Dyson + fit, frozen and active sweeps), the invalid-mode count "
-        "and flips, max|ΔΩ| and max|δW|/|W0| at both supports. `shared_pole` (a "
-        "shared-pole `collision_source`): at every refresh the source's whole W stage is "
+        "and flips, max|ΔΩ| and max|δW|/|W0| at both supports. `tangential` (a "
+        "tangential `collision_source`): at every refresh the source's whole W stage is "
         "rerun at the window populations — the response bank of χ0(f(t)) at the support "
         "set, the moments, the recipe and the constructor, a full refit "
-        "(`gw.shared_pole_screening.screen_shared_poles`; bitwise the run's model at "
+        "(`gw.tangential_screening.screen_tangential_poles`; bitwise the run's model at "
         "ρ_eq) — and the window Σ is swept on the new model; the head stays the run's, "
         "the frozen part is swept per refresh as with `refreshed`, and the static limit "
         "is the equilibrium model's own W^c(0). The refresh lines add the refit walls "
@@ -1137,15 +1137,15 @@ TD_KEY_DOCS = {
         "convergence tolerance. Legacy frozen screening and collision-off defaults "
         "are unchanged.", ("td_collision_statistics",)),
     "lorrax.collision_rebase": (
-        "= auto", "With refreshed or shared-pole screening and `collision = subtracted`: "
+        "= auto", "With refreshed or tangential screening and `collision = subtracted`: "
         "`on`, the subtracted C[ρ_eq] is re-evaluated on each refresh's W (one more "
         "window sweep at the equilibrium populations), so ρ_eq stays a fixed point of "
         "every refresh's dissipator and the regularization tails cancel at every W; "
-        "`off`, the t0 rates of ρ_eq throughout; `auto`, on for `shared_pole`, off "
+        "`off`, the t0 rates of ρ_eq throughout; `auto`, on for `tangential`, off "
         "otherwise. The refresh lines add the rebase wall.",
         ("td_collision",)),
     "lorrax.collision_spm_support_sites_ev": (
-        "= the production ladder", "With `collision_screening = shared_pole`: the refits' "
+        "= the production ladder", "With `collision_screening = tangential`: the refits' "
         "support set, `'<line eV list> | <imaginary eV list> [| <line height eV>]'` "
         "(`sigma_w_support_sites_ev` of the GW deck, with an optional line height), "
         "replacing the production ladder re-resolved at every state; the equilibrium "
@@ -1283,7 +1283,7 @@ TD_KEY_DOCS = {
         "([td_agw_dynamical.md §1.5, Eq. 8c](theory/td_agw_dynamical.md)).",
         ("td_collision",)),
     "lorrax.collision_spm_chi0_active": (
-        "= one rule on every pair", "With `collision_screening = shared_pole`: `auto` or `[a0, a1]`, "
+        "= one rule on every pair", "With `collision_screening = tangential`: `auto` or `[a0, a1]`, "
         "the active bands A of the refits' chi0 (0-based on the W carrier's band axis, "
         "half-open), extended to the smallest isolated band group (positive gaps below and "
         "above) containing it and the window; `auto` starts from the window. chi0 is then "
@@ -1292,7 +1292,7 @@ TD_KEY_DOCS = {
         "the first refit and held for the run. Refused only if no isolated group exists.",
         ("td_collision",)),
     "lorrax.collision_frozen_bands": (
-        "= every frozen band", "With `collision_screening = refreshed` or `shared_pole` and "
+        "= every frozen band", "With `collision_screening = refreshed` or `tangential` and "
         "`collision_refresh_sweep = active`: `[n_below, n_above]`, the frozen bands whose "
         "part is re-swept under W(t) — [b_lo − n_below, b_lo) and [b_hi, b_hi + n_above); "
         "the others keep their part at W0 (Σ^F[W(t)] ≈ Σ^F[W0] + Σ^F_kept[W(t)] − "

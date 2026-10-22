@@ -1,13 +1,13 @@
-# The shared-pole screened interaction: implementation
+# The tangential screened interaction: implementation
 
-This page is how `sigma_w_model = shared_pole` is computed each map: the
+This page is how `sigma_w_model = tangential` is computed each map: the
 response bank that samples $W_c$, the constructor that reduces the samples to
 one real-pole model per parent $q$, the store, the Σ consumer, the gate rows and
 the byte model. The model, its equations `(W n)` and why it is built this way
-are [the shared-pole theory page](../theory/shared-pole-w-model.md); deck keys
+are [the tangential theory page](../theory/tangential-w-model.md); deck keys
 are in the [input reference](../input_reference.md); rebuilding the model inside
 a QSGW loop and retaining its quadrature are
-[self-consistency](../self_consistency.md#shared-pole-w-with-retained-quadrature).
+[self-consistency](../self_consistency.md#tangential-w-with-retained-quadrature).
 
 Notation: `q` is a raw parent (one irreducible $q$; `−q` is its own parent when
 time reversal is broken); `n` is the packed centroid count
@@ -18,26 +18,26 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
 
 | stage | owner |
 |---|---|
-| deck surface (`sigma_w_model`, `sigma_w_accuracy`, `sigma_w_support_sites_ev`, `write_w`/`write_poles`) | `gw.gw_config._resolve_shared_pole_inputs` |
-| recipe, support ladders, gate tables, capacity ledger, receipt | `gw.shared_pole_recipe` |
-| per-map orchestration, bank residence | `gw.shared_pole_screening` |
+| deck surface (`sigma_w_model`, `sigma_w_accuracy`, `sigma_w_support_sites_ev`, `write_w`/`write_poles`) | `gw.gw_config._resolve_tangential_inputs` |
+| recipe, support ladders, gate tables, capacity ledger, receipt | `gw.tangential_recipe` |
+| per-map orchestration, bank residence | `gw.tangential_screening` |
 | §2 response bank (samples, moments, Coulomb roots) | `gw.response_bank`; rules `minimax.response_group_rules` |
-| §3 directions | `gw.shared_pole_directions` |
-| §4 pencils | `gw.shared_pole_pencil` |
-| §4 reduction, paired basis and cut | `gw.shared_pole_reduction` |
-| §4 dedupe and measured model checks | `gw.shared_pole_gates` |
-| constructor chain, route admission | `gw.shared_pole_constructor` |
-| §6 parent rounds | `gw.shared_pole_local` |
-| §6 whole-mesh (face) execution adapters | `gw.shared_pole_execution` |
-| photon CC/TT/CT sectors ([bispinor sectors](bispinor_shared_pole_w.md)) | `gw.shared_pole_sectors` |
-| §10 byte model | `gw.shared_pole_capacity` |
-| §7 store | `file_io.shared_pole_store` |
+| §3 directions | `gw.tangential_directions` |
+| §4 pencils | `gw.tangential_pencil` |
+| §4 reduction, paired basis and cut | `gw.tangential_reduction` |
+| §4 dedupe and measured model checks | `gw.tangential_gates` |
+| constructor chain, route admission | `gw.tangential_constructor` |
+| §6 parent rounds | `gw.tangential_local` |
+| §6 whole-mesh (face) execution adapters | `gw.tangential_execution` |
+| photon CC/TT/CT sectors ([bispinor sectors](bispinor_tangential_w.md)) | `gw.tangential_sectors` |
+| §10 byte model | `gw.tangential_capacity` |
+| §7 store | `file_io.tangential_store` |
 | §8 Σ consumer | `gw.mpa.sigma` |
-| §8 Γ head coupled to the current body | `gw.shared_pole_head` |
+| §8 Γ head coupled to the current body | `gw.tangential_head` |
 
 ## 1 One map
 
-1. **Recipe.** `resolve_shared_pole_recipe` reads the current census
+1. **Recipe.** `resolve_tangential_recipe` reads the current census
    (occupations, $\mu$, gap, active charge, cell volume) and places the supports
    (theory §5.1). It fixes `direction_cutoff`, `imaginary_width`
    $=\lceil n/4\rceil$, `infinity_width` $=\lceil n/8\rceil$,
@@ -61,7 +61,7 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
    constructor has committed. The shared scratch file `bank.h5` is used only
    for `write_w` (which re-reads the bank), a distributed `linalg`, and a
    per-rank store the disk or quota refuses at initialization
-   (`gw.shared_pole_screening`). A field created later (line panels, photon
+   (`gw.tangential_screening`). A field created later (line panels, photon
    contact fields) that the disk refuses is held in host memory, with one
    `RuntimeWarning` per bank (`ResidentBankPayload`); a scalar `bank.h5` is unlinked
    once the constructor has committed `model.h5` (kept for `write_w`; the
@@ -73,7 +73,7 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
 4. **Constructor** (§3–§6) → `model.h5`, one parent round at a time. An SC
    map keeps the model on the devices instead (`ResidentSectorModel`, the
    photon sectors' carrier) when the model at its stored column bound and one
-   copy fit half the device budget (`shared_pole_store.admit_resident_model`,
+   copy fit half the device budget (`tangential_store.admit_resident_model`,
    the sectors' rule); the head, Σ and, on the accepted final map, the
    `W0_qmunu` persist read it there, and the next map's entry or the end of
    the loop releases it. Reads are the file's bytes; Σ and W0 match the file
@@ -92,7 +92,7 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
    (recipe_hash included) and every model and constant it names is a file in
    that directory; sector models that were resident died with the run, so the
    map rebuilds, and the report names every removed file in one WARNING line;
-   a manifest of another identity refuses (`GATE shared_pole_output`).
+   a manifest of another identity refuses (`GATE tangential_output`).
 5. **Σ** (§8) synthesizes $W_c(\tau)$ from the factors.
 
 Every map rebuilds samples, directions, poles and ranks from the current
@@ -240,7 +240,7 @@ sample and parent span.
 
 ## 3 Directions
 
-`gw.shared_pole_directions` selects $Q_a$ per fitted support through
+`gw.tangential_directions` selects $Q_a$ per fitted support through
 `distrib_la` (theory §5.1): right singular vectors of the line sample above
 `direction_cutoff` (at most `line_direction_cap`, whole multiplets within
 $10^{-6}$), leading eigenvectors of $-\operatorname{Herm}W_c(iu)$ to
@@ -279,10 +279,10 @@ and agree to round-off.
 
 ## 4 Pencils and reduction
 
-`gw.shared_pole_pencil` assembles (W 18)–(W 19) for a TRS bank and
+`gw.tangential_pencil` assembles (W 18)–(W 19) for a TRS bank and
 (W 25)–(W 26) for an ordered bank, from `Q`, `O`, `D` and the moments only;
 blocks come out `P(None,'x','y')` on either route.
-`gw.shared_pole_reduction` applies
+`gw.tangential_reduction` applies
 (W 20): diagonal equilibration, keep cut `normalized_gram_keep` and the pole
 budget (the largest `pole_budget` directions, less an edge member tied to its
 neighbour below the cut within `multiplet_relative_tolerance` or the eigh's
@@ -293,13 +293,13 @@ infinity-norm bound, never from an on-device residual), and one Hermitian
 $v$-block with keep $10^{-7}$, a second relative cut on the restricted pencil,
 and the signed model (W 27); poles with $|\mu|\le$ keep$\cdot\max|\mu|$ are at
 infinity and their output weight is reported (`infinite_weight_ok`). Dedupe
-(W 29) is `gw.shared_pole_gates`.
+(W 29) is `gw.tangential_gates`.
 
 ## 5 Photon sectors
 
-`bispinor_gw = full_shared_pole` builds CC, TT and CT models from one photon
+`bispinor_gw = full_tangential` builds CC, TT and CT models from one photon
 bank. Their model, carrier, route, staged construction, store and Σ consumer
-are [shared-pole W for bispinor sectors](bispinor_shared_pole_w.md).
+are [tangential W for bispinor sectors](bispinor_tangential_w.md).
 
 ## 6 Execution
 
@@ -307,7 +307,7 @@ are [shared-pole W for bispinor sectors](bispinor_shared_pole_w.md).
 **Local parent rounds** — one whole parent per rank, batch layout
 `P(('x','y'), ...)` — whenever the complete selection stack and the
 conservative reduction pencil (`constructor_side_upper_bound`) fit the
-device, whatever `linalg` names: `gw.shared_pole_local.round_program` packs each parent's
+device, whatever `linalg` names: `gw.tangential_local.round_program` packs each parent's
 panels to the round extent (`round_tables`; ordered originals and mirrors as two
 halves of one extent), assembles and reduces its pencil with local dense kernels
 and sorts its poles; synthetic slots are skipped. Otherwise the **face route**
@@ -325,13 +325,13 @@ and a face model check beside its own whole-chain program, which is also its
 retry); the service runs a stack one or more whole matrices per rank when its
 shape price fits that room, else on the whole mesh
 ([eigh stacks](../services/distrib_la/api.md#eigh-stack)). The route is fixed
-before any read and the report line `Shared-pole constructor:` names it and
+before any read and the report line `Tangential constructor:` names it and
 its prices. A face program holds its eighs' first attempts; a failed check
 reruns that round's whole-chain program on the whole mesh
 (`distrib_la.checked_program`).
 
 **Sectors.** The bispinor sectors take their own route, decided once per map
-from the recipe shapes ([bispinor sectors §4–5](bispinor_shared_pole_w.md#sector-route)).
+from the recipe shapes ([bispinor sectors §4–5](bispinor_tangential_w.md#sector-route)).
 
 **Face products.** Every face GEMM of the constructor is `distrib_la.panel_matmul`
 on the square mesh, every parent of
@@ -357,7 +357,7 @@ path past that point (CrI3 24×24, $n = 3328$: the local pencil needs 64 GB per
 rank, so 40 GB cards take the face route at any $P$).
 
 **Infinity directions** come from the Hermitian part of the exact $M_1$
-(`shared_pole_directions.infinity_directions`), as the imaginary supports read
+(`tangential_directions.infinity_directions`), as the imaginary supports read
 $-\mathrm{Herm}\,W$: the Dyson chain forming $M_1$ from bare moments
 Hermitian to $4\times10^{-16}$ leaves an anti-Hermitian part up to
 $1.0\times10^{-12}$ of $\max|M_1|$ at $n = 3328$, at the checked eigh's
@@ -368,7 +368,7 @@ $10^{-12}$. The bare moments are checked where they are produced
 
 `model.h5` (`lorrax.shared-real-pole.v1`) and `bank.h5`
 (`lorrax.shared-real-pole-bank.v3`) share one authenticated header
-(`file_io.shared_pole_store`); bulk payloads cross SlabIO only.
+(`file_io.tangential_store`); bulk payloads cross SlabIO only.
 
 | field | meaning |
 |---|---|
@@ -384,14 +384,14 @@ $10^{-12}$. The bare moments are checked where they are produced
 A bank of a retired schema (v1, v2: dense line samples) is refused by name, and
 constructor resume then rebuilds it. `write_poles = true` exports $(b,\Lambda)$.
 A run with `write_restart_tensors = true` persists `W0_qmunu` $=V+W_c(0)$
-for BSE: `gw.mpa.sigma.shared_pole_static_wc` runs the §8 synthesis with the
+for BSE: `gw.mpa.sigma.tangential_static_wc` runs the §8 synthesis with the
 $\omega=0$ coefficient $-1/(2\Lambda)$ and adds the hole branch
 $W_+(-q,0)^{\mathsf T}$ (ordered) or $W_+$ (TRS), i.e. $-b\Lambda^{-1}b^\dagger$
 on a TRS store. A one-shot stores the resolver's $\omega=0$ head; a
 self-consistent run evaluates the accepted final map's model once, after the
 loop, from the devices (step 4) or that map's retained scratch generation, and
 stores the map's iteration head at $\omega=0$. The four-current route stores
-its CC sector's $V+W_{c,CC}(0)$ ([bispinor sectors §6](bispinor_shared_pole_w.md#sector-store)).
+its CC sector's $V+W_{c,CC}(0)$ ([bispinor sectors §6](bispinor_tangential_w.md#sector-store)).
 Both evaluators run at
 the q parents of the run's V wedge, and the restart stores those parents with
 their unfold tables: no full-q W is formed for the file, and BSE unfolds on
@@ -410,7 +410,7 @@ debug output.
 ## 8 The Σ consumer
 
 Σ contracts $G$ with $W(\tau)$ synthesized from the factors inside the Σ
-window executable (`gw.mpa.sigma._shared_pole_w_synthesis`, bound to the τ body
+window executable (`gw.mpa.sigma._tangential_w_synthesis`, bound to the τ body
 by `gw.mpa.sigma.SynthesisTau`, the same pair the photon sectors use):
 
 $$ W_{c,+}(q,\tau) = b\,\mathrm{diag}\big(d_j(\tau)\big)\,b^{\dagger}, \qquad
@@ -421,7 +421,7 @@ then the little-group realization and the fixed-q projection, all on the
 parent rows. The result is the parent pair $(W_p, W_p^{\mathsf T})$,
 $[n_{q,\rm irr},\mu,\mu]$; no full-q $W$ is formed (TASTE 97). The Σ kconv call
 unfolds the pair on its transform's load through the store's q-wedge tables
-(`_shared_pole_q_wedge`, pair-transpose rule, mathdx mode 9), as the GN-PPM
+(`_tangential_q_wedge`, pair-transpose rule, mathdx mode 9), as the GN-PPM
 wedge does, one row pass of whole centroid orbits at a time: the pass's rows of
 the pair enter mode 9 with the load tables cut to the pass on the device
 (`subtile_stream.window_load`), and the pass's parent Green comes from
@@ -431,12 +431,12 @@ Mode 7 reads the Green's unfold tables placed once per run
 and cut to the pass the same way, so no window program holds table
 constants. The passes are equal windows run as one `lax.scan`
 ([memory model](memory-model.md#the-green-side-stages)). An endpoint map
-that crosses a mesh shard refuses (`GATE shared_pole_w_parent_local`). The factors are read once per Σ call and stay resident:
+that crosses a mesh shard refuses (`GATE tangential_w_parent_local`). The factors are read once per Σ call and stay resident:
 $32\,n_{q,\rm irr}\,\mu\,\bar K/P$ bytes per rank face-sharded,
 `P(None,'x',None,'y')`, or $16\,n_{q,\rm irr}\,\mu\,\bar K(1/P_x+1/P_y)$ when the
 panel search admits the replicated pole columns ($\bar K$ the store's pole
 carrier). Where those do not fit, on a `linalg = local` deck whose whole parents fit per rank
-(`shared_pole_execution.whole_parent_execution`, the bank's rule), one copy is
+(`tangential_execution.whole_parent_execution`, the bank's rule), one copy is
 held instead, whole parents per rank in `distrib_la`'s batch layout
 ($16\lceil n_{q,\rm irr}/P\rceil\mu\bar K$ bytes): each rank contracts its own
 parents over their live pole columns and only $W(\tau)$ moves, batch to face
@@ -449,7 +449,7 @@ width a device loop, one of each when everything fits. A store whose resident
 factors do not fit runs at one parent and one column multiple, with one
 `memory over budget` warning line. The synthesized $W$ always uses both mesh axes.
 The photon sectors synthesize through the same owner and placement rule
-([bispinor sectors §7](bispinor_shared_pole_w.md#sector-sigma)).
+([bispinor sectors §7](bispinor_tangential_w.md#sector-sigma)).
 
 **Two τ nodes per loop trip.** On GPU the scalar Σ τ window evaluates two τ
 nodes per trip of its device loop, so one node's W(τ) synthesis and
@@ -488,7 +488,7 @@ $W_p^{\mathsf T}$. Both local forms equal the exchanged transposes bit for bit
 off-diagonal ranks move their tiles while the diagonal ranks copy theirs and
 wait; that cost 26 % of a P16 node. The static $W(0)$ restart member
 unfolds the parent pair only at V's q parents and at their $-q$ rows
-(`_shared_pole_at_rows`); no full-q W is formed.
+(`_tangential_at_rows`); no full-q W is formed.
 
 **Two-component decks.** $W$ is spin-scalar; $G$ carries the spinor axes and the
 τ kernel broadcasts $W_q$ over both (`ppm_tau_kernel` `prep_w`).
@@ -499,7 +499,7 @@ consumer splits the Green band sum into the three brackets of
 executable and applies the pooled fit. The sector consumer brackets the CC
 class only ([four-current Σ](../theory/band-extrapolation.md#four-current)).
 
-**Γ head** (`gw.shared_pole_head`). `head_correction = full` evaluates the
+**Γ head** (`gw.tangential_head`). `head_correction = full` evaluates the
 current body at Γ one frequency at a time, folds the common head wings
 through total $W$ and fits the scalar head with the MPA head owner; its
 vertices trace the spinor index and its capacity is $2/(n_{\rm spin}n_{\rm spinor})$
@@ -538,7 +538,7 @@ four-component charge store has its own `representation` row
 ## 10 Byte model
 
 Per rank, for parent batch $b$, sample batch $a$, pencil side $R$
-(`shared_pole_capacity.shared_pole_byte_terms`; `ConstructorCapacity` turns the
+(`tangential_capacity.tangential_byte_terms`; `ConstructorCapacity` turns the
 terms into ledger rows):
 
 $$
@@ -565,7 +565,7 @@ concurrent stages exceeds the device budget (`memory.per_device_gb`) less the
 runtime reserve, the row is recorded FAIL, one warning line is printed, and
 the stage is admitted and runs (owner 2026-10-01: no refusal on a price).
 
-**Bank payload** (`shared_pole_bank_payload_bytes`, the residence admission):
+**Bank payload** (`tangential_bank_payload_bytes`, the residence admission):
 
 $$
 B=\frac{16\,N_q}{P}\Big[(2N_{\rm dense}+N_m)\,d^2

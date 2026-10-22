@@ -54,7 +54,7 @@ _MODE_METHOD = {
     "cohsex": ("COHSEX", "static COHSEX: screened exchange plus Coulomb hole at omega = 0"),
     "gn_ppm": ("GN-PPM", "Godby-Needs plasmon-pole GW, one pole per element"),
     "hl_ppm": ("HL-PPM", "Hybertsen-Louie plasmon-pole GW"),
-    "mpa": ("MPA", "full-frequency GW, shared-pole (multipole) model of W"),
+    "mpa": ("MPA", "full-frequency GW, tangential (multipole) model of W"),
 }
 _DIM_EFFECT = {
     3: "3D bulk: no Coulomb truncation",
@@ -136,7 +136,7 @@ def method_rows(config) -> list[tuple[str, str]]:
             "gn_ppm": f"; W at z = 0 and z = i {omega_p:.2f} eV for GN-PPM",
             "hl_ppm": f"; W at z = 0 and z = {omega_p:.2f} eV for HL-PPM",
             "cohsex": "; W at z = 0",
-            "mpa": "; W on the shared-pole frequency samples",
+            "mpa": "; W on the tangential frequency samples",
         }.get(mode, "")
         rows.append(("screening", screening))
     head = config.head.correction.value
@@ -1369,7 +1369,7 @@ class GWProductionReport(ProductionReport):
             isdf_total - zeta - zeta_transverse - v_q - restart_load).floor()
 
         screening_total = top_level("gw_jax.screening")
-        # A shared-pole bank may call chi/W owners internally. Its inclusive
+        # A tangential bank may call chi/W owners internally. Its inclusive
         # band already owns those seconds; do not print them a second time.
         chi0 = outer_prefixed("chi.", within="gw_jax.screening", excluding=("spole.",))
         w_screen = outer_prefixed("W.", within="gw_jax.screening", excluding=("spole.",))

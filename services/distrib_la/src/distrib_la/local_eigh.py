@@ -29,7 +29,7 @@ the solve (``H`` is unitary to eps).  Jacobi (``syevj``) is also exact on these
 inputs but 5-28x slower than ``zheevd`` for single matrices of n = 128..4096,
 so it is not the route.  Evidence: lead probes 2026-10-15 (pool logs
 lead_eigh_probe, lead_eigh_probe2, lead_eigh_time, lead_eigh_probe3); the
-failure made hsuite sp_export refuse with GATE shared_pole_gram_valid (NaN out
+failure made hsuite sp_export refuse with GATE tangential_gram_valid (NaN out
 of ``response_bank._coulomb_roots``).
 
 BATCHED STACKS: :data:`BATCHED_EIGH_ROUTE`.  jaxlib's ROCm eigh (``hipsolver_syevd_ffi``)
@@ -66,7 +66,7 @@ eigensolver's rounding at ``isdf.cplus.factor``'s c128[4, 96, 96] charge C_q sta
 decoupled rows on one constant diagonal, a 40-fold eigenvalue inside the spectrum).  C+ differs
 between the routes by <= 1.9e-8 relative, as each route does from host LAPACK, and the stage
 gives: jaxlib's loop, a 0.110 eV tolerance miss; the batched driver, GATE
-shared_pole_zero_ritz (its ``infinite_weight_ok``, a 1e-6 bound on near-null Ritz weight);
+tangential_zero_ritz (its ``infinite_weight_ok``, a 1e-6 bound on near-null Ritz weight);
 jaxlib's loop on a second unitary reflection of the same matrix, PASS.  The stacks are gate
 cases (``tests/data/rocsolver_eigh_na_sc_stacks.npz``).
 """
@@ -129,7 +129,7 @@ class BatchedEighRow(NamedTuple):
 BATCHED_EIGH_ROUTE = {"ROCM": BatchedEighRow("lorrax_rocsolver_batched_eigh", {
     # min_n = 128, not 40: a STOPGAP for hsuite na_sc's isdf.cplus.factor c128[4, 96, 96] stack.
     # That stage's outcome follows the eigensolver's rounding (VALID, NOT IDENTICAL above): with
-    # the batched driver it refuses by GATE shared_pole_zero_ritz (or, on the exact input, gets
+    # the batched driver it refuses by GATE tangential_zero_ritz (or, on the exact input, gets
     # rocSOLVER's silent NaN), with jaxlib's loop it misses tolerance by 0.110 eV, with the loop
     # on a second reflection it passes.  Lift this when that stage no longer depends on the
     # solver's rounding.

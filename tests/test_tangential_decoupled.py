@@ -46,8 +46,8 @@ def _orthonormal(rng, n, w):
 
 def _pencil(mesh, seed=0, n=24, k=24, width=4, iw=2, q=4):
     """States, infinity panels and tables of ``q`` parents in the ordered paired layout."""
-    from gw.shared_pole_directions import port_extent
-    from gw.shared_pole_local import round_tables
+    from gw.tangential_directions import port_extent
+    from gw.tangential_local import round_tables
     rng = np.random.default_rng(seed)
     extent = port_extent(mesh)
     nodes = [0.7j, 1.9j]
@@ -89,12 +89,12 @@ def test_face_routes_match_the_local_round(monkeypatch):
     scalar route's face round (one program, ``face_reduce_round``, pencil columns in the face's
     tile-interleaved order) against the local round on the synthetic pencil."""
     mesh = _mesh()
-    import gw.shared_pole_execution as ex
-    from gw.shared_pole_directions import port_extent
-    from gw.shared_pole_execution import face_reduce_decoupled, face_ritz_carrier
-    from gw.shared_pole_local import BATCH, reduce_round
-    from gw.shared_pole_capacity import _local_eigenplan
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
+    import gw.tangential_execution as ex
+    from gw.tangential_directions import port_extent
+    from gw.tangential_execution import face_reduce_decoupled, face_ritz_carrier
+    from gw.tangential_local import BATCH, reduce_round
+    from gw.tangential_capacity import _local_eigenplan
+    from gw.tangential_recipe import shared_real_pole_gates_ordered_v1
     extent = port_extent(mesh)
     states, infinity, tables, models = _pencil(mesh)
     q = len(models)
@@ -131,7 +131,7 @@ def test_face_routes_match_the_local_round(monkeypatch):
             assert np.allclose(lb[p] @ np.conj(lb[p].T), db[p] @ np.conj(db[p].T), rtol=1e-7, atol=1e-9), (sub, p)
         # The face span's rows are in the face's tile-interleaved pencil order: position k of
         # the face holds row standard[k] of the whole-matrix order.
-        from gw.shared_pole_pencil import join_vectors, split_vectors
+        from gw.tangential_pencil import join_vectors, split_vectors
         f = int(tables["order"].shape[-1])
         standard = join_vectors(split_vectors(np.arange(side)[None], (f // 2, f // 2, (side - f) // 2, (side - f) // 2), 1),
                                 int(mesh.shape["y"]))[0]

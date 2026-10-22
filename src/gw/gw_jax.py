@@ -102,8 +102,8 @@ from .gw_config import (
 	packed_bare_transverse_route,
 	packed_photon_replaces_charge_sigma, packed_photon_screens_current,
 	refuse_unimplemented_compute_mode, uses_dynamic_packed_photon_route,
-	folds_scalar_head, uses_direct_bispinor_shared_pole_head,
-	uses_full_bispinor_shared_pole, uses_bare_transverse_shared_pole,
+	folds_scalar_head, uses_direct_bispinor_tangential_head,
+	uses_full_bispinor_tangential, uses_bare_transverse_tangential,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response,
 	infer_material_class, resolve_mpa_sampling_alpha,
 	validate_material_inputs)
@@ -302,7 +302,7 @@ def _open_production_report(args):
 
 def _report_head_and_photon_policy(config, report):
     """Report the resolved head and photon policies."""
-    direct_photon = uses_direct_bispinor_shared_pole_head(config)
+    direct_photon = uses_direct_bispinor_tangential_head(config)
     log.info(
         f"  Head policy: head_correction={config.head.correction.value}; "
         f"screening_diagrams={config.screening.diagrams.value}; "
@@ -329,13 +329,13 @@ def _report_head_and_photon_policy(config, report):
             f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}"
             f"{_bispinor_note}")
         _bare_taken, _bare_reason = packed_bare_transverse_route(config)
-        if uses_full_bispinor_shared_pole(config):
+        if uses_full_bispinor_tangential(config):
             report.progress(
-                "Photon route   : FULL shared-pole CC/CT/TC/TT screening "
+                "Photon route   : FULL tangential CC/CT/TC/TT screening "
                 "and sector Sigma; four-current Dyson at each bank frequency")
-        elif uses_bare_transverse_shared_pole(config):
+        elif uses_bare_transverse_tangential(config):
             report.progress(
-                "Photon route   : four-spinor CC full-frequency shared-pole "
+                "Photon route   : four-spinor CC full-frequency tangential "
                 "screening plus bare TT exchange; no CT/TT Dyson solve "
                 "[theory: docs/theory/bispinor-gw.md#bare-transverse]")
         elif config.bispinor_gw.value == "full_static_cohsex":
@@ -404,12 +404,12 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
                 f"kmeans (orbit-closed), or use screening_diagrams = w_rpa; doc: "
                 f"docs/architecture/symmetry_register.md §7.")
     # Before any basis, bank or constructor: the w_bse ladder and HL-PPM
-    # refuse an ordered store, and full_shared_pole a store with time
+    # refuse an ordered store, and full_tangential a store with time
     # reversal, here, on the final symmetry verdict.
-    from .screening import refuse_full_shared_pole_with_trs, refuse_w_bse_without_trs
+    from .screening import refuse_full_tangential_with_trs, refuse_w_bse_without_trs
     from .ppm_pipeline import refuse_hl_ppm_without_trs
     refuse_w_bse_without_trs(config, sym)
-    refuse_full_shared_pole_with_trs(config, sym)
+    refuse_full_tangential_with_trs(config, sym)
     refuse_hl_ppm_without_trs(config, sym)
     centroid_indices = centroid_basis.centroid_indices
     n_rmu = centroid_basis.n_rmu
@@ -472,7 +472,7 @@ def _prepare_isdf_carriers(
         mode, print0, qp_solver, sym, tensors_filename, tmp_dir, wfn, enk_dft, *,
         centroid_basis=None):
     """Produce the fitted ISDF operators and wavefunction views."""
-    from .shared_pole_screening import compile_w_model_ahead
+    from .tangential_screening import compile_w_model_ahead
     compile_w_model_ahead(config, meta, sym, mesh_xy)
     with _manual_stage(1, _stage_count(qp_solver), "ISDF basis and Coulomb metric",
                        name="gw_jax.isdf") as _stage:
@@ -524,26 +524,26 @@ def _prepare_isdf_carriers(
             f"mu={oneshot_occupation_state.mu_ry * RYD_TO_EV:.8f} eV, "
             f"width={oneshot_occupation_state.smearing_width_ry:.10f} Ry, "
             f"occ_hash={oneshot_occupation_state.occ_hash}")
-    if config.sigma.w_model == "shared_pole" and qp_solver is not QPSolver.SELF_CONSISTENT:
-        from .shared_pole_recipe import (SUPPORT_READ_PAD_EV, bind_shared_pole_census,
-                                         resolve_shared_pole_recipe)
+    if config.sigma.w_model == "tangential" and qp_solver is not QPSolver.SELF_CONSISTENT:
+        from .tangential_recipe import (SUPPORT_READ_PAD_EV, bind_tangential_census,
+                                         resolve_tangential_recipe)
         from centroid.sampling_metric import full_k_quadrature_weights
         census_inputs = dict(trs_allowed=sym.trs_allowed,
                              state_capacity=wfn.occupation_state_capacity,
                              kweights=full_k_quadrature_weights(wfn, wfn.symmetry()))
-        bind_shared_pole_census(
+        bind_tangential_census(
             wfns, meta, occupation_state=oneshot_occupation_state, **census_inputs)
         from .qp_support import requested_reads_ev
         energy, states, frame_mu_ev = _oneshot_requested(
             config, enk_dft, wfn, oneshot_occupation_state, material_class)
         support_reads_ev = frame_mu_ev + requested_reads_ev(
             energy, states, config.sigma.omega_step_ev, pad_ev=SUPPORT_READ_PAD_EV)
-        meta.shared_pole_recipe = resolve_shared_pole_recipe(
+        meta.tangential_recipe = resolve_tangential_recipe(
             config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0,
             support_reads_ev=support_reads_ev)
         from .ppm_pipeline import observing_window_source, publish_window_source
         if observing_window_source():
-            # TD-aGW's shared-pole refit re-resolves this recipe at its own census
+            # TD-aGW's tangential refit re-resolves this recipe at its own census
             # (tdagw.dynsig.spm_screening); one empty list test otherwise.
             publish_window_source(recipe_inputs=dict(
                 census_inputs, support_reads_ev=np.array(support_reads_ev, np.float64)))
@@ -608,10 +608,10 @@ def _prepare_oneshot_response(
         from .qsgw_head import build_dft_head_response, head_quadrature_omegas
         if mode.value == "mpa":
             from .mpa import sample_plan
-            if config.sigma.w_model == "shared_pole":
-                from .shared_pole_head import shared_pole_head_plan
-                oneshot_mpa_plan = shared_pole_head_plan(
-                    config, meta.shared_pole_recipe, material_class=material_class)
+            if config.sigma.w_model == "tangential":
+                from .tangential_head import tangential_head_plan
+                oneshot_mpa_plan = tangential_head_plan(
+                    config, meta.tangential_recipe, material_class=material_class)
             else:
                 from .mpa.model import make_mpa_plan
                 oneshot_mpa_plan = make_mpa_plan(
@@ -922,7 +922,7 @@ def _oneshot_requested(config, enk_dft, wfn, occupation_state, material_class):
     """
     from .efermi import sigma_frame_mu_ev
     from .qp_support import requested_states
-    from .shared_pole_recipe import active_band_mask
+    from .tangential_recipe import active_band_mask
     e_ry = np.asarray(enk_dft, dtype=np.float64)
     metal = material_class == "metal" and occupation_state is not None
     mu_ev = sigma_frame_mu_ev(

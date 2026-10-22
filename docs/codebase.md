@@ -123,30 +123,30 @@ else.
 | `qsgw_head.py` | Builds finite-link velocity and head data for QSGW. |
 | `qsgw_utils.py` | The QSGW Σ_xc build, the one-shot `solve_qp` seam (Σ_xc + V_H, no QP root) and matrix I/O helpers. |
 | `quadrature_log.py` | Records the quadrature rules a run used, for the production report. |
-| `response_bank.py` | Response-bank algebra for the shared-pole construction. |
+| `response_bank.py` | Response-bank algebra for the tangential construction. |
 | `restart_q_storage.py` | Stores the producer's q parents and the record that authenticates their unfold. |
 | `sc_iteration.py` | Runs one self-consistent iteration map. |
 | `sc_state_identity.py` | Map-0 QP identities from multiplet-projector overlaps. |
 | `scissor.py` | Applies and reports scissor corrections. |
 | `screening.py` | Plans and executes screening calculations. |
 | `screening_bse.py` | The GW-side stage of `screening_diagrams = w_bse` / `w_rpa_resolvent`. |
-| `shared_pole_capacity.py` | Device-byte accounting for one shared-pole construction. |
-| `shared_pole_constructor.py` | Constructs the physical shared real-pole W (tangential Hermite/Ritz). |
-| `shared_pole_directions.py` | Selects directions and builds the per-parent state panels. |
-| `shared_pole_execution.py` | Runs shared-pole equations on the full x/y mesh. |
-| `shared_pole_gates.py` | Measured gates and diagnostics of a constructed shared-pole model. |
-| `shared_pole_head.py` | Evaluates current Gamma shared-pole W and routes its scalar head through the common head and MPA owners. |
-| `shared_pole_local.py` | Runs shared-pole parent rounds, one parent per rank. |
-| `shared_pole_pencil.py` | Builds resolvent-identity pencil columns for the shared-pole construction. |
-| `shared_pole_recipe.py` | Shared real-pole input recipe and gate table. |
-| `shared_pole_reduction.py` | Ritz reduction of the shared-pole pencils. |
-| `shared_pole_screening.py` | Deck-driven shared real-pole screening stage. |
-| `shared_pole_sectors.py` | Charge/current cross pencils on parent-local stacks. |
+| `tangential_capacity.py` | Device-byte accounting for one tangential construction. |
+| `tangential_constructor.py` | Constructs the physical shared real-pole W (tangential Hermite/Ritz). |
+| `tangential_directions.py` | Selects directions and builds the per-parent state panels. |
+| `tangential_execution.py` | Runs tangential equations on the full x/y mesh. |
+| `tangential_gates.py` | Measured gates and diagnostics of a constructed tangential model. |
+| `tangential_head.py` | Evaluates current Gamma tangential W and routes its scalar head through the common head and MPA owners. |
+| `tangential_local.py` | Runs tangential parent rounds, one parent per rank. |
+| `tangential_pencil.py` | Builds resolvent-identity pencil columns for the tangential construction. |
+| `tangential_recipe.py` | Shared real-pole input recipe and gate table. |
+| `tangential_reduction.py` | Ritz reduction of the tangential pencils. |
+| `tangential_screening.py` | Deck-driven shared real-pole screening stage. |
+| `tangential_sectors.py` | Charge/current cross pencils on parent-local stacks. |
 | `sigma_box_plan.py` | Denominator-box quadrature plan for dynamic Σ(ω). |
 | `sigma_dispatch.py` | Dispatches one self-energy call per resolved compute mode. |
 | `sigma_x_bispinor.py` | Implements bare-current exchange routes for spinor inputs. |
 | `static_gauge_response.py` | Builds packed static-gauge response inputs. |
-| `static_screening.py` | Static W(0) and its q→0 head: an RPA Dyson solve for a BSE restart without W0, or the retained shared-pole model at ω = 0 for the W0 persist. |
+| `static_screening.py` | Static W(0) and its q→0 head: an RPA Dyson solve for a BSE restart without W0, or the retained tangential model at ω = 0 for the W0 persist. |
 | `subtile_stream.py` | A node rule evaluated sub-tile by sub-tile: the loop of the direct χ₀ stream and of Σ τ, with orbit-cut row passes. |
 | `v_q_bispinor.py` | Builds the packed bare-current interaction operator. |
 | `v_q_g_flat.py` | Builds Coulomb matrices from flattened reciprocal-space data. |
@@ -242,8 +242,8 @@ else.
 | `qp_wfn.py` | Reads and writes quasiparticle wavefunction data. |
 | `read_bgw_vcoul.py` | Compatibility shim over the `vcoul` service's parser of BerkeleyGW's `vcoul` file. |
 | `restart_bundle.py` | Reads the GW restart bundle. |
-| `shared_pole_store.py` | Shared real-pole model and construction-scratch I/O. |
-| `sigma_checkpoint.py` | The sweep-checkpoint schema, written by a one-shot shared-pole sweep: on shell `tmp/sigma_checkpoint_oneshot_on_shell.h5` (pair and slots), under `sigma_omega_grid_debug = true` `tmp/sigma_checkpoint_oneshot.h5` (cubes); and the SC loop's `sc_seed/sc_checkpoint.h5`. |
+| `tangential_store.py` | Shared real-pole model and construction-scratch I/O. |
+| `sigma_checkpoint.py` | The sweep-checkpoint schema, written by a one-shot tangential sweep: on shell `tmp/sigma_checkpoint_oneshot_on_shell.h5` (pair and slots), under `sigma_omega_grid_debug = true` `tmp/sigma_checkpoint_oneshot.h5` (cubes); and the SC loop's `sc_seed/sc_checkpoint.h5`. |
 | `sigma_output.py` | Writes self-energy and quasiparticle outputs. |
 | `slab_io.py` | Exposes sharded slab reads and writes. |
 | `static_gauge_head.py` | Reads and writes static-gauge head data. |

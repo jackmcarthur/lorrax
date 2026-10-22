@@ -182,7 +182,7 @@ the edge kept ``S(N₃)``, and in SC one state at the edge flipped by
 says so.
 
 MEASURED.  BANDEX (``sandbox:runs/Si_scalar/42_bandex_20260927``), Si 4³
-25 Ry scalar, shared-pole W, truth S(536) with the complete basis, 71
+25 Ry scalar, tangential W, truth S(536) with the complete basis, 71
 degeneracy-closed states within ±10 eV of midgap, G truncated at N and W
 built at 536 (case a) or at N (case c); std over the states / max 4v4c /
 median 4v4c direct, meV.  This function reproduces the study's scores to

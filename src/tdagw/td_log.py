@@ -570,10 +570,10 @@ class TdReport(ScientificProductionReport):
         if not scr:
             return ""
         mean = lambda key: sum(h.get(key, 0.0) for h in refs) / len(refs)
-        if scr[0].get("member") == "shared_pole":
+        if scr[0].get("member") == "tangential":
             avg = lambda f: sum(f(c) for c in scr) / len(scr)
             low = [c["census"]["frac_residue_below"]["1"] for c in scr if c.get("census")]
-            return (f"; shared-pole refits: {avg(lambda c: c['refit_s']):.3g} s per refresh (bank "
+            return (f"; tangential refits: {avg(lambda c: c['refit_s']):.3g} s per refresh (bank "
                     f"{avg(lambda c: c['walls']['bank']):.3g}, moments "
                     f"{avg(lambda c: c['walls']['moments']):.3g}, constructor "
                     f"{avg(lambda c: c['walls']['constructor']):.3g})"

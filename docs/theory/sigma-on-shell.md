@@ -1,6 +1,6 @@
 # On-shell Σ_c
 
-A dynamic Σ_c (GN/HL-PPM, MPA, shared-pole, the four-current sectors) is
+A dynamic Σ_c (GN/HL-PPM, MPA, tangential, the four-current sectors) is
 integrated from its time-domain nodes σ(τ) by the minimax window quadrature
 ([Σ(ω) quadrature problem](sigma-quadrature-problem.md)). Every consumer of
 the result reads it at the energies of the states it belongs to: the QSGW
@@ -137,7 +137,7 @@ the cube instead of reading a table. It writes:
 - Under SC: the QSGW pair interpolated from the cube, Z from the stencil,
   the cube rotated to the DFT basis at the end so `sigma_diag.dat` carries
   `sigC`/`sigXC` at E_DFT, and the edge census read on the cube.
-- A one-shot shared-pole sweep checkpoint (`tmp/sigma_checkpoint_oneshot.h5`,
+- A one-shot tangential sweep checkpoint (`tmp/sigma_checkpoint_oneshot.h5`,
   `file_io.sigma_checkpoint`), written when the sweep took at least 5× its
   predicted write.
 

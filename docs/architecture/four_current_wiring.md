@@ -15,7 +15,7 @@ is the q-IBZ count, $N_k$ the full k count, and $P$ the process count.
 
 ## Routes and predicates
 
-`bispinor_gw ∈ {bare_transverse, full_static_cohsex, full_shared_pole}`
+`bispinor_gw ∈ {bare_transverse, full_static_cohsex, full_tangential}`
 (`gw_config.BispinorGWMode`). The value selects which Lorentz blocks are
 screened and who contracts Σ; every value resolves to the same normalized
 RKB carrier. The retired spellings `charge_hall_cubature`,
@@ -29,8 +29,8 @@ refusal names its replacement.
 | **P-screened** | `packed_photon_screens_current` (`full_static_cohsex`) | all sixteen built; one packed Dyson solve | `gw.photon_sigma`, TT part of the packed Σ |
 | **P-bare** | `packed_bare_transverse_route(config)[0]` | zero by declaration; CC from the scalar owner, $W={\rm diag}(W_{00},D_{TT})$ | `gw.photon_sigma` |
 | **B** (incumbent) | `bare_transverse`, none of the others | none; bare TT tiles contracted directly | `gw.sigma_x_bispinor` |
-| **SP-hybrid** | `uses_bare_transverse_shared_pole` | none; CC is a shared-pole bank | `gw.sigma_x_bispinor` |
-| **SP-full** | `uses_full_bispinor_shared_pole` | ordered CC/CT/TC/TT sector bank | `gw.sigma_x_bispinor` for bare exchange; the dynamic sectors by the [sector Σ consumer](bispinor_shared_pole_w.md#sector-sigma) |
+| **SP-hybrid** | `uses_bare_transverse_tangential` | none; CC is a tangential bank | `gw.sigma_x_bispinor` |
+| **SP-full** | `uses_full_bispinor_tangential` | ordered CC/CT/TC/TT sector bank | `gw.sigma_x_bispinor` for bare exchange; the dynamic sectors by the [sector Σ consumer](bispinor_tangential_w.md#sector-sigma) |
 
 "P" rows below apply to both packed modes. `uses_static_photon_response`
 is true on P-screened and P-bare.
@@ -76,7 +76,7 @@ Further predicates:
 |---|---|
 | `uses_coupled_photon_head` | packed and `head_correction = full`: run the Γ completion and keep the four literal-Γ vectors |
 | `uses_bare_tt_gamma_head` | insert the bare TT overlay into $V$: SP-hybrid unless `off`; B with GN/HL or `x_only` under `full`, `sys_dim ∈ {2,3}` |
-| `uses_direct_bispinor_shared_pole_head` | SP-full with `head_correction = full` (its direct sector head) |
+| `uses_direct_bispinor_tangential_head` | SP-full with `head_correction = full` (its direct sector head) |
 | `folds_scalar_head` | `head_correction = full` on every route but SP-full: the scalar charge head folded once through W(Γ) |
 
 ## The map
@@ -103,7 +103,7 @@ flowchart TD
     SW["scalar CC W and HeadResolver"]
     PK["packed V, chi0, W (P)"]
     HD["Γ completion (P, head full)"]
-    SP["shared-pole banks (SP)"]
+    SP["tangential banks (SP)"]
   end
   subgraph SIG["self-energy"]
     PS["photon_sigma (P)"]
@@ -149,7 +149,7 @@ flowchart TD
 
 `bispinor_tt_head_correction` is a removed deck key. `read_lorrax_input`
 refuses it at any value. The TT overlay is decided by
-`uses_bare_tt_gamma_head` and the direct shared-pole head alone.
+`uses_bare_tt_gamma_head` and the direct tangential head alone.
 
 **The carrier resolver.**
 `common.four_current_model.resolve_four_current_representation(bispinor, model)`
@@ -313,7 +313,7 @@ constructs `StaticHeadTerms` for the band-diagonal shifts. Only static
 packed COHSEX skips this: its sixteen-block operator replaces the charge Σ,
 and the completion owns the charge head.
 
-### 3d. Shared-pole routes
+### 3d. Tangential routes
 
 SP-hybrid builds the full-frequency CC bank on the four-spinor charge
 carrier. SP-full builds the ordered CC/CT/TC/TT sector bank, and under
@@ -321,7 +321,7 @@ carrier. SP-full builds the ordered CC/CT/TC/TT sector bank, and under
 (`gw.photon_direct_head.build_direct_photon_head`; physics in
 [theory §5](../theory/four-current-head-corrections.md#direct-bulk-head)).
 Bank construction, sector reduction, storage and byte models are owned by
-[shared-pole W for bispinor sectors](bispinor_shared_pole_w.md).
+[tangential W for bispinor sectors](bispinor_tangential_w.md).
 
 ## Stage 4: self-energy
 
@@ -420,11 +420,11 @@ driver entry.
 |---|---|---|
 | `bispinor_gw_*_retired` (three) | `coerce_bispinor_gw_mode` | a retired mode spelling; names the replacement |
 | (deck key) `bispinor_tt_head_correction` | `read_lorrax_input` | the removed key appears at any value |
-| `full_shared_pole_trs` | `screening.refuse_full_shared_pole_with_trs` (driver entry, on the measured symmetry) | `full_shared_pole` on a WFN with time reversal; use `bare_transverse` |
+| `full_tangential_trs` | `screening.refuse_full_tangential_with_trs` (driver entry, on the measured symmetry) | `full_tangential` on a WFN with time reversal; use `bare_transverse` |
 | `bispinor_self_consistency_requires_live_four_current` | `refuse_unsupported_bispinor_gw` | bispinor QSGW with `density_self_consistent = false` |
 | `bare_tt_gamma_restart_unstamped` | same | `restart = true` where the bare TT overlay is on (`x_only`, B with GN/HL): restart $V$ does not stamp it |
 | `restart_bispinor_charge_carrier` | `gw_init._restart_charge_basis` | `restart = true` on a bundle whose `charge_representation` stamp is not `normalized_rkb_four_current_v1` (every bispinor bundle written before this name, including the 2026-10-05 `isometric_kinetic_balance_four_current_v1` bundles) |
-| `full_shared_pole_envelope` | same | `full_shared_pole` without bispinor, MPA, `sigma_w_model = shared_pole` and `w_rpa` |
+| `full_tangential_envelope` | same | `full_tangential` without bispinor, MPA, `sigma_w_model = tangential` and `w_rpa` |
 | `bispinor_gw_requires_bispinor` | same | `full_static_cohsex` with `bispinor = false` |
 | `static_bispinor_photon_head_slab_only` | same | P-screened with `head_correction = full` and `sys_dim ≠ 2` |
 | `static_bispinor_photon_envelope` | same, over `packed_static_envelope` | any envelope row fails for `full_static_cohsex` |

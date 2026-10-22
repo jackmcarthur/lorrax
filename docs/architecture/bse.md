@@ -81,18 +81,18 @@ store it (`gw.screening.driver_persists_w0`, `restart_static_w`):
 | GW run | `W0_qmunu` |
 |---|---|
 | `cohsex`, `gn_ppm`, `hl_ppm` with `screening_diagrams = w_rpa` | the Dyson W(0) |
-| `mpa` with `sigma_w_model = shared_pole`, scalar store, one-shot | $V + W^c(0)$ of the model (`gw.mpa.sigma.shared_pole_static_wc`) |
+| `mpa` with `sigma_w_model = tangential`, scalar store, one-shot | $V + W^c(0)$ of the model (`gw.mpa.sigma.tangential_static_wc`) |
 | the same, `qp_solver = self_consistent` | $V + W^c(0)$ of the accepted final map, evaluated once after the loop |
 | `w_bse`, `w_rpa_resolvent` | the RPA W(0), written by the ladder stage before the ladder runs |
 | bispinor `mpa`, shared pole, `bispinor_gw = bare_transverse`, one-shot or self-consistent | $V + W^c(0)$ of the four-component charge store on the charge V, the same evaluator (charge sector only) |
-| bispinor `mpa`, `bispinor_gw = full_shared_pole` | $V + W^c_{CC}(0)$ of the CC sector (`gw.mpa.sector_sigma.sector_static_wc`) |
+| bispinor `mpa`, `bispinor_gw = full_tangential` | $V + W^c_{CC}(0)$ of the CC sector (`gw.mpa.sector_sigma.sector_static_wc`) |
 | `x_only`; `mpa` with `sigma_w_model = mpa` | nothing |
 | shared pole on a metal, or `head_correction = full` without an ω = 0 head sample | nothing; the log says why |
 
 W0 is stored on the q parents of `V_qmunu`, with their unfold tables, whenever
 the run's q axis reduces (`restart_q_storage = auto` resolves `ibz`;
 [symmetry register](symmetry_register.md)); a deck whose q axis does not reduce
-stores every q. GW never forms a full-q W0 for the file: the shared-pole
+stores every q. GW never forms a full-q W0 for the file: the tangential
 evaluators run at the parent rows and the writer stores the producer's parents
 (`gw_output.persist_w0_and_head`). The BSE reader restores the full q grid on
 load (`restart_bundle.read_interaction` → `symmetry_maps.unfold_isdf_operator`,
@@ -111,7 +111,7 @@ owner (`qsgw_head.build_dft_head_response`) unless `head_correction = off`. No �
 is evaluated, no pole is fitted, and the bundle is not modified: the rebuild
 runs on every BSE call.
 
-Measured against a stored shared-pole W0 on the same bundle (claim 2888,
+Measured against a stored tangential W0 on the same bundle (claim 2888,
 P4 A100): the ten lowest exciton energies moved by at most 0.0078 meV (MoS2
 3×3, 4v × 6c) and 0.00002 meV (Si 4³, 4v × 8c); ε₂ peaks are identical on a
 5 meV grid. The rebuild doubled the BSE wall in those runs: 9.83 → 19.34 s on
@@ -515,7 +515,7 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
   is the charge sector: the direct term screens with $W_{CC}(0)$ and the
   exchange term uses the charge V; the CT/TC/TT blocks, screened or bare,
   never enter the BSE kernel. On `bispinor_gw = bare_transverse` it is
-  V + W_c(0) of the charge store; on `bispinor_gw = full_shared_pole` it is
+  V + W_c(0) of the charge store; on `bispinor_gw = full_tangential` it is
   V + W_c,CC(0) of the CC sector (`gw/mpa/sector_sigma.py:sector_static_wc`,
   the sector Σ synthesis at the ω = 0 coefficient; the CC block of
   W_∞ − V is zero because the Ward contact is TT-only). An SC run keeps its

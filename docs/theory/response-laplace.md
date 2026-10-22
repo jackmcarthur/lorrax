@@ -5,10 +5,10 @@ rows for response kernels on a transition interval [L, H] that no sample
 frequency crosses. `minimax.laplace_ritz` owns the placement, the projection
 and the continuum certificate. The production consumer is the GN-PPM
 imaginary-axis probe ([Minimax quadrature §3](minimax-quadrature.md)). The
-shared-pole response bank uses the grouped shared-node rules of
+tangential response bank uses the grouped shared-node rules of
 `minimax.response_group_rules` instead: complex times shared by a group of
 samples, with sampled rather than continuum error bounds
-([shared-pole model §2](../architecture/shared_pole_model.md)). Energies
+([tangential model §2](../architecture/tangential_model.md)). Energies
 share one unit (Ry in GW), times its inverse, and derivatives are taken with
 respect to s = z².
 

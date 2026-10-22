@@ -1,6 +1,6 @@
 """Checkpoints of sharded cubes plus a small host record, read back by authenticated identity.
 
-Three owners use it. ``gw.sigma_dispatch`` keeps a one-shot shared-pole Σ sweep
+Three owners use it. ``gw.sigma_dispatch`` keeps a one-shot tangential Σ sweep
 between the τ sweep and finalize: on shell (the default) its pair and slots,
 ``tmp/sigma_checkpoint_oneshot_on_shell.h5``, and on the omega grid
 (``sigma_omega_grid_debug``) its cubes, ``tmp/sigma_checkpoint_oneshot.h5``.

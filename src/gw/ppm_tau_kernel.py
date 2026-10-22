@@ -17,7 +17,7 @@ channel algebra and the kernel plumbing around it.
 The module-level kernel caches are co-located with the factories that read
 them.  :func:`get_sigma_spatial_kernel` is the reusable
 ``G_k x W_q -> Sigma`` owner, :func:`get_shared_sigma_tau_kernel` is the
-resident pole route's τ body, and a shared-pole model's W synthesis rides the
+resident pole route's τ body, and a tangential model's W synthesis rides the
 same ``sigma_kij`` through ``gw.mpa.sigma.SynthesisTau``.
 """
 
@@ -700,7 +700,7 @@ def get_shared_sigma_tau_kernel(
 
     The resident pole route's τ body: W(τ) from the resident residues
     (:func:`build_shared_w_tau`) contracted by the cached ``sigma_kij``. A
-    shared-pole model supplies its own W synthesis through
+    tangential model supplies its own W synthesis through
     ``gw.mpa.sigma.SynthesisTau`` instead, over the same ``sigma_kij``.
     """
     kgrid = tuple(int(x) for x in kgrid)

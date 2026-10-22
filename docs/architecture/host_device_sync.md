@@ -124,7 +124,7 @@ functions, not a pytest:
 |---|---|---|
 | `response_bank.produce_sample_bank`, `_integrate_sigma_batches` | `disallow` | passes, eqp exact (dput/w2 g5b; dput/w3 g8a with `LORRAX_CHECK_COUNTS=1`) |
 | Σ per-window `window_pick`, `run_window`, `window_arguments`, selector | `disallow_explicit` | passes (same runs) |
-| `construct_shared_poles` | `disallow` | trips on the per-round round table (dput/w2 g5d) |
+| `construct_tangential_poles` | `disallow` | trips on the per-round round table (dput/w2 g5d) |
 
 ## 5 The placement cache {#placement-cache}
 
@@ -151,9 +151,9 @@ letting `jax.device_put` assert cross-process equality with an all-gather
 |---|---|---|
 | checked solves (`distrib_la._result_check`) | failed? any notice to print? | `_read_status`: one int32 word `[failed, notice_0, …]` per status, on every rank. The error table is read only when a notice prints. |
 | the reciprocity census (`response_bank`) | receipt rows | scalars kept on the device and read once, at `_finish_receipt` |
-| the shared-pole model digest (`shared_pole_store._model_digest`) | refuse if any panel is invalid; hash bytes | per-panel verdicts read once after the loop; one `psum_replicate` of all q-batches' row hashes |
+| the tangential model digest (`tangential_store._model_digest`) | refuse if any panel is invalid; hash bytes | per-panel verdicts read once after the loop; one `psum_replicate` of all q-batches' row hashes |
 | the Coulomb sub-span start, Σ window tables, omega-slab starts | loop control | device-carried counters (dput/w2, dput/w3) |
-| the bank's rule pencils | the shift pencil of a geometry | one read per consumed geometry, the next one prefetched ([shared-pole model §2](shared_pole_model.md)) |
+| the bank's rule pencils | the shift pencil of a geometry | one read per consumed geometry, the next one prefetched ([tangential model §2](tangential_model.md)) |
 
 Fe V2 P=4, rank 0: checked-solve
 status 164 → 82; the reciprocity census 64 → 1; digest verdicts and reductions

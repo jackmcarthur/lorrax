@@ -148,7 +148,7 @@ Each node costs two GEMMs (\(N_kN_bN_\mu^2\)) and one lattice FFT
 An imaginary frequency multiplies the kernel by \(\cos\omega t\). Rules and
 their certificates: [minimax quadrature](minimax-quadrature.md) (static and
 plasmon-pole), [MPA sampling](THEORY_mpa_implementation.md) (complex lines),
-[compact noncrossing response](response-laplace.md) (the shared-pole bank).
+[compact noncrossing response](response-laplace.md) (the tangential bank).
 
 Two cases change the kernel, not the factorization:
 
@@ -219,7 +219,7 @@ which \(W\) samples they request and how they turn them into poles:
 | `gn_ppm` | \(W(0)\), \(W(i\omega_p)\) | one pole per element; with broken time reversal two Hermitian residues \(R_\pm=B\pm D\), \(R_+\) on empty and \(R_-\) on occupied branches | [minimax](minimax-quadrature.md), [derivation](gn-ppm-nonhermitian.md) |
 | `hl_ppm` | \(W(0)\) | one pole per element fixed by static screening and the f-sum rule | [HL-GPP](hl-gpp-derivation.md) |
 | `mpa`, `sigma_w_model = mpa` | two complex-frequency lines | several complex poles per element, Loewner fit | [MPA](THEORY_mpa_implementation.md) |
-| `mpa`, `sigma_w_model = shared_pole` | a response sample bank | \(W^c_q(z)=\sum_j b_jb_j^\dagger/(z^2-\Omega_j^2)\): one real pole set per q shared by all elements, \(16N_\mu K_q\) bytes per stored q | [shared-pole W](shared-pole-w-model.md) |
+| `mpa`, `sigma_w_model = tangential` | a response sample bank | \(W^c_q(z)=\sum_j b_jb_j^\dagger/(z^2-\Omega_j^2)\): one real pole set per q shared by all elements, \(16N_\mu K_q\) bytes per stored q | [tangential W](tangential-w-model.md) |
 
 The production calculation is the last row under `qp_solver = self_consistent`
 ([production QSGW](../how-to/production-qsgw.md)).
@@ -285,5 +285,5 @@ table gives the physical reason for each refusal.
 
 | case | refusal | why |
 |---|---|---|
-| metal with `cohsex`, `gn_ppm` or `hl_ppm` | `GATE gn_ppm_refuses_metals`, `GATE fractional_occupations_require_mpa` | these split bands by a 0/1 step at \(E_F\); metals use `mpa` (production: `sigma_w_model = shared_pole`) or `x_only` |
-| time-reversal-broken metal with `sigma_w_model = mpa` | `GATE mpa_ordered_metal` | the elementwise metal fit carries one residue and no odd channel; the shared-pole ordered store does |
+| metal with `cohsex`, `gn_ppm` or `hl_ppm` | `GATE gn_ppm_refuses_metals`, `GATE fractional_occupations_require_mpa` | these split bands by a 0/1 step at \(E_F\); metals use `mpa` (production: `sigma_w_model = tangential`) or `x_only` |
+| time-reversal-broken metal with `sigma_w_model = mpa` | `GATE mpa_ordered_metal` | the elementwise metal fit carries one residue and no odd channel; the tangential ordered store does |

@@ -170,7 +170,7 @@ def resolve_sigma_efermi_ry(fermi_reference, *, occupation_state, wfn):
 #  consumer imports from here rather than re-spelling the rule.  The
 #  consumers are the Sigma branch supports (``gw.ppm_windows``), the MPA
 #  pole-window geometry (``gw.mpa.sigma_windows``), the chi0
-#  fractional-occupation supports (``gw.w_isdf``) and the shared-pole
+#  fractional-occupation supports (``gw.w_isdf``) and the tangential
 #  response-bank samples (``gw.response_bank``).
 # ---------------------------------------------------------------------------
 

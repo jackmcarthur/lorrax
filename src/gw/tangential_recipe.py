@@ -80,7 +80,7 @@ _GATE_ROWS = {
     # The exact Gram is PSD, so a negative computed eigenvalue is rounding.
     # Weyl: gamma_min >= -||E||_2 >= -gamma_n ||D^-1/2 Sigma D^-1/2||_F with
     # Sigma the uncancelled magnitude of each divided-difference entry
-    # (shared_pole_reduction.gram_rounding_floor), plus R u gamma_max for the solver.
+    # (tangential_reduction.gram_rounding_floor), plus R u gamma_max for the solver.
     "gram_rounding_validity": ("even route: equilibrated gamma_min >= -max(-normalized_gram_validity * gamma_max, bound_factor * gamma_n ||D^-1/2 Sigma D^-1/2||_F + R u gamma_max); gamma_n = n u/(1-n u), Sigma the uncancelled divided-difference magnitudes; sample error not bounded",
                                {"bound_factor": 1.0, "unit_roundoff": 2.0 ** -53}),
     "zero_ritz_policy": ("drop lambda <= cutoff only within factor-weight budget",
@@ -292,9 +292,9 @@ def gate_receipt(name, value=None, *, passed=None, reason, table=None):
         Measurement scope/evidence, or the concrete missing dependency.
     """
     if not isinstance(reason, str) or not reason.strip():
-        raise ValueError("shared-pole receipt requires a nonempty reason")
+        raise ValueError("tangential receipt requires a nonempty reason")
     if passed is not None and type(passed) is not bool:
-        raise TypeError("shared-pole receipt passed must be bool or None")
+        raise TypeError("tangential receipt passed must be bool or None")
     json.dumps(value, allow_nan=False)
     def missing(item):
         if isinstance(item, dict):
@@ -326,7 +326,7 @@ class CapacityLedger:
         Device bytes per rank live outside the ledger when it is bound (the
         driver's arrays: wavefunctions, V, the ISDF tensors). Every admission
         sees the budget less this and the inherited peak. Production measures it
-        collectively at bind (:func:`resolve_shared_pole_recipe`); 0 by default.
+        collectively at bind (:func:`resolve_tangential_recipe`); 0 by default.
 
     Each reservation owns disjoint device resident/workspace bytes computed by its
     caller for its ACTUAL batch sizes, including packing and native workspace.
@@ -384,7 +384,7 @@ class CapacityLedger:
         tuple as ``concurrent_with`` to reserve their own disjoint footprint.
         """
         if self._live_stages is None:
-            raise ValueError("GATE shared_pole_capacity_lifetimes: got: unbound caller lifetimes; want: explicitly set ledger.live_stages before callee admission; why: unknown upstream bytes are not zero")
+            raise ValueError("GATE tangential_capacity_lifetimes: got: unbound caller lifetimes; want: explicitly set ledger.live_stages before callee admission; why: unknown upstream bytes are not zero")
         return self._live_stages
 
     @live_stages.setter
@@ -433,7 +433,7 @@ class CapacityLedger:
         self.entries.append(row)
         from lxkit import memory
         if row['device_budget_status'] != 'PASS':
-            memory.admit(f"shared-pole ledger {stage}", self.price(row),
+            memory.admit(f"tangential ledger {stage}", self.price(row),
                          row['available_device_bytes_per_rank'], runs_in=runs_in)
         self._accepted[stage] = row
         if book:
@@ -460,7 +460,7 @@ class CapacityLedger:
             operands=memory.Term(float(self.baseline_bytes_per_rank), beside * ranks,
                                  source="live outside the ledger at bind + live ledger rows"),
             xla=memory.Term(own if row.get('whole') else 0.0, 0.0 if row.get('whole') else own * ranks,
-                            source=f"{row.get('stage', 'ledger')} (shared-pole ledger)"),
+                            source=f"{row.get('stage', 'ledger')} (tangential ledger)"),
             ranks=ranks, label=self.price_label())
 
     def preview(self, *, resident_bytes_per_rank,
@@ -518,8 +518,8 @@ class CapacityLedger:
     def price_label(self):
         """The stage name a reservation's price is recorded under (``lxkit.memory.book``)."""
         if not self.baseline_bytes_per_rank:
-            return "shared-pole ledger"
-        return f"shared-pole ledger + {self.baseline_bytes_per_rank / 1e9:.2f} GB baseline"
+            return "tangential ledger"
+        return f"tangential ledger + {self.baseline_bytes_per_rank / 1e9:.2f} GB baseline"
 
     def room_bytes_per_rank(self, concurrent_with=()):
         """What a new reservation beside ``concurrent_with`` may still take: the device
@@ -568,7 +568,7 @@ def construction_receipt(measurements=None, *, capacity=None, capacity_entry_sta
              shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b)
     unknown = set(measurements) - set(table)
     if unknown:
-        raise ValueError(f"unknown shared-pole receipt predicates: {sorted(unknown)}")
+        raise ValueError(f"unknown tangential receipt predicates: {sorted(unknown)}")
     result = {"schema": RECEIPT_SCHEMA, "recipe_version": RECIPE_VERSION,
             "recipe_hash": RECIPE_HASH,
             "gate_version": (CHARGE4_GATE_VERSION if charge4 else
@@ -637,7 +637,7 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
         ``reduction``, ``zero``, ``passive``, ``retained``, ``moment_defects``
         from the reduction and the gates, and the host ``held``,
         ``reciprocity`` and ``permutation`` records. ``reduction`` is at the
-        parent's own extent (``gw.shared_pole_local.own_extent_receipts``).
+        parent's own extent (``gw.tangential_local.own_extent_receipts``).
     price, coulomb, native_queries, identity : mapping / iterable
         The capacity row for this parent, the Coulomb receipt, the constructor's
         native workspace queries, and the current state identity.
@@ -716,7 +716,7 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
     return row, measurements
 
 
-def bind_shared_pole_sc_identity(meta, state, *, occupation_state, print_fn):
+def bind_tangential_sc_identity(meta, state, *, occupation_state, print_fn):
     """Label current SC scratch, without claiming QP provenance (ruling 22).
 
     ``state`` supplies the current iteration. Reuse the carried occupation
@@ -726,24 +726,24 @@ def bind_shared_pole_sc_identity(meta, state, *, occupation_state, print_fn):
 
     iteration = operator.index(state.iteration)
     if isinstance(state.iteration, bool) or iteration < 0:
-        raise ValueError("GATE shared_pole_sc_identity: iteration must be a nonnegative integer")
-    recipe = meta.shared_pole_recipe
+        raise ValueError("GATE tangential_sc_identity: iteration must be a nonnegative integer")
+    recipe = meta.tangential_recipe
     occ_hash = (getattr(occupation_state, 'occ_hash', None)
                 if occupation_state is not None else
-                meta.shared_pole_census.get('occupation_sha256'))
+                meta.tangential_census.get('occupation_sha256'))
     if not isinstance(occ_hash, str) or not occ_hash:
-        raise ValueError("GATE shared_pole_sc_identity: current occupation label is missing")
+        raise ValueError("GATE tangential_sc_identity: current occupation label is missing")
     identity = dict(hamiltonian=f'sc_map_{iteration}:{occ_hash}',
                     wavefunctions='qp_rotation_unreceipted',
                     recipe_hash=recipe['recipe_hash'], gate_hash=recipe['gate_hash'],
                     authentication='NON-AUTHENTICATING')
-    meta.shared_pole_state_identity = identity
-    log.info(f"shared-pole SC identity NON-AUTHENTICATING: {identity}; "
+    meta.tangential_state_identity = identity
+    log.info(f"tangential SC identity NON-AUTHENTICATING: {identity}; "
              "scratch only; rebuild every map; no restart reuse or publication")
     return dict(identity)
 
 
-def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
+def tangential_restart_handle(restart_path, *, expected_identity, meta,
                                mesh_xy, print_fn):
     """Authenticate one current-map restart member through the store owner.
 
@@ -773,28 +773,28 @@ def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
             or expected_identity.get('wavefunctions') == 'qp_rotation_unreceipted'
             or expected_identity.get('authentication') == 'NON-AUTHENTICATING'
             or str(expected_identity.get('hamiltonian', '')).startswith('sc_map_')):
-        raise ValueError("GATE shared_pole_sc_restart: SC models are scratch-only and "
+        raise ValueError("GATE tangential_sc_restart: SC models are scratch-only and "
                          "NON-AUTHENTICATING; rebuild A/B/C on every map")
     from file_io.tagged_arrays import (
-        read_shared_pole_restart_member, SharedPoleMemberMissing,
-        SharedPoleMemberRefused,
+        read_tangential_restart_member, TangentialMemberMissing,
+        TangentialMemberRefused,
     )
 
-    recipe = getattr(meta, 'shared_pole_recipe', None)
-    capacity = getattr(meta, 'shared_pole_capacity', None)
+    recipe = getattr(meta, 'tangential_recipe', None)
+    capacity = getattr(meta, 'tangential_capacity', None)
     keys = ('recipe_version', 'recipe_hash', 'gate_version', 'gate_hash',
             'accuracy', 'eta_ev', 'n')
     if not isinstance(recipe, dict) or any(recipe.get(key) is None for key in keys):
-        raise ValueError("GATE shared_pole_restart: current resolved recipe is missing")
+        raise ValueError("GATE tangential_restart: current resolved recipe is missing")
     if not isinstance(capacity, CapacityLedger):
-        raise ValueError("GATE shared_pole_restart: current map capacity ledger is missing")
+        raise ValueError("GATE tangential_restart: current map capacity ledger is missing")
     capacity.live_stages  # Unknown upstream residency is not zero.
     try:
-        member, header = read_shared_pole_restart_member(
+        member, header = read_tangential_restart_member(
             restart_path, expected_identity=expected_identity, mesh_xy=mesh_xy,
             capacity=capacity, return_header=True)
-    except SharedPoleMemberMissing as exc:
-        log.info(f"shared-pole restart: {exc}; build and register a new member")
+    except TangentialMemberMissing as exc:
+        log.info(f"tangential restart: {exc}; build and register a new member")
         return None
     stored = header.get('recipe', {})
     # Table hashes bind the deterministic recipe; state identity binds its
@@ -802,11 +802,11 @@ def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
     # physical choices without binding mesh-dependent planning bytes into W.
     for key in keys:
         if stored.get(key) != recipe[key]:
-            raise SharedPoleMemberRefused(
-                f"GATE shared_pole_restart: recipe {key} mismatch; "
+            raise TangentialMemberRefused(
+                f"GATE tangential_restart: recipe {key} mismatch; "
                 f"got {stored.get(key)!r}, want {recipe[key]!r}")
     path = (Path(restart_path).resolve().parent / member['path']).resolve()
-    log.info(f"shared-pole restart: authenticated {path}; digest={member['digest']}; "
+    log.info(f"tangential restart: authenticated {path}; digest={member['digest']}; "
              "skip bank, moments and construction")
     return dict(path=str(path), identity=dict(header['identity']),
                 digest=member['digest'], K=list(header['K']))
@@ -816,7 +816,7 @@ def active_band_mask(energies_kn_ry, mu_ry, recipe=None):
     """Bands the W model treats as dynamically active: ``max_k E_nk >= mu -
     active_depth_ev``.  Deeper bands (semicore) carry no plasma charge.
 
-    The one owner of that rule: the shared-pole census counts the plasma
+    The one owner of that rule: the tangential census counts the plasma
     charge with it, and the SC ``cover`` policy grows the Sigma grid only
     over identities it calls active (``sc_iteration._sc_sampled_support``).
     """
@@ -827,7 +827,7 @@ def active_band_mask(energies_kn_ry, mu_ry, recipe=None):
     return depth <= recipe['active_depth_ev']
 
 
-def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_capacity, kweights):
+def bind_tangential_census(wfns, meta, *, occupation_state, trs_allowed, state_capacity, kweights):
     """Bind the current physical charge census to the existing metadata bundle.
 
     Parameters
@@ -865,22 +865,22 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
             or energies.shape[0] != meta.nk_tot or not energies.size
             or not np.all(np.isfinite(energies))
             or not np.all(np.isfinite(occupations))):
-        raise ValueError("GATE shared_pole_census: got: inconsistent/nonfinite energy or occupation table; want: current full-BZ logical tables; why: physical charge needs authenticated weights")
-    from file_io.shared_pole_store import charge_representation
+        raise ValueError("GATE tangential_census: got: inconsistent/nonfinite energy or occupation table; want: current full-BZ logical tables; why: physical charge needs authenticated weights")
+    from file_io.tangential_store import charge_representation
     # trs_allowed is recorded, not gated: a measured break selects the ordered
     # bank and model, and consumers that need the even form refuse by name.
     bispinor = int(meta.nspinor) == 4 and int(meta.nspinor_wfnfile) == 2
     if not charge_representation(meta) or int(meta.nspin) != 1:
-        raise ValueError("GATE shared_pole_representation: want one scalar, spinor or authenticated bispinor state")
+        raise ValueError("GATE tangential_representation: want one scalar, spinor or authenticated bispinor state")
     capacity = float(state_capacity)
     physical_spinor = int(meta.nspinor_wfnfile) if bispinor else int(meta.nspinor)
     if capacity * physical_spinor != 2.0:
-        raise ValueError("GATE shared_pole_census: got: state capacity times Nspinor other than 2; want: authenticated spin-restricted capacity; why: charge normalization")
+        raise ValueError("GATE tangential_census: got: state capacity times Nspinor other than 2; want: authenticated spin-restricted capacity; why: charge normalization")
     val = energies[:, wfns.slices.val]
     cond = energies[:, wfns.slices.cond_all_logical]
     response_cond = energies[:, wfns.slices.cond]
     if not val.size or not cond.size or not response_cond.size:
-        raise ValueError("GATE shared_pole_gap: got: empty logical valence/conduction window; want: both nonempty; why: support geometry needs a physical gap")
+        raise ValueError("GATE tangential_gap: got: empty logical valence/conduction window; want: both nonempty; why: support geometry needs a physical gap")
     vbm, cbm = float(np.max(val)), float(np.min(cond))
     mu = (0.5 * (vbm + cbm) if occupation_state is None
           else float(occupation_state.mu_ry))
@@ -889,7 +889,7 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     weights = np.asarray(kweights, dtype=np.float64)
     if (weights.shape != (meta.nk_tot,) or not np.all(np.isfinite(weights))
             or np.any(weights < 0) or not np.isclose(weights.sum(), 1.0, rtol=0, atol=1e-12)):
-        raise ValueError("GATE shared_pole_kweights: got: invalid physical weights; want: finite nonnegative full-BZ weights summing to one; why: plasma charge normalization")
+        raise ValueError("GATE tangential_kweights: got: invalid physical weights; want: finite nonnegative full-BZ weights summing to one; why: plasma charge normalization")
     # A partially occupied BAND must cross mu across the k census; smearing
     # tails in a gapped band do not authorize metallic line spacing.
     crossing = (np.min(energies, axis=0) <= mu) & (np.max(energies, axis=0) >= mu)
@@ -903,8 +903,8 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     volume = float(meta.cell_volume)
     if not (math.isfinite(mu) and math.isfinite(volume) and volume > 0
             and math.isfinite(electrons) and electrons > 0):
-        raise ValueError("GATE shared_pole_plasma: got: nonpositive/nonfinite active charge or cell volume; want: positive finite electrons and bohr^3; why: omega_p requires positive density")
-    meta.shared_pole_census = {
+        raise ValueError("GATE tangential_plasma: got: nonpositive/nonfinite active charge or cell volume; want: positive finite electrons and bohr^3; why: omega_p requires positive density")
+    meta.tangential_census = {
         "mu_ry": mu, "gap_ev": gap_ev, "partial_at_mu": partial_at_mu,
         "energy_span_ry": float(energies.max()-energies.min()),
         "response_transition_span_ry": float(response_cond.max()-val.min()),
@@ -974,7 +974,7 @@ def _sector_treatment_ceiling(response_span_ry, session):
     required = 2.0 * float(response_span_ry)
     if not math.isfinite(required) or required <= 0.0:
         raise ValueError(
-            "GATE shared_pole_treatment_ceiling: current response span must be "
+            "GATE tangential_treatment_ceiling: current response span must be "
             f"finite and positive, got {response_span_ry!r}")
     if session is None:
         return dict(version="sector_twice_map_span_v1", status="current_map",
@@ -1023,33 +1023,33 @@ def parse_support_sites(text):
         return None
     parts = text.split('|')
     if len(parts) not in (2, 3):
-        raise ValueError(f"GATE shared_pole_support_sites: got: {text!r}; want: '<line eV list> | <imaginary eV list> [| <line height eV>]'; why: the override replaces both ladders or neither")
+        raise ValueError(f"GATE tangential_support_sites: got: {text!r}; want: '<line eV list> | <imaginary eV list> [| <line height eV>]'; why: the override replaces both ladders or neither")
 
     def sites(raw, name, floor, minimum):
         try:
             values = [float(v) for v in raw.replace(',', ' ').split()]
         except ValueError:
-            raise ValueError(f"GATE shared_pole_support_sites: got: {raw!r} for {name}; want: comma-separated eV numbers; why: the ladder is an explicit site list") from None
+            raise ValueError(f"GATE tangential_support_sites: got: {raw!r} for {name}; want: comma-separated eV numbers; why: the ladder is an explicit site list") from None
         if len(values) < minimum:
-            raise ValueError(f"GATE shared_pole_support_sites: got: {len(values)} {name} sites; want: at least {minimum}; why: the held midpoints need adjacent pairs")
+            raise ValueError(f"GATE tangential_support_sites: got: {len(values)} {name} sites; want: at least {minimum}; why: the held midpoints need adjacent pairs")
         if any(not math.isfinite(v) or v < floor for v in values):
-            raise ValueError(f"GATE shared_pole_support_sites: got: {values} for {name}; want: finite sites >= {floor} eV; why: a support off the causal quadrant has no bank evaluation")
+            raise ValueError(f"GATE tangential_support_sites: got: {values} for {name}; want: finite sites >= {floor} eV; why: a support off the causal quadrant has no bank evaluation")
         if any(b <= a for a, b in zip(values, values[1:])):
-            raise ValueError(f"GATE shared_pole_support_sites: got: {values} for {name}; want: strictly increasing; why: repeated sites collapse the pencil")
+            raise ValueError(f"GATE tangential_support_sites: got: {values} for {name}; want: strictly increasing; why: repeated sites collapse the pencil")
         return values
 
     line = sites(parts[0], 'line', 0.0, 2)
     imaginary = sites(parts[1], 'imaginary', 0.0, 2)
     if imaginary[0] <= 0.0:
-        raise ValueError(f"GATE shared_pole_support_sites: got: imaginary site {imaginary[0]} eV; want: > 0; why: the imaginary ladder is geometric")
+        raise ValueError(f"GATE tangential_support_sites: got: imaginary site {imaginary[0]} eV; want: > 0; why: the imaginary ladder is geometric")
     height = None
     if len(parts) == 3:
         try:
             height = float(parts[2].strip())
         except ValueError:
-            raise ValueError(f"GATE shared_pole_support_sites: got: {parts[2]!r} for the line height; want: one eV number; why: the line ladder has one height") from None
+            raise ValueError(f"GATE tangential_support_sites: got: {parts[2]!r} for the line height; want: one eV number; why: the line ladder has one height") from None
         if not math.isfinite(height) or height <= 0.0:
-            raise ValueError(f"GATE shared_pole_support_sites: got: line height {height} eV; want: finite > 0; why: a support on the real axis has no bank evaluation")
+            raise ValueError(f"GATE tangential_support_sites: got: line height {height} eV; want: finite > 0; why: a support on the real axis has no bank evaluation")
     # repr round-trips a double exactly, so the canonical text that enters
     # recipe_hash is the geometry the stream samples, to the last bit.
     canonical = (','.join(repr(v) for v in line) + '|'
@@ -1063,7 +1063,7 @@ def imaginary_sample_count(kappa, tier, recipe=shared_real_pole_v1_r3b):
 
     Production: the rational-approximation count
     ``max(min_count, round(log(16 kappa^2) log(4/eps) / (2 pi^2)))``; relaxed:
-    the tier's fixed count.  One owner for the shared-pole imaginary ladder and
+    the tier's fixed count.  One owner for the tangential imaginary ladder and
     the Matsubara index set.
     """
     if tier == 'production':
@@ -1230,11 +1230,11 @@ def matsubara_indices(beta_ry_inv, bandwidth_ry, tier, recipe=shared_real_pole_v
     return np.concatenate(([0], positive)).astype(np.int64)
 
 
-def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
+def resolve_tangential_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                               support_reads_ev, support_session=None):
     """Resolve DESIGN §5 from current metadata into scalars and small arrays.
 
-    ``bind_shared_pole_census`` must have consumed this map's occupation state.
+    ``bind_tangential_census`` must have consumed this map's occupation state.
     Returns a plain dict with equal-length ``z_ry`` complex128, ``role`` int8,
     ``distinct_id`` int64 and ``held`` bool arrays [role]. Repeated physical
     points share a distinct_id; fitting and held IDs are disjoint. Infinity's
@@ -1252,23 +1252,23 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     All ranks execute the metadata work; only ``print_fn`` may filter by rank.
     """
     from common.units import RYD_TO_EV
-    from .gw_config import (uses_bare_transverse_shared_pole,
-                            uses_full_bispinor_shared_pole)
+    from .gw_config import (uses_bare_transverse_tangential,
+                            uses_full_bispinor_tangential)
 
-    if config.sigma.w_model != "shared_pole":
+    if config.sigma.w_model != "tangential":
         return None
-    charge4 = uses_bare_transverse_shared_pole(config)
-    photon = uses_full_bispinor_shared_pole(config)
+    charge4 = uses_bare_transverse_tangential(config)
+    photon = uses_full_bispinor_tangential(config)
     if int(meta.nspinor) == 4 and not (charge4 or photon):
-        raise ValueError("GATE shared_pole_representation: four-component shared-pole "
+        raise ValueError("GATE tangential_representation: four-component tangential "
                          "response needs an explicit charge or full photon route")
-    census = getattr(meta, "shared_pole_census", None)
+    census = getattr(meta, "tangential_census", None)
     if census is None:
-        raise ValueError("GATE shared_pole_census: got: absent current census; want: bind_shared_pole_census after current occupations; why: no guessed plasma charge or frozen recipe")
+        raise ValueError("GATE tangential_census: got: absent current census; want: bind_tangential_census after current occupations; why: no guessed plasma charge or frozen recipe")
     stop = wfns.slices.b4_logical - wfns.slices.b0
     energies = np.asarray(wfns.enk, dtype=np.float64)[:, :stop]
     if hashlib.sha256(energies.tobytes()).hexdigest() != census['energy_sha256']:
-        raise ValueError("GATE shared_pole_census: got: stale energies; want: census rebound at current bands; why: SC must rebuild geometry")
+        raise ValueError("GATE tangential_census: got: stale energies; want: census rebound at current bands; why: SC must rebuild geometry")
     # The run's budget in decimal GB (was per_device_gb * 2**30: GiB, 7.4% over the deck).
     from common.gpu_utils import device_budget_bytes
     from lxkit import memory
@@ -1276,10 +1276,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     # What the allocator holds outside the ledger now (the driver's arrays), the largest over
     # processes: memory.room takes the minimum room, so every rank gets the same baseline.
     baseline = max(0, budget - memory.room(bucketed=False))
-    meta.shared_pole_capacity = CapacityLedger(
+    meta.tangential_capacity = CapacityLedger(
         meta, mesh_xy=mesh_xy, device_budget_bytes=budget, baseline_bytes=baseline)
-    meta.shared_pole_capacity.room_bytes = budget - baseline
-    log.debug(f"shared-pole ledger: budget {budget / 1e9:.2f} GB/rank, {baseline / 1e9:.2f} GB/rank "
+    meta.tangential_capacity.room_bytes = budget - baseline
+    log.debug(f"tangential ledger: budget {budget / 1e9:.2f} GB/rank, {baseline / 1e9:.2f} GB/rank "
              f"live outside the ledger at bind (the driver's arrays); admissions see "
              f"{(budget - baseline) / 1e9:.2f} GB/rank")
     recipe = shared_real_pole_v1_r3b
@@ -1287,7 +1287,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     policy = recipe[tier]
     eta = float(config.sigma.regularization_ev)
     if not math.isfinite(eta) or eta <= 0:
-        raise ValueError("GATE shared_pole_eta: got: invalid eta; want: finite positive sigma_regularization_ev; why: causal sampling height")
+        raise ValueError("GATE tangential_eta: got: invalid eta; want: finite positive sigma_regularization_ev; why: causal sampling height")
     height = max(recipe['height_floor_ev'], recipe['height_eta_factor'] * eta)
     override = parse_support_sites(getattr(config.sigma, 'w_support_sites_ev', ''))
     plasma_ry = 2.0 * math.sqrt(4.0 * math.pi * census['active_electrons']
@@ -1298,10 +1298,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     umax = max(recipe['imaginary_floor_max_ev'], top)
     reads_abs = np.asarray(support_reads_ev, dtype=np.float64).ravel()
     if not reads_abs.size or not np.isfinite(reads_abs).all():
-        raise ValueError("GATE shared_pole_support_reads: got: no finite requested reads; want: qp_support.requested_reads_ev of this map's requested states; why: the line sites are placed over the energies Sigma reads")
+        raise ValueError("GATE tangential_support_reads: got: no finite requested reads; want: qp_support.requested_reads_ev of this map's requested states; why: the line sites are placed over the energies Sigma reads")
     reads = reads_abs - census['mu_ry'] * RYD_TO_EV
     if umin >= umax:
-        raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
+        raise ValueError(f"GATE tangential_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
     support_receipt = None
     if support_session is not None:
         key = (RECIPE_HASH, tier, eta, int(meta.nspinor), int(meta.n_rmu),
@@ -1374,9 +1374,9 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     fit_ids = sorted({i for i, held in zip(distinct_ids, held_flags) if not held})
     held_ids = sorted({i for i, held in zip(distinct_ids, held_flags) if held})
     if set(fit_ids) & set(held_ids):
-        raise ValueError("GATE shared_pole_held_exclusion: got: held/training collision; want: disjoint physical IDs; why: held diagnostics must be independent")
+        raise ValueError("GATE tangential_held_exclusion: got: held/training collision; want: disjoint physical IDs; why: held diagnostics must be independent")
     # The operator is the spin-traced charge response [q, mu, mu] on scalar
-    # and two-component decks alike (shared_pole_store.charge_representation).
+    # and two-component decks alike (tangential_store.charge_representation).
     n = int(meta.n_rmu)
     # A support override is a different physical sampling geometry, so it must
     # be a different recipe identity: restart membership, the bank header and
@@ -1440,7 +1440,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'bank_rule_tolerance': policy['bank_rule_tolerance'],
         'moment_convention': recipe['moment_convention'], 'census': dict(census),
         'operator_realization': recipe['operator_realization'],
-        'U_bytes_per_rank': meta.shared_pole_capacity.U_bytes_per_rank,
+        'U_bytes_per_rank': meta.tangential_capacity.U_bytes_per_rank,
     }
     if charge4:
         result['charge_operator'] = 'four-component-spin-traced-v1'
@@ -1482,8 +1482,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         shown = value.tolist() if isinstance(value, np.ndarray) else value
         rule = next((v for prefix, v in rules.items() if key.startswith(prefix)),
                     'canonical role/ID census and versioned recipe; no accuracy inferred from missing evidence')
-        log.debug(f'  [shared-pole recipe {RECIPE_VERSION}] {key}={shown} (rule: {rule})')
+        log.debug(f'  [tangential recipe {RECIPE_VERSION}] {key}={shown} (rule: {rule})')
         receipt[str(key)] = dict(value=shown, rule=rule)
-    log.debug(f'shared-pole recipe {RECIPE_VERSION}', extra=record(
-        'shared_pole.recipe', version=RECIPE_VERSION, entries=receipt))
+    log.debug(f'tangential recipe {RECIPE_VERSION}', extra=record(
+        'tangential.recipe', version=RECIPE_VERSION, entries=receipt))
     return result

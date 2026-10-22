@@ -26,7 +26,7 @@ propagation (example drives, the run log, the integrator) is
 
 The ISDF model reads the bundle through the BSE loader: ψ at the centroids,
 ζ, V and the static W (`W0_qmunu`); the bundle's band range must contain the
-TD window. A shared-pole MPA run on an identity-only k grid refuses to write
+TD window. A tangential MPA run on an identity-only k grid refuses to write
 `W0_qmunu`; `compute_mode = cohsex` (static RPA W0) writes it. To propagate with BerkeleyGW's screening on the same
 representation, `gw.epsmat_cli` with `mode = project` writes a copy of the
 bundle whose `W0_qmunu` is BerkeleyGW's ε⁻¹ projected on ζ; `mode = export`

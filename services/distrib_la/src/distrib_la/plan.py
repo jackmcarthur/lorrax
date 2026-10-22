@@ -187,7 +187,7 @@ def cached_scan(key, build):
 class RoomExhausted(NamedTuple):
     """A room of 0 that a caller KNOWS: its stage was admitted over budget.
 
-    The shared-pole ledger warns and continues (owner ruling 2026-10-01), so an eigh
+    The tangential ledger warns and continues (owner ruling 2026-10-01), so an eigh
     inside such a stage has no budgeted room. The whole mesh is then the
     minimum-footprint route: :meth:`Plan.stack_route` takes it and prints one
     warning line, and route (c) stays fail-closed. A plan given room 0 WITHOUT

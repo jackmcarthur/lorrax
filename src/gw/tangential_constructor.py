@@ -17,10 +17,10 @@ import time
 
 import jax
 from common import timing
-from gw.shared_pole_capacity import ConstructorCapacity
-from gw.shared_pole_directions import (_round_kernels, _sample_point, line_panel_states, port_extent,
+from gw.tangential_capacity import ConstructorCapacity
+from gw.tangential_directions import (_round_kernels, _sample_point, line_panel_states, port_extent,
                                        select_round_states, infinity_directions)
-from gw.shared_pole_reduction import ORIENTATION_PAIR_REFUSAL
+from gw.tangential_reduction import ORIENTATION_PAIR_REFUSAL
 
 
 def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordered,
@@ -35,8 +35,8 @@ def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordere
     every line sample's stored panels (``selection_face_count``).
     """
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_execution import constructor_execution, line_panel_count, selection_face_count
-    from file_io.shared_pole_store import line_panel_geometry
+    from gw.tangential_execution import constructor_execution, line_panel_count, selection_face_count
+    from file_io.tangential_store import line_panel_geometry
 
     column_extent = port_extent(mesh_xy)
     moment_fields = ("M0", "M1", "M2", "M3") if odd_moments else ("M1", "M3")
@@ -54,7 +54,7 @@ def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordere
     return execution, receipt, column_extent, faces, moment_fields
 
 
-def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, residence=None):
+def construct_tangential_poles(bank, moments, meta, config, *, mesh_xy, output, residence=None):
     """Construct and write a current-state, bounded-batch real-pole model.
 
     Parameters
@@ -69,7 +69,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         ``path`` to committed physical M1/M3 in the same scratch schema.
     meta : Meta
         Current packed centroid basis, scalar representation and the once-
-        resolved ``shared_pole_recipe`` with current state identities.
+        resolved ``tangential_recipe`` with current state identities.
     config : LorraxConfig
         Cached dense policy is read once, before any per-q plans.
     mesh_xy : Mesh
@@ -96,8 +96,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
     def phase(name):
         """One named constructor stage; its wall adds to ``walls[name]`` (the per-map summary)."""
         started = time.monotonic()
-        if getattr(meta, "shared_pole_capacity", None) is not None:
-            meta.shared_pole_capacity.at_phase()
+        if getattr(meta, "tangential_capacity", None) is not None:
+            meta.tangential_capacity.at_phase()
         with timing.section("spole." + name):
             yield
         walls[name] = walls.get(name, 0.0) + time.monotonic() - started
@@ -105,18 +105,18 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
     with phase("entry"):
         import numpy as np
         from jax.sharding import NamedSharding, PartitionSpec as P
-        from file_io.shared_pole_store import (
-            charge_representation, validate_shared_pole_bank,
-            RoundReader, read_round_samples, write_shared_pole_model,
+        from file_io.tangential_store import (
+            charge_representation, validate_tangential_bank,
+            RoundReader, read_round_samples, write_tangential_model,
         )
         from gw.gw_config import linalg_resolution
         from common.staged_reshard import face_to_batch_reshard
-        from gw.shared_pole_local import (batch_to_face, canonical_factors, check_round, face_rows,
+        from gw.tangential_local import (batch_to_face, canonical_factors, check_round, face_rows,
                                           own_extent_receipts, reduce_round, round_tables,
                                           recipe_panel_widths, recipe_infinity_width, pad_states,
                                           carrier_history)
-        from gw.shared_pole_capacity import round_padding_output_bytes
-        from gw.shared_pole_recipe import (
+        from gw.tangential_capacity import round_padding_output_bytes
+        from gw.tangential_recipe import (
             build_construction_row, charge4_gates, construction_receipt,
             shared_real_pole_gates_v1_r3b as gates,
             shared_real_pole_gates_ordered_v1,
@@ -125,33 +125,33 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         from gw.w_isdf import response_coulomb_powers
 
     with phase("setup"):
-        recipe = meta.shared_pole_recipe
+        recipe = meta.tangential_recipe
         # Time-reversal-broken scalar states take the ordered particle-hole route.
         ordered = not bool(bank["tables"]["sym"].trs_allowed)
         # Every charge carrier contracts to one mu x mu CC operator.
         if not charge_representation(meta):
-            raise ValueError("GATE shared_pole_representation: expected an authenticated charge carrier")
+            raise ValueError("GATE tangential_representation: expected an authenticated charge carrier")
         charge4 = recipe.get("charge_operator") == "four-component-spin-traced-v1"
         if (int(meta.nspinor) == 4) != charge4:
-            raise ValueError("GATE shared_pole_representation: charge4 recipe and carrier disagree")
+            raise ValueError("GATE tangential_representation: charge4 recipe and carrier disagree")
         if charge4:
             gates = charge4_gates(ordered)
         elif ordered:
             gates = shared_real_pole_gates_ordered_v1
-        from gw.shared_pole_recipe import table_hash
+        from gw.tangential_recipe import table_hash
         if recipe["gate_hash"] != table_hash(gates):
-            raise ValueError("GATE shared_pole_representation: recipe gate table differs from charge carrier")
+            raise ValueError("GATE tangential_representation: recipe gate table differs from charge carrier")
         resolution = linalg_resolution({"linalg": config.backend.linalg})
         identity = bank["identity"]
-        ledger = meta.shared_pole_capacity
+        ledger = meta.tangential_capacity
         upstream = ledger.live_stages
         n = int(meta.n_rmu_padded)
         # Every device byte this construction admits is priced here; the driver
         # below keeps only `budget.retained_panels` and `budget.batch_width`
         # current as it moves from selection to reduction to the model checks.
-        header = validate_shared_pole_bank(bank["path"], expected_identity=identity,
+        header = validate_tangential_bank(bank["path"], expected_identity=identity,
                                            mesh_xy=mesh_xy, require_complete=True)
-        moment_header = validate_shared_pole_bank(moments["path"], expected_identity=identity,
+        moment_header = validate_tangential_bank(moments["path"], expected_identity=identity,
                                                   mesh_xy=mesh_xy)
         # The stored plan must bind the current physical points and role census.
         stored_recipe = header["recipe"]
@@ -164,17 +164,17 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             else:
                 equal = current == previous
             if not equal:
-                raise ValueError(f"GATE shared_pole_bank_state: got: stale {name}; want: current resolved recipe; why: no frozen SC inputs")
+                raise ValueError(f"GATE tangential_bank_state: got: stale {name}; want: current resolved recipe; why: no frozen SC inputs")
         for sample_id in (*recipe["fit_ids"], *recipe["held_ids"]):
             if _sample_point(recipe, sample_id) != _sample_point(stored_recipe, sample_id):
-                raise ValueError("GATE shared_pole_bank_state: got: changed z; want: current physical sample point; why: recipe hashes alone do not bind resolved points")
+                raise ValueError("GATE tangential_bank_state: got: changed z; want: current physical sample point; why: recipe hashes alone do not bind resolved points")
         if bool(header.get("ordered", False)) != ordered:
-            raise ValueError(f"GATE shared_pole_representation: got: bank ordered={bool(header.get('ordered', False))} with trs_allowed={not ordered}; want: an ordered bank exactly when time reversal is broken (both orientations, -q as its own parent); why: particle-hole pairing across parents")
+            raise ValueError(f"GATE tangential_representation: got: bank ordered={bool(header.get('ordered', False))} with trs_allowed={not ordered}; want: an ordered bank exactly when time reversal is broken (both orientations, -q as its own parent); why: particle-hole pairing across parents")
         # Odd z-moments M0/M2 certify the ordered infinity block; a finite-state
         # ordered bank builds without it and records the moments NOT_MEASURED.
         odd_moments = ordered and bool(header.get("odd_moments", False))
         logical_n = int(meta.n_rmu)
-        from gw.shared_pole_execution import constructor_side_upper_bound
+        from gw.tangential_execution import constructor_side_upper_bound
         execution, execution_receipt, column_extent, selection_faces, moment_fields = constructor_route(
             meta, config, recipe, mesh_xy=mesh_xy, ledger=ledger, upstream=upstream,
             ordered=ordered, odd_moments=odd_moments,
@@ -200,7 +200,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         receipt_entry_start = 0
         held_ids = [int(i) for i in recipe["held_ids"]]
         if not held_ids:
-            raise ValueError("GATE shared_pole_held: got: no held samples; want: at least one held support; why: the model checks compare W and dW/ds there")
+            raise ValueError("GATE tangential_held: got: no held samples; want: at least one held support; why: the model checks compare W and dW/ds there")
         held_lo, held_hi = min(held_ids), max(held_ids) + 1
         nq = int(header["bank_shape"]["nq"])
         # A local round runs one parent per rank from its sample read to its
@@ -209,8 +209,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         # (``parent_rounds``); a short last round repeats its last parent.
         face_batch = 1
         if execution == 'face':
-            from gw.shared_pole_capacity import check_eigh_room, face_eigh_room
-            from gw.shared_pole_execution import face_batch_width, face_ritz_carrier, face_round_compiled_bytes
+            from gw.tangential_capacity import check_eigh_room, face_eigh_room
+            from gw.tangential_execution import face_batch_width, face_ritz_carrier, face_round_compiled_bytes
             keep_budget = recipe.get("pole_budget")
             # The conservative round's infinity carrier and its block in the pencil side
             # (constructor_side_upper_bound), for the width's compiled admission.
@@ -238,10 +238,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             # The selection row reserves its eigh stacks as native workspace: handed back to them.
             selected = execution_receipt['face_batch']['selection']
             budget.face_room = face_eigh_room(selected, retained_bound - int(selected['workspace_bytes_per_rank']),
-                                              stage="shared-pole constructor selection")
+                                              stage="tangential constructor selection")
             execution_receipt['face_eigh_room_bytes_per_rank'] = dict(selection=int(budget.face_room))
             eig = budget.eigenplan(n)
-        from gw.shared_pole_local import parent_rounds
+        from gw.tangential_local import parent_rounds
         # One fixed width per route; a short last round repeats its last real parent.
         rounds = parent_rounds(header['n_q_irr'], mesh_xy.size if execution == 'local' else face_batch)
         batch_spec = P(("x", "y"))
@@ -331,7 +331,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 round_states, infinity = pad_states(round_states, widths, infinity, infinity_width)
             with phase("gram_reduction"):
                 if execution == 'face':
-                    from gw.shared_pole_execution import face_reduce_round
+                    from gw.tangential_execution import face_reduce_round
                     # The kept span on the budget's carrier, as the local round
                     # solves it on its Ritz carrier: the Schur and final eigh run
                     # at about 2 x budget instead of the pencil side.
@@ -352,7 +352,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                         beside=budget.ledger.price(reduction_row))
                 qi = infinity[0]
                 # One device-to-host read of the round's replicated diagnostics and vectors.
-                from gw.shared_pole_local import host_tree
+                from gw.tangential_local import host_tree
                 (round_reduction, round_zero, round_retained, round_permutation), (poles, active) = host_tree(
                     (tuple(round_diagnostics), tuple(vectors)))
                 # rocSOLVER zheevd can return finite eigenvalues with NaN eigenvectors and info 0
@@ -364,7 +364,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     from distrib_la import native_eigh_jacobi
                     bad = [ids[i] for i in range(real) if not bool(finite[i])]
                     import warnings
-                    warnings.warn(f"shared-pole round: local eigh returned non-finite eigenpairs at q={bad}; "
+                    warnings.warn(f"tangential round: local eigh returned non-finite eigenpairs at q={bad}; "
                                   "re-solved the round by Jacobi", RuntimeWarning, stacklevel=1)
                     del round_model, round_signed, vectors, round_diagnostics
                     round_model, round_signed, vectors, round_diagnostics = reduce_round(
@@ -390,7 +390,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     for name in ("gram_diagonal_positive", "gram_valid", "retained_metric_positive"):
                         if not round_reduction[name][slot]:
                             raise ValueError(
-                                f"GATE shared_pole_{name}: got: failed at q={q}, "
+                                f"GATE tangential_{name}: got: failed at q={q}, "
                                 f"Gram min/max={round_reduction['gram_min_relative'][slot]}, "
                                 f"rounding floor/max={round_reduction['gram_floor_relative'][slot]}, "
                                 f"paired Schur S min/max={round_reduction['paired_min_relative'][slot] if ordered else 'n/a'}, "
@@ -399,18 +399,18 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                                 f"want: Gram min >= -floor (normalized_gram_validity; even route: the larger of it and gram_rounding_validity) "
                                 "and valid diagonal/retained metric; why: no PSD repair")
                     if not round_reduction.get("ritz_eigh_finite", [True] * (slot + 1))[slot]:
-                        raise ValueError(f"GATE shared_pole_ritz_eigh_finite: got: non-finite Ritz eigenpairs at q={q}; "
+                        raise ValueError(f"GATE tangential_ritz_eigh_finite: got: non-finite Ritz eigenpairs at q={q}; "
                                          "want: finite eigenvalues and eigenvectors of the reduced pencil; "
                                          "why: a silent eigensolver failure, not a physical zero-Ritz weight")
                     if not round_zero["zero_policy"][slot]:
-                        raise ValueError(f"GATE shared_pole_zero_ritz: got: failed at q={q} [{_sp_report(slot)}]; want: finite positive response within dropped-weight budget; why: no pole clipping")
+                        raise ValueError(f"GATE tangential_zero_ritz: got: failed at q={q} [{_sp_report(slot)}]; want: finite positive response within dropped-weight budget; why: no pole clipping")
                     # The ordered identity is on the ORIGINAL infinity directions: exact only for the
                     # full Galerkin span, projection accuracy after the keep/retention cuts. It is
                     # reported beside the full_m1/full_m3 diagnostic bands, as the TRS route reports
                     # its original-direction defects; the retained Ritz algebra is the metric gate above.
                     if not ordered and not all(value[slot] <= gates["retained_subspace_moments"]["threshold"]
                                                for value in round_retained.values()):
-                        raise ValueError(f"GATE shared_pole_retained_moments: got: failed at q={q}; want: projected latent moment identity <=1e-10; why: corrected Ritz algebra")
+                        raise ValueError(f"GATE tangential_retained_moments: got: failed at q={q}; want: projected latent moment identity <=1e-10; why: corrected Ritz algebra")
                 reductions = own_extent_receipts(round_reduction, tables["own"][:real])
             with phase("coulomb"):
                 budget.batch_width = len(ids)
@@ -469,9 +469,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             with phase("gates"):
                 for slot, q in enumerate(ids[:real]):
                     if not passive["passivity"][slot]:
-                        raise ValueError(f"GATE shared_pole_passivity: got: failed at q={q}; want: 0 <= V-whitened -W(i eta) <= I; why: passive screening")
+                        raise ValueError(f"GATE tangential_passivity: got: failed at q={q}; want: 0 <= V-whitened -W(i eta) <= I; why: passive screening")
                     if not ordered and not np.all(reciprocity["passed"][slot]):
-                        raise ValueError(f"GATE shared_pole_model_reciprocity: got: { {k: v[slot].tolist() for k, v in reciprocity.items()} } at q={q}; want: model preserves transpose symmetry of symmetric held data; why: conjugate-port closure must survive reduction")
+                        raise ValueError(f"GATE tangential_model_reciprocity: got: { {k: v[slot].tolist() for k, v in reciprocity.items()} } at q={q}; want: model preserves transpose symmetry of symmetric held data; why: conjugate-port closure must survive reduction")
             with phase("receipts"):
                 price = budget.plan(side)
                 counts = active.sum(axis=-1, dtype=np.int64)
@@ -514,11 +514,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 budget.retained_panels = tuple(factors)
     with phase("writer_stack"):
         if sorted(placed) != list(range(nq)):
-            raise ValueError(f"GATE shared_pole_rounds: got: parents {sorted(placed)}; want: each of {nq} parents once; why: one canonical store")
+            raise ValueError(f"GATE tangential_rounds: got: parents {sorted(placed)}; want: each of {nq} parents once; why: one canonical store")
         order = np.argsort(placed)
         width = max(block.shape[-1] for block in factors)
         public_b = canonical_factors(mesh_xy, tuple(int(i) for i in order))(*factors)
-        from gw.shared_pole_local import store_pole_rows
+        from gw.tangential_local import store_pole_rows
         store_poles, store_device_counts = store_pole_rows(
             mesh_xy, tuple(b for _, b in store_poles), int(width), tuple(int(i) for i in order))(
             tuple(p for (p, _), _ in store_poles), tuple(a for (_, a), _ in store_poles))
@@ -534,7 +534,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             if resident is not None:
                 target = resident
                 ledger.live_stages = (*ledger.live_stages, model_residence["stage"])
-        store_header = write_shared_pole_model(
+        store_header = write_tangential_model(
             target, public_b, store_poles,
             np.concatenate(store_counts)[order], q_span=(0, nq), meta=meta, tables=bank["tables"], recipe=recipe,
             receipts={"identity": identity, "q_receipts": [receipts[q] for q in range(nq)]}, ordered=ordered,

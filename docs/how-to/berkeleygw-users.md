@@ -45,7 +45,7 @@ load (`wfn_loader.WfnLoader`); use a noncollinear calculation for magnetism.
 | `frequency_dependence 0` (sigma) | `compute_mode = cohsex` | static COHSEX |
 | `frequency_dependence 1` | `compute_mode = hl_ppm` | Hybertsen–Louie plasmon pole |
 | `frequency_dependence 3` | `compute_mode = gn_ppm` | Godby–Needs; probe frequency `ppm_omega_p` (default 2 Ry) |
-| `frequency_dependence 2` | `compute_mode = mpa`, `sigma_w_model = shared_pole` | full frequency; LORRAX fits W with real poles shared per $q$ ([shared-pole W](../theory/shared-pole-w-model.md)) instead of tabulating $\varepsilon^{-1}(\omega)$ |
+| `frequency_dependence 2` | `compute_mode = mpa`, `sigma_w_model = tangential` | full frequency; LORRAX fits W with real poles shared per $q$ ([tangential W](../theory/tangential-w-model.md)) instead of tabulating $\varepsilon^{-1}(\omega)$ |
 | `number_bands` (epsilon) | `number_bands_chi` | bands in $\chi_0$ |
 | `number_bands` (sigma) | `number_bands_sigma` | bands in the $\Sigma$ sum; `number_bands` sets both |
 | `band_index_min/max`, `diag` | `ncond`, or `number_bands_protected` (the total band count of the request: every occupied band plus conduction bands up to that total) | $\Sigma$ bands are always $[1, n_\mathrm{occ} + $`ncond`$]$; `nval` does not change them ([its roles](../input_reference.md#system)) |
@@ -474,7 +474,7 @@ by crystal coordinate modulo a reciprocal lattice vector.
 4×4×4 grid, 8 irreducible k, 25 Ry), same 100-band sum for $\chi_0$ and
 $\Sigma$, $\Sigma$ for bands 1–24. BerkeleyGW: contour deformation (300 real
 and 15 imaginary frequencies, 0.25 eV broadening, ε cutoff 25 Ry,
-`cell_average_cutoff 1.0d-12`). LORRAX: one-shot shared-pole full frequency at
+`cell_average_cutoff 1.0d-12`). LORRAX: one-shot tangential full frequency at
 its defaults except `use_band_extrapolation = false` and
 `mc_average_vcoul_body = false`; 1100 centroids.
 
@@ -492,7 +492,7 @@ LORRAX took 55 s on one node of 4 A100 GPUs. With band extrapolation on (the
 LORRAX default) the indirect gap is 1.1256 eV, +45.8 meV: the extrapolated
 tail, which BerkeleyGW truncates, lowers every state by about 155 meV and
 opens the gap. The remaining differences come from the frequency treatment
-(contour deformation against the shared-pole W and its quadrature), the head
+(contour deformation against the tangential W and its quadrature), the head
 (§4.2), the ISDF basis and the derivative (§4.6).
 
 **Static COHSEX, Si.** Si 4×4×4 (48 operations, 8 irreducible k), 25 Ry,

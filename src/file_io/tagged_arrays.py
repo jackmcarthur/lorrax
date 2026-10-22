@@ -43,11 +43,11 @@ ZETA_FIT_WINDOWS_DATASET = "zeta_fit_windows"
 CHARGE_ZETA_IDENTITY_DATASET = "charge_zeta_identity"
 # Copy of the paired v_q_bispinor.h5 generation receipt (bispinor runs only).
 BISPINOR_V_RECEIPT_DATASET = "bispinor_v_receipt"
-SHARED_POLE_MEMBER_DATASET = "shared_pole_member"
-_SHARED_POLE_MEMBER_FIELDS = ("path", "schema", "digest", "iteration_id")
+TANGENTIAL_MEMBER_DATASET = "tangential_member"
+_TANGENTIAL_MEMBER_FIELDS = ("path", "schema", "digest", "iteration_id")
 
 
-class SharedPoleMemberMissing(ValueError):
+class TangentialMemberMissing(ValueError):
     """No member in a committed bundle; the caller may construct it once."""
 
     status = "missing"
@@ -57,7 +57,7 @@ class SharedPoleMemberMissing(ValueError):
         super().__init__(reason)
 
 
-class SharedPoleMemberRefused(ValueError):
+class TangentialMemberRefused(ValueError):
     """Existing member is incompatible or corrupt; never rebuild in place."""
 
     status = "refused"
@@ -68,28 +68,28 @@ class SharedPoleMemberRefused(ValueError):
                          "a copy of the bundle (restart=true)")
 
 
-def _shared_pole_member_record(values):
+def _tangential_member_record(values):
     """Authenticate the small, ordered restart membership receipt."""
     raw = np.asarray(values)
     if raw.shape != (4,) or raw.dtype.kind not in ("S", "U", "O"):
-        raise ValueError("GATE shared_pole_member: expected four UTF-8 strings")
+        raise ValueError("GATE tangential_member: expected four UTF-8 strings")
     decoded = []
     for value in raw.tolist():
         if isinstance(value, bytes):
             value = value.decode("utf-8")
         if not isinstance(value, str) or not value or "\x00" in value:
-            raise ValueError("GATE shared_pole_member: empty or invalid field")
+            raise ValueError("GATE tangential_member: empty or invalid field")
         decoded.append(value)
-    record = dict(zip(_SHARED_POLE_MEMBER_FIELDS, decoded))
+    record = dict(zip(_TANGENTIAL_MEMBER_FIELDS, decoded))
     if Path(record["path"]).is_absolute() or record["path"] == ".":
-        raise ValueError("GATE shared_pole_member: member path must be relative")
+        raise ValueError("GATE tangential_member: member path must be relative")
     digest = record["digest"]
     if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-        raise ValueError("GATE shared_pole_member: digest must be a SHA256 hex string")
+        raise ValueError("GATE tangential_member: digest must be a SHA256 hex string")
     return record
 
 
-def register_shared_pole_restart_member(
+def register_tangential_restart_member(
         restart_path, model_path, *, expected_identity, mesh_xy, capacity=None):
     """Register an authenticated immutable model after its construction.
 
@@ -113,7 +113,7 @@ def register_shared_pole_restart_member(
         changing it requires a new restart bundle. No model data are appended.
     """
     from .commit_state import assert_committed
-    from .shared_pole_store import validate_shared_pole_model
+    from .tangential_store import validate_tangential_model
 
     restart_path = Path(restart_path).resolve()
     model_path = Path(model_path).resolve()
@@ -121,13 +121,13 @@ def register_shared_pole_restart_member(
 
     def _validate():
         if model_path == restart_path:
-            raise ValueError("GATE shared_pole_member: model must be a separate file")
-        header = validate_shared_pole_model(
+            raise ValueError("GATE tangential_member: model must be a separate file")
+        header = validate_tangential_model(
             model_path, expected_identity=expected_identity, mesh_xy=mesh_xy,
             **({"capacity":capacity} if capacity is not None else {}))
         if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
-            raise ValueError("GATE shared_pole_member: payload authentication requires capacity")
-        member.update(_shared_pole_member_record([
+            raise ValueError("GATE tangential_member: payload authentication requires capacity")
+        member.update(_tangential_member_record([
             os.path.relpath(model_path, restart_path.parent), header["schema"],
             header["digest"], header["identity"]["iteration_id"]]))
 
@@ -136,27 +136,27 @@ def register_shared_pole_restart_member(
         # has released its handle before this metadata-only transaction.
         with h5py.File(restart_path, "r+") as h5:
             assert_committed(h5, path=restart_path)
-            if SHARED_POLE_MEMBER_DATASET in h5:
-                existing = _shared_pole_member_record(
-                    h5[SHARED_POLE_MEMBER_DATASET][()])
+            if TANGENTIAL_MEMBER_DATASET in h5:
+                existing = _tangential_member_record(
+                    h5[TANGENTIAL_MEMBER_DATASET][()])
                 if existing != member:
                     raise ValueError(
-                        "GATE shared_pole_member: immutable member replacement "
+                        "GATE tangential_member: immutable member replacement "
                         "refused; use a new restart bundle for this SC map")
                 return
             set_commit_state(h5, False)
             h5.create_dataset(
-                SHARED_POLE_MEMBER_DATASET,
+                TANGENTIAL_MEMBER_DATASET,
                 data=np.asarray([member[k].encode("utf-8")
-                                 for k in _SHARED_POLE_MEMBER_FIELDS], dtype="S"))
+                                 for k in _TANGENTIAL_MEMBER_FIELDS], dtype="S"))
             set_commit_state(h5, True)
 
-    rank0_transaction(restart_path, stage="restart.shared_pole_member",
+    rank0_transaction(restart_path, stage="restart.tangential_member",
                       validate=_validate, write=_write)
     return member
 
 
-def read_shared_pole_restart_member(
+def read_tangential_restart_member(
         restart_path, *, expected_identity, mesh_xy, capacity=None,
         return_header=False):
     """Authenticate current-map membership without expanding factors into W.
@@ -184,17 +184,17 @@ def read_shared_pole_restart_member(
 
     Raises
     ------
-    SharedPoleMemberMissing
+    TangentialMemberMissing
         status="missing": no member in an existing committed bundle. The
         caller may construct/register once in that bundle.
-    SharedPoleMemberRefused
+    TangentialMemberRefused
         status="refused": incomplete, malformed, missing linked payload,
         identity/recipe/gate mismatch or corrupt payload. ``reason`` preserves
         the exact validator diagnostic. Never classified as missing, and
         never permission to replace an immutable member.
     """
     from .commit_state import agree_io_refusal, assert_committed
-    from .shared_pole_store import validate_shared_pole_model
+    from .tangential_store import validate_tangential_model
 
     try:
         # Agree after serial metadata I/O and before the validator enters
@@ -206,36 +206,36 @@ def read_shared_pole_restart_member(
             restart_path = restart_path.resolve()
             with h5py.File(restart_path, "r") as h5:
                 assert_committed(h5, path=restart_path)
-                if SHARED_POLE_MEMBER_DATASET in h5:
-                    member = _shared_pole_member_record(h5[SHARED_POLE_MEMBER_DATASET][()])
+                if TANGENTIAL_MEMBER_DATASET in h5:
+                    member = _tangential_member_record(h5[TANGENTIAL_MEMBER_DATASET][()])
         except Exception as exc:
-            error = ValueError(exc.reason) if isinstance(exc, SharedPoleMemberRefused) else exc
+            error = ValueError(exc.reason) if isinstance(exc, TangentialMemberRefused) else exc
         agree_io_refusal(error, path=restart_path,
-                         stage="restart.shared_pole_member/read")
+                         stage="restart.tangential_member/read")
         receipt = hashlib.sha256(repr(member).encode("utf-8")).digest()
         receipts = np.asarray(all_gather_processes(np.frombuffer(receipt, np.uint8)))
         if not np.all(receipts == receipts.reshape(-1, 32)[0]):
-            raise SharedPoleMemberRefused("GATE shared_pole_member: ranks read different membership receipts")
+            raise TangentialMemberRefused("GATE tangential_member: ranks read different membership receipts")
         if member is None:
-            raise SharedPoleMemberMissing("GATE shared_pole_member: restart has no model member")
-        header = validate_shared_pole_model(
+            raise TangentialMemberMissing("GATE tangential_member: restart has no model member")
+        header = validate_tangential_model(
             restart_path.parent / member["path"],
             expected_identity=expected_identity, mesh_xy=mesh_xy,
             **({"capacity":capacity} if capacity is not None else {}))
         if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
-            raise ValueError("GATE shared_pole_member: payload authentication requires capacity")
+            raise ValueError("GATE tangential_member: payload authentication requires capacity")
         linked = {"schema": header["schema"], "digest": header["digest"],
                   "iteration_id": header["identity"]["iteration_id"]}
         for key, value in linked.items():
             if member[key] != value:
                 raise ValueError(
-                    f"GATE shared_pole_member: linked {key} changed; "
+                    f"GATE tangential_member: linked {key} changed; "
                     f"got {value!r}, want {member[key]!r}; rebuild the SC bundle")
         return (member, header) if return_header else member
-    except (SharedPoleMemberMissing, SharedPoleMemberRefused):
+    except (TangentialMemberMissing, TangentialMemberRefused):
         raise
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
-        raise SharedPoleMemberRefused(str(exc)) from exc
+        raise TangentialMemberRefused(str(exc)) from exc
 
 
 def _encode_charge_zeta_identity(receipt):

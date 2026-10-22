@@ -2,7 +2,7 @@
 
 Every GW stage ends in dense linear algebra on matrices whose side is the
 centroid count: the W Dyson solve, the ζ factors, the eigensolves of
-htransform, QSGW and the shared-pole constructor, and the GEMMs between them.
+htransform, QSGW and the tangential constructor, and the GEMMs between them.
 This page derives where each of those operations runs on a mesh of $P$
 devices: the sizes that decide it, the layouts and the exchanges between them,
 the distributed product, the two eigh routes, the inverse roots, the memory
@@ -89,10 +89,10 @@ A call therefore makes two exchanges whatever its block count, and joins its
 blocks into one buffer the size of the joined output. A sharding constraint
 on a global `take` can let GSPMD gather the operand onto one mesh axis.
 
-**Placing panels.** A shared-pole round joins $S$ state panels $[B, n, r_s]$ and
+**Placing panels.** A tangential round joins $S$ state panels $[B, n, r_s]$ and
 takes each slot's pencil columns from them
-([bispinor sectors §5.2](bispinor_shared_pole_w.md#5-construction), equation S 4a).
-`pack_panels` (`src/gw/shared_pole_local.py:286`) does this one panel at a time,
+([bispinor sectors §5.2](bispinor_tangential_w.md#5-construction), equation S 4a).
+`pack_panels` (`src/gw/tangential_local.py:286`) does this one panel at a time,
 before the round's programs, into row-major accumulators: packed column $f$ of
 slot $b$ is row $bF + f$, a complex value held as its (re, im) reals. In the batch
 layout each rank scatters its own slots' panel columns and no byte moves
@@ -104,15 +104,15 @@ the panel width and $F$, never by $S$, so a later SC map with more line panels
 makes more calls and no new program.
 
 **Tile-interleaved blocks.** When a face matrix's axis is a run of logical
-blocks, each a multiple of $p$, the shared-pole face pencils hold it in the
+blocks, each a multiple of $p$, the tangential face pencils hold it in the
 tile-interleaved order: rank row (column) $b$ holds the $b$-th $1/p$ of every
-block, in block order ([bispinor sectors §5.2](bispinor_shared_pole_w.md#5-construction),
+block, in block order ([bispinor sectors §5.2](bispinor_tangential_w.md#5-construction),
 equation S 4b). Joining or splitting blocks is then every rank's own
 concatenation or slice of its tiles. The adjoint is the tile at the mirrored
 grid position, one `ppermute` across the grid's diagonal, because rows and
 columns share the order. An eigensolve sees a symmetric permutation $PAP^\mathsf T$
 of the whole-order matrix, so either route returns the same spectrum with
-eigenvectors $Pu$. The tile algebra lives in `src/gw/shared_pole_pencil.py:39`.
+eigenvectors $Pu$. The tile algebra lives in `src/gw/tangential_pencil.py:39`.
 
 ### What GSPMD emits {#what-gspmd-emits}
 
@@ -250,7 +250,7 @@ $\bar A\,\mathrm{diag}(w)\,\bar B$ from the same exchange. A transposed operand
 crosses the grid diagonal in one `ppermute` and is transposed locally
 ([API](../services/distrib_la/api.md#bounded-face-products)). Face programs
 compile with XLA's latency-hiding scheduler (`FACE_COMPILER_OPTIONS`,
-`src/gw/shared_pole_execution.py:264`), which runs the prefetched gather beside
+`src/gw/tangential_execution.py:264`), which runs the prefetched gather beside
 the local GEMM.
 
 `panel_matmul` is the only distributed GEMM: every `matmul` request runs it on
@@ -264,9 +264,9 @@ already sit in the batch layout, `batch_gram`
 (`services/distrib_la/src/distrib_la/_panel_matmul.py:167`) contracts each
 device's own rows with the same local active-range GEMM (`_panel_contraction`),
 and only $W$ moves, batch to face. It has no panel loop: the contraction axis is
-whole on each device. The shared-pole Σ uses it when the replicated pole
+whole on each device. The tangential Σ uses it when the replicated pole
 columns do not fit and whole parents do
-([shared-pole model §8](shared_pole_model.md)).
+([tangential model §8](tangential_model.md)).
 
 ## 4 The eigh routes {#eigh-routes}
 
@@ -297,8 +297,8 @@ request, `LinalgResolution.eigh_backend` (`resolve_linalg`, the one owner):
 `linalg = local` asks `auto`, which is the platform's capacity eigh where one
 exists and a refusal by name (`GATE eigh_capacity_route`) at the stack that
 needs it where none does (ROCm today); `linalg = distributed` asks
-`distributed`, refused at plan time where the leg has none. The shared-pole sectors decide each stack so
-(`gw.shared_pole_execution.staged_eigh`); a caller that passes a
+`distributed`, refused at plan time where the leg has none. The tangential sectors decide each stack so
+(`gw.tangential_execution.staged_eigh`); a caller that passes a
 room instead lets `distrib_la` decide each stack by the same price
 ([API § eigh-stack](../services/distrib_la/api.md#eigh-stack)). Each figure is
 the largest any rank read and no size is exchanged, so every rank decides alike.
@@ -321,7 +321,7 @@ cuSOLVERMp returned wrong vectors with status 0 on such matrices
 
 ## 5 Inverse roots: Newton–Schulz
 
-The ordered shared-pole reduction needs $Z = A^{-1/2}$ of a Hermitian metric
+The ordered tangential reduction needs $Z = A^{-1/2}$ of a Hermitian metric
 $A$ that is the identity up to a small error. The coupled Newton–Schulz
 iteration
 
@@ -336,7 +336,7 @@ with $d_{\rm next} \le d^2(3+d)/4$. Each step is three batched GEMMs, so it runs
 `panel_matmul` in the face layout with no eigensolve. The iteration count is
 fixed from the initial bound, $\lceil \log_2(\ln \varepsilon_t / \ln d)\rceil$,
 never from an on-device residual, so every rank runs the same program
-(`_metric_inverse_root`, `src/gw/shared_pole_reduction.py:20`). For the paired
+(`_metric_inverse_root`, `src/gw/tangential_reduction.py:20`). For the paired
 sector metric, which is the identity to about $10^{-8}$ by construction, that is
 one iteration; an eigh-based root of the same stack costs more (claim 3425).
 The receipt reports $\max\|ZAZ - I\|_F/\sqrt R$. The checked eigh chain
@@ -430,7 +430,7 @@ With $\mu$ the padded centroid count and $Q$ the stage's q extent:
 | W Dyson solve (`gw.w_isdf.solve_w`) | per-q dense LU, $\lceil Q/P\rceil$ whole $(\mu,\mu)$ tiles per device; the distributed plan when they do not fit the budget ([memory model § routes](memory-model.md#routes)) | `plan('solve_lu', backend='distributed').batched`, $sQ\mu^2/P$; the μ axes never leave the face |
 | W ladder resolvent (`bse.w_ladder`, `screening_diagrams = w_bse`) | one code path for both layouts; no whole-$\mu^2$ object per device | same |
 | eigensolves (htransform `fH_q`, `vq_interp` `C_q`, QSGW $H_k$) | route (c): one whole matrix per device | the capacity route: one matrix over the mesh |
-| shared-pole constructor | q-local rounds, else face rounds with each eigh stack on route (c) or the mesh by `place()` | same ([bispinor sectors §4](bispinor_shared_pole_w.md#sector-route)) |
+| tangential constructor | q-local rounds, else face rounds with each eigh stack on route (c) or the mesh by `place()` | same ([bispinor sectors §4](bispinor_tangential_w.md#sector-route)) |
 | BSE restart load, matvec, W densify | face tiles through SlabIO and `shard_map`, $s\,n_k\mu^2/P$ | same |
 
 **Where the ζ factor saturates.** The charge factor's only parallel axis is q,
@@ -466,7 +466,7 @@ idle.
 side $R = 32000$ is $sR^2 = 16.4$ GB per matrix and is held several times over,
 so one whole TT parent per device would need 155.8 GB against 72.0 (CT 212.7, CC
 71.1). The sector constructor therefore runs on the face, one round of all 61
-parents ([bispinor sectors §8](bispinor_shared_pole_w.md#sector-byte-budget)).
+parents ([bispinor sectors §8](bispinor_tangential_w.md#sector-byte-budget)).
 
 **Its eighs still run whole.** The largest stack is the TT reduced eigh,
 $m = 20480$. On the mesh it would hold $s\,m^2/P = 105$ MB per matrix per

@@ -22,22 +22,22 @@ log = get_logger(__name__)
 
 def build_static_screened_w(wfns, V_q, *, config, meta, mesh_xy, sym=None,
                             centroid_indices=None, head_resolver=None, occupation_state=None,
-                            shared_pole=None,
+                            tangential=None,
                             print_fn=print):
     """Return W(0) and its matching q→0 head from a live or retained state.
 
     ``wfns`` contains the authenticated WFN centroid faces and energies in
-    Ry. Without ``shared_pole`` this is a direct Dyson solve, with no pole
+    Ry. Without ``tangential`` this is a direct Dyson solve, with no pole
     fit. A supplied model is the evaluated QSGW/one-shot state and is read
     through its existing synthesis owner. ``V_q`` is the matching bare
     QirrOperator. The response body
     and optional local-field head fold use the same transition manifold.
     """
-    if shared_pole is not None:
+    if tangential is not None:
         # A retained model belongs to its evaluated map. Rebuilding from a
         # parent DFT WFN here would discard the QSGW state and change W.
-        W = _shared_pole_static_body(
-            shared_pole, V_q, meta=meta, mesh_xy=mesh_xy, print_fn=print_fn)
+        W = _tangential_static_body(
+            tangential, V_q, meta=meta, mesh_xy=mesh_xy, print_fn=print_fn)
         return W, head_resolver.at(0.0j)
     if wfns is None:
         raise ValueError("Static Dyson screening requires wavefunction faces")
@@ -91,8 +91,8 @@ def build_static_w_from_restart(filename, input_file, mesh_xy, *, print_fn=print
             "GATE bse_static_w_bispinor_sectors: missing screened W0 on a "
             "four-current restart; the BSE direct kernel has no packed "
             "CC/CT/TC/TT response handoff. Supply an authenticated stored "
-            "charge W0 (a bispinor_gw = bare_transverse or full_shared_pole "
-            "shared-pole run stores one); a scalar rebuild would omit the "
+            "charge W0 (a bispinor_gw = bare_transverse or full_tangential "
+            "tangential run stores one); a scalar rebuild would omit the "
             "coupled sectors.")
     if config.qp_solver is QPSolver.SELF_CONSISTENT:
         raise ValueError(
@@ -137,22 +137,22 @@ def build_static_w_from_restart(filename, input_file, mesh_xy, *, print_fn=print
     return W, head, float(meta.cell_volume)
 
 
-def _shared_pole_static_body(shared_pole, V_q, *, meta, mesh_xy, print_fn):
+def _tangential_static_body(tangential, V_q, *, meta, mesh_xy, print_fn):
     """Evaluate the retained map at zero, using the sole pole synthesis owner."""
     from symmetry_maps import QirrOperator
     from .mpa.sector_sigma import sector_static_wc
-    from .mpa.sigma import shared_pole_static_wc
+    from .mpa.sigma import tangential_static_wc
     from .restart_q_storage import deposit_pre_unfold
 
     V_op = QirrOperator.of(V_q)
-    # Evaluated at V's q parents only: no full-q W is formed.  full_shared_pole
+    # Evaluated at V's q parents only: no full-q W is formed.  full_tangential
     # stores the CC sector (charge-sector W0; CT/TC/TT not stored).
-    evaluate = (sector_static_wc if shared_pole.get("representation") == "sector-ordered-ph"
-                else shared_pole_static_wc)
-    wc = evaluate(shared_pole, meta, mesh_xy=mesh_xy, rows=V_op.full_rows)
+    evaluate = (sector_static_wc if tangential.get("representation") == "sector-ordered-ph"
+                else tangential_static_wc)
+    wc = evaluate(tangential, meta, mesh_xy=mesh_xy, rows=V_op.full_rows)
     if tuple(wc.shape) != tuple(V_op.values.shape):
         raise ValueError(
-            "GATE shared_pole_static_w: model Wc(0) has shape "
+            "GATE tangential_static_w: model Wc(0) has shape "
             f"{tuple(wc.shape)}; V_q is {V_op.n_wedge} parent q x "
             f"{tuple(V_op.values.shape[1:])}; the two must share one "
             "packed centroid carrier")
@@ -165,7 +165,7 @@ def _shared_pole_static_body(shared_pole, V_q, *, meta, mesh_xy, print_fn):
             sym_idx_q=V_op.sym_idx, sym_perm=V_op.sym_perm,
             L_table=V_op.L_table, n_sym_spatial=V_op.n_sym_spatial,
             mu_basis=getattr(meta, "mu_basis", None))
-    log.info("  W0 (restart): V + Wc(omega = 0) of the shared-pole "
-             f"model {str(shared_pole.get('digest', ''))[:12]}, on {V_op.n_wedge} of "
+    log.info("  W0 (restart): V + Wc(omega = 0) of the tangential "
+             f"model {str(tangential.get('digest', ''))[:12]}, on {V_op.n_wedge} of "
              f"{V_op.n_full} q")
     return W0

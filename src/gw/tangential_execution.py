@@ -1,6 +1,6 @@
-"""Execution adapters for shared-pole equations on the complete x/y mesh.
+"""Execution adapters for tangential equations on the complete x/y mesh.
 
-The local adapter lives in shared_pole_local. This module supplies no new
+The local adapter lives in tangential_local. This module supplies no new
 physics: matrix operations enter through distrib_la, matrix results remain
 face tiled, and only spectra, masks and small scalar receipts replicate.
 """
@@ -22,7 +22,7 @@ def constructor_side_upper_bound(recipe, *, ordered, odd_moments,
     independently selected partner direction. Multiplet closure is carried by
     ``column_extent``. This is an admission bound, never a retained-rank rule.
     """
-    from gw.shared_pole_recipe import ROLE_CODES
+    from gw.tangential_recipe import ROLE_CODES
 
     held = np.asarray(recipe['held'], dtype=bool)
     roles = np.asarray(recipe['role'], dtype=np.int64)
@@ -47,7 +47,7 @@ def constructor_side_upper_bound(recipe, *, ordered, odd_moments,
 
 def line_panel_count(recipe):
     """Fitted line supports off the imaginary axis: the samples the bank stores as panels."""
-    from gw.shared_pole_directions import _sample_point
+    from gw.tangential_directions import _sample_point
     return sum(1 for sid in recipe['fit_ids'] if _sample_point(recipe, int(sid)).real != 0)
 
 
@@ -84,7 +84,7 @@ def line_selection_price(rows, *, mesh, nq, execution, eigh_backend):
     """
     import math
     import distrib_la
-    from gw.shared_pole_capacity import constructor_price_plan
+    from gw.tangential_capacity import constructor_price_plan
     ranks = int(mesh.size)
     blocks = sum(int(a) * int(b) for a in rows for b in rows)
     largest = max(int(r) for r in rows)
@@ -104,7 +104,7 @@ def line_selection_price(rows, *, mesh, nq, execution, eigh_backend):
     return int(resident), int(workspace)
 
 
-def whole_parent_execution(price, *, ledger, carry=0, site="shared-pole whole parents", whole=0):
+def whole_parent_execution(price, *, ledger, carry=0, site="tangential whole parents", whole=0):
     """'local' when whole parents per rank fit the ledger beside its live stages, else 'face'.
 
     ``price(execution)`` returns the route's ``(resident, workspace)`` bytes per
@@ -141,7 +141,7 @@ def line_selection_execution(rows, *, mesh, ledger, nq, eigh_backend, carry=0):
     return whole_parent_execution(
         lambda execution: line_selection_price(rows, mesh=mesh, nq=nq, execution=execution,
                                                eigh_backend=eigh_backend),
-        ledger=ledger, carry=carry, site=f"shared-pole line selection {int(nq)} parents",
+        ledger=ledger, carry=carry, site=f"tangential line selection {int(nq)} parents",
         whole=max(map(int, rows)))
 
 
@@ -155,11 +155,11 @@ def line_selection_room(ledger, resident, *, carry=0):
     ``check_eigh_room`` hands that reservation back. A shape price, the same
     on every rank; 0 (no room) refuses by name.
     """
-    from gw.shared_pole_capacity import face_eigh_room
+    from gw.tangential_capacity import face_eigh_room
     return face_eigh_room(ledger.preview(resident_bytes_per_rank=int(resident) + int(carry),
                                          workspace_bytes_per_rank=0,
                                          concurrent_with=ledger.live_stages),
-                          stage="shared-pole line selection")
+                          stage="tangential line selection")
 
 
 def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
@@ -188,7 +188,7 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     resident per rank the local round runs beside (an earlier sector's held
     outputs, ``held_sector_bytes``).
     """
-    from gw.shared_pole_capacity import ConstructorCapacity
+    from gw.tangential_capacity import ConstructorCapacity
 
     if (cross_original_sides is None) != (cross_retained_side is None):
         raise ValueError('cross route requires both original sides and retained side')
@@ -247,7 +247,7 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
         # The face's own batch fills the room later (face_batch_width), so its
         # price here is the provider's contexts alone; the caller records the
         # map's final route.
-        decision.update(memory.admit('shared-pole constructor', (
+        decision.update(memory.admit('tangential constructor', (
             ('local', dataclasses.replace(ledger.price(max(rows, key=lambda r: r['aggregate_bytes_per_rank'])),
                                           whole=int(side))),
             ('face', memory.Price(outside=memory.contexts()))),
@@ -413,7 +413,7 @@ def face_eigh(mesh, n, *, room, backend):
     """
     import dataclasses
     if room is None:
-        raise ValueError("GATE shared_pole_eigh_room: got: face_eigh(room=None); want: the caller's "
+        raise ValueError("GATE tangential_eigh_room: got: face_eigh(room=None); want: the caller's "
                          "room (face_eigh_room) or RoomExhausted; why: a face plan with no room "
                          "refuses every stack; a pricing caller uses face_eigh_price")
     from distrib_la import RoomExhausted
@@ -460,12 +460,12 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
     equality ignores the room the stacks were decided in. ``carrier``
     (``face_ritz_carrier``) solves an ordered pencil's kept span on that many
     columns, None keeping the whole H'_vv side. The state columns arrive packed
-    (``shared_pole_local.pack_panels``), so the program's shape is the round's
+    (``tangential_local.pack_panels``), so the program's shape is the round's
     extent and never its panel count.
     """
-    from gw.shared_pole_local import solve_parent_pencil
-    from gw.shared_pole_gates import sort_shared_pole_columns
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
+    from gw.tangential_local import solve_parent_pencil
+    from gw.tangential_gates import sort_tangential_columns
+    from gw.tangential_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
     gates=shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     mm=face_matmul(mesh)
     if eigh_plan is None:
@@ -477,7 +477,7 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
             keep_budget=keep_budget,retain_span=retain_span,gram_keep=gram_keep,
             matrix_sharding=NamedSharding(mesh,P(None,"x","y")),carrier=carrier)
         model,signed,diagnostics=reduced[:3]
-        model,permutation=sort_shared_pole_columns(model, matrix_sharding=NamedSharding(mesh,P(None,"x","y")))
+        model,permutation=sort_tangential_columns(model, matrix_sharding=NamedSharding(mesh,P(None,"x","y")))
         result=model,signed,(*diagnostics,permutation)
         return (*result,reduced[3]) if retain_span else result
     return face_program(body,mesh,outputs='parent')
@@ -494,7 +494,7 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     side. ``eigh_backend`` is the deck's eigh request (``face_eigh``). A short last round's synthetic slots repeat its last parent
     (``parent_rounds``); callers read only the leading real slots. An ordered round's
     columns enter the tile-interleaved order of the face (``interleave_tables``)."""
-    from gw.shared_pole_pencil import interleave_tables
+    from gw.tangential_pencil import interleave_tables
     if ordered:
         tables=interleave_tables(tables,int(mesh.shape['y']))
     side=tables['active'].shape[-1]
@@ -503,7 +503,7 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     program=lambda room: face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep,
                                              face_eigh(mesh,side,room=room,backend=eigh_backend),
                                              None if carrier is None else int(carrier),plan_room(room))
-    from gw.shared_pole_local import pack_panels
+    from gw.tangential_local import pack_panels
     packed=pack_panels(tuple([s[k] for s in states] for k in (1,2,3)),tables['order'],
                        [int(s[1].shape[-1]) for s in states],mesh_xy=mesh,layout='face')
     args=(tables['points'],tables['active'],*packed,tuple(infinity))
@@ -542,7 +542,7 @@ def price_round(executable, mesh, beside, whole=False):
                                         source=f"{'local' if whole else 'face'} round program "
                                                "(memory_analysis temp + outputs - alias)"),
                         ranks=ranks, label="reduction round executable")
-    memory.admit("shared-pole reduction round", beside + part, memory.run()["budget"])
+    memory.admit("tangential reduction round", beside + part, memory.run()["budget"])
     memory.book(part)
 
 
@@ -582,8 +582,8 @@ def face_round_check_program(mesh, ordered, eigh_plan, room=None):
     its room whether the passivity eighs run on the mesh or one per rank;
     ``room`` (:func:`plan_room`) keys the program with it.
     """
-    from gw.shared_pole_local import _round_check_equations
-    from gw.shared_pole_recipe import (shared_real_pole_gates_ordered_v1,
+    from gw.tangential_local import _round_check_equations
+    from gw.tangential_recipe import (shared_real_pole_gates_ordered_v1,
                                        shared_real_pole_gates_v1_r3b)
     gates = (shared_real_pole_gates_ordered_v1 if ordered else
              shared_real_pole_gates_v1_r3b)
@@ -606,7 +606,7 @@ def face_round_check_program(mesh, ordered, eigh_plan, room=None):
 #: and 1.46 (2048); the compiled sizing figures of the P4 Fe 4^3 (0.95, CT
 #: 1.09-1.51) and CrI3 6x6 (0.82-1.48) receipts and of the P64 CrI3 24x24
 #: receipt (1.57-1.63). Two copies bound every one of them
-#: (``tests/test_shared_pole_face_price.py`` replays those receipts).
+#: (``tests/test_tangential_face_price.py`` replays those receipts).
 FACE_PROGRAM_COPIES = 2
 
 
@@ -614,15 +614,15 @@ def _face_price(mesh, rows, width, side, phase, **terms):
     """Bytes per rank of one face round program for ``width`` parents: an upper bound.
 
     ``FACE_PROGRAM_COPIES`` of the byte model that admits every local round
-    (``shared_pole_byte_terms``), tiled over the mesh (``width / P`` copies
+    (``tangential_byte_terms``), tiled over the mesh (``width / P`` copies
     each). The eigh and matmul workspace is quoted beside it
     (``ConstructorCapacity.quote``), as it was beside the compiled figure.
     Nothing is compiled to be measured, and every rank prices the same
     shapes, so the figure is agreed by construction.
     """
     from types import SimpleNamespace
-    from gw.shared_pole_capacity import shared_pole_byte_terms
-    price = shared_pole_byte_terms(SimpleNamespace(n_rmu_padded=int(rows)), mesh_xy=mesh,
+    from gw.tangential_capacity import tangential_byte_terms
+    price = tangential_byte_terms(SimpleNamespace(n_rmu_padded=int(rows)), mesh_xy=mesh,
                                    resolution=SimpleNamespace(layout='distributed'), pencil_side=int(side),
                                    parent_batch=int(width), sample_batch=1, phase=phase, **terms)
     return FACE_PROGRAM_COPIES * int(price['terms_bytes_per_rank']['phase_dense_temporaries'])
@@ -679,7 +679,7 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, comp
 
     The scalar face route runs a batch of physical parents per round, every
     matrix tiled over all ranks (``face_reduce_round``); the bispinor sectors
-    size their rounds by P instead (``shared_pole_sectors.sector_route``). Before
+    size their rounds by P instead (``tangential_sectors.sector_route``). Before
     any bank read, at the conservative recipe side, the ``selection`` price
     (its ``quote`` arguments) may reject a width; ``compiled(width, room)``, the
     reduction program compiled at that width's abstract operands with its eighs
@@ -690,7 +690,7 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, comp
     per shape, and step down in proportion to the whole price. The constructor still
     admits every phase at its actual side.
     """
-    from gw.shared_pole_capacity import ConstructorCapacity, face_eigh_room
+    from gw.tangential_capacity import ConstructorCapacity, face_eigh_room
 
     budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh, ledger=ledger,
                                  upstream=upstream, execution='face')
@@ -710,7 +710,7 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, comp
         # The row reserves the round's eigh stacks as its native workspace: that is their room.
         reduction = row('reduction', extra(width), eigen_side=eigen_side)
         room = face_eigh_room(reduction, held - int(reduction['workspace_bytes_per_rank']),
-                              stage="shared-pole constructor batch admission")
+                              stage="tangential constructor batch admission")
         price = budget.program_bytes = max(1, int(compiled(width, room)))
         reduction = row('reduction', extra(width), eigen_side=eigen_side)
         receipt = dict(parent_batch=width, program_bytes_per_rank=price, selection=picked, reduction=reduction,
@@ -725,28 +725,28 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, comp
 
 @lru_cache(maxsize=None)
 def cross_action_program(mesh,mirror,imaginary,conjugate):
-    from gw.shared_pole_sectors import _cross_products
+    from gw.tangential_sectors import _cross_products
     return face_program(partial(_cross_products,mirror=mirror,imaginary=imaginary,
         conjugate=conjugate,mm=face_matmul(mesh)),mesh)
 
 
 @lru_cache(maxsize=None)
 def positive_cross_program(mesh):
-    from gw.shared_pole_sectors import _positive_cross_equations
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    from gw.tangential_sectors import _positive_cross_equations
+    from gw.tangential_recipe import shared_real_pole_gates_ordered_v1 as gates
     return face_program(partial(_positive_cross_equations,gates=gates,
         matrix_sharding=NamedSharding(mesh,P(None,"x","y"))),mesh,outputs='positive_cross')
 
 
 @lru_cache(maxsize=None)
 def held_program(mesh):
-    from gw.shared_pole_sectors import _sector_held_equations
+    from gw.tangential_sectors import _sector_held_equations
     return face_program(partial(_sector_held_equations,mm=face_matmul(mesh)),mesh,outputs='scalars')
 
 
 @lru_cache(maxsize=None)
 def compact_program(mesh,width):
-    from gw.shared_pole_sectors import _compact_sector_equations
+    from gw.tangential_sectors import _compact_sector_equations
     return face_program(partial(_compact_sector_equations,width=width,
         matrix_sharding=NamedSharding(mesh,P(None,"x","y"))),mesh,outputs='compact')
 
@@ -754,7 +754,7 @@ def compact_program(mesh,width):
 # ---- the staged face route: a round of parents in flight, stage programs over sub-batches ----
 #
 # The paired reduction is GEMM stages with an eigh between them
-# (``shared_pole_reduction``). A face round of w parents run as one program
+# (``tangential_reduction``). A face round of w parents run as one program
 # holds eigh stacks of w matrices, so the round count sets the eigh wall: 21
 # rounds of 3 at CrI3 24x24 P64 cost 21 serial local eighs (SECTFAST). Here
 # each GEMM stage runs as its own program over sub-batches of ``width``
@@ -863,7 +863,7 @@ def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):
     eigh request (``LinalgResolution.eigh_backend``) for the whole mesh."""
     import distrib_la
     from lxkit import memory
-    from gw.shared_pole_capacity import _local_eigenplan
+    from gw.tangential_capacity import _local_eigenplan
     n = int(stack[-1])
     local = _local_eigenplan(mesh, n)
     need = int(beside) + distrib_la.eigh_stack_bytes(local, stack, np.complex128)
@@ -876,7 +876,7 @@ def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):
                      + distrib_la.eigh_stack_bytes(mesh_plan, stack, np.complex128))
     except RuntimeError as refusal:      # no whole-mesh library here: route (c) or that refusal
         mesh_plan, no_mesh, mesh_need = None, refusal, 0
-    site = f"shared-pole {label} eigh stack {int(stack[0])} x {n}^2"
+    site = f"tangential {label} eigh stack {int(stack[0])} x {n}^2"
     mesh_row = dict(row, aggregate_bytes_per_rank=mesh_need, workspace_bytes_per_rank=0,
                     resident_bytes_per_rank=mesh_need - row['aggregate_bytes_per_rank'] + need)
     if memory.admit(site, (
@@ -886,7 +886,7 @@ def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):
         return local
     if no_mesh is not None:
         raise no_mesh
-    mesh_plan.require_capacity(f"shared-pole {label} eigh stack {int(stack[0])} x {n}^2")
+    mesh_plan.require_capacity(f"tangential {label} eigh stack {int(stack[0])} x {n}^2")
     return mesh_plan
 
 
@@ -917,10 +917,10 @@ def _run_stages(mesh, nq, width, program, *stacks):
 @lru_cache(maxsize=None)
 def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_keep, carrier):
     """The four stage programs of the staged face reduction, each jitted on the face."""
-    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil
-    from gw.shared_pole_reduction import paired_members, keep_stage, paired_stage, output_stage
-    from gw.shared_pole_gates import sort_shared_pole_columns, apply_shared_pole_zero_policy, ordered_moment_identity
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    from gw.tangential_pencil import assemble_ordered_tangential_pencil
+    from gw.tangential_reduction import paired_members, keep_stage, paired_stage, output_stage
+    from gw.tangential_gates import sort_tangential_columns, apply_tangential_zero_policy, ordered_moment_identity
+    from gw.tangential_recipe import shared_real_pole_gates_ordered_v1 as gates
     if not (ordered and odd_moments):
         raise ValueError('the staged face route is the ordered sector reduction')
     mm = face_matmul(mesh)
@@ -945,7 +945,7 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
                     **({'width': int(stage['kept'].shape[-1])} if 'kept' in stage else {}))
 
     def stage1(points, active, q, o, d, infinity):
-        pencil = assemble_ordered_shared_pole_pencil([(points, q, o, d)], infinity, matmul=mm, matrix_sharding=ms)
+        pencil = assemble_ordered_tangential_pencil([(points, q, o, d)], infinity, matmul=mm, matrix_sharding=ms)
         stage = paired_members(pencil, active, gates=gates, matrix_sharding=ms)
         stage['paired'] = jnp.broadcast_to(stage['paired'], (points.shape[0],))
         return arrays(stage)
@@ -963,9 +963,9 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
                                matrix_sharding=ms)
         model, signed, reduction = reduced[:3]
         retained = ordered_moment_identity(signed, infinity, matmul=mm)
-        model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+        model, zero = apply_tangential_zero_policy(model, gates=gates)
         zero['zero_policy'] = zero['zero_policy'] & reduction['infinite_weight_ok']
-        model, permutation = sort_shared_pole_columns(model, matrix_sharding=ms)
+        model, permutation = sort_tangential_columns(model, matrix_sharding=ms)
         result = model, signed, (reduction, zero, retained, permutation)
         return (*result, reduced[3]) if retain_span else result
     return tuple(face_program(fn, mesh, outputs='mixed' if i < 3 else 'parent')
@@ -983,16 +983,16 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
     eigh stack k (its ledger row) while it runs. Returns what ``face_reduce_round`` returns,
     for every parent of the round, its original-pencil span (``retain_span``) with its rows in
     the face's tile-interleaved order, as the round's columns enter it (``interleave_tables``)."""
-    from gw.shared_pole_pencil import interleave_tables
+    from gw.tangential_pencil import interleave_tables
     tables = interleave_tables(tables, int(mesh.shape['y']))
     nq = int(tables['active'].shape[0])
     programs = _stage_programs(mesh, bool(ordered), bool(odd_moments), None if keep_budget is None else int(keep_budget),
                                bool(retain_span), gram_keep, None if carrier is None else int(carrier))
     (stage1, stage2, stage3, stage4), passthrough = programs
     hvv_eigh, schur_eigh, reduced_eigh = (plan.batched for plan in eigh_plans)
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    from gw.tangential_recipe import shared_real_pole_gates_ordered_v1 as gates
     cut = gates["normalized_gram_keep"]["threshold"] if gram_keep is None else gram_keep  # keep_stage's cut
-    from gw.shared_pole_local import pack_panels
+    from gw.tangential_local import pack_panels
     widths = [int(s[1].shape[-1]) for s in states]
 
     def members(points, order, active, qs, os_, ds, infinity):
@@ -1050,15 +1050,15 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
 @lru_cache(maxsize=None)
 def cross_pencil_program(mesh):
     """The CT joint pencil (metric, value, O_C, O_T) of a face round, no eigh."""
-    from gw.shared_pole_sectors import _cross_pencil_equations
+    from gw.tangential_sectors import _cross_pencil_equations
     return face_program(partial(_cross_pencil_equations, mm=face_matmul(mesh),
                                 matrix_sharding=NamedSharding(mesh, P(None, "x", "y"))), mesh)
 
 
 @lru_cache(maxsize=None)
 def _cross_stage_programs(mesh):
-    from gw.shared_pole_sectors import joint_keep_stage, joint_output_stage
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    from gw.tangential_sectors import joint_keep_stage, joint_output_stage
+    from gw.tangential_recipe import shared_real_pole_gates_ordered_v1 as gates
     mm = face_matmul(mesh)
     ms = NamedSharding(mesh, P(None, 'x', 'y'))
     flat = lambda d: {k: v for k, v in d.items() if k != 'diagnostics'} | {'d_' + k: v for k, v in d['diagnostics'].items()}
@@ -1088,7 +1088,7 @@ def face_cross_decoupled(pencil, *, mesh, eigh_plans, width, eigh_rows=None):
     keep, output = _cross_stage_programs(mesh)
     run = partial(_run_stages, mesh, nq, width)
     with timing.section('decoupled.eigh_metric'), priced(0, eigh_plans[0], pencil[0]):
-        from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+        from gw.tangential_recipe import shared_real_pole_gates_ordered_v1 as gates
         gamma, u = eigh_plans[0].batched(pencil[0], cut=gates["normalized_gram_keep"]["threshold"])
     with timing.section('decoupled.keep'):
         stage = run(keep, *pencil, gamma, u)

@@ -11,7 +11,7 @@ The representation is deliberately general: poles need not be real, residues
 need not be positive, and a lesser/noise realization may contain poles absent
 from the retarded response.  Those properties are required by the proposed
 full-matrix nonequilibrium closure in ``docs/theory/td_agw_dynamical.md`` and
-are outside the contracts of :mod:`gw.shared_pole_constructor`.
+are outside the contracts of :mod:`gw.tangential_constructor`.
 
 The routines below provide the small-matrix oracle for three operations that
 must be certified before a distributed implementation is admitted:

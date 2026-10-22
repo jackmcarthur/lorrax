@@ -53,14 +53,14 @@ bands. The Na stages run in `run/na/`.
 | htransform | `bandstructure.htransform` | Galerkin band interpolation on a G–X–M path with two interior points per segment (`htransform.in`): the 5 × 5 × 1 grid has spacing 0.2, so the interior points at multiples of 2/15 are off the grid; the corners are on it |
 | exciton_bands | `bse.exciton_bands` | fH interpolation, then finite-Q TDA (1v × 1c) on the same path |
 | cohsex | `gw.gw_jax` | static COHSEX one-shot, restarted |
-| sp_export | `gw.gw_jax` | shared-pole one-shot with `write_w`/`write_poles` (the file-model path), restarted; the W bank is compared by value, the pole model by member shapes |
+| sp_export | `gw.gw_jax` | tangential one-shot with `write_w`/`write_poles` (the file-model path), restarted; the W bank is compared by value, the pole model by member shapes |
 | kin_ion_bisp | `gw.kin_ion_io` | four-component kinetic-balance kinetic + ionic matrix elements |
 | dipole_bisp | `psp.get_dipole_mtxels` | the four-component dipole the direct head authenticates |
-| bisp_sc | `gw.gw_jax` | `bispinor_gw = full_shared_pole` through the SC driver, 2 maps: fresh charge + transverse ζ (both on the charge centroid set), ordered CC/CT/TC/TT sector poles, direct four-current Γ head, `sc_head_update = dft_velocity`, live four-current density, the default band extrapolation (on the CC class); map 0 is the one-shot |
+| bisp_sc | `gw.gw_jax` | `bispinor_gw = full_tangential` through the SC driver, 2 maps: fresh charge + transverse ζ (both on the charge centroid set), ordered CC/CT/TC/TT sector poles, direct four-current Γ head, `sc_head_update = dft_velocity`, live four-current density, the default band extrapolation (on the CC class); map 0 is the one-shot |
 | bse_bisp | `bse.bse_jax` | TDA Davidson after `bisp_sc` on the four-component restart: the final map's W0 = V + W_c,CC(0) (charge sector only) |
 | na_kin_ion | `gw.kin_ion_io` | bcc Na kinetic + ionic matrix elements; the 56 orbit-closed centroids (fitted on the ζ legs, 8 × 13) are stored in `fixture_na/` |
 | na_dipole | `psp.get_dipole_mtxels` | the default dipole: q→0 velocity plus the parallel-transport link artifact |
-| na_sc | `gw.gw_jax` | metal shared-pole QSGW, 2 maps to a 1.5 eV criterion, production defaults: Fermi-Dirac fixed-N occupations and metal head, `number_bands_protected = 8` (QP matrix 1–8, tail 9–13), 2s and 2p read on two coarse windows at η 5 eV, `sc_semicore = dft`, the rigid tail with min(Z, 1/Z) weights, spectral_shell extrapolation, held Σ windows re-planned on escape, `write_qsgw_datasets`, the unnamed `sc_head_update`, which resolves to `parallel_transport` (the 3³ links fail `GATE pt_head_window_hybridized`, so the map runs with the Σ term D_kΔH zeroed) with its per-map head block, distributed linalg |
+| na_sc | `gw.gw_jax` | metal tangential QSGW, 2 maps to a 1.5 eV criterion, production defaults: Fermi-Dirac fixed-N occupations and metal head, `number_bands_protected = 8` (QP matrix 1–8, tail 9–13), 2s and 2p read on two coarse windows at η 5 eV, `sc_semicore = dft`, the rigid tail with min(Z, 1/Z) weights, spectral_shell extrapolation, held Σ windows re-planned on escape, `write_qsgw_datasets`, the unnamed `sc_head_update`, which resolves to `parallel_transport` (the 3³ links fail `GATE pt_head_window_hybridized`, so the map runs with the Σ term D_kΔH zeroed) with its per-map head block, distributed linalg |
 
 All stages run in one Python process per rank (`chain.run_stage` calls each
 driver's `main` in sequence): one `jax.distributed` world, one FFI load, one
@@ -95,7 +95,7 @@ only) makes one rank refuse after (or before) a stage's driver, to check
 this path.
 
 Not covered:
-- GN-PPM through the SC driver: the shared-pole stages are the SC runs;
+- GN-PPM through the SC driver: the tangential stages are the SC runs;
 - `screening_diagrams = w_bse`: it refuses on a time-reversal-broken
   reference (`GATE w_bse_requires_measured_trs`);
 - the planners' chunked paths: at μ = 6 every object is KB-sized, and a

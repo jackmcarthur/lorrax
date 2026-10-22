@@ -613,7 +613,7 @@ def project_little_group_operator(
         # Steps run in segments; a segment [lo, hi) transforms only the parents
         # whose group has operations past lo.  Padding every parent to the
         # largest group made the loop cost n_parents x max|G_q| tile transforms
-        # instead of sum|G_q| (bcc 8^3: 2784 vs 430, ~37 ms of a Na shared-pole
+        # instead of sum|G_q| (bcc 8^3: 2784 vs 430, ~37 ms of a Na tangential
         # Sigma tau node).  Each parent still adds its operations in the same
         # order, and a parent's padded steps add exact zeros, as before; the
         # phase is formed over all parents.

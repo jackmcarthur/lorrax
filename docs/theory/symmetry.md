@@ -197,7 +197,7 @@ of a nonsymmorphic group and breaks closure.
   built from conjugated faces and unconjugated weights. It equals
   \(\overline{G_{\bar{\mathbf k}}}\) only when the weights are real.
   Conjugating instead would send \(G(t)\) to \(G(-t)\) and flip the sign of
-  \(\operatorname{Im}\Sigma\), the lifetime. Multipole and shared-pole
+  \(\operatorname{Im}\Sigma\), the lifetime. Multipole and tangential
   residues use the same rule; pole positions carry no wrap phase.
 * A rectangular operator between two centroid families (the charge–current
   tiles CT and TC) uses each family's own \((\alpha,\mathbf L)\) on each

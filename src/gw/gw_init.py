@@ -46,7 +46,7 @@ from .gw_config import (
 	refuse_unsupported_bispinor_gw,
 	uses_bare_tt_gamma_head,
 	uses_coupled_photon_head,
-	uses_direct_bispinor_shared_pole_head,
+	uses_direct_bispinor_tangential_head,
 )
 
 # ── The ζ file's PUBLIC API ──────────────────────────────────────────────
@@ -2296,7 +2296,7 @@ def _bispinor_charge_tile(zeta_g, *, cfg, meta, wfn, sym, centroid_indices,
 def _bispinor_tt_head(cfg):
     """Whether the four-current V's TT tiles carry the Γ mini-BZ head."""
     return (uses_bare_tt_gamma_head(cfg)
-            or uses_direct_bispinor_shared_pole_head(cfg))
+            or uses_direct_bispinor_tangential_head(cfg))
 
 
 def _bispinor_v_policy(cfg, meta):
@@ -2449,7 +2449,7 @@ def _compute_photon_vq(
     # ``_finalize_vq_views`` is the one packing owner.
     G0_all = photon_g0_vectors[0]
     if not (uses_coupled_photon_head(cfg)
-            or uses_direct_bispinor_shared_pole_head(cfg)):
+            or uses_direct_bispinor_tangential_head(cfg)):
         photon_g0_vectors = None
 
     head_channel = None
@@ -3207,7 +3207,7 @@ def _restart_gamma_vectors(
         _to_run_order, basis_T, cfg, mesh_xy, meta, photon_g0_vectors, tmp_dir):
     """Produce canonical Gamma vectors from the stored one-leg factors."""
     if (uses_coupled_photon_head(cfg)
-            or uses_direct_bispinor_shared_pole_head(cfg)):
+            or uses_direct_bispinor_tangential_head(cfg)):
         from file_io.restart_bundle import read_photon_gamma
         bases = (meta.mu_basis, basis_T, basis_T, basis_T)
         photon_g0_vectors = tuple(

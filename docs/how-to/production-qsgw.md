@@ -1,6 +1,6 @@
 # Production QSGW: the recipe and its error budget
 
-**The production GW calculation is full-frequency QSGW with the shared-pole
+**The production GW calculation is full-frequency QSGW with the tangential
 W, built from residues.** GN-PPM is not the production route
 ([decisions](../architecture/decisions.md#production-gw-route)).
 
@@ -8,15 +8,15 @@ This page owns the production recipe: the route, the options it sets, the
 minimum settings, the error budget and which parts are on main. Key
 meanings are in the [input reference](../input_reference.md); the QSGW map and
 its stop rules in [self-consistency](../self_consistency.md); the W model in
-[shared-pole W](../theory/shared-pole-w-model.md); metal-only rules in
+[tangential W](../theory/tangential-w-model.md); metal-only rules in
 [metals](metals.md). Numbers cite sandbox claims.
 
 ## The route
 
-- **W.** `compute_mode = mpa` with `sigma_w_model = shared_pole`. Each map
+- **W.** `compute_mode = mpa` with `sigma_w_model = tangential`. Each map
   rebuilds W_c as one set of real poles per q, shared by every matrix element,
   with positive residues, from samples of W_c and ∂W_c and the exact moments
-  ([theory](../theory/shared-pole-w-model.md)). `compute_mode = auto` never
+  ([theory](../theory/tangential-w-model.md)). `compute_mode = auto` never
   selects `mpa`, so the deck names it. The tier `sigma_w_accuracy =
   production` is the default.
 - **Σ.** Σ_c(ω) on the real axis from the pole sum, by the certified
@@ -40,7 +40,7 @@ its stop rules in [self-consistency](../self_consistency.md); the W model in
   Do not set `number_bands_chi` or `number_bands_sigma` apart from it. Choose
   N for χ₀, which is not extrapolated.
 - **Band extrapolation.** On by default (`use_band_extrapolation`). Σ's G sum
-  is extrapolated past N by the pooled `spectral_shell` fit, on the shared-pole
+  is extrapolated past N by the pooled `spectral_shell` fit, on the tangential
   Σ (scalar and both bispinor routes) as on GN/HL-PPM. The exponent is fixed at β = 3 and only the shell offset
   Ω is fitted. Ω is bounded below on every map so that every requested state
   keeps a tail ([band extrapolation](../theory/band-extrapolation.md#the-model)).
@@ -52,7 +52,7 @@ its stop rules in [self-consistency](../self_consistency.md); the W model in
   [metals](metals.md). An SC deck that does not name `sc_head_update` takes
   `parallel_transport` when the link artifact exists (the dipole step writes
   it by default), else `dft_velocity` from `dipole.h5`, else `off`. This holds
-  on scalar decks and on `bispinor_gw = full_shared_pole`, whose direct Γ head
+  on scalar decks and on `bispinor_gw = full_tangential`, whose direct Γ head
   reads the same velocity. On a metal, `bare_transverse` refuses
   `parallel_transport`. The run keeps that head on every map, and
   complete links always serve the Σ term D_kΔH. The link error is a
@@ -92,7 +92,7 @@ The keys that differ from the defaults:
 [cohsex]
 sys_dim = 3             # 2 for a slab
 compute_mode = mpa
-sigma_w_model = shared_pole
+sigma_w_model = tangential
 qp_solver = self_consistent
 sc_tol_ev = 1e-3
 number_bands_protected = M  # b3, the QP-matrix top; a convergence parameter
@@ -138,7 +138,7 @@ midgap, and the error of the smallest gap on the k grid.
 extrapolated, by design: the ISDF basis is fitted on pairs of bands inside
 the band set ([scope](../theory/band-extrapolation.md#scope)). W's band
 convergence is the largest remaining dependence on N. Si 4³ scalar, 25 Ry,
-one-shot, headless, shared-pole Σ_c read at E_DFT, 71 states, against the
+one-shot, headless, tangential Σ_c read at E_DFT, 71 states, against the
 complete basis of 536 bands (claim 3027):
 
 | N | W at N, G complete | W at N, G at N and extrapolated (production) |
@@ -217,7 +217,7 @@ The recipe fixes two more sources:
 - **W model.** QP RMS 0.80 meV against contour deformation at the pole cap
   (Si, near-gap window); 8.2 meV non-rigid RMS in a wider window at the same
   supports (claim 2431;
-  [pole count](../theory/shared-pole-w-model.md#shared-pole-pole-count)).
+  [pole count](../theory/tangential-w-model.md#tangential-pole-count)).
 - **Semicore read at η_semi = 5 eV.** E_F ± 1 eV std / max 3.6 / 15.9 meV
   (Fe 4³, against η_semi = 1 eV) and 2.9 / 20.0 meV (MoS2 3×3, against the
   deck η), both converged SC (claim 2960). `sigma_omega_patches_ev` sets
@@ -250,12 +250,12 @@ did not fit the devices and streamed to per-rank files: 34.9 GiB per rank,
 
 ## On main
 
-- The shared-pole W rebuilt every map, the full-frequency Σ and the QSGW map
+- The tangential W rebuilt every map, the full-frequency Σ and the QSGW map
   above.
 - ε 1e-4 on every Σ route, with rules built cold in each run
   (claim 2941) and planned once at map 0, then held
   ([self-consistency §4](../self_consistency.md#sigma-grid-and-quadrature)).
-- The pooled `spectral_shell` extrapolation at β = 3 on the shared-pole Σ and
+- The pooled `spectral_shell` extrapolation at β = 3 on the tangential Σ and
   on GN/HL-PPM.
 - The band classes above: `number_bands_protected` (or `nval`/`ncond`; giving
   both refuses), the QP matrix inside the ζ left range
@@ -267,7 +267,7 @@ did not fit the devices and streamed to per-rank files: 34.9 GiB per rank,
 - The velocity heads and their per-map head block, as above.
 - W's line sites held across maps while they drift by at most
   max(3 meV, 0.1 × the previous map's max|dE|)
-  ([self-consistency §6](../self_consistency.md#shared-pole-w-with-retained-quadrature)).
+  ([self-consistency §6](../self_consistency.md#tangential-w-with-retained-quadrature)).
 
 ## Open
 

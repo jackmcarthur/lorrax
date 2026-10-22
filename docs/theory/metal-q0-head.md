@@ -2,7 +2,7 @@
 
 This page owns the long-wavelength response of a metal as it enters the
 Γ-cell head: the scalar charge head (`gw.qsgw_head`) and the four-current
-direct head of `full_shared_pole` (`gw.photon_direct_head`). Both take one
+direct head of `full_tangential` (`gw.photon_direct_head`). Both take one
 Fermi-surface model, one intraband/interband split and one cell average from
 the same owners. Nothing in it assumes a spherical Fermi surface or a
 spherical cell. Occupations, the frequency plan and the finite-q body are
@@ -321,7 +321,7 @@ bank's consumer ([four-current heads §5](four-current-head-corrections.md#direc
   $z\ne0$ (q-independent in the cell, error confined to near-line samples
   $|z|\lesssim q_{\rm cell}u_F$, i.e. to $Z$). The static row's fold takes the
   row's own Γ body; only an exact $z=0$ row also builds the static Matsubara
-  body. Certified by `tests/test_shared_pole_head_ordered_metal.py`.
+  body. Certified by `tests/test_tangential_head_ordered_metal.py`.
 - **Damping and the wings.** $r(z)$ multiplies the $D/z^2$ term of $S$. The
   ordered metal's intraband wing ($\propto1/z$) keeps the undamped Drude
   form at $\gamma_0>0$; time reversal cancels it on a non-magnetic metal.

@@ -8,9 +8,9 @@ order in which $\omega\to0$ and $q\to0$ are taken. This page owns how
 weighting is safe to discretize, the metal frequency plan, the two $q\to0$
 limits, the occupation-weighted $\Sigma$, and the one occupation state per map.
 
-The production metal model is `sigma_w_model = shared_pole`, whose bank carries
+The production metal model is `sigma_w_model = tangential`, whose bank carries
 signed metallic weights through its occupation envelope
-([bank](../architecture/shared_pole_model.md#2-the-response-bank));
+([bank](../architecture/tangential_model.md#2-the-response-bank));
 `sigma_w_model = mpa` (elementwise poles) is the comparison and uses the plan of
 §2. Sample geometry, the pole fit and the disk pipeline are
 [multipole frequency integration](THEORY_mpa_implementation.md); the distributed
@@ -328,7 +328,7 @@ family.
 
 **One state per map, solved at entry.** Each QSGW map solves its occupation
 state from the spectrum of the $H$ it was handed, and that one state reaches
-$\chi$, the head, the shared-pole recipe and $\Sigma$. Occupations are then a
+$\chi$, the head, the tangential recipe and $\Sigma$. Occupations are then a
 function of the iterate, $\mathrm{occ}=\mathrm{occ}(H)$, so the map
 $F(H)=H_{\rm KIH}+\Delta H[H,\mathrm{occ}(H)]$ depends on $H$ alone — the
 property an accelerated iteration needs, since every evaluation sees

@@ -45,10 +45,10 @@ The suite is `tests/hsuite`: the production drivers run end to end on two tiny
 fixtures, at P4 on one node, all in one process per rank. On a magnetic H2⁻
 cell (two H atoms, three electrons, noncollinear with spin-orbit, time reversal
 broken) the chain is kmeans → kin_ion → dipole → gwjax GN-PPM one-shot → BSE →
-htransform → exciton bands, then restarted COHSEX, a shared-pole one-shot with
+htransform → exciton bands, then restarted COHSEX, a tangential one-shot with
 its W and pole exports, and the four-component chain (kin_ion, dipole, 2-map
-`full_shared_pole` QSGW, BSE). On bcc Na 3³ it runs kin_ion, dipole and a
-2-map metal shared-pole QSGW at the production defaults. Each stage
+`full_tangential` QSGW, BSE). On bcc Na 3³ it runs kin_ion, dipole and a
+2-map metal tangential QSGW at the production defaults. Each stage
 is checked on its outputs (eqp columns, the numeric members of the h5 files it
 writes, eigenvalue tables) against the stored
 references in `tests/hsuite/reference/`, and every rank log is scanned for

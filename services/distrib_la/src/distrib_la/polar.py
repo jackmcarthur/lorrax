@@ -776,7 +776,7 @@ def leading_eigenvectors_above(perp, top, cutoff, *, real, eigh_plan, column_ext
                                multiplet_tol=1e-6, real_rows=None):
     """Leading eigenvectors of each row of ``perp`` above ``cutoff**2`` times ``top``'s largest eigenvalue.
 
-    The partner cut of the shared-pole rounds in one call: both Hermitian
+    The partner cut of the tangential rounds in one call: both Hermitian
     stacks [b, m, m] (face or batch layout, ``real_rows`` as for
     :func:`leading_eigenvectors`) are solved on their route, and row ``i < real``
     keeps the eigenvalues of ``perp`` strictly above ``cutoff**2 * max eig(top_i)``,
@@ -801,7 +801,7 @@ def leading_eigenvectors_above(perp, top, cutoff, *, real, eigh_plan, column_ext
     _check_tolerance(multiplet_tol)
     # Check what you use. The cut reads top's largest eigenvalue and perp's columns above
     # cutoff**2 * max eig(top), closed over a boundary multiplet (relative gap
-    # multiplet_tol << 1/2). The shared-pole partner operands have perp = R R^H with R the
+    # multiplet_tol << 1/2). The tangential partner operands have perp = R R^H with R the
     # part of O outside span(Q), so max eig(perp) <= max eig(top); then probing each
     # operand's columns above PARTNER_CHECK_CUT * cutoff**2 of its own largest eigenvalue
     # covers every column read (the device word refuses a perp above top). It leaves out

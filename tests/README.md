@@ -42,8 +42,8 @@ A new test needs no bootstrap import of its own. Run the unit layer with
 | `test_eqp_fullzone_cpu.py` | the eqp reader: wedge, unfold and full-zone blocks agree |
 | `test_bgw_epsmat_cpu.py` | the BerkeleyGW ε⁻¹ block equals the dense RPA inverse |
 | `test_sigma_on_shell_cpu.py` | the on-shell Σ fold equals its closed form |
-| `test_shared_pole_head_ordered_fold.py` | ordered wings equal the direct Lehmann sum |
-| `test_shared_pole_decoupled.py` | the decoupled face routes equal the local round |
+| `test_tangential_head_ordered_fold.py` | ordered wings equal the direct Lehmann sum |
+| `test_tangential_decoupled.py` | the decoupled face routes equal the local round |
 | `test_response_bank_blocks_cpu.py` | four-block χ₀ equals the exact ordered-pair scan |
 | `test_cd_kernels.py` | contour-deformation kernels equal a dense per-q sum |
 | `test_trs_qe_decides.py` | QE's data decides the 2c time-reversal verdict |

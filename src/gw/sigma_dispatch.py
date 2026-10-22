@@ -935,8 +935,8 @@ def _on_shell_eqp_operand(sigma_c, band_axis):
 def _mpa_sigma_model_resources(W_by_role, sigma_w_model, head_correction=None):
     """Select the current body and independent scalar-head resources."""
     fit_identity = fit_digest = None
-    if sigma_w_model == "shared_pole":
-        handle = W_by_role["shared_pole"]
+    if sigma_w_model == "tangential":
+        handle = W_by_role["tangential"]
         fit_path = handle["path"]
         fit_identity, fit_digest = handle["identity"], handle["digest"]
         if handle.get("representation") == "sector-ordered-ph":
@@ -945,13 +945,13 @@ def _mpa_sigma_model_resources(W_by_role, sigma_w_model, head_correction=None):
             policy = getattr(head_correction, "value", head_correction)
             if (policy != "off"
                     and handle.get("direct_photon_head") != "first_order_cc_ct_tc_tt"):
-                raise ValueError("GATE shared_pole_sector_head: direct four-current Γ is absent from the sector bank")
+                raise ValueError("GATE tangential_sector_head: direct four-current Γ is absent from the sector bank")
             return fit_path, None, fit_identity, fit_digest
         if getattr(head_correction, "value", head_correction) != "off":
             head_fit_path = W_by_role.get("mpa_head")
             if (head_fit_path is None or head_fit_path.get("identity") != fit_identity
                     or head_fit_path.get("body_digest") != fit_digest):
-                raise ValueError("GATE shared_pole_head: current body-bound MPA scalar head is missing or stale")
+                raise ValueError("GATE tangential_head: current body-bound MPA scalar head is missing or stale")
         else:
             head_fit_path = None
     else:
@@ -965,7 +965,7 @@ def _mpa_sigma_model_resources(W_by_role, sigma_w_model, head_correction=None):
 
 def _sweep_checkpoint(config, input_dir, fit_identity, fit_digest, head, lorentz_output,
                       *, e_qp_ev, body_options, band_slices, efermi_ry, request=None):
-    """Path and identity of a one-shot shared-pole sweep checkpoint, or None.
+    """Path and identity of a one-shot tangential sweep checkpoint, or None.
 
     Only one-shots: an SC run continues at map granularity from its own
     checkpoint (``sc_seed/sc_checkpoint.h5``), and SC retention deletes
@@ -1101,9 +1101,9 @@ def validate_band_extrapolation(config, mode, *, print_fn=None):
                 f"stage refusing here is compute_mode = "
                 f"{getattr(mode, 'value', mode)}.  The band-convergence "
                 f"extrapolation is wired into the bracketed pole-sum Σ_c "
-                f"(gn_ppm / hl_ppm, scalar mpa, and the bispinor shared-pole "
+                f"(gn_ppm / hl_ppm, scalar mpa, and the bispinor tangential "
                 f"routes bispinor_gw = bare_transverse and "
-                f"full_shared_pole), and for a static stage "
+                f"full_tangential), and for a static stage "
                 f"this is a CORRECTNESS "
                 f"guard rather than a wiring gap: the 1/N -> 0 limit point is "
                 f"mode-dependent, and on a static Coulomb hole it overshoots "
@@ -1113,7 +1113,7 @@ def validate_band_extrapolation(config, mode, *, print_fn=None):
                 f"falling to 32.8 for GN-PPM).  A bispinor MPA fit is "
                 f"not extrapolated: unvalidated.  Use "
                 f"compute_mode = gn_ppm, a scalar mpa, or a bispinor "
-                f"shared-pole route, add "
+                f"tangential route, add "
                 f"a gnppm stage to the sc_stage_N_type ladder, or set "
                 f"use_band_extrapolation = false.  (This deck NAMES the key; "
                 f"had it been left at its default the feature would have "
@@ -1136,8 +1136,8 @@ def validate_band_extrapolation(config, mode, *, print_fn=None):
                 "NOT the reason here.  A bispinor MPA fit is unmeasured; the "
                 "1/N -> 0 limit has never been measured on it, so "
                 "extrapolating would be an unvalidated claim, not a "
-                "correction.  The bispinor shared-pole routes "
-                "(bare_transverse and full_shared_pole) run the scalar "
+                "correction.  The bispinor tangential routes "
+                "(bare_transverse and full_tangential) run the scalar "
                 "executor and ARE extrapolated")
         else:
             because = (
@@ -1286,7 +1286,7 @@ def _static_sigma_channels(
     photon_head_sigma_basis = None
     sigma_lorentz = None
     sig_x_b = None
-    sector_dynamic = (W_by_role.get("shared_pole", {}).get("representation")
+    sector_dynamic = (W_by_role.get("tangential", {}).get("representation")
                       == "sector-ordered-ph")
     if not sector_dynamic and packed_photon_replaces_charge_sigma(config):
         (sig_x, sig_sx, sig_coh, photon_head_sigma_diag, photon_head_sigma_basis, sigma_lorentz) = _packed_static_sigma_channels(
@@ -1467,13 +1467,13 @@ def _compute_mpa_sigma(
     sigma_efermi_ry, sigma_efermi_provenance = resolve_sigma_efermi_ry(
         config.sigma.fermi_reference,
         occupation_state=occupation_state, wfn=wfn)
-    sector_handle = W_by_role.get("shared_pole", {})
+    sector_handle = W_by_role.get("tangential", {})
     head = None
     if head_fit_path is None:
         if sector_handle.get("direct_photon_head") == "first_order_cc_ct_tc_tt":
-            log.info("  shared-pole photon Γ: first-order direct CC/CT/TC/TT included in sector poles")
+            log.info("  tangential photon Γ: first-order direct CC/CT/TC/TT included in sector poles")
         else:
-            log.info("  shared-pole scalar head: OFF by explicit head_correction policy")
+            log.info("  tangential scalar head: OFF by explicit head_correction policy")
     else:
         head = (head_fit_path if isinstance(head_fit_path, dict) else
                 _bundle_reader.read_head_fit_collective(
@@ -1674,14 +1674,14 @@ def _compute_mpa_sigma(
             poles_ry=head["Omega_p"], residues_ry=head["B_p"],
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
     from .ppm_pipeline import observing_window_source, publish_window_source
-    if (sigma_w_model == "shared_pole" and observing_window_source()
+    if (sigma_w_model == "tangential" and observing_window_source()
             and sector_handle.get("representation") != "sector-ordered-ph"):
-        # TD-aGW's window Sigma reads the scalar shared-pole Sigma stage here
+        # TD-aGW's window Sigma reads the scalar tangential Sigma stage here
         # (ppm_pipeline.observe_window_sigma_source); with no open block this
         # is one empty list test and the stage is unchanged.
         publish_window_source(
-            member="shared_pole", wfns=wfns, meta=meta, config=config,
-            model=dict(W_by_role["shared_pole"]), head=head_diag, efermi_ry=sigma_efermi_ry,
+            member="tangential", wfns=wfns, meta=meta, config=config,
+            model=dict(W_by_role["tangential"]), head=head_diag, efermi_ry=sigma_efermi_ry,
             request=request, occupation_state=occupation_state,
             linalg=linalg_resolution({"linalg": config.backend.linalg}).layout)
     body_omega, body_odd = body.sigma_c_kij, body.sigma_c_odd_kij

@@ -70,7 +70,7 @@ def gate_cases(mesh):
                 out[key] = m
     # Zero-row blocks (ELPA 2026.02.001 returns wrong pairs, orth ~4e-3, for a block at the
     # global TAIL; ELPA_TAIL_BLOCK_UPSTREAM.md): head, tail and padded sides, and a caller's tail
-    # block past 16384 (the shared-pole face constructor's shape), through the checked plan. The
+    # block past 16384 (the tangential face constructor's shape), through the checked plan. The
     # wrapper's last-row swap makes every case correct; a refusal fails.
     n = 2304 * p
     cases = (("head", n, np.arange(32)), ("tail", n, np.arange(n - 32, n)), ("padded", n - 32, None),

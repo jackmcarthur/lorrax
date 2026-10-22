@@ -4,7 +4,7 @@ Where this sits (docs/dev/cd_frequency_integration.md): ``gw.sigma_dispatch._com
 calls :func:`compute_sigma_c_cd_omega_grid` instead of the pole executor when the deck says
 ``sigma_frequency_integration = contour_deformation``; the result is the same
 :class:`gw.ppm_sigma.SigmaOmegaResult` the one finalizer consumes.  No physics is rebuilt here:
-chi0 at every node and knot is the shared-pole bank's own response quadrature (:func:`bank_chi0`:
+chi0 at every node and knot is the tangential bank's own response quadrature (:func:`bank_chi0`:
 ``response_bank.response_support`` / ``response_quadrature`` shared-node rules at
 ``cd_chi0_rule_tolerance``, value rows of ``response_bank.integrate_response_group``,
 ``ordered=True``; no Lehmann sum), the Dyson pair is the response bank's equation set (W_c = H X (1-X)^-1 H,
@@ -79,7 +79,7 @@ FD9 = np.array([1 / 280, -4 / 105, 1 / 5, -4 / 5, 0.0, 4 / 5, -1 / 5, 4 / 105, -
 #: Occupation floor (fe_cd): f below it is 0, 1 - f below it is 1 (moves f by <= 1e-14).
 OCCUPATION_FLOOR = 1e-14
 #: Default relative tolerance of the bank response rule serving chi0 at every CD point
-#: (``cd_chi0_rule_tolerance``; the shared-pole production ``bank_rule_tolerance``).
+#: (``cd_chi0_rule_tolerance``; the tangential production ``bank_rule_tolerance``).
 CD_CHI0_RULE_TOLERANCE = 1e-8
 CD_RECIPE = dict(version="cd_production_v3", laws="ordered_cd TRREF / Run211 jets",
                  beta_ev=[0.5, 4.0], slope="fd9 rolling ghosts", imaginary_rule="tan_mapped_gauss two-panel",
@@ -756,7 +756,7 @@ def cd_chunk_plan(n, nq_irr, nq_pad, ndev, n_imag, J, override=0):
 def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots, windows=None,
               rule_capacity=None, rules_file=None, time_reversal=False, save_path=None, allow_partial=False,
               band_windows=False, remote_margin_ry=None, print_fn=print):
-    """chi0 at the CD points from the shared-pole bank's own response quadrature.
+    """chi0 at the CD points from the tangential bank's own response quadrature.
 
     ``z_ry`` lists every point the CD streams evaluate (imaginary nodes ``i u`` and real knots
     ``j h + i eta`` with their FD-9 ghosts; Im z > 0; a repeat is evaluated once).  The rules are

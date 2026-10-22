@@ -41,9 +41,9 @@ from gw.wavefunction_bundle import (
 from runtime.padding import combined_divisor, pad_to_axis, padded_axis
 
 from .sigma_windows import (summarize_sigma_poles,
-                            shared_pole_frequencies,
-                            shared_pole_intervals,
-                            summarize_shared_poles)
+                            tangential_frequencies,
+                            tangential_intervals,
+                            summarize_tangential_poles)
 
 
 def _unfenced(name, *, sync_ranks=True):
@@ -65,7 +65,7 @@ _band_fence = _unfenced
 
 
 @jax.jit
-def _shared_pole_weights(poles2, intervals, E_ref_B, t_node):
+def _tangential_weights(poles2, intervals, E_ref_B, t_node):
     """Causal residue weights exp[-i(Ω-Eref)τ]/(2Ω), DESIGN §3.4.
 
     Replicated ``poles2[parent,column]`` is in Ry², ``intervals[parent,2]``
@@ -83,10 +83,10 @@ def _shared_pole_weights(poles2, intervals, E_ref_B, t_node):
 
 
 @jax.jit
-def _shared_pole_omega0_weights(poles2, intervals, E_ref_B, t_node):
+def _tangential_omega0_weights(poles2, intervals, E_ref_B, t_node):
     """The causal branch at omega = 0: 1/(2 Omega (0 - Omega)) = -1/(2 Lambda).
 
-    The frequency-domain partner of :func:`_shared_pole_weights` (the
+    The frequency-domain partner of :func:`_tangential_weights` (the
     one-sided transform of (SP 4) is ``1/(2 Omega (omega - Omega))``),
     evaluated at the one frequency the static restart W0 needs. Same
     signature, so the synthesis binds either; Eref and tau are unused.
@@ -119,9 +119,9 @@ def _shared_pole_omega0_weights(poles2, intervals, E_ref_B, t_node):
 # Decides it: rank imbalance, not bytes.  transpose_xy copies on diagonal ranks and moves the tile on
 #   the others, so diagonal ranks waited ~16 ms per node at the next collective (2954).  Left: this
 #   transpose, 5.1 vs 1.5 ms per node at P16, ~7% of a node (2958).
-def synthesize_shared_pole_parents(
+def synthesize_tangential_parents(
     b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, mesh_xy, gemm, layout="face",
-    weights_fn=_shared_pole_weights, active_range=False, same_factor=True,
+    weights_fn=_tangential_weights, active_range=False, same_factor=True,
     orientation="pair",
 ):
     """Synthesize both raw-parent orientations through the configured G service.
@@ -137,7 +137,7 @@ def synthesize_shared_pole_parents(
         The component axis is 1 for charge and 3 for current endpoints.
         ``layout='local'``: ``b_X`` is the one factor ``[Bp,mu,column]`` in
         ``distrib_la``'s batch layout (whole parents per rank, Bp the parents
-        padded to the mesh) and ``b_Y`` is ``None`` (:func:`_shared_pole_contract_local`),
+        padded to the mesh) and ``b_Y`` is ``None`` (:func:`_tangential_contract_local`),
         or the right factor ``[Bp,nu,column]`` of a two-factor sector.
     same_factor : bool
         Both orientations hold the same physical b (the scalar model, a
@@ -175,9 +175,9 @@ def synthesize_shared_pole_parents(
         Wplus to obtain its antiunitary partner: d must retain its phase.
     """
     if orientation not in ("pair", "plus", "transpose"):
-        raise ValueError(f"shared-pole synthesis orientation {orientation!r}")
+        raise ValueError(f"tangential synthesis orientation {orientation!r}")
     if orientation != "pair" and not same_factor:
-        raise ValueError("a single shared-pole orientation needs the same factor on both faces")
+        raise ValueError("a single tangential orientation needs the same factor on both faces")
     one = (lambda w: jnp.conj(w)) if orientation == "transpose" else (lambda w: w)
     if layout == "local":
         # The replicated intervals take the factor's padded batch rows (an
@@ -187,16 +187,16 @@ def synthesize_shared_pole_parents(
             jnp.pad(intervals, ((0, rows - n_parent), (0, 0))),
             NamedSharding(mesh_xy, P(("x", "y"), None)))
         weights = one(weights_fn(poles2, intervals, E_ref_B, t_node))
-        plus = _shared_pole_contract_local(b_X, weights, intervals, mesh_xy=mesh_xy,
+        plus = _tangential_contract_local(b_X, weights, intervals, mesh_xy=mesh_xy,
                                            n_parent=n_parent, right=b_Y,
                                            partner=not same_factor)
     else:
         if b_X.ndim != 4 or b_Y.ndim != 4:
-            raise ValueError("shared-pole faces require [parent,mu,spin,column]")
+            raise ValueError("tangential faces require [parent,mu,spin,column]")
         if b_X.shape[2] not in (1, 3) or b_Y.shape[2] not in (1, 3):
-            raise ValueError("GATE shared_pole_components: expected charge=1 or current=3")
+            raise ValueError("GATE tangential_components: expected charge=1 or current=3")
         weights = one(weights_fn(poles2, intervals, E_ref_B, t_node))
-        plus = _shared_pole_contract(b_X, b_Y, weights, gemm=gemm, layout=layout,
+        plus = _tangential_contract(b_X, b_Y, weights, gemm=gemm, layout=layout,
                                      intervals=intervals if active_range else None,
                                      partner=not same_factor)
     if orientation == "plus":
@@ -214,13 +214,13 @@ def synthesize_shared_pole_parents(
     return plus, transposed
 
 
-def _shared_pole_factor_specs(layout):
+def _tangential_factor_specs(layout):
     return ((P(None, "x", None, "y"), P(None, "y", None, "x"))
             if layout == "face" else
             (P(None, "x", None, None), P(None, "y", None, None)))
 
 
-def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=None,
+def _tangential_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=None,
                           partner=False):
     """W(τ) = b d b† through G's configured face or axis contraction.
 
@@ -267,7 +267,7 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=N
     return value[:, :, 0, :, 0], pair[:, :, 0, :, 0]
 
 
-def _shared_pole_contract_local(b, weights, intervals, *, mesh_xy, n_parent, right=None,
+def _tangential_contract_local(b, weights, intervals, *, mesh_xy, n_parent, right=None,
                                 partner=False):
     """W(τ) = b d b† with whole parents per rank: one local GEMM each, one exchange out.
 
@@ -287,24 +287,24 @@ def _shared_pole_contract_local(b, weights, intervals, *, mesh_xy, n_parent, rig
                       partner=partner)
 
 
-def _shared_pole_fixed_q_policy(header):
+def _tangential_fixed_q_policy(header):
     """Resolve the policy from the store's authenticated TRS/grid metadata.
 
-    Resolved once per panel, in `_shared_pole_panel_tables`, and carried in its
+    Resolved once per panel, in `_tangential_panel_tables`, and carried in its
     `policy` entry: the unfold and the routed synthesis both need it and both
     take those tables, so neither resolves a second copy of the same header.
     """
-    from gw.qgrid_symmetry import qgrid_trs_policy_from_shared_pole_store
+    from gw.qgrid_symmetry import qgrid_trs_policy_from_tangential_store
 
-    return qgrid_trs_policy_from_shared_pole_store(header, announce=False)
+    return qgrid_trs_policy_from_tangential_store(header, announce=False)
 
 
-def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
+def _tangential_panel_tables(meta, header, q_span, *, mesh_xy):
     """Authenticate packed endpoint maps and one parent's child-row panel."""
-    from gw.qgrid_symmetry import shared_pole_packed_action
+    from gw.qgrid_symmetry import tangential_packed_action
 
     qt = header["qirr"]
-    packed, wraps, certificates = shared_pole_packed_action(meta, header, mesh_xy=mesh_xy)
+    packed, wraps, certificates = tangential_packed_action(meta, header, mesh_xy=mesh_xy)
     lo, hi = map(int, q_span)
     parent_map = np.asarray(qt["irr_idx_q"], dtype=np.int32)
     rows = np.flatnonzero((parent_map >= lo) & (parent_map < hi)).astype(np.int32)
@@ -312,7 +312,7 @@ def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
     # relation exactly. The common TRS policy makes q/-q use one spatial
     # realization, as for the ordinary W producer. This changes only small
     # row metadata; the endpoint routing and all-P operator tiles are intact.
-    policy = _shared_pole_fixed_q_policy(header)
+    policy = _tangential_fixed_q_policy(header)
     return dict(parent_span=(lo, hi), rows=rows, parent_rows=parent_map[rows] - lo,
                 sym_rows=policy.unfold_sym_idx[rows], policy=policy,
                 q_frac=np.asarray(qt["q_irr_frac"], dtype=np.float64)[lo:hi],
@@ -320,24 +320,24 @@ def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
                 n_sym_spatial=int(qt["n_sym_spatial"]))
 
 
-def _shared_pole_panel_realizer(meta, header, q_span, *, mesh_xy, tables=None):
+def _tangential_panel_realizer(meta, header, q_span, *, mesh_xy, tables=None):
     """The physical parent pair of one panel: ``(plus, transposed) -> (W, Wt)`` on its parent rows.
 
     The magnetic little-group realization, then the fixed-q TRS projection,
     both on the parent tiles.  Nothing is unfolded: the Σ kconv call reads the pair
-    through the store's q-wedge load tables (:func:`_shared_pole_q_wedge`),
+    through the store's q-wedge load tables (:func:`_tangential_q_wedge`),
     ``Wt`` on the antiunitary rows.  Endpoint maps that cross a shard refuse
     (the fused load reads only this rank's parent tile).
     """
     from jax import shard_map
-    from gw.qgrid_symmetry import shared_pole_operator_realizer
+    from gw.qgrid_symmetry import tangential_operator_realizer
 
     if tables is None:
-        tables = _shared_pole_panel_tables(meta, header, q_span, mesh_xy=mesh_xy)
+        tables = _tangential_panel_tables(meta, header, q_span, mesh_xy=mesh_xy)
     _require_local_maps(tables["certificates"])
     policy = tables["policy"]
     qids = np.asarray(header["q_irr_full_idx"])[slice(*q_span)]
-    realize = shared_pole_operator_realizer(
+    realize = tangential_operator_realizer(
         meta, header, q_full_idx=qids, mesh_xy=mesh_xy)
 
     def body(plus, transposed):
@@ -367,7 +367,7 @@ def _shared_pole_panel_realizer(meta, header, q_span, *, mesh_xy, tables=None):
 def _require_local_maps(certificates):
     if not all(certificates[axis]["is_local"] for axis in ("x", "y")):
         raise ValueError(
-            "GATE shared_pole_w_parent_local: a packed endpoint map crosses a mesh shard; "
+            "GATE tangential_w_parent_local: a packed endpoint map crosses a mesh shard; "
             "W is built on the irreducible q and unfolded on the Sigma load, which reads "
             "only this rank's parent tile (TASTE 97: no full-q W route)")
 
@@ -376,12 +376,12 @@ _W_LOADS = {}
 _W_LOAD_TRS = {}
 
 
-def _shared_pole_q_wedge(meta, header, *, mesh_xy, with_trs=False):
+def _tangential_q_wedge(meta, header, *, mesh_xy, with_trs=False):
     """The store's q wedge as the Σ kconv call reads W: ``(wedge, (particle, hole) device loads)``.
 
     ``wedge`` is a ``symmetry_maps.QirrOperator`` of tables (no values): the
     store's parent rows ``irr_idx_q`` with the TRS policy's unfold operations,
-    the packed endpoint action (:func:`gw.qgrid_symmetry.shared_pole_packed_action`)
+    the packed endpoint action (:func:`gw.qgrid_symmetry.tangential_packed_action`)
     and the pair-transpose rule, so an antiunitary q reads ``Wt``.  mathdx
     mode 9 (``_get_sigma_kij_kernel(q_wedge=)``) unfolds W on its load.  An
     ordered store's valence branch W_+(-q)^T reads the same parent pair
@@ -389,15 +389,15 @@ def _shared_pole_q_wedge(meta, header, *, mesh_xy, with_trs=False):
     has none.  The device tables are placed once per mesh and wedge.
     """
     from symmetry_maps import QirrOperator, device_load_tables
-    from gw.qgrid_symmetry import shared_pole_packed_action
+    from gw.qgrid_symmetry import tangential_packed_action
     from .sector_sigma import hole_tables
 
     qt = header["qirr"]
-    packed, wraps, certificates = shared_pole_packed_action(meta, header, mesh_xy=mesh_xy)
+    packed, wraps, certificates = tangential_packed_action(meta, header, mesh_xy=mesh_xy)
     _require_local_maps(certificates)
     wedge = QirrOperator(
         values=None, irr_idx=np.asarray(qt["irr_idx_q"], np.int32),
-        sym_idx=np.asarray(_shared_pole_fixed_q_policy(header).unfold_sym_idx, np.int32),
+        sym_idx=np.asarray(_tangential_fixed_q_policy(header).unfold_sym_idx, np.int32),
         sym_perm=np.asarray(packed, np.int32), L_table=np.asarray(wraps),
         q_irr_frac=np.asarray(qt["q_irr_frac"], np.float64),
         n_sym_spatial=int(qt["n_sym_spatial"]),
@@ -418,23 +418,23 @@ def _shared_pole_q_wedge(meta, header, *, mesh_xy, with_trs=False):
     return wedge, loads
 
 
-def _shared_pole_at_rows(meta, header, rows, *, mesh_xy):
+def _tangential_at_rows(meta, header, rows, *, mesh_xy):
     """``(W, Wt) -> W_+`` at the full-q rows ``rows`` only, for the W0 restart member.
 
     The BSE restart stores ``W0 = V + Wc(0)`` on V's q parents
-    (:func:`shared_pole_static_wc`); the unfold tables are cut to ``rows``,
+    (:func:`tangential_static_wc`); the unfold tables are cut to ``rows``,
     so no full-q W is formed.  The Σ route never calls this.
     """
     from jax import shard_map
     from symmetry_maps import unfold_operator_local
 
     nq = int(header["n_q_irr"])
-    tables = _shared_pole_panel_tables(meta, header, (0, nq), mesh_xy=mesh_xy)
+    tables = _tangential_panel_tables(meta, header, (0, nq), mesh_xy=mesh_xy)
     _require_local_maps(tables["certificates"])
     cert = tables["certificates"]
     rows = np.asarray(rows, np.int64).reshape(-1)
     if not np.array_equal(tables["rows"], np.arange(tables["rows"].size)):
-        raise ValueError("GATE shared_pole_static_w: the whole parent span must "
+        raise ValueError("GATE tangential_static_w: the whole parent span must "
                          "cover every full q in order")
 
     def body(W, Wt):
@@ -455,9 +455,9 @@ _SYNTHESIS_PROGRAMS = {}
 
 
 def _synthesis_program(key, build):
-    """One scalar shared-pole synthesis program per static configuration, per process.
+    """One scalar tangential synthesis program per static configuration, per process.
 
-    Every SC map rebuilds the shared-pole model, not the programs that consume
+    Every SC map rebuilds the tangential model, not the programs that consume
     it: a later map with the same shapes dispatches the first map's jit object
     and compiled executable instead of recompiling them (P2-A, claim 2735).
     ``key`` names everything a program closes over (mesh, layout, panel span
@@ -470,7 +470,7 @@ def _synthesis_program(key, build):
     return entry
 
 
-def _shared_pole_static_key(meta, header, tables, *, mesh_xy, layout):
+def _tangential_static_key(meta, header, tables, *, mesh_xy, layout):
     """Content key of the store symmetry, packed basis and panel tables."""
     from ffi import ffi_dial_key
 
@@ -506,17 +506,17 @@ def _w_orientation(all_identity, reads_w, reads_wt, *, weights_on_load=True):
     return "plus" if reads_w else "transpose"
 
 
-def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy, layout="face",
-                             weights_fn=_shared_pole_weights, stage="sigma"):
+def _tangential_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy, layout="face",
+                             weights_fn=_tangential_weights, stage="sigma"):
     """Read the factors once and bind W(τ) on the irreducible q for the window executable.
 
     Returns a :class:`WSynthesis` whose ``q_wedge`` is the store's q wedge
-    (:func:`_shared_pole_q_wedge`).  The parent faces are read once per Σ
+    (:func:`_tangential_q_wedge`).  The parent faces are read once per Σ
     call and held for the sweep; ``w_kernel`` runs inside every window
     executable and, per τ node, synthesizes each parent panel of
     ``schedule``'s admitted capacity — W_parent = b d(τ) b† and its transpose
     through G's builder, little-group realization, fixed-q projection
-    (:func:`_shared_pole_panel_realizer`) — into the parent pair ``(W, Wt)``
+    (:func:`_tangential_panel_realizer`) — into the parent pair ``(W, Wt)``
     ``[n_q_irr, m, m]``.  It returns ``(W, Wt, load)``: the Σ kconv call unfolds
     the pair on its load through ``load`` (the particle tables, or on an
     ordered store's valence branch the q-negated ones), so no full-q W is
@@ -526,13 +526,13 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     chunk when the budget admits every column (TASTE 96).
 
     ``weights_fn`` is the per-column coefficient: the causal d(τ) for Σ, or
-    :func:`_shared_pole_omega0_weights` for :func:`shared_pole_static_wc`.
+    :func:`_tangential_omega0_weights` for :func:`tangential_static_wc`.
     ``stage`` prefixes this call's capacity-ledger stage names, which are
     unique per map.
     """
     _band_fence('tau.synthesis_plan', sync_ranks=True)
     with timing.section('tau.synthesis_plan'):
-        from file_io.shared_pole_store import face_width, read_shared_pole_faces
+        from file_io.tangential_store import face_width, read_tangential_faces
         from .sector_sigma import _placer, _zeros
 
         nq = int(header["n_q_irr"])
@@ -540,10 +540,10 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         m = int(meta.mu_basis.n_packed)
         bcap, ccap = int(schedule["parent_capacity"]), int(schedule["column_capacity"])
         if bcap < 1 or ccap < 1:
-            raise ValueError("shared-pole panel capacities must be positive")
+            raise ValueError("tangential panel capacities must be positive")
         # Ordered stores: conduction windows use W_+(q), valence windows W_+(-q)^T.
         ordered = header.get("representation") == "scalar-ordered-ph"
-        q_wedge, loads, particle_trs = _shared_pole_q_wedge(
+        q_wedge, loads, particle_trs = _tangential_q_wedge(
             meta, header, mesh_xy=mesh_xy, with_trs=True)
         # The valence branch of an ordered store reads W_+(-q)^T through the
         # q-negated tables: the same parent pair, another load, chosen per
@@ -569,8 +569,8 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             return synthesis
         local = layout == "local"
         if local and (bcap < nq or ccap < kmax):
-            raise ValueError("shared-pole synthesis: whole parents per rank take one panel")
-        factor_specs = None if local else _shared_pole_factor_specs(layout)
+            raise ValueError("tangential synthesis: whole parents per rank take one panel")
+        factor_specs = None if local else _tangential_factor_specs(layout)
         # One static column width: the whole laddered K when every column fits
         # (one chunk), else the admitted chunk carrier, stepped by that width.
         chunked = ccap < kmax
@@ -584,8 +584,8 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         panels = []
         for lo in range(0, nq, bcap):
             hi = min(lo + bcap, nq)
-            tables = _shared_pole_panel_tables(meta, header, (lo, hi), mesh_xy=mesh_xy)
-            static = _shared_pole_static_key(meta, header, tables, mesh_xy=mesh_xy, layout=layout)
+            tables = _tangential_panel_tables(meta, header, (lo, hi), mesh_xy=mesh_xy)
+            static = _tangential_static_key(meta, header, tables, mesh_xy=mesh_xy, layout=layout)
             count = hi - lo
             if not local:
                 native_workspace = max(native_workspace, matmul_workspace_bytes_per_rank(
@@ -600,26 +600,26 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 gemm = None if local else gemm_plan(
                     mesh_xy, m=m, k=width, n=m, nq=count, dtype=np.complex128, layout=layout,
                     enable_active_range=True, warmup=False)
-                realize_pair = _shared_pole_panel_realizer(
+                realize_pair = _tangential_panel_realizer(
                     meta, header, span, mesh_xy=mesh_xy, tables=tables)
 
                 def body(factors, poles2, ranges, e, t):
                     if orientation != "pair":
                         # One orientation read, the realization the identity pair: form
                         # that tile alone on this rank's faces (no transpose exchange).
-                        tile = synthesize_shared_pole_parents(
+                        tile = synthesize_tangential_parents(
                             *factors, poles2, ranges, e, t, mesh_xy=mesh_xy, gemm=gemm,
                             layout=layout, weights_fn=weights_fn, active_range=True,
                             orientation=orientation)
                         return tile, tile
-                    plus, transposed = synthesize_shared_pole_parents(
+                    plus, transposed = synthesize_tangential_parents(
                         *factors, poles2, ranges, e, t, mesh_xy=mesh_xy, gemm=gemm,
                         layout=layout, weights_fn=weights_fn, active_range=True)
                     return realize_pair(plus, transposed)
                 return jax.jit(body)
-            kind = ("synthesis" if weights_fn is _shared_pole_weights
+            kind = ("synthesis" if weights_fn is _tangential_weights
                     else "synthesis." + weights_fn.__name__)
-            identity = bool(_shared_pole_panel_realizer(
+            identity = bool(_tangential_panel_realizer(
                 meta, header, (lo, hi), mesh_xy=mesh_xy, tables=tables).is_identity)
             kernels = {o: _synthesis_program(
                 (static, kind, count, m, width) + (() if o == "pair" else (o,)),
@@ -629,11 +629,11 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         schedule["native_gemm_workspace_bytes_per_rank"] = native_workspace
     _band_fence('tau.factor_read', sync_ranks=True)
     with timing.section('tau.factor_read'):
-        capacity = getattr(meta, "shared_pole_capacity", None)
+        capacity = getattr(meta, "tangential_capacity", None)
         # The stages live beside this Σ call, as the admitted schedule named them.
         ambient = (tuple(schedule["capacity_receipt"]["concurrent_with"])
                    if "capacity_receipt" in schedule else None)
-        x, y, poles, _counts = read_shared_pole_faces(
+        x, y, poles, _counts = read_tangential_faces(
             io, (0, nq), meta=meta, header=header, column_span=(0, kmax) if chunked else None,
             orientations=("x",) if local else ("x", "y"))
         if local:
@@ -726,7 +726,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     def window_intervals(indices, bounds):
         # Host plan data: the Σ executor stacks every window's intervals into
         # its window table (placed once per Σ call, read on device per window).
-        return shared_pole_intervals(frequencies, np.asarray(indices), np.asarray(bounds))
+        return tangential_intervals(frequencies, np.asarray(indices), np.asarray(bounds))
 
     def window_operands(space, intervals):
         return (panel_factors, panel_poles, intervals, branch_load(space))
@@ -748,7 +748,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
 
     key = ("scalar-parent", mesh_xy, nq, m, width, n_chunks, ordered, q_wedge.wedge_key(),
            tuple((p["span"], p["count"], p["static"]) for p in panels))
-    if weights_fn is not _shared_pole_weights:
+    if weights_fn is not _tangential_weights:
         key += (weights_fn.__name__,)
     synthesis = WSynthesis(w_kernel, window_operands, lambda: (panel_factors, panel_poles),
                            close, native_workspace, key, tile_bytes=16 * nq * m * m // int(mesh_xy.size),
@@ -768,21 +768,21 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     return synthesis
 
 
-def shared_pole_static_wc(handle, meta, *, mesh_xy, rows, layout="face"):
-    """Wc(q, omega = 0) of the current scalar shared-pole model at the full-q rows ``rows``.
+def tangential_static_wc(handle, meta, *, mesh_xy, rows, layout="face"):
+    """Wc(q, omega = 0) of the current scalar tangential model at the full-q rows ``rows``.
 
     The static screened correction the restart stores for BSE
     (``W0_qmunu = V + Wc(0)``). It is evaluated by the Σ synthesis above —
     the same factor read, little-group realization and fixed-q projection
-    on the parents — with :func:`_shared_pole_omega0_weights` in place of
+    on the parents — with :func:`_tangential_omega0_weights` in place of
     d(τ), so the store keeps one evaluator; the parent pair is then unfolded
-    at ``rows`` only (:func:`_shared_pole_at_rows`): the q parents of the
+    at ``rows`` only (:func:`_tangential_at_rows`): the q parents of the
     run's V wedge, which the restart stores (BSE unfolds on load), so no
     full-q W is formed (TASTE 97). The two branches of the time-ordered W
     enter as the Σ consumer routes them: W_+(q) and, on an ordered store,
     W_+(-q)^T (SP 5), read at the rows -q; a TRS store's valence branch is
     W_+ itself, which gives ``-b Λ^-1 b†``
-    (docs/architecture/shared_pole_model.md §7).
+    (docs/architecture/tangential_model.md §7).
 
     Returns ``(len(rows), m, m)`` complex128 at ``P(None,'x','y')`` in the
     run's packed centroid order. Every array is an all-P tile. The synthesis
@@ -795,46 +795,46 @@ def shared_pole_static_wc(handle, meta, *, mesh_xy, rows, layout="face"):
     Frobenius in Wc (4e-6 at Gamma), with identical V and heads.  The BSE
     E_1..E_5 on the two restarts agree within 0.07 meV.
     """
-    from file_io.shared_pole_store import (open_shared_pole_model,
-                                           validate_shared_pole_model)
+    from file_io.tangential_store import (open_tangential_model,
+                                           validate_tangential_model)
     from symmetry_maps import q_negation_index
 
-    capacity = meta.shared_pole_capacity
-    header = validate_shared_pole_model(
+    capacity = meta.tangential_capacity
+    header = validate_tangential_model(
         handle["path"], expected_identity=handle["identity"], mesh_xy=mesh_xy,
         capacity=capacity)
     if header["digest"] != handle["digest"]:
-        raise ValueError("GATE shared_pole_identity: W0 handle digest differs from model")
+        raise ValueError("GATE tangential_identity: W0 handle digest differs from model")
     if header.get("representation") not in ("scalar-trs-even-s", "scalar-ordered-ph"):
-        raise ValueError("GATE shared_pole_static_w: a scalar charge store is required; "
+        raise ValueError("GATE tangential_static_w: a scalar charge store is required; "
                          f"got representation {header.get('representation')!r}")
     ordered = header["representation"] == "scalar-ordered-ph"
     Q, m = int(header["n_q_full"]), int(meta.mu_basis.n_packed)
     rows = np.asarray(rows, np.int64).reshape(-1)
     if rows.size == 0 or rows.min() < 0 or rows.max() >= Q:
-        raise ValueError(f"GATE shared_pole_static_w: rows must be full-q rows in [0, {Q})")
+        raise ValueError(f"GATE tangential_static_w: rows must be full-q rows in [0, {Q})")
     ambient = capacity.live_stages
     tile = -(-16 * rows.size * m * m // int(mesh_xy.size))
     capacity.reserve("w0.static_output", resident_bytes_per_rank=2 * tile,
                      workspace_bytes_per_rank=0, concurrent_with=ambient)
     capacity.live_stages = (*ambient, "w0.static_output")
     try:
-        schedule = _shared_pole_memory_schedule(meta, header, mesh_xy=mesh_xy,
+        schedule = _tangential_memory_schedule(meta, header, mesh_xy=mesh_xy,
                                                 layout=layout, stage="w0")
         counts = np.asarray(header["K"], np.int64)
         intervals = device_put_process_local(
             np.stack([np.zeros_like(counts), counts], axis=1),
             NamedSharding(mesh_xy, P()))
         minus_q = np.asarray(q_negation_index(tuple(int(v) for v in header["grid"])))
-        with open_shared_pole_model(handle["path"], mesh_xy=mesh_xy) as reader:
-            synthesis = _shared_pole_w_synthesis(
+        with open_tangential_model(handle["path"], mesh_xy=mesh_xy) as reader:
+            synthesis = _tangential_w_synthesis(
                 reader, meta, header, None, schedule, mesh_xy=mesh_xy,
                 layout=schedule.get("factor_layout", layout),
-                weights_fn=_shared_pole_omega0_weights, stage="w0")
+                weights_fn=_tangential_omega0_weights, stage="w0")
         from common.collectives import transpose_xy
-        plus_at = _shared_pole_at_rows(meta, header, rows, mesh_xy=mesh_xy)
+        plus_at = _tangential_at_rows(meta, header, rows, mesh_xy=mesh_xy)
         # W_-(q) = W_+(-q)^T: W_+ at the rows -q, transposed in its endpoint faces.
-        minus_at = (_shared_pole_at_rows(meta, header, minus_q[rows], mesh_xy=mesh_xy)
+        minus_at = (_tangential_at_rows(meta, header, minus_q[rows], mesh_xy=mesh_xy)
                     if ordered else None)
         face = NamedSharding(mesh_xy, P(None, "x", "y"))
 
@@ -879,7 +879,7 @@ def _w_extents(meta, extents):
     return tuple(int(e) for e in extents)
 
 
-def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, layout="face", extents=None):
+def _tangential_panel_cost(meta, header, b, c, *, mesh_xy, layout="face", extents=None):
     """Price the new buffers of one b-parent x c-column synthesis panel.
 
     Coordinator ruling12 separates unchanged spatial/ψ/Σ peak regression
@@ -894,7 +894,7 @@ def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, layout="face", exten
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
     tile = 16 * rows*cols // (px*py)
     multiple = combined_divisor(px,py)
-    c = padded_axis(c,multiple,name="shared_pole_K_chunk").carrier
+    c = padded_axis(c,multiple,name="tangential_K_chunk").carrier
     faces = 16 * b * c*(rows+cols) / (px*py)
     # Parent, partner and fixed-size group accumulators coexist. The
     # compiled reservation below measures actual aliases and exchange
@@ -912,7 +912,7 @@ def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, layout="face", exten
                 workspace_bytes_per_rank=int(np.ceil(peak-faces)))
 
 
-def _shared_pole_resident_bytes(meta, header, *, mesh_xy, layout, extents=None):
+def _tangential_resident_bytes(meta, header, *, mesh_xy, layout, extents=None):
     """Per-rank bytes of the factors the synthesis holds for a whole Σ call.
 
     All n_q_irr parent faces at the store's whole-K carrier K̄, both
@@ -920,7 +920,7 @@ def _shared_pole_resident_bytes(meta, header, *, mesh_xy, layout, extents=None):
     the pole columns replicated (axis layout), plus the replicated poles
     8·n·K̄ (a sector: μ·K̄ and ν·K̄ for its two endpoints, ``extents``).
     """
-    from file_io.shared_pole_store import face_width
+    from file_io.tangential_store import face_width
 
     rows, cols = _w_extents(meta, extents)
     nq = int(header["n_q_irr"])
@@ -931,16 +931,16 @@ def _shared_pole_resident_bytes(meta, header, *, mesh_xy, layout, extents=None):
     return int(np.ceil(nq*pair + 8*nq*k))
 
 
-def _shared_pole_local_price(meta, header, *, mesh_xy, extents=None, factors=1):
+def _tangential_local_price(meta, header, *, mesh_xy, extents=None, factors=1):
     """Per-rank ``(resident, workspace)`` bytes of the synthesis with whole parents per rank.
 
     Resident: the one factor ``[ceil(nq/P), μ, K̄]`` (a two-factor sector,
     ``factors=2``: both, ``μ + ν``) and its poles.  Workspace: one parent's two
     GEMM operands, the rank's W rows (and a two-factor sector's partner rows)
     before the exchange, and the parent pair on the face with its realization
-    temporaries (as :func:`_shared_pole_panel_cost`'s ``6·tile``).
+    temporaries (as :func:`_tangential_panel_cost`'s ``6·tile``).
     """
-    from file_io.shared_pole_store import face_width
+    from file_io.tangential_store import face_width
 
     m, n = _w_extents(meta, extents)
     nq = int(header["n_q_irr"])
@@ -953,23 +953,23 @@ def _shared_pole_local_price(meta, header, *, mesh_xy, extents=None, factors=1):
     return int(resident), int(workspace)
 
 
-def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage="sigma",
+def _tangential_memory_schedule(meta, header, *, mesh_xy, layout="face", stage="sigma",
                                  linalg=None, extents=None, factors=1):
     """Price the resident factors, size the τ panels from what is left, admit.
 
     The factors are read once per Σ call and stay resident
-    (:func:`_shared_pole_resident_bytes`); only the synthesis workspace of one
+    (:func:`_tangential_resident_bytes`); only the synthesis workspace of one
     parent panel × pole-column chunk depends on (b, c), and the chunk count
     degenerates to one when everything fits (TASTE 96).  Caller-bound
-    live_stages charge other NEW shared-pole objects. Per coordinator
+    live_stages charge other NEW tangential objects. Per coordinator
     ruling12, the unchanged spatial/ψ/Σ footprint and its one full-q W are
     reported separately against the incumbent (<=1.05x).
 
     Placement, in order: the replicated pole columns (``axis``) when the panel
     search admits them (no exchange per node); else, on a ``linalg = local``
     deck (the resolved ``linalg``) whose whole parents fit per rank
-    (``shared_pole_execution.whole_parent_execution``, the bank's rule), whole
-    parents (``factor_layout='local'``, :func:`_shared_pole_contract_local`:
+    (``tangential_execution.whole_parent_execution``, the bank's rule), whole
+    parents (``factor_layout='local'``, :func:`_tangential_contract_local`:
     only W(τ) moves); else the face SUMMA panels.
 
     A photon sector (``gw.mpa.sector_sigma.sector_synthesis``) takes the same
@@ -978,9 +978,9 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
     and pole column, so only that panel is admissible (the face route always
     is: its SUMMA panels are bounded by one W tile from the shapes).
     """
-    capacity = getattr(meta, "shared_pole_capacity", None)
+    capacity = getattr(meta, "tangential_capacity", None)
     if capacity is None:
-        raise ValueError("GATE shared_pole_capacity: missing current-map CapacityLedger")
+        raise ValueError("GATE tangential_capacity: missing current-map CapacityLedger")
     concurrent = capacity.live_stages
     accepted = {row["stage"]: row for row in capacity.entries}
     caller_bytes = sum(accepted[name][key] for name in concurrent for key in
@@ -995,7 +995,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
     sector = extents is not None
     if not sector and tuple(int(capacity.geometry[key]) for key in
              ("nq", "nspinor", "nmu", "px", "py")) != (Q, spin, n, px, py):
-        raise ValueError("GATE shared_pole_capacity: store/current-map geometry mismatch")
+        raise ValueError("GATE tangential_capacity: store/current-map geometry mismatch")
     U = capacity.U_bytes_per_rank
     if kmax == 0:
         receipt = capacity.reserve(f"{stage}.synthesis", resident_bytes_per_rank=0,
@@ -1003,7 +1003,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
         return dict(status=receipt["status"],parent_capacity=nq,column_capacity=1,
                     capacity_receipt=receipt,route="empty")
     if not sector:
-        tables = _shared_pole_panel_tables(meta, header, (0,nq), mesh_xy=mesh_xy)
+        tables = _tangential_panel_tables(meta, header, (0,nq), mesh_xy=mesh_xy)
         _require_local_maps(tables["certificates"])
     rows_w, cols_w = _w_extents(meta, extents)
     # The ledger owns the hardware limit (ruling24); 3U is a scaling
@@ -1016,17 +1016,17 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
     multiple = combined_divisor(px,py)
 
     def workspace(b, c, layout):
-        return _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,
+        return _tangential_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,
                                        layout=layout,extents=extents)["workspace_bytes_per_rank"]
 
     def search(layout):
         best = None
         if sector:
-            left = budget - _shared_pole_resident_bytes(
+            left = budget - _tangential_resident_bytes(
                 meta, header, mesh_xy=mesh_xy, layout=layout, extents=extents)
             return (1, -nq*kmax, nq, kmax) if workspace(nq, kmax, layout) <= left else None
         for b in range(1,nq+1):
-            left = budget - _shared_pole_resident_bytes(
+            left = budget - _tangential_resident_bytes(
                 meta, header, mesh_xy=mesh_xy, layout=layout)
             # The physical logical-U bound applies to every NEW projector
             # matrix, even when orbit packing pads the endpoint carrier. The
@@ -1065,11 +1065,11 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
     # face SUMMA's per-node re-gather of every factor panel.
     if layout != "axis" and linalg == "local" and (
             sector or int(header.get("factor_components", 1)) == 1):
-        from gw.shared_pole_execution import whole_parent_execution
+        from gw.tangential_execution import whole_parent_execution
         execution, whole_resident, whole_workspace = whole_parent_execution(
-            lambda e: (_shared_pole_local_price(meta, header, mesh_xy=mesh_xy, extents=extents,
+            lambda e: (_tangential_local_price(meta, header, mesh_xy=mesh_xy, extents=extents,
                                                 factors=factors) if e == "local"
-                       else (_shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy,
+                       else (_tangential_resident_bytes(meta, header, mesh_xy=mesh_xy,
                                                          layout=layout, extents=extents), 0)),
             ledger=capacity, whole=int(meta.n_rmu))
         if execution == "local":
@@ -1088,9 +1088,9 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
                         projection_matrix_bytes_per_rank=int(16*nq*rows_w*cols_w
                                                              / (px*py)))
     b,c = (nq,kmax) if sector else (1,multiple) if best is None else best[2:]
-    footprint = _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,layout=layout,
+    footprint = _tangential_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,layout=layout,
                                         extents=extents)
-    resident = _shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy, layout=layout,
+    resident = _tangential_resident_bytes(meta, header, mesh_xy=mesh_xy, layout=layout,
                                            extents=extents)
     projection_bytes = 16*b*rows_w*cols_w/(px*py)
     if not sector and projection_bytes > U:
@@ -1198,10 +1198,10 @@ def _admit(compiled, meta, stage, *, native=0, resident=0, counted=0, peak=None)
     from runtime.aot_memory import aot_kernel_peak_bytes, agreed_chunk
     if peak is None:
         peak = aot_kernel_peak_bytes(compiled)
-    meta.shared_pole_capacity.reserve(
+    meta.tangential_capacity.reserve(
         stage, resident_bytes_per_rank=resident,
         workspace_bytes_per_rank=-agreed_chunk(-(max(0, int(peak.total) - counted) + int(native))),
-        concurrent_with=meta.shared_pole_capacity.live_stages)
+        concurrent_with=meta.tangential_capacity.live_stages)
     return compiled
 
 
@@ -1250,7 +1250,7 @@ def _static_key(value):
 
 
 class WSynthesis:
-    """A shared-pole model's bound W(τ) synthesis: kernel, per-window operands, lifetime.
+    """A tangential model's bound W(τ) synthesis: kernel, per-window operands, lifetime.
 
     ``w_kernel(*window_operands(space, intervals), ref, time)`` is
     W(τ) in its consumer's operand layout and is traceable: it runs inside the
@@ -1284,7 +1284,7 @@ _SYNTHESIS_TAU = {}
 class SynthesisTau:
     """One τ body for the window executable: W(τ) synthesis and Σ(τ) in one program.
 
-    Serves the scalar shared-pole route and every photon sector.
+    Serves the scalar tangential route and every photon sector.
     ``window_kernel(space)`` is the traceable ``fn(*arguments, t, active_count)``
     of :meth:`DeviceOmegaAccumulator.integrate_window`: one for both W branches,
     unless the synthesis reads one W orientation per branch
@@ -1356,7 +1356,7 @@ class SynthesisTau:
                       for x in jax.tree.leaves(self._synthesis.resident_operands()))
         peak = aot_kernel_peak_bytes(compiled)
         workspace = -agreed_chunk(-(max(0, int(peak.total) - counted) + int(self._native)))
-        ledger = self._meta.shared_pole_capacity
+        ledger = self._meta.tangential_capacity
         row = ledger.preview(resident_bytes_per_rank=0, workspace_bytes_per_rank=workspace,
                              concurrent_with=ledger.live_stages)
         return row["device_budget_status"] == "PASS"
@@ -1398,7 +1398,7 @@ class SynthesisTau:
 
 
 def _sigma_window_table(accumulator, synthesis, plan, capacity):
-    """The Σ window table of a shared-pole sweep: every planned window's operands, placed once.
+    """The Σ window table of a tangential sweep: every planned window's operands, placed once.
 
     Rows follow the plan (the sweep's one pass).  Fields: the coefficient
     inputs of :meth:`DeviceOmegaAccumulator.window_table` (nodes padded to
@@ -1464,7 +1464,7 @@ def _integrate_sigma_batches(
     """One spatial executor for streamed fit slabs: one executable per window.
 
     Each planned window runs its τ nodes in one device ``fori_loop``
-    (:meth:`DeviceOmegaAccumulator.integrate_window`).  A shared-pole model
+    (:meth:`DeviceOmegaAccumulator.integrate_window`).  A tangential model
     (``w_synthesis``, a :class:`WSynthesis`) synthesizes W(τ) inside that
     body through :class:`SynthesisTau`: the scalar route over the shared
     ``sigma_kij``, a photon sector over its own spatial kconv call
@@ -1578,7 +1578,7 @@ def _integrate_sigma_batches(
         if tau_kernel_factory is not None:
             tau_kernel = tau_kernel_factory(w_synthesis, sigma_axis)
         elif synthesis:
-            # The scalar shared-pole route: the shared sigma_kij reads the
+            # The scalar tangential route: the shared sigma_kij reads the
             # parent pair its synthesis builds inside the same τ body, and
             # unfolds it on the transform's load (mathdx mode 9, the q wedge).
             from gw.ppm_tau_kernel import sigma_kconv_tables, sigma_pass_price
@@ -2377,8 +2377,8 @@ def compute_sigma_c_mpa_omega_grid(
 
     ``omega_eta_ry``/``omega_group``/``group_fixed``: the SC coarse windows'
     per-frequency broadening and window labels (``sigma_box_plan.plan_sigma_windows``).
-    ``linalg``: the deck's resolved dense layout, which places a shared-pole
-    model's W(τ) synthesis (:func:`_shared_pole_memory_schedule`).
+    ``linalg``: the deck's resolved dense layout, which places a tangential
+    model's W(τ) synthesis (:func:`_tangential_memory_schedule`).
     ``request`` (``gw.ppm_sigma.OnShellRequest``): where Sigma_c is evaluated;
     the windows are planned on its ``frequencies_ry`` (on which
     ``omega_eta_ry``/``omega_group`` are labelled).  ``omega_grid_ry`` in its
@@ -2414,8 +2414,8 @@ def compute_sigma_c_mpa_omega_grid(
     (``SigmaOmegaResult.branches``); the D = 0 observability twin, when it
     runs, is not branch-resolved.
     """
-    if sigma_w_model not in ("mpa", "shared_pole"):
-        raise ValueError(f"sigma_w_model must be mpa or shared_pole; got {sigma_w_model!r}")
+    if sigma_w_model not in ("mpa", "tangential"):
+        raise ValueError(f"sigma_w_model must be mpa or tangential; got {sigma_w_model!r}")
     if (request is None) == (omega_grid_ry is None):
         raise ValueError("compute_sigma_c_mpa_omega_grid: pass request (on shell) or "
                          "omega_grid_ry (the grid), not both")
@@ -2424,25 +2424,25 @@ def compute_sigma_c_mpa_omega_grid(
     grid_ry = omega_grid_ry if request is None else None
     if request is not None:
         omega_grid_ry = request.frequencies_ry
-    shared_pole = sigma_w_model == "shared_pole"
-    if shared_pole and tau_kernel_factory is not None:
+    tangential = sigma_w_model == "tangential"
+    if tangential and tau_kernel_factory is not None:
         raise ValueError(
             "compute_sigma_c_mpa_omega_grid: tau_kernel_factory serves the pole "
-            "route; a shared-pole model passes its sector kernel through sector_context")
+            "route; a tangential model passes its sector kernel through sector_context")
     fixed_pole_support_ry = None
     support_window_ry = support_top_ev = None
-    if shared_pole:
-        from file_io.shared_pole_store import open_shared_pole_model, validate_shared_pole_model
+    if tangential:
+        from file_io.tangential_store import open_tangential_model, validate_tangential_model
         with timing.section("sigma.model_validate"):
-            ledger = validate_shared_pole_model(
+            ledger = validate_tangential_model(
                 fit_src, expected_identity=fit_identity, mesh_xy=mesh_xy,
-                capacity=meta.shared_pole_capacity)
+                capacity=meta.tangential_capacity)
         if fit_digest is not None and ledger["digest"] != fit_digest:
-            raise ValueError("GATE shared_pole_identity: screening handle digest differs from model")
-        recipe = meta.shared_pole_recipe
+            raise ValueError("GATE tangential_identity: screening handle digest differs from model")
+        recipe = meta.tangential_recipe
         if not np.isclose(regularization_width_ry * RYD_TO_EV,
                           recipe["eta_ev"], rtol=0, atol=1e-12):
-            raise ValueError("GATE shared_pole_eta: Sigma and current recipe eta differ")
+            raise ValueError("GATE tangential_eta: Sigma and current recipe eta differ")
         # W's line support as the model header records it (absolute eV reads).
         header_recipe = ledger.get("recipe") or {}
         if header_recipe.get("support_reads_ev") is not None:
@@ -2455,10 +2455,10 @@ def compute_sigma_c_mpa_omega_grid(
         n_poles = int(ledger["n_q_irr"])
         ordered_residues = False
         with timing.section("sigma.capacity"):
-            schedule = (_shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy, layout=wfns.layout,
+            schedule = (_tangential_memory_schedule(meta, ledger, mesh_xy=mesh_xy, layout=wfns.layout,
                                                      linalg=linalg)
                         if sector_context is None else sector_context["schedule"](ledger))
-        log.debug(f"  shared-pole Sigma capacity: {schedule}")
+        log.debug(f"  tangential Sigma capacity: {schedule}")
     elif isinstance(fit_src, MemoryPoleSource):
         # In-memory GN/HL poles: no store, so no file identity to check.
         ledger = fit_src.ledger
@@ -2492,7 +2492,7 @@ def compute_sigma_c_mpa_omega_grid(
     # (audit A1; hdf5_owner enforces it).  The context manager is the
     # release path: a refusal from the planner or the executor must still
     # close the handle on every rank.
-    with (open_shared_pole_model(fit_src, mesh_xy=mesh_xy) if shared_pole else
+    with (open_tangential_model(fit_src, mesh_xy=mesh_xy) if tangential else
           fit_src if isinstance(fit_src, MemoryPoleSource) else
           open_pole_reader(fit_src, mesh_xy=mesh_xy)) as reader:
         # One bounded extrema census serves both routes.  In particular, the
@@ -2502,11 +2502,11 @@ def compute_sigma_c_mpa_omega_grid(
         certificate = None
         # A route without a pole census reuses rules across the run's plans.
         rule_scope = RUN_SCOPE
-        if shared_pole:
-            from file_io.shared_pole_store import read_shared_pole_census
+        if tangential:
+            from file_io.tangential_store import read_tangential_census
             with timing.section("sigma.census"):
-                poles_device, counts_device = read_shared_pole_census(
-                    reader, header=ledger, capacity=meta.shared_pole_capacity)
+                poles_device, counts_device = read_tangential_census(
+                    reader, header=ledger, capacity=meta.tangential_capacity)
                 poles2, counts = map(np.asarray, jax.device_get((poles_device, counts_device)))
                 del poles_device, counts_device
                 # A sector call scopes its rules by the map's union census
@@ -2516,8 +2516,8 @@ def compute_sigma_c_mpa_omega_grid(
                     ledger["identity"],
                     *((poles2, counts) if scope is None else scope),
                     eta=regularization_width_ry, eps=quadrature_eps)
-                frequencies = shared_pole_frequencies(poles2, counts)
-                summaries = summarize_shared_poles(
+                frequencies = tangential_frequencies(poles2, counts)
+                summaries = summarize_tangential_poles(
                     poles2, counts, branches,
                     regularization_width_ry=regularization_width_ry,
                     edge_factor=edge_factor)
@@ -2529,11 +2529,11 @@ def compute_sigma_c_mpa_omega_grid(
                     union2 = np.ones((len(union_rows), max(1, max(map(len, union_rows)))))
                     for q, row in enumerate(union_rows):
                         union2[q, :len(row)] = np.sort(row)
-                    certificate = summarize_shared_poles(
+                    certificate = summarize_tangential_poles(
                         union2, np.asarray(union_counts, np.int64), branches,
                         regularization_width_ry=regularization_width_ry,
                         edge_factor=edge_factor)
-        for lo in (() if shared_pole else range(0, n_poles, int(pole_batch_size))):
+        for lo in (() if tangential else range(0, n_poles, int(pole_batch_size))):
             hi = min(lo + int(pole_batch_size), n_poles)
             Omega, B, B_odd = reader.read(
                 slice(lo, hi), unfold=getattr(reader, "q_wedge", None) is None,
@@ -2640,10 +2640,10 @@ def compute_sigma_c_mpa_omega_grid(
                     f"noise={window['runtime_noise_bound']:.6g}/"
                     f"{window['runtime_noise_budget']:.6g}")
         with timing.section("sigma.tau_sweep"):
-            if shared_pole:
+            if tangential:
                 _band_fence('tau.synthesis_setup', sync_ranks=True)
                 with timing.section('tau.synthesis_setup'):
-                    synthesis = (_shared_pole_w_synthesis(
+                    synthesis = (_tangential_w_synthesis(
                         reader, meta, ledger, frequencies, schedule, mesh_xy=mesh_xy,
                         layout=schedule.get("factor_layout", wfns.layout))
                         if sector_context is None else sector_context["synthesis"](

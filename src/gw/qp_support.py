@@ -9,7 +9,7 @@ stays inside
   ``sigma_omega_max_ev``, or the patch list): a fixed interval that never grows.
   Unset edges give the sample next to E_F.
 * ``R`` is the requested states: the QP-window identities (nval/ncond) the W
-  model treats as active (``shared_pole_recipe.active_band_mask``), outside
+  model treats as active (``tangential_recipe.active_band_mask``), outside
   ``sc_frozen_core_bands``, and quasiparticles at the previous map
   (:func:`quasiparticle_mask`).  Under ``clamp``/``static`` only those inside
   the padded requested window (``scissor.sc_padded_window_ev``).
@@ -112,9 +112,9 @@ def requested_reads_ev(energy_relative_ev, requested_kn, step_ev, pad_ev=SUPPORT
     """The energies around the requested states that W's line must cover, ``E - mu`` (eV), 1-D.
 
     Each requested state's input energy at every offset of ``[-pad, +pad]`` on the
-    Sigma step.  The W recipe passes its own pad (``shared_pole_recipe
+    Sigma step.  The W recipe passes its own pad (``tangential_recipe
     .SUPPORT_READ_PAD_EV``, 5 eV), wider than the plan's 2 eV.  The one source of where
-    W's line supports must hold (``shared_pole_recipe.support_rule_line_sites``);
+    W's line supports must hold (``tangential_recipe.support_rule_line_sites``);
     the caller passes its own requested mask (one-shot or SC map), so neither
     path's semicore rule is decided here.  Empty when nothing is requested.
     """
@@ -413,7 +413,7 @@ def coarse_windows_plan(sigma, energy_rel_ev, semicore_kn, near_lo_ev, held=None
         if users:
             raise ValueError(
                 "GATE sigma_coarse_window: sigma_omega_patches_ev lo:hi:eta windows serve "
-                "the coarse (semicore) class of the MPA/shared-pole Sigma (scalar or "
+                "the coarse (semicore) class of the MPA/tangential Sigma (scalar or "
                 "sector), and no occupied state of this run lies below the coarse floor "
                 "(or its Sigma is PPM/static).")
         return None, "", ()
@@ -456,7 +456,7 @@ def oneshot_support_ev(sigma, deck_grid_ev, energy_rel_ev, requested_kn, coarse_
 def semicore_patch_route(compute_mode):
     """THE one predicate for a Sigma route that reads the semicore patch.
 
-    The MPA/shared-pole Sigma, scalar or sector (bispinor): both run the one
+    The MPA/tangential Sigma, scalar or sector (bispinor): both run the one
     pole executor and window planner (``mpa.sigma.compute_sigma_c_mpa_omega_grid``;
     ``mpa.sector_sigma`` calls it once per sector pair with the same options),
     so the coarse class (``meta.coarse_class``, built once in

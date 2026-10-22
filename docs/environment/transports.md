@@ -32,7 +32,7 @@ Native MPI (parallel HDF5, SLATE, ScaLAPACK) — the site MPI, linked directly
 A library all-reduce or reduce-scatter (RCCL, NCCL, MPI) adds the P per-rank terms in
 the order its rings or trees take from the devices' physical links. The same P=4 job on
 another GPU set, or with ranks paired differently across MI250X packages, therefore
-rounds differently in the last bit, and the ISDF fit and the shared-pole gates amplify
+rounds differently in the last bit, and the ISDF fit and the tangential gates amplify
 that. Measured on Fe V2: Σ_c moved by 4e-7 to 7.5e-7 eV and eqp prints flipped with the
 placement. On hsuite `bisp_sc`, the CT sector's `retained_metric_positive` gate passed or
 failed with the placement (det lane, 2026-10-16).

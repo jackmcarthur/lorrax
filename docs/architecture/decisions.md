@@ -18,20 +18,20 @@ The GW driver's phase invariants and the per-function contracts of
 direct head (on the dense k set when `head_dense_file` is given) plus the GW
 mesh's wing fold through W(Γ), on metals and insulators. `off` stays as the one
 documented debug value (the CD route, the TD-aGW SPM member and head-off
-convergence arms need it). On `bispinor_gw = full_shared_pole`, `full` is the
+convergence arms need it). On `bispinor_gw = full_tangential`, `full` is the
 existing direct sector head, and the run record states "no local-field fold on
-the four-current bank". The shared-pole `bare_transverse` four-spinor charge
+the four-current bank". The tangential `bare_transverse` four-spinor charge
 carrier folds like the scalar store: its charge operator, wing vertices and
-velocity are spin-traced on the same carrier (`gw.shared_pole_head` docstring).
+velocity are spin-traced on the same carrier (`gw.tangential_head` docstring).
 
 **Why.** Local fields move the head's gap part `v/ε_M` by `v·Δ(1/ε_M)`: on Si
 4³ the dense head goes from ε_M 13.5 (unfolded) to 12.3 (folded), about 21 meV
 of the gap. A deck dial that drops them is not a prescription.
 
 **Licenses deleting.** `HeadCorrection.NO_LOCAL_FIELDS`, its default under
-`full_shared_pole`, `GATE full_shared_pole_head`, `GATE
+`full_tangential`, `GATE full_tangential_head`, `GATE
 bispinor_head_correction_no_local_fields_unavailable`, `GATE
-shared_pole_head_nspinor`, and the `wings=False` direct-only head builds.
+tangential_head_nspinor`, and the `wings=False` direct-only head builds.
 
 ## 2026-10-08 — One memory rule sets the device budget and the pool {#headroom}
 
@@ -113,7 +113,7 @@ recompiled again. On CrI3 24×24 at P64 the two 2026-10-05 instances cost
 about 120 s per leg and 220–270 s per chain of recompiles that no production
 output reported.
 
-**Deletes.** `shared_pole_local.grow_round` and the Ritz carrier history,
+**Deletes.** `tangential_local.grow_round` and the Ritz carrier history,
 the face route's own ragged schedule and the `real != len(own)` refusal;
 `parent_rounds` is the one schedule; the one remaining history is the
 pencil extent's (`round_tables`, in the SC session).
@@ -166,8 +166,8 @@ and one copy of its tables per pass. Compile time and host memory then grow
 linearly with the pass count, which reaches hundreds per rank on
 production decks.
 
-**Not yet conforming.** The parent panels of the scalar shared-pole W
-synthesis (`gw.mpa.sigma._shared_pole_w_synthesis`) are a static Python loop
+**Not yet conforming.** The parent panels of the scalar tangential W
+synthesis (`gw.mpa.sigma._tangential_w_synthesis`) are a static Python loop
 inside the window executable; its pole-column chunks are a `fori_loop`.
 
 ## 2026-10-01 — Dense per-q linear algebra runs local or on the full mesh, never on a sub-mesh {#no-sub-mesh}
@@ -188,9 +188,9 @@ third plan with its own communicator creation (a world-collective
 `MPI_Comm_split`, see the square-mesh ruling below), its own divisibility
 contract and its own failure modes, and it gains nothing at that limit.
 
-**Exception: plans that do not fit.** Under `local`, a shared-pole
+**Exception: plans that do not fit.** Under `local`, a tangential
 parent stack whose whole matrices do not fit beside the live stages takes
-the distributed plan instead (`gw.shared_pole_execution.whole_parent_execution`
+the distributed plan instead (`gw.tangential_execution.whole_parent_execution`
 for the bank's line selection, `constructor_execution` for the constructor),
 and so does a W Dyson solve whose whole matrices per rank do not fit the
 budget (owner 2026-10-13; `lxkit.memory.admit`,
@@ -244,9 +244,9 @@ figure exceeds `memory_per_device_gb` or its tile. It prints one
 `RuntimeWarning` per stage kind (`lxkit.memory.admit`:
 `memory over budget at <stage>: needs X GB/rank, budget Y GB/rank, over by
 Z GB; continuing (an OOM is possible)`), takes its smallest size and runs. The
-shared-pole capacity ledger records an over-budget row as `FAIL` and admits it
-(`gw.shared_pole_recipe.CapacityLedger.reserve`). Correctness gates still
-refuse, for example `GATE shared_pole_gram_valid` (`gw.shared_pole_constructor`);
+tangential capacity ledger records an over-budget row as `FAIL` and admits it
+(`gw.tangential_recipe.CapacityLedger.reserve`). Correctness gates still
+refuse, for example `GATE tangential_gram_valid` (`gw.tangential_constructor`);
 a k grid the mathdx family cannot hold takes the router's XLA backend with one
 warning ([router](kconv.md#router)).
 
@@ -256,8 +256,8 @@ stops runs the device would hold. The allocator decides exactly, at the
 cost of an OOM where the device truly lacks the room.
 
 **Deleted.** Every capacity refusal: `compiled_chunk_capacity`,
-`shared_pole_round_capacity`, `zeta-mubatch-capacity`, `vq_tile_budget`,
-`gn_ppm_fit_capacity`, the budget arm of `shared_pole_capacity` and the
+`tangential_round_capacity`, `zeta-mubatch-capacity`, `vq_tile_budget`,
+`gn_ppm_fit_capacity`, the budget arm of `tangential_capacity` and the
 others the planners carried.
 
 ## 2026-09-30 — Streamed loops take one fixed tile sized from their shapes {#fixed-tile}
@@ -286,7 +286,7 @@ streamed sample, 6.6 GB at CrI3 24×24). A narrower round leaves P − w ranks
 idle (owner 2026-10-04).
 
 **Two sizes follow the budget by design**, through the capacity ledger,
-because a larger size is faster and moves no number: the shared-pole
+because a larger size is faster and moves no number: the tangential
 response sample group (`gw.response_bank.response_group_size`) and the
 htransform Galerkin whole-state fit (`bandstructure.fh_interp`,
 `isdf.galerkin`).
@@ -296,11 +296,11 @@ htransform Galerkin whole-state fit (`bandstructure.fh_interp`,
 deadlock): the ζ μ-batch planner's batch and G tile
 (`gw.gflat_memory_model.plan_zeta_route_g`; its parent chunk and plane-group
 width take the fixed tile),
-the scalar shared-pole W-synthesis panel schedule (`gw.mpa.sigma`, parent and
+the scalar tangential W-synthesis panel schedule (`gw.mpa.sigma`, parent and
 pole-column capacities from the ledger), the pair-convolution chunks
 (`gw.mixed_basis_pair_convolution._budget_target`), the non-TDA BSE column
 chunk (`bse.bse_nontda.dense_col_chunk`), the head Γ GEMM route
-(`gw.shared_pole_head`) and the plane-wave screening route
+(`gw.tangential_head`) and the plane-wave screening route
 (`gw.plane_wave_screening`). The ruling licenses converting each to
 `tile_units`.
 
@@ -314,7 +314,7 @@ function is: only on the irreducible q, by the Green builder's contraction,
 and unfolded to the full q grid only on the load of the k-convolution that
 reads it. No W(τ), W factor or pole table exists on the full q grid.
 
-* **Scalar shared-pole Σ.** `gw.mpa.sigma._shared_pole_w_synthesis` forms
+* **Scalar tangential Σ.** `gw.mpa.sigma._tangential_w_synthesis` forms
   $W(q,\tau) = b\,d(\tau)\,b^\dagger$ and its transpose on the irreducible q
   through `gw.greens_function_kernel.build_G` (little-group realization,
   fixed-q projection); `ffi.fft.make_kfft_klead_unfold` (mathdx mode 9)
@@ -327,7 +327,7 @@ reads it. No W(τ), W factor or pole table exists on the full q grid.
   load. The constant $W_\infty - V$ and the photon static classes use the
   same entry.
 * **Restart.** The stored $W_0 = V + W_c(0)$
-  (`gw.mpa.sigma.shared_pole_static_wc`) holds the q parents with their
+  (`gw.mpa.sigma.tangential_static_wc`) holds the q parents with their
   unfold tables; BSE unfolds on load.
 
 **Why.** W has the symmetry of the crystal, as G does. A full-q copy costs
@@ -338,10 +338,10 @@ the tile through an index map and phases.
 **Licenses deleting** the V_R Lorentz k-convolution targets the native
 library still exports for older trees (nothing in `ffi.fft` calls them).
 
-## 2026-09-29 — Production GW is full-frequency QSGW with the shared-pole W {#production-gw-route}
+## 2026-09-29 — Production GW is full-frequency QSGW with the tangential W {#production-gw-route}
 
 **Rule (owner).** The production GW calculation is full-frequency QSGW with
-W built from residues: `compute_mode = mpa`, `sigma_w_model = shared_pole`,
+W built from residues: `compute_mode = mpa`, `sigma_w_model = tangential`,
 `qp_solver = self_consistent`. GN-PPM is a comparison route, and it refuses
 metals. One band count serves χ₀ and Σ, and Σ's band sum is extrapolated by
 the pooled `spectral_shell` fit. The error budget has two classes, reported
@@ -352,9 +352,9 @@ recipe, its budget and its pending parts are
 [production QSGW](../how-to/production-qsgw.md).
 
 **Why.** The owner's interest is the full-frequency calculation ("much more
-interested in the full freq shared pole GW calc than GNPPM"). The shared-pole
+interested in the full freq shared pole GW calc than GNPPM"). The tangential
 W is a pole sum with real poles and positive residues by construction
-([shared-pole W §4.3](../theory/shared-pole-w-model.md)), the form a Green's
+([tangential W §4.3](../theory/tangential-w-model.md)), the form a Green's
 function has; GN-PPM fits one pole per matrix element.
 
 ## 2026-09-29 — The current vertex is the q = 0 velocity operator {#current-vertex-q0}
@@ -453,7 +453,7 @@ with the first and which only the decks that select it ever test.
 
 **Ruling (lead, for the owner's production-CD goal; χ⁰ amended by the owner 2026-10-19).**
 `sigma_frequency_integration = pole_model | contour_deformation` under `compute_mode = mpa`.  Contour
-deformation evaluates Σ_c on the ISDF W(z) built from the shared-pole bank's response-quadrature χ⁰
+deformation evaluates Σ_c on the ISDF W(z) built from the tangential bank's response-quadrature χ⁰
 (rules per CD memory window at `cd_chi0_rule_tolerance`, `gw.cd.chi0_rules`; no Lehmann sum) and the
 response bank's Dyson pair equations, streams W in `runtime.tiles` chunks without persisting it, and
 hands its cube to the one dynamic-Σ finalizer.
@@ -467,16 +467,16 @@ factory and the `internal_ff_cd` branches did not land and are not supported.  T
 `head_correction` other than `off`, `linalg` other than `local`, band extrapolation and a per-window η;
 W(z) persistence (`write_w`) is not offered.
 
-## 2026-09-18 — Headless shared-pole SC is allowed for brute-grid development
+## 2026-09-18 — Headless tangential SC is allowed for brute-grid development
 
-`sigma_w_model = shared_pole` with `qp_solver = self_consistent` and
+`sigma_w_model = tangential` with `qp_solver = self_consistent` and
 `head_correction = off` runs, with a warning
-(`gw_config.warn_headless_shared_pole_self_consistency`) that names the
+(`gw_config.warn_headless_tangential_self_consistency`) that names the
 measured map-1 q = 0 Gram risk. The dense-k grid is the intended convergence
 limit: the missing head is a finite-grid term, so the headless map is judged
 by its own convergence. The Gram gate is unchanged; a headless run may still
-refuse at `GATE shared_pole_gram_valid`. An ordered (time-reversal-broken)
-store refused `head_correction = full` (`GATE shared_pole_head_ordered`) and
+refuse at `GATE tangential_gram_valid`. An ordered (time-reversal-broken)
+store refused `head_correction = full` (`GATE tangential_head_ordered`) and
 carried the direct head (the since-deleted `no_local_fields`) instead; since 2026-10-19 it folds
 the signed body and Lehmann wings, and since 2026-10-20 an ordered metal does
 too ([metal head §5](../theory/metal-q0-head.md#5-limits-of-the-model)).

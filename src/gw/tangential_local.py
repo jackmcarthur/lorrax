@@ -1,4 +1,4 @@
-"""Rounds of shared-pole parents, one parent per mesh rank (batch layout).
+"""Rounds of tangential parents, one parent per mesh rank (batch layout).
 
 The round schedule, the column tables and the one round program that packs,
 assembles, reduces, gates and sorts every parent of a round on its own rank
@@ -53,7 +53,7 @@ def batch_to_face(mesh_xy):
 
     def restore(a):
         if py > 1:
-            pad = padded_axis(a.shape[2], py, name='shared_pole_factor_width').pad
+            pad = padded_axis(a.shape[2], py, name='tangential_factor_width').pad
             if pad:
                 a = jnp.pad(a, ((0, 0), (0, 0), (0, pad)))
             a = jax.lax.all_to_all(a, 'y', split_axis=2, concat_axis=0, tiled=True)
@@ -89,7 +89,7 @@ def batch_stack_to_face(mesh_xy, nq):
                      check_vma=False)
 
     def pad(a):
-        width = padded_axis(a.shape[2], py, name='shared_pole_factor_width').pad if py > 1 else 0
+        width = padded_axis(a.shape[2], py, name='tangential_factor_width').pad if py > 1 else 0
         return jnp.pad(a, ((0, 0), (0, 0), (0, width))) if width else a
 
     return jax.jit(lambda *fields: move(jnp.stack([pad(f) for f in fields], axis=1))[:nq],
@@ -139,10 +139,10 @@ def canonical_factors(mesh_xy, order, components=1):
 
 def carrier_history(meta):
     """One model's held writer widths (``held_writer_width``), shared by its SC maps."""
-    history = getattr(meta, "_shared_pole_carrier_history", None)
+    history = getattr(meta, "_tangential_carrier_history", None)
     if history is None:
         history = {}
-        meta._shared_pole_carrier_history = history
+        meta._tangential_carrier_history = history
     return history
 
 
@@ -192,7 +192,7 @@ def pad_states(states, widths, infinity, infinity_width):
     """
     def pad(a, w):
         if int(a.shape[-1]) > int(w):
-            raise ValueError(f"GATE shared_pole_carrier: got: a panel of {int(a.shape[-1])} columns on a "
+            raise ValueError(f"GATE tangential_carrier: got: a panel of {int(a.shape[-1])} columns on a "
                              f"carrier of {int(w)}; want: carrier >= panel; why: a carrier is the recipe "
                              "bound or the panel's own width, never narrower")
         return a if int(a.shape[-1]) == int(w) else _pad_columns(a.sharding, a.shape, int(w))(a)
@@ -246,7 +246,7 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     # side, follows the selection. The padding is inert: zero columns that
     # the zero-row-safe eigensolver keeps out of every spectrum.
     if np.any(carriers > np.asarray(widths, np.int64)[None, :]):
-        raise ValueError("GATE shared_pole_round_tables: got: a state carrier wider than its "
+        raise ValueError("GATE tangential_round_tables: got: a state carrier wider than its "
                          "panel; want: column_extent(count) <= panel width; why: its columns "
                          "would index the next state's panel")
     capacity = max(sum(int(widths[a]) for a in half) for half in halves)
@@ -362,7 +362,7 @@ def pack_round(fields, widths, nodes, infinity, infinity_width, *, extent, halve
     the host's (one read; diagnostic).
     """
     import numpy as np
-    from gw.shared_pole_directions import device_index
+    from gw.tangential_directions import device_index
     slots, states = int(fields[0][0].shape[0]), len(widths)
     F = int(extent) * int(halves)
     shapes = tuple((int(panels[0].shape[1]), np.dtype(panels[0].dtype).name) for panels in fields)
@@ -739,7 +739,7 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
                    for g, w in zip((live, points, active), want)                 # this process's shards
                    for s in g.addressable_shards)
         if not same:
-            raise ValueError("GATE shared_pole_round_tables_device: the device-built round tables "
+            raise ValueError("GATE tangential_round_tables_device: the device-built round tables "
                              "differ from the host's (live, points, active)")
     args = (live, points, active, q, o, d, tuple(infinity))
     budget = None if keep_budget is None else int(keep_budget)
@@ -747,7 +747,7 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
                             bool(retain_span), gram_keep, budget)
     if beside is None:
         return program(*args)
-    from gw.shared_pole_execution import compiled_for, price_round
+    from gw.tangential_execution import compiled_for, price_round
     executable = compiled_for(program, args)
     price_round(executable, mesh_xy, beside, whole=True)
     return executable(*args)
@@ -763,31 +763,31 @@ def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
     reduction, zero policy and original/retained moment identities.
     """
     import jax.numpy as jnp
-    from gw.shared_pole_gates import (apply_shared_pole_zero_policy, ordered_moment_identity,
+    from gw.tangential_gates import (apply_tangential_zero_policy, ordered_moment_identity,
                                      retained_moment_identity)
-    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil, assemble_shared_pole_pencil
-    from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil, reduce_shared_pole_pencil
+    from gw.tangential_pencil import assemble_ordered_tangential_pencil, assemble_tangential_pencil
+    from gw.tangential_reduction import reduce_ordered_tangential_pencil, reduce_tangential_pencil
     finite = [(points, q, o, d)]
-    # Support geometry of the even route's Gram validity floor (shared_pole_reduction.gram_rounding_floor).
+    # Support geometry of the even route's Gram validity floor (tangential_reduction.gram_rounding_floor).
     rounding = dict(points=points, derivative_norm=jnp.linalg.norm(d, axis=-2), rows=int(q.shape[-2]))
     if ordered:
-        pencil = assemble_ordered_shared_pole_pencil(finite, infinity if odd_moments else None,
+        pencil = assemble_ordered_tangential_pencil(finite, infinity if odd_moments else None,
                                                      matmul=matmul, matrix_sharding=matrix_sharding)
-        reduced = reduce_ordered_shared_pole_pencil(
+        reduced = reduce_ordered_tangential_pencil(
             pencil, active, eigh=eigh, matmul=matmul, gates=gates, keep_budget=keep_budget,
             retain_span=retain_span, matrix_sharding=matrix_sharding, gram_keep=gram_keep, carrier=carrier)
         model, signed, reduction = reduced[:3]
         if retain_span:
             coefficients = reduced[3]
         retained = ordered_moment_identity(signed, infinity, matmul=matmul) if odd_moments else {}
-        model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+        model, zero = apply_tangential_zero_policy(model, gates=gates)
         zero["zero_policy"] = zero["zero_policy"] & reduction["infinite_weight_ok"]
     else:
-        pencil = assemble_shared_pole_pencil(finite, infinity, matmul=matmul)
-        model, reduction, coefficients = reduce_shared_pole_pencil(
+        pencil = assemble_tangential_pencil(finite, infinity, matmul=matmul)
+        model, reduction, coefficients = reduce_tangential_pencil(
             pencil, active, eigh=eigh, matmul=matmul, gates=gates, keep_budget=keep_budget,
             rounding=rounding)
-        model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+        model, zero = apply_tangential_zero_policy(model, gates=gates)
         # E selects the infinity block, the last columns of X.
         side, width = pencil[0].shape[-1], infinity[0].shape[-1]
         selector = (jnp.arange(side)[:, None] == jnp.arange(side - width, side)[None, :])
@@ -829,8 +829,8 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retai
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from jax import shard_map
-    from gw.shared_pole_gates import sort_shared_pole_columns
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
+    from gw.tangential_gates import sort_tangential_columns
+    from gw.tangential_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
 
     gates = shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     batch, replicated = P(BATCH), NamedSharding(mesh_xy, P())
@@ -852,7 +852,7 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retai
             return jax.tree.map(lambda a: jnp.zeros(a.shape, a.dtype), jax.eval_shape(work, args))
         reduced = jax.lax.cond(live[0], work, skip, args)
         model, signed, diagnostics = reduced[:3]
-        model, permutation = sort_shared_pole_columns(model)
+        model, permutation = sort_tangential_columns(model)
         result = model, signed, (*diagnostics, permutation)
         return (*result,reduced[3]) if retain_span else result
 
@@ -923,15 +923,15 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
 
-    from gw.shared_pole_execution import is_face
+    from gw.tangential_execution import is_face
     if is_face(model[0]):
         # A face round holds ``real`` physical parents in its leading slots;
         # the gate equations are per parent, so each is checked on its own
         # leading row (no data moves) and the replicated rows are stacked.
-        from gw.shared_pole_execution import (face_check_bytes, face_compiled, face_eigh,
+        from gw.tangential_execution import (face_check_bytes, face_compiled, face_eigh,
                                               face_round_check_program, plan_room)
         if eigh_plan.n not in (None, int(model[0].shape[-2])):
-            raise ValueError('whole-mesh shared-pole checks need the n x n eigh plan')
+            raise ValueError('whole-mesh tangential checks need the n x n eigh plan')
         program = lambda plan: face_round_check_program(mesh_xy, bool(ordered), plan, plan_room(plan))
         n, rows = int(model[0].shape[-2]), []
         for slot in range(int(real)):
@@ -1015,15 +1015,15 @@ def _round_check_equations(model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
     """Shared scalar gate equations for local-parent and whole-mesh adapters."""
     import jax
     import jax.numpy as jnp
-    from gw.shared_pole_directions import _model_diagnostics
-    from gw.shared_pole_gates import (shared_pole_passivity,
-                                      shared_pole_reciprocity,
-                                      signed_shared_pole_passivity)
+    from gw.tangential_directions import _model_diagnostics
+    from gw.tangential_gates import (tangential_passivity,
+                                      tangential_reciprocity,
+                                      signed_tangential_passivity)
 
     factor, poles, active = model
     if ordered:
         factor, mu, kept = signed
-        passive = signed_shared_pole_passivity(
+        passive = signed_tangential_passivity(
             signed, inverse, eta_ry=eta, matmul=matmul, eigh=eigh, gates=gates)
         node = z[:, None]
         weights = jnp.where(kept, 1 / (node * mu - 1), 0)
@@ -1031,7 +1031,7 @@ def _round_check_equations(model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
         scale = jnp.where(kept, 1 / jnp.where(kept, jnp.abs(mu), 1), 0)
         moment_model = (factor * scale[:, None, :], scale ** 2, kept)
     else:
-        passive = shared_pole_passivity(
+        passive = tangential_passivity(
             model, inverse, eta_ry=eta, matmul=matmul, eigh=eigh, gates=gates)
         weights = jnp.where(active, 1 / ((z ** 2)[:, None] - poles), 0)
         slopes = -weights ** 2
@@ -1047,7 +1047,7 @@ def _round_check_equations(model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
                           / jnp.maximum(jnp.linalg.norm(exact),
                                         jnp.finfo(jnp.float64).tiny))
             reciprocity.append({} if ordered else
-                shared_pole_reciprocity(value, exact, gates=gates))
+                tangential_reciprocity(value, exact, gates=gates))
         return jnp.stack(errors), jax.tree.map(lambda *v: jnp.stack(v), *reciprocity)
     errors, reciprocity = jax.lax.map(sample, (weights, slopes, wc[0], dw[0]))
     rows = lambda a: jnp.swapaxes(a, 0, 1)[None]
@@ -1075,7 +1075,7 @@ def round_checks(mesh_xy, native_eigh, ordered):
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from jax import shard_map
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
+    from gw.tangential_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
 
     gates = shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     batch, rep = P(BATCH), P()

@@ -1,6 +1,6 @@
 """MPA Sigma frequency windows, derived directly from fitted pole geometry.
 
-This module reduces each sharded pole field (or a shared-pole store's ragged
+This module reduces each sharded pole field (or a tangential store's ragged
 census) to the per-branch extrema the box planner (``gw.sigma_box_plan``)
 needs, and defines the planner's row type ``SharedSigmaWindow``.  No pole tile,
 plan file, or spatial kernel lives here.
@@ -179,7 +179,7 @@ def summarize_sigma_poles(
         for local in range(int(Omega_poles.shape[0])))
 
 
-def shared_pole_frequencies(poles2_ry2, counts):
+def tangential_frequencies(poles2_ry2, counts):
     """Validate replicated metadata and return sorted active Ω per parent.
 
     Parameters
@@ -200,25 +200,25 @@ def shared_pole_frequencies(poles2_ry2, counts):
     poles2 = np.asarray(poles2_ry2)
     counts = np.asarray(counts)
     if poles2.ndim != 2 or poles2.dtype != np.dtype(np.float64):
-        raise ValueError("shared-pole poles2 must be float64 [parent,Kcap]")
+        raise ValueError("tangential poles2 must be float64 [parent,Kcap]")
     if counts.shape != poles2.shape[:1] or counts.dtype != np.dtype(np.int64):
-        raise ValueError("shared-pole K must be int64 [parent]")
+        raise ValueError("tangential K must be int64 [parent]")
     if poles2.shape[1] > np.iinfo(np.int32).max:
-        raise ValueError("shared-pole column indices exceed int32 capacity")
+        raise ValueError("tangential column indices exceed int32 capacity")
     if np.any(counts < 0) or np.any(counts > poles2.shape[1]):
-        raise ValueError("shared-pole K lies outside the stored column extent")
+        raise ValueError("tangential K lies outside the stored column extent")
     if not np.all(np.isfinite(poles2)) or np.any(poles2 <= 0):
-        raise ValueError("shared-pole frequencies and sentinels must be finite positive")
+        raise ValueError("tangential frequencies and sentinels must be finite positive")
     result = []
     for row, count in zip(poles2, counts):
         active = row[:int(count)]
         if np.any(active[1:] < active[:-1]):
-            raise ValueError("shared-pole active columns must be jointly sorted by Λ")
+            raise ValueError("tangential active columns must be jointly sorted by Λ")
         result.append(np.sqrt(active))
     return tuple(result)
 
 
-def shared_pole_intervals(frequencies, pole_indices, bounds):
+def tangential_intervals(frequencies, pole_indices, bounds):
     """Return parent-prefix intervals for the owner's ``(lower, upper]`` rule.
 
     ``frequencies`` is the validated ragged census in Ry; ``pole_indices``
@@ -229,13 +229,13 @@ def shared_pole_intervals(frequencies, pole_indices, bounds):
     indices = np.asarray(pole_indices)
     bounds = np.asarray(bounds, dtype=np.float64)
     if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
-        raise ValueError("shared-pole parent indices must be an integer vector")
+        raise ValueError("tangential parent indices must be an integer vector")
     if bounds.shape != (indices.size, 6) or np.any(np.isnan(bounds)):
-        raise ValueError("shared-pole bounds must be [nselected,6] without NaN")
+        raise ValueError("tangential bounds must be [nselected,6] without NaN")
     if np.any(indices < 0) or np.any(indices >= len(frequencies)):
-        raise ValueError("shared-pole selector references a missing parent")
+        raise ValueError("tangential selector references a missing parent")
     if len(set(map(int, indices))) != indices.size:
-        raise ValueError("shared-pole window selects a parent more than once")
+        raise ValueError("tangential window selects a parent more than once")
     intervals = np.zeros((len(frequencies), 2), dtype=np.int32)
     for parent, b in zip(indices, bounds):
         if not (0 >= b[2] and 0 > b[3] and 0 < b[4] and 0 <= b[5]):
@@ -247,23 +247,23 @@ def shared_pole_intervals(frequencies, pole_indices, bounds):
     return intervals
 
 
-def summarize_shared_poles(
+def summarize_tangential_poles(
     poles2_ry2, counts, branches, *, regularization_width_ry, edge_factor,
 ):
     """Feed real, ragged parent extrema to the existing Σ window planner.
 
-    Metadata shapes/units follow :func:`shared_pole_frequencies`. A parent
+    Metadata shapes/units follow :func:`tangential_frequencies`. A parent
     occupies one planner record, irrespective of its rank. Neither fake
     elementwise residue fields nor a frozen pole ceiling enter this census;
     call it again with the current bands, occupations and model each SC map.
     """
-    frequencies = shared_pole_frequencies(poles2_ry2, counts)
+    frequencies = tangential_frequencies(poles2_ry2, counts)
     _, _, _, selectors = _geometry(
         branches, regularization_width_ry, edge_factor)
     evidence = [dict() for _ in frequencies]
     indices = np.arange(len(frequencies), dtype=np.int64)
     for name, bounds in selectors.items():
-        intervals = shared_pole_intervals(
+        intervals = tangential_intervals(
             frequencies, indices,
             np.broadcast_to(bounds, (len(frequencies), 6)))
         for parent, (lo, hi) in enumerate(intervals):

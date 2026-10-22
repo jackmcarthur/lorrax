@@ -71,7 +71,7 @@ the dataset's extent.
   (`lorrax_phdf5_write`): P = 1, a tiny slab, a layout that could only be cut by
   slicing a sharded axis (a face `(q, μ_X, ν_Y)` tile too large to take whole),
   pieces whose per-rank runs would be shorter than 1 MiB, or compound source-axis layouts without an explicit file-row mover.
-- **Why:** at P16 on Lustre (A100-40GB nodes), the shared-pole bank write at
+- **Why:** at P16 on Lustre (A100-40GB nodes), the tangential bank write at
   production spread runs at 2.4 GB/s against 2.0 GB/s collective, a WFN_qp G
   window at 4.1 against 2.8, and the 66 GB CrI3 16×16 WFN_qp write at 30 s
   against 72 s. Independent writes of short runs lose (76 kB runs: 0.8 GB/s).
@@ -432,7 +432,7 @@ long contiguous file runs), the read is independent. There, two-phase
 aggregation only re-ships every byte through 16 MiB collective-buffer
 rounds: at VI3 12×12 P16, bands 0:360 (120.2 GB,
 `runs/runtime/p2d_io_20260924`), it took 56.8 s cold and 44.4 s warm, against
-17.8 s and 7.6 s independent. Short strided windows (shared-pole bank
+17.8 s and 7.6 s independent. Short strided windows (tangential bank
 rectangles) stay collective.
 
 Either way the handler reads each chunk of output rows into packed pinned
@@ -552,15 +552,15 @@ same ranks in the same layout. It is not HDF5 and moves nothing between
 ranks: each device keeps its own `(μ_X, ν_Y)` tile in one private store.
 Create, commit, read and release each end in one error agreement on every
 rank (`common.collectives.agree_io_error`), so every rank calls every method
-in the same order. Its callers are the shared-pole χ bank (label `chi`), the
+in the same order. Its callers are the tangential χ bank (label `chi`), the
 moment bank (`moments`) and the W bank (`bank_<field>`); each caller picks
 its tier ([memory model](memory-model.md#streamed-chi-bank),
-[shared-pole model §1](shared_pole_model.md#1-one-map)).
+[tangential model §1](tangential_model.md#1-one-map)).
 
 | `kind` | store per device |
 |---|---|
 | `host` | one anonymous, pre-faulted host mapping |
-| `file` | one file, `<run dir>/<label>_shared_pole/streamed_bank/<label>.<device id>` |
+| `file` | one file, `<run dir>/<label>_tangential/streamed_bank/<label>.<device id>` |
 
 - **Layout.** A record is one segment's `[q, rows, cols]` tile of one
   output, padded to the page size (the largest on any rank; never the
@@ -603,11 +603,11 @@ its tier ([memory model](memory-model.md#streamed-chi-bank),
   device groups ([memory model](memory-model.md#streamed-chi-bank)); the
   moments are computed per q batch without the stream (`response_bank`); the
   W bank takes the shared scratch file `bank.h5`
-  (`gw.shared_pole_screening`). A W-bank
+  (`gw.tangential_screening`). A W-bank
   field created after the bank's initialization (line panels, contact fields)
   that the disk refuses is held in host memory instead, agreed on every rank,
   with one `RuntimeWarning` per bank in the report's WARNINGS block
-  (`shared_pole_store.ResidentBankPayload`). A verdict costs 45–64 ms at P4 (claim
+  (`tangential_store.ResidentBankPayload`). A verdict costs 45–64 ms at P4 (claim
   3111).
 - **Lifetime.** A store file is unlinked as soon as it is opened. Its bytes
   live as long as the process's descriptor, so a refusal, a kill or a SIGKILL
@@ -617,10 +617,10 @@ its tier ([memory model](memory-model.md#streamed-chi-bank),
   committed, so nothing in the tier outlives its SC map, and an interrupted
   map cannot resume from it.
 - **Freeing space.** Only code before 2026-10-01 (or a process killed between
-  open and unlink) leaves files. The first shared-pole map of a process
+  open and unlink) leaves files. The first tangential map of a process
   removes the `streamed_bank/` directories of its run directory and prints one
-  `WARNING shared-pole output: removed streamed stores left by an earlier
-  process` line. By hand: delete `<run dir>/*_shared_pole/streamed_bank/` of
+  `WARNING tangential output: removed streamed stores left by an earlier
+  process` line. By hand: delete `<run dir>/*_tangential/streamed_bank/` of
   runs that are not running. `lfs quota -u $USER $SCRATCH` counts the bytes
   that running processes hold.
 

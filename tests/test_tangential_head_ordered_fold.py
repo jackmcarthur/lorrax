@@ -1,6 +1,6 @@
-"""The full Gamma head on an ordered (time-reversal-broken) shared-pole store.
+"""The full Gamma head on an ordered (time-reversal-broken) tangential store.
 
-``gw.shared_pole_head`` folds ``S + Y W Z / Omega`` with the store's signed
+``gw.tangential_head`` folds ``S + Y W Z / Omega`` with the store's signed
 body and the Lehmann wings of every ordered pair.  Checked here on CPU:
 
 * wings: the face kernel equals a direct numpy Lehmann sum over all ordered
@@ -132,7 +132,7 @@ def test_ordered_wings_equal_the_direct_lehmann_sum():
 
 def _body(mesh, ordered, z, b, poles, counts):
     import distrib_la
-    from gw.shared_pole_head import _gamma_body
+    from gw.tangential_head import _gamma_body
     face = NamedSharding(mesh, P(None, "x", "y"))
     rep = NamedSharding(mesh, P())
     n = b.shape[1]

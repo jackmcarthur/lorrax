@@ -1,7 +1,7 @@
-"""Resolvent-identity pencil columns for the shared-pole construction.
+"""Resolvent-identity pencil columns for the tangential construction.
 
 The even pencil in s = z**2 (W 18, W 19) and the ordered particle-hole pencil
-(z sigma_3 - M) (W 25, W 26) of docs/theory/shared-pole-w-model.md. Every
+(z sigma_3 - M) (W 25, W 26) of docs/theory/tangential-w-model.md. Every
 [b, R, R] block is assembled on the x/y face through distrib_la.blocks; eager
 concatenation and a + a^H of face-sharded operands come out replicated.
 """
@@ -141,7 +141,7 @@ def interleave_tables(tables, p):
     order, active = tables['order'], tables['active']
     half, n_inf = order.shape[-1] // 2, (active.shape[-1] - order.shape[-1]) // 2
     if half % p or n_inf % p:
-        raise ValueError(f"GATE shared_pole_tile_order: got: finite half {half} and infinity width {n_inf}; "
+        raise ValueError(f"GATE tangential_tile_order: got: finite half {half} and infinity width {n_inf}; "
                          f"want: multiples of the mesh side {p}; why: each rank's tile holds 1/p of every block")
     out = dict(tables)
     for key in ('order', 'points'):
@@ -228,7 +228,7 @@ def infinity_pencil_column(finite, infinity, *, matmul):
     return gi, hi, gii, hii, 2 * m1qi
 
 
-def assemble_shared_pole_pencil(states, infinity, *, matmul):
+def assemble_tangential_pencil(states, infinity, *, matmul):
     """Assemble G, H and O from bounded-sample action panels.
 
     ``states`` is an ordered sequence of ``(s,Q,WQ,dWQ)`` tuples, where
@@ -281,7 +281,7 @@ def ordered_infinity_pencil_column(finite, infinity, *, matmul, matrix_sharding=
     return tuple(_matrix_layout(a, ms) for a in (g, h, gii, hii, 2 * tile_join((m0qi, m1qi), -1, ms)))
 
 
-def assemble_ordered_shared_pole_pencil(states, infinity, *, matmul, matrix_sharding=None):
+def assemble_ordered_tangential_pencil(states, infinity, *, matmul, matrix_sharding=None):
     """Assemble G=X^H s3 X, H=X^H M X and O=C X for time-reversal-broken data.
 
     ``states`` holds ``(z,Q,WQ,dW/dz Q)`` with complex z in Ry, not s=z**2,

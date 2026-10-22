@@ -4,7 +4,7 @@ WHAT.  OpenBLAS keeps its worker threads in a busy-wait after a call so the
 next call finds them hot.  LORRAX drivers interleave short LAPACK calls with
 Python work, so the spinning workers hold the cores the calling thread needs:
 one 140x140 ``cho_factor`` took 28.7 ms in situ against 0.067 ms standalone
-(``minimax.uniform_rule``, DEV/327), and the Fe V2 rank-0 shared-pole rule
+(``minimax.uniform_rule``, DEV/327), and the Fe V2 rank-0 tangential rule
 build on Frontier ran 264.7 s untuned against 131.8 s with
 ``OPENBLAS_THREAD_TIMEOUT=1`` (HOSTLAT lane, 2026-10-15, eqp bit-identical).
 The setting costs 22 % only in a back-to-back BLAS loop, which no driver is.

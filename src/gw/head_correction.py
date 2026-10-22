@@ -1437,14 +1437,14 @@ class HeadResolver:
             "_q0_certificate_fn": q0_certificate_fn,
             "_mesh": mesh,
         }
-        from gw.gw_config import coerce_head_correction, uses_full_bispinor_shared_pole
+        from gw.gw_config import coerce_head_correction, uses_full_bispinor_tangential
         self._policy = coerce_head_correction(
             getattr(head, "correction", "full"))
         # ``at`` serves the once-folded head on a screened run; the
         # four-current sector bank's head is its direct sector head, so
         # there the scalar slot (the bare exchange) reads the direct sample.
         self._folded = (bool(getattr(config, "do_screened", True))
-                        and not uses_full_bispinor_shared_pole(config))
+                        and not uses_full_bispinor_tangential(config))
         self._input_dir = input_dir
         self._wfn = wfn
         self._sym = sym
@@ -1785,9 +1785,9 @@ def refuse_split_multiplet_head_occupations(energies_ry, occupations, *, where: 
     that ladder.  A step occupation by band index on a metal is not: it gives
     f = 1 and f = 0 to two states of one multiplet whenever the index cut runs
     through it.  The resulting Sigma splits the multiplet, the next map's G
-    loses G_-k = G_k^T, and the shared-pole bank loses reciprocity (lane
+    loses G_-k = G_k^T, and the tangential bank loses reciprocity (lane
     SCMETAL 2026-09-17: Na bcc Fermi-Dirac, 1.3207 eV splits at three k, bank
-    reciprocity 1e-13 -> 1e-4 in one map, ``shared_pole_gram_valid`` refused).
+    reciprocity 1e-13 -> 1e-4 in one map, ``tangential_gram_valid`` refused).
     """
     energies = np.asarray(energies_ry, dtype=np.float64)
     occ = np.asarray(occupations, dtype=np.float64)

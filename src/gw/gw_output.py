@@ -436,7 +436,7 @@ def persist_w0_and_head(
     is.  It has two callers: the ``screening_diagrams = w_bse`` stage
     helper, whose first leg computes the RPA W(0) that the ladder kernel
     consumes and persists THAT — under every mode, MPA included — and the
-    one-shot shared-pole MPA route, whose W is the model evaluated at
+    one-shot tangential MPA route, whose W is the model evaluated at
     ω = 0 (``gw.screening.restart_static_w``).  It is a NAMED OPT-IN rather
     than a relaxation of the dynamic-mode refusal below, because the two say
     different things.  The
@@ -447,7 +447,7 @@ def persist_w0_and_head(
 
     ``W_q`` may be a zero-argument callable; it is called only after the
     write-policy and output-file preflight, so a producer whose static W is
-    an evaluation rather than a held array (the shared-pole model) runs it
+    an evaluation rather than a held array (the tangential model) runs it
     only when the file is written.
 
     W0 is stored on the q parents whenever the run's q axis reduces
@@ -503,8 +503,8 @@ def persist_w0_and_head(
         full_zone, static_head_sample = photon_charge_for_restart(photon_response, meta)
         W_q = None
         static_head_only = True
-    from .gw_config import uses_full_bispinor_shared_pole
-    if uses_full_bispinor_shared_pole(config) and iteration_head is None:
+    from .gw_config import uses_full_bispinor_tangential
+    if uses_full_bispinor_tangential(config) and iteration_head is None:
         # The four-current bank injects its direct Γ head (W_h - V_h at
         # each sample, response_bank's add_direct_gamma_field) into the q = 0
         # body, so the CC sector's Wc(0) in this W0 already carries it.  The
@@ -611,7 +611,7 @@ def persist_w0_and_head(
             fft_grid=getattr(meta, "fft_grid", None), print_fn=print_fn,
             context="W0 restart tensor")
     with _tmg.section("persist_w0.write_w0"):
-        # W is held on its q parents (screening's wedge, the shared-pole
+        # W is held on its q parents (screening's wedge, the tangential
         # evaluation at V's parents, the packed photon's parents).  On the
         # wedge arm the file stores exactly those parents with their unfold
         # tables and no full-q W0 is formed here (TASTE 97); BSE unfolds on

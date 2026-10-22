@@ -229,7 +229,7 @@ on time reversal:
   $J_{\rm ind}\sim-p_\Pi\,(i\alpha_{\rm FS}/2)(\mathbf q\times\hat{\mathbf m})\rho$,
   comparable to the spin-magnetic part of $\Sigma^B$ in a half-metal. A Hall
   medium adds $\delta\mathbf j=-i\sigma_H(\hat{\mathbf z}\times\mathbf q)\phi$,
-  also CT. These cases need `full_shared_pole`.
+  also CT. These cases need `full_tangential`.
 
 ## 6. Routes {#routes}
 
@@ -237,7 +237,7 @@ on time reversal:
 `compute_mode`; all routes use the carrier of §1. Admission:
 [wiring](../architecture/four_current_wiring.md#routes-and-predicates).
 
-| term | order | `bare_transverse` | `full_static_cohsex` | `full_shared_pole` |
+| term | order | `bare_transverse` | `full_static_cohsex` | `full_tangential` |
 |---|---:|---|---|---|
 | $\rho W_C\rho$ | $c^0$ | run's frequency model ($v$ under `x_only`) | `cohsex`: packed $W_{00}(0)$; GN/HL: scalar $W_C(\omega)$ | full frequency |
 | $\Sigma^B$, direct fields | $c^{-2}$ | yes | yes | yes |
@@ -247,13 +247,13 @@ on time reversal:
 
 `full_static_cohsex` builds sixteen no-pair $\chi_0^{IJ}(\omega=0)$ (TT
 Ward-subtracted, $\Pi(q)-\Pi(0)$) and one packed Dyson solve.
-`full_shared_pole` solves the four-current Dyson equation at each bank
+`full_tangential` solves the four-current Dyson equation at each bank
 frequency and fits CC, CT/TC and TT poles separately
-([shared-pole W for bispinor sectors](../architecture/bispinor_shared_pole_w.md)).
+([tangential W for bispinor sectors](../architecture/bispinor_tangential_w.md)).
 `bare_transverse` runs as exchange only (`x_only`), incumbent (any compute
 mode), packed bare (`sys_dim = 2` one-shot COHSEX/GN/HL, contracted as
-$\mathrm{diag}(W_C,t)$) or shared-pole hybrid (`mpa`, `sigma_w_model =
-shared_pole`); the terms are the same, and packed and incumbent agree byte
+$\mathrm{diag}(W_C,t)$) or tangential hybrid (`mpa`, `sigma_w_model =
+tangential`); the terms are the same, and packed and incumbent agree byte
 for byte with the head off (CLAIMS 581).
 
 | equation | code |
@@ -263,7 +263,7 @@ for byte with the head off (CLAIMS 581).
 | $v$, $t$ tiles | `gw.v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5` |
 | $\Pi_{00}$, $W_C$ | `gw.screening.compute_screening_model` → `gw.w_isdf.compute_chi0`, `solve_w` |
 | $\Pi_{IJ}(0)$, packed $W$ | `gw.w_isdf.compute_static_photon_response` |
-| CC/CT/TC/TT bank | `gw.response_bank.compute_photon_bank`, `gw.shared_pole_sectors.construct_sector_poles` |
+| CC/CT/TC/TT bank | `gw.response_bank.compute_photon_bank`, `gw.tangential_sectors.construct_sector_poles` |
 | $\Sigma^B$ | `gw.sigma_x_bispinor.compute_sigma_x_bispinor` |
 | packed $\Sigma$ | `gw.photon_sigma.compute_static_photon_sigma` |
 | sector $\Sigma$ | `gw.mpa.sector_sigma.compute_sector_sigma` |
@@ -345,7 +345,7 @@ $\delta=\omega-(\epsilon-E_F)$. The rank-1 insertion
 $(W_h/\Omega)\,\bar g_0\otimes g_0$ is local with $g_0$ at `P('x')` and
 `P('y')`.
 
-On a `full_shared_pole` SC run the four-current bank rebuilds the direct Γ
+On a `full_tangential` SC run the four-current bank rebuilds the direct Γ
 head every map, on the velocity `sc_head_update` names. An unnamed key
 resolves as on scalar decks: `parallel_transport` where the link artifact
 exists, else `dft_velocity`. `parallel_transport` hands the bank the map's
@@ -372,7 +372,7 @@ blocks carry no Ward contact; the packed response requires
 of `compute_V_q` is the scalar $V$, checked for $V_q=\overline{V_{-q}}$
 (blind at $q=-q$; `sanity.report_parent_covariance` discriminates).
 `compute_sigma_xc` takes $W$ by role (`static`, `probe`, `mpa_fit`,
-`shared_pole`); a new mode needs its roles in
+`tangential`); a new mode needs its roles in
 `screening.screening_requests_for`, a `gw_config.MODE_SIGMA_CHANNELS` row and
 a branch, else it refuses by name. `wfns_transverse` and
 `bispinor_v_q_path` are both-or-neither.
@@ -382,7 +382,7 @@ a branch, else it refuses by name. `wfns_transverse` and
 | material | route |
 |---|---|
 | time-reversal invariant | `bare_transverse` |
-| magnet, half-metal, Hall or Chern state | `full_shared_pole` (`mpa`, `shared_pole`; its head is the direct sector head) |
+| magnet, half-metal, Hall or Chern state | `full_tangential` (`mpa`, `tangential`; its head is the direct sector head) |
 | static slab cross-check of current screening | `full_static_cohsex` |
 | exchange-only check | `bare_transverse`, `x_only` |
 | two-component reference | `bispinor = false` |

@@ -2,7 +2,7 @@
 
 The joint projection is plan section 12.2. Both endpoint output panels
 must be retained: C[X_C,X_T] and T[X_C,X_T]. For the ordered response the
-definite member is H, not G (shared-pole report equation 5.5).
+definite member is H, not G (tangential report equation 5.5).
 These functions run inside the constructor's batched linalg stage; they
 neither move an operator to the host nor prescribe a processor mesh.
 """
@@ -10,7 +10,7 @@ neither move an operator to the host nor prescribe a processor mesh.
 from functools import lru_cache
 
 import jax.numpy as jnp
-from gw.shared_pole_pencil import (_matrix_layout, _matrix_take_columns, tile_adjoint,
+from gw.tangential_pencil import (_matrix_layout, _matrix_take_columns, tile_adjoint,
                                    tile_block, tile_join)
 from common.log import get_logger
 
@@ -39,7 +39,7 @@ def _sector_read_programs(mesh,indices,masks,execution):
     import jax
     from jax import shard_map
     from jax.sharding import PartitionSpec as P
-    from gw.shared_pole_execution import face_program
+    from gw.tangential_execution import face_program
     def select(a):
         if execution == 'face':
             from common.staged_reshard import permute_sharded_axis
@@ -91,12 +91,12 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
     import numpy as np
     from jax import shard_map
     from jax.sharding import PartitionSpec as P
-    from file_io.shared_pole_store import read_shared_pole_bank
+    from file_io.tangential_store import read_tangential_bank
 
     indices,masks=_sector_indices(bank,endpoints)
     spec=P(('x','y'))
     select,join=_sector_read_programs(io.mesh,indices,masks,execution)
-    ledger=meta.shared_pole_capacity
+    ledger=meta.tangential_capacity
     ambient=ledger.live_stages
     keep=list(retained)
     out={}
@@ -109,7 +109,7 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
             row=ledger.reserve(f'sector.read.retained.{len(ledger.entries)}',
                 resident_bytes_per_rank=size,workspace_bytes_per_rank=0,concurrent_with=ambient)
             ledger.live_stages=(*ambient,row['stage'])
-            value=read_shared_pole_bank(io,meta=meta,header=header,q_ids=ids,
+            value=read_tangential_bank(io,meta=meta,header=header,q_ids=ids,
                 sample_span=sample_span if sample else None,
                 sample_ids=sample_ids if sample else None,fields=(field,),
                 partition_spec=None if execution == "face" else spec,
@@ -137,8 +137,8 @@ def sector_line_selection(bank, meta, *, mesh_xy, execution, nq, eigh_backend, r
     on the constructor's bits. Each family also stores the CT/TC actions on
     its directions.
     """
-    from file_io.shared_pole_store import _resident_sector_select
-    from gw.shared_pole_directions import LineSelection, selection_layout
+    from file_io.tangential_store import _resident_sector_select
+    from gw.tangential_directions import LineSelection, selection_layout
     layout=bank['photon_layout']
     side=int(layout.mesh_side)
     c,t=(int(layout.carrier_extent(family))//side for family in (0,1))
@@ -154,7 +154,7 @@ def sector_line_selection(bank, meta, *, mesh_xy, execution, nq, eigh_backend, r
     for family,basis in enumerate(bank['mu_bases']):
         n=(3 if family else 1)*int(basis.n_logical)
         families.append(dict(name=('C','T')[family],index=family,
-            recipe=sector_recipe(meta.shared_pole_recipe,n),logical_n=n,
+            recipe=sector_recipe(meta.tangential_recipe,n),logical_n=n,
             rows=(3 if family else 1)*int(basis.n_packed),cross=True))
     return LineSelection(families,block,mesh_xy=mesh_xy,ordered=True,execution=execution,nq=nq,
                          eigh_backend=eigh_backend,room=room)
@@ -174,7 +174,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
     parents' models before the next round reads.
 
     Signed stability is the positive retained H of the ordered pencil; see
-    docs/architecture/bispinor_shared_pole_w.md. Scalar positive-V upper passivity
+    docs/architecture/bispinor_tangential_w.md. Scalar positive-V upper passivity
     is inapplicable. Held W and moment residuals are diagnostics; physical
     accuracy is measured independently on the integrated sector Sigma.
     """
@@ -184,22 +184,22 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
     from common import timing
     from common.collectives import (device_put_process_local, gather_to_host,
                                     rank0_transaction)
-    from file_io.shared_pole_store import (validate_shared_pole_bank, _metadata, open_shared_pole_bank,
-        read_line_panel_round,write_shared_pole_model,write_shared_pole_sector_manifest)
-    from gw.shared_pole_local import batch_to_face,canonical_factors,carrier_history,face_rows,parent_rounds
-    from gw.shared_pole_screening import _json
-    from gw.shared_pole_directions import _sample_point
-    from gw.shared_pole_execution import is_face
+    from file_io.tangential_store import (validate_tangential_bank, _metadata, open_tangential_bank,
+        read_line_panel_round,write_tangential_model,write_tangential_sector_manifest)
+    from gw.tangential_local import batch_to_face,canonical_factors,carrier_history,face_rows,parent_rounds
+    from gw.tangential_screening import _json
+    from gw.tangential_directions import _sample_point
+    from gw.tangential_execution import is_face
     from jax.sharding import NamedSharding,PartitionSpec as P
 
-    header=validate_shared_pole_bank(bank['path'],expected_identity=bank['identity'],
+    header=validate_tangential_bank(bank['path'],expected_identity=bank['identity'],
                                     mesh_xy=mesh_xy,require_complete=True)
     line_lo,line_hi=(int(v) for v in header['line_panels']['sample_span'])
     if line_hi<=line_lo:
-        raise ValueError('GATE shared_pole_line_panel: photon recipe has no fitted line sample')
-    recipe=meta.shared_pole_recipe
+        raise ValueError('GATE tangential_line_panel: photon recipe has no fitted line sample')
+    recipe=meta.tangential_recipe
     if header['identity'] != bank['identity']:
-        raise ValueError('GATE shared_pole_bank_state: current sector bank identity mismatch')
+        raise ValueError('GATE tangential_bank_state: current sector bank identity mismatch')
     sector_headers=[_metadata(meta,table,recipe,bank['identity'],True,basis=basis,sector=sector)
                for table,basis,sector in zip(bank['sector_tables'],bank['mu_bases'],('CC','TT'))]
     # Line supports off the imaginary axis arrive as their stored states and
@@ -220,7 +220,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
 
     def read_diagonal(family,ids,real,layout='face',retained=()):
         # One sector's moments, dense samples and line panels for ``ids``.
-        with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
+        with open_tangential_bank(bank['path'],mesh_xy=mesh_xy) as io:
             exact=read_sector_round(io,meta,bank,header,ids,(family,family),
                 fields=('M0','M1','M2','M3'),retained=retained,execution=layout)
             refuse_nonfinite_moment(('CC','TT')[family],exact['M1'],real,mesh_xy=mesh_xy)
@@ -230,7 +230,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
 
     def read_cross(ids,real,layout='face',retained=()):
         # CT and TC at the dense samples, the CT moments and both families' cross panels.
-        with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
+        with open_tangential_bank(bank['path'],mesh_xy=mesh_xy) as io:
             ct=read_samples(io,(0,1),retained,ids,layout)
             tc=read_samples(io,(1,0),(*retained,*ct.values()),ids,layout)
             cm=read_sector_round(io,meta,bank,header,ids,(0,1),fields=('M0','M1','M2','M3'),
@@ -242,7 +242,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
     receipts=[];stores={};placed=[]
     root=Path(output).parent
     to_face=batch_to_face(mesh_xy)
-    ledger=meta.shared_pole_capacity
+    ledger=meta.tangential_capacity
     upstream=ledger.live_stages
     execution,execution_rows,route=sector_route(
         meta,config,bank['mu_bases'],header['n_q_irr'],mesh_xy=mesh_xy,upstream=upstream,print_fn=print_fn)
@@ -269,7 +269,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
                            for name,r in (('TT',sectors[1]['staged']),('CC',sectors[0]['staged']),('CT',cross['staged'])))
             if line!=staged_line:
                 staged_line=line
-                log.debug(f"Shared-pole sector constructor: round of parents {ids[0]}..{ids[real-1]}: {line}")
+                log.debug(f"Tangential sector constructor: round of parents {ids[0]}..{ids[real-1]}: {line}")
         else:
             sectors=[];retained=[]
             for family,name in enumerate(('CC','TT')):
@@ -296,14 +296,14 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
         treatment=None
         treatment_masks=(models[0][2],models[1][2],models[2][2],models[3][2])
         if treatment_policy is not None:
-            from gw.shared_pole_gates import shared_pole_treatment_mask
-            cc_mask,cc_row=shared_pole_treatment_mask(
+            from gw.tangential_gates import tangential_treatment_mask
+            cc_mask,cc_row=tangential_treatment_mask(
                 models[0][1],models[0][2],ceiling_ry=treatment_policy['ceiling_ry'])
-            tt_mask,tt_row=shared_pole_treatment_mask(
+            tt_mask,tt_row=tangential_treatment_mask(
                 models[1][1],models[1][2],ceiling_ry=treatment_policy['ceiling_ry'])
             ct_common=(jnp.all(models[2][1]==models[3][1],axis=-1)
                        &jnp.all(models[2][2]==models[3][2],axis=-1))
-            ct_mask,ct_row=shared_pole_treatment_mask(
+            ct_mask,ct_row=tangential_treatment_mask(
                 models[2][1],models[2][2],ceiling_ry=treatment_policy['ceiling_ry'])
             treatment=dict(CC=dict(cc_row,common_census=jnp.ones_like(ct_common)),
                            TT=dict(tt_row,common_census=jnp.ones_like(ct_common)),
@@ -311,12 +311,12 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
             treatment_masks=(cc_mask,tt_mask,ct_mask,ct_mask)
             for name in treatment:
                 if not bool(jnp.all(treatment[name]['common_census'][:real])):
-                    raise ValueError(f'GATE shared_pole_sector_treatment_census: sector={name}')
+                    raise ValueError(f'GATE tangential_sector_treatment_census: sector={name}')
                 if not bool(jnp.all(treatment[name]['active_prefix'][:real])):
-                    raise ValueError(f'GATE shared_pole_sector_treatment_order: sector={name}')
+                    raise ValueError(f'GATE tangential_sector_treatment_order: sector={name}')
                 if not bool(jnp.all(treatment[name]['retained_nonempty'][:real])):
                     raise ValueError(
-                        f'GATE shared_pole_sector_treatment_empty: sector={name}')
+                        f'GATE tangential_sector_treatment_empty: sector={name}')
         signed=(tuple((s['signed'][0],s['signed'][0],*s['signed'][1:]) for s in sectors)
                 +(cross['signed'],))
         budget=cross['budget']
@@ -329,7 +329,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
         held_rows={name:[] for name in ('CC','TT','CT')}
         with timing.section('spole.sector.held', announce=True):
             for name,endpoint_pair,model in zip(held_rows,((0,0),(1,1),(0,1)),signed):
-                with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
+                with open_tangential_bank(bank['path'],mesh_xy=mesh_xy) as io:
                     for sample_id in recipe['held_ids']:
                         sample_id=int(sample_id)
                         held=read_sector_round(io,meta,bank,header,ids,endpoint_pair,
@@ -365,7 +365,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
             # One writer carrier per model (CC, TT, CT) held across rounds and
             # maps (held_writer_width); CT_C and CT_T share the CT census.
             writer_history=carrier_history(meta)
-            writer_capacity=getattr(meta,'shared_pole_rank_capacity',None)
+            writer_capacity=getattr(meta,'tangential_rank_capacity',None)
             writer_events=None if writer_capacity is None else writer_capacity.setdefault('_events',[])
             for name,family,model,active_mask in zip(
                     ('CC','TT','CT_C','CT_T'),(0,1,0,1),models,treatment_masks):
@@ -401,7 +401,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
                     for q0,q1,slots in _contiguous_q_spans(ids,real):
                         public=canonical_factors(mesh_xy,slots,components=3 if family else 1)(factor)
                         filename=root/(name+'.h5') if sector_models is None else sector_models[name]
-                        store_header=write_shared_pole_model(filename,public,
+                        store_header=write_tangential_model(filename,public,
                             device_put_process_local(poles[list(slots),:width],NamedSharding(mesh_xy,P())),
                             counts[list(slots)],q_span=(q0,q1),meta=meta,tables=bank['sector_tables'][family],
                             recipe=recipe,receipts=dict(identity=bank['identity'],constructor=row_receipt),
@@ -418,8 +418,8 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
         del sectors,cross,models,signed
     ledger.live_stages=upstream
     if sorted(placed)!=list(range(header['n_q_irr'])):
-        raise ValueError('GATE shared_pole_sector_rounds: each parent must be written once')
-    handle=write_shared_pole_sector_manifest(root/'sectors.json',models=stores,bank=bank,
+        raise ValueError('GATE tangential_sector_rounds: each parent must be written once')
+    handle=write_tangential_sector_manifest(root/'sectors.json',models=stores,bank=bank,
         identity=bank['identity'],receipts=dict(rounds=receipts,status='CONSTRUCTED',
             acceptance='signed-retained-H-v1',sigma_accuracy='NOT_MEASURED'),mesh_xy=mesh_xy)
     if sector_models is not None:
@@ -439,7 +439,7 @@ def _finite_parents_program(mesh):
 
 
 def refuse_nonfinite_moment(name, m1, real, *, mesh_xy):
-    """GATE shared_pole_sector_nonfinite: a sector's M1 spectral moment is finite on every real parent.
+    """GATE tangential_sector_nonfinite: a sector's M1 spectral moment is finite on every real parent.
 
     One reduction of the moment the round already holds, replicated, so every
     rank refuses alike.
@@ -447,7 +447,7 @@ def refuse_nonfinite_moment(name, m1, real, *, mesh_xy):
     import numpy as np
     finite = np.asarray(_finite_parents_program(mesh_xy)(m1))[:int(real)]
     if not finite.all():
-        raise ValueError(f'GATE shared_pole_sector_nonfinite: spectral moment M1 of sector {name} '
+        raise ValueError(f'GATE tangential_sector_nonfinite: spectral moment M1 of sector {name} '
                          f'is not finite on parent slots {np.flatnonzero(~finite).tolist()}')
 
 
@@ -464,8 +464,8 @@ def _sector_model_residence(meta,config,header,mu_bases,execution_rows,*,mesh_xy
     Returns ``(models or None, receipt)``; a resident R is reserved as
     ``receipt["stage"]``.
     """
-    from file_io.shared_pole_store import ResidentSectorModel,admit_resident_model
-    ledger=meta.shared_pole_capacity
+    from file_io.tangential_store import ResidentSectorModel,admit_resident_model
+    ledger=meta.tangential_capacity
     nq=int(header['n_q_irr'])
     bound=[min(row['signed_side_bound'],row['conservative_pencil_side']) for row in execution_rows]
     rows=dict(CC=(mu_bases[0].n_canonical,bound[0]),TT=(3*mu_bases[1].n_canonical,bound[1]),
@@ -505,7 +505,7 @@ def _host_sector_census(poles,mask,mesh_xy,real,*,common=None,hold=None):
     # by this width (the store's factor check, the face and canonical
     # handoffs) then repeats across maps. The file keeps K.max columns.
     width=padded_axis(ladder_extent(int(counts[:real].max()),poles.shape[-1]),
-        mesh_xy,name='shared_pole_port',
+        mesh_xy,name='tangential_port',
         specs=((P('x','y'),0),(P('x','y'),1))).carrier
     if hold is not None:
         width=held_writer_width(width,int(counts[:real].max()),*hold)
@@ -532,7 +532,7 @@ def held_writer_width(live, kmax, history, key, events):
     before=int(history.get(key,0))
     if live>before:
         if before and events is not None:
-            events.append(f"shared-pole writer carrier ({key[1]}): Kmax {kmax} exceeds the held "
+            events.append(f"tangential writer carrier ({key[1]}): Kmax {kmax} exceeds the held "
                           f"width {before}; grown to {live}")
         history[key]=live
         return live
@@ -547,7 +547,7 @@ def sector_held_errors(signed, samples, z, *, mesh_xy):
     """
     from common.collectives import device_put_process_local
     from jax.sharding import NamedSharding,PartitionSpec as P
-    from gw.shared_pole_execution import is_face,held_program
+    from gw.tangential_execution import is_face,held_program
     if is_face(signed[0]):
         return held_program(mesh_xy)(*signed,samples['Wc'],samples['dWc_ds'],jnp.asarray(z))
     value=_local_held_program(mesh_xy)(*signed,samples['Wc'],samples['dWc_ds'],jnp.asarray(z))
@@ -560,7 +560,7 @@ def _local_held_program(mesh):
     import jax
     from jax import shard_map
     from jax.sharding import PartitionSpec as P
-    from gw.shared_pole_local import _mm
+    from gw.tangential_local import _mm
     spec=P(('x','y'))
     return jax.jit(shard_map(partial(_sector_held_equations,mm=_mm),mesh=mesh,
         in_specs=(spec,)*6+(P(),),out_specs=spec,check_vma=False))
@@ -581,7 +581,7 @@ def _sector_held_equations(left,right,mu,active,w,d,z,*,mm):
 def sector_recipe(recipe, n):
     """The map recipe resized to one sector of ``n`` rows: widths, line cap and pole budget."""
     import math
-    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
+    from gw.tangential_recipe import shared_real_pole_v1_r3b
     policy=shared_real_pole_v1_r3b[recipe['accuracy']]
     result=dict(recipe,n=n)
     for field in ('imaginary_width','infinity_width','line_direction_cap','pole_budget'):
@@ -609,9 +609,9 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     import copy
     import numpy as np
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_capacity import ConstructorCapacity,round_padding_output_bytes
-    from gw.shared_pole_directions import port_extent
-    from gw.shared_pole_local import reduce_round,recipe_panel_widths,recipe_infinity_width,pad_states
+    from gw.tangential_capacity import ConstructorCapacity,round_padding_output_bytes
+    from gw.tangential_directions import port_extent
+    from gw.tangential_local import reduce_round,recipe_panel_widths,recipe_infinity_width,pad_states
     components=int(geometry['components'])
     basis=geometry['basis']
     n=components*basis.n_logical
@@ -619,10 +619,10 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     local_meta.mu_basis=basis
     local_meta.n_rmu=n
     local_meta.n_rmu_padded=components*basis.n_packed
-    recipe=sector_recipe(meta.shared_pole_recipe,n)
+    recipe=sector_recipe(meta.tangential_recipe,n)
     budget=ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
-                               mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,
-                               upstream=meta.shared_pole_capacity.live_stages,
+                               mesh_xy=mesh_xy,ledger=meta.tangential_capacity,
+                               upstream=meta.tangential_capacity.live_stages,
                                execution='local')
     budget.batch_width=len(geometry['ids'])
     budget.retained_panels=tuple(retained)
@@ -669,7 +669,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
 
 
 def _SECTOR_GRAM_KEEP():
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
+    from gw.tangential_recipe import shared_real_pole_gates_ordered_v1
     return shared_real_pole_gates_ordered_v1['normalized_gram_keep']['sector_threshold']
 
 
@@ -685,16 +685,16 @@ def _sector_tables(meta, geometry, n, counts, widths, states, values, infinity_w
     """A round's column tables at the recipe carriers; the pencil extent is grow-only over this
     sector's rounds and SC maps (``round_tables``: discovered in map 0, held from map 1), and an
     SC map past 0 that still grows it says so in its log."""
-    from gw.shared_pole_local import round_tables,carrier_history
+    from gw.tangential_local import round_tables,carrier_history
     history=carrier_history(meta)
     name=(('sector',geometry['sector'],n),'extent',2)
     before=int(history.get(name,(0,))[0])
     tables=round_tables(counts,widths,[s[0] for s in states],[v.shape[-1] for v in values],
         infinity_width,column_extent=extent,ordered=True,odd_moments=True,key=name[0],history=history)
-    capacity=getattr(meta,'shared_pole_rank_capacity',None)
+    capacity=getattr(meta,'tangential_rank_capacity',None)
     if before and capacity is not None and int(history[name][0])>before:
         capacity.setdefault('_events',[]).append(
-            f"shared-pole {geometry['sector']} round: a state's selection exceeds its held carrier; "
+            f"tangential {geometry['sector']} round: a state's selection exceeds its held carrier; "
             f"pencil extent {before} -> {int(history[name][0])}")
     return tables
 
@@ -706,14 +706,14 @@ def _sector_gates(diagnostics, sector, ids, real):
     reduction,zero,_,_=jax.tree.map(np.asarray,diagnostics)
     for name in ('orientation_paired','gram_diagonal_positive','gram_valid','retained_metric_positive'):
         if not np.all(reduction[name][:real]):
-            raise ValueError(f"GATE shared_pole_sector_{name}: sector={sector}, "
+            raise ValueError(f"GATE tangential_sector_{name}: sector={sector}, "
                              f"parents={list(ids)[:real]}, "
                              f"passed={reduction[name][:real].tolist()}, "
                              f"Gram min/max={reduction['gram_min_relative'][:real].tolist()}, "
                              f"paired Schur S min/max={reduction['paired_min_relative'][:real].tolist()}; no repair")
     if not np.all(zero['zero_policy'][:real]):
         bad=np.flatnonzero(~np.asarray(zero['zero_policy'][:real]))
-        raise ValueError(f"GATE shared_pole_sector_zero_ritz: sector={sector}, parents={[list(ids)[i] for i in bad]}, "
+        raise ValueError(f"GATE tangential_sector_zero_ritz: sector={sector}, parents={[list(ids)[i] for i in bad]}, "
                          f"dropped weight fraction={zero['dropped_factor_weight_fraction'][bad].tolist()}, "
                          f"dropped={zero['dropped_count'][bad].tolist()}, retained={zero['retained_rank'][bad].tolist()}, "
                          f"factor weight={zero['factor_weight'][bad].tolist()}, "
@@ -725,9 +725,9 @@ def _sector_selection(samples, moments, line, recipe, geometry, n, eig, *, mesh_
     of one batch of parents (face stacks or batch layout), the eighs on ``eig``. Returns
     (states, counts, roles, infinity, values); the caller forms the tables and pads the panels."""
     import numpy as np
-    from gw.shared_pole_directions import (_round_kernels,line_panel_states,port_extent,
+    from gw.tangential_directions import (_round_kernels,line_panel_states,port_extent,
                                            select_round_states,infinity_directions)
-    from gw.shared_pole_execution import is_face
+    from gw.tangential_execution import is_face
     face=is_face(samples['Wc'])
     extent=port_extent(mesh_xy)
     kernels=_round_kernels(mesh_xy,'face' if face else 'batch')
@@ -760,10 +760,10 @@ def staged_sector(read, ids, real, meta, config, geometry, *, mesh_xy, route):
     from common import timing
     from contextlib import contextmanager
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_capacity import ConstructorCapacity,staged_sector_bytes,_shard_bytes,_local_eigenplan
-    from gw.shared_pole_directions import port_extent
-    from gw.shared_pole_local import recipe_panel_widths,recipe_infinity_width,pad_states
-    from gw.shared_pole_execution import (face_reduce_decoupled,face_ritz_carrier,face_reduction_bytes,
+    from gw.tangential_capacity import ConstructorCapacity,staged_sector_bytes,_shard_bytes,_local_eigenplan
+    from gw.tangential_directions import port_extent
+    from gw.tangential_local import recipe_panel_widths,recipe_infinity_width,pad_states
+    from gw.tangential_execution import (face_reduce_decoupled,face_ritz_carrier,face_reduction_bytes,
                                           staged_eigh,stage_width)
     components=int(geometry['components'])
     basis=geometry['basis']
@@ -773,8 +773,8 @@ def staged_sector(read, ids, real, meta, config, geometry, *, mesh_xy, route):
     local_meta.mu_basis=basis
     local_meta.n_rmu=n
     local_meta.n_rmu_padded=components*basis.n_packed
-    recipe=sector_recipe(meta.shared_pole_recipe,n)
-    ledger=meta.shared_pole_capacity
+    recipe=sector_recipe(meta.tangential_recipe,n)
+    ledger=meta.tangential_capacity
     ambient=ledger.live_stages
     budget=ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
                                mesh_xy=mesh_xy,ledger=ledger,upstream=ambient,execution='face')
@@ -868,7 +868,7 @@ def slice_sector(sector, slots, mesh_xy):
     and table; shared records (roles, recipe, budget) pass through."""
     import jax
     import numpy as np
-    from gw.shared_pole_execution import parent_rows
+    from gw.tangential_execution import parent_rows
     index=np.asarray(slots,np.int64)
     def rows(a):
         if isinstance(a,(int,float,bool,str,dict)) or a is None:
@@ -910,12 +910,12 @@ def staged_cross(sectors, read, ids, real, meta, *, mesh_xy, sample_ids, cross_e
     from contextlib import contextmanager
     from common.collectives import device_put_process_local
     from jax.sharding import NamedSharding,PartitionSpec as P
-    from gw.shared_pole_capacity import staged_cross_bytes,_shard_bytes
-    from gw.shared_pole_execution import (_assemble,face_cross_bytes,face_cross_decoupled,parent_rows,
+    from gw.tangential_capacity import staged_cross_bytes,_shard_bytes
+    from gw.tangential_execution import (_assemble,face_cross_bytes,face_cross_decoupled,parent_rows,
                                           staged_eigh,stage_width)
-    from gw.shared_pole_local import parent_rounds
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    ledger=meta.shared_pole_capacity
+    from gw.tangential_local import parent_rounds
+    from gw.tangential_recipe import shared_real_pole_gates_ordered_v1 as gates
+    ledger=meta.tangential_capacity
     upstream=ledger.live_stages
     live,held=(_cross_carriers(w,mesh_xy,'face') for w in cross_span_widths(meta,sectors))
     widths=[max(a,b) for a,b in zip(live,held)]
@@ -969,12 +969,12 @@ def staged_cross(sectors, read, ids, real, meta, *, mesh_xy, sample_ids, cross_e
     for name in ('gram_valid','retained_metric_positive'):
         if not bool(jnp.all(diagnostics[name][:int(real)])):
             bad=np.flatnonzero(~np.asarray(diagnostics[name][:int(real)])).tolist()
-            raise ValueError(f'GATE shared_pole_sector_{name}: sector=CT, parents={[ids[i] for i in bad]}; '
+            raise ValueError(f'GATE tangential_sector_{name}: sector=CT, parents={[ids[i] for i in bad]}; '
                 f"Gram min/max={float(jnp.min(diagnostics['gram_min_relative'][:int(real)])):.9e}; "
                 f"threshold={gates['normalized_gram_validity']['threshold']}; no repair")
     models,zero=positive_cross_models(signed,mesh_xy=mesh_xy)
     if not bool(jnp.all(zero['zero_policy'][:int(real)])):
-        raise ValueError('GATE shared_pole_sector_zero_ritz: sector=CT')
+        raise ValueError('GATE tangential_sector_zero_ritz: sector=CT')
     replicated=NamedSharding(mesh_xy,P())
     staged=dict(parents=width,side=side,stage=int(stage),stacks_bytes_per_rank=int(stacks),
                 eigh_routes=['c' if p.batched_route==distrib_la.ROUTE_BATCH_RESHARD else 'mesh' for p in plans])
@@ -989,7 +989,7 @@ def _cross_carriers(widths, mesh_xy, execution):
         return list(widths)
     from jax.sharding import PartitionSpec as P
     from runtime.padding import padded_axis
-    return [padded_axis(width,mesh_xy,name='shared_pole_port',
+    return [padded_axis(width,mesh_xy,name='tangential_port',
         specs=((P('x','y'),0),(P('x','y'),1))).carrier for width in widths]
 
 
@@ -1005,7 +1005,7 @@ def _cross_actions(sectors, samples, *, mesh_xy, sample_ids, line_cross):
 
 def _cross_pencil(sectors, samples, moments, *, mesh_xy, sample_ids, line_cross, widths):
     """One face sub-batch's CT joint pencil (metric, value, O_C, O_T) at the round's spans."""
-    from gw.shared_pole_execution import cross_pencil_program
+    from gw.tangential_execution import cross_pencil_program
     actions=_cross_actions(sectors,samples,mesh_xy=mesh_xy,sample_ids=sample_ids,line_cross=line_cross)
     packed,cross=_pack_cross_spans(sectors,widths,actions,mesh_xy=mesh_xy,execution='face')
     return cross_pencil_program(mesh_xy)(*packed,cross,tuple(moments[f'M{i}'] for i in range(4)))
@@ -1028,8 +1028,8 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     from common.collectives import device_put_process_local
     from jax.sharding import NamedSharding,PartitionSpec as P
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_capacity import ConstructorCapacity
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    from gw.tangential_capacity import ConstructorCapacity
+    from gw.tangential_recipe import shared_real_pole_gates_ordered_v1 as gates
     charge, transverse = sectors
     ct, tc = samples
     retained = jax.tree.leaves(tuple((s['model'],s['signed'],s['coefficients'],
@@ -1037,8 +1037,8 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     local_meta = copy.copy(meta)
     local_meta.n_rmu_padded = sum(s['model'][0].shape[-2] for s in sectors)
     budget = ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
-        mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,
-        upstream=meta.shared_pole_capacity.live_stages,execution='local')
+        mesh_xy=mesh_xy,ledger=meta.tangential_capacity,
+        upstream=meta.tangential_capacity.live_stages,execution='local')
     budget.batch_width = charge['model'][0].shape[0]
     # Cross assembly has rectangular original pencils; only the projected
     # retained pair is square. Keep those two extents distinct in the ledger.
@@ -1062,7 +1062,7 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
         from types import SimpleNamespace
         from distrib_la import native_eigh_jacobi
         import warnings
-        warnings.warn("shared-pole CT round: local eigh returned non-finite eigenpairs; re-solved the round by Jacobi",
+        warnings.warn("tangential CT round: local eigh returned non-finite eigenpairs; re-solved the round by Jacobi",
                       RuntimeWarning, stacklevel=1)
         del signed,diagnostics
         signed,diagnostics=reduce_cross_round(*packed,cross,
@@ -1075,7 +1075,7 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
             from jax.experimental.multihost_utils import process_allgather
             import numpy as np
             _gathered = lambda a: np.asarray(process_allgather(a, tiled=True))
-            raise ValueError(f'GATE shared_pole_sector_{name}: sector=CT; '
+            raise ValueError(f'GATE tangential_sector_{name}: sector=CT; '
                 f"Gram min/max={float(jnp.min(diagnostics['gram_min_relative'][:real])):.9e}; "
                 f"threshold={gates['normalized_gram_validity']['threshold']}; "
                 f"per parent: passed={_gathered(diagnostics[name])[:real].tolist()}, "
@@ -1086,7 +1086,7 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
                 + "; no repair")
     models,zero=positive_cross_models(signed,mesh_xy=mesh_xy)
     if not bool(jnp.all(zero['zero_policy'][:real])):
-        raise ValueError('GATE shared_pole_sector_zero_ritz: sector=CT')
+        raise ValueError('GATE tangential_sector_zero_ritz: sector=CT')
     budget.retained_panels=tuple(retained)
     replicated=NamedSharding(mesh_xy,P())
     return dict(models=models,signed=signed,
@@ -1102,7 +1102,7 @@ def cross_span_widths(meta, sectors):
     Ranks drift across a ladder step between rounds and SC maps (Fe 4^3
     bispinor CC 1152 <-> 1280, TT 1408 <-> 1536), and each step recompiled
     the cross reduction (2 x 11.2 s at map 2). Every SC map binds
-    ``meta.shared_pole_rank_capacity`` (a dict the quadrature session keeps):
+    ``meta.tangential_rank_capacity`` (a dict the quadrature session keeps):
     ``held`` is then the largest live width of any earlier round or map, grown
     only when a live width exceeds it, with the growth noted in
     ``held["_events"]`` for the SC log; it never shrinks. The extra columns
@@ -1112,7 +1112,7 @@ def cross_span_widths(meta, sectors):
     """
     from runtime.padding import ladder_extent
     live=[];held=[]
-    capacity=getattr(meta,'shared_pole_rank_capacity',None)
+    capacity=getattr(meta,'tangential_rank_capacity',None)
     for name,sector in zip(('CC','TT'),sectors):
         active=sector['signed'][2]
         cap=int(sector['coefficients'].shape[-1])
@@ -1126,7 +1126,7 @@ def cross_span_widths(meta, sectors):
         if width>before:
             if before:
                 capacity.setdefault('_events',[]).append(
-                    f"shared-pole CT span ({name}): retained rank {rank} exceeds the "
+                    f"tangential CT span ({name}): retained rank {rank} exceeds the "
                     f"held width {before}; grown to {width}")
             capacity[name]=width
         held.append(min(cap,int(capacity[name])))
@@ -1138,22 +1138,22 @@ def _pack_cross_spans(sectors, widths, actions, *, mesh_xy, execution):
 
     Returns ``(packed, cross)``: per sector ``(points, Q, WQ, infinity, Y, signed)`` with
     Q and WQ packed at the sector's round extent, and ``cross`` the packed TC-on-C output
-    and CT-on-T (output, derivative) columns (``shared_pole_local.pack_panels``), so the
+    and CT-on-T (output, derivative) columns (``tangential_local.pack_panels``), so the
     CT pencil program's shape never follows the panel count. On the face the columns are
     in the face's tile-interleaved order (``interleave_tables``), as the face span Y's
     rows are (``face_reduce_decoupled``).
     """
     import jax
     from jax.sharding import NamedSharding,PartitionSpec as P
-    from gw.shared_pole_local import _batch_put,pack_panels
-    from gw.shared_pole_pencil import interleave_tables
+    from gw.tangential_local import _batch_put,pack_panels
+    from gw.tangential_pencil import interleave_tables
     face=execution=='face'
     packed,cross=[],[]
     for sector,width,(outputs,fields) in zip(sectors,widths,((actions[0],1),(actions[1],2))):
         # Drop only exactly inactive carrier columns. This is a storage
         # compaction of the retained span, not a second physical rank cut.
         if face:
-            from gw.shared_pole_execution import compact_program
+            from gw.tangential_execution import compact_program
             compact=compact_program(mesh_xy,width)
         else:
             compact=_local_compact_program(mesh_xy,width)
@@ -1200,7 +1200,7 @@ def positive_cross_models(signed, *, mesh_xy):
     on each physical endpoint; a large charge norm cannot hide a lost current
     factor. The signed model remains available for held-frequency checks.
     """
-    from gw.shared_pole_execution import is_face,positive_cross_program
+    from gw.tangential_execution import is_face,positive_cross_program
     if is_face(signed[0]):
         return positive_cross_program(mesh_xy)(*signed)
     return _local_positive_cross_program(mesh_xy)(*signed)
@@ -1212,14 +1212,14 @@ def _local_positive_cross_program(mesh):
     import jax
     from jax import shard_map
     from jax.sharding import PartitionSpec as P
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    from gw.tangential_recipe import shared_real_pole_gates_ordered_v1 as gates
     spec=P(('x','y'))
     return jax.jit(shard_map(partial(_positive_cross_equations,gates=gates),mesh=mesh,
         in_specs=(spec,)*4,out_specs=(spec,spec),check_vma=False))
 
 
 def _positive_cross_equations(left,right,mu,active,*,gates,matrix_sharding=None):
-    from gw.shared_pole_gates import apply_shared_pole_zero_policy,sort_shared_pole_columns
+    from gw.tangential_gates import apply_tangential_zero_policy,sort_tangential_columns
     cut=gates['normalized_gram_keep']['threshold']*jnp.max(jnp.abs(jnp.where(active,mu,0)),axis=-1)
     retained=active & (jnp.abs(mu)>cut[:,None])
     positive=retained & (mu>0)
@@ -1231,7 +1231,7 @@ def _positive_cross_equations(left,right,mu,active,*,gates,matrix_sharding=None)
         lost=jnp.sum(jnp.where(active & ~retained,weight,0),axis=-1)
         infinite=lost/jnp.where(total>0,total,1)
         b=c*(jnp.sqrt(2.)/safe*positive)[:,None,:]
-        model,zero=apply_shared_pole_zero_policy((b,jnp.where(positive,1/safe**2,1),positive),gates=gates)
+        model,zero=apply_tangential_zero_policy((b,jnp.where(positive,1/safe**2,1),positive),gates=gates)
         zero['infinite_weight_fraction']=infinite
         zero['zero_policy'] &= infinite<=gates['zero_ritz_policy']['threshold']['max_dropped_weight_fraction']
         models.append(model);checks.append(zero)
@@ -1239,7 +1239,7 @@ def _positive_cross_equations(left,right,mu,active,*,gates,matrix_sharding=None)
     # weight. Admit only if BOTH endpoint loss budgets pass, then use one
     # permutation for the two files, including degenerate poles.
     same=jnp.all(models[0][2]==models[1][2],axis=-1)
-    charge,order=sort_shared_pole_columns(models[0],matrix_sharding=matrix_sharding)
+    charge,order=sort_tangential_columns(models[0],matrix_sharding=matrix_sharding)
     current=(_matrix_take_columns(models[1][0],order,matrix_sharding),charge[1],charge[2])
     return (charge,current),dict(zero_policy=same & checks[0]['zero_policy'] & checks[1]['zero_policy'],
                               charge=checks[0],current=checks[1])
@@ -1282,9 +1282,9 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_ids, mesh_xy, 
     Outputs follow the paired state order and the derivative is d/dz, report
     equation 5.3.
     """
-    from gw.shared_pole_directions import _round_kernels, _sample_point
-    from gw.shared_pole_execution import is_face,cross_action_program
-    from gw.shared_pole_local import _pad_columns
+    from gw.tangential_directions import _round_kernels, _sample_point
+    from gw.tangential_execution import is_face,cross_action_program
+    from gw.tangential_local import _pad_columns
     face=is_face(samples[0])
     k=_round_kernels(mesh_xy,'face' if face else 'batch')
     index={int(sid):i for i,sid in enumerate(sample_ids)}
@@ -1308,7 +1308,7 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_ids, mesh_xy, 
             continue
         imaginary=_sample_point(recipe,sid).real==0
         if not imaginary:
-            raise ValueError(f'GATE shared_pole_line_panel: line sample {sid} has no stored cross panel')
+            raise ValueError(f'GATE tangential_line_panel: line sample {sid} has no stored cross panel')
         node=jnp.asarray(state[0])
         sample=jnp.asarray(index[sid],jnp.int32)
         if face:
@@ -1323,7 +1323,7 @@ def _local_cross_action_program(mesh,mirror,imaginary,conjugate):
     import jax
     from jax import shard_map
     from jax.sharding import PartitionSpec as P
-    from gw.shared_pole_local import _mm
+    from gw.tangential_local import _mm
     def apply(panels,q,node,sample):
         return _cross_products(panels,q,node,sample,mirror=mirror,
             imaginary=imaginary,conjugate=conjugate,mm=_mm)
@@ -1354,8 +1354,8 @@ def _local_cross_parent_program(mesh,native_eigh):
     import jax
     from jax import shard_map
     from jax.sharding import PartitionSpec as P
-    from gw.shared_pole_local import _mm
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    from gw.tangential_local import _mm
+    from gw.tangential_recipe import shared_real_pole_gates_ordered_v1 as gates
     spec=P(('x','y'))
     body=partial(_cross_reduce_equations,mm=_mm,eigh=native_eigh,gates=gates)
     return jax.jit(shard_map(body,mesh=mesh,in_specs=(spec,)*4,
@@ -1374,7 +1374,7 @@ def _cross_pencil_equations(charge,transverse,cross,moments,*,mm,matrix_sharding
     Each sector is ``(points, Q, WQ, infinity, Y, signed)`` with Q and WQ at its round
     extent, and ``cross`` the TC-on-C output and the CT-on-T output and derivative at the
     same columns (``_pack_cross_spans``). Every block joins in the tile-interleaved order of
-    ``matrix_sharding`` (``shared_pole_pencil.tile_join``), the sectors' own pencil order."""
+    ``matrix_sharding`` (``tangential_pencil.tile_join``), the sectors' own pencil order."""
     (tc,),(ct,dct)=cross
     g,h,otc,oct=ordered_cross_pencil((charge[0],charge[1],charge[3][0]),(transverse[0],transverse[1],transverse[3][0]),
                                      (tc,ct,dct),moments,matmul=mm,matrix_sharding=matrix_sharding)
@@ -1404,7 +1404,7 @@ def ordered_cross_pencil(charge, transverse, cross_actions, cross_moments, *, ma
     tile-interleaved order of ``matrix_sharding``, the sectors' own pencil
     order. No adjoint symmetry is imposed on a cross tile.
     """
-    from gw.shared_pole_pencil import _finite_column_g
+    from gw.tangential_pencil import _finite_column_g
 
     join = lambda arrays, axis: tile_join(arrays, axis, matrix_sharding)
     zc, qc, ic = charge
@@ -1504,13 +1504,13 @@ def reduce_sector_pencil(pencil, *, eigh, matmul, gates, matrix_sharding=None):
 
 # The joint CT reduction's two GEMM stages around its two eighs (``reduce_sector_pencil``
 # composes them in one program; the staged CT runs each stage over a batch of parents
-# and each eigh over the round's stack, ``shared_pole_execution.face_cross_decoupled``).
+# and each eigh over the round's stack, ``tangential_execution.face_cross_decoupled``).
 
 def joint_keep_stage(pencil, gamma, u, *, matmul, gates, matrix_sharding=None):
     """The metric's keep cut and its corrected basis Y; ``reduced`` (Y^H V Y, the null block at
     the sentinel) goes to the second eigh."""
     from distrib_la import hermitian_part
-    from gw.shared_pole_reduction import _metric_inverse_root
+    from gw.tangential_reduction import _metric_inverse_root
 
     metric, value, oc, ot = pencil
     top = gamma[:, -1]
@@ -1533,7 +1533,7 @@ def joint_keep_stage(pencil, gamma, u, *, matmul, gates, matrix_sharding=None):
     reduced = _matrix_layout(hermitian_part(matmul(y, matmul(value, y), transa="C")), matrix_sharding)
     # Distinct inert sentinels in [s, 2s), s = -(||reduced||_F + 1): a common value is an exactly
     # degenerate cluster, the input on which rocSOLVER zheevd returns NaN vectors with info 0
-    # (shared_pole_reduction.reduce_shared_pole_pencil, the same Ritz construction).
+    # (tangential_reduction.reduce_tangential_pencil, the same Ritz construction).
     sentinel = -(jnp.linalg.norm(reduced, axis=(-2, -1)) + 1)
     side = reduced.shape[-1]
     spread = 1 + jnp.arange(side, dtype=sentinel.dtype) / side
@@ -1566,8 +1566,8 @@ def staged_round(read_diagonal, read_cross, ids, real, meta, config, geometry, *
     from functools import partial
     from common import timing
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_capacity import ConstructorCapacity,_shard_bytes
-    ledger=meta.shared_pole_capacity
+    from gw.tangential_capacity import ConstructorCapacity,_shard_bytes
+    ledger=meta.tangential_capacity
     upstream=ledger.live_stages
     row_bytes=lambda tree:sum(_shard_bytes(a) for a in {id(a):a for a in jax.tree.leaves(tree)
                                                          if hasattr(a,'sharding')}.values())
@@ -1606,7 +1606,7 @@ def staged_round(read_diagonal, read_cross, ids, real, meta, config, geometry, *
 
 def sector_route(meta, config, mu_bases, nq, *, mesh_xy, upstream, print_fn=print):
     """The map's sector route from the recipe shapes, decided once and recorded on one line
-    (``lxkit.memory.record_route``, site ``shared-pole sector constructor``).
+    (``lxkit.memory.record_route``, site ``tangential sector constructor``).
 
     q-local, rounds of P parents with one whole parent per rank, when every sector's local
     round fits (``sector_execution``); otherwise rounds of R = min(nq, P) parents (balanced)
@@ -1620,8 +1620,8 @@ def sector_route(meta, config, mu_bases, nq, *, mesh_xy, upstream, print_fn=prin
     """
     import jax
     from types import SimpleNamespace
-    from gw.shared_pole_capacity import shared_pole_byte_terms
-    from gw.shared_pole_execution import line_panel_count
+    from gw.tangential_capacity import tangential_byte_terms
+    from gw.tangential_execution import line_panel_count
     execution,rows=sector_execution(meta,config,mu_bases,nq,mesh_xy=mesh_xy,upstream=upstream)
     nq,ranks=int(nq),int(mesh_xy.size)
     rounds=-(-nq//min(nq,ranks))
@@ -1631,12 +1631,12 @@ def sector_route(meta, config, mu_bases, nq, *, mesh_xy, upstream, print_fn=prin
     budget=rows[0]['local_selection']['device_budget_bytes_per_rank']
     local=", ".join(f"{name} {need(row)/1e9:.1f}" for name,row in (('CC',rows[0]),('TT',rows[1]),('CT',joint)))
     if execution=='face':
-        recipe=meta.shared_pole_recipe
+        recipe=meta.tangential_recipe
         lines=line_panel_count(recipe)
         dense=len(recipe['fit_ids'])-lines
         tiles={}
         for row in rows:
-            unit=shared_pole_byte_terms(SimpleNamespace(n_rmu_padded=int(row['packed_extent'])),mesh_xy=mesh_xy,
+            unit=tangential_byte_terms(SimpleNamespace(n_rmu_padded=int(row['packed_extent'])),mesh_xy=mesh_xy,
                 resolution=SimpleNamespace(layout='distributed'),pencil_side=0,parent_batch=1,
                 sample_batch=max(1,dense),phase='selection',selection_faces=int(row['selection_faces']))['resident_bytes_per_rank']
             tiles[row['sector']]=dict(unit=int(unit),dense=dense)
@@ -1648,7 +1648,7 @@ def sector_route(meta, config, mu_bases, nq, *, mesh_xy, upstream, print_fn=prin
     else:
         text=f"q-local, {-(-nq//width)} round(s) of {width} parents (local GB/rank {local} of {budget/1e9:.1f})"
     from lxkit import memory
-    memory.record_route("shared-pole sector constructor", execution, text,
+    memory.record_route("tangential sector constructor", execution, text,
                         warning="; ".join(w for w in (row.get('warning') for row in (*rows, joint)) if w) or None)
     return execution,rows,dict(width=width,rounds=-(-nq//width))
 
@@ -1662,11 +1662,11 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
     """
     import copy
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_directions import port_extent
-    from gw.shared_pole_execution import constructor_execution, line_panel_count, selection_face_count
-    recipe=meta.shared_pole_recipe
-    ledger=meta.shared_pole_capacity
-    from gw.shared_pole_capacity import held_sector_bytes, retained_span_columns
+    from gw.tangential_directions import port_extent
+    from gw.tangential_execution import constructor_execution, line_panel_count, selection_face_count
+    recipe=meta.tangential_recipe
+    ledger=meta.tangential_capacity
+    from gw.tangential_capacity import held_sector_bytes, retained_span_columns
     extent=port_extent(mesh_xy)
     execution_rows=[]
     rows=[(1 if family==0 else 3)*basis.n_packed for family,basis in enumerate(mu_bases)]

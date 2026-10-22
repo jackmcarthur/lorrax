@@ -274,7 +274,7 @@ void retire_read_buf(PhdfCtx* ctx);
 // within the per-file bound (32 MiB) or when it fits the process-wide
 // retained budget (``LORRAX_PHDF5_READ_STAGING_RETAIN_MB``, default 256);
 // otherwise retire it.  A buffer above the per-file bound used to be
-// retired after every read and re-pinned by the next: the Fe V2 shared-pole
+// retired after every read and re-pinned by the next: the Fe V2 tangential
 // constructor paid 16 x ~50 MB re-pins per run, 0.25 s of handler time on
 // the dispatch thread (lane slabmr diagnostic run d7a, before this change).
 void settle_read_buf(PhdfCtx* ctx);

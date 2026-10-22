@@ -1,14 +1,14 @@
-"""Device-byte accounting for one shared-pole construction (I 1).
+"""Device-byte accounting for one tangential construction (I 1).
 
 The constructor's physics is the Hermite/Ritz chain in
-``gw.shared_pole_constructor``. Everything that prices it -- the carrier byte
+``gw.tangential_constructor``. Everything that prices it -- the carrier byte
 model, the native eigh workspace queries, the map ledger reservations and
 the panels that stay live across a stage -- is here, so the driver reads as the
 equations and this file reads as the budget.
 
 One :class:`ConstructorCapacity` belongs to one construction. It owns no array:
 ``retained_panels`` is a view of arrays the driver keeps alive, and the ledger
-(``gw.shared_pole_recipe.CapacityLedger``) owns admission and refusal.
+(``gw.tangential_recipe.CapacityLedger``) owns admission and refusal.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ def retained_span_columns(side, kept):
     """Columns of a rank-local paired round's coefficient map Y (``retain_span``).
 
     The ordered reduction returns Y [R, 2c] on its solve's own columns
-    (``reduce_ordered_shared_pole_pencil``); ``kept`` = 2 min(R/2, budget)
+    (``reduce_ordered_tangential_pencil``); ``kept`` = 2 min(R/2, budget)
     bounds 2c (the Ritz carrier is at most the budget). The CT round's
     compacted width of a sector is at most these columns.
     """
@@ -41,7 +41,7 @@ def held_sector_bytes(n, side, kept):
     return 16 * (5 * n * side + side * retained_span_columns(side, kept))
 
 
-def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
+def tangential_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
                            parent_batch, sample_batch, phase="reduction",
                            selection_faces=None, cross_original_sides=None,
                            padding_output_bytes_per_rank=0, ritz_budget=None,
@@ -67,10 +67,10 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     packed = int(meta.n_rmu_padded)
     b, a, r = int(parent_batch), int(sample_batch), int(pencil_side)
     if min(packed, b, a) <= 0 or r < 0:
-        raise ValueError("GATE shared_pole_capacity: got: invalid extents; want: positive basis/batches and nonnegative pencil; why: live-set pricing")
+        raise ValueError("GATE tangential_capacity: got: invalid extents; want: positive basis/batches and nonnegative pencil; why: live-set pricing")
     padding_output_bytes_per_rank = int(padding_output_bytes_per_rank)
     if padding_output_bytes_per_rank < 0 or (phase != "reduction" and padding_output_bytes_per_rank):
-        raise ValueError("GATE shared_pole_capacity: round padding outputs require reduction and nonnegative bytes")
+        raise ValueError("GATE tangential_capacity: round padding outputs require reduction and nonnegative bytes")
     dense_copies = math.ceil(b / p) if resolution.layout == "local" else b / p
     if phase == "selection":
         dense = 24 * packed**2
@@ -82,7 +82,7 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
                         else int(selection_faces))
         if sample_faces < 2*a:
             raise ValueError(
-                'GATE shared_pole_capacity: selection_faces underprices '
+                'GATE tangential_capacity: selection_faces underprices '
                 f'the {2*a} base sample faces; got {sample_faces}')
     elif phase == "cross_reduction":
         if selection_faces is not None or cross_original_sides is None or len(cross_original_sides) != 2:
@@ -140,7 +140,7 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
         dense = 8 * packed**2 + 4 * packed * r
         sample_faces = max(2*a, 2)
     else:
-        raise ValueError(f"unknown shared-pole capacity phase: {phase}")
+        raise ValueError(f"unknown tangential capacity phase: {phase}")
     action_side = sum(map(int, cross_original_sides)) if phase == 'cross_reduction' else r
     terms = {
         "sample_or_moment_batch": math.ceil(16*b*sample_faces*packed**2/p),
@@ -165,7 +165,7 @@ def constructor_eigenplan(mesh_xy, side, execution, *, room, backend):
     is in no cache key, for the deck's eigh request ``backend``,
     ``LinalgResolution.eigh_backend``). Pricing uses :func:`constructor_price_plan`."""
     if execution == "face":
-        from gw.shared_pole_execution import face_eigh
+        from gw.tangential_execution import face_eigh
         return face_eigh(mesh_xy, int(side), room=room, backend=backend)
     return _local_eigenplan(mesh_xy, int(side))
 
@@ -175,7 +175,7 @@ def constructor_price_plan(mesh_xy, side, execution, *, backend):
     kernel, or the whole-mesh plan with no room (``face_eigh_price``), which never
     decides or runs a stack."""
     if execution == "face":
-        from gw.shared_pole_execution import face_eigh_price
+        from gw.tangential_execution import face_eigh_price
         return face_eigh_price(mesh_xy, int(side), backend=backend)
     return _local_eigenplan(mesh_xy, int(side))
 
@@ -254,7 +254,7 @@ def check_eigh_room(model_row, price):
     program's proposed size, ``face_check_bytes``), with the row's own reservation of that
     same n x n eigh handed back (the model phase prices it; run30k: 8 GiB without the
     hand-back, 15 with it).  The model row is booked to ``spole.passivity_held``; the check
-    program is booked there compiled (``shared_pole_local.book_check_eighs``)."""
+    program is booked there compiled (``tangential_local.book_check_eighs``)."""
     from lxkit import memory
     held = model_row['aggregate_bytes_per_rank'] - model_row['native_workspace'].get('eigh', 0)
     aggregate = held + price
@@ -266,7 +266,7 @@ def check_eigh_room(model_row, price):
         xla=memory.Term(spread=float(held) * ranks, source="model ledger row"),
         ranks=ranks, label="spole.passivity_held"), stage="spole.passivity_held")
     return face_eigh_room(dict(model_row, aggregate_bytes_per_rank=aggregate),
-                          stage="shared-pole passivity/held checks")
+                          stage="tangential passivity/held checks")
 
 
 def _shard_bytes(array):
@@ -344,7 +344,7 @@ class ConstructorCapacity:
         a face plan decides its stacks against ``face_room``, which the face
         admission sets first (``face_eigh_room``; unset is refused by name)."""
         if self.execution == "face" and self.face_room is None:
-            raise ValueError("GATE shared_pole_face_room: got: a face constructor eigh plan before "
+            raise ValueError("GATE tangential_face_room: got: a face constructor eigh plan before "
                              "its room; want: face_room = face_eigh_room(admission) first; why: "
                              "distrib_la refuses every eigh stack in room 0")
         return constructor_eigenplan(self._mesh_xy, int(side), self.execution,
@@ -388,7 +388,7 @@ class ConstructorCapacity:
             side = self._side
         self._side = side
         # A local reduction round admits its own executable, eigh stacks included, beside
-        # this row (shared_pole_execution.price_round); the row holds its operands only.
+        # this row (tangential_execution.price_round); the row holds its operands only.
         price, native = self.quote(side, phase=self._phase, eigh=not (
                                        self.execution == "local" and self._phase == "reduction"),
                                    sample_batch=sample_batch,
@@ -435,7 +435,7 @@ class ConstructorCapacity:
         side = int(side)
         from types import SimpleNamespace
         pricing_resolution = SimpleNamespace(layout="distributed" if self.execution == "face" else "local")
-        price = shared_pole_byte_terms(
+        price = tangential_byte_terms(
             self._meta, mesh_xy=self._mesh_xy, resolution=pricing_resolution,
             pencil_side=side, parent_batch=self.batch_width,
             sample_batch=sample_batch, phase=phase,

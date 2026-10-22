@@ -248,7 +248,7 @@ four ranks compiling and 16 cores per rank, take 104.0 s serial and 55.8,
 29.1, 16.4 and 12.4 s on 2, 4, 8 and 16 threads, each compile stretching
 ×1.23 at 8 and ×1.69 at 16. 73.2 of their 105.5 cold seconds have shapes fixed
 before the first call: once the inputs load, or at a named boundary (the
-shared-pole frequency rule, the pole model, the Σ plan). The 1566 real
+tangential frequency rule, the pole model, the Σ plan). The 1566 real
 compiles under 50 ms (45.5 s) no thread can take; only fewer programs moves
 them (claim 4178).
 
@@ -258,7 +258,7 @@ request number there. XLA then compiles on one of min(8, physical cores)
 helper threads. Whichever of the helper and the live call reaches the compile
 first compiles under that number, and the other waits, so a program compiles
 once and takes one number on every rank, whatever the timing. Two owners
-submit: the scalar shared-pole W-model setup, before the ζ fit (V^(1/2) of
+submit: the scalar tangential W-model setup, before the ζ fit (V^(1/2) of
 the bare V's parents under a distributed `linalg`, and the MPA scalar head
 fit when a head correction is on), and a streamed bank (all its row passes at
 once). On the P4 hsuite this takes release cold from 336.7 to 326.3 s, with
@@ -272,10 +272,10 @@ each large compile; threads overlap whole compiles.
 |---|---|---|
 | the three uncacheable programs | open: they compile in every process until their host callbacks go | 4139 |
 | more `compile_ahead` sites | open, none without reordering its owner: the static and direct bank streams wait on the frequency rule, which the moments build; the distrib_la stacks take the call's batch; the ζ kernels compile inside the memory check's loop | — |
-| merging the largest families | not carried: they are distinct by physics (χ integrate's 11 programs are the four-current family blocks and node sets, the MPA window runner's bisp_sc programs the sectors' pole-panel widths, the shared-pole rounds one per sector), and merging their shapes adds masked work | 4155 |
+| merging the largest families | not carried: they are distinct by physics (χ integrate's 11 programs are the four-current family blocks and node sets, the MPA window runner's bisp_sc programs the sectors' pole-panel widths, the tangential rounds one per sector), and merging their shapes adds masked work | 4155 |
 | keep the in-memory caches between hsuite stages | rejected: warm 161.5 s against 161.9 s | 4130 |
 | drop traceback locations | rejected: warm 161.8 s against 161.9 s | 4130 |
-| the relaxed shared-pole tier | rejected: moves eqp by up to 0.64 eV | 4130 |
+| the relaxed tangential tier | rejected: moves eqp by up to 0.64 eV | 4130 |
 | `--xla_gpu_force_compilation_parallelism=16` | rejected: Si cold compile +3.0 % | 684 |
 | `--xla_gpu_enable_libnvptxcompiler`, `--xla_gpu_libnvjitlink_mode` | rejected: abort at flag parsing in jaxlib 0.9.1 | 4130, 4179 |
 | defer compiles behind async dispatch | rejected: hides at most 57.6 of 221.6 s (a sync follows every one or two dispatches) and needs a fork of JAX's pjit path | 4178 |

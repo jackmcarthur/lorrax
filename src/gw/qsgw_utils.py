@@ -1113,7 +1113,7 @@ def remove_managed(dir_path, pattern, *, keep=(), barrier_tag, print_fn=print):
     return.  A matching directory (a per-map scratch generation) is removed
     with its contents.  Returns the removed names (empty off rank 0).  Shared
     by ``sc_iteration._clear_sc_eqp_snapshots``,
-    ``gw.mpa.model.retain_iteration_artifacts`` and the shared-pole exports and
+    ``gw.mpa.model.retain_iteration_artifacts`` and the tangential exports and
     scratch; each caller owns its own regex, keep-set and report line.
     """
     import os

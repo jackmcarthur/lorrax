@@ -6,8 +6,8 @@ each, and fits every $q$-wedge matrix element of $W_c=W-v$ independently with
 $N_p$ complex poles (the multipole approximation of Leon *et al.*). The fitted
 poles feed the common $\Sigma(\omega)$ quadrature. `compute_mode = mpa` runs;
 `gw_config.UNIMPLEMENTED_MODES` is empty. The alternative body model under the
-same mode, `sigma_w_model = shared_pole`, is
-[the shared-pole screened interaction](shared-pole-w-model.md).
+same mode, `sigma_w_model = tangential`, is
+[the tangential screened interaction](tangential-w-model.md).
 
 This page owns the sample geometry, the $\chi$ sample rules, the disk pipeline,
 the multipole fit and the MPA-specific parts of $\Sigma$. The frequency

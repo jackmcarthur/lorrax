@@ -204,7 +204,7 @@ Invoke: `python -m gw.gw_jax -i gw.in`.
 | key | default | meaning |
 |---|---|---|
 | `number_bands` / `nval` / `ncond` | 100 / 5 / 5 | χ₀ and Σ band-sum top / interior valence edge / Σ conduction count. `number_bands_chi` and `number_bands_sigma` split the two sums |
-| `compute_mode` | `auto` | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `mpa`. `auto` infers from the legacy flags and never selects `mpa`. `gn_ppm` refuses metallic occupations ([input reference](input_reference.md)). Production: `mpa` with `sigma_w_model = shared_pole` ([production QSGW](how-to/production-qsgw.md)) |
+| `compute_mode` | `auto` | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `mpa`. `auto` infers from the legacy flags and never selects `mpa`. `gn_ppm` refuses metallic occupations ([input reference](input_reference.md)). Production: `mpa` with `sigma_w_model = tangential` ([production QSGW](how-to/production-qsgw.md)) |
 | `qp_solver` | `auto` → `one_shot_dft` | `one_shot_dft`: full-matrix effective H with Σ at $E_\mathrm{DFT}$, Hermitian-symmetrized; `self_consistent`: the QSGW loop, Σ read at each map's own energies. No QP equation is solved; `fixed_point` is retired and refuses by name ([self-consistency](self_consistency.md)) |
 | `sigma_omega_grid_debug` | false | debug: Σ_c on the whole ω grid instead of on shell (the `sigma_mnk.h5` Σ(ω) cube, the grid freq-debug table, `qp_omega0_ev`, the ±0.5 eV Z); see [on-shell Σ_c](theory/sigma-on-shell.md#grid-debug). `write_eqp2` and the `eqp2_*` keys are retired and refuse by name |
 | `restart` | false | `true` reuses `tmp/isdf_tensors_<N_mu>.h5` after authentication |
@@ -232,7 +232,7 @@ Operating at thousands of centroids (the distributed plan, per-rank scalings):
 The one dynamic-Σ dispatch (`gw.sigma_dispatch._compute_mpa_sigma`) and the one finalizer
 (`finalize_dynamic_sigma`) are shared with the pole models; only the body kernel changes.
 `gw.cd.sigma.compute_sigma_c_cd_omega_grid` streams the ISDF W(z) at the CD nodes and knots, built
-from the shared-pole bank's response-quadrature χ⁰ (`gw.cd.sigma.bank_chi0`), and accumulates Σ_c on
+from the tangential bank's response-quadrature χ⁰ (`gw.cd.sigma.bank_chi0`), and accumulates Σ_c on
 the file k wedge inside one `shard_map` over q; W(z) is never persisted.  Besides `sigma_mnk.h5` the
 run writes `cd_sigma_own_energy.npz`, `cd_sigma_receipt.json` and `cd_leak_ledger.csv`; with
 `cd_checkpoint = write | resume` also `tmp/cd_checkpoint.h5`, and under `LORRAX_CD_STOP_AFTER`

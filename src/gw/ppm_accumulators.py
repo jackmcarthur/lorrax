@@ -13,7 +13,7 @@ with ``ω_kn`` the per-state evaluation energies.  The coefficient of a node
 is the scalar ``prefactor·α·exp(-i(E_ref − s·|ω|)t)`` evaluated per state on
 the device, so the fold reads each ``σ(τ)`` once and writes a depth-2 matrix;
 the derivative slot is the exact ω-derivative of the same quadrature,
-``i·s·s_ext·t`` times it.  It serves MPA, one-pole GN/HL-PPM and shared-pole
+``i·s·s_ext·t`` times it.  It serves MPA, one-pole GN/HL-PPM and tangential
 data and never stores a history of time-domain matrices.
 
 Some one-sided control quadratures first sum their time-node contributions

@@ -1,6 +1,6 @@
 """The TD refit's chi0 in four (hole x electron) blocks, on the synthetic GW bundle (CPU, 2x2 mesh).
 
-``gw.response_bank`` with ``meta.shared_pole_response_blocks`` (``response_blocks``,
+``gw.response_bank`` with ``meta.tangential_response_blocks`` (``response_blocks``,
 ``_block_quadrature``, ``_integrate_block_passes``) against the exact ordered-pair scan
 ``gw.w_isdf.compute_chi0_direct_fractional`` at complex z down to Im z = 0.1 eV, with random
 fractional populations on the active bands; the one-rule path on the same carrier as the
@@ -87,9 +87,9 @@ def bank_chi(wfns, meta, mesh, z_ry, *, blocks=None):
     import jax
     from gw import response_bank as RB
     if blocks is not None:
-        meta.shared_pole_response_blocks = dict(active=tuple(blocks), held={})
-    elif hasattr(meta, "shared_pole_response_blocks"):
-        del meta.shared_pole_response_blocks
+        meta.tangential_response_blocks = dict(active=tuple(blocks), held={})
+    elif hasattr(meta, "tangential_response_blocks"):
+        del meta.tangential_response_blocks
     plan = sample_plan(z_ry, 0.0)
     receipt = dict(correlation_count=0)
     say = lambda *a, **k: None

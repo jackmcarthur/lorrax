@@ -3201,7 +3201,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // or not), since the register load fixes one block per SM either way.  Its load holds a spin
     // group per thread (48 complex values at ns 4), so it runs 256 threads, not the plan's 512 (a
     // 128-register cap would spill it).  Kept 2026-09-25 (FP): mode 3 is 90% of the
-    // FFT-family time of an Fe 8^3 shared-pole SC map, and the stage is 1.14-1.23x at its kconv call
+    // FFT-family time of an Fe 8^3 tangential SC map, and the stage is 1.14-1.23x at its kconv call
     // (claim 2779); mode 8's split arm serves 10^3-16^3 at ns 4.
     const bool kbox_rows = (mode >= 2 && mode <= 5) || mode == 9;
     const bool kbox_single_only = mode == 4 || mode == 5;

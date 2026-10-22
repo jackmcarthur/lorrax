@@ -201,7 +201,7 @@ class BispinorGWMode(str, enum.Enum):
     """How the four-current photon channels enter the GW self-energy; see docs/dev/gw_config_contracts.md."""
 
     BARE_TRANSVERSE = "bare_transverse"
-    FULL_SHARED_POLE = "full_shared_pole"
+    FULL_TANGENTIAL = "full_tangential"
     FULL_STATIC_COHSEX = "full_static_cohsex"
 
 
@@ -1180,13 +1180,13 @@ _DEFAULTS = {
     # Suppressing the write makes the file ABSENT, which is the loudest of
     # the states those guards distinguish.
     "write_restart_tensors": True,
-    # Standalone shared-pole outputs; internal construction stores remain required.
+    # Standalone tangential outputs; internal construction stores remain required.
     #
     # ``write_poles`` is the PRODUCTION export and stays top-level beside
     # ``write_restart_tensors``: it is a supported artifact with a stable
     # format, and it is complete for a static-W consumer.  The model it
     # writes is evaluated as ``Wc(s) = b (s - Lambda)^-1 b^dagger`` with
-    # ``s = z^2`` (gw.shared_pole_constructor, the ``weights = 1/(s-poles)``
+    # ``s = z^2`` (gw.tangential_constructor, the ``weights = 1/(s-poles)``
     # evaluation), so ``Wc(omega=0) = -b Lambda^-1 b^dagger`` EXACTLY, from
     # the two datasets this key already exports.  Static screened
     # ``W(0) = v + Wc(0)``.
@@ -1202,7 +1202,7 @@ _DEFAULTS = {
     # 19.44 GiB against the pole export's 1.22 GiB, 16x, for bytes no
     # consumer opens.  Owner ruling 2026-09-11.
     "write_poles": False,
-    # Debug (shared-pole)
+    # Debug (tangential)
     "write_w": False,
     # ``write_qsgw_datasets``: does this run add the QSGW / QP-ladder
     # appendix to sigma_mnk.h5?  DEFAULT false, and false is exactly
@@ -1670,7 +1670,7 @@ _DEFAULTS = {
     "sigma_w_accuracy": "production",
     # ``sigma_frequency_integration``: how Sigma_c(omega) integrates over W's
     # frequency.  pole_model = the time-domain/pole executor of
-    # sigma_w_model = mpa | shared_pole (every existing deck, bit-identical);
+    # sigma_w_model = mpa | tangential (every existing deck, bit-identical);
     # contour_deformation = imaginary-axis quadrature + real-axis residues on
     # the ISDF W(z) from the bank-quadrature chi0, streamed (gw.cd).  The cd_*
     # sub-keys are its own.
@@ -1692,9 +1692,9 @@ _DEFAULTS = {
     "cd_own_energy_band_min": 1,
     # ``cd_checkpoint``: off | write (accumulators after every chunk, tmp/cd_checkpoint.h5) | resume.
     "cd_checkpoint": "off",
-    # "" = the shared-pole resolver's own line and imaginary ladders.
+    # "" = the tangential resolver's own line and imaginary ladders.
     # "<line eV list> | <imaginary eV list>" replaces both with explicit
-    # sites (gw.shared_pole_recipe.parse_support_sites); the height, held
+    # sites (gw.tangential_recipe.parse_support_sites); the height, held
     # fractions, widths and gates are unchanged, and the sites enter
     # recipe_version/recipe_hash so no store crosses ladders on restart.
     "sigma_w_support_sites_ev": "",
@@ -2223,14 +2223,14 @@ def mpa_sigma_runs_scalar_executor(config) -> bool:
     (``bispinor_gw = bare_transverse`` with the shared pole): its store is
     the four-component charge operator and ``sigma_dispatch._compute_mpa_sigma``
     hands it to ``compute_sigma_c_mpa_omega_grid`` like a scalar store.  The
-    four-current sector bank (``full_shared_pole``) runs that executor once
+    four-current sector bank (``full_tangential``) runs that executor once
     per endpoint class (``mpa.sector_sigma``), and its CC class brackets its
     Green band sum.  A bispinor MPA fit is unmeasured and keeps the full-band
     sum.
     """
     return (not bool(getattr(config, "bispinor", False))
-            or uses_bare_transverse_shared_pole(config)
-            or uses_full_bispinor_shared_pole(config))
+            or uses_bare_transverse_tangential(config)
+            or uses_full_bispinor_tangential(config))
 
 
 # ---------------------------------------------------------------------------
@@ -2403,26 +2403,26 @@ def _resolve_cd_inputs(params):
             "(IMPLEMENTATION LIMIT)")
 
 
-def _resolve_shared_pole_inputs(params):
-    """Validate the shared-pole deck surface once, preserving explicitness."""
-    from .shared_pole_recipe import shared_real_pole_v1_r3b as recipe
+def _resolve_tangential_inputs(params):
+    """Validate the tangential deck surface once, preserving explicitness."""
+    from .tangential_recipe import shared_real_pole_v1_r3b as recipe
 
     named = params[_DECK_NAMED_KEYS]
-    for key, choices in (("sigma_w_model", ("mpa", "shared_pole")),
+    for key, choices in (("sigma_w_model", ("mpa", "tangential")),
                          ("sigma_w_accuracy", ("production", "relaxed"))):
         value = str(params[key]).strip().lower()
         if value not in choices:
             raise ValueError(
-                f"GATE shared_pole_enum: {key} got: {value!r}; "
+                f"GATE tangential_enum: {key} got: {value!r}; "
                 f"want: {' | '.join(choices)}; why: unknown W recipe")
         params[key] = value
     mode = str(params["compute_mode"]).strip().lower()
     model = params["sigma_w_model"]
     for key in ("write_w", "write_poles"):
-        if params[key] and (mode != "mpa" or model != "shared_pole"):
+        if params[key] and (mode != "mpa" or model != "tangential"):
             raise ValueError(
                 f"{key}=true requires compute_mode=mpa and "
-                "sigma_w_model=shared_pole (fixed frequency-bank outputs)")
+                "sigma_w_model=tangential (fixed frequency-bank outputs)")
     if (params["write_w"] or params["write_poles"]) and not str(params["wfn_file"]).strip():
         raise ValueError("write_w/write_poles require a nonempty wfn_file source path")
     # DEBUG STATUS, ANNOUNCED AT PARSE TIME.  ``write_w`` is off by default
@@ -2434,7 +2434,7 @@ def _resolve_shared_pole_inputs(params):
     if params["write_w"]:
         _print_deck_report(
             "\n  ==========================================================\n"
-            "  WARNING -- DEBUG: write_w = true dumps the WHOLE shared-pole\n"
+            "  WARNING -- DEBUG: write_w = true dumps the WHOLE tangential\n"
             "  Wc frequency sample bank (every fixed sample, plus dWc_ds,\n"
             "  M1 and M3) to <map>_w.h5.  This is a debugging output with\n"
             "  no consumer in this tree; it is NOT needed for BSE.\n"
@@ -2447,26 +2447,26 @@ def _resolve_shared_pole_inputs(params):
             "  ==========================================================")
     if "sigma_w_model" in named and mode != "mpa":
         raise ValueError(
-            f"GATE shared_pole_applicability: sigma_w_model got: {model!r} "
+            f"GATE tangential_applicability: sigma_w_model got: {model!r} "
             f"with compute_mode={mode!r}; want: compute_mode=mpa; "
             "why: this key selects the MPA Sigma W representation")
-    if "sigma_w_accuracy" in named and model != "shared_pole":
+    if "sigma_w_accuracy" in named and model != "tangential":
         raise ValueError(
-            "GATE shared_pole_applicability: sigma_w_accuracy got: "
+            "GATE tangential_applicability: sigma_w_accuracy got: "
             f"{params['sigma_w_accuracy']!r} with sigma_w_model={model!r}; "
-            "want: sigma_w_model=shared_pole; why: tier has no other consumer")
-    if "sigma_w_support_sites_ev" in named and model != "shared_pole":
+            "want: sigma_w_model=tangential; why: tier has no other consumer")
+    if "sigma_w_support_sites_ev" in named and model != "tangential":
         raise ValueError(
-            "GATE shared_pole_applicability: sigma_w_support_sites_ev got: "
+            "GATE tangential_applicability: sigma_w_support_sites_ev got: "
             f"{params['sigma_w_support_sites_ev']!r} with sigma_w_model={model!r}; "
-            "want: sigma_w_model=shared_pole; why: only the shared-pole "
+            "want: sigma_w_model=tangential; why: only the tangential "
             "resolver has support ladders to replace")
     eta = float(params["sigma_regularization_ev"])
     if not (np.isfinite(eta) and eta > 0.0):
         raise ValueError(
             f"GATE sigma_regularization: sigma_regularization_ev got: {eta!r}; "
             "want: finite > 0 eV; why: the causal evaluation needs positive broadening")
-    if model != "shared_pole":
+    if model != "tangential":
         return
     head_enabled = coerce_head_correction(params['head_correction']) is not HeadCorrection.OFF
     unused_keys = {"mpa_pole_batch_size", "mpa_fit_reuse_file",
@@ -2478,19 +2478,19 @@ def _resolve_shared_pole_inputs(params):
     unused = sorted(named.intersection(unused_keys))
     if unused:
         raise ValueError(
-            f"GATE shared_pole_unused_inputs: got: {', '.join(unused)}; "
-            "want: remove elementwise MPA fit keys; why: shared_pole uses its versioned recipe")
+            f"GATE tangential_unused_inputs: got: {', '.join(unused)}; "
+            "want: remove elementwise MPA fit keys; why: tangential uses its versioned recipe")
     # Refuse a malformed ladder at parse time, not five minutes into the
     # stream, and announce the override the way write_w is announced: the
     # deck no longer gets the resolver's certified support rule.
-    from .shared_pole_recipe import parse_support_sites
+    from .tangential_recipe import parse_support_sites
     override = parse_support_sites(params["sigma_w_support_sites_ev"])
     if override is not None:
         params["sigma_w_support_sites_ev"] = override["text"]
         _print_deck_report(
             "\n  ==========================================================\n"
             "  WARNING -- DEBUG: sigma_w_support_sites_ev replaces BOTH\n"
-            "  shared-pole support ladders with explicit sites:\n"
+            "  tangential support ladders with explicit sites:\n"
             f"    line      {override['line_ev']} eV\n"
             f"    imaginary {override['imaginary_ev']} eV\n"
             "  The resolver's band-structure line rule (production),\n"
@@ -2503,13 +2503,13 @@ def _resolve_shared_pole_inputs(params):
             "  ==========================================================")
     # sigma_quadrature_eps means one thing on every Sigma route; a tier only
     # supplies a default when the deck omits the key (relaxed: 5e-4).
-    from .shared_pole_recipe import SIGMA_EPS_DEFAULT
+    from .tangential_recipe import SIGMA_EPS_DEFAULT
     default_eps = SIGMA_EPS_DEFAULT.get(params["sigma_w_accuracy"])
     if default_eps is not None and "sigma_quadrature_eps" not in named:
         params["sigma_quadrature_eps"] = default_eps
     # minimax_target_error retains its incumbent static-stage meaning; the
     # bank always consumes the tier's bank_rule_tolerance from the resolver
-    # (production 1e-8, relaxed 1e-7; gw.shared_pole_recipe).
+    # (production 1e-8, relaxed 1e-7; gw.tangential_recipe).
 
 
 def _normalize_input_string(value):
@@ -3037,9 +3037,9 @@ def _apply_input_envelope(
             and "sc_head_update" not in _named_keys
             and resolved.sc.head_update == "off"
             and (not bool(resolved.bispinor)
-                 or uses_full_bispinor_shared_pole(resolved))
+                 or uses_full_bispinor_tangential(resolved))
             and bool(resolved.do_G0)
-            and resolved.sigma.w_model == "shared_pole"
+            and resolved.sigma.w_model == "tangential"
             and resolved.head.correction is HeadCorrection.FULL):
         links = resolved.paths.parallel_transport_file
         dipole = os.path.join(resolved.input_dir or ".", "dipole.h5")
@@ -3061,12 +3061,12 @@ def _apply_input_envelope(
     if (resolved.qp_solver is QPSolver.SELF_CONSISTENT
             and "sc_head_update" not in _named_keys
             and resolved.sc.head_update == "off"
-            and uses_full_bispinor_shared_pole(resolved)):
+            and uses_full_bispinor_tangential(resolved)):
         resolved = _dc_replace(resolved, sc=_dc_replace(
             resolved.sc, head_update="dft_velocity"))
         print_fn(
             "  [config provenance] sc_head_update was not named on "
-            "bispinor_gw = full_shared_pole; using dft_velocity (the direct "
+            "bispinor_gw = full_tangential; using dft_velocity (the direct "
             "Gamma head follows every map on the QP-rotated velocity)")
     if "restart" not in _named_keys:
         print_fn(
@@ -3079,7 +3079,7 @@ def _apply_input_envelope(
     refuse_unsupported_screening_diagrams(resolved)
     refuse_unsupported_head_dense(resolved)
     refuse_unsupported_bispinor_gw(resolved)
-    warn_headless_shared_pole_self_consistency(resolved, print_fn=print_fn)
+    warn_headless_tangential_self_consistency(resolved, print_fn=print_fn)
     announce_legacy_sigma_axis_keys(
         _named_keys, resolved.compute_mode, resolved.qp_solver,
         print_fn=print_fn)
@@ -3523,7 +3523,7 @@ def read_lorrax_input(filename: str) -> dict:
         params = dict(_DEFAULTS)
         params[_DECK_NAMED_KEYS] = frozenset()
     _require_sys_dim(params, filename)
-    _resolve_shared_pole_inputs(params)
+    _resolve_tangential_inputs(params)
     _resolve_cd_inputs(params)
     params[_LINALG_RESOLUTION] = resolve_linalg(params)
     _counts = resolve_band_counts(params, deck_named=params[_DECK_NAMED_KEYS])
@@ -3782,21 +3782,21 @@ def uses_coupled_photon_head(config) -> bool:
             and config.head.correction is HeadCorrection.FULL)
 
 
-def uses_full_bispinor_shared_pole(config) -> bool:
+def uses_full_bispinor_tangential(config) -> bool:
     """Select the CC/CT/TC/TT frequency-dependent photon sector bank."""
     return (bool(config.bispinor)
             and config.compute_mode is ComputeMode.MPA
-            and config.sigma.w_model == "shared_pole"
+            and config.sigma.w_model == "tangential"
             and config.screening.diagrams is ScreeningDiagrams.W_RPA
             and coerce_bispinor_gw_mode(config.bispinor_gw)
-                is BispinorGWMode.FULL_SHARED_POLE)
+                is BispinorGWMode.FULL_TANGENTIAL)
 
 
-def uses_bare_transverse_shared_pole(config) -> bool:
+def uses_bare_transverse_tangential(config) -> bool:
     """Select screened four-spinor CC and bare transverse exchange."""
     return (bool(config.bispinor)
             and config.compute_mode is ComputeMode.MPA
-            and config.sigma.w_model == "shared_pole"
+            and config.sigma.w_model == "tangential"
             and config.screening.diagrams is ScreeningDiagrams.W_RPA
             and coerce_bispinor_gw_mode(config.bispinor_gw)
                 is BispinorGWMode.BARE_TRANSVERSE)
@@ -3804,7 +3804,7 @@ def uses_bare_transverse_shared_pole(config) -> bool:
 
 def uses_bare_tt_gamma_head(config) -> bool:
     """Insert the bare transverse Gamma average into bare-TT V tiles."""
-    hybrid = (uses_bare_transverse_shared_pole(config)
+    hybrid = (uses_bare_transverse_tangential(config)
               and config.head.correction is not HeadCorrection.OFF)
     incumbent_ppm = (bool(config.bispinor)
                      and config.compute_mode.ppm_model is not None
@@ -3822,15 +3822,15 @@ def uses_bare_tt_gamma_head(config) -> bool:
     return hybrid or incumbent_ppm or bare_x
 
 
-def uses_direct_bispinor_shared_pole_head(config) -> bool:
+def uses_direct_bispinor_tangential_head(config) -> bool:
     """First-order direct Γ completion of the ordered four-current bank.
 
-    On ``bispinor_gw = full_shared_pole`` the head (``head_correction =
+    On ``bispinor_gw = full_tangential`` the head (``head_correction =
     full``) is this direct sector head: no local-field fold exists for the
     four-current bank, and the run record says so
     (:func:`incumbent_bispinor_head_record`).
     """
-    return (uses_full_bispinor_shared_pole(config)
+    return (uses_full_bispinor_tangential(config)
             and config.head.correction is HeadCorrection.FULL)
 
 
@@ -3839,10 +3839,10 @@ def folds_scalar_head(config) -> bool:
 
     ``head_correction = full`` on every route but the four-current sector
     bank, whose head is its direct sector head
-    (:func:`uses_direct_bispinor_shared_pole_head`).
+    (:func:`uses_direct_bispinor_tangential_head`).
     """
     return (config.head.correction is HeadCorrection.FULL
-            and not uses_full_bispinor_shared_pole(config))
+            and not uses_full_bispinor_tangential(config))
 
 
 def incumbent_bispinor_head_record(config) -> tuple[str, str]:
@@ -3859,13 +3859,13 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
             "  ==========================================================\n",
             "DEBUG: no Gamma-cell head at all (head_correction=off on the "
             "incumbent route); NOT a production calculation")
-    if uses_direct_bispinor_shared_pole_head(config):
+    if uses_direct_bispinor_tangential_head(config):
         return "", ("first-order direct CC/CT/TC/TT Gamma-cell head "
-                    "in ordered shared-pole sectors (bulk: screened "
+                    "in ordered tangential sectors (bulk: screened "
                     "sphere; slab: exact Wigner-Seitz polygon); FD metal "
                     "Drude; no local-field fold on the four-current bank; "
                     "spatial current uses the dipole-velocity approximation")
-    if uses_bare_transverse_shared_pole(config):
+    if uses_bare_transverse_tangential(config):
         return "", ("frequency-dependent scalar CC Gamma head on the "
                     "four-spinor charge carrier, local fields folded once "
                     "through W(Gamma); bare transverse Gamma exchange")
@@ -3885,13 +3885,13 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
         "<D_TT> and this deck is outside its envelope")
 
 
-def warn_headless_shared_pole_self_consistency(config, print_fn=print) -> None:
-    """Allow shared-pole SC with the head off, with the measured risk recorded.
+def warn_headless_tangential_self_consistency(config, print_fn=print) -> None:
+    """Allow tangential SC with the head off, with the measured risk recorded.
 
     MEASURED, 2026-09-11 (AUNION, claim 2189).  ``sigma_w_model =
-    shared_pole`` with ``qp_solver = self_consistent`` and
+    tangential`` with ``qp_solver = self_consistent`` and
     ``head_correction = off`` completes map 0 and then dies inside map 1 on
-    ``GATE shared_pole_gram_valid`` at q=0 -- the parent where the head
+    ``GATE tangential_gram_valid`` at q=0 -- the parent where the head
     correction acts.  Three independent sources were measured on the same
     Si deck and all three fail: the SC quadrature branch alone
     (Gram min/max -2.294e-07), the seven-lane union (-2.012e-07), and
@@ -3899,27 +3899,27 @@ def warn_headless_shared_pole_self_consistency(config, print_fn=print) -> None:
     material past map 1 and map 2 with ``head_correction = full``
     (job 58216796), so this is a property of the deck, not of the source.
 
-    OWNER POLICY, 2026-09-18.  Head off is allowed for shared-pole
+    OWNER POLICY, 2026-09-18.  Head off is allowed for tangential
     self-consistency as a brute-grid/development mode.  The dense-k limit
     is the intended convergence limit, so the former parse-time refusal is
     retired and the measured failure is retained here as a warning instead.
     This does not loosen the Gram gate: a headless run may still refuse
-    numerically at ``GATE shared_pole_gram_valid``, and the signed Gamma
+    numerically at ``GATE tangential_gram_valid``, and the signed Gamma
     head remains the production path for ordered stores.
 
-    SCOPED TO SELF-CONSISTENCY ON PURPOSE.  A headless shared-pole
+    SCOPED TO SELF-CONSISTENCY ON PURPOSE.  A headless tangential
     ONE-SHOT run is not covered by this evidence and is not refused here;
     it remains a legitimate debug run.
     """
-    if (getattr(config.sigma, "w_model", "mpa") != "shared_pole"
+    if (getattr(config.sigma, "w_model", "mpa") != "tangential"
             or config.qp_solver is not QPSolver.SELF_CONSISTENT
             or config.head.correction is not HeadCorrection.OFF):
         return
     print_fn(
-        "  [config warning] shared-pole SC with head_correction = off is "
+        "  [config warning] tangential SC with head_correction = off is "
         "allowed as a brute-grid/development mode (owner policy 2026-09-18). "
         "The scalar route has measured a map-1 q = 0 Gram failure "
-        "(GATE shared_pole_gram_valid, -2.29e-07/-2.01e-07 against -1e-07); "
+        "(GATE tangential_gram_valid, -2.29e-07/-2.01e-07 against -1e-07); "
         "the Gram gate is unchanged and the run may still refuse "
         "numerically.  The dense-k limit is the intended convergence limit; "
         "the signed Gamma head remains the production path for ordered "
@@ -3959,16 +3959,16 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "  doc:  docs/input_reference.md, density_self_consistent.")
     if mode is BispinorGWMode.BARE_TRANSVERSE:
         return
-    if mode is BispinorGWMode.FULL_SHARED_POLE:
-        if not uses_full_bispinor_shared_pole(config):
+    if mode is BispinorGWMode.FULL_TANGENTIAL:
+        if not uses_full_bispinor_tangential(config):
             raise ValueError(
-                "GATE full_shared_pole_envelope: bispinor_gw=full_shared_pole "
+                "GATE full_tangential_envelope: bispinor_gw=full_tangential "
                 "requires bispinor=true, compute_mode=mpa, "
-                "sigma_w_model=shared_pole, and screening_diagrams=w_rpa")
+                "sigma_w_model=tangential, and screening_diagrams=w_rpa")
         if (config.qp_solver is QPSolver.SELF_CONSISTENT
                 and config.sc.head_update not in PHOTON_DIRECT_HEAD_UPDATES):
             raise ValueError(
-                "GATE full_shared_pole_head_update: the four-current direct "
+                "GATE full_tangential_head_update: the four-current direct "
                 "Gamma head has three SC modes.\n"
                 f"  got:  sc_head_update = {config.sc.head_update}\n"
                 "  want: parallel_transport (the map's QSGW velocity "
@@ -4217,10 +4217,10 @@ class DynamicSigmaConfig:
     cd_band_tile: int = 0
     cd_own_energy_band_min: int = 1
     cd_checkpoint: str = "off"
-    #: ``sigma_w_support_sites_ev``: "" (default, the shared-pole
+    #: ``sigma_w_support_sites_ev``: "" (default, the tangential
     #: resolver's own ladders) or "<line eV list> | <imaginary eV list>",
     #: an explicit support geometry for support-rule studies.  Parsed and
-    #: gated by ``gw.shared_pole_recipe.parse_support_sites``.
+    #: gated by ``gw.tangential_recipe.parse_support_sites``.
     w_support_sites_ev: str = _DEFAULTS["sigma_w_support_sites_ev"]
     quadrature_eps: float = _DEFAULTS["sigma_quadrature_eps"]
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
@@ -4236,7 +4236,7 @@ class DynamicSigmaConfig:
     #: ``use_band_extrapolation`` (default TRUE) and its deprecated alias
     #: ``sigma_band_extrapolation`` by
     #: :func:`resolve_band_extrapolation`.  Applied by the GN/HL-PPM pipeline
-    #: and the MPA Σ of scalar and bispinor shared-pole decks
+    #: and the MPA Σ of scalar and bispinor tangential decks
     #: (``gw.ppm_pipeline``'s band-extrapolation seam); on a static stage or a
     #: bispinor MPA fit it is turned OFF with a recorded note (or refused --
     #: see ``band_extrapolation_explicit``) by ``gw.sigma_dispatch``: the
@@ -4525,20 +4525,20 @@ INSULATOR_HEAD_UPDATES = ("interband_commutator",)
 HEAD_UPDATES = METAL_HEAD_UPDATES + INSULATOR_HEAD_UPDATES
 
 #: The SC head modes of the four-current direct Γ head
-#: (``bispinor_gw = full_shared_pole``): ``off`` builds it on the DFT state,
+#: (``bispinor_gw = full_tangential``): ``off`` builds it on the DFT state,
 #: ``dft_velocity`` on each map's state with the QP-rotated velocity, and
 #: ``parallel_transport`` with the map's QSGW velocity (``qsgw_head.qp_velocity``).
 PHOTON_DIRECT_HEAD_UPDATES = ("off", "dft_velocity", "parallel_transport")
 
 
 def uses_metal_direct_drude_head(config) -> bool:
-    """Admit the per-map velocity head (Drude + Thomas-Fermi) on a shared-pole metal.
+    """Admit the per-map velocity head (Drude + Thomas-Fermi) on a tangential metal.
 
     ``dft_velocity`` is admitted under ``head_correction = full`` on scalar,
-    bare-transverse and four-current (``full_shared_pole``) decks.  Scalar
+    bare-transverse and four-current (``full_tangential``) decks.  Scalar
     and bare-transverse decks fold the head (intraband wings and the static
     fold) on the charge carrier: the four-spinor carrier's charge operator
-    is spin-traced like the scalar one (``gw.shared_pole_head`` docstring).
+    is spin-traced like the scalar one (``gw.tangential_head`` docstring).
     Owner ruling 2026-09-25: full on time-reversal-even metals on the frozen
     and the per-map routes; since 2026-10-20 on ordered metals too,
     docs/theory/metal-q0-head.md section 5.  The four-current bank builds
@@ -4553,14 +4553,14 @@ def uses_metal_direct_drude_head(config) -> bool:
     """
     if not (config.qp_solver is QPSolver.SELF_CONSISTENT
             and config.sc.head_update in METAL_HEAD_UPDATES
-            and config.sigma.w_model == "shared_pole"):
+            and config.sigma.w_model == "tangential"):
         return False
     if config.head.correction is not HeadCorrection.FULL:
         return False
     if config.sc.head_update == "parallel_transport":
-        return not config.bispinor or uses_full_bispinor_shared_pole(config)
-    return (not config.bispinor or uses_bare_transverse_shared_pole(config)
-            or uses_full_bispinor_shared_pole(config))
+        return not config.bispinor or uses_full_bispinor_tangential(config)
+    return (not config.bispinor or uses_bare_transverse_tangential(config)
+            or uses_full_bispinor_tangential(config))
 
 
 @dataclass(frozen=True)
@@ -4578,7 +4578,7 @@ class SCConfig:
     eigh: str = "auto"    # "auto" | "native" | "distributed"
     #: "off" | "parallel_transport" | "dft_velocity" | "interband_commutator".
     #: Every non-off mode rebuilds the head. Only ``dft_velocity`` with an
-    #: ordered shared-pole direct head is admitted on a metal; see
+    #: ordered tangential direct head is admitted on a metal; see
     #: ``uses_metal_direct_drude_head``.  ``interband_commutator`` is
     #: insulator-only.
     head_update: str = "off"
@@ -4673,7 +4673,7 @@ class DebugConfig:
     #: on-shell evaluation (``gw.ppm_sigma.OnShellSigma``).
     sigma_omega_grid_debug: bool
     write_wfn_h5: bool
-    #: Dump the WHOLE shared-pole Wc frequency sample bank (every fixed
+    #: Dump the WHOLE tangential Wc frequency sample bank (every fixed
     #: sample, plus ``dWc_ds``/M1/M3) to ``<map>_w.h5``.  Debugging only.
     #: BSE's static W does NOT need this: ``Wc(0) = -b Lambda^-1 b^dagger``
     #: is exact from ``write_poles``, and no consumer in this tree reads the
@@ -4702,7 +4702,7 @@ def _validate_occupation_smearing(screening, width_ry):
     # A metal's width is its Fermi-Dirac kBT.  ``occ_broadening > 0`` is the
     # MP1 smeared-head dial, and its only metal consumer was the velocity
     # Metallic velocity-head routes are resolved below; only the direct
-    # shared-pole Drude route is admitted.
+    # tangential Drude route is admitted.
     # ``occ_broadening = 0`` is the "step occupations" dial, not a width, so
     # it may stand beside a metal width (the b24/b40 step-occupation arms).
     broadening_ev = float(screening.occ_broadening_ev)
@@ -4740,7 +4740,7 @@ def validate_material_inputs(config, material_class):
                 "metal, and GN-PPM is not allowed for metals (owner ruling "
                 "2026-09-17).\n"
                 "  got:  compute_mode = gn_ppm on fractional WFN occupations\n"
-                "  want: compute_mode = mpa with sigma_w_model = shared_pole "
+                "  want: compute_mode = mpa with sigma_w_model = tangential "
                 "(the production metal model; plain mpa stays as the "
                 "comparison)\n"
                 "  why:  GN-PPM stays for insulators only; its Sigma driver "
@@ -4761,7 +4761,7 @@ def validate_material_inputs(config, material_class):
                 "  got:  fractional occupations with the interband-commutator "
                 "head\n"
                 "  want: an insulator, or sc_head_update = off / "
-                "dft_velocity / parallel_transport (shared_pole direct "
+                "dft_velocity / parallel_transport (tangential direct "
                 "Drude head) on a metal\n"
                 "  why:  the route builds the QSGW velocity from interband "
                 "position elements r_ml = -i v_ml/(E_m - E_l) only; the "
@@ -4779,9 +4779,9 @@ def validate_material_inputs(config, material_class):
                 "tetrahedron Fermi-surface weights, Drude term, Thomas-Fermi "
                 "static head)\n"
                 "  want: sc_head_update = off, or dft_velocity with "
-                "shared_pole and head_correction = full, or "
+                "tangential and head_correction = full, or "
                 "parallel_transport on a scalar or "
-                "bispinor_gw = full_shared_pole deck\n"
+                "bispinor_gw = full_tangential deck\n"
                 "  why:  the bare-transverse head has no link consumer\n"
                 "  doc:  docs/self_consistency.md, 'Metals: direct Drude head'")
         if width_ry is None:
@@ -4893,7 +4893,7 @@ class LorraxConfig:
     #: a COMPLEMENT to q_irr storage and not an alternative to it.
     write_restart_tensors: bool
     #: Export the centroid/pole residue factor b and squared poles Lambda.
-    #: The production shared-pole export; complete for a static-W consumer
+    #: The production tangential export; complete for a static-W consumer
     #: (``Wc(0) = -b Lambda^-1 b^dagger``).  The frequency-bank dump is the
     #: DEBUG sibling and lives at ``config.debug.write_w``.
     write_poles: bool

@@ -2,7 +2,7 @@
 
 cuSOLVERMp's syevd returns wrong eigenpairs with info 0 on some Hermitian
 matrices with a large exact-zero block. The matrix here has the structure of
-the shared-pole joint CT metric that refused on Fe 4^3 bispinor (claim 3148):
+the tangential joint CT metric that refused on Fe 4^3 bispinor (claim 3148):
 [[I, M], [M^H, I]] on 990 + 1018 active rows of a 1152 + 1536 carrier (680
 exact-zero rows at each block's tail), M random with ||M||_2 = 0.988, seed 1.
 On it, bare cuSOLVERMp returned residual 2.0e-2 and orthogonality 5.5e-2 while

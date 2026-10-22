@@ -18,12 +18,12 @@ Which Lorentz blocks each `bispinor_gw` route screens, their $1/c$ order and
 the Σ owner: [Bispinor GW §6](bispinor-gw.md#routes). Admission and the
 packed envelope: [wiring](../architecture/four_current_wiring.md#routes-and-predicates).
 The Γ-cell head per route: packed routes take the coupled completion (§4);
-the incumbent and shared-pole hybrid take the scalar charge head (§3) and
-the bare TT overlay (§2.1); `full_shared_pole` takes the direct head (§5).
+the incumbent and tangential hybrid take the scalar charge head (§3) and
+the bare TT overlay (§2.1); `full_tangential` takes the direct head (§5).
 
 **Heads are always on** ([decisions, 2026-09-01](../architecture/decisions.md)).
 `head_correction = off` is a DEBUG skip with a loud banner on every route;
-`full` is the only other value. On `full_shared_pole` it is the direct sector
+`full` is the only other value. On `full_tangential` it is the direct sector
 head (§5), with no local-field fold on the four-current bank. No other key
 moves the head or the route.
 
@@ -42,7 +42,7 @@ packed screened modes on one deck. On MoS₂ 3×3 it is $1.2\times10^{-8}$ eV
 over 270 quasiparticle states (CLAIMS 581), far below the sub-meV
 transverse Γ-cell head (§2.1). The bound does not cover CT under time
 reversal: there $\chi_{CT}(0)=0$ while the dynamic $\chi_{CT}(\omega)$ is
-nonzero ([Bispinor GW §5](bispinor-gw.md#bare-transverse)). Outside `full_shared_pole`, no current block
+nonzero ([Bispinor GW §5](bispinor-gw.md#bare-transverse)). Outside `full_tangential`, no current block
 depends on frequency.
 
 ## 2. The bare propagator and its Γ-cell average
@@ -109,8 +109,8 @@ The head is frequency independent, because $\Sigma^B$ is. Its weight in Σ
 is $\langle v\rangle/(\Omega N_k)$. In 2D, $\langle v\rangle\propto
 q_c^{-1}\propto N_k^{1/2}$, so the head falls as $N_k^{-1/2}$. The overlay
 is on for incumbent GN/HL and for `x_only` under `head_correction = full`
-with `sys_dim ∈ {2,3}`, and for the shared-pole hybrid unless the head is
-`off`. On `full_shared_pole` it stays in $V$ for exchange and is subtracted
+with `sys_dim ∈ {2,3}`, and for the tangential hybrid unless the head is
+`off`. On `full_tangential` it stays in $V$ for exchange and is subtracted
 from the screening root. Restart refuses on the first two, because a
 restart $V$ does not stamp the choice
 (`GATE bare_tt_gamma_restart_unstamped`). Inside the packed envelope the
@@ -252,8 +252,8 @@ The derivation and branch assignment are owned by
   holds without time reversal. The k sum runs over the full zone, unfolded
   by the measured magnetic group. HL's real probe cannot resolve an odd
   residue and keeps the single-residue fit.
-* On a time-reversal-broken scalar shared-pole store `full` folds the signed
-  body and Lehmann wings (`gw.shared_pole_head`), on an ordered metal with
+* On a time-reversal-broken scalar tangential store `full` folds the signed
+  body and Lehmann wings (`gw.tangential_head`), on an ordered metal with
   the pair-split wings of [metal head §5](metal-q0-head.md#5-limits-of-the-model).
 
 ## 4. The packed static photon head
@@ -359,9 +359,9 @@ centroids it reaches 11.5 meV in the bare-X head of individual occupied
 states (CLAIMS 586). The wings and the current blocks have no band-diagonal
 form, so they stay in the $(\mu,\nu)$ representation on every route.
 
-## 5. The direct first-order head (`full_shared_pole`) {#direct-bulk-head}
+## 5. The direct first-order head (`full_tangential`) {#direct-bulk-head}
 
-`full_shared_pole` with `head_correction = full` completes the
+`full_tangential` with `head_correction = full` completes the
 ordered sector bank with a direct Γ head
 (`gw.photon_direct_head.build_direct_photon_head`) for `sys_dim = 3` or
 `2` (§5.1). A metal needs the current map's Fermi–Dirac occupations; an

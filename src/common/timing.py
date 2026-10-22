@@ -1109,7 +1109,7 @@ def fenced_section(name: str, *, sync_ranks: bool = True,
 
     ``announce``/``label`` forward to :func:`section` so a fenced stage can
     carry the 60 s heartbeat.  Without that forwarding every caller reaching
-    for the fence -- which is the entire shared-pole path -- was structurally
+    for the fence -- which is the entire tangential path -- was structurally
     unable to announce, whatever it passed.
     """
     fence(name, sync_ranks=sync_ranks)

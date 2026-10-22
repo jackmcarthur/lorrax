@@ -1,4 +1,4 @@
-"""chi0 rules of the contour-deformation route: the shared-pole bank's response quadrature on the CD
+"""chi0 rules of the contour-deformation route: the tangential bank's response quadrature on the CD
 memory windows, built in the job or precomputed on a CPU node.
 
 Where this sits (docs/dev/cd_frequency_integration.md): :func:`gw.cd.sigma.bank_chi0` evaluates chi0 at
@@ -267,7 +267,7 @@ def _star_sha(table):
 def sample_plan(wfns, meta, points, *, mu_ry, tolerance):
     """The bank sample plan of the CD points, and the census tables it is built from.
 
-    ``partial_at_mu`` follows ``shared_pole_recipe.bind_shared_pole_census``: some partially occupied
+    ``partial_at_mu`` follows ``tangential_recipe.bind_tangential_census``: some partially occupied
     band crosses mu across the k census.
     """
     from common.collectives import gather_to_host
@@ -385,8 +385,8 @@ def build_rules(wfns, meta, points, windows, *, mu_ry, tolerance, slots, capacit
     if not points.size or not np.all(np.isfinite(points)) or not np.all(points.imag > 0):
         raise ValueError("GATE cd_chi0_points: got: an empty, nonfinite or non-causal CD point set; want: "
                          "finite points with Im z > 0; why: the bank rule fits upper-half-plane evaluations")
-    if getattr(meta, "shared_pole_response_rules", None) is not None:
-        raise ValueError("GATE cd_chi0_session: got: a held shared-pole rule session on meta; want: none; "
+    if getattr(meta, "tangential_response_rules", None) is not None:
+        raise ValueError("GATE cd_chi0_session: got: a held tangential rule session on meta; want: none; "
                          "why: the CD rule must neither reuse nor overwrite the bank's held-map rules")
     plan, energy, occupied = sample_plan(wfns, meta, points, mu_ry=mu_ry, tolerance=tolerance)
     receipt = {"correlation_count": 0}

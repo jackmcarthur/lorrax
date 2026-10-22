@@ -208,9 +208,9 @@ populations:
 3. $\chi^0_q$ and $\partial_s\chi^0_q$ at the supports: one k-convolution of
    $G(\tau_j)\,G(-\tau_j)$ per time (the W term's FFT path), projected by the
    rule's rows (`minimax.response_group_rules`);
-4. $W_q=[1-v_q\chi^0_q]^{-1}v_q$ at the supports, then either the shared-pole
+4. $W_q=[1-v_q\chi^0_q]^{-1}v_q$ at the supports, then either the tangential
    pencil per parent q (poles $\Omega_j(t)$, factors $b_j(t)$;
-   [shared-pole model](shared-pole-w-model.md)) or the two-residue GN-PPM fit
+   [tangential model](tangential-w-model.md)) or the two-residue GN-PPM fit
    at $\omega=0$ and $i\omega_p$ ([GN-PPM](gn-ppm-nonhermitian.md)), on the
    ordered route, because the magnet and a helicity-selective drive both break
    time reversal;
@@ -232,7 +232,7 @@ insulator's interval.
 | $r_\mu$, $\tilde\zeta_q(\mathbf G)$, $V(q)$, the heads | whole run (the restart) | — |
 | window ψ at the centroids, fixed basis | whole run | rotated each refresh |
 | out-of-window $G(\tau_j)$ | while the response rule is held | with the rule |
-| response rules, supports, Σ rules | under the QSGW hold tests ([self-consistency §6](../self_consistency.md#shared-pole-w-with-retained-quadrature)) | when the populated transition interval leaves the plan, logged by name |
+| response rules, supports, Σ rules | under the QSGW hold tests ([self-consistency §6](../self_consistency.md#tangential-w-with-retained-quadrature)) | when the populated transition interval leaves the plan, logged by name |
 | $U$, $E$, $f$; window $G(\tau_j)$; $\chi^0$, $W$ and the pole model at the supports; $\Sigma_c$ on the window | — | every refresh |
 
 ### Cost

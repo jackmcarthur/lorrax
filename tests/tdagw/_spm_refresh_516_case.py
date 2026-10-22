@@ -1,10 +1,10 @@
-"""The shared-pole collision refresh on CrI3 516 (6x6 k, nosym), measured.
+"""The tangential collision refresh on CrI3 516 (6x6 k, nosym), measured.
 
     lx run -N 1 -G 4 -n 4 -- python3 -u tests/tdagw/_spm_refresh_516_case.py \\
         --spm-ref <516>/lorrax/04_gw_oneshot_mpa_eqp --ref <516>/lorrax/07_gw_gnppm_bundle \\
         --out DIR --sections SP0,SPC,SPF
 
-docs/theory/td_agw_dynamical.md §1.4, §7.1 (shared-pole member).  One JSON file
+docs/theory/td_agw_dynamical.md §1.4, §7.1 (tangential member).  One JSON file
 DIR/spm_516.json (rank 0; rewritten after every section) and ``RESULT {...}``.  The
 04 and 07 arms are read-only: the source is the production one
 (``tdagw.dynsig.gw_window_source`` on a copy of the 04 deck in DIR/driver), the TD
@@ -23,7 +23,7 @@ SPC  states (rho_eq and the hot state, --hot-amount of band b_lo+1 moved to b_lo
 SPF  rho_eq propagated --eq-fs with the collision on (refresh every --refresh-fs):
      max|rho - rho_eq| and the held Delta Sigma^h per variant (both zero to round-off)
 SPD  driven runs: --cd-pulses x --cd-cadences x --cd-variants (V1, V2, frozen = the
-     equilibrium shared-pole W throughout): P(t), n_c, Tr rho, every refresh's record
+     equilibrium tangential W throughout): P(t), n_c, Tr rho, every refresh's record
      (walls, census, K, gates), compiles; the populations at the pulse peak and the end
      of each run are saved (DIR/states_<tag>.npz) and refitted (SPC's measurements)
 SPE  eta: the source rerun at sigma_regularization_ev = --eta-low (deck override; the
@@ -63,7 +63,7 @@ def _v2_sites(recipe, low_line, low_imag, height_ev):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--spm-ref", required=True, help="the shared-pole GW arm (04)")
+    ap.add_argument("--spm-ref", required=True, help="the tangential GW arm (04)")
     ap.add_argument("--ref", required=True, help="the TD bundle arm (07): bundle_input, dipoles")
     ap.add_argument("--bands", type=int, nargs=2, default=(128, 132))
     ap.add_argument("--out", required=True)
@@ -80,7 +80,7 @@ def main():
                     help="SPD: skip the refits and eta rates at the peak / end states")
     ap.add_argument("--hot-amount", type=float, default=0.05)
     ap.add_argument("--eta-list", default="", help="SPC: window-sweep Lorentzians, eV (default: the "
-                    "source's; the shared-pole Sigma stage refuses any other: the recipe stamps eta)")
+                    "source's; the tangential Sigma stage refuses any other: the recipe stamps eta)")
     ap.add_argument("--eq-fs", type=float, default=2.5)
     ap.add_argument("--refresh-fs", type=float, default=0.5)
     ap.add_argument("--refresh-df", type=float, default=1e-3)
@@ -162,7 +162,7 @@ def main():
         src = D.gw_window_source(spm_deck, mesh, workdir=os.path.join(os.path.abspath(a.out), "driver"),
                                  screening=True, say=say)
         meta = src["meta"]
-        rec0 = meta.shared_pole_recipe
+        rec0 = meta.tangential_recipe
         out["source"] = dict(wall_s=src["wall_s"], rc=src["rc"], member=src["member"],
                              nk=int(meta.nk_tot), n_mu=int(meta.n_rmu), memory_after=mem(),
                              eta_ev=float(src["config"].sigma.regularization_ev),
@@ -208,7 +208,7 @@ def main():
     def model_path(V, label):
         """The model file of variant V's refit ``label`` (its scratch slot)."""
         hits = sorted(glob.glob(os.path.join(os.path.abspath(a.out), f"refits_{V}",
-                                             label + "_shared_pole", "**", "*.h5"), recursive=True))
+                                             label + "_tangential", "**", "*.h5"), recursive=True))
         hits = [h for h in hits if "model" in os.path.basename(h)] or hits
         return hits[0] if hits else None
 
@@ -339,7 +339,7 @@ def main():
                 colls[V] = D.window_collision(
                     src, sysw.ops, mesh=mesh, k_frac=sysw.hdr["kpts"], b_lo=b_lo, ntr=1,
                     form="subtracted", hermitian="dynamic", sweep="active",
-                    screening="shared_pole", spm_support_sites=sites[V],
+                    screening="tangential", spm_support_sites=sites[V],
                     spm_scratch=os.path.join(os.path.abspath(a.out), f"refits_{V}"),
                     spm_chi0_active=blocks_of(V), say=say)
                 t0r = colls[V]["t0"]
@@ -418,7 +418,7 @@ def main():
                             dtm_as=dtm_as, efield=efield, collision="subtracted",
                             refresh_fs=refresh_fs, refresh_df=refresh_df, sweep="active")
         if variant != "frozen":
-            raw["lorrax"]["collision_screening"] = "shared_pole"
+            raw["lorrax"]["collision_screening"] = "tangential"
             raw["lorrax"]["collision_source"] = spm_deck
             if sites[variant]:
                 raw["lorrax"]["collision_spm_support_sites_ev"] = sites[variant]
@@ -572,7 +572,7 @@ def main():
                 src_e = D.gw_window_source(
                     spm_deck, mesh, workdir=os.path.join(os.path.abspath(a.out), f"driver_{key}"),
                     screening=True, overrides={"sigma_regularization_ev": eta_e}, say=say)
-                re_ = src_e["meta"].shared_pole_recipe
+                re_ = src_e["meta"].tangential_recipe
                 spe[key] = dict(eta_ev=eta_e, source=dict(
                     wall_s=src_e["wall_s"], eta_ev=float(src_e["config"].sigma.regularization_ev),
                     K=[min(src_e["model"]["K"]), max(src_e["model"]["K"])],
@@ -587,7 +587,7 @@ def main():
                     ce = D.window_collision(
                         src_e, sysw.ops, mesh=mesh, k_frac=sysw.hdr["kpts"], b_lo=b_lo, ntr=1,
                         form="subtracted", hermitian="dynamic", sweep="active",
-                        screening="shared_pole", spm_support_sites=v2e,
+                        screening="tangential", spm_support_sites=v2e,
                         spm_scratch=os.path.join(os.path.abspath(a.out), f"refits_{key}_{V}"),
                         spm_chi0_active=blocks_of(V), say=say)
                     se = dict(t0_line=ce["t0"].get("line", ""), sites=v2e, states={})
@@ -645,7 +645,7 @@ def sv3(coll, f_hot_b, src, say):
     if jax.process_index() != 0:
         return None
     dev = jax.local_devices()[0]
-    recipe = scr["meta"].shared_pole_recipe
+    recipe = scr["meta"].tangential_recipe
     codes = recipe["role_codes"]
     z, role = np.asarray(recipe["z_ry"]), np.asarray(recipe["role"])
     fit_m = np.isin(role, [codes["line"], codes["imaginary"]])

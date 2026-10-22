@@ -3802,8 +3802,8 @@ def metal_response_nodes(omegas, config, *, metal):
     """The z at which the head operands are evaluated for each plan node.
 
     An insulator's nodes unchanged; a metal's static rows at ``z = 0``: the
-    head kernels here and the shared-pole Gamma body
-    (``shared_pole_head.build_shared_pole_head``), so the static fold is
+    head kernels here and the tangential Gamma body
+    (``tangential_head.build_tangential_head``), so the static fold is
     real on an ordered store too.
     """
     if not metal:
@@ -3845,16 +3845,16 @@ def head_quadrature_omegas(config) -> tuple[complex, ...]:
     ``M_1`` (:func:`head_moment_m1`, ``gw.mpa.model._pin_static_head_sample``).
     None when the head is off; none for the BGW finite-q0 head, whose
     samples are finite-q epsilon rows of the body's own chi samples; and none
-    for the four-current sector head (``bispinor_gw = full_shared_pole``,
-    ``gw_config.uses_direct_bispinor_shared_pole_head``), which has no scalar
+    for the four-current sector head (``bispinor_gw = full_tangential``,
+    ``gw_config.uses_direct_bispinor_tangential_head``), which has no scalar
     pole fit to pin (its rows were built and never read).
     """
     from gw.gw_config import (HeadCorrection, coerce_head_correction,
-                              uses_direct_bispinor_shared_pole_head)
+                              uses_direct_bispinor_tangential_head)
     head = config.head
     if (coerce_head_correction(getattr(head, "correction", HeadCorrection.FULL))
             is HeadCorrection.OFF or bool(getattr(head, "uses_bgw_metal_q0shift", False))
-            or uses_direct_bispinor_shared_pole_head(config)):
+            or uses_direct_bispinor_tangential_head(config)):
         return ()
     xi, _ = head_quadrature_rule()
     return tuple(1j * float(x) for x in xi)
@@ -4573,7 +4573,7 @@ def build_dft_head_response(
     dipole file while the body uses ``number_bands_chi`` is refused by shape
     and slicing here rather than silently mixing transition manifolds.
 
-    ``S_direct`` needs no time-reversal assumption (``gw.shared_pole_head``
+    ``S_direct`` needs no time-reversal assumption (``gw.tangential_head``
     docstring), so this is also the head an ordered store folds.
 
     ``occupation_state`` is the metal's fixed-N Fermi-Dirac state on this

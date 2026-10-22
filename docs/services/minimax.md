@@ -26,7 +26,7 @@ and `certified=False`.
 | `fit_damped_reciprocal(rectangles, *, target_error, ...)` | One positive rule `1/d ≈ Σ w e^{−d t}` for `1/(x − iγ)` over rectangles `(x_min, x_max, γ_min, γ_max)`, `x_min > 0`. | `gw.mpa.sigma_windows` |
 | `damped_line_rule`, `damped_rectangle_rule`, `damped_rectangle_gauss_rule`, `damped_rectangle_positive_rule` | MPA positive-time line and rectangle rules, § [Damped MPA rules](#damped-mpa-rules). | `gw.mpa.model` |
 | `augment_odd_laplace(times, x_min, x_max, omega, *, tolerance, max_extra=16)` | Odd GN-PPM channel on the even rule's times, § [Odd imaginary-axis channel](#odd-imaginary-axis-channel). | `gw.minimax_screening` |
-| `response_group_rules`, `ResponseGroupTree`, `response_laplace_rule`, `response_bank_rule` | Shared-pole response rules, § [Response-bank rule sessions](#response-bank-rule-sessions). | `response_group_rules`, `ResponseGroupTree`: `gw.response_bank`; `response_laplace_rule`: `gw.minimax_screening`; `response_bank_rule`: none |
+| `response_group_rules`, `ResponseGroupTree`, `response_laplace_rule`, `response_bank_rule` | Tangential response rules, § [Response-bank rule sessions](#response-bank-rule-sessions). | `response_group_rules`, `ResponseGroupTree`: `gw.response_bank`; `response_laplace_rule`: `gw.minimax_screening`; `response_bank_rule`: none |
 | `matsubara_response_rule(beta_ry_inv, delta_max_ry, n_indices, *, rel_tol=1e-8)` | Finite-temperature KMS-paired imaginary-time rule, § [Matsubara rules](#finite-temperature-matsubara-rules). | `gw.w_isdf` |
 | `positive_reciprocal`, `odd_reciprocal`, `damped_line_reciprocal` | Analytic constructions on three one-dimensional reciprocal domains, § [Analytic reciprocal constructors](#analytic-reciprocal-constructors). | none directly; `analytic_line_box_rule` wraps the line rule |
 
@@ -83,7 +83,7 @@ derivatives are with respect to s = z². No rule sees band masks, occupations
 or response arrays, and none certifies W or Σ accuracy.
 
 * **`response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
-  decay_rate=0)`** (the shared-pole bank). A stacked Hankel shift pencil
+  decay_rate=0)`** (the tangential bank). A stacked Hankel shift pencil
   proposes complex Laplace times shared by every forward (z) and reverse
   (−z̄) pole of a sample group; linear projection fits 1/(d − p) and
   1/(d − p)² on those nodes. Each node is one Green-pair evaluation A(t):
@@ -108,7 +108,7 @@ or response arrays, and none certifies W or Σ accuracy.
   OpenBLAS (numpy's and scipy's) at min(16, CPUs of the affinity mask) threads
   (the pin of `analytic_box_rule`): the pencil's QR,
   SVD and least squares pick different times at different thread counts, and
-  the shared-pole W poles inherit them.
+  the tangential W poles inherit them.
 * **`ResponseGroupTree(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
   decay_rate=0)`** (the same build, one node at a time). Nodes are tuples of
   sample indices; `children(node)` gives the two halves, `tried(node)` is False

@@ -512,7 +512,7 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     QR/SVD, eigvals and least squares sum in a thread-count dependent order,
     and a different order picks different node times (Fe 4^3 map-1 group:
     one node count, three time digests at 8, 16 and 32 threads, P2-S
-    2026-09-25). The shared-pole W poles inherit these rules.
+    2026-09-25). The tangential W poles inherit these rules.
 
     Every node t is ONE Green-pair evaluation A(t): forward rows use the
     exponential exp[-(d-reference_ry)*t] and fit 1/(d-z); reverse rows use

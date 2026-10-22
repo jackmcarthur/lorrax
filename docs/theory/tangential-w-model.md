@@ -1,6 +1,6 @@
-# The shared-pole screened interaction {#shared-pole-theory}
+# The tangential screened interaction {#tangential-theory}
 
-`sigma_w_model = shared_pole` represents the correlation part of the screened
+`sigma_w_model = tangential` represents the correlation part of the screened
 interaction, $W_c=W-v$, in the ISDF centroid basis by **one set of real poles
 per parent $q$, shared by every matrix element, with one factor vector per
 pole**. The poles and factors are the Ritz pairs of a Hermitian pencil
@@ -13,13 +13,13 @@ target.
 
 This page owns the model and its derivation. How the samples are streamed,
 reduced, sharded, stored and consumed, the gate rows and the byte model are
-[the shared-pole implementation page](../architecture/shared_pole_model.md),
-and for the bispinor sectors [their implementation page](../architecture/bispinor_shared_pole_w.md);
+[the tangential implementation page](../architecture/tangential_model.md),
+and for the bispinor sectors [their implementation page](../architecture/bispinor_tangential_w.md);
 deck keys are in the [input reference](../input_reference.md); the $\Sigma$
 frequency quadrature is [the Sigma quadrature problem](sigma-quadrature-problem.md);
 rebuilding the model inside a QSGW loop, and the magnetic little-group
 realization of the stored model, are in
-[self-consistency](../self_consistency.md#shared-pole-w-with-retained-quadrature).
+[self-consistency](../self_consistency.md#tangential-w-with-retained-quadrature).
 
 Notation: $n=N_\mu$ is the packed centroid count; a response at momentum $q$
 is an $n\times n$ matrix acting with the Coulomb congruence $v_q$. Frequencies
@@ -292,7 +292,7 @@ One real-time $\chi_0$ stream per parent evaluates $W_c$ and $\partial_sW_c$ at
 a fixed set of **supports** $z_a$: points on the damped line $z=\omega+ih$ and
 on the imaginary axis $z=iu$. $W$ is never formed at a real frequency; one
 occupation-weighted time rule covers the whole active transition interval
-([the bank](../architecture/shared_pole_model.md#2-the-response-bank)), and the
+([the bank](../architecture/tangential_model.md#2-the-response-bank)), and the
 moments are exact band sums. Production uses at least 18 fitted supports and at
 most 40 bank samples including the held diagnostic supports; the $M_1/M_3$ block
 is additional.
@@ -309,7 +309,7 @@ Placement is a condenser problem, not a choice of interesting frequencies:
   $\eta$-broadened density of the crossings $|E-\epsilon_{mk}|$ that contour
   deformation actually meets for the **reads**: every requested state's input
   energy $\pm 5$ eV on the $\Sigma$ step (`gw.qp_support.requested_reads_ev` with
-  `shared_pole_recipe.SUPPORT_READ_PAD_EV`; the $\Sigma$ plan itself pads 2 eV),
+  `tangential_recipe.SUPPORT_READ_PAD_EV`; the $\Sigma$ plan itself pads 2 eV),
   so the line reaches every state the run asks for. Their count is the strip law
   $n=\lceil(\Omega_R-h)\ln(4/\epsilon)/(\pi h)\rceil$, $\Omega_R=\max|E_{\rm read}-\mu|$,
   $\epsilon=10^{-3}$: $W(x+ih)$ is analytic in a strip of half-width $h$, so a
@@ -610,7 +610,7 @@ by up to 14 meV and closing the gap by 0.77 meV, with no head or small-$q$
 origin (claim 2371) — and the full ordered model reproduces an exact
 contour-deformation reference to 0.017 meV at the own energy (claim 2388).
 
-## 8 The pole count {#shared-pole-pole-count}
+## 8 The pole count {#tangential-pole-count}
 
 ### 8.1 Three sizes
 
@@ -635,7 +635,7 @@ The retained rank is the smaller of
 2. the **pole budget** $\lceil1.8\,N_\mu\rceil$, largest first, per parent.
    The cut never splits a degenerate multiplet: a member tied to its
    neighbour below the cut leaves with it, so $K$ can sit a few below the
-   budget at a high-symmetry parent (`gw.shared_pole_reduction`).
+   budget at a high-symmetry parent (`gw.tangential_reduction`).
 
 Where the port-space spectrum is rich the budget binds; where it cuts first
 the natural rank does. $K/N_\mu$ alone does not say which.
@@ -670,7 +670,7 @@ a convergence statement.
 
 ## 9 Signed interactions: the photon sectors
 
-The four-current route (`bispinor_gw = full_shared_pole`) builds the same model
+The four-current route (`bispinor_gw = full_tangential`) builds the same model
 per sector (CC, TT, and the joint CT span) from the paramagnetic response
 $\chi_p(z)=C(zJ-H_0)^{-1}C^\dagger$, with particle/hole signature $J$,
 positive transition energies in $H_0$, and the square roots of positive
@@ -695,7 +695,7 @@ the assembled photon matrix; the assembled model is judged by its integrated
 $\Sigma$. Which channel carries which frequency model is
 [four-current heads and frequency](four-current-head-corrections.md); how the
 sectors are built and consumed is
-[shared-pole W for bispinor sectors](../architecture/bispinor_shared_pole_w.md).
+[tangential W for bispinor sectors](../architecture/bispinor_tangential_w.md).
 
 ## Appendix A. The resolvent identity
 

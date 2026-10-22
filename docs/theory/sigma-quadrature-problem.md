@@ -2,12 +2,12 @@
 
 Every dynamic self-energy reaches one planner and one executor through
 `gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`: GN/HL-PPM (written as a
-one-pole in-memory store), elementwise MPA, the shared-pole W and its photon
+one-pole in-memory store), elementwise MPA, the tangential W and its photon
 sectors. The planner is `gw.sigma_box_plan`, the rule builder the derived
 `minimax.analytic_box_rule` (§7), the τ kernel `gw.ppm_tau_kernel`. Pole models
 belong to [Multipole frequency integration](THEORY_mpa_implementation.md),
 [Metallic MPA screening](metallic-mpa-screening.md) and the
-[shared-pole model](../architecture/shared_pole_model.md); this page owns the
+[tangential model](../architecture/tangential_model.md); this page owns the
 frequency integral. The frequencies are the states' own evaluation energies
 ([on-shell Σ_c](sigma-on-shell.md)).
 
@@ -95,7 +95,7 @@ On the resident-pole route (GN/HL one-pole store, elementwise MPA) poles are
 read in batches of `mpa_pole_batch_size` (1–8, default 4), and a window runs
 once per batch that holds any of its poles, so a window over N_p poles pays
 ⌈N_p/b⌉ G builds and convolutions per node. The one-pole store is one batch.
-The shared-pole route synthesizes W(τ) for all poles inside each node and
+The tangential route synthesizes W(τ) for all poles inside each node and
 pays each node once.
 
 ## 4. Product windows
@@ -167,7 +167,7 @@ mass-weighted fit is what loses such a state.
 
 ε is `sigma_quadrature_eps`, the only accuracy dial, read the same way on
 every Σ route (GN/HL-PPM, MPA, shared pole). The default is 10⁻⁴ (the
-`relaxed` shared-pole tier defaults to 5·10⁻⁴); the
+`relaxed` tangential tier defaults to 5·10⁻⁴); the
 [input reference](../input_reference.md) owns both.
 
 Because the windows partition the tuples, a state's delivered error is one
@@ -258,7 +258,7 @@ the map-0 grid (`sigma_box_plan._sc_padded_box_spec`):
   neighbouring window, whose certificate covers it.
 - **Poles**: near edges and widths padded by 10 %; the far edge of a window
   whose pole selector has no upper bound (pole tail, bulk and ω tail, §4) by
-  a factor 2, because the highest shared-pole mode moves 10–30 % per map
+  a factor 2, because the highest tangential mode moves 10–30 % per map
   (Fe 4³ charge SC, map 2: 24.2 → 28.6 Ry) and a sign-definite relative rule
   pays about one node for the doubled edge. A four-current sector's pole
   treatment ceiling is included in the box.
@@ -305,7 +305,7 @@ OpenBLAS at min(16, CPUs of the mask), so a rule's bytes are a function of
 (box, ε) on one machine class for every mask of 16 or more CPUs.
 
 **Request scope.** Within one run a rule is reused only through an in-process
-scope. The shared-pole route keys the scope by the map's physical identity
+scope. The tangential route keys the scope by the map's physical identity
 (energies, occupations and recipe, with the SC map label stripped), η, ε and
 the pole census; the PPM and MPA routes use one scope per run. A sector Σ
 call scopes by the union census of its CC, TT and CT_C models, so the four
@@ -329,7 +329,7 @@ travels as data and raises on every rank.
   folds each Σ(τ_l) into the window's frequencies; nothing returns to the
   host between nodes. The resident-pole route builds W(τ_l) from the pole
   batch's residues.
-- **Shared-pole and sector routes.** The same window executable also
+- **Tangential and sector routes.** The same window executable also
   synthesizes W(τ_l) = b d(τ_l) b† from factors read once per Σ call: the
   scalar route at the irreducible parents, then unfolded to the full q grid;
   a sector from its endpoint factors on the full grid.

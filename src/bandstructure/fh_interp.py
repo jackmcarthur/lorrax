@@ -1657,7 +1657,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     # Route completeness for every htransform / BSE stage after this entry
     # (htransform, exciton_bands, bse_k_grid, vq_interp): a whole matrix of
     # side >= N_mu/2 on a rank needs a mesh route (GATE nmu2_no_backup), as
-    # gw.shared_pole_recipe sets it for GW.
+    # gw.tangential_recipe sets it for GW.
     from lxkit import memory
     memory.set_nmu(int(meta.n_rmu))
     nsigmarange, enk_sigma = load_wfns_and_enk_for_sigma(wfn, sym, nval, ncond, nband)

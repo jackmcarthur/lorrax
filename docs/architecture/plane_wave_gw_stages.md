@@ -50,7 +50,7 @@ not wired.
 - Insulators (the MPA plan and the Σ executor run with `material_class = insulator`),
   bulk (`SphereScreening` is built with `sys_dim = 3`), and the MPA W only: the deck's
   `sigma_w_model` is not read, and `compute_sigma_c_mpa_omega_grid` refuses a
-  `tau_kernel_factory` on the shared-pole route.
+  `tau_kernel_factory` on the tangential route.
 - No Γ head: v(q + G = 0) = 0 and the Γ W is the head-removed body. A deck compared
   against it needs `head_correction = off` and `mc_average_vcoul_body = false`; the
   comparison decks also set `bare_coulomb_cutoff = 25` (claims 2864, 2868).
@@ -162,8 +162,8 @@ that partner path first.
 
 ## Not built
 
-- A shared-pole W on the plane-wave sphere with Σ_c through the shared-pole route:
-  `construct_shared_poles` must first take a bank reader and a basis axis.
+- A tangential W on the plane-wave sphere with Σ_c through the tangential route:
+  `construct_tangential_poles` must first take a bank reader and a basis axis.
 - The bispinor pathway, and a convergence study against ISDF gwjax and BerkeleyGW.
 - The Γ head and wings: the wing producer and the head owner's S(z)
   (`SphereScreening.gamma_head` exists; the pipeline does not call it).

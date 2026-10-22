@@ -99,12 +99,12 @@ class observe_window_sigma_source:
     TD-aGW's collision term (docs/theory/td_agw_dynamical.md §1.5, §9 item 5)
     evaluates ``gw.ppm_sigma.window_sigma_c`` on the GW run's own carrier and
     screening model.  A GN-PPM run persists W(0) but neither W(i w_p) nor its
-    poles, and a shared-pole one-shot keeps its ``model.h5`` but not the inputs
+    poles, and a tangential one-shot keeps its ``model.h5`` but not the inputs
     of its W stage, so the TD driver runs the GW driver in its own process and
     reads them here: no stage is re-implemented and the driver's outputs are
     unchanged (with no open block every seam is one empty list test).
     ``with observe_window_sigma_source() as src: gw_jax.main(...)`` leaves in
-    ``src``: ``member`` (``"gn_ppm"`` or ``"shared_pole"``), ``wfns`` (the Sigma
+    ``src``: ``member`` (``"gn_ppm"`` or ``"tangential"``), ``wfns`` (the Sigma
     carrier), ``meta``, ``config``, ``head`` (``HeadSigmaDiag`` or None),
     ``efermi_ry``, ``request`` (the run's ``OnShellRequest`` or None) and
 
@@ -114,13 +114,13 @@ class observe_window_sigma_source:
       ``W_supports`` (copies of the fit's two W samples, W(0) and W(probe) on
       the fit's q set, taken right after the fit), the held inputs of the
       GN-PPM screening update (``gw.ppm_sigma.screening_update``, Eq. 6);
-    * shared pole (``gw.sigma_dispatch``'s scalar shared-pole Sigma stage):
+    * shared pole (``gw.sigma_dispatch``'s scalar tangential Sigma stage):
       ``model`` (the screening handle: ``path``, ``identity``, ``digest``,
       ``K``), ``occupation_state`` (the run's), ``linalg``; ``screening=True``
       also ``screening_inputs``, the arguments of the run's
-      ``gw.shared_pole_screening.screen_shared_poles`` (``wfns``, ``V_q``,
+      ``gw.tangential_screening.screen_tangential_poles`` (``wfns``, ``V_q``,
       ``meta``, ``config``, ``kwargs``), taken at its entry: the held inputs of
-      the shared-pole refit (the W stage re-run at other occupations), and
+      the tangential refit (the W stage re-run at other occupations), and
       ``recipe_inputs`` (``gw.gw_jax``'s census inputs and requested reads),
       with which the refit re-resolves the recipe at its own census.
 
@@ -571,7 +571,7 @@ def _extrapolation_reads(sigma_omega, *, e_state_ev, wfn):
     order against DFT, the DFT energy by index gave the two members of one
     doublet two tail ratios and split it (bcc Na 3^3, map 1: 2.5 meV at
     k = (1/3,1/3,1/3)), and the next W broke the crystal symmetry
-    (GATE shared_pole_gram_valid at map 2).  One-shot and SC map 0 read E_DFT.
+    (GATE tangential_gram_valid at map 2).  One-shot and SC map 0 read E_DFT.
     One owner for the run's fit (:func:`_report_band_extrapolation`) and the
     checkpoints' (:func:`evaluate_band_checkpoints`).
     """

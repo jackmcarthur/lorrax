@@ -433,8 +433,8 @@ a pole field read from its q wedge, with the endpoint actions $\mathcal L_k$, $\
 **Mode 11** serves three χ₀ streams of `gw.w_isdf`:
 
 - the identity-vertex step response;
-- the selected-q charge streams of the shared-pole response bank (the χ₀
-  samples the W model is fitted to; [shared-pole model](shared_pole_model.md)):
+- the selected-q charge streams of the tangential response bank (the χ₀
+  samples the W model is fitted to; [tangential model](tangential_model.md)):
   the direct stream, the retarded stream and the static correlation obtained
   through the Kubo–Martin–Schwinger (KMS) relation. Each node's correlation
   $r$ is transformed once, and its rows at $q$ and $-q$ are combined by the

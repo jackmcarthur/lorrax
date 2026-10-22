@@ -149,7 +149,7 @@ rulings override anything here.
   `band_extrapolation_is_consumable` is true when any stage is GN/HL-PPM, or
   is MPA with a Σ_c that runs the scalar pole-sum executor
   (`mpa_sigma_runs_scalar_executor`: scalar decks and both bispinor
-  shared-pole routes, `bare_transverse` and `full_shared_pole`; the latter
+  tangential routes, `bare_transverse` and `full_tangential`; the latter
   brackets its CC class only).
 - **`sigma_stage_modes`** returns every mode the run dispatches Σ under, in
   order: the staged ladder when `config.sc.stages` exists, else the one
@@ -171,9 +171,9 @@ rulings override anything here.
 
 - **`HeadCorrection`**: `full` (the default: an irreducible direct response is
   completed with its microscopic head and wings exactly once, and a
-  micro-reducible response is used as is; on `bispinor_gw = full_shared_pole`
+  micro-reducible response is used as is; on `bispinor_gw = full_tangential`
   it is the first-order direct four-current Γ head, with no local-field fold
-  on that bank, `uses_direct_bispinor_shared_pole_head`; `folds_scalar_head`
+  on that bank, `uses_direct_bispinor_tangential_head`; `folds_scalar_head`
   names the folded scalar case), `off` (no special Γ-cell term, for
   brute-force k convergence; the one debug value).
 - **`ScreeningConfig`**: `method` exists only to refuse anything but `minimax`
@@ -209,7 +209,7 @@ rulings override anything here.
   eigh; the ζ back-solve is a whole-tile factor applied on its q owners under
   either value. `LinalgResolution.eigh_backend` (`local` → `auto`,
   `distributed` → `distributed`) is the eigh request of every whole-mesh site
-  (shared-pole face and staged plans, line selection, parallel-transport
+  (tangential face and staged plans, line selection, parallel-transport
   polar); none names a backend itself.
 - **`eigh_backend_choices`** reads `distrib_la.BACKEND_CHOICES`, which imports
   without any `.so`; a literal fallback covers a tree without `services/`, and
@@ -243,7 +243,7 @@ rulings override anything here.
 
 - **`BispinorGWMode`** is orthogonal to `ComputeMode`: it selects which Lorentz
   blocks are screened and contracted. Values: `bare_transverse` (the default),
-  `full_shared_pole`, `full_static_cohsex`. Retired spellings refuse by name
+  `full_tangential`, `full_static_cohsex`. Retired spellings refuse by name
   in `coerce_bispinor_gw_mode`, never aliased.
 - **`packed_static_envelope`** is the one table of the packed static photon
   operator's conditions. It yields `(accepted, got, want, klass, why,

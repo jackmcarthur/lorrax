@@ -178,7 +178,7 @@ def dump():
 
 # ---------------------------------------------------------------- summarize
 #: Thin wrappers whose caller is the real site.
-_HELPERS = ("placement.py:", "_slab_io_ffi.py:1296:", "shared_pole_directions.py:34:", "<lambda>", "<genexpr>",
+_HELPERS = ("placement.py:", "_slab_io_ffi.py:1296:", "tangential_directions.py:34:", "<lambda>", "<genexpr>",
             "collectives.py:634:replicate_to_mesh")
 
 

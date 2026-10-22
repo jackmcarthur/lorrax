@@ -266,14 +266,14 @@ switch to another head mid-run.
 | `sc_head_update` | velocity each map | reads | admitted on |
 |---|---|---|---|
 | `off` | none: the fixed DFT response | `dipole.h5` | every deck |
-| `dft_velocity` | $U^\dagger v_\mathrm{DFT}\,U$ | `dipole.h5`, or the artifact's velocity stage | insulators; metals with the shared-pole W and `head_correction = full` |
-| `parallel_transport` | $U^\dagger(v_\mathrm{DFT} + D_k\Delta H)\,U$ | the full link artifact | insulators; metals with the shared-pole W on a scalar or `full_shared_pole` deck |
+| `dft_velocity` | $U^\dagger v_\mathrm{DFT}\,U$ | `dipole.h5`, or the artifact's velocity stage | insulators; metals with the tangential W and `head_correction = full` |
+| `parallel_transport` | $U^\dagger(v_\mathrm{DFT} + D_k\Delta H)\,U$ | the full link artifact | insulators; metals with the tangential W on a scalar or `full_tangential` deck |
 | `interband_commutator` | $U^\dagger(v_\mathrm{DFT} + [\Delta H, \mathcal W])\,U$ | the artifact's velocity stage (`vnl_included = 1`) | insulators only |
 
-When `sc_head_update` is not named on an SC deck with the shared-pole W and
-the head on (scalar or `full_shared_pole`), it resolves to `parallel_transport`
+When `sc_head_update` is not named on an SC deck with the tangential W and
+the head on (scalar or `full_tangential`), it resolves to `parallel_transport`
 if `parallel_transport_file` exists (the dipole step writes it by default),
-else `dft_velocity` if `dipole.h5` exists, else `off` (a `full_shared_pole`
+else `dft_velocity` if `dipole.h5` exists, else `off` (a `full_tangential`
 deck takes `dft_velocity` even then, because its four-current bank reads
 `dipole.h5` on every route); the choice is printed under
 `[config provenance]`. Other combinations refuse by name
@@ -320,7 +320,7 @@ same velocity to `dipole_qsgw.h5`; what it holds and what it pairs with:
 
 ## 8. The four-current (bispinor) case
 
-On `bispinor_gw = full_shared_pole` (the route that screens the charge and
+On `bispinor_gw = full_tangential` (the route that screens the charge and
 current channels together; [bispinor GW](bispinor-gw.md)) the four-current
 bank builds a direct Γ head, the first-order $q \to 0$ head assembled from
 velocity matrix elements without a local-field fold
@@ -330,7 +330,7 @@ vertex $(\alpha_\mathrm{fs}/2)\,v_{nm}$ (`gw.photon_direct_head`). `off`
 builds it on the DFT state, `dft_velocity` on each map's state with the
 rotated `dipole.h5` velocity, `parallel_transport` with each map's
 $v_\mathrm{DFT} + D_k\Delta H$ (`gw.sc_iteration.photon_head_state`);
-`interband_commutator` refuses (`GATE full_shared_pole_head_update`). On
+`interband_commutator` refuses (`GATE full_tangential_head_update`). On
 `bare_transverse` decks (the default route: charge screening plus the bare
 transverse interaction) `parallel_transport` refuses on metals. The static
 Hall current of the packed static photon head

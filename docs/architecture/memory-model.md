@@ -111,8 +111,8 @@ a provider context under `linalg = local` carries it as its `outside` term
 |---|---|
 | W Dyson (`gw.w_isdf._dyson_route`) | local: faces + $16\mu^2(3\lceil Q/P\rceil + 2)$; distributed: faces + one LU pair + contexts |
 | SC eigh, density scan (`gw.sc_iteration`, `gw.qsgw_density`) | one $(n_b, n_b)$ tile within 1 % of `B`; cuSOLVERMp eigh / `band_2d` |
-| shared-pole whole parents, constructor, staged eigh stacks (`gw.shared_pole_execution`) | the local route's compiled programs; the face / whole mesh + contexts |
-| head Γ GEMM (`gw.shared_pole_head._gamma_gemm_route`), ζ face GEMMs | staged where its program compiled fits the room (`distrib_la.staged_fits`); `panel_matmul` faces |
+| tangential whole parents, constructor, staged eigh stacks (`gw.tangential_execution`) | the local route's compiled programs; the face / whole mesh + contexts |
+| head Γ GEMM (`gw.tangential_head._gamma_gemm_route`), ζ face GEMMs | staged where its program compiled fits the room (`distrib_la.staged_fits`); `panel_matmul` faces |
 | transverse ζ factor, Galerkin factor, coarse V(q) chunk | each route's own program compiled (`runtime.aot_memory.compiled_price`) |
 | htransform node-pair stages: fine-q top block, path and active window, orbital operators, moment grid (`bandstructure.fh_interp.admit_node_route`) | `q-batched`: whole $(N_B, N_B)$ matrices of the rank's q rows after one face→q exchange; `face`: one q tiled over the mesh (`linalg = distributed` pins it); each route's program compiled, the chosen executable then run |
 | nodal fit: quadrature metric, node Gram (`isdf.galerkin`) | host orbit-folded blocks of at most 64 MiB; the Gram on the face with the `distrib_la` eigh plan |
@@ -123,7 +123,7 @@ a provider context under `linalg = local` carries it as its `outside` term
   lowered and compiled at its abstract operands: `temp + outputs − alias` plus
   cuFFT plan scratch (`runtime.aot_memory.compiled_new_bytes`), the largest any
   rank read. Where the program then runs, the priced executable is the one
-  executed (the response bank, the ζ tile passes, the shared-pole rounds), so a
+  executed (the response bank, the ζ tile passes, the tangential rounds), so a
   price costs no extra compile. `check_chunk` corrects a chunk once from that
   figure ([§ The compiled check](#the-compiled-check)).
 - **Proposals, then the run's check.** Where the program that will run is not
@@ -137,7 +137,7 @@ a provider context under `linalg = local` carries it as its `outside` term
   the minimum over ranks); over it, twice the rounds while a rank's share still
   shrinks, each compiled only when the one before is over, and when none fits the
   smallest runs under `admit`'s warning. Every rank runs the largest choice any rank made. A local reduction round is admitted
-  at its compiled round program (`shared_pole_execution.price_round`). The receipt
+  at its compiled round program (`tangential_execution.price_round`). The receipt
   shows the proposal; the run's check prints when it is over.
 - **Room classes.** A room enters a program or a price only through tests of
   compiled figures against it (`distrib_la.room_test`: `place()`'s fit and
@@ -313,7 +313,7 @@ response sample on the response rows. When every sample's carry does not fit
 one group on the devices, the stream runs once with every sample, and each
 finished row pass goes to SlabIO's per-rank streamed tier
 ([SlabIO](slab_io.md#streamed-tier); `response_bank.response_bank_residence`,
-the shared-pole bank's device / host / file rule): host memory when it takes
+the tangential bank's device / host / file rule): host memory when it takes
 at most half the host budget, else one file per rank. The devices hold two
 pass carries, then three sample reads. Its size per map, over all ranks, is
 
@@ -328,7 +328,7 @@ Ni 20³ charge (22 samples, 1062 parents, μ 1782): 2.4 TB per map, 34.9 GiB
 per rank at P64. Fe 20³ bispinor (1062 parents, μ 1800, μ_T 900): 15.3 TB
 per map, which needs that much free scratch and quota. The W bank comes on
 top while the samples are solved
-([shared-pole model §10](shared_pole_model.md#10-byte-model)), and both are
+([tangential model §10](tangential_model.md#10-byte-model)), and both are
 released within the map.
 
 When the disk or quota cannot hold the bank on some rank, the samples
@@ -348,7 +348,7 @@ G_tile = 16 · N_k · n_s² · μ² / P          bytes per rank
 
 `G_tile` is one k-resolved spinor `(μ, ν)` operator (`G`, `W`, `V`) sharded
 `P(None, 'x', 'y')`. The screening and Σ stages hold a few of them; the
-shared-pole capacity ledger warns above `3U` with `U = G_tile`. The ζ-fit
+tangential capacity ledger warns above `3U` with `U = G_tile`. The ζ-fit
 receipt prints every term as a `G_tile` ratio against a ceiling of
 `4·G_tile`, so a reader sees at once whether the fit, rather than the GW
 stages, sets the node count.
@@ -466,7 +466,7 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | ζ fit, current channels (bispinor) | the same, at μ_T, with three factors, accumulators and Z stores | `plan_zeta_route_g(n_vertex=3)` ([§ route G](#route-g-zeta-fit)) | warns; smallest μ-batch |
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | warns; one q |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
-| shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | warns and admits, when a stage and its named concurrent stages exceed the budget |
+| tangential screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([tangential model](tangential_model.md), byte model) | warns and admits, when a stage and its named concurrent stages exceed the budget |
 | static / GN-PPM screening | the χ₀ node ([§ Green-side](#the-green-side-stages)); the GN fit's q block (XLA's compiled footprint of one q) | `price_chi0_node` (a price, no choice); `_gn_ppm_fit_q_block`: the fixed tile, at least one q | warns; one q (only under `LORRAX_PPM_FIT_ARENA_GIB`) |
 | Σ(τ) sweep | the resident pole fields, band-complete ψ, then one row pass ([§ Green-side](#the-green-side-stages)) | `subtile_stream.plan_windows`: equal orbit-aligned windows, the pass count from the fixed tile and the shortest window that keeps it | — |
 | matrix-element sweep (V_H, four-current) | the step's slabs, and FFT boxes `(2 + 2·n_comp)·n_s·N_r·16` per band of a band-layout operator | `mtxel_sweep.plan_sweep`: bands in the fewest chunks whose boxes fit the fixed tile | — |
@@ -598,7 +598,7 @@ temporaries is compiled once at map 0 and never runs (Fe 8³: 2.3 s cold,
 | Σ τ window (`gw.mpa.sigma.SynthesisTau.admit`) | row pass | yes: the first window executable | the synthesis GEMM's native workspace and mode 7's split-arm scratch `S_7` (added); the passes are not re-solved |
 | ζ μ batch (`gw.isdf_fitting`, route G) | centroids per owner | yes: the batch executable, which the loop then runs | the lookahead batch's rows (its output, added) |
 
-The direct stream's group is the one shared-pole size that follows the
+The direct stream's group is the one tangential size that follows the
 budget: it fits the capacity ledger, then the compiled check above. The ledger
 does not own the ψ carriers and other residents live when W is built; the
 rule's `φ` ([§ Budget](#budget)) is all they have.
@@ -705,7 +705,7 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
 
 Every `common.timing` section is a tracker of `lxkit.memory`. A planner books its
 price to the section that allocates it, `memory.book(price, stage=...)` (the
-shared-pole ledger's `reserve(..., runs_in=...)`); that section waits on the work
+tangential ledger's `reserve(..., runs_in=...)`); that section waits on the work
 dispatched before it, meters the allocator's high-water from the booking, waits on
 its own work, and prints one rank-0 line:
 
@@ -722,7 +722,7 @@ arrays, allocator, the executables that ran) in either mode, without waits
 (`lxkit.memory_residuals`). An increment price
 (`priced(..., increment=True)`) adds the allocator's bytes in use at entry as its
 `operands` as a part of its own (`resident at stage entry`), read once per stage, so
-rows booked under one label cannot drop it. The shared-pole store's admissions are booked so, beside what the caller
+rows booked under one label cannot drop it. The tangential store's admissions are booked so, beside what the caller
 holds whether or not a live ledger row names it. The reader is the leg's `peak_reader`: CUDA's pool
 `CU_MEMPOOL_ATTR_USED_MEM_HIGH`, reset at each boundary (exact); BFC's
 `peak_bytes_in_use`, which never resets, exact where the stage raised the mark

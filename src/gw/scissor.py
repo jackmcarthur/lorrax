@@ -313,7 +313,7 @@ def sc_window_pad_ev(energy_relative_to_mu_ev):
 #: fit_scissor returned the no-information identity (alpha=1, beta=0, n=0,
 #: w=0), and every out-of-block state sat at its DFT energy while its
 #: in-block neighbour took the full Sigma correction (+4.7 to +4.9 eV on that
-#: deck).  That step is what destabilised the q=0 shared-pole pencil
+#: deck).  That step is what destabilised the q=0 tangential pencil
 #: (claim 2486).  1e-3 saturates at 6.9 widths -- +-1.9 eV at the same width,
 #: i.e. the intended "genuinely partial" manifold -- and is still far inside
 #: any real partial occupation (the docstring's O(0.1)).

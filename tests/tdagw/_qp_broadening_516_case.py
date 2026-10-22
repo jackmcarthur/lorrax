@@ -8,7 +8,7 @@ The window Sigma (``gw.ppm_sigma.window_sigma_c``) on the band block [--win), U 
 e = eps^DFT, f = the populations of the state, on the on-shell list (Sigma_ij(e_i),
 Sigma_ij(e_j), exact) and on a real grid (``omega_ry``: --step-ev from the DFT VBM -
 --below-ev to the DFT CBM + --above-ev; Sigma_ij(omega + i eta), the Lorentzian of the
-sweep).  Arms: the 04 shared-pole run at each --etas, the source rerun at that eta
+sweep).  Arms: the 04 tangential run at each --etas, the source rerun at that eta
 (``sigma_regularization_ev`` override: the recipe couples eta to W, so W is refitted at
 every eta), at rho_eq and at the hot state (--hot-amount of band 129 moved to 130 at
 every k) with W refitted there (``tdagw.dynsig.spm_refit``; V1 the production ladder,
@@ -174,7 +174,7 @@ def main():
                     continue
                 V = st.split("_")[1]
                 sites = "" if V == "V1" else _v2_sites(
-                    src["meta"].shared_pole_recipe, [float(x) for x in a.v2_line.split(",") if x],
+                    src["meta"].tangential_recipe, [float(x) for x in a.v2_line.split(",") if x],
                     [float(x) for x in a.v2_imag.split(",") if x], a.v2_height if a.v2_height > 0 else None)
                 scr = D.spm_screening(src, mesh=mesh, b_lo=128, n_active=4, support_sites=sites,
                                       scratch=os.path.join(os.path.abspath(a.out), f"refits_{V}_{eta:g}"))

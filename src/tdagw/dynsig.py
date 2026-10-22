@@ -55,7 +55,7 @@ Green tiles (nk, mu, s, nu, t) at P(None,'x',None,'y',None); chi0, W
 (nq, mu, nu) at P(None,'x','y'); W_R (mu, nu, kx, ky, kz) at
 P('x','y',None,None,None).  Every N_mu^2-class object is 2-D sharded.
 
-Prototype scope: static screening only (the GN-PPM / shared-pole members, the
+Prototype scope: static screening only (the GN-PPM / tangential members, the
 head of dchi0, the in-jit re-plan of the rule are design items of the theory
 page); the chi0 products are a reference implementation of the weight-row
 generalization that ``gw.w_isdf._get_chi_minimax_kernel_face`` needs.
@@ -775,7 +775,7 @@ def dynsig_model(dyn: dict, mesh_xy: Mesh, *, k_frac, rho_eq, screening: str = "
     from tdagw.self_energy import SelfEnergyModel, isdf_model
     if screening not in ("frozen", "static_rpa"):
         _refuse("dynsig_screening", repr(screening), "'frozen' | 'static_rpa'",
-                "the GN-PPM / shared-pole members are design items (theory page)")
+                "the GN-PPM / tangential members are design items (theory page)")
     iso = isdf_model(dyn["td"], mesh_xy, k_frac=k_frac, rho_eq=rho_eq)
     kern = make_dynsig_kernels(mesh_xy, dyn["kgrid"])
     rows = np.asarray(flat_k_rows(k_frac, dyn["kgrid"]), np.int64)
@@ -846,7 +846,7 @@ def gw_window_source(gw_deck: str, mesh: Mesh, *, workdir: str, screening: bool 
     """The collision term's source: the GW run's own carrier, screening model and head.
 
     A GN-PPM run persists W(0) but neither W(i w_p) nor its pole model, and a
-    shared-pole one-shot keeps its ``model.h5`` but not its W stage's inputs, so the
+    tangential one-shot keeps its ``model.h5`` but not its W stage's inputs, so the
     GW driver (``gw.gw_jax.main``) runs in this process on a copy of ``gw_deck`` in
     ``workdir`` (``write_restart_tensors = false``: the run's own restart is never
     written; ``overrides`` set deck keys of the copy) and
@@ -854,13 +854,13 @@ def gw_window_source(gw_deck: str, mesh: Mesh, *, workdir: str, screening: bool 
     return: no GW stage is re-implemented, and the window Sigma at rho_eq is the
     run's (§6.1).  Collective: every process calls it.  Must run outside another
     driver's ``RunSession`` (the GW driver owns the timing table and stdout while
-    it runs).  Returns the observer's dict (``member`` "gn_ppm" or "shared_pole",
+    it runs).  Returns the observer's dict (``member`` "gn_ppm" or "tangential",
     ``wfns``, ``meta``, ``config``, ``head``, ``efermi_ry``, ``request``; GN-PPM:
     ``poles``, ``V_q``, ``quad`` and with ``screening`` ``fit_plan``,
     ``W_supports``; shared pole: ``model``, ``occupation_state``, ``linalg`` and
     with ``screening`` ``screening_inputs``, ``recipe_inputs``) plus ``poles`` (the
     window Sigma's model: the ``PPMBuildResult``, or
-    ``gw.ppm_sigma.shared_pole_window_source`` of the run's model), ``plan``
+    ``gw.ppm_sigma.tangential_window_source`` of the run's model), ``plan``
     (``gw.ppm_sigma.window_sigma_plan`` on the run's own on-shell frequency list),
     ``deck``, ``workdir``, ``rc``, ``wall_s``.
     """
@@ -868,7 +868,7 @@ def gw_window_source(gw_deck: str, mesh: Mesh, *, workdir: str, screening: bool 
     import gw.gw_jax as gw_driver
     from jax.experimental import multihost_utils
     from gw.ppm_pipeline import observe_window_sigma_source
-    from gw.ppm_sigma import shared_pole_window_source, window_sigma_plan
+    from gw.ppm_sigma import tangential_window_source, window_sigma_plan
     t0 = time.perf_counter()
     workdir = os.path.abspath(workdir)
     copy = os.path.join(workdir, os.path.basename(gw_deck))
@@ -883,20 +883,20 @@ def gw_window_source(gw_deck: str, mesh: Mesh, *, workdir: str, screening: bool 
     finally:
         os.chdir(cwd)
     member = src.get("member")
-    if member not in ("gn_ppm", "shared_pole"):
+    if member not in ("gn_ppm", "tangential"):
         _refuse("dynsig_window_source", f"no window Sigma stage ran in {gw_deck}",
-                "a compute_mode = gn_ppm deck or a scalar sigma_w_model = shared_pole deck",
-                "point the source at a GN-PPM or shared-pole GW run")
+                "a compute_mode = gn_ppm deck or a scalar sigma_w_model = tangential deck",
+                "point the source at a GN-PPM or tangential GW run")
     mode = str(getattr(src["config"].compute_mode, "value", src["config"].compute_mode))
     if member == "gn_ppm" and mode != "gn_ppm":
         _refuse("dynsig_gnppm_mode", f"compute_mode = {mode}", "gn_ppm (the ordered GN fit the "
                 "branch rates are measured on)", "use a GN-PPM run")
-    if member == "shared_pole":
+    if member == "tangential":
         if screening and ("screening_inputs" not in src or "recipe_inputs" not in src):
-            _refuse("dynsig_spm_source", f"no shared-pole W stage observed in {gw_deck}",
-                    "a one-shot shared-pole run (its W stage runs in this process)",
+            _refuse("dynsig_spm_source", f"no tangential W stage observed in {gw_deck}",
+                    "a one-shot tangential run (its W stage runs in this process)",
                     "drop restart from the deck")
-        src["poles"] = shared_pole_window_source(src["model"], src["meta"],
+        src["poles"] = tangential_window_source(src["model"], src["meta"],
                                                  efermi_ry=src["efermi_ry"], linalg=src["linalg"])
     req = src["request"]
     freqs = None if req is None else np.asarray(req.frequencies_ry) + float(src["efermi_ry"])
@@ -905,14 +905,14 @@ def gw_window_source(gw_deck: str, mesh: Mesh, *, workdir: str, screening: bool 
                deck=os.path.abspath(gw_deck), workdir=workdir, rc=rc,
                wall_s=time.perf_counter() - t0)
     what = ("GN-PPM poles at the run's own W_0" if member == "gn_ppm" else
-            f"shared-pole model K {min(src['model']['K'])}-{max(src['model']['K'])}")
+            f"tangential model K {min(src['model']['K'])}-{max(src['model']['K'])}")
     say(f"  collision source: GW driver on {gw_deck} in {workdir} (rc {rc}, "
         f"{src['wall_s']:.1f} s): {what}, {int(src['meta'].nk_tot)} k, N_mu {int(src['meta'].n_rmu)}")
     return src
 
 
 #: ``window_collision``'s screening (``[lorrax] collision_screening``).
-COLLISION_SCREENINGS = ("frozen", "refreshed", "shared_pole")
+COLLISION_SCREENINGS = ("frozen", "refreshed", "tangential")
 
 
 def collision_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
@@ -1065,7 +1065,7 @@ def screen_populations(scr: dict, f_rows, *, valid_prev=None):
 
 
 # ===========================================================================
-# The shared-pole member: the W stage of the GW run re-run at the populations
+# The tangential member: the W stage of the GW run re-run at the populations
 # ===========================================================================
 
 #: Residue-weighted census cuts (eV): the weight of the poles below each.
@@ -1075,7 +1075,7 @@ CENSUS_BINS_EV = np.geomspace(1.0e-3, 2.0e2, 64)
 
 
 def pole_census(path, *, cuts_ev=CENSUS_CUTS_EV, bins_ev=CENSUS_BINS_EV) -> dict:
-    """Residue-weighted census of a shared-pole model file (host, h5py ``'r'``).
+    """Residue-weighted census of a tangential model file (host, h5py ``'r'``).
 
     For the ordered (W 16) or even (W 14) store, parent q's pole j has energy
     Omega_j = sqrt(Lambda_j) and residue R_j = b_j b_j^H / (2 Omega_j) on the
@@ -1182,13 +1182,13 @@ def chi0_active_group(enk, win: slice, request="auto"):
 
 def spm_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
                   support_sites: str = "", scratch: str, chi0_active=None) -> dict:
-    """The held objects of the shared-pole refit of the collision term (§1.4, §7.1).
+    """The held objects of the tangential refit of the collision term (§1.4, §7.1).
 
-    A refit is the GW run's own W stage (``gw.shared_pole_screening.
-    screen_shared_poles``: response bank -> moments -> constructor -> model)
+    A refit is the GW run's own W stage (``gw.tangential_screening.
+    screen_tangential_poles``: response bank -> moments -> constructor -> model)
     re-run at the instantaneous populations, with the recipe re-resolved at the
-    instantaneous census (``gw.shared_pole_recipe.bind_shared_pole_census`` +
-    ``resolve_shared_pole_recipe``).  Every input is the run's, taken at its seams
+    instantaneous census (``gw.tangential_recipe.bind_tangential_census`` +
+    ``resolve_tangential_recipe``).  Every input is the run's, taken at its seams
     (``gw_window_source(screening=True)``: ``screening_inputs``,
     ``recipe_inputs``): the W carrier (psi of every band at the centroids, eps^G,
     the step occupations), V, the symmetry tables and the run's occupation state
@@ -1205,7 +1205,7 @@ def spm_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
     (hole x electron) blocks FF, FA, AF, AA with F the other bands at their
     0/1 step (``gw.response_bank.response_blocks``): only AA crosses zero,
     every block's interval comes from band energies, and its rule is built at
-    the first refit and held for the run (``meta.shared_pole_response_blocks``).
+    the first refit and held for the run (``meta.tangential_response_blocks``).
 
     Returns dict: ``inputs`` (the run's W-stage arguments), ``recipe_inputs``,
     ``meta`` (the refit's metadata copy), ``config`` (the run's with the head off
@@ -1217,23 +1217,23 @@ def spm_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
     import copy as _copy
     from jax.experimental import multihost_utils
     from gw.gw_config import HeadCorrection
-    from gw.shared_pole_recipe import parse_support_sites
+    from gw.tangential_recipe import parse_support_sites
     from common.units import RYD_TO_EV
     if "screening_inputs" not in source or "recipe_inputs" not in source:
         _refuse("dynsig_spm_source", "a source without the run's W-stage inputs",
-                "gw_window_source(..., screening=True) on a shared-pole deck",
+                "gw_window_source(..., screening=True) on a tangential deck",
                 "rebuild the source with screening=True")
     inp = source["screening_inputs"]
     wfns_w, meta_run, config_run, kw = inp["wfns"], inp["meta"], inp["config"], inp["kwargs"]
     state = kw.get("occupation_state")
     f_eq = np.asarray(jax.device_get(wfns_w.occ if state is None else state.f_kn), np.float64)
-    mu = (float(meta_run.shared_pole_census["mu_ry"]) if state is None else float(state.mu_ry))
+    mu = (float(meta_run.tangential_census["mu_ry"]) if state is None else float(state.mu_ry))
     win = slice(int(b_lo), int(b_lo) + int(n_active))
     enk_w = np.asarray(jax.device_get(wfns_w.enk), np.float64)
     enk_s = np.asarray(jax.device_get(source["wfns"].enk), np.float64)
     if enk_s.shape[0] != enk_w.shape[0] or not np.array_equal(enk_s[:, win], enk_w[:, win]):
         _refuse("dynsig_spm_carriers", "the Sigma and W carriers' window energies differ",
-                "one k order and band axis", "run the shared-pole source on an identity-only grid")
+                "one k order and band axis", "run the tangential source on an identity-only grid")
     if np.any((f_eq[:, win] != 0.0) & (f_eq[:, win] != 1.0)):
         _refuse("dynsig_spm_step", "fractional equilibrium occupations in the window",
                 "an insulating step reference (0/1)", "metals are not in this member")
@@ -1256,13 +1256,13 @@ def spm_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
     if chi0_active is not None:
         # Read by gw.response_bank (response_support, response_quadrature): the
         # refit's own meta copy only; the block rules are held in "held".
-        scr["meta"].shared_pole_response_blocks = dict(active=(a0, a1), held={})
+        scr["meta"].tangential_response_blocks = dict(active=(a0, a1), held={})
     scr["chi0_active"] = None if chi0_active is None else dict(
         requested=chi0_active if isinstance(chi0_active, str) else [int(x) for x in chi0_active],
         bands=[a0, a1], edge_gaps_ev=[g * RYD_TO_EV for g in edge_gaps])
     # The production variant's reference is the run's own recipe; an override is
     # resolved at the run's census (the same resolver, another support set).
-    scr["recipe0"] = meta_run.shared_pole_recipe if override is None else _spm_recipe(scr, f_eq)
+    scr["recipe0"] = meta_run.tangential_recipe if override is None else _spm_recipe(scr, f_eq)
     if jax.process_index() == 0:
         os.makedirs(scratch, exist_ok=True)
     multihost_utils.sync_global_devices("dynsig spm_screening scratch")
@@ -1275,18 +1275,18 @@ def _spm_recipe(scr: dict, f_kn) -> dict:
     Also installs that census and the resolver's fresh capacity ledger on ``scr['meta']``.
     """
     import copy as _copy
-    from gw.shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
+    from gw.tangential_recipe import bind_tangential_census, resolve_tangential_recipe
     inp, rin = scr["inputs"], scr["recipe_inputs"]
     meta = _copy.copy(inp["meta"])
-    bind_shared_pole_census(inp["wfns"], meta, occupation_state=_occupation_duck(f_kn, scr["mu_ry"]),
+    bind_tangential_census(inp["wfns"], meta, occupation_state=_occupation_duck(f_kn, scr["mu_ry"]),
                             trs_allowed=rin["trs_allowed"], state_capacity=rin["state_capacity"],
                             kweights=rin["kweights"])
-    recipe = resolve_shared_pole_recipe(scr["config"], inp["wfns"], meta,
+    recipe = resolve_tangential_recipe(scr["config"], inp["wfns"], meta,
                                         mesh_xy=inp["kwargs"]["mesh_xy"],
                                         print_fn=lambda *a, **k: None,
                                         support_reads_ev=rin["support_reads_ev"])
-    scr["meta"].shared_pole_census = meta.shared_pole_census
-    scr["meta"].shared_pole_capacity = meta.shared_pole_capacity
+    scr["meta"].tangential_census = meta.tangential_census
+    scr["meta"].tangential_capacity = meta.tangential_capacity
     return recipe
 
 
@@ -1299,13 +1299,13 @@ def _recipe_sites_equal(a: dict, b: dict) -> bool:
 
 
 def spm_refit(scr: dict, f_rows, *, label: str, census: bool = True, say=None):
-    """The shared-pole W of the window populations ``f_rows`` (nk, n_A) on the bundle's k rows.
+    """The tangential W of the window populations ``f_rows`` (nk, n_A) on the bundle's k rows.
 
-    The run's W stage (``screen_shared_poles``) at the occupation table f_eq with the
+    The run's W stage (``screen_tangential_poles``) at the occupation table f_eq with the
     window block set to ``f_rows`` (dress none: U = 1, e = eps^G, f = diag rho), after
     its recipe is re-resolved at that census (whether a support moved is recorded).
     Returns (poles, rec): ``poles`` is the window Sigma's source
-    (``gw.ppm_sigma.shared_pole_window_source``: the new model with the refit's
+    (``gw.ppm_sigma.tangential_window_source``: the new model with the refit's
     metadata), ``rec`` the walls (``recipe_s``, ``screen_s``; rank 0: the bank,
     moments and constructor receipts' seconds and ``census_s``), ``K`` per q, the
     constructor's gate rows that did not pass, ``sites_moved`` and, with
@@ -1316,26 +1316,26 @@ def spm_refit(scr: dict, f_rows, *, label: str, census: bool = True, say=None):
     import shutil
     import time
     from jax.experimental import multihost_utils
-    from gw.ppm_sigma import shared_pole_window_source
-    from gw.shared_pole_screening import screen_shared_poles
+    from gw.ppm_sigma import tangential_window_source
+    from gw.tangential_screening import screen_tangential_poles
     inp = scr["inputs"]
     f = scr["f_eq"].copy()
     f[scr["rows"], scr["win"]] = np.asarray(f_rows, np.float64)
     t0 = time.perf_counter()
     recipe = _spm_recipe(scr, f)
     moved = not _recipe_sites_equal(recipe, scr["recipe0"])
-    scr["meta"].shared_pole_recipe = recipe
+    scr["meta"].tangential_recipe = recipe
     t1 = time.perf_counter()
-    root = os.path.join(scr["scratch"], label + "_shared_pole")
+    root = os.path.join(scr["scratch"], label + "_tangential")
     if jax.process_index() == 0 and os.path.isdir(root):
         shutil.rmtree(root)
     multihost_utils.sync_global_devices("dynsig spm_refit slot")
     kw = dict(inp["kwargs"], run_dir=scr["scratch"], label=label, tensors_filename=None,
               occupation_state=_occupation_duck(f, scr["mu_ry"]), head_resolver=None,
               print_fn=(say if say is not None else (lambda *a, **k: None)))
-    out = screen_shared_poles(inp["wfns"], inp["V_q"], scr["meta"], scr["config"], **kw)
+    out = screen_tangential_poles(inp["wfns"], inp["V_q"], scr["meta"], scr["config"], **kw)
     t2 = time.perf_counter()
-    handle = out["shared_pole"]
+    handle = out["tangential"]
     rec = dict(recipe_s=t1 - t0, screen_s=t2 - t1, K=[int(k) for k in handle["K"]],
                sites_moved=bool(moved), label=label)
     if jax.process_index() == 0:
@@ -1346,7 +1346,7 @@ def spm_refit(scr: dict, f_rows, *, label: str, census: bool = True, say=None):
             rec["census_s"] = time.perf_counter() - t3
     scr["n"] += 1
     import copy as _copy
-    poles = shared_pole_window_source(handle, _copy.copy(scr["meta"]),
+    poles = tangential_window_source(handle, _copy.copy(scr["meta"]),
                                       efermi_ry=scr["efermi_ry"], linalg=scr["linalg"])
     return poles, rec
 
@@ -1395,7 +1395,7 @@ _REFIT_GATE_VALUES = ("held_w", "full_m1_defect", "full_m3_defect", "passivity",
 
 
 def _model_payload_cmp(path_a: str, path_b: str):
-    """Two shared-pole models' payloads (``factor``, ``poles2_ry2``, ``K``): bitwise and max |a - b| (rank 0)."""
+    """Two tangential models' payloads (``factor``, ``poles2_ry2``, ``K``): bitwise and max |a - b| (rank 0)."""
     if jax.process_index() != 0:
         return None
     import h5py
@@ -1431,7 +1431,7 @@ def _refit_walls(sr: dict) -> dict:
 
 
 def spm_record(screens: list, eq: dict | None = None) -> dict:
-    """One shared-pole refresh's refit summary over its trials (``spm_refit`` records).
+    """One tangential refresh's refit summary over its trials (``spm_refit`` records).
 
     Walls are summed over the trials; ``K`` is the first trial's per-q pole count and
     ``dK_eq`` its change against the equilibrium refit; the census (rank 0) is the
@@ -1440,7 +1440,7 @@ def spm_record(screens: list, eq: dict | None = None) -> dict:
     walls = [_refit_walls(sr) for sr in screens]
     total = lambda key: sum(w[key] for w in walls)
     r0 = screens[0]
-    out = dict(member="shared_pole", refit_s=sum(sr["recipe_s"] + sr["screen_s"] for sr in screens),
+    out = dict(member="tangential", refit_s=sum(sr["recipe_s"] + sr["screen_s"] for sr in screens),
                recipe_s=sum(sr["recipe_s"] for sr in screens),
                walls={k: total(k) for k in walls[0]}, K=list(r0["K"]),
                K_min=min(min(sr["K"]) for sr in screens), K_max=max(max(sr["K"]) for sr in screens),
@@ -1461,7 +1461,7 @@ def spm_record(screens: list, eq: dict | None = None) -> dict:
 
 
 def spm_line(rec: dict) -> str:
-    """The shared-pole part of a refresh line (``window_collision``'s log)."""
+    """The tangential part of a refresh line (``window_collision``'s log)."""
     sc = rec["screen"]
     w = sc["walls"]
     c = sc.get("census") or {}
@@ -1486,11 +1486,11 @@ def spm_line(rec: dict) -> str:
 
 
 def spm_t0_line(screen_eq: dict) -> str:
-    """The shared-pole part of the t0 line: the refit at rho_eq against the run's model."""
+    """The tangential part of the t0 line: the refit at rho_eq against the run's model."""
     cmp = screen_eq.get("model_vs_run") or {}
     w = _refit_walls(screen_eq)
     c = screen_eq.get("census") or {}
-    return (f"; screening shared_pole ({screen_eq['variant']}"
+    return (f"; screening tangential ({screen_eq['variant']}"
             + (f" supports {screen_eq['support_sites']}" if screen_eq.get("support_sites") else "")
             + f"): refit at rho_eq {screen_eq['recipe_s'] + screen_eq['screen_s']:.2f} s (bank "
             f"{w['bank']:.2f}, moments {w['moments']:.2f}, constructor {w['constructor']:.2f}), model "
@@ -1751,7 +1751,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
 
     Parameters
     ----------
-    source : :func:`gw_window_source` (a GN-PPM or a scalar shared-pole GW run).
+    source : :func:`gw_window_source` (a GN-PPM or a scalar tangential GW run).
     ops : the propagator's ``tdagw.eom.TdOperators`` of the window [b_lo, b_lo + nb)
         (its ``rho_eq``, ``w_k`` and k padding); ``k_frac`` (nk, 3) its k list.
     b_lo : the window's first band, 0-based on the GW run's band axis.
@@ -1769,14 +1769,14 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     check_full : ``sweep = "active"`` only (diagnostic): also run the full sweep at
         t0 and at every refresh and record the differences of the rates and of
         Delta Sigma^h (``full_vs_split`` in each record).
-    screening : :data:`COLLISION_SCREENINGS`.  ``"frozen"``: the run's poles (or shared-pole
-        model) throughout (the incumbent).  ``"shared_pole"`` (td_agw_dynamical.md §1.4,
-        §7.1; a shared-pole source): each refresh re-runs the GW run's W stage at the
+    screening : :data:`COLLISION_SCREENINGS`.  ``"frozen"``: the run's poles (or tangential
+        model) throughout (the incumbent).  ``"tangential"`` (td_agw_dynamical.md §1.4,
+        §7.1; a tangential source): each refresh re-runs the GW run's W stage at the
         window populations (:func:`spm_screening`, :func:`spm_refit`: response bank,
         moments, recipe and constructor, a full refit) and sweeps the window Sigma on
         the new model; as with ``"refreshed"`` the frozen part is swept per refresh,
         the head stays the run's and the static limit is the equilibrium model's
-        own W^c(0) (``gw.mpa.sigma.shared_pole_static_wc``).  ``"refreshed"``
+        own W^c(0) (``gw.mpa.sigma.tangential_static_wc``).  ``"refreshed"``
         (GN-PPM source; td_agw_dynamical.md §7.1): each refresh
         re-screens W at both GN supports from the window populations
         (:func:`collision_screening`, :func:`screen_populations`: dchi0, the Dyson
@@ -1798,16 +1798,16 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         coefficient at i omega_p, a comparison).
     screening_gamma_ev : the static support's same-side principal-value width
         (:func:`collision_screening`), eV; 0 refuses degenerate pairs.
-    rebase : refreshed or shared-pole screening only: the subtracted form's C[rho_eq] at
+    rebase : refreshed or tangential screening only: the subtracted form's C[rho_eq] at
         the rates of rho_eq on the refresh's W(t) (one more window sweep at f_eq) instead
         of the t0 rates, so rho_eq stays a fixed point of each refresh's dissipator and the
         regularization tails of C[rho_eq] cancel at every W.  None: on for
-        ``"shared_pole"`` with ``form = "subtracted"``, off otherwise (the GN-PPM
+        ``"tangential"`` with ``form = "subtracted"``, off otherwise (the GN-PPM
         member's measured option; ``"raw"`` subtracts nothing).
-    spm_support_sites : ``"shared_pole"`` only: :func:`spm_screening`'s support set (""
+    spm_support_sites : ``"tangential"`` only: :func:`spm_screening`'s support set (""
         the run's production ladder, re-resolved at every state).
-    spm_scratch : ``"shared_pole"`` only: the refits' model directory (required).
-    spm_chi0_active : ``"shared_pole"`` only: :func:`spm_screening`'s ``chi0_active``
+    spm_scratch : ``"tangential"`` only: the refits' model directory (required).
+    spm_chi0_active : ``"tangential"`` only: :func:`spm_screening`'s ``chi0_active``
         (None: one rule on all pairs; ``(a0, a1)``: chi0 as four blocks).
     in_scattering : :data:`IN_SCATTERINGS`, ``sweep = "active"`` for ``"full"``: the
         active part's internal line is the populations (diag rho, the incumbent) or the
@@ -1917,7 +1917,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     if frozen_plan not in ("window", "gw_list"):
         _refuse("dynsig_collision_frozen_plan", repr(frozen_plan), "'window' | 'gw_list'",
                 "pick one")
-    refreshed = screening in ("refreshed", "shared_pole")
+    refreshed = screening in ("refreshed", "tangential")
     if refreshed:
         _refuse("dynsig_collision_keldysh_screening", f"screening = {screening!r}",
                 "screening = 'frozen' until a joint retarded/lesser W realization exists",
@@ -1925,19 +1925,19 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                 "the nonequilibrium W< required by the column-sampled MGKBA operator")
     if frozen_bands is not None and (not refreshed or sweep != "active"):
         _refuse("dynsig_collision_frozen_bands", f"frozen_bands with screening = {screening!r}, "
-                f"sweep = {sweep!r}", "screening = 'refreshed' or 'shared_pole', sweep = 'active'",
+                f"sweep = {sweep!r}", "screening = 'refreshed' or 'tangential', sweep = 'active'",
                 "the truncation is of the frozen part's change under W(t)")
-    rebase = (screening == "shared_pole" and form != "raw") if rebase is None else bool(rebase)
+    rebase = (screening == "tangential" and form != "raw") if rebase is None else bool(rebase)
     if rebase and not refreshed:
         _refuse("dynsig_collision_rebase", "rebase with screening = 'frozen'",
-                "screening = 'refreshed' or 'shared_pole'", "the t0 rates are rho_eq's at W0")
+                "screening = 'refreshed' or 'tangential'", "the t0 rates are rho_eq's at W0")
     member = source.get("member", "gn_ppm")
     if ((screening == "refreshed" and member != "gn_ppm")
-            or (screening == "shared_pole" and member != "shared_pole")):
+            or (screening == "tangential" and member != "tangential")):
         _refuse("dynsig_collision_member", f"screening = {screening!r} on a {member} source",
-                "refreshed on a GN-PPM source, shared_pole on a shared-pole source",
+                "refreshed on a GN-PPM source, tangential on a tangential source",
                 "point collision_source at the matching GW run")
-    if screening == "shared_pole" and not spm_scratch:
+    if screening == "tangential" and not spm_scratch:
         _refuse("dynsig_collision_spm_scratch", "no refit directory", "spm_scratch",
                 "pass the refits' model directory (outdir/collision_refits)")
     if check_truncation and frozen_bands is None:
@@ -2079,9 +2079,9 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         out["wall_s"] = time.perf_counter() - t
         return out
 
-    spm = member == "shared_pole"
+    spm = member == "tangential"
     scr, screen_eq = None, None
-    if screening == "shared_pole":
+    if screening == "tangential":
         t_s = time.perf_counter()
         scr = spm_screening(source, mesh=mesh, b_lo=int(b_lo), n_active=nb,
                             support_sites=spm_support_sites, scratch=spm_scratch,
@@ -2095,9 +2095,9 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                          model_vs_run=_model_payload_cmp(source["model"]["path"],
                                                          poles_eq["model"]["path"]))
     if spm:                                             # the model's own W^c(0) (owner ruling)
-        from gw.mpa.sigma import shared_pole_static_wc
-        from gw.ppm_sigma import fresh_shared_pole_capacity
-        W0c = shared_pole_static_wc(poles["model"], fresh_shared_pole_capacity(poles["meta"], mesh),
+        from gw.mpa.sigma import tangential_static_wc
+        from gw.ppm_sigma import fresh_tangential_capacity
+        W0c = tangential_static_wc(poles["model"], fresh_tangential_capacity(poles["meta"], mesh),
                                     mesh_xy=mesh, rows=np.arange(int(meta.nk_tot)))
     else:
         W0c = poles.Wc0_q                               # the run's W^c(0): the static limit's
@@ -2391,8 +2391,8 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                f"[{receipt['edges']['vbm_in'][0]:.3g}, {receipt['edges']['vbm_in'][1]:.3g}], CBM Gamma "
                f"[{receipt['edges']['cbm_out'][0]:.3g}, {receipt['edges']['cbm_out'][1]:.3g}] D "
                f"[{receipt['edges']['cbm_in'][0]:.3g}, {receipt['edges']['cbm_in'][1]:.3g}] meV")
-            + ("" if screen_eq is None or screening != "shared_pole" else spm_t0_line(screen_eq))
-            + ("" if screen_eq is None or screening == "shared_pole" else
+            + ("" if screen_eq is None or screening != "tangential" else spm_t0_line(screen_eq))
+            + ("" if screen_eq is None or screening == "tangential" else
                f"; screening refreshed: at rho_eq max|dchi0| {screen_eq['dchi_max'][0]:.1e}/"
                f"{screen_eq['dchi_max'][1]:.1e}, max|W - W0|/|W0| {screen_eq['dW'][0]:.1e}/"
                f"{screen_eq['dW'][1]:.1e} (0 / i w_p), poles "
@@ -2453,7 +2453,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                 rb[bundle_of] = rho_h[tr]
             f_rows.append(fb)
             at = None
-            if screening == "shared_pole":       # two slots per trial: this refresh's and the last
+            if screening == "tangential":       # two slots per trial: this refresh's and the last
                 at, srec = spm_refit(scr, fb, label=f"s{(state['n'] + 1) % 2}t{tr}")
                 screens.append(srec)
                 poles_now.append(at)
@@ -2518,7 +2518,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                    rebase_s=rebase_s, c_eq_now=(None if not rebase else
                                                 [float(out["c_eq_diag"]), float(out["c_eq_offdiag"])]))
         rec.update(balance)
-        if screening == "shared_pole":
+        if screening == "tangential":
             rec.update(screen=spm_record(screens, screen_eq))
         elif refreshed:
             worst = lambda key: max(sr[key] for sr in screens)
@@ -2594,9 +2594,9 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                 f"||C[rho_eq]|| diag {rec['c_eq_diag']:.2e} off {rec['c_eq_offdiag']:.2e}; "
                 f"{sweep} sweep {rec['nodes']['distinct_tau']} tau"
                 + (f" ({rec['nodes']['rebuilds']} rules rebuilt)" if rec["nodes"]["rebuilds"] else "")
-                + ("" if "screen" not in rec or screening != "shared_pole" else
+                + ("" if "screen" not in rec or screening != "tangential" else
                    spm_line(rec))
-                + ("" if "screen" not in rec or screening == "shared_pole" else
+                + ("" if "screen" not in rec or screening == "tangential" else
                    f"; W(t): dchi0 {rec['screen']['dchi_s']:.2f} s, Dyson+fit "
                    f"{rec['screen']['fit_s']:.2f} s"
                    + ("" if "frozen_s" not in rec else

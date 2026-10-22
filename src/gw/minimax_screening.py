@@ -1384,7 +1384,7 @@ def build_imag_probe_response_rule(quad, omega_p, minimax_config, *,
                                    print_fn=None, with_odd_kernel=False):
     """GN-PPM χ₀(iω_p) quadrature from the analytic response rule.
 
-    The same ``minimax.response_laplace_rule`` the shared-pole bank samples
+    The same ``minimax.response_laplace_rule`` the tangential bank samples
     χ₀ with (elliptic decay rates, Ritz times, continuum residual
     certificate; ``docs/theory/response-laplace.md``) places the times here,
     on the static window ``[quad.x_min, quad.x_max]`` at the single sample

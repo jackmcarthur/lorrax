@@ -48,7 +48,7 @@ def w_model_row(poles, samples, seconds, *, reused=False) -> str:
     """The ``W model`` stage row: poles per q, frequency samples, wall.
 
     >>> w_model_row({"W": [4, 6, 6]}, 22, 7.84)
-    'shared-pole, 4-6 poles per q on 3 q, from 22 frequency samples; 7.8 s'
+    'tangential, 4-6 poles per q on 3 q, from 22 frequency samples; 7.8 s'
     """
     from common.report_blocks import fmt_wall
 
@@ -56,12 +56,12 @@ def w_model_row(poles, samples, seconds, *, reused=False) -> str:
         return f"{min(ks)}" if min(ks) == max(ks) else f"{min(ks)}-{max(ks)}"
     filled = {name: ks for name, ks in poles.items() if ks}
     if list(filled) == ["W"]:
-        what = f"shared-pole, {span(filled['W'])} poles per q on {len(filled['W'])} q"
+        what = f"tangential, {span(filled['W'])} poles per q on {len(filled['W'])} q"
     elif filled:
-        what = ("shared-pole sectors, poles per q " + ", ".join(
+        what = ("tangential sectors, poles per q " + ", ".join(
             f"{name} {span(ks)}" for name, ks in filled.items()))
     else:
-        what = "shared-pole"
+        what = "tangential"
     source = ("reused, no bank built" if reused else
               f"from {samples} frequency samples" if samples else "")
     return f"{what}{', ' + source if source else ''}; {fmt_wall(seconds)}"
@@ -86,7 +86,7 @@ def _json(value):
             return x.item()
         if isinstance(x, complex):
             return dict(real=x.real, imag=x.imag)
-        from file_io.shared_pole_store import ResidentSectorModel
+        from file_io.tangential_store import ResidentSectorModel
         if isinstance(x, ResidentSectorModel):
             return str(x)
         raise TypeError(type(x).__name__)
@@ -104,7 +104,7 @@ def _authenticated_constructor_resume(root, identity, recipe, *, photon=False, c
     Any other partial directory follows the existing remove-and-rebuild path,
     including a bank built against another V digest (another P, older code).
     """
-    from file_io.shared_pole_store import validate_shared_pole_bank
+    from file_io.tangential_store import validate_tangential_bank
 
     receipt_paths = ((root / 'bank_receipt.json',) if photon else
                      (root / 'bank_receipt.json', root / 'moments_receipt.json'))
@@ -130,7 +130,7 @@ def _authenticated_constructor_resume(root, identity, recipe, *, photon=False, c
           or (bank_receipt.get('coulomb_identity') or {}).get('sha256') != coulomb_sha256):
         return False
     try:
-        header = validate_shared_pole_bank(
+        header = validate_tangential_bank(
             bank_path, expected_identity=identity, mesh_xy=None,
             require_complete=True, expected_recipe=recipe, collective=False)
     except (KeyError, OSError, TypeError, ValueError):
@@ -159,7 +159,7 @@ def _published_sector_handle(root, identity):
     except (OSError, ValueError):
         return None
     if header.get('identity') != identity:
-        raise ValueError(f'GATE shared_pole_output: sector manifest at {manifest} binds another '
+        raise ValueError(f'GATE tangential_output: sector manifest at {manifest} binds another '
                          'map, recipe or WFN; use a fresh run directory')
     paths = [row.get('path') for row in header.get('sectors', {}).values()]
     paths.append(header.get('constant', {}).get('path'))
@@ -174,15 +174,15 @@ def _published_sector_handle(root, identity):
 
 def _mark_photon_head(handle, config):
     """Name the direct four-current Γ head on a photon handle when heads are on."""
-    from .gw_config import HeadCorrection, uses_direct_bispinor_shared_pole_head
+    from .gw_config import HeadCorrection, uses_direct_bispinor_tangential_head
     if config.head.correction is HeadCorrection.OFF:
         return
-    if not uses_direct_bispinor_shared_pole_head(config):
-        raise ValueError("GATE shared_pole_photon_head: unsupported photon Γ policy")
+    if not uses_direct_bispinor_tangential_head(config):
+        raise ValueError("GATE tangential_photon_head: unsupported photon Γ policy")
     handle["direct_photon_head"] = "first_order_cc_ct_tc_tt"
 
 
-def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
+def tangential_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
     """Bind logical current energies/occupations and their wavefunction source.
 
     SC supplies the current Hamiltonian/rotation identity from its owner;
@@ -193,22 +193,22 @@ def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
     from .response_bank import response_weights
     census = response_weights(wfns, meta)[-1]
     source = wfn_fingerprint(wfn) if binding is None else fingerprint_from_binding(binding, wfn)
-    state = getattr(meta, "shared_pole_state_identity", None)
+    state = getattr(meta, "tangential_state_identity", None)
     if str(label).startswith("sc_"):
         if not isinstance(state, dict) or any(not isinstance(state.get(k), str)
                 or not state[k] for k in ("hamiltonian", "wavefunctions")):
-            raise ValueError("GATE shared_pole_state_identity: current SC Hamiltonian/rotation identity missing")
+            raise ValueError("GATE tangential_state_identity: current SC Hamiltonian/rotation identity missing")
     else:
         state = dict(wavefunctions=source, hamiltonian=hashlib.sha256(
             (source + census["energy_sha256"]).encode()).hexdigest())
-    recipe = meta.shared_pole_recipe
+    recipe = meta.tangential_recipe
     identity = dict(iteration_id=str(label), hamiltonian=state["hamiltonian"],
         wavefunctions=state["wavefunctions"], energies=census["energy_sha256"],
         occupations=census["occupation_sha256"],
         centroids=hashlib.sha256(np.asarray(centroid_indices, np.int64).tobytes()).hexdigest(),
         recipe_hash=recipe["recipe_hash"], gate_hash=recipe["gate_hash"])
     if str(label).startswith("sc_"):
-        # The SC state labels do not name the WFN (bind_shared_pole_sc_identity),
+        # The SC state labels do not name the WFN (bind_tangential_sc_identity),
         # so an SC map's bank, model and sector manifest bind the source WFN's
         # fingerprint here (the dipole provenance's): a rerun reuses them only
         # on the same WFN, never on energies alone.
@@ -234,7 +234,7 @@ def _coulomb_resource(value, meta, sym, mesh_xy):
     qids = np.asarray(sym.q_irr_full_idx, np.int64)
     op = QirrOperator.of(value)
     if op.n_full != meta.nk_tot or tuple(op.values.shape[1:]) != (basis.n_packed, basis.n_packed):
-        raise ValueError("GATE shared_pole_coulomb: expected the packed bare V")
+        raise ValueError("GATE tangential_coulomb: expected the packed bare V")
     # The parents' rows are one array for the run (the wedge's own values, or
     # one gather of a whole-zone operator), so the held roots and the digest
     # are reused by every SC map.
@@ -272,15 +272,15 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
     until it is released.
     """
     from common.gpu_utils import host_bytes_per_process
-    from file_io.shared_pole_store import ResidentBankPayload, shared_pole_bank_payload_bytes
+    from file_io.tangential_store import ResidentBankPayload, tangential_bank_payload_bytes
     from .gw_config import linalg_resolution
-    from .shared_pole_constructor import constructor_route
+    from .tangential_constructor import constructor_route
 
-    from .shared_pole_directions import line_width_bounds
-    ledger = meta.shared_pole_capacity
+    from .tangential_directions import line_width_bounds
+    ledger = meta.tangential_capacity
     ordered = bool(photon) or not bool(sym.trs_allowed)
     nq = len(np.asarray(sym.q_irr_full_idx))
-    R = shared_pole_bank_payload_bytes(meta, recipe=meta.shared_pole_recipe,
+    R = tangential_bank_payload_bytes(meta, recipe=meta.tangential_recipe,
                                        ordered=ordered, nq=nq, mesh_xy=mesh_xy,
                                        line_widths=line_width_bounds(meta, mesh_xy=mesh_xy,
                                            photon_bases=None if photon is None else mu_bases),
@@ -314,7 +314,7 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
     if both["aggregate_bytes_per_rank"] > receipt["half_budget_bytes_per_rank"]:
         return host("payload and one read copy exceed half the device budget")
     if photon is not None:
-        from .shared_pole_sectors import sector_execution
+        from .tangential_sectors import sector_execution
         route = lambda upstream: sector_execution(meta, config, mu_bases, nq,
                                                   mesh_xy=mesh_xy, upstream=upstream)[0]
         without = route(())
@@ -327,7 +327,7 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
         execution, wanted = route((stage,)), without
     else:
         execution, wanted = constructor_route(
-            meta, config, meta.shared_pole_recipe, mesh_xy=mesh_xy, ledger=ledger,
+            meta, config, meta.tangential_recipe, mesh_xy=mesh_xy, ledger=ledger,
             upstream=(stage,), ordered=ordered, odd_moments=ordered, nq=nq)[0], "local"
     if execution != wanted:
         return host("constructor would change route with the payload live")
@@ -359,7 +359,7 @@ def hold_resident_model(model, meta, nbytes, *, stage):
     (``mpa.sector_sigma.sector_static_wc``).  Its ``nbytes`` stay reserved
     as ``stage``; :func:`release_resident_model` releases it.
     """
-    ledger = meta.shared_pole_capacity
+    ledger = meta.tangential_capacity
     ledger.reserve(stage, resident_bytes_per_rank=int(nbytes),
                    workspace_bytes_per_rank=0, concurrent_with=ledger.live_stages)
     ledger.live_stages = (*ledger.live_stages, stage)
@@ -371,9 +371,9 @@ def _scalar_model_residence(meta, nq, width, *, mesh_xy, root, identity):
 
     The model file of an SC map has three readers in the same process: the
     head, Sigma and, on the accepted final map, the W0 persist
-    (``gw.mpa.sigma.shared_pole_static_wc``); no later run reads it (SC
+    (``gw.mpa.sigma.tangential_static_wc``); no later run reads it (SC
     scratch never serves a restart). It stays resident under the sector
-    models' admission (``shared_pole_store.admit_resident_model``): R, its
+    models' admission (``tangential_store.admit_resident_model``): R, its
     bytes at the stored K extent's bound (``model_column_bound`` of the
     constructor's column width), and one copy fit in half of the device
     budget beside the live stages. The constructor has finished when this is
@@ -382,9 +382,9 @@ def _scalar_model_residence(meta, nq, width, *, mesh_xy, root, identity):
     is unchanged. Otherwise model.h5 is written as before. Returns ``(model or None, receipt)``; a resident R is reserved as
     ``receipt["stage"]`` and the model is held for :func:`release_resident_model`.
     """
-    from file_io.shared_pole_store import (ResidentSectorModel, admit_resident_model,
+    from file_io.tangential_store import (ResidentSectorModel, admit_resident_model,
                                            model_column_bound)
-    ledger = meta.shared_pole_capacity
+    ledger = meta.tangential_capacity
     R = ResidentSectorModel.payload_bytes(mesh_xy, nq, meta.mu_basis.n_canonical,
                                           model_column_bound(meta, width))
     receipt = admit_resident_model(
@@ -418,22 +418,22 @@ def _release_bank_file(path):
         stat = os.stat(path)
         os.unlink(path)
         return dict(bytes=int(stat.st_size), links=int(stat.st_nlink))
-    return rank0_transaction(path, stage="shared_pole.bank.release", write=unlink,
+    return rank0_transaction(path, stage="tangential.bank.release", write=unlink,
                              return_value=True)
 
 
-#: The per-map scratch generation ``screen_shared_poles`` creates under an SC
+#: The per-map scratch generation ``screen_tangential_poles`` creates under an SC
 #: label (bank, Coulomb staging, constant and receipts).
-_MANAGED_SCRATCH = r"sc_[0-9]{4}_shared_pole"
+_MANAGED_SCRATCH = r"sc_[0-9]{4}_tangential"
 #: Set once this process has swept earlier processes' streamed stores (prepare_output).
 _SWEPT: list = []
 
 
 def retain_iteration_scratch(run_dir, label, *, print_fn=print):
-    """Collectively keep only map ``label``'s shared-pole scratch generation.
+    """Collectively keep only map ``label``'s tangential scratch generation.
 
-    Each SC map screens into its own ``sc_NNNN_shared_pole/``, and a file-tier
-    bank there is the payload of ``shared_pole_bank_payload_bytes`` (about
+    Each SC map screens into its own ``sc_NNNN_tangential/``, and a file-tier
+    bank there is the payload of ``tangential_bank_payload_bytes`` (about
     0.27 TB on Fe 8^3), so without this the scratch grows linearly in maps.  The caller invokes it
     only after the current map's model has been built, consumed by Sigma and
     passed the Sigma gates, so a failure keeps the last usable generation, and
@@ -449,15 +449,15 @@ def retain_iteration_scratch(run_dir, label, *, print_fn=print):
 
     root = os.path.abspath(os.fspath(run_dir))
     removed = remove_managed(
-        root, _MANAGED_SCRATCH, keep=[os.path.join(root, f"{label}_shared_pole")],
-        barrier_tag=f"shared_pole.scratch.retain.{label}", print_fn=print_fn)
+        root, _MANAGED_SCRATCH, keep=[os.path.join(root, f"{label}_tangential")],
+        barrier_tag=f"tangential.scratch.retain.{label}", print_fn=print_fn)
     if removed:
-        log.debug(f"  shared-pole scratch: retained {label}; discarded: "
+        log.debug(f"  tangential scratch: retained {label}; discarded: "
                  + ", ".join(sorted(removed)))
     return tuple(sorted(removed))
 
 
-def _shared_pole_tables(meta, sym, centroid_indices):
+def _tangential_tables(meta, sym, centroid_indices):
     """Build raw-parent tables through the canonical symmetry service."""
     from symmetry_maps import (QirrTables, centroid_source_map_and_wrap,
                                bgw_integer_q_to_fractional)
@@ -472,7 +472,7 @@ def _shared_pole_tables(meta, sym, centroid_indices):
 
 
 def compile_w_model_ahead(config, meta, sym, mesh_xy):
-    """Submit the scalar shared-pole W model's shape-fixed compiles before the zeta fit.
+    """Submit the scalar tangential W model's shape-fixed compiles before the zeta fit.
 
     H = V^(1/2) of the bare V's parents takes its shape from the centroid
     basis and the q wedge, and the scalar head's pole fit from the deck's
@@ -480,8 +480,8 @@ def compile_w_model_ahead(config, meta, sym, mesh_xy):
     (``common.jax_compile_cache.compile_ahead``) while the zeta fit and V run,
     instead of when the bank and the head first need them.
     """
-    from .gw_config import HeadCorrection, uses_full_bispinor_shared_pole
-    if config.sigma.w_model != "shared_pole" or uses_full_bispinor_shared_pole(config):
+    from .gw_config import HeadCorrection, uses_full_bispinor_tangential
+    if config.sigma.w_model != "tangential" or uses_full_bispinor_tangential(config):
         return
     from .response_bank import compile_coulomb_roots_ahead
     compile_coulomb_roots_ahead(meta, config, mesh_xy, len(sym.q_irr_full_idx))
@@ -490,7 +490,7 @@ def compile_w_model_ahead(config, meta, sym, mesh_xy):
         compile_scalar_fit_ahead(config.mpa.n_poles, config.mpa.pole_solver)
 
 
-def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
+def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         centroid_indices, run_dir, label, wfn,
                         wfn_fingerprint_binding, tensors_filename, occupation_state, print_fn,
                         head_resolver=None, mpa_plan=None, iteration_head_response=None,
@@ -504,32 +504,32 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     ISDF basis, but never skips the current response or W construction.
     """
     source_wfn = None
-    from .gw_config import uses_full_bispinor_shared_pole
-    photon = uses_full_bispinor_shared_pole(config)
+    from .gw_config import uses_full_bispinor_tangential
+    photon = uses_full_bispinor_tangential(config)
     if photon and int(meta.nspinor) != 4:
-        raise ValueError("GATE shared_pole_sectors: full_shared_pole requires four-spinor metadata")
+        raise ValueError("GATE tangential_sectors: full_tangential requires four-spinor metadata")
     photon_layout = None
     if photon:
         from .photon_layout import PhotonBasisLayout
         if wfns_transverse is None or bispinor_v_q_path is None or mu_bases is None:
-            raise ValueError("GATE shared_pole_sectors: both current-map endpoint bundles and photon V are required")
+            raise ValueError("GATE tangential_sectors: both current-map endpoint bundles and photon V are required")
         photon_layout = PhotonBasisLayout.from_centroid_extents(
             mu_bases[0].n_logical, mu_bases[1].n_logical, mesh_xy)
     if config.debug.write_w or config.write_poles:
         source_wfn = getattr(wfn, "path", None)
         if source_wfn is None or not str(source_wfn).strip():
-            raise ValueError("GATE shared_pole_output: write_w/write_poles require the source WFN path before screening")
+            raise ValueError("GATE tangential_output: write_w/write_poles require the source WFN path before screening")
     # A time-reversal-broken metal runs on this route (METAL 2026-09-16): the
     # ordered bank keeps both particle-hole orientations with the odd channel
     # (8d3ad5fe) and its kernels return the physical orientation FT_q[chi]
     # (86307cff). GATE mpa_ordered_metal stays on the MPA route, which fits one
     # residue with no odd channel (gw.mpa.model._require_metal_time_reversal).
     if material_class == "metal" and not bool(getattr(sym, "trs_allowed", True)):
-        log.info("  shared-pole screening: time-reversal-broken METAL; ordered bank "
+        log.info("  tangential screening: time-reversal-broken METAL; ordered bank "
                  "(both orientations, odd channel) with fractional occupations")
     from .ppm_pipeline import observing_window_source, publish_window_source
     if not photon and observing_window_source():
-        # The held inputs of TD-aGW's shared-pole refit (this stage re-run at the
+        # The held inputs of TD-aGW's tangential refit (this stage re-run at the
         # window's populations, tdagw.dynsig.spm_screening); one empty list test
         # when no ppm_pipeline.observe_window_sigma_source block is open.
         publish_window_source(screening_inputs=dict(
@@ -541,14 +541,14 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 iteration_head_response=iteration_head_response,
                 material_class=material_class)))
     with timing.section("spole.screening_setup"):
-        from file_io.shared_pole_store import initialize_shared_pole_bank
-        from file_io.tagged_arrays import register_shared_pole_restart_member
-        from .shared_pole_recipe import shared_pole_restart_handle
-        from .shared_pole_constructor import construct_shared_poles
+        from file_io.tangential_store import initialize_tangential_bank
+        from file_io.tagged_arrays import register_tangential_restart_member
+        from .tangential_recipe import tangential_restart_handle
+        from .tangential_constructor import construct_tangential_poles
         from .w_isdf import produce_w_bank, compute_response_moments
 
         started = time.monotonic()
-        recipe, ledger = meta.shared_pole_recipe, meta.shared_pole_capacity
+        recipe, ledger = meta.tangential_recipe, meta.tangential_capacity
         # This is the top-level map boundary. All upstream V/psi carriers are
         # inherited; no newly allocated bank/constructor arrays exist yet.
         # (The SC map entry already released the previous map's resident model.)
@@ -557,22 +557,22 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             from common.collectives import replicate_to_mesh
             occupations = np.asarray(occupation_state.f_kn, np.float64)
             if occupations.shape != wfns.occ.shape:
-                raise ValueError("GATE shared_pole_occupations: supplied current state does not match carrier")
+                raise ValueError("GATE tangential_occupations: supplied current state does not match carrier")
             wfns = dataclasses.replace(wfns, occ=replicate_to_mesh(occupations, mesh_xy))
             if photon:
                 wfns_transverse = dataclasses.replace(wfns_transverse, occ=wfns.occ)
-        identity = shared_pole_identity(wfns, meta, label=label, wfn=wfn,
+        identity = tangential_identity(wfns, meta, label=label, wfn=wfn,
             binding=wfn_fingerprint_binding, centroid_indices=centroid_indices)
         sc_scratch = str(label).startswith("sc_")
         if config.restart and tensors_filename is not None and not sc_scratch and not photon:
-            handle = shared_pole_restart_handle(tensors_filename,
+            handle = tangential_restart_handle(tensors_filename,
                 expected_identity=identity, meta=meta, mesh_xy=mesh_xy, print_fn=print_fn)
             if handle is not None:
-                result = dict(shared_pole=handle)
+                result = dict(tangential=handle)
                 from .gw_config import HeadCorrection
                 if config.head.correction is not HeadCorrection.OFF:
-                    from .shared_pole_head import build_shared_pole_head
-                    head, iteration_head = build_shared_pole_head(
+                    from .tangential_head import build_tangential_head
+                    head, iteration_head = build_tangential_head(
                         handle, None, V_q, wfns, meta, config, mesh_xy=mesh_xy, wfn=wfn,
                         response=iteration_head_response, head_resolver=head_resolver,
                         plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
@@ -581,14 +581,14 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 # export on disk always implies a finished head.  Under SC
                 # this branch is unreachable (``sc_scratch`` skips restart).
                 if config.debug.write_w or config.write_poles:
-                    from file_io.shared_pole_store import export_shared_pole_outputs
+                    from file_io.tangential_store import export_tangential_outputs
                     with timing.section("spole.outputs"):
-                        export_shared_pole_outputs(handle, meta=meta, config=config,
+                        export_tangential_outputs(handle, meta=meta, config=config,
                             mesh_xy=mesh_xy, source_wfn=source_wfn,
                             run_dir=run_dir, label=label, print_fn=print_fn,
-                            tables=_shared_pole_tables(meta, sym, centroid_indices))
+                            tables=_tangential_tables(meta, sym, centroid_indices))
                 return result
-        root = Path(run_dir).resolve() / (str(label) + "_shared_pole")
+        root = Path(run_dir).resolve() / (str(label) + "_tangential")
         # The bare V parents (a collective device digest, before the rank-0 resume
         # decision): a complete bank resumes only when built against these values.
         coulomb = None if photon else _coulomb_resource(V_q, meta, sym, mesh_xy)
@@ -609,18 +609,18 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             # generation's leftovers before it creates any.
             stale = remove_stale_streamed_banks(
                 [root / "streamed_bank"] if _SWEPT else
-                [p / "streamed_bank" for p in Path(run_dir).resolve().glob("*_shared_pole")])
+                [p / "streamed_bank" for p in Path(run_dir).resolve().glob("*_tangential")])
             _SWEPT.append(True)
             if stale:
-                log.warning("shared-pole output: removed streamed stores left by an earlier "
+                log.warning("tangential output: removed streamed stores left by an earlier "
                             "process: " + " ".join(stale),
-                            extra=message("shared_pole_stale_stores_removed",
+                            extra=message("tangential_stale_stores_removed",
                                           lines=("left behind by an earlier process; "
                                                  "nothing of this run is lost",)))
             model = root / "model.h5"
             if photon and (root / 'sectors.json').exists():
                 if _published_sector_handle(root, identity) is not None:
-                    log.info(f"shared-pole output: authenticated sector manifest retained at {root}; reusing it")
+                    log.info(f"tangential output: authenticated sector manifest retained at {root}; reusing it")
                     return "published"
             complete, bound = False, None
             if model.exists():
@@ -635,36 +635,36 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             if complete and sc_scratch and not photon and bound == identity:
                 # An SC map's committed model of this very map (the file tier
                 # persists it): Sigma reads it; nothing upstream is rebuilt.
-                log.info(f"shared-pole output: committed model of this map retained at {model}; reusing it")
+                log.info(f"tangential output: committed model of this map retained at {model}; reusing it")
                 return "committed"
             if complete:
-                log.info(f"shared-pole output: complete model retained at {model}; refusing rebuild")
-                raise ValueError(f"GATE shared_pole_output: complete model {model}; use its compatible restart member or a fresh run directory")
+                log.info(f"tangential output: complete model retained at {model}; refusing rebuild")
+                raise ValueError(f"GATE tangential_output: complete model {model}; use its compatible restart member or a fresh run directory")
             if _authenticated_constructor_resume(root, identity, recipe, photon=photon,
                                                  coulomb_sha256=None if photon else coulomb['sha256']):
-                log.info(f"shared-pole output: authenticated complete bank retained at {root}; resuming constructor")
+                log.info(f"tangential output: authenticated complete bank retained at {root}; resuming constructor")
                 stale = [name for name in (_SECTOR_OUTPUTS if photon else ())
                          if (root / name).exists()]
                 for name in stale:
                     (root / name).unlink()
                 if stale:
-                    log.warning(f"shared-pole output: removed {' '.join(stale)} from {root}; "
+                    log.warning(f"tangential output: removed {' '.join(stale)} from {root}; "
                                 "rebuilding this map's constructor",
-                                extra=message("shared_pole_stale_outputs_removed"))
+                                extra=message("tangential_stale_outputs_removed"))
                 return True
             if root.exists():
                 removed = ' '.join(sorted(path.name for path in root.iterdir()))
-                log.warning(f"shared-pole output: removed partial directory {root} "
+                log.warning(f"tangential output: removed partial directory {root} "
                             f"({removed}); rebuilding this map",
-                            extra=message("shared_pole_partial_output_removed"))
+                            extra=message("tangential_partial_output_removed"))
                 shutil.rmtree(root)
             else:
-                log.debug(f"shared-pole output: creating new directory {root}")
+                log.debug(f"tangential output: creating new directory {root}")
             root.mkdir(parents=True)
             return False
 
         resume_constructor = rank0_transaction(
-            root, stage="shared_pole.prepare_output", write=prepare_output,
+            root, stage="tangential.prepare_output", write=prepare_output,
             return_value=True)
         if resume_constructor == "published":
             from common.collectives import agree_io_error
@@ -672,13 +672,13 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             try:
                 handle = _published_sector_handle(root, identity)
                 if handle is None:
-                    raise ValueError(f"GATE shared_pole_output: sector manifest at {root} changed during reuse")
+                    raise ValueError(f"GATE tangential_output: sector manifest at {root} changed during reuse")
             except (OSError, ValueError) as exc:
                 error = exc
-            agree_io_error(error, path=root / 'sectors.json', stage='shared_pole.published_handle')
+            agree_io_error(error, path=root / 'sectors.json', stage='tangential.published_handle')
             _mark_photon_head(handle, config)
-            return dict(shared_pole=handle)
-        tables = _shared_pole_tables(meta, sym, centroid_indices)
+            return dict(tangential=handle)
+        tables = _tangential_tables(meta, sym, centroid_indices)
     if resume_constructor == "committed":
         coulomb = None
     with timing.section("spole.bank_setup"):
@@ -689,11 +689,11 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                                                   root=root, label=label,
                                                   photon=photon_layout if photon else None,
                                                   mu_bases=mu_bases)
-        log.debug(f"shared-pole bank residence: {residence['residence']}; "
+        log.debug(f"tangential bank residence: {residence['residence']}; "
                  f"{residence['payload_bytes_per_rank'] / 2**30:.3f} GiB/rank, "
                  f"{residence['payload_bytes_total'] / 2**30:.2f} GiB total; {residence['reason']}"
                  if 'payload_bytes_per_rank' in residence else
-                 f"shared-pole bank residence: file; {residence['reason']}")
+                 f"tangential bank residence: file; {residence['reason']}")
         if "stage" in residence:
             ledger.live_stages = (residence["stage"],)
         bank = dict(path=str(root / "bank.h5") if resident is None else resident,
@@ -701,10 +701,10 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         if photon:
             bank.update(photon_layout=photon_layout, mu_bases=mu_bases,
                         bispinor_v_q_path=bispinor_v_q_path,
-                        sector_tables=(tables, _shared_pole_tables(
+                        sector_tables=(tables, _tangential_tables(
                             meta, sym, mu_bases[1].canonical_indices)))
         if not resume_constructor:
-            initialize_shared_pole_bank(bank["path"], meta=meta, tables=tables,
+            initialize_tangential_bank(bank["path"], meta=meta, tables=tables,
                 recipe=recipe, identity=identity, mesh_xy=mesh_xy,
                 **(dict(photon_layout=photon_layout, mu_bases=mu_bases) if photon else {}))
             if not getattr(bank["path"], "fits", True):
@@ -714,8 +714,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 bank["path"], resident = str(root / "bank.h5"), None
                 residence = dict(residence, residence="file", reason="per-rank files refused "
                                  "by the filesystem (capacity); shared scratch file")
-                log.debug(f"shared-pole bank residence: file; {residence['reason']}")
-                initialize_shared_pole_bank(bank["path"], meta=meta, tables=tables,
+                log.debug(f"tangential bank residence: file; {residence['reason']}")
+                initialize_tangential_bank(bank["path"], meta=meta, tables=tables,
                     recipe=recipe, identity=identity, mesh_xy=mesh_xy,
                     **(dict(photon_layout=photon_layout, mu_bases=mu_bases) if photon else {}))
         receipts = dict(identity=identity)
@@ -738,13 +738,13 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             recorded.add(stage)
             path = root / (stage + "_receipt.json")
             rank0_transaction(
-                path, stage=f"shared_pole.receipt.{stage}",
+                path, stage=f"tangential.receipt.{stage}",
                 write=lambda: path.write_text(_json(receipt) + "\n"))
-            log.debug(f"shared-pole {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
+            log.debug(f"tangential {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
                      f"seconds={receipt.get('seconds', {})}")
     with timing.section("spole.bank"):
         if resume_constructor:
-            log.debug('shared-pole bank: not produced; '
+            log.debug('tangential bank: not produced; '
                      + ('committed model reused' if resume_constructor == 'committed'
                         else 'authenticated complete producer artifact reused'))
         elif photon:
@@ -761,7 +761,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 sym=sym, sample_plan=recipe, bank_io=bank, print_fn=print_fn))
     if not photon and not resume_constructor:
         with timing.section("spole.moments", announce=True,
-                            label="shared-pole response moments"):
+                            label="tangential response moments"):
             record("moments", compute_response_moments(wfns, meta, config,
                 mesh_xy=mesh_xy, sym=sym, bank_io=bank))
         moments_seconds = receipts["moments"].get("seconds", {})
@@ -776,24 +776,24 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     # final writer. It must query its own native workspace at the actual R.
     # W/dW and M1/M3 are distinct keyed datasets in the same scratch file.
     if resume_constructor == "committed":
-        from file_io.shared_pole_store import validate_shared_pole_model
+        from file_io.tangential_store import validate_tangential_model
         model_path = root / "model.h5"
         result = dict(model=str(model_path), status="COMMITTED_MODEL_REUSED",
-                      model_header=validate_shared_pole_model(
+                      model_header=validate_tangential_model(
                           model_path, expected_identity=identity, mesh_xy=mesh_xy,
                           capacity=ledger),
                       model_residence=dict(residence="file", reason="committed model reused"))
     elif photon:
-        from .shared_pole_sectors import construct_sector_poles
+        from .tangential_sectors import construct_sector_poles
         result = construct_sector_poles(bank, meta, config,
             mesh_xy=mesh_xy, output=str(root / "model.h5"), print_fn=print_fn)
         from lxkit import memory
-        from .shared_pole_execution import route_summary
+        from .tangential_execution import route_summary
         rows = result.get("execution") or ()
         if rows:
             routes = [(row["sector"], row) for row in rows] + [("CT", rows[0]["joint"])]
             for name, row in routes:
-                memory.record_route(f"shared-pole sector constructor {name}", row["mode"],
+                memory.record_route(f"tangential sector constructor {name}", row["mode"],
                                     route_summary(row["mode"], row), warning=row.get("warning"))
             _print_eigh_stack_routes(print_fn)
     else:
@@ -808,23 +808,23 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             model_rule = partial(_scalar_model_residence, meta, mesh_xy=mesh_xy,
                                  root=root, identity=identity)
         with timing.section("spole.constructor", announce=True,
-                            label="shared-pole constructor"):
-            result = construct_shared_poles(bank, bank, meta, config,
+                            label="tangential constructor"):
+            result = construct_tangential_poles(bank, bank, meta, config,
                 mesh_xy=mesh_xy, output=str(root / "model.h5"), residence=model_rule)
         walls = dict(result.get("seconds", {}))
         rounds = walls.pop("rounds", 0)
         from lxkit import memory
-        from .shared_pole_execution import route_summary
+        from .tangential_execution import route_summary
         route = result.get("execution")
         if route is not None:
-            memory.record_route("shared-pole constructor", route["mode"],
+            memory.record_route("tangential constructor", route["mode"],
                                 route_summary(route["mode"], route),
                                 warning=route.get("warning"))
-        log.debug("Shared-pole constructor: "
+        log.debug("Tangential constructor: "
                  + f"{rounds} round(s); seconds "
                  + " ".join(f"{name}={value:.2f}" for name, value in
                             sorted(walls.items(), key=lambda item: -item[1])),
-                  extra=sidecar_record("shared_pole.constructor", rounds=rounds,
+                  extra=sidecar_record("tangential.constructor", rounds=rounds,
                                        seconds=dict(walls)))
         _print_eigh_stack_routes(print_fn)
     if resident is not None:
@@ -837,15 +837,15 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         released = _release_bank_file(root / "bank.h5")
         if released is not None:
             residence = dict(residence, released=released)
-            log.debug(f"shared-pole bank: scratch file released after the constructor "
+            log.debug(f"tangential bank: scratch file released after the constructor "
                      f"({released['bytes'] / 2**30:.2f} GiB, {released['links']} link(s))")
     receipts["bank_residence"] = residence
     with timing.section("spole.screening_finalize", announce=True,
-                        label="shared-pole receipts and head"):
+                        label="tangential receipts and head"):
         record("constructor", result)
         models = result["model_residence"]
         if "payload_bytes_per_rank" in models:
-            log.debug(f"shared-pole {'sector models' if photon else 'model'}: {models['residence']}; "
+            log.debug(f"tangential {'sector models' if photon else 'model'}: {models['residence']}; "
                      f"{models['payload_bytes_per_rank'] / 2**30:.3f} GiB/rank"
                      f"{' bound' if photon else ''}; {models['reason']}")
         header = None if photon else result["model_header"]
@@ -861,22 +861,22 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             handle["hold_charge_model"] = True
         # Device-resident sector models stay live until Sigma releases them.
         ledger.live_stages = (handle['model_stage'],) if handle.get('model_stage') else ()
-        result = dict(shared_pole=handle)
+        result = dict(tangential=handle)
         from .gw_config import HeadCorrection
         if photon:
             _mark_photon_head(handle, config)
         elif config.head.correction is not HeadCorrection.OFF:
-            from .shared_pole_head import build_shared_pole_head
-            head, iteration_head = build_shared_pole_head(
+            from .tangential_head import build_tangential_head
+            head, iteration_head = build_tangential_head(
                 handle, header, V_q, wfns, meta, config, mesh_xy=mesh_xy, wfn=wfn,
                 response=iteration_head_response, head_resolver=head_resolver,
                 plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
             result.update(mpa_head=head, iteration_head=iteration_head)
             record("head", head)
         if (config.debug.write_w or config.write_poles) and not photon:
-            from file_io.shared_pole_store import export_shared_pole_outputs
+            from file_io.tangential_store import export_tangential_outputs
             with timing.section("spole.outputs"):
-                receipts["outputs"] = export_shared_pole_outputs(handle, meta=meta,
+                receipts["outputs"] = export_tangential_outputs(handle, meta=meta,
                     config=config, mesh_xy=mesh_xy, source_wfn=source_wfn,
                     run_dir=run_dir, label=label, tables=tables, print_fn=print_fn)
         # The member lives in the restart file, so it is registered exactly when
@@ -884,7 +884,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         from .gw_output import restart_tensor_writes_enabled
         if (tensors_filename is not None and not sc_scratch and not photon
                 and restart_tensor_writes_enabled(config, tensors_filename)):
-            receipts["restart_member"] = register_shared_pole_restart_member(
+            receipts["restart_member"] = register_tangential_restart_member(
                 tensors_filename, handle["path"], expected_identity=identity,
                 mesh_xy=mesh_xy, capacity=ledger)
         receipts["seconds"] = time.monotonic() - started
@@ -898,6 +898,6 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         compact = {key: (dict(file=key + "_receipt.json") if key in recorded else value)
                    for key, value in receipts.items()}
         rank0_transaction(
-            summary, stage="shared_pole.construction_receipt",
+            summary, stage="tangential.construction_receipt",
             write=lambda: summary.write_text(_json(compact) + "\n"))
         return result

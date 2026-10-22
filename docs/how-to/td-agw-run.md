@@ -397,18 +397,18 @@ to 77 meV between refreshes, following the invalid-mode flips in the refresh
 lines, and P(t) does not converge with the cadence. Read the flips column
 before trusting a run.
 
-### Shared-pole screening {#collision-shared-pole}
+### Tangential screening {#collision-tangential}
 
 This section records the earlier arithmetic-operator prototype. The deck below
 now refuses at `td_collision_keldysh_screening`; the passive retarded pole bank
 cannot stand in for a joint retarded/lesser response-and-noise realization.
 
 ```toml
-collision_screening = "shared_pole"       # historical example: currently refused
+collision_screening = "tangential"       # historical example: currently refused
 collision_source = "../04_gw_oneshot_mpa_eqp/oneshot.in"   # the SPM GW deck (default: bundle_input)
 collision_refresh_sweep = "active"
 collision_refresh_fs = 0.25
-# collision_rebase = "auto"               # on for shared_pole: C[rho_eq] on W(t)
+# collision_rebase = "auto"               # on for tangential: C[rho_eq] on W(t)
 # collision_spm_support_sites_ev = "<line> | <imaginary> | <height>"   # explicit supports (V2'); default: the ladder
 ```
 

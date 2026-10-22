@@ -19,8 +19,8 @@ converged by raising `number_bands`; its measured size is in
 ## Where it runs
 
 The plasmon-pole stages (`gn_ppm`, `hl_ppm`), the scalar `mpa` stage
-(shared pole or MPA fit) and both bispinor shared-pole routes
-(`bispinor_gw = bare_transverse` and `full_shared_pole`) consume it: all of
+(shared pole or MPA fit) and both bispinor tangential routes
+(`bispinor_gw = bare_transverse` and `full_tangential`) consume it: all of
 them run the same pole-sum Σ executor, which splits the Green band sum into
 brackets. A static stage and a bispinor MPA fit do not: a defaulted-on key
 disables itself with a log note and a named key refuses. On a static Coulomb
@@ -29,7 +29,7 @@ hole the band limit anti-converges, so that guard is a correctness rule
 
 ## Four-current Σ {#four-current}
 
-With `bispinor_gw = full_shared_pole`, Σ_c is a sum of four endpoint classes
+With `bispinor_gw = full_tangential`, Σ_c is a sum of four endpoint classes
 (CC, TT, CT, TC), each with its own pole set and its own τ sweep, plus the
 equal-time W∞ − V constant ([bispinor GW](bispinor-gw.md#routes)). Only the
 CC class is extrapolated. Its τ sweep splits the Green band sum into the
@@ -181,12 +181,12 @@ own band truncation.
 | shared pole, one-shot (claim 2948) | 35.6 / 125.1 / 37.0 / −120.4 | 21.2 / 83.7 / 24.3 / −72.8 (β 4.75, Ω 36 eV) |
 | GN-PPM, head off (claim 2942) | 34.4 / 107.1 / 36.8 / −96.4 | 19.9 / 72.0 / 20.5 / −53.3 (β 4.75, Ω 38 eV) |
 
-The shared-pole legs ran with a study Gram-validity dial (the stock gate
+The tangential legs ran with a study Gram-validity dial (the stock gate
 refuses 78 bands on 2532 centroids). Most of the remainder is W's band
 truncation ([scope](#scope)), which the study below separates (case c
 against case a).
 
-**Study (shared-pole W, stored samples).** Si 4³, 25 Ry, scalar, complete
+**Study (tangential W, stored samples).** Si 4³, 25 Ry, scalar, complete
 basis (536 bands) as the truth;
 71 degeneracy-closed states within ±10 eV of midgap. G truncated at N; W at
 536 bands (case a) or at N (case c). Std over the states / max 4v4c difference

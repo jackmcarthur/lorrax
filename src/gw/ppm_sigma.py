@@ -772,7 +772,7 @@ def assert_gapped_occupations_for_ppm(occ_full, *, print_fn=print) -> int:
         f"uniformly empty over k\n"
         f"  fix:  GN/HL-PPM is not allowed for metals (owner ruling "
         f"2026-09-17): run this system with compute_mode = mpa and "
-        f"sigma_w_model = shared_pole on a WFN with its fractional "
+        f"sigma_w_model = tangential on a WFN with its fractional "
         f"occupations and occ_smearing_width_ry; or narrow the band window "
         f"so no band crosses E_F\n"
         f"  why:  with a crossing band, vbm > cbm, so the 'midgap' Fermi "
@@ -2043,45 +2043,45 @@ def add_window_parts(a: dict, b: dict) -> dict:
     return out
 
 
-def shared_pole_window_source(model: dict, meta, *, efermi_ry: float, linalg) -> dict:
-    """The ``poles`` argument of :func:`window_sigma_c` for a scalar shared-pole model.
+def tangential_window_source(model: dict, meta, *, efermi_ry: float, linalg) -> dict:
+    """The ``poles`` argument of :func:`window_sigma_c` for a scalar tangential model.
 
     ``model`` is the screening handle (``path``, ``identity``, ``digest``, ``K``) of
-    ``gw.shared_pole_screening.screen_shared_poles``; ``meta`` the bundle whose
-    ``shared_pole_recipe`` and ``shared_pole_capacity`` built it (the Σ stage's
+    ``gw.tangential_screening.screen_tangential_poles``; ``meta`` the bundle whose
+    ``tangential_recipe`` and ``tangential_capacity`` built it (the Σ stage's
     eta gate and model validation read them); ``efermi_ry`` the omega frame of the
-    run's shared-pole Σ stage (``efermi.resolve_sigma_efermi_ry``); ``linalg`` the
+    run's tangential Σ stage (``efermi.resolve_sigma_efermi_ry``); ``linalg`` the
     deck's resolved dense layout (``gw_config.linalg_resolution(...).layout``),
     which places the W(τ) synthesis.
     """
-    return dict(member="shared_pole", model=dict(model), meta=meta, efermi_ry=float(efermi_ry),
+    return dict(member="tangential", model=dict(model), meta=meta, efermi_ry=float(efermi_ry),
                 linalg=linalg)
 
 
-def fresh_shared_pole_capacity(meta, mesh_xy):
-    """A shallow copy of ``meta`` with its own shared-pole capacity ledger, no stage live.
+def fresh_tangential_capacity(meta, mesh_xy):
+    """A shallow copy of ``meta`` with its own tangential capacity ledger, no stage live.
 
-    The ledger (``gw.shared_pole_recipe.CapacityLedger``) prices one map's phases
+    The ledger (``gw.tangential_recipe.CapacityLedger``) prices one map's phases
     under unique stage names; a window Sigma or a static-W call after the GW run
     (TD-aGW, every refresh) is its own phase, so each gets a fresh ledger with no
     upstream reservation live (the run's bank and constructor are gone by then).
     """
     import copy
     from common.gpu_utils import device_budget_bytes
-    from .shared_pole_recipe import CapacityLedger
+    from .tangential_recipe import CapacityLedger
     out = copy.copy(meta)
-    out.shared_pole_capacity = CapacityLedger(out, mesh_xy=mesh_xy,
+    out.tangential_capacity = CapacityLedger(out, mesh_xy=mesh_xy,
                                               device_budget_bytes=int(device_budget_bytes()))
-    out.shared_pole_capacity.live_stages = ()
+    out.tangential_capacity.live_stages = ()
     return out
 
 
-def _shared_pole_window_run(wfns_t, source, meta_t, mesh_xy, plan, pop, internal_bands, *,
+def _tangential_window_run(wfns_t, source, meta_t, mesh_xy, plan, pop, internal_bands, *,
                             request_for, omega_grid_ry, keep_branches, print_fn, particle=None):
-    """One window sweep of a shared-pole model: the run's shared-pole Σ stage on the window carrier.
+    """One window sweep of a tangential model: the run's tangential Σ stage on the window carrier.
 
     ``gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`` (``sigma_w_model =
-    "shared_pole"``) with the causal branches of the band populations ``pop``
+    "tangential"``) with the causal branches of the band populations ``pop``
     (:func:`_population_branches`, restricted to ``internal_bands``; ``particle``
     the conduction weights where they are not 1 - pop, a non-diagonal line's),
     the run's ω frame, broadening and quadrature, and the plan's held session.
@@ -2093,7 +2093,7 @@ def _shared_pole_window_run(wfns_t, source, meta_t, mesh_xy, plan, pop, internal
     request = None if request_for is None else request_for(efermi)
     omega = omega_grid_ry if request is None else request.frequencies_ry
     s = wfns_t.slices
-    # The shared-pole executor's branches run over the Σ band sum (``slices.sigma_sum``,
+    # The tangential executor's branches run over the Σ band sum (``slices.sigma_sum``,
     # gw.mpa.sigma._branches), which the faces carry; ``pop`` is on ``slices.full``.
     nb_all = int(np.asarray(jax.device_get(wfns_t.enk)).shape[1])
     cols = np.arange(nb_all)[s.full]
@@ -2109,7 +2109,7 @@ def _shared_pole_window_run(wfns_t, source, meta_t, mesh_xy, plan, pop, internal
         np.broadcast_to(np.asarray(internal_bands.mask, bool), np.shape(w))[:, sel],
         particle_weights=None if cw is None else np.asarray(cw)[:, sel])
     res = compute_sigma_c_mpa_omega_grid(
-        wfns_t, model["path"], meta_t, mesh_xy, sigma_w_model="shared_pole",
+        wfns_t, model["path"], meta_t, mesh_xy, sigma_w_model="tangential",
         fit_identity=model["identity"], fit_digest=model["digest"], request=request,
         omega_grid_ry=None if request is not None else omega_grid_ry, efermi_ry=efermi,
         regularization_width_ry=float(cfg.regularization_ev) / RYD_TO_EV,
@@ -2147,10 +2147,10 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         occupations ``occ``, Ry).  Held for the run, never modified.  Its parent
         rows must be the full zone (a general drive breaks the point group).
     poles : :class:`PPMBuildResult` (:func:`fit_pole_model` / :func:`screening_update`), or a
-        shared-pole source, :func:`shared_pole_window_source`: the scalar shared-pole model
+        tangential source, :func:`tangential_window_source`: the scalar tangential model
         of a GW run (or of a refit at other occupations) swept by the run's own
-        shared-pole Σ stage (``gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`` with
-        ``sigma_w_model = "shared_pole"``); it has no invalid modes, so its
+        tangential Σ stage (``gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`` with
+        ``sigma_w_model = "tangential"``); it has no invalid modes, so its
         ``branch_pair['static']`` is zero.
     window : ``dict(b_lo, U, e, f)`` — the active window [b_lo, b_lo + n_A) on the
         bundle's band axis: U (nk, n_A, n_A) the instantaneous orbitals'
@@ -2201,8 +2201,8 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         matrix and sits in ``static_limit['sx']`` (``head`` zero).
     static_limit_wc0 : with ``static_limit`` only: the W^c(0) of the static limit,
         (nq, mu, mu) as ``poles.Wc0_q`` (default ``poles.Wc0_q``; required for a
-        shared-pole source, whose static value is its model's,
-        ``gw.mpa.sigma.shared_pole_static_wc``).  A refreshed-screening collision term
+        tangential source, whose static value is its model's,
+        ``gw.mpa.sigma.tangential_static_wc``).  A refreshed-screening collision term
         sweeps the poles of W(t) and subtracts the static limit of the run's W0, the
         part K drho already holds (td_agw_dynamical.md §7.1).
 
@@ -2302,11 +2302,11 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     put = lambda a: device_put_process_local(np.ascontiguousarray(a), rep)
     rows = np.asarray(kplan.parent_full_rows if kplan.parent_full_rows is not None
                       else np.arange(nk))
-    spm = isinstance(poles, dict) and poles.get("member") == "shared_pole"
+    spm = isinstance(poles, dict) and poles.get("member") == "tangential"
     if spm and static_limit and static_limit_wc0 is None:
-        raise ValueError("GATE window_sigma_static_wc0: got a shared-pole source without "
+        raise ValueError("GATE window_sigma_static_wc0: got a tangential source without "
                          "static_limit_wc0; want the model's W^c(0) (gw.mpa.sigma."
-                         "shared_pole_static_wc); fix: pass static_limit_wc0")
+                         "tangential_static_wc); fix: pass static_limit_wc0")
     meta_src = poles.get("meta", meta) if spm else meta
     head = None if internal == "frozen" else plan.get("head")
 
@@ -2343,14 +2343,14 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
                 b_id_4_user=int(meta_src.b_id_4_user or meta_src.b_id_4) + n_ins,
                 b_id_4_chi=shift(meta_src.b_id_4_chi), b_id_4_sigma=shift(meta_src.b_id_4_sigma))
         if spm:
-            # The shared-pole Σ stage reads the map's recipe and census, set on the run's
+            # The tangential Σ stage reads the map's recipe and census, set on the run's
             # metadata as attributes outside its fields (gw_jax), which dataclasses.replace
             # does not carry (its __post_init__ rederives nb_sigma and the band edges from
             # b_id_3); its capacity ledger is this call's own.
-            for name in ("shared_pole_recipe", "shared_pole_census", "shared_pole_state_identity"):
+            for name in ("tangential_recipe", "tangential_census", "tangential_state_identity"):
                 if hasattr(meta_src, name):
                     setattr(meta_t, name, getattr(meta_src, name))
-            meta_t = fresh_shared_pole_capacity(meta_t, mesh_xy)
+            meta_t = fresh_tangential_capacity(meta_t, mesh_xy)
         return wfns_t, meta_t, slices_t, enk_l
 
     def line_sweep(line, pop_l, part_l, ib_l, plan_l, omega_grid=None, keep_branches=False):
@@ -2377,8 +2377,8 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         if spm:
             # each Sigma evaluation (the on-shell pair, the grid) is its own capacity phase:
             # the ledger's stage names are unique per ledger, so every call gets a fresh one
-            res = _shared_pole_window_run(
-                wfns_t, poles, fresh_shared_pole_capacity(meta_t, mesh_xy), mesh_xy, plan_l,
+            res = _tangential_window_run(
+                wfns_t, poles, fresh_tangential_capacity(meta_t, mesh_xy), mesh_xy, plan_l,
                 pop_l, ib_l, request_for=request_for if omega_grid is None else None,
                 omega_grid_ry=omega_grid, keep_branches=keep_branches, print_fn=quiet,
                 particle=part_l)
@@ -2439,7 +2439,7 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     sweep = census()
     hr = head_rows(res.efermi_ry, enk_t, pop, nb_sig)
     # The pole executor returns a band-count cube (count 0: the window's sum); the
-    # shared-pole executor (gw.mpa.sigma) its OnShellSigma directly.
+    # tangential executor (gw.mpa.sigma) its OnShellSigma directly.
     point = first(res.sigma_c_kij).with_head(hr)
     pair = np.asarray(gather_to_host(block4(point.pair)))
     diag = np.einsum("kii->ki", pair[0])

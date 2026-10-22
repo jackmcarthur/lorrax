@@ -147,7 +147,7 @@ sentinel-padded H'_vv (n 9152, 4×4). So:
   `workspace_bytes_per_rank`.
   **Check what you use:** a caller that keeps only w > c·max(w) passes `cut=c`
   (`plan.batched(A, cut=c)`, every route; every attempt of the chain is
-  probed on those columns only). The shared-pole Gram, H′_vv, Schur and
+  probed on those columns only). The tangential Gram, H′_vv, Schur and
   sector-metric eighs pass their keep cut, the passivity eigh 1e-8 (its
   verdict reads eigenvalues only), the charge ζ factor `zeta_rcond` and the
   Coulomb root its support tolerance; the Ritz eighs and the response
@@ -314,7 +314,7 @@ route (c), and refuses by name at the first stack that needs the whole mesh
   route (c) (about 8 n² per whole matrix a rank holds on route (c); on the whole
   mesh the vectors stack, the values and one solve's workspace). The bispinor sector
   constructor prices each stack so and passes an explicit route-(c) or
-  whole-mesh plan (`gw.shared_pole_execution.staged_eigh`): no room, no
+  whole-mesh plan (`gw.tangential_execution.staged_eigh`): no room, no
   sizing compile and no exchange.  `eigh_stack_proposal(mesh, shape, dtype)` is the
   route-(c) first attempt in closed form (five matrices per rank's share of the batch, plus
   the solver workspace outside the program, `local_eigh_workspace`), for a caller whose run program is not known yet (the line

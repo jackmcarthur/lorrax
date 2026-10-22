@@ -101,7 +101,7 @@ nav:
       - HL-GPP derivation: theory/hl-gpp-derivation.md
       - Non-Hermitian GN-PPM: theory/gn-ppm-nonhermitian.md
       - Multipole frequency integration (MPA): theory/THEORY_mpa_implementation.md
-      - Shared-pole screened interaction: theory/shared-pole-w-model.md
+      - Tangential screened interaction: theory/tangential-w-model.md
       - The Sigma(omega) quadrature problem: theory/sigma-quadrature-problem.md
       - Sigma_c band extrapolation: theory/band-extrapolation.md
       - On-shell Sigma_c: theory/sigma-on-shell.md
@@ -133,8 +133,8 @@ nav:
       - Charge zeta fit (route G): architecture/zeta_fit_mubatch.md
       - Face-psi zeta fitting: architecture/zeta_fit_face_psi_cct.md
       - Fractional chi0 response face: architecture/fractional_chi0_response_face.md
-      - Shared-pole W (implementation): architecture/shared_pole_model.md
-      - Shared-pole W for bispinor sectors: architecture/bispinor_shared_pole_w.md
+      - Tangential W (implementation): architecture/tangential_model.md
+      - Tangential W for bispinor sectors: architecture/bispinor_tangential_w.md
       - Four-current wiring: architecture/four_current_wiring.md
       - Iterative eigensolvers: architecture/iterative_eigensolvers.md
       - The NSCF Hamiltonian: architecture/nscf_hamiltonian.md

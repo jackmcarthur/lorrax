@@ -473,7 +473,7 @@ def _staged_mover(mesh: Mesh, body, in_spec, out_spec, lead: int, p_x: int,
     from jax import shard_map
     from runtime.padding import mesh_divisor
     ndev = mesh_divisor(mesh)
-    # jit: an eager call (the shared-pole constructor's) compiles once per
+    # jit: an eager call (the tangential constructor's) compiles once per
     # shape instead of dispatching the body op by op on every call; under a
     # caller's jit it inlines as before.
     sm = jax.jit(shard_map(body, mesh=mesh, in_specs=(in_spec,),
@@ -508,7 +508,7 @@ def face_to_batch_reshard(mesh: Mesh, *,
 
     Memoized per (mesh, axes, lead): the returned kernel keeps its
     per-shape programs, so a caller that asks again every SC map (the
-    shared-pole constructor) reuses them instead of recompiling.
+    tangential constructor) reuses them instead of recompiling.
 
     Parameters
     ----------

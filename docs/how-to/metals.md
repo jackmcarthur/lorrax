@@ -15,8 +15,8 @@ page does not restate them.
   QE). Every other smearing family refuses (`GATE metal_occupations_fermi_dirac`).
   The code classifies the material from the `WFN.h5` occupations; no key sets
   it.
-- **W is the shared-pole model.** `compute_mode = mpa`,
-  `sigma_w_model = shared_pole`. GN-PPM refuses metals
+- **W is the tangential model.** `compute_mode = mpa`,
+  `sigma_w_model = tangential`. GN-PPM refuses metals
   (`GATE gn_ppm_refuses_metals`). Elementwise MPA (`sigma_w_model = mpa`) is a
   comparison only, and it refuses time-reversal-broken metals
   (`GATE mpa_ordered_metal`).
@@ -63,7 +63,7 @@ fixed-N μ).
   default); `sigma_omega_min_ev`/`sigma_omega_max_ev` are optional minimum
   extents. Σ is evaluated on shell, so the grid sets the covered range
   ([on-shell Σ_c](../theory/sigma-on-shell.md)).
-- The shared-pole support ladders, the Σ quadrature rules
+- The tangential support ladders, the Σ quadrature rules
   (`sigma_quadrature_eps`, default 1e-4) and the SC pad-then-hold windows.
 - The q→0 head from the tetrahedron Fermi-surface weights and the
   `dipole.h5` velocities.
@@ -103,7 +103,7 @@ nval = 10
 ncond = 8
 number_bands = 35
 compute_mode = mpa
-sigma_w_model = shared_pole
+sigma_w_model = tangential
 occ_smearing_width_ry = 0.02
 fermi_reference = mp1_fixed_n
 qp_solver = self_consistent

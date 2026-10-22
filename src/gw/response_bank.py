@@ -106,7 +106,7 @@ def _dyson_room(meta, mesh_xy, n):
     exchange, no sync. None (the leg's library, never one_device) on one rank, with no
     ledger, or with the ledger's caller lifetimes unbound (unknown live bytes are not zero).
     """
-    ledger = getattr(meta, "shared_pole_capacity", None)
+    ledger = getattr(meta, "tangential_capacity", None)
     ranks = int(mesh_xy.size)
     if ledger is None or ranks <= 1:
         return None
@@ -579,7 +579,7 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     """
     from ffi import ffi_dial_key
 
-    from file_io.shared_pole_store import charge_representation
+    from file_io.tangential_store import charge_representation
 
     if vertex is not None:
         if pair_mode == "laplace":
@@ -719,7 +719,7 @@ def _check_bare_hermitian(mesh_xy, q0, receipt, **moments):
     """GATE response_moment_hermiticity on one q batch's even bare moments.
 
     The constructor selects its infinity directions from the Hermitian part of
-    M1 (``shared_pole_directions.infinity_directions``), so the Hermiticity of
+    M1 (``tangential_directions.infinity_directions``), so the Hermiticity of
     what M1 is formed from is checked here, at the checked eigh's round-off
     tolerance ``distrib_la.roundoff_tol(n)``. GPU streams give <= 4e-16 (CrI3
     24x24, n = 3328); the replicated ratios make every rank refuse alike.
@@ -755,15 +755,15 @@ def _record_odd_moments(q0, M0, M1, M2, M3, receipt):
 
 def _bank_context(wfns, meta, sym, bank_io, mesh_xy):
     """Authenticate A/B's existing scratch transaction and physical state."""
-    from file_io.shared_pole_store import (charge_representation,
-                                           validate_shared_pole_bank)
+    from file_io.tangential_store import (charge_representation,
+                                           validate_tangential_bank)
 
     # The measured time-reversal verdict selects the orientation (callers
     # read sym.trs_allowed); only the operator representation refuses here.
     if not charge_representation(meta) and "photon_v" not in bank_io:
         raise ValueError("GATE response_representation: want an authenticated "
                          "scalar, two-component, or four-component charge carrier")
-    header = validate_shared_pole_bank(bank_io["path"],
+    header = validate_tangential_bank(bank_io["path"],
         expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
     qids = np.asarray(sym.q_irr_full_idx, dtype=np.int64)
     if not np.array_equal(qids, header["q_irr_full_idx"]):
@@ -924,7 +924,7 @@ def dense_layout(meta, config, mesh_xy, n):
     one parent after another (``whole_parent_execution``, the line selection's
     rule). Every rank decides from the shapes and the shared ledger."""
     from .gw_config import linalg_resolution
-    from .shared_pole_execution import whole_parent_execution
+    from .tangential_execution import whole_parent_execution
     layout = linalg_resolution(
         config if hasattr(config, "get") else {"linalg": config.backend.linalg}).layout
     if layout != "local":
@@ -932,7 +932,7 @@ def dense_layout(meta, config, mesh_xy, n):
     whole = _WHOLE_PARENT_MATRICES * 16 * int(n) * int(n)
     execution, _, _ = whole_parent_execution(
         lambda e: (0, whole if e == "local" else -(-whole // int(mesh_xy.size))),
-        ledger=meta.shared_pole_capacity, whole=int(n))
+        ledger=meta.tangential_capacity, whole=int(n))
     return "local" if execution == "local" else "distributed"
 
 
@@ -940,7 +940,7 @@ def _reserve(meta, stage, resident, workspace=0, runs_in=None, book=True):
     """Reserve a uniquely named actual-batch footprint in the shared ledger, priced in the
     section that allocates it (``runs_in``; ``book`` False: a live set later phases' rooms
     hold, no stage's own price)."""
-    ledger = meta.shared_pole_capacity
+    ledger = meta.tangential_capacity
     name = f"{stage}:{len(ledger.entries)}"
     row = ledger.reserve(name, resident_bytes_per_rank=int(resident),
                         workspace_bytes_per_rank=int(workspace),
@@ -995,7 +995,7 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
     def execute(kernel, args, stage, runtime_bytes=0):
         """``runtime_bytes``: what the executable draws at run time outside its
         buffer assignment (mathdx mode 11's split arm), admitted with it."""
-        meta.shared_pole_capacity.at_phase()
+        meta.tangential_capacity.at_phase()
         with timing.section('bank.compile.' + stage, announce=True):
             started = time.monotonic()
             executable = _compiled(kernel, args)
@@ -1030,7 +1030,7 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 lu = lu if lu is not None and lu.backend == "cusolvermp" else None
                 if lu is not None:
                     from distrib_la import lu_workspace_query
-                    ledger, n_lu = meta.shared_pole_capacity, int(args[0].shape[-1])
+                    ledger, n_lu = meta.tangential_capacity, int(args[0].shape[-1])
                     room = max(0, ledger.room_bytes_per_rank(ledger.live_stages) - memory.argument_size_in_bytes - new)
                     try:
                         # getrf, its pivots and one block column (cap 0: the native's narrowest
@@ -1055,7 +1055,7 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 inherited_stream=False,
                 stream_temporaries_admitted=stream))
         with timing.section('bank.dispatch.' + stage, announce=stream,
-                            label=f"shared-pole bank {stage} dispatch"):
+                            label=f"tangential bank {stage} dispatch"):
             started = time.monotonic()
             try:
                 result = executable(*args)
@@ -1083,7 +1083,7 @@ def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout, room=None):
         # where they fit (a whole n^2 per rank unpriced was 115 GB/rank at n 30000).
         if room is None:
             from common.gpu_utils import shared_device_room
-            room = shared_device_room("shared-pole bank Coulomb root eigh")
+            room = shared_device_room("tangential bank Coulomb root eigh")
         eig = plan("eigh", mesh_xy, n=n_packed, budget_bytes=room)
     else:
         eig = plan("eigh", mesh_xy, backend="distributed", n=n_packed,
@@ -1118,7 +1118,7 @@ def _coulomb_pack(basis,mesh_xy):
 #: and q set), so the bank, moments and constructor of every map after the
 #: first reuse the first map's roots instead of re-reading V and re-solving its
 #: eigenproblems.  Keyed by the operator token of the resource
-#: (``shared_pole_screening._coulomb_resource``), the span and the solve layout;
+#: (``tangential_screening._coulomb_resource``), the span and the solve layout;
 #: a new operator drops the old roots.  Held bytes per rank: 32 N_mu_packed^2 per
 #: held q row / P; the bank, moments and constructor rounds share (0, N_q)
 #: (a round slices its rows, one transient round slice), so
@@ -1259,7 +1259,7 @@ def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
     # (bucketed: the program is cached on it); every rank enters the agreement.
     from .gw_config import linalg_resolution
     from common.gpu_utils import shared_device_room
-    room = (shared_device_room("shared-pole bank Coulomb root eigh")
+    room = (shared_device_room("tangential bank Coulomb root eigh")
             if linalg_resolution({"linalg": layout}).layout == "local" else None)
     kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout, room)
     _compiled(kernel, (_packed_v(mesh_xy, shape[0], basis.n_packed),), ahead=True)
@@ -1379,7 +1379,7 @@ def _finish_receipt(receipt, meta, header, started):
     _resolve_reciprocity(receipt)
     receipt["seconds"]["total"] = time.monotonic()-started
     receipt["bank_complete"] = bool(header["complete"])
-    receipt["capacity"] = meta.shared_pole_capacity.receipt()
+    receipt["capacity"] = meta.tangential_capacity.receipt()
     stats = [d.memory_stats() for d in jax.local_devices()]
     local_peak = max((v.get("peak_bytes_in_use",0) for v in stats if v),default=0)
     from jax.experimental import multihost_utils
@@ -1444,7 +1444,7 @@ def _run_priced(program, *args, label):
     (``runtime.aot_memory.compiled_new_bytes``) beside the bytes in use, compiled once per signature."""
     from lxkit import memory
     from runtime.aot_memory import compiled_new_bytes
-    from gw.shared_pole_execution import compiled_for
+    from gw.tangential_execution import compiled_for
     executable = compiled_for(program, args)
     memory.book(memory.priced(compiled_new_bytes(executable), f"{label} (compiled)", increment=True))
     return executable(*args)
@@ -1538,7 +1538,7 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
     order = _moment_batch_major(mesh_xy, n_out, int(width), n_batch)
     outputs = [(r, r) for r in range(n_batch * n_out)]
     # The passes being drained stay live beside every correlation's admission.
-    ledger = meta.shared_pole_capacity
+    ledger = meta.tangential_capacity
     live = ledger.live_stages
     in_flight = bank.in_flight * 2 * n_batch * int(width) * n_out * 16 * max(r * c for r, c, _ in segments[0])
     carries, _ = _reserve(meta, "moment_pass_carry", 0, in_flight, book=False)
@@ -1568,7 +1568,7 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
 def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                         vertex=None, contact=None, direct_head=None):
     """Stage B: six exact correlations, physical recurrence, scratch write."""
-    from file_io.shared_pole_store import write_shared_pole_bank
+    from file_io.tangential_store import write_tangential_bank
     header, qids, census = _bank_context(wfns, meta, sym, bank_io, mesh_xy)
     receipt = _receipt("moments", census, bank_io)
     if not bool(sym.trs_allowed):
@@ -1576,7 +1576,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
         # 1/z^3, so the same six correlations stay exact on an ordered bank.
         receipt["ordered"] = True
     execute = _bank_execution(meta, mesh_xy, receipt, config, photon=vertex is not None)
-    ledger = meta.shared_pole_capacity
+    ledger = meta.tangential_capacity
     ambient = ledger.live_stages
     started = time.monotonic()
     n = meta.mu_basis.n_packed if vertex is None else vertex.n
@@ -1681,7 +1681,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                         continue
                     span = (int(q0+lo),int(q0+hi))
                     io_started = time.monotonic()
-                    header = write_shared_pole_bank(bank_io["path"], q_span=span,
+                    header = write_tangential_bank(bank_io["path"], q_span=span,
                         **{name: values[name][lo:hi] for i,name in enumerate(fields) if not marked[lo,i]},
                         meta=meta, expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
                     receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
@@ -1756,7 +1756,7 @@ def _reciprocity_census(receipt, value, z_batch, q_full, parent, meta):
     This row REFUSES NOTHING. It is recorded because it is the quantity that
     fails first when a self-consistent loop amplifies an off-manifold
     reciprocity-violating mode, and nothing else in the construction measures
-    it: the shared-pole Gram gate sees it only after the Loewner pencil has
+    it: the tangential Gram gate sees it only after the Loewner pencil has
     amplified it by ~1e2.
     Every rank evaluates it; no rank-conditional device work (INVARIANTS 21).
     """
@@ -2017,7 +2017,7 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
     # with the response rule's own energy pad and widened only when the support
     # leaves them. Bands outside the support carry exact-zero weight, so a held
     # wider interval is the same product.
-    session = getattr(meta, "shared_pole_response_rules", None)
+    session = getattr(meta, "tangential_response_rules", None)
     if session is not None:
         held = session.get("band_ranges")
         if held is None or any(a < c or b > d for (a, b), (c, d) in zip(band_ranges, held)):
@@ -2033,7 +2033,7 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
     log.debug(f"Response occupied/empty band intervals: {band_ranges} of {f.shape[-1]}")
     support = dict(f=f, u=u, refs=refs, lo=lo, hi=hi, mu=mu, decay_rate=decay_rate,
                    amplitude=amplitude, band_ranges=band_ranges)
-    spec = getattr(meta, "shared_pole_response_blocks", None)
+    spec = getattr(meta, "tangential_response_blocks", None)
     if spec is not None:
         # The TD refit only (tdagw.dynsig.spm_screening): chi0 as four blocks on the
         # same stream; the band bounds above enclose every block's weights.
@@ -2099,7 +2099,7 @@ def _block_quadrature(meta, sample_plan, receipt, support, *, group_size, print_
 
     A block's rule is built once on every sample (decay rate 0, its own
     interval and gauge reference; minimax ``panels`` for a sample whose pencil
-    fails) and held in the block spec (``meta.shared_pole_response_blocks
+    fails) and held in the block spec (``meta.tangential_response_blocks
     ["held"]``) while its interval and the samples are unchanged.  An
     evaluation group is at most ``group_size`` samples in the one-block order
     (:func:`response_groups`); its passes are every block rule group with a
@@ -2110,7 +2110,7 @@ def _block_quadrature(meta, sample_plan, receipt, support, *, group_size, print_
     import minimax
     from .sigma_box_plan import snap_outward
     from .response_pencil import response_pencil_source
-    spec = meta.shared_pole_response_blocks
+    spec = meta.tangential_response_blocks
     held = spec.setdefault("held", {})
     z = bank_points(sample_plan)
     rel_tol = float(sample_plan["bank_rule_tolerance"])
@@ -2215,7 +2215,7 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
     lo, hi = snap_outward(support["lo"], 1., -1), snap_outward(support["hi"], 1., +1)
     decay_rate = snap_outward(support["decay_rate"], 1., -1)
     amplitude = snap_outward(support["amplitude"], 1., +1)
-    session = getattr(meta, "shared_pole_response_rules", None)
+    session = getattr(meta, "tangential_response_rules", None)
     old = None if session is None else session.get("frequency")
     metallic = sample_plan["census"]["partial_at_mu"]
     failed = [] if old is None else [
@@ -2876,7 +2876,7 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
     budget less that room.  Every rank computes the same group.
     """
     from common.gpu_utils import device_budget_bytes
-    ledger = meta.shared_pole_capacity
+    ledger = meta.tangential_capacity
     device_room = ledger.room_bytes_per_rank(ledger.live_stages)
     fixed = max(int(stream_workspace), int(selection[0]) + int(selection[1]))
     fits = lambda g: (ledger.preview(resident_bytes_per_rank=g*carry_per_sample+int(selection[0]),
@@ -2892,7 +2892,7 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
 def response_bank_residence(meta, *, segments, n_samples, carry_per_sample, group_size, host_reserved=0):
     """Where this map's χ bank (value and slope of every sample) lives.
 
-    The rule of the shared-pole bank (``shared_pole_screening._bank_residence``):
+    The rule of the tangential bank (``tangential_screening._bank_residence``):
     on the devices when every sample fits one group (``group_size``, from the
     capacity ledger and the compiled stream); otherwise streamed, the stream
     running once with every sample and each row pass written out
@@ -2922,7 +2922,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
 
     A fitted line sample off the imaginary axis stores only its direction
     panels: its directions are selected from W(z) itself and the constructor
-    reads nothing else from it (``gw.shared_pole_directions.LineSelection``).
+    reads nothing else from it (``gw.tangential_directions.LineSelection``).
     Samples on the imaginary axis and held samples are stored dense.
     """
     with timing.section('bank.setup', announce=True):
@@ -2992,11 +2992,11 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             receipt["ordered"] = True
         started = time.monotonic()
         execute = _bank_execution(meta, mesh_xy, receipt, config, photon=vertex is not None)
-        ledger = meta.shared_pole_capacity
+        ledger = meta.tangential_capacity
         ambient = ledger.live_stages
-    from file_io.shared_pole_store import (dense_sample_rows, read_shared_pole_bank,
-                                           shared_pole_bank_writer)
-    from .shared_pole_execution import line_selection_execution, line_selection_room
+    from file_io.tangential_store import (dense_sample_rows, read_tangential_bank,
+                                           tangential_bank_writer)
+    from .tangential_execution import line_selection_execution, line_selection_room
     response_rows = panel_rows(0, len(qids))
     row_index = {q: i for i, q in enumerate(response_rows)}
     face_bytes = 16*n*n//mesh_xy.size
@@ -3040,11 +3040,11 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
 
     def line_selector(execution, width, room):
         if vertex is None:
-            from .shared_pole_directions import charge_line_selection
+            from .tangential_directions import charge_line_selection
             return charge_line_selection(meta, mesh_xy=mesh_xy, ordered=ordered,
                                          execution=execution, nq=width,
                                          eigh_backend=face_eigh_backend, room=room)
-        from .shared_pole_sectors import sector_line_selection
+        from .tangential_sectors import sector_line_selection
         return sector_line_selection(bank_io, meta, mesh_xy=mesh_xy, execution=execution, nq=width,
                                      eigh_backend=face_eigh_backend, room=room)
 
@@ -3059,7 +3059,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     line_layout = ("batch" if selection is not None and selection.execution == "local"
                    and dyson.pair("batch") is not None else "face")
     with timing.section('bank.window_geometry', announce=True,
-                              label="shared-pole frequency rule construction"):
+                              label="tangential frequency rule construction"):
         support = response_support(wfns, meta, sample_plan, receipt, print_fn=print_fn)
         ledger.live_stages = ambient
         segments = stream_segments(wfns, meta, mesh_xy, len(response_rows), vertex)
@@ -3194,7 +3194,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         if vertex is None:
             return 0.
         io_started = time.monotonic()
-        constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
+        constant = read_tangential_bank(bank_handle, span, meta=meta, header=header,
                                          fields=("constant",))["constant"]
         receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
         return constant
@@ -3268,7 +3268,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     value = value - constant
             else:
                 io_started = time.monotonic()
-                saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
+                saved = read_tangential_bank(bank_handle, span, meta=meta, header=header,
                     sample_span=(sample,sample+1), fields=("Wc",))
                 receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
                 value = saved["Wc"][:,0]
@@ -3384,7 +3384,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     else (lambda row: finish(next(raw_group))))
         io_started = time.monotonic()
         # One collective writer transaction per group, not per sample.
-        with shared_pole_bank_writer(bank_io["path"], meta=meta,
+        with tangential_bank_writer(bank_io["path"], meta=meta,
                 expected_identity=bank_io["identity"], mesh_xy=mesh_xy) as (bank_handle, header, write):
             receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
             # Dense members first, line members (the selection, the bank's largest phase) last;
@@ -3642,13 +3642,13 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     also this map's ``qsgw_head.qp_velocity`` (DFT basis, head storage), and
     ``off`` the DFT bundle and its fixed-N state.
     """
-    from file_io.shared_pole_store import validate_shared_pole_bank
+    from file_io.tangential_store import validate_tangential_bank
 
     started = time.monotonic()
     # The photon bank's head, fenced so it is no longer an unnamed band of
     # spole.bank (P2-S): scratch validation, the V-file digest, the census.
     with timing.section("bank.photon_setup"):
-        header = validate_shared_pole_bank(bank_io["path"],
+        header = validate_tangential_bank(bank_io["path"],
             expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
         if header.get("photon_layout", {}).get("packed_extent") != layout.packed_extent:
             raise ValueError("GATE photon_bank_layout: scratch has a different packed photon layout")
@@ -3664,7 +3664,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
         census = response_weights(wfns, meta)[-1]
         receipt = _receipt("photon", census, bank)
         execute = _bank_execution(meta, mesh_xy, receipt, config, photon=True)
-    ledger = meta.shared_pole_capacity
+    ledger = meta.tangential_capacity
     ambient = ledger.live_stages
     nq, n = len(sym.q_irr_full_idx), layout.packed_extent
     # Packed V, contact/reference/D, all XY tiled.  The stream reads the two
@@ -3683,9 +3683,9 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                                          mesh_xy=mesh_xy, layout=layout)
         bank["photon_v"] = photon_bare_operator(wfns, wfns_transverse, meta,
             path=bank["bispinor_v_q_path"], mu_bases=mu_bases, layout=layout, mesh_xy=mesh_xy)
-        from .gw_config import uses_direct_bispinor_shared_pole_head
+        from .gw_config import uses_direct_bispinor_tangential_head
         direct_gamma = None
-        if uses_direct_bispinor_shared_pole_head(config):
+        if uses_direct_bispinor_tangential_head(config):
             from .photon_direct_head import subtract_bare_tt_from_bank
             if photon_g0_vectors is None or len(photon_g0_vectors) != 4:
                 raise ValueError("GATE photon_direct_gamma_vectors: expected four authenticated G=0 vectors")
@@ -3703,7 +3703,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     before = time.monotonic()
     log.debug("photon bank: centroid D and static grid reference")
     with timing.section("bank.static_contact"):
-        from file_io.shared_pole_store import write_bank_contact
+        from file_io.tangential_store import write_bank_contact
         grid, drude, contact = photon_static_contact(wfns, meta, mesh_xy=mesh_xy,
             layout=layout, vertex=vertex, occupation_state=occupation_state,
             sample_plan=sample_plan, execute=execute, receipt=receipt)
@@ -3719,7 +3719,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     del grid, drude
     direct_head = None
     with timing.section("bank.direct_head"):
-        if uses_direct_bispinor_shared_pole_head(config):
+        if uses_direct_bispinor_tangential_head(config):
             from .qsgw_head import read_authenticated_dipole_velocity
             from .photon_direct_head import build_direct_photon_head, packed_gamma_vectors
             cache = photon_head_cache if photon_head_cache is not None else {}
@@ -3765,7 +3765,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
         sym=sym, sample_plan=sample_plan, bank_io=bank, vertex=vertex,
         contact=contact, direct_head=direct_head, print_fn=print_fn)
     receipt["seconds"]["samples"] = time.monotonic()-before
-    header = validate_shared_pole_bank(bank["path"], expected_identity=bank["identity"],
+    header = validate_tangential_bank(bank["path"], expected_identity=bank["identity"],
                                        mesh_xy=mesh_xy, require_complete=True)
     ledger.live_stages = ambient
     receipt["completion"] = True

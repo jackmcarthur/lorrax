@@ -2172,7 +2172,7 @@ class SymMaps:
         # The view selects no antiunitary action (below), but time reversal is a
         # property of the Hamiltonian, not of the computational group: the
         # measured verdict carries over, so TR consumers (unordered response
-        # stores, the shared-pole head, W Hermiticity) keep their TR form.
+        # stores, the tangential head, W Hermiticity) keep their TR form.
         view.trs_allowed = self.trs_allowed
         view.qe_operation_antiunitary = np.array([False])
         view.qe_antiunitary_rows = np.empty(0, dtype=np.int32)

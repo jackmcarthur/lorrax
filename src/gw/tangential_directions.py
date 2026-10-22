@@ -97,7 +97,7 @@ def _sample_point(recipe, sample_id):
               else complex(value) for value in recipe["z_ry"]]
     values = np.asarray(points)[rows]
     if not len(rows) or not np.all(values == values[0]):
-        raise ValueError("GATE shared_pole_sample_identity: got: absent/inconsistent point; want: one z per distinct_id; why: roles share bank evaluations only")
+        raise ValueError("GATE tangential_sample_identity: got: absent/inconsistent point; want: one z per distinct_id; why: roles share bank evaluations only")
     return complex(values[0])
 
 
@@ -112,8 +112,8 @@ def _round_kernels(mesh, layout="batch"):
     from types import SimpleNamespace
     from jax import shard_map
 
-    from gw.shared_pole_execution import face_program, face_matmul
-    from gw.shared_pole_local import _mm as _local_product
+    from gw.tangential_execution import face_program, face_matmul
+    from gw.tangential_local import _mm as _local_product
     batch, rep = P(('x', 'y')), P()
     mm = face_matmul(mesh) if layout == 'face' else lambda a,b,**kw: _local_product(a,b,**kw)
     adjoint = lambda a: jnp.conj(jnp.swapaxes(a, -1, -2))
@@ -207,7 +207,7 @@ def port_extent(mesh_xy):
     rank cap: the same function sizes round sums and pole budgets, which exceed n.
     """
     from runtime.padding import ladder_extent, padded_axis
-    return lambda width: padded_axis(ladder_extent(width), mesh_xy, name="shared_pole_port",
+    return lambda width: padded_axis(ladder_extent(width), mesh_xy, name="tangential_port",
                                      specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
 
 
@@ -218,9 +218,9 @@ def line_width_bounds(meta, *, mesh_xy, photon_bases=None):
     the tier sets none) on the extent ladder, the constructor's own bound for a
     line support; a multiplet closed past the cap stores its actual width.
     """
-    from gw.shared_pole_sectors import sector_recipe
+    from gw.tangential_sectors import sector_recipe
     extent = port_extent(mesh_xy)
-    recipe = meta.shared_pole_recipe
+    recipe = meta.tangential_recipe
     if photon_bases is None:
         families = {"charge": int(meta.n_rmu)}
     else:
@@ -263,7 +263,7 @@ def infinity_directions(kernels, m1, width, **kwargs):
 
 def _role_entries(recipe):
     """Fitted (sample id, role label) pairs in fit order, labelled as the receipts name them."""
-    from gw.shared_pole_recipe import ROLE_CODES
+    from gw.tangential_recipe import ROLE_CODES
     names = {code: name for name, code in ROLE_CODES.items()}
     entries = [(int(sample), names[int(role)] + f":{i}")
                for i, (sample, role, held) in enumerate(zip(recipe["distinct_id"], recipe["role"], recipe["held"]))
@@ -271,7 +271,7 @@ def _role_entries(recipe):
     entries = [(sid, label) for sid in (int(i) for i in recipe["fit_ids"])
                for sample, label in entries if sample == sid]
     if any(label.split(":", 1)[0] not in ("line", "imaginary") for _, label in entries):
-        raise ValueError("GATE shared_pole_role: got: a fitted role other than line or imaginary; want: line or imaginary fitted role; why: unknown tangent semantics")
+        raise ValueError("GATE tangential_role: got: a fitted role other than line or imaginary; want: line or imaginary fitted role; why: unknown tangent semantics")
     return entries
 
 
@@ -299,7 +299,7 @@ def _select(k, W, entries, kind, index, recipe, *, real, eigh_plan, column_exten
 
 
 def is_face_stack(array):
-    from gw.shared_pole_execution import is_face
+    from gw.tangential_execution import is_face
     return is_face(array)
 
 
@@ -359,7 +359,7 @@ def _mirror_states(k, states, flags, z, *, W=None, dW=None, j=None, partner=None
     """
     if z.real != 0:
         if partner is None:
-            raise ValueError("GATE shared_pole_minus_q_partner: a line support off the imaginary axis "
+            raise ValueError("GATE tangential_minus_q_partner: a line support off the imaginary axis "
                              "needs W_q(-conj z) on the ordered route")
         xs = k.stack(*[st[1] for st in states])
         flat = k.minus_q_partner(tuple(flags))(
@@ -400,10 +400,10 @@ def line_sample_states(W, dW, recipe, *, sid, ordered, real, mesh_xy, eigh_plan,
     k = _round_kernels(eigh_plan.mesh, "face" if is_face_stack(W) else "batch")
     entries = [(s, label) for s, label in _role_entries(recipe) if s == sid]
     if not entries or any(not label.startswith("line:") for _, label in entries):
-        raise ValueError(f"GATE shared_pole_line_panel: sample {sid} is not a fitted line support")
+        raise ValueError(f"GATE tangential_line_panel: sample {sid} is not a fitted line support")
     z = _sample_point(recipe, sid)
     if z.real == 0:
-        raise ValueError(f"GATE shared_pole_line_panel: sample {sid} lies on the imaginary axis; it stays dense")
+        raise ValueError(f"GATE tangential_line_panel: sample {sid} lies on the imaginary axis; it stays dense")
     put = replicated(mesh_xy)
     q_all, values = _select(k, W, entries[:1], "line", {sid: 0}, recipe, real=real, eigh_plan=eigh_plan,
                             column_extent=column_extent, logical_n=logical_n)
@@ -414,7 +414,7 @@ def line_sample_states(W, dW, recipe, *, sid, ordered, real, mesh_xy, eigh_plan,
         widths = tuple(int(row[0].size) for row in values)
     del q_all
     if any(w < 1 or w > logical_n for w in widths[:real]):
-        raise ValueError(f"GATE shared_pole_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
+        raise ValueError(f"GATE tangential_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
     states, flags, counts = _sample_states(k, W, dW, device_index(mesh_xy, 0), z, "line", direction, widths,
                                            recipe, ordered=ordered, real=real, eigh_plan=eigh_plan,
                                            column_extent=column_extent, put=put,
@@ -442,7 +442,7 @@ def selection_layout(mesh, execution, nq):
     axis [B, 1, m, n]. ``to_face`` takes panel fields [B, m, r] back to the
     face and stacks them [nq, F, m_X, r_Y].
     """
-    from gw.shared_pole_local import batch_stack_to_face
+    from gw.tangential_local import batch_stack_to_face
     face4 = NamedSharding(mesh, P(None, None, "x", "y"))
     stack = jax.jit(lambda *fields: jnp.stack(fields, axis=1)[:nq], out_shardings=face4)
     axis = jax.jit(lambda a: a[:, None], out_shardings=(
@@ -474,9 +474,9 @@ class LineSelection:
     """
 
     def __init__(self, families, block, *, mesh_xy, ordered, execution, nq, eigh_backend, room=None):
-        from gw.shared_pole_capacity import constructor_eigenplan
+        from gw.tangential_capacity import constructor_eigenplan
         if execution == "face" and room is None:
-            raise ValueError("GATE shared_pole_line_room: got: a face line selection with no room; "
+            raise ValueError("GATE tangential_line_room: got: a face line selection with no room; "
                              "want: line_selection_room of its admission; why: distrib_la refuses "
                              "every eigh stack in room 0")
         self.room = room
@@ -499,8 +499,8 @@ class LineSelection:
                 for f, g in ((0, 1), (1, 0))}
 
     def _cross(self, family, rectangles, states, *, mirror):
-        from gw.shared_pole_sectors import _local_cross_action_program
-        from gw.shared_pole_execution import cross_action_program
+        from gw.tangential_sectors import _local_cross_action_program
+        from gw.tangential_execution import cross_action_program
         f = family["index"]
         rectangles = rectangles[(f, 1 - f)]
         # A mirror state acts with the minus-q partner's rectangles.
@@ -605,7 +605,7 @@ def charge_line_selection(meta, *, mesh_xy, ordered, execution, nq, eigh_backend
     mask = _padding_mask(mesh_xy, tuple(bool(v) for v in np.asarray(basis.active_mask)))
     move, _, _ = selection_layout(mesh_xy, execution, int(nq))
     # The one-sample stack [B, n, n] itself (no sample axis, so no copy of it; ``_select``).
-    return LineSelection([dict(name="charge", index=0, recipe=meta.shared_pole_recipe,
+    return LineSelection([dict(name="charge", index=0, recipe=meta.tangential_recipe,
                                logical_n=int(meta.n_rmu), rows=int(basis.n_packed), cross=False)],
                          lambda value, _: move(mask(value)),
                          mesh_xy=mesh_xy, ordered=ordered, execution=execution, nq=nq,
@@ -667,7 +667,7 @@ def select_round_states(samples, recipe, *, sample_ids, real, mesh_xy, eigh_plan
     index = {int(sid): i for i, sid in enumerate(sample_ids)}
     entries = _role_entries(recipe)
     if any(sid not in index and sid not in line_states for sid, _ in entries):
-        raise ValueError("GATE shared_pole_sample_identity: a fitted sample is neither dense nor a stored line sample")
+        raise ValueError("GATE tangential_sample_identity: a fitted sample is neither dense nor a stored line sample")
     put = replicated(mesh_xy)
     points = sample_points(mesh_xy, recipe)
     kinds = {kind: [(sid, label) for sid, label in entries
@@ -702,7 +702,7 @@ def select_round_states(samples, recipe, *, sample_ids, real, mesh_xy, eigh_plan
                 direction = k.column(q_all, device_index(mesh_xy, e))
                 widths = tuple(int(row[e].size) for row in values)
                 if any(w < 1 or w > logical_n for w in widths[:real]):
-                    raise ValueError(f"GATE shared_pole_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
+                    raise ValueError(f"GATE tangential_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
                 new, flags, new_counts = _sample_states(
                     k, W, dW, j, z, kind, direction, widths, recipe, ordered=ordered, real=real,
                     eigh_plan=eigh_plan, column_extent=column_extent, put=put,
@@ -750,7 +750,7 @@ def _prepare_partners(k, W, dW, recipe, kinds, selected, index, *, real, ordered
                 direction = k.column(q_all, device_index(mesh_xy, e))
                 widths = tuple(int(row[e].size) for row in values)
                 if any(w < 1 or w > logical_n for w in widths[:real]):
-                    raise ValueError(f"GATE shared_pole_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
+                    raise ValueError(f"GATE tangential_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
                 s = z if ordered else z ** 2
                 output, action = k.act(False, (2, False) if ordered else None)(
                     W, dW, device_index(mesh_xy, index[sid]), direction, points, device_index(mesh_xy, sid))
@@ -776,8 +776,8 @@ def _round_partner_directions_many(pairs, cutoff, *, real, kernels, eigh_plan, c
     so the shapes are the per-pair call's. Face stacks, a single pair and pairs of
     unequal shape take the per-pair call.
     """
-    from gw.shared_pole_execution import is_face
-    from gw.shared_pole_local import _pad_columns
+    from gw.tangential_execution import is_face
+    from gw.tangential_local import _pad_columns
     count = len(pairs)
     if (count < 2 or any(is_face(q) for q, _ in pairs)
             or len({(tuple(q.shape), tuple(o.shape)) for q, o in pairs}) != 1):
@@ -837,7 +837,7 @@ def _round_partner_directions(q, output, cutoff, *, real, kernels, eigh_plan, co
     round, empty slots included, so a round's state list and panel widths (and
     every program keyed on them) repeat from round to round.
     """
-    from gw.shared_pole_execution import is_face
+    from gw.tangential_execution import is_face
     spectral_rows = None if is_face(q) else real
     top, perp = kernels.dedupe(q, output)
     directions, counts = distrib_la.leading_eigenvectors_above(
@@ -845,7 +845,7 @@ def _round_partner_directions(q, output, cutoff, *, real, kernels, eigh_plan, co
         multiplet_tol=tol, real_rows=spectral_rows)
     if directions is None:
         return _times_zero(q), counts
-    from gw.shared_pole_local import _pad_columns
+    from gw.tangential_local import _pad_columns
     if directions.shape[-1] < q.shape[-1]:
         directions = _pad_columns(directions.sharding, directions.shape, int(q.shape[-1]))(directions)
     return directions, counts

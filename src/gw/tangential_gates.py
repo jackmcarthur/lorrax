@@ -1,7 +1,7 @@
-"""Measured gates and diagnostics of a constructed shared-pole model.
+"""Measured gates and diagnostics of a constructed tangential model.
 
 Moment identities, the zero-Ritz policy, passivity and reciprocity. The receipt
-rows these feed are listed in docs/architecture/shared_pole_model.md section 9.
+rows these feed are listed in docs/architecture/tangential_model.md section 9.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ def ordered_moment_identity(signed, infinity, *, matmul):
     return rows
 
 
-def signed_shared_pole_passivity(signed, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, gates):
+def signed_tangential_passivity(signed, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, gates):
     """Hermitian-part passivity of the signed particle-hole model at z = i eta.
 
     -Wc_r(i eta) = sum_j c_j c_j^H/(1 - i eta mu_j); its Hermitian part sums
@@ -78,7 +78,7 @@ def retained_moment_identity(pencil, coefficients, model, infinity_selector, *, 
     return rows
 
 
-def apply_shared_pole_zero_policy(model, *, gates):
+def apply_tangential_zero_policy(model, *, gates):
     """Drop low Ritz values only within the resolved factor-weight budget.
 
     ``model=(b,poles2,active)`` has shapes [b,n,Kp], [b,Kp], [b,Kp].
@@ -105,7 +105,7 @@ def apply_shared_pole_zero_policy(model, *, gates):
     }
 
 
-def sort_shared_pole_columns(model, *, matrix_sharding=None):
+def sort_tangential_columns(model, *, matrix_sharding=None):
     """Sort joint active b/Lambda columns, retaining ties and safe padding.
 
     Returns the same three model arrays and the [b,Kp] permutation. Active
@@ -116,14 +116,14 @@ def sort_shared_pole_columns(model, *, matrix_sharding=None):
     """
     b, poles, active = model
     order = jnp.argsort(jnp.where(active, poles, jnp.inf), axis=-1, stable=True)
-    from gw.shared_pole_pencil import _matrix_take_columns
+    from gw.tangential_pencil import _matrix_take_columns
     b = _matrix_take_columns(b, order, matrix_sharding)
     poles = jnp.take_along_axis(poles, order, axis=-1)
     active = jnp.take_along_axis(active, order, axis=-1)
     return (jnp.where(active[:, None, :], b, 0), jnp.where(active, poles, 1), active), order
 
 
-def shared_pole_treatment_mask(poles, active, *, ceiling_ry):
+def tangential_treatment_mask(poles, active, *, ceiling_ry):
     """Return the complete-column mask for a numerical frequency ceiling.
 
     The input model already has an ascending active prefix. The ceiling is a
@@ -134,7 +134,7 @@ def shared_pole_treatment_mask(poles, active, *, ceiling_ry):
     """
     ceiling_ry = float(ceiling_ry)
     if not np.isfinite(ceiling_ry) or ceiling_ry <= 0.0:
-        raise ValueError("shared-pole treatment ceiling must be positive")
+        raise ValueError("tangential treatment ceiling must be positive")
     keep = active & (poles <= ceiling_ry ** 2)
     omega = jnp.sqrt(jnp.where(active, poles, 0))
     retained_omega = jnp.sqrt(jnp.where(keep, poles, 0))
@@ -148,7 +148,7 @@ def shared_pole_treatment_mask(poles, active, *, ceiling_ry):
     }
 
 
-def shared_pole_passivity(model, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, gates):
+def tangential_passivity(model, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, gates):
     """Test raw latent-model passivity on the authenticated Coulomb support.
 
     The authenticated inverse square root [b,n,n] and b [b,n,Kp] are
@@ -191,7 +191,7 @@ def _passivity_response_checks(response, *, eigh, gates):
             "passivity_max": maximum, "passivity_antihermitian_relative": anti}
 
 
-def shared_pole_reciprocity(value, reference, *, gates):
+def tangential_reciprocity(value, reference, *, gates):
     """Check W(s).T=W(s) where held input data have this extra symmetry.
 
     ``value`` and ``reference`` are matching [...,n,n] complex128 response

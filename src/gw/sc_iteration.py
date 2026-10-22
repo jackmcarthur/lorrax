@@ -526,9 +526,9 @@ class SCMapScreeningArtifacts:
     static_w: object | None
     iteration_head: object | None
     static_head_terms: object | None
-    #: This map's shared-pole model handle (``W_by_role["shared_pole"]``);
+    #: This map's tangential model handle (``W_by_role["tangential"]``);
     #: the accepted final map's is evaluated at omega = 0 for ``W0_qmunu``.
-    shared_pole: object | None = None
+    tangential: object | None = None
     #: ``(qsgw_head.QPVelocity, U, E_QP, nb_logical)`` of this map's head,
     #: the operands of ``dipole_qsgw.h5`` (``qsgw_head.write_qsgw_dipole``);
     #: ``None`` on a run with no velocity head.
@@ -2312,7 +2312,7 @@ def _report_extrapolation_eqp_shift(
 
 def _sc_head_frequency_plan(
         config, quad, *, material_class, certified_fit=None, mesh_xy=None,
-        shared_pole_recipe=None):
+        tangential_recipe=None):
     """Single frequency plan for SC body W and every head provenance arm.
 
     A live screening build takes its ceiling from ``quad``.  A certified-fit
@@ -2323,14 +2323,14 @@ def _sc_head_frequency_plan(
 
     requests = screening_requests_for(config.compute_mode, config)
     mpa_plan = None
-    if config.compute_mode is ComputeMode.MPA and config.sigma.w_model == "shared_pole":
-        if shared_pole_recipe is None:
-            raise ValueError("GATE shared_pole_sc_plan: current-map recipe is missing")
+    if config.compute_mode is ComputeMode.MPA and config.sigma.w_model == "tangential":
+        if tangential_recipe is None:
+            raise ValueError("GATE tangential_sc_plan: current-map recipe is missing")
         if getattr(config, "head", None) is not None and config.head.correction is not HeadCorrection.OFF:
-            from .shared_pole_head import shared_pole_head_plan
+            from .tangential_head import tangential_head_plan
             from .mpa.sample_plan import plan_z
             from .qsgw_head import head_quadrature_omegas
-            plan = shared_pole_head_plan(config, shared_pole_recipe,
+            plan = tangential_head_plan(config, tangential_recipe,
                                           material_class=material_class)
             # The fit nodes, then the head's imaginary-axis moment rule.
             points = list(map(complex, plan_z(plan))) + list(head_quadrature_omegas(config))
@@ -2339,9 +2339,9 @@ def _sc_head_frequency_plan(
             return requests, plan, points
         # Select existing physical fit coordinates; never rebuild an MPA grid
         # or call the shared recipe resolver a second time for the head.
-        ids = np.asarray(shared_pole_recipe['distinct_id'])
-        held = np.asarray(shared_pole_recipe['held'])
-        z = np.asarray(shared_pole_recipe['z_ry'])
+        ids = np.asarray(tangential_recipe['distinct_id'])
+        held = np.asarray(tangential_recipe['held'])
+        z = np.asarray(tangential_recipe['z_ry'])
         _, first = np.unique(ids[~held], return_index=True)
         head_omegas = [complex(value) for value in z[~held][np.sort(first)]]
         if bool(config.do_G0) and 0j not in head_omegas:
@@ -2410,7 +2410,7 @@ def _sc_coarse_identities(inputs, shape):
     (``band_partition.semicore_floor``: the minimum energy of the lowest
     requested valence band, or a >= 4 eV gap under number_bands_protected;
     kept on ``meta.coarse_class``).
-    Fixed for the run.  The MPA/shared-pole Sigma reads the patch on every
+    Fixed for the run.  The MPA/tangential Sigma reads the patch on every
     route, scalar or sector (``qp_support.semicore_patch_route``).
     """
     from .qp_support import coarse_identities
@@ -2460,7 +2460,7 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
     # other QP-matrix identity is protected at the deck eta, on the near grid.
     semicore = _sc_coarse_identities(inputs, energies_loop.shape)
     # Owner 2026-09-24: the requested states are the protected identities the
-    # W model treats as active (``active_n``: shared_pole_recipe.active_band_mask
+    # W model treats as active (``active_n``: tangential_recipe.active_band_mask
     # on the fixed DFT ladder), never frozen core; owner 2026-09-27: only
     # quasiparticles move the support.
     everyone = requested_states(sigma, inputs.config.sc.frozen_core_bands,
@@ -2583,10 +2583,10 @@ def _record_semicore_z(inputs, iteration, z_kn, semicore_kn):
 
 def _sc_active_identities(inputs):
     """Per DFT identity of the QP window: does the W model treat it as
-    active (``shared_pole_recipe.active_band_mask`` on the DFT ladder about
+    active (``tangential_recipe.active_band_mask`` on the DFT ladder about
     the DFT Fermi level)?  Fixed for the run, so ``cover`` never switches a
     state between Sigma(E) and Sigma(0)."""
-    from .shared_pole_recipe import active_band_mask
+    from .tangential_recipe import active_band_mask
     return active_band_mask(np.asarray(inputs.e_dft_active_kn_ry, dtype=np.float64),
                             float(inputs.wfn.efermi))
 
@@ -2819,10 +2819,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     call lives here directly — adding a new Σ scheme that wants extra
     W frequencies is purely a screening + compute_sigma_xc change.
     """
-    # The previous map's device-resident shared-pole model has had its last
+    # The previous map's device-resident tangential model has had its last
     # reader; release it before the rotation and the Hartree rebuild, which
     # no capacity planner prices it against.
-    from .shared_pole_screening import release_resident_model
+    from .tangential_screening import release_resident_model
     release_resident_model()
     n_occ = int(inputs.meta.nelec)
     E_qp_ry = U_qp = None
@@ -3317,13 +3317,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             f"Hartree from iteration {state.iteration} orbitals "
             f"(E_F = {exact_hartree_dft.efermi_ry:.6f} Ry)")
 
-    if inputs.config.sigma.w_model == "shared_pole":
-        from .shared_pole_recipe import (
-            SUPPORT_READ_PAD_EV, bind_shared_pole_census, resolve_shared_pole_recipe,
-            bind_shared_pole_sc_identity,
+    if inputs.config.sigma.w_model == "tangential":
+        from .tangential_recipe import (
+            SUPPORT_READ_PAD_EV, bind_tangential_census, resolve_tangential_recipe,
+            bind_tangential_sc_identity,
         )
         from centroid.sampling_metric import full_k_quadrature_weights
-        bind_shared_pole_census(
+        bind_tangential_census(
             wfns_qp, inputs.meta, occupation_state=entry_occ_state,
             trs_allowed=inputs.sym.trs_allowed,
             state_capacity=inputs.wfn.occupation_state_capacity,
@@ -3331,7 +3331,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         from .qp_support import requested_reads_ev
         # W's line sites cover this map's requested reads: the states that set the
         # sampled Sigma support (``_sc_sampled_support``), at E_in +/- the plan pad.
-        inputs.meta.shared_pole_recipe = resolve_shared_pole_recipe(
+        inputs.meta.tangential_recipe = resolve_tangential_recipe(
             inputs.config, wfns_qp, inputs.meta, mesh_xy=inputs.mesh_xy,
             print_fn=inputs.print_fn,
             support_reads_ev=frame_mu_ev + requested_reads_ev(
@@ -3339,37 +3339,37 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 pad_ev=SUPPORT_READ_PAD_EV),
             support_session=(None if inputs.fixed_quadrature_session is None else
                              inputs.fixed_quadrature_session.setdefault(
-                                 "shared_pole_supports", {})))
-        _record_shared_pole_replans(inputs, int(state.iteration),
-                                    inputs.meta.shared_pole_recipe)
-        bind_shared_pole_sc_identity(
+                                 "tangential_supports", {})))
+        _record_tangential_replans(inputs, int(state.iteration),
+                                    inputs.meta.tangential_recipe)
+        bind_tangential_sc_identity(
             inputs.meta, state, occupation_state=entry_occ_state,
             print_fn=inputs.print_fn)
-        inputs.meta.shared_pole_response_rules = (
+        inputs.meta.tangential_response_rules = (
             None if inputs.fixed_quadrature_session is None else
             inputs.fixed_quadrature_session.setdefault("chi", {}))
         # Map 1 records the model's Kmax and later maps keep at least it, so
         # the store and its readers keep one column extent
-        # (shared_pole_store._k_extent); map 0 is the one-shot's exact Kmax.
-        inputs.meta.shared_pole_k_capacity = (
+        # (tangential_store._k_extent); map 0 is the one-shot's exact Kmax.
+        inputs.meta.tangential_k_capacity = (
             None if inputs.fixed_quadrature_session is None or int(state.iteration) == 0
-            else inputs.fixed_quadrature_session.setdefault("shared_pole_k_capacity", {}))
-        # The CT round's retained CC/TT span widths (shared_pole_sectors.cross_span_widths),
+            else inputs.fixed_quadrature_session.setdefault("tangential_k_capacity", {}))
+        # The CT round's retained CC/TT span widths (tangential_sectors.cross_span_widths),
         # held from map 0 on, so no later round or map recompiles CT below them.
-        inputs.meta.shared_pole_rank_capacity = (
+        inputs.meta.tangential_rank_capacity = (
             None if inputs.fixed_quadrature_session is None
-            else inputs.fixed_quadrature_session.setdefault("shared_pole_rank_capacity", {}))
-        # The sector writers' held carrier widths (shared_pole_local.carrier_history,
+            else inputs.fixed_quadrature_session.setdefault("tangential_rank_capacity", {}))
+        # The sector writers' held carrier widths (tangential_local.carrier_history,
         # held_writer_width) live in the session too, the one owner of held SC
         # state. The round pencils need no hold: their extent is the panels'
         # capacity, fixed before the first round (round_tables).
         if inputs.fixed_quadrature_session is not None:
-            inputs.meta._shared_pole_carrier_history = (
-                inputs.fixed_quadrature_session.setdefault("shared_pole_carriers", {}))
+            inputs.meta._tangential_carrier_history = (
+                inputs.fixed_quadrature_session.setdefault("tangential_carriers", {}))
 
     from .gw_config import (folds_scalar_head,
-                            uses_direct_bispinor_shared_pole_head)
-    if uses_direct_bispinor_shared_pole_head(inputs.config):
+                            uses_direct_bispinor_tangential_head)
+    if uses_direct_bispinor_tangential_head(inputs.config):
         sigma = inputs.band_slices.sigma
         # A metal's head reads the entry-solved FD state; an insulator's reads
         # the bundle's step occupations (``metal_occ_state`` is None).
@@ -3424,7 +3424,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                             else (None, inputs.wfns_dft,
                                   _fixed_dft_head_occupation_state(inputs),
                                   None)))
-                   if inputs.config.sigma.w_model == "shared_pole"
+                   if inputs.config.sigma.w_model == "tangential"
                    and wfns_transverse_qp is not None else {}),
                 print_fn=inputs.print_fn)
         return produced
@@ -3434,7 +3434,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     requests, mpa_plan, head_omegas = _sc_head_frequency_plan(
         inputs.config, inputs.quad, certified_fit=certified_fit,
         mesh_xy=inputs.mesh_xy, material_class=inputs.material_class,
-        shared_pole_recipe=getattr(inputs.meta, 'shared_pole_recipe', None))
+        tangential_recipe=getattr(inputs.meta, 'tangential_recipe', None))
 
     # Per-iteration QSGW q->0 head.  The opt-in map is stationary even for
     # accelerators that evaluate one carry repeatedly: at iteration zero
@@ -3452,7 +3452,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     photon_velocity = None
     pt = getattr(inputs, "parallel_transport", None)
     fixed_dft_full_head = (inputs.fixed_dft_head_response is not None or
-        (pt is None and inputs.config.sigma.w_model == "shared_pole"
+        (pt is None and inputs.config.sigma.w_model == "tangential"
          and folds_scalar_head(inputs.config)))
     if pt is not None or fixed_dft_full_head:
         from .head_correction import compute_static_head_terms_from_sample
@@ -3528,7 +3528,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                                  correction=None),
                          U_full, wfns_qp.enk[:, :nb_storage],
                          int(pt.nb_logical))
-    if pt is not None and uses_direct_bispinor_shared_pole_head(inputs.config):
+    if pt is not None and uses_direct_bispinor_tangential_head(inputs.config):
         # The four-current bank builds the direct Gamma head from U^H v U of
         # this velocity (response_bank.compute_photon_bank); here only the
         # per-map head block is formed from it.
@@ -3610,11 +3610,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # sharded as before.
         iteration_head_response = inputs.fixed_dft_head_response
         if (iteration_head_response is None or
-                (inputs.config.sigma.w_model == "shared_pole"
+                (inputs.config.sigma.w_model == "tangential"
                  and tuple(iteration_head_response.omegas) != tuple(head_omegas))):
             from .qsgw_head import build_dft_head_response, metal_head_summary
             dft_head_state = _fixed_dft_head_occupation_state(inputs)
-            # The shared-pole head grid follows this map's energy span, so
+            # The tangential head grid follows this map's energy span, so
             # the response is rebuilt on it; its frequency-free part (dipole
             # velocity, Fermi-surface table, Drude atoms, static head) is a
             # function of the DFT state only and is held across maps.
@@ -3726,7 +3726,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 nk_tot=int(inputs.meta.nk_tot),
             )
 
-    if uses_direct_bispinor_shared_pole_head(inputs.config) and inputs.config.do_G0:
+    if uses_direct_bispinor_tangential_head(inputs.config) and inputs.config.do_G0:
         # The scalar static owner still supplies the *bare* CC exchange slot;
         # its one-shot DFT step mask is not this map's metallic occupation.
         from .head_correction import compute_static_head_terms
@@ -3831,8 +3831,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # The W model's held pole-column extent or CT span width grew this map (a
     # live Kmax or retained rank past it): say so, as the window plan says
     # its extensions.
-    for held in (getattr(inputs.meta, "shared_pole_k_capacity", None),
-                 getattr(inputs.meta, "shared_pole_rank_capacity", None)):
+    for held in (getattr(inputs.meta, "tangential_k_capacity", None),
+                 getattr(inputs.meta, "tangential_rank_capacity", None)):
         for note in ({} if held is None else held).pop("_events", []):
             _record_sc(inputs, f"    SC map {int(state.iteration)}: {note}")
     if bool(sigma_result.hartree_omitted) != (exact_hartree_dft is not None):
@@ -3989,11 +3989,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # Keep at most one complete MPA screening model on disk.  The current
     # map has now built its replacement, consumed it through Sigma, passed
     # the Sigma gates and assembled H.  Only at this point is the preceding
-    # map's pair (or shared-pole scratch generation) safe to unlink.  The
+    # map's pair (or tangential scratch generation) safe to unlink.  The
     # newest survives convergence for restart/debugging; ordinary screening
     # modes never enter these branches.
-    if mpa_mode and inputs.config.sigma.w_model == "shared_pole":
-        from .shared_pole_screening import retain_iteration_scratch
+    if mpa_mode and inputs.config.sigma.w_model == "tangential":
+        from .tangential_screening import retain_iteration_scratch
         retain_iteration_scratch(
             os.path.join(inputs.input_dir, "tmp", "mpa"),
             f"sc_{state.iteration:04d}", print_fn=inputs.print_fn)
@@ -4033,7 +4033,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 static_w=W_by_role.get("static"),
                 iteration_head=iteration_head,
                 static_head_terms=iteration_static_head_terms,
-                shared_pole=W_by_role.get("shared_pole"),
+                tangential=W_by_role.get("tangential"),
                 qsgw_velocity=qsgw_velocity,
             ),
             exact_hartree_dft=exact_hartree_dft,
@@ -4111,17 +4111,17 @@ def _refuse_empty_map_output(e_output_kn_ev: np.ndarray, *,
 
 def _record_sc_verdict(inputs, verdict):
     """Log a map's verdict and hand its max|dE| to the held W line sites,
-    which move only past a tenth of the iterate's own error (shared_pole_recipe
+    which move only past a tenth of the iterate's own error (tangential_recipe
     LINE_SITE_HOLD_EV)."""
     _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
     if inputs.fixed_quadrature_session is not None:
         inputs.fixed_quadrature_session.setdefault(
-            "shared_pole_supports", {})["sc_residual_ev"] = float(verdict.max_abs_ev)
+            "tangential_supports", {})["sc_residual_ev"] = float(verdict.max_abs_ev)
 
 
-def _record_shared_pole_replans(inputs, iteration, recipe):
+def _record_tangential_replans(inputs, iteration, recipe):
     """One SC log line per held W sampling object re-planned on this map
-    (``shared_pole_recipe``: line sites past LINE_SITE_HOLD_EV, a sector
+    (``tangential_recipe``: line sites past LINE_SITE_HOLD_EV, a sector
     ceiling below twice the current span)."""
     if not recipe:
         return
@@ -6093,7 +6093,7 @@ def load_head_velocity_source(
 ):
     """Resolve ``sc_head_update`` to the head's velocity source, or None.
 
-    On a shared-pole metal, ``dft_velocity`` uses the authenticated dipole
+    On a tangential metal, ``dft_velocity`` uses the authenticated dipole
     for the direct head and ``parallel_transport`` (scalar decks) the
     artifact below, so the Drude term sees ``U^dagger (v + D_k DeltaH) U``.
     Other metal velocity-head routes retain the named refusal in
@@ -6111,7 +6111,7 @@ def load_head_velocity_source(
     ``dft_velocity``
         the exact DFT p-matrix velocity stage ONLY, through
         ``load_dft_velocity_head`` on insulators. The admitted metallic
-        shared-pole direct head reads the same authenticated operator from
+        tangential direct head reads the same authenticated operator from
         ``dipole.h5``. Neither route has a finite-link derivative of Delta H.
 
     ``interband_commutator``
@@ -6137,12 +6137,12 @@ def load_head_velocity_source(
     ``link_unserved`` and every map runs with ``D_k DeltaH = 0``
     (``qsgw_head.qp_velocity``).  The link error itself gates nothing.
     """
-    from gw.gw_config import HEAD_UPDATES, uses_direct_bispinor_shared_pole_head
+    from gw.gw_config import HEAD_UPDATES, uses_direct_bispinor_tangential_head
 
     mode = str(config.sc.head_update)
     if mode not in HEAD_UPDATES:
         return None
-    if (uses_direct_bispinor_shared_pole_head(config)
+    if (uses_direct_bispinor_tangential_head(config)
             and mode != "parallel_transport"):
         # The four-current bank reads and rotates the dipole velocity itself
         # (``response_bank.compute_photon_bank``); no scalar head consumes one.
@@ -6512,7 +6512,7 @@ def run_sc_driver(
     # solves (``_fixed_dft_head_occupation_state``); it is built there.
     if (parallel_transport is None
             and config.head.correction is HeadCorrection.FULL
-            and config.sigma.w_model != "shared_pole"
+            and config.sigma.w_model != "tangential"
             and material_class != "metal"):
         # ``sc_head_update=off`` freezes this direct DFT response.  Build it
         # once, on the same single-sourced frequency plan every map consumes,
@@ -6520,7 +6520,7 @@ def run_sc_driver(
         from .qsgw_head import build_dft_head_response
         _, _, fixed_head_omegas = _sc_head_frequency_plan(
             config, quad, material_class=material_class,
-            shared_pole_recipe=getattr(meta, "shared_pole_recipe", None))
+            tangential_recipe=getattr(meta, "tangential_recipe", None))
         fixed_dft_head_response = build_dft_head_response(
             wfns, np.asarray(fixed_head_omegas, dtype=np.complex128),
             input_dir=input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
@@ -6619,12 +6619,12 @@ def run_sc_driver(
             f"map calls; {verdict.summary()}")
     sigma_result = state_final.outputs.sigma_result
     screening = state_final.outputs.screening
-    # A four-current (full_shared_pole) map carries its head inside the
+    # A four-current (full_tangential) map carries its head inside the
     # accepted map's sector poles (``direct_photon_head``, rebuilt each map
     # from photon_head_state), never as iteration_head samples or static
     # head terms, so that model is the accepted final-map head.
-    sector_head = (isinstance(screening.shared_pole, dict)
-                   and screening.shared_pole.get("direct_photon_head") is not None)
+    sector_head = (isinstance(screening.tangential, dict)
+                   and screening.tangential.get("direct_photon_head") is not None)
     requires_iteration_head = not sector_head and (
         config.head.correction is HeadCorrection.FULL
         or str(config.sc.head_update) != "off")
@@ -6661,7 +6661,7 @@ def run_sc_driver(
     # one writes the static W body together with the head samples produced by
     # the exact same accepted map.  ``persist_w0_and_head`` consumes the
     # matching fixed-name pre-unfold capture when IBZ storage is selected.
-    # The shared-pole route has no static W body: its W0 is the accepted
+    # The tangential route has no static W body: its W0 is the accepted
     # final map's model evaluated at omega = 0 (``restart_static_w``), read
     # from the devices (the map's resident model) or from that map's retained
     # scratch generation.
@@ -6670,18 +6670,18 @@ def run_sc_driver(
     mpa = config.compute_mode is ComputeMode.MPA
     try:
         if driver_persists_w0(config.compute_mode, config):
-            final_w = screening.shared_pole if mpa else screening.static_w
+            final_w = screening.tangential if mpa else screening.static_w
             if final_w is None:
                 raise RuntimeError(
                     "GATE persist_sc_requires_final_static_w: "
-                    f"screening.{'shared_pole' if mpa else 'static_w'} got: "
+                    f"screening.{'tangential' if mpa else 'static_w'} got: "
                     "None; want: the accepted final-map static W body (its "
-                    "shared-pole model on compute_mode = mpa); why: restart "
+                    "tangential model on compute_mode = mpa); why: restart "
                     "persistence must not write head samples without their "
                     "matching W.")
             W_static = restart_static_w(
                 config.compute_mode,
-                dict(static=screening.static_w, shared_pole=screening.shared_pole,
+                dict(static=screening.static_w, tangential=screening.tangential,
                      iteration_head=screening.iteration_head),
                 V_q, config=config, meta=meta, mesh_xy=mesh_xy,
                 material_class=material_class,
@@ -6718,13 +6718,13 @@ def run_sc_driver(
         del v_qsgw, U_qsgw, e_qsgw
     # W0 is the only large object in the final-map payload.  Drop it before
     # WFN/sigma artifact construction; the tiny head/term provenance remains.
-    # A device-resident shared-pole model has had its last reader (the W0
+    # A device-resident tangential model has had its last reader (the W0
     # persist above) and is released with it.
-    if screening.shared_pole is not None:
-        from .shared_pole_screening import release_resident_model
+    if screening.tangential is not None:
+        from .tangential_screening import release_resident_model
         release_resident_model()
     screening = dataclasses.replace(
-        screening, static_w=None, shared_pole=None, qsgw_velocity=None)
+        screening, static_w=None, tangential=None, qsgw_velocity=None)
     state_final = dataclasses.replace(
         state_final,
         outputs=dataclasses.replace(
