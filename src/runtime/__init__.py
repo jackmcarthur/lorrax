@@ -2488,21 +2488,26 @@ def read_verbose_switches(argv=None) -> None:
     :func:`run_main_and_finalize`), before any parser and any report.
     """
     import sys
+    # Renamed flags (runtime.renames.CLI_FLAGS) take their current spelling
+    # here as well, so no driver's parser ever sees an old one.
+    from .renames import rename_cli_argv
     if argv is None:
         if (not sys.argv or _argv_is_pytest(sys.argv[0])
                 or _VERBOSE_ARGV_READ[0] == tuple(sys.argv)):
             return
         args = sys.argv[1:]
-        kept = [arg for arg in args if arg != VERBOSE_FLAG]
-        if len(kept) != len(args):
+        kept = rename_cli_argv([arg for arg in args if arg != VERBOSE_FLAG])
+        if kept != args:
             sys.argv[1:] = kept
+        if VERBOSE_FLAG in args:
             set_verbose(source=VERBOSE_FLAG)
         _VERBOSE_ARGV_READ[0] = tuple(sys.argv)
     else:
-        kept = [arg for arg in argv if arg != VERBOSE_FLAG]
-        if len(kept) != len(argv):
-            if isinstance(argv, list):
-                argv[:] = kept
+        verbose = VERBOSE_FLAG in argv
+        kept = rename_cli_argv([arg for arg in argv if arg != VERBOSE_FLAG])
+        if kept != list(argv) and isinstance(argv, list):
+            argv[:] = kept
+        if verbose:
             set_verbose(source=VERBOSE_FLAG)
     deck = _deck_of(kept)
     if deck and not _VERBOSE[0] and deck_verbose(deck):

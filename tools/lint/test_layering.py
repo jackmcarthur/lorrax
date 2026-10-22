@@ -113,6 +113,9 @@ _L3_MODULES = frozenset({
     "runtime.jax_support", "runtime.pjrt_log_filter",
     # stdlib-only package-origin sealing at the first runtime boundary
     "runtime.source_closure",
+    # the renamed-names table (old deck keys, values, CLI flags, names on disk);
+    # stdlib-only, read by ``runtime``'s start-up argv hook before any parser
+    "runtime.renames",
     # stdlib-only site network policy resolved before backend initialization
     "runtime.network_env",
     # the leg's vendor first-use policy (kernel stores, BLAS warm-up), armed

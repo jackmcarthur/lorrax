@@ -48,9 +48,12 @@ _TANGENTIAL_MEMBER_FIELDS = ("path", "schema", "digest", "iteration_id")
 
 
 def _member_dataset(h5):
-    """The bundle's model-member dataset under its current or old name (common.renames), or None."""
-    from common.renames import disk_names
-    return next((name for name in disk_names(TANGENTIAL_MEMBER_DATASET) if name in h5), None)
+    """The bundle's model-member dataset under its current or old name (runtime.renames), or None."""
+    from runtime.renames import disk_name, disk_names
+    present = next((name for name in disk_names(TANGENTIAL_MEMBER_DATASET) if name in h5), None)
+    if present is not None:
+        disk_name(present)              # an old spelling is noted once
+    return present
 
 
 class TangentialMemberMissing(ValueError):

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rename name families across the tree: file and directory names (git mv) and
-# file contents (ruplacer --preserve-case).  See RENAMING.md.
+# file contents (ruplacer --preserve-case).  See docs/dev/renaming.md.
 #
 #   tools/rename_sweep.sh        old_name=new_name [old2=new2 ...]   # dry run
 #   tools/rename_sweep.sh --go   old_name=new_name [old2=new2 ...]   # apply
@@ -14,18 +14,18 @@
 #
 # Never swept (git pathspecs below): manual/ (a generated copy of the manual,
 # rebuilt by the manual's own publish step), UPGRADE_NOTES.md (history),
-# src/common/renames.py (the alias table, which keeps the old spellings) and
-# this script (its examples name the first rename; bash also reads a running
+# src/runtime/renames.py (the alias table, which keeps the old spellings),
+# docs/dev/renaming.md (its examples name the first rename) and this script (its examples name the first rename; bash also reads a running
 # script from disk, so a script that edits itself breaks mid-run).
 # ruplacer's own -T globs match file basenames only, so they cannot skip a
 # directory; the files are chosen with git instead and passed one at a time.
-# Needs ruplacer >= 0.10 and ripgrep on PATH (RENAMING.md says where from).
+# Needs ruplacer >= 0.10 and ripgrep on PATH (docs/dev/renaming.md says where from).
 set -euo pipefail
 go=""
 if [[ ${1:-} == --go ]]; then go=--go; shift; fi
 (( $# )) || { sed -n 2,22p "$0"; exit 2; }
 cd "$(git rev-parse --show-toplevel)"
-skip=(':!manual' ':!UPGRADE_NOTES.md' ':!src/common/renames.py' ':!tools/rename_sweep.sh')
+skip=(':!manual' ':!UPGRADE_NOTES.md' ':!src/runtime/renames.py' ':!docs/dev/renaming.md' ':!tools/rename_sweep.sh')
 # More paths to leave alone (history files of another repo, say), as git pathspecs:
 #   RENAME_SKIP=":!REVISIONS_R3.md :!notes/old" tools/rename_sweep.sh ...
 read -r -a extra <<< "${RENAME_SKIP:-}"

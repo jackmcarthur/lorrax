@@ -24,7 +24,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from runtime.padding import combined_divisor, padded_axis, spec_divisor
 from common import timing
 from common.log import get_logger, record as log_record
-from common.renames import disk_name
+from runtime.renames import disk_name
 from common.collectives import (agree_io_error, device_put_process_local, device_put_process_local_cached,
                                 process_rank, psum_replicate,
                                 rank0_read, rank0_transaction)

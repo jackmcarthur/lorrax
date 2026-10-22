@@ -34,6 +34,14 @@ Both rules have machine enforcement: `tools/lint/test_layering.py` for the impor
 direction and the driver plumbing budgets ([Layers](architecture/layers.md)),
 `tools/lint/test_env_registry.py` for the environment surface.
 
+## Renaming
+
+Renaming a public identifier, a deck key or value, a CLI flag, or an HDF5
+group, dataset or attribute goes through the alias table
+`src/runtime/renames.py` and the sweep in [Renaming](dev/renaming.md), never
+through an ad-hoc `sed`. The old name stays readable, with one NOTE saying
+what to write instead.
+
 ## The test suite
 
 > **THE FOUR-GPU RULE — every GPU verification leg runs at P=4.** A P=1-only

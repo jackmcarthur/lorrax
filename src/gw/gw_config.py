@@ -250,7 +250,7 @@ def coerce_bispinor_gw_mode(value) -> BispinorGWMode:
     if isinstance(value, BispinorGWMode):
         return value
     raw = getattr(value, "value", value)
-    from common.renames import deck_value
+    from runtime.renames import deck_value
     spelling = deck_value("gw", "bispinor_gw", str(raw).strip().lower())
     retired = _RETIRED_BISPINOR_GW_MODES.get(spelling)
     if retired is not None:
@@ -3513,9 +3513,9 @@ def read_lorrax_input(filename: str) -> dict:
     if start is not None:
         (section, end) = _read_input_section(
             end, kp_end, kp_idx, lines, start, filename)
-        # Old key and value spellings (common.renames) become the current ones
+        # Old key and value spellings (runtime.renames) become the current ones
         # first, so every check below sees only current names.
-        from common.renames import rename_deck_keys, rename_deck_values
+        from runtime.renames import rename_deck_keys, rename_deck_values
         rename_deck_keys("gw", section)
         (retired) = _report_early_retired_keys(
             section)

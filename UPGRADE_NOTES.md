@@ -32,7 +32,7 @@ differently.
   `file_io.shared_pole_store` is `file_io.tangential_store`, and every
   `shared_pole` identifier is `tangential` (`screen_shared_poles` is
   `screen_tangential_poles`). The old spellings LORRAX still accepts are listed
-  in one table, `src/common/renames.py`; RENAMING.md has the procedure.
+  in one table, `src/runtime/renames.py`; `docs/dev/renaming.md` has the procedure.
 
 ## 2026-10-21 — Centroid and kin-ion flag cleanup
 
