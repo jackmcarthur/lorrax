@@ -21,7 +21,10 @@ from typing import Optional
 import h5py
 import numpy as np
 
+from common.log import get_logger
 from common.units import RYD_TO_EV
+
+log = get_logger(__name__)
 
 #: Ry -> eV, from ``common.units`` — the one place the number lives.  Kept
 #: under this module's historical name because both absorption drivers import
@@ -245,27 +248,23 @@ def load_eigenvectors_h5(path: str | Path):
     =1 for spinor or non-spin), distinct from ``nspinor`` (=2 for spinor,
     inferred here from ``spin_kernel == 3``).
 
-    NON-TDA FILES ARE REFUSED, not silently truncated.  ``bse_io``'s
-    writer persists the resonant ``X`` to ``exciton_data/eigenvectors``
-    and the coupling ``Y`` to a sibling ``eigenvectors_coupling``; this
+    NON-TDA FILES ARE REFUSED, not silently truncated.  A non-TDA file
+    (``use_tda = 0``) holds the resonant ``X`` in ``exciton_data/eigenvectors``
+    and the coupling ``Y`` in ``eigenvectors_deexcitation`` (BerkeleyGW's
+    layout, written by ``bse_window.write_eigenvectors_stream`` too); this
     reader only ever returned the first.  Reading a non-TDA file and
     contracting ``X`` alone gives the TDA answer for a non-TDA solve,
     which is wrong by the whole anti-resonant channel — see the
     ``NotImplementedError`` below for the contraction it would need.
+    ``kpts`` is BerkeleyGW's ``(nk, 3)``.
     """
     with h5py.File(str(path), "r") as f:
         eigvals_eV = np.asarray(f["exciton_data/eigenvalues"][:], dtype=np.float64)
         evecs = np.asarray(f["exciton_data/eigenvectors"][:])  # (nQ,N,nk,nc,nv,ns,2)
-        has_coupling = "eigenvectors_coupling" in f["exciton_data"]
-        # ``use_tda`` is ours (and BGW's) but not guaranteed on every writer's
-        # output, so the presence of the coupling block is the second witness.
-        use_tda_ds = f.get("exciton_header/params/use_tda")
-        use_tda = True if use_tda_ds is None else bool(int(use_tda_ds[()]))
-        if has_coupling or not use_tda:
+        use_tda = bool(int(f["exciton_header/params/use_tda"][()]))
+        if not use_tda:
             raise NotImplementedError(
-                f"{path!s} is a NON-TDA eigenvector file "
-                f"(use_tda={use_tda}, coupling block "
-                f"{'present' if has_coupling else 'absent'}), and the "
+                f"{path!s} is a NON-TDA eigenvector file (use_tda = 0), and the "
                 f"sum-over-states absorption route is TDA-only.\n"
                 f"The full-BSE oscillator strength is NOT |Σ_t X_t conj(d_t)|²: "
                 f"it needs both halves of the paired vector and both the left "
@@ -651,20 +650,16 @@ def write_state_spectra(*, energies_Ry, exciton_dipoles, d_alpha, de_cv,
                 continue
             e2 = eps2[:, col]
             e1 = np.ones_like(e2) if no_eps1 else kramers_kronig_eps1(om_Ry, e2)
+            # BerkeleyGW's header exactly (a reader may skip four lines); what
+            # LORRAX used to add there is logged instead.
             e = np.asarray(directions[col], dtype=np.float64)
-            header = [
-                f"BSE absorption from the eigensolve ({'with' if tag == 'eh' else 'without'} "
-                f"electron-hole interaction)",
-                f"polarization: {label}, Cartesian ({e[0]:.6f}, {e[1]:.6f}, {e[2]:.6f})",
-                f"{kind} broadening, energy_resolution = {float(width_eV):.4f} eV; "
-                f"V_cell = {V_cell:.6f} bohr^3, N_k = {nk}, n_spinor = {n_spinor}",
-            ]
-            if tag == "eh":
-                header.append(f"{e_S.size} computed states: complete below {complete:.4f} eV; "
-                              f"column 4 is their density of states (1/eV)")
-            else:
-                header.append(f"{de.size} window transitions; column 4 is their density (1/eV)")
-            write_absorption_dat(name, omegas_eV, e2, e1, col4, header)
+            write_absorption_dat(name, omegas_eV, e2, e1, col4)
+            log.info(
+                f"{name}: polarization {label} = Cartesian ({e[0]:.6f}, {e[1]:.6f}, "
+                f"{e[2]:.6f}); {kind} broadening {float(width_eV):.4f} eV; V_cell = "
+                f"{V_cell:.6f} bohr^3, N_k = {nk}, n_spinor = {n_spinor}; "
+                + (f"{e_S.size} computed states, complete below {complete:.4f} eV"
+                   if tag == "eh" else f"{de.size} window transitions"))
     return paths
 
 
@@ -711,22 +706,20 @@ def kramers_kronig_eps1(omegas, eps2):
     return eps1
 
 
-def write_absorption_dat(path, omegas_eV, eps2, eps1, jdos, header_lines=None):
-    """4-column BGW-style ``absorption_*.dat``.
+def write_absorption_dat(path, omegas_eV, eps2, eps1, jdos):
+    """BerkeleyGW's ``absorption_*.dat``, byte for byte in layout.
 
-    Matches BGW's ``BSE/absp.f90:182`` format ``4f16.9``: columns are
-    ω(eV), ε₂(ω), ε₁(ω), JDOS(ω).
+    ``BSE/absp.f90``: four list-directed header lines (``write(10,*)``, hence
+    the leading blank) and rows ``100 format(4f16.9)``: ω (eV), ε₂(ω), ε₁(ω),
+    JDOS(ω).  Nothing else, so a reader that skips four lines reads it.
     """
     with open(str(path), "w") as f:
-        if header_lines:
-            for line in header_lines:
-                f.write(f"# {line}\n")
         f.write(" # Column 1: omega\n")
         f.write(" # Column 2: eps2(omega)\n")
         f.write(" # Column 3: eps1(omega)\n")
         f.write(" # Column 4: JDOS(omega)\n")
         for o, e2, e1, jd in zip(omegas_eV, eps2, eps1, jdos):
-            f.write(f" {o:15.9f}  {e2:14.9f}  {e1:14.9f}  {jd:14.9f}\n")
+            f.write(f"{o:16.9f}{e2:16.9f}{e1:16.9f}{jd:16.9f}\n")
 
 
 def fortran_e(value, width: int, digits: int) -> str:
@@ -754,16 +747,20 @@ BGW_POLARIZATION_SUFFIXES = ("b1", "b2", "b3")
 
 
 def bgw_eigenvalue_lines(eigvals_eV, dipoles_pol=None, *, n_spin: int,
-                         n_spinor: int, vol_supercell: float) -> list[str]:
+                         n_spinor: int, vol_supercell: float,
+                         triplet: bool = False) -> list[str]:
     """The lines of one BerkeleyGW ``eigenvalues*.dat`` (TDA, complex flavor).
 
-    BerkeleyGW ``BSE/absp_io.f90`` ``write_eigenvalues``, singlet kernel::
+    BerkeleyGW ``BSE/absp_io.f90`` ``write_eigenvalues``::
 
         write(14,'(a,i8)') '# neig  = ', neig
         write(14,'(a,e16.9)') '# vol   = ', vol
         write(14,'(a,2i8)') '# nspin, nspinor = ', xct%nspin, xct%nspinor
         '#       eig (eV)   abs(dipole)^2' // '    ' // '  Re(dipole)    Im(dipole)'
         write(14,'(4e16.8)') evals(ii), cs(ii,ipol), dipoles_r(ii,ipol)
+
+    The triplet kernel writes `` mg `` in place of the four blanks (``triplet``)
+    and the same dipoles: BerkeleyGW computes them as for the singlet.
 
     ``dipoles_pol`` (``(N,)`` complex) is ``D = <0|r|S>`` along this file's
     polarization; ``vol_supercell`` is ``N_k V_cell`` (bohr^3, BerkeleyGW's
@@ -782,7 +779,8 @@ def bgw_eigenvalue_lines(eigvals_eV, dipoles_pol=None, *, n_spin: int,
     if d.size != energies.size:
         raise ValueError(f"bgw_eigenvalue_lines: {energies.size} energies for "
                          f"{d.size} dipoles")
-    lines.append("#       eig (eV)   abs(dipole)^2      Re(dipole)    Im(dipole)")
+    lines.append("#       eig (eV)   abs(dipole)^2" + (" mg " if triplet else "    ")
+                 + "  Re(dipole)    Im(dipole)")
     lines += ["".join(fortran_e(v, 16, 8) for v in
                       (e, float(np.abs(di) ** 2), di.real, di.imag))
               for e, di in zip(energies, d)]
@@ -791,35 +789,48 @@ def bgw_eigenvalue_lines(eigvals_eV, dipoles_pol=None, *, n_spin: int,
 
 def write_eigenvalues_dat(
     path, eigvals_eV, dipoles_pol=None, *, n_spin, n_spinor, vol_supercell,
+    triplet=False,
 ):
     """One BerkeleyGW ``eigenvalues*.dat`` at ``path``
     (:func:`bgw_eigenvalue_lines`)."""
     with open(str(path), "w") as f:
         f.write("\n".join(bgw_eigenvalue_lines(
             eigvals_eV, dipoles_pol, n_spin=n_spin, n_spinor=n_spinor,
-            vol_supercell=vol_supercell)) + "\n")
+            vol_supercell=vol_supercell, triplet=triplet)) + "\n")
+
+
+def eigenvalue_file_names(labels) -> list[str]:
+    """BerkeleyGW's names per polarization (``BSE/absp_io.f90``): one
+    polarization (a deck ``polarization``, label ``e``) is ``eigenvalues.dat``,
+    the three axes ``eigenvalues_b1.dat`` .. ``_b3.dat``."""
+    return (["eigenvalues.dat"] if tuple(labels) == ("e",) else
+            [f"eigenvalues_{label}.dat" for label in labels])
 
 
 def write_bgw_eigenvalues(directory, eigvals_eV, dipoles=None, *, n_spin,
-                          n_spinor, vol_supercell) -> list[str]:
+                          n_spinor, vol_supercell, directions=None, labels=None,
+                          triplet=False) -> list[str]:
     """Every root in BerkeleyGW's own files; returns the paths written.
 
-    ``dipoles`` ``(N, 3)`` (``<0|r_a|S>``, Cartesian) gives BerkeleyGW's
-    three-polarization set ``eigenvalues_b1.dat`` .. ``_b3.dat``; without
-    dipoles one ``eigenvalues.dat`` lists the energies.
+    ``dipoles`` ``(N, 3)`` (``<0|r_a|S>``, Cartesian) are projected on each of
+    ``directions`` (``polarization_directions``; default the three axes), one
+    file per direction named by :func:`eigenvalue_file_names`, the column
+    BerkeleyGW's ``dipoles_r = Σ A conj(ê·s)``.  Without dipoles one
+    ``eigenvalues.dat`` lists the energies.
     """
     directory = Path(directory)
     if dipoles is None:
         jobs = [("eigenvalues.dat", None)]
     else:
-        d = np.asarray(dipoles, dtype=np.complex128)
-        jobs = [(f"eigenvalues_{suffix}.dat", d[:, a])
-                for a, suffix in enumerate(BGW_POLARIZATION_SUFFIXES)]
+        if directions is None:
+            directions, labels = np.eye(3), BGW_POLARIZATION_SUFFIXES
+        d = project_dipoles(np.asarray(dipoles, dtype=np.complex128).T, directions)
+        jobs = list(zip(eigenvalue_file_names(labels), d))
     paths = []
     for name, d_pol in jobs:
         write_eigenvalues_dat(directory / name, eigvals_eV, d_pol,
                               n_spin=n_spin, n_spinor=n_spinor,
-                              vol_supercell=vol_supercell)
+                              vol_supercell=vol_supercell, triplet=triplet)
         paths.append(str(directory / name))
     return paths
 

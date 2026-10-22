@@ -295,8 +295,9 @@ def exciton_dipoles(r, A, n_val: int) -> np.ndarray:
 def eigenvector_kpts(params: dict, nk: int) -> np.ndarray:
     """The k points of a ``load_eigenvectors_h5`` params dict as (nk, 3).
 
-    ``bse_jax`` writes ``exciton_header/kpoints/kpts`` in the BerkeleyGW
-    layout (3, nk) (``bse_window`` stores ``kpts.T``); (nk, 3) is accepted too.
+    ``bse_jax`` writes ``exciton_header/kpoints/kpts`` in BerkeleyGW's layout,
+    (nk, 3) as h5py reads it; (3, nk), the layout files written before
+    2026-10-22 carry, is accepted too.
     """
     kp = np.asarray(params["kpts"], dtype=np.float64)
     if kp.shape == (3, nk):
