@@ -96,3 +96,30 @@ def test_eigenvectors_h5_is_berkeleygw_layout(tmp_path):
     Y = d["eigenvectors_deexcitation"][..., 0] + 1j * d["eigenvectors_deexcitation"][..., 1]
     want = np.transpose(full[:, 1, :NC, :NV, :], (0, 3, 1, 2))[:, :, :, ::-1]
     assert np.array_equal(Y[0, :, :, :, :, 0], want)
+    _check_eigenvalues_dat(tmp_path)
+
+
+def _check_eigenvalues_dat(tmp_path):
+    """Three axes -> eigenvalues_b1..b3.dat, one polarization -> eigenvalues.dat;
+    the triplet run writes the same files and rows, its header ' mg '."""
+    from bse.absorption_common import write_bgw_eigenvalues
+    D = np.array([[1 + 1j, 0.5, 0.0], [0.1j, 2.0, 1.0]])
+    kw = dict(n_spin=1, n_spinor=1, vol_supercell=1080.4)
+    files = {}
+    for kind in ("singlet", "triplet"):
+        d = tmp_path / kind
+        d.mkdir()
+        names = write_bgw_eigenvalues(d, [3.1, 3.2], D, triplet=kind == "triplet", **kw)
+        files[kind] = {p.split("/")[-1]: open(p).read().splitlines() for p in names}
+    assert sorted(files["singlet"]) == ["eigenvalues_b1.dat", "eigenvalues_b2.dat",
+                                        "eigenvalues_b3.dat"] == sorted(files["triplet"])
+    for name, s in files["singlet"].items():
+        t = files["triplet"][name]
+        assert s[:3] == t[:3] and s[4:] == t[4:]
+        assert s[3] == "#       eig (eV)   abs(dipole)^2      Re(dipole)    Im(dipole)"
+        assert t[3] == "#       eig (eV)   abs(dipole)^2 mg   Re(dipole)    Im(dipole)"
+    one = write_bgw_eigenvalues(tmp_path, [3.1, 3.2], D, directions=np.array([[0, 0, 1.0]]),
+                                labels=("e",), **kw)
+    assert [p.split("/")[-1] for p in one] == ["eigenvalues.dat"]
+    row = open(one[0]).read().splitlines()[5]
+    assert row == "  0.32000000E+01  0.10000000E+01  0.10000000E+01  0.00000000E+00"
