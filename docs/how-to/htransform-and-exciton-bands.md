@@ -456,7 +456,7 @@ as markers.
 | `--refit-guard-bands` | 4 | guard bands of the refit's $f(H)$ window above the ζ window; 0 must fail the tile identity |
 | `--a-band` | top band | band whose bandwidth sets $a$ in $f$ (§3) |
 | `--head-minibz-average` | the deck's `head_minibz_average` | per-$Q$ mini-BZ average of the finite-$Q$ exchange head |
-| `--w-coarse-grid` / `--w-head-densify` / `--w-head-gamma-cell` | unset / `c1` / `fine` | sample W on a coarse sub-grid and trigonometrically interpolate it to the BSE grid; `c1` splits the Γ head off and re-attaches it analytically |
+| `--w-coarse-grid` / `--w-head-densify` | unset / `srlr` | sample W on a coarse sub-grid and trigonometrically interpolate it to the BSE grid with the srlr long-range model fitted on the sub-grid (the restart's `W0_lr` decimated to it); `c1` and `--w-head-gamma-cell` were removed and refuse |
 | `--rerun-check` | off | a second warm solve pass: a reproducibility assert and per-$Q$ timing |
 
 A downfolded GW bundle ([downfold](../downfold.md)) works here too: the driver
