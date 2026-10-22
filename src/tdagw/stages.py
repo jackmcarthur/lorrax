@@ -933,7 +933,7 @@ def describe_rows(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtim
     if rec:                                  # the bundle route's receipts (also in the header)
         pr, vr = rec["pairs"], rec["velocity"]
         rows["td_system"] = (
-            f"  TD system       : {'bse_k_grid' if rec['densified'] else 'native'} bundle, "
+            f"  TD system       : {'kgrid_fine' if rec['densified'] else 'native'} bundle, "
             f"energies {rec['energy_source']}, r = v/(i dE_DFT) from {vr['route']}; "
             f"pair rule {pr['rule']} at {pr['gap_ev']:g} eV (vv' below: {pr['vv']['below_gap']} "
             f"of {pr['vv']['pairs']}, cc' below: {pr['cc']['below_gap']} of {pr['cc']['pairs']}), "

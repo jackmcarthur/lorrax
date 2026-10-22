@@ -192,7 +192,7 @@ def make_w_densifier(
 
       * ``output='R'`` → ``W_R_fine`` — what the exciton_bands
         ``--w-coarse-grid`` path feeds the matvec directly;
-      * ``output='k'`` → ``W_q_fine`` — what the ``bse_k_grid`` bundle
+      * ``output='k'`` → ``W_q_fine`` — what the ``kgrid_fine`` bundle
         densification stores, so each solver's own ``ifftn(W_q)``
         reproduces the padded ``W_R``.
 
@@ -250,7 +250,7 @@ def decimate_W_q_to_subgrid(W_q: jax.Array,
 
 
 def _parse_grid_spec(spec) -> Optional[tuple[int, int, int]]:
-    """Parse a ``bse_k_grid`` value → ``(nx, ny, nz)`` or ``None`` (unset).
+    """Parse a ``kgrid_fine`` value → ``(nx, ny, nz)`` or ``None`` (unset).
 
     Accepts ``"NX NY NZ"``, ``"NX,NY,NZ"``, a 3-tuple/list, or an empty
     string / None (→ ``None``).  Single source for both the cohsex.in key and
@@ -266,14 +266,14 @@ def _parse_grid_spec(spec) -> Optional[tuple[int, int, int]]:
             return None
         parts = s.replace(",", " ").split()
     if len(parts) != 3:
-        raise ValueError(f"bse_k_grid must have 3 integers, got {spec!r}")
+        raise ValueError(f"kgrid_fine must have 3 integers, got {spec!r}")
     return tuple(int(x) for x in parts)
 
 
 def _read_lorrax_input_quietly(input_file: Optional[str]) -> dict:
     """The deck as a dict, or ``{}`` — a config read must never crash a load.
 
-    Same tolerance as :func:`_resolve_bse_k_grid`'s own read: the loader has
+    Same tolerance as :func:`_resolve_kgrid_fine`'s own read: the loader has
     to work on a restart with no deck beside it, and a malformed key is a
     reason to fall back to defaults loudly, not to lose the tensors.
     """
@@ -292,24 +292,24 @@ def _read_lorrax_input_quietly(input_file: Optional[str]) -> dict:
         return {}
 
 
-def _resolve_bse_k_grid(bse_k_grid, input_file: Optional[str]):
-    """Resolve the fine grid: explicit ``bse_k_grid`` arg wins; else read the
-    ``bse_k_grid`` key from ``input_file`` (cohsex.in).  Returns a 3-tuple or
+def _resolve_kgrid_fine(kgrid_fine, input_file: Optional[str]):
+    """Resolve the fine grid: explicit ``kgrid_fine`` arg wins; else read the
+    ``kgrid_fine`` key from ``input_file`` (cohsex.in).  Returns a 3-tuple or
     ``None`` (feature off)."""
-    fine = _parse_grid_spec(bse_k_grid)
+    fine = _parse_grid_spec(kgrid_fine)
     if fine is not None:
         return fine
     if input_file is not None and os.path.isfile(input_file):
         try:
             from gw.gw_config import read_lorrax_input
-            return _parse_grid_spec(read_lorrax_input(input_file).get("bse_k_grid"))
+            return _parse_grid_spec(read_lorrax_input(input_file).get("kgrid_fine"))
         except Exception as exc:               # config parse must never crash load
-            log.warning(f"BSE: bse_k_grid config read failed ({exc}); feature off",
+            log.warning(f"BSE: kgrid_fine config read failed ({exc}); feature off",
                         extra=message(
-                            id="bse_k_grid_config_read_failed",
-                            found=("bse_k_grid config read", f"failed ({exc})"),
-                            needs="a readable deck with a valid bse_k_grid",
-                            fix="check the deck syntax; bse_k_grid densification is off"))
+                            id="kgrid_fine_config_read_failed",
+                            found=("kgrid_fine config read", f"failed ({exc})"),
+                            needs="a readable deck with a valid kgrid_fine",
+                            fix="check the deck syntax; kgrid_fine densification is off"))
     return None
 
 
@@ -324,7 +324,7 @@ def resolve_w_head_densify(mode, params=None, *, modes=W_HEAD_DENSIFY_MODES) -> 
 
     Explicit argument wins; else the deck's ``w_head_densify`` key; else
     ``'c1'``.  The retired ``'legacy'`` arm refuses by name; ``modes`` is
-    what the calling path implements (``srlr`` runs on the ``bse_k_grid``
+    what the calling path implements (``srlr`` runs on the ``kgrid_fine``
     bundle path only, not on ``exciton_bands --w-coarse-grid``).
     """
     val = mode
@@ -339,7 +339,7 @@ def resolve_w_head_densify(mode, params=None, *, modes=W_HEAD_DENSIFY_MODES) -> 
         raise ValueError(
             f"GATE w_head_densify_path: w_head_densify = {val!r} is not "
             f"implemented on this path; want one of {tuple(modes)} (srlr runs "
-            f"on the bse_k_grid bundle densification).")
+            f"on the kgrid_fine bundle densification).")
     if val not in W_HEAD_DENSIFY_MODES:
         raise ValueError(
             f"w_head_densify = {val!r} is not one of {W_HEAD_DENSIFY_MODES}. "
@@ -355,7 +355,7 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
                          gamma_cell: str = "fine", log_fn=log.debug, static_sample=None):
     """The C1 head channel ``S_fine(q)`` for a coarse→fine W, end to end.
 
-    ONE composer for BOTH shipping densification paths — the ``bse_k_grid``
+    ONE composer for BOTH shipping densification paths — the ``kgrid_fine``
     bundle densification (:func:`_interpolate_bse_data_to_grid`) and
     ``exciton_bands --w-coarse-grid``.  They differ only in which grid the
     reference head was measured on (``ref_grid``), and that difference is an
@@ -412,7 +412,7 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
     # ``Meta`` has no ``sys_dim`` field — it is STAMPED on the two Metas the
     # tree builds, by ``gw.gw_jax.main`` and by
     # ``bandstructure.htransform.initialize_wfns`` (which is the one BOTH
-    # shipping densification paths hold: the ``bse_k_grid`` bundle leg below
+    # shipping densification paths hold: the ``kgrid_fine`` bundle leg below
     # and ``bse.exciton_bands``' ``--w-coarse-grid`` leg).  Until 2026-08-17
     # this read ``getattr(meta, "sys_dim", None)`` into a guard that RETURNED
     # on ``None``, and htransform did not stamp: so the bulk-3D refusal could
@@ -953,7 +953,7 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
                       qp_states: bool = False, pair_rule: str = "mask",
                       pair_gap_ev: float = 0.05,
                       mixing_receipt: bool = False) -> dict:
-    r"""r-form dipoles of a ``bse_k_grid`` bundle, in the gauge of its own ψ.
+    r"""r-form dipoles of a ``kgrid_fine`` bundle, in the gauge of its own ψ.
 
     The coarse WFN's velocity matrix ``v(k)`` (``psp.get_dipole_mtxels``'
     ``dipole.h5``, unfolded in the loader's gauge, which is the Galerkin
@@ -1233,7 +1233,7 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
                 "sum_d2_fixed_over_rq": float(sum_fix / sum_rq) if sum_rq > 0 else float("nan"),
                 "lowest_dE_rq_minus_eig_meV_mean": float(low_shift.mean()),
                 "lowest_dE_rq_minus_eig_meV_max": float(np.abs(low_shift).max())}
-        log_fn(f"[bse_k_grid dipoles] r-fix (fine states of a QP f(H)): r from the "
+        log_fn(f"[kgrid_fine dipoles] r-fix (fine states of a QP f(H)): r from the "
                f"DFT eigenbasis of their f(H) block, rotated back; max off-block "
                f"(v<->c) mixing {rfix['max_offblock_mixing']:.3e}; f(H) off-diagonal "
                f"max {f_off:.3e} (relative); window sum |d|^2 eigenbasis/fixed "
@@ -1247,7 +1247,7 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
     mixing = None
     if mixing_receipt and not qp_states:
         mixing = _qp_window_mixing(f_win, n_val)
-        log_fn(f"[bse_k_grid dipoles] eqp_corrections without dipole_position_fix: d = "
+        log_fn(f"[kgrid_fine dipoles] eqp_corrections without dipole_position_fix: d = "
                f"v/dE_RQ; QP/DFT window mixing receipt: max off-block (v<->c) "
                f"mixing {mixing[0]:.3e}, f(H) off-diagonal max {mixing[1]:.3e} "
                f"(relative); large values (strongly band-dependent QP shifts, "
@@ -1261,25 +1261,25 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
     del out, f_win
     shift_mev = float(np.max(np.abs(
         e_dft - np.asarray(gather_to_host(fine.enk_full))))) * RYD_TO_EV * 1e3
-    log_fn(f"[bse_k_grid dipoles] {path} ({label}) carried through the "
+    log_fn(f"[kgrid_fine dipoles] {path} ({label}) carried through the "
            f"htransform on bands [{b0},{b1}): d_alpha {d_alpha.shape} in the "
            f"densified ψ gauge (the bundle's own U_q)")
     state_tol = DENSIFIED_DIPOLE_STATE_FLOOR + 10.0 * defect
-    log_fn(f"[bse_k_grid dipoles] on-grid identity at {n_on_grid} fine q "
+    log_fn(f"[kgrid_fine dipoles] on-grid identity at {n_on_grid} fine q "
            f"that are coarse k: states max|σ(C*U) - 1| = {state_dev:.3e} "
            f"(gate {state_tol:.1e} = 1e-8 + 10 max|C Cᴴ - I|), images max rel "
            f"deviation {on_grid_rel:.3e} (gate "
            f"{DENSIFIED_DIPOLE_ONGRID_RTOL:.0e})")
-    log_fn(f"[bse_k_grid dipoles] transition energies from {path}'s "
+    log_fn(f"[kgrid_fine dipoles] transition energies from {path}'s "
            f"band_energies (Rayleigh quotients of its f(H) in the fine "
            f"states): max |E - eps_bundle| = {shift_mev:.3f} meV (the eqp_corrections "
            f"shift; 0 without eqp_corrections)")
-    log_fn("[bse_k_grid dipoles] velocity carried unweighted (fit window top isolated)"
+    log_fn("[kgrid_fine dipoles] velocity carried unweighted (fit window top isolated)"
            if weight is None else
-           f"[bse_k_grid dipoles] velocity carried as g v g (fit window top meets "
+           f"[kgrid_fine dipoles] velocity carried as g v g (fit window top meets "
            f"band {b1} at {weight[0]:.6f} Ry; width {weight[1]:.6f} Ry); window "
            f"weight min/max {weight_floor:.6f} (gate {DENSIFIED_VELOCITY_WEIGHT_FLOOR:.0e})")
-    log_fn("[bse_k_grid dipoles] image locality, outer-shell L2 fraction "
+    log_fn("[kgrid_fine dipoles] image locality, outer-shell L2 fraction "
            "(diagnostic): " + ", ".join(
                f"{name} {locality[name][0]:.3e}" for name in _DIPOLE_IMAGES
                if name in locality))
@@ -1300,7 +1300,7 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         "q_frac": q_frac,
         "source": os.path.abspath(str(path)),
         "velocity": str(label),
-        "route": "bse_k_grid htransform velocity (bse_densify.densified_dipoles)"
+        "route": "kgrid_fine htransform velocity (bse_densify.densified_dipoles)"
                  + (f" + {DENSIFIED_POSITION_FORM}" if qp_states else ""),
         "on_grid_rel": float(on_grid_rel),
         "on_grid_state_dev": float(state_dev),
@@ -1429,7 +1429,7 @@ def _interpolate_bse_data_to_grid(
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
 
-    The single coarse→fine densification the ``bse_k_grid`` knob drives, living
+    The single coarse→fine densification the ``kgrid_fine`` knob drives, living
     in the GENERAL init so EVERY solver consumes a fine-grid bundle unchanged.
     Each piece goes through the shared builder its exciton_bands sibling uses
     (until 2026-07-31 the W leg was a SECOND, eager copy — ``local_ifftn3``/
@@ -1438,7 +1438,7 @@ def _interpolate_bse_data_to_grid(
 
       * ψ_{v,c}(k) and QP ε_{v,c}(k) on the fine mesh ← ONE htransform fH
         (``bandstructure.htransform.initialize_wfns`` +
-        ``bandstructure.bse_setup.compute_wfns_fi`` with ``kgrid_fi=fine_grid``);
+        ``bandstructure.bse_setup.compute_wfns_fi`` with ``kgrid_fine=fine_grid``);
         the fH is built over the full loaded band window and only the BSE
         sub-window [nval−n_val, nval+n_cond) is returned (interior, guarded).
       * V_Q exchange q=0 tile ← CARRIED THROUGH unchanged by default.  A Q=0
@@ -1456,7 +1456,7 @@ def _interpolate_bse_data_to_grid(
       * W direct ← ``make_w_densifier(output='k')`` — the ONE sharded
         coarse→fine densifier (shard_map FFTs + jitted per-pair R embedding, (μ,ν)
         sharding preserved end to end); the exciton_bands ``--w-coarse-grid``
-        flag runs the SAME factory with ``output='R'``.  ``bse_k_grid`` drives
+        flag runs the SAME factory with ``output='R'``.  ``kgrid_fine`` drives
         it automatically (the banner below is the "W-pad fired" proof).
         Its operand is the head-EXCLUDED body and the Γ head is re-attached
         analytically afterwards — see ``head_channel`` below.
@@ -1510,14 +1510,14 @@ def _interpolate_bse_data_to_grid(
     for a, (f, c) in enumerate(zip(fine_grid, coarse_grid)):
         if c <= 0 or f < c:
             raise ValueError(
-                f"bse_k_grid axis {a}: fine {f} must be at least the coarse "
+                f"kgrid_fine axis {a}: fine {f} must be at least the coarse "
                 f"restart extent {c}; trigonometric densification cannot "
                 f"coarsen an axis.")
     n_val = int(data["n_val"]); n_cond = int(data["n_cond"])
     nv_pad = int(data["n_val_pad"]); nc_pad = int(data["n_cond_pad"])
     n_rmu = int(data["n_rmu"]); n_rmu_pad = int(data["n_rmu_pad"])
     nk_f = fine_grid[0] * fine_grid[1] * fine_grid[2]
-    log_fn(f"[bse_k_grid] coarse {coarse_grid[0]}x{coarse_grid[1]}x{coarse_grid[2]}"
+    log_fn(f"[kgrid_fine] coarse {coarse_grid[0]}x{coarse_grid[1]}x{coarse_grid[2]}"
            f" → fine {fine_grid[0]}x{fine_grid[1]}x{fine_grid[2]} "
            f"({nk_f} k-pts); interpolating ψ/ε (htransform), V_Q (vq_interp), "
            f"W (per-pair Wigner-Seitz embedding in R)")
@@ -1532,7 +1532,7 @@ def _interpolate_bse_data_to_grid(
     refuse_conflicting_qp_state_sources(
         wfn_path=_parse_wfn_path(input_file),
         state_artifact_path=restart_file,
-        where="bse_k_grid restart/htransform state")
+        where="kgrid_fine restart/htransform state")
 
     # ── WHICH ISDF BASIS THE htransform FITS IN ───────────────────────────
     # On a NATIVE bundle: the deck's own table, and ``keep`` is None — this
@@ -1546,7 +1546,7 @@ def _interpolate_bse_data_to_grid(
     # (μ_S_pad − μ_L) columns — NEGATIVE — and the run dies in ``jnp.pad``
     # with an index error that names neither the downfold nor the basis.
     # Same defect class as PIPELINE_HEALTH row 4, which closed this for
-    # exciton_bands and never reached the ``bse_k_grid`` path.
+    # exciton_bands and never reached the ``kgrid_fine`` path.
     from .exciton_bands import resolve_isdf_basis
     centroids_path, keep_idx = resolve_isdf_basis(
         restart_file, params, input_file, n_rmu_bundle=n_rmu, log=log_fn)
@@ -1582,7 +1582,7 @@ def _interpolate_bse_data_to_grid(
     b_min, b_max = nval_in - n_val, nval_in + n_cond
     if b_min < 0 or b_max > nb_window:
         raise ValueError(
-            f"bse_k_grid BSE window [{b_min},{b_max}) escapes the htransform fH "
+            f"kgrid_fine BSE window [{b_min},{b_max}) escapes the htransform fH "
             f"window [0,{nb_window}); the input's nval/nband must load "
             f">= {n_val} valence and >= {n_cond} conduction guard bands.")
     # SPLASH RADIUS OF THE f-SHOULDER (``2026-08-11-fifth-wall-is-the-f-\
@@ -1596,21 +1596,21 @@ def _interpolate_bse_data_to_grid(
     # the deck's own vocabulary.
     _n_guard = nb_window - b_max
     if _n_guard < 4:
-        log.warning(f"bse_k_grid: only {_n_guard} conduction guard "
+        log.warning(f"kgrid_fine: only {_n_guard} conduction guard "
                     f"band(s) above the BSE window [{b_min},{b_max}) inside the "
                     f"{nb_window}-band htransform window.  The f-transform's shift "
                     f"is max_k eps of THAT window's top band, so f == 0 there and "
                     f"the shoulder below it carries ~1% of fH's weight; the top of "
                     f"the returned window may be arbitrary.  Raise nband/ncond.",
                     extra=message(
-                        id="bse_k_grid_guard_bands_few",
+                        id="kgrid_fine_guard_bands_few",
                         found=("conduction guard bands above the BSE window",
                                str(_n_guard)),
                         needs="at least 4",
                         fix="raise nband/ncond in the deck"))
     bundle = compute_wfns_fi(
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
-        kgrid_co=coarse_grid, kgrid_fi=fine_grid,
+        kgrid_co=coarse_grid, kgrid_fine=fine_grid,
         band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, log_fn=log_fn,
         a_band_index=htransform_a_band,
         batch_size=int(params.get("wfn_fi_q_chunk", 0)),
@@ -1716,7 +1716,7 @@ def _interpolate_bse_data_to_grid(
                            jnp.asarray(gstar, dtype=jnp.int32))
         V_q0 = 0.5 * (V_q0 + jnp.conj(V_q0).T)   # Hermitize (stencil residue)
         V_q0 = jax.device_put(V_q0, NamedSharding(mesh_xy, P("x", "y")))
-        log_fn(f"[bse_k_grid] V_q0 exchange tile REBUILT via vq_interp "
+        log_fn(f"[kgrid_fine] V_q0 exchange tile REBUILT via vq_interp "
                f"eval_vq(Q=0), fine mini-BZ head <v_LR>={head_val:.4f} "
                f"(gstar={gstar}) — head_minibz_average=true (deck opt-in).  "
                f"The deck's disk body and vhead rank-1 head are REPLACED; that "
@@ -1724,7 +1724,7 @@ def _interpolate_bse_data_to_grid(
                f"needs (tests/KNOWN_FAILURES.md).")
     else:
         V_q0 = data["V_q0"]
-        log_fn("[bse_k_grid] V_q0 exchange tile CARRIED THROUGH from the "
+        log_fn("[kgrid_fine] V_q0 exchange tile CARRIED THROUGH from the "
                "coarse bundle unchanged (head_minibz_average off = the "
                "default): the q=0 body is k-grid-independent and the deck's "
                "loader-injected vhead rank-1 head is preserved exactly.  The "
@@ -1766,7 +1766,7 @@ def _interpolate_bse_data_to_grid(
     del W_coarse
     if srlr:
         W_q_fine = _add_rank_lr(W_q_fine, A_f, D_f, mesh_xy, 1.0)
-    log_fn(f"[bse_k_grid] W embedded per centroid pair (Wigner-Seitz) in R "
+    log_fn(f"[kgrid_fine] W embedded per centroid pair (Wigner-Seitz) in R "
            f"{coarse_grid[0]}x{coarse_grid[1]}x{coarse_grid[2]}→"
            f"{fine_grid[0]}x{fine_grid[1]}x{fine_grid[2]} "
            f"(exact trig-interp; direct term now on the fine grid)"
@@ -1823,10 +1823,10 @@ def _interpolate_bse_data_to_grid(
         W_q_fine = attach_head_channel(
             W_q_fine, data["g0_X"], data["g0_Y"], S_fine,
             head_channel["cell_volume"], centroid_frac=r_mu, bvec=geom.bvec)
-        log_fn(f"[bse_k_grid] fine Γ head: q0_head="
+        log_fn(f"[kgrid_fine] fine Γ head: q0_head="
                f"{head_channel.get('q0_head', 'rank1')}, diagonal "
                f"{q0_head_ry:.8e} Ry (fine q ≠ 0 heads on the W tile)")
-        log_fn("[bse_k_grid] W Γ head re-attached AFTER densification (C1): "
+        log_fn("[kgrid_fine] W Γ head re-attached AFTER densification (C1): "
                "the interpolant saw the body only, and the head is analytic "
                "at every fine q inside the coarse Γ cell.  This also changes "
                "the Davidson/FEAST preconditioner diagonal, which reads "

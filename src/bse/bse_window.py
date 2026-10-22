@@ -228,7 +228,7 @@ def write_eigenvectors_stream(
     # beside the eigenvectors as ``exciton_data/dipoles`` (1, n_write, 3, 2) —
     # a LORRAX extension BGW readers ignore (``eigenvectors.h5.spec``).
     # ``dipole_attrs`` (optional) are written as that dataset's attributes:
-    # a bse_k_grid run stamps where its dipoles came from.
+    # a kgrid_fine run stamps where its dipoles came from.
     RYD2EV = 13.6056980659
     if dipoles is not None:
         dipoles = np.asarray(dipoles)
@@ -458,7 +458,7 @@ def refuse_eqp_on_a_qp_wfn(input_file: str, eqp_file: str) -> None:
     Measured on the MoS2 run-82 parent smoke, JID 57269074 step ``.128``:
     ``00_lorrax_gw/exciton_parent_smoke.in:9`` selects ``WFN_qp.h5`` and the
     wrapper passes ``eqp_corrections = eqp1.dat``.  The existing shape guard in
-    ``exciton_bands`` sees this ONLY when a ``bse_k_grid`` densification has
+    ``exciton_bands`` sees this ONLY when a ``kgrid_fine`` densification has
     already moved ψ to a different k axis; without densification the two
     tables are the same size and the overwrite is invisible.
 
@@ -665,7 +665,7 @@ def apply_eqp_to_bse_window(data, restart_file: str, eqp_file: str,
 
     Refuses (before touching ``data``) an eqp ladder on a QP WFN, whose ψ
     and E are already a matched pair (:func:`refuse_eqp_on_a_qp_wfn`), and
-    energies rebuilt on the native restart grid after ``bse_k_grid`` has
+    energies rebuilt on the native restart grid after ``kgrid_fine`` has
     densified ψ to another k axis.
     """
     from file_io.restart_bundle import read_metadata
@@ -679,7 +679,7 @@ def apply_eqp_to_bse_window(data, restart_file: str, eqp_file: str,
     if int(data["eps_c"].shape[0]) != int(data["psi_c_X"].shape[0]):
         raise ValueError(
             "eqp_corrections rebuilt energies on the native restart "
-            f"grid ({int(data['eps_c'].shape[0])} k) after bse_k_grid "
+            f"grid ({int(data['eps_c'].shape[0])} k) after kgrid_fine "
             "had already densified the BSE wavefunctions to "
             f"{int(data['psi_c_X'].shape[0])} k.  This would mix coarse "
             "energies with fine-grid psi.  If wfn_file is WFN_qp.h5, "

@@ -228,8 +228,8 @@ def require_dipole_k_grid(attrs, nk: int, *, dipole_path) -> None:
 
     ``dipole_cart`` is contracted against the transition index ``(c, v, k)``,
     so the file's k list must be the bundle's, in the bundle's order.  A
-    coarse file sliced onto a ``bse_k_grid`` bundle used to crash after the
-    eigensolve; a ``bse_k_grid`` bundle carries its own dipoles
+    coarse file sliced onto a ``kgrid_fine`` bundle used to crash after the
+    eigensolve; a ``kgrid_fine`` bundle carries its own dipoles
     (``bse.bse_densify.densified_dipoles``) and never slices a file.
     """
     got = int(attrs.get("nk", -1))

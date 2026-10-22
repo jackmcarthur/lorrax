@@ -662,7 +662,7 @@ def build_fine_head_scalars(
         shipping paths differ in it, which is the whole reason it is an
         argument rather than assumed:
 
-        * ``bse_k_grid`` — a COARSE restart densified up.  ``ref_grid`` is the
+        * ``kgrid_fine`` — a COARSE restart densified up.  ``ref_grid`` is the
           coarse grid, so with ``fine == coarse`` the Γ entry is ``gamma_ref``
           divided by itself and the result is exactly ``head_ref``.
         * ``--w-coarse-grid`` — a NATIVE FINE restart decimated and densified
@@ -795,7 +795,7 @@ def _validated_sys_dim(sys_dim):
             "no sys_dim field: it is STAMPED, by gw.gw_jax.main on the GW "
             "driver's Meta and by bandstructure.htransform.initialize_wfns on "
             "the one the bandstructure leg and both BSE densification paths "
-            "(bse.bse_densify's bse_k_grid bundle, bse.exciton_bands' "
+            "(bse.bse_densify's kgrid_fine bundle, bse.exciton_bands' "
             "--w-coarse-grid) use.  A Meta reaching here without it was built "
             "by a site that does neither, and that site is the fix — passing "
             "sys_dim=3 here to make this go away re-opens exactly the escape "

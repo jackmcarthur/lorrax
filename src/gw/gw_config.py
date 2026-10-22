@@ -1533,7 +1533,7 @@ _DEFAULTS = {
     # returned byte-identically (fast path untouched).  This is the native-
     # coarse route for a nonnested target; exciton_bands ``--w-coarse-grid``
     # instead decimates a native fine W and therefore remains nested-only.
-    "bse_k_grid": "",
+    "kgrid_fine": "",
     # Coarse-to-fine W-head treatment.  ``c1`` splits the singular Gamma
     # head before densification and re-attaches it analytically; ``legacy``
     # is retained only as the shipped A/B control.
@@ -1843,7 +1843,7 @@ _DEFAULTS = {
     "get_centroids_fi": False,   # Gate; if True, compute fine-grid wfns at coarse centroids.
     "wfn_fi_min": 0,             # Sub-window of htransform band axis (0-based).
     "wfn_fi_max": 0,             # Exclusive upper end. wfn_fi_max==0 → use full window.
-    "kgrid_fi": "",              # "nx ny nz" or "nx,ny,nz". Empty → no fine grid.
+    "kgrid_fine": "",              # "nx ny nz" or "nx,ny,nz". Empty → no fine grid.
     # Fine-grid q CHUNK: how many q-points of the fine set have their
     # f(H(q)) built and decomposed at once.  0 (DEFAULT) = N_q_co, the
     # COARSE k-point count prod(kgrid_co) — not a bare constant.  fH_R is
@@ -2930,7 +2930,7 @@ def _input_storage(
         get_centroids_fi=bool(params["get_centroids_fi"]),
         wfn_fi_min=int(params["wfn_fi_min"]),
         wfn_fi_max=int(params["wfn_fi_max"]),
-        kgrid_fi=str(params["kgrid_fi"] or ""),
+        kgrid_fine=str(params["kgrid_fine"] or ""),
         wfn_fi_q_chunk=int(params["wfn_fi_q_chunk"]),
     )
     if bse.wfn_fi_q_chunk < 0:
@@ -4727,7 +4727,7 @@ class BSEConfig:
     get_centroids_fi: bool
     wfn_fi_min: int
     wfn_fi_max: int
-    kgrid_fi: str
+    kgrid_fine: str
     wfn_fi_q_chunk: int   # 0 = N_q_co (prod(kgrid_co)); see compute_wfns_fi
 
 

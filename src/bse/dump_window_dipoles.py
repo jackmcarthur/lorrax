@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""``python -m bse.dump_window_dipoles``: a ``bse_k_grid`` bundle's window dipoles, per fine q, to HDF5.
+"""``python -m bse.dump_window_dipoles``: a ``kgrid_fine`` bundle's window dipoles, per fine q, to HDF5.
 
 The bundle is loaded exactly as ``bse.bse_jax`` loads it (same deck, restart,
 ``--eqp``, ``--dipole``, window and degeneracy options, the square startup
@@ -71,7 +71,7 @@ def check_eigenvectors(eigenvectors_h5, d_alpha):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("-i", "--input", required=True, help="the BSE run's deck (with bse_k_grid)")
+    ap.add_argument("-i", "--input", required=True, help="the BSE run's deck (with kgrid_fine)")
     ap.add_argument("--n-val", type=int, required=True)
     ap.add_argument("--n-cond", type=int, required=True)
     ap.add_argument("--n-occ", type=int, default=None)
@@ -106,9 +106,9 @@ def main(argv=None):
     if not data.get("densified") or dip is None:
         raise SystemExit(
             f"GATE dump_window_dipoles_densified: {args.input} loads an undensified bundle "
-            f"(no bse_k_grid); want a bse_k_grid deck; why: an undensified run slices "
+            f"(no kgrid_fine); want a kgrid_fine deck; why: an undensified run slices "
             f"{args.dipole} itself (absorption_common.window_dipoles), there is nothing "
-            f"to dump; fix: pass the deck of the bse_k_grid run.")
+            f"to dump; fix: pass the deck of the kgrid_fine run.")
     if jax.process_index() != 0:
         return 0
     import h5py

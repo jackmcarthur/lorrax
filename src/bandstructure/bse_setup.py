@@ -106,14 +106,14 @@ def _cached_kernel(key, build):
     return fn
 
 
-def _parse_kgrid_fi(spec) -> tuple[int, int, int]:
+def _parse_kgrid_fine(spec) -> tuple[int, int, int]:
     """Accept '8 8 1', '8,8,1', or a tuple/list."""
     if isinstance(spec, (tuple, list)):
         parts = list(spec)
     else:
         parts = str(spec).replace(',', ' ').split()
     if len(parts) != 3:
-        raise ValueError(f"kgrid_fi must have 3 entries, got {spec!r}")
+        raise ValueError(f"kgrid_fine must have 3 entries, got {spec!r}")
     return tuple(int(x) for x in parts)
 
 
@@ -323,7 +323,7 @@ def compute_wfns_fi(
     B_at_mu,
     enk_sigma: jax.Array,
     kgrid_co: tuple[int, int, int],
-    kgrid_fi=None,
+    kgrid_fine=None,
     band_window_fi: tuple[int, int],
     mesh_xy: Mesh,
     a_band_index: int | None = None,
@@ -347,7 +347,7 @@ def compute_wfns_fi(
                    the geometry; ``shape`` = (rank, ns, n_μ).
         enk_sigma: (nb, nk_co) DFT band energies in Ry.
         kgrid_co:  (nkx, nky, nkz) coarse uniform k-grid.
-        kgrid_fi:  (nkx_fi, nky_fi, nkz_fi) fine k-grid; tuple/list/string.
+        kgrid_fine:  (nkx_fi, nky_fi, nkz_fi) fine k-grid; tuple/list/string.
                    Mutually exclusive with ``q_list``.
         band_window_fi: (b_min, b_max) — sub-window of the htransform band
                    axis to RETURN on the fine grid (0-based, exclusive end).
@@ -395,8 +395,8 @@ def compute_wfns_fi(
     contraction over (n_μ) along either mesh axis stays local.
     """
     log = log_fn if log_fn is not None else (lambda *a, **kw: None)
-    if (kgrid_fi is None) == (q_list is None):
-        raise ValueError("pass exactly one of kgrid_fi / q_list")
+    if (kgrid_fine is None) == (q_list is None):
+        raise ValueError("pass exactly one of kgrid_fine / q_list")
     nb_co = int(ctilde.shape[1])
     rank = int(ctilde.shape[2])
     nspinor = int(B_at_mu.shape[1])
@@ -434,9 +434,9 @@ def compute_wfns_fi(
                    f"ndev={_ndev} so the q axis splits)")
 
     if q_list is None:
-        kgrid_fi = _parse_kgrid_fi(kgrid_fi)
-        nq = kgrid_fi[0] * kgrid_fi[1] * kgrid_fi[2]
-        log(f"  bse_setup: {kgrid_co} → {kgrid_fi} ({nq} q-pts), "
+        kgrid_fine = _parse_kgrid_fine(kgrid_fine)
+        nq = kgrid_fine[0] * kgrid_fine[1] * kgrid_fine[2]
+        log(f"  bse_setup: {kgrid_co} → {kgrid_fine} ({nq} q-pts), "
             f"bands [{b_min}, {b_max}) of {nb_co} fitted, rank {rank}, "
             f"{_batch_note}")
     else:
@@ -466,7 +466,7 @@ def compute_wfns_fi(
 
     # ── q-points (uniform fine grid or explicit list), padded to batch ───
     if q_list is None:
-        q_all = _uniform_kgrid_frac(kgrid_fi)
+        q_all = _uniform_kgrid_frac(kgrid_fine)
     else:
         q_all = jnp.asarray((q_list + 0.5) % 1.0 - 0.5)
     n_pad = padded_axis(nq, bs, name="BSE setup q batch").pad

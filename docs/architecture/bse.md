@@ -13,12 +13,12 @@ bands, [exciton bands](../how-to/htransform-and-exciton-bands.md#7-exciton-bands
 
 | input | producer | what the BSE reads |
 |---|---|---|
-| the deck (`-i`) | the GW deck | WFN path, centroid files, `nval`/`ncond`/`nband`, head settings, `bse_k_grid` |
+| the deck (`-i`) | the GW deck | WFN path, centroid files, `nval`/`ncond`/`nband`, head settings, `kgrid_fine` |
 | `isdf_tensors_<N_mu>.h5`, in the run directory or its `tmp/` | `gw.gw_jax` with `write_restart_tensors = true` (the default) | parent ψ faces at the centroids, `enk_full` (Ry), `V_qmunu`, `W0_qmunu` and its `W0_ready` flag, the head vector `G0_mu_nu`, `vhead`/`whead`; on a static-Dyson W0, the dressed long-range channels `W0_lr` |
 | `WFN.h5` and the centroid table named in the deck | QE → pw2bgw; `centroid.kmeans_cli` | authentication of the bundle, and the static-screening rebuild |
 | `eqp1.dat` (`--eqp`, optional) | `gw.gw_jax`, or BerkeleyGW's `sigma` | diagonal QP energies: the WFN's file wedge, unfolded through the symmetry service, or a full-zone file (a block for every full-BZ k), where every k takes its own block as BerkeleyGW reads it (`restart_bundle._eqp_on_full_bz`) |
 | `qp_wfn_rotations.h5` (`--qp-rotations`, optional; exclusive with `--eqp`) | `gw.gw_jax` (`file_io.qp_wfn.write_qp_rotations_h5`) | the GW run's $H_{QP} = U\,\mathrm{diag}(E_{QP})\,U^\dagger$ on its Σ window, unfolded to the full BZ by `restart_bundle.read_qp_rotations_artifact`: the BSE runs in its eigenbasis ([QP-rotated basis](#the-qp-rotated-basis)) |
-| `dipole.h5` (`--dipole`) | `psp.get_dipole_mtxels` | velocity matrix elements and `band_energies` for absorption and per-state dipoles; under `bse_k_grid`, the deck (coarse) WFN's file, which the densifier carries to the fine grid |
+| `dipole.h5` (`--dipole`) | `psp.get_dipole_mtxels` | velocity matrix elements and `band_energies` for absorption and per-state dipoles; under `kgrid_fine`, the deck (coarse) WFN's file, which the densifier carries to the fine grid |
 | `dipole_qsgw.h5` (`--dipole`) | a QSGW run with a velocity head ([QSGW dipoles](../self_consistency.md#qsgw-dipoles)) | the same layout: $U^\dagger v\,U$ with the head's velocity $v$ (`qsgw_head.qp_velocity`) and `band_energies` = $E_{QP}$; stamped `basis = qp` and, when the run writes `WFN_qp.h5`, bound to that WFN's fingerprint. It pairs only with a restart built from `WFN_qp.h5` |
 
 Exactly one `isdf_tensors_*.h5` may sit in the run directory and its `tmp/`
@@ -158,7 +158,7 @@ $U = \mathrm{FFT}_k\big(W_R \cdot \mathrm{IFFT}_k T\big)$, with $W_R$ the
 screened tile already in R space. A dense $N_k \times N_k$ contraction is not
 used: it is $O(N_k^2)$ against the FFT's $O(N_k \log N_k)$.
 
-`bse_k_grid` densifies the bundle before any solve (`bse.bse_densify`). ψ and
+`kgrid_fine` densifies the bundle before any solve (`bse.bse_densify`). ψ and
 ε go through one htransform $f(H)$; with `--eqp` its energies are the
 quasiparticle ones, so the fine ε are QP. W's body, with its Γ head removed, is
 embedded in R per centroid pair, at the Wigner–Seitz images of minimal
@@ -176,7 +176,7 @@ q = 0 exchange tile is k-grid invariant and is carried through unchanged,
 unless `head_minibz_average = true`: then it is rebuilt through
 `bse.vq_interp` with the fine grid's mini-BZ head
 ([LT head](../theory/lt-exchange-head.md)), and the W head's Γ-cell reference
-uses the analytic sphere. Without `bse_k_grid` the optical BSE does not read
+uses the analytic sphere. Without `kgrid_fine` the optical BSE does not read
 `head_minibz_average`. With `--dipole`, the velocity goes through the same
 htransform as ψ ([dipoles](#dipoles-and-absorption)).
 
@@ -281,7 +281,7 @@ dipole file's own `band_energies`: DFT energies for `dipole.h5`, $E_{QP}$ for
 `dipole_qsgw.h5`. `--eqp` changes the transition energies of the Hamiltonian,
 not the dipoles.
 
-A `bse_k_grid` bundle carries its own dipoles (`bse_densify.densified_dipoles`)
+A `kgrid_fine` bundle carries its own dipoles (`bse_densify.densified_dipoles`)
 and never slices a file (`absorption_common.window_dipoles` is the one source
 of both). The deck WFN's velocity, unfolded in the loader's gauge, which is
 the Galerkin fit's, enters the htransform's basis and is Fourier-interpolated
@@ -424,7 +424,7 @@ $$I_\pm = \frac{|D_x \mp i D_y|^2}{2N_k},\qquad \eta = \frac{I_+ - I_-}{I_+ + I_
 per unit cell in bohr² (an exciton normalized over $N_k$ points has
 $|D|^2 \propto N_k$). The stored dipoles are $D$ times the global $-i$ of the
 velocity form ($d = \langle c|\hat v|v\rangle/\Delta E = i\langle c|\hat r|v\rangle$)
-on the native and the `bse_k_grid` routes alike, which no modulus sees; the
+on the native and the `kgrid_fine` routes alike, which no modulus sees; the
 conjugated spelling $\langle S|\hat r|0\rangle$ would swap $I_+$ and $I_-$. On a
 C3-symmetric toy the transitions into $p_\pm = (p_x \pm i p_y)/\sqrt2$ come out
 pure σ± ($\langle L_z\rangle = \pm1$), and the two routes agree to 1e-14 at
@@ -481,8 +481,8 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
 | `GATE bse_static_w_head_vector` | `bse_loading.load_bse_data_from_restart_sharded` | a rebuild on a bundle without `G0_mu_nu` |
 | `GATE dipole_basis` | `file_io.dipole.require_dipole_basis` | a dipole whose `basis` stamp (`dft` or `qp`; an unstamped file reads `dft`) differs from the basis of the WFN's ψ, e.g. `dipole_qsgw.h5` with a DFT WFN |
 | `GATE dipole_k_grid` | `file_io.dipole.require_dipole_k_grid` | a dipole whose k list is not the bundle's (another grid's file) |
-| `GATE velocity_wfn_fingerprint` | `file_io.dipole.require_dipole_wfn_fingerprint` (from `velocity_stamp` and `absorption_common.window_dipoles`) | a `--dipole` that is not the deck WFN's: under `bse_k_grid` e.g. the fine grid's own `dipole.h5` (read before the htransform fit); on an undensified run another WFN's file with the same k list, or a file with no `prov_wfn_sha256` |
-| `GATE densified_dipoles` | `absorption_common.window_dipoles` | a `bse_k_grid` bundle whose dipoles were not built from `--dipole` (loaded without `velocity_file`) |
+| `GATE velocity_wfn_fingerprint` | `file_io.dipole.require_dipole_wfn_fingerprint` (from `velocity_stamp` and `absorption_common.window_dipoles`) | a `--dipole` that is not the deck WFN's: under `kgrid_fine` e.g. the fine grid's own `dipole.h5` (read before the htransform fit); on an undensified run another WFN's file with the same k list, or a file with no `prov_wfn_sha256` |
+| `GATE densified_dipoles` | `absorption_common.window_dipoles` | a `kgrid_fine` bundle whose dipoles were not built from `--dipole` (loaded without `velocity_file`) |
 | `GATE densified_velocity_bands` | `bse_densify.densified_dipoles` | a velocity file with fewer bands than the htransform window |
 | `GATE densified_velocity_weight` | `bse_densify.densified_dipoles` | an unfitted band reaching the BSE window's top, or a velocity weight below 1e-3 of its maximum in the fine window |
 | `GATE dipole_band_window` | `file_io.dipole.require_dipole_bands` (`absorption_common.window_dipoles` and `slice_dipole_to_bse_window`, `gw.qsgw_head.head_source`) | a `dipole.h5` whose stored bands (`band_min`/`band_max`, else `[0, nb)`) do not cover the window from band 0 |
@@ -497,7 +497,7 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
 | `GATE bse_qp_star_tables` | the same | a wedge-stored artifact whose unfold tables are not the WFN's |
 | `GATE bse_qp_star_gauge` | the same; `bse_qp_rotation.certify_star_gauge` | an artifact $H_{QP}(k)$, or a restart centroid band matrix of 1 or $\sigma_z$, that misses its (anti)unitary star image by more than $10^{-10}$ |
 | `GATE bse_qp_dipole_velocity` | `absorption_common.window_dipoles` | `--qp-rotations --dipole` with a momentum-only (`skip_vnl`) dipole |
-| `GATE bse_qp_rotations_k_grid` | `bse_loading.load_bse_data_from_restart_sharded` | `--qp-rotations` with `bse_k_grid` |
+| `GATE bse_qp_rotations_k_grid` | `bse_loading.load_bse_data_from_restart_sharded` | `--qp-rotations` with `kgrid_fine` |
 | `GATE eqp_star_spread` | `restart_bundle.apply_eqp_corrections` (`_eqp_on_full_bz`) | an `--eqp` file whose QP shifts $E_{QP} - E_{DFT}$, averaged over each DFT multiplet, differ across a symmetry star by more than 1 meV (`EQP_STAR_SPREAD_TOL_EV`); the message names the band, its multiplet and the two k. Per-band values are applied as given |
 | `GATE eqp_full_zone_count`, eqp k coverage | the same | an `--eqp` file with more blocks than the full BZ; a full-zone-sized file in which some full-BZ k matches no block or two (crystal coordinates mod G to 1e-6); a file that is neither the wedge nor the full zone |
 | two QP descriptions | `bse_jax.parse_args`, `file_io.qp_wfn.refuse_conflicting_qp_state_sources` | `--eqp` with `--qp-rotations`; a rotation on a QP WFN deck or on a restart from another WFN |
@@ -522,7 +522,7 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
   resident CC model past Σ until the final-map persist.
 - The BSE reads ψ from the restart, which holds the deck WFN's states. `--eqp`
   replaces energies only (`bse/bse_window.py:569`); `--qp-rotations` rotates ψ
-  into the QP basis on the native grid and refuses `bse_k_grid`, so a densified
+  into the QP basis on the native grid and refuses `kgrid_fine`, so a densified
   BSE with QP ψ needs a GW restart generated from `WFN_qp.h5`, with
   `dipole_qsgw.h5` as its dipole. A `WFN_qp.h5` written before 2026-09-30 from a WFN that stores both
   k and −k has broken rows; regenerate it

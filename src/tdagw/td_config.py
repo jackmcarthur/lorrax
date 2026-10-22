@@ -964,13 +964,13 @@ TD_KEY_DOCS = {
                            "td_bundle_key")),
     "lorrax.bundle_input": (
         "", "The GW deck of the restart bundle (`system = bundle`); a deck with "
-        "`bse_k_grid` builds the densified system. With `model = isdf` it is also the "
+        "`kgrid_fine` builds the densified system. With `model = isdf` it is also the "
         "model's deck.", ("td_bundle_input", "td_bundle_key", "td_densified_velocity",
                           "td_densified_k_order")),
     "lorrax.eqp_file": (
         "= DFT energies", "The BSE run's `eqp1.dat` (`system = bundle`): QP energies by DFT "
         "index on a coarse deck, the htransform's QP f(H) states and energies on a "
-        "`bse_k_grid` deck.", ("td_bundle_key",)),
+        "`kgrid_fine` deck.", ("td_bundle_key",)),
     "lorrax.dipole_file": (
         "", "The coarse WFN's `dipole.h5` (`psp.get_dipole_mtxels`) for r = v/(iΔE) with the "
         "velocity's own (DFT) energies (`system = bundle`); it must cover the window and "
@@ -985,7 +985,7 @@ TD_KEY_DOCS = {
         "= `system.esmear`", "The energy scale of `pair_rule`, eV; also the smallest "
         "accepted c↔v gap.", ("td_cv_gap", "td_pair_gap_route_b")),
     "lorrax.dipole_position_fix": (
-        "", "A `bse_k_grid` bundle with `eqp_file`: the window position is the exact "
+        "", "A `kgrid_fine` bundle with `eqp_file`: the window position is the exact "
         "r of the fine QP states (the DFT f(H) eigenbasis of the window, `bse_jax "
         "dipole_position_fix`) instead of v/ΔE of their Rayleigh quotients. Opt in for "
         "strongly band-dependent QP ladders (CrI3-type); the bundle log's QP/DFT mixing "

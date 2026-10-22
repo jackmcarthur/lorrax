@@ -9,7 +9,7 @@ refer to the same ψ:
 * **Energies.**  The window's energies of the loader (``model["window"]``):
   quasiparticle when an ``eqp_file`` is given — re-sliced by DFT index on a
   coarse deck exactly as ``bse_jax eqp_corrections`` does, the eigenvalues of the
-  htransform's QP f(H) on a ``bse_k_grid`` deck — and DFT otherwise.
+  htransform's QP f(H) on a ``kgrid_fine`` deck — and DFT otherwise.
   Occupations by window position: the ``n_val`` valence rows are full.
 * **Position operator.**  ``r_nm = v_nm / (i (E_n − E_m))`` from the bundle's
   own velocity ``v_nm = ⟨n|v̂|m⟩`` (``v̂ = i[H, r̂]``), with the velocity's own
@@ -17,7 +17,7 @@ refer to the same ψ:
   scissor-invariant, the convention of the BSE dipoles
   (``absorption_common.slice_dipole_to_bse_window``).  Coarse deck: the
   coarse WFN's ``dipole.h5`` sliced over the WHOLE window (vv', cc' and cv);
-  ``bse_k_grid`` deck: the velocity carried through the htransform into the
+  ``kgrid_fine`` deck: the velocity carried through the htransform into the
   fine states (``bse_densify.densified_dipoles(full_window=True)``).
 * **Pairs.**  ``n = m`` is excluded: a velocity gives no diagonal position, so
   the system has no intraband commutator ``E·[r^intra, ρ]`` — TDGW's
@@ -371,11 +371,11 @@ def _coarse_velocity(model: dict, input_file: str, dipole_file: str, *, bands,
 
 
 def _densified_velocity(model: dict) -> tuple[np.ndarray, np.ndarray, dict]:
-    """``window["dipoles"]`` of a bse_k_grid bundle: fine velocity + its DFT energies."""
+    """``window["dipoles"]`` of a kgrid_fine bundle: fine velocity + its DFT energies."""
     from tdagw.model import flat_k_rows
     dip = model["window"]["dipoles"]
     if dip is None or "v_window" not in dip:
-        raise _gate("td_densified_velocity", "a bse_k_grid window without v_window",
+        raise _gate("td_densified_velocity", "a kgrid_fine window without v_window",
                     "the velocity over every window pair",
                     "load with velocity_file and velocity_full_window=True")
     rows = np.asarray(flat_k_rows(np.asarray(dip["q_frac"]), model["kgrid"]))
@@ -405,7 +405,7 @@ def build_td_system(input_file: str, mesh_xy, *, bands, dipole_file: str,
 
     Parameters
     ----------
-    input_file : the GW deck of the restart (a ``bse_k_grid`` deck densifies).
+    input_file : the GW deck of the restart (a ``kgrid_fine`` deck densifies).
     bands : (b_lo, b_hi) — absolute 0-based TD window, straddling ``n_occ``.
     dipole_file : the coarse WFN's ``dipole.h5`` (``psp.get_dipole_mtxels``).
     eqp_file : the BSE run's ``eqp1.dat`` (QP energies), or None (DFT).
@@ -459,7 +459,7 @@ def build_td_system(input_file: str, mesh_xy, *, bands, dipole_file: str,
     if eigenvectors_file:
         receipts["bse_dipoles"] = bse_dipole_receipt(r, eigenvectors_file, n_val, hdr["kpts"])
     hdr["td_system"] = receipts
-    log(f"[td_system] {'bse_k_grid' if densified else 'coarse'} bundle {input_file}: "
+    log(f"[td_system] {'kgrid_fine' if densified else 'coarse'} bundle {input_file}: "
         f"{hdr['kpts'].shape[0]} k x {e_qp.shape[1]} bands [{b_lo},{b_hi}) "
         f"({n_val}v), energies {window['energy_source']}, r from {vrec['route']}, "
         f"pair rule {pair_rule} at {gap_ev:g} eV (vv' below: {prec['vv']['below_gap']}, "

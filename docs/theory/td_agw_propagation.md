@@ -92,7 +92,7 @@ $g_s = 2$ for `nspinor = 1`, 1 for spinors:
 `[lorrax] system = "bundle"` builds the header in memory from a LORRAX GW
 restart bundle (`bundle_input` = its GW deck); no TDGW WFN, `vmtxel` or
 finite-difference step runs. One `load_td_model` call supplies the model's
-wavefunctions, the window record and, for `bse_k_grid` decks, the fine-grid
+wavefunctions, the window record and, for `kgrid_fine` decks, the fine-grid
 velocity, so the header and ΔΣ share one ψ gauge.
 
 | header | from the bundle |
@@ -106,7 +106,7 @@ velocity, so the header and ΔΣ share one ψ gauge.
 
 **Velocity.** Native decks slice `dipole_file` (the bundle's `dipole.h5`) to
 the window and refuse when its band energies differ from the restart's DFT
-energies by more than 1e-8 Ry (`td_dipole_energies`). `bse_k_grid` decks take
+energies by more than 1e-8 Ry (`td_dipole_energies`). `kgrid_fine` decks take
 Route B's window velocity in the fine $U_q$ gauge
 (`densified_dipoles(full_window=True)`) with its Newton-inverted DFT
 energies. With `--eqp` the fine states are QP-mixed and $v_{nm}/\Delta E$ is

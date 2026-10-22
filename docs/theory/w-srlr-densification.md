@@ -1,6 +1,6 @@
 # Long-range W densification (SR/LR)
 
-`bse_k_grid` evaluates the static W on a fine q grid from its coarse-grid
+`kgrid_fine` evaluates the static W on a fine q grid from its coarse-grid
 tiles by trigonometric interpolation (the per-centroid-pair Wigner–Seitz
 embedding in R, `bse.bse_densify.make_w_densifier`). The interpolant is exact on the coarse
 points and accurate where W is analytic in q. Near Γ it is not: the screened

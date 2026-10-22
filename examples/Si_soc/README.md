@@ -112,7 +112,7 @@ XML reader refuses the file ("not well-formed"), hence the `sed`.
 | `compute_mode = hl_ppm` | `sigma.x` default `frequency_dependence 1` |
 | `ppm_omega_p = 200.0` | none: LORRAX's HL fit reads the first moment at a real probe frequency, which must lie above every χ₀ transition (3.48 Ry here); 200 Ry is the f-sum limit |
 | `use_band_extrapolation = false` | BerkeleyGW truncates the band sum |
-| `bse_k_grid = 10 10 10` | `absorption.x`'s `WFN_fi` grid |
+| `kgrid_fine = 10 10 10` | `absorption.x`'s `WFN_fi` grid |
 | `sys_dim = 3` | no truncation |
 
 `ht.in` asks for bands 1–24 (`ncond = 16`): htransform fits 4 guard bands above
@@ -157,7 +157,7 @@ Lowest excitons (TDA, eV):
 | S9 | 3.273 | 3.162 | 3.216 |
 
 The fine grids differ: `absorption.x` reads the shifted `WFN_fi`, which has no
-Γ point, while `bse_k_grid = 10 10 10` is unshifted and contains Γ, where the
+Γ point, while `kgrid_fine = 10 10 10` is unshifted and contains Γ, where the
 direct gap is. On BerkeleyGW's own QP energies LORRAX's S1 lies 68 meV below
 the Γ transition (3.247 eV); BerkeleyGW's lies 10 meV below it, at a k of the
 shifted grid. The BerkeleyGW column is the upstream example's own absorption

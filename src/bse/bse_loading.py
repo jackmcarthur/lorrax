@@ -15,7 +15,7 @@ from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY,
                                     resolve_band_window)
 
 from .bse_densify import (_interpolate_bse_data_to_grid,
-                          _read_lorrax_input_quietly, _resolve_bse_k_grid,
+                          _read_lorrax_input_quietly, _resolve_kgrid_fine,
                           resolve_w_head_densify)
 from .bse_head import _inject_q0_head, _resolve_head_params
 from .bse_preconditioner import compute_pair_amplitude
@@ -115,7 +115,7 @@ def load_bse_data_from_restart_sharded(
     n_occ: Optional[int] = None,
     inject_head: bool = True,
     load_v_full: bool = False,
-    bse_k_grid=None,
+    kgrid_fine=None,
     w_head_densify=None,
     w_head_gamma_cell: str = "fine",
     degeneracy_mode: str = DEFAULT_MODE,
@@ -141,12 +141,12 @@ def load_bse_data_from_restart_sharded(
     and ε are the matched QP energies.  ``data["qp_rotation"]`` carries the
     window's U columns for the dipoles; it is ``None`` on the DFT basis.
 
-    ``bse_k_grid`` (``(nx,ny,nz)`` / ``"nx ny nz"`` / ``None``) turns on
+    ``kgrid_fine`` (``(nx,ny,nz)`` / ``"nx ny nz"`` / ``None``) turns on
     fine-grid densification: when set and DIFFERENT from the coarse restart
     grid, the ENTIRE bundle (ψ, QP ε, V_Q exchange, W direct) is interpolated
     onto that grid via :func:`_interpolate_bse_data_to_grid` BEFORE returning,
     so every downstream solver runs on the fine grid transparently.  When
-    ``None`` the value is read from the cohsex.in ``bse_k_grid`` key (via
+    ``None`` the value is read from the cohsex.in ``kgrid_fine`` key (via
     ``input_file``); unset or == the coarse grid → the coarse bundle is
     returned byte-identically (fast path untouched).
 
@@ -217,7 +217,7 @@ def load_bse_data_from_restart_sharded(
     # injection, because C1 (the default) hands the densifier the
     # head-EXCLUDED body and re-attaches the head per fine q afterwards, so on
     # a densifying run the rank-1 whead must NOT go on now.
-    fine_grid = _resolve_bse_k_grid(bse_k_grid, input_file)
+    fine_grid = _resolve_kgrid_fine(kgrid_fine, input_file)
     densify_pending = (fine_grid is not None
                        and fine_grid != (nkx, nky, nkz))
     qp_rotation = None
@@ -234,7 +234,7 @@ def load_bse_data_from_restart_sharded(
         if densify_pending:
             raise ValueError(
                 f"GATE bse_qp_rotations_k_grid: got qp_rotations_file with "
-                f"bse_k_grid = {fine_grid} on a {(nkx, nky, nkz)} restart; "
+                f"kgrid_fine = {fine_grid} on a {(nkx, nky, nkz)} restart; "
                 f"want the native grid.  why: the densifying htransform takes "
                 f"QP energies only (eqp_corrections), so the fine ψ and velocity would "
                 f"stay in the DFT basis.  fix: run the native grid, or "
@@ -385,14 +385,14 @@ def load_bse_data_from_restart_sharded(
         "q0_head_ry": q0_head_ry,
     }
 
-    # ── bse_k_grid coarse→fine densification ─────────────────────────────
+    # ── kgrid_fine coarse→fine densification ─────────────────────────────
     # Unset or == the coarse grid → the coarse bundle above is returned
     # UNTOUCHED.  That is the on-grid byte-identity guarantee, and it is
     # structural rather than measured.
     if densify_pending:
         if input_file is None:
             raise ValueError(
-                "bse_k_grid densification needs input_file (cohsex.in) to run "
+                "kgrid_fine densification needs input_file (cohsex.in) to run "
                 "the htransform ψ/ε and vq_interp V_Q interpolation.")
         data = _interpolate_bse_data_to_grid(
             data, fine_grid, restart_file, input_file, mesh_xy,

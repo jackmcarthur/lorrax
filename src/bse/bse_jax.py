@@ -126,10 +126,10 @@ def _preview_lanczos(
     if not tda and kgrid is not None:
         # GATE nontda_dense_size before the restart load and the W transform.
         from math import prod
-        from .bse_densify import _resolve_bse_k_grid
+        from .bse_densify import _resolve_kgrid_fine
         from .bse_nontda import refuse_dense_window
         refuse_dense_window(n_cond, n_val, prod(
-            _resolve_bse_k_grid(None, input_file) or kgrid), create_mesh_2d())
+            _resolve_kgrid_fine(None, input_file) or kgrid), create_mesh_2d())
     restart_file = _find_restart_file(input_file)
     # ONE solve path on any mesh (1x1 included): the sharded loader and
     # ``solve_bse_sharded`` on the trial-stack matvec.  The single-device
@@ -165,7 +165,7 @@ def _preview_lanczos(
         )
         qp_rotation = data.get("qp_rotation")
         grid_x, grid_y = mesh_xy.devices.shape
-        # EQP override on enk_full (BGW eqp1.dat semantics).  A bse_k_grid
+        # EQP override on enk_full (BGW eqp1.dat semantics).  A kgrid_fine
         # bundle took the QP energies inside its htransform; re-slicing the
         # coarse restart here would put coarse ε on the fine k axis.
         n_occ_eqp = None
@@ -179,7 +179,7 @@ def _preview_lanczos(
                 int(data["n_val"]), int(data["n_cond"]), n_occ, grid_x,
                 grid_y, degeneracy_mode=degeneracy_mode,
                 degeneracy_tol_ry=degeneracy_tol_ry)
-        # The BSE-grid htransform (bse_k_grid) and QP-rotation receipts: one
+        # The BSE-grid htransform (kgrid_fine) and QP-rotation receipts: one
         # row each here, the whole receipt in the JSON sidecar.
         from common.scientific_output import (htransform_quality_lines,
                                               spectral_compression_lines)
@@ -316,7 +316,7 @@ def _preview_lanczos(
                 # the brightest in RESULTS; eigenvectors.h5 keeps the written
                 # states'): the window dipoles Haydock seeds
                 # from (``absorption_common.window_dipoles``: the dipole.h5 slice
-                # at the n_occ the loader and ``eqp_corrections`` settled on, a bse_k_grid
+                # at the n_occ the loader and ``eqp_corrections`` settled on, a kgrid_fine
                 # bundle's own, or a qp_rotations_file bundle's QP-basis dipoles),
                 # contracted against the solve's distributed eigenvectors in state
                 # blocks (no gather).
@@ -368,7 +368,7 @@ def _preview_lanczos(
     if haydock is not None:
         # ε₂(ω) by the Haydock recursion on THIS payload: the loaded bundle,
         # the eigensolve's W_R (keep_W_R) and the same matvec, so the second
-        # process's startup, load (htransform + densify on bse_k_grid), W
+        # process's startup, load (htransform + densify on kgrid_fine), W
         # transform and compiles are not paid again.
         from .absorption_common import build_dipole_vector_bse
         from .absorption_haydock import (POLARIZATIONS, haydock_coefficients,
@@ -601,12 +601,12 @@ def _settings_parser():
         help="with --write-eigs (TDA): contract each written state against "
              "this dipole.h5 (psp.get_dipole_mtxels, the file "
              "absorption_haydock reads) and store <0|r|S> as "
-             "exciton_data/dipoles in eigenvectors.h5.  Under bse_k_grid it "
+             "exciton_data/dipoles in eigenvectors.h5.  Under kgrid_fine it "
              "is the deck (coarse) WFN's dipole.h5: the densifier carries it "
              "through the htransform into the fine states")
     parser.add_argument(
         "--dipole-position-fix", action="store_true",
-        help="bse_k_grid with --eqp: the dipoles are the exact <c|r|v> of the "
+        help="kgrid_fine with --eqp: the dipoles are the exact <c|r|v> of the "
              "fine QP states, from the DFT f(H) eigenbasis of the window "
              "(bse_densify.densified_dipoles qp_states), instead of "
              "v/dE_RQ.  Opt in when the logged QP/DFT window mixing is large "

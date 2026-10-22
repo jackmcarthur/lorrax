@@ -338,7 +338,7 @@ def inplane_helicity(dipoles, n_k):
     ``dipoles`` is :func:`exciton_dipole_projections`' ``(n_states, 3)``,
     which is ⟨0|r̂|S⟩ times the global −i of the velocity form
     (``d = ⟨c|v̂|v⟩/ΔE = i⟨c|r̂|v⟩``) on the native route and on the
-    ``bse_k_grid`` route alike; no modulus sees that factor.  The
+    ``kgrid_fine`` route alike; no modulus sees that factor.  The
     ⟨S|r̂|0⟩ spelling (a conjugated D) swaps I+ and I−, so the convention
     lives in this function and nowhere else.  An exciton normalised over the
     N_k-point zone has |D|² ∝ N_k, so the division gives strengths per unit
@@ -441,7 +441,7 @@ def _deck_wfn_fingerprint(wfn_path):
 def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
     """``(d_alpha, de_cv)`` of the BSE window ``data`` solves: THE dipole source.
 
-    A ``bse_k_grid`` bundle carries its own (``data["dipoles"]``, built by
+    A ``kgrid_fine`` bundle carries its own (``data["dipoles"]``, built by
     ``bse_densify.densified_dipoles`` from ``dipole_file``, the coarse WFN's
     velocity, in the fine ψ gauge) and never slices a file: the coarse file
     has another k list, and a fine grid's ``dipole.h5`` has the right shape
@@ -466,7 +466,7 @@ def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
         dip = data.get("dipoles")
         if dip is None or dip["source"] != os.path.abspath(str(dipole_file)):
             raise ValueError(
-                f"GATE densified_dipoles: got a bse_k_grid bundle whose "
+                f"GATE densified_dipoles: got a kgrid_fine bundle whose "
                 f"dipoles are {None if dip is None else dip['source']!r}; "
                 f"want those built from {os.path.abspath(str(dipole_file))!r}; "
                 f"why: a densified bundle's dipoles exist only in its own ψ "

@@ -1,5 +1,5 @@
 """In-plane helicity of BSE states: the campaign convention on a C3 toy, and
-one table on the native and ``bse_k_grid`` routes.
+one table on the native and ``kgrid_fine`` routes.
 
 σ+ is the field E₀(cos ωt, sin ωt, 0).  A state whose orbital angular momentum
 about +z is one unit above the ground state's absorbs σ+ only.  The toy is a

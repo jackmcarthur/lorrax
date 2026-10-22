@@ -21,7 +21,7 @@ forms an ``A``, so it cannot conjugate one wrongly: it evaluates
 ``⟨d|(z − H)⁻¹|d⟩`` with the seed ``|d⟩ = Σ_t d_t |t⟩`` taken straight
 from ``slice_dipole_to_bse_window`` (correct, because
 ``⟨t|r̂|0⟩ = ⟨ck|r̂|vk⟩ = d_t``) and the Lanczos inner product
-``⟨s|H|s⟩`` conjugating the bra as usual (on a ``bse_k_grid`` bundle the
+``⟨s|H|s⟩`` conjugating the bra as usual (on a ``kgrid_fine`` bundle the
 seed is the bundle's own fine-gauge dipoles, ``window_dipoles``).  Its
 spectral weights are
 therefore ``|⟨S|d⟩|² = |Σ_t conj(A_t) d_t|²``, which is exactly
@@ -339,7 +339,7 @@ def run_haydock(
     from .bse_io import resolve_n_occ
     n_occ = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)
     if eqp_file is not None and not data["densified"]:
-        # (A bse_k_grid bundle took the QP energies inside its htransform.)
+        # (A kgrid_fine bundle took the QP energies inside its htransform.)
         # Re-slice the band window AND re-resolve n_occ on the eqp-corrected
         # energies (a QP shift can move the gap). Overwrite n_occ so the
         # downstream dipole slice below uses the corrected value too, rather

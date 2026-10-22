@@ -15,7 +15,7 @@ Two drivers share one interpolation engine:
 | `python -m bse.exciton_bands` | the lowest exciton energies $E_S(Q)$ of the finite-momentum Bethe–Salpeter equation along the deck's Q path | `<prefix>.dat`, `<prefix>.png`, `<prefix>.out` |
 
 The same engine also supplies the fine-grid wavefunctions of BSE
-densification (`bse_k_grid`, [BSE](../architecture/bse.md)).
+densification (`kgrid_fine`, [BSE](../architecture/bse.md)).
 
 ## 1. The problem
 
@@ -479,7 +479,7 @@ qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin] [--color orbital:d]
 | `-wfn` / `--wfn-file` | the deck's `wfn_file` | another WFN, for example `WFN_qp.h5` |
 | `-o` / `--output-file`, `--report-file` | `bandstructure.dat`, `htransform.out` | outputs |
 | `linalg` | `local` | `distributed` pins the `face` route of the top-block solves; otherwise each stage's route is admitted from its compiled price (§2) |
-| `get_centroids_fi`, `kgrid_fi`, `wfn_fi_min`/`wfn_fi_max`, `wfn_fi_q_chunk` | off | BSE handoff: fine-grid ψ at the coarse centroids (`bse_setup.compute_wfns_fi`); keep at least 4 bands between `wfn_fi_max` and the top of the window |
+| `get_centroids_fi`, `kgrid_fine`, `wfn_fi_min`/`wfn_fi_max`, `wfn_fi_q_chunk` | off | BSE handoff: fine-grid ψ at the coarse centroids (`bse_setup.compute_wfns_fi`); keep at least 4 bands between `wfn_fi_max` and the top of the window |
 | `--plot` | off | show the band plot |
 
 ## 9. Refusals and limits

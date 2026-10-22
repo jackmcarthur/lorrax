@@ -261,7 +261,7 @@ The BSE contract is [BSE](architecture/bse.md); this table only says where each 
 | `absorption_common.py` | Shared absorption helpers: dipole slicing to the window, the ⟨0\|r̂\|S⟩ contraction, Lorentzian, JDOS, Kramers–Kronig, `.dat`/`.h5` writers. |
 | `absorption_haydock.py` | ε₂(ω) by the Haydock continued fraction on the TDA BSE; `python -m bse.absorption_haydock`. |
 | `bse_davidson_helpers.py` | Start subspace and diagonal preconditioners for `solvers.davidson.davidson` on the BSE vector layout. |
-| `bse_densify.py` | Coarse-to-fine densification of the BSE bundle under `bse_k_grid`, its window dipoles included. |
+| `bse_densify.py` | Coarse-to-fine densification of the BSE bundle under `kgrid_fine`, its window dipoles included. |
 | `bse_feast.py` | FEAST contour eigensolver, its GMRES solves and the spectral deflation the W_BSE ladder reuses. |
 | `bse_head.py` | The q = 0 Coulomb head: its scalars and their rank-one injection. |
 | `bse_io.py` | Compatibility facade: re-exports names from `bse_window`, `bse_head`, `bse_densify`, `bse_loading` and the window names of `common.band_degeneracy`. |

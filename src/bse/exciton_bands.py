@@ -1011,7 +1011,7 @@ def _gate_stats_on_device(
         # before any subtraction or mu contraction.  The index tables are
         # closed-over integer metadata from symmetry_maps, so this remains one
         # jit and neither mu-sharded wavefunction is gathered.  The production
-        # bse_k_grid path is NOT such a caller: its general loader has already
+        # kgrid_fine path is NOT such a caller: its general loader has already
         # rebuilt both operands on the fine grid and compares every row.
         if ht_idx is not None:
             e_ht = jnp.take(e_ht, ht_idx, axis=0)
@@ -1090,7 +1090,7 @@ def gate_htransform_vs_stored(
     :func:`symmetry_maps.common_uniform_grid_indices`.  This cannot repair a
     bundle whose energy and wavefunction tables have different k axes; that
     is refused before either index table is used.  The production
-    ``bse_k_grid`` path compares every fine-grid row because its general
+    ``kgrid_fine`` path compares every fine-grid row because its general
     loader has already densified the complete BSE bundle.
     """
     paired = (htransform_k_indices is not None, stored_k_indices is not None)
@@ -1108,7 +1108,7 @@ def gate_htransform_vs_stored(
             "bundle: each energy table and its wavefunction table must share "
             "one k axis, but htransform has "
             f"eps={n_ht_eps}, psi={n_ht_psi} and stored/data has "
-            f"eps={n_st_eps}, psi={n_st_psi}.  A bse_k_grid run with eqp_corrections "
+            f"eps={n_st_eps}, psi={n_st_psi}.  A kgrid_fine run with eqp_corrections "
             "can cause exactly this if coarse restart energies are applied "
             "after psi was densified; apply the QP ladder before "
             "densification, or use WFN_qp.h5 without the redundant eqp_corrections.")
@@ -1404,7 +1404,7 @@ def build_parser():
                          "solve scan (no extra compile), so density is "
                          "cheap; it is the htransform ψ_c(k+Q) cache that "
                          "grows linearly, and that is what to watch on a "
-                         "densified (bse_k_grid) bundle.")
+                         "densified (kgrid_fine) bundle.")
     ap.add_argument("--vq-mode", choices=("interp", "refit", "both", "ongrid"),
                     default="interp")
     ap.add_argument("--refit-points", type=str, default=None,
@@ -1794,7 +1794,7 @@ def main(argv=None):
             # does, and for a stricter reason: ongrid CONSUMES it, refit is
             # CERTIFIED AGAINST it — the tile null under --refit-window=zeta, the
             # contracted on-grid eigenvalue gate under =bse.  Both read
-            # ``V_q_full`` (or, after a bse_k_grid densification, the coarse tiles
+            # ``V_q_full`` (or, after a kgrid_fine densification, the coarse tiles
             # the densifier parks in ``V_q_coarse``, which is that same array), so
             # a refit run that did not ask for it reached its own gate and refused
             # itself for the bundle "carrying none" — measured, job 56612363 step
@@ -1940,11 +1940,11 @@ def main(argv=None):
         q_list = (Qpath[:, None, :] + k_frac[None, :, :]).reshape(-1, 3)
         # kgrid_co is the COARSE grid that ``ctilde`` lives on (= the WFN/restart
         # grid, from ``meta``), NOT ``(nkx,nky,nkz)`` — those come from ``data`` and
-        # are the FINE grid after a ``bse_k_grid`` coarse→fine densification, which
+        # are the FINE grid after a ``kgrid_fine`` coarse→fine densification, which
         # ``k_frac`` above correctly uses for the fine BSE k-sum.  ``build_fH_R``
         # ifft-reshapes ctilde's k-axis into ``kgrid_co``, so it MUST equal
         # ``prod(coarse)``; passing the fine grid crashes (36-k ctilde ≠ 12×12).
-        # No-op when bse_k_grid is unset (data grid == meta grid).
+        # No-op when kgrid_fine is unset (data grid == meta grid).
         kgrid_co_ct = (int(meta.nkx), int(meta.nky), int(meta.nkz))
         _path_quality_records = []
         bundle = compute_wfns_fi(
@@ -1983,7 +1983,7 @@ def main(argv=None):
             # host ``svd`` per k.  A diagnostic is allowed to cost something; it
             # is not allowed to cost something invisibly.
             t0 = time.time()
-            # ``data`` is the POST-bse_k_grid bundle.  When densification is on,
+            # ``data`` is the POST-kgrid_fine bundle.  When densification is on,
             # both its psi/eps and this Q=Gamma cache live on the FINE grid; the
             # native coarse restart is no longer either operand.  Comparing a
             # coarse/fine intersection here used the coarse energy cardinality
@@ -1998,7 +1998,7 @@ def main(argv=None):
                       f"at {nQ} Q x {nk} k")
         stages.begin(3, "Exchange kernel V_Q", name="exb.exchange")
 
-        # ── V_Q tiles ─ ONE shared arbitrary-Q model build.  The bse_k_grid
+        # ── V_Q tiles ─ ONE shared arbitrary-Q model build.  The kgrid_fine
         #    coarse→fine general init (bse_io) calls the SAME
         #    ``vq_interp.build_vq_evaluator`` — there is a single exchange-interp
         #    orchestration, not one here and one there. ─────────────────────────
@@ -2028,7 +2028,7 @@ def main(argv=None):
                 f"in ongrid/interp no refit runs at all.")
         kgrid_bse = np.array([nkx, nky, nkz], dtype=np.int64)
         # WHICH GRID INDEXES THE EXCHANGE TILES.  Normally the bundle's own.  After
-        # a ``bse_k_grid`` coarse→fine densification the bundle's grid is the FINE
+        # a ``kgrid_fine`` coarse→fine densification the bundle's grid is the FINE
         # one but the stored tiles are still the COARSE ones — exact where they
         # exist (V_{μν}(q) is a ζ/G-sphere object and never sees the k-grid) and
         # simply ABSENT at a fine q that is not a coarse q.  So the on-grid Q set
@@ -2040,7 +2040,7 @@ def main(argv=None):
         if V_ongrid is None and data.get("V_q_coarse") is not None:
             V_ongrid = data["V_q_coarse"]
             kgrid_vq = np.asarray(data["V_q_coarse_grid"], dtype=np.int64)
-            vq_src = "the COARSE restart grid (bse_k_grid densification)"
+            vq_src = "the COARSE restart grid (kgrid_fine densification)"
         if ongrid:
             if V_ongrid is None:
                 raise SystemExit(
@@ -2053,7 +2053,7 @@ def main(argv=None):
                     f"--vq-mode=ongrid needs every Q on the "
                     f"{kgrid_vq[0]}x{kgrid_vq[1]}x{kgrid_vq[2]} EXCHANGE-TILE grid "
                     f"({vq_src}); the path is off by {off:.3e} grid units.  On a "
-                    f"bse_k_grid-densified bundle that grid is the COARSE restart "
+                    f"kgrid_fine-densified bundle that grid is the COARSE restart "
                     f"grid, not the fine BSE grid "
                     f"({nkx}x{nky}x{nkz}): densifying moves the k-SUM, it does not "
                     f"create exchange tiles at new q.  Use a K_POINTS block whose "
@@ -2386,7 +2386,7 @@ def main(argv=None):
                 # before the sub-sampling, so what gets trig-interpolated is the
                 # body alone, and the head is re-attached analytically at every
                 # fine q inside the coarse Γ cell (gw.head_densify).  Note the
-                # asymmetry with the ``bse_k_grid`` path: there the loader can
+                # asymmetry with the ``kgrid_fine`` path: there the loader can
                 # DEFER the injection because it knows a densification is coming,
                 # whereas here the restart is natively fine and the loader has
                 # already injected — so the head is subtracted back off, using the

@@ -1627,7 +1627,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     # ``meta.sys_dim = config.sys_dim``) and every dimension-aware consumer
     # reads ``meta.sys_dim`` off that stamp.  This is the OTHER Meta in the
     # tree — the one the bandstructure driver, ``bse.bse_densify``'s
-    # ``bse_k_grid`` densification, ``bse.exciton_bands``' ``--w-coarse-grid``
+    # ``kgrid_fine`` densification, ``bse.exciton_bands``' ``--w-coarse-grid``
     # leg and ``bse.vq_interp.refit_prepare`` all use — so it is stamped here,
     # from the same key, once, rather than at each of those four call sites.
     #
@@ -1655,7 +1655,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             "explicitly.  Do NOT default it here.")
     meta.sys_dim = int(params["sys_dim"])
     # Route completeness for every htransform / BSE stage after this entry
-    # (htransform, exciton_bands, bse_k_grid, vq_interp): a whole matrix of
+    # (htransform, exciton_bands, kgrid_fine, vq_interp): a whole matrix of
     # side >= N_mu/2 on a rank needs a mesh route (GATE nmu2_no_backup), as
     # gw.tangential_recipe sets it for GW.
     from lxkit import memory

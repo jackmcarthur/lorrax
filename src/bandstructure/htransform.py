@@ -651,7 +651,7 @@ def main(argv=None):
         stages.begin(3, "Outputs", name="htransform.outputs")
 
         # Optional BSE interpolation handoff: fine-k wfns at coarse centroids.
-        # Driven by ``get_centroids_fi`` + ``kgrid_fi`` + ``wfn_fi_{min,max}``;
+        # Driven by ``get_centroids_fi`` + ``kgrid_fine`` + ``wfn_fi_{min,max}``;
         # see ``bandstructure.bse_setup.compute_wfns_fi`` for the contract.
         if params.get("get_centroids_fi", False):
             from .bse_setup import compute_wfns_fi
@@ -686,7 +686,7 @@ def main(argv=None):
                 wfns_fi = compute_wfns_fi(
                     ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
                     kgrid_co=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
-                    kgrid_fi=params["kgrid_fi"],
+                    kgrid_fine=params["kgrid_fine"],
                     band_window_fi=(b_min, b_max),
                     mesh_xy=mesh_xy, a_band_index=args.a_band,
                     use_low_mem_eigh=use_low_mem_eigh, log_fn=log,

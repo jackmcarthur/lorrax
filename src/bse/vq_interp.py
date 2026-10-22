@@ -1498,7 +1498,7 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     up to float summation reorder ~1e-13), just ``1/nranks`` the work.
 
     ``kgrid`` overrides ``zx['kgrid']`` for the mini-BZ CELL SIZE — the
-    ``bse_k_grid`` coarse→fine init passes the FINE k-grid here so the q=0
+    ``kgrid_fine`` coarse→fine init passes the FINE k-grid here so the q=0
     exchange head is the (smaller) fine mini-BZ average, not the coarse one
     (the head magnitude scales with the mini-BZ cell area).  That init reaches
     this function only on the ``head_minibz_average`` OPT-IN arm; with the key
@@ -1747,7 +1747,7 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
     (``read_vq_payload`` → ``build_cq`` → gates → ``prepare_coarse`` →
     ``lr_design_blocks`` → ``fit_lr_model`` → nulls → ``make_eval_vq`` +
     stencil pieces).  BOTH the ``exciton_bands`` Q-path driver and the general
-    BSE init's ``bse_k_grid`` coarse→fine densification (on its
+    BSE init's ``kgrid_fine`` coarse→fine densification (on its
     ``head_minibz_average`` opt-in arm only) call this — there is no second
     copy of the setup sequence.
 

@@ -472,7 +472,7 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
 
     W(q) (with its q = 0 head) comes from the BSE restart loader
     (``bse_loading.load_bse_data_from_restart_sharded``, so a deck with
-    ``bse_k_grid`` delivers the densified W and ψ), ψ from ``wfn_file`` when
+    ``kgrid_fine`` delivers the densified W and ψ), ψ from ``wfn_file`` when
     given (:func:`sample_window_psi`, TDGW's gauge) and from the restart
     otherwise, and the Hartree operator from the restart's ``zeta_q.h5``.
 
@@ -484,7 +484,7 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
     wfn_file : str, optional — TDGW's full-grid WFN.h5.
     zeta_file : str, optional — default ``<restart dir>/zeta_q.h5``.
     eqp_file : str, optional — BerkeleyGW ``eqp.dat``, the BSE run's ``eqp_corrections``.
-        On a ``bse_k_grid`` deck it enters the loader's htransform, so the
+        On a ``kgrid_fine`` deck it enters the loader's htransform, so the
         fine ψ are the quasiparticle f(H) states (the states of a
         ``bse_jax eqp_corrections`` run on the same deck) and the fine ε are QP.  On a
         coarse deck ψ stay the restart's (or ``wfn_file``'s) and the file
@@ -568,7 +568,7 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
                         bands=(b_lo, b_hi), densified=bool(data.get("densified", False)))
         if wfn_file is not None:
             if data.get("densified", False):
-                _refuse("td_wfn_densified", "wfn_file with a bse_k_grid deck",
+                _refuse("td_wfn_densified", "wfn_file with a kgrid_fine deck",
                         "ψ from one source", "drop wfn_file (the densified ψ is the htransform's)")
             centroids = load_centroid_basis(cfg.paths.centroids_file, deck_wfn.fft_grid,
                                             sym=deck_wfn.symmetry())
@@ -626,9 +626,9 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
 
 
 def _deck_densifies(input_file: str, header: dict) -> bool:
-    """True when the deck's ``bse_k_grid`` differs from the restart's grid (the loader's own test)."""
-    from bse.bse_densify import _resolve_bse_k_grid
-    fine = _resolve_bse_k_grid(None, input_file)
+    """True when the deck's ``kgrid_fine`` differs from the restart's grid (the loader's own test)."""
+    from bse.bse_densify import _resolve_kgrid_fine
+    fine = _resolve_kgrid_fine(None, input_file)
     coarse = tuple(int(n) for n in np.asarray(header["grid"]).reshape(-1)[:3])
     return fine is not None and tuple(int(n) for n in fine) != coarse
 
@@ -660,7 +660,7 @@ def _loader_options(loader, *, eqp_file=None, velocity_file=None,
                     "run from a checkout that merges the BSEDIP loader")
         if not densifies:
             _refuse("td_velocity_route", "velocity_file on a deck without a densifying "
-                    "bse_k_grid", "a bse_k_grid deck (the loader reads the velocity there "
+                    "kgrid_fine", "a kgrid_fine deck (the loader reads the velocity there "
                     "only)", "slice the coarse dipole.h5 with absorption_common.window_dipoles")
         out["velocity_file"] = os.path.abspath(velocity_file)
     if velocity_full_window:
@@ -676,7 +676,7 @@ def _loader_options(loader, *, eqp_file=None, velocity_file=None,
                     f"{velocity_file!r} on {loader.__module__}.{loader.__name__}",
                     "a densified bundle whose loader carries the velocity "
                     "(velocity_position_fix)", "drop lorrax.dipole_position_fix, or use a "
-                    "bse_k_grid deck")
+                    "kgrid_fine deck")
         out["velocity_position_fix"] = True
     return out
 

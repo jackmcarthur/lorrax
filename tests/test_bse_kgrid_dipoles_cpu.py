@@ -1,4 +1,4 @@
-"""``bse_k_grid`` dipoles: ``densified_dipoles`` against the exact fine-grid answer (CPU, 2x2 host mesh).
+"""``kgrid_fine`` dipoles: ``densified_dipoles`` against the exact fine-grid answer (CPU, 2x2 host mesh).
 
 ``bse.bse_densify.densified_dipoles`` on a toy tight-binding slab whose
 orbitals are the htransform nodes (all at the cell origin, unit metric), so the
@@ -125,7 +125,7 @@ def _densify(mesh, c, e, v, *, fh_energies=None, e_file=None, q_perm=None,
         fine = compute_wfns_fi(
             ctilde=jnp.asarray(c), B_at_mu=nodes,
             enk_sigma=jnp.asarray(e_fh.T),
-            kgrid_co=KC, kgrid_fi=KF, band_window_fi=(B_MIN, B_MAX),
+            kgrid_co=KC, kgrid_fine=KF, band_window_fi=(B_MIN, B_MAX),
             mesh_xy=mesh, return_coeffs=True)
         if q_perm is not None:
             fine.q_frac = fine.q_frac[q_perm]

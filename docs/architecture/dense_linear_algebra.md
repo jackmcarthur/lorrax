@@ -438,7 +438,7 @@ so every rank past $Q$ idles for the whole factor stage, and the run says so
 when $P > Q$.
 
 **What does not divide by $P$.**
-- `bse/vq_interp` (the `exciton_bands` and `bse_k_grid` paths) keeps `Fch`, the
+- `bse/vq_interp` (the `exciton_bands` and `kgrid_fine` paths) keeps `Fch`, the
   $(Q, \mu, n_G)$ long-range form factors, as a host array on every process; with
   `run_diagnostics`, `S` and `V_SRc` add two $(Q,\mu,\mu)$ host mirrors per
   process.

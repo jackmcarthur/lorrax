@@ -14,7 +14,7 @@ rule stated in its own docstring:
 ``bse_densify``
     Coarse k-grid to fine: the exact real-space zero-pad, the one sharded
     densifier, C1's analytic per-fine-q head channel, and the whole-bundle
-    interpolation the ``bse_k_grid`` key drives.
+    interpolation the ``kgrid_fine`` key drives.
 ``bse_loading``
     Reading a GW restart into a BSE bundle: the readiness and q-wedge gates,
     the SlabIO / serial transports, and the two loaders.
@@ -40,7 +40,7 @@ from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY,
 
 from .bse_densify import (W_HEAD_DENSIFY_MODES, _interpolate_bse_data_to_grid,
                           _parse_grid_spec, _read_lorrax_input_quietly,
-                          _resolve_bse_k_grid, build_w_head_channel,
+                          _resolve_kgrid_fine, build_w_head_channel,
                           decimate_W_q_to_subgrid, make_w_densifier,
                           pad_W_R_to_grid, resolve_w_head_densify,
                           w_pair_embedding)
