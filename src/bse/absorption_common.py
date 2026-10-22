@@ -509,6 +509,25 @@ def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
     return qp_window_dipoles(dipole_cart, deltaE, qp), de_cv
 
 
+def window_transition_energies(data):
+    """The BSE operator's own window transitions ``E_c − E_v``, ``(nk, nc, nv)`` Ry.
+
+    Where each transition sits in H (QP under ``eqp_corrections`` /
+    ``eqp_co_corrections``, the QP states' energies under ``qp_rotations_file``):
+    the δ positions of the independent-particle spectra (``absorption_noeh.dat``,
+    Haydock's noeh column), as BerkeleyGW places them.  :func:`window_dipoles`'
+    ``de_cv`` is the velocity's own ΔE, the dipoles' denominator, and stays that
+    (DFT energies on the ``eqp`` routes, 0.7 eV low on Si).
+    """
+    def host(a):
+        if getattr(a, "is_fully_addressable", True):
+            return np.asarray(a)
+        return np.asarray(a.addressable_data(0))          # replicated table
+    nc, nv = int(data["n_cond"]), int(data["n_val"])
+    ec, ev = host(data["eps_c"])[:, :nc], host(data["eps_v"])[:, :nv]
+    return (ec[:, :, None] - ev[:, None, :]).real.astype(np.float64)
+
+
 def build_dipole_vector_bse(d_alpha, n_cond_pad=None, n_val_pad=None):
     """Reshape (3, nk, nc, nv) → (3, nc_pad, nv_pad, nk) BSE block-vector form.
 

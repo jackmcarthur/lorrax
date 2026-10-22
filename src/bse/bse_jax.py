@@ -295,10 +295,10 @@ def _preview_lanczos(
     helicity_lines = ()
     dipoles = None
 
-    d_alpha = de_cv = None
+    d_alpha = de_op = None
     if dipole_file is not None:
         from file_io.restart_bundle import read_metadata
-        from .absorption_common import window_dipoles
+        from .absorption_common import window_dipoles, window_transition_energies
         from .bse_io import resolve_n_occ
         from .bse_window import _parse_wfn_path
         n_occ_dip = (n_occ_eqp if n_occ_eqp is not None else resolve_n_occ(
@@ -308,6 +308,11 @@ def _preview_lanczos(
             d_alpha, de_cv = window_dipoles(
                 data, dipole_file, n_occ=n_occ_dip,
                 wfn_path=_parse_wfn_path(input_file))
+        # The noeh spectra sit at the operator's own (QP) transitions, not at
+        # the velocity's (DFT) energies that divide the dipoles.
+        de_op = window_transition_energies(data)
+        if de_op.shape != tuple(de_cv.shape):
+            raise ValueError(f"window transitions {de_op.shape} vs dipoles {tuple(de_cv.shape)}")
 
     n_write = 0
     dipole_attrs = None
@@ -380,7 +385,7 @@ def _preview_lanczos(
             spectrum["polarization"], _parse_wfn_path(input_file))
         spectrum_files = write_state_spectra(
             energies_Ry=eigenvalues_host[:n_eig], exciton_dipoles=dipoles,
-            d_alpha=d_alpha, de_cv=de_cv, directions=directions, labels=labels,
+            d_alpha=d_alpha, de_cv=de_op, directions=directions, labels=labels,
             V_cell=float(cell_volume), nk=nk, n_spinor=int(data["psi_c_X"].shape[2]),
             width_eV=spectrum["width_ev"], kind=spectrum["kind"],
             omegas_eV=spectrum["omegas_ev"], no_eps1=spectrum["no_eps1"],
@@ -410,7 +415,7 @@ def _preview_lanczos(
             write_haydock_outputs(
                 out_prefix=haydock["out_prefix"], directions=directions,
                 labels=labels, alphas=alphas,
-                betas=betas, norms=norms, d_alpha=d_alpha, de_cv=de_cv,
+                betas=betas, norms=norms, d_alpha=d_alpha, de_cv=de_op,
                 V_cell=float(cell_volume), nk=nk, eta_eV=haydock["eta_ev"],
                 n_spin=int(haydock["n_spin"]),
                 n_spinor=int(data["psi_c_X"].shape[2]),
