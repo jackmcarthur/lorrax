@@ -702,8 +702,8 @@ def read_metadata(filename):
         )
 
 
-def read_interaction(filename, kind, mesh_xy, *, nohead=False):
-    """Return a padded, full-q interaction with P(None, x, y) sharding."""
+def _interaction_dataset(filename, kind, nohead):
+    """The dataset name of a persisted interaction (``bare`` V or ``screened`` W0)."""
     names = {"bare": "V_qmunu", "screened": "W0_qmunu"}
     name = names[kind]
     with h5py.File(filename, "r") as f:
@@ -713,7 +713,130 @@ def read_interaction(filename, kind, mesh_xy, *, nohead=False):
             raise ValueError(f"{filename}: {kind} interaction was not persisted")
         if nohead and name + "_nohead" in f:
             name += "_nohead"
-    return read_munu_tensor_from_h5(filename, name, mesh_xy)
+    return name
+
+
+def read_interaction(filename, kind, mesh_xy, *, nohead=False):
+    """Return a padded, full-q interaction with P(None, x, y) sharding."""
+    return read_munu_tensor_from_h5(
+        filename, _interaction_dataset(filename, kind, nohead), mesh_xy)
+
+
+def _interaction_rows(filename, name, mesh_xy, *, gamma_only=False):
+    """``(read_rows, n_q, n_rmu_pad, dtype)`` for a ``(q, μ, ν)`` interaction dataset.
+
+    ``read_rows(q0, n)`` returns the full-zone rows ``[q0, q0 + n)`` as a
+    ``(n, μ_pad, ν_pad)`` array at ``P(None, 'x', 'y')``, read one block at a
+    time: a full-zone dataset's rows straight off the disk, a q-IBZ wedge's
+    through the symmetry action of those rows alone (the unfold is pointwise in
+    the full-zone q, so a subset of its tables restores that subset exactly).
+    The wedge is read once and held; a full-zone dataset is never whole in
+    memory here.  ``gamma_only``: only full-zone row 0 will be asked for, so a
+    wedge reads its one parent row, not the wedge.
+    """
+    from .slab_io import SlabIO
+    from symmetry_maps import dataset_q_storage, read_tables, unfold_isdf_operator
+
+    with h5py.File(filename, "r") as f:
+        ds_shape = tuple(int(s) for s in f[name].shape)
+        ds_dtype = f[name].dtype
+        tables = (read_tables(f, name)
+                  if dataset_q_storage(f[name]) == "ibz" else None)
+    if len(ds_shape) != 3:
+        raise ValueError(_REGENERATE)
+    mu_tag = padded_mu_axis(int(ds_shape[-1]), mesh_xy)
+    n_pad = mu_tag.carrier
+    spec = P(None, "x", "y")
+
+    def _slab(q0, n):
+        with SlabIO(filename, mode="r", mesh=mesh_xy) as io:
+            arr = io.read_slab(name, shape=(int(n), n_pad, n_pad), dtype=ds_dtype,
+                               offset=(int(q0), 0, 0), mesh=mesh_xy, partition_spec=spec)
+        for axis in (-2, -1):
+            authenticate_axis(arr, mu_tag, axis=axis,
+                              where=f"_interaction_rows dataset {name!r}")
+        return arr
+
+    if tables is None:
+        return _slab, int(ds_shape[0]), n_pad, ds_dtype
+    t = tables.padded(int(n_pad))
+    irr, sym = np.asarray(t.irr_idx_q), np.asarray(t.sym_idx_q)
+    q_irr = np.asarray(t.q_irr_frac)
+    if gamma_only:
+        # Γ's parent row alone, re-indexed as a one-row wedge.
+        p = int(irr[0])
+        wedge, irr, q_irr = _slab(p, 1), np.zeros_like(irr), q_irr[p:p + 1]
+    else:
+        wedge = _slab(0, ds_shape[0])
+
+    def _unfold(q0, n):
+        rows = slice(int(q0), int(q0) + int(n))
+        if gamma_only and (int(q0), int(n)) != (0, 1):
+            raise ValueError("_interaction_rows: a gamma_only reader serves row 0 alone")
+        return unfold_isdf_operator(
+            wedge, irr_idx=irr[rows], sym_idx=sym[rows], sym_perm=t.sym_perm,
+            L_table=t.L_table, q_irr_frac=q_irr, mesh_xy=mesh_xy,
+            n_sym_spatial=int(t.n_sym_spatial))
+    return _unfold, int(irr.size), n_pad, ds_dtype
+
+
+def read_interaction_gamma(filename, kind, mesh_xy, *, nohead=False):
+    """The q = 0 tile of a persisted interaction, ``(μ_pad, ν_pad)`` at ``P('x', 'y')``.
+
+    One stored row is read (a wedge's Γ parent, unfolded through Γ's own
+    action): the BSE exchange needs this tile alone, and reading the full zone
+    to keep it held N_k tiles at the load's peak.
+    """
+    read_rows, _, _, _ = _interaction_rows(
+        filename, _interaction_dataset(filename, kind, nohead), mesh_xy,
+        gamma_only=True)
+    return jax.jit(lambda a: a[0], out_shardings=NamedSharding(mesh_xy, P("x", "y")))(
+        read_rows(0, 1))
+
+
+@functools.lru_cache(maxsize=None)
+def _qgrid_block_writer(mesh_xy, grid):
+    """``write(out, block, q0) -> out``: rows ``[q0, q0 + b)`` of a ``(b, μ, ν)`` block into the
+    ``(μ, ν, kx, ky, kz)`` tile, ``out`` DONATED so the tile is the one buffer that grows."""
+    nq = int(np.prod(grid))
+    out_sh = NamedSharding(mesh_xy, P("x", "y", None, None, None))
+
+    def write(out, block, q0):
+        flat = out.reshape(out.shape[:2] + (nq,))
+        flat = jax.lax.dynamic_update_slice_in_dim(
+            flat, jnp.moveaxis(block, 0, -1), q0, axis=2)
+        return flat.reshape(out.shape)
+    return jax.jit(write, donate_argnums=(0,), out_shardings=out_sh)
+
+
+def read_interaction_qgrid(filename, kind, mesh_xy, grid, *, nohead=False):
+    """A persisted interaction on the full q grid in the BSE layout,
+    ``(μ_pad, ν_pad, kx, ky, kz)`` at ``P('x', 'y', None, None, None)``.
+
+    Built in q blocks, each written into the donated output: the ``(q, μ, ν)``
+    read layout and the ``(μ, ν, q)`` BSE layout are never both whole.  A
+    block is one fixed tile (``runtime.tiles.TILE_BYTES``) per rank, or an
+    eighth of the zone when that is larger: a wedge's unfold bakes each
+    block's rows into its program, so at most eight programs compile.  The
+    last block is clamped onto its neighbour (rewriting identical rows), so
+    one write program serves every block.
+    """
+    from runtime import tiles
+    grid = tuple(int(n) for n in grid)
+    read_rows, nq, n_pad, dtype = _interaction_rows(
+        filename, _interaction_dataset(filename, kind, nohead), mesh_xy)
+    if nq != int(np.prod(grid)):
+        raise ValueError(f"{filename}: {kind} interaction holds {nq} q rows; "
+                         f"the k grid {grid} has {int(np.prod(grid))}")
+    tile_row = 16 * n_pad * n_pad // int(mesh_xy.devices.size)
+    b = min(nq, max(1, int(tiles.TILE_BYTES) // max(1, tile_row), -(-nq // 8)))
+    out = jax.jit(lambda: jnp.zeros((n_pad, n_pad) + grid, dtype),
+                  out_shardings=NamedSharding(mesh_xy, P("x", "y", None, None, None)))()
+    write = _qgrid_block_writer(mesh_xy, grid)
+    for q0 in range(0, nq, b):
+        q0 = min(q0, nq - b)
+        out = write(out, read_rows(q0, b), jnp.int32(q0))
+    return out
 
 
 def read_wavefunctions(filename, input_file, mesh_xy, *, bands=None, family="charge"):
@@ -780,14 +903,19 @@ def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
             "screened body supplied by the static response owner")
     v = read_wavefunctions(filename, input_file, mesh_xy, bands=val_indices)
     c = read_wavefunctions(filename, input_file, mesh_xy, bands=cond_indices)
-    V = read_interaction(filename, "bare", mesh_xy, nohead=nohead)
-    W = (read_interaction(filename, "screened", mesh_xy, nohead=nohead)
-         if screened_w is None else screened_w)
     grid = tuple(int(n) for n in m["grid"])
-    def qgrid(a):
-        return jax.jit(lambda x: x.reshape(grid+x.shape[-2:]).transpose(3,4,0,1,2),
-            out_shardings=NamedSharding(mesh_xy, P("x", "y", None, None, None)))(a)
-    return v, c, V[0], qgrid(W), qgrid(V) if full_exchange else None
+    # Γ's exchange tile alone; the full-zone V only when a caller asks for it.
+    V0 = read_interaction_gamma(filename, "bare", mesh_xy, nohead=nohead)
+    V_full = (read_interaction_qgrid(filename, "bare", mesh_xy, grid, nohead=nohead)
+              if full_exchange else None)
+    if screened_w is None:
+        W = read_interaction_qgrid(filename, "screened", mesh_xy, grid, nohead=nohead)
+    else:
+        # A rebuilt (q, μ, ν) body: one relayout; the caller drops its copy.
+        W = jax.jit(lambda x: x.reshape(grid + x.shape[-2:]).transpose(3, 4, 0, 1, 2),
+                    out_shardings=NamedSharding(mesh_xy, P("x", "y", None, None, None)))(
+            screened_w)
+    return v, c, V0, W, V_full
 
 
 def read_coarse_interactions(filename, input_file, mesh_xy, *, pad_mu=False):

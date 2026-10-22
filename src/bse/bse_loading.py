@@ -270,6 +270,7 @@ def load_bse_data_from_restart_sharded(
     psi_v_X, psi_c_X, V_q0, W_q, V_q_full = read_bse_payload(
         restart_file, input_file, mesh_xy, read_val, read_cond,
         nohead=use_nohead, full_exchange=load_v_full, screened_w=screened_w)
+    screened_w = None                # relaid out as W_q: one W layout survives
     if qp_rotation is not None:
         from .bse_qp_rotation import rotate_window_psi
         psi_v_X, psi_c_X = rotate_window_psi(

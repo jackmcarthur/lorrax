@@ -524,7 +524,7 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
     from bse.bse_window import resolve_n_occ
     from common.band_degeneracy import DEFAULT_MODE
     from file_io.restart_bundle import (_find_restart_file, read_coulomb_policy_from_h5,
-                                        read_interaction, read_metadata)
+                                        read_interaction_gamma, read_metadata)
     from gw.gw_config import LorraxConfig
     from file_io.centroids import load_centroid_basis
     from file_io.wfn_basis import centroid_table_md5
@@ -609,7 +609,7 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
     model = assemble_td_model(psi, data["W_R"], zeta_G, v_G, mesh_xy=mesh_xy, kgrid=kgrid,
                               k_frac=k_frac, band_lo=b_lo, n_bands=b_hi - b_lo,
                               n_rmu=n_rmu, receipts=receipts)
-    model["V_q0_stored"] = read_interaction(restart_file, "bare", mesh_xy)[0]
+    model["V_q0_stored"] = read_interaction_gamma(restart_file, "bare", mesh_xy)
     model["V_q0_bse"] = data["V_q0"]
     model["g0_X"] = data["g0_X"]
     for name, path in (("eqp_file", eqp_file), ("velocity_file", velocity_file)):
