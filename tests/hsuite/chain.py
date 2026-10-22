@@ -164,6 +164,16 @@ eqp0_file = gnppm_eqp0.dat
 eqp1_file = gnppm_eqp1.dat
 report_file = gnppm.out
 sigma_omega_h5_file = gnppm_sigma.h5
+""" + """\
+# bse.bse_jax (BerkeleyGW absorption.x names)
+number_val_bands_fine = 1
+number_cond_bands_fine = 2
+highest_occupied_band = 3
+full_bse = false
+spin_singlet = true
+band_degeneracy = off
+solver_max_iter = 40
+number_eigenvalues = 2
 """
 
 _PATH = """
@@ -191,14 +201,23 @@ K_POINTS {{crystal_b}}
 
 # Five k-points per side leave the Galerkin basis no room below the full
 # state count at the default QRCP tolerance (1e-3 saturates at 80 of 80).
-EXCITED_DECK = _DECK_COMMON + """restart = true
+_EXCITED_BASE = _DECK_COMMON + """restart = true
 compute_mode = cohsex
 qp_solver = one_shot_dft
 linalg = local
 htransform_qr_eps = 1e-2
+"""
+# bse.exciton_bands: one conduction band, so the window's top band lies below
+# the fitted window's top (compute_wfns_fi refuses otherwise).
+EXCITED_DECK = _EXCITED_BASE + """\
+number_val_bands_fine = 1
+number_cond_bands_fine = 1
+number_eigenvalues = 1
+solver_max_iter = 40
+band_degeneracy = off
 """ + _PATH
 
-HTRANSFORM_DECK = EXCITED_DECK.replace(_PATH, _PATH_OFFGRID)
+HTRANSFORM_DECK = _EXCITED_BASE + _PATH_OFFGRID
 
 _SIDE = "2" if rank_session._resolve_proc_count() == 4 else "1"
 
@@ -273,6 +292,14 @@ sc_max_iter = 2
 sc_tol_ev = 3.0
 sc_head_update = dft_velocity
 density_self_consistent = true
+number_val_bands_fine = 1
+number_cond_bands_fine = 2
+highest_occupied_band = 3
+full_bse = false
+spin_singlet = true
+band_degeneracy = off
+solver_max_iter = 40
+number_eigenvalues = 2
 """),
     # The compile check (steady_compile_problems), run only when named in
     # --only: the bisp_sc deck on the face route (linalg = distributed at P4)
@@ -442,22 +469,16 @@ STAGES = (
     # A regression check, not physics: the DFT gap is 72 meV, far below the
     # ~1 eV exciton binding of this weakly screened molecule, so the TDA
     # eigenvalues come out negative (-0.94, -0.78 eV).
-    ("bse", "bse.bse_jax",
-     ["-i", "gnppm.in", "--bse", "--lanczos", "--tda", "--solver", "davidson",
-      "--n-val", "1", "--n-cond", "2", "--n-occ", "3",
-      "--band-degeneracy", "off", "--max-lanczos-iter", "40",
-      "--n-eig", "2", "--block-size", "1", *_P,
-      "--report-file", "bse.out"]),
+    ("bse", "bse.bse_jax", ["-i", "gnppm.in", *_P, "--report-file", "bse.out"]),
     ("htransform", "bandstructure.htransform",
      ["-i", "htransform.in", "--guard-bands", "1", "-o", "htransform.dat",
       "--report-file", "htransform.out"]),
     # One conduction band: the window's top band must lie below the fitted
     # window's top, or fH cannot see it (compute_wfns_fi refuses).  The default
-    # per-Q solver (Davidson, 0.01 meV); --max-iter caps its iterations.
+    # per-Q solver (Davidson, 0.01 meV); solver_max_iter caps its iterations.
+    # The BSE keys are in excited.in.
     ("exciton_bands", "bse.exciton_bands",
-     ["-i", "excited.in", "--n-val", "1", "--n-cond", "1", "--n-eig", "1",
-      "--max-iter", "40", "--vq-mode", "ongrid",
-      "--q-per-segment", "1", "--band-degeneracy", "off", *_P,
+     ["-i", "excited.in", "--vq-mode", "ongrid", "--q-per-segment", "1", *_P,
       "--out-prefix", "exciton", "--report-file", "exciton.out"]),
     ("cohsex", "gw.gw_jax", ["-i", "cohsex.in"]),
     ("sp_export", "gw.gw_jax", ["-i", "sp_export.in"]),
@@ -469,12 +490,7 @@ STAGES = (
     ("bisp_sc3", "gw.gw_jax", ["-i", "bisp_sc3.in"]),
     # BSE after SP-full: the final map's W0 = V + Wc_CC(0) (charge sector
     # only; CT/TC/TT are not stored), on the four-component restart.
-    ("bse_bisp", "bse.bse_jax",
-     ["-i", "bisp_sc.in", "--bse", "--lanczos", "--tda", "--solver", "davidson",
-      "--n-val", "1", "--n-cond", "2", "--n-occ", "3",
-      "--band-degeneracy", "off", "--max-lanczos-iter", "40",
-      "--n-eig", "2", "--block-size", "1", *_P,
-      "--report-file", "bse_bisp.out"]),
+    ("bse_bisp", "bse.bse_jax", ["-i", "bisp_sc.in", *_P, "--report-file", "bse_bisp.out"]),
     # bcc Na in run/na/.  Its centroids are stored in fixture_na/ (kmeans
     # is covered above): 56 orbit-closed points from `centroid.kmeans_cli 64
     # --seed 42 --oversample 1.5 --fit-window 0:8,0:13` (the zeta legs).

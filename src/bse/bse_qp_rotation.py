@@ -1,4 +1,4 @@
-"""The quasiparticle-rotated BSE transition basis (``bse_jax --qp-rotations``).
+"""The quasiparticle-rotated BSE transition basis (``bse_jax qp_rotations_file``).
 
 A GW run diagonalizes its Hermitian effective Hamiltonian in the Σ window
 ``[q0, q1)`` of the deck WFN's DFT bands,
@@ -23,7 +23,7 @@ three things and nothing else.
 ``V_μν`` and ``W_μν`` live in the centroid basis and do not depend on the band
 basis, so the restart's V and W0 are used unchanged.
 
-The window is chosen in QP order: ``--n-val``/``--n-cond`` count states of the
+The window is chosen in QP order: ``number_val_bands_fine``/``number_cond_bands_fine`` count states of the
 artifact's ascending ladder below/above ``n_occ``, and the degeneracy guard
 runs on that ladder.  A QP state of the window may be dominated by a DFT band
 outside the DFT-index window of the same counts; (2) runs over the whole
@@ -133,7 +133,7 @@ def qp_window_from_artifact(U, E, band_range, *, n_occ, n_val, n_cond,
     band_range : (q0, q1) — absolute DFT band range of the block.
     n_occ : int — occupied count; QP states ``[q0, n_occ)`` are occupied.
     n_val, n_cond : int — requested QP valence/conduction counts.
-    degeneracy_mode, degeneracy_tol_ry : the ``--band-degeneracy`` guard,
+    degeneracy_mode, degeneracy_tol_ry : the ``band_degeneracy`` guard,
         applied to the QP ladder (``common.band_degeneracy``).
 
     Returns
@@ -160,10 +160,10 @@ def qp_window_from_artifact(U, E, band_range, *, n_occ, n_val, n_cond,
             f"(n_occ {n_occ}); want it inside the QP rotation block "
             f"[{q0}, {q1}) with the occupied boundary strictly inside.  why: "
             f"outside the block there are no QP states, only DFT ones.  fix: "
-            f"narrow --n-val/--n-cond, or rerun the GW with a wider Σ window.")
+            f"narrow number_val_bands_fine/number_cond_bands_fine, or rerun the GW with a wider Σ window.")
     n_val, n_cond = resolve_band_window(
         E, n_occ - q0, n_val, n_cond, tol_ry=degeneracy_tol_ry,
-        mode=degeneracy_mode, where="bse --qp-rotations (QP ladder)", log=log)
+        mode=degeneracy_mode, where="bse qp_rotations_file (QP ladder)", log=log)
     lo, hi = n_occ - n_val, n_occ + n_cond
     if not (q0 <= lo and hi <= q1):
         raise ValueError(
@@ -355,7 +355,7 @@ def qp_window_dipoles(dipole_cart, delta_e, qp):
                    + (U_c^H v^same U_v)_{c'v'} / (E'_c' - E'_v').             (3)
 
     At ``U = I`` the second term is exactly zero and the first is the
-    ``--eqp`` dipole ``v_cv / ΔE_cv`` (``slice_dipole_to_bse_window``),
+    ``eqp_corrections`` dipole ``v_cv / ΔE_cv`` (``slice_dipole_to_bse_window``),
     bit for bit.  Omitted: the explicit ``∂_k ΔH`` of the covariant
     derivative ``D_k ΔH`` (the ``parallel_transport`` velocity), which enters
     only through the cross-gap mixing ``θ`` (``qp["diagnostics"]``) and is
@@ -392,7 +392,7 @@ def load_qp_rotation(restart_file, input_file, qp_rotations_file, *, header,
                      log=log.info):
     """Read, authenticate and window one ``qp_wfn_rotations.h5`` for the BSE.
 
-    Refuses: ``--eqp`` beside it, a QP WFN deck, a restart from another WFN
+    Refuses: ``eqp_corrections`` beside it, a QP WFN deck, a restart from another WFN
     (``file_io.qp_wfn.refuse_conflicting_qp_state_sources``); another WFN's
     artifact (``authenticate_qp_rotations_source_wfn``); a k frame or a
     non-unitary U (``validate_qp_rotations_frame``); a block outside the
@@ -422,7 +422,7 @@ def load_qp_rotation(restart_file, input_file, qp_rotations_file, *, header,
     wfn_path = _parse_wfn_path(input_file)
     refuse_conflicting_qp_state_sources(
         wfn_path=wfn_path, qp_rotations_file=path,
-        state_artifact_path=restart_file, where="bse --qp-rotations")
+        state_artifact_path=restart_file, where="bse qp_rotations_file")
     artifact = read_qp_rotations_artifact(path)
     wfn = WfnLoader(wfn_path)
     authenticate_qp_rotations_source_wfn(artifact, wfn, artifact_path=path)

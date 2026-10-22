@@ -286,7 +286,7 @@ def resolve_conduction_window(enk_sigma, *, nb_window: int, nval_in: int,
         raise ValueError(
             f"BSE conduction window [{b_min},{b_max}) exceeds the htransform "
             f"fH window ({nb_window} bands): raise nband in {input_file} to "
-            f">= {b_max}, or drop --n-cond to <= {nb_window - int(nval_in)}")
+            f">= {b_max}, or drop number_cond_bands_fine to <= {nb_window - int(nval_in)}")
     check_band_window(
         np.asarray(enk_sigma).T, b_min, b_max, tol_ry=tol_ry, mode=mode,
         where="exciton_bands htransform conduction window", log=log_fn)

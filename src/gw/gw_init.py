@@ -1127,7 +1127,7 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 
 #: Env override for the band-sum degeneracy guard: ``snap`` (or ``off``)
 #: downgrades the refusal below.  Same three-mode vocabulary as
-#: ``common.band_degeneracy.MODES`` and the BSE's ``--band-degeneracy``; it is
+#: ``common.band_degeneracy.MODES`` and the BSE's ``band_degeneracy``; it is
 #: an ENV knob rather than a deck key because it is an escape hatch for a
 #: deck you are debugging, not a property of the calculation you would want
 #: recorded in the input file.  Never set it to make a gate pass

@@ -1860,6 +1860,39 @@ _DEFAULTS = {
 
 }
 
+#: BSE deck keys (2026-10-21, owner decision D1 = A): the BSE drivers' physics,
+#: under BerkeleyGW's absorption.x and kernel.x names where the meaning matches.
+#: Read and typed by the drivers (``bse.bse_deck``); an empty value is unset and
+#: the driver's own default applies.  gw_jax accepts and ignores them.
+BSE_DECK_KEYS = (
+    # absorption.x: the BSE window and occupations
+    "number_val_bands_fine", "number_cond_bands_fine", "highest_occupied_band",
+    "band_degeneracy", "degeneracy_check_override", "degeneracy_tol_ry",
+    # QP energies, dipoles
+    "eqp_corrections", "eqp_co_corrections", "qp_rotations_file",
+    "dipole_file", "dipole_position_fix", "use_momentum", "use_velocity",
+    # kernel and solver
+    "full_bse", "spin_singlet", "local_fields", "number_eigenvalues",
+    "write_eigenvectors", "helicity_table", "solver", "solver_max_iter",
+    "block_size", "lanczos_rtol", "lanczos_check_every", "lanczos_n_reorth",
+    "davidson_precond", "davidson_tol_mev", "davidson_margin",
+    "davidson_margin_tol_mev", "davidson_olsen", "davidson_eps_shift",
+    "davidson_m_max", "trlan_m_max", "trlan_n_keep",
+    # spectrum (Haydock)
+    "haydock", "number_iterations", "energy_resolution", "omega_min_ev",
+    "omega_max_ev", "delta_frequency", "no_eps1",
+    # KPM density of states and FEAST windows
+    "kpm_dos", "kpm_window_count", "kpm_n_moments", "kpm_n_random",
+    "kpm_n_lanczos", "kpm_emin_ev", "kpm_emax_ev", "kpm_plot_file",
+    "feast", "feast_n_lanczos", "feast_buffer", "feast_n_quad1", "feast_n_quad2",
+    "feast_quadrature", "feast_ritz_count", "feast_tol_mev", "feast_iter",
+    "feast_window1", "feast_window2", "gmres_max_iter", "gmres_tol",
+    "gmres_seed", "gmres_fp32",
+    # kernel.x (bse.bsemat_cli)
+    "number_val_bands", "number_cond_bands", "extended_kernel", "exciton_Q_shift",
+)
+_DEFAULTS.update({key: "" for key in BSE_DECK_KEYS})
+
 #: Deck keys of the retired fixed-Sigma eqp2 ladder (UPGRADE_NOTES.md,
 #: "Sigma_c on shell only"; the omega-grid debug path it read was restored
 #: without it, "Sigma(omega) grid debug restored"): each refuses by name at

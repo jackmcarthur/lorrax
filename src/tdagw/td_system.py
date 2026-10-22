@@ -8,7 +8,7 @@ refer to the same ψ:
 
 * **Energies.**  The window's energies of the loader (``model["window"]``):
   quasiparticle when an ``eqp_file`` is given — re-sliced by DFT index on a
-  coarse deck exactly as ``bse_jax --eqp`` does, the eigenvalues of the
+  coarse deck exactly as ``bse_jax eqp_corrections`` does, the eigenvalues of the
   htransform's QP f(H) on a ``bse_k_grid`` deck — and DFT otherwise.
   Occupations by window position: the ``n_val`` valence rows are full.
 * **Position operator.**  ``r_nm = v_nm / (i (E_n − E_m))`` from the bundle's
@@ -304,14 +304,14 @@ def eigenvector_kpts(params: dict, nk: int) -> np.ndarray:
     if kp.shape == (nk, 3):
         return kp
     raise _gate("td_eigenvector_kpts", f"kpts of shape {kp.shape}", f"(3, {nk}) or ({nk}, 3)",
-                "pass a bse_jax --write-eigs file of the same k grid")
+                "pass a bse_jax write_eigenvectors file of the same k grid")
 
 
 def bse_dipole_receipt(r, eigenvectors_file: str, n_val: int, kpts, *,
                        n_states: Optional[int] = None) -> dict:
     """The BSE's stored ``⟨0|r̂|S⟩`` reproduced from this header's r.
 
-    ``bse_jax --dipole`` stores ``Σ_t A^S_t conj(d_t)`` with
+    ``bse_jax dipole_file`` stores ``Σ_t A^S_t conj(d_t)`` with
     ``d = ⟨c|v̂|v⟩/ΔE = i ⟨c|r̂|v⟩``, i.e. ``−i ⟨0|r̂|S⟩``; the receipt compares
     :func:`exciton_dipoles` with ``i × stored`` and the in-plane helicity
     strengths ``I± = |D_x ∓ i D_y|²/2`` of both.
@@ -411,11 +411,11 @@ def build_td_system(input_file: str, mesh_xy, *, bands, dipole_file: str,
     eqp_file : the BSE run's ``eqp1.dat`` (QP energies), or None (DFT).
     pair_rule, gap_ev : same-occupation pairs (module doc); ``gap_ev`` is also
         the smallest accepted c↔v gap.
-    eigenvectors_file : a ``bse_jax --write-eigs --dipole`` file on the same
+    eigenvectors_file : a ``bse_jax write_eigenvectors and dipole_file`` file on the same
         bundle and window: adds the ⟨0|r|S⟩ gauge receipt.
     position_fix : densified deck with ``eqp_file``: the loader's opt-in exact
         position of the fine QP states (``lorrax.dipole_position_fix``,
-        ``bse_jax --dipole-position-fix``); off, ``v/ΔE_RQ``.
+        ``bse_jax dipole_position_fix``); off, ``v/ΔE_RQ``.
     """
     from file_io.restart_bundle import _find_restart_file, read_metadata
     from tdagw.model import _deck_densifies, load_td_model

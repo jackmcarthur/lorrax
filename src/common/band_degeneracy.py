@@ -6,7 +6,7 @@ The BAND-axis member of the truncation policy family — its spectral twin is
 INWARD, deliberately; ``docs/architecture/rank_truncation_policy.md`` §5 states the
 discriminator once.
 
-THE PROBLEM.  ``--n-val N`` / ``--n-cond M`` pick a band window by COUNTING:
+THE PROBLEM.  ``number_val_bands_fine N`` / ``number_cond_bands_fine M`` pick a band window by COUNTING:
 the valence window is ``[n_occ - N, n_occ)`` and the conduction window is
 ``[n_occ, n_occ + M)``.  Counting knows nothing about the spectrum, so a
 window boundary can land *inside* a degenerate multiplet — a Kramers pair
@@ -107,7 +107,7 @@ MODES = ("strict", "snap", "off")
 #: The mode every caller gets when nobody says otherwise: **strict**.
 #:
 #: THE ONE PLACE THIS IS DECIDED.  Every function default and every driver's
-#: ``--band-degeneracy`` default reads this name; there is no second literal
+#: ``band_degeneracy`` default reads this name; there is no second literal
 #: in the tree, because the way ``snap`` survived a day as an unwanted default
 #: was that "the default" was spelled six times in three files and changing it
 #: meant finding all six.  Flipping this line flips the flag everywhere.
@@ -409,25 +409,25 @@ def resolve_band_window(
         # The counts line is the whole point of refusing rather than snapping,
         # so it has to be TRUE.  Two of the findings above are not repairable
         # by widening at all — a gapless midline, and a multiplet still open
-        # at the top of the input — and on those a "Fix: use --n-val X" line
+        # at the top of the input — and on those a "Fix: set number_val_bands_fine = X" line
         # is worse than no line: the user re-runs with the counts it names,
         # gets the same refusal, and concludes the guard is broken.  So the
         # fix line is only a counts line when the counts actually fix it.
         if not unrepairable:
-            fix = (f"  Fix: use --n-val {n_val_new} --n-cond {n_cond_new}, or "
-                   f"pass --band-degeneracy snap to widen to those counts "
-                   f"automatically, or --band-degeneracy off to proceed on a "
+            fix = (f"  Fix: set number_val_bands_fine = {n_val_new} and number_cond_bands_fine = {n_cond_new}, or "
+                   f"set band_degeneracy = snap to widen to those counts "
+                   f"automatically, or band_degeneracy = off to proceed on a "
                    f"cut multiplet deliberately.")
         else:
-            reach = (f"--band-degeneracy snap would reach n_val={n_val_new} "
+            reach = (f"band_degeneracy = snap would reach n_val={n_val_new} "
                      f"n_cond={n_cond_new} and the window would STILL be cut"
                      if (n_val_new, n_cond_new) != (n_val, n_cond) else
-                     "--band-degeneracy snap would return the counts you "
+                     "band_degeneracy = snap would return the counts you "
                      "asked for")
             fix = (f"  Fix: widening cannot clear everything above "
                    f"({reach}).  What has to change is the INPUT — more bands "
                    f"(nband) above the window, or the right n_occ — not the "
-                   f"window counts.  --band-degeneracy off proceeds on a cut "
+                   f"window counts.  band_degeneracy = off proceeds on a cut "
                    f"multiplet deliberately.")
         raise BandWindowDegeneracyError(f"{head}\n{body}\n{fix}")
     if (n_val_new, n_cond_new) != (n_val, n_cond):
@@ -442,7 +442,7 @@ def resolve_band_window(
                       f"per k instead of {n_val * n_cond}",
                 lines=tuple(findings),
                 fix="this is not the calculation asked for; the default "
-                    "--band-degeneracy strict refuses here, off keeps the "
+                    "band_degeneracy = strict refuses here, off keeps the "
                     "requested counts"))
     else:
         # Everything found was un-snappable (the midline, or a multiplet that
@@ -480,7 +480,7 @@ def check_band_window(
     ``mode="strict"`` — the default since 2026-08-10 — raises; ``"snap"``
     warns (there is nothing to snap here, so it degrades to a warning by
     design); ``"off"`` is silent.  This twin takes its mode from the SAME
-    ``--band-degeneracy`` flag as the resolver, deliberately: one flag that
+    ``band_degeneracy`` flag as the resolver, deliberately: one flag that
     means two things depending on which seam it reaches is how a user comes to
     believe a run refused everything unsafe when one seam only whispered.
     """

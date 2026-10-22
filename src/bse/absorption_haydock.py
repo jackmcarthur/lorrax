@@ -42,6 +42,7 @@ from runtime import bootstrap
 bootstrap()
 
 import argparse
+import os
 from functools import partial
 from pathlib import Path
 
@@ -55,6 +56,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import get_donated_kfft_kminor
 
 from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, window_dipoles, write_absorption_dat, write_absorption_h5)
+from .bse_deck import (DeckError, Key, check_dipole_operator, deck_params, eqp_file,
+                       omega_count, read_settings)
 from .bse_head import head_shifted_eps_c
 from .bse_window import _parse_wfn_path
 from .bse_io import (load_bse_data_from_restart_sharded)
@@ -311,7 +314,7 @@ def run_haydock(
 ):
     """End-to-end Haydock absorption: load BSE data, run the block recursion over
     the requested polarizations, evaluate the continued fraction, write outputs.
-    ``bse.bse_jax --haydock-iter`` runs the same recursion on the eigensolve's
+    ``bse.bse_jax haydock = true`` runs the same recursion on the eigensolve's
     payload in the same process."""
     restart_file = _find_restart_file(input_file)
     n_devices = jax.device_count()
@@ -351,13 +354,13 @@ def run_haydock(
     nc_pad = int(data["n_cond_pad"])
     nv_pad = int(data["n_val_pad"])
     # The window the loader RESOLVED — clamped to the file and then widened by
-    # ``--band-degeneracy`` at a cut multiplet.  The dipole slice below has to
+    # ``band_degeneracy`` at a cut multiplet.  The dipole slice below has to
     # agree with the Hamiltonian's window band-for-band, so it reads these and
     # not the ``n_val``/``n_cond`` REQUEST: on a snapping deck the request cuts
     # the dipole over a narrower, differently-placed window and
     # ``build_dipole_vector_bse`` then zero-pads the slots the BSE window is
     # really using.  That is silently wrong absorption, not a crash — the same
-    # pre-snap assumption ``bse_jax``'s ``--write-eigs`` path made loudly.
+    # pre-snap assumption ``bse_jax``'s ``write_eigenvectors`` path made loudly.
     n_val_eff = int(data["n_val"])
     n_cond_eff = int(data["n_cond"])
     log.info(f"[haydock] mesh {grid_x}x{grid_y}, problem "
@@ -389,60 +392,84 @@ def run_haydock(
                   if data["densified"] else None))
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(allow_abbrev=False,
-        description="Haydock-route BSE absorption (continued fraction; no eigenvectors)",
-    )
+#: Deck key -> setting of the Haydock driver (BerkeleyGW absorption.x names).
+HAYDOCK_KEYS = {
+    "number_val_bands_fine": Key("n_val", "int"),
+    "number_cond_bands_fine": Key("n_cond", "int"),
+    "highest_occupied_band": Key("n_occ", "int"),
+    "dipole_file": Key("dipole", "path"),
+    "dipole_position_fix": Key("dipole_position_fix", "bool"),
+    "number_iterations": Key("n_iter", "int"),
+    "energy_resolution": Key("eta_eV", "float"),
+    "omega_min_ev": Key("omega_min_eV", "float"),
+    "omega_max_ev": Key("omega_max_eV", "float"),
+    "delta_frequency": Key("delta_frequency", "float"),
+    "no_eps1": Key("no_eps1", "bool"),
+}
+
+
+def build_parser():
+    """The Haydock driver's command line: the deck and the output prefix.
+
+    Every physics setting is a deck key (``HAYDOCK_KEYS``); the cell volume
+    and the spinor count are read from the WFN."""
+    p = argparse.ArgumentParser(
+        allow_abbrev=False,
+        description="Haydock-route BSE absorption (continued fraction; no "
+                    "eigenvectors); settings are deck keys in the deck passed with -i")
     p.add_argument("-i", "--input", required=True,
-                   help="cohsex.in (BSE input; restart bundle resolved from it)")
-    p.add_argument("--n-val", type=int, required=True)
-    p.add_argument("--n-cond", type=int, required=True)
-    p.add_argument("--n-occ", type=int, required=True)
-    p.add_argument("--eqp", default=None,
-                   help="BGW eqp1.dat for QP corrections (optional)")
-    p.add_argument("--dipole", default="dipole.h5",
-                   help="dipole.h5 from psp.get_dipole_mtxels (default: "
-                        "dipole.h5); under bse_k_grid the deck (coarse) WFN's, "
-                        "carried through the htransform into the fine states")
-    p.add_argument("--dipole-position-fix", action="store_true",
-                   help="bse_k_grid with --eqp: exact <c|r|v> of the fine QP "
-                        "states instead of v/dE_RQ (bse_jax --dipole-position-fix)")
-    p.add_argument("--V-cell", type=float, required=True,
-                   help="Unit-cell volume (bohr^3)")
-    p.add_argument("--n-iter", type=int, default=200,
-                   help="Haydock iterations per polarisation (default 200)")
-    p.add_argument("--n-spin", type=int, default=1,
-                   help="Spin multiplicity (2 only for collinear spin-polarised)")
-    p.add_argument("--n-spinor", type=int, default=2,
-                   help="Spinor components (2 for spinor calcs, default 2)")
-    p.add_argument("--eta-eV", type=float, default=0.1)
-    p.add_argument("--omega-min-eV", type=float, default=0.0)
-    p.add_argument("--omega-max-eV", type=float, default=15.0)
-    p.add_argument("--n-omega", type=int, default=1500)
+                   help="the GW deck, which also carries the BSE keys")
     p.add_argument("--out-prefix", default="absorption_haydock")
-    p.add_argument("--no-eps1", action="store_true",
-                   help="Skip Kramers-Kronig eps1 (faster)")
-    p.add_argument("--pol", default=POLARIZATIONS,
-                   help="Cartesian polarizations to recurse, a subset of 'xyz' "
-                        "(default all three).  Each costs one BSE matvec per "
-                        "step: 'x' alone is the whole spectrum of a cubic "
-                        "crystal and of in-plane light on a hexagonal one")
-    args = p.parse_args(argv)
+    return p
+
+
+def _defaults():
+    return argparse.Namespace(
+        n_val=None, n_cond=None, n_occ=None, dipole=None, dipole_position_fix=False,
+        n_iter=200, eta_eV=0.1, omega_min_eV=0.0, omega_max_eV=15.0, n_omega=1500,
+        delta_frequency=None, no_eps1=False)
+
+
+def main(argv=None):
+    p = build_parser()
+    cli = p.parse_args(argv)
     try:
-        pols = parse_polarizations(args.pol)
-    except ValueError as exc:
+        params, named = deck_params(cli.input)
+        args, named = read_settings(
+            cli.input, _defaults(), HAYDOCK_KEYS,
+            required=("number_val_bands_fine", "number_cond_bands_fine"),
+            params=params, named=named)
+        eqp = eqp_file(params, named, cli.input)
+        if args.dipole is None:
+            args.dipole = os.path.join(os.path.dirname(os.path.abspath(cli.input)),
+                                       "dipole.h5")
+        if args.delta_frequency:
+            args.n_omega = omega_count(args.omega_min_eV, args.omega_max_eV,
+                                       float(args.delta_frequency))
+        check_dipole_operator(params, named, args.dipole)
+    except DeckError as exc:
         p.error(str(exc))
+    pols = tuple(range(3))
+    if args.n_iter <= 0:
+        p.error("number_iterations must be > 0")
+
+    from wfn_loader import WfnLoader
+    wfn = WfnLoader(_parse_wfn_path(cli.input))
+    try:
+        V_cell, n_spinor = float(wfn.cell_volume), int(wfn.nspinor)
+    finally:
+        wfn.close()
 
     run_haydock(
-        input_file=args.input,
+        input_file=cli.input,
         n_val=args.n_val, n_cond=args.n_cond, n_occ=args.n_occ,
-        eqp_file=args.eqp, dipole_file=args.dipole,
+        eqp_file=eqp, dipole_file=args.dipole,
         dipole_position_fix=args.dipole_position_fix,
-        V_cell=args.V_cell, n_iter=args.n_iter,
-        eta_eV=args.eta_eV, n_spin=args.n_spin, n_spinor=args.n_spinor,
+        V_cell=V_cell, n_iter=args.n_iter,
+        eta_eV=args.eta_eV, n_spin=1, n_spinor=n_spinor,
         omega_min_eV=args.omega_min_eV, omega_max_eV=args.omega_max_eV,
         n_omega=args.n_omega,
-        out_prefix=args.out_prefix, no_eps1=args.no_eps1, pols=pols,
+        out_prefix=cli.out_prefix, no_eps1=args.no_eps1, pols=pols,
     )
 
 

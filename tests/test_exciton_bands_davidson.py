@@ -6,12 +6,12 @@ Q), the screened kernel real in R space (so every H_Q is Hermitian):
 
 1. ``build_path_solver_davidson`` (the CLI default) gives each Q's lowest 2 within 0.01 meV of
    ``eigvalsh`` of H_Q assembled from the same stack matvec, as does the full-Krylov block
-   Lanczos scan (``--solver lanczos``, 36 steps of width 1) to 1e-6 meV.
+   Lanczos scan (``solver = block_lanczos``, 36 steps of width 1) to 1e-6 meV.
 2. One planned Davidson serves the whole path (``solvers.davidson`` plan cache, one entry).
 3. ``GATE davidson_converged``: the path capped at 2 iterations refuses at Q row 0, before the
    driver's write.
-4. The CLI: ``--solver`` defaults to davidson, ``--max-iter`` to auto; ``--block-size`` refuses
-   under davidson and parses under ``--solver lanczos``.
+4. The deck keys: ``solver`` defaults to davidson, ``solver_max_iter`` to auto; ``block_size``
+   refuses under davidson and parses under ``solver = block_lanczos``.
 
 A script on a 1x1 mesh (login node, <= 4 threads):
 ``JAX_PLATFORMS=cpu python -m tests.test_exciton_bands_davidson``.  It skips under pytest.
@@ -93,7 +93,7 @@ def run_cases(mesh):
 
     plans0 = sum(1 for k in dav._PLANS if k[0][0] == "exciton_bands")
     p = exb.build_parser()
-    a0 = p.parse_args(["-i", "x.in"])
+    a0 = _deck_args(p, [])
     solve = exb.build_path_solver_davidson(
         mesh, *KGRID, NC, NV, NC, NV, n_eig=N_EIG, max_iter=max(30, min(200, n_phys // 2)),
         tol_mev=a0.davidson_tol_mev, W_q0=d["W_q0"])
@@ -114,16 +114,31 @@ def run_cases(mesh):
         out["capped_refuses_at_row_0"] = ("GATE davidson_converged" in str(e)
                                           and "at Q row 0" in str(e))
 
-    def refuses(argv):
+    def refuses(lines):
         try:
-            exb.check_solver_flags(p, p.parse_args(argv))
+            _deck_args(p, lines, check=True)
             return False
         except SystemExit:
             return True
     out["cli"] = (a0.solver == "davidson" and a0.max_iter is None
-                  and refuses(["-i", "x.in", "--block-size", "4"])
-                  and not refuses(["-i", "x.in", "--solver", "lanczos", "--block-size", "4"]))
+                  and refuses(["block_size = 4"])
+                  and not refuses(["solver = block_lanczos", "block_size = 4"]))
     return out
+
+
+def _deck_args(p, lines, check=False):
+    """The driver's settings for a toy deck holding ``lines`` (BSE deck keys)."""
+    import tempfile
+    from bse import exciton_bands as exb
+    fd = tempfile.NamedTemporaryFile("w", suffix=".in", delete=False)
+    fd.write("[cohsex]\nsys_dim = 3\nnumber_val_bands_fine = 3\nnumber_cond_bands_fine = 3\n"
+             + "".join(f"{line}\n" for line in lines))
+    fd.close()
+    args = p.parse_args(["-i", fd.name])
+    settings_ap = exb.deck_settings(p, args)
+    if check:
+        exb.check_solver_flags(settings_ap, args)
+    return args
 
 
 def main() -> int:
@@ -141,7 +156,7 @@ def main() -> int:
             out["davidson_vs_dense_meV"] <= TOL_MEV and out["lanczos_vs_dense_meV"] <= 1e-6,
         "2 one planned Davidson for the whole path": out["exciton_plans"] == 1,
         "3 GATE davidson_converged refuses a 2-iteration cap at Q row 0": out["capped_refuses_at_row_0"],
-        "4 CLI: davidson default, --block-size refused unless --solver lanczos": out["cli"],
+        "4 deck: davidson default, block_size refused unless solver = block_lanczos": out["cli"],
     }
     ok = all(checks.values())
     if jax.process_index() == 0:

@@ -5,7 +5,7 @@ window definition in eV, and FEAST ellipse-trapezoid quadrature nodes/weights),
 this module implements the full FEAST solve: shifted GMRES linear solves at each
 quadrature node plus Rayleigh-Ritz eigenpair extraction (``run_feast_ritz``).
 FEAST is the DEFAULT solve route for the ``bse_jax`` CLI entry point (bse_jax.py
-runs ``bse_feast.run(bse_feast.settings(...))`` unless ``--lanczos`` is passed). Output is printed to
+runs ``bse_feast.run(bse_feast.settings(...))`` on the deck's ``feast = true``). Output is printed to
 stdout in a physics-style report.
 """
 from __future__ import annotations
@@ -608,7 +608,7 @@ def _get_feast_runner(
     gives.  It also means compile behaviour is unchanged: one traced core per
     cache entry, exactly as before.  (A narrower key would now be SOUND, since
     distinct operand sets can safely share one executable, and would remove the
-    per-window compile that ``--gmres-fp32`` pays.  That is a live improvement,
+    per-window compile that ``gmres_fp32`` pays.  That is a live improvement,
     deliberately not taken here: it changes compile counts, and this commit is
     scoped to making P>1 possible.  Registered in
     ``FIX_solver_robustness.md``.)
@@ -1127,15 +1127,15 @@ def refuse_unconverged_feast(results: dict, windows, *, tol_mev: float, ry_to_ev
         raise RuntimeError(
             f"GATE feast_converged: {line}.  A saturated window can hold more "
             "eigenvalues than its Ritz subspace, so some may be missing.  No FEAST "
-            "eigenvalues were reported.  Fix: raise --feast-ritz-count, narrow the "
-            "window, or use the default eigensolve (bse_jax without --feast).")
+            "eigenvalues were reported.  Fix: raise feast_ritz_count, narrow the "
+            "window, or use the default eigensolve (bse_jax without feast = true).")
     if bad:
         raise RuntimeError(
             f"GATE feast_converged: {line} ({'; '.join(bad[:6])}"
             f"{'; ...' if len(bad) > 6 else ''}).  No FEAST eigenvalues were "
-            "reported.  Fix: raise --feast-iter, --gmres-max-iter or the "
-            "quadrature, tighten --gmres-tol, loosen --feast-tol-mev, or use the "
-            "default eigensolve (bse_jax without --feast) for the lowest roots.")
+            "reported.  Fix: raise feast_iter, gmres_max_iter or the "
+            "quadrature, tighten gmres_tol, loosen feast_tol_mev, or use the "
+            "default eigensolve (bse_jax without feast = true) for the lowest roots.")
     return line
 
 

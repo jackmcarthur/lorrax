@@ -19,7 +19,7 @@ Content: All the dimensions and scalar quantities
 
 	Attribute: transition_basis, qp_rotations_file
 	Type: string
-	Value: LORRAX extension, written only by bse.bse_jax --qp-rotations:
+	Value: LORRAX extension, written only by bse.bse_jax qp_rotations_file:
 	"qp_rotations" and the absolute path of the qp_wfn_rotations.h5 whose QP
 	states the amplitudes are on (bse.bse_qp_rotation). Absent means the deck
 	WFN's DFT bands; only then do nv/nc index dipole.h5.
@@ -186,7 +186,7 @@ Content: All the arrays
 	Dims(2): 3
 	Dims(3): nevecs
 	Dims(4): nQ
-	Value: LORRAX extension, written by bse.bse_jax --write-eigs --dipole
+	Value: LORRAX extension, written by bse.bse_jax write_eigenvectors and dipole_file
 	(TDA only); BerkeleyGW readers ignore it. The per-state exciton dipole
 	<0|r_alpha|S> = sum_t A^S_t conj(d^alpha_t), alpha = x, y, z Cartesian,
 	with d^alpha_t = <ck|v_alpha|vk> / (E_ck - E_vk) from dipole.h5

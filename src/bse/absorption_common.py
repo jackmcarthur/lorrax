@@ -227,7 +227,7 @@ def load_exciton_dipoles_h5(path: str | Path):
         if "dipoles" not in f["exciton_data"]:
             raise KeyError(
                 f"{path!s} has no exciton_data/dipoles: it was written without "
-                f"--dipole (bse.bse_jax), or by BerkeleyGW")
+                f"dipole_file (bse.bse_jax), or by BerkeleyGW")
         eig_eV = np.asarray(f["exciton_data/eigenvalues"][()], dtype=np.float64)
         raw = np.asarray(f["exciton_data/dipoles"][0])        # (N, 3, 2)
     return eig_eV / RYD2EV, raw[..., 0] + 1j * raw[..., 1]
@@ -277,7 +277,7 @@ def load_eigenvectors_h5(path: str | Path):
                 f"(the anti-resonant dipole is −conj(d) because "
                 f"s_(c→v) = −conj(s_(v→c)), BerkeleyGW BSE/diag.f90:722-731), "
                 f"and no driver in this tree assembles it yet.  Solve with "
-                f"--tda, or add the coupling contraction before reading this "
+                f"full_bse = false, or add the coupling contraction before reading this "
                 f"file for absorption.")
         spin_kernel = int(f["exciton_header/params/spin_kernel"][()])
         params = {
@@ -362,7 +362,7 @@ def inplane_helicity(dipoles, n_k):
 
 
 def helicity_table_lines(energies_ev, dipoles, n_k):
-    """The ``bse_jax --helicity-table`` report block, one row per state.
+    """The ``bse_jax helicity_table`` report block, one row per state.
 
     The convention (:data:`HELICITY_CONVENTION`) and ``N_k`` head the
     table; the rows are :func:`inplane_helicity` of ``dipoles`` beside each
@@ -449,7 +449,7 @@ def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
     after ``file_io.dipole.require_dipole_k_grid`` and the file's WFN stamp
     against ``wfn_path`` (``file_io.dipole.require_dipole_wfn_fingerprint``),
     then slices it (:func:`slice_dipole_to_bse_window`) at ``n_occ`` over the
-    loader's resolved window, or, on a ``--qp-rotations`` bundle
+    loader's resolved window, or, on a ``qp_rotations_file`` bundle
     (``data["qp_rotation"]``), takes the QP-basis dipoles of
     ``bse.bse_qp_rotation.qp_window_dipoles`` from the same checked file,
     which must then hold the velocity p − i[r, V_NL] of H_DFT

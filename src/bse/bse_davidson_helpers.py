@@ -167,7 +167,7 @@ def init_bse_subspace(
 #  The EXACT transition-space diagonal of H_BSE
 # ═══════════════════════════════════════════════════════════════════════
 
-#: The transition-space dimension at or above which ``--davidson-precond auto``
+#: The transition-space dimension at or above which ``davidson_precond auto``
 #: turns the exact assembled diagonal on.
 #:
 #: THIS NUMBER IS A PLACEHOLDER, NOT A MEASUREMENT.  What is measured, and only

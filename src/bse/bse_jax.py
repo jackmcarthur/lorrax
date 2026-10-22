@@ -26,6 +26,8 @@ from common.scientific_output import policy
 from common.units import RYD_TO_EV
 from runtime.run_session import RunSession
 
+from .bse_deck import (DeckError, Key, check_dipole_operator, deck_params,
+                       deck_source, eqp_file, key_of, omega_count, read_settings)
 from .bse_ring_comm import (
     build_bse_ring_matvec_full,
     create_mesh_2d,
@@ -213,7 +215,7 @@ def _preview_lanczos(
     nv_pad = int(data["n_val_pad"])
     # The window this run is ACTUALLY solving, read off the loader — which
     # clamped the request to what the file holds and then, under an
-    # explicit ``--band-degeneracy snap``, may have widened it outward past
+    # explicit ``band_degeneracy = snap``, may have widened it outward past
     # a cut multiplet.  Everything downstream that needs to name
     # bands uses these, never the ``n_val``/``n_cond`` arguments: those are
     # the request, and the request is stale the moment the guard fires.
@@ -314,8 +316,8 @@ def _preview_lanczos(
                 # the brightest in RESULTS; eigenvectors.h5 keeps the written
                 # states'): the window dipoles Haydock seeds
                 # from (``absorption_common.window_dipoles``: the dipole.h5 slice
-                # at the n_occ the loader and ``--eqp`` settled on, a bse_k_grid
-                # bundle's own, or a --qp-rotations bundle's QP-basis dipoles),
+                # at the n_occ the loader and ``eqp_corrections`` settled on, a bse_k_grid
+                # bundle's own, or a qp_rotations_file bundle's QP-basis dipoles),
                 # contracted against the solve's distributed eigenvectors in state
                 # blocks (no gather).
                 from .absorption_common import (build_dipole_vector_bse,
@@ -439,10 +441,10 @@ def _davidson_report(*, n_eig, tol_mev, budget, dim):
     from .bse_lanczos import davidson_stop_line
     return davidson_stop_line(
         n_eig=n_eig, tol_mev=tol_mev, budget=budget,
-        cap=(f"the cap is --max-lanczos-iter, default max(30, min(200, dim // 2)) = "
+        cap=(f"the cap is solver_max_iter, default max(30, min(200, dim // 2)) = "
              f"{max(30, min(200, int(dim) // 2))} at dim {int(dim)}"),
         refused="No eigenvector, spectrum or Haydock output was written.",
-        fix="raise --max-lanczos-iter or --davidson-m-max, or loosen --davidson-tol-mev")
+        fix="raise solver_max_iter or davidson_m_max, or loosen davidson_tol_mev")
 
 
 def _files_text(paths) -> str:
@@ -491,12 +493,37 @@ def _emit_results(report, log_lines, stdout_lines) -> None:
 
 
 def build_parser():
-    """The BSE CLI.  Below the startup call: ``--band-degeneracy`` takes its
-    choices from ``common.band_degeneracy`` (tests/test_cli_help_seam.py)."""
+    """The BSE command line: the deck, the device mesh and the output names.
+
+    Every physics setting is a deck key (``BSE_KEYS``, BerkeleyGW's
+    absorption.x names); an old physics flag refuses before this parser runs
+    (``runtime.renames.CLI_FLAGS``)."""
     import argparse
 
-    parser = argparse.ArgumentParser(allow_abbrev=False, description="BSE JAX entry point")
-    parser.add_argument("-i", "--input", help="COHSEX input file (for canonical isdf_tensors_*.h5 lookup)")
+    parser = argparse.ArgumentParser(
+        allow_abbrev=False, description="BSE eigensolve; settings are deck keys "
+        "(BerkeleyGW absorption.x names) in the deck passed with -i")
+    parser.add_argument("-i", "--input", help="the GW deck, which also carries the BSE keys")
+    parser.add_argument("--px", type=int, default=None,
+                        help="mesh rows; default = the run's square startup "
+                             "mesh")
+    parser.add_argument("--py", type=int, default=None,
+                        help="mesh columns; must equal --px, and px*py must "
+                             "be the job's device count")
+    parser.add_argument("--report-file", default=None,
+                        help="human-readable run report (default: bse.out)")
+    parser.add_argument("--out-prefix", default=None,
+                        help="prefix of the absorption files (default: absorption)")
+    return parser
+
+
+def _settings_parser():
+    """The BSE settings and their defaults, one attribute per deck key of
+    ``BSE_KEYS`` (never parsed from a command line).  ``band_degeneracy``
+    takes its choices from ``common.band_degeneracy``."""
+    import argparse
+
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--n-val", type=int, default=4)
     parser.add_argument("--n-cond", type=int, default=4)
     parser.add_argument("--band-degeneracy", choices=MODES,
@@ -513,12 +540,6 @@ def build_parser():
     parser.add_argument("--degeneracy-tol-ry", type=float,
                         default=DEGENERACY_TOL_RY, dest="degeneracy_tol_ry",
                         help="'same multiplet' tolerance in Ry (default 1 meV)")
-    parser.add_argument("--px", type=int, default=None,
-                        help="mesh rows; default = the run's square startup "
-                             "mesh")
-    parser.add_argument("--py", type=int, default=None,
-                        help="mesh columns; must equal --px, and px*py must "
-                             "be the job's device count")
     parser.add_argument("--n-eig", type=int, default=5)
     parser.add_argument("--feast-n-lanczos", type=int, default=10, help="Lanczos steps for FEAST bounds.")
     parser.add_argument("--feast-buffer", type=float, default=0.05, help="Emax buffer fraction for FEAST windows.")
@@ -547,9 +568,6 @@ def build_parser():
                         help="Use full BSE kernel (D+V-W). Overrides default RPA.")
     parser.add_argument("--kpm-window-count", type=int, default=4,
                         help="Number of KPM-derived windows for FEAST.")
-    parser.add_argument("--lanczos", action="store_true",
-                        help="the eigensolve route (--solver, default davidson), which "
-                             "is the default since 2026-10-21; kept as a no-op alias")
     parser.add_argument("--feast", action="store_true",
                         help="FEAST window solver (the default route until 2026-10-21; "
                              "now explicit).  Refuses unless every in-window Ritz pair "
@@ -600,9 +618,6 @@ def build_parser():
              "cell for D = <0|r|S>, and eta = (I+ - I-)/(I+ + I-); sigma+ is the "
              "field E0 (cos wt, sin wt, 0), x -> y, counter-clockwise seen "
              "from +z (absorption_common.inplane_helicity)")
-    parser.add_argument(
-        "--report-file", default=None,
-        help="human-readable Lanczos report (default: bse.out)")
     parser.add_argument(
         "--max-lanczos-iter",
         type=int,
@@ -757,29 +772,115 @@ def build_parser():
     parser.add_argument("--kpm-emin-ev", type=float, default=None, help="Override KPM E_min (eV).")
     parser.add_argument("--kpm-emax-ev", type=float, default=None, help="Override KPM E_max (eV).")
     parser.add_argument("--kpm-plot-file", type=str, default="bse_dos_kpm.png", help="KPM DOS plot output file.")
-    parser.add_argument("--eqp", type=str, default=None, help="Path to BGW eqp1.dat for QP corrections.")
+    parser.add_argument("--eqp", type=str, default=None, help="QP energy file (eqp1.dat format).")
     parser.add_argument(
         "--qp-rotations", default=None, metavar="QP_ROTATIONS_H5",
         help="the GW run's qp_wfn_rotations.h5: solve in the eigenbasis of "
              "its H_QP = U diag(E_QP) U^H (rotated psi at the centroids, "
-             "E_QP, rotated dipoles; bse.bse_qp_rotation).  --n-val/--n-cond "
-             "count QP states.  Mutually exclusive with --eqp.")
+             "E_QP, rotated dipoles; bse.bse_qp_rotation).  The window "
+             "counts QP states.  Mutually exclusive with eqp_corrections.")
     parser.add_argument("--n-occ", type=int, default=None, help="Number of occupied bands.")
+    parser.add_argument("--degeneracy-check-override", action="store_true")
+    parser.add_argument("--haydock", action="store_true")
+    parser.add_argument("--number-iterations", type=int, default=None)
+    parser.add_argument("--delta-frequency", type=float, default=None)
     return parser
 
 
-#: Retired flags refuse by name rather than as an unrecognised argument.
-_RETIRED_FLAGS = {
-    "--ring-timing": ("its timed ring-matvec arm was deleted 2026-08-08; "
-                      "time the jitted matvec with common.timing instead"),
+def _write_eigenvectors(n: int):
+    """BerkeleyGW's ``write_eigenvectors``: 0 none, < 0 every computed state, > 0 that many."""
+    return None if n == 0 else -1 if n < 0 else n
+
+
+def _solver_name(name: str) -> str:
+    """The deck's solver names; ``block_lanczos`` is the code's ``lanczos``."""
+    return "lanczos" if name == "block_lanczos" else name
+
+
+#: Deck key -> settings attribute.  BerkeleyGW absorption.x names where the
+#: meaning matches (``number_val_bands_fine``, ``number_eigenvalues``,
+#: ``energy_resolution`` ...); LORRAX's own solver keys keep LORRAX names.
+BSE_KEYS = {
+    "number_val_bands_fine": Key("n_val", "int"),
+    "number_cond_bands_fine": Key("n_cond", "int"),
+    "highest_occupied_band": Key("n_occ", "int"),
+    "band_degeneracy": Key("band_degeneracy", choices=tuple(MODES)),
+    "degeneracy_check_override": Key("degeneracy_check_override", "bool"),
+    "degeneracy_tol_ry": Key("degeneracy_tol_ry", "float"),
+    "qp_rotations_file": Key("qp_rotations", "path"),
+    "dipole_file": Key("dipole", "path"),
+    "dipole_position_fix": Key("dipole_position_fix", "bool"),
+    "full_bse": Key("tda", "bool", convert=lambda full: not full),
+    "spin_singlet": Key("bse", "bool"),
+    "local_fields": Key("rpa", "bool"),
+    "number_eigenvalues": Key("n_eig", "int"),
+    "write_eigenvectors": Key("write_eigs", "int", convert=_write_eigenvectors),
+    "helicity_table": Key("helicity_table", "bool"),
+    "solver": Key("solver", choices=("davidson", "block_lanczos", "trlan"),
+                  convert=_solver_name),
+    "solver_max_iter": Key("max_lanczos_iter", "int"),
+    "block_size": Key("block_size", "int"),
+    "lanczos_rtol": Key("lanczos_rtol", "float"),
+    "lanczos_check_every": Key("lanczos_check_every", "int"),
+    "lanczos_n_reorth": Key("n_reorth", "int"),
+    "davidson_precond": Key("davidson_precond", choices=("bare", "exact", "auto")),
+    "davidson_tol_mev": Key("davidson_tol_mev", "float"),
+    "davidson_margin": Key("davidson_margin", "int"),
+    "davidson_margin_tol_mev": Key("davidson_margin_tol_mev", "float"),
+    "davidson_olsen": Key("davidson_olsen", "bool"),
+    "davidson_eps_shift": Key("davidson_eps_shift", "float"),
+    "davidson_m_max": Key("davidson_m_max", "int"),
+    "trlan_m_max": Key("trlan_m_max", "int"),
+    "trlan_n_keep": Key("trlan_n_keep", "int"),
+    "haydock": Key("haydock", "bool"),
+    "number_iterations": Key("number_iterations", "int"),
+    "energy_resolution": Key("haydock_eta_ev", "float"),
+    "omega_min_ev": Key("haydock_omega_min_ev", "float"),
+    "omega_max_ev": Key("haydock_omega_max_ev", "float"),
+    "delta_frequency": Key("delta_frequency", "float"),
+    "no_eps1": Key("haydock_no_eps1", "bool"),
+    "kpm_dos": Key("kpm_dos", "bool"),
+    "kpm_window_count": Key("kpm_window_count", "int"),
+    "kpm_n_moments": Key("kpm_n_moments", "int"),
+    "kpm_n_random": Key("kpm_n_random", "int"),
+    "kpm_n_lanczos": Key("kpm_n_lanczos", "int"),
+    "kpm_emin_ev": Key("kpm_emin_ev", "float"),
+    "kpm_emax_ev": Key("kpm_emax_ev", "float"),
+    "kpm_plot_file": Key("kpm_plot_file", "str"),
+    "feast": Key("feast", "bool"),
+    "feast_n_lanczos": Key("feast_n_lanczos", "int"),
+    "feast_buffer": Key("feast_buffer", "float"),
+    "feast_n_quad1": Key("feast_n_quad1", "int"),
+    "feast_n_quad2": Key("feast_n_quad2", "int"),
+    "feast_quadrature": Key("feast_quadrature", choices=("zolotarev", "ellipse")),
+    "feast_ritz_count": Key("feast_ritz_count", "int"),
+    "feast_tol_mev": Key("feast_tol_mev", "float"),
+    "feast_iter": Key("feast_iter", "int"),
+    "feast_window1": Key("feast_window1", "str", convert=str.split),
+    "feast_window2": Key("feast_window2", "str", convert=str.split),
+    "gmres_max_iter": Key("gmres_max_iter", "int"),
+    "gmres_tol": Key("gmres_tol", "float"),
+    "gmres_seed": Key("gmres_seed", "int"),
+    "gmres_fp32": Key("gmres_fp32", "bool"),
 }
 
-#: The flags each route reads, beyond the ones every route reads.  A flag
-#: set away from its default on a route that does not read it refuses by
-#: name: the default FEAST route used to drop --eqp, --n-eig, --n-occ and
-#: the solver flags silently, so a QP run came back on DFT energies.
+#: Deck keys the other BSE drivers also read (bse.absorption_haydock,
+#: bse.exciton_bands, bse.bsemat_cli).  One deck serves them all, so a route of
+#: this driver that does not read one of these leaves it alone.
+_SHARED_KEYS = frozenset({
+    "number_val_bands_fine", "number_cond_bands_fine", "highest_occupied_band",
+    "band_degeneracy", "degeneracy_check_override", "degeneracy_tol_ry",
+    "dipole_file", "dipole_position_fix", "number_eigenvalues", "solver",
+    "solver_max_iter", "block_size", "davidson_tol_mev", "number_iterations",
+    "energy_resolution", "omega_min_ev", "omega_max_ev", "delta_frequency", "no_eps1",
+})
+
+#: The settings each route reads, beyond the ones every route reads.  A key
+#: the deck sets on a route that does not read it refuses by name: the FEAST
+#: route used to drop the QP energies, the root count, the occupations and
+#: the solver settings silently, so a QP run came back on DFT energies.
 _COMMON_DESTS = {"input", "n_val", "n_cond", "px", "py", "rpa", "bse", "tda",
-                 "lanczos", "feast", "kpm_dos"}
+                 "feast", "kpm_dos"}
 _ROUTE_DESTS = {
     "feast": {
         "feast_n_lanczos", "feast_buffer", "feast_n_quad1", "feast_n_quad2",
@@ -797,19 +898,20 @@ _ROUTE_DESTS = {
         "davidson_m_max", "davidson_tol_mev", "davidson_margin",
         "davidson_margin_tol_mev", "trlan_m_max", "trlan_n_keep",
         "eqp", "n_occ", "band_degeneracy", "degeneracy_tol_ry", "dipole",
-        "dipole_position_fix", "helicity_table", "qp_rotations", *(
+        "dipole_position_fix", "helicity_table", "qp_rotations", "haydock",
+        "number_iterations", "delta_frequency", *(
             "haydock_" + k for k in ("iter", "pol", "eta_ev", "omega_min_ev",
                                      "omega_max_ev", "n_omega", "n_spin",
                                      "no_eps1", "out_prefix"))},
 }
 
-#: The route names the refusals print ("lanczos" is the eigensolve's old flag).
-_ROUTE_NAMES = {"lanczos": "eigensolve", "feast": "--feast", "kpm": "--kpm-dos"}
+#: The route names the refusals print ("lanczos" is the eigensolve).
+_ROUTE_NAMES = {"lanczos": "eigensolve", "feast": "feast", "kpm": "kpm_dos"}
 
-#: On the eigensolve route, the flags only one ``--solver`` reads.  One set away
-#: from its default under another solver refuses: the default solver changed
-#: from lanczos to davidson on 2026-10-20, and a command line that tuned the
-#: Lanczos recurrence must not run Davidson and drop the tuning in silence.
+#: On the eigensolve route, the settings only one ``solver`` reads.  One set
+#: away from its default under another solver refuses: the default solver
+#: changed from block Lanczos to Davidson on 2026-10-20, and a deck that tuned
+#: the Lanczos recurrence must not run Davidson and drop the tuning in silence.
 _SOLVER_DESTS = {
     "lanczos": {"block_size", "lanczos_rtol", "lanczos_check_every", "n_reorth"},
     "davidson": {"davidson_precond", "davidson_olsen", "davidson_eps_shift",
@@ -819,76 +921,117 @@ _SOLVER_DESTS = {
 }
 
 
+def _deck_settings(input_file, parser):
+    """``(args, named)``: the settings the deck's BSE keys give, checked.
+
+    ``named`` is the set of deck keys the deck names.  A deck key this driver
+    cannot use refuses through ``parser.error``.
+    """
+    schema = _settings_parser()
+    try:
+        params, named = deck_params(input_file)
+        args, named = read_settings(
+            input_file, schema.parse_args([]), BSE_KEYS,
+            required=("number_val_bands_fine", "number_cond_bands_fine"),
+            params=params, named=named)
+        args.eqp = eqp_file(params, named, input_file)
+        if args.degeneracy_check_override:
+            if "band_degeneracy" in named and args.band_degeneracy != "off":
+                raise DeckError("`degeneracy_check_override` is band_degeneracy = off; "
+                                "the deck also sets band_degeneracy = "
+                                f"{args.band_degeneracy}")
+            args.band_degeneracy = "off"
+        args.haydock_iter = (int(args.number_iterations)
+                             if args.haydock and args.number_iterations else
+                             _HAYDOCK_DEFAULT_ITER if args.haydock else 0)
+        if args.delta_frequency:
+            args.haydock_n_omega = omega_count(args.haydock_omega_min_ev,
+                                               args.haydock_omega_max_ev,
+                                               float(args.delta_frequency))
+        check_dipole_operator(params, named, args.dipole)
+    except DeckError as exc:
+        parser.error(str(exc))
+    return schema, args, named
+
+
+#: Haydock steps when ``haydock = true`` names no ``number_iterations``
+#: (bse.absorption_haydock's default).
+_HAYDOCK_DEFAULT_ITER = 200
+
+
 def parse_args(argv=None):
-    """``(route, args)``: strict parsing, retired and route-ignored flags refused."""
+    """``(route, args)``: the command line, then the deck's BSE keys, checked."""
     import sys
     parser = build_parser()
     raw = list(sys.argv[1:] if argv is None else argv)
-    for flag, why in _RETIRED_FLAGS.items():
-        if flag in raw:
-            parser.error(f"{flag} is retired: {why}")
-    args = parser.parse_args(raw)
-    if args.input is None:
+    cli = parser.parse_args(raw)
+    if cli.input is None:
         parser.error("Default run requires -i/--input.")
-    # The eigensolve ("lanczos", by its old flag) is the default route since
-    # 2026-10-21; FEAST was, and is now explicit.  --lanczos is a no-op alias.
-    if sum((args.kpm_dos, args.feast, args.lanczos)) > 1:
-        parser.error("--kpm-dos, --feast and --lanczos each select a route "
-                     "(--lanczos, the eigensolve, is the default); give one")
+    schema, args, named = _deck_settings(cli.input, parser)
+    args.input, args.px, args.py = cli.input, cli.px, cli.py
+    args.report_file = cli.report_file
+    if cli.out_prefix is not None:
+        args.haydock_out_prefix = cli.out_prefix
+    args.deck_named = frozenset(named)
+    by_key = key_of(BSE_KEYS)
+    name = lambda dest: "eqp_corrections" if dest == "eqp" else by_key(dest)  # noqa: E731
+    schema_dests = set(vars(schema.parse_args([])))
+    if args.kpm_dos and args.feast:
+        parser.error("deck keys `kpm_dos` and `feast` each select a route (the "
+                     "eigensolve is the default); give one")
     route = "kpm" if args.kpm_dos else "feast" if args.feast else "lanczos"
     ignored = sorted(
-        "--" + dest.replace("_", "-") for dest, value in vars(args).items()
+        f"`{name(dest)}`" for dest, value in vars(args).items()
         if dest not in _COMMON_DESTS | _ROUTE_DESTS[route]
-        and value != parser.get_default(dest))
+        and name(dest) not in _SHARED_KEYS
+        and dest in schema_dests
+        and value != schema.get_default(dest))
     if ignored:
         parser.error(
             f"{', '.join(ignored)} {'is' if len(ignored) == 1 else 'are'} not "
             f"read by the {_ROUTE_NAMES[route]} route and would be ignored; drop "
             f"{'it' if len(ignored) == 1 else 'them'} or choose the route "
             f"that reads {'it' if len(ignored) == 1 else 'them'} (the default, "
-            f"the eigensolve with QP energies and eigenvectors; --feast for "
-            f"FEAST windows; --kpm-dos for the density of states)")
+            f"the eigensolve with QP energies and eigenvectors; feast = true for "
+            f"FEAST windows; kpm_dos = true for the density of states)")
     if args.eqp is not None and args.qp_rotations is not None:
-        parser.error("--eqp and --qp-rotations are two descriptions of the QP "
-                     "state: the first relabels DFT bands with diagonal QP "
-                     "energies, the second rotates them into the eigenbasis "
-                     "of H_QP; choose one")
+        parser.error("eqp_corrections and qp_rotations_file are two descriptions "
+                     "of the QP state: the first relabels DFT bands with diagonal "
+                     "QP energies, the second rotates them into the eigenbasis of "
+                     "H_QP; choose one")
     if route == "lanczos":
         wrong = sorted(
-            "--" + dest.replace("_", "-")
+            f"`{name(dest)}`"
             for solver, dests in _SOLVER_DESTS.items() if solver != args.solver
-            for dest in dests if getattr(args, dest) != parser.get_default(dest))
+            for dest in dests
+            if name(dest) not in _SHARED_KEYS
+            and getattr(args, dest) != schema.get_default(dest))
         if wrong:
+            solver = "block_lanczos" if args.solver == "lanczos" else args.solver
             parser.error(
                 f"{', '.join(wrong)} {'is' if len(wrong) == 1 else 'are'} not "
-                f"read by --solver {args.solver} (the default since 2026-10-20 "
+                f"read by solver = {solver} (the default since 2026-10-20 "
                 f"is davidson); name the solver that reads "
                 f"{'it' if len(wrong) == 1 else 'them'} or drop "
                 f"{'it' if len(wrong) == 1 else 'them'}")
-    haydock_flags = sorted(
-        "--" + dest.replace("_", "-") for dest in vars(args)
-        if dest.startswith("haydock_") and dest != "haydock_iter"
-        and getattr(args, dest) != parser.get_default(dest))
     if args.davidson_margin < 0:
-        parser.error("--davidson-margin must be >= 0")
+        parser.error("davidson_margin must be >= 0")
     if (args.davidson_margin_tol_mev is not None
             and args.davidson_margin_tol_mev < args.davidson_tol_mev):
-        parser.error("--davidson-margin-tol-mev is a looser lock for the margin "
-                     "roots: it must be >= --davidson-tol-mev")
+        parser.error("davidson_margin_tol_mev is a looser lock for the margin "
+                     "roots: it must be >= davidson_tol_mev")
     if args.haydock_iter < 0:
-        parser.error("--haydock-iter must be >= 0 (0 = off)")
-    if args.haydock_iter == 0 and haydock_flags:
-        parser.error(f"{', '.join(haydock_flags)} only configure "
-                     f"--haydock-iter N > 0, which is off")
+        parser.error("number_iterations must be > 0")
     if args.haydock_iter > 0:
         if not args.tda or args.dipole is None:
-            parser.error("--haydock-iter runs the TDA Haydock recursion seeded "
-                         "by the window dipoles: it needs --tda and --dipole")
+            parser.error("haydock = true runs the TDA Haydock recursion seeded "
+                         "by the window dipoles: it needs the TDA (no full_bse) "
+                         "and dipole_file")
         if args.rpa or not args.bse:
-            parser.error("--haydock-iter runs absorption_haydock's screened "
-                         "recursion (D + V - W): it needs --bse")
+            parser.error("haydock = true runs absorption_haydock's screened "
+                         "recursion (D + V - W): it needs spin_singlet = true")
         if args.qp_rotations is not None:
-            parser.error("--haydock-iter on a --qp-rotations bundle is not "
+            parser.error("haydock = true on a qp_rotations_file bundle is not "
                          "supported: run bse.absorption_haydock's inputs")
         from .absorption_haydock import parse_polarizations
         try:
@@ -897,62 +1040,66 @@ def parse_args(argv=None):
             parser.error(str(exc))
     if args.dipole is not None and (
             (args.write_eigs is None and args.haydock_iter == 0) or not args.tda):
-        parser.error("--dipole stores per-state dipoles beside the written "
-                     "eigenvectors or seeds --haydock-iter: it needs "
-                     "--write-eigs or --haydock-iter, and --tda (the "
+        parser.error("dipole_file stores per-state dipoles beside the written "
+                     "eigenvectors or seeds the Haydock recursion: it needs "
+                     "write_eigenvectors or haydock = true, and the TDA (the "
                      "full-BSE oscillator strength needs both halves of the "
                      "paired vector)")
     if args.helicity_table and args.dipole is None:
-        parser.error("--helicity-table reports the per-state dipoles: it needs "
-                     "--dipole (with --write-eigs and --tda)")
+        parser.error("helicity_table reports the per-state dipoles: it needs "
+                     "dipole_file (with write_eigenvectors and the TDA)")
     return route, args
 
 
 def settings_rows(args, *, source) -> tuple:
-    """The BSE SETTINGS rows from the parsed command line; ``source(*flags)``
-    says whether a flag was given (``ProductionReport.flag_source``)."""
+    """The BSE SETTINGS rows from the deck's BSE keys; ``source(*keys)`` says
+    whether the deck names a key (``bse_deck.deck_source``)."""
     use_tda = args.tda
     include_w = not (args.rpa or not args.bse)
     basis_file = args.qp_rotations or args.eqp
     return (
-        Setting("--tda", "on" if use_tda else "off", source("--tda"),
+        Setting("full_bse", "off" if use_tda else "on", source("full_bse"),
                 "Tamm-Dancoff Hermitian BSE" if use_tda else
                 "full resonant-antiresonant BSE"),
-        Setting("--bse" if include_w else "--rpa", "on", source("--bse", "--rpa"),
+        Setting("spin_singlet" if include_w else "local_fields", "on",
+                source("spin_singlet", "local_fields"),
                 "kernel D + V - W: screened direct term (stored W0 or a static RPA "
                 "rebuild)" if include_w else
                 "kernel D + V: RPA, no screened direct term"),
-        Setting("--solver", str(args.solver), source("--solver"),
+        Setting("solver", "block_lanczos" if args.solver == "lanczos" else str(args.solver),
+                source("solver"),
                 (f"block of {int(args.n_eig)} roots + up to {int(args.davidson_margin)} "
                  f"margin, {args.davidson_precond} "
                  f"diagonal preconditioner; trial-stack matvec"
                  if args.solver == "davidson" else
                  f"block size {int(args.block_size)}, {int(args.n_eig)} roots; "
                  "trial-stack matvec")),
-        (Setting("--davidson-tol-mev", f"{float(args.davidson_tol_mev):g}",
-                 source("--davidson-tol-mev"),
+        (Setting("davidson_tol_mev", f"{float(args.davidson_tol_mev):g}",
+                 source("davidson_tol_mev"),
                  "stop when every root's residual is below this (meV)")
          if args.solver == "davidson" else
-         Setting("--lanczos-rtol", f"{float(args.lanczos_rtol):g}", source("--lanczos-rtol"),
+         Setting("lanczos_rtol", f"{float(args.lanczos_rtol):g}", source("lanczos_rtol"),
                  f"stop at this relative change, checked every "
                  f"{int(args.lanczos_check_every)} iterations"
                  if args.lanczos_rtol > 0.0 else "fixed Krylov dimension: no convergence test")),
-        Setting("--qp-rotations" if args.qp_rotations else "--eqp",
+        Setting("qp_rotations_file" if args.qp_rotations else "eqp_corrections",
                 os.path.basename(str(basis_file)) if basis_file else "none",
-                source("--qp-rotations", "--eqp"),
+                source("qp_rotations_file", "eqp_corrections", "eqp_co_corrections"),
                 "QP-rotated bands, eigenstates of the GW H_QP" if args.qp_rotations
                 else "DFT bands, diagonal QP energies" if args.eqp
                 else "DFT bands and energies"),
-        Setting("--band-degeneracy", str(args.band_degeneracy), source("--band-degeneracy"),
+        Setting("band_degeneracy", str(args.band_degeneracy),
+                source("band_degeneracy", "degeneracy_check_override"),
                 f"tolerance {float(args.degeneracy_tol_ry) * RYD_TO_EV * 1.0e3:.3f} meV"),
-    ) + ((Setting("--haydock-iter", str(int(args.haydock_iter)), source("--haydock-iter"),
+    ) + ((Setting("number_iterations", str(int(args.haydock_iter)),
+                  source("haydock", "number_iterations"),
                   f"Haydock eps2 ({args.haydock_pol}) on the eigensolve's payload, "
                   f"eta {float(args.haydock_eta_ev):g} eV"),)
          if getattr(args, "haydock_iter", 0) else ())
 
 
 def _haydock_settings(args) -> dict | None:
-    """The ``--haydock-*`` flags as ``_preview_lanczos``'s ``haydock`` bundle (None: off)."""
+    """The Haydock deck keys as ``_preview_lanczos``'s ``haydock`` bundle (None: off)."""
     if args.haydock_iter <= 0:
         return None
     return {"n_iter": int(args.haydock_iter), "pols": args.haydock_pols,
@@ -1031,7 +1178,7 @@ def main(argv=None) -> int:
         report = run.report
         report.begin(input_file=args.input)
         report.devices(mesh_role="BSE transition axes c x v")
-        report.settings(settings_rows(args, source=report.flag_source))
+        report.settings(settings_rows(args, source=deck_source(args.deck_named)))
 
         from .bse_window import _parse_wfn_path
         from wfn_loader import WfnLoader

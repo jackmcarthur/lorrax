@@ -135,7 +135,7 @@ def load_bse_data_from_restart_sharded(
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_parent_y/enk_full).
 
-    ``qp_rotations_file`` (``--qp-rotations``) puts the window in the GW
+    ``qp_rotations_file`` (``qp_rotations_file``) puts the window in the GW
     run's QP basis (``bse.bse_qp_rotation``): the window is resolved on the
     QP ladder, ψ is read for the whole rotation block and rotated, eq. (2),
     and ε are the matched QP energies.  ``data["qp_rotation"]`` carries the
@@ -150,12 +150,12 @@ def load_bse_data_from_restart_sharded(
     ``input_file``); unset or == the coarse grid → the coarse bundle is
     returned byte-identically (fast path untouched).
 
-    ``eqp_file`` (``--eqp``) enters the htransform on the densified path, so
+    ``eqp_file`` (``eqp_corrections``) enters the htransform on the densified path, so
     the fine ε are quasiparticle; ``data["densified"]`` tells the caller
     whether it still owes the coarse QP re-slice
     (``bse_window.apply_eqp_and_reslice_bands``).
 
-    ``velocity_file`` (``--dipole``) is read only on the densified path: the
+    ``velocity_file`` (``dipole_file``) is read only on the densified path: the
     coarse WFN's ``dipole.h5``, carried through the same htransform as ψ, and
     ``data["dipoles"]`` holds the window dipoles in the fine ψ gauge
     (``bse_densify.densified_dipoles``).  Off it, the driver slices the file
@@ -168,7 +168,7 @@ def load_bse_data_from_restart_sharded(
     ``velocity_position_fix``), its same-occupation pairs by
     ``velocity_pair_rule`` / ``velocity_pair_gap_ev``
     (``bse_densify.densified_dipoles``' ``pair_rule`` / ``pair_gap_ev``).
-    ``velocity_position_fix`` (``--dipole-position-fix``, opt-in) applies
+    ``velocity_position_fix`` (``dipole_position_fix``, opt-in) applies
     ``densified_dipoles``' exact-position fix under ``eqp_file``; off, the
     dipoles are ``v/ΔE_RQ`` and a QP/DFT mixing receipt is logged.
 
@@ -233,10 +233,10 @@ def load_bse_data_from_restart_sharded(
     else:
         if densify_pending:
             raise ValueError(
-                f"GATE bse_qp_rotations_k_grid: got --qp-rotations with "
+                f"GATE bse_qp_rotations_k_grid: got qp_rotations_file with "
                 f"bse_k_grid = {fine_grid} on a {(nkx, nky, nkz)} restart; "
                 f"want the native grid.  why: the densifying htransform takes "
-                f"QP energies only (--eqp), so the fine ψ and velocity would "
+                f"QP energies only (eqp_corrections), so the fine ψ and velocity would "
                 f"stay in the DFT basis.  fix: run the native grid, or "
                 f"densify a restart built from WFN_qp.h5.")
         from .bse_qp_rotation import load_qp_rotation

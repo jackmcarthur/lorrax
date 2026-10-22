@@ -5,7 +5,7 @@ rule stated in its own docstring:
 
 ``bse_window``
     Which bands are in the window, and how its axes are padded.  The
-    ``PAD_EPS_GUARD_RY`` sentinel, the pad masks and counts, the ``--eqp``
+    ``PAD_EPS_GUARD_RY`` sentinel, the pad masks and counts, the ``eqp_corrections``
     re-slice, and the eigenvector writer's declared window.
 ``bse_head``
     The q=0 rank-1 Coulomb head: where its scalars come from, the ``w0_ready``

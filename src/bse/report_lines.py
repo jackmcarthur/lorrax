@@ -91,7 +91,7 @@ def bse_results_lines(energies_ev, *, gap=None, dipoles=None, n_k: int = 1,
     ``gap`` is ``(E_gap eV, k index 1-based, "QP" | "DFT")``, the lowest direct
     transition of the solved window; the binding row is ``E_gap - E(S1)``.
     ``dipoles`` (``(n_roots, 3)``) adds the oscillator table, ``helicity``
-    the ``--helicity-table`` lines; ``eigenvectors`` says what was written,
+    the ``helicity_table`` lines; ``eigenvectors`` says what was written,
     ``roots_file`` which file holds every root; ``extra_rows`` follow.
 
     With ``trim`` and more than :data:`BSE_ROOTS_LISTED` roots the tables list
@@ -111,7 +111,7 @@ def bse_results_lines(energies_ev, *, gap=None, dipoles=None, n_k: int = 1,
         table.append(f"  [the first {BSE_ROOTS_FIRST} of {n_roots} roots; all are in "
                      f"{roots_file or 'the rank-0 stdout'}"
                      + ("" if dipoles is not None else
-                        "; the brightest need --dipole") + "]")
+                        "; the brightest need dipole_file") + "]")
     if dipoles is not None:
         table += [""] + oscillator_lines(dipoles, n_k, states)
     if helicity:
@@ -131,7 +131,7 @@ def bse_results_lines(energies_ev, *, gap=None, dipoles=None, n_k: int = 1,
         if energies_ev.size:
             rows.append(("binding (S1)", f"{float(gap_ev) - float(energies_ev[0]):.5f} eV "
                                          f"below the {kind} gap"))
-    rows.append(("eigenvectors", eigenvectors or "not written (--write-eigs)"))
+    rows.append(("eigenvectors", eigenvectors or "not written (write_eigenvectors)"))
     if roots_file:
         rows.append(("all roots", f"{n_roots} in {roots_file}, BerkeleyGW's layout"))
     rows += [(str(label), str(value)) for label, value in extra_rows]

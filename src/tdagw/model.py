@@ -483,14 +483,14 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
         must straddle n_occ and close degenerate multiplets at both edges.
     wfn_file : str, optional — TDGW's full-grid WFN.h5.
     zeta_file : str, optional — default ``<restart dir>/zeta_q.h5``.
-    eqp_file : str, optional — BerkeleyGW ``eqp.dat``, the BSE run's ``--eqp``.
+    eqp_file : str, optional — BerkeleyGW ``eqp.dat``, the BSE run's ``eqp_corrections``.
         On a ``bse_k_grid`` deck it enters the loader's htransform, so the
         fine ψ are the quasiparticle f(H) states (the states of a
-        ``bse_jax --eqp`` run on the same deck) and the fine ε are QP.  On a
+        ``bse_jax eqp_corrections`` run on the same deck) and the fine ε are QP.  On a
         coarse deck ψ stay the restart's (or ``wfn_file``'s) and the file
         only sets ``window``'s energies (``keep_window``).
     velocity_file : str, optional — the coarse WFN's ``dipole.h5``
-        (``bse_jax --dipole``).  The loader reads it on the densified route
+        (``bse_jax dipole_file``).  The loader reads it on the densified route
         only; refuses on a coarse deck and with a loader that has no
         ``velocity_file``.
     velocity_full_window : bool — ask the loader for the velocity over every
@@ -498,7 +498,7 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
         option.  Needs ``velocity_file``.
     velocity_position_fix : bool — with ``eqp_file``, the loader's opt-in
         exact position of the fine QP states (``bse_jax
-        --dipole-position-fix``; CrI3-type QP ladders) instead of
+        dipole_position_fix``; CrI3-type QP ladders) instead of
         ``v/ΔE_RQ``; forwarded only, refuses (GATE td_velocity_position_fix)
         without ``velocity_file`` or with a loader that has no such option.
     keep_window : bool — keep the loader's window as ``model["window"]``:
@@ -651,7 +651,7 @@ def _loader_options(loader, *, eqp_file=None, velocity_file=None,
         out["eqp_file"] = os.path.abspath(eqp_file)
     if velocity_full_window and velocity_file is None:
         _refuse("td_velocity_full_window", "velocity_full_window=True, velocity_file=None",
-                "a velocity_file", "pass the coarse WFN's dipole.h5 (bse_jax --dipole)")
+                "a velocity_file", "pass the coarse WFN's dipole.h5 (bse_jax dipole_file)")
     if velocity_file is not None:
         if "velocity_file" not in params:
             _refuse("td_velocity_loader", f"{loader.__module__}.{loader.__name__} has no "
@@ -687,7 +687,7 @@ def _window_record(data: dict, *, restart_file: str, input_file: str, n_occ: int
 
     On the densified route the loader's ε already carry ``eqp_file`` (its
     htransform).  On a coarse deck with ``eqp_file`` they are re-sliced as
-    ``bse_jax --eqp`` does (``bse_window.apply_eqp_and_reslice_bands``); a
+    ``bse_jax eqp_corrections`` does (``bse_window.apply_eqp_and_reslice_bands``); a
     QP gap that moves ``n_occ`` refuses, since ψ hold the DFT window.
     """
     densified = bool(data.get("densified", False))

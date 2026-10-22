@@ -842,7 +842,7 @@ def _position_in_fine_states(v_win, f_win, n_val, newton, *, rule, gap_ry,
                              chunk=_POSITION_Q_CHUNK):
     r"""⟨ĩ|r̂|j̃⟩ in fine states that are NOT eigenstates of the velocity's H.
 
-    With ``--eqp`` the fine states |ĩ⟩ diagonalize the interpolated QP
+    With ``eqp_corrections`` the fine states |ĩ⟩ diagonalize the interpolated QP
     ``f(H)``; the velocity's own (DFT) ``f(H)`` block ``f_win`` is then not
     diagonal in them.  Per q: ``f_win = W diag(φ) Wᴴ``, ``ε = f⁻¹(φ)``
     (``newton``), ``v' = Wᴴ v W``, ``r' = v'/(i Δε)`` with the pair rule
@@ -886,7 +886,7 @@ def _qp_window_mixing(f_win, n_val):
     ``f_win`` (nq, nb, nb) is the velocity's DFT f(H) block in the fine
     window, valence rows first.  The two numbers of the r-fix record
     (``max_offblock_mixing``, ``fh_offdiag_rel_max``), computed the same way
-    whether or not the fix is applied: they say when ``--dipole-position-fix``
+    whether or not the fix is applied: they say when ``dipole_position_fix``
     is needed (the fine QP states are not DFT eigenstates).
     """
     fq = 0.5 * (f_win + np.conj(np.swapaxes(f_win, -1, -2)))
@@ -977,8 +977,8 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
     bands: outer-shell image 26 % unweighted, against 1.9 % for f(H)).  A
     window whose top band stays below every unfitted band takes ``g ≡ 1``,
     the unweighted route.  The transition energies are the velocity's own:
-    the file's ``band_energies`` (DFT for ``dipole.h5``), never ``--eqp``,
-    because ``r = v/ΔE`` is scissor-invariant.  Under ``--eqp`` the fine
+    the file's ``band_energies`` (DFT for ``dipole.h5``), never ``eqp_corrections``,
+    because ``r = v/ΔE`` is scissor-invariant.  Under ``eqp_corrections`` the fine
     states are eigenvectors of the QP ``f(H)``, so each band's energy is the
     Rayleigh quotient of the file's ``f(H)`` in it, Newton-inverted (exact
     when the two Hamiltonians share eigenvectors, second order otherwise):
@@ -995,7 +995,7 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
     Two receipts.  The on-grid identity is a gate: at every fine q that is a
     coarse k the fine window states span the coarse states that hold the
     window's positions in the order of ``fh_energies`` (the fH's own,
-    QP under ``--eqp``, which can move a band across a window edge: MoS₂
+    QP under ``eqp_corrections``, which can move a band across a window edge: MoS₂
     9×9 at Γ), degenerate partners included, ``σ(W_S) = 1`` for
     ``W = C_k^* U_q`` (catches a q list or band window that is not the
     htransform's), and the four images reproduce ``W^† O(k) W``
@@ -1043,9 +1043,9 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         c <- v): ``v_window`` and ``e_dft_window`` below.  Off by default;
         the default outputs do not depend on it.
     qp_states : bool
-        The exact-position fix, opt-in (``--dipole-position-fix``; the
+        The exact-position fix, opt-in (``dipole_position_fix``; the
         loader passes ``eqp_file is not None and velocity_position_fix``).
-        Under ``--eqp`` the fine states are eigenstates of a QUASIPARTICLE
+        Under ``eqp_corrections`` the fine states are eigenstates of a QUASIPARTICLE
         f(H); with strongly band-dependent QP shifts that interpolant mixes
         the velocity's DFT bands, the DFT f(H) block is not diagonal in them,
         and ``v/ΔE`` of its Rayleigh quotients is not their position (CrI3
@@ -1247,11 +1247,11 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
     mixing = None
     if mixing_receipt and not qp_states:
         mixing = _qp_window_mixing(f_win, n_val)
-        log_fn(f"[bse_k_grid dipoles] --eqp without --dipole-position-fix: d = "
+        log_fn(f"[bse_k_grid dipoles] eqp_corrections without dipole_position_fix: d = "
                f"v/dE_RQ; QP/DFT window mixing receipt: max off-block (v<->c) "
                f"mixing {mixing[0]:.3e}, f(H) off-diagonal max {mixing[1]:.3e} "
                f"(relative); large values (strongly band-dependent QP shifts, "
-               f"CrI3-type) call for --dipole-position-fix")
+               f"CrI3-type) call for dipole_position_fix")
 
     on_grid_rel, state_dev, defect, n_on_grid = _dipole_on_grid_identity(
         out, basis.ctilde, fine.coeffs_fi, ops_host=(v_full, f_full),
@@ -1272,8 +1272,8 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
            f"{DENSIFIED_DIPOLE_ONGRID_RTOL:.0e})")
     log_fn(f"[bse_k_grid dipoles] transition energies from {path}'s "
            f"band_energies (Rayleigh quotients of its f(H) in the fine "
-           f"states): max |E - eps_bundle| = {shift_mev:.3f} meV (the --eqp "
-           f"shift; 0 without --eqp)")
+           f"states): max |E - eps_bundle| = {shift_mev:.3f} meV (the eqp_corrections "
+           f"shift; 0 without eqp_corrections)")
     log_fn("[bse_k_grid dipoles] velocity carried unweighted (fit window top isolated)"
            if weight is None else
            f"[bse_k_grid dipoles] velocity carried as g v g (fit window top meets "
@@ -1468,11 +1468,11 @@ def _interpolate_bse_data_to_grid(
     Parameters
     ----------
     eqp_file : str or None
-        The wedge ``eqp1.dat`` (``--eqp``).  Its QP energies enter the fH
+        The wedge ``eqp1.dat`` (``eqp_corrections``).  Its QP energies enter the fH
         through ``initialize_wfns``, the one reader on this path, so the fine
         ε are quasiparticle; the coarse bundle's ε are not re-sliced after.
     velocity_file : str or None
-        The COARSE WFN's ``dipole.h5`` (``--dipole``).  Authenticated against
+        The COARSE WFN's ``dipole.h5`` (``dipole_file``).  Authenticated against
         the deck WFN before the fit, then carried through the same htransform
         as ψ (:func:`densified_dipoles`); the bundle's ``dipoles`` key holds
         the fine-grid window dipoles in its own ψ gauge, ``None`` without it.
@@ -1485,7 +1485,7 @@ def _interpolate_bse_data_to_grid(
     velocity_position_fix : bool
         With ``eqp_file``: the exact-position fix of
         :func:`densified_dipoles` (``qp_states``), opt-in
-        (``--dipole-position-fix``); off, ``v/ΔE_RQ`` and the mixing receipt.
+        (``dipole_position_fix``); off, ``v/ΔE_RQ`` and the mixing receipt.
     head_channel : dict or None
         C1's split-and-reattach hand-off from the loader, ``None`` on the
         ``legacy`` arm.  When present it carries ``whead`` (the head scalar the

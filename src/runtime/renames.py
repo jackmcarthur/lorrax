@@ -68,6 +68,123 @@ DECK_VALUES: dict[tuple[str, str, str], str | Rename] = {
 #: ``--old v`` are all refused before the driver's parser runs.
 CLI_FLAGS: dict[tuple[str, str], str | Rename] = {}
 
+_BSE_SOLVERS = ("bse.bse_jax", "bse.absorption_haydock", "bse.exciton_bands")
+
+
+def _bse_flags(programs, rows: dict[str, str | Rename]) -> None:
+    for prog in programs:
+        for old, new in rows.items():
+            CLI_FLAGS[(prog, old)] = new
+
+
+# 2026-10-21: BSE physics settings are deck keys with BerkeleyGW absorption.x
+# and kernel.x names; the command line keeps -i, --px/--py, --report-file and
+# --out-prefix (owner decision D1 = A).
+_bse_flags(_BSE_SOLVERS, {
+    "--n-val": "number_val_bands_fine",
+    "--n-cond": "number_cond_bands_fine",
+    "--n-occ": "highest_occupied_band",
+    "--band-degeneracy": "band_degeneracy",
+    "--degeneracy-tol-ry": "degeneracy_tol_ry",
+    "--eqp": Rename("eqp_co_corrections",
+                    "or eqp_corrections without kgrid_fine; a bare key reads eqp_co.dat "
+                    "(eqp.dat), a value names the file"),
+    "--dipole": "dipole_file",
+    "--n-eig": "number_eigenvalues",
+    "--block-size": "block_size",
+})
+_bse_flags(("bse.bse_jax", "bse.absorption_haydock"), {
+    "--dipole-position-fix": "dipole_position_fix",
+})
+_bse_flags(("bse.bse_jax",), {
+    "--tda": Rename("full_bse", "TDA is now the default; full_bse = true solves the full BSE"),
+    "--bse": Rename("spin_singlet", "the screened kernel is the default: spinor on a spinor "
+                                    "WFN, spin_singlet otherwise"),
+    "--rpa": Rename("local_fields", "local_fields = true drops W"),
+    "--lanczos": Rename("", "it changed nothing; the eigensolve is the default route"),
+    "--feast": "feast",
+    "--kpm-dos": "kpm_dos",
+    "--solver": Rename("solver", "values davidson, block_lanczos, trlan"),
+    "--write-eigs": Rename("write_eigenvectors", "BerkeleyGW's sign convention: < 0 writes "
+                                                 "every computed state"),
+    "--qp-rotations": "qp_rotations_file",
+    "--helicity-table": "helicity_table",
+    "--max-lanczos-iter": "solver_max_iter",
+    "--lanczos-rtol": "lanczos_rtol",
+    "--lanczos-check-every": "lanczos_check_every",
+    "--n-reorth": "lanczos_n_reorth",
+    "--davidson-precond": "davidson_precond",
+    "--davidson-tol-mev": "davidson_tol_mev",
+    "--davidson-margin": "davidson_margin",
+    "--davidson-margin-tol-mev": "davidson_margin_tol_mev",
+    "--davidson-olsen": "davidson_olsen",
+    "--davidson-eps-shift": "davidson_eps_shift",
+    "--davidson-m-max": "davidson_m_max",
+    "--trlan-m-max": "trlan_m_max",
+    "--trlan-n-keep": "trlan_n_keep",
+    "--haydock-iter": Rename("number_iterations", "with haydock = true"),
+    "--haydock-pol": Rename("polarization", "a vector along b1 b2 b3; unset computes x, y, z"),
+    "--haydock-eta-ev": Rename("energy_resolution", "eV, Lorentzian"),
+    "--haydock-omega-min-ev": "omega_min_ev",
+    "--haydock-omega-max-ev": "omega_max_ev",
+    "--haydock-n-omega": Rename("delta_frequency", "the step in eV replaces the count"),
+    "--haydock-n-spin": Rename("", "LORRAX runs spinor or non-spinor WFNs; the spin factor "
+                                   "comes from the WFN"),
+    "--haydock-no-eps1": "no_eps1",
+    "--haydock-out-prefix": "--out-prefix",
+    "--kpm-window-count": "kpm_window_count",
+    "--kpm-n-moments": "kpm_n_moments",
+    "--kpm-n-random": "kpm_n_random",
+    "--kpm-n-lanczos": "kpm_n_lanczos",
+    "--kpm-emin-ev": "kpm_emin_ev",
+    "--kpm-emax-ev": "kpm_emax_ev",
+    "--kpm-plot-file": "kpm_plot_file",
+    "--feast-n-lanczos": "feast_n_lanczos",
+    "--feast-buffer": "feast_buffer",
+    "--feast-n-quad1": "feast_n_quad1",
+    "--feast-n-quad2": "feast_n_quad2",
+    "--feast-quadrature": "feast_quadrature",
+    "--feast-ritz-count": "feast_ritz_count",
+    "--feast-tol-mev": "feast_tol_mev",
+    "--feast-iter": "feast_iter",
+    "--feast-window1": "feast_window1",
+    "--feast-window2": "feast_window2",
+    "--gmres-max-iter": "gmres_max_iter",
+    "--gmres-tol": "gmres_tol",
+    "--gmres-seed": "gmres_seed",
+    "--gmres-fp32": "gmres_fp32",
+    "--ring-timing": Rename("", "time the matvec with common.timing"),
+})
+_bse_flags(("bse.absorption_haydock",), {
+    "--n-iter": "number_iterations",
+    "--eta-eV": Rename("energy_resolution", "eV, Lorentzian"),
+    "--omega-min-eV": "omega_min_ev",
+    "--omega-max-eV": "omega_max_ev",
+    "--n-omega": Rename("delta_frequency", "the step in eV replaces the count"),
+    "--no-eps1": "no_eps1",
+    "--pol": Rename("polarization", "a vector along b1 b2 b3; unset computes x, y, z"),
+    "--V-cell": Rename("", "the cell volume is read from the WFN"),
+    "--n-spinor": Rename("", "the spinor count is read from the WFN; spinor = true asserts it"),
+    "--n-spin": Rename("", "LORRAX runs spinor or non-spinor WFNs; the spin factor comes "
+                           "from the WFN"),
+})
+_bse_flags(("bse.exciton_bands",), {
+    "--max-iter": "solver_max_iter",
+    "--solver": Rename("solver", "values davidson, block_lanczos"),
+    "--davidson-tol-mev": "davidson_tol_mev",
+})
+# kernel.x's names for the exported kernel (bsemat_cli writes absorption.x's
+# bsemat.h5): deck keys, as kernel.inp's.
+_bse_flags(("bse.bsemat_cli",), {
+    "--n-val": "number_val_bands",
+    "--n-cond": "number_cond_bands",
+    "--kernel": Rename("extended_kernel", "true writes the extended kernel, false (the "
+                                          "default) the TDA kernel; one form per run"),
+    "--extended": "extended_kernel",
+    "--exciton-Q": Rename("exciton_Q_shift", "kernel.x's Qflag Qx Qy Qz, with its sign: "
+                                             "Q_shift = -Q"),
+})
+
 #: Names on disk: {old: new}.  HDF5 dataset names, header schema strings and
 #: run-directory suffixes.  A reader probes the new name, then the old one.
 DISK_NAMES: dict[str, str] = {

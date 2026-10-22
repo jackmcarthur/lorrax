@@ -99,9 +99,10 @@ pad transitions then sit at +2e3 Ry, harmless to the lowest n_eig.  (No-op
 at 1×1 mesh: there are no pads.)
 
 Run (never on a login node; module-free srun+shifter runner):
-    python -m bse.exciton_bands -i cohsex.in --n-val 4 --n-cond 4 \
-        --n-eig 6 --vq-mode both --refit-points 0,8,15,22,29
-The input file must carry a K_POINTS crystal_b block (the Q path).
+    python -m bse.exciton_bands -i cohsex.in --vq-mode both --refit-points 0,8,15,22,29
+The input file must carry a K_POINTS crystal_b block (the Q path) and the BSE
+deck keys it shares with bse.bse_jax (number_val_bands_fine,
+number_cond_bands_fine, number_eigenvalues, solver, eqp_corrections ...).
 """
 from __future__ import annotations
 
@@ -147,6 +148,7 @@ from common.report_blocks import Setting
 from common.scientific_output import abs_path, band_range, policy
 from runtime.run_session import RunSession
 from .bse_head import head_shifted_eps_c
+from .bse_deck import DeckError, Key, deck_params, deck_source, eqp_file, read_settings
 from .bse_io import (load_bse_data_from_restart_sharded, decimate_W_q_to_subgrid, make_w_densifier, w_pair_embedding, build_w_head_channel, resolve_w_head_densify, _resolve_head_params, PAD_EPS_GUARD_RY)
 from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
@@ -397,7 +399,7 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
 def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                                nc_pad: int, nv_pad: int, n_cond: int, n_val: int,
                                *, n_eig: int, max_iter: int, tol_mev: float, W_q0):
-    """The ``--solver davidson`` (default) counterpart of :func:`build_path_solver`:
+    """The ``solver = davidson`` (default) counterpart of :func:`build_path_solver`:
     the same call signature and outputs, the per-Q lowest ``n_eig`` from
     ``bse_lanczos.solve_bse_sharded``'s Davidson (exact diagonal
     E_c(k+Q) - E_v(k) + (V_x(Q) - W_d)/nk, soft locking, margin roots, the
@@ -438,9 +440,9 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                 davidson_precond="exact", davidson_tol_Ry=tol_mev / RY_TO_MEV,
                 davidson_plan_key="exciton_bands")
             davidson_stop_line(n_eig=n_eig, tol_mev=tol_mev, budget=max_iter,
-                               cap="the cap is --max-iter", where=f" at Q row {iQ}",
+                               cap="the cap is solver_max_iter", where=f" at Q row {iQ}",
                                refused="No exciton band file was written.",
-                               fix="raise --max-iter, or loosen --davidson-tol-mev")
+                               fix="raise solver_max_iter, or loosen davidson_tol_mev")
             rows.append(np.asarray(_gather_host(ev)).real)
         return replicate_to_mesh(np.stack(rows), mesh_xy), ()
 
@@ -449,12 +451,12 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
 
 
 def check_solver_flags(ap, args) -> None:
-    """A flag only the other ``--solver`` reads refuses (the default is davidson)."""
+    """A deck key only the other ``solver`` reads refuses (the default is davidson)."""
     if args.solver == "davidson" and args.block_size != ap.get_default("block_size"):
-        ap.error("--block-size is read by --solver lanczos only (the default solver "
-                 "is davidson since 2026-10-21); drop it or add --solver lanczos")
+        ap.error("block_size is read by solver = block_lanczos only (the default solver "
+                 "is davidson since 2026-10-21); drop it or set solver = block_lanczos")
     if args.solver == "lanczos" and args.davidson_tol_mev != ap.get_default("davidson_tol_mev"):
-        ap.error("--davidson-tol-mev is read by --solver davidson only")
+        ap.error("davidson_tol_mev is read by solver = davidson only")
 
 
 def _precond_w_q0(args, data):
@@ -466,7 +468,7 @@ def _precond_w_q0(args, data):
 
 def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, head_mbz, W_q0):
     """The per-Q lowest-``n_eig`` solver of the band scan: Davidson (default, cap
-    ``max(30, min(200, n_phys // 2))`` iterations) or ``--solver lanczos``'s fixed
+    ``max(30, min(200, n_phys // 2))`` iterations) or ``solver = block_lanczos``'s fixed
     block-Lanczos scan (40 block iterations)."""
     if args.solver == "lanczos":
         return build_path_solver(
@@ -1106,10 +1108,10 @@ def gate_htransform_vs_stored(
             "bundle: each energy table and its wavefunction table must share "
             "one k axis, but htransform has "
             f"eps={n_ht_eps}, psi={n_ht_psi} and stored/data has "
-            f"eps={n_st_eps}, psi={n_st_psi}.  A bse_k_grid run with --eqp "
+            f"eps={n_st_eps}, psi={n_st_psi}.  A bse_k_grid run with eqp_corrections "
             "can cause exactly this if coarse restart energies are applied "
             "after psi was densified; apply the QP ladder before "
-            "densification, or use WFN_qp.h5 without the redundant --eqp.")
+            "densification, or use WFN_qp.h5 without the redundant eqp_corrections.")
     if paired[0]:
         ht_idx = np.asarray(htransform_k_indices, dtype=np.int32)
         st_idx = np.asarray(stored_k_indices, dtype=np.int32)
@@ -1210,8 +1212,8 @@ _PROBE_TICK = None      # instrument: set by an out-of-tree profiling probe
 
 
 def settings_rows(args, *, source) -> tuple:
-    """The exciton-band SETTINGS rows from the parsed command line; ``source(*flags)``
-    says whether a flag was given (``ProductionReport.flag_source``)."""
+    """The exciton-band SETTINGS rows from the command line and the deck;
+    ``source(*names)`` says where each came from."""
     rerun = rerun_check_enabled(args)
     return (
         Setting("--vq-mode", str(args.vq_mode), source("--vq-mode"),
@@ -1221,16 +1223,17 @@ def settings_rows(args, *, source) -> tuple:
                 else "none", source("--w-coarse-grid"),
                 "W on a coarse grid, trigonometric densification" if args.w_coarse_grid
                 else "W on the native BSE k grid"),
-        Setting("--solver", str(args.solver), source("--solver"),
+        Setting("solver", "block_lanczos" if args.solver == "lanczos" else str(args.solver),
+                source("solver"),
                 f"Davidson per Q, exact diagonal, residual below "
                 f"{float(args.davidson_tol_mev):g} meV" if args.solver == "davidson"
                 else f"block Lanczos per Q, block size {int(args.block_size)}"),
-        Setting("--max-iter", "auto" if args.max_iter is None else str(int(args.max_iter)),
-                source("--max-iter"),
+        Setting("solver_max_iter", "auto" if args.max_iter is None else str(int(args.max_iter)),
+                source("solver_max_iter"),
                 "iteration cap" if args.solver == "davidson"
                 else "block iterations (Krylov = block x iter)"),
-        Setting("--eqp", os.path.basename(str(args.eqp)) if args.eqp else "none",
-                source("--eqp"),
+        Setting("eqp_corrections", os.path.basename(str(args.eqp)) if args.eqp else "none",
+                source("eqp_corrections", "eqp_co_corrections"),
                 "quasiparticle corrections from this file" if args.eqp
                 else "DFT eigenvalues from the WFN"),
         Setting("--cert-grade", str(args.cert_grade), source("--cert-grade"),
@@ -1241,6 +1244,18 @@ def settings_rows(args, *, source) -> tuple:
                 "the Q scan is solved twice, a reproducibility check" if rerun
                 else "the Q scan is solved once"),
     )
+
+
+def _settings_source(args):
+    """``source(*names)``: ``deck`` for a deck key the deck names, ``cli`` for a given flag."""
+    from common.production_report import ProductionReport
+    deck = deck_source(getattr(args, "deck_named", frozenset()))
+
+    def source(*names):
+        if any(not n.startswith("--") for n in names):
+            return deck(*names)
+        return ProductionReport.flag_source(*names)
+    return source
 
 
 def rerun_check_enabled(args) -> bool:
@@ -1269,14 +1284,29 @@ def rerun_check_enabled(args) -> bool:
     return bool(getattr(args, "rerun_check", False))
 
 
-def build_parser():
-    """The driver's argparse parser, built where a test can reach it — so a
-    flag's default is observable without running a full solve."""
+#: Deck key -> setting: the BSE keys this driver shares with bse.bse_jax
+#: (BerkeleyGW absorption.x names).  The exciton-band flags stay on the
+#: command line.
+EXB_KEYS = {
+    "number_val_bands_fine": Key("n_val", "int"),
+    "number_cond_bands_fine": Key("n_cond", "int"),
+    "band_degeneracy": Key("band_degeneracy", choices=tuple(MODES)),
+    "degeneracy_check_override": Key("degeneracy_check_override", "bool"),
+    "degeneracy_tol_ry": Key("degeneracy_tol_ry", "float"),
+    "number_eigenvalues": Key("n_eig", "int"),
+    "solver": Key("solver", choices=("davidson", "block_lanczos"),
+                  convert=lambda name: "lanczos" if name == "block_lanczos" else name),
+    "davidson_tol_mev": Key("davidson_tol_mev", "float"),
+    "block_size": Key("block_size", "int"),
+    "solver_max_iter": Key("max_iter", "int"),
+    "dipole_file": Key("dipole", "path"),
+}
+
+
+def _settings_defaults():
+    """The defaults of the settings :data:`EXB_KEYS` fills."""
     import argparse
-    ap = argparse.ArgumentParser(allow_abbrev=False,
-        description="Exciton bandstructure E_S(Q) along a K_POINTS crystal_b path")
-    ap.add_argument("-i", "--input", required=True,
-                    help="cohsex.in with a K_POINTS crystal_b Q-path block")
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--n-val", type=int, default=4)
     ap.add_argument("--n-cond", type=int, default=4)
     ap.add_argument("--band-degeneracy", choices=MODES, default=DEFAULT_MODE,
@@ -1297,6 +1327,66 @@ def build_parser():
                          f"{DEGENERACY_TOL_RY:.4e} = 1 meV; the smallest "
                          f"between-pair boundary gap measured on the Si "
                          f"12x12 SOC deck was 5.9 meV)")
+    ap.add_argument("--n-eig", type=int, default=6)
+    ap.add_argument("--solver", choices=("davidson", "lanczos"), default="davidson",
+                    help="per-Q lowest --n-eig solver: davidson (default; "
+                         "bse_lanczos' exact-diagonal Davidson, stopped on the "
+                         "--davidson-tol-mev residual) or lanczos (fixed block "
+                         "Lanczos, --block-size x --max-iter)")
+    ap.add_argument("--davidson-tol-mev", type=float, default=0.01,
+                    help="--solver davidson: every root's residual below this (meV)")
+    ap.add_argument("--block-size", type=int, default=8,
+                    help="--solver lanczos only: block size")
+    ap.add_argument("--max-iter", type=int, default=None,
+                    help="iteration cap: Davidson iterations (default "
+                         "max(30, min(200, n_phys // 2))) or block-Lanczos "
+                         "iterations (default 40, Krylov = block x iter)")
+    ap.add_argument("--eqp", type=str, default=None,
+                    help="BGW-format eqp1.dat (the one LORRAX's GW writes): "
+                         "run the whole BSE on QUASIPARTICLE energies instead "
+                         "of DFT.  Both legs are corrected — the stored "
+                         "valence/conduction eps from the restart AND the "
+                         "htransform's enk_sigma, so the interpolated "
+                         "eps_c(k+Q) is a QP band and the on-grid gate "
+                         "compares QP against QP.")
+    ap.add_argument("--dipole", default=None,
+                    help="dipole.h5 for the mini-BZ head TENSOR (only read "
+                         "when head_minibz_average is ON).  Default: "
+                         "dipole.h5 beside the input file.  The head's "
+                         "q-linear coefficient IS this dipole, which is why "
+                         "the cell-averaged head needs no d(zeta)/dq.")
+    ap.add_argument("--degeneracy-check-override", action="store_true")
+    return ap
+
+
+def deck_settings(ap, args):
+    """``args`` with the deck's shared BSE keys filled in; a key it cannot use refuses."""
+    settings_ap = _settings_defaults()
+    try:
+        params, named = deck_params(args.input)
+        settings, named = read_settings(
+            args.input, settings_ap.parse_args([]), EXB_KEYS,
+            required=("number_val_bands_fine", "number_cond_bands_fine"),
+            params=params, named=named)
+        settings.eqp = eqp_file(params, named, args.input)
+        if settings.degeneracy_check_override:
+            settings.band_degeneracy = "off"
+    except DeckError as exc:
+        ap.error(str(exc))
+    for key, value in vars(settings).items():
+        setattr(args, key, value)
+    args.deck_named = frozenset(named)
+    return settings_ap
+
+
+def build_parser():
+    """The driver's argparse parser, built where a test can reach it — so a
+    flag's default is observable without running a full solve."""
+    import argparse
+    ap = argparse.ArgumentParser(allow_abbrev=False,
+        description="Exciton bandstructure E_S(Q) along a K_POINTS crystal_b path")
+    ap.add_argument("-i", "--input", required=True,
+                    help="cohsex.in with a K_POINTS crystal_b Q-path block")
     ap.add_argument("--q-per-segment", type=int, default=16,
                     dest="q_per_segment",
                     help="MINIMUM number of Q the driver puts on each "
@@ -1315,30 +1405,8 @@ def build_parser():
                          "cheap; it is the htransform ψ_c(k+Q) cache that "
                          "grows linearly, and that is what to watch on a "
                          "densified (bse_k_grid) bundle.")
-    ap.add_argument("--n-eig", type=int, default=6)
-    ap.add_argument("--solver", choices=("davidson", "lanczos"), default="davidson",
-                    help="per-Q lowest --n-eig solver: davidson (default; "
-                         "bse_lanczos' exact-diagonal Davidson, stopped on the "
-                         "--davidson-tol-mev residual) or lanczos (fixed block "
-                         "Lanczos, --block-size x --max-iter)")
-    ap.add_argument("--davidson-tol-mev", type=float, default=0.01,
-                    help="--solver davidson: every root's residual below this (meV)")
-    ap.add_argument("--block-size", type=int, default=8,
-                    help="--solver lanczos only: block size")
-    ap.add_argument("--max-iter", type=int, default=None,
-                    help="iteration cap: Davidson iterations (default "
-                         "max(30, min(200, n_phys // 2))) or block-Lanczos "
-                         "iterations (default 40, Krylov = block x iter)")
     ap.add_argument("--vq-mode", choices=("interp", "refit", "both", "ongrid"),
                     default="interp")
-    ap.add_argument("--eqp", type=str, default=None,
-                    help="BGW-format eqp1.dat (the one LORRAX's GW writes): "
-                         "run the whole BSE on QUASIPARTICLE energies instead "
-                         "of DFT.  Both legs are corrected — the stored "
-                         "valence/conduction eps from the restart AND the "
-                         "htransform's enk_sigma, so the interpolated "
-                         "eps_c(k+Q) is a QP band and the on-grid gate "
-                         "compares QP against QP.")
     ap.add_argument("--refit-points", type=str, default=None,
                     help="comma list of path indices to refit "
                          "(vq-mode=both; default ~5 evenly spaced)")
@@ -1423,12 +1491,6 @@ def build_parser():
                          "4-13%% near-Γ/zone-boundary head error, "
                          "arbitrary_q_bse.md §16.4).  Overrides the cohsex.in "
                          "``head_minibz_average`` key; default (unset) uses it.")
-    ap.add_argument("--dipole", default=None,
-                    help="dipole.h5 for the mini-BZ head TENSOR (only read "
-                         "when head_minibz_average is ON).  Default: "
-                         "dipole.h5 beside the input file.  The head's "
-                         "q-linear coefficient IS this dipole, which is why "
-                         "the cell-averaged head needs no d(zeta)/dq.")
     ap.add_argument("--px", type=int, default=None,
                     help="mesh rows; default = the run's square startup mesh")
     ap.add_argument("--py", type=int, default=None,
@@ -1593,7 +1655,8 @@ def main(argv=None):
 
     ap = build_parser()
     args = ap.parse_args(argv)
-    check_solver_flags(ap, args)
+    settings_ap = deck_settings(ap, args)
+    check_solver_flags(settings_ap, args)
 
     report_path = os.path.abspath(
         args.report_file if args.report_file else args.out_prefix + ".out")
@@ -1606,7 +1669,7 @@ def main(argv=None):
         log = _LOGGER.debug          # helper chatter: forensic detail
         report.begin(input_file=args.input)
         report.devices(mesh_role="BSE transition axes c x v")
-        report.settings(settings_rows(args, source=report.flag_source))
+        report.settings(settings_rows(args, source=_settings_source(args)))
         # ---- Stage timing -----------------------------------------------------
         # DELIBERATELY a driver-local two-column table (``name  seconds``) and NOT
         # ``common.timing.report``: eight live campaign harnesses parse this table
@@ -1748,7 +1811,7 @@ def main(argv=None):
         n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
         nv_pad, nc_pad = int(data["n_val_pad"]), int(data["n_cond_pad"])
         n_rmu, n_rmu_pad = int(data["n_rmu"]), int(data["n_rmu_pad"])
-        # ── QP energies (--eqp): both legs of the pair basis move together.
+        # ── QP energies (eqp_corrections): both legs of the pair basis move together.
         # The stored leg is re-sliced here; the interpolated leg takes the
         # same ``enk_qp_full`` right after ``initialize_wfns`` below.
         enk_qp_full = None
@@ -1924,7 +1987,7 @@ def main(argv=None):
             # both its psi/eps and this Q=Gamma cache live on the FINE grid; the
             # native coarse restart is no longer either operand.  Comparing a
             # coarse/fine intersection here used the coarse energy cardinality
-            # left behind by the invalid post-densification --eqp path to index an
+            # left behind by the invalid post-densification eqp_corrections path to index an
             # already-fine psi table, turning an operand-provenance bug into a
             # spurious subspace-overlap failure.  The gate below first verifies
             # each psi/eps pair has one k axis, then compares all actual rows.

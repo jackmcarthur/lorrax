@@ -1,9 +1,13 @@
 """``python -m bse.bsemat_cli``: LORRAX static W -> BerkeleyGW 4.0 bsemat.h5.
 
-    python3 -u -m bse.bsemat_cli -i cohsex.in --wfn-co WFN_co.h5 --n-val 8 --n-cond 8 \\
-        [--kernel tda extended] [--bgw-eps epsmat.h5] [--gauge map identity] \\
+    python3 -u -m bse.bsemat_cli -i cohsex.in --wfn-co WFN_co.h5 \\
+        [--bgw-eps epsmat.h5] [--gauge map identity] \\
         [--q0-body head-less dipole] [--mu-small off|N|Nx|auto ...] [--downfold-rcond R] \\
-        [--exciton-Q Q1 Q2 Q3 [--wfnq-co WFNq_co.h5]] [-o bsemat.h5]
+        [--wfnq-co WFNq_co.h5] [-o bsemat.h5]
+
+The kernel's settings are kernel.x's keys in the deck: ``number_val_bands``,
+``number_cond_bands`` (required), ``extended_kernel`` (default false: the TDA
+blocks) and ``exciton_Q_shift Qflag Qx Qy Qz`` (default ``1 0 0 0``).
 
 ``-i`` is the producer GW deck. Its run directory holds the restart
 (``tmp/isdf_tensors_*.h5``: a static-Dyson ``W0_qmunu``, ``V_qmunu`` and, beside
@@ -20,21 +24,21 @@ BerkeleyGW's 3-D q0 body term from the bundle's stored q → 0 wings
 the file's own band window (the ``gw.downfold`` driver's selection and transfer,
 docs/downfold.md) and builds the rows by GEMMs over the small W.
 
-``--exciton-Q`` (crystal, default 0) writes kernel.x's finite-momentum kernel on
-the same coarse k count: file row k holds the electron at k (WFN_co) and the hole
-at k − Q, the pair |v k−Q, c k⟩ of ``bse.exciton_bands``' |v k, c k+Q⟩. On the
-restart grid both legs are the restart's (``exciton_Q_shift 2 -Q``). Off it, WFN_co
-is the restart grid shifted by +Q, its states come from the htransform, the hole
-gauge from ``--wfnq-co`` and the exchange tile from the per-Q ζ refit
-(``exciton_Q_shift 0 -Q``). docs/theory/bgw-bsemat-export.md#finite-q.
+``exciton_Q_shift Qflag Qx Qy Qz`` (crystal) writes kernel.x's finite-momentum
+kernel on the same coarse k count, with kernel.x's sign: Q = -(Qx, Qy, Qz) is the
+exciton momentum, and file row k holds the electron at k (WFN_co) and the hole at
+k − Q, the pair |v k−Q, c k⟩ of ``bse.exciton_bands``' |v k, c k+Q⟩. Qflag 1 is
+Q = 0. Qflag 2: Q on the restart grid, both legs the restart's. Qflag 0: off the
+grid, WFN_co is the restart grid shifted by +Q, its states come from the
+htransform, the hole gauge from ``--wfnq-co`` and the exchange tile from the per-Q
+ζ refit. docs/theory/bgw-bsemat-export.md#finite-q.
 
-Several files from one load: ``--kernel`` (``--extended`` = ``--kernel extended``),
-``--gauge``, ``--q0-body`` and ``--mu-small`` each take one or more values, and the
-run writes one file per combination (``bse.bsemat_export.run_bsemat_exports``):
+Several files from one load: ``--gauge``, ``--q0-body`` and ``--mu-small`` each
+take one or more values, and the run writes one file per combination
+(``bse.bsemat_export.run_bsemat_exports``):
 the restart is read, the head split solved and the gauge fitted once, and the row
 kernels compile once per file shape. One combination writes ``-o``; several write
-``<stem>_<tag><ext>``, the tag naming each varying value (``tda``/``ext``,
-``map``/``nomap``, ``q0hl``/``q0dip``, ``mu<value>``). Each file gets
+``<stem>_<tag><ext>``, the tag naming each varying value (``map``/``nomap``, ``q0hl``/``q0dip``, ``mu<value>``). Each file gets
 ``<file>.json`` (gates, Frobenius norms and ``stages``, the per-stage walls in s);
 rank 0 prints the stage table (``common.timing``) at the end.
 Physics and conventions:
@@ -55,14 +59,6 @@ def build_parser():
     ap.add_argument("-i", "--input", required=True, help="producer GW deck of the restart")
     ap.add_argument("--wfn-co", required=True,
                     help="explicit full-grid coarse WFN (BerkeleyGW WFN_co)")
-    ap.add_argument("--n-val", type=int, required=True,
-                    help="valence (spinor) bands = BerkeleyGW number_val_bands")
-    ap.add_argument("--n-cond", type=int, required=True,
-                    help="conduction (spinor) bands = BerkeleyGW number_cond_bands")
-    ap.add_argument("--kernel", nargs="+", choices=("tda", "extended"), default=None,
-                    help="kernel form(s), one file each from one load: tda (default), extended "
-                         "(extended_kernel: every (n1,n2)->(n1',n2') block, non-TDA absorption)")
-    ap.add_argument("--extended", action="store_true", help="= --kernel extended")
     ap.add_argument("--bgw-eps", default=None,
                     help="BerkeleyGW epsmat.h5 whose q list fixes the head slot of zone-boundary ties")
     ap.add_argument("--gauge", nargs="+", choices=("map", "identity"), default=None,
@@ -80,21 +76,48 @@ def build_parser():
                          "docs/theory/bgw-bsemat-export.md#downfold has the measured accuracy)")
     ap.add_argument("--downfold-rcond", type=float, default=None,
                     help="downfold transfer cut, relative eigenvalue (default: gw.downfold's 1.1e-6)")
-    ap.add_argument("--exciton-Q", type=float, nargs=3, default=[0.0, 0.0, 0.0],
-                    metavar=("Q1", "Q2", "Q3"), dest="exciton_Q",
-                    help="exciton momentum Q (crystal; default 0): the kernel of the pairs |v k-Q, c k> on "
-                         "WFN_co's k list, written with BerkeleyGW's exciton_Q_shift = -Q (qflag 2 on the "
-                         "restart grid, 0 off it). Off the grid WFN_co is the grid shifted by Q and the "
-                         "electron leg comes from the htransform, as in bse.exciton_bands")
     ap.add_argument("--wfnq-co", default=None,
-                    help="off-grid --exciton-Q only: the restart grid's explicit WFN, BerkeleyGW's WFNq_co "
-                         "(the hole leg's coefficient gauge)")
+                    help="exciton_Q_shift Qflag 0 only: the restart grid's explicit WFN, BerkeleyGW's "
+                         "WFNq_co (the hole leg's coefficient gauge)")
     ap.add_argument("-o", "--output", default="bsemat.h5",
                     help="output file; with several combinations, the <stem><ext> of <stem>_<tag><ext>")
     ap.add_argument("--summary", default=None,
                     help="JSON summary path of a one-file run (default: <output>.json); with several "
                          "files each gets <file>.json and this path the list of them")
     return ap
+
+
+def kernel_settings(ap, a):
+    """kernel.x's deck keys onto ``a``: ``n_val``, ``n_cond``, ``extended_kernel``,
+    ``exciton_Q`` (the exciton momentum, ``-(Qx, Qy, Qz)`` of ``exciton_Q_shift``)."""
+    from .bse_deck import DeckError, Key, deck_params, read_settings
+    keys = {"number_val_bands": Key("n_val", "int"),
+            "number_cond_bands": Key("n_cond", "int"),
+            "extended_kernel": Key("extended_kernel", "bool"),
+            "exciton_Q_shift": Key("exciton_Q_shift", "floats")}
+    defaults = argparse.Namespace(n_val=None, n_cond=None, extended_kernel=False,
+                                  exciton_Q_shift=[1.0, 0.0, 0.0, 0.0])
+    try:
+        params, named = deck_params(a.input)
+        settings, _ = read_settings(a.input, defaults, keys,
+                                    required=("number_val_bands", "number_cond_bands"),
+                                    params=params, named=named)
+    except DeckError as exc:
+        ap.error(str(exc))
+    shift = settings.exciton_Q_shift
+    if len(shift) != 4 or shift[0] not in (0.0, 1.0, 2.0):
+        ap.error(f"exciton_Q_shift takes Qflag Qx Qy Qz with Qflag 0, 1 or 2; got {shift}")
+    qflag, q_shift = int(shift[0]), [float(x) for x in shift[1:]]
+    if qflag == 1 and any(q_shift):
+        ap.error("exciton_Q_shift Qflag 1 is the Q = 0 kernel; give Qx Qy Qz = 0 0 0")
+    if qflag == 0 and a.wfnq_co is None:
+        ap.error("exciton_Q_shift Qflag 0 reads the hole leg's gauge from WFNq_co: pass --wfnq-co")
+    if qflag != 0 and a.wfnq_co is not None:
+        ap.error("--wfnq-co is read by exciton_Q_shift Qflag 0 only")
+    a.n_val, a.n_cond = settings.n_val, settings.n_cond
+    a.extended_kernel = settings.extended_kernel
+    a.exciton_Q = [-x + 0.0 for x in q_shift]
+    a.exciton_qflag = qflag
 
 
 def mu_small_of(spec, n_b):
@@ -112,19 +135,18 @@ def mu_small_of(spec, n_b):
 def file_combinations(ap, a):
     """The files of one run, one dict per combination of the multi-valued flags (no runtime).
 
-    Axes: ``--kernel`` (or ``--extended``), ``--gauge`` (or ``--no-gauge-map``),
-    ``--q0-body``, ``--mu-small``. One combination writes ``-o``; several write
-    ``<stem>_<tag><ext>``, the tag naming each axis that varies (``TAGS``).
-    Contradictory or repeated values end the process through ``ap.error``.
+    Axes: the kernel form (``extended_kernel``, one value), ``--gauge`` (or
+    ``--no-gauge-map``), ``--q0-body``, ``--mu-small``. One combination writes
+    ``-o``; several write ``<stem>_<tag><ext>``, the tag naming each axis that
+    varies (``TAGS``).  Contradictory or repeated values end the process through
+    ``ap.error``.
     """
-    if a.extended and a.kernel:
-        ap.error("--extended is --kernel extended; give one of them")
     if a.no_gauge_map and a.gauge:
         ap.error("--no-gauge-map is --gauge identity; give one of them")
-    axes = (a.kernel or (["extended"] if a.extended else ["tda"]),
+    axes = (["extended"] if getattr(a, "extended_kernel", False) else ["tda"],
             a.gauge or (["identity"] if a.no_gauge_map else ["map"]),
             list(a.q0_body), list(a.mu_small))
-    for flag, vals in zip(("--kernel", "--gauge", "--q0-body", "--mu-small"), axes):
+    for flag, vals in zip(("extended_kernel", "--gauge", "--q0-body", "--mu-small"), axes):
         if len({str(v).strip().lower() for v in vals}) != len(vals):
             ap.error(f"{flag} repeats a value: {vals}")
     for v in a.mu_small:
@@ -174,6 +196,7 @@ def main(argv=None) -> int:
     _record_pre_main(RUNTIME, "bsemat", _pre_main)    # bsemat.runtime_stack.<phase>, bsemat.imports
     ap = build_parser()
     a = ap.parse_args(argv)
+    kernel_settings(ap, a)
     files = file_combinations(ap, a)
     from .bse_ring_comm import create_mesh_2d
     from .bsemat_export import output_spec, run_bsemat_exports

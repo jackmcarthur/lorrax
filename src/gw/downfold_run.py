@@ -42,7 +42,7 @@ to.  It is NOT a truncation of the stored band axis: ``psi_parent_y`` and
 compressed.  That is deliberate.  Truncating bands would renumber every band
 index in the bundle, move the ``band_window`` stamp that
 ``assert_restart_window_matches`` refuses on, and break the drop-in property
-outright — a consumer asking for ``--n-occ 8`` would silently get different
+outright — a consumer asking for ``highest_occupied_band = 8`` would silently get different
 states.  Band-axis truncation is a separate, later stage with its own
 renumbering contract.
 """

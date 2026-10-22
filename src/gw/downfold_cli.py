@@ -131,11 +131,10 @@ def _print_validation_recipe(result) -> None:
              "against your accuracy bar")
     log.info("  (production BSE work wants better than 1 meV).  Copy-paste, "
              "after putting the SAME")
-    log.info("  BSE deck in both directories and keeping every flag "
-             "identical on both legs:")
+    log.info("  BSE deck (number_val_bands_fine, number_cond_bands_fine, ...) "
+             "in both directories:")
     log.info(f"    for d in {parent} {small}; do (cd \"$d\" && python3 -u -m "
-             f"bse.bse_jax -i cohsex.in --n-val 4 --n-cond 4 --lanczos "
-             f"2>&1 | tail -40); done")
+             f"bse.bse_jax -i cohsex.in 2>&1 | tail -40); done")
     log.info("  The band counts are yours; if the strict band-degeneracy "
              "guard refuses them it")
     log.info("  names the counts that work — use those, on BOTH legs, or the "

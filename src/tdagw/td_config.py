@@ -615,7 +615,7 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
         name = kw.pop("dataset_name", typ)
         if typ == "exciton_projection" and not kw.get("eigenvectors"):
             raise _gate("td_exciton_projection", f"measurement {i} without eigenvectors",
-                        "a bse_jax --write-eigs eigenvectors.h5 on the same bundle and window",
+                        "a bse_jax write_eigenvectors eigenvectors.h5 on the same bundle and window",
                         f"set measurements.{i}.eigenvectors")
         meas.append((name, typ, kw))
     if sum(m[1] == "exciton_projection" for m in meas) > 1:
@@ -987,11 +987,11 @@ TD_KEY_DOCS = {
     "lorrax.dipole_position_fix": (
         "", "A `bse_k_grid` bundle with `eqp_file`: the window position is the exact "
         "r of the fine QP states (the DFT f(H) eigenbasis of the window, `bse_jax "
-        "--dipole-position-fix`) instead of v/ΔE of their Rayleigh quotients. Opt in for "
+        "dipole_position_fix`) instead of v/ΔE of their Rayleigh quotients. Opt in for "
         "strongly band-dependent QP ladders (CrI3-type); the bundle log's QP/DFT mixing "
         "receipt says when.", ("td_velocity_position_fix",)),
     "lorrax.check_eigenvectors": (
-        "", "A `bse_jax --write-eigs --dipole` file on the same bundle and window: the "
+        "", "A `bse_jax write_eigenvectors and dipole_file` file on the same bundle and window: the "
         "builder reproduces its ⟨0|r|S⟩ from the header (the gauge receipt, logged and "
         "stored in the header). It costs a load of the eigenvectors; leave it unset in "
         "production once the receipt has been read.", ("td_bundle_key", "td_eigenvector_kpts")),

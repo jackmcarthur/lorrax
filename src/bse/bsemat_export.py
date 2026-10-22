@@ -955,7 +955,7 @@ def run_bsemat_exports(*, input_file, wfn_co, n_val, n_cond, outputs, rcond=A.RC
         if bad:
             raise ValueError(f"GATE bsemat_finite_q_form: {bad} ask for extended_kernel or the downfold "
                              "at exciton_Q != 0; the finite-Q file is the TDA kernel on the parent's "
-                             "centroids (kernel.x's finite-Q route). fix: --kernel tda --mu-small off")
+                             "centroids (kernel.x's finite-Q route). fix: extended_kernel = false and --mu-small off")
     t0, w0 = time.time(), _stage_walls()
     try:
         ctx = _export_context(input_file=input_file, wfn_co=wfn_co, n_val=n_val, n_cond=n_cond,

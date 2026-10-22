@@ -200,7 +200,7 @@ def solve_bse_sharded(
 
     ``keep_W_R`` leaves the transformed screened kernel on the payload as
     ``data["W_R"]`` (one (μ, ν, k) tile per rank, the solve's own) for a second
-    consumer in the same process (``bse_jax --haydock-iter``); a payload that
+    consumer in the same process (``bse_jax haydock = true``); a payload that
     already carries ``W_R`` is solved on it without a second transform.
 
     Davidson (the default) solves ``n_eig + davidson_margin`` roots and stops
@@ -278,7 +278,7 @@ def solve_bse_sharded(
     if _need_W_q0 and data.get("_W_q0_for_precond") is None:
         if data.get("W_q") is None:
             raise ValueError(
-                "--davidson-precond exact needs the q=0 slice of W_q, but "
+                "davidson_precond exact needs the q=0 slice of W_q, but "
                 "this payload's W_q has already been consumed by the donated "
                 "ifft and no slice was stashed.  Reload the payload.")
         data["_W_q0_for_precond"] = data["W_q"][:, :, 0, 0, 0]
@@ -530,7 +530,7 @@ def solve_bse_sharded(
 
         m_max = int(trlan_m_max) if trlan_m_max else max(3 * n_eig, 60)
         n_keep = int(trlan_n_keep) if trlan_n_keep else n_eig + 10
-        # ``--max-lanczos-iter`` is read as a budget of matvec APPLICATIONS,
+        # ``solver_max_iter`` is read as a budget of matvec APPLICATIONS,
         # so the A/B against the unrestarted path is like-for-like: both
         # spend the same number of H applications.
         per_cycle = m_max - n_keep

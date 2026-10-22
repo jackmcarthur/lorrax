@@ -104,9 +104,9 @@ def _dense_refusal(N: int) -> str:
     """The one refusal text for a dense window over ``_DENSE_N_MAX``."""
     return (f"non-TDA dense window N={N} (n_cond x n_val x nk, mesh-padded) exceeds "
             f"_DENSE_N_MAX={_DENSE_N_MAX}: the dense structure-preserving solve "
-            "assembles A and B, O(N^2).  Alternatives: --tda (the TDA Davidson, the "
-            "default eigensolve), --feast (FEAST windows, refused unless converged to "
-            "--feast-tol-mev), or a smaller --n-val / --n-cond.  The matrix-free SDY "
+            "assembles A and B, O(N^2).  Alternatives: full_bse = false (the TDA Davidson, the "
+            "default eigensolve), feast = true (FEAST windows, refused unless converged to "
+            "feast_tol_mev), or a smaller number_val_bands_fine / number_cond_bands_fine.  The matrix-free SDY "
             "route (bse_nontda solver='matrixfree') has no bse_jax flag and refuses on a "
             "sharded mesh.")
 

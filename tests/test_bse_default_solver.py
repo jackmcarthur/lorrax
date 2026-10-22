@@ -4,8 +4,8 @@ cannot reach.
 On a synthetic spinor payload (k grid 2x2x2, 4v x 4c, N_mu 24: transition dimension 128) in
 the loader's shardings, the screened kernel real in R space (so H is Hermitian):
 
-1. ``bse_jax``'s CLI defaults (``--solver davidson --davidson-precond exact
-   --davidson-tol-mev 0.01``) through ``bse_lanczos.solve_bse_sharded`` solve 8 + 8 margin
+1. ``bse_jax``'s deck defaults (``solver = davidson``, ``davidson_precond = exact``,
+   ``davidson_tol_mev = 0.01``) through ``bse_lanczos.solve_bse_sharded`` solve 8 + 8 margin
    roots, stop CONVERGED on the lowest 8 and return those 8, within 0.01 meV of a full-Krylov
    Lanczos (120 of 128 steps) and of ``eigvalsh`` of the operator assembled from the same
    matvec.
@@ -13,14 +13,14 @@ the loader's shardings, the screened kernel real in R space (so H is Hermitian):
    capped at 2 iterations refuses, and its run directory stays empty.
 3. ``keep_W_R``: ``absorption_haydock.haydock_coefficients`` on the eigensolve's payload
    equals the standalone route (a fresh payload) to 1e-12.
-4. ``bse_jax --lanczos --dipole-position-fix`` parses and reaches the loader as
+4. A deck with ``dipole_position_fix = true`` parses and reaches the loader as
    ``velocity_position_fix=True``.
 5. ``GATE cpu_davidson_threads`` refuses four emulated CPU devices on 4 host threads and
    passes them on 16.
-6. Margin roots locked at 1 meV (``--davidson-margin-tol-mev 1``) stop CONVERGED with the same
+6. Margin roots locked at 1 meV (``davidson_margin_tol_mev = 1``) stop CONVERGED with the same
    lowest 8 (0.01 meV from dense) in fewer H applications than the default lock.
-7. Routes: no route flag is the eigensolve (Davidson), ``--lanczos`` its alias, ``--feast``
-   FEAST; two route flags, or a FEAST flag without ``--feast``, refuse.  ``GATE
+7. Routes: no route key is the eigensolve (Davidson), ``feast = true`` FEAST; two route
+   keys, or a FEAST key without ``feast = true``, refuse.  ``GATE
    feast_converged`` refuses an in-window Ritz pair at 13.6 meV and a saturated window (every
    Ritz pair in-window), and passes when only an out-of-window pair is unconverged.  ``GATE
    nontda_dense_size``: a non-TDA window over 4096 states refuses before the restart load.
@@ -102,7 +102,7 @@ def run_cases(mesh):
     ops = _host_operands()
     H = _dense(mesh, ops)
     exact = np.linalg.eigvalsh(0.5 * (H + H.conj().T))[:N_EIG]
-    p = bse_jax.build_parser()
+    p = bse_jax._settings_parser()
     defaults = {k: p.get_default(k) for k in ("solver", "davidson_precond", "davidson_tol_mev")}
 
     data = _payload(mesh, ops)
@@ -135,9 +135,19 @@ def run_cases(mesh):
     return out
 
 
+def _toy_deck(lines):
+    """A deck file with the toy window and ``lines`` (BSE deck keys); its path."""
+    import tempfile
+    fd = tempfile.NamedTemporaryFile("w", suffix=".in", delete=False)
+    fd.write("[cohsex]\nsys_dim = 3\nnumber_val_bands_fine = 4\nnumber_cond_bands_fine = 4\n"
+             + "".join(f"{line}\n" for line in lines))
+    fd.close()
+    return fd.name
+
+
 def _driver_cases(mesh, ops):
-    """The driver path on the synthetic payload (loader and restart lookup stubbed): the
-    parsed ``--lanczos --dipole-position-fix`` reaches the loader, and a Davidson capped
+    """The driver path on the synthetic payload (loader and restart lookup stubbed): a
+    parsed ``dipole_position_fix = true`` reaches the loader, and a Davidson capped
     at 2 iterations refuses before anything is written; then the CPU threads gate."""
     import os
     import tempfile
@@ -145,8 +155,9 @@ def _driver_cases(mesh, ops):
     import jax
     import numpy as np
     from bse import bse_io, bse_jax, bse_lanczos
-    _, args = bse_jax.parse_args(["-i", "toy.in", "--lanczos", "--tda", "--bse", "--write-eigs",
-                                  "--dipole", "toy_dipole.h5", "--dipole-position-fix"])
+    _, args = bse_jax.parse_args(["-i", _toy_deck(
+        ["full_bse = false", "spin_singlet = true", "write_eigenvectors = -1",
+         "dipole_file = /toy/toy_dipole.h5", "dipole_position_fix = true"])])
     seen = {}
 
     def load(restart_file, **kw):
@@ -186,9 +197,9 @@ def _driver_cases(mesh, ops):
             return str(exc)
         finally:
             os.sched_getaffinity = real
-    def route(argv):
+    def route(lines):
         try:
-            r, a = bse_jax.parse_args(["-i", "toy.in", *argv])
+            r, a = bse_jax.parse_args(["-i", _toy_deck(lines)])
             return r if r != "lanczos" else f"eigensolve/{a.solver}"
         except SystemExit:
             return "refused"
@@ -214,15 +225,14 @@ def _driver_cases(mesh, ops):
         dense_gate = str(exc)
     finally:
         bse_io.load_bse_data_from_restart_sharded = real_load
-    routes = [route([]), route(["--lanczos"]), route(["--feast"]), route(["--feast", "--lanczos"]),
-              route(["--feast-n-quad1", "6"])]
-    return {"routes_and_feast_gate": routes == ["eigensolve/davidson", "eigensolve/davidson", "feast",
-                                                "refused", "refused"]
+    routes = [route([]), route(["feast = true"]), route(["feast = true", "kpm_dos = true"]),
+              route(["feast_n_quad1 = 6"])]
+    return {"routes_and_feast_gate": routes == ["eigensolve/davidson", "feast", "refused", "refused"]
             and feast_gate([1e-9, 1e-3, 1.0]) == "refused" and feast_gate([1e-9, 1e-9, 1.0]) == "pass"
             and feast_gate([1e-9, 1e-9, 1e-9], evals=(0.05, 0.1, 0.12)) == "refused"
-            and "_DENSE_N_MAX" in dense_gate and "N=8192" in dense_gate and "--tda" in dense_gate
+            and "_DENSE_N_MAX" in dense_gate and "N=8192" in dense_gate and "full_bse" in dense_gate
             and loads == [],
-            "dipole_position_fix_reaches_loader": seen.get("velocity_file") == "toy_dipole.h5"
+            "dipole_position_fix_reaches_loader": seen.get("velocity_file") == "/toy/toy_dipole.h5"
             and seen.get("velocity_position_fix") is True,
             "capped_davidson_refuses_unwritten": "GATE davidson_converged" in gate
             and "/2 iterations" in gate and written == [],
@@ -240,7 +250,7 @@ def main() -> int:
         return 0
     out = run_cases(mesh)
     checks = {
-        f"1 Davidson (CLI defaults, {N_EIG} + 8 margin roots) CONVERGED, <= {TOL_MEV} meV "
+        f"1 Davidson (deck defaults, {N_EIG} + 8 margin roots) CONVERGED, <= {TOL_MEV} meV "
         "from full-Krylov Lanczos and dense":
             out["davidson_converged"] and out["davidson_roots"] == f"{N_EIG}+8"
             and out["davidson_vs_lanczos_meV"] <= TOL_MEV
@@ -249,13 +259,13 @@ def main() -> int:
             out["capped_davidson_refuses_unwritten"],
         "3 Haydock on the eigensolve's payload == standalone (1e-12)":
             out["haydock_combined_vs_standalone"] <= 1e-12,
-        "4 --lanczos --dipole-position-fix parsed and reaches the loader":
+        "4 dipole_position_fix = true parsed and reaches the loader":
             out["dipole_position_fix_reaches_loader"],
         "5 GATE cpu_davidson_threads: 4 devices refuse on 4 threads, run on 16": out["cpu_threads_gate"],
         f"6 margin locked at 1 meV: CONVERGED, <= {TOL_MEV} meV from dense, fewer H applications":
             out["margin_lock_converged"] and out["margin_lock_vs_dense_meV"] <= TOL_MEV
             and out["margin_lock_matvecs"] < out["davidson_matvecs"],
-        "7 routes (--lanczos alias, --feast explicit), GATE feast_converged (residual, saturation), "
+        "7 routes (feast = true explicit), GATE feast_converged (residual, saturation), "
         "GATE nontda_dense_size before the load":
             out["routes_and_feast_gate"],
     }

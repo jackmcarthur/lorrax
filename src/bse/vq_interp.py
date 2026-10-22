@@ -2426,7 +2426,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=log.debug,
             f"on-grid TILE null would (correctly) refuse it.  Two ways "
             f"forward:\n"
             f"  * set the deck's nval/ncond to the GW run's "
-            f"({zx['nb']} bands total); --n-val/--n-cond still choose the BSE "
+            f"({zx['nb']} bands total); number_val_bands_fine/number_cond_bands_fine still choose the BSE "
             f"window inside it.  The guards also enter the nodal fit, whose "
             f"printed [nodes] metric line says whether that wider state set "
             f"is represented;\n"

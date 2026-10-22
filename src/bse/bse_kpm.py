@@ -421,7 +421,7 @@ def run(args) -> None:
 
     # Omitted --px/--py = the run's canonical square mesh, not 1x1; a given
     # shape must BE that mesh (bse_ring_comm.create_mesh_xy_from_flags).
-    # Reached from bse_jax --kpm-dos, which forwards its own resolved shape.
+    # Reached from bse_jax kpm_dos = true, which forwards its own resolved shape.
     mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
     args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
     restart_file = _find_restart_file(args.input)

@@ -5,10 +5,10 @@ names.  A caller asks for ``n_val``/``n_cond``; this module turns that request
 into a real band range, and every number that leaves it is post-clamp and
 post-guard.  ``resolve_n_occ`` settles where the gap is; the band-degeneracy
 guard keeps a window boundary from cutting a degenerate multiplet — under the
-default ``--band-degeneracy strict`` it REFUSES such a window, and only the
+default ``band_degeneracy = strict`` it REFUSES such a window, and only the
 explicit ``snap`` opt-in widens the request outward
 (:mod:`common.band_degeneracy`); and ``apply_eqp_and_reslice_bands`` re-asks
-both questions on the quasiparticle spectrum when ``--eqp`` moved the
+both questions on the quasiparticle spectrum when ``eqp_corrections`` moved the
 energies.  Nothing else in the BSE is allowed to re-derive a window from an
 array's shape: the shapes carry the mesh PAD, not the bands.
 
@@ -187,9 +187,9 @@ def write_eigenvectors_stream(
     #
     # Two other numbers get mistaken for them and neither belongs in the file:
     #
-    #   * the CLI ``--n-val``/``--n-cond`` REQUEST, which is PRE-guard and so
-    #     can be NARROWER than what was solved whenever ``--band-degeneracy
-    #     snap`` widened it (on the Si deck ``--n-cond 4`` becomes 8).
+    #   * the CLI ``number_val_bands_fine``/``number_cond_bands_fine`` REQUEST, which is PRE-guard and so
+    #     can be NARROWER than what was solved whenever ``band_degeneracy
+    #     = snap`` widened it (on the Si deck ``number_cond_bands_fine = 4`` becomes 8).
     #     Declaring the request created the dataset at the wrong ``nc`` and
     #     the write died part-way, leaving a truncated ``eigenvectors.h5``
     #     behind — worse than writing none.
@@ -254,7 +254,7 @@ def write_eigenvectors_stream(
             f"n_val={n_val} does not fit the eigenvectors' (nc, nv) = "
             f"({_nc_arr}, {_nv_arr}).  Pass the LOADER's resolved counts "
             f"(data['n_cond'] / data['n_val']), not the CLI request — under "
-            f"--band-degeneracy snap the resolved window is the wider one.")
+            f"band_degeneracy = snap the resolved window is the wider one.")
     kpts = _generate_kpts_grid(nkx, nky, nkz)
     nk = kpts.shape[0]
     ns = 1
@@ -299,7 +299,7 @@ def write_eigenvectors_stream(
                     f"not pad: the declared window is narrower than the one "
                     f"that was solved.  Pass the LOADER's resolved counts "
                     f"(data['n_cond'] / data['n_val']) — under "
-                    f"--band-degeneracy snap they exceed the CLI request.")
+                    f"band_degeneracy = snap they exceed the CLI request.")
         c = np.transpose(kept, (2, 0, 1))[:, :, ::-1][..., None]
         return c.real, c.imag
 
@@ -328,7 +328,7 @@ def write_eigenvectors_stream(
     #
     # WHY ``gather_to_host`` AND NOT ``jax.device_get``.  A writer must not
     # depend on a solver's layout to be correct.  Replication holds on the
-    # Lanczos routes but NOT on ``--solver davidson``, which returns ``X`` on
+    # Lanczos routes but NOT on ``solver = davidson``, which returns ``X`` on
     # the solve sharding ``P(None,"x","y",None)``; a bare ``device_get`` died
     # there on every rank at P>1 with "Fetching value for `jax.Array` that
     # spans non-addressable (non process local) devices".  ``bse_lanczos``
@@ -450,14 +450,14 @@ def refuse_eqp_on_a_qp_wfn(input_file: str, eqp_file: str) -> None:
 
     ``write_qp_wfn_h5`` produces a WFN.h5 whose ψ and E are a MATCHED PAIR:
     the rotated orbitals carry the QP eigenvalues that produced the rotation.
-    ``--eqp`` supplies a diagonal ladder written against **DFT band labels**,
+    ``eqp_corrections`` supplies a diagonal ladder written against **DFT band labels**,
     so applying it on top of a QP WFN discards the canonical eigenvalues and
     relabels the rotated orbitals with the mean-field ordering.  Every array
     keeps the right shape, so nothing downstream notices.
 
     Measured on the MoS2 run-82 parent smoke, JID 57269074 step ``.128``:
     ``00_lorrax_gw/exciton_parent_smoke.in:9`` selects ``WFN_qp.h5`` and the
-    wrapper passes ``--eqp eqp1.dat``.  The existing shape guard in
+    wrapper passes ``eqp_corrections = eqp1.dat``.  The existing shape guard in
     ``exciton_bands`` sees this ONLY when a ``bse_k_grid`` densification has
     already moved ψ to a different k axis; without densification the two
     tables are the same size and the overwrite is invisible.
@@ -613,7 +613,7 @@ def apply_eqp_and_reslice_bands(
 
     ``n_val``/``n_cond`` must be the loader-CLAMPED counts (``data['n_val']`` /
     ``data['n_cond']``), not raw CLI requests, or the slice can run out of
-    bounds.  Single-sourced by the sharded --eqp paths (bse_jax._preview_lanczos,
+    bounds.  Single-sourced by the sharded eqp_corrections paths (bse_jax._preview_lanczos,
     absorption_haydock).
 
     Returns ``(eps_v_padded, eps_c_padded, n_occ_eff)``.
@@ -635,13 +635,13 @@ def apply_eqp_and_reslice_bands(
         enk_full_np, n_occ_eff - n_val, n_occ_eff + n_cond,
         tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
         where="apply_eqp_and_reslice_bands (QP-corrected spectrum; re-run "
-              "with a wider --n-val/--n-cond to repair)", log=_log0)
+              "with a wider number_val_bands_fine/number_cond_bands_fine to repair)", log=_log0)
     val_idx = np.arange(n_occ_eff - n_val, n_occ_eff)
     cond_idx = np.arange(n_occ_eff, n_occ_eff + n_cond)
     eps_v = jnp.asarray(enk_full_np[:, val_idx])
     eps_c = jnp.asarray(enk_full_np[:, cond_idx])
     # Signed sentinel, as at the loader seam — this REPLACES data['eps_*'],
-    # so a zero pad here would re-open the wrong-number path after --eqp.
+    # so a zero pad here would re-open the wrong-number path after eqp_corrections.
     eps_v = pad_axis(eps_v, grid_y, axis=1, fill=-PAD_EPS_GUARD_RY).array
     eps_c = pad_axis(eps_c, grid_x, axis=1, fill=PAD_EPS_GUARD_RY).array
     return eps_v, eps_c, n_occ_eff
@@ -678,12 +678,12 @@ def apply_eqp_to_bse_window(data, restart_file: str, eqp_file: str,
         degeneracy_mode=degeneracy_mode, degeneracy_tol_ry=degeneracy_tol_ry)
     if int(data["eps_c"].shape[0]) != int(data["psi_c_X"].shape[0]):
         raise ValueError(
-            "--eqp rebuilt energies on the native restart "
+            "eqp_corrections rebuilt energies on the native restart "
             f"grid ({int(data['eps_c'].shape[0])} k) after bse_k_grid "
             "had already densified the BSE wavefunctions to "
             f"{int(data['psi_c_X'].shape[0])} k.  This would mix coarse "
             "energies with fine-grid psi.  If wfn_file is WFN_qp.h5, "
-            "remove --eqp: that file already carries the canonical QP "
+            "remove eqp_corrections: that file already carries the canonical QP "
             "eigenvalues paired with its rotated wavefunctions.  A "
             "mean-field WFN plus diagonal eqp corrections needs the eqp "
             "ladder applied inside the htransform densification, not "

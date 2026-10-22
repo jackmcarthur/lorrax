@@ -217,7 +217,7 @@ def _require_wfn_fingerprint(value, *, where: str) -> str:
 #: relabels rotated orbitals with someone else's band ordering (measured on
 #: the MoS2 run-82 parent smoke, JID 57269074 step .128; deck
 #: ``exciton_parent_smoke.in:9`` selects ``WFN_qp.h5`` and the wrapper passes
-#: ``--eqp eqp1.dat``).  Until this stamp existed the only discriminator was
+#: ``eqp_corrections = eqp1.dat``).  Until this stamp existed the only discriminator was
 #: the FILENAME, which is not a fact about the contents.
 #:
 #: ABSENT MEANS UNVERIFIABLE, NOT MEAN-FIELD — the same reading the
@@ -844,7 +844,7 @@ def write_qp_wfn_h5(
     # THE FILE SAYS WHAT IT IS.  ψ and E in here are a MATCHED PAIR: the
     # rotated orbitals carry the QP eigenvalues that produced the rotation,
     # and applying a second, DFT-band-labelled QP ladder on top of them
-    # (``exciton_bands --eqp``) silently discards the canonical ones and
+    # (``exciton_bands``' ``eqp_corrections``) silently discards the canonical ones and
     # relabels the rotated orbitals with someone else's ordering.  Nothing on
     # disk could tell a consumer that this WFN.h5 is not mean-field, so the
     # only discriminator available was the filename.  Stamped here, in the one
@@ -1528,10 +1528,12 @@ def _refuse_conflicting_qp_state_sources(
             "by a different version of the QP writer, which is still a "
             "positive QP-state identification rather than permission to "
             "stack another source.")
-    fix = ("Fix: drop --eqp.  To run a mean-field WFN with diagonal QP "
-           "corrections instead, select the mean-field WFN and keep --eqp."
+    fix = ("Fix: drop the QP energy file (the BSE's eqp_corrections or "
+           "eqp_co_corrections, htransform's --eqp-file).  To run a mean-field WFN "
+           "with diagonal QP corrections instead, select the mean-field WFN and keep it."
            if eqp_file else
-           "Fix: drop --qp-rotations and use this QP WFN by itself, or "
+           "Fix: drop the rotation artifact (the BSE's qp_rotations_file, "
+           "htransform's --qp-rotations) and use this QP WFN by itself, or "
            "select the mean-field WFN before applying the rotation artifact.")
     raise ValueError(
         f"{requested} cannot be applied to {wfn_path}: it is already a "

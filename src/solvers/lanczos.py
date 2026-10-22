@@ -14,7 +14,7 @@ Three variants:
 The two JIT-able variants reorthogonalise by **batched classical
 Gram-Schmidt, applied twice** (``cgs2``) — every overlap of a sweep in one
 matrix product, so two collectives per iteration instead of ``j+1``.  It is
-the only route; the basis window ``--n-reorth`` selects is independent of it —
+the only route; the basis window ``lanczos_n_reorth`` selects is independent of it —
 see the route section below ``_block_alpha_stats``.
 
 Every one of them carries the **α-Hermiticity invariant** — see the section
@@ -430,7 +430,7 @@ def _block_alpha_stats(alpha_all):
 # THE SENTINEL, AND THE TRAP IT SETS
 # ----------------------------------
 # ``FULL_REORTH`` (-1) means "the whole basis", the same convention
-# ``bse/bse_jax.py --n-reorth`` and ``bse/exciton_bands.py`` already used.  It
+# ``bse/bse_jax.py lanczos_n_reorth`` and ``bse/exciton_bands.py`` already used.  It
 # is a SENTINEL, not a width, and two consumers below read ``n_reorth`` as a
 # width without checking:
 #
@@ -446,7 +446,7 @@ def _block_alpha_stats(alpha_all):
 # the resolved value.
 
 #: Sentinel: reorthogonalise against the ENTIRE basis built so far.
-#: Same convention as ``bse/bse_jax.py --n-reorth`` and
+#: Same convention as ``bse/bse_jax.py lanczos_n_reorth`` and
 #: ``bse/exciton_bands.py``, so one value means one thing everywhere.
 FULL_REORTH = -1
 
