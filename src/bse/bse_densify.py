@@ -1830,96 +1830,104 @@ def _interpolate_bse_data_to_grid(
     # (head and, in a slab, the G_z channels), which is added back exactly
     # at every fine q (``_srlr_terms``).
     srlr = resolve_w_head_densify(None, params) == "srlr"
-    W_coarse = data["W_q"]
-    # The tile's μ positions, read and receipt-checked ONCE: the embedding, the
-    # srlr model rows and the c1 head phase all take this array.
-    r_mu = w_tile_centroid_frac(wfn, centroids_path, keep, n_rmu,
-                                restart_file=restart_file, log_fn=log_fn)
-    if srlr:
-        if keep is not None:
-            raise ValueError(
-                "GATE srlr_downfold: w_head_densify = srlr on a downfolded "
-                "bundle; want: the native centroid set W0_lr was written in.")
-        A_c, D_c, A_f, D_f = _srlr_terms(
-            restart_file, wfn, sym, meta, params, coarse_grid=coarse_grid,
-            fine_grid=fine_grid, n_rmu=n_rmu, n_rmu_pad=int(W_coarse.shape[0]),
-            mesh_xy=mesh_xy, input_file=input_file, centroid_frac=r_mu,
-            log_fn=log_fn)
-        W_coarse = _add_rank_lr(W_coarse, A_c, D_c, mesh_xy, -1.0)
-    densify_W = make_w_densifier(
-        mesh_xy, P("x", "y", None, None, None), fine_grid, output="k",
-        embedding=w_pair_embedding(coarse_grid, wfn, r_mu,
-                                   int(W_coarse.shape[0]), meta.sys_dim))
-    W_q_fine = densify_W(W_coarse)
-    del W_coarse
-    if srlr:
-        W_q_fine = _add_rank_lr(W_q_fine, A_f, D_f, mesh_xy, 1.0)
-    log_fn(f"[kgrid_fine] W embedded per centroid pair (Wigner-Seitz) in R "
-           f"{coarse_grid[0]}x{coarse_grid[1]}x{coarse_grid[2]}→"
-           f"{fine_grid[0]}x{fine_grid[1]}x{fine_grid[2]} "
-           f"(exact trig-interp; direct term now on the fine grid)"
-           + (" with the SR/LR long-range model split off and re-added"
-              if srlr else ""))
-
-    # ── C1: re-attach W's Γ head, per fine q, on the densified BODY ────────
-    # The loader DEFERRED the rank-1 whead injection when it saw a pending
-    # densification (``_inject_q0_head(defer_whead=True)``), so ``data["W_q"]``
-    # above is the pre-injection body and what the trig interpolant just
-    # handled carried no Kronecker delta.  Now the head goes back on, with a
-    # per-fine-q scalar from the one ratified integrand (gw.head_densify).
-    #
-    # ``head_channel`` is None on the ``legacy`` arm, where the loader injected
-    # as before and the delta went through the interpolant — the documented
-    # defect, kept only so the A/B has a shipped control.
-    q0_head_ry = 0.0
-    if head_channel is None and data.get("q0_head_ry", 0.0):
-        # The loader defers W's head on a densifying run, so a nonzero coarse
-        # diagonal here was normalised on the COARSE N_k and would be dropped
-        # (or mis-scaled) on the fine bundle.
-        raise ValueError(
-            f"GATE densify_q0_head: coarse bundle carries q0_head_ry="
-            f"{data['q0_head_ry']!r} Ry but no head_channel; want 0.  why: "
-            f"the fine bundle would lose or mis-scale the Γ head.  fix: the "
-            f"loader must defer whead on a densifying run.")
-    if head_channel is not None:
-        from gw.head_densify import attach_head_channel
-        from vcoul import CoulombGeometry
-        from .bse_head import q0_head_diagonal
-        geom = CoulombGeometry.from_wfn(wfn)
-        S_fine = build_w_head_channel(
-            wfn, sym, meta, params,
-            coarse_grid=coarse_grid, fine_grid=fine_grid,
-            whead=head_channel["whead"], ref_grid=coarse_grid,
-            input_file=input_file, restart_file=restart_file, geometry=geom,
-            mesh=mesh_xy,
-            gamma_cell=head_channel.get("gamma_cell", "fine"), log_fn=log_fn,
-            static_sample=head_channel.get("static_sample"))
+    def _densified_w():
+        """W on the fine grid and its fine Γ head diagonal ``q0_head_ry``."""
+        W_coarse = data["W_q"]
+        # The tile's μ positions, read and receipt-checked ONCE: the embedding, the
+        # srlr model rows and the c1 head phase all take this array.
+        r_mu = w_tile_centroid_frac(wfn, centroids_path, keep, n_rmu,
+                                    restart_file=restart_file, log_fn=log_fn)
         if srlr:
-            # The model owns the head at every fine q ≠ 0; c1 keeps Γ.
-            S_fine = np.where(np.arange(S_fine.size).reshape(S_fine.shape) == 0,
-                              S_fine, 0.0)
-        # On a "diagonal" bundle Γ leaves the tile: at fine q = 0 the pair
-        # densities are the exact overlaps δ_nn', so its head is the
-        # transition-diagonal constant S(0)/(Ω N_k,fine) (bse_head module
-        # docstring).  A "rank1" bundle keeps it on the tile, as before.
-        S_fine = np.array(S_fine, dtype=np.float64)
-        if head_channel.get("q0_head", "rank1") == "diagonal":
-            q0_head_ry = q0_head_diagonal(
-                S_fine.flat[0], head_channel["cell_volume"],
-                int(np.prod(fine_grid)))
-            S_fine.flat[0] = 0.0
-        W_q_fine = attach_head_channel(
-            W_q_fine, data["g0_X"], data["g0_Y"], S_fine,
-            head_channel["cell_volume"], centroid_frac=r_mu, bvec=geom.bvec)
-        log_fn(f"[kgrid_fine] fine Γ head: q0_head="
-               f"{head_channel.get('q0_head', 'rank1')}, diagonal "
-               f"{q0_head_ry:.8e} Ry (fine q ≠ 0 heads on the W tile)")
-        log_fn("[kgrid_fine] W Γ head re-attached AFTER densification (C1): "
-               "the interpolant saw the body only, and the head is analytic "
-               "at every fine q inside the coarse Γ cell.  This also changes "
-               "the Davidson/FEAST preconditioner diagonal, which reads "
-               "W_q[:,:,0,0,0] directly — correctness-neutral, convergence-"
-               "relevant.")
+            if keep is not None:
+                raise ValueError(
+                    "GATE srlr_downfold: w_head_densify = srlr on a downfolded "
+                    "bundle; want: the native centroid set W0_lr was written in.")
+            A_c, D_c, A_f, D_f = _srlr_terms(
+                restart_file, wfn, sym, meta, params, coarse_grid=coarse_grid,
+                fine_grid=fine_grid, n_rmu=n_rmu, n_rmu_pad=int(W_coarse.shape[0]),
+                mesh_xy=mesh_xy, input_file=input_file, centroid_frac=r_mu,
+                log_fn=log_fn)
+            W_coarse = _add_rank_lr(W_coarse, A_c, D_c, mesh_xy, -1.0)
+        densify_W = make_w_densifier(
+            mesh_xy, P("x", "y", None, None, None), fine_grid, output="k",
+            embedding=w_pair_embedding(coarse_grid, wfn, r_mu,
+                                       int(W_coarse.shape[0]), meta.sys_dim))
+        W_q_fine = densify_W(W_coarse)
+        del W_coarse
+        if srlr:
+            W_q_fine = _add_rank_lr(W_q_fine, A_f, D_f, mesh_xy, 1.0)
+        log_fn(f"[kgrid_fine] W embedded per centroid pair (Wigner-Seitz) in R "
+               f"{coarse_grid[0]}x{coarse_grid[1]}x{coarse_grid[2]}→"
+               f"{fine_grid[0]}x{fine_grid[1]}x{fine_grid[2]} "
+               f"(exact trig-interp; direct term now on the fine grid)"
+               + (" with the SR/LR long-range model split off and re-added"
+                  if srlr else ""))
+
+        # ── C1: re-attach W's Γ head, per fine q, on the densified BODY ────────
+        # The loader DEFERRED the rank-1 whead injection when it saw a pending
+        # densification (``_inject_q0_head(defer_whead=True)``), so ``data["W_q"]``
+        # above is the pre-injection body and what the trig interpolant just
+        # handled carried no Kronecker delta.  Now the head goes back on, with a
+        # per-fine-q scalar from the one ratified integrand (gw.head_densify).
+        #
+        # ``head_channel`` is None on the ``legacy`` arm, where the loader injected
+        # as before and the delta went through the interpolant — the documented
+        # defect, kept only so the A/B has a shipped control.
+        q0_head_ry = 0.0
+        if head_channel is None and data.get("q0_head_ry", 0.0):
+            # The loader defers W's head on a densifying run, so a nonzero coarse
+            # diagonal here was normalised on the COARSE N_k and would be dropped
+            # (or mis-scaled) on the fine bundle.
+            raise ValueError(
+                f"GATE densify_q0_head: coarse bundle carries q0_head_ry="
+                f"{data['q0_head_ry']!r} Ry but no head_channel; want 0.  why: "
+                f"the fine bundle would lose or mis-scale the Γ head.  fix: the "
+                f"loader must defer whead on a densifying run.")
+        if head_channel is not None:
+            from gw.head_densify import attach_head_channel
+            from vcoul import CoulombGeometry
+            from .bse_head import q0_head_diagonal
+            geom = CoulombGeometry.from_wfn(wfn)
+            S_fine = build_w_head_channel(
+                wfn, sym, meta, params,
+                coarse_grid=coarse_grid, fine_grid=fine_grid,
+                whead=head_channel["whead"], ref_grid=coarse_grid,
+                input_file=input_file, restart_file=restart_file, geometry=geom,
+                mesh=mesh_xy,
+                gamma_cell=head_channel.get("gamma_cell", "fine"), log_fn=log_fn,
+                static_sample=head_channel.get("static_sample"))
+            if srlr:
+                # The model owns the head at every fine q ≠ 0; c1 keeps Γ.
+                S_fine = np.where(np.arange(S_fine.size).reshape(S_fine.shape) == 0,
+                                  S_fine, 0.0)
+            # On a "diagonal" bundle Γ leaves the tile: at fine q = 0 the pair
+            # densities are the exact overlaps δ_nn', so its head is the
+            # transition-diagonal constant S(0)/(Ω N_k,fine) (bse_head module
+            # docstring).  A "rank1" bundle keeps it on the tile, as before.
+            S_fine = np.array(S_fine, dtype=np.float64)
+            if head_channel.get("q0_head", "rank1") == "diagonal":
+                q0_head_ry = q0_head_diagonal(
+                    S_fine.flat[0], head_channel["cell_volume"],
+                    int(np.prod(fine_grid)))
+                S_fine.flat[0] = 0.0
+            W_q_fine = attach_head_channel(
+                W_q_fine, data["g0_X"], data["g0_Y"], S_fine,
+                head_channel["cell_volume"], centroid_frac=r_mu, bvec=geom.bvec)
+            log_fn(f"[kgrid_fine] fine Γ head: q0_head="
+                   f"{head_channel.get('q0_head', 'rank1')}, diagonal "
+                   f"{q0_head_ry:.8e} Ry (fine q ≠ 0 heads on the W tile)")
+            log_fn("[kgrid_fine] W Γ head re-attached AFTER densification (C1): "
+                   "the interpolant saw the body only, and the head is analytic "
+                   "at every fine q inside the coarse Γ cell.  This also changes "
+                   "the Davidson/FEAST preconditioner diagonal, which reads "
+                   "W_q[:,:,0,0,0] directly — correctness-neutral, convergence-"
+                   "relevant.")
+        return W_q_fine, q0_head_ry
+
+    # A kernel without the direct term (the loader's ``need_W=False``) has no W
+    # to densify and no screened head: its placeholder rides through unchanged.
+    W_q_fine, q0_head_ry = (_densified_w() if data.get("w_loaded", True)
+                            else (data["W_q"], 0.0))
 
     out = dict(data)
     out.update({

@@ -1659,6 +1659,7 @@ def run(args) -> None:
             mesh_xy=mesh_xy,
             input_file=args.input,
             q0_head="diagonal",       # operands via bse_head.head_shifted_eps_c
+            need_W=not args.rpa,      # local_fields: no W read, rebuilt or kept
         )
 
     use_tda = args.tda

@@ -73,7 +73,10 @@ that control is the off-diagonal $\Sigma - v_{xc}$ alone.
 
 The direct term is always screened. Bare V is never used as W:
 `restart_bundle.read_bse_payload` refuses without a stored W0 or a rebuilt one
-(`GATE bse_requires_screened_w0`).
+(`GATE bse_requires_screened_w0`). A kernel without the direct term
+(`local_fields = true`) loads with `need_W = False`: no W is read, rebuilt or
+kept (the matvec's W slot is a (p_x, p_y, 1, 1, 1) zero tile), the screened
+q = 0 head is not taken, and a bundle without W0 loads.
 
 **Stored W0.** A bundle with `W0_ready = true` is read as it is. Which GW runs
 store it (`gw.screening.driver_persists_w0`, `restart_static_w`):

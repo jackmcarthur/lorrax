@@ -28,6 +28,15 @@ from common.log import get_logger
 log = get_logger(__name__)
 
 
+def no_w_operand(mesh_xy: Mesh) -> jax.Array:
+    """The W slot of a kernel without the screened direct term: a (p_x, p_y, 1, 1, 1)
+    zero tile at ``P('x','y',None,None,None)``.  No matvec reads it (``kernel='rpa'``
+    traces no W term); it only fills the signature, so no W tile is resident."""
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    return jax.jit(lambda: jnp.zeros((px, py, 1, 1, 1), jnp.complex128),
+                   out_shardings=NamedSharding(mesh_xy, P("x", "y", None, None, None)))()
+
+
 def _pad_last_axis(x: jax.Array, target: int) -> jax.Array:
     pad = target - x.shape[-1]
     if pad <= 0:
@@ -133,8 +142,16 @@ def load_bse_data_from_restart_sharded(
     velocity_pair_gap_ev: float = 0.05,
     velocity_position_fix: bool = False,
     q0_head: str = "rank1",
+    need_W: bool = True,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_parent_y/enk_full).
+
+    ``need_W=False`` (a kernel without the screened direct term: the RPA,
+    ``local_fields``) never reads, rebuilds or densifies W: ``data["W_q"]`` is
+    :func:`no_w_operand`, a (p_x, p_y, 1, 1, 1) zero tile in W's sharding that
+    fills the matvec signature's slot, ``data["w_loaded"]`` is False, and the
+    screened q = 0 head is not taken (``whead`` belongs to W).  A bundle with no
+    W0 then loads too.
 
     ``qp_rotations_file`` (``qp_rotations_file``) puts the window in the GW
     run's QP basis (``bse.bse_qp_rotation``): the window is resolved on the
@@ -197,10 +214,11 @@ def load_bse_data_from_restart_sharded(
     nkx, nky, nkz = (int(n) for n in header["grid"])
     n_rmu = header["centroid_count"]
     n_rmu_pad = padded_mu_extent(n_rmu, mesh_xy)
-    w0_ready = header["screened_ready"]
+    # Without the direct term no W is read, and no screened head is taken.
+    w0_ready = header["screened_ready"] and need_W
     screened_w = None
     built_head = None
-    if not w0_ready:
+    if need_W and not w0_ready:
         if header["head_vector"] is None:
             raise ValueError("GATE bse_static_w_head_vector: missing ISDF G=0 vector; regenerate the restart")
         from gw.static_screening import build_static_w_from_restart
@@ -269,8 +287,11 @@ def load_bse_data_from_restart_sharded(
         g0_Y = device_put_process_local(g0, NamedSharding(mesh_xy, P("y")))
     psi_v_X, psi_c_X, V_q0, W_q, V_q_full = read_bse_payload(
         restart_file, input_file, mesh_xy, read_val, read_cond,
-        nohead=use_nohead, full_exchange=load_v_full, screened_w=screened_w)
+        nohead=use_nohead, full_exchange=load_v_full, screened_w=screened_w,
+        screened=need_W)
     screened_w = None                # relaid out as W_q: one W layout survives
+    if not need_W:
+        W_q = no_w_operand(mesh_xy)
     if qp_rotation is not None:
         from .bse_qp_rotation import rotate_window_psi
         psi_v_X, psi_c_X = rotate_window_psi(
@@ -388,6 +409,7 @@ def load_bse_data_from_restart_sharded(
         # densifier replaces q0_head_ry on a "diagonal" bundle.
         "q0_head": q0_head,
         "q0_head_ry": q0_head_ry,
+        "w_loaded": bool(need_W),
     }
 
     # ── kgrid_fine coarse→fine densification ─────────────────────────────

@@ -890,14 +890,17 @@ def read_lr_channels(filename):
 
 
 def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
-                     *, nohead=False, full_exchange=False, screened_w=None):
+                     *, nohead=False, full_exchange=False, screened_w=None,
+                     screened=True):
     """Return canonical BSE ψ faces, Γ exchange and the screened q grid.
 
     A missing stored W is accepted only with an explicit screened body
     from the response owner. Bare V is never used as the direct term.
+    ``screened=False`` (a kernel without the direct term) reads no W and
+    returns ``None`` in its place.
     """
     m = read_metadata(filename)
-    if not m["screened_ready"] and screened_w is None:
+    if screened and not m["screened_ready"] and screened_w is None:
         raise ValueError(
             "GATE bse_requires_screened_w0: missing stored W0 and no "
             "screened body supplied by the static response owner")
@@ -908,7 +911,9 @@ def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
     V0 = read_interaction_gamma(filename, "bare", mesh_xy, nohead=nohead)
     V_full = (read_interaction_qgrid(filename, "bare", mesh_xy, grid, nohead=nohead)
               if full_exchange else None)
-    if screened_w is None:
+    if not screened:
+        W = None
+    elif screened_w is None:
         W = read_interaction_qgrid(filename, "screened", mesh_xy, grid, nohead=nohead)
     else:
         # A rebuilt (q, μ, ν) body: one relayout; the caller drops its copy.
