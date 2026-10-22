@@ -1668,8 +1668,7 @@ def main(argv=None):
 
     ap = build_parser()
     args = ap.parse_args(argv)
-    settings_ap = deck_settings(ap, args)
-    check_solver_flags(settings_ap, args)
+    check_solver_flags(deck_settings(ap, args), args)
 
     report_path = os.path.abspath(
         args.report_file if args.report_file else args.out_prefix + ".out")

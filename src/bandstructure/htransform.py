@@ -446,6 +446,32 @@ class _BasisStateLog:
         return self._log(*args, **kwargs)
 
 
+def _apply_coarse_window(params, args, parser) -> None:
+    """``number_cond_bands_coarse``: the conduction bands the H-transform fits,
+    the deck's ncond plus guard bands (it replaces ``--guard-bands``);
+    ``number_val_bands_coarse`` only warns."""
+    _nc_coarse = str(params.get("number_cond_bands_coarse", "") or "").strip()
+    if _nc_coarse:
+        if args.guard_bands != parser.get_default("guard_bands"):
+            parser.error("number_cond_bands_coarse sets the fitted conduction bands, "
+                         "and so the guard bands; drop --guard-bands")
+        try:
+            args.guard_bands = int(_nc_coarse) - int(params["ncond"])
+        except ValueError:
+            parser.error(f"deck key `number_cond_bands_coarse` takes an integer, "
+                         f"got {_nc_coarse!r}")
+        if args.guard_bands < 0:
+            parser.error(f"number_cond_bands_coarse = {_nc_coarse} is below ncond = "
+                         f"{int(params['ncond'])}, the conduction bands written on the path")
+    if str(params.get("number_val_bands_coarse", "") or "").strip():
+        logger.warning("number_val_bands_coarse has no effect: the H-transform always "
+                       "fits every valence band of the window (nval)",
+                       extra=message(id="number_val_bands_coarse_ignored",
+                                     found=("number_val_bands_coarse",
+                                            str(params["number_val_bands_coarse"])),
+                                     fix="remove number_val_bands_coarse"))
+
+
 def write_fine_grid_bands(params, *, ctilde, B_at_mu, enk_sigma, meta, wfn, mesh_xy,
                           a_band, use_low_mem_eigh, output_path, log):
     """The fine-grid bands of ``get_centroids_fi``, written to ``<stem>_fine.h5``.
@@ -587,28 +613,7 @@ def main(argv=None):
         distrib_la_batched_route = resolve_distrib_la_batched_route(params)
         use_low_mem_eigh = linalg_resolution(params).layout == "distributed"
         n_return_bands = int(params["nval"]) + int(params["ncond"])
-        # number_cond_bands_coarse: the conduction bands the H-transform fits,
-        # the deck's ncond plus guard bands (it replaces --guard-bands).
-        _nc_coarse = str(params.get("number_cond_bands_coarse", "") or "").strip()
-        if _nc_coarse:
-            if args.guard_bands != parser.get_default("guard_bands"):
-                parser.error("number_cond_bands_coarse sets the fitted conduction bands, "
-                             "and so the guard bands; drop --guard-bands")
-            try:
-                args.guard_bands = int(_nc_coarse) - int(params["ncond"])
-            except ValueError:
-                parser.error(f"deck key `number_cond_bands_coarse` takes an integer, "
-                             f"got {_nc_coarse!r}")
-            if args.guard_bands < 0:
-                parser.error(f"number_cond_bands_coarse = {_nc_coarse} is below ncond = "
-                             f"{int(params['ncond'])}, the conduction bands written on the path")
-        if str(params.get("number_val_bands_coarse", "") or "").strip():
-            logger.warning("number_val_bands_coarse has no effect: the H-transform always "
-                           "fits every valence band of the window (nval)",
-                           extra=message(id="number_val_bands_coarse_ignored",
-                                         found=("number_val_bands_coarse",
-                                                str(params["number_val_bands_coarse"])),
-                                         fix="remove number_val_bands_coarse"))
+        _apply_coarse_window(params, args, parser)
     
         # Override WFN file if provided via CLI
         if args.wfn_file is not None:
