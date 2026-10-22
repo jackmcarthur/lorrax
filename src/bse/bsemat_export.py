@@ -1000,7 +1000,8 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
     from vcoul import lr_channels as vc_lr_channels
     from symmetry_maps import read_tables
     from file_io import bgw_bsemat as F
-    from file_io.restart_bundle import _find_restart_file, read_metadata
+    from file_io.restart_bundle import (_find_restart_file, read_metadata,
+                                        refuse_mpa_static_w)
     from file_io.centroids import load_centroids
     from gw.lr_channels import slab_shells
     from .bse_loading import load_bse_data_from_restart_sharded
@@ -1008,6 +1009,7 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
 
     _stage("restart_load")
     restart = _find_restart_file(input_file)
+    refuse_mpa_static_w(restart)                         # GATE bse_mpa_w0
     params = _deck_params(input_file)
     sys_dim = int(params.get("sys_dim", 3))
     if sys_dim == 3 and str(params.get("mc_average_vcoul_body", "false")).lower() in ("true", "1", "yes"):

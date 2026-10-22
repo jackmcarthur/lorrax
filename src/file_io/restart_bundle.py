@@ -716,6 +716,24 @@ def _interaction_dataset(filename, kind, nohead):
     return name
 
 
+def refuse_mpa_static_w(filename) -> None:
+    """``GATE bse_mpa_w0``: a BSE reads W(0), and an MPA restart's is the pole fit's.
+
+    The route is the ``compute_mode`` stamp on ``W0_qmunu``
+    (``gw.gw_output._stamp_screening_diagrams``); a restart written before the
+    stamp passes.  Called by the BSE drivers when they read W, not by the GW
+    restart path, which may reuse an MPA W0 for its own route.
+    """
+    with h5py.File(filename, "r") as f:
+        mode = f["W0_qmunu"].attrs.get("compute_mode") if "W0_qmunu" in f else None
+    if mode is not None and str(np.asarray(mode).astype(str)).lower() == "mpa":
+        raise ValueError(
+            f"GATE bse_mpa_w0: {filename} was written by compute_mode = mpa, so its W(0) "
+            "comes from the MPA pole fit; the BSE needs the static W(0) of a static GW "
+            "run; fix: rerun GW on this deck with compute_mode = cohsex (or gn_ppm, "
+            "hl_ppm) and write_restart_tensors = true, and point the BSE at that restart.")
+
+
 def read_interaction(filename, kind, mesh_xy, *, nohead=False):
     """Return a padded, full-q interaction with P(None, x, y) sharding."""
     return read_munu_tensor_from_h5(

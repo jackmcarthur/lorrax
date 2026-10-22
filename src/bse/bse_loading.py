@@ -214,7 +214,10 @@ def load_bse_data_from_restart_sharded(
 
     from common.collectives import _require_addressable
     _require_addressable(mesh_xy, origin="BSE restart reader")
-    from file_io.restart_bundle import read_metadata, read_bse_payload
+    from file_io.restart_bundle import (read_metadata, read_bse_payload,
+                                        refuse_mpa_static_w)
+    if need_W:
+        refuse_mpa_static_w(restart_file)            # GATE bse_mpa_w0
     header = read_metadata(restart_file)
     enk_full = header["energies"]
     nkx, nky, nkz = (int(n) for n in header["grid"])

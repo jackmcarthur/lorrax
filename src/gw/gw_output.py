@@ -381,13 +381,20 @@ def _stamp_screening_diagrams(tensors_filename: str, config) -> None:
 
     diagrams = getattr(
         getattr(config, "screening", None), "diagrams", None)
-    if diagrams is None:
+    # The route that made W0 travels with it too: an MPA W(0) is the pole
+    # fit's, which the BSE refuses (restart_bundle.refuse_mpa_static_w).
+    mode = getattr(config, "compute_mode", None)
+    if diagrams is None and mode is None:
         return
     if process_rank() == 0:
         with h5py.File(tensors_filename, "a") as f:
             if "W0_qmunu" in f:
-                f["W0_qmunu"].attrs["screening_diagrams"] = str(
-                    getattr(diagrams, "value", diagrams))
+                if diagrams is not None:
+                    f["W0_qmunu"].attrs["screening_diagrams"] = str(
+                        getattr(diagrams, "value", diagrams))
+                if mode is not None:
+                    f["W0_qmunu"].attrs["compute_mode"] = str(
+                        getattr(mode, "value", mode))
     barrier("restart_screening_diagrams_stamp")
 
 
