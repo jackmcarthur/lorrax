@@ -1,6 +1,6 @@
 """The dressed long-range channels of the static W, at every coarse q.
 
-What the SR/LR W densifier (``bse.bse_densify``, ``w_head_densify = srlr``)
+What the SR/LR W densifier (``bse.bse_densify``, srlr, the only W model)
 needs from GW, computed beside the static Dyson solve because χ₀ exists only
 there.  With the long-range channels L of ``vcoul.lr_channels`` (plane waves
 q + G_a, kernel v_a = v(q+G_a)) and the ISDF rows
@@ -220,7 +220,8 @@ def finish(state, W_q):
             "for W0's dressed channel polarizability P at q != 0; want <= 1e-3 "
             "(P <= 0); why: χ₀, V and W disagree (prefactor, kernel or q "
             "rows), so F~ and P would not split this W0.  W0_lr is not "
-            "written; w_head_densify = srlr will refuse on this restart.",
+            "written; a kgrid_fine BSE (srlr W interpolation) will refuse on "
+            "this restart.",
             RuntimeWarning, stacklevel=2)
         return
     basis = state["basis"]
@@ -296,7 +297,7 @@ def fit_model(qc, Ft, P, *, r_mu, S_cart, c0, sys_dim, r_fit):
         raise ValueError(
             f"GATE srlr_fit_points: {sel.size} coarse q inside the fit radius "
             f"{r_fit:.3f} bohr^-1; want >= 2; why: no long-range model can be "
-            "fitted; fix: a denser coarse grid, or w_head_densify = c1.")
+            "fitted; fix: a denser coarse GW grid.")
     deg = MAX_DEG_F
     while deg > 0 and _monomials(qc[:1, :dim], deg, 1.0).shape[1] > sel.size // 2:
         deg -= 1

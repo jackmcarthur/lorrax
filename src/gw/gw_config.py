@@ -1545,10 +1545,11 @@ _DEFAULTS = {
     # every valence band of the window.
     "number_cond_bands_coarse": "",
     "number_val_bands_coarse": "",
-    # Coarse-to-fine W-head treatment.  ``c1`` splits the singular Gamma
-    # head before densification and re-attaches it analytically; ``legacy``
-    # is retained only as the shipped A/B control.
-    "w_head_densify": "c1",
+    # Coarse-to-fine W interpolation.  ``srlr`` (the only model since
+    # 2026-10-22) moves W's long-range part (head and, in a slab, its G_z
+    # channels) into a fitted model the trigonometric interpolant never sees;
+    # ``c1`` and ``legacy`` refuse (runtime.renames.DECK_VALUES).
+    "w_head_densify": "srlr",
     "bare_coulomb_cutoff": None,
     # ζ-sphere cutoff (Ry).  When the writer emits zeta_q_G with per-q
     # WFN.h5-style spheres, this is the cutoff used to define the per-q

@@ -8,9 +8,9 @@ head goes as $v/\varepsilon$ ($1/q^2$ in bulk), and the slab-truncated kernel
 $v(\mathbf K)=\frac{8\pi}{K^2}\big(1-e^{-z_c K_\parallel}\cos K_z z_c\big)$ is
 non-analytic in $|q_\parallel|$ in every out-of-plane channel
 $\mathbf K=\mathbf q+\mathbf G_{ws}+n\mathbf b_3$, with slope
-$8\pi z_c(-1)^n/G_z^2$ at $q\to0$. `w_head_densify = c1` re-attaches only the
-Γ head. `w_head_densify = srlr` moves the whole long-range part of W into a
-fitted model and interpolates the remainder.
+$8\pi z_c(-1)^n/G_z^2$ at $q\to0$. The removed `w_head_densify = c1`
+re-attached only the Γ head. srlr, the only model since 2026-10-22, moves the
+whole long-range part of W into a fitted model and interpolates the remainder.
 
 ## Channels {#channels}
 

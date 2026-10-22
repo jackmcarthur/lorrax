@@ -70,6 +70,9 @@ DECK_VALUES: dict[tuple[str, str, str], str | Rename] = {
     ("gw", "sigma_w_model", "shared_pole"): "tangential",
     ("gw", "bispinor_gw", "full_shared_pole"): "full_tangential",
     ("td", "lorrax.collision_screening", "shared_pole"): "tangential",
+    # 2026-10-22: srlr is the only coarse -> fine W interpolation.
+    ("gw", "w_head_densify", "c1"): Rename("", "srlr is the only model"),
+    ("gw", "w_head_densify", "legacy"): Rename("", "srlr is the only model"),
 }
 
 #: Command-line flags: {(program, old flag): new flag, deck key or Rename}.
@@ -182,6 +185,9 @@ _bse_flags(("bse.exciton_bands",), {
     "--max-iter": "solver_max_iter",
     "--solver": Rename("solver", "values davidson, block_lanczos"),
     "--davidson-tol-mev": "davidson_tol_mev",
+    # 2026-10-22: it picked the Γ cell of the c1 head model, removed with c1.
+    "--w-head-gamma-cell": Rename("", "it tuned the removed c1 head model; srlr is the "
+                                      "only model"),
 })
 # kernel.x's names for the exported kernel (bsemat_cli writes absorption.x's
 # bsemat.h5): deck keys, as kernel.inp's.

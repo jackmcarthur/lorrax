@@ -147,7 +147,7 @@ def _legacy_message(text: str) -> tuple[Message, bool]:
         return Message("WARNING", "centroids_not_orbit_closed",
                        "the centroid set is not closed under the symmetry operations",
                        lines=(match.group(1),)), False
-    match = re.match(r"w_head_densify = c1: the injected head and the S tensor "
+    match = re.match(r"W Γ head: the injected head and the S tensor "
                      r"disagree by (\S+) on (\(.*?\)) \(whead=(\S+), integrand=(\S+) ", body)
     if match:
         return Message(

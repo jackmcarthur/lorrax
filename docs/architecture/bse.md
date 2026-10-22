@@ -163,12 +163,10 @@ used: it is $O(N_k^2)$ against the FFT's $O(N_k \log N_k)$.
 
 `kgrid_fine` densifies the bundle before any solve (`bse.bse_densify`). ψ and
 ε go through one htransform $f(H)$; with `--eqp` its energies are the
-quasiparticle ones, so the fine ε are QP. W's body, with its Γ head removed, is
-embedded in R per centroid pair, at the Wigner–Seitz images of minimal
-|R + L T + r_μ − r_ν| (`common.ws_images`), and the head is re-attached
-analytically at each fine q
-(`w_head_densify = c1`). `w_head_densify = srlr` instead removes a fitted
-model of W's whole long-range part (the screened head and, in a slab, its G_z
+quasiparticle ones, so the fine ε are QP. W is embedded in R per centroid
+pair, at the Wigner–Seitz images of minimal |R + L T + r_μ − r_ν|
+(`common.ws_images`), after the srlr model (the only one since 2026-10-22;
+`w_head_densify = c1` refuses) removes a fitted model of W's whole long-range part (the screened head and, in a slab, its G_z
 channels) before the embedding and adds it back at every fine q, from the
 dressed channels GW stored in `W0_lr`
 ([SR/LR densification](../theory/w-srlr-densification.md)). Both
