@@ -157,13 +157,15 @@ $$
 
 The log prints a short block when the interpolation runs: the coarse and fine grids, the size $N_L$ of $\bG_L$, the fit degrees and residuals, the window radii, and how many coarse and fine $\bq$ used the model and how many were skipped ($w=0$, interpolant only).
 
+On the MoS₂ monolayer, 9×9 to 12×12:
+
 ```text
-W interpolation (srlr): coarse <grid> -> fine <grid>
-  long-range subspace G_L: <N_L> plane wave(s) per q (G = 0, or G_z = -n..n in a slab)
-  fit on <n> coarse q: F~ degree <d> (rel. residual <r>), P degree <d> in q^2 (rel. residual <r>)
-  window w(q): 1 below <r_a>, 0 above <r_b> bohr^-1 (q_ins <q>)
-  model used at <n> of <N> coarse q and <n> of <N> fine q, Gamma exact; skipped (w = 0, interpolant only): <n> coarse q, <n> fine q
-  head kernel <kernel>; S anchor <source>
+W interpolation (srlr): coarse 9x9x1 -> fine 12x12x1
+  long-range subspace G_L: 7 plane wave(s) per q (G_z = -3..3)
+  fit on 60 coarse q: F~ degree 4 (rel. residual 0.0748), P degree 3 in q^2 (rel. residual 0.0309)
+  window w(q): 1 below 0.2022, 0 above 0.5460 bohr^-1 (q_ins 0.6067)
+  model used at 60 of 81 coarse q and 108 of 144 fine q, Gamma exact; skipped (w = 0, interpolant only): 20 coarse q, 35 fine q
+  head kernel point; S anchor restart head tensor (isdf_tensors_1198.h5)
 ```
 
 
@@ -268,15 +270,14 @@ The densification runs in the BSE loader whenever the deck's `kgrid_fine` differ
 The measurements below come from development runs recorded in the code and its documents, not from a release benchmark.
 {: .intro }
 
-A static Dyson GW run on silicon (`compute_mode = cohsex`, 1100 orbit-closed centroids, `mc_average_vcoul_body = false`) supplied $W$ for a Lanczos BSE on the 8×8×8 grid, with the same quasiparticle energies in every arm. The control used the native 8×8×8 $W$, and the other two arms a 4×4×4 $W$ densified to 8×8×8 by each route.
+Static Dyson GW runs (`compute_mode = cohsex`) supplied $W$ on a coarse grid; the BSE (TDA, 8 valence × 8 conduction bands, the same quasiparticle energies in every arm) ran on the fine grid with $W$ interpolated by `srlr`, and is compared with a BSE on $W$ computed directly on the fine grid. The table gives the lowest 40 exciton energies against that direct run, rerun on 2026-10-22 with the BerkeleyGW deck keys (identical to the 2026-10-20 runs to 0.001 meV).
 
-| Arm | $\Omega_1$ (eV) | $\Omega_1-\Omega_1^{\mathrm{native}}$ (meV) | $\Omega_9$ (eV) | $\Omega_9-\Omega_9^{\mathrm{native}}$ (meV) |
-|---|---|---|---|---|
-| native 8×8×8 $W$ | 2.96238 | 0 | 2.98867 | 0 |
-| 4×4×4 → 8×8×8, `c1` | 2.97001 | +7.63 | 2.99950 | +10.83 |
-| 4×4×4 → 8×8×8, `srlr` | 2.96814 | +5.76 | 2.99659 | +7.92 |
+| System, grids | $\Omega_1$ direct (eV) | `srlr`: mean abs. offset, mean (meV) | removed `c1` (meV) | BerkeleyGW direct (meV) | BerkeleyGW dual grid (meV) |
+|---|---|---|---|---|---|
+| Si with SOC, 4×4×4 → 8×8×8 | 2.96915 | 1.41, +1.41 | — | 0.37 | +36.97 |
+| MoS₂, 9×9 → 12×12 | 2.91743 | 2.65, +0.42 | 10.55 | 1.90 | −178.7 |
 
-`srlr` removes about a quarter of the `c1` error here. The runs predate the change of 2026-10-20 to the per-pair image placement of §4.2, which moved the Si 4×4×4 → 8×8×8 $W$ body by 19–27 % on the first three off-grid shells, so the numbers will change. On the MoS₂ monolayer, densified from 9×9 to 12×12 with `srlr`, the absorption $\varepsilon_2$ is within 2.0 % rms of the direct 12×12 peak.
+BerkeleyGW direct is its absorption on the directly computed fine-grid kernel, and BerkeleyGW dual grid its own coarse-to-fine kernel interpolation from the same coarse grid; both columns are mean absolute offsets from the LORRAX direct run. On the Si 4×4×4 → 8×8×8 arm `srlr` fits 26 coarse $\bq$ with $N_L = 1$; on MoS₂ it fits 60 with $N_L = 7$.
 
 ## Notation {: #notation }
 
