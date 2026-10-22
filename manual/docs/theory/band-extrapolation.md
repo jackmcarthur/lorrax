@@ -40,7 +40,7 @@ $\Sigma^x$ sums over occupied bands only and has no empty-band tail. The $\chi^0
 `band_extrapolation_is_consumable`
 {: .in-code }
 
-The pole-sum Σ executors consume it: `gn_ppm`, `hl_ppm` and scalar `mpa` (elementwise or shared pole), and both bispinor shared-pole routes, where only the charge–charge class of $\Sigma^c$ is extrapolated. Static stages (`cohsex`, `x_only`) and a bispinor MPA fit do not: on a static Coulomb hole the band limit anti-converges. An unset key disables itself there with a log line; an explicit `use_band_extrapolation = true` refuses unless another stage of the run consumes it.
+The pole-sum Σ executors consume it: `gn_ppm`, `hl_ppm` and scalar `mpa` (elementwise or tangential), and both bispinor tangential routes, where only the charge–charge class of $\Sigma^c$ is extrapolated. Static stages (`cohsex`, `x_only`) and a bispinor MPA fit do not: on a static Coulomb hole the band limit anti-converges. An unset key disables itself there with a log line; an explicit `use_band_extrapolation = true` refuses unless another stage of the run consumes it.
 
 ### <span class="n">1.4</span> Other corrections of the same truncation {: #trunc-compare }
 
@@ -265,14 +265,14 @@ $\hat\Sigma^c$ replaces $\Sigma^c(N_3)$ everywhere downstream: the $\bq\to0$ hea
 
 ### <span class="n">5.4</span> Measured {: #ex-measured }
 
-Si 4³, scalar, 25 Ry, one-shot shared-pole $W$, against the complete basis (536 bands); eqp0 errors over the 71 multiplet-closed states within ±10 eV of midgap (standard deviation / maximum / gap). With $W$ complete and $G$ truncated at $N$, which isolates the extrapolation:
+Si 4³, scalar, 25 Ry, one-shot tangential $W$, against the complete basis (536 bands); eqp0 errors over the 71 multiplet-closed states within ±10 eV of midgap (standard deviation / maximum / gap). With $W$ complete and $G$ truncated at $N$, which isolates the extrapolation:
 
 | $N$ | No extrapolation | Extrapolated |
 |---|---|---|
 | 78 | 29.2 / 68 / −90 meV | 9.0 / 27 / −2.6 meV |
 | 64–142 | — | std ≤ 12.6 meV, \|gap\| ≤ 10.7 meV |
 
-Five cutoffs in place of three give the same numbers at $N=78$. With $W$ also truncated at $N$ (a production run), the extrapolation opens the gap by 13–23 meV; the remaining error is $W$'s ([GW driver](../drivers/gw/index.md#accuracy)). On the four-current route (Fe 4³, `full_shared_pole`, 36 bands) the CC tail moves eqp0 within $E_F\pm10$ eV by a median of 342 meV; extrapolating every class instead of CC alone changes eqp0 by at most 0.08 meV. The scalar model has been measured on silicon only.
+Five cutoffs in place of three give the same numbers at $N=78$. With $W$ also truncated at $N$ (a production run), the extrapolation opens the gap by 13–23 meV; the remaining error is $W$'s ([GW driver](../drivers/gw/index.md#accuracy)). On the four-current route (Fe 4³, `full_tangential`, 36 bands) the CC tail moves eqp0 within $E_F\pm10$ eV by a median of 342 meV; extrapolating every class instead of CC alone changes eqp0 by at most 0.08 meV. The scalar model has been measured on silicon only.
 
 ## <span class="n">6</span> Keys and outputs {: #keys }
 

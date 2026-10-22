@@ -272,7 +272,7 @@ isdf_tensors_<N_σ>.h5
     [child_unfold_tables/]       sym_perm, L_table, q_irr_full_idx; @covariance_verdict, @covariance_tol
 ```
 
-Not copied from the parent: `zeta_fit_windows` (the BSE falls back on `band_window`), `charge_zeta_identity`, `@charge_representation`, the transverse (bispinor) family, `W0_lr/` (so `w_head_densify = srlr` refuses on a downfolded bundle), `@screening_diagrams` and the shared-pole members. `W0_qmunu` is written directly, with `W0_ready` true.
+Not copied from the parent: `zeta_fit_windows` (the BSE falls back on `band_window`), `charge_zeta_identity`, `@charge_representation`, the transverse (bispinor) family, `W0_lr/` (so `w_head_densify = srlr` refuses on a downfolded bundle), `@screening_diagrams` and the tangential members. `W0_qmunu` is written directly, with `W0_ready` true.
 
 ### Transported ζ {: #zeta }
 

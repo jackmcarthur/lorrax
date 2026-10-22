@@ -183,7 +183,7 @@ $2(\bk+\bG)$ acts on all four components, $V^{\mathrm{NL}}$ on the two large one
 ### `bispinor_gw` {: .kw data-type="enum" data-default="bare_transverse" }
 Four-current screening model; here only checked: `full_static_cohsex` refuses without `bispinor = true`.
 
-`bare_transverse` `full_shared_pole` `full_static_cohsex`
+`bare_transverse` `full_tangential` `full_static_cohsex`
 {: .kw-values }
 
 ### `linalg` {: .kw data-type="enum" data-default="local" }

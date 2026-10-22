@@ -43,7 +43,7 @@ restart bundle, `qp_wfn_rotations.h5`
 #### Read by
 
 [bse](../bse/index.md)
-:   restart bundle; `eqp1.dat` (`--eqp`) or `WFN_qp.h5` as its WFN; `tmp/zeta_q.h5` for a $W(0)$ rebuild
+:   restart bundle; `eqp1.dat` (`eqp_corrections`) or `WFN_qp.h5` as its WFN; `tmp/zeta_q.h5` for a $W(0)$ rebuild
 
 [exciton-bands](../exciton-bands/index.md)
 :   restart bundle; `tmp/zeta_q.h5` for $V_\bq$ interpolation
@@ -78,13 +78,13 @@ File formats are on the [Files](files.md) page.
     **and matching** this run's provenance JSON (WFN path spelling, a q-wedge equivalence and legacy keys at their legacy values excepted), the stored centroid table element by element, and the ζ dataset's $N_\mu$. The WFN is identified by resolved path and byte size. Device count is not in the provenance, so a fit at one process count is reused at another.<br>
     <span class="refuse">Refits on miss, per channel. `LORRAX_FORCE_REFIT=1` forces a refit.</span>
 
-!!! cache "tmp/mpa/&lt;label&gt;_shared_pole/"
+!!! cache "tmp/mpa/&lt;label&gt;_tangential/"
     **Reused when** a QSGW map finds its own committed `model.h5`, or a complete response bank of the same identity and the same $V_\bq$ digest<br>
     **and matching** the map identity: Hamiltonian, wavefunctions, energies, occupations, centroids, recipe and WFN.<br>
-    <span class="refuse">Rebuilds a partial directory. A complete one-shot model refuses (`GATE shared_pole_output`): use its restart member or a fresh run directory.</span>
+    <span class="refuse">Rebuilds a partial directory. A complete one-shot model refuses (`GATE tangential_output`): use its restart member or a fresh run directory.</span>
 
 !!! cache "tmp/sigma_checkpoint_oneshot_on_shell.h5, tmp/sigma_checkpoint_oneshot.h5"
-    **Reused when** `restart = true` on a one-shot shared-pole run (the `_on_shell` file; the other under `sigma_omega_grid_debug = true`)<br>
+    **Reused when** `restart = true` on a one-shot tangential run (the `_on_shell` file; the other under `sigma_omega_grid_debug = true`)<br>
     **and matching** the identity hash of the $W$ digest, head, energies, options and bands, and on shell the evaluation tables and covered range.<br>
     <span class="refuse">Deleted and recomputed.</span>
 

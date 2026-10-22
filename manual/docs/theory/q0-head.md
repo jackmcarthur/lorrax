@@ -50,7 +50,7 @@ The pair sum runs over the χ⁰ band manifold, up to `number_bands_chi` (defaul
 `fold_cartesian_head_wings_sharded`
 {: .in-code }
 
-The wings $Y^a(\br_\mu;z)$ and $Z^b(\br_\nu;z)$ have one velocity leg and one pair-density leg $\psi^*_{m\bk}(\br_\mu)\psi_{n\bk}(\br_\mu)$. Eliminating the body from the bordered Dyson equation, against the headless Γ body $W^{\mathrm{body}}_\Gamma(\mu,\nu;z)$ (the Γ row of the Dyson solve, or the [shared-pole](shared-pole-w.md) store evaluated at Γ), gives the head with local fields:
+The wings $Y^a(\br_\mu;z)$ and $Z^b(\br_\nu;z)$ have one velocity leg and one pair-density leg $\psi^*_{m\bk}(\br_\mu)\psi_{n\bk}(\br_\mu)$. Eliminating the body from the bordered Dyson equation, against the headless Γ body $W^{\mathrm{body}}_\Gamma(\mu,\nu;z)$ (the Γ row of the Dyson solve, or the [tangential](tangential-w.md) store evaluated at Γ), gives the head with local fields:
 
 $$
 \chi_{00}(\bq,z)=q_aS^{\mathrm{eff}}_{ab}(z)\,q_b,\qquad
@@ -65,7 +65,7 @@ The product $Y W^{\mathrm{body}}_\Gamma Z$ is contracted over $(\mu,\nu)$. `head
 | `no_local_fields` | $S$ alone, no wings and no fold (the direct head) | metals on four-current decks; comparison |
 | `off` | no head: $\bar v_{00}=\bar W_{00}=0$ | debugging brute-force k convergence |
 
-Under `bispinor_gw = full_shared_pole` an unset `head_correction` resolves to `no_local_fields`, and an explicit `full` refuses. On a time-reversal-broken (ordered) shared-pole store `full` folds the signed Γ body $b\,D_+b^\dagger-[b\,D_-b^\dagger]^{\mathsf T}$, $D_\pm(z)=1/(z\mp\Omega)$, against wings summed over both orders of every band pair; on an ordered metal `full` refuses (`GATE shared_pole_head_ordered`) and `no_local_fields` is the route. The retired `do_G0` maps `false` to `off` and `true` to `full`. The four-current routes carry further Lorentz channels; this page covers the scalar charge head.
+Under `bispinor_gw = full_tangential` an unset `head_correction` resolves to `no_local_fields`, and an explicit `full` refuses. On a time-reversal-broken (ordered) tangential store `full` folds the signed Γ body $b\,D_+b^\dagger-[b\,D_-b^\dagger]^{\mathsf T}$, $D_\pm(z)=1/(z\mp\Omega)$, against wings summed over both orders of every band pair; on an ordered metal `full` refuses (`GATE tangential_head_ordered`) and `no_local_fields` is the route. The retired `do_G0` maps `false` to `off` and `true` to `full`. The four-current routes carry further Lorentz channels; this page covers the scalar charge head.
 
 ### <span class="n">1.4</span> Where the head response comes from {: #sources }
 
@@ -151,9 +151,9 @@ The head is sampled on the body's frequency plan. Its samples, its model and the
 | GN-PPM | $0$, $i\omega_p$ | one pole, two-point fit | $0$, $i\omega_p$ |
 | HL-GPP | $0$ | one pole, f-sum rule | $0$, $\omega_p$ |
 | MPA | the body's $2n_p$ complex samples | $n_p$ poles, static sample exact | $0$ |
-| shared pole | its own $2n_p$-point MPA plan, the shared-pole Γ body evaluated there | $n_p$ poles, static sample exact | $0$ |
+| tangential | its own $2n_p$-point MPA plan, the tangential Γ body evaluated there | $n_p$ poles, static sample exact | $0$ |
 
-$\omega_p$ is `ppm_omega_p` (default `2.0` Ry) and $n_p$ is `mpa_n_poles` (default `8`). The MPA samples lie on two lines $z_s=\omega_s+i\varpi$ with heights `mpa_varpi_near_ry` and `mpa_varpi_far_ry` (defaults `0.2`, `2.0` Ry). On the elementwise MPA route the head refuses a grid different from the body's, because head and body residues are summed in one Σ. Under `sigma_w_model = shared_pole` the body has no such grid: the head builds the same double-parallel plan from the `mpa_*` keys on the recipe's energy span, which is why those keys stay legal there while the head is on. The treatments themselves are on [Frequency treatments of Σ](frequency-treatments.md).
+$\omega_p$ is `ppm_omega_p` (default `2.0` Ry) and $n_p$ is `mpa_n_poles` (default `8`). The MPA samples lie on two lines $z_s=\omega_s+i\varpi$ with heights `mpa_varpi_near_ry` and `mpa_varpi_far_ry` (defaults `0.2`, `2.0` Ry). On the elementwise MPA route the head refuses a grid different from the body's, because head and body residues are summed in one Σ. Under `sigma_w_model = tangential` the body has no such grid: the head builds the same double-parallel plan from the `mpa_*` keys on the recipe's energy span, which is why those keys stay legal there while the head is on. The treatments themselves are on [Frequency treatments of Σ](frequency-treatments.md).
 
 ### <span class="n">3.2</span> The fit {: #poles-fit }
 
@@ -166,7 +166,7 @@ $$
 \bar W_{00}(z)=\bar v_{00}+\sum_jR_j\left[\frac{1}{z-\Omega_j}-\frac{1}{z+\Omega_j}\right],\qquad \mathrm{Im}\,\Omega_j<0 \tag{3.1}
 $$
 
-MPA and shared-pole runs fit $n_p$ poles to $2n_p$ samples, then re-solve the residues with the sample nearest $z=0$ as an equality constraint, because that sample alone fixes the on-shell head (§4.3). The negative imaginary parts of $\Omega_j$ are the time-ordered $i\eta$; no further broadening is added.
+MPA and tangential runs fit $n_p$ poles to $2n_p$ samples, then re-solve the residues with the sample nearest $z=0$ as an equality constraint, because that sample alone fixes the on-shell head (§4.3). The negative imaginary parts of $\Omega_j$ are the time-ordered $i\eta$; no further broadening is added.
 
 GN-PPM fits one pole to the two samples $0$ and $i\omega_p$. HL-GPP takes its pole from the f-sum rule, with $N_e$ the WFN electron count:
 
@@ -216,7 +216,7 @@ $$
 +\sum_jR_j\Big[\frac{1-f_{n\bk}}{\omega-E_{n\bk}-\Omega_j}+\frac{f_{n\bk}}{\omega-E_{n\bk}+\Omega_j}\Big]\Big\},\qquad \mathrm{Im}\,\Omega_j<0 \tag{4.3}
 $$
 
-$\omega$ and $E_{n\bk}$ are measured from $E_F$. On MPA and shared-pole runs the fitted widths $-\mathrm{Im}\,\Omega_j$ play the role of $\eta$; the plasmon-pole head takes $\Omega_h-10^{-6}i$ Ry. Neither uses `sigma_regularization_ev`, the body's $\eta$. At $\omega=E_{n\bk}$ the correlation part is $(\tfrac12-f_{n\bk})\,\bar W^c_{00}(0)/(V_{\mathrm{cell}}N_k)$ for any pole model, which is why the fit reproduces the static sample exactly. The pole sum is evaluated analytically and added to the Σ body at finalize, outside the body's frequency quadrature.
+$\omega$ and $E_{n\bk}$ are measured from $E_F$. On MPA and tangential runs the fitted widths $-\mathrm{Im}\,\Omega_j$ play the role of $\eta$; the plasmon-pole head takes $\Omega_h-10^{-6}i$ Ry. Neither uses `sigma_regularization_ev`, the body's $\eta$. At $\omega=E_{n\bk}$ the correlation part is $(\tfrac12-f_{n\bk})\,\bar W^c_{00}(0)/(V_{\mathrm{cell}}N_k)$ for any pole model, which is why the fit reproduces the static sample exactly. The pole sum is evaluated analytically and added to the Σ body at finalize, outside the body's frequency quadrature.
 
 !!! note
     The code's MPA residue `B_p` is $R_j$. Its PPM `R_h` is the residue $R_h$ of (3.2), and its `B_h` is $2\Omega_hR_h=-\bar W^c_{00}(0)\,\Omega_h^2$.
@@ -284,7 +284,7 @@ where `vcoul`($\bq_0$) is row 1 of BerkeleyGW's sigma-side table. An override ap
 
 ### <span class="n">6.2</span> BerkeleyGW's q₀ emulation {: #bgw-q0 }
 
-`bgw_metal_q0_treatment = bgw_q0shift` (default `exact`) takes $\bar v_{00}$ from the analytic inscribed sphere plus the outer Monte Carlo estimator, and the $W$ head from a finite shifted-$\bq_0$ Dyson row at `bgw_metal_q0_vector` (default `0 0 0.125`, reduced coordinates; nonzero and on the k grid). It requires `compute_mode = mpa` and `sys_dim = 3`, sets `mc_average_vcoul_body = false`, and the shared-pole head refuses it.
+`bgw_metal_q0_treatment = bgw_q0shift` (default `exact`) takes $\bar v_{00}$ from the analytic inscribed sphere plus the outer Monte Carlo estimator, and the $W$ head from a finite shifted-$\bq_0$ Dyson row at `bgw_metal_q0_vector` (default `0 0 0.125`, reduced coordinates; nonzero and on the k grid). It requires `compute_mode = mpa` and `sys_dim = 3`, sets `mc_average_vcoul_body = false`, and the tangential head refuses it.
 
 ### <span class="n">6.3</span> The epshead source {: #bgw-epshead }
 

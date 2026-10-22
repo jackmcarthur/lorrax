@@ -1,8 +1,8 @@
-"""Numerical check of the equations on docs/theory/shared-pole-w.md (sections 2-5 and 7).
+"""Numerical check of the equations on docs/theory/tangential-w.md (sections 2-5 and 7).
 
 Small random realizations in double precision. Each check prints its worst
 relative defect, and all of them should be at round-off (below 1e-9). Run from the site root:
-    _tools/plotenv/bin/python -B figures_src/shared-pole/check_loewner.py
+    _tools/plotenv/bin/python -B figures_src/tangential/check_loewner.py
 """
 import numpy as np
 from scipy.linalg import eigh

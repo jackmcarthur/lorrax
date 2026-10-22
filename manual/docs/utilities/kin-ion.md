@@ -143,7 +143,7 @@ Four-component run. Stamped; GW refuses a file whose stamp differs.
 ### `bispinor_gw` {: .kw data-type="enum" data-default="bare_transverse" }
 Four-current screening model; here only checked: `full_static_cohsex` refuses without `bispinor = true`.
 
-`bare_transverse` `full_shared_pole` `full_static_cohsex`
+`bare_transverse` `full_tangential` `full_static_cohsex`
 {: .kw-values }
 
 ## Output format {: #output }

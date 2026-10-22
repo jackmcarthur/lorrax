@@ -42,14 +42,15 @@ Every key, with its default, is listed by `python -m gw.epsmat_cli --print-schem
 ## BSE kernel {: #bsemat }
 
 ```
-python -m bse.bsemat_cli -i ../gw/gw.in --wfn-co WFN_co.h5 --n-val 4 --n-cond 4 -o bsemat.h5
+# deck keys in the -i deck: number_val_bands_fine = 4, number_cond_bands_fine = 4
+python -m bse.bsemat_cli -i ../gw/gw.in --wfn-co WFN_co.h5 -o bsemat.h5
 ```
 
 The file holds the direct and exchange kernels of the static BSE on the coarse grid, in BerkeleyGW 4.0 layout. `absorption.x` reads it in place of `kernel.x`'s output. `--wfn-co` is the explicit full-grid coarse WFN that absorption reads (`no_symmetries_coarse_grid`). The kernel is written in that file's coefficient gauge and k order, so BerkeleyGW's interpolation to the fine grid applies unchanged.
 
 - `--bgw-eps epsmat.h5` places the $\bq=0$ head exactly as `kernel.x` does at zone-boundary ties.
-- `--kernel extended` writes every band block, for absorption beyond the Tamm–Dancoff approximation.
-- `--exciton-Q Q1 Q2 Q3` writes the finite-momentum kernel of the pairs $|v\,\mathbf k-\mathbf Q,\,c\,\mathbf k\rangle$.
+- `extended_kernel = true` writes every band block, for absorption beyond the Tamm–Dancoff approximation.
+- `exciton_Q_shift Q1 Q2 Q3` writes the finite-momentum kernel of the pairs $|v\,\mathbf k-\mathbf Q,\,c\,\mathbf k\rangle$.
 - Several values of `--kernel`, `--gauge`, `--q0-body` or `--mu-small` write one file each from a single load.
 
 ## What carries over {: #interop }

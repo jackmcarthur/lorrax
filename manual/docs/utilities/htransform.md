@@ -188,7 +188,7 @@ Diagonal QP: the window's $E_{n\bk_{\mathrm{co}}}$ are replaced by the GW run's 
 The states are unchanged, so off-diagonal QP mixing is absent. A missing or unparsable file refuses.
 {: .kw-details }
 
-### `--qp-rotations` {: .kw data-type="path" data-default="none" }
+### `qp_rotations_file` {: .kw data-type="path" data-default="none" }
 Full QP Hamiltonian from `qp_wfn_rotations.h5`: $f(H^{\mathrm{QP}})=U\,f(E^{\mathrm{QP}})\,U^\dagger$ in the same DFT basis.
 
 The QP block must lie inside the fitted window, start at its lower edge and contain the returned window; source-WFN fingerprint, bands, grid and $\bk$ coordinates must match.
@@ -303,7 +303,7 @@ galerkin_dft.h5
     - `htransform_qr_eps` outside (0, 1); `htransform_rank_multiplier` in (0, 1); `htransform_qrcp_seed` outside uint32.
     - `--eqp-file` together with `--qp-rotations`, or either with a QP WFN (`-wfn WFN_qp.h5`).
     - An `--eqp-file` that is missing or not a wedge `eqp1.dat`.
-    - A `--qp-rotations` file whose QP block does not start at the fitted window's lower edge inside it, or whose WFN fingerprint, bands, grid or $\bk$ coordinates differ.
+    - A `qp_rotations_file` file whose QP block does not start at the fitted window's lower edge inside it, or whose WFN fingerprint, bands, grid or $\bk$ coordinates differ.
     - A deck without `sys_dim`, or with an unknown key.
 
 The refusals of the path and of the fine grid are on their own pages.

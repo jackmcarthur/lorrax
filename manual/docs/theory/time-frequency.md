@@ -150,10 +150,10 @@ For Σ:
 
 For χ⁰:
 
-- Each term is an exponential in a transition energy $\Delta=E_c-E_v$ between the gap and the largest transition of the band window. It decays at imaginary times and is damped at the complex or real times used for the shared-pole and multipole samples.
-- The result is needed at a few fixed frequencies, namely $z=0$, a plasmon-pole probe, the multipole sample lines or the shared-pole supports.
+- Each term is an exponential in a transition energy $\Delta=E_c-E_v$ between the gap and the largest transition of the band window. It decays at imaginary times and is damped at the complex or real times used for the tangential and multipole samples.
+- The result is needed at a few fixed frequencies, namely $z=0$, a plasmon-pole probe, the multipole sample lines or the tangential supports.
 - A gapped system needs no broadening on the imaginary axis, and on a sample line $z=\omega+i\varpi$ the height $\varpi$ acts as one.
-- The accuracy target is an absolute $\varepsilon_\chi=10^{-6}$ Ry⁻¹, tighter on the shared-pole route.
+- The accuracy target is an absolute $\varepsilon_\chi=10^{-6}$ Ry⁻¹, tighter on the tangential route.
 
 The keys that set these numbers are collected in §[6](#frame).
 
@@ -294,7 +294,7 @@ Semicore states far below the read region are read on coarse windows of their ow
 
 ## <span class="n">5</span> The response transform {: #response }
 
-As noted in §2.5, χ⁰ is needed only at a few fixed frequencies, and its rules follow from the samples LORRAX takes of $W$ ([Frequency treatments](frequency-treatments.md)). At $z=0$, which serves the static $W$ and the start of the multipole lines, χ⁰ takes the minimax rule of §3 at imaginary times, with about ten nodes. A plasmon-pole probe on the imaginary axis takes a rule of the same kind, and a real-axis probe above every transition takes two of them. On the production shared-pole route all supports share one set of complex times, so each node is one Green-function product serving every sample. The multipole sample lines are damped by their height, at least 0.2 Ry, so a resolution-limited real-time rule of the kind in §2.3 is practical there. Details are in §[7](#laplace) and [Tangential W model §6.2](shared-pole-w.md#bank-times), and the node loop in [Parallel algorithms §4](parallel-algorithms.md#par-time).
+As noted in §2.5, χ⁰ is needed only at a few fixed frequencies, and its rules follow from the samples LORRAX takes of $W$ ([Frequency treatments](frequency-treatments.md)). At $z=0$, which serves the static $W$ and the start of the multipole lines, χ⁰ takes the minimax rule of §3 at imaginary times, with about ten nodes. A plasmon-pole probe on the imaginary axis takes a rule of the same kind, and a real-axis probe above every transition takes two of them. On the production tangential route all supports share one set of complex times, so each node is one Green-function product serving every sample. The multipole sample lines are damped by their height, at least 0.2 Ry, so a resolution-limited real-time rule of the kind in §2.3 is practical there. Details are in §[7](#laplace) and [Tangential W model §6.2](tangential-w.md#bank-times), and the node loop in [Parallel algorithms §4](parallel-algorithms.md#par-time).
 
 ---
 
@@ -316,10 +316,10 @@ Each consumer of a frequency kernel has its own rule, certified in its own error
 | GN probe rule (§[7.2](#probes)) | GN-PPM at $i\omega_p$ | imaginary | `minimax_target_error`, relative | fixed ceiling of 64 |
 | two $1/y$ rules (§[7.3](#probes-hl)) | HL-GPP at real $\omega_p>\Delta_{\max}$ | imaginary, both signs | `minimax_target_error`, absolute | `minimax_max_nodes` |
 | damped-line rule (§[7.4](#mpa-lines)) | elementwise MPA line points | real | `minimax_target_error`, relative to $1/\varpi$ | `minimax_max_nodes` per panel order |
-| shared complex-time rule ([Tangential W model §6.2](shared-pole-w.md#bank-times)) | every shared-pole support | complex | [`sigma_w_accuracy`](../drivers/gw/keywords.md#sigma_w_accuracy): `bank_rule_tolerance` $10^{-8}$ (`production`) or $10^{-7}$ (`relaxed`) | 192 per shared set |
+| shared complex-time rule ([Tangential W model §6.2](tangential-w.md#bank-times)) | every tangential support | complex | [`sigma_w_accuracy`](../drivers/gw/keywords.md#sigma_w_accuracy): `bank_rule_tolerance` $10^{-8}$ (`production`) or $10^{-7}$ (`relaxed`) | 192 per shared set |
 | sector rule or near-resonance rule (§[9](#sigma-boxes)) | every Σ window | complex | [`sigma_quadrature_eps`](../drivers/gw/keywords.md#sigma_quadrature_eps) ($10^{-4}$, or $5\times10^{-4}$ under `relaxed`) | none |
 
-The Σ windows also read [`sigma_regularization_ev`](../drivers/gw/keywords.md#sigma_regularization_ev) (the broadening $\eta$, 0.25 eV) and [`sigma_window_edge_factor`](../drivers/gw/keywords.md#sigma_window_edge_factor) (the state edge $1.5\,\eta$). [`minimax_energy_reference`](../drivers/gw/keywords.md#minimax_energy_reference) (`midgap`) sets the energy zero of the static and probe χ⁰ rules, from which it cancels. It accepts `midgap`, `vbm`, `cbm` and `none` (aliases `raw`, `zero`), and any other value, including a number, refuses. The shared-pole route reads neither `minimax_target_error` nor `minimax_max_nodes`, although the static rule is still built on every screened route.
+The Σ windows also read [`sigma_regularization_ev`](../drivers/gw/keywords.md#sigma_regularization_ev) (the broadening $\eta$, 0.25 eV) and [`sigma_window_edge_factor`](../drivers/gw/keywords.md#sigma_window_edge_factor) (the state edge $1.5\,\eta$). [`minimax_energy_reference`](../drivers/gw/keywords.md#minimax_energy_reference) (`midgap`) sets the energy zero of the static and probe χ⁰ rules, from which it cancels. It accepts `midgap`, `vbm`, `cbm` and `none` (aliases `raw`, `zero`), and any other value, including a number, refuses. The tangential route reads neither `minimax_target_error` nor `minimax_max_nodes`, although the static rule is still built on every screened route.
 
 ## <span class="n">7</span> Reference: χ⁰ rules at fixed frequencies {: #laplace }
 
@@ -430,7 +430,7 @@ A rule that breaks one of these constraints refuses the run in planning, before 
 `gw.qp_support.coarse_windows_plan`
 {: .in-code }
 
-The broadening sets the resolution a near-resonance window pays for. Occupied semicore states tens of eV below the read region would stretch the resonant windows down to them at the deck's $\eta$. On the MPA and shared-pole routes (`compute_mode = mpa`) semicore states outside the requested set are read instead on coarse windows of their own, broadened by 5 eV, sampled every 2.5 eV and certified at $\max(\varepsilon_\Sigma,\,3\times10^{-3})$. `sigma_omega_patches_ev` accepts `lo:hi:eta` triples that replace these windows, each with its own $\eta$ at or above `sigma_regularization_ev`.
+The broadening sets the resolution a near-resonance window pays for. Occupied semicore states tens of eV below the read region would stretch the resonant windows down to them at the deck's $\eta$. On the MPA and tangential routes (`compute_mode = mpa`) semicore states outside the requested set are read instead on coarse windows of their own, broadened by 5 eV, sampled every 2.5 eV and certified at $\max(\varepsilon_\Sigma,\,3\times10^{-3})$. `sigma_omega_patches_ev` accepts `lo:hi:eta` triples that replace these windows, each with its own $\eta$ at or above `sigma_regularization_ev`.
 
 !!! refuses
     - A malformed or overlapping triple, a triple with $\eta$ below `sigma_regularization_ev`, or triples on a self-consistent run with no semicore states (`GATE sigma_coarse_window`). A one-shot whose semicore states are all requested warns and ignores them.

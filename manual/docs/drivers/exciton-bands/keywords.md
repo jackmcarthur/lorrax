@@ -12,6 +12,8 @@ page: keywords
 
 The driver takes command-line flags and reads deck keys, written `key = value` one per line, from the deck passed with `-i`; the deck also carries the `K_POINTS` path block. Defaults are read from the driver's argparse parser (`src/bse/exciton_bands.py`, `build_parser`) and the keyword schema (`src/gw/gw_config.py`). An unknown flag refuses; a prefix of a flag is not accepted.
 
+The BSE keys it shares with [`bse`](../bse/keywords.md) are deck keys under BerkeleyGW's names (`number_val_bands_fine`, `number_cond_bands_fine`, `number_eigenvalues`, `solver`, `davidson_tol_mev`, `block_size`, `solver_max_iter`, `eqp_corrections`, `band_degeneracy`, `degeneracy_tol_ry`, `dipole_file`, and the spin keys); an old flag refuses with its key. `kgrid_fine_shift` refuses: the $\bk+\bQ$ list is Γ-centred. The exciton-band flags below stay on the command line.
+
 Required
 {: .kw-group }
 
@@ -28,13 +30,13 @@ On a downfolded bundle the parent table recorded in the bundle is used first.
 
 **Bands**
 
-### `--n-val` {: .kw data-type="int" data-default="required" }
+### `number_val_bands_fine` {: .kw data-type="int" data-default="required" }
 Valence bands in the BSE window, counted down from the highest occupied band. Shared with [`bse`](../bse/keywords.md).
 
-Clamped to the occupied count, which is the WFN's `ifmax`; this driver has no `--n-occ`.
+Clamped to the occupied count, which is the WFN's `ifmax`; this driver has no `highest_occupied_band`.
 {: .kw-details }
 
-### `--n-cond` {: .kw data-type="int" data-default="required" }
+### `number_cond_bands_fine` {: .kw data-type="int" data-default="required" }
 Conduction bands in the BSE window. Shared with [`bse`](../bse/keywords.md).
 
 Must fit inside the deck's H-transform window below its guard bands.
@@ -49,7 +51,7 @@ Under `--refit-window zeta` the window must be the GW run's ζ-fit window exactl
 ### `ncond` {: .kw data-type="int" data-default="required" }
 Conduction bands of the H-transform window.
 
-Keep at least `--n-cond` + 4: fewer than four guard bands above the BSE conduction window warns, and more than 16 warns too.
+Keep at least `number_cond_bands_fine` + 4: fewer than four guard bands above the BSE conduction window warns, and more than 16 warns too.
 {: .kw-details }
 
 **Q path**
@@ -105,12 +107,12 @@ Overrides the deck key, but can only switch it on. Reads `dipole.h5`. Refuses wi
 {: .kw-details }
 
 ### `head_minibz_average` {: .kw data-type="bool" data-default="false" }
-Deck form of `--head-minibz-average`. Shared with [`bse`](../bse/keywords.md), which reads it under `bse_k_grid`; it must match the GW run.
+Deck form of `--head-minibz-average`. Shared with [`bse`](../bse/keywords.md), which reads it under `kgrid_fine`; it must match the GW run.
 
-### `--dipole` {: .kw data-type="path" data-default="dipole.h5 beside the deck" }
+### `dipole_file` {: .kw data-type="path" data-default="dipole.h5 beside the deck" }
 `dipole.h5` for the mini-BZ head tensor. Read only when the head average is on.
 
-Unlike [`bse`](../bse/keywords.md), where `--dipole` stores exciton dipoles, here it supplies the head's $\bq$-linear coefficient.
+Unlike [`bse`](../bse/keywords.md), where `dipole_file` stores exciton dipoles, here it supplies the head's $\bq$-linear coefficient.
 {: .kw-details }
 
 ### `--refit-window` {: .kw data-type="enum" data-default="zeta" }
@@ -151,13 +153,13 @@ The WFN must carry them. `0` must fail the tile check.
 
 **Bands**
 
-### `--eqp` {: .kw data-type="path" data-default="—" }
+### `eqp_corrections` {: .kw data-type="path" data-default="—" }
 BerkeleyGW-format `eqp1.dat`: run on quasiparticle energies. Shared with [`bse`](../bse/keywords.md).
 
-Both legs move: the stored valence and conduction energies and the H-transform energies at $\bk+\bQ$. Refuses on a QP wavefunction and with `bse_k_grid`.
+Both legs move: the stored valence and conduction energies and the H-transform energies at $\bk+\bQ$. Refuses on a QP wavefunction and with `kgrid_fine`.
 {: .kw-details }
 
-### `--band-degeneracy` {: .kw data-type="enum" data-default="strict" }
+### `band_degeneracy` {: .kw data-type="enum" data-default="strict" }
 A BSE window edge inside a degenerate multiplet. Shared with [`bse`](../bse/keywords.md).
 
 `strict` refuses and names working counts, `snap` widens the loaded window outward, `off` proceeds. Checked on the loaded window and on the H-transform conduction window, where `snap` only warns.
@@ -166,18 +168,18 @@ A BSE window edge inside a degenerate multiplet. Shared with [`bse`](../bse/keyw
 `strict` `snap` `off`
 {: .kw-values }
 
-### `--degeneracy-tol-ry` {: .kw data-type="float" data-default="7.3499e-5" }
+### `degeneracy_tol_ry` {: .kw data-type="float" data-default="7.3499e-5" }
 "Same multiplet" tolerance in Ry (1 meV). Shared with [`bse`](../bse/keywords.md).
 
 **Solver**
 
-### `--n-eig` {: .kw data-type="int" data-default="6" }
+### `number_eigenvalues` {: .kw data-type="int" data-default="6" }
 Exciton levels per $\bQ$. Shared with [`bse`](../bse/keywords.md), where the default is 5.
 
-### `--block-size` {: .kw data-type="int" data-default="8" }
+### `block_size` {: .kw data-type="int" data-default="8" }
 Block width of the per-$\bQ$ block Lanczos. Shared with [`bse`](../bse/keywords.md), where the default is 1.
 
-### `--max-iter` {: .kw data-type="int" data-default="40" }
+### `solver_max_iter` {: .kw data-type="int" data-default="40" }
 Block-Lanczos iterations; the Krylov dimension is block × iterations, capped at the physical transition count.
 
 Reorthogonalization is always full.
@@ -196,16 +198,16 @@ Run report.
 
 **Screened interaction**
 
-### `bse_k_grid` {: .kw data-type="str" data-default="&quot;&quot;" }
+### `kgrid_fine` {: .kw data-type="str" data-default="&quot;&quot;" }
 Fine BSE grid `"NX NY NZ"`: the loader moves the whole problem onto it before the solve. Shared with [`bse`](../bse/keywords.md).
 
-The exchange-tile grid stays the coarse restart grid. Refuses with `--eqp`.
+The exchange-tile grid stays the coarse restart grid. Refuses with `eqp_corrections`.
 {: .kw-details }
 
 ### `w_head_densify` {: .kw data-type="enum" data-default="c1" }
 Treatment of the long-range part of $W$ when it is densified. Shared with [`bse`](../bse/keywords.md).
 
-`--w-coarse-grid` implements `c1` only; `srlr` runs on the `bse_k_grid` path. `legacy` refuses by name.
+`--w-coarse-grid` implements `c1` only; `srlr` runs on the `kgrid_fine` path. `legacy` refuses by name.
 {: .kw-details }
 
 `c1` `srlr`

@@ -108,7 +108,7 @@ nav:
       - Physics overview: theory/physics.md
       - Frequency treatments of Σ: theory/frequency-treatments.md
       - Time–frequency transforms: theory/time-frequency.md
-      - Tangential W model: theory/shared-pole-w.md
+      - Tangential W model: theory/tangential-w.md
       - Contour deformation: theory/contour-deformation.md
       - The q → 0 head: theory/q0-head.md
       - Short- and long-range W: theory/w-range-splitting.md
@@ -122,3 +122,4 @@ nav:
 
 hooks:
   - hooks/strip_comments.py
+  - hooks/redirects.py

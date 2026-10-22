@@ -1,9 +1,9 @@
-"""Fig. 6.1 of docs/theory/shared-pole-w.md: where the shared-pole supports go.
+"""Fig. 6.1 of docs/theory/tangential-w.md: where the tangential supports go.
 
 Si, 4x4x4 k grid, all 537 bands of the 25 Ry basis (../time-frequency/data/
 si_dense_scalar_bands.json, IBZ energies replicated by their weights to the full grid).
 The supports are placed by the production recipe as it stands on LORRAX origin/main
-152b92d0e (src/gw/shared_pole_recipe.py):
+152b92d0e (src/gw/tangential_recipe.py):
   height        h = max(2.6 eV, 4 eta)                                  :1287
   line count    strip law, clamped to [18 - n_im, 40 - n_im - n_held]   :1086-1105
   line sites    equal quantiles of rho^(1/2), rho the crossing density  :1163-1206 (copied below)
@@ -35,7 +35,7 @@ OUT = os.path.normpath(os.path.join(HERE, "..", "..", "docs", "assets", "figures
 
 def support_rule_line_sites(energies_ev, mu_ev, eta_ev, height_ev, reads_ev, count,
                             power=0.5, grid=4001):
-    """Verbatim logic of shared_pole_recipe.support_rule_line_sites (origin/main :1163-1206)."""
+    """Verbatim logic of tangential_recipe.support_rule_line_sites (origin/main :1163-1206)."""
     levels = np.asarray(energies_ev, dtype=np.float64).ravel() - mu_ev
     evaluation, delta = np.asarray(reads_ev, dtype=np.float64).ravel(), 0.01
     pairs = np.zeros(1)
@@ -188,6 +188,6 @@ bx.set_xlabel("Re $z$  (eV)", labelpad=2)
 bx.legend(loc="upper right", fontsize=9.0, ncol=2, title="each scaled to unit peak", title_fontsize=8.6)
 bx.set_title(r"(b)  Line sites at equal areas of $g^{1/2}$, where $g$ counts the crossings $|\omega-E_m|$ that Σ meets", x=-0.05)
 
-path = os.path.join(OUT, "theory-sharedpole-supports.png")
+path = os.path.join(OUT, "theory-tangential-supports.png")
 fig.savefig(path, dpi=S.DPI, facecolor="white")
 print("wrote", path)

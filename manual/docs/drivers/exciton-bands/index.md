@@ -16,8 +16,7 @@ Computes the lowest exciton energies $\Omega_S(\bQ)$ at every point of a high-sy
 <div class="glance" markdown>
 
 Invoke
-:   `python -u -m bse.exciton_bands -i cohsex.in --n-val 4 --n-cond 4 --n-eig 6`
-
+:   `python -u -m bse.exciton_bands -i cohsex.in` (deck keys: `number_val_bands_fine = 4`, `number_cond_bands_fine = 4`, `number_eigenvalues = 6`)
 Reads
 :   deck with a `K_POINTS` path, `isdf_tensors_<N_mu>.h5`, `zeta_q.h5`, `WFN.h5`, `centroids_file`; optional `eqp1.dat`, `dipole.h5`
 
@@ -56,11 +55,13 @@ Exchange at $\bQ$
 
 === "Local"
     ```bash
-    uv run python -u -m bse.exciton_bands -i cohsex.in --n-val 4 --n-cond 4 --n-eig 6 --vq-mode refit
+    # deck keys in the -i deck: number_val_bands_fine = 4, number_cond_bands_fine = 4, number_eigenvalues = 6
+    uv run python -u -m bse.exciton_bands -i cohsex.in --vq-mode refit
     ```
 === "Perlmutter"
     ```bash
-    srun -n 4 python -u -m bse.exciton_bands -i cohsex.in --n-val 4 --n-cond 4 --n-eig 6 --vq-mode refit
+    # deck keys in the -i deck: number_val_bands_fine = 4, number_cond_bands_fine = 4, number_eigenvalues = 6
+    srun -n 4 python -u -m bse.exciton_bands -i cohsex.in --vq-mode refit
     ```
 === "Frontera"
     ```bash
@@ -85,7 +86,7 @@ K_POINTS crystal_b
   0.000 0.000 0.000 16   #G
 ```
 
-`nval` and `ncond` set the H-transform window. It must hold the BSE window (`--n-val`, `--n-cond`) with at least four conduction guard bands above it, and under the default `--refit-window zeta` it must be the GW run's ζ-fit window. The count on a corner's line is the number of points on the segment that ends at that corner ([Q path](theory.md#path)).
+`nval` and `ncond` set the H-transform window. It must hold the BSE window (`number_val_bands_fine`, `number_cond_bands_fine`) with at least four conduction guard bands above it, and under the default `--refit-window zeta` it must be the GW run's ζ-fit window. The count on a corner's line is the number of points on the segment that ends at that corner ([Q path](theory.md#path)).
 
 ## Choosing an exchange route {: #route }
 
@@ -134,10 +135,10 @@ K_POINTS crystal_b
     - `--refit-window zeta` with a deck window other than the GW run's ζ-fit window. `--refit-window bse` with a deck window outside it, with `--vq-mode` other than `refit`, or with no finite on-grid $\bQ$ on the path.
     - A refit whose on-grid tiles miss the stored ones by more than 5 % (relative), or whose on-grid eigenvalues miss the stored-tile eigenvalues by more than the `--cert-grade` tolerance (0.01 meV, or 1.0 meV).
     - `--head-minibz-average`, or the deck's `head_minibz_average = true`, with `--vq-mode refit`. A `dipole.h5` whose $\bk$ count differs from the BSE grid.
-    - A BSE window edge inside a degenerate multiplet (`--band-degeneracy strict`), on the loaded window or on the H-transform conduction window.
+    - A BSE window edge inside a degenerate multiplet (`band_degeneracy = strict`), on the loaded window or on the H-transform conduction window.
     - A BSE conduction window that does not fit inside the deck's H-transform window. Raise `ncond`.
     - H-transform conduction energies at $\Gamma$ more than 0.05 Ry from the stored ones, or a conduction-subspace overlap below 0.5.
-    - `--eqp` on a QP wavefunction, or together with `bse_k_grid` densification. Remove `--eqp`.
+    - `eqp_corrections` on a QP wavefunction, or together with `kgrid_fine` densification. Remove `eqp_corrections`.
     - A `--w-coarse-grid` that does not divide the BSE grid, or with `w_head_densify = srlr`. `w_head_densify = legacy`.
     - `--q-per-segment` below 1.
 

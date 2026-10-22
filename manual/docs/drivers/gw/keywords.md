@@ -79,16 +79,16 @@ Optional
 ### `sigma_w_model` {: .kw data-type="enum" data-default="mpa" }
 Model of $W^c$ under `compute_mode = mpa`.
 
-`shared_pole` is the production model ([Tangential W model](../../theory/shared-pole-w.md)); `mpa` fits poles element by element. Naming the key with another `compute_mode` refuses.
+`tangential` is the production model ([Tangential W model](../../theory/tangential-w.md)); `mpa` fits poles element by element. Naming the key with another `compute_mode` refuses. The old value `shared_pole` is still accepted, with a note in the log.
 {: .kw-details }
 
-`shared_pole` `mpa`
+`tangential` `mpa`
 {: .kw-values }
 
 ### `sigma_w_accuracy` {: .kw data-type="enum" data-default="production" }
-Tier of the shared-pole recipe.
+Tier of the tangential recipe.
 
-`relaxed` also sets an omitted `sigma_quadrature_eps` to `5e-4`. Requires `sigma_w_model = shared_pole`.
+`relaxed` also sets an omitted `sigma_quadrature_eps` to `5e-4`. Requires `sigma_w_model = tangential`.
 {: .kw-details }
 
 `production` `relaxed`
@@ -113,21 +113,21 @@ Diagrams summed by $W$: the RPA Dyson series, the ladder-corrected resolvent, or
 {: .kw-values }
 
 ### `write_poles` {: .kw data-type="bool" data-default="false" }
-Exports the stored shared-pole factors $\tilde b_{j\bq}(\mu)=\sqrt{2\Omega_{j\bq}}\,b_{j\bq}(\mu)$ and $\Omega^2_{j\bq}$ to `tmp/mpa/<map>_poles.h5`, with $b$ the residue-normalised factor of [Tangential W model §2.1](../../theory/shared-pole-w.md#model-form).
+Exports the stored tangential factors $\tilde b_{j\bq}(\mu)=\sqrt{2\Omega_{j\bq}}\,b_{j\bq}(\mu)$ and $\Omega^2_{j\bq}$ to `tmp/mpa/<map>_poles.h5`, with $b$ the residue-normalised factor of [Tangential W model §2.1](../../theory/tangential-w.md#model-form).
 
-A static-W consumer needs nothing else, since $W(0) = V - 2b\,\Omega^{-1} b^\dagger = V - \tilde b\,\Omega^{-2} \tilde b^\dagger$. Requires `compute_mode = mpa` and `sigma_w_model = shared_pole`.
+A static-W consumer needs nothing else, since $W(0) = V - 2b\,\Omega^{-1} b^\dagger = V - \tilde b\,\Omega^{-2} \tilde b^\dagger$. Requires `compute_mode = mpa` and `sigma_w_model = tangential`.
 {: .kw-details }
 
 ### `minimax_target_error` {: .kw data-type="float" data-default="1e-6" }
 Accuracy target of the χ⁰ time rules, in a currency set by each rule.
 
-Absolute error in Ry⁻¹ for the static rule, the HL probe and the insulating MPA $i\varpi_2$ sample; relative for the GN probe certificate and, against $1/\varpi$, for the MPA line samples. The shared-pole bank ignores it and uses its tier's tolerance ([Rules and keys](../../theory/time-frequency.md#frame-keys)).
+Absolute error in Ry⁻¹ for the static rule, the HL probe and the insulating MPA $i\varpi_2$ sample; relative for the GN probe certificate and, against $1/\varpi$, for the MPA line samples. The tangential bank ignores it and uses its tier's tolerance ([Rules and keys](../../theory/time-frequency.md#frame-keys)).
 {: .kw-details }
 
 ### `minimax_max_nodes` {: .kw data-type="int" data-default="64" }
 Node cap of the static, HL-probe and insulating-MPA rules; order cap of one panel of an MPA line rule.
 
-A static rule that misses its target at the cap refuses. The GN probe and the shared-pole bank ignore it; the GN probe stops at 64 nodes ([minimax](../../theory/time-frequency.md#frame-keys)).
+A static rule that misses its target at the cap refuses. The GN probe and the tangential bank ignore it; the GN probe stops at 64 nodes ([minimax](../../theory/time-frequency.md#frame-keys)).
 {: .kw-details }
 
 ### `minimax_energy_reference` {: .kw data-type="enum" data-default="midgap" }
@@ -146,13 +146,13 @@ Probe columns per block of the ladder solve (`w_bse`, `w_rpa_resolvent`).
 {: .kw-details }
 
 ### `sigma_w_support_sites_ev` {: .kw data-type="string" data-default="(empty)" }
-Replaces both shared-pole support ladders, written `"<line list> | <imaginary list>"` in eV.
+Replaces both tangential support ladders, written `"<line list> | <imaginary list>"` in eV.
 
 A support study dial, announced as a debug warning; the sites enter the recipe hash.
 {: .kw-details }
 
 ### `write_w` {: .kw data-type="bool" data-default="false" }
-Dumps the whole shared-pole $W^c$ sample bank. Debug.
+Dumps the whole tangential $W^c$ sample bank. Debug.
 
 About 16 times the size of the pole export; no consumer reads it. Same requirements as `write_poles`.
 {: .kw-details }
@@ -198,7 +198,7 @@ An explicit `false` keeps the DFT $V^{\mathrm H}$ as an announced comparison mod
 ### `sc_head_update` {: .kw data-type="enum" data-default="off" }
 How the $\bq \to 0$ head follows each QSGW map.
 
-Unnamed on a shared-pole QSGW deck with the head on, it becomes `parallel_transport` if `parallel_transport_file` exists, else `dft_velocity` if `dipole.h5` exists. `interband_commutator` refuses on a metal; any value but `off` refuses with `head_correction = off`.
+Unnamed on a tangential QSGW deck with the head on, it becomes `parallel_transport` if `parallel_transport_file` exists, else `dft_velocity` if `dipole.h5` exists. `interband_commutator` refuses on a metal; any value but `off` refuses with `head_correction = off`.
 {: .kw-details }
 
 `off` `parallel_transport` `dft_velocity` `interband_commutator`
@@ -371,7 +371,7 @@ The $\bq \to 0$ keys. Their physics is on [the q → 0 head](../../theory/q0-hea
 ### `head_correction` {: .kw data-type="enum" data-default="full" }
 Γ-cell policy.
 
-`full` is the macroscopic head with wings and body fold, `no_local_fields` the direct head only, `off` a debug skip. Unset on `bispinor_gw = full_shared_pole` it becomes `no_local_fields`. On a time-reversal-broken metal the shared-pole route refuses `full`.
+`full` is the macroscopic head with wings and body fold, `no_local_fields` the direct head only, `off` a debug skip. Unset on `bispinor_gw = full_tangential` it becomes `no_local_fields`. On a time-reversal-broken metal the tangential route refuses `full`.
 {: .kw-details }
 
 `full` `no_local_fields` `off`
@@ -380,7 +380,7 @@ The $\bq \to 0$ keys. Their physics is on [the q → 0 head](../../theory/q0-hea
 ### `head_minibz_average` {: .kw data-type="bool" data-default="false" }
 Coulomb head as a mini-BZ cell average instead of a point value.
 
-A BSE run on a densified `bse_k_grid` must use the same value.
+A BSE run on a densified `kgrid_fine` must use the same value.
 {: .kw-details }
 
 ### `wcoul0_source` {: .kw data-type="enum" data-default="s_tensor" }
@@ -580,10 +580,10 @@ Four-component run: four-channel ζ fit, transverse Σ channels and a second cen
 ### `bispinor_gw` {: .kw data-type="enum" data-default="bare_transverse" }
 Four-current screening model.
 
-`full_shared_pole` needs `compute_mode = mpa`, `sigma_w_model = shared_pole` and `screening_diagrams = w_rpa`, and refuses `head_correction = full`. `full_static_cohsex` is one-shot on a slab.
+`full_tangential` needs `compute_mode = mpa`, `sigma_w_model = tangential` and `screening_diagrams = w_rpa`, and refuses `head_correction = full`; the old value `full_shared_pole` is still accepted. `full_static_cohsex` is one-shot on a slab.
 {: .kw-details }
 
-`bare_transverse` `full_shared_pole` `full_static_cohsex`
+`bare_transverse` `full_tangential` `full_static_cohsex`
 {: .kw-values }
 
 ### `centroids_file_current` {: .kw data-type="path" data-default="(empty)" }
@@ -601,7 +601,7 @@ Writes each four-current map's on-shell CC, CT+TC and TT matrices. Debug.
 **Multipole sampling**
 {: #mpa }
 
-These keys configure the elementwise MPA fit (`sigma_w_model = mpa`). Under `shared_pole` with the head on, the first seven set the sampling of the head fit and the last three refuse; with the head off all ten refuse (`GATE shared_pole_unused_inputs`).
+These keys configure the elementwise MPA fit (`sigma_w_model = mpa`). Under `tangential` with the head on, the first seven set the sampling of the head fit and the last three refuse; with the head off all ten refuse (`GATE tangential_unused_inputs`).
 
 ### `mpa_n_poles` {: .kw data-type="int" data-default="8" }
 Poles per matrix element, 1 to 16.
@@ -743,8 +743,8 @@ Density cutoff of [kin-ion](../../utilities/kin-ion.md) and [dipole](../../utili
 ### `screened_coulomb_cutoff` {: .kw data-type="float" data-default="WFN ecutwfc" }
 Sphere of the plane-wave $\chi_\bq(\bG,\bG')$ path, in Ry. No driver reads it.
 
-### `bse_k_grid` {: .kw data-type="string" data-default="(empty)" }
-[BSE](../bse/keywords.md): fine k grid onto which the BSE problem is interpolated.
+### `kgrid_fine` {: .kw data-type="string" data-default="(empty)" }
+[BSE](../bse/keywords.md#fine-grid) and [htransform](../../utilities/htransform-fine-grid.md): fine k grid onto which the BSE problem (or the htransform's fine bands) is interpolated.
 
 ### `w_head_densify` {: .kw data-type="enum" data-default="c1" }
 [BSE](../bse/keywords.md): coarse-to-fine treatment of the W head.
@@ -761,14 +761,8 @@ Sphere of the plane-wave $\chi_\bq(\bG,\bG')$ path, in Ry. No driver reads it.
 ### `get_centroids_fi` {: .kw data-type="bool" data-default="false" }
 [htransform](../../utilities/htransform.md): computes fine-grid wavefunctions at the coarse centroids.
 
-### `wfn_fi_min` {: .kw data-type="int" data-default="0" }
-[htransform](../../utilities/htransform.md): first band of the fine-grid window, 0-based.
-
-### `wfn_fi_max` {: .kw data-type="int" data-default="0" }
-[htransform](../../utilities/htransform.md): exclusive end of that window; `0` takes the full window.
-
-### `kgrid_fi` {: .kw data-type="string" data-default="(empty)" }
-[htransform](../../utilities/htransform.md): fine k grid, `"nx ny nz"`.
+### `kgrid_fine_shift`, `number_cond_bands_coarse` {: .kw data-type="string, int" data-default="(empty)" }
+[BSE](../bse/keywords.md#fine-grid) and [htransform](../../utilities/htransform-fine-grid.md): kgrid.x's offset of `kgrid_fine` and the coarse conduction bands of the band interpolation.
 
 ### `wfn_fi_q_chunk` {: .kw data-type="int" data-default="0" }
 [htransform](../../utilities/htransform.md): fine q points processed at once; `0` takes the coarse k count.

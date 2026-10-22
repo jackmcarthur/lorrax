@@ -181,7 +181,7 @@ with $\chi^0_\bR(t_\ell)$ the product of [GW theory Eq. (2.2)](../drivers/gw/the
 `gw.response_bank.integrate_response_group`
 {: .in-code }
 
-On the shared-pole route every support sample of a group shares one set of complex time nodes ([Tangential W model §6.2](shared-pole-w.md#bank-times)). One Green pair per node serves every member's value and $\partial_s$ derivative and both particle–hole orientations. Per node the product is transformed to $\bq$ and only the rows of the $\bq$ batch and their $-\bq$ partners are kept; they are folded into each member with that member's forward and reverse weights. The carry is $[2\cdot\text{members},\,\bq,\,\mu_x,\,\nu_y]$; the node loop runs over the live nodes only, and the rank's rows run in the passes of §[2.3](#par-kconv-passes).
+On the tangential route every support sample of a group shares one set of complex time nodes ([Tangential W model §6.2](tangential-w.md#bank-times)). One Green pair per node serves every member's value and $\partial_s$ derivative and both particle–hole orientations. Per node the product is transformed to $\bq$ and only the rows of the $\bq$ batch and their $-\bq$ partners are kept; they are folded into each member with that member's forward and reverse weights. The carry is $[2\cdot\text{members},\,\bq,\,\mu_x,\,\nu_y]$; the node loop runs over the live nodes only, and the rank's rows run in the passes of §[2.3](#par-kconv-passes).
 
 The group holds every sample when the carry fits the device. Otherwise the stream still runs once, with every sample, and each finished row pass goes to SlabIO's per-rank streamed tier (§[6.3](#par-mem-io)): host memory when the bank takes at most half the host budget, else one file per rank. Splitting the samples into device groups would re-run every Green pair per group; it is used only when the disk refuses the bank and on the full-k Green route.
 
@@ -192,7 +192,7 @@ The group holds every sample when the carry fits the device. Otherwise the strea
 
 Each product window ([GW theory §3.3](../drivers/gw/theory.md#sig-tf); why windows: [Time–frequency transforms §4](time-frequency.md#windows)) is one compiled program whose device loop runs the window's nodes; nothing returns to the host between nodes. Per node $t_\ell$:
 
-1. **W at the node.** On the shared-pole route, $W^c_\bq(t_\ell)=b\,\mathrm{diag}(d_j(t_\ell))\,b^\dagger$ on the irreducible $\bq$ only, by the Green-builder GEMM from the resident pole factors ([Tangential W model §6.1](shared-pole-w.md#sig-synth)).
+1. **W at the node.** On the tangential route, $W^c_\bq(t_\ell)=b\,\mathrm{diag}(d_j(t_\ell))\,b^\dagger$ on the irreducible $\bq$ only, by the Green-builder GEMM from the resident pole factors ([Tangential W model §6.1](tangential-w.md#sig-synth)).
 2. **Product per row pass.** $W^c$'s window rows are unfolded and transformed to $\bR$ on the load; the parent $G^{\gtrless}(t_\ell)$ of the window's rows is one local GEMM; the k-convolution of Eq. (2.1) forms $\Sigma^c_\bk(\br_\mu,\br_\nu;t_\ell)$ for the window's rows, which are projected on the bands at once.
 3. **Fold.** The band matrix at the node is added to the on-shell slots with a per-state coefficient:
 
@@ -229,12 +229,12 @@ $$
 
 The two plans agree to round-off. With $Q<P$ the local plan leaves $P-Q$ ranks idle; at one $\bq$ and large $N_\mu$ only the distributed plan holds a matrix. Each decision prints once as `route W Dyson …`.
 
-### <span class="n">5.2</span> The shared-pole constructor {: #par-dense-sp }
+### <span class="n">5.2</span> The tangential constructor {: #par-dense-sp }
 
-`gw.shared_pole_constructor`
+`gw.tangential_constructor`
 {: .in-code }
 
-The constructor reduces each irreducible $\bq$'s samples to poles ([Tangential W model §7.8](shared-pole-w.md#ritz)). Local rounds give one whole parent per rank and solve its pencil with local dense kernels; they are taken whenever the complete selection stack and a conservative pencil price fit the device, under either `linalg`. Otherwise the face route runs a batch of parents on the whole mesh with distributed GEMMs and eigensolves. A local round holds a whole parent's pencil per rank, so its peak does not fall with $P$; the face route is the path past that point.
+The constructor reduces each irreducible $\bq$'s samples to poles ([Tangential W model §7.8](tangential-w.md#ritz)). Local rounds give one whole parent per rank and solve its pencil with local dense kernels; they are taken whenever the complete selection stack and a conservative pencil price fit the device, under either `linalg`. Otherwise the face route runs a batch of parents on the whole mesh with distributed GEMMs and eigensolves. A local round holds a whole parent's pencil per rank, so its peak does not fall with $P$; the face route is the path past that point.
 
 ## <span class="n">6</span> Memory and I/O {: #par-mem }
 
@@ -259,7 +259,7 @@ bounded by the pool reservation and by $M/4$ from below; $T_{\mathrm{ord}}$ = 16
 `runtime.tiles.tile_units`
 {: .in-code }
 
-A loop that streams over $\bk$, $\bq$, bands, centroids, samples or rows takes the most units whose bytes per rank fit 1 GiB. The count comes from the loop's shapes alone, never from free memory or the budget, so every rank compiles the same loop and results do not depend on the memory a run was given. Some planners still size from the budget: the ζ batch and $\bG$ tile, the response sample group and the shared-pole synthesis panels.
+A loop that streams over $\bk$, $\bq$, bands, centroids, samples or rows takes the most units whose bytes per rank fit 1 GiB. The count comes from the loop's shapes alone, never from free memory or the budget, so every rank compiles the same loop and results do not depend on the memory a run was given. Some planners still size from the budget: the ζ batch and $\bG$ tile, the response sample group and the tangential synthesis panels.
 
 A price above the budget never refuses: the stage prints one `memory over budget at <stage>` warning, runs at its smallest size, and fails only if the device truly lacks the room. A compiled module larger than the whole card refuses before it runs (`GATE xla_rematerialization`).
 
@@ -268,7 +268,7 @@ A price above the budget never refuses: the stage prints one `memory over budget
 `file_io.slab_io.SlabIO`
 {: .in-code }
 
-Bulk arrays ($V_\bq$, $W_\bq(0)$, ζ, the Z store, the shared-pole bank and model) are read and written by SlabIO through parallel HDF5: each rank reads and writes only its own hyperslab, and no array is gathered onto one rank or one host. The file holds the logical array; its bytes do not depend on the mesh that wrote it, so a restart bundle written at one $P$ reads at another. Large writes are cut into row blocks of at most 64 MiB per rank written independently in file order; other layouts use two-phase collective I/O. One queue per process keeps every rank's collective HDF5 calls in the same order.
+Bulk arrays ($V_\bq$, $W_\bq(0)$, ζ, the Z store, the tangential bank and model) are read and written by SlabIO through parallel HDF5: each rank reads and writes only its own hyperslab, and no array is gathered onto one rank or one host. The file holds the logical array; its bytes do not depend on the mesh that wrote it, so a restart bundle written at one $P$ reads at another. Large writes are cut into row blocks of at most 64 MiB per rank written independently in file order; other layouts use two-phase collective I/O. One queue per process keeps every rank's collective HDF5 calls in the same order.
 
 The per-rank streamed tier holds a bank that fits nowhere else: each rank writes and reads its own rows, in host memory or in one file per rank, and the tier is released within the map.
 

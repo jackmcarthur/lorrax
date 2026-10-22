@@ -7,7 +7,7 @@
 
 <figure class="flowchart" markdown>
 [![Static W for the BSE](../assets/figures/b4.png)](../assets/figures/b4.png)
-<figcaption><strong>Fig. B4.</strong> Static $W$ for the BSE on a fine k grid. Stage 1 forms the static $W$ on the GW grid and the polarizability in plane waves, in blocks of the long-range vectors $\bG_L$ and the rest $\bG_S$. Stage 2 takes the Schur complement on the $\bG_L$ block, which gives the long-range polarizability $P$, the screened interaction $D$, the local-field factor $\Lambda$ and the long-range part $W^{\mathrm{LR}}$. Stage 3 Fourier-interpolates the short-range part, evaluates the fitted long-range part at every fine $\bq$, and adds the $\bq=0$ head. A shared-pole GW run has no split and supports only `c1`.</figcaption>
+<figcaption><strong>Fig. B4.</strong> Static $W$ for the BSE on a fine k grid. Stage 1 forms the static $W$ on the GW grid and the polarizability in plane waves, in blocks of the long-range vectors $\bG_L$ and the rest $\bG_S$. Stage 2 takes the Schur complement on the $\bG_L$ block, which gives the long-range polarizability $P$, the screened interaction $D$, the local-field factor $\Lambda$ and the long-range part $W^{\mathrm{LR}}$. Stage 3 Fourier-interpolates the short-range part, evaluates the fitted long-range part at every fine $\bq$, and adds the $\bq=0$ head. A tangential GW run has no split and supports only `c1`.</figcaption>
 </figure>
 
 ## <span class="n">1</span> Overview {: #overview }
@@ -220,7 +220,7 @@ The arrays are computed in the static step of the RPA screening, beside the Dyso
 |---|---|---|
 | `compute_mode = cohsex`, `gn_ppm` or `hl_ppm` | Dyson $W(0)$ | written |
 | the same with `mc_average_placement` other than `off` | Dyson $W(0)$, two-solve head placement | not written |
-| `compute_mode = mpa`, `sigma_w_model = shared_pole` | $V+W^c(0)$ evaluated from the poles | not written |
+| `compute_mode = mpa`, `sigma_w_model = tangential` | $V+W^c(0)$ evaluated from the poles | not written |
 | `compute_mode = mpa`, `sigma_w_model = mpa`; `x_only` | none | not written |
 
 Even on the first row the arrays are skipped silently when `sys_dim` is neither 2 nor 3, when `tmp/zeta_q.h5` is absent, or when the $\bq$ list was reduced without a wedge, and they are withheld with a warning when $P$ fails the check of §3.2. The BSE also needs W0 stored on its irreducible wedge, which `restart_q_storage = auto` gives only for an orbit-closed centroid set on a reduced $\bq$ path.
@@ -230,11 +230,11 @@ Even on the first row the arrays are skipped silently when `sys_dim` is neither 
 `bse_densify._interpolate_bse_data_to_grid`
 {: .in-code }
 
-The densification runs in the BSE loader whenever the deck's `bse_k_grid` differs from the bundle's grid, so `bse.bse_jax`, every solver behind it, and `bse.exciton_bands` with the same deck key receive a fine bundle.
+The densification runs in the BSE loader whenever the deck's `kgrid_fine` differs from the bundle's grid, so `bse.bse_jax`, every solver behind it, and `bse.exciton_bands` with the same deck key receive a fine bundle.
 
 | Key | Default | Role here |
 |---|---|---|
-| [`bse_k_grid`](../drivers/bse/keywords.md#bse_k_grid) | empty | the fine grid; empty or equal to the coarse grid skips the densification |
+| [`kgrid_fine`](../drivers/bse/keywords.md#kgrid_fine) | empty | the fine grid; empty or equal to the coarse grid skips the densification |
 | [`w_head_densify`](../drivers/bse/keywords.md#w_head_densify) | `c1` | `c1` (§5) or `srlr` (§2 to §4); `legacy` is retired and refuses by name |
 | `head_minibz_average` | `false` | must match the GW run; enters the Γ-cell average of the head |
 | `mc_average_vcoul_body` | `true` | read by GW; decides the averaged head kernel of §2 |
@@ -250,7 +250,7 @@ The densification runs in the BSE loader whenever the deck's `bse_k_grid` differ
     - Symmetry rows not in the bundle's flat FFT order (`GATE srlr_q_order`), or a slab relabelling that leaves the set of $\bG_L$ (`GATE srlr_channel_relabel`).
 
 !!! note "Today and intended"
-    `c1` is the default and what a production run uses today. The production GW route is the shared-pole model, whose restart has no `W0_lr`, so `srlr` refuses on it by name. `srlr` runs today on the bundle of a static Dyson run, for example a `cohsex` or `gn_ppm` GW on the same deck, since the BSE reads only the static $W(0)$. The intended state is that the shared-pole route writes the arrays of its own $W(0)$ and `srlr` becomes the default.
+    `c1` is the default and what a production run uses today. The production GW route is the tangential model, whose restart has no `W0_lr`, so `srlr` refuses on it by name. `srlr` runs today on the bundle of a static Dyson run, for example a `cohsex` or `gn_ppm` GW on the same deck, since the BSE reads only the static $W(0)$. The intended state is that the tangential route writes the arrays of its own $W(0)$ and `srlr` becomes the default.
 
 ## <span class="n">7</span> A measured example {: #example }
 

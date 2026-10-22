@@ -19,8 +19,8 @@ page: files
 | `zeta_q.h5` | — | gw | Beside the restart. Every route but `ongrid`; `interp` and `both` need it on the full BZ. |
 | `WFN.h5` | `wfn_file` | DFT + pw2bgw | The H-transform input; also gives the occupied count. |
 | `centroids_frac_<N>.txt` | `centroids_file` | centroids | Required. On a downfolded bundle, the parent table recorded in the bundle. |
-| `eqp1.dat` | `--eqp` | gw | Diagonal QP energies on the wedge, unfolded on load. |
-| `dipole.h5` | `--dipole` | dipole | Only with the mini-BZ head average. Default: beside the deck. |
+| `eqp1.dat` | `eqp_corrections` | gw | Diagonal QP energies on the wedge, unfolded on load. |
+| `dipole.h5` | `dipole_file` | dipole | Only with the mini-BZ head average. Default: beside the deck. |
 
 ## Outputs {: #outputs }
 
@@ -30,7 +30,7 @@ page: files
 :   Exciton levels $\Omega_S(\bQ)$ in eV, one row per $\bQ$, with a header naming the run. Default prefix `exciton_bands`.
 
 `<prefix>.png`
-:   The lowest `--n-eig` levels along the path, corner labels on the axis, refit spot checks as markers and the certification stamp at the foot.
+:   The lowest `number_eigenvalues` levels along the path, corner labels on the axis, refit spot checks as markers and the certification stamp at the foot.
 
 `<prefix>.out`
 :   Run report (`--report-file`): routes, environment, band windows, the path corners, the resolved kernels, the levels at each corner, the Hermiticity check and the files read and written.

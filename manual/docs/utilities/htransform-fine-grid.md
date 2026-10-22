@@ -3,7 +3,7 @@
 `bandstructure.bse_setup.compute_wfns_fi` States and energies on a fine k grid, interpolated from the GW grid for the BSE.
 {: .page-summary }
 
-The BSE and exciton-bands drivers call the [H-transform](htransform.md) in memory to carry $\psi_{n\bk}(\br_\mu)$ and $E^{\mathrm{QP}}_{n\bk}$ from the coarse grid $\bk_{\mathrm{co}}$ of the GW run to a fine grid $\bk_{\mathrm{fi}}$. Under [`bse_k_grid`](../drivers/bse/keywords.md#bse_k_grid) this fills the BSE fine grid, and for [exciton bands](../drivers/exciton-bands/index.md) it gives the shifted conduction states $\psi_{c\,\bk+\bQ}$. No DFT calculation on the fine grid is needed.
+The BSE and exciton-bands drivers call the [H-transform](htransform.md) in memory to carry $\psi_{n\bk}(\br_\mu)$ and $E^{\mathrm{QP}}_{n\bk}$ from the coarse grid $\bk_{\mathrm{co}}$ of the GW run to a fine grid $\bk_{\mathrm{fi}}$. Under [`kgrid_fine`](../drivers/bse/keywords.md#kgrid_fine) this fills the BSE fine grid, and for [exciton bands](../drivers/exciton-bands/index.md) it gives the shifted conduction states $\psi_{c\,\bk+\bQ}$. No DFT calculation on the fine grid is needed.
 {: .lead }
 
 ## Band window {: #window }
@@ -19,13 +19,16 @@ Optional
 
 **Fine grids**
 
-### `bse_k_grid` {: .kw data-type="str" data-default="empty" }
-`"NX NY NZ"`: the Γ-centred BSE fine grid that this engine fills. Owned by the [BSE driver](../drivers/bse/keywords.md#bse_k_grid).
+### `kgrid_fine`, `kgrid_fine_shift` {: .kw data-type="int[3], float[3]" data-default="empty, 0 0 0" }
+The fine grid $\bk_{\mathrm{fi}}$ and kgrid.x's offset $\delta\bk$ in fractions of one fine step, $\bk_i = (i + \delta\bk)/N$. Shared by the [BSE driver](../drivers/bse/keywords.md#fine-grid) and the `get_centroids_fi` route below; a shift breaks the grid's symmetry and samples the zone evenly (a DOS). Exciton bands refuse a shift.
+
+### `number_cond_bands_coarse` {: .kw data-type="int" data-default="ncond" }
+Conduction bands of the coarse grid that the H-transform fits. In the BSE it may exceed `ncond` (the extra bands are guard bands read from the WFN); in the standalone driver it replaces `--guard-bands` (fitted conduction bands = `ncond` + guard bands). `number_val_bands_coarse` is accepted and ignored: every valence band of the window is fitted.
 
 ### `wfn_fi_q_chunk` {: .kw data-type="int" data-default="0 → N_k(co)" }
 $\bk_{\mathrm{fi}}$ points per $f(H_{\bk_{\mathrm{fi}}})$ build and eigensolve on the BSE routes, rounded up to a multiple of the device count.
 
-Read by `bse_k_grid` and exciton bands only; a negative value refuses. The standalone `get_centroids_fi` recovery always uses the default.
+Read by `kgrid_fine` and exciton bands only; a negative value refuses. The standalone `get_centroids_fi` recovery always uses the default.
 {: .kw-details }
 
 ### `linalg` {: .kw data-type="enum" data-default="local" }
@@ -39,26 +42,17 @@ The path always uses the native batched `eigvalsh`/`eigh`. Also sets the batch r
 
 On the fine-grid route the returned bands are the ascending-eigenvalue slice of the window.
 
-`bse.exciton_bands` passes `--a-band`, `--refit-guard-bands`, `--q-per-segment` and `--eqp` to this engine; they are on the [exciton-bands keyword page](../drivers/exciton-bands/keywords.md).
+`bse.exciton_bands` passes `--a-band`, `--refit-guard-bands`, `--q-per-segment` and `eqp_corrections` to this engine; they are on the [exciton-bands keyword page](../drivers/exciton-bands/keywords.md).
 
-**Standalone recovery (diagnostic)**
+**Standalone fine grid**
 
-The standalone driver can also run the fine-grid recovery after the path. Its result is logged and not written.
+With `get_centroids_fi = true` the standalone driver also interpolates onto `kgrid_fine` (shifted by `kgrid_fine_shift`) after the path and writes only the fine window's bands to `<output stem>_fine.h5`: `kpoints` (crystal), `energies_ev` (k, band), `bands` (1-based), and the attributes `kgrid`, `kgrid_shift`.
 
 ### `get_centroids_fi` {: .kw data-type="bool" data-default="false" }
-After the path, also computes $\psi_{n\bk_{\mathrm{fi}}}(\br_\mu)$ and $E_{n\bk_{\mathrm{fi}}}$ on `kgrid_fi`.
+Runs the fine-grid interpolation after the path and writes `<stem>_fine.h5`. The BSE drivers do not read this key.
 
-Diagnostic: the result is logged (shapes) and not written. The BSE drivers do not read this key.
-{: .kw-details }
-
-### `kgrid_fi` {: .kw data-type="str" data-default="empty" }
-`"nx ny nz"` (or comma-separated) fine grid of the `get_centroids_fi` recovery.
-
-### `wfn_fi_min`, `wfn_fi_max` {: .kw data-type="int" data-default="0, 0" }
-Window-relative sub-window $[$`wfn_fi_min`$,$ `wfn_fi_max`$)$ returned by the `get_centroids_fi` recovery.
-
-`wfn_fi_max = 0` means the whole fitted window, guard bands included.
-{: .kw-details }
+### `number_val_bands_fine`, `number_cond_bands_fine` {: .kw data-type="int" data-default="nval, ncond" }
+The fine window written: valence bands below and conduction bands above the occupied boundary (BerkeleyGW's counting). Fewer than four fitted bands above the window warns. `wfn_fi_min` and `wfn_fi_max` refuse with these names.
 
 ## Refusals {: #refusals }
 

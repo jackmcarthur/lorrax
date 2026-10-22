@@ -51,7 +51,7 @@ LORRAX keeps a small number of real poles in place of the $2N_t$ of (1.4). We fi
 
 ### <span class="n">2.1</span> Shared poles {: #model-form }
 
-`file_io.shared_pole_store`
+`file_io.tangential_store`
 {: .in-code }
 
 With time reversal each antiresonant pole at $-\Omega_S$ has the same factor $b_S$ as its resonant partner at $+\Omega_S$, and the two enter with opposite signs. LORRAX keeps $K_\bq\ll N_t$ such pairs, with poles $\Omega_{j\bq}>0$ and factor vectors $b_{j\bq}(\mu)$ on the $N_\mu$ ISDF points ([ISDF](isdf.md)), shared by every matrix element:
@@ -179,7 +179,7 @@ reproduces every sample, $W_r(\lambda_j)r_j=W(\lambda_j)r_j$ and $\ell_iW_r(\xi_
 
 ### <span class="n">4.3</span> The Hermitian pencil in s {: #loewner-hermitian }
 
-`gw.shared_pole_pencil.assemble_shared_pole_pencil`
+`gw.tangential_pencil.assemble_tangential_pencil`
 {: .in-code }
 
 LORRAX applies §4.2 to Casida's form (2.2), with $s=z^2$ in place of $z$, $C_\bq$ in place of $H$, and $\sqrt2\,\phi\Delta^{1/2}$ and its adjoint in place of $\phi$ and $\sigma\phi^\dagger$. Each support $z_a$ gives a right point $s_a=z_a^2$ with an $N_\mu\times r_a$ block of directions $Q_a$, taken from the sample itself (§[7.5](#pen-directions)). Because $W^c(\bar s)=W^c(s)^\dagger$, the same sample also gives the left point $\bar s_a$ with directions $Q_a^\dagger$, so $\tilde U=U^\dagger$ and the pencil is Hermitian. In the general framework the left and right points are chosen separately, and the poles are far more robust to noise when the two sets interleave than when they are separated [30]. Taking every left point as the conjugate of a right point removes that choice. It also makes $\mathbb G$ the Pick matrix of $-W^c(s)$, a Nevanlinna function of $s$, at the supports, the matrix whose positivity Fei, Yeh and Gull use to test that Matsubara data admit a positive spectral function [31]. LORRAX works with the negatives of the two Loewner matrices, which we call the **overlap matrix** $\mathbb G=-\mathbb L$ and the **projected Casida matrix** $\mathbb H=-\mathbb L_s$. In the language of linear systems, $U$ and $\tilde U$ are the generalized controllability and observability matrices of the data, and $\mathbb G$ and $\mathbb H$ are the matrices $E$ and $A$ of a realization built from the samples alone [28, 29]. With $F$ of §3.1 and the blocks $U_a=(s_a-C_\bq)^{-1}FQ_a$,
@@ -237,14 +237,14 @@ Equation (4.7) is the Rayleigh–Ritz problem of the positive definite $C_\bq$ o
 
 ## <span class="n">5</span> Where the samples go {: #supports }
 
-`gw.shared_pole_recipe.resolve_shared_pole_recipe`
+`gw.tangential_recipe.resolve_tangential_recipe`
 {: .in-code }
 
 The construction of §4 works for any supports, but its accuracy where Σ reads the model depends on their placement. LORRAX uses one support set for every irreducible $\bq$, chosen from the band energies, the requested states, $E_F$ and $\eta$ without reference to $W$ (Fig. 6.1).
 {: .intro }
 
 <figure class="flowchart" markdown>
-[![Supports of the tangential W model in the complex frequency plane](../assets/figures/theory-sharedpole-supports.png)](../assets/figures/theory-sharedpole-supports.png)
+[![Supports of the tangential W model in the complex frequency plane](../assets/figures/theory-tangential-supports.png)](../assets/figures/theory-tangential-supports.png)
 <figcaption><strong>Fig. 6.1.</strong> Production supports for Si (4×4×4 k points, η = 0.25 eV, quasiparticles requested for the 4 occupied and 4 lowest empty bands). (a) Filled circles enter the pencil, open circles are held supports that only check the model, and the dotted line marks $\omega_{\mathrm{pl}}$. The grey profile is the density of transitions $E_c-E_v$, which the poles of $W^c$ follow. With time reversal $W^c$ is even in $z$, so $\mathrm{Re}\,z<0$ needs no samples. (b) The line sites divide the area under $g^{1/2}$, the square root of the crossing density, into equal parts.</figcaption>
 </figure>
 
@@ -261,7 +261,7 @@ The pole form (2.1) is what lets Σ be evaluated in time, and the samples of $W^
 
 ### <span class="n">6.1</span> Synthesis at the Σ time nodes {: #sig-synth }
 
-`gw.mpa.sigma.synthesize_shared_pole_parents`
+`gw.mpa.sigma.synthesize_tangential_parents`
 {: .in-code }
 
 Σ is evaluated in product windows, each a set of states times an interval $P$ of sorted poles, with its own time rule $\{t_\ell,w_\ell\}$ ([Time–frequency transforms §3](time-frequency.md#windows)). At each node of a window, $W^c$ is synthesized from the poles of the interval by (2.4) in one matrix product, and it enters the self-energy as a product in real space,
@@ -325,7 +325,7 @@ The construction runs once per irreducible $\bq$ after the ISDF fit and $V_\bq$,
 
 ### <span class="n">7.1</span> Line supports {: #sup-line }
 
-`gw.shared_pole_recipe.support_rule_line_sites`
+`gw.tangential_recipe.support_rule_line_sites`
 {: .in-code }
 
 The line sites sit at equal quantiles of $g(\omega)^{1/2}$, where $g$ is the $\eta$-broadened density of crossings. The power $1/2$ spreads sites into the sparse tail and is an empirical choice, with Σ on Si insensitive to it between 0.25 and 0.75. The count is the strip law of §5, clamped:
@@ -342,7 +342,7 @@ $E$ runs over the reads, each requested state's energy plus multiples of `sigma_
 
 ### <span class="n">7.2</span> Imaginary supports {: #sup-imag }
 
-`gw.shared_pole_recipe.imaginary_sample_count`
+`gw.tangential_recipe.imaginary_sample_count`
 {: .in-code }
 
 The imaginary supports are geometric between a floor set by the gap and a ceiling above the plasma frequency, and their count is a rational-approximation count of the kind cited in §[9.2](#red-small), for the ratio $\kappa$ of the plasma ceiling to the floor:
@@ -358,7 +358,7 @@ Here $u_{\min}=\max(E_g,4\eta)$ and $u_{\max}=\max(16\ \mathrm{eV},\,\omega_{\ma
 
 ### <span class="n">7.3</span> Held supports, tiers and overrides {: #sup-held }
 
-`gw.shared_pole_recipe.resolve_shared_pole_recipe`
+`gw.tangential_recipe.resolve_tangential_recipe`
 {: .in-code }
 
 Up to four held supports are evaluated with the bank and never enter the pencil. They are the line midpoints nearest 25 % and 65 % of the ladder, and the geometric midpoints $\sqrt{u_0u_1}$ and $\sqrt{u_{n-2}u_{n-1}}$ of the first and last imaginary pairs. They feed the `held_w` diagnostic and count toward the cap of 40 samples.
@@ -392,7 +392,7 @@ with $M_{mn}(\br_\mu)=\psi^*_{m\bk-\bq}(\br_\mu)\psi_{n\bk}(\br_\mu)$ and $\Delt
 
 ### <span class="n">7.5</span> Probe directions {: #pen-directions }
 
-`gw.shared_pole_directions._select`
+`gw.tangential_directions._select`
 {: .in-code }
 
 The directions $Q_a$ of each support are read from that support's own sample, and those of the moment state from $M_1$:
@@ -405,14 +405,14 @@ A cut never splits a degenerate multiplet (relative tolerance $10^{-6}$), so a l
 
 ### <span class="n">7.6</span> The pencil as assembled {: #pencil }
 
-`gw.shared_pole_pencil.assemble_shared_pole_pencil`
+`gw.tangential_pencil.assemble_tangential_pencil`
 {: .in-code }
 
 The code's `G` and `H` are $\mathbb G$ and $\mathbb H$ of (4.5) and (4.6). Each block is three matrix products. A line support adds a conjugate state at $\bar s_a$ whose directions are its own output $W^c(z_a)Q_a$, with output and action $W^c(z_a)^\dagger W^c(z_a)Q_a$ and $\partial_sW^c(z_a)^\dagger W^c(z_a)Q_a$, so it costs no sample. The confluent entry of (4.5) applies between a line support and its conjugate state and in the diagonal block of an imaginary support. The moment state needs only $Q_\infty$, $M_1Q_\infty$ and $M_3Q_\infty$, and no full moment matrix is kept.
 
 ### <span class="n">7.7</span> Broken time reversal {: #pen-ordered }
 
-`gw.shared_pole_pencil.assemble_ordered_shared_pole_pencil`
+`gw.tangential_pencil.assemble_ordered_tangential_pencil`
 {: .in-code }
 
 When time reversal is measured broken, $W^c$ is no longer even in $z$ and the $s$ form (2.2) is lost. The construction then works in $z$ with a linear pencil whose two matrices play the roles of the Hermitian $\sigma H_\bq$ and the metric $\sigma$ of (1.3). This is §4.2 with the metric $\sigma$ kept, so $\mathbb G=U^\dagger\sigma U$ is indefinite. Every support gets a conjugate state and mirror states at $-z$ and $-\bar z$ read from the partner $-\bq$. The moment state needs the moments $M_0$ to $M_3$ of the expansion $W^c=\sum_n2M_nz^{-(n+1)}$, of which $M_0$ and $M_2$ vanish under time reversal, and the Gram keep cut is $10^{-7}$. Each $\bq$ stores positive poles only, and its negative side is the partner's positive side, transposed:
@@ -425,14 +425,14 @@ The particle–hole pairing $W_\bq(z)=W_{-\bq}(-z)^{\mathsf T}$ then holds by st
 
 ### <span class="n">7.8</span> Reduction to poles {: #ritz }
 
-`gw.shared_pole_reduction.reduce_shared_pole_pencil`
+`gw.tangential_reduction.reduce_tangential_pencil`
 {: .in-code }
 
 The pencil is truncated to its well-conditioned span, whitened and diagonalized, which solves (4.7) stably. $\mathbb G$ is equilibrated by its diagonal, its eigendirections with $\gamma>10^{-8}\gamma_{\max}$ are kept up to the pole budget, the kept metric is whitened by a coupled Newton–Schulz iteration, $Z^\dagger\mathbb GZ=I$, and the Hermitian part of $Z^\dagger\mathbb HZ$ is diagonalized. Its eigenvalues are the $\Omega_{j\bq}^2$, and the factors are $\mathbb W$ applied to the Ritz vectors as in (4.7). Ritz values $\Omega^2\le10^{-6}$ Ry² are dropped while the dropped factor weight stays within $10^{-6}$ of the total, and beyond that the run refuses, so no weight is discarded silently.
 
 ### <span class="n">7.9</span> The pole count {: #ritz-count }
 
-`gw.shared_pole_reduction._within_budget`
+`gw.tangential_reduction._within_budget`
 {: .in-code }
 
 The pole count is a rank, set per $\bq$ by the smaller of the numerical rank of the equilibrated $\mathbb G$ and the budget:
@@ -441,11 +441,11 @@ $$
 K_\bq=\min\Big(\#\big\{\gamma>10^{-8}\gamma_{\max}\big\},\ \lceil1.8\,N_\mu\rceil\Big) \tag{7.6}
 $$
 
-$K_\bq$ can sit a few below the budget where a multiplet straddles the cut. The budget keeps storage at $16N_\mu K_\bq$ bytes and the synthesis of (6.1) at $\mathcal O(N_\mu^2K_\bq)$ per node. On Si the budget gives 0.80 meV QP RMS against a contour-deformation reference and an uncapped store 0.29 meV (LORRAX `docs/theory/shared-pole-w-model.md` §6.3).
+$K_\bq$ can sit a few below the budget where a multiplet straddles the cut. The budget keeps storage at $16N_\mu K_\bq$ bytes and the synthesis of (6.1) at $\mathcal O(N_\mu^2K_\bq)$ per node. On Si the budget gives 0.80 meV QP RMS against a contour-deformation reference and an uncapped store 0.29 meV (LORRAX `docs/theory/tangential-w-model.md` §6.3).
 
 ### <span class="n">7.10</span> Gates {: #ritz-gates }
 
-`gw.shared_pole_gates`
+`gw.tangential_gates`
 {: .in-code }
 
 Every model is checked before it is stored, and each gate row is written to the receipt with its value, threshold and verdict. Passivity is checked on the model in the Coulomb-whitened form,
@@ -466,7 +466,7 @@ where $\mathrm{Re}$ denotes the Hermitian part. The condition holds for the exac
 
 ### <span class="n">7.11</span> Under self-consistency {: #bank-sc }
 
-`gw.shared_pole_recipe._held_line_sites`
+`gw.tangential_recipe._held_line_sites`
 {: .in-code }
 
 Under `qp_solver = self_consistent` each map rebuilds the samples, directions and poles from its own states, but two things are held so that successive maps stay comparable. The imaginary ladder's envelope only widens, and while it holds, the line sites stay unless the support rule would move one by more than $\max(3\ \mathrm{meV},\,0.1\times$ the last SC residual$)$. A larger move or a larger count re-plans the line and is logged as `line_site_replan`. The bank's time rule (§6.2) is reused while the new transition interval lies inside the old one, the occupation envelope is no wider, the material class is unchanged and the supports are identical. Otherwise it is rebuilt on an interval padded by 4 eV, and the log names the failed test (`Response rule rebuilt at a held map`). A map whose model fits in half the device budget keeps it on the devices and writes no `model.h5`, unless an export asks for one. The loop itself is on [Quasiparticle self-consistency](qsgw.md).
@@ -478,27 +478,27 @@ The keys below change what this page computes, and full entries are on the [GW i
 
 ### <span class="n">8.1</span> Selecting the model {: #model-select }
 
-`gw.shared_pole_screening.screen_shared_poles`
+`gw.tangential_screening.screen_tangential_poles`
 {: .in-code }
 
-The deck and the code keep the model's earlier name, `shared_pole`. The production route needs both lines in the deck, because `sigma_w_model` defaults to `mpa` (the elementwise fit) and `compute_mode = auto` never selects `mpa`.
+Until 2026-10-21 the deck value was `shared_pole`; that spelling is still accepted, with a note in the log. The production route needs both lines in the deck, because `sigma_w_model` defaults to `mpa` (the elementwise fit) and `compute_mode = auto` never selects `mpa`.
 
 ```ini
 compute_mode  = mpa
-sigma_w_model = shared_pole
+sigma_w_model = tangential
 ```
 
 <span class="status production">Production</span> for insulators, metals and time-reversal-broken decks. The other treatments and the comparison table are on [Frequency treatments](frequency-treatments.md#compare).
 
 !!! refuses
-    - `sigma_w_model` named with `compute_mode` other than `mpa` (`GATE shared_pole_applicability`). Set `compute_mode = mpa`.
-    - `sigma_w_accuracy` or `sigma_w_support_sites_ev` named without `sigma_w_model = shared_pole` (`GATE shared_pole_applicability`).
-    - `mpa_pole_batch_size`, `mpa_fit_reuse_file` or `mpa_overwrite_completed_artifacts` under `shared_pole`, and with `head_correction = off` also every MPA sampling key (`GATE shared_pole_unused_inputs`). Remove them.
+    - `sigma_w_model` named with `compute_mode` other than `mpa` (`GATE tangential_applicability`). Set `compute_mode = mpa`.
+    - `sigma_w_accuracy` or `sigma_w_support_sites_ev` named without `sigma_w_model = tangential` (`GATE tangential_applicability`).
+    - `mpa_pole_batch_size`, `mpa_fit_reuse_file` or `mpa_overwrite_completed_artifacts` under `tangential`, and with `head_correction = off` also every MPA sampling key (`GATE tangential_unused_inputs`). Remove them.
     - `sigma_regularization_ev` not finite and positive (`GATE sigma_regularization`).
 
 ### <span class="n">8.2</span> The static member and other readers {: #sig-static }
 
-`gw.mpa.sigma.shared_pole_static_wc`
+`gw.mpa.sigma.tangential_static_wc`
 {: .in-code }
 
 The synthesis of (6.1) with the weight $-1/\Omega_j$ in place of the time factor gives one branch of $W^c_\bq(0)$, and the two branches add to the static value of §2.1. With `write_restart_tensors = true` (default) the restart bundle stores $W_\bq(0)=V_\bq+W^c_\bq(0)$ as `W0_qmunu` for the BSE, written by `screening.restart_static_w`. It is skipped, with a printed reason, on a metal, or under `head_correction = full` when there is no $\omega=0$ head sample. `write_poles = true` exports the stored factors with $\Omega^2$ and $K$, which is complete for any static-$W$ consumer. The $\bq\to0$ head reads the body of the model at Γ ([The q → 0 head](q0-head.md)), and on a time-reversal-broken store, metals included, it folds the signed body.
@@ -508,7 +508,7 @@ The synthesis of (6.1) with the weight $-1/\Omega_j$ in place of the time factor
 | Key | Default | Role here |
 |---|---|---|
 | [`compute_mode`](../drivers/gw/keywords.md#compute_mode) | `auto` | Must be `mpa`; `auto` never selects it. |
-| [`sigma_w_model`](../drivers/gw/keywords.md#sigma_w_model) | `mpa` | `shared_pole` selects this model. |
+| [`sigma_w_model`](../drivers/gw/keywords.md#sigma_w_model) | `mpa` | `tangential` selects this model. |
 | [`sigma_w_accuracy`](../drivers/gw/keywords.md#sigma_w_accuracy) | `production` | Recipe tier, which sets every constant of §[8.4](#keys-recipe). `relaxed` also defaults an omitted `sigma_quadrature_eps` to `5e-4`. |
 | [`sigma_regularization_ev`](../drivers/gw/keywords.md#sigma_regularization_ev) | `0.25` | $\eta$, which sets $h=\max(2.6\ \mathrm{eV},4\eta)$, $u_{\min}=\max(E_g,4\eta)$ and the width of $g$. |
 | [`sigma_w_support_sites_ev`](../drivers/gw/keywords.md#sigma_w_support_sites_ev) | empty | Explicit line and imaginary sites and an optional height (§[7.3](#sup-held)). Debug. |
@@ -523,9 +523,9 @@ The synthesis of (6.1) with the weight $-1/\Omega_j$ in place of the time factor
 | [`write_w`](../drivers/gw/keywords.md#write_w) | `false` | Dumps the whole sample bank to `tmp/mpa/<label>_w.h5`. Debug. |
 | [`write_restart_tensors`](../drivers/gw/keywords.md#write_restart_tensors) | `true` | Stores `W0_qmunu` (§[8.2](#sig-static)) and registers a one-shot `model.h5` as a restart member. |
 | [`restart`](../drivers/gw/keywords.md#restart_1) | `false` | One-shot: reuses a restart member of the same identity and skips bank, moments and construction. SC maps rebuild. |
-| [`head_correction`](../drivers/gw/keywords.md#head_correction) | `full` | Γ head on the shared-pole body, which folds the signed body on a time-reversal-broken store. With the head on, the MPA sampling keys configure the head fit. |
+| [`head_correction`](../drivers/gw/keywords.md#head_correction) | `full` | Γ head on the tangential body, which folds the signed body on a time-reversal-broken store. With the head on, the MPA sampling keys configure the head fit. |
 | [`qp_solver`](../drivers/gw/keywords.md#qp_solver) | `auto` | `self_consistent` rebuilds the model every map (§[7.11](#bank-sc)). |
-| [`bispinor_gw`](../drivers/gw/keywords.md#bispinor_gw) | `bare_transverse` | `full_shared_pole` builds charge, current and cross sector models from one photon bank, not covered here. |
+| [`bispinor_gw`](../drivers/gw/keywords.md#bispinor_gw) | `bare_transverse` | `full_tangential` builds charge, current and cross sector models from one photon bank, not covered here. |
 | [`linalg`](../drivers/gw/keywords.md#linalg), [`memory_per_device_gb`](../drivers/gw/keywords.md#memory_per_device_gb) | `local`, `0.0` | Execution route and residence of bank and model, with no effect on the model. |
 
 ### <span class="n">8.4</span> Recipe constants {: #keys-recipe }
@@ -560,13 +560,13 @@ Paths are under `tmp/mpa/`, and `<label>` is `oneshot`, or `sc_NNNN` for SC map 
 
 <div class="file-list" markdown>
 
-`<label>_shared_pole/model.h5`
-:   Schema `lorrax.shared-real-pole.v1`: `factor` $[\bq,\mu,\text{comp},K_{\max}]$ complex128 $=\sqrt{2\Omega_{j\bq}}\,b_{j\bq}(\mu)$ in Ry$^{3/2}$, `poles2_ry2` $[\bq,K_{\max}]$ $=\Omega^2_{j\bq}$, `K` $[\bq]$ and `header_json` (identity, resolved recipe, `recipe_hash`, `support_top_ev`, `support_reads_ev`). Inactive columns hold $b=0$, $\Omega^2=1$ Ry². A $\bq$ costs $16N_\mu K_\bq$ bytes.
+`<label>_tangential/model.h5`
+:   Schema `lorrax.tangential.v1` (`lorrax.shared-real-pole.v1` before 2026-10-21, still read): `factor` $[\bq,\mu,\text{comp},K_{\max}]$ complex128 $=\sqrt{2\Omega_{j\bq}}\,b_{j\bq}(\mu)$ in Ry$^{3/2}$, `poles2_ry2` $[\bq,K_{\max}]$ $=\Omega^2_{j\bq}$, `K` $[\bq]$ and `header_json` (identity, resolved recipe, `recipe_hash`, `support_top_ev`, `support_reads_ev`). Inactive columns hold $b=0$, $\Omega^2=1$ Ry². A $\bq$ costs $16N_\mu K_\bq$ bytes.
 
-`<label>_shared_pole/*_receipt.json`
+`<label>_tangential/*_receipt.json`
 :   Bank, moment, constructor and head receipts, with every gate row's value, threshold and verdict.
 
-`<label>_shared_pole/bank.h5`
+`<label>_tangential/bank.h5`
 :   Scratch on the file tier only: $W^c$, $\partial_sW^c$, the line panels, $M_1$, $M_3$. Deleted after construction unless `write_w = true`.
 
 `<label>_poles.h5`

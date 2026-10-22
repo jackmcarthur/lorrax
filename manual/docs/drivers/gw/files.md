@@ -66,10 +66,10 @@ Relative paths in `wfn_file`, `centroids_file`, `centroids_file_current`, `kin_i
 :   $\zeta_{\bq\mu}(\bG)$ with its fit provenance.
 
 `tmp/mpa/`
-:   Shared-pole models and exports, or the elementwise-MPA sample and fit stores.
+:   Tangential models and exports, or the elementwise-MPA sample and fit stores.
 
 `tmp/sigma_checkpoint_oneshot_on_shell.h5`, `tmp/sigma_checkpoint_oneshot.h5`
-:   One-shot shared-pole runs whose Σ sweep took at least 5× its predicted write (`write_restart_tensors = true`): the swept on-shell pair and slots, or under `sigma_omega_grid_debug = true` the Σ(ω) cubes. Reused on `restart = true`.
+:   One-shot tangential runs whose Σ sweep took at least 5× its predicted write (`write_restart_tensors = true`): the swept on-shell pair and slots, or under `sigma_omega_grid_debug = true` the Σ(ω) cubes. Reused on `restart = true`.
 
 `<run>/gwjax.out`
 :   The run report (`report_file`).
@@ -220,7 +220,7 @@ tmp/isdf_tensors_<N_mu>.h5
   [whead]                          complex128[n_w]                  @omega_grid [@head_correction @response_kind @head_source]
   [S_cart_head]                    complex128[3, 3]                 @convention @omega_ry
   [W0_lr/]                         Ft P gvec v q_frac               @n_z @sys_dim @head_kernel @convention
-  [shared_pole_member]             bytes[4]         path, schema, digest, iteration_id
+  [tangential_member]             bytes[4]         path, schema, digest, iteration_id
 ```
 
 
@@ -262,15 +262,15 @@ tmp/zeta_q.h5
 
 $N_q$ is the q-irreducible wedge when the centroid set is orbit-closed, else every q point; the G sphere is $|\bq+\bG|^2\le$ `zeta_cutoff`. The file is written only when `write_restart_tensors = true`. `fit_provenance` is stamped after `zeta_is_done`, and not at all when `LORRAX_MAX_RCHUNKS` truncated the fit. The file is not named by $N_\mu$: two runs in one directory share it.
 
-## Shared-pole and MPA stores {: #mpa-stores }
+## Tangential and MPA stores {: #mpa-stores }
 
-`shared_pole_store.write_shared_pole_model`
+`tangential_store.write_tangential_model`
 {: .in-code }
 
-With `sigma_w_model = shared_pole`, each screening build writes `tmp/mpa/<label>_shared_pole/`, where `<label>` is `oneshot` or `sc_<NNNN>`. Its `model.h5`, schema `lorrax.shared-real-pole.v1`, holds $W^c_\bq(\mu,\nu;z)=\sum_j b_{j\bq}(\mu)b^*_{j\bq}(\nu)\big[(z-\Omega_{j\bq})^{-1}-(z+\Omega_{j\bq})^{-1}\big]$, with $b$ normalised as in [Tangential W model §2.1](../../theory/shared-pole-w.md#model-form):
+With `sigma_w_model = tangential`, each screening build writes `tmp/mpa/<label>_tangential/`, where `<label>` is `oneshot` or `sc_<NNNN>`. Its `model.h5`, schema `lorrax.tangential.v1` (`lorrax.shared-real-pole.v1` before 2026-10-21, still read), holds $W^c_\bq(\mu,\nu;z)=\sum_j b_{j\bq}(\mu)b^*_{j\bq}(\nu)\big[(z-\Omega_{j\bq})^{-1}-(z+\Omega_{j\bq})^{-1}\big]$, with $b$ normalised as in [Tangential W model §2.1](../../theory/tangential-w.md#model-form):
 
 ```tree
-tmp/mpa/<label>_shared_pole/model.h5
+tmp/mpa/<label>_tangential/model.h5
   lorrax_io_committed              int32[1]
   header_json                      bytes            canonical JSON: identity, recipe, digest, ...
   final_commit                     bytes            header digest; present once complete

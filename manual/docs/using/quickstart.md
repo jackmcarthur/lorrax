@@ -118,7 +118,7 @@ nval           = 4                        # valence bands in the QP window
 ncond          = 8                        # conduction bands in the QP window
 number_bands   = 60                       # top of the chi0 and Sigma band sums
 compute_mode   = mpa
-sigma_w_model  = shared_pole
+sigma_w_model  = tangential
 qp_solver      = one_shot_dft
 ```
 
@@ -156,20 +156,27 @@ A step has finished when its report ends with `LORRAX … completed.`; a refused
 
 ## 5. Excitons {: #bse }
 
-```bash
-$RUN bse.bse_jax -i gw.in --bse --tda --n-val 4 --n-cond 4 --n-occ 8 --eqp eqp1.dat
+Add the BSE keys to `gw.in` (BerkeleyGW's absorption.inp names):
+
+```ini
+number_val_bands_fine = 4
+number_cond_bands_fine = 4
+eqp_corrections = eqp1.dat
 ```
 
-[`bse`](../drivers/bse/index.md) reads the one restart bundle in `tmp/` beside the deck (two refuse), applies the QP energies of `eqp1.dat`, and prints the lowest exciton energies to `bse.out`. Band counts include spinor bands: Si with spin–orbit coupling has 8 occupied bands. A window edge inside a degenerate multiplet refuses; `--band-degeneracy snap` widens it.
+```bash
+$RUN bse.bse_jax -i gw.in
+```
+
+[`bse`](../drivers/bse/index.md) reads the one restart bundle in `tmp/` beside the deck (two refuse), applies the QP energies of `eqp1.dat`, and prints the lowest exciton energies to `bse.out`. Band counts include spinor bands: Si with spin–orbit coupling has 8 occupied bands. A window edge inside a degenerate multiplet refuses; `band_degeneracy = snap` widens it.
 
 ## 6. Absorption spectrum {: #absorption }
 
 ```bash
-VCELL=$(python -c "import h5py; print(h5py.File('WFN.h5','r')['mf_header/crystal/celvol'][()])")
-$RUN bse.absorption_haydock -i gw.in --n-val 4 --n-cond 4 --n-occ 8 --V-cell $VCELL --eqp eqp1.dat --eta-eV 0.1
+$RUN bse.absorption_haydock -i gw.in
 ```
 
-`bse.absorption_haydock` runs the Haydock recursion on the same BSE Hamiltonian, one seed per Cartesian polarization, and writes $\varepsilon_2(\omega)$, $\varepsilon_1(\omega)$ and the joint density of states to `absorption_haydock_b1_eh.dat`, `_b2_`, `_b3_` (columns: ω in eV, $\varepsilon_2$, $\varepsilon_1$, JDOS) and `absorption_haydock.h5`. `--V-cell` is the cell volume in bohr³. It needs at least two devices.
+`bse.absorption_haydock` runs the Haydock recursion on the same BSE Hamiltonian, one seed per Cartesian polarization, and writes $\varepsilon_2(\omega)$, $\varepsilon_1(\omega)$ and the joint density of states to `absorption_haydock_b1_eh.dat`, `_b2_`, `_b3_` (columns: ω in eV, $\varepsilon_2$, $\varepsilon_1$, JDOS) and `absorption_haydock.h5`, broadened by `energy_resolution` (0.1 eV). The cell volume and spinor count come from the WFN. It needs at least two devices.
 
 ## Next {: #next }
 

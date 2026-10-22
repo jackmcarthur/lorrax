@@ -60,8 +60,8 @@ The H-transform is not a separate run. The driver builds the Galerkin basis and 
 | `WFN.h5` | always | the H-transform; under `refit` a second time, with `--refit-guard-bands` more bands, for the ζ′ pair densities |
 | centroid table | always | the points $\br_\mu$ at which $\psi_{c\,\bk+\bQ}$ is evaluated |
 | `zeta_q.h5` | `--vq-mode` `interp`, `both`, `refit` | `interp` and `both`: every stored ζ tile, full BZ; `refit`: metadata and `fit_provenance` only, so IBZ storage is enough |
-| `eqp1.dat` | `--eqp` | QP energies on both legs ([Theory §2.3](theory.md#bands-qp)) |
-| `dipole.h5` | `--head-minibz-average` or `head_minibz_average`, on `interp` and `both` | the head tensor of [Theory §3.4](theory.md#ex-head); `--dipole` names it, default beside the deck |
+| `eqp1.dat` | `eqp_corrections` | QP energies on both legs ([Theory §2.3](theory.md#bands-qp)) |
+| `dipole.h5` | `--head-minibz-average` or `head_minibz_average`, on `interp` and `both` | the head tensor of [Theory §3.4](theory.md#ex-head); `dipole_file` names it, default beside the deck |
 
 `ongrid` reads no ζ. File formats are on the [Files](files.md#inputs) page.
 
@@ -71,12 +71,12 @@ The driver loads its $\bQ$-independent data through the optical BSE's own code, 
 
 - restart discovery and its one-bundle refusal;
 - the loader: band window and degeneracy guard, ζ-training check, $\bq\to0$ head injection with the deck's `vhead` and `whead_0freq` overrides, and the rebuild of a missing static $W$ from the restart;
-- `bse_k_grid` densification with `w_head_densify` ([Theory §4.4](theory.md#w-fine));
+- `kgrid_fine` densification with `w_head_densify` ([Theory §4.4](theory.md#w-fine));
 - the `eqp1.dat` reader and its re-slice of the window;
 - the `dipole.h5` reader and its basis check;
 - the production stack matvec and the device mesh.
 
-`bse.bse_jax` needs none of the centroid table, `WFN.h5` for interpolation, or `zeta_q.h5`. `--dipole` names a different use in each driver: exciton dipoles there, the head tensor here. This driver has no `--n-occ`; the occupied count is the WFN's `ifmax`.
+`bse.bse_jax` needs none of the centroid table, `WFN.h5` for interpolation, or `zeta_q.h5`. `dipole_file` names a different use in each driver: exciton dipoles there, the head tensor here. This driver has no `highest_occupied_band`; the occupied count is the WFN's `ifmax`.
 
 ## Caches {: #caches }
 

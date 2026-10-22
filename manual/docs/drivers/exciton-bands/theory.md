@@ -41,7 +41,7 @@ $$
 \langle cv\bk|H_\bQ|c'v'\bk'\rangle = \big(E^{\mathrm{QP}}_{c\,\bk+\bQ}-E^{\mathrm{QP}}_{v\bk}\big)\,\delta_{cc'}\delta_{vv'}\delta_{\bk\bk'} + \langle cv\bk|V_\bQ - W|c'v'\bk'\rangle, \qquad H_\bQ A^{S\bQ} = \Omega_S(\bQ)\,A^{S\bQ} \tag{1.2}
 $$
 
-$v$ runs over the `--n-val` highest occupied bands and $c$ over the `--n-cond` lowest empty ones, on the $N_k$ points of the restart's $\bk$ grid. At $\bQ = 0$ this is the optical TDA Hamiltonian of the [`bse`](../bse/theory.md) driver. There is no non-TDA route.
+$v$ runs over the `number_val_bands_fine` highest occupied bands and $c$ over the `number_cond_bands_fine` lowest empty ones, on the $N_k$ points of the restart's $\bk$ grid. At $\bQ = 0$ this is the optical TDA Hamiltonian of the [`bse`](../bse/theory.md) driver. There is no non-TDA route.
 
 ### <span class="n">1.3</span> Exchange and direct kernels at Q {: #kernels }
 
@@ -79,7 +79,7 @@ The eigenvalues give $E_{c\,\bk+\bQ}$ through the inverse of $f$. The basis is f
 `bse_setup.resolve_conduction_window`
 {: .in-code }
 
-$f(H)$ is built over the deck's full window, $[n_\mathrm{elec}-n_\mathrm{val},\, n_\mathrm{elec}+n_\mathrm{cond})$ with the deck's `nval` and `ncond`, and the BSE conduction bands are returned from its interior. With $n_c$ = `--n-cond` the number of conduction guard bands above them is:
+$f(H)$ is built over the deck's full window, $[n_\mathrm{elec}-n_\mathrm{val},\, n_\mathrm{elec}+n_\mathrm{cond})$ with the deck's `nval` and `ncond`, and the BSE conduction bands are returned from its interior. With $n_c$ = `number_cond_bands_fine` the number of conduction guard bands above them is:
 
 $$
 n_\mathrm{guard} = n_\mathrm{cond} - n_c \tag{2.2}
@@ -92,7 +92,7 @@ Fewer than four guards let the window edge ring off the grid; more than 16 widen
 `bse_window.apply_eqp_to_bse_window`
 {: .in-code }
 
-Without `--eqp` the energies are the mean-field $E_{n\bk}$ of the restart and $E^{\mathrm{QP}} = E$ in (1.2). With `--eqp eqp1.dat` the wedge corrections are unfolded by symmetry and applied to both legs: the stored valence and conduction energies, re-sliced on the corrected spectrum, and the energies $f(H)$ is built from, so $E^{\mathrm{QP}}_{c\,\bk+\bQ}$ is an interpolated QP band. Off-diagonal QP mixing is not represented. A full QP exciton band structure needs a restart built from `WFN_qp.h5`.
+Without `eqp_corrections` the energies are the mean-field $E_{n\bk}$ of the restart and $E^{\mathrm{QP}} = E$ in (1.2). With `eqp_corrections = eqp1.dat` the wedge corrections are unfolded by symmetry and applied to both legs: the stored valence and conduction energies, re-sliced on the corrected spectrum, and the energies $f(H)$ is built from, so $E^{\mathrm{QP}}_{c\,\bk+\bQ}$ is an interpolated QP band. Off-diagonal QP mixing is not represented. A full QP exciton band structure needs a restart built from `WFN_qp.h5`.
 
 ### <span class="n">2.4</span> The check at Γ {: #bands-gate }
 
@@ -263,12 +263,12 @@ $$
 
 $\mathsf S$ is the $\bq\to0$ response tensor; $S(\Gamma)$ is the average over the fine mini-BZ cell (`--w-head-gamma-cell fine`), and the scale is pinned to the restart's $w^{\mathrm{head}}$. On equal grids the result is the native $W$ bit for bit. The route is compared with `srlr` on [Short- and long-range W §3.3](../../theory/w-range-splitting.md#c1).
 
-### <span class="n">4.4</span> Fine BSE grid with `bse_k_grid` {: #w-fine }
+### <span class="n">4.4</span> Fine BSE grid with `kgrid_fine` {: #w-fine }
 
 `bse_densify._interpolate_bse_data_to_grid`
 {: .in-code }
 
-With the deck key `bse_k_grid` the loader moves the whole problem to the finer grid before the driver starts: states and energies by H-transform, $W$ by the same interpolant with `w_head_densify = c1` (as in 4.3) or `srlr`, which subtracts a fitted long-range model $\mathrm{LR}_m$ with window $w(|\bq|)$ from every coarse tile and adds it back at every fine $\bq$:
+With the deck key `kgrid_fine` the loader moves the whole problem to the finer grid before the driver starts: states and energies by H-transform, $W$ by the same interpolant with `w_head_densify = c1` (as in 4.3) or `srlr`, which subtracts a fitted long-range model $\mathrm{LR}_m$ with window $w(|\bq|)$ from every coarse tile and adds it back at every fine $\bq$:
 
 $$
 W_{\bq_f} = T\big[W - w\,\mathrm{LR}_m\big]_{\bq_f} + w\,\mathrm{LR}_m(\bq_f) \tag{4.4}
@@ -299,13 +299,13 @@ The exchange goes through the transition density $\rho(\br_\mu)$ and $V_\bQ$; th
 `build_path_solver`
 {: .in-code }
 
-For each $\bQ$ the pair amplitude $\psi^*_{c\,\bk+\bQ}(\br_\mu)\psi_{v\bk}(\br_\mu)$ is formed once, then a fixed-depth block Lanczos with full reorthogonalization returns the lowest `--n-eig` Ritz values:
+For each $\bQ$ the pair amplitude $\psi^*_{c\,\bk+\bQ}(\br_\mu)\psi_{v\bk}(\br_\mu)$ is formed once, then a fixed-depth block Lanczos with full reorthogonalization returns the lowest `number_eigenvalues` Ritz values:
 
 $$
 H_\bQ A^{S\bQ} = \Omega_S(\bQ)\,A^{S\bQ}, \qquad S = 1,\dots,n_\mathrm{eig}, \qquad \dim\mathcal K = b\cdot\min\!\big(n_\mathrm{iter},\ \lfloor n_v n_c N_k / b\rfloor\big) \tag{5.2}
 $$
 
-$b$ is `--block-size` and $n_\mathrm{iter}$ is `--max-iter`. The start block has no weight on mesh pad slots. The whole $\bQ$ list, with certification and spot-check rows, is one `lax.scan`: one compile serves every point, and extra points cost one scan row each.
+$b$ is `block_size` and $n_\mathrm{iter}$ is `solver_max_iter`. The start block has no weight on mesh pad slots. The whole $\bQ$ list, with certification and spot-check rows, is one `lax.scan`: one compile serves every point, and extra points cost one scan row each.
 
 ### <span class="n">5.3</span> Output {: #solve-out }
 

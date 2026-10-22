@@ -52,7 +52,7 @@ A partly filled band is in both supports. The same predicate cuts the χ⁰ sums
 
 ### <span class="n">1.4</span> One state per map {: #occ-map }
 
-Each QSGW map solves its occupations and $E_F$ from the spectrum of the Hamiltonian it was handed, and that one state reaches χ⁰, the head, the shared-pole recipe and Σ. $E_F$ is never mixed. The map $F[H]$ is then a function of $H$ alone, with $f$ and $E_F$ functions of $H$, and its fixed points are unchanged. The loop is on [Quasiparticle self-consistency §2.2](qsgw.md#om-occ).
+Each QSGW map solves its occupations and $E_F$ from the spectrum of the Hamiltonian it was handed, and that one state reaches χ⁰, the head, the tangential recipe and Σ. $E_F$ is never mixed. The map $F[H]$ is then a function of $H$ alone, with $f$ and $E_F$ functions of $H$, and its fixed points are unchanged. The loop is on [Quasiparticle self-consistency §2.2](qsgw.md#om-occ).
 
 ### <span class="n">1.5</span> Smeared occupations on an insulator {: #occ-insulator }
 
@@ -157,16 +157,16 @@ A folded head (`head_correction = full`) uses the folded $S(0)$ and the static f
 
 ### <span class="n">3.4</span> Head routes on a metal {: #head-routes }
 
-The metallic head is bulk only: a `sys_dim = 2` metal refuses in the cell average. Both `head_correction = no_local_fields` (the direct head) and `full` (scalar decks) are admitted; a time-reversal-broken metal refuses `full` on the shared-pole route (`GATE shared_pole_head_ordered`): its static $z=0$ slot is not certified without time reversal. Every metallic head, including the frozen DFT head of `sc_head_update = off`, uses the fixed-N Fermi–Dirac state of §1. On a self-consistent run the per-map heads `dft_velocity` and `parallel_transport` require `sigma_w_model = shared_pole`.
+The metallic head is bulk only: a `sys_dim = 2` metal refuses in the cell average. Both `head_correction = no_local_fields` (the direct head) and `full` (scalar decks) are admitted; a time-reversal-broken metal refuses `full` on the tangential route (`GATE tangential_head_ordered`): its static $z=0$ slot is not certified without time reversal. Every metallic head, including the frozen DFT head of `sc_head_update = off`, uses the fixed-N Fermi–Dirac state of §1. On a self-consistent run the per-map heads `dft_velocity` and `parallel_transport` require `sigma_w_model = tangential`.
 
 ## <span class="n">4</span> Screening and Σ on a metal {: #sigma }
 
-The production metal model is the shared-pole $W$ with occupation-weighted Σ branches. The head carries the same per-state occupations.
+The production metal model is the tangential $W$ with occupation-weighted Σ branches. The head carries the same per-state occupations.
 {: .intro }
 
 ### <span class="n">4.1</span> The metal model of W {: #sigma-w }
 
-A metal deck sets `compute_mode = mpa` and `sigma_w_model = shared_pole`. The default `sigma_w_model` is `mpa` (elementwise poles), which on a metal is a comparison route and refuses when time reversal is measured broken (`GATE mpa_ordered_metal`). The shared-pole bank carries the signed metallic weights through its occupation envelope ([Tangential W model §6.3](shared-pole-w.md#bank-accuracy)). The scalar head is fitted on the metal MPA plan of §2.2: the body's own grid on elementwise MPA, a plan of its own with the shared-pole Γ body evaluated on it under `shared_pole` ([The q → 0 head §3.1](q0-head.md#poles-samples)).
+A metal deck sets `compute_mode = mpa` and `sigma_w_model = tangential`. The default `sigma_w_model` is `mpa` (elementwise poles), which on a metal is a comparison route and refuses when time reversal is measured broken (`GATE mpa_ordered_metal`). The tangential bank carries the signed metallic weights through its occupation envelope ([Tangential W model §6.3](tangential-w.md#bank-accuracy)). The scalar head is fitted on the metal MPA plan of §2.2: the body's own grid on elementwise MPA, a plan of its own with the tangential Γ body evaluated on it under `tangential` ([The q → 0 head §3.1](q0-head.md#poles-samples)).
 
 ### <span class="n">4.2</span> Occupation-weighted Σ branches {: #sigma-branches }
 
@@ -205,7 +205,7 @@ Treatments and routes that assume a gap or integer occupations refuse a metallic
 | Route | On a metal | Gate |
 |---|---|---|
 | `compute_mode = x_only` | runs | — |
-| `compute_mode = mpa`, `sigma_w_model = shared_pole` | production | — |
+| `compute_mode = mpa`, `sigma_w_model = tangential` | production | — |
 | `compute_mode = mpa`, `sigma_w_model = mpa` | runs if time reversal holds | `mpa_ordered_metal` |
 | `compute_mode = gn_ppm` | refuses | `gn_ppm_refuses_metals` |
 | `compute_mode = cohsex`, `hl_ppm` | refuses | `fractional_occupations_require_mpa` |
@@ -220,8 +220,8 @@ Treatments and routes that assume a gap or integer occupations refuse a metallic
     - `fermi_reference` other than `mp1_fixed_n`.
     - `occ_broadening > 0` beside `occ_smearing_width_ry`.
     - `sys_dim = 2`: the metallic head is bulk only.
-    - `head_correction = full` on a time-reversal-broken metal, shared-pole route. Use `no_local_fields`.
-    - A per-map velocity head (`dft_velocity`, `parallel_transport`) without `sigma_w_model = shared_pole`, or on a route with no metallic completion.
+    - `head_correction = full` on a time-reversal-broken metal, tangential route. Use `no_local_fields`.
+    - A per-map velocity head (`dft_velocity`, `parallel_transport`) without `sigma_w_model = tangential`, or on a route with no metallic completion.
     - A `dipole.h5` built with another velocity operator, on every head route; one written for another WFN or band window, on the folded `full` head (`GATE dft_head_dipole_provenance`; the direct head only warns unless `LORRAX_SANITY=strict`, [The q → 0 head §1.4](q0-head.md#sources)). Rerun the [dipole utility](../utilities/dipole.md) after fixing the window.
 
 ## Notation {: #notation }
@@ -238,7 +238,7 @@ Treatments and routes that assume a gap or integer occupations refuse a metallic
 | $\chi^{\mathrm{intra}}(\bq,z)$ | anisotropic Fermi-surface Lindhard function |
 | $N_0$, $\kappa^2$ | density of states at $E_F$ per volume; Thomas–Fermi wavevector squared |
 | $\epsilon_\infty$ | interband dielectric tensor $1-8\pi S(0)$ |
-| $b_{j\bq}$, $\Omega_{j\bq}$ | shared-pole vectors and poles of $W^c$ |
+| $b_{j\bq}$, $\Omega_{j\bq}$ | tangential vectors and poles of $W^c$ |
 
 ## References {: #refs }
 

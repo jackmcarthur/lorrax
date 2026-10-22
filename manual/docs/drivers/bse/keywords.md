@@ -5,12 +5,12 @@ page: keywords
 
 # Input keywords
 
-`bse.bse_jax` Every command-line flag and deck key the BSE driver and `bse.absorption_haydock` read.
+`bse.bse_jax` Every deck key the BSE driver and `bse.absorption_haydock` read, and the four command-line flags.
 {: .page-summary }
 
 <div class="chain-map" data-driver="bse" data-page="keywords"></div>
 
-`bse.bse_jax` takes command-line flags; deck keys are written `key = value` in the GW deck passed with `-i`. Defaults are read from the keyword schema (`src/bse/bse_jax.py` and `src/bse/absorption_haydock.py` argument parsers, `src/gw/gw_config.py` `_DEFAULTS`). The CLI is strict: an unknown flag refuses, and so does a flag set away from its default on a route that does not read it. Where a flag has a BerkeleyGW counterpart in `kernel.inp` or `absorption.inp`, the details name it.
+The BSE settings are deck keys in the deck passed with `-i` (the GW deck), under BerkeleyGW's `absorption.x` names wherever the meaning is the same. A key is written `key = value`, or as in BerkeleyGW's inputs: `key value` without `=`, and a bare flag (`full_bse`) for `full_bse = true`, so `absorption.inp` lines can be pasted. The command line keeps `-i`, `--px`/`--py`, `--report-file` and `--out-prefix`. An old command-line flag refuses with its new name ("`--n-val` is now deck key `number_val_bands_fine`"), and so does an old deck key ("`bse_k_grid` is now `kgrid_fine`"). A key that only another route reads refuses on the route that would ignore it. Defaults are the drivers' own (`src/bse/bse_jax.py` `BSE_KEYS`, `src/bse/absorption_haydock.py` `HAYDOCK_KEYS`); the keys are listed in `src/gw/gw_config.py` `BSE_DECK_KEYS`.
 
 ## `bse.bse_jax` {: #bse-jax }
 
@@ -20,308 +20,221 @@ Required
 **Command line**
 
 ### `-i`, `--input` {: .kw data-type="path" data-default="required" }
-The GW deck. Locates the restart bundle, `wfn_file`, the centroid table and the deck keys below.
-
-### `--n-val` {: .kw data-type="int" data-default="required" }
-Valence bands $n_v$ below the occupied boundary $n_{\mathrm{occ}}$. BerkeleyGW: `number_val_bands`.
-
-Clamped to $n_{\mathrm{occ}}$. Counts bands, spinor bands included.
-{: .kw-details }
-
-### `--n-cond` {: .kw data-type="int" data-default="required" }
-Conduction bands $n_c$ from $n_{\mathrm{occ}}$ up. BerkeleyGW: `number_cond_bands`.
-
-Clamped to the bands stored in the bundle.
-{: .kw-details }
+The GW deck. Locates the restart bundle, `wfn_file`, the centroid table and every key below.
 
 **Deck keys**
 
-### `nval`, `ncond`, `number_bands` {: .kw data-type="int" data-default="required" }
-Deck keys. The GW band window the bundle was written with; under `bse_k_grid`, also the window of the band interpolation.
+### `number_val_bands_fine` {: .kw data-type="int" data-default="required" }
+Valence bands of the BSE window, counted down from the highest occupied band, spinor bands included. BerkeleyGW: `number_val_bands_fine`.
 
-The bundle authenticates against them, so they must be the GW run's values. Under `bse_k_grid`, fewer than four conduction guard bands above the BSE window draws a warning.
+Without `kgrid_fine` the window is solved on the GW grid, as BerkeleyGW's absorption with `skip_interpolation`. Clamped to the occupied count.
 {: .kw-details }
+
+### `number_cond_bands_fine` {: .kw data-type="int" data-default="required" }
+Conduction bands of the BSE window, from the lowest unoccupied band up. BerkeleyGW: `number_cond_bands_fine`.
+
+### `nval`, `ncond`, `number_bands` {: .kw data-type="int" data-default="required" }
+The GW band window the bundle was written with. The bundle authenticates against them, so they must be the GW run's values.
 
 ### `centroids_file` {: .kw data-type="path" data-default="required" }
-Deck key. Centroid table; its content hash authenticates the bundle, and under `bse_k_grid` it is the interpolation's point set.
-
-On a downfolded bundle the parent table comes from the bundle's own provenance.
-{: .kw-details }
+Centroid table; its content hash authenticates the bundle, and under `kgrid_fine` it is the interpolation's point set.
 
 Optional
 {: .kw-group }
 
-**Route and kernel**
+**Kernel and spin**
 
-### `--lanczos` {: .kw data-type="flag" data-default="no-op" }
-Selects the eigensolve, which is the default route, so the flag changes nothing. It is kept so that older command lines still parse.
+### `full_bse` {: .kw data-type="bool" data-default="false" }
+Solve the full $\begin{pmatrix}A&B\\-B^*&-A^*\end{pmatrix}$ problem. Off: the Tamm–Dancoff resonant block $A$, as in BerkeleyGW. `dipole_file`, the spectra and the Haydock recursion need the TDA.
 
-The eigensolve runs the solver chosen by `--solver` with `--tda` and the dense full-BSE solver without. Only this route reads `--n-eig`, `--write-eigs`, `--dipole`, `--eqp`, `--n-occ` and the solver flags. Two route flags together, such as `--lanczos` with `--kpm-dos`, refuse.
+### `spin_singlet`, `spin_triplet` {: .kw data-type="bool" data-default="singlet" }
+Non-spinor WFN only: the singlet kernel $D + 2V - W$ (default) or the triplet kernel $D - W$. BerkeleyGW: `spin_singlet`, `spin_triplet`.
+
+A spinor WFN has one kernel, $D + V - W$ (exchange weight 1), and either key refuses there. The spin case changes only the scalar exchange weight; every case runs the same matvec. A collinear spin-polarized WFN refuses.
 {: .kw-details }
 
-### `--tda` {: .kw data-type="flag" data-default="off" }
-Tamm–Dancoff: solve the resonant block $A$ only. Off: the full $\begin{pmatrix}A&B\\-B^*&-A^*\end{pmatrix}$ problem on every route.
+### `local_fields` {: .kw data-type="bool" data-default="false" }
+Drop the screened direct term: $D + w V$, the RPA with local fields. BerkeleyGW: `local_fields`. Never the default.
 
-BerkeleyGW is TDA by default; LORRAX is not. Required by `--dipole`.
-{: .kw-details }
+### `spinor` {: .kw data-type="bool" data-default="the WFN's" }
+Assertion only: refuses unless it matches the WFN's spinor count. BerkeleyGW: `spinor`.
 
-### `--bse` {: .kw data-type="flag" data-default="off" }
-Includes the screened direct term: kernel $D + w_x V - W$. Off: the RPA kernel $D + w_x V$, and $W$ is never built.
-
-With it, the BerkeleyGW counterpart is `spin_singlet` (scalar) or the spinor kernel.
-{: .kw-details }
-
-### `--rpa` {: .kw data-type="flag" data-default="off" }
-Forces the RPA kernel $D + w_x V$ even with `--bse`. BerkeleyGW: `local_fields`.
+### `extended_kernel` {: .kw data-type="bool" data-default="false" }
+Read by [`bse.bsemat_cli`](../berkeleygw-export.md#bsemat) only. In a solver deck it prints one NOTE: LORRAX does not interpolate the kernel, and `full_bse` selects the non-TDA problem.
 
 **Bands and energies**
 
-### `--eqp` {: .kw data-type="path" data-default="—" }
-`eqp1.dat` with diagonal QP energies on the irreducible wedge; replaces $E$ by $E^{\mathrm{QP}}$ in the diagonal, ψ unchanged. Eigensolve route only. BerkeleyGW: `eqp_corrections` (`eqp_co_corrections` with `bse_k_grid`).
+### `highest_occupied_band` {: .kw data-type="int" data-default="WFN ifmax" }
+Occupied-band count that places the window $[n_{\mathrm{occ}} - n_v,\, n_{\mathrm{occ}} + n_c)$. BerkeleyGW: `highest_occupied_band`.
 
-Without `bse_k_grid` the window is re-sliced on the corrected spectrum; with it the QP energies enter the band interpolation.
+### `eqp_corrections`, `eqp_co_corrections` {: .kw data-type="bool or path" data-default="—" }
+QP energies in `eqp1.dat` format on the GW grid's irreducible wedge. BerkeleyGW: `eqp_corrections` (no fine grid), `eqp_co_corrections` (with `kgrid_fine`, where the energies enter the band interpolation).
+
+A bare key reads BerkeleyGW's file name beside the deck (`eqp.dat`, `eqp_co.dat`); a value names the file (LORRAX's GW writes `eqp1.dat`). `eqp_co_corrections` without `kgrid_fine`, or `eqp_corrections` with it, refuses. Without a fine grid the window is re-sliced on the corrected spectrum.
 {: .kw-details }
 
-### `--n-occ` {: .kw data-type="int" data-default="WFN ifmax" }
-Occupied-band count that places the window $[n_{\mathrm{occ}} - n_v,\, n_{\mathrm{occ}} + n_c)$. Eigensolve route only.
-
-`--kpm-dos` always takes the count from the deck's WFN.
-{: .kw-details }
+### `qp_rotations_file` {: .kw data-type="path" data-default="—" }
+The GW run's `qp_wfn_rotations.h5`: solve in the eigenbasis of its $H_{QP}$; the window counts QP states. Exclusive with the eqp keys; refuses `kgrid_fine`.
 
 ### `wfn_file` {: .kw data-type="path" data-default="WFN.h5" }
-Deck key. WFN for the occupied count, the cell volume, bundle authentication, the W0 rebuild and the band interpolation; relative to the deck.
+WFN for the occupied count, the cell volume, the spinor count, bundle authentication and the band interpolation; relative to the deck.
 
-### `--band-degeneracy` {: .kw data-type="enum" data-default="strict" }
-What happens when a window edge cuts a degenerate multiplet (a Kramers pair under spin–orbit coupling). Eigensolve route only; the other routes use `strict`.
-
-`strict` refuses and names counts that work; `snap` widens the window outward to the multiplet boundary; `off` proceeds. BerkeleyGW: `degeneracy_check_override`.
-{: .kw-details }
+### `band_degeneracy` {: .kw data-type="enum" data-default="strict" }
+What happens when a window edge cuts a degenerate multiplet (a Kramers pair under spin–orbit coupling). `strict` refuses and names counts that work; `snap` widens the window outward; `off` proceeds.
 
 `strict` `snap` `off`
 {: .kw-values }
 
-### `--degeneracy-tol-ry` {: .kw data-type="float" data-default="7.3499e-05 (1 meV)" }
-Energy tolerance in Ry for "same multiplet". Eigensolve route only.
+### `degeneracy_check_override` {: .kw data-type="bool" data-default="false" }
+BerkeleyGW's name for `band_degeneracy = off`.
 
-**Solver**
+### `degeneracy_tol_ry` {: .kw data-type="float" data-default="7.3499e-05 (1 meV)" }
+Energy tolerance in Ry for "same multiplet".
 
-### `--n-eig` {: .kw data-type="int" data-default="5" }
-Number of lowest eigenpairs $\Omega_S$, $A^S$. Eigensolve route only. BerkeleyGW: `number_eigenvalues`.
+**Fine grid**
+{: #fine-grid }
 
-### `--solver` {: .kw data-type="enum" data-default="davidson" }
-Eigensolver for the lowest `--n-eig` roots. Ignored without `--tda`.
+### `kgrid_fine` {: .kw data-type="int[3]" data-default="—" }
+The fine BSE grid $\bk_{\mathrm{fi}}$, `NX NY NZ`. Replaces BerkeleyGW's `WFN_fi`: ψ, $E^{\mathrm{QP}}$, the dipoles and $W$ move to $\bk_{\mathrm{fi}}$ before the solve, by the [H-transform](../../utilities/htransform-fine-grid.md) and the coarse-to-fine kernel interpolation.
 
-`davidson`: block Davidson with the exact diagonal preconditioner, stopped when every root's residual is below `--davidson-tol-mev`. `lanczos`: block Lanczos with CGS2 reorthogonalization, at a fixed Krylov dimension or to `--lanczos-rtol`. `trlan`: thick-restart Lanczos, the convergence of `lanczos` from a basis capped at `--trlan-m-max`. A flag that only another solver reads refuses.
+Each axis must be at least the coarse one; the two grids need not nest.
 {: .kw-details }
 
-`davidson` `lanczos` `trlan`
-{: .kw-values }
+### `kgrid_fine_shift` {: .kw data-type="float[3]" data-default="0 0 0" }
+kgrid.x's offset $\delta\bk$ of the fine grid, in fractions of one fine-grid step: $\bk_i = (i + \delta\bk)/N$. `0.5 0.5 0.5` is half a step; BerkeleyGW's Si example uses `0.47 0.37 0.31`.
 
-### `--davidson-tol-mev` {: .kw data-type="float" data-default="0.01" }
-Davidson stopping rule in meV. The solve stops when every root's residual $\lVert Hx - \Omega x\rVert$ is below it, relative above $|\Omega| = 1$ Ry.
-
-A residual $r$ puts an exact eigenvalue within $\lVert r\rVert$ of $\Omega$, so the tolerance bounds each root's error, which is typically $\lVert r\rVert^2$ divided by the gap to the next root. A solve that reaches the iteration cap first refuses (`GATE davidson_converged`).
+A shift breaks the grid's symmetry and samples the zone evenly. Only $\bk - \bk'$ enters the direct term, so $W$ stays on the unshifted fine $\bq$ grid; the $\bQ = 0$ exchange tile does not depend on $\bk$. `eigenvectors.h5` holds the shifted $\bk$. Values are reduced modulo 1. [Exciton bands](../exciton-bands/keywords.md) and TD-aGW refuse a shift.
 {: .kw-details }
 
-### `--max-lanczos-iter` {: .kw data-type="int" data-default="max(30, min(200, N/2))" }
-Iteration budget, with $N = n_{c,\mathrm{pad}}\,n_{v,\mathrm{pad}}\,N_k$. For Davidson it caps the block iterations, and the solve normally stops earlier on `--davidson-tol-mev`.
+### `number_cond_bands_coarse` {: .kw data-type="int" data-default="ncond" }
+Conduction bands of the coarse (GW) grid that enter the band interpolation. BerkeleyGW: `number_cond_bands_coarse`.
 
-For `lanczos` it is the Krylov dimension, run as `max_lanczos_iter // block_size` block steps. For `trlan` it is the matvec budget.
+Coarse much wider than fine is the expected case: the GW grid carries the conduction sums, the BSE is a near-gap problem. Fewer than `number_cond_bands_fine` refuses; fewer than four above it warns, because the top of the interpolated window then lies in the f-transform's shoulder. Above `ncond`, the extra bands are read from the WFN as guard bands.
 {: .kw-details }
 
-### `--davidson-precond` {: .kw data-type="enum" data-default="exact" }
-Davidson preconditioner diagonal.
-
-`exact`: the assembled $\mathrm{diag}(H) = E_c - E_v + (V_x - W_d)/N_k$, or $E_c - E_v + V_x/N_k$ under `--rpa`, which is what BerkeleyGW hands PRIMME. It is assembled once, and each iteration costs the same as with `bare`. `bare`: the transition energy $E_c - E_v$. `auto`: chooses by the transition-space dimension.
-{: .kw-details }
-
-`exact` `bare` `auto`
-{: .kw-values }
-
-### `--davidson-margin` {: .kw data-type="int" data-default="8" }
-Extra roots solved above `--n-eig` and not reported, at most half the transition space. The stop reads only the lowest `--n-eig`.
-
-### `--davidson-margin-tol-mev` {: .kw data-type="float" data-default="--davidson-tol-mev" }
-Looser residual, in meV, at which a margin root locks. A locked root stays in the basis and gets no further correction. It must be at least `--davidson-tol-mev`.
-
-### `--davidson-m-max` {: .kw data-type="int" data-default="10 × n_eig" }
-Davidson subspace size before restart; memory is $2m_{\max}$ vectors.
-
-### `--davidson-olsen` {: .kw data-type="flag" data-default="off" }
-Olsen correction of the preconditioned direction; makes a small `--davidson-eps-shift` safe.
-
-### `--davidson-eps-shift` {: .kw data-type="float" data-default="1e-3" }
-Preconditioner regularization in Ry. An explicit `0` is replaced by the default.
-
-### `--block-size` {: .kw data-type="int" data-default="1" }
-Lanczos block width: larger matrix products, fewer dispatches.
-
-### `--lanczos-rtol` {: .kw data-type="float" data-default="0.0" }
-`0`: fixed iteration count. `> 0`: exits when the lowest `--n-eig` Ritz values change by less than this between checks.
-
-Lanczos solver only, at any block size; absolute floor $10^{-8}$.
-{: .kw-details }
-
-### `--lanczos-check-every` {: .kw data-type="int" data-default="4" }
-Convergence-check cadence in block iterations under `--lanczos-rtol > 0`.
-
-### `--n-reorth` {: .kw data-type="int" data-default="-1" }
-Reorthogonalization window; `-1` is the full Krylov depth.
-
-Narrower windows give ghost eigenvalues and cost the same; keep full for spinor spectra.
-{: .kw-details }
-
-### `--trlan-m-max` {: .kw data-type="int" data-default="max(3 n_eig, 60)" }
-Thick-restart basis slots, the memory cap.
-
-### `--trlan-n-keep` {: .kw data-type="int" data-default="n_eig + 10" }
-Ritz vectors kept across a restart; $n_{\mathrm{eig}} \le n_{\mathrm{keep}} < m_{\max}$.
-
-**Output files**
-
-### `--write-eigs` {: .kw data-type="int" data-default="off" }
-Writes the lowest $N \le$ `--n-eig` states to `eigenvectors.h5`; the bare flag writes `--n-eig`. BerkeleyGW: `write_eigenvectors`.
-
-### `--dipole` {: .kw data-type="path" data-default="—" }
-With `--write-eigs` and `--tda`: contracts each written state with this `dipole.h5` and stores $d^\alpha_S$ as `exciton_data/dipoles`.
-
-A `psp.get_dipole_mtxels --skip-vnl` file corresponds to BerkeleyGW's `use_momentum`.
-{: .kw-details }
-
-### `--report-file` {: .kw data-type="path" data-default="bse.out" }
-Run report of the eigensolve route.
-
-**Fine grid and head**
-
-### `bse_k_grid` {: .kw data-type="str" data-default="\"\"" }
-Deck key. The fine BSE grid $\bk_{\mathrm{fi}}$ as `NX NY NZ` (or comma-separated). Replaces BerkeleyGW's `WFN_fi` with coarse-to-fine kernel interpolation.
-
-Each axis must be at least the coarse one, and the two grids need not nest. ψ, $E^{\mathrm{QP}}$, $W$ and the dipoles move to $\bk_{\mathrm{fi}}$ in the loader, so `--dipole` and `bse.absorption_haydock` run on the fine grid.
-{: .kw-details }
+### `number_val_bands_coarse` {: .kw data-type="int" data-default="—" }
+Accepted and ignored, with a warning: the H-transform always fits every valence band of the GW window.
 
 ### `w_head_densify` {: .kw data-type="enum" data-default="c1" }
-Deck key. Long-range model split off $W$ before the densification under `bse_k_grid`.
-
-`srlr`, the intended route: the long range is carried by the plane-wave channels $\bq+\bG_a\to0$ (bulk: the Wigner–Seitz slot; slab: plus the $G_z$ shells), whose dressed form factors and polarizability come from the bundle's `W0_lr`, are fitted in $\bq$, screened, switched off smoothly by a window inside the zone, and evaluated at every fine $\bq$; Γ keeps the `c1` head. `c1`: the $\bq \to 0$ head alone, re-attached at each fine $\bq$ in the coarse Γ cell. Today only a static-Dyson GW run writes `W0_lr`, so after a shared-pole run `srlr` refuses (`GATE srlr_restart_channels`) and `c1` is what runs. See [Theory §1.4](theory.md#grid-w) and [Short- and long-range W](../../theory/w-range-splitting.md).
-{: .kw-details }
+Long-range model split off $W$ before the densification under `kgrid_fine`. `srlr`: the plane-wave channels $\bq+\bG_a\to0$ carry the long range from the bundle's `W0_lr`; `c1`: the $\bq \to 0$ head alone. See [Short- and long-range W](../../theory/w-range-splitting.md).
 
 `c1` `srlr`
 {: .kw-values }
 
 ### `head_minibz_average` {: .kw data-type="bool" data-default="false" }
-Deck key, read only under `bse_k_grid`. `true` rebuilds the $V_{\bq=0}$ tile with the fine grid's mini-BZ head and takes the $W$ head's Γ-cell reference from the analytic sphere.
+Read under `kgrid_fine`: rebuilds the $V_{\bq=0}$ tile with the fine grid's mini-BZ head. Must match the GW run.
 
-Must match the GW run ([q → 0 head](../../theory/q0-head.md#minibz)). `false` carries the coarse tile through unchanged.
-{: .kw-details }
-
-### `vhead` {: .kw data-type="float" data-default="—" }
-Deck key. Overrides the bundle's $V^{\mathrm{head}}$ (Ry·bohr³) in the rank-one $V_{\bq=0}$ head. Shared with the GW side.
-
-A cross-code validation knob (BerkeleyGW's head). A non-numeric value refuses.
-{: .kw-details }
-
-### `whead_0freq` {: .kw data-type="float" data-default="—" }
-Deck key. Overrides $W^{\mathrm{head}}(\omega = 0)$ on $W_{\bq=0}$. Added only to a screened $W$.
-
-### GW screening and head keys {: .kw data-type="deck" data-default="GW run" }
-`head_correction`, `wcoul0_source` and the other screening keys are read only when the bundle has no stored W0 and the driver rebuilds $W(0)$.
-
-They must describe the GW run; see the [GW keywords](../gw/keywords.md).
-{: .kw-details }
+### `vhead`, `whead_0freq` {: .kw data-type="float" data-default="—" }
+Overrides of the bundle's $V^{\mathrm{head}}$ and $W^{\mathrm{head}}(\omega = 0)$ (Ry·bohr³). Cross-code validation knobs.
 
 ### `wfn_fi_q_chunk` {: .kw data-type="int" data-default="0" }
-Deck key. Fine-grid points per batch of the band interpolation under `bse_k_grid`; `0` uses the coarse $N_k$. Memory only.
+Fine-grid points per batch of the band interpolation; `0` uses the coarse $N_k$. Memory only.
 
-### `htransform_rank_multiplier`, `htransform_qr_eps`, `htransform_qrcp_seed` {: .kw data-type="float, float, int" data-default="20.0, 1e-3, 0" }
-Deck keys. Basis controls of the band interpolation under `bse_k_grid`. Defined on the [htransform](../../utilities/htransform.md#htransform_qr_eps) page.
+### `htransform_qr_eps` {: .kw data-type="float" data-default="1e-3" }
+Basis control of the band interpolation, on the [htransform](../../utilities/htransform.md#htransform_qr_eps) page.
 
-### `sigma_freq_debug_output` {: .kw data-type="bool" data-default="false" }
-Deck key. Runs the `vq_interp` self-checks when `head_minibz_average` rebuilds the exchange tile. Large host memory.
+**Solver**
+
+### `number_eigenvalues` {: .kw data-type="int" data-default="5" }
+Number of lowest eigenpairs. BerkeleyGW: `number_eigenvalues`.
+
+### `solver` {: .kw data-type="enum" data-default="davidson" }
+Eigensolver of the TDA problem. `davidson`: block Davidson with the exact diagonal preconditioner, stopped when every root's residual is below `davidson_tol_mev`. `block_lanczos`: block Lanczos at a fixed Krylov dimension or to `lanczos_rtol`. `trlan`: thick-restart Lanczos within `trlan_m_max` slots. A key that only another solver reads refuses. The full BSE (`full_bse`) uses the dense non-TDA solver.
+
+BerkeleyGW's `diagonalization` (dense), `diagonalization_primme` and `lanczos` (a Lanczos spectrum) are other methods, so their names are not used.
+{: .kw-details }
+
+`davidson` `block_lanczos` `trlan`
+{: .kw-values }
+
+### `solver_max_iter` {: .kw data-type="int" data-default="max(30, min(200, N/2))" }
+Iteration budget of every solver, with $N$ the transition count: Davidson's cap on block iterations, Lanczos's Krylov dimension, TRLan's matvec budget.
+
+### `davidson_tol_mev` {: .kw data-type="float" data-default="0.01" }
+Davidson stopping rule in meV: every root's residual $\lVert Hx - \Omega x\rVert$ below it. A solve that reaches `solver_max_iter` first refuses (`GATE davidson_converged`).
+
+### `davidson_precond`, `davidson_margin`, `davidson_margin_tol_mev`, `davidson_m_max`, `davidson_olsen`, `davidson_eps_shift` {: .kw data-type="mixed" data-default="exact, 8, davidson_tol_mev, 10·n_eig, false, 1e-3" }
+Davidson internals: the preconditioner diagonal (`exact`, `bare`, `auto`), extra unreported roots and the residual at which they lock, the subspace size, the Olsen correction, the regularization in Ry.
+
+### `block_size`, `lanczos_rtol`, `lanczos_check_every`, `lanczos_n_reorth` {: .kw data-type="mixed" data-default="1, 0, 4, −1" }
+`block_lanczos` internals: block width, convergence threshold (0 = fixed dimension) and its cadence, reorthogonalization window (−1 = full; keep it for spinor spectra).
+
+### `trlan_m_max`, `trlan_n_keep` {: .kw data-type="int" data-default="max(3 n_eig, 60), n_eig + 10" }
+`trlan` internals: basis slots and Ritz vectors kept across a restart.
+
+**Dipoles, spectra and output files**
+
+### `dipole_file` {: .kw data-type="path" data-default="—" }
+`dipole.h5` (`psp.get_dipole_mtxels`), relative to the deck. With it, and the TDA, each state's $\langle 0\lvert\hat r\rvert S\rangle$ goes to `eigenvalues_b1.dat`…`_b3.dat`, the spectra below are written, and the Haydock recursion is seeded. Under `kgrid_fine` it is the coarse WFN's file, carried through the band interpolation.
+
+### `use_momentum`, `use_velocity` {: .kw data-type="bool" data-default="—" }
+BerkeleyGW's operator choice, checked against `dipole_file`'s `skip_vnl` stamp. LORRAX chooses the operator when the dipole file is made: `psp.get_dipole_mtxels --skip-vnl` is the momentum $p$ alone, the default is the velocity $p + i[V_{\mathrm{NL}}, r]$.
+
+### `dipole_position_fix` {: .kw data-type="bool" data-default="false" }
+Under `kgrid_fine` with QP energies: the dipoles are the exact $\langle c\lvert r\rvert v\rangle$ of the fine QP states instead of $v/\Delta E$ of their Rayleigh quotients. Opt in for strongly band-dependent QP shifts.
+
+### `polarization` {: .kw data-type="float[3]" data-default="unset" }
+Light polarization $p_1\,p_2\,p_3$ along $\mathbf b_1\,\mathbf b_2\,\mathbf b_3$, as in BerkeleyGW. The Cartesian vector $\sum_i p_i \mathbf b_i$ is built and normalized. Unset: one spectrum per Cartesian axis (files `_b1`, `_b2`, `_b3`); set: one spectrum (files without the suffix).
+
+### `energy_resolution` {: .kw data-type="float" data-default="0.1" }
+Broadening in eV. BerkeleyGW: `energy_resolution`.
+
+### `gaussian_broadening`, `lorentzian_broadening` {: .kw data-type="bool" data-default="gaussian" }
+Profile of the spectra from the eigensolve: a Gaussian of standard deviation `energy_resolution` (the default, as BerkeleyGW's diagonalization) or a Lorentzian of half width `energy_resolution`. The Haydock spectrum is Lorentzian only.
+
+### `delta_frequency`, `omega_min_ev`, `omega_max_ev` {: .kw data-type="float" data-default="0.01, 0, 15" }
+Frequency grid of the spectra in eV, endpoints included. BerkeleyGW: `delta_frequency`.
+
+### `no_eps1` {: .kw data-type="bool" data-default="false" }
+Skips Kramers–Kronig; the $\varepsilon_1$ column is `1`.
+
+With `dipole_file` the eigensolve writes BerkeleyGW's `absorption_eh.dat` (the computed states, complete below the highest) and `absorption_noeh.dat` (the window's transitions): $\omega$, $\varepsilon_2$, $\varepsilon_1$ and the density of states.
+{: .kw-details }
+
+### `write_eigenvectors` {: .kw data-type="int" data-default="0" }
+States written to `eigenvectors.h5`: 0 none, $N > 0$ the lowest $N$, $N < 0$ every computed state. BerkeleyGW: `write_eigenvectors`.
+
+### `helicity_table` {: .kw data-type="bool" data-default="false" }
+With `dipole_file`: each state's in-plane circular strengths in the report.
+
+### `haydock`, `number_iterations` {: .kw data-type="bool, int" data-default="false, 200" }
+After the eigensolve, `number_iterations` Haydock steps on the same payload in the same process; writes `absorption_haydock.h5` and `absorption_haydock*_eh.dat`. BerkeleyGW: `haydock`, `number_iterations`. Needs the TDA and `dipole_file`.
 
 **Exciton density of states**
 
-### `--kpm-dos` {: .kw data-type="flag" data-default="off" }
-Computes the KPM density of states of $H$ and exits. It cannot be combined with `--lanczos`.
+### `kpm_dos` {: .kw data-type="bool" data-default="false" }
+Computes the KPM density of states of $H$ and exits, with `kpm_window_count`, `kpm_n_moments`, `kpm_n_random`, `kpm_n_lanczos`, `kpm_emin_ev`, `kpm_emax_ev`, `kpm_plot_file`.
 
-### `--kpm-window-count` {: .kw data-type="int" data-default="4" }
-`--kpm-dos` only. Number of windows of equal state count marked on the density of states.
-
-### `--kpm-n-moments`, `--kpm-n-random`, `--kpm-n-lanczos` {: .kw data-type="int" data-default="100, 4, 100" }
-`--kpm-dos` only. Chebyshev moments $M$, stochastic trace vectors $R$ ($RM$ matvecs), Lanczos steps for the bounds.
-
-### `--kpm-emin-ev`, `--kpm-emax-ev` {: .kw data-type="float" data-default="Lanczos bounds" }
-`--kpm-dos` only. Override the spectral bounds, in eV.
-
-### `--kpm-plot-file` {: .kw data-type="path" data-default="bse_dos_kpm.png" }
-`--kpm-dos` only. DOS plot; the moments go beside it as `.npz`.
-
-**Device layout**
+**Command line**
 
 ### `--px`, `--py` {: .kw data-type="int" data-default="startup mesh" }
 Device mesh over the $(c, v)$ transition axes. Given together, square, and using every device.
 
+### `--report-file` {: .kw data-type="path" data-default="bse.out" }
+Run report.
+
+### `--out-prefix` {: .kw data-type="path" data-default="absorption" }
+Prefix of the absorption files from the eigensolve (`absorption_haydock` for the Haydock files).
+
 ## Absorption (`bse.absorption_haydock`)
 
-A separate entry point. It always uses the TDA kernel $D + w_x V - W$, needs at least two devices, and checks band degeneracy `strict`. Under `bse_k_grid` the loader densifies the bundle and the dipoles with it.
+A separate entry point: the TDA screened recursion ($D + w V - W$), at least two devices, band degeneracy `strict`. It reads `number_val_bands_fine`, `number_cond_bands_fine`, `highest_occupied_band`, the eqp keys, `dipole_file` (default `dipole.h5` beside the deck), `dipole_position_fix`, `use_momentum`/`use_velocity`, the spin keys, `number_iterations`, `energy_resolution`, `delta_frequency`, `omega_min_ev`, `omega_max_ev`, `no_eps1`, `polarization` and the fine-grid keys, as above. The cell volume and the spinor count are read from the WFN. The command line is `-i` and `--out-prefix` (default `absorption_haydock`). `gaussian_broadening` and `local_fields` refuse.
 
-Required
-{: .kw-group }
+## Renamed and retired
 
-**Bands and cell**
-
-### `-i`, `--n-val`, `--n-cond` {: .kw data-type="path, int, int" data-default="required" }
-As for `bse.bse_jax`.
-
-### `--n-occ` {: .kw data-type="int" data-default="required" }
-Occupied-band count; re-resolved on the QP spectrum under `--eqp`.
-
-### `--V-cell` {: .kw data-type="float" data-default="required" }
-Cell volume $\Omega_{\mathrm{cell}}$ in bohr³ for the prefactor $\kappa$. Not read from the WFN.
-
-Optional
-{: .kw-group }
-
-**Inputs**
-
-### `--dipole` {: .kw data-type="path" data-default="dipole.h5" }
-Velocity matrix elements; the seed $|d_\alpha\rangle$ in position form, with the file's own band energies.
-
-### `--eqp` {: .kw data-type="path" data-default="—" }
-As for `bse.bse_jax`. BerkeleyGW: `eqp_corrections`.
-
-**Spectrum**
-
-### `--eta-eV` {: .kw data-type="float" data-default="0.1" }
-Lorentzian half-width $\eta$ in eV, also of the JDOS column. BerkeleyGW: `energy_resolution` with `lorentzian_broadening`.
-
-### `--omega-min-eV`, `--omega-max-eV`, `--n-omega` {: .kw data-type="float, float, int" data-default="0.0, 15.0, 1500" }
-Uniform frequency grid in eV, endpoints included. The Kramers–Kronig integral for $\varepsilon_1$ is truncated to it.
-
-### `--n-iter` {: .kw data-type="int" data-default="200" }
-Haydock steps per polarization, without reorthogonalization. BerkeleyGW: `number_iterations`.
-
-### `--no-eps1` {: .kw data-type="flag" data-default="off" }
-Skips Kramers–Kronig; the $\varepsilon_1$ column is `1`.
-
-**Spin factors and output**
-
-### `--n-spinor` {: .kw data-type="int" data-default="2" }
-$n_{\mathrm{spinor}}$ in $\kappa$. The default is the spinor case: set `1` for a scalar run.
-
-### `--n-spin` {: .kw data-type="int" data-default="1" }
-$n_{\mathrm{spin}}$ in $\kappa$; `2` only for a collinear spin-polarized run.
-
-### `--out-prefix` {: .kw data-type="path" data-default="absorption_haydock" }
-Names `<prefix>.h5`. The text files are always `absorption_haydock_b{1,2,3}_eh.dat`, in the prefix's directory.
-
-## Retired
-
-### `--ring-timing` {: .kw data-type="flag" data-default="refuses" }
-Retired; refuses by name. Time the matvec with `common.timing`.
-
-### `w_head_densify = legacy` {: .kw data-type="value" data-default="refuses" }
-Retired. Use `c1` or `srlr`.
-
-### `LORRAX_LANCZOS_REORTH` {: .kw data-type="env" data-default="refuses" }
-Retired; CGS2 is the only reorthogonalization. Unset it.
-
+| Old | Now |
+|---|---|
+| `--n-val`, `--n-cond`, `--n-occ` | `number_val_bands_fine`, `number_cond_bands_fine`, `highest_occupied_band` |
+| `--tda` (default off) | TDA is the default; `full_bse = true` for the full BSE |
+| `--bse`, `--rpa` (default RPA) | the screened kernel is the default; `local_fields = true` for the RPA |
+| `--eqp` | `eqp_corrections` / `eqp_co_corrections` |
+| `--dipole`, `--qp-rotations` | `dipole_file`, `qp_rotations_file` |
+| `--n-eig`, `--write-eigs` | `number_eigenvalues`, `write_eigenvectors` (BerkeleyGW's sign convention) |
+| `--solver lanczos`, `--max-lanczos-iter`, `--n-reorth` | `solver = block_lanczos`, `solver_max_iter`, `lanczos_n_reorth` |
+| `--haydock-iter`, `--haydock-eta-ev`, `--haydock-n-omega`, `--haydock-pol` | `haydock` + `number_iterations`, `energy_resolution`, `delta_frequency`, `polarization` |
+| `--eta-eV`, `--n-iter`, `--n-omega`, `--pol` (Haydock) | `energy_resolution`, `number_iterations`, `delta_frequency`, `polarization` |
+| `--V-cell`, `--n-spinor`, `--n-spin` (Haydock) | removed: read from the WFN |
+| `--lanczos` | removed (it changed nothing) |
+| other `--davidson-*`, `--trlan-*`, `--lanczos-*`, `--kpm-*`, `--feast-*`, `--gmres-*` | the deck key of the same name in snake case |
+| `bse_k_grid` | `kgrid_fine` |
+| `--ring-timing`, `w_head_densify = legacy`, `LORRAX_LANCZOS_REORTH` | retired |

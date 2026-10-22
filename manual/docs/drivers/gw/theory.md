@@ -14,7 +14,7 @@ page: theory
 
 <figure class="flowchart" markdown>
 [![Full-frequency GW driver](../../assets/figures/g0.png)](../../assets/figures/g0.png)
-<figcaption><strong>Fig. G0.</strong> The four stages of <code>gw.gw_jax</code> on the production route (shared-pole <i>W</i>), read left to right within a stage and top to bottom between stages; the loop strip on stage 4 is the QSGW cycle back to stage 2.</figcaption>
+<figcaption><strong>Fig. G0.</strong> The four stages of <code>gw.gw_jax</code> on the production route (tangential <i>W</i>), read left to right within a stage and top to bottom between stages; the loop strip on stage 4 is the QSGW cycle back to stage 2.</figcaption>
 </figure>
 
 ## <span class="n">1</span> ISDF basis and Coulomb metric {: #isdf }
@@ -66,7 +66,7 @@ $$
 
 $E_\mathrm{cut}$ is `bare_coulomb_cutoff` (default: the WFN `ecutwfc`). $v$ is truncated according to `sys_dim` and averaged over the mini Brillouin zone at every $\bq\neq0$ (`mc_average_vcoul_body`, default `true`). The $\bq+\bG=0$ term is omitted from this sum; it is the head of §[4.3](#qp-head). $V_\bq$ is written to the restart bundle `tmp/isdf_tensors_<N_mu>.h5`.
 
-## <span class="n">2</span> Screened interaction and the shared-pole model {: #screening }
+## <span class="n">2</span> Screened interaction and the tangential model {: #screening }
 
 $\chi^0$ is a product of two Green's functions in time on the points $\br_\mu$. It is transformed only to the few complex frequencies the Σ treatment needs, $W$ follows from one Dyson solve per $\bq$ and frequency, and on the production route $W^c$ is condensed into one set of poles shared by every matrix element.
 {: .intro }
@@ -113,7 +113,7 @@ $$
 \sum_\ell w_\ell(z)\,e^{-i\Delta t_\ell}\approx\frac{2\Delta}{\Delta^2-z^2},\qquad \chi^0_\bq(\br_\mu,\br_\nu;z)=\int\!dt\,e^{izt}\,\chi^0_\bq(t)\approx-i\sum_\ell w_\ell(z)\,\chi^0_\bq(\br_\mu,\br_\nu;t_\ell) \tag{2.3}
 $$
 
-Which frequencies are requested depends on the treatment (§[3.5](#sig-treat)). On the shared-pole route the frequencies are batched: neighbouring $z$ share one set of complex time nodes, each with its own weights, so a batch costs about as many nodes as its hardest member, at most a few hundred. How the time nodes are chosen, and how each rule is fitted and its error controlled: [Time–frequency transforms](../../theory/time-frequency.md).
+Which frequencies are requested depends on the treatment (§[3.5](#sig-treat)). On the tangential route the frequencies are batched: neighbouring $z$ share one set of complex time nodes, each with its own weights, so a batch costs about as many nodes as its hardest member, at most a few hundred. How the time nodes are chosen, and how each rule is fitted and its error controlled: [Time–frequency transforms](../../theory/time-frequency.md).
 
 <figure class="flowchart" markdown>
 [![Independent-particle response and RPA screening](../../assets/figures/g3.png)](../../assets/figures/g3.png)
@@ -140,9 +140,9 @@ Under `screening_diagrams = w_bse` or `w_rpa_resolvent`, $W$ comes instead from 
 <figcaption><strong>Fig. G13.</strong> The resolvent route: the two particle–hole Hamiltonians (stage 1), shifted solves for each probe column (stage 2), and the head tensor from the same Hamiltonian (stage 3).</figcaption>
 </figure>
 
-### <span class="n">2.5</span> The shared-pole model of W {: #scr-sp }
+### <span class="n">2.5</span> The tangential model of W {: #scr-sp }
 
-`shared_pole_screening.screen_shared_poles`
+`tangential_screening.screen_tangential_poles`
 {: .in-code }
 
 On the production route the correlation part of $W$ is one set of real poles per $\bq$, shared by every matrix element:
@@ -151,7 +151,7 @@ $$
 W^c_\bq(\mu,\nu;z)=\sum_jb_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\left[\frac{1}{z-\Omega_{j\bq}}-\frac{1}{z+\Omega_{j\bq}}\right]\quad\Longleftrightarrow\quad W^c_\bq(\mu,\nu;t)=-i\sum_jb_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\,e^{-i\Omega_{j\bq}|t|} \tag{2.5}
 $$
 
-$W^c$ and $\partial_zW^c=W\,\partial_z\chi^0\,W$ are sampled at the fixed supports of §[2.3](#scr-tf), and the exact moments fix the high-frequency tail. Each support keeps the action of $W^c$ on a few probe directions; the two-sided tangential Hermite interpolation conditions form a Loewner pencil, and its Ritz pairs give $\Omega_{j\bq}^2$ and $b_{j\bq}$. Nothing is fitted: the poles are real, the residues are positive semidefinite, and the static limit $W_\bq(0)=V_\bq-\sum_j2b_{j\bq}b^\dagger_{j\bq}/\Omega_{j\bq}$ is a model output. $W^c(t)$ is even in $t$, so one $W^c$ serves both orderings in Σ. The model is written to `tmp/mpa/<label>_shared_pole/model.h5`, with $b$ normalised as in [Tangential W model §2.1](../../theory/shared-pole-w.md#model-form), and rebuilt on every QSGW map. Supports, pencil and gates: [Tangential W model](../../theory/shared-pole-w.md).
+$W^c$ and $\partial_zW^c=W\,\partial_z\chi^0\,W$ are sampled at the fixed supports of §[2.3](#scr-tf), and the exact moments fix the high-frequency tail. Each support keeps the action of $W^c$ on a few probe directions; the two-sided tangential Hermite interpolation conditions form a Loewner pencil, and its Ritz pairs give $\Omega_{j\bq}^2$ and $b_{j\bq}$. Nothing is fitted: the poles are real, the residues are positive semidefinite, and the static limit $W_\bq(0)=V_\bq-\sum_j2b_{j\bq}b^\dagger_{j\bq}/\Omega_{j\bq}$ is a model output. $W^c(t)$ is even in $t$, so one $W^c$ serves both orderings in Σ. The model is written to `tmp/mpa/<label>_tangential/model.h5`, with $b$ normalised as in [Tangential W model §2.1](../../theory/tangential-w.md#model-form), and rebuilt on every QSGW map. Supports, pencil and gates: [Tangential W model](../../theory/tangential-w.md).
 
 ## <span class="n">3</span> Self-energy {: #sigma }
 
@@ -230,7 +230,7 @@ By default $\Sigma^c$ is evaluated on shell: the sweep folds each node directly 
 
 ### <span class="n">3.5</span> Frequency treatments {: #sig-treat }
 
-`compute_mode` selects the model for $W^c$; under `compute_mode = mpa`, `sigma_w_model` selects elementwise or shared poles. `x_only` keeps $\Sigma^x$ alone.
+`compute_mode` selects the model for $W^c$; under `compute_mode = mpa`, `sigma_w_model` selects elementwise poles or the tangential model. `x_only` keeps $\Sigma^x$ alone.
 
 | Treatment | Deck | $W$ evaluated at | Model for $W^c(z)$ | Limits |
 |---|---|---|---|---|
@@ -238,7 +238,7 @@ By default $\Sigma^c$ is evaluated on shell: the sweep folds each node directly 
 | GN-PPM | `gn_ppm` | $W(0)$, $W(i\omega_p)$ | one pole per element | Refuses metallic occupations |
 | HL-GPP | `hl_ppm` | $W(0)$, $W(\omega_p)$, real $\omega_p>\Delta_\mathrm{max}$ | one pole per element | Refuses metals and broken time reversal |
 | MPA, elementwise | `mpa`, `sigma_w_model = mpa` | $2N_p$ points on two complex lines | $N_p$ complex poles per element | Refuses time-reversal-broken metals |
-| MPA, shared pole | `mpa`, `sigma_w_model = shared_pole` | line and imaginary ladders, plus moments | real poles shared by all elements | — |
+| MPA, tangential | `mpa`, `sigma_w_model = tangential` | line and imaginary ladders, plus moments | real poles shared by all elements | — |
 
 === "COHSEX"
     **Static COHSEX** <span class="status supported">Supported</span>
@@ -339,8 +339,8 @@ By default $\Sigma^c$ is evaluated on shell: the sweep folds each node directly 
     mpa_n_poles   = 8
     ```
 
-===+ "MPA · shared pole"
-    **Multipole, shared pole** <span class="status production">Production</span>
+===+ "MPA · tangential"
+    **Multipole, tangential** <span class="status production">Production</span>
 
     One set of real poles per $\bq$, shared by every matrix element, from samples of $W^c$ and $\partial_zW^c$ and the exact moments (§[2.5](#scr-sp)).
 
@@ -361,7 +361,7 @@ By default $\Sigma^c$ is evaluated on shell: the sweep folds each node directly 
 
     ```ini
     compute_mode  = mpa
-    sigma_w_model = shared_pole
+    sigma_w_model = tangential
     ```
 
 ## <span class="n">4</span> Quasiparticles {: #qp }
@@ -451,7 +451,7 @@ $t$ is the static transverse photon; its exchange is the Breit interaction. $t(\
 
 Kinetic balance makes the transverse current $O(c^{-1})$ and the charge $O(1)$, so the polarization blocks are $\Pi_{00}=O(1)$, $\Pi_{0T},\Pi_{T0}=O(c^{-1})$, $\Pi_{TT}=O(c^{-2})$. Block inversion of $W=D+D\Pi W$, with $W_C=(v^{-1}-\Pi_{00})^{-1}$, gives the terms of Σ and what each route keeps:
 
-| Term of Σ | Order | `bare_transverse` | `full_static_cohsex` | `full_shared_pole` |
+| Term of Σ | Order | `bare_transverse` | `full_static_cohsex` | `full_tangential` |
 |---|---|---|---|---|
 | $\rho W_C\rho$ | $c^0$ | the run's treatment | static, or plasmon pole | full frequency |
 | $J^T t J^T$ (bare transverse exchange $\Sigma^B$) and the direct fields | $c^{-2}$ | yes | yes | yes |
@@ -466,10 +466,10 @@ $\Sigma^B$ is static and is one exchange contraction in every treatment. With ti
 | Material | `bispinor_gw` | Deck |
 |---|---|---|
 | time-reversal invariant | `bare_transverse` (default) | any `compute_mode` |
-| magnet, half-metal, Hall or Chern state | `full_shared_pole` | `compute_mode = mpa`, `sigma_w_model = shared_pole`, `head_correction = no_local_fields` |
+| magnet, half-metal, Hall or Chern state | `full_tangential` | `compute_mode = mpa`, `sigma_w_model = tangential`, `head_correction = no_local_fields` |
 | static cross-check of current screening | `full_static_cohsex` | one-shot; `compute_mode = cohsex`, `gn_ppm` or `hl_ppm` (current blocks at $\omega=0$); `sys_dim = 2` with the head on |
 
-`full_shared_pole` solves the four-current Dyson equation at each bank frequency and fits the CC, CT/TC and TT sectors as separate shared-pole models; only the CC sum is band-extrapolated. A bispinor QSGW run rebuilds $\rho$ and $\mathbf J$ on every map and refuses `density_self_consistent = false`. `sigma_diag.dat` splits $\Sigma^{xc}$ into `sigCC`, `sigCT` and `sigTT`. No Dirac–Coulomb–Breit reference yet certifies the absolute $\Sigma^B$.
+`full_tangential` solves the four-current Dyson equation at each bank frequency and fits the CC, CT/TC and TT sectors as separate tangential models; only the CC sum is band-extrapolated. A bispinor QSGW run rebuilds $\rho$ and $\mathbf J$ on every map and refuses `density_self_consistent = false`. `sigma_diag.dat` splits $\Sigma^{xc}$ into `sigCC`, `sigCT` and `sigTT`. No Dirac–Coulomb–Breit reference yet certifies the absolute $\Sigma^B$.
 
 ## Notation {: #notation }
 
@@ -487,7 +487,7 @@ Equations are in real time $t$, time-ordered, at $T=0$ with $\hbar=1$: $\chi^0=-
 | $\chi^0_\bq(\br_\mu,\br_\nu;z)$ | independent-particle polarizability |
 | $W_\bq(\mu,\nu;z)$, $W^c=W-V$ | screened interaction; its correlation part |
 | $t_\ell$, $w_\ell$ | time nodes and weights of a rule |
-| $b_{j\bq}(\mu)$, $\Omega_{j\bq}$ | shared-pole factor vectors (residue $b_{j\bq}b^\dagger_{j\bq}$) and poles |
+| $b_{j\bq}(\mu)$, $\Omega_{j\bq}$ | tangential factor vectors (residue $b_{j\bq}b^\dagger_{j\bq}$) and poles |
 | $R_{j\bq}(\mu,\nu)$, $\Omega_{j\bq}(\mu,\nu)$ | elementwise residues and poles (PPM, MPA) |
 | $\omega_p$, $N_p$ | PPM probe frequency; MPA pole count |
 | $d^{\gtrless}$, $\eta$ | branch denominators of $\Sigma^c$; broadening |

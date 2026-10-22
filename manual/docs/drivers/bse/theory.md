@@ -14,7 +14,7 @@ page: theory
 
 ## <span class="n">1</span> Bands and interactions on the BSE grid {: #grid }
 
-Every BSE quantity is assembled from what the GW run left in the restart bundle: band values at the ISDF points, the band energies, $V_\bq(\mu,\nu)$ and the static $W_\bq(\mu,\nu;0)$. When the deck sets `bse_k_grid`, bands and $W$ are first carried from the GW grid $\bk_{\mathrm{co}}$ to the finer BSE grid $\bk_{\mathrm{fi}}$; below, $\bk$ always denotes a point of the grid the BSE runs on.
+Every BSE quantity is assembled from what the GW run left in the restart bundle: band values at the ISDF points, the band energies, $V_\bq(\mu,\nu)$ and the static $W_\bq(\mu,\nu;0)$. When the deck sets `kgrid_fine`, bands and $W$ are first carried from the GW grid $\bk_{\mathrm{co}}$ to the finer BSE grid $\bk_{\mathrm{fi}}$; below, $\bk$ always denotes a point of the grid the BSE runs on.
 {: .intro }
 
 ### <span class="n">1.1</span> The transition window {: #grid-window }
@@ -22,7 +22,7 @@ Every BSE quantity is assembled from what the GW run left in the restart bundle:
 `bse_loading.load_bse_data_from_restart_sharded`
 {: .in-code }
 
-The transition basis $|cv\bk\rangle$ pairs the $n_v$ highest occupied bands with the $n_c$ lowest empty ones around the occupied count $n_{\mathrm{occ}}$ (`--n-occ`, else the WFN's `ifmax`):
+The transition basis $|cv\bk\rangle$ pairs the $n_v$ highest occupied bands with the $n_c$ lowest empty ones around the occupied count $n_{\mathrm{occ}}$ (`highest_occupied_band`, else the WFN's `ifmax`):
 
 $$
 v \in [\,n_{\mathrm{occ}} - n_v,\; n_{\mathrm{occ}}\,), \qquad c \in [\,n_{\mathrm{occ}},\; n_{\mathrm{occ}} + n_c\,), \qquad N = n_c\, n_v\, N_k \tag{1.1}
@@ -31,27 +31,27 @@ $$
 Every window band must lie in both band windows of the GW run's ζ fit, because the direct term reads $v v'$ and $c c'$ pair densities. $n_c$ and $n_v$ are padded to the device mesh with zero ψ and energies of $\pm 10^3$ Ry, so pad states decouple and are dropped on output.
 
 !!! note
-    A window edge inside a degenerate multiplet refuses under `--band-degeneracy strict`. `snap` widens the window outward; the widened window is what the run solves and what `eigenvectors.h5` records.
+    A window edge inside a degenerate multiplet refuses under `band_degeneracy = strict`. `snap` widens the window outward; the widened window is what the run solves and what `eigenvectors.h5` records.
 
 ### <span class="n">1.2</span> Quasiparticle energies {: #grid-qp }
 
 `restart_bundle.apply_eqp_corrections`
 {: .in-code }
 
-The bundle holds mean-field energies $E_{n\bk}$ on the full grid. `--eqp` reads `eqp1.dat` on the irreducible wedge and unfolds it through the symmetry service, so for $\bk = S\bk_{\mathrm{irr}}$:
+The bundle holds mean-field energies $E_{n\bk}$ on the full grid. `eqp_corrections` reads `eqp1.dat` on the irreducible wedge and unfolds it through the symmetry service, so for $\bk = S\bk_{\mathrm{irr}}$:
 
 $$
 E^{\mathrm{QP}}_{n\bk} = E^{\mathrm{QP}}_{n\bk_{\mathrm{irr}}} \quad (n \text{ in the file}), \qquad E^{\mathrm{QP}}_{n\bk} = E_{n\bk} \quad (\text{otherwise}) \tag{1.2}
 $$
 
-Only energies change; ψ always comes from the bundle. Without `bse_k_grid` the window is re-sliced on the corrected spectrum, since a QP shift can move the gap. With it, the QP energies enter the band interpolation of §1.3.
+Only energies change; ψ always comes from the bundle. Without `kgrid_fine` the window is re-sliced on the corrected spectrum, since a QP shift can move the gap. With it, the QP energies enter the band interpolation of §1.3.
 
 ### <span class="n">1.3</span> Band interpolation {: #grid-bands }
 
 `bse_densify._interpolate_bse_data_to_grid`
 {: .in-code }
 
-When `bse_k_grid` differs from the GW grid, one H-transform over the GW band window gives the window bands and their QP energies at every fine point:
+When `kgrid_fine` differs from the GW grid, one H-transform over the GW band window gives the window bands and their QP energies at every fine point:
 
 $$
 \big\{\psi_{n\bk_{\mathrm{co}}}(\br_\mu),\, E^{\mathrm{QP}}_{n\bk_{\mathrm{co}}}\big\} \;\longrightarrow\; \big\{\psi_{n\bk_{\mathrm{fi}}}(\br_\mu),\, E^{\mathrm{QP}}_{n\bk_{\mathrm{fi}}}\big\}, \qquad n \in [\,n_{\mathrm{occ}} - n_v,\; n_{\mathrm{occ}} + n_c\,) \tag{1.3}
@@ -64,7 +64,7 @@ The method, its basis keys and its quality checks are on the [htransform](../../
 `bse_head._inject_q0_head` · `bse_densify.make_w_densifier`
 {: .in-code }
 
-$W_\bq(\mu,\nu;0)$ is the bundle's stored W0 (a Dyson $W(0)$, or $V + W^c(0)$ of a shared-pole model), or, without one, a static Dyson rebuild on every call. The $\bq \to 0$ head enters as a rank-one term on the $\bq = 0$ tiles, with $g_0(\mu) = \zeta_{\bq=0,\mu}(\bG = 0)$; deck `vhead` and `whead_0freq` override the bundle's values:
+$W_\bq(\mu,\nu;0)$ is the bundle's stored W0 (a Dyson $W(0)$, or $V + W^c(0)$ of a tangential model), or, without one, a static Dyson rebuild on every call. The $\bq \to 0$ head enters as a rank-one term on the $\bq = 0$ tiles, with $g_0(\mu) = \zeta_{\bq=0,\mu}(\bG = 0)$; deck `vhead` and `whead_0freq` override the bundle's values:
 
 $$
 V_{\bq=0}(\mu,\nu) \mathrel{+}= \frac{V^{\mathrm{head}}}{\Omega_{\mathrm{cell}}}\, g_0^*(\mu)\, g_0(\nu), \qquad
@@ -77,7 +77,7 @@ $$
 W_{\bq_{\mathrm{fi}}}(\mu,\nu;0) = \underbrace{\mathrm{FFT}_{\bR \to \bq_{\mathrm{fi}}}\,\mathrm{IFFT}_{\bq_{\mathrm{co}} \to \bR}\big[W_{\bq_{\mathrm{co}}} - W^{\mathrm{LR}}_{\bq_{\mathrm{co}}}\big]}_{[W^{\mathrm{SR}}]^{\mathrm{interp}}_{\bq_{\mathrm{fi}}}} + W^{\mathrm{LR}}_{\bq_{\mathrm{fi}}} \tag{1.5}
 $$
 
-With `w_head_densify = c1` (the default) the long-range part is the head alone, $W^{\mathrm{LR}}_\bq = h(\bq)\, g_0^*(\mu)\, g_0(\nu)/\Omega_{\mathrm{cell}}$, with $h(\bq) = \bar W_{00}\,s(\bq)/\langle s\rangle_{\Gamma_c}$ and $s(\bq) = v(\bq)/\big(1 - v(\bq)\,\bq\cdot S\cdot\bq\big)$ inside the coarse Γ cell $\Gamma_c$ and zero outside. Here $\bar W_{00}$ is the $W^{\mathrm{head}}$ of (1.4). With `srlr` it is $w(|\bq|)\,\tilde\zeta^\dagger_\bq D_\bq\tilde\zeta_\bq/\Omega_{\mathrm{cell}}$ with $D_\bq = [v_L^{-1} - P_\bq]^{-1}$, built from the ISDF coefficients $\zeta_{\bq\mu}(\bG_L)$ at the long-range plane waves $\bG_L$, dressed by the short-range local fields and fitted from the bundle's `W0_lr`. Γ keeps the `c1` head. Both routes, the plane waves $\bG_L$ and the window are derived on [Short- and long-range W](../../theory/w-range-splitting.md). Without `bse_k_grid` only the last transform, $W_\bR = \mathrm{IFFT}_{\bq\to\bR}W_\bq$, runs.
+With `w_head_densify = c1` (the default) the long-range part is the head alone, $W^{\mathrm{LR}}_\bq = h(\bq)\, g_0^*(\mu)\, g_0(\nu)/\Omega_{\mathrm{cell}}$, with $h(\bq) = \bar W_{00}\,s(\bq)/\langle s\rangle_{\Gamma_c}$ and $s(\bq) = v(\bq)/\big(1 - v(\bq)\,\bq\cdot S\cdot\bq\big)$ inside the coarse Γ cell $\Gamma_c$ and zero outside. Here $\bar W_{00}$ is the $W^{\mathrm{head}}$ of (1.4). With `srlr` it is $w(|\bq|)\,\tilde\zeta^\dagger_\bq D_\bq\tilde\zeta_\bq/\Omega_{\mathrm{cell}}$ with $D_\bq = [v_L^{-1} - P_\bq]^{-1}$, built from the ISDF coefficients $\zeta_{\bq\mu}(\bG_L)$ at the long-range plane waves $\bG_L$, dressed by the short-range local fields and fitted from the bundle's `W0_lr`. Γ keeps the `c1` head. Both routes, the plane waves $\bG_L$ and the window are derived on [Short- and long-range W](../../theory/w-range-splitting.md). Without `kgrid_fine` only the last transform, $W_\bR = \mathrm{IFFT}_{\bq\to\bR}W_\bq$, runs.
 
 <figure class="flowchart" markdown>
 [![Static W for the BSE](../../assets/figures/b4.png)](../../assets/figures/b4.png)
@@ -104,13 +104,13 @@ The Hamiltonian couples electron–hole pairs through the bare exchange $V$ and 
 
 ### <span class="n">2.1</span> Tamm–Dancoff Hamiltonian {: #ham-tda }
 
-With `--tda`, the solvers diagonalize the resonant block:
+In the TDA, the default, the solvers diagonalize the resonant block:
 
 $$
 \langle cv\bk|H|c'v'\bk'\rangle = \big(E^{\mathrm{QP}}_{c\bk} - E^{\mathrm{QP}}_{v\bk}\big)\,\delta_{cc'}\delta_{vv'}\delta_{\bk\bk'} + w_x\,\langle cv\bk|V|c'v'\bk'\rangle - \langle cv\bk|W|c'v'\bk'\rangle \tag{2.1}
 $$
 
-Without `--bse`, or with `--rpa`, the $W$ term is dropped (the RPA kernel $D + w_x V$, BerkeleyGW's `local_fields`) and $W$ is never built.
+With `local_fields = true` the $W$ term is dropped (the RPA kernel $D + w_x V$, BerkeleyGW's `local_fields`) and $W$ is never built.
 
 ### <span class="n">2.2</span> Kernel matrix elements {: #ham-kernel }
 
@@ -133,7 +133,7 @@ $s$, $t$ are spinor components. $W$ is the charge-sector interaction, one $W$ fo
 `bse_ring_comm.build_bse_ring_matvec_full`
 {: .in-code }
 
-Without `--tda`, every route solves the full resonant–antiresonant problem, with $A$ the block of Eq. (2.1) and $B = w_x V^B - W^B$ the coupling block:
+With `full_bse = true`, every route solves the full resonant–antiresonant problem, with $A$ the block of Eq. (2.1) and $B = w_x V^B - W^B$ the coupling block:
 
 $$
 \begin{pmatrix} A & B \\ -B^* & -A^* \end{pmatrix}\begin{pmatrix} X^S \\ Y^S \end{pmatrix} = \Omega_S \begin{pmatrix} X^S \\ Y^S \end{pmatrix}, \qquad X^{S\dagger}X^S - Y^{S\dagger}Y^S = 1 \tag{2.3}
@@ -152,7 +152,7 @@ $$
 w_x = \begin{cases} 2 & n_{\mathrm{spinor}} = 1 \ \text{(singlet)} \\ 1 & n_{\mathrm{spinor}} = 2 \end{cases} \tag{2.4}
 $$
 
-There is no triplet kernel. The same $n_{\mathrm{spin}}$, $n_{\mathrm{spinor}}$ enter the absorption prefactor (§5.3), where they are user input to `bse.absorption_haydock`.
+On a non-spinor WFN the triplet kernel (`spin_triplet`) has no exchange, $w_x = 0$; a spinor WFN has the one kernel with $w_x = 1$. The same $n_{\mathrm{spinor}}$ enters the absorption prefactor (§5.3), read from the WFN.
 
 ## <span class="n">3</span> The matrix-free product HX {: #hx }
 
@@ -222,7 +222,7 @@ $$
 H q_j = \beta_{j-1} q_{j-1} + \alpha_j q_j + \beta_j q_{j+1}, \qquad Q^\dagger H Q\, y_S = \Omega_S\, y_S, \qquad A^S = Q y_S \tag{4.1}
 $$
 
-Reorthogonalization is full CGS2 by default (`--n-reorth -1`); a narrower window produces ghost eigenvalues that spoil per-state oscillator strengths.
+Reorthogonalization is full CGS2 by default (`lanczos_n_reorth -1`); a narrower window produces ghost eigenvalues that spoil per-state oscillator strengths.
 
 <figure class="flowchart" markdown>
 [![BSE eigenpairs](../../assets/figures/b3.png)](../../assets/figures/b3.png)
@@ -235,17 +235,17 @@ The tabs give each route's update or projection.
 
 | Route | Flags | Hamiltonian | Returns | Limits |
 |---|---|---|---|---|
-| Davidson | `--tda` (default) | TDA | $\Omega_S$, $A^S$ | memory $2m_{\max}$ vectors |
-| Lanczos | `--tda --solver lanczos` | TDA | $\Omega_S$, $A^S$ | Krylov memory $\propto$ `--max-lanczos-iter` |
-| Thick restart | `--tda --solver trlan` | TDA | $\Omega_S$, $A^S$ | extra matvecs for the cap |
-| Full BSE | no `--tda` | full | $\Omega_S$, $(X^S, Y^S)$ | $N \le 4096$, dense |
+| Davidson | default | TDA | $\Omega_S$, $A^S$ | memory $2m_{\max}$ vectors |
+| Lanczos | `solver = block_lanczos` | TDA | $\Omega_S$, $A^S$ | Krylov memory $\propto$ `solver_max_iter` |
+| Thick restart | `solver = trlan` | TDA | $\Omega_S$, $A^S$ | extra matvecs for the cap |
+| Full BSE | `full_bse = true` | full | $\Omega_S$, $(X^S, Y^S)$ | $N \le 4096$, dense |
 
 === "Davidson"
     **Block Davidson** <span class="status production">Production</span>
 
-    The default solver. Each step adds the preconditioned residual of every unconverged root and restarts when the basis reaches `--davidson-m-max`. The block holds the `--n-eig` lowest roots and `--davidson-margin` margin roots above them, which are solved but not reported.
+    The default solver. Each step adds the preconditioned residual of every unconverged root and restarts when the basis reaches `davidson_m_max`. The block holds the `number_eigenvalues` lowest roots and `davidson_margin` margin roots above them, which are solved but not reported.
 
-    The preconditioner is the exact diagonal of $H$ (`exact`, the default) or the transition energy (`bare`, shown below), and $\epsilon$ is `--davidson-eps-shift`. The solve stops when every reported root's residual $\lVert r_S\rVert$ is below `--davidson-tol-mev`, 0.01 meV by default.
+    The preconditioner is the exact diagonal of $H$ (`exact`, the default) or the transition energy (`bare`, shown below), and $\epsilon$ is `davidson_eps_shift`. The solve stops when every reported root's residual $\lVert r_S\rVert$ is below `davidson_tol_mev`, 0.01 meV by default.
 
     $$
     |r_S\rangle = (H - \Omega_S)|S\rangle, \qquad t_{S,cv\bk} = \frac{r_{S,cv\bk}}{E^{\mathrm{QP}}_{c\bk} - E^{\mathrm{QP}}_{v\bk} - \Omega_S + \epsilon}, \qquad Q \to [\,Q,\ t_S\,] \tag{4.2}
@@ -255,13 +255,13 @@ The tabs give each route's update or projection.
     :   residual corrections, optional Olsen projection
 
     ```bash
-    python -m bse.bse_jax -i gw.in --tda --bse
+    python -m bse.bse_jax -i gw.in
     ```
 
 === "Lanczos"
     **Block Lanczos** <span class="status supported">Supported</span>
 
-    The recurrence of Eq. (4.1), optionally with blocks of `--block-size` vectors and an early exit on `--lanczos-rtol`.
+    The recurrence of Eq. (4.1), optionally with blocks of `block_size` vectors and an early exit on `lanczos_rtol`.
 
     Converges the extremal spectrum first, so the low-lying excitons and the spectrum shape come quickly.
 
@@ -273,13 +273,14 @@ The tabs give each route's update or projection.
     :   Krylov, full reorthogonalization
 
     ```bash
-    python -m bse.bse_jax -i gw.in --tda --bse --solver lanczos --n-eig 10
+    # deck keys in the -i deck: solver = block_lanczos, number_eigenvalues = 10
+    python -m bse.bse_jax -i gw.in
     ```
 
 === "Thick restart"
     **Thick-restart Lanczos** <span class="status supported">Supported</span>
 
-    Lanczos to `--trlan-m-max` vectors, then a restart from the `--trlan-n-keep` lowest Ritz vectors.
+    Lanczos to `trlan_m_max` vectors, then a restart from the `trlan_n_keep` lowest Ritz vectors.
 
     The projected matrix after a restart is an arrowhead; the convergence is Lanczos's, from bounded memory.
 
@@ -291,7 +292,8 @@ The tabs give each route's update or projection.
     :   Krylov, capped and restarted
 
     ```bash
-    python -m bse.bse_jax -i gw.in --tda --bse --solver trlan
+    # deck keys in the -i deck: solver = trlan
+    python -m bse.bse_jax -i gw.in
     ```
 
 === "Full BSE"
@@ -309,7 +311,7 @@ The tabs give each route's update or projection.
     :   the whole transition space, $N \le 4096$
 
     ```bash
-    python -m bse.bse_jax -i gw.in --bse
+    python -m bse.bse_jax -i gw.in
     ```
 
 ### <span class="n">4.3</span> Exciton density of states and windows {: #solve-kpm }
@@ -317,13 +319,13 @@ The tabs give each route's update or projection.
 `bse_kpm.run_kpm_dos`
 {: .in-code }
 
-With $H$ scaled to $[-1, 1]$ by Lanczos bounds, stochastic Chebyshev moments over $R$ random vectors give a Jackson-damped density of states, whose integral divides the spectrum into `--kpm-window-count` windows of equal state count:
+With $H$ scaled to $[-1, 1]$ by Lanczos bounds, stochastic Chebyshev moments over $R$ random vectors give a Jackson-damped density of states, whose integral divides the spectrum into `kpm_window_count` windows of equal state count:
 
 $$
 \mu_n = \frac{1}{R}\sum_{r}\langle r|T_n(\tilde H)|r\rangle, \qquad \rho(E) \propto \sum_{n=0}^{M} g_n\,\mu_n\,T_n(\tilde E) \tag{4.3}
 $$
 
-`--kpm-dos` stops here and writes the density of states.
+`kpm_dos = true` stops here and writes the density of states.
 
 ## <span class="n">5</span> Dipoles and the absorption spectrum {: #abs }
 
@@ -341,14 +343,14 @@ $$
 d^\alpha_{cv\bk} = \frac{\langle c\bk|\hat v_\alpha|v\bk\rangle}{E_{c\bk} - E_{v\bk}} = i\,\langle c\bk|\hat r_\alpha|v\bk\rangle \tag{5.1}
 $$
 
-The denominator uses the dipole file's own band energies, so `--eqp` changes the Hamiltonian but not the dipoles. A `--skip-vnl` file, the momentum alone, corresponds to BerkeleyGW's `use_momentum` ([dipole utility](../../utilities/dipole.md#-skip-vnl)). Under `bse_k_grid` the dipoles are carried to the fine grid with the bands.
+The denominator uses the dipole file's own band energies, so `eqp_corrections` changes the Hamiltonian but not the dipoles. A `--skip-vnl` file, the momentum alone, corresponds to BerkeleyGW's `use_momentum` ([dipole utility](../../utilities/dipole.md#-skip-vnl)). Under `kgrid_fine` the dipoles are carried to the fine grid with the bands.
 
 ### <span class="n">5.2</span> Exciton dipoles {: #abs-ds }
 
 `absorption_common.exciton_dipole_projections`
 {: .in-code }
 
-`--dipole` contracts each written TDA eigenvector with the window's dipoles,
+`dipole_file` contracts each written TDA eigenvector with the window's dipoles,
 
 $$
 d^\alpha_S = \sum_{cv\bk} A^S_{cv\bk}\, d^{\alpha*}_{cv\bk} = -i\,\langle 0|\hat r_\alpha|S\rangle \tag{5.2}
@@ -367,7 +369,7 @@ $$
 \varepsilon^\alpha_2(\omega) = \kappa\sum_S |d^\alpha_S|^2\, L_\eta(\omega - \Omega_S), \qquad L_\eta(x) = \frac{\eta/\pi}{x^2 + \eta^2}, \qquad \kappa = \frac{16\pi^2}{\Omega_{\mathrm{cell}}\, N_k\, n_{\mathrm{spin}}\, n_{\mathrm{spinor}}} \tag{5.3}
 $$
 
-with $N_k$ the BSE grid and $\eta$ = `--eta-eV`. For spinors $\kappa = 8\pi^2/(\Omega_{\mathrm{cell}} N_k)$.
+with $N_k$ the BSE grid and $\eta$ = `energy_resolution`. For spinors $\kappa = 8\pi^2/(\Omega_{\mathrm{cell}} N_k)$.
 
 ### <span class="n">5.4</span> Haydock continued fraction {: #abs-haydock }
 

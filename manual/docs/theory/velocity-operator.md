@@ -80,7 +80,7 @@ $$
 \big(i[\Delta H,\hat{\mathbf r}]\big)_{mn\bk}=(D_\bk\Delta H)_{mn} \tag{2.3}
 $$
 
-The QP velocity is $U^\dagger(v^{\mathrm{DFT}}+D_\bk\Delta H)\,U$, with $U$ the rotation from DFT to QP states. `sc_head_update` selects which velocity each map uses for the head, and the accepted final map writes the same velocity to `dipole_qsgw.h5` ([Quasiparticle self-consistency](qsgw.md)). Its schema default is `off`, but left unnamed on a self-consistent shared-pole deck with the head on it resolves to `parallel_transport` when `parallel_transport_file` exists, else to `dft_velocity` when `dipole.h5` exists.
+The QP velocity is $U^\dagger(v^{\mathrm{DFT}}+D_\bk\Delta H)\,U$, with $U$ the rotation from DFT to QP states. `sc_head_update` selects which velocity each map uses for the head, and the accepted final map writes the same velocity to `dipole_qsgw.h5` ([Quasiparticle self-consistency](qsgw.md)). Its schema default is `off`, but left unnamed on a self-consistent tangential deck with the head on it resolves to `parallel_transport` when `parallel_transport_file` exists, else to `dft_velocity` when `dipole.h5` exists.
 
 ## <span class="n">3</span> Berry connection from parallel transport {: #berry }
 

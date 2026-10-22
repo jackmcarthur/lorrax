@@ -55,7 +55,7 @@ user
 
 </div>
 
-The BSE is the end of the chain: no LORRAX driver reads its output. `bse.absorption_haydock` reads the same inputs as `bse.bse_jax`, never `eigenvectors.h5`. The sum-over-states $\varepsilon_2$ from stored dipoles is `absorption_common.eps2_from_exciton_dipoles`, which has no command line. Under `bse_k_grid` the band interpolation of the [htransform](../../utilities/htransform.md#how) utility runs in-process; no htransform file is read. File formats are on the [Files](files.md) page.
+The BSE is the end of the chain: no LORRAX driver reads its output. `bse.absorption_haydock` reads the same inputs as `bse.bse_jax`, never `eigenvectors.h5`. The sum-over-states $\varepsilon_2$ from stored dipoles is `absorption_common.eps2_from_exciton_dipoles`, which has no command line. Under `kgrid_fine` the band interpolation of the [htransform](../../utilities/htransform.md#how) utility runs in-process; no htransform file is read. File formats are on the [Files](files.md) page.
 
 ## Caches {: #caches }
 

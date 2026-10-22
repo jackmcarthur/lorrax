@@ -25,7 +25,7 @@ Writes
 :   `eqp0.dat`, `eqp1.dat`, `sigma_diag.dat`, `qp_wfn_rotations.h5`, `WFN_qp.h5`, restart bundle, `gwjax.out`
 
 Σ treatment
-:   shared-pole model (`compute_mode = mpa`, `sigma_w_model = shared_pole`) or `gn_ppm`; others for debugging and comparison ([below](#treatment))
+:   tangential model (`compute_mode = mpa`, `sigma_w_model = tangential`) or `gn_ppm`; others for debugging and comparison ([below](#treatment))
 
 </div>
 
@@ -36,7 +36,7 @@ Writes
 1. **ISDF basis and Coulomb metric**
    Fit $\zeta_{\bq\mu}(\br)$ by least squares on the pair-density Gram over the fit windows, then build $V_\bq(\mu,\nu)$ on the sphere $|\bq+\bG|^2\le$ `bare_coulomb_cutoff`. A `tmp/zeta_q.h5` whose fit provenance matches is reused instead of refitted.
 2. **Screening**
-   $\chi^0_\bq(\br_\mu,\br_\nu;z)$ from the products $-iG^{\gtrless}G^{\lessgtr}$ on the points, at the complex frequencies the treatment requests, then the per-$\bq$ Dyson solve $W_\bq(z)=[I-V_\bq\chi^0_\bq(z)]^{-1}V_\bq$. On the production route $W^c=W-V$ becomes one set of real poles per $\bq$, shared by every matrix element ([Tangential W model](../../theory/shared-pole-w.md)).
+   $\chi^0_\bq(\br_\mu,\br_\nu;z)$ from the products $-iG^{\gtrless}G^{\lessgtr}$ on the points, at the complex frequencies the treatment requests, then the per-$\bq$ Dyson solve $W_\bq(z)=[I-V_\bq\chi^0_\bq(z)]^{-1}V_\bq$. On the production route $W^c=W-V$ becomes one set of real poles per $\bq$, shared by every matrix element ([Tangential W model](../../theory/tangential-w.md)).
 3. **Self-energy**
    $\Sigma^x$ and $\Sigma^c(\omega)$, read at each state's own energy, with the $\bq\to0$ head carried as a separate scalar channel ([the q → 0 head](../../theory/q0-head.md)). On the dynamic treatments the $\Sigma^c$ band sum is extrapolated past `number_bands_sigma` ([band extrapolation](../../theory/band-extrapolation.md)).
 4. **Quasiparticle bands**
@@ -46,7 +46,7 @@ Writes
 
 <figure class="flowchart" markdown>
 [![Full-frequency GW driver](../../assets/figures/g0.png)](../../assets/figures/g0.png)
-<figcaption><strong>Fig. G0.</strong> The four stages on the production route (shared-pole <i>W</i>), read left to right within a stage, with the input and output objects and their files on the right; the dark strip on stage 4 is the QSGW loop back to stage 2.</figcaption>
+<figcaption><strong>Fig. G0.</strong> The four stages on the production route (tangential <i>W</i>), read left to right within a stage, with the input and output objects and their files on the right; the dark strip on stage 4 is the QSGW loop back to stage 2.</figcaption>
 </figure>
 
 ## Running {: #run }
@@ -79,7 +79,7 @@ sys_dim                = 3                        # system dimensionality: requi
 number_bands           = 200                      # total bands in the GW calculation, for chi0 and Sigma
 number_bands_protected = 40                       # active bands for Sigma matrix elements, from the lowest valence band
 compute_mode           = mpa
-sigma_w_model          = shared_pole
+sigma_w_model          = tangential
 qp_solver              = self_consistent
 sc_tol_ev              = 1e-3
 ```
@@ -88,10 +88,10 @@ Every other key takes its default ([keywords](keywords.md)). Choose `number_band
 
 ## Choosing a Σ treatment {: #treatment }
 
-Two treatments are for production runs: the shared-pole model, full frequency, for insulators, metals and time-reversal-broken decks; and the Godby–Needs plasmon pole for insulators. The others are kept for debugging and comparison. `qp_solver` is a separate axis. Expand a row for the model, its deck lines and its limits; the derivations are on [Frequency treatments](../../theory/frequency-treatments.md).
+Two treatments are for production runs: the tangential model, full frequency, for insulators, metals and time-reversal-broken decks; and the Godby–Needs plasmon pole for insulators. The others are kept for debugging and comparison. `qp_solver` is a separate axis. Expand a row for the model, its deck lines and its limits; the derivations are on [Frequency treatments](../../theory/frequency-treatments.md).
 
-???+ treatment production "mpa + shared_pole · Shared-pole model · full frequency"
-    One set of real poles $\Omega_{j\bq}$ per irreducible $\bq$, shared by every matrix element, with one factor vector $b_{j\bq}(\mu)$ per pole ([normalisation](../../theory/shared-pole-w.md#model-form)). The poles come from samples of $W^c$ and $\partial_zW^c$ on a line above the real axis and an imaginary ladder, plus the exact high-frequency moments; nothing is fitted element by element. $\Sigma^c(\omega)$ is evaluated on the real axis at each state's own energy.
+???+ treatment production "mpa + tangential · Tangential model · full frequency"
+    One set of real poles $\Omega_{j\bq}$ per irreducible $\bq$, shared by every matrix element, with one factor vector $b_{j\bq}(\mu)$ per pole ([normalisation](../../theory/tangential-w.md#model-form)). The poles come from samples of $W^c$ and $\partial_zW^c$ on a line above the real axis and an imaginary ladder, plus the exact high-frequency moments; nothing is fitted element by element. $\Sigma^c(\omega)$ is evaluated on the real axis at each state's own energy.
 
     $$
     W^c_{\bq}(\mu,\nu;z)=\sum_{j}b_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\left[\frac{1}{z-\Omega_{j\bq}}-\frac{1}{z+\Omega_{j\bq}}\right],\qquad \Omega_{j\bq}>0
@@ -99,11 +99,11 @@ Two treatments are for production runs: the shared-pole model, full frequency, f
 
     ```ini
     compute_mode  = mpa
-    sigma_w_model = shared_pole
+    sigma_w_model = tangential
     qp_solver     = self_consistent
     ```
 
-    **Note** The production route for insulators, metals and time-reversal-broken decks, with `qp_solver = self_consistent`. `sigma_w_accuracy = relaxed` selects the looser recipe tier. `mpa_pole_batch_size`, `mpa_fit_reuse_file` and `mpa_overwrite_completed_artifacts` refuse here. Full page: [Tangential W model](../../theory/shared-pole-w.md).
+    **Note** The production route for insulators, metals and time-reversal-broken decks, with `qp_solver = self_consistent`. `sigma_w_accuracy = relaxed` selects the looser recipe tier. `mpa_pole_batch_size`, `mpa_fit_reuse_file` and `mpa_overwrite_completed_artifacts` refuse here. Full page: [Tangential W model](../../theory/tangential-w.md).
 
 ??? treatment supported "gn_ppm · Godby–Needs plasmon pole · plasmon pole"
     One real pole per matrix element, fixed by $W^c$ at $z=0$ and at $z=i\omega_p$, $\omega_p=$ `ppm_omega_p` (default 2 Ry). On a time-reversal-broken deck the fit carries a second, odd residue.
@@ -160,7 +160,7 @@ Two treatments are for production runs: the shared-pole model, full frequency, f
         **Note** Refuses metallic occupations and time-reversal-broken decks.
 
     ??? treatment supported "mpa · Elementwise multipole · full frequency"
-        $n_p$ complex poles per matrix element (`mpa_n_poles`, default 8), fitted to $W^c$ at $2n_p$ points on two lines above the real axis. The comparison model for the shared pole.
+        $n_p$ complex poles per matrix element (`mpa_n_poles`, default 8), fitted to $W^c$ at $2n_p$ points on two lines above the real axis. The comparison model for the tangential model.
 
         $$
         W^c_{\bq}(\mu,\nu;z)=\sum_{j=1}^{n_p}R_{j\bq}(\mu,\nu)\left[\frac{1}{z-\Omega_{j\bq}(\mu,\nu)}-\frac{1}{z+\Omega_{j\bq}(\mu,\nu)}\right]
@@ -174,7 +174,7 @@ Two treatments are for production runs: the shared-pole model, full frequency, f
         **Note** What `compute_mode = mpa` runs when `sigma_w_model` is not named. Runs on metals; refuses a time-reversal-broken metal.
 
     ??? treatment in-progress "cd · Contour deformation · full frequency"
-        The frequency integral rotated onto the imaginary axis, plus the residues of the Green's-function poles the rotation crosses, as in BerkeleyGW and Yambo, on the exact ISDF $W(z)$ with no pole model. A reference for the pole models and for comparisons with other codes; the production full-frequency route is the shared pole. Full page: [Contour deformation](../../theory/contour-deformation.md).
+        The frequency integral rotated onto the imaginary axis, plus the residues of the Green's-function poles the rotation crosses, as in BerkeleyGW and Yambo, on the exact ISDF $W(z)$ with no pole model. A reference for the pole models and for comparisons with other codes; the production full-frequency route is the tangential model. Full page: [Contour deformation](../../theory/contour-deformation.md).
 
         $$
         \Sigma^c(E)=-\frac{1}{2\pi}\int_{-\infty}^{\infty}du\,G(E+iu)\,W^c(iu)+\sum_{\text{crossed poles}}\mathrm{Res}
@@ -201,7 +201,7 @@ The numerical controls (`sigma_quadrature_eps`, the centroid count, the pole bud
 | k grid | (WFN) | The link error $\epsilon_{\mathrm{link}}$ printed by dipole and on every QSGW map: 9 % on MoS₂ 3×3, 4.6 % on Fe 4³, 3.4 % on Si 4³. On MoS₂ 3×3 the QSGW gap is 5.167 eV without the link term and 4.483 eV with it. | Refine the k grid ([velocity operator §3.6](../../theory/velocity-operator.md#berry-valid)). |
 | ISDF points | `centroids_file` | $\Sigma^x$ RMS ≤ 1 meV at $N_\mu\approx0.5\,r$ ([ISDF §4](../../theory/isdf.md#isdf-accuracy)). | Select on the Σ pair set. |
 | Σ quadrature | `sigma_quadrature_eps` | Default $10^{-4}$: eqp0 within 0.89 meV of $\varepsilon=10^{-6}$ (Fe 4³ QSGW, $E_F\pm15$ eV). | Lower $\varepsilon$. |
-| Pole count of $W$ | (recipe) | 0.80 meV QP RMS against contour deformation, Si ([Tangential W model §7.9](../../theory/shared-pole-w.md#ritz-count)). | — |
+| Pole count of $W$ | (recipe) | 0.80 meV QP RMS against contour deformation, Si ([Tangential W model §7.9](../../theory/tangential-w.md#ritz-count)). | — |
 | Semicore read | (fixed, η = 5 eV) | $E_F\pm1$ eV: 3.6 / 15.9 meV on Fe 4³, 2.9 / 20.0 meV on MoS₂ 3×3 ([QSGW §3.3](../../theory/qsgw.md#bands-core)). | `sigma_omega_patches_ev` windows at a smaller η. |
 
 !!! note "Agreement with BerkeleyGW"
@@ -226,8 +226,8 @@ A refusal names the key or file and the fix. The ones most runs meet are listed 
     - A value outside its range or enum. The message names the accepted values. 
     - Two spellings of one setting that disagree: `nband` and `number_bands`, `number_bands` and a different `number_bands_chi` or `number_bands_sigma`, `use_band_extrapolation` and `sigma_band_extrapolation`, `do_G0` and `head_correction`, `do_screened = false` with a screened `compute_mode`. Keep one. 
     - `number_bands_protected` beside `nval` or `ncond`, or outside [occupied count, `number_bands`]. 
-    - `sigma_w_model` named without `compute_mode = mpa`; `sigma_w_accuracy`, `sigma_w_support_sites_ev`, `write_poles` or `write_w` without `sigma_w_model = shared_pole`. 
-    - An elementwise MPA key under `sigma_w_model = shared_pole`: `mpa_pole_batch_size`, `mpa_fit_reuse_file`, `mpa_overwrite_completed_artifacts`, and with the head off every `mpa_*` key. Delete them. 
+    - `sigma_w_model` named without `compute_mode = mpa`; `sigma_w_accuracy`, `sigma_w_support_sites_ev`, `write_poles` or `write_w` without `sigma_w_model = tangential`. 
+    - An elementwise MPA key under `sigma_w_model = tangential`: `mpa_pole_batch_size`, `mpa_fit_reuse_file`, `mpa_overwrite_completed_artifacts`, and with the head off every `mpa_*` key. Delete them. 
     - `sigma_regularization_ev` that is not finite and positive. 
     - `screening_diagrams = w_bse | w_rpa_resolvent` outside its supported treatments, on a centroid set that is not orbit-closed, or (`w_bse`) on a time-reversal-broken WFN. 
     - `sc_initial_qp_rotations_file` without `qp_solver = self_consistent`; `mpa_fit_reuse_file` without `compute_mode = mpa` and `qp_solver = one_shot_dft`. 
@@ -240,7 +240,7 @@ A refusal names the key or file and the fix. The ones most runs meet are listed 
 
 ??? refuses "Material class"
     - Integer WFN occupations (an insulator) with `occ_smearing_width_ry`, `fermi_reference = mp1_fixed_n` or `mpa_metal_origin_shift_ry`. Remove the key. 
-    - Elementwise MPA on a time-reversal-broken metal. Use `sigma_w_model = shared_pole`. 
+    - Elementwise MPA on a time-reversal-broken metal. Use `sigma_w_model = tangential`. 
     - `hl_ppm` on a time-reversal-broken WFN, or with `ppm_omega_p` at or below the largest $\chi^0$ transition. Raise `ppm_omega_p`, or use `gn_ppm`. 
 
 ??? refuses "During the run"

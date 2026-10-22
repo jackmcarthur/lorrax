@@ -94,7 +94,7 @@ $\langle m\bk|V^{\mathrm H}|n\bk\rangle$ is contracted with the mean-field orbit
 `sigma_dispatch.compute_sigma_xc`
 {: .in-code }
 
-$\chi^0 \to W \to \Sigma^c(\omega)$ and $\Sigma^x$ are rebuilt from $\psi^{\mathrm{QP}}$, $E^{\mathrm{QP}}$ and $f$ through the run's own frequency treatment, with $\Sigma^c = i\,G^{\gtrless}W^c$, $t\gtrless0$ ([GW theory](../drivers/gw/theory.md), [frequency treatments](frequency-treatments.md)). With the production shared-pole $W$, every map rebuilds the pole model from its own states ([Tangential W model](shared-pole-w.md)). The $\bq\to0$ head follows the map on the QP velocity chosen by `sc_head_update` ([the q → 0 head](q0-head.md), [velocity operator](velocity-operator.md)). The band-extrapolation fit is redone on every map. Each map costs one full $\chi^0\to W\to\Sigma$ evaluation.
+$\chi^0 \to W \to \Sigma^c(\omega)$ and $\Sigma^x$ are rebuilt from $\psi^{\mathrm{QP}}$, $E^{\mathrm{QP}}$ and $f$ through the run's own frequency treatment, with $\Sigma^c = i\,G^{\gtrless}W^c$, $t\gtrless0$ ([GW theory](../drivers/gw/theory.md), [frequency treatments](frequency-treatments.md)). With the production tangential $W$, every map rebuilds the pole model from its own states ([Tangential W model](tangential-w.md)). The $\bq\to0$ head follows the map on the QP velocity chosen by `sc_head_update` ([the q → 0 head](q0-head.md), [velocity operator](velocity-operator.md)). The band-extrapolation fit is redone on every map. Each map costs one full $\chi^0\to W\to\Sigma$ evaluation.
 
 ### <span class="n">2.5</span> Assembly {: #om-assemble }
 
@@ -212,7 +212,7 @@ Each map writes these lines to `gwjax.out`; none of them but the verdict decides
 | `fixed point NOT UNIQUE` | Only with `sigma_out_of_grid = static`: states within the jump $\Sigma(E)\to\Sigma(0)$ of a range edge have two fixed points, and the path picks one. Use `cover`. |
 | `SC NOT CONVERGED` | Printed before the refusal: median $\lvert\Delta E\rvert$, then the bands with a state moving more than 20 meV, and by at least `sc_tol_ev`. |
 
-A loop that stalls usually has one of three causes. Empty states far above $E_F$ on a metal, where $\mathrm{Re}\,\Sigma^c$ rises on shell, have $Z>1$ and a local gain near 1: end the QP matrix below them. The elementwise fit (`sigma_w_model = mpa`) is not identifiable from its 16 samples, so $\Sigma^c$ jumps by 10–20 meV between maps (map gain 14–18 on Si at 24 bands and 192 centroids): use the shared pole. Bands just below $b_3$ can stall at 5 meV to 0.12 eV while the states within ±10 eV of midgap are stable (Si 4³ SOC, $b_3\ge32$). A stalled run leaves `sc_seed/` to restart from (§7.2).
+A loop that stalls usually has one of three causes. Empty states far above $E_F$ on a metal, where $\mathrm{Re}\,\Sigma^c$ rises on shell, have $Z>1$ and a local gain near 1: end the QP matrix below them. The elementwise fit (`sigma_w_model = mpa`) is not identifiable from its 16 samples, so $\Sigma^c$ jumps by 10–20 meV between maps (map gain 14–18 on Si at 24 bands and 192 centroids): use the tangential model. Bands just below $b_3$ can stall at 5 meV to 0.12 eV while the states within ±10 eV of midgap are stable (Si 4³ SOC, $b_3\ge32$). A stalled run leaves `sc_seed/` to restart from (§7.2).
 
 ## <span class="n">6</span> One-shot as the special case {: #one-shot }
 

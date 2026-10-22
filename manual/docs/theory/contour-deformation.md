@@ -159,7 +159,7 @@ $$
 R(E)=\sum_{\bq l}\begin{cases}-(1-f_l)\,a_l(\lvert x\rvert+i\eta), & x\ge0\\[2pt] \phantom{-(1-{}}f_l\,\tilde a_l(\lvert x\rvert+i\eta), & x<0\end{cases}\qquad x=E-E_{l,\bk-\bq} \tag{4.1}
 $$
 
-An empty part ($x\ge0$) reads the pair's own $W^c_\bq$; an occupied part ($x<0$) reads $\tilde a$, the contraction of $W^c_{-\bq}(\lvert x\rvert+i\eta)^{\mathsf T}$. Only $\mathrm{Re}\,z\ge0$ is ever evaluated: the transpose at $-\bq$ supplies the negative-frequency side, which is the particle–hole pairing $W_\bq(z)=W_{-\bq}(-z)^{\mathsf T}$ of [Shared-pole W (7.5)](shared-pole-w.md#pen-ordered) (*inferred*: the code states the rule, not the identity). $x=0$ belongs to the $x\ge0$ branch.
+An empty part ($x\ge0$) reads the pair's own $W^c_\bq$; an occupied part ($x<0$) reads $\tilde a$, the contraction of $W^c_{-\bq}(\lvert x\rvert+i\eta)^{\mathsf T}$. Only $\mathrm{Re}\,z\ge0$ is ever evaluated: the transpose at $-\bq$ supplies the negative-frequency side, which is the particle–hole pairing $W_\bq(z)=W_{-\bq}(-z)^{\mathsf T}$ of [Tangential W (7.5)](tangential-w.md#pen-ordered) (*inferred*: the code states the rule, not the identity). $x=0$ belongs to the $x\ge0$ branch.
 
 There are no θ-functions of $E_F$ in (4.1). The Fermi level enters through the occupations $f_l$, which are the fixed-$N$ occupation state on a metal and the step table on an insulator, floored at $10^{-14}$ ($f<10^{-14}\to0$, $1-f<10^{-14}\to1$), and through the evaluation energies, which the code receives relative to $E_F$ and shifts to absolute energies. A fractional $f_l$ contributes its empty share $1-f_l$ when $x\ge0$ and its occupied share $f_l$ when $x<0$.
 
@@ -208,7 +208,7 @@ Because a residue reads two knots, a knot chunk needs only the $(\bk,l)$ rows so
 
 ## <span class="n">5</span> χ⁰ and W at the CD points {: #chi0 }
 
-$\chi^0$ at every imaginary node and every knot, ghosts included, comes from the shared-pole response bank's own time-domain quadrature ([Tangential W model §6.2](shared-pole-w.md#bank-times)), not from a sum over transitions with energy denominators. The rule is built per chunk of points, so each chunk's Green-pair sweep serves only its own points.
+$\chi^0$ at every imaginary node and every knot, ghosts included, comes from the tangential response bank's own time-domain quadrature ([Tangential W model §6.2](tangential-w.md#bank-times)), not from a sum over transitions with energy denominators. The rule is built per chunk of points, so each chunk's Green-pair sweep serves only its own points.
 {: .intro }
 
 ### <span class="n">5.1</span> The point set and its windows {: #chi0-points }
@@ -223,7 +223,7 @@ The CD points are $z=iu_i$ (imaginary chunks) and $z=x_j+i\eta$ (knot chunks: ch
 `gw.cd.chi0_rules.build_rules`
 {: .in-code }
 
-Each node of a rule is one product of Green's functions on the ISDF points at a complex time $t_\ell$; the coefficients project every transition denominator onto those exponentials (the form of [Shared-pole W (6.2)](shared-pole-w.md#bank-times)). χ⁰ at a point is the value row of `response_bank.integrate_response_group` with `ordered=True`, the physical $\chi^0_\bq$. Which rule a window gets depends on where its points lie relative to the lowest transition $\Delta_{\min}$ of the response support:
+Each node of a rule is one product of Green's functions on the ISDF points at a complex time $t_\ell$; the coefficients project every transition denominator onto those exponentials (the form of [Tangential W (6.2)](tangential-w.md#bank-times)). χ⁰ at a point is the value row of `response_bank.integrate_response_group` with `ordered=True`, the physical $\chi^0_\bq$. Which rule a window gets depends on where its points lie relative to the lowest transition $\Delta_{\min}$ of the response support:
 
 | Window | Rule | Fallback |
 |---|---|---|
@@ -355,9 +355,9 @@ The identity holds the deck (comments, `cd_checkpoint` and `restart` dropped), t
 The table below sets the CD route beside LORRAX's production treatment and beside BerkeleyGW's contour deformation. Yambo's and GreenX's implementations were not checked for this page.
 {: .intro }
 
-### <span class="n">9.1</span> Against the shared-pole W {: #compare-shared-pole }
+### <span class="n">9.1</span> Against the tangential W {: #compare-tangential }
 
-| | Contour deformation (`gw.cd`) | Tangential W model ([page](shared-pole-w.md)) |
+| | Contour deformation (`gw.cd`) | Tangential W model ([page](tangential-w.md)) |
 |---|---|---|
 | $W^c$ | exact ISDF RPA value at each point | $K_\bq$ shared real poles, Ritz values of a Loewner pencil |
 | Dyson solves | one per imaginary node and per knot (with ghosts), per irreducible $\bq$; hundreds | 18 to 40 supports |
@@ -367,7 +367,7 @@ The table below sets the CD route beside LORRAX's production treatment and besid
 | head, band extrapolation | off (refused) | on |
 | use | reference and comparisons | production |
 
-On Si the shared-pole budget gives 0.80 meV QP RMS against a contour-deformation reference ([Tangential W model §7.9](shared-pole-w.md#ritz-count)).
+On Si the tangential budget gives 0.80 meV QP RMS against a contour-deformation reference ([Tangential W model §7.9](tangential-w.md#ritz-count)).
 
 ### <span class="n">9.2</span> Against BerkeleyGW {: #compare-bgw }
 

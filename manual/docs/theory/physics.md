@@ -22,11 +22,11 @@ $$
 H = T + V^{\mathrm{ion}} + V^{\mathrm H} + \Sigma^{\mathrm{QSGW}},\qquad H_\bk = U_\bk\,\mathrm{diag}(E^{\mathrm{QP}}_\bk)\,U^\dagger_\bk \tag{1.1}
 $$
 
-A one-shot run reads $\Sigma^{xc}$ at the mean-field energies; a QSGW run iterates (1.1) to self-consistency ([quasiparticle self-consistency](qsgw.md)). The production calculation is full-frequency QSGW with the shared-pole $W$.
+A one-shot run reads $\Sigma^{xc}$ at the mean-field energies; a QSGW run iterates (1.1) to self-consistency ([quasiparticle self-consistency](qsgw.md)). The production calculation is full-frequency QSGW with the tangential $W$.
 
 <figure class="flowchart" markdown>
 [![Full-frequency GW driver](../assets/figures/g0.png)](../assets/figures/g0.png)
-<figcaption><strong>Fig. G0.</strong> The GW driver as a map of the physics: the ISDF basis and $V$ (1), screening $\chi^0\to W$ and the shared-pole model of $W^c$ (2), the self-energy $\Sigma^c = iG^{\gtrless}W^c$ in real time and $\Sigma^x$ (3), and the quasiparticle Hamiltonian with its QSGW loop (4). Each stage links to its own theory page in §6.</figcaption>
+<figcaption><strong>Fig. G0.</strong> The GW driver as a map of the physics: the ISDF basis and $V$ (1), screening $\chi^0\to W$ and the tangential model of $W^c$ (2), the self-energy $\Sigma^c = iG^{\gtrless}W^c$ in real time and $\Sigma^x$ (3), and the quasiparticle Hamiltonian with its QSGW loop (4). Each stage links to its own theory page in §6.</figcaption>
 </figure>
 
 ### <span class="n">1.3</span> BSE excitons {: #ch-bse }
@@ -78,11 +78,11 @@ In a one-shot run $\chi^0$ is built from the mean-field states; in QSGW from the
 | Rank-$N_\mu$ pair-density basis | every two-particle object | centroid count | [ISDF](isdf.md) |
 | Analytic $\bq\to0$ head | $W$ and Σ at $\bq=0$ | `head_correction` | [the q → 0 head](q0-head.md) |
 | Static screening $W(0)$ in the kernel | BSE | — | [BSE theory](../drivers/bse/theory.md) |
-| Tamm–Dancoff (resonant block only) | BSE | `--tda` | [BSE theory](../drivers/bse/theory.md) |
+| Tamm–Dancoff (resonant block only) | BSE | default (`full_bse = true` for the full problem) | [BSE theory](../drivers/bse/theory.md) |
 | Pseudopotential of the mean-field run | $V^{\mathrm{ion}}$ | the mean-field run | [kin-ion](../utilities/kin-ion.md) |
 
 !!! note
-    The BSE driver solves the full problem with resonant and coupling blocks unless `--tda` is given. The production absorption route uses the Tamm–Dancoff approximation, as BerkeleyGW does by default.
+    The BSE driver solves the Tamm–Dancoff problem by default, as BerkeleyGW does; `full_bse = true` adds the coupling block.
 
 ## <span class="n">3</span> Space-time, real-axis {: #space-time }
 
@@ -115,7 +115,7 @@ FFT $\bR\to\bq$ and the transform $X(\omega) = \int dt\,e^{i\omega t-\eta|t|}X(t
 
 ### <span class="n">3.3</span> The self-energy on the real axis {: #st-sigma }
 
-With $W^c$ as a set of poles, $W^c_\bq(\mu,\nu;z) = \sum_j b_{j\bq}(\mu)b^*_{j\bq}(\nu)\big[(z-\Omega_{j\bq})^{-1}-(z+\Omega_{j\bq})^{-1}\big]$ ([normalisation of $b$](shared-pole-w.md#model-form)), its time form is closed and even in $t$, and the correlation self-energy is again a product:
+With $W^c$ as a set of poles, $W^c_\bq(\mu,\nu;z) = \sum_j b_{j\bq}(\mu)b^*_{j\bq}(\nu)\big[(z-\Omega_{j\bq})^{-1}-(z+\Omega_{j\bq})^{-1}\big]$ ([normalisation of $b$](tangential-w.md#model-form)), its time form is closed and even in $t$, and the correlation self-energy is again a product:
 
 $$
 W^c_\bq(\mu,\nu;t) = -i\sum_jb_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\,e^{-i\Omega_{j\bq}|t|},\qquad
@@ -196,7 +196,7 @@ Each fact has one home page. The table follows the chain.
 | ζ fit and $V_\bq(\mu,\nu)$ | G1 | [ISDF and V(q)](isdf.md) |
 | Time and frequency rules | G3, G6 | [time–frequency transforms](time-frequency.md) |
 | $\chi^0$, $W$, frequency models of $W^c$ | G5, G7, G8 | [frequency treatments](frequency-treatments.md) |
-| Tangential W model | G9, G9b | [Tangential W model](shared-pole-w.md) |
+| Tangential W model | G9, G9b | [Tangential W model](tangential-w.md) |
 | $\bq\to0$ head | G10 | [the q → 0 head](q0-head.md) |
 | Fractional occupations | G14 | [metals](metals.md) |
 | Band tail of $\Sigma^c$ | G16 | [band extrapolation](band-extrapolation.md) |
@@ -217,7 +217,7 @@ Each fact has one home page. The table follows the chain.
 | $G^{\gtrless}$ | greater and lesser Green's functions |
 | $\chi^0$ | independent-particle polarizability |
 | $V$, $W$, $W^c = W - V$ | bare and screened Coulomb interaction; correlation part |
-| $b_{j\bq}(\mu)$, $\Omega_{j\bq}$ | shared-pole vectors (residue $b_{j\bq}b^\dagger_{j\bq}$) and pole energies of $W^c$ |
+| $b_{j\bq}(\mu)$, $\Omega_{j\bq}$ | tangential vectors (residue $b_{j\bq}b^\dagger_{j\bq}$) and pole energies of $W^c$ |
 | $\Sigma^x$, $\Sigma^c$, $\Sigma^{xc}$ | exchange, correlation and total GW self-energy |
 | $\Sigma^{\mathrm{QSGW}}$ | static Hermitian QSGW self-energy |
 | $V^{\mathrm{ion}}$, $V^{\mathrm H}$ | pseudopotential; Hartree potential |
