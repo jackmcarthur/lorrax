@@ -196,10 +196,10 @@ downfold_rcond = 1.1e-6
    accuracy target. The driver prints this line with the run's own paths:
 
     ```bash
-    for d in /path/to/the/gw/run /path/to/the/small/bundle; do (cd "$d" && python3 -u -m bse.bse_jax -i cohsex.in --n-val 4 --n-cond 4 --lanczos 2>&1 | tail -40); done
+    for d in /path/to/the/gw/run /path/to/the/small/bundle; do (cd "$d" && python3 -u -m bse.bse_jax -i cohsex.in 2>&1 | tail -40); done
     ```
 
-    Under the default `--band-degeneracy strict` a band count that cuts a
+    Under the default `band_degeneracy = strict` a band count that cuts a
     multiplet refuses and names the counts that work; use those on both legs.
     If the eigenvalues disagree, raise `mu_small`, widen the window, or build
     a larger parent.

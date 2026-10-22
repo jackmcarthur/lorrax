@@ -84,7 +84,7 @@ $g_s = 2$ for `nspinor = 1`, 1 for spinors:
 - `carrier_density`: $(n_c, n_v)$ per unit cell, $n_c = g_s\sum_k w_k \sum_c \rho_{k,cc}$ over the
   unoccupied rows and $n_v$ the holes in the occupied ones (LORRAX);
 - `exciton_projection`: $c_S(t) = \sum_{kcv} A^{S*}_{kcv}\rho_{k,cv}(t)$ on the BSE eigenvectors of
-  `eigenvectors` (`bse_jax --write-eigs`, same window and k grid); $|c_S|^2/N_k$ is the
+  `eigenvectors` (`bse_jax write_eigenvectors`, same window and k grid); $|c_S|^2/N_k$ is the
   population of exciton S per unit cell (LORRAX).
 
 ## The system from a GW bundle {#bundle}
@@ -109,7 +109,7 @@ the window and refuse when its band energies differ from the restart's DFT
 energies by more than 1e-8 Ry (`td_dipole_energies`). `kgrid_fine` decks take
 Route B's window velocity in the fine $U_q$ gauge
 (`densified_dipoles(full_window=True)`) with its Newton-inverted DFT
-energies. With `--eqp` the fine states are QP-mixed and $v_{nm}/\Delta E$ is
+energies. With `eqp_corrections` the fine states are QP-mixed and $v_{nm}/\Delta E$ is
 not their position (the onset oscillator strength comes out 13–19 % low on
 8 → 30 k); Route B then returns `r_window`, the exact
 $\langle\tilde i|\hat r|\tilde j\rangle$ of the fine states (same-occupation
@@ -142,7 +142,7 @@ c↔v pairs are never masked; a c↔v gap at or below $\Delta$ refuses
 (6×6 k, 2v2c) 2 of 36 $vv'$ and 23 of 36 $cc'$ (bands 131/132 nearly
 degenerate), smallest c–v DFT gap 1.514 eV.
 
-**Gauge receipt.** `check_eigenvectors` = a `bse_jax --write-eigs --dipole`
+**Gauge receipt.** `check_eigenvectors` = a `bse_jax write_eigenvectors and dipole_file`
 file on the same bundle and window: the builder forms
 $\langle 0|\mathbf r|S\rangle = \sum_{kcv} A^S_{kcv}\, r_{k,vc}$ from the
 header and compares it with `bse_jax`'s dipoles, so the TD drive and the BSE
@@ -171,7 +171,7 @@ $E_0 f(0) d/(\sqrt2(\Omega + \omega))$, which is physical for that drive.
 
 **TDA.** `[lorrax] tda = true` applies TDGW's TDA to the ISDF ΔΣ: only
 $\delta\rho_{cv}$ drives, only $\Delta\Sigma_{cv}$ and its conjugate are kept
-(the projection of `tdgw_bridge --tda`).
+(the projection of `tdgw_bridge full_bse = false`).
 
 ## Integrators {#integrators}
 

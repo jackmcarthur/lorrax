@@ -231,16 +231,21 @@ with `head_correction`, and a deck that names the key refuses at parse.
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `kgrid_fine` | str | `""` | `"NX NY NZ"`: densifies the BSE bundle (ψ/ε, W) from the coarse restart grid before any solve. Each extent must be at least the coarse one; integer nesting is not required. Empty keeps the coarse grid. |
+| `kgrid_fine` | str | `""` | `"NX NY NZ"`: densifies the BSE bundle (ψ/ε, W) from the coarse restart grid before any solve, and the htransform utility's fine grid (`get_centroids_fi`). Each extent must be at least the coarse one; integer nesting is not required. Empty keeps the coarse grid. Was `bse_k_grid` / `kgrid_fi`. |
+| `kgrid_fine_shift` | str | `""` | kgrid.x's offset dk of the fine grid, `"dx dy dz"` in fractions of one fine step: k_i = (i + dk)/N; reduced mod 1. W stays on the unshifted q grid. exciton_bands and TD-aGW refuse it. |
+| `number_cond_bands_coarse` | str | `""` | Conduction bands of the coarse grid in the band interpolation (BerkeleyGW's name); empty = `ncond`. At least `number_cond_bands_fine`; fewer than 4 more warns. |
+| `number_val_bands_coarse` | str | `""` | Accepted and ignored with a warning: the H-transform fits every valence band of the window. |
 | `w_head_densify` | str | `c1` | Coarse-to-fine W treatment under `kgrid_fine`. `c1` splits off the singular Γ head and reattaches it analytically per fine q. `srlr` interpolates W minus a fitted dressed long-range model (head and slab G_z channels) and adds the model back at every fine q ([SR/LR densification](theory/w-srlr-densification.md)); it needs a restart whose W0 came from the static Dyson solve (`W0_lr` group, e.g. `compute_mode = cohsex`) stored on its q wedge, and runs on the `kgrid_fine` bundle path only (`exciton_bands --w-coarse-grid` refuses it). `legacy` is retired and refuses by name. |
 | `htransform_qr_eps` | float | `1e-3` | Relative cutoff (qr_eps²) of the pseudo-inverse of the refit's node Gram (`vq_interp`); the nodal htransform fit itself has no tolerance. |
 | `htransform_rank_multiplier` | — | retired | Refuses by name (`GATE htransform_qrcp_retired`): the nodal basis has no rank search; its nodes are the ISDF centroids up to 1.25 × 22 × fitted bands, else 22 × fitted bands by k-means. |
 | `htransform_qrcp_seed` | — | retired | Refuses by name (`GATE htransform_qrcp_retired`): the nodal basis has no random sketch. |
-| `get_centroids_fi` | bool | `false` | htransform → BSE handoff: also computes fine-grid ψ at the coarse centroids. |
-| `wfn_fi_min` | int | `0` | Lower edge of the htransform band sub-window (0-based). |
-| `wfn_fi_max` | int | `0` | Exclusive upper edge; `0` selects the full window. |
-| `kgrid_fine` | str | `""` | `"nx ny nz"` fine k-grid for the wavefunction recovery; empty = none. |
+| `get_centroids_fi` | bool | `false` | htransform: also interpolates onto `kgrid_fine` (+ `kgrid_fine_shift`) and writes the bands `number_val_bands_fine` below and `number_cond_bands_fine` above the occupied boundary to `<stem>_fine.h5` (`wfn_fi_min`/`wfn_fi_max` refuse with those names). |
 | `wfn_fi_q_chunk` | int | `0` | Fine-grid q-points per f(H(q)) build; `0` = N_q,coarse. It is rounded to the device count. |
+
+The BSE drivers' own keys (BerkeleyGW's absorption.x and kernel.x names:
+`number_val_bands_fine`, `full_bse`, `eqp_co_corrections`, `polarization`, ...) are
+listed in `gw_config.BSE_DECK_KEYS` and documented on the
+[BSE driver page](drivers.md#bse-bsebse_jax).
 
 htransform keeps its Galerkin basis in `galerkin_dft.h5` beside the deck. A file
 whose provenance matches (WFN fingerprint, centroid SHA-256, band window, grids,
@@ -381,8 +386,8 @@ behind `lorrax.model = isdf` is on [TD-aGW interaction](theory/td_agw.md).
 | `lorrax.dipole_file` | `""` | The coarse WFN's `dipole.h5` (`psp.get_dipole_mtxels`) for r = v/(iΔE) with the velocity's own (DFT) energies (`system = bundle`); it must cover the window and carry the restart's DFT energies. | `td_bundle_input`, `td_bundle_key`, `td_dipole_bands`, `td_dipole_energies` |
 | `lorrax.pair_rule` | `mask` | Same-occupation pairs (vv', cc') of the bundle's r: `mask` multiplies r by 1 − exp(−ΔE²/(2 gap²)), `cut` zeroes pairs with \|ΔE\| < gap, `cv` keeps the c↔v blocks only (TDGW's `use_vmtxel` layout). n = m is always zero (no intraband commutator on this route). | `td_pair_rule`, `td_pair_gap_route_b` |
 | `lorrax.pair_gap_ev` | unset (= `system.esmear`) | The energy scale of `pair_rule`, eV; also the smallest accepted c↔v gap. | `td_cv_gap`, `td_pair_gap_route_b` |
-| `lorrax.dipole_position_fix` | `false` | A `kgrid_fine` bundle with `eqp_file`: the window position is the exact r of the fine QP states (the DFT f(H) eigenbasis of the window, `bse_jax --dipole-position-fix`) instead of v/ΔE of their Rayleigh quotients. Opt in for strongly band-dependent QP ladders (CrI3-type); the bundle log's QP/DFT mixing receipt says when. | `td_velocity_position_fix` |
-| `lorrax.check_eigenvectors` | `""` | A `bse_jax --write-eigs --dipole` file on the same bundle and window: the builder reproduces its ⟨0\|r\|S⟩ from the header (the gauge receipt, logged and stored in the header). It costs a load of the eigenvectors; leave it unset in production once the receipt has been read. | `td_bundle_key`, `td_eigenvector_kpts` |
+| `lorrax.dipole_position_fix` | `false` | A `kgrid_fine` bundle with `eqp_file`: the window position is the exact r of the fine QP states (the DFT f(H) eigenbasis of the window, `bse_jax dipole_position_fix`) instead of v/ΔE of their Rayleigh quotients. Opt in for strongly band-dependent QP ladders (CrI3-type); the bundle log's QP/DFT mixing receipt says when. | `td_velocity_position_fix` |
+| `lorrax.check_eigenvectors` | `""` | A `bse_jax write_eigenvectors and dipole_file` file on the same bundle and window: the builder reproduces its ⟨0\|r\|S⟩ from the header (the gauge receipt, logged and stored in the header). It costs a load of the eigenvectors; leave it unset in production once the receipt has been read. | `td_bundle_key`, `td_eigenvector_kpts` |
 | `lorrax.degeneracy_mode` | `""` (= `strict`) | The band-window degeneracy gate of the bundle load (`strict` refuses a window edge inside a QP multiplet, `snap` widens the window, `off` keeps it; TDGW applies no such check, so reproducing a TDGW window may need `off`). | `td_degeneracy_mode`, `td_bundle_key` |
 | `lorrax.tda` | `false` | TDGW's TDA semantics for the ISDF ΔΣ: only δρ_cv drives, only ΔΣ_cv (and its Hermitian conjugate) is kept, the resonant–antiresonant coupling is dropped (the projection of `tdagw_bridge --tda`). ISDF model only. | `td_tda_model` |
 | `lorrax.stiff_modes` | `0` (= no split) | `cfm4` only: split ΔΣ exactly on the invariant subspace of the n largest eigenvalues of the coupling map L (a real Arnoldi on L at the start of the run, `stiff_krylov` steps; n raised to the end of a ± / conjugate group): ΔΣ[x] = (ΔΣ[x] − Σ_j ⟨u_j, x⟩ b_j) + Σ_j ⟨u_j, x⟩ b_j, b_j = ΔΣ[u_j]. The first part keeps the predictor and `n_corr` corrections; the second is solved implicitly at the Gauss nodes (simplified Newton on exponentials and projections, no ΔΣ call), so the static limit and the probe bind the slow map L(1 − Π) only. Needs an affine model. On the 30×30 CrI3 ISDF model 10 modes double the stable step (50 → 100 as); it pays at P(t) errors near 1e-4, not at 1e-5 ([choosing an integrator](how-to/td-agw-run.md#integrators)). | `td_stiff_modes`, `td_stiff_method`, `td_stiff_model`, `td_stiff_basis` |

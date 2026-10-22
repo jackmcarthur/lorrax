@@ -65,12 +65,16 @@ load (`wfn_loader.WfnLoader`); use a noncollinear calculation for magnetism.
 | `vxc.dat`, `kih.dat`, `dont_use_vxcdat` | none | §4.5 |
 | `no_symmetries_q_grid` | none | LORRAX uses every symmetry QE reports |
 | k-point list (sigma) | none | every k of the WFN wedge |
-| `degeneracy_check_override` | none | a band count that cuts a degenerate multiplet refuses |
-| `eqp_corrections` (kernel, absorption) | `--eqp` of `bse.bse_jax` | §7 |
-| `exciton_Q_shift` (kernel, absorption) | `--exciton-Q` of `bse.bsemat_cli`; the shift is −Q | §7 |
-| `use_momentum` (absorption) | `psp.get_dipole_mtxels --skip-vnl` | §7 |
-| `number_val_bands`, `number_cond_bands` | `--n-val`, `--n-cond` | counted in bands, spinor bands included |
-| `energy_resolution`, `number_iterations` | `--eta-eV`, `--n-iter` of `bse.absorption_haydock` | |
+| `degeneracy_check_override` | `degeneracy_check_override` (BSE) = `band_degeneracy = off` | GW: a band count that cuts a degenerate multiplet refuses |
+| absorption.inp keys | the same deck keys in the GW deck, read by `bse.bse_jax` and `bse.absorption_haydock` | BerkeleyGW's `key value` and bare-flag lines are accepted; [BSE keywords](../drivers.md#bse-bsebse_jax), §7 |
+| `number_val_bands_fine`, `number_cond_bands_fine`, `number_cond_bands_coarse` | same | the BSE window and the coarse bands of the band interpolation; `number_val_bands_coarse` is ignored (every valence band is fitted) |
+| `WFN_fi` grid and its kgrid.x shift | `kgrid_fine`, `kgrid_fine_shift` | no fine-grid DFT: the H-transform fills the grid |
+| `eqp_corrections`, `eqp_co_corrections` | same | without / with `kgrid_fine`; a value may name the file (`eqp1.dat`) |
+| `spin_singlet`, `spin_triplet`, `local_fields`, `spinor` | same | non-spinor WFN only for the first two; a spinor WFN has one kernel |
+| `diagonalization` + `number_eigenvalues`, `haydock` + `number_iterations` | `solver` + `number_eigenvalues`, `haydock` + `number_iterations` | TDA is the default; `full_bse` |
+| `energy_resolution`, `gaussian_broadening`, `lorentzian_broadening`, `delta_frequency`, `polarization`, `write_eigenvectors` | same | `polarization` along b1 b2 b3, normalized as a Cartesian vector |
+| `use_momentum`, `use_velocity` (absorption) | same, checked against `dipole.h5`; the file is made with or without `psp.get_dipole_mtxels --skip-vnl` | §7 |
+| kernel.x's `number_val_bands`, `number_cond_bands`, `extended_kernel`, `exciton_Q_shift` | same, read by `bse.bsemat_cli` | §7 |
 
 ## 3. Outputs {#outputs}
 
@@ -513,9 +517,9 @@ conventions (§4.1–4.2) carry into the kernel. To compare with BerkeleyGW's
 
 - **Dipole operator.** BerkeleyGW's `use_momentum` uses $\hat p$ only. Write
   that with `python -m psp.get_dipole_mtxels -i deck.in --skip-vnl --out
-  dipole_p_only.h5` and pass it as `--dipole`. The default `dipole.h5`
+  dipole_p_only.h5` and pass it as `dipole_file`. The default `dipole.h5`
   includes the nonlocal term and is the physical velocity.
-- **QP energies.** `--eqp` takes a BerkeleyGW-format `eqp1.dat`, LORRAX's or
+- **QP energies.** `eqp_corrections` takes a BerkeleyGW-format `eqp1.dat`, LORRAX's or
   BerkeleyGW's. The reader (`file_io.restart_bundle.apply_eqp_corrections`)
   takes either the WFN's file wedge (one block per WFN k, unfolded through the
   symmetry service) or a full-zone file with a block for every full-BZ k,
@@ -526,11 +530,11 @@ conventions (§4.1–4.2) carry into the kernel. To compare with BerkeleyGW's
   $E_{QP} - E_{DFT}$, averaged over each DFT multiplet, differ across a
   symmetry star by more than 1 meV, so the two codes cannot apply different
   energies from one file. To compare kernels, give both codes the same QP energies.
-- **Band counts.** `--n-val` and `--n-cond` count bands, spinor bands
+- **Band counts.** `number_val_bands_fine` and `number_cond_bands_fine` count bands, spinor bands
   included, as BerkeleyGW's `number_val_bands` and `number_cond_bands` do. The
-  occupied count comes from the WFN's `ifmax` or `--n-occ`. A window edge
+  occupied count comes from the WFN's `ifmax` or `highest_occupied_band`. A window edge
   inside a degenerate multiplet (a Kramers pair under spin–orbit coupling)
-  refuses unless `--band-degeneracy snap` widens it.
+  refuses unless `band_degeneracy = snap` widens it.
 - **Spectrum.** The dipole of a transition $t = (v, c, k)$ is the position
   matrix element, obtained from the velocity in `dipole.h5`:
   $d^\alpha_t = \langle ck|\hat r_\alpha|vk\rangle = v^\alpha_{cv}/\big(i(E_c - E_v)\big)$
@@ -544,20 +548,21 @@ conventions (§4.1–4.2) carry into the kernel. To compare with BerkeleyGW's
   $\varepsilon_2^\alpha(\omega) = \frac{16\pi^2}{V N_k n_\mathrm{spin}
   n_\mathrm{spinor}}\lVert d^\alpha\rVert^2\,\big(-\mathrm{Im}\,g^\alpha(\omega+i\eta)/\pi\big)$,
   BerkeleyGW's Haydock formula (`bse.absorption_haydock`, `python -m
-  bse.absorption_haydock`). Match `--eta-eV` to `energy_resolution`,
-  `--n-iter` to `number_iterations`, and `--V-cell` (bohr³) to the cell;
-  `--n-spin` and `--n-spinor` (defaults 1 and 2, the spinor case) enter the
-  prefactor and must describe the WFN. The outputs
-  `absorption_haydock_b1_eh.dat` (b2, b3) are the three Cartesian
-  polarizations. Compare $\varepsilon_2(\omega)$, not raw sums of $|d|^2$.
+  bse.absorption_haydock`), with `energy_resolution` and `number_iterations`
+  as in absorption.inp; the cell volume and the spinor count come from the
+  WFN. The outputs `absorption_haydock_b1_eh.dat` (b2, b3) are the three
+  Cartesian polarizations, or `absorption_haydock_eh.dat` for a deck
+  `polarization`. With `dipole_file` the eigensolve also writes
+  `absorption_eh.dat` and `absorption_noeh.dat` from its computed states
+  (Gaussian by default, as BerkeleyGW's diagonalization). Compare $\varepsilon_2(\omega)$, not raw sums of $|d|^2$.
 - **Kernel files.** `python -m bse.bsemat_cli` writes `bsemat.h5` from the GW
   restart for BerkeleyGW's `absorption` ([theory](../theory/bgw-bsemat-export.md)).
-  `--exciton-Q Q1 Q2 Q3` writes the finite-momentum kernel. `absorption.inp` must carry
-  the file's `exciton_Q_shift` (= −Q), which `absorption` does not check, and at `qflag`
+  `exciton_Q_shift Qflag Qx Qy Qz` in the deck, with kernel.x's sign, writes the finite-momentum
+  kernel. `absorption.inp` must carry the same `exciton_Q_shift`, which `absorption` does not check, and at `qflag`
   2 BerkeleyGW 4.0's `absorption` needs an `eqp.dat` whose valence column at $p$ holds
   $E_v(p-Q_s)$ ([BerkeleyGW 4.0 defects](../theory/bgw-bsemat-export.md#finite-q)).
-- **Eigenvectors.** `bse.bse_jax --lanczos --tda --bse --write-eigs N
-  --dipole FILE` writes `eigenvectors.h5` in BerkeleyGW's layout (eV, valence
+- **Eigenvectors.** `bse.bse_jax` with `write_eigenvectors = N` and `dipole_file = FILE`
+  in the deck writes `eigenvectors.h5` in BerkeleyGW's layout (eV, valence
   axis reversed; [BSE outputs](../architecture/bse.md#outputs)). An
   $\varepsilon_2$ summed over a truncated set of eigenstates converges slowly
   in peak height; compare full spectra through the Haydock route, and compare

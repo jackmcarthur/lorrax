@@ -7,4 +7,11 @@ compute_mode = hl_ppm     # Hybertsen-Louie plasmon pole (sigma.x frequency_depe
 ppm_omega_p = 200.0       # HL probe above every chi0 transition: the f-sum limit
 use_band_extrapolation = false   # BerkeleyGW truncates the band sum at number_bands
 centroids_file = centroids_frac_996.txt   # the table step 1 wrote
-kgrid_fine = 10 10 10     # BSE fine grid, as absorption's WFN_fi
+# BSE, as absorption.inp (BerkeleyGW names)
+kgrid_fine = 10 10 10                # absorption's WFN_fi grid
+kgrid_fine_shift = 0.47 0.37 0.31    # its kgrid.x shift dk (fractions of one step)
+number_val_bands_fine = 8
+number_cond_bands_fine = 8
+number_cond_bands_coarse = 16        # as absorption.inp's number_cond_bands_coarse
+eqp_co_corrections = eqp1.dat
+number_eigenvalues = 16

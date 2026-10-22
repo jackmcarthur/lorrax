@@ -267,11 +267,11 @@ written files; a smaller value writes the leading sub-block of the converged
 
 ## bsemat — `bse.bsemat_cli`
 
-Writes BerkeleyGW 4.0's kernel file `bsemat.h5` (TDA, or `extended_kernel` with
-`--extended`) from a finished static-Dyson GW bundle. The head, wing and body at
+Writes BerkeleyGW 4.0's kernel file `bsemat.h5` (TDA, or every block with
+`extended_kernel = true`) from a finished static-Dyson GW bundle. The head, wing and body at
 every q come from the stored V, W and one ζ column per q, so no plane-wave pair
 density is formed. Invoke:
-`python3 -u -m bse.bsemat_cli -i cohsex.in --wfn-co WFN_co.h5 --n-val NV --n-cond NC --bgw-eps epsmat.h5`
+`python3 -u -m bse.bsemat_cli -i cohsex.in --wfn-co WFN_co.h5 --bgw-eps epsmat.h5`, with kernel.x's keys `number_val_bands`, `number_cond_bands`, `extended_kernel` and `exciton_Q_shift` in the deck
 on a square mesh. `--wfn-co` is the explicit full-grid WFN that BerkeleyGW's
 absorption reads (`no_symmetries_coarse_grid`); the file is written in its
 coefficient gauge and k order. `--bgw-eps` supplies the q list that fixes
@@ -282,20 +282,20 @@ file's band window (an integer, `kx` = k·N_b of the parent's centroids with
 N_b = NV + NC, or `auto` for the eigenvalue-rank ceiling; `--downfold-rcond`) with
 the [downfold](downfold.md) driver's selection and transfer, and builds the rows
 by GEMMs over the small W; the theory page gives its measured accuracy. `--q0-body dipole` adds the
-3-D q0 body term from the bundle's stored q → 0 wings. `--kernel`
-(`--extended` = `--kernel extended`), `--gauge` (`--no-gauge-map` = `--gauge identity`),
-`--q0-body` and `--mu-small` each take several values; one run then writes one file
-per combination from a single load of the bundle, head split and gauge map, named
-`<stem>_<tag><ext>` after `-o` (for example `--kernel tda extended` writes
-`bsemat_tda.h5` and `bsemat_ext.h5`). Each `<file>.json` carries `stages`, the wall
+3-D q0 body term from the bundle's stored q → 0 wings. `--gauge`
+(`--no-gauge-map` = `--gauge identity`), `--q0-body` and `--mu-small` each take
+several values; one run then writes one file per combination from a single load
+of the bundle, head split and gauge map, named `<stem>_<tag><ext>` after `-o`
+(for example `--gauge map identity` writes `bsemat_map.h5` and
+`bsemat_nomap.h5`). The kernel form (`extended_kernel`) is one per run. Each `<file>.json` carries `stages`, the wall
 seconds of every stage, and rank 0 prints the `common.timing` stage table at the end.
-`--exciton-Q Q1 Q2 Q3` (crystal, default 0) writes the finite-momentum TDA kernel
-(BerkeleyGW `exciton_Q_shift` = −Q): on the restart grid from the restart's own
-states (`qflag` 2); off it, `--wfn-co` is the restart grid shifted by +Q, the
+`exciton_Q_shift Qflag Qx Qy Qz` (kernel.x's key and sign: the exciton momentum is
+−(Qx, Qy, Qz); default `1 0 0 0`) writes the finite-momentum TDA kernel: on the
+restart grid from the restart's own states (Qflag 2); off it, `--wfn-co` is the restart grid shifted by +Q, the
 electron leg comes from the deck's htransform and `--wfnq-co` is the restart
-grid's WFN (`qflag` 0; not yet validated, so it refuses unless the restart's ζ
+grid's WFN (Qflag 0; not yet validated, so it refuses unless the restart's ζ
 covers the full zone). BerkeleyGW 4.0's absorption needs a compensating
-`eqp.dat` at `qflag` 2 ([theory](theory/bgw-bsemat-export.md#finite-q)).
+`eqp.dat` at Qflag 2 ([theory](theory/bgw-bsemat-export.md#finite-q)).
 [The theory page](theory/bgw-bsemat-export.md) owns the equations, the conventions and the
 refusals.
 
@@ -322,40 +322,49 @@ owns the method, every flag and key, the output formats and the refusals.
 ## bse — `bse.bse_jax`
 
 Solves the Bethe–Salpeter equation for $Q = 0$ excitons in the transition
-basis $|vk \to ck\rangle$: the full (non-TDA) problem by default, the resonant
-block $A$ with `--tda`. `--rpa` (the default kernel) drops $W$; `--bse`
-includes it. The Hamiltonian, the inputs, the screened W(0) handoff, the
-matvec and its kernels, the solvers, the dipoles, the outputs and the refusals
-are on [the BSE page](architecture/bse.md).
+basis $|vk \to ck\rangle$: the Tamm–Dancoff resonant block $A$ by default,
+the full problem with `full_bse = true`. The kernel is the screened
+$D + wV - W$ by default (the spinor kernel on a spinor WFN; `spin_singlet`,
+or `spin_triplet`, on a non-spinor one); `local_fields = true` drops $W$. The
+Hamiltonian, the inputs, the screened W(0) handoff, the matvec and its
+kernels, the solvers, the dipoles, the outputs and the refusals are on
+[the BSE page](architecture/bse.md).
 
-Invoke: `python -u -m bse.bse_jax -i cohsex.in --tda --bse ...` in the GW
-run directory. The mesh is the run's square startup mesh; `--px`/`--py` must
-be square and use every device. The CLI is strict: an unknown flag refuses,
-and so does a flag the chosen route (the default eigensolve, `--feast` or
-`--kpm-dos`) does not read — `--eqp`, `--qp-rotations`, `--n-eig`, `--n-occ` and the
-solver flags are eigensolve-only (marked *Lanczos* below, after its old flag).
+Invoke: `python -u -m bse.bse_jax -i gw.in` in the GW run directory. Every
+setting is a deck key in `gw.in`, under BerkeleyGW's absorption.x name where
+the meaning matches; BerkeleyGW's `key value` and bare-flag lines are
+accepted. The command line keeps `-i`, `--px`/`--py` (square, every device),
+`--report-file` and `--out-prefix`; an old flag refuses with its deck key.
+A key that only another route reads (`feast = true`, `kpm_dos = true`, or a
+solver's own keys) refuses.
 
-| flag | default | meaning |
+| deck key | default | meaning |
 |---|---|---|
-| `--lanczos` / `--feast` | eigensolve | the eigensolve (`--solver`, Davidson by default) is the default route since 2026-10-21; `--lanczos` is a no-op alias. `--feast` runs FEAST windows (`bse_feast`, `--feast-iter` 2) and refuses unless every in-window Ritz pair's residual is below `--feast-tol-mev` (0.01 meV; `GATE feast_converged`), and when a window is saturated (every Ritz pair in-window: raise `--feast-ritz-count`) |
-| `--bse` / `--rpa` | RPA | `--bse` adds $-W$ |
-| `--tda` | off | resonant block only; without it every route solves the full BSE, and `--lanczos` goes to the dense `bse_nontda` solver, ignoring `--solver`, `--block-size` and `--n-reorth` |
-| `--n-val` / `--n-cond` / `--n-occ` | 4 / 4 / the WFN's `ifmax` | transition window; the occupied-band count is `--n-occ` (*Lanczos*), else the deck WFN's `ifmax` |
-| `--band-degeneracy` | `strict` | *Lanczos*. A window edge inside a multiplet: `strict` refuses and names working counts, `snap` widens outward, `off` proceeds; tolerance `--degeneracy-tol-ry` (1 meV) |
-| `--solver` | `davidson` | *Lanczos*. `davidson` (default since 2026-10-20): block Davidson on the `--n-eig` lowest roots with the exact diagonal preconditioner and soft locking, stopped by its residual test; `lanczos` (fixed Krylov dimension, or `--lanczos-rtol`); `trlan` (thick restart, bounded memory, fixed matvec budget, `--trlan-*`). A flag only another solver reads refuses (`--block-size`, `--lanczos-rtol`, `--lanczos-check-every`, `--n-reorth` are Lanczos's; `--davidson-*` Davidson's; `--trlan-*` TRLan's) |
-| `--davidson-margin` / `--davidson-margin-tol-mev` | 8 / `--davidson-tol-mev` | *Lanczos*, Davidson. Roots solved above `--n-eig` and not reported (at most half the transition space); the residual at which a margin root locks (stays in the basis, no further correction) |
-| `--davidson-tol-mev` / `--davidson-precond` / `--davidson-m-max` | 0.01 / `exact` / 10·n-eig | *Lanczos*, Davidson. Stop when every root's residual $\lVert Hx - Ex\rVert$ is below the tolerance (meV; an exact eigenvalue lies within the residual, the error is typically residual²/gap); diagonal `exact` = assembled diag(H), `bare` = $E_c - E_v$; basis capacity before a restart |
-| `--block-size` / `--max-lanczos-iter` / `--n-reorth` | 1 / auto / −1 | *Lanczos*. Block width / iteration budget: Lanczos's total Krylov dimension, Davidson's cap on block iterations, TRLan's matvec budget / reorthogonalization window (−1 = full, needed for degenerate spinor spectra) |
-| `--n-eig` / `--write-eigs [N]` | 5 / off | *Lanczos*. Eigenpairs; write `eigenvectors.h5` |
-| `--dipole FILE` | none | *Lanczos*, with `--write-eigs` and `--tda`: store each written state's dipole $\langle 0\lvert\hat r\rvert S\rangle$ from `FILE` (a `dipole.h5`) in `eigenvectors.h5`. Under `kgrid_fine`, `FILE` is the deck (coarse) WFN's, carried through the densifying htransform ([dipoles](architecture/bse.md#dipoles-and-absorption)); with `--eqp` the dipoles are $v/\Delta E$ of the fine states' Rayleigh quotients, and `--dipole-position-fix` (opt-in, CrI3-type QP ladders; the log's QP/DFT mixing receipt says when) makes them the exact position of the fine QP states; `absorption_haydock --dipole [--dipole-position-fix]` reads it the same way, and `python -m bse.dump_window_dipoles -i deck.in --n-val NV --n-cond NC [--n-occ N] --dipole FILE [--eqp EQP] [--dipole-position-fix] [--full-window] --out d.h5 [--check-eigenvectors eigenvectors.h5 --check-key d_alpha_rq]` writes them (and, with the fix, `d_alpha_rq`) in the run's gauge for re-contracting a saved `eigenvectors.h5` |
-| `--haydock-iter N` | 0 (off) | *Lanczos*, with `--tda` and `--dipole`: after the eigensolve, N steps of the Haydock recursion of `bse.absorption_haydock` on the same payload and transformed kernel, in the same process; writes `--haydock-out-prefix` (`absorption_haydock`) `.h5` and `absorption_haydock_b<1-3>_eh.dat`. `--haydock-pol` (`xyz`) picks the Cartesian polarizations (one matvec each per step; `x` alone for a cubic crystal), `--haydock-eta-ev` (0.1), `--haydock-omega-min-ev`/`-max-ev`/`--haydock-n-omega` (0/15/1500), `--haydock-n-spin` (1), `--haydock-no-eps1` as the standalone driver's flags; the cell volume is the deck WFN's |
-| `--helicity-table` | off | *Lanczos*, with `--dipole`: add each written state's in-plane circular strengths to `bse.out`, $I_\pm = \lvert D_x \mp i D_y\rvert^2/(2N_k)$ in bohr² per unit cell for $D = \langle 0\lvert\hat r\rvert S\rangle$, and $\eta = (I_+ - I_-)/(I_+ + I_-)$. σ+ is the field $E_0(\cos\omega t, \sin\omega t, 0)$: x → y, counter-clockwise seen from +z ([helicity](architecture/bse.md#dipoles-and-absorption)) |
-| `--eqp FILE` | none | *Lanczos*. Diagonal QP energies from the wedge `eqp1.dat`, unfolded through the symmetry service; the restart must be proved to come from the same unrotated WFN |
-| `--qp-rotations FILE` | none | *Lanczos*, native grid. Solve in the eigenbasis of the GW run's $H_{QP}$ from its `qp_wfn_rotations.h5`: rotated ψ at the centroids, $E_{QP}$, QP-basis dipoles; `--n-val`/`--n-cond` count QP states. Exclusive with `--eqp`; refuses `kgrid_fine` ([QP-rotated basis](architecture/bse.md#the-qp-rotated-basis)) |
-| `kgrid_fine` (deck) | `""` | fine grid "NX NY NZ", each axis at least the coarse extent |
-| `head_minibz_average` (deck) | false | read only under `kgrid_fine`: rebuilds the q = 0 exchange tile with the fine grid's mini-BZ head and takes the W head's Γ-cell reference from the analytic sphere ([LT head](theory/lt-exchange-head.md)); must match the GW run |
+| `number_val_bands_fine` / `number_cond_bands_fine` | required | the BSE window, counted from the occupied boundary (BerkeleyGW's names) |
+| `highest_occupied_band` | the WFN's `ifmax` | occupied-band count |
+| `full_bse` | false | the full BSE (dense `bse_nontda` solver); off = TDA |
+| `spin_singlet` / `spin_triplet` | singlet | non-spinor WFN only: $D + 2V - W$ or $D - W$; refuse on a spinor WFN, whose kernel is $D + V - W$. Only the scalar exchange weight changes |
+| `local_fields` / `spinor` | false / the WFN's | RPA with local fields ($D + wV$), never the default / an assertion on the WFN |
+| `band_degeneracy` / `degeneracy_check_override` / `degeneracy_tol_ry` | `strict` / false / 1 meV | a window edge inside a multiplet: `strict` refuses and names working counts, `snap` widens outward, `off` proceeds (`degeneracy_check_override` = `off`) |
+| `eqp_corrections` / `eqp_co_corrections` | none | QP energies (eqp1.dat format): without / with `kgrid_fine`. A bare key reads `eqp.dat` / `eqp_co.dat` beside the deck, a value names the file |
+| `qp_rotations_file` | none | solve in the eigenbasis of the GW run's $H_{QP}$; native grid only, exclusive with the eqp keys ([QP-rotated basis](architecture/bse.md#the-qp-rotated-basis)) |
+| `kgrid_fine` / `kgrid_fine_shift` | none / `0 0 0` | fine grid `NX NY NZ` and kgrid.x's offset dk (fractions of one fine step, k = (i + dk)/N); W stays on the unshifted fine q grid |
+| `number_cond_bands_coarse` | `ncond` | conduction bands of the coarse grid in the band interpolation; ≥ `number_cond_bands_fine`, ≥ 4 more recommended. `number_val_bands_coarse` is ignored with a warning |
+| `head_minibz_average` | false | read only under `kgrid_fine`: rebuilds the q = 0 exchange tile with the fine grid's mini-BZ head ([LT head](theory/lt-exchange-head.md)); must match the GW run |
+| `solver` | `davidson` | TDA eigensolver: `davidson` (exact diagonal, residual stop `davidson_tol_mev`, 0.01 meV; `GATE davidson_converged`), `block_lanczos` (`block_size`, `lanczos_rtol`, `lanczos_check_every`, `lanczos_n_reorth`), `trlan` (`trlan_m_max`, `trlan_n_keep`). A key only another solver reads refuses |
+| `number_eigenvalues` / `solver_max_iter` | 5 / auto | roots; iteration budget of every solver |
+| `davidson_margin` / `davidson_margin_tol_mev` / `davidson_precond` / `davidson_m_max` | 8 / `davidson_tol_mev` / `exact` / 10·n_eig | Davidson internals |
+| `dipole_file` | none | TDA: per-state dipoles $\langle 0\lvert\hat r\rvert S\rangle$ (`eigenvalues_b1..3.dat`), the spectra below and the Haydock seed. Under `kgrid_fine` the coarse WFN's file, carried through the band interpolation ([dipoles](architecture/bse.md#dipoles-and-absorption)); `dipole_position_fix` gives the exact position of fine QP states. `use_momentum` / `use_velocity` assert the file's operator |
+| `energy_resolution` / `gaussian_broadening` / `lorentzian_broadening` | 0.1 eV / on / off | broadening of `absorption_eh.dat` and `absorption_noeh.dat` (BerkeleyGW's files, from the computed states and the window's transitions; complete below the highest root) |
+| `polarization` / `omega_min_ev` / `omega_max_ev` / `delta_frequency` / `no_eps1` | the three axes / 0 / 15 / 0.01 / false | polarization along b1 b2 b3 (the Cartesian vector is normalized); the frequency grid in eV |
+| `write_eigenvectors` | 0 | `eigenvectors.h5`: 0 none, N > 0 the lowest N, < 0 every computed state |
+| `helicity_table` | false | with `dipole_file`: in-plane circular strengths $I_\pm = \lvert D_x \mp i D_y\rvert^2/(2N_k)$ in `bse.out` ([helicity](architecture/bse.md#dipoles-and-absorption)) |
+| `haydock` / `number_iterations` | false / 200 | after the eigensolve, Haydock steps on the same payload; writes `absorption_haydock.h5` and `absorption_haydock*_eh.dat` |
+| `feast` / `kpm_dos` | false | the FEAST window route (`feast_*`, `gmres_*`; refuses unless converged, `GATE feast_converged`) / the KPM density of states (`kpm_*`) |
 
-Forgetting `--bse` gives RPA. Absorption comparisons with BerkeleyGW:
+`python -m bse.dump_window_dipoles -i deck.in --n-val NV --n-cond NC [--n-occ N] --dipole FILE [--eqp EQP] [--dipole-position-fix] [--full-window] --out d.h5 [--check-eigenvectors eigenvectors.h5 --check-key d_alpha_rq]`
+writes the window dipoles in the run's gauge for re-contracting a saved
+`eigenvectors.h5` (its own flags). Absorption comparisons with BerkeleyGW:
 [BerkeleyGW users](how-to/berkeleygw-users.md#bse).
 
 ## exciton bands — `bse.exciton_bands`
@@ -367,9 +376,9 @@ from htransform, W is the coarse-grid convolution of the GW restart, and the
 exchange tile at off-grid $Q$ comes from `bse.vq_interp`. Each $Q$'s lowest
 roots come from `bse_lanczos`' Davidson (the default: one planned solver for
 the path, residual stop, a $Q$ that does not converge refuses) or, with
-`--solver lanczos`, from block Lanczos in one compiled `lax.scan`. Writes `<prefix>.dat` and `<prefix>.png` (rank 0).
+`solver = block_lanczos`, from block Lanczos in one compiled `lax.scan`. Writes `<prefix>.dat` and `<prefix>.png` (rank 0).
 
-Invoke: `python -u -m bse.exciton_bands -i cohsex.in --n-val 4 --n-cond 4 --n-eig 6`.
+Invoke: `python -u -m bse.exciton_bands -i cohsex.in`, with the BSE deck keys it shares with `bse.bse_jax` (`number_val_bands_fine`, `number_cond_bands_fine`, `number_eigenvalues`, `solver`, `solver_max_iter`, `eqp_corrections`, `dipole_file`, ...) in the deck; the exciton-band flags stay on the command line. A `kgrid_fine_shift` refuses.
 
 [Band interpolation and exciton bands](how-to/htransform-and-exciton-bands.md#7-exciton-bands)
 owns the method, the exchange routes (`--vq-mode`) and their certification,

@@ -106,7 +106,7 @@ loader call is the earlier one:
 | `eqp_file` | the BSE run's `--eqp`. On a `kgrid_fine` deck it enters the htransform, so the fine ψ are the quasiparticle f(H) states of a `bse_jax --eqp` run on that deck and the fine ε are QP. On a coarse deck ψ do not change and the file only sets the window energies |
 | `velocity_file` | the coarse `dipole.h5` (`--dipole`), carried through the htransform; read on the densified route only, refused elsewhere and by a loader that has no velocity |
 | `velocity_full_window` | the velocity over every window pair (vv', cc' and cv); refused until the loader offers it |
-| `keep_window` | `model["window"]`: the loader's ε (Ry, window ascending), `n_occ`, `n_val`, `n_cond`, dipoles and where the energies came from; on a coarse deck with `eqp_file` the ε are re-sliced as `bse_jax --eqp` does them |
+| `keep_window` | `model["window"]`: the loader's ε (Ry, window ascending), `n_occ`, `n_val`, `n_cond`, dipoles and where the energies came from; on a coarse deck with `eqp_file` the ε are re-sliced as `bse_jax eqp_corrections` does them |
 
 The densified route reproduces the BSE. On CrI3 30×30 (`kgrid_fine` on a
 μ_S = 714 downfold, bands [88, 144), the 6000-centroid run's eqp) the lowest
@@ -131,7 +131,7 @@ selects every block. `tdagw.kernel_export` writes $K$ in that convention.
 With `nblocks = 1` TDGW's TDA reader takes only the $(cv, c'v')$ block of the
 same dataset and propagates $\Delta\Sigma_{cv}=K_{cv,c'v'}\,\delta\rho_{c'v'}$,
 $\Delta\Sigma_{vc}=\Delta\Sigma_{cv}^\dagger$, every other block zero; the
-exporter's and the bridge's `--tda` produce exactly that. At TDGW 41a5c34 a
+exporter's and the bridge's `full_bse = false` produce exactly that. At TDGW 41a5c34 a
 native run can use only that file: its extended reader builds the kernel
 without the run's parallel k axis, and the first update refuses at any rank
 count.

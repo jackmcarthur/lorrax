@@ -89,7 +89,7 @@ $RUN centroid.kmeans_cli 1000 -i gw.in      # 1. centroids_frac_996.txt
 $RUN psp.get_dipole_mtxels -i gw.in         # 2. dipole.h5
 $RUN gw.kin_ion_io -i gw.in                 # 3. kin_ion.h5
 $RUN gw.gw_jax -i gw.in                     # 4. eqp0.dat, eqp1.dat, qp_wfn_rotations.h5, tmp/
-$RUN bse.bse_jax -i gw.in --tda --bse --n-val 8 --n-cond 8 --n-eig 16 --eqp eqp1.dat
+$RUN bse.bse_jax -i gw.in                    # 5. the BSE (its keys are in gw.in)
 $RUN bandstructure.htransform -i ht.in --eqp-file eqp1.dat   # bandstructure.dat, as inteqp
 ```
 
@@ -112,7 +112,8 @@ XML reader refuses the file ("not well-formed"), hence the `sed`.
 | `compute_mode = hl_ppm` | `sigma.x` default `frequency_dependence 1` |
 | `ppm_omega_p = 200.0` | none: LORRAX's HL fit reads the first moment at a real probe frequency, which must lie above every χ₀ transition (3.48 Ry here); 200 Ry is the f-sum limit |
 | `use_band_extrapolation = false` | BerkeleyGW truncates the band sum |
-| `kgrid_fine = 10 10 10` | `absorption.x`'s `WFN_fi` grid |
+| `kgrid_fine = 10 10 10`, `kgrid_fine_shift = 0.47 0.37 0.31` | `absorption.x`'s `WFN_fi` grid and its kgrid.x shift |
+| `number_val_bands_fine = 8`, `number_cond_bands_fine = 8`, `number_cond_bands_coarse = 16`, `eqp_co_corrections` | the same keys of `absorption.inp` |
 | `sys_dim = 3` | no truncation |
 
 `ht.in` asks for bands 1–24 (`ncond = 16`): htransform fits 4 guard bands above
@@ -156,8 +157,10 @@ Lowest excitons (TDA, eV):
 | S1 | 3.237 | 3.125 | 3.179 |
 | S9 | 3.273 | 3.162 | 3.216 |
 
-The fine grids differ: `absorption.x` reads the shifted `WFN_fi`, which has no
-Γ point, while `kgrid_fine = 10 10 10` is unshifted and contains Γ, where the
+The numbers above predate `kgrid_fine_shift` and were run on an unshifted fine
+grid; `gw.in` now carries BerkeleyGW's shift, so a rerun compares like for like.
+On the unshifted grid the fine grids differed: `absorption.x` reads the shifted
+`WFN_fi`, which has no Γ point, while `kgrid_fine = 10 10 10` contains Γ, where the
 direct gap is. On BerkeleyGW's own QP energies LORRAX's S1 lies 68 meV below
 the Γ transition (3.247 eV); BerkeleyGW's lies 10 meV below it, at a k of the
 shifted grid. The BerkeleyGW column is the upstream example's own absorption

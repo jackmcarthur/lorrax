@@ -5,6 +5,46 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-21 — BSE: BerkeleyGW key names in the deck, TDA and the screened kernel by default
+
+The BSE drivers read their settings from the deck passed with `-i`, under
+BerkeleyGW's absorption.x and kernel.x names. Old command lines refuse with
+the deck key to write ("`--n-val` is now deck key `number_val_bands_fine`").
+
+- **Results that move.** TDA is the default (`full_bse = true` for the full
+  BSE; was full BSE unless `--tda`). The screened kernel is the default (was
+  RPA unless `--bse`); `local_fields = true` gives the RPA. On a non-spinor
+  WFN `spin_singlet` (default) or `spin_triplet`; on a spinor WFN those keys
+  refuse. A deck that relied on either old default changes its answer.
+- **bse.bse_jax:** keep `-i`, `--px/--py`, `--report-file`, `--out-prefix`.
+  `--n-val`, `--n-cond`, `--n-occ` are `number_val_bands_fine`,
+  `number_cond_bands_fine`, `highest_occupied_band`; `--eqp` is
+  `eqp_corrections` (or `eqp_co_corrections` with `kgrid_fine`; a bare key
+  reads `eqp.dat` / `eqp_co.dat`); `--dipole` is `dipole_file`; `--n-eig`,
+  `--write-eigs` are `number_eigenvalues`, `write_eigenvectors` (0 none,
+  < 0 every computed state); `--solver lanczos` is `solver = block_lanczos`;
+  `--max-lanczos-iter` is `solver_max_iter`; `--haydock-iter N` is
+  `haydock = true` with `number_iterations`; the other solver, KPM and FEAST
+  flags are the deck keys of the same name in snake case. `--lanczos` is gone.
+- **bse.absorption_haydock:** `--eta-eV`, `--n-iter`, `--n-omega` are
+  `energy_resolution`, `number_iterations`, `delta_frequency`; `--V-cell`,
+  `--n-spinor`, `--n-spin` are gone (read from the WFN); `--pol` is
+  `polarization`, a vector along b1 b2 b3.
+- **bse.exciton_bands:** the window, solver, eqp and dipole settings are the
+  same deck keys; its own flags stay. `--max-iter` is `solver_max_iter`.
+- **bse.bsemat_cli:** `--n-val`, `--n-cond`, `--kernel`/`--extended`,
+  `--exciton-Q` are kernel.x's deck keys `number_val_bands`,
+  `number_cond_bands`, `extended_kernel`, `exciton_Q_shift Qflag Qx Qy Qz`
+  (kernel.x's sign, Q_shift = -Q). One kernel form per run.
+- **Fine grid:** `bse_k_grid` is `kgrid_fine` (also the htransform utility's
+  `kgrid_fi`); new `kgrid_fine_shift` (kgrid.x's dk) and
+  `number_cond_bands_coarse`. The htransform utility's `wfn_fi_min`/`max`
+  are `number_val_bands_fine`/`number_cond_bands_fine`, counted from the
+  occupied boundary, and its fine bands are written to `<stem>_fine.h5`.
+- **New output:** with `dipole_file` the eigensolve writes
+  `absorption_eh.dat` and `absorption_noeh.dat` (Gaussian by default).
+- **Deck syntax:** BerkeleyGW's `key value` and bare-flag lines are read.
+
 ## 2026-10-21 — Old deck keys, values and flags refuse instead of being aliased
 
 A renamed deck key, deck value or command-line flag is no longer accepted

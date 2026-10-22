@@ -207,7 +207,7 @@ parent's centroids.
 
 ## Finite exciton momentum {#finite-q}
 
-`--exciton-Q Q1 Q2 Q3` (crystal, default 0) writes `kernel.x`'s
+`exciton_Q_shift Q1 Q2 Q3` (crystal, default 0) writes `kernel.x`'s
 finite-momentum kernel on the same coarse k count. BerkeleyGW's
 `exciton_Q_shift` $Q_s$ is the negative of the exciton momentum: `kernel.x`
 puts the conduction leg of row k at $k$ (WFN_co) and the valence leg at

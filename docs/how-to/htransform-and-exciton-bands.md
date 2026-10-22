@@ -207,7 +207,7 @@ of §7.
 
 Two routes put GW energies on the path. They are mutually exclusive.
 
-- **`--qp-rotations qp_wfn_rotations.h5`, the full QP Hamiltonian.** The GW
+- **`qp_rotations_file qp_wfn_rotations.h5`, the full QP Hamiltonian.** The GW
   run's QP eigensystem $H_\mathrm{QP} = U\,\mathrm{diag}(E_\mathrm{QP})\,U^\dagger$
   (in the DFT basis) rotates the compact rows,
   $C_\mathrm{QP}[k] = U[k]^T C[k]$, so the same build gives
@@ -276,7 +276,7 @@ the deck, j-averaged radial functions: QE `projwfc`'s projector). With
 `--velocity` it also reads the stored velocity $v^a_{nm} = \langle
 nk|\partial_{k_a}H|mk\rangle$ of the WFN's states. Each operator is carried
 into the nodal frame as $C^T O\, C^*$ and interpolated with the same node-pair
-sum as $f(H)$. On the `--qp-rotations` route only the eigenvectors change: $U$
+sum as $f(H)$. On the `qp_rotations_file` route only the eigenvectors change: $U$
 is unitary on the fitted window, so the operator image is the same.
 
 **Velocity.** `dipole.h5` (`psp.get_dipole_mtxels`, $p + i[V_\mathrm{NL}, r]$)
@@ -284,7 +284,7 @@ belongs to a DFT `WFN.h5`; for QSGW, run on the SC run's `WFN_qp.h5` with its
 `dipole_qsgw.h5`, $U^\dagger(v_\mathrm{DFT} + D_k\Delta H)U$ between the same
 states with their `band_energies`. The file's basis and WFN fingerprint are
 checked and its `velocity` attribute is printed. A QP velocity with no
-$\Sigma$ term refuses, and so does `--velocity` with `--qp-rotations` or
+$\Sigma$ term refuses, and so does `--velocity` with `qp_rotations_file` or
 `--eqp-file`: the DFT velocity with QP energies is not $\partial_k
 H_\mathrm{QP}$ (on a scissored toy model it gives a moment 22 % low).
 
@@ -409,11 +409,11 @@ worst difference are written into the output header.
 **The per-$Q$ solver.** By default each $Q$ is solved by `bse_lanczos`'
 Davidson, the `bse_jax` default: the exact diagonal
 $\varepsilon_c(k+Q) - \varepsilon_{vk}$ plus the kernel diagonal as
-preconditioner, soft locking, 8 margin roots above `--n-eig`, and a stop when
-every root's residual is below `--davidson-tol-mev` (0.01 meV). One planned
+preconditioner, soft locking, 8 margin roots above `number_eigenvalues`, and a stop when
+every root's residual is below `davidson_tol_mev` (0.01 meV). One planned
 solver serves the whole path, with each $Q$'s operands as arguments, so it
-compiles once. A $Q$ that stops on the `--max-iter` cap refuses
-(`GATE davidson_converged`) before anything is written. `--solver lanczos`
+compiles once. A $Q$ that stops on the `solver_max_iter` cap refuses
+(`GATE davidson_converged`) before anything is written. `solver = block_lanczos`
 keeps the fixed block Lanczos (pair amplitudes and block Lanczos over the BSE
 stack matvec), one jitted function under one `lax.scan` over the whole $Q$
 list; it has no convergence test. Extra points
@@ -429,9 +429,9 @@ plotted). Passing the images of a few off-grid path points measures the
 interpolation error without an external reference. Gates evaluated only on
 grid points cannot see off-grid errors, for the reason given in §3.
 
-**Quasiparticle energies.** `--eqp eqp1.dat` corrects both legs: the stored
+**Quasiparticle energies.** `eqp_corrections eqp1.dat` corrects both legs: the stored
 valence and conduction energies and the htransform energies. There is no
-`--qp-rotations` route; a full-QP exciton band structure needs a GW restart
+`qp_rotations_file` route; a full-QP exciton band structure needs a GW restart
 built from `WFN_qp.h5`.
 
 **Output.** `<prefix>.dat` (default `exciton_bands.dat`) has a header naming
@@ -448,10 +448,10 @@ as markers.
 
 | flag | default | meaning |
 |---|---|---|
-| `--n-val` / `--n-cond` | 4 / 4 | BSE window, in bands |
-| `--solver` / `--davidson-tol-mev` | `davidson` / 0.01 | per-$Q$ solver: Davidson to a residual below the tolerance (meV), or `lanczos`, the fixed block-Lanczos scan |
-| `--n-eig` / `--max-iter` | 6 / auto | roots per $Q$; iteration cap: Davidson max(30, min(200, n/2)) at transition dimension n, block Lanczos 40 |
-| `--block-size` | 8 | block-Lanczos width; `--solver lanczos` only, refused otherwise |
+| `number_val_bands_fine` / `number_cond_bands_fine` | 4 / 4 | BSE window, in bands |
+| `solver` / `davidson_tol_mev` | `davidson` / 0.01 | per-$Q$ solver: Davidson to a residual below the tolerance (meV), or `lanczos`, the fixed block-Lanczos scan |
+| `number_eigenvalues` / `solver_max_iter` | 6 / auto | roots per $Q$; iteration cap: Davidson max(30, min(200, n/2)) at transition dimension n, block Lanczos 40 |
+| `block_size` | 8 | block-Lanczos width; `solver = block_lanczos` only, refused otherwise |
 | `--band-degeneracy` | `strict` | a window edge inside a multiplet refuses (`snap` widens it, `off` proceeds); checked on the loader window and the htransform conduction window |
 | `--refit-guard-bands` | 4 | guard bands of the refit's $f(H)$ window above the ζ window; 0 must fail the tile identity |
 | `--a-band` | top band | band whose bandwidth sets $a$ in $f$ (§3) |
@@ -494,8 +494,8 @@ qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin] [--color orbital:d]
 | `f-shoulder` | a returned band is absent from $f(H)$ at some coarse $k$ | add guard bands |
 | Newton not converged | $\max|f(x) - y| > 10^{-12}$ Ry after 50 steps | a returned band lies in the flat part of $f$; add guard bands or set `--a-band` |
 | standalone window cuts the occupied bands | `nval` ≠ occupied bands | set `nval` to the occupied count |
-| QP block not inside the fitted window | `--qp-rotations` block extends past $[b_0, b_1)$ | widen `ncond` |
-| conflicting QP sources | `WFN_qp.h5` with `--eqp-file` or `--qp-rotations` | give one |
+| QP block not inside the fitted window | `qp_rotations_file` block extends past $[b_0, b_1)$ | widen `ncond` |
+| conflicting QP sources | `WFN_qp.h5` with `--eqp-file` or `qp_rotations_file` | give one |
 | `orbital_totals_t0_gap` | `--velocity` totals at $T = 0$ with overlapping bands or a fractional count | set `occ_smearing_width_ry` |
 | `orbital_totals_empty_band`, `htransform_moments_window` | no returned band lies wholly above $\mu$ + 10 kT; the top returned band holds more than $10^{-6}$ occupation | raise `ncond` |
 | exciton bands: no `K_POINTS {crystal_b}` block; `interp` on a bulk deck or on IBZ-only ζ; `ongrid` at an off-grid $Q$; failed `bse`-window certificate | §7 gives each condition | add the path block; use `refit` on a bulk deck, or a full-BZ `zeta_q.h5` for `interp`; use `interp` or `refit` off the grid; widen the refit's guard bands or use `--refit-window zeta` |

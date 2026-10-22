@@ -173,7 +173,8 @@ From here:
   `K_POINTS {crystal_b}` path. Its window rules (`nval` equal to the electron
   count, guard bands) are in
   [drivers](drivers.md#htransform-bandstructurehtransform).
-- **Excitons.** `$RUN bse.bse_jax -i gw.in --lanczos --tda --bse` in
+- **Excitons.** `$RUN bse.bse_jax -i gw.in`, with `number_val_bands_fine`
+  and `number_cond_bands_fine` (BerkeleyGW's names) in `gw.in`, in
   the GW run directory. It reads the restart bundle the GW run wrote ([drivers](drivers.md#bse-bsebse_jax),
   [BSE](architecture/bse.md)).
 

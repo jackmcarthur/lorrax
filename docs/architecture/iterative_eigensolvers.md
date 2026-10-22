@@ -159,8 +159,8 @@ slots stay allocated but excluded until they are overwritten.
 
 | solver | caller | operator |
 |---|---|---|
-| planned Davidson | `psp.run_nscf` ([NSCF Hamiltonian](nscf_hamiltonian.md)); `bse.bse_lanczos` (`--solver davidson`, the default; also `bse.exciton_bands` per $Q$) | $H_k$ on the G sphere; the BSE Hamiltonian |
-| block Lanczos | `bse.bse_lanczos`, `bse.exciton_bands` (`--solver lanczos`) | the BSE Hamiltonian |
+| planned Davidson | `psp.run_nscf` ([NSCF Hamiltonian](nscf_hamiltonian.md)); `bse.bse_lanczos` (`solver = davidson`, the default; also `bse.exciton_bands` per $Q$) | $H_k$ on the G sphere; the BSE Hamiltonian |
+| block Lanczos | `bse.bse_lanczos`, `bse.exciton_bands` (`solver = block_lanczos`) | the BSE Hamiltonian |
 | thick-restart Lanczos | `bse.bse_lanczos` | the BSE Hamiltonian |
 
 Which BSE solver each CLI flag selects is [BSE](bse.md).

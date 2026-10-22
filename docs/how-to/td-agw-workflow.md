@@ -43,7 +43,7 @@ goes the other way ([ε⁻¹ export](../theory/bgw_epsmat_export.md)).
   the valence manifold.
 - The window (`system.ibndmin`, `ibndmax`, `ivbm`) is in TDGW's 1-based DFT
   band indices. Its edges should close degenerate multiplets in the DFT and
-  the QP spectrum; the BSE's `--band-degeneracy strict` (its default) on the
+  the QP spectrum; the BSE's `band_degeneracy = strict` (its default) on the
   same window is the check.
 - The header: run TDGW once on the window. With `control.files.use_vmtxel =
   true` it carries BerkeleyGW's dipoles; on coarse grids TDGW's own
@@ -59,11 +59,11 @@ goes the other way ([ε⁻¹ export](../theory/bgw_epsmat_export.md)).
    ([choosing a method](../theory/td_agw_propagation.md#choosing)).
 2. **Inside TDGW** (`tdagw.tdgw_bridge tdgw.toml --input <GW deck>`): TDGW's
    own propagation with its self-energy update replaced by the same operator,
-   the full kernel or TDGW's TDA semantics (`--tda`). More than one rank needs
+   the full kernel or TDGW's TDA semantics (`full_bse = false`). More than one rank needs
    an h5py built against parallel HDF5.
 3. **As a dense kernel** (`tdagw.kernel_export`): `kernel.h5` in TDGW's
    convention, for `lorrax.model = "tdgw_kernel"` or a native TDGW run (TDA
-   files only, `--tda`, at TDGW 41a5c34).
+   files only, `full_bse = false`, at TDGW 41a5c34).
 
 The three apply the same ΔΣ; they differ in who integrates (LORRAX's
 integrators or TDGW's RK45) and in what is formed (nothing, or the dense
