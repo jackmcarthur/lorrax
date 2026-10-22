@@ -55,8 +55,8 @@ from common.staged_reshard import concatenate_sharded_axis, face_to_batch_reshar
 # Q's free r axis is zero-padded through ``runtime.padding`` and split over
 # the full mesh product.  ``common.staged_reshard`` owns the exact
 # product-band → product-r exchange used to put streamed wavefunctions there.
-from common.ws_images import (pair_ws_code, pair_ws_code_fourier, pair_ws_code_table,
-                              pair_ws_images)
+from common.ws_images import (pair_ws_code_fourier, pair_ws_images,
+                              pair_ws_local_codes)
 from common.collectives import (
     device_put_process_local,
     gather_to_host,
@@ -450,14 +450,17 @@ def node_pair_table(B_at_mu, kgrid, mesh_xy: Mesh) -> dict:
 
     Built once per (k grid, node and target geometry) from
     ``common.ws_images`` on the scalar nodes of ``B_at_mu``
-    (:class:`isdf.galerkin.NodalInterp`), one image table over the nodes and
-    the back-map targets together, and indexed per spin block of the
+    (:class:`isdf.galerkin.NodalInterp`), one candidate-image table over the
+    nodes and targets, but tie codes only for addressable node x node and
+    target x node tiles, indexed per spin block of the
     ``(s, nu)`` axes; exact-null pad rows take pattern 0 (their tensor rows
     are zero).  ``code`` ``(n_c, rank, rank)`` (node x node: fH_R, operator
     images) and ``target_code`` ``(n_c, t_carrier, rank)`` (target x node:
     the back-map L_R; ``code`` itself when the targets are the nodes) are
     placed on the face layout ``P(None, 'x', 'y')``, each rank building only
-    its own tile.  Admitted by ``lxkit.memory`` (one route: the face).
+    its own tile in bounded host chunks. The only replicated code data is
+    the small tie-pattern LUT; no all-site pair matrix is retained.
+    Admitted by ``lxkit.memory`` (one route: the face).
     """
     from lxkit import memory
     from common.gpu_utils import shared_device_room
@@ -483,10 +486,10 @@ def node_pair_table(B_at_mu, kgrid, mesh_xy: Mesh) -> dict:
         operands=memory.Term(0.0, tiles, "int16 code tiles (exact extents)"),
         ranks=ranks, label=stage)),),
         int(room) if isinstance(room, (int, np.integer)) else 0)
-    scalar = pair_ws_code_table(pair_ws_images(
+    images = pair_ws_images(
         tuple(int(v) for v in kgrid), B_at_mu.lattice_bohr,
         nodes if targets is None else np.concatenate([nodes, targets]),
-        int(B_at_mu.sys_dim)))
+        int(B_at_mu.sys_dim))
     face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
     def carried(extent, count, offset):
@@ -494,16 +497,44 @@ def node_pair_table(B_at_mu, kgrid, mesh_xy: Mesh) -> dict:
         return np.where(rows < ns * count, offset + rows % count, -1)
 
     node = carried(rank, n, 0)
-    code = jax.make_array_from_callback(
-        (n_c, rank, rank), face,
-        lambda index: pair_ws_code(scalar, node[index[1]], node[index[2]]))
-    target_code = code
+    layouts = [((n_c, rank, rank), node)]
     if targets is not None:
         target = carried(t_carrier, targets.shape[0], n)
-        target_code = jax.make_array_from_callback(
-            (n_c, t_carrier, rank), face,
-            lambda index: pair_ws_code(scalar, target[index[1]],
-                                       node[index[2]]))
+        layouts.append(((n_c, t_carrier, rank), target))
+    indices, blocks = [], []
+    for shape, row in layouts:
+        local = list(face.addressable_devices_indices_map(shape).values())
+        indices.append(local)
+        blocks.extend((row[ix[1]], node[ix[2]]) for ix in local)
+    local_codes, local_patterns = pair_ws_local_codes(images, blocks)
+    # Only the small mask dictionary is replicated. Every process must use
+    # the same LUT, including processes whose own face lacks a tie pattern.
+    from common.collectives import all_gather_processes
+    size = max(int(v) for v in all_gather_processes(
+        np.array([local_patterns.size], np.int64)).reshape(-1))
+    masks = np.pad(local_patterns, (0, size - local_patterns.size))
+    patterns = np.unique(all_gather_processes(masks).reshape(-1))
+    patterns = patterns[patterns != 0]
+    if patterns.size >= np.iinfo(np.int16).max:
+        raise ValueError("node_pair_table: tie patterns exceed the int16 code")
+    remap = np.searchsorted(patterns, local_patterns).astype(np.int16)
+    placed, start = [], 0
+    index_key = lambda ix: tuple((s.start, s.stop, s.step) for s in ix)
+    for (shape, row), local in zip(layouts, indices):
+        payload = {index_key(ix): np.where(
+                       (row[ix[1]][:, None] >= 0)[None]
+                       & (node[ix[2]][None, :] >= 0)[None], remap[c], 0)
+                   for ix, c in
+                   zip(local, local_codes[start:start + len(local)])}
+        placed.append(jax.make_array_from_callback(
+            shape, face, lambda ix, payload=payload: payload[index_key(ix)]))
+        start += len(local)
+    code = placed[0]
+    target_code = placed[-1]
+    bits = np.left_shift(np.int64(1), np.arange(images["img"].shape[1], dtype=np.int64))
+    member = (patterns[:, None] & bits[None, :]) != 0
+    scalar = dict(weights=member / member.sum(axis=1, keepdims=True),
+                  img=images["img"], valid=images["valid"], kgrid=images["kgrid"])
     # The staged face→q exchange factory issues a collective, so it is built
     # here, synchronously on every rank and outside every jit.
     table = dict(scalar, code=code, target_code=target_code,

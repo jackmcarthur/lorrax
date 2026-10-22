@@ -1865,7 +1865,22 @@ def _interpolate_bse_data_to_grid(
             mesh_xy, P("x", "y", None, None, None), fine_grid, output="k",
             embedding=w_pair_embedding(coarse_grid, wfn, r_mu,
                                        int(W_coarse.shape[0]), meta.sys_dim))
-        W_q_fine = densify_W(W_coarse)
+        # The fine output is not the peak: the embedding and FFT can hold
+        # several local W tiles. Admit this exact executable beside the
+        # resident coarse W, then run the executable whose bytes were read.
+        from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+        from common.gpu_utils import shared_device_room
+        from lxkit import memory
+        densify_compiled = densify_W.lower(W_coarse).compile()
+        new_bytes = -agreed_chunk(-compiled_new_bytes(densify_compiled))
+        stage = "BSE coarse-to-fine W interpolation"
+        room = shared_device_room(stage)
+        memory.admit(stage, (("centroid face", memory.Price(
+            xla=memory.Term(0.0, new_bytes * int(mesh_xy.size),
+                            "W interpolation (compiled program, new bytes)"),
+            ranks=int(mesh_xy.size), label=stage)),),
+            int(room) if isinstance(room, (int, np.integer)) else 0)
+        W_q_fine = densify_compiled(W_coarse)
         del W_coarse
         W_q_fine = _add_rank_lr(W_q_fine, A_f, D_f, mesh_xy, 1.0)
         log_fn(f"[kgrid_fine] W embedded per centroid pair (Wigner-Seitz) in R "

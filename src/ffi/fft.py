@@ -1165,11 +1165,12 @@ def _require_target(target: str, platform: str) -> None:
     from ffi.common import ffi_loader
     ok, why = ffi_loader.probe_target(target, platform)
     if not ok:
+        build = "build_ffi_host.sh" if platform == "cpu" else "build_ffi_cuda.sh"
         raise RuntimeError(
             f"GATE kconv-target: got a liblorrax_ffi without {target} on "
             f"{platform} ({why}); want the handler this router selects; fix: "
             "rebuild the native library (Perlmutter: "
-            "config/perlmutter/build_ffi_cuda.sh) from this tree.")
+            f"config/perlmutter/{build}) from this tree.")
 
 
 def _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale) -> dict:
@@ -1279,6 +1280,8 @@ def seed_cubin_cache(store: str, cache: str) -> int:
 #: The host FFTW3-ABI flat-k transform and fused Σ convolution of the plan backend.
 FLAT_K_TARGET = "lorrax_mklfft_flat_k"
 GW_CONV_TARGET = "lorrax_mklfft_gw_conv"
+HOST_KCONV_KMINOR_TARGET = "lorrax_mklfft_kconv_kminor"
+HOST_KCONV_KLEAD_TARGET = "lorrax_mklfft_kconv_klead"
 
 
 # Kernel lessons: the plan backend's host FFTW3-ABI handlers (numbers: sandbox claim ids).
@@ -2212,9 +2215,9 @@ def make_local_kconv_klead(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
 
     ``U = mult · fftn(ifftn(T) · V_R[:, None, :, None, :])`` for ``T``/``U``
     ``(nk, a, mx, b, my)`` and ``V_R`` ``(nk, mx, my)``.  CUDA: mathdx mode 2, the
-    Σ τ pass of :func:`make_kconv_klead`, in place on T.  Elsewhere the XLA backend (as
-    :func:`make_local_kconv_kminor`), not the gw_conv host handler, which takes
-    k-space W.  The BSE W term holds its T k-leading so that the encode and
+    Σ τ pass of :func:`make_kconv_klead`, in place on T. CPU: the same FFTW
+    chunk engine as gw_conv with the stored kernel directly, with bounded
+    per-thread scratch. The BSE W term holds its T k-leading so that the encode and
     decode are batched ZGEMMs with no T-sized transpose, and calls this factory.
     """
     kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
@@ -2239,6 +2242,18 @@ def make_local_kconv_klead(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
         return _kdft
 
     backend = kconv_backend(mesh, kgrid)
+
+    if backend == "plan":
+        _require_target(HOST_KCONV_KLEAD_TARGET, "cpu")
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(scale))
+
+        def _host_klead_stored(t, v_r):
+            _check_complex(t, v_r)
+            return jax.ffi.ffi_call(
+                HOST_KCONV_KLEAD_TARGET, jax.ShapeDtypeStruct(t.shape, t.dtype),
+                input_output_aliases={0: 0})(t, v_r, **attrs)
+        return _host_klead_stored
 
     def _xla(t, v_r):
         t_r = _kfft(t, kg, "ifftn", backend) * scale
@@ -3495,6 +3510,18 @@ def make_local_kconv_kminor(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
         return _kdft_kminor_conv
 
     backend = kconv_backend(mesh, kgrid, kminor=True)
+
+    if backend == "plan":
+        _require_target(HOST_KCONV_KMINOR_TARGET, "cpu")
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(scale), out_layout=np.int64(out_layout))
+
+        def _host_kminor_conv(x, k_r):
+            _check_complex(x, k_r)
+            out = jax.ShapeDtypeStruct(kconv_kminor_out_shape(x.shape, out_layout), x.dtype)
+            kw = {"input_output_aliases": {0: 0}} if out_layout == 0 else {}
+            return jax.ffi.ffi_call(HOST_KCONV_KMINOR_TARGET, out, **kw)(x, k_r, **attrs)
+        return _host_kminor_conv
 
     def _xla(x, k_r):
         _check_complex(x, k_r)

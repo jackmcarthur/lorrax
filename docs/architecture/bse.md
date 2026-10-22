@@ -206,6 +206,11 @@ serves and printed once (`[bse] W term:`, `[bse] W term decode:`):
 2. T is formed on the load; U is stored and decoded by XLA.
 3. XLA builds T; the k-leading convolution reads it and writes U.
 
+The CPU plan backend and a plain XLA fallback use route 3. Their outer/decode
+factories compose materialized T and U arrays, so they cannot use route 1's
+whole-tile memory plan. Native CPU FFTs reduce convolution scratch while the
+same block plan bounds the stored T/U carrier.
+
 The kernels, their refusals and the `LORRAX_BSE_OUTER_KSUM` A/B switch are in
 [the FFI layer](ffi_layout.md#kernel-operations). The decode keeps the
 (t, μ)-first order on every route.

@@ -71,8 +71,8 @@ grid; consumers decide that against authenticated symmetry metadata
 * **Refusals.**
   - `backend='phdf5_host'` is deleted and refuses; an unknown backend refuses.
   - `phdf5` without a mesh refuses.
-  - `auto` at P > 1 with a mesh and no phdf5-capable library on either
-    platform refuses, quoting each platform's probe reason and naming
+  - `auto` at P > 1 with a mesh and no phdf5-capable library for that mesh's
+    platform refuses, quoting its probe reason and naming
     `LORRAX_WFN_BACKEND=eager`. It never demotes silently.
   - `flavor != 2` (real WFN) and `nspin != 1` refuse at construction, before
     the coefficient dataset is read: the coefficient slicing hard-codes the
@@ -110,7 +110,10 @@ grid; consumers decide that against authenticated symmetry metadata
 | backend | transport | picked by `auto` when |
 |---|---|---|
 | `eager` | per-rank h5py read of the rank's band block, host unfold | no mesh, one process, or forced |
-| `phdf5` | `SlabIO.read_slabs`: the union of k windows, read by independent MPI-IO in chunks of band rows ([slab_io tuning](../architecture/slab_io.md#tuning)), unfold on device | several processes, a 2-D mesh, and a phdf5-capable CUDA or host library |
+| `phdf5` | `SlabIO.read_slabs`: the union of k windows, read by independent MPI-IO in chunks of band rows ([slab_io tuning](../architecture/slab_io.md#tuning)), unfold on device | several processes, a 2-D mesh, and a phdf5-capable library for that mesh’s platform |
+
+Backend selection probes only the mesh’s platform. A CPU mesh opens the host
+library without probing or loading an accelerator library.
 
 `read_slabs` takes n windows of one slab shape with per-window valid shapes
 and returns a window axis. The per-rank band clamp,

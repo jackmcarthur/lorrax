@@ -200,6 +200,8 @@ _HOST_TARGET_SYMBOLS = {
     # their historical mklfft spelling) — the cpu leg of the ffi.fft router.
     "lorrax_mklfft_flat_k":           "MklFftFlatKHostFfi",
     "lorrax_mklfft_gw_conv":          "MklFftGwConvHostFfi",
+    "lorrax_mklfft_kconv_kminor":     "MklFftKminorConvHostFfi",
+    "lorrax_mklfft_kconv_klead":      "MklFftKleadStoredHostFfi",
     # CBLAS batched-GEMM handler (cpp/cblas) — the LORRAX_BANDS_GEMM_FFI
     # body of common.contract_bands (contract_bands_block_reshard).
     "lorrax_mklblas_gemm_batch":      "MklBlasGemmBatchHostFfi",

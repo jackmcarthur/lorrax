@@ -21,7 +21,7 @@ works:
   mesh it still reads only THIS rank's band block (``_eager_build_process_local``).
 - **phdf5** (collective parallel-HDF5 FFI + on-device unfold): multi-rank
   + 2-D mesh + an FFI .so exporting the kchunk-union read handler on
-  either platform.  Reuses the same union-read + unfold kernel that
+  the mesh's platform. Reuses the same union-read + unfold kernel that
   powered the legacy ``PhdfWfnReader.coeffs_gspace`` path, but stops one
   step short of the FFT-box scatter so the output stays G-flat (the
   loader's defining layout).
@@ -601,19 +601,15 @@ class WfnLoader:
           * Mesh missing → eager (single-device / laptop / pytest).
           * Single-process JAX → eager (no benefit from a collective /
             union read).
-          * Multi-process JAX + mesh + CUDA FFI .so loadable → phdf5
-            (collective MPI-IO read on GPU).  The probe pins the CUDA
-            library explicitly.
-          * Multi-process JAX + mesh + host FFI .so exposes the phdf5 read
-            handlers → phdf5 (collective MPI-IO read on CPU).  Same single
-            read path — the phdf5 C++ read core is shared and only its
-            device-staging tail switches (cudaMemcpyAsync H2D vs a host
-            memcpy); the ffi_call resolves to the host handler by lowering
-            platform and open_file routes the collective lifecycle to the
-            host lib (liblorrax_ffi_host.so built with the phdf5 subpackage).
-          * Multi-process JAX + mesh, no phdf5-capable FFI .so on EITHER
+          * Multi-process JAX + mesh + its platform's FFI .so exposes the
+            phdf5 read handlers → phdf5. A CPU mesh probes only the host
+            leg, so selecting an I/O backend cannot load CUDA libraries.
+            The parallel-HDF5 read core is shared; FFI lowering and the
+            file lifecycle follow the mesh platform, including its device
+            staging or host memcpy.
+          * Multi-process JAX + mesh, no phdf5-capable FFI .so for its
             platform → **REFUSE**, quoting ``probe_target``'s three-way
-            reason for both.  No demotion to the retired ``phdf5_host``
+            reason.  No demotion to the retired ``phdf5_host``
             tier (``docs/services/wfn_loader.md``); an operator who wants
             the host read asks by name, ``LORRAX_WFN_BACKEND=eager``,
             which is checked above and never reaches the probe.
@@ -647,21 +643,17 @@ class WfnLoader:
                 return "eager"
         except Exception:
             return "eager"
-        # GPU first, then CPU: the SAME collective MPI-IO read path, served
-        # by whichever platform's FFI library can serve a slab read.  The
-        # question "can this platform read a slab" belongs to the slab_io entry point that
-        # does the reading, so this ladder asks
-        # ``slab_io.probe_read_availability`` and nothing here names an FFI
-        # target.  That probe wraps ``ffi_loader.probe_target``, which
-        # distinguishes the three ways a target can be unusable — which is
-        # why the refusal below quotes its reason verbatim instead of
-        # reducing it to a bool — and it is per-platform UNCACHED, because a
-        # ladder is exactly what a platform-blind cache would poison.
+        # Probe the leg that SlabIO will actually execute on this mesh.
+        # Probing every accelerator first dlopens CUDA on CPU ranks solely
+        # to choose a backend (219 MiB/rank in the MoS2 BSE profile).
         from file_io.slab_io import probe_read_availability
-        from lxkit import LEGS, accelerator_legs
+        from lxkit import LEGS, accelerator_legs, mesh_ffi_platform
+        platform = mesh_ffi_platform(self._mesh)
+        # Keep the compatibility probe order for a vendor without a known leg.
+        platforms = ([platform] if platform in LEGS else
+                     [leg.key for leg in accelerator_legs()] + [LEGS["cpu"].key])
         reasons = []
-        # Every device leg, then the host leg (lxkit.LEGS order).
-        for _plat in [leg.key for leg in accelerator_legs()] + [LEGS["cpu"].key]:
+        for _plat in platforms:
             usable, why = probe_read_availability(_plat)
             if usable:
                 return "phdf5"

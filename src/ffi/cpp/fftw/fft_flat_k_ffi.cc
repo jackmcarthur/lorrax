@@ -39,6 +39,7 @@
 // attributes; the batch is whatever trail the caller shards onto this rank.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <complex>
@@ -178,16 +179,18 @@ static bool log_enabled() {
 struct DescKey {
     // The fields map one-for-one onto fftw_plan_many_dft's advanced-interface
     // parameters.  t_in/t_out ARE istride/ostride; n IS howmany; idist and
-    // odist are both 1 (the flat-k layout is ONE uniform batch -- the whole
-    // reason the advanced interface is an exact fit and guru buys nothing).
+    // odist default to 1 for the flat-k layout.  Contiguous k-minor
+    // trajectories use t_in=t_out=1 and dist_in=dist_out=nk instead.
     long d0, d1, d2;
     long t_in, t_out;      // element stride (istride / ostride)
     long n;                // transforms per execute call (howmany)
     int  sign;             // kFftwForward | kFftwBackward
+    long dist_in = 1, dist_out = 1;
 
     bool operator<(const DescKey& o) const {
-        return std::tie(d0, d1, d2, t_in, t_out, n, sign) <
-               std::tie(o.d0, o.d1, o.d2, o.t_in, o.t_out, o.n, o.sign);
+        return std::tie(d0, d1, d2, t_in, t_out, n, sign, dist_in, dist_out) <
+               std::tie(o.d0, o.d1, o.d2, o.t_in, o.t_out, o.n, o.sign,
+                        o.dist_in, o.dist_out);
     }
 };
 // ---------------------------------------------------------------------------
@@ -408,11 +411,11 @@ static fftw_plan_t get_descriptor(const DescKey& k, void* in_hint,
     int n3[3] = {static_cast<int>(k.d0), static_cast<int>(k.d1),
                  static_cast<int>(k.d2)};
     // inembed/onembed NULL => taken as n, so element (i0,i1,i2) of transform
-    // j sits at  base + j*dist + (i0*d1*d2 + i1*d2 + i2)*stride.
+    // j sits at base + j*dist + (i0*d1*d2 + i1*d2 + i2)*stride.
     fftw_plan_t p = api.plan_many(
         3, n3, static_cast<int>(k.n),
-        in_hint,  nullptr, static_cast<int>(k.t_in),  1,
-        out_hint, nullptr, static_cast<int>(k.t_out), 1,
+        in_hint,  nullptr, static_cast<int>(k.t_in),  static_cast<int>(k.dist_in),
+        out_hint, nullptr, static_cast<int>(k.t_out), static_cast<int>(k.dist_out),
         k.sign, kFftwEstimate | kFftwUnaligned);
     if (!p) return nullptr;
 
@@ -606,59 +609,13 @@ static Arena& vr_arena() {
     return a;
 }
 
-static ffi::Error GwConvDispatch(
-    ffi::AnyBuffer G, ffi::AnyBuffer W, ffi::Result<ffi::AnyBuffer> S,
-    int64_t nkx, int64_t nky, int64_t nkz, double scale_i, double scale_f)
+static ffi::Error run_klead_stored(
+    long d0, long d1, long d2, int64_t a, int64_t mx, int64_t b, int64_t my,
+    double scale_i, double scale_f, const C128* g_in, const C128* vr, C128* s_out)
 {
-    if (G.element_type() != ffi::DataType::C128 ||
-        W.element_type() != ffi::DataType::C128 ||
-        S->element_type() != ffi::DataType::C128) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "mklfft.gw_conv: buffers must be complex128");
-    }
-    auto gd = G.dimensions();
-    auto wd = W.dimensions();
-    auto sd = S->dimensions();
-    if (gd.size() != 5 || wd.size() != 3 || sd.size() != 5 ||
-        !std::equal(gd.begin(), gd.end(), sd.begin())) {
-        return ffi::Error(
-            ffi::ErrorCode::kInvalidArgument,
-            "mklfft.gw_conv: expected G/S (nk, a, mx, b, my) and W (nk, mx, my)");
-    }
-    const int64_t nk = gd[0], a = gd[1], mx = gd[2], b = gd[3], my = gd[4];
-    if (nkx < 1 || nky < 1 || nkz < 1 || nk != nkx * nky * nkz ||
-        wd[0] != nk || wd[1] != mx || wd[2] != my) {
-        std::ostringstream os;
-        os << "mklfft.gw_conv: shape mismatch — G(nk=" << nk << ",a=" << a
-           << ",mx=" << mx << ",b=" << b << ",my=" << my << ") vs W("
-           << wd[0] << "," << wd[1] << "," << wd[2] << ") vs kgrid ("
-           << nkx << "," << nky << "," << nkz << ")";
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
-    }
-    const int64_t Tg = a * mx * b * my;
-    const int64_t Tv = mx * my;
-    if (Tg == 0 || Tv == 0) return ffi::Error::Success();
-    if (!fftw_api().ok) return engine_absent_error();
-
-    const auto* g_in = static_cast<const C128*>(G.untyped_data());
-    const auto* w_in = static_cast<const C128*>(W.untyped_data());
-    auto* s_out = static_cast<C128*>(S->untyped_data());
-    const bool aliased = (static_cast<const void*>(g_in) ==
-                          static_cast<const void*>(s_out));
-
-    const long d0 = (long)nkx, d1 = (long)nky, d2 = (long)nkz;
-
-    // --- stage 1: V_R = IFFT[W] into the arena (strided, trail stride Tv).
-    Arena& ar = vr_arena();
-    std::unique_lock<std::mutex> ar_lock(ar.mu);  // serializes concurrent convs
-    if ((int64_t)ar.buf.size() < nk * Tv) ar.buf.resize(nk * Tv);
-    C128* vr = ar.buf.data();
-    {
-        ffi::Error e = run_flat_batch(d0, d1, d2, Tv, /*forward=*/false,
-                                      scale_i, w_in, vr);
-        if (!e.success()) return e;
-    }
-
+    const int64_t nk = d0 * d1 * d2;
+    const int64_t Tg = a * mx * b * my, Tv = mx * my;
+    const bool aliased = g_in == s_out;
     // --- stage 2: chunked IFFT(G) -> multiply by V_R (broadcast over a, b)
     //              -> FFT back into S, per ~4 MiB compact buffer.
     const int64_t C = std::min<int64_t>(chunk_elems(nk), Tg);
@@ -674,8 +631,8 @@ static ffi::Error GwConvDispatch(
                          "[mklfft] gw_conv first call: nk=(%ld,%ld,%ld) "
                          "G trail (a=%ld,mx=%ld,b=%ld,my=%ld) Tg=%ld Tv=%ld "
                          "scale_i=%.6e scale_f=%.6e aliased=%d threads=%d "
-                         "chunk=%ld arena=%.1f MB\n",
-                         (long)nkx, (long)nky, (long)nkz, (long)a, (long)mx,
+                         "chunk=%ld kernel=%.1f MB\n",
+                         (long)d0, (long)d1, (long)d2, (long)a, (long)mx,
                          (long)b, (long)my, (long)Tg, (long)Tv, scale_i,
                          scale_f, (int)aliased, nthr, (long)C,
                          nk * Tv * 16.0 / 1e6);
@@ -751,6 +708,193 @@ static ffi::Error GwConvDispatch(
     return ffi::Error::Success();
 }
 
+static ffi::Error GwConvDispatch(
+    ffi::AnyBuffer G, ffi::AnyBuffer W, ffi::Result<ffi::AnyBuffer> S,
+    int64_t nkx, int64_t nky, int64_t nkz, double scale_i, double scale_f)
+{
+    if (G.element_type() != ffi::DataType::C128 ||
+        W.element_type() != ffi::DataType::C128 ||
+        S->element_type() != ffi::DataType::C128) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "mklfft.gw_conv: buffers must be complex128");
+    }
+    auto gd = G.dimensions();
+    auto wd = W.dimensions();
+    auto sd = S->dimensions();
+    if (gd.size() != 5 || wd.size() != 3 || sd.size() != 5 ||
+        !std::equal(gd.begin(), gd.end(), sd.begin())) {
+        return ffi::Error(
+            ffi::ErrorCode::kInvalidArgument,
+            "mklfft.gw_conv: expected G/S (nk, a, mx, b, my) and W (nk, mx, my)");
+    }
+    const int64_t nk = gd[0], a = gd[1], mx = gd[2], b = gd[3], my = gd[4];
+    if (nkx < 1 || nky < 1 || nkz < 1 || nk != nkx * nky * nkz ||
+        wd[0] != nk || wd[1] != mx || wd[2] != my) {
+        std::ostringstream os;
+        os << "mklfft.gw_conv: shape mismatch — G(nk=" << nk << ",a=" << a
+           << ",mx=" << mx << ",b=" << b << ",my=" << my << ") vs W("
+           << wd[0] << "," << wd[1] << "," << wd[2] << ") vs kgrid ("
+           << nkx << "," << nky << "," << nkz << ")";
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    const int64_t Tg = a * mx * b * my;
+    const int64_t Tv = mx * my;
+    if (Tg == 0 || Tv == 0) return ffi::Error::Success();
+    if (!fftw_api().ok) return engine_absent_error();
+
+    const auto* g_in = static_cast<const C128*>(G.untyped_data());
+    const auto* w_in = static_cast<const C128*>(W.untyped_data());
+    auto* s_out = static_cast<C128*>(S->untyped_data());
+    const long d0 = (long)nkx, d1 = (long)nky, d2 = (long)nkz;
+
+    // --- stage 1: V_R = IFFT[W] into the arena (strided, trail stride Tv).
+    Arena& ar = vr_arena();
+    std::unique_lock<std::mutex> ar_lock(ar.mu);  // serializes concurrent convs
+    if ((int64_t)ar.buf.size() < nk * Tv) ar.buf.resize(nk * Tv);
+    C128* vr = ar.buf.data();
+    {
+        ffi::Error e = run_flat_batch(d0, d1, d2, Tv, /*forward=*/false,
+                                      scale_i, w_in, vr);
+        if (!e.success()) return e;
+    }
+
+    return run_klead_stored(d0, d1, d2, a, mx, b, my,
+                            scale_i, scale_f, g_in, vr, s_out);
+}
+
+// BSE k-leading convolution uses the same chunk engine as GW, with the
+// caller's real-space kernel directly: no W transform or private W arena.
+static ffi::Error KleadStoredDispatch(
+    ffi::AnyBuffer X, ffi::AnyBuffer K, ffi::Result<ffi::AnyBuffer> Y,
+    int64_t nkx, int64_t nky, int64_t nkz, double scale)
+{
+    auto xd = X.dimensions();
+    auto kd = K.dimensions();
+    auto yd = Y->dimensions();
+    if (X.element_type() != ffi::DataType::C128 ||
+        K.element_type() != ffi::DataType::C128 ||
+        Y->element_type() != ffi::DataType::C128 ||
+        xd.size() != 5 || kd.size() != 3 || yd.size() != 5 ||
+        !std::equal(xd.begin(), xd.end(), yd.begin())) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "mklfft.kconv_klead: expected complex128 X/Y "
+                          "(nk,a,mx,b,my) and K_R (nk,mx,my)");
+    }
+    if (nkx < 1 || nky < 1 || nkz < 1 || xd[0] != nkx * nky * nkz ||
+        kd[0] != xd[0] || kd[1] != xd[2] || kd[2] != xd[4]) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "mklfft.kconv_klead: X/K_R shapes disagree with the k grid");
+    }
+    if (xd[1] * xd[2] * xd[3] * xd[4] == 0) return ffi::Error::Success();
+    if (!fftw_api().ok) return engine_absent_error();
+    return run_klead_stored((long)nkx, (long)nky, (long)nkz,
+                            xd[1], xd[2], xd[3], xd[4], 1.0, scale,
+                            static_cast<const C128*>(X.untyped_data()),
+                            static_cast<const C128*>(K.untyped_data()),
+                            static_cast<C128*>(Y->untyped_data()));
+}
+
+// BSE convolution with K_R already stored in real space.  Each contiguous
+// k trajectory is transformed in bounded per-thread chunks; neither a
+// k-leading transpose nor a full R-space X intermediate is materialized.
+static ffi::Error KminorConvDispatch(
+    ffi::AnyBuffer X, ffi::AnyBuffer K, ffi::Result<ffi::AnyBuffer> Y,
+    int64_t nkx, int64_t nky, int64_t nkz, double scale, int64_t out_layout)
+{
+    if (X.element_type() != ffi::DataType::C128 ||
+        K.element_type() != ffi::DataType::C128 ||
+        Y->element_type() != ffi::DataType::C128) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "mklfft.kconv_kminor: buffers must be complex128");
+    }
+    auto xd = X.dimensions();
+    auto kd = K.dimensions();
+    auto yd = Y->dimensions();
+    if (xd.size() != 6 || kd.size() != 3 || yd.size() != 6 ||
+        (out_layout != 0 && out_layout != 1)) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "mklfft.kconv_kminor: expected X rank 6, K rank 3, "
+                          "Y rank 6 and out_layout 0 or 1");
+    }
+    const int64_t d0 = xd[0], d1 = xd[1], d2 = xd[2];
+    const int64_t d3 = xd[3], d4 = xd[4], nk = xd[5];
+    const std::array<int64_t, 6> expected = out_layout == 0
+        ? std::array<int64_t, 6>{d0, d1, d2, d3, d4, nk}
+        : std::array<int64_t, 6>{d0, nk, d3, d1, d4, d2};
+    if (nkx < 1 || nky < 1 || nkz < 1 || nk != nkx * nky * nkz ||
+        kd[0] != d1 || kd[1] != d2 || kd[2] != nk ||
+        !std::equal(yd.begin(), yd.end(), expected.begin())) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "mklfft.kconv_kminor: X/K/Y shapes disagree with "
+                          "the k grid, broadcast axes or output layout");
+    }
+    const int64_t rows = d0 * d1 * d2 * d3 * d4;
+    if (rows == 0) return ffi::Error::Success();
+    if (!fftw_api().ok) return engine_absent_error();
+    const auto* x_in = static_cast<const C128*>(X.untyped_data());
+    const auto* k_in = static_cast<const C128*>(K.untyped_data());
+    auto* y_out = static_cast<C128*>(Y->untyped_data());
+    if (out_layout == 1 && x_in == y_out) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "mklfft.kconv_kminor: transposed output cannot alias X");
+    }
+    const int64_t C = std::min<int64_t>(chunk_elems(nk), rows);
+    const int64_t n_chunks = (rows + C - 1) / C;
+    const int nthr = static_cast<int>(std::min<int64_t>(team_threads(), n_chunks));
+    ErrSink err;
+
+#pragma omp parallel num_threads(nthr)
+    {
+        MklLocalPin pin(1);
+        static thread_local std::vector<C128> backward_buf, forward_buf;
+        if ((int64_t)backward_buf.size() < nk * C) backward_buf.resize(nk * C);
+        // Layout 0 writes its forward transform straight to Y.  Layout 1
+        // needs one more compact chunk before the permuted store.
+        if (out_layout == 1 && (int64_t)forward_buf.size() < nk * C)
+            forward_buf.resize(nk * C);
+
+#pragma omp for schedule(dynamic)
+        for (int64_t ci = 0; ci < n_chunks; ++ci) {
+            if (err.failed.load(std::memory_order_relaxed)) continue;
+            const int64_t t0 = ci * C;
+            const long c = static_cast<long>(std::min<int64_t>(C, rows - t0));
+            C128* buf = backward_buf.data();
+            DescKey kb{(long)nkx, (long)nky, (long)nkz, 1, 1, c,
+                       kFftwBackward, (long)nk, (long)nk};
+            fftw_plan_t hb = get_descriptor(kb, const_cast<C128*>(x_in + t0 * nk), buf);
+            if (!hb) { err.record(0, "kminor conv bwd plan"); continue; }
+            execute(hb, x_in + t0 * nk, buf);
+            for (int64_t j = 0; j < c; ++j) {
+                const int64_t kernel_row = ((t0 + j) / (d3 * d4)) % (d1 * d2);
+                C128* bp = buf + j * nk;
+                const C128* kp = k_in + kernel_row * nk;
+                for (int64_t k = 0; k < nk; ++k) bp[k] *= kp[k] * scale;
+            }
+            C128* dest = out_layout == 0 ? y_out + t0 * nk : forward_buf.data();
+            DescKey kf{(long)nkx, (long)nky, (long)nkz, 1, 1, c,
+                       kFftwForward, (long)nk, (long)nk};
+            fftw_plan_t hf = get_descriptor(kf, buf, dest);
+            if (!hf) { err.record(0, "kminor conv fwd plan"); continue; }
+            execute(hf, buf, dest);
+            if (out_layout == 1) {
+                for (int64_t j = 0; j < c; ++j) {
+                    int64_t r = t0 + j;
+                    const int64_t i4 = r % d4; r /= d4;
+                    const int64_t i3 = r % d3; r /= d3;
+                    const int64_t i2 = r % d2; r /= d2;
+                    const int64_t i1 = r % d1; r /= d1;
+                    const int64_t base = ((((r * nk) * d3 + i3) * d1 + i1) * d4 + i4) * d2 + i2;
+                    const int64_t stride = d3 * d1 * d4 * d2;
+                    for (int64_t k = 0; k < nk; ++k)
+                        y_out[base + k * stride] = dest[j * nk + k];
+                }
+            }
+        }
+    }
+    if (err.failed.load()) return ffi::Error(ffi::ErrorCode::kInternal, err.msg);
+    return ffi::Error::Success();
+}
+
 }  // namespace lorrax_ffi::mklfft
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -777,3 +921,28 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nkz")
         .Attr<double>("scale_i")         // inverse-transform scale (both IFFTs)
         .Attr<double>("scale_f"));       // forward scale × caller multiplier
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    MklFftKminorConvHostFfi,
+    lorrax_ffi::mklfft::KminorConvDispatch,
+    xla::ffi::Ffi::Bind()
+        .Arg<xla::ffi::AnyBuffer>()      // X (d0,d1,d2,d3,d4,nk), c128
+        .Arg<xla::ffi::AnyBuffer>()      // K_R (d1,d2,nk), c128
+        .Ret<xla::ffi::AnyBuffer>()      // layout 0 may alias X
+        .Attr<int64_t>("nkx")
+        .Attr<int64_t>("nky")
+        .Attr<int64_t>("nkz")
+        .Attr<double>("scale")
+        .Attr<int64_t>("out_layout"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    MklFftKleadStoredHostFfi,
+    lorrax_ffi::mklfft::KleadStoredDispatch,
+    xla::ffi::Ffi::Bind()
+        .Arg<xla::ffi::AnyBuffer>()      // X (nk,a,mx,b,my), c128
+        .Arg<xla::ffi::AnyBuffer>()      // K_R (nk,mx,my), c128
+        .Ret<xla::ffi::AnyBuffer>()      // may alias X
+        .Attr<int64_t>("nkx")
+        .Attr<int64_t>("nky")
+        .Attr<int64_t>("nkz")
+        .Attr<double>("scale"));

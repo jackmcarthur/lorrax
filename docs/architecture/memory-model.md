@@ -1,9 +1,9 @@
 # Memory model
 
-A LORRAX calculation is feasible on `P` ranks exactly when every stage's
-per-rank live set fits the device budget. Every large object is tiled over
-the whole `x × y` mesh, so its per-rank bytes fall as `1/P`; nothing large is
-materialised on fewer than all `P` ranks. This page states, stage by stage,
+A LORRAX calculation needs every stage's per-rank live set to fit the device
+budget and its processes' combined host memory to fit their node. The leading
+device faces are tiled over the `x × y` mesh and fall as `1/P`; fixed tile
+workspaces and replicated host data need separate accounting. This page states, stage by stage,
 what is resident per rank, how it scales, and which planner prices it.
 One implementation prices, admits and measures every stage: `lxkit.memory`
 (`services/lxkit/src/lxkit/memory.py`). Prices come from measurement: the
@@ -476,12 +476,34 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | direct Γ head (bulk metals) | the compiled per-sample footprint × samples per call, split over every rank | `photon_direct_head.direct_gamma_chunk_plan`: the fixed tile, at least 2¹⁰ samples per rank, at most one 2¹⁷ replicate per call | — |
 | head wings | `n_ends` gathered endpoint blocks `16·N_k·n_s·block·N_b` | `qsgw_head.head_wing_mu_block`: the fixed tile, at least 16 centroids | — |
 | exciton_bands C_q | P_R and its update, one ψ chunk and its Pk | `vq_interp.build_cq_q_chunk`: q rows within the fixed tile | — |
-| htransform R images | f(H)_R and the back-map L_R, `16·N_k·N_B·(N_B + N_T)/P` (`N_B` = spin × nodes, `N_T` = spin × centroids, 0 when they are the nodes), and the int16 WS code tiles `2·N_k·N_B·(N_B + N_T)/P` | `fh_interp.build_fH_R` compiled (one program); `node_pair_table` exact extents | refuses |
+| htransform R images | f(H)_R and the back-map L_R, `16·N_k·N_B·(N_B + N_T)/P` (`N_B` = spin × nodes, `N_T` = spin × centroids, 0 when they are the nodes), and the int16 WS code tiles `2·N_k·N_B·(N_B + N_T)/P` | `fh_interp.build_fH_R` compiled (one program); `node_pair_table` exact code extents; WS tie-mask tile's own compiled executable | warns and admits |
+| BSE coarse-to-fine W | resident coarse W plus the fine output and embedding/FFT temporaries, all on the centroid face | `bse_densify._densified_w`: the exact densifier executable's compiled new bytes, admitted beside resident arrays before that executable runs | warns and admits |
 | restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` (SlabIO writes per-rank hyperslabs) | — | — |
 
-Replicated per-process metadata (the TRS-augmented centroid permutation and
-lattice-wrap tables, `O(n_sym·μ)`; the q-folding tables, `O(N_k)`) is
-negligible at every size.
+Replicated per-process metadata includes the TRS-augmented centroid permutation
+and lattice-wrap tables, `O(n_sym·μ)`, and q-folding tables, `O(N_k)`; it does
+not shrink with the mesh.
+
+The htransform WS constructor computes only addressable node×node and
+target×node code tiles. It retains no all-site pair matrix or target×target
+table. For local int16 code bytes `C`, host construction holds `O(C)` data
+(up to three copies during remapping), plus one displacement block. Its
+width `m` satisfies `m·(64·N_k + 32·n_image + 48) ≤ TILE_BYTES` (1 GiB,
+at least one pair); this bounds the mask and sort buffers by a fixed tile,
+not the process's total RSS. Repeated spin-site rows share one geometry
+decision. The actual device tie-mask program is compiled and admitted before
+execution; host copies and NumPy allocator overhead remain outside that
+device price. Only geometry and the small agreed tie-pattern dictionary are
+replicated. A Perlmutter P4 probe with 4,000 targets, 264 nodes and a 4×4 grid
+reduced process peak RSS from 1,925 to 469 MiB and the retained replicated
+host table from 149 MiB to 1.8 KiB (evidence:
+`/pscratch/sd/j/jackm/cs_claude/bse_memory_prerelease_20261022/memory/`).
+
+Fine W's resident size alone does not determine preprocessing capacity. A CPU
+P4 compiled probe at 10,000 centroids, coarse 3×3 and fine 6×6, needs 36.4 GB
+per rank: 3.6 GB coarse input, 14.4 GB fine output and 18.4 GB temporaries.
+The production coarse-to-fine boundary admits those new output/temporary
+bytes against the room beside the already resident coarse input.
 
 The χ₀ node cannot be chunked over q, because the k-convolution needs the
 whole k axis on every rank. A completed W of an earlier screening role is

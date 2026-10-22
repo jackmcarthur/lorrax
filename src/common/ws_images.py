@@ -39,7 +39,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-__all__ = ["WS_TIE_TOL_BOHR2", "lattice_bohr", "pair_ws_code",
+__all__ = ["WS_TIE_TOL_BOHR2", "lattice_bohr", "pair_ws_code", "pair_ws_local_codes",
            "pair_ws_code_fourier", "pair_ws_code_table", "pair_ws_embed",
            "pair_ws_fourier", "pair_ws_images", "pair_ws_weights"]
 
@@ -317,6 +317,22 @@ def _class_ties(disp, a, b, valid, tol):
     return jax.lax.map(one, (a, b, valid))
 
 
+def _tie_pattern_codes(masks, first, single, n_t):
+    """Intern single-image patterns without sorting the full pair stack.
+
+    Only entries with several minimal images need a mask sort. The usual
+    single-image entry reads its code from the small image-slot lookup.
+    """
+    bits = np.left_shift(np.int64(1), np.arange(n_t, dtype=np.int64))
+    present = np.bincount(first[single], minlength=n_t)[:n_t] > 0
+    patterns = np.union1d(bits[present], np.unique(masks[~single]))
+    if patterns.size >= np.iinfo(np.int16).max:
+        raise ValueError("WS tie patterns exceed the int16 code")
+    code = np.searchsorted(patterns, bits).astype(np.int16)[first]
+    code[~single] = np.searchsorted(patterns, masks[~single])
+    return patterns, code
+
+
 def pair_ws_code_table(images: dict) -> dict:
     """Compact form of :func:`pair_ws_weights` for every class and pair.
 
@@ -348,18 +364,111 @@ def pair_ws_code_table(images: dict) -> dict:
     # Patterns = the distinct masks, ascending (np.unique's order): the
     # one-image masks present, by count, and the tie masks, by a sort of the
     # (few) entries that tie.
-    present = np.bincount(first[single], minlength=n_t)[:n_t] > 0
-    patterns = np.union1d(bits[present], np.unique(masks[~single]))
-    if patterns.size >= np.iinfo(np.int16).max:
-        raise ValueError(f"pair_ws_code_table: {patterns.size} tie patterns "
-                         "exceed the int16 code")
-    class_code = np.searchsorted(patterns, bits).astype(np.int16)[first]
-    class_code[~single] = np.searchsorted(patterns, masks[~single])
+    patterns, class_code = _tie_pattern_codes(masks, first, single, n_t)
     member = (patterns[:, None] & bits[None, :]) != 0
     weights = member / member.sum(axis=1, keepdims=True)
     return dict(class_code=class_code, pair=pair, weights=weights,
                 img=images["img"], valid=images["valid"],
                 kgrid=images["kgrid"])
+
+
+def pair_ws_local_codes(images: dict, blocks) -> tuple[list[np.ndarray], np.ndarray]:
+    """Tie codes for only the requested rectangular site-pair blocks.
+
+    Parameters
+    ----------
+    images : dict
+        Candidate images from :func:`pair_ws_images`.
+    blocks : sequence of (rows, cols)
+        Site-index arrays into ``images['pos']`` for each addressable face
+        tile. Negative indices denote exact-null pad rows.
+
+    Returns
+    -------
+    codes : list of ndarray
+        ``(n_class, len(rows), len(cols))`` int16, indexing ``patterns``.
+    patterns : ndarray
+        Local tie masks, int64. The caller agrees these small dictionaries
+        across processes and remaps the codes before building a shared LUT.
+
+    Collective: every process enters. Only requested pairs are evaluated,
+    in bounded displacement blocks; repeated spin-site rows are evaluated
+    once. The exact tie-kernel executables are admitted before they run.
+    In particular a target-by-node back-map never constructs target-by-target
+    displacements or a replicated all-site integer sort. The image decision
+    remains :func:`pair_ws_weights`, through ``_class_ties``.
+    """
+    from runtime.tiles import tile_units
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    from common.collectives import all_gather_processes
+    from common.gpu_utils import shared_device_room
+    from lxkit import memory
+
+    n_t = int(images["img"].shape[1])
+    if n_t > 62:
+        raise ValueError(f"pair_ws_local_codes: {n_t} candidate images per "
+                         "class exceed the 62-bit tie mask")
+    n_c = int(images["img"].shape[0])
+    pos = np.asarray(images["pos"], dtype=np.float64)
+    patterns, lookup, codes = [], {}, []
+    # The returned masks, their sort/inverse buffers, and the weight kernel's
+    # one-class image stack all fit the fixed tile, independent of N_mu.
+    per_pair = 64 * n_c + 32 * n_t + 48
+    # Spin components repeat the same scalar site, so only the distinct row
+    # and column indices need a geometric image decision.
+    blocks = [(np.unique(rows, return_inverse=True),
+               np.unique(cols, return_inverse=True)) for rows, cols in blocks]
+    widths = np.asarray(sorted({tile_units(per_pair, len(r[0]) * len(c[0]))
+                                for r, c in blocks}), dtype=np.int64)
+    count = int(np.max(all_gather_processes(np.array([widths.size], np.int64))))
+    widths = np.unique(all_gather_processes(np.pad(widths, (0, count - widths.size))))
+    widths = widths[widths > 0]
+    with jax.default_device(jax.local_devices()[0]):
+        a, b, valid = (jnp.asarray(images[k]) for k in ("a", "b", "valid"))
+        kernels, peak = {}, 0
+        for width in widths:
+            kernel = _class_ties.lower(
+                jax.ShapeDtypeStruct((int(width), 3), jnp.float64),
+                a, b, valid, float(images["tol"])).compile()
+            kernels[int(width)] = kernel
+            peak = max(peak, compiled_new_bytes(kernel)
+                       + int(kernel.memory_analysis().argument_size_in_bytes))
+        peak = -agreed_chunk(-peak)
+        stage = "htransform WS tie-mask tile"
+        room = shared_device_room(stage)
+        memory.admit(stage, (("local tile", memory.Price(
+            xla=memory.Term(float(peak), 0.0, "tie-mask tile (compiled program)"),
+            ranks=int(jax.device_count()), label=stage)),),
+            int(room) if isinstance(room, (int, np.integer)) else 0)
+        for (rows, row_inverse), (cols, col_inverse) in blocks:
+            nr, nc = len(rows), len(cols)
+            out = np.empty((n_c, nr * nc), dtype=np.int16)
+            width = tile_units(per_pair, nr * nc)
+            if width == 0:
+                codes.append(np.empty((n_c, row_inverse.size, col_inverse.size), np.int16))
+                continue
+            for lo in range(0, nr * nc, width):
+                flat = np.arange(lo, min(lo + width, nr * nc))
+                ir, ic = rows[flat // nc], cols[flat % nc]
+                disp = pos[np.maximum(ir, 0)] - pos[np.maximum(ic, 0)]
+                # One compiled shape per block width, including its short
+                # tail. Padded decisions are discarded before interning.
+                disp = np.pad(disp, ((0, width - flat.size), (0, 0)))
+                masks, first, single = (np.asarray(v)[:, :flat.size] for v in
+                    kernels[width](jnp.asarray(disp), a, b, valid, float(images["tol"])))
+                found, block_code = _tie_pattern_codes(masks, first, single, n_t)
+                ids = []
+                for mask in found:
+                    mask = int(mask)
+                    if mask not in lookup:
+                        if len(patterns) >= np.iinfo(np.int16).max:
+                            raise ValueError("pair_ws_local_codes: tie patterns exceed the int16 code")
+                        lookup[mask] = len(patterns)
+                        patterns.append(mask)
+                    ids.append(lookup[mask])
+                out[:, lo:lo + flat.size] = np.asarray(ids, np.int16)[block_code]
+            codes.append(out.reshape(n_c, nr, nc)[:, row_inverse[:, None], col_inverse[None, :]])
+    return codes, np.asarray(patterns, dtype=np.int64)
 
 
 def pair_ws_code(table: dict, rows=None, cols=None) -> np.ndarray:
