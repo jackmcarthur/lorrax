@@ -32,14 +32,14 @@ def backend_namespace():
     return ns
 
 
-def fixture(mesh, ns):
+def fixture(mesh, ns, *, band_factor=2):
     import jax
     import jax.numpy as jnp
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.collectives import device_put_process_local
     px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
-    nc, nv, nk, nlog = 2*px, 2*py, 1, 17
+    nc, nv, nk, nlog = band_factor*px, band_factor*py, 1, 17
     n = ((nlog + px*py-1)//(px*py))*(px*py)
     pair = nc*nv*nk
     sh = SimpleNamespace(X=NamedSharding(mesh, P(None, "x", "y", None)),
@@ -94,29 +94,33 @@ def evaluate(context, ns, nlog, n, chunk):
     data, sh = context["data"], context["sh"]
     seed = ns["_get_probe_rhs_program"](context["gen"], sh, 1)
     solve = ns["_get_block_gmres_solver"](context["matvec"], sh, 48, 1e-11,
-                                         jnp.complex128, with_slope=True)
+                                         jnp.complex128, with_slope=context["with_slope"])
     result = np.zeros((n, n), np.complex128)
-    slope = result.copy()
+    slope = result.copy() if context["with_slope"] else None
     for start, real, probes in ns["_identity_probe_blocks"](nlog, n, chunk):
         rhs = seed(device_put_process_local(probes, sh.S_k0),
                    data["psi_c_X"], data["psi_v_X"], data["V_q0"])
-        value, residual, _iterations, fields = solve(rhs, context["diag"],
-            jnp.asarray(0.25j), context["operands"])
+        solved = solve(rhs, context["diag"], jnp.asarray(0.25j), context["operands"])
+        value, residual, _iterations = solved[:3]
         assert float(np.max(gather_to_host(residual))) < 2e-10
-        for target, action in ((result, value), (slope, fields["dWc_ds"])):
+        actions = [(result, value)]
+        if slope is not None:
+            actions.append((slope, solved[3]["dWc_ds"]))
+        for target, action in actions:
             tile = context["snapshot"](action, data["psi_c_Y"], data["psi_v_Y"], data["V_q0"])
             target[:, start:start+real] = np.asarray(gather_to_host(tile))[:, :real]
     return result, slope
 
 
-def run_capacity_gate(mesh):
+def run_capacity_gate(mesh, *, with_slope=True, band_factor=2):
     import jax
     import numpy as np
     from lxkit import memory
     from unittest.mock import patch
     jax.config.update("jax_enable_x64", True)
     ns = backend_namespace()
-    context, nlog, n, h, vertex, v = fixture(mesh, ns)
+    context, nlog, n, h, vertex, v = fixture(mesh, ns, band_factor=band_factor)
+    context["with_slope"] = context["with_moments"] = bool(with_slope)
     plan = ns["_plan_probe_chunk"]
     prices = []
     with patch.object(memory, "book", lambda price, **kw: prices.append(price.bytes())):
@@ -129,8 +133,14 @@ def run_capacity_gate(mesh):
         room = int((full_price+floor_price)//2)
         used = int(memory.run()["budget"]-memory.room(bucketed=False))
         memory.set_budget(used+room)
-        actual_room = memory.room()
-        chosen = plan(context, None, n_pad=n, carry_bytes=10000, stack_bytes=12000)
+        room_reads, read_room = [], memory.room
+        def metered_room(**kwargs):
+            value = read_room(**kwargs)
+            room_reads.append(value)
+            return value
+        with patch.object(memory, "room", metered_room):
+            chosen = plan(context, None, n_pad=n, carry_bytes=10000, stack_bytes=12000)
+        actual_room = room_reads[-1]
         assert int(mesh.shape["y"]) <= chosen < n
         assert chosen % int(mesh.shape["y"]) == 0
         assert prices[-1] <= actual_room
@@ -143,9 +153,10 @@ def run_capacity_gate(mesh):
     readout = np.hstack([v @ vertex.T, v @ vertex.T])
     r = np.linalg.inv(0.25j*np.eye(h.shape[0])-h)
     np.testing.assert_allclose(value, readout @ r @ seed, atol=2e-12, rtol=2e-10)
-    np.testing.assert_allclose(derivative, -readout @ r @ r @ seed/(0.5j), atol=2e-12, rtol=2e-10)
     np.testing.assert_allclose(value, full_value, atol=2e-12, rtol=2e-10)
-    np.testing.assert_allclose(derivative, full_derivative, atol=2e-12, rtol=2e-10)
+    if derivative is not None:
+        np.testing.assert_allclose(derivative, -readout @ r @ r @ seed/(0.5j), atol=2e-12, rtol=2e-10)
+        np.testing.assert_allclose(derivative, full_derivative, atol=2e-12, rtol=2e-10)
     assert np.all(value[nlog:] == 0) and np.all(value[:, nlog:] == 0)
     return dict(mesh=list(mesh.devices.shape), logical=nlog, padded=n, chunk=chosen,
                 full_price=full_price, reduced_price=reduced_price, room=actual_room,
@@ -173,6 +184,15 @@ def test_large_default_proposal_is_bounded_without_constructing_large_arrays():
         per_probe = ns["_probe_scaling_bytes"](data, mesh)
         units = tile_units(per_probe*side, (10000+side-1)//side)
         assert units*side < 10000
+
+
+def test_value_only_probe_budget_and_math():
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+    side = 2 if len(jax.devices("cpu")) >= 4 else 1
+    mesh = Mesh(np.asarray(jax.devices("cpu")[:side*side]).reshape(side, side), ("x", "y"))
+    assert run_capacity_gate(mesh, with_slope=False, band_factor=4)["max_value_error"] < 2e-12
 
 
 def test_shared_arnoldi_harvest_ritz_and_deflated_solve():
