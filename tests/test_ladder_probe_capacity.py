@@ -234,6 +234,8 @@ if __name__ == "__main__":
     import json
     import runtime
     stack = runtime.initialize_communicator_stack()
+    from common.gpu_utils import resolve_device_budget_gb
+    resolve_device_budget_gb()
     import jax
     summary = run_capacity_gate(stack.mesh)
     print(f"r{jax.process_index()} LADDER_PROBE_CAPACITY PASS " + json.dumps(summary), flush=True)
