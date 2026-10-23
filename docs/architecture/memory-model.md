@@ -544,9 +544,11 @@ sphere-to-box inverse rows and separable Bloch-phase tables inside the local
 FFT scan. For `c` scan rows and `b` local bands, a chunk touches at most
 `w = min(N_k, ceil((c + b - gcd(c,b))/b))` distinct k rows. The per-k tables
 therefore occupy at most `4·w·N_r` inverse bytes and, with Bloch phases,
-`3·16·w·μ` phase bytes, rather than retaining these tables for every k row.
-The gathered per-FFT-row intermediates remain part of the compiled scan
-tile. G-flat coefficients stay band-sharded, while the canonical sparse
+`16·w·min(3·μ, nx+ny+nz)` phase bytes: shape alone chooses between the
+three axis exponent vectors and their gathered centroid values. This is
+never larger than the former `3·16·w·μ` phase bound. No table is retained
+for every k row. The gathered per-FFT-row intermediates remain part of
+the compiled scan tile. G-flat coefficients stay band-sharded, while the canonical sparse
 sphere-index table remains replicated metadata. One local FFT still needs
 its complete spatial grid; increasing P does not reduce that one-row floor.
 
@@ -556,6 +558,16 @@ contain extents and shardings; centroid coordinates, WFN/Meta objects and
 device data are not retained. Packed-mask reshards and insertions stay local
 to the request. This avoids repeated tracing, lowering and persistent-cache
 reads on warm calls without retaining sampled faces or request-index tables.
+
+When `0 < c < b` and `c` divides `b`, chunks stay within one k row. An
+outer k scan retains that row's inverse and phase data while an inner band
+scan reuses it; crossing-k chunks keep the flat scan. Both scans have
+`unroll=1`. This trades repeated table construction for one retained k row,
+not an all-k cache. Retention can prevent aliasing with FFT temporaries:
+the P4 probe added about 0.19 MB of compiled scratch at 24×24×80 and 8.40 MB
+at 128³, independent of whether the request had one or three k rows. The
+actual compiled price includes this bounded storage; identical peak memory
+is not assumed. Full-band chunks keep their previous flat-scan route.
 
 The htransform WS constructor computes only addressable node×node and
 target×node code tiles. It retains no all-site pair matrix or target×target

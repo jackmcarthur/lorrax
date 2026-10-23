@@ -923,6 +923,7 @@ def gflat_to_rmu(
     # largest number of distinct logical k rows any chunk can touch.
     from math import gcd
     k_span = min(nk, -(-(cs + nb_local - gcd(cs, nb_local)) // nb_local))
+    phase_at_mu = 3 * n_rmu <= nx + ny + nz
 
     if kvecs_frac is None:
         kvecs_shape = None
@@ -1004,19 +1005,34 @@ def gflat_to_rmu(
                     psi_flat, ((0, pad_N), (0, 0), (0, 0)))
             out_flat = jnp.zeros(
                 (N + pad_N, ns, n_rmu), dtype=psi_.dtype)
-            def body(out, i):
-                i0    = i * cs
-                sub   = jax.lax.dynamic_slice_in_dim(
-                    psi_flat, i0, cs, axis=0)            # (cs, ns, ngkmax)
-                k_row = jnp.clip(
-                    (i0 + jnp.arange(cs)) // nb_local, 0, nk - 1)  # (cs,)
-                k_first = i0 // nb_local
-                span_rows = jnp.minimum(
-                    k_first + jnp.arange(k_span), nk - 1)
+            def at_mu(phases):
+                return (phases[0][:, r_mu_[:, 0]],
+                        phases[1][:, r_mu_[:, 1]],
+                        phases[2][:, r_mu_[:, 2]])
+
+            def tables(span_rows):
                 mapped_span = (span_rows if k_row_map_ is None
                                else k_row_map_[span_rows])
                 inverse = _sphere_inverse(g_index_[mapped_span], n_rtot)
-                within_span = k_row - k_first
+                if kvecs_ is None:
+                    return inverse, None
+                # Keep the original separable exponent and multiply order,
+                # including loader-paired k representatives.
+                kv = kvecs_[mapped_span]
+                _ph = lambda k_axis, n: jnp.exp(
+                    +2j * jnp.pi * k_axis[:, None]
+                    * (jnp.arange(n) / n)[None, :])
+                phases = (
+                    _ph(kv[:, 0], nx),
+                    _ph(kv[:, 1], ny),
+                    _ph(kv[:, 2], nz))
+                # Retain the smaller representation across a band scan.
+                # Shape alone chooses; centroid values remain runtime data.
+                return inverse, at_mu(phases) if phase_at_mu else phases
+
+            def sample_chunk(out, i0, inverse, phases, within_span):
+                sub = jax.lax.dynamic_slice_in_dim(
+                    psi_flat, i0, cs, axis=0)            # (cs, ns, ngkmax)
                 # Singleton-nb reshape so _box_kernel's (n_k, nb, ns,
                 # ngkmax) contract takes (cs, 1, ns, ngkmax) per row.
                 # Per-row sphere-index gather: (cs, ngkmax).
@@ -1028,31 +1044,55 @@ def gflat_to_rmu(
                 rb = local_ifftn3(box, axes=(-3, -2, -1), norm=norm)
                 # Centroid gather — (cs, ns, n_rmu).
                 samples = rb[:, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
-                if kvecs_ is not None:
+                if phases is not None:
                     # Per-row Bloch phase at the gathered centroid
                     # cells — apply_bloch_phase is multiplicative on the
                     # spatial axes, so applying it post-gather is
                     # algebraically identical to applying it on the
                     # full FFT box before gather (cf. gflat_to_rchunk's
                     # phase-on-slice pattern).
-                    # Keep the original separable exponent and multiply
-                    # order, including loader-paired k representatives.
-                    kv = kvecs_[mapped_span]
-                    _ph = lambda k_axis, n: jnp.exp(
-                        +2j * jnp.pi * k_axis[:, None]
-                        * (jnp.arange(n) / n)[None, :])
-                    phx = _ph(kv[:, 0], nx)[:, r_mu_[:, 0]]
-                    phy = _ph(kv[:, 1], ny)[:, r_mu_[:, 1]]
-                    phz = _ph(kv[:, 2], nz)[:, r_mu_[:, 2]]
+                    phx, phy, phz = phases if phase_at_mu else at_mu(phases)
                     phx_q = phx[within_span]
                     phy_q = phy[within_span]
                     phz_q = phz[within_span]
                     samples = samples * (phx_q * phy_q * phz_q)[:, None, :]
                 return jax.lax.dynamic_update_slice_in_dim(
-                    out, samples, i0, axis=0), None
+                    out, samples, i0, axis=0)
 
-            out_flat, _ = jax.lax.scan(
-                body, out_flat, jnp.arange(n_chunks, dtype=jnp.int32), unroll=1)
+            if k_span == 1 and cs < nb_local and nb_local % cs == 0:
+                # Chunks lie wholly within one k row. Retain only that row's
+                # inverse/phases while sampling all its local band chunks,
+                # rather than rebuilding the same bounded tables per chunk.
+                def sample_k(out, k):
+                    inverse, phases = tables(jnp.reshape(k, (1,)))
+
+                    def sample_bands(out, b):
+                        i0 = k * nb_local + b * cs
+                        return sample_chunk(
+                            out, i0, inverse, phases,
+                            jnp.zeros((cs,), dtype=jnp.int32)), None
+
+                    out, _ = jax.lax.scan(
+                        sample_bands, out,
+                        jnp.arange(nb_local // cs, dtype=jnp.int32), unroll=1)
+                    return out, None
+
+                out_flat, _ = jax.lax.scan(
+                    sample_k, out_flat, jnp.arange(nk, dtype=jnp.int32), unroll=1)
+            else:
+                def sample_flat(out, i):
+                    i0 = i * cs
+                    k_row = jnp.clip(
+                        (i0 + jnp.arange(cs)) // nb_local, 0, nk - 1)
+                    k_first = i0 // nb_local
+                    inverse, phases = tables(jnp.minimum(
+                        k_first + jnp.arange(k_span), nk - 1))
+                    return sample_chunk(
+                        out, i0, inverse, phases, k_row - k_first), None
+
+                out_flat, _ = jax.lax.scan(
+                    sample_flat, out_flat,
+                    jnp.arange(n_chunks, dtype=jnp.int32), unroll=1)
             if pad_N:
                 out_flat = out_flat[:N]
             return out_flat.reshape(nk, nb_local, ns, n_rmu)
