@@ -3573,9 +3573,10 @@ def _require_sys_dim(params, filename) -> None:
         raise ValueError(
             f"GATE sys_dim_required: {filename} does not set sys_dim.\n"
             "  want: sys_dim = 3 for bulk, 2 for a slab with vacuum along c\n"
-            "  why:  it selects the Coulomb truncation of V_q, W and the "
-            "Hartree term; a wrong value runs to completion with wrong "
-            "numbers\n"
+            "  why:  it selects the GW V_q/W and beyond-DFT transverse "
+            "boundary; a wrong value gives wrong screening\n"
+            "  DFT ionic/scalar Hartree terms follow authenticated QE XML, "
+            "with this key as the legacy fallback when no XML binds\n"
             "  fix:  add sys_dim = 3 (bulk) or sys_dim = 2 (slab) to the "
             "[cohsex] section\n"
             "  doc:  docs/input_reference.md, sys_dim.")
