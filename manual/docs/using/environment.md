@@ -85,7 +85,7 @@ Unset, they check and warn; `strict` refuses (CI and regression gates); `0` or `
 ### `LORRAX_TRS_CHECK` {: .kw data-type="env · enum" data-default="1" }
 The two-component time-reversal measurement on the occupied states, run before any consumer uses time reversal.
 
-`strict` also refuses a broken or inconclusive reference. `0 false off no` refuse: skipping the measurement would assert time reversal ([Inputs from DFT](inputs-from-dft.md#spinors)).
+`strict` also refuses a broken or inconclusive reference. `0 false off no` refuse: skipping the measurement would assert time reversal ([Required DFT inputs](inputs-from-dft.md#spinors)).
 {: .kw-details }
 
 `1` `strict`

@@ -18,7 +18,7 @@ LORRAX reads the same `WFN.h5` as BerkeleyGW and writes `eqp0.dat` and `eqp1.dat
 | `vxc.dat`, `kih.dat` | [`kin-ion`](../utilities/kin-ion.md) | `kin_ion.h5` holds $\langle m\bk\vert T+V^{\mathrm{ion}}\vert n\bk\rangle$. |
 | `epsilon_cutoff` (the G basis of $\varepsilon$) | [`centroids`](../utilities/centroids.md) | `centroids_frac_<N>.txt`, the ISDF points $\br_\mu$. |
 
-The run directory also holds QE's `data-file-schema.xml`, from which LORRAX reads the symmetry operations and time-reversal flags, and the pseudopotential files that `kin-ion` and `dipole` read. What `WFN.h5` must contain is on [Inputs from DFT](inputs-from-dft.md).
+The run directory also holds QE's `data-file-schema.xml`, from which LORRAX reads the symmetry operations and time-reversal flags, and the pseudopotential files that `kin-ion` and `dipole` read. What `WFN.h5` must contain is on [Required DFT inputs](inputs-from-dft.md).
 
 ### Files {: #files }
 
@@ -60,7 +60,7 @@ LORRAX never subtracts a $V^{xc}$ and never solves a QP equation. A one-shot run
 
 ### k-points without kgrid.x {: #kpoints }
 
-BerkeleyGW builds the full zone from the WFN's k list with the rotation matrices of the header alone; its symmetry record carries no time-reversal flag. Its manual therefore has the NSCF list written by `kgrid.x` without time reversal, or a time-reversal-reduced WFN unfolded afterwards by `wfn_time_reversal.x`, and its `pw2bgw.x` for QE 7.2 allows magnetization only with no symmetries. LORRAX unfolds with every header operation and its composition with time reversal: all of them when time reversal holds, and on a magnet those QE marks `t_rev = 1` ([Symmetry §1.1](../theory/symmetry.md#sym-used)). The NSCF takes `K_POINTS automatic` and `kgrid.x` is not needed ([Inputs from DFT](inputs-from-dft.md#kgrid)). A `WFN.h5` from a `kgrid.x` list is read as well, so a comparison run that gives one file to both codes uses the list BerkeleyGW can unfold.
+BerkeleyGW builds the full zone from the WFN's k list with the rotation matrices of the header alone; its symmetry record carries no time-reversal flag. Its manual therefore has the NSCF list written by `kgrid.x` without time reversal, or a time-reversal-reduced WFN unfolded afterwards by `wfn_time_reversal.x`, and its `pw2bgw.x` for QE 7.2 allows magnetization only with no symmetries. LORRAX unfolds with every header operation and its composition with time reversal: all of them when time reversal holds, and on a magnet those QE marks `t_rev = 1` ([Symmetry §1.1](../theory/symmetry.md#sym-used)). The NSCF takes `K_POINTS automatic` and `kgrid.x` is not needed ([Required DFT inputs](inputs-from-dft.md#kgrid)). A `WFN.h5` from a `kgrid.x` list is read as well, so a comparison run that gives one file to both codes uses the list BerkeleyGW can unfold.
 
 ## epsilon.inp {: #epsilon }
 

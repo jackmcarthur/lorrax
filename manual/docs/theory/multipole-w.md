@@ -103,7 +103,7 @@ On a metal, the default `sigma_w_model` was `mpa` (elementwise poles), a compari
 |---|---|---|
 | `compute_mode = mpa` (formerly with `sigma_w_model = mpa`) | runs if time reversal holds | `mpa_ordered_metal` |
 
-In the [time-reversal consumer table](symmetry.md#sym-trs-consumers), the MPA fit carries a second, odd residue when time reversal is broken, like the GN-PPM fit, and elementwise MPA on a metal refuses a time-reversal-broken input file, like `hl_ppm`. On a magnetic input file ([Inputs from DFT](../using/inputs-from-dft.md)) the elementwise multipole fit carries that odd residue per pole and refuses on a metal. Multipole residues, like the tangential ones, use the transpose rule of [Symmetry](symmetry.md).
+In the [time-reversal consumer table](symmetry.md#sym-trs-consumers), the MPA fit carries a second, odd residue when time reversal is broken, like the GN-PPM fit, and elementwise MPA on a metal refuses a time-reversal-broken input file, like `hl_ppm`. On a magnetic input file ([Required DFT inputs](../using/inputs-from-dft.md)) the elementwise multipole fit carries that odd residue per pole and refuses on a metal. Multipole residues, like the tangential ones, use the transpose rule of [Symmetry](symmetry.md).
 
 ## χ⁰ on the sample lines {: #mpa-lines }
 

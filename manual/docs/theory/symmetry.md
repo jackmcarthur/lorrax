@@ -11,7 +11,7 @@ LORRAX keeps wavefunctions only at the k rows stored in `WFN.h5`, the parents. E
 {: .intro }
 
 !!! note
-    The NSCF k list may be QE's own reduced `K_POINTS automatic` grid, reduced by every operation QE used: the space group with its fractional translations, time reversal on a nonmagnetic crystal, and the time-reversal-composed operations of a magnet. LORRAX unfolds it to the full grid itself (§1.4), so BerkeleyGW's `kgrid.x` is not needed ([Inputs from DFT](../using/inputs-from-dft.md#kgrid)). A full-grid k that no permitted operation reaches refuses (§6.4).
+    The NSCF k list may be QE's own reduced `K_POINTS automatic` grid, reduced by every operation QE used: the space group with its fractional translations, time reversal on a nonmagnetic crystal, and the time-reversal-composed operations of a magnet. LORRAX unfolds it to the full grid itself (§1.4), so BerkeleyGW's `kgrid.x` is not needed ([Required DFT inputs](../using/inputs-from-dft.md#kgrid)). A full-grid k that no permitted operation reaches refuses (§6.4).
 
 ### <span class="n">1.1</span> Operations used {: #sym-used }
 
@@ -113,7 +113,7 @@ The partner pairs are stored $\bk/{-\bk}$ rows, spatial images of a stored partn
 `symmetry_maps.resolve_qe_symmetry_binding`
 {: .in-code }
 
-The loader searches near `WFN.h5` for a QE `data-file-schema.xml`; where to stage it is on [Inputs from DFT](../using/inputs-from-dft.md#schema). A `WFN_qp.h5` also searches beside its stamped source WFN. A candidate binds only if it matches the WFN in:
+The loader searches near `WFN.h5` for a QE `data-file-schema.xml`; where to link it is on [Required DFT inputs](../using/inputs-from-dft.md#schema). A `WFN_qp.h5` also searches beside its stamped source WFN. A candidate binds only if it matches the WFN in:
 
 | Checked | Against |
 |---|---|

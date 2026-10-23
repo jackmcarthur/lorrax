@@ -100,7 +100,7 @@ wfn2hdf.x BIN WFN WFN.h5                   # to HDF5
 cp Si.save/data-file-schema.xml .          # symmetry and time-reversal record
 ```
 
-The QE side, and what `WFN.h5` must contain, is on [Inputs from DFT](inputs-from-dft.md).
+The QE side, and what `WFN.h5` must contain, is on [Required DFT inputs](inputs-from-dft.md).
 
 !!! note
     The LORRAX [`nscf`](../drivers/nscf/index.md) driver replaces the QE nscf, `pw2bgw.x` and `wfn2hdf.x` for a nonmagnetic, norm-conserving PBE calculation: `$RUN psp.run_nscf -i nscf.in`, with `save_dir`, `nbnd = 80` and `kgrid = 4 4 4` in an `[nscf]` section. It writes no `data-file-schema.xml`, and the scf one is used only when its k-points are those of `WFN.h5`. This run's scf is on 8×8×8, so with its fully relativistic pseudopotential `dipole` and `kin-ion` refuse ([nscf dependencies](../drivers/nscf/dependencies.md)); use the QE route here.

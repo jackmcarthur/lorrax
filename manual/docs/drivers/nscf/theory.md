@@ -168,7 +168,7 @@ $$
 f_{n\bk} = \begin{cases} 1, & n \le N_{\mathrm{occ}} \\ 0, & n > N_{\mathrm{occ}} \end{cases}, \qquad N_{\mathrm{occ}} = \tfrac12\,N_{\mathrm{el}}\,n_{\mathrm{spin}}\,n_{\mathrm{spinor}} \tag{3.2}
 $$
 
-No smearing or Fermi level is written. Metals need the QE route of [Inputs from DFT](../../using/inputs-from-dft.md); see [Metals](../../theory/metals.md).
+No smearing or Fermi level is written. Metals need the QE route of [Required DFT inputs](../../using/inputs-from-dft.md); see [Metals](../../theory/metals.md).
 
 ### <span class="n">3.3</span> G order {: #out-gorder }
 

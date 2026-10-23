@@ -111,7 +111,7 @@ The QE SCF must be built with HDF5, so that the `.save` holds `charge-density.hd
     ```
 
 ??? treatment not-in-lorrax "QE nscf + pw2bgw.x · external"
-    The route of [Inputs from DFT](../../using/inputs-from-dft.md), listed for comparison. Use it for metals, magnetic or non-PBE runs and ultrasoft or PAW pseudopotentials, none of which `psp.run_nscf` reproduces. Use it also for spin–orbit runs with fully relativistic pseudopotentials when the SCF ran on a different k set: `run_nscf` writes no QE schema, the SCF's does not bind, and `dipole` and `kin-ion` then refuse ([Dependencies](dependencies.md)).
+    The route of [Required DFT inputs](../../using/inputs-from-dft.md), listed for comparison. Use it for metals, magnetic or non-PBE runs and ultrasoft or PAW pseudopotentials, none of which `psp.run_nscf` reproduces. Use it also for spin–orbit runs with fully relativistic pseudopotentials when the SCF ran on a different k set: `run_nscf` writes no QE schema, the SCF's does not bind, and `dipole` and `kin-ion` then refuse ([Dependencies](dependencies.md)).
 
 ## Complete-basis WFN: `psp.run_dense_h` {: #dense-h }
 

@@ -77,7 +77,7 @@ nav:
   - Using LORRAX:
       - Quickstart: using/quickstart.md
       - Installation: using/installation.md
-      - Inputs from DFT: using/inputs-from-dft.md
+      - Required DFT inputs: using/inputs-from-dft.md
       - Environment variables: using/environment.md
       - For BerkeleyGW users: using/berkeleygw-users.md
   - Drivers:
