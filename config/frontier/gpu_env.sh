@@ -9,6 +9,7 @@ if [[ ! -x "$_lorrax_frontier_venv/bin/python" || ! -f "$_lorrax_frontier_venv/b
     unset _lorrax_frontier_root _lorrax_frontier_venv
     return 1
 fi
+export LORRAX_OLCF_VENV="$_lorrax_frontier_venv"
 source "$_lorrax_frontier_venv/bin/activate"
 export LORRAX_CHECKOUT="$_lorrax_frontier_root" LORRAX_ROOT="$_lorrax_frontier_root"
 # runtime.source_closure owns the service source roots; a clone needs src only.
