@@ -136,7 +136,7 @@ a provider context under `linalg = local` carries it as its `outside` term
 |---|---|
 | W Dyson (`gw.w_isdf._dyson_route`) | local: faces + $16\mu^2(3\lceil Q/P\rceil + 2)$; distributed: faces + one LU pair + contexts |
 | response-bank Coulomb roots (`gw.response_bank._select_coulomb_program`) | complete compiled checked program for both roots plus native GEMM/eigh workspace and contexts; local first, existing distributed algebra when it does not fit |
-| charge Cplus factor (`isdf.core._factor_c_q_face`) | complete compiled first and whole-chain programs plus the matching native EIGH query and contexts; first only when its checked backup also fits, otherwise the existing whole-mesh program |
+| charge Cplus factor (`isdf.core._factor_c_q_face`) | complete compiled first and whole-chain programs plus matching native EIGH query and contexts; smaller local shares follow the service's doubling schedule before the whole-mesh program, each including its checked backup |
 | SC eigh, density scan (`gw.sc_iteration`, `gw.qsgw_density`) | one $(n_b, n_b)$ tile within 1 % of `B`; cuSOLVERMp eigh / `band_2d` |
 | tangential whole parents, constructor, staged eigh stacks (`gw.tangential_execution`) | the local route's compiled programs; the face / whole mesh + contexts |
 | head Γ GEMM (`gw.tangential_head._gamma_gemm_route`), ζ face GEMMs | staged where its program compiled fits the room (`distrib_la.staged_fits`); `panel_matmul` faces |

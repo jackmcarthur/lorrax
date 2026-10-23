@@ -146,9 +146,12 @@ Before running the factor, the owner admits its complete compiled Cplus
 program (`temp + output - alias` beside the live C_q), the native EIGH size
 query, and any provider contexts not already withheld by the run budget.
 The first program must also leave room for its checked whole-mesh backup.
-When it does not fit, that existing whole-mesh program runs directly.
+When it does not fit, the owner tries smaller local shares with the
+service's existing doubling schedule before the whole-mesh program.
 The batch-reshard chooser includes the native workspace for the actual
 local share in each round; reducing the share uses its existing scan.
+Equivalent recorded first/retry room decisions reuse the same compiled
+factor programs; exact byte budgets are not executable-cache keys.
 
 **Back-solve.** The charge channel forms ζ = B(BᴴZ) on the face per G tile
 (two face GEMMs, `ZetaG._contract_v_face`). A current channel's rank p holds

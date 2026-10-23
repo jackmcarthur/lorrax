@@ -660,6 +660,18 @@ def _round_candidates(nb: int, ranks: int) -> list:
     return out
 
 
+def eigh_rounds(nb: int, ranks: int, start: int = 1) -> tuple:
+    """Route-(c) ``(rounds, local_share)`` candidates, doubling while the share shrinks."""
+    nb, ranks, start = int(nb), int(ranks), int(start)
+    if min(nb, ranks, start) < 1:
+        raise ValueError('eigh rounds need positive batch, ranks and start')
+    share = lambda r: -(-(-(-nb // r)) // ranks)
+    tries = [start]
+    while tries[-1] < nb and share(min(nb, 2 * tries[-1])) < share(tries[-1]):
+        tries.append(min(nb, 2 * tries[-1]))
+    return tuple((r, share(r)) for r in tries)
+
+
 @lru_cache(maxsize=1)
 def _measured_code_hash() -> str:
     """The distrib_la sources the measured programs are built from (and the jax build): a cached
@@ -1724,6 +1736,8 @@ class Plan:
             from distrib_la._batch_reshard import batch_layout_eigh_call
             return batch_layout_eigh_call("eigh", self.mesh, A)
         traced = isinstance(A, jax.core.Tracer)
+        if self.op == "eigh" and _route is None and in_checked_retry():
+            _rounds = None       # an outer first-route choice never changes its checked backup
         route = self.route_for(A.shape, A.dtype, traced) if _route is None else _route
         if route not in BATCHED_ROUTES:
             raise ValueError(
@@ -1737,7 +1751,7 @@ class Plan:
             if self.op == "eigh":
                 cut = kwargs.pop("cut", None)
                 self._reshard_options(kwargs)
-                rounds = (1 if _route is not None else
+                rounds = (int(_rounds) if _rounds is not None else 1 if _route is not None else
                           self.stack_route(A.shape, A.dtype, traced=traced).rounds)
                 return self._checked_reshard("eigh", A, rounds, cut)
             return self._batch_reshard((A, *args), kwargs)
@@ -1843,14 +1857,13 @@ class Plan:
             return rounds, run(rounds)
         from distrib_la.workspace import local_eigh_workspace
         nb, n, ranks = int(A.shape[0]), int(A.shape[-1]), int(self.mesh.size)
-        share = lambda r: -(-(-(-nb // r)) // ranks)
-        tries = [int(rounds)]
-        while tries[-1] < nb and share(min(nb, 2 * tries[-1])) < share(tries[-1]):
-            tries.append(min(nb, 2 * tries[-1]))
+        candidates = eigh_rounds(nb, ranks, rounds)
+        tries = [r for r, share in candidates]
+        shares = dict(candidates)
 
         def price(r):
             return memory.priced((_analysis_bytes(run(r)) or 0) + local_eigh_workspace(
-                self.mesh, share(r), n, A.dtype), f"distrib_la route (c) {phase} program, {r} round(s) (compiled)")
+                self.mesh, shares[r], n, A.dtype), f"distrib_la route (c) {phase} program, {r} round(s) (compiled)")
         chosen = memory.admit(f"distrib_la route (c) stack {nb} x {n}^2",
                               tuple((f"{r} round(s)", lambda r=r: price(r)) for r in tries),
                               memory.room(bucketed=False), device=False)

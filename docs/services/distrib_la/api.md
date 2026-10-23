@@ -365,6 +365,11 @@ route (c), and refuses by name at the first stack that needs the whole mesh
   size has sized the retry and runs the first program in the room it leaves.
   `call.runner(first, retry=whole)` reuses exact already-compiled first and
   backup executables after the caller admits both complete programs.
+  `eigh_rounds(nb, ranks, start=1)` supplies the existing route-(c)
+  doubling candidates and each one's actual local share, for callers
+  admitting a larger fused program around that same solver. An explicit
+  private `_rounds` on `Plan.batched` changes only that first route; the
+  checked backup keeps its natural route and round count.
   `checked_shapes(fn, *args)` is `jax.eval_shape` of the first phase.
 
 ### Resident operands: `batch_layout` and `local_batch`

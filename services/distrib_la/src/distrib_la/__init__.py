@@ -129,6 +129,7 @@ from distrib_la.plan import (
     ROUTE_SCAN,
     Plan,
     StackRoute,
+    eigh_rounds,
     ensure_sharding,
     new_stack_routes,
     plan,
@@ -171,7 +172,7 @@ __all__ = [
     "face_sharding", "on_face", "hermitian_part", "hermitian_block",
     "join_columns", "diagonal_like",
     # plan
-    "Plan", "plan", "StackRoute", "RoomExhausted", "room_class", "room_or_exhausted", "room_test", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes", "native_eigh_jacobi",
+    "Plan", "plan", "StackRoute", "eigh_rounds", "RoomExhausted", "room_class", "room_or_exhausted", "room_test", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes", "native_eigh_jacobi",
     # native dense workspace queries (no allocation)
     "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "local_eigh_workspace", "eigh_stack_bytes", "eigh_stack_proposal", "lu_workspace_bytes", "lu_workspace_query", "route_bytes", "staged_fits",
     # polar / SVD

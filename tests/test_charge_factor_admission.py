@@ -34,35 +34,31 @@ def main():
         c[q, logical:, logical:] = 99*np.eye(n-logical)
     face = NamedSharding(mesh, P(None, 'x', 'y'))
     value = device_put_process_local(c, face)
-    admitted, admit = [], memory.admit
+    admitted, admit, force = [], memory.admit, None
 
     def route(stage, routes, room, **kwargs):
         chosen = admit(stage, routes, room, **kwargs)
         if stage == 'charge Cplus factor':
             admitted.append(chosen)
+            return force or chosen
         return chosen
 
-    memory.admit = route
-    try:
-        factor = core._factor_c_q_face(value, mesh, logical)
-    finally:
-        memory.admit = admit
+    for force in (None, 'whole'):
+        memory.admit = route
+        try:
+            factor = core._factor_c_q_face(value, mesh, logical)
+        finally:
+            memory.admit = admit
+        inverse = matmul(factor, factor, mesh=mesh, transb='C', backend='distributed')
+        np.testing.assert_allclose(np.asarray(gather_to_host(inverse)), expected,
+                                   rtol=2e-11, atol=2e-11)
+        np.testing.assert_array_equal(np.asarray(gather_to_host(factor))[:, logical:], 0)
+        del factor, inverse
     assert admitted
-    inverse = matmul(factor, factor, mesh=mesh, transb='C', backend='distributed')
-    np.testing.assert_allclose(np.asarray(gather_to_host(inverse)), expected,
-                               rtol=2e-11, atol=2e-11)
-    # Execute the exact admitted backup too: both routes must preserve the
-    # physical inverse and exact-zero pad rows, irrespective of eigenvector gauge.
-    eig, program, prepared = core._charge_face_cache[next(reversed(core._charge_face_cache))]
     if jax.local_devices()[0].platform == 'cpu':
+        from distrib_la import plan
+        eig = plan('eigh', mesh, n=n)
         assert workspace_bytes_per_rank(eig, 'eigh', ((n, n),), np.complex128, checked=True) == 0
-    _, whole, runner = next(iter(prepared.values()))
-    other = program.finish((value,), whole(value))[0]
-    rebuilt = matmul(other, other, mesh=mesh, transb='C', backend='distributed')
-    np.testing.assert_allclose(np.asarray(gather_to_host(rebuilt)), expected,
-                               rtol=2e-11, atol=2e-11)
-    for b in (factor, other):
-        np.testing.assert_array_equal(np.asarray(gather_to_host(b))[:, logical:], 0)
     ref = weakref.ref(value)
     del value
     assert ref() is None, 'compiled factor cache retained its input array'

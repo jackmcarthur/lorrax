@@ -1550,77 +1550,89 @@ def _factor_c_q_face(C_q, mesh_xy, n_rmu_logical, zeta_rcond=ZETA_RCOND_DEFAULT)
     plan_room = room_or_exhausted(max(0, int(room)-int(reserve)),
         stage="isdf charge factor provider contexts", priced_bytes=int(reserve),
         available_bytes=int(room)) if int(room) > 0 else room
-    eig, program, prepared = _charge_factor_program(
-        mesh_xy, (int(nq), int(n)), n_log, float(rcond), plan_room)
-    signature = (str(C_q.dtype), str(getattr(C_q, 'format', None)), C_q.sharding)
-    if signature not in prepared:
-        first, _ = program.compiled(C_q)
-        whole = program.lower(C_q).compile()
-        prepared[signature] = first, whole, program.runner(first, retry=whole)
-    first, whole, run_first = prepared[signature]
-    from distrib_la import ROUTE_BATCH_RESHARD
-    local_first = (eig.is_native or eig.backend == 'one_device'
-        or eig.stack_route(C_q.shape, C_q.dtype, traced=False).route == ROUTE_BATCH_RESHARD)
-    prices = {}
+    from distrib_la import ROUTE_BATCH_RESHARD, eigh_rounds
+    variants, prices = {}, {}
 
-    def price(phase):
-        if phase not in prices:
-            executable = first if phase == 'first' else whole
+    def prepare(rounds):
+        if rounds not in variants:
+            variants[rounds] = _charge_factor_program(
+                C_q, mesh_xy, n_log, float(rcond), plan_room, rounds)
+        return variants[rounds]
+
+    def price(rounds, phase):
+        key = rounds, phase
+        if key not in prices:
+            eig, program, first, whole, runner = prepare(rounds)
+            route = eig.stack_route(C_q.shape, C_q.dtype, traced=False)
+            local = (eig.is_native or eig.backend == 'one_device'
+                or phase == 'first' and route.route == ROUTE_BATCH_RESHARD)
             native = _charge_factor_workspace(eig, C_q.shape, C_q.dtype,
-                                               first=phase == 'first')
-            prices[phase] = compiled_price(compiled=executable, extra=native,
+                                               first=phase == 'first', rounds=rounds)
+            priced = compiled_price(compiled=first if phase == 'first' else whole, extra=native,
                 ranks=int(mesh_xy.size), face=True, contexts=int(mesh_xy.size) > 1,
                 source=f"complete Cplus {phase} program plus queried native workspace")
-            prices[phase] = replace(prices[phase], whole=int(n) if (
-                local_first if phase == 'first' else eig.is_native or eig.backend == 'one_device') else 0)
-        return prices[phase]
+            prices[key] = replace(priced, whole=int(n) if local else 0)
+        return prices[key]
 
-    def first_with_backup():
-        return max((price('first'), price('whole')), key=lambda p: p.bytes())
+    def first_with_backup(rounds):
+        quoted = max((price(rounds, 'first'), price(rounds, 'whole')), key=lambda p: p.bytes())
+        return replace(quoted, whole=price(rounds, 'first').whole)
 
+    eig = prepare(None)[0]
+    route = eig.stack_route(C_q.shape, C_q.dtype, traced=False)
+    candidates = [None]
+    if route.route == ROUTE_BATCH_RESHARD:
+        candidates += [r for r, share in eigh_rounds(int(nq), int(mesh_xy.size))
+                       if r > route.rounds and share < route.per_rank]
+    names = {r: 'first' if r is None else f'{r} rounds' for r in candidates}
     chosen = memory.admit("charge Cplus factor",
-        [('first', first_with_backup), ('whole', lambda: price('whole'))], int(room))
-    B, figures = (run_first(C_q) if chosen == 'first'
-                  else program.finish((C_q,), whole(C_q)))
+        [(names[r], lambda r=r: first_with_backup(r)) for r in candidates]
+        + [('whole', lambda: price(None, 'whole'))], int(room))
+    rounds = next((r for r in candidates if names[r] == chosen), None)
+    eig, program, first, whole, runner = prepare(rounds)
+    B, figures = (program.finish((C_q,), whole(C_q)) if chosen == 'whole' else runner(C_q))
     cplus.report(figures, rcond=rcond, n_log=n_log)
     return B
 
 
-def _charge_factor_workspace(eig, shape, dtype, *, first):
+def _charge_factor_workspace(eig, shape, dtype, *, first, rounds=None):
     """Native scratch of the existing first route or the checked whole-mesh backup."""
-    from distrib_la import local_eigh_workspace, workspace_bytes_per_rank, ROUTE_BATCH_RESHARD
-    if eig.is_native or eig.backend == 'one_device':
+    from distrib_la import local_eigh_workspace, workspace_bytes_per_rank, ROUTE_BATCH_RESHARD, eigh_rounds
+    if (eig.is_native and eig.capacity_refusal is None) or eig.backend == 'one_device':
         return workspace_bytes_per_rank(eig, 'eigh', (tuple(shape),), dtype)
     route = eig.stack_route(shape, dtype, traced=False)
     if route.route == ROUTE_BATCH_RESHARD and (first or eig.capacity_refusal is not None):
-        return local_eigh_workspace(eig.mesh, route.per_rank, int(shape[-1]), dtype)
+        share = (route.per_rank if rounds is None or not first else
+                 eigh_rounds(shape[0], eig.mesh.size, rounds)[0][1])
+        return local_eigh_workspace(eig.mesh, share, int(shape[-1]), dtype)
     # A rank-2 query names one distributed solve, never a cached local-stack route.
     return workspace_bytes_per_rank(eig, 'eigh', (tuple(shape[-2:]),), dtype, checked=not first)
 
 
-def _charge_factor_program(mesh_xy, shape, n_log, rcond, room):
-    """The single charge-factor equation and its metadata-only executable cache."""
-    from distrib_la import checked_program, plan
+def _charge_factor_program(C_q, mesh_xy, n_log, rcond, room, rounds=None):
+    """The single factor equation, compiled once per class of equivalent room decisions."""
+    from distrib_la import checked_program, plan, room_class, RoomExhausted
     from isdf import cplus
-    nq, n = shape
+    nq, n, _ = C_q.shape
     face, rep = NamedSharding(mesh_xy, P(None, 'x', 'y')), NamedSharding(mesh_xy, P())
-    # distrib_la.plan.place decides the stack in the room beside what the zeta stage holds now
-    # (C, the stores; lxkit.memory.room, the same on every rank): whole
-    # matrices per rank where they fit (Fe: 64 q, n 312), else the whole mesh (a Gamma deck:
-    # nq 1, n 29998). The room's bucket keys the program, so a later call decides in its own room.
-    key = (_mesh_key(mesh_xy), int(nq), int(n), n_log, float(rcond), room)
-    if key not in _charge_face_cache:
+    key = (_mesh_key(mesh_xy), tuple(C_q.shape), str(C_q.dtype), str(getattr(C_q, 'format', None)),
+           C_q.sharding, int(n_log), float(rcond), rounds,
+           room if isinstance(room, RoomExhausted) else None)
+
+    def build():
         eig = plan("eigh", mesh_xy, n=int(n), budget_bytes=room)
         @partial(checked_program, mesh=mesh_xy, out_shardings=(face, rep), in_shardings=(face,))
         def _fn(C):
-            # A traced iota mask, not a host (n, n) constant per rank.
             live = jnp.arange(int(n)) < n_log
             C = jnp.where(live[:, None] & live[None, :], C, 0)
             B, figures = cplus.factor(C, rcond=rcond, rank_log=True, n_log=n_log,
-                                      eigh=lambda c: eig.batched(c, cut=rcond))
-            return B, figures                      # zero pad block: ζ's pad rows stay zero
-        _charge_face_cache[key] = eig, _fn, {}
-    return _charge_face_cache[key]
+                eigh=lambda c: eig.batched(c, cut=rcond, _rounds=rounds))
+            return B, figures
+        first, _ = _fn.compiled(C_q)
+        whole = _fn.lower(C_q).compile()
+        return eig, _fn, first, whole, _fn.runner(first, retry=whole)
+
+    return room_class(_charge_face_cache, key, int(room), build)
 
 
 def solve_zeta_charge_dense(C, Z, *, charge_zeta_solve: str,
