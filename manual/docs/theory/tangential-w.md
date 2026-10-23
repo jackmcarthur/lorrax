@@ -438,10 +438,10 @@ The pencil is truncated to its well-conditioned span, whitened and diagonalized,
 The pole count is a rank, set per $\bq$ by the smaller of the numerical rank of the equilibrated $\mathbb G$ and the budget:
 
 $$
-K_\bq=\min\Big(\#\big\{\gamma>10^{-8}\gamma_{\max}\big\},\ \lceil1.8\,N_\mu\rceil\Big) \tag{7.6}
+K_\bq=\min\Big(\#\big\{\gamma>10^{-8}\gamma_{\max}\big\},\ \lceil N_\mu\rceil\Big) \tag{7.6}
 $$
 
-$K_\bq$ can sit a few below the budget where a multiplet straddles the cut. The budget keeps storage at $16N_\mu K_\bq$ bytes and the synthesis of (6.1) at $\mathcal O(N_\mu^2K_\bq)$ per node. On Si the budget gives 0.80 meV QP RMS against a contour-deformation reference and an uncapped store 0.29 meV (LORRAX `docs/theory/tangential-w-model.md` §6.3).
+$K_\bq$ can sit a few below the budget where a multiplet straddles the cut. The budget keeps storage at $16N_\mu K_\bq$ bytes and the synthesis of (6.1) at $\mathcal O(N_\mu^2K_\bq)$ per node. On Si the earlier budget of $1.8N_\mu$ gave 0.80 meV QP RMS against a contour-deformation reference, and an uncapped store 0.29 meV (LORRAX `docs/theory/tangential-w-model.md` §8.3). The default of $N_\mu$, adopted on 2026-10-23, trades this for errors of about 5 meV, and it was accurate in every case tested.
 
 ### <span class="n">7.10</span> Gates {: #ritz-gates }
 
@@ -528,7 +528,7 @@ The synthesis of (6.1) with the weight $-1/\Omega_j$ in place of the time factor
 
 ### <span class="n">8.4</span> Recipe constants {: #keys-recipe }
 
-No input key reaches the constants below. `sigma_w_accuracy` picks a column of the hashed recipe table `shared_real_pole_v1_r3b` (`RECIPE_VERSION = shared_real_pole_v1_r4`). The table hash enters the model identity, so a store built under another recipe refuses on restart.
+No input key reaches the constants below. `sigma_w_accuracy` picks a column of the hashed recipe table `shared_real_pole_v1_r3b` (`RECIPE_VERSION = shared_real_pole_v1_r5`). The table hash enters the model identity, so a store built under another recipe is rebuilt on restart, not reused.
 
 | Constant | `production` | `relaxed` | Role |
 |---|---|---|---|
@@ -545,7 +545,7 @@ No input key reaches the constants below. `sigma_w_accuracy` picks a column of t
 | `imaginary_width_fraction` | 1/4 | 1/8 | imaginary $Q_a$ width |
 | `infinity_width_fraction` | 1/8 | 1/16 | $Q_\infty$ width |
 | `multiplet_relative_tolerance` | $10^{-6}$ | same | multiplet closure of every cut |
-| `pole_budget_fraction` | 1.8 | none | $K_\bq\le\lceil1.8N_\mu\rceil$ |
+| `pole_budget_fraction` | 1.0 | none | $K_\bq\le\lceil N_\mu\rceil$ |
 | `normalized_gram_keep` | $10^{-8}$ | same | keep $\gamma>10^{-8}\gamma_{\max}$ |
 | `zero_ritz_policy` | $10^{-6}$ Ry², $10^{-6}$ | same | drop $\Omega^2\le10^{-6}$ Ry² within the weight budget |
 | `bank_rule_tolerance` | $10^{-8}$ | $10^{-7}$ | $\epsilon_{\mathrm{bank}}$ of (6.3) |
@@ -586,7 +586,7 @@ Moment matching fits the Taylor coefficients of the transfer function at a point
 
 ### <span class="n">9.2</span> Why a small model suffices {: #red-small }
 
-Σ uses $W^c$ only through sums over its poles weighted by $1/(\omega-E\mp\Omega\pm i\eta)$, which vary with $\Omega$ on the scale $\eta$. Poles closer together than $\eta$ therefore need not be resolved one by one, and the model only has to reproduce averages of the spectral measure of (2.2) over that scale. A model with real poles and positive residues, as §[4.3](#loewner-hermitian) builds, is a quadrature of that measure, and samples at a height $h$ above $\eta$ fix those averages as long as the supports are spaced finely enough along the line. Away from the spectrum, as on the imaginary axis, the error of a rational approximation falls geometrically with the number of poles, and the count grows only as the logarithm of the spectral range [20, 21, 22]. Along a line at height $h$ it grows as the reach of the line divided by $h$ (§[5](#supports)). Neither count depends on the measure, so the number of transitions $N_t$ does not enter. Each pole carries a rank-one residue, so data of size $N_\mu\times N_\mu$ need of order $N_\mu$ poles, and LORRAX caps the count at $\lceil1.8N_\mu\rceil$. On Si that model reproduces quasiparticle energies from contour deformation to 0.80 meV RMS (§[7.9](#ritz-count)).
+Σ uses $W^c$ only through sums over its poles weighted by $1/(\omega-E\mp\Omega\pm i\eta)$, which vary with $\Omega$ on the scale $\eta$. Poles closer together than $\eta$ therefore need not be resolved one by one, and the model only has to reproduce averages of the spectral measure of (2.2) over that scale. A model with real poles and positive residues, as §[4.3](#loewner-hermitian) builds, is a quadrature of that measure, and samples at a height $h$ above $\eta$ fix those averages as long as the supports are spaced finely enough along the line. Away from the spectrum, as on the imaginary axis, the error of a rational approximation falls geometrically with the number of poles, and the count grows only as the logarithm of the spectral range [20, 21, 22]. Along a line at height $h$ it grows as the reach of the line divided by $h$ (§[5](#supports)). Neither count depends on the measure, so the number of transitions $N_t$ does not enter. Each pole carries a rank-one residue, so data of size $N_\mu\times N_\mu$ need of order $N_\mu$ poles, and LORRAX caps the count at $\lceil N_\mu\rceil$. On Si a cap of $1.8N_\mu$ reproduces quasiparticle energies from contour deformation to 0.80 meV RMS, and the default cap to about 5 meV (§[7.9](#ritz-count)).
 
 ## Notation {: #notation }
 

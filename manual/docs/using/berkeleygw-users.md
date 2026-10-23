@@ -51,7 +51,7 @@ $$
 W^c_\bq(\mu,\nu;z)=\sum_jb_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\left[\frac{1}{z-\Omega_{j\bq}}-\frac{1}{z+\Omega_{j\bq}}\right]
 $$
 
-In effect it is a multi-plasmon-pole model with hundreds of poles, by default up to about twice the number of ISDF points ([Tangential W model](../theory/tangential-w.md#model-form)). $\Sigma^c(\omega)$ then has a closed pole form and is evaluated directly on the real axis, with no analytic continuation and no frequency grid for $\varepsilon^{-1}$. A contour-deformation route, [`sigma_frequency_integration`](../drivers/gw/keywords.md#sigma_frequency_integration) `= contour_deformation`, serves as a reference ([Contour deformation §9.2](../theory/contour-deformation.md#compare-bgw)). All treatments: [Frequency treatments of Σ](../theory/frequency-treatments.md#compare-table).
+In effect it is a multi-plasmon-pole model with hundreds of poles, by default up to the number of ISDF points ([Tangential W model](../theory/tangential-w.md#model-form)). $\Sigma^c(\omega)$ then has a closed pole form and is evaluated directly on the real axis, with no analytic continuation and no frequency grid for $\varepsilon^{-1}$. A contour-deformation route, [`sigma_frequency_integration`](../drivers/gw/keywords.md#sigma_frequency_integration) `= contour_deformation`, serves as a reference ([Contour deformation §9.2](../theory/contour-deformation.md#compare-bgw)). All treatments: [Frequency treatments of Σ](../theory/frequency-treatments.md#compare-table).
 
 ### The q → 0 head without shifted wavefunctions {: #head }
 

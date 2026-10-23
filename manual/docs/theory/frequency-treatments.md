@@ -182,7 +182,7 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
     :   $z_a=\omega_a+ih$ and $z_a=iu_a$, plus $M_1$, $M_3$
 
     Model
-    :   $K_\bq\le\lceil1.8N_\mu\rceil$ shared real poles
+    :   $K_\bq\le\lceil N_\mu\rceil$ shared real poles
 
     Frequency
     :   full frequency

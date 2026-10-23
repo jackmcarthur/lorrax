@@ -367,7 +367,7 @@ The table below sets the CD route beside LORRAX's production treatment and besid
 | head, band extrapolation | off (refused) | on |
 | use | reference and comparisons | production |
 
-On Si the tangential budget gives 0.80 meV QP RMS against a contour-deformation reference ([Tangential W model §7.9](tangential-w.md#ritz-count)).
+On Si a tangential budget of $1.8N_\mu$ gives 0.80 meV QP RMS against a contour-deformation reference ([Tangential W model §7.9](tangential-w.md#ritz-count)).
 
 ### <span class="n">9.2</span> Against BerkeleyGW {: #compare-bgw }
 

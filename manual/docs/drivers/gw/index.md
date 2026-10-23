@@ -186,7 +186,7 @@ The numerical controls (`sigma_quadrature_eps`, the centroid count, the pole bud
 | k grid | (WFN) | The link error $\epsilon_{\mathrm{link}}$ printed by dipole and on every QSGW map: 9 % on MoS₂ 3×3, 4.6 % on Fe 4³, 3.4 % on Si 4³. On MoS₂ 3×3 the QSGW gap is 5.167 eV without the link term and 4.483 eV with it. | Refine the k grid ([velocity operator §3.6](../../theory/velocity-operator.md#berry-valid)). |
 | ISDF points | `centroids_file` | $\Sigma^x$ RMS ≤ 1 meV at $N_\mu\approx0.5\,r$ ([ISDF §4](../../theory/isdf.md#isdf-accuracy)). | Select on the Σ pair set. |
 | Σ quadrature | `sigma_quadrature_eps` | Default $10^{-4}$: eqp0 within 0.89 meV of $\varepsilon=10^{-6}$ (Fe 4³ QSGW, $E_F\pm15$ eV). | Lower $\varepsilon$. |
-| Pole count of $W$ | (recipe) | 0.80 meV QP RMS against contour deformation, Si ([Tangential W model §7.9](../../theory/tangential-w.md#ritz-count)). | — |
+| Pole count of $W$ | (recipe) | 0.80 meV QP RMS against contour deformation at the earlier $1.8N_\mu$ budget, Si ([Tangential W model §7.9](../../theory/tangential-w.md#ritz-count)). | — |
 | Semicore read | (fixed, η = 5 eV) | $E_F\pm1$ eV: 3.6 / 15.9 meV on Fe 4³, 2.9 / 20.0 meV on MoS₂ 3×3 ([QSGW §3.3](../../theory/qsgw.md#bands-core)). | `sigma_omega_patches_ev` windows at a smaller η. |
 
 !!! note "Agreement with BerkeleyGW"
