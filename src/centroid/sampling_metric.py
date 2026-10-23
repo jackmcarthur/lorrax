@@ -103,10 +103,11 @@ def _quadrature_tables(wfn, sym):
     The distinguishing fact is whether the raw WFN k axis is the irreducible
     wedge or the whole grid, i.e. ``wfn.nkpts`` against ``sym.nk_tot``:
 
-    * **IBZ storage** (``wfn.nkpts < sym.nk_tot``): one stored row per star,
-      and ``kweights`` already carries the WHOLE star's weight.  The stored
-      parents must therefore cover the entire normalised weight, and each
-      full-BZ member of a star takes ``w_parent / n_members``.
+    * **IBZ storage** (``wfn.nkpts < sym.nk_tot``): a file row carries its
+      file-star weight. The file wedge can contain several rows of one
+      authenticated SymMaps star (for example separate raw TR partners).
+      Sum those weights at their canonical parent, using the service's exact
+      file-to-full-grid indices, then assign ``w_star / n_members``.
     * **Full-BZ storage** (``wfn.nkpts == sym.nk_tot``): every point of the
       grid is stored and ``kweights`` IS the full-BZ quadrature already.
       Each member keeps its own stored weight; the parents cover only
@@ -171,19 +172,30 @@ def _quadrature_tables(wfn, sym):
                 f"= {fixed_points.tolist()}")
         full_weights[:] = kweights
     else:
-        used_weight = float(kweights[parents_used].sum())
+        file_rows = np.asarray(sym.kirr_fullids)
+        if (file_rows.shape != (nk_raw,) or file_rows.dtype.kind not in "iu"
+                or np.any(file_rows < 0) or np.any(file_rows >= nk_full)
+                or np.unique(file_rows).size != nk_raw):
+            raise ValueError(
+                "SymMaps.kirr_fullids must give one distinct exact full-BZ "
+                f"row for each raw WFN k row; got shape={file_rows.shape}")
+        file_parents = parent_for_k[file_rows]
+        if not np.array_equal(file_parents[parents_used], parents_used):
+            raise ValueError(
+                "SymMaps canonical star parents do not map their own stored "
+                "k points to themselves")
+        parent_weights = np.bincount(
+            file_parents, weights=kweights, minlength=nk_raw)
+        used_weight = float(parent_weights[parents_used].sum())
         if not np.isclose(used_weight, 1.0, rtol=1.0e-12, atol=1.0e-14):
             raise ValueError(
-                "SymMaps full-BZ parents omit nonzero WFN quadrature weight: "
-                f"selected normalized weight={used_weight:.17g}, want 1. "
-                f"The raw WFN k axis ({nk_raw} rows) is read as the IBZ "
-                f"because it is shorter than nk_tot={nk_full}; an IBZ file "
-                "must store one row per star and carry the whole star weight "
-                "on it")
+                "SymMaps canonical parents omit WFN quadrature weight after "
+                "exact file-row folding: "
+                f"selected normalized weight={used_weight:.17g}, want 1")
         for parent in parents_used:
             member_rows = np.flatnonzero(parent_for_k == parent)
             full_weights[member_rows] = (
-                float(kweights[parent]) / float(member_rows.size))
+                float(parent_weights[parent]) / float(member_rows.size))
 
     if not np.isclose(full_weights.sum(), 1.0, rtol=1.0e-12, atol=1.0e-14):
         raise ValueError(
@@ -202,7 +214,8 @@ def _quadrature_tables(wfn, sym):
 def full_k_quadrature_weights(wfn, sym) -> np.ndarray:
     """Normalised full-BZ quadrature weight of every unfolded k point.
 
-    IBZ storage spreads each parent weight uniformly over its star; full-BZ
+    IBZ storage folds file-row weights to canonical stars and spreads each
+    star weight uniformly over its members; full-BZ
     storage passes the stored weights through.  See :func:`_quadrature_tables`.
     """
     return _quadrature_tables(wfn, sym)[2].copy()
