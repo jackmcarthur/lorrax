@@ -1979,10 +1979,13 @@ def _centroid_stream_geometry(
             requested_band_tile, p_band,
             name="centroid stream band tile").carrier
     from runtime.padding import padded_axis
-    nk_accum = padded_axis(
-        nk_tot, k_tile, name="centroid stream k accumulator").carrier
-    nb_accum = padded_axis(
-        nb_total, band_tile, name="centroid stream band accumulator").carrier
+    # The output faces shard centroids, not k or bands. Only the transfer
+    # tile needs mesh-aligned bands and a fixed k extent. Keeping that pad
+    # in the persistent output wastes O(nk * (P - nb) * mu / sqrt(P)) at
+    # nb < P, and its final crop overlaps both padded and logical faces.
+    # Trim the terminal transfer tile at insertion instead.
+    nk_accum = int(nk_tot)
+    nb_accum = int(nb_total)
     parent_groups = None
     parent_stream_active = False
     from wfn_loader import IBZRows
@@ -2153,7 +2156,11 @@ def _centroid_sampling_indices(
     g_index_full = None
     request = domain if full_k_rows is None else full_k_rows
     if parent_groups is None:
-        g_index_full = loader.box_index_dev(k=request, mesh=mesh_xy)
+        # This table belongs to one bounded k batch. Retaining every request
+        # key would reconstruct O(nk_full * ngkmax) host/device state across
+        # an otherwise streamed large-k calculation.
+        g_index_full = loader.box_index_dev(
+            k=request, mesh=mesh_xy, cache=False)
     # Use the k representatives paired with this loader's typed full-BZ map.
     kvecs_frac_full = loader.kvecs(k=request)
     return g_index_full, kvecs_frac_full
@@ -2241,9 +2248,16 @@ def _centroid_stream_kernels(
         )
 
     @partial(
-        jax.jit, donate_argnums=(0, 1), out_shardings=(out_Y, out_X))
-    def _insert_tile(acc_y, acc_x, psi_rmu_band, k0, b0):
+        jax.jit, donate_argnums=(0, 1), out_shardings=(out_Y, out_X),
+        static_argnames=("valid_k", "valid_b"))
+    def _insert_tile(acc_y, acc_x, psi_rmu_band, k0, b0, *, valid_k, valid_b):
         tile_y, tile_x = _reshard_centroid_tile(psi_rmu_band)
+        # Slice only after bands have left the mesh. Slicing the band-sharded
+        # input would gather it. Explicit valid extents also prevent XLA's
+        # dynamic-update-slice clamp from moving a terminal tile backwards
+        # over already-written physical rows.
+        tile_y = tile_y[:valid_k, :valid_b]
+        tile_x = tile_x[:valid_k, :, :valid_b]
         zero = jnp.int32(0)
         acc_y = jax.lax.dynamic_update_slice(
             acc_y, tile_y, (k0, b0, zero, zero))
@@ -2266,7 +2280,9 @@ def _centroid_stream_kernels(
         with timing.section("load_centroids.reshard_insert"):
             acc_y, acc_x = _insert_tile(
                 acc_y, acc_x, psi_rmu_band,
-                jnp.int32(output_row), jnp.int32(b_rel))
+                jnp.int32(output_row), jnp.int32(b_rel),
+                valid_k=1,
+                valid_b=min(int(psi_G_one.shape[1]), nb_accum - b_rel))
             jax.block_until_ready((acc_y, acc_x))
         del psi_rmu_band
         return acc_y, acc_x
@@ -2398,7 +2414,8 @@ def _sample_centroid_domain_tiles(
             with timing.section("load_centroids.reshard_insert"):
                 psi_rmu_all, psi_rmuT_all = _insert_tile(
                     psi_rmu_all, psi_rmuT_all, psi_rmu_band,
-                    jnp.int32(k0), jnp.int32(b_rel))
+                    jnp.int32(k0), jnp.int32(b_rel),
+                    valid_k=k1-k0, valid_b=b_hi_rel-b_rel)
                 jax.block_until_ready((psi_rmu_all, psi_rmuT_all))
             del psi_rmu_band
     return psi_rmu_all, psi_rmuT_all
