@@ -95,6 +95,11 @@ On CPU the live count is the per-device union of local storage intervals:
 global/local aliases and overlapping views spend the budget once. Reading
 the count neither synchronizes pending kernels nor retains local arrays.
 
+At eager stage boundaries, `distrib_la.ensure_sharding` preserves a concrete
+operand already in the required layout: an eager `with_sharding_constraint`
+can copy the entire operand even when its sharding matches. Inside a `jit`,
+the helper retains the constraint; a genuinely different layout still reshards.
+
 CPU compiler heaps are separate from that live-array count. A cold P121
 1 MiB all-to-all compile left 30.39 GiB of node PSS, although glibc had
 already freed most of the compiler scratch. Releasing those free pages

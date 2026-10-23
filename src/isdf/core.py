@@ -1320,7 +1320,9 @@ def _identity_pad_block_diagonal(
             f"n_rmu_logical={n_rmu_logical} > input extent {n_rmu}")
     sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     if n_rmu_logical == n_rmu:
-        return jax.lax.with_sharding_constraint(M, sharding)
+        # Concrete no-op; traced callers retain the layout constraint.
+        from distrib_la import ensure_sharding
+        return ensure_sharding(M, sharding)
     # The pad-block identity [n_rmu_logical, n_rmu) is traced inside one program on M's face:
     # an eager jnp.diag built the whole (n_rmu, n_rmu) on every process's default device.
     return _identity_pad_program(sharding, int(n_rmu), int(n_rmu_logical))(M)

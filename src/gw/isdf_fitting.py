@@ -653,7 +653,7 @@ def fit_zeta_to_h5(
     _write_file = bool(write_zeta_file)
 
     # ========== per channel: C_q, its factor, its file ==========
-    from distrib_la import gemm_plan as _gemm_plan
+    from distrib_la import gemm_plan as _gemm_plan, ensure_sharding
     _mu_gemm = int(k_unfold_plan.n_centroid_packed)
     # C's enclosing JIT compiles this GEMM; standalone dummy warmup would
     # compile and execute it again without reusing that executable.
@@ -690,7 +690,9 @@ def fit_zeta_to_h5(
                     part = w * part
                 C_q = part if C_q is None else C_q + part
                 del part
-            C_q_flat = jax.lax.with_sharding_constraint(
+            # The producer already returns this face. An eager constraint
+            # would copy the complete stored-q stack despite matching layout.
+            C_q_flat = ensure_sharding(
                 C_q.reshape(n_q_disk, n_rmu_padded, n_rmu_padded), flat_shard)
             del C_q
             if n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu:
