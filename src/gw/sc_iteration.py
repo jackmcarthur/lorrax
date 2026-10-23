@@ -2323,7 +2323,7 @@ def _sc_head_frequency_plan(
 
     requests = screening_requests_for(config.compute_mode, config)
     mpa_plan = None
-    if config.compute_mode is ComputeMode.MPA and config.sigma.w_model == "tangential":
+    if config.compute_mode.is_pole_route and config.sigma.w_model == "tangential":
         if tangential_recipe is None:
             raise ValueError("GATE tangential_sc_plan: current-map recipe is missing")
         if getattr(config, "head", None) is not None and config.head.correction is not HeadCorrection.OFF:
@@ -2347,7 +2347,7 @@ def _sc_head_frequency_plan(
         if bool(config.do_G0) and 0j not in head_omegas:
             head_omegas.append(0j)
         return requests, None, head_omegas
-    if config.compute_mode is ComputeMode.MPA:
+    if config.compute_mode.is_pole_route:
         from .mpa import sample_plan
         if quad is None:
             if certified_fit is None:
@@ -3080,7 +3080,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # replays and asserts the stored occupation provenance on this exact
     # entry ladder.  Later maps retain only the fit's sample geometry and
     # rebuild screening from their live occupations.
-    mpa_mode = inputs.config.compute_mode is ComputeMode.MPA
+    mpa_mode = inputs.config.compute_mode.is_pole_route
     elementwise_mpa = mpa_mode and inputs.config.sigma.w_model == "mpa"
     screening_reuse = None
     certified_fit = None
@@ -6667,7 +6667,7 @@ def run_sc_driver(
     # scratch generation.
     from .restart_q_storage import take_pre_unfold
     from .screening import driver_persists_w0, restart_static_w
-    mpa = config.compute_mode is ComputeMode.MPA
+    mpa = config.compute_mode.is_pole_route
     try:
         if driver_persists_w0(config.compute_mode, config):
             final_w = screening.tangential if mpa else screening.static_w

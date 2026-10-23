@@ -13,7 +13,7 @@ its stop rules in [self-consistency](../self_consistency.md); the W model in
 
 ## The route
 
-- **W.** `compute_mode = mpa` with `sigma_w_model = tangential`. Each map
+- **W.** `compute_mode = tangential`. Each map
   rebuilds W_c as one set of real poles per q, shared by every matrix element,
   with positive residues, from samples of W_c and ∂W_c and the exact moments
   ([theory](../theory/tangential-w-model.md)). `compute_mode = auto` never
@@ -91,8 +91,7 @@ The keys that differ from the defaults:
 ```ini
 [cohsex]
 sys_dim = 3             # 2 for a slab
-compute_mode = mpa
-sigma_w_model = tangential
+compute_mode = tangential
 qp_solver = self_consistent
 sc_tol_ev = 1e-3
 number_bands_protected = M  # b3, the QP-matrix top; a convergence parameter

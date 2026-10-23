@@ -133,7 +133,7 @@ def screening_requests_for(
     if mode is ComputeMode.HL_PPM:
         return [static, ScreeningRequest(
             omega_ry=complex(float(config.ppm.omega_p), 0.0), role="probe")]
-    if mode is ComputeMode.MPA:
+    if mode.is_pole_route:
         # MPA owns a shared multi-frequency disk walk, not independent W
         # requests.  ``gw.mpa.model.build_mpa_fit`` is called by the driver
         # directly; the gw_config.UNIMPLEMENTED_MODES row that used to gate
@@ -763,7 +763,7 @@ def compute_screening_model(
     """
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
-    if mode is ComputeMode.MPA:
+    if mode.is_pole_route:
         if static_only:
             return {}
         if getattr(config.sigma, "frequency_integration", "pole_model") == "contour_deformation":
@@ -943,7 +943,7 @@ def driver_persists_w0(mode, config) -> bool:
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
     if diagrams is not ScreeningDiagrams.W_RPA:
         return False
-    if mode is ComputeMode.MPA:
+    if mode.is_pole_route:
         sigma = getattr(config, "sigma", None)
         return (getattr(sigma, "w_model", "mpa") == "tangential"
                 and (not bool(getattr(config, "bispinor", False))
@@ -972,7 +972,7 @@ def restart_static_w(mode, W_by_role, V_q, *, config, meta, mesh_xy,
     ``head_correction = full`` without a finalized ω = 0 sample.  A BSE on
     that restart rebuilds the scalar static response through its owner.
     """
-    if mode is not ComputeMode.MPA:
+    if not mode.is_pole_route:
         return W_by_role.get("static", V_q)
     from .gw_config import folds_scalar_head
     why = None

@@ -463,4 +463,4 @@ def semicore_patch_route(compute_mode):
     ``gw_init.coarse_class_for_deck``) and its windows are route-independent.
     """
     from .gw_config import ComputeMode
-    return compute_mode is ComputeMode.MPA
+    return ComputeMode(getattr(compute_mode, 'value', compute_mode)).is_pole_route

@@ -5,6 +5,27 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-22 — GW: `compute_mode = tangential`; BSE: BerkeleyGW output files, srlr only
+
+- **Decks.** The tangential W model is `compute_mode = tangential`. The
+  `sigma_w_model` key refuses: "`sigma_w_model` is now `compute_mode =
+  tangential` (or `compute_mode = mpa` for the elementwise model)". Write
+  `compute_mode = tangential` for `compute_mode = mpa` + `sigma_w_model =
+  tangential`; results are bit-identical. `sigma_w_accuracy`,
+  `sigma_w_support_sites_ev`, `write_w`, `write_poles` and
+  `bispinor_gw = full_tangential` require `compute_mode = tangential`.
+- **BSE W interpolation.** `w_head_densify` is `srlr` only; `c1` and
+  `legacy` refuse. A `kgrid_fine` BSE needs a restart with `W0_lr` (a static
+  GW: `cohsex`, `gn_ppm`, `hl_ppm`). A BSE on a `compute_mode = mpa` restart
+  refuses (`GATE bse_mpa_w0`).
+- **BSE files.** `eigenvectors.h5`, `eigenvalues*.dat` and `absorption_*.dat`
+  are BerkeleyGW's exact layout (`versionnumber`, int32 scalars, `kpts`
+  (nk, 3), the four eigenvector datasets, `spin_kernel` per kernel, the WFN's
+  `mf_header`; `eigenvalues.dat` along a deck `polarization`; absorption files
+  with BerkeleyGW's four header lines only). Readers of the old `version`,
+  (3, nk) `kpts` or `eigenvectors_coupling` must follow.
+- **FEAST** is deprecated, and refuses under the TDA (`GATE feast_tda_complex`).
+
 ## 2026-10-21 — BSE: BerkeleyGW key names in the deck, TDA and the screened kernel by default
 
 The BSE drivers read their settings from the deck passed with `-i`, under

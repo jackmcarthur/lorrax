@@ -176,6 +176,7 @@ class ComputeMode(str, enum.Enum):
     GN_PPM = "gn_ppm"
     HL_PPM = "hl_ppm"
     MPA = "mpa"
+    TANGENTIAL = "tangential"
 
     @property
     def needs_screening(self) -> bool:
@@ -186,7 +187,15 @@ class ComputeMode(str, enum.Enum):
     def is_dynamic(self) -> bool:
         """True when the mode builds a Σ_c(ω) grid: GN/HL-PPM and MPA; see docs/dev/gw_config_contracts.md."""
         return self in (ComputeMode.GN_PPM, ComputeMode.HL_PPM,
-                        ComputeMode.MPA)
+                        ComputeMode.MPA, ComputeMode.TANGENTIAL)
+
+    @property
+    def is_pole_route(self) -> bool:
+        """The full-frequency pole route: ``mpa`` (elementwise MPA fit of W) and
+        ``tangential`` (the tangential W model).  They share the screening,
+        Σ_c pole executor and restart path; where they differ the code reads
+        ``config.sigma.w_model``, which ``compute_mode`` sets."""
+        return self in (ComputeMode.MPA, ComputeMode.TANGENTIAL)
 
     @property
     def ppm_model(self) -> str | None:
@@ -370,7 +379,17 @@ MODE_SIGMA_CHANNELS: dict[ComputeMode, frozenset[SigmaChannel]] = {
     ComputeMode.GN_PPM: frozenset({SigmaChannel.X, SigmaChannel.C_OMEGA}),
     ComputeMode.HL_PPM: frozenset({SigmaChannel.X, SigmaChannel.C_OMEGA}),
     ComputeMode.MPA: frozenset({SigmaChannel.X, SigmaChannel.C_OMEGA}),
+    ComputeMode.TANGENTIAL: frozenset({SigmaChannel.X, SigmaChannel.C_OMEGA}),
 }
+
+
+def sigma_w_model_of(compute_mode) -> str:
+    """The pole route's W model, set by ``compute_mode`` alone (the old
+    ``sigma_w_model`` deck key refuses): ``"tangential"`` under
+    ``compute_mode = tangential``, else ``"mpa"`` (the elementwise fit; read
+    only on the pole route)."""
+    raw = str(getattr(compute_mode, "value", compute_mode) or "").strip().lower()
+    return "tangential" if raw == ComputeMode.TANGENTIAL.value else "mpa"
 
 
 def coerce_compute_mode(mode) -> ComputeMode:
@@ -531,7 +550,7 @@ _W_RPA_RESOLVENT_REFUSALS: tuple[
     ),
     (
         "w_rpa_resolvent_mpa_unimplemented",
-        lambda cfg: cfg.compute_mode is ComputeMode.MPA,
+        lambda cfg: cfg.compute_mode.is_pole_route,
         lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
         "cohsex or gn_ppm, or screening_diagrams = w_bse / w_rpa under mpa",
         "use cohsex or gn_ppm with w_rpa_resolvent, or keep compute_mode = "
@@ -1679,7 +1698,6 @@ _DEFAULTS = {
     # (owner 2026-09-24): cover (grow the grid over every protected
     # identity), clamp (the nearest grid edge), static (omega = 0).
     "sigma_out_of_grid": "cover",
-    "sigma_w_model": "mpa",
     "sigma_w_accuracy": "production",
     # ``sigma_frequency_integration``: how Sigma_c(omega) integrates over W's
     # frequency.  pole_model = the time-domain/pole executor of
@@ -2261,7 +2279,7 @@ def band_extrapolation_is_consumable(modes, *, scalar_mpa: bool = True) -> bool:
     is :func:`mpa_sigma_runs_scalar_executor` of the run's config.
     """
     return any(getattr(m, "ppm_model", None) is not None
-               or (m is ComputeMode.MPA and bool(scalar_mpa)) for m in modes)
+               or (getattr(m, "is_pole_route", False) and bool(scalar_mpa)) for m in modes)
 
 
 def mpa_sigma_runs_scalar_executor(config) -> bool:
@@ -2351,7 +2369,7 @@ def _resolve_cd_inputs(params):
             f"with compute_mode={mode!r}; want: compute_mode=mpa; why: CD is a frequency "
             "integration of the dynamic full-frequency Sigma")
     for key in sorted(named):
-        if key in ("sigma_w_model", "sigma_w_accuracy", "sigma_w_support_sites_ev",
+        if key in ("sigma_w_accuracy", "sigma_w_support_sites_ev",
                    "write_w", "write_poles", "mpa_fit_reuse_file") or key.startswith("mpa_"):
             raise ValueError(
                 f"GATE cd_applicability: {key} got: {params[key]!r} with "
@@ -2456,8 +2474,7 @@ def _resolve_tangential_inputs(params):
     from .tangential_recipe import shared_real_pole_v1_r3b as recipe
 
     named = params[_DECK_NAMED_KEYS]
-    for key, choices in (("sigma_w_model", ("mpa", "tangential")),
-                         ("sigma_w_accuracy", ("production", "relaxed"))):
+    for key, choices in (("sigma_w_accuracy", ("production", "relaxed")),):
         value = str(params[key]).strip().lower()
         if value not in choices:
             raise ValueError(
@@ -2465,12 +2482,12 @@ def _resolve_tangential_inputs(params):
                 f"want: {' | '.join(choices)}; why: unknown W recipe")
         params[key] = value
     mode = str(params["compute_mode"]).strip().lower()
-    model = params["sigma_w_model"]
+    model = sigma_w_model_of(mode)
     for key in ("write_w", "write_poles"):
-        if params[key] and (mode != "mpa" or model != "tangential"):
+        if params[key] and model != "tangential":
             raise ValueError(
-                f"{key}=true requires compute_mode=mpa and "
-                "sigma_w_model=tangential (fixed frequency-bank outputs)")
+                f"{key}=true requires compute_mode=tangential "
+                "(fixed frequency-bank outputs)")
     if (params["write_w"] or params["write_poles"]) and not str(params["wfn_file"]).strip():
         raise ValueError("write_w/write_poles require a nonempty wfn_file source path")
     # DEBUG STATUS, ANNOUNCED AT PARSE TIME.  ``write_w`` is off by default
@@ -2493,21 +2510,16 @@ def _resolve_tangential_inputs(params):
             "  MEASURED cost, Na P16 (claim 2162): 19.44 GiB against the\n"
             "  pole export's 1.22 GiB.  Leave it false for production.\n"
             "  ==========================================================")
-    if "sigma_w_model" in named and mode != "mpa":
-        raise ValueError(
-            f"GATE tangential_applicability: sigma_w_model got: {model!r} "
-            f"with compute_mode={mode!r}; want: compute_mode=mpa; "
-            "why: this key selects the MPA Sigma W representation")
     if "sigma_w_accuracy" in named and model != "tangential":
         raise ValueError(
             "GATE tangential_applicability: sigma_w_accuracy got: "
-            f"{params['sigma_w_accuracy']!r} with sigma_w_model={model!r}; "
-            "want: sigma_w_model=tangential; why: tier has no other consumer")
+            f"{params['sigma_w_accuracy']!r} with compute_mode={mode!r}; "
+            "want: compute_mode=tangential; why: tier has no other consumer")
     if "sigma_w_support_sites_ev" in named and model != "tangential":
         raise ValueError(
             "GATE tangential_applicability: sigma_w_support_sites_ev got: "
-            f"{params['sigma_w_support_sites_ev']!r} with sigma_w_model={model!r}; "
-            "want: sigma_w_model=tangential; why: only the tangential "
+            f"{params['sigma_w_support_sites_ev']!r} with compute_mode={mode!r}; "
+            "want: compute_mode=tangential; why: only the tangential "
             "resolver has support ladders to replace")
     eta = float(params["sigma_regularization_ev"])
     if not (np.isfinite(eta) and eta > 0.0):
@@ -2787,7 +2799,7 @@ def _input_response(
         omega_step_ev=float(params["sigma_omega_step_ev"]),
         regularization_ev=float(params["sigma_regularization_ev"]),
         out_of_grid=str(params["sigma_out_of_grid"]).strip().lower(),
-        w_model=str(params["sigma_w_model"]),
+        w_model=sigma_w_model_of(params["compute_mode"]),
         w_accuracy=str(params["sigma_w_accuracy"]),
         frequency_integration=str(params["sigma_frequency_integration"]),
         cd_imaginary_nodes=int(params["cd_imaginary_nodes"]),
@@ -3661,7 +3673,7 @@ def refuse_unsupported_bgw_metal_q0_treatment(config) -> None:
     if not bool(config.head.uses_bgw_metal_q0shift):
         return
     mode = config.compute_mode
-    if mode is ComputeMode.MPA:
+    if mode.is_pole_route:
         return
     raise ValueError(
         "GATE bgw_q0shift_requires_mpa: "
@@ -3856,7 +3868,7 @@ def uses_coupled_photon_head(config) -> bool:
 def uses_full_bispinor_tangential(config) -> bool:
     """Select the CC/CT/TC/TT frequency-dependent photon sector bank."""
     return (bool(config.bispinor)
-            and config.compute_mode is ComputeMode.MPA
+            and config.compute_mode.is_pole_route
             and config.sigma.w_model == "tangential"
             and config.screening.diagrams is ScreeningDiagrams.W_RPA
             and coerce_bispinor_gw_mode(config.bispinor_gw)
@@ -3866,7 +3878,7 @@ def uses_full_bispinor_tangential(config) -> bool:
 def uses_bare_transverse_tangential(config) -> bool:
     """Select screened four-spinor CC and bare transverse exchange."""
     return (bool(config.bispinor)
-            and config.compute_mode is ComputeMode.MPA
+            and config.compute_mode.is_pole_route
             and config.sigma.w_model == "tangential"
             and config.screening.diagrams is ScreeningDiagrams.W_RPA
             and coerce_bispinor_gw_mode(config.bispinor_gw)
@@ -4034,8 +4046,8 @@ def refuse_unsupported_bispinor_gw(config) -> None:
         if not uses_full_bispinor_tangential(config):
             raise ValueError(
                 "GATE full_tangential_envelope: bispinor_gw=full_tangential "
-                "requires bispinor=true, compute_mode=mpa, "
-                "sigma_w_model=tangential, and screening_diagrams=w_rpa")
+                "requires bispinor=true, compute_mode=tangential, "
+                "and screening_diagrams=w_rpa")
         if (config.qp_solver is QPSolver.SELF_CONSISTENT
                 and config.sc.head_update not in PHOTON_DIRECT_HEAD_UPDATES):
             raise ValueError(
@@ -4809,14 +4821,15 @@ def validate_material_inputs(config, material_class):
                 "metal, and GN-PPM is not allowed for metals (owner ruling "
                 "2026-09-17).\n"
                 "  got:  compute_mode = gn_ppm on fractional WFN occupations\n"
-                "  want: compute_mode = mpa with sigma_w_model = tangential "
-                "(the production metal model; plain mpa stays as the "
-                "comparison)\n"
+                "  want: compute_mode = tangential "
+                "(the production metal model; compute_mode = mpa stays as "
+                "the comparison)\n"
                 "  why:  GN-PPM stays for insulators only; its Sigma driver "
                 "splits bands by a 0/1 step at a derived Fermi level "
                 "(gw.ppm_sigma.assert_gapped_occupations_for_ppm)\n"
                 "  doc:  docs/input_reference.md, compute_mode")
-        if config.compute_mode not in (ComputeMode.MPA, ComputeMode.X_ONLY):
+        if not (config.compute_mode.is_pole_route
+                or config.compute_mode is ComputeMode.X_ONLY):
             raise ValueError(
                 "GATE fractional_occupations_require_mpa: WFN occupations "
                 f"identify a metal, but compute_mode={config.compute_mode.value}; "
@@ -5053,10 +5066,10 @@ class LorraxConfig:
                 "sc_initial_qp_rotations_file seeds a new self-consistent "
                 "Hamiltonian run and requires qp_solver=self_consistent.")
         if self.mpa.fit_reuse_file is not None:
-            if self.compute_mode is not ComputeMode.MPA:
+            if not self.compute_mode.is_pole_route:
                 raise ValueError(
                     "mpa_fit_reuse_file is only meaningful with "
-                    "compute_mode = mpa")
+                    "compute_mode = tangential or mpa")
             if self.qp_solver is not QPSolver.ONE_SHOT_DFT:
                 raise ValueError(
                     "mpa_fit_reuse_file currently supports only "

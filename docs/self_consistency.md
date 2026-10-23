@@ -740,7 +740,7 @@ a symmetry axis.
 
 ## 7 Metals {#7-metals}
 
-- Use `compute_mode = mpa` with `sigma_w_model = tangential`. GN-PPM refuses
+- Use `compute_mode = tangential`. GN-PPM refuses
   metals (`GATE gn_ppm_refuses_metals`): its Σ splits bands by a 0/1 step at
   a derived Fermi level.
 - Occupations are Fermi–Dirac only (`GATE metal_occupations_fermi_dirac`), and

@@ -718,24 +718,21 @@ def _interaction_dataset(filename, kind, nohead):
 
 def refuse_mpa_static_w(filename) -> None:
     """``GATE bse_mpa_w0``: a BSE needs a static W(0), and the multipole-W GW
-    route (``compute_mode = mpa`` with ``sigma_w_model = mpa``) leaves none.
+    route (``compute_mode = mpa``) leaves none.
 
-    The route is the restart's ``gw_compute_mode`` / ``gw_sigma_w_model``
-    file stamps (``gw.gw_output.stamp_w0_route``); the tangential model
-    (``sigma_w_model = tangential``) and a restart written before the stamps
-    pass.  Called by the BSE drivers when they read W, not by the GW restart
-    path.
+    The route is the restart's ``gw_compute_mode`` file stamp
+    (``gw.gw_output.stamp_w0_route``); ``compute_mode = tangential`` and a
+    restart written before the stamp pass.  Called by the BSE drivers when
+    they read W, not by the GW restart path.
     """
     with h5py.File(filename, "r") as f:
-        mode, w_model = (str(np.asarray(f.attrs.get(k, "")).astype(str)).lower()
-                         for k in ("gw_compute_mode", "gw_sigma_w_model"))
-    if mode == "mpa" and w_model == "mpa":
+        mode = str(np.asarray(f.attrs.get("gw_compute_mode", "")).astype(str)).lower()
+    if mode == "mpa":
         raise ValueError(
-            f"GATE bse_mpa_w0: {filename} was written by the MPA route (compute_mode = mpa, "
-            "sigma_w_model = mpa), whose W comes from the pole fit; the BSE needs the static "
-            "W(0) of a static GW run; fix: rerun GW on this deck with compute_mode = cohsex "
-            "(or gn_ppm, hl_ppm) and write_restart_tensors = true, and point the BSE at that "
-            "restart.")
+            f"GATE bse_mpa_w0: {filename} was written by compute_mode = mpa, whose W comes "
+            "from the pole fit; the BSE needs the static W(0) of a static GW run; fix: rerun "
+            "GW on this deck with compute_mode = cohsex (or gn_ppm, hl_ppm) and "
+            "write_restart_tensors = true, and point the BSE at that restart.")
 
 
 def read_interaction(filename, kind, mesh_xy, *, nohead=False):
@@ -4865,7 +4862,7 @@ def require_parent_screening_consumer(config):
     mode = str(getattr(config.compute_mode, "value", config.compute_mode))
     if diagrams == "w_rpa":
         return
-    if diagrams in ("w_bse", "w_rpa_resolvent") and mode != "mpa":
+    if diagrams in ("w_bse", "w_rpa_resolvent") and mode not in ("mpa", "tangential"):
         return
     raise ValueError(
         "GATE parent_screening_diagrams: screening_diagrams = "

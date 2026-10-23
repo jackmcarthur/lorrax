@@ -392,21 +392,17 @@ def _stamp_screening_diagrams(tensors_filename: str, config) -> None:
 
 
 def stamp_w0_route(tensors_filename: str, config) -> None:
-    """Stamp the GW route on the restart file: ``gw_compute_mode`` and
-    ``gw_sigma_w_model`` file attributes, written on every route (including
-    the multipole one, which persists no W0) so the BSE can refuse a W(0) it
-    cannot use (``file_io.restart_bundle.refuse_mpa_static_w``).  Rank 0,
-    h5py metadata write, then a barrier, as the W0 stamps."""
+    """Stamp the GW route on the restart file: the ``gw_compute_mode`` file
+    attribute, written on every route (including ``mpa``, which persists no
+    W0) so the BSE can refuse a W(0) it cannot use
+    (``file_io.restart_bundle.refuse_mpa_static_w``).  Rank 0, h5py metadata
+    write, then a barrier, as the W0 stamps."""
     import h5py
     from common.collectives import barrier, process_rank
     mode = getattr(config, "compute_mode", None)
-    w_model = getattr(getattr(config, "sigma", None), "w_model", None)
-    if process_rank() == 0 and os.path.exists(tensors_filename):
+    if process_rank() == 0 and mode is not None and os.path.exists(tensors_filename):
         with h5py.File(tensors_filename, "a") as f:
-            if mode is not None:
-                f.attrs["gw_compute_mode"] = str(getattr(mode, "value", mode))
-            if w_model is not None:
-                f.attrs["gw_sigma_w_model"] = str(getattr(w_model, "value", w_model))
+            f.attrs["gw_compute_mode"] = str(getattr(mode, "value", mode))
     barrier("restart_w0_route_stamp")
 
 

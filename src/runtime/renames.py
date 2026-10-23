@@ -62,12 +62,14 @@ DECK_KEYS: dict[tuple[str, str], str | Rename] = {
                                  "occupied boundary, not a 0-based band index"),
     ("gw", "wfn_fi_max"): Rename("number_cond_bands_fine", "conduction bands above the "
                                  "occupied boundary, not a 0-based band index"),
+    # 2026-10-22: the tangential W model is its own compute_mode.
+    ("gw", "sigma_w_model"): Rename("compute_mode = tangential",
+                                    "or `compute_mode = mpa` for the elementwise model"),
 }
 
 #: Deck values: {(deck, key, old value): new value or Rename}.  ``key`` is the NEW key.
 DECK_VALUES: dict[tuple[str, str, str], str | Rename] = {
     # 2026-10-21: the shared-pole W model is the tangential W model.
-    ("gw", "sigma_w_model", "shared_pole"): "tangential",
     ("gw", "bispinor_gw", "full_shared_pole"): "full_tangential",
     ("td", "lorrax.collision_screening", "shared_pole"): "tangential",
     # 2026-10-22: srlr is the only coarse -> fine W interpolation.

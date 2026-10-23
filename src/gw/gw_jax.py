@@ -517,7 +517,7 @@ def _prepare_isdf_carriers(
         solve_oneshot_occupations(
             config, wfn, wfns, material_class, mesh_xy=mesh_xy, print_fn=print0)
         if (qp_solver is not QPSolver.SELF_CONSISTENT
-            and mode in (ComputeMode.MPA, ComputeMode.X_ONLY)) else None)
+            and (mode.is_pole_route or mode is ComputeMode.X_ONLY)) else None)
     if oneshot_occupation_state is not None:
         log.info(
             f"  one-shot occupations: fixed-N {oneshot_occupation_state.smearing_family} state, "
@@ -606,7 +606,7 @@ def _prepare_oneshot_response(
             and not packed_photon_replaces_charge_sigma(config)
             and qp_solver is not QPSolver.SELF_CONSISTENT):
         from .qsgw_head import build_dft_head_response, head_quadrature_omegas
-        if mode.value == "mpa":
+        if mode.is_pole_route:
             from .mpa import sample_plan
             if config.sigma.w_model == "tangential":
                 from .tangential_head import tangential_head_plan
@@ -626,7 +626,7 @@ def _prepare_oneshot_response(
                 [complex(r.omega_ry) for r in oneshot_head_requests],
                 dtype=np.complex128)
         reused_mpa_fit_owns_head = (
-            mode is ComputeMode.MPA
+            mode.is_pole_route
             and config.mpa.fit_reuse_file is not None)
         if oneshot_omegas.size and not reused_mpa_fit_owns_head:
             oneshot_head_response = build_dft_head_response(
@@ -846,7 +846,7 @@ def _install_oneshot_head(
     """Install the finalized one-shot head samples in their resolver."""
     if (oneshot_head_response is not None
             and not packed_photon_replaces_charge_sigma(config)):
-        if mode.value == "mpa":
+        if mode.is_pole_route:
             if W_by_role.get("mpa_fit_reused", False):
                 final_head = None
                 log.info(
@@ -891,7 +891,7 @@ def _persist_screening(
                 tensors_filename=tensors_filename, head_resolver=head_resolver,
                 config=config, meta=meta, mesh_xy=mesh_xy,
                 sym=sym, centroid_indices=centroid_indices,
-                static_head_only=mode is ComputeMode.MPA,
+                static_head_only=mode.is_pole_route,
                 print_fn=print0)
 
 
@@ -908,7 +908,7 @@ def _prepare_static_head(config, do_screened, head_resolver, meta, mode,
             with timing.section("gw_jax.static_head"):
                 static_head_terms = _compute_static_head(
                     head_resolver, meta, do_screened,
-                    require_screened=(do_screened and mode is not ComputeMode.MPA
+                    require_screened=(do_screened and not mode.is_pole_route
                                       and qp_solver is not QPSolver.SELF_CONSISTENT),
                     occupation_state=occupation_state)
     return (static_head_terms)
@@ -1610,7 +1610,7 @@ def _report_final_observables(
                        if np.mean(_xc_abs) > 0.0 else np.mean(_odd_abs))
         _odd_prefix = (
             "MPA odd Sigma  "
-            if getattr(config.compute_mode, "value", config.compute_mode) == "mpa"
+            if config.compute_mode.is_pole_route
             else "GN odd Sigma   ")
         _odd_line = (
             f"{_odd_prefix}: measured-broken-TR ordered residue; "

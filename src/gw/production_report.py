@@ -54,7 +54,8 @@ _MODE_METHOD = {
     "cohsex": ("COHSEX", "static COHSEX: screened exchange plus Coulomb hole at omega = 0"),
     "gn_ppm": ("GN-PPM", "Godby-Needs plasmon-pole GW, one pole per element"),
     "hl_ppm": ("HL-PPM", "Hybertsen-Louie plasmon-pole GW"),
-    "mpa": ("MPA", "full-frequency GW, tangential (multipole) model of W"),
+    "mpa": ("MPA", "full-frequency GW, elementwise multipole model of W"),
+    "tangential": ("tangential", "full-frequency GW, tangential model of W"),
 }
 _DIM_EFFECT = {
     3: "3D bulk: no Coulomb truncation",
@@ -137,6 +138,7 @@ def method_rows(config) -> list[tuple[str, str]]:
             "hl_ppm": f"; W at z = 0 and z = {omega_p:.2f} eV for HL-PPM",
             "cohsex": "; W at z = 0",
             "mpa": "; W on the tangential frequency samples",
+            "tangential": "; W on the tangential frequency samples",
         }.get(mode, "")
         rows.append(("screening", screening))
     head = config.head.correction.value
@@ -161,7 +163,7 @@ def method_rows(config) -> list[tuple[str, str]]:
         tol = float(config.degen_avg_tol_ry)
         rows.append(("degenerate sets", f"reported diagonals averaged within "
                                         f"{tol * RYD_TO_EV:.2g} eV"))
-    if mode == "mpa":
+    if mode in ("mpa", "tangential"):
         rows.append(("MPA sampling", f"frequency sampling exponent "
                                      f"{float(config.mpa.sampling_alpha):g}"))
     return rows
@@ -1043,7 +1045,7 @@ class GWProductionReport(ProductionReport):
         key overrides it), for the symmetry block's time-reversal row."""
         allowed = bool(sym.trs_allowed)
         mode = config.compute_mode.value
-        if mode == "mpa":
+        if mode in ("mpa", "tangential"):
             from .mpa.model import chi0_orientation_route
             return "MPA chi0: " + chi0_orientation_route(material_class, trs_allowed=allowed)
         if mode == "gn_ppm":

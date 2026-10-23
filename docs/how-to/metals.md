@@ -15,9 +15,8 @@ page does not restate them.
   QE). Every other smearing family refuses (`GATE metal_occupations_fermi_dirac`).
   The code classifies the material from the `WFN.h5` occupations; no key sets
   it.
-- **W is the tangential model.** `compute_mode = mpa`,
-  `sigma_w_model = tangential`. GN-PPM refuses metals
-  (`GATE gn_ppm_refuses_metals`). Elementwise MPA (`sigma_w_model = mpa`) is a
+- **W is the tangential model.** `compute_mode = tangential`. GN-PPM refuses metals
+  (`GATE gn_ppm_refuses_metals`). Elementwise MPA (`compute_mode = mpa`) is a
   comparison only, and it refuses time-reversal-broken metals
   (`GATE mpa_ordered_metal`).
 - **One band support.** A band is in a χ or Σ branch iff its weight ($f$ or
@@ -77,7 +76,7 @@ fixed-N μ).
 | `occ_broadening > 0` beside `occ_smearing_width_ry` (MP1 smeared head) | `metal_sc_head_update_disabled` |
 | `sc_head_update = parallel_transport` on a `bare_transverse` bispinor deck, or `dft_velocity` with `full` on a bispinor deck | `metal_sc_head_update_disabled` |
 | `sc_head_update = interband_commutator` | `sc_head_interband_commutator_insulator_only` |
-| `sigma_w_model = mpa` on a time-reversal-broken metal | `mpa_ordered_metal` |
+| `compute_mode = mpa` on a time-reversal-broken metal | `mpa_ordered_metal` |
 | a `dipole.h5` written for another window or WFN | `dft_head_dipole_provenance` |
 | a window edge inside a degenerate multiplet | `BandWindowDegeneracyError` |
 | `occupation_window_threshold` | retired |
@@ -102,8 +101,7 @@ bispinor = false
 nval = 10
 ncond = 8
 number_bands = 35
-compute_mode = mpa
-sigma_w_model = tangential
+compute_mode = tangential
 occ_smearing_width_ry = 0.02
 fermi_reference = mp1_fixed_n
 qp_solver = self_consistent

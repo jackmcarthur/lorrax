@@ -45,7 +45,7 @@ load (`wfn_loader.WfnLoader`); use a noncollinear calculation for magnetism.
 | `frequency_dependence 0` (sigma) | `compute_mode = cohsex` | static COHSEX |
 | `frequency_dependence 1` | `compute_mode = hl_ppm` | Hybertsen–Louie plasmon pole |
 | `frequency_dependence 3` | `compute_mode = gn_ppm` | Godby–Needs; probe frequency `ppm_omega_p` (default 2 Ry) |
-| `frequency_dependence 2` | `compute_mode = mpa`, `sigma_w_model = tangential` | full frequency; LORRAX fits W with real poles shared per $q$ ([tangential W](../theory/tangential-w-model.md)) instead of tabulating $\varepsilon^{-1}(\omega)$ |
+| `frequency_dependence 2` | `compute_mode = tangential` | full frequency; LORRAX fits W with real poles shared per $q$ ([tangential W](../theory/tangential-w-model.md)) instead of tabulating $\varepsilon^{-1}(\omega)$ |
 | `number_bands` (epsilon) | `number_bands_chi` | bands in $\chi_0$ |
 | `number_bands` (sigma) | `number_bands_sigma` | bands in the $\Sigma$ sum; `number_bands` sets both |
 | `band_index_min/max`, `diag` | `ncond`, or `number_bands_protected` (the total band count of the request: every occupied band plus conduction bands up to that total) | $\Sigma$ bands are always $[1, n_\mathrm{occ} + $`ncond`$]$; `nval` does not change them ([its roles](../input_reference.md#system)) |

@@ -204,7 +204,7 @@ Invoke: `python -m gw.gw_jax -i gw.in`.
 | key | default | meaning |
 |---|---|---|
 | `number_bands` / `nval` / `ncond` | 100 / 5 / 5 | χ₀ and Σ band-sum top / interior valence edge / Σ conduction count. `number_bands_chi` and `number_bands_sigma` split the two sums |
-| `compute_mode` | `auto` | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `mpa`. `auto` infers from the legacy flags and never selects `mpa`. `gn_ppm` refuses metallic occupations ([input reference](input_reference.md)). Production: `mpa` with `sigma_w_model = tangential` ([production QSGW](how-to/production-qsgw.md)) |
+| `compute_mode` | `auto` | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `tangential` \| `mpa`. `auto` infers from the legacy flags and never selects `tangential` or `mpa`. `gn_ppm` refuses metallic occupations ([input reference](input_reference.md)). Production: `compute_mode = tangential` ([production QSGW](how-to/production-qsgw.md)) |
 | `qp_solver` | `auto` → `one_shot_dft` | `one_shot_dft`: full-matrix effective H with Σ at $E_\mathrm{DFT}$, Hermitian-symmetrized; `self_consistent`: the QSGW loop, Σ read at each map's own energies. No QP equation is solved; `fixed_point` is retired and refuses by name ([self-consistency](self_consistency.md)) |
 | `sigma_omega_grid_debug` | false | debug: Σ_c on the whole ω grid instead of on shell (the `sigma_mnk.h5` Σ(ω) cube, the grid freq-debug table, `qp_omega0_ev`, the ±0.5 eV Z); see [on-shell Σ_c](theory/sigma-on-shell.md#grid-debug). `write_eqp2` and the `eqp2_*` keys are retired and refuse by name |
 | `restart` | false | `true` reuses `tmp/isdf_tensors_<N_mu>.h5` after authentication |

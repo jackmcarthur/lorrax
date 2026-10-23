@@ -237,8 +237,7 @@ qp_solver = one_shot_dft
 """),
     # The tangential file-model path: one-shot with the W bank, the folded
     # head and the pole model exported.
-    "sp_export.in": _restart_deck("spx", """compute_mode = mpa
-sigma_w_model = tangential
+    "sp_export.in": _restart_deck("spx", """compute_mode = tangential
 mpa_n_poles = 2
 qp_solver = one_shot_dft
 sigma_regularization_ev = 0.25
@@ -260,8 +259,7 @@ write_poles = true
 _BISP_COMMON = """bispinor = true
 centroids_file_current = {centroids}
 bispinor_gw = full_tangential
-compute_mode = mpa
-sigma_w_model = tangential
+compute_mode = tangential
 mpa_n_poles = 2
 sigma_regularization_ev = 0.25
 linalg = local
@@ -328,8 +326,7 @@ bispinor = false
 wfn_file = WFN.h5
 kin_ion_file = kin_ion.h5
 restart = false
-compute_mode = mpa
-sigma_w_model = tangential
+compute_mode = tangential
 occ_smearing_width_ry = 0.01
 fermi_reference = mp1_fixed_n
 qp_solver = self_consistent

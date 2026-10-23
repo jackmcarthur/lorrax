@@ -54,7 +54,7 @@ from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from runtime.padding import PaddedAxis
 from .gw_config import (
-    BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel,
+    BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel, coerce_compute_mode,
     band_extrapolation_is_consumable, linalg_resolution,
     mpa_sigma_runs_scalar_executor,
     mode_builds_channels, refuse_explicit_gij,
@@ -1057,7 +1057,7 @@ def _validate_band_checkpoints(config, mode):
         why = "it reads the band-extrapolation sweep; set use_band_extrapolation = true"
     elif bool(config.debug.sigma_omega_grid_debug):
         why = "it keeps on-shell band diagonals; unset sigma_omega_grid_debug"
-    elif getattr(mode, "value", mode) != ComputeMode.MPA.value or not (
+    elif not coerce_compute_mode(mode).is_pole_route or not (
             mpa_sigma_runs_scalar_executor(config)):
         why = ("it is wired into the scalar MPA executor only (compute_mode = mpa, "
                f"scalar or bare_transverse); this stage is {getattr(mode, 'value', mode)}")
@@ -1335,7 +1335,7 @@ def _static_sigma_channels(
         _bispinor_sigma = (
             wfns_transverse is not None and bispinor_v_q_path is not None)
         retain_lorentz = _bispinor_sigma and (
-            mode is not ComputeMode.MPA or config.debug.sigma_lorentz_debug_output)
+            not mode.is_pole_route or config.debug.sigma_lorentz_debug_output)
         # Charge pending input work to its boundary, not to exchange.
         with timing.section("sigma.input_wait"):
             timing.stage_wait(wfns, wfns_transverse, V_q, Gij)
@@ -1885,7 +1885,7 @@ def compute_sigma_xc(
         raise ValueError(
             f"compute_sigma_xc: dynamic mode {mode!r} requires e_qp_ev "
             "(QP energies for the QSGW Σ_c evaluation).")
-    if mode is ComputeMode.MPA:
+    if mode.is_pole_route:
         return _compute_mpa_sigma(
             W_by_role, band_slices, config, e_qp_ev, fixed_quadrature_session, h_transverse,
             input_dir, iteration_head, material_class, mesh_xy, meta, occupation_state, omit_v_h,
