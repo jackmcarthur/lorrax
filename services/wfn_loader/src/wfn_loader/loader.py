@@ -2125,7 +2125,7 @@ class WfnLoader:
         ``k`` is resolved once by :meth:`kvecs`, the same public loader entry point
         whose representatives are paired with :meth:`gvecs`.
         """
-        gvecs = np.asarray(self.gvecs(k=k))                  # (n_k, ngkmax, 3) int
+        gvecs = np.asarray(self.gvecs(k=k, cache=False))     # (n_k, ngkmax, 3) int
         kvecs_np = self.kvecs(k=k)
         # WFN stores bvec in reciprocal-lattice units and blat=2π/alat in
         # bohr⁻¹.  This file-format boundary is the one place the bispinor
