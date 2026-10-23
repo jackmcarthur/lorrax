@@ -282,6 +282,10 @@ not values to enforce by changing inputs.
 
 ![Fully relativistic MoS₂ band structures from LORRAX and BerkeleyGW, with DFT and GW curves on Γ–M–K–Γ.](../assets/figures/tutorial-mos2-soc-bands.png)
 
+Light gray is the QE DFT path from the BerkeleyGW reference, blue is LORRAX GW,
+and orange is BerkeleyGW GW. Each dataset is aligned to its own valence-band
+maximum, so this plot compares dispersions and gaps rather than absolute QP offsets.
+
 ![Fully relativistic MoS₂ interacting and independent-particle absorption spectra from LORRAX and BerkeleyGW.](../assets/figures/tutorial-mos2-soc-absorption.png)
 
 | Quantity (eV) | LORRAX | BerkeleyGW |

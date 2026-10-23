@@ -16,7 +16,7 @@ def bands(path):
 
 fig, ax = plt.subplots(figsize=(5, 5))
 for source, column, color, label in (
-    (Path('bandstructure.dat'), 5, '0.6', 'DFT'),
+    (Path('../../2-fully_rel/3-bs/bandstructure.dat'), 5, '0.8', 'DFT'),
     (Path('bandstructure.dat'), 6, 'tab:blue', 'LORRAX GW'),
     (Path('../../2-fully_rel/3-bs/bandstructure.dat'), 6, 'tab:orange', 'BerkeleyGW GW'),
 ):
