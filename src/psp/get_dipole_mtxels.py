@@ -60,7 +60,7 @@ from common.log import get_logger, message, record
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from common import Meta
 from gw.gw_config import (
-	BispinorGWMode, coerce_bispinor_gw_mode,
+	BispinorGWMode, LorraxConfig, coerce_bispinor_gw_mode,
 	read_lorrax_input as read_cohsex_input,
 	resolve_distrib_la_batched_route,
 	resolve_eigh_backend,
@@ -1025,7 +1025,12 @@ def main(argv=None):
 		# table that the first ``wfn.load(...)`` would immediately build again.
 		sym = wfn.symmetry()
 
-		ncond = int(params.get("ncond", 5))
+		# The same request resolver as GW and kin-ion, including the protected
+		# form and its gates. Resolve before extent, finite-q blocks and stamps.
+		bands = LorraxConfig.from_input_file(
+			str(input_path), print_fn=lambda *_a, **_k: None,
+			resolve_hardware=False).with_band_request(wfn)
+		nval, ncond = int(bands.nval), int(bands.ncond)
 		# Choose target band count: at least nelec+ncond, clipped to file bands; honor user nband if larger
 		try:
 			nband_param = params.get("nband", None)
@@ -1066,7 +1071,6 @@ def main(argv=None):
 			args, wfn, _resolve_dipole_nb_written(wfn, ncond=ncond, nband=nband),
 			parser)
 
-		nval = int(params.get("nval", 5))
 		log.debug("\nCreating system metadata...")
 		meta = Meta.from_system(wfn, sym, nval, ncond, nband, 0, bispinor)
 

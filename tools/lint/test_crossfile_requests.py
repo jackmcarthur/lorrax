@@ -828,14 +828,13 @@ def test_the_head_reader_consumes_the_window_rather_than_mirroring_defaults():
     an invented ``run=5/5/610``, and under ``LORRAX_SANITY=strict`` that
     false warning refuses a correct file.
 
-    So the reader must NOT carry a default at all.  It consumes the run's
-    RESOLVED window and refuses when one is absent; the writer keeps its
-    deck defaults, because resolving a deck is its job.
+    So the reader must NOT carry a default at all. It consumes the run's
+    RESOLVED window and refuses when one is absent. The producer now uses
+    the shared config resolver, including protected-band requests; its
+    actual window/provenance behaviour is covered by the P4 producer gate.
     """
     src_r = _read("gw/head_correction.py")
-    src_w = _read("psp/get_dipole_mtxels.py")
     for frag in ('params.get("nval", 5)', 'params.get("ncond", 5)'):
-        assert frag in src_w, "writer changed: %s" % frag
         assert frag not in src_r, (
             "the head reader re-grew the writer's DEFAULT %s.  A provenance "
             "reference the checker invents cannot fail for the reason it "
