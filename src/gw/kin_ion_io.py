@@ -82,6 +82,7 @@ from common.scientific_output import (
 )
 from wfn_loader import WfnLoader                                    # noqa: E402
 from file_io.kin_ion import write_kin_ion
+from file_io.qe_save_reader import dft_sys_dim
 from gw.gw_config import (
     BispinorGWMode,
     LorraxConfig,
@@ -365,8 +366,6 @@ def main(argv=None):
         wfn_path = _resolve_against(params.get("wfn_file", "WFN.h5"), input_dir)
 
         sys_dim_file = params.get("sys_dim")
-        sys_dim = int(sys_dim_file if sys_dim_file is not None else
-                      (args.sys_dim if args.sys_dim is not None else 3))
 
         log.debug(f"Loading WFN: {os.path.basename(wfn_path)}")
         # The module-top ``initialize_communicator_stack()`` already built and
@@ -378,8 +377,9 @@ def main(argv=None):
         with timing.section("load_wfn"):
             wfn = WfnLoader(wfn_path, mesh=mesh_xy)
             sym = wfn.symmetry()
-        from file_io.qe_save_reader import dft_sys_dim
-        sys_dim = dft_sys_dim(wfn, fallback=sys_dim)
+        sys_dim = dft_sys_dim(
+            wfn, fallback=int(sys_dim_file if sys_dim_file is not None else
+                              (args.sys_dim if args.sys_dim is not None else 3)))
         if args.sys_dim is not None and int(args.sys_dim) != sys_dim:
             raise SystemExit(
                 f"--sys_dim {args.sys_dim} contradicts the DFT boundary sys_dim={sys_dim}; "
@@ -456,7 +456,7 @@ def main(argv=None):
         _report_run_facts(
             report, wfn=wfn, sym=sym, meta=meta, ctx=ctx, bispinor=bispinor,
             sys_dim=sys_dim, sys_dim_source=(
-                "QE XML" if wfn.resolve_qe_symmetry() is not None else
+                "QE" if wfn.resolve_qe_symmetry() is not None else
                 "deck" if sys_dim_file is not None else
                 "cli" if args.sys_dim is not None else "default"),
             nb_eff=nb_eff, nval=nval, nb_window=nb_window, nband=nband)
