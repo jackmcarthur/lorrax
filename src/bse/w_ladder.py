@@ -506,8 +506,8 @@ class WLadderWedge:
     #: the resolvent), so consumers must restore only the omitted macroscopic
     #: v head and must not apply a head/body Schur fold again.
     head_result: object | None = None
-    #: Optional exact response fields. Slopes/reflected values have the wc
-    #: shape; M0..M3 have (nq, mu_pad, mu_pad) and do not carry a z axis.
+    #: Optional materialized exact response fields (None when streamed).
+    #: Slopes/reflected values have the wc shape; M0..M3 have only a q axis.
     response_fields: dict | None = None
 
 
@@ -942,11 +942,11 @@ def compute_wc_qwedge(
     M0/M2 certify vanishing odd-in-z coefficients and M1/M3 feed the model.
     The caller must check these raw fields; none is Hermitized or projected.
     With either flag, ``on_z`` receives a sixth dictionary of face-sharded
-    ``(nq_irr, mu_pad, mu_pad)`` fields. M0/M2 are supplied at the first z
-    only and then released; M1/M3 remain available. Without streaming the
+    ``(nq_irr, mu_pad, mu_pad)`` fields. M0..M3 are supplied at the first z
+    only and then released. Without streaming the
     returned ``response_fields`` carries all requested values (slopes and
-    reflected values have a leading z axis). Streaming retains only moments
-    in the return. Residual/iteration outputs cover every shifted solve.
+    reflected values have a leading z axis). Streaming retains no response
+    matrices in the return. Residual/iteration outputs cover every shifted solve.
     These actions require the full operator, so ``route='auto'`` chooses
     ``plain`` and an explicitly requested ring lift refuses.
 
@@ -1138,8 +1138,7 @@ def compute_wc_qwedge(
             fields.update(moment_fields)
             on_z(iz, z, wc_z, resid[iz], iters[iz], fields)
             if iz == 0:
-                moment_fields.pop("M0", None)
-                moment_fields.pop("M2", None)
+                moment_fields.clear()
         else:
             on_z(iz, z, wc_z, resid[iz], iters[iz])
 
@@ -1175,14 +1174,11 @@ def compute_wc_qwedge(
             stacked.astype(jnp.complex128), wedge_sh)
         _assert_pad_block_is_zero(wc, nlog)
     response_fields = None
-    if with_slope or with_moments:
-        response_fields = dict(moment_fields)
-        if on_z is None:
-            response_fields.update({name: _stack_rows(rows)
-                                    for name, rows in moment_tiles.items()})
-            for name, by_z in response_tiles.items():
-                response_fields[name] = jax.lax.with_sharding_constraint(
-                    jnp.stack([_stack_rows(rows) for rows in by_z], axis=0), wedge_sh)
+    if (with_slope or with_moments) and on_z is None:
+        response_fields = {name: _stack_rows(rows) for name, rows in moment_tiles.items()}
+        for name, by_z in response_tiles.items():
+            response_fields[name] = jax.lax.with_sharding_constraint(
+                jnp.stack([_stack_rows(rows) for rows in by_z], axis=0), wedge_sh)
     head_result = None
     if head_dipole_path is not None:
         head_result = compute_ladder_head(

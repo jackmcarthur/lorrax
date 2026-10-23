@@ -173,3 +173,82 @@ def test_compiled_shared_gmres_actions_against_dense_reference():
             np.testing.assert_allclose(vertex @ np.asarray(action).T,
                 readout @ np.linalg.matrix_power(h, order) @ seed / 2,
                 atol=2e-14, rtol=2e-13)
+
+
+def test_streamed_facade_releases_all_moments_after_first_sample():
+    import __future__
+    import builtins
+    import weakref
+
+    def imports(name, *args, **kwargs):
+        if name == "runtime.padding":
+            return SimpleNamespace(padded_axis=lambda n, *a, **k: SimpleNamespace(carrier=n))
+        return builtins.__import__(name, *args, **kwargs)
+
+    def accumulate(old, tile, start, count, size, _mesh):
+        if old is None:
+            old = np.zeros((size, size), complex)
+        old[:, start:start+count] = tile[:, :count]
+        return old
+
+    def zero_padding(value, logical):
+        assert np.all(value[..., logical:, :] == 0) and np.all(value[..., :, logical:] == 0)
+
+    source = Path(__file__).parents[1] / "src/bse/w_ladder.py"
+    nodes = [node for node in ast.parse(source.read_text()).body
+             if isinstance(node, ast.FunctionDef)
+             and node.name in {"compute_wc_qwedge", "_identity_probe_blocks"}]
+    sym = SimpleNamespace(q_irr_kgrid_int=np.zeros((2, 3), int),
+                          irr_idx_q=np.arange(2), sym_idx_q=np.zeros(2, int),
+                          q_irr_full_idx=np.arange(2))
+    namespace = {"__builtins__": dict(vars(builtins), __import__=imports), "np": np, "jnp": np,
+        "jax": SimpleNamespace(lax=SimpleNamespace(with_sharding_constraint=lambda a, _s: a)),
+        "P": lambda *args: args, "NamedSharding": lambda _mesh, spec: spec,
+        "WLadderWedge": SimpleNamespace,
+        "load_bse_data_from_restart_sharded": lambda *a, **k: {"V_q0": np.zeros((8, 8)), "n_rmu": 7},
+        "_psi_at_rest_2d": lambda data, _mesh: data, "_symmetry_tables": lambda _path: sym,
+        "_accumulate_columns": accumulate, "gather_to_host": lambda a: a,
+        "_assert_pad_block_is_zero": zero_padding}
+    moment_visits = []
+
+    def sweep(_data, _mesh, qrows, zrows, **kwargs):
+        for iz, z in enumerate(zrows):
+            for iq, q in enumerate(qrows):
+                for start, count, probes in kwargs["probe_blocks_for_q"](iq, q):
+                    body = np.zeros((8, 8), complex)
+                    body[:7, :7] = (iq + 1) * (iz + 1)
+                    value = body @ probes.T
+                    fields = {"dWc_ds": 2*value, "Wc_minus_z": value}
+                    if iz == 0:
+                        fields.update({f"M{j}": (j+1)*value for j in range(4)})
+                        moment_visits.append((iq, start))
+                    kwargs["on_result"](iq, q, iz, z, start, count, value,
+                        np.zeros(len(probes)), np.ones(len(probes), int), fields)
+            if kwargs["on_z_done"] is not None:
+                kwargs["on_z_done"](iz, z)
+
+    namespace["sweep_q_wedge"] = sweep
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec",
+                 flags=__future__.annotations.compiler_flag), namespace)
+    prior_moments = []
+    seen = []
+
+    def consume(iz, _z, value, _res, _iters, fields):
+        if iz == 0:
+            prior_moments.extend(weakref.ref(fields[f"M{j}"]) for j in range(4))
+        else:
+            assert all(reference() is None for reference in prior_moments)
+            assert not any(name.startswith("M") for name in fields)
+        seen.append(value.copy())
+
+    kwargs = dict(input_file="unused", gmres_tol=1e-6, gmres_max_iter=300,
+                  probe_chunk=2, with_slope=True, with_moments=True)
+    mesh = SimpleNamespace(devices=np.empty((2, 2)))
+    result = namespace["compute_wc_qwedge"]("unused", [0j, 1j, 2j], mesh,
+                                           on_z=consume, **kwargs)
+    assert result.wc is None and result.response_fields is None
+    assert len(moment_visits) == 2*4
+    materialized = namespace["compute_wc_qwedge"]("unused", [0j, 1j, 2j], mesh, **kwargs)
+    np.testing.assert_array_equal(materialized.wc, np.stack(seen))
+    for name in ("M0", "M1", "M2", "M3"):
+        assert materialized.response_fields[name].shape == (2, 8, 8)
