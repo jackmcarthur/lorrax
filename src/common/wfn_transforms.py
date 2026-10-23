@@ -2192,6 +2192,15 @@ def _centroid_face_kernels(
         psi_rmuT = jax.lax.with_sharding_constraint(psi_rmuT, out_X)
         return psi_rmu, psi_rmuT
 
+    if mu_active_mask is None:
+        # These programs depend only on geometry. Recreating the jit wrapper
+        # would repeat tracing, lowering and persistent-cache reads per call.
+        # Packed masks stay request-local rather than entering a global cache.
+        _reshard_centroid_tile = _cached_jit(
+            'centroid_tile_reshard',
+            (n_rmu, n_rmu_padded, stage_Y_4d, stage_X_4d, out_Y, out_X),
+            lambda: _reshard_centroid_tile)
+
     def _finish_faces(psi_rmu_all, psi_rmuT_all, nk_result):
         # Remove fixed-shape stream/loader pad rows before returning the
         # public logical k and band extents.
@@ -2225,6 +2234,7 @@ def _centroid_stream_kernels(
         nb_accum, nk_accum, nspinor, out_X, out_Y):
     """Produce the existing donated tile-insertion and sampling kernels."""
     from common import timing
+    nk_parent = int(loader.nkpts)
     @partial(jax.jit, out_shardings=(out_Y, out_X))
     def _zero_faces():
         return (
@@ -2240,10 +2250,10 @@ def _centroid_stream_kernels(
     def _zero_parent_faces():
         return (
             jnp.zeros(
-                (int(loader.nkpts), nb_accum, nspinor, n_rmu_padded),
+                (nk_parent, nb_accum, nspinor, n_rmu_padded),
                 dtype=jnp.complex128),
             jnp.zeros(
-                (int(loader.nkpts), n_rmu_padded, nb_accum, nspinor),
+                (nk_parent, n_rmu_padded, nb_accum, nspinor),
                 dtype=jnp.complex128),
         )
 
@@ -2264,6 +2274,18 @@ def _centroid_stream_kernels(
         acc_x = jax.lax.dynamic_update_slice(
             acc_x, tile_x, (k0, zero, b0, zero))
         return acc_y, acc_x
+
+    # Zero programs capture only integer extents and output shardings, never
+    # a loader, Meta, centroid coordinates or a packed active mask.
+    zero_key = (nb_accum, nspinor, n_rmu_padded, out_Y, out_X)
+    _zero_faces = _cached_jit(
+        'centroid_zero_faces', (nk_accum, *zero_key), lambda: _zero_faces)
+    _zero_parent_faces = _cached_jit(
+        'centroid_zero_parent_faces', (nk_parent, *zero_key), lambda: _zero_parent_faces)
+    if getattr(meta, 'mu_basis', None) is None:
+        _insert_tile = _cached_jit(
+            'centroid_insert_tile', (_reshard_centroid_tile, out_Y, out_X),
+            lambda: _insert_tile)
 
     def _sample_and_insert_one(
             acc_y, acc_x, psi_G_one, g_index_one, output_row, b_rel,

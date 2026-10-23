@@ -550,6 +550,13 @@ tile. G-flat coefficients stay band-sharded, while the canonical sparse
 sphere-index table remains replicated metadata. One local FFT still needs
 its complete spatial grid; increasing P does not reduce that one-row floor.
 
+The streaming centroid loader reuses geometry-only zero, reshard and donated
+insertion programs through its existing signature cache. The unmasked keys
+contain extents and shardings; centroid coordinates, WFN/Meta objects and
+device data are not retained. Packed-mask reshards and insertions stay local
+to the request. This avoids repeated tracing, lowering and persistent-cache
+reads on warm calls without retaining sampled faces or request-index tables.
+
 The htransform WS constructor computes only addressable node×node and
 target×node code tiles. It retains no all-site pair matrix or target×target
 table. For local int16 code bytes `C`, host construction holds `O(C)` data
