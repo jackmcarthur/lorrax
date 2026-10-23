@@ -28,7 +28,9 @@ Goals
 Instructions
 ------------
 
-1. Use a built LORRAX checkout with its normal Perlmutter environment. Create
+1. Use a built LORRAX checkout on Perlmutter or Frontier. Source its normal
+   run environment (`config/frontier/gpu_env.sh` on Frontier), which selects
+   the Python environment used for that build. Create
    a new working copy; the destination must not already exist:
 
    ```bash
@@ -65,11 +67,23 @@ Instructions
 
    The LORRAX comparison plots read these reference outputs.
 
-4. Allocate four GPUs, keep `LORRAX` set to your built checkout, and run:
+4. Enter a GPU allocation, keep `LORRAX` set to your built checkout and its
+   Python environment active, and run:
 
    ```bash
    bash 00-run-lorrax.sh
    ```
+
+   The launcher uses the existing site profile to select Perlmutter's four
+   CUDA GPUs or four Frontier GCDs (half a node), with one MPI rank per device.
+   It sources the checkout's normal site environment and uses the same Python
+   for numerical stages, the band-table export and plots. No stage-specific
+   environment exports are needed. See the installation guides for
+   [Perlmutter](https://jackmcarthur.github.io/lorrax/installation/perlmutter/)
+   and [Frontier](https://jackmcarthur.github.io/lorrax/installation/frontier/).
+   The `perlmutter/` QE and BerkeleyGW preparation adapters remain specific to
+   NERSC; on Frontier, supply the same prepared mean-field and reference files
+   using the site's QE/BerkeleyGW installation.
 
    Alternatively, go through [GW](2-gw/3-lorrax_fully_rel/README.md), then
    [BSE](3-bse/3-lorrax_fully_rel/README.md), running the directories and scripts
@@ -86,7 +100,8 @@ Instructions
 6. After both tracks finish, check their outputs:
 
    ```bash
-   "$LORRAX/.venv/bin/python" validate_tutorial.py --tutorial-root . > validation.json
+   source 2-gw/3-lorrax_fully_rel/lorrax_env.sh
+   lorrax_python validate_tutorial.py --tutorial-root . > validation.json
    ```
 
    Inspect `status` in `validation.json`: missing outputs are `PENDING`,

@@ -4,4 +4,4 @@ cd "$(dirname "$0")"
 source ../lorrax_env.sh
 lorrax_run bandstructure.htransform -i ht.in -o bandstructure_dft.lorrax.dat > inteqp_dft.out 2>&1
 lorrax_run bandstructure.htransform -i ht.in --eqp-file eqp_co.dat -o bandstructure_qp.lorrax.dat > inteqp.out 2>&1
-"$LORRAX/.venv/bin/python" 03-export_bandstructure.py
+lorrax_python 03-export_bandstructure.py

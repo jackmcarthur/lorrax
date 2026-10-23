@@ -43,7 +43,8 @@ Instructions
    the interacting and independent-particle spectra:
 
    ```bash
-   "$LORRAX/.venv/bin/python" 02-plot_absorption.py
+   source ../../../2-gw/3-lorrax_fully_rel/lorrax_env.sh
+   lorrax_python 02-plot_absorption.py
    ```
 
    Compare the onset, peak positions and stage timings between the two codes.
