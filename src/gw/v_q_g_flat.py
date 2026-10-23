@@ -1038,11 +1038,12 @@ def _finish_vq_tile(s, *, V_sh, mesh_xy, stack_cols, unfold_isdf_one_leg,
                 sym_idx_q=unfold_sym, sym_perm=sym_perm,
                 L_table=L_table, n_sym_spatial=n_sym_spatial)
 
-    V_qmunu = jax.lax.with_sharding_constraint(V_acc, V_sh)
+    from distrib_la import ensure_sharding
+    V_qmunu = ensure_sharding(V_acc, V_sh)
     if s['write_g0']:
         g0_spec = (P(None, 'x') if int(g0_acc.ndim) == 2
                    else P(None, None, 'x'))
-        return V_qmunu, jax.lax.with_sharding_constraint(
+        return V_qmunu, ensure_sharding(
             g0_acc, NamedSharding(mesh_xy, g0_spec))
     return V_qmunu, None
 
