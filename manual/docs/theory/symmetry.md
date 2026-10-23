@@ -137,8 +137,8 @@ Every consumer reads the one boolean `SymMaps.trs_allowed`; none accepts an over
 | k map | all $2n_t$ rows | QE-typed rows; a WFN reduced by $\bk \leftrightarrow -\bk$ refuses |
 | q axis | $\bq$ and $-\bq$ share one spatial row (§4.3) | $\bq$ and $-\bq$ are independent parents |
 | χ⁰ response store | unordered: $\chi^{\mathsf T}$ and $\chi$ coincide | ordered: the physical orientation |
-| GN-PPM, MPA fits | one residue per pole | a second, odd residue ([PPM](frequency-treatments.md#ppm-odd), [MPA](frequency-treatments.md#mpa-metal)) |
-| `hl_ppm`, elementwise MPA on a metal | run | refuse ([Frequency treatments](frequency-treatments.md#ppm-odd)) |
+| GN-PPM fit | one residue per pole | a second, odd residue ([PPM](frequency-treatments.md#ppm-odd)) |
+| `hl_ppm` | runs | refuses ([Frequency treatments](frequency-treatments.md#ppm-odd)) |
 | `screening_diagrams = w_bse` | runs | refuses (`GATE w_bse_requires_measured_trs`) |
 | `bispinor_gw = full_tangential` | refuses (`GATE full_tangential_trs`) | runs |
 | `head_correction = full`, tangential | runs | runs with the signed Γ body; refuses on a metal ([q → 0 head](q0-head.md)) |
@@ -216,7 +216,7 @@ X_{-S_s\bar{\mathbf p}}(\mu,\nu) = e^{-2\pi i\bar{\mathbf p}\cdot(\mathbf L_{s\m
 G_{\Theta\bk}(\br,\br';t) = \Theta\,G_{\bk}(\br',\br;t)^{\mathsf T}\,\Theta^{-1} \tag{4.2}
 $$
 
-The transpose rule reads a partner $G^{\mathsf T}_{\bar\bk} = \sum_n w_n\,\overline{\psi_n}\,\psi_n^{\mathsf T}$, built from conjugated faces and unconjugated weights; it equals $\overline{G_{\bar\bk}}$ only for real weights. Conjugating instead would send $G(t)$ to $G(-t)$ and flip the sign of $\mathrm{Im}\,\Sigma$, the lifetime. Multipole and tangential residues use the transpose rule; pole positions carry no wrap phase. A rectangular operator between two centroid families (charge × current) uses each family's own $(\alpha,\mathbf L)$ on its endpoint.
+The transpose rule reads a partner $G^{\mathsf T}_{\bar\bk} = \sum_n w_n\,\overline{\psi_n}\,\psi_n^{\mathsf T}$, built from conjugated faces and unconjugated weights; it equals $\overline{G_{\bar\bk}}$ only for real weights. Conjugating instead would send $G(t)$ to $G(-t)$ and flip the sign of $\mathrm{Im}\,\Sigma$, the lifetime. Tangential residues use the transpose rule; pole positions carry no wrap phase. A rectangular operator between two centroid families (charge × current) uses each family's own $(\alpha,\mathbf L)$ on its endpoint.
 
 ### <span class="n">4.3</span> ζ, V and the q axis {: #sym-op-q }
 

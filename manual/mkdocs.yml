@@ -70,6 +70,7 @@ not_in_nav: |
   /drivers/bse/dependencies.md
   /drivers/nscf/dependencies.md
   /drivers/bse/feast.md
+  /theory/multipole-w.md
 
 nav:
   - Home: index.md

@@ -25,7 +25,7 @@ Writes
 :   `eqp0.dat`, `eqp1.dat`, `sigma_diag.dat`, `qp_wfn_rotations.h5`, `WFN_qp.h5`, restart bundle, `gwjax.out`
 
 Σ treatment
-:   tangential model (`compute_mode = mpa`, `sigma_w_model = tangential`) or `gn_ppm`; others for debugging and comparison ([below](#treatment))
+:   tangential model (`compute_mode = tangential`) or `gn_ppm`; others for debugging and comparison ([below](#treatment))
 
 </div>
 
@@ -78,8 +78,7 @@ centroids_file         = centroids_frac_1200.txt  # as centroid.kmeans_cli names
 sys_dim                = 3                        # system dimensionality: required
 number_bands           = 200                      # total bands in the GW calculation, for chi0 and Sigma
 number_bands_protected = 40                       # active bands for Sigma matrix elements, from the lowest valence band
-compute_mode           = mpa
-sigma_w_model          = tangential
+compute_mode           = tangential
 qp_solver              = self_consistent
 sc_tol_ev              = 1e-3
 ```
@@ -90,7 +89,7 @@ Every other key takes its default ([keywords](keywords.md)). Choose `number_band
 
 Two treatments are for production runs: the tangential model, full frequency, for insulators, metals and time-reversal-broken decks; and the Godby–Needs plasmon pole for insulators. The others are kept for debugging and comparison. `qp_solver` is a separate axis. Expand a row for the model, its deck lines and its limits; the derivations are on [Frequency treatments](../../theory/frequency-treatments.md).
 
-???+ treatment production "mpa + tangential · Tangential model · full frequency"
+???+ treatment production "tangential · Tangential model · full frequency"
     One set of real poles $\Omega_{j\bq}$ per irreducible $\bq$, shared by every matrix element, with one factor vector $b_{j\bq}(\mu)$ per pole ([normalisation](../../theory/tangential-w.md#model-form)). The poles come from samples of $W^c$ and $\partial_zW^c$ on a line above the real axis and an imaginary ladder, plus the exact high-frequency moments; nothing is fitted element by element. $\Sigma^c(\omega)$ is evaluated on the real axis at each state's own energy.
 
     $$
@@ -98,12 +97,11 @@ Two treatments are for production runs: the tangential model, full frequency, fo
     $$
 
     ```ini
-    compute_mode  = mpa
-    sigma_w_model = tangential
-    qp_solver     = self_consistent
+    compute_mode = tangential
+    qp_solver    = self_consistent
     ```
 
-    **Note** The production route for insulators, metals and time-reversal-broken decks, with `qp_solver = self_consistent`. `sigma_w_accuracy = relaxed` selects the looser recipe tier. `mpa_pole_batch_size`, `mpa_fit_reuse_file` and `mpa_overwrite_completed_artifacts` refuse here. Full page: [Tangential W model](../../theory/tangential-w.md).
+    **Note** The production route for insulators, metals and time-reversal-broken decks, with `qp_solver = self_consistent`. `sigma_w_accuracy = relaxed` selects the looser recipe tier. Full page: [Tangential W model](../../theory/tangential-w.md).
 
 ??? treatment supported "gn_ppm · Godby–Needs plasmon pole · plasmon pole"
     One real pole per matrix element, fixed by $W^c$ at $z=0$ and at $z=i\omega_p$, $\omega_p=$ `ppm_omega_p` (default 2 Ry). On a time-reversal-broken deck the fit carries a second, odd residue.
@@ -159,19 +157,6 @@ Two treatments are for production runs: the tangential model, full frequency, fo
 
         **Note** Refuses metallic occupations and time-reversal-broken decks.
 
-    ??? treatment supported "mpa · Elementwise multipole · full frequency"
-        $n_p$ complex poles per matrix element (`mpa_n_poles`, default 8), fitted to $W^c$ at $2n_p$ points on two lines above the real axis. The comparison model for the tangential model.
-
-        $$
-        W^c_{\bq}(\mu,\nu;z)=\sum_{j=1}^{n_p}R_{j\bq}(\mu,\nu)\left[\frac{1}{z-\Omega_{j\bq}(\mu,\nu)}-\frac{1}{z+\Omega_{j\bq}(\mu,\nu)}\right]
-        $$
-
-        ```ini
-        compute_mode  = mpa
-        sigma_w_model = mpa
-        ```
-
-        **Note** What `compute_mode = mpa` runs when `sigma_w_model` is not named. Runs on metals; refuses a time-reversal-broken metal.
 
     ??? treatment in-progress "cd · Contour deformation · full frequency"
         The frequency integral rotated onto the imaginary axis, plus the residues of the Green's-function poles the rotation crosses, as in BerkeleyGW and Yambo, on the exact ISDF $W(z)$ with no pole model. A reference for the pole models and for comparisons with other codes; the production full-frequency route is the tangential model. Full page: [Contour deformation](../../theory/contour-deformation.md).
@@ -214,7 +199,7 @@ A refusal names the key or file and the fix. The ones most runs meet are listed 
 !!! refuses "Common"
     - No `sys_dim`. Add `sys_dim = 3` (bulk) or `2` (slab). 
     - An unknown key, or a `;` comment after a value. Delete the key; comments start with `#`. 
-    - Fractional WFN occupations (a metal) with any `compute_mode` but `mpa` or `x_only`, without `occ_smearing_width_ry`, without `fermi_reference = mp1_fixed_n`, or with `sc_head_update = interband_commutator`. 
+    - Fractional WFN occupations (a metal) with `compute_mode = cohsex`, `gn_ppm` or `hl_ppm`, without `occ_smearing_width_ry`, without `fermi_reference = mp1_fixed_n`, or with `sc_head_update = interband_commutator`. 
     - A `kin_ion.h5` that is missing, has too few bands, or was built for another `sys_dim`, spinor count, k-point count or `bispinor` setting, or in the retired format with Hartree folded in. Rerun kin-ion. Its WFN fingerprint is not compared. 
     - A missing `dipole.h5` with the head on, or one built with another velocity operator, with or without the nonlocal commutator. Under `head_correction = full`, also one from another WFN or band window; on the direct-head path that mismatch only warns, unless `LORRAX_SANITY=strict`. Rerun dipole on this deck and WFN. 
     - A centroid table whose fit windows drop an occupied band. Rerun centroids with windows that start at band 0. 
@@ -226,21 +211,19 @@ A refusal names the key or file and the fix. The ones most runs meet are listed 
     - A value outside its range or enum. The message names the accepted values. 
     - Two spellings of one setting that disagree: `nband` and `number_bands`, `number_bands` and a different `number_bands_chi` or `number_bands_sigma`, `use_band_extrapolation` and `sigma_band_extrapolation`, `do_G0` and `head_correction`, `do_screened = false` with a screened `compute_mode`. Keep one. 
     - `number_bands_protected` beside `nval` or `ncond`, or outside [occupied count, `number_bands`]. 
-    - `sigma_w_model` named without `compute_mode = mpa`; `sigma_w_accuracy`, `sigma_w_support_sites_ev`, `write_poles` or `write_w` without `sigma_w_model = tangential`. 
-    - An elementwise MPA key under `sigma_w_model = tangential`: `mpa_pole_batch_size`, `mpa_fit_reuse_file`, `mpa_overwrite_completed_artifacts`, and with the head off every `mpa_*` key. Delete them. 
+    - The retired key `sigma_w_model` (use `compute_mode = tangential`); `sigma_w_accuracy`, `sigma_w_support_sites_ev`, `write_poles` or `write_w` without `compute_mode = tangential`. 
+    - A key of the [other W models](../../theory/multipole-w.md#keywords) under `compute_mode = tangential`, and with the head off every head-fit sampling key. Delete them. 
     - `sigma_regularization_ev` that is not finite and positive. 
     - `screening_diagrams = w_bse | w_rpa_resolvent` outside its supported treatments, on a centroid set that is not orbit-closed, or (`w_bse`) on a time-reversal-broken WFN. 
-    - `sc_initial_qp_rotations_file` without `qp_solver = self_consistent`; `mpa_fit_reuse_file` without `compute_mode = mpa` and `qp_solver = one_shot_dft`. 
+    - `sc_initial_qp_rotations_file` without `qp_solver = self_consistent`. 
     - `sc_head_update` other than `off` with `head_correction = off`; `occ_broadening > 0` outside a QSGW run with a velocity head, or beside `occ_smearing_width_ry`. 
     - `use_band_extrapolation = true` or a bracket scheme named on a run with no dynamic Σ stage; a bracket scheme named with extrapolation off. 
     - `sigma_out_of_grid = clamp | static` without both `sigma_omega_min_ev` and `sigma_omega_max_ev`. 
-    - `bgw_metal_q0_treatment = bgw_q0shift` with `sys_dim = 2`, without `compute_mode = mpa`, or beside an explicit `mc_average_vcoul_body = true`. 
     - `zeta_cutoff` above the density cutoff, `bare_coulomb_cutoff` above `zeta_cutoff`, `zeta_nband` outside $[1,\max(N_\chi,N_\Sigma)]$, or a QP matrix that reaches past the ζ fit's left window. 
     - `number_bands_sigma` below twice the occupied count with band extrapolation on. Raise `number_bands`. 
 
 ??? refuses "Material class"
-    - Integer WFN occupations (an insulator) with `occ_smearing_width_ry`, `fermi_reference = mp1_fixed_n` or `mpa_metal_origin_shift_ry`. Remove the key. 
-    - Elementwise MPA on a time-reversal-broken metal. Use `sigma_w_model = tangential`. 
+    - Integer WFN occupations (an insulator) with `occ_smearing_width_ry`, `fermi_reference = mp1_fixed_n` or the head-fit metal origin shift ([keys](../../theory/multipole-w.md#keywords)). Remove the key. 
     - `hl_ppm` on a time-reversal-broken WFN, or with `ppm_omega_p` at or below the largest $\chi^0$ transition. Raise `ppm_omega_p`, or use `gn_ppm`. 
 
 ??? refuses "During the run"

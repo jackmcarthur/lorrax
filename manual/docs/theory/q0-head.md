@@ -72,10 +72,10 @@ Under `bispinor_gw = full_tangential` an unset `head_correction` resolves to `no
 `qsgw_head.build_dft_head_response`
 {: .in-code }
 
-Three producers return $S$ in the convention of (1.2). One-shot runs with `head_correction = full` build $S$, the wings and the fold from `dipole.h5` on the run's own occupations. The direct resolver serves `no_local_fields`, `x_only` and the exchange head of MPA and self-consistent runs; its source is `wcoul0_source` (default `s_tensor`, which reads `dipole.h5`). QSGW maps rebuild $S$ from the QP-rotated velocity when `sc_head_update` asks for it ([Quasiparticle self-consistency](qsgw.md)).
+Three producers return $S$ in the convention of (1.2). One-shot runs with `head_correction = full` build $S$, the wings and the fold from `dipole.h5` on the run's own occupations. The direct resolver serves `no_local_fields`, `x_only` and the exchange head of self-consistent runs; its source is `wcoul0_source` (default `s_tensor`, which reads `dipole.h5`). QSGW maps rebuild $S$ from the QP-rotated velocity when `sc_head_update` asks for it ([Quasiparticle self-consistency](qsgw.md)).
 
 !!! note
-    `dipole.h5` must exist on every route that reads the direct resolver, including the exchange head of an MPA run, although $\bar v_{00}$ does not depend on $S$. A `dipole.h5` built with another velocity operator, with or without the nonlocal commutator, refuses on every route (`GATE static_head_dipole_operator`, `GATE dft_head_dipole_provenance`). One written for another WFN or band window refuses on the folded `full` head (`GATE dft_head_dipole_provenance`); on the direct resolver it only warns, unless `LORRAX_SANITY=strict`. Rerun the [dipole utility](../utilities/dipole.md).
+    `dipole.h5` must exist on every route that reads the direct resolver. A `dipole.h5` built with another velocity operator, with or without the nonlocal commutator, refuses on every route (`GATE static_head_dipole_operator`, `GATE dft_head_dipole_provenance`). One written for another WFN or band window refuses on the folded `full` head (`GATE dft_head_dipole_provenance`); on the direct resolver it only warns, unless `LORRAX_SANITY=strict`. Rerun the [dipole utility](../utilities/dipole.md).
 
 ## <span class="n">2</span> Mini-BZ cell averages {: #minibz }
 
@@ -150,23 +150,22 @@ The head is sampled on the body's frequency plan. Its samples, its model and the
 | COHSEX | $0$ | static | $0$ |
 | GN-PPM | $0$, $i\omega_p$ | one pole, two-point fit | $0$, $i\omega_p$ |
 | HL-GPP | $0$ | one pole, f-sum rule | $0$, $\omega_p$ |
-| MPA | the body's $2n_p$ complex samples | $n_p$ poles, static sample exact | $0$ |
-| tangential | its own $2n_p$-point MPA plan, the tangential Γ body evaluated there | $n_p$ poles, static sample exact | $0$ |
+| tangential | a $2n_p$-point plan of its own on two lines above the real axis, the tangential Γ body evaluated there | $n_p$ poles, static sample exact | $0$ |
 
-$\omega_p$ is `ppm_omega_p` (default `2.0` Ry) and $n_p$ is `mpa_n_poles` (default `8`). The MPA samples lie on two lines $z_s=\omega_s+i\varpi$ with heights `mpa_varpi_near_ry` and `mpa_varpi_far_ry` (defaults `0.2`, `2.0` Ry). On the elementwise MPA route the head refuses a grid different from the body's, because head and body residues are summed in one Σ. Under `sigma_w_model = tangential` the body has no such grid: the head builds the same double-parallel plan from the `mpa_*` keys on the recipe's energy span, which is why those keys stay legal there while the head is on. The treatments themselves are on [Frequency treatments of Σ](frequency-treatments.md).
+$\omega_p$ is `ppm_omega_p` (default `2.0` Ry) and $n_p$ defaults to `8`. The tangential head's samples lie on two lines $z_s=\omega_s+i\varpi$ with heights `0.2` and `2.0` Ry by default. The tangential body has no frequency grid of its own, so the head builds this double-parallel plan on the recipe's energy span from the head-fit sampling keys ([listed here](multipole-w.md#keywords)), which stay legal under `compute_mode = tangential` while the head is on. The treatments themselves are on [Frequency treatments of Σ](frequency-treatments.md).
 
 ### <span class="n">3.2</span> The fit {: #poles-fit }
 
 `mpa.model.fit_head_samples`
 {: .in-code }
 
-The screened head takes the elementwise multipole form ([Frequency treatments §5.2](frequency-treatments.md#mpa-fit)) with scalar residues and complex poles:
+The screened head takes a scalar pole form with complex poles:
 
 $$
 \bar W_{00}(z)=\bar v_{00}+\sum_jR_j\left[\frac{1}{z-\Omega_j}-\frac{1}{z+\Omega_j}\right],\qquad \mathrm{Im}\,\Omega_j<0 \tag{3.1}
 $$
 
-MPA and tangential runs fit $n_p$ poles to $2n_p$ samples, then re-solve the residues with the sample nearest $z=0$ as an equality constraint, because that sample alone fixes the on-shell head (§4.3). The negative imaginary parts of $\Omega_j$ are the time-ordered $i\eta$; no further broadening is added.
+Tangential runs fit $n_p$ poles to $2n_p$ samples, then re-solve the residues with the sample nearest $z=0$ as an equality constraint, because that sample alone fixes the on-shell head (§4.3). The negative imaginary parts of $\Omega_j$ are the time-ordered $i\eta$; no further broadening is added.
 
 GN-PPM fits one pole to the two samples $0$ and $i\omega_p$. HL-GPP takes its pole from the f-sum rule, with $N_e$ the WFN electron count:
 
@@ -174,7 +173,7 @@ $$
 \Omega_h^2=\frac{\omega_{\mathrm{pl}}^2}{1-\bar W_{00}(0)/\bar v_{00}},\qquad \omega_{\mathrm{pl}}^2=\frac{16\pi N_e}{V_{\mathrm{cell}}},\qquad R_h=-\tfrac12\bar W^c_{00}(0)\,\Omega_h \tag{3.2}
 $$
 
-`ppm_head_omega_h_ry` (unset by default, Ry) fixes $\Omega_h$ for both PPM treatments; $\bar W^c_{00}(0)$ is still computed and sets the residue. MPA does not read it.
+`ppm_head_omega_h_ry` (unset by default, Ry) fixes $\Omega_h$ for both PPM treatments; $\bar W^c_{00}(0)$ is still computed and sets the residue. The tangential head does not read it.
 
 ## <span class="n">4</span> The head in Σ {: #sigma }
 
@@ -216,10 +215,10 @@ $$
 +\sum_jR_j\Big[\frac{1-f_{n\bk}}{\omega-E_{n\bk}-\Omega_j}+\frac{f_{n\bk}}{\omega-E_{n\bk}+\Omega_j}\Big]\Big\},\qquad \mathrm{Im}\,\Omega_j<0 \tag{4.3}
 $$
 
-$\omega$ and $E_{n\bk}$ are measured from $E_F$. On MPA and tangential runs the fitted widths $-\mathrm{Im}\,\Omega_j$ play the role of $\eta$; the plasmon-pole head takes $\Omega_h-10^{-6}i$ Ry. Neither uses `sigma_regularization_ev`, the body's $\eta$. At $\omega=E_{n\bk}$ the correlation part is $(\tfrac12-f_{n\bk})\,\bar W^c_{00}(0)/(V_{\mathrm{cell}}N_k)$ for any pole model, which is why the fit reproduces the static sample exactly. The pole sum is evaluated analytically and added to the Σ body at finalize, outside the body's frequency quadrature.
+$\omega$ and $E_{n\bk}$ are measured from $E_F$. On tangential runs the fitted widths $-\mathrm{Im}\,\Omega_j$ play the role of $\eta$; the plasmon-pole head takes $\Omega_h-10^{-6}i$ Ry. Neither uses `sigma_regularization_ev`, the body's $\eta$. At $\omega=E_{n\bk}$ the correlation part is $(\tfrac12-f_{n\bk})\,\bar W^c_{00}(0)/(V_{\mathrm{cell}}N_k)$ for any pole model, which is why the fit reproduces the static sample exactly. The pole sum is evaluated analytically and added to the Σ body at finalize, outside the body's frequency quadrature.
 
 !!! note
-    The code's MPA residue `B_p` is $R_j$. Its PPM `R_h` is the residue $R_h$ of (3.2), and its `B_h` is $2\Omega_hR_h=-\bar W^c_{00}(0)\,\Omega_h^2$.
+    The code's head-fit residue `B_p` is $R_j$. Its PPM `R_h` is the residue $R_h$ of (3.2), and its `B_h` is $2\Omega_hR_h=-\bar W^c_{00}(0)\,\Omega_h^2$.
 
 ### <span class="n">4.4</span> Static COHSEX head {: #sigma-cohsex }
 
@@ -262,11 +261,11 @@ V_\Gamma(\mu,\nu)\mathrel{+}=\frac{\bar v_{00}}{V_{\mathrm{cell}}}\,g^*_0(\mu)\,
 W_\Gamma(\mu,\nu;0)\mathrel{+}=\frac{\bar W_{00}(0)}{V_{\mathrm{cell}}}\,g^*_0(\mu)\,g_0(\nu) \tag{5.1}
 $$
 
-$V^{\mathrm{head}}$ is always added. The screened head is added only when a screened $W_0$ was loaded, and on MPA runs it is the static $\bar W_{00}(0)$ only. The BSE kernel, its densified grids (`w_head_densify`, default `c1`, which reattaches the head inside the coarse Γ cell from `S_cart_head`) and the exciton-band LT tensor are on the [BSE theory](../drivers/bse/theory.md) and [exciton-bands theory](../drivers/exciton-bands/theory.md) pages.
+$V^{\mathrm{head}}$ is always added. The screened head is added only when a screened $W_0$ was loaded. The BSE kernel, its densified grids (`w_head_densify`, default `c1`, which reattaches the head inside the coarse Γ cell from `S_cart_head`) and the exciton-band LT tensor are on the [BSE theory](../drivers/bse/theory.md) and [exciton-bands theory](../drivers/exciton-bands/theory.md) pages.
 
 ## <span class="n">6</span> Imposed heads and BerkeleyGW {: #bgw }
 
-BerkeleyGW computes $\varepsilon^{-1}$ at a small shifted $\bq_0$ and combines its head with the mini-BZ average of $v$. LORRAX has no $\bq_0$ calculation; three keys reproduce or impose the BerkeleyGW head for cross-code checks.
+BerkeleyGW computes $\varepsilon^{-1}$ at a small shifted $\bq_0$ and combines its head with the mini-BZ average of $v$. LORRAX has no $\bq_0$ calculation; a few keys reproduce or impose the BerkeleyGW head for cross-code checks.
 {: .intro }
 
 ### <span class="n">6.1</span> Imposed head values {: #bgw-impose }
@@ -280,13 +279,9 @@ $$
 \bar v_{00}\;\leftrightarrow\;\texttt{vcoul}(\bq_0),\qquad \bar W_{00}(0)\;\leftrightarrow\;\bar v_{00}\,\varepsilon^{-1}_{00}(\bq_0,0) \tag{6.1}
 $$
 
-where `vcoul`($\bq_0$) is row 1 of BerkeleyGW's sigma-side table. An override applies only when the $W$ value for that frequency is also set. A GN deck that overrides the static head without `whead_imfreq` fits one computed and one imposed sample and logs `[head] MIXED HEAD`. `vhead` takes precedence over the restart value in the BSE. Multipoint QSGW-MPA heads refuse overrides.
+where `vcoul`($\bq_0$) is row 1 of BerkeleyGW's sigma-side table. An override applies only when the $W$ value for that frequency is also set. A GN deck that overrides the static head without `whead_imfreq` fits one computed and one imposed sample and logs `[head] MIXED HEAD`. `vhead` takes precedence over the restart value in the BSE.
 
-### <span class="n">6.2</span> BerkeleyGW's q₀ emulation {: #bgw-q0 }
-
-`bgw_metal_q0_treatment = bgw_q0shift` (default `exact`) takes $\bar v_{00}$ from the analytic inscribed sphere plus the outer Monte Carlo estimator, and the $W$ head from a finite shifted-$\bq_0$ Dyson row at `bgw_metal_q0_vector` (default `0 0 0.125`, reduced coordinates; nonzero and on the k grid). It requires `compute_mode = mpa` and `sys_dim = 3`, sets `mc_average_vcoul_body = false`, and the tangential head refuses it.
-
-### <span class="n">6.3</span> The epshead source {: #bgw-epshead }
+### <span class="n">6.2</span> The epshead source {: #bgw-epshead }
 
 `wcoul0_source = epshead` replaces the direct head sample by an isotropic model fitted to BerkeleyGW's $\varepsilon^{-1}_{00}(\bq_0,0)$ from `eps0mat.h5`. It is static and reuses $\omega=0$ at every frequency. It serves only the direct resolver (§1.4); the folded head of a `full` run is built from `dipole.h5` regardless. A missing file refuses.
 

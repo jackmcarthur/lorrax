@@ -168,7 +168,7 @@ $\chi^0$ and $\Sigma^c$ are evaluated as sums over time nodes ([Time–frequency
 `gw.w_isdf._get_chi_minimax_kernel_fused`
 {: .in-code }
 
-On the fixed-rule routes (static, plasmon-pole and elementwise-MPA screening) with step occupations, the node loop is one `lax.scan` inside one compiled program; finite occupations take a contour kernel with the same node structure ([metals](metals.md)). Per node $t_\ell$: the occupied and empty Green's functions at the raw parents, one band GEMM each; one fused k-convolution that unfolds both, transforms them to $\bR$, traces the spin indices of their product and adds it to every output frequency $z_o$:
+On the fixed-rule routes (static and plasmon-pole screening) with step occupations, the node loop is one `lax.scan` inside one compiled program; finite occupations take a contour kernel with the same node structure ([metals](metals.md)). Per node $t_\ell$: the occupied and empty Green's functions at the raw parents, one band GEMM each; one fused k-convolution that unfolds both, transforms them to $\bR$, traces the spin indices of their product and adds it to every output frequency $z_o$:
 
 $$
 \chi^0_\bR(\br_\mu,\br_\nu;z_o) \mathrel{+}= \alpha_{\ell o}\,\chi^0_\bR(\br_\mu,\br_\nu;t_\ell), \qquad o = 1,\dots,n_{\mathrm{out}} \tag{4.1}

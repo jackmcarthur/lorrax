@@ -273,7 +273,7 @@ W^c_\bq(\mu,\nu;\pm t_\ell)&=-i\sum_{j\in P}b_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\,e^{-
 \end{aligned} \tag{6.1}
 $$
 
-with the upper sign for $G^>$ windows and the lower for $G^<$. The synthesis costs $\mathcal O(N_\mu^2|P|)$ per node, while the Fourier transforms and the product with $G$ are paid once per node whatever the number of poles. The [elementwise multipole route](frequency-treatments.md#multipole) instead repeats the whole node once per batch of poles.
+with the upper sign for $G^>$ windows and the lower for $G^<$. The synthesis costs $\mathcal O(N_\mu^2|P|)$ per node, while the Fourier transforms and the product with $G$ are paid once per node whatever the number of poles.
 
 <figure class="flowchart" markdown>
 [![The tangential W model in the self-energy](../assets/figures/g9b.png)](../assets/figures/g9b.png)
@@ -481,19 +481,18 @@ The keys below change what this page computes, and full entries are on the [GW i
 `gw.tangential_screening.screen_tangential_poles`
 {: .in-code }
 
-Until 2026-10-21 the deck value was `shared_pole`; that spelling is still accepted, with a note in the log. The production route needs both lines in the deck, because `sigma_w_model` defaults to `mpa` (the elementwise fit) and `compute_mode = auto` never selects `mpa`.
+Since 2026-10-22 the model is its own `compute_mode` value. The key that used to select it, `sigma_w_model = tangential` (`shared_pole` before 2026-10-21), is retired and refuses. `compute_mode = auto` never selects the model, so the production deck names it:
 
 ```ini
-compute_mode  = mpa
-sigma_w_model = tangential
+compute_mode = tangential
 ```
 
 <span class="status production">Production</span> for insulators, metals and time-reversal-broken decks. The other treatments and the comparison table are on [Frequency treatments](frequency-treatments.md#compare).
 
 !!! refuses
-    - `sigma_w_model` named with `compute_mode` other than `mpa` (`GATE tangential_applicability`). Set `compute_mode = mpa`.
-    - `sigma_w_accuracy` or `sigma_w_support_sites_ev` named without `sigma_w_model = tangential` (`GATE tangential_applicability`).
-    - `mpa_pole_batch_size`, `mpa_fit_reuse_file` or `mpa_overwrite_completed_artifacts` under `tangential`, and with `head_correction = off` also every MPA sampling key (`GATE tangential_unused_inputs`). Remove them.
+    - The retired key `sigma_w_model`. Use `compute_mode = tangential`.
+    - `sigma_w_accuracy` or `sigma_w_support_sites_ev` named without `compute_mode = tangential` (`GATE tangential_applicability`).
+    - Keys of the [other W models](multipole-w.md#keywords) that this route does not read, and with `head_correction = off` also the head-fit sampling keys (`GATE tangential_unused_inputs`). Remove them.
     - `sigma_regularization_ev` not finite and positive (`GATE sigma_regularization`).
 
 ### <span class="n">8.2</span> The static member and other readers {: #sig-static }
@@ -507,8 +506,7 @@ The synthesis of (6.1) with the weight $-1/\Omega_j$ in place of the time factor
 
 | Key | Default | Role here |
 |---|---|---|
-| [`compute_mode`](../drivers/gw/keywords.md#compute_mode) | `auto` | Must be `mpa`; `auto` never selects it. |
-| [`sigma_w_model`](../drivers/gw/keywords.md#sigma_w_model) | `mpa` | `tangential` selects this model. |
+| [`compute_mode`](../drivers/gw/keywords.md#compute_mode) | `auto` | `tangential` selects this model; `auto` never selects it. |
 | [`sigma_w_accuracy`](../drivers/gw/keywords.md#sigma_w_accuracy) | `production` | Recipe tier, which sets every constant of §[8.4](#keys-recipe). `relaxed` also defaults an omitted `sigma_quadrature_eps` to `5e-4`. |
 | [`sigma_regularization_ev`](../drivers/gw/keywords.md#sigma_regularization_ev) | `0.25` | $\eta$, which sets $h=\max(2.6\ \mathrm{eV},4\eta)$, $u_{\min}=\max(E_g,4\eta)$ and the width of $g$. |
 | [`sigma_w_support_sites_ev`](../drivers/gw/keywords.md#sigma_w_support_sites_ev) | empty | Explicit line and imaginary sites and an optional height (§[7.3](#sup-held)). Debug. |
@@ -523,7 +521,7 @@ The synthesis of (6.1) with the weight $-1/\Omega_j$ in place of the time factor
 | [`write_w`](../drivers/gw/keywords.md#write_w) | `false` | Dumps the whole sample bank to `tmp/mpa/<label>_w.h5`. Debug. |
 | [`write_restart_tensors`](../drivers/gw/keywords.md#write_restart_tensors) | `true` | Stores `W0_qmunu` (§[8.2](#sig-static)) and registers a one-shot `model.h5` as a restart member. |
 | [`restart`](../drivers/gw/keywords.md#restart_1) | `false` | One-shot: reuses a restart member of the same identity and skips bank, moments and construction. SC maps rebuild. |
-| [`head_correction`](../drivers/gw/keywords.md#head_correction) | `full` | Γ head on the tangential body, which folds the signed body on a time-reversal-broken store. With the head on, the MPA sampling keys configure the head fit. |
+| [`head_correction`](../drivers/gw/keywords.md#head_correction) | `full` | Γ head on the tangential body, which folds the signed body on a time-reversal-broken store. With the head on, the head-fit sampling keys ([list](multipole-w.md#keywords)) configure the head fit. |
 | [`qp_solver`](../drivers/gw/keywords.md#qp_solver) | `auto` | `self_consistent` rebuilds the model every map (§[7.11](#bank-sc)). |
 | [`bispinor_gw`](../drivers/gw/keywords.md#bispinor_gw) | `bare_transverse` | `full_tangential` builds charge, current and cross sector models from one photon bank, not covered here. |
 | [`linalg`](../drivers/gw/keywords.md#linalg), [`memory_per_device_gb`](../drivers/gw/keywords.md#memory_per_device_gb) | `local`, `0.0` | Execution route and residence of bank and model, with no effect on the model. |

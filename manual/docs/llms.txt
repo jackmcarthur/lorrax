@@ -55,6 +55,7 @@
 - [Theory](https://jackmcarthur.github.io/lorrax/drivers/exciton-bands/theory/): manual/docs/drivers/exciton-bands/theory.md
 - [Dependencies](https://jackmcarthur.github.io/lorrax/drivers/gw/dependencies/): manual/docs/drivers/gw/dependencies.md
 - [Dependencies](https://jackmcarthur.github.io/lorrax/drivers/nscf/dependencies/): manual/docs/drivers/nscf/dependencies.md
+- [The multipole W model](https://jackmcarthur.github.io/lorrax/theory/multipole-w/): manual/docs/theory/multipole-w.md
 - [Orbital magnetization](https://jackmcarthur.github.io/lorrax/theory/orbital-magnetization/): manual/docs/theory/orbital-magnetization.md
 - [Parallel algorithms](https://jackmcarthur.github.io/lorrax/theory/parallel-algorithms/): manual/docs/theory/parallel-algorithms.md
 - [Downfold utility](https://jackmcarthur.github.io/lorrax/utilities/downfold/): manual/docs/utilities/downfold.md

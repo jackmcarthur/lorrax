@@ -117,8 +117,7 @@ sys_dim        = 3                        # 3 bulk, 2 slab; required
 nval           = 4                        # valence bands in the QP window
 ncond          = 8                        # conduction bands in the QP window
 number_bands   = 60                       # top of the chi0 and Sigma band sums
-compute_mode   = mpa
-sigma_w_model  = tangential
+compute_mode   = tangential
 qp_solver      = one_shot_dft
 ```
 
@@ -181,7 +180,7 @@ $RUN bse.absorption_haydock -i gw.in
 ## Next {: #next }
 
 - Self-consistent GW: set `qp_solver = self_consistent` and rerun step 4 ([QSGW](../theory/qsgw.md)).
-- Metals: `compute_mode = mpa` with `occ_smearing_width_ry` ([Metals](../theory/metals.md)).
+- Metals: `compute_mode = tangential` with `occ_smearing_width_ry` ([Metals](../theory/metals.md)).
 - QP band structures: [`htransform`](../utilities/htransform.md) with a `K_POINTS crystal_b` block in the deck.
 - Exciton dispersion: [`exciton-bands`](../drivers/exciton-bands/index.md).
 

@@ -40,7 +40,7 @@ $\Sigma^x$ sums over occupied bands only and has no empty-band tail. The $\chi^0
 `band_extrapolation_is_consumable`
 {: .in-code }
 
-The pole-sum Σ executors consume it: `gn_ppm`, `hl_ppm` and scalar `mpa` (elementwise or tangential), and both bispinor tangential routes, where only the charge–charge class of $\Sigma^c$ is extrapolated. Static stages (`cohsex`, `x_only`) and a bispinor MPA fit do not: on a static Coulomb hole the band limit anti-converges. An unset key disables itself there with a log line; an explicit `use_band_extrapolation = true` refuses unless another stage of the run consumes it.
+The pole-sum Σ executors consume it: `gn_ppm`, `hl_ppm` and scalar `tangential`, and both bispinor tangential routes, where only the charge–charge class of $\Sigma^c$ is extrapolated. Static stages (`cohsex`, `x_only`) do not: on a static Coulomb hole the band limit anti-converges. An unset key disables itself there with a log line; an explicit `use_band_extrapolation = true` refuses unless another stage of the run consumes it.
 
 ### <span class="n">1.4</span> Other corrections of the same truncation {: #trunc-compare }
 

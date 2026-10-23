@@ -70,7 +70,7 @@ In a one-shot run $\chi^0$ is built from the mean-field states; in QSGW from the
 |---|---|---|---|
 | $\Gamma = 1$ (GW) | Σ and $\chi^0$ | — | this page |
 | RPA, $\chi^0$ of independent particles | $W$ | — | this page |
-| Frequency model of $W^c$ | Σ | `compute_mode`, `sigma_w_model` | [frequency treatments](frequency-treatments.md) |
+| Frequency model of $W^c$ | Σ | `compute_mode` | [frequency treatments](frequency-treatments.md) |
 | Static Hermitian Σ in $H$ | QP Hamiltonian | `qp_solver` | [QSGW](qsgw.md) |
 | Σ read at mean-field energies (one-shot) | QP Hamiltonian | `qp_solver = one_shot_dft` | [QSGW](qsgw.md) |
 | Finite band sum of $G$ in $\Sigma^c$, extrapolated | Σ | `use_band_extrapolation` | [band extrapolation](band-extrapolation.md) |

@@ -84,13 +84,13 @@ In real time the two terms are the retarded product $-i\,G^>_\bR(\br_\mu,\br_\nu
 `mpa.sampling`
 {: .in-code }
 
-The metal plan is the insulating two-line plan with the near line's first point moved from $z=0$ to:
+The metal plan is the insulating two-line plan of the head fit ([The q → 0 head §3.1](q0-head.md#poles-samples)) with the near line's first point moved from $z=0$ to:
 
 $$
 z_0=i\varpi_0,\qquad \varpi_0=2\times10^{-5}\ \mathrm{Ry} \tag{2.2}
 $$
 
-$\varpi_0$ is `mpa_metal_origin_shift_ry` (unset: $2\times10^{-5}$ Ry; refused on an insulator). It is a displacement off the zero-energy intraband transitions, not a broadening. `mpa_sampling_alpha` defaults to 2 on a metal and 1 on an insulator, concentrating the samples near zero. The rule bandwidth is $\max_{\mathrm{supp}(1-f)}E-\min_{\mathrm{supp}\,f}E$ over the supports of §1.3.
+$\varpi_0$ is set by one of the head-fit sampling keys ([listed here](multipole-w.md#keywords); unset: $2\times10^{-5}$ Ry; refused on an insulator). It is a displacement off the zero-energy intraband transitions, not a broadening. The grading exponent of the sampling defaults to 2 on a metal and 1 on an insulator, concentrating the samples near zero. The rule bandwidth is $\max_{\mathrm{supp}(1-f)}E-\min_{\mathrm{supp}\,f}E$ over the supports of §1.3.
 
 ### <span class="n">2.3</span> The origin and static rows {: #resp-origin }
 
@@ -157,7 +157,7 @@ A folded head (`head_correction = full`) uses the folded $S(0)$ and the static f
 
 ### <span class="n">3.4</span> Head routes on a metal {: #head-routes }
 
-The metallic head is bulk only: a `sys_dim = 2` metal refuses in the cell average. Both `head_correction = no_local_fields` (the direct head) and `full` (scalar decks) are admitted; a time-reversal-broken metal refuses `full` on the tangential route (`GATE tangential_head_ordered`): its static $z=0$ slot is not certified without time reversal. Every metallic head, including the frozen DFT head of `sc_head_update = off`, uses the fixed-N Fermi–Dirac state of §1. On a self-consistent run the per-map heads `dft_velocity` and `parallel_transport` require `sigma_w_model = tangential`.
+The metallic head is bulk only: a `sys_dim = 2` metal refuses in the cell average. Both `head_correction = no_local_fields` (the direct head) and `full` (scalar decks) are admitted; a time-reversal-broken metal refuses `full` on the tangential route (`GATE tangential_head_ordered`): its static $z=0$ slot is not certified without time reversal. Every metallic head, including the frozen DFT head of `sc_head_update = off`, uses the fixed-N Fermi–Dirac state of §1. On a self-consistent run the per-map heads `dft_velocity` and `parallel_transport` require `compute_mode = tangential`.
 
 ## <span class="n">4</span> Screening and Σ on a metal {: #sigma }
 
@@ -166,7 +166,7 @@ The production metal model is the tangential $W$ with occupation-weighted Σ bra
 
 ### <span class="n">4.1</span> The metal model of W {: #sigma-w }
 
-A metal deck sets `compute_mode = mpa` and `sigma_w_model = tangential`. The default `sigma_w_model` is `mpa` (elementwise poles), which on a metal is a comparison route and refuses when time reversal is measured broken (`GATE mpa_ordered_metal`). The tangential bank carries the signed metallic weights through its occupation envelope ([Tangential W model §6.3](tangential-w.md#bank-accuracy)). The scalar head is fitted on the metal MPA plan of §2.2: the body's own grid on elementwise MPA, a plan of its own with the tangential Γ body evaluated on it under `tangential` ([The q → 0 head §3.1](q0-head.md#poles-samples)).
+A metal deck sets `compute_mode = tangential`. The tangential bank carries the signed metallic weights through its occupation envelope ([Tangential W model §6.3](tangential-w.md#bank-accuracy)). The scalar head is fitted on the metal plan of §2.2, with the tangential Γ body evaluated on it ([The q → 0 head §3.1](q0-head.md#poles-samples)).
 
 ### <span class="n">4.2</span> Occupation-weighted Σ branches {: #sigma-branches }
 
@@ -205,8 +205,7 @@ Treatments and routes that assume a gap or integer occupations refuse a metallic
 | Route | On a metal | Gate |
 |---|---|---|
 | `compute_mode = x_only` | runs | — |
-| `compute_mode = mpa`, `sigma_w_model = tangential` | production | — |
-| `compute_mode = mpa`, `sigma_w_model = mpa` | runs if time reversal holds | `mpa_ordered_metal` |
+| `compute_mode = tangential` | production | — |
 | `compute_mode = gn_ppm` | refuses | `gn_ppm_refuses_metals` |
 | `compute_mode = cohsex`, `hl_ppm` | refuses | `fractional_occupations_require_mpa` |
 | `screening_diagrams = w_bse`, `w_rpa_resolvent` | refuses | `w_bse_insulators_only`, `w_rpa_resolvent_insulators_only` |
@@ -221,7 +220,7 @@ Treatments and routes that assume a gap or integer occupations refuse a metallic
     - `occ_broadening > 0` beside `occ_smearing_width_ry`.
     - `sys_dim = 2`: the metallic head is bulk only.
     - `head_correction = full` on a time-reversal-broken metal, tangential route. Use `no_local_fields`.
-    - A per-map velocity head (`dft_velocity`, `parallel_transport`) without `sigma_w_model = tangential`, or on a route with no metallic completion.
+    - A per-map velocity head (`dft_velocity`, `parallel_transport`) without `compute_mode = tangential`, or on a route with no metallic completion.
     - A `dipole.h5` built with another velocity operator, on every head route; one written for another WFN or band window, on the folded `full` head (`GATE dft_head_dipole_provenance`; the direct head only warns unless `LORRAX_SANITY=strict`, [The q → 0 head §1.4](q0-head.md#sources)). Rerun the [dipole utility](../utilities/dipole.md) after fixing the window.
 
 ## Notation {: #notation }

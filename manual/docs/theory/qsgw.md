@@ -212,7 +212,7 @@ Each map writes these lines to `gwjax.out`; none of them but the verdict decides
 | `fixed point NOT UNIQUE` | Only with `sigma_out_of_grid = static`: states within the jump $\Sigma(E)\to\Sigma(0)$ of a range edge have two fixed points, and the path picks one. Use `cover`. |
 | `SC NOT CONVERGED` | Printed before the refusal: median $\lvert\Delta E\rvert$, then the bands with a state moving more than 20 meV, and by at least `sc_tol_ev`. |
 
-A loop that stalls usually has one of three causes. Empty states far above $E_F$ on a metal, where $\mathrm{Re}\,\Sigma^c$ rises on shell, have $Z>1$ and a local gain near 1: end the QP matrix below them. The elementwise fit (`sigma_w_model = mpa`) is not identifiable from its 16 samples, so $\Sigma^c$ jumps by 10–20 meV between maps (map gain 14–18 on Si at 24 bands and 192 centroids): use the tangential model. Bands just below $b_3$ can stall at 5 meV to 0.12 eV while the states within ±10 eV of midgap are stable (Si 4³ SOC, $b_3\ge32$). A stalled run leaves `sc_seed/` to restart from (§7.2).
+A loop that stalls usually has one of two causes. Empty states far above $E_F$ on a metal, where $\mathrm{Re}\,\Sigma^c$ rises on shell, have $Z>1$ and a local gain near 1: end the QP matrix below them. Bands just below $b_3$ can stall at 5 meV to 0.12 eV while the states within ±10 eV of midgap are stable (Si 4³ SOC, $b_3\ge32$). A stalled run leaves `sc_seed/` to restart from (§7.2).
 
 ## <span class="n">6</span> One-shot as the special case {: #one-shot }
 

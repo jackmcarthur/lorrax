@@ -47,7 +47,7 @@ LORRAX computes quasiparticle energies $E^{\mathrm{QP}}_{n\bk}$ in the GW approx
 | Page | Covers |
 |---|---|
 | [Physics overview](theory/physics.md) | The equations LORRAX evaluates, from $G$ to $W$ to Σ to the BSE |
-| [Frequency treatments of Σ](theory/frequency-treatments.md) | `x_only`, `cohsex`, `gn_ppm`, `hl_ppm`, `mpa` |
+| [Frequency treatments of Σ](theory/frequency-treatments.md) | `x_only`, `cohsex`, `gn_ppm`, `hl_ppm`, `tangential` |
 | [Time–frequency transforms](theory/time-frequency.md) | The frequency convolutions of χ⁰ and Σ as sums over time nodes: sampling, minimax rules and the windows of Σ |
 | [Tangential W model](theory/tangential-w.md) | $W^c$ as one set of poles shared by every matrix element |
 | [The q → 0 head](theory/q0-head.md) | The singular head of $V$ and $W$ as a mini-BZ cell average with local fields, from the velocity matrix elements |

@@ -71,7 +71,7 @@ BerkeleyGW builds the full zone from the WFN's k list with the rotation matrices
 | `frequency_dependence` | [`compute_mode`](../drivers/gw/keywords.md#compute_mode) | One key for screening and $\Sigma$; values in the [sigma.inp](#sigma) table. |
 | `imaginary_frequency` (eV, default 2 Ry) | [`ppm_omega_p`](../drivers/gw/keywords.md#ppm_omega_p) (Ry, default `2.0`) | The GN probe $i\omega_p$. |
 | `broadening` | [`sigma_regularization_ev`](../drivers/gw/keywords.md#sigma_regularization_ev) | $\chi^0$ is evaluated at complex $z$ without broadening; η enters once, in $\Sigma$ (default 0.25 eV). |
-| `frequency_dependence_method`, `init_frequency`, `delta_frequency`, `delta_frequency_step`, `frequency_low_cutoff`, `frequency_high_cutoff`, `number_imaginary_freqs`, `plasma_freq` | none | Tangential supports follow [`sigma_w_accuracy`](../drivers/gw/keywords.md#sigma_w_accuracy); the elementwise MPA samples follow the `mpa_*` keys. |
+| `frequency_dependence_method`, `init_frequency`, `delta_frequency`, `delta_frequency_step`, `frequency_low_cutoff`, `frequency_high_cutoff`, `number_imaginary_freqs`, `plasma_freq` | none | Tangential supports follow [`sigma_w_accuracy`](../drivers/gw/keywords.md#sigma_w_accuracy). |
 | `begin qpoints`, `qgrid`, `number_qpoints` | none | Every $\bq$ of the WFN grid; the $\bq\to0$ head comes from `dipole.h5`. |
 | `cell_slab_truncation` | [`sys_dim`](../drivers/gw/keywords.md#sys_dim) `= 2` | `sys_dim` is required; `3` is untruncated bulk. |
 | `cell_box_truncation`, `cell_wire_truncation`, `spherical_truncation`, `coulomb_truncation_radius` | none | Only `sys_dim` 3 and 2 build $V_\bq$. |
@@ -93,7 +93,7 @@ BerkeleyGW builds the full zone from the WFN's k list with the rotation matrices
 | `frequency_dependence 0` | `compute_mode = cohsex` | Coulomb hole as a partial band sum ([conventions](#conventions)). |
 | `frequency_dependence 1` | `compute_mode = hl_ppm` | <span class="status in-progress">In progress</span>: set [`ppm_omega_p`](../drivers/gw/keywords.md#ppm_omega_p) above every $\chi^0$ transition; the 2 Ry default refuses on most decks. |
 | `frequency_dependence 3` | `compute_mode = gn_ppm` | Probe $i\omega_p$ = `ppm_omega_p`. |
-| `frequency_dependence 2` | `compute_mode = mpa` with [`sigma_w_model`](../drivers/gw/keywords.md#sigma_w_model) `= tangential` | Both lines are needed: `sigma_w_model` defaults to `mpa` (elementwise poles), and `compute_mode = auto` never selects `mpa`. |
+| `frequency_dependence 2` | `compute_mode = tangential` | Name it in the deck: `compute_mode = auto` never selects it. |
 | `frequency_dependence_method`, `cd_integration_method` | none | $\Sigma^c$ is evaluated on the real axis from the pole model. |
 | `number_bands` | [`number_bands_sigma`](../drivers/gw/keywords.md#number_bands_sigma) | $\Sigma^c$ is extrapolated past it by default, [`use_band_extrapolation`](../drivers/gw/keywords.md#use_band_extrapolation). |
 | `band_index_min`, `band_index_max`, `number_diag`, `diag` | [`ncond`](../drivers/gw/keywords.md#ncond), or [`number_bands_protected`](../drivers/gw/keywords.md#number_bands_protected) | $\Sigma$ always covers bands 1 to $n_{\mathrm{occ}}+$ `ncond`; [`nval`](../drivers/gw/keywords.md#nval) does not move the lower edge. `kin-ion` and `dipole` resolve either form as GW does. |
@@ -112,7 +112,7 @@ BerkeleyGW builds the full zone from the WFN's k list with the rotation matrices
 | `tol_degeneracy` | [`degen_avg_tol_ry`](../drivers/gw/keywords.md#degen_avg_tol_ry) | Both default to $10^{-6}$ Ry. LORRAX uses it only to average the written diagonals; [`no_degen_averaging`](../drivers/gw/keywords.md#no_degen_averaging) disables that. |
 | `degeneracy_check_override` | none | A band count that cuts a multiplet refuses. |
 | `no_symmetries_q_grid`, `use_symmetries_q_grid`, `dont_symmetrize` | none | Every operation of the WFN header is used, typed by `data-file-schema.xml` ([Symmetry §1.1](../theory/symmetry.md#sym-used)). |
-| `screening_semiconductor`, `screening_metal`, `screening_graphene` | none | The class follows the WFN occupations. A metal needs [`occ_smearing_width_ry`](../drivers/gw/keywords.md#occ_smearing_width_ry) and admits only `mpa` and `x_only` ([Metals](../theory/metals.md)). |
+| `screening_semiconductor`, `screening_metal`, `screening_graphene` | none | The class follows the WFN occupations. A metal needs [`occ_smearing_width_ry`](../drivers/gw/keywords.md#occ_smearing_width_ry) and admits `tangential` and `x_only` ([Metals](../theory/metals.md)). |
 | `spin_index_min`, `spin_index_max` | none | `nspin = 2` refuses; magnetism runs as a noncollinear spinor WFN. |
 | `eqp_corrections`, `eqp_outer_corrections` | none | Use `qp_solver = self_consistent` ([QSGW](../theory/qsgw.md)). |
 | `fermi_level`, `occ_broadening`, `number_core_excluded`, `avgpot`, `spline_scissors` | none | As in [epsilon.inp](#epsilon). |
@@ -242,8 +242,7 @@ sys_dim                = 3                         # no truncation
 number_bands           = 100                       # both number_bands
 nval                   = 8
 ncond                  = 16                        # bands 1-24 = 8 occupied + 16
-compute_mode           = mpa                       # frequency_dependence 2
-sigma_w_model          = tangential
+compute_mode           = tangential                # frequency_dependence 2
 qp_solver              = one_shot_dft
 bare_coulomb_cutoff    = 25.0
 mc_average_vcoul_body  = false                     # cell_average_cutoff 1.0d-12

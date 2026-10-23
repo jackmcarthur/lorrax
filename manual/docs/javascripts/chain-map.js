@@ -61,7 +61,7 @@
   }
 
   // the gw theory page's treatment tabs move the Σ chip
-  const TAB = { COHSEX: 'cohsex', 'GN-PPM': 'gn_ppm', 'HL-GPP': 'hl_ppm', MPA: 'mpa' };
+  const TAB = { COHSEX: 'cohsex', 'GN-PPM': 'gn_ppm', 'HL-GPP': 'hl_ppm', TANGENTIAL: 'tangential' };
   function bindTabs() {
     document.querySelectorAll('.tabbed-set > input').forEach(inp => {
       if (inp.dataset.lxBound) return; inp.dataset.lxBound = '1';

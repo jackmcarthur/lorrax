@@ -8,7 +8,7 @@ page: theory
 `gw.gw_jax` The equations each stage evaluates.
 {: .page-summary }
 
-<div class="chain-map" data-driver="gw" data-page="theory" data-treatment="mpa"></div>
+<div class="chain-map" data-driver="gw" data-page="theory" data-treatment="tangential"></div>
 
 <div class="section-cards"></div>
 
@@ -133,7 +133,7 @@ $$
 
 One LU per $\bq$ and $z$. `linalg = local` (default) solves whole matrices per rank when they fit the device budget and otherwise falls back to the block-distributed solve that `linalg = distributed` always uses ([Parallel algorithms §5.1](../../theory/parallel-algorithms.md#par-dense-dyson)). The static $W_\bq(0)$ is written to the restart bundle for the BSE.
 
-Under `screening_diagrams = w_bse` or `w_rpa_resolvent`, $W$ comes instead from the resolvent identity $W_\bq(z)-V_\bq=V_\bq\chi_\bq(z)V_\bq$ with the particle–hole Hamiltonian $H^\mathrm{RPA}$ (bubbles only) or $H^\mathrm{BSE}$ (plus the statically screened ladder), solved by GMRES at each $z$. `w_bse` runs one-shot under COHSEX, GN-PPM and elementwise MPA; `w_rpa_resolvent` under COHSEX and GN-PPM only ([`screening_diagrams`](keywords.md#screening_diagrams)).
+Under `screening_diagrams = w_bse` or `w_rpa_resolvent`, $W$ comes instead from the resolvent identity $W_\bq(z)-V_\bq=V_\bq\chi_\bq(z)V_\bq$ with the particle–hole Hamiltonian $H^\mathrm{RPA}$ (bubbles only) or $H^\mathrm{BSE}$ (plus the statically screened ladder), solved by GMRES at each $z$. `w_bse` runs one-shot under COHSEX and GN-PPM (and [one other W model](../../theory/multipole-w.md#sigma)); `w_rpa_resolvent` under COHSEX and GN-PPM only ([`screening_diagrams`](keywords.md#screening_diagrams)).
 
 <figure class="flowchart" markdown>
 [![Screening by the resolvent identity](../../assets/figures/g13.png)](../../assets/figures/g13.png)
@@ -213,7 +213,7 @@ The states and poles are partitioned into product windows. Each window gets a ru
 </figure>
 
 !!! note
-    The same executor serves GN-PPM, HL-GPP and elementwise MPA: their elementwise residues $R_{j\bq}(\mu,\nu)$ and poles enter Eq. (3.3) in place of $b_{j\bq}(\mu)b^*_{j\bq}(\nu)$ and $\Omega_{j\bq}$. Treatment details: [frequency treatments](../../theory/frequency-treatments.md).
+    The same executor serves GN-PPM and HL-GPP: their elementwise residues $R_{j\bq}(\mu,\nu)$ and poles enter Eq. (3.3) in place of $b_{j\bq}(\mu)b^*_{j\bq}(\nu)$ and $\Omega_{j\bq}$. Treatment details: [frequency treatments](../../theory/frequency-treatments.md).
 
 ### <span class="n">3.4</span> Matrix elements {: #sig-me }
 
@@ -230,15 +230,14 @@ By default $\Sigma^c$ is evaluated on shell: the sweep folds each node directly 
 
 ### <span class="n">3.5</span> Frequency treatments {: #sig-treat }
 
-`compute_mode` selects the model for $W^c$; under `compute_mode = mpa`, `sigma_w_model` selects elementwise poles or the tangential model. `x_only` keeps $\Sigma^x$ alone.
+`compute_mode` selects the model for $W^c$. `x_only` keeps $\Sigma^x$ alone.
 
 | Treatment | Deck | $W$ evaluated at | Model for $W^c(z)$ | Limits |
 |---|---|---|---|---|
 | COHSEX | `cohsex` | $W(0)$ | static | Refuses metallic occupations |
 | GN-PPM | `gn_ppm` | $W(0)$, $W(i\omega_p)$ | one pole per element | Refuses metallic occupations |
 | HL-GPP | `hl_ppm` | $W(0)$, $W(\omega_p)$, real $\omega_p>\Delta_\mathrm{max}$ | one pole per element | Refuses metals and broken time reversal |
-| MPA, elementwise | `mpa`, `sigma_w_model = mpa` | $2N_p$ points on two complex lines | $N_p$ complex poles per element | Refuses time-reversal-broken metals |
-| MPA, tangential | `mpa`, `sigma_w_model = tangential` | line and imaginary ladders, plus moments | real poles shared by all elements | — |
+| Tangential | `tangential` | line and imaginary ladders, plus moments | real poles shared by all elements | — |
 
 === "COHSEX"
     **Static COHSEX** <span class="status supported">Supported</span>
@@ -313,34 +312,8 @@ By default $\Sigma^c$ is evaluated on shell: the sweep folds each node directly 
     compute_mode = hl_ppm
     ```
 
-=== "MPA · elementwise"
-    **Multipole, elementwise** <span class="status supported">Supported</span>
-
-    Several complex poles per matrix element, fit to $2N_p$ samples on two lines parallel to the real axis.
-
-    The samples sit at $z_n=\omega_m s_n^\alpha+i\varpi_{1,2}$, with heights `mpa_varpi_near_ry` and `mpa_varpi_far_ry`. A Loewner pencil in $z^2$ gives the poles, then guards and a residue refit. Each pole keeps its damping in $W^c(t)$. It is a comparison route; `compute_mode = mpa` alone selects it, because `sigma_w_model` defaults to `mpa`.
-
-    $$
-    W^c_\bq(\mu,\nu;z)=\sum_{j=1}^{N_p}R_{j\bq}(\mu,\nu)\left[\frac{1}{z-\Omega_{j\bq}(\mu,\nu)}-\frac{1}{z+\Omega_{j\bq}(\mu,\nu)}\right],\qquad \mathrm{Re}\,\Omega_{j\bq}>0,\ \ \mathrm{Im}\,\Omega_{j\bq}\le0 \tag{3.5}
-    $$
-
-    W evaluated at
-    :   $2N_p$ complex frequencies, $N_p$ = `mpa_n_poles` (default `8`)
-
-    Model
-    :   $N_p$ complex poles per element
-
-    Frequency
-    :   full frequency
-
-    ```ini
-    compute_mode  = mpa
-    sigma_w_model = mpa
-    mpa_n_poles   = 8
-    ```
-
-===+ "MPA · tangential"
-    **Multipole, tangential** <span class="status production">Production</span>
+===+ "Tangential"
+    **Tangential model** <span class="status production">Production</span>
 
     One set of real poles per $\bq$, shared by every matrix element, from samples of $W^c$ and $\partial_zW^c$ and the exact moments (§[2.5](#scr-sp)).
 
@@ -360,8 +333,7 @@ By default $\Sigma^c$ is evaluated on shell: the sweep folds each node directly 
     :   full frequency
 
     ```ini
-    compute_mode  = mpa
-    sigma_w_model = tangential
+    compute_mode = tangential
     ```
 
 ## <span class="n">4</span> Quasiparticles {: #qp }
@@ -418,7 +390,7 @@ $S_{ab}$ comes from the velocity matrix elements $\langle m\bk|\hat{\mathbf v}_a
 `band_extrapolation`
 {: .in-code }
 
-The $\Sigma^c$ band sum of the dynamic treatments (GN-PPM, HL-GPP, MPA) is extrapolated past `number_bands_sigma` from three bracket sums, at 70, 85 and 100 % of it under the default bracket scheme (`use_band_extrapolation`, default `true`). The extrapolated $\Sigma^c$ is what the QP stage and every QSGW map read; one-shot runs keep the raw values in the `*_raw` columns of `sigma_diag.dat`. $\chi^0$ is not extrapolated. A run with `number_bands_sigma` below twice the occupied count refuses. Estimator and failure modes: [band extrapolation](../../theory/band-extrapolation.md).
+The $\Sigma^c$ band sum of the dynamic treatments (GN-PPM, HL-GPP, tangential) is extrapolated past `number_bands_sigma` from three bracket sums, at 70, 85 and 100 % of it under the default bracket scheme (`use_band_extrapolation`, default `true`). The extrapolated $\Sigma^c$ is what the QP stage and every QSGW map read; one-shot runs keep the raw values in the `*_raw` columns of `sigma_diag.dat`. $\chi^0$ is not extrapolated. A run with `number_bands_sigma` below twice the occupied count refuses. Estimator and failure modes: [band extrapolation](../../theory/band-extrapolation.md).
 
 ## <span class="n">5</span> Four-current GW {: #four-current }
 
@@ -466,7 +438,7 @@ $\Sigma^B$ is static and is one exchange contraction in every treatment. With ti
 | Material | `bispinor_gw` | Deck |
 |---|---|---|
 | time-reversal invariant | `bare_transverse` (default) | any `compute_mode` |
-| magnet, half-metal, Hall or Chern state | `full_tangential` | `compute_mode = mpa`, `sigma_w_model = tangential`, `head_correction = no_local_fields` |
+| magnet, half-metal, Hall or Chern state | `full_tangential` | `compute_mode = tangential`, `head_correction = no_local_fields` |
 | static cross-check of current screening | `full_static_cohsex` | one-shot; `compute_mode = cohsex`, `gn_ppm` or `hl_ppm` (current blocks at $\omega=0$); `sys_dim = 2` with the head on |
 
 `full_tangential` solves the four-current Dyson equation at each bank frequency and fits the CC, CT/TC and TT sectors as separate tangential models; only the CC sum is band-extrapolated. A bispinor QSGW run rebuilds $\rho$ and $\mathbf J$ on every map and refuses `density_self_consistent = false`. `sigma_diag.dat` splits $\Sigma^{xc}$ into `sigCC`, `sigCT` and `sigTT`. No Dirac–Coulomb–Breit reference yet certifies the absolute $\Sigma^B$.
@@ -488,8 +460,8 @@ Equations are in real time $t$, time-ordered, at $T=0$ with $\hbar=1$: $\chi^0=-
 | $W_\bq(\mu,\nu;z)$, $W^c=W-V$ | screened interaction; its correlation part |
 | $t_\ell$, $w_\ell$ | time nodes and weights of a rule |
 | $b_{j\bq}(\mu)$, $\Omega_{j\bq}$ | tangential factor vectors (residue $b_{j\bq}b^\dagger_{j\bq}$) and poles |
-| $R_{j\bq}(\mu,\nu)$, $\Omega_{j\bq}(\mu,\nu)$ | elementwise residues and poles (PPM, MPA) |
-| $\omega_p$, $N_p$ | PPM probe frequency; MPA pole count |
+| $R_{j\bq}(\mu,\nu)$, $\Omega_{j\bq}(\mu,\nu)$ | elementwise residues and poles (PPM) |
+| $\omega_p$ | PPM probe frequency |
 | $d^{\gtrless}$, $\eta$ | branch denominators of $\Sigma^c$; broadening |
 | $\Sigma^x$, $\Sigma^c$, $\Sigma^{xc}$, $\Sigma^\mathrm{QSGW}$ | exchange, correlation, their sum, the static Hermitian operator |
 | $T+V^\mathrm{ion}$, $V^\mathrm{H}$ | the `kin_ion.h5` operator; the Hartree potential |

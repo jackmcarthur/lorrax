@@ -28,14 +28,14 @@ $$
 \Sigma^c_{\bk}(\br_\mu,\br_\nu;\omega)=\frac{1}{N_k}\sum_{\bq,n,j}\psi_{n\bk-\bq}(\br_\mu)\psi^*_{n\bk-\bq}(\br_\nu)\,R_{j\bq}(\mu,\nu)\left[\frac{1-f_{n\bk-\bq}}{\omega-E_{n\bk-\bq}-\Omega_{j\bq}+i\eta}+\frac{f_{n\bk-\bq}}{\omega-E_{n\bk-\bq}+\Omega_{j\bq}-i\eta}\right] \tag{1.2}
 $$
 
-The treatments differ in the poles: one per matrix element (plasmon-pole models), a few complex ones per element (elementwise MPA), or one real set shared by all elements, $R_j(\mu,\nu)=b_j(\mu)b^*_j(\nu)$ (tangential, [normalisation of $b$](tangential-w.md#model-form)). $\eta$ is `sigma_regularization_ev` (default 0.25 eV), applied once, by Σ. LORRAX never sums (1.2) directly; §6 gives the time-node quadrature it runs.
+The treatments differ in the poles: one per matrix element (plasmon-pole models), or one real set shared by all elements, $R_j(\mu,\nu)=b_j(\mu)b^*_j(\nu)$ (tangential, [normalisation of $b$](tangential-w.md#model-form)). $\eta$ is `sigma_regularization_ev` (default 0.25 eV), applied once, by Σ. LORRAX never sums (1.2) directly; §6 gives the time-node quadrature it runs.
 
 ### <span class="n">1.3</span> Selecting a treatment {: #frame-select }
 
 `gw_config.ComputeMode`
 {: .in-code }
 
-`compute_mode` names the treatment; under `compute_mode = mpa`, `sigma_w_model` names the representation of $W^c$. The two keys together give six routes:
+`compute_mode` names the treatment. It gives five routes:
 
 | Deck | Treatment |
 |---|---|
@@ -43,13 +43,12 @@ The treatments differ in the poles: one per matrix element (plasmon-pole models)
 | `compute_mode = cohsex` | static COHSEX |
 | `compute_mode = gn_ppm` | Godby–Needs plasmon pole |
 | `compute_mode = hl_ppm` | Hybertsen–Louie plasmon pole |
-| `compute_mode = mpa`, `sigma_w_model = mpa` | elementwise multipole |
-| `compute_mode = mpa`, `sigma_w_model = tangential` | tangential model (production) |
+| `compute_mode = tangential` | tangential model (production) |
 
-`compute_mode` defaults to `auto`, which reads the legacy keys: `use_ppm_sigma = true` gives `gn_ppm` (or `hl_ppm` when `ppm_model = hl`), otherwise `do_screened` gives `cohsex` or `x_only`. `auto` never selects `mpa`. `sigma_w_model` defaults to `mpa`, so the production route needs both lines in the deck. Key-by-key entries are on the GW keyword page: [`compute_mode`](../drivers/gw/keywords.md#compute_mode), [`sigma_w_model`](../drivers/gw/keywords.md#sigma_w_model).
+`compute_mode` defaults to `auto`, which reads the legacy keys: `use_ppm_sigma = true` gives `gn_ppm` (or `hl_ppm` when `ppm_model = hl`), otherwise `do_screened` gives `cohsex` or `x_only`. `auto` never selects `tangential`, so the production route names it in the deck. The key-by-key entry is on the GW keyword page: [`compute_mode`](../drivers/gw/keywords.md#compute_mode). Other W models are on [this page](multipole-w.md).
 
 !!! note
-    The material class is read from the WFN occupations. On a metal every `compute_mode` except `mpa` and `x_only` refuses; `sigma_w_model = tangential` is the production metal model. See [Metals §5](metals.md#refusals).
+    The material class is read from the WFN occupations. On a metal `cohsex`, `gn_ppm` and `hl_ppm` refuse; `compute_mode = tangential` is the production metal model. See [Metals §5](metals.md#refusals).
 
 ## <span class="n">2</span> Comparison {: #compare }
 
@@ -66,7 +65,6 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
 | COHSEX | $z=0$ | static | 1 | closed form at $t=0$ | refuses | <span class="status supported">Supported</span> |
 | GN-PPM | $0$, $i\omega_p$ | one real pole per element | 2 | time nodes, one pole batch | refuses | <span class="status supported">Supported</span> |
 | HL-GPP | $0$, real $\omega_p>\Delta_{\max}$ | one real pole per element | 2 | time nodes, one pole batch | refuses | <span class="status in-progress">In progress</span> |
-| MPA | $2n_p$ points on two lines | $n_p$ complex poles per element | $2n_p$ (16) | time nodes, $\lceil n_p/4\rceil$ pole batches | runs | <span class="status supported">Supported</span> |
 | Tangential | 18–40 supports, plus $M_1$, $M_3$ | $K_\bq$ real poles shared by all elements | 18–40 | time nodes, all poles at once | runs | <span class="status production">Production</span> |
 | CD | imaginary-axis rule, plus knots $x_j+i\eta$ | none: exact $W^c(z)$ at each point | $n$ + $J$ (hundreds) | imaginary-axis sum plus residues | runs | <span class="status in-progress">In progress</span> |
 | AC | imaginary axis | Padé of $\Sigma^c(i\omega)$ | grid | — | — | <span class="status not-in-lorrax">Not in LORRAX</span> |
@@ -169,32 +167,6 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
     ppm_omega_p  = 200.0
     ```
 
-=== "MPA"
-    **Elementwise multipole** <span class="status supported">Supported</span>
-
-    $n_p$ complex poles per matrix element, fitted to $W^c$ at $2n_p$ points on two lines parallel to the real axis (the multipole approximation of Leon *et al.*).
-
-    $2n_p$ W solves, stored on disk frequency-major. The fit runs element by element; Σ runs each window once per resident batch of `mpa_pole_batch_size` poles. This is the comparison model for the tangential model.
-
-    $$
-    W^c_{\bq}(\mu,\nu;z)=\sum_{j=1}^{n_p}R_{j\bq}(\mu,\nu)\left[\frac{1}{z-\Omega_{j\bq}(\mu,\nu)}-\frac{1}{z+\Omega_{j\bq}(\mu,\nu)}\right],\qquad \mathrm{Im}\,\Omega_j\le0 \tag{2.1}
-    $$
-
-    W evaluated at
-    :   $z^{(i)}_n=\omega_ms_n^\alpha+i\varpi_i$, $i=1,2$, $n<n_p$
-
-    Model
-    :   $n_p$ poles per element, `mpa_n_poles` (8)
-
-    Frequency
-    :   full frequency
-
-    ```ini
-    compute_mode  = mpa
-    sigma_w_model = mpa
-    mpa_n_poles   = 8
-    ```
-
 === "Tangential"
     **Tangential model** <span class="status production">Production</span>
 
@@ -216,8 +188,7 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
     :   full frequency
 
     ```ini
-    compute_mode  = mpa
-    sigma_w_model = tangential
+    compute_mode = tangential
     ```
 
 === "CD"
@@ -247,7 +218,7 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
 === "AC"
     **Analytic continuation** <span class="status not-in-lorrax">Not in LORRAX</span>
 
-    $\Sigma^c$ is computed on the imaginary axis and continued to real frequencies by a Padé or multipole fit of $\Sigma^c(i\omega)$ itself. Listed for comparison.
+    $\Sigma^c$ is computed on the imaginary axis and continued to real frequencies by a Padé or other rational fit of $\Sigma^c(i\omega)$ itself. Listed for comparison.
 
     LORRAX never continues $\Sigma$. Its rational models are of $W^c$, and $\Sigma^c$ is integrated on the real axis from them (§6).
 
@@ -263,14 +234,14 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
 
 ### <span class="n">2.2</span> Which treatment to use {: #compare-choose }
 
-The tangential model is the default recommendation for every material. COHSEX and the plasmon-pole models are cheap insulator references; elementwise MPA is the comparison model for the tangential model.
+The tangential model is the default recommendation for every material. COHSEX and the plasmon-pole models are cheap insulator references.
 
 | Situation | Treatment |
 |---|---|
 | production, insulator or metal | tangential |
-| metal | tangential (MPA runs; GN, HL, COHSEX refuse) |
+| metal | tangential (GN, HL, COHSEX refuse) |
 | time-reversal-broken insulator | tangential or GN-PPM (two-residue fit); HL refuses |
-| time-reversal-broken metal | tangential with `head_correction = no_local_fields`; elementwise MPA refuses |
+| time-reversal-broken metal | tangential with `head_correction = no_local_fields` |
 | fast static estimate | COHSEX |
 
 ## <span class="n">3</span> Static treatments {: #static }
@@ -374,82 +345,35 @@ $$
 $D$ is Hermitian, so both residues are. Empty-band branches of Σ consume $R_+$ and occupied-band branches $R_-$; with $D=0$ this is (4.1). HL cannot separate $R_+-R_-$ from a real-axis sample, where $W^c$ is Hermitian for any system, and refuses a time-reversal-broken deck.
 
 !!! refuses
-    - Metallic WFN occupations, for both models (`GATE gn_ppm_refuses_metals`, `GATE fractional_occupations_require_mpa`). Use `compute_mode = mpa` with `sigma_w_model = tangential`.
+    - Metallic WFN occupations, for both models (`GATE gn_ppm_refuses_metals`, `GATE fractional_occupations_require_mpa`). Use `compute_mode = tangential`.
     - `compute_mode = hl_ppm` with `ppm_omega_p` at or below the largest $\chi^0$ transition (`GATE hl_ppm_probe_in_spectrum`). Raise `ppm_omega_p` above it.
     - `compute_mode = hl_ppm` on a deck whose measured time reversal is broken (`GATE hl_ppm_requires_measured_trs`). Use `gn_ppm` or the tangential model.
 
-## <span class="n">5</span> Multipole models {: #multipole }
+## <span class="n">5</span> The tangential model {: #tangential }
 
-Both multipole routes run under `compute_mode = mpa` and sample $W^c$ at complex frequencies away from the real axis. The elementwise route fits each element separately; the tangential route builds one pole set per $\bq$.
+The production full-frequency treatment samples $W^c$ at complex frequencies away from the real axis and builds one pole set per $\bq$, shared by every matrix element.
 {: .intro }
 
-### <span class="n">5.1</span> The double-parallel samples {: #mpa-samples }
-
-`gw.mpa.sampling.double_parallel_grid`
-{: .in-code }
-
-With $\omega_m=\max\Delta$ over the screening bands and $n_p$ nested fractions $0=s_0<\dots<s_{n_p-1}=1$, the samples sit on two lines:
-
-$$
-z^{(1)}_n=\omega_m s_n^{\alpha}+i\varpi_1,\qquad z^{(2)}_n=\omega_m s_n^{\alpha}+i\varpi_2,\qquad n=0,\dots,n_p-1 \tag{5.1}
-$$
-
-$\varpi_1=$ `mpa_varpi_near_ry` (0.2 Ry) and $\varpi_2=$ `mpa_varpi_far_ry` (2 Ry). On an insulator the first near point is $z=0$ exactly; on a metal it is $i\varpi_0$ with $\varpi_0=$ `mpa_metal_origin_shift_ry` ($2\times10^{-5}$ Ry when unset), a stability displacement, not a broadening. $\alpha=$ `mpa_sampling_alpha` defaults to 1 on an insulator and 2 on a metal. `mpa_sampling_schedule = nested` adds one point per line as $n_p$ grows and moves none. Each point's $\chi^0$ rule follows its analytic character: the static Laplace rule at $z=0$, the imaginary-axis rule at $i\varpi_2$, and one damped real-time rule shared by the rest of a line ([Time–frequency transforms §7.4](time-frequency.md#mpa-lines)).
-
-<figure class="flowchart" markdown>
-[![Multipole W (MPA, elementwise)](../assets/figures/g8.png)](../assets/figures/g8.png)
-<figcaption><strong>Fig. G8.</strong> Elementwise MPA: $\chi^0$ and Dyson at the $2n_p$ double-parallel points, a Loewner pencil per element for the poles and one least-squares solve for the residues, then the pole batches enter the time-node Σ.</figcaption>
-</figure>
-
-### <span class="n">5.2</span> The elementwise pole fit {: #mpa-fit }
-
-`gw.mpa.pade_fit.fit_mpa_poles`
-{: .in-code }
-
-Each element of $W^c$ on the $\bq$ wedge is fitted with $n_p=$ `mpa_n_poles` (default 8, allowed 1–16) poles. In $x=z^2$, with the even samples $s$ and odd samples $r$ as the two interpolation sides, the default `loewner` solver forms
-
-$$
-L_{sr}=\frac{W^c_s-W^c_r}{x_s-x_r},\qquad L^{x}_{sr}=\frac{x_sW^c_s-x_rW^c_r}{x_s-x_r},\qquad \Omega_j^2=\mathrm{eig}\big(L^{+}L^{x}\big) \tag{5.2}
-$$
-
-Guards follow in order: reflection when $\mathrm{Re}\,\Omega^2<0$, time order when $\mathrm{Im}\,\Omega^2>0$, then pruning of coincident, out-of-range and null poles. The residues come from one complex least-squares solve over all $2n_p$ samples, on the guarded poles when a guard fired. `companion` and `thiele` change only the pole identification. More poles are not monotonically better: raise $n_p$ only against held-out $W$ and QP energies.
-
-### <span class="n">5.3</span> Metals and broken time reversal in MPA {: #mpa-metal }
-
-`gw.mpa.model`
-{: .in-code }
-
-On a metal the near origin row $i\varpi_0$ is evaluated exactly by an ordered band-pair scan, because a damped rule at $\varpi_0$ needs about $10^6$ nodes; every other point uses the fractional-occupation contour, with the rule bandwidth taken from the occupation supports. On a time-reversal-broken insulator one ordered sweep also returns $\chi(-\bar z)$, and the fit adds an odd residue per pole:
-
-$$
-W^c(z)=\sum_j\left[\frac{R_{j,+}}{z-\Omega_j}-\frac{R_{j,-}}{z+\Omega_j}\right],\qquad R_{j,\pm}=R_j\pm D_j \tag{5.3}
-$$
-
-$\Omega_j$ and the even residue $R_j$ (the code's `B_p`) are fitted on $W_{\mathrm{even}}$ and $D_j$ by a fixed-pole least squares on $W_{\mathrm{odd}}$; empty branches consume $R_+$ and occupied branches $R_-$, as in (4.4). Elementwise MPA on a metal with broken time reversal refuses (`GATE mpa_ordered_metal`). The $\bq\to0$ head is fitted on the identical $z$ grid ([The q → 0 head §3](q0-head.md#poles)). Details: [Metals §2](metals.md#response).
-
-### <span class="n">5.4</span> The tangential model {: #shared }
+### <span class="n">5.1</span> One pole set per q {: #shared }
 
 `gw.tangential_screening.screen_tangential_poles`
 {: .in-code }
 
-`sigma_w_model = tangential` keeps the $\chi^0$ and Dyson machinery and replaces the elementwise fit by one Hermitian construction per $\bq$:
+`compute_mode = tangential` keeps the $\chi^0$ and Dyson machinery and builds one Hermitian construction per $\bq$:
 
 $$
-W^c_{\bq}(\mu,\nu;z)=\sum_{j=1}^{K_\bq}b_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\left[\frac{1}{z-\Omega_{j\bq}}-\frac{1}{z+\Omega_{j\bq}}\right],\qquad \Omega_{j\bq}>0 \tag{5.4}
+W^c_{\bq}(\mu,\nu;z)=\sum_{j=1}^{K_\bq}b_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\left[\frac{1}{z-\Omega_{j\bq}}-\frac{1}{z+\Omega_{j\bq}}\right],\qquad \Omega_{j\bq}>0 \tag{5.1}
 $$
 
 The samples sit on a line $z=\omega+ih$ placed by the crossing density of the requested states and on a log-spaced imaginary ladder; tangential samples and the exact moments $M_1$, $M_3$ fill a Loewner pencil whose Ritz pairs are the poles. Real poles, positive residues and the moments hold by construction, and the support count grows only as $\ln(1/\epsilon)$. Derivation, keys and constants: [Tangential W model](tangential-w.md), with the normalisation of $b$ in [§2.1](tangential-w.md#model-form).
 
 !!! refuses
-    - Under `sigma_w_model = tangential`: `mpa_pole_batch_size`, `mpa_fit_reuse_file`, `mpa_overwrite_completed_artifacts`, and, when `head_correction = off`, every MPA sampling key (`GATE tangential_unused_inputs`). Remove them.
-    - `sigma_w_model` named with `compute_mode` other than `mpa` (`GATE tangential_applicability`). Set `compute_mode = mpa`.
-    - `mpa_n_poles` outside 1–16, `mpa_sampling_alpha` other than 1 or 2, line heights not $0<\varpi_1<\varpi_2$, `mpa_metal_origin_shift_ry` set on an insulator or not below $\varpi_1$.
-    - Sample points that coincide in $x=z^2$. Change $n_p$ or the line heights.
-    - Elementwise MPA on a metal with broken time reversal (`GATE mpa_ordered_metal`). Use the tangential model.
+    - Under `compute_mode = tangential`: the keys of the [other W models](multipole-w.md#keywords) this route does not read, and, when `head_correction = off`, the head-fit sampling keys (`GATE tangential_unused_inputs`). Remove them.
+    - The retired key `sigma_w_model`. Use `compute_mode = tangential`.
 
 ## <span class="n">6</span> Evaluating Σᶜ {: #sigma }
 
-GN-PPM, HL-GPP, elementwise MPA and the tangential model reach one planner and one executor. The planner turns (1.2) into a sum over time nodes, one $\bk$-convolution per node, with no state–pole double sum.
+GN-PPM, HL-GPP and the tangential model reach one planner and one executor. The planner turns (1.2) into a sum over time nodes, one $\bk$-convolution per node, with no state–pole double sum.
 {: .intro }
 
 ### <span class="n">6.1</span> One time node is one convolution {: #sigma-nodes }
@@ -463,7 +387,7 @@ $$
 \Sigma^{c}_{\bk}(\omega)\approx-\frac{1}{N_k}\sum_\ell w_\ell\,e^{\pm i\omega t_\ell}\sum_{\bq}G^{S}_{\bk-\bq}(\pm t_\ell)\,W^{c,P}_{\bq}(\pm t_\ell),\qquad W^{c,P}_{\bq}(\pm t)=-i\sum_{j\in P}R_{j\bq}\,e^{-i\Omega_{j\bq}t} \tag{6.1}
 $$
 
-with the upper sign and $G^S=G^>$ on the empty branch, the lower sign and $G^S=G^<$ on the occupied one. The summand is $i\Sigma^c_\bk(\pm t_\ell)$ of (1.1) restricted to the window, and only the scalar phase sees the output frequency; the code measures energies from a window reference $E^{\mathrm{ref}}$ and restores it in the same phase. The $\bq$ sum is an IFFT to $\bR$, a product, and an FFT back. The (window, node) pair count is the cost. The resident-pole routes (GN, HL, elementwise MPA) load poles in batches of `mpa_pole_batch_size` (default 4) and run a window once per batch that holds any of its poles; the plasmon-pole store is one batch. The tangential model synthesizes $W^c(t_\ell)$ from all its poles inside each node and pays each node once.
+with the upper sign and $G^S=G^>$ on the empty branch, the lower sign and $G^S=G^<$ on the occupied one. The summand is $i\Sigma^c_\bk(\pm t_\ell)$ of (1.1) restricted to the window, and only the scalar phase sees the output frequency; the code measures energies from a window reference $E^{\mathrm{ref}}$ and restores it in the same phase. The $\bq$ sum is an IFFT to $\bR$, a product, and an FFT back. The (window, node) pair count is the cost. The plasmon-pole routes (GN, HL) hold their poles as one resident batch. The tangential model synthesizes $W^c(t_\ell)$ from all its poles inside each node and pays each node once.
 
 ### <span class="n">6.2</span> Windows, boxes and the accuracy dial {: #sigma-boxes }
 
@@ -502,7 +426,6 @@ and the derivative is the exact $\omega$-derivative of the same quadrature, not 
 | $\Omega_{j\bq}$, $R_{j\bq}(\mu,\nu)$ | pole frequencies and residues of a pole model |
 | $b_{j\bq}(\mu)$, $K_\bq$ | tangential factor vectors, $R_{j\bq}=b_{j\bq}b^\dagger_{j\bq}$; pole count |
 | $z_p$, $\omega_p$ | plasmon-pole probe frequency; `ppm_omega_p` |
-| $n_p$, $\varpi_1$, $\varpi_2$, $\omega_m$, $\alpha$ | MPA pole count, line heights, line length, grading |
 | $R$, $D$, $R_\pm$ | even and odd residues; branch residues $R\pm D$ |
 | $\eta$ | Σ broadening, `sigma_regularization_ev` |
 | $t_\ell$, $w_\ell$, $\varepsilon$ | Σ time nodes and weights; `sigma_quadrature_eps` |
@@ -512,8 +435,6 @@ and the derivative is the exact $\omega$-derivative of the same quadrature, not 
 1. L. Hedin, Phys. Rev. 139, A796 (1965).
 2. M. S. Hybertsen and S. G. Louie, Phys. Rev. B 34, 5390 (1986).
 3. R. W. Godby and R. J. Needs, Phys. Rev. Lett. 62, 1169 (1989).
-4. D. A. Leon, C. Cardoso, T. Chiarotti, D. Varsano, E. Molinari and A. Ferretti, Phys. Rev. B 104, 115157 (2021).
-5. D. A. Leon, A. Ferretti, D. Varsano, E. Molinari and C. Cardoso, Phys. Rev. B 107, 155130 (2023).
-6. H. N. Rojas, R. W. Godby and R. J. Needs, Phys. Rev. Lett. 74, 1827 (1995).
-7. J. Deslippe, G. Samsonidze, D. A. Strubbe, M. Jain, M. L. Cohen and S. G. Louie, Comput. Phys. Commun. 183, 1269 (2012).
+4. H. N. Rojas, R. W. Godby and R. J. Needs, Phys. Rev. Lett. 74, 1827 (1995).
+5. J. Deslippe, G. Samsonidze, D. A. Strubbe, M. Jain, M. L. Cohen and S. G. Louie, Comput. Phys. Commun. 183, 1269 (2012).
 

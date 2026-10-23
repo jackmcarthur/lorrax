@@ -15,7 +15,7 @@ window.SPECS.lorraxPipeline = {
         { name: 'kin-ion', note: '$\\langle m\\bk|T+V^{\\mathrm{ion}}|n\\bk\\rangle$' },
         { name: 'dipole', note: 'velocity $\\langle m\\bk|\\hat{v}|n\\bk\\rangle$' }] },
     { id: 'gw', number: '02', title: 'GW', summary: '$\\Sigma^{xc}_{n\\bk}(\\omega)\\ \\rightarrow\\ E^{\\mathrm{QP}}_{n\\bk}$',
-      optionsLabel: 'Σ', options: [{ id: 'mpa', label: 'tangential' }, { id: 'gn_ppm', label: 'GN-PPM' }, { id: 'cohsex', label: 'COHSEX' }, { id: 'hl_ppm', label: 'HL-GPP' }],
+      optionsLabel: 'Σ', options: [{ id: 'tangential', label: 'tangential' }, { id: 'gn_ppm', label: 'GN-PPM' }, { id: 'cohsex', label: 'COHSEX' }, { id: 'hl_ppm', label: 'HL-GPP' }],
       handoff: 'restart · eqp1.dat',
       helperLabel: 'BSE inputs', helpers: [
         { name: 'htransform', note: 'QP bands on a $\\bk$ path' },

@@ -70,25 +70,16 @@ Optional
 ### `compute_mode` {: .kw data-type="enum" data-default="auto" }
 Σ treatment. See [frequency treatments](../../theory/frequency-treatments.md).
 
-`auto` resolves from the legacy keys to `cohsex` (or `x_only`, `gn_ppm`, `hl_ppm`) and never selects `mpa`. A metal admits only `mpa` and `x_only`.
+`tangential` is the production model ([Tangential W model](../../theory/tangential-w.md)). `auto` resolves from the legacy keys to `cohsex` (or `x_only`, `gn_ppm`, `hl_ppm`) and never selects `tangential`. A metal admits `tangential` and `x_only`; `cohsex`, `gn_ppm` and `hl_ppm` refuse. Other W models are described [here](../../theory/multipole-w.md).
 {: .kw-details }
 
-`x_only` `cohsex` `gn_ppm` `hl_ppm` `mpa`
-{: .kw-values }
-
-### `sigma_w_model` {: .kw data-type="enum" data-default="mpa" }
-Model of $W^c$ under `compute_mode = mpa`.
-
-`tangential` is the production model ([Tangential W model](../../theory/tangential-w.md)); `mpa` fits poles element by element. Naming the key with another `compute_mode` refuses. The old value `shared_pole` is still accepted, with a note in the log.
-{: .kw-details }
-
-`tangential` `mpa`
+`x_only` `cohsex` `gn_ppm` `hl_ppm` `tangential`
 {: .kw-values }
 
 ### `sigma_w_accuracy` {: .kw data-type="enum" data-default="production" }
 Tier of the tangential recipe.
 
-`relaxed` also sets an omitted `sigma_quadrature_eps` to `5e-4`. Requires `sigma_w_model = tangential`.
+`relaxed` also sets an omitted `sigma_quadrature_eps` to `5e-4`. Applies under `compute_mode = tangential`, and refuses without it.
 {: .kw-details }
 
 `production` `relaxed`
@@ -97,7 +88,7 @@ Tier of the tangential recipe.
 ### `sigma_frequency_integration` {: .kw data-type="enum" data-default="pole_model" }
 Frequency integration of $\Sigma^c$.
 
-`pole_model` is the time-node route of the `sigma_w_model` pole models. `contour_deformation` integrates on the imaginary axis and adds the real-axis residues, on the exact ISDF $W(z)$; it needs `compute_mode = mpa`, `head_correction = off`, `use_band_extrapolation = false`, `linalg = local` and `screening_diagrams = w_rpa`, and refuses the `sigma_w_*`, `mpa_*`, `write_w` and `write_poles` keys.
+`pole_model` is the time-node route of the pole models. `contour_deformation` integrates on the imaginary axis and adds the real-axis residues, on the exact ISDF $W(z)$; it needs `compute_mode = mpa`, `head_correction = off`, `use_band_extrapolation = false`, `linalg = local` and `screening_diagrams = w_rpa`, and refuses the `sigma_w_*` keys, the head-fit sampling keys, `write_w` and `write_poles`.
 {: .kw-details }
 
 `pole_model` `contour_deformation`
@@ -106,7 +97,7 @@ Frequency integration of $\Sigma^c$.
 ### `screening_diagrams` {: .kw data-type="enum" data-default="w_rpa" }
 Diagrams summed by $W$: the RPA Dyson series, the ladder-corrected resolvent, or the RPA resolvent.
 
-`w_bse` runs one-shot under `cohsex`, `gn_ppm` and elementwise `mpa` on a time-reversal-symmetric WFN; `w_rpa_resolvent` under `cohsex` and `gn_ppm` only. Both need an orbit-closed centroid set.
+`w_bse` runs one-shot under `cohsex` and `gn_ppm` (and [one other W model](../../theory/multipole-w.md#sigma)) on a time-reversal-symmetric WFN; `w_rpa_resolvent` under `cohsex` and `gn_ppm` only. Both need an orbit-closed centroid set.
 {: .kw-details }
 
 `w_rpa` `w_bse` `w_rpa_resolvent`
@@ -115,17 +106,17 @@ Diagrams summed by $W$: the RPA Dyson series, the ladder-corrected resolvent, or
 ### `write_poles` {: .kw data-type="bool" data-default="false" }
 Exports the stored tangential factors $\tilde b_{j\bq}(\mu)=\sqrt{2\Omega_{j\bq}}\,b_{j\bq}(\mu)$ and $\Omega^2_{j\bq}$ to `tmp/mpa/<map>_poles.h5`, with $b$ the residue-normalised factor of [Tangential W model §2.1](../../theory/tangential-w.md#model-form).
 
-A static-W consumer needs nothing else, since $W(0) = V - 2b\,\Omega^{-1} b^\dagger = V - \tilde b\,\Omega^{-2} \tilde b^\dagger$. Requires `compute_mode = mpa` and `sigma_w_model = tangential`.
+A static-W consumer needs nothing else, since $W(0) = V - 2b\,\Omega^{-1} b^\dagger = V - \tilde b\,\Omega^{-2} \tilde b^\dagger$. Requires `compute_mode = tangential`.
 {: .kw-details }
 
 ### `minimax_target_error` {: .kw data-type="float" data-default="1e-6" }
 Accuracy target of the χ⁰ time rules, in a currency set by each rule.
 
-Absolute error in Ry⁻¹ for the static rule, the HL probe and the insulating MPA $i\varpi_2$ sample; relative for the GN probe certificate and, against $1/\varpi$, for the MPA line samples. The tangential bank ignores it and uses its tier's tolerance ([Rules and keys](../../theory/time-frequency.md#frame-keys)).
+Absolute error in Ry⁻¹ for the static rule and the HL probe; relative for the GN probe certificate. The tangential bank ignores it and uses its tier's tolerance ([Rules and keys](../../theory/time-frequency.md#frame-keys)).
 {: .kw-details }
 
 ### `minimax_max_nodes` {: .kw data-type="int" data-default="64" }
-Node cap of the static, HL-probe and insulating-MPA rules; order cap of one panel of an MPA line rule.
+Node cap of the static and HL-probe rules.
 
 A static rule that misses its target at the cap refuses. The GN probe and the tangential bank ignore it; the GN probe stops at 64 nodes ([minimax](../../theory/time-frequency.md#frame-keys)).
 {: .kw-details }
@@ -148,7 +139,7 @@ Probe columns per block of the ladder solve (`w_bse`, `w_rpa_resolvent`).
 ### `sigma_w_support_sites_ev` {: .kw data-type="string" data-default="(empty)" }
 Replaces both tangential support ladders, written `"<line list> | <imaginary list>"` in eV.
 
-A support study dial, announced as a debug warning; the sites enter the recipe hash.
+A support study dial, announced as a debug warning; the sites enter the recipe hash. Applies under `compute_mode = tangential`, and refuses without it.
 {: .kw-details }
 
 ### `write_w` {: .kw data-type="bool" data-default="false" }
@@ -395,14 +386,11 @@ Broadening of the head evaluation, in Ry.
 ### `bgw_metal_q0_treatment` {: .kw data-type="enum" data-default="exact" }
 Metallic $\bq = 0$ convention.
 
-`bgw_q0shift` emulates BerkeleyGW's shifted $q_0$; it needs `compute_mode = mpa` and `sys_dim = 3`, and refuses an explicit `mc_average_vcoul_body = true`.
+The other value, BerkeleyGW's shifted-$q_0$ emulation, and its vector key are described [here](../../theory/multipole-w.md#bgw-q0); the tangential head refuses it.
 {: .kw-details }
 
-`exact` `bgw_q0shift`
+`exact`
 {: .kw-values }
-
-### `bgw_metal_q0_vector` {: .kw data-type="string" data-default="0 0 0.125" }
-Reduced coordinates of the shifted $q_0$ under `bgw_q0shift`. Three finite numbers, not all zero.
 
 ### `mc_average_placement` {: .kw data-type="enum" data-default="off" }
 Where the $\bq \ne 0$ mini-BZ average enters: in $V$ (`off`) or on W's head after the Dyson solve (`bgw`).
@@ -470,7 +458,7 @@ For a main WFN written without symmetry.
 **Files**
 {: #files }
 
-A relative path resolves against the deck's directory for `wfn_file`, `centroids_file`, `centroids_file_current`, `kin_ion_file`, `parallel_transport_file`, `static_gauge_hall_file`, `bgw_vcoul_file`, `bgw_vcoul_sym_wfn`, `mpa_fit_reuse_file`, `sc_initial_qp_rotations_file`, `report_file`, `sigma_diag_file`, `eqp0_file`, `eqp1_file` and `sigma_omega_h5_file`. `sigma_freq_debug_file` and `sc_dump_dir` are used as given, so a relative value resolves against the launch directory. Formats are on the [Files](files.md) page.
+A relative path resolves against the deck's directory for `wfn_file`, `centroids_file`, `centroids_file_current`, `kin_ion_file`, `parallel_transport_file`, `static_gauge_hall_file`, `bgw_vcoul_file`, `bgw_vcoul_sym_wfn`, `sc_initial_qp_rotations_file`, `report_file`, `sigma_diag_file`, `eqp0_file`, `eqp1_file` and `sigma_omega_h5_file`. `sigma_freq_debug_file` and `sc_dump_dir` are used as given, so a relative value resolves against the launch directory. Formats are on the [Files](files.md) page.
 
 ### `wfn_file` {: .kw data-type="path" data-default="WFN.h5" }
 Mean-field wavefunctions, BerkeleyGW format.
@@ -580,7 +568,7 @@ Four-component run: four-channel ζ fit, transverse Σ channels and a second cen
 ### `bispinor_gw` {: .kw data-type="enum" data-default="bare_transverse" }
 Four-current screening model.
 
-`full_tangential` needs `compute_mode = mpa`, `sigma_w_model = tangential` and `screening_diagrams = w_rpa`, and refuses `head_correction = full`; the old value `full_shared_pole` is still accepted. `full_static_cohsex` is one-shot on a slab.
+`full_tangential` needs `compute_mode = tangential` and `screening_diagrams = w_rpa`, and refuses `head_correction = full`; the old value `full_shared_pole` is still accepted. `full_static_cohsex` is one-shot on a slab.
 {: .kw-details }
 
 `bare_transverse` `full_tangential` `full_static_cohsex`
@@ -598,55 +586,10 @@ Empty means $\sigma_H = 0$; a named file that is absent refuses.
 ### `sigma_lorentz_debug_output` {: .kw data-type="bool" data-default="false" }
 Writes each four-current map's on-shell CC, CT+TC and TT matrices. Debug.
 
-**Multipole sampling**
-{: #mpa }
+**Head-fit sampling**
+{: #head-fit }
 
-These keys configure the elementwise MPA fit (`sigma_w_model = mpa`). Under `tangential` with the head on, the first seven set the sampling of the head fit and the last three refuse; with the head off all ten refuse (`GATE tangential_unused_inputs`).
-
-### `mpa_n_poles` {: .kw data-type="int" data-default="8" }
-Poles per matrix element, 1 to 16.
-
-### `mpa_sampling_alpha` {: .kw data-type="int" data-default="1 insulator, 2 metal" }
-Exponent of the nested sampling partition $\omega_n = \omega_m s_n^\alpha$.
-
-`1` `2`
-{: .kw-values }
-
-### `mpa_sampling_schedule` {: .kw data-type="enum" data-default="nested" }
-Continuation of the sampling above eight poles.
-
-`nested` `leon`
-{: .kw-values }
-
-### `mpa_pole_solver` {: .kw data-type="enum" data-default="loewner" }
-Pole identification method.
-
-`loewner` `companion` `thiele`
-{: .kw-values }
-
-### `mpa_varpi_near_ry` {: .kw data-type="float" data-default="0.2" }
-Height of the near complex sampling line, in Ry. Must be below `mpa_varpi_far_ry`.
-
-### `mpa_varpi_far_ry` {: .kw data-type="float" data-default="2.0" }
-Height of the far complex sampling line, in Ry.
-
-### `mpa_metal_origin_shift_ry` {: .kw data-type="float" data-default="2e-5" }
-Metal only: height of the first near-line sample, $z = i\cdot$shift, in Ry.
-
-Refused on an insulator; must lie below `mpa_varpi_near_ry`.
-{: .kw-details }
-
-### `mpa_pole_batch_size` {: .kw data-type="int" data-default="4" }
-Fitted-pole slabs resident during the MPA Σ, 1 to 8. Memory schedule only.
-
-### `mpa_fit_reuse_file` {: .kw data-type="path" data-default="(empty)" }
-A finalized MPA fit reused read-only, after authentication.
-
-Requires `compute_mode = mpa` and `qp_solver = one_shot_dft`.
-{: .kw-details }
-
-### `mpa_overwrite_completed_artifacts` {: .kw data-type="bool" data-default="false" }
-Permits replacing a completed MPA sample store or finalized fit.
+The head-fit sampling keys are listed on [this page](../../theory/multipole-w.md#keywords).
 
 **Plasmon pole**
 {: #ppm }

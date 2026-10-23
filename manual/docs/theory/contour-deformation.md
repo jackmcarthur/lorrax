@@ -29,12 +29,12 @@ head_correction             = off
 use_band_extrapolation      = false
 ```
 
-The first landing has four implementation limits, each a named refusal: no $\bq\to0$ head correction, `linalg = local` only, one η, and no band extrapolation. Without the head, Σ at Γ uses only the $\bq=0$ body of $V_\bq$ and $W_\bq$ ([The q → 0 head](q0-head.md)). The other `sigma_w_*`, `mpa_*` and pole-export keys refuse beside it, since this route builds no model of $W$.
+The first landing has four implementation limits, each a named refusal: no $\bq\to0$ head correction, `linalg = local` only, one η, and no band extrapolation. Without the head, Σ at Γ uses only the $\bq=0$ body of $V_\bq$ and $W_\bq$ ([The q → 0 head](q0-head.md)). The other `sigma_w_*` keys, the head-fit sampling keys and the pole-export keys refuse beside it, since this route builds no model of $W$.
 
 !!! refuses
     - `sigma_frequency_integration` other than `pole_model` or `contour_deformation` (`GATE cd_enum`).
     - Any `cd_*` key without `contour_deformation` (`GATE cd_applicability`).
-    - `compute_mode` other than `mpa`; `sigma_w_model`, `sigma_w_accuracy`, `sigma_w_support_sites_ev`, `write_w`, `write_poles`, `mpa_fit_reuse_file` or any `mpa_*` key named; `screening_diagrams` other than `w_rpa` (`GATE cd_applicability`).
+    - `compute_mode` other than `mpa`; `sigma_w_accuracy`, `sigma_w_support_sites_ev`, `write_w`, `write_poles` or any key of the [other W models](multipole-w.md#keywords) named; `screening_diagrams` other than `w_rpa` (`GATE cd_applicability`).
     - `head_correction` other than `off` (`GATE cd_head_unimplemented`); `linalg` other than `local` (`GATE cd_linalg_local`).
     - Band extrapolation on, including by default (`GATE cd_band_extrapolation_unimplemented`); a per-window η in `sigma_omega_patches_ev` (`GATE cd_single_eta`).
     - $h$ outside $(0,\eta/4]$ (`GATE cd_knot_step`); fewer than 5 imaginary nodes (`GATE cd_imaginary_nodes`).
