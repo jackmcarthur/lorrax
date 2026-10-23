@@ -10,6 +10,15 @@ band windows and the counts it takes are in
 Full-grid pivoting and continuous point refinement below are designs, not
 implemented production routes or measured speedups.
 
+When snapping merges candidates, the selector restores the candidate pool
+from the highest-weight unoccupied FFT-grid points. Symmetric selection
+adds complete spatial orbits and uses flat grid index to break equal-weight
+ties. Grid permutations are streamed one operation at a time, so this repair
+needs O(N_r + M) host storage, without a grid-by-candidate array. The pool
+never exceeds the FFT-grid capacity; whole-orbit budgets can leave a small
+unused remainder. Requests above the number of distinct FFT-grid points
+refuse before clustering.
+
 ## What is being optimized?
 
 The candidate Gram accumulates k batches and square tiles sized from the
