@@ -25,9 +25,8 @@ export LMOD_PAGER=none
 module load PrgEnv-gnu/8.7.0 "$MPICH_MOD" "$HDF5_MOD" "$ROCM_MOD" cmake cray-python/3.12.12
 # No wrapper-injected LibSci: PrgEnv-gnu loads the site-default cray-libsci and
 # the CC wrapper would add its threaded pair to the link.  The leg's one host
-# BLAS is the sequential, locking OpenBLAS its SLATE links (build_openblas_seq.sh,
-# copied into the SLATE-HIP install by build_slate_hip.sh), which arrives through
-# SLATE's CMake interface.
+# BLAS is the sequential, locking OpenBLAS (build_openblas_seq.sh), which libelpa
+# links and resolves from its own prefix.
 module unload cray-libsci 2>/dev/null || true
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"         # cmake probes jax.ffi.include_dir() from here
@@ -56,7 +55,7 @@ nm -D --defined-only "$SO" | grep -E " T (lrx_|lorrax_ffi_|Phdf)" | awk '{print 
 # Dependency closure (lxkit.native_provider).  The ROCm libraries resolve from
 # the directories the venv's JAX ROCm plugin maps them from (the rocm-sdk
 # wheels: one rocBLAS/rocSOLVER/hipBLASLt/RCCL/HIP runtime per process), the
-# SLATE-HIP stack and its OpenBLAS from the leg's own RPATH, MPI/HDF5 from the
+# ELPA prefix (libelpa and its OpenBLAS) from the leg's own RUNPATH, MPI/HDF5 from the
 # pinned directories.  The loader opens exactly those files and refuses a
 # process that maps another copy of any of them.
 # shellcheck disable=SC1091

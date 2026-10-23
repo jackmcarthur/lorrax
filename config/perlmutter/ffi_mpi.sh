@@ -5,11 +5,10 @@
 # and the module recipe (module/stack.sh).
 #   host leg: config/perlmutter/build_ffi_host.sh
 #   CUDA leg: config/perlmutter/build_ffi_cuda.sh
-#   SLATE:    src/ffi/cpp/stage/slate_build_perlmutter.sh (after PrgEnv-gnu)
 #
 # In a GPU run both legs are dlopened into one process, so they must name the
 # same libmpi.  cray-hdf5-parallel/1.14.3.7 (the phdf5 stage both legs share)
-# and the SLATE host install carry DT_NEEDED libmpi_gnu_123.so.12, which is
+# carries DT_NEEDED libmpi_gnu_123.so.12, which is
 # cray-mpich 9.0.1.  So everything pins to 9.0.1:
 #   - cray-mpich/9.0.1;
 #   - the LibSci that links it, cray-libsci/25.09.0.  The site-default 26.03.0
@@ -23,7 +22,7 @@
 # passed their own gates and the pair could not be sealed.
 #
 # To move to a new MPI, change these values and nothing else.  Every value
-# must still agree with the phdf5 stage's and SLATE's DT_NEEDED; GATE 1
+# must still agree with the phdf5 stage's DT_NEEDED; GATE 1
 # (gate_one_mpi.sh) and gate_one_odr.py (Gate 10) enforce that.
 # ============================================================================
 LORRAX_PM_MPICH_MODULE="cray-mpich/9.0.1"

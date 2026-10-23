@@ -56,7 +56,7 @@ The site configuration contains only:
 - the checkout, module destination, container image, and supplemental
   third-party Python directory;
 - the Shifter module set and native container layout;
-- immutable host stage roots for NVHPC, parallel HDF5, SLATE, and FFTW;
+- immutable host stage roots for NVHPC, parallel HDF5, the Cray runtime, and FFTW;
 - the CPU MPIwrapper build inputs.
 
 First-party Python services are package dependencies in the root
@@ -70,7 +70,7 @@ The Perlmutter container mounts these host stages at stable paths:
 |---|---|---|
 | `LORRAX_FFI_NVHPC_DIR` | `/lorrax_nvhpc` | selected cuSOLVERMp/cuBLASMp tree |
 | `LORRAX_FFI_PHDF5_DIR` | `/lorrax_phdf5` | one Cray parallel-HDF5 build |
-| `LORRAX_FFI_SLATE_DIR` | `/lorrax_slate` | SLATE support and Cray GPU transport |
+| `LORRAX_FFI_CRAY_DIR` | `/lorrax_cray` | Cray LibSci and GPU MPI transport (`stage/cray_runtime_stage.sh`) |
 | `LORRAX_FFI_FFTW_DIR` | `/lorrax_fftw` | double-precision serial FFTW engine |
 
 The corresponding `*_DEFAULT` values in `site_config.sh` are used unless an

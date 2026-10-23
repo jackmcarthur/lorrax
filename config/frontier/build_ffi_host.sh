@@ -11,10 +11,7 @@
 #   run environment is config/frontier/ffi_env.sh.
 # Needs:
 #   * the venv that will LOAD the library (its jaxlib supplies the XLA FFI
-#     headers): $LORRAX_OLCF_VENV, default $HOME/envs/lx-jax091-rocm7141;
-#   * the gpu_backend=none SLATE from config/frontier/build_slate_cpu.sh at
-#     $LORRAX_SLATE_HOST_INSTALL_DIR (default
-#     $HOME/software/slate_builds/cpu/install, the CMakeLists' own default).
+#     headers): $LORRAX_OLCF_VENV, default $HOME/envs/lx-jax091-rocm7141.
 #
 # This is the Frontier twin of config/perlmutter/build_ffi_host.sh, written
 # section for section in parallel so `diff` shows values.  The long arguments
@@ -35,10 +32,6 @@
 #                                        loop is used, announced at first use)
 #   fft        FFTW3 advanced interface  cray-fftw 3.3.10.11, found at RUN time
 #                                        by dlopen; never DT_NEEDED (GATE 5)
-#   slate      slate:: C++ templates     ICL SLATE v2025.05.28-1,
-#                                        gpu_backend=none, built against this
-#                                        LibSci + cray-mpich (NOT the OLCF
-#                                        slate module: it links OpenBLAS)
 #   phdf5      parallel HDF5             cray-hdf5-parallel 1.14.3.7 (.so.310)
 #   MPI        one libmpi                cray-mpich 9.0.1, libmpi_gnu_123.so.12
 # The versions and the reasons for them are in config/frontier/ffi_mpi.sh.
@@ -69,9 +62,8 @@ LORRAX_OLCF_CMAKE="${LORRAX_OLCF_CMAKE:-$LORRAX_OLCF_CMAKE_MODULE}"
 # GATE 7's have-side.  Bare host, both legs load the module's HDF5, so the
 # stage defaults to that module's HDF5_DIR (set below, once it is loaded).
 LORRAX_OLCF_PHDF5_STAGE="${LORRAX_FFI_PHDF5_DIR:-}"
-# LibSci threading flavour; MUST match the SLATE install's (checked below).
+# LibSci threading flavour: ONE per process (the threaded _mp pair).
 LORRAX_OLCF_LIBSCI_FLAVOUR="${LORRAX_OLCF_LIBSCI_FLAVOUR:-_mp}"
-LORRAX_SLATE_HOST_INSTALL_DIR="${LORRAX_SLATE_HOST_INSTALL_DIR:-$HOME/software/slate_builds/cpu/install}"
 LORRAX_OLCF_VENV="${LORRAX_OLCF_VENV:-$HOME/envs/lx-jax091-rocm7141}"
 LORRAX_VENV_PY="$LORRAX_OLCF_VENV/bin/python"
 # XLA FFI headers must match the RUNTIME jaxlib.
@@ -142,12 +134,6 @@ if [[ ! -f "$LORRAX_XLA_FFI_HEADERS_DIR/xla/ffi/api/ffi.h" ]]; then
     echo "[build_ffi_host] ERROR: XLA FFI headers not at $LORRAX_XLA_FFI_HEADERS_DIR" >&2
     exit 2
 fi
-if [[ ! -d "$LORRAX_SLATE_HOST_INSTALL_DIR/lib64" ]]; then
-    echo "[build_ffi_host] ERROR: gpu_backend=none SLATE not found at" >&2
-    echo "[build_ffi_host]   $LORRAX_SLATE_HOST_INSTALL_DIR" >&2
-    echo "[build_ffi_host] Build it with: bash config/frontier/build_slate_cpu.sh" >&2
-    exit 2
-fi
 
 # ---------------------------------------------------------------------------
 # PRE-FLIGHT 1: the eleven ScaLAPACK/BLACS names must be in LibSci.
@@ -166,26 +152,6 @@ if [[ -n "$missing" ]]; then
     exit 2
 fi
 echo "[build_ffi_host] pre-flight: all 11 ScaLAPACK/BLACS symbols present in $(basename "$SCALAPACK_SO")"
-
-# ---------------------------------------------------------------------------
-# PRE-FLIGHT 2 (Frontier addition): the SLATE install agrees with this leg —
-# same libmpi SONAME, same LibSci flavour, no GPU runtime, no second BLAS.
-# A disagreement here is a GATE 1 / GATE 2 failure found before compiling.
-# ---------------------------------------------------------------------------
-_slate_needed="$(for f in "$LORRAX_SLATE_HOST_INSTALL_DIR"/lib64/lib{slate,blaspp,lapackpp}.so; do
-                    readelf -d "$f" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p'; done | sort -u)"
-grep -qx "$LORRAX_OLCF_MPI_SONAME" <<<"$_slate_needed" || {
-    echo "[build_ffi_host] ERROR: SLATE does not link $LORRAX_OLCF_MPI_SONAME:" >&2
-    printf '    %s\n' $_slate_needed >&2; exit 2; }
-grep -qx "libsci_gnu_mpi${LORRAX_OLCF_LIBSCI_FLAVOUR}.so.6\|libsci_gnu${LORRAX_OLCF_LIBSCI_FLAVOUR}.so.6" <<<"$_slate_needed" || {
-    echo "[build_ffi_host] ERROR: SLATE links no libsci_gnu*${LORRAX_OLCF_LIBSCI_FLAVOUR}; flavours would differ:" >&2
-    printf '    %s\n' $_slate_needed >&2; exit 2; }
-if grep -qiE 'amdhip|rocblas|rocsolver|hipblas|cudart|cublas|openblas|mkl_' <<<"$_slate_needed"; then
-    echo "[build_ffi_host] ERROR: SLATE links a GPU runtime or a second BLAS:" >&2
-    printf '    %s\n' $_slate_needed >&2; exit 2
-fi
-echo "[build_ffi_host] pre-flight: SLATE links $LORRAX_OLCF_MPI_SONAME and libsci${LORRAX_OLCF_LIBSCI_FLAVOUR} only"
-unset _slate_needed
 
 # ---------------------------------------------------------------------------
 # Configure + build.  Explicit ScaLAPACK link line (the CMake probe expects an
@@ -210,7 +176,6 @@ cmake "$SRC" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER=CC \
     -DLORRAX_XLA_FFI_INCLUDE_DIR="$LORRAX_XLA_FFI_HEADERS_DIR" \
-    -DLORRAX_SLATE_HOST_INSTALL_DIR="$LORRAX_SLATE_HOST_INSTALL_DIR" \
     -DLORRAX_SCALAPACK_LIBRARIES="-L$LORRAX_OLCF_LIBSCI_DIR/lib -Wl,--no-as-needed -lsci_gnu_mpi${F} -lsci_gnu${F} -lgomp -lpthread -lm -ldl" \
     -DLORRAX_CBLAS_INCLUDE_DIR="$LORRAX_OLCF_LIBSCI_DIR/include" \
     -DLORRAX_CBLAS_LIBRARY="$LORRAX_OLCF_LIBSCI_DIR/lib/libsci_gnu${F}.so" \
@@ -264,22 +229,22 @@ fi
 echo "[build_ffi_host] GATE 9 PASSED: 0 lorrax_ffi internals exported, all $(grep -cE '^lrx_' <<<"$_dynsyms") lrx_* entry points leg-suffixed"
 unset _dynsyms
 
-# Dependency closure (lxkit.native_provider), as on Perlmutter: the SLATE
-# install and the pinned MPI/HDF5/LibSci files, enforced by the loader.
+# Dependency closure (lxkit.native_provider), as on Perlmutter: the pinned
+# MPI/HDF5/LibSci files, enforced by the loader.
 "$LORRAX_VENV_PY" "$LORRAX_ROOT/src/ffi/cpp/stage/write_checkout_closure.py" \
-    "$SO_FILE" --private-dir "$LORRAX_SLATE_HOST_INSTALL_DIR/lib64" \
+    "$SO_FILE" \
     --library-dirs "$LORRAX_OLCF_RUNTIME_LIB_DIRS" || {
         echo "[build_ffi_host] FAILED: dependency closure" >&2; exit 1; }
 _closure_sha="$("$LORRAX_VENV_PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["record_sha256"])' "$SO_FILE.closure.json")"
 
-# All five host backends are built here.  GATE 8 needs a python that imports
+# All four host backends are built here.  GATE 8 needs a python that imports
 # jax and must run inside an allocation; LORRAX_GATE_FFTW_PY is passed so a
 # run on a compute node executes it (on a login node it is not evidence).
-LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-scalapack,gemm,slate,phdf5,fft}" \
+LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-scalapack,gemm,phdf5,fft}" \
 LORRAX_FFI_EXPECT_MPI="${LORRAX_FFI_EXPECT_MPI:-$LORRAX_OLCF_MPI_SONAME}" \
 LORRAX_FFI_EXPECT_HDF5_SOVERSION="${LORRAX_FFI_EXPECT_HDF5_SOVERSION:-$_stage_sov}" \
 LORRAX_PHDF5_STAGE="$LORRAX_OLCF_PHDF5_STAGE" \
-LD_LIBRARY_PATH="$LORRAX_SLATE_HOST_INSTALL_DIR/lib64:$LORRAX_OLCF_RUNTIME_LIB_DIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+LD_LIBRARY_PATH="$LORRAX_OLCF_RUNTIME_LIB_DIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 LORRAX_GATE_FFTW_PY="${LORRAX_GATE_FFTW_PY:-}" \
 GATE_TAG=build_ffi_host \
     bash "$LORRAX_ROOT/scripts/verify_ffi_build.sh" --leg host "$SO_FILE" || {
@@ -299,7 +264,6 @@ GATE_TAG=build_ffi_host \
     "hdf5=$LORRAX_OLCF_HDF5" \
     "phdf5_stage=$LORRAX_OLCF_PHDF5_STAGE" \
     "fftw=$LORRAX_OLCF_FFTW" \
-    "slate=$LORRAX_SLATE_HOST_INSTALL_DIR" \
     "venv=$LORRAX_OLCF_VENV" || {
         echo "[build_ffi_host] WARNING: provenance stamp failed" >&2
     }
