@@ -926,9 +926,10 @@ def driver_persists_w0(mode, config) -> bool:
       persisted; BSE reconstructs the scalar static response.
 
     ``compute_mode = mpa`` with ``sigma_w_model = tangential`` (the
-    production W) answers yes, one-shot and self-consistent alike:
-    :func:`restart_static_w` evaluates the model at ω = 0 through the Σ
-    synthesis owner.  A self-consistent run evaluates the accepted final
+    production W) answers yes, one-shot and self-consistent alike: the
+    scalar one-shot persists one static Dyson solve at ω = 0, the others
+    the model at ω = 0 through the Σ synthesis owner
+    (:func:`restart_static_w`).  A self-consistent run evaluates the accepted final
     map's model, once, after the loop (``sc_iteration.run_sc_driver``).
     The bispinor charge route (``bispinor_gw = bare_transverse`` with the
     tangential) is included: its store is the four-component charge
@@ -962,18 +963,32 @@ def driver_persists_w0(mode, config) -> bool:
 
 
 def restart_static_w(mode, W_by_role, V_q, *, config, meta, mesh_xy,
-                     material_class=None, head_source=None, print_fn=print):
+                     material_class=None, head_source=None, print_fn=print,
+                     static_solve_inputs=None):
     """The static W the driver persists as ``W0_qmunu``, or ``None``.
 
     Non-MPA modes: the ``static`` role, the Dyson W(ω = 0) (``V_q`` when
-    the mode screened nothing).  MPA on the scalar tangential store: a
-    zero-argument callable that returns ``V + Wc(0)`` on ``V_q``'s own q
-    wedge, with ``Wc(0)`` from :func:`gw.mpa.sigma.tangential_static_wc`
-    (the Σ synthesis at the ω = 0 coefficient) and its pre-unfold wedge
-    deposited for the restart writer exactly as the Dyson route deposits
-    its own.  It is a callable so the evaluation runs only after
-    ``persist_w0_and_head`` has passed its write-policy preflight: a run
-    that writes no restart pays nothing.
+    the mode screened nothing).  Pole routes return a zero-argument
+    callable, so the evaluation runs only after ``persist_w0_and_head`` has
+    passed its write-policy preflight: a run that writes no restart pays
+    nothing.
+
+    One-shot scalar tangential (``static_solve_inputs`` given: the
+    screening ``wfns``, the static minimax ``quad`` and ``e_ref``, ``sym``,
+    ``centroid_indices``, ``occupation_state``): ONE static χ₀ build and
+    Dyson solve through :func:`compute_static_w` (role ``static``), so W0
+    and the srlr long-range channels (``W0_lr``, :mod:`gw.lr_channels`)
+    come from the same χ₀(0) and the split W = J + F̃ᴴDF̃ the fine-grid BSE
+    uses is exact.  The tangential support set holds no z = 0 sample (its
+    imaginary ladder is geometric, > 0), so the channels cannot be taken
+    from the bank.  No head channel is placed: the tangential Σ's W has
+    none either.  Σ never reads this W.
+
+    Otherwise (the SC final map, the bispinor charge routes): ``V + Wc(0)``
+    on ``V_q``'s own q wedge, with ``Wc(0)`` from
+    :func:`gw.mpa.sigma.tangential_static_wc` (the Σ synthesis at the
+    ω = 0 coefficient) and its pre-unfold wedge deposited for the restart
+    writer exactly as the Dyson route deposits its own; no ``W0_lr``.
 
     ``None`` is returned, with the reason printed, when the head at ω = 0
     that must be stored beside it does not exist: a metal (this writer
@@ -997,6 +1012,16 @@ def restart_static_w(mode, W_by_role, V_q, *, config, meta, mesh_xy,
         log.info(f"  W0_qmunu NOT persisted: {why}.  A BSE on this restart "
                  "rebuilds the scalar static response.")
         return None
+    if static_solve_inputs is not None and not bool(getattr(config, "bispinor", False)):
+        def solve():
+            log.info("  W0 for BSE: static Dyson solve at omega = 0 "
+                     "(+1 chi0 build and Dyson solve); srlr channels from the same chi0")
+            s = dict(static_solve_inputs)
+            return compute_static_w(
+                s.pop("wfns"), V_q, s.pop("quad"), config=config, meta=meta,
+                mesh_xy=mesh_xy, role="static", **s)
+
+        return solve
     handle = W_by_role["tangential"]
 
     def evaluate():
