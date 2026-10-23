@@ -356,7 +356,7 @@ def build_feature_metric_diagonal(
     for c0 in range(0, parents_used.size, k_chunk):
         chunk = tuple(int(p) for p in parents_used[c0:c0 + k_chunk])
         k_spec = IBZRows(chunk)
-        box_index = wfn.box_index(k=k_spec)
+        box_index = wfn.box_index(k=k_spec, cache=False)
         density = [None] * len(windows)
         for lo in range(union_lo, union_hi, band_chunk):
             hi = min(lo + band_chunk, union_hi)

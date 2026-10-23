@@ -401,6 +401,14 @@ M_axis  = 16·n_par·n_s·μ·N_b·(1/p_x + 1/p_y)
 M_panel = 2·16·n_par·n_s·μ·(N_b/p_x)·(1/p_x + 1/p_y)    one Green build's two live SUMMA panels
 ```
 
+The shared centroid sampler's band-complete X/Y outputs use `M_axis` with
+the requested k rows. Its persistent streamed outputs have exactly the
+requested k and band extents; only transfer/FFT tiles carry terminal pad
+rows. The terminal tile is trimmed after its face reshard and before its
+donated insertion, so no final padded-output crop overlaps two complete
+face pairs. Transfer faces and the local full-grid FFT scan remain separate
+workspaces; the fixed tile is a workspace target, not a total-process cap.
+
 With `s = n_par/N_k` (the symmetry reduction) and `r = N_b/μ`, in units of
 the Green tile:
 
