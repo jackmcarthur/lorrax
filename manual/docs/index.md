@@ -65,6 +65,7 @@ LORRAX computes quasiparticle energies $E^{\mathrm{QP}}_{n\bk}$ in the GW approx
 ## Where to start {: #start }
 
 - New to LORRAX: [Installation](using/installation.md), then [Quickstart](using/quickstart.md) for the full sequence from `pw.x` to an absorption spectrum.
+- Following a worked example: [MoS₂ with spin–orbit coupling](tutorials/mos2-soc.md) adds a fully relativistic LORRAX track to the BerkeleyGW 2026 workshop, with executed GW/BSE results and comparison plots.
 - Preparing a material: [Required DFT inputs](using/inputs-from-dft.md) states what `WFN.h5` must contain and which QE settings it needs.
 - Coming from BerkeleyGW: [For BerkeleyGW users](using/berkeleygw-users.md) maps `epsilon.inp`, `sigma.inp`, `kernel.inp` and `absorption.inp` keywords to LORRAX keys.
 - Looking up an input key: the Input keywords page of each driver. Environment variables are on [Environment variables](using/environment.md).

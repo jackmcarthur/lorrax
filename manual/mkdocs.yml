@@ -81,6 +81,8 @@ nav:
       - Required DFT inputs: using/inputs-from-dft.md
       - Environment variables: using/environment.md
       - For BerkeleyGW users: using/berkeleygw-users.md
+  - Tutorials:
+      - "MoS₂ with spin–orbit coupling": tutorials/mos2-soc.md
   - Drivers:
       - gw:
           - Overview: drivers/gw/index.md

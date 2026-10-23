@@ -1,44 +1,75 @@
 Hands-on Session: Spin-Orbit Coupling (SOC) - BSE - LORRAX Fully Rel
 =================================================================
 
-This track uses the same fully relativistic mean field as the workshop.
-It consumes the LORRAX GW result in `../../2-gw/3-lorrax_fully_rel`.
+Overview
+--------
+
+In this directory, we will calculate optical absorption with spin-orbit
+coupling using LORRAX. This track reads the GW result in
+`../../2-gw/3-lorrax_fully_rel` and is parallel to `../2-fully_rel`.
+
+Goals
+-----
+
+1. Export the native screened interaction as a BerkeleyGW BSE kernel.
+2. Solve the native BSE and compare absorption with and without electron-hole
+   interactions.
+3. Compare the fully relativistic spectra with the BerkeleyGW track.
 
 Instructions
 ------------
 
-1. Run `bash 01-link_files.sh`.
+1. Finish the LORRAX GW track, then run `bash 01-link_files.sh` here.
+   Inspect `gw.in` in `1-kernel` and `2-absorption`; compare them with
+   `../2-fully_rel/1-kernel/kernel.inp` and
+   `../2-fully_rel/2-absorption/absorption.inp`.
 
-2. In `1-kernel`, run `bash 01-run_kernel.run`. The native LORRAX exporter
-   writes `bsemat.h5` in BerkeleyGW's format. Its explicit full-grid
-   `WFN_co.h5` is the additional 3 x 3 mean-field calculation in
-   `1-mf/2-fully_rel/2c-Wfn_full`; this provides the coefficient gauge and
-   k ordering required by the exporter. It does not replace the workshop's
-   original 200-band WFN used by GW.
+2. Go to `1-kernel` and run `bash 01-run_kernel.run`. Check `kernel.out`.
+   The exporter writes `bsemat.h5` using the explicit full-grid `WFN_co.h5`
+   from `../../1-mf/2-fully_rel/2c-Wfn_full` to match its coefficient gauge and
+   k ordering. The coarse grid is `3 3 1`; GW still uses its 200-band sums.
 
-3. In `2-absorption`, run `bash 01-run_absorption.run`. LORRAX solves its
-   matrix-free BSE from the same native restart used to export the kernel.
-   The retained bands, fine grid and shift are the workshop's: six valence,
-   eight conduction, 8 x 8 x 1, shift (0.47, 0.37, 0).
+3. Go to `2-absorption` and run `bash 01-run_absorption.run`. LORRAX solves
+   its matrix-free BSE from the same native GW restart used for the export.
+   The fine window is six valence and eight conduction bands on `8 8 1`,
+   with shift `(0.47, 0.37, 0)`.
 
-4. Check the solver's residual and convergence report. The requested
-   3,072 roots cover the complete retained TDA transition space; the
-   Gaussian width is the workshop's 0.15 eV. The output includes
-   `eigenvalues.dat`, `eigenvectors.h5`, `absorption_eh.dat` and `absorption_noeh.dat` in the
-   BerkeleyGW layouts.
+4. Check `absorption.out` for convergence of all 3,072 requested roots and
+   inspect the residuals. These roots cover the complete retained
+   Tamm–Dancoff transition space. The outputs include `eigenvalues.dat`,
+   `eigenvectors.h5`, `absorption_eh.dat` and `absorption_noeh.dat`.
 
-The explicit reciprocal-basis polarization `(1, 1, 0)` matches the
-BerkeleyGW reference default, which follows its fine-grid shift. Its
-velocity operator uses a finite shift; LORRAX uses its analytic velocity
-operator, so a finite numerical difference is expected.
+5. After the adjacent fully relativistic BerkeleyGW reference has run, plot
+   the interacting and independent-particle spectra:
 
-5. After the BerkeleyGW fully relativistic reference has run, execute
-   `"$LORRAX/.venv/bin/python" 02-plot_absorption.py` to compare both implementations. This
-   comparison needs no scalar-relativistic calculation.
+   ```bash
+   "$LORRAX/.venv/bin/python" 02-plot_absorption.py
+   ```
 
-The 22 coarse conduction states include interpolation guards. The retained
-fine BSE space stays at six valence and eight conduction bands, and the
-exported kernel retains twelve valence/twelve conduction states. The
-48-band coarse manifold has a global 49.79 meV upper DFT gap; it avoids
-inverting vanishing velocity weights. Spectra use a 0.01 eV grid through
-17 eV; BerkeleyGW chooses each file’s end point automatically.
+   Compare the onset, peak positions and stage timings between the two codes.
+   No scalar-relativistic calculation is needed for this comparison.
+
+Calculation settings
+--------------------
+
+The 22 coarse conduction states are part of the 48-band interpolation
+manifold, including guards. The retained fine space stays at six valence and
+eight conduction bands; the exported kernel uses twelve valence and twelve
+conduction bands. The saved coarse manifold has a 49.79 meV global upper DFT
+gap, allowing the unweighted velocity interpolation route.
+
+The reciprocal-basis polarization is `(1, 1, 0)`, matching the BerkeleyGW
+reference default. BerkeleyGW uses finite-shift velocity matrix elements;
+LORRAX uses its analytic velocity operator. The Gaussian width is 0.15 eV,
+and the native spectra run from 0 to 17 eV in 0.01 eV steps. BerkeleyGW chooses
+each file's end point automatically.
+
+Comparison
+----------
+
+The saved native fine-grid onset is 2.511 eV, versus 1.592 eV in BerkeleyGW.
+This substantial disagreement remains unresolved. Convergence of all retained
+roots is a solver check, not convergence of the physical spectrum or proof
+of agreement between codes. See the [saved results](https://github.com/jackmcarthur/lorrax/blob/main/examples/MoS2_SOC_2026/results/README.md)
+for the spectra and controlled comparisons. The workshop's small grids and
+band counts should not be used as converged MoS2 predictions.

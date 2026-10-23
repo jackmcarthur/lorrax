@@ -1,11 +1,34 @@
-# MoS2 SOC: BerkeleyGW 2026 workshop and LORRAX
+Hands-on Session: Spin-Orbit Coupling (SOC) with LORRAX
+=====================================================
 
-Follow [the walkthrough](README-LORRAX.md) to download the checksum-pinned
-workshop example and generate parallel fully relativistic GW/BSE folders.
-[Preparation](perlmutter/README.md) lists the tested Perlmutter modules and
-mean-field commands. The original workshop materials are fetched with their
-LICENSE; this directory contains the LORRAX additions.
+Overview
+--------
 
-[Executed results and comparison](results/README.md) include the actual tables,
-plots and reader tests. The native fine-grid BSE onset differs from BerkeleyGW
-(2.511 versus 1.592 eV); that remaining difference is explicit in the report.
+In this example, we will calculate the quasiparticle bandstructure and optical
+absorption of MoS2 with spin-orbit coupling using LORRAX. We will use the fully
+relativistic mean field from the 2026 BerkeleyGW workshop and compare the two
+codes in parallel GW and BSE folders.
+
+The workshop uses small cutoffs, k-point grids and band counts for teaching.
+These are not converged predictions. The saved native fine-grid BSE onset is
+2.511 eV versus 1.592 eV in BerkeleyGW; this disagreement remains unresolved.
+
+Goals
+-----
+
+1. Compute a fully relativistic GW bandstructure with LORRAX.
+2. Solve the BSE and plot interacting and independent-particle absorption.
+3. Compare the inputs, outputs and timings with the BerkeleyGW track.
+
+Instructions
+------------
+
+1. Follow [README-LORRAX.md](README-LORRAX.md) to download and prepare a new
+   working copy. The original workshop files and LICENSE stay in that copy;
+   this directory supplies the additional LORRAX folders.
+2. Work through [GW](2-gw/3-lorrax_fully_rel/README.md), then
+   [BSE](3-bse/3-lorrax_fully_rel/README.md), in numerical order. The
+   [Perlmutter preparation guide](perlmutter/README.md) gives the modules and
+   mean-field commands.
+3. Compare your plots and tables with the [saved results](results/README.md),
+   which distinguish successful execution from agreement between the codes.

@@ -18,6 +18,7 @@
 - [Input keywords](https://jackmcarthur.github.io/lorrax/drivers/nscf/keywords/): manual/docs/drivers/nscf/keywords.md
 - [Theory](https://jackmcarthur.github.io/lorrax/drivers/nscf/theory/): manual/docs/drivers/nscf/theory.md
 - [LORRAX](https://jackmcarthur.github.io/lorrax/): manual/docs/index.md
+- [MoS₂ with spin–orbit coupling](https://jackmcarthur.github.io/lorrax/tutorials/mos2-soc/): manual/docs/tutorials/mos2-soc.md
 - [Band extrapolation](https://jackmcarthur.github.io/lorrax/theory/band-extrapolation/): manual/docs/theory/band-extrapolation.md
 - [Centroid selection](https://jackmcarthur.github.io/lorrax/theory/centroid-selection/): manual/docs/theory/centroid-selection.md
 - [Contour deformation](https://jackmcarthur.github.io/lorrax/theory/contour-deformation/): manual/docs/theory/contour-deformation.md
