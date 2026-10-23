@@ -644,10 +644,8 @@ def _gram_q0_tiled_from_psi_kernel(
 	local_tile_cols = int(tile_width) // n_y
 	n_row_tiles = -(-local_rows // local_tile_rows)
 	n_col_tiles = -(-local_cols // local_tile_cols)
-	n_tiles = n_row_tiles * n_col_tiles
 	row_tail = local_rows - (n_row_tiles - 1) * local_tile_rows
 	col_tail = local_cols - (n_col_tiles - 1) * local_tile_cols
-	has_tail = (row_tail != local_tile_rows or col_tail != local_tile_cols)
 	cache_key = (
 		'gram_q0_tiled_from_psi_sm', _mesh_key(mesh_xy), nk, n_points,
 		nb_l, nb_r, nspinor, tile_width, gamma_mode,
@@ -680,12 +678,7 @@ def _gram_q0_tiled_from_psi_kernel(
 		         out_specs=out_spec, check_vma=False)
 		def _local(G_local, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
 		           perm_L_, phase_L_, perm_R_, phase_R_):
-			def _one_tile(G_acc, tile_idx):
-				# Preserve the incumbent c-outer/r-inner tile order.  There is no
-				# arithmetic dependence between tiles, but the order is useful HLO
-				# evidence that this is the same fixed schedule in one executable.
-				c_idx = tile_idx // jnp.int32(n_row_tiles)
-				r_idx = tile_idx - c_idx * jnp.int32(n_row_tiles)
+			def _one_tile(G_acc, r_idx, c_idx, row_count, col_count):
 				r_start = r_idx * jnp.int32(local_tile_rows)
 				c_start = c_idx * jnp.int32(local_tile_cols)
 
@@ -711,56 +704,40 @@ def _gram_q0_tiled_from_psi_kernel(
 					symmetrize=False,
 					transverse_feature_sum=transverse,
 				)
-				# A two-index ``.at[].set(mode='drop')`` lowers this contiguous
-				# tile store to one scalar scatter iteration per matrix element.
-				# At CrI3 M=588/P4 that was 294^2=86,436 iterations and four
-				# tiny GPU kernels each.  DUS expresses the actual operation.  A
-				# static four-way tail switch keeps the final partial row/column
-				# exact without a larger padded Gram or a read/merge of G_acc.
-				if not has_tail:
-					G_acc = jax.lax.dynamic_update_slice(
-						G_acc, G_tile, (r_start, c_start))
-				else:
-					row_last = r_idx == jnp.int32(n_row_tiles - 1)
-					col_last = c_idx == jnp.int32(n_col_tiles - 1)
-					branch = (jnp.asarray(row_last, dtype=jnp.int32) * 2
-					          + jnp.asarray(col_last, dtype=jnp.int32))
+				G_acc = jax.lax.dynamic_update_slice(
+					G_acc, G_tile[:row_count, :col_count], (r_start, c_start))
+				return G_acc
 
-					def _store_full(args):
-						G_, tile_, r_, c_ = args
-						return jax.lax.dynamic_update_slice(
-							G_, tile_, (r_, c_))
+			# Preserve the c-outer/r-inner schedule and the full padded tile
+			# arithmetic. Static edge epilogues keep every Gram store outside
+			# a conditional: returning the whole carry from a tail switch forces
+			# two complete local-Gram copies per tile on the GPU backend.
+			def _full_column(G_acc, c_idx):
+				def _full_row(G_acc, r_idx):
+					return _one_tile(G_acc, r_idx, c_idx,
+					                 local_tile_rows, local_tile_cols), None
+				if n_row_tiles > 1:
+					G_acc, _ = jax.lax.scan(
+						_full_row, G_acc,
+						jnp.arange(n_row_tiles - 1, dtype=jnp.int32), unroll=1)
+				return _one_tile(G_acc, jnp.int32(n_row_tiles - 1), c_idx,
+				                 row_tail, local_tile_cols), None
 
-					def _store_col_tail(args):
-						G_, tile_, r_, c_ = args
-						return jax.lax.dynamic_update_slice(
-							G_, tile_[:, :col_tail], (r_, c_))
+			if n_col_tiles > 1:
+				G_local, _ = jax.lax.scan(
+					_full_column, G_local,
+					jnp.arange(n_col_tiles - 1, dtype=jnp.int32), unroll=1)
 
-					def _store_row_tail(args):
-						G_, tile_, r_, c_ = args
-						return jax.lax.dynamic_update_slice(
-							G_, tile_[:row_tail, :], (r_, c_))
+			def _last_column_row(G_acc, r_idx):
+				return _one_tile(G_acc, r_idx, jnp.int32(n_col_tiles - 1),
+				                 local_tile_rows, col_tail), None
 
-					def _store_corner(args):
-						G_, tile_, r_, c_ = args
-						return jax.lax.dynamic_update_slice(
-							G_, tile_[:row_tail, :col_tail], (r_, c_))
-
-					G_acc = jax.lax.switch(
-						branch,
-						(_store_full, _store_col_tail,
-						 _store_row_tail, _store_corner),
-						(G_acc, G_tile, r_start, c_start),
-					)
-				return G_acc, None
-
-			G_local, _ = jax.lax.scan(
-				_one_tile,
-				G_local,
-				jnp.arange(n_tiles, dtype=jnp.int32),
-				unroll=1,
-			)
-			return G_local
+			if n_row_tiles > 1:
+				G_local, _ = jax.lax.scan(
+					_last_column_row, G_local,
+					jnp.arange(n_row_tiles - 1, dtype=jnp.int32), unroll=1)
+			return _one_tile(G_local, jnp.int32(n_row_tiles - 1),
+			                 jnp.int32(n_col_tiles - 1), row_tail, col_tail)
 
 		if nested:
 			@partial(jax.jit,
