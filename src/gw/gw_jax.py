@@ -1829,6 +1829,9 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 		    V_q, W_by_role, centroid_indices, config, head_resolver, mesh_xy, meta, mode, print0,
 		    qp_solver, sym, tensors_filename, photon_response=photon_response,
 		    material_class=material_class, head_response=oneshot_head_response)
+		if qp_solver is not QPSolver.SELF_CONSISTENT:
+			from .tangential_screening import release_coulomb_cache
+			release_coulomb_cache()
 		(
 		    static_head_terms) = _prepare_static_head(
 		    config, do_screened, head_resolver, meta, mode, qp_solver,

@@ -2029,8 +2029,10 @@ def response_coulomb_powers(meta, config, *, mesh_xy, bank_io, q_span):
 
     H=V^1/2 and H_pinv=V^-1/2 on the numerical PSD support (zero outside).
     Both outputs are packed complex128 ``[b,mu_p,mu_p]`` face arrays at
-    ``P(None,'x','y')``. They are temporary caller-owned resources, never
-    a retained full-q copy. The receipt binds the Coulomb hash and ranks.
+    ``P(None,'x','y')``. The response owner caches these roots for reuse by
+    the bank and constructor. The driver releases that cache after its last
+    screening use; callers holding an output retain their own reference.
+    The receipt binds the Coulomb hash and ranks.
     """
     from .response_bank import (_bank_execution, _coulomb_batch, _receipt,
                                 authenticate_coulomb)

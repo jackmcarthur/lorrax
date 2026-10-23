@@ -1275,6 +1275,18 @@ def _coulomb_pack(basis,mesh_xy):
 _COULOMB_ROOTS: dict = {}
 
 
+def release_coulomb_cache():
+    """Release the bare-operator and root holds after their last screening use.
+
+    Ordinary callers keep their arrays; only the cache's references are
+    removed. One-shot GW calls this before Sigma, and QSGW after its final
+    W0 persist, retaining root reuse between its maps.
+    """
+    _COULOMB_ROOTS.clear()
+    _COULOMB_OPERATORS.clear()
+    _OPERATOR_DIGESTS.clear()
+
+
 def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
     """Read one authenticated canonical V batch; convert through its owner."""
     if "photon_v" in bank_io:

@@ -154,6 +154,13 @@ root reconstructions use local GEMMs.
 Both outputs remain `H_q(mu_X,nu_Y)` faces. The programs and executable
 caches retain geometry and plans, never the Coulomb input.
 
+The response bank and tangential screening owner share bare-V parent rows
+and both Coulomb roots across their bank, moment and constructor calls.
+One-shot GW releases these cache references after W0 persistence and before
+Sigma. QSGW retains reuse between maps and releases them after the final
+W0 persistence. Clearing these holds does not delete arrays still owned by
+callers or clear compiled programs.
+
 The nodal fit keeps sampled states on centroid faces. Whole-orbit packing
 allows each rank to accumulate its normal-equation tile without gathering
 node samples or a whole orbit matrix. The shared nonnegative quadratic solver
