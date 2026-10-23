@@ -299,7 +299,14 @@ The planner decides in this order:
    ([memory model](memory-model.md#the-compiled-check)).
 
 The fit then packs whole orbits into bins of at most the planned b/P with
-the least padded work, n_batch·(c+1) (`best_owner_orbit_batches`). The
+the least padded work, n_batch·(c+1) (`best_owner_orbit_batches`). The search
+computes orbit membership and its stable largest-first order once, scores
+all candidate widths from the shared LPT partition metadata, and constructs
+centroid slots and endpoint/wrap tables only for the winner. It keeps the
+same descending-width order and first-candidate tie rule, so the selected
+batch and every transport-table byte agree with exhaustive materialization.
+The metadata search holds only linear-size orbit, owner and load arrays;
+it retains no table bank across candidates or fits. The
 planner's floor keeps every bin within the plan (CrI3 24×24 P36: 12-member
 orbits make the batch 432, which the plan prices, not 36).
 `route_g_plane_chunk` prices the packed batch: the source rows (X_B, pair

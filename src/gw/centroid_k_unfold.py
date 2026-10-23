@@ -611,6 +611,46 @@ def widest_unfold_orbit(k_unfold_plan) -> int:
     return int(max(sizes, default=1))
 
 
+def _unfold_orbit_packing(plan):
+    """The orbit members and stable LPT order, shared by shape search and materialization."""
+    members, sizes = unfold_orbits(plan)
+    by_size = sorted(range(len(members)),
+                     key=lambda g: (-int(sizes[g]), int(members[g][0])))
+    return members, sizes, by_size
+
+
+def _partition_orbit_bins(packing, n_ranks, b_target):
+    """The existing LPT bin assignment without allocating endpoint/wrap tables.
+
+    Returns ``(owner, loads, b)``. Every candidate uses the same largest-first
+    order and least-load tie break as :func:`orbit_mu_batches`; only the
+    selected candidate needs its centroid slots and symmetry-action tables.
+    """
+    import heapq
+
+    members, sizes, by_size = packing
+    P_ = int(n_ranks)
+    up = lambda v: -(-int(v) // P_) * P_
+    b_cap = max(up(int(sizes.max())), (int(b_target) // P_) * P_)
+    n_batch = max(1, -(-int(np.sum(sizes)) // b_cap))
+    while True:
+        heap = [(0, beta) for beta in range(n_batch)]
+        owner = np.empty((len(members),), dtype=np.int64)
+        loads = np.zeros((n_batch,), dtype=np.int64)
+        ok = True
+        for g in by_size:
+            load, beta = heapq.heappop(heap)
+            if load + int(sizes[g]) > b_cap:
+                ok = False
+                break
+            owner[g] = beta
+            loads[beta] = load + int(sizes[g])
+            heapq.heappush(heap, (int(loads[beta]), beta))
+        if ok:
+            return owner, loads, up(int(loads.max()))
+        n_batch += 1
+
+
 def orbit_mu_batches(k_unfold_plan, mu_pad: int, n_ranks: int, *,
                      b_target: int) -> MuOrbitBatches:
     """Pack the plan's centroid orbits whole into batches of about ``b_target``.
@@ -628,8 +668,6 @@ def orbit_mu_batches(k_unfold_plan, mu_pad: int, n_ranks: int, *,
     the batch is replicated and unfolded before the transpose.  The layout's
     pad slots belong to no batch (their face rows, hence Z rows, are zero).
     """
-    import heapq
-
     plan = k_unfold_plan
     P_ = int(n_ranks)
     if int(mu_pad) != int(plan.n_centroid_packed):
@@ -639,29 +677,10 @@ def orbit_mu_batches(k_unfold_plan, mu_pad: int, n_ranks: int, *,
     if P_ < 1 or int(b_target) < 1:
         raise ValueError(
             f"orbit_mu_batches: need n_ranks, b_target >= 1; got {P_}, {b_target}.")
-    members, sizes = unfold_orbits(plan)
-    up = lambda v: -(-int(v) // P_) * P_
-    b_cap = max(up(int(sizes.max())), (int(b_target) // P_) * P_)
-    by_size = sorted(range(len(members)),
-                     key=lambda g: (-int(sizes[g]), int(members[g][0])))
-    n_batch = max(1, -(-int(np.sum(sizes)) // b_cap))
-    while True:
-        heap = [(0, beta) for beta in range(n_batch)]
-        owner = np.empty((len(members),), dtype=np.int64)
-        loads = np.zeros((n_batch,), dtype=np.int64)
-        ok = True
-        for g in by_size:
-            load, beta = heapq.heappop(heap)
-            if load + int(sizes[g]) > b_cap:
-                ok = False
-                break
-            owner[g] = beta
-            loads[beta] = load + int(sizes[g])
-            heapq.heappush(heap, (int(loads[beta]), beta))
-        if ok:
-            break
-        n_batch += 1
-    b = up(int(loads.max()))
+    packing = _unfold_orbit_packing(plan)
+    members, _, _ = packing
+    owner, loads, b = _partition_orbit_bins(packing, P_, b_target)
+    n_batch = len(loads)
     c = b // P_
     mu = np.full((n_batch, b), -1, dtype=np.int32)
     for beta in range(n_batch):

@@ -111,17 +111,23 @@ def best_owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_max: int):
     every bin fits ``c_max`` and the plan prices the widest batch that runs
     (CrI3 24x24 P36: 12-member orbits make the batch 432, not the 36 of
     c_max = 1).
-    ponytail: a linear scan over c and a fixed-cost guess of one centroid.
+    The shape search runs the same LPT partition on orbit metadata, then
+    materializes endpoint/wrap tables only at the winning width. Candidate
+    order and the fixed-cost guess of one centroid are unchanged.
     """
+    if max(1, int(c_max)) == 1:
+        return owner_orbit_batches(plan, mu_pad, n_ranks, c_target=1)
+    from gw.centroid_k_unfold import _partition_orbit_bins, _unfold_orbit_packing
+    packing = _unfold_orbit_packing(plan)
     best = None
     for c in range(max(1, int(c_max)), 0, -1):
-        mb = owner_orbit_batches(plan, mu_pad, n_ranks, c_target=c)
-        if best is not None and mb.c > c_max:
+        _, loads, width = _partition_orbit_bins(packing, 1, c)
+        if best is not None and width > c_max:
             continue                      # an orbit wider than c: no gain
-        cost = mb.n_batch * (mb.c + 1)
+        cost = -(-len(loads) // int(n_ranks)) * (width + 1)
         if best is None or cost < best[0]:
-            best = (cost, mb)
-    return best[1]
+            best = (cost, c)
+    return owner_orbit_batches(plan, mu_pad, n_ranks, c_target=best[1])
 
 
 def typed_child_G_tables(plan, *, fft_grid, sphere_par, gvec_child,
