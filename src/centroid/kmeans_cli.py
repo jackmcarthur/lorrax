@@ -562,10 +562,19 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
     else:
         kmeans_target = M_cand
 
+    # Seeding samples logical FFT points without replacement. Apply the cap
+    # after converting the candidate point budget to orbit representatives;
+    # an already-valid representative count must keep its existing seeds.
+    if kmeans_target > n_rtot:
+        log.info(
+            f"Capping k-means initialization from {kmeans_target} to "
+            f"{n_rtot} logical FFT-grid points")
+        kmeans_target = n_rtot
+
     stages.begin(2, "Weighted k-means", name="centroid.kmeans")
     row("target", f"{M_cand} candidates = {kmeans_target} orbit representatives "
                   f"x {n_sym} operations" if orbit_aware else
-                  f"{M_cand} candidates (literal points)")
+                  f"{kmeans_target} candidates (literal points)")
     with timing.section("kmeans") as kmeans_section:
         labels, centroids, _lloyd_steps, _lloyd_move_sq = weighted_kmeans_jax(
             avec_ang, weight, N_c=kmeans_target, seed=args.seed,

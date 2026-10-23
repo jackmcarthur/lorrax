@@ -19,6 +19,12 @@ never exceeds the FFT-grid capacity; whole-orbit budgets can leave a small
 unused remainder. Requests above the number of distinct FFT-grid points
 refuse before clustering.
 
+Oversampling may request more candidates than the FFT grid can supply.
+The initializer first converts that point budget to orbit representatives,
+then caps its seed count at the logical grid size. Mesh padding never
+increases the sampling population. Feasible representative counts keep the
+same seeds; snapping and whole-orbit pruning keep their existing budgets.
+
 The FFT-grid positions and weights are distributed before initialization,
 so k-means++ random scores and nearest-seed distances use grid shards as
 Lloyd does. Each seed exchanges one local winner per rank, including its
