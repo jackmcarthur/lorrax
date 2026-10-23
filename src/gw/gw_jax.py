@@ -873,24 +873,29 @@ def _persist_screening(
         print0, qp_solver, sym, tensors_filename, photon_response=None,
         material_class=None, head_response=None):
     """Persist the screened static body and head on the canonical q set."""
-    if (driver_persists_w0(mode, config)
-            and qp_solver is not QPSolver.SELF_CONSISTENT):
-        W_static = restart_static_w(
-            mode, W_by_role, V_q, config=config, meta=meta, mesh_xy=mesh_xy,
-            material_class=material_class, head_source=head_resolver, print_fn=print0)
-        if W_static is None:
-            return
-        with timing.section("gw_jax.persist_w0"):
-            from .gw_output import persist_w0_and_head
-            from .qsgw_head import static_head_wings_host
-            persist_w0_and_head(
-                W_static, photon_response=photon_response,
-                head_wings=static_head_wings_host(head_response, mesh_xy),
-                tensors_filename=tensors_filename, head_resolver=head_resolver,
-                config=config, meta=meta, mesh_xy=mesh_xy,
-                sym=sym, centroid_indices=centroid_indices,
-                static_head_only=mode is ComputeMode.MPA,
-                print_fn=print0)
+    try:
+        if (driver_persists_w0(mode, config)
+                and qp_solver is not QPSolver.SELF_CONSISTENT):
+            W_static = restart_static_w(
+                mode, W_by_role, V_q, config=config, meta=meta, mesh_xy=mesh_xy,
+                material_class=material_class, head_source=head_resolver, print_fn=print0)
+            if W_static is None:
+                return
+            with timing.section("gw_jax.persist_w0"):
+                from .gw_output import persist_w0_and_head
+                from .qsgw_head import static_head_wings_host
+                persist_w0_and_head(
+                    W_static, photon_response=photon_response,
+                    head_wings=static_head_wings_host(head_response, mesh_xy),
+                    tensors_filename=tensors_filename, head_resolver=head_resolver,
+                    config=config, meta=meta, mesh_xy=mesh_xy,
+                    sym=sym, centroid_indices=centroid_indices,
+                    static_head_only=mode is ComputeMode.MPA,
+                    print_fn=print0)
+    finally:
+        if qp_solver is not QPSolver.SELF_CONSISTENT:
+            from .tangential_screening import release_coulomb_cache
+            release_coulomb_cache()
 
 
 def _prepare_static_head(config, do_screened, head_resolver, meta, mode,
@@ -1829,9 +1834,6 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 		    V_q, W_by_role, centroid_indices, config, head_resolver, mesh_xy, meta, mode, print0,
 		    qp_solver, sym, tensors_filename, photon_response=photon_response,
 		    material_class=material_class, head_response=oneshot_head_response)
-		if qp_solver is not QPSolver.SELF_CONSISTENT:
-			from .tangential_screening import release_coulomb_cache
-			release_coulomb_cache()
 		(
 		    static_head_terms) = _prepare_static_head(
 		    config, do_screened, head_resolver, meta, mode, qp_solver,

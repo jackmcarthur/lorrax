@@ -28,14 +28,17 @@ def main():
   return value
  rb._coulomb_batch=batch
  original_persist=gw._persist_screening
- def persist(*args,**kwargs):
-  value=original_persist(*args,**kwargs)
+ def capture_cache():
   seen=set()
   for kind,arrays in [('root',[a for v in rb._COULOMB_ROOTS.values() for a in v[:2]]),('operator',list(rb._COULOMB_OPERATORS.values()))]:
    for a in arrays:
     if id(a) in seen:continue
     seen.add(id(a));refs.append(({'kind':kind,'shape':list(a.shape),'local_bytes':sum(a.addressable_data(i).nbytes for i in range(len(a.sharding.addressable_devices)))},weakref.ref(a)))
-  checkpoint('after_persist_before_driver_cleanup')
+ def persist(*args,**kwargs):
+  capture_cache()
+  checkpoint('before_persist')
+  value=original_persist(*args,**kwargs)
+  checkpoint('after_persist')
   return value
  gw._persist_screening=persist
  original_sigma=gw._run_oneshot_sigma
