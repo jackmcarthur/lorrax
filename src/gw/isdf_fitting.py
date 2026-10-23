@@ -269,10 +269,19 @@ def _fit_mubatch(
     # c_plan = c_min no chunk is re-solved and the slope is unused.
     slope = (at(c_plan) - at(c_min)) / (c_plan - c_min) if c_plan > c_min else 0.0
     with timing.section("zeta_fit.mubatch.memcheck"):
+        planned = build(c_plan)
+        from common.gpu_utils import device_budget_bytes
+        from lxkit import memory
+        device_budget_bytes()
+        # Every existing argument and ambient family (notably the charge
+        # faces during a current fit) is already in the allocator's floor.
+        # compiled_new_bytes adds only new work and the lookahead output;
+        # do not subtract the analytic resident floor or arguments again.
+        room = int(memory.room(bucketed=False))
         check = check_chunk(
             c_plan, build=build, stage="zeta route-G mu batch", minimum=c_min,
             fixed=at(c_plan) - c_plan * slope - ws0, per_unit=slope,
-            room=plan.target_bytes - ws0,
+            room=room, compiled=planned,
             extra=lambda c, compiled: int(compiled.memory_analysis().output_size_in_bytes))
     # check_chunk compares the largest figure any rank read, so every rank
     # built and returns the same chunk.
@@ -287,13 +296,12 @@ def _fit_mubatch(
         n_blk, n_grp, compiled=batch_executable,
         # the fewest blocks ≥ v holding fewer plane groups each (the kernel's ceil(n_grp / n_blk))
         snap=lambda v: v if v < 2 else -(-n_grp // (-(-n_grp // (v - 1)) - 1)),
-        build=lambda n: build(agreed, n_blk=n), room=plan.target_bytes - ws0,
+        build=lambda n: build(agreed, n_blk=n), room=room,
         figure=lambda ex: compiled_new_bytes(
             ex, extra=int(ex.memory_analysis().output_size_in_bytes)),
         stage="zeta route-G mu batch, plane blocks")
     # The stage's price: the batch executable's compiled figure beside the resident set (the
     # analytic working set only chose the chunk).
-    from lxkit import memory
     memory.book(memory.priced(compiled_new_bytes(batch_executable, extra=int(
         batch_executable.memory_analysis().output_size_in_bytes)),
         "route-G mu batch executable (memory_analysis + FFT plans + outputs)", increment=True))

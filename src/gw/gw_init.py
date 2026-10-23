@@ -1429,6 +1429,12 @@ class _ZetaFitContract:
 	reuse_transverse: tuple[bool, ...] = ()
 
 	@property
+	def fit_band_range(self):
+		"""The existing left/right fit union, independent of the loaded faces."""
+		return (min(self.band_range_left[0], self.band_range_right[0]),
+		        max(self.band_range_left[1], self.band_range_right[1]))
+
+	@property
 	def reuse(self):
 		"""Whether every artifact required by this contract is reusable."""
 		return bool(self.reuse_charge and all(self.reuse_transverse))
@@ -2034,6 +2040,7 @@ def _fit_transverse_zeta_channels(
                 band_range=band_slices.full_range,
                 band_chunk=int(_chunks_T['mubatch'].band_chunk),
                 centroid_indices=_cent_T_idx, placement="device", bispinor=True,
+                store_band_range=zeta_contract.fit_band_range,
                 bispinor_lift=(representation.current_lift or "raw"),
                 k_domain=sym.parent_k_domain, print_fn=print_fn)
         faces = _psi.faces
@@ -2675,6 +2682,7 @@ def _prepare_fresh_parent_faces(
     			band_range=band_slices.full_range,
     			band_chunk=int(_mb_plan.band_chunk),
     			centroid_indices=centroid_indices, placement="device",
+                        store_band_range=zeta_contract.fit_band_range,
     			bispinor=bool(int(meta.nspinor) == 4),
     			bispinor_lift=(representation.charge_lift or "raw"),
     			k_domain=sym.parent_k_domain, print_fn=print0)
