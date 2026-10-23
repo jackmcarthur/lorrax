@@ -461,6 +461,19 @@ factors do not fit runs at one parent and one column multiple, with one
 The photon sectors synthesize through the same owner and placement rule
 ([bispinor sectors §7](bispinor_tangential_w.md#sector-sigma)).
 
+Unchunked distributed-face factors keep the same logical
+`[q,mu,component,K]` indices and NamedSharding but are placed pole-major
+(`major_to_minor=(3,0,1,2)`) when their resident parent panels are formed.
+The scalar and photon consumers share this placement. The original read
+faces are then released, so a window does not also retain their format
+conversion. Axis, whole-parent and column-chunk placement are unchanged.
+The window executable cache includes the concrete physical input format;
+abstract placement operands retain their sharding-only signature.
+After placement completes, both consumers refresh the ledger's agreed
+current room before choosing the window's overlap. The room now includes
+the resident factors; a pre-read room must not admit another copy of that
+space through the ledger's live-row handback.
+
 **Two τ nodes per loop trip.** On GPU the scalar Σ τ window evaluates two τ
 nodes per trip of its device loop, so one node's W(τ) synthesis and
 exchanges run beside the other node's k-convolutions. Only that program is

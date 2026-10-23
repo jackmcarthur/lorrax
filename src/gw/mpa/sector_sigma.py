@@ -534,7 +534,8 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     the caller's census.
     """
     from file_io.tangential_store import face_width, read_tangential_faces
-    from .sigma import _tangential_memory_schedule, _tangential_weights
+    from .sigma import (_face_factor_panel, _tangential_factor_specs,
+                        _tangential_memory_schedule, _tangential_weights)
     from .sigma_windows import tangential_intervals
 
     del layout
@@ -605,7 +606,11 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
         elif route=='axis':
             b_x=_placer(mesh_xy,P(None,'x',None,None))(b_x)
             b_y=_placer(mesh_xy,P(None,'y',None,None))(b_y)
+        else:
+            b_x,b_y=(_face_factor_panel(mesh_xy,spec,nq)(a,np.int32(0))
+                       for spec,a in zip(_tangential_factor_specs(route),(b_x,b_y)))
         jax.block_until_ready((b_x,b_y,poles))
+        capacity.at_phase()
         kernel=_w_program(mesh_xy,route,same,m,nc,n,nt,nq,kcarrier,weights_fn or _tangential_weights)
     except BaseException:
         capacity.live_stages=ambient

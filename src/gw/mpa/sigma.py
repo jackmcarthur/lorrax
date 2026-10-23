@@ -220,6 +220,25 @@ def _tangential_factor_specs(layout):
             (P(None, "x", None, None), P(None, "y", None, None)))
 
 
+@lru_cache(maxsize=None)
+def _face_factor_panel(mesh_xy, spec, width):
+    """Slice a distributed W factor into its pole-major consumer format.
+
+    The logical array remains ``[q,mu,component,K]`` at ``spec``. Keeping
+    each pole's parent/endpoints contiguous lets the face GEMM use these
+    resident values directly, rather than retaining another format copy
+    inside every tau-window executable. Components remain adjacent to mu
+    so their merge in :func:`_tangential_contract` is a local view. The start
+    row is an operand: equal-width panels share one compiled placement.
+    """
+    from jax.experimental.layout import Format, Layout
+
+    target = Format(Layout(major_to_minor=(3, 0, 1, 2)),
+                    NamedSharding(mesh_xy, spec))
+    return jax.jit(lambda a, start: jax.lax.dynamic_slice_in_dim(a, start, width, axis=0),
+                   out_shardings=target)
+
+
 def _tangential_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=None,
                           partner=False):
     """W(τ) = b d b† through G's configured face or axis contraction.
@@ -654,7 +673,11 @@ def _tangential_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy,
         for panel in panels:
             lo, hi = panel["span"]
             whole = (lo, hi) == (0, nq)
-            fx = (x, y) if whole else (x[lo:hi], y[lo:hi])
+            if layout == "face" and not chunked:
+                fx = tuple(_face_factor_panel(mesh_xy, spec, hi-lo)(a, np.int32(lo))
+                           for spec, a in zip(factor_specs, (x, y)))
+            else:
+                fx = (x, y) if whole else (x[lo:hi], y[lo:hi])
             pp = poles if whole else poles[lo:hi]
             if chunked:
                 fx = tuple(_chunk_major(mesh_xy, factor_specs[i % 2], n_chunks, width)(f)
@@ -671,6 +694,7 @@ def _tangential_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy,
             capacity.reserve(f"{stage}.synthesis.resident", resident_bytes_per_rank=resident,
                              workspace_bytes_per_rank=0, concurrent_with=ambient)
             capacity.live_stages = (*ambient, f"{stage}.synthesis.resident")
+            capacity.at_phase()
 
     # Per branch: the pair, or (every panel's realization the identity) the one orientation
     # its load reads.  The unread tile slot carries the read one; the load never reads it.
