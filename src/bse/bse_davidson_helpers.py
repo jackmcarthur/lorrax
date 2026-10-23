@@ -70,6 +70,9 @@ def init_bse_subspace(
       (normalised), seeded by ``seed``. They cover spectral regions
       missed by the energy-sorted picks.
 
+    A full logical-manifold request uses every physical unit vector instead:
+    its Gram matrix is exactly the identity, with no redundant random tail.
+
     Parameters
     ----------
     eps_c : (nk, nc) jax array (any sharding) — nc is the PADDED extent
@@ -97,9 +100,6 @@ def init_bse_subspace(
     nk, nc = eps_c_np.shape
     _, nv = eps_v_np.shape
 
-    n_random = max(0, min(n_random, n_eig))
-    n_pick = n_eig - n_random
-
     # Physical extents.  DROP THE PAD BY COUNT, never by value.
     #
     # This used to be `finite = isfinite(flat) & (flat > 1e-12)` with the
@@ -123,6 +123,16 @@ def init_bse_subspace(
         raise ValueError(
             f"init_bse_subspace: logical extents (n_cond={nc_log}, "
             f"n_val={nv_log}) must be in (0, padded] = (0, {nc}] x (0, {nv}]")
+    physical = nc_log * nv_log * nk
+    if not 0 < n_eig <= physical:
+        raise ValueError(f"init_bse_subspace: n_eig={n_eig} must be in [1, {physical}] "
+                         "for the logical transition space")
+    # The full manifold is already spanned by every physical unit vector.
+    # Replacing its last few coordinates by random vectors adds no coverage,
+    # worsens conditioning, and makes an avoidable large structured Gram
+    # eigensolve necessary. Keep the exactly orthonormal canonical basis.
+    n_random = 0 if n_eig == physical else max(0, min(n_random, n_eig))
+    n_pick = n_eig - n_random
 
     # ── Part 1: lowest PHYSICAL (c, v, k) by energy ───────────────────
     delta_E = (eps_c_np[:, :nc_log, None]

@@ -110,6 +110,43 @@ def test_full_near_full_and_padded_davidson_capacity():
             run_cases(Mesh(np.asarray(jax.devices("cpu")[:side*side]).reshape(side, side), ("x", "y")))
 
 
+def test_full_physical_seed_has_exact_identity_gram_and_partial_seed_is_unchanged():
+    import jax
+    import numpy as np
+    import pytest
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from common.collectives import gather_to_host
+    jax.config.update("jax_enable_x64", True)
+    devices = jax.devices("cpu")
+    side = 2 if len(devices) >= 4 else 1
+    mesh = Mesh(np.asarray(devices[:side*side]).reshape(side, side), ("x", "y"))
+    sh = NamedSharding(mesh, P(None, "x", "y", None))
+    nc = nv = 4
+    ec = np.tile([.3, .4, .5, 1000.], (2, 1))
+    ev = np.tile([-.1, -.2, -.3, -1000.], (2, 1))
+    init = initial_subspace()
+    full = np.asarray(gather_to_host(init(ec, ev, 18, n_cond=3, n_val=3,
+        n_random=5, seed=89, mesh=mesh, sharding=sh)))
+    np.testing.assert_array_equal(full.reshape(18, -1) @ full.reshape(18, -1).conj().T, np.eye(18))
+    assert np.count_nonzero(full) == 18
+    assert np.all(full[:, 3:] == 0) and np.all(full[:, :, 3:] == 0)
+    # Literal original partial-request construction: same picks, NumPy RNG,
+    # normalization and padded embedding. No random stream changes there.
+    expected = np.zeros((7, nc, nv, 2), np.complex128)
+    picks = np.argsort((ec[:, :3, None]-ev[:, None, :3]).reshape(-1))[:2]
+    k, c, v = np.unravel_index(picks, (2, 3, 3))
+    expected[np.arange(2), c, v, k] = 1
+    rng = np.random.default_rng(89)
+    tail = rng.standard_normal((5, 3, 3, 2)) + 1j*rng.standard_normal((5, 3, 3, 2))
+    tail /= np.maximum(np.sqrt(np.sum(np.abs(tail)**2, axis=(1, 2, 3), keepdims=True)), 1e-30)
+    expected[2:, :3, :3] = tail
+    partial = gather_to_host(init(ec, ev, 7, n_cond=3, n_val=3,
+        n_random=5, seed=89, mesh=mesh, sharding=sh))
+    np.testing.assert_array_equal(partial, expected)
+    with pytest.raises(ValueError, match="logical transition space"):
+        init(ec, ev, 19, n_cond=3, n_val=3)
+
+
 if __name__ == "__main__":
     import json
     import runtime
