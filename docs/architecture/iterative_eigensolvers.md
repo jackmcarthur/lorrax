@@ -27,7 +27,12 @@ $M$; the unused tail is allocated but never read or cleared.
 vector_shape, vector_sharding=None)` builds a `complex128` block Davidson
 solver for the `n_eig` lowest eigenpairs; `plan_local_davidson` is the same
 solver on one device. It requires `1 ≤ n_eig ≤ prod(vector_shape)` and
-`capacity ≥ 2·n_eig` and never adjusts them.
+`capacity ≥ min(2·n_eig, prod(vector_shape))`. Storage capacity is capped at
+the declared vector-space dimension, including any padding: more independent
+vectors cannot exist. This matters for near/full-spectrum solves, where an
+unreachable larger capacity also enlarges the ROCm capacity eigensolve.
+Corrections are limited to the available basis slots; an exhausted full space
+that still fails its true-residual test returns `NO_DIRECTIONS`, not convergence.
 
 ```python
 from solvers import plan_local_davidson

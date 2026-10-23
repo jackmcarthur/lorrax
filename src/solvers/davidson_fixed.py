@@ -169,6 +169,11 @@ def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, dat
                 lambda p: subspace.orthogonalize(v, p, m), p)
             p = normalizer.constrain(p)
             p, rank = _whiten(p, normalizer)
+            # A basis cannot exceed the vector-space dimension. Near/full
+            # spectrum requests can have capacity < 2*block; retain only the
+            # directions that fit after the optional Ritz restart.
+            room = capacity-jnp.where(restart, block, m)
+            rank = jnp.minimum(rank, jnp.maximum(0, room)).astype(jnp.int32)
             hp = _active_blocks(rank, block, jnp.zeros_like(p),
                                 lambda i, w, hp: _put(hp, apply_h(data, _take(p, i, w)), i),
                                 constrain=normalizer.constrain)
@@ -203,7 +208,9 @@ def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vecto
     Both must be JAX-traceable. Distributed vectors use synchronized collective
     iterations; independent k-points use separate local plans.
 
-    ``capacity >= 2*n_eig`` is explicit; no iteration changes an array shape.
+    Capacity is capped at ``prod(vector_shape)``: more independent vectors
+    cannot exist. It must cover ``min(2*n_eig, prod(vector_shape))``; no
+    iteration changes an array shape.
     There is no hidden default capacity or persistent compilation cache.
     The service resolves CUDA active BLAS or the CPU compatibility provider.
     ``lock_converged`` turns on soft locking and ``n_converge`` (``<= n_eig``) stops on
@@ -214,8 +221,10 @@ def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vecto
     vector_shape = tuple(vector_shape)
     if not vector_shape or any(not isinstance(n, int) or n < 1 for n in vector_shape):
         raise ValueError('vector_shape must contain positive Python integers')
-    if not 1 <= n_eig <= prod(vector_shape) or capacity < 2*n_eig:
-        raise ValueError('require 1 <= n_eig <= vector size and capacity >= 2*n_eig')
+    dimension = prod(vector_shape)
+    capacity = min(capacity, dimension)
+    if not 1 <= n_eig <= dimension or capacity < min(2*n_eig, dimension):
+        raise ValueError('require 1 <= n_eig <= vector size and capacity >= min(2*n_eig, vector size)')
     if n_converge is not None and not (isinstance(n_converge, int) and 1 <= n_converge <= n_eig):
         raise ValueError('n_converge must be a Python integer with 1 <= n_converge <= n_eig')
     if not float(margin_lock) >= 1.0:

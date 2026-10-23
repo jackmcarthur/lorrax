@@ -7,6 +7,7 @@ resolves a plan from the initial vector geometry and reports its final status.
 from __future__ import annotations
 
 import inspect
+from math import prod
 import time
 
 import jax
@@ -54,8 +55,9 @@ def davidson(apply_H, *, n_eig, precond_fn=None, init_fn=None, X0=None,
     """Lowest Hermitian eigenpairs, using fixed-capacity active-only iteration.
 
     ``X0`` has shape ``(n_eig, *vector_shape)``; vector axes retain their
-    NamedSharding. Capacity defaults to ``10*n_eig`` and is at least twice
-    the requested roots. A two- or three-argument preconditioner is accepted.
+    NamedSharding. Capacity defaults to ``10*n_eig``, at least twice the
+    requested roots, capped at the declared vector-space dimension. A two-
+    or three-argument preconditioner is accepted.
     The third argument is the current Ritz vectors. When ``data`` is given,
     both callbacks take that explicit pytree as their first argument; use this
     form for distributed arrays so none is captured as a compiled constant.
@@ -80,7 +82,8 @@ def davidson(apply_H, *, n_eig, precond_fn=None, init_fn=None, X0=None,
             raise ValueError('Provide either init_fn or X0')
         X0, _ = init_fn(apply_H if data is None else lambda v: apply_H(data, v), n_eig)
     initial = jnp.asarray(X0[:n_eig], dtype=jnp.complex128)
-    capacity = max(int(m_max if m_max is not None else DEFAULT_M_MAX_FACTOR*n_eig), 2*n_eig)
+    capacity = min(prod(initial.shape[1:]),
+                   max(int(m_max if m_max is not None else DEFAULT_M_MAX_FACTOR*n_eig), 2*n_eig))
     if precond_fn is None:
         precond_fn = _default_precond if data is None else lambda payload, r, e: _default_precond(r, e)
     # Inspect the callable without swallowing an internal TypeError during a
