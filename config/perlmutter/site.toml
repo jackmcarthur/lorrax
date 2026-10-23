@@ -5,8 +5,9 @@
 # A multi-node CUDA step.
 [nccl]
 # The Slurm network option srun must create the step with: in a step with a
-# VNI, MPI-IO and NCCL's OFI initialization fail together and NCCL runs over
-# TCP sockets.
+# VNI, MPI-IO and NCCL's OFI initialization fail together (P16, 2026-10-22:
+# MPI_Init_thread / create_vni_context reported ENOSPC). gpu_env.sh and the
+# module arrange this before srun; Python cannot repair an existing step.
 step_network = "no_vni"
 # libfabric's CUDA memory interface (NCCL's OFI plugin, below) dlopens this
 # unversioned name.  It must name the CUDA runtime the dependency closure
@@ -25,7 +26,7 @@ NCCL_NET_PLUGIN = "/global/common/software/nersc9/nccl/2.29.2-cu13/plugin/lib/li
 NCCL_NET_GDR_LEVEL = "PHB"
 FI_CXI_DISABLE_HOST_REGISTER = "1"
 FI_CXI_RDZV_THRESHOLD = "0"
-NCCL_CROSS_NIC = "2"
+# NCCL_CROSS_NIC is left unset: NCCL's default is already 2.
 NCCL_SOCKET_IFNAME = "hsn"
 # libfabric 2.3.1's registration-cache monitor. Its default is memhooks ("memhooks is the default
 # if available", fi_info -e), which intercepts mmap: one rank of run30k deadlocked in

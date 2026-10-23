@@ -145,6 +145,19 @@ def plan_network_environment(env, *, platform='gpu', is_file=None, cxi=None):
     profile = site_profile(env)
     section = (profile or {}).get(leg.collective_library) if multiple is True else None
     step_network = (section or {}).get('step_network')
+    # Slurm must receive this before it creates the step. An explicit NCCL
+    # transport does not avoid MPI's endpoint allocation (MPI-IO + OFI/cxi,
+    # P16 Perlmutter, 2026-10-22: MPI_Init_thread failed with ENOSPC).
+    options = {value.strip() for value in env.get('SLURM_NETWORK', '').split(',')}
+    if step_network and step_network not in options:
+        raise RuntimeError(
+            f'Refusing multi-node {profile["site"]} {leg.key} startup: the step '
+            f'was created without SLURM_NETWORK={step_network} '
+            f'(SLURM_NETWORK={env.get("SLURM_NETWORK")!r}); MPI/OFI endpoint '
+            'initialization can fail with "No space left on device". Source '
+            f'config/{profile["site"]}/gpu_env.sh before srun, or relaunch with '
+            f'`SLURM_NETWORK={step_network} srun ...`. Setting it inside a '
+            'running step cannot repair the allocation.')
     if 'NCCL_NET' in env or 'NCCL_NET_PLUGIN' in env:
         if section and env.get('NCCL_NET', '').strip().lower() == 'socket':
             raise RuntimeError(_sockets_refusal(
@@ -177,14 +190,6 @@ def plan_network_environment(env, *, platform='gpu', is_file=None, cxi=None):
     if multiple is not True:
         return result
     if section:
-        # The option must reach srun before it creates the step; changing
-        # os.environ here cannot repair the step's network allocation.
-        options = {value.strip() for value in env.get('SLURM_NETWORK', '').split(',')}
-        if step_network and step_network not in options:
-            raise RuntimeError(_sockets_refusal(
-                profile['site'], nodes, f'the step was created without SLURM_NETWORK='
-                f"{step_network} (SLURM_NETWORK={env.get('SLURM_NETWORK')!r})",
-                step_network, leg))
         defaults = section.get('env', {})
         # An absolute plugin path, because LD_LIBRARY_PATH cannot change the
         # loader's search path once Python has started.
