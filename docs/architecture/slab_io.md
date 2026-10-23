@@ -764,3 +764,14 @@ all ranks. A handle that appears under two `path=` values, or after its own
 | `learning the geometry of dataset … needs either the FFI metadata entry points …` | library without `lrx_phdf5_dataset_geometry`, writable handle | rebuild, or `create_dataset` first |
 | `LORRAX_SLAB_IO_TIMING=1 requires a rebuilt PHDF5 provider` | library without `lrx_phdf5_close_timed` | rebuild, or unset |
 | `Input key 'slab_io'` / `'use_ffi_io'` `… must be removed` | retired deck key | delete the line |
+
+
+### Direct host metadata reads
+
+`file_io.slab_io.quiesce_pending_io()` waits for already-submitted work on
+the process's shared HDF5 lane, including native asynchronous union-read
+completion tokens across handles. Calling it on an idle lane creates no
+worker, opens no handle and performs no communication. Direct h5py consumers
+use it before reading or closing their handles. This sequencing contract
+assumes the same single host submission thread as `SlabIO`; it does not
+serialize arbitrary concurrent callers outside the lane.

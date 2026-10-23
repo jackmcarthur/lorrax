@@ -148,3 +148,27 @@ file's stripe layout at open.
 * **Private spellings** (`._filename`, `._ensure_sym()`, `._kpt_starts`) in
   new code: use `path`, `symmetry()`, `kpt_starts`.
 * **`__slots__` or strict `__setattr__` on `WfnLoader`** (§ Contract).
+
+## Bounded raw-G metadata and host/native ordering
+
+Raw `wfns/gvecs` stays file-backed. `get_gvec_nk(parent)` owns raw parent
+reads and retains one exact, unpadded host row; replacing the parent releases
+the previous slot. Repeated band tiles of one parent therefore perform one
+G-vector read. Closing the loader clears this slot. Request-level
+`cache=False` bypasses retained k-set tables while keeping this bounded
+one-parent cache. Header energies and occupations remain eager arrays.
+
+TRS stamp hashing streams raw G vectors in slices of at most 8 MiB, with the
+same dtype, shape, C-order bytes and SHA-256 serialization as an eager array.
+It detects changed file content even when the path and mtime are unchanged.
+Detached symmetry metadata remains usable after loader close; raw G reads
+require the open loader.
+
+`WfnLoader.sync_read_staging()` drains already-posted native reads and
+writes before direct h5py access. It does not initialize the transport or a
+communicator, open a file, or introduce an MPI collective. A cache miss and
+constructor, provenance, eager-read, QE-attribute and close entry points use
+this public barrier. Full-k phase rows are prepared before posting the
+current coefficient union read. As with `SlabIO`, calls follow one host
+submission thread per process; the barrier is not a lock for arbitrary
+concurrent external Python submitters.

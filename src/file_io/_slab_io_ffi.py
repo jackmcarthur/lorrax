@@ -2411,6 +2411,16 @@ class _CollectiveLane:
 _LANE = _CollectiveLane()
 
 
+def quiesce_pending_io() -> None:
+    """Finish posted native HDF5 operations before an external reader.
+
+    This only waits for already submitted work. With an idle lane it opens
+    no handle, starts no worker, initializes no backend and communicates
+    nothing, so rank-local metadata consumers may call it safely.
+    """
+    _LANE.quiesce(None)
+
+
 class _LaneSlot:
     """One handle's entry point to the lane, with the old per-handle dispatcher API.
 

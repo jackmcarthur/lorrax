@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import sys
 from dataclasses import dataclass
 import types
 from pathlib import Path
@@ -194,6 +195,7 @@ def read_wfn_provenance(path: str) -> WfnProvenance:
     """Read one canonical MfHeader into the post-hoc authentication view."""
     from file_io.mf_header import read_mf_header_from_file
     resolved = str(Path(path).expanduser().resolve())
+    WfnLoader.sync_read_staging()
     with h5.File(resolved, "r") as handle:
         mf = read_mf_header_from_file(handle)
     summary = _occupation_summary(mf)
@@ -280,6 +282,7 @@ class WfnLoader:
                 f"WfnLoader: backend={backend!r} requires a Mesh; pass mesh=...")
         self.backend = backend
 
+        self.sync_read_staging()
         self._file = h5.File(self._path, "r")
 
         # The collective read handle (lazy on first load).  Held here so
@@ -348,11 +351,11 @@ class WfnLoader:
         # never touches this — slurping the whole ``(nb, ns, ngktot, 2)`` f64
         # array unconditionally was pure waste + a latent OOM (a second,
         # whole-array read on the exact multi-rank path where memory is
-        # tightest).  ``_gvecs_raw`` (ngktot,3) + ``_kpt_starts`` are cheap
-        # index metadata both backends use — keep those eager.
+        # tightest). Raw G vectors can also be large at dense k grids;
+        # consumers slice one parent row from the file-backed dataset.
         self._coeffs_ds = (
             self._file["wfns/coeffs"] if self.backend == "eager" else None)
-        self._gvecs_raw = self._file["wfns/gvecs"][:]     # (ngktot, 3) int
+        self._gvecs_raw = self._file["wfns/gvecs"]       # (ngktot, 3) int
         # kpt_starts = cumulative (exclusive prefix) sum of ngk.
         self._kpt_starts = kpt_starts(self.ngk)
 
@@ -379,6 +382,7 @@ class WfnLoader:
         # replacing the single slot at the next parent keeps residency O(1)
         # in k even for extremely large reciprocal spheres.
         self._parent_unfold_g_cache: tuple[int, "jax.Array"] | None = None
+        self._parent_g_host_cache: tuple[int, np.ndarray] | None = None
 
         # Two-component DFT-reference TRS check (default on).  It compares
         # occupied one-particle density operators in G space, using only raw
@@ -521,6 +525,18 @@ class WfnLoader:
         if handle is not None:
             handle.close()
 
+    @staticmethod
+    def sync_read_staging() -> None:
+        """Finish posted native I/O before a direct host metadata read.
+
+        This opens no file or communicator. Looking up the already-loaded
+        public transport leaves standalone eager/header callers independent
+        of the native backend and its initialization.
+        """
+        transport = sys.modules.get('file_io.slab_io')
+        if transport is not None:
+            transport.quiesce_pending_io()
+
     def close(self) -> None:
         """Release both handles, propagating the first cleanup failure.
 
@@ -528,6 +544,10 @@ class WfnLoader:
         collective close.  Still close the SlabIO handle if h5py close fails.
         """
         error = None
+        try:
+            self.sync_read_staging()
+        except BaseException as exc:
+            error = exc
         for name in ("_file", "_slab_io"):
             handle = getattr(self, name, None)
             setattr(self, name, None)
@@ -538,6 +558,7 @@ class WfnLoader:
                     if error is None:
                         error = exc
         self._parent_unfold_g_cache = None
+        self._parent_g_host_cache = None
         if error is not None:
             raise error
 
@@ -738,6 +759,7 @@ class WfnLoader:
         """
         if not self._qe_symmetry_checked:
             from symmetry_maps import resolve_qe_symmetry_binding
+            self.sync_read_staging()
             source = self._file.attrs.get("qp_wfn_source", "")
             source = source.decode() if isinstance(source, bytes) else str(source)
             self.qe_symmetry_binding, self.qe_symmetry_diagnostic = (
@@ -1139,9 +1161,7 @@ class WfnLoader:
         if not unfold:
             rows = []
             for ik in k_idxs:
-                start = int(self._kpt_starts[int(ik)])
-                end = start + int(self.ngk[int(ik)])
-                rows.append(self._gvecs_raw[start:end])
+                rows.append(self.get_gvec_nk(int(ik)))
         else:
             from symmetry_maps import unfold_reciprocal_carriers
 
@@ -1158,9 +1178,7 @@ class WfnLoader:
                 kbar = int(sym.irr_idx_k[nk_int])
                 sym_krep, _, _ = sym.operation_rows(sym_idx)
                 sym_krep = np.asarray(sym_krep, dtype=np.int32)
-                start = int(self._kpt_starts[kbar])
-                end = start + int(self.ngk[kbar])
-                k_gvecs = self._gvecs_raw[start:end]
+                k_gvecs = self.get_gvec_nk(kbar)
                 Gkk = sym.get_umklapp_vector(
                     self, nk_int, sym_idx, kbar, sym_krep)
                 rows.append(unfold_reciprocal_carriers(
@@ -1195,12 +1213,24 @@ class WfnLoader:
     def get_gvec_nk(self, ik: int) -> np.ndarray:
         """The (ngk[ik], 3) IBZ G-list for one k, read from the raw slab.
 
-        It bypasses the padded ``gvecs`` table, which is why tests use it as
-        an independent reference.  Production code uses
-        ``loader.gvecs(k='ibz')[ik, :loader.ngk_valid(k='ibz')[ik]]``."""
-        start = int(self._kpt_starts[int(ik)])
-        end = start + int(self.ngk[int(ik)])
-        return self._gvecs_raw[start:end]
+        A single parent row is cached on the host. Native I/O is drained
+        before a cache miss reads the file-backed dataset; repeated band
+        tiles for that parent perform no further G-vector reads.
+        """
+        ik = int(ik)
+        if not 0 <= ik < int(self.nkpts):
+            raise ValueError(f'raw WFN G-vector row {ik} outside [0,{self.nkpts})')
+        cached = self._parent_g_host_cache
+        if cached is not None and cached[0] == ik:
+            return cached[1]
+        self._parent_g_host_cache = None
+        del cached
+        self.sync_read_staging()
+        start = int(self._kpt_starts[ik])
+        end = start + int(self.ngk[ik])
+        row = self._gvecs_raw[start:end]
+        self._parent_g_host_cache = (ik, row)
+        return row
 
     # ------------------------------------------------------------------
     # G-flat → FFT-box index (zero-sentinel gather table)
@@ -1430,9 +1460,8 @@ class WfnLoader:
                 "WfnLoader parent-G row outside the raw WFN k axis "
                 f"[0,{int(self.nkpts)}); got {parent}.")
         ngk = int(self.ngk[parent])
-        start = int(self._kpt_starts[parent])
         row = np.zeros((int(self.ngkmax), 3), dtype=np.int32)
-        row[:ngk] = self._gvecs_raw[start:start + ngk]
+        row[:ngk] = self.get_gvec_nk(parent)
         return row
 
     def _parent_g_row_device(self, parent: int) -> jax.Array:
@@ -1550,8 +1579,7 @@ class WfnLoader:
         phase = np.ones((len(rows), ngkmax), dtype=np.complex128)
         for out, (sym_row, parent) in enumerate(zip(sym_rows, parents)):
             ngk_k = int(self.ngk[int(parent)])
-            start = int(self._kpt_starts[int(parent)])
-            g_parent = self._gvecs_raw[start:start + ngk_k]
+            g_parent = self.get_gvec_nk(int(parent))
             phase_valid = sym.reciprocal_phase(int(sym_row), g_parent)
             if phase_valid is not None:
                 phase_valid = np.asarray(phase_valid, dtype=np.complex128)
@@ -1733,6 +1761,10 @@ class WfnLoader:
             for ibz in ibz_unique_sorted
         ], axis=0).astype(np.int64)
 
+        # Prepare any file-backed G metadata before posting this async read.
+        # Cache misses drain prior native I/O through get_gvec_nk's owner.
+        phase_rows = (self._host_phase_rows_for_full_k(k_idxs)
+                      if unfold else None)
         cnk_at_ibz = self._ensure_slab_io().read_slabs(
             "wfns/coeffs",
             shape=(nb, ns, ngkmax, 2),
@@ -1749,11 +1781,12 @@ class WfnLoader:
         return self._phdf5_unfold_and_shard(
             cnk_at_ibz, k_idxs=k_idxs, unfold=unfold, n_reads=n_reads,
             n_k=n_k, bands_per_rank=bands_per_rank, ns=ns, ngkmax=ngkmax,
-            position_in_reads=position_in_reads, out_sharding=out_sharding)
+            position_in_reads=position_in_reads, out_sharding=out_sharding,
+            phase_rows=phase_rows)
 
     def _phdf5_unfold_and_shard(
         self, cnk_at_ibz, *, k_idxs, unfold, n_reads, n_k, bands_per_rank,
-        ns, ngkmax, position_in_reads, out_sharding,
+        ns, ngkmax, position_in_reads, out_sharding, phase_rows,
     ) -> jax.Array:
         """Tail of the phdf5 read: on-device symmetry unfold (+ transpose
         to WfnLoader's G-flat layout) of the union buffer ``cnk_at_ibz``
@@ -1778,9 +1811,7 @@ class WfnLoader:
                            jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
             phase_sh = NamedSharding(self._mesh, P(None, None))
             phase_k = device_put_process_local(
-                self._host_phase_rows_for_full_k(
-                    np.asarray(k_idxs, dtype=np.int32)),
-                phase_sh)
+                phase_rows, phase_sh)
             tr_mask_k = jnp.take(static["tr_mask_per_full"],
                                   jnp.asarray(k_idxs, dtype=jnp.int32), axis=0)
             psi = unfold_jit(cnk_at_ibz, U_k, phase_k, tr_mask_k,
@@ -1977,6 +2008,7 @@ class WfnLoader:
         # the handle.  Opening it lazily costs one h5py lookup and keeps
         # this method usable from a driver whose loader is phdf5-backed.
         if self._coeffs_ds is None:
+            self.sync_read_staging()
             self._coeffs_ds = self._file["wfns/coeffs"]
 
         psi_np = self._eager_build(
@@ -2123,6 +2155,7 @@ class WfnLoader:
           3. Apply the canonical rotation, translation phase and TR action.
           5. Place into output at ``[j, :nb_logical, :, :ngk]``; rest zero.
         """
+        self.sync_read_staging()
         nb_logical = b_hi - b_lo
         ns = int(self.nspinor)
         ngkmax = int(self.ngkmax)
@@ -2152,7 +2185,7 @@ class WfnLoader:
             end = start + ngk_k
             raw = self._coeffs_ds[b_lo:b_hi, :, start:end, :]
             cnk = raw[..., 0] + 1j * raw[..., 1]                    # (nb, ns, ngk_k)
-            g_bar = self._gvecs_raw[start:end]                      # (ngk_k, 3)
+            g_bar = self.get_gvec_nk(kbar)                         # (ngk_k, 3)
             cnk = sym.unfold_wavefunction(
                 cnk, row=sym_idx, g_parent=g_bar)
             out[j, :nb_logical, :, :ngk_k] = cnk
