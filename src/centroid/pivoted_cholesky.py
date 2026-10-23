@@ -831,11 +831,13 @@ def prune_candidates_by_pivoted_cholesky(
     ``n_point_budget`` is the selection budget; this is the physically correct
     centroid-pruning path.
 
-    Returns ``(keep_idx, rank, G, d_final, d_taken, trR_over_trG,
+    Returns ``(keep_idx, rank, d_final, d_taken, trR_over_trG,
     psd_info, unpicked)``.  ``unpicked`` is the largest residual left on a
     candidate the select never picked, in units of its floor: at most 1 means
     the pool is spent and ``rank`` is its rank; above 1 the point budget
-    stopped the select while the pool still held directions.
+    stopped the select while the pool still held directions. The internal
+    padded Gram is released after its last diagnostic; returning its logical
+    slice would replicate a ragged candidate matrix on every rank.
 
     ``n_point_budget`` is THE FLOOR (owner ruling, 2026-08-10: "everything
     the user has input on they should be specifying in units of points, and
@@ -1062,6 +1064,7 @@ def prune_candidates_by_pivoted_cholesky(
             piv_used, rank_i, psd_host, n_keep=n_delivered, M=M,
             M_pad=M_pad, orbit_id=None, d0max=float(diag_host.max()),
             tol_rel=tol_rel)
+        del G
         d_final_np = np.asarray(
             _mh.process_allgather(d_final, tiled=True))[:M]
         # Materializing these sharded diagnostics may itself lower a JAX
@@ -1070,8 +1073,6 @@ def prune_candidates_by_pivoted_cholesky(
         # already left the selector (cross-rank compile-agreement refusal).
         d_taken_np = np.asarray(d_taken)
         trR_over_trG_np = np.asarray(trR_over_trG)
-        if n_pad:
-            G = G[:M, :M]
         if verbose:
             last = max(n_delivered - 1, 0)
             log.debug(
@@ -1084,7 +1085,7 @@ def prune_candidates_by_pivoted_cholesky(
             log.debug(f"[pivoted_cholesky] tr(R_k)/tr(G): "
                       f"first={float(trR_over_trG_np[1]):.3e}, "
                       f"last-delivered={float(trR_over_trG_np[n_delivered]):.3e}")
-        return (keep_idx, rank_i, G, d_final_np, d_taken_np,
+        return (keep_idx, rank_i, d_final_np, d_taken_np,
                 trR_over_trG_np, psd_host,
                 _unpicked_over_floor(d_final_np, diag_host.max(), tol_rel))
 
@@ -1214,10 +1215,9 @@ def prune_candidates_by_pivoted_cholesky(
         # orbits, so it is not comparable to the point count at all.
         _report_point_granularity(G, in_kept, rank_i, unit="orbits",
                                   tol_rel=tol_rel, verbose=verbose)
+    del G
     d_final_np = np.asarray(_mh.process_allgather(d_final, tiled=True))[:M]
-    if n_pad:
-        G = G[:M, :M]        # hand back the LOGICAL Gram, not the padded one
-    return (keep_idx, rank_i, G, d_final_np, d_taken_np,
+    return (keep_idx, rank_i, d_final_np, d_taken_np,
             trR_over_trG_np, psd_host,
             _unpicked_over_floor(d_final_np, diag_host.max(), tol_rel))
 
