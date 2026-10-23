@@ -157,9 +157,8 @@ def _release_lloyd_before_prune(*arrays) -> None:
         if not array.is_deleted():
             array.delete()
     del unique_arrays
-    # Lloyd's executable cache can retain device constants and the allocator
-    # cannot reclaim deleted buffers while Python cycles still own them.
-    jax.clear_caches()
+    # Release Python cycles after deleting the finished array buffers. Keep
+    # compiled programs available to the shared WFN and pruning routines.
     gc.collect()
     after = _bytes_in_use()
     memory_note = ""
