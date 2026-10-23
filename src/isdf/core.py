@@ -1111,191 +1111,198 @@ def c_q_downfold(
 # ============================================================================
 
 
-def _c_q_dirac_quarters(psi_mun, psi_nmu, weight_l, weight_r, *, plan,
-                        kgrid, mesh_xy, gemm, gamma_L, gamma_R):
-	"""Exact four-spinor CCT, four Pauli-quarter pairs through the native owner.
+def _c_q_parent_program(plan, kgrid, gemm, shape, dtype, nq, complete, width):
+    """One SUMMA/typed-parent column stream; all cached closures are metadata."""
+    from distrib_la import gemm_plan
+    from common.fft_helpers import make_fused_conv_kparent
+    mesh = plan.mesh_xy
+    np_, ns, mu, nb = map(int, shape)
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    ml, nl, nk = mu // px, mu // py, math.prod(kgrid)
+    hs = min(ns, 2)
+    native_plan, parity = plan.dirac_halves() if ns == 4 else (plan, None)
+    mu_tiles, permutations, wraps = native_plan.cct_column_tiles(width)
+    nt, _, width = mu_tiles.shape
+    layout = 'face' if gemm.in_sharding_a.spec == P(None, 'x', 'y') else 'axis'
+    tiled_gemm = gemm_plan(mesh, m=hs*mu, n=hs*width*py, k=nb, nq=np_,
+                           dtype=dtype, backend=gemm.backend,
+                           alpha=gemm.alpha, beta=gemm.beta, layout=layout,
+                           reduction_axis=gemm.reduction_axis, warmup=False)
+    mun = NamedSharding(mesh, P(None, None, *tiled_gemm.in_sharding_a.spec[1:]))
+    nmu = NamedSharding(mesh, P(None, tiled_gemm.in_sharding_b.spec[1], None, tiled_gemm.in_sharding_b.spec[2]))
+    out = NamedSharding(mesh, P(None, 'x', 'y'))
+    rep = NamedSharding(mesh, P())
+    pair_spec = P(None, None, 'x', None, 'y')
+    pair = make_fused_conv_kparent(mesh, kgrid, hs, (ml, width),
+                perm_l=np.arange(hs), phase_l=np.ones(hs),
+                perm_r=np.arange(hs), phase_r=np.ones(hs), centroid_major=True)
 
-	What would the owner object to? A second convolution/vertex convention,
-	unfolded psi, or a replicated normal matrix. None is introduced: the
-	typed half action, monomial tables, SUMMA and parent convolution are the
-	existing owners. All 16 spin-pair terms survive. The quarter sum changes
-	reduction order (value parity), never the band contraction or fit metric.
-	For P=px*py, parent scratch is O(4*nparent*M²/P), not the full spin
-	16*nparent*M²/P; the scalar output stays 16*Nk*M²/P bytes. Band panels
-	keep their existing SUMMA bound on GPU and the service's CPU contract.
-	"""
-	from common.gamma_matrices import gamma_perm_phase_host
-	from distrib_la import gemm_plan
-	from common.fft_helpers import make_fused_conv_kparent
+    @partial(shard_map, mesh=mesh, in_specs=(nmu.spec, P()), out_specs=nmu.spec, check_vma=False)
+    def take_columns(pn, beta):
+        idx = jnp.asarray(mu_tiles)[beta, jax.lax.axis_index('y')]
+        valid = idx >= 0
+        local = jnp.maximum(idx - jax.lax.axis_index('y') * nl, 0)
+        return jnp.take(pn, local, axis=3) * valid[None, None, None, :]
 
-	half, parity = plan.dirac_halves()  # authenticates diag(U, parity*U)
-	np_, _, mu, nb = map(int, psi_mun.shape)
-	px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
-	mu_loc, col_loc = mu // px, mu // py
-	key = ('c_q_dirac_quarters', mesh_xy, plan, gemm, tuple(kgrid),
-	       tuple(psi_mun.shape), str(psi_mun.dtype))
-	if key not in _isdf_pipeline_cache:
-		layout = 'face' if gemm.in_sharding_a.spec == P(None, 'x', 'y') else 'axis'
-		quarter_gemm = gemm_plan(mesh_xy, m=2*mu, n=2*mu, k=nb, nq=np_,
-		                         dtype=psi_mun.dtype, backend=gemm.backend,
-		                         alpha=gemm.alpha, beta=gemm.beta,
-		                         layout=layout, reduction_axis=gemm.reduction_axis,
-		                         warmup=False)
-		mun = NamedSharding(mesh_xy, P(None, None, *quarter_gemm.in_sharding_a.spec[1:]))
-		nmu = NamedSharding(mesh_xy, P(None, quarter_gemm.in_sharding_b.spec[1],
-		                             None, quarter_gemm.in_sharding_b.spec[2]))
-		rep = NamedSharding(mesh_xy, P())
-		out = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-		pair_spec = P(None, None, 'x', None, 'y')
-		pair = make_fused_conv_kparent(mesh_xy, kgrid, 2, (mu_loc, col_loc),
-		       perm_l=np.arange(2), phase_l=np.ones(2),
-		       perm_r=np.arange(2), phase_r=np.ones(2), centroid_major=True)
+    @partial(shard_map, mesh=mesh,
+             in_specs=(pair_spec, pair_spec, P(), P(), P(), P(), P(), P()),
+             out_specs=out.spec, check_vma=False)
+    def tail(dl, dr, beta, h, g, gamma, qrows, partners):
+        lp, lL, _, _ = _parent_local_tables(native_plan, native_plan.centroid_local_perm,
+                                            native_plan.L_table, ml, nl)
+        y = jax.lax.axis_index('y')
+        tables = _parent_conv_tables_local(native_plan, lp, lL,
+                   jnp.asarray(permutations)[beta, y], jnp.asarray(wraps)[beta, y])
+        if ns == 4:
+            perm, phase, flip = gamma
+            uh, ug = h ^ flip[0], g ^ flip[1]
+            tables = (*tables[:-2], tables[-2] * jnp.where(h == g, 1., jnp.asarray(parity))[:, None, None],
+                       tables[-1] * jnp.where(uh == ug, 1., jnp.asarray(parity))[:, None, None])
+            vl = (perm[0], jax.lax.dynamic_slice_in_dim(phase[0], 2*h, 2))
+            vr = (perm[1], jax.lax.dynamic_slice_in_dim(phase[1], 2*g, 2))
+            tables = _parent_conv_vertices(tables, vl, vr)
+        result = pair(dl, dr, tables)
+        selected = jnp.take(result, jnp.asarray(qrows), axis=0)
+        if complete:
+            selected = selected + jnp.conj(jnp.take(result, jnp.asarray(partners), axis=0))
+        return selected
 
-		@partial(shard_map, mesh=mesh_xy,
-		         in_specs=(pair_spec, pair_spec, P(), P(), P()),
-		         out_specs=P(None, 'x', 'y'), check_vma=False)
-		def tail(dl, dr, h, g, gamma):
-			perm, phase, flip = gamma
-			tables = _parent_conv_tables(half, half.centroid_local_perm,
-			                              half.L_table, mu_loc, col_loc)
-			uh, ug = h ^ flip[0], g ^ flip[1]
-			# A quarter's parity belongs to its typed unfold, before vertices.
-			left_sign = jnp.where(h == g, 1., jnp.asarray(parity))
-			right_sign = jnp.where(uh == ug, 1., jnp.asarray(parity))
-			tables = (*tables[:-2], tables[-2]*left_sign[:, None, None],
-			          tables[-1]*right_sign[:, None, None])
-			vl = (perm[0], jax.lax.dynamic_slice_in_dim(phase[0], 2*h, 2))
-			vr = (perm[1], jax.lax.dynamic_slice_in_dim(phase[1], 2*g, 2))
-			return pair(dl, dr, _parent_conv_vertices(tables, vl, vr))
+    @partial(shard_map, mesh=mesh, in_specs=(out.spec, out.spec, P()),
+             out_specs=out.spec, check_vma=False)
+    def put_columns(c, u, beta):
+        idx = jnp.asarray(mu_tiles)[beta, jax.lax.axis_index('y')]
+        idx = jnp.where(idx >= 0, idx - jax.lax.axis_index('y') * nl, nl)
+        return c.at[:, :, idx].set(u, mode='drop', unique_indices=True)
 
-		# The gamma pair is data, so the six vertex pairs share one program.
-		@partial(jax.jit, in_shardings=(mun, nmu, rep, rep, rep), out_shardings=out)
-		def run(pm, pn, wl, wr, gamma):
-			def projector(w, h, g):
-				l = jax.lax.dynamic_slice_in_dim(pm, 2*h, 2, axis=1)
-				r = jax.lax.dynamic_slice_in_dim(pn, 2*g, 2, axis=2)
-				a = merge_spin_centroid(l, 1, 2) * w[None, None, :].astype(pm.dtype)
-				b = merge_spin_centroid(jnp.conj(r), 2, 3)
-				d = quarter_gemm(a, b).reshape(np_, mu, 2, mu, 2)
-				return jnp.transpose(d, (0, 2, 1, 4, 3))
-			def add(total, hg):
-				total, wl_ = jax.lax.optimization_barrier((total, wl))
-				h, g = hg
-				dl = projector(wl_, h, g)
-				dl, wr_ = jax.lax.optimization_barrier((dl, wr))
-				dr = projector(wr_, h ^ gamma[2][0], g ^ gamma[2][1])
-				return total + tail(dl, dr, h, g, gamma), None
-			nk = math.prod(kgrid)
-			zero = jax.lax.with_sharding_constraint(jnp.zeros((nk, mu, mu), pm.dtype), out)
-			return jax.lax.scan(add, zero, jnp.asarray(((0,0),(0,1),(1,0),(1,1)), jnp.int32), unroll=1)[0]
-		_isdf_pipeline_cache[key] = run
-	# Each vertex's in-block permutation, its four phases, and whether it
-	# swaps the upper and lower halves (every gamma but the identity does).
-	(pl, fl), (pr, fr) = map(gamma_perm_phase_host, (gamma_L, gamma_R))
-	gamma = (np.stack([pl[:2] % 2, pr[:2] % 2]), np.stack([fl, fr]),
-	         np.asarray([gamma_L != 0, gamma_R != 0], np.int32))
-	return _isdf_pipeline_cache[key](psi_mun, psi_nmu,
-	       jnp.asarray(weight_l, jnp.float64), jnp.asarray(weight_r, jnp.float64), gamma)
+    @partial(jax.jit, donate_argnums=(0,), in_shardings=(out, mun, nmu, rep, rep, rep, rep, rep), out_shardings=out)
+    def run(c0, pm, pn, wl, wr, gamma, qrows, partners):
+        def tile(c, beta):
+            pn_tile = take_columns(pn, beta)
+            def projector(w, h, g):
+                left = (jax.lax.dynamic_slice_in_dim(pm, 2*h, 2, axis=1) if ns == 4 else pm)
+                right = (jax.lax.dynamic_slice_in_dim(pn_tile, 2*g, 2, axis=2) if ns == 4 else pn_tile)
+                a = merge_spin_centroid(left, 1, 2) * w[None, None, :].astype(pm.dtype)
+                b = merge_spin_centroid(jnp.conj(right), 2, 3)
+                d = tiled_gemm(a, b).reshape(np_, mu, hs, width*py, hs)
+                return jnp.transpose(d, (0, 2, 1, 4, 3))
+            def quarter(total, hg):
+                h, g = hg
+                uh, ug = ((h ^ gamma[2][0], g ^ gamma[2][1]) if ns == 4 else (h, g))
+                dl = projector(wl, h, g)
+                dr = projector(wr, uh, ug)
+                return total + tail(dl, dr, beta, h, g, gamma, qrows, partners), None
+            if ns == 4:
+                zero = jax.lax.with_sharding_constraint(jnp.zeros((nq, mu, width*py), pm.dtype), out)
+                u = jax.lax.scan(quarter, zero, jnp.asarray(((0,0),(0,1),(1,0),(1,1)), jnp.int32), unroll=1)[0]
+            else:
+                u = tail(projector(wl, 0, 0), projector(wr, 0, 0), beta, 0, 0, gamma, qrows, partners)
+            return put_columns(c, u, beta), None
+        return jax.lax.scan(tile, c0, jnp.arange(nt, dtype=jnp.int32), unroll=1)[0]
+
+    zero = jax.jit(lambda: jnp.zeros((nq, mu, mu), dtype), out_shardings=out)
+    return run, zero, dict(tiles=nt, width=width, output_shape=(nq, mu, mu), sharding=out)
 
 
 def c_q_from_psi_sm(
-	psi_mun_parent: jax.Array,
-	psi_nmu_parent: jax.Array,
-	weight_l: jax.Array,
-	weight_r: jax.Array,
-	*,
-	k_unfold_plan,
-	kgrid: tuple[int, int, int],
-	mesh_xy: Mesh,
-	gemm,
-	gamma_L: int = 0,
-	gamma_R: int = 0,
-) -> jax.Array:
-	"""Contract raw-parent band projectors and apply fixed vertices after typed unfolding."""
-	n_parent, s_, mu_pk, nb = (int(v) for v in psi_mun_parent.shape)
-	nkx, nky, nkz = kgrid
-	nk = nkx * nky * nkz
-	plan = k_unfold_plan
-	if int(plan.n_parent) != n_parent or int(plan.n_full) != nk:
-		raise ValueError(
-			"_c_q_face_parent: plan k extents (parent/full) "
-			f"{plan.n_parent}/{plan.n_full} disagree with the operands "
-			f"{n_parent}/{nk}.")
-	if int(plan.n_centroid_packed) != mu_pk or int(plan.nspinor) != s_:
-		raise ValueError(
-			"_c_q_face_parent: psi_mun_parent must be in the plan's packed "
-			f"centroid order with its spin extent; got mu={mu_pk}, s={s_} "
-			f"vs plan {plan.n_centroid_packed}/{plan.nspinor}.")
-	if tuple(int(v) for v in psi_nmu_parent.shape) != (n_parent, nb, s_, mu_pk):
-		raise ValueError(
-			"_c_q_face_parent: psi_nmu_parent shape "
-			f"{tuple(psi_nmu_parent.shape)} != {(n_parent, nb, s_, mu_pk)}.")
-	if s_ == 4:
-		return _c_q_dirac_quarters(psi_mun_parent, psi_nmu_parent, weight_l, weight_r,
-		       plan=plan, kgrid=kgrid, mesh_xy=mesh_xy, gemm=gemm,
-		       gamma_L=gamma_L, gamma_R=gamma_R)
-	left_gamma = (None, None) if gamma_L == 0 else _gamma_perm_phase_mu(gamma_L)
-	right_gamma = (None, None) if gamma_R == 0 else _gamma_perm_phase_mu(gamma_R)
-	px = int(mesh_xy.shape['x'])
-	py = int(mesh_xy.shape['y'])
-	mu_loc = mu_pk // px
-	col_loc = mu_pk // py
-	from common.fft_helpers import make_fused_conv_kparent
-	p_l, ph_l = _conv_kpair_static_gamma(None, s_)
-	p_r, ph_r = _conv_kpair_static_gamma(None, s_)
-	pair_kernel = make_fused_conv_kparent(
-		mesh_xy, kgrid, s_, (mu_loc, col_loc),
-		perm_l=p_l, phase_l=ph_l, perm_r=p_r, phase_r=ph_r, centroid_major=True)
+    psi_mun_parent, psi_nmu_parent, weight_l, weight_r, *, k_unfold_plan,
+    kgrid, mesh_xy, gemm, gamma_L=0, gamma_R=0, q_rows=None, q_neg_idx=None,
+):
+    """Parent Gram on ``C_q(mu_X,nu_Y)``, with bounded symmetry-closed columns.
 
-	in_mun = NamedSharding(mesh_xy, P(None, None, *gemm.in_sharding_a.spec[1:]))
-	in_nmu = NamedSharding(mesh_xy, P(None, gemm.in_sharding_b.spec[1],
-	                                      None, gemm.in_sharding_b.spec[2]))
-	w_rep = NamedSharding(mesh_xy, P(None))
-	out_C = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-	# The router's parent convolution takes the logical (p, s, mu, s', nu)
-	# order; centroid_major tells the CUDA handler the physical layout.
-	pair_spec = P(None, None, 'x', None, 'y')
+    Both parent wavefunction faces retain their band/centroid mesh axes.
+    ``q_rows`` selects full-grid q labels before assembling the output; when
+    ``q_neg_idx`` is given, each bounded tile completes LR+conj(RL at -q)
+    before selection or the caller's channel weights. Defaults return every
+    uncompleted q row, preserving the standalone contract.
+    The exact executable is admitted before allocating its donated output.
+    """
+    from lxkit import memory
+    from distrib_la import room_class, room_test
+    from common.gpu_utils import device_budget_bytes
+    from common.gamma_matrices import gamma_perm_phase_host
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes, ModuleDoesNotFit
 
-	cache_key = ('c_q_face_parent', mesh_xy, plan, gemm, tuple(kgrid),
-	             tuple(psi_mun_parent.shape), tuple(psi_nmu_parent.shape),
-	             str(psi_mun_parent.dtype), str(psi_nmu_parent.dtype),
-	             bool(gamma_L), bool(gamma_R))
-	if cache_key not in _isdf_pipeline_cache:
-		left_spec = tuple(None if value is None else w_rep for value in left_gamma)
-		right_spec = tuple(None if value is None else w_rep for value in right_gamma)
-		@partial(jax.jit, in_shardings=(in_mun, in_nmu, w_rep, w_rep,
-		                                 left_spec, right_spec),
-		         out_shardings=out_C)
-		def _fused(psi_mun_, psi_nmu_, w_l, w_r, vertex_l, vertex_r):
-			def _projector(w):
-				A = merge_spin_centroid(psi_mun_, 1, 2)            # (p, mu*s, nb)
-				A = A * w[None, None, :].astype(A.dtype)
-				B = merge_spin_centroid(jnp.conj(psi_nmu_), 2, 3)  # (p, nb, nu*s)
-				D = gemm(A, B)                                      # (p, mu*s, nu*s)
-				# Centroid-major, the merged order itself: the Green layout the
-				# plan's unfold transports without a layout copy.
-				return D.reshape(D.shape[0], mu_pk, s_, mu_pk, s_)  # (p, mu, s, nu, s')
+    device_budget_bytes()
+    plan = k_unfold_plan
+    np_, ns, mu, nb = map(int, psi_mun_parent.shape)
+    nk = math.prod(kgrid)
+    if (int(plan.n_parent), int(plan.n_full), int(plan.n_centroid_packed), int(plan.nspinor)) != (np_, nk, mu, ns):
+        raise ValueError("CCT raw-parent face differs from its typed plan")
+    if tuple(psi_nmu_parent.shape) != (np_, nb, ns, mu):
+        raise ValueError("CCT right face differs from its left face")
+    rows = np.arange(nk, dtype=np.int32) if q_rows is None else np.asarray(q_rows, np.int32)
+    if rows.ndim != 1 or len(rows) < 1 or np.any(rows < 0) or np.any(rows >= nk) or len(np.unique(rows)) != len(rows):
+        raise ValueError("CCT output q rows must be unique valid full-grid indices")
+    partners = None
+    if q_neg_idx is not None:
+        neg = np.asarray(q_neg_idx, np.int32)
+        if (neg.shape != (nk,) or np.any(neg < 0) or np.any(neg >= nk)
+                or not np.array_equal(neg[neg], np.arange(nk))):
+            raise ValueError("CCT q-negation must be a full-grid involution")
+        partners = neg[rows]
+    if ns == 4:
+        (pl, fl), (pr, fr) = map(gamma_perm_phase_host, (gamma_L, gamma_R))
+        gamma = (np.stack([pl[:2] % 2, pr[:2] % 2]), np.stack([fl, fr]),
+                 np.asarray([gamma_L != 0, gamma_R != 0], np.int32))
+    else:
+        if gamma_L or gamma_R:
+            raise ValueError("CCT current vertices require four-spinor faces")
+        gamma = (np.zeros((2, ns), np.int32), np.ones((2, ns), np.complex128), np.zeros(2, np.int32))
+    wl, wr = jnp.asarray(weight_l, jnp.float64), jnp.asarray(weight_r, jnp.float64)
+    args = (psi_mun_parent, psi_nmu_parent, wl, wr, gamma, rows,
+            np.empty((0,), np.int32) if partners is None else partners)
+    key = ('cct_parent_columns', plan, gemm, tuple(kgrid), tuple(psi_mun_parent.shape),
+           str(psi_mun_parent.dtype), len(rows), partners is not None)
+    room = agreed_chunk(int(memory.room()))
+    world = int(mesh_xy.size)
+    output_bytes = len(rows) * mu * mu * int(psi_mun_parent.dtype.itemsize) // world
+    columns = mu // int(mesh_xy.shape['y'])
+    # The native call simultaneously reads both parent projectors and writes
+    # its full-k scalar tile. These distinct FFI buffers give a strict lower
+    # bound, not an admission price; SUMMA/staging bytes come from compilation.
+    per_column_min = 16 * (mu // int(mesh_xy.shape['x'])) * (2 * np_ * min(ns, 2)**2 + nk)
+    column_plan = plan.dirac_halves()[0] if ns == 4 else plan
 
-			# Parent contraction; the convolution's load applies the typed transport.
-			# Parent-sized copies into the logical order; XLA folds them into the
-			# input layout the CUDA handler asks for.
-			D_l = jnp.transpose(_projector(w_l), (0, 2, 1, 4, 3))
-			D_r = jnp.transpose(_projector(w_r), (0, 2, 1, 4, 3))
+    def decide():
+        width = columns
+        previous_shape = None
+        while True:
+            shape = column_plan.cct_column_shape(width)
+            lower = output_bytes + per_column_min * shape[1]
+            if (not room_test(lambda r, minimum=lower: minimum <= r, room)
+                    and shape != previous_shape and width > 1):
+                previous_shape = shape
+                width = max(1, width // 2)
+                continue
+            # The cache holds immutable tables/programs and executable signatures;
+            # wavefunctions and normal matrices never enter it.
+            variant_key = (key, width)
+            if variant_key not in _isdf_pipeline_cache:
+                run, zero, meta = _c_q_parent_program(plan, tuple(kgrid), gemm,
+                    tuple(psi_mun_parent.shape), psi_mun_parent.dtype, len(rows), partners is not None, width)
+                aval = jax.ShapeDtypeStruct(meta['output_shape'], psi_mun_parent.dtype,
+                                           sharding=meta['sharding'])
+                try:
+                    executable = run.lower(aval, *args).compile()
+                    need = -agreed_chunk(-compiled_new_bytes(executable, extra=output_bytes))
+                except ModuleDoesNotFit:
+                    executable, need = None, 1 << 62
+                _isdf_pipeline_cache[variant_key] = (executable, zero, meta, need)
+            executable, zero, meta, need = _isdf_pipeline_cache[variant_key]
+            fit = room_test(lambda r, price=need: price <= r, room)
+            shape = (meta['tiles'], meta['width'])
+            if fit or shape == previous_shape or width == 1:
+                if executable is None:
+                    raise ValueError("CCT's smallest symmetry-closed column program exceeds device memory")
+                return executable, zero, meta, need
+            previous_shape = shape
+            width = max(1, width // 2)
 
-			@partial(shard_map, mesh=mesh_xy, in_specs=(pair_spec, pair_spec),
-			         out_specs=P(None, 'x', 'y'), check_vma=False)
-			def _tail(D_l_, D_r_):
-				tables = _parent_conv_tables(
-					plan, plan.centroid_local_perm, plan.L_table, mu_loc, col_loc)
-				return pair_kernel(D_l_, D_r_, _parent_conv_vertices(tables, vertex_l, vertex_r))
-
-			return _tail(D_l, D_r)
-
-		_isdf_pipeline_cache[cache_key] = _fused
-
-	return _isdf_pipeline_cache[cache_key](psi_mun_parent, psi_nmu_parent,
-	             jnp.asarray(weight_l, dtype=jnp.float64),
-	             jnp.asarray(weight_r, dtype=jnp.float64), left_gamma, right_gamma)
+    executable, zero, meta, need = room_class(
+        _isdf_pipeline_cache, ('cct_room', key), room, decide)
+    source = f"CCT {len(rows)}/{nk} q rows, {meta['tiles']} symmetry-closed column tiles"
+    memory.admit(source, [(source, memory.priced(0, source, spread=need*world, ranks=world))], room)
+    return executable(zero(), *args)
 
 
 def _identity_pad_block_diagonal(
@@ -1313,7 +1320,9 @@ def _identity_pad_block_diagonal(
             f"n_rmu_logical={n_rmu_logical} > input extent {n_rmu}")
     sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     if n_rmu_logical == n_rmu:
-        return jax.lax.with_sharding_constraint(M, sharding)
+        # Concrete no-op; traced callers retain the layout constraint.
+        from distrib_la import ensure_sharding
+        return ensure_sharding(M, sharding)
     # The pad-block identity [n_rmu_logical, n_rmu) is traced inside one program on M's face:
     # an eager jnp.diag built the whole (n_rmu, n_rmu) on every process's default device.
     return _identity_pad_program(sharding, int(n_rmu), int(n_rmu_logical))(M)
@@ -1527,33 +1536,103 @@ def _factor_c_q_face(C_q, mesh_xy, n_rmu_logical, zeta_rcond=ZETA_RCOND_DEFAULT)
     (``cut = rcond``).  The pad block is zeroed (its pairs deflate below the cut),
     so B's pad block is zero and ζ = B(BᴴZ) is the logical solve, pads zero.
     """
-    from distrib_la import checked_program, plan
+    from dataclasses import replace
     from isdf import cplus
+    from lxkit import memory
+    from runtime.aot_memory import compiled_price
+    from common.gpu_utils import shared_device_room
     nq, n, _ = C_q.shape
     n_log = int(n_rmu_logical)
     rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
+    room = shared_device_room("isdf zeta charge factor")
+    reserve = memory.contexts().at(int(mesh_xy.size)) if int(mesh_xy.size) > 1 else 0
+    from distrib_la import room_or_exhausted
+    plan_room = room_or_exhausted(max(0, int(room)-int(reserve)),
+        stage="isdf charge factor provider contexts", priced_bytes=int(reserve),
+        available_bytes=int(room)) if int(room) > 0 else room
+    from distrib_la import ROUTE_BATCH_RESHARD, eigh_rounds
+    variants, prices = {}, {}
+
+    def prepare(rounds):
+        if rounds not in variants:
+            variants[rounds] = _charge_factor_program(
+                C_q, mesh_xy, n_log, float(rcond), plan_room, rounds)
+        return variants[rounds]
+
+    def price(rounds, phase):
+        key = rounds, phase
+        if key not in prices:
+            eig, program, first, whole, runner = prepare(rounds)
+            route = eig.stack_route(C_q.shape, C_q.dtype, traced=False)
+            local = (eig.is_native or eig.backend == 'one_device'
+                or phase == 'first' and route.route == ROUTE_BATCH_RESHARD)
+            native = _charge_factor_workspace(eig, C_q.shape, C_q.dtype,
+                                               first=phase == 'first', rounds=rounds)
+            priced = compiled_price(compiled=first if phase == 'first' else whole, extra=native,
+                ranks=int(mesh_xy.size), face=True, contexts=int(mesh_xy.size) > 1,
+                source=f"complete Cplus {phase} program plus queried native workspace")
+            prices[key] = replace(priced, whole=int(n) if local else 0)
+        return prices[key]
+
+    def first_with_backup(rounds):
+        quoted = max((price(rounds, 'first'), price(rounds, 'whole')), key=lambda p: p.bytes())
+        return replace(quoted, whole=price(rounds, 'first').whole)
+
+    eig = prepare(None)[0]
+    route = eig.stack_route(C_q.shape, C_q.dtype, traced=False)
+    candidates = [None]
+    if route.route == ROUTE_BATCH_RESHARD:
+        candidates += [r for r, share in eigh_rounds(int(nq), int(mesh_xy.size))
+                       if r > route.rounds and share < route.per_rank]
+    names = {r: 'first' if r is None else f'{r} rounds' for r in candidates}
+    chosen = memory.admit("charge Cplus factor",
+        [(names[r], lambda r=r: first_with_backup(r)) for r in candidates]
+        + [('whole', lambda: price(None, 'whole'))], int(room))
+    rounds = next((r for r in candidates if names[r] == chosen), None)
+    eig, program, first, whole, runner = prepare(rounds)
+    B, figures = (program.finish((C_q,), whole(C_q)) if chosen == 'whole' else runner(C_q))
+    cplus.report(figures, rcond=rcond, n_log=n_log)
+    return B
+
+
+def _charge_factor_workspace(eig, shape, dtype, *, first, rounds=None):
+    """Native scratch of the existing first route or the checked whole-mesh backup."""
+    from distrib_la import local_eigh_workspace, workspace_bytes_per_rank, ROUTE_BATCH_RESHARD, eigh_rounds
+    if (eig.is_native and eig.capacity_refusal is None) or eig.backend == 'one_device':
+        return workspace_bytes_per_rank(eig, 'eigh', (tuple(shape),), dtype)
+    route = eig.stack_route(shape, dtype, traced=False)
+    if route.route == ROUTE_BATCH_RESHARD and (first or eig.capacity_refusal is not None):
+        share = (route.per_rank if rounds is None or not first else
+                 eigh_rounds(shape[0], eig.mesh.size, rounds)[0][1])
+        return local_eigh_workspace(eig.mesh, share, int(shape[-1]), dtype)
+    # A rank-2 query names one distributed solve, never a cached local-stack route.
+    return workspace_bytes_per_rank(eig, 'eigh', (tuple(shape[-2:]),), dtype, checked=not first)
+
+
+def _charge_factor_program(C_q, mesh_xy, n_log, rcond, room, rounds=None):
+    """The single factor equation, compiled once per class of equivalent room decisions."""
+    from distrib_la import checked_program, plan, room_class, RoomExhausted
+    from isdf import cplus
+    nq, n, _ = C_q.shape
     face, rep = NamedSharding(mesh_xy, P(None, 'x', 'y')), NamedSharding(mesh_xy, P())
-    # distrib_la.plan.place decides the stack in the room beside what the zeta stage holds now
-    # (C, the stores; lxkit.memory.room, the same on every rank): whole
-    # matrices per rank where they fit (Fe: 64 q, n 312), else the whole mesh (a Gamma deck:
-    # nq 1, n 29998). The room's bucket keys the program, so a later call decides in its own room.
-    from common.gpu_utils import shared_device_room
-    room = shared_device_room("isdf zeta charge eigh")
-    key = (_mesh_key(mesh_xy), int(nq), int(n), n_log, float(rcond), room)
-    if key not in _charge_face_cache:
+    key = (_mesh_key(mesh_xy), tuple(C_q.shape), str(C_q.dtype), str(getattr(C_q, 'format', None)),
+           C_q.sharding, int(n_log), float(rcond), rounds,
+           room if isinstance(room, RoomExhausted) else None)
+
+    def build():
         eig = plan("eigh", mesh_xy, n=int(n), budget_bytes=room)
         @partial(checked_program, mesh=mesh_xy, out_shardings=(face, rep), in_shardings=(face,))
         def _fn(C):
-            # A traced iota mask, not a host (n, n) constant per rank.
             live = jnp.arange(int(n)) < n_log
             C = jnp.where(live[:, None] & live[None, :], C, 0)
             B, figures = cplus.factor(C, rcond=rcond, rank_log=True, n_log=n_log,
-                                      eigh=lambda c: eig.batched(c, cut=rcond))
-            return B, figures                      # zero pad block: ζ's pad rows stay zero
-        _charge_face_cache[key] = _fn
-    B, figures = _charge_face_cache[key](C_q)
-    cplus.report(figures, rcond=rcond, n_log=n_log)
-    return B
+                eigh=lambda c: eig.batched(c, cut=rcond, _rounds=rounds))
+            return B, figures
+        first, _ = _fn.compiled(C_q)
+        whole = _fn.lower(C_q).compile()
+        return eig, _fn, first, whole, _fn.runner(first, retry=whole)
+
+    return room_class(_charge_face_cache, key, int(room), build)
 
 
 def solve_zeta_charge_dense(C, Z, *, charge_zeta_solve: str,

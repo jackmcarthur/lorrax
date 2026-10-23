@@ -947,15 +947,18 @@ def fit_ppm(
          print_fn=print_fn if print_fn is not None else print)
 
     q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    Omega = jax.lax.with_sharding_constraint(
+    # The fit keeps the input face. Preserve matching concrete fields rather
+    # than making a second full pole set at this eager boundary.
+    from distrib_la import ensure_sharding
+    Omega = ensure_sharding(
         jnp.asarray(fit.omega_qmunu), q_shard)
-    B = jax.lax.with_sharding_constraint(jnp.asarray(fit.B_qmunu), q_shard)
+    B = ensure_sharding(jnp.asarray(fit.B_qmunu), q_shard)
     B_odd = (None if fit.B_odd_qmunu is None else
-             jax.lax.with_sharding_constraint(
+             ensure_sharding(
                  jnp.asarray(fit.B_odd_qmunu), q_shard))
-    valid_mask = jax.lax.with_sharding_constraint(
+    valid_mask = ensure_sharding(
         jnp.asarray(fit.valid_qmunu), q_shard)
-    Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
+    Wc0_q = ensure_sharding(Wc0_q, q_shard)
     t1 = _t.perf_counter()
 
     probe_hermiticity_residual = None

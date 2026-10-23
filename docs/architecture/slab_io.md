@@ -47,6 +47,8 @@ workload it exists for.
 Buffers round up to 2 MiB and are freed at `close`. Pinned memory does not
 show in `/proc`; `ffi.io.staging_totals()` returns
 `(live_contexts, staged_bytes)`.
+With no platform argument, this diagnostic follows the initialized JAX
+backend, including CPU runs that leave `JAX_PLATFORMS` unset.
 
 **Device memory.** `write_slab` holds a reference to its operand until that
 operand's `H5Dwrite` completes. The process's one writer queue holds at most
@@ -169,7 +171,7 @@ a backend, striping, ROMIO hints, or a mesh-divisible extent.
 | `write_slab(name, A, *, offset=None, global_shape=None, valid_shape=None)` | yes, **asynchronous** | Enqueues and returns. Bytes are on disk after `sync_writes()` or `close()`. |
 | `read_slab(name, *, shape=None, dtype=None, offset=None, valid_shape=None, mesh=None, partition_spec=None, as_numpy=False)` | yes, synchronous | Returns a `jax.Array` sharded `partition_spec` on `mesh` (default: the handle's). `as_numpy=True` returns host numpy through `device_get`, which is valid for a replicated read. |
 | `read_slabs(name, *, shape, offsets, valid_shapes, partition_spec, window_axis, dtype=None, mesh=None)` | yes (every rank calls it; a band-block transfer is independent) | n windows of one slab shape, stacked on a new axis at `window_axis`, read in chunks of output rows ([tuning](#tuning)). Returns an async result that the caller's next op sequences. |
-| `read_multi(requests, *, partition_spec, mesh=None)` | yes (every rank passes the same list in the same order) | N `read_slab` requests (`name`, `shape`, `offset`, optional `valid_shape`, `dtype`) of one rank and one `partition_spec`, in ONE `PhdfReadMulti` dispatch: one posted control (handler ABI 8, [control](#stream-race)), one collective `H5Dread_multi` (HDF5 >= 1.14), one staging region, N H2D copies behind one event. Each value is exactly `read_slab`'s; the outputs are the only device bytes. Returns before the read lands (no host sync); the next HDF5 entry point and `close` wait for it. HDF5 refuses overlapping selections in one `H5Dread_multi`, so identical requests are read once and shared, and requests whose boxes overlap on one dataset go in a later disjoint wave (one more dispatch each; normally one wave). Requests `read_slab` would move as file rows keep that route; a library without the handler refuses (`GATE slab_io_read_multi`). |
+| `read_multi(requests, *, partition_spec, mesh=None)` | yes (every rank passes the same list in the same order) | N `read_slab` requests (`name`, `shape`, `offset`, optional `valid_shape`, `dtype`) of one rank and one `partition_spec`, in ONE `PhdfReadMulti` dispatch: one posted control (handler ABI 8, [control](#stream-race)), one collective `H5Dread_multi` (HDF5 >= 1.14), one staging region, N H2D copies behind one event. Each value is exactly `read_slab`'s; the outputs are the only device bytes. Returns before the read lands (no host sync); the next HDF5 entry point and `close` wait for it. HDF5 permits each unique dataset only once per `H5Dread_multi`, including disjoint selections: identical requests are read once and shared; distinct requests of that dataset use separate waves. Different datasets still batch together (normally one wave). Requests `read_slab` would move as file rows keep that route; a library without the handler refuses (`GATE slab_io_read_multi`). |
 | `read_small(name, *, dtype=None)` | yes | A whole small dataset as host numpy on every rank, scalars included. |
 | `write_attr(name, value)` | no (queues) | A small replicated dataset, written by rank 0 at close. It replaces any existing dataset of that name. |
 | `stamp_dataset_attrs(name, attrs)` | no (queues) | HDF5 attributes on an existing dataset, stamped by rank 0 at close. |
@@ -520,7 +522,12 @@ then `PROGRESS` every 60 s, then `COMPLETE`.
 `tmp/isdf_tensors_<N_μ>.h5` is written by
 `tagged_arrays.write_restart_state_to_h5` through SlabIO at the logical μ
 extent, so a bundle reads at any device count. Its contents are listed in
-[`drivers.md`](../drivers.md). `restart_bundle.read_restart_state_from_h5`
+[`drivers.md`](../drivers.md). A reduced-q write binds the producer's
+canonical pre-unfold capture before choosing its V operand; the writer
+authenticates that capture. It does not canonicalize an unused full-zone V.
+Paired centroid-axis conversions
+use `PackedCentroidBasis.pack_operator` / `unpack_operator`, whose q tiles
+bound their permutation scratch. `restart_bundle.read_restart_state_from_h5`
 reads it in two passes, and never holds an h5py handle and a SlabIO handle on
 the file at once:
 

@@ -80,6 +80,30 @@ Refusals are `ValueError` or `RuntimeError` (`TypeError` /
 such as `src/bandstructure/bse_setup.py` re-raise `type(exc)(why)` with added
 context, which a service-specific exception class would break.
 
+## Non-negative quadratics
+
+`solve_nonnegative_quadratic(A, b, *, mesh, n_logical, maxiter=None)` minimizes
+`0.5*x.T@A@x - b.T@x` subject to `x >= 0`. `A` is real float64 SPD on
+`P('x','y')`; `b` and the returned weights are vectors on `P('x')`,
+replicated along y. The matrix extent is mesh padded; variables after
+`n_logical` are fixed exactly to zero. The caller supplies any ridge and
+resolves the shared `lxkit.memory` run budget before entering collectively.
+
+The function consumes **both inputs by donation** while diagonally scaling
+the quadratic. It uses block principal pivots and the existing distributed
+LU plan for masked principal systems. Inactive rows and columns become an
+identity block on the original face, so there is no dynamic active-submatrix
+gather. The normal matrix and its factors stay distributed; only scalar
+KKT convergence information reaches Python. A non-finite solve, failed
+residual check or iteration limit refuses with `GATE nonnegative_quadratic`.
+Every kernel executes the compiled program admitted at its actual operands;
+the LU result checks remain in the service's cacheable `checked_program`.
+
+This is an eager iterative solve, rather than a trace-safe factory. Its
+default limit is `20*n_logical` principal solves. It serves the orbit-tied
+nodal quadrature metric without requiring a replicated NumPy normal matrix,
+Cholesky factor or SciPy NNLS workspace on every process.
+
 ## Dense factorizations: `plan` {#dense-factorizations}
 
 ```python
@@ -108,6 +132,16 @@ replicated; eigenvectors return as columns, `A Z = Z diag(w)`, in the input's
 face layout. `ensure_sharding` is the only reshard on entry: a tracer gets a
 sharding constraint, an array already in layout passes untouched, anything
 else is placed process-locally.
+
+Use this public helper at eager stage boundaries too. An eager
+`with_sharding_constraint` can copy an entire resident operator even when
+its current `NamedSharding` and physical format already match: the measured
+Fe V producer duplicated its 59 × 3164 × 3164 complex128 parent stack,
+2.363 GB per rank at P4, between capture and return. `ensure_sharding`
+preserves the physical buffer in that matching case and explicitly moves a
+mismatched operand. Inside a traced program it retains the sharding
+constraint; constraints inside `jit`/`shard_map` still express that program's
+layout contract.
 
 **No distributed result is returned unchecked** (`_result_check`). The
 distributed libraries fail silently. cuSOLVERMp 0.9.1's syevd returned wrong
@@ -329,6 +363,13 @@ route (c), and refuses by name at the first stack that needs the whole mesh
   stack on the whole mesh, refused by name if a solve fails every attempt.
   `call.lower` lowers that program, so a caller that admits it by its compiled
   size has sized the retry and runs the first program in the room it leaves.
+  `call.runner(first, retry=whole)` reuses exact already-compiled first and
+  backup executables after the caller admits both complete programs.
+  `eigh_rounds(nb, ranks, start=1)` supplies the existing route-(c)
+  doubling candidates and each one's actual local share, for callers
+  admitting a larger fused program around that same solver. An explicit
+  private `_rounds` on `Plan.batched` changes only that first route; the
+  checked backup keeps its natural route and round count.
   `checked_shapes(fn, *args)` is `jax.eval_shape` of the first phase.
 
 ### Resident operands: `batch_layout` and `local_batch`
@@ -611,7 +652,7 @@ The native libraries allocate workspace outside XLA's memory planner, so a
 caller sizing a stage asks the service first. All three queries allocate
 nothing and accept `float64` or `complex128` only.
 
-- `workspace_bytes_per_rank(plan, op, shapes, dtype)`: the device workspace
+- `workspace_bytes_per_rank(plan, op, shapes, dtype, checked=False)`: the device workspace
   per rank of a resolved CUDA `Plan` or `GemmPlan`. For a distributed `eigh`
   it is the cuSOLVERMp workspace rounded to 256 bytes plus one private operand
   tile `(n/P_x)(n/P_y)·itemsize`, which keeps eigh non-donating despite the
@@ -619,8 +660,13 @@ nothing and accept `float64` or `complex128` only.
   returns the cuSolverDn workspace plus a 4-byte info word. A distributed
   `gemm` has none: `panel_matmul`'s panels are XLA's. Query collectively on
   the real mesh; off CUDA it returns 0.
+  `checked=True` also covers the native scratch of a gathered EIGH retry
+  admitted by that plan, for pricing its complete checked executable.
 - `matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend,
   batched_route)`: the same query for a `matmul` route.
+- `local_eigh_workspace(mesh, share, n, dtype)`: native scratch outside the
+  compiled buffers for the rank's actual local share of EIGH matrices in a
+  round. CUDA charges `share` times the cuSOLVERDn size query; CPU returns zero.
 Operand carriers, transpose staging, communication buffers and persistent
 context resources are the caller's to admit.
 
@@ -647,6 +693,8 @@ such as a missing conjugate or an unsymmetrized product, and never round-off.
 | `resolve_matmul_backend(requested, mesh, *, batched_route)` | the GEMM route a request names (`panel_matmul` or `off`) |
 | `mesh_key(mesh)`, `mesh_platform(mesh)`, `mesh_is_cpu(mesh)` | a hashable mesh identity (axes, extents, platform, device ids) and its predicates; key any cache whose value does not retain the mesh on `mesh_key`, because two same-shaped meshes over different devices lower to different handlers |
 | `dial_key()`, `probe_target`, `has_target`, `backend_module` | the factory cache key and the capability probes (absent vs broken) |
+| `room_class(cache, key, room, build)` | cache a program choice while its recorded room tests give the same outcomes; cached values must retain geometry/programs only |
+| `room_test(test, room)` | evaluate a price-versus-room predicate and record it for enclosing `room_class` builds; use this when a caller supplies its own compiled chooser |
 
 ## Rules for callers
 

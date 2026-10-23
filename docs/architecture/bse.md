@@ -171,8 +171,12 @@ channels) before the embedding and adds it back at every fine q, from the
 dressed channels GW stored in `W0_lr`
 ([SR/LR densification](../theory/w-srlr-densification.md)). Both
 additions go into the fine W's donated buffer: the long-range model in q
-blocks of the fixed tile, the head as one fused pass, so the densification
-holds one fine W per rank. The
+blocks of the fixed tile, the head as one fused pass. The shared W densifier
+scans independent centroid-face tiles: a local inverse FFT, the same exact
+pair-dependent WS embedding, then the fine FFT. It writes each completed
+tile directly into the final fine W, keeping coarse input and fine output
+resident with bounded FFT/WS scratch. The final five-dimensional accumulator
+also avoids a whole-fine-W layout copy at the scan boundary. The
 q = 0 exchange tile is k-grid invariant and is carried through unchanged,
 unless `head_minibz_average = true`: then it is rebuilt through
 `bse.vq_interp` with the fine grid's mini-BZ head
@@ -205,6 +209,11 @@ serves and printed once (`[bse] W term:`, `[bse] W term decode:`):
    store: neither T nor U reaches HBM (two warp groups in ping-pong).
 2. T is formed on the load; U is stored and decoded by XLA.
 3. XLA builds T; the k-leading convolution reads it and writes U.
+
+The CPU plan backend and a plain XLA fallback use route 3. Their outer/decode
+factories compose materialized T and U arrays, so they cannot use route 1's
+whole-tile memory plan. Native CPU FFTs reduce convolution scratch while the
+same block plan bounds the stored T/U carrier.
 
 The kernels, their refusals and the `LORRAX_BSE_OUTER_KSUM` A/B switch are in
 [the FFI layer](ffi_layout.md#kernel-operations). The decode keeps the

@@ -117,8 +117,18 @@ def _apply(mesh, ops, *, pair=None):
 
 def _route_patches(route):
     """Module attributes that force ``route`` on any backend (the refusals the router reads)."""
+    from common.fft_helpers import make_local_kconv_klead_outer
+
+    # Exercise every algebraic composition on CPU too.  Production CPU routing
+    # refuses the native-fused memory plan, so inject this composition directly
+    # when testing the fused/outer block identities.
+    def outer(mesh, kgrid):
+        conv = make_local_kconv_klead_outer(mesh, kgrid, norm="ortho")
+        return lambda rank: conv
+
     forced = lambda *a, **k: "forced by tests/test_bse_w_blocks.py"
-    return {"fused": {}, "outer": {"klead_outer_decode_refusal": forced},
+    return {"fused": {"_make_outer_router": outer},
+            "outer": {"_make_outer_router": outer, "klead_outer_decode_refusal": forced},
             "xla": {"klead_outer_refusal": forced}}[route]
 
 
@@ -229,7 +239,9 @@ def run_cases(mesh, *, xla_reference=False):
             if keep:
                 memory.set_budget(keep["budget"], limit_bytes=keep["limit"], per_node=keep["per_node"],
                                   platform=keep["platform"], linalg=keep["linalg"])
-    warned = any("memory over budget at bse.w_term" in str(w.message) for w in seen)
+    warned = any(any(marker in str(w.message) for marker in
+                     ("memory over budget at bse.w_term", "memory: bse.w_term priced over the limit"))
+                 for w in seen)
     return out, red, warned
 
 
@@ -331,7 +343,7 @@ def main() -> int:
             print(f"{'ok  ' if v <= TOL else 'FAIL'} {k:44s} rel {v:.3e}", flush=True)
         for k, v in red.items():
             print(f"{'ok  ' if v > 1e-6 else 'FAIL'} red twin {k:35s} rel {v:.3e} (must exceed 1e-6)", flush=True)
-        print(f"{'ok  ' if warned else 'FAIL'} over-budget price warned (memory over budget at bse.w_term)", flush=True)
+        print(f"{'ok  ' if warned else 'FAIL'} over-budget memory price warned", flush=True)
         print(f"{'ok  ' if mem_ok else 'FAIL'} W term temps {temp / 1e9:.3f} GB per rank "
               f"(must stay below half of W_R, {w_bytes / 1e9:.2f} GB)", flush=True)
         print(f"{'ok  ' if twin_ok else 'FAIL'} red twin 5-D block slice: temps {twin / 1e9:.3f} GB per rank "

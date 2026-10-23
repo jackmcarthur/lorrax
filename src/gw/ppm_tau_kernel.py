@@ -23,7 +23,7 @@ same ``sigma_kij`` through ``gw.mpa.sigma.SynthesisTau``.
 
 from __future__ import annotations
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import Callable, NamedTuple
 
 import dataclasses
@@ -262,7 +262,30 @@ def bracket_selectors(selector, selectors):
     return masks, ranges, live
 
 
-def sigma_subtile_operands(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, *, mesh_xy):
+@lru_cache(maxsize=None)
+def _sigma_subtile_operand_program(mesh_xy, sum_layout):
+    """Placement only; the cache holds programs and geometry, never ψ values."""
+    from .greens_function_kernel import green_right_operand
+    from .subtile_stream import band_complete, green_rows, projection_complete
+    if sum_layout not in ("axis", "face"):
+        raise ValueError(f"Sigma sum-band layout must be face or axis, got {sum_layout!r}")
+
+    @jax.jit
+    def place(xn, yr, xr, yn):
+        if sum_layout == "axis":
+            xn, yr = band_complete(xn, yr, mesh_xy)
+            xn = green_rows(xn, mesh_xy)
+        else:
+            xn = jax.lax.with_sharding_constraint(
+                xn, NamedSharding(mesh_xy, P(None, None, "x", "y")))
+            yr = jax.lax.with_sharding_constraint(
+                yr, NamedSharding(mesh_xy, P(None, "x", None, "y")))
+        return xn, green_right_operand(yr), *projection_complete(xr, yn, mesh_xy)
+    return place
+
+
+def sigma_subtile_operands(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, *, mesh_xy,
+                           sum_layout="axis"):
     """The Σ τ operands as the sub-tile kernel reads them, placed once per Σ call.
 
     The Green faces become band-complete rows, the left ones μ-major
@@ -273,19 +296,58 @@ def sigma_subtile_operands(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, *, 
     right operand (``greens_function_kernel.green_right_operand``: conj ψ
     merged centroid-major), formed here once per Σ call, not once per τ node.
     """
-    from .greens_function_kernel import green_right_operand
-    from .subtile_stream import band_complete, green_rows, projection_complete
+    return _sigma_subtile_operand_program(mesh_xy, sum_layout)(
+        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn)
 
-    @jax.jit
-    def place(xn, yr, xr, yn):
-        rows, cols = band_complete(xn, yr, mesh_xy)
-        return (green_rows(rows, mesh_xy), green_right_operand(cols),
-                *projection_complete(xr, yn, mesh_xy))
-    return place(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn)
+
+def prepare_sigma_subtile(operands, mesh_xy, build, *, _force_layout=None):
+    """Choose and admit Σ's sum-band layout before allocating its axis banks.
+
+    ``operands`` are the four canonical parent faces. ``build(layout, abstract)``
+    returns the consumer context, its compiled window/node programs, and native
+    scratch bytes. Only the chosen placement executes. The fast axis route
+    must fit both placement and the complete consumer with its retained banks;
+    otherwise shared panel GEMMs read the 2D sum-band faces. The small QP
+    projection keeps its existing axis carrier in either route.
+    """
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+
+    layouts = ("axis", "face") if _force_layout is None else (_force_layout,)
+    candidates = []
+    for layout in layouts:
+        placement = _sigma_subtile_operand_program(mesh_xy, layout).lower(*operands).compile()
+        place_new = -agreed_chunk(-compiled_new_bytes(placement))
+        room = agreed_chunk(int(memory.room()))
+        # No full axis window is compiled when even placement cannot fit.
+        if layout == "axis" and place_new > room and _force_layout is None:
+            continue
+        abstract = jax.tree.map(
+            lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=a.sharding),
+            placement.out_info)
+        context, programs, native = build(layout, abstract)
+        consumer_new = max(compiled_new_bytes(p, extra=native) for p in programs)
+        stats = placement.memory_analysis()
+        retained = max(0, int(stats.output_size_in_bytes) - int(stats.alias_size_in_bytes))
+        needed = -agreed_chunk(-max(place_new, retained + consumer_new))
+        price = memory.priced(0, f"Sigma {layout} sum-band placement + compiled window",
+                              spread=needed * mesh_xy.size, ranks=mesh_xy.size)
+        candidates.append((layout, price, placement, context))
+        if needed <= agreed_chunk(int(memory.room())):
+            break
+    chosen = memory.admit("Sigma sum-band operands", [(c[0], c[1]) for c in candidates],
+                          agreed_chunk(int(memory.room())))
+    layout, _, placement, context = next(c for c in candidates if c[0] == chosen)
+    log.info(f"Sigma summed bands: {layout} layout")
+    prepared = placement(*operands)
+    # Keep placement's scratch and the consumer's scratch from overlapping.
+    jax.block_until_ready(prepared)
+    return layout, prepared, context
 
 
 def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_extent,
-                          energy_windows, k_unfold_plan, q_wedge, static=False):
+                          energy_windows, k_unfold_plan, q_wedge, static=False,
+                          sum_layout="axis"):
     """Σ_k(τ) for W(τ) on the q wedge, row pass by row pass (``gw.subtile_stream``).
 
         Σ_mn(k) = Σ_{μ ∈ passes} Σ_ν ψ*_m(μ) [G ⋆ W](k)_{μν} ψ_n(ν)
@@ -361,7 +423,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     tables = g_tables if whole else window_tables(g_tables, R, px, ns)
     # Not warmed: the plan runs inside the window executable.
     gemm = gemm_plan(mesh_xy, m=px * R * ns, k=nb, n=n_rmu * ns, nq=n_parent,
-                     dtype=jnp.complex128, layout="axis", enable_active_range=True,
+                     dtype=jnp.complex128, layout=sum_layout, enable_active_range=True,
                      warmup=False)
     conv = make_kconv_klead_unfold(mesh_xy, kgrid, tables,
                                    store_rows=k_unfold_plan.parent_full_rows,
@@ -372,7 +434,8 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     finish = project.finish
     # ψ rows and columns, the projection faces, and the Green's right operand (one copy of the
     # columns, formed once per node).
-    psi_bytes = 16 * n_parent * ns * ((nb + nb_sig) * (local_rows + nu) + nb * nu)
+    sum_bytes = nb * (local_rows + 2 * nu) if sum_layout == "axis" else 2 * nb * n_rmu / (px * py)
+    psi_bytes = 16 * n_parent * ns * (sum_bytes + nb_sig * (local_rows + nu))
     scratch = sigma_kconv_scratch(kgrid=kgrid, ns=ns, rows=R, n_right=nu, mesh=mesh_xy)
     price = dict(d=ns, ns=ns, passes=len(windows), tile=float(TILE_BYTES), scratch=int(scratch),
                  new=float(R * row_bytes + psi_bytes + scratch))
@@ -402,7 +465,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
         τ node, row pass and bracket reads it,
         and the partner is ``conj(A·diag(w*)·B)`` from the same two operands.
         """
-        options = dict(e_ref=ref, layout="axis", gemm=gemm, k_unfold_plan=k_unfold_plan,
+        options = dict(e_ref=ref, layout=sum_layout, gemm=gemm, k_unfold_plan=k_unfold_plan,
                        band_range=band_range, trim_zero_bands=True, unfold=False,
                        real_weights=bool(static), right=g_right)
         options["mask" if sel.dtype == jnp.bool_ else "band_weight"] = sel
@@ -418,8 +481,10 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
                              "load tables (load, g_load = sigma_kconv_tables)")
         # The left Green rows arrive μ-major and the right ones as the Green's right
         # operand (sigma_subtile_operands, once per Σ call).
-        rows_all = jax.lax.with_sharding_constraint(psi_coh_xn, NamedSharding(mesh_xy, GREEN_ROWS_SPEC))
-        g_right = jax.lax.with_sharding_constraint(psi_coh_yr, NamedSharding(mesh_xy, P(None, None, "y")))
+        rows_spec = GREEN_ROWS_SPEC if sum_layout == "axis" else P(None, None, "x", "y")
+        right_spec = P(None, None, "y") if sum_layout == "axis" else P(None, "x", "y")
+        rows_all = jax.lax.with_sharding_constraint(psi_coh_xn, NamedSharding(mesh_xy, rows_spec))
+        g_right = jax.lax.with_sharding_constraint(psi_coh_yr, NamedSharding(mesh_xy, right_spec))
         left_all, right_all = projection_complete(psi_proj_xr, psi_proj_yn, mesh_xy)
         bracket_masks, bracket_ranges, live = bracket_selectors(mask_A, selectors)
         zero = jax.lax.with_sharding_constraint(
@@ -451,15 +516,20 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
             return tuple(out)
 
         accs = (zero,) * len(selectors)
+        def green_window(s=None):
+            if sum_layout == "axis":
+                return window_green_rows(rows, mesh_xy, s, None if s is None else R)
+            return rows if s is None else window_rows(rows, mesh_xy, s, R, axis=2, spec=rows_spec)
+
         if whole:
-            accs = one_pass(accs, W, Wt, window_green_rows(rows, mesh_xy), left, load, g_load)
+            accs = one_pass(accs, W, Wt, green_window(), left, load, g_load)
         else:
             def step(s, lo, hi, accs):
                 # The pass's window: W's and the ψ rows, the projection rows
                 # zeroed outside the live rows, and both tables cut there.
                 Wp, Wtp = (None if a is None else window_rows(a, mesh_xy, s, R, axis=1, spec=w_spec)
                            for a in (W, Wt))
-                return one_pass(accs, Wp, Wtp, window_green_rows(rows, mesh_xy, s, R),
+                return one_pass(accs, Wp, Wtp, green_window(s),
                                 window_rows(left, mesh_xy, s, R, axis=3, live=(lo, hi)),
                                 window_load(load, mesh_xy, s, lo, hi, R),
                                 window_load(g_load, mesh_xy, s, lo, hi, R, ns),
@@ -491,6 +561,7 @@ def _get_sigma_kij_kernel(
     k_unfold_plan=None,
     q_wedge=None,
     static: bool = False,
+    sum_layout: str = "axis",
 ) -> Callable[..., jax.Array]:
     """Build Green functions with band-range masks and contract each bracket against one prepared W.
 
@@ -512,14 +583,14 @@ def _get_sigma_kij_kernel(
     key = (id(mesh_xy), tuple(map(int, kgrid)),
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
            face_band_extent, bool(energy_windows),
-           k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key(), bool(static))
+           k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key(), bool(static), sum_layout)
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     if q_wedge is not None:
         kernel, price = _sigma_subtile_kernel(
             mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets, face_shape=face_shape,
             face_band_extent=face_band_extent, energy_windows=energy_windows,
-            k_unfold_plan=k_unfold_plan, q_wedge=q_wedge, static=static)
+            k_unfold_plan=k_unfold_plan, q_wedge=q_wedge, static=static, sum_layout=sum_layout)
         _sigma_kij_kernel_cache[key] = kernel
         _SIGMA_PASS_PRICE[id(kernel)] = price
         return kernel
@@ -695,6 +766,7 @@ def get_shared_sigma_tau_kernel(
     layout: str = "face", face_shape=None, face_band_extent=None,
     k_unfold_plan=None, _sigma_kij=None,
     q_wedge=None,
+    sum_layout: str = "axis",
 ) -> Callable[..., jax.Array]:
     """Build selected multipole W(tau) tiles for the shared complex Sigma contraction.
 
@@ -711,7 +783,7 @@ def get_shared_sigma_tau_kernel(
 
     key = (id(mesh_xy), kgrid, ffi_dial_key(),
            brackets, layout, face_shape, face_band_extent,
-           k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key())
+           k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key(), sum_layout)
     if _sigma_kij is None and key in _sigma_shared_tau_kernel_cache:
         return _sigma_shared_tau_kernel_cache[key]
 
@@ -722,7 +794,7 @@ def get_shared_sigma_tau_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
         brackets=brackets, layout=layout, face_shape=face_shape,
         face_band_extent=face_band_extent,
-        k_unfold_plan=k_unfold_plan, q_wedge=q_wedge)
+        k_unfold_plan=k_unfold_plan, q_wedge=q_wedge, sum_layout=sum_layout)
     # On the q wedge W(τ) is read by the pair-transpose rule: an antiunitary
     # row takes the tile built from the conjugated residues (the fitted
     # fields are Hermitian; the time factor is not conjugated).
@@ -761,4 +833,5 @@ def get_shared_sigma_tau_kernel(
     # Never publish a kernel built around a caller's spatial kernel.
     if _sigma_kij is None:
         _sigma_shared_tau_kernel_cache[key] = _tau
+    _SIGMA_PASS_PRICE[id(_tau)] = sigma_pass_price(sigma_kij)
     return _tau

@@ -6725,6 +6725,8 @@ def run_sc_driver(
     if screening.tangential is not None:
         from .tangential_screening import release_resident_model
         release_resident_model()
+    from .tangential_screening import release_coulomb_cache
+    release_coulomb_cache()
     screening = dataclasses.replace(
         screening, static_w=None, tangential=None, qsgw_velocity=None)
     state_final = dataclasses.replace(

@@ -217,6 +217,18 @@ for the full-zone g0, the IBZ one-leg unfold sources, and the head channel's
 slots (`vcoul.head_slot_table(...).sel`). `ZetaG.head_columns(sel)` reads them
 from the shell.
 
+Scalar initialization explicitly consumes the fit factor after its last V
+contraction: `gw_init._compute_scalar_vq` passes `consume_fit_factor=True`
+through the existing V wrapper. `compute_all_V_q_g_flat` calls
+`ZetaG.release_fit_factor` after the G-tile pass and before the full-q
+unfold. This releases the owner's factor/pivot references while retaining
+the Z store and kept shell; head construction still reads those columns,
+and the existing final `close()` releases the remaining resources. Generic
+`contract_v`, `contract_v_group` and `write_file` calls keep their reusable
+default lifecycle. Retirement drops references rather than deleting arrays
+that another owner might hold, and the fit factor no longer contributes to
+the scalar full-q unfold's live set.
+
 ## ζ consumers
 
 The fit returns a `ZetaG` (`zeta_layout = 'G_flat'`) in place of a ζ loader.
@@ -235,7 +247,11 @@ cross-channel `contract_v` (V^{μν} from two ζ streams); it is not built.
 Each fit family reads ψ(G) once: `common.psi_G_store.load_parent_psi_G`
 samples the family's centroid faces and keeps the G-slot store on the device
 for the loop (charge in `gw_init._prepare_fresh_parent_faces`, currents in
-`gw_init._fit_transverse_zeta_channels`).
+`gw_init._fit_transverse_zeta_channels`). The faces cover the complete loaded
+band window for screening and Σ. The retained G-slot store covers only the
+existing left/right fit union, through `store_band_range`; its band carrier
+is padded independently and its unused slots are zero. The default loader
+call without that keyword still retains its complete read window.
 G-slot carrier padding uses `runtime.padding`'s reusable program, so it does
 not rebuild a JAX function for every band chunk.
 
@@ -301,7 +317,14 @@ The planner decides in this order:
    ([memory model](memory-model.md#the-compiled-check)).
 
 The fit then packs whole orbits into bins of at most the planned b/P with
-the least padded work, n_batch·(c+1) (`best_owner_orbit_batches`). The
+the least padded work, n_batch·(c+1) (`best_owner_orbit_batches`). The search
+computes orbit membership and its stable largest-first order once, scores
+all candidate widths from the shared LPT partition metadata, and constructs
+centroid slots and endpoint/wrap tables only for the winner. It keeps the
+same descending-width order and first-candidate tie rule, so the selected
+batch and every transport-table byte agree with exhaustive materialization.
+The metadata search holds only linear-size orbit, owner and load arrays;
+it retains no table bank across candidates or fits. The
 planner's floor keeps every bin within the plan (CrI3 24×24 P36: 12-member
 orbits make the batch 432, which the plan prices, not 36).
 `route_g_plane_chunk` prices the packed batch: the source rows (X_B, pair
@@ -313,7 +336,10 @@ split (one row, one plane group per block) when that is larger: the source
 stage does not depend on the split, so a split under the bytes it already
 holds costs nothing. The compiled
 check reads that price at the planned chunk, with the widest orbit as its
-minimum chunk. Still over the room, it steps the plane blocks to the count
+minimum chunk. Its room is the agreed allocator room after compilation,
+without GiB bucketing. Thus the arguments and any charge faces still held
+during a current fit spend the budget once; the executable price adds only
+new bytes and one lookahead output. Still over the room, it steps the plane blocks to the count
 the compiled figure implies (bytes a + b/n_blk through the last two figures),
 rounded up to the next count with fewer plane groups per block, while that
 lowers the compiled figure (every rank on the largest one), up to one plane

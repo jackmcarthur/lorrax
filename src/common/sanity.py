@@ -194,7 +194,7 @@ def _is_jax(a: Any) -> bool:
 _FINITE_STATS_CACHE: dict = {}
 
 
-def _finite_stats_fn(shape, dtype, sharding):
+def finite_stats_program(shape, dtype, sharding):
     """The jitted ``(n_bad, n_nan, max_abs)`` reduction — ONE module.
 
     Cached at module level for exactly the reason :func:`_herm_stats`
@@ -262,7 +262,7 @@ def _finite_stats(a: Any) -> tuple[int, int, float, int]:
         import jax
 
         arr = a
-        stats = _finite_stats_fn(
+        stats = finite_stats_program(
             arr.shape, arr.dtype, getattr(arr, "sharding", None))(arr)
         n_bad, n_nan, max_abs = (float(v) for v in np.asarray(jax.device_get(stats)))
         return int(n_bad), int(n_nan), float(max_abs), int(arr.size)
@@ -305,7 +305,21 @@ def check_finite(
     """
     if not sanity_enabled():
         return True
-    n_bad, n_nan, max_abs, size = _finite_stats(array)
+    return report_finite_stats(name, _finite_stats(array), print_fn=print_fn,
+                               expect_max_abs=expect_max_abs, verbose=verbose)
+
+
+def report_finite_stats(name, stats, *, print_fn=print, expect_max_abs=None,
+                        verbose=False):
+    """Apply the finite gate to exact ``(n_bad, n_nan, max_abs, size)`` totals.
+
+    A bounded producer sums the counts and takes the maximum across disjoint
+    panels using :func:`finite_stats_program`; this is the same verdict and
+    message as :func:`check_finite` on the complete array.
+    """
+    if not sanity_enabled():
+        return True
+    n_bad, n_nan, max_abs, size = stats
     if size == 0:
         return True
     if verbose:

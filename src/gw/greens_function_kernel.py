@@ -124,7 +124,7 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
     GEMM's own merged endpoint order split by a reshape.  ``pair`` (face
     route only): also the conjugate-face partner ``conj(A)·diag(w)·conj(B)``
     from the SAME panel exchange (each gathered panel conjugated before its
-    own local GEMM; no conjugated tile).  ``right`` (local GEMMs): the right
+    own local GEMM; no conjugated tile).  ``right``: the right
     operand already formed (:func:`green_right_operand`); ``psi_nmu`` is then
     not read.
     """
@@ -235,14 +235,24 @@ def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gem
                     prepared_active_gemm=None, right=None) -> ParentGreen:
     """The parent Green and its antiunitary partner, before the typed unfold (see :class:`ParentGreen`).
 
-    ``right`` (a local GEMM): the right operand formed once by the caller
+    ``right``: the right operand formed once by the caller
     (:func:`green_right_operand`).  The partner ``conj(A)·diag(w)·conj(B)``
     is then ``conj(A·diag(conj w)·B)``, the same two operands at conjugate
     weights, so no conjugated face is formed.
     """
     if right is not None:
-        if getattr(gemm, "backend", "local") != "local" or Gij is not None or phases is None:
-            raise ValueError("build_G_parents(right=...) takes a local GEMM and band phases")
+        if gemm is None or Gij is not None or phases is None:
+            raise ValueError("build_G_parents(right=...) takes a GEMM plan and band phases")
+
+        if (getattr(gemm, "backend", "local") != "local"
+                and prepared_active_gemm is None
+                and has_antiunitary_rows(k_unfold_plan) and real_weights is False
+                and jnp.issubdtype(phases.dtype, jnp.complexfloating)):
+            G, partner = _build_G_face(
+                psi_xn, None, gemm=gemm, phases=phases, mesh=k_unfold_plan.mesh_xy,
+                band_range=band_range, prepared_active_gemm=prepared_active_gemm,
+                n_full=k_unfold_plan.n_full, right=right, pair=True)
+            return ParentGreen(G, partner)
 
         def build(w):
             return _build_G_face(psi_xn, None, gemm=gemm, phases=w, mesh=k_unfold_plan.mesh_xy,
@@ -459,7 +469,7 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
     builds an antiunitary partner as the conjugate-face GEMM with no device
     predicate, so a node loop does not stop on a host-read conditional; at a
     node whose phases are real that GEMM equals ``conj(G)``.
-    ``right`` (``unfold=False``, a local GEMM): the right operand formed once
+    ``right`` (``unfold=False``): the right operand formed once
     from ``psi_yr`` (:func:`green_right_operand`); ``psi_yr`` is then not read.
     """
     if real_weights is None:

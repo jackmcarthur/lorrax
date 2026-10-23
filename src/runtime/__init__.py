@@ -812,6 +812,8 @@ def set_default_env(*, platform: str = "gpu") -> None:
     tune_glibc_malloc()
     skip_gpu_plugin_discovery()
     resolved_platforms = os.environ.get("JAX_PLATFORMS", "")
+    from .blas_env import tune_cpu_malloc_arenas
+    _MALLOC_TUNE["cpu_arenas"] = tune_cpu_malloc_arenas(resolved_platforms)
     xla_platform = (
         "cpu" if platform == "cpu" or resolved_platforms == "cpu" else "gpu")
     disable_xla_rematerialization()
@@ -3626,6 +3628,10 @@ def format_startup_report(f: dict) -> list:
         add("  glibc malloc tuning was never attempted in this process, "
             "which means set_default_env() did not run and this report is "
             "describing an environment LORRAX did not configure.")
+    arenas = mt.get("cpu_arenas", {})
+    if arenas.get("applied"):
+        add(f"  CPU glibc arenas are limited to {arenas['maximum']} before "
+            "worker startup to bound retained preprocessing scratch.")
     bt = f.get("blas_tune", {})
     if bt.get("applied") is False:
         add(f"  WARNING: OpenBLAS spin tuning is NOT in force ({bt.get('reason')}).")

@@ -32,7 +32,6 @@ from .gw_config import (ZETA_RCOND_DEFAULT,
 
 from isdf.core import (
     c_q_from_psi_sm,
-    complete_ordered_pair_normal_equations,
     factor_c_q,
     _resolve_solver_kind,
     zeta_factor_resident,
@@ -269,10 +268,19 @@ def _fit_mubatch(
     # c_plan = c_min no chunk is re-solved and the slope is unused.
     slope = (at(c_plan) - at(c_min)) / (c_plan - c_min) if c_plan > c_min else 0.0
     with timing.section("zeta_fit.mubatch.memcheck"):
+        planned = build(c_plan)
+        from common.gpu_utils import device_budget_bytes
+        from lxkit import memory
+        device_budget_bytes()
+        # Every existing argument and ambient family (notably the charge
+        # faces during a current fit) is already in the allocator's floor.
+        # compiled_new_bytes adds only new work and the lookahead output;
+        # do not subtract the analytic resident floor or arguments again.
+        room = int(memory.room(bucketed=False))
         check = check_chunk(
             c_plan, build=build, stage="zeta route-G mu batch", minimum=c_min,
             fixed=at(c_plan) - c_plan * slope - ws0, per_unit=slope,
-            room=plan.target_bytes - ws0,
+            room=room, compiled=planned,
             extra=lambda c, compiled: int(compiled.memory_analysis().output_size_in_bytes))
     # check_chunk compares the largest figure any rank read, so every rank
     # built and returns the same chunk.
@@ -287,13 +295,12 @@ def _fit_mubatch(
         n_blk, n_grp, compiled=batch_executable,
         # the fewest blocks ≥ v holding fewer plane groups each (the kernel's ceil(n_grp / n_blk))
         snap=lambda v: v if v < 2 else -(-n_grp // (-(-n_grp // (v - 1)) - 1)),
-        build=lambda n: build(agreed, n_blk=n), room=plan.target_bytes - ws0,
+        build=lambda n: build(agreed, n_blk=n), room=room,
         figure=lambda ex: compiled_new_bytes(
             ex, extra=int(ex.memory_analysis().output_size_in_bytes)),
         stage="zeta route-G mu batch, plane blocks")
     # The stage's price: the batch executable's compiled figure beside the resident set (the
     # analytic working set only chose the chunk).
-    from lxkit import memory
     memory.book(memory.priced(compiled_new_bytes(batch_executable, extra=int(
         batch_executable.memory_analysis().output_size_in_bytes)),
         "route-G mu batch executable (memory_analysis + FFT plans + outputs)", increment=True))
@@ -646,7 +653,7 @@ def fit_zeta_to_h5(
     _write_file = bool(write_zeta_file)
 
     # ========== per channel: C_q, its factor, its file ==========
-    from distrib_la import gemm_plan as _gemm_plan
+    from distrib_la import gemm_plan as _gemm_plan, ensure_sharding
     _mu_gemm = int(k_unfold_plan.n_centroid_packed)
     # C's enclosing JIT compiles this GEMM; standalone dummy warmup would
     # compile and execute it again without reusing that executable.
@@ -667,32 +674,26 @@ def fit_zeta_to_h5(
                      f"{'' if v == 0 else f', {_bname} basis: ' + ' + '.join(f'({w:.3g})U{i}{j}' for w, i, j in terms)}): "
                      f"{k_unfold_plan.n_parent} -> {nk_tot} k rows")
             C_q = None
-            # Complex channel weights (circular currents): each Cartesian vertex
-            # pair's RL block is conj(LR) at -q, so complete every pair Gram
-            # before weighting it, exactly as isdf.zeta_mubatch completes each
-            # Z pair before the same weights.  Completing the weighted sum
-            # would conjugate the weights on the RL half (channel c's LR plus
-            # the conjugate channel's RL).
-            _per_pair_completion = (_q_neg_idx is not None and any(
-                complex(w).imag != 0.0 for w, _, _ in terms))
+            # Complete every Cartesian pair's bounded column tile before
+            # weighting it, as route G completes the corresponding Z pair.
+            # This is linear-equivalent for real weights and essential for
+            # complex circular weights. Only the stored q rows are assembled.
             for w, i, j in terms:
                 part = c_q_from_psi_sm(
                     kgrid=kgrid, mesh_xy=mesh_xy,
                     psi_mun_parent=psi_mun_parent, psi_nmu_parent=psi_nmu_parent,
                     weight_l=weight_l_face, weight_r=weight_r_face,
                     gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
-                    gamma_L=i, gamma_R=j)
-                if _per_pair_completion:
-                    part = complete_ordered_pair_normal_equations(
-                        jax.lax.with_sharding_constraint(
-                            part.reshape(nq, n_rmu_padded, n_rmu_padded), flat_shard),
-                        _q_neg_idx)
+                    gamma_L=i, gamma_R=j, q_rows=q_irr_full_idx,
+                    q_neg_idx=_q_neg_idx)
                 if len(terms) > 1 or w != 1.0:
                     part = w * part
                 C_q = part if C_q is None else C_q + part
                 del part
-            C_q_flat = jax.lax.with_sharding_constraint(
-                C_q.reshape(nq, n_rmu_padded, n_rmu_padded), flat_shard)
+            # The producer already returns this face. An eager constraint
+            # would copy the complete stored-q stack despite matching layout.
+            C_q_flat = ensure_sharding(
+                C_q.reshape(n_q_disk, n_rmu_padded, n_rmu_padded), flat_shard)
             del C_q
             if n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu:
                 # Interleaved pad slots (orbit-packed order): C_q's pad rows and
@@ -704,14 +705,9 @@ def fit_zeta_to_h5(
                 # Rank-local by construction (Fe3GeTe2 P36/P16 OOM, 2026-09-21).
                 C_q_flat = add_pad_diagonal_sharded(
                     C_q_flat, mu_basis.active_mask, float(n_rmu), mesh_xy=mesh_xy)
-            if _q_neg_idx is not None and not _per_pair_completion:
-                C_q_flat = complete_ordered_pair_normal_equations(
-                    C_q_flat, _q_neg_idx)
-            # IBZ cascade: slice C_q to the stored rows before the per-q factor.
-            if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
-                from symmetry_maps import slice_q_full_to_ibz
-                C_q_flat = slice_q_full_to_ibz(
-                    C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
+            # Completion and q selection already occurred on each bounded
+            # column tile. The mean pad diagonal commutes with that linear
+            # completion; factor/conditioning checks see the same stored rows.
             timing.stage_wait(C_q_flat)
 
         with timing.section("zeta_fit.cholesky"):

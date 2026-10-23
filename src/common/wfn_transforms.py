@@ -2251,8 +2251,10 @@ def _centroid_face_kernels(
         if int(psi_rmu_all.shape[1]) > nb_total:
             psi_rmu_all = psi_rmu_all[:, :nb_total, :, :]
             psi_rmuT_all = psi_rmuT_all[:, :, :nb_total, :]
-        psi_rmu_all = jax.lax.with_sharding_constraint(psi_rmu_all, out_Y)
-        psi_rmuT_all = jax.lax.with_sharding_constraint(psi_rmuT_all, out_X)
+        # A matching concrete face needs no copy; slices still reshard when needed.
+        from distrib_la import ensure_sharding
+        psi_rmu_all = ensure_sharding(psi_rmu_all, out_Y)
+        psi_rmuT_all = ensure_sharding(psi_rmuT_all, out_X)
 
         # Zero user-band-pad rows (unchanged contract).
         nb_user_in_range = max(0, meta.b_id_4_user - b_start)
