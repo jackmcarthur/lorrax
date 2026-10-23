@@ -10,7 +10,7 @@ The things most different from BerkeleyGW are:
 
 1. **Only a single wavefunction file is needed**, with no `WFNq.h5`. The $q	o0$ limit comes from the velocity matrix elements of [`dipole`](../utilities/dipole.md).
 2. **The wavefunction file must be in the HDF5 format**, `WFN.h5`, written by `wfn2hdf.x` ([§3](#pw2bgw)).
-3. **Quantum ESPRESSO automatic k-grids should be used**, not `kgrid.x` ([k-points](#kgrid)).
+3. **Quantum ESPRESSO automatic k-grids should be used** (`K_POINTS automatic` in the NSCF input), rather than BerkeleyGW's `kgrid.x` ([k-points](#kgrid)).
 4. **All symmetries, including time reversal and inversion, should be used.** Do not set `nosym`, `noinv` or `no_t_rev`; LORRAX unfolds the reduced k-grid with the same operations QE used ([Magnets](#magnets)).
 5. **UPF pseudopotentials must be used**, linked in the LORRAX run directory, because LORRAX builds the one-body parts of the Hamiltonian itself ([§4](#pseudopotentials)).
 6. **Magnetic materials only:** the Quantum ESPRESSO `data-file-schema.xml` must be linked in the run directory, for the magnetic symmetries ([Symmetry record](#schema)). Spin–orbit runs with fully relativistic pseudopotentials also need it ([§5](#spinors)).
