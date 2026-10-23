@@ -2329,7 +2329,7 @@ def main(argv=None):
                 # loader's exact diagonal ``data["q0_head_ry"]``, not on W_q.
                 from .bse_densify import _add_rank_lr, _srlr_terms, densify_w
                 w_head_mode = resolve_w_head_densify(args.w_head_densify, params)
-                W_q_fine_in, data["W_q"] = data["W_q"], None
+                W_q, data["W_q"] = data["W_q"], None
                 r_mu, _geom = _w_tile_gauge(
                     wfn, centroids_path, keep_idx, n_rmu, restart_file, log)
                 if keep_idx is not None:
@@ -2339,21 +2339,19 @@ def main(argv=None):
                 A_c, D_c, A_f, D_f = _srlr_terms(
                     restart_file, wfn, sym, meta, params, coarse_grid=cg,
                     fine_grid=(nkx, nky, nkz), n_rmu=n_rmu,
-                    n_rmu_pad=int(W_q_fine_in.shape[0]), mesh_xy=mesh_xy,
+                    n_rmu_pad=int(W_q.shape[0]), mesh_xy=mesh_xy,
                     input_file=args.input, centroid_frac=r_mu,
                     lr_grid=(nkx, nky, nkz), log_fn=log)
-                W_q_coarse = _add_rank_lr(decimate_W_q_to_subgrid(W_q_fine_in, cg),
-                                          A_c, D_c, mesh_xy, -1.0)
-                del W_q_fine_in
-                densify_W = make_w_densifier(
-                    mesh_xy, sh.W.spec, (nkx, nky, nkz), output="k",
-                    embedding=w_pair_embedding(
-                        cg, wfn, r_mu, int(W_q_coarse.shape[0]), meta.sys_dim))
-                W_dense = densify_w(W_q_coarse, mesh_xy=mesh_xy, densifier=densify_W)
-                # Dispatch owns the pending read; the Q sweep needs only W_R.
-                del W_q_coarse
-                W_R = _ifftn(_add_rank_lr(W_dense, A_f, D_f, mesh_xy, 1.0))
-                del W_dense, A_c, D_c, A_f, D_f
+                W_q = _add_rank_lr(decimate_W_q_to_subgrid(W_q, cg),
+                                   A_c, D_c, mesh_xy, -1.0)
+                W_q = densify_w(
+                    W_q, mesh_xy=mesh_xy, densifier=make_w_densifier(
+                        mesh_xy, sh.W.spec, (nkx, nky, nkz), output="k",
+                        embedding=w_pair_embedding(
+                            cg, wfn, r_mu, int(W_q.shape[0]), meta.sys_dim)))
+                W_R = _ifftn(_add_rank_lr(W_q, A_f, D_f, mesh_xy, 1.0))
+                # Queued reads own their inputs; the Q sweep needs only W_R.
+                del W_q, A_c, D_c, A_f, D_f
                 log(f"[coarse-W] W sampled on {cg[0]}x{cg[1]}x{cg[2]} sub-grid of "
                     f"{nkx}x{nky}x{nkz}, embedded per centroid pair in R (trig-interp to fine "
                     f"grid) [w_head_densify={w_head_mode}]")
