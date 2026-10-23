@@ -1202,6 +1202,28 @@ def _file_rows(result, wfn_path, args):
     return rows
 
 
+def _report_environment(report, args):
+    """Open the wavefunction and report its operator and sampling context."""
+    from .bse_window import _parse_wfn_path
+    from wfn_loader import WfnLoader
+    wfn_path = _parse_wfn_path(args.input)
+    wfn = WfnLoader(wfn_path, mesh=RUNTIME.mesh)
+    sym = wfn.symmetry()
+    report.environment(wfn=wfn, lines=(
+        "Transition data: distributed band and centroid blocks on X x Y",
+        "Eigensolve path: " + policy(
+            args.solver, ("lanczos", "davidson", "trlan")),
+        "Eigenvectors   : " + (
+            "written to a separate numerical artifact"
+            + (" with per-state dipoles <0|r|S>" if args.dipole else "")
+            + (" and their in-plane helicity table" if args.helicity_table
+               else "")
+            if args.write_eigs is not None else "not requested"),
+    ))
+    report.sampling(wfn=wfn, sym=sym)
+    return wfn_path, wfn
+
+
 def main(argv=None) -> int:
     route, args = parse_args(argv)
 
@@ -1270,23 +1292,7 @@ def main(argv=None) -> int:
         report.devices(mesh_role="BSE transition axes c x v")
         report.settings(settings_rows(args, source=deck_source(args.deck_named)))
 
-        from .bse_window import _parse_wfn_path
-        from wfn_loader import WfnLoader
-        wfn_path = _parse_wfn_path(args.input)
-        wfn = WfnLoader(wfn_path, mesh=RUNTIME.mesh)
-        sym = wfn.symmetry()
-        report.environment(wfn=wfn, lines=(
-            "Transition data: distributed band and centroid blocks on X x Y",
-            "Eigensolve path: " + policy(
-                args.solver, ("lanczos", "davidson", "trlan")),
-            "Eigenvectors   : " + (
-                "written to a separate numerical artifact"
-                + (" with per-state dipoles <0|r|S>" if args.dipole else "")
-                + (" and their in-plane helicity table" if args.helicity_table
-                   else "")
-                if args.write_eigs is not None else "not requested"),
-        ))
-        report.sampling(wfn=wfn, sym=sym)
+        wfn_path, wfn = _report_environment(report, args)
 
         result = _preview_lanczos(
             args.input,
