@@ -15,7 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # LORRAX_FFI_BUILD_DIR: alternate build dir (default: in-tree build/).
-# Useful for building against a different SLATE install without racing a
+# Useful for building against a different stage without racing a
 # concurrently-used in-tree .so; point LORRAX_FFI_SO at the result.
 BUILD_DIR="${LORRAX_FFI_BUILD_DIR:-${SCRIPT_DIR}/build}"
 

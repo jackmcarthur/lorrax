@@ -15,7 +15,7 @@ previous behaviour):
   partial build doesn't export.
 
 Originally staged on the `frontera-ffi` branch; long since merged — the
-Frontera FFI stack (CUDA + host SLATE/ScaLAPACK + phdf5) is mainline and
+Frontera FFI stack (CUDA + host ScaLAPACK + phdf5) is mainline and
 production-certified (2026-07 campaign, scorecard AM-AU).
 
 ## Why Frontera is different
@@ -113,7 +113,7 @@ contract and its numbers: [`docs/environment/machines/frontera.md` §3](../../do
   lib, `FI_PROVIDER_PATH`, the `LORRAX_MPI_PROVIDER` dial, UCX
   setdefaults — now unconditional) and `ffi_env.sh` (back-compat shim)
   adds the phdf5 `.so`/library staging under `LORRAX_FFI_PHDF5=1`.
-* **SLATE / ScaLAPACK** — built by `build_ffi_host.sh` into
+* **ScaLAPACK** — built by `build_ffi_host.sh` (`LORRAX_HOST_SCALAPACK=1`) into
   `liblorrax_ffi_host.so`; ScaLAPACK `pzheevd`
   (`ScalapackEighHostFfi`) is the permanent CPU distributed eigh behind
   the `ffi/linalg` facade.
@@ -140,7 +140,7 @@ never `fi_info` (it false-negatives on mlx).
 | `mpi_transport_env.sh` | Intel-MPI transport hygiene, **unconditional**: PMI2 glue, `I_MPI_FABRICS` (default `shm:ofi`; `LORRAX_MPI_FABRICS=shm` = rtx hatch), `LORRAX_MPI_PROVIDER` case-block, UCX setdefaults, `I_MPI_DEBUG` |
 | `ffi_env.sh` | **deprecated back-compat shim**: sources the two above + the `LORRAX_FFI_PHDF5=1` staging block |
 | `stage_ffi_deps.sh` | the venv's pip wheels (cmake, ninja) and the former GPU CUDA root |
-| `build_ffi_host.sh` | CPU host FFI: phdf5 + SLATE/ScaLAPACK `liblorrax_ffi_host.so` |
+| `build_ffi_host.sh` | CPU host FFI: phdf5 + ScaLAPACK `liblorrax_ffi_host.so` |
 | `build_mpiwrapper.sh` + `mpiwrapper/` | the patched MPIwrapper for `impl=mpi` (login node) |
 | `build_mpi_overlay.sh` + `sitecustomize.py` | the mpi4py 4.1.2 / parallel-h5py 3.16.0 PYTHONPATH overlay, pinned + verified (`fetch` on login, `build` in-container) |
 | `stage_host_pmi.sh` | stages the host SLURM PMI2 lib to `$WORK/host_pmi` (provenance + checksum recorded in the script) |

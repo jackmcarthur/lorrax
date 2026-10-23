@@ -1,5 +1,5 @@
 // ctx_registry.h — the per-process map from a CONFIGURATION key to a live
-// native context (cuSolverMp/cuBLASMp, SLATE, ScaLAPACK-on-SlateCtx).
+// native context (cuSolverMp/cuBLASMp, and the MPI mesh context of ScaLAPACK/ELPA).
 //
 // WHY.  An FFI attribute is baked into the HLO, so it must be a pure
 // function of the configuration.  The vendor handlers used to take the
@@ -40,7 +40,7 @@ void unbind(int64_t key);
 void forget_handle(int64_t handle);
 
 // The live handle bound to `key`, provided its configuration belongs to the
-// library `family` ("cusolvermp" or "slate"); 0 otherwise, with the reason
+// library `family` ("cusolvermp" or "mesh"); 0 otherwise, with the reason
 // written to stderr once per key.  Callers keep their existing null check.
 int64_t resolve(int64_t key, const char* family);
 

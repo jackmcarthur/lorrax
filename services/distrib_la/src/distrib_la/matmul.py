@@ -3,7 +3,7 @@
 The explicit ``batched_route='auto'`` route runs the face GEMM,
 :func:`distrib_la.panel_matmul`'s batched SUMMA, on every platform
 for every backend name except ``'off'`` (the retired provider names
-``'cublasmp'``, ``'cusolvermp'``, ``'scalapack'`` and ``'slate'`` included:
+``'cublasmp'``, ``'cusolvermp'`` and ``'scalapack'`` included:
 no native batched GEMM is called).
 
 The default ``batched_route='batch_reshard'`` route moves A, B and C from
@@ -31,7 +31,7 @@ __all__ = ["MATMUL_BACKEND_CHOICES", "matmul", "resolve_matmul_backend",
 
 MATMUL_BACKEND_CHOICES = (
     "auto", "off", "distributed", "cusolvermp", "cublasmp",
-    "scalapack", "slate",
+    "scalapack",
 )
 """Public provider vocabulary accepted by :func:`matmul` and its resolver."""
 
@@ -143,6 +143,9 @@ def resolve_matmul_backend(requested: str, mesh: Mesh, *,
     requested = str(requested).strip().lower()
     route = str(batched_route).strip().lower()
     if requested not in MATMUL_BACKEND_CHOICES:
+        from distrib_la.resolve import REMOVED_BACKENDS
+        if requested in REMOVED_BACKENDS:
+            raise ValueError(f"`{requested}` was removed: {REMOVED_BACKENDS[requested]}")
         raise ValueError(
             f"matmul backend must be one of "
             f"{'|'.join(MATMUL_BACKEND_CHOICES)}, got {requested!r}")

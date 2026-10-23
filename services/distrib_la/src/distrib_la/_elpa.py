@@ -5,7 +5,7 @@ ELPA 2026.02.001 on the AMD GPU (``config/frontier/build_elpa_hip.sh``, bound by
 tridiagonalization, GPU divide-and-conquer, GPU back-transformation.  Measured on MI250X
 (ELPA_ROCM_REPORT.md), P=4 (2x2), cold wall, sampled residual/orthogonality <= 1.9e-14:
 
-    n       complex128: 1-stage  2-stage  SLATE-HIP     float64: 1-stage  2-stage  SLATE-HIP
+    n       complex128: 1-stage  2-stage  former lib   float64: 1-stage  2-stage  former lib
     20480               23.1     71.5     121.8                  15.3     34.5     84.4
     30720               56.5     186.6    aborts                 33.7     88.2     213.6
 
@@ -14,12 +14,12 @@ and returns wrong eigenvectors (sampled residual and orthogonality ~0.1) on the 
 at n >= 47104 (ELPA 2026.02.001; ELPA_TWO_STAGE_UPSTREAM_REPORT.md).  The handler pins
 ELPA_SOLVER_1STAGE and refuses ``ELPA_FORCE_*`` environment overrides.
 
-The operand contract is SLATE's (:func:`distrib_la._slate.distributed_eigh`): each rank's
+The operand contract (that of the eigh this backend replaced): each rank's
 ``(N/p, N/p)`` block, locally transposed to column-major bytes, read as ELPA's block-cyclic
 local array at tile ``nb | N/p`` on the square ``p x p`` grid, so ELPA solves
 ``Pi A Pi^T``; the eigenvector rows come back in ``A``'s order and only Q's columns are
-permuted back (:mod:`distrib_la._cyclic`).  The handler shares the SLATE family's per-mesh
-MPI context, as ScaLAPACK does.
+permuted back (:mod:`distrib_la._cyclic`).  The handler runs on the per-mesh MPI
+context (:mod:`distrib_la._mesh_ctx`), as ScaLAPACK does.
 
 Tile: ELPA's GPU kernels need ``nb`` a power of two (any other value silently moves work
 to the host).  1-stage: nb 64 and 128 measured equal (20480, both dtypes: 23.1 vs 23.0 s
@@ -51,7 +51,7 @@ import jax.numpy as jnp
 from jax import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la import _slate
+from distrib_la import _mesh_ctx
 from distrib_la._cyclic import cyclic_to_block, pad_with_sentinels
 from distrib_la.resolve import mesh_key
 
@@ -199,7 +199,7 @@ def distributed_eigh(A: jax.Array, *, mesh: Mesh, compute_evecs: bool = True,
                      side: int | None = None) -> Tuple[jax.Array, jax.Array]:
     """Distributed Hermitian eigendecomposition on ELPA (ROCM leg).
 
-    Same contract as :func:`distrib_la._slate.distributed_eigh`: ``A`` square, float64 or
+    The module's operand contract: ``A`` square, float64 or
     complex128, sharded ``P('x','y')`` on a square ``('x','y')`` mesh; returns ``W``
     ``(n,)`` ascending, replicated, and ``Q`` ``(n, n)`` with the eigenvectors as columns,
     ``P('x','y')``.  ``block_size`` must be a power of two dividing ``side/p``; ``side``
@@ -209,7 +209,7 @@ def distributed_eigh(A: jax.Array, *, mesh: Mesh, compute_evecs: bool = True,
         raise ValueError(f"elpa distributed_eigh: expected a square matrix, got {A.shape}")
     if A.dtype not in (jnp.complex128, jnp.float64):
         raise ValueError(f"elpa distributed_eigh: dtype {A.dtype} (supported: complex128, float64)")
-    p, q = _slate.validate_mesh(mesh, require_square=True)
+    p, q = _mesh_ctx.validate_mesh(mesh, require_square=True)
     n = int(A.shape[0])
     if n % p:
         raise ValueError(f"elpa distributed_eigh: n={n} must be divisible by mesh axis size {p}.")
@@ -224,8 +224,8 @@ def distributed_eigh(A: jax.Array, *, mesh: Mesh, compute_evecs: bool = True,
     if side < n or side % p or nb < 1 or nb & (nb - 1) or local % nb:
         raise ValueError(f"elpa distributed_eigh: tile {nb} must be a power of two dividing "
                          f"the solve tile {local} (side {side}, {p}x{q} mesh).")
-    _slate.ensure_registered(mesh, _EIGH_FFI_TARGET)
-    ctx_key = _slate.context_key(mesh)
+    _mesh_ctx.ensure_registered(mesh, _EIGH_FFI_TARGET)
+    ctx_key = _mesh_ctx.context_key(mesh)
     key = ("eigh", mesh_key(mesh), A.dtype, n, side, nb, bool(compute_evecs), int(ctx_key),
            elpa_threads())
     fn = _JIT_CACHE.get(key)

@@ -76,10 +76,9 @@ LORRAX_MPICH_CONTAINER_DIR="/opt/udiImage/modules/mpich"
 LORRAX_DARSHAN_LIB_DIR="/global/common/software/nersc9/darshan/default/lib"
 
 # Default host-side paths for the 3 FFI bind-mount stages.  Users can
-# override with LORRAX_FFI_{NVHPC,PHDF5,SLATE}_DIR before `module load`.
+# override with LORRAX_FFI_{NVHPC,PHDF5,CRAY}_DIR before `module load`.
 # Relocated off $SCRATCH to $HOME/software 2026-06-24: scratch is purged on
-# inactivity, and these are small read-once libs that belong on non-purged $HOME
-# (matches LORRAX_SLATE_INSTALL_DIR_DEFAULT below).
+# inactivity, and these are small read-once libs that belong on non-purged $HOME.
 LORRAX_FFI_NVHPC_DIR_DEFAULT="$HOME/software/lorrax_nvhpc"
 # 2026-08-06: moved off lorrax_phdf5_cray/stage, which held HDF5 **1.12**
 # while config/perlmutter/build_ffi_host.sh has loaded
@@ -96,7 +95,8 @@ LORRAX_FFI_NVHPC_DIR_DEFAULT="$HOME/software/lorrax_nvhpc"
 # stage swap without a matching `src/ffi/cpp/build.sh` is the same skew
 # again with the legs reversed.  Move both together.
 LORRAX_FFI_PHDF5_DIR_DEFAULT="$HOME/software/lorrax_phdf5_cray_1.14.3.7/stage"
-LORRAX_FFI_SLATE_DIR_DEFAULT="$HOME/software/lorrax_slate_cray/stage"
+# Cray runtime libs (libsci, libmpi_gtl_cuda, ...): src/ffi/cpp/stage/cray_runtime_stage.sh.
+LORRAX_FFI_CRAY_DIR_DEFAULT="$HOME/software/lorrax_cray_runtime/stage"
 
 # FFTW3 engine for the container.  The image ships none (measured
 # 2026-08-06, in-container on a compute node), and the flat-k FFT handler
@@ -105,10 +105,6 @@ LORRAX_FFI_SLATE_DIR_DEFAULT="$HOME/software/lorrax_slate_cray/stage"
 # with "mklfft: no FFTW3 engine in this process".  Populate with
 # src/ffi/cpp/stage/fftw_stage_cray.sh after `module load cray-fftw`.
 LORRAX_FFI_FFTW_DIR_DEFAULT="$HOME/software/lorrax_fftw_cray/stage"
-
-# Host SLATE install (bundled blaspp/lapackpp alongside).  Override with
-# LORRAX_SLATE_INSTALL_DIR before `module load`.
-LORRAX_SLATE_INSTALL_DIR_DEFAULT="$HOME/software/slate/install"
 
 # CPU MPI adapter for JAX's MPItrampoline backend.  This is an unmodified,
 # pinned upstream MPIwrapper build against Cray MPICH; the wrapper is a small

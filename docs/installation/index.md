@@ -15,7 +15,7 @@ A LORRAX process needs three things.
    `cuda13`) also installs `nvidia-mathdx`, whose headers the k-convolution
    kernels are compiled from at run time ([k-convolution](../architecture/kconv.md)).
 2. **The native FFI pair**: `liblorrax_ffi_host.so` (the host leg: ScaLAPACK,
-   SLATE, CBLAS, an FFTW3-ABI FFT and parallel HDF5) and `liblorrax_ffi.so`
+   CBLAS, an FFTW3-ABI FFT and parallel HDF5) and `liblorrax_ffi.so`
    (the CUDA leg: cuSOLVERMp, cuBLASMp, cuBLAS, cuFFT, the NVRTC-built
    mathdx k-convolution and Fourier-plan kernels, and parallel HDF5). The
    pair is required at every process count, P = 1 included, because there is

@@ -27,68 +27,21 @@
  * WHY THIS HIDES `*lorrax_ffi*` AND NOT `*`.  A DENYLIST, DELIBERATELY.
  * ============================================================================
  * The obvious version of this file is `local: *;` with the handler surface
- * and the ctypes ABI listed under `global:` -- "export only the sanctioned
- * surface".  IT WAS WRITTEN THAT WAY FIRST AND IT CRASHES, and the crash is
- * the reason this file has the shape it has.
+ * and the ctypes ABI listed under `global:`.  MEASURED, Perlmutter
+ * 2026-08-08: that form CRASHED five host cells while a third-party C++
+ * template library (removed 2026-10-23) was linked, because it localises the
+ * weak COMDAT template instantiations our translation units emit, which the
+ * C++ ABI intends the dynamic linker to merge with that library's.  So the
+ * rule this file states is the rule the defect needs: **LORRAX's own
+ * definitions are private to the library that compiled them**; everything
+ * else keeps the linkage the C++ ABI intends.  A denylist also fails safe: a
+ * new LORRAX symbol in `namespace lorrax_ffi` is hidden automatically, a new
+ * third-party dependency is left alone.  Not re-measured without that library.
  *
- * MEASURED, Perlmutter 2026-08-08, same tree, same commands, only the host
- * .so's version script moving (`services/distrib_la/tests/
- * test_distrib_la_contract.py -k "slate and cpu"`, artifacts under
- * /pscratch/sd/j/jackm/svc_ffi_odr/_reports/slate_*.xml):
- *
- *   version script            slate host cells   what stayed global
- *   ------------------------  -----------------  --------------------------
- *   none at all                8 P / 2 skip      everything
- *   this one (*lorrax_ffi*)    8 P / 2 skip      all third-party
- *   `local: *` + _ZT* global   3 P / 5 CRASH     typeinfo/typeinfo-name/vtable
- *   `local: *` + slate/blas/
- *      std templates global    8 P / 2 skip      third-party TEMPLATES
- *   `local: *`                 3 P / 5 CRASH     nothing
- *
- * The two crashing arms are exactly the two that localise the SLATE / blaspp
- * / libstdc++ TEMPLATE INSTANTIATIONS our own translation units emit;
- * localising the typeinfo and vtables is harmless, and localising the
- * templates is fatal on its own.  `SlatePotrfHostFfi` segfaults inside the
- * handler (`Fatal Python error: Segmentation fault`, top frame
- * `distrib_la/_slate.py:344 _potrf`), five cells:
- * slate_cholesky_trsm_cpu[float64,complex128],
- * slate_trsm_rectangular_rhs_cpu[16,48], slate_batched_cholesky_trsm_cpu.
- *
- * That is the vague-linkage contract, and it is not ours to break.  Our TUs
- * emit weak COMDAT copies of SLATE's inline and template code; the dynamic
- * linker is SUPPOSED to merge them with libslate.so's, so that one
- * definition -- and one copy of any static inside it -- serves the process.
- * `local: *` unmerges them and our compilation of a SLATE inline then runs
- * against libslate's data structures.  Those duplicates are ODR-CORRECT
- * (same headers, same source); LORRAX's own were not.
- *
- * So the rule this file states is the rule the defect actually needs:
- * **LORRAX's own definitions are private to the library that compiled them.**
- * Everything else keeps the linkage the C++ ABI intends.
- *
- * A DENYLIST STILL FAILS SAFE, which is the other half of the choice.  A new
- * LORRAX symbol lands in `namespace lorrax_ffi` and is hidden automatically;
- * a new third-party dependency is left alone automatically.  The allowlist
- * form has the opposite failure mode -- forgetting a third-party namespace
- * does not fail the build, it segfaults at runtime, which is what the table
- * above is a record of.
- *
- * WHAT REMAINS SHARED, AND WHERE IT IS TRACKED.  ~234 third-party
- * vague-linkage names (slate::, blas::, xla::ffi::, libstdc++ internals) are
- * still defined by both files, and the FIRST library loaded still answers
- * them for both.  That is the SAME defect `libslate.so.2` / `libblaspp.so.2`
- * sharing one SONAME already is, it is what `_open_accelerator_before_host` in both
- * loaders exists for, and `test_so_acceptance.py`'s check 5 ratchets it.
- * It is NOT L1 and this file does not claim to fix it.
- *
- * NOT -fvisibility=hidden, for a second and independent reason: gcc marks a
- * non-default-visibility type's typeinfo NAME private with a leading '*',
- * after which libstdc++'s `type_info::operator==` compares POINTERS ONLY
- * (typeinfo's `__name[0] != '*'` guard).  libslate.so throws
- * `slate::Exception` / `slate::MpiException` / `blas::Error` ACROSS the .so
- * boundary into our handlers, where they match today by strcmp on that name.
- * A version script relocalises symbols at LINK time without touching what
- * the compiler emitted, so the exception path is bit-for-bit unchanged.
+ * NOT -fvisibility=hidden: gcc then marks a type's typeinfo NAME private, and
+ * libstdc++'s `type_info::operator==` compares pointers only, so an exception
+ * thrown across a .so boundary would stop matching.  A version script
+ * relocalises at LINK time without touching what the compiler emitted.
  *
  * The FROZEN `*Ffi` handler symbols (invariant 1) and the `lrx_*` ctypes ABI
  * are not mentioned here at all: they are not `lorrax_ffi`-namespaced, so

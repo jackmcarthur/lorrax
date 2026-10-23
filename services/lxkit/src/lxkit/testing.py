@@ -57,7 +57,7 @@ __all__ = [
 # Reporting BROKEN as a skip is how the host leg was lost on 2026-08-06: the
 # .so carried a DT_NEEDED on cray-fftw's `libfftw3.so.mpi31.3`, which the
 # Shifter container does not mount, so dlopen failed and NINETEEN
-# ScaLAPACK/SLATE/GEMM contract tests -- none of which perform an FFT -- were
+# ScaLAPACK/GEMM contract tests -- none of which perform an FFT -- were
 # reported as "19 skipped" alongside "0 failed".  The suite looked green.  A
 # skip reads as "not applicable on this platform"; what it meant was "did not
 # run".  Nothing in the output distinguished them.
@@ -500,7 +500,7 @@ def import_isolation(pkg: str, forbidden_roots: Iterable[str], *,
 # ---------------------------------------------------------------------------
 # A skip reads as "not applicable on this machine".  When that is false it
 # is the quietest way a suite can lose coverage, and this tree has the
-# receipt: on 2026-08-06 nineteen ScaLAPACK/SLATE contract cells reported
+# receipt: on 2026-08-06 nineteen distributed-LA contract cells reported
 # "19 skipped" beside "0 failed" because a built-and-unloadable .so was
 # probed as absent.  Nothing in the output distinguished "does not apply"
 # from "did not run".
@@ -509,7 +509,7 @@ def import_isolation(pkg: str, forbidden_roots: Iterable[str], *,
 # section fixes the per-MACHINE half, in the two directions a skip can lie:
 #
 #   POSITIVE  the machine DECLARES which backends must be there.  On
-#             Perlmutter scalapack, slate, cusolvermp and phdf5 must all
+#             Perlmutter scalapack, cusolvermp and phdf5 must all
 #             probe available; if one does not, that is a defect in the
 #             build or the environment and the gate FAILS with the probe's
 #             own three-way reason (unknown target / library would not
@@ -603,10 +603,9 @@ _UNIVERSAL_SKIPS = (
                 "that does not need it"),
 )
 
-#: Perlmutter's declared expected-backend profile.  The four MUST rows are
+#: Perlmutter's declared expected-backend profile.  The three MUST rows are
 #: the charter's, and they are measurable today: survey 2 verified all
-#: eleven ScaLAPACK symbols in LibSci 25.09.0, the SLATE host and device
-#: builds, cuSOLVERMp 0.7.2 and the phdf5 handlers at the ARTIFACT level
+#: eleven ScaLAPACK symbols in LibSci 25.09.0, cuSOLVERMp 0.7.2 and the phdf5 handlers at the ARTIFACT level
 #: (nm/readelf), and BUILD_NOTES.md pins the host .so those symbols live
 #: in.  ``cusolvermp`` is CUDA-only by construction, so its row is
 #: asserted on a GPU leg; ``scalapack`` is host-only for the same reason.
@@ -614,7 +613,6 @@ _PERLMUTTER = MachineProfile(
     machine="perlmutter",
     must=(
         MustRow("scalapack", "distrib_la", "lorrax_scalapack_eigh", "cpu"),
-        MustRow("slate", "distrib_la", "lorrax_slate_potrf", "cpu"),
         MustRow("cusolvermp", "distrib_la", "lorrax_cusolvermp_eigh", "CUDA"),
         # Not distrib_la's library to probe: phdf5 belongs to slab_io,
         # which is not a service yet.  The row is declared HERE because
@@ -624,14 +622,7 @@ _PERLMUTTER = MachineProfile(
         # slab_io retrofit (charter wave 1b) supplies the probe.
         MustRow("phdf5", "slab_io", "lorrax_phdf5_read", "cpu"),
     ),
-    allowed_skips=_UNIVERSAL_SKIPS + (
-        AllowedSkip("slate_eigh_true_eigenvectors_cpu", "SIGSEGV",
-                    "nothing — bug L-2 is CARRIED, not covered: SLATE's "
-                    "host heev faults deterministically and a SIGSEGV "
-                    "takes the whole pytest process down.  See "
-                    "docs/services/distrib_la/backends.md; the CPU eigh contract is "
-                    "covered by the ScaLAPACK cells instead"),
-    ),
+    allowed_skips=_UNIVERSAL_SKIPS,
     min_collected=1,
     asserts_nothing=False,
 )

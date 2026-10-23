@@ -156,46 +156,6 @@
       ]
     },
     {
-      "backend": "scalapack",
-      "mesh": "1x1",
-      "op": "eigh",
-      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
-      "shape": [
-        2,
-        64
-      ]
-    },
-    {
-      "backend": "scalapack",
-      "mesh": "1x1",
-      "op": "eigh",
-      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
-      "shape": [
-        2,
-        256
-      ]
-    },
-    {
-      "backend": "scalapack",
-      "mesh": "1x1",
-      "op": "eigh",
-      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
-      "shape": [
-        8,
-        256
-      ]
-    },
-    {
-      "backend": "scalapack",
-      "mesh": "1x1",
-      "op": "eigh",
-      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
-      "shape": [
-        2,
-        1024
-      ]
-    },
-    {
       "backend": "cusolvermp",
       "compile_seconds": 0.00549339602002874,
       "dtype": "complex128",
@@ -262,78 +222,6 @@
       "seconds": 0.04395269596716389,
       "seconds_max": 0.04425770801026374,
       "seconds_min": 0.043517592013813555,
-      "shape": [
-        2,
-        1024
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 0.8595346559886821,
-      "dtype": "complex128",
-      "mesh": "1x1",
-      "op": "eigh",
-      "operands": "reused",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "plan.batched",
-      "seconds": 0.7756953500211239,
-      "seconds_max": 0.8628360900329426,
-      "seconds_min": 0.7034179709735326,
-      "shape": [
-        2,
-        64
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 0.7247173159848899,
-      "dtype": "complex128",
-      "mesh": "1x1",
-      "op": "eigh",
-      "operands": "reused",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "plan.batched",
-      "seconds": 0.9539554860093631,
-      "seconds_max": 0.9919865159899928,
-      "seconds_min": 0.821236226009205,
-      "shape": [
-        2,
-        256
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 3.7287632150109857,
-      "dtype": "complex128",
-      "mesh": "1x1",
-      "op": "eigh",
-      "operands": "reused",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "plan.batched",
-      "seconds": 3.713506200001575,
-      "seconds_max": 3.7406966829439625,
-      "seconds_min": 3.651374531968031,
-      "shape": [
-        8,
-        256
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 2.1622968149604276,
-      "dtype": "complex128",
-      "mesh": "1x1",
-      "op": "eigh",
-      "operands": "reused",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "plan.batched",
-      "seconds": 2.194399450032506,
-      "seconds_max": 2.278904175036587,
-      "seconds_min": 2.0875437020440586,
       "shape": [
         2,
         1024
@@ -446,78 +334,6 @@
       "mesh": "1x1",
       "op": "cholesky",
       "refused": "cholesky backend 'cusolvermp' needs a true-2D mesh (px >= 2 and py >= 2): its block-cyclic 2-D layout degenerates on the 1x1 mesh. Use a true-2D mesh, or 'auto' (demotes to native with an announcement), or 'off' for the native path.",
-      "shape": [
-        2,
-        1024
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 1.3139438349753618,
-      "dtype": "complex128",
-      "mesh": "1x1",
-      "op": "cholesky",
-      "operands": "fresh per call (donated)",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "factor+solve",
-      "seconds": 1.256230988947209,
-      "seconds_max": 1.5081980919931084,
-      "seconds_min": 1.1537841419922188,
-      "shape": [
-        2,
-        64
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 1.4012929170276038,
-      "dtype": "complex128",
-      "mesh": "1x1",
-      "op": "cholesky",
-      "operands": "fresh per call (donated)",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "factor+solve",
-      "seconds": 1.3045629799598828,
-      "seconds_max": 1.3587077839765698,
-      "seconds_min": 1.1787040599738248,
-      "shape": [
-        2,
-        256
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 5.223647731996607,
-      "dtype": "complex128",
-      "mesh": "1x1",
-      "op": "cholesky",
-      "operands": "fresh per call (donated)",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "factor+solve",
-      "seconds": 5.6336180579965,
-      "seconds_max": 5.993911003984977,
-      "seconds_min": 5.511541809013579,
-      "shape": [
-        8,
-        256
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 1.3233570950105786,
-      "dtype": "complex128",
-      "mesh": "1x1",
-      "op": "cholesky",
-      "operands": "fresh per call (donated)",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "factor+solve",
-      "seconds": 1.5736608549486846,
-      "seconds_max": 1.5875628399662673,
-      "seconds_min": 1.423188487009611,
       "shape": [
         2,
         1024

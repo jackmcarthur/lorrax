@@ -17,7 +17,7 @@ writes goes to one of these places:
 | what | default | move it with |
 |---|---|---|
 | the Python venv | `<clone>/.venv` | (the clone location) |
-| SLATE and the cuSOLVERMp/cuBLASMp stage | `<clone>/.build` | `LORRAX_BUILD_PREFIX` (to share one SLATE between clones) |
+| the cuSOLVERMp/cuBLASMp stage | `<clone>/.build` | `LORRAX_BUILD_PREFIX` |
 | the two FFI libraries | `<clone>/src/ffi/cpp/build{,_host}/` | nothing; the loader looks there |
 | JAX compile cache, mathdx kernel cache | `$SCRATCH/.cache/lorrax/` | [`ISDF_JAX_CACHE_DIR`](../reference/env_vars.md) (compile cache only) |
 | the CUDA driver's JIT cache | `$SCRATCH/.nv/ComputeCache` once `gpu_env.sh` is sourced (CUDA's default is `~/.nv`) | `CUDA_CACHE_PATH` |
@@ -60,14 +60,12 @@ below. Take one allocation `JOBID` for both, for example
 
 ```bash
 srun --jobid=$JOBID -N 1 -n 1 -c 64 --gres=none bash -c '
-  bash src/ffi/cpp/stage/slate_build_perlmutter.sh cpu &&
   bash config/perlmutter/build_ffi_host.sh &&
   bash config/perlmutter/build_ffi_cuda.sh'
 ```
 
 | step | builds | time (one Perlmutter node) |
 |---|---|---|
-| `slate_build_perlmutter.sh cpu` | SLATE with `gpu_backend=none` into `.build/slate` | about 2 min |
 | `build_ffi_host.sh` | the host leg, `src/ffi/cpp/build_host/liblorrax_ffi_host.so` | about 30 s |
 | `build_ffi_cuda.sh` | stages the cuSOLVERMp/cuBLASMp wheels, then the CUDA leg, `src/ffi/cpp/build/liblorrax_ffi.so` | about 1 min |
 
@@ -91,8 +89,7 @@ build.
   route. The CUDA leg compiles and links against it, and `build_ffi_cuda.sh`
   refuses another wheel version or a record whose NCCL is not that wheel. The
   HPC SDK's `comm_libs` NCCL (2.29.3) is never used;
-- the pinned MPI, HDF5 and LibSci of `config/perlmutter/ffi_mpi.sh`;
-- SLATE, for the host leg.
+- the pinned MPI, HDF5 and LibSci of `config/perlmutter/ffi_mpi.sh`.
 
 At start-up the loader opens exactly those files, then refuses the process if
 any other copy of one of them is mapped. So a clone runs on what its build
@@ -181,7 +178,7 @@ The module sets:
 The bundle's manifest carries each leg's dependency closure. Its libraries
 are the toolkit's CUDA math files (the module venv has no CUDA math wheels),
 the venv's `nvidia-nccl-cu13` 2.30.7 wheel (the same NCCL as a clone), the
-sealed cuSOLVERMp/cuBLASMp/SLATE copies, and the pinned MPI and HDF5. Every start-up enforces that closure exactly as for a clone
+sealed cuSOLVERMp/cuBLASMp copies, and the pinned MPI and HDF5. Every start-up enforces that closure exactly as for a clone
 ([the dependency closure](ffi-build.md#closure)). The module's
 `LD_LIBRARY_PATH` serves JAX and the external system libraries; it cannot
 change which file a leg uses.
@@ -228,7 +225,7 @@ over quota fails in `seal_bundle.py` with `Disk quota exceeded`.
 | path under `$LORRAX_MODULE_PREFIX` | written by |
 |---|---|
 | `python/`, `venv/` (or `LORRAX_MODULE_VENV`, an absolute path: `lorrax_cuda13_runtime` keeps `.venv`) | `setup_env.sh` (once per prefix) |
-| `native/` (SLATE, cuSOLVERMp stage; `build/` before 2026-10-17, which `seal_bundle.py` refuses as a search-path directory) | `build.sh` (first build only) |
+| `native/` (the cuSOLVERMp stage; `build/` before 2026-10-17, which `seal_bundle.py` refuses as a search-path directory) | `build.sh` (first build only) |
 | `releases/source-<rev8>/`, `releases/<rev8>-bundle-<id12>/` | `publish.sh` (read-only, never replaced) |
 | `modulefiles/<name>/<version>.lua` | `publish.sh` (the previous file kept as `.before-<rev8>`) |
 
@@ -256,7 +253,7 @@ the bundle record the commit they came from.
    ```
 
 2. **Candidate**, once per revision, in a zero-GPU compute step (about
-   1 min, plus about 2 min for SLATE on the first build in a prefix).
+   1 min).
 
    ```bash
    srun --jobid=$JOBID -N 1 -n 1 -c 64 --gres=none \
@@ -266,8 +263,7 @@ the bundle record the commit they came from.
    The script clones the revision into `cand/src` and links its `.venv` to
    the module venv; builds both legs with `build_ffi_host.sh` and
    `build_ffi_cuda.sh` (each ends in `VERIFY PASSED`); seals the pair into
-   `cand/bundle` with the private closure cuBLASMp, cuSOLVERMp, BLAS++,
-   LAPACK++ and SLATE; writes `cand/source` (`git archive` plus
+   `cand/bundle` with the private closure cuBLASMp and cuSOLVERMp; writes `cand/source` (`git archive` plus
    `SOURCE_COMMIT`); and renders `cand/modulefiles/`. It refuses a candidate
    path that is relative, already exists, or lies inside the checkout or
    inside `releases/`.

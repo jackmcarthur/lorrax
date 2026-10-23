@@ -47,7 +47,7 @@ python -m pip install -e ../lxkit -e .
 
 Import top-level names only. `from distrib_la.<submodule> import …` from
 outside the package fails `tools/lint/test_layering.py`, because the package is its
-own facade: ScaLAPACK, SLATE and cuSOLVERMp are reached through one
+own facade: ScaLAPACK, ELPA and cuSOLVERMp are reached through one
 module, `distrib_la.loader`, and nowhere else. Native JAX routes, the
 vocabularies and the capability report work with no native library present;
 the FFI routes need the LORRAX native pair ([Backends § where the libraries
@@ -156,7 +156,7 @@ sentinel-padded H'_vv (n 9152, 4×4). So:
   them as exact zero eigenvalues with unit vectors, in ascending order
   (`deflate_zero_rows`; a matrix with no zero row passes through unchanged;
   the columns are reordered only when a live eigenvalue is negative).
-- Every distributed eigh (cuSOLVERMp, SLATE, ScaLAPACK; single, scanned or
+- Every distributed eigh (cuSOLVERMp, ELPA, ScaLAPACK; single, scanned or
   stacked) is checked against 8 fixed-seed probe columns X, the same on every
   rank: ‖(AZ − Z diag(w))X‖/(‖A‖‖X‖) and ‖(ZᴴZ − I)X‖/‖X‖ within
   `roundoff_tol(n, dtype)` = 64·n·eps, at O(n²k) beside the O(n³) solve. A
@@ -701,8 +701,7 @@ such as a missing conjugate or an unsymmetrized product, and never round-off.
 - **No `jnp.linalg.svd` or `eigh(A.H @ A)` at a consumer.** Use
   `polar_factor`, or hoist `plan_polar_factor` for a streamed loop.
 - **No Python loop over the batch axis.** Use `Plan.batched`: a loop hands
-  the compiler `B` separate calls, and with SLATE recompiles its eager
-  `shard_map` wrappers per matrix.
+  the compiler `B` separate calls.
 - **No backend from the environment.** The `linalg` deck dial chooses; the
   environment only says which library exists.
 - **No eigenvector comparison across meshes.** Degenerate subspaces have no

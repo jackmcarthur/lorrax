@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # build_host.sh — build liblorrax_ffi_host.so, the CUDA-free host-platform
-# FFI library (SLATE host handlers; see CMakeLists.txt, host leg).
+# FFI library (see CMakeLists.txt, host leg).
 #
-# Runs HOST-SIDE under the Cray PE (no Shifter container) against the
-# gpu_backend=none SLATE install.  cmake + the ~30 s compile are fine on a
+# Runs HOST-SIDE under the Cray PE (no Shifter container).  cmake + the ~30 s compile are fine on a
 # login node; to route through the allocation instead:
 #
 #   srun --jobid=$SLURM_JOBID --overlap -N1 -n1 -c 32 \
@@ -19,9 +18,6 @@
 #
 # Overrides (env):
 #   LORRAX_FFI_HOST_BUILD_DIR      alternate build dir
-#   LORRAX_SLATE_HOST_INSTALL_DIR  SLATE none-backend install
-#                                  (default $LORRAX_BUILD_PREFIX/slate/cpu/install,
-#                                   LORRAX_BUILD_PREFIX default <checkout>/.build)
 #   LORRAX_XLA_FFI_HEADERS_DIR     pre-staged header dir (skips staging)
 #   LORRAX_FFI_HOST_IMAGE          a Shifter image to stage headers from
 #                                  (container runs only; the JAX-0.9 image
@@ -42,7 +38,7 @@ LORRAX_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"   # this checkout; an export
 # found" printed as a WARNING, the link succeeded, and the library shipped with
 # `scalapack=0` and zero Scalapack* handlers.  It also left cray-libsci loaded
 # at configure time, so the CC wrapper auto-injected the sequential LibSci
-# beside the threaded pair the SLATE install needs.  Two defects, one command,
+# beside the threaded pair.  Two defects, one command,
 # no failure.
 #
 # The verifier at the bottom of this file would now catch both.  Catching them
@@ -78,7 +74,6 @@ if [[ -n "$_site" ]]; then
 fi
 
 BUILD_DIR="${LORRAX_FFI_HOST_BUILD_DIR:-${SCRIPT_DIR}/build_host}"
-SLATE_DIR="${LORRAX_SLATE_HOST_INSTALL_DIR:-${LORRAX_BUILD_PREFIX:-$LORRAX_ROOT/.build}/slate/cpu/install}"
 # XLA FFI headers must match the RUNTIME jaxlib.  Default: this checkout's
 # venv (`uv sync`), whose jaxlib ships them.  LORRAX_FFI_HOST_IMAGE instead
 # stages them out of a container image once.
@@ -96,16 +91,8 @@ else
     exit 2
 fi
 
-if [[ ! -d "${SLATE_DIR}/lib64" ]]; then
-    echo "[build_host] ERROR: SLATE gpu_backend=none install not found at" >&2
-    echo "[build_host]   ${SLATE_DIR}" >&2
-    echo "[build_host] Build it first:" >&2
-    echo "[build_host]   bash src/ffi/cpp/stage/slate_build_perlmutter.sh cpu" >&2
-    exit 2
-fi
-
 # ---------------------------------------------------------------------------
-# Modules (same pattern as cpp/stage/slate_build_perlmutter.sh cpu): Cray PE,
+# Modules: Cray PE,
 # no CUDA — with craype-accel-nvidia80 loaded the CC wrapper would link
 # libmpi_gtl_cuda, whose libcuda.so.1 dependency defeats the purpose.
 # ---------------------------------------------------------------------------
@@ -140,7 +127,6 @@ if [[ ! -f "${HDR_DIR}/xla/ffi/api/ffi.h" ]]; then
     exit 2
 fi
 
-echo "[build_host] SLATE (none) = ${SLATE_DIR}"
 echo "[build_host] XLA headers  = ${HDR_DIR}"
 echo "[build_host] build dir    = ${BUILD_DIR}"
 
@@ -156,8 +142,7 @@ cmake "${SCRIPT_DIR}" \
     -DLORRAX_FFI_PLATFORM=host \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER=CC \
-    -DLORRAX_XLA_FFI_INCLUDE_DIR="${HDR_DIR}" \
-    -DLORRAX_SLATE_HOST_INSTALL_DIR="${SLATE_DIR}"
+    -DLORRAX_XLA_FFI_INCLUDE_DIR="${HDR_DIR}"
 
 cmake --build . --parallel
 
@@ -171,7 +156,6 @@ fi
 # closure as this verify environment resolves it, recorded beside the leg; the
 # loader opens exactly those files and refuses a process mapping another copy.
 python3 "${SCRIPT_DIR}/stage/write_checkout_closure.py" "${SO_FILE}" \
-    --private-dir "${SLATE_DIR}/lib64" \
     --library-dirs "${LD_LIBRARY_PATH:-}" --skip-missing-dirs || {
         echo "[build_host] FAILED: dependency closure" >&2; exit 1; }
 
@@ -187,7 +171,7 @@ python3 "${SCRIPT_DIR}/stage/write_checkout_closure.py" "${SO_FILE}" \
 # On a site with no ScaLAPACK/GEMM this build legitimately contains fewer
 # backends than the default expectation.  SAY SO — the declaration is the
 # gate:
-#     LORRAX_FFI_EXPECT_BACKENDS=slate,phdf5,fft bash src/ffi/cpp/build_host.sh
+#     LORRAX_FFI_EXPECT_BACKENDS=phdf5,fft bash src/ffi/cpp/build_host.sh
 # ===========================================================================
 echo
 echo "[build_host] --- build contract (scripts/verify_ffi_build.sh) ---"
@@ -204,7 +188,6 @@ bash "${LORRAX_ROOT}/scripts/verify_ffi_build.sh" --leg host "${SO_FILE}" || {
 # which source produced an already-built file.
 "${SCRIPT_DIR}/stage/stamp_provenance.sh" "${SO_FILE}" \
     "leg=host" \
-    "slate=${SLATE_DIR}" \
     "build_dir=${BUILD_DIR}" \
     "closure_sha256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["record_sha256"])' "${SO_FILE}.closure.json")"
 

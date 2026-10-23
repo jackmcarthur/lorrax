@@ -64,7 +64,6 @@ export LORRAX_MPIWRAPPER_SO="${LORRAX_MPIWRAPPER_SO:-$WORK/lorrax_mpiwrapper/ins
 # I_MPI_PMI_LIBRARY=$WORK/host_pmi/libpmi2.so.0 (LORRAX_PMI2_LIB overrides);
 # stage it once with config/frontera/stage_host_pmi.sh.
 
-export LORRAX_SLATE_HOST_LIB=${LORRAX_SLATE_HOST_LIB:-$WORK/slate_builds/cpu/install/lib64}
 export LORRAX_IMPI_ROOT=${LORRAX_IMPI_ROOT:-/opt/intel/compilers_and_libraries_2020.4.304/linux/mpi/intel64}
 export LORRAX_HDF5_ROOT=${LORRAX_HDF5_ROOT:-/home1/apps/intel19/impi19_0/phdf5/1.14.6}
 export LORRAX_MKL_LIB=${LORRAX_MKL_LIB:-/opt/intel/compilers_and_libraries_2020.1.217/linux/mkl/lib/intel64_lin}
@@ -92,7 +91,7 @@ cat > "$INNER" <<'EOS'
 set -u
 export JAX_PLATFORMS=cpu JAX_ENABLE_X64=1 CUDA_VISIBLE_DEVICES=""
 export HDF5_USE_FILE_LOCKING=FALSE
-# BLAS-side thread teams (MKL pzheevd, SLATE OpenMP, scipy_openblas).  The
+# BLAS-side thread teams (MKL pzheevd, scipy_openblas).  The
 # XLA:CPU pool does NOT obey OMP — taskset affinity is its size (ADVICE §10).
 export OMP_NUM_THREADS=28 OPENBLAS_NUM_THREADS=28 MKL_NUM_THREADS=28
 # compile cache ON (AT/AU verdict; AH fixed the P>1 deadlock — warm
@@ -114,9 +113,9 @@ export LORRAX_MPI_FINALIZE_FIX=skip_atexit   # overlay sitecustomize; without
 # in-repo warm_mesh_cliques() (docs/environment/transports.md, the warm-up).  Setting it would
 # only mask a missing warm-up call site.
 
-# --- host library search path (host FFI .so deps: SLATE, MKL, phdf5,
+# --- host library search path (host FFI .so deps: MKL, phdf5,
 # Intel MPI runtime + bundled libfabric, Intel compiler runtime) ------------
-export LD_LIBRARY_PATH="$LORRAX_SLATE_HOST_LIB:$LORRAX_MKL_LIB:$LORRAX_HDF5_ROOT/lib:$LORRAX_IMPI_ROOT/lib/release:$LORRAX_IMPI_ROOT/lib:$LORRAX_IMPI_ROOT/libfabric/lib:$LORRAX_ICC_RUNTIME:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$LORRAX_MKL_LIB:$LORRAX_HDF5_ROOT/lib:$LORRAX_IMPI_ROOT/lib/release:$LORRAX_IMPI_ROOT/lib:$LORRAX_IMPI_ROOT/libfabric/lib:$LORRAX_ICC_RUNTIME:${LD_LIBRARY_PATH:-}"
 
 # host RDMA/UCX userspace for mlx, staged as symlinks APPENDED to
 # LD_LIBRARY_PATH (a bare /hostlibs on the path shadows container glibc):

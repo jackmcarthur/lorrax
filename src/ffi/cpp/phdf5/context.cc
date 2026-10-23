@@ -77,7 +77,7 @@ static void throw_if_cuda(lrx::gpu::Error st, const char* what) {
 // caller triggers it eagerly via the exported ``lrx_phdf5_init_mpi``
 // (takes ~400 ms on first call; calling it during program startup
 // before the hot path saves that time on the critical path).
-// GUARD (scorecard AS.4b; twin in cpp/slate/context.cc).  This ctx runs a
+// GUARD (scorecard AS.4b; twin in cpp/mesh/context.cc).  This ctx runs a
 // dedicated writer thread whose H5Dwrite drives MPI-IO collectives
 // concurrently with any main-thread / XLA-thread MPI traffic.  That
 // concurrency is only DEFINED at MPI_THREAD_MULTIPLE.  When *we* init MPI we
@@ -103,7 +103,7 @@ static void throw_if_cuda(lrx::gpu::Error st, const char* what) {
 // construction.  Rank now comes from MPI_Comm_rank rather than open_ctx's
 // argument, which is what let it live at the lower level.
 //
-// Mechanism shared with the slate twin in cpp/common/mpi_thread_guard.h
+// Mechanism shared with the mesh twin in cpp/common/mpi_thread_guard.h
 // (2026-08-01 dedup); the hazard sentence stays per family.
 static void require_thread_multiple() {
     lorrax_ffi::mpiguard::require_thread_multiple(

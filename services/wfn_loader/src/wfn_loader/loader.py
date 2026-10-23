@@ -230,6 +230,40 @@ def uniform_band_windows(b_lo: int, b_hi: int, width: int) -> list:
 
 
 class WfnLoader:
+    """Reader for a BerkeleyGW ``WFN.h5``: header, G tables and ψ(G).
+
+    Parameters
+    ----------
+    path
+        The ``WFN.h5`` file.  Complex flavor (``flavor = 2``) and
+        ``nspin = 1`` only; ``nspinor`` may be 1 or 2.  Anything else raises
+        ``ValueError`` before the coefficients are touched.
+    mesh
+        Optional 2-D ``('x', 'y')`` device mesh.  Required for
+        ``backend='phdf5'``; may be bound later with :meth:`adopt_mesh`.
+    backend
+        ``'auto'`` (default), ``'eager'`` (per-rank h5py) or ``'phdf5'``
+        (collective MPI-IO).  The two transports are byte-identical;
+        ``LORRAX_WFN_BACKEND`` forces one under ``'auto'``.
+    qe_schema
+        Path to QE's ``data-file-schema.xml``.  ``None`` searches next to
+        the WFN; an explicit path must authenticate against the WFN.
+
+    The constructor binds every ``mf_header`` field as an attribute (``nkpts``,
+    ``nbands``, ``nspinor``, ``kgrid``, ``fft_grid``, ``kpoints`` (crystal),
+    ``energies`` (Ry), ``bvec`` (units of ``blat``), ``blat`` (1/bohr),
+    ``cell_volume`` (bohr³), ``sym_matrices``, ``translations`` (BGW ``tnp``
+    = 2π·τ), …), derives ``nelec``, ``vbm``, ``cbm``, ``efermi`` (Ry) and
+    ``atom_crys``, and runs the two-component time-reversal check whose
+    verdict is ``trs_holds``.
+
+    ψ comes back G-flat, ``(n_k, n_b, n_spinor, ngkmax)`` complex128, from
+    :meth:`load` (global, band-sharded), :meth:`load_process_local` (this
+    process only) or :meth:`bands` (band-chunked).  Pair it with
+    :meth:`gvecs` / :meth:`ngk_valid` / :meth:`kvecs` for the same ``k``.
+    Use as a context manager or call :meth:`close`.
+    """
+
     uniform_band_windows = staticmethod(uniform_band_windows)
 
     # ------------------------------------------------------------------

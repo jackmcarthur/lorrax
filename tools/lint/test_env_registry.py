@@ -114,7 +114,7 @@ def universal_globs(globs):
     """The subset of ``globs`` that would cover the whole gated namespace.
 
     ``registry_vocabulary`` harvests any ``ALLCAPS*`` token in the page,
-    which is the right rule for a family row like ``LORRAX_SLATE_*`` and
+    which is the right rule for a family row like ``LORRAX_PHDF5_*`` and
     the WRONG one for the same spelling used in a SENTENCE.  A bare
     ``LORRAX_*`` in prose is not a family — it is the English for "all of
     them" — and admitting it as a prefix makes :func:`covered` return True
@@ -325,7 +325,7 @@ def test_the_real_registry_has_no_universal_glob():
         "docs/reference/env_vars.md contains %r, a prefix glob covering the whole "
         "%s namespace.  Every read site would be 'covered' and neither "
         "registry test could ever fail.  Write the family out (e.g. "
-        "`LORRAX_SLATE_*`), or say 'every LORRAX variable' in words without "
+        "`LORRAX_PHDF5_*`), or say 'every LORRAX variable' in words without "
         "the trailing star." % (sorted(bad), _GATED_NAMESPACE))
 
 

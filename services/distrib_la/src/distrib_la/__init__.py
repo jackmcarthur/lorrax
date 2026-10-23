@@ -2,10 +2,8 @@
 
 One public API for ``polar_factor``, ``eigh``, ``cholesky``, ``solve_lu`` and
 ``matmul`` on an ``('x','y')`` device mesh, over four backend families:
-**scalapack/PBLAS** (CPU preferred),
-**slate** (CPU fallback where it is not broken; ROCm always,
-declared-untested), **cusolvermp** (CUDA preferred) and **native**
-(pure JAX, everywhere).  A caller says what it wants computed and on which mesh;
+**scalapack/PBLAS** (CPU), **cusolvermp** (CUDA), **elpa** (ROCm eigh) and
+**native** (pure JAX, everywhere).  A caller says what it wants computed and on which mesh;
 which library runs is a resolved fact it can read but never has to
 branch on.
 
@@ -14,7 +12,7 @@ a consumer needs is a top-level name here, and importing
 ``distrib_la.<submodule>`` from outside is a layering violation the
 monorepo's ``tools/lint/test_layering.py`` fails on.  That is what makes
 "only distrib_la sees the provider families" checkable rather than
-aspirational — ScaLAPACK, SLATE and cuSOLVERMp appear in
+aspirational — ScaLAPACK, ELPA and cuSOLVERMp appear in
 exactly one dependency edge in this package (:mod:`distrib_la.loader`, which
 dlopens a ``.so`` by path) and in zero of its declared dependencies.
 

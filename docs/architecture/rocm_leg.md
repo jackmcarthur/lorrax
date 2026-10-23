@@ -151,6 +151,7 @@ native collective refuses by `GATE subspace_native_collectives`. Gate:
 | pair convolution / plane FFT, modes 1, 10 | kdft `kbox_parent`, `plane_gather` | mathdx | both built |
 | Local Fourier plan | `fourier_plan_rocm` (rocBLAS + hipFFT, no fused pair) | `fourier_plan_mathdx` | both built |
 | batched local eigh | `rocsolver_batched_eigh` | jaxlib cuSOLVER | by design |
-| distributed eigh / LU | SLATE above `ONE_DEVICE_MAX_N`, one device below | cuSOLVERMp at every n | CUDA size row open |
+| distributed eigh | ELPA above `ONE_DEVICE_MAX_N`, one device below | cuSOLVERMp, or one device within the room | by design |
+| distributed LU | one device within the room, refused beyond it | cuSOLVERMp, or one device within the room | no ROCm LU library |
 | active subspace | `devsize` | `blas` | both built |
 | parallel HDF5 | `phdf5` | `phdf5` | one source |

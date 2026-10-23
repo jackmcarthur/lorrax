@@ -15,7 +15,7 @@ The two exception types split the one question every skip decision turns on::
 
 :func:`lxkit.testing.absent_or_broken` is the harness arm that consumes the
 split.  Collapsing the two is how the LORRAX host leg was lost on
-2026-08-06 — 19 ScaLAPACK/SLATE/GEMM contract cells reported "19 skipped"
+2026-08-06 — 19 distributed-LA/GEMM contract cells reported "19 skipped"
 alongside "0 failed" and the suite looked green.
 
 The three reason constructors are the *unusable* taxonomy, ported from

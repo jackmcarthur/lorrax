@@ -156,46 +156,6 @@
       ]
     },
     {
-      "backend": "scalapack",
-      "mesh": "2x2",
-      "op": "eigh",
-      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
-      "shape": [
-        2,
-        64
-      ]
-    },
-    {
-      "backend": "scalapack",
-      "mesh": "2x2",
-      "op": "eigh",
-      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
-      "shape": [
-        2,
-        256
-      ]
-    },
-    {
-      "backend": "scalapack",
-      "mesh": "2x2",
-      "op": "eigh",
-      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
-      "shape": [
-        8,
-        256
-      ]
-    },
-    {
-      "backend": "scalapack",
-      "mesh": "2x2",
-      "op": "eigh",
-      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
-      "shape": [
-        2,
-        1024
-      ]
-    },
-    {
       "backend": "cusolvermp",
       "compile_seconds": 3.1288676830008626,
       "dtype": "complex128",
@@ -262,78 +222,6 @@
       "seconds": 3.45719280798221,
       "seconds_max": 3.51397883502068,
       "seconds_min": 3.4527344109956175,
-      "shape": [
-        2,
-        1024
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 1.0602835440076888,
-      "dtype": "complex128",
-      "mesh": "2x2",
-      "op": "eigh",
-      "operands": "reused",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "plan.batched",
-      "seconds": 0.9706676310161129,
-      "seconds_max": 1.0767450439743698,
-      "seconds_min": 0.9630591530003585,
-      "shape": [
-        2,
-        64
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 1.1987819430069067,
-      "dtype": "complex128",
-      "mesh": "2x2",
-      "op": "eigh",
-      "operands": "reused",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "plan.batched",
-      "seconds": 1.2210406660451554,
-      "seconds_max": 1.4381957210134715,
-      "seconds_min": 1.0029351789853536,
-      "shape": [
-        2,
-        256
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 4.869594656978734,
-      "dtype": "complex128",
-      "mesh": "2x2",
-      "op": "eigh",
-      "operands": "reused",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "plan.batched",
-      "seconds": 5.0717302929842845,
-      "seconds_max": 5.681265875988174,
-      "seconds_min": 4.987632556993049,
-      "shape": [
-        8,
-        256
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 2.634290231973864,
-      "dtype": "complex128",
-      "mesh": "2x2",
-      "op": "eigh",
-      "operands": "reused",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "plan.batched",
-      "seconds": 3.0769396999967285,
-      "seconds_max": 3.195995991991367,
-      "seconds_min": 2.541792348958552,
       "shape": [
         2,
         1024
@@ -478,78 +366,6 @@
       "seconds": 0.010319388005882502,
       "seconds_max": 0.017636082018725574,
       "seconds_min": 0.010248920996673405,
-      "shape": [
-        2,
-        1024
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 2.1167933020042256,
-      "dtype": "complex128",
-      "mesh": "2x2",
-      "op": "cholesky",
-      "operands": "fresh per call (donated)",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "factor+solve",
-      "seconds": 1.7836512539652176,
-      "seconds_max": 2.1351269260048866,
-      "seconds_min": 1.623464033997152,
-      "shape": [
-        2,
-        64
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 2.152845269010868,
-      "dtype": "complex128",
-      "mesh": "2x2",
-      "op": "cholesky",
-      "operands": "fresh per call (donated)",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "factor+solve",
-      "seconds": 1.9773450530483387,
-      "seconds_max": 2.1569220069795847,
-      "seconds_min": 1.8121970979846083,
-      "shape": [
-        2,
-        256
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 7.908179880992975,
-      "dtype": "complex128",
-      "mesh": "2x2",
-      "op": "cholesky",
-      "operands": "fresh per call (donated)",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "factor+solve",
-      "seconds": 5.543686182005331,
-      "seconds_max": 7.768423915025778,
-      "seconds_min": 5.437325934006367,
-      "shape": [
-        8,
-        256
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 1.4396036510006525,
-      "dtype": "complex128",
-      "mesh": "2x2",
-      "op": "cholesky",
-      "operands": "fresh per call (donated)",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "factor+solve",
-      "seconds": 1.4090154530131258,
-      "seconds_max": 1.515208007011097,
-      "seconds_min": 1.3856237459694967,
       "shape": [
         2,
         1024
@@ -797,25 +613,6 @@
       ]
     },
     {
-      "backend": "slate",
-      "compile_seconds": 0.5973599909921177,
-      "dtype": "complex128",
-      "leg": "step6.cross_size",
-      "mesh": "2x2",
-      "op": "eigh",
-      "operands": "reused",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "plan.single",
-      "seconds": 0.4005507430410944,
-      "seconds_max": 0.4130130860139616,
-      "seconds_min": 0.3673832790227607,
-      "shape": [
-        1,
-        64
-      ]
-    },
-    {
       "backend": "off",
       "compile_seconds": 0.2252904330380261,
       "dtype": "complex128",
@@ -867,25 +664,6 @@
       "seconds": 1.560662267031148,
       "seconds_max": 1.6456919370102696,
       "seconds_min": 1.5478204779792577,
-      "shape": [
-        1,
-        256
-      ]
-    },
-    {
-      "backend": "slate",
-      "compile_seconds": 0.5468905059969984,
-      "dtype": "complex128",
-      "leg": "step6.cross_size",
-      "mesh": "2x2",
-      "op": "eigh",
-      "operands": "reused",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "plan.single",
-      "seconds": 0.5458041889942251,
-      "seconds_max": 0.6320307020214386,
-      "seconds_min": 0.4865103679476306,
       "shape": [
         1,
         256
@@ -949,25 +727,6 @@
       ]
     },
     {
-      "backend": "slate",
-      "compile_seconds": 1.6317593320272863,
-      "dtype": "complex128",
-      "leg": "step6.cross_size",
-      "mesh": "2x2",
-      "op": "eigh",
-      "operands": "reused",
-      "reps": 5,
-      "resolved": "slate",
-      "route": "plan.single",
-      "seconds": 1.3873811149969697,
-      "seconds_max": 1.4878442020271905,
-      "seconds_min": 1.2474324480281211,
-      "shape": [
-        1,
-        1024
-      ]
-    },
-    {
       "backend": "off",
       "compile_seconds": 0.32068146200617775,
       "dtype": "complex128",
@@ -1025,25 +784,6 @@
       ]
     },
     {
-      "backend": "slate",
-      "compile_seconds": 5.55901286599692,
-      "dtype": "complex128",
-      "leg": "step6.cross_size",
-      "mesh": "2x2",
-      "op": "eigh",
-      "operands": "reused",
-      "reps": 3,
-      "resolved": "slate",
-      "route": "plan.single",
-      "seconds": 5.443630088993814,
-      "seconds_max": 5.689387430960778,
-      "seconds_min": 5.397280014003627,
-      "shape": [
-        1,
-        2048
-      ]
-    },
-    {
       "backend": "off",
       "compile_seconds": 0.7217128879856318,
       "dtype": "complex128",
@@ -1095,19 +835,6 @@
       "seconds": 2.7393706620205194,
       "seconds_max": 2.775997537013609,
       "seconds_min": 2.7198488459689543,
-      "shape": [
-        1,
-        4096
-      ]
-    },
-    {
-      "backend": "slate",
-      "jobid": "56457930",
-      "leg": "step6.slate4096",
-      "mesh": "2x2",
-      "op": "eigh",
-      "refused": "SIGSEGV, not a refusal message: SLATE's CUDA eigh crashes deterministically at n=4096 on the 4-process 2x2 and takes every rank down (srun rc=139, 'nid001088: task 0: Segmentation fault'), jobid 56457930, _reports/gpu_slate4096_segv.log.  resolve_backend guard 2d now REFUSES this combination (bug L-4), so a future run of this bench records the refusal text instead of crashing.  It RUNS at n<=2048 on the same mesh.",
-      "route": "plan.single",
       "shape": [
         1,
         4096

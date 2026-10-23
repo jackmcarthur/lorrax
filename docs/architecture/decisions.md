@@ -12,6 +12,33 @@ The GW driver's phase invariants and the per-function contracts of
 `gw.gw_config` are developer reference, not rulings:
 [GW driver and configuration contracts](../dev/gw_config_contracts.md).
 
+## 2026-10-23 — SLATE is removed; ROCm LU is one device within the room {#no-slate}
+
+**Rule (owner).** LORRAX has no SLATE backend. The distributed libraries are
+ScaLAPACK (cpu), cuSOLVERMp (CUDA) and ELPA (ROCm eigh); Cholesky beyond
+cuSOLVERMp is `native2d`. ROCm has no distributed LU library: `distributed`
+LU there resolves to `one_device` where one matrix's priced program fits the
+caller's room (`budget_bytes`) and refuses by name beyond it or without a
+room. ROCm Cholesky is `native` / `native2d` only. A request for `slate`
+refuses with "`slate` was removed: ...".
+
+**Why.** SLATE served no route that another library did not serve better:
+ELPA replaced it for ROCm eigh (5-8x at n = 20480-30720,
+`ELPA_ROCM_REPORT.md`), and one GCD beat SLATE 2×2 on ROCm LU wherever both
+ran (complex128: 0.72 / 1.53 / 4.10 s against 3.63 / 10.4 / 16.1 s at
+n = 8192 / 12288 / 16384) and runs to n = 28672 (22.7 s;
+`ROCSOLVER_LU_REPORT.md` §2). The Perlmutter CUDA leg never carried it.
+Keeping it cost an extra build per machine and the shared-SONAME borrowing
+between legs.
+
+**Licenses deleting** `src/ffi/cpp/slate/`, `distrib_la._slate`, the SLATE
+build and stage scripts, the `LORRAX_{HOST,ROCM}_HAVE_SLATE` CMake options and
+`LORRAX_SLATE_*` variables, the ScaLAPACK overlay refusal
+(`LORRAX_SCALAPACK_ALLOW_SLATE_API`), the subrow context, and
+`lxkit.native_provider`'s borrowed-provider machinery (done; FFI ABI 11). The
+mesh context survives as `src/ffi/cpp/mesh/` (`MeshCtx`). The
+accelerator-before-host load order is kept until it is re-measured.
+
 ## 2026-10-20 — One q→0 head prescription; `no_local_fields` is deleted {#one-head}
 
 **Rule (owner).** The head is the folded head, `head_correction = full`: the

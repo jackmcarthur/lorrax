@@ -13,7 +13,6 @@ import importlib
 import jax
 import numpy as np
 import pytest
-from jax import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 jax.config.update("jax_enable_x64", True)
@@ -58,7 +57,7 @@ _LIB = (RuntimeError, ValueError)     # the library: absent here (RuntimeError) 
 #: expectation is ("=", backend) or ("raises", regex).
 #: main 4bae15f55's ONE_DEVICE_MAX_N rows: the bound its round rule planned with.
 # ---- the size route returns the right numbers --------------------------------------------------
-def test_one_device_numerics_eigh_lu_and_slate_rows(mesh, monkeypatch):
+def test_one_device_numerics_eigh_lu(mesh, monkeypatch):
     # eigh: whole matrices per rank, in rounds (8: one matrix per rank per round), face layout out
     a = _hermitian(5, 8)                              # ragged against P = 4
     for max_n in (8, 64):
@@ -98,19 +97,3 @@ def test_one_device_numerics_eigh_lu_and_slate_rows(mesh, monkeypatch):
     assert lu.backend == "one_device"
     X = lu.batched(_face(mesh, A5), _face(mesh, B5))
     assert np.allclose(np.asarray(X), np.linalg.solve(A5, B5), atol=1e-11)
-    # SLATE LU relabel on a p x 1 mesh: SLATE writes X's row i at the slot JAX reads as global row
-    # r*(n/p) + c*nb + t, where i = (c*p + r)*nb + t; ``_rows_in_order`` must return X itself.
-    from distrib_la import _slate
-    mesh41 = Mesh(np.array(jax.devices()[:4]).reshape(4, 1), ("x", "y"))
-    p_, n, nb, nq, c = 4, 32, 2, 2, 3
-    X = np.arange(nq * n * c, dtype=np.float64).reshape(nq, n, c)
-    slot = np.empty_like(X)
-    for i in range(n):
-        blk, t = divmod(i, nb)
-        cc, r = divmod(blk, p_)
-        slot[:, r * (n // p_) + cc * nb + t] = X[:, i]
-    spec = P(None, "x", "y")
-    fn = shard_map(lambda x: _slate._rows_in_order(x, n=n, p=p_, q=1, nb=nb), mesh=mesh41,
-                   in_specs=spec, out_specs=spec, check_vma=False)
-    got = jax.jit(fn)(jax.device_put(slot, NamedSharding(mesh41, spec)))
-    assert np.array_equal(np.asarray(got), X)

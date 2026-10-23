@@ -11,8 +11,8 @@ cmake_minimum_required(VERSION 3.22)
 #       (the AMD device leg: the shared device families over the HIP runtime,
 #        phdf5 so far; entry script: config/frontier/build_ffi_rocm.sh)
 #   cmake -S src/ffi/cpp -DLORRAX_FFI_PLATFORM=host ...  -> liblorrax_ffi_host.so
-#       (CUDA-free by construction: phdf5 + ScaLAPACK + FFTW3-ABI FFT + CBLAS GEMM + SLATE
-#        gpu_backend=none; entry scripts: build_host.sh,
+#       (CUDA-free by construction: phdf5 + ScaLAPACK + FFTW3-ABI FFT + CBLAS GEMM;
+#        entry scripts: build_host.sh,
 #        config/frontera/build_ffi_host.sh)
 #
 # The selector is EXPLICIT and refuses when unset (announce-or-refuse): the
@@ -462,50 +462,6 @@ message(STATUS "MPI:  include=${LORRAX_MPI_INCLUDE_DIR} lib=${LORRAX_MPI_LIBRARY
 endif()  # LORRAX_FFI_HAVE_PHDF5
 
 # ----------------------------------------------------------------------------
-#  SLATE — for the ffi.slate subpackage.  Found via find_package(slate)
-#  pointing at the host install (accessible inside the container via
-#  siteFs mount of /global/u2).  Runtime deps (Cray libsci etc.) come from
-#  the stage dir populated by src/ffi/cpp/stage/slate_stage_cray.sh.
-# ----------------------------------------------------------------------------
-if(NOT DEFINED LORRAX_SLATE_INSTALL_DIR AND DEFINED ENV{LORRAX_SLATE_INSTALL_DIR})
-    set(LORRAX_SLATE_INSTALL_DIR "$ENV{LORRAX_SLATE_INSTALL_DIR}" CACHE PATH
-        "SLATE install prefix")
-endif()
-if(NOT DEFINED LORRAX_SLATE_INSTALL_DIR)
-    set(LORRAX_SLATE_INSTALL_DIR "$ENV{HOME}/software/slate/install"
-        CACHE PATH "SLATE install prefix (default: host build under \$HOME/software/slate/install)")
-endif()
-
-# slateConfig.cmake internally find_dependency(blaspp, lapackpp), which
-# live alongside slate in ${LORRAX_SLATE_INSTALL_DIR}.  Point all three
-# at their CMake config dirs so the find chain resolves.
-set(slate_DIR    "${LORRAX_SLATE_INSTALL_DIR}/lib64/cmake/slate")
-set(blaspp_DIR   "${LORRAX_SLATE_INSTALL_DIR}/lib64/cmake/blaspp")
-set(lapackpp_DIR "${LORRAX_SLATE_INSTALL_DIR}/lib64/cmake/lapackpp")
-
-# slateConfig expects MPI::MPI_CXX (from find_package(MPI)).  We deliberately
-# avoid that search above so we can pin to the chosen MPI stack.  Create a
-# stand-in IMPORTED target that points at the same libmpi / mpi.h.
-if(NOT TARGET MPI::MPI_CXX)
-    add_library(MPI::MPI_CXX INTERFACE IMPORTED)
-    set_target_properties(MPI::MPI_CXX PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES "${LORRAX_MPI_INCLUDE_DIR}"
-        INTERFACE_LINK_LIBRARIES      "${LORRAX_MPI_LIBRARY}")
-endif()
-
-find_package(slate CONFIG)
-if(slate_FOUND)
-    message(STATUS "SLATE: found via ${LORRAX_SLATE_INSTALL_DIR}")
-    set(LORRAX_HAVE_SLATE 1)
-else()
-    message(STATUS
-        "SLATE: not found at ${LORRAX_SLATE_INSTALL_DIR} — ffi.slate targets "
-        "will be skipped.  Build SLATE (see sources/SLATE) or set "
-        "-DLORRAX_SLATE_INSTALL_DIR=... to include them.")
-    set(LORRAX_HAVE_SLATE 0)
-endif()
-
-# ----------------------------------------------------------------------------
 # Build lorrax_ffi.so
 # ----------------------------------------------------------------------------
 set(LORRAX_FFI_SOURCES
@@ -577,16 +533,6 @@ if(LORRAX_FFI_HAVE_PHDF5)
         phdf5/read_ffi.cc
     )
 endif()
-if(LORRAX_HAVE_SLATE)
-    list(APPEND LORRAX_FFI_SOURCES
-        slate/context.cc
-        slate/eigh_ffi.cc
-        slate/potrf_ffi.cc
-        slate/trsm_ffi.cc
-        slate/batched_potrf_ffi.cc
-        slate/batched_trsm_ffi.cc
-    )
-endif()
 
 # ---------------------------------------------------------------------------
 #  GENERATED CAPABILITY HEADER + BUILD STAMP — the device leg, since 2026-08-08.
@@ -612,11 +558,6 @@ if(LORRAX_FFI_HAVE_CAL)
     set(LORRAX_CFG_CAL 1)
 else()
     set(LORRAX_CFG_CAL 0)
-endif()
-if(LORRAX_HAVE_SLATE)
-    set(LORRAX_CFG_SLATE 1)
-else()
-    set(LORRAX_CFG_SLATE 0)
 endif()
 if(LORRAX_FFI_HAVE_PHDF5)
     set(LORRAX_CFG_PHDF5 1)
@@ -659,11 +600,10 @@ target_link_options(lorrax_ffi PRIVATE "LINKER:--enable-new-dtags")
 #  build's layout came to be read under the other's.
 #
 #  exports_cuda.map localises everything LORRAX itself defines.  READ IT
-#  before widening the pattern: the `local: *` form was tried first and
-#  segfaults five SLATE host cells, because it also unmerges the weak COMDAT
-#  copies of SLATE's template code that the C++ ABI intends the dynamic
-#  linker to merge with libslate.so's.  The file carries the five-arm
-#  measurement.  LINK_DEPENDS so editing the map relinks.
+#  before widening the pattern: the `local: *` form was measured (with a
+#  third-party C++ template library linked, since removed) to unmerge weak
+#  COMDAT copies the C++ ABI intends the dynamic linker to merge.  The file
+#  carries the measurement.  LINK_DEPENDS so editing the map relinks.
 # ----------------------------------------------------------------------------
 target_link_options(lorrax_ffi PRIVATE
     "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports_cuda.map")
@@ -721,9 +661,6 @@ endif()
 if(LORRAX_FFI_HAVE_PHDF5)
     target_link_libraries(lorrax_ffi PRIVATE ${HDF5_LIBRARIES} "${LORRAX_MPI_LIBRARY}")
 endif()
-if(LORRAX_HAVE_SLATE)
-    target_link_libraries(lorrax_ffi PRIVATE slate)
-endif()
 
 # Propagate the switches to the C++ sources (api.cc, cusolvermp/context.cc).
 target_compile_definitions(lorrax_ffi PRIVATE
@@ -761,10 +698,7 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LorraxParallelHdf5.cmake")
 # LANGUAGES CXX ONLY — deliberate, do not add C or Fortran.  Nothing here is
 # Fortran (the ScaLAPACK calls go through MKL's C bindings) and the py312
 # apptainer container this builds in has no gfortran, so enabling Fortran
-# fails the configure outright.  SLATE's OWN CMakeLists declares
-# `LANGUAGES CXX Fortran` while using Fortran nowhere and needs the same
-# one-line patch before it will configure here — see
-# config/frontera/build_ffi_host.sh, step "patch SLATE".
+# fails the configure outright.
 project(lorrax_ffi_host LANGUAGES CXX)
 
 # Same Open MPI C++-bindings guard as the CUDA leg (see the comment there);
@@ -788,7 +722,7 @@ add_compile_definitions(OMPI_SKIP_MPICXX=1)
 # platform="CUDA") with the same jax.ffi target names — the jaxlib
 # cpu-lapack / cuda-cusolver registration split.
 #
-# Three optional component groups, each CUDA-free and each INDEPENDENT of the
+# Two optional component groups, each CUDA-free and each INDEPENDENT of the
 # others (they were not independent before 2026-07-31 — see the "HOST
 # NUMERICAL LIBRARIES" block further down for what that cost):
 #   LORRAX_FFI_HAVE_PHDF5     (ON)  parallel-HDF5 read + write handlers
@@ -796,10 +730,8 @@ add_compile_definitions(OMPI_SKIP_MPICXX=1)
 #   LORRAX_HOST_HAVE_SCALAPACK(ON)  ScaLAPACK distributed eigh + fused LU,
 #                                   plus the CBLAS GEMM and MKL-FFT handlers
 #                                   that ride the same link line
-#   LORRAX_HOST_HAVE_SLATE    (ON)  SLATE gpu_backend=none host handlers
 # Every group downgrades to a "skipped" STATUS line if its dependency is not
-# found, so a phdf5-only host lib still builds on a cluster with neither a
-# SLATE install nor a ScaLAPACK.
+# found, so a phdf5-only host lib still builds on a cluster with no ScaLAPACK.
 #
 
 set(CMAKE_CXX_STANDARD 17)
@@ -807,7 +739,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(LORRAX_FFI_HAVE_PHDF5  "Build the phdf5 host read+write handlers (needs parallel HDF5)" ON)
-option(LORRAX_HOST_HAVE_SLATE "Build the SLATE host handlers (needs a gpu_backend=none SLATE install)" ON)
 
 # ----------------------------------------------------------------------------
 # XLA FFI headers.  They must match the RUNTIME jaxlib (the container's jax,
@@ -847,9 +778,9 @@ endif()
 #  WHAT ITS ABSENCE LOOKS LIKE.       Read this before debugging a link error.
 #  ===========================================================================
 #
-#  Four of the host handler families call a numerical library.  THREE OF THE
-#  FOUR TARGET A PUBLISHED, MULTI-VENDOR API and are therefore not tied to any
-#  one vendor; only SLATE is a single-implementation library.  The table is
+#  Three of the host handler families call a numerical library.  ALL THREE
+#  TARGET A PUBLISHED, MULTI-VENDOR API and are therefore not tied to any
+#  one vendor.  The table is
 #  the map from "symbol the linker could not find" back to "thing that was
 #  not resolved here".
 #
@@ -859,9 +790,7 @@ endif()
 #            (Fortran ABI; the ELEVEN  defines 8 + libmkl_blacs_<mpi>_lp64
 #            symbols listed below,     defines 3 = all eleven, measured),
 #            declared in scalapack/    Cray LibSci (libsci_*_mpi_*), netlib
-#            cpp/blacs_grid.h)         ScaLAPACK, AMD AOCL.  NOT SLATE's
-#                                      libslate_scalapack_api: 6/11, and
-#                                      refused -- see RESOLVE 1/4 below.
+#            cpp/blacs_grid.h)         ScaLAPACK, AMD AOCL.
 #  cblas     CBLAS (cblas_dgemm /      Intel MKL, Cray LibSci, OpenBLAS,
 #            cblas_zgemm; the batched  BLIS, ATLAS.  Only the *_batch entry
 #            entry is an extension)    is vendor-variable, and that is asked
@@ -869,27 +798,16 @@ endif()
 #  fftw      FFTW3 advanced interface  FFTW, cray-fftw, MKL's FFTW3 export,
 #            (fftw_plan_many_dft),     AOCL.  Bound at RUNTIME, never linked
 #            bound by dlsym            (RESOLVE 3/4).
-#  slate     slate:: C++ templates     ICL SLATE ONLY (a C++ library, not an
-#                                      ABI — no second implementation exists)
 #
 #  The target names keep their historical spellings (lorrax_mklblas_*,
 #  lorrax_mklfft_*); nothing at runtime can observe which vendor supplied
 #  ScaLAPACK or CBLAS — src/ffi/common/ffi_loader.py keys only on LORRAX's
 #  own handler symbol names (ScalapackEighHostFfi, ...).
 #
-#  RESOLUTION IS ONE BLOCK, FOUR CONSUMERS.  Before 2026-07-31 the ScaLAPACK,
-#  CBLAS and FFT resolutions were all nested inside `if(slate_FOUND)`, and
-#  the FFT one additionally inside the MKL branch of the ScaLAPACK probe.
-#  Two capabilities were silently lost as a result:
-#    * no SLATE install  ->  ScaLAPACK eigh/LU, GEMM and FFT handlers ALL
-#      dropped, though none of them calls SLATE (proved by compiling
-#      cpp/scalapack/{eigh,solve_lu}_ffi.cc and cpp/{fftw,cblas}/*.cc with
-#      only the XLA-FFI and MPI header paths — they need no SLATE header, and
-#      the resulting objects reference no slate symbol);
-#    * ScaLAPACK given explicitly via -DLORRAX_SCALAPACK_LIBRARIES  ->  the
-#      FFT handlers were not merely skipped, they were never reached, so the
-#      configure log said nothing at all about them.
-#  Both are fixed by resolving first and appending second, below.
+#  RESOLUTION IS ONE BLOCK, THREE CONSUMERS: resolve first, append second,
+#  below, so no capability is nested inside another's probe (before
+#  2026-07-31 the ScaLAPACK, CBLAS and FFT resolutions were nested and two
+#  capabilities were silently lost).
 #
 #  WHAT A MISSING PIECE LOOKS LIKE, AND WHERE TO FIX IT
 #  ----------------------------------------------------
@@ -911,12 +829,6 @@ endif()
 #      -> the CBLAS came from a header-only prefix with no library on the
 #         link line.  cblas_?gemm_batch will NEVER appear here: it is looked
 #         up at runtime and its absence selects the plain-GEMM loop.
-#  unresolved at load: slate::* (mangled _ZN5slate...)
-#      -> libslate.so is not on the load path.  Note this is the ONLY family
-#         whose absence cannot be worked around with another vendor.
-#  configure says "SLATE (host): not found" and you wanted SLATE
-#      -> -DLORRAX_SLATE_HOST_INSTALL_DIR must point at the prefix that
-#         CONTAINS lib64/cmake/slate/slateConfig.cmake.
 #  hangs or aborts inside blacs_gridinit with no error
 #      -> BLACS flavour does not match the MPI actually linked (MKL ships one
 #         BLACS per MPI: mkl_blacs_intelmpi_lp64 vs mkl_blacs_openmpi_lp64).
@@ -947,28 +859,12 @@ set(_mklblas_on       0)
 #  prototypes hand-declared in cpp/scalapack/blacs_grid.h because ScaLAPACK
 #  ships no vendor-neutral C header).
 #
-#  SLATE DOES NOT SUPPLY THEM, AND CANNOT (measured 2026-07-31, job 7883830).
-#  The `slate` target brings in BLAS/LAPACK only, and the reason is NOT the
-#  -DSCALAPACK_LIBRARIES="" this repo's SLATE build passes — as this comment
-#  used to say.  Two independent facts:
-#    * SLATE v2025.05.28's own CMakeLists.txt has the whole `scalapack_api`
-#      block COMMENTED OUT ("# todo: requires ScaLAPACK"), so a CMake install
-#      never contains libslate_scalapack_api regardless of that setting.
-#    * Even when built from the GNUmakefile (or
-#      cpp/stage/slate_build_scalapack_api.sh), that library DEFINES only 6 of
-#      the eleven names below — every compute routine, none of the
-#      grid/descriptor tools, and it CALLS numroc_ / Cblacs_gridinfo itself.
-#      It is an OVERLAY on a real ScaLAPACK, never a provider.  LORRAX
-#      REFUSES it at run time (cpp/scalapack/blacs_grid.h) because its
-#      pXheevd is bug L-2, its shims hard-code MPI_COMM_WORLD, and they
-#      hard-wire info=0.  Refusal: docs/services/distrib_la/backends.md.
 #  Workstream L (2026-07-25) had to hand-inject the link line via
 #  -DCMAKE_SHARED_LINKER_FLAGS on every configure — that gap is closed here.
 #
 #  Resolution order:
 #    1. -DLORRAX_SCALAPACK_LIBRARIES="<link line>" — vendor-agnostic escape
-#       hatch (Cray LibSci, netlib, AOCL, ...; NOT SLATE's overlay — see
-#       above).  A CMake list or a space-separated string; raw `-l`/`-L`
+#       hatch (Cray LibSci, netlib, AOCL, ...).  A CMake list or a space-separated string; raw `-l`/`-L`
 #       flags are fine.
 #    2. MKL, probed under -DLORRAX_MKL_ROOT / $MKLROOT.  This is the Frontera
 #       path (MKL 2020.1 at
@@ -1218,63 +1114,14 @@ else()
 endif()
 
 # ----------------------------------------------------------------------------
-#  RESOLVE 4/4 — SLATE, the gpu_backend=none install (optional; skipped if
-#  absent).  This is the only host dependency with no second implementation:
-#  it is a C++ template library, so there is no ABI another vendor could
-#  supply.  Its absence costs the slate potrf/trsm/batched host handlers and
-#  NOTHING ELSE — the ScaLAPACK, GEMM and FFT handlers above are independent
-#  of it (see the header note).
-#
-#  cpp/slate/context.cc and cpp/slate/ctx.h are NOT SLATE code despite the
-#  directory: they are LORRAX's own MPI mesh context (a rank-remapped
-#  MPI_Comm plus the host-collective mutex) in namespace lorrax_ffi::slate,
-#  and they include only <mpi.h>.  The ScaLAPACK handlers use that context,
-#  which is why context.cc is compiled whenever EITHER family is on.
-# ----------------------------------------------------------------------------
-if(LORRAX_HOST_HAVE_SLATE)
-    if(NOT DEFINED LORRAX_SLATE_HOST_INSTALL_DIR AND DEFINED ENV{LORRAX_SLATE_HOST_INSTALL_DIR})
-        set(LORRAX_SLATE_HOST_INSTALL_DIR "$ENV{LORRAX_SLATE_HOST_INSTALL_DIR}" CACHE PATH
-            "SLATE gpu_backend=none install prefix")
-    endif()
-    if(NOT DEFINED LORRAX_SLATE_HOST_INSTALL_DIR)
-        set(LORRAX_SLATE_HOST_INSTALL_DIR "$ENV{HOME}/software/slate_builds/cpu/install"
-            CACHE PATH "SLATE gpu_backend=none install prefix")
-    endif()
-    set(slate_DIR    "${LORRAX_SLATE_HOST_INSTALL_DIR}/lib64/cmake/slate")
-    set(blaspp_DIR   "${LORRAX_SLATE_HOST_INSTALL_DIR}/lib64/cmake/blaspp")
-    set(lapackpp_DIR "${LORRAX_SLATE_HOST_INSTALL_DIR}/lib64/cmake/lapackpp")
-    if(NOT TARGET MPI::MPI_CXX)
-        add_library(MPI::MPI_CXX INTERFACE IMPORTED)
-    endif()
-    find_package(slate CONFIG
-        NO_DEFAULT_PATH PATHS "${LORRAX_SLATE_HOST_INSTALL_DIR}/lib64/cmake/slate")
-    if(slate_FOUND)
-        message(STATUS "SLATE (host): found via ${LORRAX_SLATE_HOST_INSTALL_DIR}")
-    else()
-        message(STATUS
-            "SLATE (host): not found at ${LORRAX_SLATE_HOST_INSTALL_DIR} — "
-            "slate potrf/trsm/batched host handlers skipped.  The "
-            "ScaLAPACK, GEMM and FFT host handlers do NOT depend on SLATE "
-            "and are unaffected.")
-    endif()
-endif()
-
-# ----------------------------------------------------------------------------
 #  APPEND — sources, link libraries and library search paths, in a FIXED
 #  order.  Keep this order: it is what makes the emitted link line for the
 #  full 11-target Frontera build byte-identical to the pre-2026-07-31 one,
 #  which is how this restructure was checked without a compute node.
 # ----------------------------------------------------------------------------
-# LORRAX's MPI mesh context — needed by the slate AND the scalapack handlers.
-if(slate_FOUND OR _scalapack_on)
-    list(APPEND LORRAX_FFI_HOST_SOURCES slate/context.cc)
-endif()
-if(slate_FOUND)
-    list(APPEND LORRAX_FFI_HOST_SOURCES slate/host_ffi.cc)
-    list(APPEND _host_link_libs slate)
-endif()
 if(_scalapack_on)
     list(APPEND LORRAX_FFI_HOST_SOURCES
+        mesh/context.cc                 # LORRAX's MPI mesh context (cpp/mesh/)
         scalapack/solve_lu_ffi.cc
         scalapack/getrf_getrs_ffi.cc
         scalapack/eigh_ffi.cc)
@@ -1339,7 +1186,7 @@ list(APPEND LORRAX_FFI_HOST_SOURCES common/build_config.cc common/ctx_registry.c
 
 if(NOT LORRAX_FFI_HOST_SOURCES)
     message(FATAL_ERROR
-        "No host FFI components selected/found (phdf5 off and SLATE absent). "
+        "No host FFI components selected/found (phdf5 off and no ScaLAPACK). "
         "Nothing to build.")
 endif()
 
@@ -1370,11 +1217,6 @@ if(_mklblas_on)
     set(LORRAX_CFG_GEMM 1)
 else()
     set(LORRAX_CFG_GEMM 0)
-endif()
-if(slate_FOUND)
-    set(LORRAX_CFG_SLATE 1)
-else()
-    set(LORRAX_CFG_SLATE 0)
 endif()
 if(LORRAX_FFI_HAVE_PHDF5)
     set(LORRAX_CFG_PHDF5 1)
@@ -1487,8 +1329,8 @@ elseif(LORRAX_FFI_PLATFORM STREQUAL "rocm")
 #
 # Families, one per port (each gated against XLA on the same device, as its
 # CUDA twin is):  phdf5;  kdft (the k-leading direct-DFT convolution and
-# transform, modes 2/3, and the k-minor pair, modes 4/5, run-time compiled);  slate (distributed
-# eigh / potrf / trsm and their batched forms over a gpu_backend=hip SLATE);
+# transform, modes 2/3, and the k-minor pair, modes 4/5, run-time compiled);  elpa (the distributed
+# eigh, over the MPI mesh context cpp/mesh/);
 # rocsolver (the batched local Hermitian eigh, one rocsolver_{z,d}{heevd,syevd}_strided_batched
 # call per stack, and the one-device LU solve on a 2^31-byte-span-blocked rocBLAS trsm/gemm path
 # (rocsolver/lu_solve_ffi.cc: rocBLAS trsm's in-place path is wrong past that span), both
@@ -1638,51 +1480,9 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 
 # Capability header: the shared template; only phdf5 is a claim on this leg.
 set(LORRAX_CFG_PHDF5 1)
-foreach(_k CUSOLVERMP CUBLASMP CUFFT CAL SLATE FFTW3 SCALAPACK GEMM)
+foreach(_k CUSOLVERMP CUBLASMP CUFFT CAL FFTW3 SCALAPACK GEMM)
     set(LORRAX_CFG_${_k} 0)
 endforeach()
-# ---- SLATE (gpu_backend=hip): the slate/ family on this leg ----------------
-# The SAME slate/*.cc as the CUDA leg (leg-neutral through gpu_runtime.h),
-# against a SLATE built by config/frontier/build_slate_hip.sh.  The install
-# must be a HIP build: a gpu_backend=none SLATE links and loads, and then
-# every handler refuses with blas::get_device_count()=0 (the CUDA leg's
-# SONAME-race signature, ffi_loader.py).  So the configure refuses it here.
-option(LORRAX_ROCM_HAVE_SLATE
-    "Build the SLATE device handlers (needs a gpu_backend=hip SLATE install)" ON)
-if(LORRAX_ROCM_HAVE_SLATE)
-    if(NOT DEFINED LORRAX_SLATE_ROCM_INSTALL_DIR AND DEFINED ENV{LORRAX_SLATE_ROCM_INSTALL_DIR})
-        set(LORRAX_SLATE_ROCM_INSTALL_DIR "$ENV{LORRAX_SLATE_ROCM_INSTALL_DIR}" CACHE PATH
-            "gpu_backend=hip SLATE install prefix")
-    endif()
-    if(NOT DEFINED LORRAX_SLATE_ROCM_INSTALL_DIR)
-        set(LORRAX_SLATE_ROCM_INSTALL_DIR "$ENV{HOME}/software/slate_builds/hip/install"
-            CACHE PATH "gpu_backend=hip SLATE install prefix (config/frontier/build_slate_hip.sh)")
-    endif()
-    set(slate_DIR    "${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64/cmake/slate")
-    set(blaspp_DIR   "${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64/cmake/blaspp")
-    set(lapackpp_DIR "${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64/cmake/lapackpp")
-    if(NOT TARGET MPI::MPI_CXX)    # slateConfig wants it; pin it to the leg's MPI
-        add_library(MPI::MPI_CXX INTERFACE IMPORTED)
-        set_target_properties(MPI::MPI_CXX PROPERTIES
-            INTERFACE_INCLUDE_DIRECTORIES "${LORRAX_MPI_INCLUDE_DIR}"
-            INTERFACE_LINK_LIBRARIES      "${LORRAX_MPI_LIBRARY}")
-    endif()
-    find_package(slate CONFIG NO_DEFAULT_PATH PATHS "${slate_DIR}")
-    if(NOT slate_FOUND)
-        message(FATAL_ERROR
-            "GATE rocm-slate: no SLATE at ${LORRAX_SLATE_ROCM_INSTALL_DIR}; want a "
-            "gpu_backend=hip install; fix: bash config/frontier/build_slate_hip.sh, "
-            "-DLORRAX_SLATE_ROCM_INSTALL_DIR=<prefix>, or -DLORRAX_ROCM_HAVE_SLATE=OFF")
-    endif()
-    if(NOT slate_use_hip)
-        message(FATAL_ERROR
-            "GATE rocm-slate: ${LORRAX_SLATE_ROCM_INSTALL_DIR} is a SLATE without HIP "
-            "(slate_use_hip=${slate_use_hip}); its handlers would refuse with "
-            "get_device_count()=0; fix: point at the build_slate_hip.sh install")
-    endif()
-    message(STATUS "SLATE (hip): ${LORRAX_SLATE_ROCM_INSTALL_DIR}")
-    set(LORRAX_CFG_SLATE 1)
-endif()
 set(LORRAX_CFG_MATH_LINK "")
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/common/lorrax_config.h.in"
                "${CMAKE_CURRENT_BINARY_DIR}/lorrax_config.h" @ONLY)
@@ -1695,11 +1495,8 @@ set_target_properties(lorrax_ffi_rocm PROPERTIES
     BUILD_WITH_INSTALL_RPATH ON
     INSTALL_RPATH "$ORIGIN"            # the same $ORIGIN-only RUNPATH as the other legs
 )
-# DT_RUNPATH, except where the leg binds a SLATE: DT_RPATH (SLATE section below).
-# Not both: the Cray wrapper reorders -Wl options, so --enable-new-dtags wins.
-if(NOT LORRAX_ROCM_HAVE_SLATE)
-    target_link_options(lorrax_ffi_rocm PRIVATE "LINKER:--enable-new-dtags")
-endif()
+# DT_RUNPATH, as on the other legs.
+target_link_options(lorrax_ffi_rocm PRIVATE "LINKER:--enable-new-dtags")
 target_include_directories(lorrax_ffi_rocm SYSTEM PRIVATE
     "${LORRAX_XLA_FFI_INCLUDE_DIR}"
     "${HDF5_INCLUDE_DIRS}"
@@ -1724,43 +1521,15 @@ message(STATUS "lorrax_ffi_rocm will build sources:")
 foreach(_s ${LORRAX_FFI_ROCM_SOURCES})
     message(STATUS "  ${_s}")
 endforeach()
-if(LORRAX_ROCM_HAVE_SLATE)
-    target_sources(lorrax_ffi_rocm PRIVATE
-        slate/context.cc slate/eigh_ffi.cc slate/potrf_ffi.cc slate/trsm_ffi.cc
-        slate/batched_potrf_ffi.cc slate/batched_trsm_ffi.cc
-        slate/batched_solve_lu_ffi.cc)    # LU: this leg only (CUDA's is cusolvermp)
-    target_link_libraries(lorrax_ffi_rocm PRIVATE slate)
-    # THE LEG BINDS ITS OWN SLATE.  libslate/libblaspp/liblapackpp share their
-    # SONAMEs with the gpu_backend=none install the host leg uses, and
-    # config/frontier/ffi_env.sh puts THAT install on LD_LIBRARY_PATH, which
-    # ld.so searches before any DT_RUNPATH.  With the $ORIGIN-only RUNPATH the
-    # other legs carry, this leg would therefore map the device-less SLATE and
-    # every handler would refuse (get_device_count()=0).  DT_RPATH is searched
-    # BEFORE LD_LIBRARY_PATH, so the leg carries the HIP install as an RPATH
-    # entry after $ORIGIN.  That directory holds only the three SLATE
-    # libraries, so it can shadow nothing else.  In a process that opens both
-    # legs the accelerator-first rule (lxkit.legs) opens this one first, and
-    # the HIP SLATE then serves the host leg too, as the CUDA SLATE does on
-    # Perlmutter.  verify_ffi_build.sh GATE 3c checks the resolution.
-    set_target_properties(lorrax_ffi_rocm PROPERTIES
-        INSTALL_RPATH "$ORIGIN;${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64")
-    target_link_options(lorrax_ffi_rocm PRIVATE "LINKER:--disable-new-dtags")
-    message(STATUS "  slate/{context,eigh,potrf,trsm,batched_potrf,batched_trsm}")
-endif()
 # ---- ELPA (AMD GPU kernels): the elpa/ family on this leg ------------------
 # ELPA 2026.02.001 built by config/frontier/build_elpa_hip.sh into its
 # content-keyed prefix (OpenMP, the LORRAX device-allocator patch, ScaLAPACK
-# static and hidden inside libelpa).  The handler shares the SLATE family's
-# per-mesh MPI context (as ScaLAPACK does), so it needs LORRAX_ROCM_HAVE_SLATE.
-# The prefix joins the RPATH AFTER SLATE's: the leg's libopenblas.so.0 stays
-# SLATE's copy (the closure writer and ld.so both resolve a SONAME once).
+# static and hidden inside libelpa).  The handler runs on LORRAX's per-mesh MPI
+# context (cpp/mesh/, as ScaLAPACK does), compiled here with it.  libelpa
+# resolves its OpenBLAS (the prefix's copy) through its own RUNPATH.
 option(LORRAX_ROCM_HAVE_ELPA
     "Build the ELPA eigh handler (needs config/frontier/build_elpa_hip.sh's prefix)" ON)
 if(LORRAX_ROCM_HAVE_ELPA)
-    if(NOT LORRAX_ROCM_HAVE_SLATE)
-        message(FATAL_ERROR "GATE rocm-elpa: the ELPA handler uses the SLATE family's mesh "
-            "context; fix: -DLORRAX_ROCM_HAVE_SLATE=ON or -DLORRAX_ROCM_HAVE_ELPA=OFF")
-    endif()
     if(NOT DEFINED LORRAX_ELPA_ROCM_DIR AND DEFINED ENV{LORRAX_ELPA_ROCM_DIR})
         set(LORRAX_ELPA_ROCM_DIR "$ENV{LORRAX_ELPA_ROCM_DIR}")
     endif()
@@ -1775,14 +1544,14 @@ if(LORRAX_ROCM_HAVE_ELPA)
     unset(LORRAX_ELPA_LIBRARY CACHE)
     find_library(LORRAX_ELPA_LIBRARY NAMES elpa_openmp elpa
                  PATHS "${LORRAX_ELPA_ROCM_DIR}/lib" NO_DEFAULT_PATH NO_CACHE REQUIRED)
-    target_sources(lorrax_ffi_rocm PRIVATE elpa/eigh_ffi.cc)
+    target_sources(lorrax_ffi_rocm PRIVATE mesh/context.cc elpa/eigh_ffi.cc)
     target_include_directories(lorrax_ffi_rocm SYSTEM PRIVATE ${_elpa_inc})
     target_link_libraries(lorrax_ffi_rocm PRIVATE "${LORRAX_ELPA_LIBRARY}")
     get_target_property(_rp lorrax_ffi_rocm INSTALL_RPATH)
     set_target_properties(lorrax_ffi_rocm PROPERTIES
         INSTALL_RPATH "${_rp};${LORRAX_ELPA_ROCM_DIR}/lib")
     message(STATUS "ELPA (hip): ${LORRAX_ELPA_ROCM_DIR} (${LORRAX_ELPA_LIBRARY})")
-    message(STATUS "  elpa/eigh")
+    message(STATUS "  mesh/context, elpa/eigh")
 endif()
 else()
     message(FATAL_ERROR

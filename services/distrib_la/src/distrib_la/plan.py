@@ -539,7 +539,7 @@ def _eigh_columns(backend: str, lam, Q):
 
     ``A @ Q == Q @ diag(lam)``.  cuSOLVERMp's wrapper returns the raw
     device buffer, whose documented layout is the conjugate transpose of
-    that; SLATE and ScaLAPACK already return columns.  This is the ONE
+    that; ELPA and ScaLAPACK already return columns.  This is the ONE
     place the difference is known — it used to live inside ``dispatch_eigh``
     only, so anything reaching a backend module directly had to remember it
     independently, and the serial dispatch path silently returned ROWS on
@@ -586,30 +586,15 @@ def _gathered_eigh(A, *, mesh):
 #:   one         attribute implementing the SINGLE-tile form, or None
 #:   many        attribute implementing the STACKED form, or None
 #:   post        result normaliser, applied to both forms
-#:   one_handle  ``one`` returns a library HANDLE rather than arrays
-#:               (absent means it returns arrays)
 #:
 #: A missing ``many`` is filled in by scanning ``one`` — that is what
 #: :meth:`Plan.batched` IS.  A missing ``one`` means the library only ever
 #: factors a whole stack (one descriptor, one workspace), so there is no
 #: single-tile call to scan and the stacked entry is the only route.
 #:
-#: ``cholesky`` is asymmetric on purpose: cuSOLVERMp's batched potrf returns
-#: a HANDLE object carrying the block-cyclic geometry, while SLATE's
-#: per-tile potrf returns a ``SlateLowerL`` handle of its own.  The plan
-#: does not flatten that difference away — :func:`distrib_la.factor` is
-#: where it is handled — it just stops every caller from re-deriving which
-#: is which.
-#:
-#: ``one_handle`` is DECLARED and not discovered, and the difference is the
-#: point.  The old loop-and-stack path found out by calling ``one`` once and
-#: looking at what came back; a scan cannot, because a handle is not a
-#: pytree and the failure would arrive from inside ``lax.scan`` as a type
-#: error naming neither the op nor the backend.  Declaring it lets
-#: :meth:`Plan.batched` refuse BEFORE it runs anything, with the sentence
-#: that says what to call instead.  ``tests/test_distrib_la_shape_algebra``
-#: cross-checks the flag against each wrapper's own return annotation, so
-#: the declaration cannot quietly disagree with the code.
+#: ``cholesky``'s one library entry (cuSOLVERMp's batched potrf) returns a HANDLE
+#: object carrying the block-cyclic geometry; :func:`distrib_la.factor` is where
+#: it is handled.
 #: The agreed size-route costs of a ``distributed`` plan resolved to ``one_device``, one per
 #: room-free call signature (:func:`_measured_rounds`' on-disk key; None where no library
 #: resolves).  The room is applied per call: a new room is arithmetic, with no exchange, no
@@ -1000,8 +985,6 @@ def _measured_rounds(p, A, args, single: bool = False):
 _IMPL: dict[tuple[str, str], dict[str, Any]] = {
     ("eigh", "cusolvermp"):     dict(one="distributed_eigh",
                                      many=None, post=_eigh_columns),
-    ("eigh", "slate"):          dict(one="distributed_eigh",
-                                     many=None, post=_eigh_columns),
     ("eigh", "elpa"):           dict(one="distributed_eigh",
                                      many=None, post=_eigh_columns),
     ("eigh", "scalapack"):      dict(one="distributed_eigh",
@@ -1010,16 +993,10 @@ _IMPL: dict[tuple[str, str], dict[str, Any]] = {
     ("cholesky", "cusolvermp"): dict(one=None,
                                      many="batched_distributed_cholesky",
                                      post=None),
-    ("cholesky", "slate"):      dict(one="distributed_cholesky",
-                                     many=None, post=None,
-                                     one_handle=True),
     ("solve_lu", "cusolvermp"): dict(one=None,
                                      many="batched_distributed_solve_lu",
                                      post=None),
     ("solve_lu", "scalapack"):  dict(one=None,
-                                     many="batched_distributed_solve_lu",
-                                     post=None),
-    ("solve_lu", "slate"):      dict(one=None,
                                      many="batched_distributed_solve_lu",
                                      post=None),
     # one_device (the size route of ``distributed``): pure JAX with the FFI
@@ -1913,7 +1890,6 @@ class Plan:
         decoration: see :data:`_SCAN_CACHE` for the measurement that says
         an uncached eager scan is slower than the Python loop it replaces.
         """
-        spec = _IMPL[(self.op, self.backend)]
         one, post = self._entry("one")
         if one is None:
             raise NotImplementedError(
@@ -1921,13 +1897,6 @@ class Plan:
                 f"FFI entry point nor a single-tile one to scan, which "
                 f"should be unreachable: every row of the impl table has at "
                 f"least one of them.")
-        if spec.get("one_handle"):
-            raise NotImplementedError(
-                f"{self.op} backend {self.backend!r} has no batched entry "
-                f"point and its single-tile entry returns a library HANDLE "
-                f"rather than an array, so there is no stack for a scan to "
-                f"build.  Use distrib_la.factor()/solve(), which carries "
-                f"the handle in an opaque token instead of flattening it.")
 
         mesh, backend, tile = self.mesh, self.backend, self.in_sharding
 
@@ -2066,7 +2035,7 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
             and _size_routed_library(op, backend, mesh_xy, n, resolved)):
         # Route (c) solves each matrix WHOLE on one device: exactly what the size
         # route just ruled out for this n.  Left as the default it ran a 20480
-        # complex LU on one GCD of a plan that reports slate (MI250X P4,
+        # complex LU on one GCD of a plan that reports the leg library (MI250X P4,
         # dlascale probe1); the leg library's own route runs instead.  An
         # explicit batched_route is honoured as named.
         batched_route = "auto"

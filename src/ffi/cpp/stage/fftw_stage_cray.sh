@@ -19,7 +19,7 @@
 # 2026-08-06, in-container on a compute node under
 # `nvcr.io/nvidia/jax:25.04-py3`:
 #
-#   * `find /usr /usr/local /opt /lib /lib64 /lorrax_slate /lorrax_phdf5
+#   * `find /usr /usr/local /opt /lib /lib64 /lorrax_cray /lorrax_phdf5
 #      /lorrax_nvhpc -name 'libfftw3*'`            -> EMPTY.
 #   * every ladder candidate (libfftw3.so.3, libfftw3.so.mpi31.3,
 #     libmkl_rt.so, libfftw3.so) -> "cannot open shared object file".
@@ -27,7 +27,7 @@
 #     RPATH (which is what makes the BARE-HOST leg work) resolves nothing.
 #
 # So the container ships no FFTW3 and one must be staged in, the same way
-# /lorrax_phdf5, /lorrax_slate and /lorrax_nvhpc already are.  Shifter at
+# /lorrax_phdf5, /lorrax_cray and /lorrax_nvhpc already are.  Shifter at
 # NERSC refuses --volume from /opt/ system paths, so bind-mounting
 # /opt/cray/pe/fftw directly is NOT available; $HOME/software IS a valid
 # siteFs --volume source, which is why every other stage lives there.

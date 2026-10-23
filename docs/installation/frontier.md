@@ -16,8 +16,8 @@ pins live in `config/frontier/`.
 | `rocm/7.14.1` (compile only: the same release as the venv's wheels) | `config/frontier/build_ffi_rocm.sh` |
 
 The JAX ROCm plugin maps its HIP runtime, rocBLAS, rocSOLVER, hipBLASLt,
-RCCL and rocFFT from the venv's `rocm-sdk` wheels. The ROCm leg and the HIP
-SLATE are compiled against module `rocm/7.14.1`, the same release with the
+RCCL and rocFFT from the venv's `rocm-sdk` wheels. The ROCm leg and ELPA
+are compiled against module `rocm/7.14.1`, the same release with the
 same SONAMEs, and at run time they bind the wheel copies. So a process maps
 one ROCm stack.
 
@@ -26,15 +26,15 @@ one ROCm stack.
 Run once per clone, in order:
 
 ```bash
-bash config/frontier/build_openblas_seq.sh   # the sequential OpenBLAS the HIP SLATE links
-bash config/frontier/build_slate_hip.sh      # SLATE, gpu_backend=hip
-bash config/frontier/build_slate_cpu.sh      # SLATE, gpu_backend=none
+bash config/frontier/build_openblas_seq.sh   # the sequential, locking OpenBLAS ELPA links
 bash config/frontier/build_ffi_host.sh       # src/ffi/cpp/build_host/liblorrax_ffi_host.so
 bash config/frontier/build_ffi_rocm.sh       # src/ffi/cpp/build_rocm/liblorrax_ffi_rocm.so
 ```
 
-The SLATE and OpenBLAS builds install under `$HOME/software/slate_builds` and
-are shared by every clone. Rebuild both legs after a pull that changes
+OpenBLAS installs under `$HOME/software/openblas_seq/install`
+(`LORRAX_OPENBLAS_ROOT`) and ELPA under `$HOME/software/elpa_builds`
+(`build_ffi_rocm.sh` builds it when its prefix is incomplete); both are shared
+by every clone. Rebuild both legs after a pull that changes
 `src/ffi/cpp/` or `config/frontier/`.
 
 **The build records, and every run enforces, each leg's dependency closure**
@@ -43,16 +43,15 @@ are shared by every clone. Rebuild both legs after a pull that changes
 `PROVENANCE`. The record names every library the leg maps:
 
 - **ROCm leg:** the venv's `rocm-sdk` HIP runtime, rocBLAS and rocSOLVER (and
-  their dependencies); the HIP SLATE, BLAS++, LAPACK++ and OpenBLAS from its
-  RPATH; the pinned MPI and HDF5.
-- **Host leg:** the CPU SLATE stack and the pinned MPI, HDF5 and LibSci.
+  their dependencies); ELPA and OpenBLAS from its RUNPATH; the pinned MPI
+  and HDF5.
+- **Host leg:** the pinned MPI, HDF5 and LibSci.
 
 At start-up the loader opens exactly those files, then refuses the process if
 any other copy of one of them is mapped. A module ROCm library on
 `LD_LIBRARY_PATH`, an `LD_PRELOAD`, or a site LibSci that maps another
-cray-mpich cannot replace a recorded file. In a GPU process the ROCm leg opens
-first and its HIP SLATE stack answers for the host leg as well; that is the
-only place two records may disagree. A refusal reads
+cray-mpich cannot replace a recorded file, and the two legs' records may not
+disagree. A refusal reads
 
 ```text
 GATE native-closure: got <wrong file>; want <recorded file>; fix: <remedy>
@@ -61,7 +60,7 @@ GATE native-closure: got <wrong file>; want <recorded file>; fix: <remedy>
 The remedy is to remove what maps the other copy, or to rebuild the leg in the
 environment you run in. Setting `LD_LIBRARY_PATH` neither causes nor fixes it.
 A record goes stale when a recorded file changes, for example when the venv's
-`rocm-sdk` wheels are reinstalled or a SLATE install is rebuilt. The next run
+`rocm-sdk` wheels are reinstalled or OpenBLAS or ELPA is rebuilt. The next run
 then refuses until the legs are rebuilt.
 
 ## 3. Run {#run}

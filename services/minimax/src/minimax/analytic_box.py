@@ -336,9 +336,34 @@ def _sector_rule(box, eps, rung, relative):
 def analytic_box_rule(box, eps, *, mass_cap=83.0, relative=None):
     """Derived rule for ``1/d`` on ``box``; see the module docstring.
 
-    Returns the first rung whose boundary certificate passes (sup <= eps and
-    term mass <= ``mass_cap`` in the box's currency), or the last rung built,
-    uncertified, which the planner refuses.
+    Parameters
+    ----------
+    box
+        ``(re_lo, re_hi, im_lo, im_hi)`` in one energy unit (Sigma passes Ry),
+        with ``0 < im_lo <= im_hi``.  For a Sigma window ``d = omega - (E +
+        Omega) + i(eta + gamma)``: the real extent comes from the window's
+        frequency, state and pole corners; ``im_lo`` is the broadening ``eta``
+        plus the smallest pole damping.  A box whose real interval contains 0
+        is a crossing (near-resonance) box; otherwise it is sign-definite.
+    eps
+        Target error in the box's currency: peak-relative
+        ``im_lo |Q(d) - 1/d|`` on a crossing box, relative ``|d| |Q(d) - 1/d|``
+        on a sign-definite one.
+    mass_cap
+        Bound on the term mass ``rho sum_k |w_k exp(i t_k d)|`` in the same
+        currency (the executor's round-off amplification).
+    relative
+        Override the currency; ``None`` picks relative exactly when the box is
+        sign-definite.
+
+    Returns
+    -------
+    UniformRule
+        ``times`` (complex, inverse energy unit) and ``weights`` with
+        ``1/d ~= sum_k weights_k exp(i times_k d)``: the first rung whose
+        boundary certificate passes (sup <= eps and term mass <= ``mass_cap``),
+        or the last rung built, uncertified (``sup_error > eps``), which the
+        caller must refuse.
     """
     re_lo, re_hi, im_lo, im_hi = map(float, box)
     if not (np.isfinite([re_lo, re_hi, im_lo, im_hi]).all() and re_lo <= re_hi

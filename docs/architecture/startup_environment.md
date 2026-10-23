@@ -97,8 +97,8 @@ not in the repo). Use the same pattern for a new site:
    **and whose closure record still verifies on this machine**
    (`python -m lxkit.closure verify <leg.so>`, exit 0): its own build
    first, then any sibling worktree. The key covers the sources; the record
-   covers the libraries (SLATE, OpenBLAS, the ROCm or CUDA wheels, MPI, HDF5,
-   LibSci, by content hash). A rebuilt SLATE install or a changed wheel
+   covers the libraries (ELPA, OpenBLAS, the ROCm or CUDA wheels, MPI, HDF5,
+   LibSci, by content hash). A rebuilt ELPA install or a changed wheel
    therefore fails the match and forces a rebuild, rather than being reused.
    The loader would refuse such a build at start-up anyway. Optionally build what is missing,
    under a per-worktree `flock`. **Keep locks and logs outside the worktree**,

@@ -5,7 +5,7 @@ Every case goes through the public API (``distrib_la.plan``), never a backend mo
     eigh      plan('eigh', mesh, backend='distributed', n=n, batched_route='auto')(A)
     solve_lu  plan('solve_lu', mesh, backend='distributed', n=n, batched_route='auto').batched(A, B)
     cholesky  plan('cholesky', mesh, backend=<leg library>, n=n, batched_route='auto')   (no
-              'distributed' spelling for cholesky: slate on ROCM, cusolvermp on CUDA)
+              'distributed' spelling for cholesky: cusolvermp on CUDA; ROCM has none)
 
 and REFUSES to time a case whose plan did not resolve the leg's distributed library (no
 one_device, no native, no host): the resolved backend, the plan's describe() line and the
@@ -200,15 +200,6 @@ def layout(op, backend, n, px, py, dtype="complex128"):
     """(nb, grid, note) the backend runs this op at (bench-only read of private layout fns)."""
     grid = f"{px}x{py}"
     try:
-        if backend == "slate":
-            from distrib_la import _slate as S
-            if op == "eigh":
-                side, nb = S.eigh_layout(n, px)
-                return nb, grid, f"heev side {side}, two-stage (he2hb devices, hb2st rank-0 host)"
-            if op == "solve_lu":
-                return S.lu_layout(n, px, py), grid, "getrf PartialPiv + getrs, Target::Devices"
-            if op == "cholesky":
-                return n // max(px, py), grid, "potrf one tile per rank (fromDevices, in place)"
         if backend == "elpa" and op == "eigh":
             from distrib_la import _elpa as E
             side, nb = E.eigh_layout(n, px, dtype)
@@ -231,7 +222,7 @@ def leg_library(op, mesh):
     from distrib_la import resolve as _r
     plat = _r.mesh_platform(mesh)
     if op == "cholesky":
-        return {"ROCM": "slate", "CUDA": "cusolvermp"}.get(plat), plat
+        return {"CUDA": "cusolvermp"}.get(plat), plat
     return _r._DISTRIBUTED_DEFAULT.get((op, plat)), plat
 
 
@@ -249,7 +240,7 @@ def make_plan(op, mesh, n, force_library=False):
 
 def lower_of(handle):
     if hasattr(handle, "to_jax_lower"):
-        return handle.to_jax_lower()                             # SlateLowerL: (n, n) P('x','y')
+        return handle.to_jax_lower()                             # a lower-factor handle: (n, n) P('x','y')
     from distrib_la._cusolvermp import cholesky_handle_to_natural_L
     return cholesky_handle_to_natural_L(handle)[0]               # (1, n, n) -> (n, n)
 
@@ -320,7 +311,7 @@ def run_case(op, n, dname, mesh, args, nrhs=None):
             kw = {}
             if args.eigh_nb is not None:
                 # Plan(A, **kw) forwards keywords to the backend's entry
-                # (distrib_la._slate.distributed_eigh(block_size=...)).
+                # (e.g. distrib_la._elpa.distributed_eigh(block_size=...)).
                 kw["block_size"] = args.eigh_nb
                 row["nb"] = args.eigh_nb
             if kw:
@@ -496,7 +487,7 @@ def main():
                          "eigh:*:30720) -- one process can then cover a grid minus the cases a "
                          "baseline aborts on")
     ap.add_argument("--nrhs", nargs="+", default=["min", "64", "n"],
-                    help="'min' = the mesh's q (SLATE/cuSOLVERMp need q | nrhs), an int, or 'n'")
+                    help="'min' = the mesh's q (cuSOLVERMp needs q | nrhs), an int, or 'n'")
     ap.add_argument("--steady-max", type=float, default=120.0)
     ap.add_argument("--case-timeout", type=float, default=2400.0)
     ap.add_argument("--sample-s", type=float, default=0.25)

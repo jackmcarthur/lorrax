@@ -90,7 +90,7 @@ lifetime documented.
 
 ## 6. Broken promise: approval at resolve, failure at call
 
-A resolver approved a SLATE Cholesky on a mesh the call rejected; a tier
+A resolver approved a (since removed) SLATE Cholesky on a mesh the call rejected; a tier
 approved `distributed` while its body hard-coded ScaLAPACK; `pzheevd` returned
 `INFO = 0` with garbage eigenvectors on short workspace. **A capability or
 geometry check tests exactly what will execute: a returned backend name is a

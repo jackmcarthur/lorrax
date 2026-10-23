@@ -427,7 +427,7 @@ The design, every native target and the build: [the FFI layer](architecture/ffi_
 | `contour.py` | The contour accumulator, $A[o,q,m,n] \mathrel{+}= p[o]\,c[q,m,n]$. |
 | `io.py` | Parallel-HDF5 (MPI-IO) transport, behind SlabIO. |
 | `common/` | Locating, loading and registering the shared libraries (`ffi_loader`); dtype helpers; a byte-exact broadcast through the JAX distributed store. |
-| `cpp/` | The C++ sources by target (`cufft`, `fftw`, `cublas`, `cblas`, `cusolvermp`, `scalapack`, `slate`, `phdf5`, `active_subspace`), the build scripts, the build gates, and `stage/seal_bundle.py`, which seals a two-library bundle. |
+| `cpp/` | The C++ sources by target (`cufft`, `fftw`, `cublas`, `cblas`, `cusolvermp`, `scalapack`, `elpa`, `mesh`, `phdf5`, `active_subspace`), the build scripts, the build gates, and `stage/seal_bundle.py`, which seals a two-library bundle. |
 | `phdf5/` | `ARCHITECTURE.md` of the parallel-HDF5 backend. |
 
 ## `services/`
@@ -438,7 +438,7 @@ caller contracts ([substrate services](architecture/services.md)).
 
 | service | level | owns | extras |
 |---|---|---|---|
-| `distrib_la` | L3 | distributed dense linear algebra on the `('x','y')` mesh: plans, GEMM and SUMMA panels, eigh, Cholesky, LU, polar factor, with cuSOLVERMp/cuBLASMp, SLATE, ScaLAPACK and pure-JAX backends ([contract](services/distrib_la/api.md)) | `bench/` |
+| `distrib_la` | L3 | distributed dense linear algebra on the `('x','y')` mesh: plans, GEMM and SUMMA panels, eigh, Cholesky, LU, polar factor, with cuSOLVERMp/cuBLASMp, ScaLAPACK, ELPA and pure-JAX backends ([contract](services/distrib_la/api.md)) | `bench/` |
 | `lxkit` | L3 (`deck_doctor` L1) | the foundation the services share: capability gates, the absent-versus-broken probe vocabulary, loop-carry marking (`mark_varying`), process-local placement, native-provider attestation, the cache root; `python -m lxkit.deck_doctor` preflights a deck | |
 | `minimax` | L1 | runtime quadrature rules: screening, Σ box rules, response-bank rules, their certificates ([contract](services/minimax.md)) | |
 | `symmetry_maps` | L1 | the space group of a deck: k-grid reduction, IBZ ⇄ full-BZ tables, unfolds, q-grid time-reversal policy, the QE-schema binding ([contract](services/symmetry_maps.md)) | |

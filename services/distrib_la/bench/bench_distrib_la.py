@@ -23,7 +23,7 @@ contention.
 THIS SCRIPT OVERWRITES ITS TAG'S FILE, AND SOME ROWS IN THERE ARE NOT
 ITS OWN.  ``cpu2x2.json`` / ``gpu2x2.json`` also carry the step-6 eigh
 investigation's single-matrix sweep (``shape [1, n]``, ``n`` up to 4096,
-tagged ``"leg": "step6.cross_size"`` / ``"step6.slate4096"``), produced by
+tagged ``"leg": "step6.cross_size"``), produced by
 a DIFFERENT harness — ``svc_distrib_la_perf/perf_eigh.py``.  Re-running
 this script drops them.  Merge, do not clobber: the row key across the
 two sources is ``(op, backend, shape, route)``, because the step-6 rows
@@ -68,9 +68,9 @@ if __name__ == "__main__":
         if _plat == "CUDA":
             try:
                 from distrib_la.loader import get_lib as _get_lib
-                _get_lib(_plat).lrx_slate_init_mpi()
+                _get_lib(_plat).lrx_mesh_init_mpi()
             except Exception as _exc:                          # noqa: BLE001
-                print(f"slate_init_mpi skipped: {_exc}", flush=True)
+                print(f"mesh_init_mpi skipped: {_exc}", flush=True)
         import jax
         if _plat == "CUDA":
             jax.distributed.initialize(local_device_ids=[0])
@@ -84,9 +84,8 @@ import distrib_la as D                                        # noqa: E402
 #: and a baseline table without it cannot answer "was this worth it".
 _ROWS = [
     ("eigh", "off"), ("eigh", "distributed"), ("eigh", "scalapack"),
-    ("eigh", "cusolvermp"), ("eigh", "slate"),
+    ("eigh", "cusolvermp"),
     ("cholesky", "native2d"), ("cholesky", "cusolvermp"),
-    ("cholesky", "slate"),
     ("solve_lu", "distributed"), ("solve_lu", "scalapack"),
     ("solve_lu", "cusolvermp"),
 ]

@@ -13,7 +13,7 @@ digit); this module adds the production seams:
     sharded ``P(('x','y'))`` over all mesh devices and each device eighs +
     cleans + splits its own q-shard collective-free, in chunks with one
     host round-trip each (``auto`` = this batched native path; the
-    distributed-FFI backends ``cusolvermp|slate`` stay available by
+    distributed-FFI backends ``cusolvermp|scalapack|elpa`` stay available by
     explicit request for tiles too large to eigh replicated).
   * ``fit_lr_model`` (the b26p LSQ) stays HOST/replicated on purpose: the
     normal blocks are (n_b ≤ 10)² per (G_z, q) — a few kilobytes, O(10⁶)

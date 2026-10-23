@@ -39,8 +39,8 @@ LORRAX library (ROCm) has no engine for that operation.
 | **Separable local DFT with supports**: `y = R_out·F·E_in·x`, ≤ 3 axes | `gw.plane_wave_pipeline` (the plane-wave K4 driver: both `MixedBasisPairConvolution`s' sphere↔box transforms); the route-G plane FFT's `in_gather` form | `lorrax_fourier_plan_mathdx`: cuBLAS ZGEMM axes, the fused cuBLASDx pair when it fits the opt-in shared memory, one cuFFT group; startup refuses an nvidia-mathdx other than 25.6.0 (`GATE mathdx-pair-wheel`); cuFFT/cuBLAS sizes below 2³¹ (`GATE fourier-plan-int32`) ([plan](#local-fourier-plan-localfourierplan)) | the XLA leg | `dot_general` GEMM axes and one `jnp.fft` group, on every lowering without a route row (ROCM: `lorrax_fourier_plan_rocm`, [plan](#local-fourier-plan-localfourierplan)) | `tests/test_fourier_plan_xla_gate.py` | `common.fourier_plan.LocalFourierPlan` ([service](../dev/fourier_plan.md)) |
 | **Green build GEMM**: `G_k(μ,ν;τ) = Σ_n ψ_nk(μ) w_n(τ) ψ*_nk(ν)` at the k parents | every Green of gwjax: χ₀ (`gw.w_isdf`), Σ (`gw.ppm_tau_kernel`, `gw.cohsex_sigma`), the ζ-fit projectors (`gw.isdf_fitting`) → the parent Green `(n_parent, μ, s, ν, s')` | a batched 2-D SUMMA (`distrib_la.panel_matmul`, [bounded face products](../services/distrib_la/api.md#bounded-face-products)): XLA all-gathers of band panels of at most `N_b/p` columns, every k in one exchange, each multiplied by the classic-cuBLAS local active-range GEMM (`distrib_la._active_local_cuda`); the response bank's band-window Greens take the same SUMMA with host-known intervals (`gemm_plan(layout='face').prepare_active_range`) | the same SUMMA with the JAX local interval product (`distrib_la._active_local.active_local_matmul`) | the CPU engine is plain XLA | — | `gw.greens_function_kernel.face_green_product`, `build_G_parents`; `distrib_la.panel_matmul` ([active GEMM ranges](../services/distrib_la/api.md#active-ranges)) |
 | **Band projection**: `O_k,mn = Σ ψ*_mk(μ) O_k(μ,ν) ψ_nk(ν)` | Σ_mn from Σ_k(μ,ν) (`gw.ppm_tau_kernel`, `gw.cohsex_sigma`, `gw.photon_sigma`, `gw.mpa.sector_sigma`); BSE W decode (`bse.bse_ring_comm`), `common.zeta_projection` | face layout: stationary-operator stream (XLA dots, ψ collectives only); legacy body: XLA einsums and two `psum_scatter`s | face layout: none; legacy body: the right contraction on `lorrax_mklblas_gemm_batch` (CBLAS, [§3a](#3a-the-dependency-matrix)) | the legacy body's einsums (`LORRAX_BANDS_GEMM_FFI=0` on cpu) | — | `common.contract_bands.contract_bands_block_reshard` ([vendor GEMM](../dev/vendor_gemm_service.md)) |
-| **Hermitian eigensolve**, batched local or distributed | the charge ζ factor (rank-truncating eigh of each C_q, on the face), the QSGW `H_k` (`gw.sc_iteration.qp_eigh`) | local: `jnp.linalg.eigh` (cuSOLVER in jaxlib); `linalg = distributed`: cuSOLVERMp `syevd` | local: LAPACK in jaxlib; distributed: ScaLAPACK `p?heevd`/`p?syevd`; host SLATE eigh always refuses at resolve (bug L-2) | `jnp.linalg.eigh` | nothing observes which vendor answered | `distrib_la.plan('eigh')`; the charge factor: `isdf.cplus.factor` ([`distrib_la`](../services/distrib_la/api.md), [deck dial](../services/distrib_la/backends.md)) |
-| **Dyson solve and dense factorizations**: `W_q = (1 − v_q χ₀_q)⁻¹ v_q` by LU; the transverse ζ LU; Cholesky on explicit request | gwjax screening (`gw.w_isdf.solve_w`), the response bank (`gw.response_bank`), the tangential head, the transverse ζ factor | local: per-q `jax.scipy.linalg.lu_factor`/`lu_solve` (cuSOLVER in jaxlib); distributed: cuSOLVERMp batched `solve_lu`/`getrf`/`getrs`, Cholesky `potrf`/`potrs`. `LORRAX_LU_NO_PIVOT` turns cuSOLVERMp pivoting off with no gate | local: LAPACK in jaxlib; distributed: ScaLAPACK `p?getrf`/`p?getrs`; Cholesky: host SLATE `potrf`/`trsm` | the local LU; Cholesky `native2d` | nothing observes which vendor answered | `distrib_la.plan('solve_lu')`, `plan('cholesky')` ([targets](#dense-linear-algebra-targets)) |
+| **Hermitian eigensolve**, batched local or distributed | the charge ζ factor (rank-truncating eigh of each C_q, on the face), the QSGW `H_k` (`gw.sc_iteration.qp_eigh`) | local: `jnp.linalg.eigh` (cuSOLVER in jaxlib); `linalg = distributed`: cuSOLVERMp `syevd` | local: LAPACK in jaxlib; distributed: ScaLAPACK `p?heevd`/`p?syevd` | `jnp.linalg.eigh` | nothing observes which vendor answered | `distrib_la.plan('eigh')`; the charge factor: `isdf.cplus.factor` ([`distrib_la`](../services/distrib_la/api.md), [deck dial](../services/distrib_la/backends.md)) |
+| **Dyson solve and dense factorizations**: `W_q = (1 − v_q χ₀_q)⁻¹ v_q` by LU; the transverse ζ LU; Cholesky on explicit request | gwjax screening (`gw.w_isdf.solve_w`), the response bank (`gw.response_bank`), the tangential head, the transverse ζ factor | local: per-q `jax.scipy.linalg.lu_factor`/`lu_solve` (cuSOLVER in jaxlib); distributed: cuSOLVERMp batched `solve_lu`/`getrf`/`getrs`, Cholesky `potrf`/`potrs`. `LORRAX_LU_NO_PIVOT` turns cuSOLVERMp pivoting off with no gate | local: LAPACK in jaxlib; distributed: ScaLAPACK `p?getrf`/`p?getrs`; Cholesky: `native2d` | the local LU; Cholesky `native2d` | nothing observes which vendor answered | `distrib_la.plan('solve_lu')`, `plan('cholesky')` ([targets](#dense-linear-algebra-targets)) |
 | **Active-subspace kernels**: store, projected eigh, project, reconstruct, Gram, CGS2 orthogonalization | Davidson (`psp.run_nscf`), Lanczos (`bse.bse_lanczos`, `bse.exciton_bands`) | `lorrax_active_subspace_*` (cuBLAS, cuSOLVER, NCCL) | `CpuSubspacePlan`: NumPy/LAPACK through `jax.pure_callback` | none | — | `distrib_la.plan_subspace`, `plan_orthogonalization` ([Davidson](iterative_eigensolvers.md)) |
 | **Parallel HDF5 slab I/O** | every sharded array read or written through `file_io.slab_io` | `phdf5_{read, read_kchunk_union, write, write_independent}`, staged through the CUDA runtime | the same handlers on the host leg | none: one transport, and a deployment that cannot serve it refuses at open | GATE 7, GATE 10 | `ffi.io` ← `file_io.slab_io` ([§5](#5-parallel-hdf5-the-ffi-side), [SlabIO](slab_io.md)) |
 
@@ -95,7 +95,7 @@ its sources, its build and its target strings.
 | kdft parent-load pair convolution and plane FFT (modes 1, 10) | `kdft/kbox_parent_ffi.cc`, `kdft/plane_gather_ffi.cc` and their kernel headers | ROCM; hipRTC, disk-cached; the ports of the CUDA mathdx modes ([ROCm leg §2](rocm_leg.md#kdft)) | `kdft_kconv_parent`, `kdft_plane_fft_gather` |
 | host flat-k FFT | `fftw/fft_flat_k_ffi.cc` | host; C++, the FFTW3 ABI bound by `dlsym` | `mklfft_flat_k`, `mklfft_gw_conv`, `mklfft_kconv_klead`, `mklfft_kconv_kminor` |
 | host CBLAS GEMM | `cblas/gemm_batch_ffi.cc` | host; C++ | `mklblas_gemm_batch` |
-| distributed dense LA | `cusolvermp/`, `scalapack/`, `slate/` | CUDA: cuSOLVERMp; host: ScaLAPACK, SLATE | [below](#dense-linear-algebra-targets) |
+| distributed dense LA | `cusolvermp/`, `scalapack/`, `elpa/`, `mesh/` | CUDA: cuSOLVERMp; host: ScaLAPACK; ROCM: ELPA eigh | [below](#dense-linear-algebra-targets) |
 | local active-range GEMM | `cublas/local_active_gemm_ffi.cc` (leg-neutral over `common/gpu_blas.h`) | CUDA (cuBLAS), ROCM (rocBLAS, the mapped `librocblas.so.5`); C++ | `cublas_local_active_range_gemm` (C aliased, beta), `cublas_local_active_range_gemm_out` (no C, beta = 0: writes every row), `cublas_local_prepared_active_range_gemm` |
 | active-range GEMM, device bounds | `active_gemm/active_gemm_device_ffi.cc` (kernel text `active_gemm/active_gemm_kernel.h`) | ROCM (`ACTIVE_LOCAL_ROUTE` row `device`); hipRTC/NVRTC for the device's target, FP64 MFMA tiles on gfx90a/gfx94x, FMA elsewhere; leg-neutral source, not yet listed on CUDA ([ROCm leg §1](rocm_leg.md#active-gemm)) | `active_gemm_device` (C aliased), `active_gemm_device_out` |
 | active subspace | `active_subspace/active_{eigh,ops}.cc` | CUDA; C++ (cuBLAS, cuSOLVER, NCCL) | `active_subspace_{store, eigh, project, reconstruct, gram, ortho, distributed_ortho, subtract, subtract_gram}` |
@@ -138,10 +138,11 @@ included (`common/rtc_build.h`).
 | `cusolvermp_batched_solve_lu_factors`, `_getrf`, `_getrs` | `CusolverMpBatched{SolveLuFactors,Getrf,Getrs}Ffi`, `cusolvermp/batched_solve_lu_ffi.cc` | `batched_distributed_solve_lu` | the W Dyson solve under `linalg = distributed` |
 | `scalapack_eigh` | `ScalapackEighHostFfi`, `scalapack/eigh_ffi.cc` | `_scalapack.distributed_eigh` | `linalg = distributed` on cpu |
 | `scalapack_batched_solve_lu_factors`, `_getrf`, `_getrs` | `ScalapackBatched{SolveLuFactors,Getrf,Getrs}HostFfi`, `scalapack/{solve_lu,getrf_getrs}_ffi.cc` | `batched_distributed_solve_lu` | `solve_lu` distributed on cpu |
-| `slate_potrf`, `_batched_potrf`, `_batched_trsm` | `Slate*HostFfi`, `slate/host_ffi.cc` | `_slate.*` | an explicit `cholesky = slate` on cpu |
-| `slate_eigh` (host) | `SlateEighHostFfi`, `slate/host_ffi.cc` | — | always refused at resolve (SIGSEGV, bug L-2) |
-| `slate_*` (CUDA) | `slate/{eigh,potrf,trsm,batched_potrf,batched_trsm}_ffi.cc` | `_slate.*` | built only when a `gpu_backend=cuda` SLATE is found; the `lorrax_A` bundle has none |
-| `slate_*` (ROCM) | the same leg-neutral `slate/*_ffi.cc` (`common/gpu_runtime.h`) | `_slate.*` | `linalg = distributed` eigh on ROCm (the `('eigh','ROCM')` default). SLATE `gpu_backend=hip` from `config/frontier/build_slate_hip.sh`, linked against the sequential LOCKING OpenBLAS of `config/frontier/build_openblas_seq.sh` and shipped in the SLATE prefix (SLATE calls host BLAS from concurrent OpenMP tasks: the threaded LibSci SIGSEGVs there and the sequential LibSci returns wrong eigenpairs once a rank holds several tiles), bound by the leg's DT_RPATH, ahead of the host SLATE on `LD_LIBRARY_PATH`; `verify_ffi_build.sh` GATE 3c/3d check it. eigh runs block-cyclic by relabeling (`distrib_la._cyclic`, tile `_slate.eigh_layout`). ROCM also compiles `slate/batched_solve_lu_ffi.cc` (`SlateBatched{SolveLuFactors,Getrf,Getrs}Ffi`): the `('solve_lu','ROCM')` default; CUDA does not (its LU is cuSOLVERMp) |
+| `elpa_eigh` | `ElpaEighFfi`, `elpa/eigh_ffi.cc` | `_elpa` | `linalg = distributed` eigh on ROCm above the size row (the `('eigh','ROCM')` default); ELPA from `config/frontier/build_elpa_hip.sh` over the sequential OpenBLAS of `config/frontier/build_openblas_seq.sh` (`LORRAX_ROCM_BLAS_DIR`) |
+
+ROCm has no distributed LU or Cholesky target: `distributed` LU there is
+`one_device` within the caller's room
+([size route](../services/distrib_la/backends.md#size-route)).
 
 The fused LU solves return the factors as a second output that the caller
 aliases to A, so XLA sees the write. The ABI-6 targets
@@ -150,8 +151,10 @@ the factors into A without declaring it, stay in the libraries for older
 trees and go at the next ABI bump.
 
 The ctypes C entry points: the cuSOLVERMp/NCCL grid context
-(`cusolvermp/c_api.cc`), the MPI mesh context SLATE and ScaLAPACK share
-(`slate/context.cc`), the phdf5 lifecycle (`phdf5/api.cc`), the workspace
+(`cusolvermp/c_api.cc`), the MPI mesh context ScaLAPACK (host) and ELPA
+(ROCM) share (`mesh/context.cc`: `MeshCtx`, `lrx_mesh_context_create` /
+`_destroy`, `lrx_mesh_init_mpi`; ctx registry family `mesh`; Python
+`distrib_la._mesh_ctx`), the phdf5 lifecycle (`phdf5/api.cc`), the workspace
 queries (`lrx_eigh_workspace_bytes`, `lrx_active_eigh_lwork`) and the two stamps (§2). The host leg's copies end
 in `_host` (`common/c_abi.h`).
 
@@ -246,13 +249,13 @@ src/ffi/cpp/
 ├── common/                  plumbing every family shares: C ABI naming, ABI and build-config
 │                            stamps, the ctx registry, env/announce and thread-pin helpers,
 │                            the NVRTC build service and the async-gather device header
-├── phdf5/  slate/                                    both legs
+├── phdf5/  mesh/                                     both legs
 ├── fftw/  cblas/  scalapack/                         host leg
 └── cusolvermp/  cublas/  cufft/  active_subspace/   CUDA leg
 ```
 
 `cufft/` holds the mathdx k-convolution family and the Fourier plan (cuFFT's
-one caller). `slate/context.cc` is the MPI mesh context SLATE and ScaLAPACK
+one caller). `mesh/context.cc` is the MPI mesh context ScaLAPACK and ELPA
 share. The host targets keep their historical `lorrax_mklfft_*` /
 `lorrax_mklblas_*` spellings. Basenames repeat across directories
 (`api.cc`, `context.cc`, `ctx.h`, `eigh_ffi.cc`, `batched_potrf_ffi.cc`), so
@@ -260,8 +263,8 @@ includes name the directory.
 
 | leg | CMake | library | feature options (all default `ON`) |
 |---|---|---|---|
-| host | `-DLORRAX_FFI_PLATFORM=host` | `liblorrax_ffi_host.so` | `LORRAX_FFI_HAVE_PHDF5`, `LORRAX_HOST_HAVE_SCALAPACK`, `LORRAX_HOST_HAVE_SLATE`, `LORRAX_HOST_HAVE_FFTW3` |
-| CUDA | `-DLORRAX_FFI_PLATFORM=cuda` | `liblorrax_ffi.so` | `LORRAX_FFI_HAVE_CAL`, `LORRAX_FFI_HAVE_PHDF5`; SLATE is probed at `LORRAX_SLATE_INSTALL_DIR` |
+| host | `-DLORRAX_FFI_PLATFORM=host` | `liblorrax_ffi_host.so` | `LORRAX_FFI_HAVE_PHDF5`, `LORRAX_HOST_HAVE_SCALAPACK`, `LORRAX_HOST_HAVE_FFTW3` |
+| CUDA | `-DLORRAX_FFI_PLATFORM=cuda` | `liblorrax_ffi.so` | `LORRAX_FFI_HAVE_CAL`, `LORRAX_FFI_HAVE_PHDF5` |
 | unset | — | `FATAL_ERROR` naming both legs | — |
 
 * **Host leg.** CUDA-free by construction: its sources compile with
@@ -319,8 +322,8 @@ each machine, what else could, and what proves it built right.
 |---|---|---|---|---|
 | **Flat-k FFT, host leg** | FFTW3 ABI by `dlsym` → cray-fftw | MKL's FFTW3 export, already resident | the candidate ladder (§3c) | GATE 5 (load time), GATE 8 (engine identity) |
 | **Host band-block GEMM** (`ffi.gemm`) | LibSci CBLAS; LibSci has no `cblas_?gemm_batch`, so the handler loops plain `cblas_?gemm` | MKL CBLAS, batched entry | any CBLAS provider (MKL, LibSci, OpenBLAS, BLIS); the chosen entry is announced at first use | GATE 2 |
-| **Distributed dense solvers** | cuSOLVERMp (GPU); ScaLAPACK from LibSci and host SLATE (CPU) | ScaLAPACK from MKL; host SLATE | — | — |
-| **Distributed transport** | NCCL for cuSOLVERMp (§4); an `MPI_COMM_WORLD` split in mesh order for SLATE and ScaLAPACK | Intel MPI | — | the `[lorrax cusolverMp] … comm path:` banner |
+| **Distributed dense solvers** | cuSOLVERMp (GPU); ScaLAPACK from LibSci (CPU) | ScaLAPACK from MKL (`LORRAX_HOST_SCALAPACK=1`) | — | — |
+| **Distributed transport** | NCCL for cuSOLVERMp (§4); an `MPI_COMM_WORLD` split in mesh order for ScaLAPACK (and ELPA on ROCm) | Intel MPI | — | the `[lorrax cusolverMp] … comm path:` banner |
 | **Parallel HDF5** | `cray-hdf5-parallel/1.14.3.7` (`libhdf5_parallel_gnu.so.310`) over `cray-mpich/9.0.1` (`libmpi_gnu_123.so.12`) | phdf5 over Intel MPI | none: one transport | GATE 1, GATE 7 |
 | **OpenMP runtime** | `libgomp` | `libiomp5` | `libgomp`, `libiomp5`, `libomp` | GATE 6 |
 | **Runtime** | bare-host CUDA 13 (`lorrax_A`); Shifter stages for container sites | apptainer | — | — |

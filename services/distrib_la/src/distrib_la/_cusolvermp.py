@@ -2,14 +2,13 @@
 
 Ported from LORRAX ``src/ffi/cusolvermp/{context,eigh,batched}.py`` at
 96a6399 and merged into ONE backend module, which is the shape
-:mod:`._slate` and :mod:`._scalapack` already had (wave-2,
+:mod:`._scalapack` already had (wave-2,
 ``ffi_layout.md`` §3/§6).  Nothing is renamed; the FFI target strings and
 the C++ handler symbols are FROZEN (invariant 1).
 
 **NOT a deletion candidate.**  ``ffi_layout.md`` §5 once listed cuSOLVERMp
 for removal; the phase charter overturned that ruling and the premises are
-measurably false — zero ``src/`` vendor imports, SLATE has no LU handler at
-all, and the preconditions the old ruling named were never met.
+measurably false — zero ``src/`` vendor imports, and the preconditions the old ruling named were never met.
 
 Section docstrings from the merged modules follow inline.
 """
@@ -200,8 +199,8 @@ own ``tests/test_distrib_la_contract.py`` (the pin migrated here with the
 backend; it was ``tests/test_ffi_linalg_contract.py`` in LORRAX).  Callers
 that need conventional
 column eigenvectors must conj-transpose; :func:`distrib_la.plan._eigh_columns`
-is the ONE place that knows it.  (The SLATE eigh returns TRUE column
-eigenvectors — the two wrappers share shapes but NOT the Q convention.)
+is the ONE place that knows it.  (The ELPA and ScaLAPACK eighs return TRUE
+column eigenvectors — the wrappers share shapes but NOT the Q convention.)
 
 Mesh restriction: ``cusolverMpSyevd`` requires square ScaLAPACK blocks
 (mb == nb).  On a non-square mesh the natural one-tile-per-rank blocks
@@ -234,7 +233,7 @@ _mesh_key = mesh_key
 
 
 # Block-cyclic eigh by relabeling (the helpers live in distrib_la._cyclic,
-# shared with the SLATE eigh).  A P('x','y') operand is one (n/p, n/p)
+# shared with the ELPA eigh).  A P('x','y') operand is one (n/p, n/p)
 # tile per rank.  Handing cuSOLVERMp the SAME local buffers with a smaller
 # square block mb (mb | n/p) makes it read them as Pi A Pi^T, Pi sending rank
 # r's local block c to global block c*p + r.  Rows and columns get the same
