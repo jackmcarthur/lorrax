@@ -64,6 +64,20 @@ source "$ROOT/config/frontier/ffi_mpi.sh"
 "$VENV/bin/python" "$ROOT/src/ffi/cpp/stage/write_checkout_closure.py" "$SO" \
     --python "$VENV/bin/python" --library-dirs "$LORRAX_OLCF_RUNTIME_LIB_DIRS" || {
         echo "[build_ffi_rocm] FAILED: dependency closure" >&2; exit 1; }
+# Acceptance uses the recorded wheel files through the runtime loader, not
+# the build module's alternate ROCm search path. No GPU is initialized here;
+# a compute-node GPU smoke remains necessary before runtime certification.
+LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-phdf5,slate,kdft}" \
+LORRAX_FFI_EXPECT_MPI="${LORRAX_FFI_EXPECT_MPI:-$LORRAX_OLCF_MPI_SONAME}" \
+LORRAX_FFI_EXPECT_HDF5_SOVERSION="${LORRAX_FFI_EXPECT_HDF5_SOVERSION:-310}" \
+LORRAX_PHDF5_STAGE="$LORRAX_OLCF_HDF5_ROOT" \
+LORRAX_GATE_FFTW_PY="$VENV/bin/python" \
+LORRAX_ROOT="$ROOT" \
+GATE_TAG=build_ffi_rocm \
+    bash "$ROOT/scripts/verify_ffi_build.sh" --leg rocm "$SO" || {
+        echo "[build_ffi_rocm] FAILED: the library does not meet the build contract." >&2
+        echo "[build_ffi_rocm] The .so is left on disk for inspection; do not pin it." >&2
+        exit 1; }
 "$ROOT/src/ffi/cpp/stage/stamp_provenance.sh" "$SO" \
     leg=rocm site=frontier rocm_module="$ROCM_MOD" mpi="$MPICH_MOD" hdf5="$HDF5_MOD" \
     venv="$VENV" \

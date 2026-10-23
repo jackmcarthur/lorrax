@@ -81,7 +81,9 @@
 #                                  src/ffi/cpp/common/lorrax_ffi_abi.h.
 #   LORRAX_PHDF5_STAGE             the runtime phdf5 stage (GATE 7's have-side).
 #   LORRAX_GATE_FFTW_PY            a python that can import jax, which is what
-#                                  makes GATE 8 runnable.
+#                                  makes GATE 8 runnable. Also selects the
+#                                  ROCm closure-check Python (otherwise the
+#                                  active environment's python3).
 #   LORRAX_FFI_VERIFY_STRICT=1     a gate that COULD NOT RUN becomes a failure.
 #                                  Off by default because GATE 8 provably
 #                                  cannot run on a login node; on for a
@@ -201,7 +203,7 @@ notrun() { warn "GATE COULD NOT RUN ($1): ${*:2}"; NOTRUN=$((NOTRUN + 1)); }
 # IS THIS A PLACE WHERE THIS LEG'S CLOSURE IS SUPPOSED TO RESOLVE?
 #
 # Three gates (1, 4, and GATE 7's mapped-objects half) resolve the dependency
-# closure with ldd, and their answer is a property of the ENVIRONMENT as much
+# closure, and their answer is a property of the ENVIRONMENT as much
 # as of the artifact.  For the host leg that is fine: it is built bare-metal
 # and runs bare-metal, so the build node is a runtime environment for it and an
 # unresolved dependency there is a real defect.
@@ -222,13 +224,23 @@ if [[ "$LEG" == cuda ]]; then
     RUNTIME_ENV=0
     [[ -d /lorrax_phdf5 || -d /lorrax_nvhpc ]] && RUNTIME_ENV=1
 fi
-# The ROCM leg is built and run bare-metal, but its HIP runtime is the one the
-# JAX plugin maps from the pip ROCm wheel, which no module puts on the search
-# path: the closure resolves here only where LD_LIBRARY_PATH carries a ROCm
-# 7 lib directory (module rocm/<v>, or the wheel's lib dirs).
+# The ROCm plugin's wheel libraries are not a shell search path. The runtime
+# opens its recorded exact files before the leg, so cold ldd is not its loader
+# and may report a correct leg as unresolved. Use that existing loader in a
+# fresh Python child, without initializing JAX or a GPU. Its live map also
+# catches a module/preload serving a different copy of a recorded family.
+ROCM_RUNTIME_MAP=""
+ROCM_RUNTIME_OK=0
 if [[ "$LEG" == rocm ]]; then
-    RUNTIME_ENV=0
-    ldd "$SO" 2>/dev/null | grep -E '^[[:space:]]*libamdhip64\.so\.7 ' | grep -qv 'not found' && RUNTIME_ENV=1
+    if [[ "${LORRAX_FFI_VERIFY_ENV:-}" != build && -n "$EXPECT_ABI" ]]; then
+        _map_file="$(mktemp)" || exit 1
+        trap 'rm -f "$_map_file"' EXIT
+        if "${LORRAX_GATE_FFTW_PY:-python3}" "$SCRIPT_DIR/verify_ffi_runtime.py" \
+                "$SO" --abi "$EXPECT_ABI" --map-file "$_map_file"; then
+            ROCM_RUNTIME_MAP="$(cat "$_map_file")"
+            ROCM_RUNTIME_OK=1
+        fi
+    fi
 fi
 [[ "${LORRAX_FFI_VERIFY_ENV:-}" == runtime ]] && RUNTIME_ENV=1
 [[ "${LORRAX_FFI_VERIFY_ENV:-}" == build   ]] && RUNTIME_ENV=0
@@ -411,6 +423,20 @@ elif [[ "$RUNTIME_ENV" -eq 0 ]]; then
       them 'not found' for a perfectly correct artifact.
       Run it where the library runs — src/ffi/cpp/build.sh does, because it
       builds in-container — or force it with LORRAX_FFI_VERIFY_ENV=runtime."
+elif [[ "$LEG" == rocm ]]; then
+    if [[ "$ROCM_RUNTIME_OK" -eq 1 ]]; then
+        _mpi="$(awk -F '\t' '$1 ~ /^libmpi(_gnu(_[0-9]+)?)?\.so/{print $1}' <<<"$ROCM_RUNTIME_MAP")"
+        if [[ -z "$_mpi" ]]; then
+            fail 1 "no libmpi in the attested live closure of $SO"
+        elif [[ -n "${LORRAX_FFI_EXPECT_MPI:-}" ]] && \
+                ! grep -q "${LORRAX_FFI_EXPECT_MPI}" <<<"$_mpi"; then
+            fail 1 "live MPI $_mpi does not match expected ${LORRAX_FFI_EXPECT_MPI}"
+        else
+            say "GATE 1 PASSED: recorded loader checked one live MPI runtime ($_mpi)"
+        fi
+    else
+        fail 1 "the recorded ROCm closure could not be opened and attested; see child output above."
+    fi
 else
     GATE_TAG="$TAG" "$CPP_DIR/gate_one_mpi.sh" "$SO" "${LORRAX_FFI_EXPECT_MPI:-}" \
         || fail 1 "see gate_one_mpi.sh output above."
@@ -513,7 +539,7 @@ elif [[ "$LEG" == rocm ]]; then
             notrun 3c "which libslate.so.2 the leg binds is an environment fact;
       not checkable where libamdhip64.so.7 does not resolve (LORRAX_FFI_VERIFY_ENV=runtime)."
         else
-            _sl="$(ldd "$SO" 2>/dev/null | awk '$1=="libslate.so.2"{print $3}')"
+            _sl="$(awk -F '\t' '$1=="libslate.so.2"{print $2}' <<<"$ROCM_RUNTIME_MAP")"
             if [[ -z "$_sl" || ! -f "$_sl" ]]; then
                 fail 3c "libslate.so.2 does not resolve for this leg here."; _g3=1
             elif ! readelf -d "$_sl" | grep NEEDED | grep -q 'librocblas'; then
@@ -530,8 +556,8 @@ elif [[ "$LEG" == rocm ]]; then
                 # BLAS is the locking OpenBLAS (build_openblas_seq.sh), shipped in
                 # the SLATE prefix.  Checked on the LEG's closure: SONAMEs the leg
                 # binds by DT_RPATH are the ones SLATE's own NEEDED entries meet.
-                _bl="$(ldd "$SO" 2>/dev/null | awk '$1 ~ /^lib(sci|openblas)/{print $1"="$3}' | sort -u | tr '\n' ' ')"
-                _ob="$(ldd "$SO" 2>/dev/null | awk '$1 ~ /^libopenblas/{print $3}' | head -1)"
+                _bl="$(awk -F '\t' '$1 ~ /^lib(sci|openblas)/{print $1"="$2}' <<<"$ROCM_RUNTIME_MAP" | sort -u | tr '\n' ' ')"
+                _ob="$(awk -F '\t' '$1 ~ /^libopenblas/{print $2}' <<<"$ROCM_RUNTIME_MAP" | head -1)"
                 if printf '%s' "$_bl" | grep -q 'libsci'; then
                     fail 3d "the leg's closure maps LibSci ($_bl): not safe for SLATE's
       concurrent host BLAS calls.  Rebuild with config/frontier/build_openblas_seq.sh
@@ -669,6 +695,11 @@ else
         _closure=on
         if [[ "$RUNTIME_ENV" -eq 0 ]]; then
             _closure=off
+        elif [[ "$LEG" == rocm ]]; then
+            # The live recorded loader already checked every HDF5 family;
+            # keep this delegated check's artifact/stage/pair halves, which
+            # do not depend on ldd's different search order.
+            _closure=off
         elif [[ ${#_peer[@]} -gt 0 ]]; then
             # The peer is the other leg by construction, so its closure belongs
             # to the other environment.
@@ -681,10 +712,18 @@ else
         GATE_TAG="$TAG" LORRAX_GATE_ONE_HDF5_CLOSURE="$_closure" \
             "$CPP_DIR/gate_one_hdf5.sh" "$SO" "${_peer[@]}" \
             || fail 7 "see gate_one_hdf5.sh output above."
-        [[ "$_closure" == off ]] && notrun 7e "the mapped-objects half of GATE 7
+        if [[ "$LEG" == rocm && "$RUNTIME_ENV" -eq 1 ]]; then
+            if [[ "$ROCM_RUNTIME_OK" -eq 1 ]]; then
+                say "GATE 7e PASSED: recorded loader attested the live HDF5 mapping"
+            else
+                fail 7e "the recorded ROCm closure could not be opened and attested."
+            fi
+        elif [[ "$_closure" == off ]]; then
+            notrun 7e "the mapped-objects half of GATE 7
       (are two distinct HDF5 objects reachable at once) was not checked in
       this environment.  Run the verifier where the library runs, or
       LORRAX_FFI_VERIFY_ENV=runtime."
+        fi
     else
         notrun 7 "$CPP_DIR/gate_one_hdf5.sh not found."
     fi
@@ -709,6 +748,12 @@ if [[ "$RUNTIME_ENV" -eq 0 ]]; then
       'wrong place', not 'wrong library'.  src/ffi/cpp/build.sh runs this
       verifier in-container, where the gate is live; force it anywhere with
       LORRAX_FFI_VERIFY_ENV=runtime."
+elif [[ "$LEG" == rocm ]]; then
+    if [[ "$ROCM_RUNTIME_OK" -eq 1 ]]; then
+        say "GATE 4 PASSED: exact recorded closure opened and attested in a fresh Python"
+    else
+        fail 4 "the recorded ROCm closure could not be opened and attested; see child output above."
+    fi
 elif command -v ldd >/dev/null 2>&1; then
     _ldd="$(ldd -r "$SO" 2>&1)"
     _bad="$(printf '%s\n' "$_ldd" | grep -iE 'not found|undefined symbol' || true)"
@@ -784,9 +829,8 @@ fi
 # three bumps in two days that motivated it.
 #
 # READ FROM THE STAMP STRING, not by calling the symbol: this tier is
-# artifact-level and never dlopens anything (the loaders do the calling half,
-# at dlopen, where a wrong answer can still be acted on).  Both come out of the
-# same translation unit, so a disagreement between them is itself a defect and
+# artifact-level (the ROCm closure child also checks the live symbol). Both
+# come out of the same translation unit, so a disagreement is itself a defect and
 # is reported as one rather than folded into a mismatch.
 # ===========================================================================
 say "--- GATE 11 (handler-signature ABI) ---"
