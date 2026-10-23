@@ -2,6 +2,7 @@
 
 
 def main():
+    import argparse
     import os
     import runtime
     stack = runtime.initialize_communicator_stack()
@@ -10,8 +11,12 @@ def main():
     import numpy as np
     from wfn_loader import IBZRows, WfnLoader
 
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--wfn', action='append', default=[])
+    args = parser.parse_args()
     paths = [os.path.join(os.environ['PROBE_SOURCE'], 'tests/hsuite/fixture_na/WFN.h5'),
-             '/pscratch/sd/j/jackm/cs_claude/mos2v2/runs/c9_srlr/WFN.h5']
+             os.path.join(os.environ['PROBE_SOURCE'], 'tests/hsuite/fixture/WFN.h5'),
+             *args.wfn]
 
     def snapshot(wfn):
         return tuple({key:id(value) for key,value in getattr(wfn, name).items()}

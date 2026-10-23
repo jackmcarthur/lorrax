@@ -116,12 +116,13 @@ from common.collectives import mesh_is_emulated
 from . import h5_journal as _journal
 from .io_timing import DISABLED, SlabIOTiming, enabled as _timing_enabled, timed
 from ._slab_io_ffi import (_FfiBackend, assert_available, mesh_divisible_shape,
-                           probe_availability, probe_read_availability)
+                           probe_availability, probe_read_availability,
+                           quiesce_pending_io)
 
 from ._slab_io_rank import StreamedBank, remove_stale_streamed_banks  # noqa: E402  (the per-rank streamed tier)
 
 __all__ = ["SlabIO", "StreamedBank", "remove_stale_streamed_banks", "assert_available", "mesh_divisible_shape",
-           "probe_availability", "probe_read_availability"]
+           "probe_availability", "probe_read_availability", "quiesce_pending_io"]
 
 #: With ``LORRAX_H5_JOURNAL=1``, every op through this class is one line in
 #: the per-rank HDF5 journal (``file_io.h5_journal``).  The production

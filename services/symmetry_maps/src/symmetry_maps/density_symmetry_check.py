@@ -83,7 +83,7 @@ _STAMP_SCHEMA = "wfn-trs-stamp-v2"
 _STAMP_KEEP = 2000
 #: Loader arrays a verdict depends on: the k set, weights, occupations and
 #: band energies, the symmetry and lattice tables the spatial unfold uses, and
-#: the per-k G lists.  All are in memory once the loader is built.
+#: the per-k G lists. Raw G vectors may remain a file-backed dataset.
 _STAMP_FIELDS = (
     "nspin", "nspinor", "nkpts", "nbands", "ngkmax", "ecutwfc", "kgrid",
     "shift", "ngk", "ifmin", "ifmax", "kweights", "kpoints", "energies",
@@ -319,6 +319,8 @@ def _merge_process_evidence(row: np.ndarray, world: int) -> np.ndarray:
 
 def _raw_ibz_psi_k(loader, ik: int, nb: int, *, b_lo: int = 0) -> np.ndarray:
     """Read one raw stored coefficient slab as ``(band,spinor,G)``."""
+    if hasattr(loader, 'sync_read_staging'):
+        loader.sync_read_staging()
     ds = loader._file["wfns/coeffs"]
     start = int(loader.kpt_starts[int(ik)])
     ngk = int(loader.ngk[int(ik)])
@@ -715,12 +717,33 @@ def _report_values_ok(report: DensitySymmetryReport) -> bool:
 
 
 def _content_digest(loader) -> str:
-    """SHA-256 over the named in-memory arrays in ``_STAMP_FIELDS``."""
+    """SHA-256 over named header arrays and bounded raw-G dataset slices.
+
+    Serialization matches the historical contiguous-array bytes, including
+    dtype byte order and the shape label. Streaming raw G vectors avoids
+    materializing all stored k rows merely to validate the TRS stamp.
+    """
+    if hasattr(loader, 'sync_read_staging'):
+        loader.sync_read_staging()
     h = hashlib.sha256()
     for name in _STAMP_FIELDS:
-        value = np.ascontiguousarray(np.asarray(getattr(loader, name)))
-        h.update(f"{name}|{value.dtype.str}|{value.shape}|".encode())
-        h.update(value.tobytes())
+        source = getattr(loader, name)
+        if (name == '_gvecs_raw' and not isinstance(source, np.ndarray)
+                and hasattr(source, 'shape') and hasattr(source, 'dtype')):
+            shape = tuple(int(n) for n in source.shape)
+            dtype = np.dtype(source.dtype)
+            h.update(f"{name}|{dtype.str}|{shape}|".encode())
+            row_bytes = dtype.itemsize * int(np.prod(shape[1:]))
+            rows = max(1, (8 << 20) // max(1, row_bytes))
+            for first in range(0, shape[0], rows):
+                block = np.ascontiguousarray(np.asarray(source[first:first+rows]))
+                if block.size:
+                    h.update(memoryview(block).cast('B'))
+        else:
+            value = np.ascontiguousarray(np.asarray(source))
+            h.update(f"{name}|{value.dtype.str}|{value.shape}|".encode())
+            if value.size:
+                h.update(memoryview(value).cast('B'))
     return h.hexdigest()
 
 
