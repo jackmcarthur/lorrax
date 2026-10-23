@@ -489,8 +489,20 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` (SlabIO writes per-rank hyperslabs) | — | — |
 
 Replicated per-process metadata includes the TRS-augmented centroid permutation
-and lattice-wrap tables, `O(n_sym·μ)`, and q-folding tables, `O(N_k)`; it does
+and lattice-wrap tables, `O(n_sym·μ)`, and q-representative tables, `O(N_k)`; it does
 not shrink with the mesh.
+
+`SymMaps` constructs its dense `kq_map`, `kqfull_map` and unwrapped
+`all_unfolded_qpt_ids` arrays independently at first access, then retains
+the same writable, assignable NumPy arrays as before. WFN unfolding and
+centroid placement use the linear-size k/q representatives and do not
+construct these dense tables. The reduced-q lookup costs
+`4·N_k·N_q,reduced` bytes; the full-q lookup and pair-label table each cost
+`4·N_k²`. The small unwrapped q-vector list remains eager. `trivial_view()`
+materializes these arrays before copying to preserve its historical shared
+full-q/pair-label arrays and independent reduced-q copy. Q-consuming stages
+therefore retain their previous table costs. No WFN/file handle is kept by
+the lazy builders.
 
 Centroid sampling (`common.wfn_transforms.gflat_to_rmu`) constructs dense
 sphere-to-box inverse rows and separable Bloch-phase tables inside the local

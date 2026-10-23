@@ -6,7 +6,7 @@
 # module retains the sym-table construction (kpoint_map, R_grid,
 # unfolded_kpts, …) and the kfull-symmap / q-IBZ helpers used by the
 # GW driver.
-from functools import lru_cache, partial
+from functools import cached_property, lru_cache, partial
 from dataclasses import dataclass
 
 import numpy as np
@@ -2131,18 +2131,22 @@ def _uniform_kminusq_index_map(full, qarr):
     return _integer_kminusq_index_map(coords, qcoords, grid, lookup)
 
 
-def _unwrapped_grid_q_tables(coords, grid):
+def _unwrapped_grid_q_tables(coords, grid, *, include_ids=True):
     """Native lexicographic q labels without sorting the Nk² pair triples."""
     coords = np.asarray(coords, dtype=np.int32)
     grid = np.asarray(grid, dtype=np.int32)
     if _integer_grid_lookup(coords, grid) is None:
         pairs = coords[:, None, :] - coords[None, :, :]
+        if not include_ids:
+            return np.unique(pairs.reshape(-1, 3), axis=0), None
         vectors, inverse = np.unique(pairs.reshape(-1, 3), axis=0, return_inverse=True)
         return vectors, inverse.reshape(len(coords), len(coords)).astype(np.int32)
     extent = 2 * grid - 1
     if int(np.prod(extent.astype(np.int64))) > np.iinfo(np.int32).max:
         raise ValueError('unwrapped q-grid label exceeds the int32 carrier')
     vectors = np.indices(tuple(extent), dtype=np.int32).reshape(3, -1).T - (grid - 1)
+    if not include_ids:
+        return vectors, None
     labels = coords[:, None, 0] - coords[None, :, 0] + grid[0] - 1
     for axis in (1, 2):
         labels *= extent[axis]
@@ -2151,6 +2155,37 @@ def _unwrapped_grid_q_tables(coords, grid):
 
 
 class SymMaps:
+    @cached_property
+    def kq_map(self):
+        """Full-k by reduced-q lookup, constructed at its first consumer.
+
+        The cached public ndarray remains writable and assignable, as before.
+        WFN unfolding and centroid placement do not need this quadratic table.
+        """
+        return self._build_kq_map(reduced=True)
+
+    @cached_property
+    def kqfull_map(self):
+        """Full-k by full-q lookup, independent of the reduced-q cache."""
+        return self._build_kq_map(reduced=False)
+
+    @cached_property
+    def all_unfolded_qpt_ids(self):
+        """Unwrapped pair labels, constructed only when a consumer needs them."""
+        return _unwrapped_grid_q_tables(self._q_map_integer_coords, self._q_map_grid)[1]
+
+    def _build_kq_map(self, *, reduced):
+        if self._q_map_identity:
+            # Preserve the identity branch's integer-difference convention,
+            # including shifted grids and arbitrary stored full-row order.
+            lookup = _integer_grid_lookup(self._q_map_integer_coords, self._q_map_grid)
+            return _integer_kminusq_index_map(
+                self._q_map_integer_coords, self._q_map_integer_coords, self._q_map_grid, lookup)
+        qpts = self._q_map_reduced_points if reduced else self._q_map_full_points
+        return self._get_kminusq_index_map(
+            self._q_map_full_points, qpts,
+            name="reduced q grid" if reduced else "full q grid")
+
     def trivial_view(self):
         """Restrict the computational group to identity over loader-unfolded full-k parents."""
         from copy import copy
@@ -2161,6 +2196,11 @@ class SymMaps:
             raise ValueError("SymMaps trivial view requires one authenticated identity row")
         row = int(identity[0])
         spatial = len(self.sym_matrices)
+        # A trivial view historically shallow-shares full-q/pair-label
+        # arrays and deep-copies its reduced-q map. Materialize before the
+        # shallow copy to preserve those writable-array semantics exactly.
+        # WFN-only and centroid consumers never request this GW view.
+        _ = self.kq_map, self.kqfull_map, self.all_unfolded_qpt_ids
         view = copy(self)
         for name in ("sym_matrices", "translations", "R_grid", "Rinv_grid", "U_spinor"):
             setattr(view, name, np.asarray(getattr(self, name))[[row]].copy())
@@ -2399,13 +2439,15 @@ class SymMaps:
         lookup = _integer_grid_lookup(self.kvecs_asints, kgrid)
         if lookup is None:
             raise ValueError('identity k-grid is not a complete integer grid')
-        self.kqfull_map = _integer_kminusq_index_map(
-            self.kvecs_asints, self.kvecs_asints, kgrid, lookup)
-        self.kq_map = self.kqfull_map.copy()
+        self._q_map_grid = kgrid.copy()
+        self._q_map_identity = True
+        self._q_map_reduced_points = None
+        self._q_map_full_points = self.unfolded_kpts.copy()
+        self._q_map_integer_coords = self.kvecs_asints.copy()
 
         # Integer q enumerations for k' - k outside the first BZ.
-        self.all_unfolded_qpts, self.all_unfolded_qpt_ids = _unwrapped_grid_q_tables(
-            self.kvecs_asints, kgrid)
+        self.all_unfolded_qpts, _ = _unwrapped_grid_q_tables(
+            self.kvecs_asints, kgrid, include_ids=False)
 
         # Trivial-sym q-IBZ: each full-BZ q is its own IBZ partner under identity.
         n_full = int(self.kvecs_asints.shape[0])
@@ -2610,8 +2652,9 @@ class SymMaps:
 
     def _initialize_q_maps(self, wfn):
         """Initialize k-minus-q maps and irreducible q representatives."""
-        self.kq_map = self.get_kminusq_map(wfn, self.unfolded_kpts)
-        self.kqfull_map = self.get_kminusqfull_map(wfn, self.unfolded_kpts)
+        self._q_map_grid = np.asarray(wfn.kgrid, dtype=np.int32).copy()
+        self._q_map_reduced_points = np.asarray(wfn.kpoints, dtype=np.float64).copy()
+        self._q_map_identity = False
 
 
         # the above kq maps are for inputting some k and some q and getting k-q in the 1BZ, but it is actually necessary to store W_q on q outside 1BZ
@@ -2621,9 +2664,12 @@ class SymMaps:
                         np.arange(wfn.kgrid[2]), 
                         indexing='ij')
         self.kvecs_asints = np.stack([kx.flatten(), ky.flatten(), kz.flatten()], axis=1) # kpoints * kgrid (kpoints as integers)
+        # Match eager tables even if a caller later mutates public geometry.
+        self._q_map_full_points = self.unfolded_kpts.copy()
+        self._q_map_integer_coords = self.kvecs_asints.copy()
 
-        self.all_unfolded_qpts, self.all_unfolded_qpt_ids = _unwrapped_grid_q_tables(
-            self.kvecs_asints, wfn.kgrid)
+        self.all_unfolded_qpts, _ = _unwrapped_grid_q_tables(
+            self.kvecs_asints, wfn.kgrid, include_ids=False)
 
         # Eager q-IBZ reduction (was lazy in `find_irreducible_qpoints`; that
         # method is gone — all consumers read these instance attrs directly).
