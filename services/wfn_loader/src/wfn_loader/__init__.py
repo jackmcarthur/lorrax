@@ -17,7 +17,7 @@ the monorepo's ``tools/lint/test_layering.py`` fails on.
 
 The surface
 -----------
-``WfnLoader(path, *, mesh=None, backend='auto')``
+``WfnLoader(path, *, mesh=None, backend='auto', qe_schema=None)``
     The class.  Its ``mf_header`` attributes are the same names the legacy
     ``WFNReader`` exposed (``nkpts``, ``nbands``, ``nspinor``, ``kgrid``,
     ``fft_grid``, ``bvec``, ``sym_matrices``, ``translations``, …), so it
@@ -31,9 +31,13 @@ The surface
     Miller-index tables, logical lengths, and the FFT-box gather table (host,
     and cached on device). Bloch phases and ``k+G`` must use the paired loader
     tables rather than reconstructing k independently.
-``KSpec``
-    The k-spec vocabulary: ``'ibz'``, ``'full_bz'``, or an explicit list
-    of full-BZ indices.
+``KSpec`` / ``IBZRows``
+    The k-spec vocabulary: ``'ibz'``, ``'full_bz'``, an explicit list
+    of full-BZ indices, or ``IBZRows(rows)`` (raw file rows, no unfold).
+``WfnProvenance`` / ``read_wfn_provenance(path)``
+    Header-only identity and occupation view; reads no G or ψ payload.
+``uniform_band_windows(b_lo, b_hi, width)``
+    Fixed-width ``(lo, mask)`` band windows; the last overlaps and is masked.
 
 THE UNDERSCORED NAMES ARE PART OF THE PUBLIC API, deliberately.  They are the
 module-level kernel / jit-cache factories the in-tree tests pin by name —

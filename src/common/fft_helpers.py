@@ -1,3 +1,30 @@
+"""The one import point for LORRAX's FFTs: local 3-D box transforms and the k-axis router.
+
+Two families, which never mix:
+
+* **Real-space boxes** (``local_fftn3``, ``local_ifftn3``,
+  ``make_sharded_fftn_3d``, ``make_sharded_ifftn_3d``): ``jnp.fft`` over the
+  three trailing FFT-box axes, run per device inside a ``shard_map`` (cuFFT
+  through XLA on NVIDIA, XLA:CPU on the host).  The box axes must be
+  replicated; only batch axes (k, bands, centroids) are sharded.  Used for
+  ψ(G) ↔ ψ(r), densities and plane-wave matrix elements.  Call the
+  ``local_*`` forms only from inside a ``shard_map``; called eagerly on a
+  sharded array, JAX gathers the whole operand onto every rank.
+* **The k axis** (everything re-exported from ``ffi.fft``, plus the flat-k
+  wrappers ``make_flat_k_fft``, ``make_flat_k_ifftn``, ``make_flat_k_fftn``,
+  ``make_local_flat_k_fftn`` and the memoised donated
+  ``get_donated_kfft_kminor``): transforms and convolutions along the
+  Monkhorst-Pack k grid of centroid-space operators, routed by device vendor
+  (nvidia-mathdx on CUDA, the host FFTW3-ABI plan on cpu, XLA elsewhere).
+  Arrays are flat-k, ``(nk, *trail)`` with ``nk = nkx*nky*nkz`` in C order
+  (kz fastest); a ``PartitionSpec`` is written on the 3-D form
+  ``(nkx, nky, nkz, *trail)`` with the three k axes ``None``.
+
+``norm`` follows ``jnp.fft`` ('backward'/None, 'ortho', 'forward') on every
+route; the native handlers receive one precomputed scale
+(``ffi.fft.ffi_fft_scale``).  Contracts: ``docs/architecture/kconv.md``
+(k axis) and ``docs/architecture/ffi_layout.md`` (kernel operations).
+"""
 from typing import Callable
 
 import jax

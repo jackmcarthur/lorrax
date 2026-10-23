@@ -1,6 +1,28 @@
-"""LORRAX FFI subpackage: JAX ↔ external parallel linear algebra libraries.
+"""LORRAX FFI subpackage: the Python half of the rank-local native kernels.
 
-See `AGENTS.md` for the directory layout and how to add a new target.
+Each module owns the ``jax.ffi.ffi_call``s of one family and the rule that
+picks its backend:
+
+* ``ffi.fft``: the k-convolution router.  Every k-axis convolution and
+  k-axis transform (the χ₀ time node, Σ = G⋆W, the W wedge into R space, the
+  BSE W term, the ζ-fit pair Gram, the route-G plane FFT) and the
+  ``common.fourier_plan.LocalFourierPlan`` custom call.  The backend follows
+  the mesh's device vendor only (``ffi.fft.kconv_backend``): nvidia-mathdx on
+  CUDA, the host FFTW3-ABI plan on cpu, kdft where it serves on ROCm, XLA
+  elsewhere.  No environment variable selects it.
+* ``ffi.gemm``: the host CBLAS batched GEMM behind the right contraction of
+  ``common.contract_bands`` (dial ``LORRAX_BANDS_GEMM_FFI``, cpu meshes only).
+* ``ffi.io``: the parallel-HDF5 slab handlers behind ``file_io.slab_io``.
+* ``ffi.gate``: the env-dial resolver (``lxkit.gate`` bound to this
+  package's loader) and the vendor platform key.
+* ``ffi.common``: library location and target registration (``ffi_loader``),
+  the per-leg family table (``families``), a byte-exact broadcast.
+
+Distributed and local dense linear algebra (GEMM plans, active-range GEMMs,
+LU, eigh) lives in ``services/distrib_la``, not here.  Contracts:
+``docs/architecture/ffi_layout.md`` (operations and targets) and
+``docs/architecture/kconv.md`` (the k-convolution modes); directory layout
+and how to add a target: ``AGENTS.md``.
 """
 
 

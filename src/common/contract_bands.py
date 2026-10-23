@@ -35,11 +35,16 @@ Structure (per rank, inside one shard_map)::
     left     = einsum(conj(ψ_left_local), right_rs)  contract (s, μ_X-local)
     out      = psum_scatter(left, 'x', dim=m)     small payload, 'x' groups
 
-Adopters (2026-07-28): the two Σ_c(τ) projection tails in
-``gw.ppm_tau_kernel`` (two-channel crossing plan + merged Laplace plan).
-Slated (owner review pending, wk_REL/contract_bands_notes.md §BSE):
-``bse.bse_stack_matvec._w_stack`` decode, the ``bse_ring_comm`` matvec
-family, ``vq_interp`` V_Q assembly.
+Consumers (``git grep -n contract_bands_block_reshard``): the GW Σ_mn
+projections on the face or axis carrier (``gw.ppm_tau_kernel``, whose τ
+row-pass stream uses ``layout="axis"``; ``gw.cohsex_sigma``,
+``gw.photon_sigma``, ``gw.mpa.sector_sigma``, ``gw.wavefunction_bundle``,
+``gw.plane_wave_pipeline``); the legacy body serves the BSE ring decode
+(``bse.bse_ring_comm``, ``extra="leading"``) and
+``common.zeta_projection``.  The BSE stack matvec does not call it: its
+decode is two batched einsums over k (``bse.bse_stack_matvec._decode_tm``,
+``_decode_v``, the first optionally fused into the k-convolution's store)
+reduced by :func:`reduce_scatter_to_band_block`.
 
 Encoded policies (each measured; evidence cited inline)
 -------------------------------------------------------
