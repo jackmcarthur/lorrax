@@ -826,22 +826,34 @@ def make_sharded_group_block_pivoted_cholesky_select(
                 take = avail & (global_pv > floor)
                 pivot_val = jnp.maximum(global_pv, floor)
 
-                gcol_slab = G_slab[:, global_p]
                 my_has_p = (global_p // M_slab == my_idx) & avail
                 local_p_rel = global_p - my_idx * M_slab
                 safe_idx = jnp.clip(local_p_rel, 0, M_slab - 1)
-                local_Lp = jnp.where(
-                    my_has_p, L[safe_idx, :], jnp.zeros_like(L[safe_idx, :]))
-                L_p = lax.psum(local_Lp, axis_name=mesh_axis)  # exact-reduce: masked broadcast, one owner of row p
 
-                prev_mask = (col_ids < j).astype(G_slab.dtype)
-                corr = L @ (jnp.conj(L_p) * prev_mask)
-                denom = jnp.sqrt(pivot_val)
-                newcol = (gcol_slab - corr) / denom
-                fix_row = my_has_p & (local_rows == local_p_rel)
-                newcol = jnp.where(
-                    fix_row, denom.astype(G_slab.dtype), newcol)
-                newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
+                def independent_column(_):
+                    gcol_slab = G_slab[:, global_p]
+                    local_Lp = jnp.where(
+                        my_has_p, L[safe_idx, :],
+                        jnp.zeros_like(L[safe_idx, :]))
+                    L_p = lax.psum(local_Lp, axis_name=mesh_axis)  # exact-reduce: masked broadcast, one owner of row p
+                    prev_mask = (col_ids < j).astype(G_slab.dtype)
+                    corr = L @ (jnp.conj(L_p) * prev_mask)
+                    denom = jnp.sqrt(pivot_val)
+                    newcol = (gcol_slab - corr) / denom
+                    fix_row = my_has_p & (local_rows == local_p_rel)
+                    return jnp.where(
+                        fix_row, denom.astype(G_slab.dtype), newcol)
+
+                # ``take`` comes from the global pivot reduction: every rank
+                # enters this collective branch together. Dependent points
+                # still consume their whole-orbit budget and keep the same
+                # deterministic pivots, but their column is exactly zero.
+                # Do not read the full factor or broadcast its row merely to
+                # discard the result once the numerical floor is reached.
+                newcol = lax.cond(
+                    take, independent_column,
+                    lambda _: jnp.zeros((M_slab,), dtype=G_slab.dtype),
+                    operand=None)
                 L = L.at[:, j].set(newcol)
                 piv = piv.at[j].set(jnp.where(
                     avail, global_p, jnp.int32(-1)))
