@@ -5,6 +5,15 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-23 — slab heads share the graded mini-BZ rule
+
+All slab scalar and photon heads now use the existing radially graded
+Wigner–Seitz rule (8/12/16 points on seven radial panels, 32 per edge).
+This resolves screened near-Γ scales that the previous single-panel
+16/24/32 rule could not certify. Both bare and screened final-pair errors
+must meet the unchanged `atol 1e-12`, `rtol 1e-8` budget. No deck changes
+are needed; fresh slab heads can move by the old quadrature error.
+
 ## 2026-10-23 — GW: the tangential W pole budget is 1.0 N_mu (was 1.8)
 
 - Production tier: at most ceil(1.0 N_mu) poles per parent (`pole_budget_fraction`, `gw/tangential_recipe.py`).

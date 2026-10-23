@@ -1083,7 +1083,7 @@ def _require_static_photon_numerical_certificate(
             "ladder produced invalid convergence diagnostics.\n"
             f"  got:  convergence shape = {convergence.shape}, values = "
             f"{convergence.tolist()}\n"
-            "  want: two finite error ratios for 16/24/32 orders\n"
+            "  want: two finite adjacent-order ratios for the provider ladder\n"
             "  why:  without both adjacent-order ratios the fixed ladder "
             "cannot certify convergence")
     if convergence[-1] > 1.0:

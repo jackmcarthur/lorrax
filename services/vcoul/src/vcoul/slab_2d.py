@@ -37,8 +37,8 @@ __all__ = ["Slab2D", "SlabQ0Certificate", "Q0_RULE_EXACT",
            "Q0_RULE_SOBOL_DEBUG"]
 
 #: The production q→0 cell-average rule: the exact mini-lattice
-#: Wigner--Seitz polygon, Γ-to-edge Duffy triangulation, fixed 16/24/32
-#: Gauss--Legendre ladder.  ONE owner, shared with the packed completion.
+#: Wigner--Seitz polygon, Γ-to-edge Duffy triangulation, graded radial
+#: 8/12/16 Gauss--Legendre ladder. ONE owner, shared with the packed completion.
 Q0_RULE_EXACT = "wigner_seitz_polygon"
 #: DEBUG/DIAGNOSTIC ONLY: the historical scrambled-Sobol Voronoi draw.
 #: Reachable only by naming it; never a production rule.
@@ -217,7 +217,7 @@ class Slab2D:
           :func:`~vcoul.minibz.slab_minibz_photon_cubature`.  The scalar
           charge head and the packed bispinor Γ completion therefore
           evaluate the same integral on the same nodes and weights.  The
-          16/24/32 ladder's last pair must converge under the mixed
+          8/12/16 ladder's last pair must converge under the mixed
           absolute+relative budget or the call REFUSES; the certificate is
           announced once per process.
         * ``"sobol_debug"`` — DEBUG/DIAGNOSTIC ONLY, the historical
@@ -338,6 +338,7 @@ class Slab2D:
         """Refuse an unconverged ladder; announce the certificate once."""
         ratios = []
         for index in range(1, len(ladder)):
+            component_ratios = []
             for slot in (1, 2):
                 previous, current = ladder[index - 1][slot], ladder[index][slot]
                 if previous is None or current is None:
@@ -353,8 +354,10 @@ class Slab2D:
                         f"current_abs={abs(current)!r}; want: all finite; "
                         "why: the fixed cubature ladder needs a valid "
                         "convergence certificate.")
-                ratios.append(
+                component_ratios.append(
                     delta / (_Q0_LADDER_ATOL + _Q0_LADDER_RTOL * scale))
+            if component_ratios:
+                ratios.append(max(component_ratios))
         if not ratios:
             raise ValueError(
                 "GATE slab_q0_polygon_nonfinite: comparable_ladder_pairs "
@@ -492,7 +495,7 @@ class Slab2D:
         charge head and the direct four-current Γ head
         (``gw.photon_direct_head``) average on, so the bare TT tile in V
         and the head that subtracts it are one reduction of one set of
-        numbers.  The 16/24/32 ladder's last pair must converge under the
+        numbers. The graded ladder's last pair must converge under the
         charge head's budget or the call refuses.  ``analytic_sphere`` is
         refused as in :meth:`q0_average`: a slab has no Baldereschi sphere.
         """

@@ -166,10 +166,12 @@ W_h(\omega)=\left\langle\frac{v(\mathbf q)}{1-v(\mathbf q)\,q_aS^{\rm eff}_{ab}(
 $$
 
 On a slab both brackets use the exact Wigner–Seitz polygon cubature of the
-mini-lattice: a Γ-to-edge Duffy triangulation on a fixed 16/24/32
-Gauss–Legendre ladder, issued by `vcoul.slab_minibz_photon_cubature`. The
+mini-lattice: a Γ-to-edge Duffy triangulation with seven geometric radial
+panels and a fixed 8/12/16 Gauss–Legendre ladder per panel, issued by
+`vcoul.slab_minibz_photon_cubature`. The
 packed completion of §4 reads the same receipt, so both routes evaluate one
-integral on one set of nodes. The call refuses if the 24→32 pair misses its
+integral on one set of nodes. The call refuses if either bare or screened
+average of the 12→16 pair misses its
 mixed tolerance. Bulk uses Sobol sampling plus the Baldereschi–Tosatti
 analytic sphere; the polygon construction is two-dimensional.
 
@@ -327,7 +329,7 @@ $M_{0a}$ and $M_{a0}$.
 
 Certificates: folded Ward residual $\le10^{-8}$, Hermiticity
 $\le10^{-10}$, Dyson forward-error bound $\le10^{-9}$, and the
-convergence of the 16/24/32 ladder. The completion is slab-only. A bulk
+convergence of the graded 8/12/16 ladder. The completion is slab-only. A bulk
 analytic sphere cannot be added after the nonlinear coupled solve, and no
 bulk integrator is derived for this route. Cost: $O(n_{\rm nodes})$
 4×4 solves on replicated data, plus ten rank-4 local outer products per
