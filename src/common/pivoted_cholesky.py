@@ -550,19 +550,40 @@ def make_sharded_pivoted_cholesky_select(
                 # too and is identical on every shard.
                 avail = global_pv > minus_inf
 
-                # Column p of G (no collective: G is row-sharded).
-                gcol_slab = G_slab[:, global_p]
-
                 # Row p of L: broadcast from owning shard via masked psum.
                 my_has_p = (global_p // M_slab == my_idx)
                 local_p_rel = global_p - my_idx * M_slab
                 safe_idx = jnp.clip(local_p_rel, 0, M_slab - 1)
-                local_Lp = jnp.where(
-                    my_has_p, L[safe_idx, :], jnp.zeros_like(L[safe_idx, :]),
-                )
+
+                def column_from_row(L_p):
+                    gcol_slab = G_slab[:, global_p]
+                    prev_mask = (col_ids_k < j).astype(G_slab.dtype)
+                    corr = L @ (jnp.conj(L_p) * prev_mask)
+                    denom = jnp.sqrt(pivot_val)
+                    newcol = (gcol_slab - corr) / denom
+                    fix_row_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
+                    return jnp.where(
+                        fix_row_mask, denom.astype(G_slab.dtype), newcol)
+
                 if orbit_id_slab is None:
-                    L_p = lax.psum(local_Lp, mesh_axis)  # exact-reduce: masked broadcast, one owner of row p
+                    def independent_column(_):
+                        local_Lp = jnp.where(
+                            my_has_p, L[safe_idx, :],
+                            jnp.zeros_like(L[safe_idx, :]))
+                        L_p = lax.psum(local_Lp, mesh_axis)  # exact-reduce: masked broadcast, one owner of row p
+                        return column_from_row(L_p)
+
+                    # The global pivot makes ``take`` identical on all
+                    # ranks. Keep delivering distinct points below the rank
+                    # floor without broadcasting or reading a zero column.
+                    newcol = lax.cond(
+                        take, independent_column,
+                        lambda _: jnp.zeros((M_slab,), dtype=G_slab.dtype),
+                        operand=None)
                 else:
+                    local_Lp = jnp.where(
+                        my_has_p, L[safe_idx, :],
+                        jnp.zeros_like(L[safe_idx, :]))
                     # ONE psum, not two.  The orbit id of the picked pivot
                     # rides the SAME masked broadcast as L[p, :] — it is the
                     # same idiom, from the same owner, at the same point in
@@ -579,16 +600,8 @@ def make_sharded_pivoted_cholesky_select(
                     L_p = _fused[:k_keep]
                     orbit_id_p = jnp.round(
                         jnp.real(_fused[k_keep])).astype(jnp.int32)
-
-                # New column.
-                prev_mask = (col_ids_k < j).astype(G_slab.dtype)
-                corr = L @ (jnp.conj(L_p) * prev_mask)
-                denom = jnp.sqrt(pivot_val)
-                newcol = (gcol_slab - corr) / denom
-                # Pivot-row entry exactly sqrt(d[p]), only on the owner.
-                fix_row_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
-                newcol = jnp.where(fix_row_mask, denom.astype(G_slab.dtype), newcol)
-                newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
+                    newcol = column_from_row(L_p)
+                    newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
 
                 L = L.at[:, j].set(newcol)
                 piv = piv.at[j].set(jnp.where(avail, global_p, jnp.int32(-1)))

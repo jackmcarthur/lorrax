@@ -112,3 +112,34 @@ def test_duplicate_pool_repair_closure_density_order_and_grid_capacity():
     assert len(full) == len(all_idx)
     assert np.array_equal(np.sort(np.ravel_multi_index(full.T, grid)), flat)
     assert _restore_orbit_pool(seed, grid, weight, Rinv, tau, 2) is seed
+
+
+def test_literal_complex_pc_full_rank_and_exhausted_tail():
+    import jax
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from common.pivoted_cholesky import make_sharded_pivoted_cholesky_select
+
+    mesh = Mesh(np.array(jax.local_devices()[:1]), ("x",))
+    active = np.arange(24) < 22
+    for feature_rank in (3, 22):
+        rng = np.random.default_rng(901+feature_rank)
+        features = rng.normal(size=(22, feature_rank))+1j*rng.normal(size=(22, feature_rank))
+        G = np.zeros((24, 24), complex)
+        G[:22, :22] = features@features.conj().T
+        expected_piv, expected_rank, expected_L = _numpy_group_pc(
+            G, np.arange(24), active, 20)
+        kernel = make_sharded_pivoted_cholesky_select(
+            mesh, 24, 20, mesh_axis="x")
+        piv, L, rank, d_final, d_taken, trace, info = jax.device_get(kernel(
+            jax.device_put(G, NamedSharding(mesh, P("x", None))), None,
+            jax.device_put(active, NamedSharding(mesh, P("x")))))
+        assert int(rank) == expected_rank
+        assert np.array_equal(piv[:rank], expected_piv[:rank])
+        assert len(np.unique(piv)) == 20 and np.all((piv >= 0) & (piv < 22))
+        np.testing.assert_allclose(L, expected_L, rtol=1e-11, atol=1e-11)
+        assert np.max(np.abs(L[:, d_taken == 0]), initial=0) == 0
+        remainder = G-L@L.conj().T
+        assert np.linalg.eigvalsh(remainder).min() > -1e-10
+        assert np.all(np.isfinite(d_final)) and np.all(np.isfinite(trace))
+        if feature_rank == 3:
+            np.testing.assert_allclose(remainder, 0, atol=1e-11)
