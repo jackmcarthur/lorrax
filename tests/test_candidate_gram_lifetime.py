@@ -20,7 +20,10 @@ def main():
     features = [np.sin((row + 1) * (feature + 2) * (k + 1) / 29)
                 + 1j * np.cos((row + 3) * (feature + 1) * (k + 2) / 31)
                 for k in range(5)]
-    gram_k = [z @ z.conj().T for z in features]
+    # Deliberately non-Hermitian raw blocks make the terminal fold observable.
+    # The separate Fourier reference covers the physical candidate builder.
+    gram_k = [z @ z.conj().T + (k + 1) * (row + 1j * row.T) / 97
+              for k, z in enumerate(features)]
     wfn = SimpleNamespace(
         nspinor=1,
         full_k_parent_groups=lambda rows: [(int(k), np.array([k])) for k in rows],
@@ -33,6 +36,7 @@ def main():
         expected_blocks = []
 
         def build_block(*args, full_k_rows=None, k_weights=None, **kwargs):
+            assert kwargs['hermitian_fold'] is False
             if len(blocks) > 1:
                 assert blocks[-1].is_deleted(), (
                     'consumed Gram block remained live when the next WFN batch began')
@@ -54,16 +58,16 @@ def main():
         expected = expected_blocks[0].copy()
         for block in expected_blocks[1:]:
             expected += block
+        expected = 0.5 * (expected + expected.conj().T)
         independent = sum(w * g for w, g in zip(weights, gram_k))
+        independent = 0.5 * (independent + independent.conj().T)
         for shard in actual.addressable_shards:
             np.testing.assert_array_equal(np.asarray(shard.data), expected[shard.index])
             np.testing.assert_allclose(
                 np.asarray(shard.data), independent[shard.index],
                 rtol=2e-15, atol=2e-15)
-        if len(blocks) > 1:
-            assert all(block.is_deleted() for block in blocks)
-        else:
-            assert blocks[0] is actual and not actual.is_deleted()
+        assert all(block.is_deleted() for block in blocks)
+        assert not actual.is_deleted()
         assert actual.sharding.spec == P('x', 'y')
         actual.delete()
 

@@ -226,6 +226,15 @@ entire local Gram at every tile. The complex scalar, spinor and transverse featu
 in `tests/test_gram_tiled_alias.py` checks partial edges, exact tiles and
 oversized tiles against an independent direct transition-feature sum.
 
+K-batch accumulation keeps each Gram raw, then applies the original
+Hermitian fold once after the real-weighted sum and after releasing WFN
+faces. The fold is real-linear; deferring it preserves the exact metric
+while avoiding overlap between its two local-Gram scratch buffers and a
+second running Gram. Floating-point association may reorder near-tied
+pivots. The standalone batch builder still folds by default. Conservative
+deferred-pipeline pricing is `max(faces + 2*Gram + tile, 3*Gram)` per device;
+the standalone folded path retains `faces + 3*Gram + tile`.
+
 ## Decision criteria
 
 First separate input reads, diagonal construction, Lloyd assignment/update,
