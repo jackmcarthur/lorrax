@@ -21,6 +21,7 @@ Goals
 1. Compute a fully relativistic GW bandstructure with LORRAX.
 2. Solve the BSE and plot interacting and independent-particle absorption.
 3. Compare the inputs, outputs and timings with the BerkeleyGW track.
+4. Plot the finite-momentum exciton bands with LORRAX.
 
 Instructions
 ------------
@@ -34,3 +35,8 @@ Instructions
    mean-field commands.
 3. Compare your plots and tables with the [saved results](results/README.md),
    which distinguish successful execution from agreement between the codes.
+
+The final BSE folder adds [exciton bands](3-bse/3-lorrax_fully_rel/3-exciton-bands/README.md)
+along Gamma–M–K–Gamma and a near-Gamma zoom. Its 30 × 30 × 1 integration
+grid interpolates the same 3 × 3 × 1 screening calculation; it is a
+separate grid from the shifted 8 × 8 × 1 optical calculation above.

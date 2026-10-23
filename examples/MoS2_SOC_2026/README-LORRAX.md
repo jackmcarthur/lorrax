@@ -24,6 +24,8 @@ Goals
 2. Export screening and a BSE kernel in BerkeleyGW's file layouts.
 3. Calculate and compare optical absorption with and without electron-hole
    interactions, then compare the fully relativistic results between codes.
+4. Calculate exciton bands along Gamma–M–K–Gamma and inspect their
+   near-Gamma dispersion.
 
 Instructions
 ------------
@@ -133,6 +135,13 @@ with absolute energy references and Cartesian coordinates.
 The native BSE uses six valence and eight conduction bands on the shifted
 `8 8 1` grid, shift `(0.47, 0.37, 0)`, polarization `(1, 1, 0)` and 0.15 eV
 Gaussian broadening. All 3,072 retained Tamm–Dancoff roots are requested.
+
+The additional `3-bse/3-lorrax_fully_rel/3-exciton-bands` stage keeps the same
+six-valence/eight-conduction window, with 64 lowest roots on a Gamma-centered
+`30 30 1` integration grid at each exciton momentum. Its full-path and
+near-Gamma plots use LORRAX only. The [stage README](3-bse/3-lorrax_fully_rel/3-exciton-bands/README.md)
+explains the linear and quadratic behavior to inspect near Gamma, the
+independent-particle threshold and the separate integration-grid checks.
 
 Comparison
 ----------

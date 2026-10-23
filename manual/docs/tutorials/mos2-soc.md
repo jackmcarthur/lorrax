@@ -25,6 +25,7 @@ describes the differences between the main plane-wave package and LORRAX.
 1. Follow fully relativistic, two-component DFT wavefunctions through GW and BSE.
 2. Run LORRAX using a directory layout familiar from the BerkeleyGW workshop.
 3. Compare band structures and absorption spectra between the two codes.
+4. Follow the exciton bands away from Γ with LORRAX.
 
 ## Settings {: #prerequisites }
 
@@ -43,6 +44,7 @@ four-GPU node for LORRAX.
 | Fine BSE grid | 8 × 8 × 1, shifted by (0.47, 0.37, 0) in grid-step units |
 | Fine BSE bands | Six valence and eight conduction; all 3,072 Tamm–Dancoff roots |
 | Spectrum | 0.15 eV Gaussian width; 0.01 eV spacing |
+| Exciton bands | Γ-centered 30 × 30 × 1 integration grid; six valence and eight conduction bands; 64 lowest roots per Q |
 
 ## Steps {: #instructions }
 
@@ -68,11 +70,46 @@ commands and what to check.
    together (`2-sigma`), which also exports `eps0mat.h5` and `epsmat.h5`, and
    the band structure by [`htransform`](../utilities/htransform-bands.md) (`3-bs`).
 4. **LORRAX BSE.** The `bsemat.h5` export (`3-bse/3-lorrax_fully_rel/1-kernel`)
-   and the BSE with its absorption spectra (`2-absorption`).
+   and the BSE with its absorption spectra (`2-absorption`), followed by
+   finite-momentum exciton bands (`3-exciton-bands`).
 
 `bash 00-run-lorrax.sh` runs parts 3 and 4 in order on a four-GPU allocation
 and makes the plots. The [For BerkeleyGW users](../using/berkeleygw-users.md)
 page maps the workshop's `.inp` keys to the `gw.in` inputs.
+
+## Exciton bands {: #exciton-bands }
+
+The final LORRAX stage solves the finite-momentum BSE along Γ–M–K–Γ:
+
+```bash
+cd 3-bse/3-lorrax_fully_rel/3-exciton-bands
+bash 01-run_exciton_bands.run
+source ../../../2-gw/3-lorrax_fully_rel/lorrax_env.sh
+lorrax_python 02-plot_exciton_bands.py
+```
+
+The [exciton-bands driver](../drivers/exciton-bands/index.md) uses the
+same native GW restart as the optical calculation. H-transform interpolation
+supplies the conduction states at k + Q; the hole remains at k. Its
+Γ-centered 30 × 30 × 1 grid samples the electron-hole sum, while screening
+and the QP Hamiltonian still originate on the 3 × 3 × 1 coarse grid.
+The additional points make the dispersion smoother; they do not establish
+convergence of the coarse screening.
+
+`exciton_bands.dat` contains the 64 lowest levels at each Q. The plot shows
+those levels along the full path and enlarges the low-energy structure near Γ.
+A matching `exciton_bands_continuum.dat` adds the independent-particle
+threshold from the same interpolated QP transitions, rather than from the
+coarse gap. Increase the root count if the highest plotted level does not
+reach that threshold.
+
+In two dimensions, long-range exchange permits a leading term linear in
+|Q| for a longitudinal bright combination, while its transverse partner
+starts quadratically. Compare these shapes near Γ. Energies alone do not
+identify a branch as bright or dark, or fix its polarization. For a cheaper
+integration grid, first compare the supplied short `gw-near-gamma.in` scan
+at otherwise identical 18 × 18, 24 × 24 and 30 × 30 settings. The original
+workshop has no corresponding exciton-dispersion step.
 
 ## Results {: #results }
 
