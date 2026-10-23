@@ -45,3 +45,12 @@ They replicate the other mesh axis. With only 19 physical centroids, world-size
 centroid padding still matters; the staged probe intentionally preserves it.
 This avoids conflating raw coefficient sharding with the memory needed to retain
 all k/band face outputs simultaneously.
+
+`parent_store_pad_check.py --wfn /scratch/WFN_axes.h5 --out /scratch/pad_check`
+checks the application's one-read parent G-slot store against the same declared
+dyadic fixture formula. Use at least four ranks so seven G slots need mesh
+padding. The default window also includes a band tail; every local coefficient
+and G/band pad is checked bitwise. Two complete store constructions report
+first/repeated wall time, process RSS peak and compile-cache counters. Reference
+generation and hashing are outside the timer. This checks store I/O, padding
+and redistribution, without a material-physics or large-FFT throughput claim.

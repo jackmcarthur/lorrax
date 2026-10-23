@@ -1131,7 +1131,7 @@ def load_parent_psi_G(
     from common.wfn_transforms import (
         load_psi_gflat_padded, _centroid_sampling_geometry,
         _centroid_sampling_shardings, _centroid_face_kernels)
-    from runtime.padding import padded_axis, mesh_divisor
+    from runtime.padding import padded_axis, pad_to_axis, mesh_divisor
 
     if placement not in ("device", "host", "none"):
         raise ValueError(
@@ -1144,7 +1144,8 @@ def load_parent_psi_G(
     b0, b1 = (int(v) for v in band_range)
     w = padded_axis(int(band_chunk), P_, name="ψ(G) band chunk").carrier
     nb_c = padded_axis(b1 - b0, P_, name="ψ(G) band carrier").carrier
-    ngk_c = padded_axis(int(loader.ngkmax), P_, name="ψ(G) G-slot carrier").carrier
+    g_axis = padded_axis(int(loader.ngkmax), P_, name="ψ(G) G-slot carrier")
+    ngk_c = g_axis.carrier
     k_spec = "ibz" if k_domain == "ibz" else "full_bz"
     nk = int(loader.nkpts) if k_spec == "ibz" else int(meta.nk_tot)
 
@@ -1223,10 +1224,7 @@ def load_parent_psi_G(
             if chunk is None:          # wholly past the file's bands: zeros
                 continue
             if int(chunk.shape[-1]) < ngk_c:
-                chunk = jax.jit(
-                    lambda a: jnp.pad(a, ((0, 0), (0, 0), (0, 0),
-                                          (0, ngk_c - a.shape[-1]))),
-                    out_shardings=NamedSharding(mesh_xy, band_sphere_spec()))(chunk)
+                chunk = pad_to_axis(chunk, g_axis, axis=-1)
             jax.block_until_ready(chunk)
         t1 = _time.perf_counter()
         kern = _gslot_face_kernel(mesh_xy, fft_grid, nk, wc, ns, ngk_c,

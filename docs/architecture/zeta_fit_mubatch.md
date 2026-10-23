@@ -236,6 +236,8 @@ Each fit family reads ψ(G) once: `common.psi_G_store.load_parent_psi_G`
 samples the family's centroid faces and keeps the G-slot store on the device
 for the loop (charge in `gw_init._prepare_fresh_parent_faces`, currents in
 `gw_init._fit_transverse_zeta_channels`).
+G-slot carrier padding uses `runtime.padding`'s reusable program, so it does
+not rebuild a JAX function for every band chunk.
 
 ## Memory per rank and the planner
 
