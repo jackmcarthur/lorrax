@@ -1,93 +1,81 @@
 # Running on clusters
 
-How many GPUs a calculation needs: the job rules, the per-GPU budget, a Green's-function size estimate, and real Perlmutter runs.
+Choose a process count, read the memory plan, and compare with measured GW calculations on Perlmutter.
 {: .page-summary }
 
 ## Job rules {: #rules }
 
-- **Process count.** One process per device, and the device count a perfect square: 1, 4, 9, 16, 25, 36, …. Any other count refuses at startup and names the two nearest squares; 32 GPUs (8 Perlmutter nodes) is not a legal job, 36 (9 nodes) is.
-- **One GPU model and memory class.** Mixed models refuse (`GATE heterogeneous_gpu_targets`). On Perlmutter a multi-node job requests `-C 'gpu&hbm40g'` or `-C 'gpu&hbm80g'`.
-- **Shared run directory.** A multi-node run writes into a directory every node mounts (`$SCRATCH`, CFS). A node-local one (`/tmp`, local NVMe) refuses at the first write (`GATE io_global_commit`, stage `SlabIO.shared_directory`).
+- **Process count.** Use one MPI rank per GPU and a square total: 1, 4, 9, 16, 25, 36, …. The mesh has equal `x` and `y` dimensions. CPU jobs use the same square rank counts; 64 and 144 ranks give 8×8 and 12×12 meshes. Set the cores and threads per rank explicitly using the [machine launch settings](installation.md#routes).
+- **One GPU model and memory class.** Mixed models refuse (`GATE heterogeneous_gpu_targets`). On Perlmutter request `-C 'gpu&hbm40g'` or `-C 'gpu&hbm80g'` for a multi-node GPU job.
+- **Shared run directory.** Every rank must see the same run directory (`$SCRATCH` or CFS). A multi-node write to a node-local directory refuses (`GATE io_global_commit`, stage `SlabIO.shared_directory`).
 
-Launch lines per machine are on the [installation page](installation.md#routes).
+Run centroids → dipole → kinetic/ionic matrix elements → GW under the same environment and with matching inputs. Complete band multiplets at every selected window boundary; widening a requested band count is preferable to cutting a degenerate subspace. Preserve the resolved counts in the reference record.
 
-## The per-GPU budget {: #budget }
+## The memory budget {: #budget }
 
-Every planner prices its stage against one budget per device, set from the card's memory before the deck is read:
+The planners share one budget per device. Leave [`memory_per_device_gb`](../drivers/gw/keywords.md#memory_per_device_gb) at zero for the automatic budget; a positive value can lower it. The budget leaves room for runtime contexts, native providers and allocation transients.
 
-| Card | Budget, `linalg = local` | Budget, `linalg = distributed` |
-|---|---|---|
+| GPU | Automatic budget, `linalg = local` | Automatic budget, `linalg = distributed` |
+|---|---:|---:|
 | A100-40GB | 31.6 GB | 28.7 GB |
 | A100-80GB | 66.4 GB | 63.4 GB |
 
-[`memory_per_device_gb`](../drivers/gw/keywords.md#memory_per_device_gb) can only lower it; a larger value warns and keeps the rule. No stage refuses on a price. A stage priced over the budget prints `memory over budget at <stage>: needs … GB/rank, budget … GB/rank, over by … GB; continuing (an OOM is possible)`, listed under `WARNINGS` in the report, runs at its smallest tile, and fails at allocation if the memory is really missing. Large objects are tiled over every rank, so the fix is more ranks or larger cards. A compiled program larger than the card refuses before it runs (`GATE xla_rematerialization`), with the same fix.
+GB means decimal GB throughout this page. On CPU, the budget starts from node memory divided among its ranks. Increasing ranks on one node divides the arrays but also adds a Python/JAX runtime, compiled programs and host staging per rank. Compare the node's combined host usage as well as the largest rank.
 
-After a GW run, the `MAJOR-STAGE DEVICE AND HOST MEMORY` block of `gwjax.out` lists each stage's device peak (max and min over ranks), its planner price and γ = peak / price, and the host high-water. A stage with γ > 1 was under-priced; the stage that set the run's peak is the one to size against. Some planners (the ζ batch, the response sample group, the tangential panels) size their tiles from the budget, so a run's peak grows with the card and is an upper bound on what it needs.
+Read `TIMING` and the pool/host peaks in `gwjax.out`, together with the `ISDF μ-batch plan`, selected routes and any `memory over budget` warnings. Verbose reports include the detailed stage-memory, price and sizing receipts. A planner can fill the available budget to run a wider batch: its observed peak is not the minimum memory required by that input. When no route fits, admission warns and selects the least-memory available route; it does not guarantee the allocation will succeed. A compiled executable larger than the device refuses before execution.
 
-## How many GPUs? {: #how-many }
+The reported device peak measures memory in the device pool. NVML also sees reserved pool space and allocations outside that pool, so its number answers a different question. Keep host high-water and per-node totals alongside the device measurement.
 
-**1. Centroids.** Take $N_\mu \approx 10\times$ the number of bands as a starting reference (Ni 20³: 120 bands, 1200 centroids; Fe 20³: 184 bands, 1792). Converge it with the [centroids utility](../utilities/centroids.md).
+## How many processors? {: #how-many }
 
-**2. One Green's function.** In complex128,
+Start around $N_\mu = 10N_b$ centroids, then converge the basis. The selector retains complete symmetry orbits, and storage may add dummy slots for the mesh. Use the **packed** centroid extent when estimating storage; keep it distinct from the number of physical interpolation points.
+
+One full-zone complex128 Green's function has size
 
 $$
-G = 16\,n_s^2\,N_\mu^2\,N_k \ \text{bytes},
+G = 16\,n_s^2\,N_\mu^2\,N_k \quad\text{bytes},
 $$
 
-with $n_s$ the spinor count (1 scalar, 2 spinor, 4 bispinor) and $N_k$ the **full** k grid. The Greens are stored on the irreducible parents, but V, W and the Σ passes are unfolded on the full grid, and the code sizes against it: the ζ-fit receipt prints `G_tile unit = … GB/dev (nk·ns²·μ²·16/P)`, which is $G/P$. On a grid with no symmetry the two counts agree; on a cubic metal the full grid is 12× the irreducible one (Ni 20³: 8000 vs 641).
+where $N_k$ counts the **full** k grid and $n_s$ is 1 for scalar, 2 for spinor and 4 for bispinor wavefunctions. A face distribution `G_k(mu_X,nu_Y)` on an $X\times Y$ mesh divides this leading storage by $P=XY$. Symmetry can reduce the stored parent set; full-zone consumers still matter for planning.
 
-**3. Total memory.** LORRAX's own multiple is **3**: the tangential screening and Σ ledger holds its live set within $3U$, $U = G/P$ per rank, and warns above it; the ζ fit's feasibility ceiling is $4\,G/P$. Below $3G$ the stages tile and stream instead of failing, so the multiple is a comfort target, not a floor. The 20³ metal runs completed with $G/P$ at about 1.2× the card (47 GB per 40 GB A100).
+**$3G/P$ is a useful first planning target, not a universal peak or a fit guarantee.** Small-k-grid calculations can be dominated by wavefunction staging, ζ-fitting FFT/work buffers, Coulomb factors or solver workspace. Streamed routes may use less. Read the actual compiled/native workspace price for the chosen input and mesh, then measure a complete run. Do not infer a smaller working process count by dividing a measured peak by card capacity.
 
-| Use | GPUs |
-|---|---|
-| comfortable | smallest square $P$ with $P\cdot B \ge 3G$ |
-| measured floor (20³ metals) | $G/P \lesssim 1.2\times$ card memory |
-
-$B$ is the budget per GPU from the table above.
-
-**Worked examples.**
-
-| System | $n_s$ | $N_\mu$ | $N_k$ | $G$ | $3G$ | comfortable on A100-80 |
-|---|---|---|---|---|---|---|
-| Si SOC, 6×6×6 | 2 | 996 | 216 | 13.7 GB | 41 GB | 1 |
-| MoS₂, 9×9×1 | 2 | 1200 | 81 | 7.5 GB | 22 GB | 1 |
-| Ni, 20×20×20 | 2 | 1200 | 8000 | 737 GB | 2.2 TB | 36 (9 nodes) |
-| Ni bispinor, 20×20×20 | 4 | 1200 | 8000 | 2.95 TB | 8.8 TB | 144 (36 nodes) |
-
-**4. Small k grids.** When $G$ is small the ζ fit sets the peak, not the Green's functions: it holds ψ(G) on the rank's G slots, $16N_kN_bn_sN_{G\psi}/P$, and its μ-batch working set. CrI₃ 6×6×1 has $G = 2.2$ GB, yet its ζ fit asks 70 GB per GPU at P = 4. Read the `ISDF μ-batch plan` receipt in `gwjax.out`; when the fit's price is above `feasibility ceiling 4·G_tile`, the fit sets the node count.
+For many-band runs, inspect the wavefunction route too. A two-axis distribution such as `psi_k(n_X,s,mu_Y)` reduces both large axes, giving leading storage proportional to $1/P$. A faster band-complete carrier `psi_k(n,s,mu_Y)` scales as $1/\sqrt P$; bounded panels offer another way to stage a contraction. Record the actual selected carrier and panels: they have different memory and communication costs.
 
 ## Local or distributed linear algebra {: #linalg }
 
-The deck key `linalg` (default `local`) sets the layout of every dense solve. Under `local` each GPU solves whole $N_\mu\times N_\mu$ matrices for its share of the irreducible q points, with no distributed factorization; under `distributed` each matrix is factored over the whole mesh (cuSOLVERMp), which divides its memory by $P$ but communicates inside every factorization.
+`linalg = local` requests whole-matrix solves on individual ranks. The services price those matrices and their workspace and can use the mesh route when they do not fit. `linalg = distributed` requests matrix solves across the mesh. Both operate on distributed inputs and outputs; the distinction is where the solve itself happens.
 
-`local` is a request, not a guarantee. At each W Dyson solve the code prices the local route, the face-tiled V, χ and W plus whole copies for $\lceil Q_{\rm irr}/P\rceil$ q points and one LU pair,
+Whole-matrix solves are often faster when several independent q matrices fit per rank. Distributed solves become useful when one matrix and its workspace are too large. Read the selected route in the report instead of inferring it from the deck alone.
 
-$$
-\frac{48\,Q_{\rm irr}N_\mu^2}{P} + 16N_\mu^2\left(3\lceil Q_{\rm irr}/P\rceil + 2\right)\ \text{bytes per GPU},
-$$
+## Reference runs on Perlmutter {: #examples }
 
-and runs it only if it fits the budget; otherwise it falls back to the distributed LU. Eigensolves choose the same way between whole matrices per GPU and the whole-mesh eigensolver, by fit and modelled speed. The choice prints once as `route W Dyson …: local` (or `distributed`) and appears in the report's Routes table.
+These are fresh fixed-input $G_0W_0$ runs from **23 October 2026**, pinned to source [`2d2ca2f104`](https://github.com/jackmcarthur/lorrax/commit/2d2ca2f104a085876a573e8b1278a7874c479b98). They use native full head corrections, default accuracy and automatic batch/layout selection. They establish completed workloads, not k-grid/band/basis convergence or minimum processor counts.
 
-More GPUs therefore do two things: they divide every tiled object, and they shrink $\lceil Q_{\rm irr}/P\rceil$ until the whole-matrix route fits, so the solves stop communicating. Past $P = Q_{\rm irr}$ the ζ charge factor has no more q points to spread, and the run says so. Set `linalg = distributed` only when a few whole $N_\mu\times N_\mu$ matrices do not fit one GPU.
+Wall time is the GW driver's `total run`, including setup and compilation but excluding centroid/dipole/kinetic preprocessing, queue wait and allocation startup. All GPU rows use A100-80GB cards and the automatic local-linalg budget (66.35 GB in the saved receipts). Persistent compilation caches were shared; the counts below make their state explicit.
 
-## Example runs on Perlmutter {: #examples }
+| System | Full k grid / stored parents | Occupied bands | Sum bands | Physical $N_\mu$ | $n_s$ | Method | Resources | GW wall | Pool peak/rank |
+|---|---|---:|---:|---:|---:|---|---|---:|---:|
+| Si SOC, 2 atoms | 4×4×4 / 8 | 8 | 52 | 528 | 2 | GN-PPM | 4 GPUs, 1 node | 59.52 s | 9.71 GB |
+| Al₂O₃, 10 atoms | 4×4×4 / 13 | 24 | 154 | 1584 | 1 | GN-PPM | 4 GPUs, 1 node | 39.23 s | 19.03 GB |
+| Ferromagnetic bcc Fe | 8×8×8 / 59 | 18 (fractional) | 110 | 1099 | 2 | Shared-pole | 4 GPUs, 1 node | 353.07 s | 33.43 GB |
 
-A100 runs from October 2026. Wall time is the driver's `total run` line (start of the process to the report; no queue wait). The minimum is measured where a smaller run exists; otherwise (*) it is the smallest square $P$ whose total budget covers the run's summed per-GPU peaks, which over-states the need because some planners fill the budget.
+| Run | Setup | ISDF / Coulomb | Screening | Self-energy | QP update | Real compiles / cache hits | Summed compile time |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Si SOC | 13.27 s | 25.96 s | 9.21 s | 10.41 s | 0.58 s | 134 / 126 | 29.7 s |
+| Al₂O₃ | 14.31 s | 13.88 s | 4.48 s | 5.96 s | 0.57 s | 10 / 271 | 2.4 s |
+| Fe | 18.59 s | 63.29 s | 176.44 s | 87.07 s | 5.94 s | 497 / 29 | 139.73 s |
 
-| System | k grid | Bands | $N_\mu$ | $n_s$ | Driver, method | GPUs used | Minimum | Wall |
-|---|---|---|---|---|---|---|---|---|
-| Si | 4×4×4 | 34 | 2952 | 1 | gw, MPA one-shot | 4 × 80 GB | 4 × 40 GB* | 338 s |
-| Si SOC | 6×6×6 | 60 | 996 | 2 | gw, HL-PPM one-shot | 4 × 40 GB | 1 × 80 GB* | 79 s |
-| Si SOC | 10×10×10 | 8 v + 8 c | 996 | 2 | bse, Davidson, 16 roots | 4 × 40 GB | 1 × 80 GB* | 86 s |
-| MoS₂ | 9×9×1 | 80 | 1200 | 2 | gw, COHSEX | 4 × 80 GB | 4 × 40 GB* | 26 s |
-| CrI₃ | 6×6×1 | 160 | 980 | 2 | gw, MPA one-shot | 4 × 80 GB | 4 × 80 GB (ζ fit already over budget) | 83 s |
-| CrI₃ | 8×8×1 | 42 v + 14 c | – | 2 | bse, Davidson, 112 roots | 4 × 80 GB | not logged | 539 s |
-| Fe | 4×4×4 | 36 | 4220 | 2 | gw, MPA one-shot | 4 × 80 GB | 4 × 40 GB* | 1188 s |
-| Ni | 20×20×20 | 120 | 1200 | 2 | gw, MPA self-consistent | 64 × 40 GB | 16 × 40 GB | 4691 s |
-| Ni bispinor | 20×20×20 | 120 | 1200 | 4 | gw, MPA self-consistent | 64 × 80 GB | 64 × 40 GB | 3604 s per SC leg |
+The Si and Al₂O₃ peaks are the rounded production pool high-water, maximized over ranks; both occur in ζ fitting. They are not exact native-pointer ledgers or total physical GPU memory. Their maximum host `ru_maxrss` is 2.43 and 4.46 GB per rank, respectively. Packed centroid extents were not emitted in these saved reports. The runs have different cache histories, so their wall times are not a controlled performance comparison.
 
-Notes on the 20³ metals (1200 centroids, padded to 1216 at P = 64):
+The Si request was widened from 48 to 52 sum bands to complete a multiplet. The Al₂O₃ request was widened from 144 to 154 (156 padded band slots); the requested QP matrix covers bands 1–30. Its dynamic Σ grid begins at −24 eV to cover the deep valence states; the final run reports complete coverage. The earlier Al₂O₃ pilot with static fallback for deep states is excluded from this table.
 
-- **Ni, spinor.** A 16 × 40 GB run completed one SC iteration in 1215 s with a 36.6 GB peak per GPU, just over its budget. So it fits on 16.
-- **Ni, bispinor.** It does not fit on 16: $G/P$ is 184 GB per GPU there. On 64 × 40 GB one SC leg completed in 3537 s (37.6 GB peak, over budget with a warning). On 64 × 80 GB the ledger asked 102 GB per GPU at the Σ sector stage and the peak reached 76 GB. 144 GPUs would be comfortable.
+Fe uses 110 physical sum bands (112 padded slots), 1099 physical centroids (1100 packed slots at P4), and the production shared-pole recipe with a pole budget of $1.0N_\mu$: 1099 poles per q from 35 samples. Band 18 is the occupied edge; the finite-temperature density tails are retained. The requested 4-valence/4-conduction frontier gives a Σ/QP prefix of bands 1–22. Its compile row excludes eight additional runtime-startup compiles; compile seconds are cumulative API time on rank 0, not a sum over MPI ranks or a critical-path decomposition.
 
+Fe's 33.43 GB is the post-startup pool-**used** high-water. The default allocator also maps a **77.895 GB pool reservation** at startup, with context/vendor storage outside it; physical process high-water was not sampled. An exact XLA-request ledger gives 33.434 GB after startup and excludes direct native allocations. These measurements do not establish a 40 GB fit. The largest host `VmHWM` is 5.53 GB/rank.
+
+Fe retains the default `sigma_reads_past_w_support` warning. Its Σ energy grid covers the requested bands; the warning concerns the W model's sampled support range and remains relevant to a separate accuracy study.
+
+All ranks exited successfully and the canonical Σ and QP outputs were checked for the stated shapes and finite entries. Preserve the input hashes, exact decks, resolved geometry, selected routes, compilation counts and all-rank exit records when repeating a reference.
+
+The [reproduction notes](../assets/cluster-references/2026-10-23/README.txt) describe the input arrangement and launch sequence. Exact decks and manifests: [Si](../assets/cluster-references/2026-10-23/si_soc/gw.in) / [record](../assets/cluster-references/2026-10-23/si_soc/manifest.json), [Al₂O₃](../assets/cluster-references/2026-10-23/al2o3_10/gw.in) / [record](../assets/cluster-references/2026-10-23/al2o3_10/manifest.json), [Fe](../assets/cluster-references/2026-10-23/fe_8x8x8/gw.in) / [record](../assets/cluster-references/2026-10-23/fe_8x8x8/manifest.json). The text bundle includes DFT decks and physical centroid tables; large wavefunction and generated matrix files remain in the NERSC evidence archive named in each record.
