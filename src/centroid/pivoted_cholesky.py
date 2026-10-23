@@ -1256,7 +1256,7 @@ def prune_candidates_by_pivoted_cholesky(
 
 
 def _left_band_slice(left, right):
-    """``(lo, hi)`` of a distinct left window inside the right one, else None.
+    """``(lo, hi)`` of a left window inside the right one, else None.
 
     The default ``v_x_vc`` feature pair (occupied + Σ conduction on the left,
     every band on the right) is nested.  Its left faces are then the rows
@@ -1264,7 +1264,7 @@ def _left_band_slice(left, right):
     """
     l0, l1 = int(left[0]), int(left[1])
     r0, r1 = int(right[0]), int(right[1])
-    if (l0, l1) == (r0, r1) or l0 < r0 or l1 > r1:
+    if l0 < r0 or l1 > r1:
         return None
     return l0 - r0, l1 - r0
 
@@ -1517,12 +1517,6 @@ def _build_gram_q0_kbatch(
         raise ValueError(
             f"Empty band window: left={left_range} right={right_range}"
         )
-    # Equal windows (every production run) load ONE set of faces and pair
-    # tensors and pass them as both sides: the right load would repeat the
-    # same WFN read, FFT and norm clamp on the same bands, so reuse is
-    # bitwise the second load's value.
-    same_window = left_range == right_range
-
     # Meta's nband must cover whichever of left/right reaches higher.
     max_band = max(left_range[1], right_range[1])
     # Meta.nval is physical occupancy, not the width of the left feature
@@ -1676,9 +1670,7 @@ def _build_gram_q0_kbatch(
         col_block = gram_tile_width(nk_, ns_, M_cols, divisor=tile_divisor,
                                     x_shards=n_x, y_shards=n_y)
 
-    if same_window:
-        psi_r_rmu_Y, psi_r_rmuT_X = psi_l_rmu_Y, psi_l_rmuT_X
-    elif left_slice is None:
+    if left_slice is None:
         with timing.section("right.load"):
             psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
                 wfn, sym, meta, cand_idx, bispinor, mesh_xy,
