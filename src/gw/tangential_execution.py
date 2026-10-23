@@ -719,6 +719,13 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, comp
         budget.program_bytes = 0
         # The row reserves the round's eigh stacks as its native workspace: that is their room.
         reduction = row('reduction', extra(width), eigen_side=eigen_side)
+        # A nonnegative compiled price cannot increase the proportional next width.
+        # When this lower bound already forces one, do not compile a doomed proposal.
+        if width > 1 and reduction['aggregate_bytes_per_rank'] > 0 and (
+                width * reduction['available_device_bytes_per_rank']
+                // reduction['aggregate_bytes_per_rank'] <= 1):
+            width = 1
+            continue
         room = face_eigh_room(reduction, held - int(reduction['workspace_bytes_per_rank']),
                               stage="tangential constructor batch admission")
         price = budget.program_bytes = max(1, int(compiled(width, room)))
