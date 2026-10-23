@@ -161,8 +161,24 @@ native libraries or run a GPU calculation.
 
 ## 4. Verify linking and reuse {#build-reuse}
 
+After building both legs, certify the pair inside an active Frontier
+allocation with four free GCDs:
+
+```bash
+bash config/frontier/verify.sh
+```
+
+This command sources `gpu_env.sh`, verifies both recorded native closures
+and the intended host FFTW, then compares native and XLA Fourier transforms
+at four MPI processes. It refuses disabled acceptance checks. The host
+build's `CMakeCache.txt` supplies the FFTW prefix; when reusing a copied
+host leg without that cache, set the existing `LORRAX_FFTW3_STAGE` to its
+verified FFTW prefix. No ROCm toolkit module or added library paths are
+needed. A login-node check that skips runtime gates does not certify the
+pair.
+
 Each closure record names the exact library bytes and dependencies used by
-its build. Check both records without loading a GPU backend:
+its build. To inspect those records without running GPU transforms:
 
 ```bash
 python -m lxkit.closure verify src/ffi/cpp/build_host/liblorrax_ffi_host.so
@@ -175,6 +191,14 @@ library refuses with `GATE native-closure`, naming the file and remedy. Fix
 the conflicting installation or rebuild against the intended environment;
 adding more library search paths does not repair an already mixed process.
 [The native build contract](ffi-build.md#closure) explains the full checks.
+
+Both native legs must share the pinned parallel HDF5 family. The normal
+PyPI `h5py` wheel is supported: its private, hashed serial HDF5 libraries
+form separate families, so no MPI-enabled `h5py` build is needed. The tested
+environment has `h5py 3.16.0` with private HDF5 2.0.0 beside the native
+pair's site HDF5 1.14.3.7. Runtime imports `h5py` before the native libraries
+and enforces [file ownership](../architecture/slab_io.md#one-owner) between
+the serial and collective handles; do not add library paths to combine them.
 
 Reusing another checkout's native pair requires **both**:
 
@@ -192,6 +216,6 @@ records after a wheel, MPI/HDF5 or shared-library update. A Python-only change
 can reuse a verified matching pair. Do not stamp or override an older library
 merely because it exists or has a closure JSON.
 
-Acceptance checks are owned by `scripts/verify_ffi_build.sh --leg host|rocm`.
-Run the applicable runtime gates on a compute node; a login-node check with
-skipped GPU/FFT gates is not a completed GPU acceptance run.
+The machine wrapper runs `scripts/verify_ffi_build.sh` with the Frontier
+pins before the four-process transform check; use the single wrapper
+command for complete acceptance.

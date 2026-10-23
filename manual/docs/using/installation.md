@@ -164,6 +164,12 @@ AMD's multi-architecture wheel index supplies
 packages from `pyproject.toml`, then the root package, and records the final
 package manifest. No CUDA extra is installed.
 
+The normal PyPI `h5py` wheel is supported; no MPI-enabled `h5py` build is
+needed. Its private serial HDF5 libraries are separate from the one pinned
+parallel HDF5 family shared by both native legs. The tested environment
+uses `h5py 3.16.0` with private HDF5 2.0.0, while the native pair uses site
+HDF5 1.14.3.7. Runtime owns the load order and file-handle separation.
+
 If the shared dependency installs are already present, build only the two
 LORRAX legs for this checkout:
 
@@ -179,7 +185,22 @@ checkouts. The ROCm builder creates or verifies its content-keyed ELPA
 prefix under `$HOME/software/elpa_builds`. Rebuilding LORRAX does not
 require deleting or rebuilding these dependencies.
 
-Inside a GPU allocation:
+After building both legs, certify them inside an active allocation with
+four free GCDs:
+
+```bash
+bash config/frontier/verify.sh
+```
+
+The command sources `gpu_env.sh`, verifies the recorded host/ROCm closures
+and intended host FFTW, then compares native and XLA Fourier transforms at
+four MPI processes. It refuses disabled acceptance checks. The host build
+cache supplies the FFTW prefix; a copied host leg without that cache needs
+the existing `LORRAX_FFTW3_STAGE` set to its verified FFTW prefix. No added
+library paths or runtime toolkit module are needed. Skipped runtime gates
+on a login node do not certify a build.
+
+Run a calculation inside the allocation:
 
 ```bash
 source config/frontier/gpu_env.sh
@@ -193,7 +214,7 @@ a 4 × 4 mesh on two complete nodes. The helper and runtime own the ROCm
 and RCCL/OFI setup; do not use the NVIDIA `select_gpu.sh` or copy Perlmutter
 network settings. No container or runtime ROCm toolkit module is needed.
 
-Check both native records with `python -m lxkit.closure verify <leg.so>`.
+The records can also be inspected with `python -m lxkit.closure verify <leg.so>`.
 Reusing a build from another checkout also requires matching FFI sources,
 Frontier build inputs and JAX/jaxlib headers; a matching ABI number or a
 closure JSON alone is insufficient. At runtime both closures must be
