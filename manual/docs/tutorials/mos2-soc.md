@@ -166,6 +166,76 @@ exports its computed screening to `eps0mat.h5` and `epsmat.h5`.
 The kernel script writes `bsemat.h5` for BerkeleyGW interoperability; the native
 BSE applies its Hamiltonian matrix-free from the GW restart.
 
+The utility calls below are already included in the numbered scripts. They
+are shown here so you can inspect or rerun each operation after its inputs
+are ready. Run these blocks from the `6a-SOC` root; each subshell returns there.
+`lorrax_run` is the four-rank launcher defined by the supplied `lorrax_env.sh`.
+
+#### Export `eps0mat.h5` and `epsmat.h5` {: #screening-export }
+
+The Sigma script calls [`gw.epsmat_cli`](../drivers/berkeleygw-export.md#epsmat)
+after GW has written its restart. For the saved 996-centroid run, its input is:
+
+```bash
+(
+    cd 2-gw/3-lorrax_fully_rel/2-sigma
+    source ../lorrax_env.sh
+    cat > epsmat.in <<'EOF'
+[epsmat]
+mode = export
+source_restart = tmp/isdf_tensors_996.h5
+parent_input_file = gw.in
+output_dir = ../1-epsilon
+epsmat_ecut = 9.0
+q0_vector = 0.001 0 0
+EOF
+    lorrax_run gw.epsmat_cli -i epsmat.in
+)
+```
+
+Use the restart filename your GW run wrote if its centroid count differs;
+the supplied run script discovers it automatically. Both dielectric files
+are written under `1-epsilon`. `epsmat_ecut` selects the exported G sphere;
+it does not rerun screening at a different cutoff.
+
+#### Export `bsemat.h5` {: #kernel-export }
+
+The kernel script calls [`bse.bsemat_cli`](../drivers/berkeleygw-export.md#bsemat)
+with the explicit full-nine-point coarse WFN prepared in step 2:
+
+```bash
+(
+    cd 3-bse/3-lorrax_fully_rel/1-kernel
+    source ../../../2-gw/3-lorrax_fully_rel/lorrax_env.sh
+    lorrax_run bse.bsemat_cli -i gw.in --wfn-co WFN_co.h5 -o bsemat.h5
+)
+```
+
+`WFN_co.h5` supplies BerkeleyGW's coarse wavefunction gauge and ordering.
+The output is the coarse kernel for BerkeleyGW's `absorption.x`; the native
+BSE continues to use its GW restart.
+
+#### Interpolate the DFT and QP bands with `htransform` {: #htransform }
+
+The workshop-style `01-run_inteqp.run` script uses LORRAX's
+[`bandstructure.htransform`](../utilities/htransform-bands.md):
+
+```bash
+(
+    cd 2-gw/3-lorrax_fully_rel/3-bs
+    source ../lorrax_env.sh
+    lorrax_run bandstructure.htransform -i ht.in -o bandstructure_dft.lorrax.dat
+    lorrax_run bandstructure.htransform -i ht.in --eqp-file eqp_co.dat \
+        -o bandstructure_qp.lorrax.dat
+    "$LORRAX/.venv/bin/python" 03-export_bandstructure.py
+)
+```
+
+The two calls use the same Γ–M–K–Γ path in `ht.in`; the second reads the
+coarse QP corrections. The adapter retains both native tables and writes
+the workshop's eight-column `bandstructure.dat` with the recorded energy
+references and coordinate conversion.
+
 **Question.** Which workshop parameters describe the same physical approximation
 in both codes, and which select different numerical representations?
 
