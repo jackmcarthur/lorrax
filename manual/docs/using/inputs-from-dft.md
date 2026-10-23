@@ -8,12 +8,11 @@ All LORRAX GW and BSE calculations start from a Quantum ESPRESSO calculation wit
 
 The things most different from BerkeleyGW are:
 
-1. **Only a single wavefunction file is needed**, with no `WFNq.h5`. The $q	o0$ limit comes from the velocity matrix elements of [`dipole`](../utilities/dipole.md).
-2. **The wavefunction file must be in the HDF5 format**, `WFN.h5`, written by `wfn2hdf.x` ([§3](#pw2bgw)).
+1. **Only a single wavefunction file from `pw2bgw.x` is needed**, with no `WFNq.h5`. No other `pw2bgw.x` outputs, such as `vxc.dat`, are needed.
+2. **The wavefunction file must be in the HDF5 format**, `WFN.h5`, written from Quantum ESPRESSO by `pw2bgw.x` and converted by `wfn2hdf.x` ([§3](#pw2bgw)).
 3. **Quantum ESPRESSO automatic k-grids should be used** (`K_POINTS automatic` in the NSCF input), rather than BerkeleyGW's `kgrid.x` ([k-points](#kgrid)).
-4. **All symmetries, including time reversal and inversion, should be used.** Do not set `nosym`, `noinv` or `no_t_rev`; LORRAX unfolds the reduced k-grid with the same operations QE used ([Magnets](#magnets)).
-5. **UPF pseudopotentials must be used**, linked in the LORRAX run directory, because LORRAX builds the one-body parts of the Hamiltonian itself ([§4](#pseudopotentials)).
-6. **Magnetic materials only:** the Quantum ESPRESSO `data-file-schema.xml` must be linked in the run directory, for the magnetic symmetries ([Symmetry record](#schema)). Spin–orbit runs with fully relativistic pseudopotentials also need it ([§5](#spinors)).
+4. **All symmetries, including time reversal and inversion, should be used.** Do not set `nosym`, `noinv` or `no_t_rev`. LORRAX unfolds the k-grid with the same operations Quantum ESPRESSO uses ([Magnets](#magnets)).
+5. **UPF pseudopotentials must be used**, and they and the Quantum ESPRESSO `data-file-schema.xml` must be linked in the LORRAX run directory ([§4](#pseudopotentials), [Symmetry record](#schema)). The schema carries the magnetic symmetries of a magnet and the spin–orbit setting of a run with fully relativistic pseudopotentials.
 
 ## Workflow {: #chain }
 
@@ -123,7 +122,7 @@ Link the pseudopotentials of the QE run in the run directory. `WFN.h5` holds the
 
 `kin-ion` and `dipole` read every `*.upf` in the input file's directory (`*.UPF` only when no `*.upf` is present), then `../qe/scf` and `../qe/nscf`; `--pseudo_dir` names another directory. The `nscf` driver reads them from `save_dir`. Each file is matched to atoms by the element in its header and the atomic numbers `atyp` of `WFN.h5`.
 
-The operators assume norm-conserving pseudopotentials: the overlap is the identity, and the nonlocal potential is $\sum_{ij}|\beta_i\rangle D_{ij}\langle\beta_j|$ from `PP_BETA` and `PP_DIJ`. Core corrections (`PP_NLCC`) are read. UPF version 2 files (root element `<UPF>`) are the format in use.
+The operators assume norm-conserving pseudopotentials, with the nonlocal potential $\sum_{ij}|\beta_i\rangle D_{ij}\langle\beta_j|$ from `PP_BETA` and `PP_DIJ`. Core corrections (`PP_NLCC`) are read. UPF version 2 files (root element `<UPF>`) are the format in use.
 
 | Condition | `kin-ion`, `dipole` | `nscf` | `psp.run_dense_h` |
 |---|---|---|---|
