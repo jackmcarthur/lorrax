@@ -24,7 +24,7 @@ All scripts are in `config/frontera/`; the order is the layer table in the
 
 | artifact | script | runs on |
 |---|---|---|
-| host FFI `liblorrax_ffi_host.so` (parallel HDF5, ScaLAPACK, SLATE, MKL FFT/GEMM) | `build_ffi_host.sh` | login node (host toolchain) |
+| host FFI `liblorrax_ffi_host.so` (parallel HDF5, ScaLAPACK with `LORRAX_HOST_SCALAPACK=1`, MKL FFT/GEMM) | `build_ffi_host.sh` | login node (host toolchain) |
 | MPIwrapper `libmpiwrapper.so` | `build_mpiwrapper.sh --fresh` | login node (needs gfortran; verifies the thread patch in the disassembly) |
 | mpi4py + parallel-h5py overlay | `build_mpi_overlay.sh fetch` (login, network) then `build` (SIF, compute) | two phases: compute nodes have no network, login nodes no apptainer |
 | staged PMI2 library `$WORK/host_pmi/libpmi2.so.0` | `stage_host_pmi.sh` | login node |
@@ -76,9 +76,7 @@ rebuilds:
 
 1. the container image `py312.sif` (no `.def` recipe in the repo);
 2. the venv `$WORK/lorrax_env/.venv` (jax 0.9.1; no lockfile-to-venv script);
-3. the SLATE host install `$WORK/slate_builds/cpu/install`, which
-   `build_ffi_host.sh` consumes;
-4. an end-to-end multi-rank MPI-IO smoke; the overlay's first multi-rank use
+3. an end-to-end multi-rank MPI-IO smoke; the overlay's first multi-rank use
    in a job is the real gate.
 
 "Cold start" therefore means a node that already sees the `/work2` artifacts.

@@ -129,7 +129,6 @@ kept by hand.
 | `LORRAX_FFT_FFI_THREADS` | unset (`auto`) | machine | Same grammar, integer 1–4096. OpenMP team of the flat-k FFT chunk loop (`fft_flat_k_ffi.cc::team_threads`). `LORRAX_MKLFFT_THREADS` is a deprecated alias, announced once; this spelling wins when both are set. |
 | `LORRAX_FFT_FFI_CHUNK` | unset (auto) | machine | Positive integer or auto; an unrecognised value is announced and auto runs. Trail elements per FFT chunk; auto sizes the per-thread buffer (`nk·chunk·16 B`) to ~512 KiB so it stays in L2 (the strided form runs 2.8× slower single-thread). `LORRAX_MKLFFT_CHUNK` is a deprecated alias, announced once. |
 | `LORRAX_SCALAPACK_MKL_THREADS` | unset (`auto`, cap 4) | machine | Case-insensitive `auto`, `off`/`0`, or an integer; an unrecognised value is announced and becomes `auto`. MKL team size pinned inside the ScaLAPACK `eigh` and `solve_lu` handlers: `auto` caps it at 4 when the global setting is larger, `off` inherits `MKL_NUM_THREADS`. pzheevd at n=2448 on a 12×12 grid runs 11.3 s/q at 14 threads against 0.46 s/q at 4. |
-| `LORRAX_SCALAPACK_ALLOW_SLATE_API` | off | machine | Standard boolean spellings, case-insensitive; a malformed value is announced and stays refused. Waives the refusal of SLATE's `libslate_scalapack_api` overlay answering the pzheevd/pzgetrf symbols (`cpp/scalapack/blacs_grid.h`); see `SLATE_SCALAPACK_TARGET` (§5). |
 
 ### 2e. Compile cache
 
@@ -201,8 +200,6 @@ refusals stay on by default; per-file and per-operation instruments are opt-in.
 | `LORRAX_DAV_TRACE` | unset | debug | Path to an `.npz`. Process 0 writes the Davidson per-iteration history (iteration, matvec count, subspace size, eigenvalues, residuals, wall) and the distinct-program count (`bse/bse_lanczos.py`). |
 | `LORRAX_FFI_PROFILE` | off | debug | C++, exactly a leading `1`. Per-call timing split inside the cuSOLVERMp eigh handler (`cpp/cusolvermp/eigh_ffi.cc`). |
 | `LORRAX_ELPA_POOL_REPORT` | unset (off) | debug | C++ (`cpp/elpa/eigh_ffi.cc`): set, non-empty and not starting with `0` is on. After every ELPA eigh call each rank prints one `[elpa.eigh]` stderr line (n, tile, wall, the workspace pool and its high-water, fallbacks and their high-water, the small-allocation high-water, rocBLAS handles and workspace, degraded and aliased counts). Changes no result. |
-| `LORRAX_SLATE_POOL_REPORT` | unset (off) | debug | C++ (`cpp/slate/pool_seed.h`): set, non-empty and not starting with `0` is on. Each SLATE handler prints its seeded device pools' high-water on stderr and samples the device bytes in use per stage (a 20 ms side thread); also turns on the `LORRAX_SLATE_TIMERS` report. Changes no result. |
-| `LORRAX_SLATE_TIMERS` | unset (off) | debug | C++ (`cpp/slate/eigh_ffi.cc`): set, non-empty and not starting with `0` is on. The SLATE eigh handler prints one stage-timing line per call per rank plus the device bytes in use per stage (the same sampler thread). Changes no result. |
 | `ISDF_JAX_PROFILE_DIR` / `ISDF_JAX_PROFILE_SECTIONS` | unset / unset (every section) | debug | Directory for `jax.profiler` traces of timed sections (`common/jax_profile.py`) / comma list of substrings selecting which sections open a trace. A session live across a multi-node PHDF5 collective write segfaults rank 0, so name the sections above P=4. |
 
 ### 3b. A/B switches, probes and test hooks
@@ -249,20 +246,19 @@ nothing. Build legs: [`architecture/ffi_layout.md`](../architecture/ffi_layout.m
 `LORRAX_FFTW3_{INCLUDE_DIR,LIBRARY}`,
 `LORRAX_MKL_{BLACS,THREAD_LIB,SCALAPACK_LIBRARY}`,
 `LORRAX_FFI_ALLOW_DEFAULT_MPI`, `LORRAX_FFI_PHDF5_DIR*`,
-`LORRAX_FFI_SLATE_DIR*`, `LORRAX_FFI_NVHPC_DIR*`, `LORRAX_FFI_FFTW_DIR*`,
-`LORRAX_FFI_PHDF5_HOST`, `LORRAX_FFI_SLATE_HOST`, `LORRAX_FFI_NVHPC_HOST`,
+`LORRAX_FFI_CRAY_DIR*`, `LORRAX_FFI_NVHPC_DIR*`, `LORRAX_FFI_FFTW_DIR*`,
+`LORRAX_FFI_PHDF5_HOST`, `LORRAX_FFI_CRAY_HOST`, `LORRAX_FFI_NVHPC_HOST`,
 `LORRAX_FFI_FFTW_HOST`, `LORRAX_FFTW_STAGE_CLOBBER`, `LORRAX_FFTW3_STAGE`,
 `LORRAX_GATE_ONE_FFTW`, `LORRAX_GATE_FFTW_PY`, `CRAY_FFTW_PATH`,
 `LORRAX_XLA_FFI_INCLUDE_DIR`, `LORRAX_XLA_FFI_HEADERS_DIR`, `LORRAX_HDF5_ROOT`,
 `LORRAX_MPI_INCLUDE_DIR`, `LORRAX_MPICH_LIB_DIR`, `LORRAX_MPI_LIBRARY`,
 `LORRAX_MPI_TYPE*`, `LORRAX_IMPI_ROOT`, `LORRAX_ICC_RUNTIME`, `LORRAX_MKL_ROOT`,
 `LORRAX_SCALAPACK_LIBRARIES`, `LORRAX_NVHPC_*`,
-`LORRAX_CUSOLVERMP_{STAGE,PIN}`, `LORRAX_CUBLASMP_PIN`, `LORRAX_SLATE_*`,
-`LORRAX_HAVE_SLATE`, `LORRAX_HOST_HAVE_SLATE`, `LORRAX_DARSHAN_LIB_DIR`,
+`LORRAX_CUSOLVERMP_{STAGE,PIN}`, `LORRAX_CUBLASMP_PIN`, `LORRAX_DARSHAN_LIB_DIR`,
 `LORRAX_XLA_CMDBUF`, `LORRAX_NNODES`, `LORRAX_NTASKS`, `LORRAX_NGPU`,
 `LORRAX_SELECT_GPU`, `LORRAX_TIER2_WORKDIR`, `LORRAX_INPUT`,
 `LORRAX_FFI_VERIFY_STRICT`, `LORRAX_BUILD_JOBS` (`8`; `16` for the CUDA leg),
-`LORRAX_BUILD_PREFIX` (`<checkout>/.build`: the SLATE tree and the
+`LORRAX_BUILD_PREFIX` (`<checkout>/.build`: the
 cuSOLVERMp/cuBLASMp stage of the Perlmutter build scripts),
 `LORRAX_MPICH_CONTAINER_DIR` (`/opt/udiImage/modules/mpich`),
 `LORRAX_SAPI_EXTRA_INCLUDES`, `LORRAX_{PY,VENV_DIR,SRC_DIR}`,
@@ -286,9 +282,8 @@ variables, not environment variables.
 | `LORRAX_RUN_DIR` | none; mandatory in the Frontera template | launch | The run directory holding the input deck, beside `LORRAX_ROOT` and `LORRAX_INPUT`. It does not select the compile-cache location. |
 | `LORRAX_PM_{PRGENV,MPICH,CMAKE,FFTW,HDF5,HDF5_DIR,LIBSCI,LIBSCI_DIR,LIBSCI_FLAVOUR,MPICH_DIR}` | `config/perlmutter/site_config.sh` | build | Perlmutter module versions and prefixes for PrgEnv, cray-mpich, cmake, cray-fftw, cray-hdf5 and cray-libsci, consumed by the host builders. |
 | `LORRAX_MPIWRAPPER_ROOT_DEFAULT` / `LORRAX_MPIWRAPPER_PREFIX_DEFAULT` / `LORRAX_MPIWRAPPER_COMMIT_DEFAULT` / `LORRAX_MPIWRAPPER_ABI_DEFAULT` | `$HOME/software/lorrax_mpiwrapper_cray` / `…/current` / the pinned v2.11.1 commit / `2.10.0` | build | Immutable, content-addressed Perlmutter releases and the atomic active symlink of the unmodified Cray-MPICH MPIwrapper adapter; used by the builder and the CPU-MPI prelude. |
-| `LORRAX_SLATE_{SRC,SCALAPACK_API_DIR}` | `cpp/stage/slate_build_scalapack_api.sh` | build | SLATE ScaLAPACK-API overlay build: source tree (mandatory) and output prefix. |
+| `LORRAX_FFI_CRAY_DIR` | `$HOME/software/lorrax_cray_runtime/stage` | build, launch | The Shifter route's Cray runtime stage (LibSci, GTL): written by `src/ffi/cpp/stage/cray_runtime_stage.sh`, bind-mounted at `/lorrax_cray` by `run_shifter.sh` and the lorrax modulefile. |
 | `LORRAX_MPIWRAPPER_SO` | `$LORRAX_MPIWRAPPER_PREFIX/lib64/libmpiwrapper.so` on Perlmutter | launch | The Perlmutter prelude verifies the adjacent pinned-source/MPI-ABI/SHA256 manifest before exporting it as `MPITRAMPOLINE_LIB`. |
-| `LORRAX_SLATE_HOST_LIB` | staging default | build | Host SLATE library path for the link line. |
 
 ### 4b. Frontera staging and MPI build scripts
 
@@ -312,11 +307,14 @@ Read by `config/frontera/stage_runtime.sh`, `build_cpu_runtime_bundle.sh`,
 | `LORRAX_FFI_SO_PHDF5` | `$LORRAX_FFI_STAGE/build_phdf5/liblorrax_ffi.so` | launch | The PHDF5-enabled CUDA FFI `.so` that `ffi_env.sh` exports as `LORRAX_FFI_SO`. |
 | `LORRAX_MPI_PROVIDER` | `auto` | launch | `auto` unsets `FI_PROVIDER` and `FI_TCP_IFACE` so Intel MPI picks the native provider (`mlx` on CLX); `tcp` pins IPoIB with `FI_TCP_IFACE=ib0` (the rtx/mlx4 escape); any other value requests that provider (never `verbs` at P ≥ 144). The unset is load-bearing: TACC's default impi module exports `FI_PROVIDER=mlx` into every shell. |
 | `LORRAX_MPI_FABRICS` / `LORRAX_PMI2_LIB` | `shm` / `$WORK/host_pmi/libpmi2.so.0` | launch | `ffi_env.sh` overrides for `I_MPI_FABRICS` (use `shm:ofi` for multi-node) and `I_MPI_PMI_LIBRARY`. |
+| `LORRAX_HOST_SCALAPACK` | `0` | build | `config/frontera/build_ffi_host.sh`: `1` builds and verifies the MKL ScaLAPACK group; `0` builds a parallel-HDF5-only host leg and says so. |
 
-### 4c. Frontier ELPA build (`config/frontier/build_elpa_hip.sh`)
+### 4c. Frontier OpenBLAS and ELPA builds (`config/frontier/build_openblas_seq.sh`, `build_elpa_hip.sh`)
 
 | var | default | class | grammar and effect |
 |---|---|---|---|
+| `LORRAX_OPENBLAS_ROOT` | `$HOME/software/openblas_seq` | build | `build_openblas_seq.sh` installs the sequential, locking OpenBLAS into `$LORRAX_OPENBLAS_ROOT/install`. |
+| `LORRAX_ROCM_BLAS_DIR` | `$HOME/software/openblas_seq/install` | build | `build_elpa_hip.sh`: the OpenBLAS prefix ELPA and its netlib ScaLAPACK link. |
 | `LORRAX_ELPA_ROOT` | `$HOME/software/elpa_builds` | build | Directory under which the script installs the immutable, content-keyed prefix `elpa-2026.02.001-<key>` (read-only once complete; verified on rerun). |
 | `LORRAX_ELPA_GFX` | `gfx90a` | build | GPU target of ELPA's AMD kernels; part of the prefix key. |
 | `LORRAX_ELPA_MAKE_J` | `16` | build | Parallel jobs of the ELPA `make`. |
@@ -346,7 +344,6 @@ Read by `config/frontera/stage_runtime.sh`, `build_cpu_runtime_bundle.sh`,
 | `CUDA_CACHE_PATH` | Perlmutter machine setting, never set by `src/`: `config/perlmutter/gpu_env.sh` defaults it to `$SCRATCH/.nv/ComputeCache` (a caller's value is kept). CUDA's own default is `~/.nv/ComputeCache`; one fresh suite plus the P1 chain wrote 208 MB there. |
 | `MPICH_ASYNC_PROGRESS` | The Perlmutter CPU-MPI prelude sets `1`, so Cray MPICH grants `MPI_THREAD_MULTIPLE` to XLA's FUNNELED request with one progress thread per rank; the prelude unsets `MPIR_CVAR_ASYNC_PROGRESS`. |
 | `LORRAX_MPI_FORCE_THREAD_MAIN`, `LORRAX_MPI_FINALIZE_FIX` | Frontera MPIwrapper/overlay controls, unset in production; `runtime` reads both only to print them in the startup report. `common.collectives.warm_mesh_cliques()` creates every communicator from the main thread, and drivers using `runtime.finalize_process()` need no finalize overlay. |
-| `SLATE_SCALAPACK_TARGET` | SLATE's own dial, read by `blacs_grid.h` to announce the demotion it controls: unset means `HostTask`, so a CUDA-built SLATE runs on the CPU unless it is `devices`. Relevant only with `LORRAX_SCALAPACK_ALLOW_SLATE_API`. |
 | `OPENBLAS_THREAD_TIMEOUT` | `setdefault` `1` by `LORRAX_BLAS_TUNE` (§2a) as the first statement of `runtime`; read once by each OpenBLAS copy when it is mapped, which is why every entry point (and every driver package `__init__`) imports `runtime` first. |
 | `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` | Read for the startup report's thread table and oversubscription warning; LORRAX sets none of them. On Frontera the XLA:CPU thread pool ignores OMP; `taskset` is the pinning mechanism. |
 | `SCRATCH` | Base of the NVRTC cubin cache ([compilation §2](../architecture/compilation.md#2-native-kernels-and-nvrtc-images)), of the JAX compile cache (§2e) and of the `tests/hsuite` run tree (`.cache/lorrax/hsuite`); `~` where it is unset. Read, never set. No quadrature rule is stored there or anywhere else. |

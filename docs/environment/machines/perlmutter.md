@@ -142,7 +142,7 @@ eight physical cores. Check the actual mask with `taskset -pc $$` inside a
 rank shell when comparing launch configurations.
 
 XLA's CPU worker pool ignores `OMP_NUM_THREADS` and uses the rank's affinity
-mask; the LibSci, SLATE and host FFT OpenMP teams honor `OMP_NUM_THREADS`.
+mask; the LibSci and host FFT OpenMP teams honor `OMP_NUM_THREADS`.
 These teams, the MPICH progress thread and Python's I/O threads share the
 mask, and LORRAX binds none of them to a private subset. Set
 `OMP_NUM_THREADS` below `-c` (`14` with `-c 16`) and allow at least two CPUs
