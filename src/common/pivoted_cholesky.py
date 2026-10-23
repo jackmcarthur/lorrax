@@ -581,9 +581,6 @@ def make_sharded_pivoted_cholesky_select(
                         lambda _: jnp.zeros((M_slab,), dtype=G_slab.dtype),
                         operand=None)
                 else:
-                    local_Lp = jnp.where(
-                        my_has_p, L[safe_idx, :],
-                        jnp.zeros_like(L[safe_idx, :]))
                     # ONE psum, not two.  The orbit id of the picked pivot
                     # rides the SAME masked broadcast as L[p, :] — it is the
                     # same idiom, from the same owner, at the same point in
@@ -594,14 +591,28 @@ def make_sharded_pivoted_cholesky_select(
                     _oid_term = jnp.where(
                         my_has_p, orbit_id_slab[safe_idx], jnp.int32(0),
                     ).astype(G_slab.dtype)
-                    _fused = lax.psum(  # exact-reduce: masked broadcast, one owner of row p
-                        jnp.concatenate([local_Lp, _oid_term[None]]),
-                        mesh_axis)
-                    L_p = _fused[:k_keep]
-                    orbit_id_p = jnp.round(
-                        jnp.real(_fused[k_keep])).astype(jnp.int32)
-                    newcol = column_from_row(L_p)
-                    newcol = jnp.where(take, newcol, jnp.zeros_like(newcol))
+
+                    def independent_group_column(_):
+                        local_Lp = jnp.where(
+                            my_has_p, L[safe_idx, :],
+                            jnp.zeros_like(L[safe_idx, :]))
+                        fused = lax.psum(  # exact-reduce: masked broadcast, one owner of row p
+                            jnp.concatenate([local_Lp, _oid_term[None]]),
+                            mesh_axis)
+                        group = jnp.round(jnp.real(fused[k_keep])).astype(jnp.int32)
+                        return column_from_row(fused[:k_keep]), group
+
+                    def dependent_group_column(_):
+                        group = lax.psum(_oid_term, mesh_axis)  # exact-reduce: one owner supplies the group, other ranks zero
+                        group = jnp.round(jnp.real(group)).astype(jnp.int32)
+                        return jnp.zeros((M_slab,), dtype=G_slab.dtype), group
+
+                    # A dependent representative still kills its whole
+                    # group. Broadcast that scalar identity without reading
+                    # or communicating the unused factor row.
+                    newcol, orbit_id_p = lax.cond(
+                        take, independent_group_column, dependent_group_column,
+                        operand=None)
 
                 L = L.at[:, j].set(newcol)
                 piv = piv.at[j].set(jnp.where(avail, global_p, jnp.int32(-1)))

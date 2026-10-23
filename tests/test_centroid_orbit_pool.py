@@ -143,3 +143,49 @@ def test_literal_complex_pc_full_rank_and_exhausted_tail():
         assert np.all(np.isfinite(d_final)) and np.all(np.isfinite(trace))
         if feature_rank == 3:
             np.testing.assert_allclose(remainder, 0, atol=1e-11)
+
+
+def test_legacy_group_pc_dependent_labels_and_independent_factor():
+    import jax
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from common.pivoted_cholesky import make_sharded_pivoted_cholesky_select
+
+    mesh = Mesh(np.array(jax.local_devices()[:1]), ("x",))
+    labels = np.r_[np.repeat(np.arange(6), [3, 2, 3, 4, 5, 5]), -1, -1].astype(np.int32)
+    active = np.arange(24) < 22
+    for feature_rank in (3, 22):
+        rng = np.random.default_rng(147+feature_rank)
+        features = rng.normal(size=(22, feature_rank))+1j*rng.normal(size=(22, feature_rank))
+        G = np.zeros((24, 24), complex)
+        G[:22, :22] = features@features.conj().T
+        # Independent NumPy recurrence: select the largest active residual,
+        # deflate one column, then remove every row of that label.
+        d = np.diag(G).real.copy()
+        available = active.copy()
+        factor = np.zeros((24, 5), complex)
+        floor = np.sqrt(np.finfo(float).eps)*d.max()
+        chosen, took = [], []
+        for j in range(5):
+            candidates = np.flatnonzero(available)
+            p = candidates[np.argmax(d[candidates])]
+            take = d[p] > floor
+            if take:
+                col = (G[:, p]-factor[:, :j]@factor[p, :j].conj())/np.sqrt(d[p])
+                col[p] = np.sqrt(d[p])
+                factor[:, j] = col
+                d = np.maximum(d-np.abs(col)**2, 0)
+            chosen.append(p)
+            took.append(take)
+            available[labels == labels[p]] = False
+        expected_rank = sum(took)
+        kernel = make_sharded_pivoted_cholesky_select(mesh, 24, 5, mesh_axis="x")
+        piv, L, rank, _, d_taken, _, _ = jax.device_get(kernel(
+            jax.device_put(G, NamedSharding(mesh, P("x", None))),
+            jax.device_put(labels, NamedSharding(mesh, P("x"))),
+            jax.device_put(active, NamedSharding(mesh, P("x")))))
+        assert int(rank) == expected_rank
+        assert np.array_equal(piv[:rank], np.asarray(chosen)[:rank])
+        assert len(np.unique(labels[piv])) == len(piv) == 5
+        assert np.all((piv >= 0) & (piv < 22))
+        np.testing.assert_allclose(L, factor, rtol=1e-11, atol=1e-11)
+        assert np.max(np.abs(L[:, d_taken == 0]), initial=0) == 0
