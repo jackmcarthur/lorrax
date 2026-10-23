@@ -42,7 +42,7 @@ BOHR_TO_ANG = 0.529177210544
 #: Bump it with any change that moves the selected points for fixed inputs:
 #: caches keyed on it (the htransform node cache,
 #: ``bandstructure.fh_interp.htransform_nodes``) are then recomputed.
-KMEANS_VERSION = "kmeans-isdf-v2"
+KMEANS_VERSION = "kmeans-isdf-v3"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -883,14 +883,60 @@ def snap_centroids_to_grid(
     return indices, indices.astype(float) / fft_grid, n_duplicates
 
 
+def _highest_weight_free_points(weight, occupied, total, count):
+    """Top free grid indices, ordered by weight then flat index.
+
+    Partition one scalar-grid copy for the cutoff, then collect only the
+    requested prefix in bounded blocks. Never sort or retain all free-grid
+    indices. Occupied points sort after all finite weights; the block masks
+    also exclude them when the input contains NaNs.
+    """
+    count = min(int(count), int(total)-len(occupied))
+    if count == 0:
+        return np.empty(0, dtype=np.int64)
+    if weight is None:
+        # At most len(occupied) entries of this prefix can be unavailable.
+        return np.setdiff1d(np.arange(count+len(occupied)), occupied,
+                            assume_unique=True)[:count]
+    flat = np.asarray(weight, dtype=np.float64).reshape(-1)
+    scores = -flat
+    scores[occupied] = np.nan
+    scores.partition(count-1)
+    cutoff = scores[count-1]
+    del scores
+
+    better_parts, tie_parts, n_ties = [], [], 0
+    block = max(1 << 16, count)
+    for start in range(0, total, block):
+        stop = min(start+block, total)
+        values = -flat[start:stop]
+        if np.isnan(cutoff):
+            better, tied = ~np.isnan(values), np.isnan(values)
+        else:
+            better, tied = values < cutoff, values == cutoff
+        lo, hi = np.searchsorted(occupied, (start, stop))
+        local = occupied[lo:hi]-start
+        better[local] = tied[local] = False
+        better_parts.append(np.flatnonzero(better)+start)
+        if n_ties < count:
+            ties = np.flatnonzero(tied)[:count-n_ties]+start
+            tie_parts.append(ties)
+            n_ties += len(ties)
+    better = np.concatenate(better_parts)
+    ties = np.concatenate(tie_parts)[:count-len(better)]
+    take = np.concatenate((better, ties))
+    return take[np.lexsort((take, -flat[take]))]
+
+
 def ensure_unique_centroids(
     centroids_frac: np.ndarray,
     fft_grid: tuple[int, int, int],
     rho: np.ndarray | None = None,
 ) -> np.ndarray:
     """Snap to the FFT grid; redistribute duplicates onto the highest-density
-    unoccupied grid points (arbitrary order if ρ is None). O(N log N), fully
-    vectorized."""
+    unoccupied grid points (flat-index order for equal weights or no ρ).
+    A scalar-grid partition finds the cutoff; only the requested replacement
+    points are sorted, with bounded blocks used to resolve cutoff ties."""
     Nx, Ny, Nz = fft_grid
     indices = (np.round(centroids_frac * np.array(fft_grid)).astype(int)
                % np.array(fft_grid))
@@ -901,10 +947,7 @@ def ensure_unique_centroids(
     if n_dups == 0:
         return indices.astype(float) / fft_grid
 
-    free = np.setdiff1d(np.arange(Nx * Ny * Nz), occupied)
-    if rho is not None:
-        free = free[np.argsort(-rho.ravel()[free])]
-    take = free[:min(n_dups, free.shape[0])]
+    take = _highest_weight_free_points(rho, occupied, Nx*Ny*Nz, n_dups)
     if take.shape[0] < n_dups:
         log.warning(
             f"ensure_unique_centroids: only {take.shape[0]} unoccupied "
