@@ -11,6 +11,7 @@ import hashlib
 import math
 import json
 import os
+from functools import lru_cache
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
@@ -2451,7 +2452,7 @@ def _compute_photon_vq(
                 mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
             )
     from file_io.restart_bundle import read_photon_charge
-    V_q_raw = read_photon_charge(bispinor_h5_path, mesh_xy)
+    V_q_raw = read_photon_charge(bispinor_h5_path, mesh_xy, retain_wedge=True)
     # Both views stay on the canonical file carrier, as on the scalar route:
     # Validation and restart I/O keep this order; the final wedge seam packs.
     G0_all = photon_g0_vectors[0]
@@ -2507,6 +2508,7 @@ def _compute_scalar_vq(
                 centroid_indices=_cent_idx_np,
                 g_chunk_size=int(cfg.memory.vq_g_chunk_size),
                 consume_fit_factor=True,
+                retain_wedge=True,
             )
             head_channel = _build_head_channel(
                 zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
@@ -2536,6 +2538,13 @@ def _select_coulomb_q_rows(V_full, *, sym, centroid_indices, meta):
     if wedge is None:
         return V_full, None
     tables = wedge[0]
+    if isinstance(V_full, QirrOperator):
+        canonical = q_wedge(sym=sym, centroid_indices=centroid_indices, meta=meta,
+                            context="canonical bare V on the q wedge", canonical=True)
+        if canonical is None or not V_full.same_wedge(
+                QirrOperator(values=None, **canonical[0])):
+            raise ValueError("GATE bare_coulomb_q_identity: canonical producer tables differ")
+        return V_full.values, tables
     rows = np.asarray(tables['full_rows'])
 
     @jax.jit
@@ -2592,18 +2601,134 @@ def _finalize_vq_views(
     while G0.ndim > 1:
         G0 = G0[0]
     log.debug(f"\n  V_q computed:")
-    log.debug(f"    Shape: {V_q_raw.shape}")
-    _vq0_trace = float(ordered_sum(jnp.diagonal(V_q_raw[0])).real)
+    from symmetry_maps import QirrOperator
+    log.debug(f"    Shape: {getattr(V_q_raw, 'shape', None)}")
+    if isinstance(V_q_raw, QirrOperator):
+        stats, pair, gamma = _canonical_coulomb_stats(V_q_raw, tuple(meta.kgrid))
+    else:
+        stats, pair, gamma = None, None, V_q_raw[0]
+    _vq0_trace = float(ordered_sum(jnp.diagonal(gamma)).real)
     log.debug(f"    V_q=0 trace: {_vq0_trace:.4f}")
     from common import sanity
-    sanity.check_finite("V_q", V_q_raw, print_fn=print_fn)
+    if stats is None:
+        sanity.check_finite("V_q", V_q_raw, print_fn=print_fn)
+    else:
+        sanity.report_finite_stats("V_q", stats, print_fn=print_fn)
     sanity.check_positive("V_q[q=0] trace", _vq0_trace, print_fn=print_fn)
-    sanity.check_hermitian("V_q[q=0]", V_q_raw[0], print_fn=print_fn)
-    sanity.check_q_conjugate_reciprocity(
-        "V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
-        print_fn=print_fn)
+    sanity.check_hermitian("V_q[q=0]", gamma, print_fn=print_fn)
+    if pair is None:
+        sanity.check_q_conjugate_reciprocity(
+            "V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
+            print_fn=print_fn)
+    else:
+        sanity.report_q_conjugate_residual("V_q[all q]", *pair, rtol=1e-5,
+                                          print_fn=print_fn)
     sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
     return V_q_raw, G0, head_channel, photon_g0_vectors
+
+
+@lru_cache(maxsize=8)
+def _canonical_coulomb_stats_program(key, mesh, width, dtype, finite_check, pair_check,
+                                    gamma_only=False):
+    """One fixed-width exact all-q statistics program; cached metadata only."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common import sanity
+    template = key.rebuild(None)
+    spec = NamedSharding(mesh, P(None, 'x', 'y'))
+    shape = (width, template.sym_perm.shape[-1], template.sym_perm.shape[-1])
+    finite = sanity.finite_stats_program(shape, dtype, spec) if finite_check else None
+
+    @jax.jit
+    def stats(values, rows, negative, valid):
+        op = template.with_values(values)
+        forward = op.unfold(mesh, rows=rows)
+        mask = valid[:, None, None]
+        finite_stats = (finite(jnp.where(mask, forward, 0)) if finite is not None
+                        else jnp.zeros(3, jnp.float64))
+        if pair_check:
+            reverse = op.unfold(mesh, rows=negative)
+            pair = jnp.stack((
+                jnp.max(jnp.where(mask, jnp.abs(forward-jnp.conj(reverse)), 0)),
+                jnp.max(jnp.where(mask, jnp.abs(forward), 0))))
+        else:
+            pair = jnp.zeros(2, jnp.float64)
+        return jnp.concatenate((finite_stats, pair)), forward[0] if gamma_only else None
+    return stats
+
+
+def _canonical_coulomb_stats(operator, kgrid, *, reciprocity=True):
+    """Exact full-zone finite/reciprocity totals without a full-zone resident.
+
+    The canonical parents remain ``V_qirr(mu_X,nu_Y)``. At most one bounded
+    q/−q panel pair is transported by the shared symmetry owner. Gamma is
+    admitted once first, so the later stats-only price sees it already live.
+    """
+    from symmetry_maps import QirrTables, QirrOperator, q_negation_index
+    from common.collectives import device_put_process_local
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    from common import sanity
+    values = operator.values
+    mesh = values.sharding.mesh
+    if (operator.n_full != int(np.prod(kgrid)) or values.ndim != 3
+            or values.shape[-2] != values.shape[-1]):
+        raise ValueError("GATE bare_coulomb_q_identity: wrong full q or matrix extent")
+    authenticated = QirrOperator.from_tables(values, QirrTables(
+        operator.irr_idx, operator.sym_idx, operator.q_irr_frac,
+        operator.sym_perm, operator.L_table, operator.n_sym_spatial))
+    if not operator.same_wedge(authenticated):
+        raise ValueError("GATE bare_coulomb_q_identity: invalid representative rows")
+    replicated = NamedSharding(mesh, P())
+    programs = {}
+    widths = []
+    checks = sanity.sanity_enabled()
+    n_queries = operator.n_full if checks else 1  # only the always-live q0 trace
+    width = min(64, n_queries)
+    while width not in widths:
+        widths.append(width)
+        width = max(1, width//2)
+    negative = np.asarray(q_negation_index(kgrid), np.int32)
+
+    def operands(start, count):
+        query = np.minimum(start + np.arange(count), operator.n_full-1).astype(np.int32)
+        return tuple(device_put_process_local(a, replicated) for a in
+                     (query, negative[query], start + np.arange(count) < operator.n_full))
+
+    gamma_program = _canonical_coulomb_stats_program(
+        operator.wedge_key(), mesh, 1, str(values.dtype), False, False, True)
+    gamma_args = operands(0, 1)
+    gamma_compiled = gamma_program.lower(values, *gamma_args).compile()
+    gamma_need = -agreed_chunk(-compiled_new_bytes(gamma_compiled))
+    memory.admit("canonical Coulomb Gamma view", [("Gamma", memory.priced(
+        0, "compiled canonical Gamma view", spread=gamma_need*int(mesh.size),
+        ranks=int(mesh.size)))], agreed_chunk(int(memory.room())))
+    _, gamma = gamma_compiled(values, *gamma_args)
+    jax.block_until_ready(gamma)
+    size = operator.n_full * int(values.shape[-2]) * int(values.shape[-1])
+    if not checks:
+        return (0, 0, 0., size), (0., 0.), gamma
+
+    def price(count):
+        program = _canonical_coulomb_stats_program(
+            operator.wedge_key(), mesh, count, str(values.dtype), checks,
+            checks and reciprocity)
+        compiled = program.lower(values, *operands(0, count)).compile()
+        programs[count] = compiled
+        need = -agreed_chunk(-compiled_new_bytes(compiled))
+        return memory.priced(0, "canonical Coulomb all-q validation",
+                             spread=need*int(mesh.size), ranks=int(mesh.size))
+
+    chosen = memory.admit("canonical Coulomb all-q validation",
+        [(count, lambda count=count: price(count)) for count in widths],
+        agreed_chunk(int(memory.room())))
+    totals = np.zeros(5, np.float64)
+    for start in range(0, n_queries, chosen):
+        result, _ = programs[chosen](values, *operands(start, chosen))
+        numbers = np.asarray(jax.device_get(result))
+        totals[:2] += numbers[:2]
+        totals[2:] = np.maximum(totals[2:], numbers[2:])
+    return (int(totals[0]), int(totals[1]), float(totals[2]), size), tuple(totals[3:]), gamma
 
 
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
@@ -2852,8 +2977,22 @@ def _prepare_fresh_coulomb(
     		(meta.mu_basis if channel == 0 else basis_T).pack_axis(vector, -1)
     		for channel, vector in enumerate(photon_g0_vectors))
     if debug_print_enabled():
-    	jax.block_until_ready(V_qmunu)
+        jax.block_until_ready(getattr(V_qmunu, 'values', V_qmunu))
     return (V_qmunu, G0, head_channel, photon_g0_vectors)
+
+
+def _full_coulomb_for_restart(operator, mesh):
+    """The existing full-storage fallback, admitted before materialization."""
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    program, operands = operator.unfold(mesh, prepare=True)
+    compiled = program.lower(*operands).compile()
+    need = -agreed_chunk(-compiled_new_bytes(compiled))
+    memory.admit("full canonical Coulomb restart", [("full", memory.priced(
+        0, "compiled full canonical Coulomb restart", spread=need*int(mesh.size),
+        ranks=int(mesh.size)))], agreed_chunk(int(memory.room())))
+    return compiled(*operands)
+
 
 def _write_fresh_restart(
         G0, V_qmunu, _candidate_plan, _to_file_order, band_slices,
@@ -2881,7 +3020,8 @@ def _write_fresh_restart(
         # unpack the unused full-zone operator before it substitutes the capture.
         V_for_write = (_qirr.capture.X_ibz
                 if _qirr.store_wedge and _qirr.capture is not None
-                else V_qmunu)
+                else (_full_coulomb_for_restart(V_qmunu, mesh_xy)
+                      if hasattr(V_qmunu, 'values') else V_qmunu))
         write_restart_state_to_h5(
                 tensors_filename,
                 n_rmu_logical=int(meta.n_rmu),
@@ -3002,17 +3142,24 @@ def _read_authenticated_restart(
     """Produce the validated stored tensors and their charge zeta identity."""
     rs = load_restart_state_from_h5(
     	tensors_filename, mesh_xy, band_slices=band_slices,
-    	n_rmu_logical=int(meta.n_rmu))
+        n_rmu_logical=int(meta.n_rmu), retain_v_wedge=True)
     charge_zeta_identity_receipt = rs.charge_zeta_identity
     V_qmunu = rs.V_qmunu
     log.info("  Loaded restart tensors from H5.")
     from file_io import describe_coulomb_policy_match
     log.debug(describe_coulomb_policy_match(tensors_filename, cfg, meta))
     from common import sanity
-    sanity.check_finite("restart V_q", V_qmunu, print_fn=print0)
+    from symmetry_maps import QirrOperator
+    if isinstance(V_qmunu, QirrOperator):
+        stats, _, gamma = _canonical_coulomb_stats(V_qmunu, tuple(meta.kgrid),
+                                                 reciprocity=False)
+        sanity.report_finite_stats("restart V_q", stats, print_fn=print0)
+    else:
+        gamma = V_qmunu[0]
+        sanity.check_finite("restart V_q", V_qmunu, print_fn=print0)
     sanity.check_positive(
     	"restart V_q[q=0] trace",
-    	float(jnp.trace(V_qmunu[0]).real), print_fn=print0)
+        float(jnp.trace(gamma).real), print_fn=print0)
     sanity.check_finite("restart ψ (psi_parent_y)",
                         rs.psi_nmu_parent, print_fn=print0)
     sanity.check_finite("restart ψ (psi_parent_y_mun)",

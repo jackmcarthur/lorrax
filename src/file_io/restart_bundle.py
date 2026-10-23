@@ -314,12 +314,15 @@ def _qirr_wedge_tables(f):
             if name in f and dataset_q_storage(f[name]) == "ibz"}
 
 
-def _unfold_wedge(A, tables, n_rmu_pad, mesh_xy):
+def _unfold_wedge(A, tables, n_rmu_pad, mesh_xy, *, retain_wedge=False):
     """Restore q-IBZ tiles through the producer symmetry action; current full-q tiles pass through."""
     if tables is None:
         return A
     from symmetry_maps import unfold_isdf_operator
     t = tables.padded(int(n_rmu_pad))
+    if retain_wedge:
+        from symmetry_maps import QirrOperator
+        return QirrOperator.from_tables(A, t)
     return unfold_isdf_operator(
         A, irr_idx=t.irr_idx_q, sym_idx=t.sym_idx_q, sym_perm=t.sym_perm,
         L_table=t.L_table, q_irr_frac=t.q_irr_frac, mesh_xy=mesh_xy,
@@ -327,7 +330,7 @@ def _unfold_wedge(A, tables, n_rmu_pad, mesh_xy):
 
 
 def read_restart_state_from_h5(filename, mesh_xy, *,
-                               band_receipt=None, n_band_carrier=None):
+                               band_receipt=None, n_band_carrier=None, retain_v_wedge=False):
     """Read raw parent faces (band-distributed) and canonical tensors through SlabIO. Spin is a shape."""
     from .slab_io import SlabIO
     from common.collectives import device_put_process_local
@@ -418,8 +421,9 @@ def read_restart_state_from_h5(filename, mesh_xy, *,
         # wedge simply arrives as (n_q_ibz, mu_pad, nu_pad) on the same spec
         # the unfold takes and returns.  A no-op on every non-wedge file.
             arr = _unfold_wedge(
-                arr, wedge_tables.get(name), n_rmu_pad, mesh_xy)
-            jax.block_until_ready(arr)
+                arr, wedge_tables.get(name), n_rmu_pad, mesh_xy,
+                retain_wedge=retain_v_wedge and name == 'V_qmunu')
+            jax.block_until_ready(getattr(arr, 'values', arr))
         return arr
 
     def _read_psi(io, name, n_mu_logical, *, spec, mu_axis=-1,
@@ -584,7 +588,7 @@ def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
 
 
 def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
-                              n_rmu_logical=None):
+                              n_rmu_logical=None, *, retain_v_wedge=False):
     """Return the canonical parent state namespace at the requested band layout. All μ axes are canonical and padded; GW packs them in its authenticated basis."""
     from types import SimpleNamespace
     # Loud-fail BEFORE any tensor is trusted (see the function's docstring).
@@ -610,7 +614,7 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
             band_axis.divisor, name=band_axis.name)
 
     return read_restart_state_from_h5(
-        filename, mesh_xy, band_receipt=band_axis)
+        filename, mesh_xy, band_receipt=band_axis, retain_v_wedge=retain_v_wedge)
 
 
 def unfold_parent_faces(faces, restart_file, input_file, mesh_xy, *, family="charge"):
@@ -1930,11 +1934,12 @@ class BispinorVqReader:
         return self._filename
 
 
-def read_photon_charge(filename, mesh_xy):
+def read_photon_charge(filename, mesh_xy, *, retain_wedge=False):
     """Return the full-q charge block of an authenticated photon artifact."""
     with BispinorVqReader(filename, mesh_xy) as reader:
         tile = reader.get_tile(0, 0)
-        return _unfold_wedge(tile, reader.q_tables[0], tile.shape[-1], mesh_xy)
+        return _unfold_wedge(tile, reader.q_tables[0], tile.shape[-1], mesh_xy,
+                             retain_wedge=retain_wedge)
 
 
 def read_photon_gamma(directory, mesh_xy, bases):

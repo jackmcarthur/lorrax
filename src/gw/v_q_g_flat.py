@@ -1052,7 +1052,7 @@ def _finish_vq_tile(s, *, V_sh, mesh_xy, stack_cols, unfold_isdf_one_leg,
 # Public charge entry point (CC tile only)
 # ---------------------------------------------------------------------------
 
-def q_wedge(*, sym, centroid_indices, meta, context: str):
+def q_wedge(*, sym, centroid_indices, meta, context: str, canonical=False):
     """The q wedge every interaction of the run is held on, or ``None`` (no reduction).
 
     ``(tables, policy)``: ``tables`` the keyword arguments of a
@@ -1067,7 +1067,7 @@ def q_wedge(*, sym, centroid_indices, meta, context: str):
     (_, q_irr_frac, irr, rows, sym_perm, L_table, reduced) = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_indices, kgrid=tuple(meta.kgrid),
         fft_grid=tuple(meta.fft_grid), context=context,
-        mu_basis=getattr(meta, 'mu_basis', None))
+        mu_basis=None if canonical else getattr(meta, 'mu_basis', None))
     if not reduced:
         return None
     from .qgrid_symmetry import qgrid_trs_policy_for
@@ -1101,6 +1101,7 @@ def compute_all_V_q_g_flat(
     centroid_indices: np.ndarray | None = None,
     budget_bytes: float | None = None,
     consume_fit_factor: bool = False,
+    retain_wedge: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """V_q^{0,0} (charge-channel CC tile) on a G-flat-on-disk ζ file.
 
@@ -1203,10 +1204,15 @@ def compute_all_V_q_g_flat(
         policy = qgrid_trs_policy_for(
             sym=sym, irr_idx_q=irr, sym_idx_q=rows, kgrid=kgrid,
             n_sym_spatial=len(perm) // 2, context="scalar V consumer")
-        V_q = unfold_isdf_operator(
-            V_q, irr_idx=irr, sym_idx=policy.unfold_sym_idx,
-            sym_perm=perm, L_table=wraps, q_irr_frac=q_frac,
-            mesh_xy=mesh_xy, n_sym_spatial=policy.n_sym_spatial)
+        if retain_wedge:
+            from symmetry_maps import QirrOperator, QirrTables
+            V_q = QirrOperator.from_tables(V_q, QirrTables(
+                irr, policy.unfold_sym_idx, q_frac, perm, wraps, policy.n_sym_spatial))
+        else:
+            V_q = unfold_isdf_operator(
+                V_q, irr_idx=irr, sym_idx=policy.unfold_sym_idx,
+                sym_perm=perm, L_table=wraps, q_irr_frac=q_frac,
+                mesh_xy=mesh_xy, n_sym_spatial=policy.n_sym_spatial)
     return V_q, g0
 
 

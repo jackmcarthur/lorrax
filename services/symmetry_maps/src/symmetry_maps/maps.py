@@ -341,6 +341,11 @@ def slice_q_full_to_ibz(arr_full, q_irr_full_idx, *, out_sharding=None):
     return _ibz_rows(arr_full, np.asarray(q_irr_full_idx, dtype=np.int32), out_sharding)
 
 
+@jax.jit
+def _unfold_identity(value):
+    return value
+
+
 def unfold_isdf_operator(
     V_q_ibz,
     *,
@@ -359,8 +364,15 @@ def unfold_isdf_operator(
     trs_pair_q_ibz=None,
     axis_local_sym_perm=None,
     right_axis_local_sym_perm=None,
+    q_rows=None,
+    prepare=False,
 ):
-    """Expand ``V_q_ibz`` over the IBZ to the full BZ; see docs/architecture/symmetry_register.md."""
+    """Expand the operator, optionally only at runtime ``q_rows`` of the full zone.
+
+    ``q_rows`` is a replicated integer vector. Host queries refuse invalid
+    rows; traced callers own their bounds and invalid device rows produce NaN.
+    The same transport and q metadata serve full and bounded queries.
+    """
     # Trivial-IBZ short-circuit. When ntran=1 (e.g. nosym runs) the IBZ is
     # already the full BZ — irr_idx is identity, sym_idx is all zeros,
     # sym_perm is identity. The take_along_axis path below is then a
@@ -579,11 +591,11 @@ def unfold_isdf_operator(
                 f"the logical/padded split at {logical}/{padded}; regenerate "
                 "the authenticated centroid tables with an identity tail")
 
-    if (square_defaults
+    if (q_rows is None and square_defaults
             and idx_np.shape[0] == int(V_q_ibz.shape[0])
             and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
             and np.all(sym_np == 0)):
-        return V_q_ibz
+        return (_unfold_identity, (V_q_ibz,)) if prepare else V_q_ibz
 
     pair_source = None
     if requested_trs_rule == "pair_transpose":
@@ -614,6 +626,18 @@ def unfold_isdf_operator(
     sym_arr = np.asarray(sym_idx, dtype=np.int32)
     q_irr_arr = np.asarray(q_irr_frac, dtype=np.float64)
     trs_mask_arr = (sym_arr >= int(n_sym_spatial))
+    query_size = None
+    if q_rows is not None:
+        if getattr(q_rows, 'ndim', np.ndim(q_rows)) != 1:
+            raise ValueError("unfold_isdf_operator: q_rows must be an integer vector")
+        if not np.issubdtype(q_rows.dtype, np.integer):
+            raise ValueError("unfold_isdf_operator: q_rows must be an integer vector")
+        query_size = int(q_rows.shape[0])
+        if query_size == 0:
+            raise ValueError("unfold_isdf_operator: q_rows must not be empty")
+        if not isinstance(q_rows, (jax.Array, jax.core.Tracer)) and (
+                np.any(np.asarray(q_rows) < 0) or np.any(np.asarray(q_rows) >= idx_arr.size)):
+            raise ValueError("unfold_isdf_operator: q_rows is outside the full zone")
     fn = _get_unfold_isdf_operator_jit(
         V_q_shape=tuple(int(s) for s in V_q_ibz.shape),
         fwd_perm_arr=fwd_perm,
@@ -630,6 +654,7 @@ def unfold_isdf_operator(
         trs_rule=trs_rule,
         left_local_perm_arr=left_local_perm,
         right_local_perm_arr=right_local_perm,
+        query_size=query_size,
         mesh_xy=mesh_xy)
     q_sh = NamedSharding(mesh_xy, P())
     # This owner can also be entered while a larger program is traced. Place
@@ -638,11 +663,15 @@ def unfold_isdf_operator(
     with jax.ensure_compile_time_eval():
         q_tables = tuple(device_put_process_local_cached(a, q_sh) for a in
                          (idx_arr, sym_arr, q_irr_arr, trs_mask_arr))
+    if q_rows is not None:
+        q_tables += (jnp.asarray(q_rows),)
     if pair_source is not None:
         pair_source = jax.device_put(
             pair_source, NamedSharding(mesh_xy, P(None, 'y', 'x')))
-        return fn(V_q_ibz, pair_source, q_tables)
-    return fn(V_q_ibz, q_tables)
+        operands = (V_q_ibz, pair_source, q_tables)
+    else:
+        operands = (V_q_ibz, q_tables)
+    return (fn, operands) if prepare else fn(*operands)
 
 
 def _permute_isdf_operator_axes_local(
@@ -1102,11 +1131,12 @@ def _get_unfold_isdf_operator_jit(
     L_arr, L_right_arr, q_irr_arr, trs_mask_arr, logical_left,
     logical_right, n_sym_spatial, mesh_xy, left_local_perm_arr=None,
     right_local_perm_arr=None,
-    trs_rule="conj", q_tile_bytes=256 << 20,
+    trs_rule="conj", q_tile_bytes=256 << 20, query_size=None,
 ):
     """Cache transport by geometry and shapes; q selections are runtime operands."""
     key = (
         V_q_shape, int(q_tile_bytes),
+        query_size,
         fwd_perm_arr.shape, fwd_perm_arr.tobytes(),
         fwd_perm_right_arr.shape, fwd_perm_right_arr.tobytes(),
         idx_arr.shape,
@@ -1148,7 +1178,7 @@ def _get_unfold_isdf_operator_jit(
     L_right_j = L_right_arr
     left_local_perm_j = left_local_perm_arr
     right_local_perm_j = right_local_perm_arr
-    n_full = int(idx_arr.size)
+    n_full = int(idx_arr.size) if query_size is None else int(query_size)
     # Memory contract: never exceed 1× single-tile per rank.  Canonical
     # ordering uses volume-preserving all_to_all redistributions.  An
     # authenticated orbit-packed order instead gathers each axis locally.
@@ -1176,7 +1206,7 @@ def _get_unfold_isdf_operator_jit(
     pair_transpose = (trs_rule == "pair_transpose")
     operator_specs = ((P(None, 'x', 'y'), P(None, 'x', 'y')) if pair_transpose
                       else (P(None, 'x', 'y'),))
-    table_specs = (P(), P(), P(), P())
+    table_specs = (P(),) * (4 if query_size is None else 5)
     in_specs = operator_specs + (table_specs,)
 
     @partial(shard_map, mesh=mesh_xy,
@@ -1188,7 +1218,15 @@ def _get_unfold_isdf_operator_jit(
         # q tiles. Full-k parent gather + endpoint gather + phased output used
         # to coexist (Fe20³/P16:78.8GB), although one output is only26.15GB.
         V_ibz_local = operands[0]
-        idx_j, sym_j, q_irr_j, trs_mask_j = operands[-1]
+        idx_j, sym_j, q_irr_j, trs_mask_j = operands[-1][:4]
+        valid_rows = None
+        if query_size is not None:
+            rows_j = operands[-1][4]
+            valid_rows = (rows_j >= 0) & (rows_j < idx_j.size)
+            lookup = jnp.where(valid_rows, rows_j, 0).astype(jnp.int32)
+            idx_j = jnp.take(idx_j, lookup, mode='fill', fill_value=0)
+            sym_j = jnp.take(sym_j, lookup, mode='fill', fill_value=0)
+            trs_mask_j = jnp.take(trs_mask_j, lookup, mode='fill', fill_value=False)
         mu_local, nu_local = n_left_padded // Px, n_right_padded // Py
         q_tile = min(n_full, max(1, int(q_tile_bytes) // (16 * mu_local * nu_local)))
 
@@ -1258,7 +1296,8 @@ def _get_unfold_isdf_operator_jit(
             return V_full_local
 
         if q_tile == n_full:
-            return transport(jnp.asarray(idx_j), jnp.asarray(sym_j), jnp.asarray(trs_mask_j))
+            out = transport(jnp.asarray(idx_j), jnp.asarray(sym_j), jnp.asarray(trs_mask_j))
+            return out if valid_rows is None else jnp.where(valid_rows[:, None, None], out, jnp.nan)
 
         def chunk(out, i):
             # A uniform overlapping final tile avoids padding the large output.
@@ -1276,13 +1315,13 @@ def _get_unfold_isdf_operator_jit(
         out, _ = jax.lax.scan(chunk,
             jnp.zeros((n_full, mu_local, nu_local), V_ibz_local.dtype),
             jnp.arange(n_tiles, dtype=jnp.int32), unroll=1)
-        return out
+        return out if valid_rows is None else jnp.where(valid_rows[:, None, None], out, jnp.nan)
 
     if pair_transpose:
         # Preserve a producer's reversed-axis placement; transposing an
         # already oriented partner must not first reshard it back to X/Y.
         partner_sh = NamedSharding(mesh_xy, P(None, "y", "x"))
-        q_sh = tuple(NamedSharding(mesh_xy, P()) for _ in range(4))
+        q_sh = tuple(NamedSharding(mesh_xy, P()) for _ in table_specs)
 
         @partial(jax.jit, in_shardings=(V_sh, partner_sh, q_sh), out_shardings=V_sh)
         def _do_unfold(V_ibz, pair_ibz, q_tables):
@@ -1290,7 +1329,7 @@ def _get_unfold_isdf_operator_jit(
                 jnp.swapaxes(pair_ibz, -2, -1), V_sh)
             return _kernel(V_ibz, transposed, q_tables)
     else:
-        q_sh = tuple(NamedSharding(mesh_xy, P()) for _ in range(4))
+        q_sh = tuple(NamedSharding(mesh_xy, P()) for _ in table_specs)
 
         @partial(jax.jit, in_shardings=(V_sh, q_sh), out_shardings=V_sh)
         def _do_unfold(V_ibz, q_tables):

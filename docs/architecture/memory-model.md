@@ -748,26 +748,29 @@ chain price. In particular, `Q < P` retains the input's one-parent floor,
 without a P-parent replica. The same transport serves the face inverse
 channel and the ζ-file-only pass.
 
-Construction/restart can temporarily unfold canonical `V_q` to the full
-zone (`16·N_k·μ_canonical²/P`). All-q finite and reciprocity checks, and the Gamma Hermitian check,
-run before q selection; restart checks keep their existing canonical domain.
-The fresh restart writer uses its authenticated canonical pre-unfold capture
-on a reduced grid, or the canonical full operator on an unreduced grid.
-Neither arm needs a packed full-zone operator.
+On a reducing q grid, fresh scalar and photon-charge initialization retain
+canonical `V_qirr(mu_X,nu_Y)` (`16·N_q,irr·μ_canonical²/P`). The GW restart
+reader makes the same opt-in choice; the public readers and generic V producer
+still return full-q arrays by default. The exact all-q finite census and
+q/−q reciprocity maximum stream fixed-width panels through the same operator
+unfold, with runtime q-index operands and a masked final tail. Gamma is
+admitted and completed once before pricing the statistics-only program against
+current room. Panel output/scratch is its actual compiled increment; a closed
+form for the two transported panels is `2·16·B·μ_canonical²/P`. Restart keeps
+its finite/trace gates without computing the unused reverse panel, and sanity
+off transports Gamma only.
 
-Before returning the ISDF state, both fresh and restart routes select the
-canonical representative q rows through `gw.gw_init._select_coulomb_q_rows`.
-The completed selection is assigned in the driver, releasing the full-zone
-parent before `_coulomb_on_wedge` converts both centroid axes through the
-existing q-tiled operator owner and attaches the packed wedge tables. Each
-executable is compiled, priced and admitted against current room before it
-runs. Screening and Σ retain only `V_qirr(mu_X,nu_Y)`
-(`16·N_q,irr·μ_packed²/P`). On an unreduced grid the full-q input is retained
-because it is the required selected carrier. Price the full-zone input and
-the actual compiled selection scratch at initialization, and the selected
-input and packing scratch separately. Full-zone normal construction,
-unfolding, all-q gates and restart-write peaks remain separate; releasing
-the parent before packing does not remove those earlier peaks.
+The fresh writer persists its unchanged authenticated canonical pre-unfold
+capture, including the existing table/centroid/provenance checks. The late
+`_select_coulomb_q_rows` seam authenticates an already-selected operator against
+the current canonical wedge, then `_coulomb_on_wedge` packs both centroid axes
+and attaches the packed tables. Each executable is compiled, priced and
+admitted before it runs. Screening and Σ retain only
+`V_qirr(mu_X,nu_Y)` (`16·N_q,irr·μ_packed²/P`). A nonreducing grid retains
+its full-q carrier because every row is required; a full-storage fallback uses
+the existing full unfold, admitted before materialization. Those cases retain
+the `16·N_k·μ_canonical²/P` resident. No reduced-grid fresh initialization or
+q-IBZ restart needs that full-zone resident.
 
 ## What the closed forms cannot see
 

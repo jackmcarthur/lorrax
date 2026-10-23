@@ -310,6 +310,26 @@ class QirrOperator:
         """``interaction`` as an operator: a full-zone array is its own trivial wedge."""
         return interaction if isinstance(interaction, cls) else cls.whole_zone(interaction)
 
+    @classmethod
+    def from_tables(cls, values, tables) -> "QirrOperator":
+        """An authenticated canonical wedge and the stored tables describing it."""
+        from symmetry_maps.qirr_store import validate_qirr_tables
+        if values.ndim != 3 or values.shape[-2] != values.shape[-1]:
+            raise ValueError("QirrOperator.from_tables: a square rank-three operator is required")
+        validate_qirr_tables(tables, int(values.shape[0]), int(values.shape[-1]))
+        if (not np.array_equal(np.asarray(tables.sym_perm)[0], np.arange(values.shape[-1]))
+                or np.any(np.asarray(tables.L_table)[0])):
+            raise ValueError("QirrOperator.from_tables: action zero must be the identity")
+        irr, sym = np.asarray(tables.irr_idx_q), np.asarray(tables.sym_idx_q)
+        rows = [np.flatnonzero((irr == parent) & (sym == 0))
+                for parent in range(int(values.shape[0]))]
+        if any(len(hit) != 1 for hit in rows):
+            raise ValueError("QirrOperator.from_tables: every parent needs one identity representative")
+        return cls(values=values, irr_idx=irr, sym_idx=sym,
+                   sym_perm=tables.sym_perm, L_table=tables.L_table,
+                   q_irr_frac=tables.q_irr_frac, n_sym_spatial=tables.n_sym_spatial,
+                   full_rows=np.asarray([hit[0] for hit in rows], np.int32))
+
     def is_whole_zone(self) -> bool:
         """Whether every q is its own wedge row (the unfold is the identity)."""
         return (self.n_wedge == self.n_full
@@ -426,15 +446,25 @@ class QirrOperator:
             raise ValueError(f"QirrOperator: q row {q_full} is not a wedge representative")
         return self.values[int(hit[0])]
 
-    def unfold(self, mesh_xy):
-        """The full-zone interaction ``(n_full, n_left, n_right)``: :func:`maps.unfold_isdf_operator`."""
+    def unfold(self, mesh_xy, *, rows=None, prepare=False):
+        """The interaction at all full-zone rows, or replicated integer ``rows``.
+
+        A bounded query uses the full operator's authenticated tables, with
+        the query vector an operand of the same transport program. No full
+        zone is formed before selecting those rows.
+        ``prepare=True`` returns the existing ``(program, operands)`` for a
+        caller to compile/admit that exact program before executing it.
+        """
         from symmetry_maps.maps import unfold_isdf_operator
-        if self.is_whole_zone():
+        if self.is_whole_zone() and rows is None and not prepare:
             return self.values
+        if rows is not None and not isinstance(rows, (jax.Array, jax.core.Tracer)):
+            rows = np.asarray(rows)
         return unfold_isdf_operator(
             self.values, irr_idx=self.irr_idx, sym_idx=self.sym_idx, sym_perm=self.sym_perm,
             L_table=self.L_table, q_irr_frac=self.q_irr_frac, mesh_xy=mesh_xy,
-            n_sym_spatial=self.n_sym_spatial, trs_rule=self.trs_rule)
+            n_sym_spatial=self.n_sym_spatial, trs_rule=self.trs_rule, q_rows=rows,
+            prepare=prepare)
 
     def load_tables(self, mesh_xy) -> UnfoldLoadTables:
         """:meth:`unfold` as load tables (scalar endpoints), for ``make_kfft_klead_unfold``.
