@@ -609,13 +609,14 @@ def admit_node_route(stage: str, program, operands, *, rank: int,
 #: The converged window is every band the stage's consumer reads (fine-k: the
 #: returned window; path and moments: their states).  Bands near f -> 0
 #: converge last, at rate ~|lam_{b+1}| / |lam|: the 144-node toy of
-#: tests/test_nodal_htransform_cpu.py needs 11 for all 16 fitted bands, hence
-#: the cap of 16; the topmost guards, at f = 0 beside the null space, need
-#: not converge and are not read.  The loop stops at convergence.
+#: tests/test_nodal_htransform_cpu.py needs 11 for all 16 fitted bands.
+#: A healthy basis can need more than 16 steps when spectral gaps are small.
+#: The bounded cap permits that refinement; the topmost guards, at f = 0
+#: beside the null space, need not converge and are not read.  The loop stops at convergence.
 TOP_BLOCK_PAD = 32
 TOP_BLOCK_TOL = 1.0e-10
 TOP_BLOCK_POWER = 2
-TOP_BLOCK_MAX_ITER = 16
+TOP_BLOCK_MAX_ITER = 128
 _TOP_BLOCK_SEED = 20261020
 
 
@@ -715,8 +716,8 @@ def log_top_block(log_fn, where: str, n_fit: int, steps, residual) -> None:
         raise RuntimeError(
             f"GATE top_block_not_converged: got: {where} window residual "
             f"{residual:.3e} after {steps} subspace iterations; want: <= "
-            f"{TOP_BLOCK_REFUSE:.0e} (the node set under-resolves the fitted "
-            "window: raise N_node or check the metric eps warning)")
+            f"{TOP_BLOCK_REFUSE:.0e} (the subspace iteration did not converge; "
+            "inspect the fitted window, spectral separation and node metric)")
 
 
 def select_active_eigenpairs(eigenvalues: jax.Array,

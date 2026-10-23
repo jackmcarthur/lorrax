@@ -104,7 +104,9 @@ eigensolve of the block follow; further steps run until the relative
 residual $\|f(H)_q v - \lambda v\|/|\lambda|$ of every band the stage's
 consumer reads (the fine-k stage: the returned window; the path and the
 moment grid: their states) is $\le 10^{-10}$ ($|\lambda|$ floored at
-$10^{-2}$ of the block's largest), at most 16. The topmost guards sit at
+$10^{-2}$ of the block's largest), at most 128. The loop exits as soon as the
+residual reaches the tolerance; a small spectral separation can require more
+than 16 steps even with an accurate nodal metric. The topmost guards sit at
 $f = 0$ beside the null space; they are not read and need not converge.
 The log line `[top-block]` prints the iteration count and the residual; a
 residual above $10^{-6}$ refuses (`GATE top_block_not_converged`). The cost
@@ -488,7 +490,7 @@ qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin] [--color orbital:d]
 |---|---|---|
 | the nodal fit refuses: centroids not orbit-closed | the centroid file was not made in orbit-aware mode | regenerate it with `centroid.kmeans_cli` (orbit mode) |
 | `[warn] nodal metric eps` | $\varepsilon > 0.1$: too few nodes for the fitted window | at least $22\,(b_1-b_0)$ orbit-closed ISDF centroids |
-| `top_block_not_converged` | a top-block window residual above $10^{-6}$ after 16 steps | raise $N_\mathrm{node}$ or check the metric warning |
+| `top_block_not_converged` | a top-block window residual above $10^{-6}$ after 128 steps | inspect the fitted window, spectral separation and nodal metric; an iteration failure alone does not prove too few nodes |
 | `quadrature_metric_nnls` | the orbit-tied NNLS did not converge | check orbit closure and the node count |
 | `htransform_qrcp_retired` | `htransform_rank_multiplier` or `htransform_qrcp_seed` in the deck | delete the line |
 | `f-shoulder` | a returned band is absent from $f(H)$ at some coarse $k$ | add guard bands |

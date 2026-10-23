@@ -433,3 +433,36 @@ def test_fit_refuses_non_orbit_closed_nodes():
         fit(centroids=closed[:1])
     with pytest.raises(ValueError, match="ISDF centroids .targets. are not"):
         fit(centroids=closed[:1], node_indices=closed)
+
+
+def test_top_block_small_gap_refines_beyond_sixteen_steps():
+    """A healthy exact basis can require more than sixteen power steps.
+
+    The independent dense Hermitian reference has no sampling or nodal metric
+    approximation. Its close spectral separation makes the former iteration
+    cap fail the unchanged residual guard, while bounded refinement recovers
+    both target eigenpairs without changing their accuracy requirement.
+    """
+    import pytest
+    from bandstructure.fh_interp import TOP_BLOCK_TOL
+
+    rng = np.random.default_rng(20261023)
+    z = rng.normal(size=(8, 8)) + 1j * rng.normal(size=(8, 8))
+    q = np.linalg.qr(z)[0]
+    spectrum = np.array([2., 1., .99, .85, .78, .6, .4, .1])
+    k = -(q * spectrum) @ q.conj().T
+    x0 = rng.normal(size=(8, 4)) + 1j * rng.normal(size=(8, 4))
+    short = jax.jit(lambda k, x: top_block_eigh(k, x, (0, 2), max_iter=16))(k, x0)
+    with pytest.raises(RuntimeError, match="top_block_not_converged"):
+        log_top_block(lambda *_: None, "exact dense control", 2, short[2], short[3])
+    values, vectors, steps, residual = jax.jit(
+        lambda k, x: top_block_eigh(k, x, (0, 2)))(k, x0)
+    values, vectors = np.asarray(values)[:2], np.asarray(vectors)[:, :2]
+    reference = np.linalg.eigvalsh(k)[:2]
+    np.testing.assert_allclose(values, reference, rtol=0, atol=2e-12)
+    np.testing.assert_allclose(vectors.conj().T @ vectors, np.eye(2), atol=2e-12)
+    relative = np.linalg.norm(k @ vectors - vectors * values, axis=0) / abs(values)
+    assert np.max(relative) <= 1.1 * TOP_BLOCK_TOL
+    assert int(steps) > 16 and float(residual) <= TOP_BLOCK_TOL
+    print(f"TOP_BLOCK_SMALL_GAP PASS: short={float(short[3]):.3e}, "
+          f"refined={float(residual):.3e}, steps={int(steps)}")
