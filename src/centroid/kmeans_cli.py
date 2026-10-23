@@ -114,6 +114,7 @@ from .kmeans_isdf import (
     weighted_kmeans_jax,
     snap_centroids_to_grid,
     ensure_unique_centroids,
+    _restore_orbit_pool,
 )
 from .production_output import (
     KMEANS_STAGES,
@@ -368,6 +369,19 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
                   f"{unfolded.shape[0]} distinct centroids (n_sym={n_sym})")
         indices, snapped, _ = snap_centroids_to_grid(
             unfolded, fft_grid, deduplicate=False)
+        before = len(indices)
+        indices = _restore_orbit_pool(
+            indices, fft_grid, weight, Rinv, tau, M_cand)
+        if len(indices) > before:
+            # Reuse the symmetry service's orbit IDs for every point,
+            # including the redistributed ones, before grouped pruning.
+            snapped = indices.astype(float) / np.asarray(fft_grid)
+            unfolded, orbit_id = unfold_orbit_unique_with_id(
+                snapped, np.asarray(Rinv), np.asarray(tau))
+            indices, snapped, _ = snap_centroids_to_grid(
+                unfolded, fft_grid, deduplicate=False)
+            log.info(f"Restored snapped candidate pool: {before} → "
+                     f"{len(indices)} unique points in complete spatial orbits")
         return indices, snapped, indices.shape[0], orbit_id
 
     log.debug(f"\nSnapping {M_cand} centroids to FFT grid {fft_grid}...")
@@ -483,6 +497,10 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
         sym = wfn.symmetry()
 
         n_rtot = int(np.prod(wfn.fft_grid))
+        if N_c > n_rtot:
+            raise ValueError(
+                f"requested {N_c} centroids but the FFT grid contains only "
+                f"{n_rtot} distinct points; request fewer centroids or a finer FFT grid")
         init_method, init_msg = _decide_init_method(N_c, n_rtot)
         if init_msg is not None:
             log.debug(init_msg)

@@ -43,7 +43,7 @@ BOHR_TO_ANG = 0.529177210544
 #: Bump it with any change that moves the selected points for fixed inputs:
 #: caches keyed on it (the htransform node cache,
 #: ``bandstructure.fh_interp.htransform_nodes``) are then recomputed.
-KMEANS_VERSION = "kmeans-isdf-v1"
+KMEANS_VERSION = "kmeans-isdf-v2"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -934,6 +934,59 @@ def ensure_unique_centroids(
     extra = np.stack([take // (Ny * Nz), (take // Nz) % Ny, take % Nz], axis=1)
     out = np.concatenate([indices[first_idx], extra], axis=0)
     return out.astype(float) / fft_grid
+
+
+def _restore_orbit_pool(indices, fft_grid, weight, Rinv, tau, target):
+    """Restore snapped duplicate points with complete, unoccupied orbits.
+
+    As on the literal-point route, prefer the highest-weight free grid
+    points, with flat grid index breaking ties. The input weight has already
+    been symmetrized: all members of a spatial orbit carry the same Lloyd
+    mass. Stream one service-owned grid permutation or added orbit at a time;
+    the working set is
+    O(N_grid + N_candidates), never grid by candidate or grid by symmetry.
+    """
+    grid = np.asarray(fft_grid, dtype=np.int64)
+    total = int(np.prod(grid))
+    target = min(int(target), total)
+    if len(indices) >= target:
+        return indices
+    occupied = np.zeros(total, dtype=bool)
+    occupied[np.ravel_multi_index(np.asarray(indices).T, tuple(grid))] = True
+    weights = np.asarray(weight, dtype=np.float64).reshape(-1)
+    # Stream permutations to identify free whole orbits. Checking a small
+    # final budget remainder must not Fourier-transform every free point or
+    # construct every free orbit individually on a million-point grid.
+    canonical = np.arange(total, dtype=np.int64)
+    for operation, shift in zip(np.asarray(Rinv), np.asarray(tau)):
+        reciprocal = np.rint(np.linalg.inv(operation)).astype(np.int64)
+        row = _sym.fft_grid_pullback_perm(
+            reciprocal[None], shift[None] * (2.0*np.pi), grid,
+            validate=True)[0]
+        canonical = np.minimum(canonical, row)
+    sizes = np.bincount(canonical, minlength=total)
+    present = np.bincount(canonical[occupied], minlength=total)
+    if np.any((present > 0) & (present != sizes)):
+        raise RuntimeError("snapped centroid pool is not closed under its spatial orbits")
+    free = np.flatnonzero((sizes > 0) & (present == 0))
+    # Flat grid index makes equal-weight choices deterministic.
+    free = free[np.lexsort((free, -weights[free]))]
+    parts = [np.asarray(indices, dtype=np.int64)]
+    count = len(indices)
+    for point in free:
+        if count + sizes[point] > target:
+            continue
+        seed = np.asarray(np.unravel_index(point, tuple(grid))) / grid
+        images = _sym.r_action_forward(
+            seed[None, :], np.asarray(Rinv), np.asarray(tau), wrap=False)
+        image_idx, _ = _sym.snap_to_grid_and_split_wrap(images, grid)
+        orbit = np.unique(np.ravel_multi_index(
+            image_idx.reshape(-1, 3).T, tuple(grid)))
+        parts.append(np.column_stack(np.unravel_index(orbit, tuple(grid))))
+        count += len(orbit)
+        if count == target:
+            break
+    return np.concatenate(parts, axis=0)
 
 
 # ─────────────────────────────────────────────────────────────────────────
