@@ -284,6 +284,46 @@ def make_w_densifier(
     return _densify
 
 
+def densify_w(W_q_coarse, *, mesh_xy, densifier):
+    """Admit and execute one coarse-to-fine W interpolation.
+
+    Price the exact output and bounded scratch beside the resident input,
+    then run the executable whose price was read. The caller retains the
+    coarse input until its last use; this helper keeps no operand cache.
+
+    Parameters
+    ----------
+    W_q_coarse : jax.Array
+        ``(mu, nu, *coarse_grid)`` complex W, with only centroid axes sharded.
+    mesh_xy : Mesh
+        The same mesh used to build ``densifier``.
+    densifier : callable
+        The jitted program from :func:`make_w_densifier`.
+
+    Returns
+    -------
+    jax.Array
+        ``(mu, nu, *fine_grid)`` in the program's declared k- or R-space
+        convention and centroid-face sharding.
+    """
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    from common.gpu_utils import shared_device_room
+    from lxkit import memory
+
+    compiled = densifier.lower(W_q_coarse).compile()
+    new_bytes = -agreed_chunk(-compiled_new_bytes(compiled))
+    output_bytes = int(compiled.memory_analysis().output_size_in_bytes)
+    scratch_bytes = max(0, new_bytes - output_bytes)
+    stage = "BSE coarse-to-fine W interpolation"
+    room = shared_device_room(stage)
+    memory.admit(stage, (("centroid face", memory.Price(
+        xla=memory.Term(scratch_bytes, output_bytes * int(mesh_xy.size),
+                        "W interpolation (compiled output and bounded scratch)"),
+        ranks=int(mesh_xy.size), label=stage)),),
+        int(room) if isinstance(room, (int, np.integer)) else 0)
+    return compiled(W_q_coarse)
+
+
 def decimate_W_q_to_subgrid(W_q: jax.Array,
                             coarse_grid: tuple[int, int, int]) -> jax.Array:
     """Sub-sample a fine-grid ``W_q`` onto a coarse BZ sub-grid (every m-th q).
@@ -1930,21 +1970,7 @@ def _interpolate_bse_data_to_grid(
         # The fine output is not the peak: the embedding and FFT can hold
         # several local W tiles. Admit this exact executable beside the
         # resident coarse W, then run the executable whose bytes were read.
-        from runtime.aot_memory import agreed_chunk, compiled_new_bytes
-        from common.gpu_utils import shared_device_room
-        from lxkit import memory
-        densify_compiled = densify_W.lower(W_coarse).compile()
-        new_bytes = -agreed_chunk(-compiled_new_bytes(densify_compiled))
-        output_bytes = int(densify_compiled.memory_analysis().output_size_in_bytes)
-        scratch_bytes = max(0, new_bytes - output_bytes)
-        stage = "BSE coarse-to-fine W interpolation"
-        room = shared_device_room(stage)
-        memory.admit(stage, (("centroid face", memory.Price(
-            xla=memory.Term(scratch_bytes, output_bytes * int(mesh_xy.size),
-                            "W interpolation (compiled output and bounded scratch)"),
-            ranks=int(mesh_xy.size), label=stage)),),
-            int(room) if isinstance(room, (int, np.integer)) else 0)
-        W_q_fine = densify_compiled(W_coarse)
+        W_q_fine = densify_w(W_coarse, mesh_xy=mesh_xy, densifier=densify_W)
         del W_coarse
         W_q_fine = _add_rank_lr(W_q_fine, A_f, D_f, mesh_xy, 1.0)
         log_fn(f"[kgrid_fine] W embedded per centroid pair (Wigner-Seitz) in R "

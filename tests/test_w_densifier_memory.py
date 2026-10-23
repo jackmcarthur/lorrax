@@ -35,13 +35,15 @@ def _reference(w, pos, lattice, coarse, fine, output):
 def main():
     import runtime
     runtime.initialize_communicator_stack()
+    import gc
     import json
+    import weakref
     import jax
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.collectives import device_put_process_local, gather_to_host
     from common.ws_images import pair_ws_images, pair_ws_embed
-    from bse.bse_densify import make_w_densifier
+    from bse.bse_densify import make_w_densifier, densify_w
     from bse.bse_ring_comm import create_mesh_2d
     from runtime import tiles
     mesh = create_mesh_2d()
@@ -63,8 +65,17 @@ def main():
             ref = _reference(w, pos, lat, cg, fg, output)
             for tile in (old_tile, 20000, 2000):
                 tiles.TILE_BYTES = tile
-                value = make_w_densifier(mesh, spec, fg, embedding=emb, output=output)(
-                    device_put_process_local(w, sh))
+                coarse = device_put_process_local(w, sh)
+                coarse_ref = weakref.ref(coarse)
+                local_refs = [weakref.ref(coarse.addressable_data(i))
+                              for i in range(len(coarse.sharding.addressable_devices))]
+                value = densify_w(coarse, mesh_xy=mesh, densifier=make_w_densifier(
+                    mesh, spec, fg, embedding=emb, output=output))
+                del coarse
+                jax.block_until_ready(value)
+                gc.collect()
+                assert coarse_ref() is None, "interpolation retained its consumed coarse input"
+                assert all(ref() is None for ref in local_refs), "coarse local storage is still held"
                 got = np.asarray(gather_to_host(value))
                 rel = float(np.max(np.abs(got - ref)) / np.max(np.abs(ref)))
                 key = f"{dim}D/{output}/tile{tile}"

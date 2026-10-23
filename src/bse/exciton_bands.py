@@ -2327,7 +2327,7 @@ def main(argv=None):
                 # fed the restart's native-grid W0_lr decimated to the sub-grid).
                 # Γ is on both grids and stays exact; its screened head is the
                 # loader's exact diagonal ``data["q0_head_ry"]``, not on W_q.
-                from .bse_densify import _add_rank_lr, _srlr_terms
+                from .bse_densify import _add_rank_lr, _srlr_terms, densify_w
                 w_head_mode = resolve_w_head_densify(args.w_head_densify, params)
                 W_q_fine_in, data["W_q"] = data["W_q"], None
                 r_mu, _geom = _w_tile_gauge(
@@ -2349,8 +2349,11 @@ def main(argv=None):
                     mesh_xy, sh.W.spec, (nkx, nky, nkz), output="k",
                     embedding=w_pair_embedding(
                         cg, wfn, r_mu, int(W_q_coarse.shape[0]), meta.sys_dim))
-                W_R = _ifftn(_add_rank_lr(densify_W(W_q_coarse), A_f, D_f,
-                                          mesh_xy, 1.0))
+                W_dense = densify_w(W_q_coarse, mesh_xy=mesh_xy, densifier=densify_W)
+                # Dispatch owns the pending read; the Q sweep needs only W_R.
+                del W_q_coarse
+                W_R = _ifftn(_add_rank_lr(W_dense, A_f, D_f, mesh_xy, 1.0))
+                del W_dense, A_c, D_c, A_f, D_f
                 log(f"[coarse-W] W sampled on {cg[0]}x{cg[1]}x{cg[2]} sub-grid of "
                     f"{nkx}x{nky}x{nkz}, embedded per centroid pair in R (trig-interp to fine "
                     f"grid) [w_head_densify={w_head_mode}]")

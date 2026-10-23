@@ -590,7 +590,7 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | head wings | `n_ends` gathered endpoint blocks `16·N_k·n_s·block·N_b` | `qsgw_head.head_wing_mu_block`: the fixed tile, at least 16 centroids | — |
 | exciton_bands C_q | P_R and its update, one ψ chunk and its Pk | `vq_interp.build_cq_q_chunk`: q rows within the fixed tile | — |
 | htransform R images | f(H)_R and the back-map L_R, `16·N_k·N_B·(N_B + N_T)/P` (`N_B` = spin × nodes, `N_T` = spin × centroids, 0 when they are the nodes), and the int16 WS code tiles `2·N_k·N_B·(N_B + N_T)/P` | `fh_interp.build_fH_R` compiled (one program); `node_pair_table` exact code extents; WS tie-mask tile's own compiled executable | warns and admits |
-| BSE coarse-to-fine W | resident coarse W plus the fine output on the centroid face, and one fixed tile of embedding/FFT scratch | `bse_densify.make_w_densifier` scans centroid-face blocks within `TILE_BYTES`; `_densified_w` admits the exact executable's output and scratch beside resident arrays | warns and admits |
+| BSE coarse-to-fine W | resident coarse W plus the fine output on the centroid face, and one fixed tile of embedding/FFT scratch | `bse_densify.make_w_densifier` scans centroid-face blocks within `TILE_BYTES`; shared `densify_w` admits the exact executable's output and scratch beside resident arrays | warns and admits |
 | restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` (SlabIO writes per-rank hyperslabs) | — | — |
 
 Replicated per-process metadata includes the TRS-augmented centroid permutation
@@ -670,7 +670,9 @@ one fixed tile instead of whole additional W carriers. Both centroid axes
 can be blocked; no whole k axis is split. The final five-dimensional output
 is the scan carry, avoiding a whole-output layout copy on exit. The exact
 compiled price separates the output's face scaling from per-rank scratch,
-and is admitted beside the already resident coarse input.
+and is admitted beside the already resident coarse input. Both the fine-grid
+bundle and the exciton coarse-W path use that same execution owner; the
+consumed coarse input is released before the Q sweep.
 
 A Perlmutter CPU P4 probe with 10,000 centroids, coarse 3×3 and fine 6×6 has
 3.6 GB coarse input and 14.4 GB fine output per rank. Centroid tiling reduces
