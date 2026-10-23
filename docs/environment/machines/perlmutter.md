@@ -61,13 +61,17 @@ network option a step needs (`step_network`), the site NCCL module's settings
 |---|---|
 | one node | no network settings |
 | several nodes, CUDA, `SLURM_NETWORK` contains `no_vni` | the profile's `[nccl.env]`: `NCCL_NET_PLUGIN` = the absolute path of `nccl/2.29.2-cu13`'s plugin, plus that module's settings including `FI_CXI_RDZV_THRESHOLD=0`; a value the caller set is kept |
-| several nodes, CUDA, no `no_vni` | **refuses**, naming the relaunch: without a VNI-free step, NCCL falls back to TCP sockets (about 12× slower) and MPI-IO with NCCL initialization fails |
+| several nodes, CUDA, no `no_vni` | **refuses**, naming the relaunch: the supported MPI-IO/OFI combination needs a VNI-free step; a controlled 16-GPU run without it failed during MPI/libfabric endpoint creation (`ENOSPC`) |
 | `NCCL_NET=Socket` on several nodes | **refuses** |
-| explicit `NCCL_NET` or `NCCL_NET_PLUGIN` | the caller's configuration, unchanged |
+| explicit `NCCL_NET` or `NCCL_NET_PLUGIN` | preserves the caller's transport choice; the site launch requirements still apply |
 
-A multi-node GPU `srun` therefore passes `--network=no_vni` (or exports
-`SLURM_NETWORK=no_vni`). The setting acts when SLURM creates the step, so
-setting it from Python is too late. `FI_CXI_RDZV_THRESHOLD=0` prevents a
+Source `config/perlmutter/gpu_env.sh` or load the LORRAX module before `srun`.
+Both default an unset `SLURM_NETWORK` to `no_vni` in a launch shell, so ordinary
+`srun` needs no network flag. An explicit value, including empty, is kept;
+`--network=...` on `srun` still chooses the step's network. Setup does not add
+this default inside an active numeric `SLURM_STEP_ID` (or legacy
+`SLURM_STEPID`), because the setting cannot repair a step already created.
+The Python runtime validates the actual step and names the relaunch if needed. `FI_CXI_RDZV_THRESHOLD=0` prevents a
 cross-node send/receive deadlock (in XLA's `all_to_all` and
 `collective_permute`) in which libfabric's NCCL proxy thread synchronizes the
 device while the NCCL kernel waits on that thread.

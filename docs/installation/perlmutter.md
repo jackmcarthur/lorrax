@@ -134,15 +134,16 @@ The result is `1 passed`, in about 5 min on cold caches.
 - `config/perlmutter/gpu_env.sh` holds the machine's run settings:
   `MPICH_GPU_SUPPORT_ENABLED=0`
   ([why](../environment/machines/perlmutter.md#mpich-gpu-support)) and
-  `CUDA_CACHE_PATH` on `$SCRATCH`. Source it once per shell before any GPU
-  `srun`. Nothing else needs setting.
+  `CUDA_CACHE_PATH` on `$SCRATCH`, and `SLURM_NETWORK=no_vni` when unset in
+  a launch shell. Source it once per shell before any GPU `srun`; explicit
+  network choices are preserved. Nothing else needs setting.
 - Use one rank per GPU, through `select_gpu.sh` and never
   `--gpus-per-task=1`
   ([why](../environment/machines/perlmutter.md#required-gpu-task-geometry)).
 - A driver's `srun` line has the same shape: replace the pytest command with
   `.venv/bin/python -u -m gw.gw_jax -i deck.in`, run from the run directory.
-  P16 is `-N 4 -n 16 --gpus-per-node=4`; a multi-node step also needs
-  `--network=no_vni`
+  P16 is `-N 4 -n 16 --gpus-per-node=4`. The sourced setup supplies the network
+  default before the step is created
   ([why](../environment/machines/perlmutter.md#network-transport-at-startup)).
 - Never run a driver on a login node.
 
