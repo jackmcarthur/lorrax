@@ -50,6 +50,12 @@ with one all-to-all, and samples the centroid faces from the local G slots, so
 the G-slot store (`P(None, None, None, ('x','y'))`) and the faces come from
 one pass.
 
+The `gvecs`, `ngk_valid`, `box_index` and `box_index_dev` accessors accept
+`cache=False` for bounded requests. This bypasses both lookup and insertion,
+including every nested host table, so a k-batch's metadata can be released
+with its consumer. The default `cache=True` preserves loader-owned reuse.
+This policy does not clear tables that another caller already cached.
+
 `kweights` has one value per raw WFN k row. The loader validates only shape
 `(nkpts,)`, finite nonnegative values and a positive sum, and never spreads
 weights over stars or decides whether the rows are an IBZ wedge or the full
