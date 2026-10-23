@@ -873,6 +873,8 @@ def _persist_screening(
         print0, qp_solver, sym, tensors_filename, photon_response=None,
         material_class=None, head_response=None):
     """Persist the screened static body and head on the canonical q set."""
+    from .gw_output import stamp_w0_route
+    stamp_w0_route(tensors_filename, config)        # read by the BSE's GATE bse_mpa_w0
     if (driver_persists_w0(mode, config)
             and qp_solver is not QPSolver.SELF_CONSISTENT):
         W_static = restart_static_w(

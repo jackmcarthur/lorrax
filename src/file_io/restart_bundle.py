@@ -717,21 +717,25 @@ def _interaction_dataset(filename, kind, nohead):
 
 
 def refuse_mpa_static_w(filename) -> None:
-    """``GATE bse_mpa_w0``: a BSE reads W(0), and an MPA restart's is the pole fit's.
+    """``GATE bse_mpa_w0``: a BSE needs a static W(0), and the multipole-W GW
+    route (``compute_mode = mpa`` with ``sigma_w_model = mpa``) leaves none.
 
-    The route is the ``compute_mode`` stamp on ``W0_qmunu``
-    (``gw.gw_output._stamp_screening_diagrams``); a restart written before the
-    stamp passes.  Called by the BSE drivers when they read W, not by the GW
-    restart path, which may reuse an MPA W0 for its own route.
+    The route is the restart's ``gw_compute_mode`` / ``gw_sigma_w_model``
+    file stamps (``gw.gw_output.stamp_w0_route``); the tangential model
+    (``sigma_w_model = tangential``) and a restart written before the stamps
+    pass.  Called by the BSE drivers when they read W, not by the GW restart
+    path.
     """
     with h5py.File(filename, "r") as f:
-        mode = f["W0_qmunu"].attrs.get("compute_mode") if "W0_qmunu" in f else None
-    if mode is not None and str(np.asarray(mode).astype(str)).lower() == "mpa":
+        mode, w_model = (str(np.asarray(f.attrs.get(k, "")).astype(str)).lower()
+                         for k in ("gw_compute_mode", "gw_sigma_w_model"))
+    if mode == "mpa" and w_model == "mpa":
         raise ValueError(
-            f"GATE bse_mpa_w0: {filename} was written by compute_mode = mpa, so its W(0) "
-            "comes from the MPA pole fit; the BSE needs the static W(0) of a static GW "
-            "run; fix: rerun GW on this deck with compute_mode = cohsex (or gn_ppm, "
-            "hl_ppm) and write_restart_tensors = true, and point the BSE at that restart.")
+            f"GATE bse_mpa_w0: {filename} was written by the MPA route (compute_mode = mpa, "
+            "sigma_w_model = mpa), whose W comes from the pole fit; the BSE needs the static "
+            "W(0) of a static GW run; fix: rerun GW on this deck with compute_mode = cohsex "
+            "(or gn_ppm, hl_ppm) and write_restart_tensors = true, and point the BSE at that "
+            "restart.")
 
 
 def read_interaction(filename, kind, mesh_xy, *, nohead=False):
