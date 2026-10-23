@@ -363,6 +363,8 @@ route (c), and refuses by name at the first stack that needs the whole mesh
   stack on the whole mesh, refused by name if a solve fails every attempt.
   `call.lower` lowers that program, so a caller that admits it by its compiled
   size has sized the retry and runs the first program in the room it leaves.
+  `call.runner(first, retry=whole)` reuses exact already-compiled first and
+  backup executables after the caller admits both complete programs.
   `checked_shapes(fn, *args)` is `jax.eval_shape` of the first phase.
 
 ### Resident operands: `batch_layout` and `local_batch`
@@ -645,7 +647,7 @@ The native libraries allocate workspace outside XLA's memory planner, so a
 caller sizing a stage asks the service first. All three queries allocate
 nothing and accept `float64` or `complex128` only.
 
-- `workspace_bytes_per_rank(plan, op, shapes, dtype)`: the device workspace
+- `workspace_bytes_per_rank(plan, op, shapes, dtype, checked=False)`: the device workspace
   per rank of a resolved CUDA `Plan` or `GemmPlan`. For a distributed `eigh`
   it is the cuSOLVERMp workspace rounded to 256 bytes plus one private operand
   tile `(n/P_x)(n/P_y)·itemsize`, which keeps eigh non-donating despite the
@@ -653,8 +655,13 @@ nothing and accept `float64` or `complex128` only.
   returns the cuSolverDn workspace plus a 4-byte info word. A distributed
   `gemm` has none: `panel_matmul`'s panels are XLA's. Query collectively on
   the real mesh; off CUDA it returns 0.
+  `checked=True` also covers the native scratch of a gathered EIGH retry
+  admitted by that plan, for pricing its complete checked executable.
 - `matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend,
   batched_route)`: the same query for a `matmul` route.
+- `local_eigh_workspace(mesh, share, n, dtype)`: native scratch outside the
+  compiled buffers for the rank's actual local share of EIGH matrices in a
+  round. CUDA charges `share` times the cuSOLVERDn size query; CPU returns zero.
 Operand carriers, transpose staging, communication buffers and persistent
 context resources are the caller's to admit.
 

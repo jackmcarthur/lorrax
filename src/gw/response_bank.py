@@ -1046,7 +1046,7 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
     gemm = workspace_bytes_per_rank(policy,"gemm",((batch,n,n),(batch,n,n)),np.complex128)
     eig_policy = (plan("eigh", mesh_xy, n=n, backend="distributed", batched_route="auto")
                   if with_eigh and layout == "local" else policy)
-    eig = workspace_bytes_per_rank(eig_policy,"eigh",((batch,n,n),),np.complex128) if with_eigh else 0
+    eig = workspace_bytes_per_rank(eig_policy,"eigh",((batch,n,n),),np.complex128,checked=True) if with_eigh else 0
     return dict(gemm=gemm,eigh=eig,total=gemm+eig,scope="actual-shape ISERV query; GEMM persistent plus concurrent eigh scratch")
 
 
@@ -1230,7 +1230,7 @@ def _select_coulomb_program(proposed, values, *, mesh_xy, n_logical, layout):
     """
     from dataclasses import replace
     from lxkit import memory
-    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    from runtime.aot_memory import compiled_price
 
     programs = {}
     ranks, n, batch = int(mesh_xy.size), int(values.shape[-1]), int(values.shape[0])
@@ -1241,14 +1241,14 @@ def _select_coulomb_program(proposed, values, *, mesh_xy, n_logical, layout):
         programs[candidate] = kernel
         executable = _compiled(kernel, (values,))
         native = response_dense_workspace(mesh_xy, n, batch, candidate, with_eigh=True)
-        need = -agreed_chunk(-compiled_new_bytes(executable, extra=native["total"]))
         source = f"compiled {candidate} Coulomb roots plus native workspace"
-        priced = replace(memory.priced(0, source, spread=need*ranks, ranks=ranks),
+        priced = replace(compiled_price(compiled=executable, extra=native["total"],
+                         ranks=ranks, face=True, source=source, contexts=ranks > 1),
                          whole=n if candidate == "local" else 0)
         # Both checked programs include the whole-mesh eigensolver retry.
         # The shared policy charges its contexts only when the run budget
         # did not already withhold them for distributed linalg.
-        return priced + memory.Price(outside=memory.contexts()) if ranks > 1 else priced
+        return priced
 
     candidates = (layout,) if layout != "local" else ("local", "distributed")
     chosen = memory.admit("Coulomb root program",

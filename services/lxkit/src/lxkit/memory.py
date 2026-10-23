@@ -563,7 +563,8 @@ def pool_reservation(total: float, leg) -> float:
 
 def contexts() -> Term:
     """The providers' contexts a route opens where the budget did not withhold them (local)."""
-    size, src = getattr(_leg(), "distributed_context", (0.0, ""))
+    leg = _leg()
+    size, src = getattr(leg, "distributed_context", (0.0, "")) if leg.accelerator else (0.0, "")
     return Term(size if _RUN.get("linalg", "local") == "local" else 0.0, source=src)
 
 

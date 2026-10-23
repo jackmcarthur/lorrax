@@ -586,19 +586,32 @@ def compiled_new_bytes(compiled, *, extra: int = 0, platform: str | None = None)
     return int(aot_kernel_peak_bytes(compiled, platform=platform).resident_increment) + int(extra)
 
 
-def compiled_price(fn, *abstract, ranks: int, face: bool, source: str, arguments: bool = False):
+def compiled_price(fn=None, *abstract, ranks: int, face: bool, source: str,
+                   arguments: bool = False, compiled=None, extra: int = 0,
+                   contexts: bool = False):
     """A route's ``lxkit.memory.Price`` from its own code ``fn`` compiled (never run) at
     ``abstract`` operands, as :func:`check_chunk` reads a chunk: :func:`compiled_new_bytes`
     (``arguments``: + the operands, which the route creates in its own layout), the largest any
-    rank read (INVARIANTS 21); ``face``: divided over the mesh, else whole on every rank."""
+    rank read (INVARIANTS 21); ``face``: divided over the mesh, else whole on every rank.
+
+    ``compiled`` supplies the exact executable instead of wrapping ``fn`` in
+    another jit. ``extra`` adds queried native workspace; ``contexts`` charges
+    shared provider contexts only where the run budget did not withhold them.
+    These options query memory only and do not initialize a provider.
+    """
     import jax
     from lxkit import memory
-    ex = jax.jit(fn).lower(*abstract).compile()
+    if compiled is not None and (fn is not None or abstract):
+        raise ValueError("compiled_price takes either a function/operands or an executable")
+    if compiled is None and fn is None:
+        raise ValueError("compiled_price needs a function or an executable")
+    ex = compiled if compiled is not None else jax.jit(fn).lower(*abstract).compile()
     got = float(-agreed_chunk(-compiled_new_bytes(
-        ex, extra=int(ex.memory_analysis().argument_size_in_bytes) if arguments else 0)))
-    return memory.Price(xla=memory.Term(0.0 if face else got, got * int(ranks) if face else 0.0,
+        ex, extra=int(extra) + (int(ex.memory_analysis().argument_size_in_bytes) if arguments else 0))))
+    price = memory.Price(xla=memory.Term(0.0 if face else got, got * int(ranks) if face else 0.0,
                                         f"{source} (compiled, never run)"),
                         ranks=int(ranks), label=source)
+    return price + memory.Price(outside=memory.contexts()) if contexts else price
 
 
 def agreed_chunk(chunk: int) -> int:

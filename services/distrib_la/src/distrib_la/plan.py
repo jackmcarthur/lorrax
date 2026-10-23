@@ -396,7 +396,7 @@ def room_class(cache, key, room, build):
 
 def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all") -> StackRoute:
     """THE placement of an eigh stack (nb, n, n) in ``room`` bytes per rank: the faster of the
-    routes whose price fits, priced from the shapes only (no vendor query) and timed by
+    routes whose price fits, priced from their compiled code and native workspace query and timed by
     :func:`_eigh_seconds`, so every rank decides alike with no exchange.
 
     Route (c) at the most whole matrices per rank whose compiled program (:func:`_stack_bytes`)
@@ -415,7 +415,9 @@ def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all") -> St
         while per_rank >= 1:
             rounds = -(-(-(-nb // ranks)) // per_rank)
             tried = -(-(-(-nb // rounds)) // ranks)
-            price = _stack_bytes(op, mesh, nb, n, dtype, rounds, phase, gathered)
+            from distrib_la.workspace import local_eigh_workspace
+            price = (_stack_bytes(op, mesh, nb, n, dtype, rounds, phase, gathered)
+                     + local_eigh_workspace(mesh, tried, n, dtype))
             if room_test(lambda r, p=price: p <= r, room):
                 one, on_mesh = (_eigh_seconds(k, n, ranks, platform) for k in ("one", "mesh"))
                 if one is None or -(-nb // ranks) * one <= nb * on_mesh:
@@ -431,7 +433,9 @@ def _gathered_admitted(mesh, shape, dtype, room=None) -> bool:
     GATHERED_EIGH_BYTES, or within the plan's room (its ``budget_bytes``).  The chain that holds
     it is priced compiled in the same room.  cuSOLVERMp 0.9.1 left n 30000 (run30k) with no
     correct attempt short of this one."""
-    need = compiled_bytes(_gathered_program(mesh), mesh, tuple(int(v) for v in shape), dtype)
+    from distrib_la.workspace import local_eigh_workspace
+    need = (compiled_bytes(_gathered_program(mesh), mesh, tuple(int(v) for v in shape), dtype)
+            + local_eigh_workspace(mesh, 1, int(shape[-1]), dtype))
     return need <= GATHERED_EIGH_BYTES or room_test(lambda r: r is not None and need <= r, room)
 
 
