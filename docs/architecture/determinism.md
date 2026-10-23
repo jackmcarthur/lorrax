@@ -14,7 +14,7 @@ the W model, `sigma_mnk.h5`, and `eqp0.dat` / `eqp1.dat` after their first line
 the **same node and the same rank→GPU placement** as its base:
 
 ```bash
-cmp <(tail -n +2 base/eqp0.dat) <(tail -n +2 new/eqp0.dat)    # and eqp1.dat, eqp_g0w0.dat
+cmp <(grep -v '^#' base/eqp0.dat) <(grep -v '^#' new/eqp0.dat)    # and eqp1.dat, eqp_g0w0.dat
 ```
 
 A change that moves numbers states `max|ΔE_qp|` in eV over every state of
