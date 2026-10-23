@@ -515,6 +515,13 @@ tile. G-flat coefficients stay band-sharded, while the canonical sparse
 sphere-index table remains replicated metadata. One local FFT still needs
 its complete spatial grid; increasing P does not reduce that one-row floor.
 
+The streaming centroid loader reuses geometry-only zero, reshard and donated
+insertion programs through its existing signature cache. The unmasked keys
+contain extents and shardings; centroid coordinates, WFN/Meta objects and
+device data are not retained. Packed-mask reshards and insertions stay local
+to the request. This avoids repeated tracing, lowering and persistent-cache
+reads on warm calls without retaining sampled faces or request-index tables.
+
 The χ₀ node cannot be chunked over q, because the k-convolution needs the
 whole k axis on every rank. A completed W of an earlier screening role is
 spilled to host (`common.collectives.spill_to_host`) while a later role runs,
