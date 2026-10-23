@@ -631,6 +631,12 @@ def build_bse_ring_matvec_full(
     the screening operator of ``bse.w_ladder`` (``w_bse``, ``w_rpa_resolvent``),
     ``bse.bse_w_exact`` and ``bse.w_omega_chain``.
 
+    The direct rung scans over individual trial vectors; its encoded
+    ``(mu,nu,s,s,k)`` scratch therefore does not grow with probe-block width.
+    Trial vectors remain distributed over their band axes throughout. Both
+    rows reuse the k-convolution router and ``contract_bands_block_reshard``;
+    neither row gathers the whole transition window on each rank.
+
     ``fuse_ladder_rung`` (LADDER SCREENING ONLY — ``screening and include_W``;
     inert everywhere else) sums the two rung ``T`` intermediates of each block
     row before the FFT chain rather than after, so the matvec runs the
@@ -954,8 +960,8 @@ def build_bse_ring_matvec_full(
         4 -> 2 applications is the single largest per-iteration saving on the
         path.  MEASURED (opt_integration, 2026-08-16) — see the arm's report.
 
-        ``fuse_ladder_rung=False`` selects the unfused core for an A/B and
-        for any bisection.
+        ``fuse_ladder_rung=False`` selects four separate rung applications
+        inside the same per-trial scan for an A/B or bisection.
 
         TWO -> ONE WAS TRIED AND IS REFUTED.  The obvious next step is to stack
         the two surviving applications: they are INDEPENDENT operands of the
@@ -964,7 +970,8 @@ def build_bse_ring_matvec_full(
         ``apply_W_from_T`` is row-count-agnostic on both arms — so
         ``jnp.concatenate([T_res, T_anti], axis=0)``, ONE application, and two
         slices back is a legal and bit-identical rewrite.  MEASURED on the
-        gnppm fixture (n_rmu 399, 3x3x1, nspinor 2; one A100, BFC; in-process
+        gnppm fixture before the per-trial memory bound (n_rmu 399, 3x3x1,
+        nspinor 2; one A100, BFC; in-process
         A/B, and the build order swapped as a control):
 
             arm                     nb=1              nb=4
@@ -992,19 +999,37 @@ def build_bse_ring_matvec_full(
         DY = apply_D_term(Y, eps_c, eps_v)
         VX = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
         VY = apply_V_ring_only(Y, psi_c_Y, psi_v_Y, M, V_q0)
-        T_res = (_T_term_A(X, psi_cW_X, psi_vW_Y)
-                 + _T_term_B(Y, psi_cW_Y, psi_vW_X))
-        T_anti = (_T_term_B(jnp.conj(X), psi_cW_Y, psi_vW_X)
-                  + _T_term_A(jnp.conj(Y), psi_cW_X, psi_vW_Y))
-        W_res = apply_W_from_T(T_res, psi_cW_X, psi_vW_Y, W_R)
-        W_anti = jnp.conj(apply_W_from_T(T_anti, psi_cW_X, psi_vW_Y, W_R))
+
+        def rung_trial(carry, rows):
+            # Keep the trial axis of each encode at one. X/Y remain band-
+            # sharded: the existing ring encoders move their distributed
+            # slices, never a replicated full c*v*k vector or a b*T stack.
+            x, y = rows[0][None], rows[1][None]
+            if fuse_ladder_rung:
+                t_res = (_T_term_A(x, psi_cW_X, psi_vW_Y)
+                         + _T_term_B(y, psi_cW_Y, psi_vW_X))
+                t_anti = (_T_term_B(jnp.conj(x), psi_cW_Y, psi_vW_X)
+                          + _T_term_A(jnp.conj(y), psi_cW_X, psi_vW_Y))
+                w_res = apply_W_from_T(t_res, psi_cW_X, psi_vW_Y, W_R)
+                w_anti = jnp.conj(apply_W_from_T(t_anti, psi_cW_X, psi_vW_Y, W_R))
+            else:
+                w_res = (_w_term_A(x, psi_cW_X, psi_vW_Y, W_R)
+                         + _w_term_B(y, psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y, W_R))
+                w_anti = jnp.conj(
+                    _w_term_B(jnp.conj(x), psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y, W_R)
+                    + _w_term_A(jnp.conj(y), psi_cW_X, psi_vW_Y, W_R))
+            return carry, (w_res[0], w_anti[0])
+
+        # Only the X-class outputs stack. The two surviving T/convolution
+        # chains reuse one trial's scratch for every probe in the block.
+        _, (W_res, W_anti) = lax.scan(rung_trial, None, (X, Y), unroll=1)
         X_out = DX + VX + VY - W_res
         Y_out = -VX - DY - VY + W_anti
         return jnp.stack([X_out, Y_out], axis=0)
 
     def _impl_core(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
                    W_R, V_q0, M, psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y):
-        if fuse_ladder_rung and include_W:
+        if include_W:
             return _impl_core_fused(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                                     eps_c, eps_v, W_R, V_q0, M,
                                     psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)

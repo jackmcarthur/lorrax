@@ -483,6 +483,22 @@ solves the resolvent one z at a time with ψ held 2-D at 1/P, by GMRES with a
 recycled spectral deflation per (q, z) (`bse_feast.harvest_spectral_deflation`).
 Keys, supported modes and refusals: [input reference](../input_reference.md).
 
+The direct rung scans individual trials within each probe block. Its encoded
+`T(mu,nu,s,s,k)` and FFT/decode scratch are reused, so this largest temporary
+does not acquire the probe-block width. The trial vectors retain their
+distributed conduction/valence layout; the ring encoders move band slices
+without gathering the complete transition window on every rank. Exchange
+and diagonal terms remain batched; their smaller trial/centroid buffers and
+the returned trial block still grow with the probe count.
+
+The rung uses the same k-convolution router and band-projection owner as the
+optical/exciton kernels. Its density-response lower row preserves the
+unconjugated Hartree dyad and conjugated direct rung. This differs from the
+optical non-TDA row. Reusing the complete optical applier would also inherit
+its full-window trial gather; a common blocked encoder must bound that
+gather and preserve the distributed decode before it can serve large-band
+screening calculations.
+
 ## Refusals
 
 | refusal | where | condition |
