@@ -918,6 +918,11 @@ def gflat_to_rmu(
     cs       = max(1, min(int(chunk_size if chunk_size else N), N))
     n_chunks = (N + cs - 1) // cs
     pad_N    = n_chunks * cs - N
+    # A flat scan chunk visits a bounded run of k rows. Its start residues
+    # modulo nb_local are multiples of gcd(cs, nb_local), so this is the
+    # largest number of distinct logical k rows any chunk can touch.
+    from math import gcd
+    k_span = min(nk, -(-(cs + nb_local - gcd(cs, nb_local)) // nb_local))
 
     if kvecs_frac is None:
         kvecs_shape = None
@@ -989,60 +994,59 @@ def gflat_to_rmu(
         out_spec = band_sphere_spec()
 
         def _body(psi_, g_index_, r_mu_, kvecs_, k_row_map_):
-            # Per-rank: (nk, nb_local, ns, ngkmax).  The box order of every
-            # k row is computed once here, outside the row scan.
-            inv_ = _sphere_inverse(g_index_, nx * ny * nz)
+            # Per-rank: (nk, nb_local, ns, ngkmax). Build inverse/phase rows
+            # only for the k span touched by the current FFT scan chunk.
+            # Their resident extent then stays bounded by the FFT tile,
+            # rather than nk*N_grid and nk*N_mu on every process.
             psi_flat = psi_.reshape(N, ns, ngkmax)
             if pad_N:
                 psi_flat = jnp.pad(
                     psi_flat, ((0, pad_N), (0, 0), (0, 0)))
             out_flat = jnp.zeros(
                 (N + pad_N, ns, n_rmu), dtype=psi_.dtype)
-            if kvecs_ is not None:
-                # Preserve the established separable phase arithmetic exactly;
-                # only its k-vector operand moved from a closure constant to a
-                # runtime value so fixed-shape k tiles share one executable.
-                _ph = lambda k_axis, n: jnp.exp(
-                    +2j * jnp.pi * k_axis[:, None]
-                    * (jnp.arange(n) / n)[None, :])
-                phx = _ph(kvecs_[:, 0], nx)
-                phy = _ph(kvecs_[:, 1], ny)
-                phz = _ph(kvecs_[:, 2], nz)
-                phx_rmu_all = phx[:, r_mu_[:, 0]]
-                phy_rmu_all = phy[:, r_mu_[:, 1]]
-                phz_rmu_all = phz[:, r_mu_[:, 2]]
-            else:
-                phx_rmu_all = phy_rmu_all = phz_rmu_all = None
-
             def body(out, i):
                 i0    = i * cs
                 sub   = jax.lax.dynamic_slice_in_dim(
                     psi_flat, i0, cs, axis=0)            # (cs, ns, ngkmax)
                 k_row = jnp.clip(
                     (i0 + jnp.arange(cs)) // nb_local, 0, nk - 1)  # (cs,)
-                mapped_k_row = (k_row if k_row_map_ is None
-                                else k_row_map_[k_row])
+                k_first = i0 // nb_local
+                span_rows = jnp.minimum(
+                    k_first + jnp.arange(k_span), nk - 1)
+                mapped_span = (span_rows if k_row_map_ is None
+                               else k_row_map_[span_rows])
+                inverse = _sphere_inverse(g_index_[mapped_span], n_rtot)
+                within_span = k_row - k_first
                 # Singleton-nb reshape so _box_kernel's (n_k, nb, ns,
                 # ngkmax) contract takes (cs, 1, ns, ngkmax) per row.
                 # Per-row sphere-index gather: (cs, ngkmax).
                 sub4 = sub.reshape(cs, 1, ns, ngkmax)
-                g_per_row = inv_[mapped_k_row]         # (cs, n_rtot)
+                g_per_row = inverse[within_span]      # (cs, n_rtot)
                 box = _gather_box(
                     sub4, g_per_row, fft_grid=fft_grid_t)  # (cs, 1, ns, nx, ny, nz)
                 box = box.reshape(cs, ns, nx, ny, nz)
                 rb = local_ifftn3(box, axes=(-3, -2, -1), norm=norm)
                 # Centroid gather — (cs, ns, n_rmu).
                 samples = rb[:, :, r_mu_[:, 0], r_mu_[:, 1], r_mu_[:, 2]]
-                if phx_rmu_all is not None:
+                if kvecs_ is not None:
                     # Per-row Bloch phase at the gathered centroid
                     # cells — apply_bloch_phase is multiplicative on the
                     # spatial axes, so applying it post-gather is
                     # algebraically identical to applying it on the
                     # full FFT box before gather (cf. gflat_to_rchunk's
                     # phase-on-slice pattern).
-                    phx_q = phx_rmu_all[mapped_k_row]
-                    phy_q = phy_rmu_all[mapped_k_row]
-                    phz_q = phz_rmu_all[mapped_k_row]
+                    # Keep the original separable exponent and multiply
+                    # order, including loader-paired k representatives.
+                    kv = kvecs_[mapped_span]
+                    _ph = lambda k_axis, n: jnp.exp(
+                        +2j * jnp.pi * k_axis[:, None]
+                        * (jnp.arange(n) / n)[None, :])
+                    phx = _ph(kv[:, 0], nx)[:, r_mu_[:, 0]]
+                    phy = _ph(kv[:, 1], ny)[:, r_mu_[:, 1]]
+                    phz = _ph(kv[:, 2], nz)[:, r_mu_[:, 2]]
+                    phx_q = phx[within_span]
+                    phy_q = phy[within_span]
+                    phz_q = phz[within_span]
                     samples = samples * (phx_q * phy_q * phz_q)[:, None, :]
                 return jax.lax.dynamic_update_slice_in_dim(
                     out, samples, i0, axis=0), None

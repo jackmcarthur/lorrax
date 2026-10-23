@@ -519,6 +519,17 @@ Replicated per-process metadata includes the TRS-augmented centroid permutation
 and lattice-wrap tables, `O(n_sym·μ)`, and q-folding tables, `O(N_k)`; it does
 not shrink with the mesh.
 
+Centroid sampling (`common.wfn_transforms.gflat_to_rmu`) constructs dense
+sphere-to-box inverse rows and separable Bloch-phase tables inside the local
+FFT scan. For `c` scan rows and `b` local bands, a chunk touches at most
+`w = min(N_k, ceil((c + b - gcd(c,b))/b))` distinct k rows. The per-k tables
+therefore occupy at most `4·w·N_r` inverse bytes and, with Bloch phases,
+`3·16·w·μ` phase bytes, rather than retaining these tables for every k row.
+The gathered per-FFT-row intermediates remain part of the compiled scan
+tile. G-flat coefficients stay band-sharded, while the canonical sparse
+sphere-index table remains replicated metadata. One local FFT still needs
+its complete spatial grid; increasing P does not reduce that one-row floor.
+
 The htransform WS constructor computes only addressable node×node and
 target×node code tiles. It retains no all-site pair matrix or target×target
 table. For local int16 code bytes `C`, host construction holds `O(C)` data
