@@ -91,6 +91,20 @@ def test_decision_matrix(site, leg, step, transport, policy, applied, mpi):
 
 # --- refusals, caller exports, site selection --------------------------------
 
+@pytest.mark.parametrize("transport", TRANSPORT)
+def test_step_network_required_with_any_transport(transport):
+    env = env_of("perlmutter", "cuda", "2node", transport)
+    del env["SLURM_NETWORK"]
+    with pytest.raises(RuntimeError, match="MPI/OFI endpoint initialization"):
+        plan(env)
+    # The requirement is a token, not a substring, and may be combined with
+    # other Slurm network options. Explicit transports obey the same rule.
+    env["SLURM_NETWORK"] = "no_vni_extra"
+    with pytest.raises(RuntimeError, match="before srun"):
+        plan(env)
+    env["SLURM_NETWORK"] = "no_vni,job_vni"
+    assert plan(env)["multi_node"] is True
+
 # --- start-up application ----------------------------------------------------
 
 @pytest.fixture
