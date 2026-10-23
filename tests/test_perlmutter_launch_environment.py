@@ -63,7 +63,10 @@ def test_gpu_setup_before_srun(tmp_path, label, step_env, active, network):
 
 @pytest.mark.parametrize('label,step_env,active', STEPS, ids=[x[0] for x in STEPS])
 @pytest.mark.parametrize('network', [None, '', 'job_vni', 'no_vni,tcs=LOW_LATENCY'])
-def test_module_setup_before_srun(label, step_env, active, network):
+@pytest.mark.parametrize('module_path', [
+    'config/modulefiles/lorrax/0.1.0.lua',
+    'config/perlmutter/module/module.lua.in'])
+def test_module_setup_before_srun(label, step_env, active, network, module_path):
     lua = shutil.which('lua')
     if not lua:
         pytest.skip('Lua interpreter is unavailable')
@@ -74,6 +77,8 @@ local assigned = {}
 help = function() end
 whatis = function() end
 family = function() end
+depends_on = function() end
+prepend_path = function() end
 pathJoin = function(...) return table.concat({...}, "/") end
 myFileName = function() return arg[1] end
 setenv = function(name, value) assigned[name] = value end
@@ -83,7 +88,7 @@ local value = assigned["SLURM_NETWORK"]
 if value == nil then value = os.getenv("SLURM_NETWORK") end
 io.write(value == nil and "" or "x", "\n", value or "", "\n")
 '''
-    result = subprocess.run([lua, '-', str(ROOT/'config/modulefiles/lorrax/0.1.0.lua')],
+    result = subprocess.run([lua, '-', str(ROOT/module_path)],
         input=program, env=launch_env(step_env, network),
         text=True, capture_output=True, check=True)
     expected = network if network is not None or active else 'no_vni'
