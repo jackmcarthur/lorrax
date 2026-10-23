@@ -167,7 +167,8 @@ class LoopProgress:
 
         A fused batch advances once with its full count; replaying individual
         increments would report intermediate counts that never returned to
-        the host and give their ETA the whole batch's elapsed time.
+        the host and give their ETA the whole batch's elapsed time. An empty
+        batch is a no-op, without starting the clock or waiting.
 
         ``wait`` is an optional JAX value; under ``LORRAX_STAGE_SYNC=1``
         (``common.timing.stage_sync``) it is blocked on at a milestone step
@@ -177,15 +178,18 @@ class LoopProgress:
         JAX value can still be globally sharded, so every process performs
         the wait (INVARIANTS row 21).  Non-milestone steps never block.
         """
-        if count < 1:
-            raise ValueError("progress count must be positive")
+        if count < 0:
+            raise ValueError("progress count must be nonnegative")
+        if count == 0:
+            return
         if self._start is None:
             self.start()
         previous = self._current
         self._current += count
         milestone = (
             self._current <= self.num_steps
-            and np.any(self._mask[previous + 1:self._current + 1]))
+            and (self._mask[self._current] if count == 1 else
+                 np.any(self._mask[previous + 1:self._current + 1])))
         # ``enabled`` defaults to process_index() == 0.  A wait on a JAX
         # value must nevertheless be reached by every process: a caller can
         # pass a globally sharded value even though today's Sigma caller uses
