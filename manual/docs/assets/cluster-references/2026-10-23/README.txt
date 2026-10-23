@@ -11,6 +11,8 @@ bundled. Regenerating DFT inputs is a new numerical run and need not produce the
 same byte hashes. Obtain matching NC pseudopotentials and check the UPF hashes.
 
 Build a coherent checkout/environment/native pair using /using/installation/;
+for the exact historical source, use its installation instructions at commit
+2d2ca2f104 (the current build scripts may differ).
 do not mix a module's native legs with another source tree. The recorded library
 hashes identify the historical measurements, not a portable prebuilt install.
 

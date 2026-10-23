@@ -188,6 +188,15 @@
     "qe_scf.in": "cc500ac7e08495ece47a0344e461e1b5182c548aae516cf744c584442e791a8d",
     "gw.in": "0c1f8912878e77074f70f6bb0f0332b3719bf240ab556df11aaa1b257a091d9a",
     "centroids_frac_528.txt": "7e5f6bfc414b752c85be83c2bb466e86c7daaae452be83e1c8270fbce245f957",
-    "qe_nscf.in": "de690d5f59674ad1dcdd1fee1e32d6a1b87cc07e39d25404726dafc5a33b8288"
+    "qe_nscf.in": "de690d5f59674ad1dcdd1fee1e32d6a1b87cc07e39d25404726dafc5a33b8288",
+    "qe_pw2bgw.in": "42f764125eed719c58fb24e0f24fd389e8f7d74e5578a057a89da962222a6fc0"
+  },
+  "dft_context": {
+    "qe_pw2bgw.in": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/00_si_444_sym_soc_128b/qe/nscf/pw2bgw.in",
+      "bytes": 432,
+      "sha256": "42f764125eed719c58fb24e0f24fd389e8f7d74e5578a057a89da962222a6fc0",
+      "provenance": "Exact converter deck from the raw-DFT parent named in Si200/manifest.yaml. Original parent WFN.h5 and imported Si200 WFN.h5 both have the WFN SHA recorded above. Copied without modification; no generated replacement input."
+    }
   }
 }
