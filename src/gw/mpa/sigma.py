@@ -1517,11 +1517,11 @@ def _integrate_sigma_batches(
             psi_proj_xr, sigma_axis, axis=1)
         psi_proj_yn = pad_to_axis(
             psi_proj_yn, sigma_axis, axis=3)
-        if synthesis or (tau_kernel_factory is None and q_wedge is not None):
-            # The q-wedge Σ kernel and the photon sectors' τ body run row passes
-            # from band-complete ψ (gw.ppm_tau_kernel._sigma_subtile_kernel,
-            # gw.mpa.sector_sigma.sector_tau_factory): placed here, once per Σ
-            # call, so no τ node exchanges ψ.
+        scalar_subtile = (tau_kernel_factory is None and (synthesis or q_wedge is not None))
+        subtile_faces = ((psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn)
+                         if scalar_subtile else None)
+        if synthesis and tau_kernel_factory is not None:
+            # Photon sectors retain their own existing axis-layout contract.
             from gw.ppm_tau_kernel import sigma_subtile_operands
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn = sigma_subtile_operands(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, mesh_xy=mesh_xy)
@@ -1575,40 +1575,39 @@ def _integrate_sigma_batches(
 
         kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
-        if tau_kernel_factory is not None:
-            tau_kernel = tau_kernel_factory(w_synthesis, sigma_axis)
-        elif synthesis:
-            # The scalar tangential route: the shared sigma_kij reads the
-            # parent pair its synthesis builds inside the same τ body, and
-            # unfolds it on the transform's load (mathdx mode 9, the q wedge).
+        def scalar_tau(sum_layout, prepared):
+            if not synthesis:
+                return get_shared_sigma_tau_kernel(
+                    mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
+                    q_wedge=q_wedge, sum_layout=sum_layout, **face_kwargs)
             from gw.ppm_tau_kernel import sigma_kconv_tables, sigma_pass_price
             sigma_kij = _get_sigma_kij_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, brackets=brackets,
-                q_wedge=w_synthesis.q_wedge, **face_kwargs)
+                q_wedge=w_synthesis.q_wedge, sum_layout=sum_layout, **face_kwargs)
 
             def scalar_spatial(xn, yr, xr, yn, energies, weight, e_ref, t, interactions,
                                g_load, sigma_kij=sigma_kij):
                 return sigma_kij(xn, yr, xr, yn, energies, weight, e_ref, t, *interactions,
                                  g_load)
             scalar_spatial.price = sigma_pass_price(sigma_kij)
-            spatial_key = ("scalar-parent", mesh_xy, kgrid, brackets,
+            spatial_key = ("scalar-parent", mesh_xy, kgrid, brackets, sum_layout,
                            w_synthesis.q_wedge.wedge_key(),
                            tuple(sorted(face_kwargs.items(), key=lambda kv: kv[0])))
-            # The Green kconv call's tables, placed once per run and plan: a window argument.
-            # Two nodes per loop trip (gw.ppm_accumulators.WINDOW_OVERLAP) on a leg
-            # whose WINDOW_PAIRING row says so: one node's W exchange runs beside the
-            # other's k-convolutions, when the paired window fits (SynthesisTau.fits,
-            # at the first compile).
             from gw.ppm_accumulators import window_pairing
-            tau_kernel = SynthesisTau(
-                scalar_spatial, w_synthesis, psi_coh_yr, psi_proj_yn, w_synthesis.native,
+            return SynthesisTau(
+                scalar_spatial, w_synthesis, prepared[1], prepared[3], w_synthesis.native,
                 "sigma.synthesis.window", meta, spatial_key, (k_unfold_plan,),
                 kconv_tables=sigma_kconv_tables(mesh_xy, k_unfold_plan),
                 overlap=window_pairing(mesh_xy))
+
+        if tau_kernel_factory is not None:
+            tau_kernel = tau_kernel_factory(w_synthesis, sigma_axis)
+        elif scalar_subtile:
+            # The first window prices its complete executable at abstract
+            # placement outputs before any full summed-band axis bank exists.
+            tau_kernel = None
         else:
-            tau_kernel = get_shared_sigma_tau_kernel(
-                mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
-                q_wedge=q_wedge, **face_kwargs)
+            tau_kernel = scalar_tau("axis", subtile_faces)
         # The residues' carrier on the wedge: the pair-transpose tables with
         # their device load, placed once per run (see ppm_tau_kernel).
         q_pair = (None if q_wedge is None else dataclasses.replace(
@@ -1721,29 +1720,63 @@ def _integrate_sigma_batches(
                 E_A_call = k_unfold_plan.parent_rows(row.E_A)
                 selector = k_unfold_plan.parent_rows(
                     jnp.reshape(selector, np.shape(row.E_A)))
-                # These arrays do not change between time nodes in this planned
-                # window, so they are built once per window rather than per node.
-                if synthesis:
-                    # The synthesis reads the right endpoint's faces and its
-                    # window operands (the table row's intervals).
-                    row_kernel = tau_kernel.window_kernel(row.space)
-                    tau_arguments = tau_kernel.window_arguments(
-                        psi_coh_xn, psi_proj_xr, E_A_call, selector,
-                        e_ref_a, e_ref_b, row.space, operands.get("intervals"))
-                else:
+                target = accumulator if accumulators is None else accumulators[row.space]
+                if not synthesis:
                     pole_indices, bounds, phase_real = (
                         device_put_process_local(x, small)
                         for x in (pole_indices, bounds, phase_real))
-                    row_kernel = tau_kernel
                     B_branch = _residue_for_space(row.space, B, B_odd)
                     if q_wedge is not None:
-                        B_branch = dataclasses.replace(
-                            q_pair, values=B_branch)
-                    tau_arguments = (
-                        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                        E_A_call, selector, B_branch, Omega,
-                        pole_indices, bounds, phase_real,
-                        e_ref_a, e_ref_b, g_load)
+                        B_branch = dataclasses.replace(q_pair, values=B_branch)
+
+                def arguments(kernel, prepared, space=row.space):
+                    xn, yr, xr, yn = prepared
+                    if synthesis:
+                        return kernel.window_arguments(
+                            xn, xr, E_A_call, selector, e_ref_a, e_ref_b, space,
+                            operands.get("intervals"))
+                    return (xn, yr, xr, yn, E_A_call, selector, B_branch, Omega,
+                            pole_indices, bounds, phase_real, e_ref_a, e_ref_b, g_load)
+
+                if scalar_subtile and tau_kernel is None:
+                    from gw.ppm_tau_kernel import prepare_sigma_subtile, sigma_pass_price
+
+                    def build(sum_layout, prepared):
+                        kernel = scalar_tau(sum_layout, prepared)
+                        if synthesis:
+                            spaces = [row.space] + sorted({r.space for r in plan} - {row.space})
+
+                            def compile_all():
+                                return [target.run_window(
+                                    kernel.window_kernel(space), arguments(kernel, prepared, space),
+                                    t_pad, coeff, n_active, active_count,
+                                    antihermitian=(win.project_code == 1), overlap=kernel.overlap,
+                                    compile_only=True) for space in spaces]
+                            compiled = compile_all()
+                            if kernel.overlap and not all(kernel.fits(c) for c in compiled):
+                                kernel.overlap = False
+                                compiled = compile_all()
+                            native = kernel._native
+                        else:
+                            compiled = [target.integrate_window(
+                                kernel, arguments(kernel, prepared), win.nodes.t, win.nodes.alpha,
+                                active_count=active_count, capacity=tau_capacity,
+                                omega_sign=win.omega_sign, prefactor=win.prefactor,
+                                e_ref_sum=win.E_ref_A + win.E_ref_B,
+                                antihermitian=(win.project_code == 1),
+                                omega_indices=row.omega_idx, omega_values=row.omega_abs,
+                                compile_only=True)]
+                            native = int((sigma_pass_price(kernel) or {}).get("scratch", 0))
+                        return kernel, compiled, native
+
+                    _, prepared, tau_kernel = prepare_sigma_subtile(subtile_faces, mesh_xy, build)
+                    psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn = prepared
+                    if synthesis:
+                        tau_kernel._right = (psi_coh_yr, psi_proj_yn)
+                    subtile_faces = None
+                prepared = (psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn)
+                row_kernel = tau_kernel.window_kernel(row.space) if synthesis else tau_kernel
+                tau_arguments = arguments(tau_kernel, prepared)
             window_options = dict(
                 active_count=active_count, capacity=tau_capacity,
                 omega_sign=win.omega_sign, prefactor=win.prefactor,

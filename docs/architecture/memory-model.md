@@ -472,8 +472,19 @@ rank's tile in row passes of whole centroid orbits (`gw.subtile_stream`):
 `Σ(τ) row` is one local μ row's live set (`ν = μ/P_y`: the parent Green and
 its partner, mode 7's output, `W_prep`, the pass's rows of `W` and its
 partner on the q parents, the pass's ψ rows), and a pass holds the most rows
-whose bytes fit the fixed tile. ψ is band-complete once per Σ call,
-`16·n_par·n_s·(N_b + N_bΣ)·(μ/P_x + μ/P_y)`. No full-tile Green or `W_prep`
+whose bytes fit the fixed tile. The scalar q-wedge Σ prices its operand
+placement and complete first window before allocating band-complete ψ. If
+that live set fits, the incumbent axis route keeps its local Green GEMMs.
+Otherwise the summed-band ψ stays on its canonical 2D faces and each row pass
+uses the shared bounded SUMMA Green product; its conjugated, merged right
+operand is formed once on the same 2D face. These sum operands scale as
+`32·n_par·n_s·N_b·μ/P`, beside the original faces. The small QP projector
+still uses its axis carriers, `16·n_par·n_s·N_bΣ·(μ/P_x + μ/P_y)`.
+Admission uses the largest compiled new-byte figure over ranks, plus retained
+placement outputs and native convolution scratch, against current room before
+placement runs. Static SX/COH uses the same choice and scalar node. Photon
+sectors and response-bank placement retain their existing contracts.
+No full-tile Green or `W_prep`
 exists. `sigma_spin_block` (the output spin block `d`, a divisor of `n_s`,
 whose stored x block fits the fixed tile) still sizes the full-zone Σ kernels
 and the static (COHSEX) and PPM spatial kernels.

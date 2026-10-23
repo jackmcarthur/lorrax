@@ -435,29 +435,43 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         from ffi import _services
         _services.ensure_on_path()
         from symmetry_maps import unfold_file_wedge_band_operator
-        from .ppm_tau_kernel import (_get_sigma_kij_kernel, sigma_kconv_tables,
-                                     sigma_subtile_operands)
+        from .ppm_tau_kernel import _get_sigma_kij_kernel, sigma_kconv_tables
         _sym = k_unfold_plan.sym
         _face_shape = tuple(int(v) for v in face_shape)
 
+        static_nodes = {}
+
         def _parent_sigma(wfns, weights, interaction, prefactor, g_load):
-            """Σ on the parent rows (one static node), unfolded to the wedge's band operator."""
+            """One admitted static node, sharing the dynamic sum-band layout chooser."""
             from .wavefunction_bundle import parent_sigma_operands
+            from .ppm_tau_kernel import prepare_sigma_subtile, sigma_pass_price
             g_mun, g_nmu, proj_nmu, proj_mun, _, _ = parent_sigma_operands(wfns)
-            # The kernel's operands, placed as the Σ τ sweep places them.
-            g_mun, g_nmu, proj_nmu, proj_mun = sigma_subtile_operands(
-                g_mun, g_nmu, *_windowed(proj_nmu, proj_mun), mesh_xy=mesh_xy)
-            kernel = _get_sigma_kij_kernel(
-                mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, layout=layout,
-                face_shape=_face_shape, face_band_extent=band_extent,
-                k_unfold_plan=k_unfold_plan, q_wedge=interaction, static=True)
-            zero = jnp.zeros((), jnp.float64)
-            parent_rows = prefactor * kernel(
-                g_mun, g_nmu, proj_nmu, proj_mun, jnp.zeros(weights.shape, jnp.float64),
-                weights, zero, zero, interaction.values, None, interaction.load, g_load)
-            # Static Σ is Hermitian, so conj and transpose coincide; the dynamic
-            # route's operator rule (unfold_file_wedge_band_operator) is one spelling.
-            return unfold_file_wedge_band_operator(_sym, parent_rows, trs_rule="transpose")
+            faces = (g_mun, g_nmu, *_windowed(proj_nmu, proj_mun))
+
+            def build(sum_layout, prepared):
+                key = (sum_layout, interaction.wedge_key())
+                if key not in static_nodes:
+                    kernel = _get_sigma_kij_kernel(
+                        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, layout=layout,
+                        face_shape=_face_shape, face_band_extent=band_extent,
+                        k_unfold_plan=k_unfold_plan, q_wedge=interaction, static=True,
+                        sum_layout=sum_layout)
+
+                    @jax.jit
+                    def node(operands, weights, interaction, g_load):
+                        zero = jnp.zeros((), jnp.float64)
+                        parent_rows = kernel(
+                            *operands, jnp.zeros(weights.shape, jnp.float64), weights,
+                            zero, zero, interaction.values, None, interaction.load, g_load)
+                        return unfold_file_wedge_band_operator(
+                            _sym, parent_rows, trs_rule="transpose")
+                    static_nodes[key] = (node, int(sigma_pass_price(kernel)["scratch"]))
+                node, native = static_nodes[key]
+                compiled = node.lower(prepared, weights, interaction, g_load).compile()
+                return compiled, [compiled], native
+
+            _, prepared, compiled = prepare_sigma_subtile(faces, mesh_xy, build)
+            return prefactor * compiled(prepared, weights, interaction, g_load)
 
         def _with_tables(op):
             """The interaction with its conj-rule load tables on the devices, and the
@@ -468,27 +482,25 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
             return op.with_load(mesh_xy), sigma_kconv_tables(mesh_xy, k_unfold_plan)
 
         @jax.jit
-        def sigma_sx(wfns, Gij, W_q, g_load):
-            """The occupied Green function against the static interaction, projected."""
-            weights = k_unfold_plan.parent_rows(
+        def occupied_weights(wfns, Gij):
+            return k_unfold_plan.parent_rows(
                 _occ_diag_full(Gij, wfns.slices.nb_sigma, nb_full))
-            return _parent_sigma(wfns, weights, W_q, 1.0, g_load)
 
         @partial(jax.jit, static_argnames=("ri_bands",))
-        def sigma_coh(wfns, W_q, V_q, g_load, *, ri_bands=None):
+        def coh_weights(wfns, *, ri_bands=None):
             s = wfns.slices
             bands = (s.sigma_sum if ri_bands is None
                      else slice(int(ri_bands[0]), int(ri_bands[1])))
-            mask = wfns.green_parent.band_mask(bands)
-            return _parent_sigma(wfns, mask, _hole_interaction(W_q, V_q), -0.5, g_load)
+            return wfns.green_parent.band_mask(bands)
 
-        # W - V unfolds by W's tables, so W's load serves COH.
         def warmed_sx(wfns, Gij, W_q):
-            return sigma_sx(wfns, Gij, *_with_tables(interaction_operator(W_q)))
+            W, g_load = _with_tables(interaction_operator(W_q))
+            return _parent_sigma(wfns, occupied_weights(wfns, Gij), W, 1.0, g_load)
 
         def warmed_coh(wfns, W_q, V_q, *, ri_bands=None):
             W, g_load = _with_tables(interaction_operator(W_q))
-            return sigma_coh(wfns, W, V_q, g_load, ri_bands=ri_bands)
+            return _parent_sigma(wfns, coh_weights(wfns, ri_bands=ri_bands),
+                                 _hole_interaction(W, V_q), -0.5, g_load)
 
         return warmed_sx, warmed_coh
 
