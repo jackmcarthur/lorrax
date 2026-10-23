@@ -13,8 +13,9 @@ link-script, numbered-directory and run-script organization.
 The original inputs, pseudopotentials, notebooks and LICENSE are downloaded
 from the workshop archive. The scalar-relativistic track is not needed here.
 The small grids and band counts make this a teaching example, not a converged
-calculation. The saved native fine-grid BSE onset differs substantially from
-BerkeleyGW; compare the results rather than assuming numerical equivalence.
+calculation. The saved spectra compare different interpolation methods from
+a 3 × 3 × 1 coarse grid to a shifted 8 × 8 × 1 fine grid. There is no explicit
+fine-grid GW+BSE reference here to establish which interpolation is more accurate.
 
 Goals
 -----
@@ -121,9 +122,11 @@ Gaussian broadening. All 3,072 retained Tamm–Dancoff roots are requested.
 Comparison
 ----------
 
-The saved native fine-grid BSE onset is 2.511 eV, compared with 1.592 eV in
-BerkeleyGW. This disagreement remains unresolved; small solver residuals do
-not establish agreement or physical convergence. The codes use different
-screening representations, QP Hamiltonians and interpolation procedures.
+The saved fine-grid BSE onset is 2.511 eV in LORRAX, compared with 1.592 eV in
+BerkeleyGW. Both interpolate from the sparse 3 × 3 × 1 coarse grid to the
+shifted 8 × 8 × 1 grid, using different QP and kernel interpolation procedures.
+No explicit fine-grid GW+BSE reference was computed, so this difference does
+not establish which method is more accurate. Small solver residuals certify
+the retained eigensolve, not the accuracy of its coarse-to-fine construction.
 The [results page](https://github.com/jackmcarthur/lorrax/blob/main/examples/MoS2_SOC_2026/results/README.md) gives the measured GW and optical
 differences, reader controls and numerical provenance separately.

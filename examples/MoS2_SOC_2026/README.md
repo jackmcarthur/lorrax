@@ -10,8 +10,10 @@ relativistic mean field from the 2026 BerkeleyGW workshop and compare the two
 codes in parallel GW and BSE folders.
 
 The workshop uses small cutoffs, k-point grids and band counts for teaching.
-These are not converged predictions. The saved native fine-grid BSE onset is
-2.511 eV versus 1.592 eV in BerkeleyGW; this disagreement remains unresolved.
+These are not converged predictions. Both methods interpolate from 3 × 3 × 1
+to a shifted 8 × 8 × 1 grid; their saved BSE onsets are 2.511 eV (LORRAX) and
+1.592 eV (BerkeleyGW). No explicit fine-grid GW+BSE reference was computed,
+so this comparison does not establish which interpolation is more accurate.
 
 Goals
 -----

@@ -14,9 +14,17 @@ by BerkeleyGW itself.
 | Lowest fine-grid BSE state | 2.511020 | 1.591552 |
 | Largest interacting spectral peak | 3.18 | 2.60 |
 
-The native fine-grid spectrum differs substantially. These saved files provide
-an executed workflow and measured comparisons; numerical equivalence between
-the native fine-grid calculations remains unestablished.
+Both fine-grid spectra interpolate from the 3 × 3 × 1 coarse grid to the
+shifted 8 × 8 × 1 grid, using different QP and kernel interpolation methods.
+No explicit GW+BSE calculation on the fine grid was performed for this
+exercise. Their difference therefore does not establish which interpolation
+is more accurate; that requires an independent fine-grid reference with
+matched physical settings.
+
+The separate [9 × 9 → 12 × 12 MoS₂ benchmark](https://jackmcarthur.github.io/lorrax/theory/w-range-splitting/#example)
+uses screening and BSE computed directly on the fine grid, with matched QP
+energies, and finds LORRAX SR/LR closer than BerkeleyGW dual-grid interpolation.
+That accuracy test should not be confused with this workshop comparison.
 
 Actual BerkeleyGW reader controls accepted the native exported screening and
 kernel. With BerkeleyGW QP data held fixed, all 3,072 exciton energies differed
@@ -24,9 +32,11 @@ from the original BerkeleyGW calculation by RMS 7.680 meV and at most 9.552 meV.
 With native QP data, that same consumer gave an onset of 1.670295 eV. A native
 coarse-grid control gave 1.664460 eV versus 1.672848 eV in its corresponding
 BerkeleyGW control; the complete 432-state coarse spectra still differ
-(RMS 78.54 meV). These controls support further investigation of the native
-coarse-to-fine treatment and establish neither full native spectral parity nor
-a particular cause for the discrepancy.
+(RMS 78.54 meV). The fine-grid consumer controls retain BerkeleyGW's own
+interpolation even when they read a native coarse kernel. They establish
+coarse-kernel compatibility under that consumer, not an independent accuracy
+test of either interpolation. The separate coarse-spectrum differences do
+not identify a particular implementation defect.
 
 [Independent validation](validation/OUTPUT_VALIDATION_REPORT.txt) separates
 31 passing structural/coverage/convergence checks from descriptive scientific

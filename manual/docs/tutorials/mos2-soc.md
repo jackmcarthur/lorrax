@@ -12,9 +12,11 @@ and add parallel LORRAX directories beside its BerkeleyGW calculations. The
 link scripts, numbered stages and output filenames follow the original exercise.
 The scalar-relativistic track is retained in the download but is not required here.
 
-Both tracks have been executed. The saved results demonstrate the workflow and
-file compatibility; the native fine-grid BSE spectrum still differs substantially
-from BerkeleyGW ([comparison](#results)). The workshop's small grids, vacuum and
+Both tracks have been executed, interpolating from a 3 × 3 × 1 coarse grid to
+a shifted 8 × 8 × 1 fine grid. The saved spectra compare two different
+coarse-to-fine methods ([comparison](#results)); no explicit fine-grid GW+BSE
+reference was computed for this exercise, so their difference does not establish
+which interpolation is more accurate. The workshop's small grids, vacuum and
 band counts are teaching settings, not converged predictions for MoS₂.
 
 The [example directory](https://github.com/jackmcarthur/lorrax/tree/main/examples/MoS2_SOC_2026)
@@ -219,11 +221,24 @@ not values to enforce by changing inputs.
 | Lowest fine-grid BSE state | 2.511020 | 1.591552 |
 | Largest interacting spectral peak | 3.18 | 2.60 |
 
-The native fine-grid BSE difference remains unresolved. A separate test in
-BerkeleyGW accepted the LORRAX-exported kernel: holding BerkeleyGW QP data fixed,
-its 3,072 exciton energies differed from the original reference by 7.680 meV RMS
-and at most 9.552 meV. This tests the exported kernel and reader; it does not
-validate the native coarse-to-fine BSE result. The
+These fine-grid results use different kernel and QP interpolation methods from
+the same sparse 3 × 3 × 1 coarse grid. Neither is an explicit GW+BSE calculation
+on the 8 × 8 × 1 fine grid, so their difference is not an accuracy verdict on
+either method. Judging interpolation accuracy requires that independent
+fine-grid calculation with matched physical settings.
+
+The separate [9 × 9 → 12 × 12 MoS₂ benchmark](../theory/w-range-splitting.md#example)
+does compare against screening and BSE computed directly on the fine grid,
+with the same QP energies in every arm. LORRAX's SR/LR interpolation was closer
+to that direct result than BerkeleyGW's dual-grid interpolation. The present
+workshop exercise does not repeat that accuracy test.
+
+A separate test in BerkeleyGW accepted the LORRAX-exported coarse kernel:
+holding BerkeleyGW QP data fixed, its 3,072 exciton energies differed from the
+original BerkeleyGW result by 7.680 meV RMS and at most 9.552 meV. That consumer
+still uses BerkeleyGW's interpolation. This tests the exported kernel and
+reader while holding the fine-grid method fixed; it is not an independent
+test of either interpolation's accuracy. The
 [comparison report](https://github.com/jackmcarthur/lorrax/blob/main/examples/MoS2_SOC_2026/results/README.md)
 records the scope of the controls.
 

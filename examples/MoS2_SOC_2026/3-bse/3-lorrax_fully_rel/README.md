@@ -67,8 +67,10 @@ each file's end point automatically.
 Comparison
 ----------
 
-The saved native fine-grid onset is 2.511 eV, versus 1.592 eV in BerkeleyGW.
-This substantial disagreement remains unresolved. Convergence of all retained
+The saved fine-grid onset is 2.511 eV in LORRAX, versus 1.592 eV in BerkeleyGW.
+These are different interpolations from 3 × 3 × 1 to shifted 8 × 8 × 1,
+without an explicit fine-grid GW+BSE reference to rank their accuracy.
+Convergence of all retained
 roots is a solver check, not convergence of the physical spectrum or proof
 of agreement between codes. See the [saved results](https://github.com/jackmcarthur/lorrax/blob/main/examples/MoS2_SOC_2026/results/README.md)
 for the spectra and controlled comparisons. The workshop's small grids and
