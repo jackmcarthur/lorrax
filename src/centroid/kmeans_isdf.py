@@ -739,6 +739,7 @@ def weighted_kmeans_jax(
     R=None,
     Rinv=None,
     tau=None,
+    return_labels: bool = True,
 ):
     """Density-weighted PBC k-means over the real-space FFT grid.
 
@@ -757,8 +758,10 @@ def weighted_kmeans_jax(
     Pass the table from ``orbit_syms.real_space_action_tables(wfn, sym)``.
 
     Returns:
-        labels  : cluster assignment for each grid point.  Its distributed
-            extent is padded to the mesh divisor when necessary; entries
+        labels  : cluster assignment for each grid point, or ``None`` when
+            ``return_labels=False`` skips the final nearest-centroid pass.
+            Its distributed extent is padded to the mesh divisor when
+            necessary; entries
             beyond ``rho.size`` are the sentinel ``-1`` and are not logical
             grid points.
         centroids: (N_c, 3) fractional centroids / canonical reps in [0, 1).
@@ -824,24 +827,26 @@ def weighted_kmeans_jax(
     log.info(f"Lloyd: {steps} steps, max movement = "
              f"{float(jnp.sqrt(max_mv_sq)):.6f}")
 
-    with timing.section("assign_labels"):
-        if orbit_aware:
-            labels, _, _ = assign_labels_orbit_chunked(
-                positions, centroids, metric_tensor, N_c,
-                c_block=_pick_c_block(N_c), offsets=offsets,
-                Rinv=Rinv, tau=tau,
-            )
-        else:
-            labels = assign_labels_chunked(
-                positions, centroids, metric_tensor, N_c,
-                c_block=_pick_c_block(N_c), offsets=offsets,
-            )
-        if n_grid_padded != n_grid_logical:
-            # Preserve the sharding-compatible padded shape, but make the
-            # non-grid tail impossible to mistake for a physical cluster
-            # assignment in any downstream inspection or pruning path.
-            labels = labels.at[n_grid_logical:].set(-1)
-        labels.block_until_ready()
+    labels = None
+    if return_labels:
+        with timing.section("assign_labels"):
+            if orbit_aware:
+                labels, _, _ = assign_labels_orbit_chunked(
+                    positions, centroids, metric_tensor, N_c,
+                    c_block=_pick_c_block(N_c), offsets=offsets,
+                    Rinv=Rinv, tau=tau,
+                )
+            else:
+                labels = assign_labels_chunked(
+                    positions, centroids, metric_tensor, N_c,
+                    c_block=_pick_c_block(N_c), offsets=offsets,
+                )
+            if n_grid_padded != n_grid_logical:
+                # Preserve the sharding-compatible padded shape, but make the
+                # non-grid tail impossible to mistake for a physical cluster
+                # assignment in any downstream inspection or pruning path.
+                labels = labels.at[n_grid_logical:].set(-1)
+            labels.block_until_ready()
 
     max_mv_sq_host = float(max_mv_sq)
     # These placed arrays are the completed Lloyd working set.  They are
