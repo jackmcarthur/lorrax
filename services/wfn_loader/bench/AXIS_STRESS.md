@@ -54,3 +54,22 @@ and G/band pad is checked bitwise. Two complete store constructions report
 first/repeated wall time, process RSS peak and compile-cache counters. Reference
 generation and hashing are outside the timer. This checks store I/O, padding
 and redistribution, without a material-physics or large-FFT throughput claim.
+# Large band-pair matrix sweeps
+
+`matrix_element_panel_check.py` checks the shared matrix-element sweep with
+nonphysical dyadic orbitals and independent analytic band blocks. It records
+compiled memory, synchronized timings, padding checks and optional SlabIO
+output stripes without gathering the full matrix. For example, on a square
+64-rank CPU mesh:
+
+```sh
+python matrix_element_panel_check.py --bands 10003 --loops 2 --write --out evidence
+```
+
+Use the normal MPI launcher. `--compile-only` prices the selected checkout's
+executable without executing it; `--operator kinetic` checks the scalar route,
+and `--operator local` uses a nonconstant real potential with an independent
+NumPy Fourier reference. `--tile-mib 1` is a benchmark-only override that
+exercises row-panel tails at small sizes, for example `--bands 257 --nk 3
+--ns 2` on nine ranks. The production fixed tile is unchanged. The tiny
+G sphere tests memory layout and output correctness, not material throughput.

@@ -798,3 +798,28 @@ numbers per stage, each the max over ranks: `host GB`, the mark at the
 stage's last exit, and `rise`, the sum of what the stage's own intervals
 added to the mark. A stage that stays below an earlier host peak shows
 `rise +0.00`.
+
+## Large-band matrix-element sweeps
+
+The shared kinetic, ionic and dipole sweep distributes the G contraction
+over all ranks and returns an x/y band-block matrix. Its local G-slab GEMM
+streams interleaved rows from each x block through the existing band-block
+reduce-scatter. For k tile `K`, `c` components and local row-panel width
+`t`, the partial and its reorder cost `2 * K * c * p_x * t * nb * 16`
+bytes. Their width is balanced within one fixed tile, with one row as the
+floor. A zero-filled gather builds only the current bra panel, including
+its tail; it never pads a second whole G-slab WFN. A padded output shard
+can coexist with its final crop; executable memory analysis includes it.
+The conservative k planner retains its earlier whole-partial price, so the
+row-panel change does not raise k residency or change k grouping.
+
+At 10,003 logical bands (10,048 carrier), one k and 64 CPU ranks, the
+dipole probe's compiled temporary fell from 9,692,382,280 to 1,049,575,176
+bytes/rank; output remained 75,721,728 bytes/rank. This is a nonphysical
+small-G memory/layout fixture, with independent analytic values and a
+4,802,880,432-byte three-component output file. It establishes bounded
+partials, not a material's FFT throughput or total capacity. The full
+requested `nk * c * nb² / P` output and the loaded WFN sphere remain
+resident. Streaming those k outputs to existing SlabIO hyperslabs is a
+separate future change. See the matrix-element probe in
+`services/wfn_loader/bench/AXIS_STRESS.md`.

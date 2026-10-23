@@ -43,8 +43,8 @@ THE PLAN (rules R1/R3 of ``reports/gwjax_scaling_levers_2026-09-23``)
     O_band ψ      ← FFT operators, per k, on this rank's whole bands
     ψ, O_band ψ   → all-to-all → (nb, ns, G/P)       the G-split layout
     ket           = O_band ψ + O_diag ψ              diagonal terms, on the slab
-    part[m,n]     = Σ_{s, G∈slab} conj ψ_m · ket_n   local GEMM
-    H[m_X, n_Y]   = reduce-scatter(part)             one ``(c, nb, nb)`` per k
+    part[m,n]     = Σ_{s, G∈slab} conj ψ_m · ket_n   row-panel GEMM
+    H[m_X, n_Y]   = reduce-scatter(part)             insert one row panel
     + Σ c*_m E c_n with c = psum_slab(Z_slab† ψ)     separable terms, R·ns·nb
 
 Per rank and per k this moves ``(1 + c_band)·ψ_k/P`` plus ``c·nb²``, where
@@ -70,11 +70,15 @@ T+V_loc+V_NL), 616.3 → 63.5 (dipole).  In the drivers at 360 bands:
 kin_ion "T + ionic matrix" 10.25 → 7.14 s, dipole "q=0 velocity" 13.97 →
 8.12 s; written artifacts equal to 5.1e-13 relative.
 
-WHERE THE CROSSOVER IS.  The one non-``1/P`` transient is the tile's
-``(K, c, nb, nb)`` partial.  The G split beats the band split in both bytes
-and memory while ``nb·√P < ns·N_G``; with N_G/nb ≈ 200–1000 at production
-cutoffs that is P ≲ 1e5, beyond the design envelope, and the ratio does
-not change with system size (both scale with the cell).
+WHERE THE CROSSOVER IS. The G split's communication beats the band split
+while ``nb·√P < ns·N_G``. A whole ``(K,c,nb,nb)`` partial nevertheless has
+a rank-independent memory floor at many bands. The contraction now streams
+interleaved x-block row panels through the existing reduce-scatter. The
+partial and its block-order copy fit one fixed tile (or one panel row),
+while the final output retains its ``1/P`` band-block layout. This changes
+neither the G partition nor the operator application. The k planner keeps
+its old conservative whole-partial price, so this change does not increase
+k residency or alter the outer k grouping.
 
 k TILES.  ``K`` comes from :func:`plan_sweep`: k is packed only until each
 per-peer all-to-all block is bandwidth-sized, and never past what the
@@ -1196,10 +1200,12 @@ def plan_sweep(geom: SweepGeometry, operator) -> SweepPlan:
     memory; in a 16-band window (145 KB blocks) it picks K = 8, 12–18%
     faster than K = 1.
 
-    One k of a step holds, per rank: ψ and its G-split copy, the operator's
+    The conservative planning price for one k holds, per rank: ψ and its G-split copy, the operator's
     ket in band layout and in G-split layout (``c = max(ncomp, 1)``
     components each) and the ``(c, nb, nb)`` slab partial plus its
-    block-ordered copy.  The FFT box of a band operator is NOT in the step:
+    block-ordered copy. The running kernel bounds those partials with row
+    panels; keeping the old price here preserves the existing k tile.
+    The FFT box of a band operator is NOT in the step:
     it runs one k at a time inside the tile and never scales with K.
     """
     from runtime.padding import bounded_partition_tile, padded_axis
@@ -1297,8 +1303,7 @@ def _sweep_body(geom: SweepGeometry, operators: tuple, spans: tuple,
                                           carrier=gc, axes=axes)
 
     def to_blocks(part):
-        """(K, [c,] nb, nb) slab partial → this rank's summed (x, y) block
-        (``K·c·nb²·16`` bytes per rank: 0.26 MB per k at nb=128)."""
+        """A slab partial's interleaved x rows → this rank's output rows."""
         return reduce_scatter_to_band_block(part, px=px, py=py, axes=axes)
 
     def band_ket(operator, t, consts):
@@ -1348,8 +1353,35 @@ def _sweep_body(geom: SweepGeometry, operators: tuple, spans: tuple,
             ket = kg if ket is None else ket + kg
         blk = None
         if ket is not None:
-            blk = to_blocks(jnp.einsum(contraction, jnp.conj(psi_g), ket,
-                                       optimize=True))
+            # A whole Nb-by-Nb G-slab partial does not shrink with P. Bound
+            # it and its block-ordered reduce-scatter copy by one fixed tile.
+            # Each panel contains the SAME local rows of every x block, so
+            # the existing reducer gives rank (x,y) its next contiguous rows.
+            from runtime.tiles import tile_units
+            components = max(int(operator.ncomp), 1)
+            row_bytes = 2 * K * components * px * nb * 16
+            fit = tile_units(row_bytes, nbx)
+            n_panels = -(-nbx // fit)
+            width = -(-nbx // n_panels)
+            extent = n_panels * width
+            rows = psi_g.reshape(K, px, nbx, *psi_g.shape[2:])
+            shape = ((K, extent, nby) if not operator.ncomp else
+                     (K, int(operator.ncomp), extent, nby))
+
+            def panel(j, acc):
+                indices = j * width + jnp.arange(width, dtype=jnp.int32)
+                # Fill only this panel's tail, not a second full G-slab WFN.
+                bra = jnp.take(rows, indices, axis=2, mode='fill',
+                               fill_value=0).reshape(
+                                   K, px * width, *psi_g.shape[2:])
+                part = jnp.einsum(contraction, jnp.conj(bra), ket,
+                                  optimize=True)
+                return jax.lax.dynamic_update_slice_in_dim(
+                    acc, to_blocks(part), j * width, axis=acc.ndim - 2)
+
+            blk = jax.lax.fori_loop(
+                0, n_panels, panel, jnp.zeros(shape, psi_g.dtype))
+            blk = blk[..., :nbx, :]
         if operator.coeffs is not None:
             # Separable terms: psum the slab projections (R·ns·nb, no G
             # axis), then couple this rank's bra rows and ket columns.
@@ -1462,8 +1494,9 @@ def sweep_matrix_elements(
     with ``ncomp > 0``, ``(nk, ncomp, nb, nb)`` sharded
     ``P(None, None, 'x', 'y')``.  Band extents are the mesh-PADDED
     ``geom.nb``; :func:`blocks_to_host` is the boundary that trims back to
-    logical.  The one transient that is not ``1/P`` is a tile's
-    ``(K, ncomp, nb, nb)`` slab partial, priced in :func:`_sweep_body`.
+    logical. The G-slab partial and its reduce-scatter reorder are bounded
+    by a fixed row-panel tile, priced in :func:`_sweep_body`; no rank forms
+    an unbounded ``(K,ncomp,nb,nb)`` partial.
 
     MASKING IS IMPLICIT AND UNCONDITIONAL
     -------------------------------------
