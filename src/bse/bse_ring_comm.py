@@ -29,7 +29,7 @@ jax.config.update("jax_enable_x64", True)
 
 
 def _make_ring_rung(mesh_xy: Mesh, kgrid, w_decode):
-    """The ladder-W rung ``f(T, psi_c_X, psi_v_Y, W_R) -> WX`` of both ring builders.
+    """Shared ladder-W field and bra decode factories.
 
         U  = fftn_k( ifftn_k(T) · W_R )          (both 'ortho')
         WX = (1/√Nk) Σ conj(ψ_c) ψ_v U           (the decode)
@@ -47,14 +47,16 @@ def _make_ring_rung(mesh_xy: Mesh, kgrid, w_decode):
                              P(None, "x", "y", None, None, None), P("x", "y", None),
                              norm="ortho", out_layout=1)
 
-    def _apply_W_from_T(T, psi_c_X, psi_v_Y, W_R):
-        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=T.real.dtype))
-        O_b = conv(T, W_R.reshape(W_R.shape[0], W_R.shape[1], nk))   # (b, k, t, μ, s, ν)
-        psi_v_snv = jnp.transpose(psi_v_Y, (0, 2, 3, 1))
-        out = w_decode(psi_c_X, O_b, psi_v_snv)      # (b, nk, c_X, v_Y)
-        return jnp.transpose(out, (0, 2, 3, 1)) / sqrt_nk   # (b, c_X, v_Y, nk)
+    def field(T, W_R):
+        return conv(T, W_R.reshape(W_R.shape[0], W_R.shape[1], nk))
 
-    return _apply_W_from_T
+    def decode(O_b, psi_c_X, psi_v_Y):
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=O_b.real.dtype))
+        psi_v_snv = jnp.transpose(psi_v_Y, (0, 2, 3, 1))
+        out = w_decode(psi_c_X, O_b, psi_v_snv)
+        return jnp.transpose(out, (0, 2, 3, 1)) / sqrt_nk
+
+    return field, decode
 
 
 def create_mesh_xy(px: int, py: int, devices: Optional[list] = None) -> Mesh:
@@ -622,80 +624,19 @@ def build_bse_ring_matvec_full(
     screening: bool = True,
     ladder_rung_slots: bool = False,
     fuse_ladder_rung: bool = True,
+    physical_branches: bool = False,
 ):
-    """Build the non-TDA SCREENING matvec ``[X;Y] -> H[X;Y]`` (the density response).
+    """Build the non-TDA density-response Hamiltonian, sharded over all P.
 
-    The optical BSE does not run here: its full matvec is
-    ``bse_stack_matvec.build_bse_stack_matvec_full``, two fused pair applications
-    on the TDA matvec's kernels, and ``screening=False`` refuses.  This builder is
-    the screening operator of ``bse.w_ladder`` (``w_bse``, ``w_rpa_resolvent``),
-    ``bse.bse_w_exact`` and ``bse.w_omega_chain``.
-
-    The direct rung scans over individual trial vectors; its encoded
-    ``(mu,nu,s,s,k)`` scratch therefore does not grow with probe-block width.
-    Trial vectors remain distributed over their band axes throughout. Both
-    rows reuse the k-convolution router and ``contract_bands_block_reshard``;
-    neither row gathers the whole transition window on each rank.
-
-    ``fuse_ladder_rung`` (LADDER SCREENING ONLY — ``screening and include_W``;
-    inert everywhere else) sums the two rung ``T`` intermediates of each block
-    row before the FFT chain rather than after, so the matvec runs the
-    ``(nb, mu, nu, s, s, k)`` chain TWICE instead of four times.  Same operator,
-    same conjugation convention, different association order (so agreement with
-    the unfused core is to rounding, not to the bit).  ``False`` selects the
-    unfused core for the A/B and for bisection — see ``_impl_core_fused``.
-
-    The coupling-block kernel AND the anti-resonant row (``_antiresonant_row``)
-    together fix *which* physical operator this is:
-
-    ``screening=True`` is the test-charge DENSITY response (the object whose
-      resolvent gives the screened Coulomb ``W = v + vχv``).  Here the B block
-      uses the SAME RING kernel ``K^A = (1/Nk)⟨M_t|v|M_t'⟩`` as the A block
-      (``apply_V_ring``), and the ring part of the anti-resonant row is
-      UN-conjugated.  Both facts follow from the density-vertex convention that
-      makes this operator a density response at all (derivation:
-      ``w_ladder`` module docstring, "the Hartree rung is a dyad"): the ring
-      part of ``H`` is the outer product of the seed injection ``[v; -v]`` and
-      the density readout ``X + Y``, so it is branch-blind and identical in all
-      four blocks.  See ``bse_w_exact`` for the identity
-      ``W(0) − v = v(0 − H)⁻¹v`` and its per-element convention.
-
-      ``include_W`` selects WHICH screening diagram set the response resums:
-
-      * ``include_W=False`` — RPA: ``A = D + V``, ``B = V`` ⇒ ``A − B = D``,
-        ``χ = χ₀(1 − vχ₀)⁻¹``.  This is the W that GW's Dyson solve produces
-        and the ONLY legal choice while W itself is being built.
-      * ``include_W=True`` — LADDER (``W_BSE``): the statically screened direct
-        rung ``−W`` is added to the irreducible part, ``A = D + V − W_d`` and
-        ``B = V − W_d^B``, so ``χ = P̃(1 − vP̃)⁻¹`` with ``P̃`` the
-        ladder-corrected irreducible polarizability.  The direct terms are the
-        OPTICAL ones verbatim (``_apply_A``'s ``W_term``, ``_apply_B``'s
-        c'↔v'-swapped ``W_term``) — the direct rung contracts band pairs
-        through W and never touches a density vertex, so the screening /
-        optical convention difference cannot reach it — but the anti-resonant
-        row CONJUGATES them while leaving the ring term alone (see
-        ``_antiresonant_row``; measured, not assumed).  Requires a W_R built
-        from an already-converged W(0) (``ensure_W_R(..., include_W=True)``),
-        i.e. the two-stage structure of the feature.  Neither ``A − B = D`` nor
-        the plain symplectic ``[[A,B],[-B,-A]]`` form survives, which is why
-        ``w_omega_chain``'s z² reduction is refused for this operator (see
-        ``w_ladder.refuse_chain_path``).
-
-      ``ladder_rung_slots`` declares the PAYLOAD convention: the finite-q
-      payload (``bse_w_exact.build_finite_q_data``) stores ``conj(psi)`` on
-      both legs — exact for the four density vertices, but the direct rung is
-      bilinear in (c, c') and (v, v') band pairs and must consume the
-      PHYSICAL (rolled, un-flipped) arrays.  With the flag set, the matvec
-      signature grows four trailing psi operands for the rung
-      (``bse_feast.ladder_matvec_operands``; ``build_finite_q_data`` supplies
-      them).  Left unfixed, the rung ran on the conjugated arrays — a defect
-      value-invisible at q=0 and measured as a 3.6e-4 violation of
-      ``W(-q) = conj(W(q))`` at finite q (claim 0215, 2026-08-15).  A
-      conj-wrap compensation inside the rung appliers was tried first and
-      REFUTED by block-level measurement (probe_block_compare, 2026-08-16:
-      ~7e-5 residual against the dense operator; physical operands measure
-      1e-20) — the physical arrays are supplied, not reconstructed.
+    physical_branches=True takes (X_full, payload), where the plain-array
+    payload from ladder_matvec_operands names both physical R/A vertices.
+    All four Hartree and direct blocks use the same encode/decode owners.
+    The include_W=False default retains the original folded RPA control.
+    Optical BSE uses bse_stack_matvec instead.
     """
+    if include_W and not physical_branches:
+        raise ValueError("Ladder screening requires physical_branches=True and "
+                         "the physical R/A payload from build_finite_q_data")
     if ladder_rung_slots and not (screening and include_W):
         raise ValueError(
             "ladder_rung_slots=True is only meaningful for the ladder "
@@ -795,17 +736,7 @@ def build_bse_ring_matvec_full(
     # canonical O layout (b, k, t, M, s, N) straight from its store
     # (:func:`_make_ring_rung`), so no transpose sits between them.
     _w_decode = contract_bands_block_reshard(mesh_xy, extra="leading")
-    _apply_W_from_T = _make_ring_rung(mesh_xy, (nkx, nky, nkz), _w_decode)
-
-    apply_W_from_T = jax.jit(
-        _apply_W_from_T,
-        in_shardings=(sh.T, sh.psi_x, sh.psi_y, sh.W),
-        out_shardings=sh.X,
-        # NB: T (arg 0) is NOT donated — the WX output has a different shape
-        # (nt,c,v,k) so the donation is always declined (no aliasable output) and
-        # emits no fallback copy. Dropping the cosmetic donate_argnums silences the
-        # recurring "donated buffers not usable" warning (audit P5, JOINT_FINDINGS §3).
-    )
+    rung_field, rung_decode = _make_ring_rung(mesh_xy, (nkx, nky, nkz), _w_decode)
 
     def _apply_D_term(X, eps_c, eps_v):
         delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]
@@ -833,271 +764,55 @@ def build_bse_ring_matvec_full(
         return (encode_T_ring_B(X, psi_cW_Y, psi_vW_X) if low_mem
                 else encode_T_gather_B(X, psi_cW_Y, psi_vW_X))
 
-    def _w_term_A(X, psi_cW_X, psi_vW_Y, W_R):
-        """``W_d X`` — the resonant direct (screened-exchange) rung alone.
+    if physical_branches:
+        from common.collectives import transpose_xy
 
-        The psi operands here are the RUNG's own: on a raw payload they are
-        the density-vertex arrays; on a ``build_finite_q_data`` payload they
-        MUST be the rolled UN-flipped arrays (``ladder_rung_slots``).  The
-        conjugated-psi density convention is exact for the four density
-        vertices and WRONG for this bilinear band-pair rung — a conj-wrap
-        compensation (``conj(rung(conj X))``, valid-looking by an elementwise
-        argument) was tried first and REFUTED by block-level measurement
-        (probe_block_compare, 2026-08-16: ~7e-5 against the dense operator,
-        vs 1e-20 with physical operands)."""
-        return apply_W_from_T(_T_term_A(X, psi_cW_X, psi_vW_Y),
-                             psi_cW_X, psi_vW_Y, W_R)
+        def physical(X_full, p):
+            """Physical R=(c[k+q],v[k]), A=(v[k+q],c[k]) density operator.
 
-    def _w_term_B(X, psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y, W_R):
-        """``W_d^B X`` — the c'<->v'-swapped (coupling) direct rung alone.
+            All four direct blocks encode their ket into the same centroid
+            field and decode with the physical bra. The anti branch stays
+            in (c,v,k) storage; its decode alone transposes the band owners.
+            """
+            X, Y = X_full
+            acy, avy = jnp.conj(p["psi_c_A_Y"]), jnp.conj(p["psi_v_A_Y"])
+            vr = (apply_V_ring_only(X, p["psi_c_Y"], p["psi_v_Y"], p["M"], p["V_q0"])
+                  + apply_V_ring_only(Y, acy, avy, p["M"], p["V_q0"]))
+            va = (apply_V_ring_only(X, p["psi_c_Y"], p["psi_v_Y"], p["M_A"], p["V_q0"])
+                  + apply_V_ring_only(Y, acy, avy, p["M_A"], p["V_q0"]))
 
-        Same operand contract as ``_w_term_A``."""
-        return apply_W_from_T(_T_term_B(X, psi_cW_Y, psi_vW_X),
-                             psi_cW_X, psi_vW_Y, W_R)
+            def rung_trial(carry, rows):
+                x, y = rows[0][None], rows[1][None]
+                t = (_T_term_A(x, p["psi_c_X"], p["psi_v_Y"])
+                     + _T_term_B(y, p["psi_c_A_Y"], p["psi_v_A_X"]))
+                field = rung_field(t, p["W_R"])
+                wr = rung_decode(field, p["psi_c_X"], p["psi_v_Y"])
+                # The same mixed kernel's anti bra has (v_X,c_Y) output.
+                wa = rung_decode(field, p["psi_v_A_X"], p["psi_c_A_Y"])
+                wa = transpose_xy(jnp.transpose(wa, (0, 3, 1, 2)), mesh_xy)
+                return carry, (wr[0], jnp.transpose(wa, (0, 2, 3, 1))[0])
 
-    def _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
-                 M, psi_cW_X, psi_vW_Y):
-        D_term = apply_D_term(X, eps_c, eps_v)
-        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
-        if not include_W:
-            return D_term + V_term
-        return D_term + V_term - _w_term_A(X, psi_cW_X, psi_vW_Y, W_R)
-
-    def _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M,
-                 psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y):
-        # The density response's coupling block takes the ring kernel K^A, the
-        # A block's own (apply_V_ring_only), on the SAME hoisted M (audit P3).
-        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
-        if not include_W:
-            return V_term
-        return V_term - _w_term_B(X, psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y, W_R)
-
-    def _antiresonant_row(X, Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                          W_R, V_q0, M,
-                          psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y):
-        """Bottom (anti-resonant) block-row of the non-TDA operator applied to
-        ``[X; Y]``: ``Y_out``.  The physics of this row depends on ``screening``:
-
-        * ``screening=True, include_W=False`` (RPA test-charge density response):
-          the coupling ``B = K^A`` is Hermitian and ``A`` is Hermitian, so the
-          operator is the symplectic ``[[A, B], [-B, -A]]`` and
-          ``Y_out = -B X - A Y``.  Validated by the W(0) resolvent closure
-          (PHASE2_LOG "W(0)").
-
-        * ``screening=True, include_W=True`` (LADDER density response): the row
-          is a HYBRID, and the split is not cosmetic.
-
-            Y_out = -[V X - conj(W_d^B conj(X))] - [D Y + V Y - conj(W_d conj(Y))]
-
-          The RING term keeps the RPA row's sign and NO conjugate, because the
-          Hartree rung is the dyad ``[M; -M] v [M^dag, M^dag]`` whose bottom row
-          IS ``-K^A`` — that is what makes ``W - v = v chi v`` hold at all (the
-          Woodbury identity in the ``w_ladder`` module docstring).  The DIRECT
-          terms are CONJUGATED, because the ladder rung is an ordinary
-          two-particle kernel whose anti-resonant blocks are the complex
-          conjugates of the resonant ones (``K^AA = conj(K^RR)``,
-          ``K^AR = conj(K^RA) = (K^RA)^dag`` since ``W_d^B`` is complex
-          SYMMETRIC) — the same para-Hermitian structure the optical row uses,
-          and the reason the ladder-only spectrum here IS the exchange-free
-          optical BSE's.
-
-          MEASURED, on the gnppm 2v2c fixture at q=0 (probe leg, JID 57052808):
-          the naive un-conjugated row ``-B X - A Y`` leaves the static tile
-          NON-Hermitian at ``max|W - W^dag|/|W| = 2.13e-05`` (exactly reproduced
-          by a dense solve, so it is the operator and not the solver, and it
-          does not move between GMRES tol 1e-9 and 1e-14).  This row gives
-          6.9e-15.  Fully conjugating the row instead — the optical ``-B*, -A*``
-          — breaks the RPA limit by 2.3e-03, because ``K^A = M v M^dag`` is
-          Hermitian but NOT symmetric (measured ``|K^A - (K^A)^T|/|K^A| =
-          1.95``).  This is the same class of defect as the historical
-          ``-B, -A`` optical bug (``bse_nontda`` module docstring): an
-          un-conjugated row against a complex-symmetric coupling.
-
-        The OPTICAL row, ``-B* X - A* Y``, is
-        ``bse_stack_matvec.build_bse_stack_matvec_full``'s."""
-        if not include_W:
-            AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                          W_R, V_q0, M, psi_cW_X, psi_vW_Y)
-            BX = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M,
-                          psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)
-            return -BX - AY
-        # Ring parts un-conjugated (the Hartree dyad's bottom row), direct
-        # parts conjugated (the ladder rung's anti-resonant blocks).  The
-        # conjugated appliers reuse the SAME kernels on conjugated inputs —
-        # no second W path, so nothing can drift between the two rows.
-        AY = (apply_D_term(Y, eps_c, eps_v)
-              + apply_V_ring_only(Y, psi_c_Y, psi_v_Y, M, V_q0)
-              - jnp.conj(_w_term_A(jnp.conj(Y), psi_cW_X, psi_vW_Y, W_R)))
-        BX = (apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
-              - jnp.conj(_w_term_B(jnp.conj(X), psi_cW_X, psi_cW_Y,
-                                   psi_vW_X, psi_vW_Y, W_R)))
-        return -BX - AY
-
-    def _impl_core_fused(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c,
-                         eps_v, W_R, V_q0, M, psi_cW_X, psi_cW_Y, psi_vW_X,
-                         psi_vW_Y):
-        """The LADDER screening non-TDA matvec with TWO rung FFT chains, not four.
-
-        ``apply_W_from_T`` is linear in ``T`` and takes the SAME
-        ``(psi_cW_X, psi_vW_Y, W_R)`` in all four of the operator's rung terms,
-        and each ROW's two terms enter with the same sign, so their ``T`` may be
-        summed BEFORE the ``T -> T_R -> U_R -> U_q -> U`` chain instead of after:
-
-            X_out = D X + V X + V Y      −      W[ T_A(X)      + T_B(Y)      ]
-            Y_out = −(V X + D Y + V Y)   + conj W[ T_B(conj X) + T_A(conj Y) ]
-
-        which is ``_apply_A + _apply_B`` and ``_antiresonant_row`` term for
-        term — the conjugation pattern is theirs and is reproduced here, not
-        re-derived (the ring parts un-conjugated because the Hartree dyad's
-        bottom row is ``-K^A``; the direct parts conjugated because the ladder
-        rung's anti-resonant blocks are the complex conjugates of the resonant
-        ones — the reasoning is in ``_antiresonant_row``'s docstring, which
-        remains the ONE place it is written down).
-
-        WHY IT IS WORTH A SECOND SPELLING OF THE ROW.  The chain's
-        ``(nb, mu, nu, s, s, k)`` buffer is the matvec: 95-96 % of the ladder
-        matvec is the direct rung and ~3/4 of a rung term is this chain, so
-        4 -> 2 applications is the single largest per-iteration saving on the
-        path.  MEASURED (opt_integration, 2026-08-16) — see the arm's report.
-
-        ``fuse_ladder_rung=False`` selects four separate rung applications
-        inside the same per-trial scan for an A/B or bisection.
-
-        TWO -> ONE WAS TRIED AND IS REFUTED.  The obvious next step is to stack
-        the two surviving applications: they are INDEPENDENT operands of the
-        SAME operator (same ``psi``, same ``W_R``, different ``T``), XLA
-        schedules them strictly serially under every flag, and
-        ``apply_W_from_T`` is row-count-agnostic on both arms — so
-        ``jnp.concatenate([T_res, T_anti], axis=0)``, ONE application, and two
-        slices back is a legal and bit-identical rewrite.  MEASURED on the
-        gnppm fixture before the per-trial memory bound (n_rmu 399, 3x3x1,
-        nspinor 2; one A100, BFC; in-process
-        A/B, and the build order swapped as a control):
-
-            arm                     nb=1              nb=4
-            XLA chain           +1.7 % faster     +0.6 % faster
-            FUSED k-minor       -15 %  SLOWER     -11 %  SLOWER
-
-        Both arms agree BIT-EXACTLY with the unstacked path (rel 0.0e+00), so
-        this is a scheduling result and not a numerics one.  The sign flips
-        because of what consumes ``T``: the XLA chain's first op is a
-        reshape/FFT that XLA fuses the ``concatenate`` INTO (peak unchanged),
-        while the fused kernel is a CUSTOM CALL, whose operand must be
-        materialized — the concatenate becomes a real copy of the doubled
-        tile, measured as +152 MiB peak at nb=1 (788.0 vs 636.1) and +0.44
-        ms/col, i.e. about two HBM passes over the pair.  Since ``auto`` (the
-        kernel) is the default and the faster arm, a win on the slower arm
-        does not pay for a 15 % loss on the default one, and the stacking is
-        NOT taken.  Evidence:
-        ``reports/screening_diagrams_wbse/evidence/rung_pair_batch/``.
-        The general lesson, which outlives this rung: batching operands across
-        a fused custom call has to pay for materializing the batched operand,
-        and only an arm whose first consumer is fusable gets that for free.
-        """
-        X, Y = X_full[0], X_full[1]
-        DX = apply_D_term(X, eps_c, eps_v)
-        DY = apply_D_term(Y, eps_c, eps_v)
-        VX = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
-        VY = apply_V_ring_only(Y, psi_c_Y, psi_v_Y, M, V_q0)
-
-        def rung_trial(carry, rows):
-            # Keep the trial axis of each encode at one. X/Y remain band-
-            # sharded: the existing ring encoders move their distributed
-            # slices, never a replicated full c*v*k vector or a b*T stack.
-            x, y = rows[0][None], rows[1][None]
-            if fuse_ladder_rung:
-                t_res = (_T_term_A(x, psi_cW_X, psi_vW_Y)
-                         + _T_term_B(y, psi_cW_Y, psi_vW_X))
-                t_anti = (_T_term_B(jnp.conj(x), psi_cW_Y, psi_vW_X)
-                          + _T_term_A(jnp.conj(y), psi_cW_X, psi_vW_Y))
-                w_res = apply_W_from_T(t_res, psi_cW_X, psi_vW_Y, W_R)
-                w_anti = jnp.conj(apply_W_from_T(t_anti, psi_cW_X, psi_vW_Y, W_R))
+            if include_W:
+                _, (wr, wa) = lax.scan(rung_trial, None, (X, Y), unroll=1)
             else:
-                w_res = (_w_term_A(x, psi_cW_X, psi_vW_Y, W_R)
-                         + _w_term_B(y, psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y, W_R))
-                w_anti = jnp.conj(
-                    _w_term_B(jnp.conj(x), psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y, W_R)
-                    + _w_term_A(jnp.conj(y), psi_cW_X, psi_vW_Y, W_R))
-            return carry, (w_res[0], w_anti[0])
+                wr, wa = jnp.zeros_like(X), jnp.zeros_like(Y)
+            return jnp.stack((apply_D_term(X, p["eps_c"], p["eps_v"]) + vr - wr,
+                              -apply_D_term(Y, p["eps_c_A"], p["eps_v_A"]) - va + wa))
 
-        # Only the X-class outputs stack. The two surviving T/convolution
-        # chains reuse one trial's scratch for every probe in the block.
-        _, (W_res, W_anti) = lax.scan(rung_trial, None, (X, Y), unroll=1)
-        X_out = DX + VX + VY - W_res
-        Y_out = -VX - DY - VY + W_anti
-        return jnp.stack([X_out, Y_out], axis=0)
+        return jax.jit(physical, out_shardings=sh.X_full)
 
-    def _impl_core(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                   W_R, V_q0, M, psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y):
-        if include_W:
-            return _impl_core_fused(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                                    eps_c, eps_v, W_R, V_q0, M,
-                                    psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)
-        X = X_full[0]
-        Y = X_full[1]
-        AX = _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                      W_R, V_q0, M, psi_cW_X, psi_vW_Y)
-        BY = _apply_B(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M,
-                      psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)
-        X_out = AX + BY
-        Y_out = _antiresonant_row(X, Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                                  eps_c, eps_v, W_R, V_q0, M,
-                                  psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)
-        return jnp.stack([X_out, Y_out], axis=0)
+    def rpa(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c,
+            eps_v, W_R, V_q0, M):
+        X, Y = X_full
+        vx = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
+        vy = apply_V_ring_only(Y, psi_c_Y, psi_v_Y, M, V_q0)
+        return jnp.stack((apply_D_term(X, eps_c, eps_v) + vx + vy,
+                          -vx - (apply_D_term(Y, eps_c, eps_v) + vy)))
 
-    if ladder_rung_slots:
-        # LADDER on a build_finite_q_data payload: the rung's psi are four
-        # EXTRA runtime operands (rolled, UN-flipped) — see
-        # bse_feast.ladder_matvec_operands and _w_term_A's operand contract.
-        def _matvec_impl(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c,
-                         eps_v, W_R, V_q0, M,
-                         psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y):
-            # M: the hoisted exchange pair amplitude (audit P3) in the shared
-            # transition layout (sh.M); the ring decode reads it in place.
-            return _impl_core(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                              eps_c, eps_v, W_R, V_q0, M,
-                              psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)
-
-        matvec = jax.jit(
-            _matvec_impl,
-            in_shardings=(
-                sh.X_full,
-                sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-                sh.eps, sh.eps, sh.W, sh.V,
-                sh.M,
-                sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-            ),
-            out_shardings=sh.X_full,
-        )
-    else:
-        def _matvec_impl(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c,
-                         eps_v, W_R, V_q0, M):
-            # M: the hoisted exchange pair amplitude (audit P3) in the shared
-            # transition layout (sh.M), read in place by the ring decode and
-            # shared by the A and B blocks.  The rung (if any) consumes the
-            # density psi arrays — correct for every raw payload (the only kind
-            # these operators see).
-            return _impl_core(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                              eps_c, eps_v, W_R, V_q0, M,
-                              psi_c_X, psi_c_Y, psi_v_X, psi_v_Y)
-
-        matvec = jax.jit(
-            _matvec_impl,
-            in_shardings=(
-                sh.X_full,
-                sh.psi_x,
-                sh.psi_y,
-                sh.psi_x,
-                sh.psi_y,
-                sh.eps,
-                sh.eps,
-                sh.W,
-                sh.V,
-                sh.M,
-            ),
-            out_shardings=sh.X_full,
-        )
-    return matvec
+    return jax.jit(rpa,
+        in_shardings=(sh.X_full, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
+                      sh.eps, sh.eps, sh.W, sh.V, sh.M),
+        out_shardings=sh.X_full)
 
 
 def build_realspace_random_transition_generator(

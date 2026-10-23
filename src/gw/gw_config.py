@@ -603,9 +603,8 @@ _W_RPA_RESOLVENT_REFUSALS: tuple[
     # occupations at the stage, before any compute, under
     # ``w_rpa_resolvent_insulators_only``.  The pair-basis /
     # integer-occupation argument transfers unchanged from ``w_bse``; the
-    # ladder's TRS pair gauge (``enforce_trs_pair_gauge``) is applied only on
-    # the ``include_w=True`` branch, and the RPA arm's reciprocity holds
-    # without it.
+    # physical R/A ladder carries both vertices explicitly, without a TRS
+    # gauge construction. The default RPA body keeps its folded representation.
     (
         "w_rpa_resolvent_head_placement_unimplemented",
         lambda cfg: str(cfg.head.mc_average_placement) != "off",

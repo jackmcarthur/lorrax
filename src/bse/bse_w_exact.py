@@ -154,7 +154,7 @@ def _roll_k_index(q, nkx, nky, nkz):
     return idx
 
 
-def build_finite_q_data(data, q, mesh_xy):
+def build_finite_q_data(data, q, mesh_xy, *, physical_branches=False):
     """Finite-momentum screening data for the W_q resolvent — the q generalization.
 
     The RPA density response at momentum ``q`` lives in the on-grid pair basis
@@ -192,9 +192,15 @@ def build_finite_q_data(data, q, mesh_xy):
         data (the roll is still the identity and ``V_q_full[...,0] == V_q0``, but
         ψ comes back conjugated); it is VALUE-identical, because χ₀(0) is real.
 
-    Requires ``data`` loaded with ``load_v_full=True``.
+    With ``physical_branches=True`` the payload instead carries BOTH raw
+    physical R=(c[k+q],v[k]) and A=(v[k+q],c[k]) legs and their distinct
+    diagonals/vertices, with no conjugation or TRS fold. The two representations
+    share the exact runtime-index roll owner.
+
+    Requires ``data`` loaded with ``load_v_full=True`` (a physical Gamma
+    payload may use its existing V_q0).
     """
-    if data.get("V_q_full") is None:
+    if data.get("V_q_full") is None and not (physical_branches and not any(q)):
         raise ValueError(
             "build_finite_q_data needs the full V tensor; load the restart with "
             "load_bse_data_from_restart_sharded(..., load_v_full=True).")
@@ -202,7 +208,31 @@ def build_finite_q_data(data, q, mesh_xy):
     qx, qy, qz = int(q[0]), int(q[1]), int(q[2])
     sh = make_bse_shardings(mesh_xy)
     dq = dict(data)
-    dq["V_q0"] = data["V_q_full"][:, :, qx, qy, qz]
+    dq["V_q0"] = (data["V_q0"] if data.get("V_q_full") is None
+                    else data["V_q_full"][:, :, qx, qy, qz])
+    if physical_branches:
+        # Physical transition vertices at the producer's +q: unlike the
+        # historical folded RPA representation, neither leg is conjugated.
+        # _roll_k_index(q) addresses k-q, hence the minus here.
+        idx = device_put_process_local(
+            _roll_k_index((-qx, -qy, -qz), nkx, nky, nkz),
+            NamedSharding(mesh_xy, P()))
+        for band in ("c", "v"):
+            for axis, layout in (("X", sh.psi_x), ("Y", sh.psi_y)):
+                key = f"psi_{band}_{axis}"
+                rolled = jax.lax.with_sharding_constraint(
+                    jnp.take(data[key], idx, axis=0), layout)
+                dq[key] = rolled if band == "c" else data[key]
+                dq[f"psi_{band}_A_{axis}"] = data[key] if band == "c" else rolled
+        dq["eps_c"] = jnp.take(data["eps_c"], idx, axis=0)
+        dq["eps_c_A"] = data["eps_c"]
+        dq["eps_v_A"] = jnp.take(data["eps_v"], idx, axis=0)
+        dq["M"] = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(dq["psi_c_X"], dq["psi_v_X"]), sh.M)
+        dq["M_A"] = jax.lax.with_sharding_constraint(compute_pair_amplitude(
+            jnp.conj(dq["psi_c_A_X"]), jnp.conj(dq["psi_v_A_X"])), sh.M)
+        dq["physical_branches"] = True
+        return dq
     # THE ROLL IS A DEVICE GATHER THROUGH A RUNTIME INDEX (see _roll_k_index),
     # so a different q needs no new compile AND no host round trip.  The index
     # is nk int32s, staged process-locally: plain ``device_put`` of host data
@@ -791,7 +821,7 @@ def _resolvent_response_actions(solve, rhs, z, value):
     return jax.lax.cond(z == 0, at_zero, away_from_zero, operand=None)
 
 
-def _moment_response_actions(apply_h, rhs):
+def _moment_response_actions(apply_h, rhs, *, retain_branches=False):
     """``C H**j B / 2``, j=0..3, before the common density projection.
 
     M0 and M2 expose forbidden odd-in-z coefficients on the even-s route;
@@ -800,16 +830,16 @@ def _moment_response_actions(apply_h, rhs):
     """
     def step(value, _):
         value = apply_h(value)
-        return value, value[0] + value[1]
+        return value, value if retain_branches else value[0] + value[1]
 
     _, powers = jax.lax.scan(step, rhs, None, length=3, unroll=1)
-    return {"M0": 0.5 * (rhs[0] + rhs[1]),
+    return {"M0": 0.5 * (rhs if retain_branches else rhs[0] + rhs[1]),
             "M1": 0.5 * powers[0], "M2": 0.5 * powers[1],
             "M3": 0.5 * powers[2]}
 
 
 def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
-                            resid_relative_to: str = "b", *, with_slope=False):
+                            resid_relative_to: str = "b", *, with_slope=False, retain_branches=False):
     """Cached jitted per-column-scan block-GMRES engine for the screening
     resolvent — the stage-2 SOLVE of :func:`apply_screening_resolvent_block`.
 
@@ -835,7 +865,7 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
     Their solves share the same operator and GMRES owner. Residual/iteration
     outputs then conservatively include every solve, not just the value leg.
     """
-    key = (id(matvec), int(max_iter), str(resid_relative_to), str(dtype), bool(with_slope))
+    key = (id(matvec), int(max_iter), str(resid_relative_to), str(dtype), bool(with_slope), bool(retain_branches))
     hit = _BLOCK_GMRES_CACHE.get(key)
     if hit is not None:
         return _bind_tol(hit[1], tol)
@@ -863,7 +893,9 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
             nrhs = jnp.linalg.norm(rhs_i)
             resid = jnp.where(nrhs == 0.0, jnp.asarray(0.0, dtype=nrhs.dtype),
                               jnp.linalg.norm(r_true) / nrhs)
-            s = jax.lax.with_sharding_constraint(x[0] + x[1], sh.X)  # (1, c, v, k)
+            def read(value):
+                return value[:, 0] if retain_branches else (value[0] + value[1])[0]
+            s = read(x)
             if with_slope:
                 def solve(b, shift, *, reflected=False):
                     # A deflation built at z is not the shifted preconditioner
@@ -880,11 +912,10 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
 
                 slope, reflected, res, count = _resolvent_response_actions(
                     solve, rhs_i, z, x)
-                fields = {"dWc_ds": (slope[0] + slope[1])[0],
-                          "Wc_minus_z": (reflected[0] + reflected[1])[0]}
-                return carry, (s[0], jnp.maximum(resid, res),
+                fields = {"dWc_ds": read(slope), "Wc_minus_z": read(reflected)}
+                return carry, (s, jnp.maximum(resid, res),
                                jnp.maximum(k_used, count), fields)
-            return carry, (s[0], resid, k_used)
+            return carry, (s, resid, k_used)
 
         # unroll=1: ONE Krylov workspace alive at a time.  The workspace is
         # O(max_iter) pair-basis vectors plus an O(max_iter^2) replicated
@@ -895,20 +926,23 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
         # to buy the memory with.
         _, result = jax.lax.scan(_solve_col, None, rhs_scan, unroll=1)
         s_all, resids, iters = result[:3]
-        s_all = jax.lax.with_sharding_constraint(s_all, sh.X)        # (nu, c, v, k)
+        def layout(value):
+            return jax.lax.with_sharding_constraint(
+                jnp.moveaxis(value, 1, 0) if retain_branches else value,
+                sh.X_full if retain_branches else sh.X)
+        s_all = layout(s_all)
         if with_slope:
             return s_all, resids, iters, {
-                name: jax.lax.with_sharding_constraint(value, sh.X)
-                for name, value in result[3].items()}
+                name: layout(value) for name, value in result[3].items()}
         return s_all, resids, iters
 
     _BLOCK_GMRES_CACHE[key] = (matvec, _block)
     return _bind_tol(_block, tol)
 
 
-def _get_block_moment_actions(matvec, sh, dtype):
+def _get_block_moment_actions(matvec, sh, dtype, *, retain_branches=False):
     """Cached exact H-power actions, with one probe's matvec scratch live."""
-    key = ("moments", id(matvec), str(dtype))
+    key = ("moments", id(matvec), str(dtype), bool(retain_branches))
     hit = _BLOCK_GMRES_CACHE.get(key)
     if hit is not None:
         return hit[1]
@@ -917,11 +951,15 @@ def _get_block_moment_actions(matvec, sh, dtype):
     def moments(rhs, operands):
         def column(carry, rhs_col):
             fields = _moment_response_actions(
-                lambda value: matvec(value, *operands), rhs_col[:, None])
-            return carry, {name: value[0] for name, value in fields.items()}
+                lambda value: matvec(value, *operands), rhs_col[:, None],
+                retain_branches=retain_branches)
+            return carry, {name: value[:, 0] if retain_branches else value[0]
+                           for name, value in fields.items()}
 
         _, fields = jax.lax.scan(column, None, jnp.moveaxis(rhs, 1, 0), unroll=1)
-        return {name: jax.lax.with_sharding_constraint(value, sh.X)
+        return {name: jax.lax.with_sharding_constraint(
+                    jnp.moveaxis(value, 1, 0) if retain_branches else value,
+                    sh.X_full if retain_branches else sh.X)
                 for name, value in fields.items()}
 
     _BLOCK_GMRES_CACHE[key] = (matvec, moments)
@@ -942,18 +980,20 @@ def _bind_tol(block, tol):
 _PROBE_RHS_CACHE = {}
 
 
-def _get_probe_rhs_program(gen, sh, nk):
+def _get_probe_rhs_program(gen, sh, nk, *, physical_branches=False):
     """The executed seed program, also lowered by the probe memory planner."""
-    key = (id(gen), sh.X_full, int(nk))
+    key = (id(gen), sh.X_full, int(nk), bool(physical_branches))
     hit = _PROBE_RHS_CACHE.get(key)
     if hit is None:
         @jax.jit
-        def seed(g, psi_c, psi_v, v):
+        def seed(g, psi_c, psi_v, v, psi_c_a=None, psi_v_a=None):
             r = jax.lax.with_sharding_constraint(
                 jnp.broadcast_to(g[:, :, None], (*g.shape, nk)), sh.S)
             f = jax.lax.with_sharding_constraint(gen(r, psi_c, psi_v, v), sh.X)
+            fa = (gen(r, jnp.conj(psi_c_a), jnp.conj(psi_v_a), v)
+                  if physical_branches else f)
             return jax.lax.with_sharding_constraint(
-                jnp.stack([f, -f], axis=0).astype(jnp.complex128), sh.X_full)
+                jnp.stack([f, -fa], axis=0).astype(jnp.complex128), sh.X_full)
 
         hit = (gen, seed)
         _PROBE_RHS_CACHE[key] = hit
@@ -1019,15 +1059,43 @@ def build_probe_rhs(G_zeta, data, gen, sh):
     # taking the memory knob back.
     g = device_put_process_local(
         np.ascontiguousarray(G, dtype=np.float64), sh.S_k0)
-    return _get_probe_rhs_program(gen, sh, nk)(
-        g, data["psi_c_X"], data["psi_v_X"], data["V_q0"])
+    physical = bool(data.get("physical_branches", False))
+    args = (data["psi_c_A_X"], data["psi_v_A_X"]) if physical else ()
+    return _get_probe_rhs_program(gen, sh, nk, physical_branches=physical)(
+        g, data["psi_c_X"], data["psi_v_X"], data["V_q0"], *args)
+
+
+_BRANCH_PROJECTION_CACHE = {}
+
+
+def _get_branch_projection_program(snapshot, sh):
+    """Executed two-leg density readout, shared with its memory admission."""
+    key = (id(snapshot), sh.V)
+    hit = _BRANCH_PROJECTION_CACHE.get(key)
+    if hit is None:
+        def project(pair, c, v, coulomb, ca, va):
+            return (snapshot(pair[0], c, v, coulomb)
+                    + snapshot(pair[1], jnp.conj(ca), jnp.conj(va), coulomb))
+
+        hit = (snapshot, jax.jit(project,
+            in_shardings=(sh.X_full, sh.psi_y, sh.psi_y, sh.V, sh.psi_y, sh.psi_y),
+            out_shardings=sh.V))
+        _BRANCH_PROJECTION_CACHE[key] = hit
+    return hit[1]
 
 
 def _project_screening_actions(actions, data, snapshot, *, view=None, snapshot_v=None):
-    """Project pair readouts through the same density vertex and V as Wc."""
-    sdata = data if view is None else view(
-        {"psi_c_Y": data["psi_c_Y"], "psi_v_Y": data["psi_v_Y"]})
+    """Project through each physical branch's matched vertex, then add."""
+    keys = ("psi_c_Y", "psi_v_Y", "psi_c_A_Y", "psi_v_A_Y")
+    sdata = {key: data[key] for key in keys if key in data}
+    if view is not None:
+        sdata = view(sdata)
     v = data["V_q0"] if snapshot_v is None else snapshot_v
+    if data.get("physical_branches", False):
+        project = _get_branch_projection_program(snapshot, make_bse_shardings(v.sharding.mesh))
+        return {name: project(value, sdata["psi_c_Y"], sdata["psi_v_Y"], v,
+                              sdata["psi_c_A_Y"], sdata["psi_v_A_Y"])
+                for name, value in actions.items()}
     return {name: snapshot(value, sdata["psi_c_Y"], sdata["psi_v_Y"], v)
             for name, value in actions.items()}
 
@@ -1137,7 +1205,8 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
     # q / omega is dispatch-only.  z is passed as a device scalar (not a Python
     # complex) so a different omega stays a runtime arg, never a baked constant.
     solver = _get_block_gmres_solver(matvec, sh, max_iter, tol, rhs.dtype,
-                                     resid_relative_to, with_slope=with_slope)
+                                     resid_relative_to, with_slope=with_slope,
+                                     retain_branches=bool(data.get("physical_branches", False)))
     # operands_fn must match the matvec's build: matvec_operands (10) for
     # every raw-payload operator, ladder_matvec_operands (14) for a
     # ladder_rung_slots build (bse_ring_comm).

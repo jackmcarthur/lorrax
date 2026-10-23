@@ -129,10 +129,18 @@ def matvec_operands(data: dict) -> tuple:
 
 
 def ladder_matvec_operands(data: dict) -> tuple:
-    """The 13 operands of a ``ladder_rung_slots`` matvec: the ordinary 9 plus
+    """Physical R/A array bundle, or the historical raw operand tuple.
+
+    The physical bundle carries two vertices without expanding the call
+    signature. Legacy rung slots are the ordinary 9 operands plus
     the rung's four PHYSICAL (rolled, un-flipped) psi arrays.  Falls back to
     the density arrays when the payload carries no rung slots — that is a raw
     payload, where the density arrays ARE physical (the q=0 identity cells)."""
+    if data.get("physical_branches", False):
+        keys = ("psi_c_X", "psi_c_Y", "psi_v_X", "psi_v_Y",
+                "psi_c_A_X", "psi_c_A_Y", "psi_v_A_X", "psi_v_A_Y",
+                "eps_c", "eps_v", "eps_c_A", "eps_v_A", "M", "M_A", "W_R", "V_q0")
+        return ({key: data[key] for key in keys},)
     return matvec_operands(data) + (
         data.get("psi_c_W_X", data["psi_c_X"]),
         data.get("psi_c_W_Y", data["psi_c_Y"]),
@@ -189,6 +197,17 @@ def build_preconditioner_diagonal_sharded(
     ``compute_pair_amplitude`` call, which is why the agreement above is at
     round-off.
     """
+    if data.get("physical_branches", False) and not use_tda:
+        anti = dict(data, M=data["M_A"], eps_c=data["eps_c_A"], eps_v=data["eps_v_A"])
+        for band in ("c", "v"):
+            for axis in ("X", "Y"):
+                anti[f"psi_{band}_{axis}"] = jnp.conj(data[f"psi_{band}_A_{axis}"])
+        dr = build_preconditioner_diagonal_sharded(data, mesh_xy, include_W, use_tda=True)
+        da = build_preconditioner_diagonal_sharded(anti, mesh_xy, include_W, use_tda=True)
+        # Swapping the physical m/n legs conjugates their Hermitian-W
+        # diagonal; the ring self-contraction and excitation energy are real.
+        return jax.lax.with_sharding_constraint(jnp.stack((dr, -jnp.conj(da)))[:, None],
+            NamedSharding(mesh_xy, P(None, None, "x", "y", None)))
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
 
     # Hoisted pair amplitudes (audit P3).  The fallback is for payloads

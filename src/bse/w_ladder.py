@@ -1,315 +1,17 @@
-"""Ladder-corrected screened Coulomb ``W_BSE(z)`` — the test-charge density
-response whose kernel carries the statically screened direct rung ``-W``.
+"""Physical non-TDA ladder density response, W_BSE(z)-v = C (z-H)^-1 B.
 
-This is the ``screening_diagrams = w_bse`` half of the GW driver's screening
-fork: the SAME resolvent identity ``W(z) - v = v (z - H)^{-1} v`` that
-``bse_w_exact`` uses for the RPA W, evaluated with the LADDER operator instead
-of the RPA one.  It is a two-stage object by construction — the ladder kernel
-``W_R`` is the RPA ``W(0)`` the ordinary path already produced — and it lives in
-``src/bse/`` because the operator is the BSE ring matvec; ``gw/`` consumes only
-the (mu, nu) tiles this module returns.
+At stored +q the two branches are R=(c[k+q],v[k]) and
+A=(v[k+q],c[k]), with distinct vertices F_R and F_A. The injection
+is [F_R; -F_A]v and the readout is v[F_R^dag,F_A^dag]. Their outer
+product supplies all four Hartree blocks. Each statically screened direct
+block uses the same physical encode/W-convolution/decode contraction.
+No TRS sewing, real-orbital assumption or projection of W(z) is used.
 
-``build_ladder_resolvent(..., include_w=False)`` DELEGATES to
-``bse_w_exact._build_rpa_resolvent`` — the RPA limit of this SAME
-resolvent identity, with the direct rung parameterized out of the ring
-matvec (``bse_ring_comm.build_bse_ring_matvec_full(..., include_W=
-False)``) rather than a second matvec builder.  As of 2026-08-23 that
-limit is ALSO a served production diagram, ``screening_diagrams =
-w_rpa_resolvent`` (``gw.screening_bse.compute_screening_ladder``'s
-``include_w=False`` arm) — a second route to ``w_rpa``'s own W, useful
-for gating this module's restart/TRS/head machinery on an operator simple
-enough to have an independent reference.  Every ``include_w=True``
-statement in this docstring — the ladder rung, its TRS-gauge derivation,
-the finite-q vertex-flip compensation — is specific to the LADDER arm and
-does not describe ``w_rpa_resolvent``, which never builds the rung at all.
-
-Scaling envelope (TASTE 8 / INVARIANTS 9) — MEASURED, not projected
----------------------------------------------------------------------------
-Every claim in this section was checked against the optimized HLO on a 2x2
-mesh with production PartitionSpecs on 2026-08-16 (the audit and its numbers:
-``reports/screening_diagrams_wbse/evidence/hlo_audit/FINDINGS.md`` in the
-sandbox); the three that did not survive are stated in their corrected form
-and the defects they named are fixed in this file.
-
-Cost per ``(q, z)`` point = (GMRES iterations) x (one ring matvec).  On the
-ladder the iteration count, not the per-iteration overhead, is the lever
-(~4 % of a ladder iteration is outside the matvec, measured 2026-09-26), so
-every ``(q, z)`` recycles ``LADDER_DEFLATION_RANK`` Ritz vectors of its own
-preconditioned operator across all of its probe columns (:func:`_deflation_for`).  The
-ladder matvec is NOT the RPA one at the same price: measured static collective
-counts are 8 -> 24 (x3.0) for the matvec and 40 -> 88 (x2.2) for the whole
-non-TDA solve, none of them on an ``N_mu^2``-class operand.  The whole
-``q x z`` sweep dispatches ONE compiled program — the operator structure is
-baked into the cached block-GMRES engine (``_get_block_gmres_solver``, keyed
-on ``id(matvec)``) and every q/z-dependent tensor (rolled ``psi_c``/``eps_c``,
-the ``V_q`` tile, the preconditioner diagonal, ``z``) flows in as a RUNTIME
-argument through ``matvec_operands``.  That sentence was FALSE until
-2026-08-16 by exactly one program: ``ensure_W_R`` sat inside the q loop and
-``make_w_densifier`` builds a fresh ``@jax.jit`` per call, costing n_q + 1
-trace+compiles per wedge.  ``W_R`` depends on ``k - k'`` and not on q, so it
-is now built once, outside the loop (see :func:`sweep_q_wedge`), and the
-sentence is true again — the audit's acceptance check is that a 2q x 2z sweep
-shows no tracing-cache miss after the first ``(q, z)``.
-
-MEMORY HIGH-WATER, in decreasing order, and none of it ``N_mu^2``-class per
-rank:
-
-* the SOLVE peak is the replicated ``O(max_iter^2)`` GMRES workspace (7.02 MiB
-  at the production ``max_iter = 300``), which is ``N_mu``-INDEPENDENT and
-  dominates both the RPA and the ladder solve;
-* inside the matvec, the ``T / T_R / U_R / U_q / U`` direct-rung chain, not the
-  probe block: the ladder matvec's peak is 5.3x the RPA one for that reason;
-* the coupling rung (``bse_ring_comm._w_term_B`` -> ``_ring_sum_B_encode``)
-  transiently holds a CONDUCTION-FULL trial buffer ``(b, c_full, v_loc, k)``,
-  y-only-sharded, twice per matvec.  Pair-basis class, so the envelope holds,
-  but it is not "``X_full`` sharded on (x, y)" and the docstring used to say it
-  was.  Pre-existing and by design; the ladder is simply the first screening
-  path to reach it;
-* the pair-basis probe block ``X_full = (2, p_chunk, c, v, k)`` sharded on
-  ``(x, y)``, plus ONE ``P('x','y')`` output tile.
-
-There is no whole-``mu^2`` per-rank object anywhere on the path, INCLUDING the
-assembly and validation tail — which is a statement this file had to earn
-twice: the pad-stripped wedge return and then :func:`_assert_pad_block_is_zero`
-each all-gathered a mu axis, and each is now a sharding-preserving form.  The
-seed enters as ``sh.S = P(None,'y',None)``, the readout leaves through the
-reduce-scatter snapshot as ``sh.V = P('x','y')``, and the stacked wedge is
-``P(None, None, 'x', 'y')`` — the same class as the existing ``W_q``.
-
-The envelope ``N_mu -> 1e4``, ``P -> 1e3`` is reached by chunking two axes and
-nothing else: ``probe_chunk`` splits the mu^2 tile column-wise, and the q-wedge
-is walked one q at a time (never batched).  ``probe_chunk`` trades DISPATCHES
-for the probe block's memory — and only since 2026-08-16: while
-:func:`_accumulate_columns` ran eagerly, every chunked placement all-gathered
-the accumulator's nu axis (``N_mu/p_x`` x ``N_mu`` per rank, dividing by
-sqrt(P) rather than P), so the knob documented as SAVING memory spent it, at
-every setting except the single-chunk default.
-
-Two-plan obligation (INVARIANTS 6): ONE code path serves both plans.  The ring
-matvec at ``P = 1`` IS the local plan — the ring/ppermute reduces to a
-no-op loop over a single rank and the shard_map bodies become the local
-einsums — so there is no second implementation to keep in step, and
-``docs/architecture/dense_linear_algebra.md`` cites this module for both plans.
-
-The derivation
---------------
-Notation: pair index ``I = (c, v, k)``; ``M_I(mu)`` the ISDF pair density
-``sum_s conj(psi_c) psi_v``; ``D_I = eps_c - eps_v``; ``v`` the (mu, nu) Coulomb
-tile; ``W`` the static screened tile.  The non-TDA operator acts on ``[X; Y]``
-with the probe seed ``rhs = [f; -f]``, ``f = M v e_nu``, and the readout
-``w = v M^dag (X + Y)`` — the convention ``bse_w_exact`` pins and gates.  The
-RPA case is the symplectic ``H = [[A, B], [-B, -A]]``; the ladder case is NOT
-(step 4).
-
-**1. The Hartree/ring rung is a DYAD, and that forces it into all four
-blocks with no conjugation.**  Write the seed as ``sigma u = [M u; -M u]`` and
-the readout as ``tau [X; Y] = M^dag (X + Y)``.  For ANY irreducible operator
-``H_0`` (the part of ``H`` that is not the ring term), adding the ring term as
-the outer product ``sigma_v tau`` — i.e. ``H = H_0 + sigma v tau``, which
-written out is exactly ``[[G, G], [-G, -G]]`` with ``G = M v M^dag`` — and
-solving ``(z - H) x = sigma v e_nu`` gives, by Woodbury,
-
-    w = v tau x = v [ Pi + Pi (v^{-1} - Pi)^{-1} Pi ] v = v Pi (1 - v Pi)^{-1} v,
-    Pi(z) = tau (z - H_0)^{-1} sigma .
-
-That is ``W(z) - v = v chi v`` with ``chi = Pi (1 - v Pi)^{-1}`` — the Dyson
-resummation — for ANY ``H_0``, exactly, with no reality or symmetry assumption.
-So the ring kernel is not "the same in both blocks" by analogy with the A
-block: it is the outer product of the perturbation's injection and the density
-readout, which is what an internal Hartree field IS.  With ``H_0 =
-diag(D, -D)`` this gives ``Pi = chi_0`` and the RPA W, which is the identity
-``bse_w_exact`` gates to 2.5e-9 at q=0 and at every symmetry-reduced finite q.
-It also fixes the anti-resonant row's conjugation pattern: the dyad's bottom
-row is ``[-G, -G]`` with NO complex conjugate.  The optical BSE's ``-B*, -A*``
-row belongs to a different basis (its anti-resonant states carry the CONJUGATE
-pair density; that is what makes its exchange ``M v M^T`` instead of
-``M v M^dag``), and using it here breaks ``w = v chi v`` already at RPA.
-
-**2. What is left to derive.**  Step 1 fixes the ring term in ALL FOUR blocks
-(``[[G, G], [-G, -G]]``, no conjugate anywhere) and reduces the problem to
-``H_0``, the irreducible part.  Writing ``H_0 = Sigma_3 (D~ + K^d)`` with
-``Sigma_3 = diag(1, -1)``, ``D~ = diag(D, D)`` and ``K^d`` the direct kernel
-MATRIX in the 2N basis, the free-propagator factorization
-``L_0^{-1} = Sigma_3 (z - Sigma_3 D~)`` gives ``Pi = tau (z - H_0)^{-1} sigma``
-= the ladder-corrected irreducible polarizability, PROVIDED ``K^d`` is the
-kernel matrix in that basis.  So all four blocks of ``K^d`` must be derived; the
-RPA case is ``K^d = 0``, ``H_0 = diag(D, -D)``, ``Pi = chi_0``.
-
-Special case worth naming, because it is the RPA path's whole optimization
-story: when ``H`` is the plain symplectic ``[[A, B], [-B, -A]]``, eliminating
-``T = X - Y`` in favour of ``S = X + Y`` gives
-``[z^2 (A-B)^{-1} - (A+B)] S = 2 f`` and hence
-
-    W(z) - v = 2 v M^dag [ z^2 (A-B)^{-1} - (A+B) ]^{-1} M v .          (*)
-
-RPA: ``A = D + G``, ``B = G`` ⇒ ``A - B = D``, ``A + B = D + 2G``, and (*) is
-what ``w_omega_chain`` exploits.  The ladder breaks BOTH the form and
-``A - B = D`` (step 4), so (*) does not apply to it at all.
-
-**3. The ladder rung.**  The screened direct term is the SAME 4-point kernel as
-the optical BSE's direct term.  Two independent matrix elements exist in the
-pair basis, distinguished by whether the KET's electron/hole role assignment is
-reversed — which is exactly what the de-excitation branch does:
-
-    W_d   [I, J] = sum_{mu,nu} [conj(psi_c[k]) psi_c'[k']](mu) W(k-k')
-                              [psi_v[k] conj(psi_v'[k'])](nu) / N_k
-    W_d^B [I, J] = sum_{mu,nu} [conj(psi_c[k]) psi_v'[k']](mu) W(k-k')
-                              [psi_v[k] conj(psi_c'[k'])](nu) / N_k
-
-``W_d`` is ``_apply_A``'s ``W_term`` (``encode_T`` + ``apply_W_from_T``);
-``W_d^B`` is ``_apply_B``'s (``encode_T_B`` + the SAME decode).  Both are the
-optical operator's direct terms VERBATIM, and that is a consequence, not an
-analogy: the direct rung contracts band pairs ``(c, c')`` and ``(v, v')``
-through ``W`` and never touches a density vertex, so the density-vertex
-convention that distinguishes this operator's exchange from the optical one
-(step 1) cannot reach it.  MEASURED on the gnppm fixture: ``W_d`` is Hermitian
-to 1.2e-12 and ``W_d^B`` is complex SYMMETRIC to 4.9e-13 (and 1.9e+00 away from
-Hermitian) — the same structure ``test_bse_dense_reference`` asserts for the
-optical blocks.
-
-**4. The anti-resonant row is a HYBRID, and this is the result that had to be
-measured.**  The remaining two blocks of ``K^d`` are fixed by ``K^d`` being a
-kernel MATRIX, i.e. Hermitian: ``K^AR = (K^RA)^dag = conj(W_d^B)`` (using
-``W_d^B`` symmetric) and ``K^AA = conj(K^RR) = conj(W_d)``.  Composed with the
-step-1 dyad this gives
-
-    A = D + V - W_d ,        B = V - W_d^B ,
-    Y_out = -[ V X - conj(W_d^B conj(X)) ] - [ D Y + V Y - conj(W_d conj(Y)) ] ,
-
-i.e. the RING terms of the bottom row keep the RPA's un-conjugated ``-V`` (they
-are the Hartree dyad's bottom row, forced by step 1) while the DIRECT terms are
-CONJUGATED (they are an ordinary two-particle kernel, so its anti-resonant
-blocks are the para-Hermitian conjugates — the same structure the OPTICAL row
-uses).  Equivalently: the ladder-only part of ``H`` is exactly the exchange-free
-optical SHAO operator ``[[A, B], [-B*, -A*]]``, so the poles of ``Pi`` are the
-exchange-free BSE's exciton energies, which is what a ladder polarizability's
-poles must be.
-
-Three candidate rows were dense-solved on the gnppm 2v2c payload at q=0 (probe
-leg, JID 57052808, 2026-08-15), scored on (a) static-tile hermiticity
-``max|W - W^dag|/|W|`` and (b) the ``W -> 0`` limit against the validated RPA W:
-
-    row                                       asym       RPA limit
-    -[B, A]        (naive symplectic)         2.13e-05   exact
-    -[B*, A*]      (full optical conjugation) 9.24e-07   2.27e-03  REFUTED
-    -[B_ring - conj(W_d^B), A_ring - conj(W_d)]  6.90e-15   exact    <- this one
-
-The naive row's 2.13e-05 is the OPERATOR, not the solver: a dense (exact) solve
-of the same operator reproduces it to every digit, and the sharded tile agrees
-with the dense one to 3e-15 at GMRES tolerances from 1e-9 to 1e-14.  Fully
-conjugating the row instead breaks the RPA limit, because ``K^A = M v M^dag`` is
-Hermitian but NOT symmetric (measured ``|K^A - (K^A)^T|/|K^A| = 1.95`` on this
-deck) — the ring term must stay un-conjugated.  This is the same class of defect
-as the historical optical ``-B, -A`` bug (``_antiresonant_row`` docstring): an
-un-conjugated row against a complex-SYMMETRIC coupling.  The dense oracle
-(``tests/test_bse_w_ladder_dense.py``) carries both as RED TWINS.
-
-**5. Consequence for the frequency path.**  The ladder operator is not the
-symplectic ``[[A, B], [-B, -A]]`` at all (step 4), and even its ``A - B`` is
-``D - W_d + W_d^B != D``.  The ``w_omega_chain`` z^2 reduction hard-assumes BOTH
-(``w_omega_chain.py:39-46``: ``S = D^{1/2}(A+B)D^{1/2}``, seed scaled by
-``D^{1/2}``, three-term recurrence in a Euclidean metric), so it is
-STRUCTURALLY REFUSED for the ladder — see :func:`refuse_chain_path`.  The
-hybrid row also rules out ``bse_nontda.make_ab_appliers`` and the SDY product
-form: the un-conjugated ring dyad is not the complex-symmetric coupling block
-that their real-linear ``F/G`` actions require.  The applicable certificate is
-full-space pseudo-Hermiticity, ``eta H = (eta H)^dag`` with
-``eta = diag(I, -I)``; it is not SDY's N-dimensional kappa-metric certificate.
-A reusable frequency basis would have to retain the full 2N operator; the
-direct path evaluates each frequency with its own shifted block-GMRES solve.
-
-**6. What hermiticity is, and is not, established.**  With the step-4 row,
-``K^d`` is Hermitian by construction and ``W_ladder(q=0, 0)`` comes out
-Hermitian to 6.9e-15 on the fixture — asserted by
-``test_ladder_w_tile_is_hermitian_at_q0``.  At FINITE q nothing here has been
-measured: the same construction should give ``W(q)^dag = W(q)`` and
-``W(q) = conj(W(-q))``, but that is for ``gw/screening._gate_w`` to demonstrate
-on the assembled tiles.  Run the gate; if it fires, that is evidence about the
-operator, not a tolerance to loosen.
-
-**7. Finite q: the vertex flip conjugates the rung, and the operator must
-compensate.**  Every tile this module returns is a ``W(z) - v`` BODY,
-head-less, in the GW ``chi_0(q)`` vertex convention — that is,
-:func:`bse_w_exact.build_finite_q_data`'s conjugation of BOTH psi legs, whose
-long correctness note (``bse_w_exact.py:199-235``) is the record of the
-finite-q vertex bug (KNOWN_FAILURES:1248) that was invisible at q=0 because
-``chi_0(0)`` is real.  The flip is exact for the four DENSITY vertices (each
-is bilinear in ``(psi_c, psi_v)`` with exactly one conj, so conjugating both
-legs flips all four at once).  The direct rung is NOT such an object: it is
-bilinear in ``(c, c')`` and ``(v, v')`` band pairs, each psi appearing once
-conjugated and once plain, so wholesale conjugation of psi conjugates the
-rung ELEMENTWISE — ``rung_flipped(X) = conj(rung_physical(conj(X)))``,
-exactly, given ``W_R`` elementwise-real (equivalent to the input W's gated
-``W(-q) = conj(W(q))`` reciprocity; no other property is used).  Composed
-with the step-4 hybrid row, an uncompensated flip therefore hands the
-resonant row the ANTI-resonant rung and vice versa — the operator becomes a
-chimera (ring resumming ``chi(q)``, rungs belonging to the folded ``-q``
-channel) that is value-identical at q=0, where the static W is real
-symmetric under TRS, and violates ``W(-q) = conj(W(q))`` at finite q.
-MEASURED before the compensation existed: 3.579e-04 against 4.081e-11 for
-the RPA operator through the identical pair of solves (claim 0215,
-JID 57064957, 2026-08-15).  The compensation lives inside the rung appliers
-(``bse_ring_comm`` ``_w_term_A``/``_w_term_B`` under
-the physical rung operand slots (``ladder_rung_slots``), so BOTH rows see the physical rung and
-the step-4 row pattern applies verbatim at every q; with it, the operator at
-``-q`` is the elementwise conjugate of the operator at ``+q`` under the TRS
-fold ``k -> -k`` (ring: ``M``, ``v_q`` conjugate; ``D`` invariant; rungs:
-shown above), which is what makes ``W(-q) = conj(W(q))`` hold by
-construction.  [AMENDED 2026-08-16: the conj-wrap compensation described
-above was REFUTED at block level (probe_block_compare: ~7e-5 residual
-against the dense operator despite exactly-conjugate operand arrays and
-exactly-real W_R; the elementwise argument does not survive contact with
-the kernels).  The mechanism that IS measured exact (1e-20, all four
-blocks) is supplying the rung with the physical rolled un-flipped arrays
-as four extra operands — ``ladder_rung_slots`` in ``bse_ring_comm``,
-slots from ``build_finite_q_data``, threading via
-``bse_feast.ladder_matvec_operands``.  No caller-side convention
-declaration remains.]
-
-**8. Finite q, second condition: the TRS pair GAUGE.**  Step 7's fold — and
-step 4's ``K^AA = conj(K^RR)`` before it — identifies the code's Y labels
-with the physical de-excitation pairs at ``-q`` through the antiunitary map
-``psi(-k) -> conj(psi(k))``.  That is an identity of PHYSICAL states only in
-the gauge ``psi(-k) = conj(psi(k))``; the diagonalizer's Bloch gauge is
-arbitrary per k, so on a raw deck the conj-pattern row fills the Y channel
-with wrong-gauge content.  The error is invisible at q=0 (one shared
-transition space), invisible to per-q hermiticity (``conj(K_d)`` is
-Hermitian in any gauge), and invisible to the RPA (ring dyad and D are
-band-window/gauge invariant — which is why the RPA arm passes reciprocity
-at 4e-11 on the same deck).  MEASURED 2026-08-16: the first-principles
-dense ladder operator itself — no production kernels, no payload flip —
-violates ``W(-q) = conj(W(q))`` at 1.043e-03 on the raw-gauge gnppm 2v2c
-fixture; fixing only the rung compensation of step 7 left the production
-statistic at its pre-fix 3.579e-04 (the swap transposes the tile, and the
-statistic is transpose-invariant).  The cure is a pure basis choice:
-``bse_w_exact.enforce_trs_pair_gauge`` overwrites ``psi(-k)`` with
-``conj(psi(k))`` pairwise (legitimate because W is invariant under unitary
-band mixing within each window), realizes real functions on degenerate
-blocks at TRIM points, and symmetrizes the energies.  ``sweep_q_wedge``
-applies it on the ``include_w=True`` branch only, so the RPA path is
-bit-untouched.  SPINOR decks use the same machinery with the Kramers pair
-gauge ``psi(-k) = i sigma_y conj(psi(k))``: every contraction this operator
-performs is a spin-singlet s-summed bilinear, in which the real-orthogonal
-``i sigma_y`` cancels identically, so the scalar derivation carries over
-once the pair gauge (and Kramers-canonical TRIM pairing) is enforced —
-see ``enforce_trs_pair_gauge``.
-
-**9. The rung sign, measured (2026-08-16).**  Every gate above is blind to
-the ABSOLUTE sign of the direct rung: the RPA limit, hermiticity,
-reciprocity and the dense oracle (same block spec) all pass identically
-under ``+W_d``.  The sign was therefore pinned by two sign-SENSITIVE
-observables on physically-signed kernels (PSD ``v`` and ``W``;
-``tests/test_bse_w_ladder_sign.py``, evidence ``sign_probe/`` in the
-sandbox): (i) the exchange-free ladder poles sit BELOW the free e-h
-continuum — attraction — and a flipped rung sits above; (ii) on the real
-scalar-Si restart the production path ENHANCES screening at q=0 AND finite
-q (Loewner-negative ``Wc`` delta, 4-8%), the Shishkin-Marsman-Kresse
-direction.  Consequently the measured gap OPENING of the first A/B (claim
-0228) is an observable of the v1 SCOPE — ladder body with the q=0
-head/wings held at RPA — not of the operator sign: the full-W
-gap-shrink results in the literature include the vertex in the long-range
-head, which v1 deliberately defers.  Do not "fix" the sign to match the
-full-W expectation; re-examine after the ladder head lands.
+The historical folded RPA representation remains the unchanged default
+when include_w=False. A physical payload can also use a zero direct rung
+to test the explicit-branch RPA/Dyson identity. Both representations use the
+same GMRES, FFT, seed and readout owners and keep pair/centroid arrays
+sharded over all processors.
 """
 from __future__ import annotations
 
@@ -342,12 +44,12 @@ from .bse_w_exact import (
     apply_screening_resolvent_block,
     build_probe_rhs,
     build_finite_q_data,
-    enforce_trs_pair_gauge,
     _symmetry_tables,
     _get_block_moment_actions,
     _project_screening_actions,
     _get_block_gmres_solver,
     _get_probe_rhs_program,
+    _get_branch_projection_program,
 )
 from common.collectives import gather_to_host
 
@@ -356,56 +58,28 @@ jax.config.update("jax_enable_x64", True)
 
 def build_ladder_resolvent(mesh_xy: Mesh, data: dict, *, include_w: bool = True,
                            fuse_ladder_rung: bool = True):
-    """Assemble the LADDER screening resolvent stack for ``data``.
+    """Build the physical R/A operator and its shared seed/solve/readout stack.
 
-    The :func:`bse_w_exact._build_rpa_resolvent` analog with the ladder kernel.
-    Returns ``(matvec, diag_h, gen, snapshot, sh)`` — the exact 5-tuple
-    :func:`bse_w_exact.apply_screening_resolvent_block` consumes, which is
-    operator-agnostic: only this assembly changes between ``w_rpa_resolvent``
-    and ``w_bse``.
-
-    ``include_w=False`` DELEGATES to ``_build_rpa_resolvent``.  That is
-    deliberate rather than a duplicated branch: the wiring-closure test
-    (``tests/test_bse_w_ladder_identities.py``) rides this flag to prove
-    the plumbing reproduces the production RPA W, so the two must be the
-    same object graph and not merely the same arguments — and, since
-    2026-08-23, so does the production ``screening_diagrams =
-    w_rpa_resolvent`` path (``gw.screening_bse.compute_screening_ladder``),
-    for the same reason.
-
-    ``include_w=True`` needs ``data['W_q']`` — the converged RPA ``W(0)`` from
-    the restart — because ``ensure_W_R(..., include_W=True)`` inverse-FFTs it
-    into the real-space kernel the direct rung convolves.  That is the feature's
-    two-stage structure, not an implementation accident.
-
-    ``matvec`` is q-INDEPENDENT (it closes over mesh and k-grid only), so build
-    it ONCE and let the per-q operands flow through ``matvec_operands``; a
-    per-q rebuild silently costs one full compile per q because the block-GMRES
-    cache is keyed on ``id(matvec)``.
-
-    The LADDER matvec is built with ``ladder_rung_slots=True``: its direct
-    rung consumes four extra operands — the PHYSICAL (rolled, un-flipped) psi
-    arrays — which ``build_finite_q_data`` supplies and
-    ``bse_feast.ladder_matvec_operands`` threads.  On a raw payload (the q=0
-    identity/oracle cells) the fallback aliases the density arrays, which ARE
-    physical there.  The engine call must pass
-    ``operands_fn=ladder_matvec_operands`` to match (claim 0215's defect —
-    the rung on conjugated arrays — is structurally unreachable this way).
+    The bare RPA default retains its original representation; explicit
+    physical payloads also permit include_w=False for the RPA identity gate.
+    W_R depends on k-k' only and is prepared once, outside the q sweep.
     """
-    if not include_w:
+    if not include_w and not data.get("physical_branches", False):
         return _build_rpa_resolvent(mesh_xy, data)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
-    ensure_W_R(data, include_W=True, mesh_xy=mesh_xy)
+    if not data.get("physical_branches", False):
+        data.update(build_finite_q_data(data, (0, 0, 0), mesh_xy, physical_branches=True))
+    ensure_W_R(data, include_W=include_w, mesh_xy=mesh_xy)
     # ``fuse_ladder_rung`` is a COST switch, not a physics one: it sums the two
     # rung T intermediates of each block row before the (mu, nu, s, s, k) FFT
     # chain instead of after, so the matvec runs that chain twice instead of
     # four times (bse_ring_comm._impl_core_fused).  Same operator to rounding;
     # False is the A/B arm.
     matvec = build_bse_ring_matvec_full(
-        mesh_xy, nkx, nky, nkz, include_W=True, screening=True,
-        ladder_rung_slots=True, fuse_ladder_rung=fuse_ladder_rung)
+        mesh_xy, nkx, nky, nkz, include_W=include_w, screening=True,
+        physical_branches=True, fuse_ladder_rung=fuse_ladder_rung)
     diag_h = build_preconditioner_diagonal_sharded(
-        data, mesh_xy, include_W=True, use_tda=False)
+        data, mesh_xy, include_W=include_w, use_tda=False)
     gen = build_realspace_random_transition_generator(
         mesh_xy, nkx, nky, nkz, int(data["n_cond_pad"]), int(data["n_val_pad"]))
     snapshot = build_density_snapshot_operator(
@@ -429,9 +103,9 @@ def refuse_chain_path(include_w: bool) -> None:
         "holds for the RPA screening operator (A = D + V, B = V) and is broken "
         "by the ladder: A - B = D - W_d + W_d^B. Using the chain here would "
         "silently evaluate a DIFFERENT operator at every frequency, not an "
-        "approximation of this one. The hybrid row also rules out the SDY "
-        "product form: its un-conjugated ring dyad is not the "
-        "complex-symmetric B required by SDY's real-linear F/G actions. The "
+        "approximation of this one. Physical finite-q R/A states also have "
+        "distinct vertices and diagonals; they cannot be identified in a "
+        "single N-dimensional real-linear action. The "
         "correct structural certificate is full-space eta-pseudo-Hermiticity "
         "(eta H = (eta H)^dag, eta = diag(I,-I)), not the N-dimensional SDY "
         "kappa metric. A reusable frequency basis must retain the full 2N "
@@ -566,9 +240,11 @@ def _plan_probe_chunk(context, requested, *, n_pad, carry_bytes, stack_bytes):
     scalar = jax.ShapeDtypeStruct((), jnp.complex128)
     pair_shape = (nc, nv, nk)
     one = jax.ShapeDtypeStruct((2, 1, *pair_shape), jnp.complex128, sharding=sh.X_full)
-    seed_program = _get_probe_rhs_program(context["gen"], sh, nk)
+    physical = bool(dq.get("physical_branches", False))
+    seed_program = _get_probe_rhs_program(context["gen"], sh, nk, physical_branches=physical)
     solver = _get_block_gmres_solver(context["matvec"], sh,
-        context["max_iter"], context["tol"], jnp.complex128, with_slope=slope)
+        context["max_iter"], context["tol"], jnp.complex128, with_slope=slope,
+        retain_branches=physical)
     psi = lambda key, layout: jax.ShapeDtypeStruct(
         dq[key].shape, dq[key].dtype, sharding=layout)
     v = abstract(dq["V_q0"] if context["snapshot_v"] is None else context["snapshot_v"])
@@ -599,15 +275,23 @@ def _plan_probe_chunk(context, requested, *, n_pad, carry_bytes, stack_bytes):
         chunk = int(units)*py
         rhs = jax.ShapeDtypeStruct((2, chunk, *pair_shape), jnp.complex128,
                                    sharding=sh.X_full)
-        readout = jax.ShapeDtypeStruct((chunk, *pair_shape), jnp.complex128, sharding=sh.X)
+        readout = (rhs if physical else jax.ShapeDtypeStruct(
+            (chunk, *pair_shape), jnp.complex128, sharding=sh.X))
         probes = jax.ShapeDtypeStruct((chunk, n_pad), jnp.float64, sharding=sh.S_k0)
+        seed_args = ((psi("psi_c_A_X", sh.psi_x), psi("psi_v_A_X", sh.psi_x))
+                     if physical else ())
         seed = seed_program.lower(probes, psi("psi_c_X", sh.psi_x),
-                                  psi("psi_v_X", sh.psi_x), abstract(dq["V_q0"])).compile()
+                                  psi("psi_v_X", sh.psi_x), abstract(dq["V_q0"]),
+                                  *seed_args).compile()
         solve = solver.lower(rhs, diag, scalar, args, deflation).compile()
-        snap = context["snapshot"].lower(readout, psi("psi_c_Y", sh.psi_y),
-                                         psi("psi_v_Y", sh.psi_y), v).compile()
+        project = (_get_branch_projection_program(context["snapshot"], sh)
+                   if physical else context["snapshot"])
+        project_args = ((psi("psi_c_A_Y", sh.psi_y), psi("psi_v_A_Y", sh.psi_y))
+                        if physical else ())
+        snap = project.lower(readout, psi("psi_c_Y", sh.psi_y),
+                             psi("psi_v_Y", sh.psi_y), v, *project_args).compile()
         rhs_bytes = 32*chunk*nc*nv*nk//p
-        readout_bytes, tile_bytes = rhs_bytes//2, 16*n_pad*chunk//p
+        readout_bytes, tile_bytes = rhs_bytes if physical else rhs_bytes//2, 16*n_pad*chunk//p
         snap_new = compiled_new_bytes(snap)
         nread = 3 if slope else 1
         moment_carry = 4*tile_bytes if moments else 0
@@ -779,17 +463,9 @@ def sweep_q_wedge(
     # the finite-q ``V_q0``, so it genuinely is per-q.
     if route not in ("plain", "lift"):
         raise ValueError(f"route must be 'plain' or 'lift', got {route!r}")
-    # The ladder's anti-resonant channel is the conj-pattern TRS fold of the
-    # -q de-excitation space, exact only in the psi(-k) = conj(psi(k)) gauge
-    # — enforce it (pure basis choice; every gauge-invariant object is
-    # untouched, which is why the RPA arm below skips it and stays
-    # bit-identical).  Measured: without it the FIRST-PRINCIPLES dense ladder
-    # operator itself breaks W(-q) = conj(W(q)) at 1.043e-03 (2026-08-16).
-    # The gauge and the engine build are eager ring-layout stages; the
-    # payload goes back to 2-D below, after them.
+    # Explicit physical R/A states require no TRS gauge construction or
+    # host gathering. The old folded RPA path remains the control.
     data = _psi_ring_view(data)
-    if include_w:
-        data = enforce_trs_pair_gauge(data, mesh_xy)
     matvec, _, gen, snapshot, sh = build_ladder_resolvent(
         mesh_xy, data, include_w=include_w)
     # ROUTE A (the Woodbury ring lift), as two constant tiles and nothing else.
@@ -818,8 +494,10 @@ def sweep_q_wedge(
     z_list_ry = np.asarray(z_list_ry, dtype=np.complex128)
     if deflation_rank is None:
         deflation_rank = LADDER_DEFLATION_RANK if include_w else 0
-    op_fn = ladder_matvec_operands if include_w else matvec_operands
-    moment_actions = (_get_block_moment_actions(matvec, sh, jnp.complex128)
+    physical = bool(data.get("physical_branches", False))
+    op_fn = ladder_matvec_operands if physical else matvec_operands
+    moment_actions = (_get_block_moment_actions(matvec, sh, jnp.complex128,
+                                               retain_branches=physical)
                       if with_moments else None)
     data = _psi_at_rest_2d(data, mesh_xy)
     probe_planned = False
@@ -827,20 +505,10 @@ def sweep_q_wedge(
     def _q_payload(iq, qv):
         q = (int(qv[0]), int(qv[1]), int(qv[2]))
         dq = _psi_at_rest_2d(
-            build_finite_q_data(_psi_ring_view(data), q, mesh_xy), mesh_xy)
-        if include_w and "psi_c_W_X" not in dq:    # pragma: no cover
-            raise RuntimeError(
-                "sweep_q_wedge built a ladder_rung_slots engine but "
-                "build_finite_q_data stopped supplying the physical rung "
-                "operands (psi_*_W_*); the rung would fall back to the "
-                "conjugated density arrays (claim 0215's defect class).")
-        # The preconditioner reads the flipped psi arrays; the rung's diagonal
-        # is real (|psi_c|^2 W |psi_v|^2 with W_R real), so the flip is inert
-        # here and no compensation is needed.
-        # The lift's preconditioner is the SAME builder on the ring-less
-        # payload: with the ring gone the exchange contraction drops out and
-        # what is left is Delta_E - W_d (or Delta_E alone at include_w=False,
-        # where z - H_0 IS the operator and the solve is exact in ONE step).
+            build_finite_q_data(_psi_ring_view(data), q, mesh_xy,
+                                physical_branches=physical), mesh_xy)
+        # Each physical branch has its own exact diagonal. The lifted
+        # solve removes only the Hartree tile from that same operator.
         solve_dq = dict(dq)
         if lift:
             solve_dq["V_q0"] = zero_v
@@ -927,7 +595,8 @@ def sweep_q_wedge(
 
 #: The psi carriers of the ring matvec payload: band axis 1, mu last.
 _PSI_KEYS = ("psi_c_X", "psi_c_Y", "psi_v_X", "psi_v_Y",
-             "psi_c_W_X", "psi_c_W_Y", "psi_v_W_X", "psi_v_W_Y")
+             "psi_c_W_X", "psi_c_W_Y", "psi_v_W_X", "psi_v_W_Y",
+             "psi_c_A_X", "psi_c_A_Y", "psi_v_A_X", "psi_v_A_Y")
 
 
 def _psi_at_rest_2d(d: dict, mesh_xy: Mesh) -> dict:
@@ -1057,7 +726,8 @@ def compute_ladder_head(
         velocity_cv, delta_cv,
         n_cond_pad=int(data["n_cond_pad"]),
         n_val_pad=int(data["n_val_pad"]))
-    head_data = _psi_ring_view(data)
+    head_data = build_finite_q_data(_psi_ring_view(data), (0, 0, 0), mesh_xy,
+                                    physical_branches=True)
     head_op = build_head_operator(mesh_xy, head_data, include_w=include_w)
     return solve_head_tensor(
         head_op, head_data, d_pair, z_list_ry, pref=float(head_pref),

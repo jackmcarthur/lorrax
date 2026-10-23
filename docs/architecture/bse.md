@@ -492,12 +492,25 @@ and diagonal terms remain batched; their smaller trial/centroid buffers and
 the returned trial block still grow with the probe count.
 
 The rung uses the same k-convolution router and band-projection owner as the
-optical/exciton kernels. Its density-response lower row preserves the
-unconjugated Hartree dyad and conjugated direct rung. This differs from the
-optical non-TDA row. Reusing the complete optical applier would also inherit
-its full-window trial gather; a common blocked encoder must bound that
-gather and preserve the distributed decode before it can serve large-band
-screening calculations.
+optical/exciton kernels. At stored +q the physical branches are
+R=(c,k+q;v,k) and A=(v,k+q;c,k). Their distinct density vertices are
+$F_R=\overline{\psi_{c,k+q}}\psi_{v,k}$ and
+$F_A=\overline{\psi_{v,k+q}}\psi_{c,k}$. The source is
+$[F_R;-F_A]v$, the readout is $v[F_R^\dagger,F_A^\dagger]$, and
+all four Hartree blocks are their outer product. Every direct block uses
+$\overline{\psi_{m_I}}\psi_{m_J}W\psi_{n_I}\overline{\psi_{n_J}}$.
+One summed ket field and one k convolution serve both bra decodes; the anti
+band owners move through the existing transpose-peer collective. This
+requires neither a real-orbital gauge nor a Kramers sewing matrix.
+
+The solver retains both branches through values, slopes and H-power moments
+until this readout. For the macroscopic velocity dipole $d=v_{cv}/\Delta$,
+the matching source is $[d;\bar d]$ and readout $[d^\dagger;-d^T]$,
+with prefactor $2/(\Omega N_k n_{spin}n_{spinor})$. The consumer restores
+the macroscopic head once. The backend convention is `physical-ra-v1`;
+persisted response banks from the former hybrid convention must be rebuilt.
+The unchanged folded RPA body remains an independent control; the explicit
+physical zero-direct-rung response matches its Dyson result at every q.
 
 ## Refusals
 
@@ -563,6 +576,3 @@ screening calculations.
   CLI.
 - `compute_mode = mpa` with `screening_diagrams = w_bse` refuses at setup
   (`GATE parent_screening_diagrams`, `file_io/restart_bundle.py:4369`).
-- The `w_bse` ladder refuses a degenerate TRIM block whose Kramers misclosure
-  exceeds 1e-8 of its scale (`GATE trs_gauge_block_not_theta_closed`,
-  `bse/bse_w_exact.py:538`).
