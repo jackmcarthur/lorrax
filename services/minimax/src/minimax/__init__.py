@@ -65,9 +65,8 @@ _SOLVER_NAMES = (
 )
 
 # Positive minimax fitting for complex-frequency resolvents, over the
-# analytic sinc rule in ``sector``.  A production surface: the pane/slab
-# Laplace route reaches it as ``minimax.fit_damped_reciprocal``
-# (``gw/mpa/sigma_windows.py::_laplace_nodes``).  SciPy, so lazy.
+# analytic sinc rule in ``sector``.  No production caller: the Sigma windows
+# take ``analytic_box_rule``.  Kept public for experiments.  SciPy, so lazy.
 _FREQUENCY_FIT_NAMES = (
     "DampedReciprocalFit", "fit_damped_reciprocal",
 )
