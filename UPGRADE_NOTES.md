@@ -5,6 +5,13 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-23 — GW: the tangential W pole budget is 1.0 N_mu (was 1.8)
+
+- Production tier: at most ceil(1.0 N_mu) poles per parent (`pole_budget_fraction`, `gw/tangential_recipe.py`).
+  Owner ruling 2026-10-22 (CODE_CHANGES 36): 1.0 N_mu was accurate in every case tried.
+- The recipe tag is now `shared_real_pole_v1_r5`, so a tangential restart written with the 1.8 budget is rebuilt,
+  not reused.
+
 ## 2026-10-22 — GW: `compute_mode = tangential`; BSE: BerkeleyGW output files, srlr only
 
 - **Decks.** The tangential W model is `compute_mode = tangential`. The

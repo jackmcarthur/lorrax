@@ -19,7 +19,7 @@ from common.log import get_logger, record
 log = get_logger(__name__)
 
 
-RECIPE_VERSION = "shared_real_pole_v1_r4"
+RECIPE_VERSION = "shared_real_pole_v1_r5"
 GATE_VERSION = "shared_real_pole_gates_v1_r3b"
 RECEIPT_SCHEMA = "lorrax.tangential.receipt.v1"
 ROLE_CODES = {"line": 0, "imaginary": 1, "infinity": 2, "held_line": 3, "held_imaginary": 4}
@@ -60,12 +60,12 @@ shared_real_pole_v1_r3b = {
     # (line + imaginary; held and the M1/M3 block are extra) and at most sample_cap bank
     # samples including the held ones; between the two, the line count is the strip law
     # of support_line_count; at most N_mu/16 right singular directions per line support;
-    # at most 1.8 N_mu retained Gram directions, the pole count K per parent.
+    # at most 1.0 N_mu retained (owner ruling 2026-10-22; was 1.8) Gram directions, the pole count K per parent.
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
                    "infinity_width_fraction": 0.125,
                    "bank_rule_tolerance": 1.0e-8, "fitted_support_count": 18,
                    "sample_cap": 40,
-                   "line_direction_cap_fraction": 0.0625, "pole_budget_fraction": 1.8},
+                   "line_direction_cap_fraction": 0.0625, "pole_budget_fraction": 1.0},
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
                 "infinity_width_fraction": 0.0625,
                 "line_count": 8, "imaginary_count": 2,
@@ -1459,7 +1459,7 @@ def resolve_tangential_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'support_top': 'largest line site, eV; read by the Sigma planner',
         'support_reads': 'absolute eV extent of the requested reads (E_in +/- the plan pad)',
         'line_direction_cap': 'production ceil(n/16) right singular directions per line support (whole multiplets); relaxed none',
-        'pole_budget': 'production ceil(1.8 n) retained Gram directions per parent (largest first); relaxed none',
+        'pole_budget': 'production ceil(1.0 n) retained Gram directions per parent (largest first); relaxed none',
         'imaginary': 'log-spaced u_min..u_max; round(log(16*(L/u_min)^2)*log(4000)/(2*pi^2)), min2; tier width ceil(f*n)',
         'held_line': 'adjacent-support midpoint nearest 25%/65% of the line interval; lower-index tie',
         'held_imaginary': 'geometric midpoint of first/last adjacent imaginary pair',
