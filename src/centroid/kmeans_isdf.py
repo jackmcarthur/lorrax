@@ -725,6 +725,14 @@ def _pick_c_block(n_c: int, preferred: int = _DEFAULT_C_BLOCK) -> int:
     return min(preferred, n_c)
 
 
+@partial(jax.jit, static_argnames=('n_c',))
+def _weighted_random_indices(rho_flat, key, *, n_c):
+    """Draw the existing weighted seeds in one compiled program."""
+    probability = rho_flat / jnp.sum(rho_flat)
+    return jax.random.choice(
+        key, rho_flat.shape[0], shape=(n_c,), p=probability, replace=False)
+
+
 def weighted_kmeans_jax(
     avec,
     rho,
@@ -797,11 +805,8 @@ def weighted_kmeans_jax(
                 mesh=mesh, mesh_axis=mesh_axis,
             )
         else:
-            rho_p = rho_flat / jnp.sum(rho_flat)
-            idx = jax.random.choice(
-                jax.random.PRNGKey(seed), rho_flat.shape[0],
-                shape=(N_c,), p=rho_p, replace=False,
-            )
+            idx = _weighted_random_indices(
+                rho_flat, jax.random.PRNGKey(seed), n_c=N_c)
             centroids = dist.grid_points(positions, idx, mesh, mesh_axis)
         centroids.block_until_ready()
 
