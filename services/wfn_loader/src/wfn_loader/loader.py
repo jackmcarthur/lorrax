@@ -1114,7 +1114,7 @@ class WfnLoader:
                 f"({len(k_idxs)}, 3); got {out.shape}.")
         return np.ascontiguousarray(out)
 
-    def gvecs(self, *, k: KSpec = "full_bz") -> np.ndarray:
+    def gvecs(self, *, k: KSpec = "full_bz", cache: bool = True) -> np.ndarray:
         """Return ``(n_k, ngkmax, 3)`` int32 — G-vector list per k, padded
         beyond logical ``ngk`` with the FFT-box **pad sentinel**.
 
@@ -1133,11 +1133,13 @@ class WfnLoader:
         two on-disk layouts (ragged ψ, ngkmax-rectangular ζ) differ only
         in how they are read, not in what they become.
 
-        Cached per k-set.
+        Cached per k-set by default. ``cache=False`` bypasses cache lookup
+        and insertion for bounded requests whose tables should die with
+        their consumer.
         """
         from common.gvec_fft_box import pad_gvecs_to_sentinel
         key = self._k_cache_key(k)
-        if key in self._gvecs_cache:
+        if cache and key in self._gvecs_cache:
             return self._gvecs_cache[key]
 
         k_idxs, unfold = self._resolve_k(k)
@@ -1178,13 +1180,14 @@ class WfnLoader:
         out, _ = pad_gvecs_to_sentinel(
             rows, tuple(int(s) for s in self.fft_grid),
             ngkmax=int(self.ngkmax))
-        self._gvecs_cache[key] = out
+        if cache:
+            self._gvecs_cache[key] = out
         return out
 
-    def ngk_valid(self, *, k: KSpec = "full_bz") -> np.ndarray:
+    def ngk_valid(self, *, k: KSpec = "full_bz", cache: bool = True) -> np.ndarray:
         """Per-k logical ngk (without pad).  Host numpy int32."""
         key = self._k_cache_key(k)
-        if key in self._ngk_valid_cache:
+        if cache and key in self._ngk_valid_cache:
             return self._ngk_valid_cache[key]
         k_idxs, unfold = self._resolve_k(k)
         if not unfold:
@@ -1193,7 +1196,8 @@ class WfnLoader:
             sym = self._ensure_sym()
             ibz_per_full = np.asarray(sym.irr_idx_k, dtype=np.int32)
             out = np.asarray(self.ngk[ibz_per_full[k_idxs]], dtype=np.int32)
-        self._ngk_valid_cache[key] = out
+        if cache:
+            self._ngk_valid_cache[key] = out
         return out
 
     def get_gvec_nk(self, ik: int) -> np.ndarray:
@@ -1209,7 +1213,7 @@ class WfnLoader:
     # ------------------------------------------------------------------
     # G-flat → FFT-box index (zero-sentinel gather table)
     # ------------------------------------------------------------------
-    def box_index(self, *, k: KSpec = "full_bz") -> np.ndarray:
+    def box_index(self, *, k: KSpec = "full_bz", cache: bool = True) -> np.ndarray:
         """Return ``(n_k, ngkmax)`` int32 — the per-k sphere index.
 
         Entry ``[k, g]`` is the flat C-order FFT-box cell of sphere slot
@@ -1220,19 +1224,21 @@ class WfnLoader:
         table exists (loader tables 2026-09-23; the retired dense gather
         table cost ``n_k·n_rtot·4`` bytes, 0.80 GB at VI3 12×12).
 
-        Cached per (k-set, ``self.fft_grid``).
+        Cached per (k-set, ``self.fft_grid``) by default. ``cache=False``
+        also bypasses the nested G-vector and valid-length caches.
         """
         cache_key = ("box_index", *self._k_cache_key(k),
                      tuple(int(s) for s in self.fft_grid))
-        if cache_key in self._gvecs_cache:
+        if cache and cache_key in self._gvecs_cache:
             return self._gvecs_cache[cache_key]
 
         from common.gvec_fft_box import build_sphere_box_index
 
         g_index = build_sphere_box_index(
-            self.gvecs(k=k), tuple(int(s) for s in self.fft_grid),
-            int(self.ngkmax), ngk_valid=self.ngk_valid(k=k))
-        self._gvecs_cache[cache_key] = g_index
+            self.gvecs(k=k, cache=cache), tuple(int(s) for s in self.fft_grid),
+            int(self.ngkmax), ngk_valid=self.ngk_valid(k=k, cache=cache))
+        if cache:
+            self._gvecs_cache[cache_key] = g_index
         return g_index
 
     def box_index_dev(
@@ -1241,6 +1247,7 @@ class WfnLoader:
         k: KSpec = "full_bz",
         mesh: "Mesh | None" = None,
         sharding: "NamedSharding | PartitionSpec | None" = None,
+        cache: bool = True,
     ) -> "jax.Array":
         """Return ``box_index(k=k)`` — the ``(n_k, ngkmax)`` sphere index — as
         a REPLICATED ``jax.Array`` on ``mesh``, placed once per ``(k, mesh)``.
@@ -1272,6 +1279,10 @@ class WfnLoader:
             (the only layout used in production; centralised here so
             future shape changes (e.g. 5-D ψ for bispinor) update one
             site instead of three).
+        cache : bool, optional
+            Default True reuses the loader-owned host/device tables.
+            False bypasses lookup and insertion at every nested table
+            accessor, so bounded request tables are owned by the caller.
         """
         from jax.sharding import NamedSharding, PartitionSpec as P
         mesh = mesh if mesh is not None else self._mesh
@@ -1284,7 +1295,7 @@ class WfnLoader:
         # built once at top-of-main and threaded through every kernel).
         cache_key = ("box_index_dev", *self._k_cache_key(k),
                      tuple(int(s) for s in self.fft_grid), id(mesh))
-        if cache_key in self._gvecs_dev_cache:
+        if cache and cache_key in self._gvecs_dev_cache:
             return self._gvecs_dev_cache[cache_key]
         # Resolve the requested sharding (default = replicated 4-axis).
         if sharding is None:
@@ -1300,9 +1311,10 @@ class WfnLoader:
         # P=64, 14.5 GB projected at P=144 (scorecard Y.3, the larger of
         # the two "P-LINEAR loader allgathers").  It was the single
         # biggest collective in a ζ-fit at 276 centroids.
-        g_idx_np = self.box_index(k=k)
+        g_idx_np = self.box_index(k=k, cache=cache)
         dev = device_put_process_local(g_idx_np, sharding)
-        self._gvecs_dev_cache[cache_key] = dev
+        if cache:
+            self._gvecs_dev_cache[cache_key] = dev
         return dev
 
     # ------------------------------------------------------------------
