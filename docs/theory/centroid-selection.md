@@ -218,6 +218,14 @@ only on one axis of a 4x4 mesh occupies 31.5 GB per rank. Two such faces
 already exceed a 40 GB GPU. Streaming or a different all-rank layout is
 necessary before claiming that this candidate count fits.
 
+The tiled candidate Gram stores each tile with one unconditional dynamic
+update of its donated destination. Static row and column edge epilogues
+preserve the padded tile arithmetic and column-outer/row-inner schedule.
+Keeping the destination outside a tail conditional avoids copying the
+entire local Gram at every tile. The complex scalar, spinor and transverse feature oracle
+in `tests/test_gram_tiled_alias.py` checks partial edges, exact tiles and
+oversized tiles against an independent direct transition-feature sum.
+
 ## Decision criteria
 
 First separate input reads, diagonal construction, Lloyd assignment/update,
