@@ -99,6 +99,8 @@ At eager stage boundaries, `distrib_la.ensure_sharding` preserves a concrete
 operand already in the required layout: an eager `with_sharding_constraint`
 can copy the entire operand even when its sharding matches. Inside a `jit`,
 the helper retains the constraint; a genuinely different layout still reshards.
+The PPM wrapper likewise adopts matching pole frequencies, even/odd residues,
+validity masks and Wc(0) directly from the producer on its existing face.
 
 CPU compiler heaps are separate from that live-array count. A cold P121
 1 MiB all-to-all compile left 30.39 GiB of node PSS, although glibc had
