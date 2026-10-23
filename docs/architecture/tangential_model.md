@@ -304,6 +304,11 @@ are [tangential W for bispinor sectors](bispinor_tangential_w.md).
 ## 6 Execution
 
 **Route.** `constructor_route` admits one route before the first bank read.
+The face batch search first tests the existing resident-only selection
+quote. If that already exceeds room, it skips the native workspace query
+and its otherwise unused compiled eigh stack. Every potentially fitting
+width, and the final one-parent fallback, keeps the full original price;
+the selected batch and executable admission are unchanged.
 **Local parent rounds** — one whole parent per rank, batch layout
 `P(('x','y'), ...)` — whenever the complete selection stack and the
 conservative reduction pencil (`constructor_side_upper_bound`) fit the

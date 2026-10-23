@@ -702,6 +702,16 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, comp
                               workspace_bytes_per_rank=sum(native.values()), concurrent_with=upstream)
     while True:
         budget.batch_width, budget.program_bytes = width, None
+        if selection is not None and width > 1:
+            # Workspace is nonnegative. A resident-only rejection cannot be
+            # rescued by compiling the selection's standalone eigh stack.
+            price = budget.resident_quote(side, phase='selection', **selection)
+            optimistic = ledger.preview(
+                resident_bytes_per_rank=price['resident_bytes_per_rank'],
+                workspace_bytes_per_rank=0, concurrent_with=upstream)
+            if optimistic['device_budget_status'] != 'PASS':
+                width -= 1
+                continue
         picked = None if selection is None else row('selection', **selection)
         if picked is not None and picked['device_budget_status'] != 'PASS' and width > 1:
             width -= 1
