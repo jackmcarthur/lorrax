@@ -451,8 +451,8 @@ def persist_w0_and_head(
     is.  It has two callers: the ``screening_diagrams = w_bse`` stage
     helper, whose first leg computes the RPA W(0) that the ladder kernel
     consumes and persists THAT — under every mode, MPA included — and the
-    one-shot tangential MPA route, whose W is the model evaluated at
-    ω = 0 (``gw.screening.restart_static_w``).  It is a NAMED OPT-IN rather
+    one-shot tangential route, whose W is a static Dyson solve at ω = 0
+    (``gw.screening.restart_static_w``).  It is a NAMED OPT-IN rather
     than a relaxation of the dynamic-mode refusal below, because the two say
     different things.  The
     refusal says "this mode's W was not sampled at {0, probe}, so do not

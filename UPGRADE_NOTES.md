@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-23 — GW: a one-shot tangential restart carries `W0_lr`; its W0 is the static Dyson W(0)
+
+- A one-shot `compute_mode = tangential` run (scalar, insulator) now persists as `W0_qmunu` the W of one
+  extra static χ₀ build and Dyson solve at ω = 0 (the `cohsex` static path), and writes the srlr channels
+  `W0_lr` from the same χ₀, so a `kgrid_fine` BSE runs on it instead of stopping at
+  `GATE srlr_restart_channels`. The log says "W0 for BSE: static Dyson solve at omega = 0".
+- Results that move: the stored W0 body (before: the tangential model evaluated at ω = 0; 13.6 % of max|W0|
+  apart on the H2 fixture, ~1e-5 on CrI3), so BSE on a new tangential restart moves too. The W0 body and
+  `W0_lr` equal a `cohsex` restart's bit for bit. Σ, QP tables and the stored head are unchanged.
+- Cost: one static screening stage (χ₀ on the static minimax rule + one Dyson solve on the q wedge) when the
+  restart is written. QSGW tangential and the bispinor tangential routes still store the model W0 without
+  `W0_lr`.
+
 ## 2026-10-23 — SLATE removed: ROCm LU now one device within the room, FFI ABI 11
 
 - **Removed.** The SLATE backend (`src/ffi/cpp/slate/`, `distrib_la._slate`), its
