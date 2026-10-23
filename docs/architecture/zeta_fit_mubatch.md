@@ -193,7 +193,12 @@ for each G tile t:   ζ_t    = C⁻¹ Z_t                 through the seam, at t
 ```
 
 `ZetaG.write_file` is the same pass without V and the shell: it forms and
-writes ζ only, for a file consumer. The factor sits on its q owners
+writes ζ only, for a file consumer. A fresh charge fit defers its file payload
+to the first `contract_v` pass, so the persisted ζ is exactly the ζ used to
+form V, even if separately compiled applications of C⁺ round differently.
+Its header/dataset stay incomplete until the tile writer closes; only a
+successful, untruncated pass then sets `zeta_is_done` and stamps the fit
+provenance. Reuse contracts the same saved ζ. The factor sits on its q owners
 ([factor and back-solve](zeta_fit_face_psi_cct.md#factor-and-back-solve)), so
 Z tiles are q-local, `P(('x','y'), None, None)`, and V accumulates on the q
 owner. Each finished object (V, the shell, or a ζ tile for the file) leaves
