@@ -31,9 +31,10 @@ def fixture(*, noise=1.e-6, trs=True, half=False):
         anti = rows.astype(bool)
         return (np.where(anti[..., None, None], -np.eye(3, dtype=int), np.eye(3, dtype=int)),
                 np.zeros(rows.shape+(3,)), anti)
+    from symmetry_maps import SymMaps
     sym = NS(trs_allowed=trs, q_irr_full_idx=np.arange(len(q)),
-        active_symmetry_rows=np.arange(2 if trs else 1), operation_rows=operation_rows,
-        reciprocal_phase=lambda _row, carriers: np.ones(len(carriers), complex))
+        active_symmetry_rows=np.arange(2 if trs else 1), operation_rows=operation_rows)
+    sym.reciprocal_phase = lambda row, carriers: SymMaps.reciprocal_phase(sym, row, carriers)
     tables = NS(irr_idx_q=np.arange(len(q)), sym_idx_q=np.zeros(len(q), int),
                 n_sym_spatial=1)
     src = NS(q_tables=tables, q_full=q, q_stored=q, kgrid=(len(q), 1, 1), sym=sym,

@@ -709,7 +709,7 @@ def fixed_q_zeta_basis(src, iq, Z, *, mesh):
         padded = np.full(Z.shape[2], Z.shape[2], dtype=np.int32)
         padded[:ngk] = slots
         phases = np.zeros(Z.shape[2], dtype=np.complex128)
-        phases[:ngk] = phase
+        phases[:ngk] = 1.0 if phase is None else phase
         return _fourier_partner_program(mesh)(Z, jnp.asarray(padded), jnp.asarray(phases))
 
     return policy.project_fixed_q(Z, full, antiunitary_partner=partner)
