@@ -343,6 +343,8 @@ from .bse_w_exact import (
     build_finite_q_data,
     enforce_trs_pair_gauge,
     _symmetry_tables,
+    _get_block_moment_actions,
+    _project_screening_actions,
 )
 from common.collectives import gather_to_host
 
@@ -504,6 +506,9 @@ class WLadderWedge:
     #: the resolvent), so consumers must restore only the omitted macroscopic
     #: v head and must not apply a head/body Schur fold again.
     head_result: object | None = None
+    #: Optional exact response fields. Slopes/reflected values have the wc
+    #: shape; M0..M3 have (nq, mu_pad, mu_pad) and do not carry a z axis.
+    response_fields: dict | None = None
 
 
 def _identity_probe_blocks(n_logical: int, n_pad: int, chunk: int):
@@ -537,6 +542,8 @@ def sweep_q_wedge(
     deflation_rank: Optional[int] = None,
     z_outer: bool = False,
     on_z_done: Optional[Callable] = None,
+    with_slope: bool = False,
+    with_moments: bool = False,
 ):
     """Walk the q-wedge x probe-chunk x z-list with ONE compiled engine.
 
@@ -660,6 +667,8 @@ def sweep_q_wedge(
     if deflation_rank is None:
         deflation_rank = LADDER_DEFLATION_RANK if include_w else 0
     op_fn = ladder_matvec_operands if include_w else matvec_operands
+    moment_actions = (_get_block_moment_actions(matvec, sh, jnp.complex128)
+                      if with_moments else None)
     data = _psi_at_rest_2d(data, mesh_xy)
 
     def _q_payload(iq, qv):
@@ -710,13 +719,17 @@ def sweep_q_wedge(
             # 2026-08-16) — and free on the ladder arm, where the matvec
             # dwarfs it.
             rhs = build_probe_rhs(G, _psi_ring_view(dq), gen, sh)
+            moments = {}
+            if with_moments and any(iz == 0 for iz, _z in z_items):
+                moments = _project_screening_actions(
+                    moment_actions(rhs, op_fn(dq)), dq, snapshot, view=_psi_ring_view)
             for iz, z in z_items:
                 if deflation_rank > 0 and iz not in defl_by_z:
                     defl_by_z[iz] = _deflation_for(
                         matvec, diag_hq, complex(z),
                         op_fn(solve_dq if lift else dq), rhs,
                         rank=int(deflation_rank))
-                W_tile, resids, iters = apply_screening_resolvent_block(
+                result = apply_screening_resolvent_block(
                     G, complex(z), dq, matvec, diag_hq, gen, snapshot, sh,
                     max_iter=gmres_max_iter, tol=gmres_tol, return_iters=True,
                     rhs=rhs,
@@ -724,9 +737,17 @@ def sweep_q_wedge(
                     snapshot_v=(eye_v if lift else None),
                     operands_fn=op_fn,
                     deflation=defl_by_z.get(iz),
-                    view=_psi_ring_view)
-                on_result(iq, q, iz, complex(z), c0, n_real,
-                          W_tile, resids, iters)
+                    view=_psi_ring_view, with_slope=with_slope)
+                W_tile, resids, iters = result[:3]
+                if with_slope or with_moments:
+                    fields = dict(result[3]) if with_slope else {}
+                    if iz == 0:
+                        fields.update(moments)
+                    on_result(iq, q, iz, complex(z), c0, n_real,
+                              W_tile, resids, iters, fields)
+                else:
+                    on_result(iq, q, iz, complex(z), c0, n_real,
+                              W_tile, resids, iters)
 
     if z_outer:
         for iz, z in enumerate(z_list_ry):
@@ -842,6 +863,48 @@ def _deflation_for(matvec, diag_h, z, operands, rhs, *, rank: int):
     return defl
 
 
+def compute_ladder_head(
+    restart_path, z_list_ry, mesh_xy, *, input_file, head_dipole_path,
+    head_n_occ, head_pref, gmres_tol, gmres_max_iter, include_w=True, data=None,
+):
+    """Gamma-only micro-reducible tensor on the body's exact H backend.
+
+    Head fits can request their own small frequency grid without solving any
+    density-space body probes. Pass the current loader payload to reuse it;
+    otherwise the same full transition-window loader supplies the operator.
+    The existing head result retains all solver and dipole/energy diagnostics.
+    """
+    if data is None:
+        data = load_bse_data_from_restart_sharded(
+            restart_path, n_val=10**9, n_cond=10**9, mesh_xy=mesh_xy,
+            input_file=input_file, inject_head=False, load_v_full=True)
+    from .absorption_common import (slice_dipole_to_bse_window)
+    from file_io.restart_bundle import (load_dipole_h5)
+    from .head_resolvent import (
+        build_head_dipole, build_head_operator, solve_head_tensor)
+
+    from .bse_window import _parse_wfn_path
+    dipole_cart, delta_e, _ = load_dipole_h5(
+        head_dipole_path, wfn_path=_parse_wfn_path(input_file))
+    n_val = int(data["n_val"])
+    n_cond = int(data["n_cond"])
+    d_alpha, delta_cv = slice_dipole_to_bse_window(
+        dipole_cart, delta_e, int(head_n_occ), n_val, n_cond)
+    velocity_cv = np.asarray(d_alpha) * np.asarray(delta_cv)[None]
+    d_pair = build_head_dipole(
+        velocity_cv, delta_cv,
+        n_cond_pad=int(data["n_cond_pad"]),
+        n_val_pad=int(data["n_val_pad"]))
+    head_data = _psi_ring_view(data)
+    head_op = build_head_operator(mesh_xy, head_data, include_w=include_w)
+    return solve_head_tensor(
+        head_op, head_data, d_pair, z_list_ry, pref=float(head_pref),
+        max_iter=int(gmres_max_iter), tol=float(gmres_tol),
+        arm=("micro_reducible_bse" if include_w
+             else "micro_reducible_rpa_resolvent"),
+        delta_cvk=delta_cv)
+
+
 def compute_wc_qwedge(
     restart_path: str,
     z_list_ry,
@@ -859,6 +922,8 @@ def compute_wc_qwedge(
     head_pref: Optional[float] = None,
     deflation_rank: Optional[int] = None,
     on_z: Optional[Callable] = None,
+    with_slope: bool = False,
+    with_moments: bool = False,
 ) -> WLadderWedge:
     """Ladder ``W(z) - v`` bodies for every irreducible q and every requested z.
 
@@ -870,6 +935,20 @@ def compute_wc_qwedge(
     tile.  The resident set is one z's wedge instead of the
     ``(nz, nq, mu, mu)`` stack, and the returned wedge carries ``wc=None``.
     psi rests 2-D (:func:`sweep_q_wedge`).
+
+    ``with_slope`` supplies exact ``dWc_ds`` (Ry^-1, s=z_Ry^2) and
+    ``Wc_minus_z`` (Ry) for an independent evenness check. ``with_moments``
+    computes M0..M3 once per q through the same full H (units Ry^(j+2));
+    M0/M2 certify vanishing odd-in-z coefficients and M1/M3 feed the model.
+    The caller must check these raw fields; none is Hermitized or projected.
+    With either flag, ``on_z`` receives a sixth dictionary of face-sharded
+    ``(nq_irr, mu_pad, mu_pad)`` fields. M0/M2 are supplied at the first z
+    only and then released; M1/M3 remain available. Without streaming the
+    returned ``response_fields`` carries all requested values (slopes and
+    reflected values have a leading z axis). Streaming retains only moments
+    in the return. Residual/iteration outputs cover every shifted solve.
+    These actions require the full operator, so ``route='auto'`` chooses
+    ``plain`` and an explicitly requested ring lift refuses.
 
     The facade the GW stage helper calls.  ``z_list_ry`` are complex Rydberg
     frequencies (cohsex: ``{0}``; gn_ppm: ``{0, i w_p}``; mpa: its sample plan);
@@ -981,13 +1060,22 @@ def compute_wc_qwedge(
     tiles = [[None] * nq for _ in range(nz)]
     resid = np.zeros((nz, nq, n_pad), dtype=np.float64)
     iters = np.zeros((nz, nq, n_pad), dtype=np.int32)
+    response_tiles = ({name: [[None] * nq for _ in range(nz)]
+                       for name in ("dWc_ds", "Wc_minus_z")} if with_slope else {})
+    moment_tiles = ({name: [None] * nq for name in ("M0", "M1", "M2", "M3")}
+                    if with_moments else {})
+    moment_fields = {}
 
     if route not in ("auto", "plain", "lift"):
         raise ValueError(
             f"route must be 'auto', 'plain' or 'lift', got {route!r}")
     n_dev = int(np.prod(mesh_xy.devices.shape))
     if route == "auto":
-        route = "lift" if (n_dev == 1 or allow_replicated_dyson) else "plain"
+        route = ("lift" if not (with_slope or with_moments)
+                 and (n_dev == 1 or allow_replicated_dyson) else "plain")
+    if route == "lift" and (with_slope or with_moments):
+        raise ValueError("Response slopes/moments require route='plain': they are "
+                         "actions of the full H, including its Hartree ring.")
     if route == "lift" and n_dev > 1 and not allow_replicated_dyson:
         raise NotImplementedError(
             f"route='lift' closes with jnp.linalg.solve on the N_mu x N_mu "
@@ -999,11 +1087,18 @@ def compute_wc_qwedge(
             f"accept the per-rank N_mu^2 tile the RPA Dyson's own DEFAULT "
             f"('local') plan already holds, or route='plain'/'auto'.")
 
-    def _on_result(iq, q, iz, z, c0, n_real, W_tile, resids, its):
+    def _on_result(iq, q, iz, z, c0, n_real, W_tile, resids, its, fields=None):
         tiles[iz][iq] = _accumulate_columns(
             tiles[iz][iq], W_tile, c0, n_real, n_pad, mesh_xy)
         resid[iz, iq, c0:c0 + n_real] = np.asarray(gather_to_host(resids))[:n_real]
         iters[iz, iq, c0:c0 + n_real] = np.asarray(gather_to_host(its))[:n_real]
+        for name, value in (fields or {}).items():
+            if name in moment_tiles:
+                moment_tiles[name][iq] = _accumulate_columns(
+                    moment_tiles[name][iq], value, c0, n_real, n_pad, mesh_xy)
+            else:
+                response_tiles[name][iz][iq] = _accumulate_columns(
+                    response_tiles[name][iz][iq], value, c0, n_real, n_pad, mesh_xy)
 
     # The lift's closing Dyson needs each q's OWN ``v`` tile, which only the
     # q-shifted payload carries; ``build_hook`` is the sweep's existing seam
@@ -1011,6 +1106,13 @@ def compute_wc_qwedge(
     v_by_q: dict = {}
 
     wedge_sh = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+
+    def _stack_rows(rows):
+        value = jax.lax.with_sharding_constraint(
+            jnp.stack(rows, axis=0).astype(jnp.complex128),
+            NamedSharding(mesh_xy, P(None, "x", "y")))
+        _assert_pad_block_is_zero(value, nlog)
+        return value
 
     def _on_z_done(iz, z):
         row = tiles[iz]
@@ -1024,7 +1126,22 @@ def compute_wc_qwedge(
         tiles[iz] = None
         del row
         _assert_pad_block_is_zero(wc_z, nlog)
-        on_z(iz, z, wc_z, resid[iz], iters[iz])
+        if with_slope or with_moments:
+            fields = {}
+            for name, by_z in response_tiles.items():
+                fields[name] = _stack_rows(by_z[iz])
+                by_z[iz] = None
+            if iz == 0:
+                for name, rows in moment_tiles.items():
+                    moment_fields[name] = _stack_rows(rows)
+                moment_tiles.clear()
+            fields.update(moment_fields)
+            on_z(iz, z, wc_z, resid[iz], iters[iz], fields)
+            if iz == 0:
+                moment_fields.pop("M0", None)
+                moment_fields.pop("M2", None)
+        else:
+            on_z(iz, z, wc_z, resid[iz], iters[iz])
 
     sweep_q_wedge(
         data, mesh_xy, q_list, z_list_ry, include_w=include_w,
@@ -1034,7 +1151,8 @@ def compute_wc_qwedge(
         build_hook=((lambda iq, q, dq: v_by_q.__setitem__(iq, dq["V_q0"]))
                     if route == "lift" else None),
         z_outer=on_z is not None,
-        on_z_done=(_on_z_done if on_z is not None else None))
+        on_z_done=(_on_z_done if on_z is not None else None),
+        with_slope=with_slope, with_moments=with_moments)
 
     if on_z is not None:
         wc = None
@@ -1056,33 +1174,22 @@ def compute_wc_qwedge(
         wc = jax.lax.with_sharding_constraint(
             stacked.astype(jnp.complex128), wedge_sh)
         _assert_pad_block_is_zero(wc, nlog)
+    response_fields = None
+    if with_slope or with_moments:
+        response_fields = dict(moment_fields)
+        if on_z is None:
+            response_fields.update({name: _stack_rows(rows)
+                                    for name, rows in moment_tiles.items()})
+            for name, by_z in response_tiles.items():
+                response_fields[name] = jax.lax.with_sharding_constraint(
+                    jnp.stack([_stack_rows(rows) for rows in by_z], axis=0), wedge_sh)
     head_result = None
     if head_dipole_path is not None:
-        from .absorption_common import (slice_dipole_to_bse_window)
-        from file_io.restart_bundle import (load_dipole_h5)
-        from .head_resolvent import (
-            build_head_dipole, build_head_operator, solve_head_tensor)
-
-        from .bse_window import _parse_wfn_path
-        dipole_cart, delta_e, _ = load_dipole_h5(
-            head_dipole_path, wfn_path=_parse_wfn_path(input_file))
-        n_val = int(data["n_val"])
-        n_cond = int(data["n_cond"])
-        d_alpha, delta_cv = slice_dipole_to_bse_window(
-            dipole_cart, delta_e, int(head_n_occ), n_val, n_cond)
-        velocity_cv = np.asarray(d_alpha) * np.asarray(delta_cv)[None]
-        d_pair = build_head_dipole(
-            velocity_cv, delta_cv,
-            n_cond_pad=int(data["n_cond_pad"]),
-            n_val_pad=int(data["n_val_pad"]))
-        head_data = _psi_ring_view(data)
-        head_op = build_head_operator(mesh_xy, head_data, include_w=include_w)
-        head_result = solve_head_tensor(
-            head_op, head_data, d_pair, z_list_ry, pref=float(head_pref),
-            max_iter=int(gmres_max_iter), tol=float(gmres_tol),
-            arm=("micro_reducible_bse" if include_w
-                 else "micro_reducible_rpa_resolvent"),
-            delta_cvk=delta_cv)
+        head_result = compute_ladder_head(
+            restart_path, z_list_ry, mesh_xy, input_file=input_file,
+            head_dipole_path=head_dipole_path, head_n_occ=head_n_occ,
+            head_pref=head_pref, gmres_tol=gmres_tol,
+            gmres_max_iter=gmres_max_iter, include_w=include_w, data=data)
     return WLadderWedge(
         wc=wc,
         n_rmu=nlog,
@@ -1095,6 +1202,7 @@ def compute_wc_qwedge(
         gmres_iters=iters,
         include_w=bool(include_w),
         head_result=head_result,
+        response_fields=response_fields,
     )
 
 

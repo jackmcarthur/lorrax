@@ -768,8 +768,48 @@ def _symmetry_reduced_q_list(input_file: str) -> np.ndarray:
     return np.asarray(_symmetry_tables(input_file).q_irr_kgrid_int, dtype=int)
 
 
+def _resolvent_response_actions(solve, rhs, z, value):
+    """Exact even-s slope and reflected value of ``R(z) rhs``.
+
+    ``solve(b, z, reflected=False)`` returns the full two-branch solution and its true residual
+    and iteration count. For nonzero z, ``dR/ds = -R**2/(2*z)``. At z=0 the
+    even readout instead has ``dW/ds = C R**3 B``; no small-z division or
+    finite-difference step enters. The reflected readout certifies the even-s
+    assumption after projection rather than imposing it on the operator.
+    """
+    squared, resid, iters = solve(value, z)
+
+    def at_zero(_):
+        cubed, res, count = solve(squared, z)
+        return cubed, value, jnp.maximum(resid, res), jnp.maximum(iters, count)
+
+    def away_from_zero(_):
+        reflected, res, count = solve(rhs, -z, reflected=True)
+        return (-squared / (2 * z), reflected,
+                jnp.maximum(resid, res), jnp.maximum(iters, count))
+
+    return jax.lax.cond(z == 0, at_zero, away_from_zero, operand=None)
+
+
+def _moment_response_actions(apply_h, rhs):
+    """``C H**j B / 2``, j=0..3, before the common density projection.
+
+    M0 and M2 expose forbidden odd-in-z coefficients on the even-s route;
+    M1 and M3 are the exact ladder moments. No RPA transition-only recurrence
+    is used. One matvec body serves the three powers of the full operator.
+    """
+    def step(value, _):
+        value = apply_h(value)
+        return value, value[0] + value[1]
+
+    _, powers = jax.lax.scan(step, rhs, None, length=3, unroll=1)
+    return {"M0": 0.5 * (rhs[0] + rhs[1]),
+            "M1": 0.5 * powers[0], "M2": 0.5 * powers[1],
+            "M3": 0.5 * powers[2]}
+
+
 def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
-                            resid_relative_to: str = "b"):
+                            resid_relative_to: str = "b", *, with_slope=False):
     """Cached jitted per-column-scan block-GMRES engine for the screening
     resolvent — the stage-2 SOLVE of :func:`apply_screening_resolvent_block`.
 
@@ -782,15 +822,20 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
     dispatch-only — replacing the old top-level ``lax.scan`` that closed over the
     per-q ``data`` and recompiled the ~4.8 s scan once per q.
 
-    Cache key ``(id(matvec), max_iter, resid_relative_to, dtype)`` keeps the
+    Cache key ``(id(matvec), max_iter, resid_relative_to, dtype, with_slope)`` keeps the
     operator-identity safety: genuinely different structures (screening vs
     optical, TDA vs full) carry distinct ``matvec`` objects and so distinct
     engines.  ``tol`` is NOT in the key — it rides in as a runtime argument
     (it appears only in the ``while_loop`` predicate), so a tolerance sweep
     reuses one executable.  ``resid_relative_to`` IS in the key because it is
     a different stopping rule and so a different program; see
-    :func:`bse_feast._gmres_solve_core` for what the two mean."""
-    key = (id(matvec), int(max_iter), str(resid_relative_to), str(dtype))
+    :func:`bse_feast._gmres_solve_core` for what the two mean.
+
+    ``with_slope`` adds exact even-s derivative and reflected-value actions.
+    Their solves share the same operator and GMRES owner. Residual/iteration
+    outputs then conservatively include every solve, not just the value leg.
+    """
+    key = (id(matvec), int(max_iter), str(resid_relative_to), str(dtype), bool(with_slope))
     hit = _BLOCK_GMRES_CACHE.get(key)
     if hit is not None:
         return _bind_tol(hit[1], tol)
@@ -819,6 +864,26 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
             resid = jnp.where(nrhs == 0.0, jnp.asarray(0.0, dtype=nrhs.dtype),
                               jnp.linalg.norm(r_true) / nrhs)
             s = jax.lax.with_sharding_constraint(x[0] + x[1], sh.X)  # (1, c, v, k)
+            if with_slope:
+                def solve(b, shift, *, reflected=False):
+                    # A deflation built at z is not the shifted preconditioner
+                    # at -z. These extra solves use the same diagonal owner.
+                    result, count = _gmres_solve_core(
+                        matvec, b, diag_h, shift, operands, max_iter, tol_rt,
+                        resid_relative_to=resid_relative_to,
+                        deflation=None if reflected else deflation)
+                    error = b - _apply_shifted_matvec(matvec, result, shift, operands)
+                    norm = jnp.linalg.norm(b)
+                    res = jnp.where(norm == 0.0, jnp.asarray(0.0, dtype=norm.dtype),
+                                    jnp.linalg.norm(error) / norm)
+                    return result, res, count
+
+                slope, reflected, res, count = _resolvent_response_actions(
+                    solve, rhs_i, z, x)
+                fields = {"dWc_ds": (slope[0] + slope[1])[0],
+                          "Wc_minus_z": (reflected[0] + reflected[1])[0]}
+                return carry, (s[0], jnp.maximum(resid, res),
+                               jnp.maximum(k_used, count), fields)
             return carry, (s[0], resid, k_used)
 
         # unroll=1: ONE Krylov workspace alive at a time.  The workspace is
@@ -828,13 +893,39 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
         # matvec amortises only 1.11x over a 16-wide block (measured,
         # opt_integration 2026-08-16), i.e. the probe axis carries no width win
         # to buy the memory with.
-        _, (s_all, resids, iters) = jax.lax.scan(_solve_col, None, rhs_scan,
-                                                 unroll=1)
+        _, result = jax.lax.scan(_solve_col, None, rhs_scan, unroll=1)
+        s_all, resids, iters = result[:3]
         s_all = jax.lax.with_sharding_constraint(s_all, sh.X)        # (nu, c, v, k)
+        if with_slope:
+            return s_all, resids, iters, {
+                name: jax.lax.with_sharding_constraint(value, sh.X)
+                for name, value in result[3].items()}
         return s_all, resids, iters
 
     _BLOCK_GMRES_CACHE[key] = (matvec, _block)
     return _bind_tol(_block, tol)
+
+
+def _get_block_moment_actions(matvec, sh, dtype):
+    """Cached exact H-power actions, with one probe's matvec scratch live."""
+    key = ("moments", id(matvec), str(dtype))
+    hit = _BLOCK_GMRES_CACHE.get(key)
+    if hit is not None:
+        return hit[1]
+
+    @jax.jit
+    def moments(rhs, operands):
+        def column(carry, rhs_col):
+            fields = _moment_response_actions(
+                lambda value: matvec(value, *operands), rhs_col[:, None])
+            return carry, {name: value[0] for name, value in fields.items()}
+
+        _, fields = jax.lax.scan(column, None, jnp.moveaxis(rhs, 1, 0), unroll=1)
+        return {name: jax.lax.with_sharding_constraint(value, sh.X)
+                for name, value in fields.items()}
+
+    _BLOCK_GMRES_CACHE[key] = (matvec, moments)
+    return moments
 
 
 def _bind_tol(block, tol):
@@ -911,6 +1002,15 @@ def build_probe_rhs(G_zeta, data, gen, sh):
         jnp.stack([f, -f], axis=0).astype(jnp.complex128), sh.X_full)
 
 
+def _project_screening_actions(actions, data, snapshot, *, view=None, snapshot_v=None):
+    """Project pair readouts through the same density vertex and V as Wc."""
+    sdata = data if view is None else view(
+        {"psi_c_Y": data["psi_c_Y"], "psi_v_Y": data["psi_v_Y"]})
+    v = data["V_q0"] if snapshot_v is None else snapshot_v
+    return {name: snapshot(value, sdata["psi_c_Y"], sdata["psi_v_Y"], v)
+            for name, value in actions.items()}
+
+
 def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
                                     snapshot, sh, *, max_iter, tol,
                                     return_iters: bool = False,
@@ -920,13 +1020,18 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
                                     solve_data=None,
                                     snapshot_v=None,
                                     deflation=None,
-                                    view=None):
+                                    view=None,
+                                    with_slope=False):
     """Screened-Coulomb resolvent on a block of probe columns — the ONE engine.
 
     ``view`` (optional) maps ``data`` to the ring layout for the two eager
     stages, the seed and the snapshot, when the payload's psi carriers rest in
     another layout (``w_ladder`` rests psi 2-D); the jitted solve takes
     ``data`` as is.  ``None`` is the historical call.
+
+    ``with_slope`` appends a dictionary of ``dWc_ds`` (Ry^-1, s=z_Ry^2)
+    and ``Wc_minus_z`` (Ry) tiles to the historical return tuple. It never
+    symmetrizes either value: the caller must certify the even-s assumption.
 
     Computes ``W(omega) - v`` tiles from the non-TDA RPA density-response
     resolvent ``v (z - H_RPA)^{-1} v`` for a whole block of centroid-space probe
@@ -1011,7 +1116,7 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
     # q / omega is dispatch-only.  z is passed as a device scalar (not a Python
     # complex) so a different omega stays a runtime arg, never a baked constant.
     solver = _get_block_gmres_solver(matvec, sh, max_iter, tol, rhs.dtype,
-                                     resid_relative_to)
+                                     resid_relative_to, with_slope=with_slope)
     # operands_fn must match the matvec's build: matvec_operands (10) for
     # every raw-payload operator, ladder_matvec_operands (14) for a
     # ladder_rung_slots build (bse_ring_comm).
@@ -1028,18 +1133,20 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
     # for THIS (q, z) operator, or None (diagonal preconditioner only).  It
     # changes the Krylov iterates, not the system: the answer moves at the
     # solver tolerance, and the true-residual gate below is unchanged.
-    s_all, resids, iters = solver(rhs, diag_h,
-                                  jnp.asarray(z, dtype=jnp.complex128),
-                                  operands_fn(data if solve_data is None
-                                              else solve_data),
-                                  deflation)
+    result = solver(rhs, diag_h, jnp.asarray(z, dtype=jnp.complex128),
+                    operands_fn(data if solve_data is None else solve_data), deflation)
+    s_all, resids, iters = result[:3]
 
     # --- Stage 3: PROJECT (pair -> zeta), reduce-scatter to W(mu_X, nu_Y). ---
-    sdata = data if view is None else view(
-        {"psi_c_Y": data["psi_c_Y"], "psi_v_Y": data["psi_v_Y"]})
-    W_tile = snapshot(s_all, sdata["psi_c_Y"], sdata["psi_v_Y"],
-                      data["V_q0"] if snapshot_v is None else snapshot_v)
-    del sdata
+    actions = {"Wc": s_all}
+    if with_slope:
+        actions.update(result[3])
+    projected = _project_screening_actions(
+        actions, data, snapshot, view=view, snapshot_v=snapshot_v)
+    W_tile = projected.pop("Wc")
+    if with_slope:
+        return ((W_tile, resids, iters, projected) if return_iters
+                else (W_tile, resids, projected))
     if return_iters:
         return W_tile, resids, iters
     return W_tile, resids
