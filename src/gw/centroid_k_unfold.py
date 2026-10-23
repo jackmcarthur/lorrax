@@ -45,6 +45,7 @@ def _readonly(value, dtype) -> np.ndarray:
 
 #: ``id(plan) -> (plan, dirac_halves())``; the plan is held so its id stays unique.
 _DIRAC_HALVES: dict = {}
+_CCT_COLUMN_TILES: dict = {}  # immutable plan/tile metadata; no numerical operands
 
 
 class OperationClasses(NamedTuple):
@@ -183,6 +184,35 @@ class CentroidKUnfoldPlan:
             local_perm=self.centroid_local_perm, L_table=self.L_table,
             spin_action_full=self.spin_action_full,
             n_sym_spatial=int(self.n_sym_spatial))
+
+    def cct_column_tiles(self, width):
+        """Whole-orbit column tiles within each Y owner for the parent Gram.
+
+        Return packed centroid indices ``(tile,Y,width)``, and the existing
+        batch-local permutation/wrap tables. Every active centroid occurs
+        once; ``-1`` slots are zeros. The band-distributed right face remains
+        on its original Y owner, so selecting a tile needs no communication.
+        """
+        key = (self, int(width))
+        if key not in _CCT_COLUMN_TILES:
+            _CCT_COLUMN_TILES[key] = {'mu': _cct_column_bins(self, int(width))}
+        tables = _CCT_COLUMN_TILES[key]
+        if 'operands' not in tables:
+            mu = tables['mu']
+            nt, py, width = mu.shape
+            perm, wraps, _ = mu_batch_tables(self, mu.reshape(-1, width))
+            tables['operands'] = (mu,
+                _readonly(perm.reshape(nt, py, perm.shape[1], width), np.int32),
+                _readonly(wraps.reshape(nt, py, wraps.shape[1], width, 3), np.int32))
+        return tables['operands']
+
+    def cct_column_shape(self, width):
+        """Score the same closed bins before materializing symmetry/wrap tables."""
+        key = (self, int(width))
+        if key not in _CCT_COLUMN_TILES:
+            _CCT_COLUMN_TILES[key] = {'mu': _cct_column_bins(self, int(width))}
+        nt, _, width = _CCT_COLUMN_TILES[key]['mu'].shape
+        return nt, width
 
     def unfold_face(self, face, *, vertex=0, spin_axis, mu_axis,
                     mesh_axis=None, tables=None):
@@ -609,6 +639,36 @@ def widest_unfold_orbit(k_unfold_plan) -> int:
     """The widest orbit of :func:`unfold_orbits`: the smallest whole-orbit owner bin."""
     _, sizes = unfold_orbits(k_unfold_plan)
     return int(max(sizes, default=1))
+
+
+def _cct_column_bins(plan, width):
+    """Pack orbit bins before materializing their authenticated endpoint tables."""
+    py = int(plan.mesh_xy.shape['y'])
+    extent = int(plan.n_centroid_packed) // py
+    members, _ = unfold_orbits(plan)
+    bins = []
+    for y in range(py):
+        groups = [m for m in members if int(m[0]) // extent == y]
+        if any(np.any(m // extent != y) for m in groups):
+            raise ValueError("CCT column tile orbit crosses its Y owner")
+        if not groups:
+            bins.append([])
+            continue
+        sizes = np.asarray([len(m) for m in groups])
+        by_size = sorted(range(len(groups)),
+                         key=lambda i: (-int(sizes[i]), int(groups[i][0])))
+        owner, loads, _ = _partition_orbit_bins(
+            (groups, sizes, by_size), 1, width)
+        bins.append([np.sort(np.concatenate(
+            [groups[i] for i in np.flatnonzero(owner == b)]))
+            for b in range(len(loads))])
+    n_tile = max(map(len, bins))
+    width = max(len(m) for by_owner in bins for m in by_owner)
+    mu = np.full((n_tile, py, width), -1, np.int32)
+    for y, by_owner in enumerate(bins):
+        for b, members in enumerate(by_owner):
+            mu[b, y, :len(members)] = members
+    return _readonly(mu, np.int32)
 
 
 def _unfold_orbit_packing(plan):

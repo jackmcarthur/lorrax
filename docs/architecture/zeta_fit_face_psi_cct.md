@@ -37,8 +37,8 @@ refused (`NotImplementedError`).
 
 ## C_q on the parents
 
-`isdf.core.c_q_from_psi_sm` forms the metric with one planned GEMM per raw
-parent and endpoint (`distrib_la.gemm_plan`, M = N = μ·ns, K = n_b):
+`isdf.core.c_q_from_psi_sm` forms the metric with planned GEMMs on raw-parent
+faces (`distrib_la.gemm_plan`, M = μ·ns, N = a column tile·ns, K = n_b):
 
 ```text
 D^X_k̄(μ a, ν b) = Σ_n w^X_n ψ_{n k̄ a}(r_μ) conj ψ_{n k̄ b}(r_ν)          X = L, R
@@ -49,8 +49,23 @@ The k-convolution router's parent-load convolution
 (`ffi.fft.make_fused_conv_kparent`, centroid-major) carries out the typed
 transport k̄ → k: the centroid permutation, the lattice-wrap phase, the spinor
 action and antiunitary conjugation, all read from `symmetry_maps` through the
-plan. It then evaluates the k correlation and writes C_q for all N_k q at
-`P(None,'x','y')`.
+plan. Each Y column tile is a union of whole centroid orbits on that Y owner;
+the existing `mu_batch_tables` authenticates its local source maps. Selecting
+the right wavefunction columns is rank-local and preserves the band/centroid
+face. The native correlation returns every full-grid q for this bounded tile.
+The tile then completes its ordered pair and selects the stored q rows before
+writing the one donated `C_qirr(mu_X,nu_Y)` output. An unreduced fit uses the
+same owner with every q row.
+
+The automatic chooser scores closed column bins before constructing their
+endpoint tables. A strict minimum (the initial output, two parent projectors
+and native full-k tile) skips impossible widths. The actual executable's
+`temp + output - alias`, plus the initial donated output, decides whether a
+width fits the agreed room; over it, the next narrower bins are tried. No
+normal matrix is allocated before that check. The caches hold host geometry
+and executables, never wavefunctions or normal matrices. Vertices, q row
+indices and their negative-q partners remain small runtime operands, so
+equal-shaped remaps and vertex pairs share the compiled program.
 
 For four spinors, the same metric is accumulated from the four Dirac-half
 pairs `(h,g)`. `CentroidKUnfoldPlan.dirac_halves` authenticates the action
@@ -59,9 +74,9 @@ and transports with `p^(h+g)`. A monomial vertex selects the matching right
 quarter. The existing service GEMM and parent convolution process each pair
 in order; all 16 spin-pair terms remain, including cross halves. This changes
 only the spin reduction order, so parity is at floating-point roundoff.
-Each parent quarter occupies `16*n_parent*4*mu²/P` bytes; the scalar output
-remains `16*N_k*mu²/P`. No four-spinor parent matrix or unfolded wavefunction
-is held by this route.
+Each parent quarter occupies `16*n_parent*4*(mu/Px)*tile_width` bytes per
+rank; the scalar output is `16*N_q_stored*mu²/P`. No four-spinor parent matrix
+or unfolded wavefunction is held by this route.
 
 A current channel applies its vertex γ̃^i on the output spin indices after
 transport. The stored faces are never vertex-folded. The four-spinor action is
@@ -69,18 +84,40 @@ on the [symmetry register](symmetry_register.md), and the Lorentz convention
 is in [four-current wiring](four_current_wiring.md).
 
 Cost per fit: 2·n_p·ns²·μ²·n_b MACs of GEMM, divided over the mesh by the
-plan, plus O(μ²·ns²·N_k log N_k / P) for the correlation. C_q takes
-N_k·μ²·16/P bytes per rank before the q selection.
+plan, plus O(μ²·ns²·N_k log N_k / P) for the correlation. Stored C_q takes
+N_q_stored·μ²·16/P bytes per rank; projectors and full-k correlation output
+are bounded column tiles. Streaming can repeat left-panel communication,
+while small fits retain the one-tile route.
 
 The GEMM plan is built with `warmup=False`, so C's enclosing JIT runs the
 first GEMM ([`gemm_plan`](../services/distrib_la/api.md#gemm_plan)).
 
 ## Normal equations
 
-`fit_zeta_to_h5` prepares C_q on all N_k q rows in three steps before
-factoring.
+The parent stream completes and selects each bounded column tile before
+`fit_zeta_to_h5` adds its inert pad diagonal and factors the stored rows.
 
-1. **Pad diagonal.** Orbit-packed centroids interleave pad slots on every
+1. **LR+RL completion.** The charge fit trains on asymmetric windows:
+   L holds every occupied state plus the Σ conduction window, and R holds
+   the Σ occupied window plus every empty state. Complex conjugation swaps
+   the ordered endpoints, so the LR pairs alone are not closed under
+   conjugation. Relabelling (n, m, k) gives N_RL(q) = conj N_LR(−q) for C and
+   for Z alike. The parent stream adds conj C_{−q} to C_q (the same
+   equation as `complete_ordered_pair_normal_equations`), using the involution from
+   `symmetry_maps.q_negation_index`, and Z receives the same completion. This
+   is the normal equation of the concatenated training set, not a projection
+   of ζ, V or W.
+   Completion happens per Cartesian pair before any complex circular-channel
+   weight. Moving the mean pad diagonal after completion preserves it:
+   `Re tr(C_q + conj C_-q) = Re tr C_q + Re tr C_-q`.
+2. **q selection.** When the run stores the irreducible wedge and the
+   centroid set is orbit-closed under the full space group with time reversal
+   (`gw.qgrid_symmetry.resolve_qgrid_symmetry_tables`), each column tile selects the
+   IBZ rows before writing C_q. When the set is not closed, the charge channel
+   stores every q, and a current channel refuses: its V_q assumes IBZ ζ.
+   Regenerate the current centroids with
+   `centroid.kmeans_cli --density-mode current`.
+3. **Pad diagonal.** Orbit-packed centroids interleave pad slots on every
    shard, so the dense solve extent is the whole carrier
    (`meta.mu_solve_extent`). The pad rows and columns of C_q are exactly
    zero. The fit adds the mean diagonal tr C_q/μ to the pad diagonal
@@ -88,23 +125,6 @@ factoring.
    eigenvalues then lie inside the active spectrum, and a unit pad cannot
    become λ_max and set the rank cut. Z's pad rows stay zero, so ζ is zero on
    the pads.
-2. **LR+RL completion.** The charge fit trains on asymmetric windows:
-   L holds every occupied state plus the Σ conduction window, and R holds
-   the Σ occupied window plus every empty state. Complex conjugation swaps
-   the ordered endpoints, so the LR pairs alone are not closed under
-   conjugation. Relabelling (n, m, k) gives N_RL(q) = conj N_LR(−q) for C and
-   for Z alike. `complete_ordered_pair_normal_equations` therefore adds
-   conj C_{−q} to C_q, using the q involution from
-   `symmetry_maps.q_negation_index`, and Z receives the same completion. This
-   is the normal equation of the concatenated training set, not a projection
-   of ζ, V or W.
-3. **q selection.** When the run stores the irreducible wedge and the
-   centroid set is orbit-closed under the full space group with time reversal
-   (`gw.qgrid_symmetry.resolve_qgrid_symmetry_tables`), C_q is sliced to the
-   IBZ rows before factoring. When the set is not closed, the charge channel
-   stores every q, and a current channel refuses: its V_q assumes IBZ ζ.
-   Regenerate the current centroids with
-   `centroid.kmeans_cli --density-mode current`.
 
 ## Factor and back-solve
 

@@ -671,6 +671,8 @@ such as a missing conjugate or an unsymmetrized product, and never round-off.
 | `resolve_matmul_backend(requested, mesh, *, batched_route)` | the GEMM route a request names (`panel_matmul` or `off`) |
 | `mesh_key(mesh)`, `mesh_platform(mesh)`, `mesh_is_cpu(mesh)` | a hashable mesh identity (axes, extents, platform, device ids) and its predicates; key any cache whose value does not retain the mesh on `mesh_key`, because two same-shaped meshes over different devices lower to different handlers |
 | `dial_key()`, `probe_target`, `has_target`, `backend_module` | the factory cache key and the capability probes (absent vs broken) |
+| `room_class(cache, key, room, build)` | cache a program choice while its recorded room tests give the same outcomes; cached values must retain geometry/programs only |
+| `room_test(test, room)` | evaluate a price-versus-room predicate and record it for enclosing `room_class` builds; use this when a caller supplies its own compiled chooser |
 
 ## Rules for callers
 

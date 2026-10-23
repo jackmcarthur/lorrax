@@ -32,7 +32,6 @@ from .gw_config import (ZETA_RCOND_DEFAULT,
 
 from isdf.core import (
     c_q_from_psi_sm,
-    complete_ordered_pair_normal_equations,
     factor_c_q,
     _resolve_solver_kind,
     zeta_factor_resident,
@@ -675,32 +674,24 @@ def fit_zeta_to_h5(
                      f"{'' if v == 0 else f', {_bname} basis: ' + ' + '.join(f'({w:.3g})U{i}{j}' for w, i, j in terms)}): "
                      f"{k_unfold_plan.n_parent} -> {nk_tot} k rows")
             C_q = None
-            # Complex channel weights (circular currents): each Cartesian vertex
-            # pair's RL block is conj(LR) at -q, so complete every pair Gram
-            # before weighting it, exactly as isdf.zeta_mubatch completes each
-            # Z pair before the same weights.  Completing the weighted sum
-            # would conjugate the weights on the RL half (channel c's LR plus
-            # the conjugate channel's RL).
-            _per_pair_completion = (_q_neg_idx is not None and any(
-                complex(w).imag != 0.0 for w, _, _ in terms))
+            # Complete every Cartesian pair's bounded column tile before
+            # weighting it, as route G completes the corresponding Z pair.
+            # This is linear-equivalent for real weights and essential for
+            # complex circular weights. Only the stored q rows are assembled.
             for w, i, j in terms:
                 part = c_q_from_psi_sm(
                     kgrid=kgrid, mesh_xy=mesh_xy,
                     psi_mun_parent=psi_mun_parent, psi_nmu_parent=psi_nmu_parent,
                     weight_l=weight_l_face, weight_r=weight_r_face,
                     gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
-                    gamma_L=i, gamma_R=j)
-                if _per_pair_completion:
-                    part = complete_ordered_pair_normal_equations(
-                        jax.lax.with_sharding_constraint(
-                            part.reshape(nq, n_rmu_padded, n_rmu_padded), flat_shard),
-                        _q_neg_idx)
+                    gamma_L=i, gamma_R=j, q_rows=q_irr_full_idx,
+                    q_neg_idx=_q_neg_idx)
                 if len(terms) > 1 or w != 1.0:
                     part = w * part
                 C_q = part if C_q is None else C_q + part
                 del part
             C_q_flat = jax.lax.with_sharding_constraint(
-                C_q.reshape(nq, n_rmu_padded, n_rmu_padded), flat_shard)
+                C_q.reshape(n_q_disk, n_rmu_padded, n_rmu_padded), flat_shard)
             del C_q
             if n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu:
                 # Interleaved pad slots (orbit-packed order): C_q's pad rows and
@@ -712,14 +703,9 @@ def fit_zeta_to_h5(
                 # Rank-local by construction (Fe3GeTe2 P36/P16 OOM, 2026-09-21).
                 C_q_flat = add_pad_diagonal_sharded(
                     C_q_flat, mu_basis.active_mask, float(n_rmu), mesh_xy=mesh_xy)
-            if _q_neg_idx is not None and not _per_pair_completion:
-                C_q_flat = complete_ordered_pair_normal_equations(
-                    C_q_flat, _q_neg_idx)
-            # IBZ cascade: slice C_q to the stored rows before the per-q factor.
-            if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
-                from symmetry_maps import slice_q_full_to_ibz
-                C_q_flat = slice_q_full_to_ibz(
-                    C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
+            # Completion and q selection already occurred on each bounded
+            # column tile. The mean pad diagonal commutes with that linear
+            # completion; factor/conditioning checks see the same stored rows.
             timing.stage_wait(C_q_flat)
 
         with timing.section("zeta_fit.cholesky"):
