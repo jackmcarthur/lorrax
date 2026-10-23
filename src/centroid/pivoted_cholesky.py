@@ -1395,6 +1395,12 @@ def build_gram_q0_via_loadwfns(
             memory_per_device_gb=memory_per_device_gb, full_k_rows=rows)
         result = block if result is None else _candidate_gram_add_kernel(mesh_xy)(result, block)
         jax.block_until_ready(result)
+        # The sum reuses the running accumulator, not both input buffers.
+        # Release this consumed block before the next WFN/Gram batch starts;
+        # retaining the local name otherwise keeps another full Gram alive.
+        if block is not result and not block.is_deleted():
+            block.delete()
+        del block
     return result
 
 
@@ -1402,7 +1408,7 @@ def build_gram_q0_via_loadwfns(
 def _candidate_gram_add_kernel(mesh_xy):
     xy = NamedSharding(mesh_xy, PartitionSpec('x', 'y'))
     @partial(jax.jit, in_shardings=(xy, xy), out_shardings=xy,
-             donate_argnums=(0, 1))
+             donate_argnums=(0,))
     def add(a, b):
         return a + b
     return add
