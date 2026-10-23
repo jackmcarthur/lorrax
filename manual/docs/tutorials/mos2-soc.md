@@ -77,6 +77,23 @@ commands and what to check.
 and makes the plots. The [For BerkeleyGW users](../using/berkeleygw-users.md)
 page maps the workshop's `.inp` keys to the `gw.in` inputs.
 
+### Plasmon-pole settings {: #plasmon-pole-settings }
+
+Both workshop tracks use the Hybertsen–Louie model. The native decks set
+`ppm_invalid_mode = static_limit`: an invalid fitted pole contributes its
+static COHSEX limit. The closest BerkeleyGW setting is
+`invalid_gpp_mode 3`. The original BerkeleyGW4 input omits that key; its
+default already takes the same branch, so the upstream input is preserved.
+`perlmutter/03-run-reference-cpu.sh` records the effective policies and input
+hashes in `perlmutter/bgw_sigma_policy.json`.
+
+This aligns the treatment of invalid poles. The fitted poles still differ:
+LORRAX obtains its HL body moment from the finite-band response at the
+200 Ry probe, while BerkeleyGW uses its density sum rule. Invalid fractions
+are also basis dependent: the two codes fit centroid-pair and plane-wave-pair
+matrix elements. Compare QP energies and convergence rather than equating
+those percentages.
+
 ## Exciton bands {: #exciton-bands }
 
 The final LORRAX stage solves the finite-momentum BSE along Γ–M–K–Γ:

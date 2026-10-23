@@ -9,6 +9,38 @@ module load cpu
 module load berkeleygw/4.0-gcc-12.3
 export OMP_NUM_THREADS=8
 module list >"$site_dir/bgw_cpu_modules.txt" 2>&1
+# Record the actual comparison policy without changing the workshop input.
+# BerkeleyGW4's omitted/-1 invalid_gpp_mode takes the same branch as3.
+python3 - "$tutorial_dir" <<'PYTHON'
+from pathlib import Path
+import hashlib
+import json
+import sys
+
+root = Path(sys.argv[1])
+bgw = root / '2-gw/2-fully_rel/2-sigma/sigma.inp'
+native = root / '2-gw/3-lorrax_fully_rel/2-sigma/gw.in'
+def settings(path):
+    rows = {}
+    for line in path.read_text().splitlines():
+        line = line.split('#', 1)[0].split('!', 1)[0].replace('=', ' ').split()
+        if len(line) >= 2:
+            rows[line[0].lower()] = line[1]
+    return rows
+reference, candidate = settings(bgw), settings(native)
+declared = int(reference.get('invalid_gpp_mode', '-1'))
+effective = 3 if declared == -1 else declared
+native_mode = candidate['ppm_invalid_mode'].lower()
+policy = {'static_limit': 3, 'infinity': 3, 'zero': 0, 'skip': 0, '2ry': 2}
+record = dict(bgw_version='4.0', bgw_frequency_dependence=int(reference.get('frequency_dependence', '1')),
+    bgw_invalid_gpp_mode_declared=declared, bgw_invalid_gpp_mode_effective=effective,
+    native_compute_mode=candidate['compute_mode'], native_ppm_invalid_mode=native_mode,
+    matching_invalid_policy=policy.get(native_mode) == effective,
+    reference_adapter_modified_input=False,
+    input_sha256={str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in (bgw, native)})
+(root / 'perlmutter/bgw_sigma_policy.json').write_text(json.dumps(record, indent=2) + '\n')
+PYTHON
 # The upstream meanfield link script also replaces every NSCF schema with
 # the SCF XML. Link only reference inputs here, after meanfield has finished.
 link_mf_input() {

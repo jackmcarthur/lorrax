@@ -62,6 +62,14 @@ The guarded mean-field file holds 204 bands so LORRAX can check the gap above
 the 200-band fit window; these spare states do not enter the sums. The QP
 calculation keeps 48 bands, including eight guards beyond the plotted 40.
 
+Both tracks use HL-PPM. The explicit native `ppm_invalid_mode = static_limit`
+matches BerkeleyGW's `invalid_gpp_mode 3`: invalid modes contribute their
+static COHSEX limit. The unchanged BerkeleyGW4 workshop input already uses
+that default. The reference adapter records both policies and input hashes
+in `perlmutter/bgw_sigma_policy.json`. Matching this policy does not make
+the fitted poles identical: the native HL body uses the finite-band
+high-frequency response; BerkeleyGW uses the density sum rule.
+
 `sigma_omega_min_ev = -65.0` eV, relative to the Sigma Fermi reference,
 includes the deep Mo semicore states. `mc_average_vcoul_body = false` uses
 the workshop's point Coulomb body. The production 2D kernel still averages

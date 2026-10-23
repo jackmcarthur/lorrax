@@ -64,6 +64,13 @@ directly and then its epsilon/kernel/output links. It preserves every NSCF XML
 and refuses missing meanfield inputs or replacement of existing regular input
 files. No upstream global link script is needed.
 
+The reference adapter also records `bgw_sigma_policy.json` with the actual
+input hashes and effective invalid-pole policies. The MoS2 reference uses
+HL-PPM. BerkeleyGW4's omitted `invalid_gpp_mode` selects the same static
+COHSEX branch as explicit `invalid_gpp_mode 3`, matching the native
+`ppm_invalid_mode = static_limit`. The original workshop input is preserved;
+making the native default explicit changes no numerical setting.
+
 On another cluster, adapt the module functions and `srun` launcher in
 `01-run-meanfield.sh` to its QE/BGW installation and scheduler. The four k-pools
 require compatible MPI counts; the tested 32-rank QE and 4-rank converter choices
