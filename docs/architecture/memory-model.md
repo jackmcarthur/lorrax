@@ -161,6 +161,11 @@ caches retain geometry and plans, never the Coulomb input.
 
 The response bank and tangential screening owner share bare-V parent rows
 and both Coulomb roots across their bank, moment and constructor calls.
+Accepted roots are shared across local and distributed execution requests
+when the authenticated operator, packed basis, numerical cut and mesh agree;
+both return the same `H_q(mu_X,nu_Y)` face contract. A constructor's sub-span
+slices the existing roots rather than retaining another pair per parent.
+The numerical backend remains part of the compiled-program identity.
 One-shot GW releases these cache references after W0 persistence and before
 Sigma. QSGW retains reuse between maps and releases them after the final
 W0 persistence. Clearing these holds does not delete arrays still owned by

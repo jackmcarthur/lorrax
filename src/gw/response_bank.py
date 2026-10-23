@@ -1266,9 +1266,11 @@ def _coulomb_pack(basis,mesh_xy):
 #: requested q span.  V is the same operator at every SC map (fixed ISDF basis
 #: and q set), so the bank, moments and constructor of every map after the
 #: first reuse the first map's roots instead of re-reading V and re-solving its
-#: eigenproblems.  Keyed by the operator token of the resource
-#: (``tangential_screening._coulomb_resource``), the span and the solve layout;
-#: a new operator drops the old roots.  Held bytes per rank: 32 N_mu_packed^2 per
+#: eigenproblems. Keyed by the resource's operator token, basis (including the
+#: logical extent that fixes the numerical cut), span and mesh. Accepted roots
+#: have the same face contract under either dense execution layout: backend
+#: choice belongs to the program cache, not the accepted-value identity. A new
+#: operator drops the old roots. Held bytes per rank: 32 N_mu_packed^2 per
 #: held q row / P; the bank, moments and constructor rounds share (0, N_q)
 #: (a round slices its rows, one transient round slice), so
 #: 32 N_q N_mu_packed^2 / P in all.
@@ -1297,9 +1299,15 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
     layout = dense_layout(meta, config, mesh_xy, basis.n_packed)
     token = resource.get("operator")
     key = None if token is None else (token, (int(q_span[0]), int(q_span[1])),
-                                      basis.n_packed, basis.n_logical, layout, mesh_xy)
+                                      basis.n_packed, basis.n_logical, basis, mesh_xy)
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+
+    def usable(roots):
+        return roots is not None and all(not value.is_deleted() and value.sharding == face
+                                         for value in roots[:2])
+
     held = _COULOMB_ROOTS.get(key)
-    if held is not None and not any(x.is_deleted() for x in held[:2]):
+    if usable(held):
         return held
     if key is not None:
         # A constructor round asks for a sub-span of the parents the producer
@@ -1307,7 +1315,7 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
         # second read and eigensolve of the same V.
         for (k_token, (k_lo, k_hi), *k_rest), cover in _COULOMB_ROOTS.items():
             if (k_token == token and tuple(k_rest) == key[2:] and k_lo <= key[1][0]
-                    and key[1][1] <= k_hi and not any(x.is_deleted() for x in cover[:2])):
+                    and key[1][1] <= k_hi and usable(cover)):
                 a, b = key[1][0] - k_lo, key[1][1] - k_lo
                 rows, start = _span_rows(mesh_xy, b - a), _span_cursor(mesh_xy, (k_token, k_lo), a, b)
                 return rows(cover[0], start), rows(cover[1], start), list(cover[2][a:b])
