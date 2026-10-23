@@ -17,5 +17,7 @@ run_stage 2-gw/3-lorrax_fully_rel/2-sigma/01-run_sigma.run
 run_stage 2-gw/3-lorrax_fully_rel/3-bs/01-run_inteqp.run
 run_stage 3-bse/3-lorrax_fully_rel/1-kernel/01-run_kernel.run
 run_stage 3-bse/3-lorrax_fully_rel/2-absorption/01-run_absorption.run
+run_stage 3-bse/3-lorrax_fully_rel/3-exciton-bands/01-run_exciton_bands.run
 (cd 2-gw/3-lorrax_fully_rel/3-bs && lorrax_python 02-plot_bandstructure.py)
 (cd 3-bse/3-lorrax_fully_rel/2-absorption && lorrax_python 02-plot_absorption.py)
+(cd 3-bse/3-lorrax_fully_rel/3-exciton-bands && lorrax_python 02-plot_exciton_bands.py)
