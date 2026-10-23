@@ -276,17 +276,40 @@ the exciton outputs are `eigenvalues.dat` and `eigenvectors.h5`.
 
 ## Executed results {: #results }
 
-The following plots come from the supplied workflow, with an independently
-executed BerkeleyGW reference. These are the saved finite-setting results,
-not values to enforce by changing inputs.
+The following plots come from the supplied workflow and an independently
+executed BerkeleyGW reference. The workshop's 3 × 3 × 1 coarse k-grid is
+deliberately underconverged. The differences reflect that sparse sampling
+and the different QP and kernel interpolation methods; each track also
+supplies its own coarse GW corrections. The denser-grid validation below
+provides a separate, controlled check of LORRAX's interpolation accuracy.
 
-![Fully relativistic MoS₂ band structures from LORRAX and BerkeleyGW, with DFT and GW curves on Γ–M–K–Γ.](../assets/figures/tutorial-mos2-soc-bands.png)
+### Workshop comparison {: #workshop-comparison }
 
-Light gray is the QE DFT path from the BerkeleyGW reference, blue is LORRAX GW,
-and orange is BerkeleyGW GW. Each dataset is aligned to its own valence-band
-maximum, so this plot compares dispersions and gaps rather than absolute QP offsets.
+<div style="display:flex; flex-wrap:wrap; gap:24px; align-items:flex-start;" markdown="1">
 
-![Fully relativistic MoS₂ interacting and independent-particle absorption spectra from LORRAX and BerkeleyGW.](../assets/figures/tutorial-mos2-soc-absorption.png)
+<figure style="width:3in; max-width:100%; margin:0;" markdown="1">
+
+[![MoS₂ DFT bands in light gray, LORRAX GW in blue and BerkeleyGW GW in orange on Γ–M–K–Γ.](../assets/figures/tutorial-mos2-soc-bands.png){ width="288" }](../assets/figures/tutorial-mos2-soc-bands.png)
+
+<figcaption style="font-size:0.86em; line-height:1.45;" markdown="1">
+**Band structure.** Light gray: QE DFT; blue: LORRAX GW; orange: BerkeleyGW GW.
+Each dataset is aligned to its own VBM, comparing dispersions and gaps.
+</figcaption>
+</figure>
+
+<figure style="width:3in; max-width:100%; margin:0;" markdown="1">
+
+[![MoS₂ optical absorption: LORRAX in blue and BerkeleyGW in orange, with solid BSE and dashed independent-particle curves.](../assets/figures/tutorial-mos2-soc-absorption.png){ width="288" }](../assets/figures/tutorial-mos2-soc-absorption.png)
+
+<figcaption style="font-size:0.86em; line-height:1.45;" markdown="1">
+**Absorption.** Blue: LORRAX; orange: BerkeleyGW. Solid: BSE; dashed:
+independent particle. Both use the workshop's shifted 8 × 8 × 1 grid.
+</figcaption>
+</figure>
+
+</div>
+
+Click either plot to open the full-resolution image.
 
 | Quantity (eV) | LORRAX | BerkeleyGW |
 |---|---:|---:|
@@ -295,17 +318,34 @@ maximum, so this plot compares dispersions and gaps rather than absolute QP offs
 | Lowest fine-grid BSE state | 2.511020 | 1.591552 |
 | Largest interacting spectral peak | 3.18 | 2.60 |
 
-These fine-grid results use different kernel and QP interpolation methods from
-the same sparse 3 × 3 × 1 coarse grid. Neither is an explicit GW+BSE calculation
-on the 8 × 8 × 1 fine grid, so their difference is not an accuracy verdict on
-either method. Judging interpolation accuracy requires that independent
-fine-grid calculation with matched physical settings.
+Neither workshop spectrum is an explicit GW+BSE calculation on the fine
+grid. Their separation therefore does not identify which interpolation is
+more accurate; the direct-reference tests below address that question.
 
-The separate [9 × 9 → 12 × 12 MoS₂ benchmark](../theory/w-range-splitting.md#example)
-does compare against screening and BSE computed directly on the fine grid,
-with the same QP energies in every arm. LORRAX's SR/LR interpolation was closer
-to that direct result than BerkeleyGW's dual-grid interpolation. The present
-workshop exercise does not repeat that accuracy test.
+### Interpolation validation on denser grids {: #interpolation-validation }
+
+At better-resolved coarse k-grids, including 9 × 9 for MoS₂, the controlled
+comparisons give us strong confidence in LORRAX's SR/LR interpolation.
+Screening and BSE were also computed directly on the fine grid, and the
+QP energies were held fixed across the comparisons. LORRAX's interpolated
+fine-grid spectra closely follow those direct calculations.
+
+[![Interpolation validation: MoS₂ uses a 9×9 coarse and 12×12 fine grid; Si uses 4³ coarse and 8³ fine grids. LORRAX full SR/LR interpolation follows the direct fine-grid absorption, while the BerkeleyGW dual-grid curve deviates more strongly. Lower panels show residuals as a percentage of the spectral peak.](../assets/figures/bse-interp-comparison.png)](../assets/figures/bse-interp-comparison.png)
+
+**Denser-grid validation.** MoS₂ is shown in panels **a, c**, and Si in
+**b, d**. Gray curves are direct coarse-grid calculations, green curves
+are direct fine-grid calculations, light blue is BerkeleyGW dual-grid
+interpolation, and blue dashed is LORRAX's full SR/LR pipeline. The lower
+panels show residuals relative to the fine-grid spectral peak.
+[Open the supplied figure at full size](../assets/figures/bse-interp-comparison.png).
+
+The accompanying [direct-reference energy benchmarks](../theory/w-range-splitting.md#example)
+give mean absolute offsets of **2.65 meV for MoS₂** and **1.41 meV for Si**
+over the lowest 40 excitons. These tests support confidence in the
+interpolation for those denser grids; they are separate from the sparse
+workshop example.
+
+### Export interoperability {: #interop }
 
 A separate test in BerkeleyGW accepted the LORRAX-exported coarse kernel:
 holding BerkeleyGW QP data fixed, its 3,072 exciton energies differed from the
