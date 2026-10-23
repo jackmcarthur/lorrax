@@ -1,4 +1,4 @@
-"""Shared runtime configuration for minimax-based screening and sigma workflows."""
+"""Shared runtime configuration for the minimax-based χ₀ quadratures."""
 
 from __future__ import annotations
 
@@ -7,20 +7,17 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class MinimaxConfig:
-    """Canonical minimax settings shared by χ₀ screening and Σ^c windows.
+    """Minimax settings of the χ₀ rules: static, imaginary probe and MPA lines.
 
-    One frozen, all-scalar (hashable) currency for both quadrature
-    consumers.  Screening builds it with an ``energy_reference``; the
-    Σ^c-window path builds it with the crossing-quadrature controls
-    (``crossing_max_nodes`` / ``crossing_eps_q``).  Each side leaves the
-    other's knobs at their defaults — the merged class carries the union
-    so the Σ-quad defaults live at exactly one site.
+    One frozen, all-scalar (hashable) record.  ``target_error`` is the
+    absolute error of ``1/x`` in Ry⁻¹ (relative for the analytic GN probe
+    and the MPA damped lines), ``max_nodes`` the node cap, and
+    ``energy_reference`` the energy zero of the exponentials
+    (``midgap``/``vbm``/``cbm``/``none``).  The Σ windows do not read this
+    record: their rules come from ``sigma_quadrature_eps`` and the
+    broadening through ``gw.sigma_box_plan``.
     """
 
     target_error: float = 1.0e-6
     max_nodes: int = 64
     energy_reference: str | float | int | None = "midgap"
-    crossing_max_nodes: int = 500
-    crossing_eps_q: float = 1.0e-3
-
-
