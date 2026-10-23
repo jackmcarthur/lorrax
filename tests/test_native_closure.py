@@ -11,13 +11,50 @@ a launch library naming the wrong file, a host SLATE target in a device process)
 from __future__ import annotations
 
 import importlib.util
+import io
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from lxkit import native_provider as npv
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+def test_mapped_paths_deduplicates_segments_before_resolving_aliases(tmp_path, monkeypatch):
+    first, second = tmp_path / "libfirst.so", tmp_path / "libsecond.so"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    alias = tmp_path / "libalias.so"
+    alias.symlink_to(first)
+    raw_paths = [str(first)] * 5 + [str(alias)] * 4 + [str(second)] * 3
+    rows = [f"1000-2000 r--p 0000 00:00 1 {path}\n" for path in raw_paths]
+    rows += [f"1000-2000 r--p 0000 00:00 1 {second} (deleted)\n",
+             "1000-2000 rw-p 0000 00:00 0 [heap]\n"]
+    maps_text = ["".join(rows)]
+    realpath = npv.os.path.realpath
+    calls = []
+
+    def resolve(path):
+        calls.append(path)
+        return realpath(path)
+
+    previous = {Path(resolve(line.rsplit(maxsplit=1)[-1]))
+                for line in rows if "/" in line and not line.rstrip().endswith(" (deleted)")}
+    assert len(calls) == 12
+    calls.clear()
+    monkeypatch.setattr(npv, "open", lambda *a, **k: io.StringIO(maps_text[0]), raising=False)
+    monkeypatch.setattr(npv, "os", SimpleNamespace(path=SimpleNamespace(realpath=resolve)))
+    assert npv._mapped_paths() == previous == {first, second}
+    assert sorted(calls) == sorted({str(first), str(alias), str(second)})
+    # The next scan resolves again, including a symlink changed in between.
+    alias.unlink()
+    alias.symlink_to(second)
+    maps_text[0] = "".join(f"1000-2000 r--p 0000 00:00 1 {alias}\n" for _ in range(4))
+    calls.clear()
+    assert npv._mapped_paths() == {second}
+    assert calls == [str(alias)]
 
 
 class _Unusable(OSError):
