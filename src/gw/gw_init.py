@@ -2519,45 +2519,68 @@ def _compute_scalar_vq(
     return V_q_raw, G0_all, head_channel
 
 
-def _coulomb_on_wedge(V_full, *, sym, centroid_indices, meta):
-    """Canonical full-zone Coulomb → packed representative rows for the run.
+def _select_coulomb_q_rows(V_full, *, sym, centroid_indices, meta):
+    """Select canonical representative rows before the full parent is released.
 
-    All-q validation and the canonical restart write precede this seam.  Select
-    the q representatives before either centroid axis is packed: keeping a
-    packed full-zone copy beside the canonical input serves no consumer.
+    Return the array and the existing packed-basis q tables separately. The
+    driver assigns this result before packing, so its full-zone input has no
+    remaining owner when the packing program allocates its staging buffers.
+    All-q validation and restart I/O have already consumed that input.
     """
-    from ffi import _services
-    _services.ensure_on_path()
     from symmetry_maps import QirrOperator
     from lxkit import memory
     from runtime.aot_memory import agreed_chunk, compiled_new_bytes
     from .v_q_g_flat import q_wedge
     wedge = q_wedge(sym=sym, centroid_indices=centroid_indices, meta=meta,
                     context="bare V on the q wedge")
-    basis = getattr(meta, 'mu_basis', None)
-    rows = None if wedge is None else np.asarray(wedge[0]['full_rows'])
-    spec = V_full.sharding.spec
+    if wedge is None:
+        return V_full, None
+    tables = wedge[0]
+    rows = np.asarray(tables['full_rows'])
 
     @jax.jit
-    def select_and_pack(values):
-        selected = (values if rows is None
-                    else QirrOperator.of(values).at_rows(rows))
-        return selected if basis is None else basis.pack_operator(selected, spec=spec)
+    def select(values):
+        return QirrOperator.of(values).at_rows(rows)
 
-    # Price the selection and the existing coupled-axis pack together, while
-    # the canonical full-zone argument is still live, then run that executable.
-    compiled = select_and_pack.lower(V_full).compile()
+    compiled = select.lower(V_full).compile()
     need = -agreed_chunk(-compiled_new_bytes(compiled))
     ranks = int(V_full.sharding.mesh.size)
-    source = "canonical Coulomb representative rows and centroid packing"
+    source = "canonical Coulomb representative rows"
     memory.admit(source,
                  [(source, memory.priced(0, source, spread=need*ranks,
                                          ranks=ranks))],
                  agreed_chunk(int(memory.room())))
-    packed = compiled(V_full)
+    selected = compiled(V_full)
+    # Completion is needed for the memory handoff, independently of timing:
+    # the caller can now drop the last full-zone reference before packing.
+    jax.block_until_ready(selected)
+    return selected, tables
+
+
+def _coulomb_on_wedge(V_selected, *, q_tables, meta):
+    """Pack selected canonical rows and attach the existing q-wedge tables."""
+    from symmetry_maps import QirrOperator
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    basis = getattr(meta, 'mu_basis', None)
+    spec = V_selected.sharding.spec
+
+    @jax.jit
+    def pack(values):
+        return values if basis is None else basis.pack_operator(values, spec=spec)
+
+    compiled = pack.lower(V_selected).compile()
+    need = -agreed_chunk(-compiled_new_bytes(compiled))
+    ranks = int(V_selected.sharding.mesh.size)
+    source = "canonical Coulomb centroid packing"
+    memory.admit(source,
+                 [(source, memory.priced(0, source, spread=need*ranks,
+                                         ranks=ranks))],
+                 agreed_chunk(int(memory.room())))
+    packed = compiled(V_selected)
     timing.stage_wait(packed)
-    return (QirrOperator.of(packed) if wedge is None
-            else QirrOperator(values=packed, **wedge[0]))
+    return (QirrOperator.of(packed) if q_tables is None
+            else QirrOperator(values=packed, **q_tables))
 
 
 def _finalize_vq_views(
@@ -3360,8 +3383,9 @@ def prepare_isdf_and_wavefunctions(
 	# From here on the bare Coulomb is packed on the run's q wedge, the one
 	# screening solves W on: its representative rows, where the unfold is
 	# the identity, so the full zone is not kept past this line.
-	V_qmunu = _coulomb_on_wedge(V_qmunu, sym=sym, centroid_indices=centroid_indices,
-	                            meta=meta)
+	V_qmunu, _coulomb_q_tables = _select_coulomb_q_rows(
+	    V_qmunu, sym=sym, centroid_indices=centroid_indices, meta=meta)
+	V_qmunu = _coulomb_on_wedge(V_qmunu, q_tables=_coulomb_q_tables, meta=meta)
 	if green_parent_carrier is not None:
 		wfns = replace(wfns, green_parent=green_parent_carrier)
 	for family, bundle in (("charge", wfns), ("current", wfns_transverse)):

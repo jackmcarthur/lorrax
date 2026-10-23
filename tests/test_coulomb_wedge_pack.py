@@ -1,6 +1,7 @@
 """P4 independent canonical→q-wedge→packed Coulomb seam and all-q checks."""
 import runtime
 import numpy as np
+import weakref
 
 
 def main():
@@ -49,7 +50,8 @@ def main():
     try:
         for reduced in (False, True):
             vq.q_wedge = lambda **kw: (tables, None) if reduced else None
-            result = owner._coulomb_on_wedge(dev, sym=None, centroid_indices=None, meta=meta)
+            chosen, qt = owner._select_coulomb_q_rows(dev, sym=None, centroid_indices=None, meta=meta)
+            result = owner._coulomb_on_wedge(chosen, q_tables=qt, meta=meta)
             selected = canonical[rows] if reduced else canonical
             expected = basis.pack_host(basis.pack_host(selected, axis=-2), axis=-1)
             np.testing.assert_array_equal(np.asarray(gather_to_host(result.values)), expected)
@@ -64,6 +66,16 @@ def main():
                     x = phase[:, None]*expected[parent]*phase.conj()[None, :]
                     literal.append(x.conj() if action >= 2 else x)
                 np.testing.assert_allclose(full, np.asarray(literal), rtol=2e-13, atol=2e-13)
+        # The actual driver assignment must release the complete canonical
+        # carrier before the packed output/staging program is entered.
+        transient = device_put_process_local(canonical, sh)
+        full_ref = weakref.ref(transient)
+        transient, qt = owner._select_coulomb_q_rows(
+            transient, sym=None, centroid_indices=None, meta=meta)
+        assert full_ref() is None, 'full canonical parent survived the row assignment'
+        result = owner._coulomb_on_wedge(transient, q_tables=qt, meta=meta)
+        expected = basis.pack_host(basis.pack_host(canonical[rows], axis=-2), axis=-1)
+        np.testing.assert_array_equal(np.asarray(gather_to_host(result.values)), expected)
         # Finite checks must inspect nonrepresentative rows too, before packing.
         bad = canonical.copy(); bad[6, 0, 0] = np.nan
         baddev = device_put_process_local(bad, sh)

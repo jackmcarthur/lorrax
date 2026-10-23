@@ -729,18 +729,19 @@ The fresh restart writer uses its authenticated canonical pre-unfold capture
 on a reduced grid, or the canonical full operator on an unreduced grid.
 Neither arm needs a packed full-zone operator.
 
-Before returning the ISDF state, both fresh and restart routes call
-`gw.gw_init._coulomb_on_wedge`: select the canonical representative q rows,
-then convert both centroid axes through the existing q-tiled operator owner,
-and only then attach the packed wedge tables. The combined selection/packing
-executable is compiled, priced and admitted against current room before that
-same executable runs. Screening and Σ retain only `V_qirr(mu_X,nu_Y)`
-(`16·N_q,irr·μ_packed²/P`). The canonical full input still lives during this
-seam, but no packed full-q copy is created on a reduced grid. Price the
-full-zone input and the actual compiled selection/packing scratch at
-initialization, rather than carrying a full operator as a Σ-stage resident.
-Earlier full-zone charge-normal construction/FFT peaks are separate and
-are not removed by selecting before packing.
+Before returning the ISDF state, both fresh and restart routes select the
+canonical representative q rows through `gw.gw_init._select_coulomb_q_rows`.
+The completed selection is assigned in the driver, releasing the full-zone
+parent before `_coulomb_on_wedge` converts both centroid axes through the
+existing q-tiled operator owner and attaches the packed wedge tables. Each
+executable is compiled, priced and admitted against current room before it
+runs. Screening and Σ retain only `V_qirr(mu_X,nu_Y)`
+(`16·N_q,irr·μ_packed²/P`). On an unreduced grid the full-q input is retained
+because it is the required selected carrier. Price the full-zone input and
+the actual compiled selection scratch at initialization, and the selected
+input and packing scratch separately. Full-zone normal construction,
+unfolding, all-q gates and restart-write peaks remain separate; releasing
+the parent before packing does not remove those earlier peaks.
 
 ## What the closed forms cannot see
 
