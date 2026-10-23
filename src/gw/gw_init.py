@@ -2809,79 +2809,84 @@ def _write_fresh_restart(
         write_restart_state_to_h5):
     """Write the existing authenticated Coulomb and parent-face restart bundle."""
     enk_full, _ = get_enk_bandrange(
-    	wfn, sym, band_slices.full_range,
-    	(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
+        wfn, sym, band_slices.full_range,
+        (band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
     _write_restart = restart_tensor_writes_enabled(
-    	cfg, tensors_filename)
+        cfg, tensors_filename)
     _qirr = resolve_restart_q_storage_for_run(
-    	cfg, sym=sym, centroid_indices=centroid_indices,
-    	fft_grid=meta.fft_grid, print_fn=print0)
+        cfg, sym=sym, centroid_indices=centroid_indices,
+        fft_grid=meta.fft_grid, print_fn=print0)
     if _write_restart:
-    	from file_io import coulomb_policy_from_config
-    	from file_io.qp_wfn import (
-    		qp_state_source_provenance_from_binding)
-    	from file_io.restart_bundle import read_bispinor_v_receipt
-    	write_restart_state_to_h5(
-    		tensors_filename,
-    		n_rmu_logical=int(meta.n_rmu),
-    		coulomb_policy=coulomb_policy_from_config(cfg, meta),
-    		V_qmunu=_to_file_order(V_qmunu, (-2, -1)),
-    		G0_mu_nu=G0, enk_full=enk_full,
-    		init_W0=True, mesh=mesh_xy,
-    		mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
-    		qp_state_source_record=(
-    			qp_state_source_provenance_from_binding(
-    			wfn,
-    			wfn_fingerprint_binding=(
-    				basis_wfn_fingerprint_binding))),
-    		charge_zeta_identity=charge_zeta_identity_receipt,
-    		bispinor_v_receipt=(None if wfns_transverse is None else
-    			read_bispinor_v_receipt(os.path.join(
-    				os.path.dirname(tensors_filename), "v_q_bispinor.h5"))),
-    		band_slices=band_slices,
-    		zeta_fit_windows=zeta_fit_band_ranges(
-    			band_slices,
-    			resolve_zeta_fit_edge(band_slices, getattr(cfg, "zeta_nband", None)),
-    			log=lambda _message: None),
-    		qirr=_qirr.with_capture(
-    			take_pre_unfold("V_qmunu")),
-    	)
+        from file_io import coulomb_policy_from_config
+        from file_io.qp_wfn import (
+                qp_state_source_provenance_from_binding)
+        from file_io.restart_bundle import read_bispinor_v_receipt
+        _qirr = _qirr.with_capture(take_pre_unfold("V_qmunu"))
+        # The wedge writer persists this authenticated canonical block.  Do not
+        # unpack the unused full-zone operator before it substitutes the capture.
+        V_for_write = (_qirr.capture.X_ibz
+                if _qirr.store_wedge and _qirr.capture is not None
+                else _to_file_order(V_qmunu, (-2, -1)))
+        write_restart_state_to_h5(
+                tensors_filename,
+                n_rmu_logical=int(meta.n_rmu),
+                coulomb_policy=coulomb_policy_from_config(cfg, meta),
+                V_qmunu=V_for_write,
+                G0_mu_nu=G0, enk_full=enk_full,
+                init_W0=True, mesh=mesh_xy,
+                mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
+                qp_state_source_record=(
+                        qp_state_source_provenance_from_binding(
+                        wfn,
+                        wfn_fingerprint_binding=(
+                                basis_wfn_fingerprint_binding))),
+                charge_zeta_identity=charge_zeta_identity_receipt,
+                bispinor_v_receipt=(None if wfns_transverse is None else
+                        read_bispinor_v_receipt(os.path.join(
+                                os.path.dirname(tensors_filename), "v_q_bispinor.h5"))),
+                band_slices=band_slices,
+                zeta_fit_windows=zeta_fit_band_ranges(
+                        band_slices,
+                        resolve_zeta_fit_edge(band_slices, getattr(cfg, "zeta_nband", None)),
+                        log=lambda _message: None),
+                qirr=_qirr,
+        )
     if _write_restart:
-    	parent_T = None if wfns_transverse is None else wfns_transverse.green_parent
-    	basis_T = None if transverse_wfn_data is None else transverse_wfn_data['meta'].mu_basis
-    	write_restart_state_to_h5(
-    		tensors_filename,
-    		n_rmu_logical=int(meta.n_rmu),
-    		psi_parent_y=_to_file_order(sigma_parent_carrier.psi_nmu, (3,)),
-    		psi_parent_y_mun=_to_file_order(sigma_parent_carrier.psi_mun, (2,)),
-    		parent_k_rows=_candidate_plan.parent_full_rows,
-    		psi_layout=sigma_parent_carrier.layout,
-    		mesh=mesh_xy, mode="a",
-    		psi_parent_y_transverse=(
-    			_to_file_order(parent_T.psi_nmu, (3,), basis_T) if parent_T is not None else None),
-    		psi_parent_y_transverse_mun=(
-    			_to_file_order(parent_T.psi_mun, (2,), basis_T) if parent_T is not None else None),
-    		n_rmu_transverse_logical=(
-    			int(transverse_wfn_data['meta'].n_rmu)
-    			if transverse_wfn_data is not None else None),
-    	)
-    	if jax.process_index() == 0:
-    		try:
-    			with h5py.File(tensors_filename, 'a') as _f:
-    				_f.attrs['centroids_charge_md5'] = (
-    					_centroid_table_md5(centroid_indices))
-    				_f.attrs['charge_representation'] = (
-    					resolve_four_current_representation(
-    						cfg.bispinor, cfg.bispinor_gw).charge_representation)
-    				if transverse_wfn_data is not None:
-    					_f.attrs['centroids_transverse_md5'] = (
-    						_centroid_table_md5(
-    							transverse_wfn_data['centroid_indices']))
-    		except Exception as exc:
-    			log.info(f"    [restart stamp] centroid content hashes "
-    			       f"not stamped ({exc}); a restart will warn "
-    			       f"instead of verifying the centroid tables.")
-    	barrier("restart_centroid_stamp")
+        parent_T = None if wfns_transverse is None else wfns_transverse.green_parent
+        basis_T = None if transverse_wfn_data is None else transverse_wfn_data['meta'].mu_basis
+        write_restart_state_to_h5(
+                tensors_filename,
+                n_rmu_logical=int(meta.n_rmu),
+                psi_parent_y=_to_file_order(sigma_parent_carrier.psi_nmu, (3,)),
+                psi_parent_y_mun=_to_file_order(sigma_parent_carrier.psi_mun, (2,)),
+                parent_k_rows=_candidate_plan.parent_full_rows,
+                psi_layout=sigma_parent_carrier.layout,
+                mesh=mesh_xy, mode="a",
+                psi_parent_y_transverse=(
+                        _to_file_order(parent_T.psi_nmu, (3,), basis_T) if parent_T is not None else None),
+                psi_parent_y_transverse_mun=(
+                        _to_file_order(parent_T.psi_mun, (2,), basis_T) if parent_T is not None else None),
+                n_rmu_transverse_logical=(
+                        int(transverse_wfn_data['meta'].n_rmu)
+                        if transverse_wfn_data is not None else None),
+        )
+        if jax.process_index() == 0:
+                try:
+                        with h5py.File(tensors_filename, 'a') as _f:
+                                _f.attrs['centroids_charge_md5'] = (
+                                        _centroid_table_md5(centroid_indices))
+                                _f.attrs['charge_representation'] = (
+                                        resolve_four_current_representation(
+                                                cfg.bispinor, cfg.bispinor_gw).charge_representation)
+                                if transverse_wfn_data is not None:
+                                        _f.attrs['centroids_transverse_md5'] = (
+                                                _centroid_table_md5(
+                                                        transverse_wfn_data['centroid_indices']))
+                except Exception as exc:
+                        log.info(f"    [restart stamp] centroid content hashes "
+                               f"not stamped ({exc}); a restart will warn "
+                               f"instead of verifying the centroid tables.")
+        barrier("restart_centroid_stamp")
 
 def _prepare_fresh_isdf(
         WavefunctionBasisReceipt, _basis_band_interval, _to_file_order, band_slices,
@@ -3294,12 +3299,16 @@ def prepare_isdf_and_wavefunctions(
 	def _to_run_order(array, mu_axes, basis=_mu_basis):
 		if array is None or basis is None:
 			return array
+		if tuple(int(axis) % array.ndim for axis in mu_axes) == (array.ndim - 2, array.ndim - 1):
+			return basis.pack_operator(array)
 		for axis in mu_axes:
 			array = basis.pack_axis(array, axis)
 		return array
 	def _to_file_order(array, mu_axes, basis=_mu_basis):
 		if array is None or basis is None:
 			return array
+		if tuple(int(axis) % array.ndim for axis in mu_axes) == (array.ndim - 2, array.ndim - 1):
+			return basis.unpack_operator(array)
 		for axis in mu_axes:
 			array = basis.unpack_axis(array, axis)
 		return array

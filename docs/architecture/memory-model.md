@@ -722,6 +722,14 @@ retains only `V_qirr(mu_X,nu_Y)` (`16·N_q,irr·μ²/P`) for screening and Σ.
 Price the full-zone transient at initialization, rather than carrying it
 as a Σ-stage resident.
 
+The reduced-q restart writer canonicalizes its captured
+`V_qirr(mu_X,nu_Y)` directly; it never converts the unused full-zone argument
+before selecting that capture. A natural full-q write and a restart read
+convert both centroid axes through the existing q-tiled operator owner,
+rather than two independent whole-stack axis conversions. Their input and
+output operators remain resident, while permutation scratch follows the
+operator's q-tile bound.
+
 ## What the closed forms cannot see
 
 ### The compiled check

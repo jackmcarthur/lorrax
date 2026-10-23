@@ -522,7 +522,12 @@ then `PROGRESS` every 60 s, then `COMPLETE`.
 `tmp/isdf_tensors_<N_μ>.h5` is written by
 `tagged_arrays.write_restart_state_to_h5` through SlabIO at the logical μ
 extent, so a bundle reads at any device count. Its contents are listed in
-[`drivers.md`](../drivers.md). `restart_bundle.read_restart_state_from_h5`
+[`drivers.md`](../drivers.md). A reduced-q write binds the producer's
+canonical pre-unfold capture before choosing its V operand; the writer
+authenticates that capture. It does not canonicalize an unused full-zone V.
+Paired centroid-axis conversions
+use `PackedCentroidBasis.pack_operator` / `unpack_operator`, whose q tiles
+bound their permutation scratch. `restart_bundle.read_restart_state_from_h5`
 reads it in two passes, and never holds an h5py handle and a SlabIO handle on
 the file at once:
 
