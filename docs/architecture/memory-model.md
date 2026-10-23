@@ -135,12 +135,24 @@ a provider context under `linalg = local` carries it as its `outside` term
 | site | routes |
 |---|---|
 | W Dyson (`gw.w_isdf._dyson_route`) | local: faces + $16\mu^2(3\lceil Q/P\rceil + 2)$; distributed: faces + one LU pair + contexts |
+| response-bank Coulomb roots (`gw.response_bank._select_coulomb_program`) | complete compiled checked program for both roots plus native GEMM/eigh workspace and contexts; local first, existing distributed algebra when it does not fit |
 | SC eigh, density scan (`gw.sc_iteration`, `gw.qsgw_density`) | one $(n_b, n_b)$ tile within 1 % of `B`; cuSOLVERMp eigh / `band_2d` |
 | tangential whole parents, constructor, staged eigh stacks (`gw.tangential_execution`) | the local route's compiled programs; the face / whole mesh + contexts |
 | head Γ GEMM (`gw.tangential_head._gamma_gemm_route`), ζ face GEMMs | staged where its program compiled fits the room (`distrib_la.staged_fits`); `panel_matmul` faces |
 | transverse ζ factor, Galerkin factor, coarse V(q) chunk | each route's own program compiled (`runtime.aot_memory.compiled_price`) |
 | htransform node-pair stages: fine-q top block, path and active window, orbital operators, moment grid (`bandstructure.fh_interp.admit_node_route`) | `q-batched`: whole $(N_B, N_B)$ matrices of the rank's q rows after one face→q exchange; `face`: one q tiled over the mesh (`linalg = distributed` pins it); each route's program compiled, the chosen executable then run |
 | nodal fit: quadrature metric, band/node Grams (`isdf.galerkin`) | orbit normal equations and every nonnegative principal solve on `P(x,y)`; point-pair scratch streamed in bounded blocks; band Gram, Loewdin and coefficients on band/rank faces through `distrib_la`; only linear geometry, orbit weights and eigenvalue vectors reach hosts |
+
+The response bank prices the complete requested q stack of `V^(1/2)` and
+its supported inverse before dispatch. One parent fitting the eigensolver
+does not imply that both reconstructions and the stack's native workspace
+fit. Admission uses `compiled_new_bytes` beside the already-live input,
+including the existing checked retry, and the same provider queries used
+by dispatch. The selected program carries its dense layout into that query;
+its full checked EIGH is queried on the whole mesh even when the subsequent
+root reconstructions use local GEMMs.
+Both outputs remain `H_q(mu_X,nu_Y)` faces. The programs and executable
+caches retain geometry and plans, never the Coulomb input.
 
 The nodal fit keeps sampled states on centroid faces. Whole-orbit packing
 allows each rank to accumulate its normal-equation tile without gathering

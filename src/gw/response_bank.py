@@ -1030,7 +1030,13 @@ def _reserve(meta, stage, resident, workspace=0, runs_in=None, book=True):
 
 @lru_cache(maxsize=32)
 def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
-    """Query the dense provider on actual bank shapes, before allocation."""
+    """Query the providers of the actual bank programs, before allocation.
+
+    Coulomb-root admission compiles checked_program.lower: its whole-chain
+    EIGH runs on the complete mesh, including when the reconstruction GEMMs
+    use local batches. Price that solver, not a local EIGH stack that the
+    admitted executable does not run.
+    """
     from distrib_la import plan, workspace_bytes_per_rank
     from .gw_config import linalg_resolution
     resolution = linalg_resolution({"linalg": layout})
@@ -1038,7 +1044,9 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
         backend="off" if layout == "local" else "distributed",
         batched_route=resolution.batched_route)
     gemm = workspace_bytes_per_rank(policy,"gemm",((batch,n,n),(batch,n,n)),np.complex128)
-    eig = workspace_bytes_per_rank(policy,"eigh",((batch,n,n),),np.complex128) if with_eigh else 0
+    eig_policy = (plan("eigh", mesh_xy, n=n, backend="distributed", batched_route="auto")
+                  if with_eigh and layout == "local" else policy)
+    eig = workspace_bytes_per_rank(eig_policy,"eigh",((batch,n,n),),np.complex128) if with_eigh else 0
     return dict(gemm=gemm,eigh=eig,total=gemm+eig,scope="actual-shape ISERV query; GEMM persistent plus concurrent eigh scratch")
 
 
@@ -1115,7 +1123,8 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                                   memory.temp_size_in_bytes + int(runtime_bytes),
                                   runs_in="bank.dispatch." + stage, book=False)
             else:
-                layout = dense_layout(meta, config, mesh_xy, args[0].shape[-1])
+                layout = getattr(kernel, "dense_layout", None) or dense_layout(
+                    meta, config, mesh_xy, args[0].shape[-1])
                 native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
                     with_eigh=stage=="coulomb_sqrt")
                 receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
@@ -1207,7 +1216,45 @@ def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout, room=None):
         hi = matmul(vectors * inverse[:, None, :], vectors, transb="C",
                     mesh=mesh_xy, backend=backend, batched_route=resolution.batched_route)
         return h, hi, jnp.any(lam < -tolerance * scale), jnp.sum(supported, axis=-1)
+    sqrt_v.dense_layout = layout
     return sqrt_v
+
+
+def _select_coulomb_program(proposed, values, *, mesh_xy, n_logical, layout):
+    """Admit the complete root program before running a whole-parent route.
+
+    A single eigensolve fitting does not imply that the stack's two root
+    reconstructions and its native workspace fit. Keep the existing local
+    route when its actual compiled program fits; otherwise price the same
+    algebra through the existing distributed backend.
+    """
+    from dataclasses import replace
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+
+    programs = {}
+    ranks, n, batch = int(mesh_xy.size), int(values.shape[-1]), int(values.shape[0])
+
+    def price(candidate):
+        kernel = (proposed if candidate == layout else
+                  _coulomb_algebra(mesh_xy, n, n_logical, candidate))
+        programs[candidate] = kernel
+        executable = _compiled(kernel, (values,))
+        native = response_dense_workspace(mesh_xy, n, batch, candidate, with_eigh=True)
+        need = -agreed_chunk(-compiled_new_bytes(executable, extra=native["total"]))
+        source = f"compiled {candidate} Coulomb roots plus native workspace"
+        priced = replace(memory.priced(0, source, spread=need*ranks, ranks=ranks),
+                         whole=n if candidate == "local" else 0)
+        # Both checked programs include the whole-mesh eigensolver retry.
+        # The shared policy charges its contexts only when the run budget
+        # did not already withhold them for distributed linalg.
+        return priced + memory.Price(outside=memory.contexts()) if ranks > 1 else priced
+
+    candidates = (layout,) if layout != "local" else ("local", "distributed")
+    chosen = memory.admit("Coulomb root program",
+        [(candidate, lambda candidate=candidate: price(candidate)) for candidate in candidates],
+        memory.room())
+    return programs[chosen]
 
 
 @lru_cache(maxsize=8)
@@ -1384,6 +1431,9 @@ def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
                 offset=(q_span[0], 0, 0), partition_spec=spec)
             v = compiled(canonical)
         del canonical
+    with timing.section("bank.plan.coulomb_roots"):
+        kernel = _select_coulomb_program(kernel, v, mesh_xy=mesh_xy,
+                                         n_logical=basis.n_logical, layout=layout)
     h, hi, negative, ranks = execute(kernel, (v,), "coulomb_sqrt")
     if bool(negative):
         raise ValueError("GATE response_coulomb_psd: resolved negative eigenvalue")
