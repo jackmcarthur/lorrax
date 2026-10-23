@@ -9,11 +9,13 @@ The binding rulings behind breaking changes are in
 
 - A one-shot `compute_mode = tangential` run (scalar, insulator) now persists as `W0_qmunu` the W of one
   extra static χ₀ build and Dyson solve at ω = 0 (the `cohsex` static path), and writes the srlr channels
-  `W0_lr` from the same χ₀, so a `kgrid_fine` BSE runs on it instead of stopping at
-  `GATE srlr_restart_channels`. The log says "W0 for BSE: static Dyson solve at omega = 0".
+  `W0_lr` and the static route's Γ head (`whead`, `S_cart_head`) from the same χ₀, so a `kgrid_fine` BSE
+  runs on it instead of stopping at `GATE srlr_restart_channels`. The log says "W0 for BSE: static Dyson
+  solve at omega = 0".
 - Results that move: the stored W0 body (before: the tangential model evaluated at ω = 0; 13.6 % of max|W0|
-  apart on the H2 fixture, ~1e-5 on CrI3), so BSE on a new tangential restart moves too. The W0 body and
-  `W0_lr` equal a `cohsex` restart's bit for bit. Σ, QP tables and the stored head are unchanged.
+  apart on the H2 fixture, ~1e-5 on CrI3) and, under `head_correction = full`, the stored head (before: the
+  tangential head at ω = 0; `whead` 26 % apart on H2), so BSE on a new tangential restart moves too. W0,
+  `W0_lr`, the head and the BSE excitons equal a `cohsex` restart's bit for bit. Σ and QP tables are unchanged.
 - Cost: one static screening stage (χ₀ on the static minimax rule + one Dyson solve on the q wedge) when the
   restart is written. QSGW tangential and the bispinor tangential routes still store the model W0 without
   `W0_lr`.

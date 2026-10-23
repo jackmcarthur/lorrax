@@ -967,10 +967,12 @@ def restart_static_w(mode, W_by_role, V_q, *, config, meta, mesh_xy,
     One-shot scalar tangential (``static_solve_inputs`` given: the
     screening ``wfns``, the static minimax ``quad`` and ``e_ref``, ``sym``,
     ``centroid_indices``, ``occupation_state``): ONE static χ₀ build and
-    Dyson solve through :func:`compute_static_w` (role ``static``), so W0
-    and the srlr long-range channels (``W0_lr``, :mod:`gw.lr_channels`)
-    come from the same χ₀(0) and the split W = J + F̃ᴴDF̃ the fine-grid BSE
-    uses is exact.  The tangential support set holds no z = 0 sample (its
+    Dyson solve, the static route's own
+    (:func:`gw.static_screening.build_static_screened_w`: role ``static``
+    through :func:`compute_static_w`, then its q → 0 head fold), so W0, the
+    srlr long-range channels (``W0_lr``, :mod:`gw.lr_channels`) and the
+    stored Γ head come from the same χ₀(0) and the split W = J + F̃ᴴDF̃ the
+    fine-grid BSE uses is exact.  The callable returns ``(W0, head)``.  The tangential support set holds no z = 0 sample (its
     imaginary ladder is geometric, > 0), so the channels cannot be taken
     from the bank.  No head channel is placed: the tangential Σ's W has
     none either.  Σ never reads this W.
@@ -1006,11 +1008,14 @@ def restart_static_w(mode, W_by_role, V_q, *, config, meta, mesh_xy,
     if static_solve_inputs is not None and not bool(getattr(config, "bispinor", False)):
         def solve():
             log.info("  W0 for BSE: static Dyson solve at omega = 0 "
-                     "(+1 chi0 build and Dyson solve); srlr channels from the same chi0")
+                     "(+1 chi0 build and Dyson solve); srlr channels and "
+                     "Gamma head from the same chi0")
+            from .static_screening import build_static_screened_w
             s = dict(static_solve_inputs)
-            return compute_static_w(
-                s.pop("wfns"), V_q, s.pop("quad"), config=config, meta=meta,
-                mesh_xy=mesh_xy, role="static", **s)
+            return build_static_screened_w(
+                s.pop("wfns"), V_q, config=config, meta=meta, mesh_xy=mesh_xy,
+                head_resolver=head_source,
+                quadrature=(s.pop("quad"), s.pop("e_ref")), print_fn=print_fn, **s)
 
         return solve
     handle = W_by_role["tangential"]
