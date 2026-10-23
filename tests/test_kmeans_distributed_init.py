@@ -130,14 +130,20 @@ def main():
     # The generic positions[argmax] twin previously gathered every point.
     def large_collectives(executable):
         found = []
+        forbidden = {(extent,) for extent in (physical, tag.carrier)}
+        forbidden |= {(extent, 3) for extent in (physical, tag.carrier)}
         for line in executable.as_text().splitlines():
-            if ' all-gather(' not in line and ' all-reduce(' not in line:
+            collective = re.search(
+                r'\b(?:all-gather|all-reduce)(?:-start|-done)?\(', line)
+            if collective is None:
                 continue
-            shape = re.search(r'= (?:f64|s64|s32|u32)\[([0-9,]*)\]', line)
-            if shape:
-                dims = tuple(int(x) for x in shape.group(1).split(',') if x)
-                if dims in ((tag.carrier,), (tag.carrier, 3)):
-                    found.append(line)
+            # Async GPU starts can return (input, output) tuples. Check
+            # every result array, including logical pre-padding grids.
+            shapes = re.findall(r'\b(?:[bfsuc]\d+|pred)\[([0-9,]*)\]',
+                                line[:collective.start()])
+            if any(tuple(int(x) for x in shape.split(',') if x) in forbidden
+                   for shape in shapes):
+                found.append(line)
         return found
 
     metric = jnp.asarray(np.diag([1., 1.4, 2.]))
