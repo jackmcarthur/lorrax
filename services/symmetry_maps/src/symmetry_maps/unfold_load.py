@@ -362,14 +362,17 @@ class QirrOperator:
         rows = np.asarray(self.irr_idx)[qn].astype(np.int32)
         syms = np.asarray(self.sym_idx)[qn].astype(np.int32)
         L0 = np.zeros_like(np.asarray(self.L_table, dtype=np.float64))
+        # This cache and the fitted-pole program outlive the input operator.
+        # Keep only the key's metadata; each lane field is the mask operand.
+        template = key[0].rebuild(None)
 
         def partner(mask):
             import jax.numpy as _jnp
             field = _jnp.where(mask, 1.0, 0.0).astype(_jnp.complex128)
             moved = unfold_isdf_operator(
-                field, irr_idx=rows, sym_idx=syms, sym_perm=self.sym_perm, L_table=L0,
-                q_irr_frac=self.q_irr_frac, mesh_xy=mesh_xy,
-                n_sym_spatial=self.n_sym_spatial, trs_rule="conj")
+                field, irr_idx=rows, sym_idx=syms, sym_perm=template.sym_perm, L_table=L0,
+                q_irr_frac=template.q_irr_frac, mesh_xy=mesh_xy,
+                n_sym_spatial=template.n_sym_spatial, trs_rule="conj")
             return _jnp.real(moved) > 0.5
         _partner_cache[key] = partner
         return partner
