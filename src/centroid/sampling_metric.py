@@ -53,7 +53,7 @@ def _transverse_metric_diagonal(
     return out * jnp.square(current_scale)
 
 
-@partial(jax.jit, static_argnames=("mode",))
+@partial(jax.jit, static_argnames=("mode",), donate_argnums=(0,))
 def _accumulate_metric_rows(row_fields, density_left, density_right,
                             row_weights, *, mode):
     """``A_g += sum_k W[k, g] Tr(D_Lk Gamma D_Rk Gamma)`` for one k chunk.
@@ -73,10 +73,16 @@ def _accumulate_metric_rows(row_fields, density_left, density_right,
         fields.reshape(fields.shape[0], -1), optimize=True)
 
 
-@jax.jit
+@partial(jax.jit, donate_argnums=(0,))
 def _accumulate_grid_pullback(accumulator, field, pullback, member_weight):
     """Add one service-owned scalar pullback without a host field copy."""
     return accumulator + member_weight * field.reshape(-1)[pullback]
+
+
+@partial(jax.jit, donate_argnums=(0,))
+def _accumulate_density_matrix(accumulator, part):
+    """Add one band tile, reusing the old running density's buffer."""
+    return accumulator + part
 
 
 def _validated_range(band_range, nbands: int, name: str) -> tuple[int, int]:
@@ -378,7 +384,11 @@ def build_feature_metric_diagonal(
                     per_k=True, memory_budget_bytes=budget)
                 if ns == 1:                      # the 1x1 matrix is rho_k
                     part = part[:, None, None].astype(jnp.complex128)
-                density[w] = part if density[w] is None else density[w] + part
+                density[w] = (part if density[w] is None
+                              else _accumulate_density_matrix(density[w], part))
+                # The first part is the running density itself. Drop only
+                # this Python reference, never delete its device buffer.
+                del part
             del psi_g
         row_fields = _accumulate_metric_rows(
             row_fields, density[0], density[-1],

@@ -524,6 +524,15 @@ device data are not retained. Packed-mask reshards and insertions stay local
 to the request. This avoids repeated tracing, lowering and persistent-cache
 reads on warm calls without retaining sampled faces or request-index tables.
 
+The centroid feature metric donates its overwritten density accumulator,
+symmetry-row field bank and final scalar grid to their update programs.
+Only the old accumulator is donated; the incoming band tile and the two
+density operands remain valid. The first band tile becomes the running
+density directly. Its temporary Python name is released after every window
+update, so the final tile does not stay live across the next WFN load or
+the symmetry fold. These updates preserve the existing band, k and symmetry
+sum order and the replicated density layout.
+
 When `0 < c < b` and `c` divides `b`, chunks stay within one k row. An
 outer k scan retains that row's inverse and phase data while an inner band
 scan reuses it; crossing-k chunks keep the flat scan. Both scans have
