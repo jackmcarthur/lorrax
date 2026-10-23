@@ -678,9 +678,22 @@ For the charge channel, `ZetaG.contract_v` accumulates `V_q` tile by tile as
 it forms ζ from the Z store, keeping ζ only at the columns the head consumers
 name.
 
-`V_q` is then unfolded to the full zone in memory (`16·N_k·μ²/P`), so the IBZ
-reduction shrinks the ζ store and the fit's accumulator by `N_k/Q`, not the
-`V_q` held by Σ.
+Its Z-store tile enters as `Z_q_XY(mu,G)` and moves to `Z_q(mu_X,G_Y)`
+through the existing explicit `_to_mu_owner` exchange, cropping padded q
+rows afterwards. A direct sharding constraint here replicated the whole
+`Q_pad × μ × g` tile on every rank. The input payload is instead
+`16·ceil(Q/P)·μ·g` bytes per rank and the output is `16·Q·μ·g/P`;
+exchange packing adds shard-sized copies, included in the compiled G-tile
+chain price. In particular, `Q < P` retains the input's one-parent floor,
+without a P-parent replica. The same transport serves the face inverse
+channel and the ζ-file-only pass.
+
+Construction/restart can temporarily unfold `V_q` to the full zone
+(`16·N_k·μ²/P`). Before returning the ISDF state,
+`gw.gw_init.prepare_isdf_and_wavefunctions` calls `_coulomb_on_wedge` and
+retains only `V_qirr(mu_X,nu_Y)` (`16·N_q,irr·μ²/P`) for screening and Σ.
+Price the full-zone transient at initialization, rather than carrying it
+as a Σ-stage resident.
 
 ## What the closed forms cannot see
 

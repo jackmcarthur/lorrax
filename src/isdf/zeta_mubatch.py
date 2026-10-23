@@ -1025,7 +1025,11 @@ def _face_kernels(mesh, Q, g_tile, with_v, inverse=False):
     if hit is not None:
         return hit
     face, mush = NamedSharding(mesh, P(None, 'x', 'y')), NamedSharding(mesh, P(None, _XY, None))
-    to_face = jax.jit(lambda Z: Z[:Q], out_shardings=face)
+    # The store is q-owned. A sharding constraint from that batch layout
+    # to the face makes GSPMD replicate the entire Q_pad x mu x G tile.
+    # Use the same explicit exchange as the other q-owner finalizers, with
+    # the logical-q crop after the exchange so padded parents stay inert.
+    to_face = _to_mu_owner(mesh, Q, 'xy')
     from distrib_la import matmul
     gemm = partial(matmul, mesh=mesh, batched_route="auto", budget_bytes=room)
     apply = jax.jit((lambda F, Z: gemm(F, Z)) if inverse else
