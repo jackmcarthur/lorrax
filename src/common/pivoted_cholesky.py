@@ -44,6 +44,49 @@ __all__ = [
 ]
 
 
+def _prefix_factor_projection(L, L_p, j):
+    """Project through completed factor columns with bounded local tiles.
+
+    A clamped final slice may overlap the previous block, so its mask
+    excludes columns before the nominal start as well as at or after ``j``.
+
+    Parameters
+    ----------
+    L : jax.Array
+        This shard's ``(rows, budget)`` Cholesky factor. The array is local
+        inside the selector's shard_map; this function performs no collective.
+    L_p : jax.Array
+        Replicated ``(budget,)`` pivot row, already broadcast by the selector.
+    j : scalar int
+        Number of completed point columns, including zero dependent columns.
+        Only columns in ``[0, j)`` contribute.
+
+    Returns
+    -------
+    jax.Array
+        Local ``(rows,)`` product ``L[:, :j] @ conj(L_p[:j])``. The factor
+        remains unchanged and no padded factor or full-width copy is formed.
+    """
+    width = min(1024, int(L.shape[1]))
+    if width == 0:
+        return jnp.zeros((int(L.shape[0]),), dtype=L.dtype)
+    col = jnp.arange(width, dtype=jnp.int32)
+    n_blocks = (j + jnp.int32(width - 1)) // jnp.int32(width)
+
+    def block(i, total):
+        nominal_start = i * jnp.int32(width)
+        start = jnp.minimum(nominal_start, jnp.int32(L.shape[1] - width))
+        factor = lax.dynamic_slice(L, (jnp.int32(0), start),
+                                   (int(L.shape[0]), width))
+        pivot = lax.dynamic_slice(L_p, (start,), (width,))
+        ids = start + col
+        mask = ((ids >= nominal_start) & (ids < j)).astype(L.dtype)
+        return total + factor @ (jnp.conj(pivot) * mask)
+
+    return lax.fori_loop(
+        0, n_blocks, block, jnp.zeros((int(L.shape[0]),), dtype=L.dtype))
+
+
 def _group_progress_effect(
     progress_fn,
     finished,
@@ -464,7 +507,6 @@ def make_sharded_pivoted_cholesky_select(
                 G_slab[jnp.arange(M_slab), col_ids_local])
             local_diag = jnp.maximum(local_diag_raw, 0.0)
             trG = ordered_psum(jnp.sum(local_diag), axis_name=mesh_axis)
-            col_ids_k = jnp.arange(k_keep)
             # The floor moves ABOVE the loop, same as the reference kernel:
             # it is the stopping rule, and ``pmax`` makes it identical on
             # every shard so the two kernels stop at the same iteration.
@@ -557,8 +599,7 @@ def make_sharded_pivoted_cholesky_select(
 
                 def column_from_row(L_p):
                     gcol_slab = G_slab[:, global_p]
-                    prev_mask = (col_ids_k < j).astype(G_slab.dtype)
-                    corr = L @ (jnp.conj(L_p) * prev_mask)
+                    corr = _prefix_factor_projection(L, L_p, j)
                     denom = jnp.sqrt(pivot_val)
                     newcol = (gcol_slab - corr) / denom
                     fix_row_mask = my_has_p & (jnp.arange(M_slab) == local_p_rel)
@@ -787,7 +828,6 @@ def make_sharded_group_block_pivoted_cholesky_select(
                 jnp.where(neg0, at0_glob, jnp.int32(-1)),
                 jnp.int32(-1),
             )
-            col_ids = jnp.arange(point_budget)
 
             def body(j, carry):
                 (d, L, piv, unadmitted, chosen, available, current, current_left,
@@ -860,8 +900,7 @@ def make_sharded_group_block_pivoted_cholesky_select(
                         my_has_p, L[safe_idx, :],
                         jnp.zeros_like(L[safe_idx, :]))
                     L_p = lax.psum(local_Lp, axis_name=mesh_axis)  # exact-reduce: masked broadcast, one owner of row p
-                    prev_mask = (col_ids < j).astype(G_slab.dtype)
-                    corr = L @ (jnp.conj(L_p) * prev_mask)
+                    corr = _prefix_factor_projection(L, L_p, j)
                     denom = jnp.sqrt(pivot_val)
                     newcol = (gcol_slab - corr) / denom
                     fix_row = my_has_p & (local_rows == local_p_rel)
