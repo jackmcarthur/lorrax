@@ -302,7 +302,7 @@ Each dataset is aligned to its own VBM, comparing dispersions and gaps.
 [![MoS₂ optical absorption: LORRAX in blue and BerkeleyGW in orange, with solid BSE and dashed independent-particle curves.](../assets/figures/tutorial-mos2-soc-absorption.png){ width="288" }](../assets/figures/tutorial-mos2-soc-absorption.png)
 
 <figcaption style="font-size:0.86em; line-height:1.45;" markdown="1">
-**Absorption.** Blue: LORRAX; orange: BerkeleyGW. Solid: BSE; dashed:
+**Absorption (0–5 eV).** Blue: LORRAX; orange: BerkeleyGW. Solid: BSE; dashed:
 independent particle. Both use the workshop's shifted 8 × 8 × 1 grid.
 </figcaption>
 </figure>

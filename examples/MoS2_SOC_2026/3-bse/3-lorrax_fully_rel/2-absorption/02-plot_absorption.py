@@ -21,8 +21,8 @@ for directory, label, color in ((Path('.'), 'LORRAX', 'tab:blue'),
         data = np.loadtxt(directory / name)
         ax.plot(data[:, 0], data[:, 1], style, color=color, lw=.9,
                 label=f'{label} {kind}')
-ax.set(xlabel='Energy (eV)', ylabel=r'$\epsilon_2$', xlim=(0, 10),
-       xticks=[0, 5, 10], ylim=(0, None))
+ax.set(xlabel='Energy (eV)', ylabel=r'$\epsilon_2$', xlim=(0, 5),
+       xticks=[0, 2.5, 5], ylim=(0, None))
 ax.yaxis.set_major_locator(MaxNLocator(nbins=4, min_n_ticks=3))
 ax.minorticks_off()
 ax.spines[['top', 'right']].set_visible(False)
