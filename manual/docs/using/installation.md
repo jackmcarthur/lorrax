@@ -37,7 +37,6 @@ The GPU linear algebra comes from these libraries:
 |---|---|---|
 | cuSOLVERMp ≥ 0.7 and cuBLASMp | required, part of the CUDA leg | The default distributed eigensolver and LU on a multi-GPU mesh. cuSOLVERMp 0.6.x returns wrong LU results on a 2-D process grid |
 | cuSOLVER, through jaxlib | installed with the CUDA extra | The single-device eigensolver and LU, used when one matrix fits on one GPU |
-| SLATE (CUDA build) | optional | Selectable alternative for the distributed Cholesky and eigensolver; never the default |
 
 ### CPU requirements {: #req-cpu }
 
@@ -56,7 +55,7 @@ The distributed eigensolver and LU on CPU are ScaLAPACK, together with BLACS and
 | netlib ScaLAPACK with OpenBLAS or BLIS | generic Linux clusters |
 | AMD AOCL | AMD CPU systems |
 
-SLATE built with `gpu_backend=none` is optional on CPU. It provides a Cholesky factorization; its CPU eigensolver crashes, so LORRAX never selects it there.
+The Cholesky factorization is LORRAX's own, on CPU and GPU alike.
 
 The service packages under `services/` (`distrib_la`, `lxkit`, `minimax`, `symmetry_maps`, `vcoul`, `wfn_loader`, `zeta_loader`) are uv workspace members and install with the project.
 
@@ -64,7 +63,7 @@ The service packages under `services/` (`distrib_la`, `lxkit`, `minimax`, `symme
 
 | Leg | File | Contains |
 |---|---|---|
-| host | `liblorrax_ffi_host.so` | ScaLAPACK, SLATE, a CBLAS GEMM, the FFTW3-ABI FFT, parallel HDF5. CUDA-free. |
+| host | `liblorrax_ffi_host.so` | ScaLAPACK, a CBLAS GEMM, the FFTW3-ABI FFT, parallel HDF5. CUDA-free. |
 | CUDA | `liblorrax_ffi.so` | cuSOLVERMp, cuBLASMp, cuBLAS, cuSOLVER, cuFFT, NCCL, the NVRTC-built mathdx k-convolution kernels, parallel HDF5 |
 
 A CPU run loads the host leg; a GPU run loads both into one process. There is no pure-JAX fallback for the k-convolution, the distributed linear algebra or the slab I/O, so a missing leg refuses at startup. Each build ends in `scripts/verify_ffi_build.sh` and prints `VERIFY PASSED`; each leg records its dependency closure in `<leg>.closure.json`, and every startup refuses a process that maps any other copy of a recorded library. A private build loads with a `LEGACY-UNSEALED` line and its hash; only a sealed pair is a production provider.
@@ -93,14 +92,12 @@ Build both legs once per clone, on a compute node, with no GPU requested:
 
 ```bash
 srun --jobid=$JOBID -N 1 -n 1 -c 64 --gres=none bash -c '
-  bash src/ffi/cpp/stage/slate_build_perlmutter.sh cpu &&
   bash config/perlmutter/build_ffi_host.sh &&
   bash config/perlmutter/build_ffi_cuda.sh'
 ```
 
 | Step | Builds |
 |---|---|
-| `slate_build_perlmutter.sh cpu` | SLATE with `gpu_backend=none` into `.build/slate` |
 | `build_ffi_host.sh` | `src/ffi/cpp/build_host/liblorrax_ffi_host.so` |
 | `build_ffi_cuda.sh` | stages cuSOLVERMp and cuBLASMp, then `src/ffi/cpp/build/liblorrax_ffi.so` |
 
@@ -129,14 +126,14 @@ Frontera runs the host leg only: its RTX 5000 GPUs (sm_75) are below the CUDA le
 
 | Artifact | Script | Runs on |
 |---|---|---|
-| host leg | `config/frontera/build_ffi_host.sh` | login node |
+| host leg | `LORRAX_HOST_SCALAPACK=1 config/frontera/build_ffi_host.sh` | login node |
 | MPIwrapper | `config/frontera/build_mpiwrapper.sh --fresh` | login node |
 | mpi4py + parallel h5py overlay | `config/frontera/build_mpi_overlay.sh fetch`, then `build` | login node, then compute node in the image |
 | staged PMI2 library | `config/frontera/stage_host_pmi.sh` | login node |
 | node-local runtime bundle | `config/frontera/build_cpu_runtime_bundle.sh` | inside the image |
 | launch | `config/frontera/templates/gw_dev.sbatch` | batch job |
 
-The image, the venv `$WORK/lorrax_env/.venv` and the SLATE host install under `$WORK/slate_builds/cpu/install` are not rebuilt by any script in the repository. The launch template refuses when `LORRAX_ROOT` or `LORRAX_RUN_DIR` is unset; edit its `#SBATCH` block (account, nodes, time) before submitting.
+The image and the venv `$WORK/lorrax_env/.venv` are not rebuilt by any script in the repository. The launch template refuses when `LORRAX_ROOT` or `LORRAX_RUN_DIR` is unset; edit its `#SBATCH` block (account, nodes, time) before submitting.
 
 ### Other sites {: #other }
 
@@ -150,7 +147,7 @@ cmake --build build_cuda -j
 scripts/verify_ffi_build.sh --leg cuda build_cuda/liblorrax_ffi.so
 ```
 
-The host leg is the same command with `-DLORRAX_FFI_PLATFORM=host` and `-DLORRAX_SLATE_HOST_INSTALL_DIR=<gpu_backend=none prefix>`, or `bash src/ffi/cpp/build_host.sh`. A library outside the in-tree build directories is selected with [`LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO`](environment.md#ffi). `config/cloud/` builds both legs from wheels on a machine with only an NVIDIA driver ≥ 580.
+The host leg is the same command with `-DLORRAX_FFI_PLATFORM=host`, or `bash src/ffi/cpp/build_host.sh`. A library outside the in-tree build directories is selected with [`LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO`](environment.md#ffi). `config/cloud/` builds both legs from wheels on a machine with only an NVIDIA driver ≥ 580.
 
 ## Checking an installation {: #check }
 
