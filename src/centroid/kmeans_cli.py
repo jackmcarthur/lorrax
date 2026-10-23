@@ -572,6 +572,7 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
             mesh=mesh, mesh_axis=mesh_axis,
             init_method=init_method,
             R=R, Rinv=Rinv, tau=tau,
+            return_labels=False,
         )
         # The host materialises ``centroids`` immediately below.  Watch every
         # returned device value here so this phase measures completion rather
