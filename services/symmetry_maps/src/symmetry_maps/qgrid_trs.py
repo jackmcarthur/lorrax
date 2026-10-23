@@ -923,7 +923,7 @@ class QgridTrsPolicy:
         return int(np.count_nonzero(self.self_negative_q))
 
     def project_fixed_q(self, operator, q_full_idx, *,
-                        transposed_partner=None, measure=True):
+                        transposed_partner=None, antiunitary_partner=None, measure=True):
         """``(operator, removed)`` — the Θ projector, and what it removed.
 
         On a measured-TRS deck this applies the one-element group average
@@ -931,6 +931,11 @@ class QgridTrsPolicy:
         so the caller can print it: a projector that silently absorbs a
         1e-2 defect is the "instrument that measures and proceeds" failure
         wearing a repair's clothes.
+
+        ``antiunitary_partner`` may supply the exact Fourier-leg image as a
+        zero-argument callable. It is evaluated only on measured-TRS fixed-q
+        rows. The same group average then acts on that representation; a
+        rectangular Fourier leg must not be made elementwise real.
 
         With ``transposed_partner`` (same shape, dtype and rectangular
         sharding as ``operator``), use the pair-transpose average at the
@@ -946,6 +951,15 @@ class QgridTrsPolicy:
         field, so ``V_q`` at a TRIM point is whatever the fit produced and
         the reciprocity gate should see it.
         """
+        if antiunitary_partner is not None:
+            if transposed_partner is not None:
+                raise ValueError("Supply only one fixed-q partner representation")
+            fixed = self_negative_q_mask(q_full_idx, kgrid=self.kgrid)
+            if int(operator.shape[0]) != int(fixed.size):
+                raise ValueError("antiunitary q_full_idx must address every operator row")
+            if not self.trs_measured or not np.any(fixed):
+                return operator, None
+            transposed_partner = antiunitary_partner()
         # At complex time, Θ acts on the residue endpoints, not on the
         # time weight. The supplied partner is W^T at the SAME tau.
         if transposed_partner is not None:

@@ -59,6 +59,19 @@ Measured on CrI3 6×6 (slab, $N_\mu=978$): 9.7e-15 at q = 0 and 8.3e-15 at
 q = (0, 1/6, 0). A producer deck with `use_bgw_vcoul` or a non-`off`
 `mc_average_placement` refuses (`GATE epsmat_coulomb_policy`).
 
+At a measured-TRS fixed-q parent, the producer stores the Θ-even operator.
+The export therefore uses the same policy's Θ-even Fourier leg in every
+contraction, with the exact typed reciprocal action and G-slot permutation.
+At Γ this is $Z_+=(Z+\Theta Z)/2$, where
+$(\Theta Z)(G)=\overline{Z(-G)}$, rather than the elementwise real part of Z.
+Writing $Z=Z_++Z_-$ gives
+$\operatorname{Re}(Z^\dagger vZ)=Z_+^\dagger vZ_++Z_-^\dagger vZ_-$.
+The unchanged 1e-9 metric gate bounds the discarded quadratic odd contribution;
+a significant odd basis still refuses. Projecting only the Gram check would
+leave (E2) and (E3) inconsistent. Magnetic and non-fixed rows keep their
+original basis. `tests/test_epsmat_theta_basis_cpu.py` checks the full
+plane-wave round trip and the nonrepresentable refusal.
+
 ## 2. Whitening, passivity and what is represented
 
 $V^{+}$ is applied through a factor: $V=U\Lambda U^\dagger$ and
