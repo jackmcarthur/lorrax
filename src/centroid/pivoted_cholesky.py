@@ -220,7 +220,8 @@ def _run_select_with_progress(
             f"wall_s={now - phase_start:.3f} elapsed_s={now - started:.3f}")
 
         phase_start = set_phase("execution")
-        start_progress()
+        if start_progress is not None:
+            start_progress()
         result = compiled(*operands)
         jax.block_until_ready(result)
         now = time.perf_counter()
@@ -857,9 +858,12 @@ def prune_candidates_by_pivoted_cholesky(
     returns the largest greedy whole-orbit set no larger than the point budget;
     there is no partial last block for the host to repair.
 
-    The select logs phase receipts (INFO) and one receipt per completely
-    deflated group (DEBUG). Each rank reports its active phase every 60 seconds
-    to stderr; the step supervisor owns walltime across all ranks.
+    The select logs phase receipts (INFO). Debug verbosity adds one ordered
+    host receipt per completely deflated group; without debug, no callback
+    inhibits persistent executable caching. Every rank agrees on this switch
+    before building the kernel. Each rank reports its active phase every
+    60 seconds to stderr independently of group receipts; the step supervisor
+    owns walltime across all ranks.
 
     ``tol_rel`` overrides the select's stopping tolerance (relative to the
     largest initial Gram diagonal).  ``None`` reads
@@ -884,6 +888,15 @@ def prune_candidates_by_pivoted_cholesky(
         raise ValueError(
             "transverse candidate pruning uses unit weight for every band "
             "in the requested left/right fit windows; band_norms must be None")
+
+    if group_block:
+        from runtime import debug_print_enabled
+        from common.collectives import all_gather_processes
+        debug_modes = all_gather_processes(np.asarray(debug_print_enabled(), dtype=np.int8))
+        if np.any(debug_modes != debug_modes.flat[0]):
+            raise ValueError("centroid progress verbosity differs across ranks; "
+                             "use the same verbose setting on every process")
+        progress_enabled = bool(debug_modes.flat[0])
 
     M = int(cand_idx.shape[0])
     n_tot = int(wfn.nbands)
@@ -1031,8 +1044,12 @@ def prune_candidates_by_pivoted_cholesky(
             f"size_min={int(group_sizes_host.min())} "
             f"size_median={float(np.median(group_sizes_host)):.1f} "
             f"size_max={int(group_sizes_host.max())}")
-        progress_fn, start_progress = _make_group_progress_reporter(
-            n_candidates=M, n_groups=n_groups, point_budget=budget)
+        # Only DEBUG consumes group receipts. The host heartbeat above
+        # remains independent of callbacks and device synchronization.
+        progress_fn = start_progress = None
+        if progress_enabled:
+            progress_fn, start_progress = _make_group_progress_reporter(
+                n_candidates=M, n_groups=n_groups, point_budget=budget)
         with timing.section("prune.select"):
             select_step = _make_sharded_block_select(
                 mesh, M_pad, budget, n_groups,
