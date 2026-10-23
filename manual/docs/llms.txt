@@ -18,7 +18,6 @@
 - [Input keywords](https://jackmcarthur.github.io/lorrax/drivers/nscf/keywords/): manual/docs/drivers/nscf/keywords.md
 - [Theory](https://jackmcarthur.github.io/lorrax/drivers/nscf/theory/): manual/docs/drivers/nscf/theory.md
 - [LORRAX](https://jackmcarthur.github.io/lorrax/): manual/docs/index.md
-- [MoS₂ with spin–orbit coupling](https://jackmcarthur.github.io/lorrax/tutorials/mos2-soc/): manual/docs/tutorials/mos2-soc.md
 - [Band extrapolation](https://jackmcarthur.github.io/lorrax/theory/band-extrapolation/): manual/docs/theory/band-extrapolation.md
 - [Centroid selection](https://jackmcarthur.github.io/lorrax/theory/centroid-selection/): manual/docs/theory/centroid-selection.md
 - [Contour deformation](https://jackmcarthur.github.io/lorrax/theory/contour-deformation/): manual/docs/theory/contour-deformation.md
@@ -33,6 +32,7 @@
 - [Time–frequency transforms](https://jackmcarthur.github.io/lorrax/theory/time-frequency/): manual/docs/theory/time-frequency.md
 - [Velocity operator](https://jackmcarthur.github.io/lorrax/theory/velocity-operator/): manual/docs/theory/velocity-operator.md
 - [Short- and long-range W](https://jackmcarthur.github.io/lorrax/theory/w-range-splitting/): manual/docs/theory/w-range-splitting.md
+- [MoS₂ with spin–orbit coupling](https://jackmcarthur.github.io/lorrax/tutorials/mos2-soc/): manual/docs/tutorials/mos2-soc.md
 - [For BerkeleyGW users](https://jackmcarthur.github.io/lorrax/using/berkeleygw-users/): manual/docs/using/berkeleygw-users.md
 - [Running on clusters](https://jackmcarthur.github.io/lorrax/using/clusters/): manual/docs/using/clusters.md
 - [Environment variables](https://jackmcarthur.github.io/lorrax/using/environment/): manual/docs/using/environment.md

@@ -8,42 +8,29 @@
 In this exercise, we will compute the quasiparticle band structure and optical
 absorption of monolayer MoS₂ with spin–orbit coupling (SOC). We use the fully
 relativistic mean field from the [2026 BerkeleyGW workshop](https://workshop.berkeleygw.org/home)
-and add parallel LORRAX directories beside its BerkeleyGW calculations. The
+and add parallel LORRAX directories beside its plane-wave calculations. The
 link scripts, numbered stages and output filenames follow the original exercise.
-The scalar-relativistic track is retained in the download but is not required here.
 
-Both tracks have been executed, interpolating from a 3 × 3 × 1 coarse grid to
-a shifted 8 × 8 × 1 fine grid. The saved spectra compare two different
-coarse-to-fine methods ([comparison](#results)); no explicit fine-grid GW+BSE
-reference was computed for this exercise, so their difference does not establish
-which interpolation is more accurate. The workshop's small grids, vacuum and
-band counts are teaching settings, not converged predictions for MoS₂.
+Both tracks interpolate from a 3 × 3 × 1 coarse grid to a shifted 8 × 8 × 1
+fine grid. This comparison is underconverged, which leads to some differences
+in the final results between the plane-wave code and LORRAX. However, the
+[figures below](#interpolation-validation) show that at converged k-grid sizes
+the two are very similar.
 
 The [example directory](https://github.com/jackmcarthur/lorrax/tree/main/examples/MoS2_SOC_2026)
-contains the LORRAX additions and saved text outputs. Its initialization helper
-downloads the original workshop inputs and preserves their README and LICENSE.
-The original SOC exercise is by Bradford A. Barker (2022), distributed in the
-2026 workshop. Its implementation reference is
-[Barker et al., Phys. Rev. B **106**, 115127 (2022)](https://doi.org/10.1103/PhysRevB.106.115127).
+describes the differences between the main plane-wave package and LORRAX.
 
 ## Goals {: #goals }
 
 1. Follow fully relativistic, two-component DFT wavefunctions through GW and BSE.
 2. Run LORRAX using a directory layout familiar from the BerkeleyGW workshop.
-3. Compare band structures and absorption spectra, separating file compatibility,
-   solver convergence and agreement between the two approximations.
+3. Compare band structures and absorption spectra between the two codes.
 
-## Before starting {: #prerequisites }
+## Settings {: #prerequisites }
 
-Use a [built LORRAX checkout](../using/installation.md) with its `.venv`, both
-native FFI libraries and the normal [Perlmutter setup](../using/clusters.md).
-The supplied launch scripts were exercised on one 128-core CPU node for Quantum
-ESPRESSO and the BerkeleyGW reference, and one four-GPU node for LORRAX.
-Calculations run on allocated compute nodes. On another cluster, adapt the
-site launchers described in the
-[preparation README](https://github.com/jackmcarthur/lorrax/blob/main/examples/MoS2_SOC_2026/perlmutter/README.md).
-
-The main settings are:
+The calculations use a [built LORRAX checkout](../using/installation.md), one
+128-core CPU node for Quantum ESPRESSO and the plane-wave reference, and one
+four-GPU node for LORRAX.
 
 | Setting | Value |
 |---|---|
@@ -51,318 +38,105 @@ The main settings are:
 | Coarse GW grid | 3 × 3 × 1, four stored k-points |
 | GW sums | 200 total bands; band extrapolation disabled |
 | ISDF points | 1,000 requested, 996 written with complete spatial symmetry orbits |
-| QP Hamiltonian | 48 bands: 26 occupied and 22 conduction, including interpolation guards |
+| QP Hamiltonian | 48 bands: 26 occupied and 22 conduction |
 | Frequency model | Hybertsen–Louie plasmon pole; full head correction |
 | Fine BSE grid | 8 × 8 × 1, shifted by (0.47, 0.37, 0) in grid-step units |
 | Fine BSE bands | Six valence and eight conduction; all 3,072 Tamm–Dancoff roots |
 | Spectrum | 0.15 eV Gaussian width; 0.01 eV spacing |
 
-## Instructions {: #instructions }
+## Steps {: #instructions }
 
-### 1. Prepare the workshop directories {: #download }
-
-Set `LORRAX` to your built checkout and choose a new working directory:
+Copy the workshop inputs and the LORRAX directories into a new working directory:
 
 ```bash
 export LORRAX=/path/to/lorrax
 python3 "$LORRAX/examples/MoS2_SOC_2026/perlmutter/prepare_meanfield.py" \
   --tutorial "$SCRATCH/MoS2_SOC_2026/6a-SOC" init
-cd "$SCRATCH/MoS2_SOC_2026/6a-SOC"
 ```
 
-The helper verifies the archive's SHA256 before extracting it and refuses an
-existing destination. For an offline initialization, append
-`--archive /path/to/6a-SOC.tar.gz` after `init`; the same checksum is required.
-The resulting tree includes:
+The calculation then runs in four parts. The README in each directory gives its
+commands and what to check.
 
-```text
-6a-SOC/
-├── 1-mf/2-fully_rel/                 # shared fully relativistic mean field
-├── 2-gw/
-│   ├── 2-fully_rel/                  # original BerkeleyGW track
-│   └── 3-lorrax_fully_rel/
-│       ├── 01-link_files.sh
-│       ├── 1-epsilon/                # centroids and one-body operators
-│       ├── 2-sigma/                  # screening, self-energy and EQP files
-│       └── 3-bs/                     # band path and plot
-├── 3-bse/
-│   ├── 2-fully_rel/                  # original BerkeleyGW track
-│   └── 3-lorrax_fully_rel/
-│       ├── 01-link_files.sh
-│       ├── 1-kernel/                 # BerkeleyGW-format kernel export
-│       └── 2-absorption/             # native BSE and spectra
-├── perlmutter/                      # mean-field and reference launchers
-└── 00-run-lorrax.sh
-```
+1. **Mean field.** Quantum ESPRESSO SCF and NSCF with the workshop inputs,
+   converted to `WFN.h5` (`perlmutter/01-run-meanfield.sh`). Two extra NSCF
+   files add spare bands and the full nine-point coarse grid.
+2. **Plane-wave reference.** The workshop's own epsilon, sigma, inteqp, kernel
+   and absorption steps (`perlmutter/03-run-reference-cpu.sh`), which the
+   comparison plots read.
+3. **LORRAX GW.** The ISDF points, kinetic/ionic matrix and velocity matrix
+   (`2-gw/3-lorrax_fully_rel/1-epsilon`), then screening and self-energy
+   together (`2-sigma`), which also exports `eps0mat.h5` and `epsmat.h5`, and
+   the band structure by [`htransform`](../utilities/htransform-bands.md) (`3-bs`).
+4. **LORRAX BSE.** The `bsemat.h5` export (`3-bse/3-lorrax_fully_rel/1-kernel`)
+   and the BSE with its absorption spectra (`2-absorption`).
 
-### 2. Run the fully relativistic mean field {: #mean-field }
+`bash 00-run-lorrax.sh` runs parts 3 and 4 in order on a four-GPU allocation
+and makes the plots. The [For BerkeleyGW users](../using/berkeleygw-users.md)
+page maps the workshop's `.inp` keys to the `gw.in` inputs.
 
-On an allocated CPU node, set `CPU_JOB_ID` and `CPU_NODE` to your active CPU
-allocation and node, then run from `6a-SOC`:
-
-```bash
-CPU_JOB_ID="$CPU_JOB_ID" CPU_NODE="$CPU_NODE" \
-  bash perlmutter/01-run-meanfield.sh all
-```
-
-This runs the original SCF and NSCF stages and converts their wavefunctions to
-BerkeleyGW files. It also prepares two additional fixed-potential NSCF files:
-
-| Directory | Purpose |
-|---|---|
-| `2c-Wfn_full` | 40 bands on all nine coarse k-points, supplying the explicit coefficient gauge for kernel export |
-| `2d-Wfn_guarded` | 204 bands on the original four k-points, supplying spare states above the 200-band fit window |
-
-The GW sums and right fit window still use 200 bands. The additional states
-allow LORRAX to check the upper band boundary. The original BerkeleyGW mean-field
-files remain in their original directories. The helper can resume completed
-stages; details and the tested QE/BGW modules are in the preparation README.
-
-The workshop uses periodic DFT. LORRAX reads that boundary from the QE XML for
-its ionic and Hartree terms, while `sys_dim = 2` selects slab screening in GW/BSE.
-
-### 3. Run the BerkeleyGW reference {: #reference }
-
-Keep the CPU allocation variables set and run:
-
-```bash
-CPU_JOB_ID="$CPU_JOB_ID" CPU_NODE="$CPU_NODE" \
-  bash perlmutter/03-run-reference-cpu.sh
-```
-
-This executes the original fully relativistic epsilon, sigma, inteqp, kernel
-and absorption inputs. It supplies the reference files used by the comparison
-plots. Its link adapter preserves the completed NSCF metadata; use it rather
-than rerunning the upstream global mean-field link script over completed stages.
-
-### 4. Run the LORRAX GW and BSE tracks {: #lorrax }
-
-Enter a four-GPU allocation, retain `LORRAX`, and run from `6a-SOC`:
-
-```bash
-bash 00-run-lorrax.sh
-```
-
-The top-level script links the inputs, runs each stage in order and plots the
-results. To inspect the stages individually, use these equivalent commands:
-
-```bash
-bash 2-gw/3-lorrax_fully_rel/01-link_files.sh
-bash 2-gw/3-lorrax_fully_rel/1-epsilon/01-run_epsilon.run
-bash 2-gw/3-lorrax_fully_rel/2-sigma/01-run_sigma.run
-bash 2-gw/3-lorrax_fully_rel/3-bs/01-run_inteqp.run
-
-bash 3-bse/3-lorrax_fully_rel/01-link_files.sh
-bash 3-bse/3-lorrax_fully_rel/1-kernel/01-run_kernel.run
-bash 3-bse/3-lorrax_fully_rel/2-absorption/01-run_absorption.run
-```
-
-Inspect the `gw.in` inputs beside the workshop's `epsilon.inp`, `sigma.inp`,
-`kernel.inp` and `absorption.inp`. The
-[BerkeleyGW users' guide](../using/berkeleygw-users.md) explains the mapping.
-LORRAX computes screening and self-energy together in `2-sigma`; `1-epsilon`
-prepares centroids, kinetic/ionic matrices and velocities. The GW script then
-exports its computed screening to `eps0mat.h5` and `epsmat.h5`.
-The kernel script writes `bsemat.h5` for BerkeleyGW interoperability; the native
-BSE applies its Hamiltonian matrix-free from the GW restart.
-
-The utility calls below are already included in the numbered scripts. They
-are shown here so you can inspect or rerun each operation after its inputs
-are ready. Run these blocks from the `6a-SOC` root; each subshell returns there.
-`lorrax_run` is the four-rank launcher defined by the supplied `lorrax_env.sh`.
-
-#### Export `eps0mat.h5` and `epsmat.h5` {: #screening-export }
-
-The Sigma script calls [`gw.epsmat_cli`](../drivers/berkeleygw-export.md#epsmat)
-after GW has written its restart. For the saved 996-centroid run, its input is:
-
-```bash
-(
-    cd 2-gw/3-lorrax_fully_rel/2-sigma
-    source ../lorrax_env.sh
-    cat > epsmat.in <<'EOF'
-[epsmat]
-mode = export
-source_restart = tmp/isdf_tensors_996.h5
-parent_input_file = gw.in
-output_dir = ../1-epsilon
-epsmat_ecut = 9.0
-q0_vector = 0.001 0 0
-EOF
-    lorrax_run gw.epsmat_cli -i epsmat.in
-)
-```
-
-Use the restart filename your GW run wrote if its centroid count differs;
-the supplied run script discovers it automatically. Both dielectric files
-are written under `1-epsilon`. `epsmat_ecut` selects the exported G sphere;
-it does not rerun screening at a different cutoff.
-
-#### Export `bsemat.h5` {: #kernel-export }
-
-The kernel script calls [`bse.bsemat_cli`](../drivers/berkeleygw-export.md#bsemat)
-with the explicit full-nine-point coarse WFN prepared in step 2:
-
-```bash
-(
-    cd 3-bse/3-lorrax_fully_rel/1-kernel
-    source ../../../2-gw/3-lorrax_fully_rel/lorrax_env.sh
-    lorrax_run bse.bsemat_cli -i gw.in --wfn-co WFN_co.h5 -o bsemat.h5
-)
-```
-
-`WFN_co.h5` supplies BerkeleyGW's coarse wavefunction gauge and ordering.
-The output is the coarse kernel for BerkeleyGW's `absorption.x`; the native
-BSE continues to use its GW restart.
-
-#### Interpolate the DFT and QP bands with `htransform` {: #htransform }
-
-The workshop-style `01-run_inteqp.run` script uses LORRAX's
-[`bandstructure.htransform`](../utilities/htransform-bands.md):
-
-```bash
-(
-    cd 2-gw/3-lorrax_fully_rel/3-bs
-    source ../lorrax_env.sh
-    lorrax_run bandstructure.htransform -i ht.in -o bandstructure_dft.lorrax.dat
-    lorrax_run bandstructure.htransform -i ht.in --eqp-file eqp_co.dat \
-        -o bandstructure_qp.lorrax.dat
-    "$LORRAX/.venv/bin/python" 03-export_bandstructure.py
-)
-```
-
-The two calls use the same Γ–M–K–Γ path in `ht.in`; the second reads the
-coarse QP corrections. The adapter retains both native tables and writes
-the workshop's eight-column `bandstructure.dat` with the recorded energy
-references and coordinate conversion.
-
-**Question.** Which workshop parameters describe the same physical approximation
-in both codes, and which select different numerical representations?
-
-### 5. Check completion and make the plots {: #checks }
-
-Read each stage's output, including the on-shell Sigma coverage and the BSE
-residual/convergence report. The independent read-only validator checks the
-completed native and BerkeleyGW files:
-
-```bash
-"$LORRAX/.venv/bin/python" validate_tutorial.py --tutorial-root . > validation.json
-"$LORRAX/.venv/bin/python" - <<'PY'
-import json
-with open("validation.json") as stream:
-    report = json.load(stream)
-print(report["status"], report["format_status"], report["coverage_status"])
-assert report["status"] == "PASS", "Inspect validation.json for FAIL or PENDING checks"
-PY
-```
-
-Inspect the JSON status: the validator itself writes a report even when files
-are missing. `PASS` certifies its format, coverage and convergence checks; it
-does not assert that the two codes give equal energies. A missing reference
-leaves its checks `PENDING`.
-
-If you ran the stages individually, generate the comparison plots with:
-
-```bash
-(cd 2-gw/3-lorrax_fully_rel/3-bs && \
-  "$LORRAX/.venv/bin/python" 02-plot_bandstructure.py)
-(cd 3-bse/3-lorrax_fully_rel/2-absorption && \
-  "$LORRAX/.venv/bin/python" 02-plot_absorption.py)
-```
-
-The band table uses the workshop's eight-column layout on the 106-point
-Γ–M–K–Γ path. The spectra are `absorption_eh.dat` and `absorption_noeh.dat`;
-the exciton outputs are `eigenvalues.dat` and `eigenvectors.h5`.
-
-## Executed results {: #results }
-
-The following plots come from the supplied workflow and an independently
-executed BerkeleyGW reference. The workshop's 3 × 3 × 1 coarse k-grid is
-deliberately underconverged. The differences reflect that sparse sampling
-and the different QP and kernel interpolation methods; each track also
-supplies its own coarse GW corrections. The denser-grid validation below
-provides a separate, controlled check of LORRAX's interpolation accuracy.
-
-### Workshop comparison {: #workshop-comparison }
+## Results {: #results }
 
 <div style="display:flex; flex-wrap:wrap; gap:24px; align-items:flex-start;" markdown="1">
 
 <figure style="width:3in; max-width:100%; margin:0;" markdown="1">
 
-[![MoS₂ DFT bands in light gray, LORRAX GW in blue and BerkeleyGW GW in orange on Γ–M–K–Γ.](../assets/figures/tutorial-mos2-soc-bands.png){ width="288" }](../assets/figures/tutorial-mos2-soc-bands.png)
+[![MoS₂ DFT bands in light gray, LORRAX GW in blue and plane-wave GW in orange on Γ–M–K–Γ, with dots at the coarse k-points.](../assets/figures/tutorial-mos2-soc-bands.png){ width="288" }](../assets/figures/tutorial-mos2-soc-bands.png)
 
 <figcaption style="font-size:0.86em; line-height:1.45;" markdown="1">
-**Band structure.** Light gray: QE DFT; blue: LORRAX GW; orange: BerkeleyGW GW.
-Each dataset is aligned to its own VBM, comparing dispersions and gaps.
+**Band structure.** Light gray: QE DFT; blue: LORRAX GW; orange: plane-wave GW.
+Dots mark the 3 × 3 × 1 coarse k-points on the path, where the QP energies are
+computed directly; between them they are interpolated. Each dataset is aligned
+to its own VBM.
 </figcaption>
 </figure>
 
 <figure style="width:3in; max-width:100%; margin:0;" markdown="1">
 
-[![MoS₂ optical absorption: LORRAX in blue and BerkeleyGW in orange, with solid BSE and dashed independent-particle curves.](../assets/figures/tutorial-mos2-soc-absorption.png){ width="288" }](../assets/figures/tutorial-mos2-soc-absorption.png)
+[![MoS₂ optical absorption: LORRAX in blue and the plane-wave code in orange, with solid BSE and dashed independent-particle curves.](../assets/figures/tutorial-mos2-soc-absorption.png){ width="288" }](../assets/figures/tutorial-mos2-soc-absorption.png)
 
 <figcaption style="font-size:0.86em; line-height:1.45;" markdown="1">
-**Absorption (0–5 eV).** Blue: LORRAX; orange: BerkeleyGW. Solid: BSE; dashed:
-independent particle. Both use the workshop's shifted 8 × 8 × 1 grid.
+**Absorption (0–5 eV).** Blue: LORRAX; orange: plane-wave code. Solid: BSE;
+dashed: independent particle. Both use the workshop's shifted 8 × 8 × 1 grid.
 </figcaption>
 </figure>
 
 </div>
 
-Click either plot to open the full-resolution image.
-
-| Quantity (eV) | LORRAX | BerkeleyGW |
+| Quantity (eV) | LORRAX | Plane wave |
 |---|---:|---:|
 | Coarse-grid EQP1 minimum gap | 3.208396 | 3.123690 |
 | Path EQP1 indirect gap | 2.872913 | 3.071206 |
 | Lowest fine-grid BSE state | 2.511020 | 1.591552 |
 | Largest interacting spectral peak | 3.18 | 2.60 |
 
-Neither workshop spectrum is an explicit GW+BSE calculation on the fine
-grid. Their separation therefore does not identify which interpolation is
-more accurate; the direct-reference tests below address that question.
+Neither workshop spectrum is an explicit GW+BSE calculation on the fine grid, so
+the difference between them does not show which interpolation is more accurate.
 
-### Interpolation validation on denser grids {: #interpolation-validation }
+### Interpolation on converged grids {: #interpolation-validation }
 
-At better-resolved coarse k-grids, including 9 × 9 for MoS₂, the controlled
-comparisons give us strong confidence in LORRAX's SR/LR interpolation.
-Screening and BSE were also computed directly on the fine grid, and the
-QP energies were held fixed across the comparisons. LORRAX's interpolated
-fine-grid spectra closely follow those direct calculations.
+On better-converged coarse grids, with screening and BSE also computed directly
+on the fine grid and the QP energies held fixed, LORRAX's interpolated spectra
+follow the direct fine-grid calculations closely.
 
-[![Interpolation validation: MoS₂ uses a 9×9 coarse and 12×12 fine grid; Si uses 4³ coarse and 8³ fine grids. LORRAX full SR/LR interpolation follows the direct fine-grid absorption, while the BerkeleyGW dual-grid curve deviates more strongly. Lower panels show residuals as a percentage of the spectral peak.](../assets/figures/bse-interp-comparison.png)](../assets/figures/bse-interp-comparison.png)
+[![Interpolation validation: MoS₂ uses a 9×9 coarse and 12×12 fine grid; Si uses 4³ coarse and 8³ fine grids. LORRAX full SR/LR interpolation follows the direct fine-grid absorption, while the plane-wave dual-grid curve deviates more strongly. Lower panels show residuals as a percentage of the spectral peak.](../assets/figures/bse-interp-comparison.png)](../assets/figures/bse-interp-comparison.png)
 
-**Denser-grid validation.** MoS₂ is shown in panels **a, c**, and Si in
-**b, d**. Gray curves are direct coarse-grid calculations, green curves
-are direct fine-grid calculations, light blue is BerkeleyGW dual-grid
-interpolation, and blue dashed is LORRAX's full SR/LR pipeline. The lower
-panels show residuals relative to the fine-grid spectral peak.
-[Open the supplied figure at full size](../assets/figures/bse-interp-comparison.png).
+**Denser-grid validation.** MoS₂ (9 × 9 → 12 × 12) in panels **a, c**, and Si
+(4³ → 8³) in **b, d**. Gray: direct coarse grid; green: direct fine grid; light
+blue: plane-wave dual-grid interpolation; blue dashed: LORRAX. The lower panels
+show residuals relative to the fine-grid spectral peak. Over the lowest 40
+excitons the mean absolute offsets from the direct calculation are **2.65 meV
+for MoS₂** and **1.41 meV for Si** ([details](../theory/w-range-splitting.md#example)).
 
-The accompanying [direct-reference energy benchmarks](../theory/w-range-splitting.md#example)
-give mean absolute offsets of **2.65 meV for MoS₂** and **1.41 meV for Si**
-over the lowest 40 excitons. These tests support confidence in the
-interpolation for those denser grids; they are separate from the sparse
-workshop example.
-
-### Export interoperability {: #interop }
-
-A separate test in BerkeleyGW accepted the LORRAX-exported coarse kernel:
-holding BerkeleyGW QP data fixed, its 3,072 exciton energies differed from the
-original BerkeleyGW result by 7.680 meV RMS and at most 9.552 meV. That consumer
-still uses BerkeleyGW's interpolation. This tests the exported kernel and
-reader while holding the fine-grid method fixed; it is not an independent
-test of either interpolation's accuracy. The
-[comparison report](https://github.com/jackmcarthur/lorrax/blob/main/examples/MoS2_SOC_2026/results/README.md)
-records the scope of the controls.
-
-The [saved text tables and plots](https://github.com/jackmcarthur/lorrax/tree/main/examples/MoS2_SOC_2026/results)
-are included in the checkout; initialization does not copy them into a new
-calculation. Regenerate the large HDF5 files with the scripts above. The
-[validation report](https://github.com/jackmcarthur/lorrax/blob/main/examples/MoS2_SOC_2026/results/validation/OUTPUT_VALIDATION_REPORT.txt)
-separates passing execution checks from descriptive comparisons.
+The [saved tables and plots](https://github.com/jackmcarthur/lorrax/tree/main/examples/MoS2_SOC_2026/results)
+are in the example directory, with a report on the exported screening and
+kernel read by the plane-wave code.
 
 **Questions.** Where are the SOC splittings visible along the band path? How do
 the quasiparticle corrections affect them? Which changes in the absorption
 can be associated with those transitions, and which would require a finer
-k-grid or a better-matched numerical treatment to interpret?
+k-grid to interpret?
+
+## Credits {: #credits }
+
+The original SOC exercise is by Bradford A. Barker (2022), distributed in the
+2026 workshop; see [Barker et al., Phys. Rev. B **106**, 115127 (2022)](https://doi.org/10.1103/PhysRevB.106.115127).
