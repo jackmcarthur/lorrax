@@ -136,6 +136,9 @@ When the samples do not fit one group, the stream runs once with every
 sample and its carry streams to SlabIO's per-rank tier
 ([memory model](memory-model.md#streamed-chi-bank)); groups remain only
 when the disk refuses the bank and on the full-k Green route. A
+group consumes dense supports before fitted line panels. Its per-rank reader
+uses that same order, retaining each member's original value/slope row pair
+and skipping already committed members, including each sample's own q spans. A
 smaller group costs ⌈members/group⌉ passes over the same nodes and gives the same
 eqp. (Rules fitted per group gave eqp up to 14.6 meV off a 100× tighter
 reference on Na 8³ at group 1, against 0.21 meV for the all-sample rule.) The chosen group's executable is

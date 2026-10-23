@@ -3085,6 +3085,13 @@ def response_bank_residence(meta, *, segments, n_samples, carry_per_sample, grou
     return "file", dict(receipt, reason="streamed; exceeds half the host budget")
 
 
+def _sample_members(members, line_span, committed):
+    """One dense-first consumption order, retaining each raw carry's row index."""
+    p0, p1 = line_span
+    order = sorted(enumerate(members), key=lambda member: p0 <= member[1] < p1)
+    return order, [(row, sample) for row, sample in order if not committed(sample)]
+
+
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
                         vertex=None, contact=None, direct_head=None, print_fn=print):
     """Stage A: integrate value and derivative together, one frequency at a time.
@@ -3521,6 +3528,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             for _ in members:
                 progress.step()
             continue
+        order, fresh = _sample_members(members, (p0, p1), committed)
         ledger.live_stages = ambient
         name, _ = _reserve(meta, "bank_outputs", rules["slots"]*carry_per_sample if stream_bank is None
                            else receipt["bank_residence"]["device_bytes_per_rank"])
@@ -3535,10 +3543,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         else:
             # Each pass's rows of every member go to the bank as they finish;
             # each member's value and slope come back one ahead of its solve.
-            fresh = [(row, sample) for row, sample in enumerate(members) if not committed(sample)]
             integrate_response_group(wfns, meta, mesh_xy, rules, group, q_ids=response_rows,
                 execute=execute, receipt=receipt, ordered=ordered, vertex=vertex, bank=stream_bank,
-                outputs=[(2*row+k, 2*row+k) for row, _ in fresh for k in (0, 1)])
+                outputs=[(2*row+k, 2*row+k) for row in sorted(row for row, _ in fresh) for k in (0, 1)])
             with timing.section('bank.stream_commit'):
                 stream_bank.commit()
             # A sample larger than its q width reads one q span per solve (the
@@ -3559,7 +3566,6 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             # Dense members first, line members (the selection, the bank's largest phase) last;
             # on the devices the last member's rows leave the group carry, which is freed
             # before that member's solves.
-            order = sorted(enumerate(members), key=lambda m: p0 <= m[1] < p1)
             last = ([row for row, sample in order if not committed(sample)] or [None])[-1]
             for row, sample in order:
                 if committed(sample):
