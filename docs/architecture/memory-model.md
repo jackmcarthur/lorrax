@@ -121,8 +121,9 @@ a provider context under `linalg = local` carries it as its `outside` term
 
 - **Programs.** A route or a dispatch is priced by the program that runs it,
   lowered and compiled at its abstract operands: `temp + outputs − alias` plus
-  cuFFT plan scratch (`runtime.aot_memory.compiled_new_bytes`), the largest any
-  rank read. Where the program then runs, the priced executable is the one
+  the largest dynamic FFT workspace (`runtime.aot_memory.compiled_new_bytes`):
+  cuFFT/hipFFT plans or ROCm's split k-minor provider query, whichever is larger,
+  taking the largest figure any rank read. Where the program then runs, the priced executable is the one
   executed (the response bank, the ζ tile passes, the tangential rounds), so a
   price costs no extra compile. `check_chunk` corrects a chunk once from that
   figure ([§ The compiled check](#the-compiled-check)).
@@ -727,6 +728,16 @@ missing, it fails at allocation.
 The nvidia-mathdx k-convolution kernels allocate no device workspace beyond
 shared memory, except the split-arm intermediates of modes 7, 8 and 11, which
 XLA's scratch allocator grants ([k-convolution family](kconv.md#tiles)).
+ROCm's native mode 4 k-minor convolution also takes one local input-sized
+scratch buffer when its provider selects a split plan with output layout 1.
+The provider's `lrx_kminor_workspace_bytes_rocm` query uses that same plan;
+`runtime.aot_memory` parses the actual compiled local shape, grid and layout
+and includes the exact bytes. Layout 0 and native transform-only mode 5 need
+no extra arena allocation. Missing query symbols or unparseable native calls
+refuse by name instead of admitting a guessed zero. The total adds the
+maximum of this term and the XLA FFT plan workspace, because the calls in the
+executable run serially. Other explicitly priced native workspaces remain
+with their existing owners.
 On CPU the host `gw_conv` handler keeps a reused host arena of
 `16·N_k·m_x·m_y` bytes and per-thread compact chunks, outside XLA.
 

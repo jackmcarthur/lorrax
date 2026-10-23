@@ -35,13 +35,21 @@
 #include <tuple>
 
 #include "../common/ffi_helpers.h"
+#include "../common/c_abi.h"
 #include "../common/gpu_runtime.h"
 #include "../common/rtc_build.h"
 #include "generated/kdft_klead_src.h"   // kCoreSrc, kPlanSrc: the shared DFT core
 #include "generated/kdft_kminor_src.h"
 #include "kdft_klead_ffi.h"
 #include "kdft_kminor_plan.h"
+#include "kdft_kminor_workspace.h"
 #include <vector>
+
+extern "C" std::int64_t LRX_C_ENTRY(lrx_kminor_workspace_bytes)(
+        int nx, int ny, int nz, int mode, int out, std::int64_t rows,
+        std::int64_t m, int cbytes) {
+    return ::kdft::kminor_workspace_bytes(nx, ny, nz, mode, out, rows, m, cbytes);
+}
 
 namespace lorrax_ffi::kdft {
 namespace {
@@ -211,8 +219,9 @@ ffi::Error launch(lrx::gpu::Stream stream, ffi::ScratchAllocator* scratch, int m
     for (size_t i = 0; i < pl.cols.size(); ++i)
         FFI_RETURN_IF_ERROR(build_pass(pl.cols[i], f32, cache_dir, &fns[i]));
     void* work = y;
-    if (mode == 4 && out == 1) {
-        std::optional<void*> buf = scratch->Allocate(X.size_bytes());   // XLA's own alignment
+    const auto work_bytes = ::kdft::kminor_workspace_bytes(pl, mode, out, X.size_bytes());
+    if (work_bytes) {
+        std::optional<void*> buf = scratch->Allocate(work_bytes);   // XLA's own alignment
         if (!buf.has_value())
             return fail("kdft-scratch", "got no " + std::to_string(X.size_bytes()) + "-byte scratch buffer from XLA "
                         "for the split arm's out_layout 1 (the permuted store cannot run in place)",

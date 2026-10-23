@@ -78,6 +78,7 @@ __all__ = [
     "KCONV_TARGETS", "KCONV_AXIS_MAX",
     "KDFT_KCONV_KLEAD_TARGET", "KDFT_KFFT_KLEAD_TARGET", "kdft_refusal", "rocm_klead_target",
     "KDFT_KCONV_KMINOR_TARGET", "KDFT_KFFT_KMINOR_TARGET", "kdft_kminor_refusal",
+    "kminor_workspace_bytes",
     "kconv_backend", "require_kconv", "mathdx_root", "cubin_cache_dir", "conv_kpair_scale",
     "make_fused_conv_kpair", "make_fused_conv_kparent", "make_fused_conv_kplane",
     "KCONV_PLANE_TARGET",
@@ -3452,6 +3453,42 @@ def kconv_kminor_out_shape(x_shape, out_layout: int) -> tuple[int, ...]:
     if out_layout == 1:
         return (d0, nk, d3, d1, d4, d2)
     raise ValueError(f"out_layout must be 0 or 1, got {out_layout!r}")
+
+
+def kminor_workspace_bytes(kgrid, x_shape, dtype, *, mode: int = 4, out_layout: int = 1) -> int:
+    """Exact per-rank dynamic scratch of the ROCm k-minor provider, in bytes.
+
+    ``x_shape`` is the rank-local input geometry, not the global tensor.
+    The loaded leg evaluates its own CPU-only plan. A missing query or a
+    refused geometry names a rebuild/refusal; it never guesses zero bytes.
+    CUDA's one-pass mathdx route and the XLA FFT route do not use this query.
+    """
+    import ctypes
+    from ffi.common import ffi_loader
+    shape = tuple(int(v) for v in x_shape)
+    kg = tuple(int(v) for v in kgrid)
+    itemsize = int(np.dtype(dtype).itemsize)
+    if len(kg) != 3 or len(shape) != 6 or min(shape) < 0 or shape[-1] != math.prod(kg):
+        raise ValueError(f"GATE kminor-workspace: invalid local shape {shape} for grid {kg}")
+    if np.dtype(dtype).kind != "c" or itemsize not in (8, 16):
+        raise ValueError(f"GATE kminor-workspace: want complex64/complex128, got {dtype}")
+    library = ffi_loader.get_lib("ROCM")
+    try:
+        query = library.lrx_kminor_workspace_bytes
+    except AttributeError as exc:
+        raise RuntimeError("GATE kminor-workspace-query: the loaded ROCm leg lacks "
+            "lrx_kminor_workspace_bytes_rocm; rebuild it from this checkout with "
+            "config/frontier/build_ffi_rocm.sh in a new build directory") from exc
+    query.argtypes = [ctypes.c_int]*5 + [ctypes.c_int64]*2 + [ctypes.c_int]
+    query.restype = ctypes.c_int64
+    rows, stride = math.prod(shape[:-1]), math.prod(shape[1:-1])
+    if any(not -(1 << 31) <= v < (1 << 31) for v in (*kg, int(mode), int(out_layout))) or max(rows, stride) >= (1 << 63):
+        raise ValueError("GATE kminor-workspace-query: geometry exceeds C query integer range")
+    result = int(query(*kg, int(mode), int(out_layout), rows, stride, itemsize))
+    if result < 0:
+        raise ValueError(f"GATE kminor-workspace-query: provider refused local shape {shape}, "
+                         f"grid {kg}, mode {mode}, layout {out_layout} (status {result})")
+    return result
 
 
 def _kminor_out_spec(x_spec: P, out_layout: int) -> P:
