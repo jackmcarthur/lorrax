@@ -235,7 +235,11 @@ cross-channel `contract_v` (V^{μν} from two ζ streams); it is not built.
 Each fit family reads ψ(G) once: `common.psi_G_store.load_parent_psi_G`
 samples the family's centroid faces and keeps the G-slot store on the device
 for the loop (charge in `gw_init._prepare_fresh_parent_faces`, currents in
-`gw_init._fit_transverse_zeta_channels`).
+`gw_init._fit_transverse_zeta_channels`). The faces cover the complete loaded
+band window for screening and Σ. The retained G-slot store covers only the
+existing left/right fit union, through `store_band_range`; its band carrier
+is padded independently and its unused slots are zero. The default loader
+call without that keyword still retains its complete read window.
 
 ## Memory per rank and the planner
 
@@ -318,7 +322,10 @@ split (one row, one plane group per block) when that is larger: the source
 stage does not depend on the split, so a split under the bytes it already
 holds costs nothing. The compiled
 check reads that price at the planned chunk, with the widest orbit as its
-minimum chunk. Still over the room, it steps the plane blocks to the count
+minimum chunk. Its room is the agreed allocator room after compilation,
+without GiB bucketing. Thus the arguments and any charge faces still held
+during a current fit spend the budget once; the executable price adds only
+new bytes and one lookahead output. Still over the room, it steps the plane blocks to the count
 the compiled figure implies (bytes a + b/n_blk through the last two figures),
 rounded up to the next count with fewer plane groups per block, while that
 lowers the compiled figure (every rank on the largest one), up to one plane
