@@ -467,7 +467,7 @@ keep their full band extent `K` so the compiled shapes never change. With
 `enable_active_range=True`,
 
 ```python
-D = plan.active_range(A, B, lo, hi, C=None, *, out=None, weights=None)
+D = plan.active_range(A, B, lo, hi, C=None, *, out=None, weights=None, conj_b=False)
 ```
 
 computes $D_q = \alpha\,(A_q \,\mathrm{diag}(w_q))_{:,lo:hi}\, B_{q,lo:hi,:} +
@@ -479,6 +479,9 @@ return an all-NaN output rather than clamp. An
 empty interval applies the `beta` semantics without reading A or B; a full
 interval calls the dense GEMM, so its evaluation order is unchanged. Interior
 holes in an interval still cost arithmetic.
+
+`conj_b=True` contracts `conj(B)` without forming it: the device kernel
+conjugates on load, every other route inside its own jit.
 
 When the interval is known before tracing, `prepared =
 plan.prepare_active_range(lo, hi)` validates and captures the bounds as
