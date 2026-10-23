@@ -1,15 +1,14 @@
 """Exchange tiles V_Q along an exciton momentum path.
 
 For each path point Q the finite-Q TDA kernel contracts the pair density
-conj(ψ_c,k+Q) ψ_v,k with the exchange tile at tile momentum q = wrap(−Q)
+conj(ψ_c,k+Q) ψ_v,k on the left of the exchange tile at q = wrap(+Q)
 (``bse.exciton_bands``, LORRAX convention: electron leg shifted by +Q).
 :func:`exchange_tiles` builds the stack of those tiles, one row per solve:
 
 * Γ (Q on an integer point): the production q = 0 tile with its rank-one
   head, ``data["V_q0"]``;
-* ``ongrid``: the stored tile ``V_qmunu[wrap(−Q)]``, exact (the BerkeleyGW finite-Q
-  writer, ``bse.bsemat_export.exchange_tile``, passes −Q to get wrap(+Q): relabelling the
-  tile here flips that writer too; ``tests/test_bsemat_finite_q_cpu.py`` pins it);
+* ``ongrid``: the stored tile ``V_qmunu[wrap(+Q)]``, exact; the native path
+  and BerkeleyGW finite-Q writer share this momentum convention;
 * ``refit``: a per-Q ζ refit contracted with the producer's Coulomb entry point
   (``bse.vq_interp.refit_vq``);
 * ``interp``: the arbitrary-Q evaluator (``vq_interp.build_vq_evaluator``),
@@ -41,7 +40,20 @@ from common.log import get_logger
 
 log = get_logger(__name__)
 
-__all__ = ["exchange_tiles"]
+__all__ = ["exchange_tiles", "exchange_tile_momentum"]
+
+
+def exchange_tile_momentum(Q):
+    """wrap(+Q) for the exchange of |v k, c k+Q>, in crystal coordinates.
+
+    rho = conj(psi_v) psi_c has Bloch momentum +Q. The transition kernel
+    M V M† has M = conj(rho), so its tile is V(+Q), as in the plane-wave
+    sum rho_G† v(Q+G) rho_G. M already forms the bra density; it does not
+    reverse the Coulomb tile's momentum (E12 in
+    docs/theory/bgw-bsemat-export.md).
+    """
+    q = np.asarray(Q, dtype=np.float64).reshape(3)
+    return q - np.round(q)
 
 
 def _hermitize(V):
@@ -93,7 +105,7 @@ def exchange_tiles(Qpath, *, route, mesh_xy, V_q0, V_ongrid, kgrid_vq,
         if np.linalg.norm(Qw) < 1e-9:
             V_rows.append(_hermitize(v_gamma))       # production q=0 tile
             continue
-        q_tile_np = -Qpath[iQ] - np.round(-Qpath[iQ])   # wrap(−Q)
+        q_tile_np = exchange_tile_momentum(Qpath[iQ])
         n_eval_calls += 1
         if route == "ongrid":
             ix, iy, iz = _tile_index(q_tile_np, kgrid_vq)
@@ -123,13 +135,13 @@ def exchange_tiles(Qpath, *, route, mesh_xy, V_q0, V_ongrid, kgrid_vq,
     # Certification twins: the producer's stored tile at each cert Q, so the
     # eigenvalue difference of the two solve rows is the exchange alone.
     for iQ in cert_idx:
-        ix, iy, iz = _tile_index(-Qpath[iQ] - np.round(-Qpath[iQ]), kgrid_vq)
+        ix, iy, iz = _tile_index(exchange_tile_momentum(Qpath[iQ]), kgrid_vq)
         V_rows.append(_hermitize(
             jax.device_put(V_ongrid[:, :, ix, iy, iz], grid_xy)))
     # --vq-mode=both spot checks: the refit ground truth at both_idx.
     for iQ in both_idx:
         zx, rst = both_refit
-        V_np = vq_interp.refit_vq(zx, rst, -Qpath[iQ], mesh_xy)
+        V_np = vq_interp.refit_vq(zx, rst, exchange_tile_momentum(Qpath[iQ]), mesh_xy)
         V_rows.append(_host_tile(V_np, n_rmu, n_rmu_pad, grid_xy))
     V_stack = jax.device_put(jnp.stack(V_rows),
                              NamedSharding(mesh_xy, P(None, "x", "y")))

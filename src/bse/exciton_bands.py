@@ -41,15 +41,15 @@ every Q of a user-supplied high-symmetry path with ONE compiled engine:
                             ``--refit-points`` spot checks, solved in the
                             SAME compiled scan (extra scan rows) so the
                             interp-vs-refit ΔE_S table is apples-to-apples.
-      ``--vq-mode=ongrid``  no model at all: the stored ``V_qmunu[wrap(−Q)]``
+      ``--vq-mode=ongrid``  no model at all: the stored ``V_qmunu[wrap(+Q)]``
                             tile, exact, but only at Q on the coarse
                             exchange-tile grid — which ``--q-per-segment``
                             (a FLOOR of 16 by default, because E_S(Q) on a
                             path is a bandstructure) puts most Q off.
     Momentum labeling: the pair density conj(ψ_c[k+Q]) ψ_v[k] pairs with
-    the tile at TILE momentum q = wrap(−Q) (reference-metric convention,
+    the tile at TILE momentum q = wrap(+Q) (rho = conj(ψ_v) ψ_c has momentum +Q,
     ``vq_interp`` docstrings); on-grid this is exactly the stored
-    ``V_qmunu[wrap(−Q)]`` slot.
+    ``V_qmunu[wrap(+Q)]`` slot.
 
     WHICH WINDOW THE REFIT FITS ζ' ON — ``--refit-window``, and it decides
     which gate certifies the run.  ``zeta`` (default) fits on the producer's
@@ -158,7 +158,7 @@ log = get_logger(__name__)
 _LOGGER = log     # the module logger, where a ``log`` parameter or local shadows it
 from .bse_preconditioner import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
-from .exchange_path import exchange_tiles
+from .exchange_path import exchange_tiles, exchange_tile_momentum
 from .bse_window import (apply_eqp_to_bse_window, pad_zone_mask_np,
                          require_valence_pad_guard)
 from . import vq_interp
@@ -740,7 +740,7 @@ def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
     kg = np.asarray(kgrid_vq, dtype=int)
     rows, worst, worst_iQ = [], 0.0, -1
     for j, iQ in enumerate(cert_idx):
-        q_tile = -Qpath[iQ] - np.round(-Qpath[iQ])
+        q_tile = exchange_tile_momentum(Qpath[iQ])
         tile = tuple(int(v) for v in
                      (np.round(q_tile * kg).astype(int) % kg))
         d_mev = np.abs(np.asarray(evs_refit_route[iQ])
@@ -1956,7 +1956,7 @@ def main(argv=None):
         #    orchestration, not one here and one there. ─────────────────────────
         t0 = time.time()
         # Q ON the coarse BZ grid needs NO exchange model at all: the production
-        # tile V_qmunu[wrap(−Q)] IS the answer, and the driver already uses exactly
+        # tile V_qmunu[wrap(+Q)] IS the answer, and the driver already uses exactly
         # that at the one on-grid point it always has (Γ, below).  ``--vq-mode
         # ongrid`` extends that existing special case to every on-grid Q — no
         # interpolation error, no b26p stencil, no ζ.  It also makes the exciton
@@ -2018,7 +2018,7 @@ def main(argv=None):
                     f"and a floor above ~2 puts most Q off any coarse grid.  "
                     f"--q-per-segment 1 restores the deck's own counts exactly; "
                     f"the dense path is what needs the full-BZ ζ.")
-            log(f"  exchange: EXACT on-grid tiles V_qmunu[wrap(-Q)] "
+            log(f"  exchange: EXACT on-grid tiles V_qmunu[wrap(+Q)] "
                 f"({nQ} Q, all on the "
                 f"{kgrid_vq[0]}x{kgrid_vq[1]}x{kgrid_vq[2]} grid = {vq_src}) "
                 f"— no interpolation")
@@ -2118,7 +2118,7 @@ def main(argv=None):
                 _seen, _qlist = set(), []
                 for _i in np.nonzero(_on)[0]:
                     _key = tuple(int(v) for v in
-                                 (np.round((-Qpath[_i]) * kgrid_vq).astype(int)
+                                 (np.round(exchange_tile_momentum(Qpath[_i]) * kgrid_vq).astype(int)
                                   % kgrid_vq))
                     if _key not in _seen:
                         _seen.add(_key)
@@ -2179,7 +2179,7 @@ def main(argv=None):
             # comparison more than once.
             seen, uniq = set(), []
             for i in cert_idx:
-                key = tuple(np.round((-Qpath[i]) * kgrid_vq).astype(int)
+                key = tuple(np.round(exchange_tile_momentum(Qpath[i]) * kgrid_vq).astype(int)
                             % kgrid_vq)
                 if key not in seen:
                     seen.add(key)
@@ -2541,7 +2541,7 @@ def main(argv=None):
                     for iQ, tile, dmax in cert_rows:
                         fh.write(f"#   Q#{iQ} tile {tile}: "
                                  f"max|dE_S| = {dmax:.5f} meV\n")
-                fh.write("# conventions: |v k, c k+Q>; exchange tile at wrap(-Q) "
+                fh.write("# conventions: |v k, c k+Q>; exchange tile at wrap(+Q) "
                          "keeps G=0 at finite Q (energy_loss); Gamma uses the "
                          "production q=0 head-body tile; energies in eV\n")
                 fh.write(f"# nodes: {' '.join(f'{int(i)}:{l}' for i, l in zip(node_idx, labels))}\n")

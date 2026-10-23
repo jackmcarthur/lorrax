@@ -383,11 +383,12 @@ with the exchange $V_Q$ weighted as in `bse.bse_jax`
   momentum difference $k-k'$ stays on the coarse grid, so $W$ needs no
   interpolation.
 - **The exchange $V_Q$** needs the bare interaction at the off-grid
-  momentum. The tile is taken at $\mathrm{wrap}(-Q)$. That is an open defect: the
-  pair density $\psi^*_{vk}\psi_{c,k+Q}$ has momentum $+Q$ and needs the tile at
-  $\mathrm{wrap}(+Q)$ ([bsemat E12](../theory/bgw-bsemat-export.md#finite-q)). On
-  MoS₂ 9×9 at $Q=(1/9,0,0)$ bright states move by up to 6.6 meV (0.38 % of the
-  1.732 eV gap); $Q=0$ is unaffected. At finite $Q$ the
+  momentum. The pair density $\rho=\psi^*_{vk}\psi_{c,k+Q}$ has momentum
+  $+Q$, so the exchange $\rho^\dagger V\rho$ takes the tile at
+  $\mathrm{wrap}(+Q)$ ([bsemat E12](../theory/bgw-bsemat-export.md#finite-q)).
+  The native path and BerkeleyGW exporter use the same momentum owner;
+  a complete-centroid plane-wave identity checks its sign, all three native
+  routes and the exporter (`tests/test_exciton_exchange_momentum_cpu.py`). At finite $Q$ the
   $G = 0$ term of $v(Q+G)$ is kept (BerkeleyGW's `energy_loss` convention):
   this is the nonanalytic long-range exchange, so $E_S(Q\to0)$ need not equal
   $E_S(\Gamma)$ for longitudinal excitons. At exactly $\Gamma$ the production
@@ -400,7 +401,7 @@ with the exchange $V_Q$ weighted as in `bse.bse_jax`
 | `interp` (default) | a closed-form interpolant of the coarse tiles: Tikhonov-cleaned short-range tiles on a lattice stencil plus one least-squares model of the long-range form factors | slab decks only (`sys_dim = 2`, $q_z = 0$ grids; refuses a bulk deck); needs full-BZ `zeta_q.h5` |
 | `refit` | a new ISDF fit $\zeta'$ at each $Q$ from the htransform states, contracted with the producer's own Coulomb kernel | any dimension; the arbitrary-$Q$ route for bulk crystals; expensive |
 | `both` | `interp` on the whole path plus `refit` at `--refit-points`, solved in the same scan | for measuring the interpolation error |
-| `ongrid` | the stored tile $V_{\mathrm{wrap}(-Q)}$ | exact, but only at $Q$ on the coarse grid; refuses off-grid $Q$ |
+| `ongrid` | the stored tile $V_{\mathrm{wrap}(+Q)}$ | exact, but only at $Q$ on the coarse grid; refuses off-grid $Q$ |
 
 **The refit window and its certificate.** `--refit-window zeta` (default)
 fits $\zeta'$ on the producer's own ζ-fit window. It then reproduces the
