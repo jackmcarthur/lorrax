@@ -116,7 +116,7 @@ case "${MPI_STACK}" in
         MPI_INCLUDE_DIR_CT="/lorrax_phdf5/include"  # staged MPICH headers
         # --mpi=cray_shasta is the PMI protocol that shifter-mpich's libmpi
         # speaks.  pmi2/pmix both produce singleton-MPI (each rank thinks
-        # world_size==1) — observed while bringing up slate FFI.  phdf5
+        # world_size==1) — observed while bringing up the MPI FFI.  phdf5
         # "worked" on pmi2 only because its default now uses independent
         # I/O (each rank writes its own shard with no collective handshake
         # — see src/ffi/cpp/phdf5/ctx.h), so it silently did the right
@@ -160,17 +160,16 @@ else
 fi
 
 # Staged third-party trees are bind-mounted inside the container at
-# stable paths: /lorrax_nvhpc, /lorrax_phdf5, /lorrax_slate.
+# stable paths: /lorrax_nvhpc, /lorrax_phdf5, /lorrax_cray.
 VOL_FLAGS=(--volume="${NVHPC_HOST}:/lorrax_nvhpc")
 if [[ -d "${PHDF5_HOST}" ]]; then
     VOL_FLAGS+=(--volume="${PHDF5_HOST}:/lorrax_phdf5")
 fi
-# SLATE stage: Cray libsci + libmpi_gtl_cuda + libxpmem + liblustreapi.
-# Populated by src/ffi/cpp/stage/slate_stage_cray.sh.  Skipped if absent.
-: "${LORRAX_FFI_SLATE_DIR:=$HOME/software/lorrax_slate_cray/stage}"
-SLATE_INSTALL_HOST="${LORRAX_SLATE_INSTALL_DIR:-$HOME/software/slate/install}"
-if [[ -d "${LORRAX_FFI_SLATE_DIR}" ]]; then
-    VOL_FLAGS+=(--volume="${LORRAX_FFI_SLATE_DIR}:/lorrax_slate")
+# Cray runtime stage: libsci + libmpi_gtl_cuda + libxpmem + liblustreapi.
+# Populated by src/ffi/cpp/stage/cray_runtime_stage.sh.  Skipped if absent.
+: "${LORRAX_FFI_CRAY_DIR:=$HOME/software/lorrax_cray_runtime/stage}"
+if [[ -d "${LORRAX_FFI_CRAY_DIR}" ]]; then
+    VOL_FLAGS+=(--volume="${LORRAX_FFI_CRAY_DIR}:/lorrax_cray")
 fi
 # FFTW3 stage: the DOUBLE-PRECISION SERIAL cray-fftw engine, and nothing
 # else.  Populated by src/ffi/cpp/stage/fftw_stage_cray.sh.  Skipped if
@@ -181,7 +180,7 @@ fi
 # advanced interface at RUN time and deliberately keeps it out of DT_NEEDED
 # (GATE 5).  Run-time resolution still needs a file to resolve TO, and
 # measured 2026-08-06 in-container on a compute node, this image has none:
-# `find /usr /usr/local /opt /lib /lib64 /lorrax_{slate,phdf5,nvhpc} -name
+# `find /usr /usr/local /opt /lib /lib64 /lorrax_{cray,phdf5,nvhpc} -name
 # 'libfftw3*'` is EMPTY, every ladder candidate returns "cannot open shared
 # object file", and /opt/cray/pe does not exist at all — so the host .so's
 # RPATH, which is what makes the BARE-HOST leg work, resolves nothing here.
@@ -221,9 +220,8 @@ if [[ ! -e "${NVHPC_HOST}/${LORRAX_NVHPC_SUBPATH}/libcusolverMp.so" ]]; then
     echo "  Set LORRAX_NVHPC_SUBPATH (see config/perlmutter/site_config.sh)." >&2
     exit 2
 fi
-# LD_LIBRARY_PATH: slate install (libslate + bundled blaspp/lapackpp) + slate
-# cray-stack stage (libsci etc.) come first; then phdf5 stage (libhdf5 +
-# SONAME shims, including libmpi_gnu_123.so.12 reused by SLATE); one selected
+# LD_LIBRARY_PATH: the Cray runtime stage (libsci etc.) comes first; then the
+# phdf5 stage (libhdf5 + SONAME shims, including libmpi_gnu_123.so.12); one selected
 # NVHPC stage (cusolverMp/cublasmp); stack MPI; and Darshan. Older CAL-linked
 # builds are unsupported: adding the 25.5 tree as a fallback also adds a
 # second libcusolverMp.so.0, making a wrong-answer 0.6.0 selection depend on
@@ -235,7 +233,7 @@ fi
 # entries above do — and putting it last means it can never shadow a vendor
 # library either.  A directory whose ordering is load-bearing is a hazard;
 # this one's is not, and that is a property worth keeping.
-LDLIB="${SLATE_INSTALL_HOST}/lib64:/lorrax_slate/lib:/lorrax_phdf5/lib:/lorrax_nvhpc/${LORRAX_NVHPC_SUBPATH}:/lorrax_fftw/lib:${MPI_LIB_DIR_CT}:/global/common/software/nersc9/darshan/default/lib"
+LDLIB="/lorrax_cray/lib:/lorrax_phdf5/lib:/lorrax_nvhpc/${LORRAX_NVHPC_SUBPATH}:/lorrax_fftw/lib:${MPI_LIB_DIR_CT}:/global/common/software/nersc9/darshan/default/lib"
 if [[ "${MPI_STACK}" == mpich ]]; then
     # mpich module ships its own PMI/libfabric deps under dep/
     LDLIB="${LDLIB}:/opt/udiImage/modules/mpich/dep"
@@ -247,10 +245,10 @@ fi
 # matters: shifter ships a CUDA-11-linked version (needs libcudart.so.11.0
 # not in our CUDA-12 container) while our Cray-module stage has the
 # CUDA-12-linked one.  LD_PRELOAD the staged version so it's already loaded
-# when SLATE asks for it.
-SLATE_PRELOAD=""
-if [[ -f "${LORRAX_FFI_SLATE_DIR}/lib/libmpi_gtl_cuda.so.0" ]]; then
-    SLATE_PRELOAD="/lorrax_slate/lib/libmpi_gtl_cuda.so.0"
+# when MPICH asks for it.
+GTL_PRELOAD=""
+if [[ -f "${LORRAX_FFI_CRAY_DIR}/lib/libmpi_gtl_cuda.so.0" ]]; then
+    GTL_PRELOAD="/lorrax_cray/lib/libmpi_gtl_cuda.so.0"
 fi
 
 SHIFTER_ARGS=(
@@ -258,11 +256,10 @@ SHIFTER_ARGS=(
     "${VOL_FLAGS[@]}"
     --env=PYTHONPATH="${PYPATH}"
     --env=LD_LIBRARY_PATH="${LDLIB}"
-    --env=LD_PRELOAD="${SLATE_PRELOAD}"
+    --env=LD_PRELOAD="${GTL_PRELOAD}"
     # Activate Cray MPICH's GPU-Direct RDMA path so MPI_Send with a
     # device pointer goes GPU->GPU over Slingshot, not staged through
-    # host RAM.  Required for any decent perf in SLATE (and other
-    # MPI-based GPU libs); pairs with the libmpi_gtl_cuda LD_PRELOAD
+    # host RAM.  Required for any decent perf in MPI-based GPU libs; pairs with the libmpi_gtl_cuda LD_PRELOAD
     # above.  Shifter strips the host-set env, so we re-set it here.
     # PER PLATFORM, not unconditionally 1: on the CPU leg it must be 0 or
     # Cray MPICH aborts in MPI_Init_thread (fixed 2026-08-06 here and in
@@ -295,12 +292,12 @@ if [[ -n "${SLURM_JOBID:-}" && -z "${SLURM_STEP_ID:-}" ]]; then
     : "${LORRAX_MPI_TYPE:=${MPI_TYPE_DEFAULT}}"
     # Per-rank GPU isolation via CUDA_VISIBLE_DEVICES=$SLURM_LOCALID —
     # NERSC-documented "Method 3" at https://docs.nersc.gov/jobs/affinity/.
-    # Needed so SLATE's blas::get_device_count() returns 1 per rank
-    # (matching JAX's 1-process-per-GPU model).  --gpus-per-task=1 would
+    # Gives each rank exactly one visible device (JAX's
+    # 1-process-per-GPU model).  --gpus-per-task=1 would
     # also achieve this via cgroups but it breaks JAX's distributed
     # topology sync (JAX queries each process's device table assuming all
     # ranks expose the same local ordinals).
-    # For SLATE, each rank needs CUDA_VISIBLE_DEVICES=$SLURM_LOCALID
+    # Each rank then has CUDA_VISIBLE_DEVICES=$SLURM_LOCALID
     # (1-GPU-per-process), and JAX needs local_device_ids=[0].  Opt-in via
     # LORRAX_SELECT_GPU=1 so phdf5/cusolvermp (which use the default
     # all-GPUs-visible model) stay unchanged.

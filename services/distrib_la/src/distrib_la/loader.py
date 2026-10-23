@@ -3,15 +3,15 @@
 Ported from LORRAX ``src/ffi/common/ffi_loader.py`` at 96a6399, carrying
 only what the distributed-linalg backends need: the two platform library
 specs, the linalg target→C++-symbol tables, the ctypes declarations for
-the cuSOLVERMp/SLATE contexts, and the probe.  The one native GEMM here is
+the cuSOLVERMp and MPI mesh contexts, and the probe.  The one native GEMM here is
 the CUDA local active-range cuBLAS product; the distributed GEMM is
 :func:`distrib_la.panel_matmul` in XLA.  Only unrelated FFT, host
 bands-GEMM and phdf5 surfaces remain in LORRAX's loader.
 
 THIS IS THE QUARANTINE BOUNDARY.  Everything in this package that knows a
 vendor library exists knows it through this module: one ``dlopen``, one
-symbol table, one probe.  ``pyproject.toml`` declares no ScaLAPACK, no
-SLATE or cuSOLVERMp because none is linked here — they are inside
+symbol table, one probe.  ``pyproject.toml`` declares no ScaLAPACK, ELPA
+or cuSOLVERMp because none is linked here — they are inside
 a ``.so`` that this file opens by path.
 
 The tables are the SERVICE's, the policy is lxkit's
@@ -74,7 +74,7 @@ __all__ = ["get_lib", "has_target", "probe_target", "loaded_lib_path",
 #: header whenever the monorepo is reachable and FAILS if the two disagree.
 #: That is the whole mechanism keeping a copy honest: a copy nothing compares
 #: is how the ten dispatch sites drifted.
-LORRAX_FFI_ABI_VERSION = 10
+LORRAX_FFI_ABI_VERSION = 11
 
 #: platform -> the C entry point reporting the library's ABI.  Per leg,
 #: because both libraries are dlopened RTLD_GLOBAL and already share sixteen
@@ -128,10 +128,6 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cusolvermp_batched_solve_lu_factors": "CusolverMpBatchedSolveLuFactorsFfi",
     "lorrax_cusolvermp_batched_getrf":    "CusolverMpBatchedGetrfFfi",
     "lorrax_cusolvermp_batched_getrs":    "CusolverMpBatchedGetrsFfi",
-    "lorrax_slate_eigh":                  "SlateEighFfi",
-    "lorrax_slate_potrf":                 "SlatePotrfFfi",
-    "lorrax_slate_batched_potrf":         "SlateBatchedPotrfFfi",
-    "lorrax_slate_batched_trsm":          "SlateBatchedTrsmFfi",
 }
 
 # The host variants: the SAME target names registered under platform="cpu"
@@ -142,10 +138,6 @@ _CUDA_TARGET_SYMBOLS = {
 # collisions is load-bearing: see the SONAME note above ``get_lib``.
 # ScaLAPACK is host-only: there is no CUDA row for it anywhere.
 _HOST_TARGET_SYMBOLS = {
-    "lorrax_slate_eigh":                    "SlateEighHostFfi",
-    "lorrax_slate_potrf":                   "SlatePotrfHostFfi",
-    "lorrax_slate_batched_potrf":           "SlateBatchedPotrfHostFfi",
-    "lorrax_slate_batched_trsm":            "SlateBatchedTrsmHostFfi",
     "lorrax_scalapack_eigh":                "ScalapackEighHostFfi",
     "lorrax_scalapack_batched_solve_lu_factors": "ScalapackBatchedSolveLuFactorsHostFfi",
     "lorrax_scalapack_batched_getrf":       "ScalapackBatchedGetrfHostFfi",
@@ -155,18 +147,6 @@ _HOST_TARGET_SYMBOLS = {
 #: Per-platform library spec.  ``build_subdir`` is relative to
 #: ``src/ffi/cpp/`` of the LORRAX checkout, when there is one (see
 #: :func:`_candidate_paths`).
-#: The ROCM leg's distributed-linalg handlers: the SLATE family, the SAME
-#: leg-neutral cpp/slate/ sources as the CUDA leg (so the same symbols; only one
-#: device leg is loaded per process), over a gpu_backend=hip SLATE
-#: (config/frontier/build_slate_hip.sh).  ``distrib_la.resolve`` carries the
-#: ROCM preference rows; cuSOLVERMp has no ROCm build, so it has no row here.
-#: Plus the SLATE LU family (cpp/slate/batched_solve_lu_ffi.cc), which only
-#: this leg builds: CUDA's distributed LU is cuSOLVERMp, the host's ScaLAPACK.
-_ROCM_SLATE_LU_SYMBOLS: dict = {
-    "lorrax_slate_batched_solve_lu_factors": "SlateBatchedSolveLuFactorsFfi",
-    "lorrax_slate_batched_getrf":            "SlateBatchedGetrfFfi",
-    "lorrax_slate_batched_getrs":            "SlateBatchedGetrsFfi",
-}
 #: The batched local Hermitian eigh (cpp/rocsolver/batched_eigh_ffi.cc: one rocSOLVER
 #: strided-batched heevd/syevd per stack), the target of local_eigh.BATCHED_EIGH_ROUTE's ROCM
 #: row.  CUDA solves the same stacks with jaxlib's cuSOLVER, so only this leg builds it.
@@ -197,10 +177,8 @@ _ROCM_ACTIVE_SUBSPACE_SYMBOLS: dict = {
 #: ROCM ``distributed`` eigh above the one-device bound (distrib_la.resolve).  ROCM only.
 _ROCM_ELPA_SYMBOLS: dict = {"lorrax_elpa_eigh": "ElpaEighFfi"}
 _ROCM_TARGET_SYMBOLS: dict = {**{t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
-                                 if t.startswith(("lorrax_slate_", "lorrax_cublas_local_",
-                                                  "lorrax_active_gemm_"))},
-                              **_ROCM_SLATE_LU_SYMBOLS, **_ROCM_LOCAL_EIGH_SYMBOLS,
-                              **_ROCM_LOCAL_LU_SYMBOLS,
+                                 if t.startswith(("lorrax_cublas_local_", "lorrax_active_gemm_"))},
+                              **_ROCM_LOCAL_EIGH_SYMBOLS, **_ROCM_LOCAL_LU_SYMBOLS,
                               **_ROCM_ACTIVE_SUBSPACE_SYMBOLS, **_ROCM_ELPA_SYMBOLS}
 
 #: Leg key -> this loader's target table and not-found build command.
@@ -208,13 +186,13 @@ _TARGETS = {"CUDA": _CUDA_TARGET_SYMBOLS, "ROCM": _ROCM_TARGET_SYMBOLS,
             "cpu": _HOST_TARGET_SYMBOLS}
 _BUILD_HINTS = {
     "CUDA": 'src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh',
-    "ROCM": "bash config/frontier/build_slate_hip.sh && bash config/frontier/build_ffi_rocm.sh",
+    "ROCM": "bash config/frontier/build_ffi_rocm.sh",
     "cpu": 'bash config/perlmutter/build_ffi_host.sh --fresh',
 }
 #: Per-target overrides of the leg's not-found build command.  A target whose handler needs a
 #: library the leg's command does not name gets that library's script first: ROCM's ELPA eigh
-#: (cpp/elpa/) is ELPA's (config/frontier/build_elpa_hip.sh), not SLATE's.  The SLATE targets
-#: and every other ROCM target keep the leg's command above; CUDA and cpu have no override.
+#: (cpp/elpa/) is ELPA's (config/frontier/build_elpa_hip.sh).  Every other target keeps the
+#: leg's command above.
 _TARGET_BUILD_HINTS = {
     ("ROCM", t): "bash config/frontier/build_elpa_hip.sh && bash config/frontier/build_ffi_rocm.sh"
     for t in _ROCM_ELPA_SYMBOLS
@@ -279,9 +257,8 @@ def _locate_so(platform: str) -> Path:
 # ---------------------------------------------------------------------------
 # THE C ABI IS PER-LIBRARY; THE PYTHON NAME IS NOT.
 # ---------------------------------------------------------------------------
-# ``cpp/slate/context.cc`` is pure MPI, but each platform build includes it
-# only when its SLATE or ScaLAPACK capability is present. When included,
-# until 2026-08-08 both .so files defined these four
+# ``cpp/mesh/context.cc`` is pure MPI; the host leg includes it with ScaLAPACK
+# and the ROCM leg with ELPA.  Until 2026-08-08 both .so files defined the same
 # ``extern "C"`` names (and five more from ``cpp/phdf5/api.cc``, which this
 # package does not call).  Both are dlopened RTLD_GLOBAL, one name with two
 # definitions behind it -- the C half of the cross-.so ODR violation
@@ -290,11 +267,10 @@ def _locate_so(platform: str) -> Path:
 # keeps every call site below leg-agnostic.  Mirrors
 # ``ffi.common.ffi_loader._bind_c_abi`` -- the two loaders open the SAME
 # FILES, so both have to know the same naming rule.
-_SLATE_C_ENTRY_POINTS = (
-    "lrx_slate_context_create",
-    "lrx_slate_subrow_context_create",
-    "lrx_slate_context_destroy",
-    "lrx_slate_init_mpi",
+_C_ENTRY_POINTS = (
+    "lrx_mesh_context_create",
+    "lrx_mesh_context_destroy",
+    "lrx_mesh_init_mpi",
     "lrx_ctx_bind",
     "lrx_ctx_unbind",
     # cpp/active_subspace/active_eigh.cc: the eigensolver workspace query.
@@ -316,7 +292,7 @@ def _bind_c_abi(lib: ctypes.CDLL, platform: str) -> None:
     suffix = _C_ABI_SUFFIX.get(platform, "")
     if not suffix:
         return
-    for base in _SLATE_C_ENTRY_POINTS:
+    for base in _C_ENTRY_POINTS:
         try:
             fn = getattr(lib, base + suffix)
         except AttributeError:
@@ -369,15 +345,12 @@ def _declare_ctx_registry(lib: ctypes.CDLL) -> None:
     lib.lrx_ctx_unbind.restype = None
 
 
-def _declare_slate(lib: ctypes.CDLL) -> None:
-    """SLATE context lifecycle, when the platform build includes it.
-
-    The CUDA leg can omit SLATE; the host leg includes this MPI context
-    when either SLATE or ScaLAPACK is built.
-    """
-    if not hasattr(lib, "lrx_slate_context_create"):
+def _declare_mesh(lib: ctypes.CDLL) -> None:
+    """The MPI mesh context lifecycle (``cpp/mesh/context.cc``), when the platform
+    build includes it (host: ScaLAPACK; ROCM: ELPA)."""
+    if not hasattr(lib, "lrx_mesh_context_create"):
         return
-    lib.lrx_slate_context_create.argtypes = [
+    lib.lrx_mesh_context_create.argtypes = [
         ctypes.c_int,           # rank
         ctypes.c_int,           # world_size
         ctypes.c_int,           # p
@@ -385,20 +358,11 @@ def _declare_slate(lib: ctypes.CDLL) -> None:
         ctypes.c_char_p,        # err_buf
         ctypes.c_int,           # err_buf_len
     ]
-    lib.lrx_slate_context_create.restype = ctypes.c_int64
-    lib.lrx_slate_subrow_context_create.argtypes = [
-        ctypes.c_int,           # rank (full-world)
-        ctypes.c_int,           # world_size
-        ctypes.c_int,           # Px
-        ctypes.c_int,           # Py
-        ctypes.c_char_p,        # err_buf
-        ctypes.c_int,           # err_buf_len
-    ]
-    lib.lrx_slate_subrow_context_create.restype = ctypes.c_int64
-    lib.lrx_slate_context_destroy.argtypes = [ctypes.c_int64]
-    lib.lrx_slate_context_destroy.restype = None
-    lib.lrx_slate_init_mpi.argtypes = []
-    lib.lrx_slate_init_mpi.restype = None
+    lib.lrx_mesh_context_create.restype = ctypes.c_int64
+    lib.lrx_mesh_context_destroy.argtypes = [ctypes.c_int64]
+    lib.lrx_mesh_context_destroy.restype = None
+    lib.lrx_mesh_init_mpi.argtypes = []
+    lib.lrx_mesh_init_mpi.restype = None
 
 
 def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
@@ -409,10 +373,6 @@ def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
         # capability probe is what turns that into a refusal, at resolve
         # time, naming the target.
         if not hasattr(lib, cpp_symbol):
-            continue
-        # Another leg's file serves this handler's library in this process:
-        # never registered, refused by name (native_provider.refuse_if_borrowed).
-        if _native.borrowed_families(platform, target_name):
             continue
         try:
             jax.ffi.register_ffi_target(
@@ -427,148 +387,22 @@ def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# THE TWO PLATFORM LIBRARIES SHARE THEIR SLATE.  Open CUDA first — IN A
-# PROCESS THAT CAN USE CUDA, and in no other.
+# LOAD ORDER: a device-capable process opens its device leg before the host leg.
 # ---------------------------------------------------------------------------
-# ``liblorrax_ffi.so`` and ``liblorrax_ffi_host.so`` do not merely differ in
-# their C++ symbols (the claim two comments in this file used to make).  BOTH
-# carry ``NEEDED libslate.so.2`` and ``NEEDED libblaspp.so.2``, and they
-# resolve those SONAMEs out of DIFFERENT BUILDS:
-#
-#   host  DT_RPATH   .../slate_builds/cpu/install/lib64   gpu_backend=none
-#   CUDA  DT_RUNPATH /lorrax_slate/lib, .../slate/install/lib64   CUDA
-#
-# ld.so keys a loaded object by SONAME, so whichever of the two is dlopened
-# FIRST decides which ``libblaspp.so.2`` the OTHER one calls for the rest of
-# the process.  The CPU build's ``blas::get_device_count()`` is a
-# compiled-in 0 -- it has no ``libcudart`` to ask.
-#
-# MEASURED, Perlmutter 2026-08-07, ``dladdr`` of ``blas::get_device_count``
-# at a failing cell, EXACTLY ONE visible GPU in both legs:
-#
-#   full-suite ``-m distrib_la``  host opened first
-#       -> .../slate_builds/cpu/install/lib64/libblaspp.so.2, returns 0
-#       -> FAILED_PRECONDITION: slate.potrf: blas::get_device_count()=0 but
-#          JAX one-process-per-GPU model requires exactly 1.       8 CELLS RED
-#   service-only (by path)        CUDA opened first
-#       -> .../slate/install/lib64/libblaspp.so.2, returns 1       ALL GREEN
-#
-# What opened the host library first was a MODULE-SCOPE probe during
-# COLLECTION: ``tests/test_fft_flat_k_numerics.py`` calls
-# ``ffi_loader.probe_target(FLAT_K_TARGET, "cpu")`` at import time.  ``-m
-# distrib_la`` deselects that file's CELLS; it does not un-import the module.
-#
-# So this is NOT a harness artefact.  Any GPU run whose first FFI touch is a
-# host target -- a phdf5 host read, an mklfft probe -- silently gets a
-# device-less SLATE, and the refusal it eventually prints names a device
-# count nobody set.
-#
-# ONE SAFE ORDER EXISTS AMONG PROCESSES THAT OPEN BOTH, and the asymmetry is
-# the reason: the host SLATE handlers run ``slate::Target::HostTask`` and
-# never consult ``get_device_count``, so a CUDA blaspp in charge costs the
-# host path nothing (measured: the service-only leg is 244 cells / 0 failed
-# with exactly that arrangement).  The reverse costs the CUDA path
-# everything.
-#
-# AND THE CHEAPER ORDER IS TO OPEN ONLY ONE.  MEASURED, Perlmutter
-# 2026-08-07 (KNOWN_FAILURES B1): a pre-open with no CUDA arm to protect
-# costs a CPU-platform process its host phdf5 path outright.  Bisect on
-# ``tests/test_file_io.py``, CPU platform (JAX_PLATFORMS=cpu), four emulated
-# host devices, same pins on every arm:
-#
-#   96a6399 branch base                  42 passed / 1 skipped
-#   b3f3675 the commit before this rule  42 passed / 1 skipped
-#   32e61fe this rule, unconditional     3 failed, Fatal Python error: Aborted
-#
-# and where it refused instead of aborting:
-#
-#   phdf5 read: logical slab out of bounds
-#     extent=[2,4,1,6]
-#     offset_base=[0,0,0,4596944070643295330]
-#     valid_shape=[3,6,6,4609783128842618077]
-#
-# -- IEEE-754 float64 bit patterns (~0.19, ~1.87) decoded as int64: one
-# library's handler reading the other's argument layout.  See INTERPOSITION
-# below.
-#
-# SO THE PRE-OPEN IS TWO-ARMED, on the one question that decides whether
-# there is a CUDA handler in this process for the order to protect:
-#
-#   CUDA-capable process  ->  CUDA first, then host.  SLATE survives, and
-#                             the ``-m distrib_la`` leg stays 130 cells /
-#                             0 failed.
-#   CPU-platform process  ->  host only.  The CUDA library is NEVER dlopened.
-#
-# Best effort on top: no CUDA library built (every CPU-only tree, the WSL
-# box) or one that cannot load (no driver on this node) leaves the
-# environment untouched, and is tried once.
-#
-# ---------------------------------------------------------------------------
-# INTERPOSITION -- THE DEFECT UNDERNEATH.  FIXED 2026-08-08; this block is
-# the record of what it was and of what the load-order rule above does NOT
-# cover.
-# ---------------------------------------------------------------------------
-# ``libslate``/``libblaspp`` were not the only collision between the two
-# files.  MEASURED 2026-08-07, ``nm -D --defined-only`` on the two pinned
-# builds (deployed device lib; build_host_h200, md5 4c4422b8...): 259 symbol
-# names DEFINED BY BOTH, **25 of them LORRAX's own** -- the nine C-linkage
-# ``lrx_phdf5_*`` / ``lrx_slate_*`` entry points and sixteen mangled
-# ``lorrax_ffi::phdf5::*`` (``open_ctx``, ``close_ctx``, ``ensure_dataset``,
-# ``open_dataset_ro``, ``ensure_pinned``, ``ensure_read_buf``,
-# ``ensure_mpi_initialized``, ``env_flag``, ``~PhdfCtx``, the ``dt::`` HDF5
-# type singletons and their guards).  Both are dlopened RTLD_GLOBAL, so once
-# both were open the FIRST one answered those names for BOTH -- including for
-# the other library's own internal calls.
-#
-# And they were not the same functions.  ``cpp/phdf5/ctx.h`` compiles
-# ``PhdfCtx`` with the CUDA stream / event / pinned-buffer members under
-# ``#ifndef LORRAX_FFI_NO_CUDA``; the host build defines that macro and drops
-# them.  One C++ type name, two struct layouts, both exporting
-# ``open_ctx(...) -> PhdfCtx*`` -- a cross-.so ODR violation.  A handler from
-# one build handed a ``PhdfCtx*`` minted by the other read its fields at the
-# wrong offsets, which is what the float64-as-int64 ``offset_base`` above and
-# the ``phdf5 read: ctx_handle is null`` in the xdist arm both are.
-#
-# FIXED, IN C++, THREE WAYS (branch fix/ffi-odr-2026-08-08):
-#   * ``src/ffi/cpp/exports_{cuda,host}.map`` -- linker version scripts that
-#     make every ``lorrax_ffi``-namespaced definition LOCAL to the library
-#     that compiled it.  Third-party vague-linkage symbols are deliberately
-#     left global; localising those was measured to segfault the SLATE host
-#     handlers, and the map carries that five-arm table.
-#   * ``cpp/common/c_abi.h`` -- the nine ``lrx_*`` entry points cannot be
-#     hidden (the loaders dlsym them), so the HOST leg's carry a ``_host``
-#     suffix.  ``_bind_c_abi`` above binds them under the plain Python name.
-#   * ``cpp/phdf5/ctx.h`` -- ``PhdfCtx``'s struct TAG is now per-leg
-#     (``PhdfCtxCudaV1`` / ``PhdfCtxHostV1``), so the cross-layout aliasing
-#     is unconstructible even without the version scripts.
-#
-# MEASURED AFTER, same two commands: 234 shared names, **0 of them LORRAX's
-# own and 0 with C linkage**.  And the mixed state is now survivable --
-# ``tests/test_file_io.py`` on a CPU-platform leg with the capability gate
-# below DISABLED (i.e. 32e61fe's unconditional pre-open, the configuration
-# that aborted):
-#
-#     pre-fix pair, gate off   Fatal Python error: Aborted, no junitxml
-#     rebuilt pair, gate off   46 passed / 1 skipped, 0 abort signatures
-#
-# ``services/distrib_la/tests/test_so_acceptance.py`` check 6 is the ratchet.
-#
-# THE GATE ABOVE STAYS ANYWAY, and this is why: it was written for the
-# ``libslate``/``libblaspp`` SONAME race, and that is a DIFFERENT defect --
-# about which BUILD of a third-party library answers, not about which of our
-# own definitions does.  ~234 third-party names are still shared (they have
-# to be: they are ODR-correct weak COMDAT copies the C++ ABI merges on
-# purpose), and there is still ONE ``libblaspp.so.2`` per process whose
-# ``blas::get_device_count()`` is a compiled-in 0 in the host build.  Nothing
-# in the ODR fix touches that.  Retiring the pre-open would re-open the eight
-# ``FAILED_PRECONDITION: slate.potrf: blas::get_device_count()=0`` cells.
-# ``test_so_acceptance.py``'s check 5 is what will say when it CAN go.
+# Introduced (2026-08-07) for a SONAME race between two builds of one third-party
+# library that both legs linked; that library was removed on 2026-10-23
+# (UPGRADE_NOTES.md), and the cross-.so ODR defect it exposed is fixed in C++
+# (``exports_{cuda,host}.map``, ``cpp/common/c_abi.h``, per-leg ``PhdfCtx`` tags;
+# ``test_so_acceptance.py`` check 6 is the ratchet).  The order is kept until
+# ``test_so_acceptance.py`` check 5 is re-run on both clusters without it.  A
+# CPU-platform process opens the host library only: a pre-open there cost the
+# host phdf5 path (KNOWN_FAILURES B1).
 #: Device legs this loader has already tried to open ahead of the host leg.
 _ACCELERATOR_FIRST_TRIED: set = set()
 
 
 def _open_accelerator_before_host() -> None:
-    """Win the ``libslate``/``libblaspp`` SONAME for the device build.
+    """Open the device leg ahead of the host leg (the load-order note above).
 
     THIS READS THE ENVIRONMENT AND STILL SELECTS NO BACKEND.  The module
     docstring's rule -- env grants a capability, a deck key picks the
@@ -631,7 +465,7 @@ def get_lib(platform: str) -> ctypes.CDLL:
         unusable_cls=LibraryUnusable, mismatch_cls=AbiMismatch)
     _bind_c_abi(lib, platform)
     _declare_cusolvermp(lib)
-    _declare_slate(lib)
+    _declare_mesh(lib)
     _declare_ctx_registry(lib)
     _register_ffi_targets(lib, platform)
     _LIBS[platform] = lib
@@ -680,9 +514,6 @@ def probe_target(target_name: str, platform: str):
             hint=(f"{spec['env']} selects the .so; LD_LIBRARY_PATH must "
                   f"cover every library that .so needs (run `ldd <so>` to "
                   f"see which are missing)."))
-    borrowed = _native.borrowed_reason(platform, target_name)
-    if borrowed:
-        return ProbeResult(False, borrowed)
     if not hasattr(lib, sym):
         return missing_symbol(target_name, sym, _LIB_PATHS.get(platform, "?"),
                               build_hint=target_build_hint(platform, target_name))
@@ -743,48 +574,24 @@ def destroy_cusolvermp_context(ctx_handle: int) -> None:
     get_lib("CUDA").lrx_destroy_cusolvermp_context(int(ctx_handle))
 
 
-def create_slate_context(rank: int, world_size: int, p: int, q: int,
-                         platform: str) -> int:
-    """Collective create of a SLATE context; returns an opaque int64 handle.
+def create_mesh_context(rank: int, world_size: int, p: int, q: int,
+                        platform: str) -> int:
+    """Collective create of an MPI mesh context; returns an opaque int64 handle.
 
-    Inits ``MPI_THREAD_MULTIPLE`` if nothing else got there first, then
-    dups ``MPI_COMM_WORLD`` for SLATE's exclusive use.  ``platform``
-    selects which library serves the call, so a CPU-mesh op never forces
-    the CUDA library to load.
+    Inits ``MPI_THREAD_MULTIPLE`` if nothing else got there first, then splits
+    ``MPI_COMM_WORLD`` with the JAX rank remap.  ``platform`` selects which
+    library serves the call, so a CPU-mesh op never forces a device library to load.
     """
     lib = get_lib(platform)
-    if not hasattr(lib, "lrx_slate_context_create"):
+    if not hasattr(lib, "lrx_mesh_context_create"):
         raise LibraryUnusable(
-            f"SLATE context unavailable on {platform}: the selected FFI "
-            "library does not export lrx_slate_context_create")
+            f"MPI mesh context unavailable on {platform}: the selected FFI "
+            "library does not export lrx_mesh_context_create")
     err = ctypes.create_string_buffer(_ERR_CAP)
-    h = lib.lrx_slate_context_create(
+    h = lib.lrx_mesh_context_create(
         int(rank), int(world_size), int(p), int(q), err, _ERR_CAP)
     if int(h) == 0:
-        raise RuntimeError("lorrax_ffi slate.context_create failed: "
-                           + err.value.decode("utf-8", errors="replace"))
-    return int(h)
-
-
-def create_slate_subrow_context(rank: int, world_size: int,
-                                Px: int, Py: int, platform: str) -> int:
-    """Collective create of a per-X-row SLATE sub-comm context.
-
-    ``MPI_COMM_WORLD`` split by x-coordinate (color=x_rank, key=y_rank),
-    giving one comm of size ``Py`` per X-row — what the batched wrappers
-    need, where each row independently processes a slice of a
-    ``(Nbatch, N, N)`` input distributed as ``P('x', None, 'y')``.
-    """
-    lib = get_lib(platform)
-    if not hasattr(lib, "lrx_slate_subrow_context_create"):
-        raise LibraryUnusable(
-            f"SLATE subrow context unavailable on {platform}: the selected "
-            "FFI library does not export lrx_slate_subrow_context_create")
-    err = ctypes.create_string_buffer(_ERR_CAP)
-    h = lib.lrx_slate_subrow_context_create(
-        int(rank), int(world_size), int(Px), int(Py), err, _ERR_CAP)
-    if int(h) == 0:
-        raise RuntimeError("lorrax_ffi slate.subrow_context_create failed: "
+        raise RuntimeError("lorrax_ffi mesh.context_create failed: "
                            + err.value.decode("utf-8", errors="replace"))
     return int(h)
 
@@ -827,14 +634,14 @@ def unbind_context(platform: str, key: int) -> None:
         lib.lrx_ctx_unbind(int(key))
 
 
-def destroy_slate_context(ctx_handle: int, platform: str) -> None:
-    get_lib(platform).lrx_slate_context_destroy(int(ctx_handle))
+def destroy_mesh_context(ctx_handle: int, platform: str) -> None:
+    get_lib(platform).lrx_mesh_context_destroy(int(ctx_handle))
 
 
-def slate_init_mpi(platform: str) -> None:
-    """Eagerly init ``MPI_THREAD_MULTIPLE`` from outside SLATE's hot path.
+def mesh_init_mpi(platform: str) -> None:
+    """Eagerly init ``MPI_THREAD_MULTIPLE`` outside the hot path.
     Idempotent; no-op if MPI is already initialized."""
-    get_lib(platform).lrx_slate_init_mpi()
+    get_lib(platform).lrx_mesh_init_mpi()
 
 
 def dial_key() -> tuple:

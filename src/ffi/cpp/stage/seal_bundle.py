@@ -7,8 +7,7 @@ Usage::
       --cuda path/to/liblorrax_ffi.so \
       --host path/to/liblorrax_ffi_host.so \
       --output path/to/lorrax-ffi-<revision> \
-      --private-lib path/to/libblaspp.so.2 \
-      --private-lib path/to/libslate.so.2
+      --private-lib path/to/libcusolverMp.so.0
 
 The output directory must not exist.  Both provider legs and every explicitly
 listed private redistributable library are copied as regular files beneath

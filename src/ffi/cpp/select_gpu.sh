@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Per-rank GPU selector for SLATE's 1-device-per-process model.  Picks the
+# Per-rank GPU selector for the 1-device-per-process model.  Picks the
 # ONE device this rank should use, exports it as CUDA_VISIBLE_DEVICES, then
 # execs its arguments in place, keeping PMI environment intact for mpich
 # collective bootstrap.

@@ -1,10 +1,10 @@
 """Block-cyclic relabeling of a ``P('x','y')`` face operand.
 
-Shared by the two distributed-eigh FFI wrappers (cuSOLVERMp and SLATE); the
+Shared by the distributed-eigh FFI wrappers (cuSOLVERMp and ELPA); the
 block POLICY (which block edge, when to pad) stays with each wrapper, since it
 was measured per library.  Moved here unchanged from ``_cusolvermp`` (the
 helpers had one caller there); the only generalisation is the mesh axis of
-:func:`cyclic_to_block` (cuSOLVERMp un-permutes rows over ``'x'``, SLATE the
+:func:`cyclic_to_block` (cuSOLVERMp un-permutes rows over ``'x'``, ELPA the
 columns of its true-column Q, which run over ``'y'``).
 
 The relabeling: a ``P('x','y')`` operand is one ``(n/p, n/p)`` tile per rank.

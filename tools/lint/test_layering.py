@@ -1872,7 +1872,7 @@ def test_the_service_api_scan_can_fail(sources):
         ("import distrib_la.loader\n",                "distrib_la.loader"),
         ("from distrib_la.plan import plan\n",        "distrib_la.plan"),
         ("from distrib_la import loader\n",           "distrib_la.loader"),
-        ("def f():\n    from distrib_la import _slate\n", "distrib_la._slate"),
+        ("def f():\n    from distrib_la import _scalapack\n", "distrib_la._scalapack"),
     ]
     for src, expected in cases:
         hits = scan_service_api(src, "m", "distrib_la", subs, api)

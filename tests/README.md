@@ -32,7 +32,7 @@ A new test needs no bootstrap import of its own. Run the unit layer with
 |---|---|
 | `test_slab_io_cpu.py` | `SlabIO` serial tier: padded block clips, reads back, a dataset that exists is reused or refused; `read_multi` / `read_slabs` equal `read_slab` |
 | `test_distrib_la_eigh_layout.py` | eigh through the padded and shifted layout returns the unpadded eigensystem |
-| `test_distrib_la_one_device.py` | the one-device route's eigh and LU equal NumPy, and the SLATE `p x 1` rows come back in order |
+| `test_distrib_la_one_device.py` | the one-device route's eigh and LU equal NumPy |
 | `test_polar_device_cut_cpu.py` | the device spectral cut equals the host sequence |
 | `test_nodal_htransform_cpu.py` | the nodal htransform (the hsuite path now has off-grid points, but no oracle): WS kernel exact on the grid, star covariant, better than its controls; metric, Loewdin and its refusal; zero-weight drop and face-versus-q-batched routes; a non-orbit-closed node set is refused |
 | `test_bse_kgrid_dipoles_cpu.py` | densified dipoles equal the exact ones on and off the grid |

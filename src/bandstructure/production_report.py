@@ -180,7 +180,7 @@ class HTransformProductionReport(ProductionReport):
         if fine_enabled:
             fine_text = policy(
                 fine_plan.requested,
-                ("auto", "off", "distributed", "cusolvermp", "slate",
+                ("auto", "off", "distributed", "cusolvermp",
                  "scalapack"))
             if str(fine_plan.requested) != str(fine_plan.backend):
                 fine_text += f" -> {fine_plan.backend}"

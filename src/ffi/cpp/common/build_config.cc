@@ -25,7 +25,7 @@
 // ---------------------------------------------------------------------------
 // liblorrax_ffi.so and liblorrax_ffi_host.so are BOTH dlopened RTLD_GLOBAL in
 // a GPU process, and sixteen symbol names are already defined by both (the
-// lrx_phdf5_* / lrx_slate_* entry points and seven mangled
+// lrx_phdf5_* / lrx_* entry points and seven mangled
 // lorrax_ffi::phdf5:: helpers).  Once both are open the first one loaded
 // answers those names for both — the cross-.so ODR hazard registered as L1 in
 // tests/KNOWN_FAILURES.md.  A build stamp that collided the same way would
@@ -35,8 +35,8 @@
 // So the names are per-leg, selected by the same LORRAX_FFI_NO_CUDA macro the
 // host target already defines.  The fix for L1 is not attempted here, and in
 // particular NOT with a blanket `local:*` version script: the ODR branch
-// measured that hiding everything by default SEGFAULTS SLATE, whose templates
-// need their symbols visible across the blaspp/lapackpp boundary.
+// measured that hiding everything by default segfaulted a third-party
+// template library (since removed; exports_cuda.map).
 
 #include "lorrax_config.h"
 #include "lorrax_ffi_abi.h"
@@ -60,13 +60,11 @@ const char kBuildConfig[] =
     " linked_fftw3=" LORRAX_CFG_STR(LORRAX_CFG_LINKED_FFTW3)
     " scalapack="    LORRAX_CFG_STR(LORRAX_CFG_HAVE_SCALAPACK)
     " gemm="         LORRAX_CFG_STR(LORRAX_CFG_HAVE_GEMM)
-    " slate="        LORRAX_CFG_STR(LORRAX_CFG_HAVE_SLATE)
     " phdf5="        LORRAX_CFG_STR(LORRAX_CFG_HAVE_PHDF5)
     " math_link="    LORRAX_CFG_MATH_LINK;
 #elif defined(LRX_LEG_ROCM)
     // The ROCM leg's families, one key per ported family (ffi_layout.md).
-    " phdf5="      LORRAX_CFG_STR(LORRAX_CFG_HAVE_PHDF5)
-    " slate="      LORRAX_CFG_STR(LORRAX_CFG_HAVE_SLATE);
+    " phdf5="      LORRAX_CFG_STR(LORRAX_CFG_HAVE_PHDF5);
 #else
     // The device leg's capabilities.  Until 2026-08-08 this leg carried NO
     // stamp at all — `strings liblorrax_ffi.so | grep scalapack=` on the
@@ -75,7 +73,6 @@ const char kBuildConfig[] =
     " cusolvermp=" LORRAX_CFG_STR(LORRAX_CFG_HAVE_CUSOLVERMP)
     " cublasmp="   LORRAX_CFG_STR(LORRAX_CFG_HAVE_CUBLASMP)
     " cufft="      LORRAX_CFG_STR(LORRAX_CFG_HAVE_CUFFT)
-    " slate="      LORRAX_CFG_STR(LORRAX_CFG_HAVE_SLATE)
     " phdf5="      LORRAX_CFG_STR(LORRAX_CFG_HAVE_PHDF5)
     " cal="        LORRAX_CFG_STR(LORRAX_CFG_HAVE_CAL);
 #endif

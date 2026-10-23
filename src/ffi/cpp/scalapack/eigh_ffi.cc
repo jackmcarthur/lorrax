@@ -2,12 +2,8 @@
 // world-wide (Px, Py) grid via ScaLAPACK's divide & conquer solver
 // (pzheevd / pdsyevd), HOST platform (JAX CPU backend).
 //
-// This is the CPU-permanent distributed eigh for LORRAX.  It replaces
-// nothing: SLATE's host ``heev`` SIGSEGVs deterministically at every
-// configuration tried (bug L-2, scorecard L §4 — reproduced on a 1x1
-// mesh, single rank, so it is not MPI, not the comm remap, not the
-// layout contract), while ScaLAPACK's getrf/getrs on the SAME library
-// and context are clean.  ScaLAPACK comes from MKL, already linked for
+// This is the CPU-permanent distributed eigh for LORRAX.  ScaLAPACK comes
+// from MKL, already linked for
 // solve_lu (see src/ffi/cpp/CMakeLists.txt) — this handler
 // adds ZERO link dependencies.
 //
@@ -38,8 +34,8 @@
 //
 // Concurrency: XLA's CPU runtime executes independent ffi_calls on its
 // intra-op thread pool, so every collective here serializes on
-// host_collective_mutex() (cpp/slate/ctx.h) exactly like the slate host
-// handlers and scalapack solve_lu — they share the same comms.
+// host_collective_mutex() (cpp/mesh/ctx.h) exactly like the other
+// ScaLAPACK handlers — they share the same comms.
 
 #include "../common/ctx_registry.h"
 #include <algorithm>
@@ -62,7 +58,7 @@
 namespace lorrax_ffi::scalapack_eigh {
 
 namespace ffi = ::xla::ffi;
-using lorrax_ffi::slate::SlateCtx;
+using lorrax_ffi::mesh::MeshCtx;
 
 // Workspace sizes for one pXheevd call on this descriptor.  The three
 // lengths are taken as max(vendor query, the documented netlib lower
@@ -108,7 +104,7 @@ static inline double work_query_value(const T& v) {
 template <typename T>
 static ffi::Error EighImpl(
     int64_t nq, int64_t n, int64_t g,
-    SlateCtx* ctx,
+    MeshCtx* ctx,
     const T* A_in, double* W_out, T* Z_out)
 {
     const int p = ctx->p;
@@ -277,16 +273,16 @@ static ffi::Error EighDispatch(
     int64_t nq, int64_t n, int64_t g,
     int64_t ctx_key)
 {
-    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
-    auto* ctx = reinterpret_cast<SlateCtx*>(ctx_handle);
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "mesh");
+    auto* ctx = reinterpret_cast<MeshCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "scalapack.eigh: ctx_handle is null");
     }
-    // Same-comm collective serialization vs the slate/scalapack host
-    // handlers — see host_collective_mutex() in cpp/slate/ctx.h.
+    // Same-comm collective serialization vs the other ScaLAPACK host
+    // handlers — see host_collective_mutex() in cpp/mesh/ctx.h.
     std::lock_guard<std::mutex> lock(
-        lorrax_ffi::slate::host_collective_mutex());
+        lorrax_ffi::mesh::host_collective_mutex());
 
     // Pin the MKL team for the pXheevd calls.  At the production grid
     // (12x12, g=204) the harness-wide MKL_NUM_THREADS=28 is CATASTROPHIC
@@ -309,21 +305,7 @@ static ffi::Error EighDispatch(
             "scalapack.eigh: W output must be float64 (real eigenvalues)");
     }
 
-    // PROVENANCE.  Refuse if the pXheevd this process will actually call is
-    // SLATE's overlay rather than the linked ScaLAPACK: that body is
-    // slate::heev, i.e. bug L-2 — the deterministic SIGSEGV this backend
-    // exists to avoid, and the one failure mode that leaves no traceback.
-    // See the block in blacs_grid.h for the measured symbol table and the
-    // LORRAX_SCALAPACK_ALLOW_SLATE_API waiver.
-    {
-        const char* evd = (dtype == ffi::DataType::F64) ? "pdsyevd_"
-                                                        : "pzheevd_";
-        const std::string refusal =
-            lorrax_ffi::scalapack::scalapack_slate_api_refusal("eigh", evd);
-        if (!refusal.empty()) {
-            return ffi::Error(ffi::ErrorCode::kUnimplemented, refusal);
-        }
-    }
+    lorrax_ffi::scalapack::scalapack_log_providers_once();   // LORRAX_DEBUG_PRINT
 
     switch (dtype) {
         case ffi::DataType::F64:
@@ -360,4 +342,4 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nq")
         .Attr<int64_t>("n")
         .Attr<int64_t>("g")              // square block: N / max(Px, Py)
-        .Attr<int64_t>("ctx_key"));   // SlateCtx (shared with ffi.slate)
+        .Attr<int64_t>("ctx_key"));   // MeshCtx (cpp/mesh/)

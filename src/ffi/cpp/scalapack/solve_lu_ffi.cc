@@ -3,19 +3,18 @@
 //
 // This is the host twin of cpp/cusolvermp/batched_solve_lu_ffi.cc — the
 // portable backend for the ``distributed_lu`` axis.  ScaLAPACK comes
-// from Cray LibSci (libsci_gnu_mpi), which liblorrax_ffi_host.so already
-// links for SLATE's BLAS — the port adds ZERO link dependencies.  The
+// from Cray LibSci (libsci_gnu_mpi) or MKL.  The
 // pXgetrf/pXgetrs and C-BLACS symbols are declared below by hand; libsci
 // ships no C header for them.
 //
-// Grid: reuses the slate SlateCtx (pure MPI, ctx.h).  Its comm is
+// Grid: reuses the MeshCtx (pure MPI, cpp/mesh/ctx.h).  Its comm is
 // rank-remapped so that BLACS "C" (column-major) grid order puts comm
 // rank (mx + my*Px) at grid coords (mx, my) = the JAX mesh coords — the
-// same pairing the slate handlers rely on for GridOrder::Col.  The grid
+// pairing context.cc builds.  The grid
 // and the Fortran-ABI prototypes live in ``blacs_grid.h``, shared with
 // the other ScaLAPACK handlers.
 //
-// Layout contract (same family as the slate host handlers):
+// Layout contract (shared by the ScaLAPACK host handlers):
 //   A : (Nq, N, N)     P(None,'x','y'), inner dims pre-transposed by the
 //                      Python wrapper → per-slice col-major local block.
 //   B : (Nq, N, NRHS)  same treatment.
@@ -42,16 +41,16 @@
 #include "xla/ffi/api/ffi.h"
 
 // blacs_grid.h happens to pull both of these in, but this TU uses
-// std::string (the refusal) and SlateCtx/host_collective_mutex directly —
+// std::string (the refusal) and MeshCtx/host_collective_mutex directly —
 // name the dependencies instead of leaning on transitive includes
 // (2026-08-01 seam-audit leftover).
-#include "../slate/ctx.h"
+#include "../mesh/ctx.h"
 #include "blacs_grid.h"
 
 namespace lorrax_ffi::scalapack_solve_lu {
 
 namespace ffi = ::xla::ffi;
-using lorrax_ffi::slate::SlateCtx;
+using lorrax_ffi::mesh::MeshCtx;
 
 template <typename T> struct Getrf;
 template <> struct Getrf<double> {
@@ -88,7 +87,7 @@ template <typename T>
 static ffi::Error SolveLuImpl(
     int64_t nq, int64_t n, int64_t nrhs,
     int64_t g, int64_t nb_b,
-    SlateCtx* ctx,
+    MeshCtx* ctx,
     const T* A_in, const T* B_in,
     T* LU_out, T* X_out)
 {
@@ -185,16 +184,16 @@ static ffi::Error SolveLu(
     int64_t g, int64_t nb_b,
     int64_t ctx_key)
 {
-    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
-    auto* ctx = reinterpret_cast<SlateCtx*>(ctx_handle);
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "mesh");
+    auto* ctx = reinterpret_cast<MeshCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "scalapack.solve_lu: ctx_handle is null");
     }
-    // Same-comm collective serialization vs the slate host handlers —
-    // see host_collective_mutex() in cpp/slate/ctx.h.
+    // Same-comm collective serialization vs the other ScaLAPACK host
+    // handlers — see host_collective_mutex() in cpp/mesh/ctx.h.
     std::lock_guard<std::mutex> lock(
-        lorrax_ffi::slate::host_collective_mutex());
+        lorrax_ffi::mesh::host_collective_mutex());
     // MKL team pin, same rationale + knob as the eigh handler
     // (LORRAX_SCALAPACK_MKL_THREADS; measured matrix in blacs_grid.h).
     lorrax_ffi::scalapack::MklThreadScope mkl_scope(
@@ -204,23 +203,7 @@ static ffi::Error SolveLu(
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "scalapack.solve_lu: A, B, X, LU must share dtype");
     }
-    // PROVENANCE — same guard as the eigh handler.  The LU shims are not
-    // bug L-2, but they carry the other two defects (hard-coded
-    // MPI_COMM_WORLD vs this ctx's rank-remapped comm, and info hard-wired
-    // to 0), so an unannounced substitution is still a silent-wrong-answer
-    // route.  Checked on getrf AND getrs: the two live in different SLATE
-    // translation units and a partial interposition is possible.
-    // See blacs_grid.h for the measured symbol table and the waiver.
-    for (const char* nm : {(dtype == ffi::DataType::F64) ? "pdgetrf_"
-                                                        : "pzgetrf_",
-                           (dtype == ffi::DataType::F64) ? "pdgetrs_"
-                                                        : "pzgetrs_"}) {
-        const std::string refusal =
-            lorrax_ffi::scalapack::scalapack_slate_api_refusal("solve_lu", nm);
-        if (!refusal.empty()) {
-            return ffi::Error(ffi::ErrorCode::kUnimplemented, refusal);
-        }
-    }
+    lorrax_ffi::scalapack::scalapack_log_providers_once();   // LORRAX_DEBUG_PRINT
     switch (dtype) {
         case ffi::DataType::F64:
             return SolveLuImpl<double>(
@@ -279,7 +262,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nrhs")
         .Attr<int64_t>("g")              // square block: N / max(Px, Py)
         .Attr<int64_t>("nb_b")           // B col block: NRHS/Py (or NRHS if Py==1)
-        .Attr<int64_t>("ctx_key"));   // SlateCtx (shared with ffi.slate)
+        .Attr<int64_t>("ctx_key"));   // MeshCtx (cpp/mesh/)
 
 // Replaced by lorrax_scalapack_batched_solve_lu_factors; kept for ABI-6 trees, deleted at the next ABI bump.
 XLA_FFI_DEFINE_HANDLER_SYMBOL(

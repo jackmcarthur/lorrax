@@ -35,16 +35,16 @@
 #include "xla/ffi/api/ffi.h"
 
 // blacs_grid.h happens to pull both of these in, but this TU uses
-// std::string (the refusal) and SlateCtx/host_collective_mutex directly —
+// std::string (the refusal) and MeshCtx/host_collective_mutex directly —
 // name the dependencies instead of leaning on transitive includes
 // (same seam-audit convention as solve_lu_ffi.cc, 2026-08-01).
-#include "../slate/ctx.h"
+#include "../mesh/ctx.h"
 #include "blacs_grid.h"
 
 namespace lorrax_ffi::scalapack_getrf_getrs {
 
 namespace ffi = ::xla::ffi;
-using lorrax_ffi::slate::SlateCtx;
+using lorrax_ffi::mesh::MeshCtx;
 
 template <typename T> struct Getrf;
 template <> struct Getrf<double> {
@@ -80,7 +80,7 @@ template <> struct Getrs<std::complex<double>> {
 // Shared descriptor/grid prologue.  Fills desca (+ optionally descb) and
 // the local extents; returns a non-empty error string on failure.
 static std::string GridPrologue(
-    SlateCtx* ctx, int64_t n, int64_t g,
+    MeshCtx* ctx, int64_t n, int64_t g,
     int* ictxt_out, int* lld_a_out, int* a_loc_cols_out, int desca[9])
 {
     const int p = ctx->p;
@@ -120,7 +120,7 @@ static std::string GridPrologue(
 template <typename T>
 static ffi::Error GetrfImpl(
     int64_t nq, int64_t n, int64_t g, int64_t ipiv_len,
-    SlateCtx* ctx,
+    MeshCtx* ctx,
     const T* A_in, T* LU_out, int32_t* ipiv_out)
 {
     int ictxt = 0, lld_a = 0, a_loc_cols = 0;
@@ -178,14 +178,14 @@ static ffi::Error GetrfDispatch(
     int64_t nq, int64_t n, int64_t g, int64_t ipiv_len,
     int64_t ctx_key)
 {
-    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
-    auto* ctx = reinterpret_cast<SlateCtx*>(ctx_handle);
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "mesh");
+    auto* ctx = reinterpret_cast<MeshCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "scalapack.getrf: ctx_handle is null");
     }
     std::lock_guard<std::mutex> lock(
-        lorrax_ffi::slate::host_collective_mutex());
+        lorrax_ffi::mesh::host_collective_mutex());
     lorrax_ffi::scalapack::MklThreadScope mkl_scope(
         lorrax_ffi::scalapack::scalapack_mkl_threads());
     const auto dtype = A.element_type();
@@ -197,16 +197,7 @@ static ffi::Error GetrfDispatch(
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "scalapack.getrf: ipiv output must be int32");
     }
-    // PROVENANCE guard — same rationale as solve_lu_ffi.cc.
-    {
-        const char* nm = (dtype == ffi::DataType::F64) ? "pdgetrf_"
-                                                       : "pzgetrf_";
-        const std::string refusal =
-            lorrax_ffi::scalapack::scalapack_slate_api_refusal("getrf", nm);
-        if (!refusal.empty()) {
-            return ffi::Error(ffi::ErrorCode::kUnimplemented, refusal);
-        }
-    }
+    lorrax_ffi::scalapack::scalapack_log_providers_once();   // LORRAX_DEBUG_PRINT
     switch (dtype) {
         case ffi::DataType::F64:
             return GetrfImpl<double>(
@@ -239,7 +230,7 @@ template <typename T>
 static ffi::Error GetrsImpl(
     int64_t nq, int64_t n, int64_t nrhs, int64_t g, int64_t nb_b,
     int64_t ipiv_len,
-    SlateCtx* ctx,
+    MeshCtx* ctx,
     const T* LU_in, const int32_t* ipiv_in, const T* B_in, T* X_out)
 {
     int ictxt = 0, lld_a = 0, a_loc_cols = 0;
@@ -308,14 +299,14 @@ static ffi::Error GetrsDispatch(
     int64_t g, int64_t nb_b, int64_t ipiv_len,
     int64_t ctx_key)
 {
-    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
-    auto* ctx = reinterpret_cast<SlateCtx*>(ctx_handle);
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "mesh");
+    auto* ctx = reinterpret_cast<MeshCtx*>(ctx_handle);
     if (ctx == nullptr) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "scalapack.getrs: ctx_handle is null");
     }
     std::lock_guard<std::mutex> lock(
-        lorrax_ffi::slate::host_collective_mutex());
+        lorrax_ffi::mesh::host_collective_mutex());
     lorrax_ffi::scalapack::MklThreadScope mkl_scope(
         lorrax_ffi::scalapack::scalapack_mkl_threads());
     const auto dtype = LU.element_type();
@@ -327,15 +318,7 @@ static ffi::Error GetrsDispatch(
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "scalapack.getrs: ipiv must be int32");
     }
-    {
-        const char* nm = (dtype == ffi::DataType::F64) ? "pdgetrs_"
-                                                       : "pzgetrs_";
-        const std::string refusal =
-            lorrax_ffi::scalapack::scalapack_slate_api_refusal("getrs", nm);
-        if (!refusal.empty()) {
-            return ffi::Error(ffi::ErrorCode::kUnimplemented, refusal);
-        }
-    }
+    lorrax_ffi::scalapack::scalapack_log_providers_once();   // LORRAX_DEBUG_PRINT
     switch (dtype) {
         case ffi::DataType::F64:
             return GetrsImpl<double>(
@@ -375,7 +358,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("n")
         .Attr<int64_t>("g")              // square block: N / max(Px, Py)
         .Attr<int64_t>("ipiv_len")       // per-rank ipiv extent: LOCr + MB
-        .Attr<int64_t>("ctx_key"));   // SlateCtx (shared with ffi.slate)
+        .Attr<int64_t>("ctx_key"));   // MeshCtx (cpp/mesh/)
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     ScalapackBatchedGetrsHostFfi,

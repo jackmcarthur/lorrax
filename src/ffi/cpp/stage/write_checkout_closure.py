@@ -12,8 +12,8 @@ exactly once, as the recorded file.  See ``docs/installation/ffi-build.md``.
 
 Each NEEDED name of the leg, transitively, is resolved in this order:
 
-1. ``--private-dir``: the engine-private providers (cuSOLVERMp/cuBLASMp stage,
-   SLATE/BLAS++/LAPACK++ install), by SONAME;
+1. ``--private-dir``: the engine-private providers (cuSOLVERMp/cuBLASMp stage),
+   by SONAME;
 2. the process directories: the RPATH/RUNPATH directories of the leg's JAX
    PJRT plugin (``lxkit.legs.LEGS[...].jax_plugin_prefix``) in ``--python``'s
    site-packages, plus any ``--process-dir``.  The JAX plugin maps its GPU

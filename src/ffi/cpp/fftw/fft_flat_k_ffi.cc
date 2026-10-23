@@ -220,7 +220,7 @@ struct DescKey {
 //  version- AND MPI-flavour-stamped, not a string that survives a move to
 //  another site, another cray-fftw, or (measured, 2026-08-06) into the
 //  Shifter container, which does not bind-mount /opt/cray/pe/fftw at all.
-//  Nineteen ScaLAPACK/SLATE/GEMM contract tests that never touch an FFT
+//  Nineteen ScaLAPACK/GEMM contract tests that never touch an FFT
 //  became skips because the FFT engine's library was not on disk.
 //
 //  Resolving symbols at run time is only half of run-time resolution.  The
@@ -475,7 +475,7 @@ static ffi::Error engine_absent_error() {
           "or name the file outright with LORRAX_FFTW3_SO=/path/to/libfftw3.so"
           ".  Do NOT try to fix this by linking FFTW3 into "
           "liblorrax_ffi_host.so: that was the pre-2026-08-06 arrangement, and "
-          "it made the ENTIRE library — ScaLAPACK, SLATE and GEMM handlers "
+          "it made the ENTIRE library — ScaLAPACK and GEMM handlers "
           "included — fail to load wherever the FFTW3 SONAME was absent.";
     return ffi::Error(ffi::ErrorCode::kInternal, os.str());
 }

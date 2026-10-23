@@ -1,11 +1,11 @@
 // mpi_thread_guard.h — the ONE thread-level requirement shared by
 // every LORRAX FFI family whose handlers drive MPI from more than one thread
-// (slate: internal OpenMP+MPI task engine; phdf5: dedicated writer thread
+// (mesh: ScaLAPACK/ELPA collectives from XLA threads; phdf5: dedicated writer thread
 // running collective MPI-IO).
 //
 // EXTRACTION (2026-08-01 seam-audit leftover).  The body existed twice —
-// cpp/slate/context.cc and cpp/phdf5/context.cc — differing only in the tag
-// and one hazard sentence, and slate's copy carried a note deferring
+// cpp/mesh/context.cc and cpp/phdf5/context.cc — differing only in the tag
+// and one hazard sentence, and the mesh copy carried a note deferring
 // extraction until "a THIRD library would copy it a third time"
 // (the retired FFI template).  The dedup was pulled forward: the two copies had
 // already begun to drift textually, and the mechanism ("query on BOTH paths,
@@ -45,7 +45,7 @@ namespace lorrax_ffi::mpiguard {
 
 // Fail on every rank when the granted MPI thread level is insufficient.
 // MPI_Abort is intentional: returning an error on one rank while peers enter
-// a PHDF5/SLATE collective is a hang, not graceful failure.
+// a PHDF5/mesh collective is a hang, not graceful failure.
 inline void require_thread_multiple(const char* tag, const char* hazard) {
     int provided = 0;
     MPI_Query_thread(&provided);

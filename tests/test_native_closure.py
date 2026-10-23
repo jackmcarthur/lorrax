@@ -6,7 +6,7 @@ files are opened by exact path, and the gate requires every recorded family to
 be mapped exactly once, as the recorded file.  The ELF reader, dlopen and
 /proc/self/maps are replaced by tables.  What only these tests catch is a refusal
 that must fire (stale or missing record, a wrong file, a second copy of a family,
-a launch library naming the wrong file, a host SLATE target in a device process).
+a launch library naming the wrong file).
 """
 from __future__ import annotations
 
@@ -184,7 +184,7 @@ def test_gate_requires_each_recorded_family_mapped_once_as_the_recorded_file(tre
     # the family comes from the SONAME, not the file name
     # (libopenblas.so.0 is mapped as libopenblas_zen-r0.3.28.so on Frontier)
     assert npv.library_family("libopenblas.so.0") == "libopenblas"
-    # a system pthreads OpenBLAS beside the SLATE-HIP one is a second BLAS (Frontier, measured)
+    # a system pthreads OpenBLAS beside the ELPA one is a second BLAS (Frontier, measured)
     for other_name in ("libopenblas_pthreads.so.0", "libopenblas_openmp.so.0", "libopenblasp.so.0",
                        "libopenblas64_.so.0"):
         assert npv.library_family(other_name) == "libopenblas", other_name

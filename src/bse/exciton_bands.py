@@ -1707,7 +1707,7 @@ def main(argv=None):
             f"{_fine_plan.backend}",
             f"Batched LA schedule: {_fine_plan.requested_batched_route} -> "
             f"{_fine_plan.batched_route}",
-            "LA alternatives : native JAX; cuSOLVERMp on GPU; SLATE or "
+            "LA alternatives : native JAX; cuSOLVERMp on GPU; "
             "ScaLAPACK on CPU. Batched LA is a schedule, not a backend",
         ))
         report.sampling(wfn=wfn, sym=sym)

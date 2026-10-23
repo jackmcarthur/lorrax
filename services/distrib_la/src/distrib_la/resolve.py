@@ -1,7 +1,7 @@
 """Backend resolution — the ONE guard ladder.
 
 A requested backend name (``auto | off | distributed | native2d |
-cusolvermp | slate | elpa | scalapack``, per op) becomes a concrete,
+cusolvermp | elpa | scalapack``, per op) becomes a concrete,
 *guaranteed-callable* backend, or a clear resolve-time error.  Every guard
 lives here, applied in ONE fixed order — SEVEN steps, all at resolve time:
 
@@ -19,11 +19,8 @@ lives here, applied in ONE fixed order — SEVEN steps, all at resolve time:
                       recorded on the plan and announced once; never silent.
     2. platform     — does the backend run on this mesh's device kind?
                       (cusolvermp is CUDA-only; scalapack is host-only)
-    2b. known-broken— slate eigh on a CPU mesh (bug L-2: SIGSEGV)
     2c. known-broken— cusolvermp eigh with ``compute_evecs=False``
                       (bug L-3: cusolverMpSyevd status=7 at every n)
-    2d. known-broken— slate eigh at n >= 4096 on a multi-rank CUDA mesh
-                      (bug L-4: SIGSEGV, the CUDA sibling of L-2)
     3. capability   — is the backend's FFI handler actually usable?
                       (``loader.probe_target``, which separates "the
                       library would not load" from "the library has no
@@ -36,10 +33,7 @@ lives here, applied in ONE fixed order — SEVEN steps, all at resolve time:
                       with more devices than processes cannot drive them
     5. geometry     — square-mesh where required (cusolverMpSyevd
                       DEADLOCKS inside a collective on rectangular blocks
-                      instead of returning an error), SLATE's
-                      square-or-N×1 tile rule + the 1×q stride-assert
-                      guard (both mirroring ``_slate.validate_tile_layout``),
-                      ScaLAPACK's square-block descriptor requirement
+                      instead of returning an error), ScaLAPACK's square-block descriptor requirement
     6. divisibility — ``n`` divisible by both mesh axes (only checked
                       when the caller passes ``n``)
 
@@ -148,11 +142,19 @@ ONE_DEVICE = "one_device"
 #: drift).  ``cholesky`` deliberately does NOT: its CPU story is a
 #: channel-policy ladder in the caller, not one library.
 BACKEND_CHOICES = {
-    "eigh":     ("auto", "off", "distributed", "cusolvermp", "slate", "elpa",
+    "eigh":     ("auto", "off", "distributed", "cusolvermp", "elpa",
                  "scalapack", ONE_DEVICE),
-    "cholesky": ("auto", "off", "native2d", "cusolvermp", "slate"),
+    "cholesky": ("auto", "off", "native2d", "cusolvermp"),
     "solve_lu": ("auto", "off", "distributed", "cusolvermp", "scalapack",
-                 "slate", ONE_DEVICE),
+                 ONE_DEVICE),
+}
+
+#: Backend names that no longer exist: {name: note}.  A request refuses with the
+#: repo's one-line "`x` was removed: ..." (docs/dev/renaming.md), not a vocabulary dump.
+REMOVED_BACKENDS = {
+    "slate": "the SLATE backend left LORRAX on 2026-10-23 (UPGRADE_NOTES.md); use 'distributed' "
+             "(CPU: scalapack, CUDA: cusolvermp, ROCm: elpa eigh / one_device LU) or "
+             "'native2d' for cholesky",
 }
 EIGH_BACKENDS = BACKEND_CHOICES["eigh"]
 CHOLESKY_BACKENDS = BACKEND_CHOICES["cholesky"]
@@ -169,25 +171,19 @@ FFI_PLATFORMS = FFI_PLATFORM_MAP
 
 #: ``distributed`` → the platform's permanent default distributed backend.
 #:
-#: On **cpu** that is ScaLAPACK ``pzheevd``, FOREVER: SLATE's host ``heev``
-#: SIGSEGVs deterministically down to a 1×1 mesh (bug L-2) while
-#: ScaLAPACK's routines on the same library and MPI context are clean, so
-#: there is no configuration in which slate is the right CPU eigh.  On
-#: **CUDA** it is cuSOLVERMp, the only library there with a distributed
-#: syevd.  On **ROCM** eigh is ELPA (``distrib_la._elpa``: ELPA 2026.02.001's
-#: one-stage GPU solver, config/frontier/build_elpa_hip.sh), gated against the
-#: native route at P=4 (``ffi.common.families`` 'elpa' row).  MEASURED against
-#: SLATE-HIP, the former row, on MI250X (ELPA_ROCM_REPORT.md; cold wall, sampled
-#: residual / orthogonality <= 2.4e-14 for ELPA):
-#:     P=4 (2x2)   c128 20480: ELPA 23.0 s vs SLATE 121.8 s;  c128 30720: ELPA
-#:                 runs, SLATE aborts (he2hb workspace outside the arena);
-#:                 f64 20480: 15.3 vs 84.4 s;  f64 30720: 33.7 vs 213.6 s.
-#:     P=16 (4x4)  c128 30720: ELPA 27.3 s vs SLATE 218 s.
-#: SLATE stays selectable (``backend='slate'``) and keeps potrf / solve_lu.
+#: On **cpu** that is ScaLAPACK ``pzheevd``.  On **CUDA** it is cuSOLVERMp, the
+#: only library there with a distributed syevd.  On **ROCM** eigh is ELPA
+#: (``distrib_la._elpa``: ELPA 2026.02.001's one-stage GPU solver,
+#: config/frontier/build_elpa_hip.sh), gated against the native route at P=4
+#: (``ffi.common.families`` 'elpa' row); measured 5-8x faster than the library it
+#: replaced at n = 20480-30720 on MI250X (ELPA_ROCM_REPORT.md).
 #:
-#: ``('solve_lu', 'ROCM')`` is SLATE too: ``slate::getrf`` (PartialPiv,
-#: Target::Devices) + ``slate::getrs`` (cpp/slate/batched_solve_lu_ffi.cc),
-#: gated against ``jnp.linalg.solve`` on the same GCDs at P=4 (2x2).
+#: ROCM has NO distributed LU library: ``('solve_lu', 'ROCM')`` is the room route
+#: alone (:data:`ONE_DEVICE_BY_ROOM`), so ``distributed`` LU there serves every ``n``
+#: whose one-device program fits the caller's room and refuses beyond it.  One device
+#: was 4-5x faster than the former 2x2 distributed LU wherever both ran: 0.72 / 1.53
+#: / 4.10 s against 3.63 / 10.4 / 16.1 s at n = 8192 / 12288 / 16384 complex128, and
+#: it runs to n = 28672 (22.7 s) on one GCD (ROCSOLVER_LU_REPORT.md section 2).
 _DISTRIBUTED_DEFAULT = {
     ("eigh", "cpu"):      "scalapack",
     ("eigh", "CUDA"):     "cusolvermp",
@@ -197,7 +193,6 @@ _DISTRIBUTED_DEFAULT = {
     # on CUDA — the two backends _IMPL already lists for this op.
     ("solve_lu", "cpu"):  "scalapack",
     ("solve_lu", "CUDA"): "cusolvermp",
-    ("solve_lu", "ROCM"): "slate",
 }
 
 #: ``distributed`` by SIZE — (op, leg) → the largest ``n`` that
@@ -211,19 +206,16 @@ _DISTRIBUTED_DEFAULT = {
 #:
 #: ROCM (MI250X GCD, 64 GB; pool logs ``distla_bound1``, ``distla_lubig*``):
 #:   eigh 16384: the one-device program at n = 16384 complex128 takes 42.4 s
-#:     (native 42.1 s, SLATE 2x2 76.4 s), peak 27.9 GB per rank, resid 9e-15;
-#:     SLATE eigh steady is 64-147x the native wall at n = 32-128 complex128
-#:     (0.22-0.29 s vs 0.0016-0.0045 s, ``distla_bound1``) and 2.7-33x at
-#:     n = 2048-8192 (SLATE_PERF_REPORT).  Beyond 16384 the SLATE comparison is
-#:     not measured, so the library takes over (the capacity route).  16384 is a
+#:     (native 42.1 s; the former 2x2 library 76.4 s), peak 27.9 GB per rank,
+#:     resid 9e-15.  Beyond 16384 ELPA takes over (the capacity route).  16384 is a
 #:     MEASURED-COVERAGE bound, not a correctness one: jnp.linalg.eigh (rocSOLVER
 #:     zheevd) is exact at n = 20480 (60.5 s, peak 35.2 GB, resid 8.4e-15) and
 #:     24576 (120.2 s, 50.75 GB, 8.1e-15) complex128 (pool logs lurc_e_*).
 #:   solve_lu: the CAPACITY of one GCD, a room leg (:data:`ONE_DEVICE_BY_ROOM`) as on CUDA:
 #:     the largest n whose priced one-device program (``_one_device.one_device_bytes``:
 #:     5 n^2 x 16 B, complex128) fits the caller's room.  There is no speed crossover below
-#:     it: one-device (distrib_la.local_lu) vs SLATE 2x2 complex128, n = 8192
-#:     0.72 vs 3.63 s, 12288 1.53 vs 10.4 s, 16384 4.10 vs 16.1 s; one-device
+#:     it: one-device (distrib_la.local_lu) vs the former 2x2 library, complex128,
+#:     n = 8192 0.72 vs 3.63 s, 12288 1.53 vs 10.4 s, 16384 4.10 vs 16.1 s; one-device
 #:     20480 6.18 s, 24576 13.3 s, 26624 14.2 s, 28672 22.7 s (peak 52.9 GB,
 #:     resid <= 1.1e-14), 30720 out of memory (pool logs lurc_f_*, lurc_k_*,
 #:     distla_lubigs).  The former 8192 was a correctness cap: rocBLAS trsm's
@@ -261,11 +253,6 @@ def one_device_round_n(op: str, platform: str, bound: int) -> int:
 #: both, cuSOLVER's LU exact through 16384 (the rocBLAS trsm defect of distrib_la.local_lu
 #: does not occur there).
 ONE_DEVICE_BY_ROOM = frozenset({("eigh", "CUDA"), ("solve_lu", "CUDA"), ("solve_lu", "ROCM")})
-#: Room legs whose library is several times slower than one device wherever one matrix fits
-#: (ROCm LU: SLATE 2x2 3.6-16 s vs 0.7-4.1 s at n 8192-16384): a sized plan without the
-#: caller's room refuses by name rather than take the library silently.
-_ROOM_REQUIRED = frozenset({("solve_lu", "ROCM")})
-
 #: ``auto`` cholesky / solve_lu: the leg's FFI candidate on a true-2-D mesh
 #: (else native).  CUDA only: cuSOLVERMp.  A leg without a row resolves
 #: ``auto`` to native as its documented policy (no probe, no notice) -- the
@@ -287,12 +274,10 @@ _NATIVE_IMPL = {
 #: A tuple of targets means ALL of them are required.
 _SPEC = {
     ("eigh", "cusolvermp"):     ("lorrax_cusolvermp_eigh",          ("CUDA",)),
-    ("eigh", "slate"):          ("lorrax_slate_eigh",       ("CUDA", "cpu", "ROCM")),
     # ELPA (cpp/elpa/, config/frontier/build_elpa_hip.sh): built on the ROCM leg only.
     ("eigh", "elpa"):           ("lorrax_elpa_eigh",        ("ROCM",)),
     ("eigh", "scalapack"):      ("lorrax_scalapack_eigh",           ("cpu",)),
     ("cholesky", "cusolvermp"): ("lorrax_cusolvermp_batched_potrf", ("CUDA",)),
-    ("cholesky", "slate"):      ("lorrax_slate_potrf",      ("CUDA", "cpu", "ROCM")),
     ("solve_lu", "cusolvermp"): (("lorrax_cusolvermp_batched_solve_lu_factors",
                                     "lorrax_cusolvermp_batched_getrf",
                                     "lorrax_cusolvermp_batched_getrs"),
@@ -306,13 +291,6 @@ _SPEC = {
                                   "lorrax_scalapack_batched_getrf",
                                   "lorrax_scalapack_batched_getrs"),
                                  ("cpu",)),
-    # SLATE's LU family: the same three entries as the two above (fused solve
-    # + split getrf/getrs), built on the ROCM leg only -- CUDA serves the op
-    # with cuSOLVERMp and the host with ScaLAPACK, so neither builds it.
-    ("solve_lu", "slate"):      (("lorrax_slate_batched_solve_lu_factors",
-                                  "lorrax_slate_batched_getrf",
-                                  "lorrax_slate_batched_getrs"),
-                                 ("ROCM",)),
 }
 
 
@@ -341,9 +319,9 @@ def mesh_key(mesh_xy) -> tuple:
 
     Public because LORRAX needs it and there is nowhere else honest to get
     it: ``isdf/core.py`` keys two announcement sets (which do not retain
-    their mesh) and used to import ``ffi.linalg._slate._mesh_key`` — a
+    their mesh) and used to import a backend-private ``_mesh_key`` — a
     reach past this package's public API into a backend-private module, for a
-    function that is neither SLATE's nor private in any real sense.  Three
+    function that is not private in any real sense.  Three
     of this package's four backends had their own copy of it; they all call
     this one now.
     """
@@ -367,6 +345,8 @@ def mesh_is_cpu(mesh_xy) -> bool:
 
 
 def _vocab_error(op: str, requested) -> str:
+    if requested in REMOVED_BACKENDS:
+        return f"`{requested}` was removed: {REMOVED_BACKENDS[requested]}"
     return (f"{op} backend must be one of "
             f"{'|'.join(BACKEND_CHOICES[op])}, got {requested!r}")
 
@@ -409,37 +389,19 @@ def _platform_phrase(platforms: tuple[str, ...]) -> str:
 def _check_geometry(op: str, backend: str, px: int, py: int) -> None:
     """Guard 5 — mesh-geometry constraints, per (op, backend).  Raises
     ValueError with the reason; silent-pass otherwise."""
-    if op == "eigh" and backend in ("cusolvermp", "slate", "elpa"):
-        # These two FFI eigh wrappers reject p != q; for cusolvermp this is
+    if op == "eigh" and backend in ("cusolvermp", "elpa"):
+        # These FFI eigh wrappers reject p != q; for cusolvermp this is
         # a DEADLOCK guard (cusolverMpSyevd hangs in a collective on
         # rectangular one-tile-per-rank blocks — observed 4x1/1x4,
-        # 2026-07-10), for SLATE heev a hard library requirement.
+        # 2026-07-10).
         # ScaLAPACK pXheevd is NOT in this class: like pXgetrf it only
         # needs square descriptor BLOCKS, so square-or-1-D is enough (its
         # rule is the ``scalapack`` branch below).
         if px != py:
             raise ValueError(
                 f"eigh backend {backend!r} needs a SQUARE mesh "
-                f"(cusolverMpSyevd DEADLOCKS on rectangular blocks; SLATE "
-                f"heev rejects them; ELPA's wrapper relabels one tile edge for "
+                f"(cusolverMpSyevd DEADLOCKS on rectangular blocks; ELPA's wrapper relabels one tile edge for "
                 f"both axes); got {px}x{py}.")
-    elif backend == "slate":
-        # These two rules MIRROR ``_slate.validate_tile_layout`` (the
-        # call-time guard) exactly, in the same order.  Keep them in sync:
-        # a rule enforced only at call time turns a returned 'slate' into a
-        # broken promise (bug L-1, 2026-07-25: cholesky+slate on a 2x4 mesh
-        # resolved, then raised on the very next call).
-        if px > 1 and py > 1 and px != py:
-            raise ValueError(
-                f"{op} backend 'slate': mesh {px}x{py} unsupported — with "
-                f"both axes > 1 the square SLATE tile size cannot give one "
-                f"tile per rank on both axes unless px == py.  Use a square "
-                f"or Nx1 mesh, or a different backend.")
-        if px == 1 and py > 1:
-            raise ValueError(
-                f"{op} backend 'slate': 1x{py} meshes hit a SLATE stride "
-                f"assert (guarded; see _slate.validate_tile_layout).  Use a "
-                f"{py}x1 or square mesh, or a different backend.")
     elif backend == "scalapack":
         # Mirrors _scalapack.validate_eigh_mesh / the LU family's own check
         # — keep them in sync (bug L-1 again).
@@ -575,7 +537,7 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
     program (:func:`distrib_la._one_device.one_device_bytes`) fits it.
 
     Returns the concrete backend to run: ``"native"``, ``"native2d"``, or
-    one of the FFI backend names (``"cusolvermp" | "slate" | "scalapack"``).
+    one of the FFI backend names (``"cusolvermp" | "elpa" | "scalapack"``).
     A returned FFI name is a *promise*: its handler is compiled into the
     loaded library and every mesh guard passed — the subsequent call cannot
     fail for an availability/geometry reason.
@@ -670,10 +632,14 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
         # no-P-scaling wall this name exists to escape.
         requested = _DISTRIBUTED_DEFAULT.get((op, mesh_platform(mesh_xy)))
         if requested is None:
+            room_leg = (op, mesh_platform(mesh_xy)) in ONE_DEVICE_BY_ROOM
             raise ValueError(
                 f"{op} backend 'distributed' has no default backend on "
                 f"platform {mesh_platform(mesh_xy)!r} "
-                f"(defined for: {sorted(_DISTRIBUTED_DEFAULT)}).")
+                f"(defined for: {sorted(_DISTRIBUTED_DEFAULT)})"
+                + (f"; on this leg it is the room route alone: n={n} needs the caller's "
+                   f"room per rank (budget_bytes) and one whole matrix's one-device "
+                   f"program within it" if room_leg else "") + ".")
     if requested == "auto":
         if op == "eigh" or mesh_is_cpu(mesh_xy):
             return NATIVE
@@ -713,22 +679,6 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
             f"Available {op} backends on this mesh: "
             f"{', '.join(_available(op, mesh_xy))}.")
 
-    # 2b. KNOWN-BROKEN combination (bug L-2).  SLATE's host ``heev``
-    # SIGSEGVs deterministically — n = 64/512/1200, meshes 1x1 / 2x2 /
-    # 4x4, intra- and inter-node, compute_evecs both ways, SLATE built
-    # both threaded and sequential.  It reproduces on ONE rank, so it is
-    # neither MPI nor the layout contract.  The handler IS compiled and the
-    # capability probe passes, so nothing below would catch it and
-    # resolve_backend would hand back a name whose first call kills the
-    # job with no Python traceback.  Refuse here, and name the replacement.
-    if op == "eigh" and requested == "slate" and platform == "cpu":
-        raise RuntimeError(
-            "eigh backend 'slate' is REJECTED on CPU meshes: SLATE's host "
-            "heev SIGSEGVs deterministically (bug L-2, reproduced on a 1x1 "
-            "mesh at n=64 — not an MPI or layout problem).  Use "
-            "'distributed' (= ScaLAPACK pzheevd, the permanent CPU default) "
-            "or 'off'/'auto' for the replicated jnp.linalg.eigh.")
-
     # 2c. KNOWN-BROKEN combination (bug L-3, found by the step-6 eigh
     # investigation).  ``compute_evecs=False`` (jobz='N') is a DOCUMENTED
     # parameter of _cusolvermp.distributed_eigh and it does not work:
@@ -765,55 +715,15 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
             "default, and what LORRAX wants everywhere) and ignore the "
             "eigenvectors, or 'off'/'auto' for jnp.linalg.eigvalsh.")
 
-    # 2d. KNOWN-BROKEN combination (bug L-4, found by the step-6 eigh
-    # investigation).  SLATE's eigh on a MULTI-RANK CUDA mesh SIGSEGVs at
-    # n >= 4096 — deterministic, and it takes the whole 4-process job down
-    # (srun rc=139, "nid001088: task 0: Segmentation fault", the other
-    # three ranks then aborted by the coordination service).  This is the
-    # CUDA sibling of bug L-2 above: same library, same routine family,
-    # same failure mode, different platform and a size threshold instead
-    # of "always".
-    #
-    # AUTHORITATIVE ARTIFACT: _reports/gpu_slate4096_segv.log, jobid
-    # 56457930 — a leg run for no other purpose than to produce this
-    # evidence, because the size sweep SKIPS the cell (a crash there would
-    # take the other 20 rows with it).
-    #
-    # WHY n >= 4096 AND NOT ALL n: SLATE eigh RAN on the same mesh and the
-    # same job class at n = 64/256/1024/2048 (0.401 / 0.546 / 1.387 /
-    # 5.444 s, jobid 56447670) — it is slow and scales badly, but it
-    # returns.  Refusing it everywhere would delete a working backend.
-    #
-    # WHY multi-rank AND NOT 1x1: the crash was only ever produced on the
-    # 2x2.  A single-device CUDA mesh at n >= 4096 is UNMEASURED, and this
-    # package does not refuse things nobody has seen fail.
-    #
-    # 4096 IS THE SMALLEST SIZE MEASURED TO CRASH, not a fitted boundary:
-    # nothing between 2048 and 4096 was tried, so the true threshold is
-    # somewhere in (2048, 4096].  Erring toward refusal is right when the
-    # failure mode is a SIGSEGV with no Python traceback.
-    if (op == "eigh" and requested == "slate" and platform == "CUDA"
-            and px * py > 1 and n is not None and int(n) >= 4096):
-        raise RuntimeError(
-            f"eigh backend 'slate' is REJECTED at n={int(n)} on the "
-            f"multi-rank CUDA mesh {px}x{py}: SLATE's CUDA eigh SIGSEGVs "
-            f"deterministically at n >= 4096 and kills every rank of the "
-            f"job (bug L-4; srun rc=139 on a 4-process 2x2, jobid "
-            f"56457930, _reports/gpu_slate4096_segv.log).  It RUNS at "
-            f"n <= 2048 on the same mesh, so this refusal is size-scoped, "
-            f"not a removal.  Use 'distributed' (= cuSOLVERMp on CUDA) or "
-            f"'off'/'auto' for the replicated jnp.linalg.eigh.")
-
     # 3. compiled capability
     #
     # ``probe_target`` (not ``has_target``) because the REASON matters to
     # whoever reads this: "the .so would not load" and "the .so has no
     # such handler" have completely different fixes, and reporting the
     # first as the second sends people to rebuild a library that is fine.
-    # That happened: wk_P G4 (2026-07-25) refused slate cholesky on a
-    # legal 8x1 mesh with "not compiled into the cpu FFI library" while
-    # `nm -D` showed SlatePotrfHostFfi present — the real cause was an
-    # incomplete LD_LIBRARY_PATH.  ``target`` may be one name or a tuple
+    # That happened (wk_P G4, 2026-07-25): a refusal said "not compiled into
+    # the cpu FFI library" while `nm -D` showed the handler present — the real
+    # cause was an incomplete LD_LIBRARY_PATH.  ``target`` may be one name or a tuple
     # of REQUIRED names (the scalapack LU family: fused solve + split
     # getrf/getrs) — every one must probe usable, and the refusal names
     # the one that failed.
@@ -913,14 +823,11 @@ def _size_route(op: str, mesh_xy, n, room: int | None = None) -> str | None:
     A shape price against a caller value every rank shares: no exchange, no sync."""
     platform = mesh_platform(mesh_xy)
     bound = one_device_max_n(op, platform, room)
-    if room is None and n is not None and (op, platform) in _ROOM_REQUIRED:
-        raise ValueError(f"GATE distrib_la_room: got: a distributed {op} plan (n={int(n)}) on "
-                         f"{platform} with no room; want: the caller's room per rank "
-                         f"(budget_bytes), which decides one_device against the library")
     if bound is None or n is None:
         return None
     px, py = _mesh_shape(mesh_xy)
-    library = _DISTRIBUTED_DEFAULT.get((op, platform))
+    # A room leg with no library (ROCM LU) refuses past the room, below.
+    library = _DISTRIBUTED_DEFAULT.get((op, platform)) or "no library (refused)"
     chosen = ONE_DEVICE if int(n) <= bound else library
     priced = ""
     if chosen == ONE_DEVICE and room is not None:
@@ -1099,9 +1006,6 @@ def backend_module(backend: str):
     if backend == "cusolvermp":
         from distrib_la import _cusolvermp
         return _cusolvermp
-    if backend == "slate":
-        from distrib_la import _slate
-        return _slate
     if backend == "elpa":
         from distrib_la import _elpa
         return _elpa
@@ -1110,5 +1014,5 @@ def backend_module(backend: str):
         return _scalapack
     raise ValueError(
         f"no FFI backend module named {backend!r} "
-        f"(known: cusolvermp, slate, elpa, scalapack, native2d, one_device; 'native' is "
+        f"(known: cusolvermp, elpa, scalapack, native2d, one_device; 'native' is "
         f"jnp + the caller's own routes and has no module).")

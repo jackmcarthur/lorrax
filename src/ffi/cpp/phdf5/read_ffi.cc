@@ -41,7 +41,7 @@
 //      into the host-resident XLA output buffer).
 // The host handlers register under DISTINCT symbol names (PhdfRead*HostFfi)
 // so the two platform .so's can co-exist in one process under RTLD_GLOBAL —
-// the same split slate/scalapack use.
+// the same split scalapack uses.
 // Seams 1 (handler binding) and 2 (index copy-in) live in platform_seam.h,
 // shared verbatim with write_ffi.cc; seam 3 (the staging tail) is below.
 #include "../common/leg.h"

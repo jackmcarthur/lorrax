@@ -13,9 +13,8 @@ write a vendor name into this family's code as if it were a fact about the
 build.  Both ops need a SQUARE or 1-D ``('x','y')`` mesh (square descriptor
 blocks, one tile per rank).
 
-The SlateCtx lifecycle (``ensure_registered`` / ``get_or_init_context`` /
-``validate_mesh``) is shared with the SLATE backend and
-imported from :mod:`._slate`: the BLACS grid is built on the slate
+The mesh-context lifecycle (``ensure_registered`` / ``get_or_init_context`` /
+``validate_mesh``) is :mod:`._mesh_ctx`'s: the BLACS grid is built on that
 context's rank-remapped MPI comm.
 
 Section docstrings from the merged modules follow inline.
@@ -31,7 +30,7 @@ from jax.sharding import Mesh, PartitionSpec as P
 
 from jax import shard_map
 from distrib_la._shape import ipiv_local_len
-from distrib_la._slate import ensure_registered, context_key, validate_mesh
+from distrib_la._mesh_ctx import ensure_registered, context_key, validate_mesh
 from distrib_la.resolve import mesh_key as _mesh_key
 
 __all__ = [
@@ -49,8 +48,8 @@ __all__ = [
 """``batched_distributed_eigh`` — ScaLAPACK ``pzheevd`` / ``pdsyevd``.
 
 The **permanent CPU backend for distributed Hermitian eigendecomposition**
-(``distrib_la.resolve_backend('eigh', 'distributed', <cpu mesh>)``).  SLATE's
-host ``heev`` SIGSEGVs deterministically on this stack — bug L-2, reproduced
+(``distrib_la.resolve_backend('eigh', 'distributed', <cpu mesh>)``).  The former
+alternative's host ``heev`` SIGSEGVed deterministically on this stack — bug L-2, reproduced
 down to a 1×1 mesh, single rank — while ScaLAPACK's routines on the SAME
 library and MPI context are clean.
 
@@ -69,8 +68,8 @@ each q into a scratch block).
 Mesh restriction: ``pXheevd`` requires SQUARE descriptor blocks
 (``MB_A == NB_A``), so with the one-tile-per-rank layout only **square and
 1-D** meshes are layout-consistent (block ``g = N / max(Px, Py)``) — the
-same geometry class as :func:`batched_distributed_solve_lu`, and unlike
-SLATE there is no 1×q stride assert, so ``1×q`` is allowed too.  Host-only:
+same geometry class as :func:`batched_distributed_solve_lu`; ``1×q`` is
+allowed too.  Host-only:
 on a GPU mesh use the cuSOLVERMp backend.
 
 GAUGE WARNING for callers: eigenVECTORS are not mesh-invariant.  Any
@@ -144,7 +143,7 @@ def batched_distributed_eigh(
         W_out = jax.ShapeDtypeStruct((nq, n), jnp.float64)
         # Z comes back as ScaLAPACK col-major local blocks = row-major
         # bytes of the per-rank block of Zᵀ; assembled at P(None,'y','x')
-        # then locally untransposed (same trick as the slate eigh).
+        # then locally untransposed (the ELPA eigh's trick).
         Z_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
         attrs = dict(nq=nq, n=n, g=g, ctx_key=int(ctx_key))
 
@@ -154,7 +153,7 @@ def batched_distributed_eigh(
                  check_vma=False)
         def _call(local_A):
             # Inner transpose: row-major shard → col-major local block
-            # (same convention as every slate/scalapack wrapper).
+            # (same convention as every FFI wrapper).
             local_A_T = jnp.transpose(local_A, (0, 2, 1))
             return jax.ffi.ffi_call(
                 _EIGH_TARGET, (W_out, Z_local_T))(local_A_T, **attrs)
@@ -205,16 +204,14 @@ portable backend for the ``distributed_lu`` axis.  Identical call contract:
     B : (Nq, N, NRHS)  P(None, 'x', 'y')
     X : same shape/sharding as B
 
-The BLACS grid is built on the slate context's rank-remapped MPI comm ("C"
+The BLACS grid is built on the mesh context's rank-remapped MPI comm ("C"
 grid order lands JAX shard (mx, my) at grid (mx, my)); the wrapper reuses
-:mod:`._slate` for mesh validation, registration, and the per-(p, q) ctx
+:mod:`._mesh_ctx` for mesh validation, registration, and the per-(p, q) ctx
 cache.
 
 Mesh restriction: ``pXgetrf`` requires SQUARE descriptor blocks
 (MB_A == NB_A), so with the one-tile-per-rank layout only square and 1-D
-meshes are layout-consistent (block g = N / max(Px, Py)) — same geometry
-class as the slate single-matrix ops, but 1×q is fine here (no SLATE
-stride assert).  Host-only: on a GPU mesh use ``distributed_lu =
+meshes are layout-consistent (block g = N / max(Px, Py)); 1×q is fine.  Host-only: on a GPU mesh use ``distributed_lu =
 cusolvermp`` instead.
 """
 
@@ -449,7 +446,7 @@ def batched_distributed_solve_lu(
                  check_vma=False)
         def _solve(local_A, local_B):
             # Inner transpose: row-major shard → col-major local block
-            # (same convention as every slate/cusolvermp wrapper).
+            # (same convention as every FFI wrapper).
             local_A_T = jnp.transpose(local_A, (0, 2, 1))
             local_B_T = jnp.transpose(local_B, (0, 2, 1))
             # The factors overwrite A and X overwrites B, both declared.

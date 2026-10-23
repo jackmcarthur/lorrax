@@ -5,16 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "distrib_la"
 version = "0.1.0"
-description = "Distributed dense linear algebra over a JAX device mesh: polar/SVD, eigh, Cholesky, LU solve, and matmul over native JAX, ScaLAPACK/PBLAS, SLATE, and cuSOLVERMp/cuBLASMp"
+description = "Distributed dense linear algebra over a JAX device mesh: polar/SVD, eigh, Cholesky, LU solve, and matmul over native JAX, ScaLAPACK/PBLAS, ELPA, and cuSOLVERMp/cuBLASMp"
 readme = "README.md"
 requires-python = ">=3.12"
 
-# THE QUARANTINE, DECLARED.  ScaLAPACK/PBLAS, SLATE, and
+# THE QUARANTINE, DECLARED.  ScaLAPACK/PBLAS, ELPA, and
 # cuSOLVERMp/cuBLASMp appear nowhere in this list because nothing here links
 # them: they are reached through
 # `jax.ffi` handlers inside a LORRAX `.so` that `distrib_la.loader`
 # dlopens by path.  That is the charter's "only distrib_la sees
-# scalapack/PBLAS/slate/cusolvermp/cuBLASMp" made structural — an installed
+# scalapack/PBLAS/elpa/cusolvermp/cuBLASMp" made structural — an installed
 # distrib_la on a machine with no `.so` imports fine, answers `list_backends`, and
 # refuses every FFI backend by name.
 #

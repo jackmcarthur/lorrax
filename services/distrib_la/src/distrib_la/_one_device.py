@@ -2,10 +2,9 @@
 
 Where one matrix fits one device, a distributed library's cost is its fixed
 per-call charge (§ "Distributed is a capacity route" in
-``docs/services/distrib_la/backends.md``).  On the ROCM leg that charge is
-SLATE's host stages: 0.22-0.29 s per eigh at n = 32-128 complex128 against
-0.0016-0.0045 s native (pool log distla_bound1), and 2.7-33x the native wall at
-n = 2048-8192 (SLATE_PERF_REPORT).  This
+``docs/services/distrib_la/backends.md``).  On the ROCM leg that charge was
+measured at 0.22-0.29 s per eigh at n = 32-128 complex128 against
+0.0016-0.0045 s native (pool log distla_bound1).  This
 backend serves that range with the leg's native JAX kernel and the FFI
 backends' operand contract, so a ``distributed`` call site runs it unchanged:
 

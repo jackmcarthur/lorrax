@@ -292,11 +292,7 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
                 1.0, lambda n, p, item: (24.0 if item == 16 else 16.0) * (n / math.isqrt(p)) ** 2
                 + 2048.0 * n / math.isqrt(p), "(24|16) (N/p)^2 + 2048 N/p", p=(4, 16),
                 source="ELPA 2026.02.001 allocator-hook high-water, MI250X P 4 and 16 "
-                       "(ELPA_ROCM_REPORT.md, table pool)")),
-            (("slate", "solve_lu"), MeasuredRow(
-                3.0, lambda n, p, item: n * n * item / p, "copies of A per rank",
-                n=(1, 40960), p=(4, 4), source="SLATE LU ~3 copies of A, OOM at n 51200 P4 "
-                "(LA_ROUTING_AUDIT)"))),
+                       "(ELPA_ROCM_REPORT.md, table pool)")),),
         outside_pool_api="hip_runtime_arena",
         collective_library="rccl", collective_net_plugin="librccl-net.so",
         # rocprofv3 --kernel-trace deadlocks RCCL at P=4 (Screening lane, 2026-10-14).
@@ -383,10 +379,10 @@ def accelerator_leg_to_open_first(platform: str, opened, tried: set, *,
                                   ) -> Optional[str]:
     """The device-leg key a loader must open before it opens ``platform``, or ``None``.
 
-    THE SONAME RULE (ffi-build.md, "Shared SONAMEs"): a device-built and a
-    host-built SLATE/BLAS++ share SONAMEs, and whichever is mapped first wins
-    for the whole process, so in a process that can host a device leg the
-    device leg opens before the host leg.  In a CPU-platform process nothing
+    THE LOAD-ORDER RULE (distrib_la.loader): in a process that can host a
+    device leg the device leg opens before the host leg (introduced for a
+    third-party SONAME race, kept until test_so_acceptance.py check 5 is re-run
+    without it).  In a CPU-platform process nothing
     opens first: there is no device handler to protect.
 
     One attempt per process per loader: ``tried`` is the loader's own set and
