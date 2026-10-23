@@ -907,6 +907,7 @@ def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
     *, k_unfold_plan=None, layout="face", selected_q=None, pair_mode="retarded",
     bank_carry=False, ordered=False, vertex=False, band_ranges=None, stream_pass=None,
+    sum_layout="axis",
 ):
     """Integrate the retarded response using final occupied and unoccupied band weights.
 
@@ -966,6 +967,8 @@ def _get_chi_fractional_contour_kernel_face(
     )
 
     from common.wfn_layout import psi_specs
+    if sum_layout not in ("axis", "face"):
+        raise ValueError(f"Response sum-band layout must be axis or face, got {sum_layout!r}")
     PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
     if pair_mode not in ("retarded", "laplace", "laplace_ordered", "kms_static", "windowed", "direct"):
         raise ValueError(f"unknown response pair mode: {pair_mode}")
@@ -1114,13 +1117,13 @@ def _get_chi_fractional_contour_kernel_face(
         photon_gemms = tuple(
             gemm_plan(mesh_xy, m=px * plan.rows * 2, k=nb_full,
                       n=photon.packed_layout.carrier_extent(family_channels(R)[0]) * 2,
-                      nq=nk_shape, dtype=jnp.complex128, layout="axis",
+                      nq=nk_shape, dtype=jnp.complex128, layout=sum_layout,
                       enable_active_range=band_ranges is not None, warmup=False)
             if stream_pass is None or int(stream_pass) == i_pair else None
             for i_pair, ((_, R), plan) in enumerate(zip(FAMILY_PAIRS, photon_plans)))
         photon_active = tuple(
             (tuple(g.prepare_active_range(*bounds) for bounds in band_ranges)
-             if band_ranges is not None and g is not None else (None, None))
+             if band_ranges is not None and g is not None and sum_layout == "axis" else (None, None))
             for g in photon_gemms)
         if jax.process_index() == 0 and stream_pass is None:
             log.debug(f"Response four-current {pair_mode} stream: row passes (CC, CT, TC, TT) "
@@ -1150,10 +1153,10 @@ def _get_chi_fractional_contour_kernel_face(
         # Every pass is one window of subtile.rows rows: one kconv call, one GEMM plan.
         pass_kconv, pass_arrays = _charge_window_kconv(mesh_xy, grid, k_unfold_plan, subtile.rows)
         pass_gemm = gemm_plan(mesh_xy, m=px * subtile.rows * ns, k=nb_full, n=n_rmu * ns,
-                              nq=nk_shape, dtype=jnp.complex128, layout="axis",
+                              nq=nk_shape, dtype=jnp.complex128, layout=sum_layout,
                               enable_active_range=band_ranges is not None, warmup=False)
         pass_active = (tuple(pass_gemm.prepare_active_range(*bounds) for bounds in band_ranges)
-                       if band_ranges is not None else (None, None))
+                       if band_ranges is not None and sum_layout == "axis" else (None, None))
         chi_tables = pass_arrays
         if jax.process_index() == 0 and not stream_pass:
             log.debug(f"Response direct stream: {len(subtile.passes)} row pass(es) of "
@@ -1315,7 +1318,8 @@ def _get_chi_fractional_contour_kernel_face(
             from .greens_function_kernel import green_right_operand
             from .photon_layout import FAMILY_PAIRS
             from .subtile_stream import band_complete, stream_passes, window_load, window_rows
-            faces = tuple(band_complete(psi_mun[f], psi_nmu[f], mesh_xy) for f in (0, 1))
+            faces = tuple(band_complete(psi_mun[f], psi_nmu[f], mesh_xy)
+                          if sum_layout == "axis" else (psi_mun[f], psi_nmu[f]) for f in (0, 1))
             # Each family's right operands, one per Dirac half, formed once
             # per dispatch: every quadrant Green of every node and pass reads them.
             rights = tuple(tuple(green_right_operand(jax.lax.slice_in_dim(
@@ -1338,7 +1342,8 @@ def _get_chi_fractional_contour_kernel_face(
                     if window is None:
                         return faces[L][0], loads, {}
                     s, lo, hi = window
-                    return (window_rows(faces[L][0], mesh_xy, s, rows_w, axis=2),
+                    return (window_rows(faces[L][0], mesh_xy, s, rows_w, axis=2,
+                                        spec=P(None, None, "x", None if sum_layout == "axis" else "y")),
                             {hg: window_load(load, mesh_xy, s, lo, hi, rows_w, 2)
                              for hg, load in loads.items()},
                             dict(live=jnp.stack([lo, hi]).astype(jnp.int32)))
@@ -1358,10 +1363,12 @@ def _get_chi_fractional_contour_kernel_face(
                                                     axis=1)
                         weight, t = oriented(weight, t)
                         return build_G_tau(left, None, enk_full, t, e_ref=ref,
-                                           band_weight=weight, layout="axis",
+                                           band_weight=weight, layout=sum_layout,
                                            gemm=photon_gemms[i_pair],
                                            k_unfold_plan=half_plans[L], unfold=False,
                                            prepared_active_gemm=photon_active[i_pair][int(current)],
+                                           band_range=(band_ranges[int(current)]
+                                               if sum_layout == "face" and band_ranges is not None else None),
                                            real_weights=False, right=rights[R][halves[1]])
                     planes = [[] for _ in keys]
                     for lw, lt, lref, uw, ut, uref in orientations(time, *band):
@@ -1594,7 +1601,8 @@ def _get_chi_fractional_contour_kernel_face(
             """
             from .greens_function_kernel import green_right_operand
             from .subtile_stream import band_complete, stream_passes, window_load, window_rows
-            rows_all, cols_all = band_complete(psi_mun, psi_nmu, mesh_xy)
+            rows_all, cols_all = (band_complete(psi_mun, psi_nmu, mesh_xy)
+                                  if sum_layout == "axis" else (psi_mun, psi_nmu))
             # The right operand of every Green build, formed once per dispatch.
             right = green_right_operand(cols_all)
             px, R = int(mesh_xy.shape["x"]), int(subtile.rows)
@@ -1604,7 +1612,8 @@ def _get_chi_fractional_contour_kernel_face(
                 if window is None:
                     return rows_all, DeviceLoadTables(*chi_load), {}
                 s, lo, hi = window
-                return (window_rows(rows_all, mesh_xy, s, R, axis=2, spec=P(None, None, "x", None)),
+                return (window_rows(rows_all, mesh_xy, s, R, axis=2,
+                                    spec=P(None, None, "x", None if sum_layout == "axis" else "y")),
                         window_load(DeviceLoadTables(*chi_load), mesh_xy, s, lo, hi, R, ns),
                         dict(live=jnp.stack([lo, hi]).astype(jnp.int32)))
 
@@ -1616,9 +1625,11 @@ def _get_chi_fractional_contour_kernel_face(
                 def parent(weight, t, ref, current):
                     weight, t = oriented(weight, t)
                     return build_G_tau(psi_p, None, enk_full, t, e_ref=ref,
-                                       band_weight=weight, layout="axis", gemm=pass_gemm,
+                                       band_weight=weight, layout=sum_layout, gemm=pass_gemm,
                                        k_unfold_plan=k_unfold_plan, unfold=False,
                                        prepared_active_gemm=pass_active[int(current)],
+                                       band_range=(band_ranges[int(current)]
+                                           if sum_layout == "face" and band_ranges is not None else None),
                                        real_weights=False, right=right)
                 lower = parent(lower_w, -time, energy_reference[0], False)
                 upper = parent(upper_w, jnp.conj(time), energy_reference[1], True)

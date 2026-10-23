@@ -391,13 +391,15 @@ stages, sets the node count.
 
 The raw-parent carrier holds two orientations of `ψ_{n k̄ s}(r_μ)` on the
 `n_par` parents, stored as faces: bands on one mesh axis, centroids on the
-other. A Green build never holds a band-complete copy; the Σ projector holds
-one for the length of its call:
+other. A Green build can use local GEMMs after gathering the summed bands,
+or retain these faces and exchange bounded SUMMA panels. The response and
+scalar q-wedge Σ streams choose between them before execution; the small
+Σ projector gathers only its projected bands for the length of its call:
 
 ```text
 M_face  = 2·16·n_par·n_s·μ·N_b / P                      resident; μ and bands both tiled
 M_axis  = 16·n_par·n_s·μ·N_b·(1/p_x + 1/p_y)
-        = 2·16·n_par·n_s·μ·N_b / √P                     one band-complete copy: the Σ projector
+        = 2·16·n_par·n_s·μ·N_b / √P                     transient axis orientations at the requested band count
 M_panel = 2·16·n_par·n_s·μ·(N_b/p_x)·(1/p_x + 1/p_y)    one Green build's two live SUMMA panels
 ```
 
@@ -483,7 +485,21 @@ still uses its axis carriers, `16·n_par·n_s·N_bΣ·(μ/P_x + μ/P_y)`.
 Admission uses the largest compiled new-byte figure over ranks, plus retained
 placement outputs and native convolution scratch, against current room before
 placement runs. Static SX/COH uses the same choice and scalar node. Photon
-sectors and response-bank placement retain their existing contracts.
+Σ sectors retain their existing contracts.
+
+The charge direct and four-current response row streams use the same choice
+inside `response_bank._compiled`: compile the complete incumbent stream
+first, including its inline band gathers, and compare its new bytes plus native
+convolution scratch with the minimum current room over ranks. An over-budget
+axis body is never dispatched. Its fallback runs the same node and row scans
+with `psi_k,s(mu_X,n_Y)` and `psi_k(n_X,s,mu_Y)` still on their 2D faces,
+using the shared Green SUMMA and complex antiunitary partner. The merged right
+operand is formed once on its face, so the summed-band resident and panels
+scale as `N_b/P`, rather than a band-complete `N_b/sqrt(P)` copy. Each sample
+group and streamed-bank segment admits its own actual executable; carry
+donation and device/host/file bank residence are unchanged. The minimum face
+route retains `memory.admit`'s existing warn-and-run policy if even it is over
+room. This is a layout choice, not a quadrature or band-window approximation.
 No full-tile Green or `W_prep`
 exists. `sigma_spin_block` (the output spin block `d`, a divisor of `n_s`,
 whose stored x block fits the fixed tile) still sizes the full-zone Σ kernels

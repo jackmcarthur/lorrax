@@ -528,7 +528,47 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
 _STREAM_KERNELS: dict = {}
 
 
-def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key, **options):
+# Placement policy beside the existing program cache; no state arrays are held.
+_STREAM_PROGRAMS: dict = {}
+
+
+def _stream_variant(state, layout):
+    variants = state["variants"]
+    if layout not in variants:
+        variants[layout] = state["build"](layout)
+    return variants[layout]
+
+
+def _resolve_stream_program(state, args, *, ahead=False):
+    """Admit the actual stream before bank dispatch; axis gathers stay inline."""
+    force = state["force"]
+    if ahead:
+        return _program_compiled(_stream_variant(state, force or "axis"), args, ahead=True)
+    from lxkit import memory
+    from common.gpu_utils import device_budget_bytes
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    device_budget_bytes()
+    for layout in ((force,) if force else ("axis", "face")):
+        kernel = _stream_variant(state, layout)
+        executable = _program_compiled(kernel, args)
+        need = -agreed_chunk(-compiled_new_bytes(executable, extra=state["native"]))
+        room = agreed_chunk(int(memory.room()))
+        if layout == "axis" and need > room:
+            if force:
+                raise ValueError("GATE response_axis_room: forced axis stream exceeds compiled room")
+            continue
+        price = memory.priced(0, f"response {layout} summed bands, compiled stream + native scratch",
+                              spread=need*state["mesh"].size, ranks=state["mesh"].size)
+        memory.admit("Response sum-band operands", [(layout, price)], room)
+        if state["last_layout"] != layout:
+            log.info(f"Response summed bands: {layout} layout")
+            state["last_layout"] = layout
+        return kernel
+    raise RuntimeError("Response sum-band layout selection produced no route")
+
+
+def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key,
+                            _native_scratch=0, _force_sum_layout=None, **options):
     """Cache programs, never state arrays; window data remain dynamic inputs.
 
     A map's stream programs are one fixed set (the streamed χ bank's and the
@@ -542,11 +582,20 @@ def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key, **opt
     its reservation.
     """
     from .w_isdf import _get_chi_fractional_contour_kernel_face
-    key = (mesh_xy, kgrid, n_outputs, shape, _ffi_key, tuple(sorted(options.items())))
+    key = (mesh_xy, kgrid, n_outputs, shape, _ffi_key, int(_native_scratch),
+           _force_sum_layout, tuple(sorted(options.items())))
     kernel = _STREAM_KERNELS.get(key)
     if kernel is None:
-        kernel = _STREAM_KERNELS[key] = _get_chi_fractional_contour_kernel_face(
-            mesh_xy, kgrid, n_outputs, shape, **options)
+        def build(layout):
+            return _get_chi_fractional_contour_kernel_face(
+                mesh_xy, kgrid, n_outputs, shape, sum_layout=layout, **options)
+        row_stream = (options.get("vertex") is not None and bool(options.get("vertex"))) or (
+            options.get("pair_mode") == "direct" and options.get("k_unfold_plan") is not None)
+        initial = _force_sum_layout or "axis"
+        kernel = _STREAM_KERNELS[key] = build(initial if row_stream else "axis")
+        if row_stream:
+            _STREAM_PROGRAMS[kernel] = dict(mesh=mesh_xy, build=build, native=int(_native_scratch),
+                force=_force_sum_layout, variants={initial: kernel}, last_layout=None)
         _release_evicted_programs()
     return kernel
 
@@ -557,13 +606,15 @@ def _release_evicted_programs():
     for key in [k for k, kernel in _STREAM_KERNELS.items()
                 if not placed_kconv_tables_live(getattr(kernel, "tail", ()))]:
         dead = _STREAM_KERNELS.pop(key)
-        for entry in [entry for entry in _COMPILED if entry[0] is dead]:
+        state = _STREAM_PROGRAMS.pop(dead, None)
+        programs = tuple(state["variants"].values()) if state else (dead,)
+        for entry in [entry for entry in _COMPILED if entry[0] in programs]:
             del _COMPILED[entry]
 
 
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
                     pair_mode="retarded", bank_carry=False, ordered=False,
-                    vertex=None, band_ranges=None, stream_pass=None):
+                    vertex=None, band_ranges=None, stream_pass=None, _force_sum_layout=None):
     """Bind the existing one-particle Green/FFT primitive to a q batch.
 
     Returns a jitted kernel and its fixed ψ/energy arguments. Caller supplies
@@ -595,6 +646,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
             mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
             (n_input, int(wfns.slices.nb_full), vertex.n, 4),
             _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids), pair_mode=pair_mode,
+            _native_scratch=_stream_scratch(wfns, meta, mesh_xy, vertex),
+            _force_sum_layout=_force_sum_layout,
             bank_carry=bank_carry, ordered=True, vertex=vertex.families,
             band_ranges=band_ranges if pair_mode == "direct" else None,
             **({} if stream_pass is None else dict(stream_pass=int(stream_pass))))
@@ -611,6 +664,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
         k_unfold_plan=parent, _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids),
+        _native_scratch=_stream_scratch(wfns, meta, mesh_xy, None),
+        _force_sum_layout=_force_sum_layout,
         pair_mode=pair_mode, bank_carry=bank_carry, ordered=ordered, band_ranges=band_ranges,
         # One segment program for every pass; the segment index is a runtime argument.
         **({} if stream_pass is None else dict(stream_pass=0)))
@@ -978,9 +1033,19 @@ def _compiled(kernel, args, *, ahead=False):
     shapes become known, and the later call with the live arrays finds the
     executable or waits for it.
     """
-    from common.jax_compile_cache import compile_ahead
+    state = _STREAM_PROGRAMS.get(kernel)
+    if state is not None:
+        if ahead:
+            return _resolve_stream_program(state, args, ahead=True)
+        kernel = _resolve_stream_program(state, args)
     if isinstance(kernel, _Decided):
         kernel = kernel.resolve(*args)          # the variant its LU decision names
+    return _program_compiled(kernel, args, ahead=ahead)
+
+
+def _program_compiled(kernel, args, *, ahead=False):
+    """The one executable cache, after any program placement decision."""
+    from common.jax_compile_cache import compile_ahead
     key = (kernel, jax.tree.structure(args), tuple(
         (tuple(x.shape), str(x.dtype), getattr(x, "sharding", None))
         if hasattr(x, "shape") else x for x in jax.tree.leaves(args)))
