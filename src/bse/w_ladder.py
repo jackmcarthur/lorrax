@@ -652,8 +652,8 @@ def _plan_probe_chunk(context, requested, *, n_pad, carry_bytes, stack_bytes):
             if floor > room:
                 units, compiled, price = 1, minimum_compiled, floor
             else:
-                slope = max(0., (price-floor)/(units-1))
-                fixed, per_unit = max(fixed, floor-slope), max(per_unit, slope)
+                measured_slope = max(0., (price-floor)/(units-1))
+                fixed, per_unit = max(fixed, floor-measured_slope), max(per_unit, measured_slope)
                 proposed = max(1, min(units-1, int((room-fixed)//max(per_unit, 1.))))
                 proposed_compiled = minimum_compiled if proposed == 1 else build(proposed)
                 proposed_price = -agreed_chunk(-figures[proposed])
