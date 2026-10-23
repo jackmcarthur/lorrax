@@ -41,8 +41,9 @@ What lives in ``isdf_header``
   ``ngkmax``-padded axis.
 - ``fit_provenance`` (scalar str, optional): JSON description of the
   INPUTS the fit consumed — band windows, cutoffs, solver knobs, source
-  WFN identity.  Written by :func:`stamp_fit_provenance` AFTER
-  :func:`mark_zeta_done`.  ``zeta_is_done`` says "this file is
+  WFN identity. The deferred charge-V writer stamps provenance before
+  its final :func:`mark_zeta_done`; an immediate writer may stamp after.
+  ``zeta_is_done`` says "this file is
   complete"; ``fit_provenance`` says "…and here is what it is complete
   FOR".  Both are required for ``gw.gw_init`` to reuse a ζ instead of
   refitting; a legacy file missing either is refit.
@@ -122,9 +123,8 @@ class IsdfHeader:
     fit_provenance: str | None = None
                                  # JSON blob describing the INPUTS this ζ was
                                  # fit from (band windows, cutoffs, solver
-                                 # knobs, source WFN identity, ...).  Written
-                                 # by :func:`stamp_fit_provenance` after
-                                 # ``mark_zeta_done``; consumed by
+                                 # knobs, source WFN identity, ...). Written
+                                 # when the payload is complete; consumed by
                                  # ``gw.gw_init``'s ζ-reuse check, which
                                  # refits unless this matches the current run
                                  # EXACTLY.  ``None`` on legacy files => no
@@ -334,11 +334,11 @@ def mark_zeta_done(path: str | Path) -> None:
 def stamp_fit_provenance(path: str | Path, provenance: str) -> None:
     """Write ``isdf_header/fit_provenance`` (idempotent, overwrite in place).
 
-    Called by the ζ driver AFTER :func:`mark_zeta_done`, so a run killed
-    between the two leaves a complete-but-unstamped file — which the reuse
-    check treats as "cannot verify" and refits.  That ordering is
-    deliberate: every failure mode falls back to recomputing, never to
-    reusing an unverified ζ.
+    An immediate ζ writer calls this after :func:`mark_zeta_done`; a
+    deferred charge-V writer calls it in the collective completion
+    transaction before the final done marker. A failed deferred stamp
+    therefore leaves the file incomplete. Reuse requires both fields, so
+    either ordering refuses an interrupted or unauthenticated artifact.
 
     ``provenance`` is a JSON string; see ``gw.gw_init._zeta_fit_provenance``
     for the schema and ``_zeta_reuse_ok`` for the comparison.

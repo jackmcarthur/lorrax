@@ -94,7 +94,7 @@ def test_cold_v_and_saved_zeta_reuse_match_literal_gram(monkeypatch, tmp_path):
     reuse = np.einsum("qmg,qg,qng->qmn", saved.conj(), v, saved)
     np.testing.assert_allclose(cold, reuse, atol=2e-14, rtol=2e-12)
     assert reads == [0, 1] and events.count("write") == 2
-    assert events.index("closed") < events.index("done") < events.index("provenance")
+    assert events.index("closed") < events.index("provenance") < events.index("done")
     assert zeta.pending_file is None
 
 
@@ -110,6 +110,37 @@ def test_partial_or_failed_v_pass_cannot_authenticate_file(
     else:
         zeta.contract_v(v, keep=np.zeros((2, 1), np.int32)).block_until_ready()
     assert "closed" in events and "done" not in events and "provenance" not in events
+
+
+@pytest.mark.parametrize("failed_phase", ["provenance", "done"])
+def test_completion_error_uses_collective_io_verdict(monkeypatch, tmp_path, failed_phase):
+    import h5py
+    from common import collectives
+    from file_io import isdf_header
+    mark_done, stamp = isdf_header.mark_zeta_done, isdf_header.stamp_fit_provenance
+    zeta, v, _raw, _factor, _saved, events, _reads = _fixture(monkeypatch, tmp_path)
+    with h5py.File(zeta.path, "w") as h5:
+        h5.create_group("isdf_header").create_dataset("zeta_is_done", data=False)
+    verdicts = []
+    def fail_metadata(*_args):
+        raise OSError("synthetic metadata failure")
+    def agree(error, *, path, stage):
+        verdicts.append((error, stage))
+        if error is not None:
+            raise RuntimeError("agreed metadata refusal") from error
+    monkeypatch.setattr(isdf_header, "mark_zeta_done",
+                        fail_metadata if failed_phase == "done" else mark_done)
+    monkeypatch.setattr(isdf_header, "stamp_fit_provenance",
+                        fail_metadata if failed_phase == "provenance" else stamp)
+    monkeypatch.setattr(collectives, "agree_io_error", agree)
+    with pytest.raises(RuntimeError, match="agreed metadata refusal"):
+        zeta.contract_v(v, keep=np.zeros((2, 1), np.int32))
+    assert "closed" in events
+    with h5py.File(zeta.path, "r") as h5:
+        assert not bool(h5["isdf_header/zeta_is_done"][()])
+        assert ("fit_provenance" in h5["isdf_header"]) == (failed_phase == "done")
+    assert isinstance(verdicts[0][0], OSError) and verdicts[0][1] == "zeta_v_provenance"
+    assert zeta.pending_file is not None
 
 
 @pytest.mark.parametrize("truncated", [False, True])

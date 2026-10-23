@@ -897,20 +897,17 @@ class ZetaG:
         """
         from file_io.slab_io import SlabIO
         from file_io.isdf_header import mark_zeta_done, stamp_fit_provenance
-        from common.collectives import barrier, process_rank
+        from common.collectives import barrier, rank0_transaction
         pending = self.pending_file
         with SlabIO(self.path, mode='a', mesh=self.mesh) as io:
             V = self.contract_v(v_table, keep=keep, zeta_io=io, print_fn=print_fn)
         barrier("zeta_v_writes_complete")
-        if pending["complete"] and process_rank() == 0:
-            mark_zeta_done(self.path)
+        def complete():
             if pending["provenance"] is not None:
-                try:
-                    stamp_fit_provenance(self.path, pending["provenance"])
-                except Exception as exc:
-                    log.info(f"    [zeta provenance] not stamped ({exc}); this ζ "
-                             "will be refit on the next run.")
-        barrier("zeta_v_provenance")
+                stamp_fit_provenance(self.path, pending["provenance"])
+            mark_zeta_done(self.path)
+        if pending["complete"]:
+            rank0_transaction(self.path, stage="zeta_v_provenance", write=complete)
         self.pending_file = None
         return V
 
