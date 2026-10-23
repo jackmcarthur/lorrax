@@ -314,7 +314,7 @@ full-W expectation; re-examine after the ladder head lands.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from typing import Callable, Iterable, Optional
 
 import numpy as np
 
@@ -506,13 +506,19 @@ class WLadderWedge:
     head_result: object | None = None
 
 
-def _identity_probe_block(n_pad: int) -> np.ndarray:
-    """Full-basis probe block: the identity in the PADDED centroid basis.
+def _identity_probe_blocks(n_logical: int, n_pad: int, chunk: int):
+    """Yield unit-column probes with only one ``(chunk, n_pad)`` host block.
 
-    ``n_pad`` is already a multiple of ``px*py`` (``padded_mu_extent``), hence of
-    ``py`` — the divisibility the reduce-scatter snapshot requires.
+    Rows above the logical centroid count remain zero in the final block.
+    Constructing the full identity, or retaining all chunks, would each cost
+    ``8 * n_pad**2`` host bytes on every rank even with a small probe chunk.
     """
-    return np.eye(n_pad, dtype=np.float64)
+    for c0 in range(0, n_logical, chunk):
+        n_real = min(chunk, n_logical - c0)
+        rows = np.arange(n_real)
+        probes = np.zeros((chunk, n_pad), dtype=np.float64)
+        probes[rows, c0 + rows] = 1.0
+        yield c0, n_real, probes
 
 
 def sweep_q_wedge(
@@ -522,7 +528,7 @@ def sweep_q_wedge(
     z_list_ry,
     *,
     include_w: bool,
-    probe_blocks_for_q: Callable[[int, tuple], Sequence],
+    probe_blocks_for_q: Callable[[int, tuple], Iterable],
     gmres_tol: float,
     gmres_max_iter: int,
     on_result: Callable,
@@ -550,7 +556,7 @@ def sweep_q_wedge(
     silently pays one full compile each time, because the block-GMRES cache is
     keyed on ``id(matvec)``.
 
-    ``probe_blocks_for_q(iq, q)`` returns a sequence of ``(c0, n_real, G)``:
+    ``probe_blocks_for_q(iq, q)`` returns an iterable of ``(c0, n_real, G)``:
     ``G`` is the ``(n_probe, n_rmu)`` probe block (``n_probe % py == 0``),
     ``n_real`` how many of its rows are live (the rest are zero pad), and ``c0``
     the caller's own offset, passed back untouched.
@@ -949,7 +955,6 @@ def compute_wc_qwedge(
     q_list = np.asarray(sym.q_irr_kgrid_int, dtype=int)
     n_pad = int(data["V_q0"].shape[0])
     nlog = int(data["n_rmu"])
-    eye = _identity_probe_block(n_pad)
     chunk = n_pad if probe_chunk is None else min(int(probe_chunk), n_pad)
 
     # Probe block ROWS are the probe columns (apply_screening_resolvent_block
@@ -972,13 +977,6 @@ def compute_wc_qwedge(
     # The same reasoning covers the zero ROWS of a short final chunk: their
     # columns are NaN inside ``W_tile`` and ``_accumulate_columns`` takes only
     # the first ``n_real``.
-    blocks = []
-    for c0 in range(0, nlog, chunk):
-        n_real = min(chunk, nlog - c0)
-        G = np.zeros((chunk, n_pad), dtype=np.float64)
-        G[:n_real, :] = eye[c0:c0 + n_real, :]
-        blocks.append((c0, n_real, G))
-
     nz, nq = int(z_list_ry.size), int(len(q_list))
     tiles = [[None] * nq for _ in range(nz)]
     resid = np.zeros((nz, nq, n_pad), dtype=np.float64)
@@ -1030,7 +1028,7 @@ def compute_wc_qwedge(
 
     sweep_q_wedge(
         data, mesh_xy, q_list, z_list_ry, include_w=include_w,
-        probe_blocks_for_q=lambda _iq, _q: blocks,
+        probe_blocks_for_q=lambda _iq, _q: _identity_probe_blocks(nlog, n_pad, chunk),
         gmres_tol=gmres_tol, gmres_max_iter=gmres_max_iter,
         on_result=_on_result, route=route, deflation_rank=deflation_rank,
         build_hook=((lambda iq, q, dq: v_by_q.__setitem__(iq, dq["V_q0"]))
