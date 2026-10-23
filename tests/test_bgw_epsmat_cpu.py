@@ -135,6 +135,104 @@ def rows_in_sphere(sphere, miller):
     return np.array([idx[tuple(g)] for g in miller])
 
 
+def test_trs_restart_exports_full_q_grid_and_exact_parent_carriers(tmp_path, monkeypatch):
+    """The SOC tutorial's TR wedge needs 8 nonzero rows, including antiunitary images."""
+    import itertools
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+    import h5py
+    from gw import epsmat_export as ee
+    import symmetry_maps as sm
+    from symmetry_maps import SymMaps, bgw_integer_q_to_fractional
+    h = json.loads((Path(__file__).parent / "fixtures/bsemat_mos2_trs_qgrid.json").read_text())
+    sym = SymMaps.__new__(SymMaps)
+    sym.sym_matrices = np.asarray(h["mtrx"], dtype=np.int64)
+    spatial = sym.sym_matrices.transpose(0, 2, 1)
+    sym.sym_mats_k = np.concatenate([spatial, -spatial])
+    sym.translations = np.zeros((12, 3))
+    sym.kvecs_asints = np.array(list(itertools.product(range(3), range(3), range(1))))
+    q_full = bgw_integer_q_to_fractional(sym.kvecs_asints, np.array([3, 3, 1]))
+    # Persisted producer metadata from the executed official SOC bundle.
+    q_stored = np.vstack([np.zeros(3), h["native_eps_q"]])
+    tables = SimpleNamespace(irr_idx_q=np.array([0, 1, 1, 1, 2, 1, 1, 1, 2]),
+                             sym_idx_q=np.array([0, 0, 12, 15, 0, 2, 3, 14, 12]),
+                             q_irr_frac=q_stored, n_q_full=9, n_sym_spatial=12)
+    metadata_wfn = SimpleNamespace(kgrid=(3, 3, 1), symmetry=lambda: sym)
+    monkeypatch.setattr(sm, "read_tensor", lambda *a, **k: (None, SimpleNamespace(table_hash="same")))
+    monkeypatch.setattr(sm, "read_tables", lambda *a, **k: tables)
+    assert np.array_equal(ee.export_q_metadata("unused", metadata_wfn, (3, 3, 1), "ibz")[1], q_full)
+    with pytest.raises(ValueError, match="epsmat_q_grid"):
+        ee.export_q_metadata("unused", metadata_wfn, (4, 3, 1), "ibz")
+    tables.sym_idx_q[3] = 0
+    with pytest.raises(ValueError, match="epsmat_q_action"):
+        ee.export_q_metadata("unused", metadata_wfn, (3, 3, 1), "ibz")
+    tables.sym_idx_q[3] = 15
+    wfn = tmp_path / "WFN.h5"
+    with h5py.File(wfn, "w") as f:
+        f["mf_header/gspace/components"] = MILLER
+        f["mf_header/crystal/bdot"] = np.asarray(h["bdot"])
+        f["mf_header/kpoints/ecutwfc"] = 5.0
+    src = SimpleNamespace(q_stored=q_stored, q_full=q_full,
+                          q_tables=tables, sym=sym, wfn_file=str(wfn),
+                          config=SimpleNamespace(head=SimpleNamespace(bare_coulomb_cutoff=None)))
+    cfg = SimpleNamespace(files=("epsmat",), bgw_reference="", epsmat_ecut=2.5)
+    plans, comps = ee.plan_export(cfg, src)
+    q_file, _, rows = plans["epsmat"]
+    assert len(rows) == 8
+    assert len({tuple(np.rint(q * [3, 3, 1]).astype(int)) for q in q_file}) == 8
+    assert sum(r.sym_row >= 12 for r in rows) == 4
+    for r in rows:
+        g = comps[r.gspace.order[:r.gspace.nmtx]]
+        gp, phase, anti = ee.parent_gvectors(src, r, g)
+        S = sym.sym_mats_k[r.sym_row]
+        assert np.max(np.abs((src.q_stored[r.iq_store] + gp) @ S.T - (r.q_file + g))) < 1e-12
+        assert phase is None and anti == (r.sym_row >= 12)
+        if r.sym_row == 0:
+            assert np.array_equal(gp, g + r.g0)
+    with pytest.raises(ValueError, match="epsmat_q_unmatched"):
+        ee.export_q_parent(src, np.array([0.125, 0., 0.]))
+
+
+def test_reciprocal_tr_and_translation_match_independent_dense_rpa():
+    """Two Fourier legs carry translation and antiunitary action; omitting either fails."""
+    from types import SimpleNamespace
+    from gw import epsmat_export as ee
+    from symmetry_maps import SymMaps
+    mesh = _mesh()
+    qp = np.array([1/6, 1/3, 1/8])
+    qc = np.array([1/6, 1/3, 7/8])
+    sym = SymMaps.__new__(SymMaps)
+    spatial = np.array([np.eye(3, dtype=int), np.diag([-1, -1, 1])])
+    sym.sym_matrices = spatial
+    sym.sym_mats_k = np.concatenate([spatial, -spatial])
+    sym.translations = np.array([[0., 0., 0.], [np.pi, np.pi/3, 0.]])
+    src = SimpleNamespace(sym=sym, q_stored=qp[None])
+    row = ee.QPlan(0, 0, qc, np.zeros(3, int), None, 3)
+    rho, qg = bgw_list(qc, 2.5)
+    g = rho[qg.order[:qg.nmtx]]
+    gp, phase, anti = ee.parent_gvectors(src, row, g)
+    assert anti
+    assert np.array_equal(gp, g * [1, 1, -1] + [0, 0, -1])
+    phase_ref = np.exp(-1j * ((qc + g) @ sym.translations[1]))
+    assert np.max(np.abs(phase - phase_ref)) < 1e-14
+    sphere, Z, v, chi0, V, W = toy(tuple(qp))
+    f = faces(mesh, Z, V, W)
+    slots = rows_in_sphere(sphere, gp)
+    n, n_pad = qg.nmtx, ee._pad_to(qg.nmtx, 4)
+    Zf = ee.zeta_face(f["zeta"], slots, mesh=mesh, n_pad=n_pad)
+    ph = np.ones(n_pad, np.complex128); ph[:n] = phase
+    Zf = ee._scale_columns(mesh)[1](Zf, ph)
+    block, _ = ee.epsinv_block(Zf, f["chi"].conj(), v_slab(qc, g), mesh=mesh, n_valid=n)
+    raw = np.asarray(block)[0, 0, 0, :n, :n]
+    emitted = (raw[..., 0] + 1j*raw[..., 1]).T
+    parent = dense_epsinv(Z, v, chi0)[np.ix_(slots, slots)]
+    independent = phase_ref[:, None] * parent.conj() * phase_ref.conj()[None, :]
+    assert np.linalg.norm(emitted-independent) / np.linalg.norm(independent-np.eye(n)) < 1e-9
+    assert np.linalg.norm(parent-independent) / np.linalg.norm(independent-np.eye(n)) > 1e-2
+    assert np.linalg.norm(parent.conj()-independent) / np.linalg.norm(independent-np.eye(n)) > 1e-2
+
+
 # ---------------------------------------------------------------------------
 
 def test_block_equals_dense_rpa_inverse_and_red_twins():

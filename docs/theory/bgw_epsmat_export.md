@@ -324,10 +324,20 @@ file needs Sigma `frequency_dependence` 0 or 1.
 
 With `bgw_reference` set, the export takes the q list, $q_0$, `ecuts` and the G
 order from BerkeleyGW's files and refuses unless its own order is identical
-(`GATE epsmat_bgw_gorder`). Every file q must equal a stored q up to a
-reciprocal lattice vector (`GATE epsmat_q_unmatched`): a symmetry-rotated W is
-not reconstructed, so a wedge bundle exports its wedge and a full-zone bundle
-(`restart_q_storage = full`) every q.
+(`GATE epsmat_bgw_gorder`). Every file q must belong to the producer's full
+grid (`GATE epsmat_q_unmatched`). Without a reference, the export writes every
+nonzero q of that grid, including the time-reversed images absent from a
+compact restart. BerkeleyGW expands file q points using its spatial symmetry
+header, so writing only a wedge reduced with time reversal can leave missing q.
+
+The restart's authenticated parent/action tables select each q's stored row.
+The shared `SymMaps` reciprocal action maps each requested $q+G$ back to its
+parent carrier and supplies the nonsymmorphic phase and antiunitary bit.
+Centroid permutations and wrap phases cancel in $Z\chi^\mu Z^\dagger$;
+the calculation keeps one consistent parent centroid basis and applies the
+scalar Fourier action to $Z$, conjugating $Z$ and $\chi^\mu$ on antiunitary
+rows. Stored q images retain the original arithmetic. Only one q's sharded
+faces are live; no full-zone $Z$, $V$ or $W$ is materialized.
 
 ## 8. Cost and distribution
 

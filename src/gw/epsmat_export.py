@@ -467,6 +467,9 @@ class ExportSource(NamedTuple):
     head: dict                   # S_cart, G0, whead, head_correction label
     wfn_file: str
     eigh: object                 # distrib_la face eigensolver, n = mu_pad (eigh_plan)
+    sym: object                  # SymMaps: the shared reciprocal/antiunitary action
+    q_full: np.ndarray           # (nk_full, 3), the complete unshifted q grid
+    q_tables: object             # validated persisted QirrTables, or None for full storage
 
 
 def _bundle_file(source_restart):
@@ -480,6 +483,41 @@ def _bundle_file(source_restart):
                 "exactly one isdf_tensors_<mu>.h5",
                 "the export reads one ISDF basis", "name the bundle file itself")
     return hits[0]
+
+
+def export_q_metadata(bundle, wfn, kgrid, storage):
+    """Full-q geometry and the persisted, authenticated parent/action tables.
+
+    Metadata only: neither V nor W is read or unfolded here.
+    """
+    from symmetry_maps import bgw_integer_q_to_fractional, read_tables, read_tensor
+    if not np.array_equal(np.asarray(wfn.kgrid), np.asarray(kgrid)):
+        _refuse("epsmat_q_grid", f"WFN grid {wfn.kgrid}, bundle grid {kgrid}",
+                "the same full q grid", "q row labels depend on the grid",
+                "use the bundle's own WFN")
+    sym = wfn.symmetry()
+    q_full = bgw_integer_q_to_fractional(sym.kvecs_asints, np.asarray(kgrid))
+    tables = None
+    if storage == "ibz":
+        _, vh = read_tensor(bundle, "V_qmunu", metadata_only=True)
+        _, wh = read_tensor(bundle, "W0_qmunu", metadata_only=True)
+        tables = read_tables(bundle, "V_qmunu")
+        if (vh.table_hash != wh.table_hash or tables.n_q_full != len(q_full)
+                or tables.n_sym_spatial != len(sym.sym_matrices)):
+            _refuse("epsmat_q_tables", "inconsistent V/W or WFN q-action tables",
+                    "the same persisted parent/action map for V, W and the WFN",
+                    "the output q images must be the producer's own",
+                    "use the bundle's own WFN and restart pair")
+        S, _, _ = sym.operation_rows(np.asarray(tables.sym_idx_q, dtype=np.int32))
+        moved = np.einsum("qij,qj->qi", S,
+                          np.asarray(tables.q_irr_frac)[np.asarray(tables.irr_idx_q)])
+        delta = moved - q_full
+        if not np.allclose(delta, np.rint(delta), rtol=0.0, atol=1e-10):
+            _refuse("epsmat_q_action", "persisted rows do not map parents to the WFN q grid",
+                    "exact shared reciprocal actions modulo lattice vectors",
+                    "the stored and current row order must agree",
+                    "use the bundle's own WFN symmetry header")
+    return sym, np.asarray(q_full), tables
 
 
 def open_export_source(cfg, mesh, *, print_fn=None):
@@ -536,6 +574,7 @@ def open_export_source(cfg, mesh, *, print_fn=None):
                 f"bundle (q {q_stored.shape[0]}, μ {n_mu})",
                 "V and W are projected on this ζ", "point zeta_file at the bundle's own ζ")
     mu_pad = int(padded_mu_axis(n_mu, mesh).carrier)
+    sym, q_full, q_tables = export_q_metadata(bundle, wfn, kgrid, storage)
     eigh = eigh_plan(mesh, mu_pad)
     n_dev = int(mesh.devices.size)
     log.info(f"  eigh        {eigh.describe()}")
@@ -552,7 +591,8 @@ def open_export_source(cfg, mesh, *, print_fn=None):
                 else "; no q0 wings stored"))
     return ExportSource(bundle=bundle, zeta=zl, q_stored=q_stored, kgrid=kgrid,
                         n_mu=n_mu, mu_pad=mu_pad, geometry=geometry, config=gw,
-                        head=head, wfn_file=gw.paths.wfn_file, eigh=eigh)
+                        head=head, wfn_file=gw.paths.wfn_file, eigh=eigh,
+                        sym=sym, q_full=q_full, q_tables=q_tables)
 
 
 def lorrax_v(src, q_frac, miller):
@@ -676,12 +716,54 @@ def _check_projection(proj, V_e, chi, Wc, iq, where, mesh):
 
 
 class QPlan(NamedTuple):
-    """One output q: file row, stored row, umklapp, BerkeleyGW G list."""
+    """One output q: file row, parent row, umklapp, G list and typed action."""
     iq_file: int
     iq_store: int
     q_file: np.ndarray
     g0: np.ndarray
     gspace: object               # bgw_epsmat.QGspace
+    sym_row: int = 0             # identity for direct stored-q/umklapp images
+
+
+def export_q_parent(src, q):
+    """Stored parent, umklapp and typed action of one requested full-grid q."""
+    idx, g0 = match_q_umklapp(src.q_stored, np.asarray(q)[None])
+    if int(idx[0]) >= 0:
+        return int(idx[0]), g0[0], 0
+    full, shift = match_q_umklapp(src.q_full, np.asarray(q)[None])
+    if int(full[0]) < 0 or src.q_tables is None:
+        _refuse("epsmat_q_unmatched", f"q {np.round(q, 6).tolist()}",
+                "a q on the producer's full grid",
+                "a q outside that grid has no stored response",
+                "use a BerkeleyGW q list on the producer's grid")
+    iq = int(full[0])
+    return (int(src.q_tables.irr_idx_q[iq]), shift[0],
+            int(src.q_tables.sym_idx_q[iq]))
+
+
+def parent_gvectors(src, row, miller):
+    """Parent G rows, scalar Fourier phase and TR bit, by the SymMaps action.
+
+    Centroid permutations and wrap phases cancel between Z, chi and Z^H;
+    the plane-wave response therefore needs only the reciprocal action.
+    """
+    if row.sym_row == 0:
+        return np.asarray(miller) + row.g0[None, :], None, False
+    from symmetry_maps import unfold_reciprocal_carriers
+    S, _, anti = src.sym.operation_rows(row.sym_row)
+    inverse = np.rint(np.linalg.inv(S)).astype(np.int64)
+    if not np.array_equal(inverse @ S, np.eye(3, dtype=np.int64)):
+        raise ValueError("epsmat parent G action must be unimodular")
+    q_parent = src.q_stored[row.iq_store]
+    gp_float = unfold_reciprocal_carriers(inverse, row.q_file[None] + miller, q_parent)
+    gp = np.rint(gp_float).astype(np.int64)
+    if not np.allclose(gp_float, gp, rtol=0.0, atol=1e-6):
+        _refuse("epsmat_parent_g", f"noninteger parent G at q {row.q_file.tolist()}",
+                "an exact reciprocal relabel under the persisted action",
+                "the q action and the G sphere must describe the same carriers",
+                "use the bundle's own WFN and q grid")
+    phase = src.sym.reciprocal_phase(row.sym_row, q_parent[None] + gp)
+    return gp, phase, bool(anti)
 
 
 def resolve_ecut(epsmat_ecut, full_ecuts, *, source):
@@ -711,7 +793,7 @@ def plan_export(cfg, src, *, print_fn=None):
 
     With ``bgw_reference`` the q list, q0, ecuts and G order are BerkeleyGW's
     own (the order is also recomputed and must agree); otherwise every
-    stored q ≠ 0 goes to ``epsmat.h5`` and Γ to ``eps0mat.h5`` at
+    full-grid q ≠ 0 goes to ``epsmat.h5`` and Γ to ``eps0mat.h5`` at
     ``q0_vector``. ``epsmat_ecut`` (0: the full sphere) keeps the leading
     ``gcutoff`` G of that order at every q (:func:`resolve_ecut`).
     """
@@ -735,8 +817,8 @@ def plan_export(cfg, src, *, print_fn=None):
             q_file, full = np.asarray([cfg.q0_vector]), bare
             src_name = "the producer's bare_coulomb_cutoff"
         else:
-            keep = np.setdiff1d(np.arange(src.q_stored.shape[0]), gamma)
-            q_file, full = np.mod(src.q_stored[keep], 1.0), bare
+            keep = np.flatnonzero(np.any(np.abs(src.q_full) > 1e-12, axis=1))
+            q_file, full = np.mod(src.q_full[keep], 1.0), bare
             q_file[np.abs(q_file - 1.0) < 1e-12] = 0.0
             src_name = "the producer's bare_coulomb_cutoff"
         if bare_set is not None and full > bare + 1e-9:
@@ -749,14 +831,14 @@ def plan_export(cfg, src, *, print_fn=None):
         for i, q in enumerate(q_file):
             if name == "eps0mat":
                 idx, g0 = (gamma[:1] if gamma.size else np.array([-1])), np.zeros((1, 3), int)
+                sym_row = 0
             else:
-                idx, g0 = match_q_umklapp(src.q_stored, q[None])
+                parent, shift, sym_row = export_q_parent(src, q)
+                idx, g0 = np.asarray([parent]), shift[None]
             if int(idx[0]) < 0:
                 _refuse("epsmat_q_unmatched", f"{name} q {np.round(q, 6).tolist()}",
-                        "a stored LORRAX q equal up to a reciprocal lattice vector",
-                        "a symmetry-rotated W is not reconstructed by this export",
-                        "use a bundle stored on the full zone or a BerkeleyGW q list "
-                        "of its stored wedge")
+                        "the stored Gamma response", "eps0mat uses the long-wavelength model",
+                        "use a bundle containing Gamma")
             qg = be.q_gspace(comps, bdot, q, full, is_q0=(name == "eps0mat"))
             if ref:
                 qref, _ = be.read_q_gspace(ref, i)
@@ -772,7 +854,7 @@ def plan_export(cfg, src, *, print_fn=None):
             if name == "eps0mat" and np.any(comps[qg.order[0]] != 0):
                 _refuse("epsmat_q0_head_first", f"first eps G {comps[qg.order[0]].tolist()}",
                         "G = 0 first at q → 0", "the head is row 0", "report")
-            rows.append(QPlan(i, int(idx[0]), np.asarray(q), g0[0], qg))
+            rows.append(QPlan(i, int(idx[0]), np.asarray(q), g0[0], qg, sym_row))
         plans[name] = (np.asarray(q_file), ecuts, rows)
         log.info(f"  {name}.h5: {len(rows)} q, ecuts {ecut_receipt}, nmtx "
                  f"{min(r.gspace.nmtx for r in rows)}..{max(r.gspace.nmtx for r in rows)}"
@@ -921,10 +1003,18 @@ def run_epsmat_export(cfg, mesh, *, print_fn=None):
         diags, figs = [], []
         with SlabIO(path, mode="a", mesh=mesh) as io:
             be.register_matrix(io, len(rows), max(r.gspace.nmtx for r in rows))
-            for r in rows:
-                Z, B, K, chi, V, Wc, qd = q_algebra(src, r.iq_store, mesh, rcond=cfg.rcond)
+            algebra, parent_iq = None, -1
+            # File offsets retain the requested q order. Group the computation
+            # by parent so its eigensolves run once, with only one parent live.
+            for r in sorted(rows, key=lambda row: row.iq_store):
+                if parent_iq != r.iq_store:
+                    algebra = None
+                    Z, B, K, chi, V, Wc, qd = q_algebra(src, r.iq_store, mesh, rcond=cfg.rcond)
+                    del B, K
+                    algebra, parent_iq = (Z, chi, V, Wc, qd), r.iq_store
+                Z, chi, V, Wc, qd = algebra
                 n = r.gspace.nmtx
-                miller = comps[r.gspace.order[:n]] + r.g0[None, :]
+                miller, phase, anti = parent_gvectors(src, r, comps[r.gspace.order[:n]])
                 slots = zeta_slots(src.zeta.gvecs(q=[r.iq_store])[0],
                                    src.zeta.ngk_valid(q=[r.iq_store])[0], miller,
                                    fill=Z.shape[2])
@@ -932,6 +1022,15 @@ def run_epsmat_export(cfg, mesh, *, print_fn=None):
                 head = _q0_head_value(cfg, src, r.q_file) if name == "eps0mat" else None
                 n_pad = _pad_to(max(n, 1), p * p)
                 Zf = zeta_face(Z, slots, mesh=mesh, n_pad=n_pad)
+                # Same parent-centroid basis on both legs: the centroid action
+                # cancels in Z chi Z^H. Only the scalar Fourier action remains.
+                if r.sym_row != 0:
+                    ph = np.ones(n_pad, np.complex128)
+                    if phase is not None:
+                        ph[:n] = phase
+                    Zf = _scale_columns(mesh)[int(anti)](Zf, jnp.asarray(ph))
+                    if anti:
+                        chi, Wc = jnp.conj(chi), jnp.conj(Wc)
                 wings, qw = None, {}
                 if name == "eps0mat" and cfg.q0_wings == "dipole":
                     W_face = V + Wc
@@ -960,12 +1059,15 @@ def run_epsmat_export(cfg, mesh, *, print_fn=None):
                 diags.append((r.iq_file, d))
                 figs.append({"q": np.round(r.q_file, 6).tolist(), "iq_file": int(r.iq_file),
                              "iq_store": int(r.iq_store), "g0": np.asarray(r.g0).tolist(),
+                             "sym_row": int(r.sym_row), "antiunitary": anti,
                              "nmtx": n, "projection_err": err, "roundtrip_vs_W": rt,
                              "head": (None if head is None else complex(head)),
                              **({"q0_wings": qw} if qw else {}), **qd})
                 log.info(f"    {name}[{r.iq_file}] nmtx {n}: block identity {err:.2e}, "
                          f"Zᴴ(ε⁻¹−1)vZ vs W−V {rt:.2e}"
                          + ("" if head is None else f", head ε⁻¹_00(q0)={complex(head):.6f}"))
+                del Z, chi, V, Wc
+            del algebra
         if rank0:
             for iq_file, d in diags:
                 be.write_q_diagonal(path, iq_file, d)
