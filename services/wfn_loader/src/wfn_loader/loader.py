@@ -1312,18 +1312,21 @@ class WfnLoader:
             raise ValueError(
                 "box_index_dev: pass `mesh=` or construct the WfnLoader "
                 "with a mesh; cannot device_put without one.")
-        # Build the cache key.  ``id(mesh)`` is fine because the mesh
-        # outlives the loader in every production driver (the mesh is
-        # built once at top-of-main and threaded through every kernel).
-        cache_key = ("box_index_dev", *self._k_cache_key(k),
-                     tuple(int(s) for s in self.fft_grid), id(mesh))
-        if cache and cache_key in self._gvecs_dev_cache:
-            return self._gvecs_dev_cache[cache_key]
-        # Resolve the requested sharding (default = replicated 4-axis).
+        # Resolve placement before cache lookup: different layouts own
+        # different local index rows even when the physical table is shared.
+        default_sharding = NamedSharding(mesh, P(None, None))
         if sharding is None:
-            sharding = NamedSharding(mesh, P(None, None))
+            sharding = default_sharding
         elif isinstance(sharding, P):
             sharding = NamedSharding(mesh, sharding)
+        # Preserve the established default key/object reuse. NamedSharding
+        # includes mesh and memory kind as well as the partition spec.
+        cache_key = ("box_index_dev", *self._k_cache_key(k),
+                     tuple(int(s) for s in self.fft_grid), id(mesh))
+        if sharding != default_sharding:
+            cache_key += ("sharding", sharding)
+        if cache and cache_key in self._gvecs_dev_cache:
+            return self._gvecs_dev_cache[cache_key]
         # Process-local placement (``common.collectives``): every rank
         # builds the SAME index table from the same file, so each may
         # simply declare its own shard.  ``jax.device_put(numpy,
