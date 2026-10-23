@@ -515,10 +515,10 @@ A bundle is never selected from its presence alone. Conditions are on the [Depen
 {: .kw-details }
 
 ### `write_restart_tensors` {: .kw data-type="bool" data-default="true" }
-Writes the restart bundle. With `false`, a downstream BSE run refuses.
+Writes the ISDF tensor file. With `false`, a downstream BSE run refuses.
 
 ### `restart_q_storage` {: .kw data-type="enum" data-default="auto" }
-q set of the restart bundle.
+q set of the ISDF tensor file.
 
 `auto` stores the irreducible wedge when the centroid set is orbit-closed and the q grid reduced, the full grid otherwise; `ibz` refuses a set that cannot be stored on the wedge.
 {: .kw-details }

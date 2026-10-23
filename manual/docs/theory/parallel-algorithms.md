@@ -268,7 +268,7 @@ A price above the budget never refuses: the stage prints one `memory over budget
 `file_io.slab_io.SlabIO`
 {: .in-code }
 
-Bulk arrays ($V_\bq$, $W_\bq(0)$, ζ, the Z store, the tangential bank and model) are read and written by SlabIO through parallel HDF5: each rank reads and writes only its own hyperslab, and no array is gathered onto one rank or one host. The file holds the logical array; its bytes do not depend on the mesh that wrote it, so a restart bundle written at one $P$ reads at another. Large writes are cut into row blocks of at most 64 MiB per rank written independently in file order; other layouts use two-phase collective I/O. One queue per process keeps every rank's collective HDF5 calls in the same order.
+Bulk arrays ($V_\bq$, $W_\bq(0)$, ζ, the Z store, the tangential bank and model) are read and written by SlabIO through parallel HDF5: each rank reads and writes only its own hyperslab, and no array is gathered onto one rank or one host. The file holds the logical array; its bytes do not depend on the mesh that wrote it, so an ISDF tensor file written at one $P$ reads at another. Large writes are cut into row blocks of at most 64 MiB per rank written independently in file order; other layouts use two-phase collective I/O. One queue per process keeps every rank's collective HDF5 calls in the same order.
 
 The per-rank streamed tier holds a bank that fits nowhere else: each rank writes and reads its own rows, in host memory or in one file per rank, and the tier is released within the map.
 

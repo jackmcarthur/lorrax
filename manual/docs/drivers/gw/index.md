@@ -22,7 +22,7 @@ Reads
 :   deck, `WFN.h5`, `centroids_frac_<N>.txt`, `kin_ion.h5`, `dipole.h5`; under QSGW also `parallel_transport.h5`
 
 Writes
-:   `eqp0.dat`, `eqp1.dat`, `sigma_diag.dat`, `qp_wfn_rotations.h5`, `WFN_qp.h5`, restart bundle, `gwjax.out`
+:   `eqp0.dat`, `eqp1.dat`, `sigma_diag.dat`, `qp_wfn_rotations.h5`, `WFN_qp.h5`, ISDF tensor file, `gwjax.out`
 
 Σ treatment
 :   tangential model (`compute_mode = tangential`) or `gn_ppm`; others for debugging and comparison ([below](#treatment))

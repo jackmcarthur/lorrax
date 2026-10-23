@@ -14,7 +14,7 @@ page: theory
 
 ## <span class="n">1</span> Bands and interactions on the BSE grid {: #grid }
 
-Every BSE quantity is assembled from what the GW run left in the restart bundle: band values at the ISDF points, the band energies, $V_\bq(\mu,\nu)$ and the static $W_\bq(\mu,\nu;0)$. When the deck sets `kgrid_fine`, bands and $W$ are first carried from the GW grid $\bk_{\mathrm{co}}$ to the finer BSE grid $\bk_{\mathrm{fi}}$; below, $\bk$ always denotes a point of the grid the BSE runs on.
+Every BSE quantity is assembled from what the GW run left in the ISDF tensor file: band values at the ISDF points, the band energies, $V_\bq(\mu,\nu)$ and the static $W_\bq(\mu,\nu;0)$. When the deck sets `kgrid_fine`, bands and $W$ are first carried from the GW grid $\bk_{\mathrm{co}}$ to the finer BSE grid $\bk_{\mathrm{fi}}$; below, $\bk$ always denotes a point of the grid the BSE runs on.
 {: .intro }
 
 ### <span class="n">1.1</span> The transition window {: #grid-window }

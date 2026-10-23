@@ -1,11 +1,11 @@
 # Downfold utility
 
-`gw.downfold_cli` A finished GW restart bundle compressed onto a subset of its centroids, for the BSE.
+`gw.downfold_cli` A finished GW ISDF tensor file compressed onto a subset of its centroids, for the BSE.
 {: .page-summary }
 
 <div class="chain-map" data-driver="downfold" data-page="files"></div>
 
-Compresses the bare and screened interaction $V_\bq(\mu,\nu)$, $W_\bq(\mu,\nu;0)$ of a finished GW run from its $N_\mu$ centroids onto a subset of $N_\sigma$ of them, chosen for a retained band window, and writes a restart bundle in the unchanged format. [`bse.bse_jax`](../drivers/bse/index.md) and [`bse.exciton_bands`](../drivers/exciton-bands/index.md) read it with no flag; every stored $(\mu,\nu)$ tensor shrinks by $(N_\sigma/N_\mu)^2$.
+Compresses the bare and screened interaction $V_\bq(\mu,\nu)$, $W_\bq(\mu,\nu;0)$ of a finished GW run from its $N_\mu$ centroids onto a subset of $N_\sigma$ of them, chosen for a retained band window, and writes an ISDF tensor file in the unchanged format. [`bse.bse_jax`](../drivers/bse/index.md) and [`bse.exciton_bands`](../drivers/exciton-bands/index.md) read it with no flag; every stored $(\mu,\nu)$ tensor shrinks by $(N_\sigma/N_\mu)^2$.
 {: .lead }
 
 <div class="glance" markdown>
@@ -208,7 +208,7 @@ All outputs go under `<output_restart>/tmp/`. The bundle is written on the full 
 <div class="file-list" markdown>
 
 `isdf_tensors_<N_σ>.h5`
-:   The small restart bundle, in the GW writer's format, plus the `downfold_provenance` group.
+:   The small ISDF tensor file, in the GW writer's format, plus the `downfold_provenance` group.
 
 `zeta_q.h5`
 :   $\zeta_{\bq\sigma}(\bG)$ on the parent's $\bq$ set, which `bse.exciton_bands --vq-mode interp` interpolates. Skipped, with a message, when the parent has no finished `G_flat` ζ.
@@ -221,7 +221,7 @@ All outputs go under `<output_restart>/tmp/`. The bundle is written on the full 
 
 </div>
 
-### Small restart bundle {: #bundle }
+### Small ISDF tensor file {: #bundle }
 
 Generated from `_write_small_bundle` and the writers it calls (`write_restart_state_to_h5`, `write_parent_wavefunctions`, `write_head_scalars_to_h5`, `_stamp_downfold_provenance`, `_stamp_isdf_basis`). Small root datasets are written by SlabIO's `write_attr` as datasets, not HDF5 attributes. Entries in brackets are conditional: `@centroids_charge_md5` is stamped only when the parent's `zeta_q.h5` header gives the FFT grid; every other bracketed entry is copied only when the parent carries it.
 

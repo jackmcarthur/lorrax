@@ -31,7 +31,7 @@ A one-shot run reads $\Sigma^{xc}$ at the mean-field energies; a QSGW run iterat
 
 ### <span class="n">1.3</span> BSE excitons {: #ch-bse }
 
-The [BSE driver](../drivers/bse/index.md) solves for neutral excitations in the basis of transitions $|cv\bk\rangle$, with the QP energies of the GW step and the static screened interaction $W(\omega=0)$ from its restart bundle:
+The [BSE driver](../drivers/bse/index.md) solves for neutral excitations in the basis of transitions $|cv\bk\rangle$, with the QP energies of the GW step and the static screened interaction $W(\omega=0)$ from its ISDF tensor file:
 
 $$
 \langle cv\bk|H^{\mathrm{BSE}}|c'v'\bk'\rangle = \big(E^{\mathrm{QP}}_{c\bk}-E^{\mathrm{QP}}_{v\bk}\big)\delta_{cc'}\delta_{vv'}\delta_{\bk\bk'} + \langle cv\bk|K^x - K^d|c'v'\bk'\rangle \tag{1.2}

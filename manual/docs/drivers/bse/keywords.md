@@ -20,7 +20,7 @@ Required
 **Command line**
 
 ### `-i`, `--input` {: .kw data-type="path" data-default="required" }
-The GW deck. Locates the restart bundle, `wfn_file`, the centroid table and every key below.
+The GW deck. Locates the ISDF tensor file, `wfn_file`, the centroid table and every key below.
 
 **Deck keys**
 

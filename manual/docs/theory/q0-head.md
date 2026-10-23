@@ -143,7 +143,7 @@ The correlation part of the head, $\bar W^c_{00}(z)=\bar W_{00}(z)-\bar v_{00}$,
 
 ### <span class="n">3.1</span> Head frequencies {: #poles-samples }
 
-The head is sampled on the body's frequency plan. Its samples, its model and the frequencies written to the restart bundle depend on `compute_mode`:
+The head is sampled on the body's frequency plan. Its samples, its model and the frequencies written to the ISDF tensor file depend on `compute_mode`:
 
 | Treatment | Head samples $z_s$ | Head model | `whead` written at |
 |---|---|---|---|
@@ -241,7 +241,7 @@ The BSE adds the head back into the Γ tiles of $V$ and $W$ instead of shifting 
 `gw_output.persist_w0_and_head`
 {: .in-code }
 
-With `write_restart_tensors = true` (the default) the restart bundle `tmp/isdf_tensors_<N_mu>.h5` carries the head beside $W_0$:
+With `write_restart_tensors = true` (the default) the ISDF tensor file `tmp/isdf_tensors_<N_mu>.h5` carries the head beside $W_0$:
 
 | Dataset | Holds | Unit |
 |---|---|---|

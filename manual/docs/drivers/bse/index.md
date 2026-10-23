@@ -5,7 +5,7 @@ page: overview
 
 # BSE driver
 
-`bse.bse_jax` Optical excitons from the Bethe–Salpeter equation on the GW restart bundle.
+`bse.bse_jax` Optical excitons from the Bethe–Salpeter equation on the ISDF tensor file from GW.
 {: .page-summary }
 
 <div class="chain-map" data-driver="bse" data-page="overview"></div>
@@ -18,7 +18,7 @@ Solves the Bethe–Salpeter equation for $\bQ = 0$ excitons in the transition ba
 Invoke
 :   `python -m bse.bse_jax -i gw.in`; spectrum: `python -m bse.absorption_haydock`
 Reads
-:   GW deck, restart bundle `isdf_tensors_<N_mu>.h5`, `WFN.h5`, centroid table, `eqp1.dat`, `dipole.h5`
+:   GW deck, ISDF tensor file `isdf_tensors_<N_mu>.h5`, `WFN.h5`, centroid table, `eqp1.dat`, `dipole.h5`
 
 Writes
 :   `bse.out`, `eigenvalues*.dat`, `eigenvectors.h5`, `absorption_eh.dat`, `absorption_noeh.dat`; `absorption_haydock.h5`, `absorption_haydock_b{1,2,3}_eh.dat`
@@ -175,7 +175,7 @@ The exchange weight is $w_x = 2$ for the singlet of a non-spinor WFN (`spin_sing
 
 ## Excitons on QSGW states {: #qsgw }
 
-`eqp_corrections` replaces the diagonal energies only. ψ always comes from the restart bundle, which holds the states of the GW deck's WFN. Two routes follow:
+`eqp_corrections` replaces the diagonal energies only. ψ always comes from the ISDF tensor file, which holds the states of the GW deck's WFN. Two routes follow:
 
 - **QSGW energies, DFT states.** Run the BSE on the self-consistent run's own bundle with `eqp_corrections = eqp1.dat`. A converged run on a route that stores W0 writes the final map's $W(0)$ there; a QSGW bundle without it is not rebuilt (`GATE bse_static_w_sc_state`).
 - **QSGW states.** Run GW on the self-consistent run's `WFN_qp.h5` (`wfn_file = WFN_qp.h5`) and solve the BSE on that bundle without `eqp_corrections`, with `dipole_file = dipole_qsgw.h5`. `eqp_corrections` on a stamped `WFN_qp.h5` refuses, and so does a DFT `dipole.h5` with it (`GATE dipole_basis`).

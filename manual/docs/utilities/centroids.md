@@ -205,7 +205,7 @@ Feature family used by both k-means and pruning. `scalar` is the charge density 
 
 </div>
 
-The GW run hashes the table's contents. A new table, even with the same count, invalidates the ζ file and the restart bundle built from the old one.
+The GW run hashes the table's contents. A new table, even with the same count, invalidates the ζ file and the ISDF tensor file built from the old one.
 
 ## Refusals {: #refusals }
 

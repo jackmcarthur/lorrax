@@ -20,7 +20,7 @@ Required
 **Files**
 
 ### `-i`, `--input` {: .kw data-type="path" data-default="required" }
-The GW deck with a `K_POINTS` block. Its directory holds the restart bundle.
+The GW deck with a `K_POINTS` block. Its directory holds the ISDF tensor file.
 
 ### `centroids_file` {: .kw data-type="path" data-default="required" }
 ISDF point table the restart was built on; the driver evaluates $\psi_{c\,\bk+\bQ}$ at these points. Shared with [`bse`](../bse/keywords.md).
@@ -67,7 +67,7 @@ The count on a corner's line is the number of points on the segment that ends th
 ### `sys_dim` {: .kw data-type="int" data-default="required" }
 Dimension of the Coulomb truncation, `3` (bulk) or `2` (slab). Required by the deck parser; this driver does not read it otherwise.
 
-Whether `interp` and `both` run is decided by the restart bundle's Coulomb-policy stamp (`sys_dim` 2 or unstamped) and a slab-separable cell with a planar $\bq$ grid; the `refit` kernel is the bulk one only for a stamped `sys_dim = 3` bundle. See [Dependencies](dependencies.md).
+Whether `interp` and `both` run is decided by the ISDF tensor file's Coulomb-policy stamp (`sys_dim` 2 or unstamped) and a slab-separable cell with a planar $\bq$ grid; the `refit` kernel is the bulk one only for a stamped `sys_dim = 3` bundle. See [Dependencies](dependencies.md).
 {: .kw-details }
 
 Optional

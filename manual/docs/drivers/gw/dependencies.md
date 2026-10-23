@@ -33,7 +33,7 @@ page: deps
 `parallel_transport.h5` (`parallel_transport_file`)
 :   [dipole](../../utilities/dipole.md); QSGW velocity heads only
 
-restart bundle, `qp_wfn_rotations.h5`
+ISDF tensor file, `qp_wfn_rotations.h5`
 :   an earlier gw run (`restart = true`, `sc_initial_qp_rotations_file`)
 
 </div>
@@ -43,19 +43,19 @@ restart bundle, `qp_wfn_rotations.h5`
 #### Read by
 
 [bse](../bse/index.md)
-:   restart bundle; `eqp1.dat` (`eqp_corrections`) or `WFN_qp.h5` as its WFN; `tmp/zeta_q.h5` for a $W(0)$ rebuild
+:   ISDF tensor file; `eqp1.dat` (`eqp_corrections`) or `WFN_qp.h5` as its WFN; `tmp/zeta_q.h5` for a $W(0)$ rebuild
 
 [exciton-bands](../exciton-bands/index.md)
-:   restart bundle; `tmp/zeta_q.h5` for $V_\bq$ interpolation
+:   ISDF tensor file; `tmp/zeta_q.h5` for $V_\bq$ interpolation
 
 [htransform](../../utilities/htransform.md)
 :   `qp_wfn_rotations.h5` or `eqp1.dat`
 
 [downfold](../../utilities/downfold.md)
-:   restart bundle; `tmp/zeta_q.h5` when present
+:   ISDF tensor file; `tmp/zeta_q.h5` when present
 
 `gw.gw_jax`
-:   restart bundle; `qp_wfn_rotations.h5` as a QSGW seed; `WFN_qp.h5` as `wfn_file`
+:   ISDF tensor file; `qp_wfn_rotations.h5` as a QSGW seed; `WFN_qp.h5` as `wfn_file`
 
 `gw.eqp_bgw`
 :   `sigma_mnk.h5`, `kin_ion.h5`: rebuilds the eqp pair from files

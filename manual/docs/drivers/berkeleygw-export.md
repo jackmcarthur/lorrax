@@ -3,7 +3,7 @@
 Write BerkeleyGW 4.0 files from a finished LORRAX run, so that BerkeleyGW's own codes can use LORRAX's screening and kernel.
 {: .page-summary }
 
-LORRAX keeps the screened interaction in the ISDF basis, as $V_\bq(\mu,\nu)$ and the static $W_\bq(\mu,\nu;0)$ in the restart bundle `tmp/isdf_tensors_<N_mu>.h5`, with the interpolation vectors $\zeta_{\bq\mu}$ beside it. Two utilities turn that bundle into the plane-wave files BerkeleyGW reads. Both run after the GW driver, on the same `WFN.h5`.
+LORRAX keeps the screened interaction in the ISDF basis, as $V_\bq(\mu,\nu)$ and the static $W_\bq(\mu,\nu;0)$ in the ISDF tensor file `tmp/isdf_tensors_<N_mu>.h5`, with the interpolation vectors $\zeta_{\bq\mu}$ beside it. Two utilities turn that bundle into the plane-wave files BerkeleyGW reads. Both run after the GW driver, on the same `WFN.h5`.
 
 | Utility | Writes | Read by |
 |---|---|---|

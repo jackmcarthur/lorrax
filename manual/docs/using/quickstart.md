@@ -1,9 +1,9 @@
 # Quickstart
 
-`WFN.h5` From a Quantum ESPRESSO calculation to quasiparticle energies and an absorption spectrum, one command per step.
+`WFN.h5` From a Quantum ESPRESSO calculation to quasiparticle energies and an absorption spectrum.
 {: .page-summary }
 
-The run below is bulk Si with spin–orbit coupling on a 4×4×4 grid. The decks are minimal: they are built from the keyword schema and name only the keys a first run needs; every other key takes its default. The QE decks of a chain that LORRAX runs in its own test suite are `tests/hsuite/fixture/{scf,nscf,pw2bgw}.in`. LORRAX must be installed first ([Installation](installation.md)).
+The following example input files carry out a run on bulk Si with spin–orbit coupling on a 4×4×4 grid. The QE input files of a workflow that LORRAX runs in its own test suite are `tests/hsuite/fixture/{scf,nscf,pw2bgw}.in`. LORRAX must be installed first ([Installation](installation.md)).
 
 ## The workflow {: #workflow }
 
@@ -14,11 +14,11 @@ Each step reads files the steps before it wrote, so they run in this order:
 1. **Mean field** ([§1](#mean-field))
    Quantum ESPRESSO scf and nscf, exported to `WFN.h5`, with the pseudopotentials and the QE `.save` kept beside it.
 2. **Preprocessing** ([§3](#preprocessing))
-   From `WFN.h5` and the GW deck: [`centroids`](../utilities/centroids.md) chooses the ISDF interpolation points, [`kin-ion`](../utilities/kin-ion.md) computes the kinetic-plus-ionic single-particle Hamiltonian, and [`dipole`](../utilities/dipole.md) the velocity matrix elements. GW needs all three.
+   From `WFN.h5` and the GW input file: [`centroids`](../utilities/centroids.md) chooses the ISDF interpolation points, [`kin-ion`](../utilities/kin-ion.md) computes the kinetic-plus-ionic single-particle Hamiltonian, and [`dipole`](../utilities/dipole.md) the velocity matrix elements. GW needs all three.
 3. **GW** ([§4](#gw))
-   [`gw`](../drivers/gw/index.md) computes the quasiparticle energies and writes the restart bundle the BSE reads.
-4. **Excitons and spectra** ([§5](#bse), [§6](#absorption))
-   [`bse`](../drivers/bse/index.md) solves for the excitons from the GW restart bundle and `eqp1.dat`; `bse.absorption_haydock` gives the absorption spectrum.
+   [`gw`](../drivers/gw/index.md) computes the quasiparticle energies and writes the ISDF tensor file the BSE reads.
+4. **Excitons and spectra** ([§5](#bse))
+   [`bse`](../drivers/bse/index.md) solves for the excitons from the ISDF tensor file and `eqp1.dat`, saves the eigenvectors to file and writes the absorption spectrum.
 
 </div>
 
@@ -75,7 +75,7 @@ K_POINTS automatic
  8 8 8 0 0 0
 ```
 
-`nscf.in` is the same deck with `calculation = 'nscf'`, `nbnd = 80` in `&system`, and the GW grid `4 4 4 0 0 0` under `K_POINTS automatic`. LORRAX unfolds QE's reduced list itself; there is no `kgrid.x` step ([k-points](inputs-from-dft.md#kgrid)). Then export with `pw2bgw.x` right after the nscf, since each `pw.x` run overwrites `Si.save/`:
+`nscf.in` is the same input file with `calculation = 'nscf'`, `nbnd = 80` in `&system`, and the GW grid `4 4 4 0 0 0` under `K_POINTS automatic`. LORRAX unfolds QE's reduced list itself; there is no `kgrid.x` step ([k-points](inputs-from-dft.md#kgrid)). Then export with `pw2bgw.x` right after the nscf, since each `pw.x` run overwrites `Si.save/`:
 
 ```fortran
 &input_pw2bgw
@@ -105,7 +105,7 @@ The QE side, and what `WFN.h5` must contain, is on [Inputs from DFT](inputs-from
 !!! note
     The LORRAX [`nscf`](../drivers/nscf/index.md) driver replaces the QE nscf, `pw2bgw.x` and `wfn2hdf.x` for a nonmagnetic, norm-conserving PBE calculation: `$RUN psp.run_nscf -i nscf.in`, with `save_dir`, `nbnd = 80` and `kgrid = 4 4 4` in an `[nscf]` section. It writes no `data-file-schema.xml`, and the scf one is used only when its k-points are those of `WFN.h5`. This run's scf is on 8×8×8, so with its fully relativistic pseudopotential `dipole` and `kin-ion` refuse ([nscf dependencies](../drivers/nscf/dependencies.md)); use the QE route here.
 
-## 2. The GW deck {: #deck }
+## 2. The GW input file {: #deck }
 
 In the run directory put `WFN.h5`, `Si.upf` and `data-file-schema.xml`, and write `gw.in`:
 
@@ -121,18 +121,18 @@ compute_mode   = tangential
 qp_solver      = one_shot_dft
 ```
 
-The same deck drives every step below. `number_bands` is also the top of the ζ-fit window, which refuses when its edge reaches the last band of `WFN.h5` (here 80) or cuts a degenerate multiplet, and names the boundary and the k-point. The band-sum check on the same edge only logs a `LORRAX SANITY FAILURE` warning when the edge comes from `number_bands`, and refuses for a named `number_bands_chi` or `number_bands_sigma` ([Band counts](inputs-from-dft.md#bands)). Keys and defaults: [gw keywords](../drivers/gw/keywords.md).
+The same input file drives every step below. `number_bands` is also the top of the ζ-fit window, which refuses when its edge reaches the last band of `WFN.h5` (here 80) or cuts a degenerate multiplet, and names the boundary and the k-point. The band-sum check on the same edge only logs a `LORRAX SANITY FAILURE` warning when the edge comes from `number_bands`, and refuses for a named `number_bands_chi` or `number_bands_sigma` ([Band counts](inputs-from-dft.md#bands)). Keys and defaults: [gw keywords](../drivers/gw/keywords.md).
 
 ## 3. Preprocessing {: #preprocessing }
 
 ```bash
-$RUN centroid.kmeans_cli 600 --seed 42 -i gw.in   # ISDF points
+$RUN centroid.kmeans_cli 600 -i gw.in             # ISDF points
 $RUN psp.get_dipole_mtxels -i gw.in              # velocity matrix elements
 $RUN gw.kin_ion_io -i gw.in                      # T + V_ion
 ```
 
-- [`centroids`](../utilities/centroids.md) selects $N_\mu$ points $\br_\mu$ and writes `centroids_frac_<n>.txt`. `n` is the count after pruning and can be below the 600 requested; read it from the `Centroids :` line of `kmeans.out` and set `centroids_file` to that name. A first count of 10 × `number_bands` is the starting point.
-- [`dipole`](../utilities/dipole.md) writes `dipole.h5`, the velocity matrix $\langle m\bk|\hat v|n\bk\rangle$ that the $\bq \to 0$ head and the absorption spectrum read, and on a grid that supports links `parallel_transport.h5`, which only QSGW reads.
+- [`centroids`](../utilities/centroids.md) selects $N_\mu$ points $\br_\mu$ and writes `centroids_frac_<n>.txt`. `n` is the count after pruning and can be below the 600 requested; read it from the `Centroids :` line of `kmeans.out` and set `centroids_file` to that name. A first count of 10 × `number_bands` is widely used in the literature.
+- [`dipole`](../utilities/dipole.md) writes `dipole.h5`, the velocity matrix $\langle m\bk|\hat v|n\bk\rangle$, which is used by the $\bq \to 0$ head corrections in GW and for the dipole matrix elements in the absorption spectrum. On a grid that supports links it also writes `parallel_transport.h5`, the Berry connection matrix elements, which are used to compute the commutator $[\br,\Sigma^{xc}]$.
 - [`kin-ion`](../utilities/kin-ion.md) writes `kin_ion.h5`, the matrix $\langle m\bk|T + V^{\mathrm{ion}}|n\bk\rangle$ that replaces BerkeleyGW's `vxc.dat`.
 
 ## 4. GW {: #gw }
@@ -148,39 +148,34 @@ $RUN gw.gw_jax -i gw.in
 | `eqp0.dat`, `eqp1.dat` | QP energies on the irreducible wedge, BerkeleyGW format, eV |
 | `sigma_diag.dat` | the Σ diagonal per k-point and band |
 | `qp_wfn_rotations.h5` | the QP eigensystem $U$, $E^{\mathrm{QP}}_{n\bk}$ |
-| `tmp/isdf_tensors_<N_mu>.h5` | the restart bundle the BSE reads |
+| `tmp/isdf_tensors_<N_mu>.h5` | the ISDF tensor file the BSE reads |
 | `gwjax.out` | the run report |
 
 A step has finished when its report ends with `LORRAX … completed.`; a refused step prints a `REFUSED (…)` line naming the condition.
 
-## 5. Excitons {: #bse }
+## 5. Excitons and absorption {: #bse }
 
 Add the BSE keys to `gw.in` (BerkeleyGW's absorption.inp names):
 
 ```ini
-number_val_bands_fine = 4
+number_val_bands_fine  = 4
 number_cond_bands_fine = 4
-eqp_corrections = eqp1.dat
+eqp_corrections        = eqp1.dat
+dipole_file            = dipole.h5
+number_eigenvalues     = 200
+write_eigenvectors     = 200
 ```
 
 ```bash
 $RUN bse.bse_jax -i gw.in
 ```
 
-[`bse`](../drivers/bse/index.md) reads the one restart bundle in `tmp/` beside the deck (two refuse), applies the QP energies of `eqp1.dat`, and prints the lowest exciton energies to `bse.out`. Band counts include spinor bands: Si with spin–orbit coupling has 8 occupied bands. A window edge inside a degenerate multiplet refuses; `band_degeneracy = snap` widens it.
-
-## 6. Absorption spectrum {: #absorption }
-
-```bash
-$RUN bse.absorption_haydock -i gw.in
-```
-
-`bse.absorption_haydock` runs the Haydock recursion on the same BSE Hamiltonian, one seed per Cartesian polarization, and writes $\varepsilon_2(\omega)$, $\varepsilon_1(\omega)$ and the joint density of states to `absorption_haydock_b1_eh.dat`, `_b2_`, `_b3_` (columns: ω in eV, $\varepsilon_2$, $\varepsilon_1$, JDOS) and `absorption_haydock.h5`, broadened by `energy_resolution` (0.1 eV). The cell volume and spinor count come from the WFN. It needs at least two devices.
+[`bse`](../drivers/bse/index.md) reads the one ISDF tensor file in `tmp/` beside the input file (two refuse), applies the QP energies of `eqp1.dat`, and solves the Tamm–Dancoff BSE for the lowest 200 excitons. It saves their eigenvectors to `eigenvectors.h5`, writes their energies and dipoles to `eigenvalues_b1.dat` … `eigenvalues_b3.dat`, and writes the absorption spectrum with and without electron–hole interaction to `absorption_b1_eh.dat` … `absorption_b3_eh.dat` and `absorption_b1_noeh.dat` …, one file per Cartesian polarization, broadened by `energy_resolution` (0.1 eV). These files follow BerkeleyGW's formats. The spectrum is complete up to the energy of the highest computed exciton. Band counts include spinor bands: Si with spin–orbit coupling has 8 occupied bands. A window edge inside a degenerate multiplet refuses; `band_degeneracy = snap` widens it.
 
 ## Next {: #next }
 
 - Self-consistent GW: set `qp_solver = self_consistent` and rerun step 4 ([QSGW](../theory/qsgw.md)).
 - Metals: `compute_mode = tangential` with `occ_smearing_width_ry` ([Metals](../theory/metals.md)).
-- QP band structures: [`htransform`](../utilities/htransform.md) with a `K_POINTS crystal_b` block in the deck.
+- QP band structures: [`htransform`](../utilities/htransform.md) with a `K_POINTS crystal_b` block in the input file.
 - Exciton dispersion: [`exciton-bands`](../drivers/exciton-bands/index.md).
 

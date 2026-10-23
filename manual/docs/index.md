@@ -8,18 +8,18 @@
 LORRAX computes quasiparticle energies $E^{\mathrm{QP}}_{n\bk}$ in the GW approximation and neutral excitations from the Bethe–Salpeter equation, starting from a Quantum ESPRESSO calculation in BerkeleyGW's `WFN.h5` format. Every two-particle object is compressed by interpolative separable density fitting (ISDF) onto $N_\mu$ real-space points $\br_\mu$, and Σ is evaluated on the real frequency axis from real-time Green's functions. It runs through JAX with one process per device, on GPUs or CPUs.
 {: .lead }
 
-## The chain {: #chain }
+## Workflow {: #chain }
 
 <div class="stages" markdown>
 
-1. **Mean field**
-   Quantum ESPRESSO `pw.x` scf and nscf, exported with `pw2bgw.x` to `WFN.h5`, or the LORRAX [`nscf`](drivers/nscf/index.md) driver from the QE scf `.save`.
+1. **Quantum ESPRESSO**
+   Quantum ESPRESSO `pw.x` scf and nscf, exported with `pw2bgw.x` to a single wavefunction file, `WFN.h5`.
 2. **GW inputs**
-   Three utilities read `WFN.h5`: [`centroids`](utilities/centroids.md) selects the ISDF interpolation points $\br_\mu$, [`kin-ion`](utilities/kin-ion.md) writes $\langle m\bk|T + V^{\mathrm{ion}}|n\bk\rangle$, and [`dipole`](utilities/dipole.md) writes the velocity matrix elements for the $\bq \to 0$ head.
+   Pre-processing for the GW code. [`centroids`](utilities/centroids.md) selects the ISDF interpolation points $\br_\mu$, [`kin-ion`](utilities/kin-ion.md) writes $\langle m\bk|T + V^{\mathrm{ion}}|n\bk\rangle$, and [`dipole`](utilities/dipole.md) writes the velocity matrix elements for the $\bq \to 0$ head.
 3. **GW**
-   [`gw`](drivers/gw/index.md) builds $V_\bq(\mu,\nu)$, $W_\bq(\mu,\nu;z)$ and $\Sigma^{xc}$, and writes `eqp0.dat`, `eqp1.dat`, `qp_wfn_rotations.h5` and the restart bundle `tmp/isdf_tensors_<N_mu>.h5`.
+   [`gw`](drivers/gw/index.md) builds $V_\bq$ and $W_\bq(z)$ in the ISDF basis, and computes self-energy matrix elements $\Sigma^{xc}(\omega)$ and quasiparticle energies, with single-shot and self-consistent options and ladder corrections. It writes `eqp0.dat` and `eqp1.dat`.
 4. **Excitons and bands**
-   [`bse`](drivers/bse/index.md) solves the optical BSE from the restart bundle; [`exciton-bands`](drivers/exciton-bands/index.md) solves it along a $\bQ$ path. [`htransform`](utilities/htransform.md) interpolates QP bands, and [`downfold`](utilities/downfold.md) downfolds $V_\bq(\mu,\nu)$ and $W_\bq(\mu,\nu;0)$ onto a subspace of the bands for the BSE.
+   [`bse`](drivers/bse/index.md) solves the Bethe–Salpeter equation for $\bQ=0$ excitons to plot the absorption spectrum, and [`exciton-bands`](drivers/exciton-bands/index.md) solves the Hamiltonian along a $\bQ$ path. [`htransform`](utilities/htransform.md) enables interpolation onto arbitrary fine k-grids and $\bQ$ center-of-mass momenta. The [`downfold`](utilities/downfold.md) routine optionally downfolds the large matrices $V_\bq$ and $W_\bq(z)$ into a subspace to reduce cost, but is not necessary.
 
 </div>
 
@@ -67,4 +67,4 @@ LORRAX computes quasiparticle energies $E^{\mathrm{QP}}_{n\bk}$ in the GW approx
 - New to LORRAX: [Installation](using/installation.md), then [Quickstart](using/quickstart.md) for the full sequence from `pw.x` to an absorption spectrum.
 - Preparing a material: [Inputs from DFT](using/inputs-from-dft.md) states what `WFN.h5` must contain and which QE settings it needs.
 - Coming from BerkeleyGW: [For BerkeleyGW users](using/berkeleygw-users.md) maps `epsilon.inp`, `sigma.inp`, `kernel.inp` and `absorption.inp` keywords to LORRAX keys.
-- Looking up a deck key: the Input keywords page of each driver. Environment variables are on [Environment variables](using/environment.md).
+- Looking up an input key: the Input keywords page of each driver. Environment variables are on [Environment variables](using/environment.md).

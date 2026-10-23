@@ -18,7 +18,7 @@ page: deps
 
 #### Reads, produced by
 
-restart bundle `isdf_tensors_<N_mu>.h5`
+ISDF tensor file `isdf_tensors_<N_mu>.h5`
 :   gw (`write_restart_tensors = true`, the default), or downfold
 
 `WFN.h5`
@@ -62,7 +62,7 @@ The BSE is the end of the chain: no LORRAX driver reads its output. `bse.absorpt
 The driver writes no cache. It reuses the GW run's bundle and the runtime's compilation cache.
 
 !!! cache "isdf_tensors_&lt;N_mu&gt;.h5"
-    **Reused when** always: it is the GW restart bundle, read and never written.<br>
+    **Reused when** always: it is the ISDF tensor file from GW, read and never written.<br>
     **and matching** centroid hash, band window, $N_\mu$, parent rows and WFN record (table above).<br>
     <span class="refuse">Refuses on mismatch.</span>
 

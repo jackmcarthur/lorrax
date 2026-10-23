@@ -15,8 +15,8 @@ page: files
 | File | Deck key | Produced by | Note |
 |---|---|---|---|
 | deck | `-i` | user | Its directory is the run directory `<run>`. |
-| `WFN.h5` | `wfn_file` | QE + `pw2bgw`, or [nscf](../nscf/index.md) | BerkeleyGW format. Its content fingerprint is stamped into the restart bundle and `qp_wfn_rotations.h5`. |
-| `centroids_frac_<N>.txt` | `centroids_file` | [centroids](../../utilities/centroids.md) | $N_\mu$ rows. Its content hash is stamped into the restart bundle. |
+| `WFN.h5` | `wfn_file` | QE + `pw2bgw`, or [nscf](../nscf/index.md) | BerkeleyGW format. Its content fingerprint is stamped into the ISDF tensor file and `qp_wfn_rotations.h5`. |
+| `centroids_frac_<N>.txt` | `centroids_file` | [centroids](../../utilities/centroids.md) | $N_\mu$ rows. Its content hash is stamped into the ISDF tensor file. |
 | `centroids_frac_<N>_current.txt` | `centroids_file_current` | [centroids](../../utilities/centroids.md) | Bispinor runs only. |
 | `kin_ion.h5` | `kin_ion_file` | [kin-ion](../../utilities/kin-ion.md) | $\langle m\bk\vert T+V^{\mathrm{ion}}\vert n\bk\rangle$, no Hartree term. |
 | `dipole.h5` | none: fixed name in `<run>` | [dipole](../../utilities/dipole.md) | The $\bq\to0$ head, with `wcoul0_source = s_tensor` (the default); the full head (`head_correction = full`) reads it under either source. |
@@ -25,9 +25,9 @@ page: files
 | Hall pseudovector file | `static_gauge_hall_file` | [dipole](../../utilities/dipole.md) | Empty means $\sigma_H=0$. |
 | BerkeleyGW `vcoul` and its WFN | `bgw_vcoul_file`, `bgw_vcoul_sym_wfn` | BerkeleyGW | Only with `use_bgw_vcoul = true`. |
 | `qp_wfn_rotations.h5` | `sc_initial_qp_rotations_file` | an earlier GW run | Seeds a QSGW run. An `sc_checkpoint.h5` beside it continues the trajectory. |
-| `tmp/isdf_tensors_<N_mu>.h5` | `restart = true` | an earlier GW run | The [restart bundle](#restart). |
+| `tmp/isdf_tensors_<N_mu>.h5` | `restart = true` | an earlier GW run | The [ISDF tensor file](#restart). |
 | `tmp/zeta_q.h5` | none | an earlier GW run | Reused when its fit provenance matches ([Caches](dependencies.md#caches)). |
-| `tmp/v_q_bispinor.h5` | `restart = true`, bispinor | an earlier GW run | Must pair with the restart bundle. |
+| `tmp/v_q_bispinor.h5` | `restart = true`, bispinor | an earlier GW run | Must pair with the ISDF tensor file. |
 
 Relative paths in `wfn_file`, `centroids_file`, `centroids_file_current`, `kin_ion_file`, `bgw_vcoul_file`, `bgw_vcoul_sym_wfn`, `parallel_transport_file`, `static_gauge_hall_file`, `sigma_diag_file`, `eqp0_file`, `eqp1_file`, `report_file`, `sigma_omega_h5_file` and `sc_initial_qp_rotations_file` resolve against `<run>`. `sigma_freq_debug_file` and `sc_dump_dir` are used as given, so a relative value resolves against the launch directory.
 
@@ -59,7 +59,7 @@ Relative paths in `wfn_file`, `centroids_file`, `centroids_file_current`, `kin_i
 :   The orbitals rotated by $U$, with $E^{\mathrm{QP}}$ (`write_wfn_h5 = true`, the default).
 
 `tmp/isdf_tensors_<N_mu>.h5`
-:   The restart bundle: $V_\bq$, $W_0$, the head scalars and the parent wavefunction faces (`write_restart_tensors = true`, the default).
+:   The ISDF tensor file: $V_\bq$, $W_0$, the head scalars and the parent wavefunction faces (`write_restart_tensors = true`, the default).
 
 `tmp/zeta_q.h5`
 :   $\zeta_{\bq\mu}(\bG)$ with its fit provenance.
@@ -178,7 +178,7 @@ A provenance line, a title line, a `#` header naming the columns, then the `k-po
 
 The rank-0 run report (`report_file`): environment, sampling, band windows and ζ-fit legs, the treatment, per-stage progress and timings, warnings, the QP gaps, and on QSGW runs one row per map. No driver reads it.
 
-## Restart bundle {: #restart }
+## ISDF tensor file {: #restart }
 
 `tagged_arrays.write_restart_state_to_h5`
 {: .in-code }
@@ -358,7 +358,7 @@ A one-shot run writes it only when Σ's k set is the WFN's own: on a symmetry-re
 
 ## Bispinor files {: #bispinor }
 
-A bispinor run adds `tmp/zeta_q_mu1.h5`, `tmp/zeta_q_mu2.h5`, `tmp/zeta_q_mu3.h5` (the [zeta_q.h5](#zeta) tree, `density = current`, $N_T$ rows), the transverse entries of the [restart bundle](#restart), and `tmp/v_q_bispinor.h5`:
+A bispinor run adds `tmp/zeta_q_mu1.h5`, `tmp/zeta_q_mu2.h5`, `tmp/zeta_q_mu3.h5` (the [zeta_q.h5](#zeta) tree, `density = current`, $N_T$ rows), the transverse entries of the [ISDF tensor file](#restart), and `tmp/v_q_bispinor.h5`:
 
 ```tree
 tmp/v_q_bispinor.h5

@@ -10,7 +10,7 @@ page: overview
 
 <div class="chain-map" data-driver="exciton-bands" data-page="overview"></div>
 
-Computes the lowest exciton energies $\Omega_S(\bQ)$ at every point of a high-symmetry path of exciton momenta $\bQ$, from one GW restart bundle on a uniform $\bk$ grid. It runs after `gw.gw_jax` and is the finite-$\bQ$ sibling of the optical [`bse`](../bse/index.md) driver.
+Computes the lowest exciton energies $\Omega_S(\bQ)$ at every point of a high-symmetry path of exciton momenta $\bQ$, from one GW ISDF tensor file on a uniform $\bk$ grid. It runs after `gw.gw_jax` and is the finite-$\bQ$ sibling of the optical [`bse`](../bse/index.md) driver.
 {: .lead }
 
 <div class="glance" markdown>
@@ -68,7 +68,7 @@ Exchange at $\bQ$
     sbatch exciton_bands_dev.sbatch   # gw_dev.sbatch with "-m bse.exciton_bands ..." on its exec line
     ```
 
-Run it in the GW run directory: the deck locates the one restart bundle beside it or in `tmp/`. The device mesh is the run's square startup mesh. The deck is the GW deck plus a `K_POINTS` block. A minimal production deck for a bulk crystal:
+Run it in the GW run directory: the deck locates the one ISDF tensor file beside it or in `tmp/`. The device mesh is the run's square startup mesh. The deck is the GW deck plus a `K_POINTS` block. A minimal production deck for a bulk crystal:
 
 ```ini
 [cohsex]

@@ -16,8 +16,8 @@ Relative `wfn_file` and `centroids_file` resolve against the deck's directory; p
 
 | File | Deck key | Produced by | Note |
 |---|---|---|---|
-| deck | `-i` | user | The GW deck. Its directory locates the restart bundle. |
-| `isdf_tensors_<N_mu>.h5` | — | gw | Restart bundle. Exactly one, beside the deck or in its `tmp/`. Every route; read, never written. |
+| deck | `-i` | user | The GW deck. Its directory locates the ISDF tensor file. |
+| `isdf_tensors_<N_mu>.h5` | — | gw | ISDF tensor file. Exactly one, beside the deck or in its `tmp/`. Every route; read, never written. |
 | `WFN.h5` | `wfn_file` | nscf, or DFT + pw2bgw | Occupied count, cell volume, bundle authentication; under `kgrid_fine`, the band interpolation. `WFN_qp.h5` from a QSGW run is accepted. |
 | `centroids_frac_<N>.txt` | `centroids_file` | centroids | Content hash authenticates the bundle; under `bse_k_grid`, the interpolation points. On a downfolded bundle, the parent table recorded in the bundle. |
 | `eqp1.dat` | `eqp_corrections` | gw | Eigensolve route and `bse.absorption_haydock`. Diagonal QP energies on the irreducible wedge, unfolded on load. Format: [GW files](../gw/files.md#eqp). |
@@ -82,7 +82,7 @@ standard output
 
 </div>
 
-Rank 0 writes `bse.out`, the eigenvalue files, `eigenvectors.h5` and the Haydock files. `eigenvectors.h5` goes to the working directory and is overwritten. The restart bundle is never modified, and no cache is written.
+Rank 0 writes `bse.out`, the eigenvalue files, `eigenvectors.h5` and the Haydock files. `eigenvectors.h5` goes to the working directory and is overwritten. The ISDF tensor file is never modified, and no cache is written.
 
 The eigenvalue files, `eigenvectors.h5` and the `absorption_haydock_b{1,2,3}_eh.dat` spectra are written in BerkeleyGW's formats, which the BerkeleyGW manual documents ([absorption outputs](https://manual.berkeleygw.org/4.0/absorption-overview/), [`eigenvectors.h5`](https://manual.berkeleygw.org/4.0/eigenvectors_h5_spec/)). The rest of this page describes the files that are specific to LORRAX.
 

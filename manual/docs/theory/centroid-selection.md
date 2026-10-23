@@ -168,7 +168,7 @@ The selector recovers the spatial Seitz operations $\{R|\boldsymbol\tau\}$ that 
 
 ### <span class="n">5.2</span> What the GW run checks {: #cs-closure-check }
 
-On load, the GW run measures whether each operation of the WFN's group permutes the points ([Symmetry](symmetry.md)). A set that is not closed runs, with a warning, on every k and q. Its restart bundle stores every q (4.15× larger on a small Si BSE test deck), and on the 960-point Si test set $\Sigma$ spreads across a k star by 16.9 meV, against 0.7 meV on a closed set.
+On load, the GW run measures whether each operation of the WFN's group permutes the points ([Symmetry](symmetry.md)). A set that is not closed runs, with a warning, on every k and q. Its ISDF tensor file stores every q (4.15× larger on a small Si BSE test deck), and on the 960-point Si test set $\Sigma$ spreads across a k star by 16.9 meV, against 0.7 meV on a closed set.
 
 ### <span class="n">5.3</span> Current-density points {: #cs-current }
 

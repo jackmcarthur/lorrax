@@ -64,7 +64,7 @@ $$
 V_\bq(\mu,\nu)=\sum_{|\bq+\bG|^2\le E_\mathrm{cut}}\zeta^*_{\bq\mu}(\bG)\,v(\bq+\bG)\,\zeta_{\bq\nu}(\bG),\qquad v(\bq+\bG)=\frac{8\pi}{|\bq+\bG|^2} \tag{1.3}
 $$
 
-$E_\mathrm{cut}$ is `bare_coulomb_cutoff` (default: the WFN `ecutwfc`). $v$ is truncated according to `sys_dim` and averaged over the mini Brillouin zone at every $\bq\neq0$ (`mc_average_vcoul_body`, default `true`). The $\bq+\bG=0$ term is omitted from this sum; it is the head of §[4.3](#qp-head). $V_\bq$ is written to the restart bundle `tmp/isdf_tensors_<N_mu>.h5`.
+$E_\mathrm{cut}$ is `bare_coulomb_cutoff` (default: the WFN `ecutwfc`). $v$ is truncated according to `sys_dim` and averaged over the mini Brillouin zone at every $\bq\neq0$ (`mc_average_vcoul_body`, default `true`). The $\bq+\bG=0$ term is omitted from this sum; it is the head of §[4.3](#qp-head). $V_\bq$ is written to the ISDF tensor file `tmp/isdf_tensors_<N_mu>.h5`.
 
 ## <span class="n">2</span> Screened interaction and the tangential model {: #screening }
 
@@ -131,7 +131,7 @@ $$
 W_\bq(\mu,\nu;z)=\big[I-V_\bq\,\chi^0_\bq(z)\big]^{-1}V_\bq,\qquad W^c_\bq(z)=W_\bq(z)-V_\bq \tag{2.4}
 $$
 
-One LU per $\bq$ and $z$. `linalg = local` (default) solves whole matrices per rank when they fit the device budget and otherwise falls back to the block-distributed solve that `linalg = distributed` always uses ([Parallel algorithms §5.1](../../theory/parallel-algorithms.md#par-dense-dyson)). The static $W_\bq(0)$ is written to the restart bundle for the BSE.
+One LU per $\bq$ and $z$. `linalg = local` (default) solves whole matrices per rank when they fit the device budget and otherwise falls back to the block-distributed solve that `linalg = distributed` always uses ([Parallel algorithms §5.1](../../theory/parallel-algorithms.md#par-dense-dyson)). The static $W_\bq(0)$ is written to the ISDF tensor file for the BSE.
 
 Under `screening_diagrams = w_bse` or `w_rpa_resolvent`, $W$ comes instead from the resolvent identity $W_\bq(z)-V_\bq=V_\bq\chi_\bq(z)V_\bq$ with the particle–hole Hamiltonian $H^\mathrm{RPA}$ (bubbles only) or $H^\mathrm{BSE}$ (plus the statically screened ladder), solved by GMRES at each $z$. `w_bse` runs one-shot under COHSEX and GN-PPM (and [one other W model](../../theory/multipole-w.md#sigma)); `w_rpa_resolvent` under COHSEX and GN-PPM only ([`screening_diagrams`](keywords.md#screening_diagrams)).
 

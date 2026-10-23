@@ -278,7 +278,7 @@ The [selector](centroid-selection.md#cs-symmetry) closes its points under the at
 
 When the charge set, or on a bispinor run the current set, is not closed, the run warns with the file name and restricts its computational group to the identity. Every full-grid k is its own parent, realized from the WFN by Eq. (3.1), and every q is computed. The restricted group uses no antiunitary row but keeps the measured time-reversal verdict, because time reversal is a property of the Hamiltonian. File outputs still reduce through the WFN's own map.
 
-The unreduced run costs a larger restart bundle and a Σ that spreads across a k star ([Centroid selection §5.2](centroid-selection.md#cs-closure-check)). Regenerate the set with the default, symmetric selection of the [centroids utility](../utilities/centroids.md#-no-symmetries) to restore the reduction.
+The unreduced run costs a larger ISDF tensor file and a Σ that spreads across a k star ([Centroid selection §5.2](centroid-selection.md#cs-closure-check)). Regenerate the set with the default, symmetric selection of the [centroids utility](../utilities/centroids.md#-no-symmetries) to restore the reduction.
 
 !!! refuses
     - `screening_diagrams = w_bse` or `w_rpa_resolvent` with a set that is not closed (`GATE resolvent_ladder_trivial_view`). The resolvent ladder solves on the reduced q wedge. Regenerate the set, or use `w_rpa`.
@@ -334,7 +334,7 @@ No key switches symmetry off. To run without it, write the WFN without it: [`nos
 | [`centroids_file`](../drivers/gw/keywords.md#centroids_file) | Its closure decides between the reduced and the unreduced run (§5). |
 | [`centroids_file_current`](../drivers/gw/keywords.md#centroids_file_current) | The bispinor current set; its closure enters the same decision. |
 | [`--no-symmetries`](../utilities/centroids.md#-no-symmetries) | Centroid selection without the crystal's symmetries; symmetric selection is the default. |
-| [`restart_q_storage`](../drivers/gw/keywords.md#restart_q_storage) | q set of the restart bundle. |
+| [`restart_q_storage`](../drivers/gw/keywords.md#restart_q_storage) | q set of the ISDF tensor file. |
 | [`qp_rotations_k_storage`](../drivers/gw/keywords.md#qp_rotations_k_storage) | k set of `qp_wfn_rotations.h5`. |
 | [`sc_on_ibz`](../drivers/gw/keywords.md#sc_on_ibz) | QSGW tables on the star wedge. |
 | [`bgw_vcoul_sym_wfn`](../drivers/gw/keywords.md#bgw_vcoul_sym_wfn) | Supplies the group that folds q onto BerkeleyGW's list for a WFN without symmetry; comparison runs only. |
