@@ -43,6 +43,7 @@ class Term:
     grid: Optional[Callable[[int], float]] = field(default=None, compare=False)
 
     def at(self, ranks: int) -> float:
+        """Bytes per rank on a mesh of ``ranks`` devices (``ranks < 1`` is taken as 1)."""
         p = max(1, int(ranks))
         return self.fixed + self.spread / p + (float(self.grid(p)) if self.grid else 0.0)
 
@@ -66,15 +67,19 @@ class Price:
     whole: int = 0
 
     def terms(self, ranks: Optional[int] = None) -> dict:
+        """``{term: bytes per rank}`` for each of :data:`TERMS` at ``ranks`` (default ``self.ranks``)."""
         return {n: getattr(self, n).at(self.ranks if ranks is None else ranks) for n in TERMS}
 
     def bytes(self, ranks: Optional[int] = None) -> float:
+        """The total per-rank bytes at ``ranks`` (default ``self.ranks``): the sum of :meth:`terms`."""
         return float(sum(self.terms(ranks).values()))
 
     def unsourced(self) -> list:
+        """Names of the nonzero terms that carry no provenance (a finding under STRICT)."""
         return [n for n, v in self.terms().items() if v and not getattr(self, n).source]
 
     def describe(self, ranks: Optional[int] = None) -> str:
+        """One line, ``"operands 1.20 GB, xla 0.40 GB, ..."``, for receipts and banners."""
         return ", ".join(f"{n} {_gb(v)}" for n, v in self.terms(ranks).items())
 
     def __add__(self, o: "Price") -> "Price":
@@ -619,6 +624,8 @@ def record_route(site, route, reason, *, warning=None) -> None:
 
 
 def routes() -> list:
+    """Every route decision recorded this run (:func:`record_route`, :func:`admit`), as dicts
+    ``site, route, reason, warning, line, count``, in first-decision order."""
     return [dict(row) for row in _ROUTES.values()]
 
 

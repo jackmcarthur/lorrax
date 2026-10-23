@@ -45,6 +45,33 @@ def _screened_sums(rq, S, extra, live):
 
 
 class Bulk3D:
+    """Untruncated 3D Coulomb kernel, ``sys_dim = 3`` (the default).
+
+    ``v(q+G) = 8π / |q+G|² / Ω`` in Ry, zero at ``q+G = 0`` (the head is a
+    separate term).  ``K = q+G`` is Cartesian in 1/bohr, built as
+    ``bvec.T @ (q + G)`` from crystal components and the
+    :class:`~vcoul.geometry.CoulombGeometry` rows.
+
+    Methods
+    -------
+    v_qG(geometry, qvec_wrapped, comps_qG)
+        One q through :func:`~vcoul.base.v_qG_table`; complex128 ``(nG,)``.
+    q0_average(geometry, kgrid, *, S_cart=None, epshead=None,
+               static_kappa2=None, nsamples=2**18, method='sobol',
+               qmc_reps=10, analytic_sphere=False, extra_chi=None)
+        ``(⟨v⟩, ⟨v/(1 − v qᵀSq)⟩)`` over the Γ mini-BZ Voronoi cell, both
+        complex128 scalars in BARE units (Ry·bohr³, no 1/Ω).  The screened
+        average uses exactly one of ``S_cart`` ``(3,3)`` (Cartesian
+        long-wavelength polarizability, optionally plus ``extra_chi(q)``),
+        ``static_kappa2`` (Thomas–Fermi ``⟨8π/(q²+κ²)⟩``), or the legacy
+        isotropic ``epshead`` model.  Scrambled-Sobol draw; ``analytic_sphere``
+        adds the Baldereschi–Tosatti sphere and widens the Voronoi fold.
+    q0_average_screened(geometry, kgrid, *, S_carts, extra_chi_rows=None, ...)
+        The screened average for a stack of ``S`` rows on one shared draw.
+    q0_average_transverse_tensor(geometry, kgrid, ...)
+        The bare transverse (Coulomb-gauge) head tensor at Γ.
+    """
+
     sys_dim = SysDim.BULK_3D
 
     def _v_bare_per_q(self, qf, gvec_q, *, bvec_f, fact,

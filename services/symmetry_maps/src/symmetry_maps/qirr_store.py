@@ -480,6 +480,7 @@ class QirrDest:
 
 
 def qirr_attr_str(node, key):
+    """HDF5 attribute ``key`` of ``node`` as ``str`` (bytes decoded as UTF-8), or ``None`` if absent."""
     if key not in node.attrs:
         return None
     v = node.attrs[key]

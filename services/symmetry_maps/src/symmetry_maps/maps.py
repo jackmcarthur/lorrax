@@ -360,7 +360,40 @@ def unfold_isdf_operator(
     axis_local_sym_perm=None,
     right_axis_local_sym_perm=None,
 ):
-    """Expand ``V_q_ibz`` over the IBZ to the full BZ; see docs/architecture/symmetry_register.md."""
+    """Expand ``V_q_ibz`` over the IBZ to the full BZ; see docs/architecture/symmetry_register.md.
+
+    For full-grid row ``q`` with parent ``p = irr_idx[q]`` and operation
+    ``s = sym_idx[q]``::
+
+        V[q, μ, ν] = C_s[ exp(2πi q_p·(L[s,μ] − L[s,ν])) V_ibz[p, α_s(μ), α_s(ν)] ]
+
+    with ``α_s = sym_perm[s]`` and ``C_s`` the identity on rows
+    ``s < n_sym_spatial``.  On antiunitary rows ``C_s`` conjugates
+    (``trs_rule='conj'``, a static Hermitian operator) or takes the
+    transposed partner (``'pair_transpose'``, an operator at a fixed
+    complex time or frequency; ``trs_pair_q_ibz`` supplies it for a
+    rectangular operator).
+
+    Parameters
+    ----------
+    V_q_ibz : (n_q_ibz, n_left, n_right) jax.Array at ``P(None, 'x', 'y')``.
+    irr_idx, sym_idx : (n_q_full,) int, host.
+    sym_perm : (n_rows, n_left) int source map; ``L_table`` :
+        (n_rows, n_left, 3) lattice wraps, both from
+        ``centroid_source_map_and_wrap(..., extend_trs=True)``.
+    q_irr_frac : (n_q_ibz, 3) float, crystal coordinates.
+    mesh_xy : the 2-D ``('x', 'y')`` mesh.
+    n_sym_spatial : int, the spatial row count.
+    right_sym_perm, right_L_table : the right endpoint's tables when it is a
+        different centroid family (both or neither).
+    left_logical_extent, right_logical_extent : physical extents inside a
+        padded centroid axis; the source maps must preserve the split.
+    axis_local_sym_perm, right_axis_local_sym_perm : shard-local source
+        maps for orbit-packed endpoints (no ``all_to_all``).
+
+    Returns ``(n_q_full, n_left, n_right)`` at ``P(None, 'x', 'y')``.  Every
+    table or shape mismatch raises ``ValueError`` before tracing.
+    """
     # Trivial-IBZ short-circuit. When ntran=1 (e.g. nosym runs) the IBZ is
     # already the full BZ — irr_idx is identity, sym_idx is all zeros,
     # sym_perm is identity. The take_along_axis path below is then a
@@ -1900,9 +1933,17 @@ def mix_lorentz_blocks(blocks, *, sym, sym_idx, mesh_xy, keys=None):
 _I_SIGMA_Y = np.array([[0.0, 1.0], [-1.0, 0.0]], dtype=np.complex128)
 
 
-def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran, *,
+def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_sym_spatial, *,
                                 nspinor=2, R_cart=None):
-    """Return the scalar, Pauli or parity-graded Dirac action, with iσy K on TR rows."""
+    """Return the scalar, Pauli or parity-graded Dirac action, with iσy K on TR rows.
+
+    ``U_spinor_spatial`` is ``(n_sym_spatial, 2, 2)`` SU(2) (``SymMaps.U_spinor``);
+    ``sym_idx`` is a scalar or ``(n,)`` row index into the TRS-augmented table
+    (rows ``>= n_sym_spatial`` are antiunitary and return ``iσ_y·conj(U)``).
+    Returns ``(nspinor, nspinor)`` complex128 for a scalar row, else
+    ``(n, nspinor, nspinor)``: the 1×1 identity for ``nspinor = 1``, ``U`` for
+    2, and ``diag(U, det(R)·U)`` for 4, which needs ``R_cart``.
+    """
     nspinor = int(nspinor)
     if nspinor not in (1, 2, 4):
         raise ValueError(
@@ -1913,10 +1954,10 @@ def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran, *,
     if nspinor == 1:
         out = np.ones((idx1.size, 1, 1), dtype=np.complex128)
         return out[0] if scalar else out
-    spatial = idx1 % (n_tran if n_tran else 1)
+    spatial = idx1 % (n_sym_spatial if n_sym_spatial else 1)
     U_sp = np.asarray(U_spinor_spatial)[spatial]
     U_trs = np.einsum('ij,kjl->kil', _I_SIGMA_Y, np.conj(U_sp))
-    out = np.where((idx1 >= n_tran)[:, None, None], U_trs, U_sp)
+    out = np.where((idx1 >= n_sym_spatial)[:, None, None], U_trs, U_sp)
     if nspinor == 4:
         if R_cart is None:
             raise ValueError("spinor_rotation_for_sym_row: nspinor=4 requires R_cart for spatial parity.")
@@ -2155,6 +2196,57 @@ def _unwrapped_grid_q_tables(coords, grid, *, include_ids=True):
 
 
 class SymMaps:
+    """IBZ ⇄ full-BZ tables and typed symmetry operations of one WFN.
+
+    ``SymMaps(wfn)`` takes a ``WfnLoader`` (or any object with the same
+    ``mf_header`` attributes and an explicit boolean ``trs_holds``; a missing
+    verdict raises ``GATE SymMaps_needs_measured_trs``).  ``wfn.symmetry()``
+    returns the loader's cached instance.  All tables are host numpy.
+
+    Operation rows.  Rows ``0 … n_t − 1`` are the WFN's spatial operations
+    (``n_t = len(sym_matrices)``); rows ``n_t … 2n_t − 1`` are the same
+    operations composed with time reversal.  ``n_sym_spatial = n_t`` in the
+    free functions of this package.
+
+    Attributes
+    ----------
+    trs_allowed : bool
+        The measured time-reversal verdict (``wfn.trs_holds``).
+    sym_matrices : (n_t, 3, 3) int
+        BGW ``mtrx``, crystal coordinates, acting on real-space fractions.
+    translations : (n_t, 3) float
+        BGW ``tnp`` = 2π·τ (τ in lattice fractions).
+    sym_mats_k : (2 n_t, 3, 3) int
+        Reciprocal action ``mtrx.T`` followed by ``-mtrx.T`` (TR rows).
+    R_cart : (2 n_t, 3, 3) float
+        Cartesian rotations, same row convention.
+    U_spinor : (n_t, 2, 2) complex
+        SU(2) images of the proper rotations.
+    unfolded_kpts : (nk_tot, 3) float
+        Full-grid k in crystal coordinates.
+    irr_idx_k, sym_idx_k : (nk_tot,) int
+        Parent WFN row and operation row of every full-grid k.
+    kirr_fullids : (nk_red,) int
+        Full-grid row of every WFN row.
+    nk_tot, nk_red : int
+        Full-grid and WFN k counts.
+    kvecs_asints : (nk_tot, 3) int
+        Full-grid k as integers on ``kgrid``.
+    irr_idx_q, sym_idx_q : (nq,) int
+        Irreducible-q parent and operation row of every full-grid q.
+    q_irr_full_idx : (nq_irr,) int
+        Full-grid row of every irreducible q.
+    q_irr_kgrid_int : (nq_irr, 3) int
+        Irreducible q on ``kgrid`` (``bgw_integer_q_to_fractional`` gives
+        the fractional form ``unfold_isdf_operator`` takes).
+    active_symmetry_rows : (n,) int
+        Rows this instance may select (antiunitary rows only when allowed).
+
+    Methods ``operation_rows``, ``cartesian_action``, ``lorentz_action``,
+    ``spinor_action``, ``reciprocal_phase``, ``fft_grid_pullback`` and
+    ``unfold_wavefunction`` apply one or more rows through this table.
+    """
+
     @cached_property
     def kq_map(self):
         """Full-k by reduced-q lookup, constructed at its first consumer.

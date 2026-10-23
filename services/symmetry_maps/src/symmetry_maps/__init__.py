@@ -365,7 +365,7 @@ __all__ = [
     "unfold_psi", "spinor_rotation_for_sym_row", "apply_spinor_rotation",
     "tau_phase_row", "tau_phase_row_jax", "unfold_reciprocal_carriers",
     # real-space orbits
-    "real_space_action_tables", "orbit_images", "canonicalize_orbit",
+    "real_space_action_tables", "lattice_grid_point_group", "orbit_images", "canonicalize_orbit",
     "unfold_orbit_unique_with_id", "centroid_source_map_and_wrap",
     "permutation_orbit_labels",
     "fft_grid_pullback_perm", "grid_point_image_perm",

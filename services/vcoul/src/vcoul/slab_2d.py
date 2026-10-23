@@ -89,6 +89,32 @@ def _announce_q0_rule(line: str, *, warn: bool = False) -> None:
 
 
 class Slab2D:
+    """Ismail-Beigi slab-truncated Coulomb kernel, ``sys_dim = 2``.
+
+    ``v(q+G) = 8π/|K|² · [1 − e^{−z_c|K_∥|} cos(K_z z_c)] / Ω`` in Ry with
+    ``K = q+G`` Cartesian (1/bohr) and ``z_c = π / b3_z``
+    (:meth:`truncation_half_height`); zero at ``K = 0``.  Requires ``b1, b2``
+    in the Cartesian xy plane and ``b3`` along +z; anything else refuses.
+
+    Methods
+    -------
+    v_qG(geometry, qvec_wrapped, comps_qG)
+        One q through :func:`~vcoul.base.v_qG_table`; complex128 ``(nG,)``.
+    q0_average(geometry, kgrid, *, S_cart=None, epshead=None,
+               rule=Q0_RULE_EXACT, certificate_fn=None, ...)
+        ``(⟨v⟩, ⟨v/(1 − v qᵀSq)⟩)`` over the Γ mini-BZ cell in BARE units
+        (Ry·bohr³), evaluated on the exact Wigner–Seitz polygon cubature
+        (:func:`~vcoul.minibz.slab_minibz_photon_cubature`).  ``rule`` is
+        ``Q0_RULE_EXACT`` or the debug ``Q0_RULE_SOBOL_DEBUG``;
+        ``certificate_fn`` receives the :class:`SlabQ0Certificate`.
+        ``analytic_sphere=True`` and ``static_kappa2`` refuse.
+    q0_average_transverse_tensor(geometry, kgrid)
+        The bare transverse head tensor on the same receipt.
+    v_head_minibz_avg(geometry, kgrid, shift_frac, ...)
+        Mini-BZ average of the (optionally Gaussian-filtered) slab kernel
+        around a finite shift.
+    """
+
     sys_dim = SysDim.SLAB_2D
 
     @staticmethod

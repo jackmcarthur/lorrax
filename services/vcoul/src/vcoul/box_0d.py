@@ -21,6 +21,17 @@ __all__ = ["Box0D"]
 
 
 class Box0D:
+    """Wigner–Seitz cell-box truncated Coulomb kernel, ``sys_dim = 0``.
+
+    ``v(G)`` comes from a real-space FFT of the WS-truncated ``1/r``
+    (:func:`~vcoul.box_fft.compute_vcoul_box`, BerkeleyGW
+    ``trunc_cell_box.f90``), times ``1/Ω``, in Ry.  Γ-only: a request at
+    ``q ≠ 0`` raises ``NotImplementedError``.  Needs ``geometry.bdot`` and
+    ``geometry.fft_grid``.  ``v(G=0)`` is finite and is not zeroed;
+    :meth:`q0_average` returns it as both members of the ``(vc0, wcoul0)``
+    pair.
+    """
+
     sys_dim = SysDim.BOX_0D
 
     def _v_bare_per_q(self, qf, gvec_q, *, bvec_f, fact,
