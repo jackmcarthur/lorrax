@@ -1,11 +1,11 @@
 # Physics overview
 
-`LORRAX` The physics of the package: the chain from mean field to GW to BSE, the approximations made at each step, and the two ideas that set the scaling.
+`LORRAX` The physics of the package: the workflow from mean field to GW to BSE, the approximations made at each step, and the two ideas that set the scaling.
 {: .page-summary }
 
 <div class="section-cards"></div>
 
-## <span class="n">1</span> The chain {: #chain }
+## <span class="n">1</span> The workflow {: #chain }
 
 LORRAX starts from a plane-wave mean-field calculation, computes GW quasiparticles on top of it, and solves the Bethe–Salpeter equation on top of those.
 {: .intro }
@@ -179,11 +179,11 @@ Objects sampled at the interpolation points carry $(\br_\mu,\br_\nu)$: $\psi_{n\
 
 ### <span class="n">5.3</span> Transforms, units and dropped factors {: #cv-units }
 
-Reciprocal to real space ($\bk\to\bR$, $\bq\to\bR$, $\bG\to\br$) is an IFFT; real to reciprocal is an FFT. This page drops the $1/N_k$ on $\bk$ and $\bq$ sums and the spin factor 2 in $\chi^0$ from its displayed equations; the theory pages that state a normalization keep $1/N_k$ ([Frequency treatments (1.1)](frequency-treatments.md#frame-time)). The code works in Rydberg; deck keys name their unit (`_ev`, `_ry`), and `eqp0.dat`, `eqp1.dat` and the logs are in eV. The interpolation grids of band interpolation are $\bk_{\mathrm{co}}$ and $\bk_{\mathrm{fi}}$.
+Reciprocal to real space ($\bk\to\bR$, $\bq\to\bR$, $\bG\to\br$) is an IFFT; real to reciprocal is an FFT. This page drops the $1/N_k$ on $\bk$ and $\bq$ sums and the spin factor 2 in $\chi^0$ from its displayed equations; the theory pages that state a normalization keep $1/N_k$ ([Frequency treatments (1.1)](frequency-treatments.md#frame-time)). The code works in Rydberg; input keys name their unit (`_ev`, `_ry`), and `eqp0.dat`, `eqp1.dat` and the logs are in eV. The interpolation grids of band interpolation are $\bk_{\mathrm{co}}$ and $\bk_{\mathrm{fi}}$.
 
 ## <span class="n">6</span> Where each piece is documented {: #map }
 
-Each fact has one home page. The table follows the chain.
+Each fact has one home page. The table follows the workflow.
 {: .intro }
 
 ### <span class="n">6.1</span> Page map {: #map-table }

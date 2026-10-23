@@ -12,7 +12,7 @@
 
 ## <span class="n">1</span> What is truncated {: #truncation }
 
-The band sum in the Green's function of $\Sigma^c$ converges slowly with the number of empty bands. LORRAX corrects that one sum and leaves every other band count as the deck sets it.
+The band sum in the Green's function of $\Sigma^c$ converges slowly with the number of empty bands. LORRAX corrects that one sum and leaves every other band count as the input file sets it.
 {: .intro }
 
 ### <span class="n">1.1</span> The Green's-function band sum of Σᶜ {: #trunc-sum }

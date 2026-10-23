@@ -3,7 +3,7 @@
 `psp.get_dipole_mtxels` The velocity matrix $\langle m\bk|\hat v_a|n\bk\rangle$ and the Berry connection from parallel-transport links.
 {: .page-summary }
 
-<div class="chain-map" data-driver="dipole" data-page="files"></div>
+<div class="workflow-map" data-driver="dipole" data-page="files"></div>
 
 Dipole matrix elements fix the $\bq \to 0$ head of $W$, the one element of the screened interaction that a finite k grid cannot sample directly. This utility computes them from the commutator of the Hamiltonian with position, analytically and with the nonlocal pseudopotential included, so that the full anisotropic head tensor comes out right. BerkeleyGW instead evaluates the head at one small but finite $\bq$, a finite-difference approach that samples a single direction.
 {: .lead }
@@ -16,7 +16,7 @@ Invoke
 :   `python -m psp.get_dipole_mtxels -i gw.in`
 
 Reads
-:   deck (`-i`), `WFN.h5`, `*.upf`
+:   input file (`-i`), `WFN.h5`, `*.upf`
 
 Writes
 :   `dipole.h5`, `parallel_transport.h5`, `dipole.out`
@@ -56,7 +56,7 @@ The velocity is the $\bk$ derivative of the Bloch Hamiltonian: $2(\bk+\bG)_a$ fr
 The link stage overlaps the cell-periodic states at each $\bk$ with those at $\bk+\mathbf b$ for every step $\mathbf b$ of a Marzari–Vanderbilt shell, keeps the polar factor of each overlap as the link $L_{\mathbf b}(\bk)$, and differences the links into the Berry connection $A_\bk$. It then checks the links on the identity $v = D_\bk\,\mathrm{diag}(E)$ and stamps the relative error $\epsilon_{\mathrm{link}}$. The operator, its sign convention, the links, the stencil and the validation are derived on [Velocity operator](../theory/velocity-operator.md).
 
 !!! note
-    GW, the QSGW head and `bse.exciton_bands` open `dipole.h5` under that name in the deck directory; no deck key names it. `--out` is resolved against the working directory, so run the utility from the deck directory or keep the default name there.
+    GW, the QSGW head and `bse.exciton_bands` open `dipole.h5` under that name in the input file directory; no input key names it. `--out` is resolved against the working directory, so run the utility from the input file directory or keep the default name there.
 
 ## Running {: #run }
 
@@ -73,7 +73,7 @@ The link stage overlaps the cell-periodic states at each $\bk$ with those at $\b
     $LORRAX_PY -u -m psp.get_dipole_mtxels -i gw.in
     ```
 
-Use the GW deck itself, so that the band extent and spinor model agree with the run that reads the file. The deck lines it reads:
+Use the GW input file itself, so that the band extent and spinor model agree with the run that reads the file. The input file lines it reads:
 
 ```ini
 wfn_file           = WFN.h5
@@ -93,7 +93,7 @@ The flags decide which artifacts a run writes:
 
 ## Keywords {: #keywords }
 
-Defaults are read from the argument parser (`src/psp/get_dipole_mtxels.py`) and the keyword schema (`src/gw/gw_config.py`). Every physical setting comes from the GW deck. Unlike kin-ion, the file covers every band of the $\chi^0$ sum, because the head and the BSE need dipoles between all of them.
+Defaults are read from the argument parser (`src/psp/get_dipole_mtxels.py`) and the keyword schema (`src/gw/gw_config.py`). Every physical setting comes from the GW input file. Unlike kin-ion, the file covers every band of the $\chi^0$ sum, because the head and the BSE need dipoles between all of them.
 
 Required
 {: .kw-group }
@@ -101,11 +101,11 @@ Required
 **Command line**
 
 ### `-i`, `--input` {: .kw data-type="path" data-default="required" }
-The GW deck.
+The GW input file.
 
-**Deck keys**
+**Input keys**
 
-The deck passes through the GW reader, so an unknown key or a missing `sys_dim` refuses.
+The input file passes through the GW reader, so an unknown key or a missing `sys_dim` refuses.
 
 ### `sys_dim` {: .kw data-type="int" data-default="required" }
 `3` bulk, `2` slab, `0` molecule. Only validated here; the velocity carries no Coulomb truncation.
@@ -122,7 +122,7 @@ Number of protected conduction bands, the conduction bands whose quasiparticle e
 ### `number_bands_protected` {: .kw data-type="int" data-default="instead of nval, ncond" }
 Alternative request for the same window: every occupied band plus protected conduction bands up to this total.
 
-Resolved exactly as in GW and [kin-ion](kin-ion.md#number_bands_protected), giving `nval` = $n_\mathrm{occ}$ and `ncond` = total − $n_\mathrm{occ}$ protected conduction bands. The stamps record the resolved values, so a `dipole.h5` built from a GW deck authenticates against the run of that deck. Giving it beside `nval` or `ncond` refuses (`GATE band_request_forms`).
+Resolved exactly as in GW and [kin-ion](kin-ion.md#number_bands_protected), giving `nval` = $n_\mathrm{occ}$ and `ncond` = total − $n_\mathrm{occ}$ protected conduction bands. The stamps record the resolved values, so a `dipole.h5` built from a GW input file authenticates against the run of that input file. Giving it beside `nval` or `ncond` refuses (`GATE band_request_forms`).
 {: .kw-details }
 
 ### `number_bands` {: .kw data-type="int" data-default="required" }
@@ -142,10 +142,10 @@ Output file, relative to the working directory.
 ### `--report-file` {: .kw data-type="path" data-default="dipole.out" }
 Run report; by default `dipole.out` beside `--out`.
 
-### `--pseudo-dir`, `--pseudo_dir` {: .kw data-type="path" data-default="deck directory" }
+### `--pseudo-dir`, `--pseudo_dir` {: .kw data-type="path" data-default="input file directory" }
 Directory scanned for `*.upf`.
 
-Without the flag, `../qe/scf` and then `../qe/nscf`, relative to the deck, are tried when the deck directory holds none.
+Without the flag, `../qe/scf` and then `../qe/nscf`, relative to the input file, are tried when the input file directory holds none.
 {: .kw-details }
 
 ### `--skip-vnl` {: .kw data-type="flag" data-default="off" }
@@ -169,10 +169,10 @@ Relative tolerance of the link check $v = D_\bk\,\mathrm{diag}(E)$.
 Above it the run warns that the k grid is coarse for the links and writes the artifact anyway.
 {: .kw-details }
 
-**Deck keys**
+**Input keys**
 
 ### `wfn_file` {: .kw data-type="string" data-default="WFN.h5" }
-Wavefunction file, relative to the deck directory.
+Wavefunction file, relative to the input file directory.
 
 ### `bispinor` {: .kw data-type="bool" data-default="false" }
 Four-component run: the velocity is built on the kinetic-balance four-spinor of `WFN.h5`. Stamped (`prov_bispinor`).
@@ -247,7 +247,7 @@ dipole.h5
 - **GW direct and static heads**: refuse another velocity operator (`GATE static_head_dipole_operator`); another WFN, band window or k count only warns, unless `LORRAX_SANITY=strict`.
 - **`bse.bse_jax`, `bse.absorption_haydock`, `bse.exciton_bands`**: compare only `basis` against the WFN (`exciton_bands` also the k count); the WFN fingerprint is not read.
 
-The fix in every case is to rerun this utility with the run's deck.
+The fix in every case is to rerun this utility with the run's input file.
 
 ### parallel_transport.h5
 
@@ -315,10 +315,10 @@ The links are stored on the IBZ only when the steps are the three reduced axes a
 ## Refusals {: #refusals }
 
 !!! refuses
-    - A deck without `sys_dim`, or with an unknown key.
+    - An input file without `sys_dim`, or with an unknown key.
     - `number_bands_protected` beside `nval` or `ncond`, below the occupied-band count or above `number_bands` (`GATE band_request_forms`). 
     - `bispinor_gw = full_static_cohsex` without `bispinor = true`.
-    - No `*.upf` found, pseudopotentials that do not cover every species, or `sys_dim` other than `0`, `2` or `3`, unless `--skip-vnl`. Stage the files beside the deck or pass `--pseudo-dir`.
+    - No `*.upf` found, pseudopotentials that do not cover every species, or `sys_dim` other than `0`, `2` or `3`, unless `--skip-vnl`. Stage the files beside the input file or pass `--pseudo-dir`.
     - Fully relativistic pseudopotentials on a two-component WFN with no `<spinorbit>` record, or `<spinorbit>` true on a one-component WFN.
     - `--parallel-transport-out` equal to `--out`, or combined with `--skip-vnl`.
     - A negative validation tolerance.
@@ -330,7 +330,7 @@ The links are stored on the IBZ only when the steps are the three reduced axes a
 The utility can also add the velocity term of a DFT+U mean field, which this manual does not describe further. A `WFN.h5` whose Quantum ESPRESSO schema declares DFT+U refuses unless both keys below are set.
 
 ### `hubbard_input` {: .kw data-type="path" data-default="unset" }
-DFT+U mean field: the pw.x input with the `HUBBARD` card, relative to the deck. Adds $\partial_{k_a} V^{\mathrm U}$ to $\hat v$.
+DFT+U mean field: the pw.x input with the `HUBBARD` card, relative to the input file. Adds $\partial_{k_a} V^{\mathrm U}$ to $\hat v$.
 
 Required, with `hubbard_occupations`, when the QE schema that authenticates `WFN.h5` declares DFT+U, and refused otherwise. Noncollinear (`nspinor = 2`), `ortho-atomic` projector and norm-conserving pseudopotentials only.
 {: .kw-details }

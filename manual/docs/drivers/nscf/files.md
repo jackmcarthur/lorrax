@@ -8,13 +8,13 @@ page: files
 `psp.run_nscf` Formats of the files run_nscf reads and writes.
 {: .page-summary }
 
-<div class="chain-map" data-driver="nscf" data-page="files"></div>
+<div class="workflow-map" data-driver="nscf" data-page="files"></div>
 
 ## Inputs {: #inputs }
 
-| File | Deck key | Produced by | Note |
+| File | Input key | Produced by | Note |
 |---|---|---|---|
-| NSCF deck | `-i` | user | INI, one `[nscf]` section; paths relative to the deck. |
+| NSCF input file | `-i` | user | INI, one `[nscf]` section; paths relative to the input file. |
 | `<prefix>.save/data-file-schema.xml` | `save_dir` | QE `pw.x` SCF | Cell, atoms, symmetry, `ecutwfc`, `ecutrho`, FFT grid, `nelec`, `noncolin`, `lspinorb`, `assume_isolated`. |
 | `<prefix>.save/charge-density.hdf5` | `save_dir` | QE `pw.x` SCF, built with HDF5 | $\rho_{\mathrm{val}}(\bG)$: `rhotot_g` on `MillerIndices`. |
 | `*.upf`, else `*.UPF` | `--pseudo_dir` | pseudopotential library | The files the QE run used; QE copies them into the `.save`. Keyed by element. |

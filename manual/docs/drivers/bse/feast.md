@@ -8,7 +8,7 @@ page: theory
 `bse.bse_feast` The contour-projection eigensolver of `bse.bse_jax`, kept off the main BSE pages.
 {: .page-summary }
 
-This page is unlisted. It collects what the BSE pages used to say about the FEAST route, which the owner removed from the visible manual on 2026-10-21. Since 2026-10-21 the route runs only with `feast = true`; before that it was the command-line default. It is deprecated and experimental: a FEAST run logs one NOTE saying so and pointing to the Davidson eigensolve. It runs only with `full_bse = true`. With the TDA (the default) it refuses (`GATE feast_tda_complex`): the TDA contour takes $2\,\mathrm{Re}$ over the upper half-plane from real start vectors into real Ritz vectors, exact only for a real symmetric $A$, and LORRAX's $A$ is complex Hermitian (spinor or not), so it never converged. It prints Ritz values only and writes no file. It refuses unless every in-window Ritz pair has a residual below `feast_tol_mev` (`GATE feast_converged`). A FEAST key without `feast = true` refuses. The old flags `--feast-*` and `--gmres-*` are the deck keys of the same name in snake case.
+This page is unlisted. It collects what the BSE pages used to say about the FEAST route, which the owner removed from the visible manual on 2026-10-21. Since 2026-10-21 the route runs only with `feast = true`; before that it was the command-line default. It is deprecated and experimental: a FEAST run logs one NOTE saying so and pointing to the Davidson eigensolve. It runs only with `full_bse = true`. With the TDA (the default) it refuses (`GATE feast_tda_complex`): the TDA contour takes $2\,\mathrm{Re}$ over the upper half-plane from real start vectors into real Ritz vectors, exact only for a real symmetric $A$, and LORRAX's $A$ is complex Hermitian (spinor or not), so it never converged. It prints Ritz values only and writes no file. It refuses unless every in-window Ritz pair has a residual below `feast_tol_mev` (`GATE feast_converged`). A FEAST key without `feast = true` refuses. The old flags `--feast-*` and `--gmres-*` are the input keys of the same name in snake case.
 
 ## Overview {: #overview }
 
@@ -16,7 +16,7 @@ This page is unlisted. It collects what the BSE pages used to say about the FEAS
     A KPM density of states splits the spectrum into windows of equal state count; FEAST projects each window by shifted GMRES at contour nodes and prints Ritz values per window. Missing: eigenvector output, `eqp_corrections` (refused on this route), and user windows (`feast_window1/2` have no effect).
 
     ```bash
-    # deck keys in the -i deck: feast = true
+    # input keys in the -i input file: feast = true
     python -m bse.bse_jax -i gw.in
     ```
 
@@ -37,7 +37,7 @@ Subspace
 :   contour-filtered block, per window
 
 ```bash
-# deck keys in the -i deck: feast = true
+# input keys in the -i input file: feast = true
 python -m bse.bse_jax -i gw.in
 ```
 

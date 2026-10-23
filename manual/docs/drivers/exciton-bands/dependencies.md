@@ -8,9 +8,9 @@ page: deps
 `bse.exciton_bands` What exciton_bands needs and what reads its output.
 {: .page-summary }
 
-<div class="chain-map" data-driver="exciton-bands" data-page="deps"></div>
+<div class="workflow-map" data-driver="exciton-bands" data-page="deps"></div>
 
-## Position in the chain {: #chain }
+## Position in the workflow {: #chain }
 
 <div class="updown" markdown>
 
@@ -55,13 +55,13 @@ The H-transform is not a separate run. The driver builds the Galerkin basis and 
 
 | Input | Read when | Used for |
 |---|---|---|
-| deck with `K_POINTS` | always | path corners, H-transform window `nval`/`ncond`, `wfn_file`, `centroids_file` |
+| input file with `K_POINTS` | always | path corners, H-transform window `nval`/`ncond`, `wfn_file`, `centroids_file` |
 | `isdf_tensors_<N_mu>.h5` | always | $\psi_{n\bk}(\br_\mu)$ and $E_{n\bk}$ on the grid, $W_\bq(\mu,\nu;0)$, $V_{\bq=0}$ and the heads; the stored $V_\bq$ tiles on every route |
 | `WFN.h5` | always | the H-transform; under `refit` a second time, with `--refit-guard-bands` more bands, for the ζ′ pair densities |
 | centroid table | always | the points $\br_\mu$ at which $\psi_{c\,\bk+\bQ}$ is evaluated |
 | `zeta_q.h5` | `--vq-mode` `interp`, `both`, `refit` | `interp` and `both`: every stored ζ tile, full BZ; `refit`: metadata and `fit_provenance` only, so IBZ storage is enough |
 | `eqp1.dat` | `eqp_corrections` | QP energies on both legs ([Theory §2.3](theory.md#bands-qp)) |
-| `dipole.h5` | `--head-minibz-average` or `head_minibz_average`, on `interp` and `both` | the head tensor of [Theory §3.4](theory.md#ex-head); `dipole_file` names it, default beside the deck |
+| `dipole.h5` | `--head-minibz-average` or `head_minibz_average`, on `interp` and `both` | the head tensor of [Theory §3.4](theory.md#ex-head); `dipole_file` names it, default beside the input file |
 
 `ongrid` reads no ζ. File formats are on the [Files](files.md#inputs) page.
 
@@ -70,7 +70,7 @@ The H-transform is not a separate run. The driver builds the Galerkin basis and 
 The driver loads its $\bQ$-independent data through the optical BSE's own code, so these behave as the [`bse` Dependencies](../bse/dependencies.md) page describes:
 
 - restart discovery and its one-bundle refusal;
-- the loader: band window and degeneracy guard, ζ-training check, $\bq\to0$ head injection with the deck's `vhead` and `whead_0freq` overrides, and the rebuild of a missing static $W$ from the restart;
+- the loader: band window and degeneracy guard, ζ-training check, $\bq\to0$ head injection with the input file's `vhead` and `whead_0freq` overrides, and the rebuild of a missing static $W$ from the restart;
 - `kgrid_fine` densification with `w_head_densify` ([Theory §4.4](theory.md#w-fine));
 - the `eqp1.dat` reader and its re-slice of the window;
 - the `dipole.h5` reader and its basis check;

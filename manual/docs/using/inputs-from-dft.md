@@ -1,12 +1,12 @@
 # Inputs from DFT
 
-`WFN.h5` The Quantum ESPRESSO side of a LORRAX run: the decks, the export to BerkeleyGW's wavefunction format, the pseudopotentials, and what spinors and magnets need.
+`WFN.h5` The Quantum ESPRESSO side of a LORRAX run: the input files, the export to BerkeleyGW's wavefunction format, the pseudopotentials, and what spinors and magnets need.
 {: .page-summary }
 
 LORRAX does no self-consistent DFT. Every driver starts from a converged plane-wave Kohn–Sham solution in BerkeleyGW's `WFN.h5` format, and every other input is derived from that file by LORRAX's own [preprocessing steps](quickstart.md#preprocessing).
 {: .lead }
 
-## The chain {: #chain }
+## Workflow {: #chain }
 
 ```text
 QE scf ──▶ QE nscf (empty states, GW k-grid) ──▶ pw2bgw.x ──▶ wfn2hdf.x ──▶ WFN.h5
@@ -29,14 +29,14 @@ A run directory holds three things from the DFT side:
 
 A standard `pw.x` SCF on a converged k-grid with norm-conserving pseudopotentials. The production route is noncollinear with spin–orbit coupling (`noncolin = .true.`, `lspinorb = .true.`) and fully relativistic ONCV pseudopotentials; scalar runs (`nspinor = 1`) are also read. A collinear spin-polarized run (`nspin = 2`) refuses downstream; run a magnet noncollinear instead ([Magnets](#magnets)).
 
-A slab deck (`sys_dim = 2`) corresponds to an SCF with `assume_isolated = '2D'`. [`psp.run_dense_h`](../drivers/nscf/index.md#dense-h), which writes a complete-basis WFN, refuses a mismatch; the QE route checks nothing.
+A slab input file (`sys_dim = 2`) corresponds to an SCF with `assume_isolated = '2D'`. [`psp.run_dense_h`](../drivers/nscf/index.md#dense-h), which writes a complete-basis WFN, refuses a mismatch; the QE route checks nothing.
 
 ## 2. NSCF {: #nscf }
 
 The NSCF puts the occupied and empty bands on the GW k-grid. There are two routes.
 
 === "QE nscf"
-    The SCF deck with `calculation = 'nscf'`, `nbnd` set to the band count of [§6](#bands), a tight `conv_thr` (`1.0d-10`), and the unshifted GW grid:
+    The SCF input file with `calculation = 'nscf'`, `nbnd` set to the band count of [§6](#bands), a tight `conv_thr` (`1.0d-10`), and the unshifted GW grid:
 
     ```fortran
     &system
@@ -110,9 +110,9 @@ On Perlmutter neither tool is on `PATH` by default:
 
 ## 4. Pseudopotentials {: #pseudopotentials }
 
-Stage the pseudopotentials of the QE run beside the deck. `WFN.h5` holds the wavefunctions and band energies but not the Hamiltonian that produced them, and LORRAX computes its one-body parts itself: [`kin-ion`](../utilities/kin-ion.md) evaluates the kinetic energy and the ionic pseudopotential between the Kohn–Sham states, $\langle m\bk|T+V^{\mathrm{ion}}|n\bk\rangle$, the fixed part of the quasiparticle Hamiltonian; [`dipole`](../utilities/dipole.md) adds the nonlocal pseudopotential's part of the velocity operator; and the [`nscf`](../drivers/nscf/index.md) driver rebuilds the whole Kohn–Sham Hamiltonian. They must be the files QE used.
+Stage the pseudopotentials of the QE run beside the input file. `WFN.h5` holds the wavefunctions and band energies but not the Hamiltonian that produced them, and LORRAX computes its one-body parts itself: [`kin-ion`](../utilities/kin-ion.md) evaluates the kinetic energy and the ionic pseudopotential between the Kohn–Sham states, $\langle m\bk|T+V^{\mathrm{ion}}|n\bk\rangle$, the fixed part of the quasiparticle Hamiltonian; [`dipole`](../utilities/dipole.md) adds the nonlocal pseudopotential's part of the velocity operator; and the [`nscf`](../drivers/nscf/index.md) driver rebuilds the whole Kohn–Sham Hamiltonian. They must be the files QE used.
 
-`kin-ion` and `dipole` read every `*.upf` in the deck's directory (`*.UPF` only when no `*.upf` is present), then `../qe/scf` and `../qe/nscf`; `--pseudo_dir` names another directory. The `nscf` driver reads them from `save_dir`. Each file is matched to atoms by the element in its header and the atomic numbers `atyp` of `WFN.h5`.
+`kin-ion` and `dipole` read every `*.upf` in the input file's directory (`*.UPF` only when no `*.upf` is present), then `../qe/scf` and `../qe/nscf`; `--pseudo_dir` names another directory. The `nscf` driver reads them from `save_dir`. Each file is matched to atoms by the element in its header and the atomic numbers `atyp` of `WFN.h5`.
 
 The operators assume norm-conserving pseudopotentials: the overlap is the identity, and the nonlocal potential is $\sum_{ij}|\beta_i\rangle D_{ij}\langle\beta_j|$ from `PP_BETA` and `PP_DIJ`. Core corrections (`PP_NLCC`) are read. UPF version 2 files (root element `<UPF>`) are the format in use.
 
@@ -157,7 +157,7 @@ Keys and defaults: [gw keywords](../drivers/gw/keywords.md).
 
 ## 8. Symmetry record {: #schema }
 
-`WFN.h5` records the symmetry operations but not which of them are composed with time reversal, nor whether spin–orbit coupling was on in QE. LORRAX reads both from a QE `data-file-schema.xml` whose operations and k-points match the WFN. A nonmagnetic crystal without spin–orbit coupling runs correctly without one; a magnet, or a spinor run with fully relativistic pseudopotentials, needs it. Copy the NSCF `<prefix>.save/data-file-schema.xml` beside `WFN.h5`. LORRAX also searches the two directories above it, each directly and under `scf/`, `nscf/`, `qe/scf/` and `qe/nscf/`, for `data-file-schema.xml` and `*.save/data-file-schema.xml`; no deck key names the path. Without a matching schema the run prints `SYMMETRY PROVENANCE WARNING`.
+`WFN.h5` records the symmetry operations but not which of them are composed with time reversal, nor whether spin–orbit coupling was on in QE. LORRAX reads both from a QE `data-file-schema.xml` whose operations and k-points match the WFN. A nonmagnetic crystal without spin–orbit coupling runs correctly without one; a magnet, or a spinor run with fully relativistic pseudopotentials, needs it. Copy the NSCF `<prefix>.save/data-file-schema.xml` beside `WFN.h5`. LORRAX also searches the two directories above it, each directly and under `scf/`, `nscf/`, `qe/scf/` and `qe/nscf/`, for `data-file-schema.xml` and `*.save/data-file-schema.xml`; no input key names the path. Without a matching schema the run prints `SYMMETRY PROVENANCE WARNING`.
 
 ## Refusals {: #refusals }
 
@@ -165,7 +165,7 @@ Keys and defaults: [gw keywords](../drivers/gw/keywords.md).
     - `WfnLoader: real-flavor WFN unsupported`: `flavor = 1`. Rerun `pw2bgw.x` with `real_or_complex = 2`.
     - `WfnLoader: spin-polarized WFN unsupported`: `nspin = 2`. Run QE noncollinear.
     - A full-grid k-point that no permitted operation reaches from the stored ones. For a nonmagnetic WFN, stage the NSCF and SCF `.save` beside `WFN.h5`; for a magnet, stage the NSCF schema. With a schema bound, the list was reduced by an operation QE did not record: regenerate it with `K_POINTS automatic`.
-    - No pseudopotentials, or none for one of the atomic numbers in `atyp`. Stage the UPF files beside the deck or pass `--pseudo_dir`.
+    - No pseudopotentials, or none for one of the atomic numbers in `atyp`. Stage the UPF files beside the input file or pass `--pseudo_dir`.
     - `sys_dim` other than 0, 2 or 3.
     - Fully relativistic pseudopotentials on a spinor WFN with no QE `<spinorbit>` record. Stage `data-file-schema.xml` beside `WFN.h5`.
     - QE `<spinorbit>` true on a scalar WFN. Use a spinor WFN or scalar-relativistic pseudopotentials.

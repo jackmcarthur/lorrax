@@ -20,7 +20,7 @@
 `gw.gw_config._resolve_cd_inputs`
 {: .in-code }
 
-<span class="status in-progress">In progress</span> The route is used as a reference for the pole models and for comparisons with other codes. It needs four deck lines, because three of the defaults it cannot run with (`compute_mode = auto`, `head_correction = full`, `use_band_extrapolation = true`) are the parser's:
+<span class="status in-progress">In progress</span> The route is used as a reference for the pole models and for comparisons with other codes. It needs four input file lines, because three of the defaults it cannot run with (`compute_mode = auto`, `head_correction = full`, `use_band_extrapolation = true`) are the parser's:
 
 ```ini
 compute_mode                = mpa
@@ -141,7 +141,7 @@ $$
 K(d,\beta)=\int_0^\infty\frac{u\,du}{(u^2+d^2)(u^2+\beta^2)}=\frac{\ln(\beta^2/d^2)}{2(\beta^2-d^2)} \tag{3.4}
 $$
 
-with the branch at $x=0$ fixed to $x\to0^+$. $S_A(E)$ is the same model summed over the nodes of §3.1, each node weighted by $1/(u_i^2+\beta^2)$, and is subtracted. The β values are module constants hashed into the recipe, not deck keys.
+with the branch at $x=0$ fixed to $x\to0^+$. $S_A(E)$ is the same model summed over the nodes of §3.1, each node weighted by $1/(u_i^2+\beta^2)$, and is subtracted. The β values are module constants hashed into the recipe, not input keys.
 
 ## <span class="n">4</span> Real-axis residues {: #real }
 
@@ -239,7 +239,7 @@ $$
 so that rounding costs at most 1 % of the tolerance. The bank's own defaults are untouched.
 
 !!! note
-    On a metal, and on every knot window, the rules come from the bank's pencil, whose size grows like $(\Delta_{\max}-\Delta_{\min})/\eta$. On the ZnO 2503-band deck a knot window's pencil is 16 619 samples, about 44 GB of host memory, which is why the rules can be built ahead on a CPU node (§[5.5](#chi0-precompute)).
+    On a metal, and on every knot window, the rules come from the bank's pencil, whose size grows like $(\Delta_{\max}-\Delta_{\min})/\eta$. On the ZnO 2503-band input file a knot window's pencil is 16 619 samples, about 44 GB of host memory, which is why the rules can be built ahead on a CPU node (§[5.5](#chi0-precompute)).
 
 ### <span class="n">5.3</span> Band windows {: #chi0-bands }
 
@@ -251,7 +251,7 @@ On a wide insulator the whole-interval knot rules can fail the sampled-error tes
 | Band window | Occupied × empty bands | Rule |
 |---|---|---|
 | crossing | $[s,N_{\mathrm{occ}})\times[N_{\mathrm{occ}},c)$ | closed-form imaginary-time rule `minimax.response_imaginary_rule` on its own interval, halved where it fails |
-| remote valence | $[s,N_{\mathrm{occ}})\times[c,N_b)$ | Laplace rule on its own interval (even-only where refused on a time-reversal deck) |
+| remote valence | $[s,N_{\mathrm{occ}})\times[c,N_b)$ | Laplace rule on its own interval (even-only where refused on a time-reversal input file) |
 | remote semicore | $[0,s)\times[N_{\mathrm{occ}},N_b)$ | as remote valence |
 
 Every (occupied, empty) pair lies in exactly one window, so the windows' band weights partition $f(1-f)$ and their χ⁰ rows add to the whole window's. Every remote transition lies above $R+m$. A window whose points all have $\lvert\mathrm{Re}\,z\rvert<\Delta_{\min}$ (the imaginary chunks) keeps the whole-interval Laplace rule. Metals refuse `auto`.
@@ -274,7 +274,7 @@ the response bank's own pair equations. Imaginary nodes need only $W^c$; knots n
 `python -m gw.cd.chi0_rules`
 {: .in-code }
 
-A run with no `cd_chi0_rules_file` builds the rules in the job and writes `cd_chi0_rules.pkl` beside the deck. The run log prints the geometry arguments of the CLI on its `chi0 rule geometry` line, so the same rules can be built on a CPU node and given back with `cd_chi0_rules_file`:
+A run with no `cd_chi0_rules_file` builds the rules in the job and writes `cd_chi0_rules.pkl` beside the input file. The run log prints the geometry arguments of the CLI on its `chi0 rule geometry` line, so the same rules can be built on a CPU node and given back with `cd_chi0_rules_file`:
 
 ```bash
 python -m gw.cd.chi0_rules --wfn WFN.h5 --nocc N --nb-chi NB --b4-logical NB \
@@ -331,7 +331,7 @@ $$
 \partial_\omega\Sigma^c_{nn}(E)\simeq\frac{\Sigma^c_{nn}(E+\delta)-\Sigma^c_{nn}(E-\delta)}{2\delta},\qquad \delta=0.5\ \mathrm{eV} \tag{6.1}
 $$
 
-with the probes interpolated linearly between the request's frequencies and clamped to their range; the log counts the clamped states. This is BerkeleyGW's `finite_difference_spacing` rule, where the pole routes use the exact derivative of their quadrature. Under `sigma_omega_grid_debug` the body is evaluated on the deck's ω grid instead. The result then passes through the one finalize every treatment shares ([GW theory](../drivers/gw/theory.md)).
+with the probes interpolated linearly between the request's frequencies and clamped to their range; the log counts the clamped states. This is BerkeleyGW's `finite_difference_spacing` rule, where the pole routes use the exact derivative of their quadrature. Under `sigma_omega_grid_debug` the body is evaluated on the input file's ω grid instead. The result then passes through the one finalize every treatment shares ([GW theory](../drivers/gw/theory.md)).
 
 ## <span class="n">7</span> Broadening and regularization {: #broadening }
 
@@ -346,7 +346,7 @@ $\chi^0$ itself carries no broadening: it is evaluated at the complex points $z$
 
 `cd_checkpoint = write` rewrites `tmp/cd_checkpoint.h5` after every completed chunk: the six replicated accumulators, the axis, the chunk index and the stage seconds. Rank 0 writes its own replica with serial h5py and publishes it by `os.replace`, so a kill mid-write leaves the previous chunk's file. `resume` continues after the last completed chunk of an authenticated checkpoint and then writes as `write`; a resume is never inferred from a file's presence, and an absent or foreign file is named and the run starts at chunk 0.
 
-The identity holds the deck (comments, `cd_checkpoint` and `restart` dropped), the χ⁰ rule tolerance, capacity, node count and windows, the geometry, the ω grid hash, η, $h$, $J$, the node count and the chunk tiling, and a digest of the code that computes the accumulators. It does not hold the repository commit, which rides along as provenance, so a commit that changes only the assembly, the finalize or the output stage still resumes. On the real axis a resume re-runs only the χ⁰ calls that rebuild the ghost tail and reproduces the uninterrupted accumulators bit for bit on CPU.
+The identity holds the input file (comments, `cd_checkpoint` and `restart` dropped), the χ⁰ rule tolerance, capacity, node count and windows, the geometry, the ω grid hash, η, $h$, $J$, the node count and the chunk tiling, and a digest of the code that computes the accumulators. It does not hold the repository commit, which rides along as provenance, so a commit that changes only the assembly, the finalize or the output stage still resumes. On the real axis a resume re-runs only the χ⁰ calls that rebuild the ghost tail and reproduces the uninterrupted accumulators bit for bit on CPU.
 
 `LORRAX_CD_STOP_AFTER = "imag:N,real:M,real_from:K"` turns a run into a timing probe: it stops after the stated chunks, writes `cd_stop_receipt.json` and finalizes no Σ.
 
@@ -412,7 +412,7 @@ The keys below change what this page computes; full entries are on the [GW input
 
 ### <span class="n">10.2</span> Constants {: #keys-constants }
 
-No deck key reaches these; they are hashed into the checkpoint identity through the code digest.
+No input key reaches these; they are hashed into the checkpoint identity through the code digest.
 
 | Constant | Value | Role |
 |---|---|---|
@@ -438,7 +438,7 @@ No deck key reaches these; they are hashed into the checkpoint identity through 
 
 ### <span class="n">10.4</span> Outputs {: #keys-out }
 
-Beside the deck, written by rank 0:
+Beside the input file, written by rank 0:
 
 <div class="file-list" markdown>
 

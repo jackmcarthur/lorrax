@@ -151,7 +151,7 @@ The planner prints its choices as `ISDF μ-batch plan` in `gwjax.out`. Per rank,
 | projector all-to-all | $2\cdot16\,n_pn_s^2N_\mu N_{G\psi}/P$ bytes | summed over batches |
 | owner FFTs and k-convolutions | $O\big(N_\mu N_kn_s^2N_r(\log N_r+\log N_k)/P\big)$ | summed over batches |
 
-The batch takes every byte left after the resident terms; the parent chunk and the plane-group width take the fixed tile. No deck key sizes the fit. When even the smallest batch (one orbit per owner, one plane per group) does not fit, the fit warns `memory over budget at zeta mu-batch` and runs that configuration; $\psi(\bG)$ is not streamed.
+The batch takes every byte left after the resident terms; the parent chunk and the plane-group width take the fixed tile. No input key sizes the fit. When even the smallest batch (one orbit per owner, one plane per group) does not fit, the fit warns `memory over budget at zeta mu-batch` and runs that configuration; $\psi(\bG)$ is not streamed.
 
 ## <span class="n">4</span> Time nodes one at a time {: #par-time }
 

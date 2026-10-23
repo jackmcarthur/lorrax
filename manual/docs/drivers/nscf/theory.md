@@ -8,7 +8,7 @@ page: theory
 `psp.run_nscf` The equations each stage evaluates.
 {: .page-summary }
 
-<div class="chain-map" data-driver="nscf" data-page="theory" data-treatment="davidson"></div>
+<div class="workflow-map" data-driver="nscf" data-page="theory" data-treatment="davidson"></div>
 
 <div class="section-cards"></div>
 

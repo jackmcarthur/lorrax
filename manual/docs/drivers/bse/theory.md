@@ -8,13 +8,13 @@ page: theory
 `bse.bse_jax` The equations each stage of the BSE driver and `bse.absorption_haydock` evaluate.
 {: .page-summary }
 
-<div class="chain-map" data-driver="bse" data-page="theory"></div>
+<div class="workflow-map" data-driver="bse" data-page="theory"></div>
 
 <div class="section-cards"></div>
 
 ## <span class="n">1</span> Bands and interactions on the BSE grid {: #grid }
 
-Every BSE quantity is assembled from what the GW run left in the ISDF tensor file: band values at the ISDF points, the band energies, $V_\bq(\mu,\nu)$ and the static $W_\bq(\mu,\nu;0)$. When the deck sets `kgrid_fine`, bands and $W$ are first carried from the GW grid $\bk_{\mathrm{co}}$ to the finer BSE grid $\bk_{\mathrm{fi}}$; below, $\bk$ always denotes a point of the grid the BSE runs on.
+Every BSE quantity is assembled from what the GW run left in the ISDF tensor file: band values at the ISDF points, the band energies, $V_\bq(\mu,\nu)$ and the static $W_\bq(\mu,\nu;0)$. When the input file sets `kgrid_fine`, bands and $W$ are first carried from the GW grid $\bk_{\mathrm{co}}$ to the finer BSE grid $\bk_{\mathrm{fi}}$; below, $\bk$ always denotes a point of the grid the BSE runs on.
 {: .intro }
 
 ### <span class="n">1.1</span> The transition window {: #grid-window }
@@ -57,14 +57,14 @@ $$
 \big\{\psi_{n\bk_{\mathrm{co}}}(\br_\mu),\, E^{\mathrm{QP}}_{n\bk_{\mathrm{co}}}\big\} \;\longrightarrow\; \big\{\psi_{n\bk_{\mathrm{fi}}}(\br_\mu),\, E^{\mathrm{QP}}_{n\bk_{\mathrm{fi}}}\big\}, \qquad n \in [\,n_{\mathrm{occ}} - n_v,\; n_{\mathrm{occ}} + n_c\,) \tag{1.3}
 $$
 
-The method, its basis keys and its quality checks are on the [htransform](../../utilities/htransform.md#how) page. Each fine axis must be at least the coarse one; nesting is not required. The GW deck's `nval`, `ncond` and `number_bands` fix the interpolation window, and fewer than four conduction bands above the BSE window draw a warning.
+The method, its basis keys and its quality checks are on the [htransform](../../utilities/htransform.md#how) page. Each fine axis must be at least the coarse one; nesting is not required. The GW input file's `nval`, `ncond` and `number_bands` fix the interpolation window, and fewer than four conduction bands above the BSE window draw a warning.
 
 ### <span class="n">1.4</span> Static W, the q → 0 head and densification {: #grid-w }
 
 `bse_head._inject_q0_head` · `bse_densify.make_w_densifier`
 {: .in-code }
 
-$W_\bq(\mu,\nu;0)$ is the bundle's stored W0 (a Dyson $W(0)$, or $V + W^c(0)$ of a tangential model), or, without one, a static Dyson rebuild on every call. The $\bq \to 0$ head enters as a rank-one term on the $\bq = 0$ tiles, with $g_0(\mu) = \zeta_{\bq=0,\mu}(\bG = 0)$; deck `vhead` and `whead_0freq` override the bundle's values:
+$W_\bq(\mu,\nu;0)$ is the bundle's stored W0 (a Dyson $W(0)$, or $V + W^c(0)$ of a tangential model), or, without one, a static Dyson rebuild on every call. The $\bq \to 0$ head enters as a rank-one term on the $\bq = 0$ tiles, with $g_0(\mu) = \zeta_{\bq=0,\mu}(\bG = 0)$; input file `vhead` and `whead_0freq` override the bundle's values:
 
 $$
 V_{\bq=0}(\mu,\nu) \mathrel{+}= \frac{V^{\mathrm{head}}}{\Omega_{\mathrm{cell}}}\, g_0^*(\mu)\, g_0(\nu), \qquad
@@ -273,7 +273,7 @@ The tabs give each route's update or projection.
     :   Krylov, full reorthogonalization
 
     ```bash
-    # deck keys in the -i deck: solver = block_lanczos, number_eigenvalues = 10
+    # input keys in the -i input file: solver = block_lanczos, number_eigenvalues = 10
     python -m bse.bse_jax -i gw.in
     ```
 
@@ -292,7 +292,7 @@ The tabs give each route's update or projection.
     :   Krylov, capped and restarted
 
     ```bash
-    # deck keys in the -i deck: solver = trlan
+    # input keys in the -i input file: solver = trlan
     python -m bse.bse_jax -i gw.in
     ```
 

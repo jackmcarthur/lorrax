@@ -8,9 +8,9 @@ page: deps
 `gw.gw_jax` What gw_jax needs and what reads its output.
 {: .page-summary }
 
-<div class="chain-map" data-driver="gw" data-page="deps"></div>
+<div class="workflow-map" data-driver="gw" data-page="deps"></div>
 
-## Position in the chain {: #chain }
+## Position in the workflow {: #chain }
 
 <div class="updown" markdown>
 
@@ -90,7 +90,7 @@ File formats are on the [Files](files.md) page.
 
 ## Runtime {: #runtime }
 
-- `--help` and argument errors are answered first, by `runtime.cli_seam`, before any runtime starts. The deck's existence is checked only after.
+- `--help` and argument errors are answered first, by `runtime.cli_seam`, before any runtime starts. The input file's existence is checked only after.
 - One module-top call brings up the runtime: `runtime.initialize_communicator_stack` (64-bit JAX, the distributed runtime at more than one process, one GPU per process, the $(x, y)$ device mesh, the compilation cache).
 - The native FFI pair is required at every process count, and the parallel-HDF5 leg is initialized before the first file is read; see [Installation](../../using/installation.md#ffi) and [Startup refusals](../../using/installation.md#refusals).
 - Every large array is read and written per rank through SlabIO; no rank gathers $V_\bq$, $W$ or ζ.

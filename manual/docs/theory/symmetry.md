@@ -7,7 +7,7 @@
 
 ## <span class="n">1</span> Operations and wedges {: #sym-ops }
 
-LORRAX keeps wavefunctions only at the k rows stored in `WFN.h5`, the parents. Every full-grid object is obtained from a parent by one space-group operation, possibly composed with time reversal. No deck key turns symmetry on or off: a run uses the operations its `WFN.h5` stores.
+LORRAX keeps wavefunctions only at the k rows stored in `WFN.h5`, the parents. Every full-grid object is obtained from a parent by one space-group operation, possibly composed with time reversal. No input key turns symmetry on or off: a run uses the operations its `WFN.h5` stores.
 {: .intro }
 
 !!! note
@@ -250,7 +250,7 @@ $$
 On the diagonal the two differ by the sign of $\mathrm{Im}\,\Sigma$, so the dynamical $\Sigma^c$ written to the file wedge takes the transpose rule. A polar vector index such as the velocity transforms by the forward Cartesian rotation, with an extra $-1$ on antiunitary rows; an axial index by $\det(R)R$. Four-current indices transform by $\Lambda_s = \mathrm{diag}(1,R_s)$ on a unitary row and $\mathrm{diag}(1,-R_s)$ on an antiunitary one, after the scalar transport. A wrong conjugation leaves every Hermitian diagonal unchanged and shows only off the diagonal.
 
 !!! note
-    A band window whose edge splits a degenerate multiplet is not a representation of the little group, and Σ then differs across a star: about 2 meV on a Si COHSEX test deck, exactly 0 with a clean edge. The ζ-fit window ends at the [`number_bands`](../drivers/gw/keywords.md#number_bands) edge and refuses a split multiplet there; the band-sum check on the same edge only warns unless the edge is named by `number_bands_chi` or `number_bands_sigma` ([Band counts](../using/inputs-from-dft.md#bands)).
+    A band window whose edge splits a degenerate multiplet is not a representation of the little group, and Σ then differs across a star: about 2 meV on a Si COHSEX test input file, exactly 0 with a clean edge. The ζ-fit window ends at the [`number_bands`](../drivers/gw/keywords.md#number_bands) edge and refuses a split multiplet there; the band-sum check on the same edge only warns unless the edge is named by `number_bands_chi` or `number_bands_sigma` ([Band counts](../using/inputs-from-dft.md#bands)).
 
 ## <span class="n">5</span> Orbit-closed centroid sets {: #sym-closure }
 
@@ -294,7 +294,7 @@ Pad slots are fixed points of every $\alpha_s$, with zero wrap, and hold exact z
 
 ## <span class="n">6</span> Where symmetry is used {: #sym-use }
 
-Symmetry replaces per-k and per-q linear algebra and storage, never a lattice convolution. Which operations a run uses is fixed by `WFN.h5`; the deck keys only choose storage.
+Symmetry replaces per-k and per-q linear algebra and storage, never a lattice convolution. Which operations a run uses is fixed by `WFN.h5`; the input keys only choose storage.
 {: .intro }
 
 ### <span class="n">6.1</span> Work on the wedge {: #sym-work }

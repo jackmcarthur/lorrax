@@ -5,14 +5,14 @@ page: keywords
 
 # Input keywords
 
-`psp.run_nscf` Every deck key and command-line flag run_nscf reads, grouped by what it controls.
+`psp.run_nscf` Every input key and command-line flag run_nscf reads, grouped by what it controls.
 {: .page-summary }
 
-<div class="chain-map" data-driver="nscf" data-page="keywords"></div>
+<div class="workflow-map" data-driver="nscf" data-page="keywords"></div>
 
-The deck is an INI file with one `[nscf]` section, keys written `key = value`; paths resolve relative to the deck. Defaults are read from the keyword schema (`src/psp/nscf_input.py`) and the driver argparse (`src/psp/run_nscf.py`). A command-line flag of the same meaning overrides the deck value. Without `-i`, `--save` is required and the same defaults apply.
+The input file is an INI file with one `[nscf]` section, keys written `key = value`; paths resolve relative to the input file. Defaults are read from the keyword schema (`src/psp/nscf_input.py`) and the driver argparse (`src/psp/run_nscf.py`). A command-line flag of the same meaning overrides the input file value. Without `-i`, `--save` is required and the same defaults apply.
 
-Every Hamiltonian parameter not listed here comes from the QE `.save` and cannot be changed from the deck: the cutoffs `ecutwfc` and `ecutrho`, the FFT grid, the structure and symmetry, `nelec`, the spinor representation (`noncolin`, `lspinorb`) and `assume_isolated`.
+Every Hamiltonian parameter not listed here comes from the QE `.save` and cannot be changed from the input file: the cutoffs `ecutwfc` and `ecutrho`, the FFT grid, the structure and symmetry, `nelec`, the spinor representation (`noncolin`, `lspinorb`) and `assume_isolated`.
 
 Required
 {: .kw-group }
@@ -22,7 +22,7 @@ Required
 ### `save_dir` {: .kw data-type="path" data-default="required" }
 QE `<prefix>.save` directory: structure, symmetry, cutoffs, FFT grid and $\rho_{\mathrm{val}}$. QE `outdir`/`prefix`; CLI `--save`.
 
-Without a deck it is given as `--save`.
+Without an input file it is given as `--save`.
 {: .kw-details }
 
 **Bands**
@@ -47,7 +47,7 @@ Optional
 **Files**
 
 ### `-i` {: .kw data-type="path" data-default="—" }
-CLI only. The deck. Alias `--input`.
+CLI only. The input file. Alias `--input`.
 
 ### `output` {: .kw data-type="path" data-default="WFN.h5" }
 Output wavefunction file. pw2bgw `wfng_file`; CLI `-o`, `--output`.
@@ -121,7 +121,7 @@ Vary it to average the stochastic noise.
 ### `tol` {: .kw data-type="float" data-default="1e-8" }
 Davidson residual threshold, Ry. CLI `--tol`.
 
-Every band must satisfy $\|(H_\bk - E_n)x_n\| < \texttt{tol}\cdot\max(1,|E_n|)$; closer in role to QE `diago_thr_init` than to `conv_thr`. `--tol 0` falls back to the deck value.
+Every band must satisfy $\|(H_\bk - E_n)x_n\| < \texttt{tol}\cdot\max(1,|E_n|)$; closer in role to QE `diago_thr_init` than to `conv_thr`. `--tol 0` falls back to the input file value.
 {: .kw-details }
 
 These solver parameters are fixed in code:
@@ -155,7 +155,7 @@ Make `wfn_file` the deterministic-band input of pseudobands-only mode.
 Despite the name, the density always comes from the `.save`. It has an effect only with `--no-davidson`.
 {: .kw-details }
 
-### `wfn_file` {: .kw data-type="path" data-default="deck directory" }
+### `wfn_file` {: .kw data-type="path" data-default="input file directory" }
 Existing `WFN.h5` with deterministic bands, read when `rho_from_wfn = true`.
 
 It must hold more bands than occupied states and the same G spheres as this run.

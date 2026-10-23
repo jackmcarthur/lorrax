@@ -8,9 +8,9 @@ page: deps
 `bse.bse_jax` What the BSE driver needs and what reads its output.
 {: .page-summary }
 
-<div class="chain-map" data-driver="bse" data-page="deps"></div>
+<div class="workflow-map" data-driver="bse" data-page="deps"></div>
 
-## Position in the chain {: #chain }
+## Position in the workflow {: #chain }
 
 <div class="updown" markdown>
 
@@ -55,7 +55,7 @@ user
 
 </div>
 
-The BSE is the end of the chain: no LORRAX driver reads its output. `bse.absorption_haydock` reads the same inputs as `bse.bse_jax`, never `eigenvectors.h5`. The sum-over-states $\varepsilon_2$ from stored dipoles is `absorption_common.eps2_from_exciton_dipoles`, which has no command line. Under `kgrid_fine` the band interpolation of the [htransform](../../utilities/htransform.md#how) utility runs in-process; no htransform file is read. File formats are on the [Files](files.md) page.
+The BSE is the end of the workflow: no LORRAX driver reads its output. `bse.absorption_haydock` reads the same inputs as `bse.bse_jax`, never `eigenvectors.h5`. The sum-over-states $\varepsilon_2$ from stored dipoles is `absorption_common.eps2_from_exciton_dipoles`, which has no command line. Under `kgrid_fine` the band interpolation of the [htransform](../../utilities/htransform.md#how) utility runs in-process; no htransform file is read. File formats are on the [Files](files.md) page.
 
 ## Caches {: #caches }
 
@@ -69,7 +69,7 @@ The driver writes no cache. It reuses the GW run's bundle and the runtime's comp
 !!! cache "W0_qmunu (in the bundle)"
     **Reused when** `W0_ready` is true.<br>
     **and matching** the bundle's authentication; nothing else is compared.<br>
-    <span class="refuse">Rebuilt in memory on every call by a static Dyson solve from the deck's WFN, centroids, `zeta_q.h5` and head inputs; never written back. About twice the wall time.</span>
+    <span class="refuse">Rebuilt in memory on every call by a static Dyson solve from the input file's WFN, centroids, `zeta_q.h5` and head inputs; never written back. About twice the wall time.</span>
 
 !!! cache "JAX compilation cache"
     **Reused when** a program of the same shapes recurs (same mesh, window and k-grid).<br>

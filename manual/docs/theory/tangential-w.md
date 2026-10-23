@@ -471,9 +471,9 @@ where $\mathrm{Re}$ denotes the Hermitian part. The condition holds for the exac
 
 Under `qp_solver = self_consistent` each map rebuilds the samples, directions and poles from its own states, but two things are held so that successive maps stay comparable. The imaginary ladder's envelope only widens, and while it holds, the line sites stay unless the support rule would move one by more than $\max(3\ \mathrm{meV},\,0.1\times$ the last SC residual$)$. A larger move or a larger count re-plans the line and is logged as `line_site_replan`. The bank's time rule (§6.2) is reused while the new transition interval lies inside the old one, the occupation envelope is no wider, the material class is unchanged and the supports are identical. Otherwise it is rebuilt on an interval padded by 4 eV, and the log names the failed test (`Response rule rebuilt at a held map`). A map whose model fits in half the device budget keeps it on the devices and writes no `model.h5`, unless an export asks for one. The loop itself is on [Quasiparticle self-consistency](qsgw.md).
 
-## <span class="n">8</span> Reference: deck, keys and outputs {: #keys }
+## <span class="n">8</span> Reference: input file, keys and outputs {: #keys }
 
-The keys below change what this page computes, and full entries are on the [GW input keywords](../drivers/gw/keywords.md) page. Deck energies are in eV and everything is in Ry internally.
+The keys below change what this page computes, and full entries are on the [GW input keywords](../drivers/gw/keywords.md) page. Input file energies are in eV and everything is in Ry internally.
 {: .intro }
 
 ### <span class="n">8.1</span> Selecting the model {: #model-select }
@@ -481,13 +481,13 @@ The keys below change what this page computes, and full entries are on the [GW i
 `gw.tangential_screening.screen_tangential_poles`
 {: .in-code }
 
-Since 2026-10-22 the model is its own `compute_mode` value. The key that used to select it, `sigma_w_model = tangential` (`shared_pole` before 2026-10-21), is retired and refuses. `compute_mode = auto` never selects the model, so the production deck names it:
+Since 2026-10-22 the model is its own `compute_mode` value. The key that used to select it, `sigma_w_model = tangential` (`shared_pole` before 2026-10-21), is retired and refuses. `compute_mode = auto` never selects the model, so the production input file names it:
 
 ```ini
 compute_mode = tangential
 ```
 
-<span class="status production">Production</span> for insulators, metals and time-reversal-broken decks. The other treatments and the comparison table are on [Frequency treatments](frequency-treatments.md#compare).
+<span class="status production">Production</span> for insulators, metals and time-reversal-broken input files. The other treatments and the comparison table are on [Frequency treatments](frequency-treatments.md#compare).
 
 !!! refuses
     - The retired key `sigma_w_model`. Use `compute_mode = tangential`.
@@ -528,7 +528,7 @@ The synthesis of (6.1) with the weight $-1/\Omega_j$ in place of the time factor
 
 ### <span class="n">8.4</span> Recipe constants {: #keys-recipe }
 
-No deck key reaches the constants below. `sigma_w_accuracy` picks a column of the hashed recipe table `shared_real_pole_v1_r3b` (`RECIPE_VERSION = shared_real_pole_v1_r4`). The table hash enters the model identity, so a store built under another recipe refuses on restart.
+No input key reaches the constants below. `sigma_w_accuracy` picks a column of the hashed recipe table `shared_real_pole_v1_r3b` (`RECIPE_VERSION = shared_real_pole_v1_r4`). The table hash enters the model identity, so a store built under another recipe refuses on restart.
 
 | Constant | `production` | `relaxed` | Role |
 |---|---|---|---|

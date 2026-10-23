@@ -19,7 +19,7 @@ python -m gw.epsmat_cli -i epsmat.in
 ```ini
 [epsmat]
 source_restart    = ../gw          # the finished GW run directory
-parent_input_file = ../gw/gw.in    # the deck that produced it
+parent_input_file = ../gw/gw.in    # the input file that produced it
 output_dir        = eps
 ```
 
@@ -42,7 +42,7 @@ Every key, with its default, is listed by `python -m gw.epsmat_cli --print-schem
 ## BSE kernel {: #bsemat }
 
 ```
-# deck keys in the -i deck: number_val_bands_fine = 4, number_cond_bands_fine = 4
+# input keys in the -i input file: number_val_bands_fine = 4, number_cond_bands_fine = 4
 python -m bse.bsemat_cli -i ../gw/gw.in --wfn-co WFN_co.h5 -o bsemat.h5
 ```
 

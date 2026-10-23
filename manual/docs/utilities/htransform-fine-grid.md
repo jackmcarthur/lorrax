@@ -8,7 +8,7 @@ The BSE and exciton-bands drivers call the [H-transform](htransform.md) in memor
 
 ## Band window {: #window }
 
-The transformed Hamiltonian is built from every band from the lowest valence band up to the deck's band count, and the bands the BSE uses are returned from inside it. Inside the BSE drivers the H-transform adds no guard bands of its own, so the deck's band count must leave at least four bands above the highest conduction band the BSE uses. The exciton-bands route warns when there are fewer than four, or more than sixteen, since a very wide window asks the shared basis to represent states the kernel never uses. The method and the shared keys are on the [overview](htransform.md).
+The transformed Hamiltonian is built from every band from the lowest valence band up to the input file's band count, and the bands the BSE uses are returned from inside it. Inside the BSE drivers the H-transform adds no guard bands of its own, so the input file's band count must leave at least four bands above the highest conduction band the BSE uses. The exciton-bands route warns when there are fewer than four, or more than sixteen, since a very wide window asks the shared basis to represent states the kernel never uses. The method and the shared keys are on the [overview](htransform.md).
 
 ## Keywords {: #keywords }
 

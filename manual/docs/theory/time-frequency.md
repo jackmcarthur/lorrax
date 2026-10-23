@@ -341,7 +341,7 @@ The kernel $K_z(\Delta)=2\Delta/(z^2-\Delta^2)$ is $-2/\Delta$ at $z=0$. $1/\Del
 `gw.minimax_screening.build_imag_probe_response_rule`
 {: .in-code }
 
-The GN-PPM probe $z=i\omega_p$ takes positive times fixed by the interval alone, from elliptic decay rates, and the weights of $\Delta/(\Delta^2+\omega_p^2)$ by one linear projection. The residual is checked at every $\Delta$ of the interval at relative tolerance `minimax_target_error`, and the degree starts at $\lceil\ln(16R)\ln(1/\varepsilon_\chi)/\pi^2\rceil$ and rises until the check passes, at most 64. A time-reversal-broken deck projects the odd target on the same times. The far-from-resonance Σ windows use the same time placement (§[9.3](#box-sector)).
+The GN-PPM probe $z=i\omega_p$ takes positive times fixed by the interval alone, from elliptic decay rates, and the weights of $\Delta/(\Delta^2+\omega_p^2)$ by one linear projection. The residual is checked at every $\Delta$ of the interval at relative tolerance `minimax_target_error`, and the degree starts at $\lceil\ln(16R)\ln(1/\varepsilon_\chi)/\pi^2\rceil$ and rises until the check passes, at most 64. A time-reversal-broken input file projects the odd target on the same times. The far-from-resonance Σ windows use the same time placement (§[9.3](#box-sector)).
 
 !!! refuses
     - No certified probe rule through 64 nodes (`remote Ritz certificate failed through 64 nodes`). Narrow the band window or relax `minimax_target_error`.
@@ -358,7 +358,7 @@ $$
 \frac{\Delta}{\Delta^2-\omega_p^2}=\frac{1/2}{\omega_p+\Delta}-\frac{1/2}{\omega_p-\Delta},\qquad \omega_p>\Delta_{\max} \tag{7.1}
 $$
 
-each taking a static $1/y$ rule on its shifted interval, with the second entering at negated times. A real-axis sample carries only the even orientation, so HL-GPP refuses a time-reversal-broken deck ([Frequency treatments §4.4](frequency-treatments.md#ppm-odd)).
+each taking a static $1/y$ rule on its shifted interval, with the second entering at negated times. A real-axis sample carries only the even orientation, so HL-GPP refuses a time-reversal-broken input file ([Frequency treatments §4.4](frequency-treatments.md#ppm-odd)).
 
 !!! refuses
     - `ppm_omega_p` at or below $\Delta_{\max}$ (`GATE hl_ppm_probe_in_spectrum`).
@@ -413,7 +413,7 @@ A rule that breaks one of these constraints refuses the run in planning, before 
 `gw.qp_support.coarse_windows_plan`
 {: .in-code }
 
-The broadening sets the resolution a near-resonance window pays for. Occupied semicore states tens of eV below the read region would stretch the resonant windows down to them at the deck's $\eta$. On the tangential route (`compute_mode = tangential`) semicore states outside the requested set are read instead on coarse windows of their own, broadened by 5 eV, sampled every 2.5 eV and certified at $\max(\varepsilon_\Sigma,\,3\times10^{-3})$. `sigma_omega_patches_ev` accepts `lo:hi:eta` triples that replace these windows, each with its own $\eta$ at or above `sigma_regularization_ev`.
+The broadening sets the resolution a near-resonance window pays for. Occupied semicore states tens of eV below the read region would stretch the resonant windows down to them at the input file's $\eta$. On the tangential route (`compute_mode = tangential`) semicore states outside the requested set are read instead on coarse windows of their own, broadened by 5 eV, sampled every 2.5 eV and certified at $\max(\varepsilon_\Sigma,\,3\times10^{-3})$. `sigma_omega_patches_ev` accepts `lo:hi:eta` triples that replace these windows, each with its own $\eta$ at or above `sigma_regularization_ev`.
 
 !!! refuses
     - A malformed or overlapping triple, a triple with $\eta$ below `sigma_regularization_ev`, or triples on a self-consistent run with no semicore states (`GATE sigma_coarse_window`). A one-shot whose semicore states are all requested warns and ignores them.

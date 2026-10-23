@@ -3,7 +3,7 @@
 `LORRAX` The Low-scaling Real-space Real-Axis eXcited-state module in BerkeleyGW.
 {: .page-summary }
 
-<div class="chain-map" data-driver="gw" data-page="deps"></div>
+<div class="workflow-map" data-driver="gw" data-page="deps"></div>
 
 LORRAX computes quasiparticle energies $E^{\mathrm{QP}}_{n\bk}$ in the GW approximation and neutral excitations from the Bethe–Salpeter equation, starting from a Quantum ESPRESSO calculation in BerkeleyGW's `WFN.h5` format. Every two-particle object is compressed by interpolative separable density fitting (ISDF) onto $N_\mu$ real-space points $\br_\mu$, and Σ is evaluated on the real frequency axis from real-time Green's functions. It runs through JAX with one process per device, on GPUs or CPUs.
 {: .lead }

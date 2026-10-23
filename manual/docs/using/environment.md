@@ -3,7 +3,7 @@
 `LORRAX_*` The few environment variables a user sets, and the developer switches.
 {: .page-summary }
 
-The environment grants machine capability: where the native libraries are, which site profile applies, how much memory a collective may take, where the compile cache lives, and how strict a check is. Physics and routing are deck keys, validated, echoed and recorded with the run; set a deck key before reaching for a variable. What a run resolved is printed in the rank-0 startup report, since several variables are read once before the JAX backend starts.
+The environment grants machine capability: where the native libraries are, which site profile applies, how much memory a collective may take, where the compile cache lives, and how strict a check is. Physics and routing are input keys, validated, echoed and recorded with the run; set an input key before reaching for a variable. What a run resolved is printed in the rank-0 startup report, since several variables are read once before the JAX backend starts.
 {: .lead }
 
 A `bool` variable follows `runtime.env_flags.env_bool`: unset or blank gives the default; `1 true yes on` (any case) is on; `0 false no off` is off; any other value is off and announced once with `*** LORRAX SANITY`. Every other type is named in its entry, which says what a malformed value does. Defaults are read from the registry `docs/reference/env_vars.md` of the LORRAX tree and checked against the read sites; each entry carries its source line.
@@ -99,10 +99,10 @@ Read by `config/frontera/templates/gw_dev.sbatch`, not by Python ([Quickstart](q
 The LORRAX checkout. Required by the Frontera template; set by the Perlmutter module.
 
 ### `LORRAX_RUN_DIR` {: .kw data-type="env · path" data-default="none" }
-The run directory holding the deck. Required by the Frontera template.
+The run directory holding the input file. Required by the Frontera template.
 
 ### `LORRAX_INPUT` {: .kw data-type="env · path" data-default="gw.in" }
-The deck the Frontera template passes to `-i`.
+The input file the Frontera template passes to `-i`.
 
 ## Developer variables {: #developer }
 

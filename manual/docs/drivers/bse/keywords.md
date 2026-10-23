@@ -5,12 +5,12 @@ page: keywords
 
 # Input keywords
 
-`bse.bse_jax` Every deck key the BSE driver and `bse.absorption_haydock` read, and the four command-line flags.
+`bse.bse_jax` Every input key the BSE driver and `bse.absorption_haydock` read, and the four command-line flags.
 {: .page-summary }
 
-<div class="chain-map" data-driver="bse" data-page="keywords"></div>
+<div class="workflow-map" data-driver="bse" data-page="keywords"></div>
 
-The BSE settings are deck keys in the deck passed with `-i` (the GW deck), under BerkeleyGW's `absorption.x` names wherever the meaning is the same. A key is written `key = value`, or as in BerkeleyGW's inputs: `key value` without `=`, and a bare flag (`full_bse`) for `full_bse = true`, so `absorption.inp` lines can be pasted. The command line keeps `-i`, `--px`/`--py`, `--report-file` and `--out-prefix`. An old command-line flag refuses with its new name ("`--n-val` is now deck key `number_val_bands_fine`"), and so does an old deck key ("`bse_k_grid` is now `kgrid_fine`"). A key that only another route reads refuses on the route that would ignore it. Defaults are the drivers' own (`src/bse/bse_jax.py` `BSE_KEYS`, `src/bse/absorption_haydock.py` `HAYDOCK_KEYS`); the keys are listed in `src/gw/gw_config.py` `BSE_DECK_KEYS`.
+The BSE settings are input keys in the input file passed with `-i` (the GW input file), under BerkeleyGW's `absorption.x` names wherever the meaning is the same. A key is written `key = value`, or as in BerkeleyGW's inputs: `key value` without `=`, and a bare flag (`full_bse`) for `full_bse = true`, so `absorption.inp` lines can be pasted. The command line keeps `-i`, `--px`/`--py`, `--report-file` and `--out-prefix`. An old command-line flag refuses with its new name ("`--n-val` is now input key `number_val_bands_fine`"), and so does an old input key ("`bse_k_grid` is now `kgrid_fine`"). A key that only another route reads refuses on the route that would ignore it. Defaults are the drivers' own (`src/bse/bse_jax.py` `BSE_KEYS`, `src/bse/absorption_haydock.py` `HAYDOCK_KEYS`); the keys are listed in `src/gw/gw_config.py` `BSE_DECK_KEYS`.
 
 ## `bse.bse_jax` {: #bse-jax }
 
@@ -20,9 +20,9 @@ Required
 **Command line**
 
 ### `-i`, `--input` {: .kw data-type="path" data-default="required" }
-The GW deck. Locates the ISDF tensor file, `wfn_file`, the centroid table and every key below.
+The GW input file. Locates the ISDF tensor file, `wfn_file`, the centroid table and every key below.
 
-**Deck keys**
+**Input keys**
 
 ### `number_val_bands_fine` {: .kw data-type="int" data-default="required" }
 Valence bands of the BSE window, counted down from the highest occupied band, spinor bands included. BerkeleyGW: `number_val_bands_fine`.
@@ -60,7 +60,7 @@ Drop the screened direct term: $D + w V$, the RPA with local fields. BerkeleyGW:
 Assertion only: refuses unless it matches the WFN's spinor count. BerkeleyGW: `spinor`.
 
 ### `extended_kernel` {: .kw data-type="bool" data-default="false" }
-Read by [`bse.bsemat_cli`](../berkeleygw-export.md#bsemat) only. In a solver deck it prints one NOTE: LORRAX does not interpolate the kernel, and `full_bse` selects the non-TDA problem.
+Read by [`bse.bsemat_cli`](../berkeleygw-export.md#bsemat) only. In a solver input file it prints one NOTE: LORRAX does not interpolate the kernel, and `full_bse` selects the non-TDA problem.
 
 **Bands and energies**
 
@@ -70,14 +70,14 @@ Occupied-band count that places the window $[n_{\mathrm{occ}} - n_v,\, n_{\mathr
 ### `eqp_corrections`, `eqp_co_corrections` {: .kw data-type="bool or path" data-default="—" }
 QP energies in `eqp1.dat` format on the GW grid's irreducible wedge. BerkeleyGW: `eqp_corrections` (no fine grid), `eqp_co_corrections` (with `kgrid_fine`, where the energies enter the band interpolation).
 
-A bare key reads BerkeleyGW's file name beside the deck (`eqp.dat`, `eqp_co.dat`); a value names the file (LORRAX's GW writes `eqp1.dat`). `eqp_co_corrections` without `kgrid_fine`, or `eqp_corrections` with it, refuses. Without a fine grid the window is re-sliced on the corrected spectrum.
+A bare key reads BerkeleyGW's file name beside the input file (`eqp.dat`, `eqp_co.dat`); a value names the file (LORRAX's GW writes `eqp1.dat`). `eqp_co_corrections` without `kgrid_fine`, or `eqp_corrections` with it, refuses. Without a fine grid the window is re-sliced on the corrected spectrum.
 {: .kw-details }
 
 ### `qp_rotations_file` {: .kw data-type="path" data-default="—" }
 The GW run's `qp_wfn_rotations.h5`: solve in the eigenbasis of its $H_{QP}$; the window counts QP states. Exclusive with the eqp keys; refuses `kgrid_fine`.
 
 ### `wfn_file` {: .kw data-type="path" data-default="WFN.h5" }
-WFN for the occupied count, the cell volume, the spinor count, bundle authentication and the band interpolation; relative to the deck.
+WFN for the occupied count, the cell volume, the spinor count, bundle authentication and the band interpolation; relative to the input file.
 
 ### `band_degeneracy` {: .kw data-type="enum" data-default="strict" }
 What happens when a window edge cuts a degenerate multiplet (a Kramers pair under spin–orbit coupling). `strict` refuses and names counts that work; `snap` widens the window outward; `off` proceeds.
@@ -165,7 +165,7 @@ Davidson internals: the preconditioner diagonal (`exact`, `bare`, `auto`), extra
 **Dipoles, spectra and output files**
 
 ### `dipole_file` {: .kw data-type="path" data-default="—" }
-`dipole.h5` (`psp.get_dipole_mtxels`), relative to the deck. With it, and the TDA, each state's $\langle 0\lvert\hat r\rvert S\rangle$ goes to `eigenvalues_b1.dat`…`_b3.dat` (`eigenvalues.dat` along a deck `polarization`), the spectra below are written, and the Haydock recursion is seeded. Under `kgrid_fine` it is the coarse WFN's file, carried through the band interpolation.
+`dipole.h5` (`psp.get_dipole_mtxels`), relative to the input file. With it, and the TDA, each state's $\langle 0\lvert\hat r\rvert S\rangle$ goes to `eigenvalues_b1.dat`…`_b3.dat` (`eigenvalues.dat` along an input file `polarization`), the spectra below are written, and the Haydock recursion is seeded. Under `kgrid_fine` it is the coarse WFN's file, carried through the band interpolation.
 
 ### `use_momentum`, `use_velocity` {: .kw data-type="bool" data-default="—" }
 BerkeleyGW's operator choice, checked against `dipole_file`'s `skip_vnl` stamp. LORRAX chooses the operator when the dipole file is made: `psp.get_dipole_mtxels --skip-vnl` is the momentum $p$ alone, the default is the velocity $p + i[V_{\mathrm{NL}}, r]$.
@@ -218,7 +218,7 @@ Prefix of the absorption files from the eigensolve (`absorption_haydock` for the
 
 ## Absorption (`bse.absorption_haydock`)
 
-A separate entry point: the TDA screened recursion ($D + w V - W$), at least two devices, band degeneracy `strict`. It reads `number_val_bands_fine`, `number_cond_bands_fine`, `highest_occupied_band`, the eqp keys, `dipole_file` (default `dipole.h5` beside the deck), `dipole_position_fix`, `use_momentum`/`use_velocity`, the spin keys, `number_iterations`, `energy_resolution`, `delta_frequency`, `omega_min_ev`, `omega_max_ev`, `no_eps1`, `polarization` and the fine-grid keys, as above. The cell volume and the spinor count are read from the WFN. The command line is `-i` and `--out-prefix` (default `absorption_haydock`). `gaussian_broadening` and `local_fields` refuse.
+A separate entry point: the TDA screened recursion ($D + w V - W$), at least two devices, band degeneracy `strict`. It reads `number_val_bands_fine`, `number_cond_bands_fine`, `highest_occupied_band`, the eqp keys, `dipole_file` (default `dipole.h5` beside the input file), `dipole_position_fix`, `use_momentum`/`use_velocity`, the spin keys, `number_iterations`, `energy_resolution`, `delta_frequency`, `omega_min_ev`, `omega_max_ev`, `no_eps1`, `polarization` and the fine-grid keys, as above. The cell volume and the spinor count are read from the WFN. The command line is `-i` and `--out-prefix` (default `absorption_haydock`). `gaussian_broadening` and `local_fields` refuse.
 
 ## Renamed and retired
 
@@ -235,6 +235,6 @@ A separate entry point: the TDA screened recursion ($D + w V - W$), at least two
 | `--eta-eV`, `--n-iter`, `--n-omega`, `--pol` (Haydock) | `energy_resolution`, `number_iterations`, `delta_frequency`, `polarization` |
 | `--V-cell`, `--n-spinor`, `--n-spin` (Haydock) | removed: read from the WFN |
 | `--lanczos` | removed (it changed nothing) |
-| other `--davidson-*`, `--trlan-*`, `--lanczos-*`, `--kpm-*` | the deck key of the same name in snake case |
+| other `--davidson-*`, `--trlan-*`, `--lanczos-*`, `--kpm-*` | the input key of the same name in snake case |
 | `bse_k_grid` | `kgrid_fine` |
 | `--ring-timing`, `w_head_densify = legacy`, `LORRAX_LANCZOS_REORTH` | retired |

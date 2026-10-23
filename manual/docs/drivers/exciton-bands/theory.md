@@ -8,7 +8,7 @@ page: theory
 `bse.exciton_bands` The equations each stage evaluates.
 {: .page-summary }
 
-<div class="chain-map" data-driver="exciton-bands" data-page="theory"></div>
+<div class="workflow-map" data-driver="exciton-bands" data-page="theory"></div>
 
 <div class="section-cards"></div>
 
@@ -22,7 +22,7 @@ An exciton of momentum $\bQ$ is built from transitions that remove an electron a
 `fh_interp.generate_kpath_from_qe_segments`
 {: .in-code }
 
-The deck's `K_POINTS` block lists corners $\bQ_0,\dots,\bQ_m$ in crystal coordinates, each with a count $n_i$. Segment $i$ runs from $\bQ_{i-1}$ to $\bQ_i$ and takes the count on the line of the corner where it ends, raised to the floor `--q-per-segment`:
+The input file's `K_POINTS` block lists corners $\bQ_0,\dots,\bQ_m$ in crystal coordinates, each with a count $n_i$. Segment $i$ runs from $\bQ_{i-1}$ to $\bQ_i$ and takes the count on the line of the corner where it ends, raised to the floor `--q-per-segment`:
 
 $$
 \bQ_{i,t} = \Big(1-\frac{t}{n_i}\Big)\bQ_{i-1} + \frac{t}{n_i}\,\bQ_i, \qquad t = 1,\dots,n_i, \qquad n_i \leftarrow \max(n_i,\, n_\mathrm{floor}) \tag{1.1}
@@ -79,7 +79,7 @@ The eigenvalues give $E_{c\,\bk+\bQ}$ through the inverse of $f$. The basis is f
 `bse_setup.resolve_conduction_window`
 {: .in-code }
 
-$f(H)$ is built over the deck's full window, $[n_\mathrm{elec}-n_\mathrm{val},\, n_\mathrm{elec}+n_\mathrm{cond})$ with the deck's `nval` and `ncond`, and the BSE conduction bands are returned from its interior. With $n_c$ = `number_cond_bands_fine` the number of conduction guard bands above them is:
+$f(H)$ is built over the input file's full window, $[n_\mathrm{elec}-n_\mathrm{val},\, n_\mathrm{elec}+n_\mathrm{cond})$ with the input file's `nval` and `ncond`, and the BSE conduction bands are returned from its interior. With $n_c$ = `number_cond_bands_fine` the number of conduction guard bands above them is:
 
 $$
 n_\mathrm{guard} = n_\mathrm{cond} - n_c \tag{2.2}
@@ -166,7 +166,7 @@ $g_0(\mu)$ is the $\bG=0$ component of $\zeta_{\bq=0,\mu}$. The kept $\bG=0$ ter
     $$
 
     Window
-    :   `--refit-window zeta` (the GW ζ-fit window) or `bse` (the deck's window), plus `--refit-guard-bands` (4)
+    :   `--refit-window zeta` (the GW ζ-fit window) or `bse` (the input file's window), plus `--refit-guard-bands` (4)
 
     ```ini
     --vq-mode refit
@@ -222,7 +222,7 @@ $$
 K^{\mathrm{head}}_{cv\bk,\,c'v'\bk'} = \frac{w_x}{N_k}\, d^{a*}_{cv\bk}\,M_{ab}(\bQ)\,d^{b}_{c'v'\bk'} \tag{3.4}
 $$
 
-Set by `--head-minibz-average` or the deck's `head_minibz_average`. The dipoles are exact matrix elements, not ISDF-reconstructed, so a run with the head average is not bit-comparable to one without it.
+Set by `--head-minibz-average` or the input file's `head_minibz_average`. The dipoles are exact matrix elements, not ISDF-reconstructed, so a run with the head average is not bit-comparable to one without it.
 
 ## <span class="n">4</span> The screened interaction {: #screening }
 
@@ -268,7 +268,7 @@ $\mathsf S$ is the $\bq\to0$ response tensor; $S(\Gamma)$ is the average over th
 `bse_densify._interpolate_bse_data_to_grid`
 {: .in-code }
 
-With the deck key `kgrid_fine` the loader moves the whole problem to the finer grid before the driver starts: states and energies by H-transform, $W$ by the same interpolant with `w_head_densify = c1` (as in 4.3) or `srlr`, which subtracts a fitted long-range model $\mathrm{LR}_m$ with window $w(|\bq|)$ from every coarse tile and adds it back at every fine $\bq$:
+With the input key `kgrid_fine` the loader moves the whole problem to the finer grid before the driver starts: states and energies by H-transform, $W$ by the same interpolant with `w_head_densify = c1` (as in 4.3) or `srlr`, which subtracts a fitted long-range model $\mathrm{LR}_m$ with window $w(|\bq|)$ from every coarse tile and adds it back at every fine $\bq$:
 
 $$
 W_{\bq_f} = T\big[W - w\,\mathrm{LR}_m\big]_{\bq_f} + w\,\mathrm{LR}_m(\bq_f) \tag{4.4}

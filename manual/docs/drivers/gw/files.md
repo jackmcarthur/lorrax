@@ -8,13 +8,13 @@ page: files
 `gw.gw_jax` Formats of the files gw_jax reads and writes.
 {: .page-summary }
 
-<div class="chain-map" data-driver="gw" data-page="files"></div>
+<div class="workflow-map" data-driver="gw" data-page="files"></div>
 
 ## Inputs {: #inputs }
 
-| File | Deck key | Produced by | Note |
+| File | Input key | Produced by | Note |
 |---|---|---|---|
-| deck | `-i` | user | Its directory is the run directory `<run>`. |
+| input file | `-i` | user | Its directory is the run directory `<run>`. |
 | `WFN.h5` | `wfn_file` | QE + `pw2bgw`, or [nscf](../nscf/index.md) | BerkeleyGW format. Its content fingerprint is stamped into the ISDF tensor file and `qp_wfn_rotations.h5`. |
 | `centroids_frac_<N>.txt` | `centroids_file` | [centroids](../../utilities/centroids.md) | $N_\mu$ rows. Its content hash is stamped into the ISDF tensor file. |
 | `centroids_frac_<N>_current.txt` | `centroids_file_current` | [centroids](../../utilities/centroids.md) | Bispinor runs only. |

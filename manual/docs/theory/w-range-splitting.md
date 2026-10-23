@@ -52,7 +52,7 @@ where the slab kernel is the truncated kernel of Ismail-Beigi [4], with $z_c=\pi
 - **Bulk.** $\bG_L$ is the single vector $\bG_{\mathrm{ws}}(\bq)=\arg\min_\bG|\bq+\bG|$, which is $\bG=0$ inside the first zone.
 - **Slab.** $\bG_L$ runs over the column $\bG_{\mathrm{ws}}+n\,\mathbf b_3$, $|n|\le n_z$. The head $G_z=0$ goes as $8\pi z_c/|\bq_\parallel|$, and each $G_z=n\,b_3\neq0$ is finite at $\bq=0$ but has a cusp there with slope $8\pi z_c(-1)^n/G_z^2$ in $|\bq_\parallel|$. The column keeps every $G_z^2$ below 1 Ry, and at least two shells, $n_z=\max\big(2,\lfloor 1\ \mathrm{bohr}^{-1}/|\mathbf b_3|\rfloor\big)$. On the MoS₂ reference cell that is $|n|\le3$.
 
-Other values of `sys_dim` refuse. On a bulk deck with `mc_average_vcoul_body = true` (the default), $V$ uses the mini-BZ average of $v$ at $\bG_{\mathrm{ws}}$ for every $\bq\neq0$ ([ISDF §3.3](isdf.md#isdf-head)), and the long-range part uses the same average. A slab always uses the point kernel.
+Other values of `sys_dim` refuse. On a bulk input file with `mc_average_vcoul_body = true` (the default), $V$ uses the mini-BZ average of $v$ at $\bG_{\mathrm{ws}}$ for every $\bq\neq0$ ([ISDF §3.3](isdf.md#isdf-head)), and the long-range part uses the same average. A slab always uses the point kernel.
 
 ## <span class="n">3</span> The exact split on the GW grid {: #split }
 
@@ -212,7 +212,7 @@ h(\bq)=\bar W_{00}\,\frac{s(\bq)}{\langle s\rangle_{\Gamma_c}},\qquad
 s(\bq)=\frac{v(\bq)}{1-v(\bq)\,\bq\cdot S\cdot\bq} \tag{5.1}
 $$
 
-$\bar W_{00}$ is the bundle's static head, or the deck's `whead_0freq`, and $s$ is the screened integrand of the [q → 0 head](q0-head.md#minibz-avg), evaluated at each fine $\bq\neq0$ and averaged over the fine cell at $\Gamma$. Points on the boundary of $\Gamma_c$ are shared with their neighbours by weight, and $h=0$ outside $\Gamma_c$. The ratio $\bar W_{00}/\langle s\rangle_{\Gamma_c}$ is logged, and a value more than 5 % from one warns. $S$ is the restart's `S_cart_head`, or is rebuilt from `dipole.h5` when the restart has none.
+$\bar W_{00}$ is the bundle's static head, or the input file's `whead_0freq`, and $s$ is the screened integrand of the [q → 0 head](q0-head.md#minibz-avg), evaluated at each fine $\bq\neq0$ and averaged over the fine cell at $\Gamma$. Points on the boundary of $\Gamma_c$ are shared with their neighbours by weight, and $h=0$ outside $\Gamma_c$. The ratio $\bar W_{00}/\langle s\rangle_{\Gamma_c}$ is logged, and a value more than 5 % from one warns. $S$ is the restart's `S_cart_head`, or is rebuilt from `dipole.h5` when the restart has none.
 
 The removed route was cheap and needed nothing beyond the head, but it left the coarse neighbours of $\Gamma$ untouched. Their values still contained the $1/q^2$ rise, and the interpolation between them overshot, as in the lower panel of Fig. 1, and in a slab the $G_z\neq0$ plane waves were not treated at all. `srlr` removes both defects.
 
@@ -242,7 +242,7 @@ Even on the first row the arrays are skipped silently when `sys_dim` is neither 
 `bse_densify._interpolate_bse_data_to_grid`
 {: .in-code }
 
-The densification runs in the BSE loader whenever the deck's `kgrid_fine` differs from the bundle's grid, so `bse.bse_jax`, every solver behind it, and `bse.exciton_bands` with the same deck key receive a fine bundle.
+The densification runs in the BSE loader whenever the input file's `kgrid_fine` differs from the bundle's grid, so `bse.bse_jax`, every solver behind it, and `bse.exciton_bands` with the same input key receive a fine bundle.
 
 | Key | Default | Role here |
 |---|---|---|
@@ -263,14 +263,14 @@ The densification runs in the BSE loader whenever the deck's `kgrid_fine` differ
     - Symmetry rows not in the bundle's flat FFT order (`GATE srlr_q_order`), or a slab relabelling that leaves the set of $\bG_L$ (`GATE srlr_channel_relabel`).
 
 !!! note "Today and intended"
-    `srlr` is the default and only model since 2026-10-22. The tangential GW route's restart has no `W0_lr`, so a `kgrid_fine` BSE on it refuses by name; use the bundle of a static Dyson run on the same deck (`cohsex`, `gn_ppm`, `hl_ppm`), since the BSE reads only the static $W(0)$. The intended state is that the tangential route writes the arrays of its own $W(0)$.
+    `srlr` is the default and only model since 2026-10-22. The tangential GW route's restart has no `W0_lr`, so a `kgrid_fine` BSE on it refuses by name; use the bundle of a static Dyson run on the same input file (`cohsex`, `gn_ppm`, `hl_ppm`), since the BSE reads only the static $W(0)$. The intended state is that the tangential route writes the arrays of its own $W(0)$.
 
 ## <span class="n">7</span> A measured example {: #example }
 
 The measurements below come from development runs recorded in the code and its documents, not from a release benchmark.
 {: .intro }
 
-Static Dyson GW runs (`compute_mode = cohsex`) supplied $W$ on a coarse grid; the BSE (TDA, 8 valence × 8 conduction bands, the same quasiparticle energies in every arm) ran on the fine grid with $W$ interpolated by `srlr`, and is compared with a BSE on $W$ computed directly on the fine grid. The table gives the lowest 40 exciton energies against that direct run, rerun on 2026-10-22 with the BerkeleyGW deck keys (identical to the 2026-10-20 runs to 0.001 meV).
+Static Dyson GW runs (`compute_mode = cohsex`) supplied $W$ on a coarse grid; the BSE (TDA, 8 valence × 8 conduction bands, the same quasiparticle energies in every arm) ran on the fine grid with $W$ interpolated by `srlr`, and is compared with a BSE on $W$ computed directly on the fine grid. The table gives the lowest 40 exciton energies against that direct run, rerun on 2026-10-22 with the BerkeleyGW input keys (identical to the 2026-10-20 runs to 0.001 meV).
 
 | System, grids | $\Omega_1$ direct (eV) | `srlr`: mean abs. offset, mean (meV) | removed `c1` (meV) | BerkeleyGW direct (meV) | BerkeleyGW dual grid (meV) |
 |---|---|---|---|---|---|

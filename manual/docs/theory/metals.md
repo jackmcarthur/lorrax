@@ -12,7 +12,7 @@
 
 ## <span class="n">1</span> Occupations {: #occupations }
 
-A metal is recognized from the WFN occupations, not from a deck key. Its occupations are Fermi–Dirac at fixed electron number, and one occupation state reaches χ⁰, the head and Σ.
+A metal is recognized from the WFN occupations, not from an input key. Its occupations are Fermi–Dirac at fixed electron number, and one occupation state reaches χ⁰, the head and Σ.
 {: .intro }
 
 ### <span class="n">1.1</span> Classifying the mean field {: #occ-class }
@@ -157,7 +157,7 @@ A folded head (`head_correction = full`) uses the folded $S(0)$ and the static f
 
 ### <span class="n">3.4</span> Head routes on a metal {: #head-routes }
 
-The metallic head is bulk only: a `sys_dim = 2` metal refuses in the cell average. Both `head_correction = no_local_fields` (the direct head) and `full` (scalar decks) are admitted; a time-reversal-broken metal refuses `full` on the tangential route (`GATE tangential_head_ordered`): its static $z=0$ slot is not certified without time reversal. Every metallic head, including the frozen DFT head of `sc_head_update = off`, uses the fixed-N Fermi–Dirac state of §1. On a self-consistent run the per-map heads `dft_velocity` and `parallel_transport` require `compute_mode = tangential`.
+The metallic head is bulk only: a `sys_dim = 2` metal refuses in the cell average. Both `head_correction = no_local_fields` (the direct head) and `full` (scalar input files) are admitted; a time-reversal-broken metal refuses `full` on the tangential route (`GATE tangential_head_ordered`): its static $z=0$ slot is not certified without time reversal. Every metallic head, including the frozen DFT head of `sc_head_update = off`, uses the fixed-N Fermi–Dirac state of §1. On a self-consistent run the per-map heads `dft_velocity` and `parallel_transport` require `compute_mode = tangential`.
 
 ## <span class="n">4</span> Screening and Σ on a metal {: #sigma }
 
@@ -166,7 +166,7 @@ The production metal model is the tangential $W$ with occupation-weighted Σ bra
 
 ### <span class="n">4.1</span> The metal model of W {: #sigma-w }
 
-A metal deck sets `compute_mode = tangential`. The tangential bank carries the signed metallic weights through its occupation envelope ([Tangential W model §6.3](tangential-w.md#bank-accuracy)). The scalar head is fitted on the metal plan of §2.2, with the tangential Γ body evaluated on it ([The q → 0 head §3.1](q0-head.md#poles-samples)).
+A metal input file sets `compute_mode = tangential`. The tangential bank carries the signed metallic weights through its occupation envelope ([Tangential W model §6.3](tangential-w.md#bank-accuracy)). The scalar head is fitted on the metal plan of §2.2, with the tangential Γ body evaluated on it ([The q → 0 head §3.1](q0-head.md#poles-samples)).
 
 ### <span class="n">4.2</span> Occupation-weighted Σ branches {: #sigma-branches }
 
@@ -211,7 +211,7 @@ Treatments and routes that assume a gap or integer occupations refuse a metallic
 | `screening_diagrams = w_bse`, `w_rpa_resolvent` | refuses | `w_bse_insulators_only`, `w_rpa_resolvent_insulators_only` |
 | `sc_head_update = interband_commutator` | refuses | `sc_head_interband_commutator_insulator_only` |
 
-### <span class="n">5.2</span> Deck conditions {: #ref-deck }
+### <span class="n">5.2</span> Input file conditions {: #ref-deck }
 
 !!! refuses
     - No `occ_smearing_width_ry`, or a width ≤ 0. Set it to the DFT Fermi–Dirac $k_BT$.

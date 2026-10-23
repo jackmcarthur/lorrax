@@ -8,7 +8,7 @@ page: overview
 `gw.gw_jax` Quasiparticle energies from the ISDF-compressed GW self-energy.
 {: .page-summary }
 
-<div class="chain-map" data-driver="gw" data-page="overview"></div>
+<div class="workflow-map" data-driver="gw" data-page="overview"></div>
 
 Computes quasiparticle energies and orbitals from the ISDF-compressed GW self-energy, one-shot or quasiparticle self-consistent (QSGW). It runs after the mean field and the [centroids](../../utilities/centroids.md), [kin-ion](../../utilities/kin-ion.md) and [dipole](../../utilities/dipole.md) utilities, and feeds [htransform](../../utilities/htransform.md), [downfold](../../utilities/downfold.md) and both BSE drivers.
 {: .lead }
@@ -19,7 +19,7 @@ Invoke
 :   `python -m gw.gw_jax -i gw.in`
 
 Reads
-:   deck, `WFN.h5`, `centroids_frac_<N>.txt`, `kin_ion.h5`, `dipole.h5`; under QSGW also `parallel_transport.h5`
+:   input file, `WFN.h5`, `centroids_frac_<N>.txt`, `kin_ion.h5`, `dipole.h5`; under QSGW also `parallel_transport.h5`
 
 Writes
 :   `eqp0.dat`, `eqp1.dat`, `sigma_diag.dat`, `qp_wfn_rotations.h5`, `WFN_qp.h5`, ISDF tensor file, `gwjax.out`
@@ -67,11 +67,11 @@ Writes
 
 Run from a compute node, one process per device. The Perlmutter line is for a clone in the current directory; the module, the Frontera build and other sites are on [Installation](../../using/installation.md#routes). The Frontera template runs `gw.gw_jax` on the CPU leg; edit its `#SBATCH` block before submitting.
 
-A minimal production deck:
+A minimal production input file:
 
 ```ini
-# Requires, beside the deck: WFN.h5, the centroids file (centroids), and kin_ion.h5 (kin-ion)
-# and dipole.h5 (dipole), both run on this deck.
+# Requires, beside the input file: WFN.h5, the centroids file (centroids), and kin_ion.h5 (kin-ion)
+# and dipole.h5 (dipole), both run on this input file.
 [cohsex]
 wfn_file               = WFN.h5
 centroids_file         = centroids_frac_1200.txt  # as centroid.kmeans_cli names it
@@ -87,7 +87,7 @@ Every other key takes its default ([keywords](keywords.md)). Choose `number_band
 
 ## Choosing a Σ treatment {: #treatment }
 
-Two treatments are for production runs: the tangential model, full frequency, for insulators, metals and time-reversal-broken decks; and the Godby–Needs plasmon pole for insulators. The others are kept for debugging and comparison. `qp_solver` is a separate axis. Expand a row for the model, its deck lines and its limits; the derivations are on [Frequency treatments](../../theory/frequency-treatments.md).
+Two treatments are for production runs: the tangential model, full frequency, for insulators, metals and time-reversal-broken input files; and the Godby–Needs plasmon pole for insulators. The others are kept for debugging and comparison. `qp_solver` is a separate axis. Expand a row for the model, its input file lines and its limits; the derivations are on [Frequency treatments](../../theory/frequency-treatments.md).
 
 ???+ treatment production "tangential · Tangential model · full frequency"
     One set of real poles $\Omega_{j\bq}$ per irreducible $\bq$, shared by every matrix element, with one factor vector $b_{j\bq}(\mu)$ per pole ([normalisation](../../theory/tangential-w.md#model-form)). The poles come from samples of $W^c$ and $\partial_zW^c$ on a line above the real axis and an imaginary ladder, plus the exact high-frequency moments; nothing is fitted element by element. $\Sigma^c(\omega)$ is evaluated on the real axis at each state's own energy.
@@ -101,10 +101,10 @@ Two treatments are for production runs: the tangential model, full frequency, fo
     qp_solver    = self_consistent
     ```
 
-    **Note** The production route for insulators, metals and time-reversal-broken decks, with `qp_solver = self_consistent`. `sigma_w_accuracy = relaxed` selects the looser recipe tier. Full page: [Tangential W model](../../theory/tangential-w.md).
+    **Note** The production route for insulators, metals and time-reversal-broken input files, with `qp_solver = self_consistent`. `sigma_w_accuracy = relaxed` selects the looser recipe tier. Full page: [Tangential W model](../../theory/tangential-w.md).
 
 ??? treatment supported "gn_ppm · Godby–Needs plasmon pole · plasmon pole"
-    One real pole per matrix element, fixed by $W^c$ at $z=0$ and at $z=i\omega_p$, $\omega_p=$ `ppm_omega_p` (default 2 Ry). On a time-reversal-broken deck the fit carries a second, odd residue.
+    One real pole per matrix element, fixed by $W^c$ at $z=0$ and at $z=i\omega_p$, $\omega_p=$ `ppm_omega_p` (default 2 Ry). On a time-reversal-broken input file the fit carries a second, odd residue.
 
     $$
     W^c_{\bq}(\mu,\nu;z)=R_{\bq}(\mu,\nu)\left[\frac{1}{z-\Omega_{\bq}(\mu,\nu)}-\frac{1}{z+\Omega_{\bq}(\mu,\nu)}\right]
@@ -144,7 +144,7 @@ Two treatments are for production runs: the tangential model, full frequency, fo
         **Note** What `compute_mode = auto` runs. Refuses metallic occupations.
 
     ??? treatment in-progress "hl_ppm · Hybertsen–Louie plasmon pole · plasmon pole"
-        The same two-point fit with the probe on the real axis above every $\chi^0$ transition, $\omega_p>\Delta_{\max}$, so the pole carries the $f$-sum coefficient. Missing: a default probe; the GN default of 2 Ry lies inside the spectrum of most decks and refuses.
+        The same two-point fit with the probe on the real axis above every $\chi^0$ transition, $\omega_p>\Delta_{\max}$, so the pole carries the $f$-sum coefficient. Missing: a default probe; the GN default of 2 Ry lies inside the spectrum of most input files and refuses.
 
         $$
         \Omega^2_{\bq}(\mu,\nu)=-\omega_p^2\,\frac{W^c_{\bq}(\mu,\nu;\omega_p)}{W^c_{\bq}(\mu,\nu;0)-W^c_{\bq}(\mu,\nu;\omega_p)}
@@ -155,7 +155,7 @@ Two treatments are for production runs: the tangential model, full frequency, fo
         ppm_omega_p  = 200.0
         ```
 
-        **Note** Refuses metallic occupations and time-reversal-broken decks.
+        **Note** Refuses metallic occupations and time-reversal-broken input files.
 
 
     ??? treatment in-progress "cd · Contour deformation · full frequency"
@@ -201,13 +201,13 @@ A refusal names the key or file and the fix. The ones most runs meet are listed 
     - An unknown key, or a `;` comment after a value. Delete the key; comments start with `#`. 
     - Fractional WFN occupations (a metal) with `compute_mode = cohsex`, `gn_ppm` or `hl_ppm`, without `occ_smearing_width_ry`, without `fermi_reference = mp1_fixed_n`, or with `sc_head_update = interband_commutator`. 
     - A `kin_ion.h5` that is missing, has too few bands, or was built for another `sys_dim`, spinor count, k-point count or `bispinor` setting, or in the retired format with Hartree folded in. Rerun kin-ion. Its WFN fingerprint is not compared. 
-    - A missing `dipole.h5` with the head on, or one built with another velocity operator, with or without the nonlocal commutator. Under `head_correction = full`, also one from another WFN or band window; on the direct-head path that mismatch only warns, unless `LORRAX_SANITY=strict`. Rerun dipole on this deck and WFN. 
+    - A missing `dipole.h5` with the head on, or one built with another velocity operator, with or without the nonlocal commutator. Under `head_correction = full`, also one from another WFN or band window; on the direct-head path that mismatch only warns, unless `LORRAX_SANITY=strict`. Rerun dipole on this input file and WFN. 
     - A centroid table whose fit windows drop an occupied band. Rerun centroids with windows that start at band 0. 
     - A `tmp/zeta_q.h5` left by a run with another centroid count or FFT grid in the same directory. Use a separate run directory or delete the file. 
     - A named `number_bands_chi` or `number_bands_sigma` that splits a degenerate multiplet or reaches the top of `WFN.h5`. Pick a legal edge from the message. 
     - A QSGW run unconverged after `sc_max_iter` maps (the per-map tables are kept), a checkpoint that continues past `sc_max_iter`, or scissored tail bands that take up occupation. Raise the budget, or widen the QP matrix. 
 
-??? refuses "Deck keys that conflict or do not apply"
+??? refuses "Input keys that conflict or do not apply"
     - A value outside its range or enum. The message names the accepted values. 
     - Two spellings of one setting that disagree: `nband` and `number_bands`, `number_bands` and a different `number_bands_chi` or `number_bands_sigma`, `use_band_extrapolation` and `sigma_band_extrapolation`, `do_G0` and `head_correction`, `do_screened = false` with a screened `compute_mode`. Keep one. 
     - `number_bands_protected` beside `nval` or `ncond`, or outside [occupied count, `number_bands`]. 

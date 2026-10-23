@@ -11,7 +11,7 @@ LORRAX reads the same `WFN.h5` as BerkeleyGW and writes `eqp0.dat` and `eqp1.dat
 |---|---|---|
 | `epsilon.x` and `sigma.x` | [`gw.gw_jax`](../drivers/gw/index.md) | One run builds $\chi^0$, $W$ and $\Sigma$; no dielectric file passes between them. |
 | `kernel.x` and `absorption.x` (diagonalization) | [`bse.bse_jax`](../drivers/bse/index.md) | No kernel file: $H$ is applied matrix-free in every run. |
-| `absorption.x` (`haydock`, `lanczos`) | `bse.absorption_haydock` | Same deck and ISDF tensor file as `bse.bse_jax`. |
+| `absorption.x` (`haydock`, `lanczos`) | `bse.absorption_haydock` | Same input file and ISDF tensor file as `bse.bse_jax`. |
 | `inteqp.x` | [`htransform`](../utilities/htransform.md) | QP bands on arbitrary $\bk$. |
 | `kernel.x` with `exciton_Q_shift` | [`exciton-bands`](../drivers/exciton-bands/index.md) | Finite-$\bQ$ excitons. |
 | `WFNq`, shifted $\bq_0$ | [`dipole`](../utilities/dipole.md) | `dipole.h5` supplies the $\bq\to0$ head. |
@@ -91,9 +91,9 @@ BerkeleyGW builds the full zone from the WFN's k list with the rotation matrices
 |---|---|---|
 | `frequency_dependence -1` | [`compute_mode`](../drivers/gw/keywords.md#compute_mode) `= x_only` | Bare exchange. The hybrid keys (`bare_exchange_fraction`, `short_range_frac_fock`, `long_range_frac_fock`, `screening_length`) have no counterpart. |
 | `frequency_dependence 0` | `compute_mode = cohsex` | Coulomb hole as a partial band sum ([conventions](#conventions)). |
-| `frequency_dependence 1` | `compute_mode = hl_ppm` | <span class="status in-progress">In progress</span>: set [`ppm_omega_p`](../drivers/gw/keywords.md#ppm_omega_p) above every $\chi^0$ transition; the 2 Ry default refuses on most decks. |
+| `frequency_dependence 1` | `compute_mode = hl_ppm` | <span class="status in-progress">In progress</span>: set [`ppm_omega_p`](../drivers/gw/keywords.md#ppm_omega_p) above every $\chi^0$ transition; the 2 Ry default refuses on most input files. |
 | `frequency_dependence 3` | `compute_mode = gn_ppm` | Probe $i\omega_p$ = `ppm_omega_p`. |
-| `frequency_dependence 2` | `compute_mode = tangential` | Name it in the deck: `compute_mode = auto` never selects it. |
+| `frequency_dependence 2` | `compute_mode = tangential` | Name it in the input file: `compute_mode = auto` never selects it. |
 | `frequency_dependence_method`, `cd_integration_method` | none | $\Sigma^c$ is evaluated on the real axis from the pole model. |
 | `number_bands` | [`number_bands_sigma`](../drivers/gw/keywords.md#number_bands_sigma) | $\Sigma^c$ is extrapolated past it by default, [`use_band_extrapolation`](../drivers/gw/keywords.md#use_band_extrapolation). |
 | `band_index_min`, `band_index_max`, `number_diag`, `diag` | [`ncond`](../drivers/gw/keywords.md#ncond), or [`number_bands_protected`](../drivers/gw/keywords.md#number_bands_protected) | $\Sigma$ always covers bands 1 to $n_{\mathrm{occ}}+$ `ncond`; [`nval`](../drivers/gw/keywords.md#nval) does not move the lower edge. `kin-ion` and `dipole` resolve either form as GW does. |
@@ -126,19 +126,19 @@ There is no kernel step for the solve. `bse.bse_jax` and `bse.absorption_haydock
 | BerkeleyGW key | LORRAX | Note |
 |---|---|---|
 | `number_val_bands`, `number_cond_bands` | same, read by `bse.bsemat_cli` | The solve's window is absorption's `number_val_bands_fine`, `number_cond_bands_fine`. |
-| `extended_kernel` | same, read by `bse.bsemat_cli` | In a solver deck it only NOTEs: the full BSE is [`full_bse`](../drivers/bse/keywords.md#full_bse). |
+| `extended_kernel` | same, read by `bse.bsemat_cli` | In a solver input file it only NOTEs: the full BSE is [`full_bse`](../drivers/bse/keywords.md#full_bse). |
 | `exciton_Q_shift` | same, read by `bse.bsemat_cli` (`Qflag Qx Qy Qz`, kernel.x's sign) | Finite-$\bQ$ solves: [`exciton-bands`](../drivers/exciton-bands/index.md). |
 | `screened_coulomb_cutoff`, `bare_coulomb_cutoff` | none | Fixed by the GW run's bundle. |
 | `energy_loss` | none | |
 | `use_symmetries_coarse_grid`, `no_symmetries_coarse_grid` | none | |
-| `cell_slab_truncation` and the other truncations | [`sys_dim`](../drivers/gw/keywords.md#sys_dim) | The deck's value, as in the GW run. |
+| `cell_slab_truncation` and the other truncations | [`sys_dim`](../drivers/gw/keywords.md#sys_dim) | The input file's value, as in the GW run. |
 | `screening_semiconductor`, `screening_metal` | none | |
 | `tddft`, `screen_exchange`, `short_range_frac_fock`, `long_range_frac_fock`, `screening_length` | none | |
 | `low_comm`, `low_memory`, `high_memory`, `n_ffts_per_batch` | [`--px`, `--py`](../drivers/bse/keywords.md#-px-py) | Device mesh only. |
 
 ## absorption.inp {: #absorption }
 
-The keys below are deck keys of the GW deck, with absorption.inp's names; BerkeleyGW's `key value` and bare-flag lines can be pasted.
+The keys below are input keys of the GW input file, with absorption.inp's names; BerkeleyGW's `key value` and bare-flag lines can be pasted.
 
 | BerkeleyGW key | LORRAX | Note |
 |---|---|---|
@@ -232,7 +232,7 @@ begin kpoints
 end
 ```
 
-Both collapse into one deck, `gw.in`:
+Both collapse into one input file, `gw.in`:
 
 ```ini
 [cohsex]
@@ -250,7 +250,7 @@ use_band_extrapolation = false                     # BerkeleyGW truncates
 ```
 
 - `epsilon_cutoff`, `screened_coulomb_cutoff`, the frequency method and both $\bk$ and $\bq$ lists have no line: $N_\mu$ replaces the cutoffs, the treatment the method, and the WFN grid the lists.
-- The last two lines exist only to match BerkeleyGW. A production deck omits them.
+- The last two lines exist only to match BerkeleyGW. A production input file omits them.
 - `WFN.h5` holds at least one band above `number_bands` (here at least 101); neither band sum may end inside a Kramers pair.
 
 With the launch prefix `$RUN` of the [Quickstart](quickstart.md#launch):
@@ -299,5 +299,5 @@ One `WFN.h5` in both codes, with the keys of [Conventions](#conventions) matched
 | | Coulomb hole against `CH'` | 0.35, 1.26 meV |
 | | total against `Sig'` | 0.34, 1.07 meV |
 
-Both rows ran with `mc_average_vcoul_body = false` against `cell_average_cutoff 1.0d-12`, and the full-frequency row with `use_band_extrapolation = false`. The two LORRAX defaults move the numbers most: band extrapolation lowers every state by about 155 meV and opens the indirect gap to 1.1256 eV (+45.8 meV); `mc_average_vcoul_body = true` moves $\Sigma^x$ by 136 meV (mean absolute) on the COHSEX deck. The full-frequency LORRAX run took 55 s on four A100 GPUs. No metal and no slab has a matched comparison.
+Both rows ran with `mc_average_vcoul_body = false` against `cell_average_cutoff 1.0d-12`, and the full-frequency row with `use_band_extrapolation = false`. The two LORRAX defaults move the numbers most: band extrapolation lowers every state by about 155 meV and opens the indirect gap to 1.1256 eV (+45.8 meV); `mc_average_vcoul_body = true` moves $\Sigma^x$ by 136 meV (mean absolute) on the COHSEX input file. The full-frequency LORRAX run took 55 s on four A100 GPUs. No metal and no slab has a matched comparison.
 

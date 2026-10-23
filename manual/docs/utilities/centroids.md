@@ -3,7 +3,7 @@
 `centroid.kmeans_cli` The ISDF interpolation points, selected by weighted k-means and pruned by pivoted Cholesky.
 {: .page-summary }
 
-<div class="chain-map" data-driver="centroids" data-page="files"></div>
+<div class="workflow-map" data-driver="centroids" data-page="files"></div>
 
 Selects the $N_\mu$ real-space points $\br_\mu$ in the unit cell that the ISDF fit uses. ISDF samples the wavefunctions $\psi_{n\bk}$ at these points and approximates every pair density by an expansion in interpolating vectors $\zeta_{\bq\mu}(\br)$,
 {: .lead }
@@ -14,7 +14,7 @@ $$
 
 The points are chosen to respect the symmetries of the crystal's space group, so every operation maps the set onto itself. As a result the self-energy keeps the symmetry of the crystal, degenerate quasiparticle levels stay degenerate, and the GW and BSE runs can work on the irreducible wedges of k and q.
 
-The utility reads the wavefunctions from `WFN.h5`. It reads the GW input deck for the band counts that set the fit windows below, and for the name of the wavefunction file. Nothing else in the deck affects the selection. It writes the centroid table that the deck names with `centroids_file`.
+The utility reads the wavefunctions from `WFN.h5`. It reads the GW input input file for the band counts that set the fit windows below, and for the name of the wavefunction file. Nothing else in the input file affects the selection. It writes the centroid table that the input file names with `centroids_file`.
 
 <div class="glance" markdown>
 
@@ -22,7 +22,7 @@ Invoke
 :   `python -m centroid.kmeans_cli n_centroids -i gw.in`
 
 Reads
-:   deck (`-i`), `WFN.h5`
+:   input file (`-i`), `WFN.h5`
 
 Writes
 :   `centroids_frac_<N>.txt`, `kmeans.out`
@@ -66,7 +66,7 @@ This spin-traced density is the charge density that standard GW screens, and the
 The weight is the diagonal of the $\bq = 0$ pair-density Gram over the left and right band windows $L$ and $R$, $s(\br) = \sum_\bk w_\bk\,\rho^L_\bk(\br)\,\rho^R_\bk(\br) = K(\br,\br)$, and Lloyd's mass is $w(\br) = s(\br)^{1/2}$; occupations do not enter. Lloyd places $\lceil 1.5\,N_\mu\rceil$ candidates as orbit representatives. Each representative is snapped to the FFT grid and then unfolded by the space group of the decorated atoms, so every orbit lands exactly on grid points. Pivoted Cholesky on $K(\br_a,\br_b)$ then keeps the candidates that add the most independent directions, admitting or rejecting whole orbits, never single points, until $N_\mu$ points are used. The written set is therefore closed under every spatial operation, including improper and nonsymmorphic ones ([Centroid selection §5](../theory/centroid-selection.md#cs-symmetry)). The objective, the Gram and the limits of the method are on [Centroid selection](../theory/centroid-selection.md); the fit that consumes the points is on [ISDF and V(q)](../theory/isdf.md).
 
 !!! note
-    The selection must be made against the band window that $\Sigma^c$ and $\chi^0$ consume. The default right window is every band in `WFN.h5`, and the default left window is the occupied bands plus the deck's `ncond` protected conduction bands, so always pass `-i`. For the count, the header's `rank law:` line estimates the $N_\mu$ that gives 1 meV RMS error in $\Sigma^x$, $N_\mu \approx 0.5\min\big(N_\bk L B,\ 445\,L^{0.107}B^{0.322},\ 0.97\,N_\bG(4E_\mathrm{wfc})\big)$, with $L$ and $B$ the window widths (per Kramers pair on a spinor WFN).
+    The selection must be made against the band window that $\Sigma^c$ and $\chi^0$ consume. The default right window is every band in `WFN.h5`, and the default left window is the occupied bands plus the input file's `ncond` protected conduction bands, so always pass `-i`. For the count, the header's `rank law:` line estimates the $N_\mu$ that gives 1 meV RMS error in $\Sigma^x$, $N_\mu \approx 0.5\min\big(N_\bk L B,\ 445\,L^{0.107}B^{0.322},\ 0.97\,N_\bG(4E_\mathrm{wfc})\big)$, with $L$ and $B$ the window widths (per Kramers pair on a spinor WFN).
 
 ## Running {: #run }
 
@@ -83,7 +83,7 @@ The weight is the diagonal of the $\bq = 0$ pair-density Gram over the left and 
     $LORRAX_PY -u -m centroid.kmeans_cli 400 -i gw.in
     ```
 
-Run it in the directory of the GW deck: both output files land in the working directory. The deck lines it reads:
+Run it in the directory of the GW input file: both output files land in the working directory. The input file lines it reads:
 
 ```ini
 wfn_file   = WFN.h5
@@ -91,11 +91,11 @@ sys_dim    = 3
 ncond      = 4
 ```
 
-After the run, set `centroids_file = centroids_frac_<N>.txt` in the GW deck, with `<N>` the count actually written.
+After the run, set `centroids_file = centroids_frac_<N>.txt` in the GW input file, with `<N>` the count actually written.
 
 ## Keywords {: #keywords }
 
-The count goes on the command line, and the deck named with `-i` supplies the deck keys. Defaults are read from the argument parser (`src/centroid/kmeans_cli.py`) and the keyword schema (`src/gw/gw_config.py`).
+The count goes on the command line, and the input file named with `-i` supplies the input keys. Defaults are read from the argument parser (`src/centroid/kmeans_cli.py`) and the keyword schema (`src/gw/gw_config.py`).
 
 Required
 {: .kw-group }
@@ -108,15 +108,15 @@ Number of points to select; positional.
 The delivered number of centroids may be slightly below `n_centroids`, because the points are selected in symmetric "orbits of points".
 {: .kw-details }
 
-**Deck keys**
+**Input keys**
 
-The deck passes through the GW reader, so with `-i` an unknown key or a missing `sys_dim` refuses.
+The input file passes through the GW reader, so with `-i` an unknown key or a missing `sys_dim` refuses.
 
 ### `ncond` {: .kw data-type="int" data-default="required" }
 Number of protected conduction bands, the conduction bands whose quasiparticle energies GW corrects. Required unless `number_bands_protected` is given. The default left window ends at $n_\mathrm{val}+\texttt{ncond}$, every occupied band plus the protected conduction bands.
 
 ### `sys_dim` {: .kw data-type="int" data-default="required" }
-Checked by the deck reader only; the selection does not use it.
+Checked by the input file reader only; the selection does not use it.
 
 Optional
 {: .kw-group }
@@ -124,13 +124,13 @@ Optional
 **Band windows**
 
 ### `-i`, `--input` {: .kw data-type="path" data-default="unset" }
-GW deck. Supplies `wfn_file` and `ncond`, the number of protected conduction bands.
+GW input file. Supplies `wfn_file` and `ncond`, the number of protected conduction bands.
 
 With it the left window is every occupied band plus the protected conduction bands, and the right window every band in `WFN.h5`. Without it the WFN is `./WFN.h5` and the left window widens to every band, with a warning.
 {: .kw-details }
 
 ### `--fit-window` {: .kw data-type="string" data-default="unset" }
-Explicit windows `L0:L1,R0:R1`, 0-based and half-open, for both the weight and the Gram, in place of the windows set by the deck.
+Explicit windows `L0:L1,R0:R1`, 0-based and half-open, for both the weight and the Gram, in place of the windows set by the input file.
 
 Both windows must start at band 0 and reach the occupied-band count.
 {: .kw-details }
@@ -160,10 +160,10 @@ When `n_centroids` exceeds $0.1\,N_r$ ($N_r$ the number of FFT grid points), the
 ### `--out-suffix` {: .kw data-type="string" data-default="'' or _current" }
 Suffix of the table and report names. Default `''` for `scalar`, `_current` for `current`.
 
-**Deck keys**
+**Input keys**
 
 ### `wfn_file` {: .kw data-type="string" data-default="WFN.h5" }
-Wavefunction file, relative to the deck directory.
+Wavefunction file, relative to the input file directory.
 
 ### `memory_per_device_gb` {: .kw data-type="float" data-default="0.0" }
 Device budget for the planners' prices; `0` keeps auto-detection.
@@ -216,7 +216,7 @@ The GW run hashes the table's contents. A new table, even with the same count, i
     - A Gram that is not positive semidefinite: the Schur residual falls below minus the noise floor.
     - A pool that runs out of candidates before the request is met, or a point budget smaller than every orbit. Raise `--oversample` or lower `n_centroids`.
     - A rank shortfall under `LORRAX_CENTROID_SELECT=strict`, or any value of that variable other than `deliver` and `strict`.
-    - A deck (`-i`) without `sys_dim`, or with an unknown key.
+    - An input file (`-i`) without `sys_dim`, or with an unknown key.
 
 A pool that is numerically flat (fewer certified directions than points) is reported, not refused: the extra points are kept as quadrature points.
 

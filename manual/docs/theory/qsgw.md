@@ -87,7 +87,7 @@ $$
 \rho(\br) = \sum_{\bk n} w_\bk\,f_{n\bk}\,\big|\psi^{\mathrm{QP}}_{n\bk}(\br)\big|^2,\qquad V^{\mathrm H}(\bG) = \frac{8\pi\,\rho(\bG)}{|\bG|^2},\quad V^{\mathrm H}(\mathbf 0) = 0 \tag{2.2}
 $$
 
-$\langle m\bk|V^{\mathrm H}|n\bk\rangle$ is contracted with the mean-field orbitals, so it enters (1.2) without rotation. The live density is on by default under `qp_solver = self_consistent`: `density_self_consistent` is switched on when the deck does not name it. An explicit `density_self_consistent = false` keeps the mean-field $V^{\mathrm H}$ on every map as an announced comparison mode. A bispinor deck builds $\rho$ and the Dirac current $J$ together and refuses the frozen field.
+$\langle m\bk|V^{\mathrm H}|n\bk\rangle$ is contracted with the mean-field orbitals, so it enters (1.2) without rotation. The live density is on by default under `qp_solver = self_consistent`: `density_self_consistent` is switched on when the input file does not name it. An explicit `density_self_consistent = false` keeps the mean-field $V^{\mathrm H}$ on every map as an announced comparison mode. A bispinor input file builds $\rho$ and the Dirac current $J$ together and refuses the frozen field.
 
 ### <span class="n">2.4</span> Screening and self-energy {: #om-sigma }
 
@@ -139,13 +139,13 @@ The sum in $\beta$ runs over the empty states of the QP matrix whose Σ was read
 
 Occupied states below a band gap of at least 4 eV form the semicore class. Their Σ is read on held windows at a broadening of 5 eV, and with `sc_semicore = dft` (default) their block of $H$ stays at the mean-field block while their mixing with the other states is kept; `qp` lets them move with their own Σ. `sc_frozen_core_bands = N` (default 0) instead holds the lowest $N$ bands at their mean-field block with no coupling; they stay in every band sum.
 
-The 5 eV read is what lets the semicore converge (at the deck η the Fe 3s $Z$ leaves $(0,1]$ from map 1 and the loop stalls), and it is a systematic error. Reading at $\eta_{\mathrm{semi}}$ smooths $\Sigma^c$ by a Lorentzian of width $\eta_{\mathrm{semi}}-\eta$; to first order the bias at the state's energy is
+The 5 eV read is what lets the semicore converge (at the input file η the Fe 3s $Z$ leaves $(0,1]$ from map 1 and the loop stalls), and it is a systematic error. Reading at $\eta_{\mathrm{semi}}$ smooths $\Sigma^c$ by a Lorentzian of width $\eta_{\mathrm{semi}}-\eta$; to first order the bias at the state's energy is
 
 $$
 \delta\,\mathrm{Re}\,\Sigma^c_{ss}(E_s)\approx(\eta_{\mathrm{semi}}-\eta)\,\mathrm{Im}\,\partial_\omega\Sigma^c_{ss}(E_s) \tag{3.2}
 $$
 
-by the Cauchy–Riemann relation $\partial_\eta\,\mathrm{Re}\,\Sigma^c=\mathrm{Im}\,\partial_\omega\Sigma^c$ of the occupied branch, analytic below the axis. A level that decays into a continuum is biased linearly in $\eta_{\mathrm{semi}}$ and an isolated level only through the curvature of $\mathrm{Re}\,\Sigma^c$. On AgI 6³ the 5 eV windows read $\mathrm{Re}\,\Sigma^c$ 2.19 eV low on Ag 4s, 0.66 eV on Ag 4p, 0.51 eV on I 4d and 1.25 eV on I 5s, against every state read at the deck η. The states within $E_F\pm1$ eV move by 3.6 / 15.9 meV (std / max) on Fe 4³ and 2.9 / 20.0 meV on MoS₂ 3×3. `sigma_omega_patches_ev` sets windows at a smaller η of their own. With the pin the semicore converges within 27 meV of its mean-field energies; under `qp` it lands 0.1–6 eV deeper (Fe 4³, MoS₂ 3×3). Freezing it with `sc_frozen_core_bands` drops its mixing with the valence, which matters on Fe 3s/3p and CrI₃ I 5s.
+by the Cauchy–Riemann relation $\partial_\eta\,\mathrm{Re}\,\Sigma^c=\mathrm{Im}\,\partial_\omega\Sigma^c$ of the occupied branch, analytic below the axis. A level that decays into a continuum is biased linearly in $\eta_{\mathrm{semi}}$ and an isolated level only through the curvature of $\mathrm{Re}\,\Sigma^c$. On AgI 6³ the 5 eV windows read $\mathrm{Re}\,\Sigma^c$ 2.19 eV low on Ag 4s, 0.66 eV on Ag 4p, 0.51 eV on I 4d and 1.25 eV on I 5s, against every state read at the input file η. The states within $E_F\pm1$ eV move by 3.6 / 15.9 meV (std / max) on Fe 4³ and 2.9 / 20.0 meV on MoS₂ 3×3. `sigma_omega_patches_ev` sets windows at a smaller η of their own. With the pin the semicore converges within 27 meV of its mean-field energies; under `qp` it lands 0.1–6 eV deeper (Fe 4³, MoS₂ 3×3). Freezing it with `sc_frozen_core_bands` drops its mixing with the valence, which matters on Fe 3s/3p and CrI₃ I 5s.
 
 ## <span class="n">4</span> Mixing {: #mixing }
 
@@ -185,7 +185,7 @@ $$
 \max_{n\bk}\big|E^{\mathrm{QP}}_{\mathrm{out},n\bk} - E^{\mathrm{QP}}_{\mathrm{in},n\bk}\big| < \varepsilon^{\mathrm{tol}} \tag{5.1}
 $$
 
-over the states of the QP matrix (the scissored tail excluded), with $\varepsilon^{\mathrm{tol}} =$ `sc_tol_ev`. The default is $10^{-4}$ eV; the production deck uses $10^{-3}$ eV. The test is a maximum, not an RMS, and compares a map's output with its own input, not successive iterates. The loop returns that input with its own Σ, $W$ and head.
+over the states of the QP matrix (the scissored tail excluded), with $\varepsilon^{\mathrm{tol}} =$ `sc_tol_ev`. The default is $10^{-4}$ eV; the production input file uses $10^{-3}$ eV. The test is a maximum, not an RMS, and compares a map's output with its own input, not successive iterates. The loop returns that input with its own Σ, $W$ and head.
 
 ### <span class="n">5.2</span> Stall and budget {: #conv-stall }
 
@@ -289,7 +289,7 @@ A converged run on a route that keeps the static $W(0)$ writes it from the accep
 `sc_iteration.make_initial_state_from_qp_rotations`
 {: .in-code }
 
-`sc_initial_qp_rotations_file` imports an authenticated eigensystem as $H = U\,\mathrm{diag}(E)\,U^\dagger$ in the original mean-field basis, averaged over each $\bk$'s little group. With an `sc_checkpoint.h5` beside it that authenticates against the deck, WFN and band window, the run continues the Anderson trajectory at the checkpoint's map; otherwise it starts a new run from the seed. A charge QSGW run seeds a bispinor QSGW run on the same WFN.
+`sc_initial_qp_rotations_file` imports an authenticated eigensystem as $H = U\,\mathrm{diag}(E)\,U^\dagger$ in the original mean-field basis, averaged over each $\bk$'s little group. With an `sc_checkpoint.h5` beside it that authenticates against the input file, WFN and band window, the run continues the Anderson trajectory at the checkpoint's map; otherwise it starts a new run from the seed. A charge QSGW run seeds a bispinor QSGW run on the same WFN.
 
 ## <span class="n">8</span> Keys {: #keys }
 

@@ -8,19 +8,19 @@ page: files
 `bse.exciton_bands` Formats of the files exciton_bands reads and writes.
 {: .page-summary }
 
-<div class="chain-map" data-driver="exciton-bands" data-page="files"></div>
+<div class="workflow-map" data-driver="exciton-bands" data-page="files"></div>
 
 ## Inputs {: #inputs }
 
-| File | Deck key | Produced by | Note |
+| File | Input key | Produced by | Note |
 |---|---|---|---|
-| deck | `-i` | user | The GW deck plus a `K_POINTS` block. Its directory locates the restart. |
-| `isdf_tensors_<N_mu>.h5` | — | gw | Exactly one, beside the deck or in its `tmp/`. ψ at the centroids, energies, $V_\bq$ tiles, static $W_\bq$, heads. |
+| input file | `-i` | user | The GW input file plus a `K_POINTS` block. Its directory locates the restart. |
+| `isdf_tensors_<N_mu>.h5` | — | gw | Exactly one, beside the input file or in its `tmp/`. ψ at the centroids, energies, $V_\bq$ tiles, static $W_\bq$, heads. |
 | `zeta_q.h5` | — | gw | Beside the restart. Every route but `ongrid`; `interp` and `both` need it on the full BZ. |
 | `WFN.h5` | `wfn_file` | DFT + pw2bgw | The H-transform input; also gives the occupied count. |
 | `centroids_frac_<N>.txt` | `centroids_file` | centroids | Required. On a downfolded bundle, the parent table recorded in the bundle. |
 | `eqp1.dat` | `eqp_corrections` | gw | Diagonal QP energies on the wedge, unfolded on load. |
-| `dipole.h5` | `dipole_file` | dipole | Only with the mini-BZ head average. Default: beside the deck. |
+| `dipole.h5` | `dipole_file` | dipole | Only with the mini-BZ head average. Default: beside the input file. |
 
 ## Outputs {: #outputs }
 

@@ -5,12 +5,12 @@ page: keywords
 
 # Input keywords
 
-`gw.gw_jax` Every deck key gw_jax reads, grouped by what it controls.
+`gw.gw_jax` Every input key gw_jax reads, grouped by what it controls.
 {: .page-summary }
 
-<div class="chain-map" data-driver="gw" data-page="keywords"></div>
+<div class="workflow-map" data-driver="gw" data-page="keywords"></div>
 
-Keys are written `key = value`, one per line, under a `[cohsex]` section header in the deck passed with `-i`; keys are case-insensitive, a comment starts with `#`, and an unknown or retired key refuses with its line number. Energies are in Ry unless the key name ends in `_ev`. Defaults are read from the keyword schema (`src/gw/gw_config.py`, `_DEFAULTS`).
+Keys are written `key = value`, one per line, under a `[cohsex]` section header in the input file passed with `-i`; keys are case-insensitive, a comment starts with `#`, and an unknown or retired key refuses with its line number. Energies are in Ry unless the key name ends in `_ev`. Defaults are read from the keyword schema (`src/gw/gw_config.py`, `_DEFAULTS`).
 
 Required
 {: .kw-group }
@@ -50,7 +50,7 @@ Giving it beside `nval` or `ncond` refuses (`GATE band_request_forms`); it must 
 ### `sys_dim` {: .kw data-type="int" data-default="required" }
 Coulomb truncation: `3` bulk, `2` slab with vacuum along $c$.
 
-A deck without it refuses (`GATE sys_dim_required`). It enters $V_\bq$, $W$ and $V^{\mathrm H}$.
+An input file without it refuses (`GATE sys_dim_required`). It enters $V_\bq$, $W$ and $V^{\mathrm H}$.
 {: .kw-details }
 
 `3` `2`
@@ -124,7 +124,7 @@ A static rule that misses its target at the cap refuses. The GN probe and the ta
 ### `minimax_energy_reference` {: .kw data-type="enum" data-default="midgap" }
 Energy zero of the band energies in the χ⁰ time rules. It cancels from $\chi^0$.
 
-`none` (aliases `raw`, `zero`) uses the raw energies. A number in the deck reaches the resolver as a string and refuses when the first rule is built ([minimax](../../theory/time-frequency.md#frame-keys)).
+`none` (aliases `raw`, `zero`) uses the raw energies. A number in the input file reaches the resolver as a string and refuses when the first rule is built ([minimax](../../theory/time-frequency.md#frame-keys)).
 {: .kw-details }
 
 `midgap` `vbm` `cbm` `none`
@@ -183,13 +183,13 @@ Reaching it unconverged refuses and keeps the per-map tables.
 ### `density_self_consistent` {: .kw data-type="bool" data-default="true under QSGW" }
 Rebuilds $V^{\mathrm H}$ from the rotated occupied orbitals on every QSGW map.
 
-An explicit `false` keeps the DFT $V^{\mathrm H}$ as an announced comparison mode; on a bispinor deck it refuses.
+An explicit `false` keeps the DFT $V^{\mathrm H}$ as an announced comparison mode; on a bispinor input file it refuses.
 {: .kw-details }
 
 ### `sc_head_update` {: .kw data-type="enum" data-default="off" }
 How the $\bq \to 0$ head follows each QSGW map.
 
-Unnamed on a tangential QSGW deck with the head on, it becomes `parallel_transport` if `parallel_transport_file` exists, else `dft_velocity` if `dipole.h5` exists. `interband_commutator` refuses on a metal; any value but `off` refuses with `head_correction = off`.
+Unnamed on a tangential QSGW input file with the head on, it becomes `parallel_transport` if `parallel_transport_file` exists, else `dft_velocity` if `dipole.h5` exists. `interband_commutator` refuses on a metal; any value but `off` refuses with `head_correction = off`.
 {: .kw-details }
 
 `off` `parallel_transport` `dft_velocity` `interband_commutator`
@@ -458,7 +458,7 @@ For a main WFN written without symmetry.
 **Files**
 {: #files }
 
-A relative path resolves against the deck's directory for `wfn_file`, `centroids_file`, `centroids_file_current`, `kin_ion_file`, `parallel_transport_file`, `static_gauge_hall_file`, `bgw_vcoul_file`, `bgw_vcoul_sym_wfn`, `sc_initial_qp_rotations_file`, `report_file`, `sigma_diag_file`, `eqp0_file`, `eqp1_file` and `sigma_omega_h5_file`. `sigma_freq_debug_file` and `sc_dump_dir` are used as given, so a relative value resolves against the launch directory. Formats are on the [Files](files.md) page.
+A relative path resolves against the input file's directory for `wfn_file`, `centroids_file`, `centroids_file_current`, `kin_ion_file`, `parallel_transport_file`, `static_gauge_hall_file`, `bgw_vcoul_file`, `bgw_vcoul_sym_wfn`, `sc_initial_qp_rotations_file`, `report_file`, `sigma_diag_file`, `eqp0_file`, `eqp1_file` and `sigma_omega_h5_file`. `sigma_freq_debug_file` and `sc_dump_dir` are used as given, so a relative value resolves against the launch directory. Formats are on the [Files](files.md) page.
 
 ### `wfn_file` {: .kw data-type="path" data-default="WFN.h5" }
 Mean-field wavefunctions, BerkeleyGW format.
@@ -599,7 +599,7 @@ Read by `compute_mode = gn_ppm | hl_ppm`.
 ### `ppm_omega_p` {: .kw data-type="float" data-default="2.0" }
 Second probe frequency, in Ry: $i\omega_p$ for GN, real $\omega_p$ for HL.
 
-An HL deck sets it above every $\chi^0$ transition energy.
+An HL input file sets it above every $\chi^0$ transition energy.
 {: .kw-details }
 
 ### `ppm_invalid_mode` {: .kw data-type="enum" data-default="static_limit" }
@@ -656,7 +656,7 @@ Largest node count of one $\chi^0$ rule set on the knot windows. In $[192, 8192]
 With `cd_chi0_band_windows = auto`: how far above the window's largest $\lvert\mathrm{Re}\,z\rvert$ a remote band window starts, in eV. In $(0, 100]$.
 
 ### `cd_chi0_rules_file` {: .kw data-type="path" data-default="(empty)" }
-Precomputed $\chi^0$ rules from `python -m gw.cd.chi0_rules`, relative to the deck.
+Precomputed $\chi^0$ rules from `python -m gw.cd.chi0_rules`, relative to the input file.
 
 Checked against the run's energies, occupations, tolerance, points and windows; a mismatch refuses (`GATE cd_chi0_rules_identity`). Empty: the rules are built in the job and written to `cd_chi0_rules.pkl`.
 {: .kw-details }
@@ -678,7 +678,7 @@ Bands of the $l$ sum contracted at a time. `0` lets the planner size it; any til
 
 ## Keys read by other drivers {: #other }
 
-The gw deck is also the deck of the preprocessing utilities and BSE, so the schema holds their keys. `gw_jax` accepts them and reads a few of them only to authenticate `dipole.h5`.
+The gw input file is also the input file of the preprocessing utilities and BSE, so the schema holds their keys. `gw_jax` accepts them and reads a few of them only to authenticate `dipole.h5`.
 
 ### `ecutrho` {: .kw data-type="float" data-default="WFN ecutwfc" }
 Density cutoff of [kin-ion](../../utilities/kin-ion.md) and [dipole](../../utilities/dipole.md), in Ry.

@@ -5,14 +5,14 @@ page: keywords
 
 # Input keywords
 
-`bse.exciton_bands` Every command-line flag and deck key exciton_bands reads, grouped by what it controls.
+`bse.exciton_bands` Every command-line flag and input key exciton_bands reads, grouped by what it controls.
 {: .page-summary }
 
-<div class="chain-map" data-driver="exciton-bands" data-page="keywords"></div>
+<div class="workflow-map" data-driver="exciton-bands" data-page="keywords"></div>
 
-The driver takes command-line flags and reads deck keys, written `key = value` one per line, from the deck passed with `-i`; the deck also carries the `K_POINTS` path block. Defaults are read from the driver's argparse parser (`src/bse/exciton_bands.py`, `build_parser`) and the keyword schema (`src/gw/gw_config.py`). An unknown flag refuses; a prefix of a flag is not accepted.
+The driver takes command-line flags and reads input keys, written `key = value` one per line, from the input file passed with `-i`; the input file also carries the `K_POINTS` path block. Defaults are read from the driver's argparse parser (`src/bse/exciton_bands.py`, `build_parser`) and the keyword schema (`src/gw/gw_config.py`). An unknown flag refuses; a prefix of a flag is not accepted.
 
-The BSE keys it shares with [`bse`](../bse/keywords.md) are deck keys under BerkeleyGW's names (`number_val_bands_fine`, `number_cond_bands_fine`, `number_eigenvalues`, `solver`, `davidson_tol_mev`, `block_size`, `solver_max_iter`, `eqp_corrections`, `band_degeneracy`, `degeneracy_tol_ry`, `dipole_file`, and the spin keys); an old flag refuses with its key. `kgrid_fine_shift` refuses: the $\bk+\bQ$ list is Γ-centred. The exciton-band flags below stay on the command line.
+The BSE keys it shares with [`bse`](../bse/keywords.md) are input keys under BerkeleyGW's names (`number_val_bands_fine`, `number_cond_bands_fine`, `number_eigenvalues`, `solver`, `davidson_tol_mev`, `block_size`, `solver_max_iter`, `eqp_corrections`, `band_degeneracy`, `degeneracy_tol_ry`, `dipole_file`, and the spin keys); an old flag refuses with its key. `kgrid_fine_shift` refuses: the $\bk+\bQ$ list is Γ-centred. The exciton-band flags below stay on the command line.
 
 Required
 {: .kw-group }
@@ -20,7 +20,7 @@ Required
 **Files**
 
 ### `-i`, `--input` {: .kw data-type="path" data-default="required" }
-The GW deck with a `K_POINTS` block. Its directory holds the ISDF tensor file.
+The GW input file with a `K_POINTS` block. Its directory holds the ISDF tensor file.
 
 ### `centroids_file` {: .kw data-type="path" data-default="required" }
 ISDF point table the restart was built on; the driver evaluates $\psi_{c\,\bk+\bQ}$ at these points. Shared with [`bse`](../bse/keywords.md).
@@ -39,7 +39,7 @@ Clamped to the occupied count, which is the WFN's `ifmax`; this driver has no `h
 ### `number_cond_bands_fine` {: .kw data-type="int" data-default="required" }
 Conduction bands in the BSE window. Shared with [`bse`](../bse/keywords.md).
 
-Must fit inside the deck's H-transform window below its guard bands.
+Must fit inside the input file's H-transform window below its guard bands.
 {: .kw-details }
 
 ### `nval` {: .kw data-type="int" data-default="required" }
@@ -65,7 +65,7 @@ The count on a corner's line is the number of points on the segment that ends th
 **Restart and layout**
 
 ### `sys_dim` {: .kw data-type="int" data-default="required" }
-Dimension of the Coulomb truncation, `3` (bulk) or `2` (slab). Required by the deck parser; this driver does not read it otherwise.
+Dimension of the Coulomb truncation, `3` (bulk) or `2` (slab). Required by the input file parser; this driver does not read it otherwise.
 
 Whether `interp` and `both` run is decided by the ISDF tensor file's Coulomb-policy stamp (`sys_dim` 2 or unstamped) and a slab-separable cell with a planar $\bq$ grid; the `refit` kernel is the bulk one only for a stamped `sys_dim = 3` bundle. See [Dependencies](dependencies.md).
 {: .kw-details }
@@ -78,7 +78,7 @@ Optional
 ### `--q-per-segment` {: .kw data-type="int" data-default="16" }
 Minimum number of $\bQ$ on each path segment.
 
-A floor, not an override: denser deck segments keep their counts, and `1` reproduces the deck's counts exactly.
+A floor, not an override: denser input file segments keep their counts, and `1` reproduces the input file's counts exactly.
 {: .kw-details }
 
 ### `--extra-q` {: .kw data-type="str" data-default="—" }
@@ -94,7 +94,7 @@ On a bulk system set `--vq-mode refit`, because `interp` and `both` are slab-onl
 ### `--vq-mode` {: .kw data-type="enum" data-default="interp" }
 Source of the off-grid exchange tile $V_\bQ$.
 
-`interp` and `both` are slab-only (judged from the bundle's Coulomb stamp and the cell, not the deck); `refit` is the bulk route; `ongrid` is exact but refuses off-grid $\bQ$.
+`interp` and `both` are slab-only (judged from the bundle's Coulomb stamp and the cell, not the input file); `refit` is the bulk route; `ongrid` is exact but refuses off-grid $\bQ$.
 {: .kw-details }
 
 `interp` `refit` `both` `ongrid`
@@ -103,13 +103,13 @@ Source of the off-grid exchange tile $V_\bQ$.
 ### `--head-minibz-average` {: .kw data-type="bool" data-default="head_minibz_average" }
 `interp`: replace the finite-$\bQ$ exchange head by its mini-BZ cell average, carried as a rank-three tensor term.
 
-Overrides the deck key, but can only switch it on. Reads `dipole.h5`. Refuses with `refit`, also when set by the deck; ignored by `ongrid`.
+Overrides the input key, but can only switch it on. Reads `dipole.h5`. Refuses with `refit`, also when set by the input file; ignored by `ongrid`.
 {: .kw-details }
 
 ### `head_minibz_average` {: .kw data-type="bool" data-default="false" }
-Deck form of `--head-minibz-average`. Shared with [`bse`](../bse/keywords.md), which reads it under `kgrid_fine`; it must match the GW run.
+Input file form of `--head-minibz-average`. Shared with [`bse`](../bse/keywords.md), which reads it under `kgrid_fine`; it must match the GW run.
 
-### `dipole_file` {: .kw data-type="path" data-default="dipole.h5 beside the deck" }
+### `dipole_file` {: .kw data-type="path" data-default="dipole.h5 beside the input file" }
 `dipole.h5` for the mini-BZ head tensor. Read only when the head average is on.
 
 Unlike [`bse`](../bse/keywords.md), where `dipole_file` stores exciton dipoles, here it supplies the head's $\bq$-linear coefficient.
@@ -118,7 +118,7 @@ Unlike [`bse`](../bse/keywords.md), where `dipole_file` stores exciton dipoles, 
 ### `--refit-window` {: .kw data-type="enum" data-default="zeta" }
 `refit`: band window the new ζ is fitted on.
 
-`zeta` is the GW run's ζ-fit window, certified by the stored tiles. `bse` is the deck's window, certified on the eigenvalues at on-grid path points; it refuses with any other `--vq-mode`.
+`zeta` is the GW run's ζ-fit window, certified by the stored tiles. `bse` is the input file's window, certified on the eigenvalues at on-grid path points; it refuses with any other `--vq-mode`.
 {: .kw-details }
 
 `zeta` `bse`
@@ -188,7 +188,7 @@ Reorthogonalization is always full.
 **Files**
 
 ### `wfn_file` {: .kw data-type="path" data-default="WFN.h5" }
-Wavefunctions for the H-transform, relative to the deck.
+Wavefunctions for the H-transform, relative to the input file.
 
 ### `--out-prefix` {: .kw data-type="str" data-default="exciton_bands" }
 Prefix of `<prefix>.dat`, `<prefix>.png` and the default report name.
@@ -220,7 +220,7 @@ Each axis must divide the BSE grid. Equal to the BSE grid, it changes nothing.
 {: .kw-details }
 
 ### `--w-head-densify` {: .kw data-type="enum" data-default="w_head_densify" }
-Overrides the deck's `w_head_densify` for `--w-coarse-grid`. Only `c1` is accepted.
+Overrides the input file's `w_head_densify` for `--w-coarse-grid`. Only `c1` is accepted.
 
 ### `--w-head-gamma-cell` {: .kw data-type="enum" data-default="fine" }
 Mini-BZ cell over which the re-attached $\Gamma$ head is averaged. `coarse` is a deliberately wrong control for tests.

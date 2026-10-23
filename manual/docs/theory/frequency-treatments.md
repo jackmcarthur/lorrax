@@ -37,7 +37,7 @@ The treatments differ in the poles: one per matrix element (plasmon-pole models)
 
 `compute_mode` names the treatment. It gives five routes:
 
-| Deck | Treatment |
+| Input file | Treatment |
 |---|---|
 | `compute_mode = x_only` | exchange only |
 | `compute_mode = cohsex` | static COHSEX |
@@ -45,14 +45,14 @@ The treatments differ in the poles: one per matrix element (plasmon-pole models)
 | `compute_mode = hl_ppm` | Hybertsen–Louie plasmon pole |
 | `compute_mode = tangential` | tangential model (production) |
 
-`compute_mode` defaults to `auto`, which reads the legacy keys: `use_ppm_sigma = true` gives `gn_ppm` (or `hl_ppm` when `ppm_model = hl`), otherwise `do_screened` gives `cohsex` or `x_only`. `auto` never selects `tangential`, so the production route names it in the deck. The key-by-key entry is on the GW keyword page: [`compute_mode`](../drivers/gw/keywords.md#compute_mode). Other W models are on [this page](multipole-w.md).
+`compute_mode` defaults to `auto`, which reads the legacy keys: `use_ppm_sigma = true` gives `gn_ppm` (or `hl_ppm` when `ppm_model = hl`), otherwise `do_screened` gives `cohsex` or `x_only`. `auto` never selects `tangential`, so the production route names it in the input file. The key-by-key entry is on the GW keyword page: [`compute_mode`](../drivers/gw/keywords.md#compute_mode). Other W models are on [this page](multipole-w.md).
 
 !!! note
     The material class is read from the WFN occupations. On a metal `cohsex`, `gn_ppm` and `hl_ppm` refuse; `compute_mode = tangential` is the production metal model. See [Metals §5](metals.md#refusals).
 
 ## <span class="n">2</span> Comparison {: #compare }
 
-The table sets the treatments side by side; the tabs give each model, its samples and its deck lines. Sections 3–5 derive the models.
+The table sets the treatments side by side; the tabs give each model, its samples and its input file lines. Sections 3–5 derive the models.
 {: .intro }
 
 ### <span class="n">2.1</span> The treatments side by side {: #compare-table }
@@ -122,7 +122,7 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
 
     One real pole per matrix element $(\bq,\mu,\nu)$, fixed by $W^c$ at zero and at one imaginary frequency.
 
-    Two W solves. The poles go to the common Σ quadrature as one in-memory pole batch. On a time-reversal-broken deck the fit carries a second, odd residue (§4.4).
+    Two W solves. The poles go to the common Σ quadrature as one in-memory pole batch. On a time-reversal-broken input file the fit carries a second, odd residue (§4.4).
 
     $$
     W^c_{\bq}(\mu,\nu;z)=R_{\bq}(\mu,\nu)\left[\frac{1}{z-\Omega_{\bq}(\mu,\nu)}-\frac{1}{z+\Omega_{\bq}(\mu,\nu)}\right],\qquad z_p=i\omega_p \tag{2.1}
@@ -147,7 +147,7 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
 
     The same two-point fit with the probe on the real axis above every transition, so $\omega_p^2W^c(\omega_p)$ reads the first-moment ($f$-sum) coefficient from the band-summed response.
 
-    Two W solves, the probe on the full zone. Missing: a default probe. `ppm_omega_p` defaults to the GN value 2 Ry, which lies inside the spectrum of most decks and refuses; set it above the largest $\chi^0$ transition.
+    Two W solves, the probe on the full zone. Missing: a default probe. `ppm_omega_p` defaults to the GN value 2 Ry, which lies inside the spectrum of most input files and refuses; set it above the largest $\chi^0$ transition.
 
     $$
     \Omega^2=-\omega_p^2\,\frac{W^c(\omega_p)}{W^c(0)-W^c(\omega_p)},\qquad \omega_p>\Delta_{\max} \tag{2.1}
@@ -172,7 +172,7 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
 
     One set of real poles per irreducible $\bq$, shared by every matrix element, with one factor vector per pole. The poles are the Ritz values of a Hermitian pencil built from samples of $W^c$ and its exact high-frequency moments; nothing is fitted.
 
-    18 to 40 W solves on a line above the real axis and a log-spaced imaginary ladder, each with its derivative at no second solve. Σ synthesizes $W^c(t)$ from every pole at each time node. It is the production route for insulators, metals and time-reversal-broken decks. Full page: [Tangential W model](tangential-w.md), with the normalisation of $b$ in [§2.1](tangential-w.md#model-form).
+    18 to 40 W solves on a line above the real axis and a log-spaced imaginary ladder, each with its derivative at no second solve. Σ synthesizes $W^c(t)$ from every pole at each time node. It is the production route for insulators, metals and time-reversal-broken input files. Full page: [Tangential W model](tangential-w.md), with the normalisation of $b$ in [§2.1](tangential-w.md#model-form).
 
     $$
     W^c_{\bq}(\mu,\nu;z)=\sum_{j=1}^{K_\bq}b_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\left[\frac{1}{z-\Omega_{j\bq}}-\frac{1}{z+\Omega_{j\bq}}\right],\qquad \Omega_{j\bq}>0 \tag{2.1}
@@ -342,12 +342,12 @@ $$
 W^c(z)=\frac{R_+}{z-\Omega}-\frac{R_-}{z+\Omega},\qquad R_\pm=R\pm D,\qquad D=\frac{i\,a_p\,(\omega_p^2+\Omega^2)}{2\,\omega_p} \tag{4.4}
 $$
 
-$D$ is Hermitian, so both residues are. Empty-band branches of Σ consume $R_+$ and occupied-band branches $R_-$; with $D=0$ this is (4.1). HL cannot separate $R_+-R_-$ from a real-axis sample, where $W^c$ is Hermitian for any system, and refuses a time-reversal-broken deck.
+$D$ is Hermitian, so both residues are. Empty-band branches of Σ consume $R_+$ and occupied-band branches $R_-$; with $D=0$ this is (4.1). HL cannot separate $R_+-R_-$ from a real-axis sample, where $W^c$ is Hermitian for any system, and refuses a time-reversal-broken input file.
 
 !!! refuses
     - Metallic WFN occupations, for both models (`GATE gn_ppm_refuses_metals`, `GATE fractional_occupations_require_mpa`). Use `compute_mode = tangential`.
     - `compute_mode = hl_ppm` with `ppm_omega_p` at or below the largest $\chi^0$ transition (`GATE hl_ppm_probe_in_spectrum`). Raise `ppm_omega_p` above it.
-    - `compute_mode = hl_ppm` on a deck whose measured time reversal is broken (`GATE hl_ppm_requires_measured_trs`). Use `gn_ppm` or the tangential model.
+    - `compute_mode = hl_ppm` on an input file whose measured time reversal is broken (`GATE hl_ppm_requires_measured_trs`). Use `gn_ppm` or the tangential model.
 
 ## <span class="n">5</span> The tangential model {: #tangential }
 

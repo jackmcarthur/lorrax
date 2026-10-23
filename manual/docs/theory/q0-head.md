@@ -62,7 +62,7 @@ The product $Y W^{\mathrm{body}}_\Gamma Z$ is contracted over $(\mu,\nu)$. `head
 | `head_correction` | Head response | Use |
 |---|---|---|
 | `full` (default) | $S^{\mathrm{eff}}$: $S$ folded once against $W^{\mathrm{body}}_\Gamma$ | production |
-| `no_local_fields` | $S$ alone, no wings and no fold (the direct head) | metals on four-current decks; comparison |
+| `no_local_fields` | $S$ alone, no wings and no fold (the direct head) | metals on four-current input files; comparison |
 | `off` | no head: $\bar v_{00}=\bar W_{00}=0$ | debugging brute-force k convergence |
 
 Under `bispinor_gw = full_tangential` an unset `head_correction` resolves to `no_local_fields`, and an explicit `full` refuses. On a time-reversal-broken (ordered) tangential store `full` folds the signed Γ body $b\,D_+b^\dagger-[b\,D_-b^\dagger]^{\mathsf T}$, $D_\pm(z)=1/(z\mp\Omega)$, against wings summed over both orders of every band pair; on an ordered metal `full` refuses (`GATE tangential_head_ordered`) and `no_local_fields` is the route. The retired `do_G0` maps `false` to `off` and `true` to `full`. The four-current routes carry further Lorentz channels; this page covers the scalar charge head.
@@ -107,7 +107,7 @@ $$
 \bar W_{00}(z_s)\approx\frac{1}{N_q}\sum_i\frac{v(\bq_i)}{1-v(\bq_i)\,q_{i,a}S^{\mathrm{eff}}_{ab}(z_s)\,q_{i,b}} \tag{2.2}
 $$
 
-`head_minibz_average = true` (default `false`) adds the analytic Baldereschi–Tosatti sphere to $\bar v_{00}$ and widens the Voronoi fold from one to three shells. A BSE run must use the GW run's value. The sample and replicate counts are not deck keys.
+`head_minibz_average = true` (default `false`) adds the analytic Baldereschi–Tosatti sphere to $\bar v_{00}$ and widens the Voronoi fold from one to three shells. A BSE run must use the GW run's value. The sample and replicate counts are not input keys.
 
 ### <span class="n">2.3</span> Slabs: exact Wigner–Seitz cubature {: #minibz-slab }
 
@@ -279,7 +279,7 @@ $$
 \bar v_{00}\;\leftrightarrow\;\texttt{vcoul}(\bq_0),\qquad \bar W_{00}(0)\;\leftrightarrow\;\bar v_{00}\,\varepsilon^{-1}_{00}(\bq_0,0) \tag{6.1}
 $$
 
-where `vcoul`($\bq_0$) is row 1 of BerkeleyGW's sigma-side table. An override applies only when the $W$ value for that frequency is also set. A GN deck that overrides the static head without `whead_imfreq` fits one computed and one imposed sample and logs `[head] MIXED HEAD`. `vhead` takes precedence over the restart value in the BSE.
+where `vcoul`($\bq_0$) is row 1 of BerkeleyGW's sigma-side table. An override applies only when the $W$ value for that frequency is also set. A GN input file that overrides the static head without `whead_imfreq` fits one computed and one imposed sample and logs `[head] MIXED HEAD`. `vhead` takes precedence over the restart value in the BSE.
 
 ### <span class="n">6.2</span> The epshead source {: #bgw-epshead }
 

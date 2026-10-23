@@ -8,7 +8,7 @@ page: overview
 `bse.exciton_bands` Exciton dispersion $\Omega_S(\bQ)$ of the finite-momentum Tamm–Dancoff BSE along a path of $\bQ$.
 {: .page-summary }
 
-<div class="chain-map" data-driver="exciton-bands" data-page="overview"></div>
+<div class="workflow-map" data-driver="exciton-bands" data-page="overview"></div>
 
 Computes the lowest exciton energies $\Omega_S(\bQ)$ at every point of a high-symmetry path of exciton momenta $\bQ$, from one GW ISDF tensor file on a uniform $\bk$ grid. It runs after `gw.gw_jax` and is the finite-$\bQ$ sibling of the optical [`bse`](../bse/index.md) driver.
 {: .lead }
@@ -16,9 +16,9 @@ Computes the lowest exciton energies $\Omega_S(\bQ)$ at every point of a high-sy
 <div class="glance" markdown>
 
 Invoke
-:   `python -u -m bse.exciton_bands -i cohsex.in` (deck keys: `number_val_bands_fine = 4`, `number_cond_bands_fine = 4`, `number_eigenvalues = 6`)
+:   `python -u -m bse.exciton_bands -i cohsex.in` (input keys: `number_val_bands_fine = 4`, `number_cond_bands_fine = 4`, `number_eigenvalues = 6`)
 Reads
-:   deck with a `K_POINTS` path, `isdf_tensors_<N_mu>.h5`, `zeta_q.h5`, `WFN.h5`, `centroids_file`; optional `eqp1.dat`, `dipole.h5`
+:   input file with a `K_POINTS` path, `isdf_tensors_<N_mu>.h5`, `zeta_q.h5`, `WFN.h5`, `centroids_file`; optional `eqp1.dat`, `dipole.h5`
 
 Writes
 :   `<prefix>.dat`, `<prefix>.png`, `<prefix>.out`
@@ -38,9 +38,9 @@ Exchange at $\bQ$
 <div class="stages" markdown>
 
 1. **Q path**
-   The deck's `K_POINTS` block gives the path corners. Each segment is raised to at least `--q-per-segment` points (16).
+   The input file's `K_POINTS` block gives the path corners. Each segment is raised to at least `--q-per-segment` points (16).
 2. **Conduction states at k + Q**
-   One H-transform over the deck's band window gives $\psi_{c\,\bk+\bQ}(\br_\mu)$ and $E^{\mathrm{QP}}_{c\,\bk+\bQ}$ for every grid $\bk$ and every path $\bQ$. No shifted DFT run is needed.
+   One H-transform over the input file's band window gives $\psi_{c\,\bk+\bQ}(\br_\mu)$ and $E^{\mathrm{QP}}_{c\,\bk+\bQ}$ for every grid $\bk$ and every path $\bQ$. No shifted DFT run is needed.
 3. **Kernels at Q**
    The exchange $V_\bQ(\mu,\nu)$ comes from the route `--vq-mode` selects. The direct $W_\bq(\mu,\nu;0)$ is the restart's, unchanged, because every momentum transfer $\bk-\bk'$ stays on the grid.
 4. **Solve along the path**
@@ -55,12 +55,12 @@ Exchange at $\bQ$
 
 === "Local"
     ```bash
-    # deck keys in the -i deck: number_val_bands_fine = 4, number_cond_bands_fine = 4, number_eigenvalues = 6
+    # input keys in the -i input file: number_val_bands_fine = 4, number_cond_bands_fine = 4, number_eigenvalues = 6
     uv run python -u -m bse.exciton_bands -i cohsex.in --vq-mode refit
     ```
 === "Perlmutter"
     ```bash
-    # deck keys in the -i deck: number_val_bands_fine = 4, number_cond_bands_fine = 4, number_eigenvalues = 6
+    # input keys in the -i input file: number_val_bands_fine = 4, number_cond_bands_fine = 4, number_eigenvalues = 6
     srun -n 4 python -u -m bse.exciton_bands -i cohsex.in --vq-mode refit
     ```
 === "Frontera"
@@ -68,7 +68,7 @@ Exchange at $\bQ$
     sbatch exciton_bands_dev.sbatch   # gw_dev.sbatch with "-m bse.exciton_bands ..." on its exec line
     ```
 
-Run it in the GW run directory: the deck locates the one ISDF tensor file beside it or in `tmp/`. The device mesh is the run's square startup mesh. The deck is the GW deck plus a `K_POINTS` block. A minimal production deck for a bulk crystal:
+Run it in the GW run directory: the input file locates the one ISDF tensor file beside it or in `tmp/`. The device mesh is the run's square startup mesh. The input file is the GW input file plus a `K_POINTS` block. A minimal production input file for a bulk crystal:
 
 ```ini
 [cohsex]
@@ -99,10 +99,10 @@ K_POINTS crystal_b
     --vq-mode refit
     ```
 
-    **Note** The default `--refit-window zeta` needs the deck's `nval`/`ncond` to reach exactly the GW run's ζ-fit window.
+    **Note** The default `--refit-window zeta` needs the input file's `nval`/`ncond` to reach exactly the GW run's ζ-fit window.
 
 ??? treatment production "interp · closed-form interpolant · slab only (default)"
-    The coarse tiles split into a short-range part, interpolated on a lattice stencil, and a long-range part, fitted once by a polynomial model of the form factors. One dispatch per $\bQ$. Refuses a bundle not built as a slab (judged from its Coulomb stamp and the cell, not the deck) and IBZ-only ζ storage.
+    The coarse tiles split into a short-range part, interpolated on a lattice stencil, and a long-range part, fitted once by a polynomial model of the form factors. One dispatch per $\bQ$. Refuses a bundle not built as a slab (judged from its Coulomb stamp and the cell, not the input file) and IBZ-only ζ storage.
 
     ```ini
     --vq-mode interp
@@ -125,18 +125,18 @@ K_POINTS crystal_b
 ## Refusals {: #refusals }
 
 !!! refuses
-    - A deck with no `K_POINTS` block. Add the path block.
-    - No `isdf_tensors_*.h5` beside the deck or in its `tmp/`, or more than one. Leave exactly one.
+    - An input file with no `K_POINTS` block. Add the path block.
+    - No `isdf_tensors_*.h5` beside the input file or in its `tmp/`, or more than one. Leave exactly one.
     - A `centroids_file` that does not exist, or whose point count differs from the restart's $N_\mu$. Point it at the table the restart was built on.
     - A downfolded bundle with no `keep_idx`, or no readable parent centroid table. Re-run [downfold](../../utilities/downfold.md#parent_centroids_file) with `parent_centroids_file` set.
     - Any route but `ongrid` with no `zeta_q.h5` beside the restart. `interp` or `both` on a bundle whose Coulomb stamp is not `sys_dim = 2` (unstamped passes), on a cell that is not slab-separable or a $\bq$ grid that is not planar, or with IBZ-only `zeta_q.h5`. Use `refit` or `ongrid`.
     - `ongrid` with a $\bQ$ off the exchange-tile grid, or on a bundle with no stored exchange tensor.
     - `refit` on a bundle with no stored exchange tensor, or whose ζ provenance lacks the rank-truncated solve and its `zeta_rcond`.
-    - `--refit-window zeta` with a deck window other than the GW run's ζ-fit window. `--refit-window bse` with a deck window outside it, with `--vq-mode` other than `refit`, or with no finite on-grid $\bQ$ on the path.
+    - `--refit-window zeta` with an input file window other than the GW run's ζ-fit window. `--refit-window bse` with an input file window outside it, with `--vq-mode` other than `refit`, or with no finite on-grid $\bQ$ on the path.
     - A refit whose on-grid tiles miss the stored ones by more than 5 % (relative), or whose on-grid eigenvalues miss the stored-tile eigenvalues by more than the `--cert-grade` tolerance (0.01 meV, or 1.0 meV).
-    - `--head-minibz-average`, or the deck's `head_minibz_average = true`, with `--vq-mode refit`. A `dipole.h5` whose $\bk$ count differs from the BSE grid.
+    - `--head-minibz-average`, or the input file's `head_minibz_average = true`, with `--vq-mode refit`. A `dipole.h5` whose $\bk$ count differs from the BSE grid.
     - A BSE window edge inside a degenerate multiplet (`band_degeneracy = strict`), on the loaded window or on the H-transform conduction window.
-    - A BSE conduction window that does not fit inside the deck's H-transform window. Raise `ncond`.
+    - A BSE conduction window that does not fit inside the input file's H-transform window. Raise `ncond`.
     - H-transform conduction energies at $\Gamma$ more than 0.05 Ry from the stored ones, or a conduction-subspace overlap below 0.5.
     - `eqp_corrections` on a QP wavefunction, or together with `kgrid_fine` densification. Remove `eqp_corrections`.
     - A `--w-coarse-grid` that does not divide the BSE grid, or with `w_head_densify = srlr`. `w_head_densify = legacy`.

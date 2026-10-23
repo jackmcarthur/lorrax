@@ -8,7 +8,7 @@ page: theory
 `gw.gw_jax` The equations each stage evaluates.
 {: .page-summary }
 
-<div class="chain-map" data-driver="gw" data-page="theory" data-treatment="tangential"></div>
+<div class="workflow-map" data-driver="gw" data-page="theory" data-treatment="tangential"></div>
 
 <div class="section-cards"></div>
 
@@ -232,7 +232,7 @@ By default $\Sigma^c$ is evaluated on shell: the sweep folds each node directly 
 
 `compute_mode` selects the model for $W^c$. `x_only` keeps $\Sigma^x$ alone.
 
-| Treatment | Deck | $W$ evaluated at | Model for $W^c(z)$ | Limits |
+| Treatment | Input file | $W$ evaluated at | Model for $W^c(z)$ | Limits |
 |---|---|---|---|---|
 | COHSEX | `cohsex` | $W(0)$ | static | Refuses metallic occupations |
 | GN-PPM | `gn_ppm` | $W(0)$, $W(i\omega_p)$ | one pole per element | Refuses metallic occupations |
@@ -268,7 +268,7 @@ By default $\Sigma^c$ is evaluated on shell: the sweep folds each node directly 
 
     One pole per matrix element, from $W^c$ at zero and at one imaginary frequency.
 
-    No sum rule is assumed. An element whose $\mathrm{Re}\,\Omega^2$ is not positive and finite takes `ppm_invalid_mode` (default `static_limit`). On a time-reversal-broken deck the anti-Hermitian half of $W^c(i\omega_p)$ gives an odd residue, and the empty and occupied branches take different residues.
+    No sum rule is assumed. An element whose $\mathrm{Re}\,\Omega^2$ is not positive and finite takes `ppm_invalid_mode` (default `static_limit`). On a time-reversal-broken input file the anti-Hermitian half of $W^c(i\omega_p)$ gives an odd residue, and the empty and occupied branches take different residues.
 
     $$
     W^c_\bq(\mu,\nu;z)=R_\bq(\mu,\nu)\left[\frac{1}{z-\Omega_\bq(\mu,\nu)}-\frac{1}{z+\Omega_\bq(\mu,\nu)}\right],\qquad \Omega^2=-z_p^2\,\frac{W^c(z_p)}{W^c(0)-W^c(z_p)},\qquad R=-\tfrac12\Omega\,W^c(0),\qquad z_p=i\omega_p \tag{3.5}
@@ -435,7 +435,7 @@ $\Sigma^B$ is static and is one exchange contraction in every treatment. With ti
 
 ### <span class="n">5.3</span> Routes {: #fc-routes }
 
-| Material | `bispinor_gw` | Deck |
+| Material | `bispinor_gw` | Input file |
 |---|---|---|
 | time-reversal invariant | `bare_transverse` (default) | any `compute_mode` |
 | magnet, half-metal, Hall or Chern state | `full_tangential` | `compute_mode = tangential`, `head_correction = no_local_fields` |

@@ -123,7 +123,7 @@ srun -N 1 -n 4 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh \
   .venv/bin/python -m pytest tests/hsuite -q -p no:cacheprovider
 ```
 
-It ends `1 passed`. `python -m tests.hsuite.chain --out <dir>` runs the same chain outside pytest and leaves every deck, report and output in `<dir>/run/`.
+It ends `1 passed`. `python -m tests.hsuite.chain --out <dir>` runs the same workflow outside pytest and leaves every input file, report and output in `<dir>/run/`.
 
 ## Sizing a job {: #sizing }
 
@@ -131,7 +131,7 @@ It ends `1 passed`. `python -m tests.hsuite.chain --out <dir>` runs the same cha
 - **One GPU model and memory class.** Mixed models refuse (`GATE heterogeneous_gpu_targets`). On Perlmutter a multi-node job requests `-C 'gpu&hbm40g'` or `-C 'gpu&hbm80g'`.
 - **Shared run directory.** A multi-node run writes into a directory every node mounts (`$SCRATCH`, CFS). A node-local one (`/tmp`, local NVMe) refuses at the first write (`GATE io_global_commit`, stage `SlabIO.shared_directory`).
 
-Every planner prices its stage against one budget per device, set from the card's memory before the deck is read:
+Every planner prices its stage against one budget per device, set from the card's memory before the input file is read:
 
 | Card | Budget, `linalg = local` | Budget, `linalg = distributed` |
 |---|---|---|

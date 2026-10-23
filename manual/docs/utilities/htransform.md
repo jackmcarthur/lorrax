@@ -3,7 +3,7 @@
 `bandstructure.htransform` Band energies and states at any $\bk$ from a coarse-grid calculation, by the Hamiltonian transformation of Wu *et al.*
 {: .page-summary }
 
-<div class="chain-map" data-driver="htransform" data-page="files"></div>
+<div class="workflow-map" data-driver="htransform" data-page="files"></div>
 
 The H-transform is the Hamiltonian transformation method of Kai Wu, Yingzhou Li, Wentiao Wu, Lin Lin, Wei Hu and Jinlong Yang, published in *npj Computational Materials* ([1](#refs)). LORRAX implements their method, and the construction, the transform function and the error analysis summarized on this page are theirs.
 {: .lead }
@@ -17,7 +17,7 @@ We prefer it to the usual alternatives for three reasons.
 - **It does the job of Wannier interpolation with fewer knobs.** The authors found it faster to construct than maximally localized Wannier functions, since it has no localization step, and more accurate for entangled bands in their tests.
 
 !!! warning "Interpolate every band from the bottom"
-    The window must start at the lowest valence band and run up to the highest conduction band you need, with a few guard bands above it. Wannier interpolation usually works with a few valence and a few conduction bands, but the H-transform needs all of the valence bands. The standalone driver refuses a window that cuts the occupied manifold and adds 4 guard bands by default ([`--guard-bands`](#-guard-bands)). Inside the BSE drivers no guard bands are added, so the deck's band count must leave at least four bands above the bands the BSE uses.
+    The window must start at the lowest valence band and run up to the highest conduction band you need, with a few guard bands above it. Wannier interpolation usually works with a few valence and a few conduction bands, but the H-transform needs all of the valence bands. The standalone driver refuses a window that cuts the occupied manifold and adds 4 guard bands by default ([`--guard-bands`](#-guard-bands)). Inside the BSE drivers no guard bands are added, so the input file's band count must leave at least four bands above the bands the BSE uses.
 
 <div class="glance" markdown>
 
@@ -25,7 +25,7 @@ Invoke
 :   `python -m bandstructure.htransform -i ht.in`
 
 Reads
-:   deck, `WFN.h5` (or `WFN_qp.h5`), `centroids_file`; optionally `eqp1.dat`, `qp_wfn_rotations.h5`, `galerkin_dft.h5`
+:   input file, `WFN.h5` (or `WFN_qp.h5`), `centroids_file`; optionally `eqp1.dat`, `qp_wfn_rotations.h5`, `galerkin_dft.h5`
 
 Writes
 :   `bandstructure.dat`, `htransform.out`, `galerkin_dft.h5`
@@ -120,7 +120,7 @@ The utility runs on its own to draw a band structure, described on [Band structu
 
 ## Keywords {: #keywords }
 
-Deck keys are `[cohsex]` keys, written `key = value`, energies in Ry; flags are those of `python -m bandstructure.htransform`. Unknown deck keys refuse. Defaults are read from the keyword schema (`src/gw/gw_config.py`) and the driver's argparse (`src/bandstructure/htransform.py`).
+Input keys are `[cohsex]` keys, written `key = value`, energies in Ry; flags are those of `python -m bandstructure.htransform`. Unknown input keys refuse. Defaults are read from the keyword schema (`src/gw/gw_config.py`) and the driver's argparse (`src/bandstructure/htransform.py`).
 
 Required
 {: .kw-group }
@@ -128,7 +128,7 @@ Required
 **Files and run**
 
 ### `-i`, `--input` {: .kw data-type="path" data-default="required" }
-The deck. Relative output paths resolve beside it.
+The input file. Relative output paths resolve beside it.
 
 ### `centroids_file` {: .kw data-type="path" data-default="required" }
 Centroid table $\br_\mu$ at which $Q_\alpha$ and $\psi_{n\bk_{\mathrm{fi}}}$ are evaluated.
@@ -153,20 +153,20 @@ On the BSE routes this is the whole $f(H)$ window, with no automatic guard bands
 ### `number_bands` {: .kw data-type="int" data-default="required" }
 Bands loaded from the WFN; above it ψ is zero-padded. Alias `nband`.
 
-With guard bands the driver raises it to $n_{\mathrm{occ}}+$`ncond`$+N_{\mathrm{guard}}$. On the BSE routes it must cover the deck window.
+With guard bands the driver raises it to $n_{\mathrm{occ}}+$`ncond`$+N_{\mathrm{guard}}$. On the BSE routes it must cover the input file window.
 {: .kw-details }
 
 **Shared keys**
 
 ### `sys_dim` {: .kw data-type="int" data-default="required" }
-Not used by the interpolation; stamped for the BSE consumers. A deck without it refuses.
+Not used by the interpolation; stamped for the BSE consumers. An input file without it refuses.
 
 Optional
 {: .kw-group }
 
 **Files and run**
 
-### `-wfn`, `--wfn-file` {: .kw data-type="path" data-default="the deck's wfn_file" }
+### `-wfn`, `--wfn-file` {: .kw data-type="path" data-default="the input file's wfn_file" }
 Another WFN, for example `WFN_qp.h5` for QSGW bands.
 
 A QP WFN combined with `--eqp-file` or `--qp-rotations` refuses.
@@ -252,7 +252,7 @@ Test only: extra exact-null basis directions for pad-invariance tests.
 :   Report: windows, $a$ and $E^{\mathrm{top}}$, basis rank and projection receipt, locality receipt, coarse-point check, timings.
 
 `galerkin_dft.h5`
-:   The compressed basis. Published once beside the deck and never overwritten; reused only on an exact provenance match, otherwise refitted in memory.
+:   The compressed basis. Published once beside the input file and never overwritten; reused only on an exact provenance match, otherwise refitted in memory.
 
 </div>
 
@@ -304,7 +304,7 @@ galerkin_dft.h5
     - `--eqp-file` together with `--qp-rotations`, or either with a QP WFN (`-wfn WFN_qp.h5`).
     - An `--eqp-file` that is missing or not a wedge `eqp1.dat`.
     - A `qp_rotations_file` file whose QP block does not start at the fitted window's lower edge inside it, or whose WFN fingerprint, bands, grid or $\bk$ coordinates differ.
-    - A deck without `sys_dim`, or with an unknown key.
+    - An input file without `sys_dim`, or with an unknown key.
 
 The refusals of the path and of the fine grid are on their own pages.
 

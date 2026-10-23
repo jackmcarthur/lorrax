@@ -3,7 +3,7 @@
 `gw.kin_ion_io` The mean-field one-body matrix $\langle m\bk|T+V^{\mathrm{ion}}|n\bk\rangle$ in the DFT band basis.
 {: .page-summary }
 
-<div class="chain-map" data-driver="kin-ion" data-page="files"></div>
+<div class="workflow-map" data-driver="kin-ion" data-page="files"></div>
 
 Writes the kinetic plus ionic part of the mean-field Hamiltonian, $\langle m\bk|T + V^{\mathrm{loc}} + V^{\mathrm{NL}}_\bk|n\bk\rangle$, to `kin_ion.h5` for the protected bands, every occupied band plus the `ncond` protected conduction bands whose quasiparticle energies GW corrects.
 {: .lead }
@@ -22,7 +22,7 @@ Invoke
 :   `python -m gw.kin_ion_io -i gw.in`
 
 Reads
-:   deck (`-i`), `WFN.h5`, `*.upf`
+:   input file (`-i`), `WFN.h5`, `*.upf`
 
 Writes
 :   `kin_ion.h5`, `kin_ion.out`
@@ -42,7 +42,7 @@ Hartree
 On the plane-wave sphere of each $\bk$, $T$ is $|\bk+\bG|^2$ (Ry), $V^{\mathrm{loc}}$ is the sum of the ionic local potentials, applied in real space, and $V^{\mathrm{NL}}_\bk$ is the separable projector sum of the UPF files, $j$-resolved when Quantum ESPRESSO's `<spinorbit>` record says so. With `sys_dim = 2` the long-range ionic tail of $V^{\mathrm{loc}}$ carries the slab Coulomb cutoff, so `kin_ion.h5` fixes the truncation for the whole GW run. No density enters: the operators commute with the space group and time reversal, so the matrix is computed on the star wedge and unfolded on read. The projectors and their $\bk$-derivative are described on [Velocity operator](../theory/velocity-operator.md).
 
 !!! note
-    `kin_ion.h5` holds no Hartree term. GW builds $V^{\mathrm H}$ from the density at run time, and on self-consistent decks from the current orbitals ([Physics overview](../theory/physics.md)). A file in the retired format with $V^{\mathrm H}$ folded in (`has_hartree = true`) refuses in GW.
+    `kin_ion.h5` holds no Hartree term. GW builds $V^{\mathrm H}$ from the density at run time, and on self-consistent input files from the current orbitals ([Physics overview](../theory/physics.md)). A file in the retired format with $V^{\mathrm H}$ folded in (`has_hartree = true`) refuses in GW.
 
 ## Running {: #run }
 
@@ -59,7 +59,7 @@ On the plane-wave sphere of each $\bk$, $T$ is $|\bk+\bG|^2$ (Ry), $V^{\mathrm{l
     $LORRAX_PY -u -m gw.kin_ion_io -i gw.in
     ```
 
-Use the GW deck itself. Every physical setting, the system dimension, the protected band window and the spinor model, is taken from it, and a command-line flag may only confirm it. The deck lines it reads:
+Use the GW input file itself. Every physical setting, the system dimension, the protected band window and the spinor model, is taken from it, and a command-line flag may only confirm it. The input file lines it reads:
 
 ```ini
 wfn_file      = WFN.h5
@@ -71,7 +71,7 @@ number_bands  = 200
 
 ## Keywords {: #keywords }
 
-Defaults are read from the argument parser (`src/gw/kin_ion_io.py`) and the keyword schema (`src/gw/gw_config.py`). Every physical setting comes from the GW deck, and the file covers the protected bands, every occupied band plus the `ncond` protected conduction bands.
+Defaults are read from the argument parser (`src/gw/kin_ion_io.py`) and the keyword schema (`src/gw/gw_config.py`). Every physical setting comes from the GW input file, and the file covers the protected bands, every occupied band plus the `ncond` protected conduction bands.
 
 Required
 {: .kw-group }
@@ -79,16 +79,16 @@ Required
 **Command line**
 
 ### `-i`, `--input` {: .kw data-type="path" data-default="required" }
-The GW deck.
+The GW input file.
 
-**Deck keys**
+**Input keys**
 
-The deck passes through the GW reader, so an unknown key or a missing `sys_dim` refuses.
+The input file passes through the GW reader, so an unknown key or a missing `sys_dim` refuses.
 
 ### `sys_dim` {: .kw data-type="int" data-default="required" }
 `3` bulk, `2` slab with vacuum along $c$, `0` molecule.
 
-`2` puts the slab cutoff on the long-range part of $V^{\mathrm{loc}}$. The value is stamped, and GW refuses a file whose stamp differs from its deck.
+`2` puts the slab cutoff on the long-range part of $V^{\mathrm{loc}}$. The value is stamped, and GW refuses a file whose stamp differs from its input file.
 {: .kw-details }
 
 `0` `2` `3`
@@ -112,7 +112,7 @@ Optional
 **Command line**
 
 ### `-o`, `--output` {: .kw data-type="path" data-default="kin_ion.h5" }
-Output file; by default `kin_ion.h5` in the deck directory.
+Output file; by default `kin_ion.h5` in the input file directory.
 
 GW reads the file named by its `kin_ion_file` key.
 {: .kw-details }
@@ -120,22 +120,22 @@ GW reads the file named by its `kin_ion_file` key.
 ### `--report-file` {: .kw data-type="path" data-default="kin_ion.out" }
 Run report; by default `kin_ion.out` beside the output file.
 
-### `--pseudo_dir` {: .kw data-type="path" data-default="deck directory" }
+### `--pseudo_dir` {: .kw data-type="path" data-default="input file directory" }
 Directory scanned for `*.upf`.
 
-When it holds none, `../qe/scf` and then `../qe/nscf`, relative to the deck, are tried.
+When it holds none, `../qe/scf` and then `../qe/nscf`, relative to the input file, are tried.
 {: .kw-details }
 
-### `--sys_dim` {: .kw data-type="int" data-default="the deck's" }
-System dimension; may only confirm the deck's `sys_dim`. A contradiction refuses.
+### `--sys_dim` {: .kw data-type="int" data-default="the input file's" }
+System dimension; may only confirm the input file's `sys_dim`. A contradiction refuses.
 
-**Deck keys**
+**Input keys**
 
-### `number_bands` {: .kw data-type="int" data-default="GW deck" }
+### `number_bands` {: .kw data-type="int" data-default="GW input file" }
 Top of the $\chi^0$ and $\Sigma$ band sums of the GW run. Alias `nband`. Kin-ion only stamps it, because the quasiparticle Hamiltonian needs the one-body matrix on the protected bands alone.
 
 ### `wfn_file` {: .kw data-type="string" data-default="WFN.h5" }
-Wavefunction file, relative to the deck directory.
+Wavefunction file, relative to the input file directory.
 
 ### `bispinor` {: .kw data-type="bool" data-default="false" }
 Four-component run. Stamped; GW refuses a file whose stamp differs.
@@ -197,18 +197,18 @@ kin_ion.h5
 
 The reader (`file_io.restart_bundle.load_kin_ion_submatrix`) unfolds the stored rows to all $n_\bk$ points through `irr_idx_k` and `sym_idx_k`, conjugating the time-reversed rows. After writing, the utility checks that on every degenerate DFT manifold the written block is a multiple of the identity and reports any block that is not.
 
-Before reading the slab GW refuses a file that is in the folded-Hartree format, has no `bispinor` stamp or a different one, or whose `sys_dim`, `nspinor`, full-BZ count or band extent does not match the run. The fix is to rerun this utility with the run's deck. The `wfn_fingerprint`, `input_file` and `pseudopotentials` stamps are recorded but not compared: a file built from another WFN with the same shape is read.
+Before reading the slab GW refuses a file that is in the folded-Hartree format, has no `bispinor` stamp or a different one, or whose `sys_dim`, `nspinor`, full-BZ count or band extent does not match the run. The fix is to rerun this utility with the run's input file. The `wfn_fingerprint`, `input_file` and `pseudopotentials` stamps are recorded but not compared: a file built from another WFN with the same shape is read.
 
 ## Refusals {: #refusals }
 
 !!! refuses
-    - A deck without `sys_dim`, or with an unknown key.
-    - `--sys_dim` that contradicts the deck's `sys_dim`. Fix the deck.
+    - An input file without `sys_dim`, or with an unknown key.
+    - `--sys_dim` that contradicts the input file's `sys_dim`. Fix the input file.
     - `bispinor_gw = full_static_cohsex` without `bispinor = true`.
     - `number_bands_protected` below the occupied-band count or above `number_bands`.
     - A `WFN.h5` with fewer bands than $n_\mathrm{occ} + \texttt{ncond}$.
     - A `WFN.h5` whose `grid_rho` differs from the wavefunction FFT box.
-    - No `*.upf` found, or pseudopotentials that do not cover every species. Stage the files beside the deck or pass `--pseudo_dir`.
+    - No `*.upf` found, or pseudopotentials that do not cover every species. Stage the files beside the input file or pass `--pseudo_dir`.
     - `sys_dim` other than `0`, `2` or `3`.
     - Fully relativistic pseudopotentials on a two-component WFN with no `<spinorbit>` record, or `<spinorbit>` true on a one-component WFN.
 

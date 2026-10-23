@@ -8,9 +8,9 @@ page: deps
 `psp.run_nscf` What run_nscf needs and what reads its output.
 {: .page-summary }
 
-<div class="chain-map" data-driver="nscf" data-page="deps"></div>
+<div class="workflow-map" data-driver="nscf" data-page="deps"></div>
 
-## Position in the chain {: #chain }
+## Position in the workflow {: #chain }
 
 <div class="updown" markdown>
 

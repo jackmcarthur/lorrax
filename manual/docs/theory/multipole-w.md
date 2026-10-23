@@ -24,7 +24,7 @@ This page is unlisted. It collects what the GW and theory pages used to say abou
     mpa_n_poles   = 8
     ```
 
-    **Note** Before 2026-10-22 the deck also read `sigma_w_model = mpa`, the key's default, so `compute_mode = mpa` alone already selected this route. Runs on metals; refuses a time-reversal-broken metal.
+    **Note** Before 2026-10-22 the input file also read `sigma_w_model = mpa`, the key's default, so `compute_mode = mpa` alone already selected this route. Runs on metals; refuses a time-reversal-broken metal.
 
 ## The model {: #model }
 
@@ -103,7 +103,7 @@ On a metal, the default `sigma_w_model` was `mpa` (elementwise poles), a compari
 |---|---|---|
 | `compute_mode = mpa` (formerly with `sigma_w_model = mpa`) | runs if time reversal holds | `mpa_ordered_metal` |
 
-In the [time-reversal consumer table](symmetry.md#sym-trs-consumers), the MPA fit carries a second, odd residue when time reversal is broken, like the GN-PPM fit, and elementwise MPA on a metal refuses a time-reversal-broken deck, like `hl_ppm`. On a magnetic deck ([Inputs from DFT](../using/inputs-from-dft.md)) the elementwise multipole fit carries that odd residue per pole and refuses on a metal. Multipole residues, like the tangential ones, use the transpose rule of [Symmetry](symmetry.md).
+In the [time-reversal consumer table](symmetry.md#sym-trs-consumers), the MPA fit carries a second, odd residue when time reversal is broken, like the GN-PPM fit, and elementwise MPA on a metal refuses a time-reversal-broken input file, like `hl_ppm`. On a magnetic input file ([Inputs from DFT](../using/inputs-from-dft.md)) the elementwise multipole fit carries that odd residue per pole and refuses on a metal. Multipole residues, like the tangential ones, use the transpose rule of [Symmetry](symmetry.md).
 
 ## χ⁰ on the sample lines {: #mpa-lines }
 
@@ -151,7 +151,7 @@ On the elementwise MPA route the head is sampled on the body's $2n_p$ complex sa
 
 ## Files {: #files }
 
-| File | Deck key | Produced by | Note |
+| File | Input key | Produced by | Note |
 |---|---|---|---|
 | `tmp/mpa/mpa_fit_<label>.h5` | `mpa_fit_reuse_file` | an earlier GW run | A finalized elementwise-MPA fit, reused by a one-shot run. |
 

@@ -22,9 +22,9 @@ The standalone [H-transform utility](htransform.md) interpolates the bands of a 
     sbatch ht.sbatch
     ```
 
-QSGW bands: add `-wfn WFN_qp.h5` (the SC run's QP WFN) or `--qp-rotations qp_wfn_rotations.h5`. Diagonal one-shot QP energies: `--eqp-file eqp1.dat`. Relative output paths resolve beside the deck.
+QSGW bands: add `-wfn WFN_qp.h5` (the SC run's QP WFN) or `--qp-rotations qp_wfn_rotations.h5`. Diagonal one-shot QP energies: `--eqp-file eqp1.dat`. Relative output paths resolve beside the input file.
 
-A minimal deck is a GW deck whose `nval` equals the number of occupied bands, plus a path:
+A minimal input file is a GW input file whose `nval` equals the number of occupied bands, plus a path:
 
 ```ini
 [cohsex]
@@ -48,7 +48,7 @@ This path has $1+40+40=81$ points: each corner's count is the number of points o
 The path can be coloured by three kinds of band character, each requested with `--color` and written to `bands_<color>.png`, with the operator expectation values in `band_operators_path.npz`.
 
 - **Spin.** `--color spin` colours each state by $\langle\boldsymbol\sigma\cdot\mathbf n\rangle$, with $\mathbf n$ the magnetization axis read from the WFN.
-- **Atomic-orbital character.** `--color orbital:d` or `--color orbital:Fe:d` colours by the weight on the atomic functions of one angular momentum, optionally of one element, taken from the `PP_PSWFC` records of the `*.upf` files beside the deck.
+- **Atomic-orbital character.** `--color orbital:d` or `--color orbital:Fe:d` colours by the weight on the atomic functions of one angular momentum, optionally of one element, taken from the `PP_PSWFC` records of the `*.upf` files beside the input file.
 - **Orbital moment.** `--color orbital` colours by the band-resolved orbital moment $\mathbf n\cdot\mathbf m_n$ of the modern theory, averaged over degenerate multiplets. It needs the velocity matrix of the WFN's own states (`--velocity dipole.h5`). The theory, the totals printed in the report and `--moments-grid` are on [Orbital magnetization](../theory/orbital-magnetization.md).
 
 ## Keywords {: #keywords }
@@ -130,7 +130,7 @@ Plain text, one line per path point and band. The values shown are a format samp
 !!! refuses
     - A band-selection tie on the path wider than the multiplet tolerance.
     - `--velocity` with `--eqp-file` or `--qp-rotations`; `--color orbital` without `--velocity`; an unknown `--color`; `--color` or `--plot` without a path.
-    - `--color orbital:[EL:]l` without `*.upf` files beside the deck.
+    - `--color orbital:[EL:]l` without `*.upf` files beside the input file.
 
 The refusals of the band window, the basis and the QP energies are on the [overview](htransform.md#refusals).
 

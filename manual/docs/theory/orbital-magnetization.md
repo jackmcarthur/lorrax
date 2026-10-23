@@ -107,7 +107,7 @@ The orbital moment is an option of the band-structure utility, and a standalone 
 `bandstructure.htransform.band_character_and_moments`
 {: .in-code }
 
-The velocity comes from the [dipole utility](../utilities/dipole.md), run on the deck's own WFN. The band-structure run then names it:
+The velocity comes from the [dipole utility](../utilities/dipole.md), run on the input file's own WFN. The band-structure run then names it:
 
 ```bash
 python -m psp.get_dipole_mtxels -i ht.in                       # writes dipole.h5
@@ -137,7 +137,7 @@ For QSGW the run reads the self-consistent run's `WFN_qp.h5` with its `dipole_qs
 `psp.orbital_magnetization.main`
 {: .in-code }
 
-`python -m psp.orbital_magnetization --wfn WFN.h5` evaluates (1.6) on the full zone of a DFT spinor WFN, at $T=0$ with an integer number of occupied bands, and needs no deck. The velocity comes from `velocity_only.h5` in the WFN's directory when that file exists. The dipole utility writes it with
+`python -m psp.orbital_magnetization --wfn WFN.h5` evaluates (1.6) on the full zone of a DFT spinor WFN, at $T=0$ with an integer number of occupied bands, and needs no input file. The velocity comes from `velocity_only.h5` in the WFN's directory when that file exists. The dipole utility writes it with
 
 ```bash
 python -m psp.get_dipole_mtxels -i gw.in --parallel-transport-out velocity_only.h5 --parallel-transport-velocity-only

@@ -46,7 +46,7 @@ The product form holds for scalar wavefunctions; on spinors $s$ is the open-spin
 `centroid.production_output.prune_band_ranges`
 {: .in-code }
 
-The default window pair is $L = [0, N_v + N_c^\Sigma)$ and $R = [0, N_b)$: every occupied band plus the deck's `ncond` on the left, every band of the WFN on the right. Without a deck (`-i`) the Σ window is unknown and $L$ widens to $R$. The windows are written into the centroid file's header, and the GW run compares them with its own fit windows ([ISDF §1.2](isdf.md)).
+The default window pair is $L = [0, N_v + N_c^\Sigma)$ and $R = [0, N_b)$: every occupied band plus the input file's `ncond` on the left, every band of the WFN on the right. Without an input file (`-i`) the Σ window is unknown and $L$ widens to $R$. The windows are written into the centroid file's header, and the GW run compares them with its own fit windows ([ISDF §1.2](isdf.md)).
 
 The right window must reach the top of every band sum the centroid file will serve. A basis selected on a smaller window is wrong by electron-volts in $\Sigma^c$ while every upstream check passes ([ISDF §4.4](isdf.md)). The selector flags are on [centroids](../utilities/centroids.md).
 
@@ -168,7 +168,7 @@ The selector recovers the spatial Seitz operations $\{R|\boldsymbol\tau\}$ that 
 
 ### <span class="n">5.2</span> What the GW run checks {: #cs-closure-check }
 
-On load, the GW run measures whether each operation of the WFN's group permutes the points ([Symmetry](symmetry.md)). A set that is not closed runs, with a warning, on every k and q. Its ISDF tensor file stores every q (4.15× larger on a small Si BSE test deck), and on the 960-point Si test set $\Sigma$ spreads across a k star by 16.9 meV, against 0.7 meV on a closed set.
+On load, the GW run measures whether each operation of the WFN's group permutes the points ([Symmetry](symmetry.md)). A set that is not closed runs, with a warning, on every k and q. Its ISDF tensor file stores every q (4.15× larger on a small Si BSE test input file), and on the 960-point Si test set $\Sigma$ spreads across a k star by 16.9 meV, against 0.7 meV on a closed set.
 
 ### <span class="n">5.3</span> Current-density points {: #cs-current }
 

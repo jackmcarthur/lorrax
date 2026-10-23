@@ -8,24 +8,24 @@ page: files
 `bse.bse_jax` Formats of the files the BSE driver and `bse.absorption_haydock` read and write.
 {: .page-summary }
 
-<div class="chain-map" data-driver="bse" data-page="files"></div>
+<div class="workflow-map" data-driver="bse" data-page="files"></div>
 
 ## Inputs {: #inputs }
 
-Relative `wfn_file` and `centroids_file` resolve against the deck's directory; paths given on the command line resolve against the working directory.
+Relative `wfn_file` and `centroids_file` resolve against the input file's directory; paths given on the command line resolve against the working directory.
 
-| File | Deck key | Produced by | Note |
+| File | Input key | Produced by | Note |
 |---|---|---|---|
-| deck | `-i` | user | The GW deck. Its directory locates the ISDF tensor file. |
-| `isdf_tensors_<N_mu>.h5` | — | gw | ISDF tensor file. Exactly one, beside the deck or in its `tmp/`. Every route; read, never written. |
+| input file | `-i` | user | The GW input file. Its directory locates the ISDF tensor file. |
+| `isdf_tensors_<N_mu>.h5` | — | gw | ISDF tensor file. Exactly one, beside the input file or in its `tmp/`. Every route; read, never written. |
 | `WFN.h5` | `wfn_file` | nscf, or DFT + pw2bgw | Occupied count, cell volume, bundle authentication; under `kgrid_fine`, the band interpolation. `WFN_qp.h5` from a QSGW run is accepted. |
 | `centroids_frac_<N>.txt` | `centroids_file` | centroids | Content hash authenticates the bundle; under `bse_k_grid`, the interpolation points. On a downfolded bundle, the parent table recorded in the bundle. |
 | `eqp1.dat` | `eqp_corrections` | gw | Eigensolve route and `bse.absorption_haydock`. Diagonal QP energies on the irreducible wedge, unfolded on load. Format: [GW files](../gw/files.md#eqp). |
 | `dipole.h5` | `dipole_file` | dipole | Velocity matrix elements and `band_energies`. `bse.bse_jax`: the per-state dipoles, `absorption_eh.dat`/`absorption_noeh.dat` and the Haydock seed (TDA). `bse.absorption_haydock`: always, default `dipole.h5`. |
 | `dipole_qsgw.h5` | `dipole_file` | gw (QSGW) | Same layout, stamped `basis = qp`; pairs only with `WFN_qp.h5`. |
-| `dipole.h5` beside the deck | — | dipole | The head tensor $S$ when the bundle has no `S_cart_head`: under `kgrid_fine`, and in a $W(0)$ rebuild. |
+| `dipole.h5` beside the input file | — | dipole | The head tensor $S$ when the bundle has no `S_cart_head`: under `kgrid_fine`, and in a $W(0)$ rebuild. |
 | `zeta_q.h5` beside the bundle | — | gw | Only for a $W(0)$ rebuild, and for `head_minibz_average = true` under `kgrid_fine`. |
-| `eps0mat.h5` beside the deck | — | BerkeleyGW `epsilon.x` | Only for a $W(0)$ rebuild with `wcoul0_source = epshead`. |
+| `eps0mat.h5` beside the input file | — | BerkeleyGW `epsilon.x` | Only for a $W(0)$ rebuild with `wcoul0_source = epshead`. |
 
 No file from the [htransform](../../utilities/htransform.md) utility is read: under `kgrid_fine` the band interpolation runs inside the driver ([Theory §1.3](theory.md#grid-bands)).
 
@@ -41,7 +41,7 @@ The bundle's full schema belongs to the [GW Files](../gw/files.md#restart) page.
 | `kgrid` | The coarse grid $(N_x, N_y, N_z)$. |
 | `psi_parent_y` | $\psi_{n\bk}(\br_\mu)$ on the parent k rows, $(k_{\mathrm{parent}}, N_b, n_{\mathrm{spinor}}, N_\mu)$; only the window bands are read and unfolded to the full grid. |
 | `psi_parent_k_rows` | Parent rows, checked against the WFN's wedge. |
-| `band_window`, `band_window_split`, `band_window_carrier`, `n_rmu_logical` | Authentication against the deck's band keys and $N_\mu$. |
+| `band_window`, `band_window_split`, `band_window_carrier`, `n_rmu_logical` | Authentication against the input file's band keys and $N_\mu$. |
 | `zeta_fit_windows` | The ζ-fit legs that must hold the BSE window; older bundles fall back on `band_window`. |
 | `V_qmunu` (`V_ready`) | The $V_{\bq=0}(\mu,\nu)$ tile only. |
 | `W0_qmunu` (`W0_ready`) | $W_\bq(\mu,\nu;0)$, unfolded from its q parents to the full grid on load. Absent or not ready: rebuilt in memory. |
@@ -60,13 +60,13 @@ The bundle's full schema belongs to the [GW Files](../gw/files.md#restart) page.
 :   Run report of the eigensolve route (`--report-file`): pathways, environment, window, exciton energies in eV, stage timings and the files read and written.
 
 `eigenvalues.dat`, `eigenvalues_b1.dat` … `eigenvalues_b3.dat`
-:   Eigensolve route: every root in BerkeleyGW's format, under its names: `eigenvalues.dat` for one polarization (a deck `polarization`, or no `dipole_file`), `eigenvalues_b1.dat` … `_b3.dat` for the three Cartesian axes. A triplet run writes the same files and rows, with BerkeleyGW's ` mg ` in the column header.
+:   Eigensolve route: every root in BerkeleyGW's format, under its names: `eigenvalues.dat` for one polarization (an input file `polarization`, or no `dipole_file`), `eigenvalues_b1.dat` … `_b3.dat` for the three Cartesian axes. A triplet run writes the same files and rows, with BerkeleyGW's ` mg ` in the column header.
 
 `absorption_eh.dat`, `absorption_noeh.dat` (or `absorption_b1_eh.dat` … `_b3_noeh.dat`)
 :   Eigensolve route with `dipole_file` and the TDA: BerkeleyGW's four header lines and `4f16.9` rows ($\omega$, $\varepsilon_2$, $\varepsilon_1$, DOS), named per polarization as the eigenvalue files.
 
 `eigenvectors.h5`
-:   `write_eigenvectors`: the lowest $N$ exciton energies and amplitudes in BerkeleyGW's layout, read unchanged by its readers: `exciton_header/versionnumber`, 32-bit integer scalars, `kpts` $(N_k, 3)$, the four eigenvector datasets $(N_Q, N, N_k, n_c, n_v, n_s, 2)$ with the valence index counted down from the VBM, `spin_kernel` 3 spinor, 1 singlet, 0 triplet, 2 local fields, and the deck WFN's `mf_header` (on a `kgrid_fine` grid with the k list replaced and the per-k band data left out). Under the TDA the left and de-excitation datasets are zeros; with `full_bse` they hold $X$, $-Y$ and $Y$. With `dipole_file` it also holds the per-state dipoles as `exciton_data/dipoles`, a LORRAX addition that BerkeleyGW readers ignore.
+:   `write_eigenvectors`: the lowest $N$ exciton energies and amplitudes in BerkeleyGW's layout, read unchanged by its readers: `exciton_header/versionnumber`, 32-bit integer scalars, `kpts` $(N_k, 3)$, the four eigenvector datasets $(N_Q, N, N_k, n_c, n_v, n_s, 2)$ with the valence index counted down from the VBM, `spin_kernel` 3 spinor, 1 singlet, 0 triplet, 2 local fields, and the input file WFN's `mf_header` (on a `kgrid_fine` grid with the k list replaced and the per-k band data left out). Under the TDA the left and de-excitation datasets are zeros; with `full_bse` they hold $X$, $-Y$ and $Y$. With `dipole_file` it also holds the per-state dipoles as `exciton_data/dipoles`, a LORRAX addition that BerkeleyGW readers ignore.
 
 `bse_dos_kpm.png`, `bse_dos_kpm.npz`
 :   `kpm_dos = true`: the exciton density of states, its Chebyshev moments and the window edges (`kpm_plot_file`).
@@ -88,7 +88,7 @@ The eigenvalue files, `eigenvectors.h5` and the `absorption_haydock_b{1,2,3}_eh.
 
 ## bse.out {: #report }
 
-Plain text, written on the eigensolve route only. Sections in order: the input deck; the device mesh; the pathways (Hamiltonian, interaction, eigensolver, iteration mode, band boundary); the WFN environment and k sampling; under `kgrid_fine`, the band-interpolation compression and quality receipts; the window (valence and conduction counts, padded and physical transition counts, requested roots); the exciton spectrum, one line `S<nnn>  <energy in eV>` per root; the stage timings (restart input, eigensolve, exciton dipoles, eigenvector write); the files read and written.
+Plain text, written on the eigensolve route only. Sections in order: the input input file; the device mesh; the pathways (Hamiltonian, interaction, eigensolver, iteration mode, band boundary); the WFN environment and k sampling; under `kgrid_fine`, the band-interpolation compression and quality receipts; the window (valence and conduction counts, padded and physical transition counts, requested roots); the exciton spectrum, one line `S<nnn>  <energy in eV>` per root; the stage timings (restart input, eigensolve, exciton dipoles, eigenvector write); the files read and written.
 
 ## bse_dos_kpm.npz {: #kpm }
 

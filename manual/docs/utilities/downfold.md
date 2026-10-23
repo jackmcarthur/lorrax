@@ -3,7 +3,7 @@
 `gw.downfold_cli` A finished GW ISDF tensor file compressed onto a subset of its centroids, for the BSE.
 {: .page-summary }
 
-<div class="chain-map" data-driver="downfold" data-page="files"></div>
+<div class="workflow-map" data-driver="downfold" data-page="files"></div>
 
 Compresses the bare and screened interaction $V_\bq(\mu,\nu)$, $W_\bq(\mu,\nu;0)$ of a finished GW run from its $N_\mu$ centroids onto a subset of $N_\sigma$ of them, chosen for a retained band window, and writes an ISDF tensor file in the unchanged format. [`bse.bse_jax`](../drivers/bse/index.md) and [`bse.exciton_bands`](../drivers/exciton-bands/index.md) read it with no flag; every stored $(\mu,\nu)$ tensor shrinks by $(N_\sigma/N_\mu)^2$.
 {: .lead }
@@ -14,7 +14,7 @@ Invoke
 :   `python -m gw.downfold_cli -i downfold.in`
 
 Reads
-:   its own `[downfold]` file, `<parent>/tmp/isdf_tensors_<N_μ>.h5`, `<parent>/tmp/zeta_q.h5`, the parent GW deck (`parent_input_file`)
+:   its own `[downfold]` file, `<parent>/tmp/isdf_tensors_<N_μ>.h5`, `<parent>/tmp/zeta_q.h5`, the parent GW input file (`parent_input_file`)
 
 Writes
 :   `<output>/tmp/isdf_tensors_<N_σ>.h5`, `tmp/zeta_q.h5`, `tmp/centroids_frac_<N_σ>_downfold.txt`, `tmp/centroids_frac_<N_μ>_parent.txt`
@@ -89,13 +89,13 @@ Then point the BSE drivers at `output_restart`.
 
 1. Run GW at an $N_\mu$ over-complete for the window to keep. The downfold removes redundancy the parent has; it cannot add any.
 2. Run once with `mu_small = auto` to read the ceiling. For a 20-band window it is about 190 at the default `downfold_rcond` (Si 196, hBN 185), stable to 2 % as the candidate pool grows 9–12×. At `downfold_rcond` 1e-8 and 1e-10 the count (693 and 1208 on Si) grows with the pool and is not a ceiling.
-3. Sweep `mu_small` down from the ceiling. At each value solve the same BSE, same deck and flags, on the parent and on the child, and keep the smallest value whose lowest $\Omega_S$ agree to the target. If none does, widen the window or build a larger parent.
+3. Sweep `mu_small` down from the ceiling. At each value solve the same BSE, same input file and flags, on the parent and on the child, and keep the smallest value whose lowest $\Omega_S$ agree to the target. If none does, widen the window or build a larger parent.
 
 The child serves the retained-window BSE and exciton bands only. It is not validated for $\Sigma$, and pole models do not transform: a GW run on the small basis starts from `centroids_frac_<N_σ>_downfold.txt` and refits.
 
 ## Keywords {: #keywords }
 
-The driver reads its own `[downfold]` file, `key = value`, `#` comments; a GW deck is not accepted. Unknown keys refuse. Defaults are read from the keyword schema (`src/gw/downfold_config.py`) and the driver's argparse (`src/gw/downfold_cli.py`).
+The driver reads its own `[downfold]` file, `key = value`, `#` comments; a GW input file is not accepted. Unknown keys refuse. Defaults are read from the keyword schema (`src/gw/downfold_config.py`) and the driver's argparse (`src/gw/downfold_cli.py`).
 
 Required
 {: .kw-group }
@@ -117,7 +117,7 @@ Relative paths resolve beside the input file. More than one bundle in the direct
 Directory for the small bundle; the driver writes `<dir>/tmp/isdf_tensors_<N_σ>.h5`. Must differ from `source_restart`.
 
 ### `parent_input_file` {: .kw data-type="path" data-default="required" }
-The parent GW deck, which authenticates and unfolds the stored wavefunctions.
+The parent GW input file, which authenticates and unfolds the stored wavefunctions.
 
 **Retained band window**
 
@@ -295,7 +295,7 @@ The run checks $\zeta_{\bq=0,\sigma}(\bG{=}0)$ against the separately transporte
 ## Refusals {: #refusals }
 
 !!! refuses
-    - An input file with no section, a section other than `[downfold]` (for example a GW deck's `[cohsex]`), an unknown key, or INI syntax errors.
+    - An input file with no section, a section other than `[downfold]` (for example a GW input file's `[cohsex]`), an unknown key, or INI syntax errors.
     - `source_restart` or `output_restart` unset; `mu_small` unset, or neither an integer nor `auto`.
     - `source_restart` neither a file nor a directory; no `isdf_tensors_*.h5` under it; more than one. Name the file.
     - `output_restart` equal to `source_restart`. Give the output its own directory.

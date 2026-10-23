@@ -8,7 +8,7 @@ page: overview
 `psp.run_nscf` Kohn–Sham bands on a k-grid from a Quantum ESPRESSO SCF, written as `WFN.h5`.
 {: .page-summary }
 
-<div class="chain-map" data-driver="nscf" data-page="overview"></div>
+<div class="workflow-map" data-driver="nscf" data-page="overview"></div>
 
 Rebuilds the plane-wave Kohn–Sham Hamiltonian $H_\bk = T_\bk + V^{\mathrm{loc}} + V^{\mathrm{NL}}_\bk + V^{\mathrm H} + V^{xc}$ from a converged QE SCF density and solves it for $N_b$ bands at every k-point of the IBZ. It replaces the QE `nscf` + `pw2bgw.x` route and writes the `WFN.h5` that the centroids, dipole and kin-ion utilities and the GW driver read.
 {: .lead }
@@ -19,7 +19,7 @@ Invoke
 :   `python -m psp.run_nscf -i nscf.in`
 
 Reads
-:   deck, `<prefix>.save/data-file-schema.xml`, `<prefix>.save/charge-density.hdf5`, `*.upf`
+:   input file, `<prefix>.save/data-file-schema.xml`, `<prefix>.save/charge-density.hdf5`, `*.upf`
 
 Writes
 :   `WFN.h5`; with `pseudobands = true`, also `WFN_pseudobands.h5`
@@ -68,7 +68,7 @@ High bands
     "$LORRAX_PY" -u -m psp.run_nscf -i "$LORRAX_INPUT"
     ```
 
-k-points are distributed round-robin over processes, and rank 0 writes. A minimal production deck:
+k-points are distributed round-robin over processes, and rank 0 writes. A minimal production input file:
 
 ```ini
 [nscf]
@@ -138,7 +138,7 @@ Centroid pruning refuses a band window above half the plane-wave basis, $\tfrac1
 
 !!! refuses
     - Neither `-i` nor `--save` on the command line.
-    - A deck with no `[nscf]` section.
+    - An input file with no `[nscf]` section.
     - No `data-file-schema.xml` in `save_dir`.
     - No `charge-density.hdf5` in `save_dir`. A QE build without HDF5 writes `charge-density.dat` instead; rebuild QE with HDF5.
     - QE `assume_isolated` other than `none` or `2D`.
