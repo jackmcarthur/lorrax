@@ -606,11 +606,11 @@ class SlabIO:
 
         A request whose payload :meth:`read_slab` would move as bounded file
         rows (large, fully distributed) is read that way, by the same route;
-        a zero-size request is zeros without I/O.  HDF5 refuses two
-        selections of one multi-dataset read that share a file address, so an
-        identical request (a repeated parent) is read once and its value
-        shared, and requests whose boxes overlap on one dataset go in a later
-        disjoint wave (one more dispatch; normally there is one wave).  A
+        a zero-size request is zeros without I/O. HDF5 permits each unique
+        dataset only once per multi-dataset call, so an identical request
+        (a repeated parent) is read once and its value shared, and distinct
+        requests of that dataset go in separate waves, even if disjoint.
+        Different datasets still batch together (normally one wave). A
         library without the handler refuses (GATE slab_io_read_multi).
         """
         requests = list(requests)

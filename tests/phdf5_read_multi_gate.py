@@ -178,7 +178,21 @@ with SlabIO(PATH, mode="r", mesh=mesh) as io:
         ok = ok and cm.puts == 0 and cs.puts == 0
         verdict(case, ok, f"n={len(reqs)} multi(posts={cm.posts}, puts={cm.puts}, syncs={cm.syncs}) "
                           f"read_slab(posts={cs.posts}, puts={cs.puts}, syncs={cs.syncs})")
-    # overlapping windows of one dataset: two disjoint waves, same bytes as read_slab
+    # Disjoint windows of the SAME dataset still need distinct native calls.
+    # An exact duplicate aliases the first result; another dataset can share a wave.
+    reqs = (requests(FACE, [lines[6]], 6, 1) + requests(FACE, [lines[6]], 0, 1)
+            + requests(FACE, [lines[5]], 2, 1) + requests(FACE, [lines[6]], 6, 1))
+    print(f"GATE disjoint_same_dataset START rank={rank}", flush=True)
+    with Count() as cm:
+        multi = io.read_multi([{k: v for k, v in r.items() if k != "k"} for r in reqs],
+                              partition_spec=FACE)
+    single = [io.read_slab(r["name"], shape=r["shape"], offset=r["offset"],
+                           valid_shape=r["valid_shape"], dtype=r["dtype"],
+                           partition_spec=FACE) for r in reqs]
+    verdict("disjoint_same_dataset", cm.posts == 2 and cm.puts == 0
+            and multi[0] is multi[3] and all(same(m, s) and matches_ref(m, expected(r))
+                for m, s, r in zip(multi, single, reqs)), f"posts={cm.posts} puts={cm.puts}")
+    # Overlapping windows of one dataset: distinct waves, same bytes as read_slab.
     reqs = requests(FACE, [lines[6]], 1, 3) + requests(FACE, [lines[6]], 2, 3)
     with Count() as cm:
         multi = io.read_multi([{k: v for k, v in r.items() if k != "k"} for r in reqs],
