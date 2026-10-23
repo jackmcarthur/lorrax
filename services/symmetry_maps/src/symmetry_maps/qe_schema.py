@@ -89,6 +89,8 @@ class QESymmetryReceipt:
     antiunitary: np.ndarray
     #: QE lspinorb (``band_structure/spinorbit``); None if the schema omits it.
     spinorbit: bool | None = None
+    #: QE Coulomb boundary; None means an older/unpopulated receipt, not periodic.
+    assume_isolated: str | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,8 @@ class QESymmetryBinding:
     scf_absolute_magnetization: float | None = None
     #: QE lspinorb, which ``noncolin`` does not imply; None if not recorded.
     spinorbit: bool | None = None
+    #: Boundary fact from the same authenticated XML as the operation typing.
+    assume_isolated: str | None = None
 
     @property
     def n_antiunitary(self) -> int:
@@ -159,6 +163,7 @@ def _read_qe_symmetry_receipt_cached(
     kgrid: np.ndarray | None = None
     noncolin = False
     spinorbit: bool | None = None
+    assume_isolated: str | None = None
     do_magnetization: bool | None = None
     calculation = ""
     absolute_magnetization: float | None = None
@@ -189,6 +194,8 @@ def _read_qe_symmetry_receipt_cached(
             noncolin = _bool_text(elem.text)
         elif tag == "spinorbit" and "band_structure" in ancestry:
             spinorbit = _bool_text(elem.text)
+        elif tag == "assume_isolated" and assume_isolated is None and elem.text:
+            assume_isolated = elem.text.strip() or "none"
         elif tag == "do_magnetization" and "magnetization" in ancestry:
             do_magnetization = _bool_text(elem.text)
         elif tag == "absolute" and "magnetization" in ancestry:
@@ -315,6 +322,7 @@ def _read_qe_symmetry_receipt_cached(
         translations=tnp,
         antiunitary=typed,
         spinorbit=spinorbit,
+        assume_isolated=assume_isolated or "none",
     )
 
 
@@ -397,6 +405,7 @@ def bind_qe_symmetry_receipt(wfn, receipt: QESymmetryReceipt) -> QESymmetryBindi
         qe_permitted_pure_time_reversal=(
             not bool(receipt.noinv) and not magnetic_symmetry),
         spinorbit=receipt.spinorbit,
+        assume_isolated=receipt.assume_isolated,
     )
 
 
@@ -482,6 +491,7 @@ def _binding_signature(binding: QESymmetryBinding) -> tuple:
         tuple(bool(value) for value in binding.antiunitary),
         bool(binding.qe_permitted_pure_time_reversal),
         binding.spinorbit,
+        binding.assume_isolated,
     )
 
 
@@ -531,7 +541,7 @@ def resolve_qe_symmetry_binding(
         paths_text = ", ".join(binding.schema_path for binding in bindings)
         raise ValueError(
             "Multiple QE schemas authenticate the WFN but disagree on "
-            f"antiunitary operation typing or spinorbit: {paths_text}. Keep "
+            f"antiunitary operation typing, spinorbit or DFT boundary: {paths_text}. Keep "
             "only the WFN-generating NSCF *.save beside WFN.h5 (its directory and the "
             "two above it).")
 

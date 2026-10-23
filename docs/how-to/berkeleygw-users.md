@@ -428,6 +428,12 @@ BerkeleyGW forms $E^\mathrm{QP} = E_\mathrm{mf} + \Sigma - V_{xc}$ with
 $V_{xc}$ from `vxc.dat` (or `kih.dat`). LORRAX reads neither: it builds
 $H = T + V_\mathrm{ion} + V_H + \Sigma_{xc}$ from `kin_ion.h5` and a Hartree
 potential it computes from the orbitals ([Hartree](../theory/hartree.md)). The
+ionic and scalar Hartree terms follow the authenticated QE `assume_isolated`
+boundary; the GW screening boundary remains the deck's `sys_dim`. Periodic
+DFT states can therefore be used with slab-truncated GW screening without
+changing their mean-field Hamiltonian. An old `kin_ion.h5` made with the wrong
+boundary must be regenerated.
+The
 implied $V_{xc} = E_\mathrm{DFT} - \langle T + V_\mathrm{ion} + V_H\rangle$
 agrees with QE's own $\langle V_{xc}\rangle$ to 0.85 meV at Γ and 2.95 meV at
 M on monolayer CrI₃ (8×8 grid, bands 100–144). Both codes print absolute

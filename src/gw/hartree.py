@@ -140,6 +140,7 @@ class ExactHartreeMatrices(NamedTuple):
 def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
                           nb: int, mesh=None,
                           include_transverse: bool = False,
+                          transverse_truncation_2d: bool | None = None,
                           charge_nspinor: int | None = None,
                           bispinor_lift: str = "raw",
                           print_fn=None,
@@ -164,9 +165,11 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
     (``psp.get_DFT_mtxels.local_potential_scalars``) V_loc takes — the
     two plans call it, so they agree by construction and differ only in
     the reassociation the sharding forces on the G sum.
-    ``truncation_2d`` MUST be the run's own convention (deck
-    ``sys_dim``); mixing it with V_loc's is a large systematic error
-    inside a ~500 eV cancellation.
+    ``truncation_2d`` MUST match the DFT ionic operator's QE convention;
+    mixing it with V_loc's is a large systematic error inside a ~500 eV
+    cancellation. The beyond-DFT transverse field uses
+    ``transverse_truncation_2d`` (the GW boundary); None retains the shared
+    convention for standalone diagnostic callers.
 
     By default returns the full-BZ matrix as a host ``numpy`` array replicated
     on every rank for diagnostic callers. Live GW consumers pass
@@ -279,7 +282,8 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
                 jnp.asarray(current_np, dtype=jnp.float64),
                 jnp.asarray(wfn.bdot, dtype=jnp.float64),
                 jnp.asarray(wfn.bvec, dtype=jnp.float64),
-                float(wfn.blat), bool(truncation_2d),
+                float(wfn.blat), bool(truncation_2d if transverse_truncation_2d is None
+                                      else transverse_truncation_2d),
                 tt_metric_sign=tt_metric_sign)
             V_T_r = jnp.asarray(np.asarray(V_T_r, dtype=np.float64),
                                 dtype=jnp.float64)

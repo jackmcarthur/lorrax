@@ -1046,11 +1046,12 @@ def _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, 
                                    sigma_result=None, static_head=None):
     """Produce the authenticated kinetic and ionic band matrix."""
     from file_io import validate_kin_ion_against_run
+    from file_io.qe_save_reader import dft_sys_dim
     _t_kin = time.perf_counter()
     validate_kin_ion_against_run(
         config.paths.kin_ion_file,
         expected_bispinor=config.bispinor,
-        sys_dim=config.sys_dim,
+        sys_dim=dft_sys_dim(wfn, fallback=config.sys_dim),
         nk=meta.nk_tot,
         band_stop=band_slices.b3,
         nspinor=int(wfn.nspinor),

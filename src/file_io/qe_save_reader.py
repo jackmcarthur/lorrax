@@ -77,6 +77,42 @@ def _text(root: ET.Element, tag: str) -> str | None:
 def _all(root: ET.Element, tag: str) -> list[ET.Element]:
     return [e for e in root.iter() if e.tag.split("}")[-1] == tag]
 
+
+def _supported_assume_isolated(value: str | None) -> str:
+    """The QE boundary modes supported by the DFT operator reconstruction."""
+    value = value.strip() if value and value.strip() else "none"
+    if value not in ("none", "2D"):
+        raise ValueError(
+            f"Unsupported assume_isolated='{value}' in QE .save. "
+            "LORRAX supports: 'none', '2D'")
+    return value
+
+
+def dft_sys_dim(wfn, *, fallback: int) -> int:
+    """DFT ionic/scalar-Hartree boundary from the WFN's authenticated QE XML.
+
+    The loader resolves and caches the streaming XML receipt before this fact
+    is consumed. A bound XML without ``assume_isolated`` is periodic, as in
+    :class:`CrystalData`; no bound XML preserves the legacy deck convention.
+    This does not choose the GW screening or beyond-DFT transverse boundary.
+    """
+    resolve = getattr(wfn, "resolve_qe_symmetry", None)
+    binding = resolve() if resolve is not None else None
+    if binding is None:
+        return int(fallback)
+    value = getattr(binding, "assume_isolated", None)
+    if value is None:
+        # An old/incomplete binding must recover its authenticated fact rather
+        # than turn a missing field into an unverified periodic assumption.
+        from symmetry_maps import read_qe_symmetry_receipt
+        receipt = read_qe_symmetry_receipt(binding.schema_path)
+        if receipt.schema_sha256 != binding.schema_sha256:
+            raise ValueError("QE schema changed after WFN authentication; reload the WFN")
+        value = getattr(receipt, "assume_isolated", None)
+        if value is None:
+            raise ValueError("Authenticated QE receipt has no boundary fact; reload the WFN")
+    return 2 if _supported_assume_isolated(value) == "2D" else 3
+
 def _vec(text: str) -> np.ndarray:
     return np.array([float(x) for x in text.split()])
 
@@ -231,12 +267,7 @@ class CrystalData:
                           dtype=np.int32) if mp else np.zeros(3, dtype=np.int32))
 
         # ── assume_isolated ──
-        iso_text = _text(root, "assume_isolated")
-        assume_isolated = iso_text.strip() if iso_text and iso_text.strip() else "none"
-        if assume_isolated not in ("none", "2D"):
-            raise ValueError(
-                f"Unsupported assume_isolated='{assume_isolated}' in QE .save. "
-                f"LORRAX supports: 'none', '2D'")
+        assume_isolated = _supported_assume_isolated(_text(root, "assume_isolated"))
 
         # ── Hamiltonian facts: the functional and whatever extends it ──
         functional = (_text(root, "functional") or "").upper()

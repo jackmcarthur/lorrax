@@ -43,10 +43,21 @@ A_i(\mathbf G)=s_{TT}\,v(\mathbf G)
 \qquad V_H(0)=A_i(0)=0 .
 $$
 
-`sys_dim = 2` replaces $v$ by the slab-truncated kernel. $s_{TT}=-1$ is the
+The scalar Hartree kernel follows the DFT ionic operator's boundary from the
+WFN-authenticated QE XML: `assume_isolated = '2D'` selects the slab kernel;
+`'none'` or an absent XML tag selects periodic 3D. The existing streaming
+schema receipt carries this fact; no full XML/density load is added. With no
+authenticated QE binding, the legacy deck convention remains the fallback.
+The same choice is used in the one-shot and density-self-consistent charge
+Poisson solves and in `kin_ion.h5` provenance validation.
+
+GW screening retains the deck's `sys_dim`, independently of the DFT boundary.
+The beyond-DFT transverse direct field also retains that GW convention:
+`sys_dim = 2` replaces its $v$ by the slab-truncated kernel. $s_{TT}=-1$ is the
 Coulomb-gauge spatial-metric sign, `vcoul.COULOMB_GAUGE_TT_SIGN`: the same
-sign the bare TT exchange tiles carry. The scalar Poisson owner supplies $v$
-to both fields (`psp.dft_operators.transverse_potential_from_current`). The
+sign the bare TT exchange tiles carry. Both fields use the same kernel
+formulas with their respective boundary selections
+(`psp.dft_operators.transverse_potential_from_current`). The
 periodic zero mode is exactly zero, so no mini-BZ head enters the direct
 field.
 

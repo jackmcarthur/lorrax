@@ -32,8 +32,8 @@ def build_argparser() -> argparse.ArgumentParser:
     argp.add_argument("--report-file", default=None,
                       help="human-readable report (default: kin_ion.out beside output)")
     argp.add_argument("--sys_dim", type=int, default=None,
-                      help="system dimensionality: 0, 2, or 3.  Must AGREE with "
-                           "the input file when the file specifies it.")
+                      help="confirm the DFT boundary: 0, 2, or 3; QE XML owns it "
+                           "when bound, otherwise the input deck does.")
     argp.add_argument("--pseudo_dir", default=None,
                       help="directory containing *.upf files (default: input file dir)")
     # SOC projector selection is automatic: QE metadata when available,
@@ -358,24 +358,15 @@ def main(argv=None):
         report.devices(mesh_role="band-matrix axes X x Y")
 
         # ---- parse input: the deck is the single source of truth ----
-        # Everything physical (Coulomb truncation, band window, spinor
-        # treatment, FFT grid) is inherited from the same file the GW run
-        # reads.  A CLI flag may only confirm the deck, never silently
-        # override it, so the generator and the run cannot disagree.
+        # The deck owns the band/spinor request and screening convention.
+        # The authenticated QE source owns the DFT operator boundary; a CLI
+        # flag can only confirm that fact (or the legacy deck fallback).
         params = read_cohsex_input(args.input)
         wfn_path = _resolve_against(params.get("wfn_file", "WFN.h5"), input_dir)
 
         sys_dim_file = params.get("sys_dim")
-        if args.sys_dim is not None and sys_dim_file is not None and (
-            int(args.sys_dim) != int(sys_dim_file)
-        ):
-            raise SystemExit(
-                f"--sys_dim {args.sys_dim} contradicts sys_dim={int(sys_dim_file)} in "
-                f"{os.path.basename(args.input)}.  kin_ion.h5 carries the Coulomb "
-                "truncation convention for the whole run — fix the deck instead."
-            )
-        sys_dim = int(args.sys_dim if args.sys_dim is not None
-                      else (sys_dim_file if sys_dim_file is not None else 3))
+        sys_dim = int(sys_dim_file if sys_dim_file is not None else
+                      (args.sys_dim if args.sys_dim is not None else 3))
 
         log.debug(f"Loading WFN: {os.path.basename(wfn_path)}")
         # The module-top ``initialize_communicator_stack()`` already built and
@@ -387,6 +378,12 @@ def main(argv=None):
         with timing.section("load_wfn"):
             wfn = WfnLoader(wfn_path, mesh=mesh_xy)
             sym = wfn.symmetry()
+        from file_io.qe_save_reader import dft_sys_dim
+        sys_dim = dft_sys_dim(wfn, fallback=sys_dim)
+        if args.sys_dim is not None and int(args.sys_dim) != sys_dim:
+            raise SystemExit(
+                f"--sys_dim {args.sys_dim} contradicts the DFT boundary sys_dim={sys_dim}; "
+                "the bound QE XML owns the DFT boundary, with the deck as legacy fallback.")
 
         # nval/ncond as gw_jax resolves them (``LorraxConfig.with_band_request``:
         # ``number_bands_protected`` sets nval = nelec, ncond = total - nelec).
@@ -459,6 +456,7 @@ def main(argv=None):
         _report_run_facts(
             report, wfn=wfn, sym=sym, meta=meta, ctx=ctx, bispinor=bispinor,
             sys_dim=sys_dim, sys_dim_source=(
+                "QE XML" if wfn.resolve_qe_symmetry() is not None else
                 "deck" if sys_dim_file is not None else
                 "cli" if args.sys_dim is not None else "default"),
             nb_eff=nb_eff, nval=nval, nb_window=nb_window, nband=nband)

@@ -2000,6 +2000,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
     from common.four_current_model import resolve_four_current_representation
     from psp.get_DFT_mtxels import spin_degeneracy_factor
     from psp.get_DFT_mtxels import build_hartree_potential
+    from file_io.qe_save_reader import dft_sys_dim
     from common.mtxel_sweep import (SweepGeometry,
                                     four_current_potential_operator,
                                     local_potential_operator,
@@ -2080,7 +2081,8 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
     with timing.section("vh.poisson"):
         V_H_r = build_hartree_potential(
             rho_r, inputs.wfn,
-            truncation_2d=bool(getattr(inputs.config, "sys_dim", 3) == 2),
+            truncation_2d=(dft_sys_dim(
+                inputs.wfn, fallback=inputs.config.sys_dim) == 2),
             expected_electrons=expected_electrons)
 
     V_T_r = None
