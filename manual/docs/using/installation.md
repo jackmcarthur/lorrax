@@ -7,18 +7,56 @@ A LORRAX installation has three parts: a Python 3.12 environment with the JAX 0.
 
 ## Requirements {: #requirements }
 
-| Component | Requirement | Note |
+### Base requirements {: #req-base }
+
+Always required, on CPU and GPU alike.
+
+| Component | Requirement | What it is for |
 |---|---|---|
-| Python | ≥ 3.12 | uv installs its own 3.12 |
-| JAX, jaxlib | `>= 0.9.0, < 0.10.0` | Any other minor series refuses at startup; there is no override |
-| CUDA extra | `cuda13` (driver ≥ 580) or `cuda12` | Installs `jax[cudaNN]` and `nvidia-mathdx==25.6.0` |
-| Python packages | `h5py >= 3.14`, `numpy >= 2.3.1`, `scipy >= 1.16`, `matplotlib`, `xmlschema`, `xsdata` | Pinned in `pyproject.toml` and `uv.lock` |
-| GPU | NVIDIA sm_80 or newer | The floor of the CUDA FFI leg |
-| MPI | the site MPI | Both FFI legs link the same `libmpi` |
-| HDF5 | parallel HDF5 ≥ 1.12, built with `HDF5_IS_PARALLEL` | Both legs link the HDF5 the run maps |
-| Linear algebra | BLAS + ScaLAPACK (LibSci, MKL or OpenBLAS + netlib); SLATE built with `gpu_backend=none`; cuSOLVERMp ≥ 0.7 and cuBLASMp | cuSOLVERMp 0.6.x returns wrong LU results on a 2-D process grid |
-| FFT | any FFTW3-ABI library, found at run time | Never linked into the host leg |
+| Python | ≥ 3.12 | The runtime; uv installs its own 3.12 |
+| JAX, jaxlib | `>= 0.9.0, < 0.10.0` | Every array operation. Any other minor series refuses at startup, and there is no override |
+| Python packages | `h5py >= 3.14`, `numpy >= 2.3.1`, `scipy >= 1.16`, `matplotlib`, `xmlschema`, `xsdata` | File I/O, the QE schema reader and plots; pinned in `pyproject.toml` and `uv.lock` |
+| MPI | the site MPI | Communication between processes; both FFI legs link the same `libmpi` |
+| HDF5 | parallel HDF5 ≥ 1.12, built with `HDF5_IS_PARALLEL` | Parallel reads and writes of the large files; both legs link the HDF5 the run maps |
+| Host FFI leg | `liblorrax_ffi_host.so`, built from `src/ffi/cpp/` ([below](#ffi)) | Loaded by every run, a GPU run included |
 | `jax_xc` | the patched 0.0.11 of `config/xc/` | Only for the [`nscf`](../drivers/nscf/index.md) driver and the dense-Hamiltonian route |
+
+### GPU requirements {: #req-gpu }
+
+For runs on NVIDIA GPUs. A GPU run loads both FFI legs.
+
+| Component | Requirement | What it is for |
+|---|---|---|
+| GPU | NVIDIA sm_80 or newer | The floor of the CUDA FFI leg |
+| CUDA extra | `cuda13` (driver ≥ 580) or `cuda12` | Installs `jax[cudaNN]` and `nvidia-mathdx==25.6.0`, whose kernels do the k-convolutions |
+| CUDA FFI leg | `liblorrax_ffi.so` with nvcc, cuBLAS, cuFFT, NVRTC and NCCL | The complete NVIDIA stack; no partial CUDA leg is built |
+
+The GPU linear algebra comes from these libraries:
+
+| Library | Status | What it gives, and when LORRAX uses it |
+|---|---|---|
+| cuSOLVERMp ≥ 0.7 and cuBLASMp | required, part of the CUDA leg | The default distributed eigensolver and LU on a multi-GPU mesh. cuSOLVERMp 0.6.x returns wrong LU results on a 2-D process grid |
+| cuSOLVER, through jaxlib | installed with the CUDA extra | The single-device eigensolver and LU, used when one matrix fits on one GPU |
+| SLATE (CUDA build) | optional | Selectable alternative for the distributed Cholesky and eigensolver; never the default |
+
+### CPU requirements {: #req-cpu }
+
+For runs on CPUs. A CPU run loads the host leg only.
+
+| Component | Requirement | What it is for |
+|---|---|---|
+| FFT | any FFTW3-ABI library: FFTW, `cray-fftw`, MKL's FFTW3 interface or AOCL | The lattice FFTs; bound at run time and never linked into the host leg |
+
+The distributed eigensolver and LU on CPU are ScaLAPACK, together with BLACS and a CBLAS GEMM. One of these stacks provides all three:
+
+| Stack | Typical site |
+|---|---|
+| Cray LibSci | Cray systems |
+| Intel MKL (`mkl_scalapack_lp64` with the `mkl_blacs_<mpi>_lp64` that matches the MPI) | Intel systems; a BLACS built for another MPI hangs in the first collective |
+| netlib ScaLAPACK with OpenBLAS or BLIS | generic Linux clusters |
+| AMD AOCL | AMD CPU systems |
+
+SLATE built with `gpu_backend=none` is optional on CPU. It provides a Cholesky factorization; its CPU eigensolver crashes, so LORRAX never selects it there.
 
 The service packages under `services/` (`distrib_la`, `lxkit`, `minimax`, `symmetry_maps`, `vcoul`, `wfn_loader`, `zeta_loader`) are uv workspace members and install with the project.
 
