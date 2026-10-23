@@ -903,7 +903,7 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
 
     ``bgw_eps`` (an ``epsmat.h5``) supplies BerkeleyGW's own q wedge, so the
     head slot of every zone-boundary tie is BerkeleyGW's; without it the
-    restart's q wedge stands in (same physics, possibly another tied slot).
+    restart's full q grid stands in (same physics, possibly another tied slot).
     ``q0_body_update`` ``(A (n, μ), D (n, n))`` is the q → 0 hook
     (``bsemat_algebra.add_q0_body_update``): the wing-mediated body term of
     BerkeleyGW's eps0mat, from the eps export's dipole wing vector. ``None``
@@ -1074,19 +1074,22 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
         tables = read_tables(f, "W0_qmunu")
     with h5py.File(wfn_co, "r") as w:
         mtrx = np.asarray(w["mf_header/symmetry/mtrx"][()])[:int(w["mf_header/symmetry/ntran"][()])]
+    from symmetry_maps import bgw_integer_q_to_fractional
+    q_full_L = bgw_integer_q_to_fractional(fft_int, grid)
     if bgw_eps:
         with h5py.File(bgw_eps, "r") as e:
             q_wedge = np.asarray(e["eps_header/qpoints/qpts"][()], dtype=np.float64)
         q_src = f"BerkeleyGW eps q list ({bgw_eps})"
     else:
-        q_wedge = np.asarray(tables.q_irr_frac, dtype=np.float64)
-        q_src = "restart q wedge"
+        # The restart wedge may use authenticated antiunitary operations that
+        # the coarse WFN's spatial-only header cannot unfold. All q of the
+        # validated restart grid provide the standalone head-order carrier.
+        q_wedge = q_full_L
+        q_src = "restart full q grid"
     q_list = bgw_kernel_q_list(q_wedge, mtrx, bdot)
     K, qlen = pair_head_momenta(kpts, bdot, q_list)
     iq_pair = np.empty((nk, nk), np.int64)
     keys, key_of = [], {}
-    from symmetry_maps import bgw_integer_q_to_fractional
-    q_full_L = bgw_integer_q_to_fractional(fft_int, grid)
     for i in range(nk):
         for j in range(nk):
             dq = kpts[i] - kpts[j]

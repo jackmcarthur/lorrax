@@ -130,7 +130,11 @@ so the head momentum is $K=\sigma q$. `--bgw-eps` gives the writer that q list,
 and the head of every pair is then BerkeleyGW's: the Si 4³ fold reproduces
 `kernel.x`'s printed list 64/64. A rule with a length tolerance misses 2 of the
 13 tied q, because there a 10⁻¹⁷ roundoff decides. Without `--bgw-eps` the
-restart's wedge stands in. Tied slots related by a symmetry of q screen equally,
+restart's full q grid stands in. Its IBZ wedge can include antiunitary reductions
+that the coarse WFN's spatial-only symmetry header cannot unfold; the full grid
+covers every pair without inventing extra symmetry operations. The provided
+`--bgw-eps` q list retains its exact BerkeleyGW ordering and missing-q refusals.
+Tied slots related by a symmetry of q screen equally,
 so the absorption is unchanged. Only the head, wing and body partition of
 those blocks moves.
 

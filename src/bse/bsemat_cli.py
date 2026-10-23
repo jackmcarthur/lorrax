@@ -16,7 +16,8 @@ BerkeleyGW's absorption reads (``no_symmetries_coarse_grid``); the kernel is
 written in its coefficient gauge and on its k order. ``--bgw-eps`` is the
 ``epsmat.h5`` whose q list BerkeleyGW's kernel would fold. It fixes the head
 slot at zone-boundary ties exactly as ``kernel.x`` does; without it the
-restart's q wedge stands in. ``--gauge identity`` (``--no-gauge-map``) writes
+restart's full q grid stands in, including q whose wedge representative needs
+an antiunitary action. ``--gauge identity`` (``--no-gauge-map``) writes
 LORRAX's own Bloch gauge, the red twin of the gauge test. ``--q0-body dipole`` adds
 BerkeleyGW's 3-D q0 body term from the bundle's stored q → 0 wings
 (``head_wing_L``/``R``, ``S_cart_head``, ``S_cart_head_direct``). ``--mu-small``
