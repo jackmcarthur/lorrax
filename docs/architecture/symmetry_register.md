@@ -45,7 +45,7 @@ Consumers read the typed accessors, never `R_cart` or a determinant:
 | `lorentz_action(rows)` | \((n,4,4)\) \(=\operatorname{diag}(1,\) polar time-odd \(R)\) |
 | `reciprocal_phase(row, carriers)` | \(e^{-i(S\mathbf K)\cdot\mathbf t}\), or `None` when \(\mathbf t\approx0\) |
 | `unfold_wavefunction(c, row=, g_parent=)` | plane-wave child coefficients, host |
-| `fft_grid_pullback(rows, fft_grid)` | \((n,N_r)\) grid pull-back permutation, read-only, cached per process |
+| `fft_grid_pullback(rows, fft_grid, cache=True)` | \((n,N_r)\) grid pull-back permutation, read-only; `cache=False` bypasses lookup/insertion for a one-pass consumer |
 
 ## 2. k and q maps
 

@@ -392,7 +392,8 @@ def build_feature_metric_diagonal(
     metric_dev = jnp.zeros(n_grid, dtype=jnp.float64)
     for slot, row in enumerate(sym_rows):
         pullback = sym.fft_grid_pullback(
-            np.asarray([int(row)], dtype=np.int32), fft_grid, validate=True)
+            np.asarray([int(row)], dtype=np.int32), fft_grid,
+            validate=True, cache=False)
         if pullback.shape != (1, n_grid):
             raise ValueError(
                 "symmetry-service FFT-grid pullback has the wrong "

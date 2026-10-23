@@ -2272,18 +2272,23 @@ def _fft_grid_pullback_memo(matrices, matrices_shape, translations,
 
 
 def fft_grid_pullback_cached(sym_matrices, translations, fft_grid, *,
-                             validate: bool = True) -> np.ndarray:
+                             validate: bool = True,
+                             cache: bool = True) -> np.ndarray:
     """:func:`fft_grid_pullback_perm`, memoised on its exact inputs; READ-ONLY.
 
     The table depends only on the operations and the grid, and every
     self-consistent map asks for it again (scalar density and the polar
     current projection).  Keyed on the int64 matrices, float64 translations
     and grid by content, so a hit returns the very table a rebuild would.
+    ``cache=False`` bypasses lookup and insertion for a one-pass consumer;
+    the same builder still returns a read-only table.
     """
     matrices = np.ascontiguousarray(sym_matrices, dtype=np.int64)
     taus = np.ascontiguousarray(translations, dtype=np.float64)
     grid = tuple(int(v) for v in np.asarray(fft_grid).reshape(-1))
-    return _fft_grid_pullback_memo(
+    build = (_fft_grid_pullback_memo if cache
+             else _fft_grid_pullback_memo.__wrapped__)
+    return build(
         matrices.tobytes(), matrices.shape, taus.tobytes(), taus.shape,
         grid, bool(validate))
 

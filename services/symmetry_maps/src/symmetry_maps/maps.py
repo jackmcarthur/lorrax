@@ -2923,12 +2923,14 @@ class SymMaps:
         return (np.asarray(self.sym_mats_k)[idx],
                 np.asarray(self.translations)[spatial], idx >= n)
 
-    def fft_grid_pullback(self, rows, fft_grid, *, validate=True):
+    def fft_grid_pullback(self, rows, fft_grid, *, validate=True, cache=True):
         """Return real-space FFT pullbacks for canonical operation rows.
 
         The table depends only on the operations and the grid, so it is
         built once per process (:func:`orbit_syms.fft_grid_pullback_cached`)
         and returned READ-ONLY; a self-consistent run asks for it every map.
+        ``cache=False`` leaves one-pass rows local to the request while
+        preserving the same read-only values and validation.
         """
         raw = np.asarray(rows)
         if raw.ndim != 1:
@@ -2941,7 +2943,7 @@ class SymMaps:
         spatial = raw.astype(np.int32, copy=False) % n
         return fft_grid_pullback_cached(
             np.asarray(self.sym_matrices)[spatial], translations, fft_grid,
-            validate=validate)
+            validate=validate, cache=cache)
 
     def cartesian_action(self, rows, *, axial, time_odd):
         """Forward action for a typed Cartesian index; see docs/architecture/symmetry_register.md."""

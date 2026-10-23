@@ -51,6 +51,12 @@ This page is the service contract.
 `unfold_v_q`, `trs_augment_U`, `compute_centroid_sym_perm`,
 `compute_rgrid_sym_perm` and `build_real_space_syms` are call-through
 aliases of `unfold_isdf_operator`, `spinor_rotation_for_sym_row`,
+`SymMaps.fft_grid_pullback(..., cache=False)` bypasses lookup and insertion
+in the four-entry host pullback cache while retaining the same read-only
+table and validation. The centroid feature metric uses this route for its
+one-pass symmetry rows, so deleting a row releases it after use; repeated
+self-consistent consumers keep the cached default.
+
 `centroid_source_map_and_wrap`, `fft_grid_pullback_perm` and
 `real_space_action_tables` (`symmetry_maps.RENAMES`). Use the primary names.
 
