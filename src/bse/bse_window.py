@@ -693,27 +693,31 @@ def apply_eqp_to_bse_window(data, restart_file: str, eqp_file: str,
     """Put a loaded BSE window on quasiparticle energies; return ``E^QP``.
 
     Both legs of the pair basis move together, or ``D_Q = ε_c(k+Q) − ε_v(k)``
-    mixes QP conduction with DFT valence.  This re-slices the stored leg,
+    mixes QP conduction with DFT valence. On the native grid this re-slices the stored leg,
     ``data["eps_v"]``/``data["eps_c"]``, on the corrected spectrum
     (:func:`apply_eqp_and_reslice_bands`, which re-resolves ``n_occ`` so a
     QP gap change cannot mis-slice), and returns the full-band
     ``(nk, nb)`` QP table for the caller's interpolated leg.  ``eqp_file``
     is the irreducible wedge or a full-zone file; ``apply_eqp_corrections``
-    places it on the full BZ and refuses star-asymmetric QP shifts.
+    places it on the full BZ and refuses star-asymmetric QP shifts. A
+    ``densified`` bundle already has matched fine-grid QP energies from the
+    loader's htransform; keep those intact and return the coarse QP table
+    only for the caller's separate shifted-leg htransform.
 
     Refuses (before touching ``data``) an eqp ladder on a QP WFN, whose ψ
     and E are already a matched pair (:func:`refuse_eqp_on_a_qp_wfn`), and
-    energies rebuilt on the native restart grid after ``kgrid_fine`` has
-    densified ψ to another k axis.
+    energies rebuilt on a different k grid without the loader's densified
+    bundle contract.
     """
     from file_io.restart_bundle import read_metadata
     refuse_eqp_on_a_qp_wfn(input_file, eqp_file)
     enk_dft = read_metadata(restart_file)["energies"]
     n_occ_in = resolve_n_occ(enk_dft, input_file=input_file)
-    data["eps_v"], data["eps_c"], n_occ_qp = apply_eqp_and_reslice_bands(
-        restart_file, eqp_file, input_file, int(data["n_val"]),
-        int(data["n_cond"]), n_occ_in, int(mesh_shape[0]), int(mesh_shape[1]),
-        degeneracy_mode=degeneracy_mode, degeneracy_tol_ry=degeneracy_tol_ry)
+    if not data.get("densified", False):
+        data["eps_v"], data["eps_c"], n_occ_qp = apply_eqp_and_reslice_bands(
+            restart_file, eqp_file, input_file, int(data["n_val"]),
+            int(data["n_cond"]), n_occ_in, int(mesh_shape[0]), int(mesh_shape[1]),
+            degeneracy_mode=degeneracy_mode, degeneracy_tol_ry=degeneracy_tol_ry)
     if int(data["eps_c"].shape[0]) != int(data["psi_c_X"].shape[0]):
         raise ValueError(
             "eqp_corrections rebuilt energies on the native restart "
@@ -726,7 +730,10 @@ def apply_eqp_to_bse_window(data, restart_file: str, eqp_file: str,
             "mean-field WFN plus diagonal eqp corrections needs the eqp "
             "ladder applied inside the htransform densification, not "
             "patched onto its output here.")
-    enk_qp = apply_eqp_corrections(enk_dft, eqp_file, input_file)
+    enk_qp = apply_eqp_corrections(
+        enk_dft, eqp_file, input_file, state_artifact_path=restart_file)
+    if data.get("densified", False):
+        n_occ_qp = resolve_n_occ(enk_qp, input_file=input_file)
     shift_ev = (enk_qp - enk_dft) * RYD_TO_EV
     log(f"  [eqp] {os.path.basename(eqp_file)}: n_occ={n_occ_qp}, "
         f"QP shifts min/max = {shift_ev.min():+.4f} / {shift_ev.max():+.4f} eV; "

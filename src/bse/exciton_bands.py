@@ -913,6 +913,18 @@ def require_zeta_for_interp(restart_file, vq_mode, kgrid) -> str:
           f"that lands on the {nx}x{ny}x{nz} BSE grid.")
 
 
+@partial(jax.jit, static_argnames=("n_val", "n_cond"))
+def _continuum_threshold_ry(eps_cQ, eps_v, *, n_val, n_cond):
+    """min_kcv(E_c(k+Q)-E_v(k)), excluding padded bands, one value per Q.
+
+    ``eps_cQ`` is ``(nQ, nk, nc_pad)`` and ``eps_v`` is ``(nk, nv_pad)``.
+    Reduce the bands first, retaining only ``(nQ, nk)`` work rather than a
+    full transition array. These are QP energies before any W-head shift.
+    """
+    return jnp.min(jnp.min(eps_cQ[:, :, :n_cond], axis=2)
+                   - jnp.max(eps_v[:, :n_val], axis=1)[None, :], axis=1)
+
+
 def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
                             n_rmu_pad, mesh_xy):
     """Reshape the htransform bundle over the concatenated {k+Q} list into
@@ -1726,7 +1738,7 @@ def main(argv=None):
         _bse_grid_quality_records = []
         data = load_bse_data_from_restart_sharded(
             restart_file, n_val=args.n_val, n_cond=args.n_cond,
-            mesh_xy=mesh_xy, input_file=args.input, inject_head=True,
+            mesh_xy=mesh_xy, input_file=args.input, eqp_file=args.eqp, inject_head=True,
             q0_head="diagonal",       # operands via bse_head.head_shifted_eps_c
             # ``refit`` NEEDS the stored exchange tensor as much as ``ongrid``
             # does, and for a stricter reason: ongrid CONSUMES it, refit is
@@ -1901,6 +1913,8 @@ def main(argv=None):
                                     quality_records=_path_quality_records)
         psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
             bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
+        continuum_ry = _continuum_threshold_ry(
+            eps_cQ, data["eps_v"], n_val=n_val, n_cond=n_cond)
         # Everything the htransform produced is now copied into the conduction
         # stacks and nothing below reads it again.  Drop it before the V_Q model
         # build: ``vq_interp.build_cq`` now returns C_q as a (μ, ν)-face SHARDED
@@ -2459,6 +2473,7 @@ def main(argv=None):
                 f"certification Q, out-prefix {args.out_prefix}")
 
         _path_ev = np.asarray(evs_path[:nQ_path], dtype=np.float64) * RY2EV
+        _continuum_ev = np.asarray(_gather_host(continuum_ry), dtype=np.float64) * RY2EV
         if cert_worst is not None:
             _cert_text = (f"{args.cert_grade} grade: worst {float(cert_worst):.5f} meV "
                           f"over {len(cert_rows)} on-grid Q points")
@@ -2545,7 +2560,17 @@ def main(argv=None):
                     fh.write(f"{iQ:4d} {x_path[iQ]:.6f} "
                              f"{Qpath[iQ][0]: .6f} {Qpath[iQ][1]: .6f} "
                              f"{Qpath[iQ][2]: .6f} refit  {row}\n")
-            _LOGGER.info(f"Wrote {dat}")
+            continuum_dat = args.out_prefix + "_continuum.dat"
+            with open(continuum_dat, "w", encoding="utf8") as fh:
+                fh.write("# Independent-particle QP continuum before the W-head kernel shift\n")
+                fh.write(provenance_header())
+                fh.write("# iQ s_path Qx Qy Qz Econt_eV\n")
+                for iQ in range(nQ):
+                    sx = x_path[iQ] if iQ < nQ_path else x_path[nQ_path - 1]
+                    fh.write(f"{iQ:4d} {sx:.9f} "
+                             f"{Qpath[iQ][0]: .9f} {Qpath[iQ][1]: .9f} "
+                             f"{Qpath[iQ][2]: .9f} {_continuum_ev[iQ]:.9f}\n")
+            _LOGGER.info(f"Wrote {dat} and {continuum_dat}")
 
             if refit_idx:
                 _LOGGER.info("\ninterp vs refit (ground truth) at spot-check Q:")
@@ -2681,6 +2706,7 @@ def main(argv=None):
                                     wfn_name)
         file_rows = [
             ("exciton bands", "written", os.path.abspath(args.out_prefix + ".dat")),
+            ("QP continuum", "written", os.path.abspath(args.out_prefix + "_continuum.dat")),
             ("exciton plot", "written", os.path.abspath(args.out_prefix + ".png")),
             ("GW/BSE restart", "read", restart_file),
             ("wavefunctions", "read", wfn_name),
