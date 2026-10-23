@@ -113,9 +113,10 @@ class LoopProgress:
                 do_work(i)
                 p.step()
 
-    ``max_updates`` is the number of milestones, each a bar line in the main
-    log.  ``print_fn`` is accepted and unused: the lines go to
-    ``lorrax.progress``.
+    ``max_updates`` bounds the number of milestones in the main log. A
+    batched ``step(count=n)`` reports the current count once when it crosses
+    one or more milestones. ``print_fn`` is accepted and unused: the lines
+    go to ``lorrax.progress``.
     """
 
     def __init__(
@@ -161,8 +162,12 @@ class LoopProgress:
                 _say(f"Started {self.title} at {_fmt_time(self._start)}.")
         return self
 
-    def step(self, wait=None):
-        """Call after each iteration completes.
+    def step(self, wait=None, *, count: int = 1):
+        """Advance ``count`` logical iterations after their work is dispatched.
+
+        A fused batch advances once with its full count; replaying individual
+        increments would report intermediate counts that never returned to
+        the host and give their ETA the whole batch's elapsed time.
 
         ``wait`` is an optional JAX value; under ``LORRAX_STAGE_SYNC=1``
         (``common.timing.stage_sync``) it is blocked on at a milestone step
@@ -172,11 +177,15 @@ class LoopProgress:
         JAX value can still be globally sharded, so every process performs
         the wait (INVARIANTS row 21).  Non-milestone steps never block.
         """
+        if count < 1:
+            raise ValueError("progress count must be positive")
         if self._start is None:
             self.start()
-        self._current += 1
+        previous = self._current
+        self._current += count
         milestone = (
-            self._current <= self.num_steps and self._mask[self._current])
+            self._current <= self.num_steps
+            and np.any(self._mask[previous + 1:self._current + 1]))
         # ``enabled`` defaults to process_index() == 0.  A wait on a JAX
         # value must nevertheless be reached by every process: a caller can
         # pass a globally sharded value even though today's Sigma caller uses

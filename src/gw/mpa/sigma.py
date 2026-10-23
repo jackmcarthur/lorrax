@@ -1870,8 +1870,7 @@ def _integrate_sigma_batches(
                 total = target.integrate_window(
                     row_kernel, tau_arguments, t_nodes, alpha_nodes, **window_options)
                 n_nodes = len(t_nodes)
-            for _ in range(n_nodes):
-                progress.step(wait=total)
+            progress.step(wait=total, count=n_nodes)
             n_tau += n_nodes
             n_sweeps += 1
         del B, B_odd, Omega
