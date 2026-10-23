@@ -191,6 +191,13 @@ with `N_k N_b` eigenvalues; there is no host `N_orbit²` or `N_k N_b²` matrix.
   `distrib_la.lu_workspace_query`) or a measured row (`lxkit.LEGS`
   `vendor_rows`) within its stated range; outside it, a warning (`GATE
   memory_unpriced` under `LORRAX_MEMORY_STRICT`).
+  The response bank resolves its Dyson plan at the actual operand batch:
+  stored parents or a streamed moment span, while the physical prefactor
+  still uses the full q count. The agreed allocator room already includes
+  materialized operands; planning subtracts only future abstract operands.
+  The same resolved checked program and LU plan own compilation, native
+  workspace queries and completion. Its getrs cap is withdrawn after either
+  dispatch or a failed admission; charge moments have no LU to admit.
 - **Route completeness.** No whole N_μ-scale matrix (side ≥ N_μ/2) is held on a
   rank without a mesh route beside it: a stage whose only candidates do so
   refuses (`GATE nmu2_no_backup`; `LORRAX_NMU2_BACKUP=report` makes it a
