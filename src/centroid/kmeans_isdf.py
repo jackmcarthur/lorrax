@@ -28,7 +28,6 @@ from jax import lax
 
 from common import timing
 from common.log import get_logger, message
-from runtime.padding import pad_axis
 from . import distribution as dist
 from ffi import _services as _lx_services        # noqa: F401
 _lx_services.ensure_on_path()
@@ -609,14 +608,13 @@ def make_lloyd_loop(
 # k-means++ init (Gumbel-max sampling, one fori_loop)
 # ─────────────────────────────────────────────────────────────────────────
 
-def _gumbel_sample_argmax(log_weights: jnp.ndarray, key) -> jnp.ndarray:
-    """One categorical draw via Gumbel-max on log-weights. ``-inf`` weights
-    are never selected; ``u`` clamped away from 0 so ``-log(-log u)`` is finite."""
+def _gumbel_scores(log_weights: jnp.ndarray, key) -> jnp.ndarray:
+    """Categorical Gumbel scores; ``-inf`` weights cannot win."""
     n = log_weights.shape[0]
     eps = jnp.finfo(log_weights.dtype).tiny
     u = jax.random.uniform(key, (n,), dtype=log_weights.dtype,
                            minval=eps, maxval=1.0 - eps)
-    return jnp.argmax(log_weights + (-jnp.log(-jnp.log(u))))
+    return log_weights + (-jnp.log(-jnp.log(u)))
 
 
 def _orbit_distance_sq(positions, rep, metric, offsets, Rinv, tau):
@@ -645,7 +643,7 @@ def _canonicalize_rep(rep, Rinv, tau):
     return canonicalize_orbit(rep[None, :], Rinv, tau)[0]
 
 
-@partial(jax.jit, static_argnames=['n_c'])
+@partial(jax.jit, static_argnames=['n_c', 'n_logical', 'mesh', 'mesh_axis'])
 def kmeans_pp_init(
     positions_frac: jnp.ndarray,
     rho_flat: jnp.ndarray,
@@ -655,6 +653,9 @@ def kmeans_pp_init(
     offsets: jnp.ndarray | None = None,
     Rinv: jnp.ndarray | None = None,
     tau: jnp.ndarray | None = None,
+    n_logical: int | None = None,
+    mesh=None,
+    mesh_axis: str | tuple[str, ...] = ('x', 'y'),
 ) -> jnp.ndarray:
     """Density-weighted k-means++ init.
 
@@ -663,6 +664,11 @@ def kmeans_pp_init(
     ``tau`` are given (default: identity-only ⇒ ordinary kmeans++).
     Centroids are canonicalised to a deterministic orbit member when
     sym data is provided.
+
+    ``mesh`` keeps grid-length weights, random scores and distances on
+    grid shards. Each draw gathers only the local score winner and its
+    point; global score ties select the lowest logical grid index.
+    ``n_logical`` excludes mesh-padding points from every draw.
     """
     if offsets is None:
         offsets = jnp.zeros((1, 3), dtype=jnp.int32)
@@ -674,9 +680,17 @@ def kmeans_pp_init(
     dtype = positions_frac.dtype
     tiny = jnp.finfo(dtype).tiny
     log_rho = jnp.log(jnp.maximum(rho_flat.astype(dtype), tiny))
+    if n_logical is not None:
+        log_rho = jnp.where(jnp.arange(rho_flat.shape[0]) < n_logical,
+                            log_rho, -jnp.inf)
 
     key, sub = jax.random.split(key)
-    first_cent = positions_frac[_gumbel_sample_argmax(log_rho, sub)]
+    def point(log_weights, draw_key):
+        scores = _gumbel_scores(log_weights, draw_key)
+        return (positions_frac[jnp.argmax(scores)] if mesh is None else
+                dist.grid_argmax(positions_frac, scores, mesh, mesh_axis))
+
+    first_cent = point(log_rho, sub)
     if orbit_aware:
         first_cent = _canonicalize_rep(first_cent, Rinv, tau)
     centroids = jnp.zeros((n_c, 3), dtype=dtype).at[0].set(first_cent)
@@ -688,7 +702,7 @@ def kmeans_pp_init(
         centroids, min_d2, key = state
         key, sub = jax.random.split(key)
         log_w = jnp.log(jnp.maximum(min_d2, tiny)) + log_rho
-        new_cent = positions_frac[_gumbel_sample_argmax(log_w, sub)]
+        new_cent = point(log_w, sub)
         if orbit_aware:
             new_cent = _canonicalize_rep(new_cent, Rinv, tau)
         centroids = centroids.at[c_idx].set(new_cent)
@@ -764,12 +778,10 @@ def weighted_kmeans_jax(
               f"orbit mode: {'on (n_sym=' + str(int(R.shape[0])) + ')' if orbit_aware else 'off'}")
 
     Nx, Ny, Nz = rho.shape
-    fx, fy, fz = (jnp.linspace(0, 1, n, endpoint=False, dtype=jnp.float64)
-                  for n in (Nx, Ny, Nz))
-    positions = jnp.stack(jnp.meshgrid(fx, fy, fz, indexing="ij"),
-                          axis=-1).reshape(-1, 3)
-    rho_flat = jnp.asarray(rho, dtype=jnp.float64).reshape(-1)
-    log.debug(f"Grid: {Nx}×{Ny}×{Nz} = {positions.shape[0]} points; N_c = {N_c}")
+    positions, rho_flat, grid = dist.place_grid(rho, mesh, mesh_axis)
+    n_grid_logical, n_grid_padded = grid.logical, grid.carrier
+    metric_tensor = dist.place(metric_tensor, mesh)
+    log.debug(f"Grid: {Nx}×{Ny}×{Nz} = {n_grid_logical} points; N_c = {N_c}")
 
     with timing.section("init"):
         if init_method == 'kpp':
@@ -778,6 +790,8 @@ def weighted_kmeans_jax(
                 jax.random.PRNGKey(seed), offsets=offsets,
                 Rinv=Rinv if orbit_aware else None,
                 tau=tau if orbit_aware else None,
+                n_logical=n_grid_logical,
+                mesh=mesh, mesh_axis=mesh_axis,
             )
         else:
             rho_p = rho_flat / jnp.sum(rho_flat)
@@ -785,51 +799,16 @@ def weighted_kmeans_jax(
                 jax.random.PRNGKey(seed), rho_flat.shape[0],
                 shape=(N_c,), p=rho_p, replace=False,
             )
-            centroids = positions[idx]
+            centroids = dist.grid_points(positions, idx, mesh, mesh_axis)
         centroids.block_until_ready()
 
-    # The grid is the distributed axis: each rank owns a slice of the
-    # points and the whole centroid list.  Seed on the LOGICAL grid above:
-    # a zero-weight padding point must not enter either k-means++ or the
-    # random weighted draw.  Only then round the distributed extent up to
-    # the product-mesh divisor.  The shared padding helper returns the same
-    # object on already-divisible paths, preserving their computation.
-    grid_divisor = dist.n_shards(mesh, mesh_axis)
-    positions_pad = pad_axis(
-        positions, grid_divisor, axis=0, fill=0.0,
-    )
-    rho_pad = pad_axis(
-        rho_flat, grid_divisor, axis=0, fill=0.0,
-    )
-    if (positions_pad.logical != rho_pad.logical
-            or positions_pad.padded != rho_pad.padded):
-        raise AssertionError(
-            "k-means grid position/weight padding extents disagree: "
-            f"positions=({positions_pad.logical}, {positions_pad.padded}), "
-            f"weights=({rho_pad.logical}, {rho_pad.padded})"
-        )
-    n_grid_logical = positions_pad.logical
-    n_grid_padded = positions_pad.padded
     if n_grid_padded != n_grid_logical:
         log.debug(
             "K-means grid mesh padding: "
             f"{n_grid_logical} -> {n_grid_padded} points "
-            f"(divisor {grid_divisor}); tail weights are zero"
+            f"(divisor {grid.divisor}); tail weights are zero"
         )
-    positions_unplaced = positions_pad.array
-    rho_unplaced = rho_pad.array
-    metric_unplaced = metric_tensor
-    positions = dist.place(positions_unplaced, mesh, mesh_axis, None)
-    rho_flat = dist.place(rho_unplaced, mesh, mesh_axis)
-    metric_tensor = dist.place(metric_unplaced, mesh)
     centroids = dist.place(centroids, mesh)
-    # dist.place stages through a host array and creates independent placed
-    # buffers.  Do not keep the original full-grid device arrays alive for
-    # the duration of Lloyd.
-    positions_unplaced.delete()
-    rho_unplaced.delete()
-    metric_unplaced.delete()
-    del positions_pad, rho_pad, positions_unplaced, rho_unplaced, metric_unplaced
 
     lloyd = make_lloyd_loop(
         mesh, N_c, max_steps, tolerance, offsets,
