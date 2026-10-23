@@ -1392,7 +1392,8 @@ def build_gram_q0_via_loadwfns(
             band_range_left=left, band_range_right=right,
             band_norms=band_norms, k_weights=weights[k0:k1],
             band_chunk_size=band_chunk_size,
-            memory_per_device_gb=memory_per_device_gb, full_k_rows=rows)
+            memory_per_device_gb=memory_per_device_gb, full_k_rows=rows,
+            hermitian_fold=False)
         result = block if result is None else _candidate_gram_add_kernel(mesh_xy)(result, block)
         jax.block_until_ready(result)
         # The sum reuses the running accumulator, not both input buffers.
@@ -1401,6 +1402,11 @@ def build_gram_q0_via_loadwfns(
         if block is not result and not block.is_deleted():
             block.delete()
         del block
+    # The Hermitian fold is real-linear. Apply it once after the complete raw sum,
+    # when the batch faces and consumed blocks are gone, so its two-shard
+    # transpose/receive workspace never overlaps a second live Gram.
+    result = _candidate_gram_hermitian_fold_kernel(mesh_xy)(result)
+    result.block_until_ready()
     return result
 
 
@@ -1432,6 +1438,7 @@ def _build_gram_q0_kbatch(
     band_chunk_size: int = 64,
     memory_per_device_gb: float | None = None,
     full_k_rows=None,
+    hermitian_fold: bool = True,
 ) -> jnp.ndarray:
     """Build the q=0 candidate Gram on a 2-D mesh using gw_jax's data path.
 
@@ -1453,6 +1460,10 @@ def _build_gram_q0_kbatch(
     Gram exactly. ``gamma_mode='transverse'`` requires ``bispinor=True`` and
     uses the equal-weight PSD sum of the three current transition-feature
     Grams. It never consumes occupations or ``band_norms``.
+
+    ``hermitian_fold=True`` preserves the standalone Hermitian result.
+    The k-batch aggregator requests raw blocks and applies the same fold
+    once after their real-weighted sum, with WFN faces already released.
 
     The shared WFN transform service unfolds each band window onto candidate
     points. Every Gram keeps the final WFN faces and fuses each pair-density/q=0
@@ -1707,8 +1718,10 @@ def _build_gram_q0_kbatch(
                     psi_r_rmuT_X / norms_r_j[None, None, :, None])
             psi_r_rmu_Y.block_until_ready()
 
-    # A price over the budget warns and runs (TASTE 96): this rank's faces,
-    # the final fold's three local-Gram slots and the tile's pair densities.
+    # A price over the budget warns and runs (TASTE 96). The standalone fold
+    # needs its input plus two local-Gram scratch slots while faces are live.
+    # The deferred path instead bounds raw batch + old accumulator + faces +
+    # pair tiles, or the final three-slot fold after faces have been released.
     faces = {id(arr): arr for arr in (psi_l_rmu_Y, psi_l_rmuT_X,
                                       psi_r_rmu_Y, psi_r_rmuT_X)
              if arr is not None}
@@ -1719,7 +1732,10 @@ def _build_gram_q0_kbatch(
     tile_bytes = gram_col_block_device_bytes(
         nk_, ns_, M_cols, col_block, x_shards=n_x, y_shards=n_y)
     target_bytes = int(float(meta.memory_per_device_gb) * 1e9)
-    price = resident_bytes + 3 * gram_local_bytes + tile_bytes
+    price = (resident_bytes + 3 * gram_local_bytes + tile_bytes
+             if hermitian_fold else
+             max(resident_bytes + 2 * gram_local_bytes + tile_bytes,
+                 3 * gram_local_bytes))
     if price > target_bytes:
         from lxkit import memory
         memory.admit("kmeans candidate Gram (faces, fold, tile)",
@@ -1747,9 +1763,10 @@ def _build_gram_q0_kbatch(
             mesh_xy=mesh_xy, tile_width=col_block,
             gamma_mode=gamma_mode, left_bands=left_slice,
         )
-        # Same Hermitian symmetrization the unblocked kernel applies,
-        # once, on the assembled square matrix.
-        G = _candidate_gram_hermitian_fold_kernel(mesh_xy)(G)
+        # Standalone calls retain their Hermitian result. The k-batch owner
+        # requests raw blocks and performs this same fold after summation.
+        if hermitian_fold:
+            G = _candidate_gram_hermitian_fold_kernel(mesh_xy)(G)
         G.block_until_ready()
     del psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X
     return G
