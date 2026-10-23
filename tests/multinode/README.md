@@ -18,7 +18,7 @@ It needs no FFI library and no square mesh (P = 8 on 2 nodes is fine).
 
 ```bash
 source config/perlmutter/gpu_env.sh
-srun -N 2 -n 8 --gpus-per-node=4 --network=no_vni src/ffi/cpp/select_gpu.sh \
+srun -N 2 -n 8 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh \
   .venv/bin/python -u tests/multinode/mn_collectives_probe.py --stack lorrax --out probe_out
 ```
 

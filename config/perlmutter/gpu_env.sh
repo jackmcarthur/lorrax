@@ -27,6 +27,12 @@
 #                  The run python: $VIRTUAL_ENV's, else this checkout's .venv,
 #                  else python3.  Idempotent.
 # ============================================================================
+# Slurm consumes this when creating a future step. Never claim to repair an
+# already-running numeric step; preserve every explicit value, including empty.
+if [[ ! ${SLURM_STEP_ID-} =~ ^[0-9]+$ && ! ${SLURM_STEPID-} =~ ^[0-9]+$ ]]; then
+    export SLURM_NETWORK="${SLURM_NETWORK-no_vni}"
+fi
+
 export MPICH_GPU_SUPPORT_ENABLED=0
 
 # CUDA_CACHE_PATH.  The CUDA driver's JIT cache defaults to ~/.nv/ComputeCache;

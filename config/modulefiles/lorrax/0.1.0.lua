@@ -7,7 +7,8 @@ LORRAX environment descriptor for the `lx` launcher.
 
 Use `lx run`, `lx test`, and `lx doctor`; this module deliberately defines no
 allocation or run shell functions.  It owns only the container image, native
-bind mounts, MPI capabilities, and supplemental third-party Python path.
+bind mounts, MPI capabilities, supplemental third-party Python path, and
+the Perlmutter network default for future srun steps.
 LORRAX runtime owns JAX, allocator, HDF5, compile-cache, and profiling policy.
 ]])
 
@@ -90,6 +91,15 @@ local shifter_args = table.concat({
     "--volume=" .. fftw_host .. ":/lorrax_fftw",
     table.concat(shifter_env_parts, " "),
 }, " ")
+
+-- Slurm needs this before srun creates a step. Existing numeric steps keep
+-- their actual launch choice; pushenv restores the caller's value on unload.
+-- Leave an explicit empty value outside Lmod's push/pop stack.
+local numeric_step = (os.getenv("SLURM_STEP_ID") or ""):match("^%d+$")
+                  or (os.getenv("SLURM_STEPID") or ""):match("^%d+$")
+if not numeric_step and os.getenv("SLURM_NETWORK") ~= "" then
+    pushenv("SLURM_NETWORK", os.getenv("SLURM_NETWORK") or "no_vni")
+end
 
 setenv("LORRAX_ROOT", lorrax_root)
 setenv("LORRAX_SRC", lorrax_src)
