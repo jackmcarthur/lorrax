@@ -2506,6 +2506,7 @@ def _compute_scalar_vq(
                 sym=sym,
                 centroid_indices=_cent_idx_np,
                 g_chunk_size=int(cfg.memory.vq_g_chunk_size),
+                consume_fit_factor=True,
             )
             head_channel = _build_head_channel(
                 zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,

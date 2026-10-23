@@ -217,6 +217,18 @@ for the full-zone g0, the IBZ one-leg unfold sources, and the head channel's
 slots (`vcoul.head_slot_table(...).sel`). `ZetaG.head_columns(sel)` reads them
 from the shell.
 
+Scalar initialization explicitly consumes the fit factor after its last V
+contraction: `gw_init._compute_scalar_vq` passes `consume_fit_factor=True`
+through the existing V wrapper. `compute_all_V_q_g_flat` calls
+`ZetaG.release_fit_factor` after the G-tile pass and before the full-q
+unfold. This releases the owner's factor/pivot references while retaining
+the Z store and kept shell; head construction still reads those columns,
+and the existing final `close()` releases the remaining resources. Generic
+`contract_v`, `contract_v_group` and `write_file` calls keep their reusable
+default lifecycle. Retirement drops references rather than deleting arrays
+that another owner might hold, and the fit factor no longer contributes to
+the scalar full-q unfold's live set.
+
 ## ζ consumers
 
 The fit returns a `ZetaG` (`zeta_layout = 'G_flat'`) in place of a ζ loader.

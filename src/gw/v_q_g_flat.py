@@ -1100,6 +1100,7 @@ def compute_all_V_q_g_flat(
     sym=None,
     centroid_indices: np.ndarray | None = None,
     budget_bytes: float | None = None,
+    consume_fit_factor: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """V_q^{0,0} (charge-channel CC tile) on a G-flat-on-disk ζ file.
 
@@ -1108,6 +1109,11 @@ def compute_all_V_q_g_flat(
     with ``zeta_R=None`` (same_zeta) and ``write_g0=True``.  The sync
     per-q loop is already ~6× faster than the legacy μ × ν tile driver
     on MoS2 3×3.
+
+    ``consume_fit_factor`` is an explicit scalar-initialization lifecycle:
+    release a live route-G fit factor after its last G contraction, before
+    full-q unfolding; retained head columns remain available. The default
+    preserves reusable readers and all generic contraction contracts.
 
     See :func:`_compute_V_q_g_flat_one_tile` for the math + I/O flow.
     """
@@ -1181,6 +1187,12 @@ def compute_all_V_q_g_flat(
         verbose=verbose,
         budget_bytes=budget_bytes,
     )
+
+    # Scalar initialization owns the last contraction of a live route-G
+    # source. Its kept shell serves the head below; the fit factor does not
+    # participate in the full-q unfold. Generic callers preserve reuse.
+    if consume_fit_factor and hasattr(zeta_loader, 'release_fit_factor'):
+        zeta_loader.release_fit_factor()
 
     from symmetry_maps import unfold_isdf_operator
     from .qgrid_symmetry import qgrid_trs_policy_for

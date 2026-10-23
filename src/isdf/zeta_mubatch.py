@@ -780,6 +780,8 @@ class ZetaG:
     @property
     def factor(self):
         """The factor operand of :func:`_logical_solve`: B, C⁺ or (LU, pivots)."""
+        if self.L_q is None:
+            raise ValueError("ZetaG: fit factor was retired after its consuming V pass")
         return self.L_q if self.lu_piv is None else (self.L_q, self.lu_piv)
 
     def write_file(self, zeta_io, *, print_fn=None):
@@ -966,9 +968,20 @@ class ZetaG:
         """Positions in :attr:`shell` of the stored-sphere slots ``sel (Q, j)``."""
         return shell_positions(self.shell_slots, sel)
 
+    def release_fit_factor(self):
+        """Retire this owner's factor after its last contraction, retaining head columns.
+
+        The consuming driver calls this only after all G tiles and requested
+        writes have completed. Other owners' references remain valid; no array
+        is deleted. Generic ``contract_v``/``write_file`` calls remain reusable
+        until that explicit retirement.
+        """
+        self.L_q = self.lu_piv = None
+
     def close(self):
         self.store.close()
-        self.L_q = self.lu_piv = self.shell = None
+        self.release_fit_factor()
+        self.shell = None
 
 
 def _debug_enabled() -> bool:

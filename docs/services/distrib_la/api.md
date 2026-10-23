@@ -133,6 +133,16 @@ face layout. `ensure_sharding` is the only reshard on entry: a tracer gets a
 sharding constraint, an array already in layout passes untouched, anything
 else is placed process-locally.
 
+Use this public helper at eager stage boundaries too. An eager
+`with_sharding_constraint` can copy an entire resident operator even when
+its current `NamedSharding` and physical format already match: the measured
+Fe V producer duplicated its 59 × 3164 × 3164 complex128 parent stack,
+2.363 GB per rank at P4, between capture and return. `ensure_sharding`
+preserves the physical buffer in that matching case and explicitly moves a
+mismatched operand. Inside a traced program it retains the sharding
+constraint; constraints inside `jit`/`shard_map` still express that program's
+layout contract.
+
 **No distributed result is returned unchecked** (`_result_check`). The
 distributed libraries fail silently. cuSOLVERMp 0.9.1's syevd returned wrong
 eigenvectors with status 0 and info 0 (reproduced outside LORRAX) on a
