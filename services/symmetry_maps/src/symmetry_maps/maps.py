@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 import jax
 import jax.numpy as jnp
-from lxkit import device_put_process_local
+from lxkit import device_put_process_local, device_put_process_local_cached
 from ._compat import deprecated_alias
 from .directed_edges import apply_band_matrix_symmetry
 from jax import shard_map
@@ -607,13 +607,9 @@ def unfold_isdf_operator(
             "unfold_isdf_operator: trs_pair_q_ibz is valid only with "
             "trs_rule='pair_transpose'")
 
-    # Sym tables are baked into the jit closure as constants — XLA folds
-    # them into the HLO, which is materially faster per call than
-    # marshalling them as runtime args (verified empirically: runtime-
-    # arg form was ~2× slower per call than closure form).  The cache
-    # keys on the content of the tables (via bytes hashes) so V_q's and
-    # W_q's calls with the same sym/centroid configuration share one
-    # compiled module without re-baking constants.
+    # The centroid permutation/wrap tables remain geometry constants. Only
+    # the small q-selection tables are operands: streaming different q spans
+    # must not compile the same transport again for each span's coordinates.
     idx_arr = np.asarray(irr_idx, dtype=np.int32)
     sym_arr = np.asarray(sym_idx, dtype=np.int32)
     q_irr_arr = np.asarray(q_irr_frac, dtype=np.float64)
@@ -635,11 +631,18 @@ def unfold_isdf_operator(
         left_local_perm_arr=left_local_perm,
         right_local_perm_arr=right_local_perm,
         mesh_xy=mesh_xy)
+    q_sh = NamedSharding(mesh_xy, P())
+    # This owner can also be entered while a larger program is traced. Place
+    # only these small host metadata here, never in the cached factory, so
+    # that neither tracers nor a previous query's arrays enter its cache.
+    with jax.ensure_compile_time_eval():
+        q_tables = tuple(device_put_process_local_cached(a, q_sh) for a in
+                         (idx_arr, sym_arr, q_irr_arr, trs_mask_arr))
     if pair_source is not None:
         pair_source = jax.device_put(
             pair_source, NamedSharding(mesh_xy, P(None, 'y', 'x')))
-        return fn(V_q_ibz, pair_source)
-    return fn(V_q_ibz)
+        return fn(V_q_ibz, pair_source, q_tables)
+    return fn(V_q_ibz, q_tables)
 
 
 def _permute_isdf_operator_axes_local(
@@ -1101,17 +1104,17 @@ def _get_unfold_isdf_operator_jit(
     right_local_perm_arr=None,
     trs_rule="conj", q_tile_bytes=256 << 20,
 ):
-    """Cache the inner ``_do_unfold`` jit by (shape, sym table content); see docs/architecture/symmetry_register.md."""
+    """Cache transport by geometry and shapes; q selections are runtime operands."""
     key = (
         V_q_shape, int(q_tile_bytes),
         fwd_perm_arr.shape, fwd_perm_arr.tobytes(),
         fwd_perm_right_arr.shape, fwd_perm_right_arr.tobytes(),
-        idx_arr.tobytes(),
-        sym_arr.tobytes(),
+        idx_arr.shape,
+        sym_arr.shape,
         L_arr.shape, L_arr.tobytes(),
         L_right_arr.shape, L_right_arr.tobytes(),
-        q_irr_arr.tobytes(),
-        trs_mask_arr.tobytes(),
+        q_irr_arr.shape,
+        trs_mask_arr.shape,
         int(logical_left), int(logical_right),
         int(n_sym_spatial),
         str(trs_rule),
@@ -1141,14 +1144,11 @@ def _get_unfold_isdf_operator_jit(
     # are embedded by the inner trace just as effectively and cannot leak.
     fwd_perm_j = fwd_perm_arr
     fwd_perm_right_j = fwd_perm_right_arr
-    idx_j = idx_arr
-    sym_j = sym_arr
     L_j = L_arr
     L_right_j = L_right_arr
-    q_irr_j = q_irr_arr
-    trs_mask_j = trs_mask_arr
     left_local_perm_j = left_local_perm_arr
     right_local_perm_j = right_local_perm_arr
+    n_full = int(idx_arr.size)
     # Memory contract: never exceed 1× single-tile per rank.  Canonical
     # ordering uses volume-preserving all_to_all redistributions.  An
     # authenticated orbit-packed order instead gathers each axis locally.
@@ -1174,8 +1174,10 @@ def _get_unfold_isdf_operator_jit(
             "basis receipts.")
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     pair_transpose = (trs_rule == "pair_transpose")
-    in_specs = ((P(None, 'x', 'y'), P(None, 'x', 'y')) if pair_transpose
-                else P(None, 'x', 'y'))
+    operator_specs = ((P(None, 'x', 'y'), P(None, 'x', 'y')) if pair_transpose
+                      else (P(None, 'x', 'y'),))
+    table_specs = (P(), P(), P(), P())
+    in_specs = operator_specs + (table_specs,)
 
     @partial(shard_map, mesh=mesh_xy,
              in_specs=in_specs,
@@ -1186,7 +1188,7 @@ def _get_unfold_isdf_operator_jit(
         # q tiles. Full-k parent gather + endpoint gather + phased output used
         # to coexist (Fe20³/P16:78.8GB), although one output is only26.15GB.
         V_ibz_local = operands[0]
-        n_full = int(idx_arr.size)
+        idx_j, sym_j, q_irr_j, trs_mask_j = operands[-1]
         mu_local, nu_local = n_left_padded // Px, n_right_padded // Py
         q_tile = min(n_full, max(1, int(q_tile_bytes) // (16 * mu_local * nu_local)))
 
@@ -1280,16 +1282,19 @@ def _get_unfold_isdf_operator_jit(
         # Preserve a producer's reversed-axis placement; transposing an
         # already oriented partner must not first reshard it back to X/Y.
         partner_sh = NamedSharding(mesh_xy, P(None, "y", "x"))
+        q_sh = tuple(NamedSharding(mesh_xy, P()) for _ in range(4))
 
-        @partial(jax.jit, in_shardings=(V_sh, partner_sh), out_shardings=V_sh)
-        def _do_unfold(V_ibz, pair_ibz):
+        @partial(jax.jit, in_shardings=(V_sh, partner_sh, q_sh), out_shardings=V_sh)
+        def _do_unfold(V_ibz, pair_ibz, q_tables):
             transposed = jax.lax.with_sharding_constraint(
                 jnp.swapaxes(pair_ibz, -2, -1), V_sh)
-            return _kernel(V_ibz, transposed)
+            return _kernel(V_ibz, transposed, q_tables)
     else:
-        @partial(jax.jit, in_shardings=V_sh, out_shardings=V_sh)
-        def _do_unfold(V_ibz):
-            return _kernel(V_ibz)
+        q_sh = tuple(NamedSharding(mesh_xy, P()) for _ in range(4))
+
+        @partial(jax.jit, in_shardings=(V_sh, q_sh), out_shardings=V_sh)
+        def _do_unfold(V_ibz, q_tables):
+            return _kernel(V_ibz, q_tables)
 
     _UNFOLD_ISDF_OPERATOR_JIT_CACHE[key] = _do_unfold
     return _do_unfold

@@ -488,8 +488,15 @@ guarantees; the signatures are in the code.
 * `_apply_unfold_phase_and_trs_local`: wrap phases and the antiunitary rule
   on one local tile. The transpose rule conjugates the other endpoint's phase
   because its operand is the partner.
-* `_get_unfold_isdf_operator_jit`: the executable is cached on table bytes,
-  extents, rule and mesh; the tables are embedded as NumPy constants.
+* `_get_unfold_isdf_operator_jit`: the executable is cached on centroid
+  permutation/wrap table bytes, extents, rule, mesh and q-table shapes.
+  Centroid geometry stays constant; the small parent indices, action rows,
+  parent q coordinates and antiunitary flags are runtime operands, so
+  different q spans share the same transport. The cache retains no query
+  arrays. This selectively changes the q metadata; making the large
+  centroid tables runtime operands had previously slowed warm calls.
+  Repeated control-table uploads use the existing bounded placement LRU
+  (64 KiB per entry, 8 MiB total); no operator or wavefunction is stored there.
 * `isdf_one_leg_source_slots(gvec, *, sym, sym_idx, q_irr_frac, kgrid)`: the
   parent sphere slot of each child's \(\mathbf G'=0\) coefficient. A missing or
   duplicated \(\mathbf G_p\) refuses (`GATE isdf_one_leg_parent_g`). A carrier
