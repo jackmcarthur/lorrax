@@ -19,6 +19,17 @@ never exceeds the FFT-grid capacity; whole-orbit budgets can leave a small
 unused remainder. Requests above the number of distinct FFT-grid points
 refuse before clustering.
 
+The FFT-grid positions and weights are distributed before initialization,
+so k-means++ random scores and nearest-seed distances use grid shards as
+Lloyd does. Each seed exchanges one local winner per rank, including its
+coordinates, rather than gathering grid positions. Global score ties use
+the lowest logical grid index; padded points never seed a centroid. The
+weighted-random route also transfers only its selected coordinates.
+Centroid coordinates and the per-centroid update accumulators remain
+replicated and scale linearly with the requested count. Exact k-means++
+still chooses seeds sequentially, so collective latency can limit its
+speed at high rank counts even when the grid storage divides by P.
+
 ## What is being optimized?
 
 The candidate Gram accumulates k batches and square tiles sized from the

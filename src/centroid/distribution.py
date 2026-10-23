@@ -16,6 +16,9 @@ specific to selecting ISDF centroids and would be wrong to generalise:
   ``NamedSharding`` / ``PartitionSpec``.  Requests 1-3 in this
   workstream's report propose moving them into ``common.collectives``,
   at which point this module keeps only the two items above.
+* :func:`place_grid`, :func:`grid_argmax`, :func:`grid_points` — the
+  grid-sharded seed inputs and small selected-point collectives. A seed
+  broadcasts its chosen point without gathering the full grid.
 
 There is deliberately NO ``single_device_mesh`` / ``process_local_mesh``
 here: both are ``common.collectives.single_device_mesh``.  An earlier
@@ -26,6 +29,8 @@ to name.
 """
 from __future__ import annotations
 
+from functools import partial
+
 import jax
 from lxkit import ordered_psum
 from jax import lax, config
@@ -34,6 +39,7 @@ from jax import shard_map
 
 from common.collectives import (
     device_put_process_local,
+    device_put_process_tiles,
     process_count,
     prepare_mesh,
     resolve_mesh,
@@ -149,6 +155,101 @@ def place(host_array, mesh: Mesh, *axes):
     """
     return device_put_process_local(
         host_array, NamedSharding(mesh, PartitionSpec(*axes)))
+
+
+def place_grid(rho, mesh: Mesh, grid_axis=MESH_AXES):
+    """Build fractional grid positions and density directly on grid shards.
+
+    Only each process's density slice reaches its device. Fractional
+    positions use the same linspace values as the logical FFT grid, with
+    zero positions and weights beyond its padded extent.
+    """
+    import numpy as np
+    import jax.numpy as jnp
+    from runtime.padding import padded_axis
+
+    axes = require_axes(mesh, grid_axis, 'place_grid')
+    axis = axes[0] if len(axes) == 1 else axes
+    nx, ny, nz = map(int, rho.shape)
+    tag = padded_axis(nx * ny * nz, n_shards(mesh, axes), name='k-means grid')
+    positions_sharding = NamedSharding(mesh, PartitionSpec(axis, None))
+
+    @partial(jax.jit, out_shardings=positions_sharding)
+    def positions():
+        index = jnp.arange(tag.carrier)
+        fx, fy, fz = (jnp.linspace(0, 1, n, endpoint=False, dtype=jnp.float64)
+                      for n in (nx, ny, nz))
+        xyz = jnp.stack((fx[jnp.minimum(index // (ny*nz), nx-1)],
+                         fy[(index // nz) % ny], fz[index % nz]), axis=-1)
+        return jnp.where((index < tag.logical)[:, None], xyz, 0.)
+
+    weights = np.asarray(rho, dtype=np.float64).reshape(-1)
+
+    def density_tile(index):
+        begin, end = index[0].start or 0, index[0].stop or tag.carrier
+        out = np.zeros(end-begin, dtype=np.float64)
+        valid_end = min(end, tag.logical)
+        if begin < valid_end:
+            out[:valid_end-begin] = weights[begin:valid_end]
+        return out
+
+    density = device_put_process_tiles(
+        (tag.carrier,), NamedSharding(mesh, PartitionSpec(axis)), density_tile)
+    return positions(), density, tag
+
+
+def grid_points(positions, index, mesh: Mesh, grid_axis=MESH_AXES):
+    """Return selected fractional points without gathering the grid.
+
+    Exactly one grid shard owns each index. Other ranks contribute zeros,
+    so the collective moves only the selected rows and preserves their bits.
+    """
+    import jax.numpy as jnp
+    axes = require_axes(mesh, grid_axis, 'grid_points')
+    axis = axes[0] if len(axes) == 1 else axes
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(PartitionSpec(axis, None), PartitionSpec()),
+             out_specs=PartitionSpec(), check_vma=False)
+    def selected(points, chosen):
+        local = chosen - lax.axis_index(axis) * points.shape[0]
+        row = points[jnp.clip(local, 0, points.shape[0]-1)]
+        valid = (local >= 0) & (local < points.shape[0])
+        row = jnp.where(valid[..., None], row, 0.)
+        return lax.psum(row, axis)  # exact-reduce: one owner supplies the point, other ranks zero
+
+    return selected(positions, index)
+
+
+def grid_argmax(positions, scores, mesh: Mesh, grid_axis=MESH_AXES):
+    """Stable global score maximum and its point in one small collective.
+
+    Each rank contributes its local best score, index and coordinates.
+    The index uses two exactly representable 32-bit words in the FP64
+    message; ties retain the lowest global index, as ``argmax`` does.
+    """
+    import jax.numpy as jnp
+    axes = require_axes(mesh, grid_axis, 'grid_argmax')
+    axis = axes[0] if len(axes) == 1 else axes
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(PartitionSpec(axis, None), PartitionSpec(axis)),
+             out_specs=PartitionSpec(), check_vma=False)
+    def selected(points, values):
+        local = jnp.argmax(values)
+        index = local + jnp.int64(lax.axis_index(axis)) * points.shape[0]
+        word = jnp.int64(2**32)
+        candidate = jnp.concatenate((values[local, None],
+            jnp.asarray([index // word, index % word], jnp.float64), points[local]))
+        candidates = lax.all_gather(candidate, axis, axis=0, tiled=False)
+        best = candidates[:, 0] == jnp.max(candidates[:, 0])
+        high = jnp.min(jnp.where(best, candidates[:, 1], jnp.inf))
+        best &= candidates[:, 1] == high
+        low = jnp.min(jnp.where(best, candidates[:, 2], jnp.inf))
+        winner = jnp.argmax(best & (candidates[:, 2] == low))
+        return candidates[winner, 3:]
+
+    return selected(positions, scores)
 
 
 # ─────────────────────────────────────────────────────────────────────────
