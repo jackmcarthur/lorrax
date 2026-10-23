@@ -666,7 +666,7 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
     # fully relativistic LiF 666-centroid deck (JID 57288835), against a
     # measured gate-preserving probe_chunk=64 discriminator on the same
     # deck (JID 57280453).  The deck key is ``ladder_probe_chunk``
-    # (ScreeningConfig); 0 keeps the whole-basis block, bit-identical.
+    # (ScreeningConfig); 0 lets the backend choose and compile-check a bounded tile.
     # The kernel's contract requires a multiple of the mesh 'y' extent
     # (the reduce-scatter snapshot tiles the probe axis over 'y'), so a
     # positive deck value is ROUNDED UP here — a placement change, never a

@@ -257,22 +257,8 @@ def apply_spectral_deflation(v: jax.Array, deflation) -> jax.Array:
 _ARNOLDI_CACHE: dict = {}
 
 
-def harvest_spectral_deflation(matvec, diag_h, z, operands, seed, *,
-                               n_arnoldi: int, rank: int):
-    """Recycled eigenvectors of the preconditioned resolvent, for every column.
-
-    Every probe column of one ``(q, z)`` solves against the SAME operator
-    ``A = (z - H) diag(z - D)^{-1}``, and on the ladder the columns all pay
-    for the same few eigenvalues far from 1 (bound excitons below the
-    free-pair continuum).  One ``n_arnoldi``-step Arnoldi from ``seed`` (a
-    ``(2, 1, c, v, k)`` pair-basis vector) finds them once; the ``rank``
-    Ritz vectors farthest from 1 become ``U`` of
-    :func:`apply_spectral_deflation`, and ``T = Q^H H_m Q`` comes from the
-    Arnoldi relation ``A V_m = V_{m+1} H`` with no further matvec.
-
-    Returns ``((U, C), ritz)``: ``ritz`` are the Ritz values of ``H_m`` on the
-    host (for the log).  Cost: ``n_arnoldi`` matvecs once per ``(q, z)``.
-    """
+def _get_deflation_arnoldi(matvec, seed, *, n_arnoldi: int):
+    """The shared cached harvest executable, exposed for compile-only pricing."""
     m = int(n_arnoldi)
     key = (id(matvec), m, tuple(seed.shape), str(seed.dtype))
     hit = _ARNOLDI_CACHE.get(key)
@@ -306,7 +292,28 @@ def harvest_spectral_deflation(matvec, diag_h, z, operands, seed, *,
 
         hit = (matvec, _arnoldi)
         _ARNOLDI_CACHE[key] = hit
-    V, H = hit[1](seed, diag_h, jnp.asarray(z, dtype=jnp.complex128), operands)
+    return hit[1]
+
+
+def harvest_spectral_deflation(matvec, diag_h, z, operands, seed, *,
+                               n_arnoldi: int, rank: int):
+    """Recycled eigenvectors of the preconditioned resolvent, for every column.
+
+    Every probe column of one ``(q, z)`` solves against the SAME operator
+    ``A = (z - H) diag(z - D)^{-1}``, and on the ladder the columns all pay
+    for the same few eigenvalues far from 1 (bound excitons below the
+    free-pair continuum).  One ``n_arnoldi``-step Arnoldi from ``seed`` (a
+    ``(2, 1, c, v, k)`` pair-basis vector) finds them once; the ``rank``
+    Ritz vectors farthest from 1 become ``U`` of
+    :func:`apply_spectral_deflation`, and ``T = Q^H H_m Q`` comes from the
+    Arnoldi relation ``A V_m = V_{m+1} H`` with no further matvec.
+
+    Returns ``((U, C), ritz)``: ``ritz`` are the Ritz values of ``H_m`` on the
+    host (for the log).  Cost: ``n_arnoldi`` matvecs once per ``(q, z)``.
+    """
+    m = int(n_arnoldi)
+    program = _get_deflation_arnoldi(matvec, seed, n_arnoldi=m)
+    V, H = program(seed, diag_h, jnp.asarray(z, dtype=jnp.complex128), operands)
     from common.collectives import gather_to_host
     Hm = np.asarray(gather_to_host(H))[:m, :m]
     ritz, S = np.linalg.eig(Hm)

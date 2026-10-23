@@ -185,9 +185,12 @@ def test_streamed_facade_releases_all_moments_after_first_sample():
             return SimpleNamespace(padded_axis=lambda n, *a, **k: SimpleNamespace(carrier=n))
         return builtins.__import__(name, *args, **kwargs)
 
+    input_rows = []
+
     def accumulate(old, tile, start, count, size, _mesh):
         if old is None:
             old = np.zeros((size, size), complex)
+            input_rows.append(weakref.ref(old))
         old[:, start:start+count] = tile[:, :count]
         return old
 
@@ -234,6 +237,7 @@ def test_streamed_facade_releases_all_moments_after_first_sample():
     seen = []
 
     def consume(iz, _z, value, _res, _iters, fields):
+        assert all(reference() is None for reference in input_rows)
         if iz == 0:
             prior_moments.extend(weakref.ref(fields[f"M{j}"]) for j in range(4))
         else:

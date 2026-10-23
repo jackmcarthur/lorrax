@@ -433,6 +433,19 @@ With $\mu$ the padded centroid count and $Q$ the stage's q extent:
 | tangential constructor | q-local rounds, else face rounds with each eigh stack on route (c) or the mesh by `place()` | same ([bispinor sectors §4](bispinor_tangential_w.md#sector-route)) |
 | BSE restart load, matvec, W densify | face tiles through SlabIO and `shard_map`, $s\,n_k\mu^2/P$ | same |
 
+The density-resolvent probe width defaults to an automatic bounded tile
+(`ladder_probe_chunk = 0`). The common 1 GiB scaling policy proposes a width;
+the shared seed, GMRES, snapshot, moment and deflation programs are compiled
+at that width and checked with the memory owner against all ranks' available
+run room. Future response wedges and deflation vectors are included. An
+over-budget automatic choice measures the minimum mesh-`y` width and checks
+one smaller proposal, falling back to that measured minimum if necessary.
+At most three shapes are compiled; a fitting initial proposal needs only one.
+The final short block is zero padded to the same width, so every q and
+frequency shares the programs. An explicit positive width remains honored and priced. A fixed
+Krylov or result footprint that exceeds the room still receives the memory
+owner's capacity warning; smaller probe blocks cannot cure that floor.
+
 **Where the ζ factor saturates.** The charge factor's only parallel axis is q,
 so every rank past $Q$ idles for the whole factor stage, and the run says so
 when $P > Q$.

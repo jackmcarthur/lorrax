@@ -1613,12 +1613,12 @@ _DEFAULTS = {
     "screening_diagrams": "w_rpa",
     # w_bse / w_rpa_resolvent only: probe columns of the mu^2 ladder tile
     # solved per block.
-    # 0 (default) = the whole padded centroid basis in one block — the
-    # historical behaviour, bit-identical for every existing deck.  A
+    # 0 (default) = a bounded automatic tile, checked against compiled
+    # seed/solve/project memory and the run budget. A
     # positive value bounds the per-block solve memory; the facade rounds
     # it up to the mesh 'y'-axis multiple the reduce-scatter snapshot
     # tiles by.  This is DISPATCH GRANULARITY, not physics: chunking
-    # changes when columns are solved, never their values.  Measured
+    # preserves the operator and stopping tolerance. Measured
     # motivation: with the knob unreachable, the fully relativistic LiF
     # 666-centroid lift solve attempted one 77.83-GiB block allocation
     # (JID 57288835), while the same deck at probe_chunk=64 passed every
@@ -4195,8 +4195,8 @@ class ScreeningConfig:
     # w_bse / w_rpa_resolvent only (both reach the ladder facade) —
     # ``bse.w_ladder.compute_wc_qwedge``'s public ``probe_chunk`` memory
     # knob, threaded through the facade (``gw.screening_bse._ladder_wedge``,
-    # which does not branch on ``include_w``).  0 = whole padded basis in
-    # one block (historical).  Deck key: ``ladder_probe_chunk``.
+    # which does not branch on ``include_w``). 0 = bounded automatic tile.
+    # Deck key: ``ladder_probe_chunk``.
     ladder_probe_chunk: int = 0
 
     def __post_init__(self):
@@ -4205,8 +4205,8 @@ class ScreeningConfig:
         if int(self.ladder_probe_chunk) < 0:
             raise ValueError(
                 f"ladder_probe_chunk = {self.ladder_probe_chunk} must be "
-                f">= 0 (0 = the whole padded centroid basis in one probe "
-                f"block; a positive value bounds the per-block ladder "
+                f">= 0 (0 = a bounded automatic probe block; "
+                f"a positive value bounds the per-block ladder "
                 f"solve memory).")
         # REFUSE, naming what IS supported, instead of silently resolving
         # to it.  ``ctsp`` (contour-tail / separable-pole terminology from

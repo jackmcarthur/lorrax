@@ -930,9 +930,34 @@ def _get_block_moment_actions(matvec, sh, dtype):
 
 def _bind_tol(block, tol):
     """Bind the runtime ``tol`` so callers keep the 4-argument call shape."""
-    return lambda rhs, diag_h, z, operands, deflation=None: block(
-        rhs, diag_h, z, operands, jnp.asarray(tol, dtype=jnp.float64),
-        deflation)
+    def call(rhs, diag_h, z, operands, deflation=None):
+        return block(rhs, diag_h, z, operands,
+                     jnp.asarray(tol, dtype=jnp.float64), deflation)
+
+    call.lower = lambda rhs, diag_h, z, operands, deflation=None: block.lower(
+        rhs, diag_h, z, operands, jnp.asarray(tol, dtype=jnp.float64), deflation)
+    return call
+
+
+_PROBE_RHS_CACHE = {}
+
+
+def _get_probe_rhs_program(gen, sh, nk):
+    """The executed seed program, also lowered by the probe memory planner."""
+    key = (id(gen), sh.X_full, int(nk))
+    hit = _PROBE_RHS_CACHE.get(key)
+    if hit is None:
+        @jax.jit
+        def seed(g, psi_c, psi_v, v):
+            r = jax.lax.with_sharding_constraint(
+                jnp.broadcast_to(g[:, :, None], (*g.shape, nk)), sh.S)
+            f = jax.lax.with_sharding_constraint(gen(r, psi_c, psi_v, v), sh.X)
+            return jax.lax.with_sharding_constraint(
+                jnp.stack([f, -f], axis=0).astype(jnp.complex128), sh.X_full)
+
+        hit = (gen, seed)
+        _PROBE_RHS_CACHE[key] = hit
+    return hit[1]
 
 
 def build_probe_rhs(G_zeta, data, gen, sh):
@@ -994,12 +1019,8 @@ def build_probe_rhs(G_zeta, data, gen, sh):
     # taking the memory knob back.
     g = device_put_process_local(
         np.ascontiguousarray(G, dtype=np.float64), sh.S_k0)
-    r = jax.lax.with_sharding_constraint(
-        jnp.broadcast_to(g[:, :, None], (n_probe, n_rmu, nk)), sh.S)
-    f = jax.lax.with_sharding_constraint(
-        gen(r, data["psi_c_X"], data["psi_v_X"], data["V_q0"]), sh.X)
-    return jax.lax.with_sharding_constraint(
-        jnp.stack([f, -f], axis=0).astype(jnp.complex128), sh.X_full)
+    return _get_probe_rhs_program(gen, sh, nk)(
+        g, data["psi_c_X"], data["psi_v_X"], data["V_q0"])
 
 
 def _project_screening_actions(actions, data, snapshot, *, view=None, snapshot_v=None):

@@ -328,7 +328,8 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from .bse_feast import (ensure_W_R, build_preconditioner_diagonal_sharded,
-                        ladder_matvec_operands, matvec_operands)
+                        ladder_matvec_operands, matvec_operands,
+                        _get_deflation_arnoldi)
 from .bse_io import load_bse_data_from_restart_sharded
 from .bse_ring_comm import (
     build_bse_ring_matvec_full,
@@ -345,6 +346,8 @@ from .bse_w_exact import (
     _symmetry_tables,
     _get_block_moment_actions,
     _project_screening_actions,
+    _get_block_gmres_solver,
+    _get_probe_rhs_program,
 )
 from common.collectives import gather_to_host
 
@@ -526,6 +529,154 @@ def _identity_probe_blocks(n_logical: int, n_pad: int, chunk: int):
         yield c0, n_real, probes
 
 
+def _probe_scaling_bytes(data, mesh):
+    """Shape-only proposal per probe; the executed programs admit the choice."""
+    nc, nv = int(data["n_cond_pad"]), int(data["n_val_pad"])
+    nk = int(data["nkx"] * data["nky"] * data["nkz"])
+    n, ns = int(data["V_q0"].shape[0]), int(data["psi_c_X"].shape[2])
+    px, py, p = int(mesh.shape["x"]), int(mesh.shape["y"]), int(mesh.size)
+    pair = nc * nv * nk / p
+    # Seed decode and snapshot ring panels scale in the probe axis, whereas
+    # GMRES/Arnoldi themselves scan one probe and keep one Krylov workspace.
+    return max(8*n*nk/py + 32*nc*nv*nk/py + 32*pair,
+               32*nc*n*nk*(ns+1)/p + 32*n*nk/px + 96*pair)
+
+
+def _plan_probe_chunk(context, requested, *, n_pad, carry_bytes, stack_bytes):
+    """Compile the real seed/solve/project/harvest at a bounded proposed width.
+
+    ``carry_bytes`` reserves the facade's not-yet-built response bank. The
+    current payload is already resident. Positive requests are priced and
+    honored; automatic proposals use the common tile bound, then at most a
+    minimum-width and one adjusted-width check. All planning operands are abstract.
+    """
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, check_chunk, compiled_new_bytes
+    from runtime.tiles import tile_units
+    dq, sh, mesh = context["data"], context["sh"], context["mesh"]
+    py, p = int(mesh.shape["y"]), int(mesh.size)
+    nc, nv = int(dq["n_cond_pad"]), int(dq["n_val_pad"])
+    nk = int(dq["nkx"] * dq["nky"] * dq["nkz"])
+    rank = int(context["deflation_rank"])
+    slope, moments = bool(context["with_slope"]), bool(context["with_moments"])
+    abstract = lambda a: (jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=a.sharding)
+                          if isinstance(a, jax.Array) else a)
+    args = jax.tree.map(abstract, context["operands"])
+    diag = abstract(context["diag"])
+    scalar = jax.ShapeDtypeStruct((), jnp.complex128)
+    pair_shape = (nc, nv, nk)
+    one = jax.ShapeDtypeStruct((2, 1, *pair_shape), jnp.complex128, sharding=sh.X_full)
+    seed_program = _get_probe_rhs_program(context["gen"], sh, nk)
+    solver = _get_block_gmres_solver(context["matvec"], sh,
+        context["max_iter"], context["tol"], jnp.complex128, with_slope=slope)
+    psi = lambda key, layout: jax.ShapeDtypeStruct(
+        dq[key].shape, dq[key].dtype, sharding=layout)
+    v = abstract(dq["V_q0"] if context["snapshot_v"] is None else context["snapshot_v"])
+    deflation, deflation_bytes, harvest_bytes = None, 0, 0
+    if rank:
+        u = jax.ShapeDtypeStruct((rank, *one.shape), jnp.complex128,
+            sharding=NamedSharding(mesh, P(None, *sh.X_full.spec)))
+        c = jax.ShapeDtypeStruct((rank, rank), jnp.complex128,
+                                sharding=NamedSharding(mesh, P()))
+        deflation = (u, c)
+        deflation_bytes = 16*(2*rank*nc*nv*nk//p + rank*rank)
+        arnoldi = max(LADDER_DEFLATION_ARNOLDI, 2*rank)
+        ex = _get_deflation_arnoldi(context["matvec"], one, n_arnoldi=arnoldi).lower(
+            one, diag, scalar, args).compile()
+        # Include the subsequent V[:m] -> U contraction and uploaded host
+        # factors beside the returned Arnoldi basis, not just its workspace.
+        harvest_bytes = compiled_new_bytes(ex) + deflation_bytes + 16*arnoldi*rank
+    ndefl = 1 if context["z_outer"] else context["nz"]
+    deflation_bytes *= ndefl
+    # Eager seed/project callers temporarily request ring-layout psi views.
+    # Price their additional carriers; the solve itself takes resting 2-D psi.
+    ring_bytes = sum(int(a.size*a.dtype.itemsize) //
+        int(mesh.shape["x" if key.endswith("_X") else "y"])
+        for key in _PSI_KEYS if isinstance((a := dq.get(key)), jax.Array))
+    figures = {}
+
+    def build(units):
+        chunk = int(units)*py
+        rhs = jax.ShapeDtypeStruct((2, chunk, *pair_shape), jnp.complex128,
+                                   sharding=sh.X_full)
+        readout = jax.ShapeDtypeStruct((chunk, *pair_shape), jnp.complex128, sharding=sh.X)
+        probes = jax.ShapeDtypeStruct((chunk, n_pad), jnp.float64, sharding=sh.S_k0)
+        seed = seed_program.lower(probes, psi("psi_c_X", sh.psi_x),
+                                  psi("psi_v_X", sh.psi_x), abstract(dq["V_q0"])).compile()
+        solve = solver.lower(rhs, diag, scalar, args, deflation).compile()
+        snap = context["snapshot"].lower(readout, psi("psi_c_Y", sh.psi_y),
+                                         psi("psi_v_Y", sh.psi_y), v).compile()
+        rhs_bytes = 32*chunk*nc*nv*nk//p
+        readout_bytes, tile_bytes = rhs_bytes//2, 16*n_pad*chunk//p
+        snap_new = compiled_new_bytes(snap)
+        nread = 3 if slope else 1
+        moment_carry = 4*tile_bytes if moments else 0
+        costs = [8*chunk*n_pad//py + compiled_new_bytes(seed) + ring_bytes,
+                 rhs_bytes + moment_carry + compiled_new_bytes(solve),
+                 rhs_bytes + moment_carry + nread*readout_bytes +
+                 (nread-1)*tile_bytes + snap_new + ring_bytes]
+        if moments:
+            moment = context["moment_actions"].lower(rhs, args).compile()
+            costs.extend([rhs_bytes + compiled_new_bytes(moment),
+                          rhs_bytes + 4*readout_bytes + 3*tile_bytes + snap_new + ring_bytes])
+        if rank:
+            costs.append(rhs_bytes + moment_carry + one.size*16//p + harvest_bytes)
+        # All response matrices remain face-sharded. The facade also holds
+        # future completed rows and one non-donated column-placement output.
+        figures[int(units)] = max(int(stack_bytes),
+            int(carry_bytes + deflation_bytes + max(costs)))
+        return solve
+
+    per_probe = _probe_scaling_bytes(dq, mesh)
+    top = n_pad//py
+    units = min(top, int(requested)//py) if requested else tile_units(per_probe*py, top)
+    room = memory.room() if memory.run() else (1 << 30) + int(carry_bytes)
+    compiled = build(units)
+    extra = lambda count, ex: max(0, figures[count] - compiled_new_bytes(ex))
+    if requested:
+        price = -agreed_chunk(-figures[units])
+        memory.admit("BSE requested probe block", memory.priced(price,
+            "compiled seed/GMRES/snapshot/moments/Arnoldi and live carries"), room)
+    else:
+        price = -agreed_chunk(-figures[units])
+        fixed = max(int(stack_bytes), int(carry_bytes)+deflation_bytes)
+        per_unit = py*per_probe
+        if price > room and units > 1:
+            # A single wide-block price cannot separate its fixed Krylov
+            # workspace from its scaling outputs. Read the executable at the
+            # irreducible width only when needed, then fit that affine floor;
+            # otherwise check_chunk would wrongly scale the fixed workspace
+            # and could choose another over-budget width when a smaller fits.
+            minimum_compiled = build(1)
+            floor = -agreed_chunk(-figures[1])
+            if floor > room:
+                units, compiled, price = 1, minimum_compiled, floor
+            else:
+                slope = max(0., (price-floor)/(units-1))
+                fixed, per_unit = max(fixed, floor-slope), max(per_unit, slope)
+                proposed = max(1, min(units-1, int((room-fixed)//max(per_unit, 1.))))
+                proposed_compiled = minimum_compiled if proposed == 1 else build(proposed)
+                proposed_price = -agreed_chunk(-figures[proposed])
+                if proposed_price <= room:
+                    units, compiled, price = proposed, proposed_compiled, proposed_price
+                else:
+                    # XLA can change schedules between widths: its temporary
+                    # size need not be affine. Never execute an over-budget
+                    # interpolation when an already-compiled width fits.
+                    memory.record_route("BSE automatic probe block", "mesh-y minimum",
+                        f"compiled width {proposed*py} exceeds room; measured minimum fits")
+                    units, compiled, price = 1, minimum_compiled, floor
+        choice = check_chunk(units, build=build, compiled=compiled,
+            fixed=fixed, per_unit=per_unit, room=room, extra=extra,
+            minimum=1, stage="BSE automatic probe block")
+        units, price = choice.chunk, choice.price
+    memory.book(memory.priced(price, "compiled ladder block and response carries", increment=True),
+                stage="bse.probe_block")
+    print(f"[w_ladder] {'requested' if requested else 'automatic'} probe chunk {units*py}/{n_pad}; "
+          f"compiled block+carry {price/1e9:.3f} GB/rank, room {room/1e9:.3f} GB/rank", flush=True)
+    return units*py
+
+
 def sweep_q_wedge(
     data: dict,
     mesh_xy: Mesh,
@@ -544,6 +695,7 @@ def sweep_q_wedge(
     on_z_done: Optional[Callable] = None,
     with_slope: bool = False,
     with_moments: bool = False,
+    probe_chunk_plan: Optional[Callable] = None,
 ):
     """Walk the q-wedge x probe-chunk x z-list with ONE compiled engine.
 
@@ -670,6 +822,7 @@ def sweep_q_wedge(
     moment_actions = (_get_block_moment_actions(matvec, sh, jnp.complex128)
                       if with_moments else None)
     data = _psi_at_rest_2d(data, mesh_xy)
+    probe_planned = False
 
     def _q_payload(iq, qv):
         q = (int(qv[0]), int(qv[1]), int(qv[2]))
@@ -699,6 +852,15 @@ def sweep_q_wedge(
         return q, dq, solve_dq, diag_hq
 
     def _solve_blocks(iq, q, dq, solve_dq, diag_hq, z_items):
+        nonlocal probe_planned
+        if probe_chunk_plan is not None and not probe_planned:
+            probe_chunk_plan(dict(data=dq, sh=sh, mesh=mesh_xy, matvec=matvec,
+                gen=gen, snapshot=snapshot, diag=diag_hq, operands=op_fn(solve_dq),
+                snapshot_v=(eye_v if lift else None), deflation_rank=deflation_rank,
+                max_iter=gmres_max_iter, tol=gmres_tol, with_slope=with_slope,
+                with_moments=with_moments, moment_actions=moment_actions,
+                z_outer=z_outer, nz=len(z_list_ry)))
+            probe_planned = True
         # One deflation space per (q, z), harvested on the first probe block
         # and reused by every later block: the operator does not depend on
         # the probe, so the eigenvectors every column pays for are found once.
@@ -955,10 +1117,12 @@ def compute_wc_qwedge(
     the result is a :class:`WLadderWedge`.
 
     ``probe_chunk`` is the memory knob: columns of the mu^2 tile solved per
-    block, defaulting to the whole (padded) basis in one block.  It must be a
+    block. None chooses a bounded width from the common tile policy, then
+    checks the executed programs and carries against the run's memory room.
+    A positive request is honored and priced. The carrier must be a
     multiple of ``py`` because the reduce-scatter snapshot tiles the probe axis
-    over ``y``.  Chunking costs one extra dispatch per chunk and nothing else —
-    the compiled engine is shared, since ``n_probe`` is the only shape that
+    over ``y``. Chunking trades stage dispatches for memory; the operator and
+    solver tolerance are unchanged. The compiled engine is shared, since ``n_probe`` is the only shape that
     changes and a chunked sweep uses ONE ``n_probe`` for all chunks except a
     final short one (which is zero-padded up, not re-shaped).
 
@@ -1087,6 +1251,18 @@ def compute_wc_qwedge(
             f"accept the per-rank N_mu^2 tile the RPA Dyson's own DEFAULT "
             f"('local') plan already holds, or route='plain'/'auto'.")
 
+    def plan_probes(context):
+        nonlocal chunk
+        # Reserve the full future result even though first-q planning happens
+        # before any of its rows exist. Stack/placement copies are separate
+        # lifetimes; do not sum their peaks with a live GMRES workspace.
+        face = 16*n_pad*n_pad//n_dev
+        bank_fields = nq*((1+2*int(with_slope))*(1 if on_z is not None else nz)
+                          + 4*int(with_moments) + int(route == "lift"))
+        chunk = _plan_probe_chunk(context, probe_chunk, n_pad=n_pad,
+            carry_bytes=(bank_fields+1)*face,
+            stack_bytes=((bank_fields+nq) if on_z is not None else 3*bank_fields)*face)
+
     def _on_result(iq, q, iz, z, c0, n_real, W_tile, resids, its, fields=None):
         tiles[iz][iq] = _accumulate_columns(
             tiles[iz][iq], W_tile, c0, n_real, n_pad, mesh_xy)
@@ -1132,9 +1308,10 @@ def compute_wc_qwedge(
                 fields[name] = _stack_rows(by_z[iz])
                 by_z[iz] = None
             if iz == 0:
-                for name, rows in moment_tiles.items():
+                for name in tuple(moment_tiles):
+                    rows = moment_tiles.pop(name)
                     moment_fields[name] = _stack_rows(rows)
-                moment_tiles.clear()
+                    del rows
             fields.update(moment_fields)
             on_z(iz, z, wc_z, resid[iz], iters[iz], fields)
             if iz == 0:
@@ -1151,7 +1328,8 @@ def compute_wc_qwedge(
                     if route == "lift" else None),
         z_outer=on_z is not None,
         on_z_done=(_on_z_done if on_z is not None else None),
-        with_slope=with_slope, with_moments=with_moments)
+        with_slope=with_slope, with_moments=with_moments,
+        probe_chunk_plan=plan_probes)
 
     if on_z is not None:
         wc = None
