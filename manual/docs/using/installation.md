@@ -127,20 +127,7 @@ It ends `1 passed`. `python -m tests.hsuite.chain --out <dir>` runs the same wor
 
 ## Sizing a job {: #sizing }
 
-- **Process count.** One process per device, and the device count a perfect square: 1, 4, 9, 16, 25, 36, …. Any other count refuses at startup and names the two nearest squares; 32 GPUs (8 Perlmutter nodes) is not a legal job, 36 (9 nodes) is.
-- **One GPU model and memory class.** Mixed models refuse (`GATE heterogeneous_gpu_targets`). On Perlmutter a multi-node job requests `-C 'gpu&hbm40g'` or `-C 'gpu&hbm80g'`.
-- **Shared run directory.** A multi-node run writes into a directory every node mounts (`$SCRATCH`, CFS). A node-local one (`/tmp`, local NVMe) refuses at the first write (`GATE io_global_commit`, stage `SlabIO.shared_directory`).
-
-Every planner prices its stage against one budget per device, set from the card's memory before the input file is read:
-
-| Card | Budget, `linalg = local` | Budget, `linalg = distributed` |
-|---|---|---|
-| A100-40GB | 31.6 GB | 28.7 GB |
-| A100-80GB | 66.4 GB | 63.4 GB |
-
-[`memory_per_device_gb`](../drivers/gw/keywords.md#memory_per_device_gb) can only lower it; a larger value warns and keeps the rule. No stage refuses on a price. A stage priced over the budget prints `memory over budget at <stage>: needs … GB/rank, budget … GB/rank, over by … GB; continuing (an OOM is possible)`, listed under `WARNINGS` in the report, runs at its smallest tile, and fails at allocation if the memory is really missing. Large objects are tiled over every rank, so the fix is more ranks or larger cards. A compiled program larger than the card refuses before it runs (`GATE xla_rematerialization`), with the same fix.
-
-After a GW run, the `MAJOR-STAGE DEVICE AND HOST MEMORY` block of `gwjax.out` lists each stage's device peak (max and min over ranks), its planner price and γ = peak / price, and the host high-water. A stage with γ > 1 was under-priced; the stage that set the run's peak is the one to size against.
+Process-count rules, the per-GPU memory budget and how many GPUs a calculation needs are on [Running on clusters](clusters.md).
 
 ## Startup refusals {: #refusals }
 

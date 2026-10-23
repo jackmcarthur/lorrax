@@ -33,6 +33,7 @@
 - [Velocity operator](https://jackmcarthur.github.io/lorrax/theory/velocity-operator/): manual/docs/theory/velocity-operator.md
 - [Short- and long-range W](https://jackmcarthur.github.io/lorrax/theory/w-range-splitting/): manual/docs/theory/w-range-splitting.md
 - [For BerkeleyGW users](https://jackmcarthur.github.io/lorrax/using/berkeleygw-users/): manual/docs/using/berkeleygw-users.md
+- [Running on clusters](https://jackmcarthur.github.io/lorrax/using/clusters/): manual/docs/using/clusters.md
 - [Environment variables](https://jackmcarthur.github.io/lorrax/using/environment/): manual/docs/using/environment.md
 - [Required DFT inputs](https://jackmcarthur.github.io/lorrax/using/inputs-from-dft/): manual/docs/using/inputs-from-dft.md
 - [Installation](https://jackmcarthur.github.io/lorrax/using/installation/): manual/docs/using/installation.md
