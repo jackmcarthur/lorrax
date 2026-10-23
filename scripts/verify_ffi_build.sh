@@ -556,9 +556,11 @@ elif [[ "$LEG" == rocm ]]; then
                 # BLAS is the locking OpenBLAS (build_openblas_seq.sh), shipped in
                 # the SLATE prefix.  Checked on the LEG's closure: SONAMEs the leg
                 # binds by DT_RPATH are the ones SLATE's own NEEDED entries meet.
-                _bl="$(awk -F '\t' '$1 ~ /^lib(sci|openblas)/{print $1"="$2}' <<<"$ROCM_RUNTIME_MAP" | sort -u | tr '\n' ' ')"
+                _bl="$(awk -F '\t' '$1 ~ /^libsci(_|[.])/ || $1 ~ /^libopenblas/{print $1"="$2}' <<<"$ROCM_RUNTIME_MAP" | sort -u | tr '\n' ' ')"
                 _ob="$(awk -F '\t' '$1 ~ /^libopenblas/{print $2}' <<<"$ROCM_RUNTIME_MAP" | head -1)"
-                if printf '%s' "$_bl" | grep -q 'libsci'; then
+                # NumPy's libscipy_openblas64_<hash>.so has its own symbol
+                # namespace. Its prefix "libsci" is not Cray's libsci_*.so.
+                if grep -qE '(^| )libsci(_|[.])' <<<"$_bl"; then
                     fail 3d "the leg's closure maps LibSci ($_bl): not safe for SLATE's
       concurrent host BLAS calls.  Rebuild with config/frontier/build_openblas_seq.sh
       then build_slate_hip.sh."; _g3=1

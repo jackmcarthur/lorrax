@@ -49,16 +49,25 @@ def test_rocm_acceptance_uses_exact_recorded_files_in_a_cold_process(tmp_path, m
 
     build(mpi, "int fixture_mpi(void) { return 17; }")
     build(providers / "librccl.so.1", "int fixture_rccl(void) { return 1; }")
+    blas = providers / "libopenblas.so.0"
+    build(blas, "int fixture_blas(void) { return 1; }")
+    build(providers / "librocblas.so.5", "int fixture_gpu_blas(void) { return 1; }")
+    slate = providers / "libslate.so.2"
+    build(slate, "extern int fixture_blas(void), fixture_gpu_blas(void); "
+                "int fixture_slate(void) { return fixture_blas()+fixture_gpu_blas(); }",
+          [str(blas), str(providers / "librocblas.so.5")])
+    locking = providers / "libopenblas.LORRAX_BUILD_FLAGS"
+    locking.write_text("USE_THREAD=0 USE_LOCKING=1\n")
     leg = tmp_path / "liblorrax_ffi_rocm.so"
-    build(leg, f'''extern int fixture_mpi(void);
+    build(leg, f'''extern int fixture_mpi(void), fixture_slate(void);
         int lorrax_ffi_rocm_abi_version(void) {{ return {abi}; }}
         const char *lorrax_ffi_rocm_build_config(void) {{
             return "leg=rocm abi={abi} phdf5=1 slate=1";
         }}
-        int PhdfFixtureFfi(void) {{ return fixture_mpi(); }}
+        int PhdfFixtureFfi(void) {{ return fixture_mpi()+fixture_slate(); }}
         void SlateFixtureFfi(void) {{}}
         void KDftFixtureFfi(void) {{}}
-        ''', [str(mpi)])
+        ''', [str(mpi), str(slate)])
     writer = _writer()
     monkeypatch.setattr(writer, "plugin_dirs", lambda *a: [])
     assert writer.main([str(leg), "--process-dir", str(providers)]) == 0
@@ -85,6 +94,20 @@ def test_rocm_acceptance_uses_exact_recorded_files_in_a_cold_process(tmp_path, m
     accepted = subprocess.run(verify, env=env, capture_output=True, text=True)
     assert accepted.returncode == 0, accepted.stdout + accepted.stderr
     assert "every gate ran and passed" in accepted.stdout
+    numpy_blas = providers / "libscipy_openblas64_fixture.so"
+    build(numpy_blas, "int fixture_numpy_blas64(void) { return 1; }")
+    private_blas = subprocess.run(verify, env={**env, "LD_PRELOAD": str(numpy_blas)},
+                                  capture_output=True, text=True)
+    assert private_blas.returncode == 0, private_blas.stdout + private_blas.stderr
+    cray_blas = providers / "libsci_gnu.so.6"
+    build(cray_blas, "int fixture_cray_blas(void) { return 1; }")
+    wrong_blas = subprocess.run(verify, env={**env, "LD_PRELOAD": str(cray_blas)},
+                                capture_output=True, text=True)
+    assert wrong_blas.returncode != 0 and "GATE FAILED (3d)" in wrong_blas.stderr
+    locking.write_text("USE_THREAD=0 USE_LOCKING=0\n")
+    unlocked = subprocess.run(verify, env=env, capture_output=True, text=True)
+    assert unlocked.returncode != 0 and "GATE FAILED (3d)" in unlocked.stderr
+    locking.write_text("USE_THREAD=0 USE_LOCKING=1\n")
     wrong_mpi = subprocess.run(verify, env={**env, "LORRAX_FFI_EXPECT_MPI": "libmpi_gnu.so.12"},
                                capture_output=True, text=True)
     assert wrong_mpi.returncode != 0 and "GATE FAILED (1)" in wrong_mpi.stderr
