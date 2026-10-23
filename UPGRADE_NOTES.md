@@ -5,6 +5,21 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-23 — Distributed memory and compilation before the GW/BSE kernels
+
+GW keeps canonical Coulomb parents through validation, retains only the fit-band
+G coefficients beside complete centroid faces, and admits the actual compiled
+factor, Dyson and response programs with their queried native workspaces.
+Accepted Coulomb roots are reused across dense execution layouts for the same
+operator, packed basis and mesh. These changes reduce avoidable copies and
+repeated solves without adding memory modes or changing the requested accuracy.
+
+A streamed response group now reads its frequency samples in the same order as
+its consumer. Results can change for mixed dense/line groups on host/file
+storage that previously associated a sample with the wrong frequency.
+Existing inputs remain valid. CPU convolution users must rebuild the host FFI
+library: the bounded k-leading and k-minor handlers are new.
+
 ## 2026-10-23 — GW: the tangential W pole budget is 1.0 N_mu (was 1.8)
 
 - Production tier: at most ceil(1.0 N_mu) poles per parent (`pole_budget_fraction`, `gw/tangential_recipe.py`).
