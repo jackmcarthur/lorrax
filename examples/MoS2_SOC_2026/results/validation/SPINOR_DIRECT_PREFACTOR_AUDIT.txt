@@ -1,0 +1,75 @@
+Independent screened-direct spinor prefactor audit — 2026-10-23
+
+Result: the proposed universal 1/nspinor=1/2 direct-kernel convention error is
+not present in the audited native TDA matvec or BGW kernel export/reader path.
+No source changes or GPU work were performed. This rules out that specific
+normalization hypothesis; it does not explain the remaining spectrum difference.
+Source reviewed: soc_tutorial_source f075e4e796f996719a1c9a48ce48d6abb5291424.
+
+1. Spin contractions and scalar/spinor split
+For spinors the direct operator is
+  -1/Nk sum[k',s,t,mu,nu] conj(pc[k,c,t,mu]) pc[k',c',t,mu]
+       W[k-k',mu,nu] pv[k,v,s,nu] conj(pv[k',v',s,nu]) X[c',v',k'].
+The two spin sums are independent, not averaged. Native _encode_A (stack
+matvec lines197–209), _decode_tm (288–296) and _decode_v (299–309) perform
+exactly those sums. They contain no spinor-count denominator. The stored psi
+spinor axis is unsharded, so MPI reductions do not divide its two components.
+
+Native build_bse_stack_matvec (895–955) returns D+VX-WX. Its only spin weight
+is exchange_spin_weight:1 for spinors,2 for a scalar singlet,0 scalar triplet
+(bse_preconditioner.py:64–89). BGW intkernel.f90:224 uses
+  factor=-8*pi/(Omega*Nk)*scaling
+for all direct parts; the spinor branch244–247 leaves fac_d=factor. The
+additional factor2 at1133/1138 belongs only to exchange and explicitly excludes
+BSE_KERNEL_SPINOR. BGW mtxel_kernel sums both spinor components into each pair
+matrix before w_sum; there is no spinor average there either. Both calculations
+have nspin1,nspinor2 and 6*8*64=3072 transitions, not duplicated scalar sectors.
+
+2. Nk, volume and Rydberg units
+The native W term uses W_R=IFFT_ortho(W_q), then
+  FFT_ortho(IFFT_ortho(T)*W_R)/sqrt(Nk).
+Expanding the unitary transforms gives exactly sum[k'] W[k-k']T[k']/Nk.
+The coarse-to-fine embedding includes sqrt(Nfine/Ncoarse), preserving this
+normalization. The CUDA outer/fused factories (ffi/fft.py:2295,2415,2443)
+pass the product of the inverse/forward unitary scales,1/Nk; CPP receives
+that scalar and introduces no spin-dependent normalization. Their remaining
+decode division is the same sqrt(Nk) as the XLA route. The0.5 transformations
+elsewhere in the pair solver are non-TDA F/G coordinates and are not used here.
+
+The exporter stores body/wing/exchange with Omega/(8*pi), while the BGW reader
+uses -8*pi/(Omega*Nk) for direct and its opposite sign for exchange. Including
+the head screening restoration, these compose to -C W C*/Nk and +C V C*/Nk.
+No nspinor enters the exporter scaling (bsemat_algebra.py:183–208;
+bsemat_export.py:713–730,836–842). Both raw files report identical cell volume
+702.201201287347 bohr^3 and nspinor2. The native slab Coulomb has8*pi/q^2 in
+Rydberg (vcoul/slab_2d.py:149), consistent with BGW's8*pi convention.
+
+The1/nspinor factor DOES occur in optical epsilon prefactors after the solve,
+in both native absorption_common.py and BGW absp.f90. It scales oscillator
+response and cannot shift eigenvalues or create the observed binding ratio.
+
+3. Independent raw-HDF amplitude evidence
+Streamed Frobenius norms (native / original BGW):
+  head      55.53538271 / 55.53975105   ratio0.99992135
+  wing     151.12762567 /151.74994671   ratio0.99589904
+  body     367.98834630 /371.51893635   ratio0.99049688
+  exchange 515.49754931 /515.33260820   ratio1.00032007
+All blocks have shape[9,9,12,12,12,12,2]. These gauge-invariant amplitudes
+exclude a uniform exported direct scale of1/2 or2. Raw elementwise overlaps are
+poor, especially exchange, so the files must NOT be described as gauge-aligned
+or entrywise equivalent. The explicit-full WFN and original expanded-wedge
+wavefunctions can carry different phases/degenerate gauges. KERNEL_NORMS.json
+and kernel_norm_probe.py preserve the streamed measurement and its limitation.
+
+4. Correct continuum for the binding comparison
+Use each BSE's own fine-grid independent transition minimum. Native report:
+3.23338eV gap,2.5110195eV lowest root ->0.72236eV dark binding (reported
+precision). BGW eigenvalues_noeh.dat gives minimum3.1585562eV, so with lowest
+root1.5915516eV its binding is1.5670046eV. The ratio remains about0.461, but a
+binding ratio is a nonlinear eigenvalue result, not a measurement of a kernel
+coefficient. Coarse GW gaps must not replace these fine-grid thresholds.
+
+The parent's actual BGW-reader run on the native kernel is the appropriate
+next discriminator between the exported coarse operator and native fine-grid
+construction. This audit makes no claim that those different interpolation or
+head models agree, and assigns no unexplained residual to centroid rank.

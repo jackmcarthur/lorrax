@@ -1,0 +1,50 @@
+Independent epsilon q-coverage review — 2026-10-23
+
+Verdict: PASS, no release blocker found in the reviewed final diff.
+Commit:4682c40fb63a6660c9c8f3574dc059e282181694
+Source: ROOT/epsmat_qcoverage_source (local lorrax_epsmat_qcoverage_20261023).
+This is independent read-only code/math review. Author/root owns compute and
+combined release gates; the final workflow artifact validator is separate.
+
+Problem and exact representation
+BerkeleyGW Common/fullbz.f90:115 expands q rows with the spatial header only.
+The original compactTR wedge here covered6/9 grid points under12 spatial ops.
+The exporter now writes all8 nonzero full-grid q points, or a reference's
+explicit q list, using the restart's persisted parent/action tables. No new
+producer full-storage mode or user input was introduced.
+
+In epsilon^{-1}-1=v Z chi Z^H, the centroid basis action cancels between Z,
+chi and Z^H. One consistent parent-centroid basis is therefore sufficient:
+map the requested q+G to parent carriers with the typed reciprocal action,
+apply the nonsymmorphic phase to each Fourier leg, and conjugate Z and chi
+for antiunitary rows. The existing SymMaps reciprocal_phase is
+exp[-i(S_effective K_parent).tau], including the time-reversal wavevector sign.
+This changes representation, not the stored screening equation or approximation.
+
+Reviewed implementation
+* WFN/bundle grid equality and all persisted parent/action mappings onto the
+  current full-q order are checked, in addition to V/W table self-integrity.
+  Noninteger parent G carriers and unmatched off-grid q requests refuse.
+* Direct stored-q/Umklapp images keep the original identity path. ShiftedGamma
+  q0 body/head/wings retain their existing policy; no antiunitary branch is
+  applied there.
+* Large Z/chi/Wc arrays stay on the existing2D faces. Conjugation is JAX on
+  those arrays, never NumPy host gathering. Parent-grouped processing reuses
+  one parent algebra tuple and explicit file-row offsets preserve requested
+  output ordering. Child conjugation does not mutate cached parent data.
+* The project counterpart never calls plan_export/QPlan. It still loops each
+  authored stored parent once, directly matches the input epsilon q moduloG,
+  and writes only that parent in the copied W0 dataset. A TR-only template
+  missing a direct parent still refuses under the existing project contract.
+* The independent dense RPA test includes antiunitary action and nonzero
+  translation, with red twins that omit phase or conjugation. The metadata
+  test checks the officialSOC q layout and mismatched-source refusal.
+* Docs now describe the current streaming pullback and remove the retired
+  restart_q_storage=full recommendation. Actual accepted producer enum remains
+  auto/ibz; a metadata-only bgw_reference could not fix the old missing image.
+
+Author's actual P4 receipt reports8 nonzero q, raw-HDF spatial closure9/9,
+original stored-q and q0 matrices bitwise unchanged, and independentTR pair
+errors2.31e-16..3.31e-16 (24.754s export). Those are cited author receipts, not
+an additional GPU run by this reviewer. Final artifact coverage is independently
+checked by validate_tutorial.py using the file's actual spatial operations.

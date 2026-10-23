@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+source ../lorrax_env.sh
+lorrax_run gw.gw_jax -i gw.in > sigma.out 2>&1
+mapfile -t restart_bundles < <(find tmp -maxdepth 1 -name 'isdf_tensors_*.h5' -print)
+[[ ${#restart_bundles[@]} == 1 ]] || { printf 'Expected one GW restart bundle.\n' >&2; exit 1; }
+cat > epsmat.in <<EOF
+[epsmat]
+mode = export
+source_restart = ${restart_bundles[0]}
+parent_input_file = gw.in
+output_dir = ../1-epsilon
+epsmat_ecut = 9.0
+q0_vector = 0.001 0 0
+EOF
+lorrax_run gw.epsmat_cli -i epsmat.in >> ../1-epsilon/epsilon.out 2>&1

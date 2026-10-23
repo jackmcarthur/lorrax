@@ -1,0 +1,13 @@
+[cohsex]
+sys_dim = 2
+nval = 26
+ncond = 14
+number_cond_bands_coarse = 22
+centroids_file = centroids.txt
+
+K_POINTS {crystal_b}
+4
+  0.000000000 0.000000000 0.0 1
+  0.000000000 0.500000000 0.0 40
+  0.333333333 0.333333333 0.0 15
+  0.000000000 0.000000000 0.0 50

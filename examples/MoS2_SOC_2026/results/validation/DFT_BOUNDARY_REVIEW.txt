@@ -1,0 +1,47 @@
+Independent DFT-boundary review — 2026-10-23
+
+Verdict: PASS, no release blocker found in the reviewed production diff.
+Source: ROOT/dft_boundary_source, commit
+6d22ca65e504902d5198c68c24139ac18c7e0fe1 (base abc4f50f7; physics commit fbf9e298d).
+Review is read-only code/equation/ownership analysis, not an independent timing
+or physical calculation. Author/root owns P4 actual H0 and combined hsuite gates.
+
+Physical model
+The reconstructed DFT Hamiltonian is T+Vion[DFT boundary]+VH[DFT boundary]. Its
+boundary must be the WFN-generating QE calculation's assume_isolated setting;
+it need not equal the chosen GW screening truncation. The existing full-basis
+DFT owners already use CrystalData.assume_isolated in this way. Periodic QE
+states with slab-truncated GW screening must therefore retain periodic ionic
+and scalar Hartree terms. This is an operator ownership correction, not an
+adjustment fitted to one QP gap.
+
+Reviewed ownership and behavior
+* The existing streaming authenticated QE receipt/binding carries raw
+  assume_isolated. Missing XML tag means periodic none,2D means slab; existing
+  CrystalData mode validation is reused and unsupported isolated modes refuse.
+* Multiple XML files that authenticate the same WFN but disagree on boundary
+  now fail the binding signature check. A current binding needs no DOM reload.
+  Legacy unpopulated boundary=None reparses only its authenticated path and
+  requires unchanged SHA; it does not silently assume periodic.
+* No authenticated XML preserves the legacy deck fallback. This retains old
+  behavior where the source boundary is unavailable; it is documented.
+* kin_ion_io resolves the same fact used by gw_jax provenance validation.
+  Existing sys_dim/truncation_2d artifact stamps now reflect the actual DFT
+  operator. A stale sys_dim2 artifact fails when the bound QE source is periodic3D.
+* One-shot scalar Hartree and the density-SC scalar Poisson update call the
+  same fact helper. GW screening sys_dim is unchanged. The additional transverse
+  direct field explicitly retains the GW sys_dim in both one-shot and SC routes;
+  the new internal optional argument defaults to the old shared convention for
+  standalone diagnostic callers.
+* No dense XML/density load or large array/cache is introduced. Resolving the
+  boundary per SC update reuses the existing binding. No WFN, gauge, occupation,
+  normalization, projector, Coulomb formula, or self-energy equation is changed.
+
+Author reports host-only unit PASS for actual streaming/default/2D, unsupported,
+no-XML fallback, custom XML name, SHA mutation, conflicting metadata and stale
+artifact refusal. Those receipts and P4 physical tests remain separate evidence;
+this report does not replace them.
+
+Follow-up6d22ca65e source review PASS: moves only the new import/assignment
+within the existing driver outline and uses the existing QE reporting enum.
+The boundary choice, fallback and refusal behavior are unchanged.

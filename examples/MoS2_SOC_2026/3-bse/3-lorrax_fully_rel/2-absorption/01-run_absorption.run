@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+source ../../../2-gw/3-lorrax_fully_rel/lorrax_env.sh
+lorrax_run bse.bse_jax -i gw.in --report-file absorption.out > absorption.log 2>&1

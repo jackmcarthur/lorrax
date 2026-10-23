@@ -1,0 +1,12 @@
+[cohsex]
+sys_dim = 2
+nval = 26
+ncond = 22
+number_bands = 200
+zeta_nband = 200
+compute_mode = hl_ppm
+ppm_omega_p = 200.0
+mc_average_vcoul_body = false
+sigma_omega_min_ev = -65.0
+use_band_extrapolation = false
+centroids_file = centroids.txt

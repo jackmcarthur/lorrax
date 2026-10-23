@@ -1,0 +1,87 @@
+Final independent SOC tutorial output validation — 2026-10-23
+
+PASS: all 31 structural and semantic checks on the frozen outputs of the literal
+00-run-lorrax.sh workflow. Numerical source: f075e4e796f996719a1c9a48ce48d6abb5291424.
+EQP ASCII writer: f9ef4a6a93c5971a586bbd4b5ccac965e6d2bf05.
+The parent owns the driver exit-code/timing receipt; this validator independently
+read the resulting files. Numerical agreement with BerkeleyGW is NOT established.
+FINAL_GATES.json separates format, coverage and descriptive physics comparisons.
+
+Verified outputs
+
+- EQP: 48 bands at four stored k points, totaling 192 states. On-shell coverage
+  is COMPLETE, with zero persisted uncovered states across all 432 unfolded
+  targets. Requested and actual evaluation energies differ by at most 1.78e-15 eV.
+  All numeric k/band blocks precede the provenance footer. The actual BGW4
+  consumer completed both QP reads and diagonalization using unstripped
+  full-nine-k output from the fixed writer. Canonical EQP0/EQP1 were regenerated
+  through that writer with every numeric byte unchanged; original files are
+  preserved under attempts/eqp_leading_comments. No physics rerun was required.
+- DFT boundary: QE specifies assume_isolated=none; kin_ion.h5 records periodic
+  3D for its ionic operator, independently of slab GW screening.
+- Velocity: all 200 bands on nine k points are available. The 48-band fitted
+  manifold has a 49.7919 meV global gap over the coarse grid, selecting the
+  existing unweighted g=1 route. The fine BSE window remains six valence and
+  eight conduction bands.
+- Bandstructure: 4,240 rows and eight BGW columns, covering 40 bands and 106
+  path points in the expected order. Raw DFT/QP reference headers reconstruct
+  absolute energies within 3.57e-10 eV. Cartesian coordinates agree with
+  kfrac @ bvec * blat within 4.97e-9 bohr^-1. Both raw seven-column files remain.
+- Epsilon: eps0mat has one q and a 303-square matrix. epsmat has eight nonzero
+  q points and 309/329-square matrices at 9 Ry. Its spatial header covers all
+  nine grid points without assuming time reversal in a BGW reader.
+- Kernel: four finite head/wing/body/exchange arrays, each with shape
+  [9,9,12,12,12,12,2], and the expected header/schema.
+- BSE: 3,072 sorted finite roots, spin/spinor counts 1/2, and the correct
+  normalization volume. All roots converged; the largest reported residual
+  is 1.3569e-9 meV versus a 0.01 meV stopping rule.
+- Absorption: both native files have 1,701 rows and four finite columns,
+  spanning 0–17 eV at 0.01 eV spacing. The interacting BGW axis matches;
+  its independent-particle file stops at 12 eV, so comparison uses common support.
+
+Scientific comparison
+
+                                  Native           BerkeleyGW
+Coarse QP1 minimum gap, eV         3.208395953        3.123689890
+Path QP1 indirect gap, eV          2.872913240        3.071206207
+Lowest BSE root, eV               2.511019500        1.591551600
+Largest interacting peak, eV      3.180000000        2.600000000
+
+Common raw DFT energies agree within 23.715 micro-eV. For 160 common QP1 rows,
+the absolute-energy RMS difference is 1.6233 eV, with a 7.5825 eV maximum. Bands
+24–30 have a mean difference of +0.7479 eV. The 3,072 energy-ordered BSE roots
+differ by RMS 0.1147 eV; the interacting spectral relative L2 difference is
+0.8411. Matching finite-q inverse-epsilon blocks differ by relative Frobenius
+0.002335/0.002493 after exact Miller-vector permutation; q0 differs by 0.1125.
+
+An additional same-coarse-grid control has lowest roots 1.6644602 eV (native)
+and 1.6728479 eV (BGW), a difference of -8.3877 meV. Its binding energies are
+1.54394 and 1.53559 eV. This disfavors a universal missing factor of two in the
+native spinor direct term. It does not establish full spectral parity: over
+all 432 sorted coarse roots, RMS/max differences are 78.54/467.79 meV.
+
+Separately, running the BGW consumer with the native exported kernel and the
+same BGW QP reference reproduces the original BGW 3,072 roots with RMS/max
+differences of 7.680/9.552 meV. This supports the exported kernel's normalization
+and interoperability under a shared consumer. It does not validate the native
+fine-grid operator or make the two fine-grid methods equivalent.
+
+The full fine-grid methods differ, and their results above remain a descriptive
+cross-code comparison. Correct formats, complete coverage and small residuals
+do not establish physical equality or assign the remaining difference to one
+cause. No residual is attributed to centroid rank without evidence.
+
+The earlier incomplete-coverage, missing-q, iteration-limit and unsupported-head
+attempts remain separate receipts. Final inputs use 48 QP bands, a 200-band sum,
+sigma_omega_min_ev=-65, mc_average_vcoul_body=false, mc_average_placement=off and
+head_minibz_average=false. Production 2D already averages the Gamma cell.
+
+Independent source reviews: DFT_BOUNDARY_REVIEW.txt and EPS_QCOVERAGE_REVIEW.txt.
+Portable read-only command: validate_tutorial.py --tutorial-root PATH_TO_6a-SOC.
+
+The prior 27-check receipt skipped comments and therefore missed the Fortran
+reader's rejection of a leading provenance record. It is preserved separately;
+the four additional checks enforce numeric-first EQP records and comment-only
+footers for both native and BGW files. eqp_footer_20261023 contains the targeted
+unit, nine-static gate, actual reader and byte-identity receipts. All numerical
+comparisons above are identical to the prior receipt.

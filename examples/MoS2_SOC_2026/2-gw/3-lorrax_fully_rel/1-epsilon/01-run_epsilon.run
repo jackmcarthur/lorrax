@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+source ../lorrax_env.sh
+lorrax_run centroid.kmeans_cli 1000 -i gw.in --seed 42 --fit-window 0:48,0:200 > centroids.out 2>&1
+mapfile -t centroid_tables < <(find . -maxdepth 1 -name 'centroids_frac_*.txt' -print)
+[[ ${#centroid_tables[@]} == 1 ]] || { printf 'Expected one centroid table; move old tables before changing its requested size.\n' >&2; exit 1; }
+ln -sfn "${centroid_tables[0]}" centroids.txt
+lorrax_run gw.kin_ion_io -i gw.in > kin_ion.out 2>&1
+lorrax_run psp.get_dipole_mtxels -i gw.in > dipole.out 2>&1
+printf 'Prepared the compressed orbital basis and mean-field operators.\nScreening and Sigma are evaluated together by 2-sigma/01-run_sigma.run.\n' > epsilon.out

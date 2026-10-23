@@ -1,0 +1,31 @@
+[cohsex]
+sys_dim = 2
+nval = 26
+ncond = 22
+number_bands = 200
+zeta_nband = 200
+compute_mode = hl_ppm
+ppm_omega_p = 200.0
+mc_average_vcoul_body = false
+sigma_omega_min_ev = -65.0
+use_band_extrapolation = false
+centroids_file = centroids.txt
+
+number_val_bands_fine = 6
+number_cond_bands_fine = 8
+number_cond_bands_coarse = 22
+kgrid_fine = 8 8 1
+kgrid_fine_shift = 0.47 0.37 0.0
+eqp_co_corrections = eqp_co.dat
+dipole_file = dipole.h5
+use_velocity
+polarization = 1 1 0
+
+number_eigenvalues = 3072
+davidson_m_max = 6144
+davidson_margin = 0
+write_eigenvectors = -1
+gaussian_broadening
+energy_resolution = 0.15
+omega_max_ev = 17.0
+delta_frequency = 0.01

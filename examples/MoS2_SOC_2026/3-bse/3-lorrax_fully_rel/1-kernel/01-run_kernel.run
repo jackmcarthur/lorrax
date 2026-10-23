@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+source ../../../2-gw/3-lorrax_fully_rel/lorrax_env.sh
+lorrax_run bse.bsemat_cli -i gw.in --wfn-co WFN_co.h5 \
+    -o bsemat.h5 > kernel.out 2>&1

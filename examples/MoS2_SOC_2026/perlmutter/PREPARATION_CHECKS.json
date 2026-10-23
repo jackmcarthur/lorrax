@@ -1,0 +1,38 @@
+{
+  "status": "PASS",
+  "download_url": "https://drive.usercontent.google.com/download?id=15nj-0VcAPZr2TPSaGwgiYEOCgal5wkTb&export=download&confirm=t",
+  "archive_sha256": "fb84d8e26ba26c4e02772c1feb16fe6a2200087c6f3ef01198921c54c0e6c8af",
+  "original_files_unchanged": 101,
+  "overlay_additions": [
+    "perlmutter",
+    "2-gw/3-lorrax_fully_rel",
+    "3-bse/3-lorrax_fully_rel",
+    "00-run-lorrax.sh",
+    "README-LORRAX.md"
+  ],
+  "prepared_stages": [
+    "2a-Wfn",
+    "2b-Wfnq",
+    "3a-Wfn_fi",
+    "3b-Wfnq_fi",
+    "4-Wfn_inteqp",
+    "2c-Wfn_full",
+    "2d-Wfn_guarded"
+  ],
+  "fixed_charge_links_checked": 7,
+  "repeat_preserves_all7_nscf_xml": true,
+  "guarded_inputs_byte_match_executed": true,
+  "lorrax_wfn_link_targets": [
+    "2-gw/3-lorrax_fully_rel/1-epsilon/WFN.h5",
+    "2-gw/3-lorrax_fully_rel/2-sigma/WFN.h5",
+    "2-gw/3-lorrax_fully_rel/3-bs/WFN.h5",
+    "3-bse/3-lorrax_fully_rel/1-kernel/WFN.h5",
+    "3-bse/3-lorrax_fully_rel/2-absorption/WFN.h5"
+  ],
+  "full_coarse_links_checked": 2,
+  "pseudo_and_xml_links_checked": true,
+  "existing_destination_refused": true,
+  "scientific_compute_executed": false,
+  "note": "Temporary filesystem fixtures only; no QE, BGW, or LORRAX calculations run",
+  "elapsed_seconds": 2.591
+}

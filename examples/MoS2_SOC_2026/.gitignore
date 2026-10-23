@@ -1,0 +1,5 @@
+# Checked-in launcher files override the repository's generic job-script rule.
+!*.run
+# Suggested generated working tree; the initializer also accepts another path.
+/workshop/
+__pycache__/
