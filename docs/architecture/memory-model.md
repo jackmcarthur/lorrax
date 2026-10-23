@@ -715,20 +715,25 @@ chain price. In particular, `Q < P` retains the input's one-parent floor,
 without a P-parent replica. The same transport serves the face inverse
 channel and the ζ-file-only pass.
 
-Construction/restart can temporarily unfold `V_q` to the full zone
-(`16·N_k·μ²/P`). Before returning the ISDF state,
-`gw.gw_init.prepare_isdf_and_wavefunctions` calls `_coulomb_on_wedge` and
-retains only `V_qirr(mu_X,nu_Y)` (`16·N_q,irr·μ²/P`) for screening and Σ.
-Price the full-zone transient at initialization, rather than carrying it
-as a Σ-stage resident.
+Construction/restart can temporarily unfold canonical `V_q` to the full
+zone (`16·N_k·μ_canonical²/P`). All-q finite and reciprocity checks, and the Gamma Hermitian check,
+run before q selection; restart checks keep their existing canonical domain.
+The fresh restart writer uses its authenticated canonical pre-unfold capture
+on a reduced grid, or the canonical full operator on an unreduced grid.
+Neither arm needs a packed full-zone operator.
 
-The reduced-q restart writer canonicalizes its captured
-`V_qirr(mu_X,nu_Y)` directly; it never converts the unused full-zone argument
-before selecting that capture. A natural full-q write and a restart read
-convert both centroid axes through the existing q-tiled operator owner,
-rather than two independent whole-stack axis conversions. Their input and
-output operators remain resident, while permutation scratch follows the
-operator's q-tile bound.
+Before returning the ISDF state, both fresh and restart routes call
+`gw.gw_init._coulomb_on_wedge`: select the canonical representative q rows,
+then convert both centroid axes through the existing q-tiled operator owner,
+and only then attach the packed wedge tables. The combined selection/packing
+executable is compiled, priced and admitted against current room before that
+same executable runs. Screening and Σ retain only `V_qirr(mu_X,nu_Y)`
+(`16·N_q,irr·μ_packed²/P`). The canonical full input still lives during this
+seam, but no packed full-q copy is created on a reduced grid. Price the
+full-zone input and the actual compiled selection/packing scratch at
+initialization, rather than carrying a full operator as a Σ-stage resident.
+Earlier full-zone charge-normal construction/FFT peaks are separate and
+are not removed by selecting before packing.
 
 ## What the closed forms cannot see
 

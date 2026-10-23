@@ -2446,7 +2446,7 @@ def _compute_photon_vq(
     from file_io.restart_bundle import read_photon_charge
     V_q_raw = read_photon_charge(bispinor_h5_path, mesh_xy)
     # Both views stay on the canonical file carrier, as on the scalar route:
-    # ``_finalize_vq_views`` is the one packing owner.
+    # Validation and restart I/O keep this order; the final wedge seam packs.
     G0_all = photon_g0_vectors[0]
     if not (uses_coupled_photon_head(cfg)
             or uses_direct_bispinor_tangential_head(cfg)):
@@ -2512,44 +2512,67 @@ def _compute_scalar_vq(
 
 
 def _coulomb_on_wedge(V_full, *, sym, centroid_indices, meta):
-    """``V_full`` (packed, full zone) as a ``QirrOperator`` on the run's q wedge."""
+    """Canonical full-zone Coulomb → packed representative rows for the run.
+
+    All-q validation and the canonical restart write precede this seam.  Select
+    the q representatives before either centroid axis is packed: keeping a
+    packed full-zone copy beside the canonical input serves no consumer.
+    """
     from ffi import _services
     _services.ensure_on_path()
     from symmetry_maps import QirrOperator
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
     from .v_q_g_flat import q_wedge
-    whole = QirrOperator.of(V_full)
     wedge = q_wedge(sym=sym, centroid_indices=centroid_indices, meta=meta,
                     context="bare V on the q wedge")
-    if wedge is None:
-        return whole
-    op = whole.restrict(QirrOperator(values=None, **wedge[0]))
-    timing.stage_wait(op.values)
-    return op
+    basis = getattr(meta, 'mu_basis', None)
+    rows = None if wedge is None else np.asarray(wedge[0]['full_rows'])
+    spec = V_full.sharding.spec
+
+    @jax.jit
+    def select_and_pack(values):
+        selected = (values if rows is None
+                    else QirrOperator.of(values).at_rows(rows))
+        return selected if basis is None else basis.pack_operator(selected, spec=spec)
+
+    # Price the selection and the existing coupled-axis pack together, while
+    # the canonical full-zone argument is still live, then run that executable.
+    compiled = select_and_pack.lower(V_full).compile()
+    need = -agreed_chunk(-compiled_new_bytes(compiled))
+    ranks = int(V_full.sharding.mesh.size)
+    source = "canonical Coulomb representative rows and centroid packing"
+    memory.admit(source,
+                 [(source, memory.priced(0, source, spread=need*ranks,
+                                         ranks=ranks))],
+                 agreed_chunk(int(memory.room())))
+    packed = compiled(V_full)
+    timing.stage_wait(packed)
+    return (QirrOperator.of(packed) if wedge is None
+            else QirrOperator(values=packed, **wedge[0]))
 
 
 def _finalize_vq_views(
         G0_all, V_q_raw, head_channel, meta, photon_g0_vectors, print_fn):
-    """Produce the packed Coulomb operator and validate its physical invariants."""
+    """Validate every canonical q row before restart I/O and wedge packing."""
     from common.collectives import gather_to_host as _gather_to_host
     G0_gathered = _gather_to_host(G0_all)
-    V_qmunu = (meta.mu_basis.pack_operator(V_q_raw)
-               if getattr(meta, 'mu_basis', None) is not None else V_q_raw)
     G0 = G0_gathered
     while G0.ndim > 1:
         G0 = G0[0]
     log.debug(f"\n  V_q computed:")
-    log.debug(f"    Shape: {V_qmunu.shape}")
+    log.debug(f"    Shape: {V_q_raw.shape}")
     _vq0_trace = float(ordered_sum(jnp.diagonal(V_q_raw[0])).real)
     log.debug(f"    V_q=0 trace: {_vq0_trace:.4f}")
     from common import sanity
-    sanity.check_finite("V_q", V_qmunu, print_fn=print_fn)
+    sanity.check_finite("V_q", V_q_raw, print_fn=print_fn)
     sanity.check_positive("V_q[q=0] trace", _vq0_trace, print_fn=print_fn)
     sanity.check_hermitian("V_q[q=0]", V_q_raw[0], print_fn=print_fn)
     sanity.check_q_conjugate_reciprocity(
         "V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
         print_fn=print_fn)
     sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
-    return V_qmunu, G0, head_channel, photon_g0_vectors
+    return V_q_raw, G0, head_channel, photon_g0_vectors
 
 
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
@@ -2826,7 +2849,7 @@ def _write_fresh_restart(
         # unpack the unused full-zone operator before it substitutes the capture.
         V_for_write = (_qirr.capture.X_ibz
                 if _qirr.store_wedge and _qirr.capture is not None
-                else _to_file_order(V_qmunu, (-2, -1)))
+                else V_qmunu)
         write_restart_state_to_h5(
                 tensors_filename,
                 n_rmu_logical=int(meta.n_rmu),
@@ -2949,7 +2972,7 @@ def _read_authenticated_restart(
     	tensors_filename, mesh_xy, band_slices=band_slices,
     	n_rmu_logical=int(meta.n_rmu))
     charge_zeta_identity_receipt = rs.charge_zeta_identity
-    V_qmunu = _to_run_order(rs.V_qmunu, (-2, -1))
+    V_qmunu = rs.V_qmunu
     log.info("  Loaded restart tensors from H5.")
     from file_io import describe_coulomb_policy_match
     log.debug(describe_coulomb_policy_match(tensors_filename, cfg, meta))
@@ -3324,7 +3347,8 @@ def prepare_isdf_and_wavefunctions(
 	        WavefunctionBasisReceipt, _basis_band_interval, _to_run_order, band_slices, basis_T,
 	        centroid_indices, cfg, charge_basis_receipt, mesh_xy, meta, photon_g0_vectors, print0,
 	        sym, tensors_filename, tmp_dir, transverse_basis_receipt, wfn)
-	# From here on the bare Coulomb is held on the run's q wedge, the one
+	# Both fresh and restart inputs remain canonical through validation/I/O.
+	# From here on the bare Coulomb is packed on the run's q wedge, the one
 	# screening solves W on: its representative rows, where the unfold is
 	# the identity, so the full zone is not kept past this line.
 	V_qmunu = _coulomb_on_wedge(V_qmunu, sym=sym, centroid_indices=centroid_indices,
