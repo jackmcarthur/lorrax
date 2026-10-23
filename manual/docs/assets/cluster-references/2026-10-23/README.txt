@@ -73,6 +73,23 @@ The production r5 shared-pole recipe uses the default pole budget 1.0*Nmu.
 CPU64/144 runs use the same physical points and bands but different dummy-slot
 padding; compare canonical outputs, not the padded array bytes.
 
+Cr:Al2O3 (80 atoms, SOC, 16 GPUs)
+--------------------------------
+Stage qe/ and run/ as for Si/Al2O3, with matching Al.upf/O.upf/Cr.upf
+aliases in run/. Copy the final gw.in and centroid table into run/.
+The original preprocess.in is also supplied; its CENTROIDS_PENDING marker
+belongs to preparation and should not replace the final GW deck.
+Use the same stage commands as the small GN-PPM cases, with the srun geometry
+changed to -N4 -n16 --ntasks-per-node=4 --gpus-per-node=4 and add
+--network=no_vni. The final GW deck covers the whole 1-399 QP prefix with
+sigma_omega_min_ev=-75 and sigma_omega_max_ev=2.75.
+To regenerate points, use 23700 --seed 0 --fit-window 0:399,0:2370 with the
+ordinary spaced CLI form shown in each manifest. The measured selector
+returned 23700 physical points; P16 storage adds 12 dummy slots.
+The attached eqp0.dat/eqp1.dat are the actual fixed-input outputs, not
+converged material predictions. See case_notes.txt for structural,
+symmetry, head/model and memory qualifications from the private archive.
+
 These are capacity/performance references, not converged material predictions.
 Do not infer a smaller successful rank count from one measured peak. A lower
 memory budget can choose different batches and must be measured independently.

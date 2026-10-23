@@ -59,12 +59,14 @@ Wall time is the GW driver's `total run`, including setup and compilation but ex
 | Si SOC, 2 atoms | 4×4×4 / 8 | 8 | 52 | 528 | 2 | GN-PPM | 4 GPUs, 1 node | 59.52 s | 9.71 GB |
 | Al₂O₃, 10 atoms | 4×4×4 / 13 | 24 | 154 | 1584 | 1 | GN-PPM | 4 GPUs, 1 node | 39.23 s | 19.03 GB |
 | Ferromagnetic bcc Fe | 8×8×8 / 59 | 18 (fractional) | 110 | 1099 | 2 | Shared-pole | 4 GPUs, 1 node | 353.07 s | 33.43 GB |
+| Cr:Al₂O₃, 80 atoms | 2×2×2 / 4 | 395 | 2370 | 23700 | 2 | GN-PPM | 16 GPUs, 4 nodes | 915.12 s | 52.89 GB |
 
 | Run | Setup | ISDF / Coulomb | Screening | Self-energy | QP update | Real compiles / cache hits | Summed compile time |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Si SOC | 13.27 s | 25.96 s | 9.21 s | 10.41 s | 0.58 s | 134 / 126 | 29.7 s |
 | Al₂O₃ | 14.31 s | 13.88 s | 4.48 s | 5.96 s | 0.57 s | 10 / 271 | 2.4 s |
 | Fe | 18.59 s | 63.29 s | 176.44 s | 87.07 s | 5.94 s | 497 / 29 | 139.73 s |
+| Cr:Al₂O₃ | 16.04 s | 326.67 s | 139.50 s | 426.11 s | 6.49 s | 310 / 11 | 59.7 s |
 
 The Si and Al₂O₃ peaks are the rounded production pool high-water, maximized over ranks; both occur in ζ fitting. They are not exact native-pointer ledgers or total physical GPU memory. Their maximum host `ru_maxrss` is 2.43 and 4.46 GB per rank, respectively. Packed centroid extents were not emitted in these saved reports. The runs have different cache histories, so their wall times are not a controlled performance comparison.
 
@@ -76,6 +78,10 @@ Fe's 33.43 GB is the post-startup pool-**used** high-water. The default allocato
 
 Fe retains the default `sigma_reads_past_w_support` warning. Its Σ energy grid covers the requested bands; the warning concerns the W model's sampled support range and remains relevant to a separate accuracy study.
 
+The 80-atom case is **Al₃₁CrO₄₈ with SOC**: 395 occupied spinor bands, 2370 physical sum bands (2372 padded slots), and 23700 physical centroids (23712 packed slots at P16). A 4-valence/4-conduction frontier still produces the full 1–399 Σ/QP prefix. The explicit −75…2.75 eV Σ range covers that prefix without out-of-grid static fallback; 831 quadrature nodes take 388.23 s. The default GN prescription treats 3.02% invalid modes with `static_limit`, a separate issue from energy-grid coverage.
+
+Its maximum pool-used peak is 52.89 GB/rank in ζ fitting, versus 41.39 GB in screening and 44.85 GB in Σ. One full-zone Green's function at the packed extent is 17.992 GB/rank, so this run peaks at **2.94G/P**. Host high-water is 15.97 GB/rank. The conservative Cplus quote exceeded the then-current planning room; the completed run stayed below the 66.35 GB budget. This demonstrates the stated 16-GPU workload; a smaller process count was not tested. Original structural/symmetry qualifications and the exact inputs are retained in the [case notes](../assets/cluster-references/2026-10-23/cr_al2o3_80/case_notes.txt).
+
 All ranks exited successfully and the canonical Σ and QP outputs were checked for the stated shapes and finite entries. Preserve the input hashes, exact decks, resolved geometry, selected routes, compilation counts and all-rank exit records when repeating a reference.
 
-The [reproduction notes](../assets/cluster-references/2026-10-23/README.txt) describe the input arrangement and launch sequence. Exact decks and manifests: [Si](../assets/cluster-references/2026-10-23/si_soc/gw.in) / [record](../assets/cluster-references/2026-10-23/si_soc/manifest.json), [Al₂O₃](../assets/cluster-references/2026-10-23/al2o3_10/gw.in) / [record](../assets/cluster-references/2026-10-23/al2o3_10/manifest.json), [Fe](../assets/cluster-references/2026-10-23/fe_8x8x8/gw.in) / [record](../assets/cluster-references/2026-10-23/fe_8x8x8/manifest.json). The text bundle includes DFT decks and physical centroid tables; large wavefunction and generated matrix files remain in the NERSC evidence archive named in each record.
+The [reproduction notes](../assets/cluster-references/2026-10-23/README.txt) describe the input arrangement and launch sequence. Exact decks and manifests: [Si](../assets/cluster-references/2026-10-23/si_soc/gw.in) / [record](../assets/cluster-references/2026-10-23/si_soc/manifest.json), [Al₂O₃](../assets/cluster-references/2026-10-23/al2o3_10/gw.in) / [record](../assets/cluster-references/2026-10-23/al2o3_10/manifest.json), [Fe](../assets/cluster-references/2026-10-23/fe_8x8x8/gw.in) / [record](../assets/cluster-references/2026-10-23/fe_8x8x8/manifest.json), [Cr:Al₂O₃](../assets/cluster-references/2026-10-23/cr_al2o3_80/gw.in) / [record](../assets/cluster-references/2026-10-23/cr_al2o3_80/manifest.json). The text bundle includes DFT decks and physical centroid tables; large wavefunction and generated matrix files remain in the NERSC evidence archive named in each record.

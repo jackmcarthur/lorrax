@@ -1,0 +1,237 @@
+{
+  "case": "Al31CrO48_SOC_80_atoms",
+  "status": "COMPLETE_16_RANKS_EXIT_ZERO_CANONICAL_OUTPUTS_PASS",
+  "source_commit": "2d2ca2f104a085876a573e8b1278a7874c479b98",
+  "source_tree": "55d3aa2404455a5754e97609b2d5deda8015af1f",
+  "input_metadata": {
+    "atoms": {
+      "Al": 31,
+      "Cr": 1,
+      "O": 48
+    },
+    "electrons": 395,
+    "occupied_spinor_bands": 395,
+    "nspinor": 2,
+    "stored_bands": 3568,
+    "stored_kpoints": 4,
+    "full_kpoints": 8,
+    "kgrid": [
+      2,
+      2,
+      2
+    ],
+    "ecutwfc_ry": 80,
+    "ecutrho_ry": 320,
+    "fft_grid": [
+      120,
+      120,
+      120
+    ],
+    "QE_symmetry_operations": 3,
+    "QE_inversion": false,
+    "DFT_gap_ev": 2.859032487,
+    "basis": "fully relativistic norm-conserving ONCV/PBE; no US/PAW; no Hubbard inputs"
+  },
+  "input_files": {
+    "WFN": {
+      "staged_path": "qe/WFN.h5",
+      "source": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/cr80/qe/WFN.h5",
+      "sha256": "540fbf172df395a565b1b44d475e4e77dc2cd6814763224c76d6d9bbdc4c8b47",
+      "size_bytes": 25961907760
+    },
+    "QE_NSCF_schema": {
+      "staged_path": "qe/data-file-schema.xml",
+      "source": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/cr80/qe/data-file-schema.xml",
+      "sha256": "a67395a4e7a273d8523400b80243badab48f2d7f46a9f76a7f43c3282ca0f9f9",
+      "size_bytes": 742797
+    },
+    "Al_PSP": {
+      "staged_path": "00_lorrax/Al.upf",
+      "source": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/cr80/qe/nscf/al31cro48.save/Al.upf",
+      "sha256": "0674454d87460e8184c858c6628332728daa8f5c130dda89521593a240bc3da0",
+      "zval": 3
+    },
+    "O_PSP": {
+      "staged_path": "00_lorrax/O.upf",
+      "source": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/cr80/qe/nscf/al31cro48.save/O.upf",
+      "sha256": "8c6886f443f3bfe7b8d18f2f6b28dd8749746d996499a542fff9666da34d7cf6",
+      "zval": 6
+    },
+    "Cr_PSP": {
+      "staged_path": "00_lorrax/Cr.upf",
+      "source": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/cr80/qe/nscf/al31cro48.save/Cr.upf",
+      "sha256": "f0a45007e5e601cf2d358f652628c56ac3628de42ed76ea15d32dc5744a3373b",
+      "zval": 14
+    }
+  },
+  "DFT_provenance": {
+    "raw_manifest": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/manifest.yaml",
+    "archive_receipt": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/evidence/cr_archive.json",
+    "spectrum_receipt": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/cr80/evidence/nscf_spectrum.json",
+    "symmetry_receipt": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/cr80/evidence/nscf_symmetry.json",
+    "NSCF_input": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/cr80/qe/nscf/nscf.in",
+    "raw_archive": "/global/cfs/cdirs/m4598/jackm/al2o3_cr_dft_20261001/cr80_qe",
+    "structural_scope": "partial relaxation5BFGS steps; final SCF1e-8Ry",
+    "magnetic_DFT_branch": "patched QE7.4.1 unsigned-general-GGA SOC; preserve native XML/magnetic operations",
+    "DFT_executable_sha256": "7755b3b2748a8158f41b13d7aca2fbb2ee5f5edfd2c5e656caecc693bf1ff7a6"
+  },
+  "sum_bands": 2370,
+  "physical_centroids": 23700,
+  "packed_centroid_extent_P16": 23712,
+  "sum_band_carrier_P16": 2372,
+  "resolved_request": {
+    "sum_bands": 2370,
+    "centroid_count": 23700,
+    "nval": 4,
+    "ncond": 4,
+    "centroid_fit_window": "0:399,0:2370"
+  },
+  "centroid_command": "python -m centroid.kmeans_cli 23700 --fit-window 0:399,0:2370 --seed 0 -i preprocess.in",
+  "launch": {
+    "ranks": 16,
+    "nodes": 4,
+    "gpus_per_node": 4,
+    "gpu_model": "NVIDIA A100-SXM4-80GB",
+    "cores_per_rank": 16,
+    "OMP_NUM_THREADS": 14,
+    "BLAS_threads": 1,
+    "threads_per_core": 1,
+    "cpu_binding": "threads",
+    "automatic_budget_gb": 66.35,
+    "mesh": [
+      4,
+      4
+    ]
+  },
+  "main_wall_seconds": 915.12,
+  "stage_wall_seconds": {
+    "setup": 16.04,
+    "ISDF_Coulomb": 326.67,
+    "screening": 139.5,
+    "self_energy": 426.11,
+    "QP": 6.49
+  },
+  "reported_device_peak": {
+    "GB_decimal_rounded": 52.89,
+    "stage": "zeta",
+    "scope": "Production pool-used high-water maximized over16ranks; not NVML reserved memory/physical process high-water."
+  },
+  "stage_pool_used_peak_gb": {
+    "ISDF": 52.89,
+    "screening": 41.39,
+    "self_energy": 44.85,
+    "QP": 3.46
+  },
+  "host_ru_maxrss_max_gb": 15.97,
+  "compile_cache": {
+    "real_compiles": 310,
+    "cache_hits": 11,
+    "summed_compile_seconds": 59.7,
+    "uncacheable": 0,
+    "state": "Existing persistent runtime caches; recorded real/hit counts, not a controlled cold/warm comparison."
+  },
+  "QP_prefix_1based": [
+    1,
+    399
+  ],
+  "frontier_1based": [
+    392,
+    399
+  ],
+  "sigma_frequency_range_ev": [
+    -75,
+    2.75
+  ],
+  "DFT_full_prefix_energy_span_ev": [
+    -73.86409743892641,
+    1.7078671809747143
+  ],
+  "sigma_tau_nodes": 831,
+  "sigma_sweep_wall_seconds": 388.23,
+  "canonical_validation": {
+    "status": "PASS",
+    "source": "2d2ca2f104a085876a573e8b1278a7874c479b98",
+    "ranks": 16,
+    "sigma_shape": [
+      2,
+      4,
+      399,
+      399
+    ],
+    "eqp": [
+      {
+        "file": "eqp0.dat",
+        "kpoints": 4,
+        "rows": 1596,
+        "bands_1based": [
+          1,
+          399
+        ],
+        "finite": true
+      },
+      {
+        "file": "eqp1.dat",
+        "kpoints": 4,
+        "rows": 1596,
+        "bands_1based": [
+          1,
+          399
+        ],
+        "finite": true
+      }
+    ],
+    "coverage": [
+      "coverage       COMPLETE: margins 71.64 eV below and 2.04 eV above the requested bands"
+    ],
+    "requested_bands_1based": [
+      1,
+      399
+    ],
+    "omega_range_ev": [
+      -75.0,
+      2.75
+    ],
+    "static_fallback_reported": false,
+    "scope": "Fresh GN-PPM G0W0 through all requested dynamic Sigma/QP states; no convergence or BGW-equality claim",
+    "coverage_sentence_scope": "The raw71.64eVlower/2.04eVupper report sentence covers the protected frontier. Full1-399prefix energy span and conservative deck margins are separate explicit fields."
+  },
+  "native_libraries": {
+    "CUDA": {
+      "resolved_library": "/pscratch/sd/j/jackm/cs_claude/bseperf/new/src/ffi/cpp/build/liblorrax_ffi.so",
+      "bytes": 2673544,
+      "sha256": "bf46de448d60525dfce7d64a00a2621d621e7526e381e001fa4093a29dd9cafa"
+    },
+    "CPU": {
+      "resolved_library": "/pscratch/sd/j/jackm/cs_claude/bse_memory_prerelease_20261022/source/src/ffi/cpp/build_host_cpu_profile/liblorrax_ffi_host.so",
+      "bytes": 1127544,
+      "sha256": "17932d83c572f8f6a119cbdc03f8f064e5ac9a279010c7bda1a1aa90fcf486ca"
+    }
+  },
+  "qualifications": {
+    "invalid_GN_modes": "3.02%, default static_limit treatment; distinct from out-of-grid static_omega0 fallback (none used)",
+    "Cplus_price": "63.81 GB quote exceeded61.20 GB current planning room; observed run peak52.89 GB below66.35 GB budget",
+    "band_window_warning": "Two exact-zero processor band pads, not omitted physical states",
+    "structural_scope": "Five BFGS steps followed by converged SCF; not a structural convergence reference",
+    "symmetry": "Three authenticated unitary QE operations retained; global TRS conservatively disabled because matching SCF charge identity unavailable",
+    "input_striping": "Immutable WFN has one read stripe"
+  },
+  "evidence_run": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/04_cr80_gnppm_reference_20261023",
+  "scope": "Reproducibility/performance reference; no band/k/basis/structural convergence or BGW equality claim",
+  "included_text_files": {
+    "preprocess.in": "9fb4f3cb30bb90dfd74b529e18563a99268ef404d4b5f09c031bb2801b6a3270",
+    "qe_scf.in": "beb5c3ee2aff9206a3559407638b5ad075eb53f9ccea04109f21db33dddc07da",
+    "gw.in": "502e36e502ba3d3aca2a17d1cbcc4e31dd984e70c3ef20a3ea12683afbbe8172",
+    "case_notes.txt": "4111e39d4d23ca8a6bd2f4d06b1349dc6410dd03e6bae816a0de9c376b18353c",
+    "eqp1.dat": "e37157ef1b28f2d438269e40b7574404cfdf12dd9aa12dd93952d507f5f9a08f",
+    "qe_pw2bgw.in": "fa2960a161e17c241578bd9d3a9ccf523e617ba6fec6560d46fd8b3f71f8a205",
+    "centroids_frac_23700.txt": "c78524207e1d87d6b395c4c8b0e35226e08041f5e62e1d627d251eeb45d60c92",
+    "qe_nscf.in": "d4ddfc015258b1326abea2bd6b072496daa978ab6d86564536902ffb77d73341",
+    "eqp0.dat": "ed8de48fb55fe86444a27362aa63f465da125643f5f6285397d0fb7dcb2e5d19"
+  },
+  "evidence_archive": "/global/cfs/cdirs/m4598/jackm/lorrax_evidence/gwjax_shared_pole_20261023/cr80_gnppm_reference",
+  "full_prefix_admission_margins_ev": {
+    "below": 1.1359025610735927,
+    "above": 1.0421328190252857,
+    "scope": "Conservative deck-range admission against full1-399DFTprefix; not the protected-frontier margin quoted by production coverage sentence."
+  }
+}
