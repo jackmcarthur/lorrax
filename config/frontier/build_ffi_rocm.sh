@@ -67,11 +67,18 @@ source "$ROOT/config/frontier/ffi_mpi.sh"
 # Acceptance uses the recorded wheel files through the runtime loader, not
 # the build module's alternate ROCm search path. No GPU is initialized here;
 # a compute-node GPU smoke remains necessary before runtime certification.
+for _control in LORRAX_FFI_VERIFY LORRAX_GATE_ONE_MPI LORRAX_GATE_ONE_HDF5; do
+    if [[ "${!_control:-on}" == off ]]; then
+        echo "[build_ffi_rocm] FAILED: $_control=off disables mandatory acceptance; provenance was not stamped." >&2
+        exit 1
+    fi
+done
 LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-phdf5,slate,kdft}" \
 LORRAX_FFI_EXPECT_MPI="${LORRAX_FFI_EXPECT_MPI:-$LORRAX_OLCF_MPI_SONAME}" \
 LORRAX_FFI_EXPECT_HDF5_SOVERSION="${LORRAX_FFI_EXPECT_HDF5_SOVERSION:-310}" \
 LORRAX_PHDF5_STAGE="$LORRAX_OLCF_HDF5_ROOT" \
 LORRAX_GATE_FFTW_PY="$VENV/bin/python" \
+LORRAX_FFI_VERIFY_STRICT=1 \
 LORRAX_ROOT="$ROOT" \
 GATE_TAG=build_ffi_rocm \
     bash "$ROOT/scripts/verify_ffi_build.sh" --leg rocm "$SO" || {
