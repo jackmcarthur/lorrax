@@ -53,6 +53,8 @@ from .bse_w_exact import (
 )
 from common.collectives import gather_to_host
 
+LADDER_RESPONSE_CONVENTION = "physical-ra-v1"
+
 jax.config.update("jax_enable_x64", True)
 
 
