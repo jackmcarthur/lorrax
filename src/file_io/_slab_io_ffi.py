@@ -1822,14 +1822,15 @@ def _normalize_window_tables(
     return off, val
 
 
-def _rank_block_offsets(
+def _rank_block_offset(
     *,
+    rank: int,
     per_rank_shape: Sequence[int],
     axis_count_per_dim: Sequence[int],
     axis_flat: Sequence[int],
     mesh_shape: Sequence[int],
 ) -> np.ndarray:
-    """``(world, ndim)`` — where each rank's block starts INSIDE a window.
+    """``(ndim,)`` — where one rank's block starts INSIDE a window.
 
     Transcribes the handler's own arithmetic (``read_ffi.cc``, "per-rank
     coord shift on sharded dims"): un-ravel the rank through ``mesh_shape``
@@ -1838,29 +1839,23 @@ def _rank_block_offsets(
     ``axis_flat`` records.  A replicated dim contributes 0, so every rank
     starts that dim at the window origin.
 
-    Built for EVERY rank rather than read off this process's shard index:
-    the count table is assembled whole and then sharded, so rank r's row
-    has to be computable on rank 0.  Pure arithmetic over replicated
-    quantities, so every rank builds the same table.
+    Posted read controls contain only this process's counts. Computing all
+    ranks' offsets would add O(world) Python work to every union read.
     """
     ndim = len(tuple(per_rank_shape))
     dims = tuple(int(m) for m in mesh_shape)
-    world = 1
-    for m in dims:
-        world *= m
-    out = np.zeros((world, ndim), dtype=np.int64)
-    for r in range(world):
-        coord = np.unravel_index(r, dims)
-        flat = 0
-        for d in range(ndim):
-            na = int(axis_count_per_dim[d])
-            block, stride = 0, 1
-            for k in range(na - 1, -1, -1):
-                ax = int(axis_flat[flat + k])
-                block += int(coord[ax]) * stride
-                stride *= dims[ax]
-            flat += na
-            out[r, d] = block * int(per_rank_shape[d])
+    out = np.zeros((ndim,), dtype=np.int64)
+    coord = np.unravel_index(int(rank), dims)
+    flat = 0
+    for d in range(ndim):
+        na = int(axis_count_per_dim[d])
+        block, stride = 0, 1
+        for k in range(na - 1, -1, -1):
+            ax = int(axis_flat[flat + k])
+            block += int(coord[ax]) * stride
+            stride *= dims[ax]
+        flat += na
+        out[d] = block * int(per_rank_shape[d])
     return out
 
 
@@ -1881,10 +1876,9 @@ def _derive_window_counts(
     Equivalently ``sum_r count[r, w, d] == valid_shapes[w][d]`` on a dim
     the world shards, which is the invariant the regression cells assert.
 
-    Row layout is the handler's: rank-major, window-minor, flattened so the
-    leading axis can be sharded across the mesh — each rank's shard_map-local
-    view is then exactly its own ``(n_windows, ndim)`` slice, and no rank
-    ever sends a row.
+    Row layout is rank-major, window-minor. The posted-control caller passes
+    only this rank's offset, producing its ``(n_windows, ndim)`` control
+    without constructing or sending another rank's rows.
     """
     world = int(rank_offsets.shape[0])
     n_win = int(valid_shapes.shape[0])
@@ -3506,12 +3500,14 @@ class _FfiBackend(_DatasetGeometry):
             axis_count_per_dim=axis_count_per_dim, axis_flat=axis_flat,
             mesh_shape=mesh_shape, ndim=len(slab_shape))
         per_rank_shape = tuple(s // d for s, d in zip(slab_shape, divs))
-        counts = _derive_window_counts(
+        me = _mesh_position(mesh)
+        counts_local = _derive_window_counts(
             per_rank_shape=per_rank_shape,
-            rank_offsets=_rank_block_offsets(
+            rank_offsets=_rank_block_offset(
+                rank=me,
                 per_rank_shape=per_rank_shape,
                 axis_count_per_dim=axis_count_per_dim,
-                axis_flat=axis_flat, mesh_shape=mesh_shape),
+                axis_flat=axis_flat, mesh_shape=mesh_shape)[None, :],
             valid_shapes=valid_t)
 
         # Handler ABI 7: neither table is placed.  The offsets and THIS rank's
@@ -3520,8 +3516,6 @@ class _FfiBackend(_DatasetGeometry):
         # allocated here and donated, as read_slab's.
         from ffi.io import _insert_at
         n_win = int(offsets_t.shape[0])
-        me = _mesh_position(mesh)
-        counts_local = np.asarray(counts)[me * n_win:(me + 1) * n_win]
         out_shape = tuple(_insert_at(list(slab_shape), int(window_axis), n_win))
         out_spec = P(*_insert_at(list(partition_spec), int(window_axis), None))
         dst, = _get_destinations(mesh, (out_spec,), (out_shape,), (jnp.dtype(dtype),))()

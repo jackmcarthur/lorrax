@@ -176,6 +176,11 @@ a backend, striping, ROMIO hints, or a mesh-divisible extent.
 | `sync_writes()` | effectively | Waits for this rank's queued collective writes. Call it on every rank or on none. |
 | `close()` / `__exit__` | yes | See [Close](#commit). |
 
+Union-read posted controls contain only the current process's window
+counts. Their Python setup is O(number of windows) per process, independent
+of world size; JAX's shard ownership and the native valid-prefix clamp are
+checked by `tests/test_slab_io_local_counts.py`.
+
 The collective calls must be made by every rank, in the same order, with the
 same dataset name and replicated arguments. A rank that skips one leaves its
 peers blocked in the collective with no traceback. The path is one of those
