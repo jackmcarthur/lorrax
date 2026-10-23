@@ -129,9 +129,11 @@ pencil's capacity, else is split in halves down to single samples, and one whose
 pencil is wider than both halves' is split without a try. The rule never
 depends on the memory budget: the evaluation runs in groups of at most the group
 size, and each group streams its rule's whole node set for its own members. The
-group size is the largest whose donated carry `[2·members, q, μ_X, ν_Y]` and
+group-size bound is the largest whose donated carry `[2·members, q, μ_X, ν_Y]` and
 compiled stream temporaries fit the map ledger and the device room (the budget
-less the bytes actually live): every sample in one group on symmetric decks.
+less the bytes actually live). After the fitted rule partitions the samples,
+every tier uses one uniform carry sized to the largest actual group. Smaller
+groups leave zero rows in that carry; the planned bound creates no unused rows.
 When the samples do not fit one group, the stream runs once with every
 sample and its carry streams to SlabIO's per-rank tier
 ([memory model](memory-model.md#streamed-chi-bank)); groups remain only

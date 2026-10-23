@@ -2476,9 +2476,9 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
 def _group_stream_arguments(rules, group):
     """Shared times and [forward/reverse, value/ds per slot, node] weights.
 
-    Every group has ``rules["slots"]`` member slots, the planned group size: a
-    short last group's empty slots carry zero weights, so every group runs the
-    one executable the planner checked (a ragged last group compiled a third
+    Every group has ``rules["slots"]`` member slots, a common capacity (the
+    bank narrows it to the largest actual group). Empty slots carry zero
+    weights, so every group runs one executable (a ragged last group compiled a third
     stream program at Fe/Ni 20^3).  An empty slot adds exact zeros to its own
     carry rows, which nothing reads; the members' rows are unchanged.
     """
@@ -3348,9 +3348,10 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         receipt["bank_residence"] = dict(residence_receipt, residence=residence)
         rules = response_quadrature(meta, sample_plan, receipt, support,
                                     group_size=group_size, print_fn=print_fn)
+        # Every tier needs only the largest actual group, not the planned cap.
+        # Empty carry rows add zeros and are never read by a sample's solve.
+        rules["slots"] = max(len(g["members"]) for g in rules["groups"])
         if stream_bank is not None:
-            # Slots: the largest rule group's members (empty slots add zeros nobody reads).
-            rules["slots"] = max(len(g["members"]) for g in rules["groups"])
             pass_carry = 2*rules["slots"]*len(response_rows)*16*max(r*c for r, c, _ in segments[0])
             # The first segment's program places the kconv tables the rest share.
             response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=response_rows,
