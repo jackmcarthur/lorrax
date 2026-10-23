@@ -480,9 +480,20 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | htransform R images | f(H)_R and the back-map L_R, `16·N_k·N_B·(N_B + N_T)/P` (`N_B` = spin × nodes, `N_T` = spin × centroids, 0 when they are the nodes), and the int16 WS code tiles `2·N_k·N_B·(N_B + N_T)/P` | `fh_interp.build_fH_R` compiled (one program); `node_pair_table` exact extents | refuses |
 | restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` (SlabIO writes per-rank hyperslabs) | — | — |
 
-Replicated per-process metadata (the TRS-augmented centroid permutation and
-lattice-wrap tables, `O(n_sym·μ)`; the q-folding tables, `O(N_k)`) is
-negligible at every size.
+Replicated per-process metadata includes the TRS-augmented centroid permutation
+and lattice-wrap tables, `O(n_sym·μ)`, and q-folding tables, `O(N_k)`; it does
+not shrink with the mesh.
+
+Centroid sampling (`common.wfn_transforms.gflat_to_rmu`) constructs dense
+sphere-to-box inverse rows and separable Bloch-phase tables inside the local
+FFT scan. For `c` scan rows and `b` local bands, a chunk touches at most
+`w = min(N_k, ceil((c + b - gcd(c,b))/b))` distinct k rows. The per-k tables
+therefore occupy at most `4·w·N_r` inverse bytes and, with Bloch phases,
+`3·16·w·μ` phase bytes, rather than retaining these tables for every k row.
+The gathered per-FFT-row intermediates remain part of the compiled scan
+tile. G-flat coefficients stay band-sharded, while the canonical sparse
+sphere-index table remains replicated metadata. One local FFT still needs
+its complete spatial grid; increasing P does not reduce that one-row floor.
 
 The χ₀ node cannot be chunked over q, because the k-convolution needs the
 whole k axis on every rank. A completed W of an earlier screening role is
