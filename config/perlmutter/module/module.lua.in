@@ -34,6 +34,15 @@ prepend_list("PATH", venv .. "/bin:" .. cuda .. "/bin")
 prepend_list("PYTHONPATH", pythonpath)
 prepend_list("LD_LIBRARY_PATH", ld_path)
 
+-- Slurm needs this before srun creates a step. Existing numeric steps keep
+-- their actual launch choice; pushenv restores the caller's value on unload.
+-- Leave an explicit empty value outside Lmod's push/pop stack.
+local numeric_step = (os.getenv("SLURM_STEP_ID") or ""):match("^%d+$")
+                  or (os.getenv("SLURM_STEPID") or ""):match("^%d+$")
+if not numeric_step and os.getenv("SLURM_NETWORK") ~= "" then
+    pushenv("SLURM_NETWORK", os.getenv("SLURM_NETWORK") or "no_vni")
+end
+
 setenv("LORRAX_ROOT", root)
 setenv("LORRAX_FFI_SO", ffi_cuda)
 setenv("LORRAX_FFI_HOST_SO", ffi_host)
