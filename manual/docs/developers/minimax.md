@@ -343,6 +343,6 @@ Constructors raise `ValueError` for invalid domains (non-positive heights, a box
 | `src/gw/cd/chi0_rules.py` | contour-deformation χ⁰ windows through `response_imaginary_rule` |
 | `src/gw/mpa/model.py` | MPA line rules through `damped_line_rule` |
 | `src/gw/w_isdf.py` | finite-temperature χ⁰ through `matsubara_response_rule` |
-| `src/gw/minimax_config.py` | `MinimaxConfig(target_error=1e-6, max_nodes=64, energy_reference='midgap', ...)`, the settings shared by the χ⁰ consumers |
+| `src/gw/minimax_config.py` | `MinimaxConfig(target_error=1e-6, max_nodes=64, energy_reference='midgap')`, the settings of the χ⁰ rules; the Σ windows do not read it |
 
 The time-domain products these rules feed are described on [Kernels](kernels.md).
