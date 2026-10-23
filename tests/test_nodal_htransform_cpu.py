@@ -466,3 +466,24 @@ def test_top_block_small_gap_refines_beyond_sixteen_steps():
     assert int(steps) > 16 and float(residual) <= TOP_BLOCK_TOL
     print(f"TOP_BLOCK_SMALL_GAP PASS: short={float(short[3]):.3e}, "
           f"refined={float(residual):.3e}, steps={int(steps)}")
+
+
+def test_path_energy_reference_roundtrip(tmp_path):
+    """The file's relative energies plus its receipt recover absolute energies."""
+    from bandstructure.htransform import write_bands_to_file
+    from common.units import RYD_TO_EV
+
+    absolute = np.array([[.25, .5], [.375, .625]])
+    reference = 1.125
+    path = tmp_path / "bands.dat"
+    write_bands_to_file(str(path), absolute - reference,
+                        np.array([[0., 0., 0.], [.5, 0., 0.]]),
+                        np.array([0., .5]), energy_reference_ry=reference)
+    header = next(line for line in path.read_text().splitlines()
+                  if line.startswith("# energy_reference_eV="))
+    offset = float(header.split("=", 1)[1])
+    data = np.loadtxt(path)
+    assert data.shape == (4, 7)
+    np.testing.assert_allclose(offset, reference * RYD_TO_EV, rtol=0, atol=1e-14)
+    np.testing.assert_allclose(data[:, 6].reshape(2, 2) + offset,
+                               absolute * RYD_TO_EV, rtol=0, atol=6e-9)

@@ -407,7 +407,8 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
 
 
 def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path,
-                        *, band_start: int = 0, nb_fit: int | None = None):
+                        *, band_start: int = 0, nb_fit: int | None = None,
+                        energy_reference_ry: float | None = None):
     if energies_on_path is None or kpath_frac is None or x_path is None:
         return
     # Same family as ``bse_io.write_eigenvectors_stream``: a WRITER must not
@@ -417,6 +418,8 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path,
     kpoints = gather_to_host(kpath_frac)
     with open(output_path, 'w', encoding='utf8') as fh:
         fh.write('# idx_k idx_b kx ky kz s energy_eV\n')
+        if energy_reference_ry is not None:
+            fh.write(f'# energy_reference_eV={float(energy_reference_ry) * RYD_TO_EV:.17g}\n')
         if nb_fit is not None:
             fh.write(
                 f"# absolute_band_window=[{int(band_start)},"
@@ -801,6 +804,7 @@ def main(argv=None):
                 kpath_data[1],
                 band_start=result["band_start"],
                 nb_fit=result["nb_fit"],
+                energy_reference_ry=result["energy_reference_ry"],
             )
         _write_progress.step()
         _write_progress.finish()

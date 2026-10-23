@@ -14,6 +14,14 @@ Two drivers share one interpolation engine:
 | `python -m bandstructure.htransform` | band energies $\varepsilon_n(q)$ on the deck's k path; optional band character and Brillouin-zone moments | `bandstructure.dat`, `htransform.out`, `galerkin_dft.h5`; optional `bands_<color>.png`, `band_operators_path.npz`, `moments.txt` |
 | `python -m bse.exciton_bands` | the lowest exciton energies $E_S(Q)$ of the finite-momentum Bethe–Salpeter equation along the deck's Q path | `<prefix>.dat`, `<prefix>.png`, `<prefix>.out` |
 
+The native `bandstructure.dat` has seven numeric columns:
+`idx_k idx_b kx ky kz s energy_eV` (zero-based indices, fractional k,
+path distance, energies relative to the reported zero). Its comment
+`energy_reference_eV` gives the exact offset subtracted from the energies;
+adding it restores their absolute reference. A DFT and a QP run generally have
+different offsets. This native table is distinct from BerkeleyGW's eight-column
+DFT/QP band table.
+
 The same engine also supplies the fine-grid wavefunctions of BSE
 densification (`kgrid_fine`, [BSE](../architecture/bse.md)).
 
