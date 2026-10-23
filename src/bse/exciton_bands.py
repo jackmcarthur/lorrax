@@ -2560,17 +2560,15 @@ def main(argv=None):
                     fh.write(f"{iQ:4d} {x_path[iQ]:.6f} "
                              f"{Qpath[iQ][0]: .6f} {Qpath[iQ][1]: .6f} "
                              f"{Qpath[iQ][2]: .6f} refit  {row}\n")
-            continuum_dat = args.out_prefix + "_continuum.dat"
-            with open(continuum_dat, "w", encoding="utf8") as fh:
-                fh.write("# Independent-particle QP continuum before the W-head kernel shift\n")
-                fh.write(provenance_header())
-                fh.write("# iQ s_path Qx Qy Qz Econt_eV\n")
-                for iQ in range(nQ):
-                    sx = x_path[iQ] if iQ < nQ_path else x_path[nQ_path - 1]
-                    fh.write(f"{iQ:4d} {sx:.9f} "
-                             f"{Qpath[iQ][0]: .9f} {Qpath[iQ][1]: .9f} "
-                             f"{Qpath[iQ][2]: .9f} {_continuum_ev[iQ]:.9f}\n")
-            _LOGGER.info(f"Wrote {dat} and {continuum_dat}")
+            np.savetxt(
+                args.out_prefix + "_continuum.dat",
+                np.column_stack((np.arange(nQ), np.concatenate((x_path,
+                    np.full(nQ - nQ_path, x_path[-1]))), Qpath, _continuum_ev)),
+                fmt=("%4d", "%.9f", "%.9f", "%.9f", "%.9f", "%.9f"),
+                header=("Independent-particle QP continuum before the W-head kernel shift\n"
+                        + provenance_header().strip("# \n")
+                        + "\niQ s_path Qx Qy Qz Econt_eV"))
+            _LOGGER.info(f"Wrote {dat} and {args.out_prefix}_continuum.dat")
 
             if refit_idx:
                 _LOGGER.info("\ninterp vs refit (ground truth) at spot-check Q:")
@@ -2700,16 +2698,12 @@ def main(argv=None):
         # where the SlabIO barrier is already a no-op.
         wfn.close()
 
-        wfn_name = str(params.get("wfn_file", "WFN.h5"))
-        if not os.path.isabs(wfn_name):
-            wfn_name = os.path.join(os.path.dirname(os.path.abspath(args.input)),
-                                    wfn_name)
         file_rows = [
             ("exciton bands", "written", os.path.abspath(args.out_prefix + ".dat")),
             ("QP continuum", "written", os.path.abspath(args.out_prefix + "_continuum.dat")),
             ("exciton plot", "written", os.path.abspath(args.out_prefix + ".png")),
             ("GW/BSE restart", "read", restart_file),
-            ("wavefunctions", "read", wfn_name),
+            ("wavefunctions", "read", _wfn_name),
             ("centroid coordinates", "read", centroids_path),
         ]
         if args.eqp:
