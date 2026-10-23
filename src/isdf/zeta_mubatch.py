@@ -900,6 +900,10 @@ class ZetaG:
         from common.collectives import barrier, rank0_transaction
         pending = self.pending_file
         with SlabIO(self.path, mode='a', mesh=self.mesh) as io:
+            # Register this fresh handle's logical disk geometry; carrier
+            # padding is clipped by SlabIO rather than enlarging the file.
+            io.create_dataset('zeta_q_G', shape=(self.store.Q, self.n_rmu, self.ngkmax),
+                              dtype=np.complex128)
             V = self.contract_v(v_table, keep=keep, zeta_io=io, print_fn=print_fn)
         barrier("zeta_v_writes_complete")
         def complete():

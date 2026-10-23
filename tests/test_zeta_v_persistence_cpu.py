@@ -36,15 +36,25 @@ def _fixture(monkeypatch, tmp_path, *, complete=True, fail_write=False):
     class Writer:
         def __init__(self, path, *, mode, mesh):
             assert mode == "a"
+            self.shapes = {}
         def __enter__(self):
             events.append("open")
             return self
+        def create_dataset(self, name, *, shape, dtype):
+            assert name == "zeta_q_G" and tuple(shape) == stored.shape
+            assert np.dtype(dtype) == stored.dtype
+            self.shapes[name] = tuple(shape)
+            events.append("registered")
         def write_slab(self, name, value, *, offset):
             assert name == "zeta_q_G"
+            # A reopened native SlabIO handle has no cached disk geometry:
+            # without registration it would infer the padded carrier extent.
+            assert name in self.shapes, "logical dataset geometry must be registered"
             if fail_write:
                 raise OSError("synthetic failed tile write")
             start = offset[2]
-            count = min(value.shape[2], stored.shape[2]-start)
+            count = min(value.shape[2], self.shapes[name][2]-start)
+            assert count > 0
             stored[:, :, start:start+count] = np.asarray(value)[:, :, :count]
             events.append("write")
         def __exit__(self, *_args):
@@ -94,6 +104,7 @@ def test_cold_v_and_saved_zeta_reuse_match_literal_gram(monkeypatch, tmp_path):
     reuse = np.einsum("qmg,qg,qng->qmn", saved.conj(), v, saved)
     np.testing.assert_allclose(cold, reuse, atol=2e-14, rtol=2e-12)
     assert reads == [0, 1] and events.count("write") == 2
+    assert events.index("registered") < events.index("write")
     assert events.index("closed") < events.index("provenance") < events.index("done")
     assert zeta.pending_file is None
 
