@@ -461,24 +461,90 @@ def _install_rank_invariant_cpu_key() -> None:
 
 
 def _cpu_target_machine(topology: bytes) -> bytes:
-    """A serialized XLA:CPU topology without its leading device records (field 1).
+    """CPU target bytes without process-local device records.
 
-    Bytes that do not parse as such records come back whole: the key is then
-    JAX's own, process-local again, and no compile fails over it.
+    XLA 0.12 wraps CpuTopologyProto in PjRtTopologyDescriptionProto field 9
+    (Any, value field 2). Authenticate its CPU name and type URL before
+    removing CpuTopologyProto field 1; preserve every other field verbatim.
+    Source: XLA d8679698, xla/pjrt/proto/topology_description.proto and
+    xla/pjrt/plugin/xla_cpu/cpu_topology{,_description}.{proto,cc}.
+    Legacy raw CPU protos remain supported. Unknown/malformed bytes retain
+    JAX's original key rather than guessing a shared executable identity.
     """
-    i = 0
+    def varint(data, i):
+        value = 0
+        for shift in range(0, 70, 7):
+            b, i = data[i], i + 1
+            if shift == 63 and b > 1:
+                raise ValueError('invalid protobuf varint')
+            value |= (b & 0x7f) << shift
+            if not b & 0x80:
+                return value, i
+        raise ValueError('invalid protobuf varint')
+
+    def fields(data):
+        out, i = [], 0
+        while i < len(data):
+            start = i
+            key, i = varint(data, i)
+            tag, wire, key_end = key >> 3, key & 7, i
+            if not tag:
+                raise ValueError('invalid protobuf field')
+            payload = None
+            if wire == 2:
+                size, i = varint(data, i)
+                end, payload = i + size, data[i:i + size]
+            elif wire == 0:
+                _, end = varint(data, i)
+            elif wire in (1, 5):
+                end = i + (8 if wire == 1 else 4)
+            else:
+                raise ValueError('unsupported protobuf wire type')
+            if end > len(data):
+                raise ValueError('truncated protobuf field')
+            out.append((tag, wire, start, key_end, end, payload))
+            i = end
+        return out
+
+    def one(rows, tag):
+        found = [r for r in rows if r[0] == tag]
+        if len(found) != 1 or found[0][1] != 2:
+            raise ValueError('missing/duplicate protobuf message')
+        return found[0]
+
+    def replace(data, row, payload):
+        size, encoded = len(payload), bytearray()
+        while size > 0x7f:
+            encoded.append((size & 0x7f) | 0x80)
+            size >>= 7
+        encoded.append(size)
+        return data[:row[3]] + bytes(encoded) + payload + data[row[4]:]
+
+    def target(data):
+        rows = fields(data)
+        fields(one(rows, 5)[5])       # CPU TargetMachineOptionsProto
+        if any(r[1] != 2 for r in rows if r[0] == 1):
+            raise ValueError('invalid CPU device record')
+        for row in rows:
+            if row[0] == 1:
+                fields(row[5])
+        return b''.join(data[r[2]:r[4]] for r in rows if r[0] != 1)
+
     try:
-        while i < len(topology) and topology[i] == 0x0A:
-            size, shift, i = 0, 0, i + 1
-            while True:
-                size |= (topology[i] & 0x7F) << shift
-                shift, i = shift + 7, i + 1
-                if topology[i - 1] < 0x80:
-                    break
-            i += size
-    except IndexError:
+        if topology[:1] == b'\x0a':     # legacy raw CpuTopologyProto
+            return target(topology)
+        outer = fields(topology)
+        if one(outer, 2)[5] != b'cpu':
+            return topology
+        packed = one(outer, 9)
+        inner = fields(packed[5])
+        if one(inner, 1)[5] != b'type.googleapis.com/xla.CpuTopologyProto':
+            return topology
+        value = one(inner, 2)
+        return replace(topology, packed,
+                       replace(packed[5], value, target(value[5])))
+    except (IndexError, ValueError):
         return topology
-    return topology[i:] if i <= len(topology) else topology
 
 
 _COMPILE_ENTRY_POINT = "backend_compile_and_load"
