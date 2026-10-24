@@ -2594,7 +2594,7 @@ def finalize_process(rc: int = 0):
             # owns the coordination service and can remove it as soon as its
             # own client is closed.  Synchronize immediately beforehand so a
             # fast rank cannot strand a peer in report/effect completion and
-            # provoke WatchJobStateAsync connection-refused noise during an
+            # provoke WatchTasksAsync connection-refused noise during an
             # otherwise clean production shutdown.  This is the shared
             # collective seam, not a driver-specific sleep or stderr filter.
             from common.collectives import barrier as _barrier
@@ -2733,17 +2733,27 @@ def run_main_and_finalize(main, argv=None) -> None:
 # from the log without re-running anything.
 
 
-def _physical_cores_in_affinity() -> int | None:
-    """Physical cores in this process's affinity mask (hyperthreads folded)."""
-    try:
-        affinity = len(os.sched_getaffinity(0))
-        with open("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list") as fh:
-            siblings = fh.read().strip()
-        per_core = 0
-        for part in siblings.split(","):
+def _cpu_list(text: str) -> set[int]:
+    """``0-3,8`` -> ``{0, 1, 2, 3, 8}`` (the kernel's cpulist format)."""
+    out: set[int] = set()
+    for part in text.strip().split(","):
+        if part:
             lo, _, hi = part.partition("-")
-            per_core += (int(hi) - int(lo) + 1) if hi else 1
-        return max(1, affinity // max(per_core, 1))
+            out.update(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+def _physical_cores_in_affinity() -> int | None:
+    """Physical cores in this process's affinity mask: one per sibling set
+    (``/sys/devices/system/cpu/cpuN/topology/thread_siblings_list``) that
+    meets the mask.  None when the mask or the topology cannot be read."""
+    try:
+        mask = os.sched_getaffinity(0)
+        cores = set()
+        for cpu in mask:
+            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as fh:
+                cores.add(min(_cpu_list(fh.read()) & mask or {cpu}))
+        return max(1, len(cores))
     except Exception:                                         # noqa: BLE001
         return None
 
@@ -2819,6 +2829,8 @@ def _thread_env() -> dict:
         affinity = None
     return {
         "affinity": affinity,
+        "physical_cores": _physical_cores_in_affinity(),
+        "rank_threads": os.environ.get("LORRAX_RANK_THREADS"),
         "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS"),
         "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS"),
         "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS"),
@@ -3529,7 +3541,8 @@ def format_startup_report(f: dict) -> list:
 
     # -- threads -----------------------------------------------------------
     t = f.get("threads", {})
-    add(f"  This process is pinned to {t.get('affinity')} schedulable CPUs, "
+    add(f"  This process is pinned to {t.get('affinity')} schedulable CPUs "
+        f"({t.get('physical_cores')} physical cores), "
         f"with OMP_NUM_THREADS={t.get('OMP_NUM_THREADS')!r}, "
         f"MKL_NUM_THREADS={t.get('MKL_NUM_THREADS')!r} and "
         f"OPENBLAS_NUM_THREADS={t.get('OPENBLAS_NUM_THREADS')!r}.")

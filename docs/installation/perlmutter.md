@@ -19,8 +19,8 @@ writes goes to one of these places:
 | the Python venv | `<clone>/.venv` | (the clone location) |
 | the cuSOLVERMp/cuBLASMp stage | `<clone>/.build` | `LORRAX_BUILD_PREFIX` |
 | the two FFI libraries | `<clone>/src/ffi/cpp/build{,_host}/` | nothing; the loader looks there |
-| JAX compile cache, mathdx kernel cache | `$SCRATCH/.cache/lorrax/` | [`ISDF_JAX_CACHE_DIR`](../reference/env_vars.md) (compile cache only) |
-| the CUDA driver's JIT cache | `$SCRATCH/.nv/ComputeCache` once `gpu_env.sh` is sourced (CUDA's default is `~/.nv`) | `CUDA_CACHE_PATH` |
+| JAX compile cache, mathdx kernel cache | `$SCRATCH/.cache/lorrax/` (`~/.cache/lorrax/` without a writable `SCRATCH`) | [`ISDF_JAX_CACHE_DIR`](../reference/env_vars.md) (compile cache only) |
+| the CUDA driver's JIT cache | `$SCRATCH/.cache/lorrax/cuda_jit` once `gpu_env.sh` is sourced (CUDA's default is `~/.nv`) | `CUDA_CACHE_PATH` |
 | uv's download cache and Python | `~/.cache/uv`, `~/.local/share/uv` | `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR` (uv's own variables) |
 
 The home quota is small, so the commands below point uv and the CUDA JIT

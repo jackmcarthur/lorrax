@@ -12,7 +12,7 @@
 # abort.  Neither FFI leg links GTL: the host leg is CUDA-free and the CUDA
 # leg's cuSOLVERMp/cuBLASMp communicate through NCCL.
 #
-# LD_LIBRARY_PATH  prepended with ~/.cache/lorrax/cudart-hmem/<id> (<id>: the
+# LD_LIBRARY_PATH  prepended with <cache tree>/cudart-hmem/<id> (<id>: the
 #                  md5 of the target's path, so two venvs never share a link),
 #                  holding libcudart.so -> the CUDA runtime the run python's
 #                  JAX plugin resolves (nvidia/cu*/lib/libcudart.so.<major>).
@@ -35,11 +35,20 @@ fi
 
 export MPICH_GPU_SUPPORT_ENABLED=0
 
+# The per-user cache tree, by the rule lxkit.user_cache_root applies to the
+# JAX compile cache and the NVRTC image cache: $SCRATCH/.cache/lorrax when
+# SCRATCH is a writable directory, else ${XDG_CACHE_HOME:-~/.cache}/lorrax.
+if [ -n "${SCRATCH:-}" ] && [ -d "$SCRATCH" ] && [ -w "$SCRATCH" ]; then
+    _lorrax_cache="$SCRATCH/.cache/lorrax"
+else
+    _lorrax_cache="${XDG_CACHE_HOME:-$HOME/.cache}/lorrax"
+fi
+
 # CUDA_CACHE_PATH.  The CUDA driver's JIT cache defaults to ~/.nv/ComputeCache;
 # one fresh test suite plus the P1 chain put 208 MB there, and NERSC home
-# quotas are small.
+# quotas are small.  It goes in the cache tree above.
 # A value the caller set is kept.
-export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-${SCRATCH:?SCRATCH is not set}/.nv/ComputeCache}"
+export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-$_lorrax_cache/cuda_jit}"
 
 _lorrax_py="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}"
 _lorrax_here="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -51,7 +60,7 @@ print(os.path.realpath(hits[0]) if hits else "")
 PY
 )"
 if [ -n "$_lorrax_cudart" ]; then
-    _lorrax_shim="${XDG_CACHE_HOME:-$HOME/.cache}/lorrax/cudart-hmem/$(printf %s "$_lorrax_cudart" | md5sum | cut -c1-12)"
+    _lorrax_shim="$_lorrax_cache/cudart-hmem/$(printf %s "$_lorrax_cudart" | md5sum | cut -c1-12)"
     mkdir -p "$_lorrax_shim"
     ln -sfn "$_lorrax_cudart" "$_lorrax_shim/libcudart.so"
     case ":${LD_LIBRARY_PATH:-}:" in
@@ -59,4 +68,4 @@ if [ -n "$_lorrax_cudart" ]; then
         *) export LD_LIBRARY_PATH="$_lorrax_shim${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
     esac
 fi
-unset _lorrax_py _lorrax_here _lorrax_cudart _lorrax_shim
+unset _lorrax_py _lorrax_here _lorrax_cudart _lorrax_shim _lorrax_cache

@@ -15,7 +15,7 @@ Code is cited as `file:line`; every measurement names its deck, $P$ and claim.
 | lowering | tracing a function to a jaxpr, then lowering the jaxpr to a StableHLO module |
 | request | one call of JAX's `compile_or_get_cached` on one rank: a persistent-cache read, or a compile |
 | real compile | one XLA backend compile (`backend_compile_and_load`) |
-| cubin cache | the per-user, writable image directory, `ffi.fft.cubin_cache_dir()` (`src/ffi/fft.py:424`): `$SCRATCH/.cache/lorrax/kconv_mathdx`, or `~/.cache/lorrax/kconv_mathdx` where the site defines no `SCRATCH` |
+| cubin cache | the per-user, writable image directory, `ffi.fft.cubin_cache_dir()` (`src/ffi/fft.py:424`): `kconv_mathdx/images` in the per-user cache tree (`lxkit.user_cache_root`: `$SCRATCH/.cache/lorrax`, else `~/.cache/lorrax`), one directory for every build and install |
 | store | a release's read-only image directory, `ffi.fft.CUBIN_STORE`: `cubin_store/` at the source root. A checkout has none unless one is built into it |
 | fully cold, release cold, warm | no store and both caches empty; the release's store present and the JAX cache empty (a release's first run); both caches hold every key the run needs |
 | hsuite | `tests/hsuite`, its 16 default stages at P4 on one A100-80 node, with the run directory, `TMPDIR`, `SCRATCH` and both caches node-local |
@@ -42,7 +42,7 @@ kernels, and the Fourier plan's fused pair. The same source is the ROCM leg's
 service with the vendor spelled by the leg (`common/leg.h`): hipRTC, resolved
 beside the HIP runtime the process mapped, for the device's full target id
 (`--offload-arch=gfx90a:sramecc+:xnack-`), keyed `hiprtc<maj>.<min>@<libhiprtc
-real path>`, and stored as `kdft_m<mode>_…_gfx90a_<key>.hsaco` in the same cache
+file name, size>`, and stored as `kdft_m<mode>_…_gfx90a_<key>.hsaco` in the same cache
 directory ([FFI layer](ffi_layout.md), the kdft family). The rest of this
 paragraph is the CUDA leg's. It compiles for the device's own
 `sm_<cc>`, keeps each image in process, stores it in the cubin cache and
@@ -52,7 +52,7 @@ and serves every world size.
 | part of the key | what it is |
 |---|---|
 | program | FNV-1a over the embedded source, the text of each embedded header and the NVRTC options that decide the image (`rtc_build.cc`, `key`). Editing a source or header, comments included, invalidates its images |
-| toolchain | `nvrtc::mathdx_toolchain`: the cuFFTDx or cuBLASDx, commonDx, CUTLASS and CCCL version headers, the wheel's dist-info name, and the NVRTC version with the loaded `libnvrtc`'s real path. A version header that reads empty disables the disk cache for that build rather than leaving the key |
+| toolchain | `nvrtc::mathdx_toolchain`: the cuFFTDx or cuBLASDx, commonDx, CUTLASS and CCCL version headers, the wheel's dist-info name, and the NVRTC version with the loaded `libnvrtc`'s file name, size and wheel dist-info (never its directory, so an image or store built from one install is a hit from any other). A version header that reads empty disables the disk cache for that build rather than leaving the key |
 | kernel constants | the k-convolution modes and BSE outer kernels: [k-convolution §14](kconv.md#build-and-cache); the Fourier pair: its two GEMM extents and supports (`fourier_plan_cuda_ffi.cc:249`) |
 | not keyed | file names, include paths, the host code, $N_\mu$, $P$ |
 

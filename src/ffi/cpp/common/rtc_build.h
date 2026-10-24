@@ -16,8 +16,10 @@
 //
 // Key (FNV-1a, in this order): the source; each embedded header's text ("\x1d" + text); each
 // deciding option ("\x1f" + option); each toolchain version file ("\x1e" + basename + content);
-// "<rtc><major>.<minor>@<RTC library real path>" (rtc = nvrtc | hiprtc); the caller's extra key.
-// Include paths are not in the key (two installs of one version compile one image).  The
+// "<rtc><major>.<minor>@<RTC library file name>#<size>[;<its wheel's dist-info name>]"
+// (rtc = nvrtc | hiprtc); the caller's extra key.  Neither include paths nor the library's
+// directory are in the key (two installs of one toolchain compile one image, so an image store
+// built from one checkout serves every other).  The
 // device architecture is a deciding option (--gpu-architecture / --offload-arch), so it is
 // keyed.  A version file that reads empty is reported in `missing`; the caller must then
 // disable its disk cache rather than drop the file from the key.
@@ -29,8 +31,8 @@
 // on CUDA and an AMDGPU code object (ELF, or a clang offload bundle) on ROCm.
 //
 // The CUDA spelling is the historical nvrtc_build.{h,cc} one, unchanged: the same calls in the
-// same order, the same key bytes, the same messages ("nvrtcCompileProgram", "cuModuleLoadData"),
-// so a CUDA image cached before the rename is still a hit.
+// same order, the same messages ("nvrtcCompileProgram", "cuModuleLoadData").  The RTC component
+// stopped naming the library's directory on 2026-10-23, so images cached before then rebuild once.
 #pragma once
 
 #include "leg.h"
