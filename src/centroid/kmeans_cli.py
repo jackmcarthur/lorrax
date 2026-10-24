@@ -124,6 +124,7 @@ from .production_output import (
     pool_rank_warning,
     prune_band_ranges,
     rank_law_estimate,
+    resolve_sigma_ncond,
     validate_mode_policy,
 )
 
@@ -236,12 +237,14 @@ def _resolve_sigma_window(args, wfn) -> tuple[int, int]:
     return n_val, max(0, int(wfn.nbands) - n_val)
 
 
-def _resolve_deck(args) -> tuple[int | None, str]:
-    """The deck's Σ conduction count ``ncond`` and its ``wfn_file``.
+def _resolve_deck(args) -> tuple[dict | None, str]:
+    """The input file's parameters and its ``wfn_file``.
 
     Without a deck: ``(None, "WFN.h5")``.  A relative ``wfn_file`` joins the
     deck's directory, as in ``gw.kin_ion_io``.  Resolved once in
-    :func:`main`; ``prune_band_ranges`` reads ``args.sigma_ncond`` for the
+    :func:`main`; :func:`_resolve_weight` resolves its Σ conduction count
+    (``ncond``, or ``number_bands_protected`` as gw resolves it) against the
+    WFN into ``args.sigma_ncond``, which ``prune_band_ranges`` reads for the
     left window.
     """
     if args.input is None:
@@ -261,7 +264,7 @@ def _resolve_deck(args) -> tuple[int | None, str]:
     if deck_gb > 0:
         from common.gpu_utils import resolve_device_budget_gb
         resolve_device_budget_gb(deck_gb)
-    return int(deck["ncond"]), resolve_input_path(
+    return deck, resolve_input_path(
         os.path.dirname(os.path.abspath(args.input)), str(deck["wfn_file"]))
 
 
@@ -319,6 +322,7 @@ def _resolve_weight(args, wfn, sym, R, tau, dist_mesh=None):
     occupied band, so the c×c' pairs Σ reads are weighted too.
     """
     n_val, n_cond = _resolve_sigma_window(args, wfn)
+    resolve_sigma_ncond(args, wfn, log.info)
     left_range, right_range, range_label = prune_band_ranges(
         args, n_val, n_cond)
     mode = "transverse" if args.density_mode == "current" else "charge"
@@ -687,7 +691,8 @@ def _select_and_report(args, run, stages):
     log.info(f"✓ JAX initialized: {dist.device_summary()}")
 
     selection_start = time.perf_counter()
-    args.sigma_ncond, wfn_path = _resolve_deck(args)
+    args.sigma_ncond = None
+    args.sigma_deck, wfn_path = _resolve_deck(args)
     report.settings(kmeans_settings_rows(args, source=report.flag_source))
     sel = select_points(args, wfn_path, stages=stages)
     (wfn, _indices, centroids_snapped, n_unique, n_pool, pruned,

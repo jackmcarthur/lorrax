@@ -625,9 +625,7 @@ def main(argv=None):
         eigh_backend = resolve_eigh_backend(params)
         distrib_la_batched_route = resolve_distrib_la_batched_route(params)
         use_low_mem_eigh = linalg_resolution(params).layout == "distributed"
-        n_return_bands = int(params["nval"]) + int(params["ncond"])
-        _apply_coarse_window(params, args, parser)
-    
+
         # Override WFN file if provided via CLI
         if args.wfn_file is not None:
             params["wfn_file"] = args.wfn_file
@@ -654,6 +652,11 @@ def main(argv=None):
         # admitted per stage (q-batched or face) inside the library.
         mesh_xy = _build_mesh_xy()
         wfn, sym = setup_wfn_and_sym(_wfn_path, mesh_xy=mesh_xy)
+        # The deck's Sigma window: number_bands_protected resolves as in gw.
+        from gw.gw_config import resolve_band_request
+        resolve_band_request(params, wfn, log)
+        n_return_bands = int(params["nval"]) + int(params["ncond"])
+        _apply_coarse_window(params, args, parser)
         from distrib_la import plan as _linalg_plan
         _fine_enabled = bool(params.get("get_centroids_fi", False))
         _fine_plan = (_linalg_plan(

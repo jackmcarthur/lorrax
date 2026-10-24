@@ -81,6 +81,19 @@ def prune_band_ranges(args, n_val: int, n_cond: int):
             "(occupied + Sigma conduction) x all bands")
 
 
+def resolve_sigma_ncond(args, wfn, print_fn=print) -> None:
+    """Set ``args.sigma_ncond`` from the input file's parameters (``args.sigma_deck``).
+
+    Its ``ncond``, or ``number_bands_protected`` resolved against the WFN as
+    gw resolves it (``gw.gw_config.resolve_band_request``); left as is when
+    no input file was given.
+    """
+    deck = getattr(args, "sigma_deck", None)
+    if deck is not None:
+        from gw.gw_config import resolve_band_request
+        args.sigma_ncond = int(resolve_band_request(deck, wfn, print_fn)["ncond"])
+
+
 class CentroidRankNotEstablished(RuntimeWarning):
     """The point budget stopped the select before the pool was spent."""
 
