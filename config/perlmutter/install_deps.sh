@@ -218,7 +218,7 @@ ENVF="$PREFIX/lorrax-env.sh"
     echo "source \"$ROOT/config/perlmutter/gpu_env.sh\""
 } > "$ENVF"
 
-# --- 7. performance self-check ----------------------------------------------
+# --- 8. performance self-check ----------------------------------------------
 # On a login node it runs only the static checks and prints the compute-node
 # command that certifies this install (exit 3); inside a GPU job step it runs
 # in full and fails loudly, naming the cause, when a run would be slow.

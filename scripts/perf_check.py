@@ -1261,8 +1261,13 @@ def cache_location_check(path: str) -> dict:
 
 
 def user_cache_root(name: str) -> str:
-    root = os.environ.get("SCRATCH") or os.path.expanduser("~")
-    return os.path.join(root, ".cache", "lorrax", name)
+    """``lxkit.user_cache_dir(name)``'s rule (mirrored: this file imports nothing of LORRAX):
+    ``$SCRATCH/.cache/lorrax`` when SCRATCH is a writable directory, else the XDG cache."""
+    s = os.environ.get("SCRATCH", "")
+    if s and os.path.isdir(s) and os.access(s, os.W_OK | os.X_OK):
+        return os.path.join(s, ".cache", "lorrax", name)
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "lorrax", name)
 
 
 def static_caches(sm: int | None, namespace: str | None) -> dict:
