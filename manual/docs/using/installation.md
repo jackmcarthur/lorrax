@@ -133,7 +133,7 @@ The supported install as shipped (JAX 0.12, the kernel store from `lorrax-postin
 | `$SCRATCH` | 48.3 s | 6.9 / 235 / 43 s | PASS (`INSTALL VERIFIED`) | 12.2 / 37.0 / 10.8 / 328.9 s |
 | CFS, `--in-place`, without `lorrax-run` | 63.1 s | — | FAIL: slow filesystem, 6.74 ms per file open | 145.0 / 120.1 / 11.7 s; imports alone 238 s |
 
-Wherever the prefix lives, the cold suite takes the same 328–330 s, against 524 s for the older commit above. The kernel store accounts for about 125 s of that; JAX 0.12 and the launch settings account for the rest. The same tree run in place from CFS is several times slower before it reaches the first GPU stage.
+Wherever the prefix lives, the cold suite takes the same 328–330 s, against 524 s for the older commit above. The kernel store accounts for about 125 s of that; JAX 0.12 and the launch settings account for the rest. With the Triton GEMM switch above, added after these runs, the same install takes 301.8 s. The same tree run in place from CFS is several times slower before it reaches the first GPU stage.
 
 #### Options {: #perlmutter-options }
 
@@ -595,7 +595,7 @@ Each setting below prevents a failure that a straightforward build or launch run
 | one GPU per rank through `select_gpu.sh`, never `--gpus-per-task=1` | `--gpus-per-task=1` confines each rank so that the first collective fails with `invalid device ordinal` |
 | one thread per physical core, `OMP_NUM_THREADS` = cores − 2, BLAS threads 1 | without it each rank's OpenMP team runs on hyperthread siblings and oversubscribes; that cost about 8% of a stage |
 
-The runtime also chooses the JAX coordinator (the step's first host, on a port derived from the job and step ids; `JAX_COORDINATOR_ADDRESS` overrides it) and adds its compilation flags to `XLA_FLAGS`; a value you set wins. Do not set XLA's allocator or memory-fraction variables.
+The runtime also chooses the JAX coordinator (the step's first host, on a port derived from the job and step ids; `JAX_COORDINATOR_ADDRESS` overrides it) and appends its flags to `XLA_FLAGS`: on NVIDIA GPUs `--xla_gpu_autotune_level=0` and `--xla_gpu_enable_triton_gemm=false`, and the rematerialization pass off. Without the Triton switch, XLA sends real float64 dots to an untuned Triton GEMM that runs about 5 times slower on an A100. A value you set wins. Do not set XLA's allocator or memory-fraction variables.
 
 A multi-process CPU run additionally sources `config/perlmutter/cpu_mpi_env.sh`, which sets `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`, `MPITRAMPOLINE_LIB` to the MPIwrapper library, `LD_PRELOAD=/opt/cray/pe/lib64/libpmi.so.0`, `JAX_NUM_CPU_DEVICES=1` and `MPICH_ASYNC_PROGRESS=1`.
 
