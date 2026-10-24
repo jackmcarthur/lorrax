@@ -41,19 +41,21 @@ def test_binding_clone_shape_passes():
     assert not j["fails"] and not j["warns"], j
 
 
-def test_binding_docs_line_without_omp_fails():
+def test_binding_docs_line_without_omp_is_flagged():
     # the docs srun line: 32 CPUs = 16 cores + their SMT siblings, OMP unset
     ranks = [_rank(r, [*range(16 * r, 16 * r + 16), *range(64 + 16 * r, 64 + 16 * r + 16)], None)
              for r in range(4)]
     j = pc.judge_binding(ranks)
-    assert any("32-thread OpenMP team on 16 physical cores" in f for f in j["fails"]), j
+    flagged = j["fails"] if pc.SMT_TEAM_SEVERITY == "FAIL" else j["warns"]
+    assert any(f.startswith("ranks 0,1,2,3: oversubscription: a 32-thread OpenMP team on 16 physical")
+               for f in flagged), j
 
 
 def test_binding_overlap_and_omp_256_fail():
     ranks = [_rank(r, range(128), "256") for r in range(2)]
     j = pc.judge_binding(ranks)
-    assert any("share" in f for f in j["fails"])
-    assert any("256-thread OpenMP" in f for f in j["fails"])
+    assert any("share CPUs" in f for f in j["fails"])
+    assert any("256-thread OpenMP team on 128 CPUs" in f for f in j["fails"])
 
 
 def test_reference_threshold():

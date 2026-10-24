@@ -1533,8 +1533,9 @@ def judge_all(ranks: list[dict], cpu_only: bool) -> tuple[str, list[dict], dict]
     else:
         comps.append(comp("3 kernels", "SKIP", ["no GPU in this step: skipped"]))
     b = judge_binding(ranks)
+    fix = [f"fix: {b['fix']}"] if (b["fails"] or b["warns"]) else []
     comps.append(comp("4 binding", "FAIL" if b["fails"] else ("WARN" if b["warns"] else "PASS"),
-                      [*(f + "; fix: " + FIX_BINDING for f in b["fails"]), *b["warns"], *b["rows"]]))
+                      [*b["fails"], *b["warns"], *fix, *b["rows"]]))
     if gpu:
         comps.append(judge_libraries(ranks, r0.get("libs_static") or {}))
         comps.append(judge_bench(ranks, ref, kind))
@@ -1543,9 +1544,6 @@ def judge_all(ranks: list[dict], cpu_only: bool) -> tuple[str, list[dict], dict]
         comps.append(comp("6 benchmark", "SKIP", ["no GPU in this step: skipped"]))
     return verdict(comps), comps, {"device_kind": kind, "reference": bool(ref), "gpu": gpu}
 
-
-FIX_BINDING = ("launch with -c <physical cores per rank> --threads-per-core=1 --cpu-bind=threads and "
-               "OMP_NUM_THREADS = cores - 2 (docs/environment/machines/perlmutter.md#cpu)")
 
 
 def report(v: str, comps: list[dict], meta: dict, ctx: dict, wall: float) -> str:
