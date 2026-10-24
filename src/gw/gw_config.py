@@ -661,15 +661,25 @@ def refuse_unsupported_head_dense(config) -> None:
 
     The dense set holds the DFT velocity of the scalar charge head
     (``gw.qsgw_head.head_source``).  A head that is off, four-current, or
-    rebuilt each SC map from QP velocities (``sc_head_update`` not ``off``)
-    would ignore it or mix two operators.  Metals refuse at the head build
+    rebuilt each SC map from QP velocities (``sc_head_update`` not ``off``),
+    or supplied by a density resolvent would ignore it or mix two operators.
+    A dense DFT tensor is not the dense ladder's micro-reducible tensor.
+    Metals refuse at the head build
     (``GATE head_dense_metal``), where the occupation state is known.
     """
     if not getattr(config.head, "dense_file", ""):
         return
     why = None
+    rule = "head_dense_operator"
     if config.head.correction is HeadCorrection.OFF:
         why = "head_correction = off builds no head"
+    elif config.screening.diagrams in (ScreeningDiagrams.W_BSE,
+                                       ScreeningDiagrams.W_RPA_RESOLVENT):
+        rule = "head_dense_resolvent"
+        why = (f"screening_diagrams = {config.screening.diagrams.value} "
+               "builds its head from the same microscopic density resolvent "
+               "as its body; replacing it with a dense DFT tensor has no "
+               "defined matching ladder kernel and vertices")
     elif bool(config.bispinor):
         why = "bispinor = true: the four-current head has no dense source"
     elif (config.qp_solver is QPSolver.SELF_CONSISTENT
@@ -678,11 +688,11 @@ def refuse_unsupported_head_dense(config) -> None:
                "each map from the QP velocity of the GW mesh")
     if why is not None:
         raise ValueError(
-            "GATE head_dense_operator: head_dense_file names a dense DFT "
+            f"GATE {rule}: head_dense_file names a dense DFT "
             "charge head this deck cannot use.\n"
             f"  got:  head_dense_file = {config.head.dense_file!r}; {why}\n"
             "  want: a scalar head (head_correction = full) "
-            "built from the DFT response: one-shot, BSE screening, or SC with "
+            "built from the DFT response: one-shot RPA, or RPA SC with "
             "sc_head_update = off\n"
             "  fix:  drop head_dense_file, or change the head settings\n"
             "  doc:  docs/input_reference.md, head_dense_file.")
