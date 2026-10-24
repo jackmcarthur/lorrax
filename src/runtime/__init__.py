@@ -2602,14 +2602,15 @@ def finalize_process(rc: int = 0):
     except Exception:                                     # jax never imported
         pass
     # Keep stderr filtered while earlier-registered cache/library hooks run.
-    # The explicit stop below drains and restores it after every exit hook.
+    # The explicit stop below drains and closes it after every exit hook.
     atexit.unregister(_stop_pjrt_log_filter)
     try:
         atexit._run_exitfuncs()
     except Exception as exc:                              # noqa: BLE001
         _print_rank0(f"  [finalize] an atexit hook failed "
                      f"({type(exc).__name__}: {exc}); continuing")
-    pjrt_notices = _stop_pjrt_log_filter()
+    sys.stderr.flush()
+    pjrt_notices = _stop_pjrt_log_filter(restore=False)
     if pjrt_notices:
         debug_print(
             f"[runtime] filtered {pjrt_notices} exact known-benign JAX "
@@ -2622,7 +2623,6 @@ def finalize_process(rc: int = 0):
         "deliberately — it deadlocks in pool shutdown after cold-compile "
         "storms (jobs 7884928/7884989).")
     sys.stdout.flush()
-    sys.stderr.flush()
     os._exit(int(rc))
 
 

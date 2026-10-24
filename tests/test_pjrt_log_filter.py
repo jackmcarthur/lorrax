@@ -111,6 +111,7 @@ def test_finalize_keeps_filter_through_exit_hooks_and_requires_a_passed_barrier(
         passed = sys.argv[2] == '1'
         def late_hook():
             os.write(2, receipt + b'UNHEALTHY_PEER_ERROR\\n')
+            sys.stderr.write('buffered Python diagnostic')
         atexit.register(late_hook)
         install_pjrt_log_filter()
         jax = types.ModuleType('jax')
@@ -125,6 +126,14 @@ def test_finalize_keeps_filter_through_exit_hooks_and_requires_a_passed_barrier(
         collective.barrier = lambda name: passed
         sys.modules.update({'jax':jax, 'jax._src':src, 'jax._src.api':api,
                             'common.collectives':collective})
+        hard_exit = os._exit
+        def check_exit(rc):
+            try:
+                os.fstat(2)
+            except OSError:
+                os.write(1, b'STDERR_CLOSED_AT_HARD_EXIT\\n')
+            hard_exit(rc)
+        os._exit = check_exit
         runtime.finalize_process(7)
     """)
     root = Path(__file__).resolve().parents[1]
@@ -135,4 +144,33 @@ def test_finalize_keeps_filter_through_exit_hooks_and_requires_a_passed_barrier(
                 env=env, capture_output=True, timeout=10)
             assert result.returncode == 7, result.stderr
             assert b'UNHEALTHY_PEER_ERROR\n' in result.stderr
+            assert b'buffered Python diagnostic' in result.stderr
+            assert b'STDERR_CLOSED_AT_HARD_EXIT\n' in result.stdout
             assert (receipt in result.stderr) is not passed, result.stderr
+
+
+def test_hard_stop_drains_owned_pipe_and_preserves_a_foreign_descriptor():
+    with tempfile.TemporaryFile() as sink, tempfile.TemporaryFile() as foreign:
+        target = os.dup(sink.fileno())
+        f = ExactPjrtNoticeFilter(target_fd=target)
+        f.start()
+        os.write(target, b'pending diagnostic\n')
+        f.stop(restore=False)
+        try:
+            os.fstat(target)
+        except OSError:
+            pass
+        else:
+            raise AssertionError('hard stop restored its owned descriptor')
+        sink.seek(0)
+        assert sink.read() == b'pending diagnostic\n'
+
+        target = os.dup(sink.fileno())
+        f = ExactPjrtNoticeFilter(target_fd=target)
+        f.start()
+        os.dup2(foreign.fileno(), target)  # A harness has replaced the owned pipe.
+        f.stop(restore=False)
+        os.write(target, b'foreign descriptor survives\n')
+        os.close(target)
+        foreign.seek(0)
+        assert foreign.read() == b'foreign descriptor survives\n'

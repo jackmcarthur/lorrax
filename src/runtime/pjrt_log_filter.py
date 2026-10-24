@@ -291,8 +291,12 @@ class ExactPjrtNoticeFilter:
             except OSError:
                 pass
 
-    def stop(self) -> int:
-        """Restore the target descriptor, drain the pipe, and return count."""
+    def stop(self, *, restore: bool = True) -> int:
+        """Drain the pipe and restore its descriptor.
+
+        ``restore=False`` closes the owned descriptor for an immediate hard
+        exit; the caller must flush its Python stream first.
+        """
         with self._lock:
             if not self._started:
                 return self._suppressed
@@ -304,9 +308,12 @@ class ExactPjrtNoticeFilter:
                 self._retire()
                 return self._suppressed
 
-            # dup2 first closes the pipe writer occupying target_fd.  The
-            # reader then sees EOF after draining all C++/Python writes.
-            os.dup2(self._saved_fd, self._target_fd)
+            # Close the owned writer so the reader drains through EOF. A hard
+            # exit leaves it closed, avoiding an unfiltered late-watcher window.
+            if restore:
+                os.dup2(self._saved_fd, self._target_fd)
+            else:
+                os.close(self._target_fd)
             self._thread.join(timeout=5.0)
             if not self._thread.is_alive():
                 os.close(self._saved_fd)
@@ -335,9 +342,9 @@ def install_pjrt_log_filter() -> None:
         _ATEXIT_REGISTERED = True
 
 
-def stop_pjrt_log_filter() -> int:
+def stop_pjrt_log_filter(*, restore: bool = True) -> int:
     """Stop the process-wide filter, returning its cumulative drop count."""
-    return _PROCESS_FILTER.stop()
+    return _PROCESS_FILTER.stop(restore=restore)
 
 
 def begin_clean_shutdown_log_filter() -> None:
