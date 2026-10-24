@@ -302,7 +302,6 @@ def load_bse_data_from_restart_sharded(
         vhead_restart = built_head.vc0
         whead_restart = np.asarray([built_head.wcoul0])
     if header["head_vector"] is not None:
-        from common.collectives import device_put_process_local
         from runtime.padding import pad_to_axis, padded_mu_axis
         g0 = pad_to_axis(header["head_vector"], padded_mu_axis(n_rmu, mesh_xy), axis=-1)
         g0_X = device_put_process_local(g0, NamedSharding(mesh_xy, P("x")))

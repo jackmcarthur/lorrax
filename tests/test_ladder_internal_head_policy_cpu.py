@@ -131,3 +131,72 @@ def test_static_rpa_rung_is_persisted_with_its_producer_diagram(monkeypatch):
     assert config.screening.diagrams is ScreeningDiagrams.W_BSE
     assert len(seen) == 1 and seen[0].screening.diagrams is ScreeningDiagrams.W_RPA
     assert seen[0].head is config.head
+
+
+@pytest.mark.parametrize('facade', ['head', 'wedge'])
+def test_no_rung_facades_load_bare_only_restart_without_screened_reads(monkeypatch,tmp_path,facade):
+    """The actual loader and payload owner must never request/rebuild W for RPA."""
+    import jax
+    from jax.sharding import Mesh,NamedSharding,PartitionSpec as P
+    from bse import w_ladder,bse_loading,head_resolvent
+    from bse import absorption_common
+    from file_io import restart_bundle
+    from gw import static_screening
+    from common.collectives import device_put_process_local
+    jax.config.update('jax_enable_x64',True)
+    mesh=Mesh(np.asarray(jax.devices('cpu')[:1]).reshape(1,1),('x','y'))
+    header=dict(grid=(1,1,1),centroid_count=2,screened_ready=False,
+        head_vector=None,bare_head=None,screened_head=None,
+        logical_band_count=2,energies=np.array([[-.2,.5]]))
+    monkeypatch.setattr(restart_bundle,'read_metadata',lambda _p: header)
+    def forbidden(*a,**k):
+        raise AssertionError('no-W facade must not inspect, read or rebuild screened W')
+    monkeypatch.setattr(restart_bundle,'refuse_mpa_static_w',forbidden)
+    monkeypatch.setattr(static_screening,'build_static_w_from_restart',forbidden)
+    psi=device_put_process_local(np.ones((1,1,1,2),complex),NamedSharding(mesh,P(None,None,None,'x')))
+    v=device_put_process_local(np.eye(2,dtype=complex),NamedSharding(mesh,P('x','y')))
+    reads=[]
+    monkeypatch.setattr(restart_bundle,'read_wavefunctions',lambda *a,**k: psi)
+    def gamma(_path,kind,*a,**k):
+        assert kind=='bare';reads.append(('Gamma',kind));return v
+    def full(_path,kind,*a,**k):
+        assert kind=='bare';reads.append(('full',kind));return v[:,:,None,None,None]
+    monkeypatch.setattr(restart_bundle,'read_interaction_gamma',gamma)
+    monkeypatch.setattr(restart_bundle,'read_interaction_qgrid',full)
+    actual=bse_loading.load_bse_data_from_restart_sharded
+    loaded=[]
+    def load(*a,**k):
+        data=actual(*a,**k,n_occ=1,cell_volume=20.)
+        assert data['w_loaded'] is False and data['q0_head_ry']==0.
+        assert data['W_q'].shape==(1,1,1,1,1) and np.all(np.asarray(data['W_q'])==0)
+        loaded.append((data,k));return data
+    monkeypatch.setattr(w_ladder,'load_bse_data_from_restart_sharded',load)
+    deck=tmp_path/'gw.in';deck.write_text('[cohsex]\nwfn_file = WFN.h5\n')
+    if facade=='head':
+        monkeypatch.setattr(restart_bundle,'load_dipole_h5',lambda *a,**k: (None,None,None))
+        monkeypatch.setattr(absorption_common,'slice_dipole_to_bse_window',
+            lambda *a: (np.ones((3,1,1,1)),np.ones((1,1,1))))
+        monkeypatch.setattr(head_resolvent,'build_head_operator',lambda *a,**k: 'head-operator')
+        result=w_ladder.prepare_ladder_head('bare-only',mesh,input_file=str(deck),
+            head_dipole_path='dipole.h5',head_n_occ=1,include_w=False)
+        assert result[0]=='head-operator'
+    else:
+        class AtSweep(Exception):
+            pass
+        monkeypatch.setattr(w_ladder,'_psi_at_rest_2d',lambda d,_m:d)
+        monkeypatch.setattr(w_ladder,'_symmetry_tables',lambda _p:NS(
+            q_irr_kgrid_int=np.zeros((1,3),int),irr_idx_q=np.array([0]),
+            sym_idx_q=np.array([0]),q_irr_full_idx=np.array([0])))
+        def sweep(data,*a,**k):
+            assert data is loaded[0][0]
+            raise AtSweep
+        monkeypatch.setattr(w_ladder,'sweep_q_wedge',sweep)
+        with pytest.raises(AtSweep):
+            w_ladder.compute_wc_qwedge('bare-only',[1j],mesh,input_file=str(deck),
+                include_w=False,gmres_tol=1e-9,gmres_max_iter=300,probe_chunk=1)
+    assert len(loaded)==1
+    assert loaded[0][1]['need_W'] is False
+    assert loaded[0][1]['inject_w_head'] is False
+    assert loaded[0][1]['native_grid_only'] is True
+    assert all(kind=='bare' for _,kind in reads)
+    assert ('Gamma','bare') in reads
