@@ -44,7 +44,7 @@ while (($#)); do
         --ref) REF="$2"; shift 2 ;;
         --with-xc) WITH_XC=1; shift ;;
         --no-ffi) BUILD_FFI=0; shift ;;
-        -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
+        -h|--help) awk 'NR > 1 && !/^#/ {exit} NR > 1' "$0"; exit 0 ;;
         -*) echo "install_deps: unknown option $1" >&2; exit 2 ;;
         *) PREFIX="$1"; shift ;;
     esac
