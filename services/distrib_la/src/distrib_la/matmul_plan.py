@@ -230,8 +230,9 @@ class GemmPlan:
         Construct with ``enable_active_range=True``. Full allocation shapes
         and output placement stay fixed; bounds are replicated integer scalars
         or arrays of shape (nq,). Each local product (the face backend's panel
-        products, the local backend's tile) runs over the interval only: CUDA
-        cuBLAS pointer views, or bounded JAX panels elsewhere. Neither route
+        products, the local backend's tile) runs over the interval only: the
+        device-bounds kernel on CUDA and ROCm, bounded JAX panels on cpu
+        (``ACTIVE_LOCAL_ROUTE``). Neither route
         multiplies inactive tails.
 
         ``conj_b``: contract ``conj(B)`` without forming it -- the device route conjugates on
