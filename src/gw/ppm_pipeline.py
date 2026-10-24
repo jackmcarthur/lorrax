@@ -1055,6 +1055,7 @@ def compute_ppm_sigma_pipeline(
     fixed_quadrature_session=None,
     e_qp_ev=None,
     print_fn=print,
+    consume_screening: bool = False,
 ) -> PPMOutputs:
     """Run the GN/HL-PPM dynamic Σ^c(ω) pipeline given pre-computed W's.
 
@@ -1065,6 +1066,10 @@ def compute_ppm_sigma_pipeline(
     same helper is invoked at the screening seam.  Decoupling the
     probe-frequency χ₀+W solve from this pipeline lets future Σ
     schemes (CD, spectral, …) share the same screening planner.
+
+    ``consume_screening=True`` transfers fresh one-shot W supports and pole
+    buffers after their static readers. V stays borrowed. Any open window
+    source observer keeps the borrowed route and receives intact copies.
 
     Sequences (with timing.section + xprof annotations):
 
@@ -1175,7 +1180,10 @@ def compute_ppm_sigma_pipeline(
             ordered=ordered,
             solve_extent=int(getattr(meta, 'mu_solve_extent', meta.n_rmu)),
         )
-        ppm = fit_pole_model(fit_inputs[0], fit_inputs[1], fit_plan, print_fn=print_fn)
+        # A source observer needs the original model/supports after Sigma.
+        consume = bool(consume_screening and not observing_window_source())
+        ppm = fit_pole_model(fit_inputs[0], fit_inputs[1], fit_plan,
+                             print_fn=print_fn, consume_supports=consume)
         screening_source = {}
         if any(obs.screening for obs in _WINDOW_SOURCE_OBSERVERS):
             screening_source = dict(fit_plan=fit_plan, W_supports=(
@@ -1195,7 +1203,7 @@ def compute_ppm_sigma_pipeline(
         with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
                 wfns, ppm, meta, mesh_xy,
-                ppm_cfg=config.ppm,
+                consume_ppm=consume, ppm_cfg=config.ppm,
                 sigma_cfg=config.sigma,
                 mpa_cfg=config.mpa,
                 # The omega grid only under sigma_omega_grid_debug; on shell

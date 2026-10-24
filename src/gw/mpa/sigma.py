@@ -2158,12 +2158,13 @@ def _attach_ordered_odd_sigma(total, even):
 
 
 @lru_cache(maxsize=8)
-def _logical_mu_fn(sharding, n_mu):
+def _logical_mu_fn(sharding, n_mu, consume=False):
     """Zero both trailing (mu, nu) axes past the logical extent, in place of layout."""
     def keep(x):
         live = jnp.arange(x.shape[-1]) < n_mu
         return jnp.where(live[:, None] & live[None, :], x, jnp.zeros((), x.dtype))
-    return jax.jit(keep, out_shardings=sharding)
+    return jax.jit(keep, out_shardings=sharding,
+                   donate_argnums=(0,) if consume else ())
 
 
 class MemoryPoleSource:
@@ -2174,7 +2175,8 @@ class MemoryPoleSource:
     zeroed once here; that is what the store round trip gave, since the
     store keeps only the logical extent and its reads zero-fill the padding.
     Batches are device slices of the resident fields.  Nothing is gathered,
-    copied to host, or written.
+    copied to host, or written. ``consume=True`` transfers the input buffers
+    to the pad-safe fields; callers must not read them afterward.
 
     ``axis``: a ``runtime.padding.PaddedAxis`` naming the operator extent
     when it is not the centroid axis -- the plane-wave response sphere
@@ -2187,7 +2189,7 @@ class MemoryPoleSource:
     """
 
     def __init__(self, Omega_p, B_p, B_odd_p=None, *, n_mu_logical=None, mesh_xy,
-                 provenance, q_wedge=None, axis=None):
+                 provenance, q_wedge=None, axis=None, consume=False):
         from runtime.padding import padded_mu_extent
         shape = tuple(int(n) for n in Omega_p.shape)
         n_mu = int(axis.logical if n_mu_logical is None else n_mu_logical)
@@ -2203,9 +2205,19 @@ class MemoryPoleSource:
                 f"MemoryPoleSource: mu extent {shape[2:]} is not the store's "
                 f"read extent ({n_pad}, {n_pad}) for n_mu = {n_mu}")
         keep = _logical_mu_fn(
-            NamedSharding(mesh_xy, P(None, None, "x", "y")), n_mu)
-        self.Omega, self.B = keep(Omega_p), keep(B_p)
-        self.B_odd = None if B_odd_p is None else keep(B_odd_p)
+            NamedSharding(mesh_xy, P(None, None, "x", "y")), n_mu, consume)
+        def field(a):
+            if a is None:
+                return None
+            out = keep(a)
+            if consume:
+                out.block_until_ready()
+                if not a.is_deleted():
+                    a.delete()
+            return out
+        self.Omega = field(Omega_p)
+        self.B = field(B_p)
+        self.B_odd = field(B_odd_p)
         from file_io.mpa_store import refuse_bad_pole_fields
         refuse_bad_pole_fields(
             self.Omega, self.B, self.B_odd, where="MemoryPoleSource")

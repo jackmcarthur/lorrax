@@ -19,7 +19,7 @@ needed for divisibility. No all-gather of the input carrier is used.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import jax
 import jax.numpy as jnp
@@ -231,9 +231,9 @@ class PackedCentroidBasis:
             crop_to=target))
 
     @lru_cache(maxsize=None)
-    def _operator_kernel(self, spec, unpack, q_tile_bytes=256 << 20):
+    def _operator_kernel(self, spec, unpack, q_tile_bytes=256 << 20, consume=False):
         convert = self.unpack_axis if unpack else self.pack_axis
-        @jax.jit
+        @partial(jax.jit, donate_argnums=(0,) if consume else ())
         def kernel(op):
             if (op.ndim < 3 or (len(spec) and spec[0] is not None)
                     or len(spec) < op.ndim
@@ -283,11 +283,22 @@ class PackedCentroidBasis:
         spec = self._spec(op, spec)
         return self._operator_kernel(spec, False)(op)
 
-    def unpack_operator(self, op, *, spec=None):
+    def unpack_operator(self, op, *, spec=None, consume=False):
+        """Packed operator to canonical order; ``consume`` transfers its buffer.
+
+        Identity conversion returns the operand itself. Otherwise an owned
+        input is retired after the conversion, including unequal carriers
+        where XLA cannot alias the output onto it.
+        """
         if self.is_identity:
             return op
         spec = self._spec(op, spec)
-        return self._operator_kernel(spec, True)(op)
+        out = self._operator_kernel(spec, True, consume=consume)(op)
+        if consume:
+            out.block_until_ready()
+            if not op.is_deleted():
+                op.delete()
+        return out
 
 
 __all__ = ["PackedCentroidBasis"]
