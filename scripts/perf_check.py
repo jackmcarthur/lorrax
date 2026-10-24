@@ -299,7 +299,7 @@ def suggested_srun(ngpu: int, topo: dict, entry: str) -> str:
     phys = topo.get("physical") or 64
     per = max(2, phys // max(ngpu, 1))
     sel = ROOT / "src/ffi/cpp/select_gpu.sh"
-    return (f"srun -N 1 -n {ngpu} -c {per} --threads-per-core=1 --cpu-bind=cores "
+    return (f"srun -N 1 -n {ngpu} -c {per} --threads-per-core=1 --cpu-bind=threads "
             f"--gpus-per-node={ngpu} env OMP_NUM_THREADS={max(1, per - 2)} "
             f"{sel} {shlex.quote(sys.executable)} {entry}")
 
@@ -482,14 +482,18 @@ out["lorrax_s"] = time.perf_counter() - t1
 out["lorrax_error"] = err
 out["total_s"] = time.perf_counter() - t0
 # .pyc census of every imported module
-import importlib.util
-missing, have, ro_missing = [], 0, 0
+import sysconfig
+roots = tuple(os.path.realpath(p) + "/" for p in (
+    sys.argv[1], sysconfig.get_paths()["purelib"], sysconfig.get_paths()["stdlib"]))
+missing, have = [], 0
 for name, mod in list(sys.modules.items()):
     spec = getattr(mod, "__spec__", None)
     origin = getattr(spec, "origin", None) if spec else None
     cached = getattr(spec, "cached", None) if spec else None
     if not origin or not origin.endswith(".py") or not cached:
         continue
+    if not os.path.realpath(origin).startswith(roots):
+        continue                       # not the install's (a site's sitecustomize, ...)
     if os.path.exists(cached):
         have += 1
     else:
@@ -929,7 +933,7 @@ def judge_binding(ranks: list[dict]) -> dict:
             warns.append(f"rank {r['rank']}: OpenMP team = all {phys} cores; leave 2 for MPI "
                          "progress and Python (OMP_NUM_THREADS={})".format(max(1, phys - 2)))
         if len(b.get("numa") or []) > 1:
-            warns.append(f"rank {r['rank']}: mask spans NUMA nodes {b['numa']}")
+            rows.append(f"rank {r['rank']}: mask spans NUMA nodes {b['numa']}")
     for host, lst in by_host.items():
         for i in range(len(lst)):
             for j in range(i + 1, len(lst)):
@@ -1389,9 +1393,20 @@ def wait_all(out: Path, stage: str, nranks: int, timeout: float = 900.0) -> bool
 # ---------------------------------------------------------------------------
 # main paths
 # ---------------------------------------------------------------------------
+#: The launcher's world variables (runtime._WORLD_SIZE_ENVS / _WORLD_RANK_ENVS): a probe is
+#: one process on its rank's GPU, never a member of the step's world.
+WORLD_ENVS = ("JAX_PROCESS_COUNT", "JAX_NUM_PROCESSES", "OMPI_COMM_WORLD_SIZE", "MV2_COMM_WORLD_SIZE",
+              "PMI_SIZE", "SLURM_NTASKS", "SLURM_NPROCS", "JAX_PROCESS_INDEX", "OMPI_COMM_WORLD_RANK",
+              "MV2_COMM_WORLD_RANK", "PMI_RANK", "SLURM_PROCID")
+
+
+def single_process_env(base_env) -> dict:
+    return {k: v for k, v in base_env.items() if k not in WORLD_ENVS}
+
+
 def probe_env(base: Path, rank: int) -> dict:
     """Environment for a bench probe: fresh compile cache and fresh cubin cache."""
-    env = dict(os.environ)
+    env = single_process_env(os.environ)
     env["ISDF_JAX_CACHE_DIR"] = str(base / "jax")
     env["SCRATCH"] = str(base / "scratch")        # the per-user cubin cache root
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -1419,10 +1434,10 @@ def rank_main(args, ctx: dict, topo: dict, out: Path) -> dict:
         res["fs"]["throughput"] = probe_throughput(big_files())
     mark(out, "fs", rank)
     wait_all(out, "fs", nranks)
-    ienv = dict(os.environ)
+    ienv = single_process_env(os.environ)
     if args.cpu_only:
         ienv["JAX_PLATFORMS"] = "cpu"     # a module's "cuda,cpu" would refuse on a CPU node
-    imp, text, wall = run_probe(PROBE_IMPORT, [], ienv, timeout=600)
+    imp, text, wall = run_probe(PROBE_IMPORT, [str(ROOT)], ienv, timeout=600)
     imp["wall_s"] = wall
     res["imports"] = imp
     mark(out, "imports", rank)
@@ -1506,7 +1521,7 @@ def judge_all(ranks: list[dict], cpu_only: bool) -> tuple[str, list[dict], dict]
     return verdict(comps), comps, {"device_kind": kind, "reference": bool(ref), "gpu": gpu}
 
 
-FIX_BINDING = ("launch with -c <physical cores per rank> --threads-per-core=1 --cpu-bind=cores and "
+FIX_BINDING = ("launch with -c <physical cores per rank> --threads-per-core=1 --cpu-bind=threads and "
                "OMP_NUM_THREADS = cores - 2 (docs/environment/machines/perlmutter.md#cpu)")
 
 
