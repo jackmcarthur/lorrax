@@ -91,6 +91,18 @@ def _ldd(lib: str, env=None, relocs=False) -> tuple[dict, list[str]]:
     return libs, undef
 
 
+def _bound(so: str) -> tuple[dict, str]:
+    """``{soname: path}`` the leg binds at run time, and where that came from: its closure
+    record (``<so>.closure.json``, the exact files the loader preloads before dlopen, so
+    LD_LIBRARY_PATH cannot change them) when there is one, else ``ldd``."""
+    record = Path(so + ".closure.json")
+    if record.is_file():
+        import json
+        libs = json.loads(record.read_text()).get("libraries", [])
+        return {os.path.basename(e["path"]): e["path"] for e in libs if e.get("path")}, "closure record"
+    return _ldd(so)[0], "ldd"
+
+
 # --------------------------------------------------------------------- blas --
 _BLAS_SYMBOLS = ("dgemm_", "zgemm_", "dsyev_", "zheev_", "dpotrf_", "dgetrf_", "dgesv_")
 
@@ -341,7 +353,7 @@ def check_nvidia(site: str | None, ffi: str | None) -> None:
         import sysconfig
         site = sysconfig.get_paths()["purelib"]
     sp = Path(site)
-    resolved = _ldd(ffi)[0] if ffi else {}
+    resolved, how = _bound(ffi) if ffi else ({}, "")
     for dep, (hdr, pfx, libglob, dist, live) in _NV.items():
         version, files = _wheel(sp, dist)
         headers = sorted(p for p in (sp / "nvidia").glob(f"**/include/{hdr}"))
@@ -376,9 +388,9 @@ def check_nvidia(site: str | None, ffi: str | None) -> None:
             stem = libs[0].name.split(".so")[0]
             hit = {k: v for k, v in resolved.items() if k.startswith(stem + ".so")}
             if hit and any(v is None or os.path.realpath(v) != os.path.realpath(libs[0]) for v in hit.values()):
-                raise Failed(dep, f"the FFI {ffi} resolves {hit}, not the venv's {libs[0]}",
-                             "drop the other copy from LD_LIBRARY_PATH (the leg's search path is $ORIGIN)")
-            shown += "; the FFI binds it" if hit else ""
+                raise Failed(dep, f"the FFI {ffi} binds {hit} ({how}), not the venv's {libs[0]}",
+                             "rebuild the CUDA leg with only the venv's wheels on its search path")
+            shown += f"; the FFI binds it ({how})" if hit else ""
         ok(dep, shown)
 
 
@@ -423,7 +435,7 @@ def check_ffi(so: str, arch: str | None, roots: list[str]) -> None:
     allowed = [os.path.realpath(r) for r in roots] + [str(d) for d in list(Path(real).parents)[:6]
                                                        if (d / "src").is_dir() or d.name == ".venv"]
     home = os.path.realpath(os.path.expanduser("~"))
-    libs, _ = _ldd(so)
+    libs, how = _bound(so)
     outside = []
     for name, path in libs.items():
         if path is None:
@@ -436,7 +448,7 @@ def check_ffi(so: str, arch: str | None, roots: list[str]) -> None:
         raise Failed(dep, f"resolves {len(outside)} librar{'y' if len(outside) == 1 else 'ies'} outside the "
                      f"install: {'; '.join(outside[:3])}", "remove those directories from LD_LIBRARY_PATH "
                      "(a shim on $HOME cost +24 s per stage) and rebuild so the closure names the install's")
-    shown = f"{len(libs)} libraries resolve inside the install or the system"
+    shown = f"{len(libs)} libraries ({how}) inside the install or the system"
     if arch:
         tool = shutil.which("cuobjdump") or next(iter(glob.glob(os.path.join(
             sys.prefix, "lib/python3*/site-packages/nvidia/cu*/bin/cuobjdump"))), None)
