@@ -123,8 +123,8 @@ if ((SPACE_CHECK)); then
             quota:*) _free=$(_quota_free_gb "${_k#quota:}") ;;
         esac
         if awk -v f="$_free" -v n="${_need[$_k]}" 'BEGIN { exit !(f < n) }'; then
-            _have=$(awk -v f="$_free" 'BEGIN { print (f < 0 ? "none: over quota by " (-f) " GB" : "only " f " GB") }')
-            echo "install_deps: REFUSED: needs ${_need[$_k]} GB for${_where[$_k]} but has $_have free (${_k/:/ }); choose another PREFIX (bash install_deps.sh /path/with/room) and/or UV_CACHE_DIR, or pass --no-space-check." >&2
+            _have=$(awk -v f="$_free" 'BEGIN { print (f < 0 ? "nothing free (over quota by " (-f) " GB)" : "only " f " GB free") }')
+            echo "install_deps: REFUSED: needs ${_need[$_k]} GB for${_where[$_k]} but has $_have (${_k/:/ }); choose another PREFIX (bash install_deps.sh /path/with/room) and/or UV_CACHE_DIR, or pass --no-space-check." >&2
             exit 3
         fi
     done
