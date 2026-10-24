@@ -1202,7 +1202,8 @@ def judge_caches(caches: dict, ranks: list[dict]) -> dict:
                              "unstable or the entries are not persisted")
                 break
     if not lines:
-        lines.append(f"compile cache and cubin cache writable on fast storage; namespace {ns}")
+        lines.append("compile cache and cubin cache writable on fast storage"
+                     + (f"; namespace {ns}" if ns else ""))
     return comp("2 caches", st, lines)
 
 
@@ -1484,7 +1485,10 @@ def probe_env(base: Path, rank: int) -> dict:
     """Environment for a bench probe: fresh compile cache and fresh cubin cache."""
     env = single_process_env(os.environ)
     env["ISDF_JAX_CACHE_DIR"] = str(base / "jax")
-    env["SCRATCH"] = str(base / "scratch")        # the per-user cubin cache root
+    # The per-user cache root (lxkit.user_cache_root takes SCRATCH only if it is a writable
+    # directory, so it must exist): a fresh, empty NVRTC image cache.
+    (base / "scratch").mkdir(parents=True, exist_ok=True)
+    env["SCRATCH"] = str(base / "scratch")
     env.setdefault("PYTHONUNBUFFERED", "1")
     return env
 
