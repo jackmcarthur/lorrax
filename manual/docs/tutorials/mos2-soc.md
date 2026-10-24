@@ -12,10 +12,11 @@ and add parallel LORRAX directories beside its plane-wave calculations. The
 link scripts, numbered stages and output filenames follow the original exercise.
 
 Both tracks interpolate from a 3 × 3 × 1 coarse grid to a shifted 8 × 8 × 1
-fine grid. This comparison is underconverged, which leads to some differences
-in the final results between the plane-wave code and LORRAX. However, the
-[figures below](#interpolation-validation) show that at converged k-grid sizes
-the two are very similar.
+fine grid. This small grid is underconverged, and the screening bases and
+plasmon-pole models also differ, as described below. This comparison therefore
+does not isolate interpolation. The [denser-grid benchmarks](#interpolation-validation)
+show LORRAX interpolation following direct fine-grid calculations closely
+with shared QP energies.
 
 The [example directory](https://github.com/jackmcarthur/lorrax/tree/main/examples/MoS2_SOC_2026)
 describes the differences between the main plane-wave package and LORRAX.
@@ -93,6 +94,14 @@ LORRAX obtains its HL body moment from the finite-band response at the
 are also basis dependent: the two codes fit centroid-pair and plane-wave-pair
 matrix elements. Compare QP energies and convergence rather than equating
 those percentages.
+
+### Screening basis {: #screening-basis }
+
+The plane-wave track builds and inverts its dielectric matrix at 9 Ry.
+LORRAX screens in the 996-point ISDF basis; its bare-Coulomb and ζ spheres
+extend to 45 Ry. `epsmat_ecut = 9.0` restricts the exported inverse dielectric
+matrix after screening, rather than rerunning GW in a 9 Ry response basis.
+The exported dimensions therefore match, while the screening bases differ.
 
 ## Exciton bands {: #exciton-bands }
 

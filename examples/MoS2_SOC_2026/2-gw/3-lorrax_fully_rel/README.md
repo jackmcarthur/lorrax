@@ -70,6 +70,14 @@ in `perlmutter/bgw_sigma_policy.json`. Matching this policy does not make
 the fitted poles identical: the native HL body uses the finite-band
 high-frequency response; BerkeleyGW uses the density sum rule.
 
+The screening bases also differ. BerkeleyGW builds and inverts its dielectric
+matrix at 9 Ry. LORRAX screens in the 996-point ISDF basis with 45 Ry
+bare-Coulomb and ζ spheres; 45 Ry is not a plane-wave χ cutoff.
+`epsmat_ecut = 9.0` selects a block of the already-screened inverse dielectric
+matrix for export. It does not rerun native GW at 9 Ry. Matching the exported
+dimensions therefore does not match the internal screening basis, and the
+workshop comparison does not isolate interpolation.
+
 `sigma_omega_min_ev = -65.0` eV, relative to the Sigma Fermi reference,
 includes the deep Mo semicore states. `mc_average_vcoul_body = false` uses
 the workshop's point Coulomb body. The production 2D kernel still averages
