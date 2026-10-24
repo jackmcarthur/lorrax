@@ -115,12 +115,12 @@
 // (for libcu++, include/cccl) is derived from the loaded libnvrtc.
 //
 // Disk cache (common/rtc_build.h owns the key rule and the image format): the router passes `cubin_dir` (ffi.fft.cubin_cache_dir:
-// $SCRATCH/.cache/lorrax/kconv_mathdx, else ~/.cache/lorrax/kconv_mathdx;
+// kconv_mathdx/images in the per-user cache tree, lxkit.user_cache_root;
 // "" = no disk cache).  A cubin is keyed by FNV-1a over the embedded source,
 // the NVRTC options (mode, grid, ns, rows per block, sm) and the whole
 // toolchain that can change the image: the cuFFTDx, commonDx, CUTLASS and
 // CCCL version headers, the nvidia-mathdx wheel's dist-info name, and the
-// NVRTC version with the loaded libnvrtc's real path (its patch level).  A
+// NVRTC version with the loaded libnvrtc's file name, size and wheel dist-info.  A
 // version header that reads empty disables the disk cache for that build
 // rather than dropping out of the key.  The image is written to a unique
 // temporary and renamed (atomic on one filesystem, so concurrent ranks cannot
