@@ -895,12 +895,24 @@ def probe_binding(topo: dict) -> dict:
             "node_physical": topo["physical"], "node_logical": topo["logical"]}
 
 
+#: A thread team larger than the rank's physical cores but within its logical CPUs (SMT
+#: siblings in the mask, e.g. the docs srun line with OMP_NUM_THREADS unset) -- severity.
+SMT_TEAM_SEVERITY = "WARN"
+
+
+def _ranks_text(rs: list[int]) -> str:
+    rs = sorted(rs)
+    return f"rank {rs[0]}" if len(rs) == 1 else "ranks " + ",".join(map(str, rs))
+
+
 def judge_binding(ranks: list[dict]) -> dict:
-    """FAIL: overlapping masks, any thread team larger than the rank's physical cores,
-    fewer than two physical cores; WARN: team == cores (no room for MPI progress /
-    Python), mask spanning NUMA nodes."""
-    fails, warns, rows = [], [], []
+    """FAIL: overlapping masks, a thread team larger than the rank's CPUs, fewer than two
+    physical cores; SMT_TEAM_SEVERITY: a team larger than the physical cores (SMT siblings);
+    WARN: team == cores (no room for MPI progress / Python).  Messages are grouped over ranks."""
+    found: dict = {}          # (severity, text) -> [ranks]
+    rows: list = []
     by_host: dict = {}
+    per_rank_cores = []
     for r in ranks:
         b = r.get("binding") or {}
         if not b:
@@ -916,37 +928,48 @@ def judge_binding(ranks: list[dict]) -> dict:
         ob = int(ob) if str(ob or "").strip().isdigit() else None
         mkl = b.get("MKL_NUM_THREADS")
         mkl = int(mkl) if (mkl or "").isdigit() else None
-        phys = b["physical"]
-        line = (f"rank {r['rank']}: {b['logical']} CPUs = {phys} physical cores"
-                f"{' (SMT siblings in mask)' if b['logical'] > phys else ''}, OpenMP team {omp}"
-                f"{'' if omp_env else ' (OMP_NUM_THREADS unset: libgomp uses every CPU of the mask)'}"
-                f", OpenBLAS {ob}, MKL {mkl}")
-        rows.append(line)
+        phys, logical = b["physical"], b["logical"]
+        per_rank_cores.append(phys)
+        rows.append((f"{logical} CPUs = {phys} physical cores"
+                     f"{' (SMT siblings in mask)' if logical > phys else ''}, OpenMP team {omp}"
+                     f"{'' if omp_env else ' (OMP_NUM_THREADS unset: libgomp uses every CPU of the mask)'}"
+                     f", OpenBLAS {ob}, MKL {mkl}"
+                     + (f"; NUMA nodes {b['numa']}" if len(b.get("numa") or []) > 1 else ""), r["rank"]))
         for name, n in (("OpenMP", omp), ("OpenBLAS", ob), ("MKL", mkl)):
-            if n and n > phys:
-                fails.append(f"oversubscription: rank {r['rank']} starts a {n}-thread {name} team "
-                             f"on {phys} physical cores")
+            if n and n > logical:
+                found.setdefault(("FAIL", f"oversubscription: a {n}-thread {name} team on {logical} CPUs "
+                                  f"({phys} physical cores)"), []).append(r["rank"])
+            elif n and n > phys:
+                found.setdefault((SMT_TEAM_SEVERITY, f"oversubscription: a {n}-thread {name} team on {phys} "
+                                  f"physical cores (SMT siblings)"), []).append(r["rank"])
         if phys < 2:
-            fails.append(f"bad binding: rank {r['rank']} has {phys} physical core(s); the MPI "
-                         "progress thread competes with compute")
+            found.setdefault(("FAIL", f"bad binding: {phys} physical core(s); the MPI progress thread "
+                              "competes with compute"), []).append(r["rank"])
         elif omp == phys:
-            warns.append(f"rank {r['rank']}: OpenMP team = all {phys} cores; leave 2 for MPI "
-                         "progress and Python (OMP_NUM_THREADS={})".format(max(1, phys - 2)))
-        if len(b.get("numa") or []) > 1:
-            rows.append(f"rank {r['rank']}: mask spans NUMA nodes {b['numa']}")
+            found.setdefault(("WARN", f"OpenMP team = all {phys} cores; leave 2 for MPI progress and "
+                              f"Python (OMP_NUM_THREADS={max(1, phys - 2)})"), []).append(r["rank"])
     for host, lst in by_host.items():
-        for i in range(len(lst)):
-            for j in range(i + 1, len(lst)):
-                ov = lst[i][1] & lst[j][1]
-                if ov:
-                    fails.append(f"bad binding: ranks {lst[i][0]} and {lst[j][0]} on {host} share "
-                                 f"{len(ov)} CPUs (no --cpu-bind, or -c missing)")
-                    break
-            else:
-                continue
-            break
-    fails = list(dict.fromkeys(fails))
-    return {"rows": rows, "fails": fails, "warns": warns}
+        pairs = [(a[0], b_[0], len(a[1] & b_[1])) for i, a in enumerate(lst) for b_ in lst[i + 1:]
+                 if a[1] & b_[1]]
+        if pairs:
+            found.setdefault(("FAIL", f"bad binding: ranks on {host} share CPUs ({len(pairs)} overlapping "
+                              f"pairs, e.g. ranks {pairs[0][0]} and {pairs[0][1]} share {pairs[0][2]}): no "
+                              "--cpu-bind, or -c missing"), []).extend([p[0] for p in pairs])
+    out = {"fails": [], "warns": [], "rows": []}
+    for (sev, text), rs in found.items():
+        msg = f"{_ranks_text(list(set(rs)))}: {text}"
+        (out["fails"] if sev == "FAIL" else out["warns"]).append(msg)
+    grouped: dict = {}
+    for text, rk in rows:
+        grouped.setdefault(text, []).append(rk)
+    out["rows"] = [f"{_ranks_text(rs)}: {t}" for t, rs in grouped.items()]
+    node = (ranks[0].get("binding") or {}) if ranks else {}
+    nper = max(1, len(by_host.get(node.get("host"), [])))
+    per = max(2, int(node.get("node_physical") or 64) // nper)
+    out["fix"] = (f"launch with -c {per} --threads-per-core=1 --cpu-bind=threads and OMP_NUM_THREADS="
+                  f"{per - 2} ({nper} ranks on {node.get('node_physical')} physical cores; "
+                  "docs/environment/machines/perlmutter.md#cpu)")
+    return out
 
 
 # ---------------------------------------------------------------------------
