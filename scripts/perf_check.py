@@ -16,21 +16,22 @@ else, so it has to be measured, against a reference, on the node that runs.
 
 Components (each a PASS/WARN/FAIL with one line of cause and fix):
 
-  1 filesystem  cold read of the install's runtime files from this node: page
-                cache dropped per file (posix_fadvise DONTNEED, verified with
-                mincore), big-file GB/s, small-file opens/s, stat/s, a cold
-                ``import jax`` + backend + LORRAX import, .pyc presence on a
-                read-only tree.
+  1 filesystem  per-open latency of ~500 real install files (CUDA and mathdx
+                headers, libdevice, jax/numpy/scipy and LORRAX sources), every
+                rank at once, warm median (a page cache cannot hide a per-open
+                server round trip, the DVS mechanism); warm os.walk+lstat rate
+                of the venv; cold ``import`` of runtime, jax, the backend and a
+                driver; .pyc presence on a read-only tree; the mount and options.
   2 caches      JAX compile cache and NVRTC cubin cache: location writable, on a
                 fast filesystem, content-keyed namespace (``_k3``), cubin store
                 images for this GPU's sm_XX; a second process must hit the
                 persistent cache for every program the first compiled.
   3 kernels     the FFI CUDA leg carries SASS for this sm_XX (fatbin parse), the
                 NVRTC path produces a cubin, PTX-JIT traps (CUDA_FORCE_PTX_JIT,
-                ...), ptxas executable vs in-process compiler and its cost.
+                ...), whether XLA execs ptxas/nvlink or compiles in-process.
   4 binding     per rank: affinity mask, physical cores, SMT siblings, the
                 OpenMP team libgomp will start, OpenBLAS/MKL threads, overlap
-                between ranks; a concurrent host GEMM.
+                between ranks.
   5 libraries   the FFI legs' recorded dependency closure enforced
                 (lxkit.native_provider, the same API the runtime gate uses) and
                 its cost; duplicate CUDA libraries mapped; LD_LIBRARY_PATH traps.
@@ -47,10 +48,8 @@ subprocess so its cost is measured, not hidden.
 from __future__ import annotations
 
 import argparse
-import ctypes
 import glob
 import json
-import mmap
 import os
 import re
 import shlex
@@ -90,22 +89,22 @@ SLOWER_FAIL = 0.15
 #: from failing on jitter).
 ABS_SLACK_S = {"import_s": 1.0, "compile_cold_s": 2.0, "compile_warm_s": 1.0,
                "nvrtc_s": 1.0, "host_gemm_s": 0.2}
-#: Filesystem: per-open latency of the install's own files, all ranks at once
-#: (cluster-independent; calibration table in docs/installation/perf_check.md).
-OPEN_MEDIAN_FAIL_MS = 1.0
-OPEN_P90_WARN_MS = 5.0
+#: Filesystem, primary: open()+close() of ~500 real install files on every rank at once,
+#: median of the SECOND (warm) pass, slowest rank.  Compute-node medians (agent D, ri_diagnose;
+#: this check's own table in docs/installation/perf_check.md): module on DVS 3.5 ms, $HOME 10.6,
+#: CFS 9.6, $SCRATCH Lustre 0.24, node /tmp 0.005; every filesystem ~0.07 ms on a login node.
+OPEN_PASS_MS = 0.5
+OPEN_FAIL_MS = 1.0
 OPEN_PER_GROUP = 120
 OPEN_WALL_BUDGET_S = 25.0
-#: An execve of ptxas slower than this (median) is reported.
-EXEC_WARN_MS = 150.0
+#: Filesystem, secondary: warm os.walk + lstat of the venv (module 952/s, clone 19983/s).
+WALK_FAIL_PER_S = 5000.0
+WALK_MAX_ENTRIES = 20000
+WALK_BUDGET_S = 8.0
 #: Filesystem types that are slow for many-small-file/exec workloads when they
 #: hold the runtime (diagnosis wording only; numbers decide).
 NETWORK_FS = {"dvs", "nfs", "nfs4", "gpfs", "lustre", "cifs", "smb3", "fuse.sshfs",
               "fuse.squashfuse", "beegfs", "wekafs", "ceph", "fuse.gcsfuse"}
-LOCAL_FAST_FS = {"tmpfs", "xfs", "ext4", "squashfs", "overlay", "btrfs", "zfs", "ramfs"}
-
-#: Big-file byte budget for the (INFO) throughput probe.
-FS_BIG_BUDGET_BYTES = 600_000_000
 
 STATUS_ORDER = {"PASS": 0, "SKIP": 0, "INFO": 0, "WARN": 1, "FAIL": 2}
 
@@ -177,61 +176,6 @@ def describe_fs(path) -> str:
     return f"{f['fstype']} at {f['mount']}" + (" (read-only)" if f["readonly"] else "")
 
 
-# ---------------------------------------------------------------------------
-# page cache control: posix_fadvise DONTNEED, verified with mincore
-# ---------------------------------------------------------------------------
-_libc = None
-
-
-def libc():
-    global _libc
-    if _libc is None:
-        _libc = ctypes.CDLL(None, use_errno=True)
-        _libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
-        _libc.mincore.restype = ctypes.c_int
-    return _libc
-
-
-def drop_cache(path: str) -> bool:
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return False
-    try:
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        return True
-    except (OSError, AttributeError):
-        return False
-    finally:
-        os.close(fd)
-
-
-def resident_fraction(path: str, max_bytes: int = 64 << 20) -> float | None:
-    """Fraction of the first ``max_bytes`` of ``path`` in the page cache (mincore)."""
-    try:
-        size = os.path.getsize(path)
-        if size == 0:
-            return None
-        n = min(size, max_bytes)
-        with open(path, "rb") as fh:
-            # A private (copy-on-write) map: writable, so ctypes can take its address,
-            # and never written, so mincore reports the file's page-cache pages.
-            mm = mmap.mmap(fh.fileno(), n, access=mmap.ACCESS_COPY)
-        try:
-            page = mmap.PAGESIZE
-            npages = (n + page - 1) // page
-            vec = ctypes.create_string_buffer(npages)
-            buf = (ctypes.c_char * n).from_buffer(mm)
-            addr = ctypes.addressof(buf)
-            rc = libc().mincore(ctypes.c_void_p(addr), ctypes.c_size_t(n), vec)
-            del buf
-            if rc != 0:
-                return None
-            return sum(1 for b in vec.raw[:npages] if b & 1) / npages
-        finally:
-            mm.close()
-    except (OSError, ValueError, BufferError):
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -392,59 +336,25 @@ def probe_open_latency(sample: list[tuple[str, str]]) -> dict:
     return res
 
 
-def probe_exec(path: str | None, n: int = 4) -> dict:
-    """Wall per execve of ``path --version`` (XLA execs ptxas once per compiled module
-    when it does not compile PTX in-process)."""
-    if not path or not os.path.isfile(path):
-        return {}
-    ms = []
-    for _ in range(n):
+def probe_walk(root: str) -> dict:
+    """Entries/s of os.walk + lstat over the venv, twice; the second (warm) pass is judged.
+    Python's import system does exactly this kind of directory scanning and stat-ing."""
+    reps = []
+    for _ in range(2):
         t0 = time.perf_counter()
-        subprocess.run([path, "--version"], capture_output=True, timeout=60)
-        ms.append((time.perf_counter() - t0) * 1e3)
-    return {"path": path, **fs_of(path), **_stats(ms)}
-
-
-def ptxas_candidates() -> list[str]:
-    sp = site_packages()
-    c = sorted(glob.glob(str(sp / "nvidia/*/bin/ptxas")))
-    if os.environ.get("CUDA_HOME"):
-        c.append(os.path.join(os.environ["CUDA_HOME"], "bin", "ptxas"))
-    w = shutil.which("ptxas")
-    if w:
-        c.append(w)
-    return [p for p in dict.fromkeys(c) if os.path.isfile(p)]
-
-
-def big_files() -> list[str]:
-    sp = site_packages()
-    big: list[str] = []
-    for pat in ("jaxlib/*.so*", "jax_plugins/*/*.so*", "nvidia/*/lib/*.so*"):
-        big += glob.glob(str(sp / pat))
-    return sorted({os.path.realpath(p) for p in big if os.path.isfile(p)})
-
-
-def probe_throughput(big: list[str]) -> dict:
-    """Big-file read GB/s after posix_fadvise(DONTNEED) (INFO only: throughput was not the
-    cause on DVS; open latency was)."""
-    for p in big:
-        drop_cache(p)
-    sample = [p for p in big if os.path.getsize(p) > (8 << 20)][:4]
-    after = [r for r in (resident_fraction(p) for p in sample) if r is not None]
-    t0 = time.perf_counter()
-    nbytes = 0
-    for p in sorted(big, key=os.path.getsize):
-        if nbytes > FS_BIG_BUDGET_BYTES or time.perf_counter() - t0 > 10:
-            break
-        with open(p, "rb", buffering=0) as fh:
-            while True:
-                b = fh.read(8 << 20)
-                if not b:
-                    break
-                nbytes += len(b)
-    dt = time.perf_counter() - t0
-    return {"bytes": nbytes, "s": dt, "gbps": nbytes / dt / 1e9 if dt > 0 else None,
-            "resident_after_drop": max(after) if after else None}
+        n = 0
+        for d, ds, fs in os.walk(root):
+            for x in ds + fs:
+                try:
+                    os.lstat(os.path.join(d, x))
+                except OSError:
+                    pass
+                n += 1
+            if n >= WALK_MAX_ENTRIES or time.perf_counter() - t0 > WALK_BUDGET_S:
+                break
+        dt = time.perf_counter() - t0
+        reps.append({"entries": n, "s": dt, "per_s": n / dt if dt > 0 else None})
+    return {"root": root, "reps": reps, **fs_of(root)}
 
 
 # ---------------------------------------------------------------------------
@@ -1000,84 +910,91 @@ def vs_ref(metric: str, value, ref: dict, higher_better: bool = False):
 
 
 def open_verdict(opens: list[dict]) -> dict:
-    """Slowest rank's first-pass open latency, overall and per group."""
-    worst_r = None
+    """The slowest rank by second-pass (warm) open median, with its per-group stats."""
+    pick = None
     for o in opens:
-        p = (o.get("passes") or [{}])[0].get("all") or {}
-        if p.get("n") and (worst_r is None or p["median_ms"] > worst_r[0]["median_ms"]):
-            worst_r = (p, o)
-    if worst_r is None:
+        passes = o.get("passes") or []
+        if len(passes) < 2 or not (passes[1].get("all") or {}).get("n"):
+            continue
+        if pick is None or passes[1]["all"]["median_ms"] > pick["passes"][1]["all"]["median_ms"]:
+            pick = o
+    if pick is None:
         return {}
-    allst, o = worst_r
-    groups = {g: v for g, v in (o.get("passes") or [{}])[0].items() if g != "all" and v.get("n")}
-    second = ((o.get("passes") or [{}, {}])[1:2] or [{}])[0].get("all") or {}
-    return {"all": allst, "groups": groups, "second": second, "where": o.get("groups") or {}}
+    p1, p2 = pick["passes"][0], pick["passes"][1]
+    return {"warm": p2["all"], "first": p1.get("all") or {},
+            "groups": {g: v for g, v in p2.items() if g != "all" and v.get("n")},
+            "where": pick.get("groups") or {}}
+
+
+STAGE_FIX = ("stage the runtime node-local (see manual: docs/installation/perf_check.md#filesystem)")
 
 
 def judge_filesystem(fs0: dict, opens: list[dict], imports: list[dict], ref: dict) -> dict:
     lines, st = [], "PASS"
     v = open_verdict(opens)
-    allst = v.get("all") or {}
-    met = {"open_median_ms": allst.get("median_ms"), "open_p90_ms": allst.get("p90_ms"),
-           "big_gbps": (fs0.get("throughput") or {}).get("gbps")}
+    warm = v.get("warm") or {}
+    walk = ((fs0.get("walk") or {}).get("reps") or [{}, {}])[-1]
+    met = {"open_warm_median_ms": warm.get("median_ms"), "open_warm_p90_ms": warm.get("p90_ms"),
+           "open_first_median_ms": (v.get("first") or {}).get("median_ms"),
+           "walk_per_s": walk.get("per_s")}
     imp = [i.get("total_s") for i in imports if i.get("total_s") is not None]
     met["import_s"] = max(imp) if imp else None
     s_imp, t_imp = vs_ref("import_s", met["import_s"], ref)
-    slow_groups = sorted(((g, s) for g, s in (v.get("groups") or {}).items()
-                          if s.get("median_ms", 0) > OPEN_MEDIAN_FAIL_MS),
-                         key=lambda t: -t[1]["median_ms"])
-    if slow_groups or (allst.get("median_ms") or 0) > OPEN_MEDIAN_FAIL_MS:
+    med = warm.get("median_ms")
+    if med is not None and med >= OPEN_FAIL_MS:
         st = "FAIL"
-        g, s = (slow_groups or [("all", allst)])[0]
-        w = (v.get("where") or {}).get(g) or {}
-        lines.append(
-            f"slow filesystem: opening install files costs {s['median_ms']:.1f} ms median "
-            f"(p90 {s['p90_ms']:.1f} ms, slowest rank, all ranks at once) for {g} under {w.get('mount')} "
-            f"on {w.get('fstype')} [{w.get('options', '')[:80]}]; a cold run opens ~10^4 of them "
-            "serially. Move the install (venv + source) to a fast filesystem or a node-local image "
-            "(docs/installation/perf_check.md#filesystem)")
-    elif (allst.get("p90_ms") or 0) > OPEN_P90_WARN_MS:
+        g, s = max((v.get("groups") or {"all": warm}).items(), key=lambda t: t[1]["median_ms"])
+        w = (v.get("where") or {}).get(g) or next(iter((v.get("where") or {}).values()), {})
+        lines.append(f"slow filesystem: {med:.2f} ms per open (warm median, slowest rank; worst group {g} "
+                     f"{s['median_ms']:.2f} ms) on {w.get('fstype')} at {w.get('mount')}; a cold run opens "
+                     f"~10^4 install files serially; {STAGE_FIX}")
+    elif med is not None and med > OPEN_PASS_MS:
         st = "WARN"
-        lines.append(f"open latency p90 {allst['p90_ms']:.1f} ms (median {allst['median_ms']:.2f} ms)")
+        lines.append(f"open latency {med:.2f} ms (warm median) is between PASS {OPEN_PASS_MS} and FAIL "
+                     f"{OPEN_FAIL_MS} ms")
+    wps = walk.get("per_s")
+    if wps is not None and wps < WALK_FAIL_PER_S:
+        w = fs0.get("walk") or {}
+        if st != "FAIL":
+            lines.insert(0, f"slow filesystem: venv walk+lstat {wps:.0f} entries/s < {WALK_FAIL_PER_S:.0f} on "
+                         f"{w.get('fstype')} at {w.get('mount')}; {STAGE_FIX}")
+        st = "FAIL"
     if s_imp == "FAIL":
         st = "FAIL"
         lines.append(f"slow cold import: {t_imp}")
-    sec = v.get("second") or {}
-    per_group = ", ".join(f"{g} {s['median_ms']:.2f}/{s['p90_ms']:.1f}"
-                          for g, s in (v.get("groups") or {}).items())
-    lines.append(f"open+close median/p90 ms (slowest rank, pass 1): all {fmt(allst.get('median_ms'), '.3f')}/"
-                 f"{fmt(allst.get('p90_ms'), '.2f')} ({per_group}); pass 2 (page cache warm) "
-                 f"{fmt(sec.get('median_ms'), '.3f')}/{fmt(sec.get('p90_ms'), '.2f')}")
+    per_group = ", ".join(f"{g} {s['median_ms']:.3f}" for g, s in (v.get("groups") or {}).items())
+    lines.append(f"open+close ms, slowest rank: warm median {fmt(med, '.3f')} p90 {fmt(warm.get('p90_ms'), '.2f')} "
+                 f"(first touch {fmt(met['open_first_median_ms'], '.3f')}); per group warm: {per_group}")
+    lines.append(f"venv walk+lstat {fmt(wps, '.0f')} entries/s (warm, {walk.get('entries')} entries); "
+                 f"slowest-rank cold import {fmt(met['import_s'], '.1f')} s [{t_imp}]")
     seen = set()
     for g, w in (v.get("where") or {}).items():
         if w.get("mount") in seen:
             continue
         seen.add(w.get("mount"))
-        lines.append(f"  {w.get('mount')}: {w.get('fstype')} {w.get('source')} [{(w.get('options') or '')[:120]}]")
-    ex = fs0.get("exec") or {}
-    if ex.get("n"):
-        lines.append(f"ptxas execve {ex['median_ms']:.0f} ms median ({ex.get('path')} on {ex.get('fstype')})")
-        if ex["median_ms"] > EXEC_WARN_MS and st != "FAIL":
-            st = "WARN"
-    tp = fs0.get("throughput") or {}
-    lines.append(f"slowest-rank cold import {fmt(met['import_s'], '.1f')} s [{t_imp}]; big-file read "
-                 f"{fmt(tp.get('gbps'), '.2f')} GB/s after DONTNEED (info"
-                 + (f"; {tp['resident_after_drop']:.0%} stayed resident" if tp.get("resident_after_drop") else "")
-                 + ")")
-    # .pyc on read-only trees
+        lines.append(f"  mount {w.get('mount')}: {w.get('fstype')} {w.get('source')} "
+                     f"[{(w.get('options') or '')[:110]}]")
+    # .pyc: a read-only tree without bytecode recompiles every imported module in every process
+    pfx = fs0.get("pycache_prefix")
     for i in imports[:1]:
         pyc = i.get("pyc") or {}
         if pyc.get("missing", 0) > 20:
             ro = "False" in (pyc.get("missing_dirs_writable") or []) or pyc.get("dont_write_bytecode")
-            msg = (f"missing .pyc: {pyc['missing']} of {pyc['missing'] + pyc['have']} imported modules "
-                   f"have no bytecode (e.g. {', '.join(pyc.get('missing_sample', [])[:2])})")
+            msg = (f"missing .pyc: {pyc['missing']} of {pyc['missing'] + pyc['have']} imported install "
+                   f"modules have no bytecode (e.g. {', '.join(pyc.get('missing_sample', [])[:1])})")
             if ro:
                 st = "FAIL"
-                lines.insert(0, msg + "; the tree is read-only (or bytecode writing is off), so every "
-                             "process recompiles them: run `python -m compileall -q <install>` at install time")
+                lines.insert(0, msg + " on a read-only tree, so every process byte-compiles them: run "
+                             "`python -m compileall -q <install>` at install time, or export "
+                             "PYTHONPYCACHEPREFIX=<node-local dir, e.g. /tmp/$USER/pycache>")
             else:
                 st = worst(st, "WARN")
                 lines.append(msg + "; the first run writes them")
+    if pfx:
+        lines.append(f"PYTHONPYCACHEPREFIX={pfx.get('path')} on {pfx.get('fstype')}")
+        if pfx.get("fstype") in NETWORK_FS:
+            st = worst(st, "WARN")
+            lines.append("PYTHONPYCACHEPREFIX is on a network filesystem: point it at node-local storage")
     return comp("1 filesystem", st, lines, met)
 
 
@@ -1368,15 +1285,17 @@ def static_caches(sm: int | None, namespace: str | None) -> dict:
     return out
 
 
-def ptx_compiler_info(children: list[str], cold_exec: dict) -> dict:
-    ptxas = [c for c in children if os.path.basename(c).startswith("ptxas")]
+def ptx_compiler_info(children: list[str]) -> dict:
+    """How XLA turned PTX into SASS in the cold compile probe: the ptxas children it
+    exec'd (one per compiled module, each a file open + exec on the install's filesystem),
+    or none (in-process libnvptxcompiler)."""
+    ptxas = [c for c in children if os.path.basename(c).startswith(("ptxas", "nvlink"))]
     xf = os.environ.get("XLA_FLAGS", "")
     if ptxas:
         p = ptxas[0]
         f = fs_of(p)
-        txt = (f"XLA compiles PTX with the ptxas executable {p} on {f['fstype']} "
-               f"(cold exec {fmt(cold_exec.get('cold_s'), '.2f')} s, warm {fmt(cold_exec.get('warm_s'), '.3f')} s)")
-        sev = "WARN" if (cold_exec.get("cold_s") or 0) > 1.0 or f["fstype"] in NETWORK_FS - {"lustre"} else "INFO"
+        txt = f"XLA execs {', '.join(sorted({os.path.basename(c) for c in ptxas}))} per compiled module: {p} on {f['fstype']}"
+        sev = "WARN" if f["fstype"] in NETWORK_FS - {"lustre"} else "INFO"
         return {"method": "ptxas", "path": p, "text": txt, "severity": sev}
     if "--xla_gpu_enable_libnvptxcompiler=true" in xf or children == []:
         return {"method": "libnvptxcompiler", "text": "XLA compiled PTX in-process (libnvptxcompiler; no "
@@ -1384,17 +1303,6 @@ def ptx_compiler_info(children: list[str], cold_exec: dict) -> dict:
     return {"method": "?", "text": f"compile children: {children[:3]}", "severity": "INFO"}
 
 
-def time_exec_cold(path: str) -> dict:
-    if not path or not os.path.isfile(path):
-        return {}
-    drop_cache(path)
-    t0 = time.perf_counter()
-    subprocess.run([path, "--version"], capture_output=True, timeout=60)
-    cold = time.perf_counter() - t0
-    t0 = time.perf_counter()
-    for _ in range(3):
-        subprocess.run([path, "--version"], capture_output=True, timeout=60)
-    return {"cold_s": cold, "warm_s": (time.perf_counter() - t0) / 3}
 
 
 # ---------------------------------------------------------------------------
@@ -1439,8 +1347,7 @@ def probe_env(base: Path, rank: int) -> dict:
 def rank_main(args, ctx: dict, topo: dict, out: Path) -> dict:
     rank, nranks = ctx["rank"], ctx["nranks"]
     res: dict = {"rank": rank, "host": ctx["host"], "binding": probe_binding(topo)}
-    # 1. open latency on every rank at once (as a run's ranks start), then rank 0's
-    #    ptxas execs and big-file throughput (which also drops the page cache for the imports).
+    # 1. open latency on every rank at once (as a run's ranks start), then rank 0's venv walk.
     sample = open_sample()
     mark(out, "start", rank)
     wait_all(out, "start", nranks)
@@ -1452,9 +1359,9 @@ def rank_main(args, ctx: dict, topo: dict, out: Path) -> dict:
         res["fs"] = {"paths": {label: {"path": p, **fs_of(p)} for label, p in (
             ("site-packages", str(site_packages())), ("source", str(ROOT)),
             ("python", os.path.realpath(sys.executable)))}}
-        px = ptxas_candidates()
-        res["fs"]["exec"] = probe_exec(px[0] if px else None)
-        res["fs"]["throughput"] = probe_throughput(big_files())
+        res["fs"]["walk"] = probe_walk(str(site_packages()))
+        pfx = os.environ.get("PYTHONPYCACHEPREFIX")
+        res["fs"]["pycache_prefix"] = {"path": pfx, **fs_of(pfx)} if pfx else None
     mark(out, "fs", rank)
     wait_all(out, "fs", nranks)
     ienv = single_process_env(os.environ)
@@ -1510,9 +1417,8 @@ def rank_main(args, ctx: dict, topo: dict, out: Path) -> dict:
             if p and os.path.isfile(p):
                 fat[p] = fatbin_inventory(p)
         children = bc.get("children") or []
-        ptxas = next((c for c in children if os.path.basename(c).startswith("ptxas")), None)
         res["kernels"] = {"env_traps": env_traps(), "fatbin": fat,
-                          "ptx_compiler": ptx_compiler_info(children, time_exec_cold(ptxas)) if gpu else {}}
+                          "ptx_compiler": ptx_compiler_info(children) if gpu else {}}
         res["libs_static"] = libs_static(imp.get("mapped") or [])
     (out / f"rank{rank}.json").write_text(json.dumps(res, indent=1, default=str))
     mark(out, "done", rank)
@@ -1586,12 +1492,12 @@ def static_main(args, ctx: dict, topo: dict, reason: str) -> int:
         say(f"  {t['severity']}: {t['text']}")
     say(f"  install: {describe_fs(site_packages())} (site-packages), {describe_fs(ROOT)} (source)")
     o = probe_open_latency(open_sample())
-    a = (o["passes"][0].get("all") or {}) if o.get("passes") else {}
+    a = (o["passes"][-1].get("all") or {}) if o.get("passes") else {}
     if a.get("n"):
-        say(f"  open latency HERE: {a['median_ms']:.3f} ms median, {a['p90_ms']:.2f} ms p90 over {a['n']} "
-            "install files. A login node can look fast where compute nodes are not (Perlmutter: "
-            "/global/common is a DVS mount on compute nodes, 5-10 ms per open): this does not "
-            "certify compute nodes.")
+        say(f"  open latency HERE: {a['median_ms']:.3f} ms warm median over {a['n']} install files "
+            f"({describe_fs(site_packages())}). Login nodes look fast on every filesystem (Perlmutter: "
+            "~0.07 ms, while /global/common is a DVS mount on compute nodes at ~3.5 ms per open), so "
+            "this does not certify compute nodes.")
     acct = os.environ.get("SBATCH_ACCOUNT") or os.environ.get("SLURM_ACCOUNT") or "<account>"
     srun = suggested_srun(ngpu, topo if not ctx["login_name"] else {"physical": 64}, entry)
     if ctx["job"] and not ctx["in_step"]:
