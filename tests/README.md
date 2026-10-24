@@ -55,6 +55,7 @@ A new test needs no bootstrap import of its own. Run the unit layer with
 | `test_module_cubin_store.py` | accepted module image assets remain regular/self-contained; source, bundle and payload mismatches refuse (stdlib-only, also runs directly) |
 | `test_network_env_multinode.py` | the multi-node network decision matrix |
 | `test_perf_check.py` | `scripts/perf_check.py`'s judgement: fatbin SASS/PTX parse, binding (clone shape passes, SMT-sibling and oversubscribed teams and overlapping masks are flagged), the 15% reference rule, a second-process compile-cache miss fails |
+| `test_jax_window.py` | `runtime.jax_support`'s per-leg JAX window: 0.12 everywhere, 0.9.1 on ROCm only, keyed by the startup leg (stdlib-only) |
 | `tdagw/test_prop_integrators_cpu.py` | the DP54 stepper takes SciPy RK45's steps |
 | `tdagw/test_validation_rabi_cpu.py` | Rabi flopping against the exact rotating-frame solution, every integrator |
 

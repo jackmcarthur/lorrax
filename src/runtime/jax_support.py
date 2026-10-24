@@ -1,16 +1,18 @@
-"""Startup refusal for a JAX/JAXLIB stack outside the 0.12 series.
+"""Startup refusal for a JAX/JAXLIB stack outside its platform's window.
 
 This is the in-process backstop for the package constraints and the tracked
 ``tools/require_jax.py`` launch preflight.  All three must agree (the
-preflight reads its window from this file).  It checks
+preflight reads its windows from this file).  It checks
 both JAX and JAXLIB after backend initialization but before the first physics
 ``jit``, then checks the private-API shapes used by the persistent compile
 cache.  There is no unsupported-version escape hatch: production and developer
-driver invocations run the same 0.12 contract.
+driver invocations run the same contract, :data:`SUPPORTED_WINDOWS`: the 0.12
+series on every leg, and exactly 0.9.1 also on ROCm.
 
 The stricter policy was restored on 2026-08-25 after a staged CUDA-12/JAX-0.7
 launcher survived an earlier environment consolidation.  The window moved
-from 0.9 to 0.12 on 2026-10-23 (the 0.12 column below).  Historical
+from 0.9 to 0.12 on 2026-10-23 (the 0.12 column below); ROCm kept 0.9.1
+by owner decision on 2026-10-24.  Historical
 measurements of 0.5/0.7/0.9 remain useful below only as negative controls for
 the API-shape gate.
 
@@ -54,7 +56,8 @@ The first version gate was wired in 2026-08-06 after four compatibility shims
 were removed from ``common/jax_compile_cache.py``.  The old 0.5 and 0.7
 measurements below are retained as negative controls: they prove that a
 version-stamped but API-incompatible build is rejected before compilation.
-They no longer define a supported production lane; only 0.12 does.
+They no longer define a supported production lane; only
+:data:`SUPPORTED_WINDOWS` does.
 
 WHY IT LIVES IN ``runtime/`` — moved from ``common/`` 2026-08-06
 ----------------------------------------------------------------
@@ -103,20 +106,37 @@ __all__ = [
     "describe",
     "enforce",
     "check_version",
+    "window_leg",
+    "in_window",
     "check_private_params",
     "check_private_symbols",
 ]
 
 # --------------------------------------------------------------------------
-# The declared support window.  ONE place, and it is the thing pyproject.toml
-# means.  Widening it is a decision that should show up in a diff.
+# The declared support windows.  ONE table, keyed by platform leg (the
+# lxkit.LEGS keys), and it is what pyproject.toml's specifiers are the union
+# of.  Widening a row is a decision that should show up in a diff.
 #
-# The owner requires one generation everywhere.  0.12.0.1 is the locked
-# release; the declared series leaves patch upgrades possible while refusing
-# 0.11 and 0.13 at startup.  tools/require_jax.py reads these two names.
+# Owner decision 2026-10-24: "Allow a per-platform JAX window (0.12 on CUDA,
+# 0.9.1 still accepted on ROCm)".  0.12.0.1 is the locked release on every
+# leg; the 0.12 series leaves patch upgrades possible while refusing 0.11 and
+# 0.13.  ROCm also accepts exactly 0.9.1, the validated Frontier stack
+# (jax_rocm7_plugin 0.9.1+rocm7.14.1, config/frontier/constraints.txt).
+#
+# The leg is the one the startup configures (lxkit.startup_gpu_leg, the same
+# reader as runtime._gpu_leg's XLA flags and allocator): JAX_PLATFORMS's first
+# entry when it names a device leg, else the installed jaxlib GPU plugin's leg,
+# else "cpu".  A forced-CPU process in the Frontier venv is therefore keyed
+# ROCM: the window describes the installed stack, not the backend one test
+# picked.  tools/require_jax.py reads this table.
 # --------------------------------------------------------------------------
-SUPPORTED_MIN = (0, 12, 0)
-SUPPORTED_MAX_EXCLUSIVE = (0, 13, 0)
+_SERIES_012 = ((0, 12, 0), (0, 13, 0))
+_ROCM_091 = ((0, 9, 1), (0, 9, 2))
+SUPPORTED_WINDOWS: dict[str, tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]] = {
+    "cpu": (_SERIES_012,),
+    "CUDA": (_SERIES_012,),
+    "ROCM": (_SERIES_012, _ROCM_091),
+}
 
 # --------------------------------------------------------------------------
 # The private-API shapes this tree is WRITTEN AGAINST.
@@ -209,6 +229,23 @@ REQUIRED_PRIVATE_PARAMS: dict[tuple[str, str], tuple[tuple[str, ...], str]] = {
         (("self", "xla_executable", "name", "backend", "..."), "fit-gate"),
 }
 
+#: Rows of :data:`REQUIRED_PRIVATE_PARAMS` that differ on an older series a
+#: :data:`SUPPORTED_WINDOWS` row still accepts, by ``(major, minor)``.  0.9.1
+#: (ROCm): ``get_executable_and_time`` has no ``host_callbacks`` (the column
+#: above); the observation patch forwards ``*args``, so both shapes work.
+PRIVATE_PARAMS_BY_SERIES: dict[tuple[int, int], dict] = {
+    (0, 9): {
+        ("jax._src.compilation_cache", "get_executable_and_time"):
+            (("cache_key", "compile_options", "backend", "executable_devices"), "cache"),
+    },
+}
+
+
+def required_private_params(version_info: tuple[int, ...]) -> dict:
+    """:data:`REQUIRED_PRIVATE_PARAMS` with the running series' rows applied."""
+    return {**REQUIRED_PRIVATE_PARAMS,
+            **PRIVATE_PARAMS_BY_SERIES.get(tuple(version_info[:2]), {})}
+
 #: Private symbols that must merely EXIST for the compile-cache patches to
 #: resolve at call time.  Absence here is the silent class, so it refuses too.
 #:
@@ -291,8 +328,33 @@ def describe() -> dict[str, Any]:
     }
 
 
-def check_version() -> list[str]:
-    """Return a list of refusal-reason strings (empty when supported)."""
+def window_leg() -> str:
+    """The :data:`SUPPORTED_WINDOWS` key of this process: the leg the startup
+    configures (:func:`lxkit.startup_gpu_leg`), else ``"cpu"``."""
+    from lxkit import startup_gpu_leg
+    leg = startup_gpu_leg()
+    return leg.key if leg is not None else "cpu"
+
+
+def in_window(version_info: tuple[int, ...], leg: str) -> bool:
+    """Whether a release tuple lies in one of ``leg``'s windows."""
+    vi = tuple(version_info)[:3]
+    return any(lo <= vi < hi for lo, hi in SUPPORTED_WINDOWS[leg])
+
+
+def describe_window(leg: str) -> str:
+    """``leg``'s windows as text, e.g. ``">= 0.12.0, < 0.13.0 or == 0.9.1"``."""
+    def one(lo, hi):
+        if len(lo) == 3 and hi == lo[:2] + (lo[2] + 1,):
+            return f"== {_fmt(lo)}"
+        return f">= {_fmt(lo)}, < {_fmt(hi)}"
+    return " or ".join(one(lo, hi) for lo, hi in SUPPORTED_WINDOWS[leg])
+
+
+def check_version(leg: str | None = None) -> list[str]:
+    """Return a list of refusal-reason strings (empty when supported) for the
+    window of ``leg`` (default :func:`window_leg`)."""
+    leg = window_leg() if leg is None else leg
     info = describe()
     problems: list[str] = []
     for package, vi, version, path in (
@@ -305,9 +367,12 @@ def check_version() -> list[str]:
             problems.append(
                 f"{package} has no parseable version tuple "
                 f"(version string {version!r})")
-        elif not (SUPPORTED_MIN <= vi < SUPPORTED_MAX_EXCLUSIVE):
+        elif not in_window(vi, leg):
             problems.append(
                 f"{package} {version} (version_info={vi}) from {path}")
+    if not problems and info["version_info"][:2] != info["jaxlib_version_info"][:2]:
+        problems.append(f"jax {info['version']} and jaxlib {info['jaxlib_version']} "
+                        f"are different series")
     return problems
 
 
@@ -315,12 +380,14 @@ def check_private_params() -> list[tuple[str, str]]:
     """Verify the ``jax._src`` signatures this tree monkeypatches.
 
     Returns ``(what the patch arms, problem)`` pairs, empty when every
-    signature is the one in :data:`REQUIRED_PRIVATE_PARAMS`.
+    signature is the one in :data:`REQUIRED_PRIVATE_PARAMS` (with the running
+    series' :data:`PRIVATE_PARAMS_BY_SERIES` rows).
     """
     import importlib
 
     problems: list[tuple[str, str]] = []
-    for (modname, attr), (want, arms) in REQUIRED_PRIVATE_PARAMS.items():
+    rows = required_private_params(tuple(describe().get("version_info", ())))
+    for (modname, attr), (want, arms) in rows.items():
         try:
             fn = importlib.import_module(modname)
             for part in attr.split("."):
@@ -366,7 +433,8 @@ def enforce(*, announce=None) -> None:
     """
     import jax
 
-    version_problems = check_version()
+    leg = window_leg()
+    version_problems = check_version(leg)
     param_problems = check_private_params()
     symbol_problems = check_private_symbols()
     # The one caller runs this after ``jax.distributed.initialize``
@@ -393,12 +461,12 @@ def enforce(*, announce=None) -> None:
         _refuse(
             RULE_UNSUPPORTED_VERSION,
             got="; ".join(version_problems),
-            want=f"jax and jaxlib >= {_fmt(SUPPORTED_MIN)}, "
-                 f"< {_fmt(SUPPORTED_MAX_EXCLUSIVE)} (same window as "
-                 f"pyproject.toml and tools/require_jax.py)",
-            fix=f"install matching jax and jaxlib {_fmt(SUPPORTED_MIN[:2])}.x "
-                "packages (uv sync from this checkout's lock); on Perlmutter, "
-                "a base module built from that lock",
+            want=f"jax and jaxlib of one series, {describe_window(leg)}, on the "
+                 f"{leg} leg (SUPPORTED_WINDOWS; tools/require_jax.py reads the "
+                 f"same table)",
+            fix="install matching jax and jaxlib 0.12.x packages (uv sync from "
+                "this checkout's lock); on Perlmutter, a base module built from "
+                "that lock; on Frontier, the venv of config/frontier/constraints.txt",
         )
     if symbol_problems:
         _refuse(

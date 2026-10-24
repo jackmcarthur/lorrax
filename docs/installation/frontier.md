@@ -36,14 +36,14 @@ module load cray-python/3.12.12
 python3 -m venv "$HOME/envs/lx-jax091-rocm7141"
 source "$HOME/envs/lx-jax091-rocm7141/bin/activate"
 python -m pip install --upgrade pip
+export PIP_CONSTRAINT="$PWD/config/frontier/constraints.txt"
 python -m pip install --no-cache-dir \
   --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
-  'rocm[libraries,device-gfx90a]==7.14.1'
+  'rocm[libraries,device-gfx90a]'
 python -m pip install --no-cache-dir \
   --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
   --extra-index-url https://pypi.org/simple \
-  'jax_rocm7_plugin==0.9.1+rocm7.14.1' \
-  'jax_rocm7_pjrt==0.9.1+rocm7.14.1'
+  jax_rocm7_plugin jax_rocm7_pjrt
 python - <<'PYTHON'
 from pathlib import Path
 import subprocess
@@ -56,8 +56,9 @@ packages = sorted({path for pattern in metadata["tool"]["uv"]["workspace"]["memb
                    for path in root.glob(pattern) if (path / "pyproject.toml").is_file()})
 editable = [arg for path in [*packages, root] for arg in ("-e", str(path))]
 subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir",
-                       "jax==0.9.1", "jaxlib==0.9.1", *editable, "pytest"])
+                       "jax", "jaxlib", *editable, "pytest"])
 PYTHON
+unset PIP_CONSTRAINT
 python -m pip freeze > frontier-python-freeze.txt
 source config/frontier/gpu_env.sh
 ```
@@ -67,6 +68,13 @@ there is no second service roster to maintain. The helper and native build
 scripts do not create this environment. Retain its package manifest and,
 for an offline rebuild, the downloaded wheels with hashes. This recipe pins
 the validated GPU stack; it is not a lock for every transitive dependency.
+The pins live in `config/frontier/constraints.txt`; export it as
+`PIP_CONSTRAINT` for any later `pip install` in this environment so nothing
+moves JAX off 0.9.1. The environment is not a uv environment: `uv sync`
+manages the checkout's `.venv` from `uv.lock` (JAX 0.12) and must not be
+pointed at it (`--active`, `UV_PROJECT_ENVIRONMENT`). JAX 0.9.1 is accepted
+on the ROCm leg only; CPU and CUDA installations need the 0.12 series
+(`runtime.jax_support.SUPPORTED_WINDOWS`).
 
 ## 2. Build the native pair {#build}
 

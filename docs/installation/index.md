@@ -31,29 +31,36 @@ A LORRAX process needs three things.
 
 ## The JAX contract {#jax}
 
-LORRAX supports exactly the JAX/JAXLIB 0.12 series:
+LORRAX supports one JAX/JAXLIB window per platform leg
+(`runtime.jax_support.SUPPORTED_WINDOWS`):
 
-```text
-jax     >= 0.12.0, < 0.13.0
-jaxlib  >= 0.12.0, < 0.13.0
-```
+| leg | jax and jaxlib (one series) |
+|---|---|
+| CPU, CUDA | `>= 0.12.0, < 0.13.0` |
+| ROCm | `>= 0.12.0, < 0.13.0`, or `== 0.9.1` (the validated [Frontier](frontier.md) environment) |
 
-Patch upgrades inside the series are allowed; any other minor generation of
-either package refuses, and there is no override. The window is narrow
+The leg is the one the startup configures (`lxkit.startup_gpu_leg`):
+`JAX_PLATFORMS`'s first entry when it names a GPU leg, else the installed
+jaxlib GPU plugin's leg, else CPU. A forced-CPU process in the Frontier
+environment is therefore keyed ROCm.
+
+Patch upgrades inside the 0.12 series are allowed; any other version
+refuses, and there is no override. The window is narrow
 because `common/jax_compile_cache.py` patches five `jax._src` private
 functions whose signatures change between generations: a mismatched JAX does
-not fail cleanly, it dies at the first compile. Three surfaces enforce the same
-window:
+not fail cleanly, it dies at the first compile. Three surfaces enforce the
+windows:
 
-1. `pyproject.toml` constrains the base, `cuda12`, `cuda13` and development
-   installs;
+1. `pyproject.toml` constrains the `cuda12`, `cuda13` and development
+   installs to 0.12 and the base install to the union of the rows;
 2. `tools/require_jax.py` checks the installed package metadata before a
-   launcher's first JAX import, without importing JAX (it reads the window
+   launcher's first JAX import, without importing JAX (it reads the table
    from `runtime/jax_support.py`);
 3. `runtime.jax_support.enforce()`, step 5b of
    `runtime.initialize_communicator_stack` (after the first `jax.devices()`,
    before the first `jit`), checks both live packages and the parameter names
-   of each private it patches (`REQUIRED_PRIVATE_PARAMS`). A mismatch refuses,
+   of each private it patches (`REQUIRED_PRIVATE_PARAMS`, with the 0.9 rows
+   of `PRIVATE_PARAMS_BY_SERIES` on 0.9.1). A mismatch refuses,
    except that at $P = 1$ the compile agreement's and the device-fit gate's
    rows only warn. The version string alone is not trusted: a date-stamped
    container build can report an allowed version over a different
@@ -85,7 +92,7 @@ explains how to port one.
 | `partial sealed-bundle override refused` | only one leg of the bundle's pair is pinned (`LORRAX_FFI_HOST_SO` with `LORRAX_FFI_SO` or `LORRAX_FFI_ROCM_SO`) | unset both, or pin both legs of one sealed bundle |
 | `mixed native providers` | the two selected legs claim different bundle manifests | select both legs from one bundle |
 | `GATE native-closure: got …; want …; fix: …` | the leg has no or a stale dependency record, or the process maps a library other than the recorded one, or two copies of one | the message's fix; the table in [the dependency closure](ffi-build.md#closure) |
-| `JAX_ENV_REFUSED` (from `tools/require_jax.py`), or the `runtime.jax_support` refusal before the first `jit` | JAX or JAXLIB outside the 0.12 series, or a `jax._src` of the wrong shape | install the 0.12 series (§ [JAX contract](#jax)) |
+| `JAX_ENV_REFUSED` (from `tools/require_jax.py`), or the `runtime.jax_support` refusal before the first `jit` | JAX or JAXLIB outside the leg's window (0.12; ROCm also 0.9.1), or a `jax._src` of the wrong shape | install the 0.12 series (§ [JAX contract](#jax)) |
 | `GATE mathdx-headers` | a CUDA run without `nvidia-mathdx` in the venv | `uv sync --extra cuda13` (or `cuda12`) |
 
 An unsealed library from a build tree loads with a `LEGACY-UNSEALED`

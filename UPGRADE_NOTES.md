@@ -5,6 +5,30 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-24 — JAX window per platform: ROCm keeps 0.9.1
+
+- **Changed.** `runtime.jax_support.SUPPORTED_WINDOWS` replaces the single
+  window: CPU and CUDA accept the 0.12 series only; ROCm accepts the 0.12
+  series or exactly 0.9.1, so the Frontier environment
+  (`$HOME/envs/lx-jax091-rocm7141`) starts again. The leg is
+  `lxkit.startup_gpu_leg` (`JAX_PLATFORMS`'s first entry, else the installed
+  GPU plugin's leg), so a `JAX_PLATFORMS=cpu` process in that environment is
+  keyed ROCm. jax and jaxlib must also be one series. `tools/require_jax.py`
+  reads the same table and prints `leg=` on its `JAX_ENV_OK` line.
+- **Packaging.** The base `jax`/`jaxlib` specifiers are the union
+  (`>=0.9.1,!=0.10.*,!=0.11.*,<0.13.0`) so the Frontier pip recipe can install
+  the editable tree beside 0.9.1; the `cuda12`/`cuda13` extras and the lock's
+  versions do not move (only the root's two `requires-dist` lines changed).
+  The Frontier pins are `config/frontier/constraints.txt`; use it as
+  `PIP_CONSTRAINT` for any pip install in that environment and never run
+  `uv sync` against it.
+- **0.9.1 code paths.** `lxkit.varying_axes` reads `ShapedArray.vma` on 0.9.1
+  and `lxkit`'s invariant all-gather uses the private `all_gather_invariant`
+  there (0.9.1 refuses `to="invarying"`). The compile-cache gate accepts
+  0.9.1's four-parameter `get_executable_and_time`. XLA flag defaults were
+  already per leg: Triton GEMM off is CUDA only; ROCm keeps autotune 0,
+  synchronous collectives and rematerialization off, as on main.
+
 ## 2026-10-23 — JAX/JAXLIB 0.12 series (was 0.9)
 
 - **Changed.** `jax` and `jaxlib` are `>= 0.12.0, < 0.13.0`, locked at 0.12.0.1

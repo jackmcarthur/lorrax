@@ -1762,36 +1762,23 @@ def _gpu_plugin_platform() -> str:
     """The ``JAX_PLATFORMS`` name of the installed jaxlib GPU plugin's leg:
     ``"rocm"`` for a ROCm build, else ``"cuda"``.
 
-    Read from the ``jax_plugins`` namespace directories on ``sys.path``
-    (``xla_cuda13``, ``xla_rocm7``, ...) against each device leg's
-    ``jax_plugin_prefix`` (:data:`lxkit.LEGS`): no plugin is imported and no
-    device is touched, because it decides ``JAX_PLATFORMS`` before the backend
-    exists.  When plugins of two legs are installed, the one whose device is
-    visible here wins (:func:`lxkit.leg_device_present`); with none found the
-    first device leg's name (``cuda``) is kept, as before.
+    The plugin is read from the ``jax_plugins`` namespace directories without
+    importing it or touching a device (:func:`lxkit.installed_plugin_leg`),
+    because it decides ``JAX_PLATFORMS`` before the backend exists; with none
+    found the first device leg's name (``cuda``) is kept, as before.
     """
-    import sys
-    from lxkit import accelerator_legs, leg_device_present
-    names = set()
-    for root in sys.path:
-        try:
-            names.update(os.listdir(os.path.join(root or ".", "jax_plugins")))
-        except OSError:
-            continue
-    legs = accelerator_legs()
-    found = [leg for leg in legs if leg.jax_plugin_prefix
-             and any(n.startswith(leg.jax_plugin_prefix) for n in names)]
-    present = [leg for leg in found if leg_device_present(leg)]
-    return (present or found or legs)[0].jax_platforms[0]
+    from lxkit import accelerator_legs, installed_plugin_leg
+    return (installed_plugin_leg() or accelerator_legs()[0]).jax_platforms[0]
 
 
 def _gpu_leg():
     """The device leg a GPU startup configures, before any backend exists:
     the leg ``JAX_PLATFORMS``'s first entry names (``set_default_env`` sets it
-    to the installed plugin's), else the installed plugin's leg."""
-    from lxkit import leg_for_jax_platform
-    first = os.environ.get("JAX_PLATFORMS", "").split(",")[0]
-    return leg_for_jax_platform(first) or leg_for_jax_platform(_gpu_plugin_platform())
+    to the installed plugin's), else the installed plugin's leg
+    (:func:`lxkit.startup_gpu_leg`, which also keys the JAX window in
+    ``runtime.jax_support``), else the first device leg."""
+    from lxkit import leg_for_jax_platform, startup_gpu_leg
+    return startup_gpu_leg() or leg_for_jax_platform(_gpu_plugin_platform())
 
 
 def _device_visibility_envs() -> tuple:
@@ -2904,7 +2891,8 @@ def _enforce_supported_jax(say) -> None:
     the job non-zero with the message at the top of the log.
 
     There is no unsupported-version escape hatch.  JAX and JAXLIB must both
-    resolve to the 0.9 series for every driver invocation.
+    lie in the leg's ``runtime.jax_support.SUPPORTED_WINDOWS`` row (the 0.12
+    series; on ROCm also 0.9.1) for every driver invocation.
     """
     _enforce_jax_support(announce=say)
 
