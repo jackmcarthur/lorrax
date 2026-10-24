@@ -73,17 +73,27 @@ def test_capacity_inside_window_keeps_native_and_failure_mask(monkeypatch):
 
 
 def test_capacity_policy_workspace_includes_jaxlib_outside_window(monkeypatch):
-    _jax, owner, _plan = _setup(monkeypatch,72,4)
-    from distrib_la import workspace
+    jax, owner, _plan = _setup(monkeypatch,72,4)
+    from distrib_la import plan, workspace
+    from jax.sharding import Mesh
     monkeypatch.setattr(workspace,'mesh_platform',lambda _mesh:'ROCM')
-    mesh = object()  # Hashable cache key; only the patched platform is read.
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1,1),('x','y'))
     workspace.local_eigh_workspace.cache_clear()
     row = owner.BATCHED_EIGH_ROUTE['ROCM']
     win = row.windows['complex128']
     for n in (72,128):
+        # The real CPU plan requires no ROCm library; only its query surface
+        # is priced for ROCm, without allocating any matrix or workspace.
+        policy = plan('eigh',mesh,n=n,backend='off',batched_route='auto')
         expected = (win.workspace_tiles*n*n*16+n*8 if n<win.min_n else
                     owner.batched_workspace_bytes((1,n,n),np.complex128,'ROCM'))
         assert expected>0
         assert workspace.local_eigh_workspace(mesh,1,n,np.complex128)==expected
+        assert workspace.workspace_bytes_per_rank(
+            policy,'eigh',((n,n),),np.complex128)==expected
+        for share in (1,3):
+            assert workspace.workspace_bytes_per_rank(
+                policy,'eigh',((share,n,n),),np.complex128)==workspace.local_eigh_workspace(
+                    mesh,share,n,np.complex128)
     assert owner.batched_eigh_row((72,72),np.complex128,'ROCM') is None
     assert owner.batched_eigh_row((128,128),np.complex128,'ROCM') is not None

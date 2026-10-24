@@ -73,10 +73,9 @@ def _off_cuda(plan, op, shapes, dtype):
     if mesh_platform(plan.mesh) == 'ROCM' and op == 'eigh':
         n, ranks = int(shapes[0][-1]), int(plan.mesh.shape['x']) * int(plan.mesh.shape['y'])
         if local:
-            from distrib_la.local_eigh import batched_workspace_bytes
-            device = batched_workspace_bytes((1,) * (len(shapes[0]) == 2) + tuple(shapes[0]),
-                                             dtype, 'ROCM')
-            src = 'rocSOLVER batched row (local_eigh.BATCHED_EIGH_ROUTE)' if device else src
+            share = int(shapes[0][0]) if len(shapes[0]) == 3 else 1
+            device = local_eigh_workspace(plan.mesh, share, n, dtype)
+            src = 'local ROCm eigh workspace (local_eigh_workspace)' if device else src
         else:
             term = memory.vendor(leg_for_platform('ROCM'), plan.backend, 'eigh', n, ranks,
                                  dtype.itemsize)
