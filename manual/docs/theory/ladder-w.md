@@ -18,6 +18,28 @@ $$
 
 with $\sigma$ the occupation differences. With $H_\bq=H^{\mathrm{RPA}}$, the transition energies plus the Coulomb exchange, (1.1) is the RPA screened interaction. With $H_\bq=H^{\mathrm{BSE}}$, which adds the direct term of the statically screened interaction $W(0)$, it is the screened interaction with the full ladder of electron–hole attraction. The second choice is the vertex-corrected $W$ of quasiparticle self-consistent GW with ladder diagrams [4].
 
+### Spin-restricted scalar wavefunctions {: #scalar-spin }
+
+For a nonmagnetic closed shell without spin–orbit coupling, the BSE separates
+into a singlet and three equivalent triplets [5]. With positive bare exchange
+$V$ and screened direct attraction $W_d$, their resonant blocks are
+
+$$
+A_S=D+2V-W_d,\qquad A_T=D-W_d.
+$$
+
+The coupling blocks have the same exchange weights, 2 and 0. The charge
+vertex is the identity in spin space: it projects onto the normalized
+singlet with amplitude $\sqrt{2}$ and has zero projection onto every triplet.
+Consequently $W=v+v\chi_{nn}v$ needs only the singlet resolvent. The spin sum
+supplies the factor 2 in the charge response; it does not multiply the
+screened direct rung.
+
+This is the non-spinor `w_bse` route, including its head and moments. The
+optical `spin_triplet` flag selects a separate excitation problem. Adding
+triplet fluctuations to a self-energy requires specifying a spin-resolved
+vertex approximation beyond the present $\Sigma=iGW$ definition.
+
 ## <span class="n">2</span> Resolvent solves with matrix-free products {: #products }
 
 `bse.bse_stack_matvec.build_bse_stack_matvec`
@@ -62,3 +84,4 @@ The dense kernel would be needed at every irreducible $\bq$, and its diagonaliza
 2. G. Onida, L. Reining and A. Rubio, Rev. Mod. Phys. 74, 601 (2002). doi:10.1103/RevModPhys.74.601
 3. M. Shishkin, M. Marsman and G. Kresse, Phys. Rev. Lett. 99, 246403 (2007). doi:10.1103/PhysRevLett.99.246403
 4. B. Cunningham, M. Grüning, D. Pashov and M. van Schilfgaarde, Phys. Rev. B 108, 165104 (2023). doi:10.1103/PhysRevB.108.165104
+5. M. Marsili et al., [Phys. Rev. B 103, 155152 (2021)](https://doi.org/10.1103/PhysRevB.103.155152), §IV.B(iii), Eqs. (52)–(53).
