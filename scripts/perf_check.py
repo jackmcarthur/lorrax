@@ -850,7 +850,12 @@ def fatbin_inventory(path: str) -> dict:
 
 
 def cubin_arch(path: str) -> int | None:
-    """sm_XX of an NVRTC cubin (EM_CUDA ELF): the e_flags arch byte, either ABI."""
+    """sm_XX of a kernel image: the ``_sm<NN>_`` field of LORRAX's image names
+    (``kconv_m3_2x1x1_ns1_c64_sm80_<hash>.cubin``, an ``LRXK``-framed file, common/rtc_build.h),
+    else the e_flags arch byte of a bare EM_CUDA ELF, either ABI."""
+    m = re.search(r"_sm(\d{2,3})[a-z]?_", os.path.basename(path))
+    if m:
+        return int(m.group(1))
     try:
         with open(path, "rb") as fh:
             h = fh.read(64)
