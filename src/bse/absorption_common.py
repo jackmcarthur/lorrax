@@ -518,13 +518,20 @@ def window_transition_energies(data):
     ``de_cv`` is the velocity's own ΔE, the dipoles' denominator, and stays that
     (DFT energies on the ``eqp`` routes, 0.7 eV low on Si).
     """
+    ec, ev = window_band_energies(data)
+    return ec[:, :, None] - ev[:, None, :]
+
+
+def window_band_energies(data):
+    """The operator's window energies ``(eps_c (nk, nc), eps_v (nk, nv))`` in Ry
+    on the host, pad rows dropped, valence ascending."""
     def host(a):
         if getattr(a, "is_fully_addressable", True):
             return np.asarray(a)
         return np.asarray(a.addressable_data(0))          # replicated table
     nc, nv = int(data["n_cond"]), int(data["n_val"])
     ec, ev = host(data["eps_c"])[:, :nc], host(data["eps_v"])[:, :nv]
-    return (ec[:, :, None] - ev[:, None, :]).real.astype(np.float64)
+    return ec.real.astype(np.float64), ev.real.astype(np.float64)
 
 
 def build_dipole_vector_bse(d_alpha, n_cond_pad=None, n_val_pad=None):
@@ -832,6 +839,73 @@ def write_bgw_eigenvalues(directory, eigvals_eV, dipoles=None, *, n_spin,
                               n_spin=n_spin, n_spinor=n_spinor,
                               vol_supercell=vol_supercell, triplet=triplet)
         paths.append(str(directory / name))
+    return paths
+
+
+def bgw_noeh_lines(ec_eV, ev_eV, d_pol, *, n_spin: int, n_spinor: int,
+                   vol_supercell: float) -> list[str]:
+    """The lines of one BerkeleyGW ``eigenvalues*_noeh.dat`` (complex flavor).
+
+    BerkeleyGW ``BSE/absp_io.f90`` ``write_eigenvalues_noeh``::
+
+        write(10,'(a,i8)') '# neig  = ', neig
+        write(10,'(a,e16.9)') '# vol   = ', vol
+        write(10,'(a,5i8)') '# nspin, nspinor, nkpt, ncb, nvb = ', ...
+        '#   ik    ic    iv    is         ec (eV)         ev (eV)        eig (eV)'
+        // '   abs(dipole)^2      Re(dipole)      Im(dipole)'
+        do ik; do ic; do iv; do is
+          write(10,'(4i6,6e16.8)') ik, ic, iv, is, ec, ev, ec - ev, |s0|^2, s0
+
+    ``ec_eV`` ``(nk, nc)`` and ``ev_eV`` ``(nk, nv)`` are the operator's window
+    energies (QP where corrected) with the valence axis in LORRAX's ascending
+    order; BerkeleyGW counts ``iv`` down from the VBM, so ``iv = 1`` is the
+    last LORRAX valence band.  ``d_pol`` ``(nk, nc, nv)`` is ``ê·d`` of the
+    window dipoles ``⟨ck|v̂|vk⟩/ΔE``, BerkeleyGW's ``s0``.  One spin channel
+    (``is = 1``); ``vol_supercell`` is ``N_k V_cell`` as in ``eigenvalues*.dat``.
+    """
+    ec = np.asarray(ec_eV, dtype=np.float64)
+    ev = np.asarray(ev_eV, dtype=np.float64)
+    d = np.asarray(d_pol, dtype=np.complex128)
+    nk, nc = ec.shape
+    nv = int(ev.shape[1])
+    if d.shape != (nk, nc, nv):
+        raise ValueError(f"bgw_noeh_lines: dipoles {d.shape} for window ({nk}, {nc}, {nv})")
+    lines = [f"# neig  = {nk * nc * nv:8d}",
+             f"# vol   = {fortran_e(vol_supercell, 16, 9)}",
+             "# nspin, nspinor, nkpt, ncb, nvb = "
+             + "".join(f"{int(x):8d}" for x in (n_spin, n_spinor, nk, nc, nv)),
+             "#   ik    ic    iv    is         ec (eV)         ev (eV)        eig (eV)"
+             "   abs(dipole)^2      Re(dipole)      Im(dipole)"]
+    for ik in range(nk):
+        for ic in range(nc):
+            for iv in range(nv):
+                c, v, s = ec[ik, ic], ev[ik, nv - 1 - iv], d[ik, ic, nv - 1 - iv]
+                lines.append(f"{ik + 1:6d}{ic + 1:6d}{iv + 1:6d}{1:6d}" + "".join(
+                    fortran_e(x, 16, 8)
+                    for x in (c, v, c - v, float(np.abs(s) ** 2), s.real, s.imag)))
+    return lines
+
+
+def write_bgw_eigenvalues_noeh(directory, ec_eV, ev_eV, d_alpha, *, n_spin,
+                               n_spinor, vol_supercell, directions=None,
+                               labels=None) -> list[str]:
+    """BerkeleyGW's non-interacting transitions, one file per polarization:
+    ``eigenvalues_noeh.dat`` for a deck ``polarization`` (label ``e``),
+    ``eigenvalues_b1_noeh.dat`` .. ``_b3`` for the three axes
+    (:func:`bgw_noeh_lines`).  ``d_alpha`` ``(3, nk, nc, nv)`` Cartesian.
+    Returns the paths written."""
+    directory = Path(directory)
+    if directions is None:
+        directions, labels = np.eye(3), BGW_POLARIZATION_SUFFIXES
+    d = project_dipoles(np.asarray(d_alpha, dtype=np.complex128), directions)
+    paths = []
+    for name, d_pol in zip(eigenvalue_file_names(labels), d):
+        path = directory / name.replace(".dat", "_noeh.dat")
+        with open(str(path), "w") as f:
+            f.write("\n".join(bgw_noeh_lines(
+                ec_eV, ev_eV, d_pol, n_spin=n_spin, n_spinor=n_spinor,
+                vol_supercell=vol_supercell)) + "\n")
+        paths.append(str(path))
     return paths
 
 
