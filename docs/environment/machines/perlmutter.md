@@ -33,10 +33,10 @@ P = 64 cold versus P = 16 cold (maximum QP1 difference 0.671 µeV) and for
 P = 64 warm versus cold (0.515 µeV). Every warm rank reports zero new
 driver backend compilations, with startup counted separately.
 
-Those full CPU runs use frozen source `ed16e34dd`, NumPy 2.4.3 and SciPy
+Those P = 64 runs use frozen source `ed16e34dd`, NumPy 2.4.3 and SciPy
 1.17.1 (job 60223103), four physical cores per rank and two BLAS/OpenMP
-threads. This qualifies that private nightly environment; the default lock
-is unchanged and the released 0.12.0.1 CPU P = 64 failure remains.
+threads. This qualifies that private nightly environment; the default JAX
+pin remains 0.12.0.1 and its CPU P = 64 failure remains.
 P = 144, including the former compiler/VMA limit, remains uncertified.
 
 ## GPU task geometry {#required-gpu-task-geometry}
