@@ -82,10 +82,12 @@ REFERENCE: dict = {
         "import_s": 18.6, "compile_cold_s": 7.64, "compile_warm_s": 0.693,
         "nvrtc_s": 5.83, "gemm_tflops": 19.26, "fft_ms": 1.025, "host_gemm_s": None,
     },
-    # Not measured (the calibration allocation was hbm80g): components 1-5 judge alone.
+    # job 60190769, nid002136, 2026-10-23, 581a81831, n=3: compile_cold 7.68/7.75/8.02 s,
+    # warm 0.696-0.703, NVRTC 5.75/6.78/7.03 (22%), GEMM 19.28-19.29, FFT 1.240-1.241 ms,
+    # import 3.7/3.8/10.6 s (first touch).
     "NVIDIA A100-SXM4-40GB": {
-        "import_s": None, "compile_cold_s": None, "compile_warm_s": None,
-        "nvrtc_s": None, "gemm_tflops": None, "fft_ms": None, "host_gemm_s": None,
+        "import_s": 10.6, "compile_cold_s": 7.75, "compile_warm_s": 0.699,
+        "nvrtc_s": 6.78, "gemm_tflops": 19.29, "fft_ms": 1.240, "host_gemm_s": None,
     },
 }
 #: A metric fails when it is worse than reference by more than this fraction...
@@ -107,8 +109,11 @@ OPEN_WALL_BUDGET_S = 25.0
 WALK_FAIL_PER_S = 5000.0
 WALK_MAX_ENTRIES = 20000
 WALK_BUDGET_S = 8.0
-#: Fewer NVRTC images for this GPU than this in the run's cache + store = no store.
+#: NVRTC images for this GPU in the run's cache + store: fewer than MIN = no store (FAIL);
+#: fewer than FULL = incomplete (WARN; the hsuite grids alone are ~60 images, the full
+#: build_cubin_store table 389).
 MIN_STORE_IMAGES = 10
+FULL_STORE_IMAGES = 50
 #: Filesystem types that are slow for many-small-file/exec workloads when they
 #: hold the runtime (diagnosis wording only; numbers decide).
 NETWORK_FS = {"dvs", "nfs", "nfs4", "gpfs", "lustre", "cifs", "smb3", "fuse.sshfs",
@@ -1319,6 +1324,10 @@ def judge_caches(caches: dict, ranks: list[dict]) -> dict:
                          "kernel was NVRTC-built, not loaded: the image key (toolchain, headers) does not "
                          f"match this install; rebuild: {build_cmd}")
         else:
+            if n_sm < FULL_STORE_IMAGES:
+                st = worst(st, "WARN")
+                lines.append(f"cubin store incomplete: {n_sm} images for sm_{sm} (the full table is 389); "
+                             f"kernels outside it NVRTC-build on first use: run {build_cmd}")
             lines.append(f"cubin images for sm_{sm}: {where}; probe kernels "
                          f"{'loaded from the cache' if not built else 'partly built: ' + ','.join(built)} "
                          f"({fmt(spr.get('s'), '.1f')} s)")

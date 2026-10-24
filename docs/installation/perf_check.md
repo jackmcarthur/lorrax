@@ -64,7 +64,8 @@ published `lorrax_A` module on `/global/common` (JAX 0.9.1).
 
 | install, node | warm open ms | venv walk /s | cold XLA compile, 36 programs | NVRTC build | verdict |
 |---|---|---|---|---|---|
-| fast, GPU node, n = 3 | 0.015–0.157 | 20,234–20,670 | 7.63–7.97 s (spread 4.4%) | 5.8–6.6 s | PASS |
+| fast, GPU node (80 GB A100), n = 3 | 0.015–0.157 | 20,234–20,670 | 7.63–7.97 s (spread 4.4%) | 5.8–6.6 s | PASS |
+| fast, GPU node (40 GB A100), n = 3 | 0.015–0.155 | 20,535–20,907 | 7.68–8.02 s | 5.8–7.0 s | PASS; the first run is `lorrax-postinstall`'s, and it wrote the stamp |
 | module, GPU node, n = 2 | 3.27–3.93 | 587–988 | 11.8–12.3 s (1.5–1.6x) | 16.5–32.6 s | FAIL: slow filesystem |
 | fast, CPU node, n = 5 | 0.015–0.24 | — | — | — | PASS (CPU only) |
 | module, CPU node, n = 5 | 1.37–4.6 | — | — | — | FAIL: slow filesystem |
