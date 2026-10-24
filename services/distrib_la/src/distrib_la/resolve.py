@@ -632,14 +632,19 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
         # no-P-scaling wall this name exists to escape.
         requested = _DISTRIBUTED_DEFAULT.get((op, mesh_platform(mesh_xy)))
         if requested is None:
-            room_leg = (op, mesh_platform(mesh_xy)) in ONE_DEVICE_BY_ROOM
+            platform = mesh_platform(mesh_xy)
+            if (op, platform) in ONE_DEVICE_BY_ROOM:
+                from distrib_la._one_device import one_device_bytes
+                need = ("" if n is None else
+                        f": n={int(n)} needs {one_device_bytes(op, int(n)) / 1e9:.2f} GB/rank")
+                raise ValueError(
+                    f"{op} on {platform} has no distributed library, only one whole matrix per "
+                    f"device within the caller's room (budget_bytes"
+                    f"{'; none given' if room is None else ''}){need}; use fewer ISDF "
+                    f"centroids, more device memory per rank, or a CUDA run.")
             raise ValueError(
-                f"{op} backend 'distributed' has no default backend on "
-                f"platform {mesh_platform(mesh_xy)!r} "
-                f"(defined for: {sorted(_DISTRIBUTED_DEFAULT)})"
-                + (f"; on this leg it is the room route alone: n={n} needs the caller's "
-                   f"room per rank (budget_bytes) and one whole matrix's one-device "
-                   f"program within it" if room_leg else "") + ".")
+                f"{op} backend 'distributed' is not available on platform {platform!r} "
+                f"(it is defined for {sorted(_DISTRIBUTED_DEFAULT)}); use backend 'native'.")
     if requested == "auto":
         if op == "eigh" or mesh_is_cpu(mesh_xy):
             return NATIVE
