@@ -235,3 +235,64 @@ def test_temporary_operator_digest_does_not_retain_static_rung():
     held = np.eye(2)[None]
     assert ns["operator_digest"](held, mesh) == expected
     assert ns["_OPERATOR_DIGESTS"][id(held)][0] is held
+
+
+def test_registered_restart_publishes_current_head_through_common_receipt_owner(tmp_path):
+    """A reused body must not leave the preceding head certificate on disk."""
+    enums = _enums()
+    model = tmp_path / 'model.h5'
+    model.write_bytes(b'authenticated-body-owned-by-restart-validator')
+    before = model.read_bytes()
+    receipt = tmp_path / 'head_receipt.json'
+    receipt.write_text('{"provenance":{"head_fit_policy":"old"}}\n')
+    identity = dict(screening_diagrams='w_bse', ladder_static_head={'shift': .01})
+    current = dict(completion=True, body_digest='same-body',
+        Omega_p=np.array([.2]), B_p=np.array([.3+0j]),
+        provenance=dict(head_fit_policy='current', head_identity=identity))
+    iteration = object()
+    calls = []
+    def transact(path, *, stage, write):
+        calls.append((Path(path), stage))
+        return write()
+    handle = dict(path=str(model), identity=identity, digest='same-body')
+    modules = {
+        'gw_config': NS(uses_full_bispinor_tangential=lambda _c: False,
+                        HeadCorrection=enums['HeadCorrection']),
+        'ppm_pipeline': NS(observing_window_source=lambda: False,publish_window_source=None),
+        'file_io.tangential_store': NS(initialize_tangential_bank=None),
+        'file_io.tagged_arrays': NS(register_tangential_restart_member=None),
+        'tangential_recipe': NS(tangential_restart_handle=lambda *a, **k: handle),
+        'tangential_constructor': NS(construct_tangential_poles=None),
+        'w_isdf': NS(produce_w_bank=None, compute_response_moments=None),
+        'tangential_head': NS(build_tangential_head=lambda *a, **k: (current, iteration)),
+        'common.collectives': NS(rank0_transaction=transact),
+    }
+    ns = dict(__builtins__=_imports(modules), np=np, json=json, Path=Path,
+        time=time, timing=NS(section=lambda *a, **k: nullcontext()),
+        log=NS(debug=lambda *a: None), tangential_identity=lambda *a, **k: dict(identity))
+    _definitions('src/gw/tangential_screening.py',
+                 {'_json', '_record_receipt', 'screen_tangential_poles'}, ns)
+    config = NS(screening=NS(diagrams='w_bse'), restart=True,
+        debug=NS(write_w=False), write_poles=False,
+        head=NS(correction=enums['HeadCorrection'].FULL))
+    meta = NS(tangential_recipe={}, tangential_capacity=NS(live_stages=()))
+    source = dict(identity=lambda: {}, head=lambda: object())
+    result = ns['screen_tangential_poles'](None, None, meta, config,
+        mesh_xy=None, sym=None, centroid_indices=[], run_dir='not-used',
+        label='oneshot', wfn=None, wfn_fingerprint_binding=None,
+        tensors_filename='restart.h5', occupation_state=None,
+        print_fn=lambda *a: None, bank_source=source, material_class='insulator')
+    stored = json.loads(receipt.read_text())
+    assert stored['provenance']['head_fit_policy'] == 'current'
+    assert stored['provenance']['head_identity'] == identity
+    assert stored['B_p'] == [{'real': .3, 'imag': 0.}]
+    assert result['mpa_head'] is current and result['iteration_head'] is iteration
+    assert calls == [(receipt, 'tangential.receipt.head')]
+    assert model.read_bytes() == before
+    # Receipt I/O failure reaches the caller rather than returning success
+    # with a new live head beside an old on-disk certificate.
+    def fail(*a, **k):
+        raise OSError('receipt write failed')
+    modules['common.collectives'] = NS(rank0_transaction=fail)
+    with pytest.raises(OSError, match='receipt write failed'):
+        ns['_record_receipt'](tmp_path, 'head', current)

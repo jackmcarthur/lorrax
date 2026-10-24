@@ -94,6 +94,16 @@ def _json(value):
     return json.dumps(value, default=encode, sort_keys=True, allow_nan=False)
 
 
+def _record_receipt(root, stage, receipt):
+    """Publish a current stage receipt with the shared all-rank I/O verdict."""
+    from common.collectives import rank0_transaction
+    path = Path(root) / (stage + "_receipt.json")
+    rank0_transaction(path, stage=f"tangential.receipt.{stage}",
+                      write=lambda: path.write_text(_json(receipt) + "\n"))
+    log.debug(f"tangential {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
+              f"seconds={receipt.get('seconds', {})}")
+
+
 def _authenticated_constructor_resume(root, identity, recipe, *, photon=False, coulomb_sha256=None):
     """Authenticate a complete producer bank before preserving it.
 
@@ -631,6 +641,7 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                                   else iteration_head_response), head_resolver=head_resolver,
                         plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
                     result.update(mpa_head=head, iteration_head=iteration_head)
+                    _record_receipt(Path(handle["path"]).parent, "head", head)
                 # The export is written only once the map is complete, so an
                 # export on disk always implies a finished head.  Under SC
                 # this branch is unreachable (``sc_scratch`` skips restart).
@@ -796,12 +807,7 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             # broadcasts its verdict, exactly as the sibling write above.
             receipts[stage] = receipt
             recorded.add(stage)
-            path = root / (stage + "_receipt.json")
-            rank0_transaction(
-                path, stage=f"tangential.receipt.{stage}",
-                write=lambda: path.write_text(_json(receipt) + "\n"))
-            log.debug(f"tangential {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
-                     f"seconds={receipt.get('seconds', {})}")
+            _record_receipt(root, stage, receipt)
     with timing.section("spole.bank"):
         if resume_constructor:
             log.debug('tangential bank: not produced; '
