@@ -430,8 +430,7 @@ class SlabIO:
         **its sharding is read from ``A.sharding``** — this method does
         not reshard, gather or replicate, and each rank contributes
         exactly the tile it already holds.  A replicated axis is
-        de-duplicated to one canonical writer
-        (``LORRAX_PHDF5_DEDUP_REPLICAS``), because overlapping hyperslab
+        de-duplicated to one canonical writer, because overlapping hyperslab
         selections are undefined under collective MPI-IO.
 
         ``offset`` (default all zeros) is where the slab starts in the

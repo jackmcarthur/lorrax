@@ -46,7 +46,7 @@ namespace lorrax_ffi::phdf5 {
 // and read_ffi.cc could not see it -- so the former timing flag was written as
 // a bare `getenv(...) != nullptr` presence test, in which `=0` turns
 // timing ON.  That is the same defect this project already post-mortems
-// for the Python driver debug switch and LORRAX_EXIT_AFTER_ZETA
+// for the Python driver debug switch and a retired early-exit switch
 // docstring).  A grammar only one file can reach is a grammar the next
 // file will re-invent wrongly.
 inline bool env_flag(const char* name, bool default_value) {
@@ -225,26 +225,19 @@ struct LORRAX_PHDF_CTX_TYPE {
     std::deque<std::function<void()>> task_queue;
     bool                              shutdown_flag = false;
 
-    // Tuning flags, read from env at open time.  Default: collective
-    // reads AND collective writes (two-phase aggregation; the strided
-    // 2-D tile pattern of the production writes is ~3 orders faster
-    // collective — scorecard AI — and the default now matches the
-    // Python phdf5_host writer so LORRAX_PHDF5_COLLECTIVE_WRITES=0
-    // means "independent" in every writer.  Historical Cray-MPICH
-    // caution: ad_cray_write_coll.c:669 OOM at >~1 GB/rank on that
-    // stack — use the env override there).  Metadata defaults to
+    // Transfer modes, set at open time: collective reads AND collective
+    // writes (two-phase aggregation; the strided 2-D tile pattern of the
+    // production writes is ~3 orders faster collective — scorecard AI —
+    // as in the Python phdf5_host writer).  Metadata is
     // non-collective so file-level ops (H5Dcreate/extend) bypass the
     // collective driver; non-collective metadata was also measured
-    // ~100 ms faster on OpenMPI small writes.  dedup_replicas
-    // drops all-but-one writer of a replica group's identical
-    // hyperslab (mesh axes not consumed by the array's sharding):
-    // required for correctness under collective writes (overlapping
-    // selections are undefined) and pure waste-removal under
-    // independent writes.  LORRAX_PHDF5_DEDUP_REPLICAS=0 disables.
+    // ~100 ms faster on OpenMPI small writes.  Writes always
+    // drop all-but-one writer of a replica group's identical hyperslab
+    // (write_ffi.cc): required for correctness under collective writes
+    // (overlapping selections are undefined).
     bool   use_collective_read  = true;
     bool   use_collective_write = true;
     bool   coll_metadata        = false;
-    bool   dedup_replicas       = true;
     size_t align_threshold   = 1 << 20;          // 1 MiB
     size_t align_length      = 1 << 20;
 };
@@ -272,7 +265,7 @@ void retire_read_buf(PhdfCtx* ctx);
 
 // After a synchronous read: keep ``read_buf`` for the next read when it is
 // within the per-file bound (32 MiB) or when it fits the process-wide
-// retained budget (``LORRAX_PHDF5_READ_STAGING_RETAIN_MB``, default 256);
+// retained budget (256 MiB);
 // otherwise retire it.  A buffer above the per-file bound used to be
 // retired after every read and re-pinned by the next: the Fe V2 tangential
 // constructor paid 16 x ~50 MB re-pins per run, 0.25 s of handler time on

@@ -132,7 +132,6 @@ __all__ = [
     "sweep_local_k",
     "gather_k_blocks",
     "sweep_lookahead",
-    "SWEEP_LOOKAHEAD_ENV",
     # impl=mpi clique warm-up
     "warm_mesh_cliques",
 ]
@@ -1067,45 +1066,15 @@ def gather_indexed_blocks_to_owner(local_vals, local_idx, n_total: int):
 # carries each item's index with it, so the assignment is free to be any
 # permutation.
 
-#: Host-ahead-of-device depth for :func:`sweep_local_k`.  Named for the
-#: driver it was first measured on, and KEPT at that name because the live
-#: D10 harness (``wk_REL/d10_inner.sh``) sets it to run the un-pipelined
-#: control cell.
-SWEEP_LOOKAHEAD_ENV = "LORRAX_KIN_ION_LOOKAHEAD"
-
+#: Host-ahead-of-device depth for :func:`sweep_local_k`.
 _DEFAULT_LOOKAHEAD = 2
 
 
 def sweep_lookahead() -> int:
-    """The resolved :func:`sweep_local_k` lookahead depth (>= 1, default 2).
-
-    ``1`` restores the serialised behaviour (no read/compute overlap) and
-    exists so the overlap's contribution can be MEASURED against the
-    pipelined default rather than asserted.
-
-    Malformed input REFUSES, naming the variable — the same rule
-    ``common.timing`` applies to the fixed driver-debug trace depth.  The parse
-    this replaces swallowed ``ValueError`` and returned the default, so
-    ``LORRAX_KIN_ION_LOOKAHEAD=one`` silently ran the PIPELINED path while
-    the operator believed the control cell had disabled it, and a control
-    that measures the same thing twice is worse than no control.
-    """
-    import os
-
-    raw = os.environ.get(SWEEP_LOOKAHEAD_ENV, "").strip()
-    if not raw:
-        return _DEFAULT_LOOKAHEAD
-    try:
-        depth = int(raw)
-    except ValueError:
-        depth = 0                    # falls into the refusal below, with raw
-    if depth < 1:
-        raise ValueError(
-            f"{SWEEP_LOOKAHEAD_ENV}={raw!r} is not a usable depth.  It is how "
-            f"many k the host may run ahead of the device in the per-k sweep: "
-            f"an integer >= 1, where 1 disables the read/compute overlap "
-            f"(default {_DEFAULT_LOOKAHEAD}).")
-    return depth
+    """The :func:`sweep_local_k` lookahead depth (2).  A caller measuring the
+    overlap passes ``lookahead=1`` to :func:`sweep_local_k` (no read/compute
+    overlap)."""
+    return _DEFAULT_LOOKAHEAD
 
 
 def local_share(items):

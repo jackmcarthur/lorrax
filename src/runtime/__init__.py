@@ -293,13 +293,6 @@ def bootstrap(*, platform: str = "gpu") -> None:
 #: plain tf32 and still short of fp32.
 _MATMUL_PINNED = ("highest", "float32")
 
-#: Announced escape for A/B measurement of the precision itself.  Named
-#: rather than silent, per the "the required layer never demotes silently"
-#: rule the FFI gate states.  Any value other than one of
-#: :data:`_MATMUL_PINNED` REFUSES: a typo in a precision knob must not
-#: resolve to TF32 by falling through.
-_MATMUL_PRECISION_ENV = "LORRAX_MATMUL_PRECISION"
-
 
 def read_matmul_precision():
     """The RESOLVED ``jax_default_matmul_precision``, normalised to a token.
@@ -349,8 +342,8 @@ def pin_matmul_precision() -> str:
     PINNING IS FREE AT THE PRODUCTION BLOCK WIDTH: the same matvec is
     3.425 ms at DEFAULT and 3.406 ms at ``highest`` for ``nb=1`` (it costs
     8 % at nb=2 and 46 % at nb=4, which matters only if a blocked
-    matrix-RHS Arnoldi ever lands — that caller can set
-    ``LORRAX_MATMUL_PRECISION`` and take the measurement with it).
+    matrix-RHS Arnoldi ever lands — that caller can take the measurement
+    with a scoped ``jax.default_matmul_precision``).
 
     ``float64`` is untouched either way: f64 dots have no TF32 path, so
     this moves only the low-precision arm and no existing f64/c128 result
@@ -361,17 +354,7 @@ def pin_matmul_precision() -> str:
     the first TRACE rather than before the first import (the config is read
     at lowering time).
     """
-    requested = os.environ.get(_MATMUL_PRECISION_ENV, "").strip().lower()
-    if requested and requested not in _MATMUL_PINNED:
-        raise ValueError(
-            f"{_MATMUL_PRECISION_ENV}={requested!r} is not one of "
-            f"{_MATMUL_PINNED}.  This knob decides whether f32/c64 dots run "
-            f"at fp32 or at TensorFloat32 (a measured 1.9e-04 vs 3.2e-07 "
-            f"forward error on the BSE ladder matvec), so an unrecognised "
-            f"value is refused rather than silently left at XLA's TF32 "
-            f"default.  'high' is deliberately NOT accepted: on XLA:GPU it "
-            f"is a 3-pass tf32 decomposition, not fp32.")
-    precision = requested or "highest"
+    precision = "highest"
     jax = _import_jax()
     jax.config.update("jax_default_matmul_precision", precision)
     return precision
@@ -434,11 +417,8 @@ def install_failfast_excepthook() -> None:
     look like success now looks like a failure.
 
     No-op in single-process runs (normal traceback + rc 1 already works,
-    and ``os._exit`` would suppress useful teardown).  Opt out with
-    ``LORRAX_FAILFAST=0``.
+    and ``os._exit`` would suppress useful teardown).
     """
-    if _env_falsy("LORRAX_FAILFAST"):
-        return
     if _resolve_proc_count() <= 1:
         return
 
@@ -451,8 +431,7 @@ def install_failfast_excepthook() -> None:
 
     def _failfast(exc_type, exc_value, exc_tb):
         # SystemExit never reaches sys.excepthook, so an intentional
-        # ``raise SystemExit(0)`` (e.g. LORRAX_EXIT_AFTER_ZETA) is
-        # unaffected by this hook.
+        # ``raise SystemExit(0)`` is unaffected by this hook.
         rank = _resolve_proc_id()
         n = _resolve_proc_count()
         # Emit on BOTH streams: under srun+apptainer, stderr written just
@@ -467,7 +446,7 @@ def install_failfast_excepthook() -> None:
             f"*** Exiting rc=1 WITHOUT teardown so this failure reaches "
             f"the job's exit code.  Peer ranks are blocked in a "
             f"collective this rank will never join; srun will now kill "
-            f"the step.  (Disable with LORRAX_FAILFAST=0.)\n\n")
+            f"the step.\n\n")
         # Production drivers intentionally route ordinary ``sys.stdout`` to
         # /dev/null.  Ask that runtime boundary for the original launcher
         # stream so the redundant stdout copy remains real; this is lazy to
@@ -1175,8 +1154,6 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
        the clock.  A run on a real GPU node NEVER reaches arm 2: the device
        nodes exist, and the CUDA driver cannot work without them.
 
-    Opt out with ``LORRAX_CPU_SKIP_GPU_PLUGINS=0``; the opt-out announces
-    itself, because "startup got a minute slower" is otherwise invisible.
     """
     plat = os.environ.get("JAX_PLATFORMS", "").strip().lower()
     plats = [p.strip() for p in plat.split(",") if p.strip()]
@@ -1204,21 +1181,6 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
         # No platform stated at all, or a GPU is stated and present: leave
         # jax's discovery exactly as it is.  Guessing here would be the one
         # way this function could cost someone a GPU.
-        return False
-
-    if _env_falsy("LORRAX_CPU_SKIP_GPU_PLUGINS"):
-        _record_demotion(
-            "LORRAX_CPU_SKIP_GPU_PLUGINS is off, so jax discovered and "
-            "loaded the CUDA PJRT plugin on this CPU-only run, which "
-            "measured 76.9 s of extra cold start on a Frontera node "
-            "(job 7882076).")
-        if announce:
-            _gpu_plugin_say(
-                "[runtime] LORRAX_CPU_SKIP_GPU_PLUGINS=0: jax will discover "
-                "and load the CUDA PJRT plugin on this CPU-only run.  "
-                "Measured cost of loading it on a cold Frontera node: 76.9 s "
-                "(job 7882076, cell c4_knob0 -- 10.5 s to this line, 87.4 s to "
-                "cuInit failing).")
         return False
 
     import sys
@@ -1275,13 +1237,12 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
     _record_demotion(
         f"GPU PJRT plugin discovery was skipped ({arm}), so no CUDA library "
         f"was loaded; the measured saving on a cold Frontera node is 76.9 s "
-        f"(job 7882076), and LORRAX_CPU_SKIP_GPU_PLUGINS=0 restores it.")
+        f"(job 7882076).")
     if announce:
         _gpu_plugin_say(
             f"[runtime] {arm}: skipping GPU PJRT plugin discovery (no CUDA "
             f"libraries are loaded; measured 76.9 s of cold start on "
-            f"Frontera, job 7882076).  LORRAX_CPU_SKIP_GPU_PLUGINS=0 "
-            f"restores it.")
+            f"Frontera, job 7882076).")
     if plats != ["cpu"]:
         # Arm 2: this IS the CPU demotion, taken early.  Do the rest of what
         # fallback_to_cpu_if_no_gpu_backend() does on demotion, so the run's
@@ -1311,7 +1272,7 @@ def tune_blas_threading() -> bool:
     ``tests/test_runtime_blas_env.py`` holds that order.  A copy mapped
     before (numpy imported first) cannot be tuned in-process: GATE blas_spin
     in :func:`bootstrap` refuses that process unless the launch exported the
-    variable or ``LORRAX_BLAS_TUNE=0`` declines the tuning.
+    variable.
 
     WHY, the cost, and the per-library witness: ``runtime.blas_env``.
     """
@@ -1357,29 +1318,14 @@ def tune_glibc_malloc() -> bool:
     within noise (~4% on the r-chunk wall at 40 nodes), and steady-state RSS
     dropped 2.3 -> 1.7 GB/rank as a bonus.
 
-    Knobs: ``LORRAX_MALLOC_TUNE=0`` disables; ``LORRAX_MALLOC_MMAP_MB`` /
-    ``LORRAX_MALLOC_TRIM_MB`` override the thresholds (MB).
+    Thresholds: ``M_MMAP_THRESHOLD`` 1 MiB, ``M_TRIM_THRESHOLD`` 128 MiB.
     """
-    if _env_falsy("LORRAX_MALLOC_TUNE"):
-        _MALLOC_TUNE.update(applied=False,
-                            reason="disabled by LORRAX_MALLOC_TUNE")
-        _record_demotion(
-            "glibc malloc tuning is DISABLED by LORRAX_MALLOC_TUNE, so long "
-            "XLA:CPU runs regain the per-r-chunk RSS ramp that OOM-killed "
-            "jobs 7874803, 7875070 and 7875071 (workstream T).")
-        if _resolve_proc_id() == 0:
-            print("[runtime] glibc malloc tuning DISABLED by "
-                  "LORRAX_MALLOC_TUNE: long XLA:CPU runs regain the "
-                  "per-r-chunk RSS ramp this tuning removes (workstream T).",
-                  flush=True)
-        return False
     reason = None
     mmap_mb = trim_mb = None
     try:
         import ctypes
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        mmap_mb = int(os.environ.get("LORRAX_MALLOC_MMAP_MB", "1"))
-        trim_mb = int(os.environ.get("LORRAX_MALLOC_TRIM_MB", "128"))
+        mmap_mb, trim_mb = 1, 128
         ok = libc.mallopt(_M_MMAP_THRESHOLD, mmap_mb * 1024 * 1024)
         ok &= libc.mallopt(_M_TRIM_THRESHOLD, trim_mb * 1024 * 1024)
         if not ok:
@@ -2766,8 +2712,8 @@ def default_blas_threads() -> str | None:
     Tempting, and why not: "all available threads" -- that is what unset
     means, and it is the slow case; or setting OMP_NUM_THREADS here too --
     OpenMP runtimes already initialised in the FFI handlers do not re-read
-    it, and the handlers have their own caps (LORRAX_MKLBLAS_THREADS,
-    LORRAX_SCALAPACK_MKL_THREADS).
+    it, and the handlers have their own caps (LORRAX_MKLBLAS_THREADS, and
+    the ScaLAPACK handlers' fixed cap of 4).
     """
     if _BLAS_AUTO:
         return _BLAS_AUTO[0]
@@ -2866,8 +2812,6 @@ def _thread_env() -> dict:
         "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS"),
         "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS"),
         "LORRAX_MKLBLAS_THREADS": os.environ.get("LORRAX_MKLBLAS_THREADS"),
-        "LORRAX_SCALAPACK_MKL_THREADS": os.environ.get(
-            "LORRAX_SCALAPACK_MKL_THREADS"),
     }
 
 
@@ -3124,7 +3068,6 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
     # therefore have thrown on every call and this field would have been
     # silently unmeasurable.
     f["matmul_precision"] = read_matmul_precision()
-    f["matmul_precision_env"] = os.environ.get(_MATMUL_PRECISION_ENV)
     f["xla_gpu_autotune"] = dict(_XLA_GPU_AUTOTUNE)
     f["jax_version"] = getattr(jax, "__version__", "unknown")
     f["jaxlib_version"] = getattr(jaxlib, "__version__", "unknown")
@@ -3251,7 +3194,6 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
     f["blas_tune"] = dict(_BLAS_TUNE)
     import sys as _sys
     f["failfast"] = bool(getattr(_sys, "_lorrax_failfast_installed", False))
-    f["failfast_env"] = os.environ.get("LORRAX_FAILFAST")
     return f
 
 
@@ -3334,10 +3276,8 @@ def format_startup_report(f: dict) -> list:
     _mp = f.get("matmul_precision")
     if _mp in _MATMUL_PINNED:
         add(f"  Default matmul precision is pinned to {_mp!r}, so f32 and "
-            f"complex64 dots run at fp32 rather than TensorFloat32"
-            + (f" (LORRAX_MATMUL_PRECISION={f.get('matmul_precision_env')!r})."
-               if f.get("matmul_precision_env") else "; f64/c128 is "
-               "unaffected either way."))
+            f"complex64 dots run at fp32 rather than TensorFloat32; "
+            f"f64/c128 is unaffected either way.")
     else:
         add(f"  WARNING: jax_default_matmul_precision resolved to {_mp!r}, "
             f"which is NOT one of {_MATMUL_PINNED}.  On XLA:GPU every f32 "
@@ -3583,9 +3523,7 @@ def format_startup_report(f: dict) -> list:
     add(f"  Inside the FFI handlers the BLAS team size is "
         f"LORRAX_MKLBLAS_THREADS={t.get('LORRAX_MKLBLAS_THREADS')!r} for the "
         f"batched GEMM, where unset means the ambient thread count, and "
-        f"LORRAX_SCALAPACK_MKL_THREADS="
-        f"{t.get('LORRAX_SCALAPACK_MKL_THREADS')!r} for the ScaLAPACK "
-        f"handlers, where unset means a cap of 4 because pzheevd measured "
+        f"a cap of 4 for the ScaLAPACK handlers, because pzheevd measured "
         f"11.28 s per q at 14 MKL threads against 0.463 s at 4.")
     aff = t.get("affinity")
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
@@ -3644,9 +3582,8 @@ def format_startup_report(f: dict) -> list:
             "leaving its peers blocked in a collective that rank will never "
             "join.")
     elif P > 1:
-        add(f"  WARNING: the fail-fast excepthook is NOT installed "
-            f"(LORRAX_FAILFAST={f.get('failfast_env')!r}), so a rank that "
-            f"dies can leave the job hanging and still exit rc=0.")
+        add("  WARNING: the fail-fast excepthook is NOT installed, so a "
+            "rank that dies can leave the job hanging and still exit rc=0.")
     else:
         add("  The fail-fast excepthook is not installed because a "
             "single-process run already fails with a traceback and rc=1.")

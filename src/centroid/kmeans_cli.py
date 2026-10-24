@@ -628,8 +628,7 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
         prune_rank = int(rank)
 
         log.info(f"  [point rank] {rank}/{n_unique} delivered centroid "
-                 "directions certified; rank deficiency is reported, while "
-                 "LORRAX_CENTROID_SELECT=strict makes it a refusal")
+                 "directions certified; rank deficiency is reported")
         row("pivots", f"{int(rank)} independent of {n_unique} kept, from the "
                       f"{n_pool}-point pool")
     elif stages.total == 3:

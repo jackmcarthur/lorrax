@@ -93,9 +93,8 @@ class PhotonBasisLayout:
     ) -> "PhotonBasisLayout":
         """Layout for logical centroid extents, padded here; or, with
         ``packed=True``, for extents that are already packed carriers
-        (``PackedCentroidBasis.n_packed``: orbit packing and the test-only
-        ``LORRAX_EXTRA_MU_PAD`` rows included), which are not padded again.
-        Without the knob the two agree whenever the extent divides the mesh.
+        (``PackedCentroidBasis.n_packed``: orbit packing included), which are
+        not padded again.  The two agree whenever the extent divides the mesh.
         """
         px = int(mesh_xy.shape['x'])
         py = int(mesh_xy.shape['y'])

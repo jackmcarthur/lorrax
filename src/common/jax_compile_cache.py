@@ -92,22 +92,6 @@ def _deadline_text(timeout_s: float) -> str:
             else "no deadline (rank 0 names a missing rank every 60 s)")
 
 
-def _agreement_deadline_env(name: str, default: float) -> float:
-    """Read a finite deadline in seconds; 0 (the default) waits without bound."""
-    raw = os.environ.get(name)
-    try:
-        value = default if raw is None or not raw.strip() else float(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"{name} must be a number of seconds (0 = no deadline), "
-            f"got {raw!r}") from exc
-    if not (value >= 0.0 and value < float("inf")):
-        raise ValueError(
-            f"{name} must be a finite non-negative number of seconds, "
-            f"got {raw!r}")
-    return value
-
-
 def _timeout_ms(timeout_s: float) -> int:
     """A deadline in seconds as the control plane's milliseconds (0 = none)."""
     return max(1, int(round(timeout_s * 1000))) if timeout_s > 0 else 0
@@ -651,8 +635,7 @@ def _format_compile_refusal(module_name, occurrence, reason, records) -> str:
         "  why: a rank-divergent program hangs silently in its next "
         "collective (INVARIANTS 21).\n"
         "  fix: remove rank-conditional shapes/jits or make the emitted "
-        "module identical; LORRAX_JAX_COMPILE_AGREEMENT=0 is an UNSAFE "
-        "bisect-only opt-out.")
+        "module identical.")
 
 
 def _publish_compile_record(module_name: str, key: str, occurrence: int) -> None:
@@ -736,18 +719,6 @@ def _configure_compile_agreement() -> None:
     # One ``jit__multi_slice`` program on every rank before the mesh warm-up
     # compiles it; otherwise the agreement below refuses JAX's own slicer.
     _install_shard_slice_patch()
-    from runtime.env_flags import env_bool
-    requested = env_bool(
-        "LORRAX_JAX_COMPILE_AGREEMENT", True, print_fn=_say)
-    if not requested:
-        s.compile_agreement_reason = (
-            "disabled by LORRAX_JAX_COMPILE_AGREEMENT=0")
-        if s.proc_idx == 0:
-            _say("*** cross-rank compile agreement DISABLED by "
-                 "LORRAX_JAX_COMPILE_AGREEMENT=0. This is an UNSAFE "
-                 "bisect-only mode: a rank-divergent compile may hang. ***")
-        return
-
     from jax._src import distributed as _dist
     client = _dist.global_state.client
     if client is None:
@@ -758,9 +729,7 @@ def _configure_compile_agreement() -> None:
                  "coordination client is not initialized.")
         return
 
-    timeout_s = _agreement_deadline_env(
-        "LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S",
-        _COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S)
+    timeout_s = _COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S
     s._compile_client = client
     s.compile_agreement_timeout_s = timeout_s
     s.compile_agreement_enabled = True

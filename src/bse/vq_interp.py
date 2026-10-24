@@ -766,59 +766,17 @@ def lr_fit_degrees(zx, *, e_cut=None, shell_floor=FIT_SHELL_FLOOR):
     return {n: DEG_B26P.get(n, 0) for n in range(nmax + 1)}
 
 
-def lr_gset(zx, alpha=ALPHA, degrees=None):
+def lr_gset(zx, alpha=ALPHA):
     """Fixed global Miller superset of the LR channel: all G with
     min_{q∈BZ, q_z=0} |q+G|² ≤ 4α² ln(1/ε_LR), minimised over a 13×13
-    in-plane q sample (reference ``lr_gset``, verbatim), then RESTRICTED to
-    the G_z channels the b26p model actually fits.
+    in-plane q sample (reference ``lr_gset``, verbatim).
 
-    THE G_z TRIM.  The cutoff above is ISOTROPIC in K, but the model is not.
-    :func:`lr_design_blocks` fits only the channels named in ``degrees``
-    (``DEG_B26P`` — |G_z| ≤ 3) and :func:`make_eval_vq` leaves every other
-    column of ``M`` at its ``jnp.zeros`` initialisation, so those columns
-    carry ``zt = 0``, ``A = 0``, and contribute EXACTLY ``0.0`` to
-    ``conj(A) A^T``.  Measured: ``max|A[:, dead]| = 0.000e+00`` over 8 target
-    Q on the MoS2 3×3 slab deck — an exact zero, not a small number.
-
-    Carrying them is not free, and how much it costs depends on the CELL.
-    ``|G_z|`` runs to ``Kmax/|b3|``, and ``|b3| = 2π/c`` shrinks as the slab's
-    vacuum padding grows, so the dead fraction rises with cell height while
-    the modelled window ``3·|b3|`` shrinks:
-
-      * Si bulk (a₃ = 7.26 bohr, |b3| = 1.061):  nG = 123, |G_z| ≤ 2,
-        **0 dead** — the trim is a no-op, the cutoff already stops inside
-        the fitted channels.
-      * MoS2 slab (a₃ = 22.68 bohr, |b3| = 0.277): nG = 337, |G_z| ≤ 9,
-        **176 dead (52.2%)**.
-
-    52% of the ``(nq, n_μ, nG)`` host ``Fch`` block, 52% of the ``(n_μ, nG)``
-    ``A`` matrix and of both of its resharding constraints, and 52% of the
-    K-dimension of the LR outer product — all of it multiplying exact zeros.
-
-    THE TRIM IS OFF BY DEFAULT, AND THE NUMBER THAT REFUSED IT IS
-    ``5.793e-03``.  The dead columns are dead in ``eval_vq`` — that part is
-    proven — but they are NOT dead in :func:`run_nulls`, whose
-    ``F_own_rebuild_vs_cleaned_LR_tile_max`` null rebuilds the LR tile from
-    the SAMPLED form factors ``Fch`` on the superset and compares it against
-    ``Sc·V_LR·Sc`` built from the FULL stored sphere.  That null certifies
-    SET COVERAGE, not model fidelity, so dropping columns from the set
-    breaks it: 5.793e-03 against a 1e-6 tolerance on the MoS2 3×3 deck.
-
-    Read the two facts together and they say something the tree did not
-    record: stage 1 subtracts the FULL-sphere ``V_LR`` and stage 3 adds back
-    only the FITTED channels, so the |G_z| > 3 weight is already lost on the
-    production path — and ``run_nulls`` cannot see that, because it tests
-    ``Fch`` rather than the fitted model.  Trimming does not create the gap;
-    it moves the gap into the one instrument that was reporting on it.
-    Closing it is a MODEL question (widen ``DEG_B26P``), not a set question,
-    and it is owner-ruled work — see FIX_vq_interp.md.
-
-    ``LORRAX_VQ_LR_GZ_TRIM=1`` opts in: bit-identical in ``eval_vq`` to ~2
-    ulp, worth 1.69x on the LR outer product at n_μ = 2412 and half the host
-    ``Fch`` block, at the price of that null.  The trim is keyed on
-    ``degrees`` rather than on the literal ``DEG_B26P`` so the superset and
-    the fit cannot drift apart silently; :func:`lr_design_blocks` REFUSES a
-    ``degrees`` wider than the one the superset was built with.
+    Every G_z channel stays in the set, including those the b26p model does
+    not fit (their columns of ``M`` are exact zeros in ``eval_vq``):
+    :func:`run_nulls`' ``F_own_rebuild_vs_cleaned_LR_tile_max`` null rebuilds
+    the LR tile from the sampled ``Fch`` on this set and certifies its
+    COVERAGE, which a G_z trim broke (5.793e-03 against 1e-6 on the MoS2 3×3
+    deck; see FIX_vq_interp.md).
     """
     K2max = 4.0 * alpha ** 2 * np.log(1.0 / EPS_LR)
     Kmax = np.sqrt(K2max)
@@ -835,10 +793,6 @@ def lr_gset(zx, alpha=ALPHA, degrees=None):
             K = zx["bvec"].T @ (qf[:, None] + Gall.astype(np.float64))
             m = np.minimum(m, np.sum(K * K, axis=0))
     keep = m <= K2max
-    if os.environ.get("LORRAX_VQ_LR_GZ_TRIM", "0") == "1":
-        deg = lr_fit_degrees(zx) if degrees is None else degrees
-        keep = keep & np.isin(np.abs(Gall[2]),
-                              np.asarray(sorted({abs(int(g)) for g in deg})))
     return np.ascontiguousarray(Gall[:, keep])
 
 
@@ -936,10 +890,8 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     q_chunk = int(min(q_chunk, nq,
                       max(ndev, ndev * (5e9 // (n_mu * ngkmax * 16 * ndev)))))
     assert np.max(np.abs(zx["qfr"][:, 2])) < 1e-12, "slab pipeline needs q_z=0"
-    # ``degrees`` reaches the superset builder as well as the fit, so the two
-    # cannot disagree about which G_z channels exist (see lr_gset's G_z trim).
     degrees = lr_fit_degrees(zx, e_cut=fit_ecut) if degrees is None else degrees
-    GS = lr_gset(zx, alpha, degrees=degrees)
+    GS = lr_gset(zx, alpha)
     nG = GS.shape[1]
     # q-batched layout: every device owns whole matrices for its own q.  That
     # needs nq_chunk % ndev == 0, which a deck with fewer BZ q-points than
@@ -1198,10 +1150,6 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     del V_dev_chunks
     return {"alpha": alpha, "eps_tik": eps_tik, "GS": GS, "S": S_np,
             "V_SRc": V_SRc_dev, "V_SRc_np": V_SRc_np, "Fch": Fch, "W": W,
-            # the degrees the SUPERSET was built with — lr_design_blocks
-            # refuses a wider request against it (silent-narrowing guard)
-            "lr_gz_degrees": (degrees if os.environ.get(
-                "LORRAX_VQ_LR_GZ_TRIM", "0") == "1" else None),
             # THE fitted channel set (:func:`lr_fit_degrees`), always present.
             # Every consumer of "which |G_z| does the model fit?" reads this —
             # the fit itself and the mini-BZ head-slot guard — so the criterion
@@ -1236,26 +1184,7 @@ def lr_design_blocks(zx, prep, degrees=None):
     ``degrees`` are model-zero (dropped).  Per-q blocks make LOO refits
     honest (target's samples excluded) at O(nb²) cost."""
     if degrees is None:
-        degrees = (prep.get("lr_gz_degrees") or prep.get("fit_degrees")
-                   or DEG_B26P)
-    # SILENT-NARROWING GUARD.  When ``prepare_coarse`` trimmed the superset to
-    # a degrees dict, asking here for a WIDER one would not raise anywhere: the
-    # loop below iterates ``prep['gz_cols']``, so a channel the superset no
-    # longer carries is simply never visited and the model quietly loses it.
-    # That is the "config key parsed and quietly ignored" failure mode; an
-    # unsupported request must refuse.
-    _trim = prep.get("lr_gz_degrees")
-    if _trim is not None:
-        extra = sorted({abs(int(g)) for g in degrees}
-                       - {abs(int(g)) for g in _trim})
-        if extra:
-            raise ValueError(
-                f"lr_design_blocks asked for |G_z| channels {extra}, but "
-                f"prepare_coarse built the LR superset trimmed to "
-                f"{sorted({abs(int(g)) for g in _trim})} (lr_gset's G_z trim). "
-                f"Those channels have no columns in prep['GS'] and would be "
-                f"silently dropped from the fit.  Rebuild prepare_coarse with "
-                f"the same `degrees`, or set LORRAX_VQ_LR_GZ_TRIM=0.")
+        degrees = prep.get("fit_degrees") or DEG_B26P
     nq = zx["nq"]
     des = {"specs": {}, "AtA": {}, "AtY": {}, "alpha": prep["alpha"]}
     for g, cols in prep["gz_cols"].items():
@@ -2011,8 +1940,7 @@ def read_zeta_fit_provenance(zeta_file: str) -> dict | None:
     ``isdf_header/fit_provenance`` is a JSON string written by
     ``gw.gw_init._zeta_fit_provenance`` AFTER ``mark_zeta_done``, so its
     presence means the ζ on disk is both complete and described.  THE BUNDLE
-    IS THE TRUTH: it records the EFFECTIVE (post-``LORRAX_ZETA_RCOND``)
-    conditioning knobs and the EXACT band windows the fit ran on, which is
+    IS THE TRUTH: it records the conditioning knobs and the EXACT band windows the fit ran on, which is
     what a refit reproducing that fit needs — the deck beside it may have
     moved, and on a decoupled ``zeta_nband`` run the deck's band window is
     not the ζ-fit window at all.
@@ -2042,10 +1970,9 @@ def _zeta_solve_of(prov: dict, zeta_file: str) -> tuple[str, float]:
 
     The two values ``isdf.core.solve_zeta_charge_dense`` needs to redo the
     producer's ζ solve.  ``zeta_rcond`` is stored as the provenance's own
-    string (``repr(value)``, or the raw env string when the deprecated env
-    twin won — ``isdf.core.deprecated_env_record``), so it parses as a float
-    either way and it is the EFFECTIVE value, which is the whole point of
-    reading it here instead of off the deck.
+    string (``repr(value)``; older stamps may hold the raw string of the retired
+    env twin), so it parses as a float either way and it is the value the fit
+    used, which is the whole point of reading it here instead of off the input file.
     """
     kind = str(prov.get("charge_zeta_solve", "")).strip().lower()
     if kind == "cholesky":

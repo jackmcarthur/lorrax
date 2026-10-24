@@ -52,9 +52,7 @@ for no defect.
 write happened on either side — open/close/open/close through different
 libraries.  Every close flushes, so this mostly works, which is why the
 pipeline runs today; it is still two caches taking turns on one file and
-it is what audit A1 wants gone.  It is counted per path and reported, and
-``LORRAX_HDF5_ONE_OWNER=strict`` promotes it to the same refusal so the
-remaining sites can be enumerated in one run.  The permanent fix is one
+it is what audit A1 wants gone.  It is counted per path and reported.  The permanent fix is one
 owner per file — see the sibling-split spec in the audit.
 
 The registry is per PROCESS and in-memory: it says nothing about other
@@ -80,7 +78,6 @@ __all__ = [
     "note_close",
     "note_open",
     "open_scope",
-    "policy",
     "probe",
     "reset_for_test",
     "shared_paths",
@@ -101,12 +98,6 @@ _STACK_LIB = {
 # "read-only" wrong is the direction that loses data.
 _READ_ONLY_MODES = frozenset({"r"})
 
-#: ``measure`` (default) counts sequential cross-stack alternation and
-#: reports it; ``strict`` refuses it.  The live-overlap-with-a-writer
-#: refusal is unconditional under both.
-POLICY_ENV = "LORRAX_HDF5_ONE_OWNER"
-_POLICIES = ("measure", "strict")
-
 _LOCK = threading.RLock()
 # abspath -> list of live handle dicts
 _LIVE: dict[str, list[dict]] = {}
@@ -122,26 +113,6 @@ _TOKEN = [0]
 # depends on import ORDER, which is exactly the property an HDF5 knob
 # read at file-open time must not depend on.  This module only REPORTS
 # the setting, in :func:`probe`.
-
-
-def policy() -> str:
-    """The alternation policy in force, from :data:`POLICY_ENV`.
-
-    The name is spelled as a LITERAL here as well as in
-    :data:`POLICY_ENV`: ``tools/env_audit.py`` and
-    ``tools/lint/test_env_registry.py`` resolve only literal arguments, so
-    this read was invisible to the gate that requires a
-    ``docs/reference/env_vars.md`` row — and the variable duly shipped without
-    one.  The constant stays for the messages and the tests.
-    """
-    got = str(os.environ.get("LORRAX_HDF5_ONE_OWNER", "measure")).strip().lower()
-    if got not in _POLICIES:
-        raise ValueError(
-            f"{POLICY_ENV}={got!r} is not one of {_POLICIES}.  "
-            f"'measure' counts cross-stack alternation on one file and "
-            f"reports it; 'strict' refuses it.  The live-overlap refusal "
-            f"is unconditional either way.")
-    return got
 
 
 def is_write_mode(mode) -> bool:
@@ -206,29 +177,6 @@ def _overlap_refusal(path, stack, mode, where, live) -> str:
     )
 
 
-def _alternation_refusal(path, stack, mode, where, rec) -> str:
-    return (
-        "LORRAX HDF5 one-owner-per-file refusal, strict policy "
-        "(audit A1; sandbox claims/0110)\n"
-        f"  file  : {path}\n"
-        f"  got   : {stack} open(mode={mode!r}) from {where}; this file was "
-        f"last opened through {rec['last_stack']}, and has been written "
-        f"through {'h5py' if rec['writes'][STACK_H5PY] else 'the FFI'} "
-        f"already (h5py: {rec['opens'][STACK_H5PY]} opens / "
-        f"{rec['writes'][STACK_H5PY]} writes; FFI: "
-        f"{rec['opens'][STACK_FFI]} opens / {rec['writes'][STACK_FFI]} "
-        f"writes; {rec['alternations']} stack alternations so far).\n"
-        f"  want   : one HDF5 library instance per file for the life of "
-        f"the process.  Sequential alternation flushes at each close and "
-        f"so usually survives, which is why it is DEFAULT-ALLOWED and "
-        f"merely counted; you asked for {POLICY_ENV}=strict, which is the "
-        f"target state audit A1 names.\n"
-        f"  fix   : move this file's small metadata to a sibling file "
-        f"touched only by h5py, leaving the payload touched only by the "
-        f"FFI — or set {POLICY_ENV}=measure to go back to counting."
-    )
-
-
 # ---------------------------------------------------------------------------
 # The entry point
 # ---------------------------------------------------------------------------
@@ -258,8 +206,8 @@ def live_verdict(path) -> str:
 def note_open(path, stack, mode, *, where: str) -> int:
     """Declare an HDF5 open.  Returns a token for :func:`note_close`.
 
-    Refuses a cross-stack overlap that includes a writer, always; refuses
-    sequential cross-stack alternation under ``strict``.
+    Refuses a cross-stack overlap that includes a writer; counts sequential
+    cross-stack alternation.
 
     JOURNALED, both outcomes.  This is the one choke point every HDF5
     open in this process passes through, whichever library instance is
@@ -301,9 +249,6 @@ def _claim(key: str, stack, mode, where) -> int:
                  or is_write_mode(mode))
         if wrote:
             rec["alternations_with_write"] += 1
-            if policy() == "strict":
-                raise RuntimeError(
-                    _alternation_refusal(key, stack, mode, where, rec))
     rec["opens"][stack] += 1
     if is_write_mode(mode):
         rec["writes"][stack] += 1
@@ -433,7 +378,7 @@ def alternation_rows() -> list[tuple[str, int, int, int, int, int]]:
     return rows
 
 
-def probe(where: str, *, print_fn=print, escalate: bool = True,
+def probe(where: str, *, print_fn=print,
           verbose: bool | None = None) -> dict:
     """Measure the mapped-libhdf5 count and the registry's shared paths.
 
@@ -442,12 +387,7 @@ def probe(where: str, *, print_fn=print, escalate: bool = True,
     Passing ``verbose=True`` prints the full inventory, while ``None``
     follows the one driver debug-print switch.  The HDF5 operation journal
     remains an independent forensic sidecar and does not make stdout noisy.
-    ``escalate`` only decides whether the
-    *strict* policy is
-    allowed to turn the measured unsafe condition — two mapped libhdf5
-    objects AND a path this process has written through both — into the
-    same refusal :func:`note_open` raises.  Under the default ``measure``
-    policy nothing is raised; the line is the deliverable.
+    Nothing is raised; the line is the deliverable.
     """
     libs, companions = _mapped_hdf5_objects()
     rows = alternation_rows()
@@ -466,7 +406,7 @@ def probe(where: str, *, print_fn=print, escalate: bool = True,
                       + ", ".join(companions) + ")")
     if verbose:
         print_fn(f"  [hdf5-probe {where}] libhdf5 {shown}; "
-                 f"HDF5_USE_FILE_LOCKING={locking}; policy={policy()}")
+                 f"HDF5_USE_FILE_LOCKING={locking}")
     if verbose and both:
         worst = both[0]
         print_fn(
@@ -490,16 +430,6 @@ def probe(where: str, *, print_fn=print, escalate: bool = True,
             + f"{' ...' if len(unsafe) > 4 else ''}.  Sequential only "
             f"(no live overlap was allowed), which is why the run "
             f"proceeds; the permanent fix is one owner per file.")
-        if escalate and policy() == "strict":
-            raise RuntimeError(
-                "LORRAX HDF5 probe refusal, strict policy (audit A1)\n"
-                f"  got  : {len(libs)} libhdf5 objects mapped ("
-                + ", ".join(libs) + f") and {len(unsafe)} file(s) written "
-                "through both stacks in this process.\n"
-                "  want : one HDF5 library instance per written file.\n"
-                f"  fix  : split the metadata onto a sibling file, or set "
-                f"{POLICY_ENV}=measure to record the condition instead of "
-                f"refusing on it.")
     return {"libraries": libs, "companions": companions,
             "shared": [r[0] for r in both],
             "unsafe": [r[0] for r in unsafe], "rows": rows}

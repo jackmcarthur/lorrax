@@ -51,7 +51,7 @@ from .fh_interp import (
 # from the CLI module for open lanes until the wave after ARCH wave 0.
 from .fh_interp import (                                             # noqa: F401
     f_transform_eigs, outer_r_shell_mask,
-    resolve_extra_rank_pad, resolve_local_vbm_index, select_active_eigenpairs,
+    resolve_local_vbm_index, select_active_eigenpairs,
     validate_centroid_subset_idx,
 )
 

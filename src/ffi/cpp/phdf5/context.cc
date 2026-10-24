@@ -6,26 +6,13 @@
 // Env tunables (all optional; docs/reference/env_vars.md is the registry).
 // Boolean knobs accept the shared writer grammar — see env_flag below
 // (mirrors Python's runtime.env_flags.env_bool; tools/lint/test_env_grammar.py):
-//   LORRAX_PHDF5_COLLECTIVE_WRITES (1)  collective vs independent writes
-//   LORRAX_PHDF5_DEDUP_REPLICAS   (1)   one canonical writer per replica
-//   LORRAX_PHDF5_INDEPENDENT      (0)   force independent READS
-//   LORRAX_PHDF5_COLL_META        (0)   collective metadata ops
-//   LORRAX_PHDF5_ALIGN_MB         (4)   H5Pset_alignment threshold/length
-//   LORRAX_PHDF5_READ_STAGING_RETAIN_MB (256) process-wide budget for read
-//                                       staging kept above 32 MiB per file
 //   LORRAX_PHDF5_STRIPE_COUNT  (policy) Lustre striping_factor hint; unset =
 //                                       clamp(world_size, 4, 128)
-//   LORRAX_PHDF5_STRIPE_SIZE_FS(policy) Lustre striping_unit hint (lfs form;
-//                                       legacy byte-valued
-//                                       LORRAX_PHDF5_STRIPE_SIZE honoured);
+//   LORRAX_PHDF5_STRIPE_SIZE_FS(policy) Lustre striping_unit hint (lfs form);
 //                                       unset = the 1->4 MiB rank-count ramp.
 //                                       Both policies transcribe
 //                                       file_io/_slab_io_ffi._stripe_policy —
 //                                       see stripe_policy_count/_unit below
-//   LORRAX_PHDF5_CB_WRITE / _DS_WRITE / _CB_NODES / _CB_BUFFER_SIZE /
-//   _CB_PER_NODE                (unset) ROMIO pass-throughs; unset = ROMIO
-//                                       automatic policy (measured best on
-//                                       Frontera — scorecard AI/AW)
 //   LORRAX_DEBUG_PRINT            (0)   print native diagnostic detail
 
 #include <cctype>
@@ -130,16 +117,6 @@ void ensure_mpi_initialized() {
     require_thread_multiple();
 }
 
-// Pull an integer tunable from env, falling back to default.
-static long env_long(const char* name, long default_value) {
-    const char* v = std::getenv(name);
-    if (!v || !*v) return default_value;
-    char* end = nullptr;
-    long parsed = std::strtol(v, &end, 10);
-    if (end == v) return default_value;
-    return parsed;
-}
-
 // ---------------------------------------------------------------------------
 // The Lustre stripe POLICY for an unset LORRAX_PHDF5_STRIPE_{COUNT,SIZE_FS}.
 // ---------------------------------------------------------------------------
@@ -183,9 +160,9 @@ static long stripe_policy_unit(int world_size) {
 // env_flag (the boolean grammar) moved to ctx.h on 2026-08-06 so every
 // phdf5 translation unit shares it.  It was static here, which is why
 // read_ffi.cc's former timing flag had to be a bare presence test.
-// Boolean knobs used to go through env_long, whose strtol grammar
-// silently kept the DEFAULT on word spellings — so e.g.
-// LORRAX_PHDF5_COLLECTIVE_WRITES=false left the FFI writer collective
+// Boolean knobs used to go through a strtol integer parse, whose grammar
+// silently kept the DEFAULT on word spellings — so e.g. the (since
+// removed) collective-writes switch set to false left the FFI writer collective
 // while the Python phdf5_host writer went independent: the two writers
 // diverged on the same environment (audit fix/zq 2026-07-28).
 
@@ -279,12 +256,8 @@ static std::atomic<size_t> g_read_reserved{0};
 
 static size_t read_retain_budget() {
     static const size_t budget = [] {
-        // Clamp before the shift, as ALIGN_MB: <= 0 retains nothing above
-        // the per-file bound (the old behaviour); 64 GiB caps a typo.
-        long mb = env_long("LORRAX_PHDF5_READ_STAGING_RETAIN_MB", 256);
-        if (mb < 0) mb = 0;
-        if (mb > (64L << 10)) mb = 64L << 10;
-        return static_cast<size_t>(mb) << 20;
+        // 256 MiB process-wide for read staging kept above the per-file bound.
+        return static_cast<size_t>(256) << 20;
     }();
     return budget;
 }
@@ -507,36 +480,15 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     ctx->q = q;
     ctx->rank = rank;
     ctx->world_size = world_size;
-    ctx->timing_enabled = env_flag("LORRAX_SLAB_IO_TIMING", false);
+    ctx->timing_enabled = env_flag("LORRAX_DEBUG_PRINT", false);
 
-    // Env-driven tuning.  Defaults (see ctx.h): reads collective, writes
-    // COLLECTIVE (default flipped 2026-07-27 to match the Python
-    // phdf5_host writer, so LORRAX_PHDF5_COLLECTIVE_WRITES means the
-    // same thing in every writer; measured on the production tile
-    // geometry: strided 2-D tiles of a contiguous dataset are ~3 orders
-    // faster under two-phase collective aggregation — scorecard AI),
-    // metadata non-collective.  Env overrides:
-    //   LORRAX_PHDF5_INDEPENDENT=1       → also force reads independent
-    //   LORRAX_PHDF5_COLLECTIVE_WRITES=0 → back to independent writes
-    //                                     (historical Cray-MPICH caution:
-    //                                     ad_cray_write_coll.c OOM at
-    //                                     >~1 GB/rank on that stack)
-    //   LORRAX_PHDF5_COLL_META=1         → re-enable collective metadata
-    //   LORRAX_PHDF5_DEDUP_REPLICAS=0    → let every rank of a replica
-    //                                     group write its identical copy
-    //                                     (overlapping selections are
-    //                                     undefined under collective
-    //                                     MPI-IO — only for debugging)
-    // Boolean knobs parse through env_flag — the SAME grammar as the
-    // Python writers' _env_flag (see env_flag above), so a given
-    // environment means the same thing in every writer.
-    const bool force_indep_read    = env_flag("LORRAX_PHDF5_INDEPENDENT", false);
-    const bool coll_write          = env_flag("LORRAX_PHDF5_COLLECTIVE_WRITES", true);
-    const bool force_coll_metadata = env_flag("LORRAX_PHDF5_COLL_META", false);
-    ctx->use_collective_read  = !force_indep_read;
-    ctx->use_collective_write = coll_write;
-    ctx->coll_metadata        = force_coll_metadata;
-    ctx->dedup_replicas       = env_flag("LORRAX_PHDF5_DEDUP_REPLICAS", true);
+    // Transfer modes (ctx.h): reads collective, writes COLLECTIVE
+    // (measured on the production tile geometry: strided 2-D tiles of a
+    // contiguous dataset are ~3 orders faster under two-phase collective
+    // aggregation — scorecard AI), metadata non-collective.
+    ctx->use_collective_read  = true;
+    ctx->use_collective_write = true;
+    ctx->coll_metadata        = false;
     // Alignment is deliberately NOT tied to the striping_unit default.
     // It used to be justified as "matches the striping unit so H5 objects
     // start on stripe boundaries", but it is measured non-load-bearing on
@@ -545,12 +497,7 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     // 2.915 at 4 nodes -- all inside the +-1.5% repeat noise (job
     // 56389339).  So it stays at 4 rather than becoming a second knob
     // that has to be kept in sync with a value it does not depend on.
-    long align_mb        = env_long("LORRAX_PHDF5_ALIGN_MB", 4);
-    // Clamp before the shift: a typo'd LORRAX_PHDF5_ALIGN_MB of 2^50 wraps
-    // ``<< 20`` around size_t and hands H5Pset_alignment a small or absurd
-    // threshold with no complaint.  16 GiB is far past any useful value.
-    if (align_mb > (1L << 14)) align_mb = 1L << 14;
-    ctx->align_threshold = (align_mb > 0) ? (size_t)align_mb << 20 : 0;
+    ctx->align_threshold = size_t{4} << 20;
     ctx->align_length    = ctx->align_threshold;
 
     // Pass MPI_COMM_WORLD straight through to H5Pset_fapl_mpio.  HDF5's
@@ -577,35 +524,19 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     // image, so these hints are the ONLY way the layout gets set on
     // Frontera).  Everything else — romio_cb_write / romio_ds_write /
     // cb_buffer_size / cb_nodes — is left at ROMIO's automatic policy
-    // unless the env asks: under H5FD_MPIO_COLLECTIVE ROMIO already
+    // (ROMIO_HINTS / MPICH_MPIIO_HINTS still reach it): under H5FD_MPIO_COLLECTIVE ROMIO already
     // runs two-phase aggregation, and FORCING romio_cb_write=enable on
     // top of it measured *slower* than ROMIO's own choice (wk_AI, P=16
     // production tile: 1826 vs 2066 MB/s).  The old defaults here
     // (cb_write=enable, ds_write=disable, cb_buffer_size=64 MiB,
     // cb_nodes=world_size) were a Perlmutter/OpenMPI-era tuning
-    // (0.85 → 4.4 GB/s on THAT stack); they are preserved as env
-    // escape hatches, not defaults, so unset-env now means the same
-    // thing in every writer: ROMIO decides.
+    // (0.85 → 4.4 GB/s on THAT stack); ROMIO decides in every writer.
     MPI_Info info = MPI_INFO_NULL;
     MPI_Info_create(&info);
     *info_out = info;                       // so a throw below still frees it
     auto info_set = [&](const char* key, const char* val) {
         MPI_Info_set(info, const_cast<char*>(key), const_cast<char*>(val));
     };
-    // Pass-through knobs (set only when the env is non-empty).
-    const char* cb_write = std::getenv("LORRAX_PHDF5_CB_WRITE");
-    if (cb_write && *cb_write) info_set("romio_cb_write", cb_write);
-    const char* ds_write = std::getenv("LORRAX_PHDF5_DS_WRITE");
-    if (ds_write && *ds_write) info_set("romio_ds_write", ds_write);
-    const char* cb_buf = std::getenv("LORRAX_PHDF5_CB_BUFFER_SIZE");
-    if (cb_buf && *cb_buf) info_set("cb_buffer_size", cb_buf);
-    const char* cb_nodes = std::getenv("LORRAX_PHDF5_CB_NODES");
-    if (cb_nodes && *cb_nodes) info_set("cb_nodes", cb_nodes);
-    const char* cb_per_node = std::getenv("LORRAX_PHDF5_CB_PER_NODE");
-    if (cb_per_node && *cb_per_node) {
-        std::string v = std::string("*:") + cb_per_node;
-        info_set("cb_config_list", v.c_str());
-    }
     // striping_factor / striping_unit: MPI-IO's way to request a Lustre
     // stripe layout when it creates the file (ROMIO applies it through
     // llapi — works inside the container with no `lfs` binary on PATH).
@@ -635,10 +566,9 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     // Env naming: LORRAX_PHDF5_STRIPE_SIZE_FS is THE documented knob
     // (env_vars.md), spelled like `lfs setstripe -S` ("4M"); it is read
     // by the three Python sites and, since workstream AW, here too —
-    // previously this file read only the undocumented byte-valued
-    // LORRAX_PHDF5_STRIPE_SIZE, so the documented knob silently did not
-    // reach the C++ writer.  The legacy byte spelling still works as a
-    // fallback.
+    // previously this file read only an undocumented byte-valued
+    // spelling (since removed), so the documented knob silently did not
+    // reach the C++ writer.
     // MEASURED DEFAULT (2026-08-05, job 56389339, /pscratch, 2.000 GiB
     // C128, GiB/s aggregate write/read, best of 2 reps, MPI world size
     // asserted):
@@ -737,17 +667,6 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
                 "\" resolves to a non-positive striping_unit, which is not a "
                 "hint ROMIO can act on.");
         }
-    } else if (const char* b = std::getenv("LORRAX_PHDF5_STRIPE_SIZE");
-               b && *b) {
-        char* end = nullptr;
-        const long parsed = std::strtol(b, &end, 10);
-        if (end == b || (end && *end) || parsed <= 0) {
-            throw std::runtime_error(
-                std::string("LORRAX_PHDF5_STRIPE_SIZE=\"") + b +
-                "\" is not a valid byte count: expected a positive plain "
-                "integer.");
-        }
-        stripe_bytes = parsed;
     }
     // Backstop only.  Every reachable way to get here non-positive now
     // throws above, naming the variable; this catches a v*mult that

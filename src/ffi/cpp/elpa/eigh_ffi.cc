@@ -31,7 +31,7 @@
 // first-fit allocator over the workspace's pool region (buffers of at least
 // n * 64 elements; smaller ones are device mallocs, see kSmallMin), so ELPA's large buffers are
 // XLA's (in memory_analysis, inside the arena); past its end the allocator
-// falls back to a device malloc (counted; LORRAX_ELPA_POOL_REPORT=1 prints it).
+// falls back to a device malloc (counted; LORRAX_DEBUG_PRINT=1 prints it).
 // The free callback synchronizes the device first: hipFree does, and ELPA
 // relies on that before a buffer is reused.  The ELPA handle (GPU setup:
 // BLAS handles, streams) is created once per (context, N, nb, dtype) with the
@@ -106,7 +106,7 @@ constexpr std::size_t kAlign = 256;
 //: complex128, 5 MiB float64; ELPA 2026.02.001, one-stage).  From the pool they would
 //: alias XLA memory after return, so the cap is twice the measured size; a larger buffer
 //: kept past the call still refuses (the live-pool check below).  The small mallocs'
-//: live high-water is reported (LORRAX_ELPA_POOL_REPORT).
+//: live high-water is reported (LORRAX_DEBUG_PRINT).
 constexpr std::size_t kSmallMin = std::size_t(1) << 20;
 constexpr std::size_t kSmallPerRow = 64;
 
@@ -480,7 +480,7 @@ static ffi::Error EighImpl(int64_t n, int64_t nb, bool compute_evecs, lrx::gpu::
         return ffi::Error(ffi::ErrorCode::kInternal,
                           "elpa.eigh: ELPA kept " + std::to_string(live_pooled) +
                           " pooled bytes past the call");
-    const char* rep = std::getenv("LORRAX_ELPA_POOL_REPORT");
+    const char* rep = std::getenv("LORRAX_DEBUG_PRINT");
     if (rep && rep[0] && rep[0] != '0') {
         std::fprintf(stderr,
             "[elpa.eigh] rank=%d n=%lld nb=%lld %s wall=%.2f pool=%.3fGB pool_hw=%.3fGB "

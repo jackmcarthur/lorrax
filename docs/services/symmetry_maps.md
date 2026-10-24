@@ -103,8 +103,7 @@ self-consistent consumers keep the cached default.
   collective's world size, so a rank-0-only open never answers a later
   all-rank open (`density_symmetry_check.cached_density_symmetry_check`). There is no dial.
 * **Env surface.** `LORRAX_TRS_CHECK` takes `1`/`on` (default) or `strict`
-  (a broken or inconclusive verdict refuses); `0`/`off` refuses.
-  `LORRAX_TRS_TOL` and `LORRAX_TRS_MAX_K` tune the measurement. The
+  (a broken or inconclusive verdict refuses); `0`/`off` refuses. The
   environment never grants a symmetry convention;
   [`docs/reference/env_vars.md`](../reference/env_vars.md) owns the definitions.
 * **`_star_conj_flags` is the single conjugation predicate:**

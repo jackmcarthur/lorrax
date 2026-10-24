@@ -34,7 +34,7 @@ Device memory, all of it XLA's (inside the arena) during the solve:
 * ELPA's own device buffers come from the workspace's pool through the patched library's
   ``lorrax_elpa_set_device_allocator``; the pool is the lower envelope of ELPA's measured
   live high-water (:func:`pool_bytes`); a larger need falls back to a device malloc outside
-  the arena, counted (``LORRAX_ELPA_POOL_REPORT=1``);
+  the arena, counted (``LORRAX_DEBUG_PRINT=1`` prints it);
 * every rocBLAS handle ELPA created gets a user-owned workspace from the workspace's tail
   (``rocblas_set_workspace``; :func:`rocblas_bytes`), detached after the call, so rocBLAS
   and rocSOLVER (``stedc``) hold no device memory between calls.  A too-small rocBLAS

@@ -236,18 +236,19 @@ def test_python_scan_sees_the_tree_at_all():
     """A LORRAX tree with zero env reads does not exist; empty = broken."""
     hits = python_read_sites()
     lorrax = [n for n in hits if n.startswith("LORRAX_")]
-    assert len(lorrax) >= 30, (
+    assert len(lorrax) >= 20, (
         "the python scan found only %d LORRAX_* reads under src/ — the "
-        "2026-07-31 baseline is ~50; the scanner has gone blind, not the "
-        "tree clean" % len(lorrax))
+        "baseline since the 2026-10 env prune is ~28; the scanner has gone "
+        "blind, not the tree clean" % len(lorrax))
 
 
 def test_cpp_scan_sees_the_tree_at_all():
     hits = cpp_read_sites()
     lorrax = [n for n in hits if n.startswith("LORRAX_")]
-    assert len(lorrax) >= 15, (
+    assert len(lorrax) >= 5, (
         "the C++ regex scan found only %d LORRAX_* reads — baseline is "
-        "~28; suspect the regex or the extension list" % len(lorrax))
+        "~7 since the 2026-10 env prune; suspect the regex or the extension "
+        "list" % len(lorrax))
 
 
 # ---------------------------------------------------------------------------
@@ -500,12 +501,12 @@ def test_module_constants_work_for_every_read_shape():
     assert hits["LORRAX_ANNOTATED"] == [("fixture.py", 10, "Gate(env=...)")]
 
 
-def test_deleting_matmul_precision_row_exposes_the_source_read():
+def test_deleting_a_module_constant_row_exposes_the_source_read():
     """A module-constant read is visible, and its one row is necessary."""
-    name = "LORRAX_MATMUL_PRECISION"
+    name = "LORRAX_ALLOW_NONFINITE_RESULT"
     sites = python_read_sites()
-    assert name in sites, "the module-constant matmul-precision read is invisible"
-    assert any(f.endswith("runtime/__init__.py") for f, _, _ in sites[name])
+    assert name in sites, "the module-constant non-finite-result read is invisible"
+    assert any(f.endswith("common/sanity.py") for f, _, _ in sites[name])
     text = _registry_text()
     exact, globs = registry_vocabulary(text)
     assert covered(name, exact, globs)

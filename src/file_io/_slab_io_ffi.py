@@ -298,16 +298,6 @@ def _stripe_size_bytes(nranks: int | None = None) -> int:
     """
     raw = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE_FS", "").strip()
     if not raw:
-        legacy = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE", "").strip()
-        if legacy:
-            try:
-                v = int(legacy)
-            except ValueError:
-                raise ValueError(
-                    f"LORRAX_PHDF5_STRIPE_SIZE={legacy!r} is not a valid "
-                    f"byte count: expected a plain integer.") from None
-            if v > 0:
-                return v
         return _stripe_policy(
             jax.process_count() if nranks is None else nranks)[1]
     mult = 1
@@ -654,9 +644,9 @@ def _assert_shared_directory(path: str) -> None:
 #     Out of memory in .../ad_cray/ad_cray_write_coll.c, line 669
 # followed by MPI_Abort and "HDF5: infinite loop closing library".  That is
 # the SAME line ``stage/phdf5_stage_cray.sh`` documents as a known Cray-MPICH
-# >=1 GB/rank OOM whose remedy is ``LORRAX_PHDF5_COLLECTIVE_WRITES=0`` /
-# ``LORRAX_PHDF5_INDEPENDENT=1``.  An operator who follows that documented
-# remedy converts the loud crash into the silent-wrong-answer regime above.
+# >=1 GB/rank OOM whose remedy was independent transfers (the env switches
+# for them are removed).  An operator who followed that documented
+# remedy converted the loud crash into the silent-wrong-answer regime above.
 # So the misdiagnosis is not hypothetical; the tree points at it.
 #
 # Hence: ask MPI, once, at the first collective open.  The verdict is
@@ -675,23 +665,17 @@ def _assert_shared_directory(path: str) -> None:
 _MPI_WORLD_VERDICT: dict[str, tuple[str, str]] = {}
 
 
-def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *, require,
+def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *,
                        tier="PHDF5_FFI"):
     """Pure decision function for the MPI-world guard — ``(verdict, msg)``.
 
     Split out from the ctypes probe so it can be tested without an MPI.
     ``verdict`` is one of ``"ok"``, ``"unprobed"``, ``"refuse"``.
 
-    ``require`` gates the UNPROBED case only, and the MISMATCH case below
-    is unconditional.  That asymmetry is deliberate — "we could not check"
-    and "we checked and it is broken" are different facts — but the
-    mismatch message used to end with "LORRAX_PHDF5_REQUIRE_MPI_WORLD=0
-    downgrades this to a warning", which was never true of that branch
-    (found 2026-08-06).  A refusal that advertises an escape hatch it
-    does not implement is worse than a bare one: it sends the reader
-    looking for a variable that cannot help, on a failure whose whole
-    point is that it is invisible.  The sentence is gone rather than
-    implemented, because CLAIMS 68 measured what proceeding costs — with
+    The UNPROBED case warns and the MISMATCH case refuses.  That asymmetry
+    is deliberate — "we could not check" and "we checked and it is broken"
+    are different facts.  The mismatch has no downgrade, because CLAIMS 68
+    measured what proceeding costs — with
     a private singleton ``MPI_COMM_WORLD`` per rank the 8 hostile
     geometries wrote and read back bit-exact at rc=0, correctly striped,
     and only because disjoint hyperslabs need no collective handshake.
@@ -704,9 +688,8 @@ def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *, require,
                f"launcher's PMI flavour does not match this MPI stack every "
                f"rank gets a private singleton MPI_COMM_WORLD and the "
                f"collective write silently degrades to {proc_count} "
-               f"unsynchronised writers on one file.  Set "
-               f"LORRAX_PHDF5_REQUIRE_MPI_WORLD=1 to make this a refusal.")
-        return ("refuse" if require else "unprobed"), msg
+               f"unsynchronised writers on one file.")
+        return "unprobed", msg
     if int(mpi_size) == int(proc_count):
         return "ok", (f"MPI_Comm_size={mpi_size} == "
                       f"jax.process_count()={proc_count} ({probe_detail})")
@@ -720,8 +703,7 @@ def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *, require,
         f"wrong-with-rc=0 whenever two ranks touch one chunk.  The usual "
         f"cause is the launcher's PMI flavour: on Perlmutter/Cray MPICH use "
         f"`srun --mpi=cray_shasta`, NOT --mpi=pmi2.  Refused identically on "
-        f"every rank, with NO downgrade: LORRAX_PHDF5_REQUIRE_MPI_WORLD "
-        f"gates only the 'could not probe' case, and CLAIMS 68 measured "
+        f"every rank, with NO downgrade: CLAIMS 68 measured "
         f"that proceeding here yields bit-exact-looking output at rc=0 "
         f"from a wholly broken MPI, so there is nothing safe to downgrade "
         f"to.  Fix the launcher.")
@@ -798,23 +780,11 @@ def _assert_mpi_world(mesh, *, mpi_size=None, probe_detail=None,
     and ``probe_detail`` instead, skipping the probe: same comparison,
     one less ABI guess.
     """
-    # This knob ignored half its own documented vocabulary until 2026-08-06:
-    # the parse here was a bare os.environ compare with no ``.lower()``, so
-    # SKIP_MPI_WORLD_CHECK=ON (or True, or YES) silently did NOT skip.  It
-    # failed closed, which is why it survived unnoticed — but the next knob
-    # written that way will fail open.  Both fixes for it agreed on the
-    # behaviour; this is the one that routes through the shared helper, so
-    # the vocabulary lives in _TRUE (line 134) and cannot drift per-site.
-    if _env_flag("LORRAX_PHDF5_SKIP_MPI_WORLD_CHECK", False):
-        return
-    require = os.environ.get(
-        "LORRAX_PHDF5_REQUIRE_MPI_WORLD", "").strip().lower() not in _FALSE
     if tier not in _MPI_WORLD_VERDICT:
         if mpi_size is None:
             mpi_size, probe_detail = _probe_mpi_world_size()
         _MPI_WORLD_VERDICT[tier] = _mpi_world_verdict(
-            mpi_size, jax.process_count(), probe_detail, require=require,
-            tier=tier)
+            mpi_size, jax.process_count(), probe_detail, tier=tier)
     verdict, msg = _MPI_WORLD_VERDICT[tier]
     if verdict == "refuse":
         import sys
@@ -2207,8 +2177,7 @@ _COMPILED_WRITES_LOCK = threading.Lock()
 def _compiled_write(sm, *args):
     """The compiled write executable for these operands, built on THIS thread.
 
-    Only jitted writers reach here (``LORRAX_WRITE_NO_JIT=1`` dispatches its
-    eager shard_map on the calling thread instead).  The lock makes the
+    The lock makes the
     check-and-build one step for two SlabIO objects on two threads.
     """
     key = (sm, *((tuple(a.shape), a.dtype, a.sharding,
@@ -2222,11 +2191,9 @@ def _compiled_write(sm, *args):
 
 @functools.lru_cache(maxsize=None)
 def _get_write_sm(mesh, in_specs, *,
-                  mesh_shape, axis_count_per_dim, axis_flat, no_jit,
+                  mesh_shape, axis_count_per_dim, axis_flat,
                   independent):
-    """One H5Dwrite per rank.  ``LORRAX_WRITE_NO_JIT=1`` (passed via
-    ``no_jit``) skips the jit wrapper — diagnostic for chasing the
-    jit-argument-retention buffer leak on long write loops.
+    """One H5Dwrite per rank.
     ``independent`` is the transfer mode (:func:`_file_order_plan`)."""
     from ffi.io import ffi_write_call
 
@@ -2243,7 +2210,7 @@ def _get_write_sm(mesh, in_specs, *,
         in_specs=(in_specs,), out_specs=P(),
         check_vma=False,
     )
-    return sm_bare if no_jit else jax.jit(sm_bare)
+    return jax.jit(sm_bare)
 
 
 # ---------------------------------------------------------------------------
@@ -2484,12 +2451,10 @@ class _FfiBackend(_DatasetGeometry):
         # router that used to answer this question by picking a lesser
         # transport has no lesser transport left to pick.
         assert_available()
-        self._timing_enabled = _env_flag("LORRAX_SLAB_IO_TIMING", False)
-        if (self._timing_enabled
-                and not self._loader.has_phdf5_timing()):
-            raise RuntimeError(
-                "LORRAX_SLAB_IO_TIMING=1 requires a rebuilt PHDF5 provider "
-                "with lrx_phdf5_close_timed; no file was opened")
+        # Native slab timing rides the debug switch the C++ side reads
+        # (context.cc), on a provider that exports lrx_phdf5_close_timed.
+        self._timing_enabled = (_env_flag("LORRAX_DEBUG_PRINT", False)
+                                and self._loader.has_phdf5_timing())
 
         self.path = path
         self.mesh = mesh
@@ -3118,7 +3083,6 @@ class _FfiBackend(_DatasetGeometry):
             mesh_shape=mesh_shape,
             axis_count_per_dim=axis_count_per_dim,
             axis_flat=axis_flat,
-            no_jit=bool(os.environ.get('LORRAX_WRITE_NO_JIT')),
             independent=bool(independent),
         )
 
@@ -3150,26 +3114,11 @@ class _FfiBackend(_DatasetGeometry):
         # and refused (bispinor_debug at P4 under pytest,
         # lx-Xg4-100442-970539-2773).  Compiling here puts it at a fixed
         # point in program order on every rank.
-        elif hasattr(sm, "lower"):
+        else:
             call = _compiled_write(sm, A)
 
             def _task():
                 tok = _posted(platform, _local_address(A), kind, control, lambda: call(A))
-                tok.block_until_ready()
-        else:
-            # ``LORRAX_WRITE_NO_JIT=1``: an eager shard_map compiles at its
-            # first CALL, so the call itself is made here, on the calling
-            # thread; the worker only waits for it.  A dispatch error is
-            # handed to the worker so it is sticky like any other.
-            try:
-                tok, dispatch_error = _posted(
-                    platform, _local_address(A), kind, control, lambda: sm(A)), None
-            except BaseException as exc:                      # noqa: BLE001
-                tok, dispatch_error = None, exc
-
-            def _task():
-                if dispatch_error is not None:
-                    raise dispatch_error
                 tok.block_until_ready()
 
         self._queued_bytes += int(A.nbytes)

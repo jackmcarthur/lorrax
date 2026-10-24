@@ -194,8 +194,8 @@ static ffi::Error SolveLu(
     // handlers — see host_collective_mutex() in cpp/mesh/ctx.h.
     std::lock_guard<std::mutex> lock(
         lorrax_ffi::mesh::host_collective_mutex());
-    // MKL team pin, same rationale + knob as the eigh handler
-    // (LORRAX_SCALAPACK_MKL_THREADS; measured matrix in blacs_grid.h).
+    // MKL team pin, same rationale + cap as the eigh handler
+    // (measured matrix in blacs_grid.h).
     lorrax_ffi::scalapack::MklThreadScope mkl_scope(
         lorrax_ffi::scalapack::scalapack_mkl_threads());
     const auto dtype = A.element_type();

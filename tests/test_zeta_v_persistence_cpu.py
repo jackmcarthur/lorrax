@@ -154,11 +154,10 @@ def test_completion_error_uses_collective_io_verdict(monkeypatch, tmp_path, fail
     assert zeta.pending_file is not None
 
 
-@pytest.mark.parametrize("truncated", [False, True])
-def test_charge_caller_defers_payload_and_provenance(monkeypatch, truncated):
+def test_charge_caller_defers_payload_and_provenance(monkeypatch):
     from gw import isdf_fitting
     from file_io import isdf_header
-    zeta = SimpleNamespace(pending_file={"complete": not truncated, "provenance": None})
+    zeta = SimpleNamespace(pending_file={"complete": True, "provenance": None})
     calls = []
     def fit(**kwargs):
         calls.append(kwargs)
@@ -175,7 +174,6 @@ def test_charge_caller_defers_payload_and_provenance(monkeypatch, truncated):
         jax_profile=SimpleNamespace(trace_section=lambda *_a: nullcontext()),
         log=SimpleNamespace(info=lambda *_a: None),
         _gate_fresh_zeta_rank_findings=lambda *_a, **_k: None,
-        active_zeta_truncating_knobs=lambda: [("LORRAX_MAX_RCHUNKS", "1")] if truncated else [],
         barrier=lambda *_a: None)
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
     caller = namespace[node.name]
@@ -185,6 +183,6 @@ def test_charge_caller_defers_payload_and_provenance(monkeypatch, truncated):
         cfg=SimpleNamespace(write_restart_tensors=True, backend=SimpleNamespace(
             distrib_la_batched_route="auto", zeta_rcond=1e-8)),
         meta=SimpleNamespace(nspinor=2), representation=SimpleNamespace(charge_lift=None))
-    assert caller(**arguments)[2] is zeta
+    assert caller(**arguments)[1] is zeta
     assert calls[0]["defer_zeta_write"] is True and calls[0]["write_zeta_file"] is True
-    assert zeta.pending_file["provenance"] == (None if truncated else '{"fixture":93}')
+    assert zeta.pending_file["provenance"] == '{"fixture":93}'

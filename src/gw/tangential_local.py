@@ -358,8 +358,6 @@ def pack_round(fields, widths, nodes, infinity, infinity_width, *, extent, halve
     carrier ``column_extent(count)`` (a static ladder table), sets ``points`` to its node
     (a per-map constant table read at the panel's device index) and ``active`` on its count,
     and advances the position: the host loop of ``round_tables``, element for element.
-    ``LORRAX_CHECK_COUNTS=1`` reads the device tables back and refuses unless they equal
-    the host's (one read; diagnostic).
     """
     import numpy as np
     from gw.tangential_directions import device_index
@@ -725,22 +723,12 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
     exact-zero columns ever leave the solve.  ``beside`` (the ledger Price of the round's
     operands): the program is admitted and booked at its compiled executable, which then runs.
     """
-    import os
-    import numpy as np
     widths = [int(st[1].shape[-1]) for st in states]
     halves = int(tables["order"].shape[-1]) // int(tables["extent"])
     live, points, active, (q, o, d) = pack_round(
         tuple([st[k] for st in states] for k in (1, 2, 3)), widths, tables["nodes"],
         tuple(infinity), int(infinity[0].shape[-1]), extent=int(tables["extent"]), halves=halves,
         blocks=int(tables["blocks"]), real=real, mesh_xy=mesh_xy, column_extent=tables["column_extent"])
-    if os.environ.get("LORRAX_CHECK_COUNTS", "0") not in ("", "0"):
-        want = (np.arange(len(tables["own"])) < int(real), tables["points"], tables["active"])
-        same = all(np.array_equal(np.asarray(s.data), np.asarray(w)[s.index])     # diagnostic only:
-                   for g, w in zip((live, points, active), want)                 # this process's shards
-                   for s in g.addressable_shards)
-        if not same:
-            raise ValueError("GATE tangential_round_tables_device: the device-built round tables "
-                             "differ from the host's (live, points, active)")
     args = (live, points, active, q, o, d, tuple(infinity))
     budget = None if keep_budget is None else int(keep_budget)
     program = round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments), budget,

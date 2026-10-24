@@ -503,8 +503,7 @@ def resolve_n_reorth(n_reorth: int | None, depth: int) -> int:
 #
 # The route reads no environment: ``solvers`` is L2 and must be a function of
 # its arguments (``tools/lint/test_layering.py::test_no_l2_module_reads_the_
-# environment``).  ``LORRAX_LANCZOS_REORTH`` is retired and refuses by name in
-# ``bse.bse_lanczos``.
+# environment``).
 
 
 def reorth_collective_count(max_iter: int) -> int:

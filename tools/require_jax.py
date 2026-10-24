@@ -22,7 +22,6 @@ from importlib import metadata
 from pathlib import Path
 
 
-_FALSE_VALUES = {"", "0", "false", "no", "off"}
 _ROOT = Path(__file__).resolve().parents[1]
 _JAX_SUPPORT = _ROOT / "src" / "runtime" / "jax_support.py"
 _LEGS = _ROOT / "services" / "lxkit" / "src" / "lxkit" / "legs.py"
@@ -51,15 +50,6 @@ def _release(version: str) -> tuple[int, int, int]:
 
 
 def main() -> int:
-    override = os.environ.get("LORRAX_JAX_UNSUPPORTED_OK", "")
-    if override.strip().lower() not in _FALSE_VALUES:
-        print(
-            "JAX_ENV_REFUSED: LORRAX_JAX_UNSUPPORTED_OK is enabled; "
-            "unsupported-JAX overrides are forbidden for LORRAX drivers",
-            file=sys.stderr,
-        )
-        return 86
-
     support = _load("_lorrax_jax_support", _JAX_SUPPORT)
     legs = _load("_lorrax_legs", _LEGS)
     plugin_names = legs.installed_plugin_names()

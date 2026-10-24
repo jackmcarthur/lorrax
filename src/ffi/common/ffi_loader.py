@@ -774,7 +774,6 @@ def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
         path, platform=platform, expected_abi=LORRAX_FFI_ABI_VERSION,
         abi_symbols=_ABI_SYMBOLS,
         build_hint=str(_PLATFORMS[platform]["build_hint"]),
-        strict_unstamped=os.environ.get("LORRAX_FFI_ABI_STRICT", "") == "1",
         unusable_cls=FfiLibraryUnusable, mismatch_cls=FfiAbiMismatch)
     _set_argtypes(lib, platform)
     _register_ffi_targets(lib, platform)

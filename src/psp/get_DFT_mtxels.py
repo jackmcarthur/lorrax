@@ -495,17 +495,6 @@ _RHO_SYM_PERM_CACHE: dict[tuple, "np.ndarray | None"] = {}
 RHO_SYM_WARN = 1.0e-3
 
 
-def density_symmetrisation_enabled() -> bool:
-    """``LORRAX_RHO_SYMMETRISE``: ``0``/``off``/``no`` turns it off.
-
-    An escape hatch for A/B measurement and for a deck whose symmetry
-    block is under suspicion; on by default, because an unsymmetrised ρ is
-    wrong for every reduced k-set and imprecise for every other one.
-    """
-    raw = os.environ.get("LORRAX_RHO_SYMMETRISE", "1").strip().lower()
-    return raw not in ("0", "off", "false", "no")
-
-
 def _rho_sym_perm(wfn, fft_grid: tuple[int, int, int]):
     """The space group's FFT-grid permutation table, or None.
 
@@ -581,11 +570,6 @@ def symmetrize_valence_density(rho_r, wfn, *, print_fn=None):
     ``translations`` (a :class:`wfn_loader.WfnLoader` everywhere in
     production); one that does not is left alone.
     """
-    if not density_symmetrisation_enabled():
-        if print_fn is not None:
-            print_fn("    rho symmetrisation: OFF "
-                     "(LORRAX_RHO_SYMMETRISE); rho used as accumulated")
-        return rho_r
     grid = tuple(int(s) for s in np.shape(rho_r))
     perm = _rho_sym_perm(wfn, grid)
     if perm is None:

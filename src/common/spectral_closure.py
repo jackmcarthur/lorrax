@@ -42,16 +42,10 @@ DROPPED** — the keep-fewer direction — on the owner's ruling of 2026-08-10:
      the middle of a block of degenerate singular values we should truncate
      the whole block."
 
-Three modes, spelled the way its sibling spells them:
-
-``"snap"`` (default)
-    Close the cut in :data:`DEFAULT_DIRECTION` and say so, loudly, naming the
-    cluster's values, its size, and the cut it moved.
-``"strict"``
-    Refuse, naming the same things and the rank that would work.
-``"off"``
-    No check.  Kept for the same reason its sibling keeps one: a guard with
-    no off switch gets deleted rather than configured.
+One behaviour: close the cut in :data:`DEFAULT_DIRECTION` and say so,
+loudly, naming the cluster's values, its size, and the cut it moved.  (The
+``strict`` and ``off`` modes and their environment dial were removed in the
+2026-10 env prune.)
 
 THE TWO-RULE FAMILY, BECAUSE THE SIBLINGS ROUND OPPOSITE WAYS ON PURPOSE
 ------------------------------------------------------------------------
@@ -81,9 +75,7 @@ about which physical states enter the calculation and half a multiplet is
 not a state of anything.  Its default is ``strict`` on the owner's ruling of
 2026-08-10 — a widened window is a DIFFERENT CALCULATION (4v4c became 4v8c,
 1024 dimensions became 2048, and a gate read 0.0906 eV of regression that no
-branch had caused), so it refuses rather than repairing, and its env row in
-``docs/reference/env_vars.md`` (``LORRAX_BAND_DEGENERACY``) carries the standing
-rule: **never set ``snap`` to make a gate pass.**  That guard is untouched by
+branch had caused), so it refuses rather than repairing.  That guard is untouched by
 this module and by the ruling above.
 
 The one-line discriminator: **a band window says WHICH STATES exist and
@@ -170,7 +162,7 @@ never brings its eigenvalues to host.  So this module has two faces over one
 criterion.
 
 :func:`resolve_spectral_cut` / :func:`cluster_at_cut` are host numpy: full
-report, full messages, ``strict`` raises where it is called.
+report, full messages.
 
 :func:`close_keep_mask` is pure ``jnp``, batched, jit- and vmap-safe, and
 returns the moved mask plus the numbers a caller needs to print.  It is a
@@ -178,16 +170,6 @@ cumulative-AND over adjacency links rather than a while-loop, so its trip
 count does not depend on the data — a REVERSE one running up from the cut
 for ``drop_block``, a forward one running down from the top for
 ``keep_block``, which is the only structural difference between the two.
-
-``strict`` at a device site cannot raise where it fires — a jitted kernel
-cannot raise at all, which is the same division of labour
-``centroid/pivoted_cholesky`` already documents ("a jitted kernel cannot
-raise, so it reports and this refuses").  So a device site that fires under
-``strict`` records the finding through a host callback and
-:func:`raise_if_pending` refuses at the next host seam, before the result is
-consumed.  The alternative — letting one seam refuse and another whisper —
-is the failure ``band_degeneracy`` names in its own ``check_band_window``
-docstring, and it is not repeated here.
 
 RELATION TO ``common/rank_criterion``
 -------------------------------------
@@ -210,7 +192,7 @@ THE ONE FAILURE THE DROP DIRECTION HAS AND THE KEEP DIRECTION DOES NOT is
 that a block can swallow the entire retained set: if every value from
 ``σ_max`` down to the cut is one degenerate block, dropping it leaves rank
 zero.  That is not a repair and it is never applied silently —
-:func:`resolve_spectral_cut` RAISES on it in every mode but ``off``, and the
+:func:`resolve_spectral_cut` RAISES on it, and the
 device face reports a zero count its caller must refuse on.  It means the
 spectrum is flat to ``rtol_deg`` across the whole retained range, which is a
 statement about the operator and not about the cut.
@@ -221,8 +203,6 @@ import math
 
 __all__ = [
     "DEFAULT_RTOL",
-    "DEFAULT_MODE",
-    "MODES",
     "DEFAULT_DIRECTION",
     "DIRECTIONS",
     "SpectralClusterError",
@@ -232,11 +212,7 @@ __all__ = [
     "resolve_spectral_cut",
     "describe_clean",
     "close_keep_mask",
-    "resolve_mode",
     "resolve_direction",
-    "note_device_snap",
-    "raise_if_pending",
-    "pending",
 ]
 
 #: f64 unit round-off.  Spelled out rather than imported so this module stays
@@ -253,16 +229,7 @@ _EPS64 = 2.220446049250313e-16
 #: of them.
 DEFAULT_RTOL: float = 1.0e-6
 
-#: The three modes, in the order the docstring introduces them.
-MODES = ("snap", "strict", "off")
-
-#: THE ONE PLACE THE DEFAULT IS DECIDED.  Every function default and every
-#: call site reads this name — the way ``snap`` survived a day as an unwanted
-#: default in the band-window guard was that "the default" was spelled six
-#: times in three files.
-DEFAULT_MODE: str = "snap"
-
-#: WHICH WAY A STRADDLED BLOCK IS CLOSED.  Orthogonal to :data:`MODES`, which
+#: WHICH WAY A STRADDLED BLOCK IS CLOSED.  Orthogonal to the retired modes, which
 #: says only whether the guard repairs, refuses, or is absent.
 #:
 #: ``"drop_block"``
@@ -279,25 +246,12 @@ DEFAULT_MODE: str = "snap"
 #:     report, not a flag to set.
 DIRECTIONS = ("drop_block", "keep_block")
 
-#: THE ONE PLACE THE DIRECTION IS DECIDED.  Same rule as :data:`DEFAULT_MODE`:
+#: THE ONE PLACE THE DIRECTION IS DECIDED.  One spelling, read by every
 #: spelled once, read by every function default and every call site.
 DEFAULT_DIRECTION: str = "drop_block"
 
-#: NAME of the environment dial the callers read — the seams this guard sits
-#: in have no deck key yet, so the mode arrives from the environment.
-#:
-#: THIS MODULE DOES NOT READ IT.  ``tools/lint/test_layering.py``: "L2 is
-#: physics-agnostic mathematics and must be a function of its arguments … if
-#: it must come from the environment, the driver reads it and passes it."
-#: So the NAME lives here, once, and each call site does the ``os.environ``
-#: lookup itself and hands the answer to :func:`resolve_mode`.  That keeps
-#: both rules: no literal is duplicated, and this module stays a function of
-#: its arguments.
-MODE_ENV = "LORRAX_SPECTRAL_CLOSURE"
-
-
 class SpectralClusterError(RuntimeError):
-    """A rank cut falls inside a degenerate block, in ``strict`` mode."""
+    """A rank cut falls inside a degenerate block and cannot be closed."""
 
 
 class SpectralBlockEmptiesCut(SpectralClusterError):
@@ -305,29 +259,10 @@ class SpectralBlockEmptiesCut(SpectralClusterError):
 
     The failure that only the ``drop_block`` direction has: the block
     straddling the cut reaches all the way to ``σ_max``, so there is no
-    non-empty closed retained set below the cut.  Raised in every mode but
-    ``off``, because a silent rank of zero is not a repair — see the module
+    non-empty closed retained set below the cut.  Always raised, because a
+    silent rank of zero is not a repair — see the module
     docstring's closing paragraph.
     """
-
-
-def resolve_mode(explicit=None) -> str:
-    """Validate a mode and supply :data:`DEFAULT_MODE` when there is none.
-
-    ``explicit`` is whatever the caller read — typically
-    ``os.environ.get(MODE_ENV)``, which is ``None`` when unset.  A
-    mis-spelled mode RAISES rather than falling back to ``off``: a guard
-    silently disarmed by a typo is worse than no guard, because the log then
-    shows a clean run.
-    """
-    if explicit is None:
-        return DEFAULT_MODE
-    mode = str(explicit).strip().lower()
-    if mode not in MODES:
-        raise ValueError(
-            f"{MODE_ENV}={mode!r} is not one of {MODES}.  A mis-spelled guard "
-            f"mode is not silently 'off'.")
-    return mode
 
 
 def resolve_direction(explicit=None) -> str:
@@ -609,7 +544,7 @@ def describe_clean(info, *, where):
             f"tolerance).  No degenerate block is cut.")
 
 
-def resolve_spectral_cut(values, n_keep, *, rtol=DEFAULT_RTOL, mode=None,
+def resolve_spectral_cut(values, n_keep, *, rtol=DEFAULT_RTOL,
                          direction=None, where="spectral cut", rcond=None,
                          log=print):
     """Return a retained count whose cut does not slice a degenerate block.
@@ -620,45 +555,25 @@ def resolve_spectral_cut(values, n_keep, *, rtol=DEFAULT_RTOL, mode=None,
     numbers whether or not the guard fired — "no news" and "a good number"
     must not look alike (preamble measurement rule 10).
 
-    ``mode`` defaults to :func:`resolve_mode` (``snap``, or the
-    ``LORRAX_SPECTRAL_CLOSURE`` env).  ``strict`` raises
-    :class:`SpectralClusterError`; ``off`` returns the proposal untouched
-    and does not even look.
-
     ``direction`` defaults to :data:`DEFAULT_DIRECTION` — drop the straddled
     block.  It is a source-level argument with no environment dial; see
     :func:`resolve_direction`.
 
-    RAISES :class:`SpectralBlockEmptiesCut` in ``snap`` as well as ``strict``
-    when dropping the block would leave rank zero.  A repair that returns an
+    RAISES :class:`SpectralBlockEmptiesCut` when dropping the block would
+    leave rank zero.  A repair that returns an
     empty basis is not a repair, and the caller cannot tell an empty result
     from a working one by its type.
     """
-    m = resolve_mode(mode)
     d = resolve_direction(direction)
-    if m == "off":
-        # ``rtol = -1`` can never fire (a relative gap is >= 0), so ``off``
-        # still returns the FULL dict — the numbers stay available to a log
-        # line even when the guard is disarmed, and no caller has to special-
-        # case a short dict.
-        return int(n_keep), cluster_at_cut(values, n_keep, rtol=-1.0,
-                                           direction=d)
     info = cluster_at_cut(values, n_keep, rtol=rtol, direction=d)
     if not info["fired"]:
         return int(info["n_keep"]), info
     msg = _message(info, where=where, rcond=rcond)
     if d == "drop_block" and info["empties"]:
         raise SpectralBlockEmptiesCut(
-            msg + f"\n  This is not a mode question: no mode but 'off' can "
-                  f"return rank 0 here.  Fix: raise rcond so the cut lands "
+            msg + f"\n  Fix: raise rcond so the cut lands "
                   f"above the flat range, or establish that this operator is "
                   f"genuinely rank-{info['n_keep_kept']} and cut there.")
-    if m == "strict":
-        raise SpectralClusterError(
-            msg + f"\n  Fix: keep {info['n_keep_closed']} instead of "
-                  f"{info['n_keep']}, or run with LORRAX_SPECTRAL_CLOSURE=snap "
-                  f"to move the cut automatically, or =off to cut through the "
-                  f"block deliberately.")
     for line in msg.splitlines():
         log(f"*** {line}")
     log(f"*** {'DROPPED THE BLOCK' if d == 'drop_block' else 'KEPT THE BLOCK'}"
@@ -786,52 +701,3 @@ def close_keep_mask(values, keep, *, rtol=DEFAULT_RTOL, direction=None):
         order, inverse_values, dimension=order.ndim - 1, is_stable=True)
     keep_out = jnp.take_along_axis(keep_s_out, inv, axis=-1)
     return keep_out, n_keep, jnp.sum(keep_s_out, axis=-1)
-
-
-# ---------------------------------------------------------------------------
-# Deferred refusal, for the seams where the guard fires inside a jit
-# ---------------------------------------------------------------------------
-
-_PENDING: list[str] = []
-
-
-def note_device_snap(where, n_keep, n_keep_out) -> None:
-    """Record a device-site firing so a host seam can refuse under ``strict``.
-
-    Called from ``jax.debug.callback`` inside the ζ kernels.  It records; it
-    does not raise, because raising out of a host callback inside XLA is not
-    a contract this tree relies on.  :func:`raise_if_pending` is the refusal.
-    """
-    _PENDING.append(
-        f"{where}: the rank cut fell inside a degenerate block on at least "
-        f"one q — retained rank {int(n_keep)} would have become "
-        f"{int(n_keep_out)} under snap ({DEFAULT_DIRECTION}).")
-
-
-def pending() -> list[str]:
-    """The findings recorded so far.  Read-only view, for gates."""
-    return list(_PENDING)
-
-
-def raise_if_pending(where="spectral cut", *, mode=None, log=print) -> None:
-    """Refuse, under ``strict``, for any device-site firing recorded since the last call.
-
-    Placed at the first host seam after a jitted truncation, so ``strict``
-    means the same thing at a device site as at a host one.  Always clears,
-    so a later stage cannot inherit an earlier stage's finding.
-    """
-    m = resolve_mode(mode)
-    found, _PENDING[:] = list(_PENDING), []
-    if not found:
-        return
-    body = "\n".join(f"  - {f}" for f in found)
-    if m == "strict":
-        raise SpectralClusterError(
-            f"[spectral-closure] {where}: {len(found)} spectral cut(s) fell "
-            f"inside a degenerate block.\n{body}\n"
-            f"  Fix: LORRAX_SPECTRAL_CLOSURE=snap moves each cut off its "
-            f"block by DROPPING the block whole (the owner's ruling of "
-            f"2026-08-10), which lowers the retained rank and can only lower "
-            f"kappa_eff with it; =off cuts through deliberately.")
-    for f in found:
-        log(f"*** [spectral-closure] {f} ***")

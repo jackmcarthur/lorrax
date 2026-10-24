@@ -16,9 +16,6 @@ covariant under the space group.
 
 ``h_transform`` runs that on a k path; ``bandstructure.bse_setup`` runs the
 same fH on a fine grid for the BSE.  The CLI is ``bandstructure.htransform``.
-
-This module reads one environment variable, ``LORRAX_EXTRA_RANK_PAD``, through
-:func:`resolve_extra_rank_pad` (test-only pad invariance, rule 2b).
 """
 import os
 import time
@@ -92,29 +89,6 @@ def _build_mesh_xy() -> Mesh:
 # A QP run reuses a DFT fit only when this file (or a link the user placed
 # here) carries the exact provenance; no other directory is searched.
 GALERKIN_BASIS_FILE = "galerkin_dft.h5"
-
-
-def resolve_extra_rank_pad() -> int:
-    """``LORRAX_EXTRA_RANK_PAD`` (default 0) — TEST-ONLY pad-invariance knob.
-
-    The one env resolver for the rank axis's extra null directions (see
-    the block comment at the use site); blank/unset → 0, negative or
-    non-integer REFUSES naming the variable.  Never set in production.
-    """
-    raw = os.environ.get("LORRAX_EXTRA_RANK_PAD")
-    if raw is None or not raw.strip():
-        return 0
-    try:
-        extra = int(raw)
-    except ValueError:
-        raise ValueError(
-            f"LORRAX_EXTRA_RANK_PAD={raw!r} is not an integer.  Accepted: "
-            f"a non-negative int, or unset/blank for 0 (no extra pad).") \
-            from None
-    if extra < 0:
-        raise ValueError(
-            f"LORRAX_EXTRA_RANK_PAD must be >= 0; got {extra}")
-    return extra
 
 
 def validate_centroid_subset_idx(selection, n_parent: int) -> np.ndarray:
@@ -242,7 +216,6 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     """
     if log_fn is None:
         log_fn = lambda *args, **kwargs: None
-    extra_rank_pad = resolve_extra_rank_pad()
     nodes = (np.asarray(centroid_indices, dtype=np.int64).reshape(-1, 3)
              if wfn_path is None else htransform_nodes(
                  wfn, centroid_indices, band_range, wfn_path=wfn_path,
@@ -254,7 +227,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                 os.fspath(basis_path), wfn=wfn, meta=meta,
                 centroid_indices=centroid_indices, node_indices=nodes,
                 band_range=band_range, bispinor=bispinor, refit_rcond=qr_eps,
-                mesh_xy=mesh_xy, extra_rank_pad=extra_rank_pad)
+                mesh_xy=mesh_xy)
         except GalerkinBasisMismatch as exc:
             log_fn(f"  [galerkin-basis] REFIT: {basis_path} was fitted for "
                    f"other inputs ({exc}); fitting in memory, the file is "
@@ -277,7 +250,6 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         band_chunk_size=band_chunk_size,
         bispinor=bispinor,
         refit_rcond=qr_eps,
-        extra_rank_pad=extra_rank_pad,
         rank_record_fn=rank_record_fn,
     )
     if publish:

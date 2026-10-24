@@ -458,52 +458,6 @@ def test_auditor_swallowed_barriers_does_not_fire_on_a_real_handler():
 
 
 # ===========================================================================
-# R4 — a truncated zeta must not be stamped complete
-# ===========================================================================
-
-def _audit_truncation_guard(src, name, stamp_fn):
-    """``[]`` when ``stamp_fn`` is reached only past a truncation check."""
-    tree = _tree(src, name)
-    calls = _call_names(tree)
-    stamps = calls.get(stamp_fn, [])
-    guards = calls.get("active_zeta_truncating_knobs", [])
-    if not stamps:
-        return ["%s never calls %s" % (name, stamp_fn)]
-    if not guards:
-        return ["%s calls %s with no truncation guard" % (name, stamp_fn)]
-    if min(guards) >= min(stamps):
-        return ["%s evaluates the truncation guard AFTER %s" % (name, stamp_fn)]
-    return []
-
-
-def test_isdf_fitting_does_not_mark_a_truncated_zeta_done():
-    """R4.  ``LORRAX_MAX_RCHUNKS=N`` breaks the r-chunk loop early and the
-    writer downstream still stamped ``zeta_is_done=True`` — the file lying
-    about itself.  ``gw_init``'s existing guard blocks REUSE; this one stops
-    the claim being written."""
-    assert _audit_truncation_guard(
-        _read("gw/isdf_fitting.py"), "isdf_fitting", "mark_zeta_done") == []
-
-
-def test_gw_init_still_guards_the_provenance_stamp():
-    """The sibling guard must not have regressed while R4 landed."""
-    assert _audit_truncation_guard(
-        _read("gw/gw_init.py"), "gw_init", "stamp_fit_provenance") == []
-
-
-def test_auditor_truncation_guard_can_fail():
-    """NEGATIVE CONTROL: unguarded, and guarded-too-late."""
-    unguarded = "def f(p):\n    mark_zeta_done(p)\n"
-    assert _audit_truncation_guard(unguarded, "u", "mark_zeta_done")
-    too_late = ("def f(p):\n    mark_zeta_done(p)\n"
-                "    t = active_zeta_truncating_knobs()\n")
-    bad = _audit_truncation_guard(too_late, "l", "mark_zeta_done")
-    assert bad and "AFTER" in bad[0], bad
-    missing = "def f(p):\n    pass\n"
-    assert _audit_truncation_guard(missing, "m", "mark_zeta_done")
-
-
-# ===========================================================================
 # R5 — retired full-BZ selection has no runtime readers.
 # ===========================================================================
 
@@ -586,24 +540,25 @@ def test_auditor_env_grammar_can_fail():
 
 def test_runtime_env_falsy_reads_blank_as_unset():
     """R6.  ``""`` used to be in ``_FALSY_TOKENS``, so
-    ``export LORRAX_MALLOC_TUNE=`` DISABLED a default-on knob."""
+    ``export LORRAX_MALLOC_TUNE=`` DISABLED a default-on knob (that knob
+    is gone; the check stands on a neutral name)."""
     assert "" not in _runtime._FALSY_TOKENS
     for blank in ("", " ", "\t", "\n"):
-        with _Env(LORRAX_MALLOC_TUNE=blank):
-            assert _runtime._env_falsy("LORRAX_MALLOC_TUNE") is False
-            assert _runtime._env_falsy("LORRAX_MALLOC_TUNE", "0") is True
+        with _Env(LORRAX_TEST_KNOB=blank):
+            assert _runtime._env_falsy("LORRAX_TEST_KNOB") is False
+            assert _runtime._env_falsy("LORRAX_TEST_KNOB", "0") is True
 
 
 def test_runtime_env_falsy_still_honours_real_falsy_tokens():
     """The half of the parser the fix must NOT have broken."""
     for tok in ("0", "off", "OFF", "false", " no ", "No"):
-        with _Env(LORRAX_MALLOC_TUNE=tok):
-            assert _runtime._env_falsy("LORRAX_MALLOC_TUNE") is True, tok
+        with _Env(LORRAX_TEST_KNOB=tok):
+            assert _runtime._env_falsy("LORRAX_TEST_KNOB") is True, tok
     for tok in ("1", "on", "yes", "true"):
-        with _Env(LORRAX_MALLOC_TUNE=tok):
-            assert _runtime._env_falsy("LORRAX_MALLOC_TUNE") is False, tok
-    with _Env(LORRAX_MALLOC_TUNE=None):
-        assert _runtime._env_falsy("LORRAX_MALLOC_TUNE") is False
+        with _Env(LORRAX_TEST_KNOB=tok):
+            assert _runtime._env_falsy("LORRAX_TEST_KNOB") is False, tok
+    with _Env(LORRAX_TEST_KNOB=None):
+        assert _runtime._env_falsy("LORRAX_TEST_KNOB") is False
 
 
 # ===========================================================================
