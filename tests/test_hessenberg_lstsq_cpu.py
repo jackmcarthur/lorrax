@@ -56,3 +56,31 @@ def test_invalid_carriers_are_not_hidden_and_other_legs_remain_bitwise(monkeypat
     assert np.isnan(owner.lstsq_hessenberg_local(np.zeros_like(h),badg,jnp.int32(0))).all()
     for active in (-1,17):
         assert np.isnan(owner.lstsq_hessenberg_local(h,g,jnp.int32(active))).all()
+
+
+def test_invalid_carriers_skip_the_svd_execution_arm(monkeypatch):
+    from distrib_la import local_svd as owner
+    monkeypatch.setattr(owner,'_process_leg_key',lambda:'ROCM')
+    original=owner.svd_local;calls=[]
+
+    def observed(a,*args,**kwargs):
+        jax.debug.callback(lambda width:calls.append(int(width)),jnp.int32(a.shape[1]))
+        return original(a,*args,**kwargs)
+
+    monkeypatch.setattr(owner,'svd_local',observed)
+    run=jax.jit(lambda h,g,k:owner.lstsq_hessenberg_local(h,g,k))
+    h=np.zeros((17,16),complex);h[0,0]=2;h[1,1]=3
+    g=np.zeros(17,complex);g[0]=1
+    np.asarray(run(h,g,jnp.int32(2)));jax.effects_barrier()
+    assert calls==[8]
+    calls.clear()
+    for bad_h,bad_g,active in ((h.copy(),g,2),(h.copy(),g,-1),
+                               (h.copy(),g,17),(np.zeros_like(h),g.copy(),0)):
+        if active==2:bad_h[10,10]=np.nan
+        if active==0:bad_g[-1]=np.nan
+        assert np.isnan(run(bad_h,bad_g,jnp.int32(active))).all()
+        jax.effects_barrier()
+        assert not calls
+    np.testing.assert_array_equal(run(np.zeros_like(h),g,jnp.int32(0)),0)
+    jax.effects_barrier()
+    assert not calls

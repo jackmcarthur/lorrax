@@ -104,11 +104,17 @@ def lstsq_hessenberg_local(h, g, active):
             return jnp.pad(y, (0, cap-width))
         return solve
 
-    index = sum(active > width for width in widths[:-1])
-    y = jax.lax.cond(active == 0, lambda _: jnp.zeros(cap, dtype),
-        lambda args: jax.lax.switch(index, tuple(branch(w) for w in widths), args), (h, g))
     inside = ((jnp.arange(cap+1)[:, None] <= active) &
               (jnp.arange(cap)[None, :] < active))
     valid = ((active >= 0) & (active <= cap) & jnp.all(jnp.isfinite(h)) &
              jnp.all(jnp.isfinite(g)) & jnp.all(jnp.where(inside, 0, h) == 0))
-    return jnp.where(valid, y, jnp.asarray(jnp.nan, dtype))
+    index = sum(active > width for width in widths[:-1])
+
+    def solve_valid(args):
+        return jax.lax.cond(active == 0, lambda _: jnp.zeros(cap, dtype),
+            lambda values: jax.lax.switch(index, tuple(branch(w) for w in widths), values), args)
+
+    # Never send a malformed/nonfinite carrier to the vendor SVD: masking its
+    # output afterward cannot recover from a driver stalled on the bad input.
+    return jax.lax.cond(valid, solve_valid,
+        lambda _: jnp.full(cap, jnp.nan, dtype), (h, g))
