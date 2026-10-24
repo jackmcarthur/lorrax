@@ -1749,7 +1749,48 @@ def main(argv=None) -> int:
     (out / "report.txt").write_text(text + "\n")
     if args.json:
         Path(args.json).write_text(json.dumps(doc, indent=1, default=str))
+    complete = len(ranks) == ctx["nranks"]
+    stamp_install(doc, v, meta, complete and not args.cpu_only)
     return 1 if v == "FAIL" else 0
+
+
+PROBE_STAMP = r"""
+import sys
+import runtime
+print("STAMP " + str(runtime.install_verification_stamp(sys.argv[1])), flush=True)
+"""
+
+
+def stamp_install(doc: dict, v: str, meta: dict, eligible: bool) -> None:
+    """Rank 0, after every rank's result is judged: a GPU PASS writes the verdict JSON at
+    ``runtime.install_verification_stamp(device kind)`` (the runtime warns INSTALL NOT
+    VERIFIED at every GPU startup until it exists); a FAIL removes it."""
+    if not meta.get("gpu") or not meta.get("device_kind"):
+        return
+    try:
+        cp = subprocess.run([sys.executable, "-c", PROBE_STAMP, str(meta["device_kind"])],
+                            env=single_process_env(os.environ), capture_output=True, text=True,
+                            timeout=300, cwd=tempfile.gettempdir())
+        line = next((x for x in cp.stdout.splitlines() if x.startswith("STAMP ")), None)
+    except (OSError, subprocess.SubprocessError):
+        line = None
+    if not line:
+        say("this install's runtime has no install_verification_stamp: nothing recorded")
+        return
+    stamp = Path(line[len("STAMP "):].strip())
+    if v == "FAIL":
+        if stamp.exists():
+            stamp.unlink()
+            say(f"removed the verification stamp {stamp}")
+        return
+    if not eligible:
+        say("not every rank reported: the install is not stamped as verified")
+        return
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    tmp = stamp.with_name(f".{stamp.name}.{socket.gethostname()}.{os.getpid()}")
+    tmp.write_text(json.dumps(doc, indent=1, default=str))
+    os.replace(tmp, stamp)
+    say(f"install verified for {meta['device_kind']}: {stamp}")
 
 
 if __name__ == "__main__":
