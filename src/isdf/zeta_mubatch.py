@@ -111,17 +111,23 @@ def best_owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_max: int):
     every bin fits ``c_max`` and the plan prices the widest batch that runs
     (CrI3 24x24 P36: 12-member orbits make the batch 432, not the 36 of
     c_max = 1).
-    ponytail: a linear scan over c and a fixed-cost guess of one centroid.
+    The shape search runs the same LPT partition on orbit metadata, then
+    materializes endpoint/wrap tables only at the winning width. Candidate
+    order and the fixed-cost guess of one centroid are unchanged.
     """
+    if max(1, int(c_max)) == 1:
+        return owner_orbit_batches(plan, mu_pad, n_ranks, c_target=1)
+    from gw.centroid_k_unfold import _partition_orbit_bins, _unfold_orbit_packing
+    packing = _unfold_orbit_packing(plan)
     best = None
     for c in range(max(1, int(c_max)), 0, -1):
-        mb = owner_orbit_batches(plan, mu_pad, n_ranks, c_target=c)
-        if best is not None and mb.c > c_max:
+        _, loads, width = _partition_orbit_bins(packing, 1, c)
+        if best is not None and width > c_max:
             continue                      # an orbit wider than c: no gain
-        cost = mb.n_batch * (mb.c + 1)
+        cost = -(-len(loads) // int(n_ranks)) * (width + 1)
         if best is None or cost < best[0]:
-            best = (cost, mb)
-    return best[1]
+            best = (cost, c)
+    return owner_orbit_batches(plan, mu_pad, n_ranks, c_target=best[1])
 
 
 def typed_child_G_tables(plan, *, fft_grid, sphere_par, gvec_child,
@@ -777,6 +783,8 @@ class ZetaG:
     @property
     def factor(self):
         """The factor operand of :func:`_logical_solve`: B, C⁺ or (LU, pivots)."""
+        if self.L_q is None:
+            raise ValueError("ZetaG: fit factor was retired after its consuming V pass")
         return self.L_q if self.lu_piv is None else (self.L_q, self.lu_piv)
 
     def write_file(self, zeta_io, *, print_fn=None):
@@ -992,9 +1000,20 @@ class ZetaG:
         """Positions in :attr:`shell` of the stored-sphere slots ``sel (Q, j)``."""
         return shell_positions(self.shell_slots, sel)
 
+    def release_fit_factor(self):
+        """Retire this owner's factor after its last contraction, retaining head columns.
+
+        The consuming driver calls this only after all G tiles and requested
+        writes have completed. Other owners' references remain valid; no array
+        is deleted. Generic ``contract_v``/``write_file`` calls remain reusable
+        until that explicit retirement.
+        """
+        self.L_q = self.lu_piv = None
+
     def close(self):
         self.store.close()
-        self.L_q = self.lu_piv = self.shell = None
+        self.release_fit_factor()
+        self.shell = None
 
 
 def _debug_enabled() -> bool:
@@ -1057,7 +1076,11 @@ def _face_kernels(mesh, Q, g_tile, with_v, inverse=False):
     if hit is not None:
         return hit
     face, mush = NamedSharding(mesh, P(None, 'x', 'y')), NamedSharding(mesh, P(None, _XY, None))
-    to_face = jax.jit(lambda Z: Z[:Q], out_shardings=face)
+    # The store is q-owned. A sharding constraint from that batch layout
+    # to the face makes GSPMD replicate the entire Q_pad x mu x G tile.
+    # Use the same explicit exchange as the other q-owner finalizers, with
+    # the logical-q crop after the exchange so padded parents stay inert.
+    to_face = _to_mu_owner(mesh, Q, 'xy')
     from distrib_la import matmul
     gemm = partial(matmul, mesh=mesh, batched_route="auto", budget_bytes=room)
     apply = jax.jit((lambda F, Z: gemm(F, Z)) if inverse else

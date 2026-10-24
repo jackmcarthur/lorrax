@@ -2143,17 +2143,14 @@ def _local_block_shape(shape, axis_count_per_dim, axis_flat, mesh_shape):
 
 
 def _disjoint_waves(batch):
-    """Split read_multi requests into waves whose file selections are disjoint.
+    """Split read_multi requests into waves with one request per dataset.
 
-    HDF5's multi-dataset selection I/O refuses two selections of one call that
-    share a file address ("duplicate addr in selections", 1.14.3, measured on
-    the gate's repeated-parent case). A round repeats its last parent, and a
-    sparse face read takes one run per parent, so: an identical request is
-    read once and aliased (``aliases``: ``(i, j)`` = request i takes j's
-    value); a request whose valid box overlaps one already in a wave on the
-    same dataset starts or joins a later wave. Normally one wave. Boxes are the
-    global ``[offset, offset + valid_shape)``, so the split is the same on
-    every rank.
+    H5Dread_multi permits each unique dataset only once, even for disjoint
+    selections (HDF5 1.14.3 refuses duplicate dataset addresses). A sparse
+    parent round can read several runs of one dataset: identical requests are
+    read once and aliased (``(i, j)`` = request i takes j's immutable value),
+    while distinct requests of that dataset go in separate waves. Different
+    datasets still batch together. The request metadata is rank-identical.
     """
     first, aliases, waves = {}, [], []
     for entry in batch:
@@ -2164,9 +2161,7 @@ def _disjoint_waves(batch):
             continue
         first[key] = i
         for wave in waves:
-            if not any(n == name and all(o < po + pv and po < o + v
-                                         for o, v, po, pv in zip(off, vshape, poff, pvs))
-                       for _, n, poff, pvs, _ in wave):
+            if not any(n == name for _, n, *_ in wave):
                 wave.append(entry)
                 break
         else:

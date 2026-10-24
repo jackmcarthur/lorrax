@@ -3,7 +3,6 @@
 # The ONE MPI every Frontier (OLCF) FFI build links, with the LibSci and HDF5
 # built against it, and the directories a run resolves them from.  Sourced by
 #   host leg: config/frontier/build_ffi_host.sh
-#   SLATE:    config/frontier/build_slate_cpu.sh
 #   runtime:  config/frontier/ffi_env.sh
 # and, when it exists, by the ROCm leg's build, which must link the same libmpi.
 # Frontier twin of config/perlmutter/ffi_mpi.sh.
@@ -22,14 +21,8 @@
 # the ones the host leg is validated with on Perlmutter (ffi_mpi.sh there);
 # all three exist on Frontier at byte-identical /opt/cray/pe paths.
 #
-# The OLCF Spack modules slate/2023.11.05 and slate/2024.10.29 are
-# gpu_backend=none (spec rocm=false cuda=false) but link libopenblas.so.0 and
-# their own BLAS++/LAPACK++ (libslate.so.1): beside LibSci's ScaLAPACK that is
-# two BLAS vendors in one process (GATE 2).  SLATE is therefore built from
-# source against this LibSci and MPI by build_slate_cpu.sh.
-#
 # To move to a new MPI, change these values and nothing else.  Every value
-# must still agree with the phdf5 module's and SLATE's DT_NEEDED; GATE 1
+# must still agree with the phdf5 module's DT_NEEDED; GATE 1
 # (gate_one_mpi.sh) enforces that.
 # ============================================================================
 LORRAX_OLCF_PRGENV_MODULE="PrgEnv-gnu/8.7.0"          # gcc-native/13.2

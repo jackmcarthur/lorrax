@@ -18,7 +18,7 @@ CPU collectives (JAX_CPU_COLLECTIVES_IMPLEMENTATION)
           ├── Frontera:   patched adapter → Intel MPI → libfabric mlx
           └── Perlmutter: unmodified adapter → Cray MPICH → Slingshot
 GPU collectives — NCCL through XLA; cuSOLVERMp and cuBLASMp also use NCCL
-Native MPI (parallel HDF5, SLATE, ScaLAPACK) — the site MPI, linked directly
+Native MPI (parallel HDF5, ScaLAPACK, ELPA) — the site MPI, linked directly
 ```
 
 | run | JAX collectives |
@@ -150,7 +150,7 @@ MULTIPLE:
 - multi-process CPU startup queries the live grant through
   `MPIABI_Query_thread` on `MPITRAMPOLINE_LIB` and refuses below MULTIPLE,
   before any XLA clique exists;
-- `src/ffi/cpp/common/mpi_thread_guard.h` (parallel HDF5, SLATE)
+- `src/ffi/cpp/common/mpi_thread_guard.h` (parallel HDF5, the mesh context)
   calls `MPI_Init_thread(MULTIPLE)` only when nothing initialized MPI first,
   and `MPI_Abort`s the world before its first collective when the grant is
   below MULTIPLE.
@@ -213,7 +213,7 @@ the `I_MPI_DEBUG>=4` `libfabric provider:` banner to see which one ran;
 
 The native libraries link the site MPI directly, not through MPItrampoline,
 and initialize it only when nothing else has (`mpi_thread_guard.h`), so they
-coexist with XLA's initialization. SLATE and ScaLAPACK split
+coexist with XLA's initialization. ScaLAPACK and ELPA (the mesh context) split
 `MPI_COMM_WORLD` in mesh order. On GPU runs no LORRAX path hands a device
 buffer to MPI: parallel HDF5 moves host buffers, and cuSOLVERMp and cuBLASMp
 communicate through NCCL. That is why Cray MPICH GPU support can stay off on

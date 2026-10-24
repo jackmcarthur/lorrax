@@ -2,10 +2,8 @@
 
 One public API for ``polar_factor``, ``eigh``, ``cholesky``, ``solve_lu`` and
 ``matmul`` on an ``('x','y')`` device mesh, over four backend families:
-**scalapack/PBLAS** (CPU preferred),
-**slate** (CPU fallback where it is not broken; ROCm always,
-declared-untested), **cusolvermp** (CUDA preferred) and **native**
-(pure JAX, everywhere).  A caller says what it wants computed and on which mesh;
+**scalapack/PBLAS** (CPU), **cusolvermp** (CUDA), **elpa** (ROCm eigh) and
+**native** (pure JAX, everywhere).  A caller says what it wants computed and on which mesh;
 which library runs is a resolved fact it can read but never has to
 branch on.
 
@@ -14,7 +12,7 @@ a consumer needs is a top-level name here, and importing
 ``distrib_la.<submodule>`` from outside is a layering violation the
 monorepo's ``tools/lint/test_layering.py`` fails on.  That is what makes
 "only distrib_la sees the provider families" checkable rather than
-aspirational — ScaLAPACK, SLATE and cuSOLVERMp appear in
+aspirational — ScaLAPACK, ELPA and cuSOLVERMp appear in
 exactly one dependency edge in this package (:mod:`distrib_la.loader`, which
 dlopens a ``.so`` by path) and in zero of its declared dependencies.
 
@@ -108,7 +106,7 @@ from distrib_la.blocks import (diagonal_like, face_sharding, hermitian_block,
                                hermitian_part, join_columns, on_face)
 from distrib_la.subspace import plan_orthogonalization, plan_subspace, subspace_route, SUBSPACE_ROUTE
 from distrib_la.active_subspace import LocalSubspacePlan, plan_local_subspace
-from distrib_la.workspace import eigh_stack_bytes, eigh_stack_proposal, lu_workspace_bytes, lu_workspace_query, workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
+from distrib_la.workspace import eigh_stack_bytes, eigh_stack_proposal, local_eigh_workspace, lu_workspace_bytes, lu_workspace_query, workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
 from distrib_la.loader import dial_key, has_target, probe_target
 from distrib_la.matmul import (
     MATMUL_BACKEND_CHOICES,
@@ -117,7 +115,7 @@ from distrib_la.matmul import (
     resolve_matmul_backend, route_bytes, staged_fits)
 from distrib_la.matmul_plan import GemmPlan, gemm_plan, local_gemm_plan
 from distrib_la._panel_matmul import batch_gram, panel_matmul
-from distrib_la.plan import RoomExhausted, room_class, room_or_exhausted  # noqa: E402
+from distrib_la.plan import RoomExhausted, room_class, room_or_exhausted, room_test  # noqa: E402
 from distrib_la.plan import (
     BATCHED_ROUTE_CHOICES,
     BATCHED_ROUTE_DEFAULT,
@@ -129,6 +127,7 @@ from distrib_la.plan import (
     ROUTE_SCAN,
     Plan,
     StackRoute,
+    eigh_rounds,
     ensure_sharding,
     new_stack_routes,
     plan,
@@ -158,8 +157,10 @@ from distrib_la.local_eigh import eigh_local, eigh_route, COMPLEX_EIGH_ROUTE
 from distrib_la.local_lu import (LOCAL_LU_ROUTE, lu_solve_local, solve_local, routes as local_lu_routes,
                                tri_solve_local)
 from distrib_la.tolerance import ROUNDOFF_MARGIN, roundoff_tol
+from distrib_la.nonnegative import solve_nonnegative_quadratic
 
 __all__ = [
+    "solve_nonnegative_quadratic",
     "eigh_local", "eigh_route", "COMPLEX_EIGH_ROUTE",
     "solve_local", "lu_solve_local", "tri_solve_local", "local_lu_routes", "LOCAL_LU_ROUTE",
     "local_batch", "batch_layout", "is_batch_layout",
@@ -169,9 +170,9 @@ __all__ = [
     "face_sharding", "on_face", "hermitian_part", "hermitian_block",
     "join_columns", "diagonal_like",
     # plan
-    "Plan", "plan", "StackRoute", "RoomExhausted", "room_class", "room_or_exhausted", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes", "native_eigh_jacobi",
+    "Plan", "plan", "StackRoute", "eigh_rounds", "RoomExhausted", "room_class", "room_or_exhausted", "room_test", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes", "native_eigh_jacobi",
     # native dense workspace queries (no allocation)
-    "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "eigh_stack_bytes", "eigh_stack_proposal", "lu_workspace_bytes", "lu_workspace_query", "route_bytes", "staged_fits",
+    "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "local_eigh_workspace", "eigh_stack_bytes", "eigh_stack_proposal", "lu_workspace_bytes", "lu_workspace_query", "route_bytes", "staged_fits",
     # polar / SVD
     "PolarPlan", "plan_polar_factor", "polar_factor",
     "right_singular_vectors", "leading_eigenvectors", "leading_eigenvectors_above",

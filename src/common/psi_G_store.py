@@ -945,7 +945,9 @@ class ParentPsiG(NamedTuple):
                      Rank ``p`` owns slots ``[p·ngk_c/P, (p+1)·ngk_c/P)``,
                      ``p = x·P_y + y``.
     ``kvecs_frac``   ``(n_k, 3)`` the loader's k representatives for these rows.
-    ``band_range``   the logical ``[b0, b1)``; bands ``[b1, b0+nb_c)`` are zero.
+    ``band_range``   the retained store's logical ``[b0, b1)``; bands
+                     ``[b1, b0+nb_c)`` are zero. The faces may cover a wider
+                     read window when ``store_band_range`` was supplied.
     ``faces``        ``(psi_y, psi_x)`` with the values and extents
                      :func:`common.wfn_transforms.load_centroids_band_chunked`
                      returns, already on the faces: ``psi_y`` at
@@ -1104,6 +1106,7 @@ def load_parent_psi_G(
     bispinor_lift: str = "raw",
     k_domain: str = "ibz",
     mu_tile_bytes: int = 256 * 2**20,
+    store_band_range: tuple[int, int] | None = None,
     print_fn=print,
 ) -> ParentPsiG:
     """Read ψ(G) of the raw parents ONCE; return the G-slot store and the faces.
@@ -1120,7 +1123,11 @@ def load_parent_psi_G(
     table and its active mask are used, as in ``load_centroids_band_chunked``,
     and the faces leave in the same layouts and extents.
 
-    Per-rank bytes: the store ``n_k·nb_c·ns·ngk_c·16/P``, the two face
+    ``store_band_range`` optionally retains only a contained logical band
+    interval in ``psi_G``/``host_tile``. The read and both centroid faces
+    still cover ``band_range``; mesh padding of the smaller store is zero.
+
+    Per-rank bytes: the store ``n_k·nb_keep·ns·ngk_c·16/P``, the two face
     accumulators ``n_k·nb_c·ns·μ·16/P`` each, the in-flight chunk twice
     (read + all-to-all), one ``band_chunk·ns·μ`` per-k partial before its
     reduce-scatter, the replicated sphere index ``n_k·ngk_c·4`` and one
@@ -1142,8 +1149,15 @@ def load_parent_psi_G(
     fft_grid = tuple(int(v) for v in meta.fft_grid)
     n_rtot = int(np.prod(fft_grid))
     b0, b1 = (int(v) for v in band_range)
+    keep0, keep1 = ((b0, b1) if store_band_range is None else
+                    tuple(int(v) for v in store_band_range))
+    if not b0 <= keep0 < keep1 <= b1:
+        raise ValueError(
+            f"load_parent_psi_G: retained bands {(keep0, keep1)} must be "
+            f"a nonempty interval inside read bands {(b0, b1)}")
     w = padded_axis(int(band_chunk), P_, name="ψ(G) band chunk").carrier
     nb_c = padded_axis(b1 - b0, P_, name="ψ(G) band carrier").carrier
+    nb_keep = padded_axis(keep1 - keep0, P_, name="ψ(G) retained bands").carrier
     g_axis = padded_axis(int(loader.ngkmax), P_, name="ψ(G) G-slot carrier")
     ngk_c = g_axis.carrier
     k_spec = "ibz" if k_domain == "ibz" else "full_bz"
@@ -1204,12 +1218,12 @@ def load_parent_psi_G(
     store = host_tile = None
     gspec = NamedSharding(mesh_xy, P(None, None, None, ('x', 'y')))
     if placement == "device":
-        store = jnp.zeros((nk, nb_c, ns, ngk_c), jnp.complex128, device=gspec)
+        store = jnp.zeros((nk, nb_keep, ns, ngk_c), jnp.complex128, device=gspec)
     elif placement == "host":
         if len(mesh_xy.local_devices) != 1:
             raise ValueError("load_parent_psi_G(placement='host') wants one "
                              "device per process (the LORRAX launch).")
-        host_tile = np.zeros((nk, nb_c, ns, ngk_c // P_), np.complex128)
+        host_tile = np.zeros((nk, nb_keep, ns, ngk_c // P_), np.complex128)
     insert = _gslot_insert_kernel(mesh_xy)
     t_read = t_xform = t_keep = 0.0
     import time as _time
@@ -1238,12 +1252,16 @@ def load_parent_psi_G(
             jax.block_until_ready((g_chunk, acc_y, acc_x))
         t2 = _time.perf_counter()
         with timing.section("psi_G_store.gslot.keep"):
-            if placement == "device":
-                store = insert(store, g_chunk, jnp.int32(lo - b0))
-                jax.block_until_ready(store)
-            elif placement == "host":
-                (shard,) = g_chunk.addressable_shards
-                host_tile[:, lo - b0:lo - b0 + wc] = np.asarray(shard.data)
+            first, last = max(lo, keep0), min(lo + wc, keep1)
+            if placement != "none" and first < last:
+                retained = g_chunk[:, first - lo:last - lo]
+                if placement == "device":
+                    store = insert(store, retained, jnp.int32(first - keep0))
+                    jax.block_until_ready(store)
+                elif placement == "host":
+                    host_tile[:, first - keep0:last - keep0] = np.asarray(
+                        retained.addressable_data(0))
+                del retained
             del g_chunk
         t3 = _time.perf_counter()
         t_read += t1 - t0
@@ -1257,4 +1275,7 @@ def load_parent_psi_G(
              f"({(b1 - b0)} logical) in chunks of {w}; read {t_read:.2f}s, "
              f"all-to-all{' + centroid DFT' if with_faces else ''} "
              f"{t_xform:.2f}s, keep[{placement}] {t_keep:.2f}s")
-    return ParentPsiG(store, host_tile, sidx, kvecs, (b0, b1), faces)
+    if (keep0, keep1) != (b0, b1):
+        print_fn(f"  ψ(G) retained bands [{keep0}, {keep1}) "
+                 f"in a {nb_keep}-band carrier; centroid faces keep the read window")
+    return ParentPsiG(store, host_tile, sidx, kvecs, (keep0, keep1), faces)

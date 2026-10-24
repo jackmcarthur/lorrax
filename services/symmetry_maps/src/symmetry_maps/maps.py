@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 import jax
 import jax.numpy as jnp
-from lxkit import device_put_process_local
+from lxkit import device_put_process_local, device_put_process_local_cached
 from ._compat import deprecated_alias
 from .directed_edges import apply_band_matrix_symmetry
 from jax import shard_map
@@ -341,6 +341,11 @@ def slice_q_full_to_ibz(arr_full, q_irr_full_idx, *, out_sharding=None):
     return _ibz_rows(arr_full, np.asarray(q_irr_full_idx, dtype=np.int32), out_sharding)
 
 
+@jax.jit
+def _unfold_identity(value):
+    return value
+
+
 def unfold_isdf_operator(
     V_q_ibz,
     *,
@@ -359,8 +364,49 @@ def unfold_isdf_operator(
     trs_pair_q_ibz=None,
     axis_local_sym_perm=None,
     right_axis_local_sym_perm=None,
+    q_rows=None,
+    prepare=False,
 ):
-    """Expand ``V_q_ibz`` over the IBZ to the full BZ; see docs/architecture/symmetry_register.md."""
+    """Expand ``V_q_ibz`` over the IBZ to the full BZ, optionally only at ``q_rows``; see docs/architecture/symmetry_register.md.
+
+    For full-grid row ``q`` with parent ``p = irr_idx[q]`` and operation
+    ``s = sym_idx[q]``::
+
+        V[q, μ, ν] = C_s[ exp(2πi q_p·(L[s,μ] − L[s,ν])) V_ibz[p, α_s(μ), α_s(ν)] ]
+
+    with ``α_s = sym_perm[s]`` and ``C_s`` the identity on rows
+    ``s < n_sym_spatial``.  On antiunitary rows ``C_s`` conjugates
+    (``trs_rule='conj'``, a static Hermitian operator) or takes the
+    transposed partner (``'pair_transpose'``, an operator at a fixed
+    complex time or frequency; ``trs_pair_q_ibz`` supplies it for a
+    rectangular operator).
+
+    Parameters
+    ----------
+    V_q_ibz : (n_q_ibz, n_left, n_right) jax.Array at ``P(None, 'x', 'y')``.
+    irr_idx, sym_idx : (n_q_full,) int, host.
+    sym_perm : (n_rows, n_left) int source map; ``L_table`` :
+        (n_rows, n_left, 3) lattice wraps, both from
+        ``centroid_source_map_and_wrap(..., extend_trs=True)``.
+    q_irr_frac : (n_q_ibz, 3) float, crystal coordinates.
+    mesh_xy : the 2-D ``('x', 'y')`` mesh.
+    n_sym_spatial : int, the spatial row count.
+    right_sym_perm, right_L_table : the right endpoint's tables when it is a
+        different centroid family (both or neither).
+    left_logical_extent, right_logical_extent : physical extents inside a
+        padded centroid axis; the source maps must preserve the split.
+    axis_local_sym_perm, right_axis_local_sym_perm : shard-local source
+        maps for orbit-packed endpoints (no ``all_to_all``).
+
+    q_rows : optional replicated int vector of full-zone rows; only those rows are
+        expanded.  Host queries refuse invalid rows; traced callers own their
+        bounds, and an invalid device row produces NaN.  The same transport and
+        q metadata serve full and bounded queries.
+    prepare : bool, default False.
+
+    Returns ``(n_q_full or len(q_rows), n_left, n_right)`` at ``P(None, 'x', 'y')``.  Every
+    table or shape mismatch raises ``ValueError`` before tracing.
+    """
     # Trivial-IBZ short-circuit. When ntran=1 (e.g. nosym runs) the IBZ is
     # already the full BZ — irr_idx is identity, sym_idx is all zeros,
     # sym_perm is identity. The take_along_axis path below is then a
@@ -579,11 +625,11 @@ def unfold_isdf_operator(
                 f"the logical/padded split at {logical}/{padded}; regenerate "
                 "the authenticated centroid tables with an identity tail")
 
-    if (square_defaults
+    if (q_rows is None and square_defaults
             and idx_np.shape[0] == int(V_q_ibz.shape[0])
             and np.array_equal(idx_np, np.arange(idx_np.shape[0]))
             and np.all(sym_np == 0)):
-        return V_q_ibz
+        return (_unfold_identity, (V_q_ibz,)) if prepare else V_q_ibz
 
     pair_source = None
     if requested_trs_rule == "pair_transpose":
@@ -607,17 +653,25 @@ def unfold_isdf_operator(
             "unfold_isdf_operator: trs_pair_q_ibz is valid only with "
             "trs_rule='pair_transpose'")
 
-    # Sym tables are baked into the jit closure as constants — XLA folds
-    # them into the HLO, which is materially faster per call than
-    # marshalling them as runtime args (verified empirically: runtime-
-    # arg form was ~2× slower per call than closure form).  The cache
-    # keys on the content of the tables (via bytes hashes) so V_q's and
-    # W_q's calls with the same sym/centroid configuration share one
-    # compiled module without re-baking constants.
+    # The centroid permutation/wrap tables remain geometry constants. Only
+    # the small q-selection tables are operands: streaming different q spans
+    # must not compile the same transport again for each span's coordinates.
     idx_arr = np.asarray(irr_idx, dtype=np.int32)
     sym_arr = np.asarray(sym_idx, dtype=np.int32)
     q_irr_arr = np.asarray(q_irr_frac, dtype=np.float64)
     trs_mask_arr = (sym_arr >= int(n_sym_spatial))
+    query_size = None
+    if q_rows is not None:
+        if getattr(q_rows, 'ndim', np.ndim(q_rows)) != 1:
+            raise ValueError("unfold_isdf_operator: q_rows must be an integer vector")
+        if not np.issubdtype(q_rows.dtype, np.integer):
+            raise ValueError("unfold_isdf_operator: q_rows must be an integer vector")
+        query_size = int(q_rows.shape[0])
+        if query_size == 0:
+            raise ValueError("unfold_isdf_operator: q_rows must not be empty")
+        if not isinstance(q_rows, (jax.Array, jax.core.Tracer)) and (
+                np.any(np.asarray(q_rows) < 0) or np.any(np.asarray(q_rows) >= idx_arr.size)):
+            raise ValueError("unfold_isdf_operator: q_rows is outside the full zone")
     fn = _get_unfold_isdf_operator_jit(
         V_q_shape=tuple(int(s) for s in V_q_ibz.shape),
         fwd_perm_arr=fwd_perm,
@@ -634,12 +688,24 @@ def unfold_isdf_operator(
         trs_rule=trs_rule,
         left_local_perm_arr=left_local_perm,
         right_local_perm_arr=right_local_perm,
+        query_size=query_size,
         mesh_xy=mesh_xy)
+    q_sh = NamedSharding(mesh_xy, P())
+    # This owner can also be entered while a larger program is traced. Place
+    # only these small host metadata here, never in the cached factory, so
+    # that neither tracers nor a previous query's arrays enter its cache.
+    with jax.ensure_compile_time_eval():
+        q_tables = tuple(device_put_process_local_cached(a, q_sh) for a in
+                         (idx_arr, sym_arr, q_irr_arr, trs_mask_arr))
+    if q_rows is not None:
+        q_tables += (jnp.asarray(q_rows),)
     if pair_source is not None:
         pair_source = jax.device_put(
             pair_source, NamedSharding(mesh_xy, P(None, 'y', 'x')))
-        return fn(V_q_ibz, pair_source)
-    return fn(V_q_ibz)
+        operands = (V_q_ibz, pair_source, q_tables)
+    else:
+        operands = (V_q_ibz, q_tables)
+    return (fn, operands) if prepare else fn(*operands)
 
 
 def _permute_isdf_operator_axes_local(
@@ -1099,19 +1165,20 @@ def _get_unfold_isdf_operator_jit(
     L_arr, L_right_arr, q_irr_arr, trs_mask_arr, logical_left,
     logical_right, n_sym_spatial, mesh_xy, left_local_perm_arr=None,
     right_local_perm_arr=None,
-    trs_rule="conj", q_tile_bytes=256 << 20,
+    trs_rule="conj", q_tile_bytes=256 << 20, query_size=None,
 ):
-    """Cache the inner ``_do_unfold`` jit by (shape, sym table content); see docs/architecture/symmetry_register.md."""
+    """Cache transport by geometry and shapes; q selections are runtime operands."""
     key = (
         V_q_shape, int(q_tile_bytes),
+        query_size,
         fwd_perm_arr.shape, fwd_perm_arr.tobytes(),
         fwd_perm_right_arr.shape, fwd_perm_right_arr.tobytes(),
-        idx_arr.tobytes(),
-        sym_arr.tobytes(),
+        idx_arr.shape,
+        sym_arr.shape,
         L_arr.shape, L_arr.tobytes(),
         L_right_arr.shape, L_right_arr.tobytes(),
-        q_irr_arr.tobytes(),
-        trs_mask_arr.tobytes(),
+        q_irr_arr.shape,
+        trs_mask_arr.shape,
         int(logical_left), int(logical_right),
         int(n_sym_spatial),
         str(trs_rule),
@@ -1141,14 +1208,11 @@ def _get_unfold_isdf_operator_jit(
     # are embedded by the inner trace just as effectively and cannot leak.
     fwd_perm_j = fwd_perm_arr
     fwd_perm_right_j = fwd_perm_right_arr
-    idx_j = idx_arr
-    sym_j = sym_arr
     L_j = L_arr
     L_right_j = L_right_arr
-    q_irr_j = q_irr_arr
-    trs_mask_j = trs_mask_arr
     left_local_perm_j = left_local_perm_arr
     right_local_perm_j = right_local_perm_arr
+    n_full = int(idx_arr.size) if query_size is None else int(query_size)
     # Memory contract: never exceed 1× single-tile per rank.  Canonical
     # ordering uses volume-preserving all_to_all redistributions.  An
     # authenticated orbit-packed order instead gathers each axis locally.
@@ -1174,8 +1238,10 @@ def _get_unfold_isdf_operator_jit(
             "basis receipts.")
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     pair_transpose = (trs_rule == "pair_transpose")
-    in_specs = ((P(None, 'x', 'y'), P(None, 'x', 'y')) if pair_transpose
-                else P(None, 'x', 'y'))
+    operator_specs = ((P(None, 'x', 'y'), P(None, 'x', 'y')) if pair_transpose
+                      else (P(None, 'x', 'y'),))
+    table_specs = (P(),) * (4 if query_size is None else 5)
+    in_specs = operator_specs + (table_specs,)
 
     @partial(shard_map, mesh=mesh_xy,
              in_specs=in_specs,
@@ -1186,7 +1252,15 @@ def _get_unfold_isdf_operator_jit(
         # q tiles. Full-k parent gather + endpoint gather + phased output used
         # to coexist (Fe20³/P16:78.8GB), although one output is only26.15GB.
         V_ibz_local = operands[0]
-        n_full = int(idx_arr.size)
+        idx_j, sym_j, q_irr_j, trs_mask_j = operands[-1][:4]
+        valid_rows = None
+        if query_size is not None:
+            rows_j = operands[-1][4]
+            valid_rows = (rows_j >= 0) & (rows_j < idx_j.size)
+            lookup = jnp.where(valid_rows, rows_j, 0).astype(jnp.int32)
+            idx_j = jnp.take(idx_j, lookup, mode='fill', fill_value=0)
+            sym_j = jnp.take(sym_j, lookup, mode='fill', fill_value=0)
+            trs_mask_j = jnp.take(trs_mask_j, lookup, mode='fill', fill_value=False)
         mu_local, nu_local = n_left_padded // Px, n_right_padded // Py
         q_tile = min(n_full, max(1, int(q_tile_bytes) // (16 * mu_local * nu_local)))
 
@@ -1256,7 +1330,8 @@ def _get_unfold_isdf_operator_jit(
             return V_full_local
 
         if q_tile == n_full:
-            return transport(jnp.asarray(idx_j), jnp.asarray(sym_j), jnp.asarray(trs_mask_j))
+            out = transport(jnp.asarray(idx_j), jnp.asarray(sym_j), jnp.asarray(trs_mask_j))
+            return out if valid_rows is None else jnp.where(valid_rows[:, None, None], out, jnp.nan)
 
         def chunk(out, i):
             # A uniform overlapping final tile avoids padding the large output.
@@ -1274,22 +1349,25 @@ def _get_unfold_isdf_operator_jit(
         out, _ = jax.lax.scan(chunk,
             jnp.zeros((n_full, mu_local, nu_local), V_ibz_local.dtype),
             jnp.arange(n_tiles, dtype=jnp.int32), unroll=1)
-        return out
+        return out if valid_rows is None else jnp.where(valid_rows[:, None, None], out, jnp.nan)
 
     if pair_transpose:
         # Preserve a producer's reversed-axis placement; transposing an
         # already oriented partner must not first reshard it back to X/Y.
         partner_sh = NamedSharding(mesh_xy, P(None, "y", "x"))
+        q_sh = tuple(NamedSharding(mesh_xy, P()) for _ in table_specs)
 
-        @partial(jax.jit, in_shardings=(V_sh, partner_sh), out_shardings=V_sh)
-        def _do_unfold(V_ibz, pair_ibz):
+        @partial(jax.jit, in_shardings=(V_sh, partner_sh, q_sh), out_shardings=V_sh)
+        def _do_unfold(V_ibz, pair_ibz, q_tables):
             transposed = jax.lax.with_sharding_constraint(
                 jnp.swapaxes(pair_ibz, -2, -1), V_sh)
-            return _kernel(V_ibz, transposed)
+            return _kernel(V_ibz, transposed, q_tables)
     else:
-        @partial(jax.jit, in_shardings=V_sh, out_shardings=V_sh)
-        def _do_unfold(V_ibz):
-            return _kernel(V_ibz)
+        q_sh = tuple(NamedSharding(mesh_xy, P()) for _ in table_specs)
+
+        @partial(jax.jit, in_shardings=(V_sh, q_sh), out_shardings=V_sh)
+        def _do_unfold(V_ibz, q_tables):
+            return _kernel(V_ibz, q_tables)
 
     _UNFOLD_ISDF_OPERATOR_JIT_CACHE[key] = _do_unfold
     return _do_unfold
@@ -1900,9 +1978,17 @@ def mix_lorentz_blocks(blocks, *, sym, sym_idx, mesh_xy, keys=None):
 _I_SIGMA_Y = np.array([[0.0, 1.0], [-1.0, 0.0]], dtype=np.complex128)
 
 
-def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran, *,
+def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_sym_spatial, *,
                                 nspinor=2, R_cart=None):
-    """Return the scalar, Pauli or parity-graded Dirac action, with iσy K on TR rows."""
+    """Return the scalar, Pauli or parity-graded Dirac action, with iσy K on TR rows.
+
+    ``U_spinor_spatial`` is ``(n_sym_spatial, 2, 2)`` SU(2) (``SymMaps.U_spinor``);
+    ``sym_idx`` is a scalar or ``(n,)`` row index into the TRS-augmented table
+    (rows ``>= n_sym_spatial`` are antiunitary and return ``iσ_y·conj(U)``).
+    Returns ``(nspinor, nspinor)`` complex128 for a scalar row, else
+    ``(n, nspinor, nspinor)``: the 1×1 identity for ``nspinor = 1``, ``U`` for
+    2, and ``diag(U, det(R)·U)`` for 4, which needs ``R_cart``.
+    """
     nspinor = int(nspinor)
     if nspinor not in (1, 2, 4):
         raise ValueError(
@@ -1913,10 +1999,10 @@ def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran, *,
     if nspinor == 1:
         out = np.ones((idx1.size, 1, 1), dtype=np.complex128)
         return out[0] if scalar else out
-    spatial = idx1 % (n_tran if n_tran else 1)
+    spatial = idx1 % (n_sym_spatial if n_sym_spatial else 1)
     U_sp = np.asarray(U_spinor_spatial)[spatial]
     U_trs = np.einsum('ij,kjl->kil', _I_SIGMA_Y, np.conj(U_sp))
-    out = np.where((idx1 >= n_tran)[:, None, None], U_trs, U_sp)
+    out = np.where((idx1 >= n_sym_spatial)[:, None, None], U_trs, U_sp)
     if nspinor == 4:
         if R_cart is None:
             raise ValueError("spinor_rotation_for_sym_row: nspinor=4 requires R_cart for spatial parity.")
@@ -2155,6 +2241,57 @@ def _unwrapped_grid_q_tables(coords, grid, *, include_ids=True):
 
 
 class SymMaps:
+    """IBZ ⇄ full-BZ tables and typed symmetry operations of one WFN.
+
+    ``SymMaps(wfn)`` takes a ``WfnLoader`` (or any object with the same
+    ``mf_header`` attributes and an explicit boolean ``trs_holds``; a missing
+    verdict raises ``GATE SymMaps_needs_measured_trs``).  ``wfn.symmetry()``
+    returns the loader's cached instance.  All tables are host numpy.
+
+    Operation rows.  Rows ``0 … n_t − 1`` are the WFN's spatial operations
+    (``n_t = len(sym_matrices)``); rows ``n_t … 2n_t − 1`` are the same
+    operations composed with time reversal.  ``n_sym_spatial = n_t`` in the
+    free functions of this package.
+
+    Attributes
+    ----------
+    trs_allowed : bool
+        The measured time-reversal verdict (``wfn.trs_holds``).
+    sym_matrices : (n_t, 3, 3) int
+        BGW ``mtrx``, crystal coordinates, acting on real-space fractions.
+    translations : (n_t, 3) float
+        BGW ``tnp`` = 2π·τ (τ in lattice fractions).
+    sym_mats_k : (2 n_t, 3, 3) int
+        Reciprocal action ``mtrx.T`` followed by ``-mtrx.T`` (TR rows).
+    R_cart : (2 n_t, 3, 3) float
+        Cartesian rotations, same row convention.
+    U_spinor : (n_t, 2, 2) complex
+        SU(2) images of the proper rotations.
+    unfolded_kpts : (nk_tot, 3) float
+        Full-grid k in crystal coordinates.
+    irr_idx_k, sym_idx_k : (nk_tot,) int
+        Parent WFN row and operation row of every full-grid k.
+    kirr_fullids : (nk_red,) int
+        Full-grid row of every WFN row.
+    nk_tot, nk_red : int
+        Full-grid and WFN k counts.
+    kvecs_asints : (nk_tot, 3) int
+        Full-grid k as integers on ``kgrid``.
+    irr_idx_q, sym_idx_q : (nq,) int
+        Irreducible-q parent and operation row of every full-grid q.
+    q_irr_full_idx : (nq_irr,) int
+        Full-grid row of every irreducible q.
+    q_irr_kgrid_int : (nq_irr, 3) int
+        Irreducible q on ``kgrid`` (``bgw_integer_q_to_fractional`` gives
+        the fractional form ``unfold_isdf_operator`` takes).
+    active_symmetry_rows : (n,) int
+        Rows this instance may select (antiunitary rows only when allowed).
+
+    Methods ``operation_rows``, ``cartesian_action``, ``lorentz_action``,
+    ``spinor_action``, ``reciprocal_phase``, ``fft_grid_pullback`` and
+    ``unfold_wavefunction`` apply one or more rows through this table.
+    """
+
     @cached_property
     def kq_map(self):
         """Full-k by reduced-q lookup, constructed at its first consumer.

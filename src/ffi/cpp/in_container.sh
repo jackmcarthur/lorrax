@@ -13,7 +13,7 @@
 # GPU leg: it must be 1.  Cray MPICH only takes the GPU-Direct RDMA path
 # (MPI_Send straight from a device pointer over Slingshot, no host bounce)
 # when this is set, and it pairs with the libmpi_gtl_cuda LD_PRELOAD
-# run_shifter.sh arranges.  Without it SLATE / cuSOLVERMp / phdf5 D2H
+# run_shifter.sh arranges.  Without it cuSOLVERMp / phdf5 D2H
 # staging all still WORK — just slowly — so nothing announces the loss.
 #
 # CPU leg: it must be 0.  With it set, Cray MPICH tries to dlopen the GTL

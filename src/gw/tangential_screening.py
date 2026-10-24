@@ -251,6 +251,13 @@ def _coulomb_resource(value, meta, sym, mesh_xy):
 _PARENT_ROWS: dict = {}
 
 
+def release_coulomb_cache():
+    """End the screening cache's lifetime while preserving caller-owned arrays."""
+    from . import response_bank
+    _PARENT_ROWS.clear()
+    response_bank.release_coulomb_cache()
+
+
 def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases=None):
     """Keep this map's bank on the devices when it fits, else in host memory.
 

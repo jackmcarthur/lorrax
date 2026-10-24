@@ -43,6 +43,7 @@ class Term:
     grid: Optional[Callable[[int], float]] = field(default=None, compare=False)
 
     def at(self, ranks: int) -> float:
+        """Bytes per rank on a mesh of ``ranks`` devices (``ranks < 1`` is taken as 1)."""
         p = max(1, int(ranks))
         return self.fixed + self.spread / p + (float(self.grid(p)) if self.grid else 0.0)
 
@@ -66,15 +67,19 @@ class Price:
     whole: int = 0
 
     def terms(self, ranks: Optional[int] = None) -> dict:
+        """``{term: bytes per rank}`` for each of :data:`TERMS` at ``ranks`` (default ``self.ranks``)."""
         return {n: getattr(self, n).at(self.ranks if ranks is None else ranks) for n in TERMS}
 
     def bytes(self, ranks: Optional[int] = None) -> float:
+        """The total per-rank bytes at ``ranks`` (default ``self.ranks``): the sum of :meth:`terms`."""
         return float(sum(self.terms(ranks).values()))
 
     def unsourced(self) -> list:
+        """Names of the nonzero terms that carry no provenance (a finding under STRICT)."""
         return [n for n, v in self.terms().items() if v and not getattr(self, n).source]
 
     def describe(self, ranks: Optional[int] = None) -> str:
+        """One line, ``"operands 1.20 GB, xla 0.40 GB, ..."``, for receipts and banners."""
         return ", ".join(f"{n} {_gb(v)}" for n, v in self.terms(ranks).items())
 
     def __add__(self, o: "Price") -> "Price":
@@ -140,12 +145,47 @@ def _held(a) -> tuple:
     return int(math.prod(a.sharding.shard_shape(a.shape)) * a.dtype.itemsize), a.sharding.addressable_devices
 
 
+def _cpu_in_use_by_device() -> dict:
+    """Unique live CPU buffer bytes, including overlapping local shard views.
+
+    A global array and its addressable local array can hold the same storage.
+    Counting both as independent operands understates room. Reading a local
+    array's cached ``addressable_shards`` also creates a self-reference in JAX;
+    use its pointer directly. Multi-device arrays need their local shards, whose
+    single-device data arrays are then inspected without that cached property.
+    """
+    import jax
+    spans = {}
+    for a in jax.live_arrays():
+        if not a.nbytes or a.is_deleted():
+            continue
+        devices = a.devices()
+        if not any(d.platform == "cpu" for d in devices):
+            continue
+        parts = ((a,) if len(devices) == 1 else
+                 (s.data for s in a.addressable_shards))
+        for part in parts:
+            device = next(iter(part.devices()))
+            if device.platform != "cpu":
+                continue
+            start = int(part.unsafe_buffer_pointer())
+            spans.setdefault(device.id, []).append((start, start + int(part.nbytes)))
+    held = {}
+    for device, intervals in spans.items():
+        end = total = 0
+        for start, stop in sorted(intervals):
+            total += max(0, stop - max(start, end))
+            end = max(end, stop)
+        held[device] = total
+    return held
+
+
 def _in_use(per_device: bool = True) -> float:
     """Allocator bytes in use, max over devices; CPU: live array bytes (``per_device``: / devices)."""
     import jax
     devices = jax.local_devices()
     if devices[0].platform == "cpu":
-        return sum(n * len(d) for n, d in map(_held, jax.live_arrays())) / (len(devices) if per_device else 1)
+        return sum(_cpu_in_use_by_device().values()) / (len(devices) if per_device else 1)
     return float(max(int((d.memory_stats() or {}).get("bytes_in_use", 0)) for d in devices))
 
 
@@ -385,6 +425,8 @@ def _snapshot() -> dict:
         groups.setdefault((tuple(a.shape), str(a.dtype), spec, born[id(a)]), [0, nbytes])[0] += 1
     for gone in set(born) - alive:
         del born[gone]
+    if jax.local_devices()[0].platform == "cpu":
+        per_device = _cpu_in_use_by_device()
     stats = [d.memory_stats() or {} for d in jax.local_devices()]
     return dict(live=max(per_device.values(), default=0),
                 in_use=max(int(st.get("bytes_in_use", 0)) for st in stats),
@@ -526,7 +568,8 @@ def pool_reservation(total: float, leg) -> float:
 
 def contexts() -> Term:
     """The providers' contexts a route opens where the budget did not withhold them (local)."""
-    size, src = getattr(_leg(), "distributed_context", (0.0, ""))
+    leg = _leg()
+    size, src = getattr(leg, "distributed_context", (0.0, "")) if leg.accelerator else (0.0, "")
     return Term(size if _RUN.get("linalg", "local") == "local" else 0.0, source=src)
 
 
@@ -619,6 +662,8 @@ def record_route(site, route, reason, *, warning=None) -> None:
 
 
 def routes() -> list:
+    """Every route decision recorded this run (:func:`record_route`, :func:`admit`), as dicts
+    ``site, route, reason, warning, line, count``, in first-decision order."""
     return [dict(row) for row in _ROUTES.values()]
 
 

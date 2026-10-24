@@ -1,0 +1,51 @@
+Layout note: the notes below describe the full private evidence bundle.
+This public case is flattened: manifest.json, qe_scf.in/qe_nscf.in/
+qe_pw2bgw.in and the named GW/centroid/QP text files. Scripts, native
+receipts and other archive-only paths remain in the CFS evidence archive
+identified by manifest.json.
+
+80-atom Cr:Al2O3 GN-PPM reference (Al31CrO48, SOC).
+
+Qualified frozen main: 2d2ca2f104a085876a573e8b1278a7874c479b98.
+Full P16 G0W0: 915.12 s on four A10080 nodes. The production pool-used
+peak is 52.89 GB/rank, max over 16 ranks; NVML reservation is not that peak.
+831 tau nodes in five fused windows took 388.23 s. Progress timestamps
+are dispatch/window progress and cannot establish individual-node timings.
+
+Four valence/four conduction frontier bands still require the current API
+prefix 1-399. Its DFT span is -73.864..+1.708 eV relative to midgap. The
+explicit Sigma range -75..+2.75 eV covers the entire prefix with at least
+1 eV margin. The production coverage sentence quotes the protected frontier;
+its 71.64 eV lower margin is not the full-prefix margin (1.136 eV).
+
+All supplied files are text. No WFN, HDF5, or native binary is uploaded or
+advertised as a public download. Raw private NERSC archive pointers and
+WFN/UPF hashes are in manifest.yaml. The actual NSCF deck contains the full
+80-atom crystal; original SCF/NSCF inputs are under qe_inputs/.
+
+For a fresh repeat, stage a new case, its authenticated qe/ raw directory,
+matching Al/O/Cr UPFs, and the supplied centroid table beside gw.in. Make
+fresh kin_ion.h5 and dipole.h5; never reuse band-specific artifacts silently.
+Kin-ion covers 399 QP bands and the dipole/head covers all 2370 sum bands.
+Centroid regeneration used P16, seed 0, default oversample 1.5, 23700 points,
+and --fit-window 0:399,0:2370. The final table has 7902 closed orbits and
+23712 packed slots (12 processor pads). Launch receipts record exact jobs,
+nodes, rank/CPU geometry and commands. Scripts require an assigned pool;
+they do not allocate. Use the checkout-owned runtime and both native legs,
+not the old site lx release pins. Do not overwrite this completed evidence.
+
+The native/source/hash receipts identify CUDA bf46... and CPU 17932... .
+The landed source is nonmanual-identical to tested d4b3b998b; landing claim
+4359 and its CFS archive hold full continuity/validation. Later upstream
+native/backend changes are outside this measurement.
+
+Qualifications retained: five BFGS structural steps, then a converged SCF;
+this is not a structural or GW convergence claim. Global TRS is disabled
+conservatively because matching SCF charge identity was unavailable; the
+three authenticated unitary QE operations are retained. The immutable
+WFN inode has one read stripe. The Cplus conservative 63.81 GB quote
+exceeded 61.20 GB planning room, but the measured run peak stayed below
+the 66.35 GB budget. The centroid-window warning concerns two exact-zero
+processor band pads, not omitted physical bands. The 3.02% invalid GN
+mode count uses the default static_limit prescription, separate from the
+out-of-grid fallback (none used). No quadrature/head tolerances were relaxed.

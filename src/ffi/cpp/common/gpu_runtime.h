@@ -85,7 +85,7 @@ inline Error memcpy_async(void* dst, const void* src, std::size_t n,
                           MemcpyKind kind, Stream s) {
     return LRX_GPU_SYM(MemcpyAsync)(dst, src, n, kind, s);
 }
-// Pitched 2-D copy (the SLATE eigh handler's tile scatter).
+// Pitched 2-D copy.
 inline Error memcpy_2d_async(void* dst, std::size_t dpitch, const void* src,
                              std::size_t spitch, std::size_t width,
                              std::size_t height, MemcpyKind kind, Stream s) {

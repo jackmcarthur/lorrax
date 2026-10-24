@@ -449,7 +449,7 @@ def mesh_is_emulated(mesh) -> bool:
     What it is for.  A mesh cell is a per-device thing; an MPI/NCCL/HDF5
     context is a per-process thing.  Every transport that bootstraps one
     context per mesh cell (``ffi.io.open_file``,
-    ``distrib_la._slate``) therefore requires ``p*q == process_count()`` and
+    ``distrib_la._scalapack``) therefore requires ``p*q == process_count()`` and
     refuses an emulated mesh — correctly, since all N devices would share
     rank 0's hyperslab or communicator.  A component with a serial tier
     (``wfn_loader``'s ``eager``, ``file_io._slab_io_serial``) asks this

@@ -26,13 +26,10 @@ instead of falling through. How the pair is built, sealed and pinned is
 `distrib_la.resolve` reads `os.environ`. A library's presence makes a backend
 possible; the deck's `linalg` dial and the caller's explicit request choose it.
 
-**Load order.** Both legs can link SLATE, and when they do they share the
-SONAMEs `libslate.so.2` and `libblaspp.so.2`: the first leg opened decides
-which copy the other binds. The host build is `gpu_backend=none`, whose
-`blas::get_device_count()` is a compiled-in 0, so if it wins, every CUDA SLATE
-handler sees no device and refuses. In any process that can use CUDA the
-loader therefore opens the CUDA leg first (`loader._open_accelerator_before_host`,
-and the same rule in `src/ffi/common/ffi_loader.py`). Before its first
+**Load order.** In any process with a device leg the loader opens that leg
+before the host leg (`loader._open_accelerator_before_host`, and the same rule
+in `src/ffi/common/ffi_loader.py`); the order is kept pending re-measurement
+now that no library is shared by SONAME between the legs. Before its first
 `dlopen` the loader also imports `h5py` if it is installed, so h5py's HDF5
 symbols bind first; h5py is not a dependency.
 
@@ -79,10 +76,13 @@ local LU on every layout, so it has no field.
 
 | op | requested names | `auto` resolves to | `distributed` resolves to |
 |---|---|---|---|
-| `eigh` | `auto off distributed cusolvermp slate scalapack one_device` | `native` everywhere | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `one_device` for `n ≤ 16384`, else `slate` ([size route](#size-route)) |
-| `cholesky` | `auto off native2d cusolvermp slate` | `cusolvermp` on a CUDA mesh with `P_x ≥ 2` and `P_y ≥ 2` when compiled, else `native` | not in the vocabulary |
-| `solve_lu` | `auto off distributed cusolvermp scalapack slate one_device` | as `cholesky` (ROCm: `native`) | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `one_device` for `n ≤ 8192`, else `slate` ([size route](#size-route)) |
+| `eigh` | `auto off distributed cusolvermp elpa scalapack one_device` | `native` everywhere | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `one_device` for `n ≤ 16384`, else `elpa` ([size route](#size-route)) |
+| `cholesky` | `auto off native2d cusolvermp` | `cusolvermp` on a CUDA mesh with `P_x ≥ 2` and `P_y ≥ 2` when compiled, else `native` | not in the vocabulary |
+| `solve_lu` | `auto off distributed cusolvermp scalapack one_device` | as `cholesky` (ROCm: `native`) | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `one_device` within the room, refused beyond it ([size route](#size-route)) |
 | `eigh`, `solve_lu` with a room (`budget_bytes`) | as above | as above | CUDA → `one_device` where one whole matrix's priced program fits the room, else `cusolvermp` ([room leg](#measured-route)) |
+
+A request for `slate` refuses with "`slate` was removed: ..." naming the
+replacement; the SLATE backend left LORRAX on 2026-10-23.
 
 - `off` and its spelling `native` resolve to `native` unconditionally: the
   pure-JAX path (`jnp.linalg.eigh`, or the caller's own Cholesky and LU
@@ -105,36 +105,10 @@ local LU on every layout, so it has no field.
   vendor (`lxkit.device_vendor`: the client's platform and version strings and
   the device kind), so a ROCm mesh resolves as `rocm`, never as CUDA. The
   table's ROCm entries are the resolution only: `distributed` eigh names
-  SLATE, the one library of the three with a ROCm build, and so does
-  `distributed` LU (`slate::getrf` PartialPiv + `slate::getrs`, ROCM leg only;
-  see [SLATE LU](#slate-lu)), both behind the leg's size route
-  ([size route](#size-route)). The ROCm leg (`liblorrax_ffi_rocm.so`) carries
-  the HIP SLATE family; a leg built without it refuses a SLATE request at the
-  capability probe (guard 4).
-
-### SLATE LU (ROCM leg) {#slate-lu}
-
-`_slate.batched_distributed_solve_lu(A, B, mesh=)` and the split pair
-`batched_distributed_getrf(A, mesh=)` → `(LU, piv)` /
-`batched_distributed_getrs(LU, piv, B, mesh=)` keep the ScaLAPACK and
-cuSOLVERMp contract: `A` `(Nq, N, N)` and `B` `(Nq, N, NRHS)` at
-`P(None,'x','y')`, both donated, `X` in `B`'s sharding. Each matrix spans the
-whole mesh, block-cyclic by relabeling as the eigh: the handler reads each
-rank's own `(N/p, N/q)` buffer with a tile `nb` dividing both local edges
-(`_slate.lu_layout`: the largest divisor at most 256, else one tile per rank),
-so SLATE factors $\Pi A \Pi^T$ and solves for $\Pi B$. On a square mesh X
-returns in A's row order with no data movement; on a `p×1` mesh one
-`all_to_all` orders its rows (`_slate._rows_in_order`). Square or `p×1` meshes,
-`NRHS % q == 0`. The operands are copied into SLATE-owned tiles (uniform
-stride) and back. Measured at P4 2×2 (pool log `distla_lugate1`, steady s,
-NRHS = n): n 8192 f64 nb 128 / 256 / 512 / 4096 (one tile) = 3.23 / 2.17 /
-2.79 / 9.59; c128 3.87 / 3.63 / 4.18 / 26.1. `getrs` is now the larger half
-(c128 n 8192: getrf 1.03 s, getrs 2.58 s). It runs only beyond the size
-route's bound. `piv` is int64 `(Nq, P·2N)` at `P(None,('x','y'))`: each
-rank's copy of SLATE's replicated pivots as (tile index, offset) pairs, opaque.
-The fused entry runs the same getrf + getrs core, so the split pair reproduces
-it bit for bit. Handlers: `cpp/slate/batched_solve_lu_ffi.cc`. CUDA does not
-build them (its LU is cuSOLVERMp).
+  ELPA (`distrib_la._elpa`, `config/frontier/build_elpa_hip.sh`) behind the
+  leg's size row. ROCm has no distributed LU library: `distributed` LU is the
+  room route alone ([size route](#size-route)), and without a room it refuses
+  as "no default backend ... room route alone".
 
 ### The guard ladder {#guard-ladder}
 
@@ -147,17 +121,13 @@ so a returned name cannot fail later for an availability or geometry reason:
      known `n` within the bound, `distributed` resolves to `one_device`
      instead ([size route](#size-route)); announced once per decision and
      recorded on the plan (`Plan.size_route`, `Plan.describe()`).
-2. **Platform.** cuSOLVERMp is CUDA-only, ScaLAPACK host-only; SLATE is
-   declared on CUDA, CPU and ROCm.
+2. **Platform.** cuSOLVERMp is CUDA-only, ScaLAPACK host-only, ELPA
+   ROCm-only.
 3. **Known-broken combinations**, each a deterministic crash with no Python
    traceback that the capability probe cannot see:
-   - SLATE `eigh` on a CPU mesh: the host `heev` segfaults, even on a 1×1
-     mesh at `n = 64`. Use `distributed` (ScaLAPACK `pzheevd`).
    - cuSOLVERMp `eigh` with `compute_evecs=False`: `cusolverMpSyevd` returns
      status 7 at every `n`. LORRAX always wants eigenvectors; ask for them
      and ignore them.
-   - SLATE `eigh` at `n ≥ 4096` on a multi-rank CUDA mesh: a segfault that
-     kills every rank. It runs at `n ≤ 2048`.
 4. **Capability.** `loader.probe_target` confirms the handler is usable and
    distinguishes "the library would not load" from "the library has no such
    handler"; the fixes differ. Every handler of a multi-handler backend (the
@@ -165,12 +135,11 @@ so a returned name cannot fail later for an availability or geometry reason:
 5. **Coverage.** One JAX process per mesh device, because each library's MPI
    or NCCL context is per process.
 6. **Geometry.**
-   - cuSOLVERMp and SLATE `eigh` need a square mesh: `cusolverMpSyevd`
+   - cuSOLVERMp and ELPA `eigh` need a square mesh: `cusolverMpSyevd`
      deadlocks inside a collective on rectangular blocks instead of
      returning an error.
    - cuSOLVERMp Cholesky and LU need `P_x ≥ 2` and `P_y ≥ 2`; their
      block-cyclic layout degenerates on a 1-D mesh.
-   - SLATE otherwise needs a square or `N × 1` mesh (below).
    - ScaLAPACK needs a square or 1-D mesh, because `pXheevd` and `pXgetrf`
      need square descriptor blocks.
 7. **Divisibility.** When `n` is given, it must divide by both mesh axes: the
@@ -187,9 +156,8 @@ route; the request is still honoured.
 | eigh, local | `jnp.linalg.eigh` (cuSolverDn in jaxlib) | `jnp.linalg.eigh` (LAPACK in jaxlib) |
 | eigh, distributed | cuSOLVERMp `syevd` | ScaLAPACK `pzheevd` / `pdsyevd` |
 | LU solve, distributed | cuSOLVERMp batched `getrf` / `getrs` | ScaLAPACK `pXgetrf` / `pXgetrs` |
-| Cholesky, explicit request | cuSOLVERMp batched `potrf` / `potrs` | SLATE `potrf` / `trsm`; `native2d` |
+| Cholesky, explicit request | cuSOLVERMp batched `potrf` / `potrs` | `native2d` |
 | GEMM, distributed | `panel_matmul` (XLA SUMMA; local products on cuBLAS) | `panel_matmul` (XLA SUMMA; local products on JAX dot panels) |
-| SLATE, any op | only when the CUDA leg was built against a `gpu_backend=cuda` SLATE | `potrf`, `trsm`; `eigh` refused (guard 3) |
 
 On ROCm, `local_eigh` also routes single complex128 matrices of side
 128–3120 through the existing native batched provider with batch one. The
@@ -202,16 +170,11 @@ boundary without a universal driver or speed claim. Its workspace is priced by t
 batched row. Real single matrices, CPU/CUDA and out-of-window sizes retain
 their previous routes.
 
-The Perlmutter CUDA leg is built without SLATE
-(`config/perlmutter/build_ffi_cuda.sh` points `LORRAX_SLATE_INSTALL_DIR` at an
-empty prefix, and the sealed bundle's CUDA leg has no `libslate` dependency),
-so an explicit `slate` on a CUDA mesh refuses at guard 4, naming the missing
-handler. Device-side distributed algebra on NVIDIA is cuSOLVERMp, which
-communicates through NCCL.
+Device-side distributed algebra on NVIDIA is cuSOLVERMp, which communicates
+through NCCL.
 
-**Handler inventory.** There is no ScaLAPACK Cholesky and no SLATE LU
-handler. `lorrax_slate_batched_potrf` / `_batched_trsm` exist on both legs,
-but no Python wrapper calls them. No native GEMM handler is called.
+**Handler inventory.** There is no ScaLAPACK Cholesky handler, and no
+native GEMM handler is called.
 
 ## Distributed is a capacity route {#capacity-route}
 
@@ -219,12 +182,14 @@ but no Python wrapper calls them. No native GEMM handler is called.
 
 `distributed` names "one matrix over the whole mesh" because some matrix
 does not fit one device. Where it does fit, the library's fixed cost is the
-whole cost. On the ROCM leg SLATE's host stages (`hb2st` on rank 0, `stedc` on
-HostTask) cost 0.22-0.29 s per eigh at `n = 32-128` (native 0.0016-0.0045 s,
-SLATE LU is 3.9-35x native even
-block-cyclic (n 512-8192; pool log `distla_lugate1`). So the ROCM leg declares a size row,
-`resolve.ONE_DEVICE_MAX_N`: `distributed` with a known `n` at or below it
-resolves to `one_device`, beyond it to `slate`.
+whole cost (the former SLATE eigh on ROCm cost 0.22-0.29 s at `n = 32-128`
+against native 0.0016-0.0045 s). So the ROCM leg declares an eigh size row,
+`resolve.ONE_DEVICE_MAX_N`: `distributed` with a known `n` at or below 16384
+resolves to `one_device`, beyond it to `elpa`. ROCm LU is a room leg
+(`resolve.ONE_DEVICE_BY_ROOM`, as on CUDA, [below](#measured-route)) with no
+library behind it: `distributed` resolves to `one_device` where one matrix's
+priced program fits the caller's room (`budget_bytes`) and refuses by name
+beyond it, or with no room.
 
 `one_device` (`distrib_la._one_device`) keeps the FFI operand contract
 (`P('x','y')` tile or `P(None,'x','y')` stack in, the same layout out). Route
@@ -239,7 +204,7 @@ in equal rounds otherwise. The plan's checked chain applies as to a library.
 This is not the silent downgrade the resolver forbids. That rule protects the
 replicated factor's O(nq·μ³)-with-no-P-scaling wall and the route changes no one
 sees. The size route is declared in a leg row, printed once per decision
-(rank 0) and kept in `Plan.describe()`. An explicit `slate` is still honoured
+(rank 0) and kept in `Plan.describe()`. An explicit `elpa` is still honoured
 as named. `one_device` refuses (`GATE one_device`) on a leg without a row or
 beyond the bound. The capacity provider of an `auto` plan with a room
 (`resolve_eigh_capacity`) stays the library. It runs only stacks of which not
@@ -248,20 +213,20 @@ that.
 
 Measured at P4 2×2 MI250X, complex128, steady s (pool log `distla_bound1`):
 
-| n | eigh `one_device` | native, 1 GCD | SLATE 2×2 (before) | LU `one_device` (NRHS = n) | native LU |
-|---|---|---|---|---|---|
-| 32 | 0.0061 | 0.0016 | 0.236 | — | — |
-| 128 | 0.0091 | 0.0045 | 0.289 | — | — |
-| 2048 | 0.151 | 0.142 | 3.97 | 0.051 | 0.034 |
-| 8192 | 6.45 | 6.37 | 17.3 | 1.06 | 0.94 |
-| 16384 | 42.4 (peak 27.9 GB/rank) | 42.1 | 76.4 | beyond the bound | wrong (below) |
+| n | eigh `one_device` | native, 1 GCD | former SLATE 2×2 |
+|---|---|---|---|
+| 32 | 0.0061 | 0.0016 | 0.236 |
+| 128 | 0.0091 | 0.0045 | 0.289 |
+| 2048 | 0.151 | 0.142 | 3.97 |
+| 8192 | 6.45 | 6.37 | 17.3 |
+| 16384 | 42.4 (peak 27.9 GB/rank) | 42.1 | 76.4 |
 
-The SLATE column at n ≥ 2048 is from the SLATE-perf lane. The LU bound is 8192.
-The native complex128 LU on one GCD (jaxlib getrf/getrs on rocSOLVER, ROCm
-7.14.1) returns a wrong solution with no error at n = 12288 and 16384 (residual
-8e-3; pool log `distla_lubig`). float64 at 16384 and complex128 at n ≤ 11616 are
-exact (`distla_lubig2`). The checked solve refused the one-device result by name
-(`GATE distrib_la_result_check`). Beyond 8192 the LU is SLATE's.
+The ROCm LU (`one_device`, on `distrib_la.local_lu`'s span-blocked path, which
+avoids rocBLAS trsm's in-place defect past a 2³¹-byte span) has no speed
+crossover against a distributed library: complex128, one GCD against the former
+SLATE 2×2, 0.72 / 1.53 / 4.10 s against 3.63 / 10.4 / 16.1 s at
+n = 8192 / 12288 / 16384, and it runs to n = 28672 (22.7 s, peak 52.9 GB) on
+one GCD (`ROCSOLVER_LU_REPORT.md` §2).
 
 ### The CUDA room leg and the measured size route {#measured-route}
 
@@ -333,15 +298,6 @@ environmental.
   failed query is fatal and the handler uses `max(query, formula)`. The
   workspace is allocated inside the handler, invisible to XLA's memory
   planner; `LORRAX_DEBUG_PRINT=1` prints it per call.
-- **SLATE's ScaLAPACK overlay is refused.** `libslate_scalapack_api.so`
-  redefines `pzheevd_`, `pdsyevd_`, `pzgetrf_`, `pdgetrf_`, `pzgetrs_` and
-  `pdgetrs_`, so an `LD_PRELOAD` would replace every routine this backend
-  calls while `resolve` still reports `scalapack`. The overlay assumes rank
-  `mx + my·p` for shard `(mx, my)` where LORRAX's mesh puts it on `mx·q + my`,
-  and its shims hard-wire `info = 0`. `blacs_grid.h` resolves the provider of
-  each routine (`dlsym` + `dladdr`) and refuses, naming it;
-  `LORRAX_SCALAPACK_ALLOW_SLATE_API=1` downgrades the refusal to one stderr
-  line for deliberate measurement.
 - **MKL thread team.** At production grids `pzheevd`/`pzgetrf` issue
   thousands of small BLAS calls between latency-bound BLACS collectives, and a
   wide MKL team starves MPI progress (24× slower at a 12×12 grid, `n = 2448`).
@@ -350,51 +306,11 @@ environmental.
   `min(current, 4)`; `LORRAX_SCALAPACK_MKL_THREADS` overrides, and the pin is a
   no-op on a non-MKL ScaLAPACK.
 
-## SLATE {#slate}
-
-SLATE serves explicit Cholesky on CPU meshes. It is also the library a ROCm
-`distributed` eigh resolves to, which no LORRAX build serves (guard 4). Its Python wrappers are in `distrib_la._slate` (reached through
-`distrib_la.backend_module('slate')`, never imported directly):
-`distributed_cholesky` (`slate::potrf`, returning an opaque lower factor) and
-`distributed_eigh` (`slate::heev`, refused on CPU and above `n = 2048` on
-multi-rank CUDA). Three pieces make SLATE read JAX-sharded data:
-
-1. **Local transpose.** JAX tiles are row-major and SLATE tiles column-major.
-   Each rank transposes its own `(n/p, n/q)` shard to `(n/q, n/p)` inside a
-   `shard_map`, which is the original block in column-major order, with no
-   inter-rank traffic.
-2. **Rank remap.** SLATE's `fromDevices`/`fromScaLAPACK` place tile `(i, j)`
-   on rank `i + j·p`, while JAX's mesh puts shard `(mx, my)` on rank
-   `mx·q + my`. `src/ffi/cpp/slate/context.cc` rebuilds the communicator with
-   `MPI_Comm_split` key `(r / q) + (r % q)·p`, so SLATE's tile-to-rank map
-   equals JAX's shard-to-rank map.
-3. **One tile per rank.** The tile size is `nb = n / max(p, q)`, the only
-   value for which JAX's contiguous block equals SLATE's block-cyclic tile on
-   a multi-rank mesh; a `block_size` override is accepted only on a 1×1 mesh.
-
-That last rule fixes the geometry SLATE accepts: a square mesh, or `N × 1`.
-With both axes above 1 and `p ≠ q`, no square tile gives one tile per rank on
-both axes and the result would be silently wrong. A `1 × q` mesh has local
-stride `n` but tile size `n/q`, which trips a SLATE assertion
-(`internal_batch.hh`: `group.ld[m] == Mij.stride()`) and aborts every rank; use
-the transposed `q × 1` mesh. `heev` additionally needs `p = q`. An exception
-thrown inside SLATE's OpenMP tasks cannot be caught by the handler and
-terminates every rank, so every layout precondition is checked in Python first
-(`_slate.validate_mesh`, `_slate.validate_tile_layout`, and the mirrored
-geometry guard in `resolve._check_geometry`). Each wrapper requires
-`p·q == jax.process_count()`.
-
-On a CPU mesh the host handlers (`src/ffi/cpp/slate/host_ffi.cc`) build SLATE
-matrices with `fromScaLAPACK` on host buffers and run `Target::HostTask`; the
-transposes, rank remap and validation are the same. The host leg links a
-`gpu_backend=none` SLATE built by `src/ffi/cpp/stage/slate_build_perlmutter.sh
-cpu` on Perlmutter ([Building the FFI libraries](../../installation/ffi-build.md)).
-
 ## GEMM providers and active-range kernels
 
 Every `matmul` request except `off` runs `distrib_la.panel_matmul`, the
 batched 2-D SUMMA in XLA, on every platform. The retired names `cublasmp`,
-`cusolvermp`, `scalapack` and `slate` are still accepted and run it too;
+`cusolvermp` and `scalapack` are still accepted and run it too;
 `off` is the staged route only. The face GEMM needs `float64` or
 `complex128`, a square `('x','y')` mesh and exact face tiling, and takes
 `transa`/`transb` itself. It replaced cuBLASMp, which it beat 1.4-1.5x on

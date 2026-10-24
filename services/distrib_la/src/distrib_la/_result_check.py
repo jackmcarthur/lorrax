@@ -571,15 +571,15 @@ def checked_program(fn, mesh, out_shardings, in_shardings=None, compiler_options
         report("first", args, status, final=False)
         del out
         return finish(args, again(*args))
-    def runner(executable):
-        """A runner of the first program ``executable`` that retries as :func:`call` does."""
+    def runner(executable, retry=None):
+        """Run the first program, reusing an admitted ``retry`` executable when supplied."""
         def run(*a):
             out, status = executable(*a)
             if not status or not _flag(status):
                 return out
             report("first", a, status, final=False)
             del out
-            return finish(a, again(*a))
+            return finish(a, again(*a) if retry is None else retry(*a))
         return run
 
     def compiled(*args):

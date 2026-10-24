@@ -4,7 +4,7 @@
 `('x', 'y')`: Hermitian eigensolves, Cholesky and LU, GEMM, the polar factor
 and the active-subspace algebra of iterative eigensolvers. It is an
 independently installable package whose runtime dependencies are `lxkit`, JAX
-and NumPy; it imports nothing from LORRAX's `src/`. ScaLAPACK, SLATE,
+and NumPy; it imports nothing from LORRAX's `src/`. ScaLAPACK, ELPA,
 cuSOLVERMp and cuBLASMp are not Python dependencies: `distrib_la.loader` opens
 them at run time through the LORRAX native FFI pair, and without that pair the
 package still imports, reports its capabilities and runs its pure-JAX routes.

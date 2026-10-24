@@ -9,9 +9,7 @@
 # Output: <checkout>/src/ffi/cpp/build_host/liblorrax_ffi_host.so, where
 #   ffi_loader.py looks by default (LORRAX_FFI_HOST_STAGE moves it).
 # Needs: `uv sync --extra cuda13` in this checkout (the venv's jaxlib supplies
-#   the XLA FFI headers) and the gpu_backend=none SLATE from
-#   src/ffi/cpp/stage/slate_build_perlmutter.sh cpu, both under
-#   $LORRAX_BUILD_PREFIX (default <checkout>/.build).
+#   the XLA FFI headers).
 #
 # This is the Perlmutter twin of config/frontera/build_ffi_host.sh.  The two
 # are deliberately STRUCTURALLY PARALLEL — same section headers, same variable
@@ -22,8 +20,8 @@
 # ----------------------------------------------------------------------------
 # WHICH LIBRARY SUPPLIES WHAT — the Perlmutter column
 # ----------------------------------------------------------------------------
-# Same four families as Frontera, different vendors.  THREE OF THE FOUR are a
-# published API, so they are swappable; only SLATE is single-implementation.
+# Same three families as Frontera, different vendors.  Each is a published
+# API, so they are swappable.
 #
 #   family     API LORRAX calls          Perlmutter provider
 #   ---------  ------------------------  ---------------------------------
@@ -45,8 +43,6 @@
 #                                        the flat-k FFT handlers are SKIPPED
 #                                        here and ffi.fft.require_kconv refuses at
 #                                        startup.  See the FFT note below.
-#   slate      slate:: C++ templates     ICL SLATE, gpu_backend=none, built
-#                                        against LibSci + cray-mpich.
 #
 # ----------------------------------------------------------------------------
 # WHY LibSci AND NOT MKL (MKL 2025.3 *does* exist at /opt/intel/oneapi/mkl)
@@ -138,7 +134,7 @@ LORRAX_PM_HDF5="${LORRAX_PM_HDF5:-$LORRAX_PM_HDF5_MODULE}"
 # library ran.  cray-fftw's SONAME is version- and MPI-flavour-stamped, and
 # the Shifter container does not bind-mount /opt/cray/pe/fftw at all, so the
 # .so simply would not dlopen in-container.  Measured 2026-08-06: nineteen
-# ScaLAPACK/SLATE/GEMM contract tests -- none of which perform an FFT --
+# ScaLAPACK/GEMM contract tests -- none of which perform an FFT --
 # turned into SKIPS, and the suite reported 0 failures.  A lost FFT
 # optimisation silently became a lost linear-algebra test suite.
 #
@@ -163,12 +159,10 @@ LORRAX_PM_CMAKE="${LORRAX_PM_CMAKE:-cmake}"
 # Bare host, both legs load the cray-hdf5-parallel module's library, so the
 # stage defaults to that module's HDF5_DIR (set below, once it is loaded).
 LORRAX_PM_PHDF5_STAGE="${LORRAX_FFI_PHDF5_DIR:-}"
-# LibSci threading flavour.  MUST match the SLATE install's, or the process
-# ends up with both libsci_gnu_mpi and libsci_gnu_mpi_mp loaded and ELF load
-# order silently decides which BLAS/ScaLAPACK runs.  The gpu_backend=none
-# SLATE here was built threaded, so: _mp.
+# LibSci threading flavour: ONE per process, or both libsci_gnu_mpi and
+# libsci_gnu_mpi_mp end up loaded and ELF load order silently decides which
+# BLAS/ScaLAPACK runs.  The threaded _mp pair is the measured configuration.
 LORRAX_PM_LIBSCI_FLAVOUR="${LORRAX_PM_LIBSCI_FLAVOUR:-_mp}"
-LORRAX_SLATE_HOST_INSTALL_DIR="${LORRAX_SLATE_HOST_INSTALL_DIR:-$LORRAX_BUILD_PREFIX/slate/cpu/install}"
 # XLA FFI headers must match the RUNTIME jaxlib, not whatever python is first
 # on PATH.  The runtime is this checkout's venv, whose jaxlib ships them.
 if [[ -z "${LORRAX_XLA_FFI_HEADERS_DIR:-}" ]]; then
@@ -214,8 +208,7 @@ module unload cudatoolkit           2>/dev/null || true
 #
 # WHY: the Cray CC wrapper auto-injects `-lsci_gnu` — the SEQUENTIAL LibSci —
 # whenever the cray-libsci module is loaded.  Our own link line asks for the
-# THREADED `_mp` pair (to match the gpu_backend=none SLATE, which links
-# threaded), so leaving the module loaded puts BOTH flavours in the .so.  That
+# THREADED `_mp` pair, so leaving the module loaded puts BOTH flavours in the .so.  That
 # is not a theoretical concern: the Cray runtime itself detects it and prints
 #     [CRAYBLAS_WARNING] Application linked against multiple cray-libsci libraries
 # on the first BLAS call.  ELF order makes it deterministic (the _mp pair comes
@@ -276,12 +269,6 @@ if [[ ! -f "$LORRAX_XLA_FFI_HEADERS_DIR/xla/ffi/api/ffi.h" ]]; then
     echo "[build_ffi_host]   $LORRAX_XLA_FFI_HEADERS_DIR" >&2
     echo "[build_ffi_host] Run 'uv sync --extra cuda13' in $LORRAX_ROOT, or set" >&2
     echo "[build_ffi_host]   LORRAX_XLA_FFI_HEADERS_DIR to the runtime jaxlib's include dir." >&2
-    exit 2
-fi
-if [[ ! -d "$LORRAX_SLATE_HOST_INSTALL_DIR/lib64" ]]; then
-    echo "[build_ffi_host] ERROR: gpu_backend=none SLATE not found at" >&2
-    echo "[build_ffi_host]   $LORRAX_SLATE_HOST_INSTALL_DIR" >&2
-    echo "[build_ffi_host] Build it with: bash src/ffi/cpp/stage/slate_build_perlmutter.sh cpu" >&2
     exit 2
 fi
 
@@ -345,7 +332,6 @@ cmake "$SRC" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER=CC \
     -DLORRAX_XLA_FFI_INCLUDE_DIR="$LORRAX_XLA_FFI_HEADERS_DIR" \
-    -DLORRAX_SLATE_HOST_INSTALL_DIR="$LORRAX_SLATE_HOST_INSTALL_DIR" \
     -DLORRAX_SCALAPACK_LIBRARIES="-L$LORRAX_PM_LIBSCI_DIR/lib -Wl,--no-as-needed -lsci_gnu_mpi${F} -lsci_gnu${F} -lgomp -lpthread -lm -ldl" \
     -DLORRAX_CBLAS_INCLUDE_DIR="$LORRAX_PM_LIBSCI_DIR/include" \
     -DLORRAX_CBLAS_LIBRARY="$LORRAX_PM_LIBSCI_DIR/lib/libsci_gnu${F}.so" \
@@ -484,7 +470,7 @@ bare_lrx=$(grep -E '^lrx_' <<<"$_dynsyms" | grep -vE '_host$' || true)
 if [[ -n "${bare_lrx//[[:space:]]/}" ]]; then
     echo "[build_ffi_host] GATE FAILED (9b): unsuffixed lrx_* entry points" >&2
     printf '%s\n' "$bare_lrx" | sed 's/^/    /' >&2
-    echo "[build_ffi_host]   cpp/phdf5/api.cc and cpp/slate/context.cc"    >&2
+    echo "[build_ffi_host]   cpp/phdf5/api.cc and cpp/mesh/context.cc"     >&2
     echo "[build_ffi_host]   compile into BOTH libraries; their entry"      >&2
     echo "[build_ffi_host]   points must go through cpp/common/c_abi.h's"   >&2
     echo "[build_ffi_host]   LRX_C_ENTRY so this leg's carry '_host'."      >&2
@@ -495,26 +481,26 @@ unset _dynsyms
 
 # GATE 4 (load-time resolution) used to be written out here; it is one of the
 # gates that moved into scripts/verify_ffi_build.sh, which runs it below with
-# the same SLATE LD_LIBRARY_PATH this script would have used.
+# the same LD_LIBRARY_PATH this script would have used.
 
-# Dependency closure (lxkit.native_provider): the SLATE install and the pinned
-# MPI/HDF5/LibSci files, recorded beside the leg; the loader opens exactly those
+# Dependency closure (lxkit.native_provider): the pinned MPI/HDF5/LibSci
+# files, recorded beside the leg; the loader opens exactly those
 # and refuses a process that maps another copy of any of them.
 "$LORRAX_ROOT/.venv/bin/python" "$LORRAX_ROOT/src/ffi/cpp/stage/write_checkout_closure.py" \
-    "$SO_FILE" --private-dir "$LORRAX_SLATE_HOST_INSTALL_DIR/lib64" \
+    "$SO_FILE" \
     --library-dirs "$LORRAX_PM_RUNTIME_LIB_DIRS" || {
         echo "[build_ffi_host] FAILED: dependency closure" >&2; exit 1; }
 _closure_sha="$("$LORRAX_ROOT/.venv/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["record_sha256"])' "$SO_FILE.closure.json")"
 
-# The Perlmutter host recipe builds ALL FIVE host backends.  Declaring it is
+# The Perlmutter host recipe builds ALL FOUR host backends.  Declaring it is
 # what turns "ScaLAPACK/BLACS not found" from a CMake WARNING into a build
 # failure — the Aug-7 deployed library shipped with scalapack=0 because
 # nothing anywhere said what it was supposed to contain.
-LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-scalapack,gemm,slate,phdf5,fft}" \
+LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-scalapack,gemm,phdf5,fft}" \
 LORRAX_FFI_EXPECT_MPI="${LORRAX_FFI_EXPECT_MPI:-$LORRAX_PM_MPI_SONAME}" \
 LORRAX_FFI_EXPECT_HDF5_SOVERSION="${LORRAX_FFI_EXPECT_HDF5_SOVERSION:-$_stage_sov}" \
 LORRAX_PHDF5_STAGE="$LORRAX_PM_PHDF5_STAGE" \
-LD_LIBRARY_PATH="$LORRAX_SLATE_HOST_INSTALL_DIR/lib64:$LORRAX_PM_RUNTIME_LIB_DIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+LD_LIBRARY_PATH="$LORRAX_PM_RUNTIME_LIB_DIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 LORRAX_GATE_FFTW_PY="${LORRAX_GATE_FFTW_PY:-$LORRAX_VENV_PY}" \
 GATE_TAG=build_ffi_host \
     bash "$LORRAX_ROOT/scripts/verify_ffi_build.sh" --leg host "$SO_FILE" || {
@@ -548,7 +534,6 @@ GATE_TAG=build_ffi_host \
     "hdf5=$LORRAX_PM_HDF5" \
     "phdf5_stage=$LORRAX_PM_PHDF5_STAGE" \
     "fftw=$LORRAX_PM_FFTW" \
-    "slate=$LORRAX_SLATE_HOST_INSTALL_DIR" \
     "closure_sha256=$_closure_sha" || {
         echo "[build_ffi_host] WARNING: provenance stamp failed" >&2
     }

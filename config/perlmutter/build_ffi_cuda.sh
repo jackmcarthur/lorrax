@@ -134,8 +134,7 @@ cmake --fresh -S "$SRC" -B "$BUILD" \
     -DHDF5_PREFER_PARALLEL=ON \
     -DLORRAX_MPI_INCLUDE_DIR="$MPICH_ROOT/include" \
     -DLORRAX_MPICH_LIB_DIR="$MPICH_ROOT/lib" \
-    -DLORRAX_MPI_LIBRARY="$LORRAX_PM_MPI_LIBRARY" \
-    -DLORRAX_SLATE_INSTALL_DIR="$PREFIX/no-slate"
+    -DLORRAX_MPI_LIBRARY="$LORRAX_PM_MPI_LIBRARY"
 cmake --build "$BUILD" --parallel "${LORRAX_BUILD_JOBS:-16}"
 SO="$BUILD/liblorrax_ffi.so"
 [[ -f "$SO" ]] || { echo "[build_ffi_cuda] FAILED: no .so produced" >&2; exit 1; }

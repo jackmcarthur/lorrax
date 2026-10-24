@@ -38,6 +38,54 @@ This resolves screened near-Γ scales that the previous single-panel
 must meet the unchanged `atol 1e-12`, `rtol 1e-8` budget. No deck changes
 are needed; fresh slab heads can move by the old quadrature error.
 
+## 2026-10-23 — SLATE removed: ROCm LU now one device within the room, FFI ABI 11
+
+- **Removed.** The SLATE backend (`src/ffi/cpp/slate/`, `distrib_la._slate`), its
+  build and stage scripts (`slate_build_perlmutter.sh`, `slate_build_scalapack_api.sh`,
+  `config/frontier/build_slate_{cpu,hip}.sh`), CMake `LORRAX_{HOST,ROCM}_HAVE_SLATE`
+  and `LORRAX_SLATE_{,HOST_,ROCM_}INSTALL_DIR`, and the variables
+  `LORRAX_SCALAPACK_ALLOW_SLATE_API`, `LORRAX_SLATE_ROOT`, `LORRAX_SLATE_HOST_BLAS_DIR`,
+  `LORRAX_SLATE_HOST_LIB`. A `slate` backend request refuses: "`slate` was removed: ...";
+  use `distributed` (CPU scalapack, CUDA cusolvermp, ROCm elpa eigh) or `native2d`
+  for Cholesky. CPU and CUDA results do not move.
+- **ROCm `solve_lu`.** `distributed` is `one_device` where one matrix's priced program
+  fits the caller's room (`budget_bytes`), and refuses by name beyond it (was SLATE).
+  Without a room it refuses ("no default backend ... room route alone"). One GCD is
+  4-5x faster than SLATE 2×2 was: complex128 0.72 / 1.53 / 4.10 s against
+  3.63 / 10.4 / 16.1 s at n = 8192 / 12288 / 16384, and runs to n = 28672 (22.7 s;
+  `ROCSOLVER_LU_REPORT.md` §2). ROCm Cholesky is `native` / `native2d` only; ROCm
+  eigh is unchanged (ELPA).
+- **FFI ABI 10 → 11.** Rebuild both legs; a pre-11 leg refuses with
+  `HANDLER ABI MISMATCH`. Seal a new bundle for the module.
+- **Renamed.** The Shifter Cray runtime stage is `src/ffi/cpp/stage/cray_runtime_stage.sh`,
+  `LORRAX_FFI_CRAY_DIR` (default `$HOME/software/lorrax_cray_runtime/stage`), mounted
+  at `/lorrax_cray` (was `slate_stage_cray.sh`, `LORRAX_FFI_SLATE_DIR`, `/lorrax_slate`):
+  re-run the script for the Shifter route. The MPI mesh context is `src/ffi/cpp/mesh/`
+  (`lrx_mesh_context_*`, ctx family `mesh`, `distrib_la._mesh_ctx`).
+- **Frontier.** `build_openblas_seq.sh` installs to `$HOME/software/openblas_seq/install`
+  (`LORRAX_OPENBLAS_ROOT`; ELPA reads `LORRAX_ROCM_BLAS_DIR`): rebuild OpenBLAS, then
+  ELPA, then both legs. **Frontera:** the host ScaLAPACK group needs
+  `LORRAX_HOST_SCALAPACK=1`. **Perlmutter:** the host build needs no SLATE install.
+  `config/perlmutter/site_config.sh` changed, so the CPU MPIwrapper adapter's recipe
+  check refuses until it is rebuilt: `config/perlmutter/build_mpiwrapper.sh` on a CPU
+  node, before the next multi-rank CPU run.
+- **Disk.** Old SLATE installs under `~/software/slate*`, `$LORRAX_BUILD_PREFIX/slate`
+  and a module's `$PREFIX/native/slate` are unused and may be deleted.
+## 2026-10-23 — Distributed memory and compilation before the GW/BSE kernels
+
+GW keeps canonical Coulomb parents through validation, retains only the fit-band
+G coefficients beside complete centroid faces, and admits the actual compiled
+factor, Dyson and response programs with their queried native workspaces.
+Accepted Coulomb roots are reused across dense execution layouts for the same
+operator, packed basis and mesh. These changes reduce avoidable copies and
+repeated solves without adding memory modes or changing the requested accuracy.
+
+A streamed response group now reads its frequency samples in the same order as
+its consumer. Results can change for mixed dense/line groups on host/file
+storage that previously associated a sample with the wrong frequency.
+Existing inputs remain valid. CPU convolution users must rebuild the host FFI
+library: the bounded k-leading and k-minor handlers are new.
+
 ## 2026-10-23 — GW: the tangential W pole budget is 1.0 N_mu (was 1.8)
 
 - Production tier: at most ceil(1.0 N_mu) poles per parent (`pole_budget_fraction`, `gw/tangential_recipe.py`).

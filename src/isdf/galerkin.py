@@ -181,7 +181,9 @@ class GalerkinBasis:
     ``ctilde`` ``(nk, nb, rank)`` holds the orthonormal coefficients
     ``C_k`` (module docstring) on the ``(s, nu)`` rank axis;
     ``basis_at_nodes`` is the :class:`NodalInterp` (nodal values and node
-    geometry); ``loewdin`` ``(nk, nb, nb)`` is ``G_k^{-1/2}``.  ``node_weights``
+    geometry); ``loewdin`` is ``G_k^{-1/2}`` on the band x/y face,
+    with both band extents mesh-padded (the artifact stores physical bands).
+    ``node_weights``
     are the metric weights ``w_nu``, ``metric_eps = max_k ||G_k - 1||_2``.
     ``rank_physical = ns * n_nodes`` excludes the exact-null mesh pad.
     ``node_indices`` are the nodes' FFT-grid indices (zero-weight nodes
@@ -471,11 +473,12 @@ def read_galerkin_basis(path, *, wfn, meta, centroid_indices, node_indices,
         nk, nb = stored["nk"], stored["nb"]
         # SlabIO's registered shape>dataset contract zero-extends the physical
         # logical dataset directly into the mesh-legal carrier shape.
+        nb_pad = -(-nb // int(mesh_xy.shape['x'])) * int(mesh_xy.shape['x'])
         ctilde, nodal, loewdin = (
             io.read_slab(name, shape=shape, partition_spec=spec)
             for name, shape, spec in zip(
-                _BASIS_ARRAYS[:3], ((nk, nb, carrier),) * 2 + ((nk, nb, nb),),
-                (rows,) * 2 + (P(),)))
+                _BASIS_ARRAYS[:3], ((nk, nb, carrier),) * 2 + ((nk, nb_pad, nb_pad),),
+                (rows,) * 2 + (P(None, 'x', 'y'),)))
         target = None
         if stored["targets"]:
             t_carrier = _rank_carrier(
@@ -532,78 +535,251 @@ def _node_interp(node_indices, nodal, *, meta, wfn, nspinor: int,
                        frac(centroid_indices))
 
 
-#: Host bytes of one node block of :func:`_quadrature_metric`'s normal rows.
+#: Scratch bound for one streamed normal-equation node-pair block.
 QUADRATURE_BLOCK_BYTES = 1 << 26
 
 
-def _quadrature_metric(phi, labels, *, block_bytes: int = QUADRATURE_BLOCK_BYTES):
-    """Orbit-tied non-negative weights ``w`` with ``Phi_k^H W Phi_k ~ 1``.
+def _run_priced(label, fn, operands, mesh):
+    """Compile, admit and execute the same sharded stage beside its inputs."""
+    from common.gpu_utils import device_budget_bytes
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    device_budget_bytes()
+    executable = fn.lower(*operands).compile()
+    new = -agreed_chunk(-compiled_new_bytes(executable))
+    memory.admit(label, (("mesh stage", memory.Price(
+        xla=memory.Term(0.0, new * int(mesh.size), label),
+        ranks=int(mesh.size), label=label)),), memory.room())
+    return executable(*operands)
 
-    ``phi`` ``(nk, nb, ns, n_mu)`` host nodal values, ``labels`` the node
-    orbit of each node.  The normal equations of ``sum_nu w_nu sum_s
-    conj(phi_kms nu) phi_kns nu = delta_mn`` over every (k, m, n) are folded
-    onto the orbits, a block of nodes at a time (one ``(ns B, ns n_mu)``
-    block of ``x^T conj(x)`` is live, at most ``block_bytes``), and solved by
-    NNLS (``W^{1/2}`` needs ``w >= 0``); a solve that does not converge
-    refuses.  Returns ``(w (n_mu,), G (nk, nb, nb))``.
-    """
-    from scipy.optimize import nnls
-    nk, nb, ns, n_mu = phi.shape
-    labels = np.asarray(labels, dtype=np.int64)
+
+def _orbit_pack(labels, p):
+    """Whole-orbit point blocks; only linear geometry metadata is on hosts."""
+    labels = np.asarray(labels, dtype=np.int32)
     n_orb = int(labels.max()) + 1
-    order = np.argsort(labels, kind="stable")
-    starts = np.flatnonzero(np.r_[True, np.diff(labels[order]) != 0])
-    rows = max(1, int(block_bytes) // (16 * ns * ns * n_mu))
-    a_o, b_o = np.zeros((n_orb, n_orb)), np.zeros(n_orb)
-    for k in range(nk):
-        x = phi[k].reshape(nb, ns * n_mu)
-        b_o += np.bincount(labels, weights=np.real(np.einsum(
-            'msn,msn->n', np.conj(phi[k]), phi[k])), minlength=n_orb)
-        for r0 in range(0, n_mu, rows):
-            r1 = min(n_mu, r0 + rows)
-            part = phi[k][:, :, r0:r1].reshape(nb, ns * (r1 - r0))
-            q = np.abs(part.T @ np.conj(x)) ** 2
-            block = q.reshape(ns, r1 - r0, ns, n_mu).sum(axis=(0, 2))
-            np.add.at(a_o, labels[r0:r1],
-                      np.add.reduceat(block[:, order], starts, axis=1))
-    chol = np.linalg.cholesky(
-        a_o + 1e-14 * np.trace(a_o) / n_orb * np.eye(n_orb))
-    try:
-        w_o, rnorm = nnls(chol.T, np.linalg.solve(chol, b_o),
-                          maxiter=20 * n_orb)
-    except RuntimeError as exc:
-        raise RuntimeError(
-            f"GATE quadrature_metric_nnls: got: the orbit-tied NNLS over "
-            f"{n_orb} node orbits did not converge in {20 * n_orb} "
-            f"iterations ({exc}); want: a converged metric (check the node "
-            "set: orbit closure and N_node >= "
-            f"{NODES_PER_FITTED_BAND} x fitted bands)") from None
-    if not (np.isfinite(rnorm) and np.all(np.isfinite(w_o))):
-        raise RuntimeError("GATE quadrature_metric_nnls: got: a non-finite "
-                           "NNLS solution; want: finite node weights")
-    w = w_o[labels]
-    gram = np.einsum('kmsn,n,klsn->kml', np.conj(phi), w, phi, optimize=True)
-    return w, gram
+    q = -(-n_orb // p)
+    counts = np.bincount(labels, minlength=n_orb)
+    groups, loads = [[] for _ in range(p)], np.zeros(p, dtype=np.int64)
+    quotas = np.minimum(q, np.maximum(0, n_orb - np.arange(p) * q))
+    for orbit in np.argsort(-counts, kind="stable"):
+        owner = min((i for i in range(p) if len(groups[i]) < quotas[i]),
+                    key=lambda i: (loads[i], i))
+        groups[owner].append(int(orbit))
+        loads[owner] += counts[orbit]
+    width = int(loads.max())
+    source = np.zeros((p, width), dtype=np.int32)
+    point_orbit = np.full((p, width), q, dtype=np.int32)
+    order = np.zeros(p * q, dtype=np.int32)
+    for owner, group in enumerate(groups):
+        offset = 0
+        for local, orbit in enumerate(group):
+            points = np.flatnonzero(labels == orbit)
+            source[owner, offset:offset + len(points)] = points
+            point_orbit[owner, offset:offset + len(points)] = local
+            order[owner * q + local] = orbit
+            offset += len(points)
+    return source.ravel(), point_orbit.ravel(), order, q
 
 
-def _loewdin(gram):
-    """``G^{-1/2}`` per k and ``eps = max_k ||G_k - 1||_2`` (host).
+def _quadrature_normal(phi, labels, mesh, block_bytes):
+    """Fold point-pair normal equations straight into an orbit x/y face.
 
-    A ``G_k`` whose smallest eigenvalue is within ``nb`` ulp of its largest
-    is singular to roundoff (an exactly rank-deficient sampling lands either
-    side of zero) and is refused like a negative one."""
-    vals, vecs = np.linalg.eigh(gram)
-    floor = (vals.shape[-1] * np.finfo(np.float64).eps
-             * np.abs(vals).max(axis=-1, keepdims=True))
-    if not np.all(vals > floor):
+    ``phi`` is ``(nk,nb,ns,n_mu_pad)`` on ``P(None,None,None,'y')``.
+    Each point moves into a whole-orbit-owned block. Only one k and a
+    bounded left-point block of ``sum_b phi_bsi conj(phi_btj)`` is live;
+    neither the point-pair matrix nor the orbit normal matrix is gathered.
+    """
+    from common.collectives import to_transpose_partner, transpose_xy
+    from common.staged_reshard import permute_sharded_axis
+    p = int(mesh.shape['x'])
+    nk, nb, ns, _ = phi.shape
+    source, point_orbit, order, q = _orbit_pack(labels, p)
+    width = len(source) // p
+    yspec, xspec = P(None, None, None, 'y'), P(None, None, None, 'x')
+    yface, xface = NamedSharding(mesh, yspec), NamedSharding(mesh, xspec)
+    packed = permute_sharded_axis(phi, 3, source, mesh, yspec)
+    valid = point_orbit < q
+    packed = jax.jit(lambda a: a * jnp.asarray(valid)[None, None, None, :],
+                      out_shardings=yface)(packed)
+    partner = jax.jit(shard_map(lambda a: to_transpose_partner(a, p),
+        mesh=mesh, in_specs=yspec, out_specs=xspec, check_vma=False),
+        out_shardings=xface)(packed)
+    rows = max(1, min(width, int(block_bytes) //
+                       max(1, 32 * ns * ns * width)))
+    padded = -(-width // rows) * rows
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(xspec, yspec, P('x'), P('y')),
+             out_specs=(P('x', 'y'), P('x')), check_vma=False)
+    def normal(left, right, oi, oj):
+        def add_k(a, k):
+            l = jnp.pad(left[k], ((0, 0), (0, 0), (0, padded - width)))
+            li = jnp.pad(oi, (0, padded - width), constant_values=q)
+            def add_rows(a, i):
+                start = i * rows
+                part = jax.lax.dynamic_slice_in_dim(l, start, rows, axis=2)
+                dot = jnp.einsum('bsi,btj->sitj', part, jnp.conj(right[k]))
+                block = jnp.sum(jnp.real(dot * jnp.conj(dot)), axis=(0, 2))
+                folded = jax.ops.segment_sum(block.T, oj, q).T
+                labels_i = jax.lax.dynamic_slice_in_dim(li, start, rows)
+                return a + jax.ops.segment_sum(folded, labels_i, q), None
+            a, _ = jax.lax.scan(add_rows, a, jnp.arange(padded // rows))
+            return a, None
+        a, _ = jax.lax.scan(add_k, jnp.zeros((q, q), jnp.float64),
+                             jnp.arange(nk))
+        norm = jnp.sum(jnp.real(left * jnp.conj(left)), axis=(0, 1, 2))
+        return a, jax.ops.segment_sum(norm, oi, q)
+
+    fn = jax.jit(normal, out_shardings=(NamedSharding(mesh, P('x', 'y')),
+                                      NamedSharding(mesh, P('x'))))
+    oi = device_put_process_local(point_orbit, NamedSharding(mesh, P('x')))
+    oj = device_put_process_local(point_orbit, NamedSharding(mesh, P('y')))
+    a, b = _run_priced('nodal orbit normal equations', fn,
+                        (partner, packed, oi, oj), mesh)
+    n_orb = int(np.max(labels)) + 1
+    face = NamedSharding(mesh, P('x', 'y'))
+    @partial(jax.jit, out_shardings=face, donate_argnums=(0,))
+    def regularize(a):
+        a = 0.5 * (a + transpose_xy(a, mesh))
+        live = jnp.arange(p * q) < n_orb
+        ridge = 1e-14 * jnp.trace(a) / n_orb
+        return a + jnp.diag(jnp.where(live, ridge, 1.0))
+    return regularize(a), b, order
+
+
+def _nodal_face(phi, indices, mesh, extra_rank_pad=0):
+    """Canonical spin/node rank face, without a replicated coefficient copy.
+
+    The raw manual reshape orders the sharded rank as (owner,spin,node).
+    The shared two-exchange permutation selects the requested nodes and
+    restores (spin,node), including exact-null carrier padding.
+    """
+    from common.staged_reshard import permute_sharded_axis
+    nk, nb, ns, nmu = (int(n) for n in phi.shape)
+    p = int(mesh.shape['x'])
+    nb_pad = -(-nb // p) * p
+    yspec = P(None, 'x', None, 'y')
+    face = NamedSharding(mesh, P(None, 'x', 'y'))
+    phi = jax.jit(lambda a: jnp.pad(a, ((0, 0), (0, nb_pad - nb),
+                                       (0, 0), (0, 0))),
+                   out_shardings=NamedSharding(mesh, yspec))(phi)
+    flat = jax.jit(shard_map(lambda a: a.reshape(a.shape[:2] + (-1,)),
+        mesh=mesh, in_specs=yspec, out_specs=P(None, 'x', 'y'),
+        check_vma=False), out_shardings=face)(phi)
+    indices = np.asarray(indices, dtype=np.int32)
+    local = nmu // p
+    source = np.concatenate([(indices // local) * (ns * local)
+                             + s * local + indices % local for s in range(ns)])
+    physical = ns * len(indices)
+    carrier = _rank_carrier(physical, mesh, extra_rank_pad)
+    source = np.pad(source, (0, carrier - physical))
+    flat = permute_sharded_axis(flat, 2, source, mesh, P(None, 'x', 'y'))
+    return jax.jit(lambda a: a * (jnp.arange(carrier) < physical),
+                   out_shardings=face)(flat)
+
+
+def _compact_rows(face, nb, mesh):
+    """Band/rank face to product-rank rows: one all-to-all and one permute."""
+    from common.collectives import to_transpose_partner
+    p = int(mesh.shape['x'])
+    rows = NamedSharding(mesh, P(None, None, ('x', 'y')))
+    def body(a):
+        if p > 1:
+            a = jax.lax.all_to_all(a, 'x', split_axis=2, concat_axis=1,
+                                   tiled=True)
+        return to_transpose_partner(a[:, :nb], p)
+    return jax.jit(shard_map(body, mesh=mesh,
+        in_specs=P(None, 'x', 'y'), out_specs=rows.spec,
+        check_vma=False), out_shardings=rows)(face)
+
+
+def _weighted_gram(phi, w, mesh):
+    """``sum_s,nu conj(phi_m) w phi_n`` on the band x/y face."""
+    from distrib_la import panel_matmul
+    from runtime.tiles import TILE_BYTES
+    face = NamedSharding(mesh, P(None, 'x', 'y'))
+    nnode = len(w)
+    raw = _nodal_face(phi, np.arange(nnode), mesh)
+    ns = int(phi.shape[2])
+    weights = np.pad(np.tile(np.sqrt(w), ns),
+                     (0, int(raw.shape[2]) - ns * nnode))
+    weighted = jax.jit(lambda a: a * jnp.asarray(weights),
+                       out_shardings=face)(raw)
+    gram_fn = jax.jit(lambda a: panel_matmul(
+        a, a, mesh=mesh, panel_bytes=TILE_BYTES, transb='C'),
+        out_shardings=face)
+    gram = _run_priced('nodal weighted band Gram', gram_fn, (weighted,), mesh)
+    nb = int(phi.shape[1])
+    @partial(jax.jit, out_shardings=face)
+    def physical_gram(g):
+        pad = jnp.arange(g.shape[1]) >= nb
+        return jnp.conj(g) + jnp.diag(pad.astype(g.dtype))[None]
+    return physical_gram(gram)
+
+
+def _quadrature_metric(phi, labels, *, block_bytes: int = QUADRATURE_BLOCK_BYTES,
+                        mesh_xy=None):
+    """Orbit-tied nonnegative metric and its distributed band Gram.
+
+    ``phi`` is ``(nk,nb,ns,n_mu_pad)`` on ``P(None,None,None,'y')``;
+    ``labels`` names its physical nodes. Only the O(n_orbit) solution and
+    node weights return to the host. The orbit normal matrix stays on the
+    entire mesh, including every principal solve of the nonnegative fit.
+    """
+    from common.collectives import single_device_mesh
+    from distrib_la import solve_nonnegative_quadratic
+    if mesh_xy is None:
+        mesh_xy = getattr(getattr(phi, 'sharding', None), 'mesh', None)
+    mesh_xy = mesh_xy if mesh_xy is not None else single_device_mesh()
+    if not isinstance(phi, jax.Array):
+        phi = device_put_process_local(phi, NamedSharding(
+            mesh_xy, P(None, None, None, 'y')))
+    n_orb = int(np.max(labels)) + 1
+    a, b, order = _quadrature_normal(phi, labels, mesh_xy, block_bytes)
+    solution = solve_nonnegative_quadratic(a, b, mesh=mesh_xy,
+                                           n_logical=n_orb)
+    packed = np.asarray(gather_to_host(solution))[:n_orb]
+    canonical = np.empty(n_orb, dtype=np.float64)
+    canonical[order[:n_orb]] = packed
+    w = canonical[np.asarray(labels)]
+    return w, _weighted_gram(phi, w, mesh_xy)
+
+
+def _loewdin(gram, *, mesh_xy=None, n_bands=None):
+    """Distributed ``G^{-1/2}`` per k and ``max_k ||G_k - 1||_2``.
+
+    A Gram whose smallest eigenvalue is within ``nb`` ulp of its largest
+    is singular to roundoff and is refused. Dummy band pads have G=1.
+    """
+    from common.collectives import single_device_mesh
+    from common.gpu_utils import shared_device_room
+    from distrib_la import panel_matmul, plan as linalg_plan
+    from runtime.tiles import TILE_BYTES
+    mesh_xy = mesh_xy or getattr(getattr(gram, 'sharding', None), 'mesh', None)
+    mesh_xy = mesh_xy if mesh_xy is not None else single_device_mesh()
+    nb = int(gram.shape[-1]) if n_bands is None else int(n_bands)
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    if not isinstance(gram, jax.Array):
+        gram = device_put_process_local(gram, face)
+    vals, vecs = linalg_plan('eigh', mesh_xy, backend='distributed',
+        n=int(gram.shape[-1]), batched_route='auto',
+        budget_bytes=shared_device_room('nodal band Gram eigh')).batched(gram)
+    vals_host = np.asarray(gather_to_host(vals))
+    floor = nb * np.finfo(np.float64).eps * np.abs(vals_host).max(axis=-1)
+    if not np.all(vals_host > floor[:, None]):
         raise ValueError(
             "fit_galerkin_basis: the quadrature-metric Gram Phi^H W Phi is "
-            f"not positive definite (min eigenvalue {float(vals.min()):.3e}, "
+            f"not positive definite (min eigenvalue {float(vals_host.min()):.3e}, "
             f"roundoff floor {float(floor.max()):.3e}); "
             "the centroid set does not resolve the fitted window")
-    inv_half = np.einsum('kmi,ki,kni->kmn', vecs, vals ** -0.5,
-                         np.conj(vecs), optimize=True)
-    return inv_half, float(np.max(np.abs(vals - 1.0)))
+    scaled = jax.jit(lambda z, v: z * v[:, None, :] ** -0.5,
+                     out_shardings=face)(vecs, vals)
+    inverse_fn = jax.jit(lambda a, b: panel_matmul(
+        a, b, mesh=mesh_xy, panel_bytes=TILE_BYTES, transb='C'),
+        out_shardings=face)
+    inv_half = _run_priced('nodal Loewdin inverse root', inverse_fn,
+                            (scaled, vecs), mesh_xy)
+    return inv_half, float(np.max(np.abs(vals_host - 1.0)))
 
 
 def _orbit_labels(indices, sym, meta, what: str):
@@ -630,20 +806,18 @@ def _orbit_labels(indices, sym, meta, what: str):
 
 def _sample(wfn, sym, meta, indices, bispinor, mesh_xy, band_range,
             band_chunk_size):
-    """Host ``(nk, nb, ns, n)`` values of the fitted window at ``indices``
-    (the GW centroid-face path)."""
+    """Mesh-legal ``(nk,nb,ns,n_pad)`` y-face samples, without a host gather."""
     nb = int(band_range[1]) - int(band_range[0])
     psi_y, psi_x = load_centroids_band_chunked(
         wfn, sym, meta, np.asarray(indices, dtype=np.int64), bool(bispinor),
         mesh_xy, band_range=tuple(int(v) for v in band_range),
         band_chunk_size=int(band_chunk_size))
     del psi_x
-    n = int(np.asarray(indices).reshape(-1, 3).shape[0])
     if int(psi_y.shape[2]) != int(meta.nspinor) or int(psi_y.shape[1]) != nb:
         raise ValueError(
             f"fit_galerkin_basis: centroid faces {tuple(psi_y.shape)} do "
             f"not carry ({nb} bands, {int(meta.nspinor)} spinor components)")
-    return np.asarray(gather_to_host(psi_y))[..., :n]
+    return psi_y
 
 
 def fit_galerkin_basis(
@@ -696,42 +870,48 @@ def fit_galerkin_basis(
     phi = _sample(wfn, sym, meta, nodes, bispinor, mesh_xy, (b_start, b_end),
                   band_chunk_size)                       # (nk, nb, ns, n_mu)
     t_sample = time.perf_counter() - t0
-    w, gram = _quadrature_metric(phi, labels)
-    inv_half, eps = _loewdin(gram)
-    # A zero-weight node's row of C = W^{1/2} Phi G^{-1/2} is exactly zero:
-    # drop it from the rank axis (exact).  The ISDF centroids stay the
-    # back-map targets, so a dropped centroid node keeps its sampled values.
+    w, gram = _quadrature_metric(phi, labels, mesh_xy=mesh_xy)
+    inv_half, eps = _loewdin(gram, mesh_xy=mesh_xy, n_bands=nb)
+    del gram
+    # Zero-weight rows are exactly null. Select them on the distributed
+    # rank; even pre-drop centroid targets stay on the mesh throughout.
     requested, keep = nodes, w > 0.0
+    kept_indices = np.flatnonzero(keep)
     n_zero = int(np.count_nonzero(~keep))
-    target_values = None
+    nodes, w, labels = nodes[keep], w[keep], labels[keep]
+    n_mu = int(nodes.shape[0])
+    n_orbits = int(np.unique(labels).size)
     if n_zero:
-        if same:
-            target_values = phi                  # every centroid, pre-drop
-        nodes, phi, w, labels = nodes[keep], phi[..., keep], w[keep], labels[keep]
-        n_mu, same = int(nodes.shape[0]), False
-        n_orbits = int(np.unique(labels).size)
-    coeff = np.einsum('kmn,kmsv,v->knsv', inv_half, phi, np.sqrt(w),
-                      optimize=True)
+        same = False
+    raw = _nodal_face(phi, kept_indices, mesh_xy, extra_rank_pad)
     rank_phys = nspinor * n_mu
-    carrier = _rank_carrier(rank_phys, mesh_xy, extra_rank_pad)
-    rows = NamedSharding(mesh_xy, P(None, None, ("x", "y")))
-
-    def pad(a, to):
-        flat = a.reshape(a.shape[0], nb, -1)
-        return np.pad(flat, ((0, 0), (0, 0), (0, to - flat.shape[2])))
-
-    ctilde = device_put_process_local(pad(coeff, carrier), rows)
-    nodal = device_put_process_local(pad(phi, carrier), rows)
-    del phi
+    carrier = int(raw.shape[2])
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    weights = np.pad(np.tile(np.sqrt(w), nspinor), (0, carrier - rank_phys))
+    weighted = jax.jit(lambda a: a * jnp.asarray(weights),
+                       out_shardings=face)(raw)
+    from distrib_la import panel_matmul
+    from runtime.tiles import TILE_BYTES
+    coefficient_fn = jax.jit(lambda a, b: panel_matmul(
+        a, b, mesh=mesh_xy, panel_bytes=TILE_BYTES, transa='T'),
+        out_shardings=face)
+    coeff = _run_priced('nodal orthonormal coefficients', coefficient_fn,
+                         (inv_half, weighted), mesh_xy)
+    ctilde = _compact_rows(coeff, nb, mesh_xy)
+    nodal = _compact_rows(raw, nb, mesh_xy)
+    del coeff, raw, weighted
     target = None
     if not same:
-        t_carrier = _rank_carrier(nspinor * centroids.shape[0], mesh_xy, 0)
-        target = device_put_process_local(pad(
-            target_values if target_values is not None else _sample(
-                wfn, sym, meta, centroids, bispinor, mesh_xy,
-                (b_start, b_end), band_chunk_size), t_carrier), rows)
-    del target_values
-    loewdin = device_put_process_local(inv_half, NamedSharding(mesh_xy, P()))
+        from_centroids = (requested.shape == centroids.shape
+                          and np.array_equal(requested, centroids))
+        target_phi = phi if from_centroids else _sample(
+            wfn, sym, meta, centroids, bispinor, mesh_xy,
+            (b_start, b_end), band_chunk_size)
+        target_face = _nodal_face(target_phi, np.arange(len(centroids)), mesh_xy)
+        target = _compact_rows(target_face, nb, mesh_xy)
+        del target_phi, target_face
+    del phi
+    loewdin = inv_half
     seconds = time.perf_counter() - t0
     from_centroids = (requested.shape == centroids.shape
                       and np.array_equal(requested, centroids))
@@ -784,78 +964,131 @@ def fit_galerkin_basis(
 _ZETA_KERNELS: dict = {}
 
 
-def _node_gram_factor(basis: GalerkinBasis, *, nspinor: int, mesh_xy: Mesh):
-    """``B`` ``(1, n, n)`` on the face ``P(None, 'x', 'y')`` with ``B B^H =
-    G^+``, the pseudo-inverse of the node Gram of the coefficient rows
-    (relative cutoff ``refit_rcond**2`` on the unit-diagonal Gram): the factor
-    of the least-squares rows ``zeta_nu(r)`` (:func:`iter_galerkin_rchunks`
-    only).  ``n`` is the node count padded to tile the mesh; pad rows of B
-    are zero.  The Gram is built on the face and its eigh is placed by
-    ``distrib_la`` in the room beside what is live (whole matrices per rank
-    where they fit, else the whole mesh), so no rank holds the
-    ``n_nodes^2`` Gram by construction."""
+def _coefficient_matrix(ctilde, *, n_nodes, nspinor, mesh, band_range=None,
+                         band_carrier=None):
+    """``conj(C)`` as a node/contracted-state face, with no complete C copy.
+
+    The contracted axis is owner-major (band owner, k, local band, spin),
+    the same ordering used by :func:`_psi_matrix`. Only local reshapes and
+    the shared two-exchange rank permutation change its representation.
+    """
+    from common.collectives import to_transpose_partner
+    from common.staged_reshard import permute_sharded_axis
+    p = int(mesh.shape['x'])
+    lo, hi = (0, int(ctilde.shape[1])) if band_range is None else band_range
+    width = hi - lo
+    bands = -(-width // p) * p if band_carrier is None else int(band_carrier)
+    nodes = -(-n_nodes // p) * p
+    rows = NamedSharding(mesh, P(None, None, ('x', 'y')))
+    part = jax.jit(lambda a: jnp.pad(a[:, lo:hi],
+        ((0, 0), (0, bands - width), (0, 0))), out_shardings=rows)(ctilde)
+    face = NamedSharding(mesh, P(None, 'x', 'y'))
+    def uncompact(a):
+        a = to_transpose_partner(a, p)
+        return (jax.lax.all_to_all(a, 'x', split_axis=1, concat_axis=2,
+                                    tiled=True) if p > 1 else a)
+    flat = jax.jit(shard_map(uncompact, mesh=mesh, in_specs=rows.spec,
+        out_specs=face.spec, check_vma=False), out_shardings=face)(part)
+    # Desired local order is (spin, this owner's nodes), including null pads.
+    point = np.arange(nodes).reshape(p, -1)
+    source = np.stack([s * n_nodes + point for s in range(nspinor)], axis=1)
+    valid = np.broadcast_to((point < n_nodes)[:, None], source.shape).ravel()
+    source = np.where(valid, source.ravel(), 0).astype(np.int32)
+    flat = permute_sharded_axis(flat, 2, source, mesh, face.spec)
+    flat = jax.jit(lambda a: a * jnp.asarray(valid), out_shardings=face)(flat)
+    def contract_axis(a):
+        a = to_transpose_partner(a, p)  # band y, nodes x
+        a = a.reshape(a.shape[:2] + (nspinor, nodes // p))
+        a = jnp.transpose(jnp.conj(a), (3, 0, 1, 2))
+        return a.reshape(1, nodes // p, -1)
+    return jax.jit(shard_map(contract_axis, mesh=mesh, in_specs=face.spec,
+        out_specs=face.spec, check_vma=False), out_shardings=face)(flat)
+
+
+def _psi_matrix(psi, mesh, bands):
+    """Product-r samples to a contracted-state/r face, preserving volume."""
+    p = int(mesh.shape['x'])
+    spec = P(None, None, None, ('y', 'x'))
+    if int(psi.shape[1]) < bands:
+        psi = jnp.pad(psi, ((0, 0), (0, bands - int(psi.shape[1])),
+                            (0, 0), (0, 0)))
+    def body(a):
+        if p > 1:
+            a = jax.lax.all_to_all(a, 'x', split_axis=1, concat_axis=3,
+                                   tiled=True)
+        return a.reshape(1, -1, a.shape[-1])
+    return shard_map(body, mesh=mesh, in_specs=spec,
+        out_specs=P(None, 'x', 'y'), check_vma=False)(psi)
+
+
+def _node_gram_factor(basis: GalerkinBasis, *, nspinor: int, mesh_xy: Mesh,
+                      coefficient_blocks=None):
+    """Face factor ``B B^H = G^+`` of the coefficient node Gram.
+
+    Coefficient blocks, normal products, eigensystems and the inverse factor
+    stay tiled over the mesh. Only the linear diagonal and eigenvalues are
+    replicated. The relative eigenvalue cutoff remains ``refit_rcond**2``.
+    """
     from common.gpu_utils import shared_device_room
-    from distrib_la import plan as linalg_plan
-    from runtime.padding import padded_axis
+    from distrib_la import panel_matmul, plan as linalg_plan
+    from runtime.tiles import TILE_BYTES
     n_nodes = int(basis.basis_at_nodes.n_nodes)
-    n = padded_axis(n_nodes, mesh_xy, name="Galerkin node Gram",
-                    specs=((P("x", None), 0), (P(None, "y"), 1))).carrier
+    n = -(-n_nodes // int(mesh_xy.shape['x'])) * int(mesh_xy.shape['x'])
     face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     rep = NamedSharding(mesh_xy, P())
-    cut = float(basis.refit_rcond) ** 2
-
-    @partial(jax.jit, out_shardings=(face, rep))
-    def _gram(c):
-        rows = c[:, :, :nspinor * n_nodes].reshape(
-            c.shape[0], c.shape[1], nspinor, n_nodes)
-        rows = jnp.pad(rows, ((0, 0), (0, 0), (0, 0), (0, n - n_nodes)))
-        g = jax.lax.with_sharding_constraint(jnp.einsum(
-            'kbsn,kbsm->nm', jnp.conj(rows), rows, optimize=True)[None], face)
+    blocks = ([_coefficient_matrix(basis.ctilde, n_nodes=n_nodes,
+                nspinor=nspinor, mesh=mesh_xy)] if coefficient_blocks is None
+              else coefficient_blocks)
+    gram = jnp.zeros((1, n, n), blocks[0].dtype, device=face)
+    @partial(jax.jit, out_shardings=face, donate_argnums=(1,))
+    def add_gram(a, g):
+        return g + panel_matmul(a, a, mesh=mesh_xy,
+                                 panel_bytes=TILE_BYTES, transb='C')
+    for block in blocks:
+        gram = _run_priced('Galerkin refit node Gram', add_gram,
+                             (block, gram), mesh_xy)
+    @partial(jax.jit, out_shardings=(face, rep), donate_argnums=(0,))
+    def normalize(g):
         scale = jnp.sqrt(jnp.maximum(jnp.real(jnp.diagonal(g[0])), 1e-300))
         live = jnp.arange(n) < n_nodes
         unit = g / scale[None, :, None] / scale[None, None, :]
         unit = jnp.where(live[:, None] & live[None, :], unit, 0)
-        return jax.lax.with_sharding_constraint(unit, face), scale
-
-    unit, scale = _gram(basis.ctilde)
-    room = shared_device_room("Galerkin node Gram eigh")
-    lam, vec = linalg_plan("eigh", mesh_xy, n=n, budget_bytes=room).batched(
-        unit)
-
+        return unit, scale
+    unit, scale = normalize(gram)
+    lam, vec = linalg_plan('eigh', mesh_xy, backend='distributed', n=n,
+                            batched_route='auto', budget_bytes=shared_device_room(
+                                'Galerkin node Gram eigh')).batched(unit)
+    cut = float(basis.refit_rcond) ** 2
     @partial(jax.jit, out_shardings=face)
-    def _factor(lam, vec, scale):
+    def factor(lam, vec, scale):
         keep = lam[0] > cut * jnp.max(lam[0])
         col = jnp.where(keep, 1.0 / jnp.sqrt(jnp.where(keep, lam[0], 1.0)), 0.0)
         row = jnp.where(jnp.arange(n) < n_nodes, 1.0 / scale, 0.0)
         return vec * row[None, :, None] * col[None, None, :]
-
-    return _factor(lam, vec, scale)
+    return factor(lam, vec, scale)
 
 
 def _make_zeta_kernel(*, mesh: Mesh, phi_shape, n_nodes: int, rank: int,
                       nspinor: int, r_carrier: int):
-    """One band chunk of ``sum_{k,n,s} conj(psi(r_nu)) psi(r)`` on r shards."""
+    """One coefficient-block/r product with all operands on mesh faces."""
+    from distrib_la import panel_matmul
+    from runtime.tiles import TILE_BYTES
     key = (id(mesh), tuple(phi_shape), int(n_nodes), int(rank), int(nspinor),
            int(r_carrier))
     fn = _ZETA_KERNELS.get(key)
     if fn is not None:
         return fn
-    psi_spec = P(None, None, None, ('y', 'x'))
-    acc_spec = P(None, ('y', 'x'))
-
-    @partial(shard_map, mesh=mesh, in_specs=(psi_spec, P(), acc_spec),
-             out_specs=acc_spec, check_vma=False)
-    def _acc(psi, phi, acc):
-        return acc + jnp.einsum('kbsr,kbsn->nr', psi, jnp.conj(phi),
-                                optimize=True)
-
-    fn = jax.jit(_acc, donate_argnums=(2,),
-                 in_shardings=(NamedSharding(mesh, psi_spec),
-                               NamedSharding(mesh, P()),
-                               NamedSharding(mesh, acc_spec)),
-                 out_shardings=NamedSharding(mesh, acc_spec))
-    _ZETA_KERNELS[key] = fn
-    return fn
+    face = NamedSharding(mesh, P(None, 'x', 'y'))
+    psi_spec = NamedSharding(mesh, P(None, None, None, ('y', 'x')))
+    @partial(jax.jit, donate_argnums=(2,),
+             in_shardings=(psi_spec, face, face), out_shardings=face)
+    def accumulate(psi, phi, acc):
+        bands = int(phi.shape[2]) // (int(psi.shape[0]) * nspinor)
+        sampled = _psi_matrix(psi, mesh, bands)
+        return acc + panel_matmul(phi, sampled, mesh=mesh,
+                                   panel_bytes=TILE_BYTES)
+    _ZETA_KERNELS[key] = accumulate
+    return accumulate
 
 
 def iter_galerkin_rchunks(
@@ -904,41 +1137,45 @@ def iter_galerkin_rchunks(
     psi_layout = NamedSharding(mesh_xy, P(None, None, None, ('y', 'x')))
     r_divisor = spec_divisor(mesh_xy, row_layout.spec, axis=2)
 
-    @partial(jax.jit, static_argnames=("lo", "hi", "pad"), out_shardings=rep)
-    def _phi(ctilde, lo, hi, pad):
-        rows = ctilde[:, lo:hi, :nspinor * n_nodes].reshape(
-            ctilde.shape[0], hi - lo, nspinor, n_nodes)
-        return jnp.pad(rows, ((0, 0), (0, pad), (0, 0), (0, 0)))
-
-    phis = [_phi(basis.ctilde, int(lo) - b_start, int(hi) - b_start,
-                 bc - (int(hi) - int(lo)))
-            for lo, hi in source.band_chunk_ranges]
-    factor = _node_gram_factor(basis, nspinor=nspinor, mesh_xy=mesh_xy)
-    from common.gpu_utils import shared_device_room
-    from distrib_la import matmul as face_matmul
-    room = shared_device_room("Galerkin refit rows GEMM")
-    mm = partial(face_matmul, mesh=mesh_xy, batched_route="auto",
-                 budget_bytes=room)
+    phis = [_coefficient_matrix(
+        basis.ctilde, n_nodes=n_nodes, nspinor=nspinor, mesh=mesh_xy,
+        band_range=(int(lo) - b_start, int(hi) - b_start), band_carrier=bc)
+        for lo, hi in source.band_chunk_ranges]
+    factor = _node_gram_factor(basis, nspinor=nspinor, mesh_xy=mesh_xy,
+                               coefficient_blocks=phis)
+    from distrib_la import panel_matmul
+    from runtime.tiles import TILE_BYTES
     n_face = int(factor.shape[1])
     face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    p = int(mesh_xy.shape['x'])
 
-    @partial(jax.jit, out_shardings=(row_layout, rep))
+    @partial(jax.jit, out_shardings=(row_layout, rep, face))
     def _rows(factor, acc):
-        # zeta = G^+ acc = B (B^H acc) by the face GEMM (distrib_la.matmul:
-        # whole matrices per rank only where they fit the room).
-        a = jax.lax.with_sharding_constraint(
-            jnp.pad(acc, ((0, n_face - n_nodes), (0, 0)))[None], face)
-        zeta = mm(factor, mm(factor, a, transa="C"))[0, :n_nodes]
-        out = jnp.zeros((rank, nspinor, zeta.shape[-1]), dtype=zeta.dtype)
-        for s in range(nspinor):
-            out = out.at[s * n_nodes:(s + 1) * n_nodes, s, :].set(zeta)
-        return out, jnp.sum(jnp.real(jnp.conj(acc) * zeta))
+        zeta = panel_matmul(factor, panel_matmul(factor, acc, mesh=mesh_xy,
+            panel_bytes=TILE_BYTES, transa='C'), mesh=mesh_xy,
+            panel_bytes=TILE_BYTES)
+        fitted = jnp.sum(jnp.real(jnp.conj(acc) * zeta))
+        def compact(z):
+            if p > 1:
+                z = jax.lax.all_to_all(z, 'x', split_axis=2, concat_axis=1,
+                                       tiled=True)
+            return z[0, :n_nodes]
+        values = shard_map(compact, mesh=mesh_xy, in_specs=face.spec,
+            out_specs=P(None, ('y', 'x')), check_vma=False)(zeta)
+        out = jnp.zeros((rank, nspinor, values.shape[-1]), dtype=values.dtype)
+        def spin(s, out):
+            return jax.lax.dynamic_update_slice(out,
+                values[:, None, :], (jnp.int32(s * n_nodes), jnp.int32(s), jnp.int32(0)))
+        return jax.lax.fori_loop(0, nspinor, spin, out), fitted, zeta
 
     @partial(jax.jit, out_shardings=(rep, rep))
-    def _part_residual(rows, psi, basis_chunk):
-        zeta = basis_chunk[:n_nodes, 0, :]
-        diff = psi - jnp.einsum('knsv,vr->knsr', rows, zeta, optimize=True)
-        return jnp.sum(jnp.abs(diff) ** 2), jnp.sum(jnp.abs(psi) ** 2)
+    def _part_residual(phi, psi, zeta):
+        bands = int(phi.shape[2]) // (int(psi.shape[0]) * nspinor)
+        sampled = _psi_matrix(psi, mesh_xy, bands)
+        predicted = panel_matmul(phi, zeta, mesh=mesh_xy,
+                                  panel_bytes=TILE_BYTES, transa='C')
+        return (jnp.sum(jnp.abs(sampled - predicted) ** 2),
+                jnp.sum(jnp.abs(sampled) ** 2))
 
     scalar = lambda x: float(np.asarray(x.addressable_data(0)))
     # |psi|^2 and fitted part over the basis window; residual and |psi|^2
@@ -955,16 +1192,16 @@ def iter_galerkin_rchunks(
         r_carrier = padded_axis(
             r1 - r0, r_divisor,
             name="Galerkin iteration real-space carrier").carrier
-        acc = jnp.zeros((n_nodes, r_carrier), jnp.complex128,
-                        device=NamedSharding(mesh_xy, P(None, ('y', 'x'))))
+        acc = jnp.zeros((1, n_face, r_carrier), jnp.complex128, device=face)
         retained = []
         for bc_idx, (bc_range, psi_bc) in enumerate(
                 source.iter_rchunk_bandwise(
                     r0, r1, product_r_spec=psi_layout.spec)):
-            acc = _make_zeta_kernel(
+            kernel = _make_zeta_kernel(
                 mesh=mesh_xy, phi_shape=phis[bc_idx].shape, n_nodes=n_nodes,
-                rank=rank, nspinor=nspinor, r_carrier=r_carrier)(
-                    psi_bc, phis[bc_idx], acc)
+                rank=rank, nspinor=nspinor, r_carrier=r_carrier)
+            acc = _run_priced('Galerkin refit sampled overlap', kernel,
+                               (psi_bc, phis[bc_idx], acc), mesh_xy)
             if receipt is not None:
                 n_valid = int(bc_range[1]) - int(bc_range[0])
                 totals[0] += scalar(jnp.sum(jnp.abs(psi_bc[:, :n_valid]) ** 2))
@@ -976,15 +1213,20 @@ def iter_galerkin_rchunks(
                     ((lo, hi), psi_bc[:, offset:offset + (hi - lo)]))
             else:
                 del psi_bc
-        basis_chunk, fitted = _rows(factor, acc)
+        basis_chunk, fitted, zeta = _run_priced(
+            'Galerkin refit basis rows', _rows, (factor, acc), mesh_xy)
         del acc
         if receipt is not None:
             totals[1] += scalar(fitted)
             for (lo, hi), psi in retained:
-                rows = _phi(basis.ctilde, lo - b_start, hi - b_start, 0)
-                res2, nrm2 = _part_residual(rows, psi, basis_chunk)
+                rows = _coefficient_matrix(
+                    basis.ctilde, n_nodes=n_nodes, nspinor=nspinor,
+                    mesh=mesh_xy, band_range=(lo - b_start, hi - b_start))
+                res2, nrm2 = _run_priced('Galerkin refit residual',
+                    _part_residual, (rows, psi, zeta), mesh_xy)
                 totals[2] += scalar(res2)
                 totals[3] += scalar(nrm2)
+        del zeta
         if sum(hi - lo for (lo, hi), _ in retained) != keep_end - keep_start:
             raise RuntimeError(
                 "iter_galerkin_rchunks: retained WFN pieces do not cover "

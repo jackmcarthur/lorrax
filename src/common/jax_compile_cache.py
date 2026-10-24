@@ -25,6 +25,9 @@ is only what that cannot see or say:
   (INVARIANTS 21), with the compile counter the receipt reads;
 * GATE xla_rematerialization (:func:`_install_device_fit_gate`): a module
   larger than the device is refused before its first execution;
+* CPU glibc compiler-heap reclamation after real compiles: RSS growth and
+  free heap must both exceed the runtime malloc trim threshold; the existing
+  allocator opt-out wins, and GPU/cache-hit paths are untouched;
 * :func:`compile_ahead`: a program whose avals a stage owner knows before its
   first call is lowered on the calling thread (program order, so every rank
   lowers the same module at the same request number) and compiled on a
@@ -128,6 +131,10 @@ class _CacheState:
         self.hits = 0          # lookups served from disk
         self.compiles = 0      # actual XLA compiles (backend_compile_and_load)
         self.compile_secs = 0.0
+        self.cpu_heap_rss = None  # RSS after the last CPU compile heap release
+        self.cpu_heap_trims = 0
+        self.cpu_heap_trim_bytes = 0
+        self.cpu_heap_trim_secs = 0.0
         # Compiles of modules with host callbacks, which JAX's persistent
         # cache never writes (compiler._cache_write): name -> [count, secs].
         self.uncacheable: dict = {}
@@ -790,6 +797,79 @@ def _fit_gate_notice(msg: str) -> None:
               flush=True)
 
 
+@functools.lru_cache(maxsize=1)
+def _cpu_malloc_functions():
+    """The glibc free-heap census and page release, or None on another libc."""
+    import ctypes
+    libc = ctypes.CDLL(None)
+    if not hasattr(libc, "gnu_get_libc_version"):
+        return None
+
+    class Mallinfo2(ctypes.Structure):
+        # glibc malloc.h: size_t fields, including free bytes inside arenas.
+        _fields_ = [(name, ctypes.c_size_t) for name in (
+            "arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks",
+            "fsmblks", "uordblks", "fordblks", "keepcost")]
+
+    info, trim = libc.mallinfo2, libc.malloc_trim
+    info.argtypes, info.restype = [], Mallinfo2
+    trim.argtypes, trim.restype = [ctypes.c_size_t], ctypes.c_int
+    return info, trim
+
+
+def _cpu_compile_rss() -> int:
+    """Resident host bytes, sampled only at real CPU compile boundaries."""
+    with open("/proc/self/statm") as stream:
+        return int(stream.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+
+
+def _cpu_compile_heap(backend, *, after=False) -> None:
+    """Release large freed CPU compiler heaps; retain every live executable.
+
+    At P121 a cold 1 MiB all-to-all compile left 139 MiB of free glibc
+    arena pages per rank. Trimming with its executable/input live released
+    16 GiB/node in 22 ms/rank, with exact output and unchanged warm latency.
+    Reuse the runtime's allocator opt-out and trim threshold (128 MiB).
+    Both RSS growth and free heap must reach that threshold. The RSS
+    watermark spans compiles, so smaller cold compiles can accumulate, but
+    a tiny compile after an earlier trim does not repeatedly scan the heap.
+    This hook runs only around real CPU compiles, never GPU or cache hits.
+    """
+    if getattr(backend, "platform", None) != "cpu":
+        return
+    import runtime
+    policy = runtime._MALLOC_TUNE
+    if not policy.get("applied"):
+        return
+    try:
+        trim_mb = int(policy["trim_mb"])
+        if trim_mb < 0:  # a caller-disabled automatic trim threshold
+            return
+        threshold = trim_mb * 1024 * 1024
+        with _STATE._compile_event_lock:
+            resident = _cpu_compile_rss()
+            if not after:
+                _STATE.cpu_heap_rss = (resident if _STATE.cpu_heap_rss is None
+                                      else min(_STATE.cpu_heap_rss, resident))
+                return
+            if (_STATE.cpu_heap_rss is None
+                    or resident - _STATE.cpu_heap_rss < threshold):
+                return
+            functions = _cpu_malloc_functions()
+            if functions is None or functions[0]().fordblks < threshold:
+                return
+            started = time.monotonic()
+            functions[1](0)
+            remaining = _cpu_compile_rss()
+            _STATE.cpu_heap_rss = remaining
+            _STATE.cpu_heap_trims += 1
+            _STATE.cpu_heap_trim_bytes += max(0, resident - remaining)
+            _STATE.cpu_heap_trim_secs += time.monotonic() - started
+    except (AttributeError, OSError, TypeError, ValueError):
+        # Optional glibc/Linux reclamation must not change compile semantics.
+        return
+
+
 def _install_compile_counter() -> None:
     """Count real XLA compiles and run the compile agreement around them.
 
@@ -897,10 +977,13 @@ def _install_compile_counter() -> None:
             _check_compile_record(*current)
         module = args[1] if len(args) > 1 else kwargs.get("module")
         callbacks = args[4] if len(args) > 4 else kwargs.get("host_callbacks")
+        backend = args[0] if args else kwargs.get("backend")
+        _cpu_compile_heap(backend)
         t0 = time.monotonic()
         try:
             return _orig(*args, **kwargs)
         finally:
+            _cpu_compile_heap(backend, after=True)
             with _STATE._compile_event_lock:
                 _STATE.compiles += 1
                 _STATE.compile_secs += time.monotonic() - t0
@@ -1051,6 +1134,9 @@ def compile_cache_stats() -> dict:
         "enabled": s.enabled, "dir": s.dir, "n_proc": s.n_proc,
         "proc_idx": s.proc_idx, "probes": s.probes, "hits": s.hits,
         "compiles": s.compiles, "compile_secs": s.compile_secs,
+        "cpu_heap_trims": s.cpu_heap_trims,
+        "cpu_heap_trim_bytes": s.cpu_heap_trim_bytes,
+        "cpu_heap_trim_secs": s.cpu_heap_trim_secs,
         "compile_agreement_configured": s.compile_agreement_configured,
         "compile_agreement_enabled": s.compile_agreement_enabled,
         "compile_agreement_reason": s.compile_agreement_reason,

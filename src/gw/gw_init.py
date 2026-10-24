@@ -11,6 +11,7 @@ import hashlib
 import math
 import json
 import os
+from functools import lru_cache
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
@@ -1429,6 +1430,12 @@ class _ZetaFitContract:
 	reuse_transverse: tuple[bool, ...] = ()
 
 	@property
+	def fit_band_range(self):
+		"""The existing left/right fit union, independent of the loaded faces."""
+		return (min(self.band_range_left[0], self.band_range_right[0]),
+		        max(self.band_range_left[1], self.band_range_right[1]))
+
+	@property
 	def reuse(self):
 		"""Whether every artifact required by this contract is reusable."""
 		return bool(self.reuse_charge and all(self.reuse_transverse))
@@ -2037,6 +2044,7 @@ def _fit_transverse_zeta_channels(
                 band_range=band_slices.full_range,
                 band_chunk=int(_chunks_T['mubatch'].band_chunk),
                 centroid_indices=_cent_T_idx, placement="device", bispinor=True,
+                store_band_range=zeta_contract.fit_band_range,
                 bispinor_lift=(representation.current_lift or "raw"),
                 k_domain=sym.parent_k_domain, print_fn=print_fn)
         faces = _psi.faces
@@ -2447,9 +2455,9 @@ def _compute_photon_vq(
                 mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
             )
     from file_io.restart_bundle import read_photon_charge
-    V_q_raw = read_photon_charge(bispinor_h5_path, mesh_xy)
+    V_q_raw = read_photon_charge(bispinor_h5_path, mesh_xy, retain_wedge=True)
     # Both views stay on the canonical file carrier, as on the scalar route:
-    # ``_finalize_vq_views`` is the one packing owner.
+    # Validation and restart I/O keep this order; the final wedge seam packs.
     G0_all = photon_g0_vectors[0]
     if not (uses_coupled_photon_head(cfg)
             or uses_direct_bispinor_tangential_head(cfg)):
@@ -2502,6 +2510,8 @@ def _compute_scalar_vq(
                 sym=sym,
                 centroid_indices=_cent_idx_np,
                 g_chunk_size=int(cfg.memory.vq_g_chunk_size),
+                consume_fit_factor=True,
+                retain_wedge=True,
             )
             head_channel = _build_head_channel(
                 zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
@@ -2514,45 +2524,214 @@ def _compute_scalar_vq(
     return V_q_raw, G0_all, head_channel
 
 
-def _coulomb_on_wedge(V_full, *, sym, centroid_indices, meta):
-    """``V_full`` (packed, full zone) as a ``QirrOperator`` on the run's q wedge."""
-    from ffi import _services
-    _services.ensure_on_path()
+def _select_coulomb_q_rows(V_full, *, sym, centroid_indices, meta):
+    """Select canonical representative rows before the full parent is released.
+
+    Return the array and the existing packed-basis q tables separately. The
+    driver assigns this result before packing, so its full-zone input has no
+    remaining owner when the packing program allocates its staging buffers.
+    All-q validation and restart I/O have already consumed that input.
+    """
     from symmetry_maps import QirrOperator
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
     from .v_q_g_flat import q_wedge
-    whole = QirrOperator.of(V_full)
     wedge = q_wedge(sym=sym, centroid_indices=centroid_indices, meta=meta,
                     context="bare V on the q wedge")
     if wedge is None:
-        return whole
-    op = whole.restrict(QirrOperator(values=None, **wedge[0]))
-    timing.stage_wait(op.values)
-    return op
+        return V_full, None
+    tables = wedge[0]
+    if isinstance(V_full, QirrOperator):
+        canonical = q_wedge(sym=sym, centroid_indices=centroid_indices, meta=meta,
+                            context="canonical bare V on the q wedge", canonical=True)
+        if canonical is None or not V_full.same_wedge(
+                QirrOperator(values=None, **canonical[0])):
+            raise ValueError("GATE bare_coulomb_q_identity: canonical producer tables differ")
+        return V_full.values, tables
+    rows = np.asarray(tables['full_rows'])
+
+    @jax.jit
+    def select(values):
+        return QirrOperator.of(values).at_rows(rows)
+
+    compiled = select.lower(V_full).compile()
+    need = -agreed_chunk(-compiled_new_bytes(compiled))
+    ranks = int(V_full.sharding.mesh.size)
+    source = "canonical Coulomb representative rows"
+    memory.admit(source,
+                 [(source, memory.priced(0, source, spread=need*ranks,
+                                         ranks=ranks))],
+                 agreed_chunk(int(memory.room())))
+    selected = compiled(V_full)
+    # Completion is needed for the memory handoff, independently of timing:
+    # the caller can now drop the last full-zone reference before packing.
+    jax.block_until_ready(selected)
+    return selected, tables
+
+
+def _coulomb_on_wedge(V_selected, *, q_tables, meta):
+    """Pack selected canonical rows and attach the existing q-wedge tables."""
+    from symmetry_maps import QirrOperator
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    basis = getattr(meta, 'mu_basis', None)
+    spec = V_selected.sharding.spec
+
+    @jax.jit
+    def pack(values):
+        return values if basis is None else basis.pack_operator(values, spec=spec)
+
+    compiled = pack.lower(V_selected).compile()
+    need = -agreed_chunk(-compiled_new_bytes(compiled))
+    ranks = int(V_selected.sharding.mesh.size)
+    source = "canonical Coulomb centroid packing"
+    memory.admit(source,
+                 [(source, memory.priced(0, source, spread=need*ranks,
+                                         ranks=ranks))],
+                 agreed_chunk(int(memory.room())))
+    packed = compiled(V_selected)
+    timing.stage_wait(packed)
+    return (QirrOperator.of(packed) if q_tables is None
+            else QirrOperator(values=packed, **q_tables))
 
 
 def _finalize_vq_views(
         G0_all, V_q_raw, head_channel, meta, photon_g0_vectors, print_fn):
-    """Produce the packed Coulomb operator and validate its physical invariants."""
+    """Validate every canonical q row before restart I/O and wedge packing."""
     from common.collectives import gather_to_host as _gather_to_host
     G0_gathered = _gather_to_host(G0_all)
-    V_qmunu = (meta.mu_basis.pack_operator(V_q_raw)
-               if getattr(meta, 'mu_basis', None) is not None else V_q_raw)
     G0 = G0_gathered
     while G0.ndim > 1:
         G0 = G0[0]
     log.debug(f"\n  V_q computed:")
-    log.debug(f"    Shape: {V_qmunu.shape}")
-    _vq0_trace = float(ordered_sum(jnp.diagonal(V_q_raw[0])).real)
+    from symmetry_maps import QirrOperator
+    log.debug(f"    Shape: {getattr(V_q_raw, 'shape', None)}")
+    if isinstance(V_q_raw, QirrOperator):
+        stats, pair, gamma = _canonical_coulomb_stats(V_q_raw, tuple(meta.kgrid))
+    else:
+        stats, pair, gamma = None, None, V_q_raw[0]
+    _vq0_trace = float(ordered_sum(jnp.diagonal(gamma)).real)
     log.debug(f"    V_q=0 trace: {_vq0_trace:.4f}")
     from common import sanity
-    sanity.check_finite("V_q", V_qmunu, print_fn=print_fn)
+    if stats is None:
+        sanity.check_finite("V_q", V_q_raw, print_fn=print_fn)
+    else:
+        sanity.report_finite_stats("V_q", stats, print_fn=print_fn)
     sanity.check_positive("V_q[q=0] trace", _vq0_trace, print_fn=print_fn)
-    sanity.check_hermitian("V_q[q=0]", V_q_raw[0], print_fn=print_fn)
-    sanity.check_q_conjugate_reciprocity(
-        "V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
-        print_fn=print_fn)
+    sanity.check_hermitian("V_q[q=0]", gamma, print_fn=print_fn)
+    if pair is None:
+        sanity.check_q_conjugate_reciprocity(
+            "V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
+            print_fn=print_fn)
+    else:
+        sanity.report_q_conjugate_residual("V_q[all q]", *pair, rtol=1e-5,
+                                          print_fn=print_fn)
     sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
-    return V_qmunu, G0, head_channel, photon_g0_vectors
+    return V_q_raw, G0, head_channel, photon_g0_vectors
+
+
+@lru_cache(maxsize=8)
+def _canonical_coulomb_stats_program(key, mesh, width, dtype, finite_check, pair_check,
+                                    gamma_only=False):
+    """One fixed-width exact all-q statistics program; cached metadata only."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common import sanity
+    template = key.rebuild(None)
+    spec = NamedSharding(mesh, P(None, 'x', 'y'))
+    shape = (width, template.sym_perm.shape[-1], template.sym_perm.shape[-1])
+    finite = sanity.finite_stats_program(shape, dtype, spec) if finite_check else None
+
+    @jax.jit
+    def stats(values, rows, negative, valid):
+        op = template.with_values(values)
+        forward = op.unfold(mesh, rows=rows)
+        mask = valid[:, None, None]
+        finite_stats = (finite(jnp.where(mask, forward, 0)) if finite is not None
+                        else jnp.zeros(3, jnp.float64))
+        if pair_check:
+            reverse = op.unfold(mesh, rows=negative)
+            pair = jnp.stack((
+                jnp.max(jnp.where(mask, jnp.abs(forward-jnp.conj(reverse)), 0)),
+                jnp.max(jnp.where(mask, jnp.abs(forward), 0))))
+        else:
+            pair = jnp.zeros(2, jnp.float64)
+        return jnp.concatenate((finite_stats, pair)), forward[0] if gamma_only else None
+    return stats
+
+
+def _canonical_coulomb_stats(operator, kgrid, *, reciprocity=True):
+    """Exact full-zone finite/reciprocity totals without a full-zone resident.
+
+    The canonical parents remain ``V_qirr(mu_X,nu_Y)``. At most one bounded
+    q/−q panel pair is transported by the shared symmetry owner. Gamma is
+    admitted once first, so the later stats-only price sees it already live.
+    """
+    from symmetry_maps import QirrTables, QirrOperator, q_negation_index
+    from common.collectives import device_put_process_local
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    from common import sanity
+    values = operator.values
+    mesh = values.sharding.mesh
+    if (operator.n_full != int(np.prod(kgrid)) or values.ndim != 3
+            or values.shape[-2] != values.shape[-1]):
+        raise ValueError("GATE bare_coulomb_q_identity: wrong full q or matrix extent")
+    authenticated = QirrOperator.from_tables(values, QirrTables(
+        operator.irr_idx, operator.sym_idx, operator.q_irr_frac,
+        operator.sym_perm, operator.L_table, operator.n_sym_spatial))
+    if not operator.same_wedge(authenticated):
+        raise ValueError("GATE bare_coulomb_q_identity: invalid representative rows")
+    replicated = NamedSharding(mesh, P())
+    programs = {}
+    widths = []
+    checks = sanity.sanity_enabled()
+    n_queries = operator.n_full if checks else 1  # only the always-live q0 trace
+    width = min(64, n_queries)
+    while width not in widths:
+        widths.append(width)
+        width = max(1, width//2)
+    negative = np.asarray(q_negation_index(kgrid), np.int32)
+
+    def operands(start, count):
+        query = np.minimum(start + np.arange(count), operator.n_full-1).astype(np.int32)
+        return tuple(device_put_process_local(a, replicated) for a in
+                     (query, negative[query], start + np.arange(count) < operator.n_full))
+
+    gamma_program = _canonical_coulomb_stats_program(
+        operator.wedge_key(), mesh, 1, str(values.dtype), False, False, True)
+    gamma_args = operands(0, 1)
+    gamma_compiled = gamma_program.lower(values, *gamma_args).compile()
+    gamma_need = -agreed_chunk(-compiled_new_bytes(gamma_compiled))
+    memory.admit("canonical Coulomb Gamma view", [("Gamma", memory.priced(
+        0, "compiled canonical Gamma view", spread=gamma_need*int(mesh.size),
+        ranks=int(mesh.size)))], agreed_chunk(int(memory.room())))
+    _, gamma = gamma_compiled(values, *gamma_args)
+    jax.block_until_ready(gamma)
+    size = operator.n_full * int(values.shape[-2]) * int(values.shape[-1])
+    if not checks:
+        return (0, 0, 0., size), (0., 0.), gamma
+
+    def price(count):
+        program = _canonical_coulomb_stats_program(
+            operator.wedge_key(), mesh, count, str(values.dtype), checks,
+            checks and reciprocity)
+        compiled = program.lower(values, *operands(0, count)).compile()
+        programs[count] = compiled
+        need = -agreed_chunk(-compiled_new_bytes(compiled))
+        return memory.priced(0, "canonical Coulomb all-q validation",
+                             spread=need*int(mesh.size), ranks=int(mesh.size))
+
+    chosen = memory.admit("canonical Coulomb all-q validation",
+        [(count, lambda count=count: price(count)) for count in widths],
+        agreed_chunk(int(memory.room())))
+    totals = np.zeros(5, np.float64)
+    for start in range(0, n_queries, chosen):
+        result, _ = programs[chosen](values, *operands(start, chosen))
+        numbers = np.asarray(jax.device_get(result))
+        totals[:2] += numbers[:2]
+        totals[2:] = np.maximum(totals[2:], numbers[2:])
+    return (int(totals[0]), int(totals[1]), float(totals[2]), size), tuple(totals[3:]), gamma
 
 
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
@@ -2655,6 +2834,7 @@ def _prepare_fresh_parent_faces(
     			band_range=band_slices.full_range,
     			band_chunk=int(_mb_plan.band_chunk),
     			centroid_indices=centroid_indices, placement="device",
+                        store_band_range=zeta_contract.fit_band_range,
     			bispinor=bool(int(meta.nspinor) == 4),
     			bispinor_lift=(representation.charge_lift or "raw"),
     			k_domain=sym.parent_k_domain, print_fn=print0)
@@ -2800,8 +2980,22 @@ def _prepare_fresh_coulomb(
     		(meta.mu_basis if channel == 0 else basis_T).pack_axis(vector, -1)
     		for channel, vector in enumerate(photon_g0_vectors))
     if debug_print_enabled():
-    	jax.block_until_ready(V_qmunu)
+        jax.block_until_ready(getattr(V_qmunu, 'values', V_qmunu))
     return (V_qmunu, G0, head_channel, photon_g0_vectors)
+
+
+def _full_coulomb_for_restart(operator, mesh):
+    """The existing full-storage fallback, admitted before materialization."""
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    program, operands = operator.unfold(mesh, prepare=True)
+    compiled = program.lower(*operands).compile()
+    need = -agreed_chunk(-compiled_new_bytes(compiled))
+    memory.admit("full canonical Coulomb restart", [("full", memory.priced(
+        0, "compiled full canonical Coulomb restart", spread=need*int(mesh.size),
+        ranks=int(mesh.size)))], agreed_chunk(int(memory.room())))
+    return compiled(*operands)
+
 
 def _write_fresh_restart(
         G0, V_qmunu, _candidate_plan, _to_file_order, band_slices,
@@ -2812,79 +3006,85 @@ def _write_fresh_restart(
         write_restart_state_to_h5):
     """Write the existing authenticated Coulomb and parent-face restart bundle."""
     enk_full, _ = get_enk_bandrange(
-    	wfn, sym, band_slices.full_range,
-    	(band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
+        wfn, sym, band_slices.full_range,
+        (band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
     _write_restart = restart_tensor_writes_enabled(
-    	cfg, tensors_filename)
+        cfg, tensors_filename)
     _qirr = resolve_restart_q_storage_for_run(
-    	cfg, sym=sym, centroid_indices=centroid_indices,
-    	fft_grid=meta.fft_grid, print_fn=print0)
+        cfg, sym=sym, centroid_indices=centroid_indices,
+        fft_grid=meta.fft_grid, print_fn=print0)
     if _write_restart:
-    	from file_io import coulomb_policy_from_config
-    	from file_io.qp_wfn import (
-    		qp_state_source_provenance_from_binding)
-    	from file_io.restart_bundle import read_bispinor_v_receipt
-    	write_restart_state_to_h5(
-    		tensors_filename,
-    		n_rmu_logical=int(meta.n_rmu),
-    		coulomb_policy=coulomb_policy_from_config(cfg, meta),
-    		V_qmunu=_to_file_order(V_qmunu, (-2, -1)),
-    		G0_mu_nu=G0, enk_full=enk_full,
-    		init_W0=True, mesh=mesh_xy,
-    		mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
-    		qp_state_source_record=(
-    			qp_state_source_provenance_from_binding(
-    			wfn,
-    			wfn_fingerprint_binding=(
-    				basis_wfn_fingerprint_binding))),
-    		charge_zeta_identity=charge_zeta_identity_receipt,
-    		bispinor_v_receipt=(None if wfns_transverse is None else
-    			read_bispinor_v_receipt(os.path.join(
-    				os.path.dirname(tensors_filename), "v_q_bispinor.h5"))),
-    		band_slices=band_slices,
-    		zeta_fit_windows=zeta_fit_band_ranges(
-    			band_slices,
-    			resolve_zeta_fit_edge(band_slices, getattr(cfg, "zeta_nband", None)),
-    			log=lambda _message: None),
-    		qirr=_qirr.with_capture(
-    			take_pre_unfold("V_qmunu")),
-    	)
+        from file_io import coulomb_policy_from_config
+        from file_io.qp_wfn import (
+                qp_state_source_provenance_from_binding)
+        from file_io.restart_bundle import read_bispinor_v_receipt
+        _qirr = _qirr.with_capture(take_pre_unfold("V_qmunu"))
+        # The wedge writer persists this authenticated canonical block.  Do not
+        # unpack the unused full-zone operator before it substitutes the capture.
+        V_for_write = (_qirr.capture.X_ibz
+                if _qirr.store_wedge and _qirr.capture is not None
+                else (_full_coulomb_for_restart(V_qmunu, mesh_xy)
+                      if hasattr(V_qmunu, 'values') else V_qmunu))
+        write_restart_state_to_h5(
+                tensors_filename,
+                n_rmu_logical=int(meta.n_rmu),
+                coulomb_policy=coulomb_policy_from_config(cfg, meta),
+                V_qmunu=V_for_write,
+                G0_mu_nu=G0, enk_full=enk_full,
+                init_W0=True, mesh=mesh_xy,
+                mode="w", kgrid=tuple(int(v) for v in meta.kgrid),
+                qp_state_source_record=(
+                        qp_state_source_provenance_from_binding(
+                        wfn,
+                        wfn_fingerprint_binding=(
+                                basis_wfn_fingerprint_binding))),
+                charge_zeta_identity=charge_zeta_identity_receipt,
+                bispinor_v_receipt=(None if wfns_transverse is None else
+                        read_bispinor_v_receipt(os.path.join(
+                                os.path.dirname(tensors_filename), "v_q_bispinor.h5"))),
+                band_slices=band_slices,
+                zeta_fit_windows=zeta_fit_band_ranges(
+                        band_slices,
+                        resolve_zeta_fit_edge(band_slices, getattr(cfg, "zeta_nband", None)),
+                        log=lambda _message: None),
+                qirr=_qirr,
+        )
     if _write_restart:
-    	parent_T = None if wfns_transverse is None else wfns_transverse.green_parent
-    	basis_T = None if transverse_wfn_data is None else transverse_wfn_data['meta'].mu_basis
-    	write_restart_state_to_h5(
-    		tensors_filename,
-    		n_rmu_logical=int(meta.n_rmu),
-    		psi_parent_y=_to_file_order(sigma_parent_carrier.psi_nmu, (3,)),
-    		psi_parent_y_mun=_to_file_order(sigma_parent_carrier.psi_mun, (2,)),
-    		parent_k_rows=_candidate_plan.parent_full_rows,
-    		psi_layout=sigma_parent_carrier.layout,
-    		mesh=mesh_xy, mode="a",
-    		psi_parent_y_transverse=(
-    			_to_file_order(parent_T.psi_nmu, (3,), basis_T) if parent_T is not None else None),
-    		psi_parent_y_transverse_mun=(
-    			_to_file_order(parent_T.psi_mun, (2,), basis_T) if parent_T is not None else None),
-    		n_rmu_transverse_logical=(
-    			int(transverse_wfn_data['meta'].n_rmu)
-    			if transverse_wfn_data is not None else None),
-    	)
-    	if jax.process_index() == 0:
-    		try:
-    			with h5py.File(tensors_filename, 'a') as _f:
-    				_f.attrs['centroids_charge_md5'] = (
-    					_centroid_table_md5(centroid_indices))
-    				_f.attrs['charge_representation'] = (
-    					resolve_four_current_representation(
-    						cfg.bispinor, cfg.bispinor_gw).charge_representation)
-    				if transverse_wfn_data is not None:
-    					_f.attrs['centroids_transverse_md5'] = (
-    						_centroid_table_md5(
-    							transverse_wfn_data['centroid_indices']))
-    		except Exception as exc:
-    			log.info(f"    [restart stamp] centroid content hashes "
-    			       f"not stamped ({exc}); a restart will warn "
-    			       f"instead of verifying the centroid tables.")
-    	barrier("restart_centroid_stamp")
+        parent_T = None if wfns_transverse is None else wfns_transverse.green_parent
+        basis_T = None if transverse_wfn_data is None else transverse_wfn_data['meta'].mu_basis
+        write_restart_state_to_h5(
+                tensors_filename,
+                n_rmu_logical=int(meta.n_rmu),
+                psi_parent_y=_to_file_order(sigma_parent_carrier.psi_nmu, (3,)),
+                psi_parent_y_mun=_to_file_order(sigma_parent_carrier.psi_mun, (2,)),
+                parent_k_rows=_candidate_plan.parent_full_rows,
+                psi_layout=sigma_parent_carrier.layout,
+                mesh=mesh_xy, mode="a",
+                psi_parent_y_transverse=(
+                        _to_file_order(parent_T.psi_nmu, (3,), basis_T) if parent_T is not None else None),
+                psi_parent_y_transverse_mun=(
+                        _to_file_order(parent_T.psi_mun, (2,), basis_T) if parent_T is not None else None),
+                n_rmu_transverse_logical=(
+                        int(transverse_wfn_data['meta'].n_rmu)
+                        if transverse_wfn_data is not None else None),
+        )
+        if jax.process_index() == 0:
+                try:
+                        with h5py.File(tensors_filename, 'a') as _f:
+                                _f.attrs['centroids_charge_md5'] = (
+                                        _centroid_table_md5(centroid_indices))
+                                _f.attrs['charge_representation'] = (
+                                        resolve_four_current_representation(
+                                                cfg.bispinor, cfg.bispinor_gw).charge_representation)
+                                if transverse_wfn_data is not None:
+                                        _f.attrs['centroids_transverse_md5'] = (
+                                                _centroid_table_md5(
+                                                        transverse_wfn_data['centroid_indices']))
+                except Exception as exc:
+                        log.info(f"    [restart stamp] centroid content hashes "
+                               f"not stamped ({exc}); a restart will warn "
+                               f"instead of verifying the centroid tables.")
+        barrier("restart_centroid_stamp")
 
 def _prepare_fresh_isdf(
         WavefunctionBasisReceipt, _basis_band_interval, _to_file_order, band_slices,
@@ -2945,17 +3145,24 @@ def _read_authenticated_restart(
     """Produce the validated stored tensors and their charge zeta identity."""
     rs = load_restart_state_from_h5(
     	tensors_filename, mesh_xy, band_slices=band_slices,
-    	n_rmu_logical=int(meta.n_rmu))
+        n_rmu_logical=int(meta.n_rmu), retain_v_wedge=True)
     charge_zeta_identity_receipt = rs.charge_zeta_identity
-    V_qmunu = _to_run_order(rs.V_qmunu, (-2, -1))
+    V_qmunu = rs.V_qmunu
     log.info("  Loaded restart tensors from H5.")
     from file_io import describe_coulomb_policy_match
     log.debug(describe_coulomb_policy_match(tensors_filename, cfg, meta))
     from common import sanity
-    sanity.check_finite("restart V_q", V_qmunu, print_fn=print0)
+    from symmetry_maps import QirrOperator
+    if isinstance(V_qmunu, QirrOperator):
+        stats, _, gamma = _canonical_coulomb_stats(V_qmunu, tuple(meta.kgrid),
+                                                 reciprocity=False)
+        sanity.report_finite_stats("restart V_q", stats, print_fn=print0)
+    else:
+        gamma = V_qmunu[0]
+        sanity.check_finite("restart V_q", V_qmunu, print_fn=print0)
     sanity.check_positive(
     	"restart V_q[q=0] trace",
-    	float(jnp.trace(V_qmunu[0]).real), print_fn=print0)
+        float(jnp.trace(gamma).real), print_fn=print0)
     sanity.check_finite("restart ψ (psi_parent_y)",
                         rs.psi_nmu_parent, print_fn=print0)
     sanity.check_finite("restart ψ (psi_parent_y_mun)",
@@ -3297,12 +3504,16 @@ def prepare_isdf_and_wavefunctions(
 	def _to_run_order(array, mu_axes, basis=_mu_basis):
 		if array is None or basis is None:
 			return array
+		if tuple(int(axis) % array.ndim for axis in mu_axes) == (array.ndim - 2, array.ndim - 1):
+			return basis.pack_operator(array)
 		for axis in mu_axes:
 			array = basis.pack_axis(array, axis)
 		return array
 	def _to_file_order(array, mu_axes, basis=_mu_basis):
 		if array is None or basis is None:
 			return array
+		if tuple(int(axis) % array.ndim for axis in mu_axes) == (array.ndim - 2, array.ndim - 1):
+			return basis.unpack_operator(array)
 		for axis in mu_axes:
 			array = basis.unpack_axis(array, axis)
 		return array
@@ -3318,11 +3529,13 @@ def prepare_isdf_and_wavefunctions(
 	        WavefunctionBasisReceipt, _basis_band_interval, _to_run_order, band_slices, basis_T,
 	        centroid_indices, cfg, charge_basis_receipt, mesh_xy, meta, photon_g0_vectors, print0,
 	        sym, tensors_filename, tmp_dir, transverse_basis_receipt, wfn)
-	# From here on the bare Coulomb is held on the run's q wedge, the one
+	# Both fresh and restart inputs remain canonical through validation/I/O.
+	# From here on the bare Coulomb is packed on the run's q wedge, the one
 	# screening solves W on: its representative rows, where the unfold is
 	# the identity, so the full zone is not kept past this line.
-	V_qmunu = _coulomb_on_wedge(V_qmunu, sym=sym, centroid_indices=centroid_indices,
-	                            meta=meta)
+	V_qmunu, _coulomb_q_tables = _select_coulomb_q_rows(
+	    V_qmunu, sym=sym, centroid_indices=centroid_indices, meta=meta)
+	V_qmunu = _coulomb_on_wedge(V_qmunu, q_tables=_coulomb_q_tables, meta=meta)
 	if green_parent_carrier is not None:
 		wfns = replace(wfns, green_parent=green_parent_carrier)
 	for family, bundle in (("charge", wfns), ("current", wfns_transverse)):

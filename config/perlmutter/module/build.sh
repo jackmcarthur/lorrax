@@ -13,8 +13,8 @@
 #
 # The legs are built by the clone route's scripts (../build_ffi_host.sh,
 # ../build_ffi_cuda.sh) in a fresh clone of the revision whose .venv is the
-# module venv, so they compile against the jaxlib they will run with.  SLATE
-# and the cuSOLVERMp/cuBLASMp stage live in $PREFIX/native, built once.
+# module venv, so they compile against the jaxlib they will run with.  The
+# cuSOLVERMp/cuBLASMp stage lives in $PREFIX/native, built once.
 # ============================================================================
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,18 +39,14 @@ mkdir -p "$CAND"
 git clone --quiet --no-checkout --shared "$SRC" "$CAND/src"
 git -C "$CAND/src" checkout --quiet --detach "$REV"
 ln -s "$VENV" "$CAND/src/.venv"
-# The shared SLATE install and cuSOLVERMp stage live in $PREFIX/native, not
-# $PREFIX/build: SLATE's install RUNPATH names its directory, and seal_bundle.py
-# refuses any search path through a directory called build (a build tree).
+# The shared cuSOLVERMp stage lives in $PREFIX/native, not $PREFIX/build:
+# seal_bundle.py refuses any search path through a directory called build.
 export LORRAX_BUILD_PREFIX="$PREFIX/native"
 # The module venv does not install lorrax; the legs' dynamic gates (GATE 8)
 # import it from the clone being built.
 export PYTHONPATH="$CAND/src/src"
-SLATE_LIB="$LORRAX_BUILD_PREFIX/slate/cpu/install/lib64"
 STAGE_LIB="$LORRAX_BUILD_PREFIX/cusolvermp-$CUSOLVERMP_VERSION/lib"
 
-[[ -e "$SLATE_LIB/libslate.so.2" ]] \
-    || bash "$CAND/src/src/ffi/cpp/stage/slate_build_perlmutter.sh" cpu
 bash "$CAND/src/config/perlmutter/build_ffi_host.sh" --fresh
 bash "$CAND/src/config/perlmutter/build_ffi_cuda.sh" --fresh
 
@@ -60,9 +56,6 @@ bash "$CAND/src/config/perlmutter/build_ffi_cuda.sh" --fresh
     --host "$CAND/src/src/ffi/cpp/build_host/liblorrax_ffi_host.so" \
     --private-lib "$STAGE_LIB/libcublasmp.so.0" \
     --private-lib "$STAGE_LIB/libcusolverMp.so.0" \
-    --private-lib "$SLATE_LIB/libblaspp.so.2" \
-    --private-lib "$SLATE_LIB/liblapackpp.so.2" \
-    --private-lib "$SLATE_LIB/libslate.so.2" \
     --output "$CAND/bundle"
 
 mkdir -p "$CAND/source"

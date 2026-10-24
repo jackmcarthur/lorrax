@@ -396,7 +396,7 @@ def room_class(cache, key, room, build):
 
 def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all") -> StackRoute:
     """THE placement of an eigh stack (nb, n, n) in ``room`` bytes per rank: the faster of the
-    routes whose price fits, priced from the shapes only (no vendor query) and timed by
+    routes whose price fits, priced from their compiled code and native workspace query and timed by
     :func:`_eigh_seconds`, so every rank decides alike with no exchange.
 
     Route (c) at the most whole matrices per rank whose compiled program (:func:`_stack_bytes`)
@@ -415,7 +415,9 @@ def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all") -> St
         while per_rank >= 1:
             rounds = -(-(-(-nb // ranks)) // per_rank)
             tried = -(-(-(-nb // rounds)) // ranks)
-            price = _stack_bytes(op, mesh, nb, n, dtype, rounds, phase, gathered)
+            from distrib_la.workspace import local_eigh_workspace
+            price = (_stack_bytes(op, mesh, nb, n, dtype, rounds, phase, gathered)
+                     + local_eigh_workspace(mesh, tried, n, dtype))
             if room_test(lambda r, p=price: p <= r, room):
                 one, on_mesh = (_eigh_seconds(k, n, ranks, platform) for k in ("one", "mesh"))
                 if one is None or -(-nb // ranks) * one <= nb * on_mesh:
@@ -431,7 +433,9 @@ def _gathered_admitted(mesh, shape, dtype, room=None) -> bool:
     GATHERED_EIGH_BYTES, or within the plan's room (its ``budget_bytes``).  The chain that holds
     it is priced compiled in the same room.  cuSOLVERMp 0.9.1 left n 30000 (run30k) with no
     correct attempt short of this one."""
-    need = compiled_bytes(_gathered_program(mesh), mesh, tuple(int(v) for v in shape), dtype)
+    from distrib_la.workspace import local_eigh_workspace
+    need = (compiled_bytes(_gathered_program(mesh), mesh, tuple(int(v) for v in shape), dtype)
+            + local_eigh_workspace(mesh, 1, int(shape[-1]), dtype))
     return need <= GATHERED_EIGH_BYTES or room_test(lambda r: r is not None and need <= r, room)
 
 
@@ -535,7 +539,7 @@ def _eigh_columns(backend: str, lam, Q):
 
     ``A @ Q == Q @ diag(lam)``.  cuSOLVERMp's wrapper returns the raw
     device buffer, whose documented layout is the conjugate transpose of
-    that; SLATE and ScaLAPACK already return columns.  This is the ONE
+    that; ELPA and ScaLAPACK already return columns.  This is the ONE
     place the difference is known — it used to live inside ``dispatch_eigh``
     only, so anything reaching a backend module directly had to remember it
     independently, and the serial dispatch path silently returned ROWS on
@@ -582,30 +586,15 @@ def _gathered_eigh(A, *, mesh):
 #:   one         attribute implementing the SINGLE-tile form, or None
 #:   many        attribute implementing the STACKED form, or None
 #:   post        result normaliser, applied to both forms
-#:   one_handle  ``one`` returns a library HANDLE rather than arrays
-#:               (absent means it returns arrays)
 #:
 #: A missing ``many`` is filled in by scanning ``one`` — that is what
 #: :meth:`Plan.batched` IS.  A missing ``one`` means the library only ever
 #: factors a whole stack (one descriptor, one workspace), so there is no
 #: single-tile call to scan and the stacked entry is the only route.
 #:
-#: ``cholesky`` is asymmetric on purpose: cuSOLVERMp's batched potrf returns
-#: a HANDLE object carrying the block-cyclic geometry, while SLATE's
-#: per-tile potrf returns a ``SlateLowerL`` handle of its own.  The plan
-#: does not flatten that difference away — :func:`distrib_la.factor` is
-#: where it is handled — it just stops every caller from re-deriving which
-#: is which.
-#:
-#: ``one_handle`` is DECLARED and not discovered, and the difference is the
-#: point.  The old loop-and-stack path found out by calling ``one`` once and
-#: looking at what came back; a scan cannot, because a handle is not a
-#: pytree and the failure would arrive from inside ``lax.scan`` as a type
-#: error naming neither the op nor the backend.  Declaring it lets
-#: :meth:`Plan.batched` refuse BEFORE it runs anything, with the sentence
-#: that says what to call instead.  ``tests/test_distrib_la_shape_algebra``
-#: cross-checks the flag against each wrapper's own return annotation, so
-#: the declaration cannot quietly disagree with the code.
+#: ``cholesky``'s one library entry (cuSOLVERMp's batched potrf) returns a HANDLE
+#: object carrying the block-cyclic geometry; :func:`distrib_la.factor` is where
+#: it is handled.
 #: The agreed size-route costs of a ``distributed`` plan resolved to ``one_device``, one per
 #: room-free call signature (:func:`_measured_rounds`' on-disk key; None where no library
 #: resolves).  The room is applied per call: a new room is arithmetic, with no exchange, no
@@ -654,6 +643,18 @@ def _round_candidates(nb: int, ranks: int) -> list:
     if last > 1:
         out.append(last)
     return out
+
+
+def eigh_rounds(nb: int, ranks: int, start: int = 1) -> tuple:
+    """Route-(c) ``(rounds, local_share)`` candidates, doubling while the share shrinks."""
+    nb, ranks, start = int(nb), int(ranks), int(start)
+    if min(nb, ranks, start) < 1:
+        raise ValueError('eigh rounds need positive batch, ranks and start')
+    share = lambda r: -(-(-(-nb // r)) // ranks)
+    tries = [start]
+    while tries[-1] < nb and share(min(nb, 2 * tries[-1])) < share(tries[-1]):
+        tries.append(min(nb, 2 * tries[-1]))
+    return tuple((r, share(r)) for r in tries)
 
 
 @lru_cache(maxsize=1)
@@ -984,8 +985,6 @@ def _measured_rounds(p, A, args, single: bool = False):
 _IMPL: dict[tuple[str, str], dict[str, Any]] = {
     ("eigh", "cusolvermp"):     dict(one="distributed_eigh",
                                      many=None, post=_eigh_columns),
-    ("eigh", "slate"):          dict(one="distributed_eigh",
-                                     many=None, post=_eigh_columns),
     ("eigh", "elpa"):           dict(one="distributed_eigh",
                                      many=None, post=_eigh_columns),
     ("eigh", "scalapack"):      dict(one="distributed_eigh",
@@ -994,16 +993,10 @@ _IMPL: dict[tuple[str, str], dict[str, Any]] = {
     ("cholesky", "cusolvermp"): dict(one=None,
                                      many="batched_distributed_cholesky",
                                      post=None),
-    ("cholesky", "slate"):      dict(one="distributed_cholesky",
-                                     many=None, post=None,
-                                     one_handle=True),
     ("solve_lu", "cusolvermp"): dict(one=None,
                                      many="batched_distributed_solve_lu",
                                      post=None),
     ("solve_lu", "scalapack"):  dict(one=None,
-                                     many="batched_distributed_solve_lu",
-                                     post=None),
-    ("solve_lu", "slate"):      dict(one=None,
                                      many="batched_distributed_solve_lu",
                                      post=None),
     # one_device (the size route of ``distributed``): pure JAX with the FFI
@@ -1720,6 +1713,8 @@ class Plan:
             from distrib_la._batch_reshard import batch_layout_eigh_call
             return batch_layout_eigh_call("eigh", self.mesh, A)
         traced = isinstance(A, jax.core.Tracer)
+        if self.op == "eigh" and _route is None and in_checked_retry():
+            _rounds = None       # an outer first-route choice never changes its checked backup
         route = self.route_for(A.shape, A.dtype, traced) if _route is None else _route
         if route not in BATCHED_ROUTES:
             raise ValueError(
@@ -1733,7 +1728,7 @@ class Plan:
             if self.op == "eigh":
                 cut = kwargs.pop("cut", None)
                 self._reshard_options(kwargs)
-                rounds = (1 if _route is not None else
+                rounds = (int(_rounds) if _rounds is not None else 1 if _route is not None else
                           self.stack_route(A.shape, A.dtype, traced=traced).rounds)
                 return self._checked_reshard("eigh", A, rounds, cut)
             return self._batch_reshard((A, *args), kwargs)
@@ -1839,14 +1834,13 @@ class Plan:
             return rounds, run(rounds)
         from distrib_la.workspace import local_eigh_workspace
         nb, n, ranks = int(A.shape[0]), int(A.shape[-1]), int(self.mesh.size)
-        share = lambda r: -(-(-(-nb // r)) // ranks)
-        tries = [int(rounds)]
-        while tries[-1] < nb and share(min(nb, 2 * tries[-1])) < share(tries[-1]):
-            tries.append(min(nb, 2 * tries[-1]))
+        candidates = eigh_rounds(nb, ranks, rounds)
+        tries = [r for r, share in candidates]
+        shares = dict(candidates)
 
         def price(r):
             return memory.priced((_analysis_bytes(run(r)) or 0) + local_eigh_workspace(
-                self.mesh, share(r), n, A.dtype), f"distrib_la route (c) {phase} program, {r} round(s) (compiled)")
+                self.mesh, shares[r], n, A.dtype), f"distrib_la route (c) {phase} program, {r} round(s) (compiled)")
         chosen = memory.admit(f"distrib_la route (c) stack {nb} x {n}^2",
                               tuple((f"{r} round(s)", lambda r=r: price(r)) for r in tries),
                               memory.room(bucketed=False), device=False)
@@ -1896,7 +1890,6 @@ class Plan:
         decoration: see :data:`_SCAN_CACHE` for the measurement that says
         an uncached eager scan is slower than the Python loop it replaces.
         """
-        spec = _IMPL[(self.op, self.backend)]
         one, post = self._entry("one")
         if one is None:
             raise NotImplementedError(
@@ -1904,13 +1897,6 @@ class Plan:
                 f"FFI entry point nor a single-tile one to scan, which "
                 f"should be unreachable: every row of the impl table has at "
                 f"least one of them.")
-        if spec.get("one_handle"):
-            raise NotImplementedError(
-                f"{self.op} backend {self.backend!r} has no batched entry "
-                f"point and its single-tile entry returns a library HANDLE "
-                f"rather than an array, so there is no stack for a scan to "
-                f"build.  Use distrib_la.factor()/solve(), which carries "
-                f"the handle in an opaque token instead of flattening it.")
 
         mesh, backend, tile = self.mesh, self.backend, self.in_sharding
 
@@ -2049,7 +2035,7 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
             and _size_routed_library(op, backend, mesh_xy, n, resolved)):
         # Route (c) solves each matrix WHOLE on one device: exactly what the size
         # route just ruled out for this n.  Left as the default it ran a 20480
-        # complex LU on one GCD of a plan that reports slate (MI250X P4,
+        # complex LU on one GCD of a plan that reports the leg library (MI250X P4,
         # dlascale probe1); the leg library's own route runs instead.  An
         # explicit batched_route is honoured as named.
         batched_route = "auto"

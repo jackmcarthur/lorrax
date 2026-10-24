@@ -108,6 +108,13 @@
 //                An ABI-9 library would see one Ret more than it binds; refused
 //                by name at load instead.
 //
+//   ABI 10 -> 11 (2026-10-23, SLATE removed).  The ScaLAPACK and ELPA handlers'
+//                `ctx_key` now names a "mesh" context (cpp/mesh/; config
+//                "lorrax-ctx/v1|mesh|..."), created by lrx_mesh_context_create;
+//                the lorrax_slate_* handlers and lrx_slate_* entry points are
+//                gone.  An ABI-10 library would refuse every new ctx_key as "not
+//                a slate context"; refused by name at load instead.
+//
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
@@ -132,4 +139,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 10
+#define LORRAX_FFI_ABI_VERSION 11

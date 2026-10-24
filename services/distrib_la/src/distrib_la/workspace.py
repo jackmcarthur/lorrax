@@ -89,13 +89,13 @@ def _off_cuda(plan, op, shapes, dtype):
 @lru_cache(maxsize=None)
 def local_eigh_workspace(mesh, share, n, dtype) -> int:
     """The device bytes a rank's local eigh of ``share`` (n, n) matrices allocates outside its
-    program's buffers: on CUDA the native cusolverDn size query (jaxlib's syevd FFI has no
-    workspace output; one matrix's, the handler solves them one at a time), on ROCm the
+    program's buffers: on CUDA the local share times the native cusolverDn
+    size query (jaxlib's batched syevd FFI has no workspace output), on ROCm the
     batched rocSOLVER workspace, or outside its window one matrix's at the same measured rate,
     none on CPU."""
     platform = mesh_platform(mesh)
     if platform == 'CUDA':
-        return _vendor_query(0, 'eigh', (int(n),), np.dtype(dtype).str)[0]
+        return int(share) * _vendor_query(0, 'eigh', (int(n),), np.dtype(dtype).str)[0]
     from distrib_la.local_eigh import BATCHED_EIGH_ROUTE, batched_workspace_bytes
     got = batched_workspace_bytes((int(share), int(n), int(n)), dtype, platform)
     row = BATCHED_EIGH_ROUTE.get(platform)
@@ -245,7 +245,7 @@ def matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend='auto',
         local=route == ROUTE_BATCH_RESHARD, backend=provider)['device_bytes'])
 
 
-def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
+def workspace_bytes_per_rank(plan, op, shapes, dtype, *, checked=False) -> int:
     """Return a dense-plan device workspace bound without solving (0 off CUDA).
 
     Parameters
@@ -262,6 +262,9 @@ def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
         batched shapes for GEMM. No operand arrays are accepted or retained.
     dtype : numpy dtype
         float64 or complex128.
+    checked : bool
+        Include the native scratch of an admitted gathered EIGH retry in
+        the bound, for a caller pricing a complete checked program.
 
     Returns
     -------
@@ -276,7 +279,13 @@ def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
         Context/handle setup and compiler metadata may allocate resources;
         the query allocates no matrix, result or queried workspace buffer.
     """
-    return int(_workspace_details(plan, op, shapes, dtype)['device_bytes'])
+    need = int(_workspace_details(plan, op, shapes, dtype)['device_bytes'])
+    if checked and op == 'eigh' and mesh_platform(plan.mesh) == 'CUDA' and not plan.is_native:
+        from distrib_la.plan import _gathered_admitted
+        n = int(shapes[0][-1])
+        if _gathered_admitted(plan.mesh, (n, n), dtype, plan.budget_bytes):
+            need = max(need, local_eigh_workspace(plan.mesh, 1, n, dtype))
+    return need
 
 
 def lu_workspace_bytes(mesh, n, dtype) -> int:

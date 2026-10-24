@@ -129,13 +129,18 @@ pencil's capacity, else is split in halves down to single samples, and one whose
 pencil is wider than both halves' is split without a try. The rule never
 depends on the memory budget: the evaluation runs in groups of at most the group
 size, and each group streams its rule's whole node set for its own members. The
-group size is the largest whose donated carry `[2·members, q, μ_X, ν_Y]` and
+group-size bound is the largest whose donated carry `[2·members, q, μ_X, ν_Y]` and
 compiled stream temporaries fit the map ledger and the device room (the budget
-less the bytes actually live): every sample in one group on symmetric decks.
+less the bytes actually live). After the fitted rule partitions the samples,
+every tier uses one uniform carry sized to the largest actual group. Smaller
+groups leave zero rows in that carry; the planned bound creates no unused rows.
 When the samples do not fit one group, the stream runs once with every
 sample and its carry streams to SlabIO's per-rank tier
 ([memory model](memory-model.md#streamed-chi-bank)); groups remain only
 when the disk refuses the bank and on the full-k Green route. A
+group consumes dense supports before fitted line panels. Its per-rank reader
+uses that same order, retaining each member's original value/slope row pair
+and skipping already committed members, including each sample's own q spans. A
 smaller group costs ⌈members/group⌉ passes over the same nodes and gives the same
 eqp. (Rules fitted per group gave eqp up to 14.6 meV off a 100× tighter
 reference on Na 8³ at group 1, against 0.21 meV for the all-sample rule.) The chosen group's executable is
@@ -304,6 +309,11 @@ are [tangential W for bispinor sectors](bispinor_tangential_w.md).
 ## 6 Execution
 
 **Route.** `constructor_route` admits one route before the first bank read.
+The face batch search first tests the existing resident-only selection
+quote. If that already exceeds room, it skips the native workspace query
+and its otherwise unused compiled eigh stack. Every potentially fitting
+width, and the final one-parent fallback, keeps the full original price;
+the selected batch and executable admission are unchanged.
 **Local parent rounds** — one whole parent per rank, batch layout
 `P(('x','y'), ...)` — whenever the complete selection stack and the
 conservative reduction pencil (`constructor_side_upper_bound`) fit the
@@ -451,6 +461,19 @@ factors do not fit runs at one parent and one column multiple, with one
 The photon sectors synthesize through the same owner and placement rule
 ([bispinor sectors §7](bispinor_tangential_w.md#sector-sigma)).
 
+Unchunked distributed-face factors keep the same logical
+`[q,mu,component,K]` indices and NamedSharding but are placed pole-major
+(`major_to_minor=(3,0,1,2)`) when their resident parent panels are formed.
+The scalar and photon consumers share this placement. The original read
+faces are then released, so a window does not also retain their format
+conversion. Axis, whole-parent and column-chunk placement are unchanged.
+The window executable cache includes the concrete physical input format;
+abstract placement operands retain their sharding-only signature.
+After placement completes, both consumers refresh the ledger's agreed
+current room before choosing the window's overlap. The room now includes
+the resident factors; a pre-read room must not admit another copy of that
+space through the ledger's live-row handback.
+
 **Two τ nodes per loop trip.** On GPU the scalar Σ τ window evaluates two τ
 nodes per trip of its device loop, so one node's W(τ) synthesis and
 exchanges run beside the other node's k-convolutions. Only that program is
@@ -555,7 +578,7 @@ with $c_b=\lceil b/P\rceil$ on local rounds ($b/P$ on the face route) and, by
 phase: selection $D=24n^2$, $s_f=2a$ over the $a$ dense fitted samples plus the
 moment faces and the line panels in face units,
 $N_{\rm line}(1+2S)\,n\,r_{\rm cap}/n^2$ (`selection_face_count`);
-reduction $D=14R^2+12nR$, $s_f=0$ (on the face route $16\,c_b D$ at the conservative side, an ordered round's kept span on `face_ritz_carrier`, admits a batch, priced from these terms and never compiled to be measured: `face_batch_width` starts at every parent and steps down in proportion to the room; the staged sector route bounds its stage programs by the same price, `stage_width`; a local paired, ordered round: $D=5R^2+3(2c)^2+12nR$ with $2c=2\min(R/2,K_{\rm budget})$, the kept-span carrier; compiled rounds hold 3.8-9.7 $R^2$ against 7.5-12 here); model
+reduction $D=14R^2+12nR$, $s_f=0$ (the face route quotes its parent program compiled at the conservative side and abstract operands, with an ordered round's kept span on `face_ritz_carrier`: `face_batch_width` starts at every parent and steps down in proportion to the room; the staged sector route bounds its stage programs by the same price, `stage_width`; a local paired, ordered round: $D=5R^2+3(2c)^2+12nR$ with $2c=2\min(R/2,K_{\rm budget})$, the kept-span carrier; compiled rounds hold 3.8-9.7 $R^2$ against 7.5-12 here); model
 checks $D=8n^2+4nR$, $s_f=2a$; CT cross reduction (local) $D=CT+8R^2+4nR+\max(C,T)R$,
 on the face the program price alone (no dense term beside it). A local round has $b=P$. The native cuSOLVERMp `eigh`
 adds a private $n^2/P$ operand tile beside its workspace, which
@@ -564,6 +587,13 @@ adds a private $n^2/P$ operand tile beside its workspace, which
 concurrent stages exceeds the device budget (`memory.per_device_gb`) less the
 runtime reserve, the row is recorded FAIL, one warning line is printed, and
 the stage is admitted and runs (owner 2026-10-01: no refusal on a price).
+
+Before a discarded face-batch program is compiled, its reduction row with
+zero program bytes is a lower bound of the final price. If that row already
+forces the existing proportional next width to one, the planner advances to
+one directly: adding the nonnegative compiled increment cannot change that
+step. The minimum-width program is still quoted, and its selected geometry,
+room, receipt and gates are unchanged.
 
 **Bank payload** (`tangential_bank_payload_bytes`, the residence admission):
 

@@ -155,6 +155,39 @@ $$
 
 $W^c$ and $\partial_zW^c=W\,\partial_z\chi^0\,W$ are sampled at the fixed supports of §[2.3](#scr-tf), and the exact moments fix the high-frequency tail. Each support keeps the action of $W^c$ on a few probe directions; the two-sided tangential Hermite interpolation conditions form a Loewner pencil, and its Ritz pairs give $\Omega_{j\bq}^2$ and $b_{j\bq}$. Nothing is fitted: the poles are real, the residues are positive semidefinite, and the static limit $W_\bq(0)=V_\bq-\sum_j2b_{j\bq}b^\dagger_{j\bq}/\Omega_{j\bq}$ is a model output. $W^c(t)$ is even in $t$, so one $W^c$ serves both orderings in Σ. The model is written to `tmp/mpa/<label>_tangential/model.h5`, with $b$ normalised as in [Tangential W model §2.1](../../theory/tangential-w.md#model-form), and rebuilt on every QSGW map. Supports, pencil and gates: [Tangential W model](../../theory/tangential-w.md).
 
+### <span class="n">2.6</span> W from the particle–hole resolvent {: #scr-resolvent }
+
+`bse.bse_ring_comm.build_bse_ring_matvec_full`
+{: .in-code }
+
+On the ISDF points the correlation part of $W$ is a resolvent of a particle–hole Hamiltonian $H_\bq$ between pair potentials,
+
+$$
+W^c_\bq(z)=C_\bq\,(z-H_\bq)^{-1}B_\bq,\qquad
+B_\bq=\frac{\eta FV_\bq}{\sqrt{N_k}},\qquad
+C_\bq=\frac{gV_\bq F^\dagger}{\sqrt{N_k}} \tag{2.6}
+$$
+
+Here $F_I(\mu)=\sum_s\overline{\psi_{m_I}(\br_\mu,s)}\psi_{n_I}(\br_\mu,s)$ runs over the physical R/A pairs of §2.4, $\eta_I=f_{n_I}-f_{m_I}$ and $g$ is the scalar-singlet/spinor exchange weight. $H_\bq$ is $H^\mathrm{RPA}$, the transition energies plus the Coulomb Hartree term, or $H^\mathrm{BSE}$, which adds the statically screened direct rung. This is the transfer-function form of [Tangential W model §3.1](../../theory/tangential-w.md#red-transfer), in which $W^c$ is a rational function of $z$ that is known only through the action of the resolvent on chosen vectors.
+
+$H_\bq$ is never formed. A Krylov solver needs only products $HX$ with a block of trial vectors, and each product is assembled from the ISDF quantities. The exchange term encodes $X$ into a density on the $N_\mu$ points, applies $V_\bq$ and decodes it. The ladder term builds the pair amplitude $\Phi_\bk(\br_\mu,\br_\nu)$, multiplies it by $W_\bR(\mu,\nu)$ after an FFT over the k grid, and transforms back ([BSE theory §3](../bse/theory.md#hx)). For $N_t=n_vn_cN_k$ transitions at one $\bq$, one product costs
+
+$$
+\mathcal C_{HX}\sim N_kN_\mu^2\,(n_v+n_c)+N_\mu^2\,N_k\log N_k,\qquad \mathcal M_{HX}\sim 16\,N_\mu^2N_k\ \text{bytes} \tag{2.7}
+$$
+
+for the band contractions, the k-convolution and the storage of $W_\bR$ and one $\Phi$. A two-component calculation multiplies the $\Phi$ storage by four. The applied resolvent $(z-H_\bq)^{-1}B_\bq r$ for each probe direction $r$ follows by GMRES at each $z$, with its true residual checked. The iteration count depends on the operator and frequency.
+
+Even one $N_t\times N_t$ block of the dense alternative costs $16N_t^2$ bytes and $\mathcal O(N_t^3)$ operations; a full non-TDA matrix has four such blocks. At fixed band and centroid counts the matrix-free product grows as $N_k\log N_k$ per $\bq$, while the dense matrix grows as $N_k^2$ in memory. The resolvent retains every pair in the requested screening band manifold. Its band count and pair window still require convergence checks; a matrix-free solve does not establish that convergence.
+
+| One $\bq$, $n_v=100$, $n_c=900$, $N_k=12^3$, $N_\mu=4000$ | Memory |
+|---|---|
+| One dense block, $N_t=1.56\times10^8$, complex128 | $16N_t^2\approx3.9\times10^{17}$ bytes, 0.39 EB |
+| Matrix-free: $W_\bR$ and one $\Phi$ | $2\times16N_\mu^2N_k\approx0.88$ TB |
+| Matrix-free: band values $\psi$ at the points | $16N_k(n_v+n_c)N_\mu\approx0.11$ TB |
+
+The dense kernel would also be needed at every irreducible $\bq$, with a cubic operation scale $N_t^3\approx4\times10^{24}$ even before the full non-TDA dimension is counted. These are global storage estimates; the distributed matrix-free kernels tile the large centroid intermediates over the process mesh.
+
 ## <span class="n">3</span> Self-energy {: #sigma }
 
 Σ splits into exchange, which needs only $V$, and correlation, which needs $W^c$. Every dynamic treatment hands its poles to the same correlation kernel: a product of $G$ and $W^c$ at complex time nodes, folded into $\Sigma^c(\omega)$ on the real axis.

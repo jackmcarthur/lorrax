@@ -142,16 +142,9 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "CUDA-only (ROCM: JAX psum; native_collectives refuses by GATE)."),
     "cusolvermp": Family(
         ("lorrax_cusolvermp_",), "cusolvermp",
-        _legs(("built", ""), ("elsewhere", "elpa (distrib_la.resolve eigh/ROCM row), slate"),
-              ("elsewhere", "scalapack, slate")),
+        _legs(("built", ""), ("elsewhere", "elpa (distrib_la.resolve eigh/ROCM row)"),
+              ("elsewhere", "scalapack")),
         note="NVIDIA-only library; no ROCm equivalent."),
-    "slate": Family(
-        ("lorrax_slate_",), "slate",
-        _legs(("built", ""), ("built", ""), ("built", "")),
-        note="ROCM: SLATE v2025.05.28-1 gpu_backend=hip (config/frontier/build_slate_hip.sh), "
-             "sequential LibSci; eigh/potrf gated against the native route at P=4, n=512-8192. "
-             "ROCM also builds the LU family (getrf PartialPiv + getrs: distributed solve_lu, "
-             "gated against jnp.linalg.solve at P=4); CUDA's LU is cusolvermp, the host's scalapack."),
     "elpa": Family(
         ("lorrax_elpa_",), "elpa",
         _legs(("elsewhere", "cusolvermp"), ("built", ""), ("elsewhere", "scalapack")),
@@ -165,7 +158,7 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "prefix with the LORRAX patches (ELPA's device buffers from the FFI workspace; "
              "rocBLAS/rocSOLVER status accounting and handle registry, so every ELPA rocBLAS "
              "handle runs on a workspace region and a failed call refuses) and ScaLAPACK hidden "
-             "inside libelpa.  Shares the SLATE family's mesh context.  Measured: "
+             "inside libelpa.  Runs on the MPI mesh context (cpp/mesh/).  Measured: "
              "ELPA_ROCM_REPORT.md."),
     "rocsolver": Family(
         ("lorrax_rocsolver_",), "rocsolver",
@@ -181,7 +174,7 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "tests/test_rocsolver_lu_gate.py).  rocSOLVER is the process's mapped copy."),
     "scalapack": Family(
         ("lorrax_scalapack_",), "scalapack",
-        _legs(("elsewhere", "cusolvermp"), ("elsewhere", "elpa (eigh), slate (solve_lu)"),
+        _legs(("elsewhere", "cusolvermp"), ("elsewhere", "elpa (eigh), rocsolver (one-device solve_lu)"),
               ("built", "")),
         note="Host-only."),
 })

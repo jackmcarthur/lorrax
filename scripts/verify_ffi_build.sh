@@ -58,9 +58,9 @@
 #                                  by default and a site that wants fewer says
 #                                  so.  That default is the entire lesson of
 #                                  the Aug-7 library.
-#                                    host: scalapack,gemm,slate,phdf5,fft
-#                                    cuda: cusolvermp,cufft,slate,phdf5
-#                                    rocm: phdf5,slate,kdft
+#                                    host: scalapack,gemm,phdf5,fft
+#                                    cuda: cusolvermp,cufft,phdf5
+#                                    rocm: phdf5,kdft
 #   LORRAX_FFI_EXPECT_HDF5_SOVERSION
 #                                  the HDF5 SOVERSION THE RUNTIME WILL MOUNT
 #                                  (e.g. 200).  Stated, not inferred: on
@@ -178,11 +178,11 @@ esac
 # THE DEFAULT IS THE FULL SET.  See the header: a build that silently lost a
 # backend must fail, and a site that deliberately builds fewer must say so.
 if [[ "$LEG" == host ]]; then
-    DEFAULT_BACKENDS="scalapack,gemm,slate,phdf5,fft"
+    DEFAULT_BACKENDS="scalapack,gemm,phdf5,fft"
 elif [[ "$LEG" == rocm ]]; then
-    DEFAULT_BACKENDS="phdf5,slate,kdft"
+    DEFAULT_BACKENDS="phdf5,elpa,kdft"
 else
-    DEFAULT_BACKENDS="cusolvermp,cufft,slate,phdf5"
+    DEFAULT_BACKENDS="cusolvermp,cufft,phdf5"
 fi
 BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-$DEFAULT_BACKENDS}"
 
@@ -324,7 +324,6 @@ backend_stamp_key() {
     case "$LEG:$1" in
         host:scalapack)  echo scalapack ;;
         host:gemm)       echo gemm ;;
-        host:slate)      echo slate ;;
         host:phdf5)      echo phdf5 ;;
         # The FFT handlers are compiled unconditionally and bind their engine by
         # runtime dlsym, so there is no configure-time key for them.
@@ -333,10 +332,9 @@ backend_stamp_key() {
         host:fft)        echo - ;;
         cuda:cusolvermp) echo cusolvermp ;;
         cuda:cufft)      echo cufft ;;
-        cuda:slate)      echo slate ;;
         cuda:phdf5)      echo phdf5 ;;
         rocm:phdf5)      echo phdf5 ;;
-        rocm:slate)      echo slate ;;
+        rocm:elpa)       echo - ;;
         # kdft compiles unconditionally on the ROCM leg (no configure key).
         rocm:kdft)       echo - ;;
         *) echo "?" ;;
@@ -346,15 +344,13 @@ backend_symbol_re() {
     case "$LEG:$1" in
         host:scalapack)  echo '^Scalapack[A-Za-z0-9]*HostFfi$' ;;
         host:gemm)       echo '^MklBlas[A-Za-z0-9]*HostFfi$' ;;
-        host:slate)      echo '^Slate[A-Za-z0-9]*HostFfi$' ;;
         host:phdf5)      echo '^Phdf[A-Za-z0-9]*HostFfi$' ;;
         host:fft)        echo '^MklFft[A-Za-z0-9]*HostFfi$' ;;
         cuda:cusolvermp) echo '^(EighMpFfi|CusolverMp[A-Za-z0-9]*Ffi)$' ;;
         cuda:cufft)      echo '^(Cufft|KConvMathdx|KFftMathdx)[A-Za-z0-9]*CudaFfi$' ;;
-        cuda:slate)      echo '^Slate[A-Za-z0-9]*Ffi$' ;;
         cuda:phdf5)      echo '^Phdf[A-Za-z0-9]*Ffi$' ;;
         rocm:phdf5)      echo '^Phdf[A-Za-z0-9]*Ffi$' ;;
-        rocm:slate)      echo '^Slate[A-Za-z0-9]*Ffi$' ;;
+        rocm:elpa)       echo '^Elpa[A-Za-z0-9]*Ffi$' ;;
         rocm:kdft)       echo '^KDft[A-Za-z0-9]*Ffi$' ;;
         *) echo "" ;;
     esac
@@ -367,9 +363,9 @@ for b in "${_want[@]}"; do
     re="$(backend_symbol_re "$b")"
     if [[ -z "$re" ]]; then
         fail 0b "'$b' is not a backend of the $LEG leg.  Known:
-      host = scalapack gemm slate phdf5 fft
-      cuda = cusolvermp cufft slate phdf5
-      rocm = phdf5 slate kdft"
+      host = scalapack gemm phdf5 fft
+      cuda = cusolvermp cufft phdf5
+      rocm = phdf5 elpa kdft"
         continue
     fi
     # On the device leg the host handlers are absent, but keep the two name
@@ -485,7 +481,7 @@ fi
 if [[ "$_mkl_seq" -gt 0 && "$_mkl_thr" -gt 0 ]]; then
     fail 2b "BOTH MKL threading layers are linked (sequential=$_mkl_seq
       threaded=$_mkl_thr).  Same hazard as 2a, and MKL prints no warning at
-      all.  Pick one threading layer and match SLATE's."
+      all.  Pick one threading layer."
 fi
 _nvendor=$(printf '%s\n' $_vendors | grep -c . || true)
 _gate2_bad=0
@@ -512,18 +508,13 @@ if [[ "$LEG" == host ]]; then
     if [[ -n "$_cuda_needed" ]]; then
         fail 3 "the host library links CUDA-stack libraries:
 $(printf '%s\n' "$_cuda_needed" | sed 's/^/        /')
-      Check that craype-accel-nvidia80 and cudatoolkit are unloaded and that
-      the SLATE install really is the gpu_backend=none variant."
+      Check that craype-accel-nvidia80 and cudatoolkit are unloaded."
     else
         say "GATE 3 PASSED: no CUDA-stack library in DT_NEEDED"
     fi
 elif [[ "$LEG" == rocm ]]; then
     # (a) no CUDA stack; (b) one HIP runtime SONAME, the 7.x one JAX's wheel
-    # provides; (c) the SONAME-race half (ffi_loader.py "SHARE THEIR SLATE"):
-    # the libslate.so.2 this environment resolves for the leg is a HIP build,
-    # not the gpu_backend=none install the host leg's LD_LIBRARY_PATH entry
-    # names -- a device-less SLATE loads fine and every handler then refuses
-    # with get_device_count()=0.
+    # provides.
     _cuda_needed="$(printf '%s\n' "$NEEDED" | grep -iE 'cuda|nccl|nvshmem|^libcal\.so' || true)"
     _hip_needed="$(printf '%s\n' "$NEEDED" | grep -E '^libamdhip64' | sort -u)"
     _g3=0
@@ -533,47 +524,6 @@ elif [[ "$LEG" == rocm ]]; then
     if [[ -n "$_hip_needed" && "$_hip_needed" != "libamdhip64.so.7" ]]; then
         fail 3b "the ROCM library links HIP runtime(s) '$(echo $_hip_needed)', not the
       libamdhip64.so.7 that the JAX ROCm 7 plugin maps."; _g3=1
-    fi
-    if printf '%s\n' "$NEEDED" | grep -qx 'libslate.so.2'; then
-        if [[ "$RUNTIME_ENV" -eq 0 ]]; then
-            notrun 3c "which libslate.so.2 the leg binds is an environment fact;
-      not checkable where libamdhip64.so.7 does not resolve (LORRAX_FFI_VERIFY_ENV=runtime)."
-        else
-            _sl="$(awk -F '\t' '$1=="libslate.so.2"{print $2}' <<<"$ROCM_RUNTIME_MAP")"
-            if [[ -z "$_sl" || ! -f "$_sl" ]]; then
-                fail 3c "libslate.so.2 does not resolve for this leg here."; _g3=1
-            elif ! readelf -d "$_sl" | grep NEEDED | grep -q 'librocblas'; then
-                fail 3c "libslate.so.2 resolves to $_sl, a SLATE WITHOUT HIP (no
-      librocblas in its DT_NEEDED).  The device leg would load the host leg's
-      gpu_backend=none SLATE.  The ROCM leg pins its SLATE by DT_RPATH
-      (CMakeLists ROCM block); a stale build or an LD_PRELOAD defeats it."; _g3=1
-            else
-                say "GATE 3c: libslate.so.2 -> $_sl (HIP build)"
-                # GATE 3d: SLATE's host BLAS must be safe for CONCURRENT callers
-                # (SLATE calls it from its OpenMP task threads).  LibSci is not,
-                # in either flavour: threaded SIGSEGVs, sequential returns wrong
-                # heev eigenpairs at nb < n/p (SLATE_PERF_REPORT); the site's
-                # BLAS is the locking OpenBLAS (build_openblas_seq.sh), shipped in
-                # the SLATE prefix.  Checked on the LEG's closure: SONAMEs the leg
-                # binds by DT_RPATH are the ones SLATE's own NEEDED entries meet.
-                _bl="$(awk -F '\t' '$1 ~ /^libsci(_|[.])/ || $1 ~ /^libopenblas/{print $1"="$2}' <<<"$ROCM_RUNTIME_MAP" | sort -u | tr '\n' ' ')"
-                _ob="$(awk -F '\t' '$1 ~ /^libopenblas/{print $2}' <<<"$ROCM_RUNTIME_MAP" | head -1)"
-                # NumPy's libscipy_openblas64_<hash>.so has its own symbol
-                # namespace. Its prefix "libsci" is not Cray's libsci_*.so.
-                if grep -qE '(^| )libsci(_|[.])' <<<"$_bl"; then
-                    fail 3d "the leg's closure maps LibSci ($_bl): not safe for SLATE's
-      concurrent host BLAS calls.  Rebuild with config/frontier/build_openblas_seq.sh
-      then build_slate_hip.sh."; _g3=1
-                elif [[ -z "$_ob" ]]; then
-                    fail 3d "the leg's closure maps no libopenblas ($_bl)."; _g3=1
-                elif grep -qs 'USE_LOCKING=1' "$(dirname "$_ob")/libopenblas.LORRAX_BUILD_FLAGS"; then
-                    say "GATE 3d: SLATE host BLAS $_ob ($(cat "$(dirname "$_ob")/libopenblas.LORRAX_BUILD_FLAGS"))"
-                else
-                    fail 3d "the leg binds $_ob, not a sequential LOCKING OpenBLAS (no
-      libopenblas.LORRAX_BUILD_FLAGS stamp with USE_LOCKING=1 beside it)."; _g3=1
-                fi
-            fi
-        fi
     fi
     [[ "$_g3" -eq 0 ]] && say "GATE 3 PASSED: no CUDA stack; HIP runtime=${_hip_needed:-none}"
 else
@@ -591,7 +541,7 @@ fi
 # by a FindOpenMP misdetection, so the .so carried three fftw DT_NEEDED
 # entries.  DT_NEEDED is resolved before any of this library's code runs, and
 # the Shifter container does not bind-mount /opt/cray/pe/fftw at all.  Measured
-# 2026-08-06: dlopen failed outright and NINETEEN ScaLAPACK/SLATE/GEMM contract
+# 2026-08-06: dlopen failed outright and NINETEEN ScaLAPACK/GEMM contract
 # tests that never perform an FFT reported as SKIPPED, with the suite green at
 # 0 failures.  A lost FFT optimisation silently became a lost linear-algebra
 # test suite.
@@ -608,7 +558,7 @@ if [[ -n "$_fftw_needed" ]]; then
     fail 5b "fftw entries in DT_NEEDED:
 $(printf '%s\n' "$_fftw_needed" | sed 's/^/        /')
       An engine resolved at RUN time must not be a LOAD-time dependency.  Any
-      fftw here makes the WHOLE library — ScaLAPACK, SLATE, GEMM and phdf5
+      fftw here makes the WHOLE library — ScaLAPACK, GEMM and phdf5
       handlers included — unloadable wherever that exact SONAME is absent.
       Two known causes: an -lfftw3 on the link line (the CMakeLists records
       the path as a dlopen hint instead), or FindOpenMP adopting cray-fftw's

@@ -123,6 +123,16 @@ nav:
       - Centroid selection: theory/centroid-selection.md
       - Symmetry: theory/symmetry.md
       - Velocity operator: theory/velocity-operator.md
+  - Developer reference:
+      - Overview: developers/index.md
+      - minimax: developers/minimax.md
+      - Kernels: developers/kernels.md
+      - distrib_la: developers/distrib_la.md
+      - lxkit: developers/lxkit.md
+      - symmetry_maps: developers/symmetry_maps.md
+      - vcoul: developers/vcoul.md
+      - wfn_loader: developers/wfn_loader.md
+      - zeta_loader: developers/zeta_loader.md
 
 hooks:
   - hooks/strip_comments.py

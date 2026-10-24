@@ -37,5 +37,4 @@
 #define LORRAX_CFG_HAVE_CAL        @LORRAX_CFG_CAL@
 
 // ---- both legs ------------------------------------------------------------
-#define LORRAX_CFG_HAVE_SLATE     @LORRAX_CFG_SLATE@
 #define LORRAX_CFG_HAVE_PHDF5     @LORRAX_CFG_PHDF5@

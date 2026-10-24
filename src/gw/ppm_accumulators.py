@@ -576,7 +576,7 @@ class DeviceOmegaAccumulator:
             # A later SC map asks again for the same runner and signature;
             # the admitted executable is the same, so compile it once.
             key = (run, jax.tree.structure(arguments),
-                   tuple((tuple(x.shape), str(x.dtype), x.sharding)
+                   tuple((tuple(x.shape), str(x.dtype), getattr(x, 'format', x.sharding))
                          for x in jax.tree.leaves(arguments)))
             if key not in _WINDOW_COMPILED:
                 _WINDOW_COMPILED[key] = run.lower(*arguments).compile()

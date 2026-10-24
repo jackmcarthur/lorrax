@@ -862,8 +862,7 @@ def eigh_backend_choices() -> tuple:
         # subscript is outside the guard now: if the public API stops publishing
         # an ``eigh`` row, that raises here rather than being papered over.
         EIGH_CHOICES_SOURCE = f"fallback ({type(exc).__name__}: {exc})"
-        return ("auto", "off", "distributed", "cusolvermp", "slate",
-                "scalapack")
+        return ("auto", "off", "distributed", "cusolvermp", "scalapack")
     EIGH_CHOICES_SOURCE = "distrib_la.BACKEND_CHOICES"
     return tuple(BACKEND_CHOICES["eigh"])
 

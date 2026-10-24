@@ -4,6 +4,15 @@
 
 ## Pages in the sidebar
 
+- [distrib_la](https://jackmcarthur.github.io/lorrax/developers/distrib_la/): manual/docs/developers/distrib_la.md
+- [Developer reference](https://jackmcarthur.github.io/lorrax/developers/): manual/docs/developers/index.md
+- [Compute kernels](https://jackmcarthur.github.io/lorrax/developers/kernels/): manual/docs/developers/kernels.md
+- [lxkit](https://jackmcarthur.github.io/lorrax/developers/lxkit/): manual/docs/developers/lxkit.md
+- [minimax](https://jackmcarthur.github.io/lorrax/developers/minimax/): manual/docs/developers/minimax.md
+- [symmetry_maps](https://jackmcarthur.github.io/lorrax/developers/symmetry_maps/): manual/docs/developers/symmetry_maps.md
+- [vcoul](https://jackmcarthur.github.io/lorrax/developers/vcoul/): manual/docs/developers/vcoul.md
+- [wfn_loader](https://jackmcarthur.github.io/lorrax/developers/wfn_loader/): manual/docs/developers/wfn_loader.md
+- [zeta_loader](https://jackmcarthur.github.io/lorrax/developers/zeta_loader/): manual/docs/developers/zeta_loader.md
 - [BerkeleyGW export](https://jackmcarthur.github.io/lorrax/drivers/berkeleygw-export/): manual/docs/drivers/berkeleygw-export.md
 - [Files](https://jackmcarthur.github.io/lorrax/drivers/bse/files/): manual/docs/drivers/bse/files.md
 - [BSE driver](https://jackmcarthur.github.io/lorrax/drivers/bse/): manual/docs/drivers/bse/index.md

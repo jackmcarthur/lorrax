@@ -1,5 +1,5 @@
 // Local exact-range batched GEMM through classic BLAS: cuBLAS on the CUDA leg, rocBLAS on the
-// ROCM leg (common/gpu_blas.h; one source, the same symbols, as phdf5 and slate).
+// ROCM leg (common/gpu_blas.h; one source, the same symbols, as phdf5).
 //
 // Each process owns complete contraction axes and independent centroid tiles:
 //   A[nq,m,k] @ B[nq,k,n] -> C[nq,m,n].

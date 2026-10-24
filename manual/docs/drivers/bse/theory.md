@@ -156,7 +156,7 @@ On a non-spinor WFN the triplet kernel (`spin_triplet`) has no exchange, $w_x = 
 
 ## <span class="n">3</span> The matrix-free product HX {: #hx }
 
-The solvers see $H$ only through its action on a block of trial vectors $X_{cv\bk}$. Exchange is a dense rank-$N_\mu$ product; the direct term is a k-convolution done by FFT, $O(N_k \log N_k)$ instead of $O(N_k^2)$.
+The solvers see $H$ only through its action on a block of trial vectors $X_{cv\bk}$. Exchange is a dense rank-$N_\mu$ product; the direct term is a k-convolution done by FFT, $O(N_k \log N_k)$ instead of $O(N_k^2)$. The same product gives the GW screening its ladder diagrams, where the resolvent of $H$ is applied by Krylov solves ([GW theory §2.6](../gw/theory.md#scr-resolvent)).
 {: .intro }
 
 ### <span class="n">3.1</span> Exchange {: #hx-x }

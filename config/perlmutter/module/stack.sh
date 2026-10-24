@@ -9,7 +9,7 @@
 #   python/                          uv-managed CPython the venv is built on
 #   venv/                            the runtime venv (setup_env.sh); LORRAX_MODULE_VENV
 #                                    names another absolute path
-#   native/                          SLATE + cuSOLVERMp stage, shared by builds
+#   native/                          cuSOLVERMp stage, shared by builds
 #                                    (not build/: the sealer refuses search paths
 #                                    through a directory named build)
 #   releases/source-<rev8>/          git-archive snapshots (publish.sh)

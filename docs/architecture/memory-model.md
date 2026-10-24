@@ -1,9 +1,9 @@
 # Memory model
 
-A LORRAX calculation is feasible on `P` ranks exactly when every stage's
-per-rank live set fits the device budget. Every large object is tiled over
-the whole `x × y` mesh, so its per-rank bytes fall as `1/P`; nothing large is
-materialised on fewer than all `P` ranks. This page states, stage by stage,
+A LORRAX calculation needs every stage's per-rank live set to fit the device
+budget and its processes' combined host memory to fit their node. The leading
+device faces are tiled over the `x × y` mesh and fall as `1/P`; fixed tile
+workspaces and replicated host data need separate accounting. This page states, stage by stage,
 what is resident per rank, how it scales, and which planner prices it.
 One implementation prices, admits and measures every stage: `lxkit.memory`
 (`services/lxkit/src/lxkit/memory.py`). Prices come from measurement: the
@@ -91,6 +91,31 @@ the run keeps `B`). On CPU `L` is the node's `MemTotal` over the processes on th
 node and the process's devices. The room beside what is allocated now is
 `memory.room() = B − bytes_in_use` (the allocator's own figure; CPU: live arrays),
 the minimum over processes, floored to a whole GiB.
+On CPU the live count is the per-device union of local storage intervals:
+global/local aliases and overlapping views spend the budget once. Reading
+the count neither synchronizes pending kernels nor retains local arrays.
+
+At eager stage boundaries, `distrib_la.ensure_sharding` preserves a concrete
+operand already in the required layout: an eager `with_sharding_constraint`
+can copy the entire operand even when its sharding matches. Inside a `jit`,
+the helper retains the constraint; a genuinely different layout still reshards.
+The PPM wrapper likewise adopts matching pole frequencies, even/odd residues,
+validity masks and Wc(0) directly from the producer on its existing face.
+
+CPU compiler heaps are separate from that live-array count. A cold P121
+1 MiB all-to-all compile left 30.39 GiB of node PSS, although glibc had
+already freed most of the compiler scratch. Releasing those free pages
+with input and executable live reduced it to 14.32 GiB, with exact output
+and unchanged warmed collective latency. The shared real-compile boundary
+(`common.jax_compile_cache`) now reclaims free glibc pages only on CPU, when
+both RSS growth and free heap reach the existing malloc trim threshold
+(128 MiB by default). Its RSS watermark spans smaller compiles and follows
+natural deallocation. The existing `LORRAX_MALLOC_TUNE` opt-out and threshold
+win; GPU compiles, persistent-cache hits, and tiny follow-up compiles do not
+trim. The integrated P121 probe used one trim per rank (15.8 ms median,
+4.35 s cold compile); this reduces retained host memory after compilation,
+not the compiler's transient peak (evidence:
+`/pscratch/sd/j/jackm/cs_claude/htransform_followup_20261022/winterp_evidence/collective_p121_*`).
 
 ### Routes and admission {#routes}
 
@@ -110,12 +135,57 @@ a provider context under `linalg = local` carries it as its `outside` term
 | site | routes |
 |---|---|
 | W Dyson (`gw.w_isdf._dyson_route`) | local: faces + $16\mu^2(3\lceil Q/P\rceil + 2)$; distributed: faces + one LU pair + contexts |
+| response-bank Coulomb roots (`gw.response_bank._select_coulomb_program`) | complete compiled checked program for both roots plus native GEMM/eigh workspace and contexts; local first, existing distributed algebra when it does not fit |
+| charge Cplus factor (`isdf.core._factor_c_q_face`) | complete compiled first and whole-chain programs plus matching native EIGH query and contexts; smaller local shares follow the service's doubling schedule before the whole-mesh program, each including its checked backup |
 | SC eigh, density scan (`gw.sc_iteration`, `gw.qsgw_density`) | one $(n_b, n_b)$ tile within 1 % of `B`; cuSOLVERMp eigh / `band_2d` |
 | tangential whole parents, constructor, staged eigh stacks (`gw.tangential_execution`) | the local route's compiled programs; the face / whole mesh + contexts |
 | head Γ GEMM (`gw.tangential_head._gamma_gemm_route`), ζ face GEMMs | staged where its program compiled fits the room (`distrib_la.staged_fits`); `panel_matmul` faces |
 | transverse ζ factor, Galerkin factor, coarse V(q) chunk | each route's own program compiled (`runtime.aot_memory.compiled_price`) |
 | htransform node-pair stages: fine-q top block, path and active window, orbital operators, moment grid (`bandstructure.fh_interp.admit_node_route`) | `q-batched`: whole $(N_B, N_B)$ matrices of the rank's q rows after one face→q exchange; `face`: one q tiled over the mesh (`linalg = distributed` pins it); each route's program compiled, the chosen executable then run |
-| nodal fit: quadrature metric, node Gram (`isdf.galerkin`) | host orbit-folded blocks of at most 64 MiB; the Gram on the face with the `distrib_la` eigh plan |
+| nodal fit: quadrature metric, band/node Grams (`isdf.galerkin`) | orbit normal equations and every nonnegative principal solve on `P(x,y)`; point-pair scratch streamed in bounded blocks; band Gram, Loewdin and coefficients on band/rank faces through `distrib_la`; only linear geometry, orbit weights and eigenvalue vectors reach hosts |
+
+Provider contexts are an accelerator allowance. The host leg charges zero
+through the same `lxkit.memory.contexts()` owner; importing the compiled-price
+helper does not initialize a CUDA provider on CPU.
+
+The response bank prices the complete requested q stack of `V^(1/2)` and
+its supported inverse before dispatch. One parent fitting the eigensolver
+does not imply that both reconstructions and the stack's native workspace
+fit. Admission uses `compiled_new_bytes` beside the already-live input,
+including the existing checked retry, and the same provider queries used
+by dispatch. The selected program carries its dense layout into that query;
+its full checked EIGH is queried on the whole mesh even when the subsequent
+root reconstructions use local GEMMs.
+Both outputs remain `H_q(mu_X,nu_Y)` faces. The programs and executable
+caches retain geometry and plans, never the Coulomb input.
+
+The response bank and tangential screening owner share bare-V parent rows
+and both Coulomb roots across their bank, moment and constructor calls.
+Accepted roots are shared across local and distributed execution requests
+when the authenticated operator, packed basis, numerical cut and mesh agree;
+both return the same `H_q(mu_X,nu_Y)` face contract. A constructor's sub-span
+slices the existing roots rather than retaining another pair per parent.
+The numerical backend remains part of the compiled-program identity.
+One-shot GW releases these cache references after W0 persistence and before
+Sigma. QSGW retains reuse between maps and releases them after the final
+W0 persistence. Clearing these holds does not delete arrays still owned by
+callers or clear compiled programs.
+
+The nodal fit keeps sampled states on centroid faces. Whole-orbit packing
+allows each rank to accumulate its normal-equation tile without gathering
+node samples or a whole orbit matrix. The shared nonnegative quadratic solver
+keeps all principal systems distributed and returns inactive weights exactly
+zero. Loewdin eigenvectors and inverse roots remain band faces; explicit
+all-to-all and transpose-partner exchanges produce the compact product-rank
+coefficient and target carriers. Basis artifacts continue to store physical
+band/rank extents through SlabIO, which reads directly into mesh-padded faces.
+The shared full-grid refit also keeps its coefficient chunks on node/state
+faces, forms its node Gram and sampled overlaps through bounded SUMMA panels,
+and exchanges the final rows directly into product-r slabs. Its retained-band
+residual uses those same faces; it never recreates the complete coefficient
+window on each rank.
+The remaining replicated fit metadata grows linearly with node/orbit count or
+with `N_k N_b` eigenvalues; there is no host `N_orbit²` or `N_k N_b²` matrix.
 
 ### Prices from measurement {#measured}
 
@@ -151,6 +221,13 @@ a provider context under `linalg = local` carries it as its `outside` term
   `distrib_la.lu_workspace_query`) or a measured row (`lxkit.LEGS`
   `vendor_rows`) within its stated range; outside it, a warning (`GATE
   memory_unpriced` under `LORRAX_MEMORY_STRICT`).
+  The response bank resolves its Dyson plan at the actual operand batch:
+  stored parents or a streamed moment span, while the physical prefactor
+  still uses the full q count. The agreed allocator room already includes
+  materialized operands; planning subtracts only future abstract operands.
+  The same resolved checked program and LU plan own compilation, native
+  workspace queries and completion. Its getrs cap is withdrawn after either
+  dispatch or a failed admission; charge moments have no LU to admit.
 - **Route completeness.** No whole N_μ-scale matrix (side ≥ N_μ/2) is held on a
   rank without a mesh route beside it: a stage whose only candidates do so
   refuses (`GATE nmu2_no_backup`; `LORRAX_NMU2_BACKUP=report` makes it a
@@ -358,13 +435,15 @@ stages, sets the node count.
 
 The raw-parent carrier holds two orientations of `ψ_{n k̄ s}(r_μ)` on the
 `n_par` parents, stored as faces: bands on one mesh axis, centroids on the
-other. A Green build never holds a band-complete copy; the Σ projector holds
-one for the length of its call:
+other. A Green build can use local GEMMs after gathering the summed bands,
+or retain these faces and exchange bounded SUMMA panels. The response and
+scalar q-wedge Σ streams choose between them before execution; the small
+Σ projector gathers only its projected bands for the length of its call:
 
 ```text
 M_face  = 2·16·n_par·n_s·μ·N_b / P                      resident; μ and bands both tiled
 M_axis  = 16·n_par·n_s·μ·N_b·(1/p_x + 1/p_y)
-        = 2·16·n_par·n_s·μ·N_b / √P                     one band-complete copy: the Σ projector
+        = 2·16·n_par·n_s·μ·N_b / √P                     transient axis orientations at the requested band count
 M_panel = 2·16·n_par·n_s·μ·(N_b/p_x)·(1/p_x + 1/p_y)    one Green build's two live SUMMA panels
 ```
 
@@ -439,8 +518,33 @@ rank's tile in row passes of whole centroid orbits (`gw.subtile_stream`):
 `Σ(τ) row` is one local μ row's live set (`ν = μ/P_y`: the parent Green and
 its partner, mode 7's output, `W_prep`, the pass's rows of `W` and its
 partner on the q parents, the pass's ψ rows), and a pass holds the most rows
-whose bytes fit the fixed tile. ψ is band-complete once per Σ call,
-`16·n_par·n_s·(N_b + N_bΣ)·(μ/P_x + μ/P_y)`. No full-tile Green or `W_prep`
+whose bytes fit the fixed tile. The scalar q-wedge Σ prices its operand
+placement and complete first window before allocating band-complete ψ. If
+that live set fits, the incumbent axis route keeps its local Green GEMMs.
+Otherwise the summed-band ψ stays on its canonical 2D faces and each row pass
+uses the shared bounded SUMMA Green product; its conjugated, merged right
+operand is formed once on the same 2D face. These sum operands scale as
+`32·n_par·n_s·N_b·μ/P`, beside the original faces. The small QP projector
+still uses its axis carriers, `16·n_par·n_s·N_bΣ·(μ/P_x + μ/P_y)`.
+Admission uses the largest compiled new-byte figure over ranks, plus retained
+placement outputs and native convolution scratch, against current room before
+placement runs. Static SX/COH uses the same choice and scalar node. Photon
+Σ sectors retain their existing contracts.
+
+The charge direct and four-current response row streams use the same choice
+inside `response_bank._compiled`: compile the complete incumbent stream
+first, including its inline band gathers, and compare its new bytes plus native
+convolution scratch with the minimum current room over ranks. An over-budget
+axis body is never dispatched. Its fallback runs the same node and row scans
+with `psi_k,s(mu_X,n_Y)` and `psi_k(n_X,s,mu_Y)` still on their 2D faces,
+using the shared Green SUMMA and complex antiunitary partner. The merged right
+operand is formed once on its face, so the summed-band resident and panels
+scale as `N_b/P`, rather than a band-complete `N_b/sqrt(P)` copy. Each sample
+group and streamed-bank segment admits its own actual executable; carry
+donation and device/host/file bank residence are unchanged. The minimum face
+route retains `memory.admit`'s existing warn-and-run policy if even it is over
+room. This is a layout choice, not a quadrature or band-window approximation.
+No full-tile Green or `W_prep`
 exists. `sigma_spin_block` (the output spin block `d`, a divisor of `n_s`,
 whose stored x block fits the fixed tile) still sizes the full-zone Σ kernels
 and the static (COHSEX) and PPM spatial kernels.
@@ -486,7 +590,8 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | direct Γ head (bulk metals) | the compiled per-sample footprint × samples per call, split over every rank | `photon_direct_head.direct_gamma_chunk_plan`: the fixed tile, at least 2¹⁰ samples per rank, at most one 2¹⁷ replicate per call | — |
 | head wings | `n_ends` gathered endpoint blocks `16·N_k·n_s·block·N_b` | `qsgw_head.head_wing_mu_block`: the fixed tile, at least 16 centroids | — |
 | exciton_bands C_q | P_R and its update, one ψ chunk and its Pk | `vq_interp.build_cq_q_chunk`: q rows within the fixed tile | — |
-| htransform R images | f(H)_R and the back-map L_R, `16·N_k·N_B·(N_B + N_T)/P` (`N_B` = spin × nodes, `N_T` = spin × centroids, 0 when they are the nodes), and the int16 WS code tiles `2·N_k·N_B·(N_B + N_T)/P` | `fh_interp.build_fH_R` compiled (one program); `node_pair_table` exact extents | refuses |
+| htransform R images | f(H)_R and the back-map L_R, `16·N_k·N_B·(N_B + N_T)/P` (`N_B` = spin × nodes, `N_T` = spin × centroids, 0 when they are the nodes), and the int16 WS code tiles `2·N_k·N_B·(N_B + N_T)/P` | `fh_interp.build_fH_R` compiled (one program); `node_pair_table` exact code extents; WS tie-mask tile's own compiled executable | warns and admits |
+| BSE coarse-to-fine W | resident coarse W plus the fine output on the centroid face, and one fixed tile of embedding/FFT scratch | `bse_densify.make_w_densifier` scans centroid-face blocks within `TILE_BYTES`; shared `densify_w` admits the exact executable's output and scratch beside resident arrays | warns and admits |
 | restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` (SlabIO writes per-rank hyperslabs) | — | — |
 
 Replicated per-process metadata includes the TRS-augmented centroid permutation
@@ -543,6 +648,39 @@ the P4 probe added about 0.19 MB of compiled scratch at 24×24×80 and 8.40 MB
 at 128³, independent of whether the request had one or three k rows. The
 actual compiled price includes this bounded storage; identical peak memory
 is not assumed. Full-band chunks keep their previous flat-scan route.
+
+The htransform WS constructor computes only addressable node×node and
+target×node code tiles. It retains no all-site pair matrix or target×target
+table. For local int16 code bytes `C`, host construction holds `O(C)` data
+(up to three copies during remapping), plus one displacement block. Its
+width `m` satisfies `m·(64·N_k + 32·n_image + 48) ≤ TILE_BYTES` (1 GiB,
+at least one pair); this bounds the mask and sort buffers by a fixed tile,
+not the process's total RSS. Repeated spin-site rows share one geometry
+decision. The actual device tie-mask program is compiled and admitted before
+execution; host copies and NumPy allocator overhead remain outside that
+device price. Only geometry and the small agreed tie-pattern dictionary are
+replicated. A Perlmutter P4 probe with 4,000 targets, 264 nodes and a 4×4 grid
+reduced process peak RSS from 1,925 to 469 MiB and the retained replicated
+host table from 149 MiB to 1.8 KiB (evidence:
+`/pscratch/sd/j/jackm/cs_claude/bse_memory_prerelease_20261022/memory/`).
+
+Fine W's resident size alone does not determine preprocessing capacity. The
+shared densifier scans independent centroid-face blocks inside `shard_map`,
+so coarse inverse FFTs, pair-dependent WS weights, and fine transforms use
+one fixed tile instead of whole additional W carriers. Both centroid axes
+can be blocked; no whole k axis is split. The final five-dimensional output
+is the scan carry, avoiding a whole-output layout copy on exit. The exact
+compiled price separates the output's face scaling from per-rank scratch,
+and is admitted beside the already resident coarse input. Both the fine-grid
+bundle and the exciton coarse-W path use that same execution owner; the
+consumed coarse input is released before the Q sweep.
+
+A Perlmutter CPU P4 probe with 10,000 centroids, coarse 3×3 and fine 6×6 has
+3.6 GB coarse input and 14.4 GB fine output per rank. Centroid tiling reduces
+compiled temporaries from 18.40 GB to 0.99 GB and measured peak RSS from
+36.63 GB to 19.43 GB; execution changes from 23.06 s to 24.99 s. These are
+W-only memory proxies, not physical 100-atom calculations (evidence:
+`/pscratch/sd/j/jackm/cs_claude/htransform_followup_20261022/winterp_evidence/`).
 
 The χ₀ node cannot be chunked over q, because the k-convolution needs the
 whole k axis on every rank. A completed W of an earlier screening role is
@@ -622,9 +760,39 @@ For the charge channel, `ZetaG.contract_v` accumulates `V_q` tile by tile as
 it forms ζ from the Z store, keeping ζ only at the columns the head consumers
 name.
 
-`V_q` is then unfolded to the full zone in memory (`16·N_k·μ²/P`), so the IBZ
-reduction shrinks the ζ store and the fit's accumulator by `N_k/Q`, not the
-`V_q` held by Σ.
+Its Z-store tile enters as `Z_q_XY(mu,G)` and moves to `Z_q(mu_X,G_Y)`
+through the existing explicit `_to_mu_owner` exchange, cropping padded q
+rows afterwards. A direct sharding constraint here replicated the whole
+`Q_pad × μ × g` tile on every rank. The input payload is instead
+`16·ceil(Q/P)·μ·g` bytes per rank and the output is `16·Q·μ·g/P`;
+exchange packing adds shard-sized copies, included in the compiled G-tile
+chain price. In particular, `Q < P` retains the input's one-parent floor,
+without a P-parent replica. The same transport serves the face inverse
+channel and the ζ-file-only pass.
+
+On a reducing q grid, fresh scalar and photon-charge initialization retain
+canonical `V_qirr(mu_X,nu_Y)` (`16·N_q,irr·μ_canonical²/P`). The GW restart
+reader makes the same opt-in choice; the public readers and generic V producer
+still return full-q arrays by default. The exact all-q finite census and
+q/−q reciprocity maximum stream fixed-width panels through the same operator
+unfold, with runtime q-index operands and a masked final tail. Gamma is
+admitted and completed once before pricing the statistics-only program against
+current room. Panel output/scratch is its actual compiled increment; a closed
+form for the two transported panels is `2·16·B·μ_canonical²/P`. Restart keeps
+its finite/trace gates without computing the unused reverse panel, and sanity
+off transports Gamma only.
+
+The fresh writer persists its unchanged authenticated canonical pre-unfold
+capture, including the existing table/centroid/provenance checks. The late
+`_select_coulomb_q_rows` seam authenticates an already-selected operator against
+the current canonical wedge, then `_coulomb_on_wedge` packs both centroid axes
+and attaches the packed tables. Each executable is compiled, priced and
+admitted before it runs. Screening and Σ retain only
+`V_qirr(mu_X,nu_Y)` (`16·N_q,irr·μ_packed²/P`). A nonreducing grid retains
+its full-q carrier because every row is required; a full-storage fallback uses
+the existing full unfold, admitted before materialization. Those cases retain
+the `16·N_k·μ_canonical²/P` resident. No reduced-grid fresh initialization or
+q-IBZ restart needs that full-zone resident.
 
 ## What the closed forms cannot see
 

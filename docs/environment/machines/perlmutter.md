@@ -112,7 +112,7 @@ the rank shell, before Python:
 
 ```bash
 export LORRAX_CHECKOUT=/path/to/checkout
-srun --jobid=$JOBID -N 2 -n 4 -c 16 bash -c '
+srun --jobid=$JOBID -N 2 -n 4 -c 16 --threads-per-core=1 --cpu-bind=threads bash -c '
   set -euo pipefail
   export OMP_NUM_THREADS=14
   . "$LORRAX_CHECKOUT/config/perlmutter/cpu_mpi_env.sh"
@@ -134,9 +134,18 @@ process; and sets:
 | `JAX_NUM_CPU_DEVICES=1` | one JAX device per rank, as the collectives require |
 | `MPICH_GPU_SUPPORT_ENABLED=0` | a CPU step has no GPU |
 
-**Threads per rank.** `srun -c` sets one affinity mask per rank. XLA's CPU
-worker pool (which ignores `OMP_NUM_THREADS`), the LibSci and SLATE OpenMP
-teams (capped by `OMP_NUM_THREADS`), the MPICH progress thread and Python's
-I/O threads all share that mask, and LORRAX binds none of them to a private
-subset. Set `OMP_NUM_THREADS` below `-c` (`14` with `-c 16`) to leave CPUs
-for the XLA pool, the progress thread and I/O.
+**Threads per rank.** Use `--threads-per-core=1 --cpu-bind=threads` so `-c`
+assigns physical cores and each rank's affinity mask excludes SMT siblings.
+`--cpu-bind=cores` expands the mask to sibling hardware threads, even with
+`--hint=nomultithread`: a measured `-c 16` step had 16 logical CPUs on only
+eight physical cores. Check the actual mask with `taskset -pc $$` inside a
+rank shell when comparing launch configurations.
+
+XLA's CPU worker pool ignores `OMP_NUM_THREADS` and uses the rank's affinity
+mask; the LibSci and host FFT OpenMP teams honor `OMP_NUM_THREADS`.
+These teams, the MPICH progress thread and Python's I/O threads share the
+mask, and LORRAX binds none of them to a private subset. Set
+`OMP_NUM_THREADS` below `-c` (`14` with `-c 16`) and allow at least two CPUs
+per rank: the required asynchronous MPI progress thread can consume a full
+CPU even while the solver is idle, so `-c 1` makes progress compete with
+computation.

@@ -1,0 +1,15 @@
+# Compute-admitted reference; see evidence/band_admission.json.
+[cohsex]
+wfn_file = ../qe/WFN.h5
+centroids_file = centroids_frac_23700.txt
+nval = 4
+ncond = 4
+number_bands = 2370
+sys_dim = 3
+ecutrho = 320.0
+compute_mode = gn_ppm
+qp_solver = one_shot_dft
+
+# Cover every requested QP-prefix state including deep semicore.
+sigma_omega_min_ev = -75
+sigma_omega_max_ev = 2.75

@@ -73,12 +73,11 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     pref = _w_solve_pref_scalar(meta)
     built = _response_programs(mesh_xy, n, backend, route, pref, ordered,
                                float(meta.cell_volume) if photon else None)
-    room = _dyson_room(meta, mesh_xy, n) if backend == "distributed" else None
-    dyson, moments, lu = built.bind(room)
+    dyson, moments, lu = built.bind(getattr(meta, "tangential_capacity", None))
     slope = built.slope
     algebra = {
         "linalg": resolution.layout,
-        "solve": lu.describe(),
+        "solve": lu.describe() + "; capacity resolved at each actual operand batch",
         "batched_route": route,
         "prefactor": pref,
         "prefactor_q_count": int(meta.nk_tot),
@@ -97,16 +96,14 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     return dyson, slope, moments, algebra
 
 
-def _dyson_room(meta, mesh_xy, n):
-    """Per-rank room of the Dyson solve, for distrib_la's size route (resolve guard 1b).
+def _dyson_room(ledger, mesh_xy, args):
+    """Room beside this actual solve signature, without charging live operands twice.
 
-    The shared ledger's room beside its bound live reservations
-    (``CapacityLedger.room_bytes_per_rank``) less the solve's own face operands (H, chi
-    and W: 3 nq n^2 complex128 over the P ranks, the pricing of ``w_isdf._dyson_route``). A shape-and-ledger rule every rank shares: no
-    exchange, no sync. None (the leg's library, never one_device) on one rank, with no
-    ledger, or with the ledger's caller lifetimes unbound (unknown live bytes are not zero).
+    The agreed allocator room already includes materialized JAX arrays. Planning
+    uses abstract future inputs; only those are charged here, at their own
+    shapes and shardings. The physical full-q count belongs to the prefactor,
+    never to the storage price of a parent or streamed q batch.
     """
-    ledger = getattr(meta, "tangential_capacity", None)
     ranks = int(mesh_xy.size)
     if ledger is None or ranks <= 1:
         return None
@@ -114,8 +111,16 @@ def _dyson_room(meta, mesh_xy, n):
         live = ledger.live_stages
     except ValueError:
         return None
-    faces = 16 * int(n) * int(n) * 3 * int(meta.nk_tot) // ranks
-    return max(0, ledger.room_bytes_per_rank(concurrent_with=live) - faces)
+    ledger.at_phase()
+    future = 0
+    for a in args:
+        if isinstance(a, jax.Array):
+            continue
+        sharding = getattr(a, "sharding", None)
+        shape = (sharding.shard_shape(a.shape) if sharding is not None
+                 else NamedSharding(mesh_xy, P(None, "x", "y")).shard_shape(a.shape))
+        future += int(np.prod(shape)) * np.dtype(a.dtype).itemsize
+    return max(0, ledger.room_bytes_per_rank(concurrent_with=live) - future)
 
 
 #: The solve-bearing programs per (builder, program, call signature, LU decision): never the room.
@@ -138,19 +143,34 @@ class _Decided:
     """
     builder: tuple
     name: str
-    room: object
+    ledger: object = field(compare=False, repr=False)
     lu: object = field(compare=False, repr=False)
+    resolved: dict = field(default_factory=dict, compare=False, repr=False)
 
     def resolve(self, *args):
         """The variant program for this call signature."""
+        if any(isinstance(a, jax.core.Tracer) for a in args):
+            raise TypeError("response Dyson admission is eager: resolve concrete or abstract operands "
+                            "before tracing the resolved checked program")
         x, n = args[1], self.builder[1]
+        if x.ndim != 3 or tuple(x.shape[-2:]) != (n, n) or int(x.shape[0]) <= 0:
+            raise ValueError(f"response Dyson expects a nonempty (batch,{n},{n}) operand; got {x.shape}")
+        if tuple(args[0].shape) != tuple(x.shape):
+            raise ValueError(f"response Dyson root/value batch {args[0].shape} differs from response {x.shape}")
+        mesh, _, backend, route = self.builder[:4]
+        room = _dyson_room(self.ledger, mesh, args)
+        lu = _dyson_plan(mesh, n, backend, route, room)
         face = jax.ShapeDtypeStruct((int(x.shape[0]), n, n), x.dtype)
-        key = (self.builder, self.name, tuple((tuple(a.shape), str(a.dtype)) for a in args),
-               self.lu.decision(face, face))
+        signature = tuple((tuple(a.shape), str(a.dtype)) for a in args)
+        key = (self.builder, self.name, signature, lu.decision(face, face))
         if key not in _VARIANTS:
             builder = _response_programs(*self.builder)
-            _VARIANTS[key] = builder.program_for(self.name, self.lu.batched)
-        return _VARIANTS[key]
+            program = builder.program_for(self.name, lu.batched)
+            program.lu = lu
+            _VARIANTS[key] = program
+        program = _VARIANTS[key]
+        self.resolved[signature] = program
+        return program
 
     def __call__(self, *args):
         return self.resolve(*args)(*args)
@@ -159,7 +179,23 @@ class _Decided:
         return self.resolve(*args).lower(*args)
 
     def finish(self, args, result):
-        return self.resolve(*args).finish(args, result)
+        signature = tuple((tuple(a.shape), str(a.dtype)) for a in args)
+        return self.resolved[signature].finish(args, result)
+
+
+def _dyson_plan(mesh_xy, n, backend, route, room):
+    """The single actual-room LU route and its existing native-workspace guard."""
+    from distrib_la import plan, lu_workspace_bytes
+    lu = plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route, budget_bytes=room)
+    if room is not None and lu.backend != "one_device":
+        face = 16 * int(n) * int(n) // int(mesh_xy.size)
+        need = face + (lu_workspace_bytes(mesh_xy, n, np.complex128) if lu.backend == "cusolvermp"
+                       else min(2_000_000_000, face))
+        if need > room:
+            raise RuntimeError(f"GATE response_dyson_capacity: the Dyson LU n={n} on the {lu.backend} "
+                               f"mesh needs {need / 1e9:.2f} GB/rank beside its operands (factor face "
+                               f"{face / 1e9:.2f} + workspace), over the room {room / 1e9:.2f} GB/rank.")
+    return lu
 
 
 @lru_cache(maxsize=None)
@@ -167,14 +203,14 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     """Reuse compiled algebra across SC maps without retaining state arrays.
 
     Returns the builder: ``slope``, the charge ``moments`` (no solve), and
-    ``bind(room) -> (dyson, moments, lu)`` with the Dyson LU plan ``lu`` at ``room``
-    (:func:`_dyson_room`: on every leg distrib_la takes one_device only where one whole
+    ``bind(ledger) -> (dyson, moments, lu)`` with the configured Dyson LU plan;
+    each actual call resolves its room (:func:`_dyson_room`: distrib_la takes one_device only where one whole
     matrix fits it, else the distributed library).  On the distributed backend the
     programs that hold the solve are :class:`_Decided`, keyed on that plan's decision and
     never on the room that decides it; on ``off`` they solve locally and are built once.
     """
     from types import SimpleNamespace
-    from distrib_la import batch_layout, checked_program, local_batch, lu_workspace_bytes, matmul, plan
+    from distrib_la import batch_layout, checked_program, local_batch, matmul, plan
 
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
     key = (mesh_xy, n, backend, route, pref, ordered, volume)
@@ -273,22 +309,11 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
              if backend == "off" else None)
     names = tuple(bodies(None))
 
-    def bind(room):
-        lu = plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route, budget_bytes=room)
-        # The provider beside the room: one factor face and its getrf/getrs workspace and pivots
-        # (cuSOLVERMp: distrib_la.lu_workspace_bytes, measured panels, nrhs = n, getrs at the
-        # default cap -- no cap is posted at bind; a dispatch books the cap it posts beside this
-        # (_bank_execution); the Dyson bodies solve against I or V; no vendor query), else the getrs workspace cap
-        # (batched_solve_lu_ffi: 2 GB, at most a face); over it, no route fits.
-        if room is not None and lu.backend != "one_device":
-            faces = 16 * int(n) * int(n) // int(mesh_xy.size)
-            need = faces + (lu_workspace_bytes(mesh_xy, n, np.complex128) if lu.backend == "cusolvermp"
-                            else min(2_000_000_000, faces))
-            if need > room:
-                raise RuntimeError(f"GATE response_dyson_capacity: the Dyson LU n={n} on the {lu.backend} "
-                                   f"mesh needs {need / 1e9:.2f} GB/rank beside its operands (factor face "
-                                   f"{faces / 1e9:.2f} + workspace), over the room {room / 1e9:.2f} GB/rank.")
-        progs = local or {name: _Decided(key, name, room, lu) for name in names}
+    def bind(ledger):
+        # Configuration only: the actual operand batch and live room own the
+        # solve route. A charge moment has no LU and must not trip its guard.
+        lu = plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route)
+        progs = local or {name: _Decided(key, name, ledger, lu) for name in names}
         pairs = {k.split(":", 1)[1]: v for k, v in progs.items() if k.startswith("pair:")}
         resident = backend == "off" and volume is None
         dyson = SimpleNamespace(value=progs["value"], pair=pairs.get,
@@ -528,7 +553,47 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
 _STREAM_KERNELS: dict = {}
 
 
-def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key, **options):
+# Placement policy beside the existing program cache; no state arrays are held.
+_STREAM_PROGRAMS: dict = {}
+
+
+def _stream_variant(state, layout):
+    variants = state["variants"]
+    if layout not in variants:
+        variants[layout] = state["build"](layout)
+    return variants[layout]
+
+
+def _resolve_stream_program(state, args, *, ahead=False):
+    """Admit the actual stream before bank dispatch; axis gathers stay inline."""
+    force = state["force"]
+    if ahead:
+        return _program_compiled(_stream_variant(state, force or "axis"), args, ahead=True)
+    from lxkit import memory
+    from common.gpu_utils import device_budget_bytes
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    device_budget_bytes()
+    for layout in ((force,) if force else ("axis", "face")):
+        kernel = _stream_variant(state, layout)
+        executable = _program_compiled(kernel, args)
+        need = -agreed_chunk(-compiled_new_bytes(executable, extra=state["native"]))
+        room = agreed_chunk(int(memory.room()))
+        if layout == "axis" and need > room:
+            if force:
+                raise ValueError("GATE response_axis_room: forced axis stream exceeds compiled room")
+            continue
+        price = memory.priced(0, f"response {layout} summed bands, compiled stream + native scratch",
+                              spread=need*state["mesh"].size, ranks=state["mesh"].size)
+        memory.admit("Response sum-band operands", [(layout, price)], room)
+        if state["last_layout"] != layout:
+            log.info(f"Response summed bands: {layout} layout")
+            state["last_layout"] = layout
+        return kernel
+    raise RuntimeError("Response sum-band layout selection produced no route")
+
+
+def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key,
+                            _native_scratch=0, _force_sum_layout=None, **options):
     """Cache programs, never state arrays; window data remain dynamic inputs.
 
     A map's stream programs are one fixed set (the streamed χ bank's and the
@@ -542,11 +607,20 @@ def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key, **opt
     its reservation.
     """
     from .w_isdf import _get_chi_fractional_contour_kernel_face
-    key = (mesh_xy, kgrid, n_outputs, shape, _ffi_key, tuple(sorted(options.items())))
+    key = (mesh_xy, kgrid, n_outputs, shape, _ffi_key, int(_native_scratch),
+           _force_sum_layout, tuple(sorted(options.items())))
     kernel = _STREAM_KERNELS.get(key)
     if kernel is None:
-        kernel = _STREAM_KERNELS[key] = _get_chi_fractional_contour_kernel_face(
-            mesh_xy, kgrid, n_outputs, shape, **options)
+        def build(layout):
+            return _get_chi_fractional_contour_kernel_face(
+                mesh_xy, kgrid, n_outputs, shape, sum_layout=layout, **options)
+        row_stream = (options.get("vertex") is not None and bool(options.get("vertex"))) or (
+            options.get("pair_mode") == "direct" and options.get("k_unfold_plan") is not None)
+        initial = _force_sum_layout or "axis"
+        kernel = _STREAM_KERNELS[key] = build(initial if row_stream else "axis")
+        if row_stream:
+            _STREAM_PROGRAMS[kernel] = dict(mesh=mesh_xy, build=build, native=int(_native_scratch),
+                force=_force_sum_layout, variants={initial: kernel}, last_layout=None)
         _release_evicted_programs()
     return kernel
 
@@ -557,13 +631,15 @@ def _release_evicted_programs():
     for key in [k for k, kernel in _STREAM_KERNELS.items()
                 if not placed_kconv_tables_live(getattr(kernel, "tail", ()))]:
         dead = _STREAM_KERNELS.pop(key)
-        for entry in [entry for entry in _COMPILED if entry[0] is dead]:
+        state = _STREAM_PROGRAMS.pop(dead, None)
+        programs = tuple(state["variants"].values()) if state else (dead,)
+        for entry in [entry for entry in _COMPILED if entry[0] in programs]:
             del _COMPILED[entry]
 
 
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
                     pair_mode="retarded", bank_carry=False, ordered=False,
-                    vertex=None, band_ranges=None, stream_pass=None):
+                    vertex=None, band_ranges=None, stream_pass=None, _force_sum_layout=None):
     """Bind the existing one-particle Green/FFT primitive to a q batch.
 
     Returns a jitted kernel and its fixed ψ/energy arguments. Caller supplies
@@ -595,6 +671,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
             mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
             (n_input, int(wfns.slices.nb_full), vertex.n, 4),
             _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids), pair_mode=pair_mode,
+            _native_scratch=_stream_scratch(wfns, meta, mesh_xy, vertex),
+            _force_sum_layout=_force_sum_layout,
             bank_carry=bank_carry, ordered=True, vertex=vertex.families,
             band_ranges=band_ranges if pair_mode == "direct" else None,
             **({} if stream_pass is None else dict(stream_pass=int(stream_pass))))
@@ -611,6 +689,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
         k_unfold_plan=parent, _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids),
+        _native_scratch=_stream_scratch(wfns, meta, mesh_xy, None),
+        _force_sum_layout=_force_sum_layout,
         pair_mode=pair_mode, bank_carry=bank_carry, ordered=ordered, band_ranges=band_ranges,
         # One segment program for every pass; the segment index is a runtime argument.
         **({} if stream_pass is None else dict(stream_pass=0)))
@@ -952,7 +1032,13 @@ def _reserve(meta, stage, resident, workspace=0, runs_in=None, book=True):
 
 @lru_cache(maxsize=32)
 def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
-    """Query the dense provider on actual bank shapes, before allocation."""
+    """Query the providers of the actual bank programs, before allocation.
+
+    Coulomb-root admission compiles checked_program.lower: its whole-chain
+    EIGH runs on the complete mesh, including when the reconstruction GEMMs
+    use local batches. Price that solver, not a local EIGH stack that the
+    admitted executable does not run.
+    """
     from distrib_la import plan, workspace_bytes_per_rank
     from .gw_config import linalg_resolution
     resolution = linalg_resolution({"linalg": layout})
@@ -960,7 +1046,9 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
         backend="off" if layout == "local" else "distributed",
         batched_route=resolution.batched_route)
     gemm = workspace_bytes_per_rank(policy,"gemm",((batch,n,n),(batch,n,n)),np.complex128)
-    eig = workspace_bytes_per_rank(policy,"eigh",((batch,n,n),),np.complex128) if with_eigh else 0
+    eig_policy = (plan("eigh", mesh_xy, n=n, backend="distributed", batched_route="auto")
+                  if with_eigh and layout == "local" else policy)
+    eig = workspace_bytes_per_rank(eig_policy,"eigh",((batch,n,n),),np.complex128,checked=True) if with_eigh else 0
     return dict(gemm=gemm,eigh=eig,total=gemm+eig,scope="actual-shape ISERV query; GEMM persistent plus concurrent eigh scratch")
 
 
@@ -980,9 +1068,19 @@ def _compiled(kernel, args, *, ahead=False):
     shapes become known, and the later call with the live arrays finds the
     executable or waits for it.
     """
-    from common.jax_compile_cache import compile_ahead
+    state = _STREAM_PROGRAMS.get(kernel)
+    if state is not None:
+        if ahead:
+            return _resolve_stream_program(state, args, ahead=True)
+        kernel = _resolve_stream_program(state, args)
     if isinstance(kernel, _Decided):
         kernel = kernel.resolve(*args)          # the variant its LU decision names
+    return _program_compiled(kernel, args, ahead=ahead)
+
+
+def _program_compiled(kernel, args, *, ahead=False):
+    """The one executable cache, after any program placement decision."""
+    from common.jax_compile_cache import compile_ahead
     key = (kernel, jax.tree.structure(args), tuple(
         (tuple(x.shape), str(x.dtype), getattr(x, "sharding", None))
         if hasattr(x, "shape") else x for x in jax.tree.leaves(args)))
@@ -998,6 +1096,10 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
         """``runtime_bytes``: what the executable draws at run time outside its
         buffer assignment (mathdx mode 11's split arm), admitted with it."""
         meta.tangential_capacity.at_phase()
+        # Freeze the actual batch's program and LU together. Finish must use
+        # this same checked program after donation, not a post-execution room.
+        if isinstance(kernel, _Decided):
+            kernel = kernel.resolve(*args)
         with timing.section('bank.compile.' + stage, announce=True):
             started = time.monotonic()
             executable = _compiled(kernel, args)
@@ -1023,7 +1125,8 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                                   memory.temp_size_in_bytes + int(runtime_bytes),
                                   runs_in="bank.dispatch." + stage, book=False)
             else:
-                layout = dense_layout(meta, config, mesh_xy, args[0].shape[-1])
+                layout = getattr(kernel, "dense_layout", None) or dense_layout(
+                    meta, config, mesh_xy, args[0].shape[-1])
                 native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
                     with_eigh=stage=="coulomb_sqrt")
                 receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
@@ -1033,7 +1136,9 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 if lu is not None:
                     from distrib_la import lu_workspace_query
                     ledger, n_lu = meta.tangential_capacity, int(args[0].shape[-1])
-                    room = max(0, ledger.room_bytes_per_rank(ledger.live_stages) - memory.argument_size_in_bytes - new)
+                    # at_phase already counted every materialized argument;
+                    # compiled_new_bytes is the additional XLA/dense work.
+                    room = max(0, ledger.room_bytes_per_rank(ledger.live_stages) - new)
                     try:
                         # getrf, its pivots and one block column (cap 0: the native's narrowest
                         # chunk) sit beside the chunks: the cap is what the room leaves past them.
@@ -1044,18 +1149,24 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                     except BaseException:
                         lu.chunk_room(n_lu, n_lu, None)
                         raise
-                _, row = _reserve(meta, stage, memory.argument_size_in_bytes, new,
-                                  runs_in="bank.dispatch." + stage, book=False)
-            receipt["memory"].append(row)
-            allocator.book(allocator.priced(new, f"bank {stage} program (temporaries + outputs - aliases, "
-                "run-time, dense and LU workspace)", increment=True), stage="bank.dispatch." + stage)
-            receipt["compiled"].append(dict(stage=stage,
-                arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
-                temporaries=memory.temp_size_in_bytes,
-                aliases=memory.alias_size_in_bytes,
-                runtime=int(runtime_bytes),
-                inherited_stream=False,
-                stream_temporaries_admitted=stream))
+            try:
+                if not stream:
+                    _, row = _reserve(meta, stage, memory.argument_size_in_bytes, new,
+                                      runs_in="bank.dispatch." + stage, book=False)
+                receipt["memory"].append(row)
+                allocator.book(allocator.priced(new, f"bank {stage} program (temporaries + outputs - aliases, "
+                    "run-time, dense and LU workspace)", increment=True), stage="bank.dispatch." + stage)
+                receipt["compiled"].append(dict(stage=stage,
+                    arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
+                    temporaries=memory.temp_size_in_bytes,
+                    aliases=memory.alias_size_in_bytes,
+                    runtime=int(runtime_bytes),
+                    inherited_stream=False,
+                    stream_temporaries_admitted=stream))
+            except BaseException:
+                if lu is not None:
+                    lu.chunk_room(n_lu, n_lu, None)
+                raise
         with timing.section('bank.dispatch.' + stage, announce=stream,
                             label=f"tangential bank {stage} dispatch"):
             started = time.monotonic()
@@ -1107,7 +1218,45 @@ def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout, room=None):
         hi = matmul(vectors * inverse[:, None, :], vectors, transb="C",
                     mesh=mesh_xy, backend=backend, batched_route=resolution.batched_route)
         return h, hi, jnp.any(lam < -tolerance * scale), jnp.sum(supported, axis=-1)
+    sqrt_v.dense_layout = layout
     return sqrt_v
+
+
+def _select_coulomb_program(proposed, values, *, mesh_xy, n_logical, layout):
+    """Admit the complete root program before running a whole-parent route.
+
+    A single eigensolve fitting does not imply that the stack's two root
+    reconstructions and its native workspace fit. Keep the existing local
+    route when its actual compiled program fits; otherwise price the same
+    algebra through the existing distributed backend.
+    """
+    from dataclasses import replace
+    from lxkit import memory
+    from runtime.aot_memory import compiled_price
+
+    programs = {}
+    ranks, n, batch = int(mesh_xy.size), int(values.shape[-1]), int(values.shape[0])
+
+    def price(candidate):
+        kernel = (proposed if candidate == layout else
+                  _coulomb_algebra(mesh_xy, n, n_logical, candidate))
+        programs[candidate] = kernel
+        executable = _compiled(kernel, (values,))
+        native = response_dense_workspace(mesh_xy, n, batch, candidate, with_eigh=True)
+        source = f"compiled {candidate} Coulomb roots plus native workspace"
+        priced = replace(compiled_price(compiled=executable, extra=native["total"],
+                         ranks=ranks, face=True, source=source, contexts=ranks > 1),
+                         whole=n if candidate == "local" else 0)
+        # Both checked programs include the whole-mesh eigensolver retry.
+        # The shared policy charges its contexts only when the run budget
+        # did not already withhold them for distributed linalg.
+        return priced
+
+    candidates = (layout,) if layout != "local" else ("local", "distributed")
+    chosen = memory.admit("Coulomb root program",
+        [(candidate, lambda candidate=candidate: price(candidate)) for candidate in candidates],
+        memory.room())
+    return programs[chosen]
 
 
 @lru_cache(maxsize=8)
@@ -1119,13 +1268,27 @@ def _coulomb_pack(basis,mesh_xy):
 #: requested q span.  V is the same operator at every SC map (fixed ISDF basis
 #: and q set), so the bank, moments and constructor of every map after the
 #: first reuse the first map's roots instead of re-reading V and re-solving its
-#: eigenproblems.  Keyed by the operator token of the resource
-#: (``tangential_screening._coulomb_resource``), the span and the solve layout;
-#: a new operator drops the old roots.  Held bytes per rank: 32 N_mu_packed^2 per
+#: eigenproblems. Keyed by the resource's operator token, basis (including the
+#: logical extent that fixes the numerical cut), span and mesh. Accepted roots
+#: have the same face contract under either dense execution layout: backend
+#: choice belongs to the program cache, not the accepted-value identity. A new
+#: operator drops the old roots. Held bytes per rank: 32 N_mu_packed^2 per
 #: held q row / P; the bank, moments and constructor rounds share (0, N_q)
 #: (a round slices its rows, one transient round slice), so
 #: 32 N_q N_mu_packed^2 / P in all.
 _COULOMB_ROOTS: dict = {}
+
+
+def release_coulomb_cache():
+    """Release the bare-operator and root holds after their last screening use.
+
+    Ordinary callers keep their arrays; only the cache's references are
+    removed. One-shot GW calls this before Sigma, and QSGW after its final
+    W0 persist, retaining root reuse between its maps.
+    """
+    _COULOMB_ROOTS.clear()
+    _COULOMB_OPERATORS.clear()
+    _OPERATOR_DIGESTS.clear()
 
 
 def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
@@ -1138,9 +1301,15 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
     layout = dense_layout(meta, config, mesh_xy, basis.n_packed)
     token = resource.get("operator")
     key = None if token is None else (token, (int(q_span[0]), int(q_span[1])),
-                                      basis.n_packed, basis.n_logical, layout, mesh_xy)
+                                      basis.n_packed, basis.n_logical, basis, mesh_xy)
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+
+    def usable(roots):
+        return roots is not None and all(not value.is_deleted() and value.sharding == face
+                                         for value in roots[:2])
+
     held = _COULOMB_ROOTS.get(key)
-    if held is not None and not any(x.is_deleted() for x in held[:2]):
+    if usable(held):
         return held
     if key is not None:
         # A constructor round asks for a sub-span of the parents the producer
@@ -1148,7 +1317,7 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
         # second read and eigensolve of the same V.
         for (k_token, (k_lo, k_hi), *k_rest), cover in _COULOMB_ROOTS.items():
             if (k_token == token and tuple(k_rest) == key[2:] and k_lo <= key[1][0]
-                    and key[1][1] <= k_hi and not any(x.is_deleted() for x in cover[:2])):
+                    and key[1][1] <= k_hi and usable(cover)):
                 a, b = key[1][0] - k_lo, key[1][1] - k_lo
                 rows, start = _span_rows(mesh_xy, b - a), _span_cursor(mesh_xy, (k_token, k_lo), a, b)
                 return rows(cover[0], start), rows(cover[1], start), list(cover[2][a:b])
@@ -1284,6 +1453,9 @@ def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
                 offset=(q_span[0], 0, 0), partition_spec=spec)
             v = compiled(canonical)
         del canonical
+    with timing.section("bank.plan.coulomb_roots"):
+        kernel = _select_coulomb_program(kernel, v, mesh_xy=mesh_xy,
+                                         n_logical=basis.n_logical, layout=layout)
     h, hi, negative, ranks = execute(kernel, (v,), "coulomb_sqrt")
     if bool(negative):
         raise ValueError("GATE response_coulomb_psd: resolved negative eigenvalue")
@@ -2314,9 +2486,9 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
 def _group_stream_arguments(rules, group):
     """Shared times and [forward/reverse, value/ds per slot, node] weights.
 
-    Every group has ``rules["slots"]`` member slots, the planned group size: a
-    short last group's empty slots carry zero weights, so every group runs the
-    one executable the planner checked (a ragged last group compiled a third
+    Every group has ``rules["slots"]`` member slots, a common capacity (the
+    bank narrows it to the largest actual group). Empty slots carry zero
+    weights, so every group runs one executable (a ragged last group compiled a third
     stream program at Fe/Ni 20^3).  An empty slot adds exact zeros to its own
     carry rows, which nothing reads; the members' rows are unchanged.
     """
@@ -2829,7 +3001,9 @@ def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, 
     if sharding is None or not hasattr(roots, "shape"):
         return 0, 0
     face = jax.ShapeDtypeStruct((int(nq), int(n), int(n)), jnp.complex128, sharding=sharding)
-    h = jax.ShapeDtypeStruct((int(nq),) + tuple(roots.shape[1:]), roots.dtype, sharding=sharding)
+    if int(roots.shape[0]) != int(nq):
+        raise ValueError(f"Dyson phase roots have {roots.shape[0]} rows, expected {nq}")
+    h = roots
     native = response_dense_workspace(mesh_xy, int(n), int(nq), layout, with_eigh=False)["total"]
     held = 16 * int(nq) * int(n) * int(n) // int(mesh_xy.size)
     if mirrored:
@@ -2839,22 +3013,25 @@ def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, 
         extra_bytes = 0
     phases = []
     pair = dyson.pair("face")
-    stages = (((pair, (jax.ShapeDtypeStruct(held_roots.shape, held_roots.dtype, sharding=held_roots.sharding),
+    stages = (((pair, (held_roots,
                        face, face) + tuple(extra) + ((face,) if extra else ()), extra_bytes),)
               if pair is not None else
               ((dyson.value, (h, face) + tuple(extra), held + extra_bytes),
                (solve_slope, (h, face, face), extra_bytes)))
-    lu = getattr(dyson.value, "lu", None)
-    if lu is not None and lu.backend == "cusolvermp":
-        from distrib_la import lu_workspace_bytes
-        native += lu_workspace_bytes(mesh_xy, int(n), np.complex128)
     for kernel, args, kept in stages:
+        if isinstance(kernel, _Decided):
+            kernel = kernel.resolve(*args)
         executable = _compiled(kernel, args)
         memory = executable.memory_analysis()
         if memory is None:
             raise ValueError("GATE response_capacity: compiled memory unavailable")
+        lu = getattr(kernel, "lu", None)
+        workspace = int(native)
+        if lu is not None and lu.backend == "cusolvermp":
+            from distrib_la import lu_workspace_bytes
+            workspace += lu_workspace_bytes(mesh_xy, int(n), np.complex128)
         phases.append((int(memory.argument_size_in_bytes) + kept,
-                       compiled_new_bytes(executable) + int(native)))
+                       compiled_new_bytes(executable) + workspace))
     return tuple(max(p[i] for p in phases) for i in (0, 1))
 
 
@@ -2916,6 +3093,13 @@ def response_bank_residence(meta, *, segments, n_samples, carry_per_sample, grou
     if total <= receipt["half_host_budget_bytes_per_rank"]:
         return "host", dict(receipt, reason="streamed; fits half the host budget")
     return "file", dict(receipt, reason="streamed; exceeds half the host budget")
+
+
+def _sample_members(members, line_span, committed):
+    """One dense-first consumption order, retaining each raw carry's row index."""
+    p0, p1 = line_span
+    order = sorted(enumerate(members), key=lambda member: p0 <= member[1] < p1)
+    return order, [(row, sample) for row, sample in order if not committed(sample)]
 
 
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
@@ -3174,9 +3358,10 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         receipt["bank_residence"] = dict(residence_receipt, residence=residence)
         rules = response_quadrature(meta, sample_plan, receipt, support,
                                     group_size=group_size, print_fn=print_fn)
+        # Every tier needs only the largest actual group, not the planned cap.
+        # Empty carry rows add zeros and are never read by a sample's solve.
+        rules["slots"] = max(len(g["members"]) for g in rules["groups"])
         if stream_bank is not None:
-            # Slots: the largest rule group's members (empty slots add zeros nobody reads).
-            rules["slots"] = max(len(g["members"]) for g in rules["groups"])
             pass_carry = 2*rules["slots"]*len(response_rows)*16*max(r*c for r, c, _ in segments[0])
             # The first segment's program places the kconv tables the rest share.
             response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=response_rows,
@@ -3354,6 +3539,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             for _ in members:
                 progress.step()
             continue
+        order, fresh = _sample_members(members, (p0, p1), committed)
         ledger.live_stages = ambient
         name, _ = _reserve(meta, "bank_outputs", rules["slots"]*carry_per_sample if stream_bank is None
                            else receipt["bank_residence"]["device_bytes_per_rank"])
@@ -3368,10 +3554,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         else:
             # Each pass's rows of every member go to the bank as they finish;
             # each member's value and slope come back one ahead of its solve.
-            fresh = [(row, sample) for row, sample in enumerate(members) if not committed(sample)]
             integrate_response_group(wfns, meta, mesh_xy, rules, group, q_ids=response_rows,
                 execute=execute, receipt=receipt, ordered=ordered, vertex=vertex, bank=stream_bank,
-                outputs=[(2*row+k, 2*row+k) for row, _ in fresh for k in (0, 1)])
+                outputs=[(2*row+k, 2*row+k) for row in sorted(row for row, _ in fresh) for k in (0, 1)])
             with timing.section('bank.stream_commit'):
                 stream_bank.commit()
             # A sample larger than its q width reads one q span per solve (the
@@ -3392,7 +3577,6 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             # Dense members first, line members (the selection, the bank's largest phase) last;
             # on the devices the last member's rows leave the group carry, which is freed
             # before that member's solves.
-            order = sorted(enumerate(members), key=lambda m: p0 <= m[1] < p1)
             last = ([row for row, sample in order if not committed(sample)] or [None])[-1]
             for row, sample in order:
                 if committed(sample):

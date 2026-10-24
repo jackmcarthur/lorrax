@@ -168,8 +168,56 @@ def serve(*, family: str, target: str, range_value: float,
           error_bound: float, n_max: int, **family_kw) -> Quadrature:
     """Compute the rule this request asks for, here, now.
 
-    Every placement is computed at run time (owner, 2026-09-16).  A
-    ``noncrossing`` solve costs 27-129 ms (median 44) per request.
+    Every rule is solved in this process and cached per process; nothing is
+    stored across runs.  A ``noncrossing`` solve costs 27-129 ms (median 44)
+    per request.
+
+    All quantities are in the family's SCALED, dimensionless units; the
+    caller rescales (``gw.minimax_screening`` owns the Rydberg conversion).
+
+    Parameters
+    ----------
+    family, target
+        One wired row of :data:`FAMILIES` and its target:
+        ``('noncrossing', 'inverse')`` fits ``1/u ~ sum_l w_l exp(-tau_l u)``
+        on ``u in [1, R]``; ``('noncrossing_imag', 'inverse_imag')`` fits
+        ``u/(u^2 + omega_hat^2)`` on ``[1, R]``; ``('crossing', 'hgl' |
+        'fermi')`` fits the regularized sign target ``G(u)`` on
+        ``u in [0, A_dim]`` as a signed sine sum.
+    range_value
+        ``R = x_max / x_min`` for the Laplace families (``x`` a decay rate,
+        e.g. a transition energy ``E_c - E_v``); ``A_dim`` (a bandwidth over
+        the regularization width) for ``crossing``.
+    error_bound
+        Requested sup-norm absolute error on the scaled interval.  For a
+        Laplace family with physical tolerance ``eps`` on ``[x_min, x_max]``
+        pass ``eps * x_min``; the physical error is ``max_error / x_min``.
+    n_max
+        Node cap.  When ``n_max`` nodes cannot reach ``error_bound`` the
+        ``n_max`` rule is returned with its larger ``max_error``: the caller
+        compares (``gw.minimax_screening`` raises ``GATE minimax_node_cap``).
+    eps_q
+        ``crossing`` only: the tail cut of the sine weight, which sets the
+        time support ``sqrt(2 ln(1/eps_q))`` (hgl) or ``ln(1/eps_q)/2``
+        (fermi).  Default ``1e-3``.
+    omega_hat
+        ``noncrossing_imag`` only, required: the probe frequency over
+        ``x_min``.
+
+    Returns
+    -------
+    Quadrature
+        ``nodes`` (tau) and ``weights`` in scaled units, the measured
+        ``max_error`` and amplification ``kappa0``, and its provenance.
+
+    Raises
+    ------
+    UnknownTarget
+        A family/target pair outside the vocabulary, an unknown keyword, or
+        ``noncrossing_imag`` without ``omega_hat``.
+    UncertifiedSolveRefused
+        A declared family with no in-process solver (``complex_laplace``,
+        ``damped_line``).
     """
     _resolve(family, target)                      # refuses an unknown request
     unknown = sorted(set(family_kw) - {"eps_q", "omega_hat"})

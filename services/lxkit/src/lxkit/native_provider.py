@@ -71,7 +71,7 @@ __all__ = [
     "read_checkout_closure", "resolve_closure",
     "assert_one_mapped_mpi_runtime", "check_abi", "checkout_build_dir",
     "describe_library",
-    "borrowed_families", "borrowed_reason", "check_launch_libraries", "families_served_elsewhere", "is_private_redistributable", "refuse_if_borrowed", "TARGET_FAMILIES", "locate_library", "open_and_attest",
+    "check_launch_libraries", "is_private_redistributable", "locate_library", "open_and_attest",
     "refuse_private_library",
 ]
 
@@ -181,8 +181,7 @@ _RUNTIME_OWNED = (
         r"atomic)[.]", re.I),
 )
 _PRIVATE_REDISTRIBUTABLE = re.compile(
-    r"^lib(?:cusolverMp|cublasmp|cal|slate(?:_scalapack_api)?|blaspp|"
-    r"lapackpp|nvshmem(?:_host)?|elpa(?:_openmp)?)[.]", re.I)
+    r"^lib(?:cusolverMp|cublasmp|cal|nvshmem(?:_host)?|elpa(?:_openmp)?)[.]", re.I)
 
 
 def is_private_redistributable(path: str | Path) -> bool:
@@ -215,8 +214,8 @@ def refuse_private_library(path: str | Path,
         raise error_cls(
             f"refusing unclassified private library {candidate.name!r}.  A "
             "sealed bundle may carry only the centrally classified LORRAX "
-            "engine redistributables (cuSolverMp/cuBLASMp/CAL, SLATE/BLAS++/"
-            "LAPACK++, ELPA, or NVSHMEM); process, compiler, site and accelerator "
+            "engine redistributables (cuSolverMp/cuBLASMp/CAL, ELPA, or "
+            "NVSHMEM); process, compiler, site and accelerator "
             "runtime providers remain external.")
 
 
@@ -592,7 +591,7 @@ def _attest_private_mapping(att: BundleAttestation,
 
     ``opened``: the bundle's platforms open in this process (the one being
     opened included).  A leg preloads only its own closure, so the host leg's
-    SLATE is not mapped while only the device leg is open.  Empty: all legs.
+    private providers are not mapped while only the device leg is open.  Empty: all legs.
     """
     mapped = _mapped_paths()
     if not mapped:  # non-Linux diagnostic environment
@@ -625,7 +624,7 @@ def _attest_private_mapping(att: BundleAttestation,
         raise unusable_cls(
             "sealed native bundle has an engine-private provider mapped "
             "outside its manifest: " + ", ".join(unlisted) + ".  A stale "
-            "SLATE/BLAS++/cuSolverMp/cuBLASMp/CAL/NVSHMEM provider can win by "
+            "cuSolverMp/cuBLASMp/CAL/ELPA/NVSHMEM provider can win by "
             "SONAME even when the requested FFI file itself is exact; restart "
             "with only the bundle's declared private closure.")
     for path in mapped:
@@ -707,7 +706,7 @@ _MUST_PIN = re.compile(
     r"^lib(?:mpi|mpich|hdf5|sci_|cusolver|cublas|cufft|cusparse|curand|cudart|"
     r"nvrtc|nvJitLink|nccl|cal[.]|nvshmem|rocsolver|rocblas|hipblas|rccl|"
     r"amdhip64|rocfft|hipfft|rocsparse|hipsparse|hipsolver|hsa-runtime64|"
-    r"amd_comgr|hiprtc|slate|blaspp|lapackpp|openblas|scalapack|fftw3|elpa)", re.I)
+    r"amd_comgr|hiprtc|openblas|scalapack|fftw3|elpa)", re.I)
 
 _COMPILERS = r"(?:gnu|cray|intel|nvidia|nv|aocc|amd|pgi)"
 #: One family per role, whatever the SONAME spelling: two members of a family
@@ -727,20 +726,10 @@ _FAMILY_RULES = (
     # Every OpenBLAS build exports the same BLAS/LAPACK symbols: the threading
     # and integer-width variants (libopenblas_pthreads, _openmp, libopenblasp,
     # libopenblas64_) are one family.  A system libopenblas_pthreads.so.0
-    # beside the SLATE-HIP OpenBLAS is two BLAS.  (numpy's libscipy_openblas64_
+    # beside the ELPA OpenBLAS is two BLAS.  (numpy's libscipy_openblas64_
     # prefixes its symbols and is its own family.)
     (re.compile(r"^libopenblas[a-z0-9_]*[.]so", re.I), "libopenblas"),
 )
-
-#: The engine-private SLATE stack a device leg and the host leg both link.  In
-#: a process with a device leg, ONE build answers these SONAMEs -- the device
-#: leg's, opened first (``ffi.common.ffi_loader._open_accelerator_before_host``:
-#: its ``blas::get_device_count()`` is a compiled-in 0 in the host build).  The
-#: host leg's own record for these families then yields to the device leg's.
-#: No other family may differ between two legs of one process.
-_DEVICE_LEG_WINS = frozenset({"libslate", "libblaspp", "liblapackpp",
-                              "libslate_scalapack_api"})
-
 
 def library_family(soname: str) -> str:
     """The family a SONAME (or file name) belongs to; see :data:`_FAMILY_RULES`."""
@@ -926,9 +915,7 @@ def _merge_expectations(records: Sequence[ClosureRecord],
                         ) -> dict[str, tuple[ClosureEntry, ClosureRecord]]:
     """family -> the one (entry, record) the process must map, in load order.
 
-    Two legs that record different files for one family refuse, except the
-    SLATE stack (:data:`_DEVICE_LEG_WINS`), where a device leg opened first
-    answers for the host leg."""
+    Two legs that record different files for one family refuse."""
     want: dict[str, tuple[ClosureEntry, ClosureRecord]] = {}
     for rec in records:
         for e in rec.entries:
@@ -939,8 +926,6 @@ def _merge_expectations(records: Sequence[ClosureRecord],
             pe, prec = prior
             if _same_path(pe.path, e.path) or pe.sha256 == e.sha256:
                 continue
-            if _yields(e, rec, prec):
-                continue
             raise _gate(
                 unusable_cls,
                 f"{rec.leg.name} records {e.family} as {e.path} but "
@@ -949,11 +934,6 @@ def _merge_expectations(records: Sequence[ClosureRecord],
                 "build both legs against the same library set (one module "
                 "stack, one venv), then reopen")
     return want
-
-
-def _yields(entry: ClosureEntry, rec: ClosureRecord, earlier: ClosureRecord) -> bool:
-    return (entry.family in _DEVICE_LEG_WINS and rec.platform == HOST.key
-            and earlier.platform in LEGS and LEGS[earlier.platform].accelerator)
 
 
 def _same_path(a: Path, b: Path) -> bool:
@@ -1093,9 +1073,6 @@ class _Enforced:
     record: ClosureRecord
     identity: str
     verified: Mapping[str, tuple[Path, str]] = None    # type: ignore[assignment]
-    #: family -> the leg whose recorded file serves it in this process
-    #: (:data:`_DEVICE_LEG_WINS`): this leg's code linked against its own.
-    served_elsewhere: Mapping[str, Path] = None        # type: ignore[assignment]
 
 
 _ENFORCED: dict[Path, _Enforced] = {}          # resolved leg -> enforcement
@@ -1159,73 +1136,8 @@ def _enforce(record: ClosureRecord, unusable_cls: Type[OSError],
     verified = check_closure_mapping(records, mapped, unusable_cls=unusable_cls,
                                      build_hint=build_hint)
     mine = {e.family for e in record.entries}
-    owners = _merge_expectations(records, unusable_cls)
-    # Served elsewhere = another leg's DIFFERENT file answers the family (a
-    # family both legs record as the same bytes, MPI or HDF5, is not borrowed).
-    served = {e.family: owners[e.family][1].leg for e in record.entries
-              if e.family in owners and owners[e.family][1].leg != record.leg
-              and owners[e.family][0].sha256 != e.sha256}
     return _Enforced(record=record, identity=_record_identity(record, verified),
-                     verified={f: v for f, v in verified.items() if f in mine},
-                     served_elsewhere=served)
-
-
-#: Host-leg FFI targets (by name prefix) -> the recorded families their code
-#: links.  Measured on the object files, not assumed: in the host build only
-#: ``slate/host_ffi.cc.o`` (the ``Slate*HostFfi`` handlers) references a
-#: ``slate::``, ``blas::`` or ``lapack::`` symbol (``nm -C -u``); the
-#: ``lrx_slate_*`` context entries (``slate/context.cc``) are MPI only, and the
-#: ScaLAPACK/CBLAS/FFTW/phdf5 handlers use none of these families.
-TARGET_FAMILIES: Mapping[str, tuple[str, ...]] = {
-    "lorrax_slate_": ("libslate", "libblaspp", "liblapackpp"),
-}
-
-
-def families_served_elsewhere(platform: str) -> dict[str, Path]:
-    """family -> the other leg whose recorded file serves it, for ``platform``'s
-    enforced leg (empty when that leg is not open or serves all its own)."""
-    leg = _PLATFORM_LEG.get(platform)
-    enforced = _ENFORCED.get(leg) if leg is not None else None
-    return dict((enforced.served_elsewhere or {}) if enforced is not None else {})
-
-
-def borrowed_families(platform: str, target: str) -> dict[str, Path]:
-    """The families ``target`` (an FFI target or C entry of ``platform``'s leg)
-    links that another leg's file serves in this process: non-empty means the
-    code would run against a library it was not built against."""
-    needs = {f for prefix, fams in TARGET_FAMILIES.items() if target.startswith(prefix)
-             for f in fams}
-    served = families_served_elsewhere(platform)
-    return {f: served[f] for f in sorted(needs) if f in served}
-
-
-def borrowed_reason(platform: str, target: str) -> str:
-    """The refusal for ``target`` when :func:`borrowed_families` is non-empty, else ''."""
-    hit = borrowed_families(platform, target)
-    if not hit:
-        return ""
-    own_leg = _PLATFORM_LEG.get(platform)
-    built = {e.family: e.path for e in _ENFORCED[own_leg].record.entries}
-    owner = next(iter(hit.values()))
-    owner_name = next((p for p, leg in _PLATFORM_LEG.items() if leg == owner), "device")
-    serving = {f: (_ENFORCED[owner].verified or {}).get(f, (owner, ""))[0] for f in hit}
-    stack = "SLATE-CPU" if set(hit) <= _DEVICE_LEG_WINS else "/".join(sorted(hit))
-    who = "host" if platform == HOST.key else platform
-    return (f"GATE native-closure: {who}-leg {target} needs {stack} but the device leg's "
-            f"SLATE serves this process ({owner_name} leg: "
-            + ", ".join(f"{f}={serving[f]}" for f in hit)
-            + "; built against " + ", ".join(f"{f}={built.get(f)}" for f in hit)
-            + f"); want: {target} only where its own leg's {stack} is mapped (a CPU-platform "
-            f"process); fix: run the op on the {owner_name} mesh, or in a CPU-only process")
-
-
-def refuse_if_borrowed(platform: str, target: str, *,
-                       unusable_cls: Type[OSError] = LibraryUnusable) -> None:
-    """Raise when ``target`` would run against a library its leg was not built
-    against (:func:`borrowed_families`).  Never silent, never a fallback."""
-    reason = borrowed_reason(platform, target)
-    if reason:
-        raise unusable_cls(reason)
+                     verified={f: v for f, v in verified.items() if f in mine})
 
 
 def check_launch_libraries(names: Sequence[str], ld_library_path: str, *,
@@ -1352,7 +1264,7 @@ def resolve_closure(leg: str | Path, *, private_dirs: Sequence[str | Path] = (),
         order += [(d, "process") for d in xdirs] + [(d, "pinned") for d in ldirs]
         rpath, runpath = search_dirs(owner)
         # ld.so: an object without DT_RUNPATH also searches the DT_RPATH of the
-        # objects that loaded it (a leg's RPATH serves its SLATE's BLAS++).
+        # objects that loaded it (a leg's RPATH serves its libraries' own dependencies).
         own = runpath if runpath else rpath + inherited
         order += [(d, "rpath") for d in own]
         for d, role in order:

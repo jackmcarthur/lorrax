@@ -1066,7 +1066,7 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
     with the distributed route; callers do not grow a second eigensolver.
 
     Batching asymmetry (only ScaLAPACK has a batched entry; cuSOLVERMp
-    and SLATE do not) is the eigh plan's ``batched_route``, not here — it is
+    and ELPA do not) is the eigh plan's ``batched_route``, not here — it is
     a backend-capability question, not a physics one.
 
     ``pXheevd`` is the permanent CPU distributed eigh; the batched entry

@@ -3,7 +3,7 @@
 # build_elpa_hip.sh -- ELPA (AMD GPU kernels, HIP streams, rocSOLVER, RCCL) for
 # the ROCm leg on OLCF Frontier (MI250X gfx90a), plus the netlib ScaLAPACK it
 # needs, both against the leg's ONE host BLAS: the sequential locking OpenBLAS
-# of build_openblas_seq.sh (the SLATE-HIP closure's libopenblas.so.0).
+# of build_openblas_seq.sh (the leg's libopenblas.so.0).
 #
 #   config/frontier/build_elpa_hip.sh            # build (or verify) the prefix
 #   config/frontier/build_elpa_hip.sh --print-prefix
@@ -17,7 +17,7 @@
 # is a new prefix -- nothing is ever rebuilt in place.  The build runs in
 # $ROOT/.stage-$KEY and is renamed into place only after every check passes.
 #
-# ONE ROCm RUNTIME, ONE MPI, ONE BLAS PER PROCESS (as build_slate_hip.sh):
+# ONE ROCm RUNTIME, ONE MPI, ONE BLAS PER PROCESS:
 #   - module rocm/7.14.1 == the pip rocm-sdk 7.14.1 wheels JAX maps; ELPA's
 #     NEEDED librocblas.so.5 / librocsolver.so.0 / libamdhip64.so.7 /
 #     librccl.so.1 bind to the objects JAX already loaded (by SONAME).
@@ -55,7 +55,7 @@ OPENMP="${LORRAX_ELPA_OPENMP:-1}"            # host stages (band->tridi) threade
 # ELPA 2026.02 refuses --enable-gpu-ccl=rccl together with --enable-openmp: one or the other.
 if [[ $OPENMP == 1 ]]; then CCL_OPT="--disable-gpu-ccl"; CCL_LIB=""; else CCL_OPT="--enable-gpu-ccl=rccl"; CCL_LIB="-lrccl"; fi
 VENV="${LORRAX_OLCF_VENV:-$HOME/envs/lx-jax091-rocm7141}"
-BLAS_DIR="${LORRAX_SLATE_HOST_BLAS_DIR:-$HOME/software/slate_builds/openblas/install}"
+BLAS_DIR="${LORRAX_ROCM_BLAS_DIR:-$HOME/software/openblas_seq/install}"
 BLAS_LIB="$BLAS_DIR/lib/libopenblas.so"
 
 if ! type module >/dev/null 2>&1; then
@@ -135,7 +135,7 @@ tar -C "$STAGE" -xzf "$SRC/elpa-$ELPA_VERSION.tar.gz"
 # (src/GPU/ROCm/rocmFunctions_template.h, one TU).  The patch adds an exported
 #   void lorrax_elpa_set_device_allocator(alloc, free, ctx)
 # and routes both wrappers through it when set, so the ROCm leg serves ELPA from
-# the FFI workspace (an XLA buffer, inside the arena) -- the SLATE pool_seed.h
+# the FFI workspace (an XLA buffer, inside the arena) -- the pool-seed
 # idea.  Unset (NULL) = stock ELPA.  The free callback must keep hipFree's
 # implicit device synchronization (ELPA relies on it before reuse).
 "$VENV/bin/python" - "$STAGE/elpa-$ELPA_VERSION/src/GPU/ROCm/rocmFunctions_template.h" <<'PY'

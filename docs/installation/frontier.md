@@ -86,9 +86,11 @@ The scripts select the pinned compiler/MPI/HDF5 stack themselves and use
 | Native leg | File | Provides |
 |---|---|---|
 | host | `src/ffi/cpp/build_host/liblorrax_ffi_host.so` | Host MPI/HDF5 operations, CPU linear algebra and FFTW |
-| ROCm | `src/ffi/cpp/build_rocm/liblorrax_ffi_rocm.so` | GPU operations through HIP, rocBLAS/rocSOLVER, SLATE/ELPA and the ROCm FFT kernels |
+| ROCm | `src/ffi/cpp/build_rocm/liblorrax_ffi_rocm.so` | GPU operations through HIP, rocBLAS/rocSOLVER, ELPA and the ROCm FFT kernels |
 
-A GPU process loads both. Each build also writes the library's
+A GPU process loads both. The current native contract is ABI 11; rebuild
+both legs after the SLATE-to-mesh-context change, rather than reusing an
+ABI-10 pair. Each build also writes the library's
 `<leg>.closure.json` and `PROVENANCE` records.
 
 ### First installation of the shared dependencies
@@ -98,21 +100,17 @@ before the two commands above:
 
 ```bash
 bash config/frontier/build_openblas_seq.sh
-bash config/frontier/build_slate_hip.sh
-bash config/frontier/build_slate_cpu.sh
 ```
 
 | Shared dependency | Default prefix |
 |---|---|
-| Sequential, locking OpenBLAS | `$HOME/software/slate_builds/openblas/install` |
-| SLATE with `gpu_backend=hip` | `$HOME/software/slate_builds/hip/install` |
-| SLATE with `gpu_backend=none` | `$HOME/software/slate_builds/cpu/install` |
+| Sequential, locking OpenBLAS | `$HOME/software/openblas_seq/install` |
 | ELPA | A content-keyed prefix under `$HOME/software/elpa_builds` |
 
 `build_ffi_rocm.sh` builds ELPA if its matching completed prefix is absent;
 otherwise it verifies and reuses that prefix. These dependency installs are
 shared across checkouts. A new Python-only checkout does not require new
-SLATE, OpenBLAS or ELPA builds. Do not use `--fresh` or remove those caches
+OpenBLAS or ELPA builds. Do not use `--fresh` or remove those caches
 merely to rebuild the two LORRAX libraries.
 
 The site pins are in `config/frontier/ffi_mpi.sh` and the build scripts:
@@ -129,7 +127,7 @@ The site pins are in `config/frontier/ffi_mpi.sh` and the build scripts:
 The ROCm module is used for compilation. At runtime, the JAX plugin and
 native device leg use the **same wheel copies** of HIP, rocBLAS, rocSOLVER,
 RCCL and rocFFT. The host leg uses the pinned MPI/HDF5/LibSci stack; the
-device leg uses that same MPI/HDF5 with its HIP SLATE/OpenBLAS/ELPA stack.
+device leg uses that same MPI/HDF5 with its OpenBLAS/ELPA stack.
 
 ## 3. Run {#run}
 

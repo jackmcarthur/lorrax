@@ -399,8 +399,8 @@ decisive on memory, and it is gated against XLA on the same device
 | operation | CUDA | CPU | ROCm and others |
 |---|---|---|---|
 | eigh, whole matrices (route (c), `linalg = local`) | `jnp.linalg.eigh` (cuSolverDn) | `jnp.linalg.eigh` (LAPACK) | `jnp.linalg.eigh` |
-| eigh, capacity route | cuSOLVERMp `syevd` | ScaLAPACK `pzheevd` | none: no ROCm library is built; `linalg = local` runs route (c) and refuses (`GATE eigh_capacity_route`) only at a stack that needs the whole mesh; `linalg = distributed` refuses at plan time |
-| LU solve, `linalg = distributed` | cuSOLVERMp batched `getrf`/`getrs` | ScaLAPACK `pXgetrf`/`pXgetrs` | ROCm: SLATE `getrf` (PartialPiv, `Target::Devices`) + `getrs`; others refuse |
+| eigh, capacity route | cuSOLVERMp `syevd` | ScaLAPACK `pzheevd` | ROCm: ELPA (`elpa`); others: none: `linalg = local` runs route (c) and refuses (`GATE eigh_capacity_route`) only at a stack that needs the whole mesh; `linalg = distributed` refuses at plan time |
+| LU solve, `linalg = distributed` | cuSOLVERMp batched `getrf`/`getrs` | ScaLAPACK `pXgetrf`/`pXgetrs` | ROCm: `one_device` within the caller's room, refused beyond it (no distributed LU library); others refuse |
 | LU solve, `linalg = local` | `jax.scipy.linalg` LU per q | same | same |
 | distributed GEMM | `panel_matmul` (XLA; local GEMMs on cuBLAS) | `panel_matmul` (XLA) | `panel_matmul` (XLA) |
 | inverse root | Newton–Schulz on `panel_matmul` | same | same |

@@ -157,7 +157,29 @@ def _gvec_fft_box_helpers():
 
 
 class ZetaLoader:
-    """Reader for ``zeta_q.h5`` produced by ``isdf_fitting.fit_zeta_to_h5``."""
+    """Reader for ``zeta_q.h5`` produced by ``isdf_fitting.fit_zeta_to_h5``.
+
+    Parameters
+    ----------
+    path
+        ``zeta_q.h5`` or a bispinor sibling ``zeta_q_mu{1,2,3}.h5``.
+    mesh
+        2-D ``('x', 'y')`` mesh for the collective reads.  ``None`` opens the
+        file header-only: header attributes, :meth:`gvecs`,
+        :meth:`ngk_valid` and :meth:`read_zeta_G_local` work; :meth:`load`,
+        :meth:`read_zeta_G_slab` and :attr:`slab_io` raise ``RuntimeError``.
+    mode
+        h5 open mode for the collective handle (``'r'``).
+
+    Raises ``ValueError`` at open when ``isdf_header/zeta_is_done`` is false
+    (``LORRAX_ALLOW_PARTIAL_ZETA=1`` overrides), when the ζ dataset holds
+    fewer μ rows than the header's ``n_rmu``, or when the header ``ngkmax``
+    disagrees with the dataset's G axis.
+
+    Derived attributes: ``n_q_on_disk``, ``n_q_full = prod(kgrid)``,
+    ``q_layout`` (``'ibz'`` or ``'full_bz'``), ``n_rmu_disk`` (padded μ
+    extent), ``n_G_sph_disk`` (``ngkmax``), ``n_rtot`` (``prod(fft_grid)``).
+    """
 
     # ------------------------------------------------------------------
     # Lifecycle

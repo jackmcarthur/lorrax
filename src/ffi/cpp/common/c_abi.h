@@ -1,13 +1,13 @@
 // c_abi.h — THE naming rule for the ctypes lifecycle entry points.
 //
-// WHY THIS FILE EXISTS.  `cpp/phdf5/api.cc` and `cpp/slate/context.cc` are
+// WHY THIS FILE EXISTS.  `cpp/phdf5/api.cc` and `cpp/mesh/context.cc` are
 // CUDA-free and therefore compile into BOTH platform libraries.  Before
 // 2026-08-08 they exported the SAME NINE `extern "C"` names out of both:
 //
 //     lrx_phdf5_open  lrx_phdf5_close  lrx_phdf5_init_mpi
 //     lrx_phdf5_ensure_dataset  lrx_phdf5_open_dataset_ro
-//     lrx_slate_context_create  lrx_slate_subrow_context_create
-//     lrx_slate_context_destroy lrx_slate_init_mpi
+//     lrx_mesh_context_create   lrx_mesh_context_destroy
+//     lrx_mesh_init_mpi
 //
 // Both libraries are dlopened RTLD_GLOBAL, which publishes every one of those
 // names into ONE process-global namespace with two definitions behind it.
@@ -20,7 +20,7 @@
 // THE RULE.  A symbol that leaves an FFI library carries the LEG in its name.
 // The handler surface already did — `PhdfReadFfi` on CUDA,
 // `PhdfReadHostFfi` on host (`phdf5/platform_seam.h`'s LRX_PHDF_HANDLER, and
-// `slate/host_ffi.cc`'s `*HostFfi`).  This macro extends the same rule to the
+// the host handlers' `*HostFfi`).  This macro extends the same rule to the
 // ctypes surface, which is the only other thing either library exports:
 //
 //     CUDA leg   lrx_phdf5_open          (unchanged — it was never ambiguous)

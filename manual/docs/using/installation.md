@@ -39,13 +39,12 @@ The GPU linear algebra comes from these libraries:
 |---|---|---|
 | cuSOLVERMp ≥ 0.7 and cuBLASMp | required, part of the CUDA leg | The default distributed eigensolver and LU on a multi-GPU mesh. cuSOLVERMp 0.6.x returns wrong LU results on a 2-D process grid |
 | cuSOLVER, through jaxlib | installed with the CUDA extra | The single-device eigensolver and LU, used when one matrix fits on one GPU |
-| SLATE (CUDA build) | optional | Selectable alternative for the distributed Cholesky and eigensolver; never the default |
 
 **AMD GPUs on Frontier**
 
 Use the validated JAX 0.9.1 ROCm environment and the native ROCm/host pair,
 not a CUDA extra. The ROCm leg uses the same HIP, rocBLAS, rocSOLVER, RCCL
-and rocFFT libraries as the JAX plugin; SLATE-HIP and ELPA supply the
+and rocFFT libraries as the JAX plugin; ELPA supply the
 distributed operations. The [Frontier route](#frontier) selects the
 environment and explains the separate native builds.
 
@@ -66,7 +65,7 @@ The distributed eigensolver and LU on CPU are ScaLAPACK, together with BLACS and
 | netlib ScaLAPACK with OpenBLAS or BLIS | generic Linux clusters |
 | AMD AOCL | AMD CPU systems |
 
-SLATE built with `gpu_backend=none` is optional on CPU. It provides a Cholesky factorization; its CPU eigensolver crashes, so LORRAX never selects it there.
+The Cholesky factorization is LORRAX's own, on CPU and GPU alike.
 
 The service packages under `services/` (`distrib_la`, `lxkit`, `minimax`, `symmetry_maps`, `vcoul`, `wfn_loader`, `zeta_loader`) are uv workspace members and install with the project.
 
@@ -74,9 +73,9 @@ The service packages under `services/` (`distrib_la`, `lxkit`, `minimax`, `symme
 
 | Leg | File | Contains |
 |---|---|---|
-| host | `liblorrax_ffi_host.so` | ScaLAPACK, SLATE, a CBLAS GEMM, the FFTW3-ABI FFT, parallel HDF5. CUDA-free. |
+| host | `liblorrax_ffi_host.so` | ScaLAPACK, a CBLAS GEMM, the FFTW3-ABI FFT, parallel HDF5. CUDA-free. |
 | CUDA | `liblorrax_ffi.so` | cuSOLVERMp, cuBLASMp, cuBLAS, cuSOLVER, cuFFT, NCCL, the NVRTC-built mathdx k-convolution kernels, parallel HDF5 |
-| ROCm | `liblorrax_ffi_rocm.so` | HIP, rocBLAS/rocSOLVER, SLATE/ELPA, ROCm FFT kernels and parallel HDF5 |
+| ROCm | `liblorrax_ffi_rocm.so` | HIP, rocBLAS/rocSOLVER, ELPA, ROCm FFT kernels and parallel HDF5 |
 
 A CPU run loads the host leg; a GPU run loads the host and its matching
 device leg into one process. A missing required leg refuses at startup.
@@ -112,14 +111,12 @@ Build both legs once per clone, on a compute node, with no GPU requested:
 
 ```bash
 srun --jobid=$JOBID -N 1 -n 1 -c 64 --gres=none bash -c '
-  bash src/ffi/cpp/stage/slate_build_perlmutter.sh cpu &&
   bash config/perlmutter/build_ffi_host.sh &&
   bash config/perlmutter/build_ffi_cuda.sh'
 ```
 
 | Step | Builds |
 |---|---|
-| `slate_build_perlmutter.sh cpu` | SLATE with `gpu_backend=none` into `.build/slate` |
 | `build_ffi_host.sh` | `src/ffi/cpp/build_host/liblorrax_ffi_host.so` |
 | `build_ffi_cuda.sh` | stages cuSOLVERMp and cuBLASMp, then `src/ffi/cpp/build/liblorrax_ffi.so` |
 
@@ -178,10 +175,10 @@ bash config/frontier/build_ffi_host.sh
 bash config/frontier/build_ffi_rocm.sh
 ```
 
-On a first installation, run `build_openblas_seq.sh`, `build_slate_hip.sh`
-and `build_slate_cpu.sh` from `config/frontier/` before those commands.
-Their installs under `$HOME/software/slate_builds` are shared across
-checkouts. The ROCm builder creates or verifies its content-keyed ELPA
+On a first installation, run `bash config/frontier/build_openblas_seq.sh`
+before those commands. Its install under `$HOME/software/openblas_seq/install`
+and the content-keyed ELPA installs under `$HOME/software/elpa_builds` are
+shared across checkouts; the ROCm builder creates a missing matching ELPA prefix. The ROCm builder creates or verifies its content-keyed ELPA
 prefix under `$HOME/software/elpa_builds`. Rebuilding LORRAX does not
 require deleting or rebuilding these dependencies.
 
@@ -232,14 +229,14 @@ Frontera runs the host leg only: its RTX 5000 GPUs (sm_75) are below the CUDA le
 
 | Artifact | Script | Runs on |
 |---|---|---|
-| host leg | `config/frontera/build_ffi_host.sh` | login node |
+| host leg | `LORRAX_HOST_SCALAPACK=1 config/frontera/build_ffi_host.sh` | login node |
 | MPIwrapper | `config/frontera/build_mpiwrapper.sh --fresh` | login node |
 | mpi4py + parallel h5py overlay | `config/frontera/build_mpi_overlay.sh fetch`, then `build` | login node, then compute node in the image |
 | staged PMI2 library | `config/frontera/stage_host_pmi.sh` | login node |
 | node-local runtime bundle | `config/frontera/build_cpu_runtime_bundle.sh` | inside the image |
 | launch | `config/frontera/templates/gw_dev.sbatch` | batch job |
 
-The image, the venv `$WORK/lorrax_env/.venv` and the SLATE host install under `$WORK/slate_builds/cpu/install` are not rebuilt by any script in the repository. The launch template refuses when `LORRAX_ROOT` or `LORRAX_RUN_DIR` is unset; edit its `#SBATCH` block (account, nodes, time) before submitting.
+The image and the venv `$WORK/lorrax_env/.venv` are not rebuilt by any script in the repository. The launch template refuses when `LORRAX_ROOT` or `LORRAX_RUN_DIR` is unset; edit its `#SBATCH` block (account, nodes, time) before submitting.
 
 ### Other sites {: #other }
 
@@ -253,7 +250,7 @@ cmake --build build_cuda -j
 scripts/verify_ffi_build.sh --leg cuda build_cuda/liblorrax_ffi.so
 ```
 
-The host leg is the same command with `-DLORRAX_FFI_PLATFORM=host` and `-DLORRAX_SLATE_HOST_INSTALL_DIR=<gpu_backend=none prefix>`, or `bash src/ffi/cpp/build_host.sh`. A library outside the in-tree build directories is selected with [`LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO`](environment.md#ffi). `config/cloud/` builds both legs from wheels on a machine with only an NVIDIA driver ≥ 580.
+The host leg is the same command with `-DLORRAX_FFI_PLATFORM=host`, or `bash src/ffi/cpp/build_host.sh`. A library outside the in-tree build directories is selected with [`LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO`](environment.md#ffi). `config/cloud/` builds both legs from wheels on a machine with only an NVIDIA driver ≥ 580.
 
 ## Checking an installation {: #check }
 

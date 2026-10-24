@@ -49,10 +49,10 @@ _rocm_so="${LORRAX_FFI_ROCM_SO:-$LORRAX_ROOT/src/ffi/cpp/build_rocm/liblorrax_ff
 # pairs. The explicit shared SOVERSION above still gates both legs here.
 srun -N1 -n1 -c7 --threads-per-core=1 --cpu-bind=cores --exclusive \
     env -u LORRAX_FFI_EXPECT_PEER_SO JAX_PLATFORMS=cpu \
-    LORRAX_FFI_EXPECT_BACKENDS=scalapack,gemm,slate,phdf5,fft \
+    LORRAX_FFI_EXPECT_BACKENDS=scalapack,gemm,phdf5,fft \
     bash "$LORRAX_ROOT/scripts/verify_ffi_build.sh" --leg host "$LORRAX_FFI_HOST_SO"
 srun -N1 -n1 -c7 --threads-per-core=1 --cpu-bind=cores --exclusive \
-    env -u LORRAX_FFI_EXPECT_PEER_SO LORRAX_FFI_EXPECT_BACKENDS=phdf5,slate,kdft \
+    env -u LORRAX_FFI_EXPECT_PEER_SO LORRAX_FFI_EXPECT_BACKENDS=phdf5,elpa,kdft \
     bash "$LORRAX_ROOT/scripts/verify_ffi_build.sh" --leg rocm "$_rocm_so"
 # The GPU request supplies Slurm's per_task binding, one GCD per rank.
 srun -N1 -n4 -c7 --threads-per-core=1 --cpu-bind=cores --exclusive \

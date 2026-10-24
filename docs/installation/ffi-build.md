@@ -1,7 +1,7 @@
 # Building the FFI libraries
 
 LORRAX reaches every vendor library (cuSOLVERMp, cuBLASMp, cuFFT, ScaLAPACK,
-SLATE, FFTW, parallel HDF5) through two shared objects built from the one C++
+FFTW, parallel HDF5) through two shared objects built from the one C++
 tree `src/ffi/cpp/`. This page is for whoever builds them: what each needs,
 how to build and verify a pair on Perlmutter, Frontera or a new site, how a
 pair is sealed for other users, how a run selects one, and the ABI rule that
@@ -13,14 +13,14 @@ design of the layer (its targets, kernels and failure modes) is
 
 | leg | file | contains |
 |---|---|---|
-| host | `liblorrax_ffi_host.so` | ScaLAPACK, SLATE (`gpu_backend=none`), a CBLAS GEMM, an FFT through the FFTW3 ABI bound at run time, parallel HDF5. CUDA-free. |
-| CUDA | `liblorrax_ffi.so` | cuSOLVERMp, cuBLASMp, cuBLAS, cuSOLVER, cuFFT, NCCL, the NVRTC-built mathdx k-convolution and Fourier-plan kernels, the small nvcc kernels, parallel HDF5. SLATE CUDA handlers only when built against a `gpu_backend=cuda` SLATE. |
+| host | `liblorrax_ffi_host.so` | ScaLAPACK, a CBLAS GEMM, an FFT through the FFTW3 ABI bound at run time, parallel HDF5. CUDA-free. |
+| CUDA | `liblorrax_ffi.so` | cuSOLVERMp, cuBLASMp, cuBLAS, cuSOLVER, cuFFT, NCCL, the NVRTC-built mathdx k-convolution and Fourier-plan kernels, the small nvcc kernels, parallel HDF5. |
 
 Every target and its source file is in the
 [kernel catalog](../architecture/ffi_layout.md#kernel-catalog).
 
 A GPU run loads both legs into one process with `dlopen(RTLD_GLOBAL)`. A leg
-can therefore be correct alone and still unusable beside its partner. Three
+can therefore be correct alone and still unusable beside its partner. Two
 consequences shape every build:
 
 1. **One MPI.** Both legs must link the same `libmpi`. Two MPIs in one
@@ -28,9 +28,6 @@ consequences shape every build:
    hangs in `MPI_Init` or a collective.
 2. **One HDF5.** The host leg must link the HDF5 SOVERSION that the run
    environment maps, so that both legs call one HDF5 library (GATE 7).
-3. **Shared SONAMEs.** A CUDA-built and a host-built SLATE or BLAS++ have the
-   same SONAMEs (`libslate.so.2`, `libblaspp.so.2`); whichever loads first
-   serves both legs.
 
 The main hazard of a build is a library that links, loads and registers
 every target while delivering less than was asked for: a missing backend, a
@@ -50,7 +47,6 @@ None of these are declared in `pyproject.toml` except `nvidia-mathdx`.
 | cuBLASMp | the version staged with cuSOLVERMp | CUDA |
 | parallel HDF5 | 1.12, built with `HDF5_IS_PARALLEL` | both |
 | MPI | the site MPI, named explicitly | both |
-| SLATE, BLAS++, LAPACK++ | a `gpu_backend=none` install for the host leg | host |
 | BLAS + ScaLAPACK | any one flavour (LibSci, MKL, OpenBLAS + netlib ScaLAPACK) | host |
 | FFTW3 ABI | found at run time, never linked | host |
 | nvidia-mathdx | 25.6.0, the wheel in the venv; not a build dependency | CUDA (run time) |
@@ -71,20 +67,6 @@ None of these are declared in `pyproject.toml` except `nvidia-mathdx`.
   `src/ffi/cpp/stage/phdf5_stage_cray.sh`; on OpenMPI sites use
   `phdf5_stage_openmpi.sh`, an MPI build from conda-forge
   (`hdf5=*=mpi_openmpi_*`) or spack (`hdf5+mpi`).
-- **SLATE, BLAS++, LAPACK++.** Build SLATE from source; BLAS++ and LAPACK++
-  install under the same prefix. On a Cray PE,
-  `src/ffi/cpp/stage/slate_build_perlmutter.sh cpu|gpu` builds either
-  reproducibly. Elsewhere:
-
-  ```bash
-  git clone --recurse-submodules https://github.com/icl-utk-edu/slate
-  cmake -S slate -B slate/build -Dgpu_backend=none -Dblas=openblas \
-      -DCMAKE_INSTALL_PREFIX=$HOME/software/slate_builds/cpu/install
-  cmake --build slate/build -j && cmake --install slate/build
-  ```
-
-  The host leg needs `gpu_backend=none`: a CUDA BLAS++ in the host leg makes
-  `get_device_count()` disagree between the legs.
 - **FFTW.** The host leg resolves its FFT engine at first use through the
   FFTW3 ABI ([which engine binds](../architecture/ffi_layout.md#3c-which-fft-engine-the-host-library-binds)).
   The FFTW prefix may reach CMake only as a `dlopen` hint, never as a
@@ -98,7 +80,7 @@ None of these are declared in `pyproject.toml` except `nvidia-mathdx`.
 
 | site | leg | entry |
 |---|---|---|
-| Perlmutter | host | `config/perlmutter/build_ffi_host.sh` (needs `slate_build_perlmutter.sh cpu` first) |
+| Perlmutter | host | `config/perlmutter/build_ffi_host.sh` |
 | Perlmutter | CUDA | `config/perlmutter/build_ffi_cuda.sh` |
 | Perlmutter module | both | `config/perlmutter/module/build.sh`, which runs the two scripts above and seals ([publishing a module](perlmutter.md#publish)) |
 | Frontera | host | `config/frontera/build_ffi_host.sh` |
@@ -128,10 +110,8 @@ cmake --build build_cuda -j
 scripts/verify_ffi_build.sh --leg cuda build_cuda/liblorrax_ffi.so
 ```
 
-The host leg is the same command with `-DLORRAX_FFI_PLATFORM=host`,
-`-DLORRAX_SLATE_HOST_INSTALL_DIR=<gpu_backend=none prefix>` and no CUDA
-options. Add `-DLORRAX_SLATE_INSTALL_DIR=<gpu_backend=cuda prefix>` to give
-the CUDA leg SLATE handlers. The CUDA leg reads the XLA FFI headers from
+The host leg is the same command with `-DLORRAX_FFI_PLATFORM=host` and no
+CUDA options. The CUDA leg reads the XLA FFI headers from
 `jax.ffi.include_dir()` of the `python3` on `PATH`; the host leg takes
 `-DLORRAX_XLA_FFI_INCLUDE_DIR` or probes the same way.
 
@@ -155,7 +135,7 @@ the CUDA leg SLATE handlers. The CUDA leg reads the XLA FFI headers from
 
 `config/perlmutter/ffi_mpi.sh` pins the one MPI both legs link:
 `cray-mpich/9.0.1` (`libmpi_gnu_123.so.12`, the MPI the parallel-HDF5 stage
-and the SLATE host install also need) and the LibSci that links it,
+also needs) and the LibSci that links it,
 `cray-libsci/25.09.0`, with darshan unloaded. To move to another MPI, change
 that file only.
 
@@ -164,15 +144,13 @@ that file only.
   cray-fftw prefixes and unloads those modules (with `craype-accel-nvidia80`
   and `cudatoolkit`) before CMake runs, so the compiler wrapper cannot inject
   a second BLAS or link FFTW. It passes the LibSci ScaLAPACK link line
-  explicitly (CMake's probe expects an MKL layout) with the `_mp` threading
-  flavour that matches the SLATE install.
+  explicitly (CMake's probe expects an MKL layout) with the measured `_mp`
+  threading flavour (`LORRAX_PM_LIBSCI_FLAVOUR`).
 - **CUDA leg.** `build_ffi_cuda.sh` builds against `cudatoolkit/13.2` and the
   clone's `uv sync --extra cuda13` venv, with plain GCC rather than the Cray
   `cc` wrapper (with `craype-accel-nvidia80` loaded the wrapper injects the
   CUDA-12 `libmpi_gtl_cuda`). It stages cuSOLVERMp 0.9.1 and cuBLASMp 0.10
   from their wheels under `LORRAX_BUILD_PREFIX` (default `<clone>/.build`).
-  It builds no SLATE, so `slate` on a CUDA mesh refuses when `distrib_la`
-  resolves it.
 - **Library search path.** Each leg's only search path is `$ORIGIN`, a
   `DT_RUNPATH`, so the run environment decides every machine library.
   `/opt/cray/pe/lib64` maps `libhdf5_parallel_gnu.so.310`, the LibSci
@@ -193,14 +171,13 @@ that file only.
 ### Frontera
 
 ```bash
-LORRAX_ROOT=$PWD \
-LORRAX_SLATE_HOST_INSTALL_DIR=$WORK/slate_builds/cpu/install \
+LORRAX_ROOT=$PWD LORRAX_HOST_SCALAPACK=1 \
   config/frontera/build_ffi_host.sh --fresh
 ```
 
 MKL supplies ScaLAPACK, CBLAS and the FFT. `libmkl_blacs_intelmpi_lp64` must
 match the MPI: the wrong BLACS links and fails only inside the first
-`blacs_gridinit`. Without `LORRAX_SLATE_HOST_INSTALL_DIR` the recipe builds a
+`blacs_gridinit`. Without `LORRAX_HOST_SCALAPACK=1` the recipe builds a
 library with parallel HDF5 only and declares that reduced set to the
 verifier.
 
@@ -253,7 +230,7 @@ leg (`src/ffi/cpp/stage/write_checkout_closure.py`): the leg's SHA-256 and every
 library of its `DT_NEEDED` closure, transitively, with path, size, mtime,
 SHA-256, `DT_SONAME` and family. Each name resolves from the first of:
 
-1. the engine-private stage (cuSOLVERMp/cuBLASMp, SLATE/BLAS++/LAPACK++);
+1. the engine-private stage (cuSOLVERMp/cuBLASMp; ELPA on ROCm);
 2. the directories the venv's JAX plugin loads its GPU libraries from (its
    RPATH/RUNPATH: the CUDA wheels, or the ROCm SDK wheels). JAX maps those
    before any leg opens, so the leg must bind the same copy;
@@ -289,29 +266,11 @@ LibSci-MPI and HDF5 across their compiler and threading variants; any other
 library is its SONAME up to `.so`. h5py's auditwheel `libhdf5-<hash>.so`, a
 private SONAME that no leg can bind, is therefore not a second HDF5.
 
-One process maps one file per family across its legs. The one exception is
-the SLATE stack (SLATE, BLAS++, LAPACK++): in a process with a device leg, the
-device leg opens first and its build answers those SONAMEs for the host leg
-too ([load order](#loader)), so the host leg's record yields for those three
-families. Any other disagreement between the legs' records refuses. "First"
-is the order the legs' `dlopen`s succeeded, recorded at that moment in one
-registry that every loader (`ffi.common.ffi_loader`, `distrib_la.loader`)
-shares, not the order their checks finished.
-
-A yielded family means the host leg's SLATE code would run against the device
-leg's SLATE (on Frontier, SLATE-HIP with OpenBLAS). It must not run. In a
-device process neither loader registers the host leg's SLATE handlers
-(`lorrax_slate_eigh`, `_potrf`, `_batched_potrf`, `_batched_trsm`), both
-`probe_target`s report the refusal, and `distrib_la`'s SLATE call sites raise
-it by name:
-`GATE native-closure: host-leg <target> needs SLATE-CPU but the device leg's SLATE serves this process (…)`.
-The host leg's other handlers (ScaLAPACK, CBLAS, FFTW, phdf5) and its
-`lrx_slate_*` context entries link none of these libraries (`nm -C -u` on the
-host build: only `slate/host_ffi.cc` references `slate::`, `blas::` or
-`lapack::`), so they run (`native_provider.TARGET_FAMILIES`). Run a SLATE op on
-the device mesh, or in a CPU-only process, where the host leg's SLATE is its
-own. Distinct SONAMEs would not fix this: under `RTLD_GLOBAL` the first
-definition of each symbol still wins.
+One process maps one file per family across its legs, and any disagreement
+between the legs' records refuses. "First" is the order the legs' `dlopen`s
+succeeded, recorded at that moment in one registry that every loader
+(`ffi.common.ffi_loader`, `distrib_la.loader`) shares, not the order their
+checks finished.
 
 **The refusal and its remedy.** Every refusal is one line:
 
@@ -326,7 +285,6 @@ GATE native-closure: got <what is mapped or found>; want <what the record says>;
 | `no closure record for …` | a leg built before this rule, or by a script that does not record | rebuild with the site's build script |
 | `stale closure record …` | the leg was rebuilt without its record, or a recorded file moved, was purged or was replaced (a module upgrade, a `uv sync` that changed the CUDA or ROCm wheels, a purged `.build`) | rebuild the leg |
 | `<leg> records mpi as … but <leg> (opened first) records …` | the two legs were built against different library sets | rebuild both legs in one environment |
-| `host-leg lorrax_slate_<op> needs SLATE-CPU but the device leg's SLATE serves this process` | a host-leg SLATE op called in a process with a device leg, whose SLATE answers the SONAMEs | run the op on the device mesh, or in a CPU-only process |
 | `libcudart.so on LD_LIBRARY_PATH resolves to <file> …: a second copy of libcudart` (multi-node) | the site transport would dlopen a runtime other than the recorded one (below) | source the site's launch script (`config/perlmutter/gpu_env.sh`, `config/frontier/rocm_env.sh`) before `srun` |
 
 **Before the first collective.** A GPU process opens its device leg as
@@ -380,8 +338,8 @@ from the checkout that built both legs; each leg's `PROVENANCE` must say
 python src/ffi/cpp/stage/seal_bundle.py \
   --cuda path/to/liblorrax_ffi.so \
   --host path/to/liblorrax_ffi_host.so \
-  --private-lib path/to/libblaspp.so.2 \
-  --private-lib path/to/libslate.so.2 \
+  --private-lib path/to/libcublasmp.so.0 \
+  --private-lib path/to/libcusolverMp.so.0 \
   --output path/to/new-bundle-dir
 ```
 
@@ -397,8 +355,7 @@ full source revision, each file's size and SHA-256, each ELF SONAME and
 
 - **Private libraries.** Repeat `--private-lib`, dependency first, for every
   engine-private provider in either leg's `DT_NEEDED` closure. Only
-  cuSOLVERMp, cuBLASMp, CAL, SLATE (and its ScaLAPACK API), BLAS++,
-  LAPACK++ and NVSHMEM qualify (`lxkit.native_provider.is_private_redistributable`).
+  cuSOLVERMp, cuBLASMp, CAL, NVSHMEM and ELPA qualify (`lxkit.native_provider.is_private_redistributable`).
   MPI, site HDF5, the CUDA runtime and driver, NCCL, and system and compiler
   libraries belong to the machine runtime and are refused: a copy in the
   bundle would be a second instance of a library the whole process
@@ -437,9 +394,7 @@ the same `lxkit.native_provider` policy) chooses one library per platform:
   library inside a sealed bundle always refuses.
 - **Load order.** In a process that can use CUDA (`JAX_PLATFORMS` unset or
   naming `cuda` or `gpu` first, and an NVIDIA device is visible), opening the host library
-  opens the CUDA library first, so a CUDA-built SLATE and BLAS++, when
-  present, win the shared SONAMEs: a host-built BLAS++ reports zero devices
-  to a CUDA SLATE. Each leg opens over its recorded dependency closure, and
+  opens the CUDA library first (kept pending re-measurement). Each leg opens over its recorded dependency closure, and
   after each `dlopen` the loader refuses a process that maps a wrong file or a
   second copy of any recorded family ([the dependency closure](#closure)),
   more than one MPI runtime included.
@@ -478,7 +433,6 @@ so `diff` between them shows only values.
 | the parallel-HDF5 stage (`LORRAX_FFI_PHDF5_DIR`) | the SOVERSION the runtime provides | it feeds only GATE 7's comparison; set it and the HDF5 module to the same version |
 | the MPI module | which MPI both legs link | both legs must name the same `libmpi` (GATE 1, GATE 10) |
 | the XLA FFI headers | the jaxlib ABI compiled against | take them from the JAX that will load the library |
-| the SLATE install | SLATE + BLAS++ + LAPACK++ | the host leg needs `gpu_backend=none` |
 | the cuSOLVERMp stage (CUDA leg) | the communication path and correctness | every stage exports the same SONAME; use ≥ 0.7 with `-DLORRAX_FFI_HAVE_CAL=OFF` |
 | the MPI include/lib dirs (CUDA leg) | which MPI the library requests | unset, CMake falls back to HPC-X OpenMPI and requests `libmpi.so.40` |
 | `CMAKE_CUDA_ARCHITECTURES` (CUDA leg) | the SASS/PTX of the nvcc translation units | NVRTC kernels compile for the device at run time regardless |

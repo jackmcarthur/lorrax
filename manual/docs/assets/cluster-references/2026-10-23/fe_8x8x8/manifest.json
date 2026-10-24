@@ -1,0 +1,243 @@
+{
+  "case": "ferromagnetic_bcc_Fe_8x8x8",
+  "status": "GPU_P4_COMPLETE_CANONICAL_OUTPUTS_PASS_ALL_4_RANKS",
+  "source_commit": "2d2ca2f104a085876a573e8b1278a7874c479b98",
+  "input_metadata": {
+    "stored_bands": 312,
+    "kgrid": [
+      8,
+      8,
+      8
+    ],
+    "stored_parents": 59,
+    "nspinor": 2,
+    "raw_occupied_edge": 18,
+    "fd_density_tail_wider": true,
+    "ecutwfc_ry": 70
+  },
+  "input_files": {
+    "WFN.h5": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/19_bcc_fm_8x8x8_shared_pole_20260921/qe/WFN.h5",
+      "bytes": 464881020,
+      "sha256": "ef8b66a6bd05b5d9b64459070c3645b2e39fe8f3a249afdaba79cc249d82f843"
+    },
+    "Fe.upf": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/19_bcc_fm_8x8x8_shared_pole_20260921/qe/scf/Fe.upf",
+      "bytes": 351837,
+      "sha256": "b9b7671a2c667a6f87a7228d30fcc205e339b69f5568fe3f3dba567fdce59a19"
+    },
+    "data-file-schema.xml": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/19_bcc_fm_8x8x8_shared_pole_20260921/qe/data-file-schema.xml",
+      "bytes": 956157,
+      "sha256": "cff410da33d687d998a821d7f881acf9f5165000506814666e88b41074fc7cee"
+    }
+  },
+  "dft_context": {
+    "scf/scf.in": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/19_bcc_fm_8x8x8_shared_pole_20260921/qe/scf/scf.in",
+      "bytes": 785,
+      "sha256": "a5f64b78854613ab0ade953ca4af692fab7229b3bcd0fd4f3e32f62731f21c10"
+    },
+    "nscf/nscf.in": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/19_bcc_fm_8x8x8_shared_pole_20260921/qe/nscf/nscf.in",
+      "bytes": 812,
+      "sha256": "b657370e47e292bf8d1419fb9cedd2f61131c292735342a6c47e55628bffb173"
+    },
+    "nscf/pw2bgw.in": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/19_bcc_fm_8x8x8_shared_pole_20260921/qe/nscf/pw2bgw.in",
+      "bytes": 337,
+      "sha256": "edf4a9f24ea9b20fada3b74934c82887ae9140602e6d28dca5e093d0025e4634"
+    },
+    "nscf_data-file-schema.xml": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/19_bcc_fm_8x8x8_shared_pole_20260921/qe/nscf_data-file-schema.xml",
+      "bytes": 956157,
+      "sha256": "cff410da33d687d998a821d7f881acf9f5165000506814666e88b41074fc7cee"
+    }
+  },
+  "sum_bands": 110,
+  "physical_centroids": 1099,
+  "packed_centroid_extent_GPU_P4": 1100,
+  "packed_centroid_extent_CPU_P64": 1152,
+  "sum_band_carrier_GPU_P4": 112,
+  "centroid_selection": {
+    "path": "preprocess/centroids_frac_1099.txt",
+    "sha256": "a10b4171334efdcb884722f627911d97b58de717794c3256a5f4a080a7f86162",
+    "fit_window": "0:22,0:110",
+    "seed": 0,
+    "oversample": 1.5,
+    "orbit_closed": true,
+    "accuracy_convergence_claim": false
+  },
+  "preprocessing_artifacts": {
+    "centroids_frac_1099.txt": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/202_fm_8x8x8_tangential_reference_20261023/preprocess/centroids_frac_1099.txt",
+      "bytes": 30900,
+      "sha256": "a10b4171334efdcb884722f627911d97b58de717794c3256a5f4a080a7f86162"
+    },
+    "dipole.h5": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/202_fm_8x8x8_tangential_reference_20261023/preprocess/dipole.h5",
+      "bytes": 302022656,
+      "sha256": "f41013a1800ea4e85447c81a8cd4a070f2a927c5041a1b4016bc8821edc97c25"
+    },
+    "kin_ion.h5": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/202_fm_8x8x8_tangential_reference_20261023/preprocess/kin_ion.h5",
+      "bytes": 471236,
+      "sha256": "da42e35cf9993bdc91d7293c4eda790e043567dcbf4293761dfb1669bb4a6da0"
+    },
+    "parallel_transport.h5": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/202_fm_8x8x8_tangential_reference_20261023/preprocess/parallel_transport.h5",
+      "bytes": 2822258326,
+      "sha256": "4b0cc13f804cee0a49624947f4a6ca4b7e9f2e4de3357a4c62f215be1991fee0"
+    }
+  },
+  "frontier_active_half_open": [
+    14,
+    22
+  ],
+  "exported_qp_prefix": 22,
+  "method": "tangential shared-pole G0W0",
+  "recipe": "shared_real_pole_v1_r5",
+  "shared_pole_budget_fraction": 1.0,
+  "actual_poles_per_q": 1099,
+  "model_supports": 35,
+  "launch_GPU": {
+    "ranks": 4,
+    "nodes": 1,
+    "gpus_per_node": 4,
+    "gpu_model": "NVIDIA A100-SXM4-80GB",
+    "automatic_budget_gb": 66.35,
+    "cores_per_rank": 16,
+    "OMP_NUM_THREADS": 14,
+    "BLAS_threads": 1,
+    "cpu_binding": "threads",
+    "threads_per_core": 1
+  },
+  "main_wall_seconds": 353.07,
+  "stage_wall_seconds": {
+    "setup": 18.59,
+    "ISDF_Coulomb": 63.29,
+    "screening": 176.44,
+    "self_energy": 87.07,
+    "QP": 5.94
+  },
+  "compile_cache": {
+    "driver_real_compiles": 497,
+    "driver_persistent_hits": 29,
+    "startup_compiles": 8,
+    "rank0_summed_compile_api_seconds": 139.7348197891,
+    "state": "Private run cache primed by fresh preprocessing; not a controlled cold/warm comparison."
+  },
+  "memory": {
+    "production_pool_used_peak_gb_rounded": 33.43,
+    "stage": "zeta",
+    "exact_XLA_requested_live_peak_bytes": 33434472445,
+    "startup_pool_reservation_bytes": 77894846241,
+    "startup_outside_bytes_approx_gb": 1.47,
+    "physical_process_hwm_measured": false,
+    "host_VmHWM_max_bytes": 5532782592,
+    "passive_1Hz_PSS_max_bytes": 5258673152,
+    "scope": "XLA requested-live ledger excludes startup reservation and allocations outside XLA; production pool-used counter includes direct pool FFI allocations. Startup pool reservation remains mapped. No 40GB capacity claim."
+  },
+  "native_libraries": {
+    "cuda_sha256": "bf46de448d60525dfce7d64a00a2621d621e7526e381e001fa4093a29dd9cafa",
+    "host_sha256": "17932d83c572f8f6a119cbdc03f8f064e5ac9a279010c7bda1a1aa90fcf486ca"
+  },
+  "gpu_validation": {
+    "job": "60175811",
+    "step": "34",
+    "mode": "science",
+    "status": "PASS",
+    "scope": "finite canonical artifacts; not physical convergence",
+    "ranks": 4,
+    "kpoints": 59,
+    "eqp_rows": 1298,
+    "bands_zero_based": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21
+    ],
+    "sources": [
+      "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/prerelease_references_20261023"
+    ],
+    "native_closures": {
+      "0": {
+        "cpu": {
+          "path": "/pscratch/sd/j/jackm/cs_claude/bse_memory_prerelease_20261022/source/src/ffi/cpp/build_host_cpu_profile/liblorrax_ffi_host.so",
+          "closure": "8555cc2a2549afea890487d5d24c465916530cf6455e2f1cb9f3e770b86d7cb6",
+          "sha256": "17932d83c572f8f6a119cbdc03f8f064e5ac9a279010c7bda1a1aa90fcf486ca",
+          "provenance": "/pscratch/sd/j/jackm/cs_claude/bse_memory_prerelease_20261022/source/src/ffi/cpp/build_host_cpu_profile/liblorrax_ffi_host.so | LEGACY-UNSEALED | recorded-rev 042540b48a1c | recorded-sha 17932d83c572f8f6 | actual 1127544 bytes sha 17932d83c572f8f6 | closure 8dd2c56af1a4 enforced, identity 8555cc2a2549 (7 libraries)"
+        },
+        "CUDA": {
+          "path": "/pscratch/sd/j/jackm/cs_claude/bseperf/new/src/ffi/cpp/build/liblorrax_ffi.so",
+          "closure": "96b58078c8ed39292bb004cb23e29688b1547d2d0afbfcabad7e77864e791956",
+          "sha256": "bf46de448d60525dfce7d64a00a2621d621e7526e381e001fa4093a29dd9cafa",
+          "provenance": "/pscratch/sd/j/jackm/cs_claude/bseperf/new/src/ffi/cpp/build/liblorrax_ffi.so | LEGACY-UNSEALED | recorded-rev 8522d6df9816 | recorded-sha bf46de448d60525d | actual 2673544 bytes sha bf46de448d60525d | closure 69d0bac9ec88 enforced, identity 96b58078c8ed (13 libraries)"
+        }
+      },
+      "1": {
+        "cpu": {
+          "path": "/pscratch/sd/j/jackm/cs_claude/bse_memory_prerelease_20261022/source/src/ffi/cpp/build_host_cpu_profile/liblorrax_ffi_host.so",
+          "closure": "8555cc2a2549afea890487d5d24c465916530cf6455e2f1cb9f3e770b86d7cb6"
+        },
+        "CUDA": {
+          "path": "/pscratch/sd/j/jackm/cs_claude/bseperf/new/src/ffi/cpp/build/liblorrax_ffi.so",
+          "closure": "96b58078c8ed39292bb004cb23e29688b1547d2d0afbfcabad7e77864e791956"
+        }
+      },
+      "2": {
+        "cpu": {
+          "path": "/pscratch/sd/j/jackm/cs_claude/bse_memory_prerelease_20261022/source/src/ffi/cpp/build_host_cpu_profile/liblorrax_ffi_host.so",
+          "closure": "8555cc2a2549afea890487d5d24c465916530cf6455e2f1cb9f3e770b86d7cb6"
+        },
+        "CUDA": {
+          "path": "/pscratch/sd/j/jackm/cs_claude/bseperf/new/src/ffi/cpp/build/liblorrax_ffi.so",
+          "closure": "96b58078c8ed39292bb004cb23e29688b1547d2d0afbfcabad7e77864e791956"
+        }
+      },
+      "3": {
+        "cpu": {
+          "path": "/pscratch/sd/j/jackm/cs_claude/bse_memory_prerelease_20261022/source/src/ffi/cpp/build_host_cpu_profile/liblorrax_ffi_host.so",
+          "closure": "8555cc2a2549afea890487d5d24c465916530cf6455e2f1cb9f3e770b86d7cb6"
+        },
+        "CUDA": {
+          "path": "/pscratch/sd/j/jackm/cs_claude/bseperf/new/src/ffi/cpp/build/liblorrax_ffi.so",
+          "closure": "96b58078c8ed39292bb004cb23e29688b1547d2d0afbfcabad7e77864e791956"
+        }
+      }
+    }
+  },
+  "evidence_run": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/202_fm_8x8x8_tangential_reference_20261023",
+  "scope": "Fixed-input reference through Sigma/QP; no physical convergence or minimum-rank claim. CPU results are separate.",
+  "included_text_files": {
+    "qe_scf.in": "a5f64b78854613ab0ade953ca4af692fab7229b3bcd0fd4f3e32f62731f21c10",
+    "centroids_frac_1099.txt": "a10b4171334efdcb884722f627911d97b58de717794c3256a5f4a080a7f86162",
+    "gw.in": "10e31eb52f62c306a539e4d8cacb072518017381b94c99912f8000c5d07eefe2",
+    "qe_pw2bgw.in": "edf4a9f24ea9b20fada3b74934c82887ae9140602e6d28dca5e093d0025e4634",
+    "qe_nscf.in": "b657370e47e292bf8d1419fb9cedd2f61131c292735342a6c47e55628bffb173"
+  },
+  "warnings": [
+    "sigma_reads_past_w_support",
+    "time_reversal_broken (expected magnetic DFT)",
+    "minimax_runtime_solve"
+  ],
+  "dynamic_coverage": "COMPLETE: 91.19 eV below and 2.04 eV above the requested bands"
+}

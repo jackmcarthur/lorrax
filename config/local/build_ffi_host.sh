@@ -5,8 +5,7 @@
 # Backends on this lane: phdf5 (own-built HDF5 1.14 over distro OpenMPI),
 # scalapack (distro netlib libscalapack-openmpi — exports all eleven required
 # symbols including the C-BLACS interface, measured 2026-08-26), and the
-# CBLAS GEMM handlers (distro OpenBLAS).  SLATE stays OFF (no SLATE install);
-# the FFTW3-ABI host FFT binds its engine at run time (docs/architecture/ffi_layout.md §3c) and the
+# CBLAS GEMM handlers (distro OpenBLAS).  The FFTW3-ABI host FFT binds its engine at run time (docs/architecture/ffi_layout.md §3c) and the
 # XLA FFT lowering stands.
 #
 # Extra apt prerequisites beyond setup_env.sh's list:
@@ -52,7 +51,6 @@ LORRAX_CBLAS_DIR="$CBLAS_STAGE" \
     -DLORRAX_FFI_PLATFORM=host \
     -DCMAKE_BUILD_TYPE=Release \
     -DPython3_EXECUTABLE="$LORRAX_LOCAL_ENV/bin/python" \
-    -DLORRAX_HOST_HAVE_SLATE=OFF \
     -DLORRAX_SCALAPACK_LIBRARIES="$SCALAPACK_SO" \
     -DLORRAX_FFI_HAVE_PHDF5=ON \
     -DHDF5_ROOT="$LORRAX_LOCAL_PHDF5" \

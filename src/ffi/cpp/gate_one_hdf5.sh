@@ -159,7 +159,7 @@ if [[ -n "$STAGE" ]]; then
         echo "[$TAG]   the stage provides ${PROV[*]}." >&2
         echo "[$TAG]   In the container that request is a plain 'not found'" >&2
         echo "[$TAG]   and the ENTIRE library fails to dlopen — ScaLAPACK," >&2
-        echo "[$TAG]   SLATE, GEMM and phdf5 handlers together, none of which" >&2
+        echo "[$TAG]   GEMM and phdf5 handlers together, none of which" >&2
         echo "[$TAG]   touch HDF5.  Do NOT repair this with a SONAME alias: a" >&2
         echo "[$TAG]   major-version alias loads and then misbehaves." >&2
         echo "[$TAG]   Either re-stage the container from the module this" >&2

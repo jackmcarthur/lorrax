@@ -1,15 +1,20 @@
 """``lxkit`` — the shared foundation every LORRAX service stands on.
 
-Seven things that standalone services need and must not own private copies of:
+Nine things that standalone services need and must not own private copies of:
 the env-dial :class:`~lxkit.gate.Gate` (grammar, rank discipline,
-announce-or-refuse), the platform legs of the native-provider ABI
-(:mod:`lxkit.legs`), the ABSENT-vs-BROKEN probe vocabulary
-(:mod:`lxkit.probe`), the loop-carry marking
-(:func:`mark_varying`), process-local array placement
-(:mod:`lxkit.placement`), native-provider selection/attestation policy
+announce-or-refuse) and the device-vendor platform key
+(:func:`device_vendor`, :func:`mesh_ffi_platform`), the platform legs of the
+native-provider ABI (:mod:`lxkit.legs`), the ABSENT-vs-BROKEN probe vocabulary
+(:mod:`lxkit.probe`), the loop-carry marking (:func:`mark_varying`),
+process-local array placement (:mod:`lxkit.placement`), placement-independent
+rank-order reductions (:mod:`lxkit.collectives`: :func:`ordered_psum` and
+friends), the device-memory model that prices, admits and receipts every
+stage (:mod:`lxkit.memory`), native-provider selection/attestation policy
 (:mod:`lxkit.native_provider`), and the per-user persistent-cache root
 (:mod:`lxkit.cache`).  :mod:`lxkit.testing` ships the pytest harness
-as a ``pytest11`` plugin.
+as a ``pytest11`` plugin; :mod:`lxkit.deck_doctor` (input-file preflight) and
+:mod:`lxkit.launcher_policy` (the ``lx`` launcher's pure policy) are
+command-line modules and are not re-exported here.
 
 PINNED PROPERTY — STDLIB-ONLY AT IMPORT
 ---------------------------------------

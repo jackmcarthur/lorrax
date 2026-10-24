@@ -86,12 +86,14 @@ def runtime_provenance(tau: np.ndarray, w: np.ndarray) -> Provenance:
 class Quadrature:
     """A rule, in the SCALED units the solver works in.
 
-    THE RESCALE STAYS WITH THE CALLER (design §3.3): the three
-    ``solve_*_interval`` / ``solve_phase_*`` wrappers in
-    ``gw.minimax_screening`` rescale into Rydberg and name *windows*.  This
-    object carries the rule as solved — ``tau`` on ``[1, R]`` or
-    ``[0, A]``, ``alpha`` beside it — and the physical error is
-    ``max_error / x_min`` at the caller's convention.
+    THE RESCALE STAYS WITH THE CALLER (design §3.3): the
+    ``solve_laplace_minimax_interval`` / ``solve_laplace_minimax_imag_interval``
+    wrappers in ``gw.minimax_screening`` rescale into Rydberg and name
+    *windows*.  This object carries the rule as solved -- ``nodes`` (tau) for
+    the scaled variable on ``[1, R]`` or ``[0, A]``, ``weights`` beside them --
+    and for a Laplace family the physical rule on ``[x_min, x_max]`` is
+    ``tau = nodes / x_min``, ``alpha = weights / x_min``, with physical error
+    ``max_error / x_min``.
     """
 
     nodes: np.ndarray        # float64

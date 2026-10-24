@@ -7,8 +7,7 @@
 // measured and returns non-orthonormal eigenvectors on the 4x4 grid at n >= 47104
 // (ELPA_TWO_STAGE_UPSTREAM_REPORT.md).
 //
-// Operand contract: the SAME as slate/eigh_ffi.cc, so distrib_la._elpa reuses
-// _slate's wrapper shape (relabeled block-cyclic layout, distrib_la._cyclic):
+// Operand contract (distrib_la._elpa; relabeled block-cyclic layout, distrib_la._cyclic):
 //   A (input):   the rank's (N/p, N/p) block, LOCALLY TRANSPOSED by the Python
 //                wrapper, i.e. column-major bytes; read as ELPA's block-cyclic
 //                local array with tile nb | N/p on the p x p grid, so ELPA
@@ -22,7 +21,7 @@
 //                transposed temporary (input_output_aliases {0: 3}), never the caller's.
 //
 // Grid: ELPA takes the process coordinates explicitly.  Rank r of the mesh's
-// SLATE context (JAX process index, mesh shard (r / q, r % q)) is ELPA process
+// MPI mesh context (cpp/mesh/; JAX process index, mesh shard (r / q, r % q)) is ELPA process
 // (row r / q, col r % q) on a parent communicator in JAX rank order -- the
 // mapping the standalone benchmark validated (ELPA_ROCM_REPORT.md).
 //
@@ -77,7 +76,7 @@
 
 #include "xla/ffi/api/ffi.h"
 #include "../common/ffi_helpers.h"
-#include "../slate/ctx.h"
+#include "../mesh/ctx.h"
 
 extern "C" {
 typedef int (*lorrax_elpa_alloc_fn)(void** ptr, std::size_t bytes, void* ctx);
@@ -260,7 +259,7 @@ static std::string forced_option() {
     return "";
 }
 
-static ffi::Error get_handle(lorrax_ffi::slate::SlateCtx* ctx, int64_t n, int64_t nb,
+static ffi::Error get_handle(lorrax_ffi::mesh::MeshCtx* ctx, int64_t n, int64_t nb,
                              bool cplx, Handle** out) {
     std::lock_guard<std::mutex> lk(g_mu);
     const auto key = std::make_tuple(static_cast<const void*>(ctx), n, nb, cplx);
@@ -358,7 +357,7 @@ struct WsAttrs {
 
 template <typename T>
 static ffi::Error EighImpl(int64_t n, int64_t nb, bool compute_evecs, lrx::gpu::Stream stream,
-                           lorrax_ffi::slate::SlateCtx* ctx, const T* d_A, T* d_Aio, double* d_W,
+                           lorrax_ffi::mesh::MeshCtx* ctx, const T* d_A, T* d_Aio, double* d_W,
                            T* d_Q, void* d_ws, std::size_t ws_bytes, WsAttrs wa) {
     constexpr bool cplx = !std::is_same_v<T, double>;
     const int p = ctx->p;
@@ -505,8 +504,8 @@ static ffi::Error EighDispatch(lrx::gpu::Stream stream, ffi::AnyBuffer A,
                                int64_t n, int64_t nb, int64_t ctx_key,
                                bool compute_evecs, int64_t pool_bytes, int64_t rb_back_bytes,
                                int64_t rb_stedc_bytes, int64_t rb_other_bytes) {
-    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
-    auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
+    const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "mesh");
+    auto* ctx = reinterpret_cast<lorrax_ffi::mesh::MeshCtx*>(ctx_handle);
     if (ctx == nullptr)
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                           "elpa.eigh: ctx_handle is null (context not initialized?)");
