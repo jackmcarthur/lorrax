@@ -533,18 +533,26 @@ rank's tile in row passes of whole centroid orbits (`gw.subtile_stream`):
 `Σ(τ) row` is one local μ row's live set (`ν = μ/P_y`: the parent Green and
 its partner, mode 7's output, `W_prep`, the pass's rows of `W` and its
 partner on the q parents, the pass's ψ rows), and a pass holds the most rows
-whose bytes fit the fixed tile. The scalar q-wedge Σ prices its operand
-placement and complete first window before allocating band-complete ψ. If
-that live set fits, the incumbent axis route keeps its local Green GEMMs.
-Otherwise the summed-band ψ stays on its canonical 2D faces and each row pass
-uses the shared bounded SUMMA Green product; its conjugated, merged right
-operand is formed once on the same 2D face. These sum operands scale as
-`32·n_par·n_s·N_b·μ/P`, beside the original faces. The small QP projector
-still uses its axis carriers, `16·n_par·n_s·N_bΣ·(μ/P_x + μ/P_y)`.
-Admission uses the largest compiled new-byte figure over ranks, plus retained
-placement outputs and native convolution scratch, against current room before
-placement runs. Static SX/COH uses the same choice and scalar node. Photon
-Σ sectors retain their existing contracts.
+whose bytes fit the fixed tile. The ordinary minimax χ and scalar q-wedge Σ share
+`subtile_stream.green_operand_program` and `prepare_green_operands`. They price
+operand placement and the complete consumer before allocating band-complete ψ.
+If that live set fits, the axis layout gathers each sum band once and keeps
+local Green GEMMs inside every row/node scan. Otherwise the summed-band ψ stays
+on its canonical 2D faces and each row pass uses the shared bounded SUMMA Green
+product. In either layout the conjugated, merged right operand is formed once
+outside all row and node loops. The two axis banks occupy
+`32·n_par·n_s·N_b·μ/sqrt(P)` bytes, or `32·n_par·n_s·N_b·μ/P` on faces,
+beside the original ψ owners. Σ additionally places its small QP projector on
+axis carriers, `16·n_par·n_s·N_bΣ·(μ/P_x + μ/P_y)`.
+
+Admission uses the largest compiled new-byte figure over ranks: the maximum
+of placement's new bytes and its retained outputs plus the consumer's new
+bytes and queried native convolution scratch, against current room. Placement
+finishes before the consumer starts, so their scratch does not overlap.
+Compile-only calls compile and price these same programs without allocating
+prepared ψ banks; the caches retain programs/geometry, not ψ payloads. Static
+SX/COH uses the same choice and scalar node. Photon Σ sectors retain their
+existing contracts.
 
 The charge direct and four-current response row streams use the same choice
 inside `response_bank._compiled`: compile the complete incumbent stream

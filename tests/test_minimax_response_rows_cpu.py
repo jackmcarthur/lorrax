@@ -126,15 +126,19 @@ def test_rows_full_and_independent_reference(monkeypatch, side, ns, anti, n_out)
                                        err_msg=f'full/reference contour={contour} real_times={real_times}')
             for tile in (1 << 30, 8192):
                 monkeypatch.setattr(tiles, 'TILE_BYTES', tile)
-                kernel = W._get_chi_minimax_kernel_fused(mesh, grid, 6, n_out, contour,
-                    (np_, nb, mu, ns), k_unfold_plan=plan, real_times=real_times)
-                value = kernel(*args)
-                got = np.stack([np.asarray(a) for a in value]) if n_out > 1 else np.asarray(value)[None]
-                np.testing.assert_allclose(got, expected, rtol=5e-12, atol=3e-11)
-                if tile == 8192:
-                    assert len(kernel.row_plan.windows) > 1
-                else:
-                    assert len(kernel.row_plan.windows) == 1
+                from gw.subtile_stream import green_operand_program
+                for layout in ('face', 'axis'):
+                    prepared = green_operand_program(mesh, layout)(pm, pn)
+                    kernel = W._get_chi_minimax_kernel_fused(mesh, grid, 6, n_out, contour,
+                        (np_, nb, mu, ns), k_unfold_plan=plan, real_times=real_times,
+                        layout=layout)
+                    value = kernel(nodes, *prepared, *tail[2:])
+                    got = np.stack([np.asarray(a) for a in value]) if n_out > 1 else np.asarray(value)[None]
+                    np.testing.assert_allclose(got, expected, rtol=5e-12, atol=3e-11)
+                    if tile == 8192:
+                        assert len(kernel.row_plan.windows) > 1
+                    else:
+                        assert len(kernel.row_plan.windows) == 1
 
 
 def test_charge_factory_dials_do_not_reuse_another_backend(monkeypatch):

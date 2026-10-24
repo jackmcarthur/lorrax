@@ -262,88 +262,6 @@ def bracket_selectors(selector, selectors):
     return masks, ranges, live
 
 
-@lru_cache(maxsize=None)
-def _sigma_subtile_operand_program(mesh_xy, sum_layout):
-    """Placement only; the cache holds programs and geometry, never ψ values."""
-    from .greens_function_kernel import green_right_operand
-    from .subtile_stream import band_complete, green_rows, projection_complete
-    if sum_layout not in ("axis", "face"):
-        raise ValueError(f"Sigma sum-band layout must be face or axis, got {sum_layout!r}")
-
-    @jax.jit
-    def place(xn, yr, xr, yn):
-        if sum_layout == "axis":
-            xn, yr = band_complete(xn, yr, mesh_xy)
-            xn = green_rows(xn, mesh_xy)
-        else:
-            xn = jax.lax.with_sharding_constraint(
-                xn, NamedSharding(mesh_xy, P(None, None, "x", "y")))
-            yr = jax.lax.with_sharding_constraint(
-                yr, NamedSharding(mesh_xy, P(None, "x", None, "y")))
-        return xn, green_right_operand(yr), *projection_complete(xr, yn, mesh_xy)
-    return place
-
-
-def sigma_subtile_operands(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, *, mesh_xy,
-                           sum_layout="axis"):
-    """The Σ τ operands as the sub-tile kernel reads them, placed once per Σ call.
-
-    The Green faces become band-complete rows, the left ones μ-major
-    (``gw.subtile_stream.green_rows``), and the projection faces the axis
-    projector's operands (``subtile_stream.projection_complete``): one exchange
-    here, none in any τ node.  :func:`_sigma_subtile_kernel` reads its left
-    Green rows in this order, and the right ones already as every Green build's
-    right operand (``greens_function_kernel.green_right_operand``: conj ψ
-    merged centroid-major), formed here once per Σ call, not once per τ node.
-    """
-    return _sigma_subtile_operand_program(mesh_xy, sum_layout)(
-        psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn)
-
-
-def prepare_sigma_subtile(operands, mesh_xy, build, *, _force_layout=None):
-    """Choose and admit Σ's sum-band layout before allocating its axis banks.
-
-    ``operands`` are the four canonical parent faces. ``build(layout, abstract)``
-    returns the consumer context, its compiled window/node programs, and native
-    scratch bytes. Only the chosen placement executes. The fast axis route
-    must fit both placement and the complete consumer with its retained banks;
-    otherwise shared panel GEMMs read the 2D sum-band faces. The small QP
-    projection keeps its existing axis carrier in either route.
-    """
-    from lxkit import memory
-    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
-
-    layouts = ("axis", "face") if _force_layout is None else (_force_layout,)
-    candidates = []
-    for layout in layouts:
-        placement = _sigma_subtile_operand_program(mesh_xy, layout).lower(*operands).compile()
-        place_new = -agreed_chunk(-compiled_new_bytes(placement))
-        room = agreed_chunk(int(memory.room()))
-        # No full axis window is compiled when even placement cannot fit.
-        if layout == "axis" and place_new > room and _force_layout is None:
-            continue
-        abstract = jax.tree.map(
-            lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=a.sharding),
-            placement.out_info)
-        context, programs, native = build(layout, abstract)
-        consumer_new = max(compiled_new_bytes(p, extra=native) for p in programs)
-        stats = placement.memory_analysis()
-        retained = max(0, int(stats.output_size_in_bytes) - int(stats.alias_size_in_bytes))
-        needed = -agreed_chunk(-max(place_new, retained + consumer_new))
-        price = memory.priced(0, f"Sigma {layout} sum-band placement + compiled window",
-                              spread=needed * mesh_xy.size, ranks=mesh_xy.size)
-        candidates.append((layout, price, placement, context))
-        if needed <= agreed_chunk(int(memory.room())):
-            break
-    chosen = memory.admit("Sigma sum-band operands", [(c[0], c[1]) for c in candidates],
-                          agreed_chunk(int(memory.room())))
-    layout, _, placement, context = next(c for c in candidates if c[0] == chosen)
-    log.info(f"Sigma summed bands: {layout} layout")
-    prepared = placement(*operands)
-    # Keep placement's scratch and the consumer's scratch from overlapping.
-    jax.block_until_ready(prepared)
-    return layout, prepared, context
-
 
 def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_extent,
                           energy_windows, k_unfold_plan, q_wedge, static=False,
@@ -461,7 +379,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
         single exchange formed.  A static node's weights are real, so its
         partner is conj(G), read on the mode-7 load.  ``g_right`` is the
         GEMM's right operand (``green_right_operand`` of the band-complete
-        columns), formed once per Σ call (:func:`sigma_subtile_operands`): every
+        columns), formed once per Σ call (:func:`subtile_stream.green_operand_program`): every
         τ node, row pass and bracket reads it,
         and the partner is ``conj(A·diag(w*)·B)`` from the same two operands.
         """
@@ -480,7 +398,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
             raise ValueError("Sigma tau: W on the q wedge and the Green kconv call need their device "
                              "load tables (load, g_load = sigma_kconv_tables)")
         # The left Green rows arrive μ-major and the right ones as the Green's right
-        # operand (sigma_subtile_operands, once per Σ call).
+        # operand (subtile_stream.green_operand_program, once per Σ call).
         rows_spec = GREEN_ROWS_SPEC if sum_layout == "axis" else P(None, None, "x", "y")
         right_spec = P(None, None, "y") if sum_layout == "axis" else P(None, "x", "y")
         rows_all = jax.lax.with_sharding_constraint(psi_coh_xn, NamedSharding(mesh_xy, rows_spec))

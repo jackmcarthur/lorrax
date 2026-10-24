@@ -450,7 +450,7 @@ def sector_right_operands(family, band_axis, mesh_xy):
 def sector_tau_factory(left, right, keys, meta, mesh_xy, brackets=None):
     """Bind Gamma_A G_AB(t) Gamma_B to the window executor: the class's :func:`sector_node`
     reading W(t)'s particle and hole branches.  The caller places the left operands
-    band-complete once per Σ call (``ppm_tau_kernel.sigma_subtile_operands``); the right
+    band-complete once per Σ call (``subtile_stream.green_operand_program``); the right
     ones are placed here.  ``brackets``: the Σ call's band brackets (the executor's own)."""
     def factory(synthesis, band_axis):
         w_tables = tuple(synthesis.w_tables)

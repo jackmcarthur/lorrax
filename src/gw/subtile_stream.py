@@ -43,6 +43,7 @@ is the same node at τ = 0 with the static interaction in place of W(τ).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import jax
 import jax.numpy as jnp
@@ -310,6 +311,87 @@ def projection_complete(psi_left, psi_right, mesh):
     left = jax.lax.with_sharding_constraint(psi_left, NamedSharding(mesh, P(None, None, None, "x")))
     right = jax.lax.with_sharding_constraint(psi_right, NamedSharding(mesh, P(None, None, "y", None)))
     return left, right
+
+
+@lru_cache(maxsize=None)
+def green_operand_program(mesh, sum_layout):
+    """Place two Green faces and an optional projection pair once per dispatch.
+
+    Input Green faces are ``(parent, spin, μ, band)`` and
+    ``(parent, band, spin, ν)``. Axis outputs have every band local: left
+    μ-major (:func:`green_rows`), right conjugated and merged as the Green
+    product reads it. Face outputs keep both mesh axes distributed. Optional
+    projection faces use :func:`projection_complete` in either layout.
+    The cache holds programs and geometry, never ψ values.
+    """
+    from .greens_function_kernel import green_right_operand
+    if sum_layout not in ("axis", "face"):
+        raise ValueError(f"Green sum-band layout must be face or axis, got {sum_layout!r}")
+
+    @jax.jit
+    def place(left, right, *projection):
+        if len(projection) not in (0, 2):
+            raise ValueError("Green placement needs zero or two projection faces")
+        if sum_layout == "axis":
+            left, right = band_complete(left, right, mesh)
+            left = green_rows(left, mesh)
+        else:
+            left = jax.lax.with_sharding_constraint(
+                left, NamedSharding(mesh, P(None, None, "x", "y")))
+            right = jax.lax.with_sharding_constraint(
+                right, NamedSharding(mesh, P(None, "x", None, "y")))
+        tail = projection_complete(*projection, mesh) if projection else ()
+        return left, green_right_operand(right), *tail
+    return place
+
+
+def prepare_green_operands(operands, mesh, build, *, label, compile_only=False,
+                           _force_layout=None):
+    """Choose and admit a shared Green layout from placement and consumer AOT.
+
+    ``operands`` are two canonical Green faces, optionally followed by two
+    projection faces. ``build(layout, abstract)`` returns the consumer context,
+    compiled consumer programs and their native scratch bytes. Only the chosen
+    placement executes; ``compile_only`` compiles/admit-checks without making ψ
+    banks. The context must contain programs/geometry, never operand values.
+    """
+    from common.gpu_utils import device_budget_bytes
+    from common.log import get_logger
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+
+    device_budget_bytes()
+    layouts = ("axis", "face") if _force_layout is None else (_force_layout,)
+    candidates = []
+    for layout in layouts:
+        placement = green_operand_program(mesh, layout).lower(*operands).compile()
+        place_new = -agreed_chunk(-compiled_new_bytes(placement))
+        room = agreed_chunk(int(memory.room()))
+        if layout == "axis" and place_new > room and _force_layout is None:
+            continue
+        abstract = jax.tree.map(
+            lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=a.sharding),
+            placement.out_info)
+        context, programs, native = build(layout, abstract)
+        consumer_new = max(compiled_new_bytes(p, extra=native) for p in programs)
+        stats = placement.memory_analysis()
+        retained = max(0, int(stats.output_size_in_bytes) - int(stats.alias_size_in_bytes))
+        needed = -agreed_chunk(-max(place_new, retained + consumer_new))
+        price = memory.priced(0, f"{label} {layout} sum-band placement + compiled window",
+                              spread=needed * mesh.size, ranks=mesh.size)
+        candidates.append((layout, price, placement, context))
+        if needed <= agreed_chunk(int(memory.room())):
+            break
+    chosen = memory.admit(f"{label} sum-band operands", [(c[0], c[1]) for c in candidates],
+                          agreed_chunk(int(memory.room())))
+    layout, _, placement, context = next(c for c in candidates if c[0] == chosen)
+    if compile_only:
+        return layout, None, context
+    get_logger(__name__).info(f"{label} summed bands: {layout} layout")
+    prepared = placement(*operands)
+    # Placement scratch must be gone before the consumer's scratch is needed.
+    jax.block_until_ready(prepared)
+    return layout, prepared, context
 
 
 def segment_blocks(plan, p, cols):

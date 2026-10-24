@@ -1563,9 +1563,9 @@ def _integrate_sigma_batches(
                          if scalar_subtile else None)
         if synthesis and tau_kernel_factory is not None:
             # Photon sectors retain their own existing axis-layout contract.
-            from gw.ppm_tau_kernel import sigma_subtile_operands
-            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn = sigma_subtile_operands(
-                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, mesh_xy=mesh_xy)
+            from gw.subtile_stream import green_operand_program
+            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn = green_operand_program(mesh_xy, "axis")(
+                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn)
         spatial_shape = (
             int(k_unfold_plan.n_parent), sigma_axis.carrier, sigma_axis.carrier)
         face_kwargs["face_band_extent"] = sigma_axis.carrier
@@ -1775,7 +1775,8 @@ def _integrate_sigma_batches(
                             pole_indices, bounds, phase_real, e_ref_a, e_ref_b, g_load)
 
                 if scalar_subtile and tau_kernel is None:
-                    from gw.ppm_tau_kernel import prepare_sigma_subtile, sigma_pass_price
+                    from gw.ppm_tau_kernel import sigma_pass_price
+                    from gw.subtile_stream import prepare_green_operands
 
                     def build(sum_layout, prepared):
                         kernel = scalar_tau(sum_layout, prepared)
@@ -1805,7 +1806,8 @@ def _integrate_sigma_batches(
                             native = int((sigma_pass_price(kernel) or {}).get("scratch", 0))
                         return kernel, compiled, native
 
-                    _, prepared, tau_kernel = prepare_sigma_subtile(subtile_faces, mesh_xy, build)
+                    _, prepared, tau_kernel = prepare_green_operands(
+                        subtile_faces, mesh_xy, build, label="Sigma")
                     psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn = prepared
                     if synthesis:
                         tau_kernel._right = (psi_coh_yr, psi_proj_yn)

@@ -69,8 +69,13 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             k_unfold_plan=None,
                             occupations: str = "step",
                             ordered: bool = False,
-                            real_times: bool = False):
+                            real_times: bool = False,
+                            sum_layout: str = "face"):
     """Build the face or parent imaginary-time response with vertices applied after unfold.
+
+    ``sum_layout`` selects the prepared Green operands of the ordinary parent
+    kernel; :func:`subtile_stream.prepare_green_operands` owns their placement.
+    It does not alter vertex or finite-temperature kernels.
 
     ``real_times``: every node time is real (the parent kernel then reads a
     complex contour's antiunitary partner as conj(G) on the load).
@@ -125,7 +130,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)
                                if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)),
-                 fused, bool(real_times) and fused)
+                 fused, bool(real_times) and fused, sum_layout if fused else None)
     if fermi_dirac:
         cache_key = cache_key + ("fermi_dirac", bool(ordered))
     if cache_key in _chi_minimax_kernel_cache:
@@ -138,7 +143,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     if fused:
         kernel = _get_chi_minimax_kernel_fused(
             mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
-            k_unfold_plan=k_unfold_plan, layout=layout, real_times=bool(real_times))
+            k_unfold_plan=k_unfold_plan, layout=sum_layout, real_times=bool(real_times))
     else:
         kernel = _get_chi_minimax_kernel_face(
             mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
@@ -807,16 +812,19 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
     keeps its full ``(q, μ_X, ν_Y)`` sharding. The typed load, Green builders
     and placement loop are the direct response stream's owners. Window sizes
     follow the fixed tile, never the memory budget or the node weights.
+    Inputs are prepared by :func:`subtile_stream.green_operand_program`: left
+    μ-major for axis, spin-major for face; right already conjugated and merged.
     """
     from common.fft_helpers import make_flat_k_fftn
-    from common.wfn_layout import psi_specs
     from distrib_la import gemm_plan
     from symmetry_maps import DeviceLoadTables
-    from .greens_function_kernel import build_G_tau, chi0_kconv_scratch, green_right_operand
-    from .subtile_stream import (plan_passes, stream_passes, window_load, window_rows)
+    from .greens_function_kernel import build_G_tau, chi0_kconv_scratch
+    from .subtile_stream import (GREEN_ROWS_SPEC, plan_passes, stream_passes, window_load,
+                                 window_rows, window_green_rows)
     from .wavefunction_bundle import CHI_Q_SPEC as _chi_spec, CHI_R_SPEC as _chi_R_spec
 
-    psi_nmu_spec, psi_mun_spec = psi_specs(layout)
+    psi_mun_spec = GREEN_ROWS_SPEC if layout == "axis" else P(None, None, "x", "y")
+    right_spec = P(None, None, "y") if layout == "axis" else P(None, "x", "y")
     nk_in, nb_full, n_rmu, ns = (int(v) for v in face_shape)
     if nk_in != k_unfold_plan.n_parent or k_unfold_plan.n_full != nk:
         raise ValueError("chi parent plan: face k extent or full-k extent disagrees with its plan.")
@@ -844,20 +852,21 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
                        warmup=False)
     nodes_shard = MinimaxNodes(t=rep1, alpha=rep1 if n_out == 1 else rep0)
 
-    def integrate(nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin, placed):
+    def integrate(nodes, psi_mun, right, mask_v, mask_c, enk_full, vmax, cmin, placed):
         acc0 = jax.lax.with_sharding_constraint(
             jnp.zeros((n_out, nk, n_rmu, n_rmu), dtype=jnp.complex128), acc_shard)
         alpha_rows = nodes.alpha[:, None] if n_out == 1 else jnp.transpose(nodes.alpha)
-        # Every τ and every window reads the same right operand, formed once.
-        right = green_right_operand(psi_nmu)
+        # Both Green operands are placed once outside all rows and τ nodes.
         load = DeviceLoadTables(*placed)
 
         def prepare(window):
             if window is None:
-                return psi_mun, load, {}
+                left = window_green_rows(psi_mun, mesh_xy) if layout == "axis" else psi_mun
+                return left, load, {}
             s, lo, hi = window
-            return (window_rows(psi_mun, mesh_xy, s, R, axis=2, spec=psi_mun_spec),
-                    window_load(load, mesh_xy, s, lo, hi, R, ns),
+            left = (window_green_rows(psi_mun, mesh_xy, s, R) if layout == "axis" else
+                    window_rows(psi_mun, mesh_xy, s, R, axis=2, spec=psi_mun_spec))
+            return (left, window_load(load, mesh_xy, s, lo, hi, R, ns),
                     dict(live=jnp.stack([lo, hi]).astype(jnp.int32)))
 
         def integrated_rows(ops, _):
@@ -891,7 +900,7 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
         return tuple(acc[o] for o in range(n_out))
 
     in_shardings = (nodes_shard, NamedSharding(mesh_xy, psi_mun_spec),
-                    NamedSharding(mesh_xy, psi_nmu_spec), rep2, rep2, rep2, rep0, rep0,
+                    NamedSharding(mesh_xy, right_spec), rep2, rep2, rep2, rep0, rep0,
                     tuple(a.sharding for a in arrays))
     program = (jax.jit(integrate, in_shardings=in_shardings,
                        out_shardings=tuple(chi_R_shard for _ in range(n_out))) if n_out >= 2
@@ -2320,20 +2329,24 @@ def _run_minimax_chi(wfns, meta, mesh_xy, args, *, n_out=1,
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, n_out=n_out, complex_contour=complex_contour,
         real_times=real_times, **_chi_parent_face_kwargs(wfns))
-    if compile_only or hasattr(kernel, "native_scratch"):
-        executable = kernel.lower(*args).compile()
+    if hasattr(kernel, "row_plan"):
+        from .subtile_stream import prepare_green_operands
+
+        def build(sum_layout, prepared):
+            selected = _get_chi_minimax_kernel(
+                mesh_xy, kgrid, n_out=n_out, complex_contour=complex_contour,
+                real_times=real_times, sum_layout=sum_layout, **_chi_parent_face_kwargs(wfns))
+            executable = selected.lower(args[0], *prepared, *args[3:]).compile()
+            return executable, [executable], selected.native_scratch
+
+        _, prepared, executable = prepare_green_operands(
+            args[1:3], mesh_xy, build, label="Minimax response", compile_only=compile_only)
+        if compile_only:
+            return None
+        return executable(args[0], *prepared, *args[3:])
     if compile_only:
+        kernel.lower(*args).compile()
         return None
-    if hasattr(kernel, "native_scratch"):
-        from lxkit import memory
-        from common.gpu_utils import device_budget_bytes
-        from runtime.aot_memory import agreed_chunk, compiled_new_bytes
-        device_budget_bytes()
-        need = -agreed_chunk(-compiled_new_bytes(executable, extra=kernel.native_scratch))
-        room = agreed_chunk(int(memory.room()))
-        price = memory.priced(0, "minimax response, compiled row windows + provider scratch",
-                              spread=need * mesh_xy.size, ranks=mesh_xy.size)
-        memory.admit("Minimax response row windows", [("rows", price)], room)
     return kernel(*args)
 
 
