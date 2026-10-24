@@ -139,9 +139,14 @@ Gaussian broadening. All 3,072 retained Tamm–Dancoff roots are requested.
 The additional `3-bse/3-lorrax_fully_rel/3-exciton-bands` stage keeps the same
 six-valence/eight-conduction window, with 64 lowest roots on a Gamma-centered
 `30 30 1` integration grid at each exciton momentum. Its full-path and
-near-Gamma plots use LORRAX only. The [stage README](3-bse/3-lorrax_fully_rel/3-exciton-bands/README.md)
-explains the linear and quadratic behavior to inspect near Gamma, the
-independent-particle threshold and the separate integration-grid checks.
+near-Gamma plots use LORRAX only. The full path has 25 Q points and a 0.25 meV
+Davidson budget; the separate near-Gamma scan keeps eight roots at 0.01 meV,
+with a distant K point retained for certification. The tutorial explicitly
+selects the existing 1 meV `visualization` exchange certificate: matched
+on-grid checks measured about 0.02 meV, above the stricter reference gate.
+The driver's `reference` default is unchanged. The [stage README](3-bse/3-lorrax_fully_rel/3-exciton-bands/README.md)
+explains the sampling, residuals and independent-particle threshold. Neither
+64-root continuum coverage nor 24 × 24 versus 30 × 30 convergence is assumed.
 
 Comparison
 ----------

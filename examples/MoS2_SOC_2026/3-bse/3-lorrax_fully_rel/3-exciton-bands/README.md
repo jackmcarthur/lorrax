@@ -24,19 +24,23 @@ Instructions
 
    ```bash
    bash 01-run_exciton_bands.run
+   bash 01-run_exciton_bands.run gw-near-gamma.in near_gamma
    ```
 
-   Inspect `exciton_bands.out` and `exciton_bands.log`. Each of the 64 roots
-   at every Q must satisfy the 0.01 meV Davidson residual. The path is
-   Gamma–M–K–Gamma, with extra points near the first Gamma. The script also
-   accepts a deck and output prefix; `gw-near-gamma.in` gives a shorter
-   21-point scan for timing and integration-grid checks.
+   Inspect `exciton_bands.out`/`.log` and `near_gamma.out`/`.log`. The full
+   path has 25 Q points: Gamma, four steps to `(0.05, 0, 0)`, seven to M,
+   six to K and seven back to Gamma. It requests 64 roots with a 0.25 meV
+   Davidson residual budget. The separate scan keeps eight roots with a
+   0.01 meV budget: 20 steps from Gamma to `(0.06, 0, 0)`, then K as an
+   on-grid certification anchor, for 22 Q points in total. Coordinates are
+   fractional reciprocal coordinates. Both use the same 30 × 30 × 1
+   integration grid, six-valence/eight-conduction window and coarse QP data.
 
 3. Source the shared tutorial environment and plot:
 
    ```bash
    source ../../../2-gw/3-lorrax_fully_rel/lorrax_env.sh
-   lorrax_python 02-plot_exciton_bands.py
+   lorrax_python 02-plot_exciton_bands.py --near-gamma-prefix near_gamma
    ```
 
    The plot writes `MoS2_exciton_bands.png` and `.pdf`. Its upper panel
@@ -46,26 +50,41 @@ Instructions
    same QP transitions at each Q. The plot never substitutes the coarse
    gap or a DFT gap for that threshold.
 
-   If a separate dense near-Gamma scan has been completed, use its output
-   prefix for the lower panel:
-
-   ```bash
-   lorrax_python 02-plot_exciton_bands.py --near-gamma-prefix near_gamma
-   ```
-
    The upper panel retains the full-path data and its continuum threshold.
-   The lower panel shows all levels in the supplied near-Gamma scan. These
-   remain ordered energy levels; the plot does not assign optical character.
+   The lower panel shows the eight near-Gamma levels within 0.12 Å⁻¹;
+   the distant K certification anchor is outside that zoom. These remain
+   ordered energy levels; the plot does not assign optical character.
+
+Exchange certification
+----------------------
+
+The runner uses `--vq-mode refit --refit-window bse` and the existing
+`visualization` certificate grade, whose exchange-comparison gate is 1 meV.
+Matched on-grid checks on the 24 × 24 and 30 × 30 integration grids gave
+0.01963 and 0.02086 meV, respectively. These pass the visualization gate
+and exceed the 0.01 meV reference gate. They measure refitted versus stored
+exchange eigenvalues, not the error of the exciton energies against a
+converged calculation or a comparison between the two integration grids.
+The solver uses a tighter absolute residual budget on both members of each
+certification comparison, independently of the plotting budget.
+
+The script accepts `deck`, `prefix` and `grade` as three optional positional
+arguments. For example, `bash 01-run_exciton_bands.run gw.in reference
+reference` requests the stricter grade and refuses when its gate is missed.
+The driver's own default remains `reference`; the tutorial selects
+`visualization` explicitly for an illustrative figure. No certificate
+constant or refusal is changed.
 
 Calculation settings
 --------------------
 
 The fine integration grid controls the electron-hole sum. It does not
 replace the 3 × 3 × 1 screening data or establish convergence of that
-coarse calculation. Compare otherwise identical 18 × 18, 24 × 24 and
-30 × 30 near-Gamma scans before choosing a cheaper integration grid.
-Retain enough levels to reach the independent-particle threshold if the
-goal is to inspect the onset of the continuum.
+coarse calculation. Compare otherwise identical 24 × 24 and 30 × 30 scans
+before choosing a cheaper integration grid. The exchange certification above
+does not establish that integration-grid convergence. At each Q, check the
+highest requested level against the matched independent-particle threshold;
+64 roots are not assumed to reach the continuum.
 
 For a bright exciton doublet in two dimensions, long-range exchange can
 produce a leading linear term in |Q| for the longitudinal combination,

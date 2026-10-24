@@ -45,7 +45,7 @@ four-GPU node for LORRAX.
 | Fine BSE grid | 8 × 8 × 1, shifted by (0.47, 0.37, 0) in grid-step units |
 | Fine BSE bands | Six valence and eight conduction; all 3,072 Tamm–Dancoff roots |
 | Spectrum | 0.15 eV Gaussian width; 0.01 eV spacing |
-| Exciton bands | Γ-centered 30 × 30 × 1 integration grid; six valence and eight conduction bands; 64 lowest roots per Q |
+| Exciton bands | Γ-centered 30 × 30 × 1 integration grid; six valence and eight conduction bands; 64 roots along the full path and eight in the near-Γ scan |
 
 ## Steps {: #instructions }
 
@@ -110,8 +110,9 @@ The final LORRAX stage solves the finite-momentum BSE along Γ–M–K–Γ:
 ```bash
 cd 3-bse/3-lorrax_fully_rel/3-exciton-bands
 bash 01-run_exciton_bands.run
+bash 01-run_exciton_bands.run gw-near-gamma.in near_gamma
 source ../../../2-gw/3-lorrax_fully_rel/lorrax_env.sh
-lorrax_python 02-plot_exciton_bands.py
+lorrax_python 02-plot_exciton_bands.py --near-gamma-prefix near_gamma
 ```
 
 The [exciton-bands driver](../drivers/exciton-bands/index.md) uses the
@@ -119,22 +120,40 @@ same native GW restart as the optical calculation. H-transform interpolation
 supplies the conduction states at k + Q; the hole remains at k. Its
 Γ-centered 30 × 30 × 1 grid samples the electron-hole sum, while screening
 and the QP Hamiltonian still originate on the 3 × 3 × 1 coarse grid.
-The additional points make the dispersion smoother; they do not establish
-convergence of the coarse screening.
+The 25-point full path has four steps from Γ to `(0.05, 0, 0)`, seven to M,
+six to K and seven back to Γ. Its 64 roots use a 0.25 meV Davidson residual
+budget. The separate eight-root scan uses 0.01 meV and 20 steps from Γ to
+`(0.06, 0, 0)`, followed by K as an on-grid certification anchor. All Q
+coordinates are fractional reciprocal coordinates. The plot's near-Γ panel
+keeps only the portion within 0.12 Å⁻¹, excluding that distant anchor.
+Both scans reuse the same coarse QP data. Smoother momentum sampling does
+not establish convergence of the coarse screening or the integration grid.
+
+For this illustrative figure the runner explicitly selects the existing
+**visualization** exchange certificate, with a 1 meV gate. Matched on-grid
+refitted-versus-stored exchange checks measured 0.01963 meV on 24 × 24 and
+0.02086 meV on 30 × 30. Those checks pass this grade and exceed the
+0.01 meV reference gate; they do not make the resulting energies reference
+values or establish convergence between the grids. Both members of each
+certificate comparison use a tighter absolute solver residual budget than
+the plotting solve. The driver's own **reference** default and all gates
+remain unchanged. A third runner argument selects that stricter grade,
+for example `bash 01-run_exciton_bands.run gw.in reference reference`.
 
 `exciton_bands.dat` contains the 64 lowest levels at each Q. The plot shows
 those levels along the full path and enlarges the low-energy structure near Γ.
 A matching `exciton_bands_continuum.dat` adds the independent-particle
 threshold from the same interpolated QP transitions, rather than from the
-coarse gap. Increase the root count if the highest plotted level does not
-reach that threshold.
+coarse gap. Check the highest retained level at every Q: 64 roots are not
+assumed to reach that threshold. Increase the root count when the goal is
+to inspect the continuum onset and the requested levels stop below it.
 
 In two dimensions, long-range exchange permits a leading term linear in
 |Q| for a longitudinal bright combination, while its transverse partner
 starts quadratically. Compare these shapes near Γ. Energies alone do not
 identify a branch as bright or dark, or fix its polarization. For a cheaper
-integration grid, first compare the supplied short `gw-near-gamma.in` scan
-at otherwise identical 18 × 18, 24 × 24 and 30 × 30 settings. The original
+integration grid, first compare otherwise identical 24 × 24 and 30 × 30
+scans; the exchange certificate is a separate check. The original
 workshop has no corresponding exciton-dispersion step.
 
 ## Results {: #results }
