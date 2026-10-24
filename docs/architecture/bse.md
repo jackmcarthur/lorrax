@@ -477,11 +477,13 @@ same field ([TD-aGW end to end](../how-to/td-agw-workflow.md#circular-drives)).
 ## W_BSE: the ladder in GW screening
 
 `screening_diagrams = w_bse` is a GW option: Σ uses the ladder-corrected
-$W(z) - v = v(z - H)^{-1}v$, with the BSE Hamiltonian's static direct rung in
-$H$ (`gw.screening_bse`, `bse.w_ladder`). The stage persists the RPA W(0), then
+$W^c(z)=C(z-H)^{-1}B$, with density vertices at both ends and a static
+direct rung in $H$ (`gw.screening_bse`, `bse.w_ladder`). The stage persists the RPA W(0), then
 solves the resolvent one z at a time with ψ held 2-D at 1/P, by GMRES with a
 recycled spectral deflation per (q, z) (`bse_feast.harvest_spectral_deflation`).
 Keys, supported modes and refusals: [input reference](../input_reference.md).
+This changes the screening in $\Sigma=iGW$; it does not add a matching
+self-energy vertex or close the self-consistent Hedin equations.
 
 The direct rung scans individual trials within each probe block. Its encoded
 `T(mu,nu,s,s,k)` and FFT/decode scratch are reused, so this largest temporary
@@ -491,26 +493,134 @@ without gathering the complete transition window on every rank. Exchange
 and diagonal terms remain batched; their smaller trial/centroid buffers and
 the returned trial block still grow with the probe count.
 
-The rung uses the same k-convolution router and band-projection owner as the
-optical/exciton kernels. At stored +q the physical branches are
-R=(c,k+q;v,k) and A=(v,k+q;c,k). Their distinct density vertices are
-$F_R=\overline{\psi_{c,k+q}}\psi_{v,k}$ and
-$F_A=\overline{\psi_{v,k+q}}\psi_{c,k}$. The source is
-$[F_R;-F_A]v$, the readout is $v[F_R^\dagger,F_A^\dagger]$, and
-all four Hartree blocks are their outer product. Every direct block uses
-$\overline{\psi_{m_I}}\psi_{m_J}W\psi_{n_I}\overline{\psi_{n_J}}$.
-One summed ket field and one k convolution serve both bra decodes; the anti
-band owners move through the existing transpose-peer collective. This
-requires neither a real-orbital gauge nor a Kramers sewing matrix.
+### Physical resonant and antiresonant branches
 
-The solver retains both branches through values, slopes and H-power moments
-until this readout. For the macroscopic velocity dipole $d=v_{cv}/\Delta$,
-the matching source is $[d;\bar d]$ and readout $[d^\dagger;-d^T]$,
-with prefactor $2/(\Omega N_k n_{spin}n_{spinor})$. The consumer restores
-the macroscopic head once. The backend convention is `physical-ra-v1`;
-persisted response banks from the former hybrid convention must be rebuilt.
-The unchanged folded RPA body remains an independent control; the explicit
-physical zero-direct-rung response matches its Dyson result at every q.
+At stored $+q$ use the two physical transitions
+
+$$
+R=(m=c,k+q;n=v,k),\qquad A=(m=v,k+q;n=c,k).
+$$
+
+Let $I$ run over both branches, $\eta_I=f_{n_I}-f_{m_I}$ ($+1$ on R,
+$-1$ on A), $D_{II}=\epsilon_{m_I}-\epsilon_{n_I}$, and
+$F_I(\mu)=\sum_s\overline{\psi_{m_I}(\mu,s)}\psi_{n_I}(\mu,s)$.
+The antiresonant diagonal is negative and its orbitals differ from R.
+With uniform full-zone k weights the physical density operator is
+
+$$
+H=D+\eta(K^{\rm H}-K^{\rm d}),\qquad
+K^{\rm H}=\frac{g}{N_k}FV_qF^\dagger,
+\qquad B=\frac{1}{\sqrt{N_k}}\eta FV_q,\qquad
+C=\frac{g}{\sqrt{N_k}}V_qF^\dagger.
+$$
+
+$g$ is the shared exchange spin weight (2 for a scalar singlet, 1 for
+spinors). All four Hartree blocks use these same vertices. For any two
+physical pairs the positive direct matrix element is
+
+$$
+K^{\rm d}_{IJ}=\frac{1}{N_k}\sum_{\mu\nu ss'}
+\overline{\psi_{m_I}(\mu,s)}\psi_{m_J}(\mu,s)
+W^{\rm RPA}_{\mu\nu}(k_I-k_J;0)
+\psi_{n_I}(\nu,s')\overline{\psi_{n_J}(\nu,s')}.
+$$
+
+This equation supplies R–R, R–A, A–R and A–A. The direct rung has no extra
+singlet factor. Both shifted electron and shifted hole orbitals are loaded
+at physical $k+q$; `build_finite_q_data` uses the existing roll-index owner
+with argument $-q$ to obtain that gather, while keeping the tile $V_q$.
+The construction needs neither real orbitals nor a band sewing matrix at
+Kramers points. Arbitrary complex phases and rotations of degenerate
+one-particle states must transform source, operator and readout together.
+
+The rung uses the same k-convolution router and band-projection owner as
+the optical/exciton kernels. One summed ket field and one k convolution
+serve both physical bra decodes; the anti band owners move through the
+existing transpose-peer collective. This shares the contraction machinery,
+without identifying the two physical vertices or substituting the optical
+solver's real-linear coordinate convention.
+
+The unchanged folded RPA body remains an independent control. Setting
+$K^{\rm d}=0$ in the explicit-branch response reproduces the Dyson RPA
+response at every q. The former hybrid of folded density vertices and
+optical direct blocks is not a valid ladder operator in complex orbital
+gauges. Its results are historical, not a convention to reuse. The backend
+identity is `physical-ra-v1`; response banks from the former convention
+must be rebuilt.
+
+### Samples, slopes and moments
+
+Both branches remain present through the shifted solves and exact actions:
+
+$$
+W^c(z)=C(z-H)^{-1}B,\qquad
+\partial_z W^c(z)=-C(z-H)^{-2}B,\qquad
+\mathcal M_j=\tfrac12 CH^jB.
+$$
+
+For $s=z^2$ and $z\ne0$, the tangential slope is
+$\partial_sW^c=(2z)^{-1}\partial_zW^c$. With measured time reversal,
+$W^c(z)=W^c(-z)$ and $\mathcal M_0=\mathcal M_2=0$, so
+$W^c(z)=2\mathcal M_1/z^2+2\mathcal M_3/z^4+\cdots$.
+The bank gates the reflected solves and forbidden moments before the
+even-$s$ fit. It does not average a noneven response into this model or
+replace ladder slopes or moments with RPA values.
+
+The tangential adapter samples this operator at the ordinary recipe's
+complex supports, supplies its exact slopes and moments to the existing
+constructor, and passes the resulting shared real poles to the unchanged
+Σ executor. Canonical centroid outputs are packed through the run's one
+basis owner before fitting. The identity binds the branch convention,
+static-rung digest and head policy; an RPA bank or another rung cannot
+authenticate as this ladder. The elementwise `mpa` parent handoff remains
+refused. Supported modes and parse refusals are owned by the
+[input reference](../input_reference.md).
+
+### Macroscopic head: the same operator, restored once
+
+The headless Γ operator already includes microscopic Hartree local fields
+and the direct rung. For the velocity dipole $d=v_{cv}/\Delta=i r_{cv}$ its
+matched source is $[d;\bar d]$ and readout $[d^\dagger,-d^T]$:
+
+$$
+\Xi_{ab}(z)=\frac{2}{\Omega N_k n_{\rm spin}n_{\rm spinor}}
+\big[d^\dagger,-d^T\big]_a(z-H_\Gamma)^{-1}
+\begin{bmatrix}d\\\bar d\end{bmatrix}_b.
+$$
+
+`head_resolvent.project_head_response` owns this readout. With both Hartree
+and direct kernels disabled, the free-pair limit agrees with the direct
+velocity tensor in the same units and band window. Properly matched folded
+RPA coordinates remain valid;
+mixing their branch sum with the physical operator does not.
+
+Only the longitudinal symmetric part of $\Xi$ enters the scalar head.
+`response_kind=micro_reducible` tells the shared head provider that its
+microscopic local fields are already present. It restores the omitted
+macroscopic Coulomb channel once, then performs the same 3D or slab
+mini-BZ average. Applying the RPA $S+YWZ$ Schur fold again would double
+count microscopic screening. No Γ head is also inserted into the body
+resolvent.
+
+The full-frequency scalar head uses fresh Γ solves at its own fit and
+imaginary-moment nodes, including static and reflected nodes. Evenness,
+imaginary-axis sign and solve residuals are checked before the existing
+scalar fitter is used. Its convention is
+$W^c_{\rm head}(z)=\sum_p2\Omega_p B_p/(z^2-\Omega_p^2)$;
+the head's inverse-frequency moment $M_1^{\rm head}=\sum_pB_p/\Omega_p^2$
+is distinct from the body's high-frequency $\mathcal M_1$ above.
+
+### Self-consistency is a separate, refused extension
+
+The implemented ladder route is single-shot. A self-consistent map would
+need its own current energies, occupied/empty pair window, wavefunctions,
+velocity vertices and freshly screened static rung
+$W^{\rm RPA}[G_n](0)$, followed by a new ladder bank, head and poles before
+evaluating that map's Σ. The resulting map also needs an identity binding
+all of these objects. Reusing the initial rung while updating $G$ defines
+a frozen-kernel approximation, not that self-consistent ladder map.
+`w_bse_self_consistency_unimplemented` therefore remains a refusal; shared
+Σ/pole infrastructure by itself does not certify this extension.
 
 ## Refusals
 

@@ -59,20 +59,21 @@ $$
 
 The product $Y W^{\mathrm{body}}_\Gamma Z$ is contracted over $(\mu,\nu)$. `head_correction` selects the policy:
 
+The ladder route `screening_diagrams = w_bse` supplies a different reduction state: the micro-reducible Γ tensor $\Xi(z)$ from the same physical resonant/antiresonant operator as its body. For $d=v_{cv}/\Delta$, its source is $[d;\bar d]$ and readout $[d^\dagger,-d^T]$, with prefactor $2/(V_{\mathrm{cell}}N_k n_{\mathrm{spin}}n_{\mathrm{spinor}})$. Microscopic Hartree local fields and the static direct rung are already in that resolvent. `response_kind = micro_reducible` therefore bypasses (1.3): only the omitted macroscopic Coulomb channel is restored before the same mini-BZ average. Applying $S+YWZ$ again would double count screening. The head's full-frequency scalar fit uses its own Γ resolvent samples and inverse-frequency moment, while the body's tangential fit uses high-frequency moments. See the [ladder response](../drivers/gw/theory.md#scr-w) and its canonical equations.
+
 | `head_correction` | Head response | Use |
 |---|---|---|
-| `full` (default) | $S^{\mathrm{eff}}$: $S$ folded once against $W^{\mathrm{body}}_\Gamma$ | production |
-| `no_local_fields` | $S$ alone, no wings and no fold (the direct head) | metals on four-current input files; comparison |
+| `full` (default) | RPA: $S^{\mathrm{eff}}$ folded once; ladder: the already micro-reducible $\Xi$ | production |
 | `off` | no head: $\bar v_{00}=\bar W_{00}=0$ | debugging brute-force k convergence |
 
-Under `bispinor_gw = full_tangential` an unset `head_correction` resolves to `no_local_fields`, and an explicit `full` refuses. On a time-reversal-broken (ordered) tangential store `full` folds the signed Γ body $b\,D_+b^\dagger-[b\,D_-b^\dagger]^{\mathsf T}$, $D_\pm(z)=1/(z\mp\Omega)$, against wings summed over both orders of every band pair; on an ordered metal `full` refuses (`GATE tangential_head_ordered`) and `no_local_fields` is the route. The retired `do_G0` maps `false` to `off` and `true` to `full`. The four-current routes carry further Lorentz channels; this page covers the scalar charge head.
+`full` and `off` are the current scalar policies; `no_local_fields` is retired. On a time-reversal-broken (ordered) tangential store, `full` folds the signed Γ body against wings summed over both orders of every band pair, including on a metal. Under `bispinor_gw = full_tangential`, the charge/current Γ blocks come from the coupled sector head, without the scalar RPA fold; the transverse head is always present. This page covers the scalar charge channel; the [four-current theory](https://github.com/jackmcarthur/lorrax/blob/main/docs/theory/bispinor-gw.md#head) owns the sector policy.
 
 ### <span class="n">1.4</span> Where the head response comes from {: #sources }
 
 `qsgw_head.build_dft_head_response`
 {: .in-code }
 
-Three producers return $S$ in the convention of (1.2). One-shot runs with `head_correction = full` build $S$, the wings and the fold from `dipole.h5` on the run's own occupations. The direct resolver serves `no_local_fields`, `x_only` and the exchange head of self-consistent runs; its source is `wcoul0_source` (default `s_tensor`, which reads `dipole.h5`). QSGW maps rebuild $S$ from the QP-rotated velocity when `sc_head_update` asks for it ([Quasiparticle self-consistency](qsgw.md)).
+The RPA producers return $S$ in the convention of (1.2). One-shot RPA runs with `head_correction = full` build $S$, the wings and the fold from `dipole.h5` on the run's own occupations; W_BSE supplies the distinct micro-reducible tensor described above. The direct resolver also serves `x_only` and the exchange head of self-consistent runs; its source is `wcoul0_source` (default `s_tensor`, which reads `dipole.h5`). QSGW maps rebuild $S$ from the QP-rotated velocity when `sc_head_update` asks for it ([Quasiparticle self-consistency](qsgw.md)).
 
 !!! note
     `dipole.h5` must exist on every route that reads the direct resolver. A `dipole.h5` built with another velocity operator, with or without the nonlocal commutator, refuses on every route (`GATE static_head_dipole_operator`, `GATE dft_head_dipole_provenance`). One written for another WFN or band window refuses on the folded `full` head (`GATE dft_head_dipole_provenance`); on the direct resolver it only warns, unless `LORRAX_SANITY=strict`. Rerun the [dipole utility](../utilities/dipole.md).

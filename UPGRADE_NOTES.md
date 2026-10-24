@@ -5,6 +5,30 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-23 — W_BSE uses physical resonant and antiresonant pairs
+
+The ladder density response now retains the distinct physical transitions
+`(c,k+q;v,k)` and `(v,k+q;c,k)` through its operator, source, readout,
+slopes and moments. The former hybrid branch convention could violate
+frequency evenness in complex spinor gauges even with converged shifted
+solves. Ladder results can move; rebuild banks and models from that
+convention. Their new operator identity contains `physical-ra-v1` and the
+static-rung digest. The folded RPA body remains a control.
+
+The Γ tensor uses the same physical operator with its matched velocity
+vertices. It is already micro-reducible: the head provider restores the
+macroscopic Coulomb channel once, without another RPA local-field fold.
+Full-frequency ladder samples, exact slopes and moments feed the common
+tangential constructor and shared-pole Σ executor. The scalar head has its
+own resolvent samples and inverse-frequency-moment fit; its moment is not
+the body's high-frequency moment. No even-frequency averaging repairs an
+operator that fails the symmetry gate.
+
+Self-consistent W_BSE remains refused. It requires a current-state static
+rung and authenticated operator/head/bank rebuild on every map; a frozen
+initial rung is a different approximation. Equations, normalization and
+source owners: [BSE architecture](docs/architecture/bse.md#w_bse-the-ladder-in-gw-screening).
+
 ## 2026-10-23 — slab heads share the graded mini-BZ rule
 
 All slab scalar and photon heads now use the existing radially graded
