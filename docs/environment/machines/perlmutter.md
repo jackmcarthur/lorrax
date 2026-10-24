@@ -23,14 +23,21 @@ On released 0.12.0.1, a real shared-pole constructor at P = 64 on two CPU
 nodes (8 × 8 mesh, four physical cores per rank) still aborts in
 `MPI_Allgather` with inconsistent panel counts. The failing run used a fresh
 compile and authenticated inputs; this is not cleared by the P = 4 tests.
-Larger CPU runs, including the former P = 144 compiler/VMA limit, remain
-uncertified.
 
-The official CPU nightly pair `jax/jaxlib==0.12.1.dev20261023` passes that
-same P = 64 constructor from both a fresh compile and a fresh-process cache
-reload. Its XLA pin is `4dc8a9012437`; this is a bounded upstream-build
-comparison, not certification of a full P = 64 GW run or a default-lock
-change.
+The official CPU nightly pair `jax/jaxlib==0.12.1.dev20261023` (XLA
+`4dc8a9012437`) completes full shared-pole GW at P = 64 on two Milan nodes.
+The Fe 8 × 8 × 8 case has 110 summed bands, 1099 centroids and QP bands
+1–22 at 59 irreducible k points. Both a cold run and a fresh-process cached
+run pass the complete finite Σ/EQP checks. Strict comparisons pass for
+P = 64 cold versus P = 16 cold (maximum QP1 difference 0.671 µeV) and for
+P = 64 warm versus cold (0.515 µeV). Every warm rank reports zero new
+driver backend compilations, with startup counted separately.
+
+Those full CPU runs use frozen source `ed16e34dd`, NumPy 2.4.3 and SciPy
+1.17.1 (job 60223103), four physical cores per rank and two BLAS/OpenMP
+threads. This qualifies that private nightly environment; the default lock
+is unchanged and the released 0.12.0.1 CPU P = 64 failure remains.
+P = 144, including the former compiler/VMA limit, remains uncertified.
 
 ## GPU task geometry {#required-gpu-task-geometry}
 
