@@ -100,6 +100,37 @@ def test_concurrent_runs_while_ranks_hold_the_image(tmp_path):
     assert sum("restored" in o[1] for o in outs) == 1
 
 
+def test_no_node_local_room_runs_from_one_shared_copy(tmp_path):
+    """No node-local directory has room (df reports 1 byte free): the node links the
+    canonical path to ONE extracted copy beside the archive and says why; cleaning that
+    image later removes the link, never the shared copy other nodes use."""
+    tree = tmp_path / "node" / "rt-e"
+    mtimes = _make_tree(tree)
+    store = tmp_path / "prefix" / "images"
+    store.mkdir(parents=True)
+    archive = store / "rt-e.tar"
+    _run("pack", tree, archive)
+    shutil.rmtree(tree)
+    fake = tmp_path / "fakebin"
+    fake.mkdir()
+    (fake / "df").write_text("#!/bin/sh\necho 'Filesystem 1B-blocks Used Available Use% Mounted'\n"
+                             "echo 'x 100 99 1 99% /'\n")
+    (fake / "df").chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}", "LORRAX_IMAGE_ROOTS": ""}
+    r = _run("restore", archive, env=env)
+    shared = tmp_path / "prefix" / "unpacked" / "rt-e"
+    assert "no node-local directory holds" in r.stderr and str(shared) in r.stderr, r.stderr
+    assert tree.is_symlink() and Path(os.readlink(tree)) == shared
+    for path, ns in mtimes.items():
+        assert Path(path).stat().st_mtime_ns == ns, path
+    other = tmp_path / "node" / "rt-f"                       # a later image restored normally
+    _make_tree(other)
+    archive_f = tmp_path / "rt-f.tar"
+    _run("pack", other, archive_f)
+    _run("clean", archive_f)
+    assert not tree.exists() and not tree.is_symlink() and shared.is_dir()
+
+
 def test_reused_release_id_refuses(tmp_path):
     tree = tmp_path / "node" / "rt-c"
     _make_tree(tree)

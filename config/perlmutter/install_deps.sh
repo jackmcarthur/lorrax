@@ -73,7 +73,7 @@ set -euo pipefail
 UV_VERSION=0.13.5
 REPO=https://github.com/jackmcarthur/lorrax.git
 
-PREFIX="" REF=main WITH_XC=0 BUILD_FFI=1 SPACE_CHECK=1 MODE=image NODE_DIR="" REBUILD=0
+PREFIX="" REF=main WITH_XC=0 BUILD_FFI=1 SPACE_CHECK=1 MODE=image NODE_DIR="" REBUILD=0 HAVE_IMAGE=0
 while (($#)); do
     case "$1" in
         --no-space-check) SPACE_CHECK=0; shift ;;
@@ -220,10 +220,11 @@ else
         [[ -n "$REV" ]] || REV="$REF"                     # a commit id
     fi
     _opts="$( ((WITH_XC)) && printf -- -xc)$( ((BUILD_FFI)) || printf -- -noffi)"
-    _cur="$(basename "$(readlink -f "$PREFIX/current" 2>/dev/null || true)" .tar.zst)"
-    if ((!REBUILD)) && [[ "$_cur" == "rt-${REV:0:12}$_opts-"* && -f "$PREFIX/images/$_cur.tar.zst.meta" ]]; then
-        say "PREFIX already holds the image $_cur of ${REV:0:12} (--rebuild builds a new one)"
-        ID="$_cur"
+    _cur="$(readlink -f "$PREFIX/current" 2>/dev/null || true)"
+    HAVE_IMAGE=0
+    if ((!REBUILD)) && [[ "$(basename "$_cur")" == "rt-${REV:0:12}$_opts-"* && -f "$_cur.meta" ]]; then
+        ID="$(basename "${_cur%.tar.zst}" .tar)"; HAVE_IMAGE=1
+        say "PREFIX already holds the image $ID of ${REV:0:12} (--rebuild builds a new one)"
     else
         ID="rt-${REV:0:12}$_opts-$(date +%m%d%H%M%S)"
     fi
@@ -233,7 +234,7 @@ else
     export CCACHE_BASEDIR="${CCACHE_BASEDIR:-$TREE}"  # hits across image ids
 fi
 
-if [[ "$MODE" == image && ! -f "$PREFIX/images/$ID.tar.zst" ]]; then
+if [[ "$MODE" == image && $HAVE_IMAGE == 0 ]]; then
     trap 'echo "install_deps: FAILED; the build tree is left at $TREE (rm -rf $TREE when done)" >&2' ERR
     say "building the runtime image $ID at $TREE (source ${REV:0:12} from $SRC_REPO)"
     rm -rf "$TREE"; mkdir -p -m 700 "$NODE_DIR"; mkdir -p "$ROOT"
@@ -248,7 +249,7 @@ if [[ "$MODE" == image && ! -f "$PREFIX/images/$ID.tar.zst" ]]; then
 fi
 
 # --- 4. the Python environment, jax_xc, the native pair, bytecode -----------
-if [[ "$MODE" == in-place || ! -f "$PREFIX/images/$ID.tar.zst" ]]; then
+if [[ "$MODE" == in-place || $HAVE_IMAGE == 0 ]]; then
     say "installing Python 3.12 and the locked environment (uv sync --frozen --extra cuda13)"
     (cd "$ROOT" && uv sync --frozen --extra cuda13)
     PY="$ROOT/.venv/bin/python"
@@ -279,7 +280,7 @@ fi
 mkdir -p "$PREFIX/share/lorrax"
 ENVF="$PREFIX/lorrax-env.sh"
 if [[ "$MODE" == image ]]; then
-    if [[ ! -f "$PREFIX/images/$ID.tar.zst" ]]; then
+    if [[ $HAVE_IMAGE == 0 ]]; then
         say "packing the image into $PREFIX/images ($(du -sh "$TREE" | cut -f1) unpacked)"
         bash "$ROOT/scripts/runtime_image.sh" install "$TREE" "$PREFIX"
         cp "$ROOT/config/perlmutter/gpu_env.sh" "$ROOT/config/perlmutter/postinstall.sh" "$PREFIX/share/lorrax/"
@@ -293,7 +294,7 @@ if [[ "$MODE" == image ]]; then
         echo "export PATH=\"$PREFIX/bin:\$PATH\""
         echo "source \"$PREFIX/share/lorrax/gpu_env.sh\""
     } > "$ENVF"
-    RUNLINE="srun -N 1 -n 4 --gpus-per-node=4 lorrax-run python -u -m gw.gw_jax -i deck.in"
+    RUNLINE="srun -N 1 -n 4 --gpus-per-node=4 lorrax-run python -u -m gw.gw_jax -i input.in"
 else
     cp "$ROOT/config/perlmutter/gpu_env.sh" "$ROOT/config/perlmutter/postinstall.sh" "$PREFIX/share/lorrax/"
     {
@@ -303,7 +304,7 @@ else
         ((WITH_XC)) && echo "export PYTHONPATH=\"$PREFIX/xc-site\${PYTHONPATH:+:\$PYTHONPATH}\""
         echo "source \"$ROOT/config/perlmutter/gpu_env.sh\""
     } > "$ENVF"
-    RUNLINE="srun -N 1 -n 4 --gpus-per-node=4 \$LORRAX_ROOT/src/ffi/cpp/select_gpu.sh python -u -m gw.gw_jax -i deck.in"
+    RUNLINE="srun -N 1 -n 4 --gpus-per-node=4 \$LORRAX_ROOT/src/ffi/cpp/select_gpu.sh python -u -m gw.gw_jax -i input.in"
 fi
 POST="$PREFIX/bin/lorrax-postinstall"
 {

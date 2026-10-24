@@ -66,6 +66,20 @@ def test_reference_threshold():
     assert pc.vs_ref("fft_ms", 3.0, ref)[0] == "INFO"
 
 
+def test_slow_cache_root_and_launch_fixes():
+    # a cache tree on a DVS home: FAIL naming the knob; Lustre scratch: no line
+    slow = {"cubin": {"path": "/home/u/.cache/lorrax/kconv_mathdx", "fstype": "dvs", "mount": "/home",
+                      "open": {"n": 5, "median_ms": 9.0}, "miss": {"n": 20, "total_s": 0.06}}}
+    fast = {"cubin": {**slow["cubin"], "fstype": "lustre", "open": {"n": 5, "median_ms": 0.2},
+                      "miss": {"n": 20, "total_s": 0.002}}}
+    st, lines = pc.judge_cache_latency([fast, slow])
+    assert st == "FAIL" and "LORRAX_CACHE_ROOT" in lines[0] and "/home/u/.cache/lorrax" in lines[0], lines
+    assert pc.judge_cache_latency([fast])[0] == "PASS"
+    # a slow tree launched without lorrax-run on an image install: the fix is lorrax-run
+    assert "launch with lorrax-run" in pc.stage_fix({"lorrax_run": "/p/bin/lorrax-run"})
+    assert "shared copy" in pc.stage_fix({"image_root": "/tmp/lorrax-u/rt-x", "image_fs": {"fstype": "lustre"}})
+
+
 def test_second_process_miss_fails():
     ranks = [{"rank": 0, "bench_warm": {"cache_stats": {"enabled": True, "probes": 12,
                                                          "hits": 9, "compiles": 3}}}]

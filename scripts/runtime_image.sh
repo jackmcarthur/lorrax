@@ -27,7 +27,7 @@
 # archive is POSIX/pax (nanosecond mtimes).
 #
 # Where the canonical parent cannot hold the tree, the tree goes to the first of
-# LORRAX_IMAGE_ROOTS (default: /dev/shm, $TMPDIR, /local/scratch, /lscratch)
+# LORRAX_IMAGE_ROOTS (default: /tmp, /dev/shm, $TMPDIR, /local/scratch, /lscratch)
 # with room, and <tree> becomes a symlink to it; the closure gate compares
 # realpaths, so it still does not rehash.  With no node-local directory large
 # enough, the node runs from ONE extracted copy on the install filesystem
@@ -59,7 +59,7 @@ _gb() { awk -v b="$1" 'BEGIN {printf "%.1f GB", b / 1e9}'; }
 _now() { date +%s.%N; }
 _since() { awk -v a="$1" -v b="$(_now)" 'BEGIN {printf "%.1f", b - a}'; }
 _user() { echo "${USER:-$(id -un)}"; }
-_roots() { echo "${LORRAX_IMAGE_ROOTS-/dev/shm ${TMPDIR:-} /local/scratch /lscratch}"; }
+_roots() { echo "${LORRAX_IMAGE_ROOTS-/tmp /dev/shm ${TMPDIR:-} /local/scratch /lscratch}"; }
 
 cmd_pack() {
     local tree=${1:?tree} archive=${2:?archive}
@@ -153,6 +153,7 @@ cmd_restore() {
     need=$(( bytes + $(stat -c %s "$archive") + bytes / 10 + (1 << 30) ))   # tree + fetched archive
     for root in "$parent" $(_roots); do
         [ -n "$root" ] && [ -d "$root" ] && [ -w "$root" ] || continue
+        [ "$root" = "$parent" ] || [ "$root/lorrax-$(_user)" != "$parent" ] || continue   # the parent itself
         free=$(_free_bytes "$root"); [ -n "$free" ] || continue
         if [ "$free" -ge "$need" ]; then place=$root; break; fi
         tried+=" $root $(_gb "$free")"
@@ -262,13 +263,14 @@ cmd_run() {
 # shared extracted copies) are removed: a job reads the archive only while it
 # restores, and the image of a running job lives on its nodes.
 cmd_install() {
-    local tree=${1:?tree} install=${2:?install dir} base old
+    local tree=${1:?tree} install=${2:?install dir} base old ext=tar.zst
     base=$(basename "$tree")
+    command -v zstd >/dev/null 2>&1 || { ext=tar; _say "no zstd here: packing an uncompressed .tar (about 2x larger)"; }
     mkdir -p "$install/images" "$install/bin"
-    cmd_pack "$tree" "$install/images/$base.tar.zst"
+    cmd_pack "$tree" "$install/images/$base.$ext"
     cp "${BASH_SOURCE[0]}" "$install/bin/lorrax-run.tmp" && chmod 755 "$install/bin/lorrax-run.tmp"
     mv "$install/bin/lorrax-run.tmp" "$install/bin/lorrax-run"
-    ln -sfn "images/$base.tar.zst" "$install/current.tmp" && mv -T "$install/current.tmp" "$install/current"
+    ln -sfn "images/$base.$ext" "$install/current.tmp" && mv -T "$install/current.tmp" "$install/current"
     for old in "$install"/images/*.tar.zst "$install"/images/*.tar "$install"/unpacked/*; do
         [ -e "$old" ] || continue
         case "$(basename "$old")" in "$base"|"$base".tar.zst|"$base".tar) continue ;; esac

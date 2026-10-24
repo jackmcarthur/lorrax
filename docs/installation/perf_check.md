@@ -18,8 +18,14 @@ every imported Python file).
 Use the `srun` line your production runs use; the check judges the install,
 the node and the launch together.
 
+For an `install_deps.sh` install, `lorrax-postinstall` runs it the way every job
+runs (through `lorrax-run`, so it judges the restored image); rerunning
+`lorrax-postinstall` skips the kernel store once it is complete. By hand:
+
 ```bash
-source <prefix>/lorrax-env.sh            # or: module load <the LORRAX module>
+source <prefix>/lorrax-env.sh
+srun -N 1 -n 4 --gpus-per-node=4 lorrax-run bash -c 'exec python $LORRAX_ROOT/scripts/perf_check.py'
+# an --in-place install, a clone or a module: the tree's own select_gpu.sh
 srun -N 1 -n 4 -c 16 --threads-per-core=1 --cpu-bind=threads --gpus-per-node=4 \
     env OMP_NUM_THREADS=14 $LORRAX_ROOT/src/ffi/cpp/select_gpu.sh \
     python $LORRAX_ROOT/scripts/perf_check.py
@@ -45,8 +51,8 @@ takes about two minutes on four A100s.
 
 | component | FAIL when | fix |
 |---|---|---|
-| 1 filesystem {#filesystem} | warm open()+close() median of ~500 install files, all ranks at once, ≥ 1.0 ms (PASS ≤ 0.5 ms); warm `os.walk`+`lstat` of the venv < 5000 entries/s; a read-only tree without `.pyc` | stage the runtime node-local, or install on a fast filesystem (Lustre `$SCRATCH`); `python -m compileall` at install, or `PYTHONPYCACHEPREFIX` on node-local storage |
-| 2 caches | the compile or cubin cache is not writable; a second process misses the persistent compile cache; a cubin store without images for this GPU | point `SCRATCH` or `ISDF_JAX_CACHE_DIR` at a writable fast filesystem; rebuild the store (`scripts/build_cubin_store.py`) |
+| 1 filesystem {#filesystem} | warm open()+close() median of ~500 install files, all ranks at once, ≥ 1.0 ms (PASS ≤ 0.5 ms); warm `os.walk`+`lstat` of the venv < 5000 entries/s; a read-only tree without `.pyc`; an `LD_LIBRARY_PATH` entry ≥ 1.0 ms per failed lookup (a slow `PATH` entry warns) | depends on the launch: on an `install_deps.sh` install launched without it, launch with `lorrax-run`; under `lorrax-run` on a node without node-local room (the image ran from the shared copy), free `/tmp` or set `LORRAX_IMAGE_ROOTS`; otherwise reinstall with `install_deps.sh`. `python -m compileall` at install, or `PYTHONPYCACHEPREFIX` on node-local storage |
+| 2 caches | the compile or cubin cache is not writable; its directory costs ≥ 1.0 ms per open or failed lookup (warm, slowest rank; a run looks up every compiled program and NVRTC image there); a second process misses the persistent compile cache; a cubin store without images for this GPU | `export LORRAX_CACHE_ROOT=<fast filesystem>` (or `ISDF_JAX_CACHE_DIR` for the compile cache) and rerun `lorrax-postinstall`; rebuild the store (`lorrax-postinstall`, or `scripts/build_cubin_store.py`) |
 | 3 kernels | the FFI CUDA leg has no SASS for this GPU's `sm_XX`; `CUDA_FORCE_PTX_JIT` or `JAX_DISABLE_JIT` set; the NVRTC path builds no cubin | rebuild the FFI for this architecture; unset the variable |
 | 4 binding | ranks share CPUs; a thread team larger than the rank's CPUs; fewer than two physical cores | `-c <cores per rank> --threads-per-core=1 --cpu-bind=threads`, `OMP_NUM_THREADS` = cores − 2 ([Perlmutter](../environment/machines/perlmutter.md#cpu)) |
 | 5 libraries | an FFI leg refuses to open, its mapped closure differs from its record, two copies of a CUDA library are mapped | rebuild, or fix `LD_LIBRARY_PATH` |

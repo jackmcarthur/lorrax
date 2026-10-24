@@ -255,10 +255,12 @@ def node_topology() -> dict:
 def suggested_srun(ngpu: int, topo: dict, entry: str) -> str:
     phys = topo.get("physical") or 64
     per = max(2, phys // max(ngpu, 1))
-    sel = ROOT / "src/ffi/cpp/select_gpu.sh"
+    run = launch_info().get("lorrax_run")
+    # A runtime-image install: lorrax-run restores the image and execs select_gpu.sh itself.
+    sel, py = (run, "python") if run else (ROOT / "src/ffi/cpp/select_gpu.sh", shlex.quote(sys.executable))
     return (f"srun -N 1 -n {ngpu} -c {per} --threads-per-core=1 --cpu-bind=threads "
             f"--gpus-per-node={ngpu} env OMP_NUM_THREADS={max(1, per - 2)} "
-            f"{sel} {shlex.quote(sys.executable)} {entry}")
+            f"{sel} {py} {entry}")
 
 
 # ---------------------------------------------------------------------------
@@ -1300,7 +1302,10 @@ def judge_caches(caches: dict, ranks: list[dict]) -> dict:
                      "its published copy will not share entries")
     r0 = next((r for r in ranks if r.get("rank") == 0), {})
     spr = r0.get("store_probe")
-    build_cmd = (f"srun -N 1 -n 1 --gpus-per-node=4 {shlex.quote(sys.executable)} "
+    run = ((r0.get("fs") or {}).get("launch") or {}).get("lorrax_run")
+    build_cmd = (f"lorrax-postinstall (or srun -N 1 -n 1 -c 128 --gpus-per-node=4 {run} --all-gpus python "
+                 f"{ROOT}/scripts/build_cubin_store.py --jobs 16)" if run else
+                 f"srun -N 1 -n 1 --gpus-per-node=4 {shlex.quote(sys.executable)} "
                  f"{ROOT}/scripts/build_cubin_store.py --jobs 16")
     if spr is not None:
         sm = r0.get("sm")
