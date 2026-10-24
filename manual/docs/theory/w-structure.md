@@ -39,7 +39,7 @@ Here $\phi$ collects the pair potentials as columns and only nonzero occupation 
 
 ## <span class="n">3</span> Positivity and moments {: #positivity }
 
-With time reversal, the antiresonant transitions mirror the resonant ones and $W^c$ depends on $z$ only through $s=z^2$. For the RPA in a transition basis with the two time-reversed branches matched, let $\Delta$ contain the positive transition energies and $K$ their Coulomb integrals. The reduction to $N_t$ resonant transitions is
+With time reversal, the antiresonant transitions mirror the resonant ones and $W^c$ depends on $z$ only through $s=z^2$. For the integer-occupation RPA in a transition basis with the two time-reversed branches matched, let $\Delta$ contain the positive transition energies and $K$ their Coulomb integrals. The reduction to $N_t$ resonant transitions is
 
 $$
 W^c_\bq(s)=F^\dagger\,(s-C_\bq)^{-1}F,\qquad C_\bq=\Delta^{1/2}(\Delta+2K)\Delta^{1/2},\qquad F=\sqrt2\,\Delta^{1/2}\phi^\dagger \tag{3.1}
