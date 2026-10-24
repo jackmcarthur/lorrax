@@ -58,9 +58,8 @@ ELLIPSE_GAMMA_FIXED = 0.2
 # matvec objects and so get distinct entries.  Value is (matvec, solver): the matvec
 # reference pins its id() so it cannot be reused by a later object while live.
 _GMRES_SOLVER_CACHE: dict[tuple, tuple] = {}
-# Cache compiled FEAST runners per (operator id, operand ids, knobs), per-process.
-# Key and value shape mirror _GMRES_SOLVER_CACHE above, and for the same reason
-# (see _get_feast_runner): the value pins every object whose id() is in the key.
+# Cache compiled FEAST cores per (operator id, knobs), never their payloads.
+# The matvec reference pins its id; caller-local wrappers own current operands.
 _FEAST_RUNNER_CACHE: dict[tuple, tuple] = {}
 
 
@@ -628,59 +627,21 @@ def _get_feast_runner(
     dtype: jnp.dtype,
     use_conjugate_symmetry: bool = True,
 ) -> Callable:
-    """Return a cached FEAST runner for this operator + operands + knobs.
+    """Bind current operands to one cached FEAST core for this operator/knobs.
 
-    TWO LAYERS, and the split is the whole point.  The jitted core ``_run``
-    takes the ten :func:`matvec_operands` arrays as a RUNTIME ARGUMENT, exactly
-    as the shifted-GMRES engine does (:func:`_get_gmres_solver`, whose operands
-    are what let one executable serve every q / omega).  The Python wrapper
-    returned to the caller supplies them, so the caller's 4-argument call shape
-    is unchanged.
+    The jitted core takes :func:`matvec_operands` as runtime arguments, so
+    different Hamiltonians share the program without sharing their values.
+    Its structural key pins the matvec identity, as the GMRES owner does;
+    JAX specializes that core on actual argument shapes and shardings.
 
-    WHY THE OPERANDS MOVED OUT OF THE CLOSURE.  They used to be captured by the
-    jitted body, which made them compile-time constants of the executable.  Two
-    consequences, one already fixed and one not:
-
-    * a runner computed one operator's answer on one operand set forever, so
-      the module-global cache handed the second of two drivers the first one's
-      program — the silent-wrong-answer hazard this cache's key was widened to
-      close (see below);
-    * **and it could not be traced at all at P>1.**  ``jax.jit`` refuses to
-      close over an array whose shards live on other processes ("Closing over
-      jax.Array that spans non-addressable (non process local) devices is not
-      allowed.  Please pass such arrays as arguments to the function"), and the
-      nine operands are mesh-sharded.  ``bse_feast --feast-ritz`` and
-      ``bse_pseudopoles`` were therefore SINGLE-PROCESS ONLY: the census had to
-      take its whole GMRES iteration-count measurement at P=1 for this reason.
-      Passing the operands as arguments is the fix jax's own error message
-      prescribes, and it makes the closure capture no ``jax.Array`` at all.
-
-    The cache key is UNCHANGED — ``id(matvec)`` plus the ids of the nine operand
-    arrays plus the scalar knobs — and so is the ``(matvec, operands, runner)``
-    value that pins those ids so a later object cannot recycle them while the
-    entry is live.  Keeping it means the wrapper handed back for one operand set
-    is never handed to another, which preserves the fixed hazard's guarantee at
-    the object level on top of the structural guarantee the runtime argument now
-    gives.  It also means compile behaviour is unchanged: one traced core per
-    cache entry, exactly as before.  (A narrower key would now be SOUND, since
-    distinct operand sets can safely share one executable, and would remove the
-    per-window compile that ``gmres_fp32`` pays.  That is a live improvement,
-    deliberately not taken here: it changes compile counts, and this commit is
-    scoped to making P>1 possible.  Registered in
-    ``FIX_solver_robustness.md``.)
-
-    Same contract, and same reason, as :func:`_get_gmres_solver`.  Gated by
-    ``tests/test_bse_feast_runner_cache.py``.
+    Only the returned cheap Python wrapper owns the current operands. The
+    global cache holds no W_R, wavefunctions, V or M after that caller drops
+    its wrapper. The existing four-argument calling convention is unchanged.
     """
-    # Built ONCE, here, and both keyed and passed below, so what the key
-    # measures is exactly what the wrapper feeds the compiled program.
     operands = matvec_operands(data)
-    key = (id(matvec), tuple(id(a) for a in operands),
-           n_quad, n_ritz, max_iter, float(tol), float(ry_to_ev), str(dtype),
+    key = (id(matvec), n_quad, n_ritz, max_iter, float(tol), float(ry_to_ev), str(dtype),
            bool(use_conjugate_symmetry))
     hit = _FEAST_RUNNER_CACHE.get(key)
-    if hit is not None:
-        return hit[2]
 
     def _run(X_batch, z_nodes, w_weights, diag_h, operands):
         # X_batch: (n_ritz, 1, nc, nv, nk)
@@ -717,7 +678,9 @@ def _get_feast_runner(
         filtered, iters = jax.lax.fori_loop(0, n_ritz, vec_body, (filtered, iters))
         return filtered, iters
 
-    core = jax.jit(_run)
+    core = hit[1] if hit is not None else jax.jit(_run)
+    if hit is None:
+        _FEAST_RUNNER_CACHE[key] = (matvec, core)
 
     def runner(X_batch, z_nodes, w_weights, diag_h):
         # A PYTHON closure over ``operands`` — not a jit one.  The arrays reach
@@ -727,7 +690,6 @@ def _get_feast_runner(
         return core(X_batch, z_nodes, w_weights, diag_h, operands)
 
     runner.core = core          # for tests/introspection: the traced program
-    _FEAST_RUNNER_CACHE[key] = (matvec, operands, runner)
     return runner
 
 
