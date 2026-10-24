@@ -68,10 +68,11 @@ def main():
                                   gridspec_kw={'height_ratios': [1.45, 1]})
     for panel, x, e, edge in ((ax, distance, energies, threshold),
                               (zoom, near_distance, near_energies, near_threshold)):
-        panel.plot(x, e, color='tab:blue', lw=.65, alpha=.8)
+        width, opacity = (.35, .65) if panel is ax else (.65, .8)
+        panel.plot(x, e, color='tab:blue', lw=width, alpha=opacity)
         if edge is not None:
             panel.plot(x, edge, '--', color='.35', lw=.9,
-                       label='Independent-particle threshold')
+                       label='Continuum threshold')
         panel.spines[['top', 'right']].set_visible(False)
         panel.yaxis.set_major_locator(MaxNLocator(nbins=4, min_n_ticks=3))
         panel.set_ylabel('Exciton energy (eV)')
@@ -88,7 +89,7 @@ def main():
     if threshold is not None:
         ax.fill_between(distance, threshold, ax.get_ylim()[1],
                         color='.92', zorder=0)
-        ax.legend(loc='best', frameon=False, handlelength=1.5)
+        ax.legend(loc='upper right', frameon=False, handlelength=1.5)
     zoom_limit = min(.12, near_distance[-1])
     zoom.set_xlim(0, zoom_limit)
     if args.near_gamma_prefix:

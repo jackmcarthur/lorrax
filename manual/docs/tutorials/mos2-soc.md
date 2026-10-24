@@ -140,6 +140,21 @@ as permitted by long-range exchange in two dimensions. The smallest
 low-level shifts are below solver resolution. Energies alone do not assign
 longitudinal/transverse or bright/dark character.
 
+<figure style="width:3in; max-width:100%; margin:1em 0;" markdown="1">
+
+[![LORRAX exciton energies along Gamma-M-K-Gamma, with the independent-particle continuum threshold, and an eight-level enlargement near Gamma.](../assets/figures/tutorial-mos2-exciton-bands.png){ width="288" }](../assets/figures/tutorial-mos2-exciton-bands.png)
+
+<figcaption style="font-size:0.86em; line-height:1.45;" markdown="1">
+
+The dashed line marks the independent-particle continuum from the same QP
+transitions. The 256-level window crosses it at 21 of 25 momenta, reaching
+152 meV above it at Γ and 113 meV at K. At four points the retained levels
+stop below the threshold. The lower panel resolves eight levels near Γ.
+[Download the PDF](../assets/figures/tutorial-mos2-exciton-bands.pdf).
+
+</figcaption>
+</figure>
+
 These are illustrative results: the lowest eight levels differ by up to
 7.65 meV between matched 24 × 24 and 30 × 30 controls. The tutorial uses the
 1 meV **visualization** exchange check; the driver's **reference** default
