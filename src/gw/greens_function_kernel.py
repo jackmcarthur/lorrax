@@ -612,23 +612,3 @@ def sigma_kconv_scratch(*, kgrid, ns, rows, n_right, mesh):
     if F.kconv_backend(mesh, kgrid) != "mathdx":
         return 0
     return F.klead_unfold_scratch_bytes(kgrid, ns, int(rows) * int(n_right))
-
-
-def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner, kgrid):
-    """Record the price of one fused chi0 node (``w_isdf._get_chi_minimax_kernel_fused``).
-
-    New per rank beside what is live: the valence and conduction parent Greens
-    ``2·(1 + partner)·T_p`` (``partner`` when an antiunitary row reads a conjugate-face
-    tile), the accumulator ``16·n_out·N_k·μ²/P``, the builds' panels
-    ``2·(1 + partner)·M_axis`` (:func:`_green_terms`) and mode 11's run-time scratch
-    (:func:`chi0_kconv_scratch`).  Nothing here is chunked: every term is a whole (μ, ν)
-    tile, and ``distrib_la.panel_matmul`` bounds the panels itself.
-    """
-    tile, panels = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=n_band,
-                                mesh=mesh)
-    acc = 16.0 * int(n_out) * int(n_full) * int(n_rmu) ** 2 / (
-        int(mesh.shape['x']) * int(mesh.shape['y']))
-    from lxkit import memory
-    new = (2.0 * (1.0 + float(bool(partner))) * (tile + panels) + acc
-           + chi0_kconv_scratch(kgrid=kgrid, n_parent=n_parent, n_rmu=n_rmu, ns=ns, mesh=mesh))
-    memory.book(memory.priced(new, "chi0 node, price_chi0_node", increment=True), stage="chi.exec")

@@ -493,21 +493,33 @@ moves; its transient is `M_axis` at the projected band count.
 
 ## The Green-side stages
 
-χ₀ and Σ(τ) read the parent Greens `T_p = 16·n_par·n_s²·μ²/P` through the
-fused k-convolution, which unfolds them on its load, so no full-k Green
-exists. A Green of real weights (real node times) reads its antiunitary
+χ₀ and Σ(τ) read parent Greens through the fused k-convolution, which
+unfolds them on its load, so no full-k Green exists. Both use orbit-closed
+centroid-row windows; one window's parent Green is
+`T_R = 16·n_par·n_s²·R·ν`, with `ν = μ/P_y` and `R` local rows.
+A Green of real weights (real node times) reads its antiunitary
 partner as `conj(G)` on the load; complex times build a conjugate-face
 partner tile (`partner = 1`). Each Green build adds its two live SUMMA
 panels `M_panel` ([§ ψ carriers](#psi-carriers)). New bytes per
 rank beside what is live:
 
 ```text
-χ₀ node   = 2·(1 + partner)·(T_p + M_panel) + 16·n_out·N_k·μ²/P + S_11   nothing chunks
+χ₀ carry  = 16·n_out·N_k·μ²/P
+χ₀ window = 2·(1 + partner)·T_R + 2·16·n_out·N_k·R·ν + ψ rows/panels + S_11
 Σ(τ) row  = 16·[(2 + partner)·n_par·n_s²·ν + N_k·ν + 2·n_q,irr·ν + n_par·n_s·(N_b + 2·N_bΣ)]
 Σ(τ) pass = R·(Σ(τ) row) + ψ + S_7
 ```
 
-`S_11` is mode 11's split-arm scratch, at most one `T_p`
+The ordinary static/GN minimax response keeps its original τ scan inside
+each row window, then performs one forward χ transform after that τ sum.
+It retains the same nodes, weights, edge references, spin trace and q
+completion. The full χ carry remains distributed over every rank; it does
+not retain whole-parent Gv/Gc matrices. The right ψ operand is prepared once
+per call. The executable's actual additional XLA bytes and queried provider
+scratch are admitted beside the live operands and placed unfold tables.
+Row sizes follow the fixed 1 GiB tile, including for small one-window cases.
+
+`S_11` is mode 11's split-arm scratch, at most one `T_R`
 (`greens_function_kernel.chi0_kconv_scratch`); it is 0 on the single pass.
 `S_7` is mode 7's, `min(R·ν, ⌊1 GiB / s⌋)` pairs of `s` B, at most 1 GiB, with
 `s = 16·N_k·n_s²` plus `16·N_k` (the chunk's pair-major `W_R`) on the m7s arm (n_s = 2
@@ -568,8 +580,10 @@ every pass, so compile time does not grow with the pass count: the static
 segment program on the charge stream and at most four on the four-current
 stream (claims 3114, 3122). A rank whose rows fit one
 tile runs one whole pass.
-`price_chi0_node` only prices the χ₀ node: a band chunk of Gv would still
-be a whole `(μ, ν)` tile. On the packed bispinor route the static photon
+The ordinary minimax χ response uses the same window and placement owners;
+its τ sum precedes the final window transform, while the direct response
+bank keeps individual node rows for its value/slope projections. On the
+packed bispinor route the static photon
 response (`V_packed`, `W_packed`, `2·16·Q·(μ + 3μ_T)²/P`) is deleted after
 the static Σ channels read it, before Hartree and the τ sweep.
 
@@ -583,7 +597,7 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | warns; one q |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | tangential screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([tangential model](tangential_model.md), byte model) | warns and admits, when a stage and its named concurrent stages exceed the budget |
-| static / GN-PPM screening | the χ₀ node ([§ Green-side](#the-green-side-stages)); the GN fit's q block (XLA's compiled footprint of one q) | `price_chi0_node` (a price, no choice); `_gn_ppm_fit_q_block`: the fixed tile, at least one q | warns; one q (only under `LORRAX_PPM_FIT_ARENA_GIB`) |
+| static / GN-PPM screening | distributed χ₀ carry and one orbit-closed parent-Green row window ([§ Green-side](#the-green-side-stages)); the GN fit's q block | `w_isdf._run_minimax_chi`: actual compiled additional bytes plus provider scratch; `_gn_ppm_fit_q_block`: the fixed tile, at least one q | warns and admits |
 | Σ(τ) sweep | the resident pole fields, band-complete ψ, then one row pass ([§ Green-side](#the-green-side-stages)) | `subtile_stream.plan_windows`: equal orbit-aligned windows, the pass count from the fixed tile and the shortest window that keeps it | — |
 | matrix-element sweep (V_H, four-current) | the step's slabs, and FFT boxes `(2 + 2·n_comp)·n_s·N_r·16` per band of a band-layout operator | `mtxel_sweep.plan_sweep`: bands in the fewest chunks whose boxes fit the fixed tile | — |
 | ψ loader off the fit plan (ζ reuse, current faces) | one band tile of G-flat rows, samples and faces | `gflat_memory_model.loader_band_chunk`: the fixed tile, at least the automatic 16 | warns; one scan row |
