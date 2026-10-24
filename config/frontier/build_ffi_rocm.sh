@@ -34,9 +34,22 @@ source "$VENV/bin/activate"         # cmake probes jax.ffi.include_dir() from he
 [ "${1:-}" = "--fresh" ] && rm -rf "$BUILD"
 # ELPA, the ROCM distributed eigh (config/frontier/build_elpa_hip.sh): its
 # content-keyed prefix, built on demand (login node, ~4 min; a no-op verify after).
-ELPA_DIR=${LORRAX_ELPA_ROCM_DIR:-$(env -i HOME="$HOME" PATH=/usr/bin:/bin bash "$ROOT/config/frontier/build_elpa_hip.sh" --print-prefix)}
-[ -e "$ELPA_DIR/LORRAX_ELPA_COMPLETE" ] || env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin \
-    bash -lc "bash '$ROOT/config/frontier/build_elpa_hip.sh'" || { echo "[build_ffi_rocm] FAILED: ELPA" >&2; exit 1; }
+# Prefix selection and build must see the same explicit controls, while module
+# state and library search paths stay out of the child. ELPA initializes its
+# own pinned module environment; a login shell would reintroduce user state.
+_build_elpa() {
+    local name
+    local child=(HOME="$HOME" PATH=/usr/bin:/bin)
+    [[ -z "${USER+x}" ]] || child+=(USER="$USER")
+    for name in LORRAX_OLCF_VENV LORRAX_OLCF_ROCM LORRAX_ROCM_BLAS_DIR \
+                LORRAX_ELPA_ROOT LORRAX_ELPA_GFX LORRAX_ELPA_OPENMP LORRAX_ELPA_MAKE_J; do
+        [[ -z "${!name+x}" ]] || child+=("$name=${!name}")
+    done
+    env -i "${child[@]}" bash "$ROOT/config/frontier/build_elpa_hip.sh" "$@"
+}
+ELPA_DIR=${LORRAX_ELPA_ROCM_DIR:-$(_build_elpa --print-prefix)}
+[ -e "$ELPA_DIR/LORRAX_ELPA_COMPLETE" ] || _build_elpa || {
+    echo "[build_ffi_rocm] FAILED: ELPA" >&2; exit 1; }
 cmake -S "$ROOT/src/ffi/cpp" -B "$BUILD" \
     -DLORRAX_FFI_PLATFORM=rocm \
     -DLORRAX_ELPA_ROCM_DIR="$ELPA_DIR" \
