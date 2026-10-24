@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from pathlib import Path
 from dataclasses import is_dataclass, fields
@@ -12,11 +13,27 @@ from common.log import get_logger
 
 log = get_logger(__name__)
 
+# A bare ``&`` that does not start an entity or character reference.
+_BARE_AMP = re.compile(rb'&(?!(?:[A-Za-z_][\w.-]*|#[0-9]+|#x[0-9A-Fa-f]+);)')
+
+
+def upf_xml_bytes(upf_path: str | Path) -> bytes:
+	"""The UPF file's bytes with every bare ``&`` escaped to ``&amp;``.
+
+	ld1.x copies its input namelist (``&INPUT``) into PP_INFO unescaped,
+	which strict XML rejects ("not well-formed (invalid token)") and QE's
+	own reader accepts.  Entities and character references are kept."""
+	return _BARE_AMP.sub(b'&amp;', Path(upf_path).read_bytes())
+
+
+def parse_upf_xml(upf_path: str | Path) -> ET.Element:
+	"""The UPF's XML root, tolerant of ld1.x's bare ``&`` (:func:`upf_xml_bytes`)."""
+	return ET.fromstring(upf_xml_bytes(upf_path))
+
 
 def detect_version(upf_path: str | Path) -> str:
 	# Decide schema by inspecting the root tag
-	import xml.etree.ElementTree as ET
-	root = ET.parse(str(upf_path)).getroot()
+	root = parse_upf_xml(upf_path)
 	tag = root.tag
 	local = tag.split('}', 1)[1] if tag.startswith('{') and '}' in tag else tag
 	if local.upper() == 'UPF':
@@ -35,7 +52,7 @@ def load_upf_pswfc(upf_path: str | Path) -> dict:
 	only declares PP_CHI.1/.2, so this reads the XML directly; it is the
 	input of QE's atomic_wfc (DFT+U projectors, psp.hubbard_ops).
 	"""
-	root = ET.parse(str(upf_path)).getroot()
+	root = parse_upf_xml(upf_path)
 
 	def local(tag):
 		return tag.split('}', 1)[1] if isinstance(tag, str) and '}' in tag else tag
@@ -83,8 +100,8 @@ def load_upf(upf_path: str | Path):
 		root_cls = model.Upf
 		# Preprocess: rename PP_BETA.n -> PP_BETA and inject index=n for compatibility
 		try:
-			tree = ET.parse(str(upf_path))
-			root = tree.getroot()
+			root = parse_upf_xml(upf_path)
+			tree = ET.ElementTree(root)
 			def rename_beta(elem: ET.Element):
 				for child in list(elem):
 					tag = child.tag
@@ -143,7 +160,7 @@ def load_upf(upf_path: str | Path):
 					pass
 		except Exception:
 			# Fallback to direct parse if preprocessing fails
-			return parser.from_path(upf_path, root_cls)
+			return parser.from_bytes(upf_xml_bytes(upf_path), root_cls)
 	else:
 		from psp import upf_model as model
 		# pick the root (pseudo) class
@@ -154,7 +171,7 @@ def load_upf(upf_path: str | Path):
 				break
 		if root_cls is None:
 			raise RuntimeError('Could not find root class for 0.99 model')
-	return parser.from_path(upf_path, root_cls)
+	return parser.from_bytes(upf_xml_bytes(upf_path), root_cls)
 
 
 def _brief_value(value):

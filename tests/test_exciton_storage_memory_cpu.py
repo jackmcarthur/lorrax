@@ -77,6 +77,12 @@ def test_exchange_storage_preflight_reads_counts_and_precedes_wavefunctions(tmp_
         calls["load_bse_data_from_restart_sharded"] + calls["compute_wfns_fi"])
 
 
+def _owned(host, sharding):
+    import jax
+    import jax.numpy as jnp
+    return jax.jit(jnp.copy, out_shardings=sharding)(jax.device_put(host, sharding))
+
+
 def _compiled_stack_controls():
     from functools import partial
     import jax
@@ -99,8 +105,11 @@ def _compiled_stack_controls():
             values = values + 1j*(values[::-1] + .25)
             energies = np.arange(3*4*nc, dtype=np.float64).reshape(12, nc)
             yspec = fit_sharding(mesh, P(None, None, None, "y"), (12, nc, ns, mu))
-            y = jax.device_put(values.reshape(12, nc, ns, mu), yspec)
-            eps = jax.device_put(energies, rep)
+            # XLA-owned inputs, as a loaded bundle's are: a CPU device_put may
+            # alias a 64-byte-aligned NumPy buffer (heap luck, so order-dependent),
+            # and a buffer XLA does not own is copied on donation, never reused.
+            y = _owned(values.reshape(12, nc, ns, mu), yspec)
+            eps = _owned(energies, rep)
             # P1 explicitly exercises X/Y sharing one underlying allocation.
             tx = y if p == 1 else jax.device_put(values.reshape(12, nc, ns, mu).transpose(0, 3, 1, 2),
                    fit_sharding(mesh, P(None, "x", None, None), (12, mu, nc, ns)))

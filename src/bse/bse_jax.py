@@ -379,8 +379,13 @@ def _preview_lanczos(
 
     # Every root, in BerkeleyGW's own files (with its dipoles when computed).
     energies_ev = eigenvalues_host[:n_eig] * ryd2ev
+    noeh = None
+    if d_alpha is not None:
+        from .absorption_common import window_band_energies
+        ec_ry, ev_ry = window_band_energies(data)
+        noeh = (ec_ry * ryd2ev, ev_ry * ryd2ev, d_alpha)
     roots_files = _write_all_roots(
-        input_file, energies_ev, dipoles, nk,
+        input_file, energies_ev, dipoles, nk, noeh=noeh,
         polarization=(spectrum or haydock or {}).get("polarization"),
         triplet=bgw_spin_kernel(int(data["psi_c_X"].shape[2]), include_W,
                                channel=data.get("exchange_channel", "singlet")) == 0)
@@ -492,16 +497,19 @@ def _files_text(paths) -> str:
     return names[0] if len(names) == 1 else f"{names[0]} .. {names[-1]}"
 
 
-def _write_all_roots(input_file, energies_ev, dipoles, nk: int, *,
+def _write_all_roots(input_file, energies_ev, dipoles, nk: int, *, noeh=None,
                      polarization=None, triplet=False) -> list[str]:
     """Every root to BerkeleyGW's ``eigenvalues.dat`` (energies, or the dipole
     along a deck ``polarization``) or, with dipoles and no ``polarization``,
     its three-axis ``eigenvalues_b1.dat`` .. ``_b3.dat``
     (``absorption_common.write_bgw_eigenvalues``), rank 0 writing.  The
     header's ``vol`` is ``N_k`` times the deck WFN's cell volume and its
-    ``nspin, nspinor`` that WFN's.  Returns the paths (on every rank)."""
+    ``nspin, nspinor`` that WFN's.  ``noeh`` ``(ec_eV, ev_eV, d_alpha)`` also
+    writes the window transitions to ``eigenvalues*_noeh.dat``
+    (``absorption_common.write_bgw_eigenvalues_noeh``); those paths are not
+    returned.  Returns the paths (on every rank)."""
     from .absorption_common import (eigenvalue_file_names, polarization_directions,
-                                    write_bgw_eigenvalues)
+                                    write_bgw_eigenvalues, write_bgw_eigenvalues_noeh)
     from .bse_window import _parse_wfn_path
     wfn_path = _parse_wfn_path(input_file)
     directions, labels = polarization_directions(polarization, wfn_path)
@@ -511,6 +519,10 @@ def _write_all_roots(input_file, energies_ev, dipoles, nk: int, *,
             celvol = float(f["mf_header/crystal/celvol"][()])
             n_spin = int(f["mf_header/kpoints/nspin"][()])
             n_spinor = int(f["mf_header/kpoints/nspinor"][()])
+        if noeh is not None:
+            write_bgw_eigenvalues_noeh(".", *noeh, n_spin=n_spin, n_spinor=n_spinor,
+                                       vol_supercell=float(nk) * celvol,
+                                       directions=directions, labels=labels)
         return write_bgw_eigenvalues(".", energies_ev, dipoles, n_spin=n_spin,
                                      n_spinor=n_spinor,
                                      vol_supercell=float(nk) * celvol,
