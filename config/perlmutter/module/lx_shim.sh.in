@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# ============================================================================
+# lx site shim for the LORRAX @REF8@ runtime image (written by
+# install_image_module.sh; installed as both src/ffi/cpp/select_gpu.sh and
+# src/ffi/cpp/in_container.sh under the module's LORRAX_ROOT).
+#
+# lx launches  srun <LORRAX_ROOT>/src/ffi/cpp/select_gpu.sh <LORRAX_SHIFTER>
+#              <LORRAX_ROOT>/src/ffi/cpp/in_container.sh <command>
+# (no select_gpu.sh on its zero-GPU path).  The real helpers live inside the
+# image, which exists on a node only after lorrax-run has restored it, so the
+# first shim a rank meets enters the image through lorrax-run and then runs the
+# image's own helper of the same name; the image's select_gpu.sh honours the
+# LORRAX_GPU_DEVICE contract lx asks for.  lx names this directory in
+# LORRAX_CHECKOUT when cwd is not a checkout; that request is moved to the
+# image tree the rank actually imports, so runtime.source_closure still attests
+# the import.  A checkout lx selected from cwd is left as it is.
+# ============================================================================
+set -eo pipefail
+helper="$(basename "$0")"
+tree="@TREE@"
+if [ "${LORRAX_IMAGE_ROOT:-}" = "$tree" ]; then
+    exec "$tree/lorrax/src/ffi/cpp/$helper" "$@"
+fi
+export LORRAX_PREFIX="@PREFIX@" LORRAX_RUNTIME=image
+source "@PREFIX@/share/lorrax/gpu_env.sh"
+exec "@PREFIX@/bin/lorrax-run" --all-gpus bash -c '
+    stub=$0 helper=$1; shift 1
+    [ "${LORRAX_CHECKOUT:-}" != "$stub" ] || export LORRAX_CHECKOUT="$LORRAX_ROOT"
+    exec "$LORRAX_ROOT/src/ffi/cpp/$helper" "$@"' "$(readlink -f "@STUB@")" "$helper" "$@"
