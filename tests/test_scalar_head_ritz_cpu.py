@@ -33,6 +33,19 @@ def test_scalar_shared_ritz_preserves_positive_poles_and_both_moment_kinds():
     # The exact static and inverse-frequency derivative constraints do not
     # arise from a residue modification: the entire held response agrees.
     assert result['provenance']['solve_mode']=='shared-Hermite-Ritz-scalar-v1'
+    from gw.tangential_head_scalar import scalar_head_certificate
+    observations=dict(z=held,Wc=reference,dWc_ds=dreference,vc0=4*abs(values[0]),
+        M1=np.sum(omega*residue),M3=np.sum(omega**3*residue))
+    certificate=scalar_head_certificate(result,observations,eta_ry=.02,
+        static_value=values[0],inverse_m1=np.sum(residue/omega**2))
+    assert np.all(certificate['passivity']['passivity'])
+    assert max(certificate['sample_value_relative'])<3e-9
+    assert max(certificate['sample_slope_relative'])<3e-8
+    assert certificate['static_relative']<3e-10
+    assert certificate['inverse_m1_relative']<3e-10
+    with pytest.raises(ValueError,match='GATE scalar_head_passivity'):
+        scalar_head_certificate(result,dict(observations,vc0=.1*abs(values[0])),eta_ry=.02,
+            static_value=values[0],inverse_m1=np.sum(residue/omega**2))
 
 
 def test_scalar_shared_ritz_refuses_nonphysical_gram_and_invalid_actions():

@@ -96,3 +96,67 @@ def scalar_head_ritz(z, values, slopes, *, moment_m1, moment_m3, gram_keep=None)
             retained={k:np.asarray(v).tolist() for k,v in retained.items()}),
         provenance=dict(solve_mode='shared-Hermite-Ritz-scalar-v1',n_valid=len(omega),
             support_count=len(z),pencil_width=len(points)+1,gram_keep=gram_keep))
+
+
+@lru_cache(maxsize=None)
+def _scalar_check_program():
+    from distrib_la import eigh_local
+    from .tangential_local import _mm, _round_check_equations
+    from .tangential_recipe import shared_real_pole_gates_v1_r3b as gates
+
+    def eigh(a, *, cut=None):
+        return tuple(eigh_local(a))
+
+    @jax.jit
+    def execute(omega,residue,z,values,slopes,bare,eta,m1,m3):
+        model = (jnp.sqrt(2*omega*residue)[None,None],
+                 omega[None]**2,jnp.ones((1,omega.size),bool))
+        return _round_check_equations(model,(),(1/jnp.sqrt(bare)).reshape(1,1,1),
+            values[None,:,None,None],slopes[None,:,None,None],z,eta,
+            m1.reshape(1,1,1),m3.reshape(1,1,1),jnp.ones((1,1,1),jnp.complex128),
+            matmul=_mm,eigh=eigh,gates=gates,ordered=False)
+    return execute
+
+
+def scalar_head_certificate(model,observations,*,eta_ry,static_value,inverse_m1):
+    """Measure the common passivity/held checks and scalar on-shell moments.
+
+    ``observations`` holds z/Wc/dWc_ds and the same vc0/M1/M3 quadrature
+    fields. Its rows are independent held observations or explicitly labelled
+    training observations. This function refuses structural/passivity errors;
+    the caller must enforce its declared accuracy budgets on the returned
+    sample/static/inverse-moment errors before publishing a model.
+    """
+    omega,residue=(np.asarray(model[key],np.complex128) for key in ('Omega_p','B_p'))
+    if omega.ndim!=1 or not len(omega) or residue.shape!=omega.shape:
+        raise ValueError('GATE scalar_head_certificate: nonempty matching pole/residue vectors required')
+    z,values,slopes=(np.asarray(observations[key],np.complex128).reshape(-1)
+                     for key in ('z','Wc','dWc_ds'))
+    bare_coulomb,moment_m1,moment_m3=(observations[key] for key in ('vc0','M1','M3'))
+    if not len(z) or values.shape!=z.shape or slopes.shape!=z.shape:
+        raise ValueError('GATE scalar_head_certificate: matching nonempty observations required')
+    if (not np.isfinite(bare_coulomb) or np.real(bare_coulomb)<=0 or np.imag(bare_coulomb)!=0
+            or not np.isfinite(eta_ry) or eta_ry<=0):
+        raise ValueError('GATE scalar_head_certificate: positive bare Coulomb and eta required')
+    if (not all(np.isfinite(a).all() for a in (omega,residue,z,values,slopes,
+            moment_m1,moment_m3,static_value,inverse_m1)) or
+            np.any(omega.imag!=0) or np.any(omega.real<=0) or
+            np.any(residue.imag!=0) or np.any(residue.real<0)):
+        raise ValueError('GATE scalar_head_certificate: finite real positive pole measure required')
+    passive,errors,reciprocity,moments=jax.device_get(_scalar_check_program()(
+        jnp.asarray(omega.real),jnp.asarray(residue.real),jnp.asarray(z),
+        jnp.asarray(values),jnp.asarray(slopes),jnp.asarray(np.real(bare_coulomb)),
+        jnp.asarray(eta_ry),jnp.asarray(moment_m1),jnp.asarray(moment_m3)))
+    if not np.all(passive['passivity']):
+        raise ValueError('GATE scalar_head_passivity: shared Coulomb-normalized bounds failed')
+    if not np.isfinite(errors).all() or not np.all(reciprocity['passed']):
+        raise ValueError('GATE scalar_head_samples: shared finite/reciprocity check failed')
+    relative=lambda value,reference: float(abs(value-reference)/max(abs(reference),np.finfo(float).tiny))
+    return dict(passivity={key:np.asarray(a).tolist() for key,a in passive.items()},
+        sample_value_relative=np.asarray(errors)[0,0].tolist(),
+        sample_slope_relative=np.asarray(errors)[0,1].tolist(),
+        reciprocity={key:np.asarray(a).tolist() for key,a in reciprocity.items()},
+        high_frequency={key:{name:np.asarray(a).tolist() for name,a in row.items()}
+                        for key,row in moments.items()},
+        static_relative=relative(-2*np.sum(residue/omega),static_value),
+        inverse_m1_relative=relative(np.sum(residue/omega**2),inverse_m1))
