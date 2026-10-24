@@ -67,7 +67,7 @@
 //   scalapack  LORRAX_SCALAPACK_MKL_THREADS  cap at 4  (pzheevd starves MPI
 //                                             progress: 24x at the 12x12 grid)
 //   mklblas    LORRAX_MKLBLAS_THREADS        ambient omp_get_max_threads()
-//   mklfft     LORRAX_MKLFFT_THREADS         ambient, then pin(1) per member
+//   mklfft     LORRAX_FFT_FFI_THREADS        ambient, then pin(1) per member
 //                                            because the CHUNK LOOP is the
 //                                            parallel dimension
 // Unifying those would fuse three different answers to three different
@@ -75,9 +75,9 @@
 
 #pragma once
 
-#include <atomic>             // once-flags for the deprecated-alias announce
+#include <atomic>
 #include <cctype>
-#include <cstdio>             // the announce fprintf in knob_value
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>   // announce_here's range-for over a braced list;
@@ -255,36 +255,6 @@ inline ThreadKnob parse_thread_knob(const char* v, long min_v, long max_v) {
     }
     r.kind = ThreadKnob::kBad;
     return r;
-}
-
-// ---------------------------------------------------------------------------
-//  Shared-spelling env knob with deprecated per-family aliases (P1.11).
-//  The flat-k FFT service registers ONE jax.ffi target family on two
-//  platforms, but its C++ knobs were spelled per backend (LORRAX_MKLFFT_LOG
-//  host vs LORRAX_CUFFT_LOG CUDA) so a deck moved between platforms silently
-//  lost its knobs.  Consumers now read the SHARED spelling first and each
-//  legacy spelling second; using a legacy spelling still works but announces
-//  the preferred name once per process (rank-scoped).  `alias_warned` lives
-//  at the call site so the once-flag is per knob, not per header.
-// ---------------------------------------------------------------------------
-inline const char* knob_value(const char* shared_env,
-                              std::initializer_list<const char*> legacy_envs,
-                              std::atomic<bool>& alias_warned) {
-    const char* v = std::getenv(shared_env);
-    if (v != nullptr) return v;
-    for (const char* legacy : legacy_envs) {
-        const char* l = std::getenv(legacy);
-        if (l == nullptr) continue;
-        if (!alias_warned.exchange(true) && announce_here()) {
-            std::fprintf(stderr,
-                         "[lorrax-ffi] %s is a DEPRECATED spelling of %s "
-                         "(one knob per FFI target family, every platform); "
-                         "it is honored this run — please rename it.\n",
-                         legacy, shared_env);
-        }
-        return l;
-    }
-    return nullptr;
 }
 
 }  // namespace lorrax_ffi::mklpin

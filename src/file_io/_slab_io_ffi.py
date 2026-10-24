@@ -298,16 +298,6 @@ def _stripe_size_bytes(nranks: int | None = None) -> int:
     """
     raw = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE_FS", "").strip()
     if not raw:
-        legacy = os.environ.get("LORRAX_PHDF5_STRIPE_SIZE", "").strip()
-        if legacy:
-            try:
-                v = int(legacy)
-            except ValueError:
-                raise ValueError(
-                    f"LORRAX_PHDF5_STRIPE_SIZE={legacy!r} is not a valid "
-                    f"byte count: expected a plain integer.") from None
-            if v > 0:
-                return v
         return _stripe_policy(
             jax.process_count() if nranks is None else nranks)[1]
     mult = 1

@@ -15,9 +15,7 @@
 //                                       staging kept above 32 MiB per file
 //   LORRAX_PHDF5_STRIPE_COUNT  (policy) Lustre striping_factor hint; unset =
 //                                       clamp(world_size, 4, 128)
-//   LORRAX_PHDF5_STRIPE_SIZE_FS(policy) Lustre striping_unit hint (lfs form;
-//                                       legacy byte-valued
-//                                       LORRAX_PHDF5_STRIPE_SIZE honoured);
+//   LORRAX_PHDF5_STRIPE_SIZE_FS(policy) Lustre striping_unit hint (lfs form);
 //                                       unset = the 1->4 MiB rank-count ramp.
 //                                       Both policies transcribe
 //                                       file_io/_slab_io_ffi._stripe_policy —
@@ -635,10 +633,9 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     // Env naming: LORRAX_PHDF5_STRIPE_SIZE_FS is THE documented knob
     // (env_vars.md), spelled like `lfs setstripe -S` ("4M"); it is read
     // by the three Python sites and, since workstream AW, here too —
-    // previously this file read only the undocumented byte-valued
-    // LORRAX_PHDF5_STRIPE_SIZE, so the documented knob silently did not
-    // reach the C++ writer.  The legacy byte spelling still works as a
-    // fallback.
+    // previously this file read only an undocumented byte-valued
+    // spelling (since removed), so the documented knob silently did not
+    // reach the C++ writer.
     // MEASURED DEFAULT (2026-08-05, job 56389339, /pscratch, 2.000 GiB
     // C128, GiB/s aggregate write/read, best of 2 reps, MPI world size
     // asserted):
@@ -737,17 +734,6 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
                 "\" resolves to a non-positive striping_unit, which is not a "
                 "hint ROMIO can act on.");
         }
-    } else if (const char* b = std::getenv("LORRAX_PHDF5_STRIPE_SIZE");
-               b && *b) {
-        char* end = nullptr;
-        const long parsed = std::strtol(b, &end, 10);
-        if (end == b || (end && *end) || parsed <= 0) {
-            throw std::runtime_error(
-                std::string("LORRAX_PHDF5_STRIPE_SIZE=\"") + b +
-                "\" is not a valid byte count: expected a positive plain "
-                "integer.");
-        }
-        stripe_bytes = parsed;
     }
     // Backstop only.  Every reachable way to get here non-positive now
     // throws above, naming the variable; this catches a v*mult that

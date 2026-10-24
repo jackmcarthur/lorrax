@@ -30,8 +30,7 @@
 //
 // Threading: an OpenMP team over the trail chunks (this TU is -fopenmp), each
 // member pinning a resident MKL to one thread (common/mkl_thread_pin.h).
-// Team size LORRAX_FFT_FFI_THREADS (auto|off|N; alias LORRAX_MKLFFT_THREADS),
-// chunk LORRAX_FFT_FFI_CHUNK (alias LORRAX_MKLFFT_CHUNK), both parsed per call.
+// Team size LORRAX_FFT_FFI_THREADS (auto|off|N), parsed per call.
 // Plans are FFTW_ESTIMATE | FFTW_UNALIGNED (MEASURE would overwrite the XLA
 // operand) and cached per shape under one mutex.
 //
@@ -105,9 +104,7 @@ using mklpin::str_ieq;
 // unit gate sweeps this knob per call.
 static int team_threads() {
     const int maxt = std::max(1, omp_get_max_threads());
-    static std::atomic<bool> alias_warned{false};
-    const char* v = mklpin::knob_value(
-        "LORRAX_FFT_FFI_THREADS", {"LORRAX_MKLFFT_THREADS"}, alias_warned);
+    const char* v = std::getenv("LORRAX_FFT_FFI_THREADS");
     const mklpin::ThreadKnob k = mklpin::parse_thread_knob(v, 1, 4096);
     switch (k.kind) {
         case mklpin::ThreadKnob::kOff: return 1;
@@ -139,12 +136,10 @@ static int team_threads() {
 // then run in cache and the big tile is streamed ONCE per direction
 // (measured: the strided→strided form, whose radix passes all stream the
 // full tile, ran 2.8× slower single-thread).  LORRAX_FFT_FFI_CHUNK
-// (deprecated alias LORRAX_MKLFFT_CHUNK) overrides for experiments; the
+// overrides for experiments; the
 // unit gate sweeps it and exercises ragged chunks explicitly.
 static int64_t chunk_elems(int64_t nk) {
-    static std::atomic<bool> alias_warned{false};
-    const char* v = mklpin::knob_value(
-        "LORRAX_FFT_FFI_CHUNK", {"LORRAX_MKLFFT_CHUNK"}, alias_warned);
+    const char* v = std::getenv("LORRAX_FFT_FFI_CHUNK");
     if (v && *v) {
         char* end = nullptr;
         const long long parsed = std::strtoll(v, &end, 10);

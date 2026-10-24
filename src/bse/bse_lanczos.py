@@ -211,8 +211,6 @@ def solve_bse_sharded(
     on same-shape payloads.  A payload may carry ``head_tensor = (D_head,
     M_head)``, the stack matvec's head-term operands (Davidson only).
     """
-    if os.environ.get("LORRAX_LANCZOS_REORTH", "").strip():
-        raise ValueError("LORRAX_LANCZOS_REORTH is retired: CGS2 is the only reorthogonalisation route; unset it")
     if not tda:
         from .bse_nontda import solve_bse_nontda_sharded
         return solve_bse_nontda_sharded(
