@@ -7,8 +7,26 @@ then bisected and measured again. No residue pin or pole repair is applied.
 import numpy as np
 from common.log import get_logger
 
-HEAD_FIT_POLICY = 'ladder-scalar-Hermite-held-v1'
+HEAD_FIT_POLICY = 'ladder-scalar-Hermite-held-v2'
 log=get_logger(__name__)
+
+
+def _inverse_reference_site(observations,certificate,reference,held,*,agree):
+    """Largest measured contribution to a failed inverse-moment integral."""
+    points,xi,weights=reference
+    available=[i for i,z in enumerate(points) if z in held]
+    if not available:
+        return None
+    lookup={complex(z):i for i,z in enumerate(observations['z'])}
+    indices=np.array([lookup[z] for z in points])
+    delta=np.asarray(certificate['predicted_values'])-np.asarray(observations['Wc'])
+    contribution=agree(abs(weights*(delta[indices]-delta[lookup[0j]])/xi**2)/np.pi)
+    if not np.isfinite(contribution).all():
+        raise ValueError('GATE ladder_head_reference_selection: finite inverse-moment contributions required')
+    selected=max(available,key=lambda i:float(contribution[i]))
+    if contribution[selected]<=0:
+        return None
+    return points[selected],float(contribution[selected])
 
 
 def fit_ladder_head_actions(evaluate,recipe,legacy_z,*,gap,mesh=None):
@@ -77,10 +95,18 @@ def fit_ladder_head_actions(evaluate,recipe,legacy_z,*,gap,mesh=None):
     # Gap and consumer broadening define the low-energy guard, rather than
     # this material's previously failed frequencies or another global grid.
     path=(0j,complex(gap,eta),complex(2*gap,eta))
-    intervals=[(a,b) for a,b in zip(path[:-1],path[1:])]
-    midpoints={.5*(a+b):(a,b) for a,b in intervals}
-    held.update(midpoints)
     fit=set(map(complex,legacy_z))|set(body_fit)|set(path)
+    # Guard the consumer's broadening over the EXISTING physical support
+    # geometry, not only two gaps. Broad sampling lines alone cannot certify
+    # narrower features between them at the eta read by Sigma.
+    real_sites=sorted({float(z.real) for z in fit|held if z.real>0})
+    guard=(0j,*(complex(x,eta) for x in real_sites))
+    midpoints={.5*(a+b):(a,b) for a,b in zip(guard[:-1],guard[1:])}
+    held.update(midpoints)
+    for i,point in enumerate(guard[1:],1):
+        if point not in fit:
+            held.add(point)
+            midpoints[point]=(guard[i-1],guard[min(i+1,len(guard)-1)])
     # Body and legacy fitting roles belong to their own constructions. A
     # coincident head-held coordinate stays independent in THIS pencil.
     fit.difference_update(held)
@@ -97,10 +123,16 @@ def fit_ladder_head_actions(evaluate,recipe,legacy_z,*,gap,mesh=None):
         inverse,reference_order=inverse96,96
         if quad_error>scalar_tol:
             raise ValueError('GATE ladder_head_inverse_moment: imaginary quadrature did not converge')
-    fit.update(set(quad24)-held)
-    attempts=[];promotions=[];extra=0
+    # Quadrature observations are an independent inverse-moment reference,
+    # not an automatic fitting grid: near-static and near-infinity columns
+    # can make the Hermite pencil ill-conditioned without adding information.
+    reference_points=quad48 if reference_order==48 else quad96
+    reference_xi,reference_weights=head_quadrature_rule(reference_order)
+    quadrature=set(quad24)|set(quad48)|set(reference_points)
+    held.update(quadrature);fit.difference_update(held)
+    attempts=[];promotions=[];promotion_records=[];extra=0
     for refinement in range(cap+1):
-        chosen=None
+        chosen=None;chosen_key=None
         for cut in (1e-8,1e-10,1e-12):
             ordered=tuple(sorted(fit,key=lambda z:(z.real,z.imag)))
             f=fields(ordered)
@@ -110,17 +142,30 @@ def fit_ladder_head_actions(evaluate,recipe,legacy_z,*,gap,mesh=None):
             certificate=scalar_head_certificate(model,observations,eta_ry=eta,
                 static_value=cache[0j]['Wc'],inverse_m1=inverse,mesh=mesh)
             errors=agreed_max([certificate['sample_value_relative'],certificate['sample_slope_relative']])
-            high=max(max(np.asarray(v)) for row in certificate['high_frequency'].values() for v in row.values())
-            static_error,inverse_error,high=agreed_max([certificate['static_relative'],
-                certificate['inverse_m1_relative'],high])
-            moments_ok=(static_error<=static_tol and inverse_error<=scalar_tol and high<=scalar_tol)
-            attempts.append(dict(refinement=refinement,gram_keep=cut,rank=len(model['Omega_p']),
+            hf=[max(np.asarray(v).max() for v in row.values())
+                for row in certificate['high_frequency'].values()]
+            static_error,inverse_error,*hf=agreed_max([certificate['static_relative'],
+                certificate['inverse_m1_relative'],*hf])
+            high=max(hf)
+            moment_score=max(static_error/static_tol,inverse_error/scalar_tol,high/scalar_tol)
+            moments_ok=moment_score<=1
+            condition=float(agreed_max(np.max(model['diagnostics']['reduction']['gram_condition'])))
+            attempt=dict(refinement=refinement,gram_keep=cut,rank=len(model['Omega_p']),
                 max_sample_error=float(np.max(errors)),static=float(static_error),
-                inverse_m1=float(inverse_error),high_frequency=float(high)))
+                inverse_m1=float(inverse_error),high_frequency=float(high),
+                high_frequency_by_moment=dict(zip(certificate['high_frequency'],map(float,hf))),
+                gram_condition=condition)
+            attempts.append(attempt)
             log.info(f'ladder head: {len(ordered)} fit supports, {len(held)} held, '
                 f'{len(model["Omega_p"])} poles; max value/slope error {np.max(errors):.2e}, '
-                f'static {static_error:.2e}, inverse moment {inverse_error:.2e}')
-            chosen=model,certificate,observations,errors,moments_ok
+                f'static {static_error:.2e}, inverse moment {inverse_error:.2e}, '
+                f'HF {high:.2e} ({attempt["high_frequency_by_moment"]}), '
+                f'Gram condition {condition:.2e}, keep {cut:.1e}')
+            # Prefer a constraint-valid subspace when refining held samples;
+            # otherwise refine from the smallest normalized moment defect.
+            choice=(0,float(np.max(errors))) if moments_ok else (1,float(moment_score),float(np.max(errors)))
+            if chosen_key is None or choice<chosen_key:
+                chosen_key=choice;chosen=model,certificate,observations,errors,attempt
             if moments_ok and np.max(errors)<=sample_tol and held:
                 model.update(sample_z=observations['z'],sample_Wc=observations['Wc'],
                     model='bse_resolvent_micro_shared_hermite_ritz',completion=True)
@@ -128,42 +173,61 @@ def fit_ladder_head_actions(evaluate,recipe,legacy_z,*,gap,mesh=None):
                     fit_z=list(ordered),held_z=sorted(held,key=lambda z:(z.real,z.imag)),
                     moment_m1=inverse,moment_m1_unpinned=complex(np.sum(model['B_p']/model['Omega_p']**2)),
                     moment_rule=f'Gauss-Legendre order{reference_order}',moment_convergence=quad_error,
-                    promotions=promotions,accuracy=dict(sample=sample_tol,static=static_tol,
+                    promotions=promotions,promotion_records=promotion_records,
+                    extra_sites_used=extra,extra_site_cap=cap,
+                    support_selection='failed-inverse-contribution-v1',
+                    accuracy=dict(sample=sample_tol,static=static_tol,
                         inverse_m1=scalar_tol,high_frequency=scalar_tol))
                 model['diagnostics'].update(certificate=certificate,
                     fit_condition=float(np.max(model['diagnostics']['reduction']['gram_condition'])),
                     fit_backward_error=float(np.max(model['diagnostics']['reduction']['retained_metric_relative'])),
                     fit_max_abs_residual=float(np.max(errors[0]*abs(observations['Wc']))))
                 return model,dict(cache=cache,fields=fixed,attempts=attempts)
-        model,certificate,observations,errors,moments_ok=chosen
-        # First refine the inverse-moment support using already measured
-        # reference nodes; no nonlinear residue adjustment is permitted.
-        extra_quad=set(quad48 if reference_order==48 else quad96)-fit-held
-        if not moments_ok and extra_quad:
-            fit.update(extra_quad)
+        model,certificate,observations,errors,attempt=chosen
+        detail=(f'fit={len(fit)}, held={len(held)}, rank={attempt["rank"]}, '
+            f'keep={attempt["gram_keep"]:.1e}, sample={attempt["max_sample_error"]:.3e}/{sample_tol:.1e}, '
+            f'static={attempt["static"]:.3e}/{static_tol:.1e}, '
+            f'inverse={attempt["inverse_m1"]:.3e}/{scalar_tol:.1e}, '
+            f'HF={attempt["high_frequency_by_moment"]}/{scalar_tol:.1e}, '
+            f'condition={attempt["gram_condition"]:.3e}, extra={extra}/{cap}')
+        if extra>=cap:
+            raise ValueError('GATE ladder_head_refinement_cap: extra-site budget exhausted; '+detail)
+        # Select the largest independently MEASURED contribution to the failed
+        # inverse-moment integral. This changes the subspace, never residues,
+        # and uses the fitted values already returned by the shared checker.
+        selected=(_inverse_reference_site(observations,certificate,
+            (reference_points,reference_xi,reference_weights),held,agree=agreed_max)
+            if attempt['inverse_m1']>scalar_tol else None)
+        if selected is not None:
+            point,contribution=selected
+            held.remove(point);fit.add(point);promotions.append(point);extra+=1
+            promotion_records.append(dict(point=point,reason='failed inverse-moment contribution',
+                absolute_contribution=contribution))
             continue
-        bad=[complex(z) for z,e in zip(observations['z'],errors.T)
+        bad=[(float(np.max(e)),complex(z)) for z,e in zip(observations['z'],errors.T)
              if complex(z) in held and np.max(e)>sample_tol]
         if not bad:
-            raise ValueError('GATE ladder_head_accuracy: sampled/static/inverse/HF certificate not met')
+            raise ValueError('GATE ladder_head_accuracy: no failed measured site can refine the remaining certificate; '+detail)
+        # Greedy held refinement adds one support at a time. Reference nodes
+        # retain other independent reference observations; a physical interval
+        # gets freshly solved midpoint guards after its held site is promoted.
+        point=max(bad,key=lambda pair:pair[0])[1]
+        held.remove(point);fit.add(point);promotions.append(point)
+        promotion_records.append(dict(point=point,reason='failed held value/slope'))
         new=[]
-        for point in bad:
-            if point not in midpoints:
-                # Body held points acquire local neighbours from the exact
-                # current support geometry; retain their held identity until
-                # this failure, then refine the two adjacent segments.
-                nearest=sorted(fit,key=lambda z:abs(z-point))[:2]
-                pair=tuple(nearest)
-            else:
-                pair=midpoints.pop(point)
-            held.remove(point);fit.add(point);promotions.append(point)
+        if point in quadrature:
+            extra+=1
+        else:
+            pair=midpoints.pop(point,None)
+            if pair is None:
+                pair=tuple(sorted(fit-{point},key=lambda z:abs(z-point))[:2])
             for a,b in ((pair[0],point),(point,pair[1])):
                 midpoint=.5*(a+b)
                 if midpoint not in fit and midpoint not in held:
                     midpoints[midpoint]=(a,b);held.add(midpoint);new.append(midpoint)
-        extra+=len(new)
+            extra+=len(new)
         if extra>cap:
-            raise ValueError('GATE ladder_head_refinement_cap: extra-site budget exhausted before certification')
+            raise ValueError('GATE ladder_head_refinement_cap: extra-site budget exhausted; '+detail)
         observe(new)
     raise ValueError('GATE ladder_head_refinement_cap: no certified scalar head')
 

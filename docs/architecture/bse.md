@@ -663,11 +663,16 @@ the head's inverse-frequency moment $M_1^{\rm head}=\sum_pB_p/\Omega_p^2$
 is distinct from the body's high-frequency $\mathcal M_1$ above.
 
 `ladder_head_fit` reuses the body recipe's fit/held supports, the incumbent
-MPA span supports, static and imaginary-axis moment nodes. Its low-energy
-guard is derived from the actual transition gap and existing consumer eta.
-Failed held sites become fitted only after failure; their intervals are
-bisected and the new sites are solved independently. The inherited recipe
-sample cap bounds extra sites. Held roles take priority over coincident
+MPA span supports, static and imaginary-axis moment observations. Its guards
+use the actual gap and the existing physical supports projected
+onto the consumer eta, with independent midpoint checks. Moment-quadrature
+nodes remain independent observations until selected: after an inverse-moment
+failure, the largest measured contribution to that error becomes one support.
+This avoids near-static/infinity columns that add conditioning loss without
+information. A failed physical held site becomes fitted only after failure;
+its interval is bisected and the new sites are solved independently. The
+inherited recipe sample cap bounds reference promotions and fresh sites.
+Held roles take priority over coincident
 supports from another construction. Scalar-only retention refinement may
 retain more Gram directions; Gram validity, metric and zero-weight gates
 remain the common constructor's. No pole or residue is repaired or pinned.

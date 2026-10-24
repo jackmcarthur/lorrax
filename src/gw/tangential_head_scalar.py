@@ -176,7 +176,7 @@ def _scalar_check_program():
         return _round_check_equations(model,(),(1/jnp.sqrt(bare)).reshape(1,1,1),
             values[None,:,None,None],slopes[None,:,None,None],z,eta,
             m1.reshape(1,1,1),m3.reshape(1,1,1),jnp.ones((1,1,1),jnp.complex128),
-            matmul=_mm,eigh=_one_parent_eigh,gates=gates,ordered=False)
+            matmul=_mm,eigh=_one_parent_eigh,gates=gates,ordered=False,return_samples=True)
     return execute
 
 
@@ -210,13 +210,14 @@ def scalar_head_certificate(model,observations,*,eta_ry,static_value,inverse_m1,
         jnp.asarray(values),jnp.asarray(slopes),jnp.asarray(np.real(bare_coulomb)),
         jnp.asarray(eta_ry),jnp.asarray(moment_m1),jnp.asarray(moment_m3))
     result,priced=_execute(_scalar_check_program(),args,mesh=mesh,side=1,label='certificate')
-    passive,errors,reciprocity,moments=jax.device_get(result)
+    passive,errors,reciprocity,moments,predicted=jax.device_get(result)
     if not _all_valid(passive['passivity'],mesh):
         raise ValueError('GATE scalar_head_passivity: shared Coulomb-normalized bounds failed')
     if not _all_valid(np.isfinite(errors).all() and np.all(reciprocity['passed']),mesh):
         raise ValueError('GATE scalar_head_samples: shared finite/reciprocity check failed')
     relative=lambda value,reference: float(abs(value-reference)/max(abs(reference),np.finfo(float).tiny))
     return dict(compiled_price_bytes_per_rank=priced,
+        predicted_values=np.asarray(predicted)[:,0,0,0],
         passivity={key:np.asarray(a).tolist() for key,a in passive.items()},
         sample_value_relative=np.asarray(errors)[0,0].tolist(),
         sample_slope_relative=np.asarray(errors)[0,1].tolist(),

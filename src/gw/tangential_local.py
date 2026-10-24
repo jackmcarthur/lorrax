@@ -1011,8 +1011,13 @@ def _leading_row_program(sharding):
 
 
 def _round_check_equations(model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
-                           *, matmul, eigh, gates, ordered):
-    """Shared scalar gate equations for local-parent and whole-mesh adapters."""
+                           *, matmul, eigh, gates, ordered, return_samples=False):
+    """Shared gate equations; optionally return the samples already evaluated.
+
+    The default four-result API is unchanged. Scalar-head support selection
+    reads the same fitted values from this admitted check, avoiding a second
+    pole evaluator or a separate tiny executable.
+    """
     import jax
     import jax.numpy as jnp
     from gw.tangential_directions import _model_diagnostics
@@ -1039,7 +1044,7 @@ def _round_check_equations(model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
 
     def sample(args):
         weight, slope, w, d = args
-        errors, reciprocity = [], []
+        errors, reciprocity, predicted = [], [], []
         for coefficient, exact in ((weight, w), (slope, d)):
             value = matmul(factor * coefficient[None, None, :],
                            factor, transb='C')[0]
@@ -1048,12 +1053,17 @@ def _round_check_equations(model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
                                         jnp.finfo(jnp.float64).tiny))
             reciprocity.append({} if ordered else
                 tangential_reciprocity(value, exact, gates=gates))
-        return jnp.stack(errors), jax.tree.map(lambda *v: jnp.stack(v), *reciprocity)
-    errors, reciprocity = jax.lax.map(sample, (weights, slopes, wc[0], dw[0]))
+            if return_samples:
+                predicted.append(value)
+        result = (jnp.stack(errors), jax.tree.map(lambda *v: jnp.stack(v), *reciprocity))
+        return (*result, jnp.stack(predicted)) if return_samples else result
+    result = jax.lax.map(sample, (weights, slopes, wc[0], dw[0]))
+    errors, reciprocity = result[:2]
     rows = lambda a: jnp.swapaxes(a, 0, 1)[None]
     defects = _model_diagnostics(moment_model, {'M1': m1, 'M3': m3}, qi,
                                  matmul=matmul)
-    return passive, rows(errors), jax.tree.map(rows, reciprocity), defects
+    checked = (passive, rows(errors), jax.tree.map(rows, reciprocity), defects)
+    return (*checked, result[2]) if return_samples else checked
 
 
 @lru_cache(maxsize=None)

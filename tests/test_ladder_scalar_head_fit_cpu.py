@@ -136,3 +136,55 @@ def test_certified_head_wiring_preserves_current_body_identity_without_mpa_refit
     kwargs['response']=dataclasses.replace(response,scalar_model=stale)
     with pytest.raises(ValueError,match='GATE tangential_head_identity'):
         build_tangential_head(dict(identity=identity,digest='body'),None,None,wfns,meta,cfg,**kwargs)
+
+
+def test_captured_actions_select_inverse_reference_without_ill_conditioned_grid_fit():
+    """Measured contribution selection meets all budgets on real captured actions."""
+    import json
+    from pathlib import Path
+    import jax
+    from gw.ladder_head_fit import _inverse_reference_site
+    from gw.qsgw_head import head_quadrature_rule
+    from gw.tangential_head_scalar import scalar_head_ritz,scalar_head_certificate
+    jax.config.update('jax_enable_x64',True)
+    def decode(v):
+        if isinstance(v,dict):
+            return complex(v['real'],v['imag']) if set(v)=={'real','imag'} else {k:decode(x) for k,x in v.items()}
+        return [decode(x) for x in v] if isinstance(v,list) else v
+    raw=decode(json.loads((Path(__file__).parent/'data/ladder_head_conditioning_actions.json').read_text()))
+    obs=raw['observations'];z=np.asarray(obs['z']);values=np.asarray(obs['Wc']);slopes=np.asarray(obs['dWc_ds'])
+    quadrature=set(map(complex,np.r_[*[1j*head_quadrature_rule(n)[0] for n in (24,48,96)]]))
+    fit={complex(p) for p in z[:raw['fit_prefix']] if complex(p) not in quadrature}
+    held=set(map(complex,z))-fit
+    xi,weights=head_quadrature_rule(raw['reference_order']);points=tuple(map(complex,1j*xi))
+    promoted=[]
+    for _ in range(6):
+        ids=np.array([i for i,p in enumerate(z) if complex(p) in fit])
+        model=scalar_head_ritz(z[ids],values[ids],slopes[ids],moment_m1=obs['M1'],moment_m3=obs['M3'],gram_keep=1e-12)
+        certificate=scalar_head_certificate(model,obs,eta_ry=raw['eta_ry'],static_value=raw['static_value'],inverse_m1=raw['inverse_m1'])
+        errors=np.maximum(certificate['sample_value_relative'],certificate['sample_slope_relative'])
+        if certificate['inverse_m1_relative']<=1e-8 and np.max(errors)<=1e-3:
+            break
+        if certificate['inverse_m1_relative']>1e-8:
+            point,contribution=_inverse_reference_site(obs,certificate,(points,xi,weights),held,agree=np.asarray)
+            assert point in points and contribution>0
+        else:
+            # An independently failing held slope still cannot be published.
+            # This component check uses other captured held observations;
+            # the full-controller oracle above checks newly solved guards.
+            i=max((i for i,p in enumerate(z) if complex(p) in held),key=lambda i:errors[i])
+            assert errors[i]>1e-3
+            point=complex(z[i])
+        assert point in held
+        # The selected observation was never fitted before this failed
+        # inverse certificate. No pole/residue constraint is applied.
+        held.remove(point);fit.add(point);promoted.append(point)
+    else:
+        raise AssertionError('captured inverse reference did not converge')
+    assert promoted and held
+    assert max(certificate['sample_value_relative'])<=1e-3
+    assert max(certificate['sample_slope_relative'])<=1e-3
+    assert certificate['static_relative']<=1e-10
+    assert certificate['inverse_m1_relative']<=1e-8
+    assert all(max(v)<=1e-8 for row in certificate['high_frequency'].values() for v in row.values())
+    assert len(fit)<raw['fit_prefix']//2  # Observed but redundant reference grid was not stuffed into FIT.

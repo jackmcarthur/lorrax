@@ -39,6 +39,7 @@ def test_scalar_shared_ritz_preserves_positive_poles_and_both_moment_kinds():
     certificate=scalar_head_certificate(result,observations,eta_ry=.02,
         static_value=values[0],inverse_m1=np.sum(residue/omega**2))
     assert np.all(certificate['passivity']['passivity'])
+    np.testing.assert_allclose(certificate['predicted_values'],reference,rtol=3e-9,atol=3e-10)
     assert max(certificate['sample_value_relative'])<3e-9
     assert max(certificate['sample_slope_relative'])<3e-8
     assert certificate['static_relative']<3e-10
@@ -243,3 +244,28 @@ def test_bulk_draw_identity_and_actions_are_fixed_between_frequency_batches(monk
         np.testing.assert_allclose(full['Wc'][index],complex(total-bare),rtol=3e-13,atol=3e-12)
     with pytest.raises(ValueError,match='GATE scalar_resolvent_head_sphere'):
         scalar_resolvent_head(kernel,geometry,grid,response,analytic_sphere=True)
+
+
+def test_shared_certificate_optional_samples_preserve_body_default_results():
+    import jax
+    import jax.numpy as jnp
+    from gw.tangential_local import _round_check_equations,_mm
+    from gw.tangential_head_scalar import _one_parent_eigh
+    from gw.tangential_recipe import shared_real_pole_gates_v1_r3b as gates
+    jax.config.update('jax_enable_x64',True)
+    omega=np.array([.3,.8]);residue=np.array([.5,.7]);z=np.array([0j,.2j,.5+.1j])
+    values,slopes=_measure(z,omega,residue)
+    model=(jnp.asarray(np.sqrt(2*omega*residue))[None,None],
+           jnp.asarray(omega**2)[None],jnp.ones((1,2),bool))
+    args=(model,(),jnp.ones((1,1,1))/2,jnp.asarray(values)[None,:,None,None],
+          jnp.asarray(slopes)[None,:,None,None],jnp.asarray(z),jnp.asarray(.02),
+          jnp.asarray([[[sum(omega*residue)]]]),jnp.asarray([[[sum(omega**3*residue)]]]),
+          jnp.ones((1,1,1),jnp.complex128))
+    kwargs=dict(matmul=_mm,eigh=_one_parent_eigh,gates=gates,ordered=False)
+    default=_round_check_equations(*args,**kwargs)
+    extended=_round_check_equations(*args,**kwargs,return_samples=True)
+    assert len(default)==4 and len(extended)==5
+    for before,after in zip(jax.tree.leaves(default),jax.tree.leaves(extended[:4])):
+        np.testing.assert_allclose(before,after,rtol=1e-14,atol=1e-14)
+    np.testing.assert_allclose(extended[4][:,0,0,0],values,rtol=1e-14,atol=1e-14)
+    np.testing.assert_allclose(extended[4][:,1,0,0],slopes,rtol=1e-14,atol=1e-14)
