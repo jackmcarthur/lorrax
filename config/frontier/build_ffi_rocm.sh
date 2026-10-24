@@ -37,6 +37,9 @@ source "$VENV/bin/activate"         # cmake probes jax.ffi.include_dir() from he
 # Prefix selection and build must see the same explicit controls, while module
 # state and library search paths stay out of the child. ELPA initializes its
 # own pinned module environment; a login shell would reintroduce user state.
+# The system profile alone (no user dotfiles) supplies the site MODULEPATH:
+# under a bare env -i, Lmod's init leaves MODULEPATH undefined and every module
+# is unknown on Frontier ("Lmod Warning: MODULEPATH is undefined").
 _build_elpa() {
     local name
     local child=(HOME="$HOME" PATH=/usr/bin:/bin)
@@ -45,7 +48,12 @@ _build_elpa() {
                 LORRAX_ELPA_ROOT LORRAX_ELPA_GFX LORRAX_ELPA_OPENMP LORRAX_ELPA_MAKE_J; do
         [[ -z "${!name+x}" ]] || child+=("$name=${!name}")
     done
-    env -i "${child[@]}" bash "$ROOT/config/frontier/build_elpa_hip.sh" "$@"
+    # $0 stays "bash" and the startup flags stay default: Frontier's profile
+    # scripts detect the shell from them and skip Lmod otherwise.
+    env -i "${child[@]}" bash -c \
+        'p=$1; shift; source "$p" >/dev/null 2>&1; exec bash "$@"' bash \
+        "${LORRAX_OLCF_SYSTEM_PROFILE:-/etc/profile}" \
+        "$ROOT/config/frontier/build_elpa_hip.sh" "$@"
 }
 ELPA_DIR=${LORRAX_ELPA_ROCM_DIR:-$(_build_elpa --print-prefix)}
 [ -e "$ELPA_DIR/LORRAX_ELPA_COMPLETE" ] || _build_elpa || {
