@@ -1463,6 +1463,22 @@ def _window_selector(shape, weighted):
     return jax.jit(select)
 
 
+def _pack_pole_fields(basis, Omega, B, B_odd, *, consume=False):
+    """Canonical pole fields to this run's packed centroid face.
+
+    ``consume`` is a final-read handoff after the source census; store and
+    borrowed/multi-read inputs keep their buffers. Scalar MPA poles stay
+    scalar, while elementwise GN poles follow the residue permutation.
+    """
+    mu = int(basis.n_canonical)
+    B = basis.pack_operator(B, consume=consume)
+    if B_odd is not None:
+        B_odd = basis.pack_operator(B_odd, consume=consume)
+    if Omega.ndim >= 2 and tuple(Omega.shape[-2:]) == (mu, mu):
+        Omega = basis.pack_operator(Omega, consume=consume)
+    return Omega, B, B_odd
+
+
 def _integrate_sigma_batches(
     wfns,
     batches,
@@ -1484,6 +1500,7 @@ def _integrate_sigma_batches(
     keep_branches=False,
     matrix_counts=None,
     print_fn,
+    consume_poles=False,
 ):
     """One spatial executor for streamed fit slabs: one executable per window.
 
@@ -1689,13 +1706,8 @@ def _integrate_sigma_batches(
             # field once per batch at this read seam.  GN-PPM's pole frequency
             # is per (q, mu, nu) and follows the residues; MPA's scalar poles
             # are left alone.
-            _basis = meta.mu_basis
-            _mu_can = int(_basis.n_canonical)
-            B = _basis.pack_operator(B)
-            if B_odd is not None:
-                B_odd = _basis.pack_operator(B_odd)
-            if Omega.ndim >= 2 and tuple(Omega.shape[-2:]) == (_mu_can, _mu_can):
-                Omega = _basis.pack_operator(Omega)
+            Omega, B, B_odd = _pack_pole_fields(
+                meta.mu_basis, Omega, B, B_odd, consume=consume_poles)
         if B_odd is not None:
             max_b = max(max_b, float(jax.device_get(jnp.max(jnp.abs(B)))))
             max_d = max(
@@ -1853,6 +1865,7 @@ def _integrate_sigma_batches(
                         "  MPA Sigma sweep begin: one executable per window "
                         "prewarmed")
                     sweep_started = True
+                    del programs
             if synthesis:
                 # One executable per window: the node loop runs on device.
                 total = target.run_window(
@@ -1873,6 +1886,11 @@ def _integrate_sigma_batches(
             progress.step(wait=total, count=n_nodes)
             n_tau += n_nodes
             n_sweeps += 1
+            # Compile-only argument lists/defaults must not pin an old ordered
+            # residue branch into the next window's allocation.
+            del compile_window, tau_arguments
+            if not synthesis:
+                del B_branch
         del B, B_odd, Omega
         gc.collect()
     progress.finish()
@@ -2276,6 +2294,7 @@ def integrate_sigma_store(
     keep_branches=False,
     matrix_counts=None,
     print_fn=print,
+    consume_source=False,
 ):
     """Read, unfold, consume, and release one pole range at a time.
 
@@ -2298,6 +2317,11 @@ def integrate_sigma_store(
     plane-wave path's ``get_shared_sigma_tau_kernel(_sigma_kij=...)``); see
     :func:`_integrate_sigma_batches`, which also owns ``keep_branches``.
     """
+    if consume_source and (not isinstance(fit_src, MemoryPoleSource)
+                           or int(n_poles) != 1 or fit_src.n_poles != 1):
+        raise ValueError("GATE sigma_source_final_read: consumed source must be a "
+                         "fresh single-pole MemoryPoleSource; keep consume_source=False "
+                         "for stores or multiple reads")
     batch_size = _bounded_pole_batch_size(pole_batch_size)
 
     q_wedge = getattr(fit_src, "q_wedge", None)
@@ -2320,7 +2344,7 @@ def integrate_sigma_store(
             q_wedge=q_wedge, tau_capacity=tau_capacity,
             tau_kernel_factory=tau_kernel_factory, omega_grid_ry=omega_grid_ry,
             keep_branches=keep_branches, matrix_counts=matrix_counts,
-            print_fn=print_fn)
+            print_fn=print_fn, consume_poles=consume_source)
 
     if isinstance(fit_src, (PoleReader, MemoryPoleSource)):
         return run(fit_src)
@@ -2440,6 +2464,7 @@ def compute_sigma_c_mpa_omega_grid(
     linalg=None,
     keep_branches=False,
     print_fn=print,
+    consume_source=False,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
 
@@ -2447,6 +2472,10 @@ def compute_sigma_c_mpa_omega_grid(
     per-frequency broadening and window labels (``sigma_box_plan.plan_sigma_windows``).
     ``linalg``: the deck's resolved dense layout, which places a tangential
     model's W(τ) synthesis (:func:`_tangential_memory_schedule`).
+    ``consume_source=True`` permits the fresh one-pole in-memory source's
+    FINAL read to transfer its canonical fields into the packed executor,
+    after the census/plan. It requires ``odd_reference=False``; borrowed,
+    stored and multi-read sources keep False.
     ``request`` (``gw.ppm_sigma.OnShellRequest``): where Sigma_c is evaluated;
     the windows are planned on its ``frequencies_ry`` (on which
     ``omega_eta_ry``/``omega_group`` are labelled).  ``omega_grid_ry`` in its
@@ -2484,6 +2513,11 @@ def compute_sigma_c_mpa_omega_grid(
     """
     if sigma_w_model not in ("mpa", "tangential"):
         raise ValueError(f"sigma_w_model must be mpa or tangential; got {sigma_w_model!r}")
+    if consume_source and (not isinstance(fit_src, MemoryPoleSource)
+                           or fit_src.n_poles != 1 or odd_reference):
+        raise ValueError("GATE sigma_source_final_read: want a fresh single-pole "
+                         "MemoryPoleSource and odd_reference=False; keep "
+                         "consume_source=False for borrowed or repeated reads")
     if (request is None) == (omega_grid_ry is None):
         raise ValueError("compute_sigma_c_mpa_omega_grid: pass request (on shell) or "
                          "omega_grid_ry (the grid), not both")
@@ -2747,7 +2781,7 @@ def compute_sigma_c_mpa_omega_grid(
                     tau_capacity=geometry.get("sc_tau_capacity"),
                     tau_kernel_factory=tau_kernel_factory, omega_grid_ry=grid_ry,
                     keep_branches=keep_branches, matrix_counts=band_matrix_counts,
-                    print_fn=print_fn)
+                    print_fn=print_fn, consume_source=consume_source)
         # odd_reference=False: the caller builds its own D=0 reference (the GN
         # arm does, in ppm_pipeline), so a second twin here would be a whole
         # extra sweep whose sigma_c_odd_kij nobody reads.

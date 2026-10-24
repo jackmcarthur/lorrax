@@ -1681,7 +1681,7 @@ def compute_sigma_c_ppm_omega_grid(
         analytic_line=False,
         # No D=0 twin on the GN/HL route: the odd-reference Sigma was a
         # diagnostic-only second sweep, removed by owner decision 2026-09-23.
-        odd_reference=False,
+        odd_reference=False, consume_source=consume_ppm,
         keep_branches=keep_branches,
         print_fn=print_fn)
     sigma_c_kij = result.sigma_c_kij

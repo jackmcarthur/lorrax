@@ -182,3 +182,70 @@ def test_owned_single_pole_axis_has_no_second_field_allocation():
     result.block_until_ready()
     assert field.is_deleted()
     np.testing.assert_array_equal(np.asarray(result),host[None])
+
+
+@pytest.mark.parametrize('side,identity',[(2,False),(2,True),(3,False)])
+def test_final_source_read_retires_canonical_fields_after_census(monkeypatch,side,identity):
+    from gw.mpa import sigma as M
+    mesh,basis,*_=case(side,identity,True)
+    sh=NamedSharding(mesh,P(None,None,'x','y'))
+    mu=basis.n_canonical
+    host=(1+np.arange(2*mu*mu).reshape(1,2,mu,mu)/10000).astype(complex)
+    p2c=basis.layout.axis.packed_to_canonical
+    take=np.maximum(p2c,0)
+    mask=(p2c>=0)[:,None]&(p2c>=0)[None,:]
+    outputs=[]
+    for consume in (False,True):
+        arrays=[jax.device_put((host*v).copy(),sh) for v in (1,-.1,.01)]
+        source=M.MemoryPoleSource(*arrays,n_mu_logical=basis.n_logical,
+            mesh_xy=mesh,provenance={},consume=True)
+        census=tuple(np.asarray(a).copy() for a in source.read(return_sharded=True,include_odd=True))
+        for got in census:
+            assert np.all(got[...,basis.n_logical:,:]==0)
+        # Model the real reader generator: it keeps the canonical fields
+        # while yielded. The pack transfer must retire those exact buffers.
+        def execute(wfns,batches,n_poles,plan,request,meta,mesh,**kwargs):
+            result=[]
+            for lo,o,b,d in batches:
+                packed=M._pack_pole_fields(meta.mu_basis,o,b,d,consume=kwargs['consume_poles'])
+                for a,can in zip(packed,census):
+                    expected=np.where(mask,can[:,:,take][:,:,:,take],0)
+                    np.testing.assert_array_equal(np.asarray(a),expected)
+                result.append(tuple(np.asarray(a).copy() for a in packed))
+            return result
+        monkeypatch.setattr(M,'_integrate_sigma_batches',execute)
+        result=M.integrate_sigma_store(None,source,1,None,None,NS(mu_basis=basis),mesh,
+                                       consume_source=consume)
+        if consume and not identity:
+            assert all(a.is_deleted() for a in (source.Omega,source.B,source.B_odd))
+        else:
+            for a,can in zip(source.read(return_sharded=True,include_odd=True),census):
+                np.testing.assert_array_equal(np.asarray(a),can)
+        outputs.append(result)
+    for a,b in zip(outputs[0][0],outputs[1][0]):np.testing.assert_array_equal(a,b)
+
+    # The generic batch mover also preserves every distinct leading batch,
+    # and chunks the flattened pole*q axis INSIDE its jit.
+    block=np.concatenate([host,2*host],axis=0)
+    block[...,basis.n_logical:,:]=0
+    block[...,:,basis.n_logical:]=0
+    field=jax.device_put(block.copy(),sh)
+    packed=basis._operator_kernel(P(None,None,'x','y'),False,
+                                  q_tile_bytes=1,consume=True)(field)
+    expected=np.where(mask,block[:,:,take][:,:,:,take],0)
+    np.testing.assert_array_equal(np.asarray(packed),expected)
+
+
+def test_final_read_contract_refuses_reread_and_nonmemory_owners():
+    from gw.mpa import sigma as M
+    mesh,basis,*_=case(2,False,True)
+    sh=NamedSharding(mesh,P(None,None,'x','y'))
+    make=lambda npoles:M.MemoryPoleSource(*[jax.device_put(np.full((npoles,2,basis.n_canonical,basis.n_canonical),v,complex),sh)
+        for v in (1,-.1,.01)],n_mu_logical=basis.n_logical,mesh_xy=mesh,provenance={})
+    for source,odd in ((make(1),True),(make(2),False),('store.h5',False)):
+        with pytest.raises(ValueError,match='sigma_source_final_read'):
+            M.compute_sigma_c_mpa_omega_grid(None,source,None,mesh,efermi_ry=0.,
+                regularization_width_ry=.01,quadrature_eps=1e-4,omega_grid_step_ry=.1,
+                omega_grid_ry=np.array([.2]),consume_source=True,odd_reference=odd)
+    with pytest.raises(ValueError,match='sigma_source_final_read'):
+        M.integrate_sigma_store(None,make(2),2,None,None,None,mesh,consume_source=True)
