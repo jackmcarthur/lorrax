@@ -17,6 +17,8 @@
 #              when the script runs from inside a checkout, which it then uses.
 #   --with-xc  also install the patched jax_xc 0.0.11 (the nscf driver only).
 #   --no-ffi   skip building the two native libraries.
+#   --no-space-check  skip the free-space and quota check (about 5 GB at
+#              PREFIX and 4.5 GB for an empty uv cache).
 #   --cubins SET  which NVRTC kernel images to build ahead of the first run:
 #              hsuite (the test suite's k-grids), all (every grid of
 #              scripts/build_cubin_store.py) or none.  The build needs a GPU
@@ -50,9 +52,10 @@ set -euo pipefail
 UV_VERSION=0.13.5
 REPO=https://github.com/jackmcarthur/lorrax.git
 
-PREFIX="" REF=main WITH_XC=0 BUILD_FFI=1 CUBINS=""
+PREFIX="" REF=main WITH_XC=0 BUILD_FFI=1 CUBINS="" SPACE_CHECK=1
 while (($#)); do
     case "$1" in
+        --no-space-check) SPACE_CHECK=0; shift ;;
         --ref) REF="$2"; shift 2 ;;
         --with-xc) WITH_XC=1; shift ;;
         --no-ffi) BUILD_FFI=0; shift ;;
@@ -72,6 +75,62 @@ say() { printf '\n[install_deps] [%4ds] %s\n' "$SECONDS" "$*"; }
     echo "  Other machines: see config/local/ and the Installation page of the manual." >&2
     exit 2; }
 
+# --- 0. room ----------------------------------------------------------------
+# PREFIX takes about 5 GB and an empty uv cache about 4.5 GB of downloads.  Both
+# the file system's free space (df) and the user's quota (NERSC myquota or
+# showquota, where present) must hold them; a quota shared by both places must
+# hold the sum.  An over-quota file system refuses writes partway through, so
+# refuse here instead.
+UV_CACHE_DIR="${UV_CACHE_DIR:-${SCRATCH:?SCRATCH is not set}/.cache/uv}"
+_quota_table=""
+if ((SPACE_CHECK)); then
+    for _q in myquota showquota; do
+        command -v "$_q" >/dev/null 2>&1 && { _quota_table="$(timeout 30 "$_q" 2>/dev/null || true)"; break; }
+    done
+fi
+_quota_label() {  # the quota row a path is charged to: home, pscratch, or nothing
+    case "$1/" in
+        "$HOME"/*) echo home ;;
+        "${SCRATCH:-/nonexistent}"/*|/pscratch/*) echo pscratch ;;
+    esac
+}
+_quota_free_gb() {  # free GiB in quota row $1 ("" when unknown); myquota's columns or showquota's | table
+    printf '%s\n' "$_quota_table" | awk -v fs="$1" '
+        function gib(s,  v, u) { v = s + 0; u = s; gsub(/[0-9. ]/, "", u)
+            return u ~ /^T/ ? v * 1024 : u ~ /^M/ ? v / 1024 : u ~ /^K/ ? v / 1048576 : v }
+        { gsub(/\|/, " "); $0 = $0 } $1 == fs { printf "%.1f\n", gib($3) - gib($2); exit }'
+}
+_df_free_gb() { local d=$1; while [[ ! -d "$d" ]]; do d=$(dirname "$d"); done
+                df -Pk "$d" | awk 'NR == 2 { printf "%.1f\n", $4 / 1048576 }'; }
+_df_fs() { local d=$1; while [[ ! -d "$d" ]]; do d=$(dirname "$d"); done; df -P "$d" | awk 'NR == 2 { print $6 }'; }
+if ((SPACE_CHECK)); then
+    _need_prefix=5
+    _need_uv=$([[ -n "$(ls -A "$UV_CACHE_DIR" 2>/dev/null | head -1)" ]] && echo 1 || echo 4.5)
+    declare -A _need=() _where=()
+    for _pair in "$PREFIX:$_need_prefix" "$UV_CACHE_DIR:$_need_uv"; do
+        _p=${_pair%:*} _n=${_pair##*:}
+        _k="df:$(_df_fs "$_p")"
+        _need[$_k]=$(awk -v a="${_need[$_k]:-0}" -v b="$_n" 'BEGIN { print a + b }'); _where[$_k]+=" $_p"
+        _l=$(_quota_label "$_p")
+        if [[ -n "$_l" && -n "$(_quota_free_gb "$_l")" ]]; then
+            _k="quota:$_l"
+            _need[$_k]=$(awk -v a="${_need[$_k]:-0}" -v b="$_n" 'BEGIN { print a + b }'); _where[$_k]+=" $_p"
+        fi
+    done
+    for _k in "${!_need[@]}"; do
+        case "$_k" in
+            df:*) _free=$(_df_free_gb "$(awk '{print $1}' <<< "${_where[$_k]}")") ;;
+            quota:*) _free=$(_quota_free_gb "${_k#quota:}") ;;
+        esac
+        if awk -v f="$_free" -v n="${_need[$_k]}" 'BEGIN { exit !(f < n) }'; then
+            _have=$(awk -v f="$_free" 'BEGIN { print (f < 0 ? "none: over quota by " (-f) " GB" : "only " f " GB") }')
+            echo "install_deps: REFUSED: needs ${_need[$_k]} GB for${_where[$_k]} but has $_have free (${_k/:/ }); choose another PREFIX (bash install_deps.sh /path/with/room) and/or UV_CACHE_DIR, or pass --no-space-check." >&2
+            exit 3
+        fi
+    done
+    unset _need _where _pair _p _n _k _l _free _need_prefix _need_uv
+fi
+
 # --- 1. uv -------------------------------------------------------------------
 mkdir -p "$PREFIX/bin"
 if [[ "$("$PREFIX/bin/uv" --version 2>/dev/null | awk '{print $2}')" != "$UV_VERSION" ]]; then
@@ -80,7 +139,7 @@ if [[ "$("$PREFIX/bin/uv" --version 2>/dev/null | awk '{print $2}')" != "$UV_VER
         | tar -xz -C "$PREFIX/bin" --strip-components=1
 fi
 export PATH="$PREFIX/bin:$PATH"
-export UV_CACHE_DIR="${UV_CACHE_DIR:-${SCRATCH:?SCRATCH is not set}/.cache/uv}"
+export UV_CACHE_DIR
 export UV_PYTHON_INSTALL_DIR="$PREFIX/uv-python"
 export UV_PYTHON_PREFERENCE=only-managed  # never a cray-python or conda module
 export UV_LINK_MODE=copy                  # the cache and PREFIX are on different file systems
