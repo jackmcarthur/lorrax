@@ -12,12 +12,13 @@
 #              when the script runs from inside a checkout, which it then uses.
 #   --with-xc  also install the patched jax_xc 0.0.11 (the nscf driver only).
 #   --no-ffi   skip building the two native libraries.
-#   --cubins SET  which NVRTC kernel images to build ahead of the first run, on
-#              this node's GPU (a Perlmutter login node has one A100, the
-#              compute nodes' architecture): hsuite (default: the test suite's
-#              k-grids), all (every grid of scripts/build_cubin_store.py), or
-#              none.  Without a GPU the step is skipped and each image compiles
-#              on first use instead (about 7 s per image per rank).
+#   --cubins SET  which NVRTC kernel images to build ahead of the first run:
+#              hsuite (the test suite's k-grids), all (every grid of
+#              scripts/build_cubin_store.py) or none.  The build needs a GPU
+#              of the compute nodes' architecture and is too heavy for a
+#              shared login node, so it runs only inside a GPU allocation
+#              (default there: hsuite; elsewhere: none).  Skipped, each image
+#              compiles on first use instead (about 7 s per image per rank).
 #
 # Runs on a login node in a few minutes (about 90 s with warm uv and ccache
 # caches); no allocation is needed.
@@ -44,7 +45,7 @@ set -euo pipefail
 UV_VERSION=0.13.5
 REPO=https://github.com/jackmcarthur/lorrax.git
 
-PREFIX="" REF=main WITH_XC=0 BUILD_FFI=1 CUBINS=hsuite
+PREFIX="" REF=main WITH_XC=0 BUILD_FFI=1 CUBINS=""
 while (($#)); do
     case "$1" in
         --ref) REF="$2"; shift 2 ;;
@@ -117,13 +118,21 @@ fi
 # Into the per-user image cache (kconv_mathdx/images under $SCRATCH/.cache/lorrax),
 # where every later install and rebuild finds them: an image's key names its
 # toolchain, never the install path.
+if [[ -z "$CUBINS" ]]; then
+    if [[ -n "${SLURM_JOB_ID:-}" ]] && nvidia-smi -L >/dev/null 2>&1; then CUBINS=hsuite; else
+        CUBINS=none
+        say "NVRTC kernel images not prebuilt (no GPU allocation here); each compiles on first use.
+  To build them ahead, inside a 1-node GPU allocation:
+    srun -N 1 -n 1 --gpus-per-node=4 $ROOT/.venv/bin/python $ROOT/scripts/build_cubin_store.py --jobs 16"
+    fi
+fi
 if ((BUILD_FFI)) && [[ "$CUBINS" != none ]]; then
     if nvidia-smi -L >/dev/null 2>&1; then
         case "$CUBINS" in
             hsuite) GRIDS="probe na_fixture h2_fixture" ;;
             all) GRIDS="" ;;
         esac
-        JOBS=$(( $(nproc) / 16 )); ((JOBS < 1)) && JOBS=1; ((JOBS > 8)) && JOBS=8
+        JOBS=$(( $(nproc) / 8 )); ((JOBS < 1)) && JOBS=1; ((JOBS > 16)) && JOBS=16
         say "building the NVRTC kernel images ($CUBINS) on this node's GPU with $JOBS workers"
         # shellcheck disable=SC2086  # GRIDS is a word list
         (cd "$ROOT" && source config/perlmutter/gpu_env.sh && \
