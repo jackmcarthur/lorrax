@@ -174,8 +174,11 @@ callers or clear compiled programs.
 The nodal fit keeps sampled states on centroid faces. Whole-orbit packing
 allows each rank to accumulate its normal-equation tile without gathering
 node samples or a whole orbit matrix. The shared nonnegative quadratic solver
-keeps all principal systems distributed and returns inactive weights exactly
-zero. Loewdin eigenvectors and inverse roots remain band faces; explicit
+uses the existing CUDA capacity route when its complete checked principal
+program plus native GETRF scratch fits the current agreed room. A lazily
+priced whole-mesh LU is its backup; other device legs retain their provider.
+Only the selected executable runs, and inactive weights return exactly zero.
+The one-system program cache keys its concrete provider, not the live room. Loewdin eigenvectors and inverse roots remain band faces; explicit
 all-to-all and transpose-partner exchanges produce the compact product-rank
 coefficient and target carriers. Basis artifacts continue to store physical
 band/rank extents through SlabIO, which reads directly into mesh-padded faces.
