@@ -46,6 +46,17 @@ Instructions
    same QP transitions at each Q. The plot never substitutes the coarse
    gap or a DFT gap for that threshold.
 
+   If a separate dense near-Gamma scan has been completed, use its output
+   prefix for the lower panel:
+
+   ```bash
+   lorrax_python 02-plot_exciton_bands.py --near-gamma-prefix near_gamma
+   ```
+
+   The upper panel retains the full-path data and its continuum threshold.
+   The lower panel shows all levels in the supplied near-Gamma scan. These
+   remain ordered energy levels; the plot does not assign optical character.
+
 Calculation settings
 --------------------
 
