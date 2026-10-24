@@ -225,14 +225,10 @@ struct LORRAX_PHDF_CTX_TYPE {
     std::deque<std::function<void()>> task_queue;
     bool                              shutdown_flag = false;
 
-    // Tuning flags, read from env at open time.  Default: collective
-    // reads AND collective writes (two-phase aggregation; the strided
-    // 2-D tile pattern of the production writes is ~3 orders faster
-    // collective — scorecard AI — and the default now matches the
-    // Python phdf5_host writer so LORRAX_PHDF5_COLLECTIVE_WRITES=0
-    // means "independent" in every writer.  Historical Cray-MPICH
-    // caution: ad_cray_write_coll.c:669 OOM at >~1 GB/rank on that
-    // stack — use the env override there).  Metadata defaults to
+    // Transfer modes, set at open time: collective reads AND collective
+    // writes (two-phase aggregation; the strided 2-D tile pattern of the
+    // production writes is ~3 orders faster collective — scorecard AI —
+    // as in the Python phdf5_host writer).  Metadata is
     // non-collective so file-level ops (H5Dcreate/extend) bypass the
     // collective driver; non-collective metadata was also measured
     // ~100 ms faster on OpenMPI small writes.  dedup_replicas

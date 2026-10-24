@@ -79,26 +79,6 @@ using lorrax_ffi::cusolvermp::LorraxCusolverMpCtx;
 using lorrax_ffi::cusolvermp::ensure_workspace;
 namespace mp = lorrax_ffi::cusolvermp::mp;
 
-// LORRAX_LU_NO_PIVOT (debug A/B), the *bool* grammar of
-// runtime/env_flags.env_bool: unset, blank, 0, false, no or off keep partial
-// pivoting; 1, true, yes or on disable it; any other value keeps pivoting
-// (the safe direction) and is announced once.  Read once per process.
-static bool lu_no_pivot() {
-    static const bool off = [] {
-        const char* v = std::getenv("LORRAX_LU_NO_PIVOT");
-        if (v == nullptr || *v == '\0') return false;
-        std::string s(v);
-        for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
-        if (s == "0" || s == "false" || s == "no" || s == "off") return false;
-        std::fprintf(stderr,
-            "*** LORRAX SANITY: LORRAX_LU_NO_PIVOT=%s is not a bool; "
-            "cuSOLVERMp LU keeps partial pivoting.\n", v);
-        return false;
-    }();
-    return off;
-}
-
 static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
                                            cudaStream_t signaller,
                                            cudaEvent_t  ev) {
@@ -399,12 +379,10 @@ static ffi::Error BatchedSolveLuImpl(
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
     }
 
-    const bool no_pivot = lu_no_pivot();
-
     for (int64_t q = 0; q < nq; ++q) {
         T* A_slice_ptr = d_A_factored_out + q * A_slice;
         T* X_slice_ptr = d_X_out + q * B_slice;
-        int64_t* ipiv_slice_ptr = no_pivot ? nullptr : (d_ipiv + q * ipiv_slice);
+        int64_t* ipiv_slice_ptr = d_ipiv + q * ipiv_slice;
         int* info_q = d_infos + q * (1 + blk);           // getrf's, then one per chunk
 
         mp_st = mp::Getrf<T>(
@@ -496,8 +474,7 @@ static ffi::Error BatchedGetrfImpl(
     LORRAX_GPU_CHECK(cudaMemsetAsync(
         d_ipiv_out, 0, nq * ipiv_len * sizeof(int64_t), ctx->stream));
 
-    const bool no_pivot = lu_no_pivot();
-    int64_t* piv0 = no_pivot ? nullptr : d_ipiv_out;
+    int64_t* piv0 = d_ipiv_out;
     // The descriptor and the vendor's workspace size, once per shape (lu_plan).
     LuPlan* plan = nullptr;
     if (auto e = lu_plan<T>(ctx, n, 0, mb, nb, 0, 0, true, false, d_LU_out, piv0, &plan);
@@ -513,7 +490,7 @@ static ffi::Error BatchedGetrfImpl(
     }
     for (int64_t q = 0; q < nq; ++q) {
         T* LU_q = d_LU_out + q * A_slice;
-        int64_t* piv_q = no_pivot ? nullptr : d_ipiv_out + q * ipiv_len;
+        int64_t* piv_q = d_ipiv_out + q * ipiv_len;
         if (auto err = reset_info(ctx); !err.success()) {
             return err;
         }
@@ -565,8 +542,7 @@ static ffi::Error BatchedGetrsImpl(
             d_X_out, d_B_in, nq * B_slice * sizeof(T),
             cudaMemcpyDeviceToDevice, ctx->stream));
     }
-    const bool no_pivot = lu_no_pivot();
-    int64_t* piv0 = no_pivot ? nullptr : const_cast<int64_t*>(d_ipiv);
+    int64_t* piv0 = const_cast<int64_t*>(d_ipiv);
     // The descriptors and the vendor's workspace size, once per shape (lu_plan).
     // Always at the default cap: this workspace is the context's persistent buffer.
     LuPlan* plan = nullptr;
@@ -599,9 +575,7 @@ static ffi::Error BatchedGetrsImpl(
     for (int64_t q = 0; q < nq; ++q) {
         T* LU_q = const_cast<T*>(d_LU) + q * A_slice;
         T* X_q = d_X_out + q * B_slice;
-        int64_t* piv_q = no_pivot ? nullptr
-                                  : const_cast<int64_t*>(d_ipiv)
-                                        + q * ipiv_len;
+        int64_t* piv_q = const_cast<int64_t*>(d_ipiv) + q * ipiv_len;
         if (auto err = reset_info(ctx); !err.success()) {
             return err;
         }

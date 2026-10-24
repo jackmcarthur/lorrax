@@ -500,12 +500,12 @@ def test_module_constants_work_for_every_read_shape():
     assert hits["LORRAX_ANNOTATED"] == [("fixture.py", 10, "Gate(env=...)")]
 
 
-def test_deleting_matmul_precision_row_exposes_the_source_read():
+def test_deleting_a_module_constant_row_exposes_the_source_read():
     """A module-constant read is visible, and its one row is necessary."""
-    name = "LORRAX_MATMUL_PRECISION"
+    name = "LORRAX_ALLOW_NONFINITE_RESULT"
     sites = python_read_sites()
-    assert name in sites, "the module-constant matmul-precision read is invisible"
-    assert any(f.endswith("runtime/__init__.py") for f, _, _ in sites[name])
+    assert name in sites, "the module-constant non-finite-result read is invisible"
+    assert any(f.endswith("common/sanity.py") for f, _, _ in sites[name])
     text = _registry_text()
     exact, globs = registry_vocabulary(text)
     assert covered(name, exact, globs)

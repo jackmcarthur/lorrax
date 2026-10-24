@@ -644,9 +644,9 @@ def _assert_shared_directory(path: str) -> None:
 #     Out of memory in .../ad_cray/ad_cray_write_coll.c, line 669
 # followed by MPI_Abort and "HDF5: infinite loop closing library".  That is
 # the SAME line ``stage/phdf5_stage_cray.sh`` documents as a known Cray-MPICH
-# >=1 GB/rank OOM whose remedy is ``LORRAX_PHDF5_COLLECTIVE_WRITES=0`` /
-# ``LORRAX_PHDF5_INDEPENDENT=1``.  An operator who follows that documented
-# remedy converts the loud crash into the silent-wrong-answer regime above.
+# >=1 GB/rank OOM whose remedy was independent transfers (the env switches
+# for them are removed).  An operator who followed that documented
+# remedy converted the loud crash into the silent-wrong-answer regime above.
 # So the misdiagnosis is not hypothetical; the tree points at it.
 #
 # Hence: ask MPI, once, at the first collective open.  The verdict is

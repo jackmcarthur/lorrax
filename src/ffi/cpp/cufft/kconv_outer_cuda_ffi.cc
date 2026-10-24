@@ -107,7 +107,7 @@ __device__ __forceinline__ lrx_c2 lrx_mul(lrx_c2 a, lrx_c2 b) {
 
 // D += A B: A 8x4 row (lane: row lane/4, col lane%4), B 4x8 col (lane: row lane%4, col lane/4),
 // D 8x8 (lane: row lane/4, cols 2(lane%4) + {0, 1}).  On the fp64 tensor cores, or (LRX_FMA, the
-// LORRAX_BSE_OUTER_KSUM=fma A/B) the same fragment contract on the FP64 FMA pipe, as the decode.
+// ksum=1 build, kept buildable) the same fragment contract on the FP64 FMA pipe, as the decode.
 #if LRX_FMA
 __device__ __forceinline__ void lrx_dmma(double& d0, double& d1, double a, double b) {
     const int l = threadIdx.x & 31, r = l >> 2, c0 = 2 * (l & 3);

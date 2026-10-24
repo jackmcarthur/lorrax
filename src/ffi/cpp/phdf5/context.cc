@@ -6,10 +6,7 @@
 // Env tunables (all optional; docs/reference/env_vars.md is the registry).
 // Boolean knobs accept the shared writer grammar — see env_flag below
 // (mirrors Python's runtime.env_flags.env_bool; tools/lint/test_env_grammar.py):
-//   LORRAX_PHDF5_COLLECTIVE_WRITES (1)  collective vs independent writes
 //   LORRAX_PHDF5_DEDUP_REPLICAS   (1)   one canonical writer per replica
-//   LORRAX_PHDF5_INDEPENDENT      (0)   force independent READS
-//   LORRAX_PHDF5_COLL_META        (0)   collective metadata ops
 //   LORRAX_PHDF5_ALIGN_MB         (4)   H5Pset_alignment threshold/length
 //   LORRAX_PHDF5_READ_STAGING_RETAIN_MB (256) process-wide budget for read
 //                                       staging kept above 32 MiB per file
@@ -182,8 +179,8 @@ static long stripe_policy_unit(int world_size) {
 // phdf5 translation unit shares it.  It was static here, which is why
 // read_ffi.cc's former timing flag had to be a bare presence test.
 // Boolean knobs used to go through env_long, whose strtol grammar
-// silently kept the DEFAULT on word spellings — so e.g.
-// LORRAX_PHDF5_COLLECTIVE_WRITES=false left the FFI writer collective
+// silently kept the DEFAULT on word spellings — so e.g. the (since
+// removed) collective-writes switch set to false left the FFI writer collective
 // while the Python phdf5_host writer went independent: the two writers
 // diverged on the same environment (audit fix/zq 2026-07-28).
 
@@ -507,19 +504,10 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     ctx->world_size = world_size;
     ctx->timing_enabled = env_flag("LORRAX_SLAB_IO_TIMING", false);
 
-    // Env-driven tuning.  Defaults (see ctx.h): reads collective, writes
-    // COLLECTIVE (default flipped 2026-07-27 to match the Python
-    // phdf5_host writer, so LORRAX_PHDF5_COLLECTIVE_WRITES means the
-    // same thing in every writer; measured on the production tile
-    // geometry: strided 2-D tiles of a contiguous dataset are ~3 orders
-    // faster under two-phase collective aggregation — scorecard AI),
-    // metadata non-collective.  Env overrides:
-    //   LORRAX_PHDF5_INDEPENDENT=1       → also force reads independent
-    //   LORRAX_PHDF5_COLLECTIVE_WRITES=0 → back to independent writes
-    //                                     (historical Cray-MPICH caution:
-    //                                     ad_cray_write_coll.c OOM at
-    //                                     >~1 GB/rank on that stack)
-    //   LORRAX_PHDF5_COLL_META=1         → re-enable collective metadata
+    // Transfer modes (ctx.h): reads collective, writes COLLECTIVE
+    // (measured on the production tile geometry: strided 2-D tiles of a
+    // contiguous dataset are ~3 orders faster under two-phase collective
+    // aggregation — scorecard AI), metadata non-collective.  Env override:
     //   LORRAX_PHDF5_DEDUP_REPLICAS=0    → let every rank of a replica
     //                                     group write its identical copy
     //                                     (overlapping selections are
@@ -528,12 +516,9 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     // Boolean knobs parse through env_flag — the SAME grammar as the
     // Python writers' _env_flag (see env_flag above), so a given
     // environment means the same thing in every writer.
-    const bool force_indep_read    = env_flag("LORRAX_PHDF5_INDEPENDENT", false);
-    const bool coll_write          = env_flag("LORRAX_PHDF5_COLLECTIVE_WRITES", true);
-    const bool force_coll_metadata = env_flag("LORRAX_PHDF5_COLL_META", false);
-    ctx->use_collective_read  = !force_indep_read;
-    ctx->use_collective_write = coll_write;
-    ctx->coll_metadata        = force_coll_metadata;
+    ctx->use_collective_read  = true;
+    ctx->use_collective_write = true;
+    ctx->coll_metadata        = false;
     ctx->dedup_replicas       = env_flag("LORRAX_PHDF5_DEDUP_REPLICAS", true);
     // Alignment is deliberately NOT tied to the striping_unit default.
     // It used to be justified as "matches the striping unit so H5 objects

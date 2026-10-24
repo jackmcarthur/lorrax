@@ -1349,15 +1349,8 @@ def _resolve_solver_kind(vertex_mu_L: int, solver_kind: str, **_) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Canonical boolean env grammar — ONE parser, imported, not copied.
-#
-# This module used to carry its own ``_env_bool`` for conditioning telemetry.
-# The rank receipt is now mandatory production output, so it has no env gate.
-# ``runtime.env_flags.env_bool`` has the identical vocabulary plus the
-# once-per-(name,value) ``*** LORRAX SANITY`` announcement on unrecognised
-# tokens.  (P1.3 grammar unification, 2026-07-31; the drift gate is
-# ``tools/lint/test_env_grammar.py``, which scans this file as an OWNED file.)
-from runtime.env_flags import env_bool
+# Boolean env reads here would go through runtime.env_flags.env_bool; none remain (the drift gate
+# ``tools/lint/test_env_grammar.py`` scans it as an OWNED file).
 from gw.gw_config import ZETA_RCOND_DEFAULT
 
 
@@ -1653,8 +1646,7 @@ def _replicated_factor_q_chunk(nq: int, n_rmu: int) -> int:
 # fastloop mini-deck (nq=4, μ≈400 → ~2.6e8 ≈ 0.1 s) stays on the pure
 # replicated execution, while every production fit from the b300 deck up
 # folds.  A module CONSTANT on purpose — this is machine capability, not
-# physics policy, and the AV audit retired policy env twins;
-# LORRAX_ZETA_QPARALLEL (below) is the schedule escape hatch / test hook.
+# physics policy, and the AV audit retired policy env twins.
 _QPARALLEL_MIN_NQ_MU3 = 5.0e9
 
 
@@ -1662,13 +1654,9 @@ def _qparallel_factor_ok(nq: int, n_rmu_logical: int, mesh_xy: Mesh) -> bool:
     """True when the replicated charge factor should EXECUTE q-parallel; see docs/architecture/zeta_fit_face_psi_cct.md."""
     if int(mesh_xy.devices.size) <= 1:
         return False
-    raw = os.environ.get("LORRAX_ZETA_QPARALLEL", "auto")
-    raw = raw.strip().lower() if raw else "auto"
-    if raw in ("", "auto"):
-        return (int(nq) >= 2
-                and float(nq) * float(n_rmu_logical) ** 3
-                >= _QPARALLEL_MIN_NQ_MU3)
-    return env_bool("LORRAX_ZETA_QPARALLEL", False)
+    return (int(nq) >= 2
+            and float(nq) * float(n_rmu_logical) ** 3
+            >= _QPARALLEL_MIN_NQ_MU3)
 
 
 # =============================================================================
@@ -2063,8 +2051,7 @@ def _qparallel_announce_transverse(nq: int, n_rmu: int, n_log: int,
     log.debug(f"  [zeta transverse factor] hoisted per-q LU, q-parallel "
               f"execution: nq={nq} scattered over {ndev} devices "
               f"(ceil(nq/P)={blk} whole ({n_log},{n_log}) tile(s)/device); "
-              f"factors are bit-identical to the all-ranks execution "
-              f"(LORRAX_ZETA_QPARALLEL=0 restores it)",
+              f"factors are bit-identical to the all-ranks execution",
               extra=record("isdf.transverse_factor_plan", nq=int(nq), devices=ndev,
                            q_per_device=blk, n_log=int(n_log)))
     if ndev > int(nq):
