@@ -131,7 +131,8 @@ def _require_checkout_matches(
     if not expected_runtime.is_file():
         raise SourceClosureError(
             "LORRAX_CHECKOUT does not name a LORRAX checkout: "
-            f"{checkout} has no src/runtime/__init__.py")
+            f"{checkout} has no src/runtime/__init__.py; left from another "
+            "install or checkout: `unset LORRAX_CHECKOUT`")
     actual = runtime_init.resolve()
     if source_root is None or expected_runtime.resolve() != actual:
         raise SourceClosureError(
@@ -139,7 +140,8 @@ def _require_checkout_matches(
             "imported; refusing a mixed-source launch. "
             f"requested={checkout} expected_runtime={expected_runtime.resolve()} "
             f"actual_runtime={actual}. Fix the launcher/source overlay; merely "
-            "exporting LORRAX_CHECKOUT does not change Python imports.")
+            "exporting LORRAX_CHECKOUT does not change Python imports.  Left over "
+            "from another checkout (no launcher set it): `unset LORRAX_CHECKOUT`.")
 
 
 def _requirement_names(data: Mapping) -> set[str]:

@@ -3,6 +3,7 @@
 # Node-local runtime image: run LORRAX without reading the install filesystem.
 #
 #   <prefix>/bin/lorrax-run [--all-gpus] <command...>        (srun's command)
+#   <prefix>/bin/python, python3                             (plain `srun python -m <driver>`)
 #   runtime_image.sh install <tree> <prefix>                 (install_deps.sh: pack into
 #                    <prefix>/images, point <prefix>/current at it, write <prefix>/bin/lorrax-run)
 #   runtime_image.sh pack    <tree> <archive.tar.zst|.tar>
@@ -258,6 +259,52 @@ cmd_run() {
     exec "$src/src/ffi/cpp/select_gpu.sh" "$@"
 }
 
+# <prefix>/bin/python and python3: what a user who never heard of lorrax-run types,
+#   module load lorrax_A; srun -n 4 python -m gw.gw_jax -i gw.in
+# enters the image the way lorrax-run does (restore once per node, the image's venv
+# python, same argv).  --all-gpus: the per-rank GPU and thread defaults are the
+# driver's own (src/runtime/rank_setup.py), so they hold however it is launched.
+# Inside a Slurm job, or for `-m <LORRAX package>`, the image's python; otherwise
+# (a login-node `python` for something else) the next python on PATH, untouched.
+# LORRAX_PYTHON=image|system forces either.
+_write_python_shim() {
+    local bin=$1 name
+    for name in python python3; do
+        cat > "$bin/$name.tmp" <<'SHIM'
+#!/usr/bin/env bash
+# Written by scripts/runtime_image.sh install: `python` for LORRAX enters the runtime image.
+bin=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+name=$(basename "$0")
+use=${LORRAX_PYTHON:-}
+if [ -z "$use" ]; then
+    use=system
+    [ -n "${SLURM_JOB_ID:-}" ] && use=image
+    prev=
+    for a in "$@"; do
+        m=
+        if [ "$prev" = -m ]; then m=$a; elif [ "${a#-m}" != "$a" ] && [ "$a" != -m ]; then m=${a#-m}; fi
+        if [ -n "$m" ]; then
+            # runtime.rank_setup.DRIVER_PACKAGES
+            case "${m%%.*}" in bandstructure|bse|centroid|gw|isdf|postprocess|psp|tdagw|file_io|common) use=image ;; esac
+            break
+        fi
+        case "$a" in -m) prev=-m ;; -c|-) break ;; -*) ;; *) break ;; esac
+    done
+fi
+if [ "$use" = image ]; then
+    exec "$bin/lorrax-run" --all-gpus python "$@"
+fi
+IFS=: read -r -a dirs <<< "$PATH"
+for d in "${dirs[@]}"; do
+    [ -n "$d" ] && [ "$(cd "$d" 2>/dev/null && pwd)" != "$bin" ] && [ -x "$d/$name" ] && exec "$d/$name" "$@"
+done
+echo "[lorrax] no other $name on PATH (LORRAX_PYTHON=image uses the LORRAX runtime's)" >&2
+exit 127
+SHIM
+        chmod 755 "$bin/$name.tmp" && mv "$bin/$name.tmp" "$bin/$name"
+    done
+}
+
 # <prefix>/images/<id>.tar.zst(.meta), <prefix>/current -> images/<id>.tar.zst,
 # <prefix>/bin/lorrax-run (this script); other images of the prefix (and their
 # shared extracted copies) are removed: a job reads the archive only while it
@@ -270,6 +317,7 @@ cmd_install() {
     cmd_pack "$tree" "$install/images/$base.$ext"
     cp "${BASH_SOURCE[0]}" "$install/bin/lorrax-run.tmp" && chmod 755 "$install/bin/lorrax-run.tmp"
     mv "$install/bin/lorrax-run.tmp" "$install/bin/lorrax-run"
+    _write_python_shim "$install/bin"
     ln -sfn "images/$base.$ext" "$install/current.tmp" && mv -T "$install/current.tmp" "$install/current"
     for old in "$install"/images/*.tar.zst "$install"/images/*.tar "$install"/unpacked/*; do
         [ -e "$old" ] || continue
@@ -277,7 +325,7 @@ cmd_install() {
         rm -rf "$old" "$old.meta"
         _say "removed the previous image $old"
     done
-    _say "installed: srun ... $install/bin/lorrax-run <command>"
+    _say "installed: srun ... python -m <driver> with $install/bin first on PATH (lorrax-env.sh / the module)"
 }
 
 if [ "$(basename "$0")" = lorrax-run ]; then
@@ -290,5 +338,6 @@ case "${1:-}" in
     restore) shift; cmd_restore "$@"; echo "$IMAGE_TREE" ;;
     run)     shift; cmd_run "$@" ;;
     clean)   shift; cmd_clean "$@" ;;
+    shims)   shift; _write_python_shim "${1:?<prefix>/bin}" ;;
     *) sed -n '3,12p' "$0" >&2; exit 2 ;;
 esac

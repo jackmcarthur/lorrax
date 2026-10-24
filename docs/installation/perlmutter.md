@@ -139,11 +139,13 @@ The result is `1 passed`, in about 5 min on cold caches.
   `CUDA_CACHE_PATH` on `$SCRATCH`, and `SLURM_NETWORK=no_vni` when unset in
   a launch shell. Source it once per shell before any GPU `srun`; explicit
   network choices are preserved. Nothing else needs setting.
-- Use one rank per GPU, through `select_gpu.sh` and never
-  `--gpus-per-task=1`
+- Use one rank per GPU and never `--gpus-per-task=1`
   ([why](../environment/machines/perlmutter.md#required-gpu-task-geometry)).
-- A driver's `srun` line has the same shape: replace the pytest command with
-  `.venv/bin/python -u -m gw.gw_jax -i deck.in`, run from the run directory.
+  A driver pins its own rank to the LOCALID-th GPU of the step and sets the
+  thread defaults (`src/runtime/rank_setup.py`, the rule `select_gpu.sh` applies),
+  so a driver's `srun` line needs no wrapper:
+  `srun -N 1 -n 4 --gpus-per-node=4 .venv/bin/python -u -m gw.gw_jax -i deck.in`,
+  run from the run directory. pytest still goes through `select_gpu.sh`.
   P16 is `-N 4 -n 16 --gpus-per-node=4`. The sourced setup supplies the network
   default before the step is created
   ([why](../environment/machines/perlmutter.md#network-transport-at-startup)).
@@ -170,8 +172,13 @@ curl -fsSLO https://raw.githubusercontent.com/jackmcarthur/lorrax/main/config/pe
 bash install_deps.sh $SCRATCH/lorrax           # login node, about 3 min; PREFIX needs about 2.5 GB
 salloc -N 1 -C gpu -G 4 -q interactive -t 0:30:00 -A <project>_g $SCRATCH/lorrax/bin/lorrax-postinstall
 source $SCRATCH/lorrax/lorrax-env.sh           # every launch shell
-srun -N 1 -n 4 --gpus-per-node=4 lorrax-run python -u -m gw.gw_jax -i input.in
+srun -N 1 -n 4 --gpus-per-node=4 python -u -m gw.gw_jax -i input.in
 ```
+
+`python` here is the prefix's `bin/python`: inside a job (or for `-m <LORRAX
+package>`) it is `lorrax-run --all-gpus python`, the image's interpreter with the
+same arguments; anywhere else it hands over to the next `python` on `PATH`.
+`lorrax-run <command>` remains for other commands.
 
 The installer ends by running `lorrax-postinstall`; outside a GPU allocation
 that prints `INSTALL NOT VERIFIED` with the `salloc` line above (your `_g`
@@ -183,7 +190,8 @@ builds the NVRTC kernel store into `$SCRATCH/.cache/lorrax/kconv_mathdx/images`
 | prefix file | what it is |
 |---|---|
 | `images/rt-<id>.tar.zst`, `.meta` | the runtime image; `current` points at the one in use, a reinstall removes the previous one |
-| `bin/lorrax-run` | the `srun` command: restore once per node, then the image's venv, then `select_gpu.sh` |
+| `bin/python`, `bin/python3` | enter the image (as `lorrax-run --all-gpus python`) inside a job or for `-m <LORRAX package>` |
+| `bin/lorrax-run` | restore once per node, then the image's venv, then `select_gpu.sh` (`--all-gpus`: without it) |
 | `bin/lorrax-postinstall` | the compute-node step above |
 | `lorrax-env.sh` | puts `bin/` on `PATH` and applies `gpu_env.sh`; source it before `srun` |
 | `share/lorrax/` | `gpu_env.sh` and `postinstall.sh`, copied from the image |
@@ -215,6 +223,23 @@ How `lorrax-run` (`scripts/runtime_image.sh`) behaves:
   A Slurm `sbcast` fan-out for large node counts is not built.
 - **Not a development tree.** Edits under `/tmp/lorrax-$USER` are lost; work on
   a clone (§1.1-1.3) and reinstall, or use `--in-place`.
+
+### 1.5 What a driver checks before it compiles {#preflight}
+
+Each refusal is one line starting `[lorrax preflight] REFUSED:` with the fix, and
+the step exits 2 on every rank (`LORRAX_PREFLIGHT=warn` runs anyway):
+
+- at `import runtime`, before any library loads: an FFI pin
+  (`LORRAX_FFI_SO`, `LORRAX_FFI_HOST_SO`, `LORRAX_FFI_ROCM_SO`) naming a missing
+  file or a build for another handler ABI, and `PYTHONPATH` naming a second LORRAX
+  source tree, each with the `unset`/`export` that fixes it (`LORRAX_ROOT` naming
+  another tree is a warning; `LORRAX_CHECKOUT` is the source-closure gate's);
+  and a venv whose files open in 1 ms or more (a slow mount: the 3.5x case);
+- after the backend is up, before the mesh: the input file (the driver's strict
+  reader, and the WFN and centroid files it names), the memory rule
+  `N_k N_mu^2 N_spinor^2 x 16 B` against the run's device memory (warned above a
+  quarter, refused above all of it), and the `lorrax-postinstall` stamp (refused
+  on an image install you own, warned otherwise).
 
 ## 2. The module {#module}
 

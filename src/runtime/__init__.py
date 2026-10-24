@@ -57,7 +57,14 @@ from __future__ import annotations
 
 import os
 
-# FIRST, before every other import: OpenBLAS reads OPENBLAS_THREAD_TIMEOUT
+# FIRST of all, for a driver process: the per-rank GPU and thread defaults a plain
+# ``srun python -m <driver>`` needs (what select_gpu.sh / lorrax-run used to supply), the
+# stale-override refusal and the import-tree latency check -- before any native library maps
+# and reads its thread or device variables.  Standard library only.
+from .rank_setup import apply as _rank_setup
+_rank_setup()
+
+# Then, before every other import: OpenBLAS reads OPENBLAS_THREAD_TIMEOUT
 # once, when each copy is mapped (numpy's at ``import numpy``, scipy's at the
 # first ``scipy.linalg``), so the default must be in the environment before
 # anything here can map one.  ``runtime.blas_env`` owns the setting, the
@@ -2072,6 +2079,22 @@ def _open_device_leg_before_collectives() -> None:
             unusable_cls=ffi_loader.FfiLibraryUnusable)
 
 
+def _run_preflight() -> None:
+    """Step 5f: :func:`runtime.preflight.run` with the live backend's facts."""
+    from .preflight import run as _preflight
+    import jax
+    devices = jax.local_devices()
+    try:
+        limit = (devices[0].memory_stats() or {}).get("bytes_limit") if devices else None
+    except Exception:                                         # noqa: BLE001
+        limit = None
+    _preflight(backend=jax.default_backend(),
+               device_kind=devices[0].device_kind if devices else "unknown",
+               n_devices=jax.device_count(), bytes_per_device=limit,
+               process_index=jax.process_index(), stamp_of=install_verification_stamp,
+               say=_print_rank0)
+
+
 def initialize_communicator_stack(*, platform: str = "gpu",
                                   axis_names=("x", "y"),
                                   print_fn=None) -> RuntimeStack:
@@ -2235,6 +2258,10 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     # -- 5d -----------------------------------------------------------------
     from common.jax_compile_cache import install_compile_agreement
     install_compile_agreement()
+    # -- 5f -----------------------------------------------------------------
+    # The preflight (runtime.preflight): input file, memory against the run's devices, the
+    # install self-check stamp -- every rank alike, refused together, before the mesh.
+    _run_preflight()
     # -- 5e -----------------------------------------------------------------
     _open_device_leg_before_collectives()
     _t_boot = time.perf_counter()
