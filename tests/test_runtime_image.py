@@ -66,13 +66,38 @@ def test_pack_restore_concurrent_and_clean(tmp_path):
     (other / ".lorrax-image").write_text("b\n")
     foreign = tmp_path / "node" / "venv-x"                      # another tool's lock + dir
     foreign.mkdir(); (tmp_path / "node" / ".venv-x.lock").touch()
-    lock = tmp_path / "node" / ".rt-b.lock"
+    lock = tmp_path / "node" / ".rt-b.use.lock"
     with open(lock, "a") as held:                               # a running process's shared lock
         fcntl.flock(held, fcntl.LOCK_SH)
         _run("clean", archive)
         assert other.is_dir()
     _run("clean", archive)
     assert not other.exists() and tree.is_dir() and foreign.is_dir()
+
+
+def test_concurrent_runs_while_ranks_hold_the_image(tmp_path):
+    """Four ranks `run` at once and keep running: a rank that restores must not
+    wait for the others to exit (each holds its use lock for its lifetime)."""
+    tree = tmp_path / "node" / "rt-d"
+    _make_tree(tree)
+    sel = tree / "lorrax" / "src" / "ffi" / "cpp" / "select_gpu.sh"
+    sel.parent.mkdir(parents=True)
+    sel.write_text('#!/usr/bin/env bash\nexec "$@"\n'); sel.chmod(0o755)
+    archive = tmp_path / "rt-d.tar"
+    _run("pack", tree, archive)
+    shutil.rmtree(tree)
+    procs = [subprocess.Popen(["bash", str(SCRIPT), "run", str(archive), "--", "sleep", "3"],
+                              env={**os.environ, "SLURM_LOCALID": str(r), "SLURM_PROCID": str(r)},
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for r in range(4)]
+    try:
+        outs = [p.communicate(timeout=30) for p in procs]
+    except subprocess.TimeoutExpired:
+        for p in procs:
+            p.kill()
+        pytest.fail("a rank waited on the image lock held by running ranks")
+    assert all(p.returncode == 0 for p in procs), outs
+    assert sum("restored" in o[1] for o in outs) == 1
 
 
 def test_reused_release_id_refuses(tmp_path):

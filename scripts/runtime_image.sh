@@ -34,12 +34,13 @@
 # (LORRAX_IMAGE_FALLBACK=<dir> names a persistent extracted copy to link to
 # instead: correct, but it reads the shared filesystem like a clone does).
 #
-# Concurrency.  Every rank of a step runs `restore`; the first on a node takes
-# the exclusive lock and extracts into a temporary name, renamed into place
-# after the marker is written; the others wait and find the marker.  Each
-# process then holds a SHARED lock on the image for its lifetime (the open fd is
+# Concurrency.  Every rank of a step runs `restore`.  Each first takes a SHARED
+# "use" lock on the image and holds it for its lifetime (the open fd is
 # inherited across exec), so `clean` -- run after every restore for the other
 # images of this user on this node -- removes only images no process is using.
+# Extraction is serialised by a separate EXCLUSIVE "install" lock: the first
+# rank extracts into a temporary name, renamed into place after the marker is
+# written; the others wait on the install lock and find the marker.
 #
 # Requirements on the node: bash, coreutils, GNU tar, flock(1); zstd for a
 # .tar.zst archive (a plain .tar needs nothing more).
@@ -77,25 +78,28 @@ cmd_pack() {
     _say "packed $tree ($bytes bytes) -> $archive ($(stat -c %s "$archive") bytes) in $(_since "$t0") s"
 }
 
-# Sets IMAGE_TREE; leaves fd 9 holding a shared lock on the image.
+# Sets IMAGE_TREE; leaves fd 9 holding a SHARED lock on <parent>/.<base>.use.lock
+# for the caller's lifetime (it is inherited across exec).  Extraction is
+# serialised by an EXCLUSIVE lock on .<base>.install.lock, held only while one
+# process extracts: a waiting rank must never ask for the lock that running
+# ranks hold shared, or it waits for their exit (a deadlock seen at P4).
 cmd_restore() {
     local archive=${1:?archive}
     [ -f "$archive" ] && [ -f "$archive.meta" ] || _die "no image $archive (+ .meta)"
-    local tree bytes id parent base lock
+    local tree bytes id parent base
     tree=$(_meta "$archive" tree); bytes=$(_meta "$archive" bytes); id=$(_meta "$archive" id)
     parent=$(dirname "$tree"); base=$(basename "$tree")
     IMAGE_TREE=$tree
     mkdir -p -m 700 "$parent" 2>/dev/null || _die "cannot create $parent"
-    lock="$parent/.$base.lock"
-    exec 9>>"$lock"
-    if [ "$(cat "$tree/.lorrax-image" 2>/dev/null)" = "$id" ]; then
-        flock -s 9; return 0                                  # restored before on this node
-    fi
-    flock -x 9
+    exec 9>>"$parent/.$base.use.lock"
+    flock -s 9                                                # in use from here: clean skips it
+    [ "$(cat "$tree/.lorrax-image" 2>/dev/null)" = "$id" ] && return 0   # restored before
+    exec 8>>"$parent/.$base.install.lock"
+    flock -x 8
     local have
     have=$(cat "$tree/.lorrax-image" 2>/dev/null || true)
     if [ "$have" = "$id" ]; then
-        flock -s 9; return 0                                  # another rank just did it
+        exec 8>&-; return 0                                   # another rank just did it
     fi
     [ -z "$have" ] || _die "$tree holds image $have, not $id: a release id names one archive; pack under a new id"
     local t0 need place="" root free
@@ -114,7 +118,7 @@ cmd_restore() {
         ln -sfn "$LORRAX_IMAGE_FALLBACK/$base" "$tree"
         echo "$id" > "$tree/.lorrax-image" 2>/dev/null || true
         _say "WARNING: no node-local room; $tree -> $LORRAX_IMAGE_FALLBACK/$base (shared filesystem)"
-        flock -s 9; return 0
+        exec 8>&-; return 0
     fi
     local dest="$place"
     [ "$place" = "$parent" ] || { dest="$place/lorrax-${USER:-$(id -un)}"; mkdir -p -m 700 "$dest"; }
@@ -146,7 +150,7 @@ cmd_restore() {
     mv "$tmp/$base" "$dest/$base"; rmdir "$tmp"
     [ "$dest" = "$parent" ] || ln -sfn "$dest/$base" "$tree"
     echo "[lorrax image] $(hostname) rank ${SLURM_PROCID:-0}: restored $base ($bytes bytes) to $dest in $(_since "$t0") s (fetch $t1 s, $n streams) from $archive" >&2
-    flock -s 9
+    exec 8>&-                                                 # waiting ranks proceed
     cmd_clean "$archive" || true
 }
 
@@ -157,17 +161,16 @@ cmd_clean() {
         keep=$(_meta "$1" tree); parent=$(dirname "$keep")
     fi
     local lock base tree
-    for lock in "$parent"/.*.lock; do
+    for lock in "$parent"/.*.use.lock; do
         [ -e "$lock" ] || continue
-        base=${lock##*/.}; base=${base%.lock}; tree="$parent/$base"
+        base=${lock##*/.}; base=${base%.use.lock}; tree="$parent/$base"
         [ "$tree" = "$keep" ] && continue
-        [ -e "$tree/.lorrax-image" ] || continue                     # not an image (another tool's lock)
+        [ -e "$tree/.lorrax-image" ] || continue                     # not an image
         (
-            exec 8>>"$lock"
-            flock -xn 8 || exit 0                                   # in use
+            exec 7>>"$lock"
+            flock -xn 7 || exit 0                                   # in use
             [ -L "$tree" ] && rm -rf "$(readlink "$tree")"
-            rm -rf "$tree" "$parent/.$base.tmp."*
-            rm -f "$lock"
+            rm -rf "$tree" "$parent/.$base.tmp."*                   # lock files stay (no inode races)
             _say "removed unused image $tree"
         )
     done
