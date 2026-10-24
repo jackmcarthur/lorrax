@@ -451,8 +451,8 @@ def persist_w0_and_head(
     is.  It has two callers: the ``screening_diagrams = w_bse`` stage
     helper, whose first leg computes the RPA W(0) that the ladder kernel
     consumes and persists THAT — under every mode, MPA included — and the
-    one-shot tangential MPA route, whose W is the model evaluated at
-    ω = 0 (``gw.screening.restart_static_w``).  It is a NAMED OPT-IN rather
+    one-shot tangential route, whose W is a static Dyson solve at ω = 0
+    (``gw.screening.restart_static_w``).  It is a NAMED OPT-IN rather
     than a relaxation of the dynamic-mode refusal below, because the two say
     different things.  The
     refusal says "this mode's W was not sampled at {0, probe}, so do not
@@ -463,7 +463,9 @@ def persist_w0_and_head(
     ``W_q`` may be a zero-argument callable; it is called only after the
     write-policy and output-file preflight, so a producer whose static W is
     an evaluation rather than a held array (the tangential model) runs it
-    only when the file is written.
+    only when the file is written.  A callable may return ``(W0, head)``
+    (the one-shot tangential static solve): that head sample is the stored
+    ω = 0 head, with the wings still from ``head_wings``.
 
     W0 is stored on the q parents whenever the run's q axis reduces
     (``restart_q_storage`` resolves ``ibz``): the file holds the producer's
@@ -504,8 +506,12 @@ def persist_w0_and_head(
         return
     if not os.path.exists(tensors_filename):
         return
+    produced_head = None
     if callable(W_q):
         W_q = W_q()
+        if isinstance(W_q, tuple):
+            # (W0, its ω = 0 head) from one static solve: the head is stored.
+            W_q, produced_head = W_q
     # ``full_zone``: a zero-argument restore of the whole q zone, called only
     # when the file stores the full zone (no wedge).  The packed photon's
     # charge block is held on its q parents; the writer never restores it on
@@ -557,7 +563,7 @@ def persist_w0_and_head(
                 "and omega=0; refusing before restart mutation.")
         if iteration_head is not None:
             raise ValueError("Supply either a static or an iteration head receipt, not both.")
-    head_static = static_head_sample
+    head_static = static_head_sample if produced_head is None else produced_head
     if iteration_head is not None:
         head_static = iteration_head.at(0.0 + 0.0j)
         if head_static.S_cart is None:

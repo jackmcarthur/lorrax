@@ -871,8 +871,11 @@ def _install_oneshot_head(
 def _persist_screening(
         V_q, W_by_role, centroid_indices, config, head_resolver, mesh_xy, meta, mode,
         print0, qp_solver, sym, tensors_filename, photon_response=None,
-        material_class=None, head_response=None):
-    """Persist the screened static body and head on the canonical q set."""
+        material_class=None, head_response=None, static_solve_inputs=None):
+    """Persist the screened static body and head on the canonical q set.
+
+    ``static_solve_inputs`` (pole routes) lets ``restart_static_w`` run the
+    one static Dyson solve whose W0 and srlr channels share one χ₀(0)."""
     try:
         from .gw_output import stamp_w0_route
         stamp_w0_route(tensors_filename, config)        # read by the BSE's GATE bse_mpa_w0
@@ -880,7 +883,8 @@ def _persist_screening(
                 and qp_solver is not QPSolver.SELF_CONSISTENT):
             W_static = restart_static_w(
                 mode, W_by_role, V_q, config=config, meta=meta, mesh_xy=mesh_xy,
-                material_class=material_class, head_source=head_resolver, print_fn=print0)
+                material_class=material_class, head_source=head_resolver, print_fn=print0,
+                static_solve_inputs=static_solve_inputs)
             if W_static is None:
                 return
             with timing.section("gw_jax.persist_w0"):
@@ -1837,7 +1841,12 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 		_persist_screening(
 		    V_q, W_by_role, centroid_indices, config, head_resolver, mesh_xy, meta, mode, print0,
 		    qp_solver, sym, tensors_filename, photon_response=photon_response,
-		    material_class=material_class, head_response=oneshot_head_response)
+		    material_class=material_class, head_response=oneshot_head_response,
+		    static_solve_inputs=(dict(
+		        wfns=wfns_screening, quad=quad, e_ref=e_ref, sym=sym,
+		        centroid_indices=centroid_indices,
+		        occupation_state=oneshot_occupation_state)
+		        if mode.is_pole_route and quad is not None else None))
 		(
 		    static_head_terms) = _prepare_static_head(
 		    config, do_screened, head_resolver, meta, mode, qp_solver,

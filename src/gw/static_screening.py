@@ -22,7 +22,7 @@ log = get_logger(__name__)
 
 def build_static_screened_w(wfns, V_q, *, config, meta, mesh_xy, sym=None,
                             centroid_indices=None, head_resolver=None, occupation_state=None,
-                            tangential=None,
+                            tangential=None, quadrature=None,
                             print_fn=print):
     """Return W(0) and its matching q→0 head from a live or retained state.
 
@@ -32,6 +32,8 @@ def build_static_screened_w(wfns, V_q, *, config, meta, mesh_xy, sym=None,
     through its existing synthesis owner. ``V_q`` is the matching bare
     QirrOperator. The response body
     and optional local-field head fold use the same transition manifold.
+    ``quadrature`` is the ``(quad, e_ref)`` static rule the caller already
+    built (the GW driver's); ``None`` builds it here.
     """
     if tangential is not None:
         # A retained model belongs to its evaluated map. Rebuilding from a
@@ -45,8 +47,9 @@ def build_static_screened_w(wfns, V_q, *, config, meta, mesh_xy, sym=None,
     from .screening import ScreeningRequest, compute_screening
     from .qsgw_head import build_dft_head_response, finalize_iteration_head_samples
 
-    quad, e_ref = (None, 0.0) if occupation_state is not None else build_static_quadrature(
-        wfns, config.minimax_config, print_fn=print_fn)
+    quad, e_ref = ((None, 0.0) if occupation_state is not None else quadrature
+                   if quadrature is not None else build_static_quadrature(
+                       wfns, config.minimax_config, print_fn=print_fn))
     request = ScreeningRequest(0.0j, "static")
     response = None
     if config.head.correction is not HeadCorrection.OFF:
