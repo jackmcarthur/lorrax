@@ -29,9 +29,11 @@ those wrappers give::
    slowdown of 2026-10-23 (DVS: every open a server round trip).  Refuses at the
    self-check's FAIL line, warns at its WARN line; the source tree alone only warns.
 
-Only for driver processes (``python -m <LORRAX package>...`` or a ``lorrax-*`` entry point),
-never under pytest; ``LORRAX_RANK_SETUP=0`` turns all of it off, ``LORRAX_PREFLIGHT=warn``
-turns the refusals into warnings.  Standard library only: this runs before numpy, jax or any
+Steps 1-2 apply to any process that imports ``runtime`` inside a Slurm step with several
+tasks on the node (a driver, or ``srun -n 4 python -m pytest tests/hsuite``): one device per
+process is the only model LORRAX runs.  Steps 3-4 are for driver processes only
+(``python -m <LORRAX package>...`` or a ``lorrax-*`` entry point).  ``LORRAX_RANK_SETUP=0``
+turns all of it off, ``LORRAX_PREFLIGHT=warn`` turns the refusals into warnings.  Standard library only: this runs before numpy, jax or any
 native library is mapped, which is what lets the thread and device variables bind.
 """
 from __future__ import annotations
@@ -346,11 +348,15 @@ def apply() -> None:
     if _DONE or os.environ.get("LORRAX_RANK_SETUP", "").strip().lower() in ("0", "off", "false", "no"):
         return
     _DONE["at"] = time.time()
+    if _in_slurm_step(os.environ) and _tasks_on_this_node(os.environ) > 1:
+        _DONE["pin"] = pin_gpu()
+        _DONE["threads"] = thread_defaults()
+        cudart_shim()
     if not is_driver_process():
         return
-    _DONE["pin"] = pin_gpu()
-    _DONE["threads"] = thread_defaults()
-    cudart_shim()
+    if "threads" not in _DONE:
+        _DONE["threads"] = thread_defaults()
+        cudart_shim()
     refuse, warn = stale_overrides()
     r2, w2 = import_tree_latency()
     refuse_or_warn(refuse + r2, warn + w2)
