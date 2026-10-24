@@ -191,6 +191,17 @@ route; the request is still honoured.
 | GEMM, distributed | `panel_matmul` (XLA SUMMA; local products on cuBLAS) | `panel_matmul` (XLA SUMMA; local products on JAX dot panels) |
 | SLATE, any op | only when the CUDA leg was built against a `gpu_backend=cuda` SLATE | `potrf`, `trsm`; `eigh` refused (guard 3) |
 
+On ROCm, `local_eigh` also routes single complex128 matrices of side
+128–3120 through the existing native batched provider with batch one. The
+reflector, triangle selection and finite/info checks stay the same. The
+3072-state tutorial Gram failed in the fused reflector/jaxlib expression
+and passed in the fused reflector/native expression. Both solvers passed
+on the same separately materialized reflected matrix, so the compiler or
+layout cause is unresolved; this is a measured composition repair, with no
+universal driver or speed claim. Its workspace is priced by the same
+batched row. Real single matrices, CPU/CUDA and out-of-window sizes retain
+their previous routes.
+
 The Perlmutter CUDA leg is built without SLATE
 (`config/perlmutter/build_ffi_cuda.sh` points `LORRAX_SLATE_INSTALL_DIR` at an
 empty prefix, and the sealed bundle's CUDA leg has no `libslate` dependency),
