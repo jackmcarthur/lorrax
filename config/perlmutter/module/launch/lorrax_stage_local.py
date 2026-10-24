@@ -92,13 +92,29 @@ def _stage_into(root: str, src_nvidia: str, key: str, need: int) -> str | None:
     return site
 
 
+def _use(site: str) -> None:
+    """Put the staged tree first and bind its CUDA runtime before anything else can.
+
+    JAX's CUDA plugin resolves its ``libcudart.so.13`` NEEDED entry through its own
+    RUNPATH (the venv's ``nvidia/cu13/lib``), not through ``nvidia`` on ``sys.path``;
+    loading the staged runtime first makes that SONAME resolve to the copy, so one
+    process never maps both (the native closure gate refuses two copies)."""
+    import ctypes
+    if site not in sys.path:
+        sys.path.insert(0, site)
+    os.environ["LORRAX_STAGED_SITE"] = site
+    cudart = os.path.join(site, "nvidia", "cu13", "lib", "libcudart.so.13")
+    if os.path.isfile(cudart):
+        ctypes.CDLL(cudart, mode=ctypes.RTLD_GLOBAL)
+
+
 def stage() -> None:
     if os.environ.get("LORRAX_STAGE_LOCAL", "on").strip().lower() in _OFF:
         return
     if os.environ.get("LORRAX_STAGED_SITE"):              # an inherited, already-staged tree
         site = os.environ["LORRAX_STAGED_SITE"]
-        if os.path.isdir(site) and site not in sys.path:
-            sys.path.insert(0, site)
+        if os.path.isdir(site):
+            _use(site)
         return
     venv_site = os.environ.get("LORRAX_STAGE_VENV_SITE", "")
     key = os.environ.get("LORRAX_STAGE_KEY", "")
@@ -110,15 +126,12 @@ def stage() -> None:
         return
     for root in roots:                                    # reuse without walking the venv
         if os.path.isfile(os.path.join(root, f"venv-{key}", "COMPLETE")):
-            site = os.path.join(root, f"venv-{key}", "site-packages")
-            sys.path.insert(0, site)
-            os.environ["LORRAX_STAGED_SITE"] = site
+            _use(os.path.join(root, f"venv-{key}", "site-packages"))
             return
     need = _tree_bytes(src)
     for root in roots:
         site = _stage_into(root, src, key, need)
         if site is not None:
-            sys.path.insert(0, site)
-            os.environ["LORRAX_STAGED_SITE"] = site
+            _use(site)
             return
     _say(f"no usable stage root in {roots}; the venv's nvidia/ stays in use")
