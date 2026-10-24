@@ -153,7 +153,8 @@ def _compiled_stack_controls():
 
 def test_conduction_stacks_cpu_p1_p4_padding_alias_and_compiled_memory():
     env = dict(os.environ, PYTHONPATH=str(ROOT / "src"),
-               XLA_FLAGS="--xla_force_host_platform_device_count=4", OPENBLAS_NUM_THREADS="1")
+               XLA_FLAGS="--xla_force_host_platform_device_count=4", OPENBLAS_NUM_THREADS="1",
+               JAX_PLATFORMS="cpu")
     result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--stack-controls"],
                             env=env, text=True, capture_output=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr

@@ -369,6 +369,7 @@ for spin in (1, 2):
 ns['_check_compiled_actions_and_head']()
 print('PHYSICAL_R_A_ORACLES: all five controls PASS')
 """
+    env["JAX_PLATFORMS"] = "cpu"
     result = subprocess.run([sys.executable, "-c", worker, str(Path(__file__).resolve())],
                             cwd=root, env=env, text=True, capture_output=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
