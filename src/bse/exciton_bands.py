@@ -502,7 +502,7 @@ def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, he
             max_iter=40 if args.max_iter is None else args.max_iter, head_tensor=head_mbz)
     n_phys = int(n_cond) * int(n_val) * nkx * nky * nkz
     if cert_rows:
-        log(f"  [refit-cert] Davidson residual for both comparison rows: "
+        log.info(f"  [refit-cert] Davidson residual for both comparison rows: "
             f"{min(args.davidson_tol_mev, 0.1 * CERT_TOL_BY_GRADE[args.cert_grade]):g} "
             "meV; the exchange certification gate is unchanged.")
     return build_path_solver_davidson(
