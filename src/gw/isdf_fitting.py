@@ -2,6 +2,7 @@ import gc
 import os
 import time
 from typing import NamedTuple
+from dataclasses import replace
 
 import numpy as np
 import jax
@@ -214,7 +215,8 @@ def _fit_mubatch(
     # orbits per owner (the owner unfolds its own pair projectors).
     # The planner floors the bins at the widest orbit; the owner streams its
     # rows through the planes at the planned width (or warns and runs).
-    from gw.gflat_memory_model import route_g_plane_chunk
+    from gw.gflat_memory_model import (log_mubatch_plan, route_g_plane_chunk,
+                                       zstore_layout)
     plane_from_col = np.asarray(jax.device_get(cyl[2]))
     canon = np.asarray(k_unfold_plan.layout.axis.packed_to_canonical)
     x_cent = np.asarray(centroid_indices, dtype=np.float64) / np.asarray(fft_grid)
@@ -318,9 +320,19 @@ def _fit_mubatch(
         # Debug split timers: the same kernel truncated after each stage.
         for stage in ('source', 'planes', 'kconv'):
             split_kernels[stage] = zmb.make_route_g_kernel(**kern_args, stop_at=stage)
+    store_bytes, placement = zstore_layout(
+        Q, int(mb.n_batch) * b, int(g_axis.carrier), n_vertex=len(vertices),
+        n_ranks=P_, host_budget_bytes=plan.host_budget_bytes)
+    resolved_plan = replace(
+        plan, b=b, n_batch=int(mb.n_batch), c_out=int(c_out), n_blk=int(n_blk),
+        store_bytes=store_bytes, placement=placement)
+    # Preserve the proposal object; only storage/report metadata is resolved here.
+    log_mubatch_plan(
+        resolved_plan, summary=True,
+        fit="transverse" if vertices != (0,) else "charge" if bispinor else None)
     stores = [zmb.ZStore(
         mesh=mesh_xy, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis, b=b,
-        placement=plan.placement,
+        placement=resolved_plan.placement,
         packed_from_slot=mb.slot_of_packed, n_batch=int(mb.n_batch),
         scratch_path=os.path.join(
             scratch_dir, "zeta_Z_store.scratch.h5" if v == 0
@@ -333,7 +345,7 @@ def _fit_mubatch(
              f"{int(plan.r_sub)} planes per group, "
              f"{n_par} parent k -> {nk}, ψ sphere {ngk_psi} "
              f"slots ({s_ax.carrier // P_}/rank), channels μ_L={list(vertices)}, "
-             f"Z store {plan.placement}")
+             f"Z store {resolved_plan.placement}")
 
     log.debug(_host_mem("fit start"))
     from common.progress import LoopProgress
@@ -404,7 +416,7 @@ def _fit_mubatch(
     log.debug(_host_mem("pre-V_q (Z store full)"))
     log.debug(f"  μ-batch timing: {n_run} batches {t_batch:.2f}s (store write incl. "
              f"the wait on the in-flight batch {sum(st.t_write for st in stores):.2f}s, "
-             f"{plan.placement}, overlapped with the next batch)")
+             f"{resolved_plan.placement}, overlapped with the next batch)")
 
     # ---- ζ = C⁻¹ Z, held lazily; written only for a file consumer --------
     zetas = {}
@@ -779,10 +791,6 @@ def fit_zeta_to_h5(
     del _face_gemm
     gc.collect()
 
-    from .gflat_memory_model import log_mubatch_plan
-    # A bispinor run fits twice (charge, then the transverse currents).
-    log_mubatch_plan(mubatch_plan, summary=True,
-                     fit="transverse" if transverse else "charge" if bispinor else None)
     t_mb0 = time.perf_counter()
     zetas, n_run, n_total = _fit_mubatch(
         wfn=wfn, meta=meta, centroid_indices=centroid_indices,
