@@ -63,6 +63,27 @@ The full output of a stage, its current input fields and one compiled work arena
 
 Automatic row streaming bounds a Green's-function or convolution intermediate while preserving the full band sum. It does not reduce the scientific band window, centroid basis or k grid, and a full operator output can remain quadratic in $N_\mu$. Orbit ownership can impose a minimum row block; the actual outputs and minimum block still enter admission. Many small band dot products would discard the dense matrix-multiply structure and can repeat communication. The useful stream axis is the large centroid-row intermediate; band and transfer staging remain separate concerns.
 
+### A typical one-shot GN-PPM estimate {: #gn-ppm-storage }
+
+For the streamed, ordinary charge GN-PPM self-energy, **centroid-sampled wavefunction storage plus a few V-sized fields is a useful resident-storage estimate**. Count one face-distributed complex128 centroid field as
+
+$$
+C = \frac{16Q N_\mu^2}{P}\quad\text{bytes per rank},
+$$
+
+using the stored q count and packed centroid extent. Here $C$ counts the entire stored-q bank of one field, rather than a single q matrix. After the fresh one-shot path retires its owned screening supports, the current complex128 pole representation retains:
+
+| GN-PPM case | Resident centroid fields | Leading storage per rank during the sweep |
+|---|---|---:|
+| No odd-residue $D$ array allocated | $V$, pole frequencies $\Omega$, even residue $B$ | $3C$ |
+| Ordered fit with $D$ present | $V$, $\Omega$, $B$, $D$ | $4C$ at rest; $5C$ while an active $B+D$ or $B-D$ field is held |
+
+A numerically zero $D$ still counts if its array is retained. Thus **“wavefunctions + $4C$” describes the ordered fit's resident baseline, not its peak requirement**. Include prepared wavefunctions, QP projectors, output accumulators and the compiled/native work arena. The raw two-dimensional wavefunction faces scale as $1/P$; the additional fast band-complete AXIS banks scale as $1/\sqrt P$ on a square mesh. The FACE fallback exchanges band panels instead. Row windows have symmetry-orbit and native-workspace floors, so their cost cannot be reduced arbitrarily.
+
+For the measured Cr80 P4 case, $C=8.98704$ GB/rank: $4C=35.95$ GB and $5C=44.94$ GB before those additional residents and workspaces. Its measured self-energy peak is 73.46 GB/rank, and the whole-GW peak is 76.87 GB/rank in V(q) construction. Screening also holds its full $\chi$ carry, V/W fields and Dyson workspace; ISDF and factorizations can set a larger peak than the pole sweep. Estimate the complete job from the largest stage's simultaneous live set, not by adding separate stage peaks.
+
+This field count applies to the owned one-shot, single-pole GN path. Self-consistent or repeated-use paths, including callbacks that retain screening supports, may hold additional fields; multipole, shared-pole, full-frequency and current-channel representations need their own counts. Use the rule to identify dominant storage, then use the actual route's compiled/native price and a completed run to establish capacity.
+
 ### Choosing the first job {: #first-job }
 
 Keep the scientific input fixed and choose a legal square process count. Compare the selected route's compiled output/temporary/alias sizes and queried provider workspace with the room beside its live operands. Then check a complete run, including preprocessing, ζ fitting, screening, the pole model, Σ and output. A successful response-kernel test alone does not establish a successful GW calculation.
