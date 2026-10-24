@@ -139,7 +139,7 @@ def fit_scalar_samples(
     valid = np.asarray(diagnostics["valid"], dtype=bool)
     if not np.any(valid):
         raise ValueError("scalar MPA head fit rejected every pole")
-    return {
+    fitted = {
         "Omega_p": np.asarray(Omega, dtype=np.complex128)[valid],
         "B_p": np.asarray(B, dtype=np.complex128)[valid],
         "condition": float(np.asarray(diagnostics["cond_pade"])),
@@ -160,6 +160,11 @@ def fit_scalar_samples(
         "eig": _fit_eig(solve),
         "rcond": float(rcond),
     }
+    if solve == "loewner":
+        fitted.update(
+            condition_retained=float(np.asarray(diagnostics["cond_retained"])),
+            rank_retained=int(np.asarray(diagnostics["rank_retained"])))
+    return fitted
 
 
 @functools.lru_cache(maxsize=None)

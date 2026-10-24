@@ -467,16 +467,18 @@ def _loewner_pencil(w, x_hat, n):
 def _loewner_roots(w, x_hat, n, rcond, eig="lapack"):
     """Poles of the Loewner interpolant, in the ``b_hat = x/x_max`` plane.
 
-    Returns ``(b_hat, cond, s_max, s_min)`` in the same shape contract as
-    the companion route, so the two are drop-in for each other.
+    Returns the roots, full condition/extrema, full-system backward error,
+    and the condition/rank of the singular directions actually inverted.
 
     THE PENCIL IS REDUCED RATHER THAN SOLVED AS A PENCIL.  The poles are
     the generalised eigenvalues of ``(sL, L)``; jax has no ``QZ``, so
     they are taken as the ordinary eigenvalues of ``L^+ sL`` with ``L^+``
     the same truncated-SVD pseudo-inverse the rest of the module uses.
     That is the identical spectrum whenever ``L`` is invertible, and the
-    reported ``cond`` is ``cond(L)`` -- precisely the number that says
-    whether it was.  The same ``n x n`` non-symmetric ``eigvals`` call
+    reported ``cond`` remains ``cond(L)``, including discarded singular
+    directions.  A lower-order response can have a singular full pencil
+    while its retained solve is well conditioned.  The same ``n x n``
+    non-symmetric ``eigvals`` call
     ends the companion route, so this is a drop-in on the eigensolver
     side too.
     """
@@ -485,12 +487,17 @@ def _loewner_roots(w, x_hat, n, rcond, eig="lapack"):
     u, s, vh = jnp.linalg.svd(L, full_matrices=False)
     s_max = s[0]
     s_min = s[-1]
-    s_inv = jnp.where(s > rcond * s_max, 1.0 / jnp.where(s > 0, s, 1.0), 0.0)
+    retained = s > rcond * s_max
+    s_inv = jnp.where(retained, 1.0 / jnp.where(s > 0, s, 1.0), 0.0)
     L_pinv = vh.conj().T @ (s_inv.astype(L.dtype)[:, None] * u.conj().T)
     cond = jnp.where(s_min > 0, s_max / s_min, jnp.inf)
+    rank_retained = jnp.sum(retained.astype(jnp.int32))
+    retained_smin = jnp.min(jnp.where(retained, s, jnp.inf))
+    cond_retained = jnp.where(
+        rank_retained > 0, s_max / retained_smin, jnp.inf)
     X = L_pinv @ sL
     return (_eigvals(X, eig), cond, s_max, s_min,
-            _matrix_backward_error(L, sL, X))
+            _matrix_backward_error(L, sL, X), cond_retained, rank_retained)
 
 
 def _companion_roots(c_coeffs, eig="lapack"):
@@ -925,7 +932,8 @@ def fit_mpa_poles(
     # the x = z**2 plane.  One solve since 2026-08-15 (see the record
     # above the verdict table).
     if solve == "loewner":
-        b_hat, cond, s_max, s_min, bwd = _loewner_roots(
+        (b_hat, cond, s_max, s_min, bwd,
+         cond_retained, rank_retained) = _loewner_roots(
             w, x_hat, n, rcond, eig)
         cond_support = cond
         cond_denominator = cond
@@ -1095,6 +1103,9 @@ def fit_mpa_poles(
         "rsd_eq28": (
             jnp.sqrt(jnp.sum(resid ** 2) / (2.0 * n - 1.0)) / w_scale),
     }
+    if solve == "loewner":
+        diag["cond_retained"] = cond_retained
+        diag["rank_retained"] = rank_retained
     if return_odd:
         return Omega, B, B_odd, diag
     return Omega, B, diag
