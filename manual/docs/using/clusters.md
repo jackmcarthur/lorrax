@@ -55,6 +55,8 @@ Use the packed centroid extent and the resolved band carrier in these estimates.
 | One full-zone Green's function | $16n_s^2N_kN_\mu^2/P$ | Applies only to a route that materializes that object. |
 | One whole dense matrix under local linear algebra | $16N_\mu^2$ | This part does not shrink as $1/P$; factorization workspace is additional. |
 
+The $n_s^2$ factor belongs to the spin-matrix Green's function; wavefunction faces carry $n_s$. Charge $V$, $W$ and pole fields have no automatic $n_s^2$ multiplier. Explicit current-channel or bispinor direct sums have their own operator layouts and capacity prices.
+
 The full output of a stage, its current input fields and one compiled work arena can overlap. Their simultaneous residency matters more than a sum of unrelated stage peaks. A pool reservation, pool-used high-water, live-buffer count and host RSS are different measurements; retain their labels when comparing runs.
 
 Automatic row streaming bounds a Green's-function or convolution intermediate while preserving the full band sum. It does not reduce the scientific band window, centroid basis or k grid, and a full operator output can remain quadratic in $N_\mu$. Orbit ownership can impose a minimum row block; the actual outputs and minimum block still enter admission. Many small band dot products would discard the dense matrix-multiply structure and can repeat communication. The useful stream axis is the large centroid-row intermediate; band and transfer staging remain separate concerns.
@@ -89,7 +91,7 @@ The downloadable decks preserve that historical source. For main at or after [`5
 
 Memory values below use decimal GB. Wall time is the GW driver's `total run`, including setup and compilation but excluding centroid/dipole/kinetic preprocessing, queue wait and allocation startup. All GPU rows use A100-80GB cards and the automatic local-linalg budget (66.35 GB in the saved receipts). Persistent compilation caches were shared; the counts below make their state explicit.
 
-| System | Full k grid / stored parents | Occupied bands | Sum bands | Physical $N_\mu$ | $n_s$ | Method | Smallest completed measurement | GW wall | Pool peak/rank |
+| System | Full k grid / stored parents | Occupied edge | Sum bands | Physical $N_\mu$ | $n_s$ | Method | Smallest completed measurement | GW wall | Pool peak/rank |
 |---|---|---:|---:|---:|---:|---|---|---:|---:|
 | Si SOC, 2 atoms | 4×4×4 / 8 | 8 | 52 | 528 | 2 | GN-PPM | 4 GPUs, 1 node | 59.52 s | 9.71 GB |
 | Al₂O₃, 10 atoms | 4×4×4 / 13 | 24 | 154 | 1584 | 1 | GN-PPM | 4 GPUs, 1 node | 39.23 s | 19.03 GB |
@@ -122,7 +124,9 @@ Fe's 33.43 GB is the post-startup pool-**used** high-water. The default allocato
 
 Fe retains the default `sigma_reads_past_w_support` warning. Its Σ energy grid covers the requested bands; the warning concerns the W model's sampled support range and remains relevant to a separate accuracy study.
 
-The 80-atom case is **Al₃₁CrO₄₈ with SOC**: 395 occupied spinor bands, 2370 physical sum bands (2372 padded slots), and 23700 physical centroids (23712 packed slots at P16). A 4-valence/4-conduction frontier still produces the full 1–399 Σ/QP prefix. The explicit −75…2.75 eV Σ range covers that prefix without out-of-grid static fallback; 831 quadrature nodes take 388.23 s. The default GN prescription treats 3.02% invalid modes with `static_limit`, a separate issue from energy-grid coverage.
+The 80-atom case is **Al₃₁CrO₄₈ with SOC**: nominal occupied spinor edge 395, 2370 physical sum bands (2372 padded slots), and 23700 physical centroids (23712 packed slots at P16). Fractional density tails through band 406 are retained. A 4-valence/4-conduction frontier still produces the full 1–399 Σ/QP prefix. The explicit −75…2.75 eV Σ range covers that prefix without out-of-grid static fallback; 831 quadrature nodes take 388.23 s. The default GN prescription treats 3.02% invalid modes with `static_limit`, a separate issue from energy-grid coverage.
+
+Of those 831 nodes, 801 belong to the deep-valence resonant window. Frequency support and the actual requested QP states therefore matter alongside $N_k$, $N_b$ and $N_\mu$: this full-prefix timing is not an estimate for a legitimate near-gap-only workflow at the same spatial sizes. Narrowing the energy range while retaining the full prefix would change its coverage contract.
 
 Its maximum pool-used peak is 52.89 GB/rank in ζ fitting, versus 41.39 GB in screening and 44.85 GB in Σ. One full-zone Green's function at the packed extent is 17.992 GB/rank, so this run peaks at **2.94G/P**. This ratio is a comparison scale; Σ already streams centroid rows. Host high-water is 15.97 GB/rank. The conservative Cplus quote exceeded the then-current planning room; the completed run stayed below the 66.35 GB budget. This demonstrates the stated 16-GPU workload; this historical record does not establish a smaller process count. Original structural/symmetry qualifications and the exact inputs are retained in the [case notes](../assets/cluster-references/2026-10-23/cr_al2o3_80/case_notes.txt).
 
