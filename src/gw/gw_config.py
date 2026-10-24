@@ -1008,9 +1008,10 @@ def resolve_eigh_backend(params) -> str:
 ZETA_RCOND_DEFAULT: float = 1e-8
 
 _DEFAULTS = {
-    # System geometry
-    "nval": 5,
-    "ncond": 5,
+    # The QP request: nval and ncond, or number_bands_protected below.  No
+    # default (None until the input file names them; missing_deck_keys).
+    "nval": None,
+    "ncond": None,
     # The QP request as one band count (owner 2026-09-29, the documented
     # form): every occupied band plus conduction bands up to this total.
     # Exclusive with nval/ncond (GATE band_request_forms); resolved against
@@ -1350,6 +1351,9 @@ _DEFAULTS = {
     # New input files should set ``compute_mode`` explicitly:
     #   "x_only" | "cohsex" | "gn_ppm" | "hl_ppm" | "mpa".
     #
+    # ``auto`` is ``gn_ppm`` (``x_only`` under do_screened = false); on a
+    # metal it refuses (metals need full-frequency GW, compute_mode =
+    # tangential).
     # ``mpa`` — the multipole-W ansatz, the owner's "FF" — runs end to end;
     # ``auto`` never infers it, and no legacy flag combination reaches it.
     # See the ``ComputeMode`` docstring for why it is spelled ``mpa`` rather
@@ -1656,12 +1660,13 @@ _DEFAULTS = {
     # PPM
     # ppm_model picks the two-point pole-fit ansatz:
     #   "gn" — Godby-Needs: second probe at ω = i·ppm_omega_p (imaginary,
-    #          ppm_omega_p ≈ 2 Ry by default).
+    #          default PPM_OMEGA_P_GN_RY = 2 Ry).
     #   "hl" — Hybertsen-Louie: second probe at ω = ppm_omega_p (real; it
-    #          must exceed every chi0 transition energy, so an HL deck sets
-    #          it: the shared 2.0 Ry default refuses on most spectra).
+    #          must exceed every chi0 transition energy: default
+    #          PPM_OMEGA_P_HL_RY = 200 Ry, the f-sum limit).
+    # None: the default of the model that runs (_ppm_omega_p).
     "ppm_model": "gn",
-    "ppm_omega_p": 2.0,
+    "ppm_omega_p": None,
     "ppm_fallback_omega": 2.0,
     # Override the head pole frequency Ω_h directly (Ry).  Useful for
     # testing against BGW's analytic head — set to BGW's
@@ -2052,6 +2057,8 @@ _NULLABLE_BOOL = frozenset({
 #: and silently truncated it — is a band edge nobody can reason about.  A
 #: non-integral value raises out of ``configparser.getint`` by name.
 _NULLABLE_INT = frozenset({
+    "nval",
+    "ncond",
     "zeta_nband",
     "number_bands_protected",
     "sys_dim",
@@ -2610,6 +2617,25 @@ _INPUT_KEY_SCHEMA = tuple(
     for key, default in _DEFAULTS.items())
 
 
+#: ``ppm_omega_p`` defaults (Ry).  GN probes W at i*omega_p; HL probes it at
+#: the real omega_p, which must lie above every chi0 transition energy
+#: (GATE hl_ppm_probe_in_spectrum), and as it grows the HL fit tends to the
+#: f-sum (first-moment) limit (docs/theory/hl-gpp-derivation.md §3).
+PPM_OMEGA_P_GN_RY = 2.0
+PPM_OMEGA_P_HL_RY = 200.0
+
+
+def _ppm_omega_p(params) -> float:
+    """``ppm_omega_p``, or the default of the PPM that runs (HL: 200 Ry, else 2 Ry)."""
+    if params.get("ppm_omega_p") is not None:
+        return float(params["ppm_omega_p"])
+    mode = str(params.get("compute_mode") or "auto").strip().lower()
+    hl = mode == "hl_ppm" or (
+        mode == "auto" and bool(params.get("use_ppm_sigma"))
+        and str(params.get("ppm_model", "gn")).strip().lower() == "hl")
+    return PPM_OMEGA_P_HL_RY if hl else PPM_OMEGA_P_GN_RY
+
+
 def _parse_input_keys(section):
     """Produce all declared typed key values and the set explicitly named by the deck."""
     params, named = {}, set()
@@ -2784,7 +2810,7 @@ def _input_response(
     )
     ppm = PPMConfig(
         model=str(params["ppm_model"]).strip().lower(),
-        omega_p=float(params["ppm_omega_p"]),
+        omega_p=_ppm_omega_p(params),
         fallback_omega=float(params["ppm_fallback_omega"]),
         head_omega_h_ry=(
             float(params["ppm_head_omega_h_ry"])
@@ -3033,14 +3059,92 @@ def _band_request_form(params, named_keys):
     return value
 
 
+def protected_band_window(total, nband, n_occ, print_fn=print):
+    """``(nval, ncond)`` of ``number_bands_protected = total`` on a WFN with ``n_occ`` occupied bands.
+
+    nval = every occupied band, ncond = the total minus it.  The one resolver
+    of the protected form: :meth:`LorraxConfig.with_band_request` (gw,
+    kin-ion, dipole) and :func:`resolve_band_request` (the tools that read
+    the input file as a dict) both call it.
+    """
+    total, n_occ = int(total), int(n_occ)
+    if not n_occ <= total <= int(nband):
+        raise ValueError(
+            f"GATE band_request_forms: number_bands_protected={total} must lie in "
+            f"[{n_occ} (the occupied bands), {int(nband)} (number_bands)].")
+    print_fn(f"  QP request: number_bands_protected={total} -> nval={n_occ} "
+             f"(every occupied band), ncond={total - n_occ}")
+    return n_occ, total - n_occ
+
+
+def missing_deck_keys(named, *keys) -> list:
+    """The refusal lines (``"<key> is required"``) for the ``keys`` the input file does not name.
+
+    ``named`` is the set of keys the input file names (``params[_DECK_NAMED_KEYS]``
+    or ``LorraxConfig.raw_input_keys``).  Besides plain key names, ``keys``
+    takes the three band forms:
+
+    * ``"band_request"``: ``nval`` and ``ncond``, or ``number_bands_protected``;
+    * ``"ncond_request"``: ``ncond``, or ``number_bands_protected``;
+    * ``"number_bands"``: ``number_bands`` (or its alias ``nband``), or both
+      ``number_bands_chi`` and ``number_bands_sigma``.
+    """
+    named = {str(k).lower() for k in (named or ())}
+    protected = "number_bands_protected" in named
+    lines = []
+    for key in keys:
+        if key in ("band_request", "ncond_request"):
+            want = ("nval", "ncond") if key == "band_request" else ("ncond",)
+            if not protected:
+                lines += [f"{k} is required (or number_bands_protected)"
+                          for k in want if k not in named]
+        elif key == "number_bands":
+            if not (named & set(_UMBRELLA_KEYS)
+                    or set(_SPECIFIC_KEYS) <= named):
+                lines.append("number_bands is required")
+        elif key not in named:
+            lines.append(f"{key} is required")
+    return lines
+
+
+def require_deck_keys(named, *keys, error=ValueError) -> None:
+    """Refuse an input file that does not name every key of ``keys`` (:func:`missing_deck_keys`)."""
+    lines = missing_deck_keys(named, *keys)
+    if lines:
+        raise error("\n".join(lines))
+
+
+#: Reserved params slot: True once :func:`resolve_band_request` has run.
+_BAND_REQUEST_RESOLVED = "_band_request_resolved"
+
+
+def resolve_band_request(params, wfn, print_fn=print) -> dict:
+    """Resolve the deck's band request in ``params`` (in place) against the WFN, and return it.
+
+    The dict twin of :meth:`LorraxConfig.with_band_request`, for the tools
+    that read the input file with :func:`read_lorrax_input` (BSE,
+    exciton-bands, centroids, htransform): under ``number_bands_protected``
+    nval and ncond become the occupied count and the rest of the total.
+    Idempotent; a deck in the nval/ncond form is returned unchanged.
+    """
+    if params.get(_BAND_REQUEST_RESOLVED):
+        return params
+    total = params.get("number_bands_protected")
+    if total not in (None, ""):
+        params["nval"], params["ncond"] = protected_band_window(
+            total, params["nband"], wfn.nelec, print_fn)
+    params[_BAND_REQUEST_RESOLVED] = True
+    return params
+
+
 def _assemble_input_config(
         _bands, _effective_named_keys, _occ_family, _occ_width, _qp_rot_k_storage,
         _resolved_do_g0, _restart_q_storage, _zeta_nband, backend, bse, cls, debug,
         filename, head, input_dir, memory, mpa, params, paths, ppm, sc, screening, sigma):
     """Produce the typed configuration from its resolved groups."""
     resolved = cls(
-        nval=int(params["nval"]),
-        ncond=int(params["ncond"]),
+        nval=None if params["nval"] is None else int(params["nval"]),
+        ncond=None if params["ncond"] is None else int(params["ncond"]),
         number_bands_protected=_band_request_form(params, _effective_named_keys),
         nband=int(_bands.isdf),
         bands=_bands,
@@ -4836,6 +4940,10 @@ def validate_material_inputs(config, material_class):
     family = config.occ_smearing_family
     width_ry = config.occ_smearing_width_ry
     if material_class == "metal":
+        if ((config.compute_mode_raw or "auto").strip().lower() == "auto"
+                and config.compute_mode is not ComputeMode.X_ONLY):
+            raise ValueError(
+                "metals must be treated with full-frequency GW: set compute_mode = tangential")
         if config.compute_mode is ComputeMode.GN_PPM:
             raise ValueError(
                 "GATE gn_ppm_refuses_metals: WFN occupations identify a "
@@ -4854,7 +4962,7 @@ def validate_material_inputs(config, material_class):
             raise ValueError(
                 "GATE fractional_occupations_require_mpa: WFN occupations "
                 f"identify a metal, but compute_mode={config.compute_mode.value}; "
-                "use compute_mode=mpa for screened GW or "
+                "use compute_mode=tangential for screened GW or "
                 "compute_mode=x_only for bare exchange.")
         if config.sc.head_update in INSULATOR_HEAD_UPDATES:
             raise ValueError(
@@ -4940,8 +5048,9 @@ class LorraxConfig:
     """Unified, immutable configuration for a LORRAX GW calculation; see docs/dev/gw_config_contracts.md."""
 
     # --- System geometry (top-level; hot path) ---
-    nval: int
-    ncond: int
+    #: None under number_bands_protected until :meth:`with_band_request`.
+    nval: int | None
+    ncond: int | None
     #: The LOADED band extent = ``bands.isdf`` = ``max(chi, sigma)``.  On
     #: every deck that names only the umbrella (or only the transitional
     #: ``nband`` alias) this is exactly the umbrella, which is why the whole
@@ -5132,15 +5241,9 @@ class LorraxConfig:
         total = self.number_bands_protected
         if total is None:
             return self
-        n_occ = int(wfn.nelec)
-        if not n_occ <= int(total) <= int(self.nband):
-            raise ValueError(
-                f"GATE band_request_forms: number_bands_protected={int(total)} must lie in "
-                f"[{n_occ} (the occupied bands), {int(self.nband)} (number_bands)].")
         from dataclasses import replace as _replace
-        print_fn(f"  QP request: number_bands_protected={int(total)} -> nval={n_occ} "
-                 f"(every occupied band), ncond={int(total) - n_occ}")
-        return _replace(self, nval=n_occ, ncond=int(total) - n_occ)
+        nval, ncond = protected_band_window(total, self.nband, wfn.nelec, print_fn)
+        return _replace(self, nval=nval, ncond=ncond)
 
     @property
     def occ_broadening_ry(self) -> float:
@@ -5164,7 +5267,9 @@ class LorraxConfig:
                     if str(self.ppm.model).strip().lower() == "hl"
                     else ComputeMode.GN_PPM
                 )
-            return ComputeMode.COHSEX if self.do_screened else ComputeMode.X_ONLY
+            # auto is GN-PPM (owner, 2026-10-20); a metal refuses it
+            # (validate_material_inputs: metals need full-frequency GW).
+            return ComputeMode.GN_PPM if self.do_screened else ComputeMode.X_ONLY
         try:
             explicit = ComputeMode(raw)
         except ValueError as exc:

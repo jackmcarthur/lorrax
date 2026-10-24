@@ -1679,6 +1679,7 @@ def _interpolate_bse_data_to_grid(
     from bandstructure.bse_setup import compute_wfns_fi
     from gw.gw_config import (
         read_lorrax_input,
+        resolve_band_request,
         resolve_distrib_la_batched_route,
     )
 
@@ -1704,6 +1705,10 @@ def _interpolate_bse_data_to_grid(
     params = read_lorrax_input(input_file)
     _distrib_la_batched_route = resolve_distrib_la_batched_route(
         params, override=distrib_la_batched_route)
+    # The deck's Sigma window: number_bands_protected resolves as in gw.
+    from .bse_window import _parse_wfn_path
+    wfn_sym = ht.setup_wfn_and_sym(_parse_wfn_path(input_file), mesh_xy=mesh_xy)
+    resolve_band_request(params, wfn_sym[0], log_fn)
     fine_shift = tuple(float(x) for x in fine_shift)
     nc_coarse = coarse_conduction_count(params, n_cond, log_fn=log_fn)
     n_extra_guard = 0
@@ -1716,7 +1721,6 @@ def _interpolate_bse_data_to_grid(
 
     # The restart and fresh htransform WFN first meet at this seam.
     from file_io.qp_wfn import refuse_conflicting_qp_state_sources
-    from .bse_window import _parse_wfn_path
     refuse_conflicting_qp_state_sources(
         wfn_path=_parse_wfn_path(input_file),
         state_artifact_path=restart_file,
@@ -1747,11 +1751,9 @@ def _interpolate_bse_data_to_grid(
     # ── The coarse velocity, authenticated BEFORE the fit ────────────────
     # It must be the deck WFN's own (basis and fingerprint): a fine grid's
     # dipole.h5 has the bundle's nk and the WRONG gauge, and refuses here.
-    wfn_sym = velocity = None
+    velocity = None
     if velocity_file is not None:
         from bandstructure.orbital import stored_velocity
-        wfn_sym = ht.setup_wfn_and_sym(_parse_wfn_path(input_file),
-                                       mesh_xy=mesh_xy)
         velocity = stored_velocity(
             velocity_file, wfn=wfn_sym[0], wfn_path=_parse_wfn_path(input_file),
             sym=wfn_sym[1], mesh=mesh_xy) + (velocity_file,)

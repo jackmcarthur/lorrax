@@ -78,7 +78,8 @@ DOWNFOLD_DEFAULTS = {
     # says so rather than stamping the parent's hash, which would be a lie
     # about which points the tensors describe.
     "parent_centroids_file": "",
-    # Producer GW deck authenticating the raw-parent symmetry action.
+    # ``parent_input_file``: REQUIRED.  The producer GW input file, which
+    # authenticates the raw-parent symmetry action.
     "parent_input_file": "",
 
     # ---- the retained band window ------------------------------------
@@ -479,7 +480,7 @@ class DownfoldConfig:
             report_residual=bool(params["report_residual"]),
             residual_refuse_above=refuse_above,
             input_path=os.path.abspath(filename),
-            parent_input_file=_path("parent_input_file", required=False),
+            parent_input_file=_path("parent_input_file", required=True),
         )
         return cfg
 
@@ -513,6 +514,9 @@ class DownfoldConfig:
 
 
 _KEY_HELP = {
+    "parent_input_file": (
+        "Point it at the GW input file of the run that wrote "
+        "source_restart."),
     "source_restart": (
         "Point it at the finished GW run: either the run directory (the "
         "driver finds tmp/isdf_tensors_*.h5 inside it) or that .h5 file "

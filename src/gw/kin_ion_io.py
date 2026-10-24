@@ -363,6 +363,8 @@ def main(argv=None):
         # The authenticated QE source owns the DFT operator boundary; a CLI
         # flag can only confirm that fact (or the legacy deck fallback).
         params = read_cohsex_input(args.input)
+        from gw.gw_config import _DECK_NAMED_KEYS, require_deck_keys
+        require_deck_keys(params[_DECK_NAMED_KEYS], "band_request")
         wfn_path = _resolve_against(params.get("wfn_file", "WFN.h5"), input_dir)
 
         sys_dim_file = params.get("sys_dim")

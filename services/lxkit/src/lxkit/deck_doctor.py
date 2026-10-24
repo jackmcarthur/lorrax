@@ -350,8 +350,10 @@ def inspect_deck(args) -> None:
     px, py = square_mesh(args.ranks)
     nelec = (int(header.ifmax.max()) if header.ifmax.size
              else int((header.occs[0, 0] > 0.5).sum()))
-    sigma_window = nelec + int(config.ncond)
     from types import SimpleNamespace
+    config = config.with_band_request(SimpleNamespace(nelec=nelec),
+                                      print_fn=lambda *_: None)
+    sigma_window = nelec + int(config.ncond)
     from gw.ppm_sigma import sigma_band_axis
 
     band_axis = sigma_band_axis(

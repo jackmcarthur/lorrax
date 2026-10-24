@@ -139,7 +139,9 @@ def _toy_deck(lines):
     """A deck file with the toy window and ``lines`` (BSE deck keys); its path."""
     import tempfile
     fd = tempfile.NamedTemporaryFile("w", suffix=".in", delete=False)
-    fd.write("[cohsex]\nsys_dim = 3\nnumber_val_bands_fine = 4\nnumber_cond_bands_fine = 4\n"
+    fd.write("[cohsex]\nsys_dim = 3\nnval = 5\nncond = 5\nnumber_bands = 100\n"
+             "centroids_file = centroids_frac.txt\n"
+             "number_val_bands_fine = 4\nnumber_cond_bands_fine = 4\n"
              + "".join(f"{line}\n" for line in lines))
     fd.close()
     return fd.name

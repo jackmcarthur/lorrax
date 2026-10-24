@@ -592,9 +592,13 @@ def main():
     else:
         if not args.save:
             parser.error("Either -i input_file or --save is required")
+        missing = [f"{flag} is required" for flag, value in
+                   (("--nbnd", args.nbnd), ("--nk", args.nk)) if value is None]
+        if missing:
+            parser.error("\n".join(missing))
         save_dir = args.save
-        nbnd = args.nbnd or 100
-        kgrid = tuple(args.nk) if args.nk else (4, 4, 4)
+        nbnd = args.nbnd
+        kgrid = tuple(args.nk)
         nosym = args.nosym
         output = args.output or "WFN.h5"
         tol = args.tol or 1e-8

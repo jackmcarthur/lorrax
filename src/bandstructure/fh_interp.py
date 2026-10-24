@@ -1584,6 +1584,9 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
         wfn, sym = setup_wfn_and_sym(wfn_file, mesh_xy=mesh_xy)
     else:
         wfn, sym = wfn_sym
+    # number_bands_protected resolves here as in gw (once per params dict).
+    from gw.gw_config import resolve_band_request
+    resolve_band_request(params, wfn, log_fn)
     nval = int(params["nval"])
     ncond = int(params["ncond"])
     nband = int(params["nband"])

@@ -1445,6 +1445,8 @@ def deck_settings(ap, args):
             args.input, settings_ap.parse_args([]), EXB_KEYS,
             required=("number_val_bands_fine", "number_cond_bands_fine"),
             params=params, named=named)
+        from gw.gw_config import require_deck_keys
+        require_deck_keys(named, "band_request", "centroids_file", error=DeckError)
         settings.eqp = eqp_file(params, named, args.input)
         if settings.degeneracy_check_override:
             settings.band_degeneracy = "off"
@@ -1766,6 +1768,9 @@ def main(argv=None):
             _wfn_name = os.path.join(
                 os.path.dirname(os.path.abspath(args.input)), _wfn_name)
         wfn, sym = ht.setup_wfn_and_sym(_wfn_name, mesh_xy=mesh_xy)
+        # The deck's Sigma window: number_bands_protected resolves as in gw.
+        from gw.gw_config import resolve_band_request
+        resolve_band_request(params, wfn, log)
         from distrib_la import plan as _linalg_plan
         _fine_plan = _linalg_plan(
             "eigh", mesh_xy, backend=args.eigh_backend, n=None,

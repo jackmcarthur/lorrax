@@ -706,7 +706,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"-i",
 		"--input",
-		default="cohsex.in",
+		required=True,
 		help="Input file (INI-like) with [cohsex] block",
 	)
 	parser.add_argument(
@@ -1004,6 +1004,8 @@ def main(argv=None):
 		report.begin(input_file=str(input_path))
 		report.devices(mesh_role="band-matrix axes X x Y")
 		params = read_cohsex_input(str(input_path))
+		from gw.gw_config import _DECK_NAMED_KEYS, require_deck_keys
+		require_deck_keys(params[_DECK_NAMED_KEYS], "band_request", "number_bands")
 
 		# The one velocity operator, v = i[H, r] = p + i[V_NL, r] (p alone
 		# under --skip-vnl), on both producer routes below.
