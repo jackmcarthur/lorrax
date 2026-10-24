@@ -18,8 +18,7 @@ def _fixture(tmp_path):
     (venv / "bin").mkdir(parents=True)
     (venv / "bin/activate").write_text(":\n")
     site_profile = tmp_path / "site profile.sh"
-    site_profile.write_text("export MODULEPATH=/site/modules
-")
+    site_profile.write_text("export MODULEPATH=/site/modules\n")
     initialization = tmp_path / "shell_init.sh"
     initialization.write_text('''module() { :; }
 cmake() { printf '%s\\n' "$@" > "$PROBE_ROOT/cmake.args"; return 73; }
