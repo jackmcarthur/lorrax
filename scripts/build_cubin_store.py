@@ -272,6 +272,12 @@ def fan_out(jobs: int, names) -> int:
               "built by the k-convolution handlers on a CUDA device, so nothing to do here",
               flush=True)
         return 1
+    stamp = _complete_stamp(names, gpus)
+    if stamp is not None and stamp.is_file():
+        print(f"[cubin-store] already complete for this architecture, toolchain, FFI build and "
+              f"grid list ({stamp}); nothing to build", flush=True)
+        return 0
+    t0 = time.time()
     procs = []
     for w in range(jobs):
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpus[w % len(gpus)],
@@ -279,7 +285,46 @@ def fan_out(jobs: int, names) -> int:
                    LORRAX_CUBIN_STORE_WORKER=f"{w}/{jobs}")
         procs.append(subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), *names],
                                       env=env))
-    return max(p.wait() for p in procs)
+    rcs = [p.wait() for p in procs]
+    if stamp is not None and all(rc == 0 for rc in rcs):
+        from lxkit import atomic_write_bytes
+        atomic_write_bytes(stamp, f"{time.time() - t0:.0f} s, {jobs} workers\n".encode())
+    print(f"[cubin-store] {jobs} workers done in {time.time() - t0:.0f} s; return codes {sorted(set(rcs))}"
+          + (f"; complete, stamped {stamp}" if stamp is not None and stamp.is_file() else
+             "; NOT stamped complete (a worker failed or skipped an image)"), flush=True)
+    return max(rcs)
+
+
+def _complete_stamp(names, gpus):
+    """``<image cache>/.complete-sm<XY>-<16 hex>``: the marker a fully successful run
+    leaves, keyed by the device architecture, the CUDA FFI leg's bytes (it embeds
+    every kernel source), the nvidia-mathdx and NVRTC wheel names and this grid list.
+    None where any part cannot be read (then nothing is skipped or stamped)."""
+    import hashlib
+    import subprocess
+    try:
+        cap = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader",
+                              "-i", gpus[0]], capture_output=True, text=True, timeout=30).stdout.strip()
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        leg = os.environ.get("LORRAX_FFI_SO") or os.path.join(root, "src/ffi/cpp/build/liblorrax_ffi.so")
+        h = hashlib.sha256()
+        with open(leg, "rb") as fh:
+            for block in iter(lambda: fh.read(1 << 22), b""):
+                h.update(block)
+        from importlib import metadata
+        for dist in ("nvidia-mathdx", "nvidia-cuda-nvrtc"):
+            try:
+                h.update(f"{dist}={metadata.version(dist)};".encode())
+            except metadata.PackageNotFoundError:
+                h.update(f"{dist}=none;".encode())
+        h.update(repr([(g, GRIDS[g]) for g in names]).encode())
+        from lxkit import user_cache_dir
+        sm = cap.replace(".", "")
+        if not sm.isdigit():
+            return None
+        return user_cache_dir("kconv_mathdx") / "images" / f".complete-sm{sm}-{h.hexdigest()[:16]}"
+    except (OSError, subprocess.SubprocessError, ImportError):
+        return None
 
 
 def main(names) -> int:
@@ -314,7 +359,7 @@ def main(names) -> int:
             print(f"[cubin-store] rank {rank} SKIP {g} {GRIDS[g][0]} {n}: {why}", flush=True)
     print(f"[cubin-store] rank {rank}: {done} calls, {skipped} skipped, {time.time() - t0:.0f} s; "
           f"cache {cache}; store {F.CUBIN_STORE}", flush=True)
-    return 0
+    return 0 if skipped == 0 else 5
 
 
 if __name__ == "__main__":

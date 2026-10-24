@@ -4,7 +4,7 @@
 # system does not already provide, under one prefix, and build the native pair.
 #
 #   curl -fsSLO https://raw.githubusercontent.com/jackmcarthur/lorrax/main/config/perlmutter/install_deps.sh
-#   bash install_deps.sh [PREFIX] [--ref REF] [--with-xc] [--no-ffi] [--cubins SET]
+#   bash install_deps.sh [PREFIX] [--ref REF] [--with-xc] [--no-ffi] [--no-space-check]
 #
 #   PREFIX     where everything goes (default $SCRATCH/lorrax; about 5 GB, plus
 #              4.5 GB of uv download cache on $SCRATCH). Compute nodes read
@@ -19,16 +19,14 @@
 #   --no-ffi   skip building the two native libraries.
 #   --no-space-check  skip the free-space and quota check (about 5 GB at
 #              PREFIX and 4.5 GB for an empty uv cache).
-#   --cubins SET  which NVRTC kernel images to build ahead of the first run:
-#              hsuite (the test suite's k-grids), all (every grid of
-#              scripts/build_cubin_store.py) or none.  The build needs a GPU
-#              of the compute nodes' architecture and is too heavy for a
-#              shared login node, so it runs only inside a GPU allocation
-#              (default there: hsuite; elsewhere: none).  Skipped, each image
-#              compiles on first use instead (about 7 s per image per rank).
 #
-# Runs on a login node in a few minutes (about 90 s with warm uv and ccache
-# caches); no allocation is needed.
+# Runs on a login node in 1.5-3 minutes (96 s with a warm uv cache, 168 s
+# without; login21, 2026-10-23); no allocation is needed for this part.  It
+# ends by installing PREFIX/bin/lorrax-postinstall (config/perlmutter/
+# postinstall.sh), the one compute-node step: the NVRTC kernel store (about
+# 4 min) and the performance self-check.  Inside a GPU allocation it runs it;
+# elsewhere it prints the salloc line that does, and the install stays
+# unverified (every GPU run's startup block says so) until it has run.
 #
 # Taken from Perlmutter, not installed (the build scripts load them; the
 # versions are pinned once in ffi_mpi.sh):
@@ -45,6 +43,7 @@
 #   xc-site/               jax_xc 0.0.11, patched (with --with-xc)
 #   lorrax/src/ffi/cpp/build_host/liblorrax_ffi_host.so, build/liblorrax_ffi.so
 #   lorrax-env.sh          source this before srun
+#   bin/lorrax-postinstall the compute-node step (kernel store + self-check)
 # uv's download cache goes to $SCRATCH/.cache/uv.
 # ============================================================================
 set -euo pipefail
@@ -52,15 +51,13 @@ set -euo pipefail
 UV_VERSION=0.13.5
 REPO=https://github.com/jackmcarthur/lorrax.git
 
-PREFIX="" REF=main WITH_XC=0 BUILD_FFI=1 CUBINS="" SPACE_CHECK=1
+PREFIX="" REF=main WITH_XC=0 BUILD_FFI=1 SPACE_CHECK=1
 while (($#)); do
     case "$1" in
         --no-space-check) SPACE_CHECK=0; shift ;;
         --ref) REF="$2"; shift 2 ;;
         --with-xc) WITH_XC=1; shift ;;
         --no-ffi) BUILD_FFI=0; shift ;;
-        --cubins) CUBINS="$2"; shift 2
-            [[ "$CUBINS" =~ ^(hsuite|all|none)$ ]] || { echo "install_deps: --cubins hsuite|all|none, not $CUBINS" >&2; exit 2; } ;;
         -h|--help) awk 'NR > 1 && !/^#/ {exit} NR > 1' "$0"; exit 0 ;;
         -*) echo "install_deps: unknown option $1" >&2; exit 2 ;;
         *) PREFIX="$1"; shift ;;
@@ -179,36 +176,7 @@ if ((BUILD_FFI)); then
     bash "$ROOT/config/perlmutter/build_ffi_cuda.sh" --fresh
 fi
 
-# --- 6. NVRTC kernel images -------------------------------------------------
-# Into the per-user image cache (kconv_mathdx/images under $SCRATCH/.cache/lorrax),
-# where every later install and rebuild finds them: an image's key names its
-# toolchain, never the install path.
-if [[ -z "$CUBINS" ]]; then
-    if [[ -n "${SLURM_JOB_ID:-}" ]] && nvidia-smi -L >/dev/null 2>&1; then CUBINS=hsuite; else
-        CUBINS=none
-        say "NVRTC kernel images not prebuilt (no GPU allocation here); each compiles on first use.
-  To build them ahead, inside a 1-node GPU allocation:
-    srun -N 1 -n 1 --gpus-per-node=4 $ROOT/.venv/bin/python $ROOT/scripts/build_cubin_store.py --jobs 16"
-    fi
-fi
-if ((BUILD_FFI)) && [[ "$CUBINS" != none ]]; then
-    if nvidia-smi -L >/dev/null 2>&1; then
-        case "$CUBINS" in
-            hsuite) GRIDS="probe na_fixture h2_fixture" ;;
-            all) GRIDS="" ;;
-        esac
-        JOBS=$(( $(nproc) / 8 )); ((JOBS < 1)) && JOBS=1; ((JOBS > 16)) && JOBS=16
-        say "building the NVRTC kernel images ($CUBINS) on this node's GPU with $JOBS workers"
-        # shellcheck disable=SC2086  # GRIDS is a word list
-        (cd "$ROOT" && source config/perlmutter/gpu_env.sh && \
-            "$PY" scripts/build_cubin_store.py --jobs "$JOBS" $GRIDS) \
-            || say "kernel image build failed (non-fatal): each image compiles on first use instead"
-    else
-        say "no GPU on this node: NVRTC kernel images will compile on first use (about 7 s each)"
-    fi
-fi
-
-# --- 7. the environment file ------------------------------------------------
+# --- 6. the environment file and lorrax-postinstall --------------------------
 ENVF="$PREFIX/lorrax-env.sh"
 {
     echo "# LORRAX on Perlmutter, written by install_deps.sh. Source before srun."
@@ -217,11 +185,19 @@ ENVF="$PREFIX/lorrax-env.sh"
     ((WITH_XC)) && echo "export PYTHONPATH=\"$PREFIX/xc-site\${PYTHONPATH:+:\$PYTHONPATH}\""
     echo "source \"$ROOT/config/perlmutter/gpu_env.sh\""
 } > "$ENVF"
+POST="$PREFIX/bin/lorrax-postinstall"
+{
+    echo "#!/usr/bin/env bash"
+    echo "# Written by install_deps.sh: the install's compute-node step (config/perlmutter/postinstall.sh)."
+    echo "source \"$ENVF\""
+    echo "exec bash \"$ROOT/config/perlmutter/postinstall.sh\" \"\$@\""
+} > "$POST"
+chmod +x "$POST"
 
-say "done. To check the installation on four GPUs:"
-cat <<EOF
-  salloc -N 1 -C gpu -G 4 -q interactive -t 0:30:00 -A <account>
-  source $ENVF
-  cd \$LORRAX_ROOT
-  srun -n 4 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh python -m pytest tests/hsuite -q -p no:cacheprovider
-EOF
+say "installed. Every run: source $ENVF, then e.g.
+    srun -N 1 -n 4 --gpus-per-node=4 \$LORRAX_ROOT/src/ffi/cpp/select_gpu.sh python -u -m gw.gw_jax -i deck.in"
+if ((BUILD_FFI)); then
+    # Inside a GPU allocation this builds the kernel store and verifies the install;
+    # elsewhere it prints INSTALL NOT VERIFIED and the salloc line that does both.
+    "$POST" || true
+fi
