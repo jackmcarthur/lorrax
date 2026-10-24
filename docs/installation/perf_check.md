@@ -79,14 +79,16 @@ SMT siblings a mask without `--threads-per-core=1` contains) is a warning.
 
 The benchmark compiles with LORRAX's own XLA flags, as every driver's startup
 sets them (`runtime.set_default_env`: the GPU leg's `xla_flag_defaults` in
-`lxkit.LEGS`, on CUDA `--xla_gpu_autotune_level=0`, and the rematerialization
-pass off), appended to the launch's `XLA_FLAGS`; a flag the launch already
-sets wins. Component 6 prints the effective value. Without them, XLA's GEMM
-autotuner spent 310 s on the first f64 8192² GEMM of a laptop GPU (4.1 s at
-level 0). On an 80 GB A100 the same f64 8192² GEMM runs at 3.70 TFLOP/s at
-level 0 against 19.2 at XLA's default level 4, and the 36-program cold compile
-takes 5.79 s against 7.78 s; the 80 GB references are those level-0 values
-(re-measured 2026-10-24, n = 3). The 40 GB references predate the flags.
+`lxkit.LEGS`, on CUDA `--xla_gpu_autotune_level=0` and
+`--xla_gpu_enable_triton_gemm=false`, and the rematerialization pass off),
+appended to the launch's `XLA_FLAGS`; a flag the launch already sets wins.
+Component 6 prints the effective value. Without them, XLA's GEMM autotuner
+spent 310 s on the first f64 8192² GEMM of a laptop GPU (4.1 s at level 0).
+At level 0 with Triton GEMM on, JAX 0.12 runs that GEMM as an untuned Triton
+kernel, 3.70 TFLOP/s on an 80 GB A100; with Triton GEMM off it is cuBLAS at
+19.3, as at XLA's default level 4, and the 36-program cold compile takes
+5.14 s against 7.78 s at level 4. The 80 GB references are measured with
+both flags (2026-10-24, n = 3). The 40 GB references predate the flags.
 
 ## Calibration
 

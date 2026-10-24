@@ -80,20 +80,22 @@ REFERENCE: dict = {
     # 0.12.0.1), slowest rank of 4, n=3 (ref1-3): compile_cold 7.63/7.64/7.97 s (spread 4.4%),
     # warm 0.687/0.699/0.690, NVRTC 5.78/5.80/6.62 (14.5%; the first run on the node is the
     # high one), GEMM 19.22-19.29, FFT 1.023-1.027 ms; import 3.7/3.7/18.6 s (first touch).
-    # compile_cold and GEMM re-measured with LORRAX's XLA flags (autotune 0, remat off), as the
-    # probes now run: job 60201235, nid200448, 2026-10-24, c5d4071eb image, lorrax-postinstall
-    # x3: compile_cold 5.785/5.808/5.767 s, GEMM 3.6995/3.6994/3.6994 TF (warm 0.688/0.695/
-    # 0.681, NVRTC 5.54-5.58, FFT 1.022-1.024: inside the old references, kept).  Same node,
-    # launch XLA_FLAGS=--xla_gpu_autotune_level=4: compile_cold 7.78 s, GEMM 19.22 TF.
+    # compile_cold and GEMM re-measured with LORRAX's XLA flags (autotune 0, Triton GEMM off,
+    # remat off), as the probes now run: job 60201906, nid200297, 2026-10-24, 0cb201574 image,
+    # perf_check by hand x3 with launch XLA_FLAGS=--xla_gpu_enable_triton_gemm=false (= the new
+    # leg default): compile_cold 5.157/5.124/5.133 s, GEMM 19.295/19.283/19.282 TF (warm
+    # 0.681-0.684, NVRTC 5.71-5.90, FFT 1.024-1.025: inside the old references, kept).  Without
+    # Triton GEMM off (autotune 0 alone, job 60201235): compile_cold 5.79 s, GEMM 3.70 TF (an
+    # untuned Triton f64 GEMM); autotune 4: compile_cold 7.78 s, GEMM 19.22 TF.
     "NVIDIA A100-SXM4-80GB": {
-        "import_s": 18.6, "compile_cold_s": 5.79, "compile_warm_s": 0.693,
-        "nvrtc_s": 5.83, "gemm_tflops": 3.70, "fft_ms": 1.025, "host_gemm_s": None,
+        "import_s": 18.6, "compile_cold_s": 5.14, "compile_warm_s": 0.693,
+        "nvrtc_s": 5.83, "gemm_tflops": 19.28, "fft_ms": 1.025, "host_gemm_s": None,
     },
     # job 60190769, nid002136, 2026-10-23, 581a81831, n=3: compile_cold 7.68/7.75/8.02 s,
     # warm 0.696-0.703, NVRTC 5.75/6.78/7.03 (22%), GEMM 19.28-19.29, FFT 1.240-1.241 ms,
-    # import 3.7/3.8/10.6 s (first touch).  NOT re-measured with LORRAX's XLA flags: on 80GB
-    # they took GEMM 19.2 -> 3.70 TF and compile_cold 7.78 -> 5.79 s, so a 40GB run now FAILs
-    # GEMM against this reference until it is re-measured.
+    # import 3.7/3.8/10.6 s (first touch).  Measured at XLA's default autotune level, NOT with
+    # LORRAX's XLA flags: GEMM matches them (80GB: 19.3 TF both ways), compile_cold is ~1.5x
+    # looser than they give (80GB: 7.78 -> 5.14 s) until it is re-measured.
     "NVIDIA A100-SXM4-40GB": {
         "import_s": 10.6, "compile_cold_s": 7.75, "compile_warm_s": 0.699,
         "nvrtc_s": 6.78, "gemm_tflops": 19.29, "fft_ms": 1.240, "host_gemm_s": None,
@@ -618,9 +620,10 @@ print("PROBE_JSON " + json.dumps(out), flush=True)
 #: Prepended to the bench and store probes, after ``import runtime`` and the source closure,
 #: before ``import jax``: LORRAX's own XLA flag defaults, exactly as a driver's
 #: ``runtime.set_default_env`` merges them (the GPU leg's ``xla_flag_defaults`` in lxkit.LEGS,
-#: CUDA: --xla_gpu_autotune_level=0; rematerialization off), appended to the launch's
-#: XLA_FLAGS, a flag the launch set winning.  Without them XLA's GEMM autotuner timed every
-#: f64 candidate of the 8192^2 GEMM for 310 s on a consumer GPU (4.1 s at level 0).
+#: CUDA: --xla_gpu_autotune_level=0 --xla_gpu_enable_triton_gemm=false; rematerialization
+#: off), appended to the launch's XLA_FLAGS, a flag the launch set winning.  Without them XLA's
+#: GEMM autotuner timed every f64 candidate of the 8192^2 GEMM for 310 s on a consumer GPU
+#: (4.1 s at level 0); at level 0 with Triton GEMM on, JAX 0.12 ran it at 3.70 TF on A100-80GB.
 XLA_DEFAULTS_SNIPPET = r"""
 def _lorrax_xla_flags():
     launch = os.environ.get("XLA_FLAGS")
@@ -636,9 +639,11 @@ def _lorrax_xla_flags():
                    f"{rec.get('value')}, {rec.get('provenance')})")
     except Exception as e:      # an older runtime: the CUDA leg's declared default, same rule
         raw = os.environ.get("XLA_FLAGS", "")
-        if "--xla_gpu_autotune_level" not in raw:
-            os.environ["XLA_FLAGS"] = (raw + " --xla_gpu_autotune_level=0").strip()
-        via.append(f"perf_check fallback --xla_gpu_autotune_level=0 ({type(e).__name__}: {e})"[:200])
+        for flag, value in (("--xla_gpu_autotune_level", "0"), ("--xla_gpu_enable_triton_gemm", "false")):
+            if flag not in raw:
+                raw = (raw + f" {flag}={value}").strip()
+        os.environ["XLA_FLAGS"] = raw
+        via.append(f"perf_check fallback: the CUDA leg's flags ({type(e).__name__}: {e})"[:200])
     return {"launch": launch, "effective": os.environ.get("XLA_FLAGS"), "via": via}
 out["xla_flags"] = _lorrax_xla_flags()
 """

@@ -182,7 +182,14 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         # Claim 683 (autotune 0).  XLA removed
         # --xla_gpu_enable_llvm_module_compilation_parallelism before jaxlib 0.12
         # (claim 4179 measured it on 0.9.1) and aborts on the unknown flag.
-        xla_flag_defaults=(("--xla_gpu_autotune_level", "0"),),
+        # Triton GEMM off: jaxlib 0.12 at autotune 0 lowers a real f64 dot to an
+        # untuned Triton GEMM fusion (8192^2 dgemm 3.74 TF/s on A100-80GB); with
+        # Triton GEMM off it is cuBLASLt, 19.3 TF/s, as at autotune 4 and on
+        # jaxlib 0.9.1.  c128 dots were cuBLASLt either way (21.9 TF/s), and
+        # perf_check's 36-program cold compile fell 5.6 -> 4.9 s (A100-80GB,
+        # n=2 each; docs/architecture/compilation.md, "The runtime's XLA flags").
+        xla_flag_defaults=(("--xla_gpu_autotune_level", "0"),
+                           ("--xla_gpu_enable_triton_gemm", "false")),
         xla_allocator="cuda_async",
         xla_allocators=("default", "platform", "bfc", "cuda_async"),
         device_memory_api="cuda_driver",
