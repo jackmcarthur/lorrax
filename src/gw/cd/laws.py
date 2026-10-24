@@ -19,6 +19,13 @@ intermediate band: out[E, k, m, n] = sum_l a[k, m, n, l] w[k, E, l].
 with the two-pole anchor at z = i eta (beta = BETA_RY), the tan-mapped Gauss rule on the
 imaginary axis (gw.cd.rule), and Hermite residues on the uniform knot grid x_j = j h.
 Shapes are documented per function; all arrays are jax arrays inside a trace.
+
+dSigma_c/dE (the ``*_dx`` laws; x = E - eps_l, so d/dE = d/dx): every term is a closed form of x on the
+same contractions, so the derivative is the same applies with differentiated weights.  The imaginary
+kernels and the anchor closed forms are differentiated in x; a residue is the derivative of its cubic
+Hermite interpolant in |x| times sign(x).  Single terms jump at x = 0 (the residue sign and the anchor
+log branch); every law takes the right branch there, so the sum of the terms' right derivatives is the
+derivative of the (smooth) sum.
 """
 from __future__ import annotations
 
@@ -45,6 +52,11 @@ def own_apply(a, w):
     return jnp.einsum('kml,kml->km', diag, w)
 
 
+def row_apply(a, w):
+    """E bound to the bra m on the whole matrix: out[k, m, n] = sum_l a[k, m, n, l] * w[k, m, l]."""
+    return jnp.einsum('kmnl,kml->kmn', a, w)
+
+
 def dagger(a):
     """Contraction of X -> contraction of X^dagger: conj and swap (m, n)."""
     return jnp.conj(jnp.swapaxes(a, 1, 2))
@@ -65,9 +77,19 @@ def imag_node_kernels(u, w, x, f, eta):
     return minus, plus
 
 
-def imag_node_terms(a, u, w, x, f, eta):
-    """One imaginary node as (operators [k, m, n, 2l], weights [k, E, 2l]): a and its dagger stacked on l."""
-    minus, plus = imag_node_kernels(u, w, x, f, eta)
+def imag_node_kernels_dx(u, w, x, f, eta):
+    """d/dx of :func:`imag_node_kernels`: minus the squared denominators [k, E, l]."""
+    fb, dv, dc = kernels(x, f, eta)
+    minus = -(fb / (dv - 1j * u) ** 2 + (1.0 - fb) / (dc - 1j * u) ** 2) * (w / (2.0 * np.pi))
+    plus = -(fb / (dv + 1j * u) ** 2 + (1.0 - fb) / (dc + 1j * u) ** 2) * (w / (2.0 * np.pi))
+    return minus, plus
+
+
+def imag_node_terms(a, u, w, x, f, eta, kernel=imag_node_kernels):
+    """One imaginary node as (operators [k, m, n, 2l], weights [k, E, 2l]): a and its dagger stacked on l.
+
+    ``kernel = imag_node_kernels_dx``: the weights of d/dx on the same operators."""
+    minus, plus = kernel(u, w, x, f, eta)
     return jnp.concatenate([a, dagger(a)], axis=-1), jnp.concatenate([minus, plus], axis=-1)
 
 
@@ -76,18 +98,18 @@ def imag_raw_node(a, u, w, x, f, eta, apply_fn=apply):
     return apply_fn(*imag_node_terms(a, u, w, x, f, eta))
 
 
-def imag_anchor_sums(u_nodes, w_nodes, x, f, eta, beta):
+def imag_anchor_sums(u_nodes, w_nodes, x, f, eta, beta, kernel=imag_node_kernels):
     """S_-(beta), S_+(beta) for each beta: list of ([k,E,l], [k,E,l]) summed over the rule.
 
     One ``lax.scan`` over the nodes in rule order (the summation order of ordered_cd's loop), so the
-    trace is one node body however many nodes the rule has.
+    trace is one node body however many nodes the rule has.  ``kernel = imag_node_kernels_dx``: d/dx.
     """
     u_nodes, w_nodes = jnp.asarray(u_nodes), jnp.asarray(w_nodes)
     zero = jnp.zeros(x.shape, jnp.complex128)
 
     def body(carry, uw):
         u, w = uw
-        minus, plus = imag_node_kernels(u, w, x, f, eta)
+        minus, plus = kernel(u, w, x, f, eta)
         return tuple((sm + minus / (u * u + b * b), sp + plus / (u * u + b * b))
                      for (sm, sp), b in zip(carry, beta)), None
     out, _ = jax.lax.scan(body, tuple((zero, zero) for _ in beta), (u_nodes, w_nodes), unroll=1)
@@ -118,6 +140,18 @@ def anchor_selector(x, f, eta, beta):
             + (1.0 - fb) * sign / (2.0 * beta * (beta + sign * dc)))
 
 
+def odd_anchor_dx(d, x, beta, zero_angle):
+    """d/dx of :func:`odd_anchor` (d = x -+ i eta, dd/dx = 1): (2 d K - 1/d) / (beta^2 - d^2), same branch."""
+    return (2.0 * d * odd_anchor(d, x, beta, zero_angle) - 1.0 / d) / (beta * beta - d * d)
+
+
+def anchor_selector_dx(x, f, eta, beta):
+    """d/dx of :func:`anchor_selector` (sign^2 = 1; x = 0 on the right branch)."""
+    fb, dv, dc = kernels(x, f, eta)
+    sign = jnp.where(x >= 0.0, 1.0, -1.0)
+    return -(fb / (2.0 * beta * (beta + sign * dv) ** 2) + (1.0 - fb) / (2.0 * beta * (beta + sign * dc) ** 2))
+
+
 def anchor_part(value0, deriv0, x, f, eta, beta, apply_fn=apply):
     """Analytic anchor integral [E, k, m, n] (``own_apply``: [k, m]) and the anchor coefficients (cp, cm)."""
     fb, dv, dc = kernels(x, f, eta)
@@ -129,6 +163,17 @@ def anchor_part(value0, deriv0, x, f, eta, beta, apply_fn=apply):
         total = total + apply_fn(0.5 * (p + m), anchor_selector(x, f, eta, b))
         total = total + apply_fn(p - m, odd)
     return total, cp, cm
+
+
+def anchor_part_dx(cp, cm, x, f, eta, beta, apply_fn=apply):
+    """d/dx of :func:`anchor_part`'s integral on its coefficients (cp, cm), which do not depend on x."""
+    fb, dv, dc = kernels(x, f, eta)
+    total = 0
+    for p, m, b in zip(cp, cm, beta):
+        odd = (fb * odd_anchor_dx(dv, x, b, -np.pi) + (1.0 - fb) * odd_anchor_dx(dc, x, b, np.pi)) * (1j / (2.0 * np.pi))
+        total = total + apply_fn(0.5 * (p + m), anchor_selector_dx(x, f, eta, b))
+        total = total + apply_fn(p - m, odd)
+    return total
 
 
 def anchor_subtraction(cp, cm, sums, apply_fn=apply):
@@ -151,31 +196,39 @@ def hermite_lower_knot(x, h, xp=jnp):
     return xp.floor(xp.abs(x) / h)
 
 
-def hermite_coefficients(x, f, h):
+def hermite_coefficients(x, f, h, derivative=False):
     """Run211 uniform-|x| cubic Hermite selectors: (index[k,E,l] int32, vl, vr, dl, dr).
 
     index = floor(|x|/h); t = |x|/h - index; residue sign f for x < 0, -(1 - f) for x >= 0
     (x = 0 is the right branch).  ``count`` clipping is the caller's coverage gate.
+    ``derivative``: the selectors of d/dx on the same knots, (d/dt of the basis) * sign(x) / h; the
+    interpolant is C1 at the knots, so either side of a knot gives the same slope.
     """
     fb = jnp.broadcast_to(f[:, None, :], x.shape)
     query = jnp.abs(x)
     index = hermite_lower_knot(x, h)
     t = jnp.clip(query / h - index, 0.0, 1.0)
     rs = jnp.where(x < 0.0, fb, -(1.0 - fb))
-    h00, h10 = 2 * t ** 3 - 3 * t ** 2 + 1, t ** 3 - 2 * t ** 2 + t
-    h01, h11 = -2 * t ** 3 + 3 * t ** 2, t ** 3 - t ** 2
+    if derivative:
+        rs = rs * jnp.where(x < 0.0, -1.0, 1.0) / h
+        h00, h10 = 6 * t ** 2 - 6 * t, 3 * t ** 2 - 4 * t + 1
+        h01, h11 = -6 * t ** 2 + 6 * t, 3 * t ** 2 - 2 * t
+    else:
+        h00, h10 = 2 * t ** 3 - 3 * t ** 2 + 1, t ** 3 - 2 * t ** 2 + t
+        h01, h11 = -2 * t ** 3 + 3 * t ** 2, t ** 3 - t ** 2
     return index.astype(jnp.int32), rs * h00, rs * h01, rs * h * h10, rs * h * h11
 
 
-def hermite_branch_coefficients(x, f, h, negative):
+def hermite_branch_coefficients(x, f, h, negative, derivative=False):
     """The knot-independent part of ONE branch's Hermite residues: (index, vl, vr, dl, dr) [k, E, l].
 
     :func:`hermite_coefficients` with the branch mask folded in once: ``negative=False`` keeps x >= 0
     (unoccupied l, weight -(1 - f)), ``negative=True`` keeps x < 0 (occupied l, weight f); the other
     side is zero.  A knot depends on these only through ``index == node`` (:func:`real_knot_select`),
-    so the CD kernel builds them once per (knot chunk, q) instead of once per knot.
+    so the CD kernel builds them once per (knot chunk, q) instead of once per knot.  ``derivative``: the
+    branch's d/dx selectors (:func:`hermite_coefficients`).
     """
-    index, vl, vr, dl, dr = hermite_coefficients(x, f, h)
+    index, vl, vr, dl, dr = hermite_coefficients(x, f, h, derivative)
     keep = (x < 0.0) if negative else (x >= 0.0)
     return (index,) + tuple(jnp.where(keep, c, 0.0) for c in (vl, vr, dl, dr))
 
