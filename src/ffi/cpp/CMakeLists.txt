@@ -1544,9 +1544,12 @@ if(LORRAX_ROCM_HAVE_ELPA)
     unset(LORRAX_ELPA_LIBRARY CACHE)
     find_library(LORRAX_ELPA_LIBRARY NAMES elpa_openmp elpa
                  PATHS "${LORRAX_ELPA_ROCM_DIR}/lib" NO_DEFAULT_PATH NO_CACHE REQUIRED)
+    # The handler owns rocBLAS workspace attachment/query calls directly;
+    # libelpa's transitive dependency cannot satisfy our --no-undefined link.
+    find_package(rocblas CONFIG REQUIRED)
     target_sources(lorrax_ffi_rocm PRIVATE mesh/context.cc elpa/eigh_ffi.cc)
     target_include_directories(lorrax_ffi_rocm SYSTEM PRIVATE ${_elpa_inc})
-    target_link_libraries(lorrax_ffi_rocm PRIVATE "${LORRAX_ELPA_LIBRARY}")
+    target_link_libraries(lorrax_ffi_rocm PRIVATE "${LORRAX_ELPA_LIBRARY}" roc::rocblas)
     get_target_property(_rp lorrax_ffi_rocm INSTALL_RPATH)
     set_target_properties(lorrax_ffi_rocm PROPERTIES
         INSTALL_RPATH "${_rp};${LORRAX_ELPA_ROCM_DIR}/lib")
