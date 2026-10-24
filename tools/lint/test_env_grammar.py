@@ -351,13 +351,8 @@ OWNED_FILES = (
 #: Boolean knobs whose ONLY readers live in the owned files, so their
 #: grammar can be fixed here without splitting the knob across packages.
 OWNED_BOOL_KNOBS = (
-    "LORRAX_EXIT_AFTER_ZETA",
-    # LORRAX_MALLOC_TRIM retired 2026-09-24 with the r-tile ζ loop, its only
-    # reader (the per-r-chunk malloc_trim); route G has no such hook.
-    # Read once, in gw_init's ζ-reuse gate — previously through a lazy
-    # ``from isdf.core import _env_bool`` (the last consumer of that
-    # helper); collapsed onto the module-scope env_bool import.
-    "LORRAX_FORCE_REFIT",
+    # Empty since the 2026-10 env prune: LORRAX_EXIT_AFTER_ZETA,
+    # LORRAX_FORCE_REFIT and LORRAX_MALLOC_TRIM are no longer read.
 )
 
 #: Boolean knobs that are ALSO read outside the owned files.  Converting
@@ -454,15 +449,16 @@ def test_defect1_exit_after_zeta_off_does_not_exit():
     The old ``if os.environ.get("LORRAX_EXIT_AFTER_ZETA"):`` at
     gw_init.py:1007 fell through to ``raise SystemExit(0)`` at :1011 for
     every non-empty value, so "off" ended a production run with rc=0.
+    The switch is gone; the grammar check stands on a neutral name.
     """
     for tok in FALSE_SPELLINGS:
-        with _Env(LORRAX_EXIT_AFTER_ZETA=tok):
-            assert gw_config.env_bool("LORRAX_EXIT_AFTER_ZETA", False) is False, (
-                "LORRAX_EXIT_AFTER_ZETA=%r would exit the job" % tok)
-    with _Env(LORRAX_EXIT_AFTER_ZETA="1"):
-        assert gw_config.env_bool("LORRAX_EXIT_AFTER_ZETA", False) is True
-    with _Env(LORRAX_EXIT_AFTER_ZETA=None):
-        assert gw_config.env_bool("LORRAX_EXIT_AFTER_ZETA", False) is False
+        with _Env(LORRAX_TEST_KNOB=tok):
+            assert gw_config.env_bool("LORRAX_TEST_KNOB", False) is False, (
+                "LORRAX_TEST_KNOB=%r read as on" % tok)
+    with _Env(LORRAX_TEST_KNOB="1"):
+        assert gw_config.env_bool("LORRAX_TEST_KNOB", False) is True
+    with _Env(LORRAX_TEST_KNOB=None):
+        assert gw_config.env_bool("LORRAX_TEST_KNOB", False) is False
 
 
 def test_defect2_malloc_trim_off_disables_trim():
@@ -472,13 +468,14 @@ def test_defect2_malloc_trim_off_disables_trim():
     isdf_fitting.py:907 missed ``""``, ``"no"`` and every uppercase
     spelling, while its documented sibling LORRAX_MALLOC_TUNE=OFF works
     (runtime._env_falsy).
+    The switch is gone; the grammar check stands on a neutral name.
     """
     for tok in FALSE_SPELLINGS:
-        with _Env(LORRAX_MALLOC_TRIM=tok):
-            assert gw_config.env_bool("LORRAX_MALLOC_TRIM", True) is False, (
-                "LORRAX_MALLOC_TRIM=%r left the trim hook ON" % tok)
-    with _Env(LORRAX_MALLOC_TRIM=None):
-        assert gw_config.env_bool("LORRAX_MALLOC_TRIM", True) is True
+        with _Env(LORRAX_TEST_KNOB=tok):
+            assert gw_config.env_bool("LORRAX_TEST_KNOB", True) is False, (
+                "LORRAX_TEST_KNOB=%r left a default-on knob ON" % tok)
+    with _Env(LORRAX_TEST_KNOB=None):
+        assert gw_config.env_bool("LORRAX_TEST_KNOB", True) is True
 
 
 def test_defect2_agrees_with_its_documented_sibling():
@@ -1024,50 +1021,6 @@ def test_env_float_announces_a_bad_value():
         assert gw_config.env_float(name, 0.0, print_fn=log) == 0.0
     assert "LORRAX SANITY" in log.text, log.text
     assert "high" in log.text and "0.0" in log.text, log.text
-
-
-# ---------------------------------------------------------------------------
-# 5. Truncating-knob provenance guard
-# ---------------------------------------------------------------------------
-
-def test_truncation_knobs_are_named_in_gw_init():
-    """``LORRAX_MAX_RCHUNKS=N`` breaks the r-chunk loop early, and the
-    writer still calls ``mark_zeta_done`` (isdf_fitting.py:1098).  If
-    ``gw_init`` then stamps ``fit_provenance`` (gw_init.py:478-486), the
-    TRUNCATED ζ becomes reusable by a later production run in the same
-    directory — silently wrong physics with no warning at all.
-
-    gw_init must therefore know which knobs truncate a fit.
-    """
-    assert hasattr(gw_config, "ZETA_TRUNCATING_ENV_KNOBS")
-    assert "LORRAX_MAX_RCHUNKS" in gw_config.ZETA_TRUNCATING_ENV_KNOBS
-    assert hasattr(gw_config, "active_zeta_truncating_knobs")
-    with _Env(LORRAX_MAX_RCHUNKS=None):
-        assert gw_config.active_zeta_truncating_knobs() == []
-    with _Env(LORRAX_MAX_RCHUNKS="2"):
-        assert gw_config.active_zeta_truncating_knobs() == [
-            ("LORRAX_MAX_RCHUNKS", "2")]
-    # An empty value is not a truncation request.
-    with _Env(LORRAX_MAX_RCHUNKS=""):
-        assert gw_config.active_zeta_truncating_knobs() == []
-
-
-def test_gw_init_consults_the_truncation_guard_before_stamping():
-    """Source-level: the provenance stamp must be guarded."""
-    src = _read("gw/gw_init.py")
-    assert "active_zeta_truncating_knobs" in src, (
-        "gw_init stamps fit_provenance unconditionally; a LORRAX_MAX_RCHUNKS "
-        "run therefore leaves a truncated ζ that _zeta_reuse_ok will reuse")
-    tree = ast.parse(src, "gw_init.py")
-    stamp_lines = [n.lineno for n in ast.walk(tree)
-                   if isinstance(n, ast.Call)
-                   and _func_name(n.func) == "stamp_fit_provenance"]
-    guard_lines = [n.lineno for n in ast.walk(tree)
-                   if isinstance(n, ast.Call)
-                   and _func_name(n.func) == "active_zeta_truncating_knobs"]
-    assert stamp_lines and guard_lines, (stamp_lines, guard_lines)
-    assert min(guard_lines) < min(stamp_lines), (
-        "the truncation guard must be evaluated before the stamp")
 
 
 # ---------------------------------------------------------------------------

@@ -451,8 +451,7 @@ def install_failfast_excepthook() -> None:
 
     def _failfast(exc_type, exc_value, exc_tb):
         # SystemExit never reaches sys.excepthook, so an intentional
-        # ``raise SystemExit(0)`` (e.g. LORRAX_EXIT_AFTER_ZETA) is
-        # unaffected by this hook.
+        # ``raise SystemExit(0)`` is unaffected by this hook.
         rank = _resolve_proc_id()
         n = _resolve_proc_count()
         # Emit on BOTH streams: under srun+apptainer, stderr written just

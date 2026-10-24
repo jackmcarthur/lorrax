@@ -92,22 +92,6 @@ def _deadline_text(timeout_s: float) -> str:
             else "no deadline (rank 0 names a missing rank every 60 s)")
 
 
-def _agreement_deadline_env(name: str, default: float) -> float:
-    """Read a finite deadline in seconds; 0 (the default) waits without bound."""
-    raw = os.environ.get(name)
-    try:
-        value = default if raw is None or not raw.strip() else float(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"{name} must be a number of seconds (0 = no deadline), "
-            f"got {raw!r}") from exc
-    if not (value >= 0.0 and value < float("inf")):
-        raise ValueError(
-            f"{name} must be a finite non-negative number of seconds, "
-            f"got {raw!r}")
-    return value
-
-
 def _timeout_ms(timeout_s: float) -> int:
     """A deadline in seconds as the control plane's milliseconds (0 = none)."""
     return max(1, int(round(timeout_s * 1000))) if timeout_s > 0 else 0
@@ -758,9 +742,7 @@ def _configure_compile_agreement() -> None:
                  "coordination client is not initialized.")
         return
 
-    timeout_s = _agreement_deadline_env(
-        "LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S",
-        _COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S)
+    timeout_s = _COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S
     s._compile_client = client
     s.compile_agreement_timeout_s = timeout_s
     s.compile_agreement_enabled = True

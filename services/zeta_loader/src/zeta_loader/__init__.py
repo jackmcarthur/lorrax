@@ -62,8 +62,7 @@ of one file in silence.
 
 COMPLETENESS IS CHECKED AT OPEN.  ``isdf_header/zeta_is_done`` is the
 writer's flag, and a ζ left by a job that died mid-write refuses here
-rather than flowing into V_q → W → Σ with rc=0
-(``LORRAX_ALLOW_PARTIAL_ZETA=1`` overrides, for debugging).
+rather than flowing into V_q → W → Σ with rc=0.
 
 Standalone, and honestly so
 ---------------------------

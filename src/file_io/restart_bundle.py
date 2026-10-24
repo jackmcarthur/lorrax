@@ -1990,9 +1990,8 @@ class BispinorVqReader:
         what makes sharded reads with spec P(None,'x','y') divide
         cleanly under any 2D mesh factorisation.
 
-        Routed through ``runtime.padding.padded_mu_extent`` so the
-        test-only LORRAX_EXTRA_MU_PAD knob stays consistent with the
-        ψ-side / write-side extents."""
+        Routed through ``runtime.padding.padded_mu_axis``, the one μ
+        round-up the ψ-side / write-side extents use."""
         from runtime.padding import padded_mu_axis
         return (padded_mu_axis(int(n_L), self._mesh).carrier,
                 padded_mu_axis(int(n_R), self._mesh).carrier)

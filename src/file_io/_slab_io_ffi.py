@@ -2197,8 +2197,7 @@ _COMPILED_WRITES_LOCK = threading.Lock()
 def _compiled_write(sm, *args):
     """The compiled write executable for these operands, built on THIS thread.
 
-    Only jitted writers reach here (``LORRAX_WRITE_NO_JIT=1`` dispatches its
-    eager shard_map on the calling thread instead).  The lock makes the
+    The lock makes the
     check-and-build one step for two SlabIO objects on two threads.
     """
     key = (sm, *((tuple(a.shape), a.dtype, a.sharding,
@@ -2212,11 +2211,9 @@ def _compiled_write(sm, *args):
 
 @functools.lru_cache(maxsize=None)
 def _get_write_sm(mesh, in_specs, *,
-                  mesh_shape, axis_count_per_dim, axis_flat, no_jit,
+                  mesh_shape, axis_count_per_dim, axis_flat,
                   independent):
-    """One H5Dwrite per rank.  ``LORRAX_WRITE_NO_JIT=1`` (passed via
-    ``no_jit``) skips the jit wrapper — diagnostic for chasing the
-    jit-argument-retention buffer leak on long write loops.
+    """One H5Dwrite per rank.
     ``independent`` is the transfer mode (:func:`_file_order_plan`)."""
     from ffi.io import ffi_write_call
 
@@ -2233,7 +2230,7 @@ def _get_write_sm(mesh, in_specs, *,
         in_specs=(in_specs,), out_specs=P(),
         check_vma=False,
     )
-    return sm_bare if no_jit else jax.jit(sm_bare)
+    return jax.jit(sm_bare)
 
 
 # ---------------------------------------------------------------------------
@@ -3108,7 +3105,6 @@ class _FfiBackend(_DatasetGeometry):
             mesh_shape=mesh_shape,
             axis_count_per_dim=axis_count_per_dim,
             axis_flat=axis_flat,
-            no_jit=bool(os.environ.get('LORRAX_WRITE_NO_JIT')),
             independent=bool(independent),
         )
 
@@ -3140,26 +3136,11 @@ class _FfiBackend(_DatasetGeometry):
         # and refused (bispinor_debug at P4 under pytest,
         # lx-Xg4-100442-970539-2773).  Compiling here puts it at a fixed
         # point in program order on every rank.
-        elif hasattr(sm, "lower"):
+        else:
             call = _compiled_write(sm, A)
 
             def _task():
                 tok = _posted(platform, _local_address(A), kind, control, lambda: call(A))
-                tok.block_until_ready()
-        else:
-            # ``LORRAX_WRITE_NO_JIT=1``: an eager shard_map compiles at its
-            # first CALL, so the call itself is made here, on the calling
-            # thread; the worker only waits for it.  A dispatch error is
-            # handed to the worker so it is sticky like any other.
-            try:
-                tok, dispatch_error = _posted(
-                    platform, _local_address(A), kind, control, lambda: sm(A)), None
-            except BaseException as exc:                      # noqa: BLE001
-                tok, dispatch_error = None, exc
-
-            def _task():
-                if dispatch_error is not None:
-                    raise dispatch_error
                 tok.block_until_ready()
 
         self._queued_bytes += int(A.nbytes)

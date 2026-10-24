@@ -40,10 +40,8 @@ from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
 
 # The env grammar and the XLA memory reading come from their owners in
 # ``runtime`` (L3, jax-free); the deck vocabulary from ``gw_config``.
-from runtime.env_flags import env_bool
 from runtime.xla_memory import classify_xla_pool, resolve_xla_gpu_memory_env
 from .gw_config import (
-	active_zeta_truncating_knobs,
 	refuse_unsupported_bispinor_gw,
 	uses_bare_tt_gamma_head,
 	uses_coupled_photon_head,
@@ -523,11 +521,10 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 
 	Returns ``True`` only when EVERY one of these holds:
 
-	  1. ``LORRAX_FORCE_REFIT`` is not set to a truthy value;
-	  2. the file exists and its ``isdf_header`` is readable;
-	  3. ``zeta_is_done`` is True (the writer flipped it after the last
+	  1. the file exists and its ``isdf_header`` is readable;
+	  2. ``zeta_is_done`` is True (the writer flipped it after the last
 	     H5Dwrite drained — a crashed fit leaves it False);
-	  4. ``fit_provenance`` is present AND byte-identical to this run's —
+	  3. ``fit_provenance`` is present AND byte-identical to this run's —
 	     with TWO named exceptions, both announced when they fire.  The
 	     legacy-key table below: a stamp that differs ONLY by keys added
 	     after it was written is read as having run each of those keys'
@@ -537,8 +534,8 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 	     file has many names, so two spellings that resolve to the same
 	     file are not a difference (:func:`_same_wfn_file`) — while two
 	     that resolve to different files refit, naming BOTH paths;
-	  5. the on-disk centroid table equals this run's centroid indices;
-	  6. (``n_rmu_expected`` given) the ζ DATASET's μ extent equals it.
+	  4. the on-disk centroid table equals this run's centroid indices;
+	  5. (``n_rmu_expected`` given) the ζ DATASET's μ extent equals it.
 	     The header and the dataset are written by two different calls,
 	     so a file can carry a good header over a ζ of the wrong shape.
 	     :func:`_check_zeta_h5_matches_basis` RAISES on that for the
@@ -552,16 +549,6 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 	sits in front of a multi-hour step whose silent misuse produced a
 	−135 eV QP gap once already (job 7874375, the restart-window bug).
 	"""
-	# Canonical boolean grammar (gw_config.env_bool, imported at module
-	# scope with the rest of this layer's env helpers — this site used to
-	# lazily import isdf.core._env_bool, the ONE other parser, which P1.3
-	# retired): under the old hand-rolled
-	# ``not in ('', '0', 'false', 'False')`` parse, ``=off``/``=no``
-	# counted as truthy and forced a multi-hour refit (audit fix/zq
-	# 2026-07-28).
-	if env_bool('LORRAX_FORCE_REFIT', False):
-		log.info("    [zeta reuse] LORRAX_FORCE_REFIT set — refitting.")
-		return False
 	if not os.path.exists(zeta_h5_path):
 		return False
 	try:
@@ -1829,7 +1816,7 @@ def _reuse_zeta_faces(
     log.info("  isdf_header/zeta_is_done is True, the centroid table")
     log.info("  matches, and fit_provenance is identical to this run's")
     log.info("  inputs (band windows, cutoffs, solver knobs, source WFN).")
-    log.info("  Set LORRAX_FORCE_REFIT=1 to refit unconditionally.")
+    log.info("  Delete or move the ISDF tensor file to refit.")
     log.info("  " + "=" * 68)
     log.info("")
     if not cfg.bispinor:
@@ -1934,21 +1921,7 @@ def _fit_charge_zeta_channel(
     if not _reuse_charge:
         _gate_fresh_zeta_rank_findings(
             "the ζ fit's rank truncation", print_fn=print_fn)
-    _trunc = active_zeta_truncating_knobs()
-    if not _reuse_charge and _trunc:
-        _names = ", ".join(f"{k}={v}" for k, v in _trunc)
-        log.info("")
-        log.info("  " + "!" * 68)
-        log.info(f"  *** LORRAX SANITY: {_names} truncated this ζ fit. ***")
-        log.info(f"  {zeta_h5_path} is INCOMPLETE and is NOT being stamped")
-        log.info( "  with fit_provenance, so no later run can reuse it.  The")
-        log.info( "  writer also left isdf_header/zeta_is_done False, so no")
-        log.info( "  restart path will trust it either.  Profiling only —")
-        log.info( "  delete this file before any production run from this")
-        log.info( "  directory.")
-        log.info("  " + "!" * 68)
-        log.info("")
-    elif not _reuse_charge and zeta_g is not None and zeta_g.pending_file is not None:
+    if not _reuse_charge and zeta_g is not None and zeta_g.pending_file is not None:
         zeta_g.pending_file["provenance"] = _provenance
     elif (not _reuse_charge and jax.process_index() == 0
           and (zeta_g is None or _write_zeta_file)):
@@ -1960,7 +1933,7 @@ def _fit_charge_zeta_channel(
                      f"will be refit on the next run.")
     if not _reuse_charge:
         barrier("zeta_provenance")
-    return peak_bytes, _trunc, zeta_g
+    return peak_bytes, zeta_g
 
 
 def _report_zeta_fit_peak(
@@ -2000,7 +1973,7 @@ def _report_zeta_fit_peak(
 
 def _fit_transverse_zeta_channels(
         _band_norms, _cent_T_idx, _chunks_T, _meta_T, _provenance_T,
-        _reuse_T, _trunc, _write_ibz_only_transverse,
+        _reuse_T, _write_ibz_only_transverse,
         _zeta_T_paths, _zeta_cutoff, band_range_left, band_range_right, band_slices, cfg,
         mesh_xy, print_fn, representation, sym, wfn, zeta_contract):
     """Fit the missing current channels on route G; return their wavefunction view.
@@ -2090,7 +2063,7 @@ def _fit_transverse_zeta_channels(
         _gate_fresh_zeta_rank_findings(
             f"the μ_L={mu} transverse ζ fit's rank truncation",
             transverse=True, print_fn=print_fn)
-        if write_T and not _trunc and jax.process_index() == 0:
+        if write_T and jax.process_index() == 0:
             try:
                 from file_io.isdf_header import stamp_fit_provenance
                 stamp_fit_provenance(_zeta_T_paths[mu], _provenance_T(mu))
@@ -2147,7 +2120,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		mu_L: path for mu_L, path in
 		enumerate(zeta_contract.zeta_transverse_paths, start=1)
 	}
-	(peak_bytes, _trunc, zeta_g) = _fit_charge_zeta_channel(
+	(peak_bytes, zeta_g) = _fit_charge_zeta_channel(
 	    _band_norms, _provenance, _reuse_charge, _write_ibz_only_charge, _zeta_cutoff,
 	    band_range_left, band_range_right, centroid_indices, cfg, chunks, k_unfold_plan,
 	    mesh_xy, meta, print_fn, psi_mun_parent, psi_nmu_parent, representation, sym, wfn,
@@ -2170,7 +2143,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	if cfg.bispinor and getattr(cfg.paths, "centroids_file_current", None):
 	    transverse_wfn_data, tt_tiles = _fit_transverse_zeta_channels(
 	        _band_norms, _cent_T_idx, _chunks_T, _meta_T, _provenance_T,
-	        _reuse_T, _trunc, _write_ibz_only_transverse, _zeta_T_paths,
+	        _reuse_T, _write_ibz_only_transverse, _zeta_T_paths,
 	        _zeta_cutoff, band_range_left, band_range_right, band_slices, cfg, mesh_xy, print_fn,
 	        representation, sym, wfn, zeta_contract)
 	    if tt_tiles is not None:
@@ -2883,16 +2856,6 @@ def _prepare_fitted_zeta(
     				transverse_wfn_data['centroid_indices']),
     			n_rmu_logical=int(_meta_receipt_T.n_rmu),
     			n_rmu_padded=int(_meta_receipt_T.n_rmu_padded)))
-    if env_bool("LORRAX_EXIT_AFTER_ZETA", False, print_fn=print0):
-    	if jax.process_index() == 0:
-    		log.info("*** LORRAX EARLY EXIT: LORRAX_EXIT_AFTER_ZETA=1 "
-    		      "— stopping after fit_zeta.  V_q, W, and Σ were "
-    		      "NOT computed; this run produced no self-energy. "
-    		      "***")
-    		import sys as _sys
-    		print("*** LORRAX EARLY EXIT (LORRAX_EXIT_AFTER_ZETA) ***",
-    		      file=_sys.stderr, flush=True)
-    	raise SystemExit(0)
     return (zeta_path, mem_est, transverse_wfn_data, transverse_basis_receipt)
 
 def _prepare_fresh_carriers(

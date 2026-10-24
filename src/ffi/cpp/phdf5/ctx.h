@@ -46,7 +46,7 @@ namespace lorrax_ffi::phdf5 {
 // and read_ffi.cc could not see it -- so the former timing flag was written as
 // a bare `getenv(...) != nullptr` presence test, in which `=0` turns
 // timing ON.  That is the same defect this project already post-mortems
-// for the Python driver debug switch and LORRAX_EXIT_AFTER_ZETA
+// for the Python driver debug switch and a retired early-exit switch
 // docstring).  A grammar only one file can reach is a grammar the next
 // file will re-invent wrongly.
 inline bool env_flag(const char* name, bool default_value) {

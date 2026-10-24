@@ -868,12 +868,6 @@ _L1_LIBRARY_ENV_READS = {
     "gw.sigma_box_plan": {
         "LORRAX_UNIFORM_RULE_TRACE",
     },
-    # resolve_extra_rank_pad — one resolver, refuse-on-garbage; the entry
-    # layer passes the resolved value down.  It moved with the fH library
-    # half (ARCH M7).
-    "bandstructure.fh_interp": {
-        "LORRAX_EXTRA_RANK_PAD",
-    },
     # resolve_fi_fshoulder_tol — the f-shoulder gate's floor, one resolver,
     # refuse-on-garbage, resolved once and passed down.  It is deliberately
     # NOT a driver flag: the gate catches a returned band that is ABSENT from

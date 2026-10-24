@@ -102,10 +102,6 @@ rulings override anything here.
   `LORRAX SANITY` line saying the knob is not in force, or, with
   `refuse=True` (knobs that gate correctness), raises naming the variable. It
   never applies a default silently.
-- **`active_zeta_truncating_knobs`** lists the env knobs in force that stop the
-  ζ fit early (`ZETA_TRUNCATING_ENV_KNOBS`: `LORRAX_MAX_RCHUNKS`). Its readers
-  keep a truncated ζ from being stamped as complete, so a later production run
-  cannot reuse it.
 - **Normalizers.** `coerce_compute_mode`, `coerce_screening_diagrams`,
   `coerce_head_correction` and `coerce_bispinor_gw_mode` accept the enum, its
   `.value` or a string; `_normalize_placement` (`head_channel.normalize_placement`)

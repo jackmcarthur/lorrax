@@ -458,52 +458,6 @@ def test_auditor_swallowed_barriers_does_not_fire_on_a_real_handler():
 
 
 # ===========================================================================
-# R4 — a truncated zeta must not be stamped complete
-# ===========================================================================
-
-def _audit_truncation_guard(src, name, stamp_fn):
-    """``[]`` when ``stamp_fn`` is reached only past a truncation check."""
-    tree = _tree(src, name)
-    calls = _call_names(tree)
-    stamps = calls.get(stamp_fn, [])
-    guards = calls.get("active_zeta_truncating_knobs", [])
-    if not stamps:
-        return ["%s never calls %s" % (name, stamp_fn)]
-    if not guards:
-        return ["%s calls %s with no truncation guard" % (name, stamp_fn)]
-    if min(guards) >= min(stamps):
-        return ["%s evaluates the truncation guard AFTER %s" % (name, stamp_fn)]
-    return []
-
-
-def test_isdf_fitting_does_not_mark_a_truncated_zeta_done():
-    """R4.  ``LORRAX_MAX_RCHUNKS=N`` breaks the r-chunk loop early and the
-    writer downstream still stamped ``zeta_is_done=True`` — the file lying
-    about itself.  ``gw_init``'s existing guard blocks REUSE; this one stops
-    the claim being written."""
-    assert _audit_truncation_guard(
-        _read("gw/isdf_fitting.py"), "isdf_fitting", "mark_zeta_done") == []
-
-
-def test_gw_init_still_guards_the_provenance_stamp():
-    """The sibling guard must not have regressed while R4 landed."""
-    assert _audit_truncation_guard(
-        _read("gw/gw_init.py"), "gw_init", "stamp_fit_provenance") == []
-
-
-def test_auditor_truncation_guard_can_fail():
-    """NEGATIVE CONTROL: unguarded, and guarded-too-late."""
-    unguarded = "def f(p):\n    mark_zeta_done(p)\n"
-    assert _audit_truncation_guard(unguarded, "u", "mark_zeta_done")
-    too_late = ("def f(p):\n    mark_zeta_done(p)\n"
-                "    t = active_zeta_truncating_knobs()\n")
-    bad = _audit_truncation_guard(too_late, "l", "mark_zeta_done")
-    assert bad and "AFTER" in bad[0], bad
-    missing = "def f(p):\n    pass\n"
-    assert _audit_truncation_guard(missing, "m", "mark_zeta_done")
-
-
-# ===========================================================================
 # R5 — retired full-BZ selection has no runtime readers.
 # ===========================================================================
 

@@ -409,51 +409,10 @@ def bounded_partition_tile(extent: int, max_tile: int, alignment: int) -> int:
     return 0
 
 
-def extra_mu_pad() -> int:
-    """TEST-ONLY: extra μ-pad rows requested via ``LORRAX_EXTRA_MU_PAD``.
-
-    Returns the integer value of the ``LORRAX_EXTRA_MU_PAD`` environment
-    variable (0 when unset/empty).  Read at call time so tests can flip
-    it per-subprocess.
-
-    Purpose: device-count-invariance testing at FIXED device count.
-    ``n_rmu_padded = round_up(n_rmu, world_size)`` changes with the
-    device count, so a pad-extent bug (a computation that runs on the
-    padded instead of the logical μ extent) is normally only visible by
-    comparing runs at different P.  This knob forces additional zero
-    pad rows on top of the mesh round-up, reproducing e.g. the P=16 pad
-    extent in a P=1/P=4 run (see
-    ``docs/architecture/padding.md#pad-extent-invariance``).  Any
-    result that changes under this knob at fixed P depends on the pad
-    extent and is a defect.
-
-    NEVER set this in production runs — it only wastes memory at best
-    and, before the pad-extent fixes, changed answers at worst.
-
-    Since the orbit-packed in-memory centroid order (2026-09-05,
-    ``common.centroid_basis``) the knob sizes only the CANONICAL carrier
-    files are read and written at; the in-memory extent is the packed
-    layout's and does not move with it.
-    """
-    import os
-    raw = os.environ.get("LORRAX_EXTRA_MU_PAD", "").strip()
-    if not raw:
-        return 0
-    val = int(raw)
-    if val < 0:
-        raise ValueError(f"LORRAX_EXTRA_MU_PAD must be >= 0; got {val}")
-    return val
-
-
 def padded_mu_axis(n_rmu: int, divisor) -> PaddedAxis:
     """Return the charge/current-centroid logical-to-carrier receipt.
 
-    ``round_up(n_rmu, divisor)`` — plus, when the test-only
-    ``LORRAX_EXTRA_MU_PAD`` env knob is set (see :func:`extra_mu_pad`),
-    that many extra pad rows, re-rounded so mesh divisibility is
-    preserved.  With ``extra % divisor == 0`` (the intended use, e.g.
-    extra=12 at P=4 to force the P=16 extent) the result is exactly
-    ``round_up(n_rmu, divisor) + extra``.
+    ``round_up(n_rmu, divisor)``.
 
     Parameters
     ----------
@@ -464,7 +423,7 @@ def padded_mu_axis(n_rmu: int, divisor) -> PaddedAxis:
         a Mesh whose axis-size product is used.
     """
     return padded_axis(
-        int(n_rmu), divisor, name="centroid mu", extra=extra_mu_pad())
+        int(n_rmu), divisor, name="centroid mu")
 
 
 def padded_mu_extent(n_rmu: int, divisor) -> int:
@@ -697,7 +656,6 @@ __all__ = [
     "pad_square",
     "strip_axis",
     "authenticate_axis",
-    "extra_mu_pad",
     "padded_mu_axis",
     "padded_mu_extent",
     "solve_at_logical",

@@ -112,30 +112,6 @@ def env_float(name: str, default: float, *, print_fn=print,
 
 
 # ---------------------------------------------------------------------------
-#  ζ-truncating env knobs
-# ---------------------------------------------------------------------------
-#: Env knobs that make the ζ fit stop EARLY and still write a file.
-#:
-#: ``LORRAX_MAX_RCHUNKS=N`` stops the ζ fit after N μ-batches (charge,
-#: route G) or N real-space tiles (current channels) in ``gw/isdf_fitting.py``.
-#: Provenance records the *configuration*, which is identical, so a stamped
-#: partial ζ would be REUSED by a later production run from the same
-#: directory.  Both guards read this list: the writer does not call
-#: ``mark_zeta_done`` and ``gw_init`` adds no ``fit_provenance``.
-ZETA_TRUNCATING_ENV_KNOBS = ("LORRAX_MAX_RCHUNKS",)
-
-
-def active_zeta_truncating_knobs() -> list[tuple[str, str]]:
-    """``[(name, raw), ...]`` for every truncating knob currently in force; see docs/dev/gw_config_contracts.md."""
-    out = []
-    for name in ZETA_TRUNCATING_ENV_KNOBS:
-        raw = os.environ.get(name)
-        if raw is not None and raw.strip():
-            out.append((name, raw))
-    return out
-
-
-# ---------------------------------------------------------------------------
 #  XLA GPU memory environment — RE-EXPORTED, not defined here
 # ---------------------------------------------------------------------------
 #
