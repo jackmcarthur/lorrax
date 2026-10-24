@@ -5,9 +5,11 @@
 
 Run it with the SAME srun line (binding flags, OMP_NUM_THREADS, modules) your
 production runs use: it judges the install, the node and the launch together.
-On a login node, or anywhere without the GPUs a run will use, it refuses to
-certify, runs only the static checks, and prints the command to run it properly
-(exit 3).  The installer calls it as its last step.
+On a login node, or where a scheduler (Slurm, PBS, LSF, Flux) exists but this is
+not a job step, it refuses to certify, runs only the static checks, and prints
+how to run it properly (exit 3).  On a workstation (no scheduler at all) it
+certifies where it runs: one process, or the ranks of mpirun.  The installer
+calls it as its last step.
 
 Why it exists.  A published module (venv + source on a read-only network
 filesystem) imported fine on a login node and ran 2x slower on compute nodes;
@@ -125,7 +127,28 @@ FULL_STORE_IMAGES = 50
 #: Filesystem types that are slow for many-small-file/exec workloads when they
 #: hold the runtime (diagnosis wording only; numbers decide).
 NETWORK_FS = {"dvs", "nfs", "nfs4", "gpfs", "lustre", "cifs", "smb3", "fuse.sshfs",
-              "fuse.squashfuse", "beegfs", "wekafs", "ceph", "fuse.gcsfuse"}
+              "fuse.squashfuse", "beegfs", "wekafs", "ceph", "fuse.gcsfuse", "9p", "v9fs"}
+#: Per-group judgement of the open sample (venv, source, ...): a group with fewer sampled
+#: files is reported, not judged alone.  Fast installs, every group, slowest rank: 0.013-0.30
+#: ms (S's 31 Perlmutter runs); the module on DVS: 0.79-19.7 ms.
+MIN_GROUP_FILES = 3
+
+#: Batch schedulers: (name, the job-id variable set inside a job, client commands that
+#: exist where the scheduler does, e.g. on its login nodes).
+SCHEDULERS = (("slurm", "SLURM_JOB_ID", ("srun", "sbatch", "squeue")),
+              ("pbs", "PBS_JOBID", ("qsub", "qstat")),
+              ("lsf", "LSB_JOBID", ("bsub", "bjobs")),
+              ("flux", "FLUX_JOB_ID", ("flux",)))
+#: Launcher rank variables (launcher, rank, size, local rank), first match wins.  Open MPI's
+#: before Slurm's: under an mpirun inside an allocation SLURM_PROCID is the daemon's.
+#: PMI_RANK last: srun's PMI plugins set it too (equal to SLURM_PROCID).
+RANK_ENVS = (("ompi", "OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE", "OMPI_COMM_WORLD_LOCAL_RANK"),
+             ("flux", "FLUX_TASK_RANK", "FLUX_JOB_SIZE", "FLUX_TASK_LOCAL_ID"),
+             ("jsrun", "JSM_NAMESPACE_RANK", "JSM_NAMESPACE_SIZE", "JSM_NAMESPACE_LOCAL_RANK"),
+             ("pals", "PALS_RANKID", "PMI_SIZE", "PALS_LOCAL_RANKID"),
+             ("mvapich", "MV2_COMM_WORLD_RANK", "MV2_COMM_WORLD_SIZE", "MV2_COMM_WORLD_LOCAL_RANK"),
+             ("slurm", "SLURM_PROCID", "SLURM_NTASKS", "SLURM_LOCALID"),
+             ("hydra", "PMI_RANK", "PMI_SIZE", "MPI_LOCALRANKID"))
 
 STATUS_ORDER = {"PASS": 0, "SKIP": 0, "INFO": 0, "WARN": 1, "FAIL": 2}
 
@@ -221,20 +244,65 @@ def gpu_inventory() -> list[dict]:
     return [{"name": "?", "cc": "?"} for d in sorted(glob.glob("/dev/nvidia[0-9]*"))]
 
 
-def context() -> dict:
-    host = socket.gethostname()
-    step = os.environ.get("SLURM_STEP_ID", os.environ.get("SLURM_STEPID", ""))
-    in_step = bool(re.fullmatch(r"\d+", step or "")) and "SLURM_PROCID" in os.environ
+def context(env=None, which=shutil.which, host: str | None = None) -> dict:
+    """Where this rank runs: the scheduler's job and step, the launcher's ranks, or a
+    workstation (no scheduler at all: certifying is allowed, there is no login node).
+
+    In a job step: Slurm (SLURM_STEP_ID + SLURM_PROCID), PBS / PBS Pro (PBS_JOBID: its job
+    shell runs on the job's first compute node), LSF and Flux (LSB_JOBID / FLUX_JOB_ID plus a
+    launcher's rank variable: an LSF batch script may run on a shared launch node).
+    Workstation: no scheduler variable, no scheduler command on PATH, not a login-named host;
+    ranks come from mpirun's variables, else a single process."""
+    env = os.environ if env is None else env
+    host = host or socket.gethostname()
+    sched = next((name for name, var, _ in SCHEDULERS if env.get(var)), None)
+    sched_cmds = [c for _, _, cmds in SCHEDULERS for c in cmds if which(c)]
     login_name = bool(re.search(r"(^|[-_.])login\d*|^login", host)) or bool(
         re.fullmatch(r"(login|uan|frontend|head)\d*", host.split(".")[0]))
+    launcher, rank, nranks, local = None, 0, 1, 0
+    for name, rv, sv, lv in RANK_ENVS:
+        if name == "slurm" and sched != "slurm":
+            continue
+        r = (env.get(rv) or "").strip()
+        if r.isdigit():
+            launcher, rank = name, int(r)
+            nranks = int(env.get(sv)) if (env.get(sv) or "").strip().isdigit() else 1
+            local = int(env.get(lv)) if (env.get(lv) or "").strip().isdigit() else 0
+            break
+    workstation = False
+    if sched == "slurm":
+        step = env.get("SLURM_STEP_ID", env.get("SLURM_STEPID", ""))
+        in_step = bool(re.fullmatch(r"\d+", step or "")) and launcher is not None
+    elif sched == "pbs":
+        in_step = True
+    elif sched in ("lsf", "flux"):
+        in_step = launcher is not None
+    else:
+        workstation = in_step = not sched_cmds and not login_name
+    job = env.get(dict((n, v) for n, v, _ in SCHEDULERS)[sched]) if sched else None
+    # Every rank of one launch must agree on the results directory.
+    if sched == "slurm":
+        launch_id = f"{job}.{env.get('SLURM_STEP_ID', env.get('SLURM_STEPID', '0'))}"
+    else:
+        lid = (env.get("PMIX_NAMESPACE") or env.get("PALS_APID") or
+               (env.get("FLUX_JOB_ID") if sched == "flux" else None) or
+               (str(os.getppid()) if nranks > 1 else str(os.getpid())))
+        launch_id = f"{sched or 'local'}-{job or host}.{lid}"
+    site = (env.get("NERSC_HOST") or "").strip() or None
     return {
         "host": host,
-        "job": os.environ.get("SLURM_JOB_ID"),
+        "job": job,
+        "scheduler": sched,
+        "scheduler_cmds": sched_cmds,
+        "launcher": launcher,
         "in_step": in_step,
-        "rank": env_int("SLURM_PROCID") or 0,
-        "nranks": env_int("SLURM_NTASKS") or 1,
-        "local_rank": env_int("SLURM_LOCALID") or 0,
+        "workstation": workstation,
+        "rank": rank,
+        "nranks": nranks,
+        "local_rank": local,
         "login_name": login_name,
+        "launch_id": launch_id,
+        "site": site,
     }
 
 
@@ -540,6 +608,34 @@ out["mapped"] = sorted(maps)
 print("PROBE_JSON " + json.dumps(out), flush=True)
 """
 
+#: Prepended to the bench and store probes, after ``import runtime`` and the source closure,
+#: before ``import jax``: LORRAX's own XLA flag defaults, exactly as a driver's
+#: ``runtime.set_default_env`` merges them (the GPU leg's ``xla_flag_defaults`` in lxkit.LEGS,
+#: CUDA: --xla_gpu_autotune_level=0; rematerialization off), appended to the launch's
+#: XLA_FLAGS, a flag the launch set winning.  Without them XLA's GEMM autotuner timed every
+#: f64 candidate of the 8192^2 GEMM for 310 s on a consumer GPU (4.1 s at level 0).
+XLA_DEFAULTS_SNIPPET = r"""
+def _lorrax_xla_flags():
+    launch = os.environ.get("XLA_FLAGS")
+    via = []
+    try:
+        runtime.disable_xla_rematerialization()
+        via.append("runtime.disable_xla_rematerialization")
+    except Exception as e:
+        via.append(f"no rematerialization default ({type(e).__name__})")
+    try:
+        rec = runtime.set_default_xla_gpu_autotune(platform="gpu")
+        via.append(f"runtime.set_default_xla_gpu_autotune (leg {rec.get('leg')}: autotune "
+                   f"{rec.get('value')}, {rec.get('provenance')})")
+    except Exception as e:      # an older runtime: the CUDA leg's declared default, same rule
+        raw = os.environ.get("XLA_FLAGS", "")
+        if "--xla_gpu_autotune_level" not in raw:
+            os.environ["XLA_FLAGS"] = (raw + " --xla_gpu_autotune_level=0").strip()
+        via.append(f"perf_check fallback --xla_gpu_autotune_level=0 ({type(e).__name__}: {e})"[:200])
+    return {"launch": launch, "effective": os.environ.get("XLA_FLAGS"), "via": via}
+out["xla_flags"] = _lorrax_xla_flags()
+"""
+
 PROBE_BENCH = r"""
 import json, os, re, sys, threading, time
 warm = sys.argv[1] == "warm"
@@ -552,6 +648,7 @@ try:
     ensure_source_closure(print_fn=lambda *a, **k: None)
 except Exception as e:
     out["source_closure_error"] = f"{type(e).__name__}: {e}"
+#XLA_DEFAULTS#
 import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)
@@ -790,6 +887,9 @@ print("PROBE_JSON " + json.dumps(out, default=str), flush=True)
 """
 
 
+PROBE_BENCH = PROBE_BENCH.replace("#XLA_DEFAULTS#", XLA_DEFAULTS_SNIPPET)
+
+
 PROBE_STORE = r"""
 import json, os, sys, time
 out = {}
@@ -799,6 +899,7 @@ try:
     ensure_source_closure(print_fn=lambda *a, **k: None)
 except Exception as e:
     out["source_closure_error"] = f"{type(e).__name__}: {e}"
+#XLA_DEFAULTS#
 import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)
@@ -819,6 +920,7 @@ except Exception as e:
     out["error"] = f"{type(e).__name__}: {e}"[:600]
 print("PROBE_JSON " + json.dumps(out, default=str), flush=True)
 """
+PROBE_STORE = PROBE_STORE.replace("#XLA_DEFAULTS#", XLA_DEFAULTS_SNIPPET)
 
 
 def kconv_log(text: str) -> list[tuple[str, str]]:
@@ -1056,17 +1158,39 @@ def judge_binding(ranks: list[dict]) -> dict:
     node = (ranks[0].get("binding") or {}) if ranks else {}
     nper = max(1, len(by_host.get(node.get("host"), [])))
     per = max(2, int(node.get("node_physical") or 64) // nper)
-    out["fix"] = (f"launch with -c {per} --threads-per-core=1 --cpu-bind=threads and OMP_NUM_THREADS="
-                  f"{per - 2} ({nper} ranks on {node.get('node_physical')} physical cores; "
-                  "docs/environment/machines/perlmutter.md#cpu)")
+    ctx0 = rank_context(ranks)
+    out["fix"] = binding_fix(ctx0.get("launcher"), per, nper, node.get("node_physical"), ctx0.get("site"))
     return out
+
+
+def binding_fix(launcher: str | None, per: int, nper: int, phys, site: str | None) -> str:
+    """The launch flags that give each rank ``per`` cores of its own, for this launcher."""
+    omp = f"OMP_NUM_THREADS={max(1, per - 2)}"
+    how = {
+        "slurm": f"srun -c {per} --threads-per-core=1 --cpu-bind=threads with {omp}",
+        "ompi": f"mpirun --map-by slot:PE={per} --bind-to core -x {omp}",
+        "pals": f"mpiexec --depth={per} --cpu-bind depth with {omp}",
+        "hydra": f"mpiexec -bind-to core:{per} with {omp}",
+        "mvapich": f"MV2_CPU_BINDING_POLICY=hybrid with {per} cores per rank and {omp}",
+        "jsrun": f"jsrun -c {per} -b packed:{per} with {omp}",
+        "flux": f"flux run -c {per} (each task is bound to its cores) with {omp}",
+    }.get(launcher or "", f"{omp} (one process: leave two cores for Python and I/O threads)"
+          if nper == 1 else f"one block of {per} cores per rank and {omp}")
+    text = (f"launch with {how} ({nper} rank(s) on {phys} physical cores: cores per rank minus 2 "
+            "OpenMP threads)")
+    if site == "perlmutter":
+        text += "; Perlmutter: docs/environment/machines/perlmutter.md#cpu"
+    return text
 
 
 # ---------------------------------------------------------------------------
 # judgement
 # ---------------------------------------------------------------------------
-def comp(name: str, status: str, lines: list[str], metrics: dict | None = None) -> dict:
-    return {"name": name, "status": status, "lines": lines, "metrics": metrics or {}}
+def comp(name: str, status: str, lines: list[str], metrics: dict | None = None,
+         why: list[str] | None = None) -> dict:
+    """One component's verdict; ``why`` = the lines that made it FAIL (the VERDICT quotes them)."""
+    return {"name": name, "status": status, "lines": lines, "metrics": metrics or {},
+            "why": list(why or []) if status == "FAIL" else []}
 
 
 def worst(*sts: str) -> str:
@@ -1105,17 +1229,49 @@ def open_verdict(opens: list[dict]) -> dict:
     if pick is None:
         return {}
     p1, p2 = pick["passes"][0], pick["passes"][1]
+    # Each group's own slowest rank: a slow minority group (a source tree on a slow home with
+    # the venv elsewhere) hides inside the overall median.
+    worst_group: dict = {}
+    for o in opens:
+        passes = o.get("passes") or []
+        if len(passes) < 2:
+            continue
+        for g, s in passes[1].items():
+            if g != "all" and s.get("n") and s["median_ms"] > worst_group.get(g, {}).get("median_ms", -1):
+                worst_group[g] = s
     return {"warm": p2["all"], "first": p1.get("all") or {},
             "groups": {g: v for g, v in p2.items() if g != "all" and v.get("n")},
+            "worst_groups": worst_group,
             "where": pick.get("groups") or {}}
+
+
+def slow_groups(v: dict, launch: dict | None = None) -> list[tuple[str, str, dict, dict]]:
+    """[(severity, label, stats, where)] of every sampled group (venv, source, ...) whose warm
+    median, at its slowest rank, is above OPEN_PASS_MS (WARN) or at least OPEN_FAIL_MS (FAIL);
+    worst first.  The label names the runtime image when the group lives in it."""
+    out = []
+    img = os.path.realpath((launch or {}).get("image_realpath") or "") if (launch or {}).get("image_realpath") else None
+    for g, s in (v.get("worst_groups") or {}).items():
+        if s.get("n", 0) < MIN_GROUP_FILES or s["median_ms"] <= OPEN_PASS_MS:
+            continue
+        w = (v.get("where") or {}).get(g) or {}
+        ex = os.path.realpath(w.get("example") or "")
+        label = g + (f" (runtime image {img})" if img and ex.startswith(img.rstrip("/") + "/") else "")
+        out.append(("FAIL" if s["median_ms"] >= OPEN_FAIL_MS else "WARN", label, s, w))
+    return sorted(out, key=lambda t: -t[2]["median_ms"])
 
 
 STAGE_FIX = ("stage the runtime node-local (see manual: docs/installation/perf_check.md#filesystem)")
 
 
-def stage_fix(launch: dict | None) -> str:
+def stage_fix(launch: dict | None, site: str | None = None) -> str:
     """The filesystem fix for how this check was launched (``launch_info``)."""
     launch = launch or {}
+    if not launch.get("image_root") and not launch.get("lorrax_run") and site != "perlmutter":
+        return ("move the install (venv and source tree) to a fast filesystem: a local disk or a "
+                "parallel scratch filesystem, not a network home or a read-only software share; "
+                "config/perlmutter/install_deps.sh shows a runtime image every job restores node-local; "
+                + STAGE_FIX)
     if launch.get("image_root"):
         fs = launch.get("image_fs") or {}
         return (f"lorrax-run ran the runtime image from {launch.get('image_realpath')} ({fs.get('fstype')} at "
@@ -1125,8 +1281,8 @@ def stage_fix(launch: dict | None) -> str:
     if launch.get("lorrax_run"):
         return (f"launch with lorrax-run, which runs every job from a node-local copy of the install: "
                 f"srun ... {launch['lorrax_run']} python ... (not the tree's select_gpu.sh)")
-    return ("reinstall with config/perlmutter/install_deps.sh (a runtime image every job restores "
-            "node-local), or keep the install on a fast filesystem; " + STAGE_FIX)
+    return ("Perlmutter: reinstall with config/perlmutter/install_deps.sh (a runtime image every job "
+            "restores node-local), or keep the install on a fast filesystem; " + STAGE_FIX)
 
 
 def judge_lookups(lookups: list[dict]) -> tuple[str, list[str]]:
@@ -1158,7 +1314,16 @@ def judge_lookups(lookups: list[dict]) -> tuple[str, list[str]]:
                    "every bare command name a rank's shell or tools run probes each of them")
             lines.append(f"slow {var}: {len(slow)} of {len(rows)} entries cost >= {OPEN_FAIL_MS} ms per failed "
                          f"lookup, and {who}: {names}. Drop them, or stage the libraries node-local")
-        elif rows:
+        mid = sorted(((d, r) for d, r in rows if OPEN_PASS_MS < r["median_ms"] < OPEN_FAIL_MS),
+                     key=lambda t: -t[1]["median_ms"])
+        if mid and var == "LD_LIBRARY_PATH":
+            # 9p (WSL /mnt/c) measured 0.64 ms: every exec and dlopen pays it per library.
+            st = worst(st, "WARN")
+            names = "; ".join(f"{d} ({r.get('fstype')}, {r['median_ms']:.2f} ms)" for d, r in mid)
+            lines.append(f"{var}: {len(mid)} of {len(rows)} entries cost between {OPEN_PASS_MS} and {OPEN_FAIL_MS} "
+                         f"ms per failed lookup: {names}; every exec and dlopen probes them for each library. "
+                         "Drop them, or move them to a fast filesystem")
+        if rows and not slow and not (mid and var == "LD_LIBRARY_PATH"):
             mx = max(r["median_ms"] for _, r in rows)
             lines.append(f"{var}: {len(rows)} entries, failed lookup <= {mx:.3f} ms each")
     return st, lines
@@ -1166,8 +1331,8 @@ def judge_lookups(lookups: list[dict]) -> tuple[str, list[str]]:
 
 def judge_filesystem(fs0: dict, opens: list[dict], imports: list[dict], ref: dict,
                      lookups: list[dict] | None = None) -> dict:
-    lines, st = [], "PASS"
-    fix = stage_fix(fs0.get("launch"))
+    lines, st, why = [], "PASS", []
+    fix = stage_fix(fs0.get("launch"), fs0.get("site"))
     s_lk, l_lk = judge_lookups(lookups or [])
     v = open_verdict(opens)
     warm = v.get("warm") or {}
@@ -1179,16 +1344,23 @@ def judge_filesystem(fs0: dict, opens: list[dict], imports: list[dict], ref: dic
     met["import_s"] = max(imp) if imp else None
     s_imp, t_imp = vs_ref("import_s", met["import_s"], ref)
     med = warm.get("median_ms")
-    if med is not None and med >= OPEN_FAIL_MS:
+    groups = slow_groups(v, fs0.get("launch"))
+    gfail = [t for t in groups if t[0] == "FAIL"]
+    if (med is not None and med >= OPEN_FAIL_MS) or gfail:
         st = "FAIL"
-        g, s = max((v.get("groups") or {"all": warm}).items(), key=lambda t: t[1]["median_ms"])
-        w = (v.get("where") or {}).get(g) or next(iter((v.get("where") or {}).values()), {})
-        lines.append(f"slow filesystem: {med:.2f} ms per open (warm median, slowest rank; worst group {g} "
-                     f"{s['median_ms']:.2f} ms) on {w.get('fstype')} at {w.get('mount')}; a cold run opens "
-                     f"~10^4 install files serially; {fix}")
-    elif med is not None and med > OPEN_PASS_MS:
+        _, g, s, w = (gfail or groups)[0]
+        others = "; ".join(f"{gg} {ss['median_ms']:.2f} ms on {ww.get('fstype')} at {ww.get('mount')}"
+                           for _, gg, ss, ww in (gfail or groups)[1:])
+        lines.append(f"slow filesystem: the {g} files take {s['median_ms']:.2f} ms per open (warm median of "
+                     f"{s['n']}, slowest rank) on {w.get('fstype')} at {w.get('mount')}"
+                     + (f"; also {others}" if others else "")
+                     + f" (all groups {fmt(med, '.2f')} ms); a cold run opens ~10^4 install files serially; {fix}")
+        why.append(lines[-1])
+    elif (med is not None and med > OPEN_PASS_MS) or groups:
         st = "WARN"
-        lines.append(f"open latency {med:.2f} ms (warm median) is between PASS {OPEN_PASS_MS} and FAIL "
+        what = (f"the {groups[0][1]} files {groups[0][2]['median_ms']:.2f} ms on {groups[0][3].get('fstype')} at "
+                f"{groups[0][3].get('mount')}" if groups else f"{med:.2f} ms")
+        lines.append(f"open latency {what} (warm median) is between PASS {OPEN_PASS_MS} and FAIL "
                      f"{OPEN_FAIL_MS} ms")
     wps = walk.get("per_s")
     if wps is not None and wps < WALK_FAIL_PER_S:
@@ -1196,13 +1368,16 @@ def judge_filesystem(fs0: dict, opens: list[dict], imports: list[dict], ref: dic
         if st != "FAIL":
             lines.insert(0, f"slow filesystem: venv walk+lstat {wps:.0f} entries/s < {WALK_FAIL_PER_S:.0f} on "
                          f"{w.get('fstype')} at {w.get('mount')}; {fix}")
+            why.append(lines[0])
         st = "FAIL"
     if s_imp == "FAIL":
         st = "FAIL"
         lines.append(f"slow cold import: {t_imp}")
-    per_group = ", ".join(f"{g} {s['median_ms']:.3f}" for g, s in (v.get("groups") or {}).items())
+        why.append(lines[-1])
+    per_group = ", ".join(f"{g} {s['median_ms']:.3f}" for g, s in (v.get("worst_groups") or {}).items())
     lines.append(f"open+close ms, slowest rank: warm median {fmt(med, '.3f')} p90 {fmt(warm.get('p90_ms'), '.2f')} "
-                 f"(first touch {fmt(met['open_first_median_ms'], '.3f')}); per group warm: {per_group}")
+                 f"(first touch {fmt(met['open_first_median_ms'], '.3f')}); per group warm (each judged, "
+                 f"its slowest rank): {per_group}")
     lines.append(f"venv walk+lstat {fmt(wps, '.0f')} entries/s (warm, {walk.get('entries')} entries); "
                  f"slowest-rank cold import {fmt(met['import_s'], '.1f')} s [{t_imp}]")
     seen = set()
@@ -1222,10 +1397,11 @@ def judge_filesystem(fs0: dict, opens: list[dict], imports: list[dict], ref: dic
                    f"modules have no bytecode (e.g. {', '.join(pyc.get('missing_sample', [])[:1])})")
             if ro:
                 st = "FAIL"
-                lines.insert(1 if lines and lines[0].startswith("slow filesystem") else 0,
-                             msg + " on a read-only tree, so every process byte-compiles them: run "
+                pos = 1 if lines and lines[0].startswith("slow filesystem") else 0
+                lines.insert(pos, msg + " on a read-only tree, so every process byte-compiles them: run "
                              "`python -m compileall -q <install>` at install time, or export "
                              "PYTHONPYCACHEPREFIX=<node-local dir, e.g. /tmp/$USER/pycache>")
+                why.append(lines[pos])
             else:
                 st = worst(st, "WARN")
                 lines.append(msg + "; the first run writes them")
@@ -1239,8 +1415,10 @@ def judge_filesystem(fs0: dict, opens: list[dict], imports: list[dict], ref: dic
             lines = l_lk + lines
         else:
             lines += l_lk
+        if s_lk == "FAIL":
+            why += [x for x in l_lk if x.startswith("slow LD_LIBRARY_PATH")]
         st = worst(st, s_lk)
-    return comp("1 filesystem", st, lines, met)
+    return comp("1 filesystem", st, lines, met, why=why)
 
 
 def fmt(v, spec: str) -> str:
@@ -1261,10 +1439,12 @@ def cache_misses(probe: dict) -> tuple[int | None, int | None]:
             sum(v for k, v in ev.items() if k.endswith("cache_hits")))
 
 
-def judge_cache_latency(lats: list[dict]) -> tuple[str, list[str]]:
+def judge_cache_latency(lats: list[dict], why: list | None = None,
+                        site: str | None = None) -> tuple[str, list[str]]:
     """Per-file cost of the cache directories, slowest rank: the warm open median of existing
     entries or the mean repeated failed lookup, whichever is larger (same thresholds as the
-    install's files)."""
+    install's files).  FAIL lines are also appended to ``why``."""
+    why = [] if why is None else why
     worst_by: dict = {}
     for lat in lats:
         for label, row in lat.items():
@@ -1283,13 +1463,17 @@ def judge_cache_latency(lats: list[dict]) -> tuple[str, list[str]]:
         st = worst(st, sev)
         knob = "ISDF_JAX_CACHE_DIR" if r.get("explicit") else "LORRAX_CACHE_ROOT"
         root = r["path"] if r.get("explicit") else os.path.dirname(r["path"].rstrip("/"))
-        lines.insert(0, f"slow cache root: the {label} cache {r['path']} is on {r.get('fstype')} at {r.get('mount')}, "
-                     f"{r['cost_ms']:.2f} ms per open or lookup (slowest rank; open "
-                     f"{fmt((r.get('open') or {}).get('median_ms'), '.3f')} ms, failed lookup "
-                     f"{fmt(r.get('miss_ms'), '.3f')} ms); a run looks up every XLA program it compiles (~2400 in the "
-                     f"test suite) and opens every NVRTC image there. Fix: export {knob}=<a directory on a fast "
-                     f"filesystem, e.g. Lustre scratch> in the launch shell (now {root}), then rerun lorrax-postinstall "
-                     "so the kernel store is built there")
+        eg = "Lustre $SCRATCH" if site == "perlmutter" else "a parallel scratch filesystem or a local disk"
+        line = (f"slow cache root: the {label} cache {r['path']} is on {r.get('fstype')} at {r.get('mount')}, "
+                f"{r['cost_ms']:.2f} ms per open or lookup (slowest rank; open "
+                f"{fmt((r.get('open') or {}).get('median_ms'), '.3f')} ms, failed lookup "
+                f"{fmt(r.get('miss_ms'), '.3f')} ms); a run looks up every XLA program it compiles (~2400 in the "
+                f"test suite) and opens every NVRTC image there. Fix: export {knob}=<a directory on a fast "
+                f"filesystem, e.g. {eg}> in the launch shell (now {root}), then rebuild the kernel store there "
+                "(lorrax-postinstall, or scripts/build_cubin_store.py)")
+        lines.insert(0, line)
+        if sev == "FAIL":
+            why.append(line)
     if worst_by and not slow:
         lines.append("cache directories: " + ", ".join(
             f"{k} {r['cost_ms']:.3f} ms per open/lookup ({r.get('fstype')})" for k, r in worst_by.items()))
@@ -1297,7 +1481,8 @@ def judge_cache_latency(lats: list[dict]) -> tuple[str, list[str]]:
 
 
 def judge_caches(caches: dict, ranks: list[dict]) -> dict:
-    lines, st = [], "PASS"
+    lines, st, why = [], "PASS", []
+    ctx0 = rank_context(ranks)
     for label in ("jax_compile", "cubin"):
         c = caches.get(label) or {}
         if not c:
@@ -1305,15 +1490,17 @@ def judge_caches(caches: dict, ranks: list[dict]) -> dict:
         if not c.get("writable"):
             st = "FAIL"
             lines.append(f"cold or misnamed caches: {label} cache {c.get('path')} is not writable "
-                         f"({c.get('error')}); every run recompiles. Point SCRATCH (or "
+                         f"({c.get('error')}); every run recompiles. Point LORRAX_CACHE_ROOT (or "
                          "ISDF_JAX_CACHE_DIR) at a writable fast filesystem")
+            why.append(lines[-1])
         elif c.get("fstype") in ("nfs", "nfs4", "dvs", "gpfs") or (c.get("write_s") or 0) > 0.5:
             st = worst(st, "WARN")
             lines.append(f"{label} cache {c.get('path')} is on {c.get('fstype')} "
                          f"(1 MB write+fsync+read {fmt(c.get('write_s'), '.3f')} s)")
-    st_lat, l_lat = judge_cache_latency([r.get("cache_latency") or {} for r in ranks])
+    st_lat, l_lat = judge_cache_latency([r.get("cache_latency") or {} for r in ranks], why,
+                                        ctx0.get("site"))
     st = worst(st, st_lat)
-    lines = l_lat + lines if st_lat == "FAIL" else lines + l_lat     # the verdict quotes the first line
+    lines = l_lat + lines if st_lat == "FAIL" else lines + l_lat
     ns = caches.get("namespace")
     if ns and not ns.endswith("_k3"):
         st = worst(st, "WARN")
@@ -1322,10 +1509,15 @@ def judge_caches(caches: dict, ranks: list[dict]) -> dict:
     r0 = next((r for r in ranks if r.get("rank") == 0), {})
     spr = r0.get("store_probe")
     run = ((r0.get("fs") or {}).get("launch") or {}).get("lorrax_run")
-    build_cmd = (f"lorrax-postinstall (or srun -N 1 -n 1 -c 128 --gpus-per-node=4 {run} --all-gpus python "
-                 f"{ROOT}/scripts/build_cubin_store.py --jobs 16)" if run else
-                 f"srun -N 1 -n 1 --gpus-per-node=4 {shlex.quote(sys.executable)} "
-                 f"{ROOT}/scripts/build_cubin_store.py --jobs 16")
+    store = f"{ROOT}/scripts/build_cubin_store.py --jobs 16"
+    if run:
+        build_cmd = (f"lorrax-postinstall (or srun -N 1 -n 1 -c 128 --gpus-per-node=4 {run} --all-gpus python "
+                     f"{store})" if ctx0.get("scheduler") == "slurm" else
+                     f"lorrax-postinstall (or {run} --all-gpus python {store} on the GPU node)")
+    elif ctx0.get("scheduler") == "slurm":
+        build_cmd = f"srun -N 1 -n 1 --gpus-per-node=4 {shlex.quote(sys.executable)} {store}"
+    else:
+        build_cmd = f"{shlex.quote(sys.executable)} {store} (on the GPU node, one process)"
     if spr is not None:
         sm = r0.get("sm")
         imgs = spr.get("images") or {}
@@ -1337,16 +1529,19 @@ def judge_caches(caches: dict, ranks: list[dict]) -> dict:
         if spr.get("error"):
             st = "FAIL"
             lines.append(f"cubin store probe failed: {spr['error'][:200]}")
+            why.append(lines[-1])
         elif n_sm < MIN_STORE_IMAGES:
             st = "FAIL"
             lines.insert(0, f"cubin store missing: {n_sm} NVRTC images for sm_{sm} ({where}); every rank "
                          "NVRTC-builds each kernel on first use (~6 s each, ~10^4 header opens; the module's "
                          f"stage measured 259 s without images, 59 s with): run {build_cmd}")
+            why.append(lines[0])
         elif probe_built:
             st = "FAIL"
             lines.insert(0, f"cold or misnamed caches: {n_sm} images for sm_{sm} present but the router's probe "
                          "kernel was NVRTC-built, not loaded: the image key (toolchain, headers) does not "
                          f"match this install; rebuild: {build_cmd}")
+            why.append(lines[0])
         else:
             if n_sm < FULL_STORE_IMAGES:
                 st = worst(st, "WARN")
@@ -1365,19 +1560,28 @@ def judge_caches(caches: dict, ranks: list[dict]) -> dict:
                 lines.append(f"cold or misnamed caches: rank {r['rank']}: a second process missed the "
                              f"persistent compile cache {misses} times (hits {hits}); the cache key is "
                              "unstable or the entries are not persisted")
+                why.append(lines[-1])
                 break
     if not lines:
         lines.append("compile cache and cubin cache writable on fast storage"
                      + (f"; namespace {ns}" if ns else ""))
-    return comp("2 caches", st, lines)
+    return comp("2 caches", st, lines, why=why)
+
+
+def rank_context(ranks: list[dict]) -> dict:
+    """Rank 0's scheduler/launcher/site record (results saved before it existed: Slurm)."""
+    r0 = next((r for r in ranks if r.get("rank") == 0), ranks[0] if ranks else {})
+    return r0.get("context") or {"scheduler": "slurm", "launcher": "slurm"}
 
 
 def judge_kernels(kern: dict, ranks: list[dict], sm: int | None) -> dict:
-    lines, st = [], "PASS"
+    lines, st, why = [], "PASS", []
     traps = kern.get("env_traps") or []
     for t in traps:
         st = "FAIL" if t["severity"] == "FAIL" else worst(st, "WARN")
         lines.append(f"JIT/PTX-only kernels: {t['text']}" if t["severity"] == "FAIL" else t["text"])
+        if t["severity"] == "FAIL":
+            why.append(lines[-1])
     for leg, inv in (kern.get("fatbin") or {}).items():
         if inv.get("error"):
             lines.append(f"{leg}: fatbin unreadable ({inv['error']})")
@@ -1388,6 +1592,7 @@ def judge_kernels(kern: dict, ranks: list[dict], sm: int | None) -> dict:
                 lines.append(f"JIT/PTX-only kernels: {leg} has SASS for sm_{inv.get('sass')} and PTX for "
                              f"{inv.get('ptx')}, none for this GPU's sm_{sm}; the driver JIT-compiles every "
                              "kernel at load. Rebuild the FFI for this architecture")
+                why.append(lines[-1])
             else:
                 lines.append(f"{os.path.basename(leg)}: SASS sm_{sm} present ({inv['n']} fatbin entries)")
     for r in ranks[:1]:
@@ -1395,6 +1600,7 @@ def judge_kernels(kern: dict, ranks: list[dict], sm: int | None) -> dict:
         if nv.get("error"):
             st = "FAIL"
             lines.append(f"NVRTC path broken: {nv['error'][:200]}")
+            why.append(lines[-1])
         elif nv:
             archs = nv.get("new_cubin_archs") or []
             if not nv.get("new_cubins"):
@@ -1404,6 +1610,7 @@ def judge_kernels(kern: dict, ranks: list[dict], sm: int | None) -> dict:
             elif sm is not None and archs and sm not in archs:
                 st = "FAIL"
                 lines.append(f"NVRTC cubin built for sm_{archs}, device is sm_{sm}")
+                why.append(lines[-1])
             else:
                 lines.append(f"NVRTC cubin built (sm_{archs})")
     px = kern.get("ptx_compiler") or {}
@@ -1411,11 +1618,11 @@ def judge_kernels(kern: dict, ranks: list[dict], sm: int | None) -> dict:
         lines.append(px.get("text", ""))
         if px.get("severity") == "WARN":
             st = worst(st, "WARN")
-    return comp("3 kernels", st, [l for l in lines if l])
+    return comp("3 kernels", st, [l for l in lines if l], why=why)
 
 
 def judge_libraries(ranks: list[dict], libs_static: dict) -> dict:
-    lines, st = [], "PASS"
+    lines, st, why = [], "PASS", []
     r0 = (ranks[0].get("bench_cold") or {}) if ranks else {}
     ffi = r0.get("ffi") or {}
     for leg in ("CUDA", "cpu"):
@@ -1425,9 +1632,11 @@ def judge_libraries(ranks: list[dict], libs_static: dict) -> dict:
         if f.get("error"):
             st = "FAIL"
             lines.append(f"FFI {leg} leg refused: {f['error'][:300]}")
+            why.append(lines[-1])
         elif f.get("closure_ok") is False:
             st = "FAIL"
             lines.append(f"FFI {leg} leg: mapped closure {f.get('closure')} differs from its record")
+            why.append(lines[-1])
         else:
             lines.append(f"FFI {leg} leg opened + closure enforced in {f['open_s']:.2f} s "
                          f"({f.get('path')})")
@@ -1438,12 +1647,13 @@ def judge_libraries(ranks: list[dict], libs_static: dict) -> dict:
     for d in libs_static.get("duplicates", []):
         st = "FAIL"
         lines.append(f"duplicate CUDA library mapped: {d}")
+        why.append(lines[-1])
     for t in libs_static.get("ld_traps", []):
         st = worst(st, t["severity"])
         lines.append(t["text"])
     if not lines:
         lines.append("no FFI legs opened (none built?)")
-    return comp("5 libraries", st, lines)
+    return comp("5 libraries", st, lines, why=why)
 
 
 def judge_bench(ranks: list[dict], ref: dict | None, kind: str) -> dict:
@@ -1473,6 +1683,11 @@ def judge_bench(ranks: list[dict], ref: dict | None, kind: str) -> dict:
     if not ref:
         lines.append(f"no reference for {kind}: benchmark reported, not judged")
         st = "INFO"
+    xf = next(((r.get("bench_cold") or {}).get("xla_flags") for r in ranks
+               if (r.get("bench_cold") or {}).get("xla_flags")), None)
+    if xf:
+        lines.append(f"XLA_FLAGS as a LORRAX run sets them: {xf.get('effective')!r} (launch: "
+                     f"{xf.get('launch')!r}; {'; '.join(xf.get('via') or [])})")
     for k in ("compile_cold_s", "s_per_program", "compile_warm_s", "nvrtc_s", "gemm_tflops", "fft_ms",
               "host_gemm_s"):
         if k == "s_per_program":          # the same measurement as compile_cold_s, per program
@@ -1712,7 +1927,9 @@ def progress(rank: int, t0: float):
 def rank_main(args, ctx: dict, topo: dict, out: Path, t0: float | None = None) -> dict:
     rank, nranks = ctx["rank"], ctx["nranks"]
     step = progress(rank, time.perf_counter() if t0 is None else t0)
-    res: dict = {"rank": rank, "host": ctx["host"], "binding": probe_binding(topo)}
+    res: dict = {"rank": rank, "host": ctx["host"], "binding": probe_binding(topo),
+                 "context": {k: ctx.get(k) for k in ("scheduler", "launcher", "workstation", "site",
+                                                     "launch_id")}}
     # 1. open latency on every rank at once (as a run's ranks start), then rank 0's venv walk.
     sample = open_sample()
     mark(out, "start", rank)
@@ -1826,7 +2043,8 @@ def judge_all(ranks: list[dict], cpu_only: bool) -> tuple[str, list[dict], dict]
     kind = r0.get("device_kind") or "?"
     ref = REFERENCE.get(kind)
     ref = ref if ref and any(v is not None for v in ref.values()) else None
-    comps = [judge_filesystem(r0.get("fs") or {}, [r.get("open") or {} for r in ranks],
+    fs0 = {**(r0.get("fs") or {}), "site": rank_context(ranks).get("site")}
+    comps = [judge_filesystem(fs0, [r.get("open") or {} for r in ranks],
                               [r.get("imports") or {} for r in ranks], ref or {},
                               [r.get("lookups") or {} for r in ranks]),
              judge_caches(r0.get("caches") or {}, ranks)]
@@ -1838,7 +2056,7 @@ def judge_all(ranks: list[dict], cpu_only: bool) -> tuple[str, list[dict], dict]
     b = judge_binding(ranks)
     fix = [f"fix: {b['fix']}"] if (b["fails"] or b["warns"]) else []
     comps.append(comp("4 binding", "FAIL" if b["fails"] else ("WARN" if b["warns"] else "PASS"),
-                      [*b["fails"], *b["warns"], *fix, *b["rows"]]))
+                      [*b["fails"], *b["warns"], *fix, *b["rows"]], why=b["fails"]))
     if gpu:
         comps.append(judge_libraries(ranks, r0.get("libs_static") or {}))
         comps.append(judge_bench(ranks, ref, kind))
@@ -1857,17 +2075,28 @@ def report(v: str, comps: list[dict], meta: dict, ctx: dict, wall: float) -> str
         for line in c["lines"]:
             out.append(f"         {line}")
     fails = [c for c in comps if c["status"] == "FAIL"]
+    where = (" (workstation: no batch scheduler, so no login node to mislead the measurement)"
+             if ctx.get("workstation") else "")
     if v == "FAIL":
-        out.append("VERDICT: FAIL -- a run on this install/launch is expected to be slower than reference:")
+        out.append(f"VERDICT: FAIL{where} -- a run on this install/launch is expected to be slower than "
+                   "reference:")
         for c in fails:
-            slow = [x for x in c["lines"] if x.startswith("SLOW ")]
-            out.append(f"  {c['name']}: {'; '.join(slow) if slow else c['lines'][0]}")
+            out.append(f"  {c['name']}: {'; '.join(fail_lines(c))}")
     elif not meta.get("gpu"):
         out.append(f"VERDICT: {'PASS' if v != 'FAIL' else 'FAIL'} (CPU only: GPU components 3, 5, 6 skipped; "
-                   "not a GPU certification)")
+                   f"not a GPU certification){where}")
     else:
-        out.append(f"VERDICT: {'PASS' if v in ('PASS', 'INFO', 'SKIP') else 'PASS with warnings'}")
+        out.append(f"VERDICT: {'PASS' if v in ('PASS', 'INFO', 'SKIP') else 'PASS with warnings'}{where}")
     return "\n".join(out)
+
+
+def fail_lines(c: dict) -> list[str]:
+    """The lines that made a component FAIL: the ones its judge recorded (``why``), else its
+    SLOW lines, else its first line."""
+    if c.get("why"):
+        return c["why"]
+    slow = [x for x in c["lines"] if x.startswith("SLOW ")]
+    return slow or c["lines"][:1]
 
 
 def static_main(args, ctx: dict, topo: dict, reason: str) -> int:
@@ -1893,20 +2122,70 @@ def static_main(args, ctx: dict, topo: dict, reason: str) -> int:
     a = (o["passes"][-1].get("all") or {}) if o.get("passes") else {}
     if a.get("n"):
         say(f"  open latency HERE: {a['median_ms']:.3f} ms warm median over {a['n']} install files "
-            f"({describe_fs(site_packages())}). Login nodes look fast on every filesystem (Perlmutter: "
-            "~0.07 ms, while /global/common is a DVS mount on compute nodes at ~3.5 ms per open), so "
-            "this does not certify compute nodes.")
-    acct = os.environ.get("SBATCH_ACCOUNT") or os.environ.get("SLURM_ACCOUNT") or "<account>"
-    srun = suggested_srun(ngpu, topo if not ctx["login_name"] else {"physical": 64}, entry)
-    if ctx["job"] and not ctx["in_step"]:
-        say("Inside an allocation: run the check as a step with your production launch line, e.g.")
-        say(f"  {srun}")
-    else:
-        say("Run it on a GPU compute node with the srun line your production runs use, e.g.")
-        say(f"  salloc -N 1 -C gpu -q interactive -t 00:15:00 --gpus-per-node={ngpu} -A {acct} \\")
-        say(f"    {srun}")
-    say("(srun ... perf_check.py --cpu-only on a CPU node checks components 1, 2 and 4 only.)")
+            f"({describe_fs(site_packages())}). A login node can look fast on a filesystem that is slow "
+            "on compute nodes, so this does not certify compute nodes"
+            + (" (Perlmutter: ~0.07 ms on a login node, while /global/common is a DVS mount on compute "
+               "nodes at ~3.5 ms per open)." if ctx.get("site") == "perlmutter" else "."))
+    for f in static_fs_findings(o):
+        say(f"  FINDING (information, not a verdict): {f}")
+    for line in launch_advice(ctx, ngpu, topo, entry):
+        say(line)
     return 3
+
+
+def static_fs_findings(opens: dict, lookups: dict | None = None, caches: dict | None = None) -> list[str]:
+    """Slow-filesystem findings measured where the check refused to certify: slow even here
+    (where a login node would look fast) is worth printing."""
+    out = []
+    v = open_verdict([opens]) if opens.get("passes") else {}
+    for sev, g, s, w in slow_groups(v):
+        out.append(f"{'slow' if sev == 'FAIL' else 'borderline'} filesystem even here: the {g} files take "
+                   f"{s['median_ms']:.2f} ms per open (warm median of {s['n']}) on {w.get('fstype')} at "
+                   f"{w.get('mount')} (FAIL >= {OPEN_FAIL_MS} ms, WARN > {OPEN_PASS_MS} ms in a job step)")
+    _, lines = judge_lookups([lookups if lookups is not None else probe_path_lookups()])
+    out += [x for x in lines if x.startswith("slow LD_LIBRARY_PATH")
+            or (x.startswith("LD_LIBRARY_PATH:") and "between" in x)]
+    _, lines = judge_cache_latency([caches if caches is not None else probe_cache_latency()])
+    out += [x for x in lines if x.startswith("slow cache root")]
+    return out
+
+
+def launch_advice(ctx: dict, ngpu: int, topo: dict, entry: str) -> list[str]:
+    """How to run the check where it certifies: generic, then this scheduler's commands, then
+    the site's line when the site is known."""
+    phys = None if ctx.get("login_name") else topo.get("physical")
+    per = max(2, (phys or 64) // max(ngpu, 1))
+    omp = f"OMP_NUM_THREADS={max(1, per - 2)}"
+    py = f"{shlex.quote(sys.executable)} {entry}"
+    out = ["Run it inside a job on a compute node, launched the way your production runs are (one rank "
+           "per GPU, the same binding flags, modules and OMP_NUM_THREADS); on a machine with no batch "
+           "scheduler it certifies where it runs. --cpu-only on a CPU node checks components 1, 2 and 4."]
+    sched = ctx.get("scheduler") or next((n for n, _, cmds in SCHEDULERS
+                                          if set(cmds) & set(ctx.get("scheduler_cmds") or [])), None)
+    inside = bool(ctx.get("job"))
+    if sched == "slurm":
+        srun = suggested_srun(ngpu, topo if not ctx.get("login_name") else {"physical": 64}, entry)
+        acct = os.environ.get("SBATCH_ACCOUNT") or os.environ.get("SLURM_ACCOUNT") or "<account>"
+        if not inside:
+            site = " -C gpu -q interactive" if ctx.get("site") == "perlmutter" else ""
+            out.append(f"Slurm: salloc -N 1{site} -t 00:15:00 --gpus-per-node={ngpu} -A {acct}, then")
+        out.append(f"  {srun}")
+    elif sched == "pbs":
+        if not inside:
+            out.append("PBS: qsub -I -l select=1 -l walltime=00:15:00 -A <project>, then")
+        out.append(f"  mpiexec -n {ngpu} --ppn {ngpu} --depth={per} --cpu-bind depth env {omp} {py}")
+    elif sched == "lsf":
+        if not inside:
+            out.append("LSF: bsub -Is -nnodes 1 -W 15 -P <project> $SHELL, then")
+        out.append(f"  jsrun -n {ngpu} -a 1 -g 1 -c {per} -b packed:{per} env {omp} {py}")
+    elif sched == "flux":
+        if not inside:
+            out.append("Flux: flux alloc -N 1 -t 15m, then")
+        out.append(f"  flux run -N 1 -n {ngpu} -c {per} -g 1 env {omp} {py}")
+    if ctx.get("site") == "perlmutter":
+        out.append("Perlmutter: lorrax-postinstall runs it for an install_deps.sh install; see "
+                   "docs/installation/perf_check.md")
+    return out
 
 
 def main(argv=None) -> int:
@@ -1930,18 +2209,24 @@ def main(argv=None) -> int:
     topo = node_topology()
     gpus = gpu_inventory()
     if not ctx["in_step"]:
-        if ctx["login_name"] or not ctx["job"]:
-            return static_main(args, ctx, topo, f"{ctx['host']} is not a compute-node job step "
-                               "(no SLURM step, or a login host)")
-        return static_main(args, ctx, topo, "not inside a job step")
+        if ctx["job"]:
+            return static_main(args, ctx, topo, f"inside {ctx['scheduler']} job {ctx['job']} but not in a "
+                               "job step (no launcher rank)")
+        why = ("a login host" if ctx["login_name"] else
+               f"no job here, and a scheduler exists ({', '.join(ctx['scheduler_cmds'][:3])} on PATH)")
+        return static_main(args, ctx, topo, f"{ctx['host']} is not a compute-node job step ({why})")
     if not gpus and not args.cpu_only:
         if ctx["rank"] == 0:
             say("no GPU visible in this step: running the CPU-only components (1, 2, 4)")
         args.cpu_only = True
-    job = f"{ctx['job']}.{os.environ.get('SLURM_STEP_ID', os.environ.get('SLURM_STEPID', '0'))}"
+    job = ctx["launch_id"]
     out = Path(args.out or user_cache_root("perfcheck")) / (job if not args.out else "")
     out.mkdir(parents=True, exist_ok=True)
     if ctx["rank"] == 0:
+        if ctx["workstation"]:
+            say(f"{ctx['host']}: no batch scheduler (no job variables, no scheduler commands) and not a "
+                f"login host: a workstation, certified here ({ctx['nranks']} rank(s), launcher "
+                f"{ctx['launcher'] or 'none: one process'})")
         say(f"results in {out}")
     try:
         rank_main(args, ctx, topo, out, t0)

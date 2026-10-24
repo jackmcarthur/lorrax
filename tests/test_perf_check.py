@@ -98,3 +98,52 @@ def test_nvrtc_bands_and_private_probe_cache(tmp_path, monkeypatch):
     env = pc.probe_env(tmp_path, 0)
     assert env["LORRAX_CACHE_ROOT"].startswith(str(tmp_path))
     assert env["SCRATCH"].startswith(str(tmp_path))
+
+def test_context_schedulers_and_workstation():
+    none = lambda c: None                                   # no scheduler command on PATH
+    ws = pc.context({}, none, "GPUtop")
+    assert ws["in_step"] and ws["workstation"] and ws["nranks"] == 1
+    mpi = pc.context({"OMPI_COMM_WORLD_RANK": "1", "OMPI_COMM_WORLD_SIZE": "2", "PMIX_NAMESPACE": "7"},
+                     none, "GPUtop")
+    assert mpi["in_step"] and (mpi["rank"], mpi["nranks"], mpi["launcher"]) == (1, 2, "ompi")
+    assert pc.context({}, none, "login21")["in_step"] is False          # login host
+    assert pc.context({}, lambda c: "/usr/bin/" + c, "nid001")["in_step"] is False   # scheduler, no job
+    assert pc.context({"PBS_JOBID": "1.pbs"}, none, "x3001c0s1b0n0")["in_step"]
+    assert not pc.context({"LSB_JOBID": "5"}, none, "batch1")["in_step"]           # launch node
+    assert pc.context({"LSB_JOBID": "5", "JSM_NAMESPACE_RANK": "0"}, none, "h01")["in_step"]
+    assert pc.context({"FLUX_JOB_ID": "f1", "FLUX_TASK_RANK": "0"}, none, "n1")["in_step"]
+    sl = {"SLURM_JOB_ID": "9"}
+    assert not pc.context(sl, none, "nid1")["in_step"]
+    assert pc.context({**sl, "SLURM_STEP_ID": "0", "SLURM_PROCID": "0"}, none, "nid1")["launch_id"] == "9.0"
+
+
+def _open(groups):
+    stats = {g: {"n": n, "median_ms": ms} for g, (ms, n) in groups.items()}
+    allv = {"n": sum(n for _, n in groups.values()),
+            "median_ms": sorted(ms for ms, n in groups.values() for _ in range(n))[
+                sum(n for _, n in groups.values()) // 2]}
+    return {"passes": [{"all": allv, **stats}, {"all": allv, **stats}],
+            "groups": {g: {"example": f"/x/{g}/f", "fstype": "9p" if g == "source" else "ext4",
+                           "mount": "/mnt/c" if g == "source" else "/"} for g in groups}}
+
+
+def test_filesystem_per_group_and_ld_warn():
+    # W: the source tree on 9p (1.47 ms) with the venv on ext4: the overall median stays fast
+    o = _open({"site-packages": (0.002, 120), "cuda headers": (0.002, 120), "source": (1.47, 120)})
+    c = pc.judge_filesystem({}, [o], [], {}, [])
+    assert c["status"] == "FAIL" and "the source files take 1.47 ms" in c["why"][0] and "/mnt/c" in c["why"][0]
+    # an LD_LIBRARY_PATH entry at 0.64 ms per failed lookup (9p) warns
+    lk = {"LD_LIBRARY_PATH": [{"dir": "/mnt/c/lib", "n": 20, "total_s": 0.0128, "fstype": "9p"}]}
+    st, lines = pc.judge_lookups([lk])
+    assert st == "WARN" and "/mnt/c/lib" in lines[0]
+
+
+def test_verdict_quotes_the_failing_cache_line():
+    # W: 2 caches FAILed on the store probe, but the VERDICT quoted the passing latency line
+    fast = {"cubin": {"path": "/c/kconv_mathdx", "fstype": "ext4", "mount": "/",
+                      "open": {"n": 5, "median_ms": 0.001}, "miss": {"n": 20, "total_s": 0.00002}}}
+    ranks = [{"rank": 0, "cache_latency": fast, "store_probe": {"error": "FfiLibraryNotBuilt: x"}}]
+    c = pc.judge_caches({}, ranks)
+    assert c["status"] == "FAIL" and not c["lines"][0].startswith("cubin store probe failed")
+    text = pc.report("FAIL", [c], {"gpu": True}, {"host": "h", "nranks": 1}, 1.0)
+    assert "2 caches: cubin store probe failed" in text.split("VERDICT")[1], text

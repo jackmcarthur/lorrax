@@ -33,9 +33,23 @@ srun -N 1 -n 4 -c 16 --threads-per-core=1 --cpu-bind=threads --gpus-per-node=4 \
 
 | where | what happens | exit |
 |---|---|---|
-| login node, or not inside a job step | static checks only, the open latency there with the warning that login nodes look fast on every filesystem, and the `salloc`/`srun` command to run | 3 |
+| login node, or a machine with a scheduler but not inside a job step | static checks only, the open latency there with the warning that login nodes can look fast on a filesystem that is slow on compute nodes, any slow filesystem it finds even there (printed as information), and how to run it: generic advice, the scheduler's commands, and a site line where the site is known | 3 |
 | a GPU job step | all six components, PASS or FAIL | 0 / 1 |
 | a CPU job step (or `--cpu-only`) | components 1, 2 and 4; the verdict says it is not a GPU certification | 0 / 1 |
+| a workstation: no scheduler variables, no scheduler commands on `PATH`, not a login-named host | certifies where it runs (there is no login node to mislead it), one process or the ranks of `mpirun`; the verdict says it is a workstation | 0 / 1 |
+
+A job step is recognised under Slurm (`SLURM_STEP_ID` and a rank), PBS and PBS
+Pro (`PBS_JOBID`: the job's shell runs on a compute node), LSF (`LSB_JOBID`
+plus a `jsrun`/`mpirun` rank, since a batch script may run on a launch node) and
+Flux (`FLUX_JOB_ID` plus `FLUX_TASK_RANK`). Ranks come from Open MPI, Flux,
+`jsrun`, PALS, MVAPICH2, Slurm or MPICH's variables, in that order. On a
+workstation:
+
+```bash
+python scripts/perf_check.py                    # one process, all six components
+mpirun -n 2 --map-by slot:PE=3 --bind-to core -x OMP_NUM_THREADS=1 \
+    python scripts/perf_check.py --cpu-only     # two ranks
+```
 
 `lorrax-postinstall` (written by `install_deps.sh`) builds the NVRTC kernel
 store and then runs this check with four ranks. When every rank has reported
@@ -53,15 +67,23 @@ seconds elapsed.
 
 | component | FAIL when | fix |
 |---|---|---|
-| 1 filesystem {#filesystem} | warm open()+close() median of ~500 install files, all ranks at once, ≥ 1.0 ms (PASS ≤ 0.5 ms); warm `os.walk`+`lstat` of the venv < 5000 entries/s; a read-only tree without `.pyc`; an `LD_LIBRARY_PATH` entry ≥ 1.0 ms per failed lookup (a slow `PATH` entry warns) | depends on the launch: on an `install_deps.sh` install launched without it, launch with `lorrax-run`; under `lorrax-run` on a node without node-local room (the image ran from the shared copy), free `/tmp` or set `LORRAX_IMAGE_ROOTS`; otherwise reinstall with `install_deps.sh`. `python -m compileall` at install, or `PYTHONPYCACHEPREFIX` on node-local storage |
+| 1 filesystem {#filesystem} | warm open()+close() median of ~500 install files, all ranks at once, ≥ 1.0 ms (PASS ≤ 0.5 ms), judged overall and for each group on its own (CUDA headers, mathdx headers, site-packages, source tree, libdevice; a group in the runtime image is named so), so a source tree on a slow mount fails even when the venv is fast; warm `os.walk`+`lstat` of the venv < 5000 entries/s; a read-only tree without `.pyc`; an `LD_LIBRARY_PATH` entry ≥ 1.0 ms per failed lookup (0.5 to 1.0 ms warns; a slow `PATH` entry warns) | depends on the launch: on an `install_deps.sh` install launched without it, launch with `lorrax-run`; under `lorrax-run` on a node without node-local room (the image ran from the shared copy), free `/tmp` or set `LORRAX_IMAGE_ROOTS`; otherwise move the install to a fast filesystem (on Perlmutter, reinstall with `install_deps.sh`). `python -m compileall` at install, or `PYTHONPYCACHEPREFIX` on node-local storage |
 | 2 caches | the compile or cubin cache is not writable; its directory costs ≥ 1.0 ms per open or failed lookup (warm, slowest rank; a run looks up every compiled program and NVRTC image there); a second process misses the persistent compile cache; a cubin store without images for this GPU | `export LORRAX_CACHE_ROOT=<fast filesystem>` (or `ISDF_JAX_CACHE_DIR` for the compile cache) and rerun `lorrax-postinstall`; rebuild the store (`lorrax-postinstall`, or `scripts/build_cubin_store.py`) |
 | 3 kernels | the FFI CUDA leg has no SASS for this GPU's `sm_XX`; `CUDA_FORCE_PTX_JIT` or `JAX_DISABLE_JIT` set; the NVRTC path builds no cubin | rebuild the FFI for this architecture; unset the variable |
-| 4 binding | ranks share CPUs; a thread team larger than the rank's CPUs; fewer than two physical cores | `-c <cores per rank> --threads-per-core=1 --cpu-bind=threads`, `OMP_NUM_THREADS` = cores − 2 ([Perlmutter](../environment/machines/perlmutter.md#cpu)) |
+| 4 binding | ranks share CPUs; a thread team larger than the rank's CPUs; fewer than two physical cores | a block of cores per rank and `OMP_NUM_THREADS` = cores − 2, in the launcher's words: `srun -c <n> --threads-per-core=1 --cpu-bind=threads`, `mpirun --map-by slot:PE=<n> --bind-to core`, `mpiexec --depth=<n> --cpu-bind depth` (PALS), `jsrun -c <n> -b packed:<n>`, `flux run -c <n>` ([Perlmutter](../environment/machines/perlmutter.md#cpu)) |
 | 5 libraries | an FFI leg refuses to open, its mapped closure differs from its record, two copies of a CUDA library are mapped | rebuild, or fix `LD_LIBRARY_PATH` |
 | 6 benchmark | a metric of a GPU model with a reference is more than 15% (and more than its absolute slack) worse: cold compile of 36 fixed programs, the warm re-run, GEMM, FFT, host GEMM. The one NVRTC build is judged by ratio alone: WARN above 1.5x the reference, FAIL above 2.5x, and the line says whether its headers came from the node-local copy (then the node's CPU is the cause) or from the install's filesystem | follow the other components' diagnoses |
 
 A thread team larger than the physical cores but within the logical CPUs (the
 SMT siblings a mask without `--threads-per-core=1` contains) is a warning.
+
+The benchmark compiles with LORRAX's own XLA flags, as every driver's startup
+sets them (`runtime.set_default_env`: the GPU leg's `xla_flag_defaults` in
+`lxkit.LEGS`, on CUDA `--xla_gpu_autotune_level=0`, and the rematerialization
+pass off), appended to the launch's `XLA_FLAGS`; a flag the launch already
+sets wins. Component 6 prints the effective value. Without them, XLA's GEMM
+autotuner spent 310 s on the first f64 8192² GEMM of a laptop GPU (4.1 s at
+level 0).
 
 ## Calibration
 
