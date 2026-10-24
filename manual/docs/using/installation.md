@@ -123,15 +123,15 @@ On Perlmutter's compute nodes, opening a file on `/global/common`, `$HOME` or CF
 | the same tree, run in place on `$SCRATCH` | 592.0 s |
 | the published module, on `/global/common` | 1164–1352 s |
 
-The supported install as shipped (JAX 0.12, the kernel store from `lorrax-postinstall`, the thread defaults of `select_gpu.sh`): fresh installs that follow this page, each with its own empty cache root, on one node with four 80 GB A100s.
+The supported install as shipped (JAX 0.12, the kernel store from `lorrax-postinstall`, the thread defaults of `select_gpu.sh`): fresh installs that follow this page, each with its own empty cache root, on one node with four 80 GB A100s. The verdicts are from the self-check as it now stands, rerun on the same node type.
 
-| Prefix on | Install (login node) | `lorrax-postinstall`: restore / kernel store / self-check | Suite, cold: k-means / GN-PPM / BSE / total |
-|---|---|---|---|
-| `/global/common` | 48.2 s | 8.6 / 235 / 41 s | 12.5 / 37.1 / 10.8 / 328.3 s |
-| `$HOME` | 47.9 s | 9.6 / 242 / 42 s | 12.4 / 37.4 / 10.8 / 329.6 s |
-| CFS | 47.3 s | 7.0 / 230 / 40 s | 12.2 / 37.2 / 11.0 / 329.5 s |
-| `$SCRATCH` | 48.3 s | 6.9 / 235 / 43 s | 12.2 / 37.0 / 10.8 / 328.9 s |
-| CFS, `--in-place`, without `lorrax-run` | 63.1 s | self-check fails: 6.74 ms per file open | 145.0 / 120.1 / 11.7 s; imports alone 238 s |
+| Prefix on | Install (login node) | `lorrax-postinstall`: restore / kernel store / self-check | Self-check verdict | Suite, cold: k-means / GN-PPM / BSE / total |
+|---|---|---|---|---|
+| `/global/common` | 48.2 s | 8.6 / 235 / 41 s | PASS (`INSTALL VERIFIED`) | 12.5 / 37.1 / 10.8 / 328.3 s |
+| `$HOME` | 47.9 s | 9.6 / 242 / 42 s | PASS (`INSTALL VERIFIED`) | 12.4 / 37.4 / 10.8 / 329.6 s |
+| CFS | 47.3 s | 7.0 / 230 / 40 s | PASS (`INSTALL VERIFIED`) | 12.2 / 37.2 / 11.0 / 329.5 s |
+| `$SCRATCH` | 48.3 s | 6.9 / 235 / 43 s | PASS (`INSTALL VERIFIED`) | 12.2 / 37.0 / 10.8 / 328.9 s |
+| CFS, `--in-place`, without `lorrax-run` | 63.1 s | — | FAIL: slow filesystem, 6.74 ms per file open | 145.0 / 120.1 / 11.7 s; imports alone 238 s |
 
 Wherever the prefix lives, the cold suite takes the same 328–330 s, against 524 s for the older commit above. The kernel store accounts for about 125 s of that; JAX 0.12 and the launch settings account for the rest. The same tree run in place from CFS is several times slower before it reaches the first GPU stage.
 
@@ -191,7 +191,7 @@ The self-check judges the install, the node and the launch line together, agains
 | kernels | the CUDA library has no code for this GPU; `CUDA_FORCE_PTX_JIT` or `JAX_DISABLE_JIT` is set | rebuild, or unset the variable |
 | binding | ranks share CPUs, or a thread team is larger than the rank's cores | launch through `lorrax-run` or `select_gpu.sh`; leave `OMP_NUM_THREADS` unset |
 | libraries | a native library refuses to load, maps a library other than its record, or a CUDA library is mapped twice | rebuild, or clear `LD_LIBRARY_PATH` |
-| benchmark | a cold compile of 36 programs, an NVRTC build, a GEMM or an FFT is more than 15% slower than the reference | follow the other components' fixes |
+| benchmark | a cold compile of 36 programs, a GEMM or an FFT is more than 15% slower than the reference; an NVRTC kernel build is more than 2.5 times slower (above 1.5 times it warns, naming whether its headers were read from node-local storage or the install filesystem) | follow the other components' fixes |
 
 Its exit status is 0 for a pass, 1 for a failure, 2 when the check itself broke, and 3 on a login node, where it runs only the static checks and prints the `srun` line to use. Run it again by hand whenever the install, the modules or the launch line change:
 
