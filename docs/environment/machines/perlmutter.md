@@ -126,16 +126,21 @@ config/perlmutter/build_mpiwrapper.sh --fresh
 ```
 
 Every multi-process CPU step sources `config/perlmutter/cpu_mpi_env.sh` in
-the rank shell, before Python:
+the rank shell, before Python. The prelude selects the backend and MPI
+adapter, not Python or its wheels. Select a CPU-only environment for this
+checkout explicitly: the tracked lock and standard module use stable
+0.12.0.1; the nightly tests described above use a separate environment.
 
 ```bash
 export LORRAX_CHECKOUT=/path/to/checkout
+export CPU_PYTHON=/path/to/cpu-only-venv/bin/python
 srun --jobid=$JOBID -N 2 -n 4 -c 16 --threads-per-core=1 --cpu-bind=threads bash -c '
   set -euo pipefail
   export OMP_NUM_THREADS=14
+  export OPENBLAS_NUM_THREADS="$OMP_NUM_THREADS" MKL_NUM_THREADS=1
   . "$LORRAX_CHECKOUT/config/perlmutter/cpu_mpi_env.sh"
-  python3 -u "$LORRAX_CHECKOUT/tools/require_jax.py"
-  python3 -u -m gw.gw_jax -i gw.in'
+  "$CPU_PYTHON" -u "$LORRAX_CHECKOUT/tools/require_jax.py"
+  "$CPU_PYTHON" -u -m gw.gw_jax -i gw.in'
 ```
 
 `cpu_mpi_env.sh` checks the adapter's source pin, MPI ABI and SHA-256

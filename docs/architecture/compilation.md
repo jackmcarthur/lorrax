@@ -18,7 +18,7 @@ Code is cited as `file:line`; every measurement names its deck, $P$ and claim.
 | cubin cache | the per-user, writable image directory, `ffi.fft.cubin_cache_dir()` (`src/ffi/fft.py:424`): `kconv_mathdx/images` in the per-user cache tree (`lxkit.user_cache_root`: `$SCRATCH/.cache/lorrax`, else `~/.cache/lorrax`), one directory for every build and install |
 | store | a release's read-only image directory, `ffi.fft.CUBIN_STORE`: `cubin_store/` at the source root. A checkout has none unless one is built into it |
 | fully cold, release cold, warm | no store and both caches empty; the release's store present and the JAX cache empty (a release's first run); both caches hold every key the run needs |
-| hsuite | `tests/hsuite`, its 16 default stages at P4 on one A100-80 node, with the run directory, `TMPDIR`, `SCRATCH` and both caches node-local |
+| hsuite | `tests/hsuite`, its 15 default driver stages at P4 on one A100-80 node (Na reads its fixed kinetic/ionic fixture), with the run directory, `TMPDIR`, `SCRATCH` and both caches node-local |
 
 ## 1 The three kinds
 
