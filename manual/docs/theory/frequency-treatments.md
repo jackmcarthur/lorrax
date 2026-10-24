@@ -7,7 +7,7 @@
 
 ## <span class="n">1</span> The common frame {: #frame }
 
-Every treatment shares $\Sigma^x$, the $\bq\to0$ head and the quasiparticle step. A treatment fixes three things only: where $W$ is sampled, the model of $W^c(\omega)$ built from those samples, and how $\Sigma^c$ is evaluated from the model.
+Two treatments serve production runs: the tangential model, which is the preferred full-frequency treatment, and the Godby–Needs plasmon pole. The others are references for debugging and comparison. Every treatment shares $\Sigma^x$, the $\bq\to0$ head and the quasiparticle step. A treatment fixes three things only: where $W$ is sampled, the model of $W^c(\omega)$ built from those samples, and how $\Sigma^c$ is evaluated from the model.
 {: .intro }
 
 ### <span class="n">1.1</span> Σᶜ as a product in time {: #frame-time }
@@ -43,7 +43,7 @@ The treatments differ in the poles: one per matrix element (plasmon-pole models)
 | `compute_mode = cohsex` | static COHSEX |
 | `compute_mode = gn_ppm` | Godby–Needs plasmon pole |
 | `compute_mode = hl_ppm` | Hybertsen–Louie plasmon pole |
-| `compute_mode = tangential` | tangential model (production) |
+| `compute_mode = tangential` | tangential model, full frequency (preferred) |
 
 `compute_mode` defaults to `auto`, which reads the legacy keys: `use_ppm_sigma = true` gives `gn_ppm` (or `hl_ppm` when `ppm_model = hl`), otherwise `do_screened` gives `cohsex` or `x_only`. `auto` never selects `tangential`, so the production route names it in the input file. The key-by-key entry is on the GW keyword page: [`compute_mode`](../drivers/gw/keywords.md#compute_mode). Other W models are on [this page](multipole-w.md).
 
@@ -234,11 +234,12 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
 
 ### <span class="n">2.2</span> Which treatment to use {: #compare-choose }
 
-The tangential model is the default recommendation for every material. COHSEX and the plasmon-pole models are cheap insulator references.
+The tangential model is the preferred full-frequency treatment for every material, and the Godby–Needs plasmon pole is the second production option for insulators. COHSEX and the Hybertsen–Louie model are cheap references.
 
 | Situation | Treatment |
 |---|---|
-| production, insulator or metal | tangential |
+| production, insulator or metal | tangential (full frequency) |
+| production, insulator, plasmon pole | GN-PPM |
 | metal | tangential (GN, HL, COHSEX refuse) |
 | time-reversal-broken insulator | tangential or GN-PPM (two-residue fit); HL refuses |
 | time-reversal-broken metal | tangential with `head_correction = no_local_fields` |
@@ -349,9 +350,9 @@ $D$ is Hermitian, so both residues are. Empty-band branches of Σ consume $R_+$ 
     - `compute_mode = hl_ppm` with `ppm_omega_p` at or below the largest $\chi^0$ transition (`GATE hl_ppm_probe_in_spectrum`). Raise `ppm_omega_p` above it.
     - `compute_mode = hl_ppm` on an input file whose measured time reversal is broken (`GATE hl_ppm_requires_measured_trs`). Use `gn_ppm` or the tangential model.
 
-## <span class="n">5</span> The tangential model {: #tangential }
+## <span class="n">5</span> The tangential model: preferred full frequency {: #tangential }
 
-The production full-frequency treatment samples $W^c$ at complex frequencies away from the real axis and builds one pole set per $\bq$, shared by every matrix element.
+The preferred full-frequency treatment samples $W^c$ at complex frequencies away from the real axis and builds one pole set per $\bq$, shared by every matrix element.
 {: .intro }
 
 ### <span class="n">5.1</span> One pole set per q {: #shared }
@@ -365,7 +366,7 @@ $$
 W^c_{\bq}(\mu,\nu;z)=\sum_{j=1}^{K_\bq}b_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\left[\frac{1}{z-\Omega_{j\bq}}-\frac{1}{z+\Omega_{j\bq}}\right],\qquad \Omega_{j\bq}>0 \tag{5.1}
 $$
 
-The samples sit on a line $z=\omega+ih$ placed by the crossing density of the requested states and on a log-spaced imaginary ladder; tangential samples and the exact moments $M_1$, $M_3$ fill a Loewner pencil whose Ritz pairs are the poles. Real poles, positive residues and the moments hold by construction, and the support count grows only as $\ln(1/\epsilon)$. Derivation, keys and constants: [Tangential W model](tangential-w.md), with the normalisation of $b$ in [§2.1](tangential-w.md#model-form).
+The samples sit on a line $z=\omega+ih$ placed by the crossing density of the requested states and on a log-spaced imaginary ladder; tangential samples and the exact moments $M_1$, $M_3$ fill a Loewner pencil whose Ritz pairs are the poles. Real poles, positive residues and the moments hold by construction, and the support count grows only as $\ln(1/\epsilon)$. The analytic structure behind it is on [Analytic structure of W](w-structure.md). Derivation, keys and constants: [Tangential W model](tangential-w.md), with the normalisation of $b$ in [§2.1](tangential-w.md#model-form).
 
 !!! refuses
     - Under `compute_mode = tangential`: the keys of the [other W models](multipole-w.md#keywords) this route does not read, and, when `head_correction = off`, the head-fit sampling keys (`GATE tangential_unused_inputs`). Remove them.

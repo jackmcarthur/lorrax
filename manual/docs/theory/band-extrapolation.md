@@ -213,7 +213,7 @@ $$
 \Omega = \arg\min_{\Omega}\sum_{|E_m-E_F|\le 10\,\mathrm{eV}}\Big|\Sigma^c_{mm}(N_1) + a_m(\Omega)\,g_m(N_1,N_2) - \Sigma^c_{mm}(N_2)\Big|^2 \tag{4.2}
 $$
 
-The pool is closed over degenerate multiplets (0.1 meV); $E_F$ is set by `fermi_reference`. The grid runs from $\Omega^{\mathrm{lo}}$ to 40 eV in 2 eV steps, and the first minimum wins. The lower bound, taken over all requested states,
+The pool is closed over degenerate multiplets (0.1 meV); $E_F$ is the midgap. The grid runs from $\Omega^{\mathrm{lo}}$ to 40 eV in 2 eV steps, and the first minimum wins. The lower bound, taken over all requested states,
 
 $$
 \Omega^{\mathrm{lo}} = \max\Big(0,\ \max_m E_m - \min_\bk E_{N_1+1,\bk} + 2\ \mathrm{eV}\Big) \tag{4.3}
@@ -289,7 +289,6 @@ The keys below change what this page computes. Full entries are on the [GW input
 | [`number_bands`](../drivers/gw/keywords.md#number_bands) | `100` | Sets `number_bands_chi` and `number_bands_sigma` together. |
 | [`band_extrapolation_bracket_scheme`](../drivers/gw/keywords.md#band_extrapolation_bracket_scheme) | `total_fractions` | Placement of $N_1$, $N_2$ (§2.2). Naming it with the extrapolation off refuses. |
 | [`band_extrapolation_estimator`](../drivers/gw/keywords.md#band_extrapolation_estimator) | `spectral_shell` | The only accepted value; `band_index_only` refuses by name. |
-| [`fermi_reference`](../drivers/gw/keywords.md#fermi_reference) | `midgap` | $E_F$ of the 10 eV pool. |
 | [`ppm_invalid_mode`](../drivers/gw/keywords.md#ppm_invalid_mode) | `static_limit` | Whether invalid plasmon poles leave an unextrapolated static term (§5.3). |
 | [`sigma_omega_grid_debug`](../drivers/gw/keywords.md#sigma_omega_grid_debug) | `false` | Debug: extrapolates the whole Σ(ω) grid instead of the on-shell values. |
 

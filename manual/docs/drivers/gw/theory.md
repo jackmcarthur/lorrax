@@ -140,12 +140,12 @@ Under `screening_diagrams = w_bse` or `w_rpa_resolvent`, $W$ comes instead from 
 <figcaption><strong>Fig. G13.</strong> The resolvent route: the two particle–hole Hamiltonians (stage 1), shifted solves for each probe column (stage 2), and the head tensor from the same Hamiltonian (stage 3).</figcaption>
 </figure>
 
-### <span class="n">2.5</span> The tangential model of W {: #scr-sp }
+### <span class="n">2.5</span> The tangential model: preferred full-frequency W {: #scr-sp }
 
 `tangential_screening.screen_tangential_poles`
 {: .in-code }
 
-On the production route the correlation part of $W$ is one set of real poles per $\bq$, shared by every matrix element:
+The tangential model is the preferred full-frequency treatment of $W$, and with the Godby–Needs plasmon pole one of the two production routes. The correlation part of $W$ is one set of real poles per $\bq$, shared by every matrix element:
 
 $$
 W^c_\bq(\mu,\nu;z)=\sum_jb_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\left[\frac{1}{z-\Omega_{j\bq}}-\frac{1}{z+\Omega_{j\bq}}\right]\quad\Longleftrightarrow\quad W^c_\bq(\mu,\nu;t)=-i\sum_jb_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\,e^{-i\Omega_{j\bq}|t|} \tag{2.5}
@@ -155,34 +155,7 @@ $W^c$ and $\partial_zW^c=W\,\partial_z\chi^0\,W$ are sampled at the fixed suppor
 
 ### <span class="n">2.6</span> W from the particle–hole resolvent {: #scr-resolvent }
 
-`bse.bse_stack_matvec.build_bse_stack_matvec`
-{: .in-code }
-
-On the ISDF points the correlation part of $W$ is a resolvent of a particle–hole Hamiltonian $H_\bq$ between pair potentials,
-
-$$
-W^c_\bq(z)=\phi_\bq\,(z-H_\bq)^{-1}\sigma\,\phi_\bq^\dagger,\qquad \phi_{mn\bk\bq}(\mu)=\sum_{\mu'}V_\bq(\mu,\mu')\,\psi^*_{m\bk}(\br_{\mu'})\,\psi_{n\bk+\bq}(\br_{\mu'}) \tag{2.6}
-$$
-
-with $\sigma$ the occupation differences. $H_\bq$ is $H^\mathrm{RPA}$, the transition energies plus the Coulomb exchange, or $H^\mathrm{BSE}$, which adds the statically screened ladder. This is the transfer-function form of [Tangential W model §3.1](../../theory/tangential-w.md#red-transfer), in which $W^c$ is a rational function of $z$ that is known only through the action of the resolvent on chosen vectors.
-
-$H_\bq$ is never formed. A Krylov solver needs only products $HX$ with a block of trial vectors, and each product is assembled from the ISDF quantities. The exchange term encodes $X$ into a density on the $N_\mu$ points, applies $V_\bq$ and decodes it. The ladder term builds the pair amplitude $\Phi_\bk(\br_\mu,\br_\nu)$, multiplies it by $W_\bR(\mu,\nu)$ after an FFT over the k grid, and transforms back ([BSE theory §3](../bse/theory.md#hx)). For $N_t=n_vn_cN_k$ transitions at one $\bq$, one product costs
-
-$$
-\mathcal C_{HX}\sim N_kN_\mu^2\,(n_v+n_c)+N_\mu^2\,N_k\log N_k,\qquad \mathcal M_{HX}\sim 16\,N_\mu^2N_k\ \text{bytes} \tag{2.7}
-$$
-
-for the band contractions, the k-convolution and the storage of $W_\bR$ and one $\Phi$. A two-component calculation multiplies the $\Phi$ storage by four. The applied resolvent $(z-H_\bq)^{-1}\sigma\phi^\dagger_\bq r$ for each probe direction $r$ then follows from a few tens of such products, by GMRES at each $z$.
-
-The dense alternative builds the kernel as an $N_t\times N_t$ matrix at every $\bq$ and inverts or diagonalizes it, at $16N_t^2$ bytes and $\mathcal O(N_t^3)$ operations. The matrix-free cost grows as $N_k\log N_k$ per $\bq$ where the dense one grows as $N_k^2$ in memory and $N_k^3$ in time. Because the products never restrict the transition space, the resolvent runs over every pair of the $\chi^0$ band sum. In effect the BSE is solved for hundreds of bands, and the result is converged with respect to the choice of transition subspace.
-
-| One $\bq$, $n_v=100$, $n_c=900$, $N_k=12^3$, $N_\mu=4000$ | Memory |
-|---|---|
-| Dense kernel, $N_t=1.56\times10^8$, complex128 | $16N_t^2\approx3.9\times10^{17}$ bytes, 0.39 EB |
-| Matrix-free: $W_\bR$ and one $\Phi$ | $2\times16N_\mu^2N_k\approx0.88$ TB |
-| Matrix-free: band values $\psi$ at the points | $16N_k(n_v+n_c)N_\mu\approx0.11$ TB |
-
-The dense kernel would also be needed at every irreducible $\bq$, and its diagonalization would take about $N_t^3\approx4\times10^{24}$ operations.
+The correlation part of $W$ is a resolvent of the particle–hole Hamiltonian between pair potentials ([Analytic structure of W](../../theory/w-structure.md#resolvent)). Under `w_bse` and `w_rpa_resolvent` LORRAX evaluates that resolvent directly, by Krylov solves built from matrix-free products with $H^{\mathrm{BSE}}$ or $H^{\mathrm{RPA}}$. The formalism, its cost and its comparison with a dense kernel are on [Ladder vertex corrections](../../theory/ladder-w.md).
 
 ## <span class="n">3</span> Self-energy {: #sigma }
 

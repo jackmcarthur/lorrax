@@ -16,6 +16,7 @@ theme:
     accent: custom
   features:
     - navigation.sections
+    - navigation.indexes
     - navigation.path
     - navigation.footer
     - navigation.instant
@@ -112,7 +113,10 @@ nav:
       - Physics overview: theory/physics.md
       - Frequency treatments of Σ: theory/frequency-treatments.md
       - Time–frequency transforms: theory/time-frequency.md
-      - Tangential W model: theory/tangential-w.md
+      - Analytic structure of W:
+          - theory/w-structure.md
+          - Tangential W model: theory/tangential-w.md
+          - Ladder vertex corrections: theory/ladder-w.md
       - Contour deformation: theory/contour-deformation.md
       - The q → 0 head: theory/q0-head.md
       - Short- and long-range W: theory/w-range-splitting.md

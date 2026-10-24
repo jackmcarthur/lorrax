@@ -8,7 +8,6 @@ number_bands = 110
 zeta_nband = 110
 sys_dim = 3
 compute_mode = tangential
-fermi_reference = mp1_fixed_n
 occ_smearing_width_ry = 0.02
 restart = false
 write_restart_tensors = true
