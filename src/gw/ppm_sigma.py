@@ -665,7 +665,7 @@ class SigmaOmegaResult:
     #: here so the shared driver report does not re-read or re-fit poles.
     odd_even_residue_ratio: float | None = None
     #: The energy (Ry) the omega axis of THIS body is measured from: the
-    #: current bundle's VBM or midgap (``_prepare_sigma_state``).  The
+    #: current bundle's midgap (``_prepare_sigma_state``).  The
     #: finalizer must read Sigma back in this frame; without it the lookup
     #: fell back to ``wfn.efermi`` (the DFT midgap), off by 0.5-1.1 eV on
     #: CrI3 16x16 SC (audit 2026-09-23 item 2).  None on non-PPM results.
@@ -730,8 +730,8 @@ def assert_gapped_occupations_for_ppm(occ_full, *, print_fn=print) -> int:
     WHAT GOES WRONG IF IT RUNS ANYWAY, which is why this refuses rather than
     warns.  ``_prepare_sigma_state`` builds ``vbm = max(enk | occupied)`` and
     ``cbm = min(enk | empty)``; with a crossing band ``vbm > cbm``, so the
-    "midgap" ``0.5*(vbm+cbm)`` is not in any gap and the ``fermi_reference``
-    the deck chose is meaningless.  It then clips
+    midgap ``0.5*(vbm+cbm)`` is not in any gap and the Sigma frame built
+    on it is meaningless.  It then clips
     ``E_cond = max(enk - efermi, 0)`` and ``H_val = max(efermi - enk, 0)``, so
     a band on the wrong side of that pseudo-Fermi level cannot even be
     REPRESENTED — its dynamic denominator collapses to the ω = 0 edge.  Every
@@ -782,9 +782,9 @@ def assert_gapped_occupations_for_ppm(occ_full, *, print_fn=print) -> int:
         f"  doc:  docs/theory/metallic-mpa-screening.md")
 
 
-def ppm_fermi_frame(enk_full, occ_full, use_midgap):
-    """The origin of the PPM Sigma(omega) grid: the current spectrum's VBM, or
-    ``0.5*(VBM + CBM)`` when ``use_midgap`` and a state is empty.
+def ppm_fermi_frame(enk_full, occ_full):
+    """The origin of the PPM Sigma(omega) grid: the current spectrum's
+    ``0.5*(VBM + CBM)``, or its VBM when no state is empty.
 
     The one owner of that rule: ``_prepare_sigma_state`` builds the Sigma
     frame with it, and ``efermi.sigma_frame_mu_ev`` (shared by the one-shot
@@ -794,8 +794,7 @@ def ppm_fermi_frame(enk_full, occ_full, use_midgap):
     occ_mask = occ_full > 0.5
     vbm = jnp.max(jnp.where(occ_mask, enk_full, -1.0e30))
     cbm = jnp.min(jnp.where(~occ_mask, enk_full, 1.0e30))
-    midgap_candidate = jnp.where(jnp.any(~occ_mask), 0.5 * (vbm + cbm), vbm)
-    return jnp.where(use_midgap, midgap_candidate, vbm)
+    return jnp.where(jnp.any(~occ_mask), 0.5 * (vbm + cbm), vbm)
 
 
 @jax.jit
@@ -805,14 +804,12 @@ def _prepare_sigma_state(
     B_q: jax.Array,
     Omega_q: jax.Array,
     valid_mask_q: jax.Array,
-    use_midgap: jax.Array,
     keep_invalid: jax.Array,
 ) -> _SigmaPhysicsState:
     """Derive Fermi level + derived energy/PPM arrays in one fused trace.
 
     Replaces ~9 eager jnp ops previously emitted at trace time by the sigma
-    driver.  ``use_midgap`` is a traced bool scalar; the caller passes
-    ``jnp.asarray(fermi_reference == 'midgap')``.  ``valid_mask_q`` is always
+    driver.  ``valid_mask_q`` is always
     a real bool array (the caller substitutes ``jnp.ones_like(...)`` when
     no mask is available), so the helper doesn't branch on None.
 
@@ -834,7 +831,7 @@ def _prepare_sigma_state(
     # decomposition needs particle/hole weights f and 1-f, not f > 0.5.
     occ_mask = occ_full > 0.5
     unocc_mask = ~occ_mask
-    efermi = ppm_fermi_frame(enk_full, occ_full, use_midgap)
+    efermi = ppm_fermi_frame(enk_full, occ_full)
 
     E_cond = jnp.maximum(enk_full - efermi, 0.0)
     H_val = jnp.maximum(efermi - enk_full, 0.0)
@@ -1420,7 +1417,7 @@ def compute_sigma_c_ppm_omega_grid(
 
     ``request_for(efermi_ry)`` returns the on-shell request at this body's
     omega reference (``dynamic_sigma.sigma_on_shell_request``); the reference
-    is the bundle's VBM/midgap resolved here.  ``omega_grid_ry`` in its place
+    is the bundle's midgap resolved here.  ``omega_grid_ry`` in its place
     evaluates Sigma_c on that grid (``sigma_omega_grid_debug``).
 
     ``keep_branches``: the result also carries each causal branch's dynamic
@@ -1468,7 +1465,6 @@ def compute_sigma_c_ppm_omega_grid(
     with timing.section("sigma.state"):
         state = _prepare_sigma_state(
             enk_full, occ_full, ppm.B_q, ppm.Omega_q, valid_mask,
-            jnp.asarray(sigma_cfg.fermi_reference == "midgap", dtype=bool),
             jnp.asarray(keep_invalid, dtype=bool))
 
     regularization_width_ry = (

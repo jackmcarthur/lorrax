@@ -5,6 +5,23 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-23 — One energy reference: `fermi_reference` and `minimax_energy_reference` removed
+
+- **Removed.** The GW deck keys `fermi_reference` and `minimax_energy_reference`.
+  Either key refuses: "`fermi_reference` was removed: LORRAX always references
+  energies to midgap internally"; delete the line. An insulator's Σ frequency axis
+  and χ⁰ rules use the midgap, a metal's Σ axis the fixed-N μ, with no option.
+  Decks that used the defaults (`midgap`; `mp1_fixed_n`, required, on a metal) do
+  not move. A deck that set `fermi_reference = vbm` gets the midgap Σ frame once
+  the line is deleted; χ⁰ never depended on `minimax_energy_reference`.
+- **Presentation at the VBM.** The GW RESULTS band-edge table is quoted relative
+  to the DFT VBM (was the midgap $E_F$); gaps and corrections do not move. The
+  htransform `bands_<color>.png` figures plot from the VBM (were the coarse-grid
+  $E_F$); every htransform figure labels its axis "relative to the VBM" (a metal:
+  the DFT $E_F$), and `bandstructure.dat` gains a `# energy_zero=` comment. Its
+  numbers, the `sigma_*.h5` and restart contents, and `band_operators_path.npz`
+  are unchanged.
+
 ## 2026-10-23 — SLATE removed: ROCm LU now one device within the room, FFI ABI 11
 
 - **Removed.** The SLATE backend (`src/ffi/cpp/slate/`, `distrib_la._slate`), its

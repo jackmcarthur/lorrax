@@ -690,16 +690,16 @@ def _band_edge(energies, column, labels, *, top: bool):
     return float(values[i]), int(labels[i]) if labels is not None else i + 1
 
 
-def results_lines(rows, *, valence_band: int, ef_ev: float | None,
-                  reference: str | None, correction_label: str | None = None) -> list[str]:
+def results_lines(rows, *, valence_band: int,
+                  correction_label: str | None = None) -> list[str]:
     """The RESULTS table: each row's VBM and CBM (k, band) and gap, in eV
-    relative to E_F, then the gap correction and the legend.
+    relative to the reference row's VBM (the BerkeleyGW comparison zero),
+    then the gap correction and the legend.
 
     ``rows`` are ``(label, energies (nk, nb) eV, first band number, k labels)``;
     the first row is the reference (DFT) and the last the one the gap
     correction is quoted for.  ``valence_band`` is the 1-based top valence
-    band; the CBM is the band above it.  ``ef_ev`` ``None`` measures from the
-    midgap of the reference row.  A row whose band window misses an edge, or
+    band; the CBM is the band above it.  A row whose band window misses an edge, or
     whose edge energies are not finite, is left out.  ``correction_label``
     names the last row in the gap-correction line (its row label otherwise).
     """
@@ -716,17 +716,15 @@ def results_lines(rows, *, valence_band: int, ef_ev: float | None,
         edges.append((label, vbm, cbm))
     if not edges:
         return ["  no complete valence / conduction pair in the QP result"]
-    if ef_ev is None:
-        ef_ev = 0.5 * (edges[0][1][0] + edges[0][2][0])
-        reference = "midgap of the DFT edges"
-    title = f"band edges, eV relative to E_F ({reference or 'reference'})"
+    zero = edges[0][1][0]
+    title = f"band edges, eV relative to the {edges[0][0]} VBM"
     width = max(44, len(title) + 2, *(len(label) + 2 for label, _, _ in edges))
     lines = [f"  {title:<{width}}{'VBM (ik, band)':<19}{'CBM (ik, band)':<18}{'gap':>7}"]
     ref_v, ref_c = edges[0][1][1], edges[0][2][1]
     vb, cb = int(valence_band), int(valence_band) + 1
     for label, (ev, kv), (ec, kc) in edges:
-        cell_v = f"{ev - ef_ev:+.3f} ({kv}, {vb})" + ("*" if kv != ref_v else "")
-        cell_c = f"{ec - ef_ev:+.3f} ({kc}, {cb})" + ("*" if kc != ref_c else "")
+        cell_v = f"{ev - zero:+.3f} ({kv}, {vb})" + ("*" if kv != ref_v else "")
+        cell_c = f"{ec - zero:+.3f} ({kc}, {cb})" + ("*" if kc != ref_c else "")
         lines.append(f"  {label:<{width}}{cell_v:<19}{cell_c:<18}{ec - ev:>7.3f}")
     if len(edges) > 1:
         first_gap = edges[0][2][0] - edges[0][1][0]
@@ -766,7 +764,7 @@ def sc_results_lines(dft_row, qsgw_row, run, *, valence_band: int, ef_ev: float 
     loop = kv_lines([("SC loop", sc_loop_line(run))])
     if not final.metal:
         lines = results_lines([dft_row, (label, *qsgw_row[1:])], valence_band=valence_band,
-                              ef_ev=ef_ev, reference=reference, correction_label="QSGW")
+                              correction_label="QSGW")
         return lines[:-1] + loop + lines[-1:] if len(lines) > 1 else lines + loop
     width = 44
     lines = [f"  {'band gap':<{width}}{'gap':>7}"]
@@ -1074,8 +1072,8 @@ class GWProductionReport(ProductionReport):
 
         The result owns this origin: for a metal it is the fixed-N chemical
         potential of the accepted map, while for an insulator it is the
-        configured VBM or midgap.  Reconstructing it from ``wfn.efermi``
-        would silently misreport every non-midgap calculation.
+        midgap.  Reconstructing it from ``wfn.efermi`` would silently
+        misreport a metal.
         """
         if not config.compute_mode.is_dynamic or self._coverage_shown:
             return
@@ -1089,8 +1087,7 @@ class GWProductionReport(ProductionReport):
         grid_lo, grid_hi = ((float(_grid[0]), float(_grid[-1])) if _grid is not None
                             else sigma_requested_edges_ev(config.sigma))
         ef_ev = float(sigma_result.efermi_dft_ev)
-        provenance = (getattr(sigma_result, "omega_reference_provenance", None)
-                      or config.sigma.fermi_reference)
+        provenance = getattr(sigma_result, "omega_reference_provenance", None)
         energies = np.asarray(enk_dft_ry, dtype=np.float64) * RYD_TO_EV
         rel = energies - ef_ev
         lv0, lv1 = b.b1 - b.b0, b.b2 - b.b0
@@ -1228,7 +1225,7 @@ class GWProductionReport(ProductionReport):
     def results(self, *, band_slices, e_dft_ry, e_qp_ry, config, sym, wfn,
                 sigma_result=None, sc_run=None) -> None:
         """RESULTS: the band edges of DFT, eqp0, eqp1 and the full-matrix H(QP),
-        each relative to E_F, and the gap correction.
+        each relative to the DFT VBM, and the gap correction.
 
         The eqp0 / eqp1 rows are read back from the files this run wrote (rank
         zero, which wrote them); the DFT row is those files' DFT column, and
@@ -1263,8 +1260,7 @@ class GWProductionReport(ProductionReport):
         rows.append(("full-matrix H(QP)", qp, first, _k_labels(qp.shape[0], sym)))
         rows.insert(0, dft_row)
         ef = getattr(sigma_result, "efermi_dft_ev", None)
-        reference = (getattr(sigma_result, "omega_reference_provenance", None)
-                     or getattr(getattr(config, "sigma", None), "fermi_reference", None))
+        reference = getattr(sigma_result, "omega_reference_provenance", None)
         self.heading("Results")
         if sc_run is not None and sc_run.final is not None:
             # SC: eqp0 = eqp1 = the accepted map's spectrum (and e_qp_ry is the
@@ -1274,10 +1270,7 @@ class GWProductionReport(ProductionReport):
                 ef_ev=None if ef is None else float(ef),
                 reference=str(reference) if reference else None))
             return
-        self.emit_lines(results_lines(
-            rows, valence_band=valence,
-            ef_ev=None if ef is None else float(ef),
-            reference=str(reference) if reference else None))
+        self.emit_lines(results_lines(rows, valence_band=valence))
 
     def timings(self, records, *, wall: float) -> None:
         """Print accumulated, non-overlapping major scientific stages.

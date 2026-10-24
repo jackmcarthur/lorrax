@@ -1631,7 +1631,6 @@ _DEFAULTS = {
     "occ_broadening": 0.0,
     "minimax_target_error": 1.0e-6,
     "minimax_max_nodes": 64,
-    "minimax_energy_reference": "midgap",
     # PPM
     # ppm_model picks the two-point pole-fit ansatz:
     #   "gn" — Godby-Needs: second probe at ω = i·ppm_omega_p (imaginary,
@@ -1818,7 +1817,6 @@ _DEFAULTS = {
     # (gw.band_extrapolation.plan_band_checkpoints,
     # gw.ppm_pipeline.evaluate_band_checkpoints).
     "band_extrapolation_checkpoints": "",
-    "fermi_reference": "midgap",
     # Fermi-Dirac kBT of a metal's occupations, in Ry.  REQUIRED when the
     # WFN occupations identify a metal; refused on an insulator.  A deck key
     # because WFN.h5 does NOT carry it: mf_header stores el/occ/w but no
@@ -1999,8 +1997,6 @@ _NORMALIZE_STR = {
     "sc_head_update",
     "wcoul0_source", "head_correction", "screening_method",
     "screening_diagrams",
-    "minimax_energy_reference",
-    "fermi_reference",
     "band_extrapolation_estimator",
     "band_extrapolation_bracket_scheme",
     "linalg",
@@ -2751,7 +2747,6 @@ def _input_response(
         occ_broadening_ev=float(params["occ_broadening"]),
         minimax_target_error=float(params["minimax_target_error"]),
         minimax_max_nodes=int(params["minimax_max_nodes"]),
-        minimax_energy_reference=str(params["minimax_energy_reference"]).strip().lower(),
         diagrams=coerce_screening_diagrams(params["screening_diagrams"]),
         ladder_probe_chunk=int(params["ladder_probe_chunk"]),
     )
@@ -2815,7 +2810,6 @@ def _input_response(
         cd_checkpoint=str(params["cd_checkpoint"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
         window_edge_factor=float(params["sigma_window_edge_factor"]),
-        fermi_reference=str(params["fermi_reference"]).strip().lower(),
         quadrature_eps=float(params["sigma_quadrature_eps"]),
         sigma_at_dft_energies=bool(params["sigma_at_dft_energies"]),
         omega_patches_ev=str(params["sigma_omega_patches_ev"]).strip(),
@@ -4189,7 +4183,6 @@ class ScreeningConfig:
     occ_broadening_ev: float      # BGW MP1 width; 0 keeps step occupations
     minimax_target_error: float
     minimax_max_nodes: int
-    minimax_energy_reference: str  # "midgap" | "vbm"
     diagrams: ScreeningDiagrams = ScreeningDiagrams.W_RPA
     # w_bse / w_rpa_resolvent only (both reach the ladder facade) —
     # ``bse.w_ladder.compute_wc_qwedge``'s public ``probe_chunk`` memory
@@ -4276,7 +4269,6 @@ class DynamicSigmaConfig:
     omega_step_ev: float
     regularization_ev: float
     window_edge_factor: float
-    fermi_reference: str
     sigma_at_dft_energies: bool
     #: Uniform denominator-box policy for dynamic Sigma quadrature.  The
     #: cache spelling is "auto" (run tmp), "off", or a deck-relative path.
@@ -4365,9 +4357,6 @@ class DynamicSigmaConfig:
                 f"{self.out_of_grid!r}.")
         self.parsed_omega_patches_ev()
         self.coarse_windows_ev()
-        if self.fermi_reference not in ("vbm", "midgap", "mp1_fixed_n"):
-            raise ValueError(
-                "fermi_reference must be 'vbm', 'midgap' or 'mp1_fixed_n'.")
         if not 0.0 < self.quadrature_eps < 1.0:
             raise ValueError("sigma_quadrature_eps must lie in (0, 1).")
         # REFUSE a retired or unrecognised estimator by name rather than
@@ -4877,19 +4866,11 @@ def validate_material_inputs(config, material_class):
                 "are always Fermi-Dirac (owner ruling 2026-09-17), and "
                 "Methfessel-Paxton or any other family refuses by name; "
                 "doc: docs/input_reference.md, occ_smearing_width_ry.")
-        if config.sigma.fermi_reference != "mp1_fixed_n":
-            raise ValueError(
-                "metallic WFN occupations require fermi_reference="
-                f"mp1_fixed_n (got {config.sigma.fermi_reference!r}).")
     else:
         if family is not None or width_ry is not None:
             raise ValueError(
                 "integer WFN occupations identify an insulator, so "
                 "occ_smearing_width_ry would be unused; remove it.")
-        if config.sigma.fermi_reference == "mp1_fixed_n":
-            raise ValueError(
-                "integer WFN occupations identify an insulator, which has "
-                "no fixed-N chemical potential; choose vbm or midgap.")
         if config.mpa.metal_origin_shift_ry is not None:
             raise ValueError(
                 "mpa_metal_origin_shift_ry is metal-only, but WFN "
@@ -5198,7 +5179,6 @@ class LorraxConfig:
         return MinimaxConfig(
             target_error=self.screening.minimax_target_error,
             max_nodes=self.screening.minimax_max_nodes,
-            energy_reference=self.screening.minimax_energy_reference,
         )
 
     @property

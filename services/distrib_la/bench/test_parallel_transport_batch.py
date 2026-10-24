@@ -25,7 +25,6 @@ sys_dim = 3
 bispinor = false
 wfn_file = WFN.h5
 occ_smearing_width_ry = 0.01
-fermi_reference = mp1_fixed_n
 ''')
         return target
     out = rank_session.stage(NA,prepare)
