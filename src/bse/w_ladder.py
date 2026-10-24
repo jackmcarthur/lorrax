@@ -699,6 +699,7 @@ def _deflation_for(matvec, diag_h, z, operands, rhs, *, rank: int):
 def compute_ladder_head(
     restart_path, z_list_ry, mesh_xy, *, input_file, head_dipole_path,
     head_n_occ, head_pref, gmres_tol, gmres_max_iter, include_w=True, data=None,
+    with_slope=False, with_moments=False,
 ):
     """Gamma-only micro-reducible tensor on the body's exact H backend.
 
@@ -736,7 +737,7 @@ def compute_ladder_head(
         max_iter=int(gmres_max_iter), tol=float(gmres_tol),
         arm=("micro_reducible_bse" if include_w
              else "micro_reducible_rpa_resolvent"),
-        delta_cvk=delta_cv)
+        delta_cvk=delta_cv, with_slope=with_slope, with_moments=with_moments)
 
 
 def compute_wc_qwedge(

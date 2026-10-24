@@ -329,7 +329,8 @@ def _check_compiled_actions_and_head():
             head_data = build_finite_q_data(head_data, (0, 0, 0), mesh, physical_branches=True)
             operator = build_head_operator(mesh, head_data, include_w=True)
             result = solve_head_tensor(operator, head_data, d_pair, points,
-                pref=pref, max_iter=48, tol=1e-12, delta_cvk=delta)
+                pref=pref, max_iter=48, tol=1e-12, delta_cvk=delta,
+                with_slope=True, with_moments=True)
             assert np.max(result.resids) < 2e-11
             H = dense(f, 0, direct=not zero, ring=not zero)['H']
             target = np.array([head_response(H, d, pref, z) for z in points])
@@ -344,6 +345,16 @@ def _check_compiled_actions_and_head():
             B = np.vstack([d, d.conj()])
             C = pref*np.hstack([d.conj().T, -d.T])
             np.testing.assert_allclose(measured, C@H@B, rtol=2e-11, atol=3e-14)
+            for index, point in enumerate(points):
+                R = np.linalg.inv(point*np.eye(len(H))-H)
+                expected_slope = C@R@R@R@B if point == 0 else -C@R@R@B/(2*point)
+                np.testing.assert_allclose(result.d_xi_ds[index], expected_slope,
+                                           rtol=8e-10, atol=3e-12)
+                np.testing.assert_allclose(result.xi_minus_z[index], target[index],
+                                           rtol=8e-10, atol=3e-12)
+            for power in range(4):
+                np.testing.assert_allclose(result.moments[f'M{power}'],
+                    C@np.linalg.matrix_power(H,power)@B/2, rtol=2e-11, atol=3e-14)
 
 
 def test_physical_density_and_head_oracles():

@@ -28,7 +28,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 
 from .bse_feast import ladder_matvec_operands, matvec_operands
-from .bse_w_exact import _get_block_gmres_solver
+from .bse_w_exact import _get_block_gmres_solver, _get_block_moment_actions
 from .w_ladder import build_ladder_resolvent
 from common.collectives import device_put_process_local, gather_to_host
 
@@ -404,6 +404,11 @@ class HeadTensorResult:
     arm: str
     operator_key: tuple
     pref: float
+    #: Optional exact even-s derivative/reflection, from the shared response actions.
+    d_xi_ds: np.ndarray | None = None
+    xi_minus_z: np.ndarray | None = None
+    #: Optional C H**j B / 2 tensors, j=0..3; these are high-frequency moments.
+    moments: dict | None = None
 
 
 def _rel_frob(a, b):
@@ -414,7 +419,8 @@ def _rel_frob(a, b):
 def solve_head_tensor(op: HeadOperator, data: dict, d_pair, z_values, *,
                       pref: float, max_iter: int = 200, tol: float = 1e-10,
                       rhs=None, arm: str = "", delta_cvk=None,
-                      resid_relative_to: str = "b") -> HeadTensorResult:
+                      resid_relative_to: str = "b", with_slope=False,
+                      with_moments=False) -> HeadTensorResult:
     """``Xi_ij(z)`` for every ``z`` in ``z_values``, one block-GMRES per ``z``.
 
     Rides ``bse_w_exact._get_block_gmres_solver`` verbatim — the body's stage-2
@@ -430,6 +436,11 @@ def solve_head_tensor(op: HeadOperator, data: dict, d_pair, z_values, *,
     path.  ``delta_cvk`` is the ``(nk, nc, nv)`` ``Delta`` that BUILT ``d``;
     supplying it turns ``delta_mismatch`` from ``nan`` into a measurement.
 
+    ``with_slope`` uses the body's exact resolvent actions, including R**3
+    at zero; residuals and iteration counts then cover every extra solve.
+    ``with_moments`` evaluates the common H-power actions once, not per z.
+    Both default off and preserve existing value-only callers.
+
     NO KRYLOV RECYCLING, deliberately: guide section 7D says "correctness does
     not depend on it".  Three right-hand sides and a handful of frequencies do
     not pay for a block-Krylov implementation, and the per-column scan
@@ -442,17 +453,21 @@ def solve_head_tensor(op: HeadOperator, data: dict, d_pair, z_values, *,
         rhs = build_head_rhs(d, sh, physical_branches=physical)
 
     solver = _get_block_gmres_solver(op.matvec, sh, max_iter, tol, rhs.dtype,
-                                     resid_relative_to, retain_branches=physical)
+                                     resid_relative_to, with_slope=bool(with_slope),
+                                     retain_branches=physical)
     operands = op.operands_fn(data)
 
     z_arr = np.atleast_1d(np.asarray(z_values, dtype=np.complex128))
     xi = np.zeros((z_arr.size, 3, 3), dtype=np.complex128)
     resids = np.zeros((z_arr.size, 3), dtype=np.float64)
     iters = np.zeros((z_arr.size, 3), dtype=np.int64)
+    slopes = np.zeros_like(xi) if with_slope else None
+    reflected = np.zeros_like(xi) if with_slope else None
 
     for iz, z in enumerate(z_arr):
-        s_all, res, it = solver(rhs, op.diag_h,
-                                jnp.asarray(z, dtype=jnp.complex128), operands)
+        solved = solver(rhs, op.diag_h,
+                        jnp.asarray(z, dtype=jnp.complex128), operands)
+        s_all, res, it = solved[:3]
         # Reuse the uploaded, pair-sharded d in the RHS; do not replicate a
         # host dipole constant or upload it again at every frequency.
         xi_z = project_head_response(rhs[0], s_all, pref=float(pref),
@@ -460,6 +475,18 @@ def solve_head_tensor(op: HeadOperator, data: dict, d_pair, z_values, *,
         xi[iz] = np.asarray(gather_to_host(xi_z))
         resids[iz] = np.asarray(gather_to_host(res))[:3]
         iters[iz] = np.asarray(gather_to_host(it))[:3]
+        if with_slope:
+            for target, name in ((slopes, "dWc_ds"), (reflected, "Wc_minus_z")):
+                target[iz] = np.asarray(gather_to_host(project_head_response(
+                    rhs[0], solved[3][name], pref=float(pref), physical_branches=physical)))
+
+    moments = None
+    if with_moments:
+        actions = _get_block_moment_actions(op.matvec, sh, rhs.dtype,
+                                            retain_branches=physical)(rhs, operands)
+        moments = {name: np.asarray(gather_to_host(project_head_response(
+            rhs[0], value, pref=float(pref), physical_branches=physical)))
+                   for name, value in actions.items()}
 
     asym = np.array([_rel_frob(x - x.T, x) for x in xi])
     anti_herm = np.array([_rel_frob(x - x.conj().T, x) for x in xi])
@@ -471,6 +498,7 @@ def solve_head_tensor(op: HeadOperator, data: dict, d_pair, z_values, *,
         xi=xi, z=z_arr, resids=resids, iters=iters, asym=asym,
         anti_herm=anti_herm, delta_mismatch=mismatch, arm=arm,
         operator_key=op.key, pref=float(pref),
+        d_xi_ds=slopes, xi_minus_z=reflected, moments=moments,
     )
 
 
