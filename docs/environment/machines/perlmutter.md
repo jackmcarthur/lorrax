@@ -7,12 +7,30 @@ LORRAX first ([Perlmutter installation](../../installation/perlmutter.md),
 which also gives the `srun` lines for a clone and a module); JAX and the GPU
 memory pool are in the [environment overview](../overview.md#gpu-pool).
 
-Perlmutter's GPU nodes carry four A100 40 GB or 80 GB cards; LORRAX runs
-there bare-host on CUDA 13.2 with JAX and JAXLIB 0.12.0.1. Certified scope: GPU
-runs on 1–4 nodes × 4 A100 at P = 4 and P = 16; CPU runs with `impl=mpi` on
-the Milan nodes (Cray MPICH 9.0.1), with collective exactness at P = 4 (one
-and two nodes) and P = 16 (four nodes), and a P = 4 GN-PPM GW run matching
-its reference Σ cell for cell. Larger CPU runs are not certified.
+Perlmutter's GPU nodes carry four A100 40 GB or 80 GB cards. The 2026-10-24
+JAX/JAXLIB 0.12.0.1 qualification covers the full GW/BSE hsuite at P = 4 on
+one A100-80 node and one Milan CPU node (`impl=mpi`, Cray MPICH 9.0.1),
+with cold and warm caches and unchanged references. The GPU source was
+`496985a8a`; the CPU source carried the same topology-key and live-buffer
+accounting fixes (jobs 60203773 and 60203776).
+
+Earlier qualifications include P = 16 on four GPU nodes, CPU collective
+exactness at P = 4 on one and two nodes and P = 16 on four nodes, and a P = 4
+GN-PPM run matching its reference Σ cell for cell. Those runs do not renew
+multi-node certification for the 0.12 upgrade.
+
+On released 0.12.0.1, a real shared-pole constructor at P = 64 on two CPU
+nodes (8 × 8 mesh, four physical cores per rank) still aborts in
+`MPI_Allgather` with inconsistent panel counts. The failing run used a fresh
+compile and authenticated inputs; this is not cleared by the P = 4 tests.
+Larger CPU runs, including the former P = 144 compiler/VMA limit, remain
+uncertified.
+
+The official CPU nightly pair `jax/jaxlib==0.12.1.dev20261023` passes that
+same P = 64 constructor from both a fresh compile and a fresh-process cache
+reload. Its XLA pin is `4dc8a9012437`; this is a bounded upstream-build
+comparison, not certification of a full P = 64 GW run or a default-lock
+change.
 
 ## GPU task geometry {#required-gpu-task-geometry}
 
