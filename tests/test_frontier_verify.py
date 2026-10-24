@@ -46,6 +46,7 @@ case "$*" in *"--leg rocm"*) exit "${PROBE_ROCM_RC:-0}";; esac
     assert "JAX_PLATFORMS=cpu" in steps[0] and "--leg\thost" in steps[0]
     assert "--leg\trocm" in steps[1]
     assert "-n4" in steps[2] and "--gpus-per-task=1" in steps[2]
+    assert not any(arg.startswith(("--gpu-bind", "--tres-bind")) for arg in steps[2].split("\t"))
     assert "JAX_PLATFORMS=rocm" in steps[2]
     assert f"{root}/tests/test_fourier_plan_xla_gate.py" in steps[2]
     log.unlink()

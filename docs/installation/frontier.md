@@ -138,9 +138,14 @@ Inside an active GPU allocation:
 ```bash
 cd /path/to/lorrax
 source config/frontier/gpu_env.sh
-srun -N 1 -n 4 -c 7 --gpus-per-task=1 --gpu-bind=closest \
+srun -N 1 -n 4 -c 7 --gpus-per-task=1 \
   python -u -m gw.gw_jax -i /path/to/run/gw.in
 ```
+
+The `--gpus-per-task=1` request supplies Slurm's `per_task:1` GPU binding,
+keeping one GCD assigned to each MPI process when CPU affinities share a
+NUMA domain. Keep this implicit binding; `--gpu-bind=closest` overrides it
+with proximity-based selection ([Slurm's `srun` reference](https://slurm.schedmd.com/srun.html#OPT_gpus-per-task)).
 
 Use one MPI process per visible GCD. Four processes form the tested 2 × 2
 mesh on half a Frontier node. A complete node has eight GCDs, but eight

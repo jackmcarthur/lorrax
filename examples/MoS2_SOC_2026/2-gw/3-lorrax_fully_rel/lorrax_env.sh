@@ -33,9 +33,9 @@ case "$lorrax_site" in
         lorrax_python_bin="$(command -v python)"
         lorrax_launch=(srun -N 1 -n 4 -c 7 --threads-per-core=1 --cpu-bind=cores)
         if [[ ${JAX_PLATFORMS:-} != cpu ]]; then
-            # Slurm assigns one MI250X GCD per rank; the CUDA selector is not
-            # involved. The tutorial uses four GCDs (half a Frontier node).
-            lorrax_launch+=(--gpus-per-task=1 --gpu-bind=closest)
+            # This also supplies Slurm's per_task binding: one GCD per rank.
+            # The tutorial uses four GCDs (half a Frontier node).
+            lorrax_launch+=(--gpus-per-task=1)
         fi
         ;;
     *)

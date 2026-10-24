@@ -54,7 +54,8 @@ srun -N1 -n1 -c7 --threads-per-core=1 --cpu-bind=cores --exclusive \
 srun -N1 -n1 -c7 --threads-per-core=1 --cpu-bind=cores --exclusive \
     env -u LORRAX_FFI_EXPECT_PEER_SO LORRAX_FFI_EXPECT_BACKENDS=phdf5,slate,kdft \
     bash "$LORRAX_ROOT/scripts/verify_ffi_build.sh" --leg rocm "$_rocm_so"
+# The GPU request supplies Slurm's per_task binding, one GCD per rank.
 srun -N1 -n4 -c7 --threads-per-core=1 --cpu-bind=cores --exclusive \
-    --gpus-per-task=1 --gpu-bind=closest env JAX_PLATFORMS=rocm \
+    --gpus-per-task=1 env JAX_PLATFORMS=rocm \
     "$VIRTUAL_ENV/bin/python" -u "$LORRAX_ROOT/tests/test_fourier_plan_xla_gate.py"
 echo "[frontier verify] PASS: artifact checks, pinned host FFTW and P4 GPU transforms."

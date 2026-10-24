@@ -204,9 +204,14 @@ Run a calculation inside the allocation:
 
 ```bash
 source config/frontier/gpu_env.sh
-srun -N 1 -n 4 -c 7 --gpus-per-task=1 --gpu-bind=closest \
+srun -N 1 -n 4 -c 7 --gpus-per-task=1 \
   python -u -m gw.gw_jax -i /path/to/run/gw.in
 ```
+
+`--gpus-per-task=1` also supplies Slurm's `per_task:1` binding, assigning one
+GCD to each MPI process. Keep that implicit binding; an explicit
+`--gpu-bind=closest` replaces it with proximity-based selection
+([Slurm reference](https://slurm.schedmd.com/srun.html#OPT_gpus-per-task)).
 
 This is a 2 × 2 mesh on four GCDs, one per MPI process. A Frontier node has
 eight GCDs, but eight processes are not a valid square mesh; sixteen form
