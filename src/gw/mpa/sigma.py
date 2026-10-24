@@ -1916,12 +1916,12 @@ def _integrate_sigma_batches(
             if len(band_counts) != len(brackets):
                 raise ValueError(
                     "MPA Sigma band_counts must align with band brackets")
-        # Format read by the sandbox parser (tools/parse_lorrax_sigma_run.py);
-        # every node now runs inside its window's executable, so none is
-        # left undispatched.
+        # Synthesis dispatches q sectors; elementwise MPA dispatches poles.
+        # Every node runs inside its window's executable, so none is left
+        # undispatched.
         log.info(
             f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
-            f"({n_poles} poles, batches of {batch_size}); "
+            f"({n_poles} {'q sectors' if synthesis else 'poles'}, batches of {batch_size}); "
             f"0 undispatched logical tau; "
             f"panes and product windows used one shared tau kernel")
         ratio = None
