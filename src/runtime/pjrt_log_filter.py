@@ -14,12 +14,21 @@ descriptor 2.  ``warnings.filterwarnings`` and replacing ``sys.stderr``
 cannot see it; raising ``TF_CPP_MIN_LOG_LEVEL`` would hide every C++ warning.
 This module instead forwards fd 2 through a small line filter and discards
 only the exact upstream-removed notice.  After every process has passed the
-explicit finalization barrier, it may additionally discard JAX 0.9.1's
-three-line ``WatchJobStateAsync`` shutdown receipt: rank zero emits
-``CANCELLED`` or an ``UNAVAILABLE`` connection-close variant when it
-deliberately closes the coordination service it owns.  The shutdown gate
-matters—an identical message during calculation is still forwarded.
-Every other byte is passed to the original descriptor unchanged.
+explicit finalization barrier, it may additionally discard the PJRT client's
+``WatchTasksAsync`` shutdown receipts (JAX 0.12; 0.9 called the watcher
+``WatchJobStateAsync`` and printed three lines).  Every rank's backend client
+watches the coordination service's task states; when rank zero deliberately
+closes the service it owns, each watcher reports ``CANCELLED`` once and then
+``UNAVAILABLE ... Connection refused`` on every retry, about once a second,
+until the process reaches ``os._exit`` (measured on Perlmutter, P = 4: 10-13
+receipts per process).  The watcher belongs to the backend client, which
+:func:`runtime.finalize_process` deliberately never destroys, so its receipts
+cannot be prevented, only recognized.  Each receipt is a block: the head line,
+the GRPC context line, the status detail, a source-location trace and a blank
+line; the trace and blank lines are dropped only inside a block that opened
+with an exact head line.  The shutdown gate matters: an identical message
+during calculation is still forwarded.  Every other byte is passed to the
+original descriptor unchanged.
 
 The filter owns fd 2 only while fd 2 still IS its pipe.  A harness may move fd
 2 under it (the hsuite chain points fds 1/2 at each stage's log and back while
@@ -52,17 +61,24 @@ _CONNECTION_REFUSED = (
     rb"ipv4:[0-9.]+:\d+: Failed to connect to remote host: Connection refused"
 )
 _CANCELLING_ALL_CALLS = rb"Cancelling all calls"
+_CLEAN_SHUTDOWN_STATUS = (rb"(?:CANCELLED: ?CANCELLED|UNAVAILABLE: ?(?:" + _CONNECTION_REFUSED +
+                          rb"|" + _CANCELLING_ALL_CALLS + rb"))")
 _CLEAN_SHUTDOWN_HEAD_LINE = re.compile(
     rb"W\d{4} \d{2}:\d{2}:\d{2}\.\d+ +\d+ "
-    rb"pjrt_client\.cc:\d+\] WatchJobStateAsync failed for task \d+: "
-    rb"(?:CANCELLED: CANCELLED|UNAVAILABLE: (?:" + _CONNECTION_REFUSED +
-    rb"|" + _CANCELLING_ALL_CALLS + rb"))\r?\n?\Z"
+    rb"pjrt_client\.cc:\d+\] WatchTasksAsync failed for task \d+: "
+    + _CLEAN_SHUTDOWN_STATUS
 )
 _CLEAN_SHUTDOWN_CONTEXT_LINE = (
     b"Additional GRPC error information from remote target "
     b"coordination_service while calling "
-    b"/tensorflow.CoordinationService/WatchJobState:"
+    b"/xla.coordination.CoordinationService/WatchTasks:"
 )
+_CLEAN_SHUTDOWN_DETAIL_LINE = re.compile(
+    rb":" + _CLEAN_SHUTDOWN_STATUS +
+    rb"(?: \[type\.googleapis\.com/tensorflow\.DerivedStatus=''\])?"
+)
+_TRACE_HEADER_LINE = b"=== Source Location Trace: ==="
+_TRACE_FRAME_LINE = re.compile(rb"[\w./+-]+\.(?:h|cc):\d+")
 
 
 def is_spurious_pjrt_version_notice(line: bytes) -> bool:
@@ -70,20 +86,26 @@ def is_spurious_pjrt_version_notice(line: bytes) -> bool:
     return _SPURIOUS_PJRT_LINE.fullmatch(line) is not None
 
 
-def is_clean_shutdown_notice(line: bytes) -> bool:
-    """Match one line of JAX's expected coordinator-close receipts."""
+def clean_shutdown_step(line: bytes, in_receipt: bool) -> tuple[bool, bool]:
+    """One line of JAX's coordinator-close receipts: ``(suppress, in_receipt)``.
+
+    A receipt opens only on an exact head line; inside one, its context,
+    detail and source-location lines are dropped, and the blank line that
+    ends it closes it.  Any other line closes it and is forwarded.
+    """
     stripped = line.rstrip(b"\r\n")
-    if (_CLEAN_SHUTDOWN_HEAD_LINE.fullmatch(line)
-            or stripped == _CLEAN_SHUTDOWN_CONTEXT_LINE):
-        return True
-    if not stripped.startswith(b":UNKNOWN:Error received from peer  {"):
-        return False
-    cancelled = (b"grpc_status:1" in stripped
-                 and b'grpc_message:"CANCELLED"' in stripped)
-    unavailable = (b"grpc_status:14" in stripped and (
-        re.search(_CONNECTION_REFUSED, stripped) is not None
-        or b'grpc_message:"Cancelling all calls"' in stripped))
-    return cancelled or unavailable
+    if _CLEAN_SHUTDOWN_HEAD_LINE.fullmatch(stripped):
+        return True, True
+    if not in_receipt:
+        return False, False
+    if not stripped:
+        return True, False
+    if (stripped == _CLEAN_SHUTDOWN_CONTEXT_LINE
+            or _CLEAN_SHUTDOWN_DETAIL_LINE.fullmatch(stripped)
+            or stripped.rstrip() == _TRACE_HEADER_LINE
+            or _TRACE_FRAME_LINE.fullmatch(stripped)):
+        return True, True
+    return False, False
 
 
 def _write_all(fd: int, payload: bytes) -> None:
@@ -116,6 +138,7 @@ class ExactPjrtNoticeFilter:
         self._started = False
         self._suppressed = 0
         self._clean_shutdown = False
+        self._in_receipt = False       # inside a clean-shutdown receipt block
         self._pipe_id: tuple[int, int] | None = None
 
     def _attached(self) -> bool:
@@ -208,9 +231,12 @@ class ExactPjrtNoticeFilter:
             self._clean_shutdown = True
 
     def _is_suppressed(self, line: bytes) -> bool:
-        return (is_spurious_pjrt_version_notice(line)
-                or (self._clean_shutdown
-                    and is_clean_shutdown_notice(line)))
+        if is_spurious_pjrt_version_notice(line):
+            return True
+        if not self._clean_shutdown:
+            return False
+        suppress, self._in_receipt = clean_shutdown_step(line, self._in_receipt)
+        return suppress
 
     def _forward(self, read_fd: int, saved_fd: int) -> None:
         pending = bytearray()
