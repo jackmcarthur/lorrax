@@ -41,6 +41,15 @@ above the deck's 13: the ζ fit's right window must have a measured upper gap,
 and the SC energy ladder (13 padded to 14 at P4) must hold the velocity's
 bands. The Na stages run in `run/na/`.
 
+Na's pristine `kin_ion.h5` is a fixed input beside its WFN and pseudopotential;
+metallic occupations and SC presets do not change this operator. It comes from
+the passing P4 suite at `496985a8a` (job 60203773), where its numeric members
+were compared with the former Na generator reference. `kin_ion_provenance.json`
+binds the three input files by SHA-256; staging refuses a changed file. The
+normal GW reader still checks the operator's spinor, band and k-storage
+contract. Na no longer tests the kinetic/ionic generator; the H2 two-component and
+four-component stages retain that coverage and their numerical references.
+
 ## The chain (`chain.py`)
 
 | stage | driver | option covered |
@@ -58,9 +67,13 @@ bands. The Na stages run in `run/na/`.
 | dipole_bisp | `psp.get_dipole_mtxels` | the four-component dipole the direct head authenticates |
 | bisp_sc | `gw.gw_jax` | `bispinor_gw = full_tangential` through the SC driver, 2 maps: fresh charge + transverse ζ (both on the charge centroid set), ordered CC/CT/TC/TT sector poles, direct four-current Γ head, `sc_head_update = dft_velocity`, live four-current density, the default band extrapolation (on the CC class); map 0 is the one-shot |
 | bse_bisp | `bse.bse_jax` | TDA Davidson after `bisp_sc` on the four-component restart: the final map's W0 = V + W_c,CC(0) (charge sector only) |
-| na_kin_ion | `gw.kin_ion_io` | bcc Na kinetic + ionic matrix elements; the 56 orbit-closed centroids (fitted on the ζ legs, 8 × 13) are stored in `fixture_na/` |
 | na_dipole | `psp.get_dipole_mtxels` | the default dipole: q→0 velocity plus the parallel-transport link artifact |
 | na_sc | `gw.gw_jax` | metal tangential QSGW, 2 maps to a 1.5 eV criterion, production defaults: Fermi-Dirac fixed-N occupations and metal head, `number_bands_protected = 8` (QP matrix 1–8, tail 9–13), 2s and 2p read on two coarse windows at η 5 eV, `sc_semicore = dft`, the rigid tail with min(Z, 1/Z) weights, spectral_shell extrapolation, held Σ windows re-planned on escape, `write_qsgw_datasets`, the unnamed `sc_head_update`, which resolves to `parallel_transport` (the 3³ links fail `GATE pt_head_window_hybridized`, so the map runs with the Σ term D_kΔH zeroed) with its per-map head block, distributed linalg |
+
+The default chain has 15 driver stages (60 rank records at P4). Na reads the
+fixed kinetic/ionic input; it is not counted as an executed or compared stage.
+Its 56 orbit-closed centroids (fitted on the ζ legs, 8 × 13) are also stored
+in `fixture_na/`.
 
 All stages run in one Python process per rank (`chain.run_stage` calls each
 driver's `main` in sequence): one `jax.distributed` world, one FFI load, one
@@ -119,6 +132,21 @@ the scalar restarted steps read.
 invocation (`lx run -N 1 -G 4 -n 4 -- python -m pytest tests/hsuite`) and the
 regenerate command.
 
+`--only` accepts driver-stage names from the table; unknown names, including
+the removed `na_kin_ion`, refuse rather than pass an empty selection. The Na
+chain alone is `--only na_dipole na_sc` and uses the same fixed input.
+`--regenerate` rewrites driver output references only, never the Na input.
+`reference/walls.json` is a historical regeneration receipt, not a current
+stage-count or timing assertion.
+
+To replace the fixed Na operator after an intentional WFN, pseudopotential or
+operator change, run `python -m gw.kin_ion_io -i na.in` separately in a staged
+Na directory on the qualified P4 stack. Review its provenance and pristine
+operator metadata, replace `fixture_na/kin_ion.h5`, update the three hashes
+and generating-run receipt in `kin_ion_provenance.json`, then run the suite
+against the unchanged downstream Na references. Do not regenerate those
+references merely to accept a changed input.
+
 ## Wall time and caches
 
 On one node at P4 the fixtures' arithmetic takes seconds; most of a run's wall
@@ -167,7 +195,8 @@ work and I/O.
 The opt-in stage `bisp_sc3` runs the `bisp_sc` deck on the face route for
 three maps (it ends unconverged by design and has no reference). Its check
 reads the SC maps' compile receipts: from map 2 on nothing compiles, and no
-program carries a host callback (which JAX's persistent cache never stores).
+program carries a host callback. JAX 0.12 can store callback programs in its
+persistent cache; the no-callback condition here checks the intended device path.
 Run it a second time on the same `--cache-dir` and its receipts show what a
 warm process still compiles.
 

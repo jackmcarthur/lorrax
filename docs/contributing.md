@@ -56,8 +56,9 @@ cell (two H atoms, three electrons, noncollinear with spin-orbit, time reversal
 broken) the chain is kmeans → kin_ion → dipole → gwjax GN-PPM one-shot → BSE →
 htransform → exciton bands, then restarted COHSEX, a tangential one-shot with
 its W and pole exports, and the four-component chain (kin_ion, dipole, 2-map
-`full_tangential` QSGW, BSE). On bcc Na 3³ it runs kin_ion, dipole and a
-2-map metal tangential QSGW at the production defaults. Each stage
+`full_tangential` QSGW, BSE). On bcc Na 3³ it reads the fixed pristine
+kinetic/ionic fixture, then runs dipole and a 2-map metal tangential QSGW at
+the production defaults: 15 driver stages, 60 rank records at P4. Each stage
 is checked on its outputs (eqp columns, the numeric members of the h5 files it
 writes, eigenvalue tables) against the stored
 references in `tests/hsuite/reference/`, and every rank log is scanned for

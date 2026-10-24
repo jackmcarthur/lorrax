@@ -11,8 +11,8 @@ in the order a user runs them:
               W and pole exports
            -> bispinor kin_ion, dipole -> four-current tangential QSGW
               (2 maps, fresh zeta; its map 0 is the one-shot)
-           -> bcc Na (run/na): kin_ion, dipole -> metal tangential QSGW
-              (2 maps, the production defaults)
+           -> bcc Na (run/na): fixed kin_ion input, dipole -> metal
+              tangential QSGW (2 maps, the production defaults)
 
 Each stage is then checked against the stored outputs in ``reference/``
 (eqp columns, numeric members of the written h5 files, solver outputs)
@@ -31,6 +31,7 @@ references.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -483,13 +484,12 @@ STAGES = (
     # bcc Na in run/na/.  Its centroids are stored in fixture_na/ (kmeans
     # is covered above): 56 orbit-closed points from `centroid.kmeans_cli 64
     # --seed 42 --oversample 1.5 --fit-window 0:8,0:13` (the zeta legs).
-    ("na_kin_ion", "gw.kin_ion_io", ["-i", "na.in"]),
     ("na_dipole", "psp.get_dipole_mtxels", ["-i", "na.in"]),
     ("na_sc", "gw.gw_jax", ["-i", "na.in"]),
 )
 
 # Stages that run in a subdirectory of the run (their own fixture).
-_STAGE_DIR = {name: NA_DIR for name in ("na_kin_ion", "na_dipole", "na_sc")}
+_STAGE_DIR = {name: NA_DIR for name in ("na_dipole", "na_sc")}
 
 # What each stage leaves behind and how it is compared.
 #   eqp: eqp files (column compare); h5: numeric members; rows: whitespace
@@ -516,7 +516,6 @@ CHECKS = {
                 "report_floats": ("bsc.out",
                                   r"SC iteration: call=\d+ .*?max\|dE\|=([0-9.e+-]+)")},
     "bse_bisp": {"stdout_floats": r"^\s*S\d+\s+([0-9.+-]+)\s*$"},
-    "na_kin_ion": {"h5": ["kin_ion.h5"]},
     "na_dipole": {"h5": ["dipole.h5"]},
     "na_sc": {"eqp": ["na_eqp0.dat", "na_eqp1.dat"],
               "h5": ["na_sigma.h5"],
@@ -574,12 +573,19 @@ def _env(cache_dir):
 
 
 def stage_fixture(run):
+    # Bind the fixed Na operator to its physical inputs, independently of
+    # metallic/SC settings. The loader checks representation and band extent.
+    provenance = json.loads((FIXTURE_NA / "kin_ion_provenance.json").read_text())
+    for name, wanted in provenance["sha256"].items():
+        if hashlib.sha256((FIXTURE_NA / name).read_bytes()).hexdigest() != wanted:
+            raise ValueError(f"hsuite Na fixture {name} differs from kin_ion_provenance.json")
     run.mkdir(parents=True, exist_ok=False)
     (run / NA_DIR).mkdir()
     for src, dst in ((FIXTURE, run), (FIXTURE_NA, run / NA_DIR)):
         for path in src.iterdir():
             shutil.copy2(path, dst / path.name)
             os.chmod(dst / path.name, 0o644)
+    write_na_deck(run / NA_DIR)
 
 
 def _centroid_file(run):
@@ -921,15 +927,26 @@ def _load(name):
 def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
               only=None):
     """Run every stage on every rank; return (walls, problems) on all ranks."""
+    if only is not None:
+        unknown = set(only) - {name for name, _module, _argv in STAGES}
+        if unknown:
+            raise ValueError(f"unknown hsuite stages: {', '.join(sorted(unknown))}; "
+                             "Na kin_ion is a fixed fixture input, not a stage")
     out = Path(out).resolve()
     run = out / "run"
     lead = rank_session._resolve_proc_id() == 0
     cache_dir = Path(cache_dir) if cache_dir else None
+    setup_error = None
     if lead:
-        stage_fixture(run)
-        if cache_dir is not None:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-    rank_session.exchange("staged")
+        try:
+            stage_fixture(run)
+            if cache_dir is not None:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            setup_error = repr(exc)
+    setup_error = rank_session.exchange(setup_error)[0]
+    if setup_error is not None:
+        raise RuntimeError(f"hsuite fixture setup failed: {setup_error}")
     # Host-side, before any device work: where every rank runs, and the
     # coordinator, so a later hang or node fault can be placed from the log.
     placements = rank_session.exchange(watchdog.placement())
@@ -945,8 +962,6 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
         where = run / _STAGE_DIR.get(name, "")
         if name == "kin_ion" and lead:
             write_decks(run)
-        if name == "na_kin_ion" and lead:
-            write_na_deck(where)
         if lead:
             for rel in _CLEAR_BEFORE.get(name, ()):
                 shutil.rmtree(run / rel, ignore_errors=True)
@@ -1001,7 +1016,7 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
     walls["total"] = time.monotonic() - t_all
     summary = {"walls_s": walls, "problems": problems, "regenerate": regenerate,
                "ranks": rank_session._resolve_proc_count(),
-               "rank_records": ranks, "compile_s": census,
+               "stage_count": len(ranks), "rank_records": ranks, "compile_s": census,
                "cache_dir": _cache_dir()}
     if LONE_FAILURE:
         # The others are blocked in a collective: no final join.
@@ -1024,7 +1039,8 @@ def main(argv=None):
                              "only the stages that have none (missing)")
     parser.add_argument("--cache-dir", default=None,
                         help="compile cache (default: <out>/jax-cache, cold)")
-    parser.add_argument("--only", nargs="*", default=None)
+    parser.add_argument("--only", nargs="*", default=None,
+                        choices=[name for name, _module, _argv in STAGES])
     args = parser.parse_args(argv)
     walls, problems = run_chain(args.out, regenerate=args.regenerate,
                                 cache_dir=args.cache_dir or Path(args.out) / "jax-cache",
