@@ -18,6 +18,12 @@ local prefix = "@PREFIX@"
 setenv("LORRAX_PREFIX", prefix)
 setenv("LORRAX_RUNTIME", "image")
 prepend_path("PATH", prefix .. "/bin")
+-- For lx, which reads these two from the base module: a site directory whose
+-- select_gpu.sh / in_container.sh enter the image through lorrax-run
+-- (install_image_module.sh), and the image tree's source on PYTHONPATH, which
+-- lx replaces with the checkout cwd is in.
+setenv("LORRAX_ROOT", "@STUB@")
+setenv("LORRAX_SHIFTER", "env PYTHONPATH=@TREE@/lorrax/src")
 
 -- gpu_env.sh, as it applies to an image runtime (it adds no cudart shim there).
 -- Slurm needs this before srun creates a step; existing numeric steps keep their
