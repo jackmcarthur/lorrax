@@ -42,6 +42,8 @@ printf '%s\\n' "$@" > "$PROBE_LOG"
         assert str(python) in args
         if site == "frontier":
             assert args[4:6] == ["-c", "7"]
+            assert args.count("--threads-per-core=1") == 1
+            assert "--cpu-bind=cores" in args
             assert ("--gpus-per-task=1" in args) == (platform != "cpu")
             assert not any(a.startswith(("--gpu-bind", "--tres-bind")) for a in args)
             assert not any("select_gpu" in a for a in args)
