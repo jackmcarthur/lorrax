@@ -97,7 +97,7 @@ Frequency integration of $\Sigma^c$.
 ### `screening_diagrams` {: .kw data-type="enum" data-default="w_rpa" }
 Diagrams summed by $W$: the RPA Dyson series, the ladder-corrected resolvent, or the RPA resolvent.
 
-`w_bse` runs one-shot under `cohsex`, `gn_ppm` and `tangential` on a time-reversal-symmetric insulating WFN; its physical R/A samples, slopes, moments and matched Γ head feed the shared-pole constructor on the last route. The elementwise `mpa` parent handoff and self-consistent ladder maps remain refused. `w_rpa_resolvent` serves `cohsex` and `gn_ppm` only. Both resolvent routes need an orbit-closed centroid set. See [the response and head conventions](theory.md#scr-w).
+`w_bse` runs one-shot under `cohsex` and `gn_ppm` (and [one other W model](../../theory/multipole-w.md#sigma)) on a time-reversal-symmetric WFN; `w_rpa_resolvent` under `cohsex` and `gn_ppm` only. Both need an orbit-closed centroid set.
 {: .kw-details }
 
 `w_rpa` `w_bse` `w_rpa_resolvent`

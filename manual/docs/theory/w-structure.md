@@ -35,23 +35,23 @@ $$
 W^c_\bq(z)=\phi\,(z-H_\bq)^{-1}\sigma\phi^\dagger=\sum_S\mathrm{sgn}(\Omega_S)\,\frac{b_S\,b_S^\dagger}{z-\Omega_S},\qquad b_S=\sum_{mn\bk}x_S^{mn\bk}\,\phi_{mn\bk\bq} \tag{2.2}
 $$
 
-Here $\phi$ collects the pair potentials as columns and only nonzero occupation differences are retained. $H_\bq$ is generally not Hermitian in the Euclidean inner product. In a stable system its eigenvectors can be normalized by $x_S^\dagger\sigma^{-1}x_{S\prime}=\mathrm{sgn}(\Omega_S)\delta_{SS\prime}$; (2.2) uses this metric normalization. For integer occupations the metric reduces to the resonant/antiresonant signature. Spin weights and cell/k-point normalizations are suppressed here; the implementation includes them in its matched vertices and prefactors. Each neutral excitation $S$ of the system contributes one pole, and its residue is the outer product of the potential $b_S$ of its transition density [1, 2]. The plasmon of a plasmon-pole model is one such excitation, or a weighted average over many of them.
+where $\phi$ collects the pair potentials as columns and $(\Omega_S,x_S)$ are the eigenpairs of $H_\bq$. Each neutral excitation $S$ of the system contributes one pole, and its residue is the outer product of the potential $b_S$ of its transition density [1, 2]. The plasmon of a plasmon-pole model is one such excitation, or a weighted average over many of them.
 
 ## <span class="n">3</span> Positivity and moments {: #positivity }
 
-With time reversal, the antiresonant transitions mirror the resonant ones and $W^c$ depends on $z$ only through $s=z^2$. For the integer-occupation RPA in a transition basis with the two time-reversed branches matched, let $\Delta$ contain the positive transition energies and $K$ their Coulomb integrals. The reduction to $N_t$ resonant transitions is
+With time reversal, the antiresonant transitions mirror the resonant ones and $W^c$ depends on $z$ only through $s=z^2$. On the $N_t$ resonant transitions, with $\Delta$ their energies and $K$ their Coulomb integrals,
 
 $$
 W^c_\bq(s)=F^\dagger\,(s-C_\bq)^{-1}F,\qquad C_\bq=\Delta^{1/2}(\Delta+2K)\Delta^{1/2},\qquad F=\sqrt2\,\Delta^{1/2}\phi^\dagger \tag{3.1}
 $$
 
-$C_\bq$ is Hermitian and positive for $\Delta>0$ and positive semidefinite Coulomb $K$, with eigenvalues $\Omega_S^2$. A changed Hamiltonian, including the attractive ladder, needs its own stability check; an electronic band gap alone does not establish ladder stability. Three properties follow directly. The poles in $s$ are real and lie between the smallest and the largest $\Omega_S^2$. Every residue is positive semidefinite, so $-W^c$ is a matrix Stieltjes function of $-s$. The expansion in $1/s$ gives the exact high-frequency moments,
+$C_\bq$ is Hermitian and, for an insulator, positive definite, with eigenvalues $\Omega_S^2$. Three properties follow directly. The poles in $s$ are real and lie between the smallest and the largest $\Omega_S^2$. Every residue is positive semidefinite, so $-W^c$ is a matrix Stieltjes function of $-s$. The expansion in $1/s$ gives the exact high-frequency moments,
 
 $$
 W^c_\bq(z)=\frac{2M_1}{z^2}+\frac{2M_3}{z^4}+\dots,\qquad M_1=\phi\Delta\phi^\dagger,\qquad M_3=\phi\Delta^{1/2}C_\bq\Delta^{1/2}\phi^\dagger \tag{3.2}
 $$
 
-$2M_1$ is the high-frequency oscillator-strength weight of the selected band window. Neither RPA moment requires a Dyson solve. Real positive squared poles and positive residues preserve this stable-response structure, but they do not by themselves bound the approximation error between sampled frequencies. With a ladder kernel, the moments instead come from the matched full Hamiltonian as $M_1=\mathcal C H\mathcal B/2$ and $M_3=\mathcal C H^3\mathcal B/2$ in (4.1); (3.1) and (3.2) are the RPA reduction, not a replacement for those ladder actions.
+$2M_1$ is the $f$-sum weight. Neither moment requires a Dyson solve. An approximation of $W^c$ that keeps real poles, positive residues and these moments is physical by construction.
 
 ## <span class="n">4</span> W as a transfer function {: #transfer }
 
@@ -61,7 +61,7 @@ $$
 W^c_\bq(z)=\mathcal C\,(z-\mathcal A)^{-1}\mathcal B,\qquad \mathcal C=\phi,\quad \mathcal A=H_\bq,\quad \mathcal B=\sigma\phi^\dagger \tag{4.1}
 $$
 
-$N_t$ runs to millions in a converged GW calculation, so $H_\bq$ cannot be diagonalized. A value of $W^c$ at one complex $z$ can nevertheless be computed without storing $H_\bq$. The Coulomb term of (2.1) has rank at most $N_\mu$, and the Woodbury identity reduces the resolvent to the $N_\mu\times N_\mu$ Dyson solve (1.1). One such sample, applied to a chosen vector $r$ on the points, is the action of the resolvent on the known vector $\sigma\phi^\dagger r$ read out through $\phi$. Samples of $W$ therefore probe $H_\bq$ through its resolvent, without the matrix ever being formed. This small Dyson reduction applies to the RPA kernel. The statically screened direct ladder instead uses matrix-free Krylov solves; its cost depends on the actual iterations and requested actions.
+$N_t$ runs to millions in a converged GW calculation, so $H_\bq$ cannot be diagonalized. A value of $W^c$ at one complex $z$ is nevertheless cheap. The Coulomb term of (2.1) has rank at most $N_\mu$, and the Woodbury identity reduces the resolvent to the $N_\mu\times N_\mu$ Dyson solve (1.1). One such sample, applied to a chosen vector $r$ on the points, is the action of the resolvent on the known vector $\sigma\phi^\dagger r$ read out through $\phi$. Samples of $W$ therefore probe $H_\bq$ through its resolvent, without the matrix ever being formed.
 
 ## <span class="n">5</span> Products with the particle–hole Hamiltonian {: #products }
 
@@ -106,3 +106,4 @@ The resolvent form (2.2) and the low cost of both samples and products lead to t
 2. G. Strinati, Riv. Nuovo Cimento 11, 1 (1988). doi:10.1007/BF02725962
 3. M. E. Casida, in *Recent Advances in Density Functional Methods, Part I*, edited by D. P. Chong (World Scientific, 1995), p. 155. doi:10.1142/9789812830586_0005
 4. A. C. Antoulas, C. A. Beattie and S. Gugercin, *Interpolatory Methods for Model Reduction* (SIAM, 2020). doi:10.1137/1.9781611976083
+

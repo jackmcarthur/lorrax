@@ -44,7 +44,7 @@ For many-band runs, inspect the wavefunction route too. A two-axis distribution 
 
 ## Local or distributed linear algebra {: #linalg }
 
-The deck key `linalg` (default `local`) requests the layout of dense solves. Under `local` each GPU solves whole $N_\mu\times N_\mu$ matrices for its share of the irreducible q points, with no distributed factorization. On CUDA, `distributed` can factor each matrix over the whole mesh through cuSOLVERMp, dividing its leading storage by $P$ while communicating inside every factorization. Provider availability differs by platform: Frontier currently has whole-matrix ROCm LU, while its ELPA eigensolver can use the whole mesh.
+The deck key `linalg` (default `local`) requests the layout of dense solves. Under `local` each GPU solves whole $N_\mu\times N_\mu$ matrices for its share of the irreducible q points, with no distributed factorization; under `distributed` each matrix is factored over the whole mesh (cuSOLVERMp), which divides its memory by $P$ but communicates inside every factorization.
 
 `local` is a request, not a guarantee. For a W Dyson batch of $Q$ stored q rows, the local-route model includes the face-tiled V, χ and W plus whole copies for $\lceil Q/P\rceil$ q points and one LU pair,
 
@@ -52,7 +52,7 @@ $$
 \frac{48\,QN_\mu^2}{P} + 16N_\mu^2\left(3\lceil Q/P\rceil + 2\right)\ \text{bytes per GPU},
 $$
 
-where $Q$ is the actual batch width, distinct from the full k-grid normalization. Provider workspace and live allocations also enter the admission decision. The local route runs when it fits; otherwise the service can use distributed LU when that provider is available. Frontier refuses a solve that cannot fit its whole-matrix LU and reports the required room. Eigensolves choose between available whole-matrix and whole-mesh providers by fit and modelled speed. The choice prints once as `route W Dyson …: local` (or `distributed`) and appears in the report's Routes table.
+where $Q$ is the actual batch width, distinct from the full k-grid normalization. Provider workspace and live allocations also enter the admission decision. The local route runs when it fits; otherwise the service can use the distributed LU. Eigensolves choose the same way between whole matrices per GPU and the whole-mesh eigensolver, by fit and modelled speed. The choice prints once as `route W Dyson …: local` (or `distributed`) and appears in the report's Routes table.
 
 More ranks divide face storage and can reduce the number of whole matrices assigned to a rank. Independent whole-matrix solves can be faster when they fit; distributed solves are useful when one matrix and its workspace are too large. Read the selected route in the report rather than inferring it from the deck alone.
 

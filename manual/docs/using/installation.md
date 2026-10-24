@@ -116,9 +116,6 @@ source $SCRATCH/lorrax/lorrax-env.sh
 srun -N 1 -n 4 --gpus-per-node=4 lorrax-run python -u -m gw.gw_jax -i gw.in
 ```
 
-!!! note "Before the next merge to main"
-    The script is on the branch `claude/robust-install`. Until it reaches `main`, download it from `https://raw.githubusercontent.com/jackmcarthur/lorrax/claude/robust-install/config/perlmutter/install_deps.sh` and add `--ref claude/robust-install`. GitHub serves a cached copy of a file for about 5 minutes after a push; a commit SHA in place of the branch name avoids that.
-
 Step 1 prints the exact `salloc` line of step 2 with your `_g` account filled in. Step 2 prints `INSTALL VERIFIED`; until it has, the startup block of every GPU run warns `INSTALL NOT VERIFIED`. Step 3 is how every [driver](../drivers/gw/index.md) is launched from this install: `lorrax-run` in front of `python`.
 
 #### Why a runtime image {: #perlmutter-image }
