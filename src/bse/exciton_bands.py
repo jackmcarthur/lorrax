@@ -867,26 +867,41 @@ def apply_q_per_segment(params, q_per_segment, log=log.debug) -> int:
 
 
 def require_zeta_for_interp(restart_file, vq_mode, kgrid) -> str:
-    """The ζ file the off-grid exchange needs — or a refusal that explains it.
+    """Check exchange storage before constructing the path wavefunctions.
 
-    ANNOUNCE OR REFUSE, BEFORE h5py GETS TO SAY IT ITS WAY.
-    ``vq_interp.build_vq_evaluator`` looks for ``zeta_q.h5`` beside the
-    restart, and a missing one is not an exotic condition: it is what EVERY
-    downfolded bundle written before 2026-08-10 looks like, and what one
-    whose parent's ζ was stored on the q-IBZ wedge still looks like.  The
-    bare ``OSError`` from that path names a file and nothing else — no hint
-    that the absence is a downfold consequence, and no hint that
-    ``--vq-mode=ongrid`` needs no ζ at all.  Third of the three ways this
-    driver failed on a downfolded bundle (PIPELINE_HEALTH.md, 2026-08-10).
-
-    A separate function rather than an inline block so the refusal can be
-    gated without a solve — same reason ``rerun_check_enabled`` is one.
+    Interpolation consumes full-BZ ζ rows; refit uses the stored fit metadata
+    and permits IBZ rows. Inspect only scalar/header counts here, leaving the
+    existing payload and fit-identity gates with their owners.
     """
     if vq_mode == "ongrid":
         return ""
     path = os.path.join(os.path.dirname(os.path.abspath(restart_file)),
                         "zeta_q.h5")
     if os.path.isfile(path):
+        from file_io.isdf_header import read_zeta_storage_metadata
+        storage = read_zeta_storage_metadata(path)
+        grid = tuple(int(v) for v in kgrid)
+        if storage['kgrid'] != grid:
+            raise SystemExit(
+                f"exciton_bands: ζ grid {storage['kgrid']} differs from the "
+                f"coarse WFN grid {grid}: {path}")
+        if not storage['complete']:
+            raise SystemExit(f"exciton_bands: incomplete ζ file: {path}")
+        if storage['layout'] != 'G_flat':
+            raise SystemExit(
+                f"exciton_bands: exchange requires G_flat ζ storage: {path}")
+        full = int(np.prod(grid))
+        if storage['n_q'] > full:
+            raise SystemExit(
+                f"exciton_bands: ζ has {storage['n_q']} rows for a {full}-q grid: {path}")
+        if vq_mode in ('interp', 'both') and storage['n_q'] != full:
+            raise SystemExit(
+                f"exciton_bands: --vq-mode={vq_mode} requires full-BZ ζ "
+                f"storage, but {path} contains {storage['n_q']} of {full} q "
+                "rows. Use --vq-mode=refit for an IBZ-stored producer "
+                "(choose --refit-window=bse for the deck's fitted window), "
+                "or --vq-mode=ongrid for stored coarse-grid exchange tiles. "
+                "No path wavefunctions have been constructed.")
         return path
     prov = None
     try:
@@ -897,14 +912,12 @@ def require_zeta_for_interp(restart_file, vq_mode, kgrid) -> str:
     nx, ny, nz = (int(v) for v in kgrid)
     raise SystemExit(
         f"exciton_bands: --vq-mode={vq_mode} builds the exchange tile at "
-        f"arbitrary Q by interpolating the stored zeta, and there is no "
+        f"arbitrary Q using the stored zeta fit, and there is no "
         f"{path}.\n"
         + ("  This bundle is a DOWNFOLD.  gw.downfold_cli transports zeta "
            "into the small basis (zeta_S = conj(T[q]) zeta_L) and writes it "
            "beside the bundle, so a bundle without one was either written "
-           "before that existed or has a PARENT whose zeta is stored on the "
-           "q-IBZ wedge — which vq_interp refuses on the parent too, so "
-           "--vq-mode=interp is unavailable on this lineage.  Use "
+           "before that existed or lacks its parent's zeta fit. Use "
            "--vq-mode=ongrid for the retained grid.\n"
            if prov is not None else
            "  The GW run that wrote this bundle left no zeta_q.h5 beside it "
@@ -945,14 +958,15 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
     at 7449ece0: one place resolves the extent, everything else asserts
     against it rather than re-deriving it.)
 
+    This consumes the bundle's ψ/energy buffers. Drop its unused transposed
+    X copy before allocating the stacks; donate Y and energies whenever the
+    output extents permit aliasing. Only one ψ input is donated, including
+    when the two incoming layouts alias on a one-device mesh.
+
     Returns (psi_cQ_X, psi_cQ_Y, eps_cQ):
         psi_cQ_[XY]: (nQ, nk, nc_pad, ns, n_rmu_pad), μ on x / y
         eps_cQ:      (nQ, nk, nc_pad) — pad bands at +PAD_EPS_GUARD_RY
     """
-    x5 = NamedSharding(mesh_xy, P(None, None, None, None, "x"))
-    y5 = NamedSharding(mesh_xy, P(None, None, None, None, "y"))
-    rep = NamedSharding(mesh_xy, P())
-
     n_rmu_src = int(bundle.psi_rmu_Y.shape[-1])
     if n_rmu_src != int(n_rmu):
         raise ValueError(
@@ -965,10 +979,29 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
               f"from (a downfolded bundle records the parent's path in its "
               f"downfold_provenance group).")
 
-    @partial(jax.jit, out_shardings=(x5, y5, rep))
+    shape = (nQ, nk, n_cond, int(bundle.psi_rmu_Y.shape[2]), n_rmu)
+    if n_cond_pad < n_cond or n_rmu_pad < n_rmu:
+        raise ValueError("conduction stack padding cannot shrink bands or centroids")
+    program = _conduction_stack_program(mesh_xy, shape, (n_cond_pad, n_rmu_pad))
+    psi, eps = bundle.psi_rmu_Y, bundle.enk_full
+    bundle.psi_rmuT_X = bundle.psi_rmu_Y = bundle.enk_full = None
+    return program(psi, eps)
+
+
+def _conduction_stack_program(mesh_xy, shape, padded):
+    """Geometry-only reshape/pad program; captures no bundle or arrays."""
+    nQ, nk, n_cond, ns, n_rmu = shape
+    n_cond_pad, n_rmu_pad = padded
+    x5 = NamedSharding(mesh_xy, P(None, None, None, None, "x"))
+    y5 = NamedSharding(mesh_xy, P(None, None, None, None, "y"))
+    rep = NamedSharding(mesh_xy, P())
+    donate = ((0,) if padded == (n_cond, n_rmu) else ())
+    if n_cond_pad == n_cond:
+        donate += (1,)
+
+    @partial(jax.jit, out_shardings=(x5, y5, rep), donate_argnums=donate)
     def _stacks(psi, eps):
-        ns = psi.shape[2]
-        psi = psi.reshape(nQ, nk, n_cond, ns, n_rmu_src)
+        psi = psi.reshape(shape)
         eps = eps.reshape(nQ, nk, n_cond)
         psi = jnp.pad(psi, ((0, 0), (0, 0), (0, n_cond_pad - n_cond),
                             (0, 0), (0, n_rmu_pad - n_rmu)))
@@ -976,7 +1009,7 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
                       constant_values=PAD_EPS_GUARD_RY)
         return psi, psi, eps
 
-    return _stacks(bundle.psi_rmu_Y, bundle.enk_full)
+    return _stacks
 
 
 def _gate_stats_on_device(
@@ -1708,6 +1741,7 @@ def main(argv=None):
             "eigh", mesh_xy, backend=args.eigh_backend, n=None,
             batched_route=args.distrib_la_batched_route)
         restart_file = _find_restart_file(args.input)
+        zeta_path = require_zeta_for_interp(restart_file, args.vq_mode, wfn.kgrid)
         report.environment(wfn=wfn, lines=(
             f"Restart tensors: {abs_path(restart_file)}",
             "Transition data: distributed band and centroid blocks on X x Y",
@@ -1915,12 +1949,11 @@ def main(argv=None):
             bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
         continuum_ry = _continuum_threshold_ry(
             eps_cQ, data["eps_v"], n_val=n_val, n_cond=n_cond)
-        # Everything the htransform produced is now copied into the conduction
-        # stacks and nothing below reads it again.  Drop it before the V_Q model
+        # The htransform's buffers have now moved into the conduction
+        # stacks. Drop the remaining bundle metadata before the V_Q model
         # build: ``vq_interp.build_cq`` now returns C_q as a (μ, ν)-face SHARDED
         # device array (no per-proc host gather), but the coarse ζ / P_R
         # intermediates it builds still want the htransform leftovers gone.
-        # ``bundle`` alone is ψ at every (Q, k) in both shardings.
         del bundle, ctilde, B_at_mu, enk_sigma
         tick("htransform_psi_cQ", t0)
 
@@ -2032,8 +2065,6 @@ def main(argv=None):
                         else bool(params.get("head_minibz_average", False)))
             log(f"  arbitrary-Q head: {'mini-BZ cell average' if head_mbz else 'point value'} "
                 f"(head_minibz_average={head_mbz})")
-            zeta_path = require_zeta_for_interp(restart_file, args.vq_mode,
-                                                (nkx, nky, nkz))
             if pure_refit:
                 # NO interpolation model is built at all.  The b26p long-range fit
                 # is the slab-only half of vq_interp; the refit path fits ζ at the

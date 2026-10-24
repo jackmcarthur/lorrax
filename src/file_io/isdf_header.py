@@ -70,6 +70,34 @@ from .wfn_basis import (
 _GROUP = 'isdf_header'
 
 
+def read_zeta_storage_metadata(path: str | Path) -> dict:
+    """Read only the grid, completion flag and ζ dataset geometry.
+
+    Unlike the full header reader, this never reads centroid or G-vector
+    tables, or ζ coefficients. It is suitable for a storage preflight before
+    allocating wavefunction caches. Legacy completion/layout defaults match
+    :class:`IsdfHeader`.
+    """
+    with h5.File(str(path), 'r') as f:
+        grid = np.asarray(f['mf_header/kpoints/kgrid'][()], dtype=np.int64)
+        if grid.shape != (3,) or np.any(grid <= 0):
+            raise ValueError(f"invalid ζ kgrid {grid.tolist()} in {path}")
+        group = f[_GROUP]
+        layout = group['zeta_layout'][()] if 'zeta_layout' in group else 'r_space'
+        if isinstance(layout, bytes):
+            layout = layout.decode('utf-8')
+        dataset = {'G_flat': 'zeta_q_G', 'r_space': 'zeta_q'}.get(str(layout))
+        if dataset is None:
+            raise ValueError(f"unsupported ζ layout {layout!r} in {path}")
+        shape = f[dataset].shape
+        if len(shape) != 3 or any(n <= 0 for n in shape):
+            raise ValueError(f"invalid {dataset} shape {shape} in {path}")
+        return dict(kgrid=tuple(int(n) for n in grid), layout=str(layout),
+                    n_q=int(shape[0]),
+                    complete=(bool(group['zeta_is_done'][()])
+                              if 'zeta_is_done' in group else True))
+
+
 @dataclass(frozen=True)
 class IsdfHeader:
     density: str                 # 'scalar' | 'current' | 'mu_L=<int>' | 'unknown'
@@ -359,6 +387,7 @@ __all__ = [
     'IsdfHeader',
     'WavefunctionBasisReceipt',
     'bind_isdf_attrs',
+    'read_zeta_storage_metadata',
     'write_isdf_header',
     'mark_zeta_done',
     'stamp_fit_provenance',
