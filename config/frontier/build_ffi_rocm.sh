@@ -48,8 +48,10 @@ _build_elpa() {
                 LORRAX_ELPA_ROOT LORRAX_ELPA_GFX LORRAX_ELPA_OPENMP LORRAX_ELPA_MAKE_J; do
         [[ -z "${!name+x}" ]] || child+=("$name=${!name}")
     done
-    env -i "${child[@]}" bash --noprofile --norc -c \
-        'source "$0" >/dev/null 2>&1; exec bash "$@"' \
+    # $0 stays "bash" and the startup flags stay default: Frontier's profile
+    # scripts detect the shell from them and skip Lmod otherwise.
+    env -i "${child[@]}" bash -c \
+        'p=$1; shift; source "$p" >/dev/null 2>&1; exec bash "$@"' bash \
         "${LORRAX_OLCF_SYSTEM_PROFILE:-/etc/profile}" \
         "$ROOT/config/frontier/build_elpa_hip.sh" "$@"
 }
