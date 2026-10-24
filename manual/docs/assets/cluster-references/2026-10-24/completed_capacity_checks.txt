@@ -5,7 +5,7 @@ reused authenticated kinetic/ionic/dipole preparation, Slurm wait and allocation
 startup. Cache histories differ; no controlled cold/warm scaling series.
 
 Cr80 P4: source 3a3aee27cab873087e93c67ada81edb10a0b369c
-  Active GPUs/nodes: 4/1; mesh [2, 2]
+  Active GPUs/nodes: 4/1; allocated GPUs: 4; mesh [2, 2]
   Physical/packed mu: 23700/23700; band carrier 2370
   Total 2481.21 s; pool-used 76.87 GB/rank; host 32.51 GB/rank
   Stages (seconds): {"isdf": 544.43, "qp": 3.1, "screening": 575.2, "self_energy": 1350.3, "setup": 8.06, "tau_sweep": 1297.25}
@@ -14,7 +14,7 @@ Cr80 P4: source 3a3aee27cab873087e93c67ada81edb10a0b369c
   Canonical comparison SHA256 0b9893bf2b48a4f05ce9a0ac64d0c6e8d08720d3d588daa96eaf8b6e876ed173
 
 Cr80 P9: source 3a3aee27cab873087e93c67ada81edb10a0b369c
-  Active GPUs/nodes: 9/3; mesh [3, 3]
+  Active GPUs/nodes: 9/3; allocated GPUs: 12; mesh [3, 3]
   Physical/packed mu: 23700/23706; band carrier 2370
   Total 1388.43 s; pool-used 57.05 GB/rank; host 19.81 GB/rank
   Stages (seconds): {"isdf": 330.73, "qp": 3.27, "screening": 434.37, "self_energy": 612.2, "setup": 7.71, "tau_sweep": 594.73}
