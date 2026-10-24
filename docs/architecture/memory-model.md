@@ -569,7 +569,12 @@ and the static (COHSEX) and PPM spatial kernels.
 equal windows of `R` rows (`subtile_stream.plan_windows`, through
 `plan_passes` on the χ streams): `R` is the orbit-aligned row count nearest
 the fixed tile, and every window ends on an admissible orbit cut. The
-windows run as one `lax.scan` (`scan_passes`, `stream_passes`). Each slices
+windows run as one `lax.scan` (`scan_passes`, `stream_passes`). The tiny
+three-int32 pass descriptors are
+barriered as a complete table before their indexed reads. This keeps the GPU
+small-loop compiler from trying to evaluate a scalar optimization barrier on
+a constant schedule; the protected read and bounded row-window lifetime stay
+the same. Each window slices
 its rows at a traced offset (`window_rows`); its unfold tables are cut from
 the tables placed once per run, on the device (`window_load`, the one
 table-cut owner); and the k-convolutions see only its live rows `[lo, hi)`

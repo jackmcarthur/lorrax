@@ -259,6 +259,18 @@ def window_green_rows(rows, mesh, s=None, R=None):
     return jnp.transpose(rows, (0, 2, 1, 3))
 
 
+def _window_table(windows):
+    """Keep the tiny pass schedule opaque before any counter-indexed read.
+
+    XLA's GPU small-loop transform otherwise tries to evaluate the inner
+    scalar barrier while specializing a constant schedule (JAX 0.12), which
+    its HloEvaluator refuses. The outer barrier keeps that table a runtime
+    value; the inner read barrier still protects the R82 read ordering.
+    The table has only three int32 entries per row pass, never matrix data.
+    """
+    return jax.lax.optimization_barrier(jnp.asarray(np.asarray(windows, np.int32)))
+
+
 def scan_passes(windows, step, carry):
     """``carry = step(s, lo, hi, carry)`` over every window (:func:`plan_windows`) in one ``lax.scan``.
 
@@ -266,7 +278,7 @@ def scan_passes(windows, step, carry):
     is one body whatever the pass count, and one window's temporaries are live
     at a time.
     """
-    table = jnp.asarray(np.asarray(windows, np.int32))
+    table = _window_table(windows)
 
     def body(c, w):
         # Read behind a barrier: a counter-indexed slice must not be
@@ -364,7 +376,7 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows, prepare, only
     live_outputs = jnp.max(jnp.where(jnp.any(weights != 0, axis=(0, 2)),
                                      jnp.arange(1, n_out + 1, dtype=jnp.int32), 0)).astype(jnp.int32)
     spec_c = P(None, None, "x", "y")
-    table = jnp.asarray(np.asarray(plan.windows, np.int32))
+    table = _window_table(plan.windows)
 
     def window_body(acc, window, segment):
         blocks = segment_blocks(plan, 0, 0)[0] if segment else plan.blocks
