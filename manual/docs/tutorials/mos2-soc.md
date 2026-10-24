@@ -105,7 +105,7 @@ The exported dimensions therefore match, while the screening bases differ.
 
 ## Exciton bands {: #exciton-bands }
 
-The final LORRAX stage solves the finite-momentum BSE along Γ–M–K–Γ:
+The final LORRAX stage follows finite-momentum excitons along Γ–M–K–Γ:
 
 ```bash
 cd 3-bse/3-lorrax_fully_rel/3-exciton-bands
@@ -115,60 +115,37 @@ source ../../../2-gw/3-lorrax_fully_rel/lorrax_env.sh
 lorrax_python 02-plot_exciton_bands.py --near-gamma-prefix near_gamma
 ```
 
-The [exciton-bands driver](../drivers/exciton-bands/index.md) uses the
-same native GW restart as the optical calculation. H-transform interpolation
-supplies the conduction states at k + Q; the hole remains at k. Its
-Γ-centered 24 × 24 × 1 grid samples the electron-hole sum, while screening
-and the QP Hamiltonian still originate on the 3 × 3 × 1 coarse grid.
-The 25-point full path has four steps from Γ to `(0.05, 0, 0)`, seven to M,
-six to K and seven back to Γ. Its 256 roots use a 0.25 meV Davidson residual
-budget. The separate eight-root scan uses 0.01 meV, eight steps from Γ to
-`(0.003, 0, 0)` and twelve more to `(0.06, 0, 0)`, followed by K as an
-on-grid certification anchor. All Q
-coordinates are fractional reciprocal coordinates. The plot's near-Γ panel
-keeps only the portion within 0.12 Å⁻¹, excluding that distant anchor.
-Both scans reuse the same coarse QP data. Smoother momentum sampling does
-not establish convergence of the coarse screening or the integration grid.
+Both scans retain six valence and eight conduction bands on a Γ-centered
+24 × 24 × 1 integration grid. H-transform interpolation supplies the electron
+at k + Q; the hole remains at k. Screening and the QP Hamiltonian still come
+from the same 3 × 3 × 1 coarse calculation.
 
-Use a regular four-GPU allocation and allow roughly three hours for the full
-path, plus the near-Γ scan. The completed near-Γ run took 25 min 37 s from
-a cold launch on four Frontier GPU ranks; the full-path allowance is a
-planning estimate and will vary by machine.
+The 25-point full path uses 256 roots and a 0.25 meV Davidson residual budget:
+four steps from Γ to `(0.05, 0, 0)`, seven to M, six to K and seven back to Γ.
+The separate 22-point near-Γ scan keeps eight roots at 0.01 meV: eight steps
+to `(0.003, 0, 0)`, twelve more to `(0.06, 0, 0)`, then K for certification.
+Coordinates are fractional reciprocal coordinates. The lower panel displays
+only |Q| ≤ 0.12 Å⁻¹, excluding the distant K anchor.
 
-For this illustrative figure the runner explicitly selects the existing
-**visualization** exchange certificate, with a 1 meV gate. Matched on-grid
-refitted-versus-stored exchange checks measured 0.01963 meV on 24 × 24 and
-0.02086 meV on 30 × 30. Those checks pass this grade and exceed the
-0.01 meV reference gate; they do not make the resulting energies reference
-values or establish convergence between the grids. Both members of each
-certificate comparison use a tighter absolute solver residual budget than
-the plotting solve. The driver's own **reference** default and all gates
-remain unchanged. A third runner argument selects that stricter grade,
-for example `bash 01-run_exciton_bands.run gw.in reference reference`.
+Use a regular four-GPU allocation. Allow roughly three hours for the full
+path, plus the near-Γ scan, which took 25 min 37 s from a cold launch on
+four Frontier GPU ranks. The full-path allowance is a planning estimate;
+runtime varies by machine. The companion `exciton_bands_continuum.dat`
+records the independent-particle threshold from the same QP transitions at
+each Q, so its coverage can be checked against the highest retained level.
 
-`exciton_bands.dat` contains the 256 lowest levels at each Q. The plot shows
-those levels along the full path and enlarges the low-energy structure near Γ.
-A matching `exciton_bands_continuum.dat` adds the independent-particle
-threshold from the same interpolated QP transitions, rather than from the
-coarse gap. Check the highest retained level at every Q: the root count alone
-does not certify coverage of that threshold. Increase it when the goal is
-to inspect the continuum onset and the requested levels stop below it.
+Near Γ, the lowest two ordered energies follow a quadratic form over the
+measured window; higher levels need a linear component plus curvature,
+as permitted by long-range exchange in two dimensions. The smallest
+low-level shifts are below solver resolution. Energies alone do not assign
+longitudinal/transverse or bright/dark character.
 
-In two dimensions, long-range exchange permits a leading term linear in
-|Q| for a longitudinal bright combination, while its transverse partner
-starts quadratically. In this 24 × 24 scan, quadratic fits to the lowest
-two ordered levels over 0.00086–0.03955 Å⁻¹ have RMS errors below 0.009 meV.
-The fourth and eighth levels rise by about 0.8 meV at the first nonzero Q;
-both linear and quadratic terms are needed over the nearest four points.
-The smallest low-level shifts are below the solver's resolution, and these
-finite-window fits do not establish asymptotic coefficients. Energies alone
-do not identify bright or dark branches or fix their polarization.
-
-Matched 24 × 24 and 30 × 30 near-Γ controls differed by up to 7.65 meV among
-the lowest eight ordered levels at their four shared momenta (7.14 meV at Γ,
-5.78 meV at K). The cheaper grid is used for this exercise without claiming
-integration-grid convergence; the exchange certificate is a separate check.
-The original workshop has no corresponding exciton-dispersion step.
+These are illustrative results: the lowest eight levels differ by up to
+7.65 meV between matched 24 × 24 and 30 × 30 controls. The tutorial uses the
+1 meV **visualization** exchange check; the driver's **reference** default
+remains unchanged. The [stage README](https://github.com/jackmcarthur/lorrax/blob/main/examples/MoS2_SOC_2026/3-bse/3-lorrax_fully_rel/3-exciton-bands/README.md)
+gives the measured fits, residual budgets and certification details. Grid
+convergence requires further calculations.
 
 ## Results {: #results }
 
