@@ -222,11 +222,12 @@ def test_temporary_operator_digest_does_not_retain_static_rung():
     _definitions("src/gw/response_bank.py", {"operator_digest"}, ns)
     operator = np.eye(2)[None]
     reference = weakref.ref(operator)
-    expected = ns["operator_digest"](operator, object(), cache=False)
+    mesh = NS(shape={"x": 1, "y": 1})
+    expected = ns["operator_digest"](operator, mesh, cache=False)
     assert not ns["_OPERATOR_DIGESTS"]
     del operator
     gc.collect()
     assert reference() is None
     held = np.eye(2)[None]
-    assert ns["operator_digest"](held, object()) == expected
+    assert ns["operator_digest"](held, mesh) == expected
     assert ns["_OPERATOR_DIGESTS"][id(held)][0] is held

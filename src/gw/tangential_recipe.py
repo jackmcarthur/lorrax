@@ -719,9 +719,11 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
 def bind_tangential_sc_identity(meta, state, *, occupation_state, print_fn):
     """Label current SC scratch, without claiming QP provenance (ruling 22).
 
-    ``state`` supplies the current iteration. Reuse the carried occupation
-    digest or the already-bound insulating census digest; compute no new hash.
-    These labels MUST NOT authenticate restart membership or skip construction.
+    ``state`` supplies the current iteration and input Hamiltonian. Reuse
+    the carried occupation digest or the bound insulating census digest.
+    The actual input Hamiltonian digest distinguishes repeated evaluations
+    of one iteration, including isospectral rotations. These labels still
+    MUST NOT authenticate external restart membership or publication.
     """
 
     iteration = operator.index(state.iteration)
@@ -733,13 +735,15 @@ def bind_tangential_sc_identity(meta, state, *, occupation_state, print_fn):
                 meta.tangential_census.get('occupation_sha256'))
     if not isinstance(occ_hash, str) or not occ_hash:
         raise ValueError("GATE tangential_sc_identity: current occupation label is missing")
-    identity = dict(hamiltonian=f'sc_map_{iteration}:{occ_hash}',
+    from .response_bank import operator_digest
+    hamiltonian = operator_digest(state.H_qp_dft, None, cache=False)
+    identity = dict(hamiltonian=f'sc_map_{iteration}:{hamiltonian}',
                     wavefunctions='qp_rotation_unreceipted',
                     recipe_hash=recipe['recipe_hash'], gate_hash=recipe['gate_hash'],
                     authentication='NON-AUTHENTICATING')
     meta.tangential_state_identity = identity
     log.info(f"tangential SC identity NON-AUTHENTICATING: {identity}; "
-             "scratch only; rebuild every map; no restart reuse or publication")
+             "scratch only; current-H input bound; no external restart reuse or publication")
     return dict(identity)
 
 

@@ -968,32 +968,54 @@ def _operator_token(values):
 def _operator_digest_program(mesh_xy, shape):
     """Σ bits·(2g+1) mod 2^64 over the real and imaginary words at global flat index g."""
     from jax import shard_map
+    from runtime.padding import padded_axis
     nq, n, m = shape
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    flat = None
+    if n % px or m % py:
+        # Logical SC carries may be odd-width and are already replicated.
+        # Each rank reads a disjoint flat tile, with a local zero tail; no
+        # replicated padded copy is formed and nothing is gathered here.
+        flat = padded_axis(int(np.prod(shape)), mesh_xy, name="operator digest carrier",
+                           spec=P(("x", "y")), axis=0)
 
     def local(v):
-        r0 = jax.lax.axis_index("x") * (n // px)
-        c0 = jax.lax.axis_index("y") * (m // py)
-        q = jnp.arange(v.shape[0], dtype=jnp.uint64)[:, None, None]
-        r = (r0 + jnp.arange(v.shape[1])).astype(jnp.uint64)[None, :, None]
-        c = (c0 + jnp.arange(v.shape[2])).astype(jnp.uint64)[None, None, :]
-        g = 2 * ((q * jnp.uint64(n) + r) * jnp.uint64(m) + c)
+        if flat is not None:
+            width = flat.carrier//(px*py)
+            rank = jax.lax.axis_index("x")*py + jax.lax.axis_index("y")
+            index = rank*width + jnp.arange(width, dtype=jnp.int64)
+            v = jnp.take(v.reshape(-1), index, mode="fill", fill_value=0)
+            g = 2*index.astype(jnp.uint64)
+        else:
+            r0 = jax.lax.axis_index("x") * (n // px)
+            c0 = jax.lax.axis_index("y") * (m // py)
+            q = jnp.arange(v.shape[0], dtype=jnp.uint64)[:, None, None]
+            r = (r0 + jnp.arange(v.shape[1])).astype(jnp.uint64)[None, :, None]
+            c = (c0 + jnp.arange(v.shape[2])).astype(jnp.uint64)[None, None, :]
+            g = 2 * ((q * jnp.uint64(n) + r) * jnp.uint64(m) + c)
         bits = jax.lax.bitcast_convert_type(jnp.stack([v.real, v.imag], -1), jnp.uint64)
         total = jnp.sum(bits[..., 0] * (2 * g + 1) + bits[..., 1] * (2 * g + 3), dtype=jnp.uint64)
         return jax.lax.psum(total, ("x", "y"))  # exact-reduce: uint64 checksum
-    return jax.jit(shard_map(local, mesh=mesh_xy, in_specs=P(None, "x", "y"), out_specs=P(),
-                             check_vma=False))
+    return jax.jit(shard_map(local, mesh=mesh_xy,
+        in_specs=P() if flat is not None else P(None, "x", "y"),
+        out_specs=P(), check_vma=False))
 
 
 def operator_digest(values, mesh_xy, *, cache=True):
-    """A device digest of a face-tiled operator ``[nq, n, m]``: one 64-bit word per
-    value position, summed with its global index, the same at every P.  Kept per
+    """A device digest of an operator ``[nq, n, m]``, the same at every P.
+
+    Face-divisible operators use their distributed faces. A logical ragged
+    SC carry must already be replicated; disjoint all-P flat tiles hash it
+    without gathering or forming a padded matrix. Kept per
     operator object (the bare V is one object for the run). Set ``cache=False``
     for temporary operators whose storage must be released after hashing."""
     hit = _OPERATOR_DIGESTS.get(id(values)) if cache else None
     if hit is not None and hit[0] is values:
         return hit[1]
     mesh = values.sharding.mesh if mesh_xy is None else mesh_xy
+    if ((values.shape[1] % int(mesh.shape["x"]) or values.shape[2] % int(mesh.shape["y"]))
+            and not values.sharding.is_fully_replicated):
+        raise ValueError("operator_digest: a ragged matrix must already be replicated; no gather is allowed")
     word = int(np.asarray(_operator_digest_program(mesh, tuple(values.shape))(values)))
     digest = hashlib.sha256(f"{tuple(values.shape)}:{word:016x}".encode()).hexdigest()
     if cache:
