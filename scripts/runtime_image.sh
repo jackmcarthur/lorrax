@@ -145,7 +145,7 @@ cmd_restore() {
     [ "$dest" = "$parent" ] || rm -rf "$dest/$base"
     mv "$tmp/$base" "$dest/$base"; rmdir "$tmp"
     [ "$dest" = "$parent" ] || ln -sfn "$dest/$base" "$tree"
-    _say "restored $base ($bytes bytes) to $dest in $(_since "$t0") s (fetch $t1 s, $n streams) from $archive"
+    echo "[lorrax image] $(hostname) rank ${SLURM_PROCID:-0}: restored $base ($bytes bytes) to $dest in $(_since "$t0") s (fetch $t1 s, $n streams) from $archive" >&2
     flock -s 9
     cmd_clean "$archive" || true
 }
