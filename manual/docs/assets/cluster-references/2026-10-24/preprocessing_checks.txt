@@ -1,0 +1,57 @@
+LORRAX preprocessing scaling checks, recorded22–23October2026
+==========================================================
+These records are distinct from the full G0W0 references on /using/clusters/.
+They establish only the named preprocessing or encoded-array workload.
+
+Centroid placement, final source
+  d719c88f5addcb75b53489189a32e96e2cf0578b
+  Real primitive MoS2 WFN,84-band equal fit windows, default1.5oversampling.
+  1A100/1MPI: target10000, delivered10000;33.536s script;
+    8.405315976GB liveGPU; independent closure/uniqueness pass.
+  4A100/4MPI: target30000, delivered29999whole-orbit points;
+    about39s script;24.301732345GB live/GPU. The one-point orbit remainder
+    is explicitly reported. Numerical rank3606 is not permission to truncate
+    the physical point table.
+  4CPU nodes/144MPI,12x12mesh: target20000, delivered20000;
+    87.629s script;3.013GB largest processRSS. All144ranks pass.
+  Runtime startup/cache histories differ, so these are capacity observations,
+  not a controlled strong-scaling or cold-start comparison.
+  Local evidence: kmeans_placement_evidence_20261022/REPORT.txt and
+    P144_MEMORY_AUDIT.txt. NERSC archive root:
+    /pscratch/sd/j/jackm/cs_claude/centroid_10k_prerelease_20261022
+
+WFN loader/FFT large-axis checks
+  Shared final branch4f5675ad7; raw-axis oracle source46339c50975c6d8132037799d4bdab0744891c46.
+  Encoded HDF5 coefficients/padding passed through256CPU ranks and16GPUs
+  with521stored k rows and20003bands. A separate20x20x20 k-grid fixture has
+  726parents and8000full k points, with3/5/7physical plane-wave spheres.
+  P4/P16 literal Fourier relative error<=2.2857376945191707e-15.
+  The tests request bounded subsets; no full8000k wavefunction face is
+  allocated. They do not represent a physical many-band metal calculation.
+  Odd3x3/5x5 CPU meshes also pass; rectangular process meshes are unsupported.
+  NERSC evidence archive:
+    /global/cfs/cdirs/m4598/jackm/lorrax_evidence/wfn_scaling_20261022
+  See SHORT_REPORT.txt, oracle20k/, padding_followup/ in that archive.
+
+Dipole matrix construction, final panel source
+  a924ef92efae6257636b41e78d85906991aafdb2;
+  combined source8f2344c2a410470a3b60fb29d12045b248d0158d.
+  64real CPU tasks on onePerlmutter node,8x8mesh,OMP1.
+  Encoded scalar coefficients,10003logical/10048carrier bands,one k,
+  three dipole components,67Gslots (61physicalpluspadding).
+  Final compiled temporary1049575176B/rank; original compiler-only price
+  9692382280B/rank. The original10k program was not executed.
+  Final warm compute16.890374s maximum across ranks.
+  Writer-run maximum RSS1675739136B/rank.
+  Logical file dipole_cart(3,1,10003,10003),4802880432payload bytes;
+  collective write11.859625s maximum across ranks.
+  Every local output shard and independent first/middle/last whole file
+  rows passed. No complete output was gathered onto one process.
+  P9ragged/spinor/k controls and real scalar/spinor/bispinor physics
+  references also pass. The small-G fixture is not a large-atom throughput
+  benchmark; dense multi-k output still costs c*Nk*Nb^2 complex elements.
+  Evidence: mtxel_scaling/ and mtxel_compile_followup_20261023/ under the
+  same wfn_scaling_20261022 archive.
+
+No listed count is a proof of the mathematical minimum number of processors.
+All times/memory scopes above retain the original evidence's meaning.

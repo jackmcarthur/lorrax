@@ -30,6 +30,8 @@ The reported device peak measures memory in the device pool. NVML also sees rese
 
 Start around $N_\mu = 10N_b$ centroids, then converge the basis. The selector retains complete symmetry orbits, and storage may add dummy slots for the mesh. Use the **packed** centroid extent when estimating storage; keep it distinct from the number of physical interpolation points.
 
+Centroid placement first works with an oversampled candidate pool. Price its Gram/factor with that candidate extent, rather than the final GW point count. Numerical rank exhaustion can save work without removing the requested physical points.
+
 One full-zone complex128 Green's function has size
 
 $$
@@ -38,9 +40,30 @@ $$
 
 where $N_k$ counts the **full** k grid and $n_s$ is 1 for scalar, 2 for spinor and 4 for bispinor wavefunctions. A face distribution `G_k(mu_X,nu_Y)` on an $X\times Y$ mesh divides this leading storage by $P=XY$. Symmetry can reduce the stored parent set; full-zone consumers still matter for planning.
 
-**$3G/P$ is a useful first planning target, not a universal peak or a fit guarantee.** Small-k-grid calculations can be dominated by wavefunction staging, ζ-fitting FFT/work buffers, Coulomb factors or solver workspace. Streamed routes may use less. Read the actual compiled/native workspace price for the chosen input and mesh, then measure a complete run. Do not infer a smaller working process count by dividing a measured peak by card capacity.
+**$3G/P$ is a rough comparison scale, not a minimum-GPU rule or a fit guarantee.** Small-k-grid calculations can be dominated by wavefunction staging, ζ-fitting FFT/work buffers, Coulomb factors or solver workspace. Row-streamed consumers do not retain a whole $G$. Read the actual compiled/native workspace price for the chosen input and mesh, then measure a complete run. Do not infer a smaller working process count by dividing a measured peak by card capacity.
 
 For many-band runs, inspect the wavefunction route too. A two-axis distribution such as `psi_k(n_X,s,mu_Y)` reduces both large axes, giving leading storage proportional to $1/P$. A faster band-complete carrier `psi_k(n,s,mu_Y)` scales as $1/\sqrt P$; bounded panels offer another way to stage a contraction. Record the actual selected carrier and panels: they have different memory and communication costs.
+
+### What must fit together {: #live-storage }
+
+Use the packed centroid extent and the resolved band carrier in these estimates. $Q$ denotes stored q rows and $N_{\rm par}$ the stored wavefunction parents; neither replaces the full $N_k$ in Fourier normalization.
+
+| Object on a face layout | Leading bytes per rank | What limits the estimate |
+|---|---:|---|
+| One complex centroid operator, such as $V$ or $W$ | $16Q N_\mu^2/P$ | Counts one field, not every field concurrently held by a stage. |
+| Two wavefunction faces | $32N_{\rm par}N_b n_sN_\mu/P$ | A band-complete prepared carrier has a different cost. |
+| One full-zone Green's function | $16n_s^2N_kN_\mu^2/P$ | Applies only to a route that materializes that object. |
+| One whole dense matrix under local linear algebra | $16N_\mu^2$ | This part does not shrink as $1/P$; factorization workspace is additional. |
+
+The full output of a stage, its current input fields and one compiled work arena can overlap. Their simultaneous residency matters more than a sum of unrelated stage peaks. A pool reservation, pool-used high-water, live-buffer count and host RSS are different measurements; retain their labels when comparing runs.
+
+Automatic row streaming bounds a Green's-function or convolution intermediate while preserving the full band sum. It does not reduce the scientific band window, centroid basis or k grid, and a full operator output can remain quadratic in $N_\mu$. Many small band dot products would discard the dense matrix-multiply structure and can repeat communication. The useful stream axis is the large centroid-row intermediate; band and transfer staging remain separate concerns.
+
+### Choosing the first job {: #first-job }
+
+Keep the scientific input fixed and choose a legal square process count. Compare the selected route's compiled output/temporary/alias sizes and queried provider workspace with the room beside its live operands. Then check a complete run, including preprocessing, ζ fitting, screening, the pole model, Σ and output. A successful response-kernel test alone does not establish a successful GW calculation.
+
+The table below records the **smallest completed measurement in the published evidence**, rather than the fewest GPUs the calculation could ever use. A minimum requires testing smaller legal counts on the same input and code. A runtime recommendation additionally needs useful throughput and headroom; fitting on a smaller job may involve more passes, repeated band-panel communication or host/disk staging. The automatic budget and streaming rules select these routes without a separate user streaming switch. Keep the selected routes and pass counts with the timing report.
 
 ## Local or distributed linear algebra {: #linalg }
 
@@ -64,12 +87,21 @@ The downloadable decks preserve that historical source. For main at or after [`5
 
 Memory values below use decimal GB. Wall time is the GW driver's `total run`, including setup and compilation but excluding centroid/dipole/kinetic preprocessing, queue wait and allocation startup. All GPU rows use A100-80GB cards and the automatic local-linalg budget (66.35 GB in the saved receipts). Persistent compilation caches were shared; the counts below make their state explicit.
 
-| System | Full k grid / stored parents | Occupied bands | Sum bands | Physical $N_\mu$ | $n_s$ | Method | Resources | GW wall | Pool peak/rank |
+| System | Full k grid / stored parents | Occupied bands | Sum bands | Physical $N_\mu$ | $n_s$ | Method | Smallest completed measurement | GW wall | Pool peak/rank |
 |---|---|---:|---:|---:|---:|---|---|---:|---:|
 | Si SOC, 2 atoms | 4×4×4 / 8 | 8 | 52 | 528 | 2 | GN-PPM | 4 GPUs, 1 node | 59.52 s | 9.71 GB |
 | Al₂O₃, 10 atoms | 4×4×4 / 13 | 24 | 154 | 1584 | 1 | GN-PPM | 4 GPUs, 1 node | 39.23 s | 19.03 GB |
 | Ferromagnetic bcc Fe | 8×8×8 / 59 | 18 (fractional) | 110 | 1099 | 2 | Shared-pole | 4 GPUs, 1 node | 353.07 s | 33.43 GB |
 | Cr:Al₂O₃, 80 atoms | 2×2×2 / 4 | 395 | 2370 | 23700 | 2 | GN-PPM | 16 GPUs, 4 nodes | 915.12 s | 52.89 GB |
+
+| Case | Resolved sum-band carrier | Physical / packed centroids | QP prefix | GPU-count conclusion |
+|---|---:|---:|---|---|
+| Si SOC | 52 | 528 / not recorded | 1–16 | P4 completed; P1 was not established by this record. |
+| Al₂O₃, 10 atoms | 156 | 1584 / not recorded | 1–30 | P4 completed; P1 was not established by this record. |
+| Fe, 8×8×8 | 112 | 1099 / 1100 at P4 | 1–22 | P4 completed on 80 GB cards; no 40 GB fit or smaller-count claim. |
+| Cr:Al₂O₃, 80 atoms | 2372 | 23700 / 23712 at P16 | 1–399 | P16 completed; this historical record establishes no smaller-count minimum. |
+
+These are four-GPU Perlmutter nodes. The program's $p_x\times p_y$ mesh is a logical ownership grid, distinct from the placement of those ranks on nodes. Changing the node count or rank mapping can change collective costs even at the same $P$; record both. Odd square meshes can add a different number and arrangement of dummy centroid/band slots without changing the physical input.
 
 | Run | Setup | ISDF / Coulomb | Screening | Self-energy | QP update | Real compiles / cache hits | Summed compile time |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -90,9 +122,28 @@ Fe retains the default `sigma_reads_past_w_support` warning. Its Σ energy grid 
 
 The 80-atom case is **Al₃₁CrO₄₈ with SOC**: 395 occupied spinor bands, 2370 physical sum bands (2372 padded slots), and 23700 physical centroids (23712 packed slots at P16). A 4-valence/4-conduction frontier still produces the full 1–399 Σ/QP prefix. The explicit −75…2.75 eV Σ range covers that prefix without out-of-grid static fallback; 831 quadrature nodes take 388.23 s. The default GN prescription treats 3.02% invalid modes with `static_limit`, a separate issue from energy-grid coverage.
 
-Its maximum pool-used peak is 52.89 GB/rank in ζ fitting, versus 41.39 GB in screening and 44.85 GB in Σ. One full-zone Green's function at the packed extent is 17.992 GB/rank, so this run peaks at **2.94G/P**. Host high-water is 15.97 GB/rank. The conservative Cplus quote exceeded the then-current planning room; the completed run stayed below the 66.35 GB budget. This demonstrates the stated 16-GPU workload; a smaller process count was not tested. Original structural/symmetry qualifications and the exact inputs are retained in the [case notes](../assets/cluster-references/2026-10-23/cr_al2o3_80/case_notes.txt).
+Its maximum pool-used peak is 52.89 GB/rank in ζ fitting, versus 41.39 GB in screening and 44.85 GB in Σ. One full-zone Green's function at the packed extent is 17.992 GB/rank, so this run peaks at **2.94G/P**. This ratio is a comparison scale; Σ already streams centroid rows. Host high-water is 15.97 GB/rank. The conservative Cplus quote exceeded the then-current planning room; the completed run stayed below the 66.35 GB budget. This demonstrates the stated 16-GPU workload; this historical record does not establish a smaller process count. Original structural/symmetry qualifications and the exact inputs are retained in the [case notes](../assets/cluster-references/2026-10-23/cr_al2o3_80/case_notes.txt).
 
 All ranks exited successfully and the canonical Σ and QP outputs were checked for the stated shapes and finite entries. Preserve the input hashes, exact decks, resolved geometry, selected routes, compilation counts and all-rank exit records when repeating a reference.
 
+### Repeating a capacity measurement {: #capacity-receipt }
+
+Record the source and native-build identities; physical and padded shapes; GPU model, rank/node mapping and CPU threads; all-rank exit status; selected routes, row/band/q passes and staging tier; stage wall times, real compiles and cache hits; largest pool-used and host peaks; and canonical output checks. Run a cold-cache and a warmed repeat separately when timing compilation matters. Summed compilation time is an API counter, not necessarily an additive part of wall time.
+
+For filesystem comparisons, also retain the shared filesystem and stripe layout of the WFN, scratch and large output files. Parallel HDF5 reads/writes rank-owned hyperslabs; stripe choices and host-versus-disk staging can affect throughput without changing the scientific result. The reference records do not establish one optimal stripe count. Follow the site's storage guidance and measure the complete I/O phase before changing it.
+
 Download the [text input bundle (ZIP)](../assets/cluster-references/Lorrax_GPU_reference_inputs_2026-10-23.zip). The [reproduction notes](../assets/cluster-references/2026-10-23/README.txt) describe the input arrangement and launch sequence. Exact decks and manifests: [Si](../assets/cluster-references/2026-10-23/si_soc/gw.in) / [record](../assets/cluster-references/2026-10-23/si_soc/manifest.json), [Al₂O₃](../assets/cluster-references/2026-10-23/al2o3_10/gw.in) / [record](../assets/cluster-references/2026-10-23/al2o3_10/manifest.json), [Fe](../assets/cluster-references/2026-10-23/fe_8x8x8/gw.in) / [record](../assets/cluster-references/2026-10-23/fe_8x8x8/manifest.json), [Cr:Al₂O₃](../assets/cluster-references/2026-10-23/cr_al2o3_80/gw.in) / [record](../assets/cluster-references/2026-10-23/cr_al2o3_80/manifest.json). The text bundle includes DFT decks and physical centroid tables; large wavefunction and generated matrix files remain in the NERSC evidence archive named in each record.
+
+### Preprocessing and shape stress tests {: #preprocessing-capacity }
+
+These measurements test individual owners. They do not establish the size of a complete GW calculation on the same resources. Details and evidence scopes are in the [preprocessing record](../assets/cluster-references/2026-10-24/preprocessing_checks.txt).
+
+| Calculation | Physical size | Completed resources | Time | Memory measurement |
+|---|---|---|---:|---|
+| MoS₂ centroid placement | 84-band fit; 10,000 points | 1 A100 | 33.54 s script | 8.41 GB live GPU |
+| MoS₂ centroid placement | 84-band fit; 30,000 requested, 29,999 complete-orbit points | 4 A100s | about 39 s script | 24.30 GB live/GPU |
+| MoS₂ centroid placement | 84-band fit; 20,000 points | 144 CPU tasks, 4 nodes | 87.63 s script | 3.013 GB max RSS/rank |
+| Encoded dipole construction | 10,003 bands, one k, three components; 4.803 GB logical file | 64 CPU tasks, 1 node | 16.89 s warm compute; 11.86 s write | 1.050 GB compiled temporary/rank; 1.676 GB writer-run max RSS/rank |
+
+The centroid cases use a three-atom physical WFN; dense point selection does not make them 100-atom WFN tests. The dipole case uses a deliberately small encoded G sphere and tests distributed matrix construction and file padding. WFN indexing also passed large-axis encoded fixtures through 256 CPU tasks and 16 GPUs, including nondivisible bands and odd square meshes. Those tests do not establish that a dense physical 20³ k grid, 20,000 bands and 10,000 centroids fit simultaneously.
 
