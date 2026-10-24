@@ -134,6 +134,29 @@ Its maximum pool-used peak is 52.89 GB/rank in ζ fitting, versus 41.39 GB in sc
 
 All ranks exited successfully and the canonical Σ and QP outputs were checked for the stated shapes and finite entries. Preserve the input hashes, exact decks, resolved geometry, selected routes, compilation counts and all-rank exit records when repeating a reference.
 
+### New capacity checks on 24 October {: #capacity-20261024 }
+
+The same fixed Cr80 scientific input now completes at P4 and P9 on source `3a3aee27c`. Separate fixed Si and Al₂O₃ runs establish P1 for those smaller cases. Their matched kinetic/ionic and dipole preprocessing was authenticated and reused; the driver totals include GW setup/compilation, excluding preprocessing and queue wait. All cards are A100-80GB. Physical sizes are unchanged from the reference inputs above.
+
+| Fixed case | Full k / parents; $n_s$ | Sum bands / carrier | Physical / packed $N_\mu$ | Active GPUs / nodes | GW wall | Pool-used peak/rank | Host peak/rank | Count conclusion |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| Si SOC, 2 atoms | 64 / 8; 2 | 52 / 52 | 528 / 528 | 1 / 1 | 70.98 s | 18.17 GB | 3.22 GB | P1 completes: the legal minimum active count for this fixed case. |
+| Al₂O₃, 10 atoms | 64 / 13; 1 | 154 / 154 | 1584 / 1584 | 1 / 1 | 50.10 s | 25.40 GB | 6.30 GB | P1 completes: the legal minimum active count for this fixed case. |
+| Cr:Al₂O₃, 80 atoms | 8 / 4; 2 | 2370 / 2370 | 23700 / 23700 | 4 / 1 | 2481.21 s | 76.87 GB | 32.51 GB | Smallest completed count tested; tight headroom. |
+| Cr:Al₂O₃, 80 atoms | 8 / 4; 2 | 2370 / 2370 | 23700 / 23706 | 9 / 3 | 1388.43 s | 57.05 GB | 19.81 GB | More measured headroom and shorter observed wall time. |
+
+P1 used one MPI rank and one selected GPU inside an existing four-GPU allocation, with no concurrent P1 legs. Active count and allocated count are different: this proves one-GPU execution, not a one-GPU allocation charge. Si used source `3a3aee27c`; Al₂O₃ used `df10cadce`, which adds the shared row-schedule compiler repair and tests. The failed initial Al₂O₃ attempt is retained separately.
+
+The Cr80 P4 peak occurs in V(q), above its 66.35 GB planning budget and close to the 77.89 GB pool reservation. P9 peaks in ζ fitting within that budget. **For this fixed case, prefer P9 for memory margin and turnaround; P4 is a demonstrated working count.** No smaller Cr80 count was tested. The observed P9 time is 44.0% lower (1.79× faster); active-GPU time is 2.757 versus 3.471 GPU-hours. Rank/node topology and shared cache histories differ, and neither arm has a controlled cold/warm repeat. These are observed timings, not a formal scaling-efficiency or historical-source regression result.
+
+All four completed cases pass canonical output integrity and full-prefix dynamic coverage, with no out-of-range fallback. Cr80 has 1596 unique rows per EQP file and `(2,4,399,399)` raw on-shell PAIR storage. Against its pinned P16 reference, maximum full-prefix EQP0/EQP1 differences are 4.08×10⁻⁷ / 3.874×10⁻⁶ eV at P4 and 4.15×10⁻⁷ / 8.970×10⁻⁶ eV at P9. For frontier bands 392–399 they are at most 4.8×10⁻⁸ / 3.7×10⁻⁸ eV. Si/Al maximum full-prefix changes are below 2×10⁻⁶ eV. Comparisons use absolute energies and raw complex Sigma with no energy/phase alignment. An independent review accepts the results within the existing registered comparison limits of 50 µeV for EQP and 2 meV for complex Sigma; the largest measured changes across these four cases are 8.970 µeV and 3.14043 µeV, respectively. This establishes reproducibility of the fixed inputs, not material or basis convergence.
+
+The Al₂O₃ P1 test also exposed a compiler failure after screening, despite modest memory use. A material-independent native JAX 0.12 reproducer identified scalar barriers on a constant scanned descriptor. The shared row/contour owner now makes the tiny schedule table opaque before indexed reads, preserving protected read ordering and bounded matrix shapes without disabling compiler passes or adding a material-specific branch. The fresh full Al₂O₃ retry and its canonical scientific readback pass. Small process counts therefore need actual end-to-end tests as well as memory estimates and P4 regressions.
+
+The mean-diagonal dummy modes also explain Cr80's printed retained-rank counts: P16 reports 11165–11166 including 12 processor pads, P9 reports 11159–11160 including 6, and P4 reports 11153–11154 with none. All imply the same 11153–11154 physical-rank range; zero dummy ζ rows contribute no physical operator. This interprets diagnostics, not an adjustment to scientific outputs.
+
+The [new capacity receipt](../assets/cluster-references/2026-10-24/completed_capacity_checks.txt) preserves source pins, measured stages and unaligned comparison scopes.
+
 ### Repeating a capacity measurement {: #capacity-receipt }
 
 Record the source and native-build identities; physical and padded shapes; GPU model, rank/node mapping and CPU threads; all-rank exit status; selected routes, row/band/q passes and staging tier; stage wall times, real compiles and cache hits; largest pool-used and host peaks; and canonical output checks. Run a cold-cache and a warmed repeat separately when timing compilation matters. Summed compilation time is an API counter, not necessarily an additive part of wall time.
