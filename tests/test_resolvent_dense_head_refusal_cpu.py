@@ -8,12 +8,12 @@ from gw.gw_config import (ComputeMode, HeadCorrection, LorraxConfig,
                           ScreeningDiagrams, refuse_unsupported_head_dense)
 
 
-def _config(tmp_path, *, mode="gn_ppm", diagrams="w_rpa", dense=True):
+def _config(tmp_path, *, mode="gn_ppm", diagrams="w_rpa", dense=True, extra=""):
     path = tmp_path / "gw.in"
     path.write_text(f"[cohsex]\nsys_dim = 3\ncompute_mode = {mode}\nscreening_diagrams = {diagrams}\n"
                     "head_correction = full\nnumber_bands = 30\n"
                     "nval = 4\nncond = 4\n"
-                    + ("head_dense_file = dense_dipole.h5\n" if dense else ""))
+                    + ("head_dense_file = dense_dipole.h5\n" if dense else "") + extra)
     return LorraxConfig.from_input_file(str(path), resolve_hardware=False,
                                        runtime_platform="cpu", print_fn=lambda *_a: None)
 
@@ -43,3 +43,13 @@ def test_dense_head_refuses_actual_resolvent_decks_and_preserves_rpa(tmp_path):
         refuse_unsupported_head_dense(replace(rpa, head=replace(rpa.head, correction=HeadCorrection.OFF)))
     with pytest.raises(ValueError, match="GATE head_dense_operator"):
         refuse_unsupported_head_dense(replace(rpa, bispinor=True))
+
+
+def test_tangential_ladder_head_overrides_refuse_before_build(tmp_path):
+    for key in ("vhead", "whead_0freq", "whead_imfreq"):
+        with pytest.raises(ValueError, match="GATE w_bse_tangential_head_override_unimplemented"):
+            _config(tmp_path, mode="tangential", diagrams="w_bse", dense=False,
+                    extra=f"{key} = 0.0\n")
+        # The two-point comparison policy is a separate, supported consumer.
+        _config(tmp_path, mode="gn_ppm", diagrams="w_bse", dense=False,
+                extra=f"{key} = 0.0\n")

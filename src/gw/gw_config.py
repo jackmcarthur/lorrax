@@ -487,6 +487,19 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
         "schur_avg placement (src/gw/head_channel.py:153)",
     ),
     (
+        "w_bse_tangential_head_override_unimplemented",
+        lambda cfg: cfg.compute_mode is ComputeMode.TANGENTIAL and any(
+            getattr(cfg.head, key, None) is not None
+            for key in ("vhead", "whead_0freq", "whead_imfreq")),
+        lambda cfg: ", ".join(f"{key} = {getattr(cfg.head, key)}"
+            for key in ("vhead", "whead_0freq", "whead_imfreq")
+            if getattr(cfg.head, key, None) is not None),
+        "the frequency-dependent head of the same physical ladder as the body",
+        "drop vhead, whead_0freq and whead_imfreq for tangential W_BSE",
+        "constant scalar overrides have no defined composition with the "
+        "micro-reducible full-frequency ladder head and its shared-pole fit",
+    ),
+    (
         "w_bse_self_consistency_unimplemented",
         lambda cfg: cfg.qp_solver is QPSolver.SELF_CONSISTENT,
         lambda cfg: f"qp_solver = {cfg.qp_solver.value}",
