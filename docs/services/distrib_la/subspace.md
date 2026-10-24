@@ -83,7 +83,15 @@ poisons the outputs with NaN (as the XLA route) instead of raising. The
 eigensolve reads no size either: the capacity matrix (active block, inactive
 diagonal distinct values in [2b, 4b), b the block's Gershgorin bound) is
 reflected (rocSOLVER `zheevd` fails on structured complex matrices) and solved
-by `lorrax_rocsolver_batched_eigh` at batch 1; cost O(capacity³) per call.
+through the shared `local_eigh` per-leg policy: the native batch-1 target
+inside its measured window, jaxlib outside it. The capacity path must respect
+that window too: a later 72×72 correction Gram near the identity returned
+nonfinite native eigenvectors with `info=0`, while jaxlib solved the same
+reflected matrix. No rank threshold or driver window is changed. Inactive
+rows still receive finite high sentinels before the solve; missing output
+values remain `+∞` and unused vectors zero. The provider workspace is priced
+by `local_eigh_workspace`, including the jaxlib route outside the native
+window; cost remains O(capacity³) per call.
 `lorrax_active_subspace_eigh` and `_distributed_ortho` are CUDA-only.
 
 `plan_local_subspace(*, capacity, n_eig, max_block_size=None)` is the

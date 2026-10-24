@@ -142,12 +142,12 @@ class LocalSubspacePlan:
         block's Gershgorin bound, so every active eigenvalue sorts first and no padded
         cluster is degenerate.  rocSOLVER zheevd fails on structured (block-diagonal,
         real-valued) matrices (``local_eigh`` module docstring), so the solve is of
-        B = H A H with ``local_eigh``'s fixed dense reflector, through the batched target
-        at batch 1 (``lorrax_rocsolver_batched_eigh``: workspace from XLA's allocator,
-        a failed or non-finite solve NaN).  C = H C_B, masked to the active block; a
-        scalar active block is answered exactly.  Cost O(capacity^3) per call.
+        B = H A H with ``local_eigh``'s fixed dense reflector, through its shared
+        per-leg solve policy (native batch 1 inside its measured window, jaxlib
+        outside). A failed or non-finite solve is NaN. C = H C_B is masked to
+        the active block; a scalar active block is answered exactly. Cost O(capacity^3) per call.
         """
-        from distrib_la.local_eigh import BATCHED_EIGH_ROUTE, _native_batched_eigh, _reflector
+        from distrib_la.local_eigh import _solve, _reflector
         cap, b = self.capacity, self.n_eig
         m = jnp.asarray(active, jnp.int32)
         idx = jnp.arange(cap)
@@ -163,8 +163,7 @@ class LocalSubspacePlan:
         uau = jnp.real(jnp.vdot(u, au))
         bm = (a - 2 * u[:, None] * jnp.conj(au)[None, :] - 2 * au[:, None] * jnp.conj(u)[None, :]
               + 4 * uau * (u[:, None] * jnp.conj(u)[None, :]))
-        w, vb = _native_batched_eigh(BATCHED_EIGH_ROUTE[self.leg_key], bm[None])
-        w, vb = w[0], vb[0]
+        w, vb = _solve(bm)
         c = (vb - 2 * u[:, None] * (jnp.conj(u) @ vb)[None, :])[:, :b]
         e = w[:b]
         column = jnp.arange(b) < m
