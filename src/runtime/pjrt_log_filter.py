@@ -76,14 +76,12 @@ _CLEAN_SHUTDOWN_CONTEXT_LINES = (
     b"coordination_service while calling "
     b"/tensorflow.CoordinationService/WatchJobState:",
 )
-_CLEAN_SHUTDOWN_DETAIL_LINE = re.compile(
-    rb":" + _CLEAN_SHUTDOWN_STATUS +
-    rb"(?: \[type\.googleapis\.com/tensorflow\.DerivedStatus=''\])?"
-)
+_DERIVED_STATUS_SUFFIX = rb"(?: \[type\.googleapis\.com/tensorflow\.DerivedStatus=''\])?"
+_CLEAN_SHUTDOWN_DETAIL_LINE = re.compile(rb":" + _CLEAN_SHUTDOWN_STATUS + _DERIVED_STATUS_SUFFIX)
 _LEGACY_SHUTDOWN_DETAIL_LINE = re.compile(
     rb':UNKNOWN:Error received from peer  \{(?:'
     rb'grpc_status:(\d+), grpc_message:"([^"\r\n]+)"|'
-    rb'grpc_message:"([^"\r\n]+)", grpc_status:(\d+))\}'
+    rb'grpc_message:"([^"\r\n]+)", grpc_status:(\d+))\}' + _DERIVED_STATUS_SUFFIX
 )
 _TRACE_HEADER_LINE = b"=== Source Location Trace: ==="
 _TRACE_FRAME_LINE = re.compile(rb"[\w./+-]+\.(?:h|cc):\d+")

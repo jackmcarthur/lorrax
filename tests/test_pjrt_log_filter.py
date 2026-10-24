@@ -7,7 +7,11 @@ refused`` block on every retry until ``os._exit``.
 The legacy three-line format is captured from Frontier JAX 0.9.1 (2026-10-24).
 """
 import os
+from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import textwrap
 
 from runtime.pjrt_log_filter import ExactPjrtNoticeFilter, clean_shutdown_step
 
@@ -29,12 +33,14 @@ _LEGACY_CONTEXT = (b"Additional GRPC error information from remote target coordi
 LEGACY_CANCELLED = (
     b"W1024 06:24:22.656981  678478 pjrt_client.cc:1604] WatchJobStateAsync failed for "
     b"task 1: CANCELLED: CANCELLED\n" + _LEGACY_CONTEXT
-    + b':UNKNOWN:Error received from peer  {grpc_message:"CANCELLED", grpc_status:1}\n')
+    + b":UNKNOWN:Error received from peer  {grpc_message:\"CANCELLED\", grpc_status:1}"
+    + b" [type.googleapis.com/tensorflow.DerivedStatus='']\n")
 LEGACY_REFUSED = (
     b"W1024 06:24:23.656981  678478 pjrt_client.cc:1604] WatchJobStateAsync failed for "
     b"task 1: UNAVAILABLE: " + _REFUSED + b"\n" + _LEGACY_CONTEXT
     + b':UNKNOWN:Error received from peer  {grpc_status:14, grpc_message:"' + _REFUSED + b'"}\n')
-RECEIPTS = (CANCELLED, REFUSED, LEGACY_CANCELLED, LEGACY_REFUSED)
+RECEIPTS = (CANCELLED, REFUSED, LEGACY_CANCELLED, LEGACY_REFUSED,
+            LEGACY_CANCELLED.replace(b" [type.googleapis.com/tensorflow.DerivedStatus='']", b""))
 
 
 def _run(before, after):
@@ -92,3 +98,41 @@ def test_real_errors_and_orphan_details_remain_visible_after_the_gate():
     # A legacy receipt ends on its detail, so an unrelated trace is preserved.
     out, _ = _run(b"", LEGACY_CANCELLED + _TRACE)
     assert out == _TRACE
+
+
+def test_finalize_keeps_filter_through_exit_hooks_and_requires_a_passed_barrier():
+    # Real finalizer/atexit/fd filter; only the GPU and collective are stand-ins.
+    # The early hook would run AFTER the filter's later-registered stop hook.
+    code = textwrap.dedent("""
+        import atexit, os, sys, types
+        import runtime
+        from runtime.pjrt_log_filter import install_pjrt_log_filter
+        receipt = bytes.fromhex(sys.argv[1])
+        passed = sys.argv[2] == '1'
+        def late_hook():
+            os.write(2, receipt + b'UNHEALTHY_PEER_ERROR\\n')
+        atexit.register(late_hook)
+        install_pjrt_log_filter()
+        jax = types.ModuleType('jax')
+        jax.effects_barrier = lambda: None
+        jax.process_index = lambda: 0
+        jax.distributed = types.SimpleNamespace(shutdown=lambda: None)
+        api = types.ModuleType('jax._src.api')
+        api.clean_up = lambda: None
+        src = types.ModuleType('jax._src')
+        src.api = api
+        collective = types.ModuleType('common.collectives')
+        collective.barrier = lambda name: passed
+        sys.modules.update({'jax':jax, 'jax._src':src, 'jax._src.api':api,
+                            'common.collectives':collective})
+        runtime.finalize_process(7)
+    """)
+    root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ, PYTHONPATH=str(root / 'src'))
+    for receipt in (REFUSED, LEGACY_CANCELLED):
+        for passed in (False, True):
+            result = subprocess.run([sys.executable, '-c', code, receipt.hex(), str(int(passed))],
+                env=env, capture_output=True, timeout=10)
+            assert result.returncode == 7, result.stderr
+            assert b'UNHEALTHY_PEER_ERROR\n' in result.stderr
+            assert (receipt in result.stderr) is not passed, result.stderr

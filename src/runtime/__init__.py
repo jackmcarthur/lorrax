@@ -2601,6 +2601,9 @@ def finalize_process(rc: int = 0):
                          f"({type(exc).__name__}: {exc}); continuing")
     except Exception:                                     # jax never imported
         pass
+    # Keep stderr filtered while earlier-registered cache/library hooks run.
+    # The explicit stop below drains and restores it after every exit hook.
+    atexit.unregister(_stop_pjrt_log_filter)
     try:
         atexit._run_exitfuncs()
     except Exception as exc:                              # noqa: BLE001
