@@ -161,6 +161,7 @@ cmd_clean() {
         [ -e "$lock" ] || continue
         base=${lock##*/.}; base=${base%.lock}; tree="$parent/$base"
         [ "$tree" = "$keep" ] && continue
+        [ -e "$tree/.lorrax-image" ] || continue                     # not an image (another tool's lock)
         (
             exec 8>>"$lock"
             flock -xn 8 || exit 0                                   # in use

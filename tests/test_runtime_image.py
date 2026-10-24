@@ -63,13 +63,16 @@ def test_pack_restore_concurrent_and_clean(tmp_path):
     # A second image of the same user on the node: held -> kept, unheld -> cleaned.
     other = tmp_path / "node" / "rt-b"
     _make_tree(other)
+    (other / ".lorrax-image").write_text("b\n")
+    foreign = tmp_path / "node" / "venv-x"                      # another tool's lock + dir
+    foreign.mkdir(); (tmp_path / "node" / ".venv-x.lock").touch()
     lock = tmp_path / "node" / ".rt-b.lock"
     with open(lock, "a") as held:                               # a running process's shared lock
         fcntl.flock(held, fcntl.LOCK_SH)
         _run("clean", archive)
         assert other.is_dir()
     _run("clean", archive)
-    assert not other.exists() and tree.is_dir()
+    assert not other.exists() and tree.is_dir() and foreign.is_dir()
 
 
 def test_reused_release_id_refuses(tmp_path):
