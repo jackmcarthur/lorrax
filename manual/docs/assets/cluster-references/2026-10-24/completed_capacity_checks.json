@@ -286,6 +286,91 @@
       "canonical_readback_SHA256": "cf1278fec4b286861fb0da8a7ec536783d7243c336ab0fa4c48c9238b287d5cc",
       "active_gpu_hours": 0.013916666666666667,
       "allocated_gpu_hours": 0.05566666666666667
+    },
+    {
+      "case": "cr_al2o3_80",
+      "source": "9ddaf21b5f3ff4960ade83c68eb477bcdcd14f99",
+      "status": "COMPLETE_CANONICAL_INTEGRITY_AND_NUMERICAL_REPRODUCIBILITY_PASS",
+      "atoms": 80,
+      "nspinor": 2,
+      "kgrid": [
+        2,
+        2,
+        2
+      ],
+      "full_k": 8,
+      "stored_parents": 4,
+      "sum_bands": 2370,
+      "sum_band_carrier": 2370,
+      "physical_centroids": 23700,
+      "packed_centroids": 23706,
+      "QP_bands_1based": [
+        1,
+        399
+      ],
+      "EQP_rows": 1596,
+      "Sigma_PAIR_shape": [
+        2,
+        4,
+        399,
+        399
+      ],
+      "sigma_range_eV": [
+        -75,
+        2.75
+      ],
+      "active_gpus": 9,
+      "nodes": 3,
+      "mesh": [
+        3,
+        3
+      ],
+      "wall_seconds": 1110.9,
+      "pool_used_peak_GB_per_rank": 57.05,
+      "host_high_water_GB_per_rank": 19.81,
+      "stage_seconds": {
+        "setup": 7.69,
+        "isdf": 331.03,
+        "screening": 160.0,
+        "self_energy": 611.46,
+        "qp": 0.7,
+        "tau_sweep": 594.49,
+        "chi0": 52.71
+      },
+      "stage_pool_used_peak_GB_per_rank": {
+        "isdf": 57.05,
+        "screening": 48.56,
+        "self_energy": 36.52
+      },
+      "full_dynamic_coverage": true,
+      "out_of_range_fallback": false,
+      "energy_alignment": false,
+      "phase_alignment": false,
+      "EQP_comparison": {
+        "eqp0.dat": {
+          "full_prefix_max_abs_eV": 4.1500000236283086e-07,
+          "full_prefix_RMS_eV": 4.120758625745612e-08,
+          "frontier_392_399_max_abs_eV": 4.799999864246729e-08
+        },
+        "eqp1.dat": {
+          "full_prefix_max_abs_eV": 8.970000003216683e-06,
+          "full_prefix_RMS_eV": 4.597465460608187e-07,
+          "frontier_392_399_max_abs_eV": 3.700000128503689e-08
+        }
+      },
+      "historical_recipe": "../2026-10-23/cr_al2o3_80/manifest.json",
+      "driver_receipt_SHA256": "1801f6249d9e6f2973a05bc2eaedcd451334faee679c9cf110c599b7fc9840f0",
+      "canonical_readback_SHA256": "993b82af42759cd0d75dde401a4b67443105c4b160fa79a732acf0acf7f2a251",
+      "allocated_gpus": 12,
+      "active_gpu_hours": 2.77725,
+      "allocated_gpu_hours": 3.7030000000000003,
+      "run_role": "final_optimized_followup",
+      "compile_cache": {
+        "real_compiles": 12,
+        "real_compile_seconds": 1.2,
+        "hits": 294,
+        "scope": "Rank0 compile-cache footer; shared persistent caches, not a controlled cold/warm arm"
+      }
     }
   ],
   "numerical_acceptance": {
@@ -293,7 +378,7 @@
     "existing_complex_Sigma_max_abs_limit_eV": 0.002,
     "worst_measured_EQP_max_abs_eV": 8.970000003216683e-06,
     "worst_measured_raw_complex_Sigma_max_abs_eV": 3.14043e-06,
-    "independent_review_SHA256": "e6e15681af57921d8fa42ea9d1c5ab0588c2859c3832f9819f02e27988c5a608",
+    "independent_review_SHA256": "369fb243e53fb57babdde78b8dc6ff836b249847c665671c21ad68f966b70c4a",
     "no_gate_changed": true
   },
   "count_conclusions": {
@@ -306,6 +391,7 @@
     "Physical versus processor-pad extents are explicit; no centroid truncation or scientific-output rank adjustment.",
     "Historical and current sources/cache histories differ. No performance ratio against the historical P16 run is certified.",
     "GW totals exclude preprocessing/queue/allocation startup; active count is distinct from reserved GPU/node billing.",
-    "Full outputs/HDF5 and driver/readback receipts remain in the private evidence archive. This compact manifest contains no large payloads."
+    "Full outputs/HDF5 and driver/readback receipts remain in the private evidence archive. This compact manifest contains no large payloads.",
+    "Final P9 followup used the same Slurm allocation as the 3a P9 arm but later shared cache history and a changed source. Its observed time change is not a controlled isolated algorithm speedup."
   ]
 }

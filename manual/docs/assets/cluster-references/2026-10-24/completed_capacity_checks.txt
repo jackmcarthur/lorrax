@@ -40,3 +40,14 @@ minimum. P1 is the legal minimum active count for the fixed Si/Al cases;
 their tests do not establish allocation pricing. Cr80 structural, magnetic,
 TRS-authentication, band/point/energy-window and GN-invalid-mode qualifications
 are unchanged. Scientific convergence is not established by these checks.
+
+Final optimized Cr80 P9 followup (earlier P4/P9 pair retained):
+  Source 9ddaf21b5f3ff4960ade83c68eb477bcdcd14f99
+  Total 1110.90 s; screening 160.00 s (chi0 52.71 s); Sigma 611.46 s (tau 594.49 s).
+  Pool-used 57.05 GB/rank; host 19.81 GB/rank; active 9 / allocated 12 GPUs on 3 nodes.
+  Active 2.77725 / allocated 3.703 GPU-hours, not site billing.
+  Compile footer 12 real / 294 hits / 1.2 s cumulative API; shared cache, later arm.
+  Driver SHA256 1801f6249d9e6f2973a05bc2eaedcd451334faee679c9cf110c599b7fc9840f0
+  Canonical comparison SHA256 993b82af42759cd0d75dde401a4b67443105c4b160fa79a732acf0acf7f2a251
+  All 9 tasks exited 0, full 1596-row coverage; reference comparison unchanged at printed EQP precision.
+  Same Slurm allocation as 3a P9 but changed source and warmer caches: no isolated algorithm timing claim.
