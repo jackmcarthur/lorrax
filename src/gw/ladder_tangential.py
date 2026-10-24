@@ -29,13 +29,31 @@ def _relative_norm(mesh):
     return jax.jit(ratio, out_shardings=NamedSharding(mesh, P()))
 
 
-def _gate_solve(residuals, iterations, *, where):
-    from .screening_bse import _GMRES_MAX_ITER, _GMRES_TOL, _residual_ceiling
+def _solver_accuracy(recipe):
+    """True-residual budget below the bank and unchanged Gram certificates.
+
+    One decade of headroom is an input-solve allocation, not a bound on
+    Hermite-Gram error amplification. The constructor still certifies its
+    actual matrix without PSD repair. No production GN-PPM control changes.
+    """
+    from .screening_bse import _GMRES_MAX_ITER
+    from .tangential_recipe import shared_real_pole_gates_v1_r3b
+    bank = float(recipe["bank_rule_tolerance"])
+    gram = abs(float(shared_real_pole_gates_v1_r3b["normalized_gram_validity"]["threshold"]))
+    if not np.isfinite((bank, gram)).all() or min(bank, gram) <= 0:
+        raise ValueError("GATE ladder_tangential_accuracy: positive finite bank and Gram budgets required")
+    return dict(gmres_tol=0.1*min(bank, gram), gmres_max_iter=int(_GMRES_MAX_ITER),
+                policy="bank-relative-true-residual-v1")
+
+
+def _gate_solve(residuals, iterations, *, accuracy, where):
     worst = float(np.max(residuals))
     hottest = int(np.max(iterations))
-    if not np.isfinite(worst) or worst > _residual_ceiling(_GMRES_TOL) or hottest >= _GMRES_MAX_ITER:
+    tol, cap = accuracy["gmres_tol"], accuracy["gmres_max_iter"]
+    if not np.isfinite(worst) or worst > tol or hottest >= cap:
         raise ValueError(f"GATE ladder_tangential_solve: {where}: residual {worst:.3e}, "
-                         f"iterations {hottest}/{_GMRES_MAX_ITER}; no truncated response may be fitted")
+                         f"requested {tol:.3e}, iterations {hottest}/{cap}; "
+                         "no inaccurate or truncated response may be fitted")
 
 
 def make_ladder_tangential_source(wfns, V_q, *, quad, e_ref, sym,
@@ -49,13 +67,13 @@ def make_ladder_tangential_source(wfns, V_q, *, quad, e_ref, sym,
     bank uses before selecting directions or writing. One frequency's wedge
     is consumed at a time. Only small head tensors and receipts are retained.
     """
-    from .screening_bse import (_GMRES_MAX_ITER, _GMRES_TOL,
-                                _assert_wedge_matches_run,
+    from .screening_bse import (_assert_wedge_matches_run,
                                 _finalize_ladder_head, prepare_ladder_restart)
     state = {}
 
     def prepare():
         if "identity" not in state:
+            state["solver"] = _solver_accuracy(meta.tangential_recipe)
             from bse.w_ladder import LADDER_RESPONSE_CONVENTION
             from .response_bank import operator_digest
             static = prepare_ladder_restart(
@@ -67,7 +85,10 @@ def make_ladder_tangential_source(wfns, V_q, *, quad, e_ref, sym,
             state["identity"] = dict(screening_diagrams="w_bse",
                 ladder_response_convention=LADDER_RESPONSE_CONVENTION,
                 ladder_static_w_sha256=operator_digest(static, mesh_xy, cache=False),
-                ladder_head_policy=str(getattr(config.head.correction, "value", config.head.correction)))
+                ladder_head_policy=str(getattr(config.head.correction, "value", config.head.correction)),
+                ladder_gmres_tol=state["solver"]["gmres_tol"],
+                ladder_gmres_max_iter=state["solver"]["gmres_max_iter"],
+                ladder_solve_accuracy_policy=state["solver"]["policy"])
             del static
         return dict(state["identity"])
 
@@ -115,7 +136,7 @@ def make_ladder_tangential_source(wfns, V_q, *, quad, e_ref, sym,
 
         def accept(iz, z, value, residuals, iterations, fields):
             nonlocal moments_written
-            _gate_solve(residuals, iterations, where=f"Wc/slope z={z}")
+            _gate_solve(residuals, iterations, accuracy=state["solver"], where=f"Wc/slope z={z}")
             # Count the backend's canonical outputs and their packed copies
             # together; the basis conversion can allocate at a new extent.
             names = ("Wc", "dWc_ds", "Wc_minus_z") + (() if moments_written else
@@ -192,7 +213,7 @@ def make_ladder_tangential_source(wfns, V_q, *, quad, e_ref, sym,
                              spec=P("y"), axis=0).carrier if requested else None)
         wedge = compute_wc_qwedge(str(tensors_filename), points, mesh_xy,
             input_file=config.input_file, include_w=True,
-            gmres_tol=_GMRES_TOL, gmres_max_iter=_GMRES_MAX_ITER,
+            gmres_tol=state["solver"]["gmres_tol"], gmres_max_iter=state["solver"]["gmres_max_iter"],
             probe_chunk=chunk, with_slope=True, with_moments=True, on_z=accept)
         _assert_wedge_matches_run(wedge, sym)
         current = validate_tangential_bank(bank_io["path"], expected_identity=bank_io["identity"],
@@ -216,11 +237,11 @@ def make_ladder_tangential_source(wfns, V_q, *, quad, e_ref, sym,
         all_points = tuple(dict.fromkeys((*points, 0j, *(-z for z in points))))
         result = compute_ladder_head(str(tensors_filename), np.asarray(all_points), mesh_xy,
             input_file=config.input_file, include_w=True,
-            gmres_tol=_GMRES_TOL, gmres_max_iter=_GMRES_MAX_ITER,
+            gmres_tol=state["solver"]["gmres_tol"], gmres_max_iter=state["solver"]["gmres_max_iter"],
             head_dipole_path=str(config.input_dir)+"/dipole.h5", head_n_occ=int(meta.nelec),
             head_pref=head_prefactor(float(meta.cell_volume), int(meta.nk_tot),
                 int(head_resolver.wfn.nspin), int(meta.nspinor_wfnfile)))
-        _gate_solve(result.resids, result.iters, where="Gamma ladder head")
+        _gate_solve(result.resids, result.iters, accuracy=state["solver"], where="Gamma ladder head")
         xi = 0.5*(np.asarray(result.xi)+np.swapaxes(np.asarray(result.xi),-1,-2))
         lookup = {z:i for i,z in enumerate(all_points)}
         scale = max(float(np.max(np.abs(xi))), np.finfo(float).tiny)

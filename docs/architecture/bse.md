@@ -580,10 +580,23 @@ complex supports, supplies its exact slopes and moments to the existing
 constructor, and passes the resulting shared real poles to the unchanged
 Σ executor. Canonical centroid outputs are packed through the run's one
 basis owner before fitting. The identity binds the branch convention,
-static-rung digest and head policy; an RPA bank or another rung cannot
+static-rung digest, head policy and solver tolerance/iteration cap; an RPA bank or another rung cannot
 authenticate as this ladder. The elementwise `mpa` parent handoff remains
 refused. Supported modes and parse refusals are owned by the
 [input reference](../input_reference.md).
+
+Hermite construction consumes values and slopes, so this path has a
+stricter input-solve budget than the production GN-PPM ladder. Its body
+and fresh Γ head use the same true-residual tolerance:
+`0.1 * min(bank_rule_tolerance, abs(normalized_gram_validity))`, giving
+`1e-9` for the production recipe and `1e-8` for the relaxed recipe, with
+the existing 300-iteration cap. Every returned residual must meet that
+requested tolerance; a solve at the cap is refused. The accuracy policy,
+tolerance and cap authenticate the bank/model identity, so an older
+looser bank cannot be reused. This allocates one decade below the existing
+certificate budgets; it does not bound Gram error amplification. The
+constructor still applies its unchanged positivity gate without PSD repair.
+The GN-PPM ladder retains its `1e-6` tolerance.
 
 ### Macroscopic head: the same operator, restored once
 

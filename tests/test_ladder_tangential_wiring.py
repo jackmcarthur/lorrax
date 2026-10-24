@@ -68,6 +68,7 @@ def test_parent_admission_uses_actual_tangential_mode_and_preserves_refusals():
 
 def test_ladder_diagram_and_rung_digest_reach_restart_validation():
     from bse.w_ladder import LADDER_RESPONSE_CONVENTION
+    from gw.tangential_recipe import shared_real_pole_gates_v1_r3b
     base = {name: "same-state" for name in ("iteration_id", "hamiltonian", "energies",
         "occupations", "wavefunctions", "centroids", "recipe_hash", "gate_hash")}
     captured = {}
@@ -87,18 +88,19 @@ def test_ladder_diagram_and_rung_digest_reach_restart_validation():
         "ppm_pipeline": NS(observing_window_source=lambda: False, publish_window_source=None),
         "file_io.tangential_store": NS(initialize_tangential_bank=None),
         "file_io.tagged_arrays": NS(register_tangential_restart_member=None),
-        "tangential_recipe": NS(tangential_restart_handle=restart),
+        "tangential_recipe": NS(tangential_restart_handle=restart,
+            shared_real_pole_gates_v1_r3b=shared_real_pole_gates_v1_r3b),
         "tangential_constructor": NS(construct_tangential_poles=None),
         "w_isdf": NS(produce_w_bank=None, compute_response_moments=None),
     }
-    ns = {"__builtins__": _imports(modules), "time": time,
+    ns = {"__builtins__": _imports(modules), "time": time, "np": np,
           "timing": NS(section=lambda *a, **k: nullcontext()),
           "tangential_identity": lambda *a, **k: dict(base)}
-    _definitions("src/gw/ladder_tangential.py", {"make_ladder_tangential_source"}, ns)
+    _definitions("src/gw/ladder_tangential.py", {"_solver_accuracy", "make_ladder_tangential_source"}, ns)
     _definitions("src/gw/tangential_screening.py", {"screen_tangential_poles"}, ns)
     config = NS(screening=NS(diagrams="w_bse"), debug=NS(write_w=False),
                 write_poles=False, restart=True, head=NS(correction="off"))
-    meta = NS(tangential_recipe={}, tangential_capacity=NS(live_stages=()))
+    meta = NS(tangential_recipe={"bank_rule_tolerance": 1e-8}, tangential_capacity=NS(live_stages=()))
     source = ns["make_ladder_tangential_source"](None, None, quad=None, e_ref=0,
         sym=None, centroid_indices=[], config=config, meta=meta, mesh_xy=None,
         tensors_filename="restart.h5", head_resolver=None)
@@ -112,6 +114,9 @@ def test_ladder_diagram_and_rung_digest_reach_restart_validation():
     assert captured["ladder_response_convention"] == "physical-ra-v1"
     assert captured["ladder_static_w_sha256"] == hashlib.sha256(static.tobytes()).hexdigest()
     assert captured["ladder_head_policy"] == "off"
+    assert captured["ladder_gmres_tol"] == pytest.approx(1e-9)
+    assert captured["ladder_gmres_max_iter"] == 300
+    assert captured["ladder_solve_accuracy_policy"] == "bank-relative-true-residual-v1"
 
     def refuse(message):
         raise ValueError(message)
@@ -121,9 +126,37 @@ def test_ladder_diagram_and_rung_digest_reach_restart_validation():
     for stale in (base, dict(captured, screening_diagrams="w_rpa"),
                   dict(captured, ladder_response_convention="folded-hybrid"),
                   dict(captured, ladder_static_w_sha256="other-rung"),
-                  dict(captured, ladder_head_policy="full")):
+                  dict(captured, ladder_head_policy="full"),
+                  dict(captured, ladder_gmres_tol=1e-6),
+                  dict(captured, ladder_gmres_max_iter=200),
+                  dict(captured, ladder_solve_accuracy_policy="old")):
         with pytest.raises(ValueError, match="stale input/SC identity"):
             ns["_check_identity"](stale, captured)
+
+
+def test_tangential_solve_budget_and_delivered_residual_gate():
+    from gw.ladder_tangential import _solver_accuracy, _gate_solve
+    from gw.screening_bse import _GMRES_TOL, _GMRES_MAX_ITER
+    from gw.tangential_recipe import shared_real_pole_v1_r3b
+    for tier, tolerance in (("production", 1e-9), ("relaxed", 1e-8)):
+        recipe = shared_real_pole_v1_r3b[tier]
+        accuracy = _solver_accuracy(recipe)
+        assert accuracy["gmres_tol"] == pytest.approx(tolerance)
+        assert accuracy["gmres_max_iter"] == _GMRES_MAX_ITER == 300
+        tol = accuracy["gmres_tol"]
+        _gate_solve(np.array([0., .9*tol, tol]), np.array([0, 5, 299]),
+                    accuracy=accuracy, where="value/slope/head control")
+        # The legacy GN guard allowed 10x the requested tolerance. The
+        # Hermite producer must instead enforce the actual input budget.
+        for bad in (np.nextafter(tol, np.inf), 1e-6, np.nan, np.inf):
+            with pytest.raises(ValueError, match="GATE ladder_tangential_solve.*requested"):
+                _gate_solve(np.array([bad]), np.array([7]), accuracy=accuracy, where=tier)
+        with pytest.raises(ValueError, match="iterations 300/300"):
+            _gate_solve(np.zeros(1), np.array([300]), accuracy=accuracy, where=tier)
+    for bad in (0., -1., np.nan, np.inf):
+        with pytest.raises(ValueError, match="GATE ladder_tangential_accuracy"):
+            _solver_accuracy({"bank_rule_tolerance": bad})
+    assert _GMRES_TOL == 1e-6  # The production GN-PPM numerical contract is unchanged.
 
 
 @pytest.mark.parametrize("micro", [True, False])
