@@ -1003,7 +1003,7 @@ def test_env_float_announces_a_bad_value():
     assert hasattr(gw_config, "env_float")
     log = _Log()
     _reset_announce()
-    name = "LORRAX_FI_FSHOULDER_TOL"
+    name = "LORRAX_TEST_KNOB"
     with _Env(**{name: "0.97"}):
         assert gw_config.env_float(name, 0.0, print_fn=log) == 0.97
     assert log.lines == []

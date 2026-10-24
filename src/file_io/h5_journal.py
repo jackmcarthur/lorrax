@@ -123,7 +123,7 @@ DIR_ENV = "LORRAX_H5_JOURNAL_DIR"
 # deliberate.  ``tools/env_audit.py`` and ``tools/lint/test_env_registry.py``
 # both resolve only literal arguments, so a read through a module
 # constant is INVISIBLE to the gate that requires a docs/reference/env_vars.md
-# row — which is exactly how the sibling ``LORRAX_HDF5_ONE_OWNER`` came
+# row — which is exactly how a (since removed) sibling variable came
 # to have no row for a week.  The constants stay because tests and error
 # messages need the name; the suite pins them to the literals by setting
 # the environment through ``J.MODE_ENV`` / ``J.DIR_ENV`` and asserting

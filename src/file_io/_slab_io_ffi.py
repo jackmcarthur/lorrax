@@ -665,23 +665,17 @@ def _assert_shared_directory(path: str) -> None:
 _MPI_WORLD_VERDICT: dict[str, tuple[str, str]] = {}
 
 
-def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *, require,
+def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *,
                        tier="PHDF5_FFI"):
     """Pure decision function for the MPI-world guard — ``(verdict, msg)``.
 
     Split out from the ctypes probe so it can be tested without an MPI.
     ``verdict`` is one of ``"ok"``, ``"unprobed"``, ``"refuse"``.
 
-    ``require`` gates the UNPROBED case only, and the MISMATCH case below
-    is unconditional.  That asymmetry is deliberate — "we could not check"
-    and "we checked and it is broken" are different facts — but the
-    mismatch message used to end with "LORRAX_PHDF5_REQUIRE_MPI_WORLD=0
-    downgrades this to a warning", which was never true of that branch
-    (found 2026-08-06).  A refusal that advertises an escape hatch it
-    does not implement is worse than a bare one: it sends the reader
-    looking for a variable that cannot help, on a failure whose whole
-    point is that it is invisible.  The sentence is gone rather than
-    implemented, because CLAIMS 68 measured what proceeding costs — with
+    The UNPROBED case warns and the MISMATCH case refuses.  That asymmetry
+    is deliberate — "we could not check" and "we checked and it is broken"
+    are different facts.  The mismatch has no downgrade, because CLAIMS 68
+    measured what proceeding costs — with
     a private singleton ``MPI_COMM_WORLD`` per rank the 8 hostile
     geometries wrote and read back bit-exact at rc=0, correctly striped,
     and only because disjoint hyperslabs need no collective handshake.
@@ -694,9 +688,8 @@ def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *, require,
                f"launcher's PMI flavour does not match this MPI stack every "
                f"rank gets a private singleton MPI_COMM_WORLD and the "
                f"collective write silently degrades to {proc_count} "
-               f"unsynchronised writers on one file.  Set "
-               f"LORRAX_PHDF5_REQUIRE_MPI_WORLD=1 to make this a refusal.")
-        return ("refuse" if require else "unprobed"), msg
+               f"unsynchronised writers on one file.")
+        return "unprobed", msg
     if int(mpi_size) == int(proc_count):
         return "ok", (f"MPI_Comm_size={mpi_size} == "
                       f"jax.process_count()={proc_count} ({probe_detail})")
@@ -710,8 +703,7 @@ def _mpi_world_verdict(mpi_size, proc_count, probe_detail, *, require,
         f"wrong-with-rc=0 whenever two ranks touch one chunk.  The usual "
         f"cause is the launcher's PMI flavour: on Perlmutter/Cray MPICH use "
         f"`srun --mpi=cray_shasta`, NOT --mpi=pmi2.  Refused identically on "
-        f"every rank, with NO downgrade: LORRAX_PHDF5_REQUIRE_MPI_WORLD "
-        f"gates only the 'could not probe' case, and CLAIMS 68 measured "
+        f"every rank, with NO downgrade: CLAIMS 68 measured "
         f"that proceeding here yields bit-exact-looking output at rc=0 "
         f"from a wholly broken MPI, so there is nothing safe to downgrade "
         f"to.  Fix the launcher.")
@@ -788,23 +780,11 @@ def _assert_mpi_world(mesh, *, mpi_size=None, probe_detail=None,
     and ``probe_detail`` instead, skipping the probe: same comparison,
     one less ABI guess.
     """
-    # This knob ignored half its own documented vocabulary until 2026-08-06:
-    # the parse here was a bare os.environ compare with no ``.lower()``, so
-    # SKIP_MPI_WORLD_CHECK=ON (or True, or YES) silently did NOT skip.  It
-    # failed closed, which is why it survived unnoticed — but the next knob
-    # written that way will fail open.  Both fixes for it agreed on the
-    # behaviour; this is the one that routes through the shared helper, so
-    # the vocabulary lives in _TRUE (line 134) and cannot drift per-site.
-    if _env_flag("LORRAX_PHDF5_SKIP_MPI_WORLD_CHECK", False):
-        return
-    require = os.environ.get(
-        "LORRAX_PHDF5_REQUIRE_MPI_WORLD", "").strip().lower() not in _FALSE
     if tier not in _MPI_WORLD_VERDICT:
         if mpi_size is None:
             mpi_size, probe_detail = _probe_mpi_world_size()
         _MPI_WORLD_VERDICT[tier] = _mpi_world_verdict(
-            mpi_size, jax.process_count(), probe_detail, require=require,
-            tier=tier)
+            mpi_size, jax.process_count(), probe_detail, tier=tier)
     verdict, msg = _MPI_WORLD_VERDICT[tier]
     if verdict == "refuse":
         import sys

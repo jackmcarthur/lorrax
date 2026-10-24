@@ -27,7 +27,6 @@ from common.log import get_logger
 log = get_logger(__name__)
 
 from common import rank_criterion
-from common import spectral_closure
 from common import jax_profile
 # Named-barrier helper: annotates failures with the barrier name and
 # no-ops at P=1; also avoids relying on ``jax.experimental.multihost_utils``
@@ -1098,16 +1097,6 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 		for b in edges))
 
 
-#: Env override for the band-sum degeneracy guard: ``snap`` (or ``off``)
-#: downgrades the refusal below.  Same three-mode vocabulary as
-#: ``common.band_degeneracy.MODES`` and the BSE's ``band_degeneracy``; it is
-#: an ENV knob rather than a deck key because it is an escape hatch for a
-#: deck you are debugging, not a property of the calculation you would want
-#: recorded in the input file.  Never set it to make a gate pass
-#: (``docs/reference/env_vars.md``).
-_BAND_DEGENERACY_ENV = "LORRAX_BAND_DEGENERACY"
-
-
 def assert_isdf_window_is_the_max(band_slices, band_range_right, zeta_nband,
 								  *, meta, log=print):
 	"""THE SIZING RULE, ENFORCED AT THE SEAM THAT CONSUMES IT.
@@ -1261,8 +1250,7 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 	  construction has no history, which is precisely the argument that made
 	  ``zeta_nband``'s edge strict on 2026-08-11.
 
-	``LORRAX_BAND_DEGENERACY=snap`` (or ``off``) downgrades the refusal for
-	both, and says so in the log when it does.  The two counts are checked
+	The two counts are checked
 	INDEPENDENTLY and the message names the legal edges for the one that
 	failed, so a deck with two bad edges learns about both.
 	"""
@@ -1281,18 +1269,12 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 	# only array that can say whether they slice a multiplet is the full
 	# ladder.  Same array and same answer as gw_init.py's other call site.
 	gaps = _bd.boundary_min_gaps(enk, is_full_spectrum=True)
-	override = os.environ.get(_BAND_DEGENERACY_ENV, "").strip().lower()
-	if override and override not in _bd.MODES:
-		raise ValueError(
-			f"{_BAND_DEGENERACY_ENV}={override!r} is not one of "
-			f"{_bd.MODES}.  A guard override with an unrecognised value is "
-			f"not silently ignored.")
 	for edge, key, what in (
 			(int(band_slices.b4_chi), "number_bands_chi", "chi0/W band sum"),
 			(int(band_slices.b4_sigma), "number_bands_sigma",
 			 "Sigma band sum")):
 		named = key in cfg.bands.named
-		mode = override or ("strict" if named else "snap")
+		mode = "strict" if named else "snap"
 		# The PADDED edge cuts nothing real: ψ above b_id_4_user is zero, so
 		# the boundary there is between a real band and a pad band and the
 		# gap is meaningless.  Ask about the LOGICAL count instead, which is
@@ -1310,16 +1292,9 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 				raise _bd.BandWindowDegeneracyError(
 					f"{detail}  This edge was requested BY NAME (`{key}` = "
 					f"{logical}), so unverifiable closure is refused.  Increase the "
-					f"WFN band count, choose a lower certified `{key}`, or set "
-					f"{_BAND_DEGENERACY_ENV}=snap to continue diagnostically.")
-			if mode == "off":
-				log(f"    *** {detail}  ({_BAND_DEGENERACY_ENV}=off: NOT "
-				    "CHECKED.) ***")
-			else:
-				log(f"    *** {detail}  Continuing because this legacy umbrella "
-				    "edge is grandfathered to a warning"
-				    + (f" ({_BAND_DEGENERACY_ENV}={override} was set)."
-				       if override else ".") + " ***")
+					f"WFN band count or choose a lower certified `{key}`.")
+			log(f"    *** {detail}  Continuing because this legacy umbrella "
+			    "edge is grandfathered to a warning. ***")
 			continue
 		gap_mev = float(gaps[logical]) * 13605.693122994
 		if gap_mev > _bd.DEGENERACY_TOL_RY * 13605.693122994:
@@ -1340,10 +1315,7 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 			f"Sigma spread, which is an identity violation and has no "
 			f"convergence knob.  Legal edges for THIS count near {logical}: "
 			f"{near or 'none in range'}.")
-		if mode == "off":
-			log(f"    *** {detail}  ({_BAND_DEGENERACY_ENV}=off: NOT "
-			    f"CHECKED.) ***")
-		elif mode == "snap":
+		if mode == "snap":
 			# THROUGH ``sanity.warn``, not a bare log line.  This branch is
 			# the one that measures a defect and PROCEEDS, and until now its
 			# output carried none of the markers the rest of the tree's
@@ -1363,19 +1335,15 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 			from common import sanity
 			sanity.warn(
 				f"{detail}  Continuing: "
-				+ (f"{_BAND_DEGENERACY_ENV}={override} was set."
-				   if override else
-				   f"this edge arrived through the umbrella `number_bands`, "
-				   f"which is grandfathered to a warning.  Set `{key}` "
-				   f"explicitly to have it enforced."),
+				f"this edge arrived through the umbrella `number_bands`, "
+				f"which is grandfathered to a warning.  Set `{key}` "
+				f"explicitly to have it enforced.",
 				print_fn=log)
 		else:
 			raise _bd.BandWindowDegeneracyError(
 				f"{detail}  This edge was requested BY NAME (`{key}` = "
 				f"{logical}), so it is enforced rather than warned about.  "
-				f"Set `{key}` to one of the legal edges above, or set "
-				f"{_BAND_DEGENERACY_ENV}=snap to continue anyway (it logs "
-				f"loudly, and it changes the physics rather than fixing it).")
+				f"Set `{key}` to one of the legal edges above.")
 
 
 @dataclass(frozen=True)
@@ -1733,34 +1701,11 @@ def _gate_fresh_zeta_rank_findings(
 	"""Dispose deferred rank findings before a fresh ζ channel is stamped.
 
 	The ζ truncations execute inside jitted kernels and therefore record through
-	the incumbent ``spectral_closure`` and ``rank_criterion`` services.  Every
+	the incumbent ``rank_criterion`` service.  Every
 	fresh charge or transverse writer must cross this host seam immediately
 	after its fit, before provenance makes that artifact reusable.  Accepted
 	restart artifacts never call this function.
 	"""
-	_sc_mode = spectral_closure.resolve_mode(
-		os.environ.get(spectral_closure.MODE_ENV))
-	# Read findings before the disposition clears them, so the clean/fired
-	# banner below cannot contradict the service result.
-	_sc_fired = bool(spectral_closure.pending())
-	spectral_closure.raise_if_pending(
-		finding_context, mode=_sc_mode, log=print_fn)
-	if _sc_mode == "off":
-		log.info("    ζ rank-cut closure: guard is OFF "
-		         "(LORRAX_SPECTRAL_CLOSURE=off) — NOT CHECKED, which is an "
-		         "absence and not a pass.")
-	elif _sc_fired:
-		log.info(f"    ζ rank-cut closure: guard fired above and the "
-		         f"straddled block was DROPPED whole (mode={_sc_mode}, "
-		         f"direction={spectral_closure.DEFAULT_DIRECTION}).  ζ's "
-		         f"retained span is point-group invariant; the rank it "
-		         f"carries is LOWER than the one zeta_rcond alone would have "
-		         f"chosen, and its κ_eff is correspondingly better.")
-	else:
-		log.debug(f"    ζ rank-cut closure: ARMED (mode={_sc_mode}, rtol="
-		         f"{spectral_closure.DEFAULT_RTOL:.1e}) and SILENT — no cut "
-		         f"fell inside a degenerate block of C_q on any q.")
-
 	_rp_mode = rank_criterion.resolve_policy_mode(
 		os.environ.get(rank_criterion.POLICY_MODE_ENV))
 	_rp_fired = bool(rank_criterion.pending())

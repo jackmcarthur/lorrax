@@ -135,7 +135,6 @@ stages.
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 
@@ -647,8 +646,7 @@ def _diag_max_of(mesh_xy):
 #   BAND WINDOWS keep WHOLE MULTIPLETS.  ``common/band_degeneracy`` is not a
 #   budget at all — a window that slices a degenerate manifold makes the run
 #   wrong rather than expensive, so the rule there is closure, not thrift:
-#   ``strict`` is the default and you never set ``snap`` to make a gate pass
-#   (``LORRAX_BAND_DEGENERACY`` in ``docs/reference/env_vars.md``).
+#   ``strict`` is the default.
 #
 # Do not re-introduce a "these two go opposite ways, on purpose" paragraph
 # here.  There was one, contrasting this floor with a snap-OUTWARD ceiling, and
@@ -1568,9 +1566,8 @@ def announce_ranks(reports, rcond, mu_s_pad, print_fn, *, ev=None) -> None:
             f"spanning {w['span_rel']:.3e} relative.  A cut through a "
             f"degenerate block makes the retained span a round-off-chosen "
             f"slice of an eigenspace, so W_S projects onto a different "
-            f"subspace at q than at Sq.  ``common/spectral_closure`` in "
-            f"{spectral_closure.resolve_mode(os.environ.get(spectral_closure.MODE_ENV))} "
-            f"mode. ***")
+            f"subspace at q than at Sq (``common/spectral_closure`` drops "
+            f"the block). ***")
     else:
         log.info(
             f"  [downfold/solve] spectral closure: the cut falls in a gap on "

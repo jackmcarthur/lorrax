@@ -231,16 +231,13 @@ struct LORRAX_PHDF_CTX_TYPE {
     // as in the Python phdf5_host writer).  Metadata is
     // non-collective so file-level ops (H5Dcreate/extend) bypass the
     // collective driver; non-collective metadata was also measured
-    // ~100 ms faster on OpenMPI small writes.  dedup_replicas
-    // drops all-but-one writer of a replica group's identical
-    // hyperslab (mesh axes not consumed by the array's sharding):
-    // required for correctness under collective writes (overlapping
-    // selections are undefined) and pure waste-removal under
-    // independent writes.  LORRAX_PHDF5_DEDUP_REPLICAS=0 disables.
+    // ~100 ms faster on OpenMPI small writes.  Writes always
+    // drop all-but-one writer of a replica group's identical hyperslab
+    // (write_ffi.cc): required for correctness under collective writes
+    // (overlapping selections are undefined).
     bool   use_collective_read  = true;
     bool   use_collective_write = true;
     bool   coll_metadata        = false;
-    bool   dedup_replicas       = true;
     size_t align_threshold   = 1 << 20;          // 1 MiB
     size_t align_length      = 1 << 20;
 };

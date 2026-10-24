@@ -1354,27 +1354,18 @@ def _resolve_solver_kind(vertex_mu_L: int, solver_kind: str, **_) -> str:
 from gw.gw_config import ZETA_RCOND_DEFAULT
 
 
-def _closure_mode():
-    # The DRIVER reads the dial and passes it: ``common.spectral_closure`` is
-    # L2 mathematics and ``tools/lint/test_layering.py`` requires it to be a
-    # function of its arguments.  The variable's NAME is still declared once,
-    # in the guard module, so nothing is duplicated but the lookup itself.
-    return spectral_closure.resolve_mode(os.environ.get(spectral_closure.MODE_ENV))
-
-
 def _policy_mode():
-    # The DRIVER reads the dial and passes it — same rule as _closure_mode.
+    # The DRIVER reads the dial and passes it: ``common.rank_criterion`` is
+    # L2 mathematics and ``tools/lint/test_layering.py`` requires it to be a
+    # function of its arguments.
     return rank_criterion.resolve_policy_mode(os.environ.get(rank_criterion.POLICY_MODE_ENV))
 
 
 def _close_the_cut(spectrum, keep, *, where: str):
     """Move a ζ rank cut off any degenerate block it slices, by DROPPING the block; ``(keep, figures)``, the figures for :func:`_report_the_cut`; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    mode = _closure_mode()
-    if mode == "off":
-        return keep, {}
     keep_new, n_pre, n_post = spectral_closure.close_keep_mask(
         spectrum, keep, rtol=spectral_closure.DEFAULT_RTOL)
-    return (keep_new if mode == "snap" else keep), {"closure": (n_pre, n_post)}
+    return keep_new, {"closure": (n_pre, n_post)}
 
 
 def _report_the_cut(figures, *, where: str, kappa_certified, rcond: float) -> None:
@@ -1385,7 +1376,6 @@ def _report_the_cut(figures, *, where: str, kappa_certified, rcond: float) -> No
     """
     if "closure" in figures:
         n_pre, n_post = figures["closure"]
-        mode = _closure_mode()
         # ``!=``, not ``>``: the default direction moves the rank DOWN.  A ``>``
         # here would have read every firing as silence after the flip, which is
         # the shape of a guard that reports a clean bill for the wrong reason.
@@ -1397,12 +1387,10 @@ def _report_the_cut(figures, *, where: str, kappa_certified, rcond: float) -> No
                 "block is DROPPED, owner ruling 2026-08-10).  A cut through a "
                 "degenerate block retains a symmetry-ARBITRARY slice of an "
                 "eigenspace, so zeta's span differs between q and Sq and the "
-                f"k-star identity fails for W and Sigma_x alike.  Mode={mode}.",
+                "k-star identity fails for W and Sigma_x alike.",
                 extra=log_message(
                     "spectral_closure_cut",
                     found=("retained rank/q", f"{n_pre} closes at {n_post}")))
-            if mode == "strict":
-                spectral_closure.note_device_snap(where, n_pre.max(), n_post.max())
     if "certify" in figures:
         kappa, n_drop, dropped_w, over = figures["certify"]
         if np.any(over):

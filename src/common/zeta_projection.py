@@ -226,18 +226,8 @@ def least_squares_transfer(
     # block it straddles by DROPPING that block whole (owner ruling
     # 2026-08-10) — pure jnp, so it stays inside the same replicated
     # computation and the verdict is identical on every process.
-    #
-    # ``off`` skips it entirely; ``strict`` computes the same verdict and
-    # refuses on host below rather than snapping, so the flag means the same
-    # thing here as at every other seam.
-    # The caller reads the dial and passes it — ``spectral_closure`` is L2 and
-    # must be a function of its arguments (tools/lint/test_layering.py).
-    _sc_mode = spectral_closure.resolve_mode(
-        os.environ.get(spectral_closure.MODE_ENV))
-    _keep_closed, _n_pre, _n_post = spectral_closure.close_keep_mask(
+    keep, _n_pre, _n_post = spectral_closure.close_keep_mask(
         w, keep, rtol=spectral_closure.DEFAULT_RTOL)
-    if _sc_mode == "snap":
-        keep = _keep_closed
     # THE CRITERION: ``keep`` is a CAP on how much G_S⁺ may amplify round-off
     # (κ_eff = λ_max/λ_min(kept) ≤ 1/rcond), NOT a search for a gap — these
     # ζ-overlap spectra are smooth and have none.  ``common/rank_criterion``
@@ -294,7 +284,7 @@ def least_squares_transfer(
     # difference is NEGATIVE — the straddled block is dropped.  Counting with
     # ``!=`` rather than ``>`` is what keeps that a firing instead of silence.
     _n_fired = int(np.count_nonzero(sc_post != sc_pre))
-    if _sc_mode != "off" and jax.process_index() == 0:
+    if jax.process_index() == 0:
         if _n_fired:
             print_fn(
                 f"*** [spectral-closure] zeta_projection transfer: the rank "
@@ -306,9 +296,8 @@ def least_squares_transfer(
                 f"A cut through a degenerate block retains a symmetry-"
                 f"ARBITRARY slice of an eigenspace, so W_S would project onto "
                 f"a different subspace at q than at Sq. "
-                + (f"THE STRADDLED BLOCK WAS DROPPED "
-                   f"({spectral_closure.DEFAULT_DIRECTION}). ***"
-                   if _sc_mode == "snap" else f"NOT closed (strict). ***"))
+                f"THE STRADDLED BLOCK WAS DROPPED "
+                f"({spectral_closure.DEFAULT_DIRECTION}). ***")
         else:
             print_fn(
                 f"[zeta_projection]   spectral closure: the cut falls in a gap "
@@ -316,14 +305,6 @@ def least_squares_transfer(
                 f"{spectral_closure.DEFAULT_RTOL:.1e} (noise floor eps/rcond = "
                 f"{spectral_closure.degeneracy_noise_rtol(rcond):.2e}) — no "
                 f"degenerate block is cut.")
-    if _sc_mode == "strict" and _n_fired:
-        raise spectral_closure.SpectralClusterError(
-            f"zeta_projection: the rcond={rcond:g} rank cut falls inside a "
-            f"degenerate block of G_S on {_n_fired} of {len(sc_pre)} q, so the "
-            f"retained span is not point-group invariant.  Fix: "
-            f"LORRAX_SPECTRAL_CLOSURE=snap drops each straddled block whole "
-            f"(retained rank {int(sc_pre.max())} -> {int(sc_post.min())} at "
-            f"worst), or =off to cut through deliberately.")
     # The cap check.  Under the default direction the closure DROPS the
     # straddled block, which raises λ_min(kept) and so can only LOWER
     # κ_eff — the cap cannot be violated by the guard, and this expression

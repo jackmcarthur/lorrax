@@ -461,7 +461,6 @@ def get_lib(platform: str) -> ctypes.CDLL:
         path, platform=platform, expected_abi=LORRAX_FFI_ABI_VERSION,
         abi_symbols=_ABI_SYMBOLS,
         build_hint=str(_PLATFORMS[platform]["build_hint"]),
-        strict_unstamped=os.environ.get("LORRAX_FFI_ABI_STRICT", "") == "1",
         unusable_cls=LibraryUnusable, mismatch_cls=AbiMismatch)
     _bind_c_abi(lib, platform)
     _declare_cusolvermp(lib)

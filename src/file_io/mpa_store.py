@@ -109,7 +109,6 @@ tables, one file — undefined the moment they overlap with a writer
   iteration**, most of them the former reopen-per-block fit writer.  The
   production walk now holds one :class:`FitWriter` payload handle and commits
   its small ledger once, after that handle closes.
-  ``LORRAX_HDF5_ONE_OWNER=strict`` turns the count into a refusal.
 
 ONE PATH.  Every payload byte is written and read through the collective
 forms (``*_collective``, :class:`FitWriter`, :class:`WColumnReader`,
@@ -568,8 +567,7 @@ def _superblock_flag_diagnosis(exc, path, mode, where):
         f"HDF5 library.  The ledger is attribute-heavy, so that needs an "
         f"FFI attribute reader beside lrx_phdf5_read_whole, or a rank-0 "
         f"read plus a broadcast.  Interim: run this stage at 4 ranks on "
-        f"one node, or set LORRAX_HDF5_ONE_OWNER=strict to enumerate every "
-        f"alternation site in one run.")
+        f"one node.")
 
 
 # ---------------------------------------------------------------------------
@@ -777,8 +775,7 @@ def allocate_w_omega_collective(
 
     The open sequence is FFI ``'w'`` → close → rank-0 h5py ``'a'`` →
     barrier: sequential cross-stack alternation with a write on each side,
-    which :mod:`file_io.hdf5_owner` counts and which
-    ``LORRAX_HDF5_ONE_OWNER=strict`` refuses.
+    which :mod:`file_io.hdf5_owner` counts.
     """
     from common.collectives import barrier, process_rank
     from file_io.slab_io import SlabIO
@@ -1638,7 +1635,7 @@ def allocate_fit_store_collective(
 
     Open sequence: FFI ``'w'`` → barrier → rank-0 h5py ``'a'`` → barrier →
     all-rank h5py ``'r'``.  Cross-stack alternation with writes on both
-    sides; ``LORRAX_HDF5_ONE_OWNER=strict`` refuses it.
+    sides, which :mod:`file_io.hdf5_owner` counts.
     """
     from common.collectives import barrier, process_rank
     from file_io.slab_io import SlabIO

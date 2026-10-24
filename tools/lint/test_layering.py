@@ -868,15 +868,6 @@ _L1_LIBRARY_ENV_READS = {
     "gw.sigma_box_plan": {
         "LORRAX_UNIFORM_RULE_TRACE",
     },
-    # resolve_fi_fshoulder_tol — the f-shoulder gate's floor, one resolver,
-    # refuse-on-garbage, resolved once and passed down.  It is deliberately
-    # NOT a driver flag: the gate catches a returned band that is ABSENT from
-    # fH, which is not a
-    # tolerance question, and the only value that changes its verdict is a
-    # negative one, whose whole purpose is reproducing a known-bad run.
-    "bandstructure.bse_setup": {
-        "LORRAX_FI_FSHOULDER_TOL",
-    },
 }
 
 

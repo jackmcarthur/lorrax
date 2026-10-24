@@ -155,29 +155,8 @@ def _uniform_kgrid_frac(kgrid: tuple[int, int, int], shift=(0.0, 0.0, 0.0)) -> j
 #: The f-shoulder tripwire's floor on ``min_k |f(ε_b)| / max|f|``, over the
 #: bands ``compute_wfns_fi`` RETURNS.  Default 0.0 — refuse only when a
 #: returned band's f is EXACTLY zero somewhere in the zone, which is the
-#: measured failure and not a tolerance judgement.  A NEGATIVE override
-#: disables the gate (announced); a positive one tightens it.
+#: measured failure and not a tolerance judgement.
 FI_FSHOULDER_TOL_DEFAULT = 0.0
-
-
-def resolve_fi_fshoulder_tol(log_fn=None) -> float:
-    """``LORRAX_FI_FSHOULDER_TOL`` (default 0.0) — the f-shoulder gate floor.
-
-    Uses the canonical ``gw_config.env_float`` announce-or-refuse grammar.
-    Here ``0`` is the DEFAULT, not an off switch: a band whose ``f`` is exactly
-    zero at some k is absent from ``fH``, so the floor that catches it is zero.
-    Turning the gate OFF needs a value no physical threshold could be
-    (negative).
-    """
-    from gw.gw_config import env_float
-    tol = env_float("LORRAX_FI_FSHOULDER_TOL", FI_FSHOULDER_TOL_DEFAULT,
-                    refuse=True)
-    if tol != FI_FSHOULDER_TOL_DEFAULT and log_fn is not None:
-        log_fn(f"  [gate] LORRAX_FI_FSHOULDER_TOL={tol:.3e} overrides the "
-               f"default {FI_FSHOULDER_TOL_DEFAULT:.1e}"
-               + ("  ** THE f-SHOULDER GATE IS DISABLED — only ever to "
-                  "reproduce a known-bad run **" if tol < 0.0 else ""))
-    return tol
 
 
 def _f_shoulder_gate(f_eps, b_min: int, b_max: int, shift: float, log_fn,
@@ -221,7 +200,7 @@ def _f_shoulder_gate(f_eps, b_min: int, b_max: int, shift: float, log_fn,
     same axis ``f_eps`` carries and — ``f`` being monotone in ε — the same
     ascending-eigenvalue slice the caller takes out of ``fH_q``.
     """
-    tol = resolve_fi_fshoulder_tol(log_fn)
+    tol = FI_FSHOULDER_TOL_DEFAULT
     fa = np.abs(np.asarray(f_eps, dtype=np.float64))     # (nb_co, nk_co)
     fmax = float(fa.max()) if fa.size else 0.0
     if fmax <= 0.0:
@@ -243,8 +222,6 @@ def _f_shoulder_gate(f_eps, b_min: int, b_max: int, shift: float, log_fn,
                f"min_b min_k |f(ε_b)|/max|f| = {worst:.6e} at band {worst_b} "
                f"(shift = {shift:.8f} Ry; {n_zero_k} exactly-zero (band, k) "
                f"slot(s) in the returned window)")
-    if tol < 0.0:
-        return worst
     if worst <= tol:
         raise ValueError(
             f"{where}: band {worst_b} of the RETURNED window "
@@ -272,9 +249,7 @@ def _f_shoulder_gate(f_eps, b_min: int, b_max: int, shift: float, log_fn,
             f"return (``number_cond_bands_fine``, the ζ-fit window).  In code: "
             f"``htransform.initialize_wfns(n_guard_bands=…)``, which "
             f"``bse.vq_interp.refit_prepare`` drives from "
-            f"``--refit-guard-bands``.  Do NOT reach for "
-            f"LORRAX_FI_FSHOULDER_TOL: a negative value reproduces the "
-            f"known-bad run and nothing else.")
+            f"``--refit-guard-bands``.")
     return worst
 
 

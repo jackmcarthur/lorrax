@@ -6,7 +6,6 @@
 // Env tunables (all optional; docs/reference/env_vars.md is the registry).
 // Boolean knobs accept the shared writer grammar — see env_flag below
 // (mirrors Python's runtime.env_flags.env_bool; tools/lint/test_env_grammar.py):
-//   LORRAX_PHDF5_DEDUP_REPLICAS   (1)   one canonical writer per replica
 //   LORRAX_PHDF5_ALIGN_MB         (4)   H5Pset_alignment threshold/length
 //   LORRAX_PHDF5_READ_STAGING_RETAIN_MB (256) process-wide budget for read
 //                                       staging kept above 32 MiB per file
@@ -507,19 +506,10 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     // Transfer modes (ctx.h): reads collective, writes COLLECTIVE
     // (measured on the production tile geometry: strided 2-D tiles of a
     // contiguous dataset are ~3 orders faster under two-phase collective
-    // aggregation — scorecard AI), metadata non-collective.  Env override:
-    //   LORRAX_PHDF5_DEDUP_REPLICAS=0    → let every rank of a replica
-    //                                     group write its identical copy
-    //                                     (overlapping selections are
-    //                                     undefined under collective
-    //                                     MPI-IO — only for debugging)
-    // Boolean knobs parse through env_flag — the SAME grammar as the
-    // Python writers' _env_flag (see env_flag above), so a given
-    // environment means the same thing in every writer.
+    // aggregation — scorecard AI), metadata non-collective.
     ctx->use_collective_read  = true;
     ctx->use_collective_write = true;
     ctx->coll_metadata        = false;
-    ctx->dedup_replicas       = env_flag("LORRAX_PHDF5_DEDUP_REPLICAS", true);
     // Alignment is deliberately NOT tied to the striping_unit default.
     // It used to be justified as "matches the striping unit so H5 objects
     // start on stripe boundaries", but it is measured non-load-bearing on
