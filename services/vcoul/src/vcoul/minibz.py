@@ -132,7 +132,7 @@ COULOMB_GAUGE_TT_SIGN = -1.0
 #: 3x3); the panels resolve it geometrically (1e-10).
 _SLAB_MINIBZ_GRADED_METHOD = (
     "true_ws_polygon_duffy_graded_gauss_legendre_v1")
-_SLAB_MINIBZ_GRADED_ORDERS = (8, 12, 16)
+_SLAB_MINIBZ_GRADED_ORDERS = (16, 24, 32)
 _SLAB_MINIBZ_GRADED_PANELS = (0.0,) + tuple(4.0 ** -k for k in range(6, -1, -1))
 _SLAB_MINIBZ_GRADED_ANGULAR = 32
 _SLAB_MINIBZ_RECEIPT_TOKEN = object()
@@ -940,7 +940,7 @@ def slab_minibz_photon_cubature(
     There is no method token, order dial, or caller-supplied geometry fact on
     this surface.  The service constructs the true mini-lattice Voronoi cell,
     triangulates Gamma to every edge and uses seven geometric radial panels
-    with 8/12/16 Gauss points per panel and 32 along each edge. The panels
+    with 16/24/32 Gauss points per panel and 32 along each edge. The panels
     resolve the small radial scale in screened scalar and photon heads;
     bare heads are their zero-response limit. Normalized weights and
     padded/physical solve counts are bound into one provider-issued result.

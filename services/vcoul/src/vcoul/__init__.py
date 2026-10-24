@@ -64,7 +64,7 @@ WHO CALLS WHAT
 ``slab_minibz_photon_cubature(kernel, geometry, kgrid)``
     The production screened-head provider: one authenticated receipt binding
     the true mini-lattice Wigner--Seitz polygon, seven geometric radial
-    panels with an 8/12/16 Duffy--Gauss ladder, cell volume, reciprocal
+    panels with an 16/24/32 Duffy--Gauss ladder, cell volume, reciprocal
     lattice/k-grid identity, normalized weights, and physical/padded solve counts.
 ``slab_minibz_graded_photon_cubature(kernel, geometry, kgrid)``
     The same canonical receipt; the direct four-current head

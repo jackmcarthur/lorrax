@@ -121,7 +121,7 @@ $$
 v(\bq)=\frac{8\pi}{q^2}\big(1-e^{-z_c q}\big)\;\xrightarrow{q\to0}\;\frac{8\pi z_c}{q} \tag{2.3}
 $$
 
-The integrand is a $1/q$ cusp, not a pole. Both averages of (2.1) run on the exact Wigner–Seitz polygon of the mini-lattice, cut into Γ-to-edge triangles with the Duffy map, whose Jacobian cancels the cusp. Seven geometric radial panels resolve screening near Γ, with a fixed 8/12/16-point Gauss–Legendre ladder per panel and 32 points per edge. The call refuses when either bare or screened average of the 12→16 pair misses its tolerance. The scalar and packed photon heads consume this same provider rule. Sobol sampling is a named debug rule on a slab and is never selected. `head_minibz_average` refuses on a slab.
+The integrand is a $1/q$ cusp, not a pole. Both averages of (2.1) run on the exact Wigner–Seitz polygon of the mini-lattice, cut into Γ-to-edge triangles with the Duffy map, whose Jacobian cancels the cusp. Seven geometric radial panels resolve screening near Γ, with a fixed 16/24/32-point Gauss–Legendre ladder per panel and 32 points per edge. The call refuses when either bare or screened average of the 24→32 pair misses its tolerance. The scalar and packed photon heads consume this same provider rule. Sobol sampling is a named debug rule on a slab and is never selected. `head_minibz_average` refuses on a slab.
 
 ### <span class="n">2.4</span> The heads in the ζ basis {: #zeta }
 

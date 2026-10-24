@@ -563,7 +563,7 @@ def _slab_gamma_cell_average(geometry, kgrid, operands, mesh, cell_volume):
 
     Every node of the provider's graded Γ-to-edge Duffy–Gauss ladder
     (``vcoul.slab_minibz_graded_photon_cubature``: seven geometric radial
-    panels toward Γ, 8/12/16 points per panel, normalized weights, ``D`` with
+    panels toward Γ, 16/24/32 points per panel, normalized weights, ``D`` with
     the Ismail–Beigi kernel at ``q_z = 0``) takes the full 4×4 Dyson solve
     before the weighted sum.  The radial Jacobian cancels the 2D ``1/q`` cusp,
     so there is no sphere; the panels resolve the TT block's near-Γ

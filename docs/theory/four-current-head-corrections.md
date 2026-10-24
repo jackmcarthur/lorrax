@@ -167,11 +167,11 @@ $$
 
 On a slab both brackets use the exact Wigner–Seitz polygon cubature of the
 mini-lattice: a Γ-to-edge Duffy triangulation with seven geometric radial
-panels and a fixed 8/12/16 Gauss–Legendre ladder per panel, issued by
+panels and a fixed 16/24/32 Gauss–Legendre ladder per panel, issued by
 `vcoul.slab_minibz_photon_cubature`. The
 packed completion of §4 reads the same receipt, so both routes evaluate one
 integral on one set of nodes. The call refuses if either bare or screened
-average of the 12→16 pair misses its
+average of the 24→32 pair misses its
 mixed tolerance. Bulk uses Sobol sampling plus the Baldereschi–Tosatti
 analytic sphere; the polygon construction is two-dimensional.
 
@@ -329,7 +329,7 @@ $M_{0a}$ and $M_{a0}$.
 
 Certificates: folded Ward residual $\le10^{-8}$, Hermiticity
 $\le10^{-10}$, Dyson forward-error bound $\le10^{-9}$, and the
-convergence of the graded 8/12/16 ladder. The completion is slab-only. A bulk
+convergence of the graded 16/24/32 ladder. The completion is slab-only. A bulk
 analytic sphere cannot be added after the nonlinear coupled solve, and no
 bulk integrator is derived for this route. Cost: $O(n_{\rm nodes})$
 4×4 solves on replicated data, plus ten rank-4 local outer products per
@@ -451,10 +451,10 @@ $q^*\sim8\pi z_c|\Pi_{TT}-C|$ far inside the cell. A single radial
 Gauss–Legendre panel reaches it only algebraically (TT 3 % at 32 points on
 CrI3 3×3, while CC is at 1e-11), so the head uses the graded rule
 (`vcoul.slab_minibz_graded_photon_cubature`): seven geometric radial panels
-$[0,4^{-6}],[4^{-6},4^{-5}],\dots,[\tfrac14,1]$ with 8/12/16 points each
+$[0,4^{-6}],[4^{-6},4^{-5}],\dots,[\tfrac14,1]$ with 16/24/32 points each
 and 32 along each edge (1e-10 at 12 points). Every node takes the
 $4\times4$ solve before the sum; the 16-point sums are the head and the
-12→16 change per field goes to the bank receipt. The metal pair split reads
+24→32 change per field goes to the bank receipt. The metal pair split reads
 the polygon's Coulomb moment (`vcoul.minibz_coulomb_moment(...,
 is_2d=True)`, $Q_{zz}=0$).
 

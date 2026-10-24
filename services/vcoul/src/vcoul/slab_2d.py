@@ -38,7 +38,7 @@ __all__ = ["Slab2D", "SlabQ0Certificate", "Q0_RULE_EXACT",
 
 #: The production q→0 cell-average rule: the exact mini-lattice
 #: Wigner--Seitz polygon, Γ-to-edge Duffy triangulation, graded radial
-#: 8/12/16 Gauss--Legendre ladder. ONE owner, shared with the packed completion.
+#: 16/24/32 Gauss--Legendre ladder. ONE owner, shared with the packed completion.
 Q0_RULE_EXACT = "wigner_seitz_polygon"
 #: DEBUG/DIAGNOSTIC ONLY: the historical scrambled-Sobol Voronoi draw.
 #: Reachable only by naming it; never a production rule.
@@ -243,7 +243,7 @@ class Slab2D:
           :func:`~vcoul.minibz.slab_minibz_photon_cubature`.  The scalar
           charge head and the packed bispinor Γ completion therefore
           evaluate the same integral on the same nodes and weights.  The
-          8/12/16 ladder's last pair must converge under the mixed
+          16/24/32 ladder's last pair must converge under the mixed
           absolute+relative budget or the call REFUSES; the certificate is
           announced once per process.
         * ``"sobol_debug"`` — DEBUG/DIAGNOSTIC ONLY, the historical

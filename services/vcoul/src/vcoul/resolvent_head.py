@@ -60,7 +60,7 @@ def scalar_resolvent_head(kernel, geometry, kgrid, response, *, analytic_sphere=
         raise ValueError('GATE scalar_resolvent_head_sphere: analytic-sphere response actions unavailable')
     dimension = int(kernel.sys_dim)
     if dimension == 2:
-        # The same authenticated 8/12/16 WS/Duffy ladder as q0_average.
+        # The same authenticated 16/24/32 WS/Duffy ladder as q0_average.
         receipt = slab_minibz_photon_cubature(kernel, geometry, kgrid)
         ladder = []
         for chunk in receipt.chunks:

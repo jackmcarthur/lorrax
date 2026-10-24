@@ -48,7 +48,7 @@ the downstream `ζ v ζ†` needs no further factor. With $K = q+G$ in Cartesian
 | `build_miniBZ_dq_cart(kgrid, bvec, *, nmc=2**18, seed=42)` | `(2·nmc, 3)` mini-BZ offsets: an `nmc` draw unioned with its negation (centrosymmetric by construction). |
 | `minibz_frac_to_cart(U, bvec)`, `minibz_cell_affine(bvec, kgrid)` | Fractional → Cartesian as `U @ bvec` (rows; never `U @ bvec.T`), and the full-cell → mini-BZ affine. |
 | `minibz_voronoi_batches`, `sample_minibz_qpoints`, `minibz_average`, `minibz_inscribed_sphere_r2`, `minibz_moment_tensor`, `wrap_points_to_voronoi` | The BGW `minibzaverage.f90` port and its tensor-weight (`⟨v q_a q_b⟩`) sibling. `minibz_average` returns **bare** kernel units (no 1/Ω); each caller applies its own volume convention. `wrap_points_to_voronoi` is the one jitted Voronoi fold. |
-| `slab_minibz_photon_cubature(kernel, geometry, kgrid) -> SlabMinibzPhotonReceipt` | The exact slab Wigner–Seitz polygon rule (Γ-to-edge Duffy triangulation, seven geometric radial panels, fixed 8/12/16 Gauss–Legendre points per panel and 32 per edge): the one slab q→0 cell-average owner, consumed by `Slab2D.q0_average` and by `gw.head_correction.complete_static_slab_photon_q0`. |
+| `slab_minibz_photon_cubature(kernel, geometry, kgrid) -> SlabMinibzPhotonReceipt` | The exact slab Wigner–Seitz polygon rule (Γ-to-edge Duffy triangulation, seven geometric radial panels, fixed 16/24/32 Gauss–Legendre points per panel and 32 per edge): the one slab q→0 cell-average owner, consumed by `Slab2D.q0_average` and by `gw.head_correction.complete_static_slab_photon_q0`. |
 | `Bulk3D.q0_average`, `Slab2D.q0_average`, `*.q0_average_transverse_tensor` | q→0 cell averages `(⟨v⟩, ⟨v/(1 − v qᵀSq)⟩)` in bare units, and the bare transverse (TT) head, § [q→0 cell averages](#q0-cell-averages). |
 | `scalar_resolvent_head(kernel, geometry, kgrid, response, *, analytic_sphere=False)` | Macroscopic scalar completion of microscopic `Xi`, exact `dXi_ds` and physical `M1/M3` tensors. Returns `Wc`, `dWc_ds`, `vc0` and high-frequency scalar moments on the same slab polygon or ordinary bulk draws. The slab certifies every action on its fixed ladder; analytic-sphere response actions refuse. The high-frequency `M3` includes the nonlinear first-moment-squared term from completion. |
 | `gauss_legendre_interval(order, left, right)` | Immutable float64 Gauss–Legendre rules on finite intervals, shared by the photon cubature and LORRAX's MPA/VNL consumers. |
@@ -98,7 +98,7 @@ takes a named rule with no silent alternative:
   (`GATE slab_q0_analytic_sphere_unavailable`): there is no
   Baldereschi–Tosatti sphere in 2D, where the head is a `|q|` cusp. Unset the
   key on a `sys_dim = 2` deck.
-* Both bare and screened averages of the final 12→16 ladder pair must
+* Both bare and screened averages of the final 24→32 ladder pair must
   converge under `atol 1e-12`, `rtol 1e-8`
   (mixed error ratio ≤ 1), else `GATE slab_q0_polygon_not_converged`
   refuses. The certificate (edges, orders, node counts, `⟨v⟩`, error ratio)
@@ -108,7 +108,7 @@ takes a named rule with no silent alternative:
   on the slab.
 * `Slab2D.q0_average_transverse_tensor` (the bare TT head of
   `gw.v_q_bispinor`) reads the same receipt: `−D_TT` of the finest rule,
-  with the same 12→16 convergence refusal. The direct four-current head
+  with the same 24→32 convergence refusal. The direct four-current head
   subtracts this tile from V (`subtract_bare_tt_from_bank`), so the tile
   removed is the one V holds.
 * `slab_minibz_graded_photon_cubature` delegates to the same canonical
