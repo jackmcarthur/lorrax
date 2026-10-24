@@ -19,15 +19,17 @@ What each one adds to the gates that already exist (it does not repeat them):
   dgemm and dsyev checked in pure Python (no second BLAS involved).  Frontier
   build_openblas_seq.sh.
 * elpa -- the closure in an EMPTY environment (``env -i``: the OpenBLAS the library binds
-  must be the expected one, found through its own RUNPATH/RPATH), ``ldd -r`` in the build
-  environment (no missing library, no undefined symbol), and with --solve a 64x64 ELPA
+  must be the expected one, found through its own RUNPATH/RPATH), ``ldd -r`` in the closure
+  record's directories (no missing library, no undefined symbol), and with --solve a 64x64 ELPA
   1-stage eigensolve against LAPACK dsyev from the same OpenBLAS.  Frontier
   build_elpa_hip.sh (the closure record and NEEDED gates stay there) and verify.sh.
 * mpi-allreduce -- JAX's CPU collectives through MPItrampoline -> MPIwrapper -> Cray MPICH, the
   exact consumer path: a cross-process allgather on >= 2 ranks.  The MPI ABI version
   handshake is build_mpiwrapper.sh's own (mpiabi_version); this is the live half.
-* nvidia -- cuSOLVERMp, cuBLASMp and NCCL: the version each library reports against the
-  header the FFI was compiled with, and (--ffi) that the FFI resolves the venv's copy.
+* nvidia -- cuSOLVERMp, cuBLASMp and NCCL: the header the FFI compiles against states the
+  installed wheel's version, header and library are files of that one wheel (its RECORD),
+  NCCL's live ncclGetVersion equals NCCL_VERSION_CODE, and (--ffi) the FFI binds that copy.
+  (cusolverMpGetVersion needs a live handle; the wheel pins are build_ffi_cuda.sh's.)
 * cholesky -- a 64x64 distributed cuSOLVERMp Cholesky on the run's mesh against numpy.
   lorrax-postinstall.
 * ffi -- the CUDA leg's cubin architectures (cuobjdump) include the site GPU's, and no
@@ -301,13 +303,10 @@ def check_mpi_allreduce() -> None:
 
 
 # ------------------------------------------------------------------- nvidia --
-_NV = {   # library: (header, macro prefix, library glob, version symbol, encode)
-    "cuSOLVERMp": ("cusolverMp.h", "CUSOLVERMP", "libcusolverMp.so*", "cusolverMpGetVersion",
-                   lambda a, b, c: a * 1000 + b * 100 + c),
-    "cuBLASMp": ("cublasmp.h", "CUBLASMP", "libcublasmp.so*", "cublasMpGetVersion",
-                 lambda a, b, c: a * 1000 + b * 100 + c),
-    "NCCL": ("nccl.h", "NCCL", "libnccl.so*", "ncclGetVersion",
-             lambda a, b, c: a * 10000 + b * 100 + c),
+_NV = {   # library: (header, macro prefix, library glob, distribution, live version symbol)
+    "cuSOLVERMp": ("cusolverMp.h", "CUSOLVERMP", "libcusolverMp.so*", "nvidia_cusolvermp", None),
+    "cuBLASMp": ("cublasmp.h", "CUBLASMP", "libcublasmp.so*", "nvidia_cublasmp", None),
+    "NCCL": ("nccl.h", "NCCL", "libnccl.so*", "nvidia_nccl", "ncclGetVersion"),
 }
 
 
@@ -322,39 +321,65 @@ def _header_version(header: Path, pfx: str) -> tuple[int, int, int] | None:
     return tuple(parts)
 
 
+def _wheel(sp: Path, dist: str):
+    """``(version, files)`` of the installed wheel whose name starts with ``dist``."""
+    for info in sorted(sp.glob(f"{dist}*.dist-info")):
+        version = info.name[len(info.name.split("-")[0]) + 1:-len(".dist-info")]
+        try:
+            files = {str((sp / line.split(",")[0]).resolve()) for line in
+                     (info / "RECORD").read_text().splitlines() if line}
+        except OSError:
+            files = set()
+        return version, files
+    return None, set()
+
+
 def check_nvidia(site: str | None, ffi: str | None) -> None:
+    """Header version == the wheel's version, header and library from that one wheel (its RECORD),
+    NCCL's live ``ncclGetVersion`` == ``NCCL_VERSION_CODE``, and (--ffi) the FFI binds that file."""
     if site is None:
         import sysconfig
         site = sysconfig.get_paths()["purelib"]
     sp = Path(site)
     resolved = _ldd(ffi)[0] if ffi else {}
-    for name, (hdr, pfx, libglob, sym, enc) in _NV.items():
-        dep = f"{name}"
-        headers = sorted(sp.glob(f"nvidia/*/include/{hdr}"))
-        libs = sorted(p for p in sp.glob(f"nvidia/*/lib/{libglob}") if p.is_file() and not p.is_symlink())
-        if not headers or not libs:
-            raise Failed(dep, f"no {hdr} / {libglob} under {sp}/nvidia", "uv sync the CUDA extra (the "
-                         "wheels the FFI is built against) into this venv")
+    for dep, (hdr, pfx, libglob, dist, live) in _NV.items():
+        version, files = _wheel(sp, dist)
+        headers = sorted(p for p in (sp / "nvidia").glob(f"**/include/{hdr}"))
+        libs = sorted(p for p in (sp / "nvidia").glob(f"**/lib/{libglob}") if p.is_file() and not p.is_symlink())
+        if version is None or not headers or not libs:
+            raise Failed(dep, f"wheel {dist}* {version or 'not installed'}, header {hdr} "
+                         f"{'found' if headers else 'missing'}, library {libglob} {'found' if libs else 'missing'} "
+                         f"under {sp}", "uv sync --extra cuda13 (the wheels the FFI is built against)")
         hv = _header_version(headers[0], pfx)
-        try:
-            h = ctypes.CDLL(str(libs[0]))
-            v = ctypes.c_int(0)
-            rc = getattr(h, sym)(ctypes.byref(v))
-            lv = v.value if rc == 0 else None
-        except (OSError, AttributeError) as exc:
-            raise Failed(dep, f"{libs[0]} does not load or has no {sym}: {exc}", "reinstall the wheel")
-        if hv is None or lv is None or enc(*hv) != lv:
-            raise Failed(dep, f"header {headers[0]} says {hv}, library {libs[0]} reports {lv}",
-                         "the wheel's header and library come from different releases: reinstall it "
-                         "(uv sync --reinstall-package <wheel>) and rebuild the FFI")
-        where = ""
+        wv = tuple(int(x) for x in re.findall(r"\d+", version)[:3])
+        if hv is None or hv != wv:
+            raise Failed(dep, f"header {headers[0]} says {hv}, the installed wheel is {version}",
+                         f"reinstall the wheel (uv sync --reinstall-package {dist.replace('_', '-')}-cu13) "
+                         "and rebuild the CUDA leg")
+        stray = [str(p) for p in (headers[0], libs[0]) if files and str(p.resolve()) not in files]
+        if stray:
+            raise Failed(dep, f"{stray} not installed by the {version} wheel (another release copied in)",
+                         "remove the copied file and reinstall the wheel")
+        shown = f"header {'.'.join(map(str, hv))} == wheel {version}; header and {libs[0].name} from it"
+        if live:
+            try:
+                v = ctypes.c_int(0)
+                rc = getattr(ctypes.CDLL(str(libs[0])), live)(ctypes.byref(v))
+            except (OSError, AttributeError) as exc:
+                raise Failed(dep, f"{libs[0]} does not load or has no {live}: {exc}", "reinstall the wheel")
+            code = hv[0] * 10000 + hv[1] * 100 + hv[2]
+            if rc != 0 or v.value != code:
+                raise Failed(dep, f"{libs[0]} reports {v.value} (rc {rc}), its header {code}",
+                             "reinstall the wheel and rebuild the CUDA leg")
+            shown += f"; live {live} {v.value}"
         if resolved:
-            hit = {k: v for k, v in resolved.items() if k.startswith(libs[0].name.split(".so")[0])}
+            stem = libs[0].name.split(".so")[0]
+            hit = {k: v for k, v in resolved.items() if k.startswith(stem + ".so")}
             if hit and any(v is None or os.path.realpath(v) != os.path.realpath(libs[0]) for v in hit.values()):
                 raise Failed(dep, f"the FFI {ffi} resolves {hit}, not the venv's {libs[0]}",
                              "drop the other copy from LD_LIBRARY_PATH (the leg's search path is $ORIGIN)")
-            where = f"; the FFI resolves it" if hit else ""
-        ok(dep, f"header {'.'.join(map(str, hv))} == library {lv}{where}")
+            shown += "; the FFI binds it" if hit else ""
+        ok(dep, shown)
 
 
 # ----------------------------------------------------------------- cholesky --
