@@ -37,8 +37,8 @@ def main():
     full=jax.ShapeDtypeStruct((meta.nk_tot,n,n),np.complex128,sharding=face)
     assert owner._dyson_room(ledger,mesh,(full,full,full))==base-3*meta.nk_tot*n*n*16//mesh.size
     unknown=CapacityLedger(meta,mesh_xy=mesh,device_budget_bytes=budget)
-    assert owner._dyson_room(unknown,mesh,(H,C)) is None
-    assert owner._dyson_room(None,mesh,(H,C)) is None
+    assert owner._dyson_room(unknown,mesh,(H,C))==memory.room(bucketed=False)
+    assert owner._dyson_room(None,mesh,(H,C))==memory.room(bucketed=False)
 
     receipt=lambda:dict(seconds={},memory=[],compiled=[])
     config=SimpleNamespace(backend=SimpleNamespace(linalg='distributed'))

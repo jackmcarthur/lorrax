@@ -77,7 +77,8 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     slope = built.slope
     algebra = {
         "linalg": resolution.layout,
-        "solve": lu.describe() + "; capacity resolved at each actual operand batch",
+        "solve": (lu.describe() if lu is not None else "solve_lu: 'distributed'")
+                 + "; capacity resolved at each actual operand batch",
         "batched_route": route,
         "prefactor": pref,
         "prefactor_q_count": int(meta.nk_tot),
@@ -104,14 +105,20 @@ def _dyson_room(ledger, mesh_xy, args):
     shapes and shardings. The physical full-q count belongs to the prefactor,
     never to the storage price of a parent or streamed q batch.
     """
-    ranks = int(mesh_xy.size)
-    if ledger is None or ranks <= 1:
-        return None
-    try:
-        live = ledger.live_stages
-    except ValueError:
-        return None
-    ledger.at_phase()
+    from common.gpu_utils import device_budget_bytes
+    from lxkit import memory
+    room = None
+    if ledger is not None and int(mesh_xy.size) > 1:
+        try:
+            live = ledger.live_stages
+        except ValueError:
+            pass
+        else:
+            ledger.at_phase()
+            room = ledger.room_bytes_per_rank(concurrent_with=live)
+    if room is None:
+        device_budget_bytes()  # Resolve the common run budget if not yet initialized.
+        room = memory.room(bucketed=False)
     future = 0
     for a in args:
         if isinstance(a, jax.Array):
@@ -120,7 +127,7 @@ def _dyson_room(ledger, mesh_xy, args):
         shape = (sharding.shard_shape(a.shape) if sharding is not None
                  else NamedSharding(mesh_xy, P(None, "x", "y")).shard_shape(a.shape))
         future += int(np.prod(shape)) * np.dtype(a.dtype).itemsize
-    return max(0, ledger.room_bytes_per_rank(concurrent_with=live) - future)
+    return max(0, int(room) - future)
 
 
 #: The solve-bearing programs per (builder, program, call signature, LU decision): never the room.
@@ -137,14 +144,13 @@ class _Decided:
     name, signature, decision)``, built with this room's plan on a miss and only ever traced
     on that signature: a room that moves without moving the decision lowers and compiles
     nothing again (COMPILEAUDIT 2026-10-05 rule 4).  A value (``builder`` is
-    :func:`_response_programs`' key; ``lu``, that room's plan, is not compared), so equal
+    :func:`_response_programs`' key), so equal
     programs compare equal.  The check-then-set needs no lock: ``compile_ahead`` lowers on
     the calling thread (INVARIANTS 21/25).
     """
     builder: tuple
     name: str
     ledger: object = field(compare=False, repr=False)
-    lu: object = field(compare=False, repr=False)
     resolved: dict = field(default_factory=dict, compare=False, repr=False)
 
     def resolve(self, *args):
@@ -203,7 +209,7 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     """Reuse compiled algebra across SC maps without retaining state arrays.
 
     Returns the builder: ``slope``, the charge ``moments`` (no solve), and
-    ``bind(ledger) -> (dyson, moments, lu)`` with the configured Dyson LU plan;
+    ``bind(ledger) -> (dyson, moments, lu)`` with a local plan or no eager LU;
     each actual call resolves its room (:func:`_dyson_room`: distrib_la takes one_device only where one whole
     matrix fits it, else the distributed library).  On the distributed backend the
     programs that hold the solve are :class:`_Decided`, keyed on that plan's decision and
@@ -312,8 +318,9 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     def bind(ledger):
         # Configuration only: the actual operand batch and live room own the
         # solve route. A charge moment has no LU and must not trip its guard.
-        lu = plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route)
-        progs = local or {name: _Decided(key, name, ledger, lu) for name in names}
+        lu = (plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route)
+              if backend == "off" else None)
+        progs = local or {name: _Decided(key, name, ledger) for name in names}
         pairs = {k.split(":", 1)[1]: v for k, v in progs.items() if k.startswith("pair:")}
         resident = backend == "off" and volume is None
         dyson = SimpleNamespace(value=progs["value"], pair=pairs.get,
