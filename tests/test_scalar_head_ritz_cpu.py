@@ -128,6 +128,54 @@ def test_scalar_pencil_refuses_other_rank_failure_before_payload_agreement(monke
         owner.scalar_head_ritz(z,value,slope,moment_m1=.15,moment_m3=.0135,mesh=object())
 
 
+def test_scalar_program_admits_new_buffers_beside_current_prepared_payload(monkeypatch):
+    import jax
+    import jax.numpy as jnp
+    import distrib_la
+    import common.gpu_utils as gpu
+    import runtime.aot_memory as aot
+    from lxkit import memory
+    from gw.tangential_head_scalar import _execute
+    jax.config.update('jax_enable_x64',True)
+    program=jax.jit(lambda x:x*2)
+    args=(jnp.arange(3,dtype=jnp.float64),)
+    expected_new=aot.compiled_new_bytes(program.lower(*args).compile())+7
+    seen=[]
+    monkeypatch.setattr(gpu,'device_budget_bytes',lambda:1000)
+    monkeypatch.setattr(memory,'room',lambda **kw:64)
+    monkeypatch.setattr(memory,'book',lambda *a,**kw:None)
+    monkeypatch.setattr(distrib_la,'local_eigh_workspace',lambda *a:7)
+    def admit(stage,price,room):
+        seen.append((price,room))
+    monkeypatch.setattr(memory,'admit',admit)
+    output,priced=_execute(program,args,mesh=object(),side=3,label='test')
+    np.testing.assert_array_equal(output,args[0]*2)
+    assert priced==expected_new
+    # The run has 1000 total bytes, but only64 remain beside the current
+    # operator/RHS/body and already materialized scalar args. No double charge.
+    assert len(seen)==1 and seen[0][1]==64
+
+
+def test_scalar_pencil_reuses_shared_single_matrix_dispatch_policy(monkeypatch):
+    import jax
+    import distrib_la
+    from gw import tangential_head_scalar as owner
+    jax.config.update('jax_enable_x64',True)
+    real=distrib_la.eigh_local
+    shapes=[]
+    def record(a):
+        shapes.append(a.shape)
+        return real(a)
+    monkeypatch.setattr(distrib_la,'eigh_local',record)
+    owner._scalar_ritz_program.cache_clear()
+    owner._scalar_check_program.cache_clear()
+    z=np.array([0j,.2j,.7j]);value,slope=_measure(z,np.array([.3]),np.array([.5]))
+    model=owner.scalar_head_ritz(z,value,slope,moment_m1=.15,moment_m3=.0135)
+    owner.scalar_head_certificate(model,dict(z=z,Wc=value,dWc_ds=slope,vc0=4.,M1=.15,M3=.0135),
+        eta_ry=.02,static_value=value[0],inverse_m1=.5/.3**2)
+    assert len(shapes)>=3 and all(len(shape)==2 for shape in shapes)
+
+
 def test_scalar_cell_actions_match_independent_rank_one_completed_hamiltonian():
     import jax
     from vcoul import CoulombGeometry,get_kernel,scalar_resolvent_head,slab_minibz_photon_cubature

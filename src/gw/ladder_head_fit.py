@@ -177,7 +177,7 @@ def build_ladder_head_fit(restart,config,meta,mesh,head_resolver,*,identity):
     import hashlib
     import json
     from pathlib import Path
-    from bse.w_ladder import prepare_ladder_head
+    from bse.w_ladder import prepare_ladder_head,LADDER_RESPONSE_CONVENTION
     from bse.head_resolvent import (build_head_rhs,head_prefactor,solve_head_tensor)
     from common.collectives import gather_to_host
     from vcoul import CoulombGeometry,get_kernel,scalar_resolvent_head
@@ -254,7 +254,7 @@ def build_ladder_head_fit(restart,config,meta,mesh,head_resolver,*,identity):
     head_identity['head_accuracy_sha256']=hashlib.sha256(json.dumps(
         model['provenance']['accuracy'],sort_keys=True).encode()).hexdigest()
     model['provenance'].update(head_identity=head_identity,solves=solves,
-        response_convention='physical-ra-v1',quadrature=state['fields']['quadrature'])
+        response_convention=LADDER_RESPONSE_CONVENTION,quadrature=state['fields']['quadrature'])
     return IterationHeadSamples(omegas=tuple(cache),samples=samples,
         sigma_energies_ry=np.empty((0,0)),sigma_occupations=np.empty((0,0)),
         efermi_ry=0.,scalar_model=model)

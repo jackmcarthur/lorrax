@@ -21,6 +21,15 @@ def _all_valid(value,mesh):
     return bool(np.all(all_gather_processes(np.asarray([value],bool))))
 
 
+def _one_parent_eigh(a,*,cut=None):
+    """The scalar port has one parent; use its shared matrix solve policy."""
+    from distrib_la import eigh_local
+    if a.ndim!=3 or a.shape[0]!=1:
+        raise ValueError('the scalar-head eigensolver expects exactly one parent')
+    values,vectors=eigh_local(a[0])
+    return values[None],vectors[None]
+
+
 def _execute(program,args,*,mesh,side,label):
     """Admit the actual replicated small program and its provider workspace."""
     if not jax.config.jax_enable_x64:
@@ -35,12 +44,17 @@ def _execute(program,args,*,mesh,side,label):
     from runtime.aot_memory import compiled_new_bytes
     from common.gpu_utils import device_budget_bytes
     executable=program.lower(*args).compile()
-    resident=sum(int(a.size*a.dtype.itemsize) for a in args)
+    # Prepared H, its RHS, the body state and these concrete scalar inputs
+    # coexist with this execution. The allocator room already charges all
+    # of them; only the executable's NEW buffers and provider scratch remain.
+    jax.block_until_ready(args)
+    device_budget_bytes()
+    room=memory.room(bucketed=False)
     vendor=local_eigh_workspace(mesh,1,int(side),np.complex128)
-    total=resident+compiled_new_bytes(executable)+vendor
-    price=memory.priced(total,f'scalar head {label}: actual program + provider workspace')
+    total=compiled_new_bytes(executable)+vendor
+    price=memory.priced(total,f'scalar head {label}: new program buffers + provider beside live operands')
     memory.book(price,stage='head.scalar.'+label)
-    memory.admit('scalar_head.'+label,price,device_budget_bytes())
+    memory.admit('scalar_head.'+label,price,room)
     return executable(*args),int(total)
 
 
@@ -66,7 +80,6 @@ def _shared_poles(model,mesh):
 
 @lru_cache(maxsize=None)
 def _scalar_ritz_program(gram_keep):
-    from distrib_la import eigh_local
     from .tangential_pencil import assemble_tangential_pencil
     from .tangential_reduction import reduce_tangential_pencil
     from .tangential_gates import apply_tangential_zero_policy, retained_moment_identity
@@ -74,9 +87,6 @@ def _scalar_ritz_program(gram_keep):
     from .tangential_recipe import shared_real_pole_gates_v1_r3b as canonical_gates
     gates = dict(canonical_gates,normalized_gram_keep=dict(
         canonical_gates['normalized_gram_keep'],threshold=float(gram_keep)))
-
-    def eigh(a, *, cut=None):
-        return tuple(eigh_local(a))
 
     @jax.jit
     def execute(points, values, slopes, m1, m3):
@@ -87,7 +97,7 @@ def _scalar_ritz_program(gram_keep):
             (qi,m1.reshape(1,1,1),m3.reshape(1,1,1)),matmul=_mm)
         active = jnp.ones((1,points.size+1),bool)
         model, diagnostics, coefficients = reduce_tangential_pencil(
-            pencil,active,eigh=eigh,matmul=_mm,gates=gates)
+            pencil,active,eigh=_one_parent_eigh,matmul=_mm,gates=gates)
         model,zero = apply_tangential_zero_policy(model,gates=gates)
         selector = jnp.eye(points.size+1,dtype=jnp.complex128)[None,:,-1:]
         retained = retained_moment_identity(pencil,coefficients,model,selector,matmul=_mm)
@@ -156,12 +166,8 @@ def scalar_head_ritz(z, values, slopes, *, moment_m1, moment_m3, gram_keep=None,
 
 @lru_cache(maxsize=None)
 def _scalar_check_program():
-    from distrib_la import eigh_local
     from .tangential_local import _mm, _round_check_equations
     from .tangential_recipe import shared_real_pole_gates_v1_r3b as gates
-
-    def eigh(a, *, cut=None):
-        return tuple(eigh_local(a))
 
     @jax.jit
     def execute(omega,residue,z,values,slopes,bare,eta,m1,m3):
@@ -170,7 +176,7 @@ def _scalar_check_program():
         return _round_check_equations(model,(),(1/jnp.sqrt(bare)).reshape(1,1,1),
             values[None,:,None,None],slopes[None,:,None,None],z,eta,
             m1.reshape(1,1,1),m3.reshape(1,1,1),jnp.ones((1,1,1),jnp.complex128),
-            matmul=_mm,eigh=eigh,gates=gates,ordered=False)
+            matmul=_mm,eigh=_one_parent_eigh,gates=gates,ordered=False)
     return execute
 
 
