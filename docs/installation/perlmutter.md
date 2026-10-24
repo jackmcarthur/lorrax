@@ -153,14 +153,15 @@ The result is `1 passed`, in about 5 min on cold caches.
 
 `config/perlmutter/install_deps.sh` is the supported install. Every persistent
 filesystem a compute node sees here is slow per file: one `open()` costs
-9-30 ms on CFS, `$HOME` and `/global/common` against 0.01 ms in node-local
-`/tmp`, and a run opens thousands of files (the interpreter, the venv, the CUDA
-headers NVRTC re-reads on every build, the FFI closure). A tree kept there runs
-up to 3.5x slower than a clone on `$SCRATCH`. So the installer builds the whole
+3.5 ms on `/global/common` and 10 ms on CFS and `$HOME`, against 0.005 ms in
+node-local `/tmp`, and a run opens thousands of files (the interpreter, the venv, the CUDA
+headers NVRTC re-reads on every build, the FFI closure). Cold, the hsuite took 1164-1352 s from
+`/global/common` (the module), 592 s from a clone on `$SCRATCH` and 524 s from
+the image. So the installer builds the whole
 runtime (uv's Python, the venv with every CUDA wheel, the source, both FFI legs
 with their closure records, compiled `.pyc`) at the node-local path
 `/tmp/lorrax-$USER/rt-<rev>-<time>` on the login node, packs it into one
-2.4 GB archive under the prefix, and removes the build tree. Every job restores
+2.6 GB archive under the prefix, and removes the build tree. Every job restores
 the archive to that same path on each node before its first rank starts, so a
 run reads one file from the install filesystem, and the prefix can be anywhere.
 
@@ -201,7 +202,7 @@ How `lorrax-run` (`scripts/runtime_image.sh`) behaves:
   find it in 0.3 s. Every absolute path the venv, the editable install and the
   closure records name is the recorded one, so the closure gate does not rehash
   and the caches key as at build time.
-- **Room.** The node needs about 9 GB free during the restore, 4.9 GB after.
+- **Room.** The node needs about 9.2 GB free during the restore, 5.1 GB after.
   Where `/tmp` lacks it the tree goes to `/dev/shm`, then `$TMPDIR` (or
   `LORRAX_IMAGE_ROOTS`), linked at the canonical path. With no node-local room
   at all the node runs from one extracted copy at `<prefix>/unpacked/` (made
