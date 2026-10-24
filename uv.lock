@@ -1320,6 +1320,8 @@ cuda12 = [
 ]
 cuda13 = [
     { name = "jax", extra = ["cuda13"] },
+    { name = "nvidia-cublasmp-cu13", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cusolvermp-cu13", marker = "sys_platform == 'linux'" },
     { name = "nvidia-mathdx", marker = "sys_platform == 'linux'" },
 ]
 docs = [
@@ -1365,6 +1367,8 @@ requires-dist = [
     { name = "mkdocstrings", marker = "extra == 'docs'", specifier = ">=0.30.1" },
     { name = "mkdocstrings-python", marker = "extra == 'docs'", specifier = ">=1.18.2" },
     { name = "numpy", specifier = ">=2.3.1" },
+    { name = "nvidia-cublasmp-cu13", marker = "sys_platform == 'linux' and extra == 'cuda13'", specifier = "==0.10.0.3695" },
+    { name = "nvidia-cusolvermp-cu13", marker = "sys_platform == 'linux' and extra == 'cuda13'", specifier = "==0.9.1.9318.post1" },
     { name = "nvidia-mathdx", marker = "sys_platform == 'linux' and extra == 'cuda12'", specifier = "==25.6.0" },
     { name = "nvidia-mathdx", marker = "sys_platform == 'linux' and extra == 'cuda13'", specifier = "==25.6.0" },
     { name = "scipy", specifier = ">=1.16.0" },
@@ -1966,6 +1970,19 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-cublasmp-cu13"
+version = "0.10.0.3695"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nvidia-cublas" },
+    { name = "nvidia-nccl-cu13" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f8/93/13cc94ca54a99f0921d9e86c63a0582de19272619950283779fc7425ceae/nvidia_cublasmp_cu13-0.10.0.3695-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:492483fd3f8c403b6e692f352600556494fa88a25e9f476ba24981b67701f5bc", size = 12134302, upload-time = "2026-07-13T22:18:11.642Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/70/fee4e51defd6c3d539195aeebd28e0d7d5aac1acfc8e4f57be7d74d6aaeb/nvidia_cublasmp_cu13-0.10.0.3695-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:c553fc66f55ccfeddc4031361b8559b60f38aac753b2032409e83f94a4594c43", size = 12305376, upload-time = "2026-07-13T22:18:33.938Z" },
+]
+
+[[package]]
 name = "nvidia-cuda-cccl"
 version = "13.3.3.4.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2143,6 +2160,22 @@ dependencies = [
 wheels = [
     { url = "https://files.pythonhosted.org/packages/03/99/686ff9bf3a82a531c62b1a5c614476e8dfa24a9d89067aeedf3592ee4538/nvidia_cusolver_cu12-11.7.5.82-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:62efa83e4ace59a4c734d052bb72158e888aa7b770e1a5f601682f16fe5b4fd2", size = 337869834, upload-time = "2025-06-05T20:06:53.125Z" },
     { url = "https://files.pythonhosted.org/packages/33/40/79b0c64d44d6c166c0964ec1d803d067f4a145cca23e23925fd351d0e642/nvidia_cusolver_cu12-11.7.5.82-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:15da72d1340d29b5b3cf3fd100e3cd53421dde36002eda6ed93811af63c40d88", size = 338117415, upload-time = "2025-06-05T20:07:16.809Z" },
+]
+
+[[package]]
+name = "nvidia-cusolvermp-cu13"
+version = "0.9.1.9318.post1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nvidia-cublas" },
+    { name = "nvidia-cublasmp-cu13" },
+    { name = "nvidia-cuda-runtime" },
+    { name = "nvidia-cusolver" },
+    { name = "nvidia-nccl-cu13" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c0/cd/ff1e67ed4c5c0fbdc583cefd3ffc7c0abe5598eaca89c0f54154bd38027d/nvidia_cusolvermp_cu13-0.9.1.9318.post1-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:846f5fb1d135cf757d6e3865ea57dd3cc77b70a00e234ced19a3c3b689c0bfb3", size = 14530148, upload-time = "2026-08-12T00:10:58.619Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/a8/0926fac62d3746dccaa74778a6cd990a614da7045bf2e5637a8bb598cd3f/nvidia_cusolvermp_cu13-0.9.1.9318.post1-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:8b55b0b239255119f78f6def00f414986389d822412771d7f2655f766526c6de", size = 13734791, upload-time = "2026-08-12T00:11:20.031Z" },
 ]
 
 [[package]]
