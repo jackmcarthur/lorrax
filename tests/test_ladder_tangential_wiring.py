@@ -102,7 +102,7 @@ def test_ladder_diagram_and_rung_digest_reach_restart_validation():
     config = NS(screening=NS(diagrams="w_bse"), debug=NS(write_w=False), input_file="cohsex.in",
                 write_poles=False, restart=True, head=NS(correction="off"))
     meta = NS(tangential_recipe={"bank_rule_tolerance": 1e-8}, tangential_capacity=NS(live_stages=()),
-              cell_volume=10.)
+              cell_volume=10., nspinor=1)
     source = ns["make_ladder_tangential_source"](None, None, quad=None, e_ref=0,
         sym=None, centroid_indices=[], config=config, meta=meta, mesh_xy=None,
         tensors_filename="restart.h5", head_resolver=None)
@@ -114,6 +114,8 @@ def test_ladder_diagram_and_rung_digest_reach_restart_validation():
             material_class="insulator", bank_source=source)
     assert captured["screening_diagrams"] == "w_bse"
     assert captured["ladder_response_convention"] == LADDER_RESPONSE_CONVENTION
+    assert captured["ladder_density_channel"] == "charge"
+    assert captured["ladder_exchange_spin_weight"] == 2.
     assert captured["ladder_static_w_sha256"] == hashlib.sha256(static.tobytes()).hexdigest()
     assert captured["ladder_static_head"] == {"policy": "exact", "q0_head_ry": .01}
     assert captured["ladder_head_policy"] == "off"
@@ -128,6 +130,10 @@ def test_ladder_diagram_and_rung_digest_reach_restart_validation():
     ns["_check_identity"](captured, captured)
     for stale in (base, dict(captured, screening_diagrams="w_rpa"),
                   dict(captured, ladder_response_convention="folded-hybrid"),
+                  dict(captured, ladder_density_channel="triplet"),
+                  dict(captured, ladder_exchange_spin_weight=0.),
+                  {k: v for k, v in captured.items() if k != "ladder_density_channel"},
+                  {k: v for k, v in captured.items() if k != "ladder_exchange_spin_weight"},
                   dict(captured, ladder_static_w_sha256="other-rung"),
                   dict(captured, ladder_static_head={"policy": "exact", "q0_head_ry": .02}),
                   dict(captured, ladder_head_policy="full"),
