@@ -143,7 +143,7 @@ bash install_deps.sh [PREFIX] [--ref REF] [--with-xc] [--node-dir DIR]
 
 #### What `install_deps.sh` does {: #perlmutter-steps }
 
-1. Checks free space and quota, and refuses in one line when the prefix (2.5 GB), the node-local build directory (7 GB) or uv's download cache (4.5 GB when empty) lacks room.
+1. Checks free space and quota, and refuses in one line when the prefix (2.5 GiB), the node-local build directory (7 GB) or uv's download cache (4.5 GB when empty) lacks room.
 2. Puts a pinned uv release binary in `PREFIX/bin`. uv's download cache and the compiler cache go to `$SCRATCH/.cache`, never to the prefix or `$HOME`.
 3. Fetches the requested commit into `<node-dir>/rt-<revision>-<time>/lorrax` and runs `uv sync --frozen --extra cuda13`. That installs CPython 3.12 inside the image and every Python dependency at the versions in `uv.lock`: JAX with its CUDA 13 plugin, the CUDA libraries with nvcc, NCCL, cuSOLVERMp, cuBLASMp and nvidia-mathdx, all as wheels.
 4. With `--with-xc`, installs and patches `jax_xc` inside the image.
@@ -214,11 +214,11 @@ The caches (compiled XLA programs, NVRTC images, the CUDA JIT cache) live under 
     #   push, use the commit's SHA in the URL instead of the branch name.)
     #
     #   PREFIX     where the install goes (default $SCRATCH/lorrax): any persistent
-    #              filesystem, fast or slow; it holds one 2.4 GB archive, so it
+    #              filesystem, fast or slow; it holds one 2.56 GB archive, so it
     #              needs about 2.5 GB.  Every job reads that archive once per node
     #              and runs from a node-local copy (below), so a slow filesystem
     #              (CFS, $HOME, /global/common) costs about 7 s per node instead of
-    #              a 2-3.5x slower run.
+    #              a 2.2-2.6x slower hsuite run.
     #   --ref REF  the LORRAX branch, tag or commit to install (default main).
     #              Ignored when the script runs from inside a checkout: the image is
     #              then built from that checkout's HEAD commit (not from uncommitted
