@@ -4870,6 +4870,10 @@ def validate_material_inputs(config, material_class):
     family = config.occ_smearing_family
     width_ry = config.occ_smearing_width_ry
     if material_class == "metal":
+        if ((config.compute_mode_raw or "auto").strip().lower() == "auto"
+                and config.compute_mode is not ComputeMode.X_ONLY):
+            raise ValueError(
+                "metals must be treated with full-frequency GW: set compute_mode = tangential")
         if config.compute_mode is ComputeMode.GN_PPM:
             raise ValueError(
                 "GATE gn_ppm_refuses_metals: WFN occupations identify a "
@@ -4888,7 +4892,7 @@ def validate_material_inputs(config, material_class):
             raise ValueError(
                 "GATE fractional_occupations_require_mpa: WFN occupations "
                 f"identify a metal, but compute_mode={config.compute_mode.value}; "
-                "use compute_mode=mpa for screened GW or "
+                "use compute_mode=tangential for screened GW or "
                 "compute_mode=x_only for bare exchange.")
         if config.sc.head_update in INSULATOR_HEAD_UPDATES:
             raise ValueError(
