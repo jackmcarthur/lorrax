@@ -13,7 +13,8 @@
 #   --with-xc  also install the patched jax_xc 0.0.11 (the nscf driver only).
 #   --no-ffi   skip building the two native libraries.
 #
-# Runs on a login node in about ten minutes; no allocation is needed.
+# Runs on a login node in a few minutes (about 90 s with warm uv and ccache
+# caches); no allocation is needed.
 #
 # Taken from Perlmutter, not installed (the build scripts load them; the
 # versions are pinned once in ffi_mpi.sh):
@@ -43,7 +44,7 @@ while (($#)); do
         --ref) REF="$2"; shift 2 ;;
         --with-xc) WITH_XC=1; shift ;;
         --no-ffi) BUILD_FFI=0; shift ;;
-        -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
         -*) echo "install_deps: unknown option $1" >&2; exit 2 ;;
         *) PREFIX="$1"; shift ;;
     esac
