@@ -115,11 +115,14 @@ def head_operator_key(mesh_xy: Mesh, data: dict, *, include_w: bool,
     ``include_w`` selects the direct rung. Without that rung, the historical
     folded RPA builder is used unless ``physical_branches`` explicitly selects
     the physical R/A control. The
-    k-grid and the pair-window pads set the shapes, the mesh sets the sharding,
+    k-grid and the pair-window pads set the shapes, the complete mesh identity
+    (axes and device assignment) sets the sharding,
     and ``fuse_ladder_rung`` selects ``bse_ring_comm._impl_core_fused`` — a cost
     switch, but still a different program.  ``V_q0`` / ``W_q`` VALUES are absent
     on purpose: they are runtime operands.
     """
+    from distrib_la import mesh_key
+
     return (
         "bse.head_resolvent",
         bool(include_w),
@@ -127,7 +130,7 @@ def head_operator_key(mesh_xy: Mesh, data: dict, *, include_w: bool,
         bool(fuse_ladder_rung),
         (int(data["nkx"]), int(data["nky"]), int(data["nkz"])),
         (int(data["n_cond_pad"]), int(data["n_val_pad"])),
-        tuple(int(s) for s in mesh_xy.devices.shape),
+        mesh_key(mesh_xy),
     )
 
 
