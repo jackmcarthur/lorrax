@@ -33,6 +33,10 @@ mkdir -p "$RELEASES"
 mkdir "$SRC_REL.tmp.$$"
 git -C "$CAND/src" archive --format=tar "$REV" | tar -x -C "$SRC_REL.tmp.$$"
 echo "$REV" > "$SRC_REL.tmp.$$/SOURCE_COMMIT"
+# The NVRTC image store accept.sh built on the candidate's GPUs (ffi.fft.CUBIN_STORE).
+[[ -f "$CAND/source/cubin_store/.complete" ]] \
+    || lorrax_module_die "no $CAND/source/cubin_store (accept.sh -n 4 builds it)"
+cp -a "$CAND/source/cubin_store" "$SRC_REL.tmp.$$/cubin_store"
 cp -a "$CAND/bundle" "$BUN_REL.tmp.$$"
 "$VENV/bin/python" - "$CAND/bundle" "$BUN_REL.tmp.$$" <<'PY'
 import hashlib, sys

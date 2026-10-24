@@ -79,11 +79,19 @@ def main() -> None:
               if len(line.split()) > 5 and ".so" in line.split()[-1]}
     toolkit = sorted(p for p in mapped if p.startswith(str(sdk) + "/"))
     assert not toolkit, f"toolkit CUDA libraries mapped: {toolkit}"
-    site = Path(jax.__file__).resolve().parents[1]
+    venv_site = Path(jax.__file__).resolve().parents[1]
+    # The node-local copy of nvidia/ (launch/lorrax_stage_local.py) when staged:
+    # it must be the one mapped, and byte-identical to the venv's wheels.
+    site = Path(os.environ.get("LORRAX_STAGED_SITE") or venv_site)
     wheels = site / "nvidia" / "cu13" / "lib"
     for name in ("libcudart.so.13", "libcublas.so.13", "libcufft.so.12"):
         want = os.path.realpath(wheels / name)
         assert want in mapped, f"{name}: the wheel's {want} is not mapped"
+        if site != venv_site:
+            assert sha256(Path(want)) == sha256(venv_site / "nvidia" / "cu13" / "lib" / name), \
+                f"staged {want} differs from the venv's"
+    if site != venv_site:
+        say(f"PASS nvidia/ staged at {site}, byte-identical to {venv_site}")
     launch = [d for d in os.environ.get("LD_LIBRARY_PATH", "").split(":")
               if d and os.path.isfile(os.path.join(d, "libcudart.so"))]
     assert launch and os.path.realpath(os.path.join(launch[0], "libcudart.so")) \

@@ -4,7 +4,9 @@
 # that is not a checkout (the candidate's accept/).  The step shape selects:
 #   -n 1  Gate 10 (src/ffi/cpp/gate_one_odr.py), which must be alone in its
 #         MPI world: its HDF5 file is per process;
-#   -n 4  verify_runtime.py and tests/hsuite at P4.
+#   -n 4  the release's NVRTC image store (scripts/build_cubin_store.py into
+#         <cand>/source/cubin_store, which publish.sh ships), then
+#         verify_runtime.py and tests/hsuite at P4.
 #
 #   S=<cand>/source/src/ffi/cpp/select_gpu.sh
 #   srun -N 1 -n 1 --gpus-per-node=4 $S bash config/perlmutter/module/accept.sh <cand>
@@ -53,6 +55,26 @@ case "${SLURM_NTASKS:?}" in
     say "Gate 10 PASS"
     ;;
 4)
+    # The release's NVRTC image store (ffi.fft.CUBIN_STORE): every rank builds its share
+    # of scripts/build_cubin_store.py's images into a fresh cache on its own GPU; rank 0
+    # collects them into the snapshot once all four are done.  A first run of the
+    # published module then links them instead of compiling with NVRTC.
+    STORE="$LORRAX_ROOT/cubin_store"
+    if [[ ! -f "$STORE/.complete" ]]; then
+        t0=$SECONDS
+        SCRATCH="$OUT/cubin_build" python -u "$LORRAX_ROOT/scripts/build_cubin_store.py" \
+            > "$OUT/cubin_build.rank$RANK.log" 2>&1 \
+            || { echo "[accept] cubin store build failed on rank $RANK: $OUT/cubin_build.rank$RANK.log" >&2; exit 1; }
+        touch "$OUT/cubin_build.done.$RANK"
+        if [[ "$RANK" == 0 ]]; then
+            until [[ $(find "$OUT" -maxdepth 1 -name 'cubin_build.done.*' | wc -l) -ge 4 ]]; do sleep 2; done
+            rm -rf "$STORE.tmp"; mkdir -p "$STORE.tmp"
+            find "$OUT/cubin_build/.cache/lorrax/kconv_mathdx" -type f -name '*.cubin' -exec cp -p {} "$STORE.tmp/" \;
+            mv "$STORE.tmp" "$STORE"; touch "$STORE/.complete"
+            say "cubin store: $(find "$STORE" -name '*.cubin' | wc -l) images, $(du -sh "$STORE" | cut -f1), $((SECONDS - t0)) s"
+        fi
+        until [[ -f "$STORE/.complete" ]]; do sleep 2; done
+    fi
     LORRAX_MODULE_EXPECT="$EXPECT" python -u "$HERE/verify_runtime.py"
     python -m pytest "$LORRAX_ROOT/tests/hsuite" -q -p no:cacheprovider
     touch "$OUT/ok.$RANK"

@@ -202,7 +202,14 @@ The recipe is `config/perlmutter/module/`; it works for any install prefix.
 | Cray MPICH, LibSci | `ffi_mpi.sh` |
 | parallel HDF5 | `build_ffi_cuda.sh`, `build_ffi_host.sh` |
 
-The module venv holds a clone's CUDA libraries. `setup_env.sh` installs
+The module venv holds a clone's CUDA libraries. Inside a Slurm job the
+module stages its `nvidia/` tree (CUDA libraries, NCCL, cuDNN, the MathDx
+headers; 3.3 GB) once per node to `/tmp/lorrax-$USER` (else
+`$SCRATCH/.cache/lorrax/stage`) at interpreter start, the first rank under a
+node lock and the others reusing it, and runs from the copy: from the
+read-only `/global/common` mount, a cold hsuite at P4 took 1352 s against
+773 s from `$SCRATCH` on the same node, all in XLA and NVRTC compile.
+`LORRAX_STAGE_LOCAL=off` keeps the venv paths. `setup_env.sh` installs
 `uv export --extra cuda13` of the checkout's lock with `--no-deps`, refuses a
 package at any other version (and a lock whose JAX or NCCL disagrees with
 `stack.sh`), and links `venv/lorrax-launch/libcudart.so` to the wheel's CUDA
@@ -289,6 +296,11 @@ the bundle record the commit they came from.
      `runtime` is imported from the snapshot, that both legs are mapped from
      the bundle with their manifest hashes, and that no pip CUDA library is
      mapped.
+
+   - `-n 4` first builds the release's NVRTC image store
+     (`scripts/build_cubin_store.py`, each rank on its own GPU) into
+     `cand/source/cubin_store`, which `publish.sh` ships, so a first run of the
+     published module links those images instead of compiling them.
 
    Passing writes `accept/gate10.ok` and `accept/ok.<rank>`.
 

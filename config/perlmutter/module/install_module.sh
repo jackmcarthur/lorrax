@@ -57,6 +57,12 @@ LD_PATH="$(IFS=:; echo "${LD_DIRS[*]}")"
 PY_DIRS=("$ROOT/src")
 for d in "$ROOT"/services/*/src; do [[ -d "$d" ]] && PY_DIRS+=("$d"); done
 PYTHONPATH_LIST="$(IFS=:; echo "${PY_DIRS[*]}")"
+# The node-local stage of nvidia/ (launch/lorrax_stage_local.py) is keyed on the
+# exact wheel set, so one tree serves every module rendered over this venv.
+[[ -r "$VENV/lorrax-locked-requirements.txt" ]] || lorrax_module_die "no $VENV/lorrax-locked-requirements.txt (setup_env.sh)"
+STAGE_KEY="$(sha256sum "$VENV/lorrax-locked-requirements.txt" | cut -c1-12)"
+[[ -r "$ROOT/config/perlmutter/module/launch/sitecustomize.py" ]] \
+    || lorrax_module_die "$ROOT has no config/perlmutter/module/launch/sitecustomize.py"
 
 mkdir -p "$(dirname "$OUT")"
 TMP="$OUT.tmp.$$"
@@ -73,6 +79,8 @@ sed \
     -e "s|@FFI_HOST@|$BUNDLE/lib/liblorrax_ffi_host.so|g" \
     -e "s|@PYTHONPATH@|$PYTHONPATH_LIST|g" \
     -e "s|@LD_PATH@|$LD_PATH|g" \
+    -e "s|@VENV_SITE@|$SITE|g" \
+    -e "s|@STAGE_KEY@|$STAGE_KEY|g" \
     "$HERE/module.lua.in" > "$TMP"
 if grep -n '@[A-Z0-9_]*@' "$TMP"; then rm -f "$TMP"; lorrax_module_die "unrendered placeholder"; fi
 [[ -e "$OUT" ]] && cp -p "$OUT" "$OUT.before-${REV:0:8}"

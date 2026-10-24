@@ -23,6 +23,25 @@ local ffi_cuda = "@FFI_CUDA@"
 local ffi_host = "@FFI_HOST@"
 local pythonpath = "@PYTHONPATH@"
 local ld_path = "@LD_PATH@"
+-- Node-local copy of the venv's nvidia/ tree (launch/lorrax_stage_local.py, run at
+-- interpreter start by launch/sitecustomize.py inside a Slurm job).  Its library
+-- directories go ahead of the venv's; ld.so skips one that does not exist yet.
+local venv_site = "@VENV_SITE@"
+local stage_key = "@STAGE_KEY@"
+local stage_roots = {"/tmp/lorrax-" .. (os.getenv("USER") or "user")}
+local scratch = os.getenv("SCRATCH") or ""
+if scratch ~= "" then table.insert(stage_roots, scratch .. "/.cache/lorrax/stage") end
+local staged_ld = {}
+for _, sroot in ipairs(stage_roots) do
+    local tree = sroot .. "/venv-" .. stage_key
+    for path in string.gmatch(ld_path, "([^:]+)") do
+        if path == venv .. "/lorrax-launch" then
+            table.insert(staged_ld, tree .. "/lorrax-launch")
+        elseif path:sub(1, #venv_site + 1) == venv_site .. "/" then
+            table.insert(staged_ld, tree .. "/site-packages" .. path:sub(#venv_site + 1))
+        end
+    end
+end
 
 -- Prepend a colon list so that it ends up first, in its own order.
 local function prepend_list(var, list)
@@ -31,8 +50,11 @@ local function prepend_list(var, list)
     for i = #items, 1, -1 do prepend_path(var, items[i]) end
 end
 prepend_list("PATH", venv .. "/bin:" .. cuda .. "/bin")
-prepend_list("PYTHONPATH", pythonpath)
-prepend_list("LD_LIBRARY_PATH", ld_path)
+prepend_list("PYTHONPATH", root .. "/config/perlmutter/module/launch:" .. pythonpath)
+prepend_list("LD_LIBRARY_PATH", table.concat(staged_ld, ":") .. ":" .. ld_path)
+setenv("LORRAX_STAGE_VENV_SITE", venv_site)
+setenv("LORRAX_STAGE_KEY", stage_key)
+setenv("LORRAX_STAGE_ROOTS", table.concat(stage_roots, ":"))
 
 -- Slurm needs this before srun creates a step. Existing numeric steps keep
 -- their actual launch choice; pushenv restores the caller's value on unload.
