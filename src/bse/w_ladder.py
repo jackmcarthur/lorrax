@@ -16,6 +16,7 @@ sharded over all processors.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable, Iterable, Optional
 
 import numpy as np
@@ -53,7 +54,37 @@ from .bse_w_exact import (
 )
 from common.collectives import gather_to_host
 
-LADDER_RESPONSE_CONVENTION = "physical-ra-v1"
+LADDER_RESPONSE_CONVENTION = "physical-ra-exact-static-head-v2"
+LADDER_INTERNAL_HEAD_POLICY = "screened-transfer-gamma-exact-diagonal-v1"
+
+
+def ladder_static_head_identity(restart_path, input_file, *, cell_volume):
+    """Bind the exact internal rung head, separate from the dense W0 body.
+
+    Uses the loader's scalar/override and optical-diagonal owners. Head
+    values are Ry bohr^3, volume is bohr^3, and the applied shift is Ry.
+    Only the small G=0 vector is hashed on the host; no W/psi is loaded.
+    """
+    import hashlib
+    from file_io.restart_bundle import read_head_metadata
+    from .bse_head import _resolve_head_params, q0_head_diagonal
+
+    header = read_head_metadata(restart_path)
+    _, whead, volume, _ = _resolve_head_params(
+        input_file, header["bare_head"], header["screened_head"], cell_volume)
+    if whead is None or volume is None or header["head_vector"] is None:
+        raise ValueError("GATE ladder_static_head_identity: missing screened head, volume or G=0 vector")
+    value = complex(np.asarray(whead).reshape(-1)[0])
+    volume = float(volume)
+    grid = tuple(map(int, np.asarray(header["grid"]).reshape(-1)))
+    if (not np.isfinite((value.real, value.imag, volume)).all()
+            or volume <= 0 or len(grid) != 3 or min(grid) <= 0):
+        raise ValueError("GATE ladder_static_head_identity: invalid head, volume or k grid")
+    g0 = np.ascontiguousarray(header["head_vector"], dtype=np.complex128)
+    return dict(policy=LADDER_INTERNAL_HEAD_POLICY, q0_head="diagonal",
+                whead_ry_bohr3=[value.real, value.imag], cell_volume_bohr3=volume,
+                kgrid=list(grid), q0_head_ry=q0_head_diagonal(value, volume, np.prod(grid)),
+                g0_shape=list(g0.shape), g0_sha256=hashlib.sha256(g0.tobytes()).hexdigest())
 
 jax.config.update("jax_enable_x64", True)
 
@@ -497,7 +528,8 @@ def sweep_q_wedge(
     if deflation_rank is None:
         deflation_rank = LADDER_DEFLATION_RANK if include_w else 0
     physical = bool(data.get("physical_branches", False))
-    op_fn = ladder_matvec_operands if physical else matvec_operands
+    op_fn = partial(ladder_matvec_operands if physical else matvec_operands,
+                    include_W=include_w)
     moment_actions = (_get_block_moment_actions(matvec, sh, jnp.complex128,
                                                retain_branches=physical)
                       if with_moments else None)
@@ -708,7 +740,8 @@ def prepare_ladder_head(restart_path, mesh_xy, *, input_file, head_dipole_path,
     if data is None:
         data = load_bse_data_from_restart_sharded(
             restart_path, n_val=10**9, n_cond=10**9, mesh_xy=mesh_xy,
-            input_file=input_file, inject_head=False, load_v_full=False)
+            input_file=input_file, inject_head=False, inject_w_head=include_w,
+            q0_head="diagonal", load_v_full=False)
         # This Gamma-only payload is owned here. Supplied data is borrowed,
         # including a body's already prepared W_R, and is never donated here.
         if include_w:
@@ -873,7 +906,8 @@ def compute_wc_qwedge(
     # problem than the W_R kernel it is fed (band-window parity, bse_w_exact.main).
     data = load_bse_data_from_restart_sharded(
         restart_path, n_val=10**9, n_cond=10**9, mesh_xy=mesh_xy,
-        input_file=input_file, inject_head=False, load_v_full=True)
+        input_file=input_file, inject_head=False, inject_w_head=include_w,
+        q0_head="diagonal", load_v_full=True)
     # The public facade owns this restart read; no caller can retain W_q.
     # Per-q diagonals and the optional later head share the small saved q=0
     # slice and this one W_R instead of keeping both all-q representations.

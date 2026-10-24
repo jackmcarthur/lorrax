@@ -124,6 +124,7 @@ def load_bse_data_from_restart_sharded(
     cell_volume: Optional[float] = None,
     n_occ: Optional[int] = None,
     inject_head: bool = True,
+    inject_w_head: bool | None = None,
     load_v_full: bool = False,
     kgrid_fine=None,
     w_head_densify=None,
@@ -200,6 +201,10 @@ def load_bse_data_from_restart_sharded(
     stored on disk (the rank-1 q=0 head from vhead/whead is NOT added). Used by
     body-vs-body diagnostics such as the W(0) resolvent cross-check, where both
     sides must be head-less (bse_w_exact ``--compare-w0``).
+    ``inject_w_head`` independently selects the screened direct head; None
+    inherits ``inject_head``. A density ladder uses False/True to omit the
+    external macroscopic Hartree head while retaining its internal static
+    direct head. Explicit True requires a resolved screened head and volume.
 
     ``load_v_full=True`` additionally reads the FULL exchange tensor
     ``V_qmunu`` at every q as ``data['V_q_full']`` (μ, ν, nkx, nky, nkz),
@@ -338,10 +343,19 @@ def load_bse_data_from_restart_sharded(
     defer_whead = densify_pending
     head_channel = None
     q0_head_ry = 0.0
+    apply_w_head = inject_head if inject_w_head is None else bool(inject_w_head)
 
-    if g0_X is not None and inject_head:
+    if inject_w_head is True and (not need_W or not w0_ready or g0_X is None):
+        raise ValueError("GATE bse_screened_head: an explicitly requested screened head "
+                         "requires screened W0 and its G=0 vector")
+    if g0_X is not None and (inject_head or apply_w_head):
         vhead, whead, cell_volume, head_src = _resolve_head_params(
             input_file, vhead_restart, whead_restart, cell_volume)
+        vhead = vhead if inject_head else None
+        whead = whead if apply_w_head else None
+        if inject_w_head is True and (whead is None or cell_volume is None):
+            raise ValueError("GATE bse_screened_head: an explicitly requested screened head "
+                             "requires whead and cell_volume (Bohr^3)")
 
         if cell_volume is not None and (vhead is not None or whead is not None):
             # whead goes on a SCREENED W or nowhere — same gate, same helper,

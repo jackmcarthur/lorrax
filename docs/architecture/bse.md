@@ -554,8 +554,20 @@ $K^{\rm d}=0$ in the explicit-branch response reproduces the Dyson RPA
 response at every q. The former hybrid of folded density vertices and
 optical direct blocks is not a valid ladder operator in complex orbital
 gauges. Its results are historical, not a convention to reuse. The backend
-identity is `physical-ra-v1`; response banks from the former convention
+identity is `physical-ra-exact-static-head-v2`; response banks from the former convention
 must be rebuilt.
+
+The internal transfer $k-k'=0$ screened head is distinct from the external
+macroscopic Hartree channel. The restart stores the static RPA body and
+screened head separately. The ladder loads the internal screened head through
+the optical exact-overlap owner: $h=\mathrm{Re}(w_{\rm head})/(\Omega N_k)$
+subtracts $hI$ in R–R, adds $hI$ in A–A, and contributes zero in R–A/A–R
+because conduction and valence orbitals are orthogonal. Both physical
+conduction operand tables use `head_shifted_eps_c`; stored DFT gaps and
+dipole normalization remain unchanged. The external bare head stays omitted
+until the existing macroscopic completion. The bank identity binds the actual
+screened scalar, volume, k grid, G=0 vector and this policy as well as the
+static dense body. Older banks must be rebuilt, without metadata migration.
 
 ### Samples, slopes and moments
 

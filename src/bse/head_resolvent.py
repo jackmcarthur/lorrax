@@ -14,6 +14,7 @@ representation; a physical zero-W payload tests the full RPA identity.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable
 
 import numpy as np
@@ -173,8 +174,8 @@ def build_head_operator(mesh_xy: Mesh, data: dict, *, include_w: bool = True,
         # arm has no rung.  Mismatching these is claim 0215's defect
         # (build_ladder_resolvent's docstring), so the choice rides WITH the
         # operator instead of being a call-site argument.
-        operands_fn=(ladder_matvec_operands if data.get("physical_branches", False)
-                     else matvec_operands),
+        operands_fn=partial(ladder_matvec_operands if data.get("physical_branches", False)
+                            else matvec_operands, include_W=include_w),
         key=key,
     )
 
@@ -243,6 +244,7 @@ def zero_kernel_payload(data: dict) -> dict:
     leave the rung live while ``W_q`` reads zero).
     """
     out = dict(data)
+    out["q0_head_ry"] = 0.0
     out["V_q0"] = jnp.zeros_like(data["V_q0"])
     if data.get("W_q") is not None:
         out["W_q"] = jnp.zeros_like(data["W_q"])

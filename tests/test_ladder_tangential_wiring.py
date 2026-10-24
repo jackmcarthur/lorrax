@@ -79,7 +79,8 @@ def test_ladder_diagram_and_rung_digest_reach_restart_validation():
         raise AtRestart
     static = np.eye(2)
     modules = {
-        "bse.w_ladder": NS(LADDER_RESPONSE_CONVENTION=LADDER_RESPONSE_CONVENTION),
+        "bse.w_ladder": NS(LADDER_RESPONSE_CONVENTION=LADDER_RESPONSE_CONVENTION,
+            ladder_static_head_identity=lambda *a, **k: {"policy": "exact", "q0_head_ry": .01}),
         "screening_bse": NS(_GMRES_MAX_ITER=300, _GMRES_TOL=1e-6,
             _assert_wedge_matches_run=None, _finalize_ladder_head=None,
             prepare_ladder_restart=lambda *a, **k: static),
@@ -98,9 +99,10 @@ def test_ladder_diagram_and_rung_digest_reach_restart_validation():
           "tangential_identity": lambda *a, **k: dict(base)}
     _definitions("src/gw/ladder_tangential.py", {"_solver_accuracy", "make_ladder_tangential_source"}, ns)
     _definitions("src/gw/tangential_screening.py", {"screen_tangential_poles"}, ns)
-    config = NS(screening=NS(diagrams="w_bse"), debug=NS(write_w=False),
+    config = NS(screening=NS(diagrams="w_bse"), debug=NS(write_w=False), input_file="cohsex.in",
                 write_poles=False, restart=True, head=NS(correction="off"))
-    meta = NS(tangential_recipe={"bank_rule_tolerance": 1e-8}, tangential_capacity=NS(live_stages=()))
+    meta = NS(tangential_recipe={"bank_rule_tolerance": 1e-8}, tangential_capacity=NS(live_stages=()),
+              cell_volume=10.)
     source = ns["make_ladder_tangential_source"](None, None, quad=None, e_ref=0,
         sym=None, centroid_indices=[], config=config, meta=meta, mesh_xy=None,
         tensors_filename="restart.h5", head_resolver=None)
@@ -111,8 +113,9 @@ def test_ladder_diagram_and_rung_digest_reach_restart_validation():
             occupation_state=None, print_fn=lambda *a: None,
             material_class="insulator", bank_source=source)
     assert captured["screening_diagrams"] == "w_bse"
-    assert captured["ladder_response_convention"] == "physical-ra-v1"
+    assert captured["ladder_response_convention"] == LADDER_RESPONSE_CONVENTION
     assert captured["ladder_static_w_sha256"] == hashlib.sha256(static.tobytes()).hexdigest()
+    assert captured["ladder_static_head"] == {"policy": "exact", "q0_head_ry": .01}
     assert captured["ladder_head_policy"] == "off"
     assert captured["ladder_gmres_tol"] == pytest.approx(1e-9)
     assert captured["ladder_gmres_max_iter"] == 300
@@ -126,6 +129,7 @@ def test_ladder_diagram_and_rung_digest_reach_restart_validation():
     for stale in (base, dict(captured, screening_diagrams="w_rpa"),
                   dict(captured, ladder_response_convention="folded-hybrid"),
                   dict(captured, ladder_static_w_sha256="other-rung"),
+                  dict(captured, ladder_static_head={"policy": "exact", "q0_head_ry": .02}),
                   dict(captured, ladder_head_policy="full"),
                   dict(captured, ladder_gmres_tol=1e-6),
                   dict(captured, ladder_gmres_max_iter=200),

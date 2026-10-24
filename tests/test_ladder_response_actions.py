@@ -206,12 +206,16 @@ def test_streamed_facade_releases_all_moments_after_first_sample():
     sym = SimpleNamespace(q_irr_kgrid_int=np.zeros((2, 3), int),
                           irr_idx_q=np.arange(2), sym_idx_q=np.zeros(2, int),
                           q_irr_full_idx=np.arange(2))
+    load_policies = []
+    def load(*_args, **kwargs):
+        load_policies.append(kwargs)
+        return {"V_q0": np.zeros((8, 8)), "n_rmu": 7, "W_q": np.ones((8, 8, 2, 1, 1))}
+
     namespace = {"__builtins__": dict(vars(builtins), __import__=imports), "np": np, "jnp": np,
         "jax": SimpleNamespace(lax=SimpleNamespace(with_sharding_constraint=lambda a, _s: a)),
         "P": lambda *args: args, "NamedSharding": lambda _mesh, spec: spec,
         "WLadderWedge": SimpleNamespace,
-        "load_bse_data_from_restart_sharded": lambda *a, **k: {
-            "V_q0": np.zeros((8, 8)), "n_rmu": 7, "W_q": np.ones((8, 8, 2, 1, 1))},
+        "load_bse_data_from_restart_sharded": load,
         "_psi_at_rest_2d": lambda data, _mesh: data, "_symmetry_tables": lambda _path: sym,
         "_accumulate_columns": accumulate, "gather_to_host": lambda a: a,
         "_assert_pad_block_is_zero": zero_padding}
@@ -267,6 +271,9 @@ def test_streamed_facade_releases_all_moments_after_first_sample():
     assert len(moment_visits) == 2*4
     materialized = namespace["compute_wc_qwedge"]("unused", [0j, 1j, 2j], mesh, **kwargs)
     assert len(consumed)==2 and consumed[0] is not consumed[1]
+    assert len(load_policies) == 2
+    assert all(policy["inject_head"] is False and policy["inject_w_head"] is True
+               and policy["q0_head"] == "diagonal" for policy in load_policies)
     np.testing.assert_array_equal(materialized.wc, np.stack(seen))
     for name in ("M0", "M1", "M2", "M3"):
         assert materialized.response_fields[name].shape == (2, 8, 8)

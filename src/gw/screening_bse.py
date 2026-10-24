@@ -603,10 +603,16 @@ def prepare_ladder_restart(
             config=config, mesh=mesh_xy, requests=[static_request],
             W_by_role={"static": W0_rpa})
     with timing.section("gw_jax.persist_w0"):
+        # W0 and its head were produced by the ordinary static RPA owners.
+        # The dynamic bank remains W_BSE; its input rung must record RPA.
+        from dataclasses import replace
+        from .gw_config import ScreeningDiagrams
+        rpa_config = replace(config, screening=replace(
+            config.screening, diagrams=ScreeningDiagrams.W_RPA))
         persist_w0_and_head(
             W0_rpa, tensors_filename=tensors_filename,
             head_resolver=head_resolver, iteration_head=rpa_iteration_head,
-            config=config, meta=meta,
+            config=rpa_config, meta=meta,
             mesh_xy=mesh_xy, sym=sym, centroid_indices=centroid_indices,
             static_head_only=True, print_fn=print_fn)
     _assert_restart_is_loadable(tensors_filename, include_w=include_w,

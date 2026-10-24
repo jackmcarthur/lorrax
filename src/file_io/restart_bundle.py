@@ -670,6 +670,20 @@ def unfold_parent_faces(faces, restart_file, input_file, mesh_xy, *, family="cha
                                    3, spec=spec) for a in faces)
 
 
+def read_head_metadata(filename):
+    """Read only the small Coulomb-head scalars, vector and k grid.
+
+    The static screened body is stored separately. No wavefunction or dense
+    interaction is read to authenticate the internal direct-head operator.
+    """
+    with h5py.File(filename, "r") as f:
+        _require_current(f)
+        def value(name):
+            return np.asarray(f[name][()]) if name in f else None
+        return dict(grid=value("kgrid"), head_vector=value("G0_mu_nu"),
+                    bare_head=value("vhead"), screened_head=value("whead"))
+
+
 def read_metadata(filename):
     """Return small, replicated bundle facts in canonical file order.
 

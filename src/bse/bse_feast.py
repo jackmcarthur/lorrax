@@ -139,7 +139,7 @@ def ensure_W_R(data: dict, include_W: bool, mesh_xy: Mesh, *, consume_W_q=False)
     return data
 
 
-def matvec_operands(data: dict) -> tuple:
+def matvec_operands(data: dict, *, include_W: bool = True) -> tuple:
     """The 9 operand arrays the ring/stack matvec consumes after ``x``, in the
     matvec's positional order ``(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
     W_R, V_q0, M)``.
@@ -152,13 +152,14 @@ def matvec_operands(data: dict) -> tuple:
     (see ``bse_w_exact`` compare-wq)."""
     return (
         data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
-        head_shifted_eps_c(data["eps_c"], data), data["eps_v"], data["W_R"],
+        (head_shifted_eps_c(data["eps_c"], data) if include_W else data["eps_c"]),
+        data["eps_v"], data["W_R"],
         data["V_q0"],
         data["M"],  # hoisted V-term pair amplitude (audit P3), transition layout
     )
 
 
-def ladder_matvec_operands(data: dict) -> tuple:
+def ladder_matvec_operands(data: dict, *, include_W: bool = True) -> tuple:
     """Physical R/A array bundle, or the historical raw operand tuple.
 
     The physical bundle carries two vertices without expanding the call
@@ -170,8 +171,14 @@ def ladder_matvec_operands(data: dict) -> tuple:
         keys = ("psi_c_X", "psi_c_Y", "psi_v_X", "psi_v_Y",
                 "psi_c_A_X", "psi_c_A_Y", "psi_v_A_X", "psi_v_A_Y",
                 "eps_c", "eps_v", "eps_c_A", "eps_v_A", "M", "M_A", "W_R", "V_q0")
-        return ({key: data[key] for key in keys},)
-    return matvec_operands(data) + (
+        operands = {key: data[key] for key in keys}
+        # The internal transfer Gamma head is the exact optical diagonal:
+        # -h in RR and +h in AA, with no c/v-overlap coupling contribution.
+        # Keep stored DFT energies unchanged for dipole normalization.
+        for key in ("eps_c", "eps_c_A"):
+            operands[key] = head_shifted_eps_c(data[key], data) if include_W else data[key]
+        return (operands,)
+    return matvec_operands(data, include_W=include_W) + (
         data.get("psi_c_W_X", data["psi_c_X"]),
         data.get("psi_c_W_Y", data["psi_c_Y"]),
         data.get("psi_v_W_X", data["psi_v_X"]),
@@ -264,7 +271,7 @@ def build_preconditioner_diagonal_sharded(
 
     tda_sharding = NamedSharding(mesh_xy, P("x", "y", None))
     diag_h = build_bse_exact_diagonal(
-        head_shifted_eps_c(data["eps_c"], data), data["eps_v"],
+        (head_shifted_eps_c(data["eps_c"], data) if include_W else data["eps_c"]), data["eps_v"],
         data["psi_c_X"], data["psi_v_Y"],
         W_q0, M, data["V_q0"], nk,
         sharding=tda_sharding, complex_out=True, memo=False,
