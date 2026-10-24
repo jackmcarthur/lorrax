@@ -45,7 +45,9 @@ startup block of every GPU run warns INSTALL NOT VERIFIED. A FAIL removes the
 file. Exit 2 means the check itself broke. Every rank writes `rank<N>.json` and rank 0
 writes `verdict.json` and `report.txt` under
 `$SCRATCH/.cache/lorrax/perfcheck/<job>.<step>/` (or `--out`). The whole check
-takes about two minutes on four A100s.
+takes about one minute on four A100s with a fast install, and many minutes on a
+slow filesystem; rank 0 prints a line as each stage starts and ends, with the
+seconds elapsed.
 
 ## What it checks, and the fix for each failure
 
@@ -56,7 +58,7 @@ takes about two minutes on four A100s.
 | 3 kernels | the FFI CUDA leg has no SASS for this GPU's `sm_XX`; `CUDA_FORCE_PTX_JIT` or `JAX_DISABLE_JIT` set; the NVRTC path builds no cubin | rebuild the FFI for this architecture; unset the variable |
 | 4 binding | ranks share CPUs; a thread team larger than the rank's CPUs; fewer than two physical cores | `-c <cores per rank> --threads-per-core=1 --cpu-bind=threads`, `OMP_NUM_THREADS` = cores − 2 ([Perlmutter](../environment/machines/perlmutter.md#cpu)) |
 | 5 libraries | an FFI leg refuses to open, its mapped closure differs from its record, two copies of a CUDA library are mapped | rebuild, or fix `LD_LIBRARY_PATH` |
-| 6 benchmark | a metric of a GPU model with a reference is more than 15% (and more than its absolute slack) worse: cold compile of 36 fixed programs, the warm re-run, one NVRTC build, GEMM, FFT, host GEMM | follow the other components' diagnoses |
+| 6 benchmark | a metric of a GPU model with a reference is more than 15% (and more than its absolute slack) worse: cold compile of 36 fixed programs, the warm re-run, GEMM, FFT, host GEMM. The one NVRTC build is judged by ratio alone: WARN above 1.5x the reference, FAIL above 2.5x, and the line says whether its headers came from the node-local copy (then the node's CPU is the cause) or from the install's filesystem | follow the other components' diagnoses |
 
 A thread team larger than the physical cores but within the logical CPUs (the
 SMT siblings a mask without `--threads-per-core=1` contains) is a warning.
@@ -75,6 +77,14 @@ published `lorrax_A` module on `/global/common` (JAX 0.9.1).
 | module, GPU node, n = 2 | 3.27–3.93 | 587–988 | 11.8–12.3 s (1.5–1.6x) | 16.5–32.6 s | FAIL: slow filesystem |
 | fast, CPU node, n = 5 | 0.015–0.24 | — | — | — | PASS (CPU only) |
 | module, CPU node, n = 5 | 1.37–4.6 | — | — | — | FAIL: slow filesystem |
+
+The NVRTC build is one CPU thread compiling, so it moves with the node rather
+than the install: four fast installs on one 80 GB node (after its kernel-store
+build) took 7.0–7.3 s, 1.20–1.25x the reference from another node, while the
+module's builds, which read about 3200 header files from DVS each, were 2.8x and
+5.6x. Hence the bands: 1.5x warns, 2.5x fails. Each rank builds the probe kernel
+into its own temporary image cache (deleted afterwards), so every run measures
+it and none leaves it in your cache.
 
 Compute-node open medians from the filesystem survey: `/global/common`
 (DVS) 3.5 ms, `$HOME` 10.6 ms, CFS 9.6 ms, `$SCRATCH` 0.24 ms, node-local

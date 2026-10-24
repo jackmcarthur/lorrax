@@ -95,8 +95,16 @@ SLOWER_FAIL = 0.15
 #: ...and by more than this absolute amount (its unit; keeps small metrics from failing
 #: on jitter).  host_gemm_s is reported, never judged: its thread count is the launch's
 #: OpenBLAS choice (select_gpu.sh defaults OPENBLAS_NUM_THREADS=1), judged by component 4.
-ABS_SLACK_S = {"import_s": 2.0, "compile_cold_s": 0.5, "compile_warm_s": 0.1,
-               "nvrtc_s": 1.0, "fft_ms": 0.1}
+ABS_SLACK_S = {"import_s": 2.0, "compile_cold_s": 0.5, "compile_warm_s": 0.1, "fft_ms": 0.1}
+#: The NVRTC build is judged by ratio bands instead: it is one CPU thread compiling, so it
+#: varies with the node, not the install.  Fast installs, slowest rank: 0.99-1.25x their
+#: model's reference (80GB refs 5.78-6.62 s on nid200276; 7.01-7.26 s on nid200421 after
+#: the store build, job 60193619; 40GB 5.75-7.03 s).  Slow-filesystem installs, where every
+#: build reads ~3200 header files from the network: 2.83x (module, docs line) and 5.6x
+#: (module, production line), both on 80GB.  WARN above 1.5x, FAIL above 2.5x: 2x headroom
+#: over the fastest-install spread, and both measured slow cases still FAIL on it alone.
+NVRTC_WARN_RATIO = 1.5
+NVRTC_FAIL_RATIO = 2.5
 #: Filesystem, primary: open()+close() of ~500 real install files on every rank at once,
 #: median of the SECOND (warm) pass, slowest rank.  Compute-node medians (agent D, ri_diagnose;
 #: this check's own table in docs/installation/perf_check.md): module on DVS 3.5 ms, $HOME 10.6,
@@ -711,6 +719,13 @@ if gpu:
         nk, m = 21, 2
         X = jax.device_put(np.ones((nk, m, m), np.complex128), NamedSharding(mesh, P(None, "x", "y")))
         f = jax.jit(F.make_kfft_klead(mesh, kg, P(None, None, None, "x", "y"), kind="fftn", norm="ortho"))
+        try:   # where this build reads its headers: the node-local copy once complete, else the wheel
+            nvrtc["header_stage"] = F.stage_nvrtc_headers()
+            nvrtc["header_stage_ready"] = bool(nvrtc["header_stage"]) and os.path.exists(
+                os.path.join(nvrtc["header_stage"], ".complete"))
+            nvrtc["mathdx_root"] = F.mathdx_root()
+        except Exception as e:
+            nvrtc["header_stage_error"] = f"{type(e).__name__}: {e}"[:200]
         t1 = T()
         jax.block_until_ready(f(X))
         nvrtc["first_call_s"] = T() - t1
@@ -1065,6 +1080,10 @@ def vs_ref(metric: str, value, ref: dict, higher_better: bool = False):
         return "SKIP", f"{metric}: not measured"
     if r is None:
         return "INFO", f"{metric} {value:.3g} (no reference)"
+    if metric == "nvrtc_s":
+        ratio = value / r if r else float("inf")
+        st = "FAIL" if ratio > NVRTC_FAIL_RATIO else ("WARN" if ratio > NVRTC_WARN_RATIO else "PASS")
+        return st, f"{metric} {value:.3g} vs ref {r:.3g} ({ratio:.2f}x)"
     if higher_better:
         bad = value < r / (1 + SLOWER_FAIL)
         ratio = r / value if value else float("inf")
@@ -1461,10 +1480,33 @@ def judge_bench(ranks: list[dict], ref: dict | None, kind: str) -> dict:
                 lines.append(f"cold XLA compile throughput {vals[k]:.3f} s/program (slowest rank)")
             continue
         s, t = vs_ref(k, vals.get(k), ref or {}, higher_better=(k == "gemm_tflops"))
-        if ref and s == "FAIL":
-            st = "FAIL"
+        if ref and s in ("FAIL", "WARN"):
+            st = worst(st, s)
+        if k == "nvrtc_s" and s in ("FAIL", "WARN"):
+            t += (f": past {NVRTC_FAIL_RATIO if s == 'FAIL' else NVRTC_WARN_RATIO}x (node-to-node spread "
+                  "on fast installs is up to 1.25x). An NVRTC build opens ~3200 CUDA/mathdx header files; "
+                  + nvrtc_header_note(ranks))
+        if k == "nvrtc_s" and vals.get(k) is None and ref:
+            st = worst(st, "WARN")
+            t = "nvrtc_s: not measured (the probe kernel was not NVRTC-built; see 3 kernels)"
         lines.append(("SLOW " if s == "FAIL" else "") + t)
     return comp("6 benchmark", st, lines, vals)
+
+
+def nvrtc_header_note(ranks: list[dict]) -> str:
+    """Where the slowest NVRTC probe read its headers: the node-local stage or the wheel."""
+    nv = {}
+    for r in ranks:
+        n = (r.get("bench_cold") or {}).get("nvrtc") or {}
+        if max(n.get("build_s") or [0]) >= max(nv.get("build_s") or [0]):
+            nv = n
+    if nv.get("header_stage_ready"):
+        return (f"this one read them from the node-local copy {nv.get('header_stage')}, so the node's CPU "
+                "is slow or busy, not the install")
+    if nv.get("mathdx_root"):
+        return (f"the node-local copy was not ready, so this one read them from {nv['mathdx_root']} "
+                f"({nv.get('mathdx_fs') or '?'}): see 1 filesystem")
+    return "see 1 filesystem"
 
 
 def verdict(components: list[dict]) -> str:
@@ -1635,31 +1677,56 @@ def single_process_env(base_env) -> dict:
 
 
 def probe_env(base: Path, rank: int) -> dict:
-    """Environment for a bench probe: fresh compile cache and fresh cubin cache."""
+    """Environment for a bench probe: fresh compile cache and fresh cubin cache, both
+    private to this rank under ``base`` (deleted after the check)."""
     env = single_process_env(os.environ)
     env["ISDF_JAX_CACHE_DIR"] = str(base / "jax")
-    # The per-user cache root (lxkit.user_cache_root takes SCRATCH only if it is a writable
-    # directory, so it must exist): a fresh, empty NVRTC image cache.
+    # The per-user cache root (lxkit.user_cache_root): LORRAX_CACHE_ROOT wins over SCRATCH, so
+    # set both.  Then the NVRTC probe kernel is built (and timed) on every run instead of
+    # loading from the user's image cache, where an earlier check left it, and it never
+    # lands there.  SCRATCH counts only as a writable directory, so it must exist.
     (base / "scratch").mkdir(parents=True, exist_ok=True)
     env["SCRATCH"] = str(base / "scratch")
+    env["LORRAX_CACHE_ROOT"] = str(base / "scratch" / ".cache" / "lorrax")
     env.setdefault("PYTHONUNBUFFERED", "1")
     return env
 
 
-def rank_main(args, ctx: dict, topo: dict, out: Path) -> dict:
+def progress(rank: int, t0: float):
+    """Rank 0's one line per stage as it starts and as every rank has finished it, with
+    seconds since the check started (on a slow filesystem a stage takes minutes)."""
+    last = {}
+
+    def step(what: str, done: bool = False) -> None:
+        if rank != 0:
+            return
+        now = time.perf_counter()
+        if done:
+            say(f"  done  {what} in {now - last.get(what, now):.0f} s (t={now - t0:.0f} s)")
+        else:
+            last[what] = now
+            say(f"  start {what} (t={now - t0:.0f} s)")
+    return step
+
+
+def rank_main(args, ctx: dict, topo: dict, out: Path, t0: float | None = None) -> dict:
     rank, nranks = ctx["rank"], ctx["nranks"]
+    step = progress(rank, time.perf_counter() if t0 is None else t0)
     res: dict = {"rank": rank, "host": ctx["host"], "binding": probe_binding(topo)}
     # 1. open latency on every rank at once (as a run's ranks start), then rank 0's venv walk.
     sample = open_sample()
     mark(out, "start", rank)
     wait_all(out, "start", nranks)
+    step("1 filesystem: open latency of install files, every rank")
     res["open"] = probe_open_latency(sample)
     res["open"]["sample"] = len(sample)
     res["lookups"] = probe_path_lookups()
     res["cache_latency"] = probe_cache_latency()
     mark(out, "open", rank)
     wait_all(out, "open", nranks)
+    step("1 filesystem: open latency of install files, every rank", done=True)
     if rank == 0:
+        step("1 filesystem: venv walk")
         res["fs"] = {"paths": {label: {"path": p, **fs_of(p)} for label, p in (
             ("site-packages", str(site_packages())), ("source", str(ROOT)),
             ("python", os.path.realpath(sys.executable)))}}
@@ -1667,8 +1734,10 @@ def rank_main(args, ctx: dict, topo: dict, out: Path) -> dict:
         res["fs"]["walk"] = probe_walk(str(site_packages()))
         pfx = os.environ.get("PYTHONPYCACHEPREFIX")
         res["fs"]["pycache_prefix"] = {"path": pfx, **fs_of(pfx)} if pfx else None
+        step("1 filesystem: venv walk", done=True)
     mark(out, "fs", rank)
     wait_all(out, "fs", nranks)
+    step("1 filesystem: cold import of runtime, jax, the backend and a driver, every rank")
     ienv = single_process_env(os.environ)
     if args.cpu_only:
         ienv["JAX_PLATFORMS"] = "cpu"     # a module's "cuda,cpu" would refuse on a CPU node
@@ -1677,29 +1746,37 @@ def rank_main(args, ctx: dict, topo: dict, out: Path) -> dict:
     res["imports"] = imp
     mark(out, "imports", rank)
     wait_all(out, "imports", nranks)
+    step("1 filesystem: cold import of runtime, jax, the backend and a driver, every rank", done=True)
     gpu = (imp.get("platform") in ("gpu", "cuda", "rocm")) and not args.cpu_only
     res["gpu"] = gpu
     if gpu:
         base = Path(tempfile.mkdtemp(prefix=f"lorrax_perfcheck_r{rank}_",
                                      dir=args.tmp or os.environ.get("TMPDIR") or "/tmp"))
         env = probe_env(base, rank)
+        step("6 benchmark: cold XLA compile of 36 programs, one NVRTC build, GEMM, FFT, every rank")
         cold, text_c, wall_c = run_probe(PROBE_BENCH, ["cold"], env, timeout=900)
         cold["wall_s"] = wall_c
         cold.setdefault("nvrtc", {})["build_s"] = nvrtc_times(text_c)
         cd = (cold.get("nvrtc") or {}).get("cubin_dir")
         cold["nvrtc"]["new_cubin_archs"] = sorted({a for a in (
             cubin_arch(os.path.join(cd, c)) for c in cold["nvrtc"].get("new_cubins", [])) if a}) if cd else []
+        if cold["nvrtc"].get("mathdx_root"):
+            cold["nvrtc"]["mathdx_fs"] = fs_of(cold["nvrtc"]["mathdx_root"])["fstype"]
         if cold.get("error"):
             cold["log_tail"] = text_c[-3000:]
         res["bench_cold"] = cold
         mark(out, "cold", rank)
         wait_all(out, "cold", nranks)
+        step("6 benchmark: cold XLA compile of 36 programs, one NVRTC build, GEMM, FFT, every rank", done=True)
+        step("2 caches: warm re-run in a second process (persistent compile cache)")
         warm, text_w, wall_w = run_probe(PROBE_BENCH, ["warm"], env, timeout=600)
         warm["wall_s"] = wall_w
         if warm.get("error"):
             warm["log_tail"] = text_w[-3000:]
         res["bench_warm"] = warm
+        step("2 caches: warm re-run in a second process (persistent compile cache)", done=True)
         if rank == 0:
+            step("2 caches: cubin store probe (the run's real image cache)")
             # The run's real NVRTC image cache (real SCRATCH): does a probe kernel load from it?
             senv = single_process_env(os.environ)
             senv["ISDF_JAX_CACHE_DIR"] = str(base / "jax_store")
@@ -1709,6 +1786,7 @@ def rank_main(args, ctx: dict, topo: dict, out: Path) -> dict:
             if sp_.get("error"):
                 sp_["log_tail"] = text_s[-2000:]
             res["store_probe"] = sp_
+            step("2 caches: cubin store probe (the run's real image cache)", done=True)
         if not args.keep:
             shutil.rmtree(base, ignore_errors=True)
         else:
@@ -1866,7 +1944,7 @@ def main(argv=None) -> int:
     if ctx["rank"] == 0:
         say(f"results in {out}")
     try:
-        rank_main(args, ctx, topo, out)
+        rank_main(args, ctx, topo, out, t0)
     except Exception as e:                                         # noqa: BLE001
         import traceback
         (out / f"rank{ctx['rank']}.json").write_text(json.dumps(
@@ -1877,6 +1955,7 @@ def main(argv=None) -> int:
             return 2
     if ctx["rank"] != 0:
         return 0
+    say(f"  waiting for every rank to report (t={time.perf_counter() - t0:.0f} s)")
     if not wait_all(out, "done", ctx["nranks"], timeout=1200):
         say("not every rank finished; judging the ranks that did")
     ranks = []

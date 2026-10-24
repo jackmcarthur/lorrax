@@ -84,3 +84,17 @@ def test_second_process_miss_fails():
     ranks = [{"rank": 0, "bench_warm": {"cache_stats": {"enabled": True, "probes": 12,
                                                          "hits": 9, "compiles": 3}}}]
     assert pc.judge_caches({}, ranks)["status"] == "FAIL"
+
+
+def test_nvrtc_bands_and_private_probe_cache(tmp_path, monkeypatch):
+    # node-to-node NVRTC spread on fast installs (7.26 s vs 5.83 s, 1.25x) passes; the module
+    # on DVS (16.5 s, 2.83x; 32.6 s, 5.6x) fails; in between warns
+    ref = {"nvrtc_s": 5.83}
+    assert pc.vs_ref("nvrtc_s", 7.26, ref)[0] == "PASS"
+    assert pc.vs_ref("nvrtc_s", 10.0, ref)[0] == "WARN"
+    assert pc.vs_ref("nvrtc_s", 16.5, ref)[0] == "FAIL"
+    # the probe's image cache is private even when the user exports LORRAX_CACHE_ROOT
+    monkeypatch.setenv("LORRAX_CACHE_ROOT", "/users/store")
+    env = pc.probe_env(tmp_path, 0)
+    assert env["LORRAX_CACHE_ROOT"].startswith(str(tmp_path))
+    assert env["SCRATCH"].startswith(str(tmp_path))
