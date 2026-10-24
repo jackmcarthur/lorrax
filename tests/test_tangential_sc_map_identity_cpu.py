@@ -24,6 +24,11 @@ def _controls(*, expect_collision=False):
     from file_io.tangential_store import _check_identity
 
     jax.config.update("jax_enable_x64", True)
+    mask = (1 << 64)-1
+    def mix(word):
+        word = ((word ^ (word >> 30))*0xbf58476d1ce4e5b9) & mask
+        word = ((word ^ (word >> 27))*0x94d049bb133111eb) & mask
+        return word ^ (word >> 31)
     energy, occupations = np.array([[-1., 1.]]), np.array([[1., 0.]])
     # Both H have EXACTLY the same eigenvalues and occupations in the
     # same unchanged DFT basis. Their occupied/empty subspaces differ.
@@ -65,6 +70,11 @@ def _controls(*, expect_collision=False):
         a, wa = bind(hamiltonians[0])
         same, wsame = bind(hamiltonians[0].copy())
         b, wb = bind(hamiltonians[1])
+        imaginary = np.diag(energy[0]).astype(complex)
+        imaginary[0, 0] = imaginary[1, 1] = 0
+        imaginary[0, 1], imaginary[1, 0] = 1j, -1j
+        c, wc = bind(imaginary)
+        d, wd = bind(imaginary.conj())
         assert a == same
         _check_identity(a, same)  # Re-evaluating the same physical input may reuse.
         assert a["energies"] == b["energies"] and a["occupations"] == b["occupations"]
@@ -79,21 +89,29 @@ def _controls(*, expect_collision=False):
                 assert "stale input/SC identity" in str(error) and "hamiltonian" in str(error)
             else:
                 raise AssertionError("a different SC Hamiltonian reused an older bank identity")
+            assert c != d  # Paired imaginary sign flips cancelled in the old linear checksum.
         gc.collect()
-        assert all(ref() is None for ref in (wa, wsame, wb))
+        assert all(ref() is None for ref in (wa, wsame, wb, wc, wd))
         assert response_bank._OPERATOR_DIGESTS == cache_before
         labels = [a["hamiltonian"], b["hamiltonian"]]
         if not expect_collision:
-            for label, h in zip(labels, hamiltonians):
+            for label, h in zip(labels+[c["hamiltonian"], d["hamiltonian"]],
+                                (*hamiltonians, imaginary, imaginary.conj())):
                 source = h[None].astype(np.complex128)
                 words = np.ascontiguousarray(source).view(np.uint64).reshape(-1)
-                total = sum((2*i+1)*int(word) for i, word in enumerate(words)) % (1 << 64)
-                reference = hashlib.sha256(f"{source.shape}:{total:016x}".encode()).hexdigest()
+                totals = [0, 0]
+                for i, word in enumerate(words):
+                    value = int(word) ^ mix((i+0x9e3779b97f4a7c15) & mask)
+                    for j, salt in enumerate((0, 0xd1b54a32d192ed03)):
+                        totals[j] = (totals[j]+mix((value+salt) & mask)) & mask
+                witness = "".join(f"{word:016x}" for word in totals)
+                reference = hashlib.sha256(f"operator-mix128-v1:{source.shape}:{witness}".encode()).hexdigest()
                 assert label.endswith(":"+reference)
         assert labels_by_n.setdefault(n, labels) == labels
         records.append(dict(ranks=side*side, logical_bands=n, collision=collision,
                             same_input_identity_reused=True,
                             distinct_hamiltonian_refused=not collision,
+                            paired_imaginary_sign_flip_distinguished=not expect_collision,
                             input_matrices_not_retained=True,
                             energy_hash=a["energies"], occupation_hash=a["occupations"],
                             hamiltonian_labels=labels))

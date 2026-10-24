@@ -218,7 +218,7 @@ def test_temporary_operator_digest_does_not_retain_static_rung():
     import gc
     import weakref
     ns = dict(np=np, hashlib=hashlib, _OPERATOR_DIGESTS={},
-              _operator_digest_program=lambda _mesh, _shape: lambda value: np.sum(value))
+              _operator_digest_program=lambda _mesh, _shape: lambda value: np.array([np.sum(value), 0]))
     _definitions("src/gw/response_bank.py", {"operator_digest"}, ns)
     operator = np.eye(2)[None]
     reference = weakref.ref(operator)

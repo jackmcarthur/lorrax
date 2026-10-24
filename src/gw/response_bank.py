@@ -966,7 +966,7 @@ def _operator_token(values):
 
 @lru_cache(maxsize=4)
 def _operator_digest_program(mesh_xy, shape):
-    """Σ bits·(2g+1) mod 2^64 over the real and imaginary words at global flat index g."""
+    """Two nonlinear uint64 word sums, indexed globally and reduced exactly."""
     from jax import shard_map
     from runtime.padding import padded_axis
     nq, n, m = shape
@@ -978,6 +978,13 @@ def _operator_digest_program(mesh_xy, shape):
         # replicated padded copy is formed and nothing is gathered here.
         flat = padded_axis(int(np.prod(shape)), mesh_xy, name="operator digest carrier",
                            spec=P(("x", "y")), axis=0)
+
+    def mix(word):
+        # SplitMix64's public-domain avalanche (S. Vigna, 2015):
+        # https://prng.di.unimi.it/splitmix64.c
+        word = (word ^ (word >> 30))*jnp.uint64(0xbf58476d1ce4e5b9)
+        word = (word ^ (word >> 27))*jnp.uint64(0x94d049bb133111eb)
+        return word ^ (word >> 31)
 
     def local(v):
         if flat is not None:
@@ -994,8 +1001,13 @@ def _operator_digest_program(mesh_xy, shape):
             c = (c0 + jnp.arange(v.shape[2])).astype(jnp.uint64)[None, None, :]
             g = 2 * ((q * jnp.uint64(n) + r) * jnp.uint64(m) + c)
         bits = jax.lax.bitcast_convert_type(jnp.stack([v.real, v.imag], -1), jnp.uint64)
-        total = jnp.sum(bits[..., 0] * (2 * g + 1) + bits[..., 1] * (2 * g + 3), dtype=jnp.uint64)
-        return jax.lax.psum(total, ("x", "y"))  # exact-reduce: uint64 checksum
+        positions = g[..., None]+jnp.arange(2, dtype=jnp.uint64)
+        words = bits ^ mix(positions+jnp.uint64(0x9e3779b97f4a7c15))
+        valid = positions < 2*int(np.prod(shape))
+        first = jnp.sum(jnp.where(valid, mix(words), 0), dtype=jnp.uint64)
+        second = jnp.sum(jnp.where(valid, mix(words+jnp.uint64(0xd1b54a32d192ed03)), 0),
+                         dtype=jnp.uint64)
+        return jax.lax.psum(jnp.stack([first, second]), ("x", "y"))
     return jax.jit(shard_map(local, mesh=mesh_xy,
         in_specs=P() if flat is not None else P(None, "x", "y"),
         out_specs=P(), check_vma=False))
@@ -1016,8 +1028,9 @@ def operator_digest(values, mesh_xy, *, cache=True):
     if ((values.shape[1] % int(mesh.shape["x"]) or values.shape[2] % int(mesh.shape["y"]))
             and not values.sharding.is_fully_replicated):
         raise ValueError("operator_digest: a ragged matrix must already be replicated; no gather is allowed")
-    word = int(np.asarray(_operator_digest_program(mesh, tuple(values.shape))(values)))
-    digest = hashlib.sha256(f"{tuple(values.shape)}:{word:016x}".encode()).hexdigest()
+    words = np.asarray(_operator_digest_program(mesh, tuple(values.shape))(values))
+    witness = "".join(f"{int(word):016x}" for word in words)
+    digest = hashlib.sha256(f"operator-mix128-v1:{tuple(values.shape)}:{witness}".encode()).hexdigest()
     if cache:
         _OPERATOR_DIGESTS[id(values)] = (values, digest)
     return digest
