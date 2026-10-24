@@ -106,3 +106,4 @@ The resolvent form (2.2) and the low cost of both samples and products lead to t
 2. G. Strinati, Riv. Nuovo Cimento 11, 1 (1988). doi:10.1007/BF02725962
 3. M. E. Casida, in *Recent Advances in Density Functional Methods, Part I*, edited by D. P. Chong (World Scientific, 1995), p. 155. doi:10.1142/9789812830586_0005
 4. A. C. Antoulas, C. A. Beattie and S. Gugercin, *Interpolatory Methods for Model Reduction* (SIAM, 2020). doi:10.1137/1.9781611976083
+

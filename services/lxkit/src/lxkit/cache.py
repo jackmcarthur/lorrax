@@ -1,7 +1,7 @@
 """The one per-user root for LORRAX's persistent caches.
 
-``$SCRATCH/.cache/lorrax/<name>``, or ``~/.cache/lorrax/<name>`` where the
-site defines no ``SCRATCH``: on scratch, never beside an input, one tree per
+``$SCRATCH/.cache/lorrax/<name>``, or ``${XDG_CACHE_HOME:-~/.cache}/lorrax/<name>``
+where the site defines no writable ``SCRATCH``: on scratch, never beside an input, one tree per
 user.  The XLA compile cache (``common.jax_compile_cache``), the mathdx cubin
 cache (``ffi.fft.cubin_cache_dir``), the WFN time-reversal stamps
 (``symmetry_maps.density_symmetry_check``) and the ``tests/hsuite`` run tree
@@ -20,15 +20,39 @@ import secrets
 import socket
 from pathlib import Path
 
-__all__ = ["atomic_write_bytes", "user_cache_dir"]
+__all__ = ["atomic_write_bytes", "user_cache_dir", "user_cache_root"]
+
+
+def user_cache_root() -> Path:
+    """The per-user tree every LORRAX cache lives in: ``LORRAX_CACHE_ROOT`` when
+    set, else ``$SCRATCH/.cache/lorrax`` when ``SCRATCH`` names a writable
+    directory, else ``${XDG_CACHE_HOME:-~/.cache}/lorrax``.
+
+    The default follows the site convention: HPC centres export ``SCRATCH``
+    for the fast, large, per-user file system, and a home directory is small and
+    often slow on compute nodes.  An exported ``SCRATCH`` that is missing or
+    read-only falls back to the user cache directory instead of failing the
+    first write.  ``LORRAX_CACHE_ROOT`` is the fix the install self-check
+    (``scripts/perf_check.py``) names when that default is slow per file (a
+    cluster whose only cache candidate is an NFS or DVS home).
+    ``config/perlmutter/gpu_env.sh`` applies the same rule to
+    ``CUDA_CACHE_PATH``.
+    """
+    explicit = os.environ.get("LORRAX_CACHE_ROOT", "").strip()
+    if explicit:
+        return Path(explicit)
+    scratch = os.environ.get("SCRATCH", "")
+    if scratch and os.path.isdir(scratch) and os.access(scratch, os.W_OK | os.X_OK):
+        return Path(scratch) / ".cache" / "lorrax"
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return Path(base) / "lorrax"
 
 
 def user_cache_dir(name: str) -> Path:
-    """``<root>/.cache/lorrax/<name>`` with root ``$SCRATCH`` or ``~``."""
+    """``<user_cache_root()>/<name>``: one subdirectory per cache owner."""
     if not name or os.sep in name or name in {".", ".."}:
         raise ValueError(f"cache name must be one path component: {name!r}")
-    root = os.environ.get("SCRATCH") or os.path.expanduser("~")
-    return Path(root) / ".cache" / "lorrax" / name
+    return user_cache_root() / name
 
 
 def atomic_write_bytes(path, data: bytes) -> Path:

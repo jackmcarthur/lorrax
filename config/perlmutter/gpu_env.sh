@@ -12,7 +12,8 @@
 # abort.  Neither FFI leg links GTL: the host leg is CUDA-free and the CUDA
 # leg's cuSOLVERMp/cuBLASMp communicate through NCCL.
 #
-# LD_LIBRARY_PATH  prepended with ~/.cache/lorrax/cudart-hmem/<id> (<id>: the
+# LD_LIBRARY_PATH  unless the allocation is one node: prepended with the
+#                  node-local /tmp/lorrax-$USER/cudart-hmem/<id> (<id>: the
 #                  md5 of the target's path, so two venvs never share a link),
 #                  holding libcudart.so -> the CUDA runtime the run python's
 #                  JAX plugin resolves (nvidia/cu*/lib/libcudart.so.<major>).
@@ -35,28 +36,50 @@ fi
 
 export MPICH_GPU_SUPPORT_ENABLED=0
 
+# The per-user cache tree, by the rule lxkit.user_cache_root applies to the
+# JAX compile cache and the NVRTC image cache: LORRAX_CACHE_ROOT when set, else
+# $SCRATCH/.cache/lorrax when SCRATCH is a writable directory, else
+# ${XDG_CACHE_HOME:-~/.cache}/lorrax.
+if [ -n "${LORRAX_CACHE_ROOT:-}" ]; then
+    _lorrax_cache="$LORRAX_CACHE_ROOT"
+elif [ -n "${SCRATCH:-}" ] && [ -d "$SCRATCH" ] && [ -w "$SCRATCH" ]; then
+    _lorrax_cache="$SCRATCH/.cache/lorrax"
+else
+    _lorrax_cache="${XDG_CACHE_HOME:-$HOME/.cache}/lorrax"
+fi
+
 # CUDA_CACHE_PATH.  The CUDA driver's JIT cache defaults to ~/.nv/ComputeCache;
 # one fresh test suite plus the P1 chain put 208 MB there, and NERSC home
-# quotas are small.
+# quotas are small.  It goes in the cache tree above.
 # A value the caller set is kept.
-export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-${SCRATCH:?SCRATCH is not set}/.nv/ComputeCache}"
+export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-$_lorrax_cache/cuda_jit}"
 
 _lorrax_py="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}"
 _lorrax_here="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ -n "$_lorrax_py" ] || { [ -x "$_lorrax_here/.venv/bin/python" ] && _lorrax_py="$_lorrax_here/.venv/bin/python"; }
-_lorrax_cudart="$("${_lorrax_py:-python3}" - <<'PY' 2>/dev/null
+# A runtime-image install (install_deps.sh; LORRAX_RUNTIME=image) has no venv on
+# the login node: lorrax-run links libcudart.so inside each node's restored image.
+_lorrax_cudart=""
+[ "${LORRAX_RUNTIME:-}" = image ] || _lorrax_cudart="$("${_lorrax_py:-python3}" - <<'PY' 2>/dev/null
 import glob, os, sysconfig
 hits = sorted(glob.glob(os.path.join(sysconfig.get_paths()["purelib"], "nvidia", "cu*", "lib", "libcudart.so.[0-9]*")))
 print(os.path.realpath(hits[0]) if hits else "")
 PY
 )"
-if [ -n "$_lorrax_cudart" ]; then
-    _lorrax_shim="${XDG_CACHE_HOME:-$HOME/.cache}/lorrax/cudart-hmem/$(printf %s "$_lorrax_cudart" | md5sum | cut -c1-12)"
-    mkdir -p "$_lorrax_shim"
-    ln -sfn "$_lorrax_cudart" "$_lorrax_shim/libcudart.so"
+# Only a step that can span nodes needs it (an allocation of one node never
+# does), and it lives in node-local /tmp, created on each node by the rank
+# wrapper select_gpu.sh from LORRAX_CUDART_SHIM: every directory on
+# LD_LIBRARY_PATH is probed for every library every process and every exec'd
+# tool loads (libc, libm, ... and their glibc-hwcaps subdirectories), and a
+# directory on a shared file system made that cost 69 s of failed opens in one
+# GW stage on Perlmutter (5495 opens, ~900 ptxas execs; 2026-10-23).
+if [ -n "$_lorrax_cudart" ] && [ "${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-0}}" != 1 ]; then
+    _lorrax_shim="/tmp/lorrax-${USER:-$(id -un)}/cudart-hmem/$(printf %s "$_lorrax_cudart" | md5sum | cut -c1-12)"
+    export LORRAX_CUDART_SHIM="$_lorrax_shim/libcudart.so=$_lorrax_cudart"
+    mkdir -p "$_lorrax_shim" 2>/dev/null && ln -sfn "$_lorrax_cudart" "$_lorrax_shim/libcudart.so"
     case ":${LD_LIBRARY_PATH:-}:" in
         *":$_lorrax_shim:"*) ;;
         *) export LD_LIBRARY_PATH="$_lorrax_shim${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
     esac
 fi
-unset _lorrax_py _lorrax_here _lorrax_cudart _lorrax_shim
+unset _lorrax_py _lorrax_here _lorrax_cudart _lorrax_shim _lorrax_cache

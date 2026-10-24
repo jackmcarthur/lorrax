@@ -1,7 +1,9 @@
 # Perlmutter (NERSC)
 
 This page installs LORRAX on NERSC Perlmutter, the reference platform (4×A100
-GPU nodes, CUDA 13.2, JAX 0.12.0.1). There are two routes. A **clone** works on
+GPU nodes, CUDA 13.2, JAX 0.12.0.1). To run LORRAX, install it with
+`install_deps.sh` ([§1.4](#image)): one script, a prefix on any filesystem,
+every job restored node-local. For development there are two routes. A **clone** works on
 any NERSC account: you build the native pair yourself and run with plain
 `srun`; use it for development. A **module** is one prebuilt venv, source
 snapshot and sealed FFI bundle that users load with `module load`; it is the
@@ -19,8 +21,8 @@ writes goes to one of these places:
 | the Python venv | `<clone>/.venv` | (the clone location) |
 | the cuSOLVERMp/cuBLASMp link stage | `<clone>/.build/cusolvermp` | (the clone location) |
 | the two FFI libraries | `<clone>/src/ffi/cpp/build{,_host}/` | nothing; the loader looks there |
-| JAX compile cache, mathdx kernel cache | `$SCRATCH/.cache/lorrax/` | [`ISDF_JAX_CACHE_DIR`](../reference/env_vars.md) (compile cache only) |
-| the CUDA driver's JIT cache | `$SCRATCH/.nv/ComputeCache` once `gpu_env.sh` is sourced (CUDA's default is `~/.nv`) | `CUDA_CACHE_PATH` |
+| JAX compile cache, mathdx kernel cache | `$SCRATCH/.cache/lorrax/` (`~/.cache/lorrax/` without a writable `SCRATCH`) | [`ISDF_JAX_CACHE_DIR`](../reference/env_vars.md) (compile cache only) |
+| the CUDA driver's JIT cache | `$SCRATCH/.cache/lorrax/cuda_jit` once `gpu_env.sh` is sourced (CUDA's default is `~/.nv`) | `CUDA_CACHE_PATH` |
 | uv's download cache and Python | `~/.cache/uv`, `~/.local/share/uv` | `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR` (uv's own variables) |
 
 The home quota is small, so the commands below point uv and the CUDA JIT
@@ -109,8 +111,11 @@ environment you run in. Setting `LD_LIBRARY_PATH` neither causes nor fixes it,
 with one exception: on a multi-node step libfabric dlopens `libcudart.so` by
 that name, through `LD_LIBRARY_PATH`. The wheel ships only `libcudart.so.13`,
 so `cudatoolkit/13.2`'s `libcudart.so` (13.2.75) would be mapped beside the
-recorded wheel runtime. `gpu_env.sh` links `libcudart.so` to the venv's
-runtime, first on `LD_LIBRARY_PATH`. A multi-node step whose `libcudart.so`
+recorded wheel runtime. Outside a one-node allocation `gpu_env.sh` links
+`libcudart.so` to the venv's runtime in node-local `/tmp` (made on each node by
+`select_gpu.sh`), first on `LD_LIBRARY_PATH`; a one-node allocation gets no
+`LD_LIBRARY_PATH` entry, because every directory there is probed for every
+library each process and tool loads. A multi-node step whose `libcudart.so`
 names another file refuses at start-up with a `GATE native-closure` line
 naming both files ([launch libraries](ffi-build.md#closure)). Source
 `gpu_env.sh` in the shell that runs `srun`.
@@ -143,6 +148,73 @@ The result is `1 passed`, in about 5 min on cold caches.
   default before the step is created
   ([why](../environment/machines/perlmutter.md#network-transport-at-startup)).
 - Never run a driver on a login node.
+
+### 1.4 The install: one runtime image, restored node-local by every job {#image}
+
+`config/perlmutter/install_deps.sh` is the supported install. Every persistent
+filesystem a compute node sees here is slow per file: one `open()` costs
+3.5 ms on `/global/common` and 10 ms on CFS and `$HOME`, against 0.005 ms in
+node-local `/tmp`, and a run opens thousands of files (the interpreter, the venv, the CUDA
+headers NVRTC re-reads on every build, the FFI closure). Cold, the hsuite took 1164-1352 s from
+`/global/common` (the module), 592 s from a clone on `$SCRATCH` and 524 s from
+the image. So the installer builds the whole
+runtime (uv's Python, the venv with every CUDA wheel, the source, both FFI legs
+with their closure records, compiled `.pyc`) at the node-local path
+`/tmp/lorrax-$USER/rt-<rev>-<time>` on the login node, packs it into one
+2.6 GB archive under the prefix, and removes the build tree. Every job restores
+the archive to that same path on each node before its first rank starts, so a
+run reads one file from the install filesystem, and the prefix can be anywhere.
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/jackmcarthur/lorrax/main/config/perlmutter/install_deps.sh
+bash install_deps.sh $SCRATCH/lorrax           # login node, about 3 min; PREFIX needs about 2.5 GB
+salloc -N 1 -C gpu -G 4 -q interactive -t 0:30:00 -A <project>_g $SCRATCH/lorrax/bin/lorrax-postinstall
+source $SCRATCH/lorrax/lorrax-env.sh           # every launch shell
+srun -N 1 -n 4 --gpus-per-node=4 lorrax-run python -u -m gw.gw_jax -i input.in
+```
+
+The installer ends by running `lorrax-postinstall`; outside a GPU allocation
+that prints `INSTALL NOT VERIFIED` with the `salloc` line above (your `_g`
+account filled in). Inside one it restores the image on the compute node,
+builds the NVRTC kernel store into `$SCRATCH/.cache/lorrax/kconv_mathdx/images`
+(about 4 min) and runs [the self-check](perf_check.md); a pass prints
+`INSTALL VERIFIED` and writes the stamp that silences the startup warning.
+
+| prefix file | what it is |
+|---|---|
+| `images/rt-<id>.tar.zst`, `.meta` | the runtime image; `current` points at the one in use, a reinstall removes the previous one |
+| `bin/lorrax-run` | the `srun` command: restore once per node, then the image's venv, then `select_gpu.sh` |
+| `bin/lorrax-postinstall` | the compute-node step above |
+| `lorrax-env.sh` | puts `bin/` on `PATH` and applies `gpu_env.sh`; source it before `srun` |
+| `share/lorrax/` | `gpu_env.sh` and `postinstall.sh`, copied from the image |
+
+uv's download cache (4.5 GB when empty) and ccache stay in `$SCRATCH/.cache`,
+never in the prefix or `$HOME`. The installer refuses up front when the prefix,
+the build directory or the uv cache lacks room (`--no-space-check` skips that).
+`--in-place` keeps the older developer layout (clone and venv under the prefix,
+run through the tree's `select_gpu.sh`); it is fast only on `$SCRATCH`.
+
+How `lorrax-run` (`scripts/runtime_image.sh`) behaves:
+
+- **Restore.** The first rank on a node fetches the archive with 16 parallel
+  16 MiB reads and unpacks it (about 7 s from `$SCRATCH` or CFS); the other
+  ranks wait on a lock and find it done. Later steps and jobs on the node
+  find it in 0.3 s. Every absolute path the venv, the editable install and the
+  closure records name is the recorded one, so the closure gate does not rehash
+  and the caches key as at build time.
+- **Room.** The node needs about 9.2 GB free during the restore, 5.1 GB after.
+  Where `/tmp` lacks it the tree goes to `/dev/shm`, then `$TMPDIR` (or
+  `LORRAX_IMAGE_ROOTS`), linked at the canonical path. With no node-local room
+  at all the node runs from one extracted copy at `<prefix>/unpacked/` (made
+  once, shared by every such node) and prints one line saying so; that reads
+  the install filesystem per file, and the self-check judges it.
+- **Several jobs, several ranks, cleanup.** Ranks and jobs of one user on one
+  node share one restored image. After each restore, this user's other images
+  on the node that no process holds are removed.
+- **Multi-node.** Each node restores from the prefix itself (about 7 s each).
+  A Slurm `sbcast` fan-out for large node counts is not built.
+- **Not a development tree.** Edits under `/tmp/lorrax-$USER` are lost; work on
+  a clone (§1.1-1.3) and reinstall, or use `--in-place`.
 
 ## 2. The module {#module}
 

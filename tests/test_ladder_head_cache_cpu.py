@@ -19,7 +19,8 @@ def _controls():
     first = Mesh(devices.reshape(2,2),('x','y'))
     same = Mesh(devices.copy().reshape(2,2),('x','y'))
     other = Mesh(devices[[0,2,1,3]].reshape(2,2),('x','y'))
-    data = dict(nkx=1,nky=1,nkz=1,n_cond_pad=2,n_val_pad=2)
+    data = dict(nkx=1,nky=1,nkz=1,n_cond_pad=2,n_val_pad=2,
+                psi_c_X=np.zeros((1,2,2,1)))
 
     def build(mesh, _data, **_kwargs):
         # The production builder closes over its mesh. No solve or large

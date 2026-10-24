@@ -5,6 +5,30 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-24 — BSE spin channels are explicit in operators and caches
+
+Scalar optical singlet and triplet solves now carry `exchange_channel`
+through their payload, factories, exact diagonal and solver cache identity.
+The former process-global selector could leave a later solve using a cached
+Hamiltonian or preconditioner from the other channel. Separate default
+singlet runs keep their equations; interleaved same-process results can move.
+The deck flags `spin_singlet` and `spin_triplet` are unchanged.
+
+Python callers must pass `exchange_channel='triplet'` to optical stack/pair
+factories and `build_bse_exact_diagonal`, or retain it on their loaded BSE
+payload. The process-global `set_exchange_channel` function is removed.
+The loader derives the channel from an existing input deck unless an explicit
+`exchange_channel` override is supplied; without either, it selects singlet.
+
+Density W_BSE and its head always use the charge operator: scalar exchange
+weight 2 and full-spinor weight 1, independent of an optical triplet payload.
+This remains screening in Sigma = i G W_BSE, without a new self-energy vertex.
+Rebuild prior W_BSE banks/models: their operator convention is now
+`physical-ra-charge-spin-static-head-v3`, and the identity records the charge
+channel and its resolved spin weight. The previous global state cannot be
+authenticated retrospectively, so no artifact migration is supplied.
+The raw static-W0 restart format is unchanged.
+
 ## 2026-10-24 — JAX window per platform: ROCm keeps 0.9.1
 
 - **Changed.** `runtime.jax_support.SUPPORTED_WINDOWS` replaces the single

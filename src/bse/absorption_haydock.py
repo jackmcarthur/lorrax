@@ -58,7 +58,6 @@ from common.fft_helpers import get_donated_kfft_kminor
 from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, polarization_directions, project_dipoles, window_dipoles, write_absorption_dat, write_absorption_h5)
 from .bse_deck import (DeckError, Key, check_dipole_operator, check_fine_grid_keys, deck_params, eqp_file,
                        omega_count, read_settings, spin_kernel)
-from .bse_preconditioner import set_exchange_channel
 from .bse_head import head_shifted_eps_c
 from .bse_window import _parse_wfn_path
 from .bse_io import (load_bse_data_from_restart_sharded)
@@ -153,12 +152,13 @@ def ensure_W_R(data, mesh_xy):
     return data["W_R"]
 
 
-def haydock_program(mesh_xy, kgrid, n_iter):
+def haydock_program(mesh_xy, kgrid, n_iter, exchange_channel="singlet"):
     """The jitted recursion ``(d_seed, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c,
     eps_v, W_R, V_q0, M) -> (alphas, betas, norms)``: every device array an
     argument, the stack matvec inside one ``lax.scan`` of ``n_iter`` steps."""
     sh = make_bse_shardings(mesh_xy)
-    matvec_stack = build_bse_stack_matvec(mesh_xy, *kgrid, kernel="bse")
+    matvec_stack = build_bse_stack_matvec(mesh_xy, *kgrid, kernel="bse",
+                                         exchange_channel=exchange_channel)
     rep = NamedSharding(mesh_xy, P())
 
     @partial(
@@ -197,7 +197,8 @@ def haydock_coefficients(data, mesh_xy, d_block_np, n_iter):
     W_R = ensure_W_R(data, mesh_xy)
     d_np = np.ascontiguousarray(d_block_np, dtype=np.complex128)
     d_seed = jax.make_array_from_callback(d_np.shape, sh.X, lambda idx: d_np[idx])
-    alphas, betas, norms = haydock_program(mesh_xy, kgrid, int(n_iter))(
+    alphas, betas, norms = haydock_program(
+        mesh_xy, kgrid, int(n_iter), data.get("exchange_channel", "singlet"))(
         d_seed, data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
         head_shifted_eps_c(data["eps_c"], data), data["eps_v"], W_R,
         data["V_q0"], data["M"])
@@ -462,7 +463,6 @@ def main(argv=None):
         if not kernel["include_w"]:
             raise DeckError("bse.absorption_haydock runs the screened TDA recursion "
                             "(D + w V - W): drop local_fields")
-        set_exchange_channel(kernel["channel"])
     except DeckError as exc:
         p.error(str(exc))
     if args.gaussian_broadening:

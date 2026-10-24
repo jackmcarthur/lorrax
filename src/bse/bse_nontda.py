@@ -227,7 +227,8 @@ def _full_matvec_and_args(data, mesh_xy, sh, *, include_W):
     from .bse_stack_matvec import build_bse_stack_pair_matvec
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     pair = build_bse_stack_pair_matvec(
-        mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa")
+        mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
+        exchange_channel=data.get("exchange_channel", "singlet"))
     if include_W:
         W_ifft = make_kfft_kminor(
             mesh_xy, (nkx, nky, nkz), sh.W.spec, kind="ifftn", norm="ortho")
@@ -434,7 +435,8 @@ def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
     from common.units import RYD_TO_EV
 
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
-    pair = build_bse_stack_pair_matvec(mesh_xy, nkx, nky, nkz)
+    pair = build_bse_stack_pair_matvec(mesh_xy, nkx, nky, nkz,
+                                     exchange_channel=data.get("exchange_channel", "singlet"))
     rep = NamedSharding(mesh_xy, P())
     UV_sh = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
     in_sh = (sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y, sh.eps, sh.eps,

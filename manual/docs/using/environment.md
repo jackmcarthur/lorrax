@@ -137,7 +137,7 @@ LORRAX reads or sets these; the vendor's documentation owns their meaning.
 | `JAX_ENABLE_X64` | Set to `1` unless exported, and pushed onto a JAX imported earlier. A resolved off refuses. |
 | `CUDA_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES` | The first one set gives the local device ids; an empty one masks that vendor's GPUs. `select_gpu.sh` sets `CUDA_VISIBLE_DEVICES` per rank. |
 | `XLA_PYTHON_CLIENT_ALLOCATOR`, `XLA_PYTHON_CLIENT_PREALLOCATE`, `XLA_CLIENT_MEM_FRACTION` | On a GPU run where neither of the first two is exported, LORRAX sets the leg's allocator (CUDA: `cuda_async`), preallocation and its pool fraction. Exporting either makes the caller own the pool; inconsistent combinations and both fraction spellings at once refuse. |
-| `XLA_FLAGS` | `rematerialization` is added to `--xla_disable_hlo_passes`; on GPU, `--xla_gpu_autotune_level=0` is appended unless present. A caller's value wins flag by flag. |
+| `XLA_FLAGS` | `rematerialization` is added to `--xla_disable_hlo_passes`; on an NVIDIA GPU, `--xla_gpu_autotune_level=0` and `--xla_gpu_enable_triton_gemm=false` are appended unless present (on AMD, the autotune flag and `--xla_gpu_disable_async_collectives=ALLCOLLECTIVES`). A caller's value wins flag by flag. |
 | `JAX_COORDINATOR_ADDRESS` | Overrides the coordinator. Otherwise, in a Slurm step, the first host of `SLURM_STEP_NODELIST` on a port derived from `SLURM_JOB_ID` and `SLURM_STEP_ID`; with neither, startup refuses. |
 | `JAX_PROCESS_COUNT`, `SLURM_NTASKS` and the MPI equivalents | Process count, first set wins. A count of 1 while any of them says more refuses (`GATE split_launch`). |
 | `JAX_CPU_COLLECTIVES_IMPLEMENTATION` | A multi-process CPU run requires `mpi`; any other value refuses. |

@@ -10,6 +10,8 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <random>
 #include <sstream>
 
@@ -259,17 +261,84 @@ static std::string mathdx_dist_info(const std::string& root) {
     return out;
 }
 
+// The node-local copy of the header trees that ffi.fft.stage_nvrtc_headers makes,
+// /tmp/lorrax-<USER or uid>/nvrtc-include/<16 hex>, when its .complete marker exists;
+// else "".  The hex is FNV-1a over (basename + "\x1e" + content) of the cuFFTDx,
+// commonDx, CUTLASS and CCCL version files, then "mathdx-dist:" + the wheel's
+// dist-info names -- the toolchain the image key already hashes; ffi/fft.py
+// _nvrtc_stage_key computes the same.  The path is computed once per header root and
+// the marker is checked on every call, so a copy that lands mid-run is used from then on.
+static std::string node_header_stage(const std::string& root, const std::string& cuda_inc,
+                                     const std::string& cccl) {
+    static std::mutex mu;
+    static std::map<std::string, std::string> paths;
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = paths.find(root + "|" + cuda_inc);
+        if (it == paths.end()) {
+            const std::string inc = root + "/include";
+            uint64_t h = fnv1a("");
+            for (const std::string& f : {inc + "/cufftdx/cufftdx_version.hpp", inc + "/commondx/commondx_version.hpp",
+                                         root + "/external/cutlass/include/cutlass/version.h", cccl})
+                h = fnv1a(f.substr(f.find_last_of('/') + 1) + "\x1e" + read_file(f), h);
+            h = fnv1a("mathdx-dist:" + mathdx_dist_info(root), h);
+            const char* user = std::getenv("USER");
+            it = paths.emplace(root + "|" + cuda_inc,
+                               "/tmp/lorrax-" + (user && *user ? std::string(user) : std::to_string(getuid())) +
+                                   "/nvrtc-include/" + hex16(h)).first;
+        }
+        path = it->second;
+    }
+    return exists(path + "/.complete") ? path : std::string();
+}
+
 void mathdx_toolchain(const std::string& root, const std::string& cuda_inc, const char* dx,
                       Program* p) {
     const std::string inc = root + "/include", cutlass = root + "/external/cutlass/include";
-    p->includes = {inc, cutlass, cuda_inc, cuda_inc + "/cccl"};
     const std::string cccl = exists(cuda_inc + "/cccl/cuda/std/__cccl/version.h")
         ? cuda_inc + "/cccl/cuda/std/__cccl/version.h" : cuda_inc + "/cuda/std/__cccl/version.h";
+    // NVRTC opens ~2900 headers per build through these -I paths (strace, 2026-10-23); a node-local copy
+    // of the same bytes serves them when present.  The include paths are not keyed and the version files
+    // stay the wheel's, so the image key is unchanged.
+    const std::string stage = node_header_stage(root, cuda_inc, cccl);
+    if (!stage.empty())
+        p->includes = {stage + "/nvidia/mathdx/include", stage + "/nvidia/mathdx/external/cutlass/include",
+                       stage + "/cuda_include", stage + "/cuda_include/cccl"};
+    else
+        p->includes = {inc, cutlass, cuda_inc, cuda_inc + "/cccl"};
     p->version_files = {inc + "/" + dx + "/" + dx + "_version.hpp", inc + "/commondx/commondx_version.hpp",
                         cutlass + "/cutlass/version.h", cccl};
     p->extra_key = "mathdx-dist:" + mathdx_dist_info(root);
 }
 #endif
+
+// The RTC library as a key component, without its install location: the real file's name
+// (a toolkit's libnvrtc.so.13.2.78 or libhiprtc.so.7.14.60850 carries the patch level), its
+// size, and for a pip wheel (<site>/nvidia/cu13/lib/libnvrtc.so.13, whose name does not) the
+// wheel's dist-info name (<site>/nvidia_cuda_nvrtc-13.4.92.dist-info): one listing of one
+// directory.  So one image serves every install of one toolchain, and a cache or store built
+// from one checkout is a hit from any other.
+static std::string rtc_identity(const std::string& path) {
+    const size_t slash = path.find_last_of('/');
+    std::string id = slash == std::string::npos ? path : path.substr(slash + 1);
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) id += "#" + std::to_string(static_cast<long long>(st.st_size));
+    if (slash == std::string::npos) return id;
+    if (DIR* d = opendir((path.substr(0, slash) + "/../../..").c_str())) {
+        std::vector<std::string> names;
+        while (dirent* e = readdir(d)) {
+            const std::string n(e->d_name);
+            if ((n.rfind("nvidia_cuda_nvrtc", 0) == 0 || n.rfind("hiprtc", 0) == 0) &&
+                n.size() > 10 && n.substr(n.size() - 10) == ".dist-info")
+                names.push_back(n);
+        }
+        closedir(d);
+        std::sort(names.begin(), names.end());
+        for (const auto& n : names) id += ";" + n;
+    }
+    return id;
+}
 
 uint64_t key(const Program& p, std::string* missing) {
     const RtcApi& rtc = rtc_api();
@@ -283,8 +352,9 @@ uint64_t key(const Program& p, std::string* missing) {
         if (text.empty() && missing) *missing += (missing->empty() ? "" : ", ") + f;
         h = fnv1a(text, fnv1a("\x1e" + f.substr(f.find_last_of('/') + 1), h));
     }
+    static const std::string rtc_id = rtc_identity(rtc.path);
     h = fnv1a(LRX_RTC_API + std::to_string(rtc_major) + "." + std::to_string(rtc_minor) + "@" +
-              rtc.path, h);
+              rtc_id, h);
     return fnv1a(p.extra_key, h);
 }
 

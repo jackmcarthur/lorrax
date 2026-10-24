@@ -202,6 +202,7 @@ def build_preconditioner_diagonal_sharded(
     mesh_xy: Mesh,
     include_W: bool = True,
     use_tda: bool = True,
+    *, exchange_channel: str | None = None,
 ) -> jax.Array:
     """``diag(H_BSE)`` for the shifted GMRES preconditioner, from the payload.
 
@@ -234,13 +235,17 @@ def build_preconditioner_diagonal_sharded(
     ``compute_pair_amplitude`` call, which is why the agreement above is at
     round-off.
     """
+    if exchange_channel is None:
+        exchange_channel = data.get("exchange_channel", "singlet")
     if data.get("physical_branches", False) and not use_tda:
         anti = dict(data, M=data["M_A"], eps_c=data["eps_c_A"], eps_v=data["eps_v_A"])
         for band in ("c", "v"):
             for axis in ("X", "Y"):
                 anti[f"psi_{band}_{axis}"] = jnp.conj(data[f"psi_{band}_A_{axis}"])
-        dr = build_preconditioner_diagonal_sharded(data, mesh_xy, include_W, use_tda=True)
-        da = build_preconditioner_diagonal_sharded(anti, mesh_xy, include_W, use_tda=True)
+        dr = build_preconditioner_diagonal_sharded(data, mesh_xy, include_W, use_tda=True,
+                                                  exchange_channel=exchange_channel)
+        da = build_preconditioner_diagonal_sharded(anti, mesh_xy, include_W, use_tda=True,
+                                                  exchange_channel=exchange_channel)
         # Swapping the physical m/n legs conjugates their Hermitian-W
         # diagonal; the ring self-contraction and excitation energy are real.
         return jax.lax.with_sharding_constraint(jnp.stack((dr, -jnp.conj(da)))[:, None],
@@ -275,6 +280,7 @@ def build_preconditioner_diagonal_sharded(
         data["psi_c_X"], data["psi_v_Y"],
         W_q0, M, data["V_q0"], nk,
         sharding=tda_sharding, complex_out=True, memo=False,
+        exchange_channel=exchange_channel,
     )
     if use_tda:
         return diag_h
@@ -925,6 +931,7 @@ def run_feast_ritz(
             data["nky"],
             data["nkz"],
             kernel="bse" if include_W else "rpa",
+            exchange_channel=data.get("exchange_channel", "singlet"),
         )
     else:
         # Full BSE: the same kernels, two fused pair applications per call.
@@ -934,6 +941,7 @@ def run_feast_ritz(
             data["nky"],
             data["nkz"],
             kernel="bse" if include_W else "rpa",
+            exchange_channel=data.get("exchange_channel", "singlet"),
         )
     sh = make_bse_shardings(mesh_xy)
 
@@ -1213,6 +1221,7 @@ def estimate_spectral_bounds_sharded(
         data["nky"],
         data["nkz"],
         kernel="bse" if include_W else "rpa",
+        exchange_channel=data.get("exchange_channel", "singlet"),
     )
 
     key = jax.random.PRNGKey(seed)

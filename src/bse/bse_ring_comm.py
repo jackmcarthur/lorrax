@@ -529,6 +529,7 @@ def apply_V_ring(
     nk: int,
     px: int,
     py: int,
+    exchange_channel: str = "singlet",
 ) -> jax.Array:
     # ``M`` (nk, c_loc, v_loc, μ): the hoisted decode-side exchange pair
     # amplitude ``Σ_s conj(ψ_c^X) ψ_v^X``, precomputed ONCE per solve (audit P3)
@@ -595,7 +596,7 @@ def apply_V_ring(
     # k in the decode (VERDICT.md).  k is a replicated (unsharded) axis here, so
     # the reduction is device-local.  The two 1/sqrt_nk compose to 1/Nk.
     # exchange_spin_weight: the scalar-singlet 2 (bse_preconditioner owns it).
-    S_total = (jnp.sum(S_total, axis=2) / sqrt_nk) * exchange_spin_weight(nspinor)  # (b, nu_local)
+    S_total = (jnp.sum(S_total, axis=2) / sqrt_nk) * exchange_spin_weight(nspinor, exchange_channel)
 
     U_partial = jnp.einsum("MN,bN->bM", V_q0, S_total)  # (b, mu_local)
     U = ordered_psum(U_partial, axis_name="y")
@@ -625,6 +626,7 @@ def build_bse_ring_matvec_full(
     ladder_rung_slots: bool = False,
     fuse_ladder_rung: bool = True,
     physical_branches: bool = False,
+    exchange_channel: str = "singlet",
 ):
     """Build the non-TDA density-response Hamiltonian, sharded over all P.
 
@@ -718,7 +720,7 @@ def build_bse_ring_matvec_full(
     )
 
     def _apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0):
-        return apply_V_ring(X, psi_c_Y, psi_v_Y, M, V_q0, nk, px, py)
+        return apply_V_ring(X, psi_c_Y, psi_v_Y, M, V_q0, nk, px, py, exchange_channel)
 
     apply_V_ring_only = _shard_map_fn(
         _apply_V_ring_only,
@@ -901,6 +903,7 @@ def build_density_snapshot_operator(
     nky: int,
     nkz: int,
     scatter_nu_on_y: bool = False,
+    exchange_channel: str = "singlet",
 ):
     """Build a sharded map: s(b,c,v,k) -> d(b,mu) = V_q0 @ sum_k R s.
 
@@ -993,7 +996,7 @@ def build_density_snapshot_operator(
         # bse_w_exact._build_rpa_resolvent's docstring) and needs the SAME
         # missing weight as apply_V_ring's identically-shaped S_total — see
         # exchange_spin_weight's docstring.
-        S_total = (S_total / sqrt_nk) * exchange_spin_weight(nspinor)
+        S_total = (S_total / sqrt_nk) * exchange_spin_weight(nspinor, exchange_channel)
 
         # V_q0 @ S: local N-slice partials, N tiled on y (mu on x from V_q0).
         U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)  # (b, mu_local_x, k)

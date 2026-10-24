@@ -164,6 +164,7 @@ def run_kpm_dos(
             data["nky"],
             data["nkz"],
             kernel="bse" if include_W else "rpa",
+            exchange_channel=data.get("exchange_channel", "singlet"),
         )
     else:
         # Full BSE: the same kernels, two fused pair applications per call.
@@ -173,6 +174,7 @@ def run_kpm_dos(
             data["nky"],
             data["nkz"],
             kernel="bse" if include_W else "rpa",
+            exchange_channel=data.get("exchange_channel", "singlet"),
         )
 
     # Moments in complex128 on the payload itself: the W term's fused kernel

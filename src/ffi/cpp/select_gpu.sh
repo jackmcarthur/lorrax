@@ -110,15 +110,98 @@ fi
 
 export CUDA_VISIBLE_DEVICES="${_select_gpu_device}"
 
+# CPU THREADS, derived from the CPUs Slurm gave this rank
+# --------------------------------------------------------
+# The plain step `srun -N 1 -n 4 --gpus-per-node=4` gives each Perlmutter rank
+# a quarter of the node WITH both hardware threads of each core (32 CPUs on
+# 16 cores), and leaves OMP_NUM_THREADS unset, so every OpenMP team (LibSci,
+# the host FFT) starts 32 threads per rank and XLA's CPU pool takes all 32.
+# The reference clone runs used `-c 16 --threads-per-core=1
+# --cpu-bind=threads` with OMP_NUM_THREADS=14, OPENBLAS_NUM_THREADS=1 and
+# MKL_NUM_THREADS=1 (docs/environment/machines/perlmutter.md, Threads per
+# rank).  Here the rank reaches that shape from whatever Slurm assigned it:
+# its affinity mask is cut to one hardware thread per physical core, and
+# OMP_NUM_THREADS is that core count less two (the MPICH progress thread and
+# Python's I/O threads), at least 1; the BLAS teams default to 1.  Where the
+# core topology cannot be read (no sysfs thread_siblings_list, no taskset)
+# the mask is left alone and the count is taken from the logical CPUs.  A
+# caller that exported OMP_NUM_THREADS owns the threading, and nothing here
+# changes.  LORRAX_RANK_THREADS records which case ran; the runtime prints it
+# in the startup CPU row.
+_select_gpu_threads() {
+    local list cpu c sib s lo hi lower keep="" n=0 total=0 topo=1 how
+    list=$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status 2>/dev/null)
+    if [[ -z "$list" ]]; then
+        export LORRAX_RANK_THREADS="select_gpu: no affinity mask readable; threads unchanged"
+        return 0
+    fi
+    local -A in_mask=()
+    local -a cpus=()
+    local IFS=,
+    for s in $list; do
+        lo=${s%-*}; hi=${s#*-}
+        for ((cpu = lo; cpu <= hi; cpu++)); do in_mask[$cpu]=1; cpus+=("$cpu"); done
+    done
+    for cpu in "${cpus[@]}"; do
+        total=$((total + 1))
+        if [[ -r "/sys/devices/system/cpu/cpu$cpu/topology/thread_siblings_list" ]]; then
+            sib=$(< "/sys/devices/system/cpu/cpu$cpu/topology/thread_siblings_list")
+        else
+            sib=$cpu; topo=0
+        fi
+        lower=0
+        for s in $sib; do
+            lo=${s%-*}; hi=${s#*-}
+            for ((c = lo; c <= hi && c < cpu; c++)); do [[ -n "${in_mask[$c]:-}" ]] && lower=1; done
+        done
+        if ((lower == 0)); then keep+="${keep:+,}$cpu"; n=$((n + 1)); fi
+    done
+    unset IFS
+    if ((topo == 0)); then
+        n=$total; how="mask of $total CPUs left alone (no sysfs core topology)"
+    elif ((n == total)); then
+        how="$total CPUs, one per core already"
+    elif ! command -v taskset >/dev/null 2>&1; then
+        n=$total; how="mask of $total CPUs left alone (no taskset)"
+    elif taskset -pc "$keep" $$ >/dev/null 2>&1; then
+        how="mask cut from $total CPUs to $n, one per physical core"
+    else
+        n=$total; how="mask of $total CPUs left alone (taskset refused)"
+    fi
+    export OMP_NUM_THREADS=$((n > 3 ? n - 2 : 1))
+    export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+    export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+    export LORRAX_RANK_THREADS="select_gpu: $how; OMP $OMP_NUM_THREADS, OpenBLAS $OPENBLAS_NUM_THREADS, MKL $MKL_NUM_THREADS"
+}
+if [[ -n "${OMP_NUM_THREADS:-}" ]]; then
+    export LORRAX_RANK_THREADS="select_gpu: OMP_NUM_THREADS=${OMP_NUM_THREADS} exported by the caller; mask and threads unchanged"
+else
+    _select_gpu_threads
+fi
+
+# The node-local libcudart.so link config/perlmutter/gpu_env.sh put on
+# LD_LIBRARY_PATH for a multi-node step ("<link>=<target>"): /tmp is per node,
+# so each rank makes it on its own node (idempotent; ln -sfn under a race
+# leaves one correct link).
+if [[ -n "${LORRAX_CUDART_SHIM:-}" ]]; then
+    _select_gpu_link=${LORRAX_CUDART_SHIM%%=*}
+    if [[ "$(readlink "$_select_gpu_link" 2>/dev/null)" != "${LORRAX_CUDART_SHIM#*=}" ]]; then
+        mkdir -p "${_select_gpu_link%/*}" 2>/dev/null &&
+            ln -sfn "${LORRAX_CUDART_SHIM#*=}" "$_select_gpu_link" 2>/dev/null
+    fi
+    unset -v _select_gpu_link
+fi
+
 case "${LORRAX_DEBUG_PRINT:-0}" in
     1|on|ON|true|TRUE|yes|YES)
         echo "[select_gpu] $(hostname) local rank ${_select_gpu_localid} ->" \
              "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" \
-             "(from ${_select_gpu_from})" >&2
+             "(from ${_select_gpu_from}); CPUs $(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status);" \
+             "${LORRAX_RANK_THREADS:-}" >&2
         ;;
 esac
 
-unset -f _select_gpu_nth
+unset -f _select_gpu_nth _select_gpu_threads
 unset -v _select_gpu_localid _select_gpu_device _select_gpu_from \
          _select_gpu_var
 exec "$@"

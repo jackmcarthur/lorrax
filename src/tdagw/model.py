@@ -173,7 +173,7 @@ def _td_program(mesh_xy: Mesh, kgrid: tuple, nspinor: int, sex: bool, hartree: b
     st = td_state_sharding(mesh_xy)
     w_term = make_w_term(mesh_xy, nkx, nky, nkz) if sex else None
     h_term = _make_hartree_term(mesh_xy) if hartree else None
-    w_s = exchange_spin_weight(nspinor)
+    w_s = exchange_spin_weight(nspinor, "singlet")
 
     def _apply(drho, psi_X, psi_Y, M, W_R, zeta_G, v_G):
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=drho.real.dtype))

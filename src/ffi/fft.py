@@ -402,6 +402,123 @@ def mathdx_root() -> str:
         "cuFFTDx headers; fix: pip install nvidia-mathdx.")
 
 
+def _nvrtc_cuda_include() -> str:
+    """The CUDA include NVRTC compiles against: beside the libnvrtc this process
+    mapped (``lib/../include`` or ``lib/../../include``, as ``rtc::toolkit_include``
+    derives it), or "" when no libnvrtc is mapped yet."""
+    import os
+    try:
+        with open("/proc/self/maps") as fh:
+            libs = {line.split(None, 5)[-1].strip() for line in fh if "/libnvrtc.so" in line}
+    except OSError:
+        return ""
+    for lib in sorted(libs):
+        d = os.path.dirname(lib)
+        for rel in ("../include", "../../include"):
+            inc = os.path.normpath(os.path.join(d, rel))
+            if (os.path.isfile(os.path.join(inc, "cccl/cuda/std/type_traits"))
+                    or os.path.isfile(os.path.join(inc, "cuda/std/type_traits"))):
+                return inc
+    return ""
+
+
+#: :func:`stage_nvrtc_headers`' node-local directory once named (empty: not yet).
+_NVRTC_STAGE: list = []
+
+
+def stage_nvrtc_headers() -> str:
+    """Copy NVRTC's header trees to node-local ``/tmp`` once per node; the stage path or "".
+
+    A mathdx build opens about 3200 files (2900 under the wheel's header trees, 1150
+    of them misses along the ``-I`` list; strace, login21 2026-10-23), which on a
+    compute node reading a shared file system is seconds per build.  The copy
+    (``/tmp/lorrax-$USER/nvrtc-include/<key>``: ``nvidia/mathdx/{include,
+    external/cutlass/include}`` and ``cuda_include``; 151 MB, 3.9 s from $SCRATCH)
+    is keyed by the toolchain the image key already hashes (:func:`_nvrtc_stage_key`,
+    the same FNV-1a as ``rtc_build.cc`` ``node_header_stage``), made under a
+    ``flock`` in a helper thread and published by rename with a ``.complete``
+    marker, so no rank waits for it; ``rtc::mathdx_toolchain`` reads headers there
+    once the marker exists, else from the wheel.  The bytes are the same, so neither
+    the image key (include paths are not keyed; the version files stay the wheel's)
+    nor any HLO attribute changes, and no environment variable is written.  Any
+    failure leaves the wheel path in use.
+    """
+    import os
+    import threading
+    if _NVRTC_STAGE:
+        return _NVRTC_STAGE[0]
+    try:
+        src = mathdx_root()
+    except RuntimeError:
+        return ""
+    cinc = _nvrtc_cuda_include()
+    if not cinc:
+        return ""                                  # no libnvrtc mapped yet: try again later
+    user = os.environ.get("USER") or str(os.getuid())
+    base = f"/tmp/lorrax-{user}/nvrtc-include/{_nvrtc_stage_key(src, cinc)}"
+    _NVRTC_STAGE.append(base)
+    if not os.path.exists(os.path.join(base, ".complete")):
+        threading.Thread(target=_copy_nvrtc_headers, args=(src, cinc, base),
+                         name="lorrax-nvrtc-headers", daemon=True).start()
+    return base
+
+
+def _nvrtc_stage_key(src: str, cinc: str) -> str:
+    """16 hex: FNV-1a 64 over (basename + 0x1e + content) of the cuFFTDx, commonDx,
+    CUTLASS and CCCL version files, then ``mathdx-dist:`` + the sorted
+    ``nvidia_mathdx-*.dist-info`` names each followed by ``;`` (``rtc_build.cc``)."""
+    import os
+
+    def fnv(data: bytes, h: int) -> int:
+        for b in data:
+            h = ((h ^ b) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+        return h
+
+    cccl = f"{cinc}/cccl/cuda/std/__cccl/version.h"
+    if not os.path.exists(cccl):
+        cccl = f"{cinc}/cuda/std/__cccl/version.h"
+    h = 1469598103934665603
+    for f in (f"{src}/include/cufftdx/cufftdx_version.hpp", f"{src}/include/commondx/commondx_version.hpp",
+              f"{src}/external/cutlass/include/cutlass/version.h", cccl):
+        try:
+            with open(f, "rb") as fh:
+                body = fh.read()
+        except OSError:
+            body = b""
+        h = fnv(os.path.basename(f).encode() + b"\x1e" + body, h)
+    try:
+        names = sorted(n for n in os.listdir(os.path.join(src, "..", ".."))
+                       if n.startswith("nvidia_mathdx-") and len(n) > 10 and n.endswith(".dist-info"))
+    except OSError:
+        names = []
+    h = fnv(("mathdx-dist:" + "".join(n + ";" for n in names)).encode(), h)
+    return f"{h:016x}"
+
+
+def _copy_nvrtc_headers(src: str, cinc: str, base: str) -> None:
+    import fcntl
+    import os
+    import shutil
+    import socket
+    try:
+        os.makedirs(os.path.dirname(base), exist_ok=True)
+        with open(base + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if os.path.exists(os.path.join(base, ".complete")):
+                return
+            tmp = f"{base}.tmp.{socket.gethostname()}.{os.getpid()}"
+            shutil.rmtree(tmp, ignore_errors=True)
+            shutil.copytree(os.path.join(src, "include"), os.path.join(tmp, "nvidia/mathdx/include"))
+            shutil.copytree(os.path.join(src, "external/cutlass/include"),
+                            os.path.join(tmp, "nvidia/mathdx/external/cutlass/include"))
+            shutil.copytree(cinc, os.path.join(tmp, "cuda_include"))
+            open(os.path.join(tmp, ".complete"), "w").close()
+            shutil.rmtree(base, ignore_errors=True)   # a torn earlier copy without its marker
+            os.rename(tmp, base)
+    except Exception:                                         # noqa: BLE001
+        pass                                                  # the wheel path stays in use
+
+
 #: Non-empty inside :func:`xla_reference`.
 _XLA_REFERENCE: list = []
 
@@ -1017,6 +1134,7 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
         root = mathdx_root()
         for target in KCONV_TARGETS:
             _require_target(target, "CUDA")
+        stage_nvrtc_headers()                     # the leg (and its libnvrtc) is mapped now
         try:
             _probe_kconv_compile(mesh)
             why = ""
@@ -1208,15 +1326,16 @@ def _check_kgrid(kgrid, backend: str) -> tuple[int, int, int]:
 
 def _mathdx_common() -> dict:
     """The two string attributes every mathdx handler takes: the wheel root and
-    the disk cubin cache directory (:func:`cubin_cache_dir`)."""
+    the disk cubin cache directory (:func:`cubin_cache_dir`).  Starts the node-local
+    header copy (:func:`stage_nvrtc_headers`), which changes neither."""
+    stage_nvrtc_headers()
     return dict(mathdx_root=mathdx_root(), cubin_dir=cubin_cache_dir())
 
 
 def cubin_cache_dir() -> str:
-    """Where the compiled mathdx kernels are kept: ``$SCRATCH/.cache/lorrax/kconv_mathdx/<ffi-tag>``,
-    or ``~/.cache/lorrax/kconv_mathdx/<ffi-tag>`` where the site defines no ``SCRATCH``;
-    ``<ffi-tag>`` is the enforced native closure identity
-    (``common.jax_compile_cache.native_cache_tag``).
+    """Where the compiled mathdx kernels are kept: ``kconv_mathdx/images`` in the per-user
+    cache tree (``lxkit.user_cache_root``: ``$SCRATCH/.cache/lorrax``, else
+    ``~/.cache/lorrax``).
 
     Always on, and separate from the XLA compile cache
     (``common.jax_compile_cache``, one namespace per jax, jaxlib, FFI bundle
@@ -1231,10 +1350,13 @@ def cubin_cache_dir() -> str:
     release's read-only store (:func:`seed_cubin_cache`).
     """
     from lxkit import user_cache_dir
-    from common.jax_compile_cache import native_cache_tag
-    # One store per native closure: an image built against one NVRTC/hipRTC and
-    # library set is never offered to another (lxkit.native_provider).
-    d = str(user_cache_dir("kconv_mathdx") / native_cache_tag())
+    # One directory per user for every build and install: each image's file name
+    # carries its full key, which names the RTC library by file name, size and
+    # wheel version but not by location (common/rtc_build.h), so an image built
+    # from one checkout, venv or module is a hit from any other, and one built by
+    # another toolchain can never be read.  (A per-native-closure subdirectory
+    # here made every rebuild of the FFI start cold.)
+    d = str(user_cache_dir("kconv_mathdx") / "images")
     seed_cubin_cache(str(CUBIN_STORE), d)
     return d
 

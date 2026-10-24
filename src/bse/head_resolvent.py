@@ -123,12 +123,14 @@ def head_operator_key(mesh_xy: Mesh, data: dict, *, include_w: bool,
     on purpose: they are runtime operands.
     """
     from distrib_la import mesh_key
+    from .bse_preconditioner import exchange_spin_weight
 
     return (
         "bse.head_resolvent",
         bool(include_w),
         bool(include_w or data.get("physical_branches", False)),
         bool(fuse_ladder_rung),
+        ("charge", exchange_spin_weight(int(data["psi_c_X"].shape[2]), "singlet")),
         (int(data["nkx"]), int(data["nky"]), int(data["nkz"])),
         (int(data["n_cond_pad"]), int(data["n_val_pad"])),
         mesh_key(mesh_xy),

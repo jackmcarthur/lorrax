@@ -138,13 +138,22 @@ A = D + w_x V - W,\qquad B = w_x V^B - W^B,$$
 
 with $D_{cvk} = \varepsilon_{ck} - \varepsilon_{vk}$, $V$ the bare exchange at
 q = 0 and $W$ the static screened direct term at momentum transfer $k - k'$.
-$w_x = 2$ for a spin-restricted scalar run (singlet) and $w_x = 1$ for spinors,
+$w_x = 2$ for a spin-restricted scalar singlet, $0$ for a scalar triplet,
+and $1$ for spinors,
 whose pair amplitude already sums both components
 (`bse_preconditioner.exchange_spin_weight`, applied at every exchange encode).
 The Tamm–Dancoff approximation keeps $A$; the RPA kernel drops $W$ and $W^B$.
-`bse_jax` applies the RPA kernel, D + V, unless `spin_singlet = true` is given; `full_bse = false`
-selects the Tamm–Dancoff problem, and without it every route solves the full
-one.
+The screened kernel and the Tamm–Dancoff problem are the defaults.
+`spin_triplet = true` selects the scalar triplet; `local_fields = true`
+drops the screened direct term. `full_bse = true` selects the full resonant
+and antiresonant problem.
+
+The loader records the optical choice in `data['exchange_channel']` through
+the existing deck owner. Stack/pair factories take it explicitly, and the
+exact-diagonal JIT, diagonal memo and planned Davidson solver include it in
+their structural identities. There is no process-global channel: interleaved
+singlet and triplet solves use the same operands without borrowing a cached
+operator or diagonal from the other channel.
 
 With $\psi_{nk,s}(\mu) \equiv \psi_{nk,s}(r_\mu)$:
 
@@ -523,8 +532,14 @@ K^{\rm H}=\frac{g}{N_k}FV_qF^\dagger,
 C=\frac{g}{\sqrt{N_k}}V_qF^\dagger.
 $$
 
-$g$ is the shared exchange spin weight (2 for a scalar singlet, 1 for
-spinors). All four Hartree blocks use these same vertices. For any two
+$g$ is the shared exchange spin weight (2 for closed-shell scalar charge,
+1 for spinors). Density screening explicitly selects this charge operator
+for its matvec, preconditioner, readout and head, independently of an optical
+payload's channel. It does not add triplet response to the charge-screened
+interaction. The head cache records the resolved charge spin weight, and
+the bank identity records the charge convention and numerical weight;
+artifacts from the former implicit global choice must be rebuilt.
+All four Hartree blocks use these same vertices. For any two
 physical pairs the positive direct matrix element is
 
 $$

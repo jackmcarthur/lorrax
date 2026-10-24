@@ -15,7 +15,7 @@ Code is cited as `file:line`; every measurement names its deck, $P$ and claim.
 | lowering | tracing a function to a jaxpr, then lowering the jaxpr to a StableHLO module |
 | request | one call of JAX's `compile_or_get_cached` on one rank: a persistent-cache read, or a compile |
 | real compile | one XLA backend compile (`backend_compile_and_load`) |
-| cubin cache | the per-user, writable image directory, `ffi.fft.cubin_cache_dir()` (`src/ffi/fft.py:424`): `$SCRATCH/.cache/lorrax/kconv_mathdx`, or `~/.cache/lorrax/kconv_mathdx` where the site defines no `SCRATCH` |
+| cubin cache | the per-user, writable image directory, `ffi.fft.cubin_cache_dir()` (`src/ffi/fft.py:424`): `kconv_mathdx/images` in the per-user cache tree (`lxkit.user_cache_root`: `$SCRATCH/.cache/lorrax`, else `~/.cache/lorrax`), one directory for every build and install |
 | store | a release's read-only image directory, `ffi.fft.CUBIN_STORE`: `cubin_store/` at the source root. A checkout has none unless one is built into it |
 | fully cold, release cold, warm | no store and both caches empty; the release's store present and the JAX cache empty (a release's first run); both caches hold every key the run needs |
 | hsuite | `tests/hsuite`, its 16 default stages at P4 on one A100-80 node, with the run directory, `TMPDIR`, `SCRATCH` and both caches node-local |
@@ -42,7 +42,7 @@ kernels, and the Fourier plan's fused pair. The same source is the ROCM leg's
 service with the vendor spelled by the leg (`common/leg.h`): hipRTC, resolved
 beside the HIP runtime the process mapped, for the device's full target id
 (`--offload-arch=gfx90a:sramecc+:xnack-`), keyed `hiprtc<maj>.<min>@<libhiprtc
-real path>`, and stored as `kdft_m<mode>_…_gfx90a_<key>.hsaco` in the same cache
+file name, size>`, and stored as `kdft_m<mode>_…_gfx90a_<key>.hsaco` in the same cache
 directory ([FFI layer](ffi_layout.md), the kdft family). The rest of this
 paragraph is the CUDA leg's. It compiles for the device's own
 `sm_<cc>`, keeps each image in process, stores it in the cubin cache and
@@ -52,7 +52,7 @@ and serves every world size.
 | part of the key | what it is |
 |---|---|
 | program | FNV-1a over the embedded source, the text of each embedded header and the NVRTC options that decide the image (`rtc_build.cc`, `key`). Editing a source or header, comments included, invalidates its images |
-| toolchain | `nvrtc::mathdx_toolchain`: the cuFFTDx or cuBLASDx, commonDx, CUTLASS and CCCL version headers, the wheel's dist-info name, and the NVRTC version with the loaded `libnvrtc`'s real path. A version header that reads empty disables the disk cache for that build rather than leaving the key |
+| toolchain | `nvrtc::mathdx_toolchain`: the cuFFTDx or cuBLASDx, commonDx, CUTLASS and CCCL version headers, the wheel's dist-info name, and the NVRTC version with the loaded `libnvrtc`'s file name, size and wheel dist-info (never its directory, so an image or store built from one install is a hit from any other). A version header that reads empty disables the disk cache for that build rather than leaving the key |
 | kernel constants | the k-convolution modes and BSE outer kernels: [k-convolution §14](kconv.md#build-and-cache); the Fourier pair: its two GEMM extents and supports (`fourier_plan_cuda_ffi.cc:249`) |
 | not keyed | file names, include paths, the host code, $N_\mu$, $P$ |
 
@@ -155,6 +155,7 @@ GPU-only; a CPU run gets none.
 | flag | leg | effect | claim |
 |---|---|---|---|
 | `--xla_gpu_autotune_level=0` | CUDA | cold compile −12.9 % (Na) and −16.3 % (Si) at P4, execution within noise | 683 |
+| `--xla_gpu_enable_triton_gemm=false` | CUDA | jaxlib 0.12 at autotune 0 lowers a real f64 dot to an untuned Triton GEMM fusion: 8192² dgemm 3.74 TF/s on A100-80GB; with the flag, cuBLASLt at 19.3 TF/s, the same as autotune 4 and as jaxlib 0.9.1 at autotune 0. c128 dots (8192², batched 64×1024², 4096×16384×4096) were cuBLASLt either way, 19.0–21.9 TF/s. perf_check's 36 programs cold: 5.55–5.67 s without, 4.91–4.97 s with, 7.19–7.29 s at autotune 4 | robust-install lane 2026-10-24 (job 60201906, `$SCRATCH/robust_install/N/runs/r1,r2`) |
 | `--xla_gpu_enable_llvm_module_compilation_parallelism=true` | CUDA, no longer set | measured on JAX 0.9.1: XLA split each module's LLVM IR into parts compiled in parallel; hsuite release-cold XLA compile 219.5 → 195.2 s. XLA removed the flag before jaxlib 0.12 (openxla/xla 194f1fe5d9) and aborts on it, so the leg no longer declares it; the 0.12 cold compile is unmeasured | 4179 |
 | `--xla_gpu_autotune_level=0` | ROCM | MI250X P4 seeded cold: XLA compile gnppm 21.8 → 18.3 s, exciton_bands 15.1 → 13.3 s against level 4; warm walls within noise; d/zgemm n = 1024–8192 steady state identical (zgemm 8192: 39.6 TF/s at both) | runtime lane 2026-10-14 (pool logs runtime_a2_flags, runtime_a3) |
 | `--xla_gpu_disable_async_collectives=ALLCOLLECTIVES` | ROCM | every collective runs on the compute stream, in program order. With async collectives an all-reduce on the collective stream and a collective of another communicator on the compute stream are in flight together, and RCCL deadlocks across ranks (all GCDs at 100 %, every rank waiting on the same executable): `qsgw_head._drude_tensor_kernel` (psum over x,y beside psum over y) hung bisp_sc 3/3, the Coulomb-root program hung sp_export 1/1; a 25-line repro of that kernel hangs at iteration 1 and runs 300/300 with the flag. bisp_sc PASS 189.2 s with it (A100 173.7 s) | disteigh lane 2026-10-15 (pool logs disteigh_bisp1-3, disteigh_repro_async/sync) |

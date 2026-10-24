@@ -675,6 +675,65 @@ def test_allocator_check_runs_inside_set_default_env():
             raise AssertionError("set_default_env accepted a bad allocator")
 
 
+def _jaxlib_allocator_spellings(source):
+    """Read the guarded literal in the supported 0.9.1/0.12 source forms.
+
+    Startup owns version admission. This check authenticates that release's
+    actual grammar and values, without importing JAX or executing its source.
+    """
+    functions = [n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef)
+                 and n.name == "generate_pjrt_gpu_plugin_options"]
+    assert len(functions) == 1, "missing or ambiguous allocator-options function"
+    fn = functions[0]
+    guards = [n for n in ast.walk(fn) if isinstance(n, ast.Compare)
+              and isinstance(n.left, ast.Name) and n.left.id == "allocator"
+              and len(n.ops) == 1 and isinstance(n.ops[0], ast.NotIn)]
+    assert len(guards) == 1, "missing or ambiguous allocator guard"
+    value = guards[0].comparators[0]
+    legacy = isinstance(value, ast.Tuple)
+    if not legacy:
+        assert isinstance(value, ast.Name) and value.id == "allowed_allocators"
+        assigned = [n for n in fn.body if isinstance(n, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == value.id for t in n.targets)]
+        assert len(assigned) == 1 and assigned[0].lineno < guards[0].lineno
+        value = assigned[0].value
+    found = ast.literal_eval(value)
+    expected = (("default", "platform", "bfc", "cuda_async") if legacy
+                else _runtime.ALLOCATOR_SPELLINGS)
+    assert found == expected, (found, expected)
+    # 0.9.1 is admitted only on ROCm; 0.12 must cover every leg's policy.
+    from lxkit import LEGS
+    legs = (LEGS["ROCM"],) if legacy else LEGS.values()
+    for leg in legs:
+        assert set(leg.xla_allocators) <= set(found), (leg.key, leg.xla_allocators, found)
+    return found
+
+
+def test_allocator_source_reader_accepts_both_formats_and_refuses_drift():
+    legacy = textwrap.dedent("""
+        def generate_pjrt_gpu_plugin_options():
+            if allocator not in ('default', 'platform', 'bfc', 'cuda_async'):
+                raise ValueError('bad allocator')
+    """)
+    current = textwrap.dedent("""
+        def generate_pjrt_gpu_plugin_options():
+            allowed_allocators = ('default', 'platform', 'bfc', 'cuda_async', 'vmm', 'address')
+            if allocator not in allowed_allocators:
+                raise ValueError('bad allocator')
+    """)
+    assert _jaxlib_allocator_spellings(legacy) == _runtime.ALLOCATOR_SPELLINGS[:4]
+    assert _jaxlib_allocator_spellings(current) == _runtime.ALLOCATOR_SPELLINGS
+    for bad in (legacy.replace("'bfc'", "'bfc_typo'"), current.replace("'address'", "'address_typo'"),
+                current.replace("'vmm', 'address'", "'vmm'"),
+                legacy + legacy, current.replace("allowed_allocators:\n", "unknown_allocators:\n")):
+        try:
+            _jaxlib_allocator_spellings(bad)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("allocator source drift was accepted")
+
+
 def test_allocator_spellings_match_the_installed_jaxlib_if_present():
     """Read jaxlib's own tuple when a copy is on disk, rather than trusting
     this module's transcription of it.  Skipped, loudly, when absent —
@@ -696,11 +755,7 @@ def test_allocator_spellings_match_the_installed_jaxlib_if_present():
         return
     with open(hits[0], encoding="utf-8") as fh:
         text = fh.read()
-    marker = "allowed_allocators = ("
-    assert marker in text, hits[0]
-    frag = text.split(marker, 1)[1].split(")", 1)[0]
-    found = tuple(p.strip().strip("'\"") for p in frag.split(",") if p.strip())
-    assert found == _runtime.ALLOCATOR_SPELLINGS, (found, hits[0])
+    _jaxlib_allocator_spellings(text)
 
 
 # ===========================================================================

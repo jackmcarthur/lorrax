@@ -318,7 +318,7 @@ verified mapped for it, computed once at enforcement. It keys every
 persistent cache that depends on native libraries, so a different library set
 never reuses an entry:
 
-- the JAX compile-cache namespace (`…_ffi-<12 hex>_k2`); an explicit
+- the JAX compile-cache namespace (`…_ffi-<12 hex>_k3`, keyed on library content, so a candidate and its published bundle share it); an explicit
   `ISDF_JAX_CACHE_DIR` is split by the same tag;
 - the k-convolution NVRTC/hipRTC image store and the rocFFT kernel store;
 - the sealed `bundle_id` and the build's `PROVENANCE`.

@@ -288,7 +288,7 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                       nc_pad: int, nv_pad: int, n_cond: int, n_val: int,
                       *, n_eig: int,
                       block_size: int, max_iter: int, n_reorth: int | None = None,
-                      head_tensor: bool = False):
+                      head_tensor: bool = False, exchange_channel: str = "singlet"):
     """One jitted ``solve_path`` for a whole Q list.
 
         solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
@@ -329,7 +329,7 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
         # O(M·n·bs²) — negligible next to the matvec at every BSE size.
         n_reorth = max_iter
     matvec = build_bse_stack_matvec(mesh_xy, nkx, nky, nkz, kernel="bse",
-                                    head_tensor=head_tensor)
+                                    head_tensor=head_tensor, exchange_channel=exchange_channel)
     from distrib_la import plan_subspace
     # The Krylov space lives on the physical transitions: the start block
     # has no support on the mesh pad, which the operator keeps at exactly
@@ -400,7 +400,7 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
 def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                                nc_pad: int, nv_pad: int, n_cond: int, n_val: int,
                                *, n_eig: int, max_iter: int, tol_mev: float, W_q0,
-                               cert_rows=(), cert_tol_mev=None):
+                               cert_rows=(), cert_tol_mev=None, exchange_channel="singlet"):
     """The ``solver = davidson`` (default) counterpart of :func:`build_path_solver`:
     the same call signature and outputs, the per-Q lowest ``n_eig`` from
     ``bse_lanczos.solve_bse_sharded``'s Davidson (exact diagonal
@@ -427,7 +427,7 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
 
     pair = jax.jit(compute_pair_amplitude, out_shardings=sh.M)
     static = dict(nkx=nkx, nky=nky, nkz=nkz, n_cond=n_cond, n_val=n_val,
-                  n_cond_pad=nc_pad, n_val_pad=nv_pad)
+                  n_cond_pad=nc_pad, n_val_pad=nv_pad, exchange_channel=exchange_channel)
 
     def solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
                    psi_v_X, psi_v_Y, eps_v, W_R, D_head=None, M_Q=None):
@@ -499,7 +499,8 @@ def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, he
         return build_path_solver(
             mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, n_eig=args.n_eig,
             block_size=args.block_size,
-            max_iter=40 if args.max_iter is None else args.max_iter, head_tensor=head_mbz)
+            max_iter=40 if args.max_iter is None else args.max_iter, head_tensor=head_mbz,
+            exchange_channel=getattr(args, "exchange_channel", "singlet"))
     n_phys = int(n_cond) * int(n_val) * nkx * nky * nkz
     if cert_rows:
         log.info(f"  [refit-cert] Davidson residual for both comparison rows: "
@@ -510,6 +511,7 @@ def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, he
         max_iter=(max(30, min(200, n_phys // 2)) if args.max_iter is None
                   else args.max_iter),
         tol_mev=args.davidson_tol_mev, W_q0=W_q0, cert_rows=cert_rows,
+        exchange_channel=getattr(args, "exchange_channel", "singlet"),
         cert_tol_mev=0.1 * CERT_TOL_BY_GRADE[args.cert_grade] if cert_rows else None)
 
 
@@ -1452,8 +1454,7 @@ def deck_settings(ap, args):
         if not kernel["include_w"]:
             raise DeckError("bse.exciton_bands solves the screened TDA BSE (D_Q + w V_Q - W): "
                             "drop local_fields")
-        from .bse_preconditioner import set_exchange_channel
-        set_exchange_channel(kernel["channel"])
+        settings.exchange_channel = kernel["channel"]
         if "kgrid_fine_shift" in named and any(
                 float(x) for x in str(params["kgrid_fine_shift"]).replace(",", " ").split()):
             raise DeckError("bse.exciton_bands does not take a shifted fine grid yet: its "

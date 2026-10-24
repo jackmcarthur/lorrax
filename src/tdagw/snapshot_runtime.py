@@ -252,7 +252,7 @@ def bare_hf_coherent_model(model, prepared, rho_eq, baseline, *, bare_head_ha=0.
         if int(prepared["psi"].shape[2]) > 2:
             raise ValueError("GATE td_snapshot_bare_hf_model: transverse four-current HF increment not implemented")
         from bse.bse_preconditioner import exchange_spin_weight
-        if prepared["spin_weight"] != exchange_spin_weight(int(static[2])):
+        if prepared["spin_weight"] != exchange_spin_weight(int(static[2]), "singlet"):
             raise ValueError("GATE td_snapshot_bare_hf_model: TD Hartree spin multiplicity differs from GW source")
         operands, reference = model.params
         extent = int(operands[3].shape[0])

@@ -237,9 +237,10 @@ def resolve_precond_route(route: str, bse_dim: int) -> str:
 # ``include_W=False``, where the direct term is absent rather than zero-valued.
 # Passing ``None`` drops the term at TRACE time, so those routes compile a program
 # with no W contraction in it at all instead of multiplying by a zero tile.
-@partial(jax.jit, static_argnames=("nk", "sharding", "complex_out"))
+@partial(jax.jit, static_argnames=("nk", "sharding", "complex_out", "exchange_channel"))
 def _exact_diagonal_kernel(eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M,
-                           V_q0, *, nk, sharding, complex_out: bool = False):
+                           V_q0, *, nk, sharding, complex_out: bool = False,
+                           exchange_channel: str = "singlet"):
     dE = eps_c.T[:, None, :] - eps_v.T[None, :, :]          # (c, v, k)
 
     if W_q0 is None:
@@ -255,7 +256,7 @@ def _exact_diagonal_kernel(eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M,
     S = jnp.einsum('kcvM,MN->kcvN', M, V_q0)
     # The matvec's scalar-singlet exchange weight (bse_preconditioner owns it).
     V_x_c = jnp.einsum('kcvN,kcvN->cvk', S, jnp.conj(M)) * exchange_spin_weight(
-        psi_c_X.shape[2])
+        psi_c_X.shape[2], exchange_channel)
 
     if complex_out:
         num = V_x_c if W_d_c is None else (V_x_c - W_d_c)
@@ -349,6 +350,7 @@ def exact_diagonal_memo_stats():
 def build_bse_exact_diagonal(
     eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M, V_q0, nk: int,
     *, sharding=None, memo: bool = True, complex_out: bool = False,
+    exchange_channel: str = "singlet",
 ):
     """``diag(H_BSE)[c, v, k]`` — assembled exactly, once per solve.
 
@@ -439,13 +441,14 @@ def build_bse_exact_diagonal(
     # ``complex_out`` is part of the memo key, not just the program key: the two
     # routes return DIFFERENT objects for the same operands, and a memo that
     # ignored the flag would hand FEAST Davidson's real diagonal.
-    meta = (int(nk), sharding, bool(complex_out))
+    meta = (int(nk), sharding, bool(complex_out), exchange_channel)
     if memo:
         hit = _DIAG_MEMO.get(meta, operands)
         if hit is not None:
             return hit
     out = _exact_diagonal_kernel(*operands, nk=int(nk), sharding=sharding,
-                                 complex_out=bool(complex_out))
+                                 complex_out=bool(complex_out),
+                                 exchange_channel=exchange_channel)
     if memo:
         _DIAG_MEMO.put(meta, operands, out)
     return out

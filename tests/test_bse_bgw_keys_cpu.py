@@ -46,8 +46,7 @@ def spin(monkeypatch, tmp_path):
     def run(nspinor, **keys):
         monkeypatch.setattr(bse_deck, "wfn_spin", lambda path: (nspinor, 1))
         return bse_deck.spin_kernel(keys, set(keys), str(wfn))
-    yield run
-    bse_preconditioner.set_exchange_channel("singlet")
+    return run
 
 
 def test_spin_model(spin):
@@ -55,12 +54,10 @@ def test_spin_model(spin):
     assert (k["include_w"], k["channel"], k["nspinor"]) == (True, "singlet", 2)
     assert bse_preconditioner.exchange_spin_weight(2) == 1.0
     assert spin(1)["channel"] == "singlet"
-    bse_preconditioner.set_exchange_channel("singlet")
     assert bse_preconditioner.exchange_spin_weight(1) == 2.0
     assert spin(1, spin_triplet="true")["channel"] == "triplet"
-    bse_preconditioner.set_exchange_channel("triplet")
-    assert bse_preconditioner.exchange_spin_weight(1) == 0.0
-    assert bse_preconditioner.exchange_spin_weight(2) == 1.0
+    assert bse_preconditioner.exchange_spin_weight(1, "triplet") == 0.0
+    assert bse_preconditioner.exchange_spin_weight(2, "triplet") == 1.0
     assert spin(1, local_fields="true")["include_w"] is False
     with pytest.raises(bse_deck.DeckError, match="non-spinor"):
         spin(2, spin_singlet="true")

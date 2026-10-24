@@ -1215,8 +1215,10 @@ _NS_PRUNE_STAMP = ".last_prune"
 #: changing (a LORRAX patch to how JAX keys or stores an entry).  ``k2``: the
 #: FFI component became the enforced native closure identity (every library the
 #: legs map, not the leg file alone); every ``k1`` namespace is retired by the
-#: age pruner.
-_KEY_SCHEMA = "k2"
+#: age pruner.  ``k3``: that identity is location-free (content hashes, not
+#: install paths), so a module candidate and its published copy of one bundle
+#: share a namespace and acceptance warms the published module's cache.
+_KEY_SCHEMA = "k3"
 
 
 def default_cache_root() -> Path:
@@ -1230,13 +1232,14 @@ def default_cache_root() -> Path:
 
 
 def _ffi_identity() -> str:
-    """``ffi-<12 hex>``: the native closure identity of the FFI legs this process
-    opened (:func:`lxkit.native_provider.native_closure_identity`, computed when
-    their dependency closure was enforced), or would open first (the identity
-    each candidate's build record promises).  Every library a leg maps -- MPI,
-    HDF5, LibSci, the GPU math/collective libraries, the engine-private
-    providers -- is in it, so a different library set is a different namespace
-    and can never reuse an entry.  ``noffi`` where no leg exists."""
+    """``ffi-<12 hex>``: the location-free native closure identity of the FFI legs
+    this process opened, or would open first
+    (:func:`lxkit.native_provider.native_closure_content_identity_or_expected`).
+    Every library a leg maps -- MPI, HDF5, LibSci, the GPU math/collective
+    libraries, the engine-private providers -- is in it by content hash, so a
+    different library set is a different namespace and can never reuse an entry,
+    while the same sealed bundle installed at two paths (an acceptance candidate
+    and its published release) is one namespace.  ``noffi`` where no leg exists."""
     try:
         from ffi.common import ffi_loader
     except Exception:                                      # noqa: BLE001
@@ -1249,7 +1252,7 @@ def _ffi_identity() -> str:
                                    if ffi_loader.loaded_lib_path(platform) else [])]
         cands += [c for c in ffi_loader._candidate_paths(platform) if c.is_file()]
         try:
-            ids.append(f"{platform}:{_np.native_closure_identity_or_expected(platform, cands)}")
+            ids.append(f"{platform}:{_np.native_closure_content_identity_or_expected(platform, cands)}")
         except _np.ClosureNotEnforced:
             continue                                       # no such leg here
         except OSError as exc:                             # a leg that cannot load
