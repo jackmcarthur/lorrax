@@ -93,9 +93,31 @@ from .pjrt_log_filter import (begin_clean_shutdown_log_filter as
 
 
 # Canonical LORRAX boolean grammar for env knobs — ONE token set, case- and
-# whitespace-insensitive, owned by ``runtime.env_flags``.  Blank is UNSET, not
-# false (a blank export is what a shell leaves for an unset expansion), and an
-# unrecognised token is announced.  ``_env_falsy`` is one negation over it.
+# whitespace-insensitive, shared by every knob in this module.  Before the
+# consolidation (release audit 2026-07-28) LORRAX_MALLOC_TUNE,
+# LORRAX_FAILFAST and the (now removed) LORRAX_GLOO_IFNAME check each parsed a
+# different subset, so e.g. LORRAX_MALLOC_TUNE=OFF (or "False", "no", " 0 ")
+# silently left the tuning ENABLED — the falsy-parse bug class this
+# workstream had already fixed once for LORRAX_CHECK_REPLICA.
+#
+# BLANK IS NOT FALSE.  ``""`` used to be in this tuple, which made
+# ``export LORRAX_MALLOC_TUNE=`` DISABLE a default-on knob while every other
+# live vocabulary in the tree — ``ffi/gate.py`` ("unset or whitespace
+# always maps to the gate's declared default"),
+# ``file_io._slab_io_ffi._env_flag`` and ``gw.gw_config.env_bool``
+# (which ``isdf.core`` imports since P1.3) —
+# reads blank as UNSET and returns the knob's default.  A blank export is
+# what a shell leaves behind for an unset variable expansion
+# (``export X=$UNDEFINED``), so under the old rule a harness typo in the
+# variable *name* silently turned the knob off.
+# ONE PARSER (2026-08-22).  This used to be a second grammar with a third
+# behaviour: an UNRECOGNISED token resolved to "not falsy", i.e. it left a
+# default-on knob silently ON while `gw_config.env_bool` and
+# `_slab_io_ffi._env_flag` both resolved the same token to OFF, and none of
+# the three said anything.  `runtime.env_flags` now owns the table and the
+# announcement; this is one negation over it, kept because the call sites
+# here read naturally as "is this turned off" and inverting at each site is
+# how a reader loses which way the default points.
 from .env_flags import ENV_FALSE as _FALSY_TOKENS   # noqa: F401
 from .env_flags import env_falsy as _env_falsy      # noqa: F401
 
