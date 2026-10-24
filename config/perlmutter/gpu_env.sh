@@ -12,7 +12,8 @@
 # abort.  Neither FFI leg links GTL: the host leg is CUDA-free and the CUDA
 # leg's cuSOLVERMp/cuBLASMp communicate through NCCL.
 #
-# LD_LIBRARY_PATH  prepended with <cache tree>/cudart-hmem/<id> (<id>: the
+# LD_LIBRARY_PATH  unless the allocation is one node: prepended with the
+#                  node-local /tmp/lorrax-$USER/cudart-hmem/<id> (<id>: the
 #                  md5 of the target's path, so two venvs never share a link),
 #                  holding libcudart.so -> the CUDA runtime the run python's
 #                  JAX plugin resolves (nvidia/cu*/lib/libcudart.so.<major>).
@@ -59,10 +60,17 @@ hits = sorted(glob.glob(os.path.join(sysconfig.get_paths()["purelib"], "nvidia",
 print(os.path.realpath(hits[0]) if hits else "")
 PY
 )"
-if [ -n "$_lorrax_cudart" ]; then
-    _lorrax_shim="$_lorrax_cache/cudart-hmem/$(printf %s "$_lorrax_cudart" | md5sum | cut -c1-12)"
-    mkdir -p "$_lorrax_shim"
-    ln -sfn "$_lorrax_cudart" "$_lorrax_shim/libcudart.so"
+# Only a step that can span nodes needs it (an allocation of one node never
+# does), and it lives in node-local /tmp, created on each node by the rank
+# wrapper select_gpu.sh from LORRAX_CUDART_SHIM: every directory on
+# LD_LIBRARY_PATH is probed for every library every process and every exec'd
+# tool loads (libc, libm, ... and their glibc-hwcaps subdirectories), and a
+# directory on a shared file system made that cost 69 s of failed opens in one
+# GW stage on Perlmutter (5495 opens, ~900 ptxas execs; 2026-10-23).
+if [ -n "$_lorrax_cudart" ] && [ "${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-0}}" != 1 ]; then
+    _lorrax_shim="/tmp/lorrax-${USER:-$(id -un)}/cudart-hmem/$(printf %s "$_lorrax_cudart" | md5sum | cut -c1-12)"
+    export LORRAX_CUDART_SHIM="$_lorrax_shim/libcudart.so=$_lorrax_cudart"
+    mkdir -p "$_lorrax_shim" 2>/dev/null && ln -sfn "$_lorrax_cudart" "$_lorrax_shim/libcudart.so"
     case ":${LD_LIBRARY_PATH:-}:" in
         *":$_lorrax_shim:"*) ;;
         *) export LD_LIBRARY_PATH="$_lorrax_shim${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;

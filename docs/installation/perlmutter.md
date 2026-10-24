@@ -109,8 +109,11 @@ environment you run in. Setting `LD_LIBRARY_PATH` neither causes nor fixes it,
 with one exception: on a multi-node step libfabric dlopens `libcudart.so` by
 that name, through `LD_LIBRARY_PATH`. The wheel ships only `libcudart.so.13`,
 so `cudatoolkit/13.2`'s `libcudart.so` (13.2.75) would be mapped beside the
-recorded wheel runtime. `gpu_env.sh` links `libcudart.so` to the venv's
-runtime, first on `LD_LIBRARY_PATH`. A multi-node step whose `libcudart.so`
+recorded wheel runtime. Outside a one-node allocation `gpu_env.sh` links
+`libcudart.so` to the venv's runtime in node-local `/tmp` (made on each node by
+`select_gpu.sh`), first on `LD_LIBRARY_PATH`; a one-node allocation gets no
+`LD_LIBRARY_PATH` entry, because every directory there is probed for every
+library each process and tool loads. A multi-node step whose `libcudart.so`
 names another file refuses at start-up with a `GATE native-closure` line
 naming both files ([launch libraries](ffi-build.md#closure)). Source
 `gpu_env.sh` in the shell that runs `srun`.
