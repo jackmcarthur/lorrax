@@ -67,7 +67,8 @@ __all__ = [
     "NativeAbiMismatch", "check_closure_mapping", "check_record_files",
     "closure_record_digest", "closure_record_path", "expected_closure_identity",
     "library_family", "native_closure_identity",
-    "native_closure_identity_or_expected", "parse_closure",
+    "native_closure_identity_or_expected", "native_closure_content_identity_or_expected",
+    "parse_closure",
     "read_checkout_closure", "resolve_closure",
     "assert_one_mapped_mpi_runtime", "check_abi", "checkout_build_dir",
     "describe_library",
@@ -1033,6 +1034,51 @@ def _record_identity(record: ClosureRecord,
     mapped = [[f, str(verified[f][0]), verified[f][1]] for f in families]
     return hashlib.sha256(_canonical({"record": record.digest,
                                       "mapped": mapped})).hexdigest()
+
+
+def _record_content_identity(record: ClosureRecord,
+                             verified: Mapping[str, tuple[Path, str]] | None) -> str:
+    """:func:`_record_identity` without file locations: the record digest (whose
+    library paths are bundle-relative inside a bundle) and, per family, the
+    content hash of the file mapped (or recorded).  Two copies of one sealed
+    bundle at different install paths -- a module candidate and its published
+    release -- get the same value; different bytes never do.  This is the key a
+    persistent cache needs: a compiled program depends on what the libraries
+    are, not on where they live (a path a program does depend on, such as the
+    cubin directory a custom call names, is in its HLO and so in JAX's own key)."""
+    first: dict[str, str] = {}
+    for e in record.entries:
+        first.setdefault(e.family, e.sha256)
+    shas = {**first, **{f: v[1] for f, v in (verified or {}).items()}}
+    return hashlib.sha256(_canonical({
+        "record": record.digest,
+        "content": [[f, shas[f]] for f in sorted(first)]})).hexdigest()
+
+
+def _expected_record(leg: Path, platform: str) -> ClosureRecord:
+    manifest = _discover_manifest(leg)
+    if manifest is not None:
+        doc = json.loads(manifest.read_text(encoding="utf-8"))
+        body = (doc.get("closures") or {}).get(platform)
+        return parse_closure(body, origin=manifest, leg=leg, platform=platform,
+                             bundle_root=manifest.parent)
+    return read_checkout_closure(leg, platform)
+
+
+def native_closure_content_identity_or_expected(platform: str,
+                                                candidates: Sequence[Path] = ()) -> str:
+    """The location-free closure identity (:func:`_record_content_identity`) of the
+    enforced ``platform`` leg, else of its first existing candidate's record.
+    Raises :class:`ClosureNotEnforced` when neither exists."""
+    leg = _PLATFORM_LEG.get(platform)
+    if leg is not None and leg in _ENFORCED:
+        native_closure_identity(platform)        # the one late re-verification
+        enf = _ENFORCED[leg]
+        return _record_content_identity(enf.record, enf.verified)
+    for c in candidates:
+        if Path(c).is_file():
+            return _record_content_identity(_expected_record(Path(c).resolve(), platform), None)
+    raise ClosureNotEnforced(f"no {platform} leg is open and no candidate exists")
 
 
 def expected_closure_identity(leg: str | Path, platform: str) -> str:

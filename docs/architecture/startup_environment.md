@@ -65,7 +65,7 @@ is removed and the target is untouched. Use it for every new cache file.
 | hipRTC / NVRTC kernel images (`common/rtc_build.cc`: kdft, active_gemm, active_subspace, kconv) | FNV over source, headers, defines, version files, RTC version and path; the kconv store is one directory per native closure identity (`kconv_mathdx/ffi-<12 hex>`) | magic + key + payload hash; a refused image is deleted and rebuilt | unique tmp + rename |
 | `wfn_trs` stamps (`symmetry_maps.density_symmetry_check`, in `lxkit.user_cache_dir("wfn_trs")`) | WFN identity, a module-source digest, algorithm version, nocc, tolerance; schema `wfn-trs-stamp-v2` | SHA-256 of the report, then a type and range check | `atomic_write_bytes` |
 | rocFFT kernel snapshot | rocFFT's, in one store per native closure identity (`rocfft/ffi-<12 hex>`) | rocFFT's | copy + merge + fsync + `os.replace` |
-| JAX compile cache | namespace keyed by the jax version and the native closure identity (`…_ffi-<12 hex>_k2`); an explicit `ISDF_JAX_CACHE_DIR` is split by the same tag | JAX's | prune by atomic rename into `.trash` |
+| JAX compile cache | namespace keyed by the jax version and the location-free native closure identity (content hashes, not install paths: `…_ffi-<12 hex>_k3`); an explicit `ISDF_JAX_CACHE_DIR` is split by the same tag | JAX's | prune by atomic rename into `.trash` |
 
 A `wfn_trs` stamp holds only the time-reversal verdict, but a hit skips the
 measurement and hands `trs_holds` to `WfnLoader`. A stale verdict would
