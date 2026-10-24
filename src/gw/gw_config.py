@@ -1350,6 +1350,9 @@ _DEFAULTS = {
     # New input files should set ``compute_mode`` explicitly:
     #   "x_only" | "cohsex" | "gn_ppm" | "hl_ppm" | "mpa".
     #
+    # ``auto`` is ``gn_ppm`` (``x_only`` under do_screened = false); on a
+    # metal it refuses (metals need full-frequency GW, compute_mode =
+    # tangential).
     # ``mpa`` — the multipole-W ansatz, the owner's "FF" — runs end to end;
     # ``auto`` never infers it, and no legacy flag combination reaches it.
     # See the ``ComputeMode`` docstring for why it is spelled ``mpa`` rather
@@ -5189,7 +5192,9 @@ class LorraxConfig:
                     if str(self.ppm.model).strip().lower() == "hl"
                     else ComputeMode.GN_PPM
                 )
-            return ComputeMode.COHSEX if self.do_screened else ComputeMode.X_ONLY
+            # auto is GN-PPM (owner, 2026-10-20); a metal refuses it
+            # (validate_material_inputs: metals need full-frequency GW).
+            return ComputeMode.GN_PPM if self.do_screened else ComputeMode.X_ONLY
         try:
             explicit = ComputeMode(raw)
         except ValueError as exc:
