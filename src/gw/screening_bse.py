@@ -23,15 +23,16 @@ active Sigma ansatz already asks for -- the SAME
 Nothing about the role set, the Sigma dispatch or any Sigma kernel
 changes; only which W satisfies the request does.
 
-THE STAGE IS TWO-STAGE BY CONSTRUCTION, NOT BY ACCIDENT.  The ladder
-kernel's ``W_R`` IS the RPA ``W(0)``.  So this module
+THE STAGE IS TWO-STAGE BY CONSTRUCTION, NOT BY ACCIDENT. The ladder uses
+the RPA ``W(0)``: ``W_R`` carries its dense body and the shared exact optical
+diagonal carries its static screened transfer-Gamma head. So this module
 
   1. runs the ordinary RPA static leg (``compute_static_w(role="static")``),
   2. persists it into the ISDF restart file (``persist_w0_and_head``) and
      VERIFIES the file is loadable before anything reads it,
   3. hands that restart path to the BSE ladder facade
-     (``bse.w_ladder.compute_wc_qwedge``), which returns head-less
-     ``W(z) - v`` bodies on the q wedge,
+     (``bse.w_ladder.compute_wc_qwedge``), which returns ``W(z) - v`` bodies
+     on the q wedge with the external macroscopic channel omitted,
   4. adds ``v`` back and holds the result as the SAME wedge
      ``symmetry_maps.QirrOperator`` the RPA path returns (the
      ``gw.v_q_g_flat.q_wedge`` tables, q/-q rows paired through the shared
@@ -48,9 +49,11 @@ LADDER W, and stamping that into ``W0_qmunu`` would put a different
 operator under a dataset every downstream consumer reads as the RPA
 static W.
 
-THE q=0 HEAD RIDES THE SAME RESOLVENT.  The singular macroscopic slot is not
-inside ``W_q``: the body facade therefore solves three dipole right-hand
-sides on the identical full-window, full-2N operator and returns ``Xi_ab``.
+THE EXTERNAL q=0 HEAD RIDES THE SAME RESOLVENT. The singular macroscopic slot
+is absent from the returned body; the operator still retains the internal
+static screened transfer-Gamma head. The body facade solves three dipole
+right-hand sides on the identical full-window, full-2N operator and returns
+``Xi_ab``.
 That tensor is already micro-reducible because the finite-G Hartree/ring term
 is in the operator.  ``head_correction=full`` restores only the omitted
 macroscopic bare-v channel through the mini-BZ reduction; applying the RPA

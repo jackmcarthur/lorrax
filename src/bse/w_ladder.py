@@ -156,12 +156,14 @@ class WLadderWedge:
         extent, sharded ``NamedSharding(mesh_xy, P(None, None, 'x', 'y'))`` —
         the same class as the existing full-BZ ``W_q``, so no rank ever holds a
         whole mu^2 tile.  ``wc[iz, iq, mu, nu]`` is ``W_q(z) - v_q`` for
-        ``z = z_list_ry[iz]``, ``q = q_irr_kgrid_int[iq]``.  Head-LESS bodies
-        (the resolvent carries no q=0 head by construction; the loader runs
-        ``inject_head=False``), in the GW ``chi_0(q)`` vertex convention.  The
-        pad rows/columns are ZERO: the probe block is the identity in the padded
-        basis and the loader's psi pad is zero, so a pad column solves to zero
-        rather than to noise.
+        ``z = z_list_ry[iz]``, ``q = q_irr_kgrid_int[iq]``. The external
+        macroscopic Hartree head is omitted; with ``include_w=True`` the
+        operator retains the internal static screened transfer-Gamma head
+        through the shared exact optical diagonal. The loader selects these
+        channels independently. The bodies use the GW ``chi_0(q)`` vertex
+        convention. Pad rows/columns are ZERO: the probe block is the identity
+        in the padded basis and the loader's psi pad is zero, so a pad column
+        solves to zero rather than to noise.
 
         PADDED, NOT PAD-STRIPPED — a deviation from DESIGN_2026-08-15 section 4,
         stated loudly because that document says "pad stripped".  The two halves

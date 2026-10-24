@@ -77,7 +77,9 @@ shared_real_pole_v1_r3b = {
 _GATE_ROWS = {
     "normalized_gram_keep": ("retain gamma/gamma_max strictly above cut", 1.0e-8),
     "normalized_gram_validity": ("gamma_min/gamma_max >= threshold; every route (the even parent Gram takes the larger of this and gram_rounding_validity)", -1.0e-7),
-    # The exact Gram is PSD, so a negative computed eigenvalue is rounding.
+    # Under the stable positive-spectral-measure premise, the exact Gram is PSD.
+    # Negative computed eigenvalues can reflect rounding, response-solve error
+    # or an unstable input model; this bound covers rounding only.
     # Weyl: gamma_min >= -||E||_2 >= -gamma_n ||D^-1/2 Sigma D^-1/2||_F with
     # Sigma the uncancelled magnitude of each divided-difference entry
     # (tangential_reduction.gram_rounding_floor), plus R u gamma_max for the solver.
