@@ -876,10 +876,10 @@ def apply_q_per_segment(params, q_per_segment, log=log.debug) -> int:
             f"exciton_bands: --q-per-segment={floor} is not a point count.  "
             f"1 is the identity (every deck count is already >= 1) and 16 is "
             f"the default.")
-    # segs[0] is the path's first corner; segs[i>0] carries the count for the
-    # segment that ENDS at it (generate_kpath_from_qe_segments).
-    deck_counts = [max(1, int(s.get("n", 1))) for s in segs[1:]]
-    for seg, n_deck in zip(segs[1:], deck_counts):
+    # QE's crystal_b: segs[i] carries the count of the segment that STARTS
+    # at it; the last corner's count is unused (generate_kpath_from_qe_segments).
+    deck_counts = [max(1, int(s.get("n", 1))) for s in segs[:-1]]
+    for seg, n_deck in zip(segs[:-1], deck_counts):
         seg["n"] = max(n_deck, floor)
     raised = [(i, a, max(a, floor))
               for i, a in enumerate(deck_counts, start=1) if a < floor]

@@ -1350,6 +1350,77 @@ def load_wfns_and_enk_for_sigma(wfn, sym, nval: int, ncond: int, nband: int):
     return nsigmarange, jnp.asarray(enk_sigma).transpose(1, 0)
 
 
+def qp_window_energies(eqp_path: str, sym, band_window: tuple[int, int],
+                       enk_dft, nelec: int, log_fn) -> jax.Array:
+    """QP energies on the htransform window, scissored above the eqp file.
+
+    Inside the bands the eqp file covers, the energies are its QP energies
+    (:func:`file_io.restart_bundle.read_eqp_energies`).  When the window
+    reaches above the file's top band ``b_qp``, the bands ``[b_qp, end)``
+    keep their DFT energies plus one rigid conduction scissor,
+
+        E_n(k) = E_DFT,n(k) + Δ_c,   Δ_c = <E_QP − E_DFT> over the file's
+                                           conduction bands [nelec, b_qp),
+
+    the k-weighted mean of :func:`gw.scissor.fit_scissor` with
+    ``conduction_rigid_mean`` (the law the SC loop applies to its sum-band
+    tail).  Without it the window would mix QP levels below ``b_qp`` with
+    unshifted DFT levels above it.
+
+    Parameters
+    ----------
+    eqp_path : str
+        BerkeleyGW-format eqp file (eV).
+    sym : SymMaps
+        The deck WFN's symmetry tables (full-BZ placement of the file).
+    band_window : (int, int)
+        Absolute half-open band window of the htransform fit.
+    enk_dft : array, (nb, nk_full), Ry
+        DFT energies of ``band_window`` on the full BZ.
+    nelec : int
+        Number of occupied bands; the scissor is fitted on the corrected
+        bands at and above it.
+
+    Returns
+    -------
+    jax.Array, (nb, nk_full), Ry
+    """
+    from file_io.restart_bundle import read_bgw_eqp
+    from gw.scissor import fit_scissor
+
+    start, end = int(band_window[0]), int(band_window[1])
+    _kpts, _e_dft, e_qp, band_offset = read_bgw_eqp(eqp_path)
+    qp_stop = int(band_offset) + int(e_qp.shape[1])
+    if end <= qp_stop:
+        return read_eqp_energies(eqp_path, sym, band_window)
+    name = os.path.basename(eqp_path)
+    if qp_stop <= max(start, int(nelec)):
+        raise ValueError(
+            f"{name} ends at band {qp_stop}, below the first conduction band "
+            f"{int(nelec)}; a scissor for the window [{start}, {end}) needs "
+            "QP-corrected conduction bands.")
+    corrected = np.asarray(read_eqp_energies(eqp_path, sym, (start, qp_stop)))
+    dft = np.asarray(enk_dft, dtype=np.float64)
+    n_corr = qp_stop - start
+    first_c = max(int(nelec) - start, 0)
+    nk = dft.shape[1]
+    fit_mask = np.zeros((nk, n_corr), dtype=bool)
+    fit_mask[:, first_c:] = True
+    fit = fit_scissor(
+        dft[:n_corr].T * RYD_TO_EV, corrected.T * RYD_TO_EV,
+        np.zeros((nk, n_corr), dtype=bool), fit_mask,
+        k_weights=np.ones(nk), conduction_rigid_mean=True)
+    out = dft.copy()
+    out[:n_corr] = corrected
+    out[n_corr:] = dft[n_corr:] + fit.beta_c_ev / RYD_TO_EV
+    log_fn(
+        f"  [QP scissor] bands [{qp_stop}, {end}) lie above {name}: DFT "
+        f"{fit.beta_c_ev:+.4f} eV, the mean QP-DFT shift of its conduction "
+        f"bands [{start + first_c}, {qp_stop}) (rms {fit.rmse_c_ev:.4f} eV "
+        f"over {fit.n_fit_c} states)")
+    return jnp.asarray(out)
+
+
 @partial(jax.jit, static_argnames=("band_offset",))
 def _apply_qp_block_to_compact_state(
         ctilde, enk_sigma, U_mnk, E_qp_nk, *, band_offset: int):
@@ -1523,7 +1594,9 @@ def generate_kpath_from_qe_segments(params: dict, wfn) -> tuple[jnp.ndarray, np.
     for i in range(len(nodes_crys) - 1):
         k0 = nodes_crys[i]
         k1 = nodes_crys[i + 1]
-        n = max(1, int(segments[i + 1].get("n", 1)))
+        # QE's crystal_b: a corner's count is the number of steps to the
+        # NEXT corner; the last corner's count is unused.
+        n = max(1, int(segments[i].get("n", 1)))
         for t in range(1, n + 1):
             alpha = t / float(n)
             pts_crys.append((1.0 - alpha) * k0 + alpha * k1)
@@ -1709,7 +1782,8 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
         if not os.path.isfile(eqp_path):
             raise SystemExit(f"FATAL: --eqp-file was given but not found: {eqp_path}")
         try:
-            enk_sigma = read_eqp_energies(eqp_path, sym, nsigmarange)
+            enk_sigma = qp_window_energies(
+                eqp_path, sym, nsigmarange, enk_sigma, int(wfn.nelec), log_fn)
             log_fn(
                 f"Using DIAGONAL QP APPROXIMATION from "
                 f"{os.path.basename(eqp_path)} for band window "
