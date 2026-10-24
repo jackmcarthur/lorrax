@@ -63,13 +63,12 @@ WHO CALLS WHAT
     response physics and applies no cell-volume factor.
 ``slab_minibz_photon_cubature(kernel, geometry, kgrid)``
     The production screened-head provider: one authenticated receipt binding
-    the true mini-lattice Wigner--Seitz polygon, fixed 16/24/32 Duffy--Gauss
-    ladder, cell volume, reciprocal lattice/k-grid identity, normalized
-    weights, and physical/padded solve counts.
+    the true mini-lattice Wigner--Seitz polygon, seven geometric radial
+    panels with an 16/24/32 Duffy--Gauss ladder, cell volume, reciprocal
+    lattice/k-grid identity, normalized weights, and physical/padded solve counts.
 ``slab_minibz_graded_photon_cubature(kernel, geometry, kgrid)``
-    The same receipt on seven geometric radial panels toward Γ (8/12/16
-    Gauss points per panel), for screened integrands with a near-Γ scale;
-    the direct four-current head (``gw.photon_direct_head``) averages on it.
+    The same canonical receipt; the direct four-current head
+    (``gw.photon_direct_head``) uses this entry.
 ``build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume, ...)``
     The 3D body head as a FUNCTION of the Cartesian ``K = q+G``, which
     ``v_qG_table`` evaluates at every ``argmin |q+G|`` slot (all of them
@@ -115,6 +114,7 @@ from vcoul.box_0d import Box0D
 from vcoul.box_fft import compute_vcoul_box
 from vcoul.bulk_3d import Bulk3D
 from vcoul.geometry import CoulombGeometry
+from vcoul.resolvent_head import scalar_resolvent_head
 from vcoul.long_range import (LRChannels, inscribed_radius, lr_channels,
                               lr_kernel, ws_shift)
 from vcoul.quadrature import (
@@ -181,6 +181,7 @@ __all__ = [
     "minibz_coulomb_moment",
     "minibz_average", "minibz_moment_tensor", "_minibz_kernel_bare",
     "iter_minibz_photon_samples",
+    "scalar_resolvent_head",
     "bulk_photon_D_raw",
     "slab_minibz_photon_cubature",
     "slab_minibz_graded_photon_cubature",

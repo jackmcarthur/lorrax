@@ -48,8 +48,9 @@ the downstream `ζ v ζ†` needs no further factor. With $K = q+G$ in Cartesian
 | `build_miniBZ_dq_cart(kgrid, bvec, *, nmc=2**18, seed=42)` | `(2·nmc, 3)` mini-BZ offsets: an `nmc` draw unioned with its negation (centrosymmetric by construction). |
 | `minibz_frac_to_cart(U, bvec)`, `minibz_cell_affine(bvec, kgrid)` | Fractional → Cartesian as `U @ bvec` (rows; never `U @ bvec.T`), and the full-cell → mini-BZ affine. |
 | `minibz_voronoi_batches`, `sample_minibz_qpoints`, `minibz_average`, `minibz_inscribed_sphere_r2`, `minibz_moment_tensor`, `wrap_points_to_voronoi` | The BGW `minibzaverage.f90` port and its tensor-weight (`⟨v q_a q_b⟩`) sibling. `minibz_average` returns **bare** kernel units (no 1/Ω); each caller applies its own volume convention. `wrap_points_to_voronoi` is the one jitted Voronoi fold. |
-| `slab_minibz_photon_cubature(kernel, geometry, kgrid) -> SlabMinibzPhotonReceipt` | The exact slab Wigner–Seitz polygon rule (Γ-to-edge Duffy triangulation, fixed 16/24/32 Gauss–Legendre ladder): the one slab q→0 cell-average owner, consumed by `Slab2D.q0_average` and by `gw.head_correction.complete_static_slab_photon_q0`. |
+| `slab_minibz_photon_cubature(kernel, geometry, kgrid) -> SlabMinibzPhotonReceipt` | The exact slab Wigner–Seitz polygon rule (Γ-to-edge Duffy triangulation, seven geometric radial panels, fixed 16/24/32 Gauss–Legendre points per panel and 32 per edge): the one slab q→0 cell-average owner, consumed by `Slab2D.q0_average` and by `gw.head_correction.complete_static_slab_photon_q0`. |
 | `Bulk3D.q0_average`, `Slab2D.q0_average`, `*.q0_average_transverse_tensor` | q→0 cell averages `(⟨v⟩, ⟨v/(1 − v qᵀSq)⟩)` in bare units, and the bare transverse (TT) head, § [q→0 cell averages](#q0-cell-averages). |
+| `scalar_resolvent_head(kernel, geometry, kgrid, response, *, analytic_sphere=False)` | Macroscopic scalar completion of microscopic `Xi`, exact `dXi_ds` and physical `M1/M3` tensors. Returns `Wc`, `dWc_ds`, `vc0` and high-frequency scalar moments on the same slab polygon or ordinary bulk draws. The slab certifies every action on its fixed ladder; analytic-sphere response actions refuse. The high-frequency `M3` includes the nonlinear first-moment-squared term from completion. |
 | `gauss_legendre_interval(order, left, right)` | Immutable float64 Gauss–Legendre rules on finite intervals, shared by the photon cubature and LORRAX's MPA/VNL consumers. |
 | `bare_coulomb_sphere_indices`, `bare_coulomb_sphere_mask`, `fft_box_miller` | Which G satisfy `|q+G|² ≤ cutoff` (Ry), and nothing else. The ζ-format sentinel padding is applied on the LORRAX side (`common.coulomb_sphere`). |
 | `compute_vcoul_box` | The 0-D box FFT (BGW `Common/trunc_cell_box.f90`). |
@@ -97,7 +98,8 @@ takes a named rule with no silent alternative:
   (`GATE slab_q0_analytic_sphere_unavailable`): there is no
   Baldereschi–Tosatti sphere in 2D, where the head is a `|q|` cusp. Unset the
   key on a `sys_dim = 2` deck.
-* The 24→32 ladder pair must converge under `atol 1e-12`, `rtol 1e-8`
+* Both bare and screened averages of the final 24→32 ladder pair must
+  converge under `atol 1e-12`, `rtol 1e-8`
   (mixed error ratio ≤ 1), else `GATE slab_q0_polygon_not_converged`
   refuses. The certificate (edges, orders, node counts, `⟨v⟩`, error ratio)
   prints once per process and is returned as `SlabQ0Certificate` through
@@ -105,16 +107,17 @@ takes a named rule with no silent alternative:
 * `static_kappa2` (the 3D Thomas–Fermi model) raises `NotImplementedError`
   on the slab.
 * `Slab2D.q0_average_transverse_tensor` (the bare TT head of
-  `gw.v_q_bispinor`) reads the same receipt: `−D_TT` of the order-32 rule,
+  `gw.v_q_bispinor`) reads the same receipt: `−D_TT` of the finest rule,
   with the same 24→32 convergence refusal. The direct four-current head
   subtracts this tile from V (`subtract_bare_tt_from_bank`), so the tile
   removed is the one V holds.
-* `slab_minibz_graded_photon_cubature` issues the same receipt on seven
-  geometric radial panels toward Γ (8/12/16 Gauss points per panel, 32 per
-  edge), for screened integrands with a near-Γ scale; the direct
-  four-current head averages on it. Bare integrands agree on both rules.
+* `slab_minibz_graded_photon_cubature` delegates to the same canonical
+  provider. Scalar and direct four-current screened heads share the radial
+  panels, which resolve screening scales far inside the cell. A single
+  ungraded panel can leave the screened average unconverged even after its
+  bare average has converged.
 * `minibz_coulomb_moment(..., is_2d=True)` is the slab cell's
-  Coulomb-weighted `Q_ab` on the order-32 polygon rule (`Q_zz = 0`); the
+  Coulomb-weighted `Q_ab` on the same finest polygon rule (`Q_zz = 0`); the
   metal pair split reads it.
 
 `Bulk3D.q0_average` takes no `rule`: the polygon construction is 2-D, so the

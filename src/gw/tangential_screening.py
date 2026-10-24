@@ -94,6 +94,16 @@ def _json(value):
     return json.dumps(value, default=encode, sort_keys=True, allow_nan=False)
 
 
+def _record_receipt(root, stage, receipt):
+    """Publish a current stage receipt with the shared all-rank I/O verdict."""
+    from common.collectives import rank0_transaction
+    path = Path(root) / (stage + "_receipt.json")
+    rank0_transaction(path, stage=f"tangential.receipt.{stage}",
+                      write=lambda: path.write_text(_json(receipt) + "\n"))
+    log.debug(f"tangential {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
+              f"seconds={receipt.get('seconds', {})}")
+
+
 def _authenticated_constructor_resume(root, identity, recipe, *, photon=False, coulomb_sha256=None):
     """Authenticate a complete producer bank before preserving it.
 
@@ -137,6 +147,43 @@ def _authenticated_constructor_resume(root, identity, recipe, *, photon=False, c
     except (KeyError, OSError, TypeError, ValueError):
         return False
     return ('photon_layout' in header) == photon
+
+
+def _authenticate_committed_body(header, root, identity, recipe, coulomb_sha256):
+    """Bind interrupted-head reuse to its current recipe and bare interaction.
+
+    The store validator below authenticates the model payload with the current
+    capacity ledger. These small existing receipts additionally bind the
+    physical inputs omitted from the state identity; no bank payload is read.
+    Missing legacy provenance refuses rather than inferring a compatible V.
+    """
+    def refuse(reason):
+        raise ValueError(f"GATE tangential_committed_resume: {reason}; use a fresh run directory")
+
+    if header.get("identity") != identity or _json(header.get("recipe")) != _json(recipe):
+        refuse("current identity or resolved recipe differs from the committed body")
+    if not isinstance(coulomb_sha256, str) or not coulomb_sha256:
+        refuse("current bare Coulomb digest is missing")
+    try:
+        bank = json.loads((root / "bank_receipt.json").read_text())
+        moments = json.loads((root / "moments_receipt.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError("GATE tangential_committed_resume: producer provenance is missing or invalid; "
+                         "use a fresh run directory") from exc
+    if (any(row.get("identity") != identity or row.get("completion") is not True
+            for row in (bank, moments)) or moments.get("bank_complete") is not True
+            or bank.get("coulomb_identity") != moments.get("coulomb_identity")
+            or (bank.get("coulomb_identity") or {}).get("sha256") != coulomb_sha256):
+        refuse("producer receipts do not bind the current bare Coulomb operator")
+    # These per-parent receipts are inside the authenticated model header,
+    # so adjacent JSON files cannot accidentally authenticate another body.
+    parents = [row for batch in header.get("construction_receipts", ())
+               for row in batch.get("receipt", {}).get("q_receipts", ())]
+    if (len(parents) != header.get("n_q_irr")
+            or any(row.get("identity") != identity
+                   or row.get("constructor", {}).get("coulomb", {}).get("sha256") != coulomb_sha256
+                   for row in parents)):
+        refuse("committed parent receipts do not bind the current bare Coulomb operator")
 
 
 # What the sector constructor publishes into a map directory.
@@ -507,13 +554,17 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         material_class=None, wfns_transverse=None,
                         bispinor_v_q_path=None, mu_bases=None,
                         photon_g0_vectors=None, photon_head_cache=None,
-                        photon_head_state=None):
+                        photon_head_state=None, bank_source=None):
     """Build current W; only one-shot models may use ISDF restart membership.
 
     SC labels own separate map scratch. ``restart`` may restore the invariant
     ISDF basis, but never skips the current response or W construction.
     """
     source_wfn = None
+    diagrams = str(getattr(config.screening.diagrams, "value", config.screening.diagrams))
+    if diagrams != "w_rpa" and bank_source is None:
+        raise ValueError("GATE tangential_response_source: a non-RPA diagram requires its own "
+                         "sample, derivative, moment and head source")
     from .gw_config import uses_full_bispinor_tangential
     photon = uses_full_bispinor_tangential(config)
     if photon and int(meta.nspinor) != 4:
@@ -573,6 +624,8 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 wfns_transverse = dataclasses.replace(wfns_transverse, occ=wfns.occ)
         identity = tangential_identity(wfns, meta, label=label, wfn=wfn,
             binding=wfn_fingerprint_binding, centroid_indices=centroid_indices)
+        if bank_source is not None:
+            identity.update(bank_source["identity"]())
         sc_scratch = str(label).startswith("sc_")
         if config.restart and tensors_filename is not None and not sc_scratch and not photon:
             handle = tangential_restart_handle(tensors_filename,
@@ -584,9 +637,11 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                     from .tangential_head import build_tangential_head
                     head, iteration_head = build_tangential_head(
                         handle, None, V_q, wfns, meta, config, mesh_xy=mesh_xy, wfn=wfn,
-                        response=iteration_head_response, head_resolver=head_resolver,
+                        response=(bank_source["head"]() if bank_source is not None
+                                  else iteration_head_response), head_resolver=head_resolver,
                         plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
                     result.update(mpa_head=head, iteration_head=iteration_head)
+                    _record_receipt(Path(handle["path"]).parent, "head", head)
                 # The export is written only once the map is complete, so an
                 # export on disk always implies a finished head.  Under SC
                 # this branch is unreachable (``sc_scratch`` skips restart).
@@ -640,13 +695,18 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         assert_committed(h5, path=model)
                         complete = "final_commit" in h5
                         raw = h5["header_json"][()] if complete else b"{}"
-                    bound = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw)).get("identity")
+                    stored_header = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
+                    bound = stored_header.get("identity")
                 except (OSError, ValueError, KeyError, AttributeError):
                     complete = False
-            if complete and sc_scratch and not photon and bound == identity:
-                # An SC map's committed model of this very map (the file tier
-                # persists it): Sigma reads it; nothing upstream is rebuilt.
-                log.info(f"tangential output: committed model of this map retained at {model}; reusing it")
+            if complete and (sc_scratch or config.restart) and not photon and bound == identity:
+                # A head failure can leave a committed body before restart
+                # membership is registered. Explicit restart may resume it;
+                # the committed branch below still validates the full payload
+                # against this identity and the current capacity ledger.
+                _authenticate_committed_body(
+                    stored_header, root, identity, recipe, coulomb["sha256"])
+                log.info(f"tangential output: committed model of the current operator retained at {model}; reusing it")
                 return "committed"
             if complete:
                 log.info(f"tangential output: complete model retained at {model}; refusing rebuild")
@@ -747,17 +807,16 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             # broadcasts its verdict, exactly as the sibling write above.
             receipts[stage] = receipt
             recorded.add(stage)
-            path = root / (stage + "_receipt.json")
-            rank0_transaction(
-                path, stage=f"tangential.receipt.{stage}",
-                write=lambda: path.write_text(_json(receipt) + "\n"))
-            log.debug(f"tangential {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
-                     f"seconds={receipt.get('seconds', {})}")
+            _record_receipt(root, stage, receipt)
     with timing.section("spole.bank"):
         if resume_constructor:
             log.debug('tangential bank: not produced; '
                      + ('committed model reused' if resume_constructor == 'committed'
                         else 'authenticated complete producer artifact reused'))
+        elif bank_source is not None:
+            sample_receipt, moment_receipt = bank_source["bank"](bank)
+            record("bank", sample_receipt)
+            record("moments", moment_receipt)
         elif photon:
             from .response_bank import compute_photon_bank
             record("bank", compute_photon_bank(wfns, wfns_transverse, meta, config,
@@ -770,7 +829,7 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         else:
             record("bank", produce_w_bank(wfns, meta, config, mesh_xy=mesh_xy,
                 sym=sym, sample_plan=recipe, bank_io=bank, print_fn=print_fn))
-    if not photon and not resume_constructor:
+    if not photon and not resume_constructor and bank_source is None:
         with timing.section("spole.moments", announce=True,
                             label="tangential response moments"):
             record("moments", compute_response_moments(wfns, meta, config,
@@ -880,7 +939,8 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             from .tangential_head import build_tangential_head
             head, iteration_head = build_tangential_head(
                 handle, header, V_q, wfns, meta, config, mesh_xy=mesh_xy, wfn=wfn,
-                response=iteration_head_response, head_resolver=head_resolver,
+                response=(bank_source["head"]() if bank_source is not None
+                          else iteration_head_response), head_resolver=head_resolver,
                 plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
             result.update(mpa_head=head, iteration_head=iteration_head)
             record("head", head)

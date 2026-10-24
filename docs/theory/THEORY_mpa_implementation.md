@@ -301,6 +301,16 @@ direct response and its wings through the Γ body
 [four-current heads](four-current-head-corrections.md) owns $S(\omega)$ and the
 fold); only the $3\times3$ result survives. The scalar samples are fitted with
 the same pole solver and guards as the body and published with it. The head
+Loewner certificate uses the condition and rank of the singular directions
+actually inverted by its existing $r_{\rm cond}$ truncation. An exact
+lower-order response may have a singular requested-order pencil; its full
+condition (infinity is encoded as the string `"inf"`) remains in head
+provenance, alongside the retained condition and rank. The backward-error
+guard still evaluates the
+**full original pencil equation**, including discarded directions, at the
+unchanged $\sqrt{\epsilon_{\rm mach}}$ budget. Other pole solvers and the body
+certification are unchanged. These guards do not certify held-out accuracy or
+the accuracy of the subsequent static/inverse-moment residue pin. The head
 consumer (`head_correction.compute_complex_pole_head_sigma_diag`) uses the
 stored complex head pole without adding $\eta$; the body applies $\eta$, so a
 convergence statement covers the body quadrature at a fixed head.

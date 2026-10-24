@@ -108,7 +108,7 @@ def _fit_mubatch(
     weight_l_face, weight_r_face, channels, vertex_terms,
     distrib_la_batched_route, n_rmu_solve,
     q_irr_full_idx, q_neg_idx, q_frac, sphere_idx, ngk_per_q,
-    mu_basis, gvec_components, scratch_dir, print_fn,
+    mu_basis, gvec_components, scratch_dir, print_fn, defer_zeta_write=False,
 ):
     """The μ-batch fit: Z^{μ_L}_q(G) of every channel by batches, C⁻¹ on the sphere.
 
@@ -428,10 +428,15 @@ def _fit_mubatch(
                     zeta_io.create_dataset(
                         'zeta_q_G', shape=(Q, int(meta.n_rmu), ngkmax),
                         dtype=np.complex128)
-                    zeta_g.write_file(zeta_io, print_fn=print_fn)
+                    if not defer_zeta_write:
+                        zeta_g.write_file(zeta_io, print_fn=print_fn)
                 from common.collectives import barrier
                 barrier("zeta_writes_complete", print_fn=print_fn)
-            log.debug(f"  μ-batch ζ file (μ_L={ch.vertex}) written in "
+            if defer_zeta_write:
+                # Persist the very ζ tiles that the first V pass contracts;
+                # a separately compiled C+ application need not round alike.
+                zeta_g.pending_file = {"complete": False, "provenance": None}
+            log.debug(f"  μ-batch ζ file (μ_L={ch.vertex}) prepared in "
                      f"{time.perf_counter() - t_w:.2f}s")
         log.debug(store.receipt())
         zetas[int(ch.vertex)] = zeta_g
@@ -463,6 +468,7 @@ def fit_zeta_to_h5(
     mubatch_plan=None,
     parent_psi=None,
     write_zeta_file: bool = True,
+    defer_zeta_write: bool = False,
     current_basis_rows=None,
     print_fn=print,
 ):
@@ -477,6 +483,10 @@ def fit_zeta_to_h5(
     current channels, which share one μ-batch loop
     (docs/architecture/zeta_fit_mubatch.md).  Each channel owns its C_q, its
     factor and its file.  Returns ``(peak_bytes, {μ_L: ZetaG})``.
+
+    ``defer_zeta_write`` leaves an incomplete header/dataset until the first
+    ``ZetaG.contract_v`` pass writes exactly the ζ tiles it uses in V. The
+    charge GW caller supplies its provenance before that pass completes.
     """
     if k_unfold_plan is None or psi_nmu_parent is None or psi_mun_parent is None:
         raise ValueError("fit_zeta_to_h5 requires a typed plan and both raw-parent faces.")
@@ -494,6 +504,8 @@ def fit_zeta_to_h5(
         raise ValueError(
             f"fit_zeta_to_h5: channels {vertices} must be (0,) (charge) or a "
             "subset of the current channels (1, 2, 3).")
+    if defer_zeta_write and vertices != (0,):
+        raise ValueError("Only the charge channel can defer its ζ file to its V pass.")
     transverse = vertices != (0,)
 
     # Two μ extents (common/meta.py): ``n_rmu`` is the LOGICAL centroid count
@@ -785,7 +797,7 @@ def fit_zeta_to_h5(
         sphere_idx=_gflat_sphere_idx_padded, ngk_per_q=_gflat_ngk_per_q,
         mu_basis=mu_basis, gvec_components=_gflat_gvec_components,
         scratch_dir=os.path.dirname(os.path.abspath(output_files[vertices[0]])),
-        print_fn=print_fn)
+        print_fn=print_fn, defer_zeta_write=defer_zeta_write)
     if _charge_rank is not None:
         from isdf import cplus
         log.info(cplus.rank_text(_charge_rank), extra=block("isdf", label="zeta rank"))
@@ -798,7 +810,9 @@ def fit_zeta_to_h5(
                  f"({n_run} of {n_total} μ batches); ζ is PARTIAL"
                  + (" and its files are NOT marked complete." if _write_file else "."))
     for ch in channels:
-        if ch.write and not _trunc and jax.process_index() == 0:
+        if zetas[ch.vertex].pending_file is not None:
+            zetas[ch.vertex].pending_file["complete"] = not bool(_trunc)
+        elif ch.write and not _trunc and jax.process_index() == 0:
             from file_io.isdf_header import mark_zeta_done
             mark_zeta_done(ch.output_file)
     _track_peak_mb = 0

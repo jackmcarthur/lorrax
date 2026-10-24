@@ -458,16 +458,27 @@ def fit_head_samples(head_samples, z, n_p, *, model, solve,
                 moment_m1=complex(moment_m1),
                 moment_rule=(f"gauss_legendre_t order={HEAD_QUADRATURE_ORDER} "
                              f"xi0={HEAD_QUADRATURE_SCALE_RY!r} Ry"))
+        if fitted["solve"] == "loewner":
+            provenance.update(
+                condition_scope="retained_loewner",
+                condition_full=("inf" if np.isposinf(fitted["condition"])
+                                else fitted["condition"]),
+                condition_retained=fitted["condition_retained"],
+                rank_retained=fitted["rank_retained"])
+    # The raw full Loewner condition can be infinite for an exact lower-rank
+    # response.  Certify the directions actually inverted, while preserving
+    # that raw value in provenance and the full-system backward-error gate.
+    condition = fitted.get("condition_retained", fitted["condition"])
     if (not all(np.all(np.isfinite(value)) for value in
-                (wc, z, fitted["Omega_p"], fitted["B_p"], fitted["condition"],
+                (wc, z, fitted["Omega_p"], fitted["B_p"], condition,
                  fitted["backward_error"], fitted["max_abs_residual"]))):
         raise ValueError("scalar-head MPA fit is nonfinite")
-    if (fitted["condition"] > provenance.get("condition_max_allowed", np.inf)
+    if (condition > provenance.get("condition_max_allowed", np.inf)
             or fitted["backward_error"] > provenance.get("backward_error_max_allowed", np.inf)):
         raise ValueError("scalar-head MPA fit exceeds its condition/backward-error gate")
     return dict(sample_z=np.asarray(z), sample_Wc=wc,
         Omega_p=fitted["Omega_p"], B_p=fitted["B_p"], model=model,
-        diagnostics=dict(fit_condition=fitted["condition"],
+        diagnostics=dict(fit_condition=condition,
             fit_backward_error=fitted["backward_error"],
             fit_max_abs_residual=fitted["max_abs_residual"]),
         provenance=provenance,

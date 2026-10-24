@@ -1,320 +1,23 @@
-"""Ladder-corrected screened Coulomb ``W_BSE(z)`` — the test-charge density
-response whose kernel carries the statically screened direct rung ``-W``.
+"""Physical non-TDA ladder density response, W_BSE(z)-v = C (z-H)^-1 B.
 
-This is the ``screening_diagrams = w_bse`` half of the GW driver's screening
-fork: the SAME resolvent identity ``W(z) - v = v (z - H)^{-1} v`` that
-``bse_w_exact`` uses for the RPA W, evaluated with the LADDER operator instead
-of the RPA one.  It is a two-stage object by construction — the ladder kernel
-``W_R`` is the RPA ``W(0)`` the ordinary path already produced — and it lives in
-``src/bse/`` because the operator is the BSE ring matvec; ``gw/`` consumes only
-the (mu, nu) tiles this module returns.
+At stored +q the two branches are R=(c[k+q],v[k]) and
+A=(v[k+q],c[k]), with distinct vertices F_R and F_A. The injection
+is [F_R; -F_A]v and the readout is v[F_R^dag,F_A^dag]. Their outer
+product supplies all four Hartree blocks. Each statically screened direct
+block uses the same physical encode/W-convolution/decode contraction.
+No TRS sewing, real-orbital assumption or projection of W(z) is used.
 
-``build_ladder_resolvent(..., include_w=False)`` DELEGATES to
-``bse_w_exact._build_rpa_resolvent`` — the RPA limit of this SAME
-resolvent identity, with the direct rung parameterized out of the ring
-matvec (``bse_ring_comm.build_bse_ring_matvec_full(..., include_W=
-False)``) rather than a second matvec builder.  As of 2026-08-23 that
-limit is ALSO a served production diagram, ``screening_diagrams =
-w_rpa_resolvent`` (``gw.screening_bse.compute_screening_ladder``'s
-``include_w=False`` arm) — a second route to ``w_rpa``'s own W, useful
-for gating this module's restart/TRS/head machinery on an operator simple
-enough to have an independent reference.  Every ``include_w=True``
-statement in this docstring — the ladder rung, its TRS-gauge derivation,
-the finite-q vertex-flip compensation — is specific to the LADDER arm and
-does not describe ``w_rpa_resolvent``, which never builds the rung at all.
-
-Scaling envelope (TASTE 8 / INVARIANTS 9) — MEASURED, not projected
----------------------------------------------------------------------------
-Every claim in this section was checked against the optimized HLO on a 2x2
-mesh with production PartitionSpecs on 2026-08-16 (the audit and its numbers:
-``reports/screening_diagrams_wbse/evidence/hlo_audit/FINDINGS.md`` in the
-sandbox); the three that did not survive are stated in their corrected form
-and the defects they named are fixed in this file.
-
-Cost per ``(q, z)`` point = (GMRES iterations) x (one ring matvec).  On the
-ladder the iteration count, not the per-iteration overhead, is the lever
-(~4 % of a ladder iteration is outside the matvec, measured 2026-09-26), so
-every ``(q, z)`` recycles ``LADDER_DEFLATION_RANK`` Ritz vectors of its own
-preconditioned operator across all of its probe columns (:func:`_deflation_for`).  The
-ladder matvec is NOT the RPA one at the same price: measured static collective
-counts are 8 -> 24 (x3.0) for the matvec and 40 -> 88 (x2.2) for the whole
-non-TDA solve, none of them on an ``N_mu^2``-class operand.  The whole
-``q x z`` sweep dispatches ONE compiled program — the operator structure is
-baked into the cached block-GMRES engine (``_get_block_gmres_solver``, keyed
-on ``id(matvec)``) and every q/z-dependent tensor (rolled ``psi_c``/``eps_c``,
-the ``V_q`` tile, the preconditioner diagonal, ``z``) flows in as a RUNTIME
-argument through ``matvec_operands``.  That sentence was FALSE until
-2026-08-16 by exactly one program: ``ensure_W_R`` sat inside the q loop and
-``make_w_densifier`` builds a fresh ``@jax.jit`` per call, costing n_q + 1
-trace+compiles per wedge.  ``W_R`` depends on ``k - k'`` and not on q, so it
-is now built once, outside the loop (see :func:`sweep_q_wedge`), and the
-sentence is true again — the audit's acceptance check is that a 2q x 2z sweep
-shows no tracing-cache miss after the first ``(q, z)``.
-
-MEMORY HIGH-WATER, in decreasing order, and none of it ``N_mu^2``-class per
-rank:
-
-* the SOLVE peak is the replicated ``O(max_iter^2)`` GMRES workspace (7.02 MiB
-  at the production ``max_iter = 300``), which is ``N_mu``-INDEPENDENT and
-  dominates both the RPA and the ladder solve;
-* inside the matvec, the ``T / T_R / U_R / U_q / U`` direct-rung chain, not the
-  probe block: the ladder matvec's peak is 5.3x the RPA one for that reason;
-* the coupling rung (``bse_ring_comm._w_term_B`` -> ``_ring_sum_B_encode``)
-  transiently holds a CONDUCTION-FULL trial buffer ``(b, c_full, v_loc, k)``,
-  y-only-sharded, twice per matvec.  Pair-basis class, so the envelope holds,
-  but it is not "``X_full`` sharded on (x, y)" and the docstring used to say it
-  was.  Pre-existing and by design; the ladder is simply the first screening
-  path to reach it;
-* the pair-basis probe block ``X_full = (2, p_chunk, c, v, k)`` sharded on
-  ``(x, y)``, plus ONE ``P('x','y')`` output tile.
-
-There is no whole-``mu^2`` per-rank object anywhere on the path, INCLUDING the
-assembly and validation tail — which is a statement this file had to earn
-twice: the pad-stripped wedge return and then :func:`_assert_pad_block_is_zero`
-each all-gathered a mu axis, and each is now a sharding-preserving form.  The
-seed enters as ``sh.S = P(None,'y',None)``, the readout leaves through the
-reduce-scatter snapshot as ``sh.V = P('x','y')``, and the stacked wedge is
-``P(None, None, 'x', 'y')`` — the same class as the existing ``W_q``.
-
-The envelope ``N_mu -> 1e4``, ``P -> 1e3`` is reached by chunking two axes and
-nothing else: ``probe_chunk`` splits the mu^2 tile column-wise, and the q-wedge
-is walked one q at a time (never batched).  ``probe_chunk`` trades DISPATCHES
-for the probe block's memory — and only since 2026-08-16: while
-:func:`_accumulate_columns` ran eagerly, every chunked placement all-gathered
-the accumulator's nu axis (``N_mu/p_x`` x ``N_mu`` per rank, dividing by
-sqrt(P) rather than P), so the knob documented as SAVING memory spent it, at
-every setting except the single-chunk default.
-
-Two-plan obligation (INVARIANTS 6): ONE code path serves both plans.  The ring
-matvec at ``P = 1`` IS the local plan — the ring/ppermute reduces to a
-no-op loop over a single rank and the shard_map bodies become the local
-einsums — so there is no second implementation to keep in step, and
-``docs/architecture/dense_linear_algebra.md`` cites this module for both plans.
-
-The derivation
---------------
-Notation: pair index ``I = (c, v, k)``; ``M_I(mu)`` the ISDF pair density
-``sum_s conj(psi_c) psi_v``; ``D_I = eps_c - eps_v``; ``v`` the (mu, nu) Coulomb
-tile; ``W`` the static screened tile.  The non-TDA operator acts on ``[X; Y]``
-with the probe seed ``rhs = [f; -f]``, ``f = M v e_nu``, and the readout
-``w = v M^dag (X + Y)`` — the convention ``bse_w_exact`` pins and gates.  The
-RPA case is the symplectic ``H = [[A, B], [-B, -A]]``; the ladder case is NOT
-(step 4).
-
-**1. The Hartree/ring rung is a DYAD, and that forces it into all four
-blocks with no conjugation.**  Write the seed as ``sigma u = [M u; -M u]`` and
-the readout as ``tau [X; Y] = M^dag (X + Y)``.  For ANY irreducible operator
-``H_0`` (the part of ``H`` that is not the ring term), adding the ring term as
-the outer product ``sigma_v tau`` — i.e. ``H = H_0 + sigma v tau``, which
-written out is exactly ``[[G, G], [-G, -G]]`` with ``G = M v M^dag`` — and
-solving ``(z - H) x = sigma v e_nu`` gives, by Woodbury,
-
-    w = v tau x = v [ Pi + Pi (v^{-1} - Pi)^{-1} Pi ] v = v Pi (1 - v Pi)^{-1} v,
-    Pi(z) = tau (z - H_0)^{-1} sigma .
-
-That is ``W(z) - v = v chi v`` with ``chi = Pi (1 - v Pi)^{-1}`` — the Dyson
-resummation — for ANY ``H_0``, exactly, with no reality or symmetry assumption.
-So the ring kernel is not "the same in both blocks" by analogy with the A
-block: it is the outer product of the perturbation's injection and the density
-readout, which is what an internal Hartree field IS.  With ``H_0 =
-diag(D, -D)`` this gives ``Pi = chi_0`` and the RPA W, which is the identity
-``bse_w_exact`` gates to 2.5e-9 at q=0 and at every symmetry-reduced finite q.
-It also fixes the anti-resonant row's conjugation pattern: the dyad's bottom
-row is ``[-G, -G]`` with NO complex conjugate.  The optical BSE's ``-B*, -A*``
-row belongs to a different basis (its anti-resonant states carry the CONJUGATE
-pair density; that is what makes its exchange ``M v M^T`` instead of
-``M v M^dag``), and using it here breaks ``w = v chi v`` already at RPA.
-
-**2. What is left to derive.**  Step 1 fixes the ring term in ALL FOUR blocks
-(``[[G, G], [-G, -G]]``, no conjugate anywhere) and reduces the problem to
-``H_0``, the irreducible part.  Writing ``H_0 = Sigma_3 (D~ + K^d)`` with
-``Sigma_3 = diag(1, -1)``, ``D~ = diag(D, D)`` and ``K^d`` the direct kernel
-MATRIX in the 2N basis, the free-propagator factorization
-``L_0^{-1} = Sigma_3 (z - Sigma_3 D~)`` gives ``Pi = tau (z - H_0)^{-1} sigma``
-= the ladder-corrected irreducible polarizability, PROVIDED ``K^d`` is the
-kernel matrix in that basis.  So all four blocks of ``K^d`` must be derived; the
-RPA case is ``K^d = 0``, ``H_0 = diag(D, -D)``, ``Pi = chi_0``.
-
-Special case worth naming, because it is the RPA path's whole optimization
-story: when ``H`` is the plain symplectic ``[[A, B], [-B, -A]]``, eliminating
-``T = X - Y`` in favour of ``S = X + Y`` gives
-``[z^2 (A-B)^{-1} - (A+B)] S = 2 f`` and hence
-
-    W(z) - v = 2 v M^dag [ z^2 (A-B)^{-1} - (A+B) ]^{-1} M v .          (*)
-
-RPA: ``A = D + G``, ``B = G`` ⇒ ``A - B = D``, ``A + B = D + 2G``, and (*) is
-what ``w_omega_chain`` exploits.  The ladder breaks BOTH the form and
-``A - B = D`` (step 4), so (*) does not apply to it at all.
-
-**3. The ladder rung.**  The screened direct term is the SAME 4-point kernel as
-the optical BSE's direct term.  Two independent matrix elements exist in the
-pair basis, distinguished by whether the KET's electron/hole role assignment is
-reversed — which is exactly what the de-excitation branch does:
-
-    W_d   [I, J] = sum_{mu,nu} [conj(psi_c[k]) psi_c'[k']](mu) W(k-k')
-                              [psi_v[k] conj(psi_v'[k'])](nu) / N_k
-    W_d^B [I, J] = sum_{mu,nu} [conj(psi_c[k]) psi_v'[k']](mu) W(k-k')
-                              [psi_v[k] conj(psi_c'[k'])](nu) / N_k
-
-``W_d`` is ``_apply_A``'s ``W_term`` (``encode_T`` + ``apply_W_from_T``);
-``W_d^B`` is ``_apply_B``'s (``encode_T_B`` + the SAME decode).  Both are the
-optical operator's direct terms VERBATIM, and that is a consequence, not an
-analogy: the direct rung contracts band pairs ``(c, c')`` and ``(v, v')``
-through ``W`` and never touches a density vertex, so the density-vertex
-convention that distinguishes this operator's exchange from the optical one
-(step 1) cannot reach it.  MEASURED on the gnppm fixture: ``W_d`` is Hermitian
-to 1.2e-12 and ``W_d^B`` is complex SYMMETRIC to 4.9e-13 (and 1.9e+00 away from
-Hermitian) — the same structure ``test_bse_dense_reference`` asserts for the
-optical blocks.
-
-**4. The anti-resonant row is a HYBRID, and this is the result that had to be
-measured.**  The remaining two blocks of ``K^d`` are fixed by ``K^d`` being a
-kernel MATRIX, i.e. Hermitian: ``K^AR = (K^RA)^dag = conj(W_d^B)`` (using
-``W_d^B`` symmetric) and ``K^AA = conj(K^RR) = conj(W_d)``.  Composed with the
-step-1 dyad this gives
-
-    A = D + V - W_d ,        B = V - W_d^B ,
-    Y_out = -[ V X - conj(W_d^B conj(X)) ] - [ D Y + V Y - conj(W_d conj(Y)) ] ,
-
-i.e. the RING terms of the bottom row keep the RPA's un-conjugated ``-V`` (they
-are the Hartree dyad's bottom row, forced by step 1) while the DIRECT terms are
-CONJUGATED (they are an ordinary two-particle kernel, so its anti-resonant
-blocks are the para-Hermitian conjugates — the same structure the OPTICAL row
-uses).  Equivalently: the ladder-only part of ``H`` is exactly the exchange-free
-optical SHAO operator ``[[A, B], [-B*, -A*]]``, so the poles of ``Pi`` are the
-exchange-free BSE's exciton energies, which is what a ladder polarizability's
-poles must be.
-
-Three candidate rows were dense-solved on the gnppm 2v2c payload at q=0 (probe
-leg, JID 57052808, 2026-08-15), scored on (a) static-tile hermiticity
-``max|W - W^dag|/|W|`` and (b) the ``W -> 0`` limit against the validated RPA W:
-
-    row                                       asym       RPA limit
-    -[B, A]        (naive symplectic)         2.13e-05   exact
-    -[B*, A*]      (full optical conjugation) 9.24e-07   2.27e-03  REFUTED
-    -[B_ring - conj(W_d^B), A_ring - conj(W_d)]  6.90e-15   exact    <- this one
-
-The naive row's 2.13e-05 is the OPERATOR, not the solver: a dense (exact) solve
-of the same operator reproduces it to every digit, and the sharded tile agrees
-with the dense one to 3e-15 at GMRES tolerances from 1e-9 to 1e-14.  Fully
-conjugating the row instead breaks the RPA limit, because ``K^A = M v M^dag`` is
-Hermitian but NOT symmetric (measured ``|K^A - (K^A)^T|/|K^A| = 1.95`` on this
-deck) — the ring term must stay un-conjugated.  This is the same class of defect
-as the historical optical ``-B, -A`` bug (``_antiresonant_row`` docstring): an
-un-conjugated row against a complex-SYMMETRIC coupling.  The dense oracle
-(``tests/test_bse_w_ladder_dense.py``) carries both as RED TWINS.
-
-**5. Consequence for the frequency path.**  The ladder operator is not the
-symplectic ``[[A, B], [-B, -A]]`` at all (step 4), and even its ``A - B`` is
-``D - W_d + W_d^B != D``.  The ``w_omega_chain`` z^2 reduction hard-assumes BOTH
-(``w_omega_chain.py:39-46``: ``S = D^{1/2}(A+B)D^{1/2}``, seed scaled by
-``D^{1/2}``, three-term recurrence in a Euclidean metric), so it is
-STRUCTURALLY REFUSED for the ladder — see :func:`refuse_chain_path`.  The
-hybrid row also rules out ``bse_nontda.make_ab_appliers`` and the SDY product
-form: the un-conjugated ring dyad is not the complex-symmetric coupling block
-that their real-linear ``F/G`` actions require.  The applicable certificate is
-full-space pseudo-Hermiticity, ``eta H = (eta H)^dag`` with
-``eta = diag(I, -I)``; it is not SDY's N-dimensional kappa-metric certificate.
-A reusable frequency basis would have to retain the full 2N operator; the
-direct path evaluates each frequency with its own shifted block-GMRES solve.
-
-**6. What hermiticity is, and is not, established.**  With the step-4 row,
-``K^d`` is Hermitian by construction and ``W_ladder(q=0, 0)`` comes out
-Hermitian to 6.9e-15 on the fixture — asserted by
-``test_ladder_w_tile_is_hermitian_at_q0``.  At FINITE q nothing here has been
-measured: the same construction should give ``W(q)^dag = W(q)`` and
-``W(q) = conj(W(-q))``, but that is for ``gw/screening._gate_w`` to demonstrate
-on the assembled tiles.  Run the gate; if it fires, that is evidence about the
-operator, not a tolerance to loosen.
-
-**7. Finite q: the vertex flip conjugates the rung, and the operator must
-compensate.**  Every tile this module returns is a ``W(z) - v`` BODY,
-head-less, in the GW ``chi_0(q)`` vertex convention — that is,
-:func:`bse_w_exact.build_finite_q_data`'s conjugation of BOTH psi legs, whose
-long correctness note (``bse_w_exact.py:199-235``) is the record of the
-finite-q vertex bug (KNOWN_FAILURES:1248) that was invisible at q=0 because
-``chi_0(0)`` is real.  The flip is exact for the four DENSITY vertices (each
-is bilinear in ``(psi_c, psi_v)`` with exactly one conj, so conjugating both
-legs flips all four at once).  The direct rung is NOT such an object: it is
-bilinear in ``(c, c')`` and ``(v, v')`` band pairs, each psi appearing once
-conjugated and once plain, so wholesale conjugation of psi conjugates the
-rung ELEMENTWISE — ``rung_flipped(X) = conj(rung_physical(conj(X)))``,
-exactly, given ``W_R`` elementwise-real (equivalent to the input W's gated
-``W(-q) = conj(W(q))`` reciprocity; no other property is used).  Composed
-with the step-4 hybrid row, an uncompensated flip therefore hands the
-resonant row the ANTI-resonant rung and vice versa — the operator becomes a
-chimera (ring resumming ``chi(q)``, rungs belonging to the folded ``-q``
-channel) that is value-identical at q=0, where the static W is real
-symmetric under TRS, and violates ``W(-q) = conj(W(q))`` at finite q.
-MEASURED before the compensation existed: 3.579e-04 against 4.081e-11 for
-the RPA operator through the identical pair of solves (claim 0215,
-JID 57064957, 2026-08-15).  The compensation lives inside the rung appliers
-(``bse_ring_comm`` ``_w_term_A``/``_w_term_B`` under
-the physical rung operand slots (``ladder_rung_slots``), so BOTH rows see the physical rung and
-the step-4 row pattern applies verbatim at every q; with it, the operator at
-``-q`` is the elementwise conjugate of the operator at ``+q`` under the TRS
-fold ``k -> -k`` (ring: ``M``, ``v_q`` conjugate; ``D`` invariant; rungs:
-shown above), which is what makes ``W(-q) = conj(W(q))`` hold by
-construction.  [AMENDED 2026-08-16: the conj-wrap compensation described
-above was REFUTED at block level (probe_block_compare: ~7e-5 residual
-against the dense operator despite exactly-conjugate operand arrays and
-exactly-real W_R; the elementwise argument does not survive contact with
-the kernels).  The mechanism that IS measured exact (1e-20, all four
-blocks) is supplying the rung with the physical rolled un-flipped arrays
-as four extra operands — ``ladder_rung_slots`` in ``bse_ring_comm``,
-slots from ``build_finite_q_data``, threading via
-``bse_feast.ladder_matvec_operands``.  No caller-side convention
-declaration remains.]
-
-**8. Finite q, second condition: the TRS pair GAUGE.**  Step 7's fold — and
-step 4's ``K^AA = conj(K^RR)`` before it — identifies the code's Y labels
-with the physical de-excitation pairs at ``-q`` through the antiunitary map
-``psi(-k) -> conj(psi(k))``.  That is an identity of PHYSICAL states only in
-the gauge ``psi(-k) = conj(psi(k))``; the diagonalizer's Bloch gauge is
-arbitrary per k, so on a raw deck the conj-pattern row fills the Y channel
-with wrong-gauge content.  The error is invisible at q=0 (one shared
-transition space), invisible to per-q hermiticity (``conj(K_d)`` is
-Hermitian in any gauge), and invisible to the RPA (ring dyad and D are
-band-window/gauge invariant — which is why the RPA arm passes reciprocity
-at 4e-11 on the same deck).  MEASURED 2026-08-16: the first-principles
-dense ladder operator itself — no production kernels, no payload flip —
-violates ``W(-q) = conj(W(q))`` at 1.043e-03 on the raw-gauge gnppm 2v2c
-fixture; fixing only the rung compensation of step 7 left the production
-statistic at its pre-fix 3.579e-04 (the swap transposes the tile, and the
-statistic is transpose-invariant).  The cure is a pure basis choice:
-``bse_w_exact.enforce_trs_pair_gauge`` overwrites ``psi(-k)`` with
-``conj(psi(k))`` pairwise (legitimate because W is invariant under unitary
-band mixing within each window), realizes real functions on degenerate
-blocks at TRIM points, and symmetrizes the energies.  ``sweep_q_wedge``
-applies it on the ``include_w=True`` branch only, so the RPA path is
-bit-untouched.  SPINOR decks use the same machinery with the Kramers pair
-gauge ``psi(-k) = i sigma_y conj(psi(k))``: every contraction this operator
-performs is a spin-singlet s-summed bilinear, in which the real-orthogonal
-``i sigma_y`` cancels identically, so the scalar derivation carries over
-once the pair gauge (and Kramers-canonical TRIM pairing) is enforced —
-see ``enforce_trs_pair_gauge``.
-
-**9. The rung sign, measured (2026-08-16).**  Every gate above is blind to
-the ABSOLUTE sign of the direct rung: the RPA limit, hermiticity,
-reciprocity and the dense oracle (same block spec) all pass identically
-under ``+W_d``.  The sign was therefore pinned by two sign-SENSITIVE
-observables on physically-signed kernels (PSD ``v`` and ``W``;
-``tests/test_bse_w_ladder_sign.py``, evidence ``sign_probe/`` in the
-sandbox): (i) the exchange-free ladder poles sit BELOW the free e-h
-continuum — attraction — and a flipped rung sits above; (ii) on the real
-scalar-Si restart the production path ENHANCES screening at q=0 AND finite
-q (Loewner-negative ``Wc`` delta, 4-8%), the Shishkin-Marsman-Kresse
-direction.  Consequently the measured gap OPENING of the first A/B (claim
-0228) is an observable of the v1 SCOPE — ladder body with the q=0
-head/wings held at RPA — not of the operator sign: the full-W
-gap-shrink results in the literature include the vertex in the long-range
-head, which v1 deliberately defers.  Do not "fix" the sign to match the
-full-W expectation; re-examine after the ladder head lands.
+The historical folded RPA representation remains the unchanged default
+when include_w=False. A physical payload can also use a zero direct rung
+to test the explicit-branch RPA/Dyson identity. Both representations use the
+same GMRES, FFT, seed and readout owners and keep pair/centroid arrays
+sharded over all processors.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from functools import partial
+from typing import Callable, Iterable, Optional
 
 import numpy as np
 
@@ -328,7 +31,8 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from .bse_feast import (ensure_W_R, build_preconditioner_diagonal_sharded,
-                        ladder_matvec_operands, matvec_operands)
+                        ladder_matvec_operands, matvec_operands,
+                        _get_deflation_arnoldi)
 from .bse_io import load_bse_data_from_restart_sharded
 from .bse_ring_comm import (
     build_bse_ring_matvec_full,
@@ -341,66 +45,74 @@ from .bse_w_exact import (
     apply_screening_resolvent_block,
     build_probe_rhs,
     build_finite_q_data,
-    enforce_trs_pair_gauge,
     _symmetry_tables,
+    _get_block_moment_actions,
+    _project_screening_actions,
+    _get_block_gmres_solver,
+    _get_probe_rhs_program,
+    _get_branch_projection_program,
 )
 from common.collectives import gather_to_host
+
+LADDER_RESPONSE_CONVENTION = "physical-ra-exact-static-head-v2"
+LADDER_INTERNAL_HEAD_POLICY = "screened-transfer-gamma-exact-diagonal-v1"
+
+
+def ladder_static_head_identity(restart_path, input_file, *, cell_volume):
+    """Bind the exact internal rung head, separate from the dense W0 body.
+
+    Uses the loader's scalar/override and optical-diagonal owners. Head
+    values are Ry bohr^3, volume is bohr^3, and the applied shift is Ry.
+    Only the small G=0 vector is hashed on the host; no W/psi is loaded.
+    """
+    import hashlib
+    from file_io.restart_bundle import read_head_metadata
+    from .bse_head import _resolve_head_params, q0_head_diagonal
+
+    header = read_head_metadata(restart_path)
+    _, whead, volume, _ = _resolve_head_params(
+        input_file, header["bare_head"], header["screened_head"], cell_volume)
+    if whead is None or volume is None or header["head_vector"] is None:
+        raise ValueError("GATE ladder_static_head_identity: missing screened head, volume or G=0 vector")
+    value = complex(np.asarray(whead).reshape(-1)[0])
+    volume = float(volume)
+    grid = tuple(map(int, np.asarray(header["grid"]).reshape(-1)))
+    if (not np.isfinite((value.real, value.imag, volume)).all()
+            or volume <= 0 or len(grid) != 3 or min(grid) <= 0):
+        raise ValueError("GATE ladder_static_head_identity: invalid head, volume or k grid")
+    g0 = np.ascontiguousarray(header["head_vector"], dtype=np.complex128)
+    return dict(policy=LADDER_INTERNAL_HEAD_POLICY, q0_head="diagonal",
+                whead_ry_bohr3=[value.real, value.imag], cell_volume_bohr3=volume,
+                kgrid=list(grid), q0_head_ry=q0_head_diagonal(value, volume, np.prod(grid)),
+                g0_shape=list(g0.shape), g0_sha256=hashlib.sha256(g0.tobytes()).hexdigest())
 
 jax.config.update("jax_enable_x64", True)
 
 
 def build_ladder_resolvent(mesh_xy: Mesh, data: dict, *, include_w: bool = True,
                            fuse_ladder_rung: bool = True):
-    """Assemble the LADDER screening resolvent stack for ``data``.
+    """Build the physical R/A operator and its shared seed/solve/readout stack.
 
-    The :func:`bse_w_exact._build_rpa_resolvent` analog with the ladder kernel.
-    Returns ``(matvec, diag_h, gen, snapshot, sh)`` — the exact 5-tuple
-    :func:`bse_w_exact.apply_screening_resolvent_block` consumes, which is
-    operator-agnostic: only this assembly changes between ``w_rpa_resolvent``
-    and ``w_bse``.
-
-    ``include_w=False`` DELEGATES to ``_build_rpa_resolvent``.  That is
-    deliberate rather than a duplicated branch: the wiring-closure test
-    (``tests/test_bse_w_ladder_identities.py``) rides this flag to prove
-    the plumbing reproduces the production RPA W, so the two must be the
-    same object graph and not merely the same arguments — and, since
-    2026-08-23, so does the production ``screening_diagrams =
-    w_rpa_resolvent`` path (``gw.screening_bse.compute_screening_ladder``),
-    for the same reason.
-
-    ``include_w=True`` needs ``data['W_q']`` — the converged RPA ``W(0)`` from
-    the restart — because ``ensure_W_R(..., include_W=True)`` inverse-FFTs it
-    into the real-space kernel the direct rung convolves.  That is the feature's
-    two-stage structure, not an implementation accident.
-
-    ``matvec`` is q-INDEPENDENT (it closes over mesh and k-grid only), so build
-    it ONCE and let the per-q operands flow through ``matvec_operands``; a
-    per-q rebuild silently costs one full compile per q because the block-GMRES
-    cache is keyed on ``id(matvec)``.
-
-    The LADDER matvec is built with ``ladder_rung_slots=True``: its direct
-    rung consumes four extra operands — the PHYSICAL (rolled, un-flipped) psi
-    arrays — which ``build_finite_q_data`` supplies and
-    ``bse_feast.ladder_matvec_operands`` threads.  On a raw payload (the q=0
-    identity/oracle cells) the fallback aliases the density arrays, which ARE
-    physical there.  The engine call must pass
-    ``operands_fn=ladder_matvec_operands`` to match (claim 0215's defect —
-    the rung on conjugated arrays — is structurally unreachable this way).
+    The bare RPA default retains its original representation; explicit
+    physical payloads also permit include_w=False for the RPA identity gate.
+    W_R depends on k-k' only and is prepared once, outside the q sweep.
     """
-    if not include_w:
+    if not include_w and not data.get("physical_branches", False):
         return _build_rpa_resolvent(mesh_xy, data)
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
-    ensure_W_R(data, include_W=True, mesh_xy=mesh_xy)
+    if not data.get("physical_branches", False):
+        data.update(build_finite_q_data(data, (0, 0, 0), mesh_xy, physical_branches=True))
+    ensure_W_R(data, include_W=include_w, mesh_xy=mesh_xy)
     # ``fuse_ladder_rung`` is a COST switch, not a physics one: it sums the two
     # rung T intermediates of each block row before the (mu, nu, s, s, k) FFT
     # chain instead of after, so the matvec runs that chain twice instead of
     # four times (bse_ring_comm._impl_core_fused).  Same operator to rounding;
     # False is the A/B arm.
     matvec = build_bse_ring_matvec_full(
-        mesh_xy, nkx, nky, nkz, include_W=True, screening=True,
-        ladder_rung_slots=True, fuse_ladder_rung=fuse_ladder_rung)
+        mesh_xy, nkx, nky, nkz, include_W=include_w, screening=True,
+        physical_branches=True, fuse_ladder_rung=fuse_ladder_rung)
     diag_h = build_preconditioner_diagonal_sharded(
-        data, mesh_xy, include_W=True, use_tda=False)
+        data, mesh_xy, include_W=include_w, use_tda=False)
     gen = build_realspace_random_transition_generator(
         mesh_xy, nkx, nky, nkz, int(data["n_cond_pad"]), int(data["n_val_pad"]))
     snapshot = build_density_snapshot_operator(
@@ -424,9 +136,9 @@ def refuse_chain_path(include_w: bool) -> None:
         "holds for the RPA screening operator (A = D + V, B = V) and is broken "
         "by the ladder: A - B = D - W_d + W_d^B. Using the chain here would "
         "silently evaluate a DIFFERENT operator at every frequency, not an "
-        "approximation of this one. The hybrid row also rules out the SDY "
-        "product form: its un-conjugated ring dyad is not the "
-        "complex-symmetric B required by SDY's real-linear F/G actions. The "
+        "approximation of this one. Physical finite-q R/A states also have "
+        "distinct vertices and diagonals; they cannot be identified in a "
+        "single N-dimensional real-linear action. The "
         "correct structural certificate is full-space eta-pseudo-Hermiticity "
         "(eta H = (eta H)^dag, eta = diag(I,-I)), not the N-dimensional SDY "
         "kappa metric. A reusable frequency basis must retain the full 2N "
@@ -444,12 +156,14 @@ class WLadderWedge:
         extent, sharded ``NamedSharding(mesh_xy, P(None, None, 'x', 'y'))`` —
         the same class as the existing full-BZ ``W_q``, so no rank ever holds a
         whole mu^2 tile.  ``wc[iz, iq, mu, nu]`` is ``W_q(z) - v_q`` for
-        ``z = z_list_ry[iz]``, ``q = q_irr_kgrid_int[iq]``.  Head-LESS bodies
-        (the resolvent carries no q=0 head by construction; the loader runs
-        ``inject_head=False``), in the GW ``chi_0(q)`` vertex convention.  The
-        pad rows/columns are ZERO: the probe block is the identity in the padded
-        basis and the loader's psi pad is zero, so a pad column solves to zero
-        rather than to noise.
+        ``z = z_list_ry[iz]``, ``q = q_irr_kgrid_int[iq]``. The external
+        macroscopic Hartree head is omitted; with ``include_w=True`` the
+        operator retains the internal static screened transfer-Gamma head
+        through the shared exact optical diagonal. The loader selects these
+        channels independently. The bodies use the GW ``chi_0(q)`` vertex
+        convention. Pad rows/columns are ZERO: the probe block is the identity
+        in the padded basis and the loader's psi pad is zero, so a pad column
+        solves to zero rather than to noise.
 
         PADDED, NOT PAD-STRIPPED — a deviation from DESIGN_2026-08-15 section 4,
         stated loudly because that document says "pad stripped".  The two halves
@@ -504,15 +218,182 @@ class WLadderWedge:
     #: the resolvent), so consumers must restore only the omitted macroscopic
     #: v head and must not apply a head/body Schur fold again.
     head_result: object | None = None
+    #: Optional materialized exact response fields (None when streamed).
+    #: Slopes/reflected values have the wc shape; M0..M3 have only a q axis.
+    response_fields: dict | None = None
 
 
-def _identity_probe_block(n_pad: int) -> np.ndarray:
-    """Full-basis probe block: the identity in the PADDED centroid basis.
+def _identity_probe_blocks(n_logical: int, n_pad: int, chunk: int):
+    """Yield unit-column probes with only one ``(chunk, n_pad)`` host block.
 
-    ``n_pad`` is already a multiple of ``px*py`` (``padded_mu_extent``), hence of
-    ``py`` — the divisibility the reduce-scatter snapshot requires.
+    Rows above the logical centroid count remain zero in the final block.
+    Constructing the full identity, or retaining all chunks, would each cost
+    ``8 * n_pad**2`` host bytes on every rank even with a small probe chunk.
     """
-    return np.eye(n_pad, dtype=np.float64)
+    for c0 in range(0, n_logical, chunk):
+        n_real = min(chunk, n_logical - c0)
+        rows = np.arange(n_real)
+        probes = np.zeros((chunk, n_pad), dtype=np.float64)
+        probes[rows, c0 + rows] = 1.0
+        yield c0, n_real, probes
+
+
+def _probe_scaling_bytes(data, mesh):
+    """Shape-only proposal per probe; the executed programs admit the choice."""
+    nc, nv = int(data["n_cond_pad"]), int(data["n_val_pad"])
+    nk = int(data["nkx"] * data["nky"] * data["nkz"])
+    n, ns = int(data["V_q0"].shape[0]), int(data["psi_c_X"].shape[2])
+    px, py, p = int(mesh.shape["x"]), int(mesh.shape["y"]), int(mesh.size)
+    pair = nc * nv * nk / p
+    # Seed decode and snapshot ring panels scale in the probe axis, whereas
+    # GMRES/Arnoldi themselves scan one probe and keep one Krylov workspace.
+    return max(8*n*nk/py + 32*nc*nv*nk/py + 32*pair,
+               32*nc*n*nk*(ns+1)/p + 32*n*nk/px + 96*pair)
+
+
+def _plan_probe_chunk(context, requested, *, n_pad, carry_bytes, stack_bytes):
+    """Compile the real seed/solve/project/harvest at a bounded proposed width.
+
+    ``carry_bytes`` reserves the facade's not-yet-built response bank. The
+    current payload is already resident. Positive requests are priced and
+    honored; automatic proposals use the common tile bound, then at most a
+    minimum-width and one adjusted-width check. All planning operands are abstract.
+    """
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, check_chunk, compiled_new_bytes
+    from runtime.tiles import tile_units
+    dq, sh, mesh = context["data"], context["sh"], context["mesh"]
+    py, p = int(mesh.shape["y"]), int(mesh.size)
+    nc, nv = int(dq["n_cond_pad"]), int(dq["n_val_pad"])
+    nk = int(dq["nkx"] * dq["nky"] * dq["nkz"])
+    rank = int(context["deflation_rank"])
+    slope, moments = bool(context["with_slope"]), bool(context["with_moments"])
+    abstract = lambda a: (jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=a.sharding)
+                          if isinstance(a, jax.Array) else a)
+    args = jax.tree.map(abstract, context["operands"])
+    diag = abstract(context["diag"])
+    scalar = jax.ShapeDtypeStruct((), jnp.complex128)
+    pair_shape = (nc, nv, nk)
+    one = jax.ShapeDtypeStruct((2, 1, *pair_shape), jnp.complex128, sharding=sh.X_full)
+    physical = bool(dq.get("physical_branches", False))
+    seed_program = _get_probe_rhs_program(context["gen"], sh, nk, physical_branches=physical)
+    solver = _get_block_gmres_solver(context["matvec"], sh,
+        context["max_iter"], context["tol"], jnp.complex128, with_slope=slope,
+        retain_branches=physical)
+    psi = lambda key, layout: jax.ShapeDtypeStruct(
+        dq[key].shape, dq[key].dtype, sharding=layout)
+    v = abstract(dq["V_q0"] if context["snapshot_v"] is None else context["snapshot_v"])
+    deflation, deflation_bytes, harvest_bytes = None, 0, 0
+    if rank:
+        u = jax.ShapeDtypeStruct((rank, *one.shape), jnp.complex128,
+            sharding=NamedSharding(mesh, P(None, *sh.X_full.spec)))
+        c = jax.ShapeDtypeStruct((rank, rank), jnp.complex128,
+                                sharding=NamedSharding(mesh, P()))
+        deflation = (u, c)
+        deflation_bytes = 16*(2*rank*nc*nv*nk//p + rank*rank)
+        arnoldi = max(LADDER_DEFLATION_ARNOLDI, 2*rank)
+        ex = _get_deflation_arnoldi(context["matvec"], one, n_arnoldi=arnoldi).lower(
+            one, diag, scalar, args).compile()
+        # Include the subsequent V[:m] -> U contraction and uploaded host
+        # factors beside the returned Arnoldi basis, not just its workspace.
+        harvest_bytes = compiled_new_bytes(ex) + deflation_bytes + 16*arnoldi*rank
+    ndefl = 1 if context["z_outer"] else context["nz"]
+    deflation_bytes *= ndefl
+    # Eager seed/project callers temporarily request ring-layout psi views.
+    # Price their additional carriers; the solve itself takes resting 2-D psi.
+    ring_bytes = sum(int(a.size*a.dtype.itemsize) //
+        int(mesh.shape["x" if key.endswith("_X") else "y"])
+        for key in _PSI_KEYS if isinstance((a := dq.get(key)), jax.Array))
+    figures = {}
+
+    def build(units):
+        chunk = int(units)*py
+        rhs = jax.ShapeDtypeStruct((2, chunk, *pair_shape), jnp.complex128,
+                                   sharding=sh.X_full)
+        readout = (rhs if physical else jax.ShapeDtypeStruct(
+            (chunk, *pair_shape), jnp.complex128, sharding=sh.X))
+        probes = jax.ShapeDtypeStruct((chunk, n_pad), jnp.float64, sharding=sh.S_k0)
+        seed_args = ((psi("psi_c_A_X", sh.psi_x), psi("psi_v_A_X", sh.psi_x))
+                     if physical else ())
+        seed = seed_program.lower(probes, psi("psi_c_X", sh.psi_x),
+                                  psi("psi_v_X", sh.psi_x), abstract(dq["V_q0"]),
+                                  *seed_args).compile()
+        solve = solver.lower(rhs, diag, scalar, args, deflation).compile()
+        project = (_get_branch_projection_program(context["snapshot"], sh)
+                   if physical else context["snapshot"])
+        project_args = ((psi("psi_c_A_Y", sh.psi_y), psi("psi_v_A_Y", sh.psi_y))
+                        if physical else ())
+        snap = project.lower(readout, psi("psi_c_Y", sh.psi_y),
+                             psi("psi_v_Y", sh.psi_y), v, *project_args).compile()
+        rhs_bytes = 32*chunk*nc*nv*nk//p
+        readout_bytes, tile_bytes = rhs_bytes if physical else rhs_bytes//2, 16*n_pad*chunk//p
+        snap_new = compiled_new_bytes(snap)
+        nread = 3 if slope else 1
+        moment_carry = 4*tile_bytes if moments else 0
+        costs = [8*chunk*n_pad//py + compiled_new_bytes(seed) + ring_bytes,
+                 rhs_bytes + moment_carry + compiled_new_bytes(solve),
+                 rhs_bytes + moment_carry + nread*readout_bytes +
+                 (nread-1)*tile_bytes + snap_new + ring_bytes]
+        if moments:
+            moment = context["moment_actions"].lower(rhs, args).compile()
+            costs.extend([rhs_bytes + compiled_new_bytes(moment),
+                          rhs_bytes + 4*readout_bytes + 3*tile_bytes + snap_new + ring_bytes])
+        if rank:
+            costs.append(rhs_bytes + moment_carry + one.size*16//p + harvest_bytes)
+        # All response matrices remain face-sharded. The facade also holds
+        # future completed rows and one non-donated column-placement output.
+        figures[int(units)] = max(int(stack_bytes),
+            int(carry_bytes + deflation_bytes + max(costs)))
+        return solve
+
+    per_probe = _probe_scaling_bytes(dq, mesh)
+    top = n_pad//py
+    units = min(top, int(requested)//py) if requested else tile_units(per_probe*py, top)
+    room = memory.room() if memory.run() else (1 << 30) + int(carry_bytes)
+    compiled = build(units)
+    extra = lambda count, ex: max(0, figures[count] - compiled_new_bytes(ex))
+    if requested:
+        price = -agreed_chunk(-figures[units])
+        memory.admit("BSE requested probe block", memory.priced(price,
+            "compiled seed/GMRES/snapshot/moments/Arnoldi and live carries"), room)
+    else:
+        price = -agreed_chunk(-figures[units])
+        fixed = max(int(stack_bytes), int(carry_bytes)+deflation_bytes)
+        per_unit = py*per_probe
+        if price > room and units > 1:
+            # A single wide-block price cannot separate its fixed Krylov
+            # workspace from its scaling outputs. Read the executable at the
+            # irreducible width only when needed, then fit that affine floor;
+            # otherwise check_chunk would wrongly scale the fixed workspace
+            # and could choose another over-budget width when a smaller fits.
+            minimum_compiled = build(1)
+            floor = -agreed_chunk(-figures[1])
+            if floor > room:
+                units, compiled, price = 1, minimum_compiled, floor
+            else:
+                measured_slope = max(0., (price-floor)/(units-1))
+                fixed, per_unit = max(fixed, floor-measured_slope), max(per_unit, measured_slope)
+                proposed = max(1, min(units-1, int((room-fixed)//max(per_unit, 1.))))
+                proposed_compiled = minimum_compiled if proposed == 1 else build(proposed)
+                proposed_price = -agreed_chunk(-figures[proposed])
+                if proposed_price <= room:
+                    units, compiled, price = proposed, proposed_compiled, proposed_price
+                else:
+                    # XLA can change schedules between widths: its temporary
+                    # size need not be affine. Never execute an over-budget
+                    # interpolation when an already-compiled width fits.
+                    memory.record_route("BSE automatic probe block", "mesh-y minimum",
+                        f"compiled width {proposed*py} exceeds room; measured minimum fits")
+                    units, compiled, price = 1, minimum_compiled, floor
+        choice = check_chunk(units, build=build, compiled=compiled,
+            fixed=fixed, per_unit=per_unit, room=room, extra=extra,
+            minimum=1, stage="BSE automatic probe block")
+        units, price = choice.chunk, choice.price
+    memory.book(memory.priced(price, "compiled ladder block and response carries", increment=True),
+                stage="bse.probe_block")
+    print(f"[w_ladder] {'requested' if requested else 'automatic'} probe chunk {units*py}/{n_pad}; "
+          f"compiled block+carry {price/1e9:.3f} GB/rank, room {room/1e9:.3f} GB/rank", flush=True)
+    return units*py
 
 
 def sweep_q_wedge(
@@ -522,7 +403,7 @@ def sweep_q_wedge(
     z_list_ry,
     *,
     include_w: bool,
-    probe_blocks_for_q: Callable[[int, tuple], Sequence],
+    probe_blocks_for_q: Callable[[int, tuple], Iterable],
     gmres_tol: float,
     gmres_max_iter: int,
     on_result: Callable,
@@ -531,6 +412,9 @@ def sweep_q_wedge(
     deflation_rank: Optional[int] = None,
     z_outer: bool = False,
     on_z_done: Optional[Callable] = None,
+    with_slope: bool = False,
+    with_moments: bool = False,
+    probe_chunk_plan: Optional[Callable] = None,
 ):
     """Walk the q-wedge x probe-chunk x z-list with ONE compiled engine.
 
@@ -550,7 +434,7 @@ def sweep_q_wedge(
     silently pays one full compile each time, because the block-GMRES cache is
     keyed on ``id(matvec)``.
 
-    ``probe_blocks_for_q(iq, q)`` returns a sequence of ``(c0, n_real, G)``:
+    ``probe_blocks_for_q(iq, q)`` returns an iterable of ``(c0, n_real, G)``:
     ``G`` is the ``(n_probe, n_rmu)`` probe block (``n_probe % py == 0``),
     ``n_real`` how many of its rows are live (the rest are zero pad), and ``c0``
     the caller's own offset, passed back untouched.
@@ -614,17 +498,9 @@ def sweep_q_wedge(
     # the finite-q ``V_q0``, so it genuinely is per-q.
     if route not in ("plain", "lift"):
         raise ValueError(f"route must be 'plain' or 'lift', got {route!r}")
-    # The ladder's anti-resonant channel is the conj-pattern TRS fold of the
-    # -q de-excitation space, exact only in the psi(-k) = conj(psi(k)) gauge
-    # — enforce it (pure basis choice; every gauge-invariant object is
-    # untouched, which is why the RPA arm below skips it and stays
-    # bit-identical).  Measured: without it the FIRST-PRINCIPLES dense ladder
-    # operator itself breaks W(-q) = conj(W(q)) at 1.043e-03 (2026-08-16).
-    # The gauge and the engine build are eager ring-layout stages; the
-    # payload goes back to 2-D below, after them.
+    # Explicit physical R/A states require no TRS gauge construction or
+    # host gathering. The old folded RPA path remains the control.
     data = _psi_ring_view(data)
-    if include_w:
-        data = enforce_trs_pair_gauge(data, mesh_xy)
     matvec, _, gen, snapshot, sh = build_ladder_resolvent(
         mesh_xy, data, include_w=include_w)
     # ROUTE A (the Woodbury ring lift), as two constant tiles and nothing else.
@@ -653,26 +529,22 @@ def sweep_q_wedge(
     z_list_ry = np.asarray(z_list_ry, dtype=np.complex128)
     if deflation_rank is None:
         deflation_rank = LADDER_DEFLATION_RANK if include_w else 0
-    op_fn = ladder_matvec_operands if include_w else matvec_operands
+    physical = bool(data.get("physical_branches", False))
+    op_fn = partial(ladder_matvec_operands if physical else matvec_operands,
+                    include_W=include_w)
+    moment_actions = (_get_block_moment_actions(matvec, sh, jnp.complex128,
+                                               retain_branches=physical)
+                      if with_moments else None)
     data = _psi_at_rest_2d(data, mesh_xy)
+    probe_planned = False
 
     def _q_payload(iq, qv):
         q = (int(qv[0]), int(qv[1]), int(qv[2]))
         dq = _psi_at_rest_2d(
-            build_finite_q_data(_psi_ring_view(data), q, mesh_xy), mesh_xy)
-        if include_w and "psi_c_W_X" not in dq:    # pragma: no cover
-            raise RuntimeError(
-                "sweep_q_wedge built a ladder_rung_slots engine but "
-                "build_finite_q_data stopped supplying the physical rung "
-                "operands (psi_*_W_*); the rung would fall back to the "
-                "conjugated density arrays (claim 0215's defect class).")
-        # The preconditioner reads the flipped psi arrays; the rung's diagonal
-        # is real (|psi_c|^2 W |psi_v|^2 with W_R real), so the flip is inert
-        # here and no compensation is needed.
-        # The lift's preconditioner is the SAME builder on the ring-less
-        # payload: with the ring gone the exchange contraction drops out and
-        # what is left is Delta_E - W_d (or Delta_E alone at include_w=False,
-        # where z - H_0 IS the operator and the solve is exact in ONE step).
+            build_finite_q_data(_psi_ring_view(data), q, mesh_xy,
+                                physical_branches=physical), mesh_xy)
+        # Each physical branch has its own exact diagonal. The lifted
+        # solve removes only the Hartree tile from that same operator.
         solve_dq = dict(dq)
         if lift:
             solve_dq["V_q0"] = zero_v
@@ -684,6 +556,15 @@ def sweep_q_wedge(
         return q, dq, solve_dq, diag_hq
 
     def _solve_blocks(iq, q, dq, solve_dq, diag_hq, z_items):
+        nonlocal probe_planned
+        if probe_chunk_plan is not None and not probe_planned:
+            probe_chunk_plan(dict(data=dq, sh=sh, mesh=mesh_xy, matvec=matvec,
+                gen=gen, snapshot=snapshot, diag=diag_hq, operands=op_fn(solve_dq),
+                snapshot_v=(eye_v if lift else None), deflation_rank=deflation_rank,
+                max_iter=gmres_max_iter, tol=gmres_tol, with_slope=with_slope,
+                with_moments=with_moments, moment_actions=moment_actions,
+                z_outer=z_outer, nz=len(z_list_ry)))
+            probe_planned = True
         # One deflation space per (q, z), harvested on the first probe block
         # and reused by every later block: the operator does not depend on
         # the probe, so the eigenvectors every column pays for are found once.
@@ -704,13 +585,17 @@ def sweep_q_wedge(
             # 2026-08-16) — and free on the ladder arm, where the matvec
             # dwarfs it.
             rhs = build_probe_rhs(G, _psi_ring_view(dq), gen, sh)
+            moments = {}
+            if with_moments and any(iz == 0 for iz, _z in z_items):
+                moments = _project_screening_actions(
+                    moment_actions(rhs, op_fn(dq)), dq, snapshot, view=_psi_ring_view)
             for iz, z in z_items:
                 if deflation_rank > 0 and iz not in defl_by_z:
                     defl_by_z[iz] = _deflation_for(
                         matvec, diag_hq, complex(z),
                         op_fn(solve_dq if lift else dq), rhs,
                         rank=int(deflation_rank))
-                W_tile, resids, iters = apply_screening_resolvent_block(
+                result = apply_screening_resolvent_block(
                     G, complex(z), dq, matvec, diag_hq, gen, snapshot, sh,
                     max_iter=gmres_max_iter, tol=gmres_tol, return_iters=True,
                     rhs=rhs,
@@ -718,9 +603,17 @@ def sweep_q_wedge(
                     snapshot_v=(eye_v if lift else None),
                     operands_fn=op_fn,
                     deflation=defl_by_z.get(iz),
-                    view=_psi_ring_view)
-                on_result(iq, q, iz, complex(z), c0, n_real,
-                          W_tile, resids, iters)
+                    view=_psi_ring_view, with_slope=with_slope)
+                W_tile, resids, iters = result[:3]
+                if with_slope or with_moments:
+                    fields = dict(result[3]) if with_slope else {}
+                    if iz == 0:
+                        fields.update(moments)
+                    on_result(iq, q, iz, complex(z), c0, n_real,
+                              W_tile, resids, iters, fields)
+                else:
+                    on_result(iq, q, iz, complex(z), c0, n_real,
+                              W_tile, resids, iters)
 
     if z_outer:
         for iz, z in enumerate(z_list_ry):
@@ -738,7 +631,8 @@ def sweep_q_wedge(
 
 #: The psi carriers of the ring matvec payload: band axis 1, mu last.
 _PSI_KEYS = ("psi_c_X", "psi_c_Y", "psi_v_X", "psi_v_Y",
-             "psi_c_W_X", "psi_c_W_Y", "psi_v_W_X", "psi_v_W_Y")
+             "psi_c_W_X", "psi_c_W_Y", "psi_v_W_X", "psi_v_W_Y",
+             "psi_c_A_X", "psi_c_A_Y", "psi_v_A_X", "psi_v_A_Y")
 
 
 def _psi_at_rest_2d(d: dict, mesh_xy: Mesh) -> dict:
@@ -836,6 +730,70 @@ def _deflation_for(matvec, diag_h, z, operands, rhs, *, rank: int):
     return defl
 
 
+def prepare_ladder_head(restart_path, mesh_xy, *, input_file, head_dipole_path,
+                        head_n_occ, include_w=True, data=None):
+    """Prepare the one Gamma operator and dipole for a streamed head solve.
+
+    Returns the existing operator, runtime payload, dipole and its transition
+    energies. A caller refining frequency supports retains these locally,
+    instead of loading/rebuilding the same wavefunctions and W_R per batch.
+    No payload is placed in a module cache. A no-rung RPA operator requests
+    bare interactions only; it never reads or rebuilds a screened W0.
+    """
+    if data is None:
+        data = load_bse_data_from_restart_sharded(
+            restart_path, n_val=10**9, n_cond=10**9, mesh_xy=mesh_xy,
+            input_file=input_file, inject_head=False, inject_w_head=include_w,
+            q0_head="diagonal", load_v_full=False, native_grid_only=True,
+            need_W=include_w)
+        # This Gamma-only payload is owned here. Supplied data is borrowed,
+        # including a body's already prepared W_R, and is never donated here.
+        if include_w:
+            ensure_W_R(data, True, mesh_xy, consume_W_q=True)
+    from .absorption_common import (slice_dipole_to_bse_window)
+    from file_io.restart_bundle import (load_dipole_h5)
+    from .head_resolvent import build_head_dipole, build_head_operator
+
+    from .bse_window import _parse_wfn_path
+    dipole_cart, delta_e, _ = load_dipole_h5(
+        head_dipole_path, wfn_path=_parse_wfn_path(input_file))
+    n_val = int(data["n_val"])
+    n_cond = int(data["n_cond"])
+    d_alpha, delta_cv = slice_dipole_to_bse_window(
+        dipole_cart, delta_e, int(head_n_occ), n_val, n_cond)
+    velocity_cv = np.asarray(d_alpha) * np.asarray(delta_cv)[None]
+    d_pair = build_head_dipole(
+        velocity_cv, delta_cv,
+        n_cond_pad=int(data["n_cond_pad"]),
+        n_val_pad=int(data["n_val_pad"]))
+    head_data = build_finite_q_data(_psi_ring_view(data), (0, 0, 0), mesh_xy,
+                                    physical_branches=True)
+    head_op = build_head_operator(mesh_xy, head_data, include_w=include_w)
+    return head_op, head_data, d_pair, delta_cv
+
+
+def compute_ladder_head(
+    restart_path, z_list_ry, mesh_xy, *, input_file, head_dipole_path,
+    head_n_occ, head_pref, gmres_tol, gmres_max_iter, include_w=True, data=None,
+    with_slope=False, with_moments=False,
+):
+    """Gamma-only micro-reducible tensor on the body's exact H backend.
+
+    The same full transition-window loader supplies the operator; a prepared
+    head can instead be retained across refinements by the head-fit owner.
+    """
+    from .head_resolvent import solve_head_tensor
+    head_op, head_data, d_pair, delta_cv = prepare_ladder_head(
+        restart_path,mesh_xy,input_file=input_file,head_dipole_path=head_dipole_path,
+        head_n_occ=head_n_occ,include_w=include_w,data=data)
+    return solve_head_tensor(
+        head_op, head_data, d_pair, z_list_ry, pref=float(head_pref),
+        max_iter=int(gmres_max_iter), tol=float(gmres_tol),
+        arm=("micro_reducible_bse" if include_w
+             else "micro_reducible_rpa_resolvent"),
+        delta_cvk=delta_cv, with_slope=with_slope, with_moments=with_moments)
+
+
 def compute_wc_qwedge(
     restart_path: str,
     z_list_ry,
@@ -853,6 +811,8 @@ def compute_wc_qwedge(
     head_pref: Optional[float] = None,
     deflation_rank: Optional[int] = None,
     on_z: Optional[Callable] = None,
+    with_slope: bool = False,
+    with_moments: bool = False,
 ) -> WLadderWedge:
     """Ladder ``W(z) - v`` bodies for every irreducible q and every requested z.
 
@@ -865,15 +825,31 @@ def compute_wc_qwedge(
     ``(nz, nq, mu, mu)`` stack, and the returned wedge carries ``wc=None``.
     psi rests 2-D (:func:`sweep_q_wedge`).
 
+    ``with_slope`` supplies exact ``dWc_ds`` (Ry^-1, s=z_Ry^2) and
+    ``Wc_minus_z`` (Ry) for an independent evenness check. ``with_moments``
+    computes M0..M3 once per q through the same full H (units Ry^(j+2));
+    M0/M2 certify vanishing odd-in-z coefficients and M1/M3 feed the model.
+    The caller must check these raw fields; none is Hermitized or projected.
+    With either flag, ``on_z`` receives a sixth dictionary of face-sharded
+    ``(nq_irr, mu_pad, mu_pad)`` fields. M0..M3 are supplied at the first z
+    only and then released. Without streaming the
+    returned ``response_fields`` carries all requested values (slopes and
+    reflected values have a leading z axis). Streaming retains no response
+    matrices in the return. Residual/iteration outputs cover every shifted solve.
+    These actions require the full operator, so ``route='auto'`` chooses
+    ``plain`` and an explicitly requested ring lift refuses.
+
     The facade the GW stage helper calls.  ``z_list_ry`` are complex Rydberg
     frequencies (cohsex: ``{0}``; gn_ppm: ``{0, i w_p}``; mpa: its sample plan);
     the result is a :class:`WLadderWedge`.
 
     ``probe_chunk`` is the memory knob: columns of the mu^2 tile solved per
-    block, defaulting to the whole (padded) basis in one block.  It must be a
+    block. None chooses a bounded width from the common tile policy, then
+    checks the executed programs and carries against the run's memory room.
+    A positive request is honored and priced. The carrier must be a
     multiple of ``py`` because the reduce-scatter snapshot tiles the probe axis
-    over ``y``.  Chunking costs one extra dispatch per chunk and nothing else —
-    the compiled engine is shared, since ``n_probe`` is the only shape that
+    over ``y``. Chunking trades stage dispatches for memory; the operator and
+    solver tolerance are unchanged. The compiled engine is shared, since ``n_probe`` is the only shape that
     changes and a chunked sweep uses ONE ``n_probe`` for all chunks except a
     final short one (which is zero-padded up, not re-shaped).
 
@@ -934,7 +910,14 @@ def compute_wc_qwedge(
     # problem than the W_R kernel it is fed (band-window parity, bse_w_exact.main).
     data = load_bse_data_from_restart_sharded(
         restart_path, n_val=10**9, n_cond=10**9, mesh_xy=mesh_xy,
-        input_file=input_file, inject_head=False, load_v_full=True)
+        input_file=input_file, inject_head=False, inject_w_head=include_w,
+        q0_head="diagonal", load_v_full=True, native_grid_only=True,
+        need_W=include_w)
+    # The public facade owns this restart read; no caller can retain W_q.
+    # Per-q diagonals and the optional later head share the small saved q=0
+    # slice and this one W_R instead of keeping both all-q representations.
+    if include_w:
+        ensure_W_R(data, True, mesh_xy, consume_W_q=True)
     data = _psi_at_rest_2d(data, mesh_xy)
 
     head_args = (head_dipole_path, head_n_occ, head_pref)
@@ -949,7 +932,6 @@ def compute_wc_qwedge(
     q_list = np.asarray(sym.q_irr_kgrid_int, dtype=int)
     n_pad = int(data["V_q0"].shape[0])
     nlog = int(data["n_rmu"])
-    eye = _identity_probe_block(n_pad)
     chunk = n_pad if probe_chunk is None else min(int(probe_chunk), n_pad)
 
     # Probe block ROWS are the probe columns (apply_screening_resolvent_block
@@ -972,24 +954,26 @@ def compute_wc_qwedge(
     # The same reasoning covers the zero ROWS of a short final chunk: their
     # columns are NaN inside ``W_tile`` and ``_accumulate_columns`` takes only
     # the first ``n_real``.
-    blocks = []
-    for c0 in range(0, nlog, chunk):
-        n_real = min(chunk, nlog - c0)
-        G = np.zeros((chunk, n_pad), dtype=np.float64)
-        G[:n_real, :] = eye[c0:c0 + n_real, :]
-        blocks.append((c0, n_real, G))
-
     nz, nq = int(z_list_ry.size), int(len(q_list))
     tiles = [[None] * nq for _ in range(nz)]
     resid = np.zeros((nz, nq, n_pad), dtype=np.float64)
     iters = np.zeros((nz, nq, n_pad), dtype=np.int32)
+    response_tiles = ({name: [[None] * nq for _ in range(nz)]
+                       for name in ("dWc_ds", "Wc_minus_z")} if with_slope else {})
+    moment_tiles = ({name: [None] * nq for name in ("M0", "M1", "M2", "M3")}
+                    if with_moments else {})
+    moment_fields = {}
 
     if route not in ("auto", "plain", "lift"):
         raise ValueError(
             f"route must be 'auto', 'plain' or 'lift', got {route!r}")
     n_dev = int(np.prod(mesh_xy.devices.shape))
     if route == "auto":
-        route = "lift" if (n_dev == 1 or allow_replicated_dyson) else "plain"
+        route = ("lift" if not (with_slope or with_moments)
+                 and (n_dev == 1 or allow_replicated_dyson) else "plain")
+    if route == "lift" and (with_slope or with_moments):
+        raise ValueError("Response slopes/moments require route='plain': they are "
+                         "actions of the full H, including its Hartree ring.")
     if route == "lift" and n_dev > 1 and not allow_replicated_dyson:
         raise NotImplementedError(
             f"route='lift' closes with jnp.linalg.solve on the N_mu x N_mu "
@@ -1001,11 +985,30 @@ def compute_wc_qwedge(
             f"accept the per-rank N_mu^2 tile the RPA Dyson's own DEFAULT "
             f"('local') plan already holds, or route='plain'/'auto'.")
 
-    def _on_result(iq, q, iz, z, c0, n_real, W_tile, resids, its):
+    def plan_probes(context):
+        nonlocal chunk
+        # Reserve the full future result even though first-q planning happens
+        # before any of its rows exist. Stack/placement copies are separate
+        # lifetimes; do not sum their peaks with a live GMRES workspace.
+        face = 16*n_pad*n_pad//n_dev
+        bank_fields = nq*((1+2*int(with_slope))*(1 if on_z is not None else nz)
+                          + 4*int(with_moments) + int(route == "lift"))
+        chunk = _plan_probe_chunk(context, probe_chunk, n_pad=n_pad,
+            carry_bytes=(bank_fields+1)*face,
+            stack_bytes=((bank_fields+nq) if on_z is not None else 3*bank_fields)*face)
+
+    def _on_result(iq, q, iz, z, c0, n_real, W_tile, resids, its, fields=None):
         tiles[iz][iq] = _accumulate_columns(
             tiles[iz][iq], W_tile, c0, n_real, n_pad, mesh_xy)
         resid[iz, iq, c0:c0 + n_real] = np.asarray(gather_to_host(resids))[:n_real]
         iters[iz, iq, c0:c0 + n_real] = np.asarray(gather_to_host(its))[:n_real]
+        for name, value in (fields or {}).items():
+            if name in moment_tiles:
+                moment_tiles[name][iq] = _accumulate_columns(
+                    moment_tiles[name][iq], value, c0, n_real, n_pad, mesh_xy)
+            else:
+                response_tiles[name][iz][iq] = _accumulate_columns(
+                    response_tiles[name][iz][iq], value, c0, n_real, n_pad, mesh_xy)
 
     # The lift's closing Dyson needs each q's OWN ``v`` tile, which only the
     # q-shifted payload carries; ``build_hook`` is the sweep's existing seam
@@ -1013,6 +1016,13 @@ def compute_wc_qwedge(
     v_by_q: dict = {}
 
     wedge_sh = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+
+    def _stack_rows(rows):
+        value = jax.lax.with_sharding_constraint(
+            jnp.stack(rows, axis=0).astype(jnp.complex128),
+            NamedSharding(mesh_xy, P(None, "x", "y")))
+        _assert_pad_block_is_zero(value, nlog)
+        return value
 
     def _on_z_done(iz, z):
         row = tiles[iz]
@@ -1026,17 +1036,34 @@ def compute_wc_qwedge(
         tiles[iz] = None
         del row
         _assert_pad_block_is_zero(wc_z, nlog)
-        on_z(iz, z, wc_z, resid[iz], iters[iz])
+        if with_slope or with_moments:
+            fields = {}
+            for name, by_z in response_tiles.items():
+                fields[name] = _stack_rows(by_z[iz])
+                by_z[iz] = None
+            if iz == 0:
+                for name in tuple(moment_tiles):
+                    rows = moment_tiles.pop(name)
+                    moment_fields[name] = _stack_rows(rows)
+                    del rows
+            fields.update(moment_fields)
+            on_z(iz, z, wc_z, resid[iz], iters[iz], fields)
+            if iz == 0:
+                moment_fields.clear()
+        else:
+            on_z(iz, z, wc_z, resid[iz], iters[iz])
 
     sweep_q_wedge(
         data, mesh_xy, q_list, z_list_ry, include_w=include_w,
-        probe_blocks_for_q=lambda _iq, _q: blocks,
+        probe_blocks_for_q=lambda _iq, _q: _identity_probe_blocks(nlog, n_pad, chunk),
         gmres_tol=gmres_tol, gmres_max_iter=gmres_max_iter,
         on_result=_on_result, route=route, deflation_rank=deflation_rank,
         build_hook=((lambda iq, q, dq: v_by_q.__setitem__(iq, dq["V_q0"]))
                     if route == "lift" else None),
         z_outer=on_z is not None,
-        on_z_done=(_on_z_done if on_z is not None else None))
+        on_z_done=(_on_z_done if on_z is not None else None),
+        with_slope=with_slope, with_moments=with_moments,
+        probe_chunk_plan=plan_probes)
 
     if on_z is not None:
         wc = None
@@ -1058,33 +1085,19 @@ def compute_wc_qwedge(
         wc = jax.lax.with_sharding_constraint(
             stacked.astype(jnp.complex128), wedge_sh)
         _assert_pad_block_is_zero(wc, nlog)
+    response_fields = None
+    if (with_slope or with_moments) and on_z is None:
+        response_fields = {name: _stack_rows(rows) for name, rows in moment_tiles.items()}
+        for name, by_z in response_tiles.items():
+            response_fields[name] = jax.lax.with_sharding_constraint(
+                jnp.stack([_stack_rows(rows) for rows in by_z], axis=0), wedge_sh)
     head_result = None
     if head_dipole_path is not None:
-        from .absorption_common import (slice_dipole_to_bse_window)
-        from file_io.restart_bundle import (load_dipole_h5)
-        from .head_resolvent import (
-            build_head_dipole, build_head_operator, solve_head_tensor)
-
-        from .bse_window import _parse_wfn_path
-        dipole_cart, delta_e, _ = load_dipole_h5(
-            head_dipole_path, wfn_path=_parse_wfn_path(input_file))
-        n_val = int(data["n_val"])
-        n_cond = int(data["n_cond"])
-        d_alpha, delta_cv = slice_dipole_to_bse_window(
-            dipole_cart, delta_e, int(head_n_occ), n_val, n_cond)
-        velocity_cv = np.asarray(d_alpha) * np.asarray(delta_cv)[None]
-        d_pair = build_head_dipole(
-            velocity_cv, delta_cv,
-            n_cond_pad=int(data["n_cond_pad"]),
-            n_val_pad=int(data["n_val_pad"]))
-        head_data = _psi_ring_view(data)
-        head_op = build_head_operator(mesh_xy, head_data, include_w=include_w)
-        head_result = solve_head_tensor(
-            head_op, head_data, d_pair, z_list_ry, pref=float(head_pref),
-            max_iter=int(gmres_max_iter), tol=float(gmres_tol),
-            arm=("micro_reducible_bse" if include_w
-                 else "micro_reducible_rpa_resolvent"),
-            delta_cvk=delta_cv)
+        head_result = compute_ladder_head(
+            restart_path, z_list_ry, mesh_xy, input_file=input_file,
+            head_dipole_path=head_dipole_path, head_n_occ=head_n_occ,
+            head_pref=head_pref, gmres_tol=gmres_tol,
+            gmres_max_iter=gmres_max_iter, include_w=include_w, data=data)
     return WLadderWedge(
         wc=wc,
         n_rmu=nlog,
@@ -1097,6 +1110,7 @@ def compute_wc_qwedge(
         gmres_iters=iters,
         include_w=bool(include_w),
         head_result=head_result,
+        response_fields=response_fields,
     )
 
 

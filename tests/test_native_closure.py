@@ -11,13 +11,153 @@ a launch library naming the wrong file).
 from __future__ import annotations
 
 import importlib.util
+import io
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+from types import SimpleNamespace
 
 import pytest
 
 from lxkit import native_provider as npv
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+def test_rocm_acceptance_uses_exact_recorded_files_in_a_cold_process(tmp_path, monkeypatch):
+    """No shell RPATH can find this MPI; production preloads must find it.
+
+    This tiny ELF fixture tests the loader/verifier protocol, not GPU kernels.
+    A conflicting live provider, stale/missing record and wrong ABI must refuse.
+    """
+    compiler = shutil.which("cc")
+    if compiler is None or not sys.platform.startswith("linux"):
+        pytest.skip("the cold ELF acceptance fixture needs Linux and a C compiler")
+    providers = tmp_path / "providers"
+    providers.mkdir()
+    mpi = providers / "libmpi_gnu_123.so.12"
+    abi = int((REPO / "src/ffi/cpp/common/lorrax_ffi_abi.h").read_text().split(
+        "#define LORRAX_FFI_ABI_VERSION ")[1].split()[0])
+
+    def build(path, body, extra=()):
+        source = path.with_suffix(".c")
+        source.write_text(body)
+        subprocess.run([compiler, "-shared", "-fPIC", str(source),
+                        "-Wl,-soname," + path.name, "-o", str(path), *extra], check=True)
+
+    build(mpi, "int fixture_mpi(void) { return 17; }")
+    build(providers / "librccl.so.1", "int fixture_rccl(void) { return 1; }")
+    blas = providers / "libopenblas.so.0"
+    build(blas, "int fixture_blas(void) { return 1; }")
+    build(providers / "librocblas.so.5", "int fixture_gpu_blas(void) { return 1; }")
+    elpa = providers / "libelpa.so.21"
+    build(elpa, "extern int fixture_blas(void), fixture_gpu_blas(void); "
+                "int fixture_elpa(void) { return fixture_blas()+fixture_gpu_blas(); }",
+          [str(blas), str(providers / "librocblas.so.5")])
+    leg = tmp_path / "liblorrax_ffi_rocm.so"
+    build(leg, f'''extern int fixture_mpi(void), fixture_elpa(void);
+        int lorrax_ffi_rocm_abi_version(void) {{ return {abi}; }}
+        const char *lorrax_ffi_rocm_build_config(void) {{
+            return "leg=rocm abi={abi} phdf5=1";
+        }}
+        int PhdfFixtureFfi(void) {{ return fixture_mpi()+fixture_elpa(); }}
+        void ElpaFixtureFfi(void) {{}}
+        void KDftFixtureFfi(void) {{}}
+        ''', [str(mpi), str(elpa)])
+    writer = _writer()
+    monkeypatch.setattr(writer, "plugin_dirs", lambda *a: [])
+    assert writer.main([str(leg), "--process-dir", str(providers)]) == 0
+    env = dict(os.environ, LORRAX_ROOT=str(REPO),
+               LORRAX_GATE_FFTW_PY=sys.executable,
+               LORRAX_FFI_VERIFY_STRICT="1", LORRAX_FFI_EXPECT_MPI=mpi.name)
+    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LORRAX_FFI_VERIFY_ENV",
+                "LORRAX_FFI_EXPECT_PEER_SO", "LORRAX_FFI_VERIFY",
+                "LORRAX_PHDF5_STAGE", "LORRAX_GATE_ONE_HDF5"):
+        env.pop(key, None)
+    unresolved = subprocess.run(["ldd", str(leg)], env=env, capture_output=True, text=True)
+    assert f"{mpi.name} => not found" in unresolved.stdout
+    receipt = tmp_path / "live.tsv"
+    probe = REPO / "scripts/verify_ffi_runtime.py"
+    # The fresh child also proves that this acceptance path never imports JAX.
+    code = ("import runpy,sys; m=runpy.run_path(sys.argv[1]); "
+            "rc=m['main'](sys.argv[2:]); assert 'jax' not in sys.modules; sys.exit(rc)")
+    command = [sys.executable, "-c", code, str(probe), str(leg),
+               "--abi", str(abi), "--map-file", str(receipt)]
+    good = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert good.returncode == 0, good.stdout + good.stderr
+    assert f"{mpi.name}\t{mpi.resolve()}\n" in receipt.read_text()
+    verify = ["bash", str(REPO / "scripts/verify_ffi_build.sh"), "--leg", "rocm", str(leg)]
+    accepted = subprocess.run(verify, env=env, capture_output=True, text=True)
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert "every gate ran and passed" in accepted.stdout
+    assert "backend 'elpa'" in accepted.stdout
+    numpy_blas = providers / "libscipy_openblas64_fixture.so"
+    build(numpy_blas, "int fixture_numpy_blas64(void) { return 1; }")
+    private_blas = subprocess.run(verify, env={**env, "LD_PRELOAD": str(numpy_blas)},
+                                  capture_output=True, text=True)
+    assert private_blas.returncode == 0, private_blas.stdout + private_blas.stderr
+    # ELPA's OpenBLAS build is authenticated by its build/closure owner;
+    # the removed SLATE-specific runtime gate 3d is no longer this protocol.
+    wrong_mpi = subprocess.run(verify, env={**env, "LORRAX_FFI_EXPECT_MPI": "libmpi_gnu.so.12"},
+                               capture_output=True, text=True)
+    assert wrong_mpi.returncode != 0 and "GATE FAILED (1)" in wrong_mpi.stderr
+
+    def refused(cmd=command, child_env=env):
+        receipt.write_text("stale successful receipt")
+        result = subprocess.run(cmd, env=child_env, capture_output=True, text=True)
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert not receipt.exists()
+        return result.stdout + result.stderr
+
+    assert "ABI MISMATCH" in refused([*command[:-3], str(abi + 1), *command[-2:]])
+    other = tmp_path / "other" / mpi.name
+    other.parent.mkdir()
+    build(other, "int fixture_mpi(void) { return 23; }")
+    assert "copies of" in refused(child_env={**env, "LD_PRELOAD": str(other)})
+    record = npv.closure_record_path(leg)
+    saved = record.read_bytes()
+    record.unlink()
+    assert "closure" in refused()
+    record.write_bytes(saved)
+    mpi.write_bytes(mpi.read_bytes() + b"changed after build")
+    assert "stale closure record" in refused()
+
+
+def test_mapped_paths_deduplicates_segments_before_resolving_aliases(tmp_path, monkeypatch):
+    first, second = tmp_path / "libfirst.so", tmp_path / "libsecond.so"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    alias = tmp_path / "libalias.so"
+    alias.symlink_to(first)
+    raw_paths = [str(first)] * 5 + [str(alias)] * 4 + [str(second)] * 3
+    rows = [f"1000-2000 r--p 0000 00:00 1 {path}\n" for path in raw_paths]
+    rows += [f"1000-2000 r--p 0000 00:00 1 {second} (deleted)\n",
+             "1000-2000 rw-p 0000 00:00 0 [heap]\n"]
+    maps_text = ["".join(rows)]
+    realpath = npv.os.path.realpath
+    calls = []
+
+    def resolve(path):
+        calls.append(path)
+        return realpath(path)
+
+    previous = {Path(resolve(line.rsplit(maxsplit=1)[-1]))
+                for line in rows if "/" in line and not line.rstrip().endswith(" (deleted)")}
+    assert len(calls) == 12
+    calls.clear()
+    monkeypatch.setattr(npv, "open", lambda *a, **k: io.StringIO(maps_text[0]), raising=False)
+    monkeypatch.setattr(npv, "os", SimpleNamespace(path=SimpleNamespace(realpath=resolve)))
+    assert npv._mapped_paths() == previous == {first, second}
+    assert sorted(calls) == sorted({str(first), str(alias), str(second)})
+    # The next scan resolves again, including a symlink changed in between.
+    alias.unlink()
+    alias.symlink_to(second)
+    maps_text[0] = "".join(f"1000-2000 r--p 0000 00:00 1 {alias}\n" for _ in range(4))
+    calls.clear()
+    assert npv._mapped_paths() == {second}
+    assert calls == [str(alias)]
 
 
 class _Unusable(OSError):

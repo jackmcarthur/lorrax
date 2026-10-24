@@ -3246,6 +3246,8 @@ class IterationHeadSamples:
     sigma_energies_ry: np.ndarray
     sigma_occupations: np.ndarray
     efermi_ry: float
+    #: A separately certified scalar resolvent model; legacy/RPA callers leave None.
+    scalar_model: dict | None = None
 
     def at(self, omega):
         z = complex(omega)

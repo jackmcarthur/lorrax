@@ -23,20 +23,21 @@ active Sigma ansatz already asks for -- the SAME
 Nothing about the role set, the Sigma dispatch or any Sigma kernel
 changes; only which W satisfies the request does.
 
-THE STAGE IS TWO-STAGE BY CONSTRUCTION, NOT BY ACCIDENT.  The ladder
-kernel's ``W_R`` IS the RPA ``W(0)``.  So this module
+THE STAGE IS TWO-STAGE BY CONSTRUCTION, NOT BY ACCIDENT. The ladder uses
+the RPA ``W(0)``: ``W_R`` carries its dense body and the shared exact optical
+diagonal carries its static screened transfer-Gamma head. So this module
 
   1. runs the ordinary RPA static leg (``compute_static_w(role="static")``),
   2. persists it into the ISDF restart file (``persist_w0_and_head``) and
      VERIFIES the file is loadable before anything reads it,
   3. hands that restart path to the BSE ladder facade
-     (``bse.w_ladder.compute_wc_qwedge``), which returns head-less
-     ``W(z) - v`` bodies on the q wedge,
+     (``bse.w_ladder.compute_wc_qwedge``), which returns ``W(z) - v`` bodies
+     on the q wedge with the external macroscopic channel omitted,
   4. adds ``v`` back and holds the result as the SAME wedge
      ``symmetry_maps.QirrOperator`` the RPA path returns (the
      ``gw.v_q_g_flat.q_wedge`` tables, q/-q rows paired through the shared
-     TRS policy; the v1 ladder has a TRS gauge but not arbitrary
-     spatial-gauge covariance), gates it, and returns ``{role: W_q}``; the
+     TRS policy and the explicit physical resonant/antiresonant branches),
+     gates it, and returns ``{role: W_q}``; the
      Sigma convolutions unfold it on load, as they do the RPA W.
 
 PERSIST-BEFORE-LOAD IS THE ORDERING CONSTRAINT OF THE WHOLE FEATURE, and
@@ -48,9 +49,11 @@ LADDER W, and stamping that into ``W0_qmunu`` would put a different
 operator under a dataset every downstream consumer reads as the RPA
 static W.
 
-THE q=0 HEAD RIDES THE SAME RESOLVENT.  The singular macroscopic slot is not
-inside ``W_q``: the body facade therefore solves three dipole right-hand
-sides on the identical full-window, full-2N operator and returns ``Xi_ab``.
+THE EXTERNAL q=0 HEAD RIDES THE SAME RESOLVENT. The singular macroscopic slot
+is absent from the returned body; the operator still retains the internal
+static screened transfer-Gamma head. The body facade solves three dipole
+right-hand sides on the identical full-window, full-2N operator and returns
+``Xi_ab``.
 That tensor is already micro-reducible because the finite-G Hartree/ring term
 is in the operator.  ``head_correction=full`` restores only the omitted
 macroscopic bare-v channel through the mini-BZ reduction; applying the RPA
@@ -535,7 +538,8 @@ def prepare_ladder_restart(
     reads its copy back off disk, which is the point of the persist.
 
     THE PERSIST IS UNCONDITIONAL ON THIS BRANCH, INCLUDING UNDER
-    ``compute_mode = mpa``.  The driver's own flush skips MPA because
+    the shared-pole full-frequency route. The driver's ordinary flush skips
+    this route because
     ``persist_w0_and_head``'s ``{0, probe}`` head grid is not MPA's sample
     set -- a real refusal, kept.  What this branch writes is not MPA's
     sample set either: it is the ONE static RPA W(0) the ladder kernel
@@ -556,10 +560,9 @@ def prepare_ladder_restart(
         raise ValueError(
             f"GATE {diagram_name}_head_placement_unimplemented: "
             f"head_channel got: {type(head_channel).__name__}; want: None "
-            "from mc_average_placement = off; why: v1 keeps the q=0 "
-            "head/wing channel RPA and "
-            f"the resolvent replaces the body only; a post-solve head "
-            f"rescale is a second opinion about the same channel.  Fix the "
+            "from mc_average_placement = off; why: the physical ladder "
+            "head already includes the finite-G response, and a second "
+            "post-solve head rescale has no derived composition. Fix the "
             f"parse gate, do not serve this here.")
 
     # THE TWO PRECONDITION BLOCKS, in cost order.  The occupation gate runs
@@ -603,10 +606,16 @@ def prepare_ladder_restart(
             config=config, mesh=mesh_xy, requests=[static_request],
             W_by_role={"static": W0_rpa})
     with timing.section("gw_jax.persist_w0"):
+        # W0 and its head were produced by the ordinary static RPA owners.
+        # The dynamic bank remains W_BSE; its input rung must record RPA.
+        from dataclasses import replace
+        from .gw_config import ScreeningDiagrams
+        rpa_config = replace(config, screening=replace(
+            config.screening, diagrams=ScreeningDiagrams.W_RPA))
         persist_w0_and_head(
             W0_rpa, tensors_filename=tensors_filename,
             head_resolver=head_resolver, iteration_head=rpa_iteration_head,
-            config=config, meta=meta,
+            config=rpa_config, meta=meta,
             mesh_xy=mesh_xy, sym=sym, centroid_indices=centroid_indices,
             static_head_only=True, print_fn=print_fn)
     _assert_restart_is_loadable(tensors_filename, include_w=include_w,
@@ -666,7 +675,7 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
     # fully relativistic LiF 666-centroid deck (JID 57288835), against a
     # measured gate-preserving probe_chunk=64 discriminator on the same
     # deck (JID 57280453).  The deck key is ``ladder_probe_chunk``
-    # (ScreeningConfig); 0 keeps the whole-basis block, bit-identical.
+    # (ScreeningConfig); 0 lets the backend choose and compile-check a bounded tile.
     # The kernel's contract requires a multiple of the mesh 'y' extent
     # (the reduce-scatter snapshot tiles the probe axis over 'y'), so a
     # positive deck value is ROUNDED UP here — a placement change, never a

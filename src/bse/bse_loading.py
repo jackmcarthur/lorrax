@@ -124,7 +124,9 @@ def load_bse_data_from_restart_sharded(
     cell_volume: Optional[float] = None,
     n_occ: Optional[int] = None,
     inject_head: bool = True,
+    inject_w_head: bool | None = None,
     load_v_full: bool = False,
+    native_grid_only: bool = False,
     kgrid_fine=None,
     w_head_densify=None,
     w_head_gamma_cell: str = "fine",
@@ -173,6 +175,10 @@ def load_bse_data_from_restart_sharded(
     ``None`` the value is read from the cohsex.in ``kgrid_fine`` key (via
     ``input_file``); unset or == the coarse grid → the coarse bundle is
     returned byte-identically (fast path untouched).
+    ``native_grid_only=True`` loads the restart grid without consulting BSE
+    fine-grid/shift settings. The GW density ladder uses this to preserve
+    the native GW response grid even when the deck also configures a later
+    interpolated optical calculation. Optical readers keep the default False.
 
     ``eqp_file`` (``eqp_corrections``) enters the htransform on the densified path, so
     the fine ε are quasiparticle; ``data["densified"]`` tells the caller
@@ -200,6 +206,10 @@ def load_bse_data_from_restart_sharded(
     stored on disk (the rank-1 q=0 head from vhead/whead is NOT added). Used by
     body-vs-body diagnostics such as the W(0) resolvent cross-check, where both
     sides must be head-less (bse_w_exact ``--compare-w0``).
+    ``inject_w_head`` independently selects the screened direct head; None
+    inherits ``inject_head``. A density ladder uses False/True to omit the
+    external macroscopic Hartree head while retaining its internal static
+    direct head. Explicit True requires a resolved screened head and volume.
 
     ``load_v_full=True`` additionally reads the FULL exchange tensor
     ``V_qmunu`` at every q as ``data['V_q_full']`` (μ, ν, nkx, nky, nkz),
@@ -211,6 +221,9 @@ def load_bse_data_from_restart_sharded(
     """
     if mesh_xy is None:
         raise ValueError("mesh_xy is required for sharded load")
+    if native_grid_only and kgrid_fine is not None:
+        raise ValueError("native_grid_only=True does not accept an explicit kgrid_fine; "
+                         "choose the native restart grid or an optical fine grid")
 
     from common.collectives import _require_addressable
     _require_addressable(mesh_xy, origin="BSE restart reader")
@@ -245,8 +258,8 @@ def load_bse_data_from_restart_sharded(
     # injection, because C1 (the default) hands the densifier the
     # head-EXCLUDED body and re-attaches the head per fine q afterwards, so on
     # a densifying run the rank-1 whead must NOT go on now.
-    fine_grid = _resolve_kgrid_fine(kgrid_fine, input_file)
-    fine_shift = _resolve_kgrid_fine_shift(input_file)
+    fine_grid = None if native_grid_only else _resolve_kgrid_fine(kgrid_fine, input_file)
+    fine_shift = (0., 0., 0.) if native_grid_only else _resolve_kgrid_fine_shift(input_file)
     if fine_grid is None and any(fine_shift):
         raise ValueError("kgrid_fine_shift shifts kgrid_fine, which the deck does not set")
     densify_pending = (fine_grid is not None
@@ -289,7 +302,6 @@ def load_bse_data_from_restart_sharded(
         vhead_restart = built_head.vc0
         whead_restart = np.asarray([built_head.wcoul0])
     if header["head_vector"] is not None:
-        from common.collectives import device_put_process_local
         from runtime.padding import pad_to_axis, padded_mu_axis
         g0 = pad_to_axis(header["head_vector"], padded_mu_axis(n_rmu, mesh_xy), axis=-1)
         g0_X = device_put_process_local(g0, NamedSharding(mesh_xy, P("x")))
@@ -338,10 +350,19 @@ def load_bse_data_from_restart_sharded(
     defer_whead = densify_pending
     head_channel = None
     q0_head_ry = 0.0
+    apply_w_head = inject_head if inject_w_head is None else bool(inject_w_head)
 
-    if g0_X is not None and inject_head:
+    if inject_w_head is True and (not need_W or not w0_ready or g0_X is None):
+        raise ValueError("GATE bse_screened_head: an explicitly requested screened head "
+                         "requires screened W0 and its G=0 vector")
+    if g0_X is not None and (inject_head or apply_w_head):
         vhead, whead, cell_volume, head_src = _resolve_head_params(
             input_file, vhead_restart, whead_restart, cell_volume)
+        vhead = vhead if inject_head else None
+        whead = whead if apply_w_head else None
+        if inject_w_head is True and (whead is None or cell_volume is None):
+            raise ValueError("GATE bse_screened_head: an explicitly requested screened head "
+                             "requires whead and cell_volume (Bohr^3)")
 
         if cell_volume is not None and (vhead is not None or whead is not None):
             # whead goes on a SCREENED W or nowhere — same gate, same helper,

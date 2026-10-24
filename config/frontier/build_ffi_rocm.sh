@@ -34,9 +34,22 @@ source "$VENV/bin/activate"         # cmake probes jax.ffi.include_dir() from he
 [ "${1:-}" = "--fresh" ] && rm -rf "$BUILD"
 # ELPA, the ROCM distributed eigh (config/frontier/build_elpa_hip.sh): its
 # content-keyed prefix, built on demand (login node, ~4 min; a no-op verify after).
-ELPA_DIR=${LORRAX_ELPA_ROCM_DIR:-$(env -i HOME="$HOME" PATH=/usr/bin:/bin bash "$ROOT/config/frontier/build_elpa_hip.sh" --print-prefix)}
-[ -e "$ELPA_DIR/LORRAX_ELPA_COMPLETE" ] || env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin \
-    bash -lc "bash '$ROOT/config/frontier/build_elpa_hip.sh'" || { echo "[build_ffi_rocm] FAILED: ELPA" >&2; exit 1; }
+# Prefix selection and build must see the same explicit controls, while module
+# state and library search paths stay out of the child. ELPA initializes its
+# own pinned module environment; a login shell would reintroduce user state.
+_build_elpa() {
+    local name
+    local child=(HOME="$HOME" PATH=/usr/bin:/bin)
+    [[ -z "${USER+x}" ]] || child+=(USER="$USER")
+    for name in LORRAX_OLCF_VENV LORRAX_OLCF_ROCM LORRAX_ROCM_BLAS_DIR \
+                LORRAX_ELPA_ROOT LORRAX_ELPA_GFX LORRAX_ELPA_OPENMP LORRAX_ELPA_MAKE_J; do
+        [[ -z "${!name+x}" ]] || child+=("$name=${!name}")
+    done
+    env -i "${child[@]}" bash "$ROOT/config/frontier/build_elpa_hip.sh" "$@"
+}
+ELPA_DIR=${LORRAX_ELPA_ROCM_DIR:-$(_build_elpa --print-prefix)}
+[ -e "$ELPA_DIR/LORRAX_ELPA_COMPLETE" ] || _build_elpa || {
+    echo "[build_ffi_rocm] FAILED: ELPA" >&2; exit 1; }
 cmake -S "$ROOT/src/ffi/cpp" -B "$BUILD" \
     -DLORRAX_FFI_PLATFORM=rocm \
     -DLORRAX_ELPA_ROCM_DIR="$ELPA_DIR" \
@@ -63,6 +76,27 @@ source "$ROOT/config/frontier/ffi_mpi.sh"
 "$VENV/bin/python" "$ROOT/src/ffi/cpp/stage/write_checkout_closure.py" "$SO" \
     --python "$VENV/bin/python" --library-dirs "$LORRAX_OLCF_RUNTIME_LIB_DIRS" || {
         echo "[build_ffi_rocm] FAILED: dependency closure" >&2; exit 1; }
+# Acceptance uses the recorded wheel files through the runtime loader, not
+# the build module's alternate ROCm search path. No GPU is initialized here;
+# a compute-node GPU smoke remains necessary before runtime certification.
+for _control in LORRAX_FFI_VERIFY LORRAX_GATE_ONE_MPI LORRAX_GATE_ONE_HDF5; do
+    if [[ "${!_control:-on}" == off ]]; then
+        echo "[build_ffi_rocm] FAILED: $_control=off disables mandatory acceptance; provenance was not stamped." >&2
+        exit 1
+    fi
+done
+LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-phdf5,elpa,kdft}" \
+LORRAX_FFI_EXPECT_MPI="${LORRAX_FFI_EXPECT_MPI:-$LORRAX_OLCF_MPI_SONAME}" \
+LORRAX_FFI_EXPECT_HDF5_SOVERSION="${LORRAX_FFI_EXPECT_HDF5_SOVERSION:-310}" \
+LORRAX_PHDF5_STAGE="$LORRAX_OLCF_HDF5_ROOT" \
+LORRAX_GATE_FFTW_PY="$VENV/bin/python" \
+LORRAX_FFI_VERIFY_STRICT=1 \
+LORRAX_ROOT="$ROOT" \
+GATE_TAG=build_ffi_rocm \
+    bash "$ROOT/scripts/verify_ffi_build.sh" --leg rocm "$SO" || {
+        echo "[build_ffi_rocm] FAILED: the library does not meet the build contract." >&2
+        echo "[build_ffi_rocm] The .so is left on disk for inspection; do not pin it." >&2
+        exit 1; }
 "$ROOT/src/ffi/cpp/stage/stamp_provenance.sh" "$SO" \
     leg=rocm site=frontier rocm_module="$ROCM_MOD" mpi="$MPICH_MOD" hdf5="$HDF5_MOD" \
     venv="$VENV" \

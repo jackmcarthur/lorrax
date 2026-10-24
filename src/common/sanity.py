@@ -917,10 +917,9 @@ def report_parent_covariance(
             f"{int(cov.get('worst_sym', -1))}; {coverage}).  The "
             f"IBZ->full-BZ unfold reconstructs V_{{-q}} from V_q by a "
             f"SPATIAL operation, so the stored V_{{-q}} depends on WHICH op "
-            f"was picked by exactly this residual, and an ordinary "
-            f"finite-fit covariance error is thereby converted into a "
-            f"q<->-q reciprocity error.  Diagnose the zeta solve "
-            f"(conditioning of zeta at this q), not the unfold.{detail}",
+            f"was picked by exactly this residual. Inspect the parent "
+            f"producer, transition-window closure and conditioning; this "
+            f"measurement does not identify which stage broke covariance.{detail}",
             print_fn=print_fn,
         )
         return False

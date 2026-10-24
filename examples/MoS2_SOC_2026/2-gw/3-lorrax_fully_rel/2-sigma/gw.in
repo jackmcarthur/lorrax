@@ -5,6 +5,7 @@ ncond = 22
 number_bands = 200
 zeta_nband = 200
 compute_mode = hl_ppm
+ppm_invalid_mode = static_limit
 ppm_omega_p = 200.0
 mc_average_vcoul_body = false
 sigma_omega_min_ev = -65.0

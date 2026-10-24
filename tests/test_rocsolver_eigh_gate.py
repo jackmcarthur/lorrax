@@ -25,7 +25,8 @@ inside ``shard_map``, the ``batch_reshard`` geometry of line_select and the cons
 Cases: random, exactly degenerate (multiplicity 3 and 8 clusters, ``Q diag(l) Q^H``),
 real-valued complex, diagonal with repeats, zero rows, block-diagonal, an all-zero and a
 scalar slot; UPLO L/U without symmetrization; the Fe line_select shape c128[16, 312, 312].
-Plus the row: a stack outside it (batch 1) is ``jnp.linalg.eigh`` bit for bit.
+Complex batch-1 cases enter the owner as 2-D matrices and test its explicit
+native promotion. Real batch 1 remains ``jnp.linalg.eigh`` bit for bit.
 
 ROCm: ``python -m tests.test_rocsolver_eigh_gate`` on any mesh (one GCD or the 2x2 P=4 mesh).
 Under pytest only the gate's own CPU checks run (comparator, captured stacks).
@@ -117,6 +118,8 @@ def passes(m):
 
 CASES = (
     # (kind, b per device, n, dtype, uplo, symmetrize_input)
+    ("random", 1, 128, "complex128", None, True),
+    ("real_valued", 1, 128, "complex128", "U", False),
     ("random", 16, 312, "complex128", None, True),          # the Fe line_select stack
     ("random", 8, 64, "complex128", None, True),
     ("random", 4, 600, "complex128", "U", False),
@@ -169,6 +172,15 @@ def gate_cases(mesh):
             ref = lambda t: le._reflected_eigh(t, uplo, sym, solve=jnp.linalg.eigh)
         else:               # XLA itself
             ref = lambda t: jnp.linalg.eigh(t, UPLO=uplo, symmetrize_input=sym)
+        if b == 1:
+            # Keep the global batch sharding while the local owner receives
+            # the actual 2-D geometry used by Gram/metric consumers.
+            def singleton(fn):
+                def apply(t):
+                    w, v = fn(t[0])
+                    return w[None], v[None]
+                return apply
+            new, ref = singleton(new), singleton(ref)
         sm = lambda f: jax.jit(jax.shard_map(lambda t: tuple(f(t)), mesh=mesh, in_specs=spec,
                                              out_specs=(spec, spec)))
         w, v = sm(new)(x)

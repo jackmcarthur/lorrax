@@ -31,6 +31,7 @@ from runtime.padding import (authenticate_axis, authenticate_padded_axis,
 from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSION,
     BAND_WINDOW_CARRIER_DATASET, CHARGE_ZETA_IDENTITY_DATASET,
     COULOMB_POLICY_DATASET, DOWNFOLD_PROVENANCE_GROUP,
+    RESTART_LOGICAL_SHAPE_ATTR, RESTART_CARRIER_SHAPE_ATTR, RESTART_PADDED_AXES_ATTR,
     _decode_charge_zeta_identity, _loaded_band_axis, _validate_shape_receipt,
     coulomb_policy_from_config, compare_coulomb_policy, parse_coulomb_policy,
     format_coulomb_policy)
@@ -173,6 +174,26 @@ def describe_coulomb_policy_match(filename, cfg, meta=None) -> str:
         "running policy is the one you meant.")
 
 
+def _validate_band_window_receipts(stored_w, stored_carrier, filename):
+    """Authenticate the logical window and its producer's padded carrier."""
+    logical, carrier = np.asarray(stored_w), np.asarray(stored_carrier)
+    if (logical.shape != (5,) or carrier.shape != (5,)
+            or not np.issubdtype(logical.dtype, np.integer)
+            or not np.issubdtype(carrier.dtype, np.integer)):
+        raise ValueError(
+            f"Restart file {filename} has malformed band-window receipts: "
+            f"logical={stored_w}, carrier={stored_carrier}; expected two "
+            "integer five-edge windows.")
+    logical, carrier = tuple(map(int, logical)), tuple(map(int, carrier))
+    if (logical[0] < 0 or any(a > b for a, b in zip(logical, logical[1:]))
+            or logical[:4] != carrier[:4] or carrier[4] < logical[4]):
+        raise ValueError(
+            f"Restart file {filename} has inconsistent logical/carrier "
+            f"band receipts: logical={logical}, carrier={carrier}. The "
+            "carrier may add only a zero-pad tail above the logical b4.")
+    return logical, carrier
+
+
 def assert_restart_window_matches(filename, band_slices=None,
                                  n_rmu_logical=None) -> None:
     """Authenticate a current bundle and its logical band and centroid receipts."""
@@ -204,18 +225,7 @@ def assert_restart_window_matches(filename, band_slices=None,
                 f"{stored_schema} but is missing band_window, "
                 f"band_window_split, or {BAND_WINDOW_CARRIER_DATASET}. The "
                 "geometry receipt is torn.")
-        if len(stored_w) != 5 or len(stored_carrier) != 5:
-            raise ValueError(
-                f"Restart file {filename} has malformed band-window receipts: "
-                f"logical={stored_w}, carrier={stored_carrier}; expected two "
-                "five-edge windows.")
-        logical = tuple(int(v) for v in stored_w)
-        carrier = tuple(int(v) for v in stored_carrier)
-        if logical[:4] != carrier[:4] or carrier[4] < logical[4]:
-            raise ValueError(
-                f"Restart file {filename} has inconsistent logical/carrier "
-                f"band receipts: logical={logical}, carrier={carrier}. The "
-                "carrier may add only a zero-pad tail above the logical b4.")
+        _validate_band_window_receipts(stored_w, stored_carrier, filename)
 
     # THE χ COUNT MUST MATCH; THE Σ COUNT NEED NOT, and the asymmetry is the
     # point.  Every tensor in this file is a function of the SCREENING side or
@@ -670,6 +680,79 @@ def unfold_parent_faces(faces, restart_file, input_file, mesh_xy, *, family="cha
                                    3, spec=spec) for a in faces)
 
 
+def read_head_metadata(filename):
+    """Read only the small Coulomb-head scalars, vector and k grid.
+
+    The static screened body is stored separately. No wavefunction or dense
+    interaction is read to authenticate the internal direct-head operator.
+    """
+    with h5py.File(filename, "r") as f:
+        _require_current(f)
+        def value(name):
+            return np.asarray(f[name][()]) if name in f else None
+        return dict(grid=value("kgrid"), head_vector=value("G0_mu_nu"),
+                    bare_head=value("vhead"), screened_head=value("whead"))
+
+
+def _metadata_band_count(f):
+    """Logical band count without materializing a parent wavefunction face.
+
+    Paired schema-2 windows are authoritative, including empty or all-zero
+    physical bands. Older accepted files without a carrier receipt retain
+    their parent-zero amplitude convention, read backwards in <=1 MiB slabs.
+    This is serial metadata I/O; it introduces no collective.
+    """
+    if BAND_WINDOW_CARRIER_DATASET in f:
+        logical, carrier = _validate_band_window_receipts(
+            f["band_window"][()], f[BAND_WINDOW_CARRIER_DATASET][()], f.filename)
+        count, carried = logical[4] - logical[0], carrier[4] - carrier[0]
+        axes = (("psi_parent_y", 1), ("psi_parent_y_mun", 3), ("enk_full", 1),
+                ("psi_parent_y_transverse", 1), ("psi_parent_y_transverse_mun", 3))
+        for name, axis in axes:
+            if name not in f:
+                continue
+            ds = f[name]
+            _validate_shape_receipt(name, ds)
+            expected_ndim = 2 if name == "enk_full" else 4
+            if len(ds.shape) != expected_ndim:
+                raise ValueError(f"Restart dataset {name!r}: expected {expected_ndim} axes, got {ds.shape}.")
+            band_carrier = carried
+            if RESTART_LOGICAL_SHAPE_ATTR in ds.attrs:
+                band_carrier = int(np.asarray(ds.attrs[RESTART_CARRIER_SHAPE_ATTR])[axis])
+            if ds.shape[axis] < count or ds.shape[axis] not in (count, band_carrier):
+                raise ValueError(
+                    f"Restart dataset {name!r}: band extent {ds.shape} disagrees "
+                    f"with logical/carrier band counts {count}/{band_carrier}.")
+            # Current writers trim the disk band axis; earlier schema-2
+            # writers may retain its carrier. An explicit axis receipt must
+            # agree with the physical window. Appending on another mesh may
+            # change a dataset's producer carrier; its own receipt validates
+            # that padding independently of the original window's carrier.
+            if RESTART_PADDED_AXES_ATTR in ds.attrs:
+                if RESTART_LOGICAL_SHAPE_ATTR not in ds.attrs:
+                    raise ValueError(
+                        f"Restart dataset {name!r}: padded band-axis receipt "
+                        "has no authenticated logical storage shape.")
+                for row in np.asarray(ds.attrs[RESTART_PADDED_AXES_ATTR]):
+                    if int(row[0]) == axis and int(row[1]) != count:
+                        raise ValueError(
+                            f"Restart dataset {name!r}: padded band-axis receipt "
+                            f"disagrees with logical band count {count}.")
+        return count
+
+    psi = f["psi_parent_y"]
+    if len(psi.shape) != 4 or not psi.shape[0] or len(f["enk_full"].shape) != 2:
+        raise ValueError("Legacy restart band metadata requires a parent wavefunction row "
+                         "and a (k, band) energy table")
+    width = max(1, (1 << 20) // psi.dtype.itemsize)
+    for band in range(psi.shape[1] - 1, -1, -1):
+        for spin in range(psi.shape[2]):
+            for mu in range(0, psi.shape[3], width):
+                if np.any(psi[0, band, spin, mu:mu + width] != 0):
+                    return band + 1
+    return int(f["enk_full"].shape[1])
+
+
 def read_metadata(filename):
     """Return small, replicated bundle facts in canonical file order.
 
@@ -681,14 +764,8 @@ def read_metadata(filename):
         _require_current(f)
         def value(name):
             return np.asarray(f[name][()]) if name in f else None
-        # Uniform band padding is exact zero in every parent face. A single
-        # parent row detects the logical prefix without loading full-k psi;
-        # preserve the all-zero-file fallback of the BSE reader.
-        psi0 = np.asarray(f["psi_parent_y"][0])
-        populated = np.flatnonzero(np.any(psi0 != 0, axis=(1, 2)))
-        nb_logical = int(populated[-1]) + 1 if populated.size else f["enk_full"].shape[1]
         return dict(
-            logical_band_count=nb_logical,
+            logical_band_count=_metadata_band_count(f),
             energies=value("enk_full"), grid=value("kgrid"),
             parent_k_rows=value("psi_parent_k_rows"),
             band_window=value("band_window"), band_split=value("band_window_split"),
@@ -3984,6 +4061,25 @@ def _fix_sphere_wrap(zx):
                  f"sphere-derived center")
 
 
+def _zeta_parent_qpoints(restart_file, nq, kgrid):
+    """Stored ζ parent labels from its paired interaction's authenticated tables.
+
+    The copied WFN header names stored k rows, which need not be the q-IBZ
+    parents the ζ writer selected. Reading their prefix is not a q map.
+    """
+    from symmetry_maps import read_tensor, read_tables
+    _, header = read_tensor(restart_file, "V_qmunu", metadata_only=True)
+    if header.table_hash is None:
+        raise ValueError("GATE vq_zeta_q_labels: IBZ ζ needs the paired V q-star tables")
+    tables = read_tables(restart_file, "V_qmunu")
+    q = np.asarray(tables.q_irr_frac, dtype=np.float64)
+    if (q.shape != (int(nq), 3)
+            or int(tables.n_q_full) != int(np.prod(kgrid))):
+        raise ValueError("GATE vq_zeta_q_labels: ζ parent extent/grid disagrees "
+                         "with the paired V q-star tables")
+    return np.array(q, copy=True)
+
+
 def read_vq_payload(restart_file: str, zeta_file: str, *,
                      mesh: Mesh | None = None, log_fn=print, input_file=None,
                      require_slab: bool = True,
@@ -4003,6 +4099,9 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     every stored ζ tile.  The pure-refit caller sets it false: that route reads
     ζ metadata and the producer's solve provenance but reconstructs ζ(Q) from
     the canonical full-BZ WFN source, so an IBZ-only ζ file is sufficient.
+    Those stored ζ parents are labeled by the paired V tensor's authenticated
+    q-star table, not a prefix of the copied WFN k list. The same sphere/cutoff
+    check applies after labeling; no ζ or interaction payload is read for it.
 
     THE THREE BIG q-STACKS STAY ON DISK.  ``ZG`` (nq, n_μ, ngkmax),
     ``Vqmunu`` and ``W0`` (nq, n_μ, n_μ) are read-only and every consumer
@@ -4072,6 +4171,7 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
             f"Regenerate the fit with full-BZ zeta, or wait for the IBZ-zeta "
             f"unfold (deferred; must route through the one SymMaps sym-action).")
     if not require_full_bz_zeta and zx["nq"] != zx["nk"]:
+        qraw = _zeta_parent_qpoints(restart_file, zx["nq"], zx["kgrid"])
         log_fn(
             f"  [vq_interp] pure refit accepts IBZ-only ζ metadata: "
             f"nq={zx['nq']}, full-BZ nk={zx['nk']}. Stored ZG is not read; "
@@ -4123,7 +4223,9 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
                  f"run_gates' per-q makeVq-vs-disk check (sigma_freq_debug_output) "
                  f"verifies it.")
         qraw = qfull
-    zx["qfr_raw"] = qraw[: zx["nq"]]
+    if qraw.shape != (zx["nq"], 3):
+        raise ValueError("GATE vq_zeta_q_labels: no exact stored ζ q-row labeling")
+    zx["qfr_raw"] = qraw
     zx["qfr"] = zx["qfr_raw"] - np.round(zx["qfr_raw"])  # BGW-wrapped, pre half-fix
     kg = zx["kgrid"]
     zx["k_int"] = np.rint(zx["qfr_raw"] * kg[None, :]).astype(int) % kg[None, :]
@@ -4866,6 +4968,9 @@ def require_parent_screening_consumer(config):
                            config.screening.diagrams))
     mode = str(getattr(config.compute_mode, "value", config.compute_mode))
     if diagrams == "w_rpa":
+        return
+    if (diagrams == "w_bse" and mode == "tangential"
+            and getattr(getattr(config, "sigma", None), "w_model", None) == "tangential"):
         return
     if diagrams in ("w_bse", "w_rpa_resolvent") and mode not in ("mpa", "tangential"):
         return

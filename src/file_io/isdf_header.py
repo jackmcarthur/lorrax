@@ -41,8 +41,9 @@ What lives in ``isdf_header``
   ``ngkmax``-padded axis.
 - ``fit_provenance`` (scalar str, optional): JSON description of the
   INPUTS the fit consumed — band windows, cutoffs, solver knobs, source
-  WFN identity.  Written by :func:`stamp_fit_provenance` AFTER
-  :func:`mark_zeta_done`.  ``zeta_is_done`` says "this file is
+  WFN identity. The deferred charge-V writer stamps provenance before
+  its final :func:`mark_zeta_done`; an immediate writer may stamp after.
+  ``zeta_is_done`` says "this file is
   complete"; ``fit_provenance`` says "…and here is what it is complete
   FOR".  Both are required for ``gw.gw_init`` to reuse a ζ instead of
   refitting; a legacy file missing either is refit.
@@ -67,6 +68,34 @@ from .wfn_basis import (
 
 
 _GROUP = 'isdf_header'
+
+
+def read_zeta_storage_metadata(path: str | Path) -> dict:
+    """Read only the grid, completion flag and ζ dataset geometry.
+
+    Unlike the full header reader, this never reads centroid or G-vector
+    tables, or ζ coefficients. It is suitable for a storage preflight before
+    allocating wavefunction caches. Legacy completion/layout defaults match
+    :class:`IsdfHeader`.
+    """
+    with h5.File(str(path), 'r') as f:
+        grid = np.asarray(f['mf_header/kpoints/kgrid'][()], dtype=np.int64)
+        if grid.shape != (3,) or np.any(grid <= 0):
+            raise ValueError(f"invalid ζ kgrid {grid.tolist()} in {path}")
+        group = f[_GROUP]
+        layout = group['zeta_layout'][()] if 'zeta_layout' in group else 'r_space'
+        if isinstance(layout, bytes):
+            layout = layout.decode('utf-8')
+        dataset = {'G_flat': 'zeta_q_G', 'r_space': 'zeta_q'}.get(str(layout))
+        if dataset is None:
+            raise ValueError(f"unsupported ζ layout {layout!r} in {path}")
+        shape = f[dataset].shape
+        if len(shape) != 3 or any(n <= 0 for n in shape):
+            raise ValueError(f"invalid {dataset} shape {shape} in {path}")
+        return dict(kgrid=tuple(int(n) for n in grid), layout=str(layout),
+                    n_q=int(shape[0]),
+                    complete=(bool(group['zeta_is_done'][()])
+                              if 'zeta_is_done' in group else True))
 
 
 @dataclass(frozen=True)
@@ -122,9 +151,8 @@ class IsdfHeader:
     fit_provenance: str | None = None
                                  # JSON blob describing the INPUTS this ζ was
                                  # fit from (band windows, cutoffs, solver
-                                 # knobs, source WFN identity, ...).  Written
-                                 # by :func:`stamp_fit_provenance` after
-                                 # ``mark_zeta_done``; consumed by
+                                 # knobs, source WFN identity, ...). Written
+                                 # when the payload is complete; consumed by
                                  # ``gw.gw_init``'s ζ-reuse check, which
                                  # refits unless this matches the current run
                                  # EXACTLY.  ``None`` on legacy files => no
@@ -334,11 +362,11 @@ def mark_zeta_done(path: str | Path) -> None:
 def stamp_fit_provenance(path: str | Path, provenance: str) -> None:
     """Write ``isdf_header/fit_provenance`` (idempotent, overwrite in place).
 
-    Called by the ζ driver AFTER :func:`mark_zeta_done`, so a run killed
-    between the two leaves a complete-but-unstamped file — which the reuse
-    check treats as "cannot verify" and refits.  That ordering is
-    deliberate: every failure mode falls back to recomputing, never to
-    reusing an unverified ζ.
+    An immediate ζ writer calls this after :func:`mark_zeta_done`; a
+    deferred charge-V writer calls it in the collective completion
+    transaction before the final done marker. A failed deferred stamp
+    therefore leaves the file incomplete. Reuse requires both fields, so
+    either ordering refuses an interrupted or unauthenticated artifact.
 
     ``provenance`` is a JSON string; see ``gw.gw_init._zeta_fit_provenance``
     for the schema and ``_zeta_reuse_ok`` for the comparison.
@@ -359,6 +387,7 @@ __all__ = [
     'IsdfHeader',
     'WavefunctionBasisReceipt',
     'bind_isdf_attrs',
+    'read_zeta_storage_metadata',
     'write_isdf_header',
     'mark_zeta_done',
     'stamp_fit_provenance',

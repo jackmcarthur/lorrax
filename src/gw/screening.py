@@ -785,6 +785,15 @@ def compute_screening_model(
                 checkpoint=str(config.sigma.cd_checkpoint), run_dir=run_dir)}
         if config.sigma.w_model == "tangential":
             from .tangential_screening import screen_tangential_poles
+            bank_source = None
+            if diagrams is ScreeningDiagrams.W_BSE:
+                from .ladder_tangential import make_ladder_tangential_source
+                bank_source = make_ladder_tangential_source(
+                    wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
+                    centroid_indices=centroid_indices, config=config, meta=meta,
+                    mesh_xy=mesh_xy, tensors_filename=tensors_filename,
+                    head_resolver=head_resolver, head_channel=head_channel,
+                    print_fn=print_fn)
             return screen_tangential_poles(
                 wfns, V_q, meta, config, mesh_xy=mesh_xy, sym=sym,
                 centroid_indices=centroid_indices, run_dir=run_dir, label=label,
@@ -796,7 +805,7 @@ def compute_screening_model(
                 bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases,
                 photon_g0_vectors=photon_g0_vectors,
                 photon_head_cache=photon_head_cache,
-                photon_head_state=photon_head_state)
+                photon_head_state=photon_head_state, bank_source=bank_source)
         reuse_path = getattr(config.mpa, "fit_reuse_file", None)
         if reuse_path is not None:
             if mpa_plan is None:

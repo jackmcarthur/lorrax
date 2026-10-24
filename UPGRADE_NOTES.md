@@ -33,6 +33,39 @@ The binding rulings behind breaking changes are in
   tree calls (complex `abs` now lowers through scaled `hypot`), so last-digit
   differences against 0.9 references are possible.
 
+## 2026-10-23 — W_BSE uses physical resonant and antiresonant pairs
+
+The ladder density response now retains the distinct physical transitions
+`(c,k+q;v,k)` and `(v,k+q;c,k)` through its operator, source, readout,
+slopes and moments. The former hybrid branch convention could violate
+frequency evenness in complex spinor gauges even with converged shifted
+solves. Ladder results can move; rebuild banks and models from that
+convention. Their new operator identity contains `physical-ra-v1` and the
+static-rung digest. The folded RPA body remains a control.
+
+The Γ tensor uses the same physical operator with its matched velocity
+vertices. It is already micro-reducible: the head provider restores the
+macroscopic Coulomb channel once, without another RPA local-field fold.
+Full-frequency ladder samples, exact slopes and moments feed the common
+tangential constructor and shared-pole Σ executor. The scalar head has its
+own resolvent samples and inverse-frequency-moment fit; its moment is not
+the body's high-frequency moment. No even-frequency averaging repairs an
+operator that fails the symmetry gate.
+
+Self-consistent W_BSE remains refused. It requires a current-state static
+rung and authenticated operator/head/bank rebuild on every map; a frozen
+initial rung is a different approximation. Equations, normalization and
+source owners: [BSE architecture](docs/architecture/bse.md#w_bse-the-ladder-in-gw-screening).
+
+## 2026-10-23 — slab heads share the graded mini-BZ rule
+
+All slab scalar and photon heads now use the existing radially graded
+Wigner–Seitz rule (8/12/16 points on seven radial panels, 32 per edge).
+This resolves screened near-Γ scales that the previous single-panel
+16/24/32 rule could not certify. Both bare and screened final-pair errors
+must meet the unchanged `atol 1e-12`, `rtol 1e-8` budget. No deck changes
+are needed; fresh slab heads can move by the old quadrature error.
+
 ## 2026-10-23 — One energy reference: `fermi_reference` and `minimax_energy_reference` removed
 
 - **Removed.** The GW deck keys `fermi_reference` and `minimax_energy_reference`.

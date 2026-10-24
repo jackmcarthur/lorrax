@@ -2065,14 +2065,16 @@ def _dyson_route(dyson, n, stack, mesh_xy):
     Local holds V, χ and W whole for its ⌈stack/P⌉ parents and one LU working
     pair, beside the face-tiled V, χ and W; distributed holds the faces and
     one face-tiled LU pair. Priced from the shapes against the fixed device
-    budget, not a live ledger; φ in the memory rule covers XLA's temporaries.
+    budget; distributed LU room is also capped by the current agreed allocator
+    room. φ in the memory rule covers XLA's temporaries.
     """
     from common.gpu_utils import device_budget_bytes
     from lxkit import memory
     ranks = int(mesh_xy.size)
     site = f"W Dyson {int(stack)} x {int(n)}^2"
     faces = 16.0 * n * n * 3 * int(stack) / ranks
-    room = max(0, int(device_budget_bytes() - faces)) if ranks > 1 else None
+    budget = device_budget_bytes()
+    room = min(max(0, int(budget - faces)), memory.room()) if ranks > 1 else None
     if dyson == "distributed":
         return "distributed", room
     if ranks <= 1:
@@ -2089,9 +2091,13 @@ def _dyson_route(dyson, n, stack, mesh_xy):
         from ffi import _services
         _services.ensure_on_path()
         from distrib_la import resolve_backend
-        resolve_backend("solve_lu", "distributed", mesh_xy)
+        resolve_backend("solve_lu", "distributed", mesh_xy, n=int(n), room=room)
     route = memory.admit(site, (("local", local_price), ("distributed", mesh_price)),
-                         device_budget_bytes(), probe=probe)
+                         budget, probe=probe)
+    if route == "local" and local_price.bytes() > budget:
+        raise RuntimeError(f"GATE w_dyson_capacity: {site} has no admitted route; "
+                           f"whole-parent algebra needs {int(local_price.bytes())} bytes/rank "
+                           f"over budget {int(budget)} and its distributed fallback did not fit")
     return ("local", None) if route == "local" else ("distributed", room)
 
 

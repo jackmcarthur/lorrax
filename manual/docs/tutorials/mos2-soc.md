@@ -12,10 +12,11 @@ and add parallel LORRAX directories beside its plane-wave calculations. The
 link scripts, numbered stages and output filenames follow the original exercise.
 
 Both tracks interpolate from a 3 × 3 × 1 coarse grid to a shifted 8 × 8 × 1
-fine grid. This comparison is underconverged, which leads to some differences
-in the final results between the plane-wave code and LORRAX. However, the
-[figures below](#interpolation-validation) show that at converged k-grid sizes
-the two are very similar.
+fine grid. This small grid is underconverged, and the screening bases and
+plasmon-pole models also differ, as described below. This comparison therefore
+does not isolate interpolation. The [denser-grid benchmarks](#interpolation-validation)
+show LORRAX interpolation following direct fine-grid calculations closely
+with shared QP energies.
 
 The [example directory](https://github.com/jackmcarthur/lorrax/tree/main/examples/MoS2_SOC_2026)
 describes the differences between the main plane-wave package and LORRAX.
@@ -25,6 +26,7 @@ describes the differences between the main plane-wave package and LORRAX.
 1. Follow fully relativistic, two-component DFT wavefunctions through GW and BSE.
 2. Run LORRAX using a directory layout familiar from the BerkeleyGW workshop.
 3. Compare band structures and absorption spectra between the two codes.
+4. Follow the exciton bands away from Γ with LORRAX.
 
 ## Settings {: #prerequisites }
 
@@ -43,6 +45,7 @@ four-GPU node for LORRAX.
 | Fine BSE grid | 8 × 8 × 1, shifted by (0.47, 0.37, 0) in grid-step units |
 | Fine BSE bands | Six valence and eight conduction; all 3,072 Tamm–Dancoff roots |
 | Spectrum | 0.15 eV Gaussian width; 0.01 eV spacing |
+| Exciton bands | Γ-centered 24 × 24 × 1 integration grid; six valence and eight conduction bands; 256 roots along the full path and eight in the near-Γ scan |
 
 ## Steps {: #instructions }
 
@@ -68,11 +71,96 @@ commands and what to check.
    together (`2-sigma`), which also exports `eps0mat.h5` and `epsmat.h5`, and
    the band structure by [`htransform`](../utilities/htransform-bands.md) (`3-bs`).
 4. **LORRAX BSE.** The `bsemat.h5` export (`3-bse/3-lorrax_fully_rel/1-kernel`)
-   and the BSE with its absorption spectra (`2-absorption`).
+   and the BSE with its absorption spectra (`2-absorption`), followed by
+   finite-momentum exciton bands (`3-exciton-bands`).
 
 `bash 00-run-lorrax.sh` runs parts 3 and 4 in order on a four-GPU allocation
 and makes the plots. The [For BerkeleyGW users](../using/berkeleygw-users.md)
 page maps the workshop's `.inp` keys to the `gw.in` inputs.
+
+### Plasmon-pole settings {: #plasmon-pole-settings }
+
+Both workshop tracks use the Hybertsen–Louie model. The native decks set
+`ppm_invalid_mode = static_limit`: an invalid fitted pole contributes its
+static COHSEX limit. The closest BerkeleyGW setting is
+`invalid_gpp_mode 3`. The original BerkeleyGW4 input omits that key; its
+default already takes the same branch, so the upstream input is preserved.
+`perlmutter/03-run-reference-cpu.sh` records the effective policies and input
+hashes in `perlmutter/bgw_sigma_policy.json`.
+
+This aligns the treatment of invalid poles. The fitted poles still differ:
+LORRAX obtains its HL body moment from the finite-band response at the
+200 Ry probe, while BerkeleyGW uses its density sum rule. Invalid fractions
+are also basis dependent: the two codes fit centroid-pair and plane-wave-pair
+matrix elements. Compare QP energies and convergence rather than equating
+those percentages.
+
+### Screening basis {: #screening-basis }
+
+The plane-wave track builds and inverts its dielectric matrix at 9 Ry.
+LORRAX screens in the 996-point ISDF basis; its bare-Coulomb and ζ spheres
+extend to 45 Ry. `epsmat_ecut = 9.0` restricts the exported inverse dielectric
+matrix after screening, rather than rerunning GW in a 9 Ry response basis.
+The exported dimensions therefore match, while the screening bases differ.
+
+## Exciton bands {: #exciton-bands }
+
+The final LORRAX stage follows finite-momentum excitons along Γ–M–K–Γ:
+
+```bash
+cd 3-bse/3-lorrax_fully_rel/3-exciton-bands
+bash 01-run_exciton_bands.run
+bash 01-run_exciton_bands.run gw-near-gamma.in near_gamma
+source ../../../2-gw/3-lorrax_fully_rel/lorrax_env.sh
+lorrax_python 02-plot_exciton_bands.py --near-gamma-prefix near_gamma
+```
+
+Both scans retain six valence and eight conduction bands on a Γ-centered
+24 × 24 × 1 integration grid. H-transform interpolation supplies the electron
+at k + Q; the hole remains at k. Screening and the QP Hamiltonian still come
+from the same 3 × 3 × 1 coarse calculation.
+
+The 25-point full path uses 256 roots and a 0.25 meV Davidson residual budget:
+four steps from Γ to `(0.05, 0, 0)`, seven to M, six to K and seven back to Γ.
+The separate 22-point near-Γ scan keeps eight roots at 0.01 meV: eight steps
+to `(0.003, 0, 0)`, twelve more to `(0.06, 0, 0)`, then K for certification.
+Coordinates are fractional reciprocal coordinates. The lower panel displays
+only |Q| ≤ 0.12 Å⁻¹, excluding the distant K anchor.
+
+Use a regular four-GPU allocation. Allow roughly three hours for the full
+path, plus the near-Γ scan, which took 25 min 37 s from a cold launch on
+four Frontier GPU ranks. The full-path allowance is a planning estimate;
+runtime varies by machine. The companion `exciton_bands_continuum.dat`
+records the independent-particle threshold from the same QP transitions at
+each Q, so its coverage can be checked against the highest retained level.
+
+Near Γ, the lowest two ordered energies follow a quadratic form over the
+measured window; higher levels need a linear component plus curvature,
+as permitted by long-range exchange in two dimensions. The smallest
+low-level shifts are below solver resolution. Energies alone do not assign
+longitudinal/transverse or bright/dark character.
+
+<figure style="width:3in; max-width:100%; margin:1em 0;" markdown="1">
+
+[![LORRAX exciton energies along Gamma-M-K-Gamma, with the independent-particle continuum threshold, and an eight-level enlargement near Gamma.](../assets/figures/tutorial-mos2-exciton-bands.png){ width="288" }](../assets/figures/tutorial-mos2-exciton-bands.png)
+
+<figcaption style="font-size:0.86em; line-height:1.45;" markdown="1">
+
+The dashed line marks the independent-particle continuum from the same QP
+transitions. The 256-level window crosses it at 21 of 25 momenta, reaching
+152 meV above it at Γ and 113 meV at K. At four points the retained levels
+stop below the threshold. The lower panel resolves eight levels near Γ.
+[Download the PDF](../assets/figures/tutorial-mos2-exciton-bands.pdf).
+
+</figcaption>
+</figure>
+
+These are illustrative results: the lowest eight levels differ by up to
+7.65 meV between matched 24 × 24 and 30 × 30 controls. The tutorial uses the
+1 meV **visualization** exchange check; the driver's **reference** default
+remains unchanged. The [stage README](https://github.com/jackmcarthur/lorrax/blob/main/examples/MoS2_SOC_2026/3-bse/3-lorrax_fully_rel/3-exciton-bands/README.md)
+gives the measured fits, residual budgets and certification details. Grid
+convergence requires further calculations.
 
 ## Results {: #results }
 

@@ -21,7 +21,9 @@ Instructions
 1. Complete `../../1-mf/2-fully_rel`, including `WFN.h5` conversion and the
    two additional `2c-Wfn_full` and `2d-Wfn_guarded` stages described in
    [the preparation guide](../../perlmutter/README.md). Use a built LORRAX
-   checkout and a four-GPU allocation; set `export LORRAX=/path/to/lorrax`.
+   checkout on Perlmutter or Frontier and a GPU allocation; set
+   `export LORRAX=/path/to/lorrax` and activate the build's Python environment.
+   The shared launcher selects four CUDA GPUs or four ROCm GCDs automatically.
    For a CPU allocation with at least 64 cores, also set
    `export JAX_PLATFORMS=cpu`.
 
@@ -42,7 +44,8 @@ Instructions
 5. Go to `3-bs`, run `bash 01-run_inteqp.run`, then plot the bandstructure:
 
    ```bash
-   "$LORRAX/.venv/bin/python" 02-plot_bandstructure.py
+   source ../lorrax_env.sh
+   lorrax_python 02-plot_bandstructure.py
    ```
 
    The path is Gamma–M–K–Gamma with the workshop's 106 points and 40 plotted
@@ -58,6 +61,22 @@ The geometry, pseudopotentials and 200-band GW sums are the workshop's.
 The guarded mean-field file holds 204 bands so LORRAX can check the gap above
 the 200-band fit window; these spare states do not enter the sums. The QP
 calculation keeps 48 bands, including eight guards beyond the plotted 40.
+
+Both tracks use HL-PPM. The explicit native `ppm_invalid_mode = static_limit`
+matches BerkeleyGW's `invalid_gpp_mode 3`: invalid modes contribute their
+static COHSEX limit. The unchanged BerkeleyGW4 workshop input already uses
+that default. The reference adapter records both policies and input hashes
+in `perlmutter/bgw_sigma_policy.json`. Matching this policy does not make
+the fitted poles identical: the native HL body uses the finite-band
+high-frequency response; BerkeleyGW uses the density sum rule.
+
+The screening bases also differ. BerkeleyGW builds and inverts its dielectric
+matrix at 9 Ry. LORRAX screens in the 996-point ISDF basis with 45 Ry
+bare-Coulomb and ζ spheres; 45 Ry is not a plane-wave χ cutoff.
+`epsmat_ecut = 9.0` selects a block of the already-screened inverse dielectric
+matrix for export. It does not rerun native GW at 9 Ry. Matching the exported
+dimensions therefore does not match the internal screening basis, and the
+workshop comparison does not isolate interpolation.
 
 `sigma_omega_min_ev = -65.0` eV, relative to the Sigma Fermi reference,
 includes the deep Mo semicore states. `mc_average_vcoul_body = false` uses

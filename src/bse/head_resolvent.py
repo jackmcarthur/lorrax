@@ -1,128 +1,20 @@
-"""Ladder head resolvent — the q=0 macroscopic tensor
+"""Macroscopic head on the same physical R/A ladder operator as the body.
 
-    Xi_ij(z) = d_i^dag (z - H_bar_BSE)^{-1} d_j          (3x3 complex per z)
+The velocity dipole d=v_cv/Delta=i*r_cv gives RHS [d;conj(d)] and
+readout [d^dag,-d^T]. The common density-vertex sign cancels between
+injection and readout. The prefactor is 2/(Omega Nk nspin nspinor), so
+the free-pair tensor agrees with compute_S_omega_cv. The engine returns
+the micro-reducible tensor only; its consumer restores the macroscopic
+Coulomb head once. No TRS or frequency averaging is applied to a result.
 
-built from the SAME operator family that produces ``W^BSE`` (``w_ladder`` /
-``bse_w_exact``), with a dipole seed substituted for the mu-basis probe seed.
-
-WS-C ENGINE ONLY.  Nothing here decides where ``Xi`` lands: no injection seam,
-no ``qsgw_head`` / ``head_correction`` call, no restoration of the omitted
-macroscopic ``V`` head (guide section 5's scalar Dyson
-``W_00 = V/(1 - V q.Xi.q)``, which is a consumer's job).  This module returns
-the tensor and its solver diagnostics.
-
-WHICH OPERATOR, AND WHY NOT THE OPTICAL ONE
--------------------------------------------
-The head must obey the SAME resonant/antiresonant convention as the body
-(guide trap 8), and the body here is the W-producing operator, not the optical
-one.  ``w_ladder``'s module docstring records the measurement that forces this:
-the optical non-TDA row ``[[A, B], [-B*, -A*]]`` breaks ``W = v chi v`` already
-at RPA, because the ring/Hartree kernel ``K^x = M v M^dag`` is Hermitian but
-NOT symmetric (measured ``|K^x - (K^x)^T| / |K^x| = 1.95`` on the gnppm 2v2c
-fixture).  The row this engine therefore rides is ``w_ladder``'s HYBRID row —
-ring dyad un-conjugated in all four blocks, direct rungs conjugated:
-
-    A = D + K^x - K^d ,   B = K^x - K^d_B
-    H = [[ A                        ,  B                              ],
-         [ -(K^x - conj(K^d_B))     , -(D + K^x - conj(K^d))          ]]
-
-built by :func:`w_ladder.build_ladder_resolvent`.  Its structural certificate
-is full-space eta-pseudo-Hermiticity, ``eta H = (eta H)^dag`` with
-``eta = diag(I, -I)`` — the property the symmetry ruling below is derived from.
-
-THE SEED AND THE READOUT
-------------------------
-``bse_w_exact.build_probe_rhs`` already emits the non-TDA super-vertex
-``[f; -f]`` (``bse_w_exact.py:783``) and ``_get_block_gmres_solver`` already
-reads out ``x[0] + x[1]``.  The dipole head is that same shape with ``f -> d``:
-
-    rhs_j = [ d_j ; -d_j ] ,        s_j = X_j + Y_j ,
-    Xi_ij = pref * sum_t conj(d_i)_t (s_j)_t .
-
-With ``K = 0`` (H = diag(Delta) resonant, -diag(Delta) antiresonant — see
-``bse_feast.build_preconditioner_diagonal_sharded``'s ``use_tda=False`` stack)
-this unwinds analytically to
-
-    (z - Delta) X = d ,  (z + Delta) Y = -d
-    s = d [ 1/(z - Delta) - 1/(z + Delta) ]
-    sum_t conj(d_i) s_j = sum_t conj(v_i) v_j / Delta^2 * 2 Delta / (z^2 - Delta^2)
-
-which is guide Test 1's independent-particle head, term for term.  THE FACTOR
-OF TWO IS NOT HARDCODED ANYWHERE: it falls out of the ``[d; -d]`` seed and the
-``X + Y`` readout, exactly as guide section 4 requires.
-
-THE PREFACTOR
--------------
-:func:`head_prefactor` is ``compute_S_omega``'s ``pref / 2``, and that halving
-is the ONLY place a factor of two is written down.  ``common.chi_from_dipole.
-compute_S_omega`` — the tree's independent implementation of this same object,
-and the gate for Test 1 — spells the transition sum as
-
-    S_ab = pref * sum_t conj(v_a) (f_v - f_c) / [ Delta (w^2 - Delta^2) ] v_b ,
-    pref = 4 / (Omega N_k n_spin n_spinor)      (chi_from_dipole.py:219)
-
-while the resolvent readout above produces ``2 / [Delta (z^2 - Delta^2)]`` per
-transition.  Hence ``pref_head = pref / 2 = 2 / (Omega N_k n_spin n_spinor)``.
-The ``(f_v - f_c) = 1`` step is the insulator assumption, which is already
-enforced upstream: ``w_bse`` refuses metals at parse
-(``gw_config.py``) and at runtime (``screening_bse.py``).
-
-DELTA IS AN ARGUMENT, NOT A LOOKUP
-----------------------------------
-Guide section 7A wants ``d_t = v_t / Delta_t`` with QP ``Delta``, while
-``absorption_common.slice_dipole_to_bse_window`` divides by the DFT ``deltaE``
-that ``dipole.h5`` carries.  A separate stream owns that migration, so
-:func:`build_head_dipole` TAKES ``delta`` and never derives it, and
-:func:`solve_head_tensor` reports ``delta_mismatch`` — the largest relative
-disagreement between the ``delta`` used to build ``d`` and the operator's own
-diagonal ``eps_c - eps_v`` — as a diagnostic rather than a refusal.  Test 1 is
-only meaningful when that number is ~0; production with a DFT ``d`` against a
-QP operator will show it as a finite number, which is the point of printing it.
-
-SYMMETRY OF Xi — READ THIS BEFORE ASSUMING IT
----------------------------------------------
-Write the readout as ``Xi_ij = w_i^dag (z - H)^{-1} eta w_j`` with
-``w_i = [d_i; d_i]`` and ``eta = diag(I, -I)`` (so the seed is ``eta w_j``).
-Two DIFFERENT statements follow, and only the first is structural:
-
-* **Hermiticity, from the operator.**  eta-pseudo-Hermiticity
-  ``eta H eta = H^dag`` gives ``[(z-H)^{-1} eta]^dag = (conj(z) - H)^{-1} eta``,
-  hence ``Xi(conj(z)) = Xi(z)^dag``.  On the real axis (``z = conj(z)``) Xi is
-  HERMITIAN; on the imaginary axis it gives ``Xi(-z) = Xi(z)^dag``.  This holds
-  for any ``d``, for the full ladder kernel, with no lattice symmetry.
-
-* **Symmetry, NOT from the operator.**  ``Xi = Xi^T`` needs both ``d`` real (up
-  to one global phase) and ``eta H eta = H^T`` — a TRANSPOSE identity, not the
-  dagger one the operator carries.  Together with pseudo-Hermiticity that would
-  force ``H = conj(H)``, which the ladder is not.  Xi comes out symmetric only
-  when the transition sum ITSELF pairs terms so that
-  ``sum_t conj(v_i) v_j f(Delta_t)`` is real — i.e. when the k-sum runs over a
-  BZ closed under ``k -> -k`` with a TRS-consistent gauge, or the crystal has
-  inversion.  It is a property of the SAMPLING, not of the engine, and
-  :func:`solve_head_tensor` MEASURES it (``asym``/``anti_herm`` in the result)
-  instead of asserting it.
-
-WHAT BREAKS DOWNSTREAM IF SYMMETRY IS ASSUMED AND DOES NOT HOLD.  Every reader
-of a (3,3) head tensor in this tree contracts it with a REAL mini-BZ draw:
-``gw.head_densify.head_scalar_pointwise`` does
-``einsum('qi,ij,qj->q', q, S, q)`` and ``vcoul``'s ``q0_average`` does the
-same.  For real ``q`` that contraction sees ONLY ``(S + S^T)/2``, so an
-antisymmetric part is silently discarded — not detected, discarded.  Worse, at
-real ``z`` where Xi is Hermitian, ``(S + S^T)/2 = Re(S)``, so the contraction
-is real by construction and ``head_densify._refuse_complex`` — the guard that
-exists to notice a complex head — CANNOT fire on a Hermitian-but-not-symmetric
-Xi.  A consumer that wants the full tensor must either symmetrize deliberately
-and say so, or refuse when ``asym`` is above tolerance.  This engine reports
-the number; it does not symmetrize.
-
-SCOPE
------
-q = 0 only.  Finite-q heads are a different object and live in
-``bse_stack_matvec``'s ``head_tensor`` branch; nothing here touches it.
+The unchanged default folded-RPA control keeps its original [d;-d]
+source and branch-sum readout. Operator identity includes the branch
+representation; a physical zero-W payload tests the full RPA identity.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable
 
 import numpy as np
@@ -137,7 +29,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh
 
 from .bse_feast import ladder_matvec_operands, matvec_operands
-from .bse_w_exact import _get_block_gmres_solver
+from .bse_w_exact import _get_block_gmres_solver, _get_block_moment_actions
 from .w_ladder import build_ladder_resolvent
 from common.collectives import device_put_process_local, gather_to_host
 
@@ -221,20 +113,25 @@ def head_operator_key(mesh_xy: Mesh, data: dict, *, include_w: bool,
     """Structural identity of the head operator — everything that is baked into
     the compiled program, and nothing that is not.
 
-    ``include_w`` picks a different builder entirely (``build_ladder_resolvent``
-    delegates to ``bse_w_exact._build_rpa_resolvent`` when it is False), the
-    k-grid and the pair-window pads set the shapes, the mesh sets the sharding,
+    ``include_w`` selects the direct rung. Without that rung, the historical
+    folded RPA builder is used unless ``physical_branches`` explicitly selects
+    the physical R/A control. The
+    k-grid and the pair-window pads set the shapes, the complete mesh identity
+    (axes and device assignment) sets the sharding,
     and ``fuse_ladder_rung`` selects ``bse_ring_comm._impl_core_fused`` — a cost
     switch, but still a different program.  ``V_q0`` / ``W_q`` VALUES are absent
     on purpose: they are runtime operands.
     """
+    from distrib_la import mesh_key
+
     return (
         "bse.head_resolvent",
         bool(include_w),
+        bool(include_w or data.get("physical_branches", False)),
         bool(fuse_ladder_rung),
         (int(data["nkx"]), int(data["nky"]), int(data["nkz"])),
         (int(data["n_cond_pad"]), int(data["n_val_pad"])),
-        tuple(int(s) for s in mesh_xy.devices.shape),
+        mesh_key(mesh_xy),
     )
 
 
@@ -277,7 +174,8 @@ def build_head_operator(mesh_xy: Mesh, data: dict, *, include_w: bool = True,
         # arm has no rung.  Mismatching these is claim 0215's defect
         # (build_ladder_resolvent's docstring), so the choice rides WITH the
         # operator instead of being a call-site argument.
-        operands_fn=ladder_matvec_operands if include_w else matvec_operands,
+        operands_fn=partial(ladder_matvec_operands if data.get("physical_branches", False)
+                            else matvec_operands, include_W=include_w),
         key=key,
     )
 
@@ -346,11 +244,18 @@ def zero_kernel_payload(data: dict) -> dict:
     leave the rung live while ``W_q`` reads zero).
     """
     out = dict(data)
+    out["q0_head_ry"] = 0.0
     out["V_q0"] = jnp.zeros_like(data["V_q0"])
-    if "W_q" in data:
+    if data.get("W_q") is not None:
         out["W_q"] = jnp.zeros_like(data["W_q"])
-    out.pop("W_R", None)
-    out.pop("_W_q0_for_precond", None)
+        out.pop("W_R", None)
+        out.pop("_W_q0_for_precond", None)
+    elif data.get("W_R") is not None:
+        # An explicitly consumed kernel has no reciprocal snapshot. Zero
+        # its real-space operand and saved diagonal slice without a reload.
+        out["W_R"] = jnp.zeros_like(data["W_R"])
+        if data.get("_W_q0_for_precond") is not None:
+            out["_W_q0_for_precond"] = jnp.zeros_like(data["_W_q0_for_precond"])
     return out
 
 
@@ -406,8 +311,10 @@ def payload_delta(data: dict) -> np.ndarray:
     return np.transpose(eps_c[:, :, None] - eps_v[:, None, :], (1, 2, 0))
 
 
-def build_head_rhs(d_pair, sh):
-    """The non-TDA head seed ``[d; -d]`` on ``sh.X_full`` = ``(2, 3, c, v, k)``.
+def build_head_rhs(d_pair, sh, *, physical_branches=False):
+    """Head seed on ``sh.X_full`` = ``(2, 3, c, v, k)``.
+
+    Physical R/A uses [d;conj(d)]; the folded RPA control uses [d;-d].
 
     Structurally the same object ``bse_w_exact.build_probe_rhs`` returns at its
     line 783 (``jnp.stack([f, -f], axis=0)``) with the mu-probe density vertex
@@ -432,7 +339,17 @@ def build_head_rhs(d_pair, sh):
             f"build_head_rhs: d_pair must be (3, c, v, k); got {d.shape}")
     dev = device_put_process_local(np.ascontiguousarray(d), sh.X)
     return jax.lax.with_sharding_constraint(
-        jnp.stack([dev, -dev], axis=0).astype(jnp.complex128), sh.X_full)
+        jnp.stack([dev, jnp.conj(dev) if physical_branches else -dev],
+                  axis=0).astype(jnp.complex128), sh.X_full)
+
+
+def project_head_response(d_pair, branches, *, pref, physical_branches=True):
+    """Matched 3x3 velocity readout; physical branches or folded-RPA sum."""
+    d = jnp.asarray(d_pair)
+    if not physical_branches:
+        return pref * jnp.einsum("icvk,jcvk->ij", jnp.conj(d), branches, optimize=True)
+    return pref * (jnp.einsum("icvk,jcvk->ij", jnp.conj(d), branches[0], optimize=True)
+                   - jnp.einsum("icvk,jcvk->ij", d, branches[1], optimize=True))
 
 
 def head_prefactor(cell_volume: float, nk_tot: int, nspin: int,
@@ -498,6 +415,11 @@ class HeadTensorResult:
     arm: str
     operator_key: tuple
     pref: float
+    #: Optional exact even-s derivative/reflection, from the shared response actions.
+    d_xi_ds: np.ndarray | None = None
+    xi_minus_z: np.ndarray | None = None
+    #: Optional C H**j B / 2 tensors, j=0..3; these are high-frequency moments.
+    moments: dict | None = None
 
 
 def _rel_frob(a, b):
@@ -508,7 +430,8 @@ def _rel_frob(a, b):
 def solve_head_tensor(op: HeadOperator, data: dict, d_pair, z_values, *,
                       pref: float, max_iter: int = 200, tol: float = 1e-10,
                       rhs=None, arm: str = "", delta_cvk=None,
-                      resid_relative_to: str = "b") -> HeadTensorResult:
+                      resid_relative_to: str = "b", with_slope=False,
+                      with_moments=False) -> HeadTensorResult:
     """``Xi_ij(z)`` for every ``z`` in ``z_values``, one block-GMRES per ``z``.
 
     Rides ``bse_w_exact._get_block_gmres_solver`` verbatim — the body's stage-2
@@ -524,6 +447,11 @@ def solve_head_tensor(op: HeadOperator, data: dict, d_pair, z_values, *,
     path.  ``delta_cvk`` is the ``(nk, nc, nv)`` ``Delta`` that BUILT ``d``;
     supplying it turns ``delta_mismatch`` from ``nan`` into a measurement.
 
+    ``with_slope`` uses the body's exact resolvent actions, including R**3
+    at zero; residuals and iteration counts then cover every extra solve.
+    ``with_moments`` evaluates the common H-power actions once, not per z.
+    Both default off and preserve existing value-only callers.
+
     NO KRYLOV RECYCLING, deliberately: guide section 7D says "correctness does
     not depend on it".  Three right-hand sides and a handful of frequencies do
     not pay for a block-Krylov implementation, and the per-column scan
@@ -531,29 +459,45 @@ def solve_head_tensor(op: HeadOperator, data: dict, d_pair, z_values, *,
     """
     sh = op.sh
     d = np.asarray(d_pair, dtype=np.complex128)
+    physical = bool(data.get("physical_branches", False))
     if rhs is None:
-        rhs = build_head_rhs(d, sh)
+        rhs = build_head_rhs(d, sh, physical_branches=physical)
 
     solver = _get_block_gmres_solver(op.matvec, sh, max_iter, tol, rhs.dtype,
-                                     resid_relative_to)
+                                     resid_relative_to, with_slope=bool(with_slope),
+                                     retain_branches=physical)
     operands = op.operands_fn(data)
 
     z_arr = np.atleast_1d(np.asarray(z_values, dtype=np.complex128))
     xi = np.zeros((z_arr.size, 3, 3), dtype=np.complex128)
     resids = np.zeros((z_arr.size, 3), dtype=np.float64)
     iters = np.zeros((z_arr.size, 3), dtype=np.int64)
+    slopes = np.zeros_like(xi) if with_slope else None
+    reflected = np.zeros_like(xi) if with_slope else None
 
     for iz, z in enumerate(z_arr):
-        s_all, res, it = solver(rhs, op.diag_h,
-                                jnp.asarray(z, dtype=jnp.complex128), operands)
-        # s_all is (3, c, v, k) = X_j + Y_j.  The contraction is a full
-        # reduction to a replicated 3x3 — the only collective this engine adds,
-        # and it moves 9 numbers, not an N_mu^2-class tile.
-        xi_z = jnp.einsum("icvk,jcvk->ij", jnp.conj(jnp.asarray(d)), s_all,
-                          optimize=True)
-        xi[iz] = float(pref) * np.asarray(gather_to_host(xi_z))
+        solved = solver(rhs, op.diag_h,
+                        jnp.asarray(z, dtype=jnp.complex128), operands)
+        s_all, res, it = solved[:3]
+        # Reuse the uploaded, pair-sharded d in the RHS; do not replicate a
+        # host dipole constant or upload it again at every frequency.
+        xi_z = project_head_response(rhs[0], s_all, pref=float(pref),
+                                     physical_branches=physical)
+        xi[iz] = np.asarray(gather_to_host(xi_z))
         resids[iz] = np.asarray(gather_to_host(res))[:3]
         iters[iz] = np.asarray(gather_to_host(it))[:3]
+        if with_slope:
+            for target, name in ((slopes, "dWc_ds"), (reflected, "Wc_minus_z")):
+                target[iz] = np.asarray(gather_to_host(project_head_response(
+                    rhs[0], solved[3][name], pref=float(pref), physical_branches=physical)))
+
+    moments = None
+    if with_moments:
+        actions = _get_block_moment_actions(op.matvec, sh, rhs.dtype,
+                                            retain_branches=physical)(rhs, operands)
+        moments = {name: np.asarray(gather_to_host(project_head_response(
+            rhs[0], value, pref=float(pref), physical_branches=physical)))
+                   for name, value in actions.items()}
 
     asym = np.array([_rel_frob(x - x.T, x) for x in xi])
     anti_herm = np.array([_rel_frob(x - x.conj().T, x) for x in xi])
@@ -565,6 +509,7 @@ def solve_head_tensor(op: HeadOperator, data: dict, d_pair, z_values, *,
         xi=xi, z=z_arr, resids=resids, iters=iters, asym=asym,
         anti_herm=anti_herm, delta_mismatch=mismatch, arm=arm,
         operator_key=op.key, pref=float(pref),
+        d_xi_ds=slopes, xi_minus_z=reflected, moments=moments,
     )
 
 

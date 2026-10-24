@@ -553,11 +553,15 @@ _MPI_RUNTIME_BASENAME = re.compile(r"^libmpi(?:_gnu(?:_[0-9]+)?)?[.]so(?:[.]|$)"
 def _mapped_paths() -> set[Path]:
     try:
         with open("/proc/self/maps", encoding="utf-8") as maps:
-            return {
-                Path(os.path.realpath(line.rsplit(maxsplit=1)[-1]))
+            paths = {
+                line.rsplit(maxsplit=1)[-1]
                 for line in maps
                 if "/" in line and not line.rstrip().endswith(" (deleted)")
             }
+        # One DSO has several mappings. Resolve each raw path once per scan,
+        # keeping distinct symlink aliases until their canonical identities
+        # are known. No cross-scan cache can hide a retargeted alias.
+        return {Path(os.path.realpath(path)) for path in paths}
     except OSError:
         return set()
 

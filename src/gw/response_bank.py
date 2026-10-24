@@ -77,7 +77,8 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     slope = built.slope
     algebra = {
         "linalg": resolution.layout,
-        "solve": lu.describe() + "; capacity resolved at each actual operand batch",
+        "solve": (lu.describe() if lu is not None else "solve_lu: 'distributed'")
+                 + "; capacity resolved at each actual operand batch",
         "batched_route": route,
         "prefactor": pref,
         "prefactor_q_count": int(meta.nk_tot),
@@ -104,14 +105,20 @@ def _dyson_room(ledger, mesh_xy, args):
     shapes and shardings. The physical full-q count belongs to the prefactor,
     never to the storage price of a parent or streamed q batch.
     """
-    ranks = int(mesh_xy.size)
-    if ledger is None or ranks <= 1:
-        return None
-    try:
-        live = ledger.live_stages
-    except ValueError:
-        return None
-    ledger.at_phase()
+    from common.gpu_utils import device_budget_bytes
+    from lxkit import memory
+    room = None
+    if ledger is not None and int(mesh_xy.size) > 1:
+        try:
+            live = ledger.live_stages
+        except ValueError:
+            pass
+        else:
+            ledger.at_phase()
+            room = ledger.room_bytes_per_rank(concurrent_with=live)
+    if room is None:
+        device_budget_bytes()  # Resolve the common run budget if not yet initialized.
+        room = memory.room(bucketed=False)
     future = 0
     for a in args:
         if isinstance(a, jax.Array):
@@ -120,7 +127,7 @@ def _dyson_room(ledger, mesh_xy, args):
         shape = (sharding.shard_shape(a.shape) if sharding is not None
                  else NamedSharding(mesh_xy, P(None, "x", "y")).shard_shape(a.shape))
         future += int(np.prod(shape)) * np.dtype(a.dtype).itemsize
-    return max(0, ledger.room_bytes_per_rank(concurrent_with=live) - future)
+    return max(0, int(room) - future)
 
 
 #: The solve-bearing programs per (builder, program, call signature, LU decision): never the room.
@@ -137,14 +144,13 @@ class _Decided:
     name, signature, decision)``, built with this room's plan on a miss and only ever traced
     on that signature: a room that moves without moving the decision lowers and compiles
     nothing again (COMPILEAUDIT 2026-10-05 rule 4).  A value (``builder`` is
-    :func:`_response_programs`' key; ``lu``, that room's plan, is not compared), so equal
+    :func:`_response_programs`' key), so equal
     programs compare equal.  The check-then-set needs no lock: ``compile_ahead`` lowers on
     the calling thread (INVARIANTS 21/25).
     """
     builder: tuple
     name: str
     ledger: object = field(compare=False, repr=False)
-    lu: object = field(compare=False, repr=False)
     resolved: dict = field(default_factory=dict, compare=False, repr=False)
 
     def resolve(self, *args):
@@ -203,7 +209,7 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     """Reuse compiled algebra across SC maps without retaining state arrays.
 
     Returns the builder: ``slope``, the charge ``moments`` (no solve), and
-    ``bind(ledger) -> (dyson, moments, lu)`` with the configured Dyson LU plan;
+    ``bind(ledger) -> (dyson, moments, lu)`` with a local plan or no eager LU;
     each actual call resolves its room (:func:`_dyson_room`: distrib_la takes one_device only where one whole
     matrix fits it, else the distributed library).  On the distributed backend the
     programs that hold the solve are :class:`_Decided`, keyed on that plan's decision and
@@ -312,8 +318,9 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     def bind(ledger):
         # Configuration only: the actual operand batch and live room own the
         # solve route. A charge moment has no LU and must not trip its guard.
-        lu = plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route)
-        progs = local or {name: _Decided(key, name, ledger, lu) for name in names}
+        lu = (plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route)
+              if backend == "off" else None)
+        progs = local or {name: _Decided(key, name, ledger) for name in names}
         pairs = {k.split(":", 1)[1]: v for k, v in progs.items() if k.startswith("pair:")}
         resident = backend == "off" and volume is None
         dyson = SimpleNamespace(value=progs["value"], pair=pairs.get,
@@ -959,36 +966,73 @@ def _operator_token(values):
 
 @lru_cache(maxsize=4)
 def _operator_digest_program(mesh_xy, shape):
-    """Σ bits·(2g+1) mod 2^64 over the real and imaginary words at global flat index g."""
+    """Two nonlinear uint64 word sums, indexed globally and reduced exactly."""
     from jax import shard_map
+    from runtime.padding import padded_axis
     nq, n, m = shape
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    flat = None
+    if n % px or m % py:
+        # Logical SC carries may be odd-width and are already replicated.
+        # Each rank reads a disjoint flat tile, with a local zero tail; no
+        # replicated padded copy is formed and nothing is gathered here.
+        flat = padded_axis(int(np.prod(shape)), mesh_xy, name="operator digest carrier",
+                           spec=P(("x", "y")), axis=0)
+
+    def mix(word):
+        # SplitMix64's public-domain avalanche (S. Vigna, 2015):
+        # https://prng.di.unimi.it/splitmix64.c
+        word = (word ^ (word >> 30))*jnp.uint64(0xbf58476d1ce4e5b9)
+        word = (word ^ (word >> 27))*jnp.uint64(0x94d049bb133111eb)
+        return word ^ (word >> 31)
 
     def local(v):
-        r0 = jax.lax.axis_index("x") * (n // px)
-        c0 = jax.lax.axis_index("y") * (m // py)
-        q = jnp.arange(v.shape[0], dtype=jnp.uint64)[:, None, None]
-        r = (r0 + jnp.arange(v.shape[1])).astype(jnp.uint64)[None, :, None]
-        c = (c0 + jnp.arange(v.shape[2])).astype(jnp.uint64)[None, None, :]
-        g = 2 * ((q * jnp.uint64(n) + r) * jnp.uint64(m) + c)
+        if flat is not None:
+            width = flat.carrier//(px*py)
+            rank = jax.lax.axis_index("x")*py + jax.lax.axis_index("y")
+            index = rank*width + jnp.arange(width, dtype=jnp.int64)
+            v = jnp.take(v.reshape(-1), index, mode="fill", fill_value=0)
+            g = 2*index.astype(jnp.uint64)
+        else:
+            r0 = jax.lax.axis_index("x") * (n // px)
+            c0 = jax.lax.axis_index("y") * (m // py)
+            q = jnp.arange(v.shape[0], dtype=jnp.uint64)[:, None, None]
+            r = (r0 + jnp.arange(v.shape[1])).astype(jnp.uint64)[None, :, None]
+            c = (c0 + jnp.arange(v.shape[2])).astype(jnp.uint64)[None, None, :]
+            g = 2 * ((q * jnp.uint64(n) + r) * jnp.uint64(m) + c)
         bits = jax.lax.bitcast_convert_type(jnp.stack([v.real, v.imag], -1), jnp.uint64)
-        total = jnp.sum(bits[..., 0] * (2 * g + 1) + bits[..., 1] * (2 * g + 3), dtype=jnp.uint64)
-        return jax.lax.psum(total, ("x", "y"))  # exact-reduce: uint64 checksum
-    return jax.jit(shard_map(local, mesh=mesh_xy, in_specs=P(None, "x", "y"), out_specs=P(),
-                             check_vma=False))
+        positions = g[..., None]+jnp.arange(2, dtype=jnp.uint64)
+        words = bits ^ mix(positions+jnp.uint64(0x9e3779b97f4a7c15))
+        valid = positions < 2*int(np.prod(shape))
+        first = jnp.sum(jnp.where(valid, mix(words), 0), dtype=jnp.uint64)
+        second = jnp.sum(jnp.where(valid, mix(words+jnp.uint64(0xd1b54a32d192ed03)), 0),
+                         dtype=jnp.uint64)
+        return jax.lax.psum(jnp.stack([first, second]), ("x", "y"))
+    return jax.jit(shard_map(local, mesh=mesh_xy,
+        in_specs=P() if flat is not None else P(None, "x", "y"),
+        out_specs=P(), check_vma=False))
 
 
-def operator_digest(values, mesh_xy):
-    """A device digest of a face-tiled operator ``[nq, n, m]``: one 64-bit word per
-    value position, summed with its global index, the same at every P.  Kept per
-    operator object (the bare V is one object for the run)."""
-    hit = _OPERATOR_DIGESTS.get(id(values))
+def operator_digest(values, mesh_xy, *, cache=True):
+    """A device digest of an operator ``[nq, n, m]``, the same at every P.
+
+    Face-divisible operators use their distributed faces. A logical ragged
+    SC carry must already be replicated; disjoint all-P flat tiles hash it
+    without gathering or forming a padded matrix. Kept per
+    operator object (the bare V is one object for the run). Set ``cache=False``
+    for temporary operators whose storage must be released after hashing."""
+    hit = _OPERATOR_DIGESTS.get(id(values)) if cache else None
     if hit is not None and hit[0] is values:
         return hit[1]
     mesh = values.sharding.mesh if mesh_xy is None else mesh_xy
-    word = int(np.asarray(_operator_digest_program(mesh, tuple(values.shape))(values)))
-    digest = hashlib.sha256(f"{tuple(values.shape)}:{word:016x}".encode()).hexdigest()
-    _OPERATOR_DIGESTS[id(values)] = (values, digest)
+    if ((values.shape[1] % int(mesh.shape["x"]) or values.shape[2] % int(mesh.shape["y"]))
+            and not values.sharding.is_fully_replicated):
+        raise ValueError("operator_digest: a ragged matrix must already be replicated; no gather is allowed")
+    words = np.asarray(_operator_digest_program(mesh, tuple(values.shape))(values))
+    witness = "".join(f"{int(word):016x}" for word in words)
+    digest = hashlib.sha256(f"operator-mix128-v1:{tuple(values.shape)}:{witness}".encode()).hexdigest()
+    if cache:
+        _OPERATOR_DIGESTS[id(values)] = (values, digest)
     return digest
 
 

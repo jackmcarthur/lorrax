@@ -254,10 +254,10 @@ $e^{i(Q_s+G)\cdot r}$ of $M_{vc}(G)$, which selects the density component of
 momentum $Q-G$; the tile momentum is $+Q$ all the same. At Q = 0 the two
 labels are one tile; at Q ≠ 0, $V(-Q)$ is the time-reversed tile, and E12 with
 it misses the plane-wave exchange (`bsemat_export.exchange_tile_momentum`;
-`tests/test_bsemat_finite_q_cpu.py` checks E12 against a plane-wave sum and
+`tests/test_exciton_exchange_momentum_cpu.py` checks E12 against a plane-wave sum and
 fails the $-Q$ tile). The tile comes from `bse.exchange_path.exchange_tiles`, the
-evaluator `bse.exciton_bands` solves with. That evaluator labels the tile of its
-argument $Q'$ as wrap$(-Q')$, so the writer calls it with $-Q$. The three cases
+evaluator `bse.exciton_bands` solves with. Both consumers pass the physical
+exciton momentum $Q$ to the same $\mathrm{wrap}(+Q)$ owner. The three cases
 (`bsemat_export.finite_q_legs`):
 
 | Q | `qflag` | electron leg (WFN_co) | hole leg | exchange tile |

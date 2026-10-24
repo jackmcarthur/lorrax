@@ -406,6 +406,7 @@ _SHARED_C_ENTRY_POINTS = (
     "lrx_phdf5_pending_controls",
     # The ROCM leg's k-box image prebuild (kdft/kbox_rspace_ffi.cc; ffi.fft._kbox_prebuild).
     "lrx_kbox_rspace_prebuild",
+    "lrx_kminor_workspace_bytes",
 )
 
 #: platform -> the suffix ``LRX_C_ENTRY`` appends on that leg.

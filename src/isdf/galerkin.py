@@ -660,12 +660,6 @@ def _nodal_face(phi, indices, mesh, extra_rank_pad=0):
     nb_pad = -(-nb // p) * p
     yspec = P(None, 'x', None, 'y')
     face = NamedSharding(mesh, P(None, 'x', 'y'))
-    phi = jax.jit(lambda a: jnp.pad(a, ((0, 0), (0, nb_pad - nb),
-                                       (0, 0), (0, 0))),
-                   out_shardings=NamedSharding(mesh, yspec))(phi)
-    flat = jax.jit(shard_map(lambda a: a.reshape(a.shape[:2] + (-1,)),
-        mesh=mesh, in_specs=yspec, out_specs=P(None, 'x', 'y'),
-        check_vma=False), out_shardings=face)(phi)
     indices = np.asarray(indices, dtype=np.int32)
     local = nmu // p
     source = np.concatenate([(indices // local) * (ns * local)
@@ -673,9 +667,15 @@ def _nodal_face(phi, indices, mesh, extra_rank_pad=0):
     physical = ns * len(indices)
     carrier = _rank_carrier(physical, mesh, extra_rank_pad)
     source = np.pad(source, (0, carrier - physical))
-    flat = permute_sharded_axis(flat, 2, source, mesh, P(None, 'x', 'y'))
-    return jax.jit(lambda a: a * (jnp.arange(carrier) < physical),
-                   out_shardings=face)(flat)
+    @partial(jax.jit, out_shardings=face)
+    def nodal(a):
+        a = jnp.pad(a, ((0, 0), (0, nb_pad - nb), (0, 0), (0, 0)))
+        flat = shard_map(lambda x: x.reshape(x.shape[:2] + (-1,)),
+            mesh=mesh, in_specs=yspec, out_specs=P(None, 'x', 'y'),
+            check_vma=False)(a)
+        flat = permute_sharded_axis(flat, 2, source, mesh, P(None, 'x', 'y'))
+        return flat * (jnp.arange(carrier) < physical)
+    return nodal(phi)
 
 
 def _compact_rows(face, nb, mesh):

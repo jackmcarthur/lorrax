@@ -491,9 +491,20 @@ intermediate that XLA's scratch allocator grants per call:
 A chunk only groups pairs into launches and chunks own disjoint outputs, so
 the chunk size never changes a value. The compiled program's
 `memory_analysis()` does not count this scratch, so callers price it
-([memory model](memory-model.md#native-handlers)). Apart from these
-intermediates the kernels allocate no device workspace beyond dynamic shared
-memory and their static tile tables (`pinfo`, counted in the opt-in check).
+([memory model](memory-model.md#native-handlers)). On ROCm, mode 4's split k-minor plan with `out_layout=1` additionally
+needs one local input-sized work buffer: its final permuted store cannot
+run in place. `ffi.fft.kminor_workspace_bytes` asks the loaded provider's
+`lrx_kminor_workspace_bytes_rocm` for the exact plan selected by
+`kdft_kminor_plan.h`; layout 0 and transform-only mode 5 use no extra work
+buffer. `runtime.aot_memory` reads each compiled local call's geometry and
+includes the largest native work buffer alongside XLA's buffer assignment.
+A stale library missing this query refuses with `GATE kminor-workspace-query`:
+rebuild the ROCm leg in a new build directory. The handler ABI is unchanged.
+CUDA's single-pass mathdx mode 4 has no such buffer.
+
+Apart from these intermediates the kernels allocate no device workspace
+beyond dynamic shared memory and their static tile tables (`pinfo`, counted
+in the opt-in check).
 
 **Tile-table load** (modes 7 and 11, single arm, $n_s = 4$, sm_80 and newer).
 The plain load keeps one pair's gathered values $g$, $U_k$ and the right

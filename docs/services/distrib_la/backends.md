@@ -159,6 +159,17 @@ route; the request is still honoured.
 | Cholesky, explicit request | cuSOLVERMp batched `potrf` / `potrs` | `native2d` |
 | GEMM, distributed | `panel_matmul` (XLA SUMMA; local products on cuBLAS) | `panel_matmul` (XLA SUMMA; local products on JAX dot panels) |
 
+On ROCm, `local_eigh` also routes single complex128 matrices of side
+128–3120 through the existing native batched provider with batch one. The
+reflector, triangle selection and finite/info checks stay the same. The
+3072-state tutorial Gram failed in the fused reflector/jaxlib expression.
+Both solvers passed on the same separately materialized reflected matrix,
+and the native vectors passed the back-transform residual on the input.
+The compiler or layout cause is unresolved; the route changes the solve
+boundary without a universal driver or speed claim. Its workspace is priced by the same
+batched row. Real single matrices, CPU/CUDA and out-of-window sizes retain
+their previous routes.
+
 Device-side distributed algebra on NVIDIA is cuSOLVERMp, which communicates
 through NCCL.
 
@@ -375,3 +386,25 @@ the LORRAX loader also reaches the handler.
    (`cusolvermp_eigh_test.py`) that asserts the
    residual ($AZ - Z\,\mathrm{diag}(w)$, or the factor's reconstruction) on a
    real mesh, and update the tables on this page.
+
+### Local SVD and least squares
+
+`svd_local` and `lstsq_local` own device-local SVD driver selection. ROCm
+uses JAX's explicit QR-SVD (`hipsolver_gesvd`) for the padded complex
+Hessenberg solve shared by FEAST and the ladder response. Frontier's default
+small-matrix Jacobi SVD stalled in actual GMRES execution; this selects a
+stable SVD driver, without forming normal equations or changing tolerance.
+CPU and CUDA retain their existing JAX calls. The least-squares result uses
+JAX's singular-value cutoff (`eps * max(m,n)` when `rcond=None`) and the
+minimum-norm solution, including rank-deficient matrices and zero padded
+columns. The existing true-residual gates still decide whether a solve is
+usable. No callback, host matrix transfer or new tuning option is added.
+
+For the shared GMRES solve, `lstsq_hessenberg_local(H,g,k)` additionally
+uses the exact active Arnoldi prefix on ROCm. Static power-of-two SVD
+widths start at8 and end at the full capacity; only the final SVD branches
+vary. The coefficient output is zero-padded to capacity, while its cutoff
+remains `eps * max(H.shape)` of the full carrier. Zero and rank-deficient
+breakdowns retain the minimum-norm result. Full-carrier finite and zero-tail
+checks prevent trimming from concealing an invalid operator result. CPU
+and CUDA retain the original full-size computation.

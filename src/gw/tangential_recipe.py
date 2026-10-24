@@ -77,7 +77,9 @@ shared_real_pole_v1_r3b = {
 _GATE_ROWS = {
     "normalized_gram_keep": ("retain gamma/gamma_max strictly above cut", 1.0e-8),
     "normalized_gram_validity": ("gamma_min/gamma_max >= threshold; every route (the even parent Gram takes the larger of this and gram_rounding_validity)", -1.0e-7),
-    # The exact Gram is PSD, so a negative computed eigenvalue is rounding.
+    # Under the stable positive-spectral-measure premise, the exact Gram is PSD.
+    # Negative computed eigenvalues can reflect rounding, response-solve error
+    # or an unstable input model; this bound covers rounding only.
     # Weyl: gamma_min >= -||E||_2 >= -gamma_n ||D^-1/2 Sigma D^-1/2||_F with
     # Sigma the uncancelled magnitude of each divided-difference entry
     # (tangential_reduction.gram_rounding_floor), plus R u gamma_max for the solver.
@@ -719,9 +721,11 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
 def bind_tangential_sc_identity(meta, state, *, occupation_state, print_fn):
     """Label current SC scratch, without claiming QP provenance (ruling 22).
 
-    ``state`` supplies the current iteration. Reuse the carried occupation
-    digest or the already-bound insulating census digest; compute no new hash.
-    These labels MUST NOT authenticate restart membership or skip construction.
+    ``state`` supplies the current iteration and input Hamiltonian. Reuse
+    the carried occupation digest or the bound insulating census digest.
+    The actual input Hamiltonian digest distinguishes repeated evaluations
+    of one iteration, including isospectral rotations. These labels still
+    MUST NOT authenticate external restart membership or publication.
     """
 
     iteration = operator.index(state.iteration)
@@ -733,13 +737,15 @@ def bind_tangential_sc_identity(meta, state, *, occupation_state, print_fn):
                 meta.tangential_census.get('occupation_sha256'))
     if not isinstance(occ_hash, str) or not occ_hash:
         raise ValueError("GATE tangential_sc_identity: current occupation label is missing")
-    identity = dict(hamiltonian=f'sc_map_{iteration}:{occ_hash}',
+    from .response_bank import operator_digest
+    hamiltonian = operator_digest(state.H_qp_dft, None, cache=False)
+    identity = dict(hamiltonian=f'sc_map_{iteration}:{hamiltonian}',
                     wavefunctions='qp_rotation_unreceipted',
                     recipe_hash=recipe['recipe_hash'], gate_hash=recipe['gate_hash'],
                     authentication='NON-AUTHENTICATING')
     meta.tangential_state_identity = identity
     log.info(f"tangential SC identity NON-AUTHENTICATING: {identity}; "
-             "scratch only; rebuild every map; no restart reuse or publication")
+             "scratch only; current-H input bound; no external restart reuse or publication")
     return dict(identity)
 
 

@@ -36,6 +36,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 import common.timing as timing
 from . import bsemat_algebra as A
+from .exchange_path import exchange_tile_momentum
 from common.log import get_logger
 
 log = get_logger(__name__)
@@ -263,22 +264,6 @@ def htransform_window(input_file, kpts, *, n_val, n_cond, n_rmu, mesh_xy):
     return psi, enk, receipts
 
 
-def exchange_tile_momentum(Q):
-    """The tile momentum of the finite-Q exchange: wrap(+Q), crystal.
-
-    Row k's exchange contracts conj(ρ_vc) on the left and ρ_v'c' on the right,
-    ρ_vc = ψ*_{v,k−Q} ψ_{c,k}, a density of momentum +Q. LORRAX's tile V_q
-    contracts a left density of momentum −q against a right one of momentum
-    +q (the direct term takes W(k − k') with C_cc', momentum k' − k, on the
-    left), so the exchange takes q = +Q (docs/theory/bgw-bsemat-export.md#finite-q,
-    E12). At Q = 0 both labels are one tile; at finite Q they are different
-    tiles (conjugate under time reversal) and only +Q reproduces the plane-wave
-    exchange (``tests/test_bsemat_finite_q_cpu.py``).
-    """
-    q = np.asarray(Q, dtype=np.float64).reshape(3)
-    return q - np.round(q)
-
-
 def exchange_tile(Q, qflag, *, data, input_file, restart, grid, n_rmu, n_rmu_pad, mesh_xy):
     """The exchange tile the file contracts (μ, ν) at ``P('x','y')``, and its receipt.
 
@@ -288,8 +273,7 @@ def exchange_tile(Q, qflag, *, data, input_file, restart, grid, n_rmu, n_rmu_pad
     plane wave e^{i(Q_s+G)·r} (``kernel_main.f90``: ``vcoularray(:, nf+1)`` at
     ``finiteq`` = Q_s = −Q) picks the density component of momentum Q − G
     (E12). The tile comes from ``bse.exchange_path.exchange_tiles``, the
-    evaluator ``bse.exciton_bands`` solves with; that evaluator labels the
-    tile of its argument Q' as wrap(−Q'), so it is called with −Q. On the
+    evaluator ``bse.exciton_bands`` solves with, using the same +Q. On the
     grid it is the stored tile (``ongrid``, exact); off the grid it is the
     per-Q ζ refit on the BSE window (``refit``, the arbitrary-Q route).
     """
@@ -309,7 +293,7 @@ def exchange_tile(Q, qflag, *, data, input_file, restart, grid, n_rmu, n_rmu_pad
         route, refit = "refit", (rst["zx_fit"], rst)
     q_tile = exchange_tile_momentum(Q)
     V_stack, _, _, _ = exchange_tiles(
-        -q_tile.reshape(1, 3), route=route, mesh_xy=mesh_xy,          # its tile is wrap(-arg) = q_tile
+        q_tile.reshape(1, 3), route=route, mesh_xy=mesh_xy,
         V_q0=data["V_q0"], V_ongrid=data.get("V_q_full"), kgrid_vq=np.asarray(grid),
         n_rmu=n_rmu, n_rmu_pad=n_rmu_pad, refit=refit, log_fn=_log)
     V = jax.jit(lambda s: s[0], out_shardings=NamedSharding(mesh_xy, P("x", "y")))(V_stack)

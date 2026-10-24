@@ -659,6 +659,62 @@ def read_q_rows(src, iq, mesh):
     return V, W, Z
 
 
+@functools.lru_cache(maxsize=None)
+def _fourier_partner_program(mesh):
+    """Exact scalar Fourier action on μ-owned ζ; G gathers remain rank-local."""
+    owner = NamedSharding(mesh, P(None, _XY, None))
+    rep = NamedSharding(mesh, P())
+
+    def apply(zeta, slots, phase):
+        padded = jnp.pad(zeta, ((0, 0), (0, 0), (0, 1)))
+        return jnp.conj(jnp.take(padded, slots, axis=2)) * phase[None, None, :]
+    return jax.jit(apply, in_shardings=(owner, rep, rep), out_shardings=owner)
+
+
+def fixed_q_zeta_basis(src, iq, Z, *, mesh):
+    """Use the producer's measured Θ-even Fourier basis at fixed-q parents.
+
+    The producer group-averages V on these rows. Realize the same symmetry
+    on ζ itself before every normalization/export contraction. The unchanged
+    V reconstruction gate still rejects a non-negligible odd-basis metric.
+    """
+    if src.q_tables is None:
+        return Z, None
+    from .qgrid_symmetry import qgrid_trs_policy_for
+    tables = src.q_tables
+    policy = qgrid_trs_policy_for(sym=src.sym, irr_idx_q=tables.irr_idx_q,
+        sym_idx_q=tables.sym_idx_q, kgrid=src.kgrid,
+        n_sym_spatial=tables.n_sym_spatial, context="epsilon Fourier basis")
+    full, _ = match_q_umklapp(src.q_full, src.q_stored[iq][None])
+    if int(full[0]) < 0:
+        raise ValueError("Stored epsilon parent must name an exact full-grid q")
+
+    def partner():
+        rows = np.arange(2*tables.n_sym_spatial, dtype=np.int32)
+        action, translation, anti = src.sym.operation_rows(rows)
+        pure = np.flatnonzero(np.asarray(anti) &
+            np.all(np.asarray(action) == -np.eye(3, dtype=int), axis=(1, 2)) &
+            np.all(np.abs(translation) < 1e-12, axis=1))
+        if pure.size != 1:
+            raise ValueError("Measured TRS requires one exact identity-time-reversal row")
+        sphere = src.zeta.gvecs(q=[iq])[0]
+        ngk = int(src.zeta.ngk_valid(q=[iq])[0])
+        row = QPlan(0, iq, src.q_stored[iq], np.zeros(3, int), None, int(pure[0]))
+        miller, phase, conjugate = parent_gvectors(src, row, sphere[:ngk])
+        slots = zeta_slots(sphere, ngk, miller, fill=Z.shape[2])
+        if not conjugate or np.any(slots >= ngk):
+            _refuse("epsmat_theta_sphere", f"stored q {iq} has missing Θ G partners",
+                    "an exactly Θ-closed stored sphere", "a Fourier leg needs its exact image",
+                    "use the producer's own ζ sphere")
+        padded = np.full(Z.shape[2], Z.shape[2], dtype=np.int32)
+        padded[:ngk] = slots
+        phases = np.zeros(Z.shape[2], dtype=np.complex128)
+        phases[:ngk] = 1.0 if phase is None else phase
+        return _fourier_partner_program(mesh)(Z, jnp.asarray(padded), jnp.asarray(phases))
+
+    return policy.project_fixed_q(Z, full, antiunitary_partner=partner)
+
+
 def q_algebra(src, iq, mesh, *, rcond, print_fn=None):
     """Stored q ``iq`` on faces: ``(Z, B, K, chi, V, Wc, diag)``; gates V and W.
 
@@ -669,6 +725,7 @@ def q_algebra(src, iq, mesh, *, rcond, print_fn=None):
     """
     from isdf import cplus
     V, W, Z = read_q_rows(src, iq, mesh)
+    Z, theta_removed = fixed_q_zeta_basis(src, iq, Z, mesh=mesh)
     p = _square_side(mesh)
     sphere = src.zeta.gvecs(q=[int(iq)])[0]
     ngk = int(src.zeta.ngk_valid(q=[int(iq)])[0])
@@ -697,7 +754,9 @@ def q_algebra(src, iq, mesh, *, rcond, print_fn=None):
     ev = face_spectrum(K, src.eigh)
     log.info(f"  q {iq} {np.round(src.q_stored[iq], 6).tolist()}: |V_rec−V|/|V|={err_v:.2e} "
              f"|W−Wᴴ|/|W|={herm_w:.2e} K∈[{ev[0]:.4f}, {ev[-1]:.2e}]")
-    diag = {"err_v": err_v, "herm_w": herm_w, "k_min": float(ev[0]), "k_max": float(ev[-1])}
+    diag = {"err_v": err_v, "herm_w": herm_w, "k_min": float(ev[0]), "k_max": float(ev[-1]),
+            "zeta_anti_theta_removed": (None if theta_removed is None else
+                                         np.asarray(theta_removed).tolist())}
     return Z, B, K, chi, V, Wc, diag
 
 

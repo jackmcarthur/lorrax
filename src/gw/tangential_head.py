@@ -185,6 +185,34 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
 
     if config.head.uses_bgw_metal_q0shift:
         raise ValueError("GATE tangential_head: shifted finite-q BGW head is not a Gamma head")
+    response_samples = getattr(response, "samples", ())
+    micro = bool(response_samples and all(
+        str(getattr(getattr(sample, "response_kind", None), "value",
+                    getattr(sample, "response_kind", ""))) == "micro_reducible"
+        for sample in response_samples))
+    scalar = getattr(response, 'scalar_model', None)
+    if scalar is not None:
+        from .ladder_head_fit import HEAD_FIT_POLICY
+        diagram = getattr(config.screening.diagrams,'value',config.screening.diagrams)
+        if (diagram!='w_bse' or material_class!='insulator' or not micro
+                or config.head.correction is not HeadCorrection.FULL
+                or not scalar.get('completion')
+                or scalar.get('provenance',{}).get('head_fit_policy')!=HEAD_FIT_POLICY):
+            raise ValueError('GATE tangential_head_model: current physical ladder certificate required')
+        head_identity=scalar['provenance'].get('head_identity',{})
+        if (head_identity.get('head_fit_policy')!=HEAD_FIT_POLICY or
+                any(head_identity[key]!=value for key,value in handle['identity'].items()
+                    if key in head_identity)):
+            raise ValueError('GATE tangential_head_identity: current ladder and head identities differ')
+        head=dict(scalar,identity=handle['identity'],body_digest=handle['digest'])
+        head['provenance']=dict(head['provenance'],body_digest=handle['digest'],
+            head_identity=dict(handle['identity'],**head_identity))
+        iteration=dataclasses.replace(response,
+            sigma_energies_ry=np.asarray(wfns.enk[:,wfns.slices.sigma]),
+            sigma_occupations=np.asarray(wfns.occ[:,wfns.slices.sigma]) if occupation_state is None else
+                np.asarray(occupation_state.f_kn[:,wfns.slices.sigma]),
+            efermi_ry=float(meta.tangential_recipe['census']['mu_ry']),scalar_model=head)
+        return head,iteration
     if plan is None:
         plan = tangential_head_plan(config, meta.tangential_recipe,
                                       material_class=material_class)
@@ -200,7 +228,7 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
     ledger = meta.tangential_capacity
     ambient = ledger.live_stages
     samples = []
-    if full:
+    if full and not micro:
         if header is None:
             from file_io.tangential_store import validate_tangential_model
             header = validate_tangential_model(handle["path"], expected_identity=handle["identity"],
@@ -257,6 +285,12 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
     with timing.section("head.sample_terms", announce=True,
                         label="tangential head sample terms"):
         for index, point in enumerate(points):
+            if micro:
+                # The density ladder has already summed microscopic local
+                # fields. Its common head owner restores only the omitted
+                # macroscopic Coulomb term; a Schur fold here counts twice.
+                samples.append(response_samples[index])
+                continue
             total = None
             if full:
                 value = evaluate(jnp.asarray(nodes[index], jnp.complex128), *args)
@@ -269,7 +303,7 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
             del total
             if full:
                 del value
-        if full:
+        if full and not micro:
             del args, b, poles, counts
     if terms:
         rows = [t for t in terms if isinstance(t, dict)]
@@ -294,7 +328,8 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
         # The rows past the fit nodes include the imaginary-axis moment rule,
         # folded through this same exact Gamma body (qsgw_head.head_moment_m1).
         head = fit_head_samples(samples[:len(z)], z, int(config.mpa.n_poles),
-            model="qsgw_schur_"+config.mpa.pole_solver if full else "dft_direct_"+config.mpa.pole_solver,
+            model=("bse_resolvent_micro_" if micro else "qsgw_schur_" if full else
+                   "dft_direct_")+config.mpa.pole_solver,
             solve=config.mpa.pole_solver, occupation_state=occupation_state,
             moment_m1=head_moment_m1(samples, points, metal=material_class == "metal"))
     if jax.process_index() == 0:

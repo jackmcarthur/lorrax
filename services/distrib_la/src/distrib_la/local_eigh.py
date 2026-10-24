@@ -58,6 +58,27 @@ target is not loadable refuses by GATE ``batched_eigh_target`` (no fallback to t
 Gate: ``tests/test_rocsolver_eigh_gate.py`` (residual, orthogonality, eigenvalues and
 eigenspaces against ``jnp.linalg.eigh`` on the same GCD).
 
+SINGLE COMPLEX MATRICES: the same ROCm row takes batch 1 in its measured
+n=128..3120 window, with an explicit leading batch axis at the native call.
+On the actual 3072-state tutorial Gram, the fused reflector/jaxlib expression
+was non-finite. Both drivers passed when fed the SAME separately materialized
+reflected B, and native vectors passed the back-transform residual on A.
+This is evidence of a composition-sensitive failure, not a universal jaxlib
+driver defect; the compiler/layout cause is unresolved. This route changes
+only the solve boundary to the existing provider. The HAH construction, UPLO contract and
+failure gates are unchanged. CPU, CUDA, real single matrices and the existing
+small/large-n exclusions retain their previous routes.
+
+A finite single complex128 ROCm matrix that still produces non-finite pairs is
+retried on the SAME reflected matrix by the existing Jacobi eigensolver. The
+device conditional adds no host synchronization. A missing required target
+still refuses; invalid inputs never enter this retry, and failure of both
+solvers remains non-finite. The compiled conditional prices its overlapping
+XLA buffers. Callers add provider scratch separately through the shared
+workspace owner: JAX allocates Jacobi scratch inside its FFI handler.
+Batched callers retain their existing
+result-check and retry policy.
+
 VALID, NOT IDENTICAL.  The batched driver and jaxlib's loop are both backward stable, not
 bitwise equal: on exactly degenerate eigenvalues they return different orthonormal bases of
 the same eigenspaces, and elsewhere they differ at rounding level.  No caller may depend on
@@ -121,7 +142,8 @@ class BatchedEighRow(NamedTuple):
 #: ``jnp.linalg.eigh``.  ROCM windows, one MI250X GCD (pool logs eigh_bench1, eigh_bench2;
 #: speedup = jnp.linalg.eigh / target): heevd | syevd, b = 2: 1.9x at n = 40..312, 1.36x at
 #: 1960, 1.18x at 3120; b = 16: 10.7x | 12.0x at n = 40, 9.3x | 9.6x at n = 312; b = 64,
-#: n = 128: 29.7x | 30.0x.  Outside: b = 1 is the same zheevd call (1.00x); n = 16 jaxlib's
+#: n = 128: 29.7x | 30.0x. Complex batch 1 addresses the composition-sensitive
+#: fused-reflector failure above, not a speed claim. Outside: n = 16 jaxlib's
 #: small-n path wins (0.6-0.8x); n = 32 is mixed (c128 1.1-1.27x at b <= 16 but 0.78x at
 #: b = 64; f64 0.84-1.08x), so min_n = 40, the smallest n measured to win at every batch
 #: (1.86x at b = 2); n > 3120 not measured.  heevdj (eigh_bench3) only
@@ -133,7 +155,7 @@ BATCHED_EIGH_ROUTE = {"ROCM": BatchedEighRow("lorrax_rocsolver_batched_eigh", {
     # rocSOLVER's silent NaN), with jaxlib's loop it misses tolerance by 0.110 eV, with the loop
     # on a second reflection it passes.  Lift this when that stage no longer depends on the
     # solver's rounding.
-    "complex128": EighWindow("heevd", min_batch=2, min_n=128, max_n=3120, workspace_tiles=4),
+    "complex128": EighWindow("heevd", min_batch=1, min_n=128, max_n=3120, workspace_tiles=4),
     "float64":    EighWindow("syevd", min_batch=2, min_n=40, max_n=3120, workspace_tiles=5)})}
 
 
@@ -219,11 +241,25 @@ def _native_batched_eigh(row, a):
 
 def _solve(b):
     """The solve of a full Hermitian stack: the leg's batched target where its row covers the
-    stack, else ``jnp.linalg.eigh`` (exactly the call the reflector route always made)."""
+    stack, else ``jnp.linalg.eigh``. A finite single complex128 ROCm matrix whose
+    preferred solver returns non-finite pairs is retried by the existing
+    Jacobi owner on this SAME matrix. Both failures remain non-finite."""
     row = batched_eigh_row(b.shape, b.dtype)
     if row is None:
-        return jnp.linalg.eigh(b)
-    return _native_batched_eigh(row, b)
+        result = jnp.linalg.eigh(b)
+    elif b.ndim == 2:
+        w, v = _native_batched_eigh(row, b[None])
+        result = w[0], v[0]
+    else:
+        return _native_batched_eigh(row, b)
+    if (b.ndim != 2 or b.dtype != jnp.complex128
+            or _process_leg_key() != "ROCM"):
+        return result
+    w, v = result
+    retry = (jnp.all(jnp.isfinite(b))
+             & ~(jnp.all(jnp.isfinite(w)) & jnp.all(jnp.isfinite(v))))
+    return jax.lax.cond(retry, lambda _: tuple(eigh_local_jacobi(b)),
+                        lambda _: (w, v), operand=None)
 
 
 def _full(a, UPLO, symmetrize_input):

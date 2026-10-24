@@ -1,4 +1,4 @@
-"""True per-rank peak HBM for a compiled JAX kernel — FFT plan scratch included.
+"""True per-rank peak HBM for a compiled JAX kernel — FFT workspace included.
 
 ``compiled.memory_analysis()`` reports ONLY what XLA's buffer assignment
 placed (``temp + argument + output - alias``).  A cuFFT plan's *workspace*
@@ -21,6 +21,14 @@ peak rose by exactly ``hipfftMakePlanMany``'s ``workSize`` on seven c128 3D
 boxes, 0 to 131.1 MB; a 1D 1009 x 4096 case gave no reading, Runtime-LEGS
 lane 2026-10-15).  The ``cufft_*`` field and error
 names are historical; they mean the leg's plan library.
+
+ROCm's native k-minor convolution also obtains hidden scratch from the arena:
+its split plan with output layout 1 uses one local input-sized buffer. The
+compiled HLO supplies the local shape and grid, and the loaded provider's
+``lrx_kminor_workspace_bytes_rocm`` evaluates the same ``plan_kminor`` used by
+the handler. A missing query or unparseable native call refuses by name and
+requires a rebuild/parser update; this exact contract has no guessed fallback.
+Only the largest dynamic workspace is added for the serialized executable.
 
 Public API: :func:`aot_kernel_peak_bytes` ``(compiled, platform=None) ->
 AotPeakBreakdown``; compare ``.total`` against the per-rank budget.  The
@@ -104,13 +112,14 @@ class AotPeakBreakdown:
                        ``memory_analysis()`` — XLA-visible buffers only.
     ``cufft_scratch``  max plan workspace over the distinct FFT ops (only
                        one plan's scratch is live at a time inside a kernel).
-    ``total``          ``compiled_peak + cufft_scratch`` — compare to budget.
+    ``native_scratch`` exact native k-minor provider workspace.
+    ``total``          ``compiled_peak + max(cufft_scratch, native_scratch)``.
     ``cufft_measured`` ``False`` means the cuFFT query was unavailable, so
                        ``cufft_scratch = 0`` is a KNOWN-LOW placeholder.
     ``fft_specs``      the plans parsed out of the HLO.
     ``resident_increment`` extra bytes above arguments that a caller has
                        already counted as resident: ``temp + output - alias``
-                       plus cuFFT scratch.
+                       plus the largest dynamic FFT workspace.
     """
     compiled_peak: int
     cufft_scratch: int
@@ -118,6 +127,7 @@ class AotPeakBreakdown:
     cufft_measured: bool
     fft_specs: tuple[FftSpec, ...]
     resident_increment: int = 0
+    native_scratch: int = 0
 
 
 class HloFftParseError(RuntimeError):
@@ -204,6 +214,47 @@ def parse_fft_specs_from_hlo(hlo_text: str) -> list[FftSpec]:
             "XLA may have changed its lowered HLO format.  Update _FFT_OP_RE "
             "in src/runtime/aot_memory.py.")
     return specs
+
+
+class NativeFftQueryError(RuntimeError):
+    """A native FFT call cannot be priced from its exact provider plan."""
+
+
+def native_fft_workspace_bytes(hlo_text: str) -> int:
+    """Largest hidden k-minor allocation in this serialized executable.
+
+    Only ROCm's native convolution has an extra arena allocation: its split
+    plan with output layout 1. XLA's FFTs are priced separately; CUDA's
+    one-pass mathdx k-minor call and native transform-only calls have none.
+    Read the *compiled local* shape, then ask the loaded provider's same plan
+    used by the handler. A parser miss or stale native library must refuse;
+    no guessed zero or duplicated split-policy threshold is admissible.
+    """
+    target = re.compile(r'custom_call_target\s*=\s*"lorrax_kdft_kconv_kminor"')
+    largest = 0
+    for line in hlo_text.splitlines():
+        if not target.search(line):
+            continue
+        output = re.search(
+            r"=\s*(c64|c128)\[([\d,\s]+)\](?:\{[\d,\s]*\})?\s+custom-call\(", line)
+        config = line.partition("backend_config=")[2]
+        attrs = dict(re.findall(r"\b(nkx|nky|nkz|out_layout)\s*=\s*(-?\d+)\s*:\s*i64", config))
+        if output is None or set(attrs) != {"nkx", "nky", "nkz", "out_layout"}:
+            raise NativeFftQueryError("GATE native-fft-workspace: cannot parse native k-minor "
+                "output/attributes from compiled HLO; update its parser before admission")
+        shape = tuple(int(v) for v in output[2].split(",") if v.strip())
+        kg = tuple(int(attrs[k]) for k in ("nkx", "nky", "nkz"))
+        layout = int(attrs["out_layout"])
+        if len(shape) != 6 or layout not in (0, 1):
+            raise NativeFftQueryError("GATE native-fft-workspace: invalid native k-minor "
+                                      f"output shape/layout {shape}/{layout}")
+        # Layout 1 writes (d0,nk,d3,d1,d4,d2), while the provider plans X.
+        local_input = shape if layout == 0 else tuple(shape[i] for i in (0, 3, 5, 2, 4, 1))
+        from ffi.fft import kminor_workspace_bytes
+        size = kminor_workspace_bytes(kg, local_input,
+            "complex64" if output[1] == "c64" else "complex128", out_layout=layout)
+        largest = max(largest, size)
+    return largest
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +525,7 @@ _PEAKS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
                           ) -> AotPeakBreakdown:
     """Per-rank peak HBM for ``compiled`` (a ``jax.stages.Compiled``),
-    XLA-visible buffers **plus** the cuFFT plan workspace XLA cannot see.
+    XLA-visible buffers **plus** the largest dynamic FFT workspace XLA cannot see.
 
     ``platform`` declares the executable's backend (``"gpu"``/``"cuda"`` vs
     anything else); leave it ``None`` to infer from this process's devices.
@@ -510,10 +561,12 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
         - int(m.alias_size_in_bytes),
     )
 
+    hlo_text = compiled.as_text()
+    native_scratch = native_fft_workspace_bytes(hlo_text)
     cufft_scratch, measured = 0, True
     api = _fft_plan_api(platform)
     try:
-        fft_specs = tuple(parse_fft_specs_from_hlo(compiled.as_text()))
+        fft_specs = tuple(parse_fft_specs_from_hlo(hlo_text))
     except HloFftParseError as exc:
         fft_specs = ()
         if api:
@@ -538,13 +591,17 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
                 f"priced as twice the largest FFT op's data, "
                 f"{cufft_scratch / 1e9:.2f} GB for this kernel")
 
+    # Both plan families allocate only for the duration of their call on the
+    # executable stream; price the largest dynamic workspace, not their sum.
+    scratch = max(cufft_scratch, native_scratch)
     peak = AotPeakBreakdown(
         compiled_peak=compiled_peak,
         cufft_scratch=cufft_scratch,
-        total=compiled_peak + cufft_scratch,
+        total=compiled_peak + scratch,
         cufft_measured=measured,
         fft_specs=fft_specs,
-        resident_increment=compiled_increment + cufft_scratch,
+        resident_increment=compiled_increment + scratch,
+        native_scratch=native_scratch,
     )
     try:
         _PEAKS.setdefault(compiled, {})[platform] = peak

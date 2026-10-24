@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from distrib_la import lstsq_hessenberg_local
 from solvers.quadrature import feast_ellipse_quadrature as _feast_ellipse_quadrature_generic
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
 from .bse_stack_matvec import build_bse_stack_matvec, build_bse_stack_matvec_full
@@ -57,9 +58,8 @@ ELLIPSE_GAMMA_FIXED = 0.2
 # matvec objects and so get distinct entries.  Value is (matvec, solver): the matvec
 # reference pins its id() so it cannot be reused by a later object while live.
 _GMRES_SOLVER_CACHE: dict[tuple, tuple] = {}
-# Cache compiled FEAST runners per (operator id, operand ids, knobs), per-process.
-# Key and value shape mirror _GMRES_SOLVER_CACHE above, and for the same reason
-# (see _get_feast_runner): the value pins every object whose id() is in the key.
+# Cache compiled FEAST cores per (operator id, knobs), never their payloads.
+# The matvec reference pins its id; caller-local wrappers own current operands.
 _FEAST_RUNNER_CACHE: dict[tuple, tuple] = {}
 
 
@@ -81,7 +81,7 @@ class QuadratureSpec:
     quadrature_type: str = "ellipse"
 
 
-def ensure_W_R(data: dict, include_W: bool, mesh_xy: Mesh) -> dict:
+def ensure_W_R(data: dict, include_W: bool, mesh_xy: Mesh, *, consume_W_q=False) -> dict:
     """Populate ``data['W_R']`` — the 8th (real-space W) argument the ring/stack
     matvecs and the shifted-matvec chain (``_apply_shifted_matvec``) expect.
 
@@ -96,10 +96,40 @@ def ensure_W_R(data: dict, include_W: bool, mesh_xy: Mesh) -> dict:
     never built, so ``W_R`` is only a shape/sharding-correct placeholder and
     ``W_q`` itself serves.  The restart loader emits ``W_q`` but not ``W_R``, so
     every solve entry point (FEAST, spectral-bound Lanczos, ``bse_w_exact``)
-    must call this before invoking a matvec.  Mutates and returns ``data``.
+    must call this before invoking a matvec. Mutates and returns ``data``.
+
+    ``consume_W_q=True`` is for a caller that owns a freshly loaded payload:
+    retain only its q=0 preconditioner slice and donate W_q to the shared
+    optical-solver transform. W_q is then None and W_R is reusable. The
+    default borrows W_q, preserving diagnostic callers and their snapshots.
     """
+    if data.get("W_q") is None:
+        if data.get("W_R") is None:
+            raise ValueError("ensure_W_R needs W_q or an already prepared W_R")
+        return data
     if include_W:
         W_q = data["W_q"]
+        if consume_W_q:
+            from common.fft_helpers import get_donated_kfft_kminor
+            from common.gpu_utils import shared_device_room
+            from runtime.aot_memory import compiled_new_bytes
+            from lxkit import memory
+            if data.get("_W_q0_for_precond") is None:
+                data["_W_q0_for_precond"] = W_q[:, :, 0, 0, 0]
+            jax.block_until_ready((W_q, data["_W_q0_for_precond"]))
+            transform = get_donated_kfft_kminor(
+                mesh_xy, tuple(int(s) for s in W_q.shape[-3:]),
+                make_bse_shardings(mesh_xy).W.spec, kind="ifftn", norm="ortho")
+            executable = transform.lower(W_q).compile()
+            stage = "BSE owned W_q to W_R"
+            price = memory.priced(compiled_new_bytes(executable),
+                                  "donated W transform: new buffers and provider scratch")
+            room = shared_device_room(stage)
+            memory.book(price, stage="bse.W_R")
+            memory.admit(stage, price, int(room) if isinstance(room, (int, np.integer)) else 0)
+            data["W_R"] = executable(W_q)
+            data["W_q"] = None
+            return data
         densify = make_w_densifier(
             mesh_xy, make_bse_shardings(mesh_xy).W.spec,
             tuple(int(s) for s in W_q.shape[-3:]), output="R")
@@ -109,7 +139,7 @@ def ensure_W_R(data: dict, include_W: bool, mesh_xy: Mesh) -> dict:
     return data
 
 
-def matvec_operands(data: dict) -> tuple:
+def matvec_operands(data: dict, *, include_W: bool = True) -> tuple:
     """The 9 operand arrays the ring/stack matvec consumes after ``x``, in the
     matvec's positional order ``(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
     W_R, V_q0, M)``.
@@ -122,18 +152,33 @@ def matvec_operands(data: dict) -> tuple:
     (see ``bse_w_exact`` compare-wq)."""
     return (
         data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
-        head_shifted_eps_c(data["eps_c"], data), data["eps_v"], data["W_R"],
+        (head_shifted_eps_c(data["eps_c"], data) if include_W else data["eps_c"]),
+        data["eps_v"], data["W_R"],
         data["V_q0"],
         data["M"],  # hoisted V-term pair amplitude (audit P3), transition layout
     )
 
 
-def ladder_matvec_operands(data: dict) -> tuple:
-    """The 13 operands of a ``ladder_rung_slots`` matvec: the ordinary 9 plus
+def ladder_matvec_operands(data: dict, *, include_W: bool = True) -> tuple:
+    """Physical R/A array bundle, or the historical raw operand tuple.
+
+    The physical bundle carries two vertices without expanding the call
+    signature. Legacy rung slots are the ordinary 9 operands plus
     the rung's four PHYSICAL (rolled, un-flipped) psi arrays.  Falls back to
     the density arrays when the payload carries no rung slots — that is a raw
     payload, where the density arrays ARE physical (the q=0 identity cells)."""
-    return matvec_operands(data) + (
+    if data.get("physical_branches", False):
+        keys = ("psi_c_X", "psi_c_Y", "psi_v_X", "psi_v_Y",
+                "psi_c_A_X", "psi_c_A_Y", "psi_v_A_X", "psi_v_A_Y",
+                "eps_c", "eps_v", "eps_c_A", "eps_v_A", "M", "M_A", "W_R", "V_q0")
+        operands = {key: data[key] for key in keys}
+        # The internal transfer Gamma head is the exact optical diagonal:
+        # -h in RR and +h in AA, with no c/v-overlap coupling contribution.
+        # Keep stored DFT energies unchanged for dipole normalization.
+        for key in ("eps_c", "eps_c_A"):
+            operands[key] = head_shifted_eps_c(data[key], data) if include_W else data[key]
+        return (operands,)
+    return matvec_operands(data, include_W=include_W) + (
         data.get("psi_c_W_X", data["psi_c_X"]),
         data.get("psi_c_W_Y", data["psi_c_Y"]),
         data.get("psi_v_W_X", data["psi_v_X"]),
@@ -189,6 +234,17 @@ def build_preconditioner_diagonal_sharded(
     ``compute_pair_amplitude`` call, which is why the agreement above is at
     round-off.
     """
+    if data.get("physical_branches", False) and not use_tda:
+        anti = dict(data, M=data["M_A"], eps_c=data["eps_c_A"], eps_v=data["eps_v_A"])
+        for band in ("c", "v"):
+            for axis in ("X", "Y"):
+                anti[f"psi_{band}_{axis}"] = jnp.conj(data[f"psi_{band}_A_{axis}"])
+        dr = build_preconditioner_diagonal_sharded(data, mesh_xy, include_W, use_tda=True)
+        da = build_preconditioner_diagonal_sharded(anti, mesh_xy, include_W, use_tda=True)
+        # Swapping the physical m/n legs conjugates their Hermitian-W
+        # diagonal; the ring self-contraction and excitation energy are real.
+        return jax.lax.with_sharding_constraint(jnp.stack((dr, -jnp.conj(da)))[:, None],
+            NamedSharding(mesh_xy, P(None, None, "x", "y", None)))
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
 
     # Hoisted pair amplitudes (audit P3).  The fallback is for payloads
@@ -215,7 +271,7 @@ def build_preconditioner_diagonal_sharded(
 
     tda_sharding = NamedSharding(mesh_xy, P("x", "y", None))
     diag_h = build_bse_exact_diagonal(
-        head_shifted_eps_c(data["eps_c"], data), data["eps_v"],
+        (head_shifted_eps_c(data["eps_c"], data) if include_W else data["eps_c"]), data["eps_v"],
         data["psi_c_X"], data["psi_v_Y"],
         W_q0, M, data["V_q0"], nk,
         sharding=tda_sharding, complex_out=True, memo=False,
@@ -257,22 +313,8 @@ def apply_spectral_deflation(v: jax.Array, deflation) -> jax.Array:
 _ARNOLDI_CACHE: dict = {}
 
 
-def harvest_spectral_deflation(matvec, diag_h, z, operands, seed, *,
-                               n_arnoldi: int, rank: int):
-    """Recycled eigenvectors of the preconditioned resolvent, for every column.
-
-    Every probe column of one ``(q, z)`` solves against the SAME operator
-    ``A = (z - H) diag(z - D)^{-1}``, and on the ladder the columns all pay
-    for the same few eigenvalues far from 1 (bound excitons below the
-    free-pair continuum).  One ``n_arnoldi``-step Arnoldi from ``seed`` (a
-    ``(2, 1, c, v, k)`` pair-basis vector) finds them once; the ``rank``
-    Ritz vectors farthest from 1 become ``U`` of
-    :func:`apply_spectral_deflation`, and ``T = Q^H H_m Q`` comes from the
-    Arnoldi relation ``A V_m = V_{m+1} H`` with no further matvec.
-
-    Returns ``((U, C), ritz)``: ``ritz`` are the Ritz values of ``H_m`` on the
-    host (for the log).  Cost: ``n_arnoldi`` matvecs once per ``(q, z)``.
-    """
+def _get_deflation_arnoldi(matvec, seed, *, n_arnoldi: int):
+    """The shared cached harvest executable, exposed for compile-only pricing."""
     m = int(n_arnoldi)
     key = (id(matvec), m, tuple(seed.shape), str(seed.dtype))
     hit = _ARNOLDI_CACHE.get(key)
@@ -306,7 +348,28 @@ def harvest_spectral_deflation(matvec, diag_h, z, operands, seed, *,
 
         hit = (matvec, _arnoldi)
         _ARNOLDI_CACHE[key] = hit
-    V, H = hit[1](seed, diag_h, jnp.asarray(z, dtype=jnp.complex128), operands)
+    return hit[1]
+
+
+def harvest_spectral_deflation(matvec, diag_h, z, operands, seed, *,
+                               n_arnoldi: int, rank: int):
+    """Recycled eigenvectors of the preconditioned resolvent, for every column.
+
+    Every probe column of one ``(q, z)`` solves against the SAME operator
+    ``A = (z - H) diag(z - D)^{-1}``, and on the ladder the columns all pay
+    for the same few eigenvalues far from 1 (bound excitons below the
+    free-pair continuum).  One ``n_arnoldi``-step Arnoldi from ``seed`` (a
+    ``(2, 1, c, v, k)`` pair-basis vector) finds them once; the ``rank``
+    Ritz vectors farthest from 1 become ``U`` of
+    :func:`apply_spectral_deflation`, and ``T = Q^H H_m Q`` comes from the
+    Arnoldi relation ``A V_m = V_{m+1} H`` with no further matvec.
+
+    Returns ``((U, C), ritz)``: ``ritz`` are the Ritz values of ``H_m`` on the
+    host (for the log).  Cost: ``n_arnoldi`` matvecs once per ``(q, z)``.
+    """
+    m = int(n_arnoldi)
+    program = _get_deflation_arnoldi(matvec, seed, n_arnoldi=m)
+    V, H = program(seed, diag_h, jnp.asarray(z, dtype=jnp.complex128), operands)
     from common.collectives import gather_to_host
     Hm = np.asarray(gather_to_host(H))[:m, :m]
     ritz, S = np.linalg.eig(Hm)
@@ -365,11 +428,11 @@ def _gmres_solve_core(matvec, b, diag_h, z, operands, max_iter, tol, *,
     ``(max_iter+1, max_iter)`` ``lstsq`` — an SVD whose cost is set by the CAP
     and not by the iterations actually taken — at EVERY iteration, measured at
     2.0 ms of a 15.6 ms column-iteration at ``max_iter=300``
-    (opt_precond/RESULTS.md §9).  The final ``y`` still comes from that same
-    ``lstsq`` on the same final ``H`` and ``g``, so the answer is unchanged
-    bit-for-bit; only the ~k redundant SVDs are gone, and the rotations are
-    the standard stable ones (never the normal equations — see the note at the
-    exit ``lstsq``).
+    (opt_precond/RESULTS.md §9). The final ``y`` is the minimum-norm solve
+    of the final ``H`` and ``g``. ROCm uses a bounded active prefix with the
+    FULL carrier's singular-value cutoff; another SVD shape can change
+    rounding, so the true-residual gate remains authoritative. The rotations
+    are the standard stable ones, never the normal equations.
     """
     if resid_relative_to not in ("b", "r0"):
         raise ValueError(
@@ -498,10 +561,10 @@ def _gmres_solve_core(matvec, b, diag_h, z, operands, max_iter, tol, *,
     # huge TRUE residual (GMRES "converges" to a wrong x).  ``lstsq`` stays
     # accurate at that conditioning; head-less/q=0 tiles are well
     # conditioned so the q=0 closure is unchanged.  The trailing zero
-    # columns of the padded Hessenberg get min-norm y=0.  ONE call, on the
-    # H the loop exited with — the same matrix the historical per-iteration
-    # spelling ended on, hence the same y to the bit.
-    y = jnp.linalg.lstsq(H, g, rcond=None)[0]
+    # columns of the padded Hessenberg get min-norm y=0. ROCm trims only
+    # exact-zero padding through a static prefix bucket, retaining the full
+    # carrier's eps cutoff. Other legs keep the original full-size solve.
+    y = lstsq_hessenberg_local(H, g, k_final)
 
     x = x0 + jnp.tensordot(y, Z, axes=(0, 0))
     return x, k_final
@@ -571,59 +634,21 @@ def _get_feast_runner(
     dtype: jnp.dtype,
     use_conjugate_symmetry: bool = True,
 ) -> Callable:
-    """Return a cached FEAST runner for this operator + operands + knobs.
+    """Bind current operands to one cached FEAST core for this operator/knobs.
 
-    TWO LAYERS, and the split is the whole point.  The jitted core ``_run``
-    takes the ten :func:`matvec_operands` arrays as a RUNTIME ARGUMENT, exactly
-    as the shifted-GMRES engine does (:func:`_get_gmres_solver`, whose operands
-    are what let one executable serve every q / omega).  The Python wrapper
-    returned to the caller supplies them, so the caller's 4-argument call shape
-    is unchanged.
+    The jitted core takes :func:`matvec_operands` as runtime arguments, so
+    different Hamiltonians share the program without sharing their values.
+    Its structural key pins the matvec identity, as the GMRES owner does;
+    JAX specializes that core on actual argument shapes and shardings.
 
-    WHY THE OPERANDS MOVED OUT OF THE CLOSURE.  They used to be captured by the
-    jitted body, which made them compile-time constants of the executable.  Two
-    consequences, one already fixed and one not:
-
-    * a runner computed one operator's answer on one operand set forever, so
-      the module-global cache handed the second of two drivers the first one's
-      program — the silent-wrong-answer hazard this cache's key was widened to
-      close (see below);
-    * **and it could not be traced at all at P>1.**  ``jax.jit`` refuses to
-      close over an array whose shards live on other processes ("Closing over
-      jax.Array that spans non-addressable (non process local) devices is not
-      allowed.  Please pass such arrays as arguments to the function"), and the
-      nine operands are mesh-sharded.  ``bse_feast --feast-ritz`` and
-      ``bse_pseudopoles`` were therefore SINGLE-PROCESS ONLY: the census had to
-      take its whole GMRES iteration-count measurement at P=1 for this reason.
-      Passing the operands as arguments is the fix jax's own error message
-      prescribes, and it makes the closure capture no ``jax.Array`` at all.
-
-    The cache key is UNCHANGED — ``id(matvec)`` plus the ids of the nine operand
-    arrays plus the scalar knobs — and so is the ``(matvec, operands, runner)``
-    value that pins those ids so a later object cannot recycle them while the
-    entry is live.  Keeping it means the wrapper handed back for one operand set
-    is never handed to another, which preserves the fixed hazard's guarantee at
-    the object level on top of the structural guarantee the runtime argument now
-    gives.  It also means compile behaviour is unchanged: one traced core per
-    cache entry, exactly as before.  (A narrower key would now be SOUND, since
-    distinct operand sets can safely share one executable, and would remove the
-    per-window compile that ``gmres_fp32`` pays.  That is a live improvement,
-    deliberately not taken here: it changes compile counts, and this commit is
-    scoped to making P>1 possible.  Registered in
-    ``FIX_solver_robustness.md``.)
-
-    Same contract, and same reason, as :func:`_get_gmres_solver`.  Gated by
-    ``tests/test_bse_feast_runner_cache.py``.
+    Only the returned cheap Python wrapper owns the current operands. The
+    global cache holds no W_R, wavefunctions, V or M after that caller drops
+    its wrapper. The existing four-argument calling convention is unchanged.
     """
-    # Built ONCE, here, and both keyed and passed below, so what the key
-    # measures is exactly what the wrapper feeds the compiled program.
     operands = matvec_operands(data)
-    key = (id(matvec), tuple(id(a) for a in operands),
-           n_quad, n_ritz, max_iter, float(tol), float(ry_to_ev), str(dtype),
+    key = (id(matvec), n_quad, n_ritz, max_iter, float(tol), float(ry_to_ev), str(dtype),
            bool(use_conjugate_symmetry))
     hit = _FEAST_RUNNER_CACHE.get(key)
-    if hit is not None:
-        return hit[2]
 
     def _run(X_batch, z_nodes, w_weights, diag_h, operands):
         # X_batch: (n_ritz, 1, nc, nv, nk)
@@ -660,7 +685,9 @@ def _get_feast_runner(
         filtered, iters = jax.lax.fori_loop(0, n_ritz, vec_body, (filtered, iters))
         return filtered, iters
 
-    core = jax.jit(_run)
+    core = hit[1] if hit is not None else jax.jit(_run)
+    if hit is None:
+        _FEAST_RUNNER_CACHE[key] = (matvec, core)
 
     def runner(X_batch, z_nodes, w_weights, diag_h):
         # A PYTHON closure over ``operands`` — not a jit one.  The arrays reach
@@ -670,7 +697,6 @@ def _get_feast_runner(
         return core(X_batch, z_nodes, w_weights, diag_h, operands)
 
     runner.core = core          # for tests/introspection: the traced program
-    _FEAST_RUNNER_CACHE[key] = (matvec, operands, runner)
     return runner
 
 

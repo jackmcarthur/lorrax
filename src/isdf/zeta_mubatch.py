@@ -776,6 +776,9 @@ class ZetaG:
         self.path = str(path)
         self.shell_slots = self.shell = None
         self.receipt = ""
+        # A charge file is completed by the V pass, with exactly its ζ tiles.
+        # The fit owner supplies completeness/provenance after its final batch.
+        self.pending_file = None
 
     @property
     def factor(self):
@@ -803,6 +806,8 @@ class ZetaG:
         ``zeta_io`` the masked ζ tiles are also written to ``zeta_q_G``;
         ``with_v=False`` (:meth:`write_file`) forms and writes ζ only.
         """
+        if self.pending_file is not None and with_v and zeta_io is None:
+            return self._contract_v_and_write(v_table, keep=keep, print_fn=print_fn)
         if self.solver_kind in _FACE_KINDS:
             return self._contract_v_face(v_table, keep=keep, zeta_io=zeta_io, with_v=with_v)
         t0 = time.perf_counter()
@@ -889,6 +894,33 @@ class ZetaG:
                         f"{'written' if zeta_io is not None else 'not written'}; "
                         f"device peak so far {peak / 1e9:.2f} GB")
         log.debug(self.receipt, extra=record("isdf.mubatch_v", text=self.receipt.strip()))
+        return V
+
+    def _contract_v_and_write(self, v_table, *, keep, print_fn=None):
+        """Persist the same ζ tiles used in V, then authenticate the closed file.
+
+        The header/dataset already exist with ``zeta_is_done=False``. A failed
+        or truncated pass cannot advertise a reusable file. The existing tile
+        writer drains before the rank-zero metadata update; no ζ stack is kept.
+        """
+        from file_io.slab_io import SlabIO
+        from file_io.isdf_header import mark_zeta_done, stamp_fit_provenance
+        from common.collectives import barrier, rank0_transaction
+        pending = self.pending_file
+        with SlabIO(self.path, mode='a', mesh=self.mesh) as io:
+            # Register this fresh handle's logical disk geometry; carrier
+            # padding is clipped by SlabIO rather than enlarging the file.
+            io.create_dataset('zeta_q_G', shape=(self.store.Q, self.n_rmu, self.ngkmax),
+                              dtype=np.complex128)
+            V = self.contract_v(v_table, keep=keep, zeta_io=io, print_fn=print_fn)
+        barrier("zeta_v_writes_complete")
+        def complete():
+            if pending["provenance"] is not None:
+                stamp_fit_provenance(self.path, pending["provenance"])
+            mark_zeta_done(self.path)
+        if pending["complete"]:
+            rank0_transaction(self.path, stage="zeta_v_provenance", write=complete)
+        self.pending_file = None
         return V
 
     def _contract_v_face(self, v_table, *, keep, zeta_io, with_v, print_fn=None):

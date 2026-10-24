@@ -197,42 +197,41 @@ The numerical controls (`sigma_quadrature_eps`, the centroid count, the pole bud
 A refusal names the key or file and the fix. The ones most runs meet are listed first; the rest are grouped below.
 
 !!! refuses "Common"
-    - No `sys_dim`. Add `sys_dim = 3` (bulk) or `2` (slab). 
-    - An unknown key, or a `;` comment after a value. Delete the key; comments start with `#`. 
-    - Fractional WFN occupations (a metal) with `compute_mode = cohsex`, `gn_ppm` or `hl_ppm`, without `occ_smearing_width_ry`, or with `sc_head_update = interband_commutator`. 
-    - A `kin_ion.h5` that is missing, has too few bands, or was built for another `sys_dim`, spinor count, k-point count or `bispinor` setting, or in the retired format with Hartree folded in. Rerun kin-ion. Its WFN fingerprint is not compared. 
-    - A missing `dipole.h5` with the head on, or one built with another velocity operator, with or without the nonlocal commutator. Under `head_correction = full`, also one from another WFN or band window; on the direct-head path that mismatch only warns, unless `LORRAX_SANITY=strict`. Rerun dipole on this input file and WFN. 
-    - A centroid table whose fit windows drop an occupied band. Rerun centroids with windows that start at band 0. 
-    - A `tmp/zeta_q.h5` left by a run with another centroid count or FFT grid in the same directory. Use a separate run directory or delete the file. 
-    - A named `number_bands_chi` or `number_bands_sigma` that splits a degenerate multiplet or reaches the top of `WFN.h5`. Pick a legal edge from the message. 
-    - A QSGW run unconverged after `sc_max_iter` maps (the per-map tables are kept), a checkpoint that continues past `sc_max_iter`, or scissored tail bands that take up occupation. Raise the budget, or widen the QP matrix. 
+    - No `sys_dim`. Add `sys_dim = 3` (bulk) or `2` (slab).
+    - An unknown key, or a `;` comment after a value. Delete the key; comments start with `#`.
+    - Fractional WFN occupations (a metal) with `compute_mode = cohsex`, `gn_ppm` or `hl_ppm`, without `occ_smearing_width_ry`, or with `sc_head_update = interband_commutator`.
+    - A `kin_ion.h5` that is missing, has too few bands, or was built for another `sys_dim`, spinor count, k-point count or `bispinor` setting, or in the retired format with Hartree folded in. Rerun kin-ion. Its WFN fingerprint is not compared.
+    - A missing `dipole.h5` with the head on, or one built with another velocity operator, with or without the nonlocal commutator. Under `head_correction = full`, also one from another WFN or band window; on the direct-head path that mismatch only warns, unless `LORRAX_SANITY=strict`. Rerun dipole on this input file and WFN.
+    - A centroid table whose fit windows drop an occupied band. Rerun centroids with windows that start at band 0.
+    - A `tmp/zeta_q.h5` left by a run with another centroid count or FFT grid in the same directory. Use a separate run directory or delete the file.
+    - A named `number_bands_chi` or `number_bands_sigma` that splits a degenerate multiplet or reaches the top of `WFN.h5`. Pick a legal edge from the message.
+    - A QSGW run unconverged after `sc_max_iter` maps (the per-map tables are kept), a checkpoint that continues past `sc_max_iter`, or scissored tail bands that take up occupation. Raise the budget, or widen the QP matrix.
 
 ??? refuses "Input keys that conflict or do not apply"
-    - A value outside its range or enum. The message names the accepted values. 
-    - Two spellings of one setting that disagree: `nband` and `number_bands`, `number_bands` and a different `number_bands_chi` or `number_bands_sigma`, `use_band_extrapolation` and `sigma_band_extrapolation`, `do_G0` and `head_correction`, `do_screened = false` with a screened `compute_mode`. Keep one. 
-    - `number_bands_protected` beside `nval` or `ncond`, or outside [occupied count, `number_bands`]. 
-    - The retired key `sigma_w_model` (use `compute_mode = tangential`); `sigma_w_accuracy`, `sigma_w_support_sites_ev`, `write_poles` or `write_w` without `compute_mode = tangential`. 
-    - A key of the [other W models](../../theory/multipole-w.md#keywords) under `compute_mode = tangential`, and with the head off every head-fit sampling key. Delete them. 
-    - `sigma_regularization_ev` that is not finite and positive. 
-    - `screening_diagrams = w_bse | w_rpa_resolvent` outside its supported treatments, on a centroid set that is not orbit-closed, or (`w_bse`) on a time-reversal-broken WFN. 
-    - `sc_initial_qp_rotations_file` without `qp_solver = self_consistent`. 
-    - `sc_head_update` other than `off` with `head_correction = off`; `occ_broadening > 0` outside a QSGW run with a velocity head, or beside `occ_smearing_width_ry`. 
-    - `use_band_extrapolation = true` or a bracket scheme named on a run with no dynamic Σ stage; a bracket scheme named with extrapolation off. 
-    - `sigma_out_of_grid = clamp | static` without both `sigma_omega_min_ev` and `sigma_omega_max_ev`. 
-    - `zeta_cutoff` above the density cutoff, `bare_coulomb_cutoff` above `zeta_cutoff`, `zeta_nband` outside $[1,\max(N_\chi,N_\Sigma)]$, or a QP matrix that reaches past the ζ fit's left window. 
-    - `number_bands_sigma` below twice the occupied count with band extrapolation on. Raise `number_bands`. 
+    - A value outside its range or enum. The message names the accepted values.
+    - Two spellings of one setting that disagree: `nband` and `number_bands`, `number_bands` and a different `number_bands_chi` or `number_bands_sigma`, `use_band_extrapolation` and `sigma_band_extrapolation`, `do_G0` and `head_correction`, `do_screened = false` with a screened `compute_mode`. Keep one.
+    - `number_bands_protected` beside `nval` or `ncond`, or outside [occupied count, `number_bands`].
+    - The retired key `sigma_w_model` (use `compute_mode = tangential`); `sigma_w_accuracy`, `sigma_w_support_sites_ev`, `write_poles` or `write_w` without `compute_mode = tangential`.
+    - A key of the [other W models](../../theory/multipole-w.md#keywords) under `compute_mode = tangential`, and with the head off every head-fit sampling key. Delete them.
+    - `sigma_regularization_ev` that is not finite and positive.
+    - `screening_diagrams = w_bse | w_rpa_resolvent` outside its supported treatments, on a centroid set that is not orbit-closed, or (`w_bse`) on a time-reversal-broken WFN.
+    - `sc_initial_qp_rotations_file` without `qp_solver = self_consistent`.
+    - `sc_head_update` other than `off` with `head_correction = off`; `occ_broadening > 0` outside a QSGW run with a velocity head, or beside `occ_smearing_width_ry`.
+    - `use_band_extrapolation = true` or a bracket scheme named on a run with no dynamic Σ stage; a bracket scheme named with extrapolation off.
+    - `sigma_out_of_grid = clamp | static` without both `sigma_omega_min_ev` and `sigma_omega_max_ev`.
+    - `zeta_cutoff` above the density cutoff, `bare_coulomb_cutoff` above `zeta_cutoff`, `zeta_nband` outside $[1,\max(N_\chi,N_\Sigma)]$, or a QP matrix that reaches past the ζ fit's left window.
+    - `number_bands_sigma` below twice the occupied count with band extrapolation on. Raise `number_bands`.
 
 ??? refuses "Material class"
-    - Integer WFN occupations (an insulator) with `occ_smearing_width_ry` or the head-fit metal origin shift ([keys](../../theory/multipole-w.md#keywords)). Remove the key. 
-    - `hl_ppm` on a time-reversal-broken WFN, or with `ppm_omega_p` at or below the largest $\chi^0$ transition. Raise `ppm_omega_p`, or use `gn_ppm`. 
+    - Integer WFN occupations (an insulator) with `occ_smearing_width_ry` or the head-fit metal origin shift ([keys](../../theory/multipole-w.md#keywords)). Remove the key.
+    - `hl_ppm` on a time-reversal-broken WFN, or with `ppm_omega_p` at or below the largest $\chi^0$ transition. Raise `ppm_omega_p`, or use `gn_ppm`.
 
 ??? refuses "During the run"
-    - `restart = true` against a bundle written for a different centroid table of the same count, or from another WFN. Set `restart = false`. 
-    - A static minimax rule that misses `minimax_target_error` within `minimax_max_nodes`. Raise the cap or the target. 
-    - A QP energy inside a hole of `sigma_omega_patches_ev`. 
-    - A non-finite $Z$: $\Sigma^c$ has a pole at a state's evaluation energy (`GATE z_factor_finite`). 
-    - A required output missing or uncommitted at the end of the run. 
+    - `restart = true` against a bundle written for a different centroid table of the same count, or from another WFN. Set `restart = false`.
+    - A static minimax rule that misses `minimax_target_error` within `minimax_max_nodes`. Raise the cap or the target.
+    - A QP energy inside a hole of `sigma_omega_patches_ev`.
+    - A non-finite $Z$: $\Sigma^c$ has a pole at a state's evaluation energy (`GATE z_factor_finite`).
+    - A required output missing or uncommitted at the end of the run.
 
 ??? refuses "Retired keys and values"
-    - A retired or removed key, or a retired value: `write_eqp2` and the `eqp2_*` keys (`GATE eqp2_retired`), `qp_solver = fixed_point`, `sc_accelerator = rcrop | linear`, `screening_method = ctsp`, `band_extrapolation_estimator = band_index_only`, any `sc_mixing` but `1.0`. The message names the replacement ([Retired](keywords.md#retired)). 
-
+    - A retired or removed key, or a retired value: `write_eqp2` and the `eqp2_*` keys (`GATE eqp2_retired`), `qp_solver = fixed_point`, `sc_accelerator = rcrop | linear`, `screening_method = ctsp`, `band_extrapolation_estimator = band_index_only`, any `sc_mixing` but `1.0`. The message names the replacement ([Retired](keywords.md#retired)).

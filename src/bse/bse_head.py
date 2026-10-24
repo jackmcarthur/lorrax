@@ -31,14 +31,13 @@ coupling block (there the overlaps are <ck|v'k> = 0).  The ISDF fit
 the exact form is a loader MODE, ``q0_head``:
 
 * ``"rank1"`` (the default): ``whead`` goes on the W tile as the ISDF
-  rank-1 ``conj(g0) g0``, exactly as before.  Every consumer that never
-  reads ``q0_head_ry`` (TD-aGW, the screening and ladder operators) gets
-  this and is unchanged.
+  rank-1 ``conj(g0) g0``, exactly as before. Consumers that never read
+  ``q0_head_ry`` (TD-aGW) keep this mode.
 * ``"diagonal"``: ``whead`` stays off W, ``_inject_q0_head`` returns the
   scalar ``q0_head_ry``, and the operator subtracts it from its conduction
-  diagonal through :func:`head_shifted_eps_c`.  Requested only by the BSE
-  operator drivers, every one of which builds its operands through that
-  helper.
+  diagonal through :func:`head_shifted_eps_c`. The BSE drivers and density
+  ladder use this helper; the ladder shifts both physical R/A conduction
+  legs, keeping the bare DFT energies used by its dipole vertex unchanged.
 
 The bundle records the mode under ``data["q0_head"]``; the helper refuses a
 bundle whose mode and scalar disagree.  ``vhead`` on the exchange tile is

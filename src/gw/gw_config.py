@@ -458,13 +458,13 @@ def coerce_screening_diagrams(value) -> ScreeningDiagrams:
 #: Predicates take the resolved :class:`LorraxConfig`.
 #:
 #: SUPPORTED, deliberately absent from this table: ``cohsex``, ``gn_ppm``,
-#: ``mpa`` and ``qp_solver = one_shot_dft``.
+#: ``tangential`` (shared-pole model) and ``qp_solver = one_shot_dft``.
 _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
     (
         "w_bse_needs_a_screened_mode",
         lambda cfg: cfg.compute_mode is ComputeMode.X_ONLY,
         lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
-        "a mode that consumes W: cohsex, gn_ppm, or mpa",
+        "a mode that consumes W: cohsex, gn_ppm, or tangential",
         "drop screening_diagrams (or set it to w_rpa) for a bare-exchange "
         "run, or pick a screened compute_mode",
         "x_only builds no W at all, so a ladder-corrected W would be "
@@ -476,7 +476,7 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
         "w_bse_hl_ppm_broadening_unimplemented",
         lambda cfg: cfg.compute_mode is ComputeMode.HL_PPM,
         lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
-        "cohsex (ladder W(0)), gn_ppm (ladder W(0) + W(i*omega_p)), or mpa",
+        "cohsex (ladder W(0)), gn_ppm (ladder W(0) + W(i*omega_p)), or tangential",
         "use gn_ppm, whose probe sits on the imaginary axis where the "
         "resolvent needs no broadening policy, or keep w_rpa for hl_ppm",
         "the HL probe is a REAL-axis frequency, and (z - H)^-1 on the real "
@@ -485,6 +485,19 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
         "broadening convention, so v1 refuses instead.  Same shape as the "
         "wired-but-refused "
         "schur_avg placement (src/gw/head_channel.py:153)",
+    ),
+    (
+        "w_bse_tangential_head_override_unimplemented",
+        lambda cfg: cfg.compute_mode is ComputeMode.TANGENTIAL and any(
+            getattr(cfg.head, key, None) is not None
+            for key in ("vhead", "whead_0freq", "whead_imfreq")),
+        lambda cfg: ", ".join(f"{key} = {getattr(cfg.head, key)}"
+            for key in ("vhead", "whead_0freq", "whead_imfreq")
+            if getattr(cfg.head, key, None) is not None),
+        "the frequency-dependent head of the same physical ladder as the body",
+        "drop vhead, whead_0freq and whead_imfreq for tangential W_BSE",
+        "constant scalar overrides have no defined composition with the "
+        "micro-reducible full-frequency ladder head and its shared-pole fit",
     ),
     (
         "w_bse_self_consistency_unimplemented",
@@ -603,9 +616,8 @@ _W_RPA_RESOLVENT_REFUSALS: tuple[
     # occupations at the stage, before any compute, under
     # ``w_rpa_resolvent_insulators_only``.  The pair-basis /
     # integer-occupation argument transfers unchanged from ``w_bse``; the
-    # ladder's TRS pair gauge (``enforce_trs_pair_gauge``) is applied only on
-    # the ``include_w=True`` branch, and the RPA arm's reciprocity holds
-    # without it.
+    # physical R/A ladder carries both vertices explicitly, without a TRS
+    # gauge construction. The default RPA body keeps its folded representation.
     (
         "w_rpa_resolvent_head_placement_unimplemented",
         lambda cfg: str(cfg.head.mc_average_placement) != "off",
@@ -662,15 +674,25 @@ def refuse_unsupported_head_dense(config) -> None:
 
     The dense set holds the DFT velocity of the scalar charge head
     (``gw.qsgw_head.head_source``).  A head that is off, four-current, or
-    rebuilt each SC map from QP velocities (``sc_head_update`` not ``off``)
-    would ignore it or mix two operators.  Metals refuse at the head build
+    rebuilt each SC map from QP velocities (``sc_head_update`` not ``off``),
+    or supplied by a density resolvent would ignore it or mix two operators.
+    A dense DFT tensor is not the dense ladder's micro-reducible tensor.
+    Metals refuse at the head build
     (``GATE head_dense_metal``), where the occupation state is known.
     """
     if not getattr(config.head, "dense_file", ""):
         return
     why = None
+    rule = "head_dense_operator"
     if config.head.correction is HeadCorrection.OFF:
         why = "head_correction = off builds no head"
+    elif config.screening.diagrams in (ScreeningDiagrams.W_BSE,
+                                       ScreeningDiagrams.W_RPA_RESOLVENT):
+        rule = "head_dense_resolvent"
+        why = (f"screening_diagrams = {config.screening.diagrams.value} "
+               "builds its head from the same microscopic density resolvent "
+               "as its body; replacing it with a dense DFT tensor has no "
+               "defined matching ladder kernel and vertices")
     elif bool(config.bispinor):
         why = "bispinor = true: the four-current head has no dense source"
     elif (config.qp_solver is QPSolver.SELF_CONSISTENT
@@ -679,11 +701,11 @@ def refuse_unsupported_head_dense(config) -> None:
                "each map from the QP velocity of the GW mesh")
     if why is not None:
         raise ValueError(
-            "GATE head_dense_operator: head_dense_file names a dense DFT "
+            f"GATE {rule}: head_dense_file names a dense DFT "
             "charge head this deck cannot use.\n"
             f"  got:  head_dense_file = {config.head.dense_file!r}; {why}\n"
             "  want: a scalar head (head_correction = full) "
-            "built from the DFT response: one-shot, BSE screening, or SC with "
+            "built from the DFT response: one-shot RPA, or RPA SC with "
             "sc_head_update = off\n"
             "  fix:  drop head_dense_file, or change the head settings\n"
             "  doc:  docs/input_reference.md, head_dense_file.")
@@ -1612,12 +1634,12 @@ _DEFAULTS = {
     "screening_diagrams": "w_rpa",
     # w_bse / w_rpa_resolvent only: probe columns of the mu^2 ladder tile
     # solved per block.
-    # 0 (default) = the whole padded centroid basis in one block — the
-    # historical behaviour, bit-identical for every existing deck.  A
+    # 0 (default) = a bounded automatic tile, checked against compiled
+    # seed/solve/project memory and the run budget. A
     # positive value bounds the per-block solve memory; the facade rounds
     # it up to the mesh 'y'-axis multiple the reduce-scatter snapshot
     # tiles by.  This is DISPATCH GRANULARITY, not physics: chunking
-    # changes when columns are solved, never their values.  Measured
+    # preserves the operator and stopping tolerance. Measured
     # motivation: with the knob unreachable, the fully relativistic LiF
     # 666-centroid lift solve attempted one 77.83-GiB block allocation
     # (JID 57288835), while the same deck at probe_chunk=64 passed every
@@ -4187,8 +4209,8 @@ class ScreeningConfig:
     # w_bse / w_rpa_resolvent only (both reach the ladder facade) —
     # ``bse.w_ladder.compute_wc_qwedge``'s public ``probe_chunk`` memory
     # knob, threaded through the facade (``gw.screening_bse._ladder_wedge``,
-    # which does not branch on ``include_w``).  0 = whole padded basis in
-    # one block (historical).  Deck key: ``ladder_probe_chunk``.
+    # which does not branch on ``include_w``). 0 = bounded automatic tile.
+    # Deck key: ``ladder_probe_chunk``.
     ladder_probe_chunk: int = 0
 
     def __post_init__(self):
@@ -4197,8 +4219,8 @@ class ScreeningConfig:
         if int(self.ladder_probe_chunk) < 0:
             raise ValueError(
                 f"ladder_probe_chunk = {self.ladder_probe_chunk} must be "
-                f">= 0 (0 = the whole padded centroid basis in one probe "
-                f"block; a positive value bounds the per-block ladder "
+                f">= 0 (0 = a bounded automatic probe block; "
+                f"a positive value bounds the per-block ladder "
                 f"solve memory).")
         # REFUSE, naming what IS supported, instead of silently resolving
         # to it.  ``ctsp`` (contour-tail / separable-pole terminology from

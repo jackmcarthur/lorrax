@@ -130,6 +130,7 @@ else.
 | `scissor.py` | Applies and reports scissor corrections. |
 | `screening.py` | Plans and executes screening calculations. |
 | `screening_bse.py` | The GW-side stage of `screening_diagrams = w_bse` / `w_rpa_resolvent`. |
+| `ladder_tangential.py` | Feeds physical R/A ladder samples, exact slopes/moments and a matched Γ head into the common tangential constructor and Σ path. |
 | `tangential_capacity.py` | Device-byte accounting for one tangential construction. |
 | `tangential_constructor.py` | Constructs the physical tangential W (Hermite/Ritz). |
 | `tangential_directions.py` | Selects directions and builds the per-parent state panels. |
@@ -271,13 +272,13 @@ The BSE contract is [BSE](architecture/bse.md); this table only says where each 
 | `bse_loading.py` | Reads a GW restart into a BSE bundle: window, padding and q = 0 head; builds a missing static W(0) through `gw.static_screening` when the restart has none. |
 | `bse_nontda.py` | Structure-preserving full (non-TDA) eigensolver: dense build, and an opt-in matrix-free solver. |
 | `bse_preconditioner.py` | Transition energies, the exchange pair amplitude and the exchange spin weight. |
-| `bse_ring_comm.py` | The BSE mesh, shardings, and the ring matvec of the screening (density-response) operator. |
+| `bse_ring_comm.py` | The BSE mesh, shardings, folded RPA control, and physical R/A density-response matvec with one shared direct-rung field for both bra decodes. |
 | `bse_stack_matvec.py` | The trial-stack TDA matvec, the non-TDA pair applier, and the full-BSE matvec built on it. |
-| `bse_w_exact.py` | Exact W_c(ω) by shifted solves on the RPA density resolvent; the TRS pair gauge the ladder uses. |
+| `bse_w_exact.py` | Finite-q physical pair payloads and the shared shifted solves, exact slopes/moments, density sources/readouts; also the folded RPA control. |
 | `bse_window.py` | The band window, its padding, the `--eqp` re-slice and the `eigenvectors.h5` writer. |
 | `exchange_path.py` | Exchange tiles V_Q along an exciton momentum path. |
 | `exciton_bands.py` | Finite-momentum TDA exciton bands E_S(Q); `python -m bse.exciton_bands`. |
-| `head_resolvent.py` | The ladder's q = 0 macroscopic tensor Ξ_ij(z). |
+| `head_resolvent.py` | The ladder's q = 0 micro-reducible tensor Ξ_ij(z), with matched physical velocity source/readout. |
 | `vq_interp.py` | Arbitrary-Q bare-exchange tile V_Q. |
 | `w_ladder.py` | Ladder-corrected W_BSE(z) for `screening_diagrams = w_bse`. |
 | `w_omega_chain.py` | W_q(ω) from one block-Lanczos chain; called by `bse_w_exact`. |

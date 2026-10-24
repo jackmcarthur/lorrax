@@ -24,11 +24,15 @@ Goals
 2. Export screening and a BSE kernel in BerkeleyGW's file layouts.
 3. Calculate and compare optical absorption with and without electron-hole
    interactions, then compare the fully relativistic results between codes.
+4. Calculate exciton bands along Gamma–M–K–Gamma and inspect their
+   near-Gamma dispersion.
 
 Instructions
 ------------
 
-1. Use a built LORRAX checkout with its normal Perlmutter environment. Create
+1. Use a built LORRAX checkout on Perlmutter or Frontier. Source its normal
+   run environment (`config/frontier/gpu_env.sh` on Frontier), which selects
+   the Python environment used for that build. Create
    a new working copy; the destination must not already exist:
 
    ```bash
@@ -65,11 +69,23 @@ Instructions
 
    The LORRAX comparison plots read these reference outputs.
 
-4. Allocate four GPUs, keep `LORRAX` set to your built checkout, and run:
+4. Enter a GPU allocation, keep `LORRAX` set to your built checkout and its
+   Python environment active, and run:
 
    ```bash
    bash 00-run-lorrax.sh
    ```
+
+   The launcher uses the existing site profile to select Perlmutter's four
+   CUDA GPUs or four Frontier GCDs (half a node), with one MPI rank per device.
+   It sources the checkout's normal site environment and uses the same Python
+   for numerical stages, the band-table export and plots. No stage-specific
+   environment exports are needed. See the installation guides for
+   [Perlmutter](https://jackmcarthur.github.io/lorrax/installation/perlmutter/)
+   and [Frontier](https://jackmcarthur.github.io/lorrax/installation/frontier/).
+   The `perlmutter/` QE and BerkeleyGW preparation adapters remain specific to
+   NERSC; on Frontier, supply the same prepared mean-field and reference files
+   using the site's QE/BerkeleyGW installation.
 
    Alternatively, go through [GW](2-gw/3-lorrax_fully_rel/README.md), then
    [BSE](3-bse/3-lorrax_fully_rel/README.md), running the directories and scripts
@@ -86,7 +102,8 @@ Instructions
 6. After both tracks finish, check their outputs:
 
    ```bash
-   "$LORRAX/.venv/bin/python" validate_tutorial.py --tutorial-root . > validation.json
+   source 2-gw/3-lorrax_fully_rel/lorrax_env.sh
+   lorrax_python validate_tutorial.py --tutorial-root . > validation.json
    ```
 
    Inspect `status` in `validation.json`: missing outputs are `PENDING`,
@@ -118,6 +135,23 @@ with absolute energy references and Cartesian coordinates.
 The native BSE uses six valence and eight conduction bands on the shifted
 `8 8 1` grid, shift `(0.47, 0.37, 0)`, polarization `(1, 1, 0)` and 0.15 eV
 Gaussian broadening. All 3,072 retained Tamm–Dancoff roots are requested.
+
+The additional `3-bse/3-lorrax_fully_rel/3-exciton-bands` stage keeps the same
+six-valence/eight-conduction window, with 256 lowest roots on a Gamma-centered
+`24 24 1` integration grid at each exciton momentum. Its full-path and
+near-Gamma plots use LORRAX only. The full path has 25 Q points and a 0.25 meV
+Davidson budget; the separate near-Gamma scan keeps eight roots at 0.01 meV,
+with eight steps from Gamma to `(0.003, 0, 0)`, twelve more to `(0.06, 0, 0)`
+and a distant K point retained for certification. The tutorial explicitly
+selects the existing 1 meV `visualization` exchange certificate: matched
+on-grid checks measured about 0.02 meV, above the stricter reference gate.
+The driver's `reference` default is unchanged. The [stage README](3-bse/3-lorrax_fully_rel/3-exciton-bands/README.md)
+explains the sampling, residuals and independent-particle threshold. The
+measured near-Gamma scan took 25 min 37 s on four Frontier GPU ranks;
+allow roughly three hours for the full path in a regular four-GPU allocation.
+Matched lowest-eight levels differ by up to 7.65 meV between the 24 × 24
+and 30 × 30 controls. Neither integration-grid convergence nor continuum
+coverage from the root count alone is assumed.
 
 Comparison
 ----------

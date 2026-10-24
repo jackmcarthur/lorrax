@@ -122,10 +122,7 @@ __all__ = [
 COULOMB_GAUGE_TT_SIGN = -1.0
 
 
-_SLAB_MINIBZ_PHOTON_METHOD = (
-    "true_ws_polygon_duffy_gauss_legendre_v1")
-_SLAB_MINIBZ_PHOTON_ORDERS = (16, 24, 32)
-#: The graded variant for SCREENED integrands: the same Γ-to-edge Duffy
+#: One rule for bare and screened integrands: the same Γ-to-edge Duffy
 #: triangles, with the radial axis cut into the geometric panels
 #: ``[0, 4^-6], [4^-6, 4^-5], ..., [1/4, 1]``.  A ladder order is the
 #: Gauss--Legendre count per radial panel; each edge carries 32 points.  A
@@ -135,7 +132,7 @@ _SLAB_MINIBZ_PHOTON_ORDERS = (16, 24, 32)
 #: 3x3); the panels resolve it geometrically (1e-10).
 _SLAB_MINIBZ_GRADED_METHOD = (
     "true_ws_polygon_duffy_graded_gauss_legendre_v1")
-_SLAB_MINIBZ_GRADED_ORDERS = (8, 12, 16)
+_SLAB_MINIBZ_GRADED_ORDERS = (16, 24, 32)
 _SLAB_MINIBZ_GRADED_PANELS = (0.0,) + tuple(4.0 ** -k for k in range(6, -1, -1))
 _SLAB_MINIBZ_GRADED_ANGULAR = 32
 _SLAB_MINIBZ_RECEIPT_TOKEN = object()
@@ -546,8 +543,8 @@ def minibz_coulomb_moment(bvec, kgrid, *, is_2d: bool = False,
         from vcoul.slab_2d import Slab2D
         zc = Slab2D._truncation_half_height_from_bvec(bvec)
         polygon, _, area = _slab_minibz_wigner_seitz_polygon(bvec, kgrid)
-        q, weight, _, _ = _slab_minibz_polygon_rule(
-            polygon, area, max(_SLAB_MINIBZ_PHOTON_ORDERS))
+        q, weight, _, _ = _slab_minibz_graded_rule(
+            polygon, area, max(_SLAB_MINIBZ_GRADED_ORDERS))
         v, _ = _minibz_kernel_bare(np.zeros(3), q, kind="slab", zc=zc)
         return (np.einsum("n,na,nb->ab", weight * v, q, q)
                 / float(np.sum(weight * v)))
@@ -824,21 +821,14 @@ def _slab_minibz_wigner_seitz_polygon(bvec, kgrid):
     return polygon, np.asarray((g1, g2), dtype=np.float64), polygon_area
 
 
-def _slab_minibz_polygon_rule(polygon, polygon_area, order):
-    r"""One normalized Gamma-to-edge Duffy--Gauss rule.
+def _slab_minibz_graded_rule(polygon, polygon_area, order):
+    """Duffy rule with ``order`` Gauss points per geometric radial panel.
 
     ``q(r,s)=r*((1-s)*v_i+s*v_{i+1})`` has Jacobian
-    ``r*|v_i x v_{i+1}|``.  That radial factor cancels the slab bare
-    kernel's integrable ``1/|q|`` cusp before summation.  Gauss nodes are
-    interior to ``(0,1)``, so the singular point itself is never evaluated.
+    ``r*|v_i x v_{i+1}|``, cancelling the slab kernel's integrable
+    ``1/|q|`` cusp. Interior Gauss nodes never evaluate the origin; the
+    geometric radial panels also resolve a screened near-Gamma scale.
     """
-    nodes, weights = gauss_legendre_interval(int(order), 0.0, 1.0)
-    return _slab_minibz_duffy_rule(
-        polygon, polygon_area, nodes, weights, nodes, weights)
-
-
-def _slab_minibz_graded_rule(polygon, polygon_area, order):
-    """The Duffy rule with ``order`` Gauss points per geometric radial panel."""
     panels = [gauss_legendre_interval(int(order), lo, hi) for lo, hi in zip(
         _SLAB_MINIBZ_GRADED_PANELS[:-1], _SLAB_MINIBZ_GRADED_PANELS[1:])]
     s_nodes, s_weights = gauss_legendre_interval(
@@ -884,9 +874,6 @@ def _slab_minibz_duffy_rule(polygon, polygon_area, r_nodes, r_weights,
 
 #: method -> (ladder orders, rule builder, radial x edge nodes per triangle).
 _SLAB_MINIBZ_RULES = {
-    _SLAB_MINIBZ_PHOTON_METHOD: (
-        _SLAB_MINIBZ_PHOTON_ORDERS, _slab_minibz_polygon_rule,
-        lambda order: order * order),
     _SLAB_MINIBZ_GRADED_METHOD: (
         _SLAB_MINIBZ_GRADED_ORDERS, _slab_minibz_graded_rule,
         lambda order: (len(_SLAB_MINIBZ_GRADED_PANELS) - 1) * order
@@ -952,26 +939,22 @@ def slab_minibz_photon_cubature(
 
     There is no method token, order dial, or caller-supplied geometry fact on
     this surface.  The service constructs the true mini-lattice Voronoi cell,
-    triangulates Gamma to every edge, evaluates the fixed 16/24/32 Duffy--GL
-    ladder, and binds the normalized weights and padded/physical solve counts
-    into one provider-issued result.  Raw ``D`` carries no cell-volume factor.
+    triangulates Gamma to every edge and uses seven geometric radial panels
+    with 16/24/32 Gauss points per panel and 32 along each edge. The panels
+    resolve the small radial scale in screened scalar and photon heads;
+    bare heads are their zero-response limit. Normalized weights and
+    padded/physical solve counts are bound into one provider-issued result.
+    Raw ``D`` carries no cell-volume factor.
     """
     return _issue_slab_minibz_receipt(
-        kernel, geometry, kgrid, _SLAB_MINIBZ_PHOTON_METHOD)
+        kernel, geometry, kgrid, _SLAB_MINIBZ_GRADED_METHOD)
 
 
 def slab_minibz_graded_photon_cubature(
     kernel, geometry, kgrid,
 ) -> SlabMinibzPhotonReceipt:
-    """The same receipt on the radially graded rule, for screened integrands.
-
-    The cell, triangles, Duffy map and ``D`` are those of
-    :func:`slab_minibz_photon_cubature`; the radial axis is cut into seven
-    geometric panels toward Γ and the ladder is 8/12/16 Gauss points per
-    panel (``_SLAB_MINIBZ_GRADED_*``).  No dial.
-    """
-    return _issue_slab_minibz_receipt(
-        kernel, geometry, kgrid, _SLAB_MINIBZ_GRADED_METHOD)
+    """The canonical graded receipt, also used by the direct photon head."""
+    return slab_minibz_photon_cubature(kernel, geometry, kgrid)
 
 
 def _issue_slab_minibz_receipt(kernel, geometry, kgrid, method):

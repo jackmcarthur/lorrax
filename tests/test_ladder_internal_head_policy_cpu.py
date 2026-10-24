@@ -1,0 +1,202 @@
+"""The internal screened head has independent placement and restart identity."""
+from dataclasses import dataclass
+from types import SimpleNamespace as NS
+
+import numpy as np
+import pytest
+
+
+def test_shared_loader_separates_external_and_internal_head_without_changing_defaults(monkeypatch, tmp_path):
+    import inspect
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from bse.bse_loading import load_bse_data_from_restart_sharded as load
+    from bse import bse_loading
+    from bse.bse_head import _inject_q0_head
+    from file_io import restart_bundle
+    from common.collectives import device_put_process_local
+    jax.config.update("jax_enable_x64", True)
+    mesh = Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
+    g0 = np.array([1., .8+0.1j])
+    header = dict(grid=(1, 1, 1), centroid_count=2, screened_ready=True,
+                  head_vector=g0, bare_head=31., screened_head=np.array([18.+0j]),
+                  logical_band_count=2, energies=np.array([[-.2, .5]]))
+    monkeypatch.setattr(restart_bundle, "read_metadata", lambda _p: header)
+    monkeypatch.setattr(restart_bundle, "refuse_mpa_static_w", lambda _p: None)
+    v = device_put_process_local(np.eye(2, dtype=complex), NamedSharding(mesh, P("x", "y")))
+    w = device_put_process_local(np.ones((2, 2, 1, 1, 1), complex),
+                                NamedSharding(mesh, P("x", "y", None, None, None)))
+    psi = device_put_process_local(np.ones((1, 1, 2, 2), complex),
+                                  NamedSharding(mesh, P(None, None, None, "x")))
+    monkeypatch.setattr(restart_bundle, "read_bse_payload", lambda *a, **k: (psi, psi, v, w, None))
+    def read(**kwargs):
+        return load("unused", 1, 1, mesh_xy=mesh, n_occ=1, cell_volume=20., **kwargs)
+    bare = read(inject_head=False)
+    selected = read(inject_head=False, inject_w_head=True, q0_head="diagonal")
+    np.testing.assert_array_equal(selected["V_q0"], bare["V_q0"])
+    np.testing.assert_array_equal(selected["W_q"], bare["W_q"])
+    assert selected["q0_head_ry"] == 18./20. and bare["q0_head_ry"] == 0.
+    np.testing.assert_array_equal(selected["eps_c"], [[.5]])
+    # Existing optical defaults still inject both channels through one owner.
+    assert inspect.signature(load).parameters["inject_w_head"].default is None
+    assert inspect.signature(load).parameters["native_grid_only"].default is False
+    legacy = read()
+    vg, wg, _, _ = _inject_q0_head(v, w, jnp.asarray(g0), jnp.asarray(g0),
+                                  31., jnp.array([18.+0j]), 20., w0_ready=True, nk=1)
+    np.testing.assert_array_equal(legacy["V_q0"], vg)
+    np.testing.assert_array_equal(legacy["W_q"], wg)
+    # A later optical grid in the same deck cannot change GW's native ladder.
+    deck = tmp_path / "combined_gw_bse.in"
+    deck.write_text("[cohsex]\nsys_dim = 3\nkgrid_fine = 7 7 1\nkgrid_fine_shift = .5 .25 0\n")
+    with monkeypatch.context() as scoped:
+        class OpticalDispatch(Exception):
+            pass
+        def optical_dispatch(_data, fine_grid, *_args, **kwargs):
+            assert fine_grid == (7, 7, 1) and kwargs["fine_shift"] == (.5, .25, 0.)
+            raise OpticalDispatch
+        scoped.setattr(bse_loading, "_interpolate_bse_data_to_grid", optical_dispatch)
+        native = read(inject_head=False, inject_w_head=True, q0_head="diagonal",
+                      native_grid_only=True, input_file=str(deck))
+        assert native["densified"] is False and native["k_shift"] == (0., 0., 0.)
+        for key in ("W_q", "V_q0", "eps_c", "eps_v", "psi_c_X", "psi_v_X"):
+            np.testing.assert_array_equal(native[key], selected[key])
+        with pytest.raises(OpticalDispatch):
+            read(inject_head=False, inject_w_head=True, q0_head="diagonal", input_file=str(deck))
+    with pytest.raises(ValueError, match="native_grid_only=True.*explicit kgrid_fine"):
+        read(native_grid_only=True, kgrid_fine=(7, 7, 1))
+    with pytest.raises(ValueError, match="bse_screened_head"):
+        read(inject_head=False, inject_w_head=True, need_W=False)
+    header["screened_head"] = None
+    with pytest.raises(ValueError, match="bse_screened_head"):
+        read(inject_head=False, inject_w_head=True, q0_head="diagonal")
+
+
+def test_static_head_identity_binds_resolved_scalar_geometry_and_policy(monkeypatch, tmp_path):
+    from bse.w_ladder import ladder_static_head_identity, LADDER_INTERNAL_HEAD_POLICY
+    from file_io import restart_bundle
+    header = dict(grid=np.array([3, 3, 1]), head_vector=np.array([1., .8+0.1j]),
+                  bare_head=31., screened_head=np.array([18.+0j]))
+    monkeypatch.setattr(restart_bundle, "read_head_metadata", lambda _path: header)
+    def identity(volume=20., deck=None):
+        return ladder_static_head_identity("unused", deck, cell_volume=volume)
+    original = identity()
+    assert original["policy"] == LADDER_INTERNAL_HEAD_POLICY
+    assert original["q0_head"] == "diagonal"
+    assert original["q0_head_ry"] == 18./(20.*9)
+    # Each of these changes the physical static operator independently of W0.
+    for name, changed in (("screened_head", np.array([19.+0j])),
+                          ("head_vector", np.array([1., .81+0.1j])),
+                          ("grid", np.array([4, 3, 1]))):
+        old = header[name]
+        header[name] = changed
+        assert identity() != original
+        header[name] = old
+    assert identity(volume=21.) != original
+    deck = tmp_path / "cohsex.in"
+    deck.write_text("whead_0freq = 23\n")
+    overridden = identity(deck=str(deck))
+    assert overridden["whead_ry_bohr3"] == [23., 0.]
+    assert overridden["q0_head_ry"] == 23./(20.*9)
+    header["screened_head"] = None
+    with pytest.raises(ValueError, match="ladder_static_head_identity"):
+        identity()
+
+
+def test_static_rpa_rung_is_persisted_with_its_producer_diagram(monkeypatch):
+    from gw import screening_bse as owner
+    from gw import gw_output
+    from gw.gw_config import HeadCorrection, ScreeningDiagrams
+    @dataclass(frozen=True)
+    class Screening:
+        diagrams: object
+    @dataclass(frozen=True)
+    class Config:
+        screening: object
+        head: object
+    config = Config(Screening(ScreeningDiagrams.W_BSE), NS(correction=HeadCorrection.OFF))
+    static = np.ones((1, 2, 2))
+    seen = []
+    monkeypatch.setattr(owner, "_refuse_metallic_mean_field", lambda *a, **k: None)
+    monkeypatch.setattr(owner, "_refuse_unusable_restart", lambda *a, **k: None)
+    monkeypatch.setattr(owner, "_gate_w_or_refuse", lambda *a, **k: None)
+    monkeypatch.setattr(owner, "_assert_restart_is_loadable", lambda *a, **k: None)
+    monkeypatch.setattr(owner, "compute_static_w", lambda *a, **k: NS(unfold=lambda _m: static))
+    monkeypatch.setattr(gw_output, "persist_w0_and_head", lambda *a, **k: seen.append(k["config"]))
+    result = owner.prepare_ladder_restart(None, None, quad=None, e_ref=0.,
+        sym=NS(), centroid_indices=[], config=config, meta=NS(kgrid=(1, 1, 1)),
+        mesh_xy=None, tensors_filename="unused", head_resolver=None,
+        print_fn=lambda *a: None)
+    assert result is static
+    assert config.screening.diagrams is ScreeningDiagrams.W_BSE
+    assert len(seen) == 1 and seen[0].screening.diagrams is ScreeningDiagrams.W_RPA
+    assert seen[0].head is config.head
+
+
+@pytest.mark.parametrize('facade', ['head', 'wedge'])
+def test_no_rung_facades_load_bare_only_restart_without_screened_reads(monkeypatch,tmp_path,facade):
+    """The actual loader and payload owner must never request/rebuild W for RPA."""
+    import jax
+    from jax.sharding import Mesh,NamedSharding,PartitionSpec as P
+    from bse import w_ladder,bse_loading,head_resolvent
+    from bse import absorption_common
+    from file_io import restart_bundle
+    from gw import static_screening
+    from common.collectives import device_put_process_local
+    jax.config.update('jax_enable_x64',True)
+    mesh=Mesh(np.asarray(jax.devices('cpu')[:1]).reshape(1,1),('x','y'))
+    header=dict(grid=(1,1,1),centroid_count=2,screened_ready=False,
+        head_vector=None,bare_head=None,screened_head=None,
+        logical_band_count=2,energies=np.array([[-.2,.5]]))
+    monkeypatch.setattr(restart_bundle,'read_metadata',lambda _p: header)
+    def forbidden(*a,**k):
+        raise AssertionError('no-W facade must not inspect, read or rebuild screened W')
+    monkeypatch.setattr(restart_bundle,'refuse_mpa_static_w',forbidden)
+    monkeypatch.setattr(static_screening,'build_static_w_from_restart',forbidden)
+    psi=device_put_process_local(np.ones((1,1,1,2),complex),NamedSharding(mesh,P(None,None,None,'x')))
+    v=device_put_process_local(np.eye(2,dtype=complex),NamedSharding(mesh,P('x','y')))
+    reads=[]
+    monkeypatch.setattr(restart_bundle,'read_wavefunctions',lambda *a,**k: psi)
+    def gamma(_path,kind,*a,**k):
+        assert kind=='bare';reads.append(('Gamma',kind));return v
+    def full(_path,kind,*a,**k):
+        assert kind=='bare';reads.append(('full',kind));return v[:,:,None,None,None]
+    monkeypatch.setattr(restart_bundle,'read_interaction_gamma',gamma)
+    monkeypatch.setattr(restart_bundle,'read_interaction_qgrid',full)
+    actual=bse_loading.load_bse_data_from_restart_sharded
+    loaded=[]
+    def load(*a,**k):
+        data=actual(*a,**k,n_occ=1,cell_volume=20.)
+        assert data['w_loaded'] is False and data['q0_head_ry']==0.
+        assert data['W_q'].shape==(1,1,1,1,1) and np.all(np.asarray(data['W_q'])==0)
+        loaded.append((data,k));return data
+    monkeypatch.setattr(w_ladder,'load_bse_data_from_restart_sharded',load)
+    deck=tmp_path/'gw.in';deck.write_text('[cohsex]\nwfn_file = WFN.h5\n')
+    if facade=='head':
+        monkeypatch.setattr(restart_bundle,'load_dipole_h5',lambda *a,**k: (None,None,None))
+        monkeypatch.setattr(absorption_common,'slice_dipole_to_bse_window',
+            lambda *a: (np.ones((3,1,1,1)),np.ones((1,1,1))))
+        monkeypatch.setattr(head_resolvent,'build_head_operator',lambda *a,**k: 'head-operator')
+        result=w_ladder.prepare_ladder_head('bare-only',mesh,input_file=str(deck),
+            head_dipole_path='dipole.h5',head_n_occ=1,include_w=False)
+        assert result[0]=='head-operator'
+    else:
+        class AtSweep(Exception):
+            pass
+        monkeypatch.setattr(w_ladder,'_psi_at_rest_2d',lambda d,_m:d)
+        monkeypatch.setattr(w_ladder,'_symmetry_tables',lambda _p:NS(
+            q_irr_kgrid_int=np.zeros((1,3),int),irr_idx_q=np.array([0]),
+            sym_idx_q=np.array([0]),q_irr_full_idx=np.array([0])))
+        def sweep(data,*a,**k):
+            assert data is loaded[0][0]
+            raise AtSweep
+        monkeypatch.setattr(w_ladder,'sweep_q_wedge',sweep)
+        with pytest.raises(AtSweep):
+            w_ladder.compute_wc_qwedge('bare-only',[1j],mesh,input_file=str(deck),
+                include_w=False,gmres_tol=1e-9,gmres_max_iter=300,probe_chunk=1)
+    assert len(loaded)==1
+    assert loaded[0][1]['need_W'] is False
+    assert loaded[0][1]['inject_w_head'] is False
+    assert loaded[0][1]['native_grid_only'] is True
+    assert all(kind=='bare' for _,kind in reads)
+    assert ('Gamma','bare') in reads

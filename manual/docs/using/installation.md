@@ -1,6 +1,6 @@
 # Installation
 
-`uv sync --extra cuda13` Python environment, the native FFI pair, and the machine routes for Perlmutter, Frontera and other sites.
+Python environment, the native FFI pair, and the machine routes for Perlmutter, Frontier, Frontera and other sites.
 {: .page-summary }
 
 A LORRAX installation has three parts: a Python 3.12 environment with the JAX 0.12 series, a pair of native libraries built from `src/ffi/cpp/`, and a launcher that gives each process one device. All three are required at every process count, one process included.
@@ -23,7 +23,9 @@ Always required, on CPU and GPU alike.
 
 ### GPU requirements {: #req-gpu }
 
-For runs on NVIDIA GPUs. A GPU run loads both FFI legs.
+A GPU run loads the matching device leg and the host leg.
+
+**NVIDIA GPUs**
 
 | Component | Requirement | What it is for |
 |---|---|---|
@@ -37,6 +39,14 @@ The GPU linear algebra comes from these libraries:
 |---|---|---|
 | cuSOLVERMp ≥ 0.7 and cuBLASMp | required, part of the CUDA leg | The default distributed eigensolver and LU on a multi-GPU mesh. cuSOLVERMp 0.6.x returns wrong LU results on a 2-D process grid |
 | cuSOLVER, through jaxlib | installed with the CUDA extra | The single-device eigensolver and LU, used when one matrix fits on one GPU |
+
+**AMD GPUs on Frontier**
+
+Use the validated JAX 0.9.1 ROCm environment and the native ROCm/host pair,
+not a CUDA extra. The ROCm leg uses the same HIP, rocBLAS, rocSOLVER, RCCL
+and rocFFT libraries as the JAX plugin; ELPA supply the
+distributed operations. The [Frontier route](#frontier) selects the
+environment and explains the separate native builds.
 
 ### CPU requirements {: #req-cpu }
 
@@ -65,14 +75,23 @@ The service packages under `services/` (`distrib_la`, `lxkit`, `minimax`, `symme
 |---|---|---|
 | host | `liblorrax_ffi_host.so` | ScaLAPACK, a CBLAS GEMM, the FFTW3-ABI FFT, parallel HDF5. CUDA-free. |
 | CUDA | `liblorrax_ffi.so` | cuSOLVERMp, cuBLASMp, cuBLAS, cuSOLVER, cuFFT, NCCL, the NVRTC-built mathdx k-convolution kernels, parallel HDF5 |
+| ROCm | `liblorrax_ffi_rocm.so` | HIP, rocBLAS/rocSOLVER, ELPA, ROCm FFT kernels and parallel HDF5 |
 
-A CPU run loads the host leg; a GPU run loads both into one process. There is no pure-JAX fallback for the k-convolution, the distributed linear algebra or the slab I/O, so a missing leg refuses at startup. Each build ends in `scripts/verify_ffi_build.sh` and prints `VERIFY PASSED`; each leg records its dependency closure in `<leg>.closure.json`, and every startup refuses a process that maps any other copy of a recorded library. A private build loads with a `LEGACY-UNSEALED` line and its hash; only a sealed pair is a production provider.
+A CPU run loads the host leg; a GPU run loads the host and its matching
+device leg into one process. A missing required leg refuses at startup.
+Each leg records its dependency closure in `<leg>.closure.json`, and startup
+checks that the process maps those libraries. The acceptance contract is
+`scripts/verify_ffi_build.sh`; skipped runtime gates on a login node do not
+certify a GPU build. A private checkout build prints `LEGACY-UNSEALED` and
+its hash, with its closure still enforced; a published module carries a
+sealed pair.
 
 ## Routes by machine {: #routes }
 
 | Machine | Route | Entry |
 |---|---|---|
 | NERSC Perlmutter (A100) | `install_deps.sh`: one runtime image, restored on each node for every job | `config/perlmutter/` |
+| OLCF Frontier (MI250X, ROCm) | a validated ROCm environment and a bare-metal host/ROCm pair | `config/frontier/` |
 | TACC Frontera (Cascade Lake CPU) | a clone with the host leg, run inside apptainer | `config/frontera/` |
 | one Ubuntu machine with an NVIDIA driver (workstation, WSL2, a rented GPU box) | everything from pip wheels plus the distro OpenMPI | `config/local/` |
 | any other cluster | the Perlmutter scripts, re-pinned to the site ([porting](#porting)) | `src/ffi/cpp/` |
@@ -627,6 +646,92 @@ Copy `config/perlmutter/` and replace the site-specific pieces:
 Before choosing where things go, measure the file-open latency of each filesystem **from a compute node**: login nodes hide it. The self-check does this as its first component, and with exit status 3 on a login node it prints the `srun` line to run it where it counts. Put the runtime on node-local storage and the caches (`LORRAX_CACHE_ROOT`) on the fastest shared filesystem, then run the self-check on a GPU node.
 
 On a cluster without Cray compiler wrappers, `config/local/build_ffi.sh` and `build_ffi_host.sh` are the closer template: plain `gcc`/`g++`, nvcc from the wheels, the system MPI and ScaLAPACK. Build through CMake, whose post-build step writes the `.closure.json` every startup requires and runs `scripts/verify_ffi_build.sh`.
+
+### Frontier (OLCF) {: #frontier }
+
+Use the existing validated JAX/jaxlib 0.9.1 environment with `rocm-sdk`
+7.14.1 wheels. From the checkout, source the setup once:
+
+```bash
+source config/frontier/gpu_env.sh
+```
+
+It selects `LORRAX_OLCF_VENV`, the active `VIRTUAL_ENV`, or the default
+`$HOME/envs/lx-jax091-rocm7141`, in that order. It activates the environment,
+checks for the ROCm plugin without starting a GPU client, prepares the
+host/ROCm library paths and selects this checkout's source. It does not
+create the Python environment or build native libraries. For a fresh Python
+3.12 installation, use the [pinned ROCm/JAX recipe](https://github.com/jackmcarthur/lorrax/blob/main/docs/installation/frontier.md#fresh-python-installation):
+AMD's multi-architecture wheel index supplies
+`rocm[libraries,device-gfx90a]==7.14.1` and
+`jax_rocm7_plugin`/`jax_rocm7_pjrt==0.9.1+rocm7.14.1`; PyPI supplies
+`jax==0.9.1` and `jaxlib==0.9.1`. That recipe installs the editable workspace
+packages from `pyproject.toml`, then the root package, and records the final
+package manifest. No CUDA extra is installed.
+
+The normal PyPI `h5py` wheel is supported; no MPI-enabled `h5py` build is
+needed. Its private serial HDF5 libraries are separate from the one pinned
+parallel HDF5 family shared by both native legs. The tested environment
+uses `h5py 3.16.0` with private HDF5 2.0.0, while the native pair uses site
+HDF5 1.14.3.7. Runtime owns the load order and file-handle separation.
+
+If the shared dependency installs are already present, build only the two
+LORRAX legs for this checkout:
+
+```bash
+bash config/frontier/build_ffi_host.sh
+bash config/frontier/build_ffi_rocm.sh
+```
+
+On a first installation, run `bash config/frontier/build_openblas_seq.sh`
+before those commands. Its install under `$HOME/software/openblas_seq/install`
+and the content-keyed ELPA installs under `$HOME/software/elpa_builds` are
+shared across checkouts; the ROCm builder creates a missing matching ELPA prefix. The ROCm builder creates or verifies its content-keyed ELPA
+prefix under `$HOME/software/elpa_builds`. Rebuilding LORRAX does not
+require deleting or rebuilding these dependencies.
+
+After building both legs, certify them inside an active allocation with
+four free GCDs:
+
+```bash
+bash config/frontier/verify.sh
+```
+
+The command sources `gpu_env.sh`, verifies the recorded host/ROCm closures
+and intended host FFTW, then compares native and XLA Fourier transforms at
+four MPI processes. It refuses disabled acceptance checks. The host build
+cache supplies the FFTW prefix; a copied host leg without that cache needs
+the existing `LORRAX_FFTW3_STAGE` set to its verified FFTW prefix. No added
+library paths or runtime toolkit module are needed. Skipped runtime gates
+on a login node do not certify a build.
+
+Run a calculation inside the allocation:
+
+```bash
+source config/frontier/gpu_env.sh
+srun -N 1 -n 4 -c 7 --threads-per-core=1 --gpus-per-task=1 \
+  python -u -m gw.gw_jax -i /path/to/run/gw.in
+```
+
+`--threads-per-core=1` selects one hardware thread per CPU core for each
+rank's seven cores. `--gpus-per-task=1` also supplies Slurm's `per_task:1`
+binding, assigning one
+GCD to each MPI process. Keep that implicit binding; an explicit
+`--gpu-bind=closest` replaces it with proximity-based selection
+([Slurm reference](https://slurm.schedmd.com/srun.html#OPT_gpus-per-task)).
+
+This is a 2 × 2 mesh on four GCDs, one per MPI process. A Frontier node has
+eight GCDs, but eight processes are not a valid square mesh; sixteen form
+a 4 × 4 mesh on two complete nodes. The helper and runtime own the ROCm
+and RCCL/OFI setup; do not use the NVIDIA `select_gpu.sh` or copy Perlmutter
+network settings. No container or runtime ROCm toolkit module is needed.
+
+The records can also be inspected with `python -m lxkit.closure verify <leg.so>`.
+Reusing a build from another checkout also requires matching FFI sources,
+Frontier build inputs and JAX/jaxlib headers; a matching ABI number or a
+closure JSON alone is insufficient. At runtime both closures must be
+enforced. Full build pins, paths and reuse rules are in the
+[Frontier installation source](https://github.com/jackmcarthur/lorrax/blob/main/docs/installation/frontier.md).
 
 ### Frontera {: #frontera }
 

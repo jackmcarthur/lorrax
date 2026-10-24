@@ -438,6 +438,7 @@ def solve_bse_sharded(
         from solvers.davidson import DEFAULT_M_MAX_FACTOR
         m_max_warm = max(int(davidson_m_max) if davidson_m_max
                          else DEFAULT_M_MAX_FACTOR * n_eig, 2 * n_solve)
+        m_max_warm = min(m_max_warm, int(np.prod(X0.shape[1:])))
         log.info(f"Davidson: {n_eig} roots + {n_solve - n_eig} margin"
                  + ("" if davidson_margin_tol_Ry is None else
                     f" (locked at {float(davidson_margin_tol_Ry) * RY_TO_MEV:g} meV)") + ", "

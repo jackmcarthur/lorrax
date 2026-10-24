@@ -486,11 +486,224 @@ same field ([TD-aGW end to end](../how-to/td-agw-workflow.md#circular-drives)).
 ## W_BSE: the ladder in GW screening
 
 `screening_diagrams = w_bse` is a GW option: Σ uses the ladder-corrected
-$W(z) - v = v(z - H)^{-1}v$, with the BSE Hamiltonian's static direct rung in
-$H$ (`gw.screening_bse`, `bse.w_ladder`). The stage persists the RPA W(0), then
+$W^c(z)=C(z-H)^{-1}B$, with density vertices at both ends and a static
+direct rung in $H$ (`gw.screening_bse`, `bse.w_ladder`). The stage persists the RPA W(0), then
 solves the resolvent one z at a time with ψ held 2-D at 1/P, by GMRES with a
 recycled spectral deflation per (q, z) (`bse_feast.harvest_spectral_deflation`).
 Keys, supported modes and refusals: [input reference](../input_reference.md).
+This changes the screening in $\Sigma=iGW$; it does not add a matching
+self-energy vertex or close the self-consistent Hedin equations.
+
+The direct rung scans individual trials within each probe block. Its encoded
+`T(mu,nu,s,s,k)` and FFT/decode scratch are reused, so this largest temporary
+does not acquire the probe-block width. The trial vectors retain their
+distributed conduction/valence layout; the ring encoders move band slices
+without gathering the complete transition window on every rank. Exchange
+and diagonal terms remain batched; their smaller trial/centroid buffers and
+the returned trial block still grow with the probe count.
+
+### Physical resonant and antiresonant branches
+
+At stored $+q$ use the two physical transitions
+
+$$
+R=(m=c,k+q;n=v,k),\qquad A=(m=v,k+q;n=c,k).
+$$
+
+Let $I$ run over both branches, $\eta_I=f_{n_I}-f_{m_I}$ ($+1$ on R,
+$-1$ on A), $D_{II}=\epsilon_{m_I}-\epsilon_{n_I}$, and
+$F_I(\mu)=\sum_s\overline{\psi_{m_I}(\mu,s)}\psi_{n_I}(\mu,s)$.
+The antiresonant diagonal is negative and its orbitals differ from R.
+With uniform full-zone k weights the physical density operator is
+
+$$
+H=D+\eta(K^{\rm H}-K^{\rm d}),\qquad
+K^{\rm H}=\frac{g}{N_k}FV_qF^\dagger,
+\qquad B=\frac{1}{\sqrt{N_k}}\eta FV_q,\qquad
+C=\frac{g}{\sqrt{N_k}}V_qF^\dagger.
+$$
+
+$g$ is the shared exchange spin weight (2 for a scalar singlet, 1 for
+spinors). All four Hartree blocks use these same vertices. For any two
+physical pairs the positive direct matrix element is
+
+$$
+K^{\rm d}_{IJ}=\frac{1}{N_k}\sum_{\mu\nu ss'}
+\overline{\psi_{m_I}(\mu,s)}\psi_{m_J}(\mu,s)
+W^{\rm RPA}_{\mu\nu}(k_I-k_J;0)
+\psi_{n_I}(\nu,s')\overline{\psi_{n_J}(\nu,s')}.
+$$
+
+This equation supplies R–R, R–A, A–R and A–A. The direct rung has no extra
+singlet factor. Both shifted electron and shifted hole orbitals are loaded
+at physical $k+q$; `build_finite_q_data` uses the existing roll-index owner
+with argument $-q$ to obtain that gather, while keeping the tile $V_q$.
+The construction needs neither real orbitals nor a band sewing matrix at
+Kramers points. Arbitrary complex phases and rotations of degenerate
+one-particle states must transform source, operator and readout together.
+
+The rung uses the same k-convolution router and band-projection owner as
+the optical/exciton kernels. One summed ket field and one k convolution
+serve both physical bra decodes; the anti band owners move through the
+existing transpose-peer collective. This shares the contraction machinery,
+without identifying the two physical vertices or substituting the optical
+solver's real-linear coordinate convention.
+
+The unchanged folded RPA body remains an independent control. Setting
+$K^{\rm d}=0$ in the explicit-branch response reproduces the Dyson RPA
+response at every q. The former hybrid of folded density vertices and
+optical direct blocks is not a valid ladder operator in complex orbital
+gauges. Its results are historical, not a convention to reuse. The backend
+identity is `physical-ra-exact-static-head-v2`; response banks from the former convention
+must be rebuilt.
+
+The internal transfer $k-k'=0$ screened head is distinct from the external
+macroscopic Hartree channel. The restart stores the static RPA body and
+screened head separately. The ladder loads the internal screened head through
+the optical exact-overlap owner: $h=\mathrm{Re}(w_{\rm head})/(\Omega N_k)$
+subtracts $hI$ in R–R, adds $hI$ in A–A, and contributes zero in R–A/A–R
+because conduction and valence orbitals are orthogonal. Both physical
+conduction operand tables use `head_shifted_eps_c`; stored DFT gaps and
+dipole normalization remain unchanged. The external bare head stays omitted
+until the existing macroscopic completion. The bank identity binds the actual
+screened scalar, volume, k grid, G=0 vector and this policy as well as the
+static dense body. Older banks must be rebuilt, without metadata migration.
+The density ladder explicitly loads the native GW restart grid. Optional
+`kgrid_fine` and `kgrid_fine_shift` settings for a later optical calculation
+in the same deck do not change its response manifold or normalization.
+
+### Samples, slopes and moments
+
+Both branches remain present through the shifted solves and exact actions:
+
+$$
+W^c(z)=C(z-H)^{-1}B,\qquad
+\partial_z W^c(z)=-C(z-H)^{-2}B,\qquad
+\mathcal M_j=\tfrac12 CH^jB.
+$$
+
+For $s=z^2$ and $z\ne0$, the tangential slope is
+$\partial_sW^c=(2z)^{-1}\partial_zW^c$. With measured time reversal,
+$W^c(z)=W^c(-z)$ and $\mathcal M_0=\mathcal M_2=0$, so
+$W^c(z)=2\mathcal M_1/z^2+2\mathcal M_3/z^4+\cdots$.
+The bank gates the reflected solves and forbidden moments before the
+even-$s$ fit. It does not average a noneven response into this model or
+replace ladder slopes or moments with RPA values.
+
+The tangential adapter samples this operator at the ordinary recipe's
+complex supports, supplies its exact slopes and moments to the existing
+constructor, and passes the resulting shared real poles to the unchanged
+Σ executor. Canonical centroid outputs are packed through the run's one
+basis owner before fitting. The identity binds the branch convention,
+static-rung digest, head policy and solver tolerance/iteration cap; an RPA bank or another rung cannot
+authenticate as this ladder. The elementwise `mpa` parent handoff remains
+refused. Supported modes and parse refusals are owned by the
+[input reference](../input_reference.md).
+
+Hermite construction consumes values and slopes, so this path has a
+stricter input-solve budget than the production GN-PPM ladder. Its body
+uses the true-residual tolerance:
+`0.1 * min(bank_rule_tolerance, abs(normalized_gram_validity))`, giving
+`1e-9` for the production recipe and `1e-8` for the relaxed recipe, with
+the existing 300-iteration cap. Every returned residual must meet that
+requested tolerance; a solve at the cap is refused. The accuracy policy,
+tolerance and cap authenticate the bank/model identity, so an older
+looser bank cannot be reused. This allocates one decade below the existing
+certificate budgets; it does not bound Gram error amplification. The
+constructor still applies its unchanged positivity gate without PSD repair.
+The GN-PPM ladder retains its `1e-6` tolerance.
+The tangential scalar-head certificate below uses the existing tight Γ
+reference tolerance `1e-10` for values, slopes and reflected solves.
+
+### Macroscopic head: the same operator, restored once
+
+The headless Γ operator already includes microscopic Hartree local fields
+and the direct rung. For the velocity dipole $d=v_{cv}/\Delta=i r_{cv}$ its
+matched source is $[d;\bar d]$ and readout $[d^\dagger,-d^T]$:
+
+$$
+\Xi_{ab}(z)=\frac{2}{\Omega N_k n_{\rm spin}n_{\rm spinor}}
+\big[d^\dagger,-d^T\big]_a(z-H_\Gamma)^{-1}
+\begin{bmatrix}d\\\bar d\end{bmatrix}_b.
+$$
+
+`head_resolvent.project_head_response` owns this readout. With both Hartree
+and direct kernels disabled, the free-pair limit agrees with the direct
+velocity tensor in the same units and band window. Properly matched folded
+RPA coordinates remain valid;
+mixing their branch sum with the physical operator does not.
+
+Only the longitudinal symmetric part of $\Xi$ enters the scalar head.
+`response_kind=micro_reducible` tells the shared head provider that its
+microscopic local fields are already present. It restores the omitted
+macroscopic Coulomb channel once, then performs the same 3D or slab
+mini-BZ average. Applying the RPA $S+YWZ$ Schur fold again would double
+count microscopic screening. No Γ head is also inserted into the body
+resolvent.
+
+For tangential `w_bse`, fresh Γ solves provide values, exact even-$s$
+slopes and high-frequency moments through the same response-action owners
+as the body. One prepared operator, wavefunction payload and dipole RHS
+survive frequency refinement; they are not reloaded per batch. Evenness,
+imaginary-axis sign, odd moments and every true solve residual are checked.
+The final macroscopic completion is differentiated on the same Coulomb
+quadrature, with no finite differences. If
+$\Xi=C_1/z^2+C_3/z^4+\cdots$, its scalar coefficients are
+
+$$
+C^{h}_1=\langle v^2 q^T C_1q\rangle,\qquad
+C^{h}_3=\langle v^2 q^T C_3q+v^3(q^T C_1q)^2\rangle .
+$$
+
+The nonlinear $C_1^2$ term is part of macroscopic completion. These
+coefficients enter the common Hermite/Ritz constructor as $2\mathcal M_1$
+and $2\mathcal M_3$ on one scalar port. Its convention remains
+$W^c_{\rm head}(z)=\sum_p2\Omega_p B_p/(z^2-\Omega_p^2)$;
+the head's inverse-frequency moment $M_1^{\rm head}=\sum_pB_p/\Omega_p^2$
+is distinct from the body's high-frequency $\mathcal M_1$ above.
+
+`ladder_head_fit` reuses the body recipe's fit/held supports, the incumbent
+MPA span supports, static and imaginary-axis moment observations. Its guards
+use the actual gap and the existing physical supports projected
+onto the consumer eta, with independent midpoint checks. Moment-quadrature
+nodes remain independent observations until selected: after an inverse-moment
+failure, the largest measured contribution to that error becomes one support.
+This avoids near-static/infinity columns that add conditioning loss without
+information. A failed physical held site becomes fitted only after failure;
+its interval is bisected and the new sites are solved independently. The
+inherited recipe sample cap bounds reference promotions and fresh sites.
+Held roles take priority over coincident
+supports from another construction. Scalar-only retention refinement may
+retain more Gram directions; Gram validity, metric and zero-weight gates
+remain the common constructor's. No pole or residue is repaired or pinned.
+
+Publication requires Coulomb-normalized passivity using the same bare-head
+receipt, finite positive real poles, static relative error at most `1e-10`,
+inverse-moment and high-frequency errors within `bank_rule_tolerance`, and
+sampled value/slope errors within `direction_cutoff`. The inverse moment's
+24/48-point rule must converge; a 96-point check is available before named
+refusal. These are measured support certificates, not a uniform real-axis
+error theorem. Pole count follows the admitted span rather than an eight-pole
+cap. All ranks use one agreed pole payload and worst-rank admission errors.
+Policy version, supports, solve controls, promotions and budgets are recorded
+in the head provenance; a head is rebuilt and certified even on body restart.
+
+The response-action scalar average currently supports the production slab
+polygon and the ordinary bulk mini-BZ draw. Tangential `w_bse` with a full
+head refuses the bulk analytic-sphere option rather than guessing its
+screened response actions. GN-PPM and legacy MPA head paths are unchanged.
+
+### Self-consistency is a separate, refused extension
+
+The implemented ladder route is single-shot. A self-consistent map would
+need its own current energies, occupied/empty pair window, wavefunctions,
+velocity vertices and freshly screened static rung
+$W^{\rm RPA}[G_n](0)$, followed by a new ladder bank, head and poles before
+evaluating that map's Σ. The resulting map also needs an identity binding
+all of these objects. Reusing the initial rung while updating $G$ defines
+a frozen-kernel approximation, not that self-consistent ladder map.
+`w_bse_self_consistency_unimplemented` therefore remains a refusal; shared
+Σ/pole infrastructure by itself does not certify this extension.
 
 ## Refusals
 
@@ -556,6 +769,3 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
   CLI.
 - `compute_mode = mpa` with `screening_diagrams = w_bse` refuses at setup
   (`GATE parent_screening_diagrams`, `file_io/restart_bundle.py:4369`).
-- The `w_bse` ladder refuses a degenerate TRIM block whose Kramers misclosure
-  exceeds 1e-8 of its scale (`GATE trs_gauge_block_not_theta_closed`,
-  `bse/bse_w_exact.py:538`).

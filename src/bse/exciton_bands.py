@@ -41,15 +41,15 @@ every Q of a user-supplied high-symmetry path with ONE compiled engine:
                             ``--refit-points`` spot checks, solved in the
                             SAME compiled scan (extra scan rows) so the
                             interp-vs-refit ΔE_S table is apples-to-apples.
-      ``--vq-mode=ongrid``  no model at all: the stored ``V_qmunu[wrap(−Q)]``
+      ``--vq-mode=ongrid``  no model at all: the stored ``V_qmunu[wrap(+Q)]``
                             tile, exact, but only at Q on the coarse
                             exchange-tile grid — which ``--q-per-segment``
                             (a FLOOR of 16 by default, because E_S(Q) on a
                             path is a bandstructure) puts most Q off.
     Momentum labeling: the pair density conj(ψ_c[k+Q]) ψ_v[k] pairs with
-    the tile at TILE momentum q = wrap(−Q) (reference-metric convention,
+    the tile at TILE momentum q = wrap(+Q) (rho = conj(ψ_v) ψ_c has momentum +Q,
     ``vq_interp`` docstrings); on-grid this is exactly the stored
-    ``V_qmunu[wrap(−Q)]`` slot.
+    ``V_qmunu[wrap(+Q)]`` slot.
 
     WHICH WINDOW THE REFIT FITS ζ' ON — ``--refit-window``, and it decides
     which gate certifies the run.  ``zeta`` (default) fits on the producer's
@@ -158,7 +158,7 @@ log = get_logger(__name__)
 _LOGGER = log     # the module logger, where a ``log`` parameter or local shadows it
 from .bse_preconditioner import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
-from .exchange_path import exchange_tiles
+from .exchange_path import exchange_tiles, exchange_tile_momentum
 from .bse_window import (apply_eqp_to_bse_window, pad_zone_mask_np,
                          require_valence_pad_guard)
 from . import vq_interp
@@ -399,7 +399,8 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
 
 def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                                nc_pad: int, nv_pad: int, n_cond: int, n_val: int,
-                               *, n_eig: int, max_iter: int, tol_mev: float, W_q0):
+                               *, n_eig: int, max_iter: int, tol_mev: float, W_q0,
+                               cert_rows=(), cert_tol_mev=None):
     """The ``solver = davidson`` (default) counterpart of :func:`build_path_solver`:
     the same call signature and outputs, the per-Q lowest ``n_eig`` from
     ``bse_lanczos.solve_bse_sharded``'s Davidson (exact diagonal
@@ -407,9 +408,13 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     ``tol_mev`` residual stop).  One planned solver serves every Q
     (``davidson_plan_key``); each Q's operands are arguments.  A Q that does not
     converge refuses (``GATE davidson_converged``) before the driver writes.
-    ``W_q0`` is the q = 0 slice of W_q, taken before W_q was donated."""
+    ``W_q0`` is the q = 0 slice of W_q, taken before W_q was donated.
+    Certification rows use the tighter ``cert_tol_mev`` residual, so a loose
+    plotting tolerance cannot dominate the exchange comparison. Both members
+    of each comparison must be included in ``cert_rows``."""
     from common.collectives import replicate_to_mesh
     from .bse_lanczos import RY_TO_MEV, davidson_stop_line, solve_bse_sharded
+    from solvers.davidson import LAST_RUN
     sh = make_bse_shardings(mesh_xy)
     rows_of = {}
 
@@ -428,6 +433,8 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                    psi_v_X, psi_v_Y, eps_v, W_R, D_head=None, M_Q=None):
         rows = []
         for iQ in range(int(psi_cQ_X.shape[0])):
+            row_tol = (min(tol_mev, cert_tol_mev)
+                       if cert_tol_mev is not None and iQ in cert_rows else tol_mev)
             i = jnp.int32(iQ)
             c_X = _row(psi_cQ_X, i, sh.psi_x)
             payload = dict(static, psi_c_X=c_X, psi_c_Y=_row(psi_cQ_Y, i, sh.psi_y),
@@ -436,14 +443,30 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                            W_q=None, M=pair(c_X, psi_v_X), _W_q0_for_precond=W_q0)
             if D_head is not None:
                 payload["head_tensor"] = (D_head, _row(M_Q, i, NamedSharding(mesh_xy, P())))
-            ev, _, _ = solve_bse_sharded(
-                payload, mesh_xy, n_eig=n_eig, max_iter=max_iter, solver_kind="davidson",
-                davidson_precond="exact", davidson_tol_Ry=tol_mev / RY_TO_MEV,
-                davidson_plan_key="exciton_bands")
-            davidson_stop_line(n_eig=n_eig, tol_mev=tol_mev, budget=max_iter,
-                               cap="the cap is solver_max_iter", where=f" at Q row {iQ}",
-                               refused="No exciton band file was written.",
-                               fix="raise solver_max_iter, or loosen davidson_tol_mev")
+            for attempt in range(2):
+                ev, _, _ = solve_bse_sharded(
+                    payload, mesh_xy, n_eig=n_eig, max_iter=max_iter, solver_kind="davidson",
+                    davidson_precond="exact", davidson_tol_Ry=row_tol / RY_TO_MEV,
+                    davidson_plan_key="exciton_bands")
+                davidson_stop_line(n_eig=n_eig, tol_mev=row_tol, budget=max_iter,
+                                   cap="the cap is solver_max_iter", where=f" at Q row {iQ}",
+                                   refused="No exciton band file was written.",
+                                   fix="raise solver_max_iter, or loosen davidson_tol_mev")
+                if cert_tol_mev is None or iQ not in cert_rows:
+                    break
+                residual = np.asarray(LAST_RUN["res"][0])[:n_eig] * RY_TO_MEV
+                if np.all(np.isfinite(residual)) and np.max(residual) <= cert_tol_mev:
+                    break
+                # The shared solver stops relative to max(1, |E_Ry|). Core
+                # excitations can therefore need a stricter scalar tolerance
+                # to meet this comparison's absolute meV error budget.
+                scale = max(1.0, float(np.max(np.abs(_gather_host(ev)))))
+                row_tol = min(row_tol, cert_tol_mev / (2 * scale))
+            else:
+                raise RuntimeError(
+                    f"GATE refit_cert_solver_accuracy: Q row {iQ} has absolute "
+                    f"residual {np.max(residual):g} meV; want <= {cert_tol_mev:g} "
+                    "meV before comparing exchange eigenvalues.")
             rows.append(np.asarray(_gather_host(ev)).real)
         return replicate_to_mesh(np.stack(rows), mesh_xy), ()
 
@@ -467,7 +490,8 @@ def _precond_w_q0(args, data):
     return data["W_q"][:, :, 0, 0, 0]
 
 
-def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, head_mbz, W_q0):
+def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, head_mbz, W_q0,
+                 *, cert_rows=()):
     """The per-Q lowest-``n_eig`` solver of the band scan: Davidson (default, cap
     ``max(30, min(200, n_phys // 2))`` iterations) or ``solver = block_lanczos``'s fixed
     block-Lanczos scan (40 block iterations)."""
@@ -477,11 +501,16 @@ def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, he
             block_size=args.block_size,
             max_iter=40 if args.max_iter is None else args.max_iter, head_tensor=head_mbz)
     n_phys = int(n_cond) * int(n_val) * nkx * nky * nkz
+    if cert_rows:
+        log.info(f"  [refit-cert] Davidson residual for both comparison rows: "
+            f"{min(args.davidson_tol_mev, 0.1 * CERT_TOL_BY_GRADE[args.cert_grade]):g} "
+            "meV; the exchange certification gate is unchanged.")
     return build_path_solver_davidson(
         mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, n_eig=args.n_eig,
         max_iter=(max(30, min(200, n_phys // 2)) if args.max_iter is None
                   else args.max_iter),
-        tol_mev=args.davidson_tol_mev, W_q0=W_q0)
+        tol_mev=args.davidson_tol_mev, W_q0=W_q0, cert_rows=cert_rows,
+        cert_tol_mev=0.1 * CERT_TOL_BY_GRADE[args.cert_grade] if cert_rows else None)
 
 
 def _report_alpha_over_path(labels, alpha_all, log=log.debug):
@@ -740,7 +769,7 @@ def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
     kg = np.asarray(kgrid_vq, dtype=int)
     rows, worst, worst_iQ = [], 0.0, -1
     for j, iQ in enumerate(cert_idx):
-        q_tile = -Qpath[iQ] - np.round(-Qpath[iQ])
+        q_tile = exchange_tile_momentum(Qpath[iQ])
         tile = tuple(int(v) for v in
                      (np.round(q_tile * kg).astype(int) % kg))
         d_mev = np.abs(np.asarray(evs_refit_route[iQ])
@@ -867,26 +896,41 @@ def apply_q_per_segment(params, q_per_segment, log=log.debug) -> int:
 
 
 def require_zeta_for_interp(restart_file, vq_mode, kgrid) -> str:
-    """The ζ file the off-grid exchange needs — or a refusal that explains it.
+    """Check exchange storage before constructing the path wavefunctions.
 
-    ANNOUNCE OR REFUSE, BEFORE h5py GETS TO SAY IT ITS WAY.
-    ``vq_interp.build_vq_evaluator`` looks for ``zeta_q.h5`` beside the
-    restart, and a missing one is not an exotic condition: it is what EVERY
-    downfolded bundle written before 2026-08-10 looks like, and what one
-    whose parent's ζ was stored on the q-IBZ wedge still looks like.  The
-    bare ``OSError`` from that path names a file and nothing else — no hint
-    that the absence is a downfold consequence, and no hint that
-    ``--vq-mode=ongrid`` needs no ζ at all.  Third of the three ways this
-    driver failed on a downfolded bundle (PIPELINE_HEALTH.md, 2026-08-10).
-
-    A separate function rather than an inline block so the refusal can be
-    gated without a solve — same reason ``rerun_check_enabled`` is one.
+    Interpolation consumes full-BZ ζ rows; refit uses the stored fit metadata
+    and permits IBZ rows. Inspect only scalar/header counts here, leaving the
+    existing payload and fit-identity gates with their owners.
     """
     if vq_mode == "ongrid":
         return ""
     path = os.path.join(os.path.dirname(os.path.abspath(restart_file)),
                         "zeta_q.h5")
     if os.path.isfile(path):
+        from file_io.isdf_header import read_zeta_storage_metadata
+        storage = read_zeta_storage_metadata(path)
+        grid = tuple(int(v) for v in kgrid)
+        if storage['kgrid'] != grid:
+            raise SystemExit(
+                f"exciton_bands: ζ grid {storage['kgrid']} differs from the "
+                f"coarse WFN grid {grid}: {path}")
+        if not storage['complete']:
+            raise SystemExit(f"exciton_bands: incomplete ζ file: {path}")
+        if storage['layout'] != 'G_flat':
+            raise SystemExit(
+                f"exciton_bands: exchange requires G_flat ζ storage: {path}")
+        full = int(np.prod(grid))
+        if storage['n_q'] > full:
+            raise SystemExit(
+                f"exciton_bands: ζ has {storage['n_q']} rows for a {full}-q grid: {path}")
+        if vq_mode in ('interp', 'both') and storage['n_q'] != full:
+            raise SystemExit(
+                f"exciton_bands: --vq-mode={vq_mode} requires full-BZ ζ "
+                f"storage, but {path} contains {storage['n_q']} of {full} q "
+                "rows. Use --vq-mode=refit for an IBZ-stored producer "
+                "(choose --refit-window=bse for the deck's fitted window), "
+                "or --vq-mode=ongrid for stored coarse-grid exchange tiles. "
+                "No path wavefunctions have been constructed.")
         return path
     prov = None
     try:
@@ -897,20 +941,30 @@ def require_zeta_for_interp(restart_file, vq_mode, kgrid) -> str:
     nx, ny, nz = (int(v) for v in kgrid)
     raise SystemExit(
         f"exciton_bands: --vq-mode={vq_mode} builds the exchange tile at "
-        f"arbitrary Q by interpolating the stored zeta, and there is no "
+        f"arbitrary Q using the stored zeta fit, and there is no "
         f"{path}.\n"
         + ("  This bundle is a DOWNFOLD.  gw.downfold_cli transports zeta "
            "into the small basis (zeta_S = conj(T[q]) zeta_L) and writes it "
            "beside the bundle, so a bundle without one was either written "
-           "before that existed or has a PARENT whose zeta is stored on the "
-           "q-IBZ wedge — which vq_interp refuses on the parent too, so "
-           "--vq-mode=interp is unavailable on this lineage.  Use "
+           "before that existed or lacks its parent's zeta fit. Use "
            "--vq-mode=ongrid for the retained grid.\n"
            if prov is not None else
            "  The GW run that wrote this bundle left no zeta_q.h5 beside it "
            "(a moved tmp/, or a restart written without the fit).\n")
         + f"  --vq-mode=ongrid needs no zeta at all and is EXACT at every Q "
           f"that lands on the {nx}x{ny}x{nz} BSE grid.")
+
+
+@partial(jax.jit, static_argnames=("n_val", "n_cond"))
+def _continuum_threshold_ry(eps_cQ, eps_v, *, n_val, n_cond):
+    """min_kcv(E_c(k+Q)-E_v(k)), excluding padded bands, one value per Q.
+
+    ``eps_cQ`` is ``(nQ, nk, nc_pad)`` and ``eps_v`` is ``(nk, nv_pad)``.
+    Reduce the bands first, retaining only ``(nQ, nk)`` work rather than a
+    full transition array. These are QP energies before any W-head shift.
+    """
+    return jnp.min(jnp.min(eps_cQ[:, :, :n_cond], axis=2)
+                   - jnp.max(eps_v[:, :n_val], axis=1)[None, :], axis=1)
 
 
 def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
@@ -933,14 +987,15 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
     at 7449ece0: one place resolves the extent, everything else asserts
     against it rather than re-deriving it.)
 
+    This consumes the bundle's ψ/energy buffers. Drop its unused transposed
+    X copy before allocating the stacks; donate Y and energies whenever the
+    output extents permit aliasing. Only one ψ input is donated, including
+    when the two incoming layouts alias on a one-device mesh.
+
     Returns (psi_cQ_X, psi_cQ_Y, eps_cQ):
         psi_cQ_[XY]: (nQ, nk, nc_pad, ns, n_rmu_pad), μ on x / y
         eps_cQ:      (nQ, nk, nc_pad) — pad bands at +PAD_EPS_GUARD_RY
     """
-    x5 = NamedSharding(mesh_xy, P(None, None, None, None, "x"))
-    y5 = NamedSharding(mesh_xy, P(None, None, None, None, "y"))
-    rep = NamedSharding(mesh_xy, P())
-
     n_rmu_src = int(bundle.psi_rmu_Y.shape[-1])
     if n_rmu_src != int(n_rmu):
         raise ValueError(
@@ -953,10 +1008,29 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
               f"from (a downfolded bundle records the parent's path in its "
               f"downfold_provenance group).")
 
-    @partial(jax.jit, out_shardings=(x5, y5, rep))
+    shape = (nQ, nk, n_cond, int(bundle.psi_rmu_Y.shape[2]), n_rmu)
+    if n_cond_pad < n_cond or n_rmu_pad < n_rmu:
+        raise ValueError("conduction stack padding cannot shrink bands or centroids")
+    program = _conduction_stack_program(mesh_xy, shape, (n_cond_pad, n_rmu_pad))
+    psi, eps = bundle.psi_rmu_Y, bundle.enk_full
+    bundle.psi_rmuT_X = bundle.psi_rmu_Y = bundle.enk_full = None
+    return program(psi, eps)
+
+
+def _conduction_stack_program(mesh_xy, shape, padded):
+    """Geometry-only reshape/pad program; captures no bundle or arrays."""
+    nQ, nk, n_cond, ns, n_rmu = shape
+    n_cond_pad, n_rmu_pad = padded
+    x5 = NamedSharding(mesh_xy, P(None, None, None, None, "x"))
+    y5 = NamedSharding(mesh_xy, P(None, None, None, None, "y"))
+    rep = NamedSharding(mesh_xy, P())
+    donate = ((0,) if padded == (n_cond, n_rmu) else ())
+    if n_cond_pad == n_cond:
+        donate += (1,)
+
+    @partial(jax.jit, out_shardings=(x5, y5, rep), donate_argnums=donate)
     def _stacks(psi, eps):
-        ns = psi.shape[2]
-        psi = psi.reshape(nQ, nk, n_cond, ns, n_rmu_src)
+        psi = psi.reshape(shape)
         eps = eps.reshape(nQ, nk, n_cond)
         psi = jnp.pad(psi, ((0, 0), (0, 0), (0, n_cond_pad - n_cond),
                             (0, 0), (0, n_rmu_pad - n_rmu)))
@@ -964,7 +1038,7 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
                       constant_values=PAD_EPS_GUARD_RY)
         return psi, psi, eps
 
-    return _stacks(bundle.psi_rmu_Y, bundle.enk_full)
+    return _stacks
 
 
 def _gate_stats_on_device(
@@ -1696,6 +1770,7 @@ def main(argv=None):
             "eigh", mesh_xy, backend=args.eigh_backend, n=None,
             batched_route=args.distrib_la_batched_route)
         restart_file = _find_restart_file(args.input)
+        zeta_path = require_zeta_for_interp(restart_file, args.vq_mode, wfn.kgrid)
         report.environment(wfn=wfn, lines=(
             f"Restart tensors: {abs_path(restart_file)}",
             "Transition data: distributed band and centroid blocks on X x Y",
@@ -1726,7 +1801,7 @@ def main(argv=None):
         _bse_grid_quality_records = []
         data = load_bse_data_from_restart_sharded(
             restart_file, n_val=args.n_val, n_cond=args.n_cond,
-            mesh_xy=mesh_xy, input_file=args.input, inject_head=True,
+            mesh_xy=mesh_xy, input_file=args.input, eqp_file=args.eqp, inject_head=True,
             q0_head="diagonal",       # operands via bse_head.head_shifted_eps_c
             # ``refit`` NEEDS the stored exchange tensor as much as ``ongrid``
             # does, and for a stricter reason: ongrid CONSUMES it, refit is
@@ -1901,12 +1976,13 @@ def main(argv=None):
                                     quality_records=_path_quality_records)
         psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
             bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
-        # Everything the htransform produced is now copied into the conduction
-        # stacks and nothing below reads it again.  Drop it before the V_Q model
+        continuum_ry = _continuum_threshold_ry(
+            eps_cQ, data["eps_v"], n_val=n_val, n_cond=n_cond)
+        # The htransform's buffers have now moved into the conduction
+        # stacks. Drop the remaining bundle metadata before the V_Q model
         # build: ``vq_interp.build_cq`` now returns C_q as a (μ, ν)-face SHARDED
         # device array (no per-proc host gather), but the coarse ζ / P_R
         # intermediates it builds still want the htransform leftovers gone.
-        # ``bundle`` alone is ψ at every (Q, k) in both shardings.
         del bundle, ctilde, B_at_mu, enk_sigma
         tick("htransform_psi_cQ", t0)
 
@@ -1942,7 +2018,7 @@ def main(argv=None):
         #    orchestration, not one here and one there. ─────────────────────────
         t0 = time.time()
         # Q ON the coarse BZ grid needs NO exchange model at all: the production
-        # tile V_qmunu[wrap(−Q)] IS the answer, and the driver already uses exactly
+        # tile V_qmunu[wrap(+Q)] IS the answer, and the driver already uses exactly
         # that at the one on-grid point it always has (Γ, below).  ``--vq-mode
         # ongrid`` extends that existing special case to every on-grid Q — no
         # interpolation error, no b26p stencil, no ζ.  It also makes the exciton
@@ -2004,7 +2080,7 @@ def main(argv=None):
                     f"and a floor above ~2 puts most Q off any coarse grid.  "
                     f"--q-per-segment 1 restores the deck's own counts exactly; "
                     f"the dense path is what needs the full-BZ ζ.")
-            log(f"  exchange: EXACT on-grid tiles V_qmunu[wrap(-Q)] "
+            log(f"  exchange: EXACT on-grid tiles V_qmunu[wrap(+Q)] "
                 f"({nQ} Q, all on the "
                 f"{kgrid_vq[0]}x{kgrid_vq[1]}x{kgrid_vq[2]} grid = {vq_src}) "
                 f"— no interpolation")
@@ -2018,8 +2094,6 @@ def main(argv=None):
                         else bool(params.get("head_minibz_average", False)))
             log(f"  arbitrary-Q head: {'mini-BZ cell average' if head_mbz else 'point value'} "
                 f"(head_minibz_average={head_mbz})")
-            zeta_path = require_zeta_for_interp(restart_file, args.vq_mode,
-                                                (nkx, nky, nkz))
             if pure_refit:
                 # NO interpolation model is built at all.  The b26p long-range fit
                 # is the slab-only half of vq_interp; the refit path fits ζ at the
@@ -2104,7 +2178,7 @@ def main(argv=None):
                 _seen, _qlist = set(), []
                 for _i in np.nonzero(_on)[0]:
                     _key = tuple(int(v) for v in
-                                 (np.round((-Qpath[_i]) * kgrid_vq).astype(int)
+                                 (np.round(exchange_tile_momentum(Qpath[_i]) * kgrid_vq).astype(int)
                                   % kgrid_vq))
                     if _key not in _seen:
                         _seen.add(_key)
@@ -2165,7 +2239,7 @@ def main(argv=None):
             # comparison more than once.
             seen, uniq = set(), []
             for i in cert_idx:
-                key = tuple(np.round((-Qpath[i]) * kgrid_vq).astype(int)
+                key = tuple(np.round(exchange_tile_momentum(Qpath[i]) * kgrid_vq).astype(int)
                             % kgrid_vq)
                 if key not in seen:
                     seen.add(key)
@@ -2366,7 +2440,8 @@ def main(argv=None):
             head_args = (jnp.asarray(D_head),
                          jnp.asarray(M_stack, dtype=jnp.float64))
         solver = _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad,
-                              n_cond, n_val, head_mbz, W_q0)
+                              n_cond, n_val, head_mbz, W_q0,
+                              cert_rows=tuple(cert_idx) + tuple(range(nQ, nQ + n_cert)))
         tick("w_r_and_build", t0)
         stages.result(f"W_R on {nkx} x {nky} x {nkz}; "
                       f"{'block Lanczos' if args.solver == 'lanczos' else 'Davidson'} solver, "
@@ -2460,6 +2535,7 @@ def main(argv=None):
                 f"certification Q, out-prefix {args.out_prefix}")
 
         _path_ev = np.asarray(evs_path[:nQ_path], dtype=np.float64) * RY2EV
+        _continuum_ev = np.asarray(_gather_host(continuum_ry), dtype=np.float64) * RY2EV
         if cert_worst is not None:
             _cert_text = (f"{args.cert_grade} grade: worst {float(cert_worst):.5f} meV "
                           f"over {len(cert_rows)} on-grid Q points")
@@ -2527,7 +2603,7 @@ def main(argv=None):
                     for iQ, tile, dmax in cert_rows:
                         fh.write(f"#   Q#{iQ} tile {tile}: "
                                  f"max|dE_S| = {dmax:.5f} meV\n")
-                fh.write("# conventions: |v k, c k+Q>; exchange tile at wrap(-Q) "
+                fh.write("# conventions: |v k, c k+Q>; exchange tile at wrap(+Q) "
                          "keeps G=0 at finite Q (energy_loss); Gamma uses the "
                          "production q=0 head-body tile; energies in eV\n")
                 fh.write(f"# nodes: {' '.join(f'{int(i)}:{l}' for i, l in zip(node_idx, labels))}\n")
@@ -2546,7 +2622,15 @@ def main(argv=None):
                     fh.write(f"{iQ:4d} {x_path[iQ]:.6f} "
                              f"{Qpath[iQ][0]: .6f} {Qpath[iQ][1]: .6f} "
                              f"{Qpath[iQ][2]: .6f} refit  {row}\n")
-            _LOGGER.info(f"Wrote {dat}")
+            np.savetxt(
+                args.out_prefix + "_continuum.dat",
+                np.column_stack((np.arange(nQ), np.concatenate((x_path,
+                    np.full(nQ - nQ_path, x_path[-1]))), Qpath, _continuum_ev)),
+                fmt=("%4d", "%.9f", "%.9f", "%.9f", "%.9f", "%.9f"),
+                header=("Independent-particle QP continuum before the W-head kernel shift\n"
+                        + provenance_header().strip("# \n")
+                        + "\niQ s_path Qx Qy Qz Econt_eV"))
+            _LOGGER.info(f"Wrote {dat} and {args.out_prefix}_continuum.dat")
 
             if refit_idx:
                 _LOGGER.info("\ninterp vs refit (ground truth) at spot-check Q:")
@@ -2676,15 +2760,12 @@ def main(argv=None):
         # where the SlabIO barrier is already a no-op.
         wfn.close()
 
-        wfn_name = str(params.get("wfn_file", "WFN.h5"))
-        if not os.path.isabs(wfn_name):
-            wfn_name = os.path.join(os.path.dirname(os.path.abspath(args.input)),
-                                    wfn_name)
         file_rows = [
             ("exciton bands", "written", os.path.abspath(args.out_prefix + ".dat")),
+            ("QP continuum", "written", os.path.abspath(args.out_prefix + "_continuum.dat")),
             ("exciton plot", "written", os.path.abspath(args.out_prefix + ".png")),
             ("GW/BSE restart", "read", restart_file),
-            ("wavefunctions", "read", wfn_name),
+            ("wavefunctions", "read", _wfn_name),
             ("centroid coordinates", "read", centroids_path),
         ]
         if args.eqp:

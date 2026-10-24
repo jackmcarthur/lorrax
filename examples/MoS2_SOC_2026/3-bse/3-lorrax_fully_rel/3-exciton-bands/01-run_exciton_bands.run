@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+source ../../../2-gw/3-lorrax_fully_rel/lorrax_env.sh
+# Reuse the GW inputs prepared by the adjacent optical-BSE track.
+for input in WFN.h5 data-file-schema.xml centroids.txt dipole.h5 kin_ion.h5 tmp eqp_co.dat \
+             Mo_ONCV_PBE_FR-1.0.upf S_ONCV_PBE_FR-1.1.upf; do
+    if [[ ! -e "../2-absorption/$input" ]]; then
+        printf 'Missing %s; finish the GW track and run ../01-link_files.sh first.\n' "$input" >&2
+        exit 1
+    fi
+    ln -sfn "../2-absorption/$input" "$input"
+done
+input=${1:-gw.in}
+prefix=${2:-exciton_bands}
+grade=${3:-visualization}
+lorrax_run bse.exciton_bands -i "$input" --vq-mode refit --refit-window bse \
+    --cert-grade "$grade" --q-per-segment 1 \
+    --out-prefix "$prefix" --report-file "$prefix.out" > "$prefix.log" 2>&1

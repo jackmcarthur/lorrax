@@ -1943,6 +1943,7 @@ def _fit_charge_zeta_channel(
                 mubatch_plan=chunks.get('mubatch'),
                 parent_psi=chunks.pop('parent_psi', None),
                 write_zeta_file=_write_zeta_file,
+                defer_zeta_write=True,
             )
             zeta_g = _zetas[0]
     if not _reuse_charge:
@@ -1962,6 +1963,8 @@ def _fit_charge_zeta_channel(
         log.info( "  directory.")
         log.info("  " + "!" * 68)
         log.info("")
+    elif not _reuse_charge and zeta_g is not None and zeta_g.pending_file is not None:
+        zeta_g.pending_file["provenance"] = _provenance
     elif (not _reuse_charge and jax.process_index() == 0
           and (zeta_g is None or _write_zeta_file)):
         try:
