@@ -43,6 +43,13 @@ for arg in "$@"; do
   esac
 done
 
+# A missing delta base makes both scanners see empty pipelines. Refuse before
+# running them so an unavailable remote ref cannot masquerade as a clean diff.
+if ! git rev-parse --verify --quiet "${BASE_REF}^{commit}" >/dev/null; then
+  printf 'release_check: delta base %s is not a commit; set RC_BASE_REF to an available commit/ref\n' "$BASE_REF" >&2
+  exit 1
+fi
+
 NAMES=()
 VERDICTS=()
 FAILED=0
