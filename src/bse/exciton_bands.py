@@ -501,6 +501,10 @@ def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, he
             block_size=args.block_size,
             max_iter=40 if args.max_iter is None else args.max_iter, head_tensor=head_mbz)
     n_phys = int(n_cond) * int(n_val) * nkx * nky * nkz
+    if cert_rows:
+        log(f"  [refit-cert] Davidson residual for both comparison rows: "
+            f"{min(args.davidson_tol_mev, 0.1 * CERT_TOL_BY_GRADE[args.cert_grade]):g} "
+            "meV; the exchange certification gate is unchanged.")
     return build_path_solver_davidson(
         mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, n_eig=args.n_eig,
         max_iter=(max(30, min(200, n_phys // 2)) if args.max_iter is None
@@ -2435,13 +2439,9 @@ def main(argv=None):
                 args, nk, nc_pad, nv_pad, n_val, n_cond, log=log)
             head_args = (jnp.asarray(D_head),
                          jnp.asarray(M_stack, dtype=jnp.float64))
-        cert_rows = tuple(cert_idx) + tuple(range(nQ, nQ + n_cert))
-        if cert_rows and args.solver == "davidson":
-            log(f"  [refit-cert] Davidson residual for both comparison rows: "
-                f"{min(args.davidson_tol_mev, 0.1 * CERT_TOL_BY_GRADE[args.cert_grade]):g} "
-                "meV; the exchange certification gate is unchanged.")
         solver = _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad,
-                              n_cond, n_val, head_mbz, W_q0, cert_rows=cert_rows)
+                              n_cond, n_val, head_mbz, W_q0,
+                              cert_rows=tuple(cert_idx) + tuple(range(nQ, nQ + n_cert)))
         tick("w_r_and_build", t0)
         stages.result(f"W_R on {nkx} x {nky} x {nkz}; "
                       f"{'block Lanczos' if args.solver == 'lanczos' else 'Davidson'} solver, "
