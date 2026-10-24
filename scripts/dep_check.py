@@ -219,14 +219,24 @@ def check_elpa(prefix: str, blas: str, solve: bool) -> None:
                      f"not {want}", "build under the same environment the run uses and link with "
                      "-Wl,-rpath,<prefix>/lib so the private OpenBLAS copy is the one bound; never let a "
                      "build-time RPATH name another OpenBLAS")
-    full, undef = _ldd(str(lib), relocs=True)
+    # The run's search path: the directories the build's closure record names
+    # (LORRAX_ELPA_CLOSURE.json: private, pinned runtime and venv ROCm dirs) before the caller's.
+    run_env = dict(os.environ)
+    record = pfx / "LORRAX_ELPA_CLOSURE.json"
+    where = "this environment"
+    if record.is_file():
+        import json
+        dirs = list(dict.fromkeys(os.path.dirname(e["path"]) for e in json.loads(record.read_text())["libraries"]))
+        run_env["LD_LIBRARY_PATH"] = ":".join(dirs + [x for x in run_env.get("LD_LIBRARY_PATH", "").split(":") if x])
+        where = f"the closure record's {len(dirs)} directories"
+    full, undef = _ldd(str(lib), env=run_env, relocs=True)
     missing = [k for k, v in full.items() if v is None]
     if missing or undef:
-        raise Failed(dep, f"ldd -r in this environment: missing {missing or 'none'}; "
+        raise Failed(dep, f"ldd -r in {where}: missing {missing or 'none'}; "
                      f"{len(undef)} undefined symbol(s){': ' + undef[0] if undef else ''}",
-                     "load the site's runtime modules (ROCm, cray-mpich) before the check, or relink "
-                     "against the libraries the run provides")
-    ok(dep, f"{search}; env -i binds {list(got.values())[0]}; ldd -r clean ({len(full)} libraries)")
+                     "rebuild the prefix (its closure record no longer resolves), or load the site's "
+                     "runtime modules (ROCm, cray-mpich) the record pins")
+    ok(dep, f"{search}; env -i binds {list(got.values())[0]}; ldd -r clean in {where} ({len(full)} libraries)")
     if not solve:
         return
     cc = os.environ.get("LORRAX_DEP_CHECK_CC") or shutil.which("cc") or shutil.which("mpicc")
@@ -246,7 +256,7 @@ def check_elpa(prefix: str, blas: str, solve: bool) -> None:
         cmd = [str(exe), want]
         if os.environ.get("SLURM_JOB_ID") and not os.environ.get("SLURM_STEP_ID") and shutil.which("srun"):
             cmd = ["srun", "-N", "1", "-n", "1", "--overlap"] + cmd
-        r = _run(cmd, timeout=300)
+        r = _run(cmd, env=run_env, timeout=300)
     m = re.search(r"MAXDIFF (\S+) INFO (-?\d+)", r.stdout)
     if not m:
         text = (r.stdout + r.stderr).strip()
