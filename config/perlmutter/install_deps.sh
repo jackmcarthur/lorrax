@@ -3,11 +3,16 @@
 # install_deps.sh: install everything LORRAX needs on NERSC Perlmutter that the
 # system does not already provide, under one prefix, and build the native pair.
 #
-#   bash install_deps.sh [PREFIX] [--ref REF] [--with-xc] [--no-ffi]
+#   curl -fsSLO https://raw.githubusercontent.com/jackmcarthur/lorrax/main/config/perlmutter/install_deps.sh
+#   bash install_deps.sh [PREFIX] [--ref REF] [--with-xc] [--no-ffi] [--cubins SET]
 #
-#   PREFIX     where everything goes (default $HOME/lorrax). A directory under
-#              /global/common/software/<project> imports Python faster on
-#              compute nodes than $HOME does.
+#   PREFIX     where everything goes (default $SCRATCH/lorrax; about 5 GB, plus
+#              4.5 GB of uv download cache on $SCRATCH). Compute nodes read
+#              the install fastest from $SCRATCH (the same libraries under
+#              /global/common/software made each NVRTC kernel build 2.7x
+#              slower, 2026-10-23), and a home quota (40 GB) is easily too
+#              small. $SCRATCH is purged after 8 weeks without access; rerun
+#              this script after a purge.
 #   --ref REF  the LORRAX branch, tag or commit to clone (default main). Ignored
 #              when the script runs from inside a checkout, which it then uses.
 #   --with-xc  also install the patched jax_xc 0.0.11 (the nscf driver only).
@@ -58,8 +63,9 @@ while (($#)); do
         *) PREFIX="$1"; shift ;;
     esac
 done
-PREFIX="$(mkdir -p "${PREFIX:-$HOME/lorrax}" && cd "${PREFIX:-$HOME/lorrax}" && pwd)"
-say() { printf '\n[install_deps] %s\n' "$*"; }
+PREFIX="${PREFIX:-${SCRATCH:-$HOME}/lorrax}"
+PREFIX="$(mkdir -p "$PREFIX" && cd "$PREFIX" && pwd)"
+say() { printf '\n[install_deps] [%4ds] %s\n' "$SECONDS" "$*"; }
 
 [[ "${NERSC_HOST:-}" == perlmutter ]] || {
     echo "install_deps: this script is for NERSC Perlmutter (NERSC_HOST=${NERSC_HOST:-unset})." >&2

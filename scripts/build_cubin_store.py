@@ -85,6 +85,9 @@ class Calls:
 
     def __init__(self):
         import jax
+        # The drivers run in x64 (the runtime turns it on); without it every complex128
+        # operand here would be demoted to complex64 and most factories refuse it.
+        jax.config.update("jax_enable_x64", True)
         import jax.numpy as jnp
         import numpy as np
         from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
