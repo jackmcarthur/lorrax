@@ -95,10 +95,12 @@ def scalar_resolvent_head(kernel, geometry, kgrid, response, *, analytic_sphere=
                 counts[rep] += count
         result = {name: np.mean([row[name]/counts[rep] for rep,row in totals.items()],axis=0)
                   for name in totals[0]}
-        rule = dict(method='existing bulk mini-BZ draws', replicates=len(totals),
+        rule = dict(method='existing bulk auto sampler; fixed rep+0 seeds', replicates=len(totals),
                     samples=[counts[rep] for rep in sorted(counts)])
     else:
         raise ValueError('GATE scalar_resolvent_head_dimension: finite-q 2D/3D head required')
     if not all(np.all(np.isfinite(value)) for value in result.values()):
         raise ValueError('GATE scalar_resolvent_head_nonfinite: all response actions must be finite')
+    rule.update(kgrid=list(map(int,kgrid)),cell_volume=float(geometry.cell_volume),
+                reciprocal_lattice_rows=np.asarray(geometry.bvec).tolist())
     return dict(result,quadrature=rule)

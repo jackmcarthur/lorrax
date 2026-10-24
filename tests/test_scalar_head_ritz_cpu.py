@@ -85,6 +85,49 @@ def test_scalar_shared_ritz_refuses_nonfinite_retained_identity(monkeypatch):
         owner.scalar_head_ritz(z,value,slope,moment_m1=.15,moment_m3=.0135)
 
 
+def test_scalar_pole_agreement_handles_different_rank_counts_without_host_payload(monkeypatch):
+    import jax
+    import common.collectives as collectives
+    from gw.tangential_head_scalar import _shared_poles
+    counts=np.array([[2],[3],[1]],np.int64)
+    packets=np.array([[[.2,.8,1.],[.1,.2,0.]],
+                      [[.3,.7,.9],[.2,.1,.05]],
+                      [[.4,1.,1.],[.3,0.,0.]]],complex)
+    calls=[]
+    def gather(value):
+        calls.append(value)
+        if len(calls)==1:
+            assert not isinstance(value,jax.Array)
+            return counts
+        assert isinstance(value,jax.Array)  # Physics uses the existing device collective.
+        assert value.shape==(2,3)
+        return packets
+    monkeypatch.setattr(collectives,'all_gather_processes',gather)
+    model=dict(Omega_p=np.array([.4+0j]),B_p=np.array([.3+0j]),provenance={})
+    actual=_shared_poles(model,object())
+    np.testing.assert_array_equal(actual['Omega_p'],packets[0,0,:2])
+    np.testing.assert_array_equal(actual['B_p'],packets[0,1,:2])
+    assert actual['provenance']['rank_local_counts']==[2,3,1]
+
+
+def test_scalar_pencil_refuses_other_rank_failure_before_payload_agreement(monkeypatch):
+    import jax
+    import common.collectives as collectives
+    from gw import tangential_head_scalar as owner
+    jax.config.update('jax_enable_x64',True)
+    real_execute=owner._execute
+    monkeypatch.setattr(owner,'_execute',lambda program,args,**kw:
+        real_execute(program,args,mesh=None,side=kw['side'],label=kw['label']))
+    def gather(flags):
+        # This process's physical pencil passes, another process fails.
+        assert np.asarray(flags).dtype==bool and np.all(flags)
+        return np.array([[True],[False]])
+    monkeypatch.setattr(collectives,'all_gather_processes',gather)
+    z=np.array([0j,.2j,.7j]);value,slope=_measure(z,np.array([.3]),np.array([.5]))
+    with pytest.raises(ValueError,match='GATE scalar_head_gram_diagonal_positive'):
+        owner.scalar_head_ritz(z,value,slope,moment_m1=.15,moment_m3=.0135,mesh=object())
+
+
 def test_scalar_cell_actions_match_independent_rank_one_completed_hamiltonian():
     import jax
     from vcoul import CoulombGeometry,get_kernel,scalar_resolvent_head,slab_minibz_photon_cubature
@@ -120,3 +163,35 @@ def test_scalar_cell_actions_match_independent_rank_one_completed_hamiltonian():
     for index in range(len(z)):
         bare,total=kernel.q0_average(geometry,grid,S_cart=response['Xi'][index])
         np.testing.assert_allclose(result['Wc'][index],complex(total-bare),rtol=2e-13,atol=3e-12)
+
+
+def test_bulk_draw_identity_and_actions_are_fixed_between_frequency_batches(monkeypatch):
+    import jax
+    import vcoul.resolvent_head as owner
+    from vcoul import CoulombGeometry,get_kernel,scalar_resolvent_head
+    jax.config.update('jax_enable_x64',True)
+    original=owner.iter_minibz_photon_samples
+    def reduced_draw(kernel,geometry,kgrid,**kwargs):
+        # The real provider/seed/folding route, with a small test-only count;
+        # no production sampler policy or additional environment setting.
+        return original(kernel,geometry,kgrid,nsamples=256,qmc_reps=2,**kwargs)
+    monkeypatch.setattr(owner,'iter_minibz_photon_samples',reduced_draw)
+    geometry=CoulombGeometry(np.eye(3)*2*np.pi/10.,1000.)
+    omega,residue=np.array([.3,1.2]),np.array([.002,.003])
+    z=np.array([0j,.2j,.31+.12j]);value,slope=_measure(z,omega,residue)
+    response=dict(Xi=value[:,None,None]*np.eye(3),dXi_ds=slope[:,None,None]*np.eye(3),
+        moments=dict(M1=np.sum(omega*residue)*np.eye(3),M3=np.sum(omega**3*residue)*np.eye(3)))
+    kernel=get_kernel(3);grid=(2,2,2)
+    full=scalar_resolvent_head(kernel,geometry,grid,response)
+    subset=dict(response,Xi=response['Xi'][1:],dXi_ds=response['dXi_ds'][1:])
+    repeated=scalar_resolvent_head(kernel,geometry,grid,subset)
+    np.testing.assert_array_equal(full['Wc'][1:],repeated['Wc'])
+    np.testing.assert_array_equal(full['dWc_ds'][1:],repeated['dWc_ds'])
+    assert full['M1']==repeated['M1'] and full['M3']==repeated['M3']
+    assert full['quadrature']==repeated['quadrature']
+    for index in range(len(z)):
+        bare,total=kernel.q0_average(geometry,grid,S_cart=response['Xi'][index],
+                                    method='auto',nsamples=256,qmc_reps=2)
+        np.testing.assert_allclose(full['Wc'][index],complex(total-bare),rtol=3e-13,atol=3e-12)
+    with pytest.raises(ValueError,match='GATE scalar_resolvent_head_sphere'):
+        scalar_resolvent_head(kernel,geometry,grid,response,analytic_sphere=True)

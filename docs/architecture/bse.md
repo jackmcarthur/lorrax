@@ -587,7 +587,7 @@ refused. Supported modes and parse refusals are owned by the
 
 Hermite construction consumes values and slopes, so this path has a
 stricter input-solve budget than the production GN-PPM ladder. Its body
-and fresh Γ head use the same true-residual tolerance:
+uses the true-residual tolerance:
 `0.1 * min(bank_rule_tolerance, abs(normalized_gram_validity))`, giving
 `1e-9` for the production recipe and `1e-8` for the relaxed recipe, with
 the existing 300-iteration cap. Every returned residual must meet that
@@ -597,6 +597,8 @@ looser bank cannot be reused. This allocates one decade below the existing
 certificate budgets; it does not bound Gram error amplification. The
 constructor still applies its unchanged positivity gate without PSD repair.
 The GN-PPM ladder retains its `1e-6` tolerance.
+The tangential scalar-head certificate below uses the existing tight Γ
+reference tolerance `1e-10` for values, slopes and reflected solves.
 
 ### Macroscopic head: the same operator, restored once
 
@@ -624,13 +626,52 @@ mini-BZ average. Applying the RPA $S+YWZ$ Schur fold again would double
 count microscopic screening. No Γ head is also inserted into the body
 resolvent.
 
-The full-frequency scalar head uses fresh Γ solves at its own fit and
-imaginary-moment nodes, including static and reflected nodes. Evenness,
-imaginary-axis sign and solve residuals are checked before the existing
-scalar fitter is used. Its convention is
+For tangential `w_bse`, fresh Γ solves provide values, exact even-$s$
+slopes and high-frequency moments through the same response-action owners
+as the body. One prepared operator, wavefunction payload and dipole RHS
+survive frequency refinement; they are not reloaded per batch. Evenness,
+imaginary-axis sign, odd moments and every true solve residual are checked.
+The final macroscopic completion is differentiated on the same Coulomb
+quadrature, with no finite differences. If
+$\Xi=C_1/z^2+C_3/z^4+\cdots$, its scalar coefficients are
+
+$$
+C^{h}_1=\langle v^2 q^T C_1q\rangle,\qquad
+C^{h}_3=\langle v^2 q^T C_3q+v^3(q^T C_1q)^2\rangle .
+$$
+
+The nonlinear $C_1^2$ term is part of macroscopic completion. These
+coefficients enter the common Hermite/Ritz constructor as $2\mathcal M_1$
+and $2\mathcal M_3$ on one scalar port. Its convention remains
 $W^c_{\rm head}(z)=\sum_p2\Omega_p B_p/(z^2-\Omega_p^2)$;
 the head's inverse-frequency moment $M_1^{\rm head}=\sum_pB_p/\Omega_p^2$
 is distinct from the body's high-frequency $\mathcal M_1$ above.
+
+`ladder_head_fit` reuses the body recipe's fit/held supports, the incumbent
+MPA span supports, static and imaginary-axis moment nodes. Its low-energy
+guard is derived from the actual transition gap and existing consumer eta.
+Failed held sites become fitted only after failure; their intervals are
+bisected and the new sites are solved independently. The inherited recipe
+sample cap bounds extra sites. Held roles take priority over coincident
+supports from another construction. Scalar-only retention refinement may
+retain more Gram directions; Gram validity, metric and zero-weight gates
+remain the common constructor's. No pole or residue is repaired or pinned.
+
+Publication requires Coulomb-normalized passivity using the same bare-head
+receipt, finite positive real poles, static relative error at most `1e-10`,
+inverse-moment and high-frequency errors within `bank_rule_tolerance`, and
+sampled value/slope errors within `direction_cutoff`. The inverse moment's
+24/48-point rule must converge; a 96-point check is available before named
+refusal. These are measured support certificates, not a uniform real-axis
+error theorem. Pole count follows the admitted span rather than an eight-pole
+cap. All ranks use one agreed pole payload and worst-rank admission errors.
+Policy version, supports, solve controls, promotions and budgets are recorded
+in the head provenance; a head is rebuilt and certified even on body restart.
+
+The response-action scalar average currently supports the production slab
+polygon and the ordinary bulk mini-BZ draw. Tangential `w_bse` with a full
+head refuses the bulk analytic-sphere option rather than guessing its
+screened response actions. GN-PPM and legacy MPA head paths are unchanged.
 
 ### Self-consistency is a separate, refused extension
 

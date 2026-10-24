@@ -185,6 +185,34 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
 
     if config.head.uses_bgw_metal_q0shift:
         raise ValueError("GATE tangential_head: shifted finite-q BGW head is not a Gamma head")
+    response_samples = getattr(response, "samples", ())
+    micro = bool(response_samples and all(
+        str(getattr(getattr(sample, "response_kind", None), "value",
+                    getattr(sample, "response_kind", ""))) == "micro_reducible"
+        for sample in response_samples))
+    scalar = getattr(response, 'scalar_model', None)
+    if scalar is not None:
+        from .ladder_head_fit import HEAD_FIT_POLICY
+        diagram = getattr(config.screening.diagrams,'value',config.screening.diagrams)
+        if (diagram!='w_bse' or material_class!='insulator' or not micro
+                or config.head.correction is not HeadCorrection.FULL
+                or not scalar.get('completion')
+                or scalar.get('provenance',{}).get('head_fit_policy')!=HEAD_FIT_POLICY):
+            raise ValueError('GATE tangential_head_model: current physical ladder certificate required')
+        head_identity=scalar['provenance'].get('head_identity',{})
+        if (head_identity.get('head_fit_policy')!=HEAD_FIT_POLICY or
+                any(head_identity[key]!=value for key,value in handle['identity'].items()
+                    if key in head_identity)):
+            raise ValueError('GATE tangential_head_identity: current ladder and head identities differ')
+        head=dict(scalar,identity=handle['identity'],body_digest=handle['digest'])
+        head['provenance']=dict(head['provenance'],body_digest=handle['digest'],
+            head_identity=dict(handle['identity'],**head_identity))
+        iteration=dataclasses.replace(response,
+            sigma_energies_ry=np.asarray(wfns.enk[:,wfns.slices.sigma]),
+            sigma_occupations=np.asarray(wfns.occ[:,wfns.slices.sigma]) if occupation_state is None else
+                np.asarray(occupation_state.f_kn[:,wfns.slices.sigma]),
+            efermi_ry=float(meta.tangential_recipe['census']['mu_ry']),scalar_model=head)
+        return head,iteration
     if plan is None:
         plan = tangential_head_plan(config, meta.tangential_recipe,
                                       material_class=material_class)
@@ -195,11 +223,6 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
     # A metal's static row takes the body at z = 0, as its head operands do.
     nodes = metal_response_nodes(points, config, metal=material_class == "metal")
     full = config.head.correction is HeadCorrection.FULL
-    response_samples = getattr(response, "samples", ())
-    micro = bool(response_samples and all(
-        str(getattr(getattr(sample, "response_kind", None), "value",
-                    getattr(sample, "response_kind", ""))) == "micro_reducible"
-        for sample in response_samples))
     if full and response is None:
         raise ValueError("GATE tangential_head: full head requires the direct response and wings")
     ledger = meta.tangential_capacity

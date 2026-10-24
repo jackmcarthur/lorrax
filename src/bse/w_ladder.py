@@ -696,17 +696,14 @@ def _deflation_for(matvec, diag_h, z, operands, rhs, *, rank: int):
     return defl
 
 
-def compute_ladder_head(
-    restart_path, z_list_ry, mesh_xy, *, input_file, head_dipole_path,
-    head_n_occ, head_pref, gmres_tol, gmres_max_iter, include_w=True, data=None,
-    with_slope=False, with_moments=False,
-):
-    """Gamma-only micro-reducible tensor on the body's exact H backend.
+def prepare_ladder_head(restart_path, mesh_xy, *, input_file, head_dipole_path,
+                        head_n_occ, include_w=True, data=None):
+    """Prepare the one Gamma operator and dipole for a streamed head solve.
 
-    Head fits can request their own small frequency grid without solving any
-    density-space body probes. Pass the current loader payload to reuse it;
-    otherwise the same full transition-window loader supplies the operator.
-    The existing head result retains all solver and dipole/energy diagnostics.
+    Returns the existing operator, runtime payload, dipole and its transition
+    energies. A caller refining frequency supports retains these locally,
+    instead of loading/rebuilding the same wavefunctions and W_R per batch.
+    No payload is placed in a module cache.
     """
     if data is None:
         data = load_bse_data_from_restart_sharded(
@@ -714,8 +711,7 @@ def compute_ladder_head(
             input_file=input_file, inject_head=False, load_v_full=True)
     from .absorption_common import (slice_dipole_to_bse_window)
     from file_io.restart_bundle import (load_dipole_h5)
-    from .head_resolvent import (
-        build_head_dipole, build_head_operator, solve_head_tensor)
+    from .head_resolvent import build_head_dipole, build_head_operator
 
     from .bse_window import _parse_wfn_path
     dipole_cart, delta_e, _ = load_dipole_h5(
@@ -732,6 +728,23 @@ def compute_ladder_head(
     head_data = build_finite_q_data(_psi_ring_view(data), (0, 0, 0), mesh_xy,
                                     physical_branches=True)
     head_op = build_head_operator(mesh_xy, head_data, include_w=include_w)
+    return head_op, head_data, d_pair, delta_cv
+
+
+def compute_ladder_head(
+    restart_path, z_list_ry, mesh_xy, *, input_file, head_dipole_path,
+    head_n_occ, head_pref, gmres_tol, gmres_max_iter, include_w=True, data=None,
+    with_slope=False, with_moments=False,
+):
+    """Gamma-only micro-reducible tensor on the body's exact H backend.
+
+    The same full transition-window loader supplies the operator; a prepared
+    head can instead be retained across refinements by the head-fit owner.
+    """
+    from .head_resolvent import solve_head_tensor
+    head_op, head_data, d_pair, delta_cv = prepare_ladder_head(
+        restart_path,mesh_xy,input_file=input_file,head_dipole_path=head_dipole_path,
+        head_n_occ=head_n_occ,include_w=include_w,data=data)
     return solve_head_tensor(
         head_op, head_data, d_pair, z_list_ry, pref=float(head_pref),
         max_iter=int(gmres_max_iter), tol=float(gmres_tol),

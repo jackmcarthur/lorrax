@@ -12,6 +12,58 @@ import jax.numpy as jnp
 import numpy as np
 
 
+def _all_valid(value,mesh):
+    """Refuse together before the following scalar payload collective."""
+    value=bool(np.all(value))
+    if mesh is None:
+        return value
+    from common.collectives import all_gather_processes
+    return bool(np.all(all_gather_processes(np.asarray([value],bool))))
+
+
+def _execute(program,args,*,mesh,side,label):
+    """Admit the actual replicated small program and its provider workspace."""
+    if not jax.config.jax_enable_x64:
+        raise ValueError('GATE scalar_head_x64: physical head actions require the existing x64 mode')
+    if mesh is None:
+        from lxkit import device_vendor
+        if device_vendor(jax.local_devices()[0])!='cpu':
+            raise ValueError('GATE scalar_head_capacity: the active mesh is required on a GPU')
+        return program(*args),None
+    from distrib_la import local_eigh_workspace
+    from lxkit import memory
+    from runtime.aot_memory import compiled_new_bytes
+    from common.gpu_utils import device_budget_bytes
+    executable=program.lower(*args).compile()
+    resident=sum(int(a.size*a.dtype.itemsize) for a in args)
+    vendor=local_eigh_workspace(mesh,1,int(side),np.complex128)
+    total=resident+compiled_new_bytes(executable)+vendor
+    price=memory.priced(total,f'scalar head {label}: actual program + provider workspace')
+    memory.book(price,stage='head.scalar.'+label)
+    memory.admit('scalar_head.'+label,price,device_budget_bytes())
+    return executable(*args),int(total)
+
+
+def _shared_poles(model,mesh):
+    """One admitted scalar pole payload on every process, even at a cut tie."""
+    if mesh is None:
+        return model
+    from common.collectives import all_gather_processes
+    counts=np.asarray(all_gather_processes(np.asarray([len(model['Omega_p'])],np.int64))).reshape(-1)
+    width=int(counts.max())
+    payload=np.zeros((2,width),np.complex128)
+    payload[0]=1
+    payload[0,:len(model['Omega_p'])]=model['Omega_p']
+    payload[1,:len(model['B_p'])]=model['B_p']
+    # Physics payloads take the owner's device collective, not its host
+    # metadata shortcut. Every process contributes an equal padded shape.
+    gathered=all_gather_processes(jax.device_put(payload,jax.local_devices()[0]))
+    model['Omega_p']=np.asarray(gathered)[0,0,:int(counts[0])].copy()
+    model['B_p']=np.asarray(gathered)[0,1,:int(counts[0])].copy()
+    model['provenance'].update(n_valid=int(counts[0]),rank_local_counts=counts.tolist())
+    return model
+
+
 @lru_cache(maxsize=None)
 def _scalar_ritz_program(gram_keep):
     from distrib_la import eigh_local
@@ -43,7 +95,7 @@ def _scalar_ritz_program(gram_keep):
     return execute
 
 
-def scalar_head_ritz(z, values, slopes, *, moment_m1, moment_m3, gram_keep=None):
+def scalar_head_ritz(z, values, slopes, *, moment_m1, moment_m3, gram_keep=None,mesh=None):
     """Construct a physical scalar head from exact response actions.
 
     ``z``, ``values`` and ``slopes`` are matching vectors, in Ry and bare
@@ -74,28 +126,32 @@ def scalar_head_ritz(z, values, slopes, *, moment_m1, moment_m3, gram_keep=None)
     if not 0 < gram_keep <= canonical_keep:
         raise ValueError('GATE scalar_head_keep: retention may only refine the common cut')
     program = _scalar_ritz_program(gram_keep)
-    model,reduction,zero,retained = jax.device_get(program(
+    args=(
         jnp.asarray(points),jnp.asarray(outputs),jnp.asarray(derivatives),
-        jnp.asarray(moment_m1),jnp.asarray(moment_m3)))
+        jnp.asarray(moment_m1),jnp.asarray(moment_m3))
+    result,priced=_execute(program,args,mesh=mesh,side=len(points)+1,label='Ritz')
+    model,reduction,zero,retained = jax.device_get(result)
     for name in ('gram_diagonal_positive','gram_valid','retained_metric_positive','ritz_eigh_finite'):
-        if not np.all(reduction[name]):
+        if not _all_valid(reduction[name],mesh):
             raise ValueError(f'GATE scalar_head_{name}: shared Hermite/Ritz predicate failed; no PSD repair')
-    if not np.all(zero['zero_policy']):
+    if not _all_valid(zero['zero_policy'],mesh):
         raise ValueError('GATE scalar_head_zero_ritz: shared positive-weight policy failed; no pole clipping')
-    if not all(np.all(np.isfinite(a)) and np.all(a<=gates['retained_subspace_moments']['threshold'])
-               for a in retained.values()):
+    if not _all_valid(all(np.all(np.isfinite(a)) and
+            np.all(a<=gates['retained_subspace_moments']['threshold'])
+            for a in retained.values()),mesh):
         raise ValueError('GATE scalar_head_retained_moments: shared retained-space identity failed')
     factors,poles,active = model
     poles = poles[0,active[0]]
     factors = factors[0,0,active[0]]
     omega = np.sqrt(poles)
     residues = np.abs(factors)**2/(2*omega)
-    return dict(Omega_p=omega.astype(np.complex128),B_p=residues.astype(np.complex128),
+    return _shared_poles(dict(Omega_p=omega.astype(np.complex128),B_p=residues.astype(np.complex128),
         diagnostics=dict(reduction={k:np.asarray(v).tolist() for k,v in reduction.items()},
             zero={k:np.asarray(v).tolist() for k,v in zero.items()},
             retained={k:np.asarray(v).tolist() for k,v in retained.items()}),
         provenance=dict(solve_mode='shared-Hermite-Ritz-scalar-v1',n_valid=len(omega),
-            support_count=len(z),pencil_width=len(points)+1,gram_keep=gram_keep))
+            support_count=len(z),pencil_width=len(points)+1,gram_keep=gram_keep,
+            compiled_price_bytes_per_rank=priced)),mesh)
 
 
 @lru_cache(maxsize=None)
@@ -118,7 +174,7 @@ def _scalar_check_program():
     return execute
 
 
-def scalar_head_certificate(model,observations,*,eta_ry,static_value,inverse_m1):
+def scalar_head_certificate(model,observations,*,eta_ry,static_value,inverse_m1,mesh=None):
     """Measure the common passivity/held checks and scalar on-shell moments.
 
     ``observations`` holds z/Wc/dWc_ds and the same vc0/M1/M3 quadrature
@@ -143,16 +199,19 @@ def scalar_head_certificate(model,observations,*,eta_ry,static_value,inverse_m1)
             np.any(omega.imag!=0) or np.any(omega.real<=0) or
             np.any(residue.imag!=0) or np.any(residue.real<0)):
         raise ValueError('GATE scalar_head_certificate: finite real positive pole measure required')
-    passive,errors,reciprocity,moments=jax.device_get(_scalar_check_program()(
+    args=(
         jnp.asarray(omega.real),jnp.asarray(residue.real),jnp.asarray(z),
         jnp.asarray(values),jnp.asarray(slopes),jnp.asarray(np.real(bare_coulomb)),
-        jnp.asarray(eta_ry),jnp.asarray(moment_m1),jnp.asarray(moment_m3)))
-    if not np.all(passive['passivity']):
+        jnp.asarray(eta_ry),jnp.asarray(moment_m1),jnp.asarray(moment_m3))
+    result,priced=_execute(_scalar_check_program(),args,mesh=mesh,side=1,label='certificate')
+    passive,errors,reciprocity,moments=jax.device_get(result)
+    if not _all_valid(passive['passivity'],mesh):
         raise ValueError('GATE scalar_head_passivity: shared Coulomb-normalized bounds failed')
-    if not np.isfinite(errors).all() or not np.all(reciprocity['passed']):
+    if not _all_valid(np.isfinite(errors).all() and np.all(reciprocity['passed']),mesh):
         raise ValueError('GATE scalar_head_samples: shared finite/reciprocity check failed')
     relative=lambda value,reference: float(abs(value-reference)/max(abs(reference),np.finfo(float).tiny))
-    return dict(passivity={key:np.asarray(a).tolist() for key,a in passive.items()},
+    return dict(compiled_price_bytes_per_rank=priced,
+        passivity={key:np.asarray(a).tolist() for key,a in passive.items()},
         sample_value_relative=np.asarray(errors)[0,0].tolist(),
         sample_slope_relative=np.asarray(errors)[0,1].tolist(),
         reciprocity={key:np.asarray(a).tolist() for key,a in reciprocity.items()},

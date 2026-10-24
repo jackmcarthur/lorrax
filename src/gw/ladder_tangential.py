@@ -68,7 +68,7 @@ def make_ladder_tangential_source(wfns, V_q, *, quad, e_ref, sym,
     is consumed at a time. Only small head tensors and receipts are retained.
     """
     from .screening_bse import (_assert_wedge_matches_run,
-                                _finalize_ladder_head, prepare_ladder_restart)
+                                prepare_ladder_restart)
     state = {}
 
     def prepare():
@@ -224,45 +224,11 @@ def make_ladder_tangential_source(wfns, V_q, *, quad, e_ref, sym,
         return sample_receipt, moment_receipt
 
     def head():
-        from bse.w_ladder import compute_ladder_head
-        from bse.head_resolvent import head_prefactor
-        from .mpa.sample_plan import plan_z
-        from .qsgw_head import head_quadrature_omegas
-        from .tangential_head import tangential_head_plan
+        from .ladder_head_fit import build_ladder_head_fit
         prepare()
-        if "head" in state:
-            return state["head"]
-        plan = tangential_head_plan(config, meta.tangential_recipe, material_class="insulator")
-        points = tuple(map(complex, plan_z(plan)))+head_quadrature_omegas(config)
-        all_points = tuple(dict.fromkeys((*points, 0j, *(-z for z in points))))
-        result = compute_ladder_head(str(tensors_filename), np.asarray(all_points), mesh_xy,
-            input_file=config.input_file, include_w=True,
-            gmres_tol=state["solver"]["gmres_tol"], gmres_max_iter=state["solver"]["gmres_max_iter"],
-            head_dipole_path=str(config.input_dir)+"/dipole.h5", head_n_occ=int(meta.nelec),
-            head_pref=head_prefactor(float(meta.cell_volume), int(meta.nk_tot),
-                int(head_resolver.wfn.nspin), int(meta.nspinor_wfnfile)))
-        _gate_solve(result.resids, result.iters, accuracy=state["solver"], where="Gamma ladder head")
-        xi = 0.5*(np.asarray(result.xi)+np.swapaxes(np.asarray(result.xi),-1,-2))
-        lookup = {z:i for i,z in enumerate(all_points)}
-        scale = max(float(np.max(np.abs(xi))), np.finfo(float).tiny)
-        even = max(float(np.max(np.abs(xi[lookup[z]]-xi[lookup[-z]])))/scale for z in points)
-        if not np.isfinite(even) or even > 2e-6:
-            raise ValueError(f"GATE ladder_tangential_head_evenness: Xi(z) versus Xi(-z) {even:.3e}")
-        for i,z in enumerate(all_points):
-            if z.real == 0:
-                largest = float(np.linalg.eigvalsh(0.5*(xi[i]+xi[i].conj().T)).max())
-                if largest > 2e-6*scale:
-                    raise ValueError(f"GATE ladder_tangential_head_sign: Xi({z}) has positive eigenvalue {largest:.3e}")
-        # Keep exactly the scalar fitter's grid, including its moment nodes;
-        # the reflected samples above certify evenness and are not fit twice.
-        import dataclasses
-        rows = np.asarray([lookup[z] for z in points], dtype=int)
-        selected = dataclasses.replace(result, z=np.asarray(points), xi=np.asarray(result.xi)[rows],
-            resids=np.asarray(result.resids)[rows], iters=np.asarray(result.iters)[rows],
-            asym=np.asarray(result.asym)[rows], anti_herm=np.asarray(result.anti_herm)[rows])
-        from types import SimpleNamespace
-        state["head"] = _finalize_ladder_head(SimpleNamespace(head_result=selected),
-            config=config, meta=meta, head_resolver=head_resolver, print_fn=print_fn)
+        if "head" not in state:
+            state["head"] = build_ladder_head_fit(tensors_filename,config,meta,mesh_xy,
+                head_resolver,identity=state["identity"])
         return state["head"]
 
     return dict(identity=prepare, bank=produce, head=head)
