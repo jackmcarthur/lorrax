@@ -406,34 +406,6 @@ def solve_bse_sharded(
             mesh=mesh_xy, sharding=bse_sharding)
 
 
-        # ── perf-campaign probe hooks (env-gated, no effect when unset) ──
-        # LORRAX_DAV_MVSCAN=w1,w2,...  time apply_H at each block width, so
-        #   the matvec-count currency can be converted to seconds honestly:
-        #   a width-20 block matvec is NOT 20 independent width-1 matvecs.
-        # LORRAX_DAV_TRACE=<path.npz>  dump the final solver snapshot.
-        import os as _os
-        _mvscan = _os.environ.get("LORRAX_DAV_MVSCAN", "")
-        if _mvscan:
-            import time as _t
-            log.info("[mvscan] block-width scaling of the BSE matvec")
-            log.info("[mvscan] width  wall_s     s/vector   rel_to_w1")
-            _per1 = None
-            for _w in [int(x) for x in _mvscan.split(",") if x.strip()]:
-                _Vw = jnp.repeat(X0[:1], _w, axis=0) if _w > n_eig else X0[:_w]
-                _Vw = jax.lax.with_sharding_constraint(_Vw, sh.X)
-                _ = apply_H(solver_data, _Vw); _.block_until_ready()          # warm
-                _reps = 5
-                _t0 = _t.perf_counter()
-                for _ in range(_reps):
-                    _o = apply_H(solver_data, _Vw)
-                _o.block_until_ready()
-                _dt = (_t.perf_counter() - _t0) / _reps
-                if _per1 is None:
-                    _per1 = _dt / _w
-                log.info(f"[mvscan] {_w:5d}  {_dt:9.5f}  {_dt/_w:9.6f}  "
-                         f"{(_dt/_w)/_per1:8.3f}")
-                del _Vw, _o
-
         # One fixed-capacity solve replaces the former shape warmup ladder.
         from solvers.davidson import DEFAULT_M_MAX_FACTOR
         m_max_warm = max(int(davidson_m_max) if davidson_m_max
@@ -465,29 +437,9 @@ def solve_bse_sharded(
                          max(1.0, float(davidson_margin_tol_Ry) / float(davidson_tol_Ry))),
         )
 
-        # ── perf-campaign probe: trace + history dump (env-gated) ──
         from solvers.davidson import (
-            TRACE_COUNTS as _DAV_TRACES,
-            MATVEC_APPLICATIONS as _DAV_MV,
-            LAST_RUN as _DAV_HIST,
-            instrumentation_summary as _dav_summary,
-        )
+            LAST_RUN as _DAV_HIST, instrumentation_summary as _dav_summary)
         log.debug(_dav_summary())
-        _trace_path = _os.environ.get("LORRAX_DAV_TRACE", "")
-        if _trace_path and jax.process_index() == 0:
-            import numpy as _np
-            _np.savez(
-                _trace_path,
-                iter=_np.asarray(_DAV_HIST.get('iter', [])),
-                mv=_np.asarray(_DAV_HIST.get('mv', [])),
-                m=_np.asarray(_DAV_HIST.get('m', [])),
-                eig=_np.asarray(_DAV_HIST.get('eig', [])),
-                res=_np.asarray(_DAV_HIST.get('res', [])),
-                t=_np.asarray(_DAV_HIST.get('t', [])),
-                n_distinct_programs=_np.asarray(len(_DAV_TRACES)),
-                total_matvec_applications=_np.asarray(_DAV_MV[0]),
-            )
-            log.debug(f"[dav-instr] final snapshot -> {_trace_path}")
 
         # Keep the physical (c, v) axes distributed across all processors.
         # The writer gathers explicitly when serializing eigenvectors.

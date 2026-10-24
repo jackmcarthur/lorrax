@@ -65,8 +65,7 @@ TOGGLE.  ``LORRAX_H5_JOURNAL``: ``0`` (default, OFF), ``1`` on, ``sync``
 = fsync after every line, for segfault-grade capture where even the
 kernel's page cache is suspect.  The journal is an incident instrument,
 not a production result, so a normal run creates no per-rank sidecars.
-``LORRAX_H5_JOURNAL_DIR`` moves the
-output; default is the process's working directory, which is the run
+The output goes to the process's working directory, which is the run
 directory for every LORRAX driver launch.  Files:
 ``h5_journal.rank<R>.log`` and ``h5_journal_crash.rank<R>.txt``.
 
@@ -94,7 +93,6 @@ import time
 from collections import deque
 
 __all__ = [
-    "DIR_ENV",
     "MODE_ENV",
     "MODE_OFF",
     "MODE_ON",
@@ -118,7 +116,6 @@ __all__ = [
 #: The toggle.  ``1``/on (default), ``0``/off, ``sync``.
 MODE_ENV = "LORRAX_H5_JOURNAL"
 #: Where the per-rank files land.  Default: the working directory.
-DIR_ENV = "LORRAX_H5_JOURNAL_DIR"
 # THE READS BELOW SPELL THESE NAMES AS LITERALS, and that duplication is
 # deliberate.  ``tools/env_audit.py`` and ``tools/lint/test_env_registry.py``
 # both resolve only literal arguments, so a read through a module
@@ -126,7 +123,7 @@ DIR_ENV = "LORRAX_H5_JOURNAL_DIR"
 # row — which is exactly how a (since removed) sibling variable came
 # to have no row for a week.  The constants stay because tests and error
 # messages need the name; the suite pins them to the literals by setting
-# the environment through ``J.MODE_ENV`` / ``J.DIR_ENV`` and asserting
+# the environment through ``J.MODE_ENV`` and asserting
 # the behaviour changes.
 
 MODE_OFF = "off"
@@ -251,7 +248,7 @@ def _rank() -> int:
 
 
 def _dir() -> str:
-    return os.environ.get("LORRAX_H5_JOURNAL_DIR") or os.getcwd()
+    return os.getcwd()
 
 
 def journal_path() -> str:
@@ -276,7 +273,7 @@ def _break(exc: BaseException, what: str) -> None:
     import warnings
     warnings.warn(
         f"LORRAX HDF5 journal disabled for this process: {what} failed with "
-        f"{type(exc).__name__}: {exc}.  Set {DIR_ENV} to a writable "
+        f"{type(exc).__name__}: {exc}.  Run from a writable "
         f"directory to get it back, or {MODE_ENV}=0 to silence this.  The "
         f"run continues — the journal is an instrument, not a gate.")
 
@@ -286,10 +283,9 @@ def _stream():
 
     The path is NOT recomputed per line: once the stream is open the
     only thing that can invalidate it is the rank becoming known (see
-    :func:`_rank`), which is one integer comparison.  ``LORRAX_H5_JOURNAL_DIR``
-    is therefore read once per process — a knob that moves the output
-    mid-run would split one rank's journal in two, which is worse than
-    ignoring it.  ``reset_for_test`` re-reads it.
+    :func:`_rank`), which is one integer comparison.  The directory
+    is therefore read once per process — a chdir mid-run would otherwise
+    split one rank's journal in two.  ``reset_for_test`` re-reads it.
     """
     stream = _STATE["stream"]
     if stream is not None and _STATE["rank_of_file"] == _rank():

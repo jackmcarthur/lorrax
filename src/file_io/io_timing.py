@@ -18,7 +18,8 @@ from runtime.env_flags import env_bool
 
 
 def enabled() -> bool:
-    return env_bool("LORRAX_SLAB_IO_TIMING", False)
+    """Slab I/O timing follows the native layer's debug switch, ``LORRAX_DEBUG_PRINT``."""
+    return env_bool("LORRAX_DEBUG_PRINT", False)
 
 
 class SlabIOTiming:

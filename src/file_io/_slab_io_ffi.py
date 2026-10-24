@@ -2451,12 +2451,10 @@ class _FfiBackend(_DatasetGeometry):
         # router that used to answer this question by picking a lesser
         # transport has no lesser transport left to pick.
         assert_available()
-        self._timing_enabled = _env_flag("LORRAX_SLAB_IO_TIMING", False)
-        if (self._timing_enabled
-                and not self._loader.has_phdf5_timing()):
-            raise RuntimeError(
-                "LORRAX_SLAB_IO_TIMING=1 requires a rebuilt PHDF5 provider "
-                "with lrx_phdf5_close_timed; no file was opened")
+        # Native slab timing rides the debug switch the C++ side reads
+        # (context.cc), on a provider that exports lrx_phdf5_close_timed.
+        self._timing_enabled = (_env_flag("LORRAX_DEBUG_PRINT", False)
+                                and self._loader.has_phdf5_timing())
 
         self.path = path
         self.mesh = mesh

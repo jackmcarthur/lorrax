@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import pickle
 import time
@@ -165,11 +164,6 @@ def sigma_rule_scope(identity, poles2, counts, *, eta, eps):
         digest.update(np.asarray([count], dtype="<i8").tobytes())
         digest.update(np.asarray(row[:int(count)], dtype="<f8").tobytes())
     return "request_" + digest.hexdigest()
-
-
-def _resolve_uniform_rule_trace():
-    """Return whether the debug-only box trace was requested."""
-    return bool(os.environ.get("LORRAX_UNIFORM_RULE_TRACE"))
 
 
 def _live_states(branch):
@@ -1800,7 +1794,7 @@ def plan_sigma_windows(
                 list(fixed_rule_session["rules"][spec["name"]]["padded_box"])
                 if frozen else None),
         })
-        if _resolve_uniform_rule_trace() and process_rank() == 0:
+        if process_rank() == 0:
             log.debug(
                 f"[uniform-box] {spec['name']} "
                 f"support_re={spec['raw_real_support']} box={spec['box']} (Ry)")

@@ -53,12 +53,12 @@ static size_t eigh_scratch_bytes(size_t workspace_bytes) {
 }
 
 // ---------------------------------------------------------------------------
-//  Profile switch
+//  Profile switch: the per-phase event timing rides LORRAX_DEBUG_PRINT
 // ---------------------------------------------------------------------------
 static inline bool profile_enabled() {
     static const bool v = [] {
-        const char* e = std::getenv("LORRAX_FFI_PROFILE");
-        return e != nullptr && *e == '1';
+        const char* e = std::getenv("LORRAX_DEBUG_PRINT");
+        return e != nullptr && *e != '\0' && *e != '0';
     }();
     return v;
 }

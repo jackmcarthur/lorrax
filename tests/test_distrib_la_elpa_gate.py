@@ -7,7 +7,7 @@
 * residual ``max|A Q - Q diag(w)| / max|A| <= TOL`` and orthogonality ``max|Q^H Q - I| <= TOL``;
 * eigenvalues ``max|w - w_ref| / max|A| <= TOL`` against the XLA route on the same device;
 * the workspace pool: the handler fails loudly if ELPA kept a pooled buffer past the call, and
-  ``LORRAX_ELPA_POOL_REPORT=1`` prints each rank's pool high-water and fallbacks;
+  ``LORRAX_DEBUG_PRINT=1`` prints each rank's pool high-water and fallbacks;
 * refusals (each must RAISE, never return a result): an ``ELPA_FORCE_solver`` environment
   override, and a rocBLAS workspace deliberately too small for ELPA's back-transformation
   (rocBLAS returns ``rocblas_status_memory_error`` without computing; the patched ELPA counts

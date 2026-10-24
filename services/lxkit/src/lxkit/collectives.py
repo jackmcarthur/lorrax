@@ -484,8 +484,7 @@ def install_reduction_guard(mode: str = "log", dump_path: str | None = None) -> 
 
 
 def install_reduction_guard_from_env() -> None:
-    """``LORRAX_REDUCTION_GUARD=log|raise`` installs the guard; ``LORRAX_REDUCTION_TRACE=<path>``
-    (``{rank}`` expanded) dumps the trace at exit.  Unset: nothing happens."""
+    """``LORRAX_REDUCTION_GUARD=log|raise`` installs the guard.  Unset: nothing happens."""
     mode = os.environ.get("LORRAX_REDUCTION_GUARD", "").strip()
     if mode:
-        install_reduction_guard(mode, os.environ.get("LORRAX_REDUCTION_TRACE") or None)
+        install_reduction_guard(mode)

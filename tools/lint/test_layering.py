@@ -862,12 +862,8 @@ def test_the_env_scan_separates_reads_from_writes():
 # the value DOWN instead) — module scope is the import-time-crash class and
 # is banned outright.
 
-_L1_LIBRARY_ENV_READS = {
-    # Debug-only support-box trace.  Accuracy is a deck key; no numerical
-    # policy is read here.
-    "gw.sigma_box_plan": {
-        "LORRAX_UNIFORM_RULE_TRACE",
-    },
+#: Empty since the 2026-10 env prune: no L1 library reads the environment.
+_L1_LIBRARY_ENV_READS: dict = {
 }
 
 
@@ -998,7 +994,7 @@ def test_the_l1_env_read_ratchet_rejects_a_new_unregistered_policy(sources):
         + "\ndef resolve_audit_negative_control():\n"
         + "    return os.environ.get('LORRAX_UNREGISTERED_POLICY', '')\n")
     live = {key for key, _line in scan_l1_env_reads(injected)}
-    assert live - _L1_LIBRARY_ENV_READS[mod] == {
+    assert live - _L1_LIBRARY_ENV_READS.get(mod, set()) == {
         "LORRAX_UNREGISTERED_POLICY"
     }, "the exact-set ratchet failed to detect a newly introduced policy read"
 

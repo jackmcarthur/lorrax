@@ -685,7 +685,7 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
     # cuSOLVERMp 0.7.2 returns status=7 (CUSOLVER_STATUS_INTERNAL_ERROR)
     # from cusolverMpSyevd at EVERY n tried — 64, 256, 1024, 4096 — on a
     # real 4-process 2x2 CUDA mesh.  Reproduced twice (jobid 56447670, both
-    # the plain and the LORRAX_FFI_PROFILE=1 decomposition legs;
+    # the plain and the LORRAX_DEBUG_PRINT=1 (per-phase profile) decomposition legs;
     # _reports/perf_gpu2x2_decomp.json + perf_gpu2x2prof_decomp.json, rows
     # "g2. distributed_eigh jobz='N'").
     #

@@ -480,7 +480,7 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     ctx->q = q;
     ctx->rank = rank;
     ctx->world_size = world_size;
-    ctx->timing_enabled = env_flag("LORRAX_SLAB_IO_TIMING", false);
+    ctx->timing_enabled = env_flag("LORRAX_DEBUG_PRINT", false);
 
     // Transfer modes (ctx.h): reads collective, writes COLLECTIVE
     // (measured on the production tile geometry: strided 2-D tiles of a

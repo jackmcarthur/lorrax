@@ -236,10 +236,10 @@ def test_python_scan_sees_the_tree_at_all():
     """A LORRAX tree with zero env reads does not exist; empty = broken."""
     hits = python_read_sites()
     lorrax = [n for n in hits if n.startswith("LORRAX_")]
-    assert len(lorrax) >= 30, (
+    assert len(lorrax) >= 20, (
         "the python scan found only %d LORRAX_* reads under src/ — the "
-        "2026-07-31 baseline is ~50; the scanner has gone blind, not the "
-        "tree clean" % len(lorrax))
+        "baseline since the 2026-10 env prune is ~28; the scanner has gone "
+        "blind, not the tree clean" % len(lorrax))
 
 
 def test_cpp_scan_sees_the_tree_at_all():
