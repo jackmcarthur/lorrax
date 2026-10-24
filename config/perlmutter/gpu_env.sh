@@ -25,7 +25,9 @@
 #                  A python without a CUDA runtime wheel (the module route,
 #                  whose record names the toolkit runtime) leaves it unchanged.
 #                  The run python: $VIRTUAL_ENV's, else this checkout's .venv,
-#                  else python3.  Idempotent.
+#                  else python3.  Idempotent.  Skipped under a lorrax module
+#                  that stages nvidia/ (LORRAX_STAGE_KEY): its lorrax-launch link
+#                  names the staged runtime.
 # ============================================================================
 # Slurm consumes this when creating a future step. Never claim to repair an
 # already-running numeric step; preserve every explicit value, including empty.
@@ -50,7 +52,10 @@ hits = sorted(glob.glob(os.path.join(sysconfig.get_paths()["purelib"], "nvidia",
 print(os.path.realpath(hits[0]) if hits else "")
 PY
 )"
-if [ -n "$_lorrax_cudart" ]; then
+# The lorrax module that stages nvidia/ node-local (LORRAX_STAGE_KEY) already lists
+# its lorrax-launch/libcudart.so -> the staged runtime first; a shim to the venv's
+# copy would map a second runtime beside the staged one.
+if [ -n "$_lorrax_cudart" ] && [ -z "${LORRAX_STAGE_KEY:-}" ]; then
     _lorrax_shim="${XDG_CACHE_HOME:-$HOME/.cache}/lorrax/cudart-hmem/$(printf %s "$_lorrax_cudart" | md5sum | cut -c1-12)"
     mkdir -p "$_lorrax_shim"
     ln -sfn "$_lorrax_cudart" "$_lorrax_shim/libcudart.so"
