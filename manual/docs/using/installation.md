@@ -114,7 +114,7 @@ On Perlmutter's compute nodes, opening a file on `/global/common`, `$HOME` or CF
 | Lustre `$SCRATCH` | 0.24 ms |
 | node-local `/tmp` | 0.005 ms |
 
-`install_deps.sh` therefore builds the whole runtime once, at a node-local path, and packs it into one archive in the prefix. Every job restores the archive to that same path on each node, in about 7 s per node, and runs from there. The prefix can then live on any filesystem. The test suite below, run cold on one node with four A100s, measures the difference:
+`install_deps.sh` therefore builds the whole runtime once, at a node-local path, and packs it into one archive in the prefix. Every job restores the archive to that same path on each node, in about 7 s per node, and runs from there. The prefix can then live on any filesystem. One commit (JAX 0.9.1, before the kernel store and the thread defaults), run cold through the test suite on one node with four A100s, isolates the effect of where the files are read from: the image saves about 11% against the same tree on `$SCRATCH`, and runs in less than half the time of the module on `/global/common`.
 
 | Install | Suite, cold |
 |---|---|
@@ -123,7 +123,7 @@ On Perlmutter's compute nodes, opening a file on `/global/common`, `$HOME` or CF
 | the same tree, run in place on `$SCRATCH` | 592.0 s |
 | the published module, on `/global/common` | 1164–1352 s |
 
-Fresh installs that follow this page, each with its own empty cache root, on one node with four 80 GB A100s:
+The supported install as shipped (JAX 0.12, the kernel store from `lorrax-postinstall`, the thread defaults of `select_gpu.sh`): fresh installs that follow this page, each with its own empty cache root, on one node with four 80 GB A100s.
 
 | Prefix on | Install (login node) | `lorrax-postinstall`: restore / kernel store / self-check | Suite, cold: k-means / GN-PPM / BSE / total |
 |---|---|---|---|
@@ -133,7 +133,7 @@ Fresh installs that follow this page, each with its own empty cache root, on one
 | `$SCRATCH` | 48.3 s | 6.9 / 235 / 43 s | 12.2 / 37.0 / 10.8 / 328.9 s |
 | CFS, `--in-place`, without `lorrax-run` | 63.1 s | self-check fails: 6.74 ms per file open | 145.0 / 120.1 / 11.7 s; imports alone 238 s |
 
-Wherever the prefix lives, the cold suite takes the same 328–330 s; the same tree run in place from CFS is several times slower before it reaches the first GPU stage.
+Wherever the prefix lives, the cold suite takes the same 328–330 s, against 524 s for the older commit above. The kernel store accounts for about 125 s of that; JAX 0.12 and the launch settings account for the rest. The same tree run in place from CFS is several times slower before it reaches the first GPU stage.
 
 #### Options {: #perlmutter-options }
 
