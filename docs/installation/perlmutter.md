@@ -147,6 +147,35 @@ The result is `1 passed`, in about 5 min on cold caches.
   ([why](../environment/machines/perlmutter.md#network-transport-at-startup)).
 - Never run a driver on a login node.
 
+### 1.4 A node-local runtime image (installs on slow filesystems) {#image}
+
+Every persistent filesystem a compute node sees here is slow per file: one
+`open()` costs 9-30 ms on CFS, `$HOME` and `/global/common` against 0.01 ms in
+node-local `/tmp`, and a run opens thousands of files (the interpreter, the
+venv, the CUDA headers NVRTC re-reads on every build, `ptxas`, the FFI
+closure). An install kept there runs up to 3.5x slower than a clone on
+`$SCRATCH`. The image removes that dependence: the whole runtime is built at
+`/tmp/lorrax-$USER/rt-<rev>` on a login node and packed into one archive, and
+every job restores it to the same path on each node before the first rank
+starts, so a run reads one file from the install filesystem.
+
+```bash
+bash config/perlmutter/build_image.sh <git-ref> <install-dir>     # login node, ~2.5 min
+source config/perlmutter/gpu_env.sh
+srun -N 1 -n 4 --gpus-per-node=4 <install-dir>/bin/lorrax-run \
+  python -u -m gw.gw_jax -i input.in
+```
+
+`lorrax-run` (`scripts/runtime_image.sh`) restores the image once per node
+(the first rank extracts, the others wait on a lock; about 6 s from `$SCRATCH`),
+then runs the command with the image's venv and `select_gpu.sh`. Every
+absolute path the venv, the editable install and the closure records name is
+the one recorded at build time, so the closure gate does not rehash and the
+compile and cubin caches key the same as at build time. Images of other
+revisions that no running process holds are removed after each restore.
+`LORRAX_IMAGE_ROOTS` names node-local directories to use where `/tmp` is too
+small (the tree is then linked at the canonical path).
+
 ## 2. The module {#module}
 
 A module is one venv, one `git archive` source snapshot and one sealed FFI
