@@ -374,7 +374,8 @@ def _fit_mubatch(
                 store.write_batch(beta, r)
                 if len(stores) > 1:
                     store.sync()          # one handle's collective writes at a time
-            del rows
+            # r would otherwise retain the last output across the next launch.
+            del r, rows
             t_batch += time.perf_counter() - t0
             n_run += 1
             progress.step()
