@@ -399,3 +399,12 @@ JAX's singular-value cutoff (`eps * max(m,n)` when `rcond=None`) and the
 minimum-norm solution, including rank-deficient matrices and zero padded
 columns. The existing true-residual gates still decide whether a solve is
 usable. No callback, host matrix transfer or new tuning option is added.
+
+For the shared GMRES solve, `lstsq_hessenberg_local(H,g,k)` additionally
+uses the exact active Arnoldi prefix on ROCm. Static power-of-two SVD
+widths start at8 and end at the full capacity; only the final SVD branches
+vary. The coefficient output is zero-padded to capacity, while its cutoff
+remains `eps * max(H.shape)` of the full carrier. Zero and rank-deficient
+breakdowns retain the minimum-norm result. Full-carrier finite and zero-tail
+checks prevent trimming from concealing an invalid operator result. CPU
+and CUDA retain the original full-size computation.

@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la import lstsq_local
+from distrib_la import lstsq_hessenberg_local
 from solvers.quadrature import feast_ellipse_quadrature as _feast_ellipse_quadrature_generic
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
 from .bse_stack_matvec import build_bse_stack_matvec, build_bse_stack_matvec_full
@@ -392,11 +392,11 @@ def _gmres_solve_core(matvec, b, diag_h, z, operands, max_iter, tol, *,
     ``(max_iter+1, max_iter)`` ``lstsq`` — an SVD whose cost is set by the CAP
     and not by the iterations actually taken — at EVERY iteration, measured at
     2.0 ms of a 15.6 ms column-iteration at ``max_iter=300``
-    (opt_precond/RESULTS.md §9).  The final ``y`` still comes from that same
-    ``lstsq`` on the same final ``H`` and ``g``, so the answer is unchanged
-    bit-for-bit; only the ~k redundant SVDs are gone, and the rotations are
-    the standard stable ones (never the normal equations — see the note at the
-    exit ``lstsq``).
+    (opt_precond/RESULTS.md §9). The final ``y`` is the minimum-norm solve
+    of the final ``H`` and ``g``. ROCm uses a bounded active prefix with the
+    FULL carrier's singular-value cutoff; another SVD shape can change
+    rounding, so the true-residual gate remains authoritative. The rotations
+    are the standard stable ones, never the normal equations.
     """
     if resid_relative_to not in ("b", "r0"):
         raise ValueError(
@@ -525,10 +525,10 @@ def _gmres_solve_core(matvec, b, diag_h, z, operands, max_iter, tol, *,
     # huge TRUE residual (GMRES "converges" to a wrong x).  ``lstsq`` stays
     # accurate at that conditioning; head-less/q=0 tiles are well
     # conditioned so the q=0 closure is unchanged.  The trailing zero
-    # columns of the padded Hessenberg get min-norm y=0.  ONE call, on the
-    # H the loop exited with — the same matrix the historical per-iteration
-    # spelling ended on, hence the same y to the bit.
-    y = lstsq_local(H, g, rcond=None)[0]
+    # columns of the padded Hessenberg get min-norm y=0. ROCm trims only
+    # exact-zero padding through a static prefix bucket, retaining the full
+    # carrier's eps cutoff. Other legs keep the original full-size solve.
+    y = lstsq_hessenberg_local(H, g, k_final)
 
     x = x0 + jnp.tensordot(y, Z, axes=(0, 0))
     return x, k_final
