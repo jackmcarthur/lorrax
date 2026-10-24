@@ -65,6 +65,11 @@ DECK_KEYS: dict[tuple[str, str], str | Rename] = {
     # 2026-10-22: the tangential W model is its own compute_mode.
     ("gw", "sigma_w_model"): Rename("compute_mode = tangential",
                                     "or `compute_mode = mpa` for the elementwise model"),
+    # 2026-10-23: one energy reference, no deck key.
+    ("gw", "fermi_reference"): Rename("", "LORRAX always references energies to midgap "
+                                          "internally"),
+    ("gw", "minimax_energy_reference"): Rename("", "LORRAX always references energies to "
+                                                   "midgap internally"),
 }
 
 #: Deck values: {(deck, key, old value): new value or Rename}.  ``key`` is the NEW key.

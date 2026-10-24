@@ -161,17 +161,13 @@ SIGMA_REGULARIZATION_ATTR = "sigma_regularization_ev"
 SIGMA_REGULARIZATION_REQUESTED_ATTR = "sigma_regularization_requested_ev"
 SIGMA_REGULARIZATION_FLOOR_POLICY_ATTR = "sigma_regularization_floor_policy"
 
-#: The provenance values the driver stamps — ONE per ``fermi_reference``
-#: value, and they are produced by ``gw.efermi.resolve_sigma_efermi_ry``
-#: rather than inferred here.  ``fixed-N mu`` is the metal path's chemical
-#: potential from the fixed-N MP1 solve; ``midgap`` is the insulating
-#: loader convention (``wfn.efermi``, ½(VBM+CBM)); ``vbm`` is
-#: ``fermi_reference = vbm``, which used to be indistinguishable from
-#: ``midgap`` in this file because the stamp was derived from "did the
-#: caller pass an explicit reference" rather than from the deck key.
+#: The provenance values the driver stamps, produced by
+#: ``gw.efermi.resolve_sigma_efermi_ry`` rather than inferred here.
+#: ``fixed-N mu`` is the metal path's chemical potential from the fixed-N
+#: solve; ``midgap`` is the insulating loader convention (``wfn.efermi``,
+#: ½(VBM+CBM)).  A file written before 2026-10-23 may also carry ``vbm``.
 OMEGA_REFERENCE_FIXED_N_MU = "fixed-N mu"
 OMEGA_REFERENCE_MIDGAP = "midgap"
-OMEGA_REFERENCE_VBM = "vbm"
 
 #: WHERE this Sigma was evaluated, stamped on :data:`SIGMA_EVAL_DATASET`.
 #: A DIFFERENT fact from the omega reference above: that says what the axis

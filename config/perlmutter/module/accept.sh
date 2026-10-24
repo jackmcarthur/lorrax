@@ -53,8 +53,11 @@ case "${SLURM_NTASKS:?}" in
     say "Gate 10 PASS"
     ;;
 4)
-    LORRAX_MODULE_EXPECT="$EXPECT" python -u "$HERE/verify_runtime.py"
+    LORRAX_MODULE_EXPECT="$EXPECT" python -u "$HERE/verify_runtime.py" "$OUT/cubin_cache.json"
     python -m pytest "$LORRAX_ROOT/tests/hsuite" -q -p no:cacheprovider
+    if [[ "$RANK" == 0 ]]; then
+        python "$HERE/cubin_store.py" capture "$OUT/cubin_cache.json" "$CAND/source"
+    fi
     touch "$OUT/ok.$RANK"
     say "P4 PASS on rank 0 (publish.sh checks every rank)"
     ;;

@@ -33,7 +33,7 @@ $$
 f_{n\bk}=\frac{1}{1+e^{(E_{n\bk}-E_F)/k_BT}},\qquad \frac{2}{n_{\mathrm{spin}}n_{\mathrm{spinor}}}\sum_{\bk}w_\bk\sum_n f_{n\bk}=N_e \tag{1.1}
 $$
 
-`occ_smearing_width_ry` has no default and is required on a metal, because `WFN.h5` does not store the smearing; set it to the DFT `degauss` with `smearing = 'fd'` in Quantum ESPRESSO. At startup the solved table must reproduce the WFN's own ($N_e$ to $10^{-8}$, $\max\lvert\Delta f\rvert$ to $10^{-6}$). A metal also requires `fermi_reference = mp1_fixed_n` (default `midgap`); with Fermi–Dirac occupations the name means the fixed-N $E_F$. On an insulator both keys refuse.
+`occ_smearing_width_ry` has no default and is required on a metal, because `WFN.h5` does not store the smearing; set it to the DFT `degauss` with `smearing = 'fd'` in Quantum ESPRESSO. At startup the solved table must reproduce the WFN's own ($N_e$ to $10^{-8}$, $\max\lvert\Delta f\rvert$ to $10^{-6}$). On an insulator the key refuses.
 
 The smearing family is not a key: metals are always Fermi–Dirac, and `occ_smearing_family` refuses by name (`GATE metal_occupations_fermi_dirac`).
 
@@ -216,7 +216,6 @@ Treatments and routes that assume a gap or integer occupations refuse a metallic
 !!! refuses
     - No `occ_smearing_width_ry`, or a width ≤ 0. Set it to the DFT Fermi–Dirac $k_BT$.
     - `occ_smearing_family` named. Remove it; metals are always Fermi–Dirac.
-    - `fermi_reference` other than `mp1_fixed_n`.
     - `occ_broadening > 0` beside `occ_smearing_width_ry`.
     - `sys_dim = 2`: the metallic head is bulk only.
     - `head_correction = full` on a time-reversal-broken metal, tangential route. Use `no_local_fields`.

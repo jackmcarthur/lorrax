@@ -127,7 +127,7 @@ $$
 κ multiplies roundoff, ISDF error and reduction-order differences between
 ranks, so a small residual with a large κ is not a good rule. The service
 reports both with each rule, and the driver prints the rule's provenance, node
-count and achieved error. The energy reference (`midgap` by default) cancels
+count and achieved error. The energy reference cancels
 from χ₀, because only Δ enters.
 
 ## 5. Refusals

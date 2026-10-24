@@ -52,6 +52,7 @@ A new test needs no bootstrap import of its own. Run the unit layer with
 | `test_ordered_collectives.py` | `lxkit.ordered_psum` is the rank-order fold |
 | `test_log_routing_cpu.py` | a `RunSession` routes warnings (as their message blocks with ids), progress and stage banners to the main log, the rank stream and the JSON sidecar |
 | `test_native_closure.py` | the sealed library closure: each recorded family mapped once as the recorded file |
+| `test_module_cubin_store.py` | accepted module image assets remain regular/self-contained; source, bundle and payload mismatches refuse (stdlib-only, also runs directly) |
 | `test_network_env_multinode.py` | the multi-node network decision matrix |
 | `tdagw/test_prop_integrators_cpu.py` | the DP54 stepper takes SciPy RK45's steps |
 | `tdagw/test_validation_rabi_cpu.py` | Rabi flopping against the exact rotating-frame solution, every integrator |

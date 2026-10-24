@@ -22,6 +22,8 @@ source "$CAND/CANDIDATE"
 for f in gate10.ok ok.0 ok.1 ok.2 ok.3; do
     [[ -e "$CAND/accept/$f" ]] || lorrax_module_die "no accept/$f in $CAND (run accept.sh at -n 1 and -n 4)"
 done
+[[ -f "$CAND/source/cubin_store/manifest.json" ]] \
+    || lorrax_module_die "no accepted cubin store in $CAND (rerun accept.sh at -n 4)"
 SRC_REL="$RELEASES/source-${REV:0:8}"
 BUN_REL="$RELEASES/${REV:0:8}-bundle-${BUNDLE_ID:0:12}"
 for d in "$SRC_REL" "$BUN_REL"; do
@@ -33,6 +35,8 @@ mkdir -p "$RELEASES"
 mkdir "$SRC_REL.tmp.$$"
 git -C "$CAND/src" archive --format=tar "$REV" | tar -x -C "$SRC_REL.tmp.$$"
 echo "$REV" > "$SRC_REL.tmp.$$/SOURCE_COMMIT"
+"$VENV/bin/python" "$HERE/cubin_store.py" copy "$CAND/source/cubin_store" \
+    "$SRC_REL.tmp.$$/cubin_store" "$REV" "$BUNDLE_ID"
 cp -a "$CAND/bundle" "$BUN_REL.tmp.$$"
 "$VENV/bin/python" - "$CAND/bundle" "$BUN_REL.tmp.$$" <<'PY'
 import hashlib, sys

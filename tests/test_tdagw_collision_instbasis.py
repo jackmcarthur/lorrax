@@ -301,8 +301,7 @@ def run_checks(mesh):
     rng2 = np.random.default_rng(20261020)
     with FF.xla_reference():
         wfns, meta = F._gw_bundle(mesh, psi, e, f, kplan)
-        mm = __import__("types").SimpleNamespace(target_error=F.TARGET, max_nodes=64,
-                                                 energy_reference="midgap")
+        mm = __import__("types").SimpleNamespace(target_error=F.TARGET, max_nodes=64)
         quad, e_ref = build_static_quadrature(wfns, mm)
         quad_p = build_imag_probe_response_rule(quad, F.OMEGA_P, mm, with_odd_kernel=True)
         V_dev = putc(V)

@@ -16,9 +16,10 @@ Two drivers share one interpolation engine:
 
 The native `bandstructure.dat` has seven numeric columns:
 `idx_k idx_b kx ky kz s energy_eV` (zero-based indices, fractional k,
-path distance, energies relative to the reported zero). Its comment
-`energy_reference_eV` gives the exact offset subtracted from the energies;
-adding it restores their absolute reference. A DFT and a QP run generally have
+path distance, energies relative to the VBM; a metal's relative to the DFT
+$E_F$). The comment `energy_zero` names that zero and `energy_reference_eV`
+gives the exact offset subtracted from the energies; adding it restores their
+absolute reference. A DFT and a QP run generally have
 different offsets. This native table is distinct from BerkeleyGW's eight-column
 DFT/QP band table.
 

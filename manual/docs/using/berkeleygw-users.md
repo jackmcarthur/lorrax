@@ -83,7 +83,7 @@ LORRAX uses more memory than BerkeleyGW, largely because it stores the Green's f
 | `cell_slab_truncation` | [`sys_dim`](../drivers/gw/keywords.md#sys_dim) `= 2` | `sys_dim` is required; `3` is untruncated bulk. |
 | `cell_box_truncation`, `cell_wire_truncation`, `spherical_truncation`, `coulomb_truncation_radius` | none | Only `sys_dim` 3 and 2 build $V_\bq$. |
 | `write_vcoul` | none | LORRAX reads BerkeleyGW's table ([sigma.inp](#sigma)); it never writes one. |
-| `fermi_level`, `fermi_level_absolute`, `fermi_level_relative` | none | $E_F$ follows from the occupations; [`fermi_reference`](../drivers/gw/keywords.md#fermi_reference) only places the frequency origin. |
+| `fermi_level`, `fermi_level_absolute`, `fermi_level_relative` | none | $E_F$ follows from the occupations. |
 | `occ_broadening` | none | Metals take Fermi–Dirac occupations, [`occ_smearing_width_ry`](../drivers/gw/keywords.md#occ_smearing_width_ry). LORRAX's own [`occ_broadening`](../drivers/gw/keywords.md#occ_broadening) is a different key: the MP1 width (eV) of the QSGW head on an insulator. |
 | `eqp_corrections` | none | One-shot $\chi^0$ uses mean-field energies; QSGW rebuilds $\chi^0$ from QP states and energies. |
 | `degeneracy_check_override` | none | A band count that cuts a multiplet refuses. |

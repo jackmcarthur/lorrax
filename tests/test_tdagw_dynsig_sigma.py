@@ -365,7 +365,7 @@ def _gw_bundle(mesh, psi, e, f, kplan):
 def _config(omega_ry):
     return SimpleNamespace(
         ppm=SimpleNamespace(invalid_mode="static_limit", fallback_omega=2.0),
-        sigma=SimpleNamespace(fermi_reference="midgap", regularization_ev=ETA_EV,
+        sigma=SimpleNamespace(regularization_ev=ETA_EV,
                               window_edge_factor=1.5, quadrature_eps=EPS_Q, omega_step_ev=0.25,
                               out_of_grid="clamp"),
         mpa=SimpleNamespace(pole_batch_size=4), compute_mode="gn_ppm",
@@ -418,7 +418,7 @@ def run_checks(mesh):
 
         # ---- G0: the GW driver's own screening on the synthetic bundle
         wfns, meta = _gw_bundle(mesh, psi, e, f, kplan)
-        mm = SimpleNamespace(target_error=TARGET, max_nodes=64, energy_reference="midgap")
+        mm = SimpleNamespace(target_error=TARGET, max_nodes=64)
         quad, e_ref = build_static_quadrature(wfns, mm)
         quad_p = build_imag_probe_response_rule(quad, OMEGA_P, mm, with_odd_kernel=True)
         V_dev = putc(V)

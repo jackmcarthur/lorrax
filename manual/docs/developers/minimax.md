@@ -113,7 +113,6 @@ Every rule is fixed by a handful of numbers, all known before any $G$ or $W$ is 
 | $R$ | $\Delta_{\max}/\Delta_{\min}$, the dimensionless range of decay rates | derived | — |
 | $\varepsilon_\chi$ | absolute error of $1/\Delta$, in Ry⁻¹ | [`minimax_target_error`](../drivers/gw/keywords.md#minimax_target_error) | $10^{-6}$ |
 | $N_{\max}$ | node cap of the static and probe rules | [`minimax_max_nodes`](../drivers/gw/keywords.md#minimax_max_nodes) | 64 |
-| $\mu$ | energy reference of the exponentials | [`minimax_energy_reference`](../drivers/gw/keywords.md#minimax_energy_reference) | midgap |
 | $\omega_p$ | plasmon-pole probe frequency (imaginary for GN, real for HL) | `ppm_omega_p` | 2 Ry (GN) |
 | $z=\omega+i\varpi$ | sample frequencies of $W$ (MPA lines, tangential supports) | the sample plan of the screening route | — |
 | $\eta$ | broadening of Σ, the distance of every pole from the real axis | [`sigma_regularization_ev`](../drivers/gw/keywords.md#sigma_regularization_ev) | 0.25 eV |
@@ -393,6 +392,6 @@ Constructors raise `ValueError` for invalid domains (non-positive heights, a box
 | `src/gw/cd/chi0_rules.py` | contour-deformation χ⁰ windows through `response_imaginary_rule` |
 | `src/gw/mpa/model.py` | MPA line rules through `damped_line_rule` |
 | `src/gw/w_isdf.py` | finite-temperature χ⁰ through `matsubara_response_rule` |
-| `src/gw/minimax_config.py` | `MinimaxConfig(target_error=1e-6, max_nodes=64, energy_reference='midgap')`, the settings of the χ⁰ rules; the Σ windows do not read it |
+| `src/gw/minimax_config.py` | `MinimaxConfig(target_error=1e-6, max_nodes=64)`, the settings of the χ⁰ rules; the Σ windows do not read it |
 
 The time-domain products these rules feed are described on [Kernels](kernels.md).

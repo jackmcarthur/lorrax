@@ -24,7 +24,7 @@ All equations are in Ry.
 **What a metal deck refuses** (key-level contract: [input reference](../input_reference.md)). GN-PPM and HL-PPM (`GATE gn_ppm_refuses_metals`,
 `GATE fractional_occupations_require_mpa`); a missing `occ_smearing_width_ry`;
 any occupation family but Fermi–Dirac (`GATE metal_occupations_fermi_dirac`);
-`fermi_reference` other than `mp1_fixed_n`; the ladder `wc_source`
+the ladder `wc_source`
 (`GATE w_bse_insulators_only`); elementwise MPA with time reversal measured
 broken (`GATE mpa_ordered_metal`: that route fits one residue with no odd
 channel); `parallel_transport` on `bare_transverse` and a folded bispinor
@@ -323,8 +323,7 @@ $k_BT$ = `occ_smearing_width_ry` (the WFN does not store it), solved at fixed
 $N$ by safeguarded bisection with capacity $2/(n_{\rm spin}n_{\rm spinor})$ per
 band; the fixed-$N$ invariant holds to $10^{-10}$, and at startup the solved
 table must reproduce the WFN's own table ($N_e$ to $10^{-8}$, $\max|\Delta f|$ to
-$10^{-6}$). `fermi_reference = mp1_fixed_n` names this fixed-$N$ $\mu$ for every
-family.
+$10^{-6}$). The Σ frequency axis of a metal is measured from this fixed-$N$ $\mu$.
 
 **One state per map, solved at entry.** Each QSGW map solves its occupation
 state from the spectrum of the $H$ it was handed, and that one state reaches

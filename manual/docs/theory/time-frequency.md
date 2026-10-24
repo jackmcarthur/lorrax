@@ -318,7 +318,7 @@ Each consumer of a frequency kernel has its own rule, certified in its own error
 | shared complex-time rule ([Tangential W model §6.2](tangential-w.md#bank-times)) | every tangential support | complex | [`sigma_w_accuracy`](../drivers/gw/keywords.md#sigma_w_accuracy): `bank_rule_tolerance` $10^{-8}$ (`production`) or $10^{-7}$ (`relaxed`) | 192 per shared set |
 | sector rule or near-resonance rule (§[9](#sigma-boxes)) | every Σ window | complex | [`sigma_quadrature_eps`](../drivers/gw/keywords.md#sigma_quadrature_eps) ($10^{-4}$, or $5\times10^{-4}$ under `relaxed`) | none |
 
-The Σ windows also read [`sigma_regularization_ev`](../drivers/gw/keywords.md#sigma_regularization_ev) (the broadening $\eta$, 0.25 eV) and [`sigma_window_edge_factor`](../drivers/gw/keywords.md#sigma_window_edge_factor) (the state edge $1.5\,\eta$). [`minimax_energy_reference`](../drivers/gw/keywords.md#minimax_energy_reference) (`midgap`) sets the energy zero of the static and probe χ⁰ rules, from which it cancels. It accepts `midgap`, `vbm`, `cbm` and `none` (aliases `raw`, `zero`), and any other value, including a number, refuses. The tangential route reads neither `minimax_target_error` nor `minimax_max_nodes`, although the static rule is still built on every screened route.
+The Σ windows also read [`sigma_regularization_ev`](../drivers/gw/keywords.md#sigma_regularization_ev) (the broadening $\eta$, 0.25 eV) and [`sigma_window_edge_factor`](../drivers/gw/keywords.md#sigma_window_edge_factor) (the state edge $1.5\,\eta$). The tangential route reads neither `minimax_target_error` nor `minimax_max_nodes`, although the static rule is still built on every screened route.
 
 ## <span class="n">7</span> Reference: χ⁰ rules at fixed frequencies {: #laplace }
 

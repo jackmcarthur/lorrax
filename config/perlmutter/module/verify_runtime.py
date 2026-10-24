@@ -18,6 +18,7 @@ import importlib.metadata as md
 import json
 import os
 from pathlib import Path
+import sys
 
 import runtime
 
@@ -117,6 +118,12 @@ def main() -> None:
     total = float(jax.jit(jnp.sum, out_shardings=NamedSharding(mesh, P()))(x))
     assert total == 64.0, total
     say("PASS 2x2 mesh reduction")
+    if len(sys.argv) > 1 and jax.process_index() == 0:
+        from ffi.fft import cubin_cache_dir, mathdx_root
+        receipt = dict(source_revision=revision, bundle_id=manifest["bundle_id"],
+                       cache=cubin_cache_dir(), mathdx_root=mathdx_root(),
+                       device_kind=jax.local_devices()[0].device_kind)
+        Path(sys.argv[1]).write_text(json.dumps(receipt, indent=2) + "\n")
     say("MODULE IDENTITY: ALL PASSED")
 
 

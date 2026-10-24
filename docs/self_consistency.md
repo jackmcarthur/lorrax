@@ -445,7 +445,7 @@ evaluated.
 
 $\Sigma_c(\omega)$ is sampled on a uniform grid of step `sigma_omega_step_ev`,
 measured from the $E_F$ of the Σ frame: `efermi.resolve_sigma_efermi_ry` for
-MPA, and the current spectrum's VBM or midgap for GN/HL-PPM
+MPA, and the current spectrum's midgap for GN/HL-PPM
 (`ppm_sigma.ppm_fermi_frame`). Coverage is judged in that same frame
 (`efermi.sigma_frame_mu_ev`). Each sampled frequency costs quadrature work,
 and a changed grid recompiles every Σ executable, so the loop plans the grid

@@ -83,7 +83,7 @@ qp_solver              = self_consistent
 sc_tol_ev              = 1e-3
 ```
 
-Every other key takes its default ([keywords](keywords.md)). Choose `number_bands` for $\chi^0$, which is not extrapolated, and give $\Sigma$ at least 20 active conduction bands. A metal adds `occ_smearing_width_ry` and `fermi_reference = mp1_fixed_n` ([Metals](../../theory/metals.md)).
+Every other key takes its default ([keywords](keywords.md)). Choose `number_bands` for $\chi^0$, which is not extrapolated, and give $\Sigma$ at least 20 active conduction bands. A metal adds `occ_smearing_width_ry` ([Metals](../../theory/metals.md)).
 
 ## Choosing a Σ treatment {: #treatment }
 
@@ -199,7 +199,7 @@ A refusal names the key or file and the fix. The ones most runs meet are listed 
 !!! refuses "Common"
     - No `sys_dim`. Add `sys_dim = 3` (bulk) or `2` (slab). 
     - An unknown key, or a `;` comment after a value. Delete the key; comments start with `#`. 
-    - Fractional WFN occupations (a metal) with `compute_mode = cohsex`, `gn_ppm` or `hl_ppm`, without `occ_smearing_width_ry`, without `fermi_reference = mp1_fixed_n`, or with `sc_head_update = interband_commutator`. 
+    - Fractional WFN occupations (a metal) with `compute_mode = cohsex`, `gn_ppm` or `hl_ppm`, without `occ_smearing_width_ry`, or with `sc_head_update = interband_commutator`. 
     - A `kin_ion.h5` that is missing, has too few bands, or was built for another `sys_dim`, spinor count, k-point count or `bispinor` setting, or in the retired format with Hartree folded in. Rerun kin-ion. Its WFN fingerprint is not compared. 
     - A missing `dipole.h5` with the head on, or one built with another velocity operator, with or without the nonlocal commutator. Under `head_correction = full`, also one from another WFN or band window; on the direct-head path that mismatch only warns, unless `LORRAX_SANITY=strict`. Rerun dipole on this input file and WFN. 
     - A centroid table whose fit windows drop an occupied band. Rerun centroids with windows that start at band 0. 
@@ -223,7 +223,7 @@ A refusal names the key or file and the fix. The ones most runs meet are listed 
     - `number_bands_sigma` below twice the occupied count with band extrapolation on. Raise `number_bands`. 
 
 ??? refuses "Material class"
-    - Integer WFN occupations (an insulator) with `occ_smearing_width_ry`, `fermi_reference = mp1_fixed_n` or the head-fit metal origin shift ([keys](../../theory/multipole-w.md#keywords)). Remove the key. 
+    - Integer WFN occupations (an insulator) with `occ_smearing_width_ry` or the head-fit metal origin shift ([keys](../../theory/multipole-w.md#keywords)). Remove the key. 
     - `hl_ppm` on a time-reversal-broken WFN, or with `ppm_omega_p` at or below the largest $\chi^0$ transition. Raise `ppm_omega_p`, or use `gn_ppm`. 
 
 ??? refuses "During the run"
