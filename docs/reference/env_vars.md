@@ -10,9 +10,9 @@ has no row here.
 **Policy.** The environment grants machine capability (library paths,
 transport, thread counts, resource caps) and debug switches. It never selects
 physics or routing: those are input-file keys, which are validated, echoed and
-recorded in provenance. An env twin of an input key that still works is
-deprecated and prints a notice whenever it is set (§1a); the routing-affecting
-variables that remain are §1b.
+recorded in provenance. An env twin of an input key is
+removed, so the input key is the only route; the routing-affecting variables
+that remain are §1b.
 
 **Grammars used below.** *bool* is `runtime/env_flags.py::env_bool`: unset or
 blank gives the default, `1 true yes on` (any case) is on, `0 false no off` is
@@ -27,21 +27,6 @@ after startup is not evidence of what applied.
 ---
 
 ## 1. Input keys: env twins and routing-affecting variables
-
-### 1a. Deprecated env twins
-
-Unset or blank uses the input key. Any other value wins, is cast as shown (a
-value the cast rejects raises), and prints a deprecation line naming the key.
-The ζ pair announces on rank 0 once per process, and ζ-fit provenance records
-the effective value, so a rerun without the variable cannot silently reuse a ζ
-fit made at a different cutoff.
-
-| var | input key | class | cast | controls |
-|---|---|---|---|---|
-| `LORRAX_ZETA_RCOND` | `zeta_rcond` (`1e-8`) | twin | float | Relative eigenvalue cutoff of the rank-revealing ζ pseudo-inverse (`rank_truncate`, `isdf/core.py`). |
-| `LORRAX_SC_MAX_ITER` | `sc_max_iter` | twin | int | Self-consistency iteration cap. |
-| `LORRAX_SC_TOL_EV` | `sc_tol_ev` | twin | float | Self-consistency convergence tolerance, eV. |
-| `LORRAX_SC_DUMP_DIR` | `sc_dump_dir` | twin | string | Directory for per-iteration self-consistency dumps. |
 
 ### 1b. Routing-affecting variables
 

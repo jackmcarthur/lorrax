@@ -1349,35 +1349,6 @@ def _resolve_solver_kind(vertex_mu_L: int, solver_kind: str, **_) -> str:
 
 
 # ---------------------------------------------------------------------------
-# DEPRECATED env overrides of input-file keys (scorecard AV; pattern #8).
-#
-# ``zeta_rcond`` is THE conditioning knob of the charge ζ solve
-# — physics policy, not machine capability — so its home is the input file,
-# where they are parsed, validated, echoed into the run log and captured by
-# ζ-fit provenance.  The env forms predate the keys and used to win SILENTLY
-# (the env read had the key's value as its *fallback*), which is exactly the
-# env-coupled-behavior failure class: a sweep run whose central parameter is
-# not in its own input file.  No live harness depends on the env forms
-# (audited 2026-07-27: the one historical user is the completed one-off
-# run_B_c1998_rcond10/run72.sbatch).  They keep working this release, but
-# the override is announced LOUDLY, once per process per variable.
-_env_override_warned: set = set()
-
-
-def _env_override_raw(env_name: str) -> str | None:
-    """THE non-empty-env-wins rule of the deprecated env twins, in ONE place: the raw env string when it is set and non-blank (that value wins this release), else ``None`` (the input key is used); see docs/architecture/zeta_fit_face_psi_cct.md."""
-    raw = os.environ.get(env_name)
-    if raw is None or raw.strip() == "":
-        return None
-    return raw
-
-
-def deprecated_env_record(env_name: str, key_value) -> str:
-    """The string ζ-fit provenance records for a deprecated env-twin knob: the raw env string when the env form wins (the exact rule the factor sites apply, via :func:`_env_override_raw`), else ``repr(key_value)``; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    raw = _env_override_raw(env_name)
-    return raw if raw is not None else repr(key_value)
-
-
 # Canonical boolean env grammar — ONE parser, imported, not copied.
 #
 # This module used to carry its own ``_env_bool`` for conditioning telemetry.
@@ -1388,27 +1359,6 @@ def deprecated_env_record(env_name: str, key_value) -> str:
 # ``tools/lint/test_env_grammar.py``, which scans this file as an OWNED file.)
 from runtime.env_flags import env_bool
 from gw.gw_config import ZETA_RCOND_DEFAULT
-
-
-def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
-    """Input key is the source of truth; a non-empty env var still overrides, but prints a deprecation notice on rank 0 (once per process); see docs/architecture/zeta_fit_face_psi_cct.md."""
-    raw = _env_override_raw(env_name)
-    if raw is None:
-        return float(key_value)
-    val = float(raw)
-    if env_name not in _env_override_warned:
-        _env_override_warned.add(env_name)
-        log.warning(
-            f"DEPRECATED env override: {env_name}={raw} overrides "
-            f"input key {key_name}={key_value!r}",
-            extra=log_message(
-                "deprecated_env_override",
-                found=(env_name, str(raw)),
-                lines=("the input file is the record; the env form still wins "
-                       "this release, but it is loud on purpose (env grants "
-                       "capability; it must not silently select policy)",),
-                fix=f"put '{key_name} = {raw}' in the deck instead"))
-    return val
 
 
 def _closure_mode():
@@ -1543,7 +1493,7 @@ def _factor_c_q_face(C_q, mesh_xy, n_rmu_logical, zeta_rcond=ZETA_RCOND_DEFAULT)
     from common.gpu_utils import shared_device_room
     nq, n, _ = C_q.shape
     n_log = int(n_rmu_logical)
-    rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
+    rcond = float(zeta_rcond)
     room = shared_device_room("isdf zeta charge factor")
     reserve = memory.contexts().at(int(mesh_xy.size)) if int(mesh_xy.size) > 1 else 0
     from distrib_la import room_or_exhausted

@@ -1381,8 +1381,7 @@ _DEFAULTS = {
     # wired for ALL modes (mode-agnostic sigma_dispatch), not just COHSEX.
     "self_consistent": False,
     # Self-consistency loop knobs (read only when qp_solver=self_consistent).
-    # Promoted from the LORRAX_SC_* env vars (2026-07-08); LORRAX_SC_MAX_ITER
-    # and LORRAX_SC_TOL_EV remain deprecated overrides.  sc_max_iter counts GW map calls; one-evaluation Anderson
+    # Input keys only (the LORRAX_SC_* env twins are gone).  sc_max_iter counts GW map calls; one-evaluation Anderson
     # spends one per iterate (13 on CrI3 8x8 and Fe 4x4x4, claims 2686-2687).
     "sc_max_iter": 30,
     "sc_tol_ev": 1.0e-4,
@@ -1468,7 +1467,7 @@ _DEFAULTS = {
     # si_cohsex_3d gate) does have eigenvalues below the cut, and 1e-6 drifts
     # its sigTOT by 1.021 meV where 1e-8 costs only 0.054 meV — the identical
     # over-complete cure at ~20× less drift (sweep table in
-    # docs/docs_gwjax/COHSEX_INPUT.md).  Env override LORRAX_ZETA_RCOND.
+    # docs/docs_gwjax/COHSEX_INPUT.md).
     # The isdf/core.py + gw/isdf_fitting.py signature defaults IMPORT
     # ZETA_RCOND_DEFAULT (defined above _DEFAULTS) — one copy, no mirrors.
     # reports/gw_rank_truncation_2026-07-20 + gw_bandrange_centroids_2026-07-21.
@@ -2864,16 +2863,7 @@ def _input_response(
 
 def _input_iteration(
         _linalg, params, print_fn):
-    """Produce the self-consistency settings with their environment precedence."""
-    def _sc_env(env_key: str, cast, file_val, input_key: str):
-        raw_env = os.environ.get(env_key)
-        if raw_env is None or raw_env == "":
-            return file_val
-        val = cast(raw_env)
-        print_fn(
-            f"  [config] {env_key}={raw_env} (deprecated env override; "
-            f"set '{input_key} = {raw_env}' in cohsex.in instead)")
-        return val
+    """Produce the self-consistency settings."""
     if float(params["sc_mixing"]) != 1.0:
         raise ValueError(
             "GATE sc_mixing_retired: nothing reads sc_mixing; Anderson "
@@ -2883,17 +2873,11 @@ def _input_iteration(
             "  fix:  delete the key\n"
             "  doc:  docs/self_consistency.md")
     sc = SCConfig(
-        max_iter=_sc_env(
-            "LORRAX_SC_MAX_ITER", int, int(params["sc_max_iter"]),
-            "sc_max_iter"),
-        tol_ev=_sc_env(
-            "LORRAX_SC_TOL_EV", float, float(params["sc_tol_ev"]),
-            "sc_tol_ev"),
+        max_iter=int(params["sc_max_iter"]),
+        tol_ev=float(params["sc_tol_ev"]),
         accelerator=str(params["sc_accelerator"]).strip().lower(),
         history_depth=int(params["sc_history_depth"]),
-        dump_dir=_sc_env(
-            "LORRAX_SC_DUMP_DIR", str, str(params["sc_dump_dir"] or ""),
-            "sc_dump_dir") or None,
+        dump_dir=str(params["sc_dump_dir"] or "") or None,
         frozen_core_bands=int(params["sc_frozen_core_bands"]),
         semicore=str(params["sc_semicore"]).strip().lower(),
         eigh=_linalg.sc_eigh,

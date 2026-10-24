@@ -52,8 +52,6 @@ ENV_HELPERS = frozenset({
     "_env_flag",                          # file_io._slab_io_ffi
     "_env_int",                           # symmetry_maps.density_symmetry_check
     "_env_float",                         # symmetry_maps.density_symmetry_check
-    "_env_override_raw",                  # isdf.core (deprecated env twins)
-    "_deprecated_env_float",              # isdf.core (deprecated env twins)
 })
 
 #: Callables whose ``env=`` keyword names an env var (typed capability

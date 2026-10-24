@@ -2011,8 +2011,7 @@ def read_zeta_fit_provenance(zeta_file: str) -> dict | None:
     ``isdf_header/fit_provenance`` is a JSON string written by
     ``gw.gw_init._zeta_fit_provenance`` AFTER ``mark_zeta_done``, so its
     presence means the ζ on disk is both complete and described.  THE BUNDLE
-    IS THE TRUTH: it records the EFFECTIVE (post-``LORRAX_ZETA_RCOND``)
-    conditioning knobs and the EXACT band windows the fit ran on, which is
+    IS THE TRUTH: it records the conditioning knobs and the EXACT band windows the fit ran on, which is
     what a refit reproducing that fit needs — the deck beside it may have
     moved, and on a decoupled ``zeta_nband`` run the deck's band window is
     not the ζ-fit window at all.
@@ -2042,10 +2041,9 @@ def _zeta_solve_of(prov: dict, zeta_file: str) -> tuple[str, float]:
 
     The two values ``isdf.core.solve_zeta_charge_dense`` needs to redo the
     producer's ζ solve.  ``zeta_rcond`` is stored as the provenance's own
-    string (``repr(value)``, or the raw env string when the deprecated env
-    twin won — ``isdf.core.deprecated_env_record``), so it parses as a float
-    either way and it is the EFFECTIVE value, which is the whole point of
-    reading it here instead of off the deck.
+    string (``repr(value)``; older stamps may hold the raw string of the retired
+    env twin), so it parses as a float either way and it is the value the fit
+    used, which is the whole point of reading it here instead of off the input file.
     """
     kind = str(prov.get("charge_zeta_solve", "")).strip().lower()
     if kind == "cholesky":
