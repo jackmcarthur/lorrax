@@ -15,8 +15,8 @@ cannot see it; raising ``TF_CPP_MIN_LOG_LEVEL`` would hide every C++ warning.
 This module instead forwards fd 2 through a small line filter and discards
 only the exact upstream-removed notice.  After every process has passed the
 explicit finalization barrier, it may additionally discard the PJRT client's
-``WatchTasksAsync`` shutdown receipts (JAX 0.12; 0.9 called the watcher
-``WatchJobStateAsync`` and printed three lines).  Every rank's backend client
+``WatchTasksAsync`` (JAX 0.12) or ``WatchJobStateAsync`` (JAX 0.9.1) shutdown
+receipts.  Every rank's backend client
 watches the coordination service's task states; when rank zero deliberately
 closes the service it owns, each watcher reports ``CANCELLED`` once and then
 ``UNAVAILABLE ... Connection refused`` on every retry, about once a second,
@@ -24,8 +24,8 @@ until the process reaches ``os._exit`` (measured on Perlmutter, P = 4: 10-13
 receipts per process).  The watcher belongs to the backend client, which
 :func:`runtime.finalize_process` deliberately never destroys, so its receipts
 cannot be prevented, only recognized.  Each receipt is a block: the head line,
-the GRPC context line, the status detail, a source-location trace and a blank
-line; the trace and blank lines are dropped only inside a block that opened
+the GRPC context line and the status detail; JAX 0.12 adds a source-location
+trace and a blank line.  Those extra lines are dropped only inside a block that opened
 with an exact head line.  The shutdown gate matters: an identical message
 during calculation is still forwarded.  Every other byte is passed to the
 original descriptor unchanged.
@@ -65,17 +65,25 @@ _CLEAN_SHUTDOWN_STATUS = (rb"(?:CANCELLED: ?CANCELLED|UNAVAILABLE: ?(?:" + _CONN
                           rb"|" + _CANCELLING_ALL_CALLS + rb"))")
 _CLEAN_SHUTDOWN_HEAD_LINE = re.compile(
     rb"W\d{4} \d{2}:\d{2}:\d{2}\.\d+ +\d+ "
-    rb"pjrt_client\.cc:\d+\] WatchTasksAsync failed for task \d+: "
+    rb"pjrt_client\.cc:\d+\] Watch(?:Tasks|JobState)Async failed for task \d+: "
     + _CLEAN_SHUTDOWN_STATUS
 )
-_CLEAN_SHUTDOWN_CONTEXT_LINE = (
+_CLEAN_SHUTDOWN_CONTEXT_LINES = (
     b"Additional GRPC error information from remote target "
     b"coordination_service while calling "
-    b"/xla.coordination.CoordinationService/WatchTasks:"
+    b"/xla.coordination.CoordinationService/WatchTasks:",
+    b"Additional GRPC error information from remote target "
+    b"coordination_service while calling "
+    b"/tensorflow.CoordinationService/WatchJobState:",
 )
 _CLEAN_SHUTDOWN_DETAIL_LINE = re.compile(
     rb":" + _CLEAN_SHUTDOWN_STATUS +
     rb"(?: \[type\.googleapis\.com/tensorflow\.DerivedStatus=''\])?"
+)
+_LEGACY_SHUTDOWN_DETAIL_LINE = re.compile(
+    rb':UNKNOWN:Error received from peer  \{(?:'
+    rb'grpc_status:(\d+), grpc_message:"([^"\r\n]+)"|'
+    rb'grpc_message:"([^"\r\n]+)", grpc_status:(\d+))\}'
 )
 _TRACE_HEADER_LINE = b"=== Source Location Trace: ==="
 _TRACE_FRAME_LINE = re.compile(rb"[\w./+-]+\.(?:h|cc):\d+")
@@ -90,17 +98,25 @@ def clean_shutdown_step(line: bytes, in_receipt: bool) -> tuple[bool, bool]:
     """One line of JAX's coordinator-close receipts: ``(suppress, in_receipt)``.
 
     A receipt opens only on an exact head line; inside one, its context,
-    detail and source-location lines are dropped, and the blank line that
-    ends it closes it.  Any other line closes it and is forwarded.
+    detail and source-location lines are dropped. The legacy detail or the
+    newer format's blank line closes it. Any other line closes it and is forwarded.
     """
     stripped = line.rstrip(b"\r\n")
     if _CLEAN_SHUTDOWN_HEAD_LINE.fullmatch(stripped):
         return True, True
     if not in_receipt:
         return False, False
+    legacy = _LEGACY_SHUTDOWN_DETAIL_LINE.fullmatch(stripped)
+    if legacy:
+        status = legacy[1] or legacy[4]
+        message = legacy[2] or legacy[3]
+        label = {b"1": b"CANCELLED", b"14": b"UNAVAILABLE"}.get(status, b"")
+        # Reuse the same status whitelist; the legacy three-line block ends here.
+        suppress = _CLEAN_SHUTDOWN_DETAIL_LINE.fullmatch(b":" + label + b":" + message)
+        return suppress is not None, False
     if not stripped:
         return True, False
-    if (stripped == _CLEAN_SHUTDOWN_CONTEXT_LINE
+    if (stripped in _CLEAN_SHUTDOWN_CONTEXT_LINES
             or _CLEAN_SHUTDOWN_DETAIL_LINE.fullmatch(stripped)
             or stripped.rstrip() == _TRACE_HEADER_LINE
             or _TRACE_FRAME_LINE.fullmatch(stripped)):
