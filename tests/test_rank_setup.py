@@ -78,7 +78,7 @@ def test_stale_overrides_name_the_unset(tmp_path):
            "LORRAX_FFI_SO": str(tmp_path / "gone.so"),
            "PYTHONPATH": f"{here / 'src'}:{old / 'src'}:/opt/x",
            "LORRAX_ROOT": str(old)}
-    refuse, warn = rank_setup.stale_overrides(env, tree=here)
+    refuse, warn = rank_setup.stale_overrides(env, tree=here, venv_tree=None)
     text = "\n".join(refuse)
     assert "ABI-10" in text and "`unset LORRAX_FFI_HOST_SO`" in text
     assert "`unset LORRAX_FFI_SO`" in text
@@ -86,7 +86,14 @@ def test_stale_overrides_name_the_unset(tmp_path):
     assert any("`unset LORRAX_ROOT`" in w for w in warn)
     ok = {"LORRAX_FFI_HOST_SO": str(here / "src/ffi/cpp/build_host/liblorrax_ffi_host.so"),
           "PYTHONPATH": str(here / "src")}
-    assert rank_setup.stale_overrides(ok, tree=here) == ([], [])
+    assert rank_setup.stale_overrides(ok, tree=here, venv_tree=here) == ([], [])
+    # one other tree on PYTHONPATH, imported by another tree's interpreter: refused unless
+    # LORRAX_CHECKOUT says the overlay is deliberate (lx)
+    over = {"PYTHONPATH": str(here / "src")}
+    refuse, _ = rank_setup.stale_overrides(over, tree=here, venv_tree=old)
+    assert refuse and "`unset PYTHONPATH`" in refuse[0]
+    over["LORRAX_CHECKOUT"] = str(here)
+    assert rank_setup.stale_overrides(over, tree=here, venv_tree=old) == ([], [])
 
 
 def test_memory_rule_refuses_and_warns():

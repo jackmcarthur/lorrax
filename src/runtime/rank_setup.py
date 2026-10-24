@@ -232,8 +232,19 @@ def _bundle_abi(lib: Path) -> int | None:
     return None
 
 
-def stale_overrides(env=os.environ, tree: Path = _TREE) -> tuple[list[str], list[str]]:
+def _venv_tree(prefix: str | None = None) -> Path | None:
+    """The LORRAX tree whose ``.venv`` this interpreter is (``<tree>/.venv``), if any."""
+    p = Path(prefix or sys.prefix)
+    if p.name == ".venv" and (p.parent / "src" / "runtime" / "__init__.py").is_file():
+        return p.parent
+    return None
+
+
+def stale_overrides(env=os.environ, tree: Path = _TREE,
+                    venv_tree: Path | None | str = "auto") -> tuple[list[str], list[str]]:
     """``(refusals, warnings)``: environment overrides that point at another tree or ABI."""
+    if venv_tree == "auto":
+        venv_tree = _venv_tree()
     refuse: list[str] = []
     warn: list[str] = []
     abi = _abi_of_tree(tree)
@@ -263,6 +274,14 @@ def stale_overrides(env=os.environ, tree: Path = _TREE) -> tuple[list[str], list
         fix = f"export PYTHONPATH={':'.join(kept)}" if kept else "unset PYTHONPATH"
         refuse.append(f"PYTHONPATH names another LORRAX source tree ({', '.join(others)}) than the "
                       f"one this process imports ({tree / 'src'}), so modules can come from both: `{fix}`")
+    elif (venv_tree is not None and Path(venv_tree).resolve() != tree.resolve()
+          and any(Path(x).expanduser().resolve() == (tree / "src").resolve() for x in pp)
+          and Path(env.get("LORRAX_CHECKOUT", "") or "/nonexistent").resolve() != tree.resolve()):
+        kept = [x for x in pp if Path(x).expanduser().resolve() != (tree / "src").resolve()]
+        fix = f"export PYTHONPATH={':'.join(kept)}" if kept else "unset PYTHONPATH"
+        refuse.append(f"PYTHONPATH makes the interpreter of {venv_tree} import the source of another tree "
+                      f"({tree / 'src'}): `{fix}` (or, for a deliberate overlay, "
+                      f"`export LORRAX_CHECKOUT={tree}`)")
     root = env.get("LORRAX_ROOT", "").strip()
     if root:
         r = Path(root).expanduser()
