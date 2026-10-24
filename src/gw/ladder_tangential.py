@@ -76,6 +76,7 @@ def make_ladder_tangential_source(wfns, V_q, *, quad, e_ref, sym,
             state["solver"] = _solver_accuracy(meta.tangential_recipe)
             from bse.w_ladder import (LADDER_RESPONSE_CONVENTION,
                                       ladder_static_head_identity)
+            from bse.bse_preconditioner import exchange_spin_weight
             from .response_bank import operator_digest
             static = prepare_ladder_restart(
                 wfns, V_q, quad=quad, e_ref=e_ref, sym=sym,
@@ -85,6 +86,8 @@ def make_ladder_tangential_source(wfns, V_q, *, quad, e_ref, sym,
                 print_fn=print_fn)
             state["identity"] = dict(screening_diagrams="w_bse",
                 ladder_response_convention=LADDER_RESPONSE_CONVENTION,
+                ladder_density_channel="charge",
+                ladder_exchange_spin_weight=exchange_spin_weight(int(meta.nspinor), "singlet"),
                 ladder_static_w_sha256=operator_digest(static, mesh_xy, cache=False),
                 ladder_static_head=ladder_static_head_identity(
                     tensors_filename, config.input_file, cell_volume=meta.cell_volume),

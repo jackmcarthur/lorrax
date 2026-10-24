@@ -186,7 +186,8 @@ def spin_kernel(params: dict, named: set, wfn_path: str) -> dict:
     term is always on unless ``local_fields = true`` (D + w V, the RPA with local
     fields), which is never the default.  Returns ``{"include_w", "channel",
     "label"}``; the channel only sets the scalar exchange weight
-    (``bse_preconditioner.set_exchange_channel``).
+    (``bse_preconditioner.exchange_spin_weight``), passed explicitly through
+    the payload and factory identity.
     """
     def flag(key):
         return key in named and as_bool(key, params[key])

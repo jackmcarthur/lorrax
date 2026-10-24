@@ -247,6 +247,7 @@ def solve_bse_sharded(
     with timing.section("bse.solve.matvec_build"):
         matvec_ring = build_bse_stack_matvec(
             mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
+            exchange_channel=data.get("exchange_channel", "singlet"),
             **({"head_tensor": True} if head_tensor is not None else {}),
         )
 
@@ -373,7 +374,8 @@ def solve_bse_sharded(
             with timing.section("bse.solve.exact_diag"):
                 _diag_H = build_bse_exact_diagonal(
                     eps_c, eps_v, psi_c_X, psi_v_Y, _W_q0, M, V_q0,
-                    nk, sharding=NamedSharding(mesh_xy, P("x", "y", None)))
+                    nk, sharding=NamedSharding(mesh_xy, P("x", "y", None)),
+                    exchange_channel=data.get("exchange_channel", "singlet"))
                 _diag_H.block_until_ready()
             _memoised = exact_diagonal_memo_stats()["hits"] > _memo_before
             log.info(f"Davidson preconditioner: EXACT diag(H) "
@@ -450,6 +452,7 @@ def solve_bse_sharded(
             # Q) names the run; the key adds everything the two programs close over.
             plan_key=(None if davidson_plan_key is None else (
                 davidson_plan_key, mesh_xy, bool(include_W), head_tensor is not None,
+                data.get("exchange_channel", "singlet"),
                 davidson_precond, bool(davidson_olsen), float(davidson_eps_shift_Ry),
                 tuple((tuple(a.shape), str(a.dtype)) for a in operator_data))),
             data=solver_data,

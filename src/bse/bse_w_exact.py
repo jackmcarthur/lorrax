@@ -100,7 +100,7 @@ def _build_rpa_resolvent(mesh_xy: Mesh, data: dict):
     matvec = build_bse_ring_matvec_full(
         mesh_xy, nkx, nky, nkz, include_W=False, screening=True)
     diag_h = build_preconditioner_diagonal_sharded(
-        data, mesh_xy, include_W=False, use_tda=False)
+        data, mesh_xy, include_W=False, use_tda=False, exchange_channel="singlet")
     gen = build_realspace_random_transition_generator(
         mesh_xy, nkx, nky, nkz, int(data["n_cond_pad"]), int(data["n_val_pad"]))
     snapshot = build_density_snapshot_operator(

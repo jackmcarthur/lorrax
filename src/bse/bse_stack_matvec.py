@@ -869,6 +869,7 @@ def build_bse_stack_matvec(
     *,
     kernel: str = "bse",
     head_tensor: bool = False,
+    exchange_channel: str = "singlet",
 ):
     """Build the trial-stack BSE matvec.
 
@@ -938,7 +939,7 @@ def build_bse_stack_matvec(
         # Encode k-SUMMED S = M† X, U = V_q0 S, decode M U broadcast over k —
         # all against the rank's own (c, v) tile; ``_exchange_U`` holds the two
         # (b, μ) psums.
-        w_x = exchange_spin_weight(psi_c_X.shape[2])
+        w_x = exchange_spin_weight(psi_c_X.shape[2], exchange_channel)
         VX = v_term(X, M, V_q0, w_x / sqrt_nk, 1.0 / sqrt_nk)
 
         if head_tensor:
@@ -988,6 +989,7 @@ def build_bse_stack_pair_matvec(
     *,
     kernel: str = "bse",
     fuse: bool = True,
+    exchange_channel: str = "singlet",
 ):
     """Build the real-linear pair applier ``pair(X, s, …) = A·X + s·B·conj(X)``.
 
@@ -1103,7 +1105,7 @@ def build_bse_stack_pair_matvec(
         #    Both encodes and the decode are local on the transition layout
         #    (``_make_v_term``); one V_q0 solve serves both blocks.
         VX = v_pair(X, Xb, sc, M, V_q0,
-                    exchange_spin_weight(psi_c_X.shape[2]) / sqrt_nk, 1.0 / sqrt_nk)
+                    exchange_spin_weight(psi_c_X.shape[2], exchange_channel) / sqrt_nk, 1.0 / sqrt_nk)
 
         if not include_W:
             return D_term + VX
@@ -1130,6 +1132,7 @@ def build_bse_stack_matvec_full(
     nkz: int,
     *,
     kernel: str = "bse",
+    exchange_channel: str = "singlet",
 ):
     """Build the optical full-BSE matvec ``[X; Y] -> H [X; Y]`` on the pair applier.
 
@@ -1154,7 +1157,8 @@ def build_bse_stack_matvec_full(
     ``kernel='rpa'`` drops ``W`` and ``W^B`` (``A = D + V``, ``B = V^B``).
     """
     sh = make_bse_shardings(mesh_xy)
-    pair = build_bse_stack_pair_matvec(mesh_xy, nkx, nky, nkz, kernel=kernel)
+    pair = build_bse_stack_pair_matvec(mesh_xy, nkx, nky, nkz, kernel=kernel,
+                                     exchange_channel=exchange_channel)
 
     def _full(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M):
         X, Yc = X_full[0], jnp.conj(X_full[1])

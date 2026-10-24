@@ -29,7 +29,7 @@ from runtime.run_session import RunSession
 from .bse_deck import (DeckError, Key, check_dipole_operator, check_fine_grid_keys, deck_params,
                        deck_source, eqp_file, key_of, note_extended_kernel, omega_count,
                        read_settings, spin_kernel)
-from .bse_preconditioner import bgw_spin_kernel, set_exchange_channel
+from .bse_preconditioner import bgw_spin_kernel
 from .bse_ring_comm import (
     create_mesh_2d,
     create_mesh_xy_from_flags,
@@ -369,7 +369,8 @@ def _preview_lanczos(
                                        else qp_rotation["path"]),
                     dipole_attrs=dipole_attrs,
                     k_shift=tuple(data.get("k_shift", (0.0, 0.0, 0.0))),
-                    spin_kernel=bgw_spin_kernel(int(data["psi_c_X"].shape[2]), include_W),
+                    spin_kernel=bgw_spin_kernel(int(data["psi_c_X"].shape[2]), include_W,
+                                               channel=data.get("exchange_channel", "singlet")),
                     wfn_path=_parse_wfn_path(input_file),
                     wfn_grid=not data["densified"],
                 )
@@ -381,7 +382,8 @@ def _preview_lanczos(
     roots_files = _write_all_roots(
         input_file, energies_ev, dipoles, nk,
         polarization=(spectrum or haydock or {}).get("polarization"),
-        triplet=bgw_spin_kernel(int(data["psi_c_X"].shape[2]), include_W) == 0)
+        triplet=bgw_spin_kernel(int(data["psi_c_X"].shape[2]), include_W,
+                               channel=data.get("exchange_channel", "singlet")) == 0)
     spectrum_files = []
     if dipoles is not None and spectrum is not None:
         # BerkeleyGW's absorption_eh.dat / absorption_noeh.dat from the solved
@@ -1009,7 +1011,6 @@ def _deck_settings(input_file, parser):
         args.rpa, args.spin_channel = not kernel["include_w"], kernel["channel"]
         args.kernel_label = kernel["label"]
         args.kernel_name = "spinor" if kernel["nspinor"] == 2 else kernel["channel"]
-        set_exchange_channel(kernel["channel"])
         note_extended_kernel(params, named, log)
     except DeckError as exc:
         parser.error(str(exc))

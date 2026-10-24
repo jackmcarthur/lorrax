@@ -19,7 +19,7 @@ from .bse_densify import (_interpolate_bse_data_to_grid,
                           _resolve_kgrid_fine_shift,
                           resolve_w_head_densify)
 from .bse_head import _inject_q0_head, _resolve_head_params
-from .bse_preconditioner import compute_pair_amplitude
+from .bse_preconditioner import compute_pair_amplitude, exchange_spin_weight
 from .bse_window import (PAD_EPS_GUARD_RY, _log0, _parse_wfn_path, resolve_n_occ,
                          assert_bse_window_in_zeta_training)
 from file_io.restart_bundle import (apply_eqp_corrections)
@@ -146,8 +146,14 @@ def load_bse_data_from_restart_sharded(
     q0_head: str = "rank1",
     need_W: bool = True,
     coupling_legs: bool = True,
+    exchange_channel: str | None = None,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_parent_y/enk_full).
+
+    ``exchange_channel`` is recorded in the returned plain-array bundle.
+    None resolves the existing optical deck choice, or singlet without a
+    deck. Density-screening callers explicitly select charge singlet; they
+    do not inherit an optical triplet choice from a shared input file.
 
     ``need_W=False`` (a kernel without the screened direct term: the RPA,
     ``local_fields``) never reads, rebuilds or densifies W: ``data["W_q"]`` is
@@ -224,6 +230,13 @@ def load_bse_data_from_restart_sharded(
     if native_grid_only and kgrid_fine is not None:
         raise ValueError("native_grid_only=True does not accept an explicit kgrid_fine; "
                          "choose the native restart grid or an optical fine grid")
+    if exchange_channel is None:
+        exchange_channel = "singlet"
+        if input_file is not None and os.path.isfile(input_file):
+            from .bse_deck import deck_params, spin_kernel
+            params, named = deck_params(input_file)
+            exchange_channel = spin_kernel(params, named, _parse_wfn_path(input_file))["channel"]
+    exchange_spin_weight(1, exchange_channel)  # validate before payload I/O
 
     from common.collectives import _require_addressable
     _require_addressable(mesh_xy, origin="BSE restart reader")
@@ -445,6 +458,7 @@ def load_bse_data_from_restart_sharded(
         "q0_head": q0_head,
         "q0_head_ry": q0_head_ry,
         "w_loaded": bool(need_W),
+        "exchange_channel": exchange_channel,
     }
     # The bundle holds the only references: the densifier pops the coarse W
     # and frees it once the fine W exists.

@@ -54,7 +54,7 @@ from .bse_w_exact import (
 )
 from common.collectives import gather_to_host
 
-LADDER_RESPONSE_CONVENTION = "physical-ra-exact-static-head-v2"
+LADDER_RESPONSE_CONVENTION = "physical-ra-charge-spin-static-head-v3"
 LADDER_INTERNAL_HEAD_POLICY = "screened-transfer-gamma-exact-diagonal-v1"
 
 
@@ -110,13 +110,14 @@ def build_ladder_resolvent(mesh_xy: Mesh, data: dict, *, include_w: bool = True,
     # False is the A/B arm.
     matvec = build_bse_ring_matvec_full(
         mesh_xy, nkx, nky, nkz, include_W=include_w, screening=True,
-        physical_branches=True, fuse_ladder_rung=fuse_ladder_rung)
+        physical_branches=True, fuse_ladder_rung=fuse_ladder_rung,
+        exchange_channel="singlet")
     diag_h = build_preconditioner_diagonal_sharded(
-        data, mesh_xy, include_W=include_w, use_tda=False)
+        data, mesh_xy, include_W=include_w, use_tda=False, exchange_channel="singlet")
     gen = build_realspace_random_transition_generator(
         mesh_xy, nkx, nky, nkz, int(data["n_cond_pad"]), int(data["n_val_pad"]))
     snapshot = build_density_snapshot_operator(
-        mesh_xy, nkx, nky, nkz, scatter_nu_on_y=True)
+        mesh_xy, nkx, nky, nkz, scatter_nu_on_y=True, exchange_channel="singlet")
     return matvec, diag_h, gen, snapshot, make_bse_shardings(mesh_xy)
 
 
@@ -550,7 +551,7 @@ def sweep_q_wedge(
             solve_dq["V_q0"] = zero_v
         diag_hq = build_preconditioner_diagonal_sharded(
             _psi_ring_view(solve_dq), mesh_xy,
-            include_W=include_w, use_tda=False)
+            include_W=include_w, use_tda=False, exchange_channel="singlet")
         if build_hook is not None:
             build_hook(iq, q, dq)
         return q, dq, solve_dq, diag_hq
@@ -745,7 +746,7 @@ def prepare_ladder_head(restart_path, mesh_xy, *, input_file, head_dipole_path,
             restart_path, n_val=10**9, n_cond=10**9, mesh_xy=mesh_xy,
             input_file=input_file, inject_head=False, inject_w_head=include_w,
             q0_head="diagonal", load_v_full=False, native_grid_only=True,
-            need_W=include_w)
+            need_W=include_w, exchange_channel="singlet")
         # This Gamma-only payload is owned here. Supplied data is borrowed,
         # including a body's already prepared W_R, and is never donated here.
         if include_w:
@@ -912,7 +913,7 @@ def compute_wc_qwedge(
         restart_path, n_val=10**9, n_cond=10**9, mesh_xy=mesh_xy,
         input_file=input_file, inject_head=False, inject_w_head=include_w,
         q0_head="diagonal", load_v_full=True, native_grid_only=True,
-        need_W=include_w)
+        need_W=include_w, exchange_channel="singlet")
     # The public facade owns this restart read; no caller can retain W_q.
     # Per-q diagonals and the optional later head share the small saved q=0
     # slice and this one W_R instead of keeping both all-q representations.

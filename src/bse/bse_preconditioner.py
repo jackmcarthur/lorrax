@@ -18,22 +18,7 @@ def compute_pair_amplitude(psi_c: jax.Array, psi_v: jax.Array) -> jax.Array:
     return jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c), psi_v)
 
 
-#: The exchange channel of a non-spinor run, set once by the driver before any
-#: matvec is built (``set_exchange_channel``): ``singlet`` (BerkeleyGW's
-#: ``spin_singlet``, the default) or ``triplet`` (``spin_triplet``).  It only
-#: changes the scalar :func:`exchange_spin_weight`; every spin case runs the
-#: same matvec, precision, batching and memory path.
-_EXCHANGE_CHANNEL = ["singlet"]
-
-
-def set_exchange_channel(channel: str) -> None:
-    """Select the non-spinor exchange channel (``singlet`` or ``triplet``) for this process."""
-    if channel not in ("singlet", "triplet"):
-        raise ValueError(f"exchange channel {channel!r}: want singlet or triplet")
-    _EXCHANGE_CHANNEL[0] = channel
-
-
-def bgw_spin_kernel(nspinor: int, include_w: bool = True) -> int:
+def bgw_spin_kernel(nspinor: int, include_w: bool = True, *, channel="singlet") -> int:
     """BerkeleyGW's ``spin_kernel`` (``Common/nrtype.f90`` ``BSE_KERNEL_*``) of this
     run: 3 spinor (whatever the kernel, as ``BSE/input_fi.f90`` forces it),
     2 local fields, 0 triplet, 1 singlet."""
@@ -41,16 +26,18 @@ def bgw_spin_kernel(nspinor: int, include_w: bool = True) -> int:
         return 3
     if not include_w:
         return 2
-    return 0 if _EXCHANGE_CHANNEL[0] == "triplet" else 1
+    return 0 if exchange_spin_weight(nspinor, channel) == 0 else 1
 
 
-def exchange_spin_weight(nspinor: int) -> float:
+def exchange_spin_weight(nspinor: int, channel: str = "singlet") -> float:
     """Spin weight of the bare-Coulomb exchange channel: 2 scalar singlet, 0 scalar
     triplet, 1 spinor.
 
     The triplet of a spin-restricted scalar run has no exchange (BerkeleyGW's
-    ``spin_triplet``); the channel is :func:`set_exchange_channel`'s.  A spinor
-    run has one kernel, weight 1.
+    ``spin_triplet``). The channel is explicit structural input to every
+    optical factory and diagonal cache. Charge screening always requests
+    singlet; a spinor run has one kernel, weight 1. No process-global state
+    may select a Hamiltonian at JIT trace time.
 
     This is the single owner of the textbook singlet split, ``D + 2V - W`` for a
     spin-restricted scalar run (``nspinor == 1``) against ``D + V - W`` for spinors
@@ -66,9 +53,11 @@ def exchange_spin_weight(nspinor: int) -> float:
     measured against a dense reference that also lacked the weight. Spinor runs
     were never affected.
     """
+    if channel not in ("singlet", "triplet"):
+        raise ValueError(f"exchange channel {channel!r}: want singlet or triplet")
     if int(nspinor) != 1:
         return 1.0
-    return 0.0 if _EXCHANGE_CHANNEL[0] == "triplet" else 2.0
+    return 0.0 if channel == "triplet" else 2.0
 
 
 def energy_diff_cv_k(eps_c: jax.Array, eps_v: jax.Array) -> jax.Array:
