@@ -205,7 +205,7 @@ print(*(ctypes.c_int.in_dll(lib, f"mpiabi_version_{part}").value
 PY
 )
 if (( ABI_MAJOR != 2 || ABI_MINOR < 9 )); then
-    echo "[build_mpiw.pm] ERROR: MPI ABI $ABI_MAJOR.$ABI_MINOR.$ABI_PATCH is incompatible with JAX 0.9.1 (needs 2.x, x >= 9)" >&2
+    echo "[build_mpiw.pm] ERROR: MPI ABI $ABI_MAJOR.$ABI_MINOR.$ABI_PATCH is incompatible with the JAX CPU runtime (needs 2.x, x >= 9)" >&2
     exit 1
 fi
 if [[ "$ABI_MAJOR.$ABI_MINOR.$ABI_PATCH" != "$LORRAX_MPIWRAPPER_ABI_DEFAULT" ]]; then

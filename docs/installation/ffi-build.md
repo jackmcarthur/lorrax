@@ -41,8 +41,8 @@ None of these are declared in `pyproject.toml` except `nvidia-mathdx`.
 | dependency | minimum | leg |
 |---|---|---|
 | NVIDIA GPU | sm_80 | CUDA |
-| CUDA toolkit | 12.x or 13.x, the same major as the JAX wheel (the `cuda12` or `cuda13` extra); Perlmutter uses 13.2 | CUDA |
-| JAX and jaxlib | 0.9.x ([the JAX contract](index.md#jax)); the XLA FFI headers come from the JAX that will load the library | both |
+| CUDA toolkit | 12.x or 13.x, the same major as the JAX wheel (the `cuda12` or `cuda13` extra); Perlmutter builds with the locked CUDA-13 wheels | CUDA |
+| JAX and jaxlib | 0.12.x ([the JAX contract](index.md#jax)); the XLA FFI headers come from the JAX that will load the library | both |
 | cuSOLVERMp | 0.7 (NCCL-native); 0.8 and later need NCCL ≥ 2.27 | CUDA |
 | cuBLASMp | the version staged with cuSOLVERMp | CUDA |
 | parallel HDF5 | 1.12, built with `HDF5_IS_PARALLEL` | both |
@@ -139,18 +139,17 @@ also needs) and the LibSci that links it,
 `cray-libsci/25.09.0`, with darshan unloaded. To move to another MPI, change
 that file only.
 
-- **Host leg.** `build_ffi_host.sh` runs bare metal under `PrgEnv-gnu`: it
-  pins the MPI, loads `cray-hdf5-parallel/1.14.3.7`, captures the LibSci and
-  cray-fftw prefixes and unloads those modules (with `craype-accel-nvidia80`
-  and `cudatoolkit`) before CMake runs, so the compiler wrapper cannot inject
-  a second BLAS or link FFTW. It passes the LibSci ScaLAPACK link line
-  explicitly (CMake's probe expects an MKL layout) with the measured `_mp`
-  threading flavour (`LORRAX_PM_LIBSCI_FLAVOUR`).
-- **CUDA leg.** `build_ffi_cuda.sh` builds against `cudatoolkit/13.2` and the
-  clone's `uv sync --extra cuda13` venv, with plain GCC rather than the Cray
-  `cc` wrapper (with `craype-accel-nvidia80` loaded the wrapper injects the
-  CUDA-12 `libmpi_gtl_cuda`). It stages cuSOLVERMp 0.9.1 and cuBLASMp 0.10
-  from their wheels under `LORRAX_BUILD_PREFIX` (default `<clone>/.build`).
+- **Host leg.** `build_ffi_host.sh` uses plain GCC and the
+  `perlmutter-host` CMake preset. `config/perlmutter/ffi_site.cmake` supplies
+  explicit paths to the pinned MPI, HDF5 and threaded LibSci `_mp` pair;
+  the Cray compiler wrapper cannot inject another BLAS or GPU library.
+  FFTW remains a run-time `dlopen` hint, never a linked dependency. A CPU-only
+  `uv sync` supplies the same JAX FFI headers without CUDA packages.
+- **CUDA leg.** `build_ffi_cuda.sh` uses the `perlmutter-cuda` preset, plain
+  GCC and nvcc from the clone's `uv sync --extra cuda13` venv. No
+  `cudatoolkit` module supplies the build toolchain. cuSOLVERMp 0.9.1 and
+  cuBLASMp 0.10 come from that venv, with an engine-private link stage at
+  `<clone>/.build/cusolvermp`.
 - **Library search path.** Each leg's only search path is `$ORIGIN`, a
   `DT_RUNPATH`, so the run environment decides every machine library.
   `/opt/cray/pe/lib64` maps `libhdf5_parallel_gnu.so.310`, the LibSci

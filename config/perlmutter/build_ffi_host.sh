@@ -2,13 +2,13 @@
 # ============================================================================
 # build_ffi_host.sh — build liblorrax_ffi_host.so (the CUDA-free host-platform
 # FFI library) on NERSC Perlmutter: plain g++ against Cray MPICH, LibSci, HDF5.
-# Bare metal: no container, no venv, no staged compiler.
+# Bare metal: no container or staged compiler; JAX headers come from the venv.
 #
 #   config/perlmutter/build_ffi_host.sh [--fresh]
 #
 # Output: <checkout>/src/ffi/cpp/build_host/liblorrax_ffi_host.so, where
 #   ffi_loader.py looks by default (LORRAX_FFI_HOST_STAGE moves it).
-# Needs: `uv sync --extra cuda13` in this checkout (the venv's jaxlib supplies
+# Needs: `uv sync` in this checkout (the venv's jaxlib supplies
 #   the XLA FFI headers).
 #
 # This is the Perlmutter twin of config/frontera/build_ffi_host.sh.  The two
@@ -99,10 +99,6 @@
 set -euo pipefail
 
 # The checkout is the one this script lives in.  An exported LORRAX_ROOT is
-
-set -euo pipefail
-
-# The checkout is the one this script lives in.  An exported LORRAX_ROOT is
 # ignored on purpose: a shell that loaded a module setting it would otherwise
 # build that module's release snapshot instead of this checkout.
 LORRAX_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -129,7 +125,7 @@ source "$LORRAX_ROOT/config/perlmutter/ffi_mpi.sh"
 # ---------------------------------------------------------------------------
 [[ -x "$LORRAX_VENV_PY" ]] || {
     echo "[build_ffi_host] ERROR: no venv at $LORRAX_ROOT/.venv." >&2
-    echo "[build_ffi_host]   Run 'uv sync --extra cuda13' in $LORRAX_ROOT first." >&2
+    echo "[build_ffi_host]   Run 'uv sync' in $LORRAX_ROOT first (add --extra cuda13 for GPU runs)." >&2
     exit 2
 }
 # CMakePresets.json needs cmake >= 3.23 (the system cmake is older).

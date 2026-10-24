@@ -17,7 +17,7 @@ writes goes to one of these places:
 | what | default | move it with |
 |---|---|---|
 | the Python venv | `<clone>/.venv` | (the clone location) |
-| the cuSOLVERMp/cuBLASMp stage | `<clone>/.build` | `LORRAX_BUILD_PREFIX` |
+| the cuSOLVERMp/cuBLASMp link stage | `<clone>/.build/cusolvermp` | (the clone location) |
 | the two FFI libraries | `<clone>/src/ffi/cpp/build{,_host}/` | nothing; the loader looks there |
 | JAX compile cache, mathdx kernel cache | `$SCRATCH/.cache/lorrax/` | [`ISDF_JAX_CACHE_DIR`](../reference/env_vars.md) (compile cache only) |
 | the CUDA driver's JIT cache | `$SCRATCH/.nv/ComputeCache` once `gpu_env.sh` is sourced (CUDA's default is `~/.nv`) | `CUDA_CACHE_PATH` |
@@ -29,9 +29,9 @@ after a purge.
 
 ### 1.1 Environment
 
-Use a login shell with the site's default modules (`PrgEnv-gnu`,
-`cudatoolkit/13.2`). Each build script loads and pins the modules it needs;
-run scripts need none.
+Use a login shell with access to the site's pinned MPI, HDF5 and LibSci
+installs. The build presets name those libraries explicitly and use plain
+GCC; the CUDA compiler and math libraries come from the venv's locked wheels.
 
 ```bash
 export UV_CACHE_DIR=$SCRATCH/.cache/uv UV_PYTHON_INSTALL_DIR=$SCRATCH/.local/uv-python
@@ -45,7 +45,7 @@ cd $SCRATCH/lorrax
 uv sync --extra cuda13
 ```
 
-`--extra cuda13` installs the CUDA-13 JAX 0.9 wheels and `nvidia-mathdx`,
+`--extra cuda13` installs the CUDA-13 JAX 0.12 wheels and `nvidia-mathdx`,
 which every k-axis convolution needs on an NVIDIA GPU. Plain `uv sync`
 installs CPU JAX only. uv downloads its own Python 3.12; the sync takes about
 30 s.
