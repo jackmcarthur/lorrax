@@ -273,7 +273,8 @@ def test_streamed_facade_releases_all_moments_after_first_sample():
     assert len(consumed)==2 and consumed[0] is not consumed[1]
     assert len(load_policies) == 2
     assert all(policy["inject_head"] is False and policy["inject_w_head"] is True
-               and policy["q0_head"] == "diagonal" for policy in load_policies)
+               and policy["q0_head"] == "diagonal" and policy["native_grid_only"] is True
+               for policy in load_policies)
     np.testing.assert_array_equal(materialized.wc, np.stack(seen))
     for name in ("M0", "M1", "M2", "M3"):
         assert materialized.response_fields[name].shape == (2, 8, 8)

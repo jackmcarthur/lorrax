@@ -126,6 +126,7 @@ def load_bse_data_from_restart_sharded(
     inject_head: bool = True,
     inject_w_head: bool | None = None,
     load_v_full: bool = False,
+    native_grid_only: bool = False,
     kgrid_fine=None,
     w_head_densify=None,
     w_head_gamma_cell: str = "fine",
@@ -174,6 +175,10 @@ def load_bse_data_from_restart_sharded(
     ``None`` the value is read from the cohsex.in ``kgrid_fine`` key (via
     ``input_file``); unset or == the coarse grid → the coarse bundle is
     returned byte-identically (fast path untouched).
+    ``native_grid_only=True`` loads the restart grid without consulting BSE
+    fine-grid/shift settings. The GW density ladder uses this to preserve
+    the native GW response grid even when the deck also configures a later
+    interpolated optical calculation. Optical readers keep the default False.
 
     ``eqp_file`` (``eqp_corrections``) enters the htransform on the densified path, so
     the fine ε are quasiparticle; ``data["densified"]`` tells the caller
@@ -216,6 +221,9 @@ def load_bse_data_from_restart_sharded(
     """
     if mesh_xy is None:
         raise ValueError("mesh_xy is required for sharded load")
+    if native_grid_only and kgrid_fine is not None:
+        raise ValueError("native_grid_only=True does not accept an explicit kgrid_fine; "
+                         "choose the native restart grid or an optical fine grid")
 
     from common.collectives import _require_addressable
     _require_addressable(mesh_xy, origin="BSE restart reader")
@@ -250,8 +258,8 @@ def load_bse_data_from_restart_sharded(
     # injection, because C1 (the default) hands the densifier the
     # head-EXCLUDED body and re-attaches the head per fine q afterwards, so on
     # a densifying run the rank-1 whead must NOT go on now.
-    fine_grid = _resolve_kgrid_fine(kgrid_fine, input_file)
-    fine_shift = _resolve_kgrid_fine_shift(input_file)
+    fine_grid = None if native_grid_only else _resolve_kgrid_fine(kgrid_fine, input_file)
+    fine_shift = (0., 0., 0.) if native_grid_only else _resolve_kgrid_fine_shift(input_file)
     if fine_grid is None and any(fine_shift):
         raise ValueError("kgrid_fine_shift shifts kgrid_fine, which the deck does not set")
     densify_pending = (fine_grid is not None

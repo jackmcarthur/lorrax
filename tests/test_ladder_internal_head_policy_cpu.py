@@ -6,12 +6,13 @@ import numpy as np
 import pytest
 
 
-def test_shared_loader_separates_external_and_internal_head_without_changing_defaults(monkeypatch):
+def test_shared_loader_separates_external_and_internal_head_without_changing_defaults(monkeypatch, tmp_path):
     import inspect
     import jax
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from bse.bse_loading import load_bse_data_from_restart_sharded as load
+    from bse import bse_loading
     from bse.bse_head import _inject_q0_head
     from file_io import restart_bundle
     from common.collectives import device_put_process_local
@@ -39,11 +40,31 @@ def test_shared_loader_separates_external_and_internal_head_without_changing_def
     np.testing.assert_array_equal(selected["eps_c"], [[.5]])
     # Existing optical defaults still inject both channels through one owner.
     assert inspect.signature(load).parameters["inject_w_head"].default is None
+    assert inspect.signature(load).parameters["native_grid_only"].default is False
     legacy = read()
     vg, wg, _, _ = _inject_q0_head(v, w, jnp.asarray(g0), jnp.asarray(g0),
                                   31., jnp.array([18.+0j]), 20., w0_ready=True, nk=1)
     np.testing.assert_array_equal(legacy["V_q0"], vg)
     np.testing.assert_array_equal(legacy["W_q"], wg)
+    # A later optical grid in the same deck cannot change GW's native ladder.
+    deck = tmp_path / "combined_gw_bse.in"
+    deck.write_text("[cohsex]\nsys_dim = 3\nkgrid_fine = 7 7 1\nkgrid_fine_shift = .5 .25 0\n")
+    with monkeypatch.context() as scoped:
+        class OpticalDispatch(Exception):
+            pass
+        def optical_dispatch(_data, fine_grid, *_args, **kwargs):
+            assert fine_grid == (7, 7, 1) and kwargs["fine_shift"] == (.5, .25, 0.)
+            raise OpticalDispatch
+        scoped.setattr(bse_loading, "_interpolate_bse_data_to_grid", optical_dispatch)
+        native = read(inject_head=False, inject_w_head=True, q0_head="diagonal",
+                      native_grid_only=True, input_file=str(deck))
+        assert native["densified"] is False and native["k_shift"] == (0., 0., 0.)
+        for key in ("W_q", "V_q0", "eps_c", "eps_v", "psi_c_X", "psi_v_X"):
+            np.testing.assert_array_equal(native[key], selected[key])
+        with pytest.raises(OpticalDispatch):
+            read(inject_head=False, inject_w_head=True, q0_head="diagonal", input_file=str(deck))
+    with pytest.raises(ValueError, match="native_grid_only=True.*explicit kgrid_fine"):
+        read(native_grid_only=True, kgrid_fine=(7, 7, 1))
     with pytest.raises(ValueError, match="bse_screened_head"):
         read(inject_head=False, inject_w_head=True, need_W=False)
     header["screened_head"] = None

@@ -568,6 +568,9 @@ dipole normalization remain unchanged. The external bare head stays omitted
 until the existing macroscopic completion. The bank identity binds the actual
 screened scalar, volume, k grid, G=0 vector and this policy as well as the
 static dense body. Older banks must be rebuilt, without metadata migration.
+The density ladder explicitly loads the native GW restart grid. Optional
+`kgrid_fine` and `kgrid_fine_shift` settings for a later optical calculation
+in the same deck do not change its response manifold or normalization.
 
 ### Samples, slopes and moments
 
