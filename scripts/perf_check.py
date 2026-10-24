@@ -587,13 +587,7 @@ def _sample():
 th = threading.Thread(target=_sample, daemon=True)
 th.start()
 
-# --- 6: the fixed compile set ----------------------------------------------------
-n = 192
-key = np.random.default_rng(0)
-c = (key.standard_normal((n, n)) + 1j * key.standard_normal((n, n)))
-h = c + c.conj().T
-v = key.standard_normal(4096)
-x3 = key.standard_normal((32, 32, 32)) + 0j
+# --- 6: the fixed compile set: 12 program shapes x 3 sizes = 36 programs ----------
 def f_gemm(a, b): return (a @ b @ a.conj().T).trace()
 def f_fft(x): return jnp.abs(jnp.fft.ifftn(jnp.fft.fftn(x) * 2.0)).sum()
 def f_eigh(h): w, U = jnp.linalg.eigh(h); return w.sum() + jnp.abs(U[:, :4]).sum()
@@ -601,8 +595,9 @@ def f_scan(x):
     def body(cc, xi):
         cc = jnp.tanh(cc * 1.01 + xi)
         return cc, jnp.exp(-cc * cc).sum()
-    return lax.scan(body, x[:64], x.reshape(64, 64))[1].sum()
+    return lax.scan(body, x[:64], x.reshape(-1, 64))[1].sum()
 def f_cg(A, b):
+    n = A.shape[0]
     A = A.real @ A.real.T + n * jnp.eye(n)
     def cond(s): return s[3] < 25
     def body(s):
@@ -622,7 +617,8 @@ def f_elem(x):
     z = jnp.where(y > 0, jnp.arctan2(y, x + 1.5), jax.scipy.special.erfc(x))
     return (z * jnp.cos(3 * z) + jnp.expm1(-jnp.abs(z))).sum()
 def f_solve(A, b):
-    As = jnp.stack([A.real + (k + n) * jnp.eye(n) for k in range(4)])
+    n = A.shape[0]
+    As =jnp.stack([A.real + (k + n) * jnp.eye(n) for k in range(4)])
     return jax.vmap(jnp.linalg.solve)(As, jnp.stack([b] * 4)).sum()
 def f_einsum(a, b): return jnp.einsum("ij,jk,kl->il", a, b, a).real.sum() + jnp.einsum("ii", b).real
 def f_scatter(x):
@@ -634,10 +630,18 @@ def f_grad(w):
         return (hcur ** 2).sum() + jnp.sin(w).sum()
     return jax.grad(loss)(w).sum()
 def f_qr(a): q, r = jnp.linalg.qr(a); return jnp.abs(jnp.diag(r)).sum() + jnp.abs(q[0]).sum()
-SET = [("gemm", f_gemm, (c, c)), ("fft", f_fft, (x3,)), ("eigh", f_eigh, (h,)),
-       ("scan", f_scan, (v,)), ("cg", f_cg, (c, v[:n])), ("sort", f_sort, (v,)),
-       ("elem", f_elem, (v,)), ("solve", f_solve, (c, v[:n])), ("einsum", f_einsum, (c, h)),
-       ("scatter", f_scatter, (v,)), ("grad", f_grad, (v,)), ("qr", f_qr, (c,))]
+key = np.random.default_rng(0)
+SET = []
+for n, nv, n3 in ((96, 2048, 16), (160, 4096, 24), (224, 8192, 32)):
+    c = key.standard_normal((n, n)) + 1j * key.standard_normal((n, n))
+    h = c + c.conj().T
+    v = key.standard_normal(nv)
+    x3 = key.standard_normal((n3, n3, n3)) + 0j
+    SET += [(f"gemm{n}", f_gemm, (c, c)), (f"fft{n3}", f_fft, (x3,)), (f"eigh{n}", f_eigh, (h,)),
+            (f"scan{nv}", f_scan, (v,)), (f"cg{n}", f_cg, (c, v[:n])), (f"sort{nv}", f_sort, (v,)),
+            (f"elem{nv}", f_elem, (v,)), (f"solve{n}", f_solve, (c, v[:n])),
+            (f"einsum{n}", f_einsum, (c, h)), (f"scatter{nv}", f_scatter, (v,)),
+            (f"grad{nv}", f_grad, (v,)), (f"qr{n}", f_qr, (c,))]
 args_dev = {nm: tuple(jax.device_put(a, dev) for a in args) for nm, _, args in SET}
 per = {}
 tc = T()
@@ -646,13 +650,11 @@ for nm, f, _ in SET:
     exe = jax.jit(f).lower(*args_dev[nm]).compile()
     per[nm] = T() - t1
     jax.block_until_ready(exe(*args_dev[nm]))
-out["compile_s"] = T() - tc
+out["compile_wall_s"] = T() - tc
+out["compile_s"] = sum(per.values())
+out["programs"] = len(per)
+out["s_per_program"] = out["compile_s"] / len(per)
 out["compile_per"] = per
-out["cache_events"] = dict(events)
-try:
-    out["cache_stats"] = JCC.compile_cache_stats()
-except Exception as e:
-    out["cache_stats_error"] = str(e)
 
 # --- 6/3: one NVRTC kernel (a k-grid no store ships) + one FFI call ------------
 nvrtc = {}
@@ -681,6 +683,13 @@ if gpu:
     except Exception as e:
         nvrtc["error"] = f"{type(e).__name__}: {e}"[:600]
 out["nvrtc"] = nvrtc
+out["cache_events"] = dict(events)
+try:
+    st = JCC.compile_cache_stats()
+    st.pop("keys", None)
+    out["cache_stats"] = st
+except Exception as e:
+    out["cache_stats_error"] = str(e)
 stop.set()
 th.join(1)
 out["children"] = sorted(children)
@@ -1135,6 +1144,7 @@ def judge_bench(ranks: list[dict], ref: dict | None, kind: str) -> dict:
             return comp("6 benchmark", "FAIL", [f"rank {r['rank']} benchmark probe failed: {c['error']}"])
         nv = c.get("nvrtc") or {}
         cand = {"compile_cold_s": c.get("compile_s"), "compile_warm_s": w.get("compile_s"),
+                "s_per_program": c.get("s_per_program"),
                 "nvrtc_s": max(nv.get("build_s") or [0]) or None,
                 "gemm_tflops": c.get("gemm_tflops"), "fft_ms": c.get("fft_ms"),
                 "host_gemm_s": c.get("host_gemm_s")}
@@ -1148,7 +1158,12 @@ def judge_bench(ranks: list[dict], ref: dict | None, kind: str) -> dict:
     if not ref:
         lines.append(f"no reference for {kind}: benchmark reported, not judged")
         st = "INFO"
-    for k in ("compile_cold_s", "compile_warm_s", "nvrtc_s", "gemm_tflops", "fft_ms", "host_gemm_s"):
+    for k in ("compile_cold_s", "s_per_program", "compile_warm_s", "nvrtc_s", "gemm_tflops", "fft_ms",
+              "host_gemm_s"):
+        if k == "s_per_program":          # the same measurement as compile_cold_s, per program
+            if vals.get(k) is not None:
+                lines.append(f"cold XLA compile throughput {vals[k]:.3f} s/program (slowest rank)")
+            continue
         s, t = vs_ref(k, vals.get(k), ref or {}, higher_better=(k == "gemm_tflops"))
         if ref and s == "FAIL":
             st = "FAIL"
