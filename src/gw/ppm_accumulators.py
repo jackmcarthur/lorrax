@@ -146,6 +146,7 @@ _WINDOW_COMPILED = {}
 # R82 (remat cloned a counter-indexed read past the counter's in-place increment, which only
 # remat does): every counter read in the window's loops sits behind an optimization barrier,
 # and rematerialization is off for every program (runtime.disable_xla_rematerialization).
+# TODO(after-1.0-jax): A/B the XLA collective-overlap flags here; docs/dev/after_1.0_jax.md item 2.
 WINDOW_OVERLAP = {"xla_gpu_enable_latency_hiding_scheduler": True}
 
 #: Whether the Σ window pairs two τ nodes per trip, by ``lxkit`` leg key (no row:

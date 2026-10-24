@@ -1,3 +1,4 @@
+# TODO(after-1.0-jax): jax.profiler.ProfileSession (JAX 0.12); docs/dev/after_1.0_jax.md item 6.
 from __future__ import annotations
 
 import logging

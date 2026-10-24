@@ -183,6 +183,7 @@ this table resolves and that every published page is in the site navigation.
 | **how GW fixed-shape kernels avoid unused work** | [`GW kernels`](dev/gw_fixed_shape_kernels.md) | bracket scan, active pole counts and reusable postprocessing. |
 | **how to rename a deck key, flag, identifier or HDF5 name** | [Renaming](dev/renaming.md) | the rule (the table `src/runtime/renames.py` plus the sweep; an old deck key, value or flag refuses with "`old` is now `new`", old HDF5 names stay readable), the table's rows and converters, the procedure, its checks and how it lands on a moved main. |
 | **developer notes on one mechanism each** | [`device_put` all-gather](dev/device_put_hidden_allgather.md) · [FFI gate contract](dev/ffi_gate_contract.md) · [band-projection primitive](dev/staged_reshard_primitive.md) · [vendor GEMM handler](dev/vendor_gemm_service.md) | each page names its one source file and owns that mechanism's contract; none is a user page. |
+| **which JAX features are deferred to after 1.0** | [JAX features deferred to after 1.0](dev/after_1.0_jax.md) | the post-1.0 JAX 0.12 work (XLA-owned NCCL communicators, communication overlap, CPU batched LAPACK, hang diagnosis, FFI command buffers, profiler session), each tagged `TODO(after-1.0-jax)` at its code site, and what was considered and dropped. |
 
 `docs/dev/` holds the developer notes linked above. It is not part of the
 rendered site (`exclude_docs` in `mkdocs.yml`), so read those pages in a

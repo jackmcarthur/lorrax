@@ -27,6 +27,7 @@ from ._active_local import active_local_route
 #   P16; 2953, 2958) but stays off: +0.5 GB/rank unpriced (2953), and before 676eeb9a2 remat
 #   reordered a loop-counter read under it (2961).
 # Decides it: at P16 the band-panel exchange is most of a build (all-gathers 1.2 of 1.85 ms; 2949).
+# TODO(after-1.0-jax): overlap the next panel's gather with this GEMM; docs/dev/after_1.0_jax.md item 2.
 def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=False,
                  transa="N", transb="N", compiler_options=None):
     """Multiply face matrices by a batched 2-D SUMMA over bounded contraction panels.

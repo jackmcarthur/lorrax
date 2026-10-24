@@ -431,6 +431,9 @@ def _ring_sum_conduction(
 
 
 # ---------------------------------------------------------------------------
+# TODO(after-1.0-jax): overlap each ring ppermute with the stage's compute;
+# docs/dev/after_1.0_jax.md item 2.
+
 # WHY THE COUPLING (B) ENCODE CANNOT BE A TWO-STAGE RING LIKE THE A ENCODE
 # ---------------------------------------------------------------------------
 # A ring stage ``ppermute``s a buffer along one mesh axis and slices the
