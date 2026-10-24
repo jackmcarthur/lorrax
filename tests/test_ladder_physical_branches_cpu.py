@@ -176,7 +176,7 @@ def _materialize_physical(f, data, sh, mesh, q, include_w, apply=None):
         apply = build_bse_ring_matvec_full(mesh, f['nk'], 1, 1,
             include_W=include_w, physical_branches=True)
     out = np.asarray(apply(jax.device_put(jnp.asarray(trial), sh.X_full),
-                           *ladder_matvec_operands(dq)))
+                           *ladder_matvec_operands(dq,include_W=include_w)))
     valid = np.zeros((nc, nv, f['nk']), bool)
     valid[:f['nc'], :f['nv']] = True
     np.testing.assert_array_equal(out[:, :, ~valid], 0)
@@ -355,6 +355,96 @@ def _check_compiled_actions_and_head():
             for power in range(4):
                 np.testing.assert_allclose(result.moments[f'M{power}'],
                     C@np.linalg.matrix_power(H,power)@B/2, rtol=2e-11, atol=3e-14)
+
+
+def _check_internal_screened_head(ns, p):
+    """Literal complete-grid W_G0 equals the shared exact diagonal at all Q."""
+    import jax
+    from jax.sharding import Mesh
+    from unittest.mock import patch
+    from bse.bse_ring_comm import build_bse_ring_matvec_full
+    from bse.bse_feast import build_preconditioner_diagonal_sharded
+    from bse.bse_head import q0_head_diagonal
+    from bse.head_resolvent import zero_kernel_payload
+    from ffi.fft import xla_reference
+    jax.config.update('jax_enable_x64',True)
+    mesh=Mesh(np.array(jax.devices('cpu')[:p*p]).reshape(p,p),('x','y'))
+    f=fixture(ns)
+    whead=.6
+    h=q0_head_diagonal(whead,f['cell_volume'],f['nk'])
+    with xla_reference(),patch('common.contract_bands.bands_gemm_ffi_enabled',lambda:False):
+        body,sh=_production_payload(f,mesh)
+        exact=dict(body,q0_head='diagonal',q0_head_ry=h)
+        # Complete orthonormal orbital grid: g0_mu=1 gives literal exact
+        # overlaps. The independent full-orbital sums retain all four blocks.
+        headed=dict(f,W=f['W'].copy())
+        headed['W'][0]+=whead/f['cell_volume']*np.ones((f['nmu'],f['nmu']))
+        rank1,_=_production_payload(headed,mesh)
+        apply=build_bse_ring_matvec_full(mesh,f['nk'],1,1,include_W=True,physical_branches=True)
+        rpa_apply=build_bse_ring_matvec_full(mesh,f['nk'],1,1,include_W=False,physical_branches=True)
+        n=f['nc']*f['nv']*f['nk']
+        correction=np.diag(np.r_[np.full(n,-h),np.full(n,h)])
+        old_c=np.asarray(body['eps_c']).copy()
+        old_v=np.asarray(body['eps_v']).copy()
+        velocity,delta,_,_=head_fields(f)
+        for q in range(f['nk']):
+            before,_=_materialize_physical(f,body,sh,mesh,q,True,apply)
+            after,dq=_materialize_physical(f,exact,sh,mesh,q,True,apply)
+            full,_=_materialize_physical(headed,rank1,sh,mesh,q,True,apply)
+            literal=dense(headed,q)['H']
+            np.testing.assert_allclose(after-before,correction,atol=3e-14,rtol=3e-12)
+            np.testing.assert_allclose(after,full,atol=3e-14,rtol=3e-12)
+            np.testing.assert_allclose(after,literal,atol=3e-14,rtol=3e-12)
+            diag=np.asarray(build_preconditioner_diagonal_sharded(
+                dq,mesh,include_W=True,use_tda=False))[:,0,:f['nc'],:f['nv']].reshape(-1)
+            np.testing.assert_allclose(diag,np.diag(after),atol=3e-14,rtol=3e-12)
+            # Borrowing the SAME positive-head payload for a zero-direct
+            # control must remove both W_R and its separate diagonal head.
+            rpa_body,_=_materialize_physical(f,body,sh,mesh,q,False,rpa_apply)
+            rpa_headed,rpa_data=_materialize_physical(f,exact,sh,mesh,q,False,rpa_apply)
+            np.testing.assert_array_equal(rpa_headed,rpa_body)
+            rpa_diag=np.asarray(build_preconditioner_diagonal_sharded(
+                rpa_data,mesh,include_W=False,use_tda=False))[:,0,:f['nc'],:f['nv']].reshape(-1)
+            np.testing.assert_allclose(rpa_diag,np.diag(rpa_body),atol=3e-14,rtol=3e-12)
+        # Operator diagonals are corrected at operand assembly, not by
+        # changing the physical mean-field gaps used by velocity dipoles.
+        np.testing.assert_array_equal(np.asarray(exact['eps_c']),old_c)
+        np.testing.assert_array_equal(np.asarray(exact['eps_v']),old_v)
+        physical_delta=(np.asarray(exact['eps_c'])[:,:f['nc'],None]
+                        -np.asarray(exact['eps_v'])[:,None,:f['nv']])
+        np.testing.assert_array_equal(physical_delta,delta)
+        # The supplied velocity is unchanged; dividing it by these actual
+        # stored gaps therefore gives the same bare-DFT dipole.
+        np.testing.assert_array_equal(velocity/physical_delta[None],velocity/delta[None])
+        free=zero_kernel_payload(exact)
+        assert free['q0_head_ry']==0 and exact['q0_head_ry']==h
+
+
+def test_physical_internal_screened_head_matches_literal_all_blocks():
+    """P1/P4, complex Ns1/Ns2, finite Q, padded bands/mu, unchanged dipole gaps."""
+    import os
+    from pathlib import Path
+    import shlex
+    import subprocess
+    import sys
+    root=Path(__file__).resolve().parents[1]
+    env=dict(os.environ)
+    flags=[f for f in shlex.split(env.get('XLA_FLAGS',''))
+           if not f.startswith('--xla_force_host_platform_device_count')]
+    env.update(XLA_FLAGS=' '.join(flags+['--xla_force_host_platform_device_count=4']),
+               JAX_PLATFORMS='cpu',OPENBLAS_NUM_THREADS='1',
+               PYTHONPATH=str(root/'src')+os.pathsep+env.get('PYTHONPATH',''))
+    worker="""import runtime
+import runpy,sys
+ns=runpy.run_path(sys.argv[1])
+for spin in (1,2):
+    for mesh in (1,2):ns['_check_internal_screened_head'](spin,mesh)
+print('INTERNAL_W_HEAD:12 all-block controls PASS')
+"""
+    result=subprocess.run([sys.executable,'-c',worker,str(Path(__file__).resolve())],
+                          cwd=root,env=env,text=True,capture_output=True,timeout=120)
+    assert result.returncode==0,result.stdout+result.stderr
+    assert '12 all-block controls PASS' in result.stdout
 
 
 def test_physical_density_and_head_oracles():
