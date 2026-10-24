@@ -137,16 +137,21 @@ The native BSE uses six valence and eight conduction bands on the shifted
 Gaussian broadening. All 3,072 retained Tamm–Dancoff roots are requested.
 
 The additional `3-bse/3-lorrax_fully_rel/3-exciton-bands` stage keeps the same
-six-valence/eight-conduction window, with 64 lowest roots on a Gamma-centered
-`30 30 1` integration grid at each exciton momentum. Its full-path and
+six-valence/eight-conduction window, with 256 lowest roots on a Gamma-centered
+`24 24 1` integration grid at each exciton momentum. Its full-path and
 near-Gamma plots use LORRAX only. The full path has 25 Q points and a 0.25 meV
 Davidson budget; the separate near-Gamma scan keeps eight roots at 0.01 meV,
-with a distant K point retained for certification. The tutorial explicitly
+with eight steps from Gamma to `(0.003, 0, 0)`, twelve more to `(0.06, 0, 0)`
+and a distant K point retained for certification. The tutorial explicitly
 selects the existing 1 meV `visualization` exchange certificate: matched
 on-grid checks measured about 0.02 meV, above the stricter reference gate.
 The driver's `reference` default is unchanged. The [stage README](3-bse/3-lorrax_fully_rel/3-exciton-bands/README.md)
-explains the sampling, residuals and independent-particle threshold. Neither
-64-root continuum coverage nor 24 × 24 versus 30 × 30 convergence is assumed.
+explains the sampling, residuals and independent-particle threshold. The
+measured near-Gamma scan took 25 min 37 s on four Frontier GPU ranks;
+allow roughly three hours for the full path in a regular four-GPU allocation.
+Matched lowest-eight levels differ by up to 7.65 meV between the 24 × 24
+and 30 × 30 controls. Neither integration-grid convergence nor continuum
+coverage from the root count alone is assumed.
 
 Comparison
 ----------

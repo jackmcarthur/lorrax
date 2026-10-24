@@ -16,8 +16,8 @@ Instructions
 
 1. Finish the native GW calculation and run `../01-link_files.sh`. Read
    `gw.in`: it retains six valence and eight conduction bands, samples the
-   electron-hole sum on a Gamma-centered 30 × 30 × 1 grid, and requests
-   64 levels at each Q. The 48-band H-transform window includes the same
+   electron-hole sum on a Gamma-centered 24 × 24 × 1 grid, and requests
+   256 levels at each Q. The 48-band H-transform window includes the same
    conduction guards as the optical calculation.
 
 2. On the four-GPU allocation, run:
@@ -29,12 +29,19 @@ Instructions
 
    Inspect `exciton_bands.out`/`.log` and `near_gamma.out`/`.log`. The full
    path has 25 Q points: Gamma, four steps to `(0.05, 0, 0)`, seven to M,
-   six to K and seven back to Gamma. It requests 64 roots with a 0.25 meV
+   six to K and seven back to Gamma. It requests 256 roots with a 0.25 meV
    Davidson residual budget. The separate scan keeps eight roots with a
-   0.01 meV budget: 20 steps from Gamma to `(0.06, 0, 0)`, then K as an
-   on-grid certification anchor, for 22 Q points in total. Coordinates are
-   fractional reciprocal coordinates. Both use the same 30 × 30 × 1
+   0.01 meV budget: eight steps from Gamma to `(0.003, 0, 0)`, twelve more
+   to `(0.06, 0, 0)`, then K as an on-grid certification anchor, for 22 Q
+   points in total. Coordinates are fractional reciprocal coordinates.
+   Both use the same 24 × 24 × 1
    integration grid, six-valence/eight-conduction window and coarse QP data.
+
+   Use a regular four-GPU allocation with enough wall time for these scans.
+   Plan for roughly three hours for the full path, plus the near-Gamma scan;
+   the latter completed in 25 min 37 s from a cold launch on four Frontier
+   GPU ranks. The full-path estimate is a planning allowance, not a measured
+   benchmark for every machine.
 
 3. Source the shared tutorial environment and plot:
 
@@ -80,15 +87,23 @@ Calculation settings
 
 The fine integration grid controls the electron-hole sum. It does not
 replace the 3 × 3 × 1 screening data or establish convergence of that
-coarse calculation. Compare otherwise identical 24 × 24 and 30 × 30 scans
-before choosing a cheaper integration grid. The exchange certification above
-does not establish that integration-grid convergence. At each Q, check the
-highest requested level against the matched independent-particle threshold;
-64 roots are not assumed to reach the continuum.
+coarse calculation. Matched 24 × 24 and 30 × 30 near-Gamma scans differed
+by up to 7.65 meV among the lowest eight ordered levels at their four shared
+momenta; the maxima at Gamma and K were 7.14 and 5.78 meV. This exercise
+uses the cheaper 24 × 24 grid without claiming integration-grid convergence.
+The exchange certification above is a separate comparison. At each Q,
+check the highest requested level against the matched independent-particle
+threshold; requesting 256 roots does not itself certify continuum coverage.
 
 For a bright exciton doublet in two dimensions, long-range exchange can
 produce a leading linear term in |Q| for the longitudinal combination,
 while the transverse partner begins quadratically. Look for those shapes
-in the near-Gamma panel. These files contain energies without exciton
-eigenvectors or dipoles, so energy ordering alone does not identify a
-branch as longitudinal, transverse, bright or dark.
+in the near-Gamma panel. In the measured 24 × 24 scan, the lowest two
+ordered levels are consistent with quadratic fits over
+0.00086–0.03955 Å⁻¹ (RMS errors below 0.009 meV). The fourth and eighth
+levels rise by about 0.8 meV already at the first nonzero Q and require
+both linear and quadratic terms over the closest four points. The smallest
+shifts of the lowest levels are below the solver's resolution; these
+finite-window fits do not establish asymptotic coefficients. The files
+contain energies without exciton eigenvectors or dipoles, so ordering alone
+does not identify a branch as longitudinal, transverse, bright or dark.

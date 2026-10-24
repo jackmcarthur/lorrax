@@ -15,12 +15,12 @@ centroids_file = centroids.txt
 number_val_bands_fine = 6
 number_cond_bands_fine = 8
 number_cond_bands_coarse = 22
-kgrid_fine = 30 30 1
+kgrid_fine = 24 24 1
 eqp_co_corrections = eqp_co.dat
 dipole_file = dipole.h5
 wfn_fi_q_chunk = 128
 
-number_eigenvalues = 64
+number_eigenvalues = 256
 solver = davidson
 davidson_tol_mev = 0.25
 solver_max_iter = 200
