@@ -50,7 +50,7 @@ def test_single_matrix_native_promotion_preserves_triangles_and_reflector(monkey
 
 
 def test_single_matrix_window_and_workspace_price_are_the_same_owner(monkeypatch):
-    _jax, le = _owner()
+    jax, le = _owner()
     n = 3072
     row = le.batched_eigh_row((n, n), np.complex128, 'ROCM')
     assert row is not None and row.windows['complex128'].min_batch == 1
@@ -61,12 +61,13 @@ def test_single_matrix_window_and_workspace_price_are_the_same_owner(monkeypatch
     assert le.batched_workspace_bytes((1, n, n), np.complex128, 'ROCM') == expected
     from types import SimpleNamespace
     from distrib_la import workspace
+    from jax.sharding import Mesh
     monkeypatch.setattr(workspace, 'mesh_platform', lambda _mesh: 'ROCM')
-    mesh = SimpleNamespace(shape={'x': 1, 'y': 1})
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1,1),('x','y'))
     receipt = workspace._off_cuda(SimpleNamespace(mesh=mesh), 'eigh',
                                   ((n, n),), np.dtype(np.complex128))
     assert receipt['device_bytes'] == expected
-    assert 'rocSOLVER batched row' in receipt['formula']
+    assert 'local_eigh_workspace' in receipt['formula']
     for shape, dtype, platform in (((127, 127), np.complex128, 'ROCM'),
                                     ((3121, 3121), np.complex128, 'ROCM'),
                                     ((n, n), np.float64, 'ROCM'),
