@@ -17,6 +17,9 @@ def _fixture(tmp_path):
     venv = tmp_path / "selected venv"
     (venv / "bin").mkdir(parents=True)
     (venv / "bin/activate").write_text(":\n")
+    site_profile = tmp_path / "site profile.sh"
+    site_profile.write_text("export MODULEPATH=/site/modules
+")
     initialization = tmp_path / "shell_init.sh"
     initialization.write_text('''module() { :; }
 cmake() { printf '%s\\n' "$@" > "$PROBE_ROOT/cmake.args"; return 73; }
@@ -39,6 +42,7 @@ fi
     env = dict(os.environ, BASH_ENV=str(initialization), PROBE_ROOT=str(root),
                LORRAX_OLCF_VENV=str(venv), LD_LIBRARY_PATH="/unwanted/library/state",
                MODULEPATH="/unwanted/modules", LOADEDMODULES="unwanted/module",
+               LORRAX_OLCF_SYSTEM_PROFILE=str(site_profile),
                ROCM_PATH="/unwanted/toolkit", LORRAX_UNRELATED="must not leak")
     for name in (*CONTROLS[1:], "LORRAX_ELPA_ROCM_DIR"):
         env.pop(name, None)
@@ -67,7 +71,10 @@ def test_elpa_query_and_build_share_only_existing_explicit_controls(tmp_path):
             else:
                 assert name not in query
         assert query["PATH"] == "/usr/bin:/bin" and query["HOME"] == env["HOME"]
-        assert not any(name in query for name in ("LD_LIBRARY_PATH", "MODULEPATH", "LOADEDMODULES",
+        # The site MODULEPATH comes from the system profile, never the parent's.
+        assert query["MODULEPATH"] == "/site/modules"
+        assert not any(name in query for name in ("LD_LIBRARY_PATH", "LOADEDMODULES",
+                                                  "LORRAX_OLCF_SYSTEM_PROFILE",
                                                   "ROCM_PATH", "BASH_ENV", "PROBE_ROOT",
                                                   "LORRAX_UNRELATED"))
         assert f"-DLORRAX_ELPA_ROCM_DIR={root}/dependency prefix" in (root / "cmake.args").read_text()
