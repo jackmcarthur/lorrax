@@ -59,8 +59,8 @@ Instructions
    The latter supplies spare states for the upper-edge gap check; the GW sums
    and right ISDF fit window still stop at 200 bands.
 
-3. Run the original fully relativistic BerkeleyGW reference on the CPU
-   allocation, using the supplied links and original input decks:
+3. Run the original fully relativistic plane-wave reference on the CPU
+   allocation, using the supplied links and original input files:
 
    ```bash
    CPU_JOB_ID=<active-allocation> CPU_NODE=<allocated-node> \
@@ -94,10 +94,11 @@ Instructions
    supplied workflow was executed on GPUs.
 
 5. Inspect the stage logs, `lorrax_timings.tsv`, bandstructure and absorption
-   plots. Compare the input decks and time spent in each stage with the
-   adjacent BerkeleyGW track. LORRAX computes screening and self-energy
+   plots. Compare the input files and time spent in each stage with the
+   adjacent plane-wave track. LORRAX computes screening and self-energy
    together in `2-sigma`; `1-epsilon` prepares its ISDF points and operators
-   and receives the exported `eps0mat.h5` and `epsmat.h5` afterward.
+   and receives the exported `eps0mat.h5` and `epsmat.h5` afterward, written
+   with a 25 Ry cutoff (`epsmat_ecut = 25.0`).
 
 6. After both tracks finish, check their outputs:
 
@@ -157,7 +158,7 @@ Comparison
 ----------
 
 The saved fine-grid BSE onset is 2.511 eV in LORRAX, compared with 1.592 eV in
-BerkeleyGW. Both interpolate from the sparse 3 × 3 × 1 coarse grid to the
+the plane-wave code. Both interpolate from the sparse 3 × 3 × 1 coarse grid to the
 shifted 8 × 8 × 1 grid, using different QP and kernel interpolation procedures.
 No explicit fine-grid GW+BSE reference was computed, so this difference does
 not establish which method is more accurate. Small solver residuals certify

@@ -59,7 +59,7 @@ the fixed-charge HDF5 link; it preserves a completed stage's NSCF XML. Do not
 rerun the upstream global `01-link_files.sh` over completed NSCF directories:
 that older script overwrites their XML with the SCF schema. The LORRAX track has
 its own subsequent link scripts. After `all` completes, the supplied
-`03-run-reference-cpu.sh` creates the original BGW reference's WFN/RHO/Vxc links
+`03-run-reference-cpu.sh` creates the original plane-wave reference's WFN/RHO/Vxc links
 directly and then its epsilon/kernel/output links. It preserves every NSCF XML
 and refuses missing meanfield inputs or replacement of existing regular input
 files. No upstream global link script is needed.

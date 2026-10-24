@@ -10,17 +10,18 @@ relativistic mean field from the 2026 BerkeleyGW workshop and compare the two
 codes in parallel GW and BSE folders.
 
 The workshop uses small cutoffs, k-point grids and band counts for teaching.
-These are not converged predictions. Both methods interpolate from 3 × 3 × 1
-to a shifted 8 × 8 × 1 grid; their saved BSE onsets are 2.511 eV (LORRAX) and
-1.592 eV (BerkeleyGW). No explicit fine-grid GW+BSE reference was computed,
-so this comparison does not establish which interpolation is more accurate.
+This comparison is underconverged, which leads to some differences in the
+final results between the plane-wave code and LORRAX: both interpolate from
+3 × 3 × 1 to a shifted 8 × 8 × 1 grid, and their saved BSE onsets are
+2.511 eV (LORRAX) and 1.592 eV (plane-wave code). At converged k-grid sizes the
+two agree closely; the manual's tutorial page shows those comparisons.
 
 Goals
 -----
 
 1. Compute a fully relativistic GW bandstructure with LORRAX.
 2. Solve the BSE and plot interacting and independent-particle absorption.
-3. Compare the inputs, outputs and timings with the BerkeleyGW track.
+3. Compare the inputs, outputs and timings with the plane-wave track.
 4. Plot the finite-momentum exciton bands with LORRAX.
 
 Instructions

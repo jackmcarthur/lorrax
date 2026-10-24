@@ -1,13 +1,13 @@
 # Executed workshop results
 
 The supplied top-level workflow completed on four Perlmutter GPUs. The original
-fully relativistic BerkeleyGW reference was executed independently on a CPU node.
+fully relativistic plane-wave reference was executed independently on a CPU node.
 The numerical LORRAX source is `f075e4e796f996719a1c9a48ce48d6abb5291424`;
 `f9ef4a6a93c5971a586bbd4b5ccac965e6d2bf05` supplies the EQP text compatibility
 fix. Its rewrite preserved every numerical byte and was consumed successfully
-by BerkeleyGW itself.
+by the plane-wave code itself.
 
-| Quantity (eV) | LORRAX | BerkeleyGW |
+| Quantity (eV) | LORRAX | Plane wave |
 |---|---:|---:|
 | Coarse-grid QP1 minimum gap | 3.208396 | 3.123690 |
 | Path QP1 indirect gap | 2.872913 | 3.071206 |
@@ -23,16 +23,16 @@ matched physical settings.
 
 The separate [9 × 9 → 12 × 12 MoS₂ benchmark](https://jackmcarthur.github.io/lorrax/theory/w-range-splitting/#example)
 uses screening and BSE computed directly on the fine grid, with matched QP
-energies, and finds LORRAX SR/LR closer than BerkeleyGW dual-grid interpolation.
+energies, and finds LORRAX SR/LR closer than plane-wave dual-grid interpolation.
 That accuracy test should not be confused with this workshop comparison.
 
-Actual BerkeleyGW reader controls accepted the native exported screening and
-kernel. With BerkeleyGW QP data held fixed, all 3,072 exciton energies differed
-from the original BerkeleyGW calculation by RMS 7.680 meV and at most 9.552 meV.
+Plane-wave reader controls accepted the native exported screening and
+kernel. With plane-wave QP data held fixed, all 3,072 exciton energies differed
+from the original plane-wave calculation by RMS 7.680 meV and at most 9.552 meV.
 With native QP data, that same consumer gave an onset of 1.670295 eV. A native
 coarse-grid control gave 1.664460 eV versus 1.672848 eV in its corresponding
-BerkeleyGW control; the complete 432-state coarse spectra still differ
-(RMS 78.54 meV). The fine-grid consumer controls retain BerkeleyGW's own
+plane-wave control; the complete 432-state coarse spectra still differ
+(RMS 78.54 meV). The fine-grid consumer controls retain the plane-wave code's own
 interpolation even when they read a native coarse kernel. They establish
 coarse-kernel compatibility under that consumer, not an independent accuracy
 test of either interpolation. The separate coarse-spectrum differences do
