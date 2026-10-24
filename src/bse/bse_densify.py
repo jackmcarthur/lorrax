@@ -782,8 +782,12 @@ def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
             f"  long-range subspace G_L: {n_L} plane wave(s) per q"
             + (f" (G_z = -{c0}..{c0})" if sys_dim == 2 else " (G = 0)"),
             f"  fit on {info['n_fit']} coarse q: F~ degree {info['deg_F']} "
-            f"(rel. residual {info['relres_F']:.4f}), P degree {info['deg_P']} in q^2 "
+            f"(rel. residual {info['relres_F']:.4f}), P degree {info['deg_P']} in q^2, "
+            f"direction-resolved to degree {'/'.join(str(d) for d in info['deg_P_dir'])} "
             f"(rel. residual {info['relres_P']:.4f})",
+            "  P head q.S.q, fitted S diagonal "
+            + " ".join(f"{s:.4f}" for s in np.diag(info["S_fit"]))
+            + ", anchor " + " ".join(f"{s:.4f}" for s in np.diag(np.real(S_cart))[:info["S_fit"].shape[0]]),
             f"  window w(q): 1 below {r_a:.4f}, 0 above {r_b:.4f} bohr^-1 "
             f"(q_ins {q_ins:.4f})",
             f"  model used at {n_on_c} of {n_c} coarse q and {n_on_f} of {n_f} fine q, "
