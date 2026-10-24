@@ -1169,10 +1169,14 @@ def _preload_closure(record: ClosureRecord, unusable_cls: Type[OSError]) -> None
     prior = _merge_expectations(_enforced_records(), unusable_cls)
     handles: list[ctypes.CDLL] = []
     for e in record.entries:
-        if e.family in prior or e.role == "attest":
-            continue      # already open (the same file, or yielded); attest: JAX's to map
+        if e.family in prior:
+            continue      # already open (the same file, or yielded)
+        path = _staged_copy(e.path)
+        if e.role == "attest" and path == e.path:
+            continue      # JAX's to map.  A staged copy is opened here: JAX maps that same
+                          # file, and the leg's RUNPATH would otherwise bind the venv's.
         try:
-            handles.append(ctypes.CDLL(str(_staged_copy(e.path)), mode=ctypes.RTLD_GLOBAL))
+            handles.append(ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL))
         except OSError as exc:
             raise _gate(unusable_cls, f"{e.path} (recorded for {e.soname} in "
                         f"{record.origin}) failed to load: {exc}",
