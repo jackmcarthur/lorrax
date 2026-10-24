@@ -123,6 +123,18 @@ On Perlmutter's compute nodes, opening a file on `/global/common`, `$HOME` or CF
 | the same tree, run in place on `$SCRATCH` | 592.0 s |
 | the published module, on `/global/common` | 1164–1352 s |
 
+Fresh installs that follow this page, each with its own empty cache root, on one node with four 80 GB A100s:
+
+| Prefix on | Install (login node) | `lorrax-postinstall`: restore / kernel store / self-check | Suite, cold: k-means / GN-PPM / BSE / total |
+|---|---|---|---|
+| `/global/common` | 48.2 s | 8.6 / 235 / 41 s | 12.5 / 37.1 / 10.8 / 328.3 s |
+| `$HOME` | 47.9 s | 9.6 / 242 / 42 s | 12.4 / 37.4 / 10.8 / 329.6 s |
+| CFS | 47.3 s | 7.0 / 230 / 40 s | 12.2 / 37.2 / 11.0 / 329.5 s |
+| `$SCRATCH` | 48.3 s | 6.9 / 235 / 43 s | 12.2 / 37.0 / 10.8 / 328.9 s |
+| CFS, `--in-place`, without `lorrax-run` | 63.1 s | self-check fails: 6.74 ms per file open | 145.0 / 120.1 / 11.7 s; imports alone 238 s |
+
+The prefix's filesystem no longer matters, and the kernel store built by `lorrax-postinstall` takes the cold suite from about 524 s to 329 s.
+
 #### Options {: #perlmutter-options }
 
 ```text
@@ -192,7 +204,7 @@ The caches (compiled XLA programs, NVRTC images, the CUDA JIT cache) live under 
 
 #### Things to know {: #perlmutter-notes }
 
-- **A full `$SCRATCH` quota refuses the install.** Pick another prefix, or pass `--no-space-check` if the space is really there.
+- **A full `$SCRATCH` quota refuses the install.** A different prefix alone does not help, because uv's download cache (4.5 GB when empty) is on `$SCRATCH` too: also point `UV_CACHE_DIR` at a filesystem with room, as the refusal line says, or pass `--no-space-check` if the space is really there.
 - **Your own `PATH`.** Directories of yours on `$HOME` early in `PATH` make the self-check warn: each command lookup that misses there costs a few milliseconds on a compute node.
 - **CPU runs with several processes** also source `config/perlmutter/cpu_mpi_env.sh` for JAX's MPI collectives ([below](#perlmutter-settings)).
 - **No `/tmp` on the compute nodes** makes the restore refuse with the instruction to reinstall with `--node-dir`.
