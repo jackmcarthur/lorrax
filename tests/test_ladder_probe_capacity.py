@@ -10,8 +10,9 @@ def backend_namespace():
     import jax.numpy as jnp
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
+    from distrib_la import lstsq_hessenberg_local
     ns = dict(jax=jax, jnp=jnp, np=np, NamedSharding=NamedSharding, P=P,
-              _BLOCK_GMRES_CACHE={}, _PROBE_RHS_CACHE={}, _ARNOLDI_CACHE={},
+              lstsq_hessenberg_local=lstsq_hessenberg_local, _BLOCK_GMRES_CACHE={}, _PROBE_RHS_CACHE={}, _ARNOLDI_CACHE={},
               _PSI_KEYS=("psi_c_X", "psi_c_Y", "psi_v_X", "psi_v_Y"),
               LADDER_DEFLATION_ARNOLDI=6)
     selected = {
