@@ -115,6 +115,19 @@ ENVF="$PREFIX/lorrax-env.sh"
     echo "source \"$ROOT/config/perlmutter/gpu_env.sh\""
 } > "$ENVF"
 
+# --- 7. performance self-check ----------------------------------------------
+# On a login node it runs only the static checks and prints the compute-node
+# command that certifies this install (exit 3); inside a GPU job step it runs
+# in full and fails loudly, naming the cause, when a run would be slow.
+say "performance self-check (scripts/perf_check.py)"
+rc=0
+(source "$ENVF" && python "$ROOT/scripts/perf_check.py" --gpus 4) || rc=$?
+case $rc in
+    0) say "performance self-check: PASS" ;;
+    3) say "performance self-check: not certified here; run the command above on a GPU node" ;;
+    *) say "performance self-check: FAIL (exit $rc); see the lines above" ;;
+esac
+
 say "done. To check the installation on four GPUs:"
 cat <<EOF
   salloc -N 1 -C gpu -G 4 -q interactive -t 0:30:00 -A <account>
