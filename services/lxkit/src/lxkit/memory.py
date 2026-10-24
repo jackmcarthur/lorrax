@@ -752,7 +752,9 @@ def require_backup(stage: str, wholes, distributed: bool) -> None:
 
 def sizing(stages: Optional[dict] = None, *, limit_bytes: Optional[float] = None,
            per_node: Optional[int] = None, platform: Optional[str] = None) -> dict:
-    """The smallest square P (``collectives.resolve_mesh``) at which every device stage fits (its
+    """The estimated smallest square P from the current memory quotes, not a capacity proof.
+
+    Every device stage fits its modeled price (its
     best admitted route, at least its booked parts, against its admission's limit, else the
     run's); ``binding``: the least headroom there; nodes = ceil(P / devices per node).
     ``stages``: ``{stage: ((route, Price), ...)}`` instead of this run's plans."""
@@ -774,13 +776,13 @@ def sizing(stages: Optional[dict] = None, *, limit_bytes: Optional[float] = None
     if not plans or p is None:
         k = (short(4096) or [None])[0]
         n = k and max(TERMS, key=lambda n: getattr(price(k, 4096), n).fixed)
-        return dict(p=None, nodes=None, binding=k, line="minimum to complete: no priced stage" if not plans else
-                    f"minimum to complete: no P suffices: {k} holds {_gb(getattr(price(k, 4096), n).fixed)}/rank "
-                    f"of {n} that no mesh divides ({getattr(price(k, 4096), n).source}) against the "
+        return dict(p=None, nodes=None, binding=k, line="estimated minimum from this memory quote: no priced stage" if not plans else
+                    f"estimated minimum from this memory quote: no square P up to 4096 fits: {k} quotes {_gb(getattr(price(k, 4096), n).fixed)}/rank "
+                    f"fixed in {n} ({getattr(price(k, 4096), n).source}) against the "
                     f"{_gb(limit[k])} limit")
     nodes = -(-p // max(1, int(_RUN.get("per_node", 1) if per_node is None else per_node)))
     binding = max(plans, key=lambda k: need(k, p) / limit[k])
-    return dict(p=p, nodes=nodes, binding=binding, line=f"minimum to complete: P = {p} ({nodes} node"
+    return dict(p=p, nodes=nodes, binding=binding, line=f"estimated minimum from this memory quote: P = {p} ({nodes} node"
                 f"{'s' * (nodes != 1)} of {_RUN.get('platform', 'this platform') if platform is None else platform})"
                 f"; binding stage {binding}")
 

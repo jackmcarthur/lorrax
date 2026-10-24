@@ -125,9 +125,12 @@ are `(name, Price)` pairs, fastest first; a `Price` has four per-rank terms,
 its provenance. The fastest route that fits its room runs. When none fits, the
 cheapest runs: within the physical limit (room + reserve) with one warning; over
 it with a banner at plan time and again when the stage opens, giving the terms,
-the shortfall and `memory.sizing()`'s `minimum to complete: P = N (X nodes of …)`,
-the smallest square mesh in whole nodes at which every admitted stage's best route
-fits (or `no P suffices`, naming the term no mesh divides). A route that opens
+the shortfall and `memory.sizing()`'s `estimated minimum from this memory quote: P = N`,
+the smallest square mesh at which the current modeled stage quotes fit. This
+is a planning estimate, not a measured capacity limit: a quote may cover a
+checked retry that the run does not execute, and its scaling model is not a
+fresh compilation at every candidate mesh. If no square mesh up to P = 4096
+fits the model, the report says so and names the quoted binding stage. A route that opens
 a provider context under `linalg = local` carries it as its `outside` term
 (`memory.contexts()`). Every decision prints once on rank 0 (`route <site>: <route>
 (<prices>)`) and the run report's Routes table lists each with its count.
@@ -960,7 +963,7 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
    which names its binder, and `Resident ψ` for the GW carriers.
 4. **On a `memory over budget` warning or a `!! MEMORY: <stage> is PRICED OVER the
    allocator limit` banner**, run at
-   the banner's `minimum to complete` or with more memory per device. For the ζ fit the smallest batch keeps ψ(G)
+   the banner's estimated minimum from the memory quote or with more memory per device. For the ζ fit the smallest batch keeps ψ(G)
    resident; for V_q, more ranks, fewer centroids, or a smaller ζ sphere;
    `vq_g_chunk_size` shrinks only the panel workspace.
 5. **Compare with the run.** `gwjax.out` prints MAJOR-STAGE DEVICE AND HOST
