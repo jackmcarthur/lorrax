@@ -864,7 +864,7 @@ def judge_binding(ranks: list[dict]) -> dict:
         if pairs:
             found.setdefault(("FAIL", f"bad binding: ranks on {host} share CPUs ({len(pairs)} overlapping "
                               f"pairs, e.g. ranks {pairs[0][0]} and {pairs[0][1]} share {pairs[0][2]}): no "
-                              "--cpu-bind, or -c missing"), []).extend([p[0] for p in pairs])
+                              "--cpu-bind, or -c missing"), []).extend([r for p in pairs for r in p[:2]])
     out = {"fails": [], "warns": [], "rows": []}
     for (sev, text), rs in found.items():
         msg = f"{_ranks_text(list(set(rs)))}: {text}"
