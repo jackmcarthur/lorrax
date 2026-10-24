@@ -1294,7 +1294,7 @@ def judge_caches(caches: dict, ranks: list[dict]) -> dict:
                          f"(1 MB write+fsync+read {fmt(c.get('write_s'), '.3f')} s)")
     st_lat, l_lat = judge_cache_latency([r.get("cache_latency") or {} for r in ranks])
     st = worst(st, st_lat)
-    lines += l_lat
+    lines = l_lat + lines if st_lat == "FAIL" else lines + l_lat     # the verdict quotes the first line
     ns = caches.get("namespace")
     if ns and not ns.endswith("_k3"):
         st = worst(st, "WARN")
