@@ -1659,12 +1659,13 @@ _DEFAULTS = {
     # PPM
     # ppm_model picks the two-point pole-fit ansatz:
     #   "gn" — Godby-Needs: second probe at ω = i·ppm_omega_p (imaginary,
-    #          ppm_omega_p ≈ 2 Ry by default).
+    #          default PPM_OMEGA_P_GN_RY = 2 Ry).
     #   "hl" — Hybertsen-Louie: second probe at ω = ppm_omega_p (real; it
-    #          must exceed every chi0 transition energy, so an HL deck sets
-    #          it: the shared 2.0 Ry default refuses on most spectra).
+    #          must exceed every chi0 transition energy: default
+    #          PPM_OMEGA_P_HL_RY = 200 Ry, the f-sum limit).
+    # None: the default of the model that runs (_ppm_omega_p).
     "ppm_model": "gn",
-    "ppm_omega_p": 2.0,
+    "ppm_omega_p": None,
     "ppm_fallback_omega": 2.0,
     # Override the head pole frequency Ω_h directly (Ry).  Useful for
     # testing against BGW's analytic head — set to BGW's
@@ -2603,6 +2604,25 @@ _INPUT_KEY_SCHEMA = tuple(
     for key, default in _DEFAULTS.items())
 
 
+#: ``ppm_omega_p`` defaults (Ry).  GN probes W at i*omega_p; HL probes it at
+#: the real omega_p, which must lie above every chi0 transition energy
+#: (GATE hl_ppm_probe_in_spectrum), and as it grows the HL fit tends to the
+#: f-sum (first-moment) limit (docs/theory/hl-gpp-derivation.md §3).
+PPM_OMEGA_P_GN_RY = 2.0
+PPM_OMEGA_P_HL_RY = 200.0
+
+
+def _ppm_omega_p(params) -> float:
+    """``ppm_omega_p``, or the default of the PPM that runs (HL: 200 Ry, else 2 Ry)."""
+    if params.get("ppm_omega_p") is not None:
+        return float(params["ppm_omega_p"])
+    mode = str(params.get("compute_mode") or "auto").strip().lower()
+    hl = mode == "hl_ppm" or (
+        mode == "auto" and bool(params.get("use_ppm_sigma"))
+        and str(params.get("ppm_model", "gn")).strip().lower() == "hl")
+    return PPM_OMEGA_P_HL_RY if hl else PPM_OMEGA_P_GN_RY
+
+
 def _parse_input_keys(section):
     """Produce all declared typed key values and the set explicitly named by the deck."""
     params, named = {}, set()
@@ -2777,7 +2797,7 @@ def _input_response(
     )
     ppm = PPMConfig(
         model=str(params["ppm_model"]).strip().lower(),
-        omega_p=float(params["ppm_omega_p"]),
+        omega_p=_ppm_omega_p(params),
         fallback_omega=float(params["ppm_fallback_omega"]),
         head_omega_h_ry=(
             float(params["ppm_head_omega_h_ry"])
