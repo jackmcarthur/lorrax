@@ -82,7 +82,7 @@ class QuadratureSpec:
     quadrature_type: str = "ellipse"
 
 
-def ensure_W_R(data: dict, include_W: bool, mesh_xy: Mesh) -> dict:
+def ensure_W_R(data: dict, include_W: bool, mesh_xy: Mesh, *, consume_W_q=False) -> dict:
     """Populate ``data['W_R']`` — the 8th (real-space W) argument the ring/stack
     matvecs and the shifted-matvec chain (``_apply_shifted_matvec``) expect.
 
@@ -97,10 +97,40 @@ def ensure_W_R(data: dict, include_W: bool, mesh_xy: Mesh) -> dict:
     never built, so ``W_R`` is only a shape/sharding-correct placeholder and
     ``W_q`` itself serves.  The restart loader emits ``W_q`` but not ``W_R``, so
     every solve entry point (FEAST, spectral-bound Lanczos, ``bse_w_exact``)
-    must call this before invoking a matvec.  Mutates and returns ``data``.
+    must call this before invoking a matvec. Mutates and returns ``data``.
+
+    ``consume_W_q=True`` is for a caller that owns a freshly loaded payload:
+    retain only its q=0 preconditioner slice and donate W_q to the shared
+    optical-solver transform. W_q is then None and W_R is reusable. The
+    default borrows W_q, preserving diagnostic callers and their snapshots.
     """
+    if data.get("W_q") is None:
+        if data.get("W_R") is None:
+            raise ValueError("ensure_W_R needs W_q or an already prepared W_R")
+        return data
     if include_W:
         W_q = data["W_q"]
+        if consume_W_q:
+            from common.fft_helpers import get_donated_kfft_kminor
+            from common.gpu_utils import shared_device_room
+            from runtime.aot_memory import compiled_new_bytes
+            from lxkit import memory
+            if data.get("_W_q0_for_precond") is None:
+                data["_W_q0_for_precond"] = W_q[:, :, 0, 0, 0]
+            jax.block_until_ready((W_q, data["_W_q0_for_precond"]))
+            transform = get_donated_kfft_kminor(
+                mesh_xy, tuple(int(s) for s in W_q.shape[-3:]),
+                make_bse_shardings(mesh_xy).W.spec, kind="ifftn", norm="ortho")
+            executable = transform.lower(W_q).compile()
+            stage = "BSE owned W_q to W_R"
+            price = memory.priced(compiled_new_bytes(executable),
+                                  "donated W transform: new buffers and provider scratch")
+            room = shared_device_room(stage)
+            memory.book(price, stage="bse.W_R")
+            memory.admit(stage, price, int(room) if isinstance(room, (int, np.integer)) else 0)
+            data["W_R"] = executable(W_q)
+            data["W_q"] = None
+            return data
         densify = make_w_densifier(
             mesh_xy, make_bse_shardings(mesh_xy).W.spec,
             tuple(int(s) for s in W_q.shape[-3:]), output="R")

@@ -244,10 +244,16 @@ def zero_kernel_payload(data: dict) -> dict:
     """
     out = dict(data)
     out["V_q0"] = jnp.zeros_like(data["V_q0"])
-    if "W_q" in data:
+    if data.get("W_q") is not None:
         out["W_q"] = jnp.zeros_like(data["W_q"])
-    out.pop("W_R", None)
-    out.pop("_W_q0_for_precond", None)
+        out.pop("W_R", None)
+        out.pop("_W_q0_for_precond", None)
+    elif data.get("W_R") is not None:
+        # An explicitly consumed kernel has no reciprocal snapshot. Zero
+        # its real-space operand and saved diagonal slice without a reload.
+        out["W_R"] = jnp.zeros_like(data["W_R"])
+        if data.get("_W_q0_for_precond") is not None:
+            out["_W_q0_for_precond"] = jnp.zeros_like(data["_W_q0_for_precond"])
     return out
 
 

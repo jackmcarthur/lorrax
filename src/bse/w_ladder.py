@@ -708,7 +708,11 @@ def prepare_ladder_head(restart_path, mesh_xy, *, input_file, head_dipole_path,
     if data is None:
         data = load_bse_data_from_restart_sharded(
             restart_path, n_val=10**9, n_cond=10**9, mesh_xy=mesh_xy,
-            input_file=input_file, inject_head=False, load_v_full=True)
+            input_file=input_file, inject_head=False, load_v_full=False)
+        # This Gamma-only payload is owned here. Supplied data is borrowed,
+        # including a body's already prepared W_R, and is never donated here.
+        if include_w:
+            ensure_W_R(data, True, mesh_xy, consume_W_q=True)
     from .absorption_common import (slice_dipole_to_bse_window)
     from file_io.restart_bundle import (load_dipole_h5)
     from .head_resolvent import build_head_dipole, build_head_operator
@@ -870,6 +874,11 @@ def compute_wc_qwedge(
     data = load_bse_data_from_restart_sharded(
         restart_path, n_val=10**9, n_cond=10**9, mesh_xy=mesh_xy,
         input_file=input_file, inject_head=False, load_v_full=True)
+    # The public facade owns this restart read; no caller can retain W_q.
+    # Per-q diagonals and the optional later head share the small saved q=0
+    # slice and this one W_R instead of keeping both all-q representations.
+    if include_w:
+        ensure_W_R(data, True, mesh_xy, consume_W_q=True)
     data = _psi_at_rest_2d(data, mesh_xy)
 
     head_args = (head_dipole_path, head_n_occ, head_pref)
