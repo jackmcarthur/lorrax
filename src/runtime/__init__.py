@@ -174,6 +174,7 @@ __all__ = [
     "collect_startup_facts",
     "format_startup_report",
     "format_production_startup_report",
+    "install_verification_stamp",
     "bootstrap",
     "set_default_env",
     "set_default_xla_gpu_autotune",
@@ -2815,6 +2816,44 @@ def default_blas_threads() -> str | None:
 _BLAS_AUTO: list = []
 
 
+def install_verification_stamp(device_kind: str):
+    """Where a passing install self-check (``scripts/perf_check.py``, run by the
+    installer's ``lorrax-postinstall``) records that THIS install runs at speed on
+    THIS GPU model: ``<user cache>/perfcheck/verified_<install>_<model>.json``.
+
+    ``<install>`` is 16 hex of SHA-256 over the source root's real path and the
+    native closure identity (``common.jax_compile_cache.native_cache_tag``), so a
+    rebuilt FFI, another checkout or another install is unverified until checked;
+    ``<model>`` is the device kind with every non-alphanumeric run as ``-``.  The
+    self-check writes the file; the runtime only tests that it exists
+    (:func:`_install_verification_facts`)."""
+    import hashlib
+    import re
+    from pathlib import Path
+    from lxkit import user_cache_dir
+    try:
+        from common.jax_compile_cache import native_cache_tag
+        tag = native_cache_tag()
+    except Exception:                                         # noqa: BLE001
+        tag = "noffi"
+    root = str(Path(__file__).resolve().parents[2])
+    install = hashlib.sha256(f"{root}|{tag}".encode()).hexdigest()[:16]
+    model = re.sub(r"[^A-Za-z0-9]+", "-", str(device_kind)).strip("-") or "unknown"
+    return user_cache_dir("perfcheck") / f"verified_{install}_{model}.json"
+
+
+def _install_verification_facts(backend: str, device_kind: str) -> dict:
+    """``{"applicable", "verified", "stamp"}`` for the startup block: GPU runs only."""
+    if str(backend).lower() not in ("gpu", "cuda", "rocm"):
+        return {"applicable": False}
+    try:
+        stamp = install_verification_stamp(device_kind)
+        return {"applicable": True, "verified": stamp.is_file(), "stamp": str(stamp)}
+    except Exception as exc:                                  # noqa: BLE001
+        return {"applicable": True, "verified": False, "stamp": None,
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _thread_env() -> dict:
     """Thread-count environment + the affinity XLA:CPU actually gets.
 
@@ -3199,6 +3238,8 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
 
     # -- threads, cache, guards -------------------------------------------
     blas_auto = default_blas_threads()
+    f["install_verification"] = _install_verification_facts(f.get("backend", ""),
+                                                            f.get("device_kind", ""))
     f["threads"] = _thread_env()
     if blas_auto:
         f["threads"]["OPENBLAS_NUM_THREADS"] = blas_auto
@@ -3643,6 +3684,7 @@ def format_startup_report(f: dict) -> list:
                 f"{r.get('lib')} {r.get('state')}={r.get('value')} "
                 f"({r.get('witness')})" if "lib" in r else str(r.get("error"))
                 for r in bt["libs"]) + ".")
+    L.extend(_install_verification_lines(f, "  WARNING: "))
     L.append(_RULE)
     return L
 
@@ -3669,9 +3711,11 @@ def format_production_startup_report(f: dict) -> list:
     kind = str(f.get("device_kind", "unknown"))
     threads = f.get("threads") or {}
     affinity = threads.get("affinity")
+    physical = threads.get("physical_cores")
     affinity_text = (
-        f"{int(affinity)} CPU cores/rank" if affinity is not None
-        else "CPU affinity unavailable")
+        "CPU affinity unavailable" if affinity is None
+        else f"{int(affinity)} logical CPUs/rank" if physical is None
+        else f"{int(physical)} cores / {int(affinity)} CPUs per rank")
     x64 = "FP64/complex128" if f.get("x64") else "FP32/complex64"
     collective = "NCCL" if backend in ("GPU", "CUDA", "ROCM") and p > 1 \
         else str((f.get("collectives") or {}).get("impl") or "local").upper()
@@ -3705,4 +3749,15 @@ def format_production_startup_report(f: dict) -> list:
         lines.append(f"Runtime startup | {float(elapsed):.1f} s")
     for demotion in f.get("demotions", ()):
         lines.append(f"WARNING         | {demotion}")
+    lines += _install_verification_lines(f, "WARNING         | ")
     return lines
+
+
+def _install_verification_lines(f: dict, prefix: str) -> list:
+    """One warning while this install has not passed its self-check on this GPU model."""
+    iv = f.get("install_verification") or {}
+    if not iv.get("applicable") or iv.get("verified"):
+        return []
+    return [f"{prefix}INSTALL NOT VERIFIED on {f.get('device_kind', 'this GPU')}: no passing "
+            f"self-check for this install (stamp {iv.get('stamp')}); run lorrax-postinstall "
+            "(printed by install_deps.sh) once in a one-node GPU allocation"]

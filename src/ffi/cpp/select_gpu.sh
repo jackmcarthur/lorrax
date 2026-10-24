@@ -179,6 +179,19 @@ else
     _select_gpu_threads
 fi
 
+# The node-local libcudart.so link config/perlmutter/gpu_env.sh put on
+# LD_LIBRARY_PATH for a multi-node step ("<link>=<target>"): /tmp is per node,
+# so each rank makes it on its own node (idempotent; ln -sfn under a race
+# leaves one correct link).
+if [[ -n "${LORRAX_CUDART_SHIM:-}" ]]; then
+    _select_gpu_link=${LORRAX_CUDART_SHIM%%=*}
+    if [[ "$(readlink "$_select_gpu_link" 2>/dev/null)" != "${LORRAX_CUDART_SHIM#*=}" ]]; then
+        mkdir -p "${_select_gpu_link%/*}" 2>/dev/null &&
+            ln -sfn "${LORRAX_CUDART_SHIM#*=}" "$_select_gpu_link" 2>/dev/null
+    fi
+    unset -v _select_gpu_link
+fi
+
 case "${LORRAX_DEBUG_PRINT:-0}" in
     1|on|ON|true|TRUE|yes|YES)
         echo "[select_gpu] $(hostname) local rank ${_select_gpu_localid} ->" \
