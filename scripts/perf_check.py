@@ -345,7 +345,16 @@ def probe_path_lookups(n: int = 20) -> dict:
     each dlopen -- tries every LD_LIBRARY_PATH entry for every library it resolves (libc,
     libm, ...).  An entry on a slow mount turns that into thousands of failed opens: a
     cudart shim directory on DVS $HOME cost 5495 failed opens and +24 s of one stage
-    (ri_rootcause).  Names are unique per lookup, so no negative-dentry cache answers."""
+    (ri_rootcause).  Judged: the same missing name looked up again and again, as the loader of
+    every new process does for libc.so.6 & co. (a mount that caches negative lookups answers
+    locally; DVS $HOME did not).  Also reported: first lookups of unique names."""
+    def _t(p: str) -> float:
+        t0 = time.perf_counter()
+        try:
+            os.close(os.open(p, os.O_RDONLY))
+        except OSError:
+            pass
+        return (time.perf_counter() - t0) * 1e3
     out: dict = {}
     for var in ("LD_LIBRARY_PATH", "PATH"):
         rows = []
@@ -353,16 +362,12 @@ def probe_path_lookups(n: int = 20) -> dict:
             if not os.path.isdir(d):
                 rows.append({"dir": d, "missing": True})
                 continue
-            ms = []
-            for i in range(n):
-                p = os.path.join(d, f"libperfcheck-{os.getpid()}-{i}.so.1")
-                t0 = time.perf_counter()
-                try:
-                    os.close(os.open(p, os.O_RDONLY))
-                except OSError:
-                    pass
-                ms.append((time.perf_counter() - t0) * 1e3)
-            rows.append({"dir": d, **_stats(ms), **fs_of(d)})
+            first = [_t(os.path.join(d, f"libperfcheck-{os.getpid()}-{i}.so.1")) for i in range(n // 2)]
+            same = os.path.join(d, "libperfcheck-absent.so.1")
+            _t(same)
+            again = [_t(same) for _ in range(n)]
+            rows.append({"dir": d, **_stats(again), "first_median_ms": _stats(first).get("median_ms"),
+                         **fs_of(d)})
         out[var] = rows
     return out
 
@@ -1025,14 +1030,19 @@ def judge_lookups(lookups: list[dict]) -> tuple[str, list[str]]:
                 if key not in worst_by or row["median_ms"] > worst_by[key]["median_ms"]:
                     worst_by[key] = row
     st, lines = "PASS", []
-    for (var, d), row in sorted(worst_by.items(), key=lambda t: -t[1]["median_ms"]):
-        if row["median_ms"] < OPEN_FAIL_MS:
-            continue
-        sev = "FAIL" if var == "LD_LIBRARY_PATH" else "WARN"
-        st = worst(st, sev)
-        lines.append(f"slow {var} entry: {d} on {row.get('fstype')} costs {row['median_ms']:.2f} ms per "
-                     "failed lookup, and every exec (ptxas/nvlink per XLA module) and dlopen probes it "
-                     "for each library: remove it, or move it to node-local storage")
+    for var in ("LD_LIBRARY_PATH", "PATH"):
+        rows = [(d, r) for (v, d), r in worst_by.items() if v == var]
+        slow = sorted(((d, r) for d, r in rows if r["median_ms"] >= OPEN_FAIL_MS),
+                      key=lambda t: -t[1]["median_ms"])
+        if slow:
+            st = worst(st, "FAIL" if var == "LD_LIBRARY_PATH" else "WARN")
+            names = "; ".join(f"{d} ({r.get('fstype')}, {r['median_ms']:.1f} ms)" for d, r in slow)
+            lines.append(f"slow {var}: {len(slow)} of {len(rows)} entries cost >= {OPEN_FAIL_MS} ms per failed "
+                         f"lookup, and every exec (ptxas/nvlink per XLA module) and dlopen probes each of them "
+                         f"for each library: {names}. Drop them, or stage the libraries node-local")
+        elif rows:
+            mx = max(r["median_ms"] for _, r in rows)
+            lines.append(f"{var}: {len(rows)} entries, failed lookup <= {mx:.3f} ms each")
     return st, lines
 
 
@@ -1669,7 +1679,14 @@ def main(argv=None) -> int:
     ap.add_argument("--keep", action="store_true", help="keep the probe cache directories")
     ap.add_argument("--tmp", help="parent of the fresh probe caches (default $TMPDIR or /tmp)")
     ap.add_argument("--json", help="also write the verdict JSON here (rank 0)")
+    ap.add_argument("--rejudge", metavar="DIR", help="re-judge a finished check's rank*.json with the "
+                    "current thresholds and references (no measurement)")
     args = ap.parse_args(argv)
+    if args.rejudge:
+        ranks = [json.loads(p.read_text()) for p in sorted(Path(args.rejudge).glob("rank*.json"))]
+        v, comps, meta = judge_all(ranks, False)
+        print(report(v, comps, meta, {"host": ranks[0].get("host"), "nranks": len(ranks)}, 0.0))
+        return 1 if v == "FAIL" else 0
     t0 = time.perf_counter()
     ctx = context()
     topo = node_topology()
