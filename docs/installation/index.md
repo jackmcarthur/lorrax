@@ -44,6 +44,12 @@ The leg is the one the startup configures (`lxkit.startup_gpu_leg`):
 jaxlib GPU plugin's leg, else CPU. A forced-CPU process in the Frontier
 environment is therefore keyed ROCm.
 
+The selected GPU leg's installed plugin and PJRT wheels must form complete
+pairs with the same public version as JAXLIB, including every patch component.
+Only a local vendor suffix such as `+rocm7.14.1` is ignored. Both metadata
+preflight and runtime check this without importing a GPU plugin; CPU-only
+environments need no GPU wheels.
+
 Patch upgrades inside the 0.12 series are allowed; any other version
 refuses, and there is no override. The window is narrow
 because `common/jax_compile_cache.py` patches five `jax._src` private
@@ -92,7 +98,7 @@ explains how to port one.
 | `partial sealed-bundle override refused` | only one leg of the bundle's pair is pinned (`LORRAX_FFI_HOST_SO` with `LORRAX_FFI_SO` or `LORRAX_FFI_ROCM_SO`) | unset both, or pin both legs of one sealed bundle |
 | `mixed native providers` | the two selected legs claim different bundle manifests | select both legs from one bundle |
 | `GATE native-closure: got …; want …; fix: …` | the leg has no or a stale dependency record, or the process maps a library other than the recorded one, or two copies of one | the message's fix; the table in [the dependency closure](ffi-build.md#closure) |
-| `JAX_ENV_REFUSED` (from `tools/require_jax.py`), or the `runtime.jax_support` refusal before the first `jit` | JAX or JAXLIB outside the leg's window (0.12; ROCm also 0.9.1), or a `jax._src` of the wrong shape | install the 0.12 series (§ [JAX contract](#jax)) |
+| `JAX_ENV_REFUSED` (from `tools/require_jax.py`), or the `runtime.jax_support` refusal before the first `jit` | JAX or JAXLIB outside the leg's window, mismatched GPU plugin/PJRT wheels, or a `jax._src` of the wrong shape | install a coherent stack for the selected leg (§ [JAX contract](#jax)) |
 | `GATE mathdx-headers` | a CUDA run without `nvidia-mathdx` in the venv | `uv sync --extra cuda13` (or `cuda12`) |
 
 An unsealed library from a build tree loads with a `LEGACY-UNSEALED`

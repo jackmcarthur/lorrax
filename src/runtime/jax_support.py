@@ -106,6 +106,7 @@ __all__ = [
     "describe",
     "enforce",
     "check_version",
+    "check_gpu_packages",
     "window_leg",
     "in_window",
     "check_private_params",
@@ -328,11 +329,11 @@ def describe() -> dict[str, Any]:
     }
 
 
-def window_leg() -> str:
+def window_leg(*, plugin_names=None) -> str:
     """The :data:`SUPPORTED_WINDOWS` key of this process: the leg the startup
     configures (:func:`lxkit.startup_gpu_leg`), else ``"cpu"``."""
     from lxkit import startup_gpu_leg
-    leg = startup_gpu_leg()
+    leg = startup_gpu_leg(plugin_names=plugin_names)
     return leg.key if leg is not None else "cpu"
 
 
@@ -351,10 +352,54 @@ def describe_window(leg: str) -> str:
     return " or ".join(one(lo, hi) for lo, hi in SUPPORTED_WINDOWS[leg])
 
 
-def check_version(leg: str | None = None) -> list[str]:
+def check_gpu_packages(jaxlib_version: str, plugin_prefix: str, plugin_names) -> list[str]:
+    """Check the selected leg's plugin/PJRT wheel releases without importing them.
+
+    ``plugin_prefix`` is the existing leg's ``jax_plugin_prefix`` (empty for
+    CPU). All installed majors of that leg must be complete pairs matching
+    JAXLIB's public version, including its patch components; only a ``+local``
+    vendor suffix is ignored. A forced-CPU process in a GPU environment still
+    checks that environment's selected leg.
+    """
+    if not plugin_prefix:
+        return []
+    from importlib import metadata
+
+    def public(version):
+        parts = str(version).split("+")
+        if (len(parts) > 2 or not re.fullmatch(
+                r"\d+(?:\.\d+)+(?:a\d+|b\d+|rc\d+)?(?:\.post\d+)?(?:\.dev\d+)?", parts[0])
+                or (len(parts) == 2 and not re.fullmatch(r"[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*", parts[1]))):
+            return None
+        return parts[0]
+
+    families = sorted({"jax-" + name.removeprefix("xla_") for name in plugin_names
+                       if re.fullmatch(re.escape(plugin_prefix) + r"\d+", name)})
+    expected = public(jaxlib_version)
+    problems = []
+    if expected is None:
+        problems.append(f"jaxlib has an unparseable public version {jaxlib_version!r}")
+    if not families:
+        return problems + [f"{plugin_prefix} plugin/PJRT namespace is not installed"]
+    for family in families:
+        for component in ("plugin", "pjrt"):
+            name = f"{family}-{component}"
+            try:
+                version = metadata.version(name)
+            except metadata.PackageNotFoundError:
+                problems.append(f"{name} is not installed")
+                continue
+            if expected is None or public(version) != expected:
+                problems.append(f"{name} version {version!r}; want jaxlib public version {jaxlib_version!r}")
+    return problems
+
+
+def check_version(leg: str | None = None, *, plugin_names=None) -> list[str]:
     """Return a list of refusal-reason strings (empty when supported) for the
     window of ``leg`` (default :func:`window_leg`)."""
-    leg = window_leg() if leg is None else leg
+    from lxkit import LEGS, installed_plugin_names
+    plugin_names = installed_plugin_names() if plugin_names is None else plugin_names
+    leg = window_leg(plugin_names=plugin_names) if leg is None else leg
     info = describe()
     problems: list[str] = []
     for package, vi, version, path in (
@@ -373,6 +418,7 @@ def check_version(leg: str | None = None) -> list[str]:
     if not problems and info["version_info"][:2] != info["jaxlib_version_info"][:2]:
         problems.append(f"jax {info['version']} and jaxlib {info['jaxlib_version']} "
                         f"are different series")
+    problems.extend(check_gpu_packages(info["jaxlib_version"], LEGS[leg].jax_plugin_prefix, plugin_names))
     return problems
 
 
@@ -433,8 +479,10 @@ def enforce(*, announce=None) -> None:
     """
     import jax
 
-    leg = window_leg()
-    version_problems = check_version(leg)
+    from lxkit import installed_plugin_names
+    plugin_names = installed_plugin_names()
+    leg = window_leg(plugin_names=plugin_names)
+    version_problems = check_version(leg, plugin_names=plugin_names)
     param_problems = check_private_params()
     symbol_problems = check_private_symbols()
     # The one caller runs this after ``jax.distributed.initialize``
@@ -462,8 +510,8 @@ def enforce(*, announce=None) -> None:
             RULE_UNSUPPORTED_VERSION,
             got="; ".join(version_problems),
             want=f"jax and jaxlib of one series, {describe_window(leg)}, on the "
-                 f"{leg} leg (SUPPORTED_WINDOWS; tools/require_jax.py reads the "
-                 f"same table)",
+                 f"{leg} leg, with GPU plugin/PJRT public versions matching jaxlib "
+                 f"(tools/require_jax.py checks the same contract)",
             fix="install matching jax and jaxlib 0.12.x packages (uv sync from "
                 "this checkout's lock); on Perlmutter, a base module built from "
                 "that lock; on Frontier, the venv of config/frontier/constraints.txt",

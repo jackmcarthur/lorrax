@@ -3,6 +3,9 @@ every leg, and exactly 0.9.1 also on ROCm, keyed by the leg the startup
 configures (``lxkit.startup_gpu_leg``).  Stdlib only: no JAX is imported."""
 from __future__ import annotations
 
+from importlib import metadata, util
+from pathlib import Path
+
 from lxkit import LEGS, startup_gpu_leg
 from runtime import jax_support as js
 
@@ -32,3 +35,61 @@ def test_window_leg_is_the_startup_leg(tmp_path, monkeypatch):
     assert startup_gpu_leg(path=[], environ={"JAX_PLATFORMS": "cpu"}, **no_dev) is None
     monkeypatch.setenv("JAX_PLATFORMS", "rocm")
     assert js.window_leg() == "ROCM"
+
+
+def test_gpu_wheel_public_versions(monkeypatch):
+    def installed(packages):
+        def version(name):
+            if name not in packages:
+                raise metadata.PackageNotFoundError(name)
+            return packages[name]
+        monkeypatch.setattr(metadata, "version", version)
+
+    for prefix, version, names, packages in (
+        ("", "0.12.0.1", (), {}),
+        ("xla_cuda", "0.12.0.1", ("xla_cuda13",), {"jax-cuda13-plugin": "0.12.0.1", "jax-cuda13-pjrt": "0.12.0.1"}),
+        ("xla_rocm", "0.9.1", ("xla_rocm7",), {"jax-rocm7-plugin": "0.9.1+rocm7.14.1", "jax-rocm7-pjrt": "0.9.1+rocm7.14.1"}),
+        ("xla_rocm", "0.12.0", ("xla_rocm7",), {"jax-rocm7-plugin": "0.12.0", "jax-rocm7-pjrt": "0.12.0"}),
+    ):
+        installed(packages)
+        assert not js.check_gpu_packages(version, prefix, names)
+
+    for packages in (
+        {"jax-rocm7-plugin": "0.12.0", "jax-rocm7-pjrt": "0.12.0"},
+        {"jax-rocm7-plugin": "0.12.0.1"},
+        {"jax-rocm7-pjrt": "0.12.0.1"},
+        {"jax-rocm7-plugin": "unknown", "jax-rocm7-pjrt": "0.12.0.1"},
+        {"jax-rocm7-plugin": "0.12.0.1.post1", "jax-rocm7-pjrt": "0.12.0.1"},
+        {},
+    ):
+        installed(packages)
+        assert js.check_gpu_packages("0.12.0.1", "xla_rocm", ("xla_rocm7",)), packages
+    assert js.check_gpu_packages("0.12.0.1", "xla_rocm", ())
+    installed({"jax-cuda13-plugin": "0.12.0.1", "jax-cuda13-pjrt": "0.12.0.1",
+               "jax-cuda12-plugin": "0.12.0", "jax-cuda12-pjrt": "0.12.0"})
+    assert js.check_gpu_packages("0.12.0.1", "xla_cuda", ("xla_cuda12", "xla_cuda13"))
+    assert js.check_gpu_packages("unknown", "xla_cuda", ("xla_cuda13",))
+
+
+def test_gpu_wheel_gate_preflight_and_forced_cpu(tmp_path, monkeypatch, capsys):
+    """The metadata preflight and in-process gate reject the same stale ROCm pair."""
+    (tmp_path / "jax_plugins" / "xla_rocm7").mkdir(parents=True)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setenv("JAX_PLATFORMS", "cpu")
+    versions = {"jax": "0.12.0.1", "jaxlib": "0.12.0.1",
+                "jax-rocm7-plugin": "0.12.0", "jax-rocm7-pjrt": "0.12.0"}
+    monkeypatch.setattr(metadata, "version", lambda name: versions[name])
+    monkeypatch.setattr(js, "describe", lambda: dict(
+        version=versions["jax"], version_info=(0, 12, 0, 1), file="jax",
+        jaxlib_version=versions["jaxlib"], jaxlib_version_info=(0, 12, 0), jaxlib_file="jaxlib"))
+    assert js.window_leg() == "ROCM"
+    assert len(js.check_version()) == 2
+    path = Path(__file__).resolve().parents[1] / "tools" / "require_jax.py"
+    spec = util.spec_from_file_location("require_jax_fixture", path)
+    preflight = util.module_from_spec(spec)
+    spec.loader.exec_module(preflight)
+    assert preflight.main() == 86
+    assert "jax-rocm7-plugin" in capsys.readouterr().err
+    versions.update({"jax-rocm7-plugin": "0.12.0.1", "jax-rocm7-pjrt": "0.12.0.1"})
+    assert not js.check_version()
+    assert preflight.main() == 0

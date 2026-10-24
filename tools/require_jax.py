@@ -61,7 +61,9 @@ def main() -> int:
         return 86
 
     support = _load("_lorrax_jax_support", _JAX_SUPPORT)
-    leg = _load("_lorrax_legs", _LEGS).startup_gpu_leg()
+    legs = _load("_lorrax_legs", _LEGS)
+    plugin_names = legs.installed_plugin_names()
+    leg = legs.startup_gpu_leg(plugin_names=plugin_names)
     key = leg.key if leg is not None else "cpu"
     window = support.describe_window(key)
     try:
@@ -74,9 +76,12 @@ def main() -> int:
              if not support.in_window(vi, key)}
     if not wrong and releases["jax"][:2] != releases["jaxlib"][:2]:
         wrong = dict(versions)
+    gpu_problems = support.check_gpu_packages(
+        versions["jaxlib"], leg.jax_plugin_prefix if leg is not None else "", plugin_names)
 
-    if wrong:
+    if wrong or gpu_problems:
         rendered = ", ".join(f"{name}={version}" for name, version in wrong.items())
+        rendered = "; ".join(filter(None, (rendered, *gpu_problems)))
         print(
             f"JAX_ENV_REFUSED: required jax/jaxlib of one series, {window}, on the "
             f"{key} leg; got " + rendered,

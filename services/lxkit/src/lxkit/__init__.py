@@ -63,6 +63,7 @@ from lxkit.legs import (
     leg_for_jax_platform,
     leg_for_platform,
     leg_for_vendor,
+    installed_plugin_names,
     installed_plugin_leg,
     process_accelerator_leg,
     startup_gpu_leg,
@@ -121,7 +122,7 @@ __all__ = [
     # the platform legs of the native-provider ABI
     "legs", "memory", "LEGS", "PlatformLeg", "accelerator_leg_to_open_first",
     "accelerator_legs", "leg_device_present", "leg_for_jax_platform", "leg_for_platform", "leg_for_vendor",
-    "process_accelerator_leg", "installed_plugin_leg", "startup_gpu_leg",
+    "process_accelerator_leg", "installed_plugin_names", "installed_plugin_leg", "startup_gpu_leg",
     # native-provider policy (the tables remain with each caller)
     "native_provider",
     # the per-user persistent-cache root

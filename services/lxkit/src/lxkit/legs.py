@@ -67,7 +67,7 @@ from typing import Callable, Mapping, Optional
 __all__ = [
     "PlatformLeg", "LEGS", "HOST", "accelerator_legs", "leg_for_vendor", "leg_for_jax_platform",
     "leg_device_present", "process_accelerator_leg", "accelerator_leg_to_open_first",
-    "installed_plugin_leg", "startup_gpu_leg",
+    "installed_plugin_names", "installed_plugin_leg", "startup_gpu_leg",
 ]
 
 
@@ -375,7 +375,20 @@ def process_accelerator_leg(*, environ: Mapping[str, str] | None = None,
     return None
 
 
+def installed_plugin_names(*, path=None) -> tuple[str, ...]:
+    """Installed ``jax_plugins`` namespace entries, without importing a plugin."""
+    import sys
+    names = set()
+    for root in (sys.path if path is None else path):
+        try:
+            names.update(os.listdir(os.path.join(root or ".", "jax_plugins")))
+        except OSError:
+            continue
+    return tuple(sorted(names))
+
+
 def installed_plugin_leg(*, path=None, environ: Mapping[str, str] | None = None,
+                         plugin_names=None,
                          exists: Callable[[str], bool] | None = None
                          ) -> Optional[PlatformLeg]:
     """The device leg of the installed jaxlib GPU plugin, or ``None`` (none installed).
@@ -386,13 +399,7 @@ def installed_plugin_leg(*, path=None, environ: Mapping[str, str] | None = None,
     answers before the backend exists.  When plugins of two legs are installed,
     the one whose device is visible here wins (:func:`leg_device_present`).
     """
-    import sys
-    names = set()
-    for root in (sys.path if path is None else path):
-        try:
-            names.update(os.listdir(os.path.join(root or ".", "jax_plugins")))
-        except OSError:
-            continue
+    names = installed_plugin_names(path=path) if plugin_names is None else plugin_names
     found = [leg for leg in accelerator_legs() if leg.jax_plugin_prefix
              and any(n.startswith(leg.jax_plugin_prefix) for n in names)]
     present = [leg for leg in found if leg_device_present(leg, environ=environ, exists=exists)]
@@ -400,6 +407,7 @@ def installed_plugin_leg(*, path=None, environ: Mapping[str, str] | None = None,
 
 
 def startup_gpu_leg(*, path=None, environ: Mapping[str, str] | None = None,
+                    plugin_names=None,
                     exists: Callable[[str], bool] | None = None) -> Optional[PlatformLeg]:
     """The device leg a startup configures, before any backend exists: the leg
     ``JAX_PLATFORMS``'s first entry names, else the installed plugin's
@@ -409,7 +417,7 @@ def startup_gpu_leg(*, path=None, environ: Mapping[str, str] | None = None,
     env = os.environ if environ is None else environ
     first = env.get("JAX_PLATFORMS", "").split(",")[0]
     return (leg_for_jax_platform(first)
-            or installed_plugin_leg(path=path, environ=env, exists=exists))
+            or installed_plugin_leg(path=path, environ=env, plugin_names=plugin_names, exists=exists))
 
 
 def accelerator_leg_to_open_first(platform: str, opened, tried: set, *,
