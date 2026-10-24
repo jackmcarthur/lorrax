@@ -4862,6 +4862,9 @@ def require_parent_screening_consumer(config):
     mode = str(getattr(config.compute_mode, "value", config.compute_mode))
     if diagrams == "w_rpa":
         return
+    if (diagrams == "w_bse" and mode == "tangential"
+            and getattr(getattr(config, "sigma", None), "w_model", None) == "tangential"):
+        return
     if diagrams in ("w_bse", "w_rpa_resolvent") and mode not in ("mpa", "tangential"):
         return
     raise ValueError(

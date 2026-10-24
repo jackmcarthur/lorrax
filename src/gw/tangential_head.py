@@ -195,12 +195,17 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
     # A metal's static row takes the body at z = 0, as its head operands do.
     nodes = metal_response_nodes(points, config, metal=material_class == "metal")
     full = config.head.correction is HeadCorrection.FULL
+    response_samples = getattr(response, "samples", ())
+    micro = bool(response_samples and all(
+        str(getattr(getattr(sample, "response_kind", None), "value",
+                    getattr(sample, "response_kind", ""))) == "micro_reducible"
+        for sample in response_samples))
     if full and response is None:
         raise ValueError("GATE tangential_head: full head requires the direct response and wings")
     ledger = meta.tangential_capacity
     ambient = ledger.live_stages
     samples = []
-    if full:
+    if full and not micro:
         if header is None:
             from file_io.tangential_store import validate_tangential_model
             header = validate_tangential_model(handle["path"], expected_identity=handle["identity"],
@@ -257,6 +262,12 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
     with timing.section("head.sample_terms", announce=True,
                         label="tangential head sample terms"):
         for index, point in enumerate(points):
+            if micro:
+                # The density ladder has already summed microscopic local
+                # fields. Its common head owner restores only the omitted
+                # macroscopic Coulomb term; a Schur fold here counts twice.
+                samples.append(response_samples[index])
+                continue
             total = None
             if full:
                 value = evaluate(jnp.asarray(nodes[index], jnp.complex128), *args)
@@ -269,7 +280,7 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
             del total
             if full:
                 del value
-        if full:
+        if full and not micro:
             del args, b, poles, counts
     if terms:
         rows = [t for t in terms if isinstance(t, dict)]
@@ -294,7 +305,8 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
         # The rows past the fit nodes include the imaginary-axis moment rule,
         # folded through this same exact Gamma body (qsgw_head.head_moment_m1).
         head = fit_head_samples(samples[:len(z)], z, int(config.mpa.n_poles),
-            model="qsgw_schur_"+config.mpa.pole_solver if full else "dft_direct_"+config.mpa.pole_solver,
+            model=("bse_resolvent_micro_" if micro else "qsgw_schur_" if full else
+                   "dft_direct_")+config.mpa.pole_solver,
             solve=config.mpa.pole_solver, occupation_state=occupation_state,
             moment_m1=head_moment_m1(samples, points, metal=material_class == "metal"))
     if jax.process_index() == 0:

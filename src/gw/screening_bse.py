@@ -35,8 +35,8 @@ kernel's ``W_R`` IS the RPA ``W(0)``.  So this module
   4. adds ``v`` back and holds the result as the SAME wedge
      ``symmetry_maps.QirrOperator`` the RPA path returns (the
      ``gw.v_q_g_flat.q_wedge`` tables, q/-q rows paired through the shared
-     TRS policy; the v1 ladder has a TRS gauge but not arbitrary
-     spatial-gauge covariance), gates it, and returns ``{role: W_q}``; the
+     TRS policy and the explicit physical resonant/antiresonant branches),
+     gates it, and returns ``{role: W_q}``; the
      Sigma convolutions unfold it on load, as they do the RPA W.
 
 PERSIST-BEFORE-LOAD IS THE ORDERING CONSTRAINT OF THE WHOLE FEATURE, and
@@ -535,7 +535,8 @@ def prepare_ladder_restart(
     reads its copy back off disk, which is the point of the persist.
 
     THE PERSIST IS UNCONDITIONAL ON THIS BRANCH, INCLUDING UNDER
-    ``compute_mode = mpa``.  The driver's own flush skips MPA because
+    the shared-pole full-frequency route. The driver's ordinary flush skips
+    this route because
     ``persist_w0_and_head``'s ``{0, probe}`` head grid is not MPA's sample
     set -- a real refusal, kept.  What this branch writes is not MPA's
     sample set either: it is the ONE static RPA W(0) the ladder kernel
@@ -556,10 +557,9 @@ def prepare_ladder_restart(
         raise ValueError(
             f"GATE {diagram_name}_head_placement_unimplemented: "
             f"head_channel got: {type(head_channel).__name__}; want: None "
-            "from mc_average_placement = off; why: v1 keeps the q=0 "
-            "head/wing channel RPA and "
-            f"the resolvent replaces the body only; a post-solve head "
-            f"rescale is a second opinion about the same channel.  Fix the "
+            "from mc_average_placement = off; why: the physical ladder "
+            "head already includes the finite-G response, and a second "
+            "post-solve head rescale has no derived composition. Fix the "
             f"parse gate, do not serve this here.")
 
     # THE TWO PRECONDITION BLOCKS, in cost order.  The occupation gate runs

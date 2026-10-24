@@ -67,6 +67,7 @@ def test_parent_admission_uses_actual_tangential_mode_and_preserves_refusals():
 
 
 def test_ladder_diagram_and_rung_digest_reach_restart_validation():
+    from bse.w_ladder import LADDER_RESPONSE_CONVENTION
     base = {name: "same-state" for name in ("iteration_id", "hamiltonian", "energies",
         "occupations", "wavefunctions", "centroids", "recipe_hash", "gate_hash")}
     captured = {}
@@ -77,10 +78,11 @@ def test_ladder_diagram_and_rung_digest_reach_restart_validation():
         raise AtRestart
     static = np.eye(2)
     modules = {
+        "bse.w_ladder": NS(LADDER_RESPONSE_CONVENTION=LADDER_RESPONSE_CONVENTION),
         "screening_bse": NS(_GMRES_MAX_ITER=300, _GMRES_TOL=1e-6,
             _assert_wedge_matches_run=None, _finalize_ladder_head=None,
             prepare_ladder_restart=lambda *a, **k: static),
-        "response_bank": NS(operator_digest=lambda a, _m: hashlib.sha256(a.tobytes()).hexdigest()),
+        "response_bank": NS(operator_digest=lambda a, _m, **_kw: hashlib.sha256(a.tobytes()).hexdigest()),
         "gw_config": NS(uses_full_bispinor_tangential=lambda _c: False),
         "ppm_pipeline": NS(observing_window_source=lambda: False, publish_window_source=None),
         "file_io.tangential_store": NS(initialize_tangential_bank=None),
@@ -107,6 +109,7 @@ def test_ladder_diagram_and_rung_digest_reach_restart_validation():
             occupation_state=None, print_fn=lambda *a: None,
             material_class="insulator", bank_source=source)
     assert captured["screening_diagrams"] == "w_bse"
+    assert captured["ladder_response_convention"] == "physical-ra-v1"
     assert captured["ladder_static_w_sha256"] == hashlib.sha256(static.tobytes()).hexdigest()
     assert captured["ladder_head_policy"] == "off"
 
@@ -116,17 +119,20 @@ def test_ladder_diagram_and_rung_digest_reach_restart_validation():
     _definitions("src/file_io/tangential_store.py", {"_IDENTITY_KEYS", "_check_identity"}, ns)
     ns["_check_identity"](captured, captured)
     for stale in (base, dict(captured, screening_diagrams="w_rpa"),
+                  dict(captured, ladder_response_convention="folded-hybrid"),
                   dict(captured, ladder_static_w_sha256="other-rung"),
                   dict(captured, ladder_head_policy="full")):
         with pytest.raises(ValueError, match="stale input/SC identity"):
             ns["_check_identity"](stale, captured)
 
 
-def test_micro_reducible_head_reuses_samples_without_body_or_second_fold():
+@pytest.mark.parametrize("micro", [True, False])
+def test_head_reuses_micro_samples_and_preserves_direct_response_route(micro):
     enums = _enums()
-    samples = tuple(NS(response_kind="micro_reducible", token=i) for i in range(3))
+    samples = tuple(NS(response_kind="micro_reducible" if micro else "direct_irreducible",
+                       token=i) for i in range(3))
     points = (1j, 2j, 3j)
-    response = NS(omegas=points, samples=samples)
+    response = NS(omegas=points, samples=samples) if micro else NS(omegas=points)
     seen = {}
     def forbidden(*_a, **_k):
         raise AssertionError("A micro-reducible head must not read or Schur-fold the body")
@@ -146,8 +152,11 @@ def test_micro_reducible_head_reuses_samples_without_body_or_second_fold():
         "mpa.model": NS(fit_head_samples=fit, head_moment_report=forbidden),
         "mpa.sample_plan": NS(plan_z=lambda _plan: np.array(points[:2])),
         "qsgw_head": NS(IterationHeadSamples=lambda **kwargs: NS(**kwargs),
-            finalize_iteration_head_rows=forbidden, head_moment_m1=moment,
-            iteration_head_sample_terms=forbidden, metal_response_nodes=lambda p, *_a, **_k: p),
+            finalize_iteration_head_rows=forbidden if micro else lambda *_a, **_k: (),
+            head_moment_m1=moment,
+            iteration_head_sample_terms=forbidden if micro else
+                lambda _response, index, _body, **_kwargs: samples[index],
+            metal_response_nodes=lambda p, *_a, **_k: p),
         "response_bank": NS(_reserve=forbidden),
         "qgrid_symmetry": NS(tangential_operator_realizer=forbidden),
         "distrib_la": NS(),
@@ -157,7 +166,8 @@ def test_micro_reducible_head_reuses_samples_without_body_or_second_fold():
         "timing": NS(section=lambda *a, **k: nullcontext())}
     _definitions("src/gw/tangential_head.py", {"build_tangential_head"}, ns)
     config = NS(head=NS(uses_bgw_metal_q0shift=False,
-                        correction=enums["HeadCorrection"].FULL),
+                        correction=enums["HeadCorrection"].FULL if micro else
+                            enums["HeadCorrection"].OFF),
                 mpa=NS(n_poles=2, pole_solver="pade"))
     meta = NS(tangential_capacity=NS(live_stages=()),
               tangential_recipe={"census": {"mu_ry": 0.}})
@@ -166,6 +176,24 @@ def test_micro_reducible_head_reuses_samples_without_body_or_second_fold():
         "digest": "ladder-body"}, None, None, wfns, meta, config,
         mesh_xy=None, wfn=None, response=response, head_resolver=None,
         plan=object(), material_class="insulator", occupation_state=None)
-    assert seen["model"] == "bse_resolvent_micro_pade"
+    assert seen["model"] == ("bse_resolvent_micro_pade" if micro else "dft_direct_pade")
     assert seen["moment_m1"] == 0.7 and iteration.samples == samples
     assert head["body_digest"] == "ladder-body"
+
+
+def test_temporary_operator_digest_does_not_retain_static_rung():
+    import gc
+    import weakref
+    ns = dict(np=np, hashlib=hashlib, _OPERATOR_DIGESTS={},
+              _operator_digest_program=lambda _mesh, _shape: lambda value: np.sum(value))
+    _definitions("src/gw/response_bank.py", {"operator_digest"}, ns)
+    operator = np.eye(2)[None]
+    reference = weakref.ref(operator)
+    expected = ns["operator_digest"](operator, object(), cache=False)
+    assert not ns["_OPERATOR_DIGESTS"]
+    del operator
+    gc.collect()
+    assert reference() is None
+    held = np.eye(2)[None]
+    assert ns["operator_digest"](held, object()) == expected
+    assert ns["_OPERATOR_DIGESTS"][id(held)][0] is held

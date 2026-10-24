@@ -458,13 +458,13 @@ def coerce_screening_diagrams(value) -> ScreeningDiagrams:
 #: Predicates take the resolved :class:`LorraxConfig`.
 #:
 #: SUPPORTED, deliberately absent from this table: ``cohsex``, ``gn_ppm``,
-#: ``mpa`` and ``qp_solver = one_shot_dft``.
+#: ``tangential`` (shared-pole model) and ``qp_solver = one_shot_dft``.
 _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
     (
         "w_bse_needs_a_screened_mode",
         lambda cfg: cfg.compute_mode is ComputeMode.X_ONLY,
         lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
-        "a mode that consumes W: cohsex, gn_ppm, or mpa",
+        "a mode that consumes W: cohsex, gn_ppm, or tangential",
         "drop screening_diagrams (or set it to w_rpa) for a bare-exchange "
         "run, or pick a screened compute_mode",
         "x_only builds no W at all, so a ladder-corrected W would be "
@@ -476,7 +476,7 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
         "w_bse_hl_ppm_broadening_unimplemented",
         lambda cfg: cfg.compute_mode is ComputeMode.HL_PPM,
         lambda cfg: f"compute_mode = {cfg.compute_mode.value}",
-        "cohsex (ladder W(0)), gn_ppm (ladder W(0) + W(i*omega_p)), or mpa",
+        "cohsex (ladder W(0)), gn_ppm (ladder W(0) + W(i*omega_p)), or tangential",
         "use gn_ppm, whose probe sits on the imaginary axis where the "
         "resolvent needs no broadening policy, or keep w_rpa for hl_ppm",
         "the HL probe is a REAL-axis frequency, and (z - H)^-1 on the real "

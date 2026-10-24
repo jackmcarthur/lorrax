@@ -500,13 +500,17 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         material_class=None, wfns_transverse=None,
                         bispinor_v_q_path=None, mu_bases=None,
                         photon_g0_vectors=None, photon_head_cache=None,
-                        photon_head_state=None):
+                        photon_head_state=None, bank_source=None):
     """Build current W; only one-shot models may use ISDF restart membership.
 
     SC labels own separate map scratch. ``restart`` may restore the invariant
     ISDF basis, but never skips the current response or W construction.
     """
     source_wfn = None
+    diagrams = str(getattr(config.screening.diagrams, "value", config.screening.diagrams))
+    if diagrams != "w_rpa" and bank_source is None:
+        raise ValueError("GATE tangential_response_source: a non-RPA diagram requires its own "
+                         "sample, derivative, moment and head source")
     from .gw_config import uses_full_bispinor_tangential
     photon = uses_full_bispinor_tangential(config)
     if photon and int(meta.nspinor) != 4:
@@ -566,6 +570,8 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 wfns_transverse = dataclasses.replace(wfns_transverse, occ=wfns.occ)
         identity = tangential_identity(wfns, meta, label=label, wfn=wfn,
             binding=wfn_fingerprint_binding, centroid_indices=centroid_indices)
+        if bank_source is not None:
+            identity.update(bank_source["identity"]())
         sc_scratch = str(label).startswith("sc_")
         if config.restart and tensors_filename is not None and not sc_scratch and not photon:
             handle = tangential_restart_handle(tensors_filename,
@@ -577,7 +583,8 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                     from .tangential_head import build_tangential_head
                     head, iteration_head = build_tangential_head(
                         handle, None, V_q, wfns, meta, config, mesh_xy=mesh_xy, wfn=wfn,
-                        response=iteration_head_response, head_resolver=head_resolver,
+                        response=(bank_source["head"]() if bank_source is not None
+                                  else iteration_head_response), head_resolver=head_resolver,
                         plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
                     result.update(mpa_head=head, iteration_head=iteration_head)
                 # The export is written only once the map is complete, so an
@@ -751,6 +758,10 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             log.debug('tangential bank: not produced; '
                      + ('committed model reused' if resume_constructor == 'committed'
                         else 'authenticated complete producer artifact reused'))
+        elif bank_source is not None:
+            sample_receipt, moment_receipt = bank_source["bank"](bank)
+            record("bank", sample_receipt)
+            record("moments", moment_receipt)
         elif photon:
             from .response_bank import compute_photon_bank
             record("bank", compute_photon_bank(wfns, wfns_transverse, meta, config,
@@ -763,7 +774,7 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         else:
             record("bank", produce_w_bank(wfns, meta, config, mesh_xy=mesh_xy,
                 sym=sym, sample_plan=recipe, bank_io=bank, print_fn=print_fn))
-    if not photon and not resume_constructor:
+    if not photon and not resume_constructor and bank_source is None:
         with timing.section("spole.moments", announce=True,
                             label="tangential response moments"):
             record("moments", compute_response_moments(wfns, meta, config,
@@ -873,7 +884,8 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             from .tangential_head import build_tangential_head
             head, iteration_head = build_tangential_head(
                 handle, header, V_q, wfns, meta, config, mesh_xy=mesh_xy, wfn=wfn,
-                response=iteration_head_response, head_resolver=head_resolver,
+                response=(bank_source["head"]() if bank_source is not None
+                          else iteration_head_response), head_resolver=head_resolver,
                 plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
             result.update(mpa_head=head, iteration_head=iteration_head)
             record("head", head)

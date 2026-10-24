@@ -112,8 +112,9 @@ def head_operator_key(mesh_xy: Mesh, data: dict, *, include_w: bool,
     """Structural identity of the head operator — everything that is baked into
     the compiled program, and nothing that is not.
 
-    ``include_w`` picks a different builder entirely (``build_ladder_resolvent``
-    delegates to ``bse_w_exact._build_rpa_resolvent`` when it is False), the
+    ``include_w`` selects the direct rung. Without that rung, the historical
+    folded RPA builder is used unless ``physical_branches`` explicitly selects
+    the physical R/A control. The
     k-grid and the pair-window pads set the shapes, the mesh sets the sharding,
     and ``fuse_ladder_rung`` selects ``bse_ring_comm._impl_core_fused`` — a cost
     switch, but still a different program.  ``V_q0`` / ``W_q`` VALUES are absent
