@@ -31,6 +31,7 @@ from runtime.padding import (authenticate_axis, authenticate_padded_axis,
 from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSION,
     BAND_WINDOW_CARRIER_DATASET, CHARGE_ZETA_IDENTITY_DATASET,
     COULOMB_POLICY_DATASET, DOWNFOLD_PROVENANCE_GROUP,
+    RESTART_LOGICAL_SHAPE_ATTR, RESTART_PADDED_AXES_ATTR,
     _decode_charge_zeta_identity, _loaded_band_axis, _validate_shape_receipt,
     coulomb_policy_from_config, compare_coulomb_policy, parse_coulomb_policy,
     format_coulomb_policy)
@@ -173,6 +174,26 @@ def describe_coulomb_policy_match(filename, cfg, meta=None) -> str:
         "running policy is the one you meant.")
 
 
+def _validate_band_window_receipts(stored_w, stored_carrier, filename):
+    """Authenticate the logical window and its producer's padded carrier."""
+    logical, carrier = np.asarray(stored_w), np.asarray(stored_carrier)
+    if (logical.shape != (5,) or carrier.shape != (5,)
+            or not np.issubdtype(logical.dtype, np.integer)
+            or not np.issubdtype(carrier.dtype, np.integer)):
+        raise ValueError(
+            f"Restart file {filename} has malformed band-window receipts: "
+            f"logical={stored_w}, carrier={stored_carrier}; expected two "
+            "integer five-edge windows.")
+    logical, carrier = tuple(map(int, logical)), tuple(map(int, carrier))
+    if (logical[0] < 0 or any(a > b for a, b in zip(logical, logical[1:]))
+            or logical[:4] != carrier[:4] or carrier[4] < logical[4]):
+        raise ValueError(
+            f"Restart file {filename} has inconsistent logical/carrier "
+            f"band receipts: logical={logical}, carrier={carrier}. The "
+            "carrier may add only a zero-pad tail above the logical b4.")
+    return logical, carrier
+
+
 def assert_restart_window_matches(filename, band_slices=None,
                                  n_rmu_logical=None) -> None:
     """Authenticate a current bundle and its logical band and centroid receipts."""
@@ -204,18 +225,7 @@ def assert_restart_window_matches(filename, band_slices=None,
                 f"{stored_schema} but is missing band_window, "
                 f"band_window_split, or {BAND_WINDOW_CARRIER_DATASET}. The "
                 "geometry receipt is torn.")
-        if len(stored_w) != 5 or len(stored_carrier) != 5:
-            raise ValueError(
-                f"Restart file {filename} has malformed band-window receipts: "
-                f"logical={stored_w}, carrier={stored_carrier}; expected two "
-                "five-edge windows.")
-        logical = tuple(int(v) for v in stored_w)
-        carrier = tuple(int(v) for v in stored_carrier)
-        if logical[:4] != carrier[:4] or carrier[4] < logical[4]:
-            raise ValueError(
-                f"Restart file {filename} has inconsistent logical/carrier "
-                f"band receipts: logical={logical}, carrier={carrier}. The "
-                "carrier may add only a zero-pad tail above the logical b4.")
+        _validate_band_window_receipts(stored_w, stored_carrier, filename)
 
     # THE χ COUNT MUST MATCH; THE Σ COUNT NEED NOT, and the asymmetry is the
     # point.  Every tensor in this file is a function of the SCREENING side or
@@ -684,6 +694,60 @@ def read_head_metadata(filename):
                     bare_head=value("vhead"), screened_head=value("whead"))
 
 
+def _metadata_band_count(f):
+    """Logical band count without materializing a parent wavefunction face.
+
+    Paired schema-2 windows are authoritative, including empty or all-zero
+    physical bands. Older accepted files without a carrier receipt retain
+    their parent-zero amplitude convention, read backwards in <=1 MiB slabs.
+    This is serial metadata I/O; it introduces no collective.
+    """
+    if BAND_WINDOW_CARRIER_DATASET in f:
+        logical, carrier = _validate_band_window_receipts(
+            f["band_window"][()], f[BAND_WINDOW_CARRIER_DATASET][()], f.filename)
+        count, carried = logical[4] - logical[0], carrier[4] - carrier[0]
+        axes = (("psi_parent_y", 1), ("psi_parent_y_mun", 3), ("enk_full", 1),
+                ("psi_parent_y_transverse", 1), ("psi_parent_y_transverse_mun", 3))
+        for name, axis in axes:
+            if name not in f:
+                continue
+            ds = f[name]
+            _validate_shape_receipt(name, ds)
+            expected_ndim = 2 if name == "enk_full" else 4
+            if len(ds.shape) != expected_ndim or ds.shape[axis] not in (count, carried):
+                raise ValueError(
+                    f"Restart dataset {name!r}: band extent {ds.shape} disagrees "
+                    f"with logical/carrier band counts {count}/{carried}.")
+            # Current writers trim the disk band axis; earlier schema-2
+            # writers may retain its carrier. An explicit axis receipt must
+            # agree with the physical window. Appending on another mesh may
+            # change a dataset's producer carrier; its own receipt validates
+            # that padding independently of the original window's carrier.
+            if RESTART_PADDED_AXES_ATTR in ds.attrs:
+                if RESTART_LOGICAL_SHAPE_ATTR not in ds.attrs:
+                    raise ValueError(
+                        f"Restart dataset {name!r}: padded band-axis receipt "
+                        "has no authenticated logical storage shape.")
+                for row in np.asarray(ds.attrs[RESTART_PADDED_AXES_ATTR]):
+                    if int(row[0]) == axis and int(row[1]) != count:
+                        raise ValueError(
+                            f"Restart dataset {name!r}: padded band-axis receipt "
+                            f"disagrees with logical band count {count}.")
+        return count
+
+    psi = f["psi_parent_y"]
+    if len(psi.shape) != 4 or not psi.shape[0] or len(f["enk_full"].shape) != 2:
+        raise ValueError("Legacy restart band metadata requires a parent wavefunction row "
+                         "and a (k, band) energy table")
+    width = max(1, (1 << 20) // psi.dtype.itemsize)
+    for band in range(psi.shape[1] - 1, -1, -1):
+        for spin in range(psi.shape[2]):
+            for mu in range(0, psi.shape[3], width):
+                if np.any(psi[0, band, spin, mu:mu + width] != 0):
+                    return band + 1
+    return int(f["enk_full"].shape[1])
+
+
 def read_metadata(filename):
     """Return small, replicated bundle facts in canonical file order.
 
@@ -695,14 +759,8 @@ def read_metadata(filename):
         _require_current(f)
         def value(name):
             return np.asarray(f[name][()]) if name in f else None
-        # Uniform band padding is exact zero in every parent face. A single
-        # parent row detects the logical prefix without loading full-k psi;
-        # preserve the all-zero-file fallback of the BSE reader.
-        psi0 = np.asarray(f["psi_parent_y"][0])
-        populated = np.flatnonzero(np.any(psi0 != 0, axis=(1, 2)))
-        nb_logical = int(populated[-1]) + 1 if populated.size else f["enk_full"].shape[1]
         return dict(
-            logical_band_count=nb_logical,
+            logical_band_count=_metadata_band_count(f),
             energies=value("enk_full"), grid=value("kgrid"),
             parent_k_rows=value("psi_parent_k_rows"),
             band_window=value("band_window"), band_split=value("band_window_split"),
