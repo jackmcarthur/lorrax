@@ -151,8 +151,10 @@ def _cpu_in_use_by_device() -> dict:
     A global array and its addressable local array can hold the same storage.
     Counting both as independent operands understates room. Reading a local
     array's cached ``addressable_shards`` also creates a self-reference in JAX;
-    use its pointer directly. Multi-device arrays need their local shards, whose
-    single-device data arrays are then inspected without that cached property.
+    use its pointer directly. A global array with one local buffer uses
+    ``addressable_data(0)``: JAX 0.12's replicated wrapper can retain the global
+    sharding in ``addressable_shards``, which then rejects it as non-local.
+    Multiple local buffers use their individual shards.
     """
     import jax
     spans = {}
@@ -162,8 +164,12 @@ def _cpu_in_use_by_device() -> dict:
         devices = a.devices()
         if not any(d.platform == "cpu" for d in devices):
             continue
-        parts = ((a,) if len(devices) == 1 else
-                 (s.data for s in a.addressable_shards))
+        if len(devices) == 1:
+            parts = (a,)
+        elif len(a.sharding.addressable_devices) == 1:
+            parts = (a.addressable_data(0),)
+        else:
+            parts = (s.data for s in a.addressable_shards)
         for part in parts:
             device = next(iter(part.devices()))
             if device.platform != "cpu":

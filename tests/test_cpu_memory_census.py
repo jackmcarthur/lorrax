@@ -96,12 +96,28 @@ def main():
         if was_enabled: gc.enable()
         assert not alive,'memory reader retained a local shard until cyclic GC'
 
+    def replicated_mesh_array_and_local_alias():
+        baseline=resident()
+        sharding=NamedSharding(stack.mesh,P())
+        a=jax.device_put(np.ones((12,6),np.complex128),sharding)
+        a.block_until_ready()
+        expected=a.nbytes*len(sharding.addressable_devices)
+        assert resident()-baseline==expected
+        local=a.addressable_data(0)
+        assert resident()-baseline==expected
+        del a
+        assert resident()-baseline==local.nbytes
+        del local
+        gc.collect()
+        assert resident()==baseline
+
     for case in (local_alias_and_distinct_allocations,overlapping_external_views,single_device_named_sharding,
-                 distributed_array_and_local_alias,observer_does_not_form_cycles):
+                 distributed_array_and_local_alias,observer_does_not_form_cycles,
+                 replicated_mesh_array_and_local_alias):
         case()
     t=time.perf_counter()
     for _ in range(100): resident()
-    print('CPU_CENSUS PASS '+json.dumps(dict(rank=jax.process_index(),cases=5,
+    print('CPU_CENSUS PASS '+json.dumps(dict(rank=jax.process_index(),cases=6,
           empty_read_mean_seconds=(time.perf_counter()-t)/100)),flush=True)
     runtime.finalize_process(0)
 
