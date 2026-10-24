@@ -87,8 +87,9 @@ spent 310 s on the first f64 8192² GEMM of a laptop GPU (4.1 s at level 0).
 At level 0 with Triton GEMM on, JAX 0.12 runs that GEMM as an untuned Triton
 kernel, 3.70 TFLOP/s on an 80 GB A100; with Triton GEMM off it is cuBLAS at
 19.3, as at XLA's default level 4, and the 36-program cold compile takes
-5.14 s against 7.78 s at level 4. The 80 GB references are measured with
-both flags (2026-10-24, n = 3). The 40 GB references predate the flags.
+5.14 s against 7.78 s at level 4. The cold-compile and GEMM references of
+both A100 models are measured with both flags (2026-10-24, n = 3; 40 GB:
+5.16 s, 19.3 TFLOP/s).
 
 ## Calibration
 

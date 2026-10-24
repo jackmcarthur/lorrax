@@ -93,12 +93,13 @@ REFERENCE: dict = {
     },
     # job 60190769, nid002136, 2026-10-23, 581a81831, n=3: compile_cold 7.68/7.75/8.02 s,
     # warm 0.696-0.703, NVRTC 5.75/6.78/7.03 (22%), GEMM 19.28-19.29, FFT 1.240-1.241 ms,
-    # import 3.7/3.8/10.6 s (first touch).  Measured at XLA's default autotune level, NOT with
-    # LORRAX's XLA flags: GEMM matches them (80GB: 19.3 TF both ways), compile_cold is ~1.5x
-    # looser than they give (80GB: 7.78 -> 5.14 s) until it is re-measured.
+    # import 3.7/3.8/10.6 s (first touch).  compile_cold and GEMM re-measured with LORRAX's XLA
+    # flags (autotune 0, Triton GEMM off, remat off): job 60202625, nid002132, 2026-10-24,
+    # d8ced33c3 image, perf_check by hand x3: compile_cold 5.162/5.153/5.162 s, GEMM 19.329/
+    # 19.327/19.316 TF (warm 0.685-0.689, NVRTC 7.07/5.57/5.72, FFT 1.239: old references kept).
     "NVIDIA A100-SXM4-40GB": {
-        "import_s": 10.6, "compile_cold_s": 7.75, "compile_warm_s": 0.699,
-        "nvrtc_s": 6.78, "gemm_tflops": 19.29, "fft_ms": 1.240, "host_gemm_s": None,
+        "import_s": 10.6, "compile_cold_s": 5.16, "compile_warm_s": 0.699,
+        "nvrtc_s": 6.78, "gemm_tflops": 19.32, "fft_ms": 1.240, "host_gemm_s": None,
     },
 }
 #: A metric fails when it is worse than reference by more than this fraction...
