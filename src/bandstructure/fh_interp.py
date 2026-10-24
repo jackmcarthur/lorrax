@@ -34,6 +34,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common import Meta
 from common import timing
 from common.band_degeneracy import DEGENERACY_TOL_RY
+from common.log import get_logger
 from common.units import RYD_TO_EV
 from file_io.restart_bundle import read_eqp_energies
 from runtime.padding import spec_divisor
@@ -65,6 +66,8 @@ from common.collectives import (
 )
 from runtime.padding import padded_axis
 from distrib_la import eigh_local
+
+logger = get_logger(__name__)
 
 
 def _build_mesh_xy() -> Mesh:
@@ -1351,7 +1354,7 @@ def load_wfns_and_enk_for_sigma(wfn, sym, nval: int, ncond: int, nband: int):
 
 
 def qp_window_energies(eqp_path: str, sym, band_window: tuple[int, int],
-                       enk_dft, nelec: int, log_fn) -> jax.Array:
+                       enk_dft, nelec: int) -> jax.Array:
     """QP energies on the htransform window, scissored above the eqp file.
 
     Inside the bands the eqp file covers, the energies are its QP energies
@@ -1364,8 +1367,8 @@ def qp_window_energies(eqp_path: str, sym, band_window: tuple[int, int],
 
     the k-weighted mean of :func:`gw.scissor.fit_scissor` with
     ``conduction_rigid_mean`` (the law the SC loop applies to its sum-band
-    tail).  Without it the window would mix QP levels below ``b_qp`` with
-    unshifted DFT levels above it.
+    tail), logged at INFO.  Without it the window would mix QP levels below
+    ``b_qp`` with unshifted DFT levels above it.
 
     Parameters
     ----------
@@ -1413,7 +1416,7 @@ def qp_window_energies(eqp_path: str, sym, band_window: tuple[int, int],
     out = dft.copy()
     out[:n_corr] = corrected
     out[n_corr:] = dft[n_corr:] + fit.beta_c_ev / RYD_TO_EV
-    log_fn(
+    logger.info(
         f"  [QP scissor] bands [{qp_stop}, {end}) lie above {name}: DFT "
         f"{fit.beta_c_ev:+.4f} eV, the mean QP-DFT shift of its conduction "
         f"bands [{start + first_c}, {qp_stop}) (rms {fit.rmse_c_ev:.4f} eV "
@@ -1783,7 +1786,7 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             raise SystemExit(f"FATAL: --eqp-file was given but not found: {eqp_path}")
         try:
             enk_sigma = qp_window_energies(
-                eqp_path, sym, nsigmarange, enk_sigma, int(wfn.nelec), log_fn)
+                eqp_path, sym, nsigmarange, enk_sigma, int(wfn.nelec))
             log_fn(
                 f"Using DIAGONAL QP APPROXIMATION from "
                 f"{os.path.basename(eqp_path)} for band window "

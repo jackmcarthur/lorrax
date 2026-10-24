@@ -50,13 +50,15 @@ def _eqp(path, case, nb):
     return str(path)
 
 
-def test_bands_above_the_eqp_file_get_the_mean_conduction_shift(case, tmp_path):
+def test_bands_above_the_eqp_file_get_the_mean_conduction_shift(
+        case, tmp_path, caplog):
     from bandstructure.fh_interp import qp_window_energies
     sym, _k, _ew, _qw, e_full, q_full = case
     eqp = _eqp(tmp_path / "eqp1.dat", case, NB_EQP)
-    lines = []
-    got = np.asarray(qp_window_energies(
-        eqp, sym, (0, NB_DFT), e_full.T / RY, NELEC, lines.append))
+    with caplog.at_level("INFO", logger="lorrax.bandstructure.fh_interp"):
+        got = np.asarray(qp_window_energies(
+            eqp, sym, (0, NB_DFT), e_full.T / RY, NELEC))
+    lines = [r.getMessage() for r in caplog.records if "QP scissor" in r.getMessage()]
     shift = float(np.mean((q_full - e_full[:, :NB_EQP])[:, NELEC:]))
     assert np.allclose(got[:NB_EQP], q_full.T / RY, atol=1e-12)
     assert np.allclose(got[NB_EQP:], (e_full[:, NB_EQP:].T + shift) / RY,
@@ -65,16 +67,16 @@ def test_bands_above_the_eqp_file_get_the_mean_conduction_shift(case, tmp_path):
     assert f"[{NB_EQP}, {NB_DFT})" in lines[0]
 
 
-def test_window_inside_the_eqp_file_is_unchanged(case, tmp_path):
+def test_window_inside_the_eqp_file_is_unchanged(case, tmp_path, caplog):
     from bandstructure.fh_interp import qp_window_energies
     sym, _k, _ew, _qw, e_full, _q = case
     eqp = _eqp(tmp_path / "eqp1.dat", case, NB_EQP)
-    lines = []
-    got = qp_window_energies(eqp, sym, (0, NB_EQP),
-                             e_full[:, :NB_EQP].T / RY, NELEC, lines.append)
+    with caplog.at_level("INFO", logger="lorrax.bandstructure.fh_interp"):
+        got = qp_window_energies(eqp, sym, (0, NB_EQP),
+                                 e_full[:, :NB_EQP].T / RY, NELEC)
     assert np.array_equal(np.asarray(got),
                           np.asarray(read_eqp_energies(eqp, sym, (0, NB_EQP))))
-    assert lines == []
+    assert not any("QP scissor" in r.getMessage() for r in caplog.records)
 
 
 def test_eqp_file_without_conduction_bands_refuses(case, tmp_path):
@@ -82,8 +84,7 @@ def test_eqp_file_without_conduction_bands_refuses(case, tmp_path):
     sym, _k, _ew, _qw, e_full, _q = case
     eqp = _eqp(tmp_path / "eqp1.dat", case, NELEC)
     with pytest.raises(ValueError, match="below the first conduction band"):
-        qp_window_energies(eqp, sym, (0, NB_DFT), e_full.T / RY, NELEC,
-                           print)
+        qp_window_energies(eqp, sym, (0, NB_DFT), e_full.T / RY, NELEC)
 
 
 def _si_path(tmp_path):
