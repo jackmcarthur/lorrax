@@ -381,6 +381,8 @@ def mathdx_root() -> str:
 
     Found from the Python package spec, never from an environment variable;
     NVRTC includes ``include/`` and ``external/cutlass/include`` beneath it.
+    Return the physical wheel path so checkout symlinks do not change the
+    FFI attribute and its persistent compilation key.
     """
     import importlib.util
     import os
@@ -391,7 +393,7 @@ def mathdx_root() -> str:
     roots = list(spec.submodule_search_locations) if spec is not None else []
     for root in roots:
         if os.path.isfile(os.path.join(root, "include", "cufftdx.hpp")):
-            return root
+            return os.path.realpath(root)
     raise RuntimeError(
         "GATE mathdx-headers: got no importable nvidia.mathdx with "
         "include/cufftdx.hpp; want the nvidia-mathdx wheel, the only supported "

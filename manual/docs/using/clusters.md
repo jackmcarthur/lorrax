@@ -1,15 +1,15 @@
 # Running on clusters
 
-Choose a process count, read the memory plan, and compare with measured GW calculations on Perlmutter.
+How many GPUs a calculation needs: the job rules, the per-GPU budget, a Green's-function size estimate, and real Perlmutter runs.
 {: .page-summary }
 
 ## Job rules {: #rules }
 
-- **Process count.** Use one MPI rank per GPU and a square total: 1, 4, 9, 16, 25, 36, …. The mesh has equal `x` and `y` dimensions. CPU jobs use the same square rank counts; 64 and 144 ranks give 8×8 and 12×12 meshes. Set the cores and threads per rank explicitly using the [machine launch settings](installation.md#routes).
-- **One GPU model and memory class.** Mixed models refuse (`GATE heterogeneous_gpu_targets`). On Perlmutter request `-C 'gpu&hbm40g'` or `-C 'gpu&hbm80g'` for a multi-node GPU job.
-- **Shared run directory.** Every rank must see the same run directory (`$SCRATCH` or CFS). A multi-node write to a node-local directory refuses (`GATE io_global_commit`, stage `SlabIO.shared_directory`).
+- **Process count.** One process per device, and the device count a perfect square: 1, 4, 9, 16, 25, 36, …. Any other count refuses at startup and names the two nearest squares; 32 GPUs (8 Perlmutter nodes) is not a legal job, 36 (9 nodes) is.
+- **One GPU model and memory class.** Mixed models refuse (`GATE heterogeneous_gpu_targets`). On Perlmutter a multi-node job requests `-C 'gpu&hbm40g'` or `-C 'gpu&hbm80g'`.
+- **Shared run directory.** A multi-node run writes into a directory every node mounts (`$SCRATCH`, CFS). A node-local one (`/tmp`, local NVMe) refuses at the first write (`GATE io_global_commit`, stage `SlabIO.shared_directory`).
 
-Run centroids → dipole → kinetic/ionic matrix elements → GW under the same environment and with matching inputs. Complete band multiplets at every selected window boundary; widening a requested band count is preferable to cutting a degenerate subspace. Preserve the resolved counts in the reference record.
+Launch lines per machine are on the [installation page](installation.md#routes).
 
 ## The memory budget {: #budget }
 
@@ -44,15 +44,23 @@ For many-band runs, inspect the wavefunction route too. A two-axis distribution 
 
 ## Local or distributed linear algebra {: #linalg }
 
-`linalg = local` requests whole-matrix solves on individual ranks. The services price those matrices and their workspace and can use the mesh route when they do not fit. `linalg = distributed` requests matrix solves across the mesh. Both operate on distributed inputs and outputs; the distinction is where the solve itself happens.
+The deck key `linalg` (default `local`) requests the layout of dense solves. Under `local` each GPU solves whole $N_\mu\times N_\mu$ matrices for its share of the irreducible q points, with no distributed factorization; under `distributed` each matrix is factored over the whole mesh (cuSOLVERMp), which divides its memory by $P$ but communicates inside every factorization.
 
-Whole-matrix solves are often faster when several independent q matrices fit per rank. Distributed solves become useful when one matrix and its workspace are too large. Read the selected route in the report instead of inferring it from the deck alone.
+`local` is a request, not a guarantee. For a W Dyson batch of $Q$ stored q rows, the local-route model includes the face-tiled V, χ and W plus whole copies for $\lceil Q/P\rceil$ q points and one LU pair,
+
+$$
+\frac{48\,QN_\mu^2}{P} + 16N_\mu^2\left(3\lceil Q/P\rceil + 2\right)\ \text{bytes per GPU},
+$$
+
+where $Q$ is the actual batch width, distinct from the full k-grid normalization. Provider workspace and live allocations also enter the admission decision. The local route runs when it fits; otherwise the service can use the distributed LU. Eigensolves choose the same way between whole matrices per GPU and the whole-mesh eigensolver, by fit and modelled speed. The choice prints once as `route W Dyson …: local` (or `distributed`) and appears in the report's Routes table.
+
+More ranks divide face storage and can reduce the number of whole matrices assigned to a rank. Independent whole-matrix solves can be faster when they fit; distributed solves are useful when one matrix and its workspace are too large. Read the selected route in the report rather than inferring it from the deck alone.
 
 ## Reference runs on Perlmutter {: #examples }
 
 These are fresh fixed-input $G_0W_0$ runs from **23 October 2026**, pinned to source [`2d2ca2f104`](https://github.com/jackmcarthur/lorrax/commit/2d2ca2f104a085876a573e8b1278a7874c479b98). They use native full head corrections, default accuracy and automatic batch/layout selection. They establish completed workloads, not k-grid/band/basis convergence or minimum processor counts.
 
-Wall time is the GW driver's `total run`, including setup and compilation but excluding centroid/dipole/kinetic preprocessing, queue wait and allocation startup. All GPU rows use A100-80GB cards and the automatic local-linalg budget (66.35 GB in the saved receipts). Persistent compilation caches were shared; the counts below make their state explicit.
+Memory values below use decimal GB. Wall time is the GW driver's `total run`, including setup and compilation but excluding centroid/dipole/kinetic preprocessing, queue wait and allocation startup. All GPU rows use A100-80GB cards and the automatic local-linalg budget (66.35 GB in the saved receipts). Persistent compilation caches were shared; the counts below make their state explicit.
 
 | System | Full k grid / stored parents | Occupied bands | Sum bands | Physical $N_\mu$ | $n_s$ | Method | Resources | GW wall | Pool peak/rank |
 |---|---|---:|---:|---:|---:|---|---|---:|---:|
@@ -85,3 +93,4 @@ Its maximum pool-used peak is 52.89 GB/rank in ζ fitting, versus 41.39 GB in sc
 All ranks exited successfully and the canonical Σ and QP outputs were checked for the stated shapes and finite entries. Preserve the input hashes, exact decks, resolved geometry, selected routes, compilation counts and all-rank exit records when repeating a reference.
 
 Download the [text input bundle (ZIP)](../assets/cluster-references/Lorrax_GPU_reference_inputs_2026-10-23.zip). The [reproduction notes](../assets/cluster-references/2026-10-23/README.txt) describe the input arrangement and launch sequence. Exact decks and manifests: [Si](../assets/cluster-references/2026-10-23/si_soc/gw.in) / [record](../assets/cluster-references/2026-10-23/si_soc/manifest.json), [Al₂O₃](../assets/cluster-references/2026-10-23/al2o3_10/gw.in) / [record](../assets/cluster-references/2026-10-23/al2o3_10/manifest.json), [Fe](../assets/cluster-references/2026-10-23/fe_8x8x8/gw.in) / [record](../assets/cluster-references/2026-10-23/fe_8x8x8/manifest.json), [Cr:Al₂O₃](../assets/cluster-references/2026-10-23/cr_al2o3_80/gw.in) / [record](../assets/cluster-references/2026-10-23/cr_al2o3_80/manifest.json). The text bundle includes DFT decks and physical centroid tables; large wavefunction and generated matrix files remain in the NERSC evidence archive named in each record.
+

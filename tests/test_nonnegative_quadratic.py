@@ -47,6 +47,14 @@ def main():
         if jax.process_index() == 0:
             print('NNLS_CASE ' + json.dumps(dict(name=name, n=n, error=error)), flush=True)
 
+    # All variables are initially free: an interior SPD optimum needs no pivot.
+    a = np.array([[2., .3], [.3, 1.5]])
+    truth = np.array([1., .5])
+    check(a, a @ truth, truth, 'positive-first-solve')
+    # Both variables start free but the unconstrained solution is (3,-1).
+    # The independent KKT solution is (1,0), requiring an actual pivot.
+    check(np.array([[1., 2.], [2., 5.]]), np.ones(2), np.array([1., 0.]),
+          'one-active-pivot')
     for n in (7, 17, 33):
         rng = np.random.default_rng(100+n)
         for scale in (1e-8, 1., 1e8):

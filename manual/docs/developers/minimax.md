@@ -3,7 +3,7 @@
 `import minimax` The time–frequency quadrature service: short exponential sums for every frequency kernel of GW.
 {: .page-summary }
 
-Every frequency integral in GW is a sum over poles. $G$ has poles at the band energies, $W^c$ at its own pole energies $\Omega$, and χ⁰ and Σ are convolutions of the two. A convolution in frequency is a product in time, so LORRAX evaluates χ⁰ and Σ as sums over a few time nodes, $t_i$, of products of time-domain Green's functions and $W$. What makes this possible is one approximation per kernel: a reciprocal such as $1/\Delta$ or $1/d$, over the whole range of transition energies or denominators the run contains, written as $\sum_i w_i\,e^{\pm i t_i d}$ or $\sum_i w_i\,e^{-\tau_i\Delta}$. Each exponential factorizes into a function of the occupied state, a function of the empty state (or of the pole of $W$), and a function of the frequency, so each node costs one product of a $G$ and a $G$ or $W$ on the centroid basis. `minimax` builds those sums. Given the bandwidths of $G$ and $W$, the band gap, the broadening and a target accuracy, it returns the nodes $t_i$ and weights $w_i$, and certifies or measures the error. The physics and the derivations are on [Time–frequency transforms](../theory/time-frequency.md); this page is the developer's view: which variables go in, which constructor to call, what comes out, and how accurate it is.
+`minimax` turns the frequency integrals of GW into short sums over time nodes. $G$ and $W$ are sums of poles, χ⁰ and Σ are frequency convolutions of them, and every term of a convolution is the reciprocal $1/d$ of one complex denominator. A single rule $1/d\approx\sum_iw_i\,e^{it_id}$, valid for every denominator a run contains, turns each convolution into a sum over the nodes $t_i$ of products of $G$ and $W$ evaluated at those times. Three numbers fixed by the poles decide how many nodes that takes: the **bandwidths** of $G$ and $W$, which set the range of $\mathrm{Re}\,d$; the **broadening**, which sets $\mathrm{Im}\,d$; and the **target error**. §1 states these relations and the recipes that follow from them, and §2 is the API. The derivations are on [Time–frequency transforms](../theory/time-frequency.md).
 {: .lead }
 
 <div class="glance" markdown>
@@ -24,31 +24,83 @@ Used by
 
 ## 1 From physics to a rule {: #physics }
 
-### 1.1 The kernels {: #kernels }
+### 1.1 Poles, bandwidths and broadening {: #poles }
 
-Two kernels carry all of LORRAX's frequency dependence.
-
-**The response kernel.** The independent-particle response at a complex frequency $z$ is a sum over occupied–empty pairs $(v,c)$ with transition energy $\Delta=E_c-E_v>0$,
+**Pole forms.** At one k point, in the band basis, the time-ordered Green's function of a band with energy $\varepsilon_n$ and occupation $f_n$ is
 
 $$
-\chi^0(z)=\sum_{vc}(f_v-f_c)\,\rho_{vc}\,\rho_{vc}^*\,K_z(\Delta),\qquad K_z(\Delta)=\frac{2\Delta}{z^2-\Delta^2}. \tag{1.1}
+G_n(\omega)=\frac{1-f_n}{\omega-\varepsilon_n+i\eta}+\frac{f_n}{\omega-\varepsilon_n-i\eta}, \tag{1.1}
 $$
 
-At $z=0$, $K_0(\Delta)=-2/\Delta$. With an energy reference $\mu$ between the occupied and empty states, an exponential in $\Delta$ factorizes,
+and the correlation part of the screened interaction is a sum of poles $\tilde\Omega_j=\Omega_j-i\gamma_j$ with $\Omega_j>0$, damping $\gamma_j\ge0$ and residues $R_j$ ([Frequency treatments](../theory/frequency-treatments.md)),
 
 $$
-\frac1\Delta\approx\sum_i\alpha_i\,e^{-\tau_i\Delta},\qquad e^{-\tau\Delta}=e^{-\tau(E_c-\mu)}\,e^{-\tau(\mu-E_v)}, \tag{1.2}
+W^c(\omega)=\sum_jR_j\Big[\frac{1}{\omega-\tilde\Omega_j}-\frac{1}{\omega+\tilde\Omega_j}\Big]. \tag{1.2}
 $$
 
-so each node $\tau_i$ is one product of the empty-state propagator $\sum_c\psi_c\psi_c^*e^{-\tau_i(E_c-\mu)}$ and the occupied-state propagator $\sum_v\psi_v\psi_v^*e^{-\tau_i(\mu-E_v)}$, both evaluated on the centroids. On the imaginary axis, $z=i\omega_p$, the kernel becomes $-2\Delta/(\Delta^2+\omega_p^2)$, and at a general complex $z=\omega+i\varpi$ the exponentials take complex times.
-
-**The self-energy kernel.** The correlation self-energy is a sum over states $n$ and poles $j$ of $W^c$,
+With $X(t)=\int\frac{d\omega}{2\pi}e^{-i\omega t}X(\omega)$, each pole becomes one damped oscillation in time:
 
 $$
-\Sigma^c_n(\omega)=\sum_{n'j}\frac{M_{nn'j}}{d},\qquad d=\omega-E_{n'}\mp\Omega_j\pm i\eta, \tag{1.3}
+\begin{aligned}
+G_n(t)&=-i(1-f_n)\,\theta(t)\,e^{-i\varepsilon_nt-\eta t}+if_n\,\theta(-t)\,e^{-i\varepsilon_nt+\eta t},\\
+W^c(t)&=-i\sum_jR_j\,e^{-i\Omega_j|t|-\gamma_j|t|}.
+\end{aligned} \tag{1.3}
 $$
 
-on four causal branches (state empty or occupied, $\omega$ above or below $E_F$). A rule $Q(d)=\sum_iw_i\,e^{it_id}\approx1/d$ factorizes the same way, $e^{it(\omega-E-\Omega)}=e^{it\omega}\,e^{-itE}\,e^{-it\Omega}$, so each node is one $G(t_i)$ times one $W^c(t_i)$, at complex time $t_i$. The occupied branch lies in the lower half plane and takes the complex-conjugate rule.
+The real part of a pole is an oscillation frequency, and its distance from the real axis is a decay rate. LORRAX applies $\eta$ once, in Σ; χ⁰ is evaluated at frequencies off the real axis and needs none.
+
+**Bandwidths.** The poles occupy bounded ranges, and these ranges are the only properties of $G$ and $W$ a rule depends on:
+
+| Quantity | Range |
+|---|---|
+| occupied states of $G$ | $\varepsilon_v\in[E_v^{\min},E_v^{\max}]$ |
+| empty states of $G$ | $\varepsilon_c\in[E_c^{\min},E_c^{\max}]$, gap $E_g=E_c^{\min}-E_v^{\max}$ |
+| poles of $W^c$ | $\Omega_j\in[\Omega_{\min},\Omega_{\max}]$, $\gamma_j\in[\gamma_{\min},\gamma_{\max}]$ |
+| output frequencies of Σ | $\omega\in[\omega_{\min},\omega_{\max}]$, the read region |
+
+**Denominators.** A convolution of two pole sums is a sum over pairs of poles, and each pair contributes one denominator. For χ⁰ the pairs are transitions $\Delta=\varepsilon_c-\varepsilon_v$:
+
+$$
+\begin{aligned}
+\chi^0(z)&=\sum_{vc}(f_v-f_c)\,\rho_{vc}\rho_{vc}^*\Big[\frac{1}{z-\Delta}-\frac{1}{z+\Delta}\Big],\\
+\Delta&\in[\Delta_{\min},\Delta_{\max}]=[E_g,\ E_c^{\max}-E_v^{\min}].
+\end{aligned} \tag{1.4}
+$$
+
+For Σ the pairs are a state and a pole of $W^c$. On the branch of empty states,
+
+$$
+\Sigma^c_n(\omega)=\sum_{n'j}\frac{M_{nn'j}}{d},\qquad d=\omega-\varepsilon_{n'}-\Omega_j+i(\eta+\gamma_j), \tag{1.5}
+$$
+
+so the denominators fill the box
+
+$$
+\begin{aligned}
+\mathrm{Re}\,d&\in\big[\omega_{\min}-E_c^{\max}-\Omega_{\max},\ \omega_{\max}-E_c^{\min}-\Omega_{\min}\big],\\
+\mathrm{Im}\,d&\in[\eta+\gamma_{\min},\ \eta+\gamma_{\max}].
+\end{aligned} \tag{1.6}
+$$
+
+The occupied branch, $d=\omega-\varepsilon_{n'}+\Omega_j-i(\eta+\gamma_j)$, is its mirror image in the lower half plane and takes the complex-conjugate rule. The bandwidths of $G$ and $W$ add: the box is $(\omega_{\max}-\omega_{\min})+(E_c^{\max}-E_c^{\min})+(\Omega_{\max}-\Omega_{\min})$ wide, while the broadening fixes its height.
+
+**From denominators to time.** For $\mathrm{Im}\,d>0$,
+
+$$
+\frac1d=-i\int_0^\infty e^{ids}\,ds, \tag{1.7}
+$$
+
+an integrand that oscillates at frequency $\mathrm{Re}\,d$ and decays at rate $\mathrm{Im}\,d$. A rule $Q(d)=\sum_iw_i\,e^{it_id}$ is a quadrature of (1.7) that must hold uniformly on the whole box. Because $e^{it(\omega-\varepsilon-\Omega)}=e^{it\omega}\,e^{-it\varepsilon}\,e^{-it\Omega}$, each node factorizes into $G(t_i)$, $W^c(t_i)$ and a phase in $\omega$, and Σ becomes $\sum_iw_i\,e^{it_i\omega}\,[G\,W^c](t_i)$. For χ⁰ at $z=0$, $1/\Delta=\int_0^\infty e^{-\tau\Delta}d\tau$, and $e^{-\tau\Delta}=e^{-\tau(\varepsilon_c-\mu)}\,e^{-\tau(\mu-\varepsilon_v)}$ splits into the empty-state propagator $\sum_c\psi_c\psi_c^*e^{-\tau(\varepsilon_c-\mu)}$ and the occupied-state propagator $\sum_v\psi_v\psi_v^*e^{-\tau(\mu-\varepsilon_v)}$, both evaluated on the centroids.
+
+**What sets the node count.** The shape of the box decides which time contour works and how many nodes it needs:
+
+| Regime | When | Contour | Nodes |
+|---|---|---|---|
+| sign-definite | $\mathrm{Re}\,d$ keeps one sign on the box: χ⁰ at $z=0$ or $z=i\omega_p$, Σ windows away from resonance | rotated to imaginary time, where every term is a pure decay $e^{-\lvert d\rvert\tau}$ | $N\approx\ln(16R)\ln(1/\varepsilon)/\pi^2$ with $R=\lvert d\rvert_{\max}/\lvert d\rvert_{\min}$: logarithmic in the bandwidth, independent of $\eta$ |
+| resonant | $\mathrm{Re}\,d$ changes sign: Σ at $\omega$ near $\varepsilon+\Omega$ | near the real time axis, where terms decay only at $\mathrm{Im}\,d\ge\eta$ | a uniform grid needs $N\approx(B/\eta)\ln(1/\varepsilon)/2\pi$ for a box of width $B$; LORRAX's bent contour replaces $B$ by the narrow side, the part of $\mathrm{Re}\,d$ on the short side of zero, so $N\propto m/\eta$ |
+| damped line | χ⁰ at $z=\omega+i\varpi$ (MPA) | real time, damped by $\varpi$ | $N\propto a=(\max\lvert\omega\rvert+\Delta_{\max})/\varpi$, about $7a$ at relative error $10^{-8}$ |
+
+The broadening therefore enters twice. In frequency it is the resolution of Σ, since each pole becomes a Lorentzian of half-width $\eta$. In time it is the decay rate of every resonant term, so it sets the horizon $T\approx\ln(1/\varepsilon)/\eta$ a resonant rule must reach. On a sign-definite box it does not enter at all, and the gap plays its role. The node count never depends on the number of bands, k points or centroids, only on these ranges and on $\varepsilon$; §[1.5](#examples) gives measured counts.
 
 ### 1.2 The variables {: #variables }
 
@@ -71,8 +123,6 @@ Every rule is fixed by a handful of numbers, all known before any $G$ or $W$ is 
 | $[\omega_{\min},\omega_{\max}]$ | output frequencies (the read region) | requested quasiparticle states plus margin | about ±10 eV |
 | $\beta$ | inverse temperature, for finite-temperature χ⁰ | occupation state | — |
 | bank tolerance | relative error of the shared complex-time rules of the tangential route | [`sigma_w_accuracy`](../drivers/gw/keywords.md#sigma_w_accuracy) | $10^{-8}$ (`production`) |
-
-Two things set the node count of every rule: the **dynamic range** of the decay rates or denominators, and the **accuracy**. For a pure decay (imaginary time) the range enters only logarithmically, through $\ln R$. For a near-resonance Σ window, where the terms oscillate and decay only at rate $\eta$, the count is set by the window's narrow side over $\eta$. Neither depends on the number of bands, k points or centroids.
 
 ### 1.3 Which constructor {: #which }
 
