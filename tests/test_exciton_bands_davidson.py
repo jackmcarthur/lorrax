@@ -98,6 +98,18 @@ def run_cases(mesh):
         mesh, *KGRID, NC, NV, NC, NV, n_eig=N_EIG, max_iter=max(30, min(200, n_phys // 2)),
         tol_mev=a0.davidson_tol_mev, W_q0=d["W_q0"])
     ev_d = np.asarray(exb._gather_host(solve(*path)[0])).real
+    mixed = exb.build_path_solver_davidson(
+        mesh, *KGRID, NC, NV, NC, NV, n_eig=N_EIG, max_iter=200,
+        tol_mev=0.25, W_q0=d["W_q0"], cert_rows=(0, 2), cert_tol_mev=0.001)
+    ev_cert = np.asarray(exb._gather_host(mixed(*path)[0])).real
+    out["certification_vs_dense_meV"] = float(
+        np.max(np.abs(ev_cert[[0, 2]] - exact[[0, 2]])) * RY_MEV)
+    shifted = (*path[:2], path[2] + 10.0, *path[3:])
+    ev_core = np.asarray(exb._gather_host(mixed(*shifted)[0])).real
+    out["core_certification_vs_dense_meV"] = float(
+        np.max(np.abs(ev_core[[0, 2]] - (exact[[0, 2]] + 10.0))) * RY_MEV)
+    out["core_certification_absolute_residual_meV"] = float(
+        np.max(np.asarray(dav.LAST_RUN["res"][0])[:N_EIG]) * RY_MEV)
     out["exciton_plans"] = sum(1 for k in dav._PLANS if k[0][0] == "exciton_bands") - plans0
     lanczos = exb.build_path_solver(mesh, *KGRID, NC, NV, NC, NV, n_eig=N_EIG, block_size=1,
                                     max_iter=n_phys)
@@ -157,6 +169,11 @@ def main() -> int:
         "2 one planned Davidson for the whole path": out["exciton_plans"] == 1,
         "3 GATE davidson_converged refuses a 2-iteration cap at Q row 0": out["capped_refuses_at_row_0"],
         "4 deck: davidson default, block_size refused unless solver = block_lanczos": out["cli"],
+        "5 certification rows <= 0.001 meV from dense despite 0.25 meV plot budget":
+            out["certification_vs_dense_meV"] <= 0.001,
+        "6 high-energy certification satisfies the absolute meV budget":
+            out["core_certification_vs_dense_meV"] <= 0.001
+            and out["core_certification_absolute_residual_meV"] <= 0.001,
     }
     ok = all(checks.values())
     if jax.process_index() == 0:

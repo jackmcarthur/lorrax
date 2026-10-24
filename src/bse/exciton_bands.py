@@ -399,7 +399,8 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
 
 def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                                nc_pad: int, nv_pad: int, n_cond: int, n_val: int,
-                               *, n_eig: int, max_iter: int, tol_mev: float, W_q0):
+                               *, n_eig: int, max_iter: int, tol_mev: float, W_q0,
+                               cert_rows=(), cert_tol_mev=None):
     """The ``solver = davidson`` (default) counterpart of :func:`build_path_solver`:
     the same call signature and outputs, the per-Q lowest ``n_eig`` from
     ``bse_lanczos.solve_bse_sharded``'s Davidson (exact diagonal
@@ -407,9 +408,13 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     ``tol_mev`` residual stop).  One planned solver serves every Q
     (``davidson_plan_key``); each Q's operands are arguments.  A Q that does not
     converge refuses (``GATE davidson_converged``) before the driver writes.
-    ``W_q0`` is the q = 0 slice of W_q, taken before W_q was donated."""
+    ``W_q0`` is the q = 0 slice of W_q, taken before W_q was donated.
+    Certification rows use the tighter ``cert_tol_mev`` residual, so a loose
+    plotting tolerance cannot dominate the exchange comparison. Both members
+    of each comparison must be included in ``cert_rows``."""
     from common.collectives import replicate_to_mesh
     from .bse_lanczos import RY_TO_MEV, davidson_stop_line, solve_bse_sharded
+    from solvers.davidson import LAST_RUN
     sh = make_bse_shardings(mesh_xy)
     rows_of = {}
 
@@ -428,6 +433,8 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                    psi_v_X, psi_v_Y, eps_v, W_R, D_head=None, M_Q=None):
         rows = []
         for iQ in range(int(psi_cQ_X.shape[0])):
+            row_tol = (min(tol_mev, cert_tol_mev)
+                       if cert_tol_mev is not None and iQ in cert_rows else tol_mev)
             i = jnp.int32(iQ)
             c_X = _row(psi_cQ_X, i, sh.psi_x)
             payload = dict(static, psi_c_X=c_X, psi_c_Y=_row(psi_cQ_Y, i, sh.psi_y),
@@ -436,14 +443,30 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                            W_q=None, M=pair(c_X, psi_v_X), _W_q0_for_precond=W_q0)
             if D_head is not None:
                 payload["head_tensor"] = (D_head, _row(M_Q, i, NamedSharding(mesh_xy, P())))
-            ev, _, _ = solve_bse_sharded(
-                payload, mesh_xy, n_eig=n_eig, max_iter=max_iter, solver_kind="davidson",
-                davidson_precond="exact", davidson_tol_Ry=tol_mev / RY_TO_MEV,
-                davidson_plan_key="exciton_bands")
-            davidson_stop_line(n_eig=n_eig, tol_mev=tol_mev, budget=max_iter,
-                               cap="the cap is solver_max_iter", where=f" at Q row {iQ}",
-                               refused="No exciton band file was written.",
-                               fix="raise solver_max_iter, or loosen davidson_tol_mev")
+            for attempt in range(2):
+                ev, _, _ = solve_bse_sharded(
+                    payload, mesh_xy, n_eig=n_eig, max_iter=max_iter, solver_kind="davidson",
+                    davidson_precond="exact", davidson_tol_Ry=row_tol / RY_TO_MEV,
+                    davidson_plan_key="exciton_bands")
+                davidson_stop_line(n_eig=n_eig, tol_mev=row_tol, budget=max_iter,
+                                   cap="the cap is solver_max_iter", where=f" at Q row {iQ}",
+                                   refused="No exciton band file was written.",
+                                   fix="raise solver_max_iter, or loosen davidson_tol_mev")
+                if cert_tol_mev is None or iQ not in cert_rows:
+                    break
+                residual = np.asarray(LAST_RUN["res"][0])[:n_eig] * RY_TO_MEV
+                if np.all(np.isfinite(residual)) and np.max(residual) <= cert_tol_mev:
+                    break
+                # The shared solver stops relative to max(1, |E_Ry|). Core
+                # excitations can therefore need a stricter scalar tolerance
+                # to meet this comparison's absolute meV error budget.
+                scale = max(1.0, float(np.max(np.abs(_gather_host(ev)))))
+                row_tol = min(row_tol, cert_tol_mev / (2 * scale))
+            else:
+                raise RuntimeError(
+                    f"GATE refit_cert_solver_accuracy: Q row {iQ} has absolute "
+                    f"residual {np.max(residual):g} meV; want <= {cert_tol_mev:g} "
+                    "meV before comparing exchange eigenvalues.")
             rows.append(np.asarray(_gather_host(ev)).real)
         return replicate_to_mesh(np.stack(rows), mesh_xy), ()
 
@@ -467,7 +490,8 @@ def _precond_w_q0(args, data):
     return data["W_q"][:, :, 0, 0, 0]
 
 
-def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, head_mbz, W_q0):
+def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, head_mbz, W_q0,
+                 *, cert_rows=()):
     """The per-Q lowest-``n_eig`` solver of the band scan: Davidson (default, cap
     ``max(30, min(200, n_phys // 2))`` iterations) or ``solver = block_lanczos``'s fixed
     block-Lanczos scan (40 block iterations)."""
@@ -481,7 +505,8 @@ def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, he
         mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, n_eig=args.n_eig,
         max_iter=(max(30, min(200, n_phys // 2)) if args.max_iter is None
                   else args.max_iter),
-        tol_mev=args.davidson_tol_mev, W_q0=W_q0)
+        tol_mev=args.davidson_tol_mev, W_q0=W_q0, cert_rows=cert_rows,
+        cert_tol_mev=0.1 * CERT_TOL_BY_GRADE[args.cert_grade] if cert_rows else None)
 
 
 def _report_alpha_over_path(labels, alpha_all, log=log.debug):
@@ -2410,8 +2435,13 @@ def main(argv=None):
                 args, nk, nc_pad, nv_pad, n_val, n_cond, log=log)
             head_args = (jnp.asarray(D_head),
                          jnp.asarray(M_stack, dtype=jnp.float64))
+        cert_rows = tuple(cert_idx) + tuple(range(nQ, nQ + n_cert))
+        if cert_rows and args.solver == "davidson":
+            log(f"  [refit-cert] Davidson residual for both comparison rows: "
+                f"{min(args.davidson_tol_mev, 0.1 * CERT_TOL_BY_GRADE[args.cert_grade]):g} "
+                "meV; the exchange certification gate is unchanged.")
         solver = _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad,
-                              n_cond, n_val, head_mbz, W_q0)
+                              n_cond, n_val, head_mbz, W_q0, cert_rows=cert_rows)
         tick("w_r_and_build", t0)
         stages.result(f"W_R on {nkx} x {nky} x {nkz}; "
                       f"{'block Lanczos' if args.solver == 'lanczos' else 'Davidson'} solver, "
