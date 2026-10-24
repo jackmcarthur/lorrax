@@ -1336,7 +1336,10 @@ def rank_main(args, ctx: dict, topo: dict, out: Path) -> dict:
         drop_install_cache(files)
     mark(out, "fs", rank)
     wait_all(out, "fs", nranks)
-    imp, text, wall = run_probe(PROBE_IMPORT, [], dict(os.environ), timeout=600)
+    ienv = dict(os.environ)
+    if args.cpu_only:
+        ienv["JAX_PLATFORMS"] = "cpu"     # a module's "cuda,cpu" would refuse on a CPU node
+    imp, text, wall = run_probe(PROBE_IMPORT, [], ienv, timeout=600)
     imp["wall_s"] = wall
     res["imports"] = imp
     mark(out, "imports", rank)
