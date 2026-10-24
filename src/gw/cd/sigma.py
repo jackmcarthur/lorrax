@@ -127,23 +127,18 @@ def sigma_x_identity_check(sx_cd_diag_ry, sx_ref_diag_ry):
 
 
 def ledger_sample(stage, chunk, seconds):
-    """One device-ledger row (this process's first device): bytes in use, pool high-water, live arrays.
+    """One device-ledger row (this process's first device): bytes in use, peak bytes, live arrays.
 
-    The high-water is read WITHOUT a reset.  ``common.timing`` owns the reset (one per section boundary)
-    and charges each interval's peak to the section on top of the stack; a reset here, once per chunk,
-    left the stage table only the interval after the last row (Fe: CD stage 0.36 GB reported against
-    4.30 GB in this ledger).  The value is therefore cumulative since the enclosing section boundary,
-    and the leak criterion is that it does not rise after the first chunk of each axis (with
-    ``bytes_in_use`` equal between equal-shaped chunks).
+    ``peak_bytes_in_use`` is the allocator's process-lifetime peak (never reset here; the per-section
+    peaks are ``common.timing``'s).  The leak criterion is that it does not rise after the first chunk
+    of each axis, with ``bytes_in_use`` equal between equal-shaped chunks.
     """
-    from runtime.xla_memory import pool_high_water
     try:
         st = jax.local_devices()[0].memory_stats() or {}
     except Exception:  # pragma: no cover - CPU backends have no stats
         st = {}
-    high = pool_high_water(reset=False)
     return dict(stage=stage, chunk=int(chunk), seconds=round(float(seconds), 3),
-                bytes_in_use=int(st.get("bytes_in_use", -1)), pool_high_water=-1 if high is None else int(high),
+                bytes_in_use=int(st.get("bytes_in_use", -1)),
                 peak_bytes_in_use=int(st.get("peak_bytes_in_use", -1)), live_arrays=len(jax.live_arrays()))
 
 

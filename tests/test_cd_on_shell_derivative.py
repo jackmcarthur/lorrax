@@ -25,9 +25,6 @@ SCRIPT = textwrap.dedent(r'''
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from gw.cd import sigma as cd
     from gw.ppm_sigma import OnShellRequest
-    import runtime.xla_memory as xm
-    if not hasattr(xm, "pool_high_water"):          # removed by aab565c0a; gw.cd.sigma.ledger_sample still imports it
-        xm.pool_high_water = lambda reset=False: None   # (separate fix pending); the ledger column reads -1
     assert jax.device_count() == 4, jax.devices()
     mesh = Mesh(np.array(jax.devices()).reshape(2, 2), ("x", "y"))
     rng = np.random.default_rng(31)
