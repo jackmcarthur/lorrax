@@ -823,21 +823,28 @@ def _incumbent(p, shapes, single: bool) -> int:
     """The route today's main takes for this call -- the owner's INCUMBENT (2026-10-17, "never
     regress main"): on a leg with a size row (:data:`resolve.ONE_DEVICE_MAX_N`, ROCM) the size
     route's ``one_device`` in the round rule's count against that row
-    (:func:`distrib_la._one_device.rounds_for`; one matrix: 1 round); on a room leg (CUDA, no
-    row) the leg library.  Returns that round count, or 0 for the library.  A shape rule: no
+    (:func:`distrib_la._one_device.rounds_for`; one matrix: 1 round); on a room leg with a
+    library, the leg library. A room-only leg has the admitted one-device round rule as its
+    incumbent. Returns that round count, or 0 for the library. A shape rule: no
     exchange, no sync."""
     from distrib_la import resolve as _resolve
     from distrib_la._one_device import rounds_for
-    row = _resolve.ONE_DEVICE_MAX_N.get((p.op, _resolve.mesh_platform(p.mesh)))
+    platform = _resolve.mesh_platform(p.mesh)
+    row = _resolve.ONE_DEVICE_MAX_N.get((p.op, platform))
     if row is None:
-        return 0
+        if (p.op, platform) in _resolve._DISTRIBUTED_DEFAULT:
+            return 0
+        # A room-only operation (ROCm LU) has no library to price or run.
+        # Resolution already admitted one whole matrix; preserve that same
+        # owner's bounded round rule instead of inventing a library fallback.
+        row = _resolve.one_device_max_n(p.op, platform, p.budget_bytes)
     if single:
         return 1
     ranks = int(p.mesh.shape["x"]) * int(p.mesh.shape["y"])
     nb, n = int(shapes[0][0]), int(shapes[0][-1])
     width = int(shapes[1][-1]) if p.op == "solve_lu" and len(shapes) > 1 else None
     return int(rounds_for(nb, n, ranks, _resolve.one_device_round_n(
-        p.op, _resolve.mesh_platform(p.mesh), int(row)), width))
+        p.op, platform, int(row)), width))
 
 
 _RULE = ("the fewest-round one_device whose per-rank footprint is within the incumbent's"

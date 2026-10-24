@@ -10,10 +10,9 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from lxkit import memory
 from distrib_la._result_check import checked_program
 from distrib_la.plan import plan
-from distrib_la.resolve import resolve_backend
 
 
-def _compile(fn, operands, mesh, label):
+def _compile(fn, operands, mesh, label, *, whole_matrix=False):
     """Admit the new bytes of the exact executable before running it."""
     executable = fn.lower(*operands).compile()
     analysis = executable.memory_analysis()
@@ -21,29 +20,34 @@ def _compile(fn, operands, mesh, label):
         raise RuntimeError(f"{label}: compiler returned no memory price")
     new = (int(analysis.output_size_in_bytes) + int(analysis.temp_size_in_bytes)
            - int(analysis.alias_size_in_bytes))
-    memory.admit(label, (("distributed face", memory.Price(
-        xla=memory.Term(0.0, max(0, new) * int(mesh.size),
+    room = memory.room()
+    if whole_matrix and new > room:
+        raise RuntimeError(f"GATE nonnegative_quadratic_capacity: {label} needs "
+                           f"{new} new executable bytes per rank, over room {room}; "
+                           "this leg has no whole-mesh LU provider beyond its room route")
+    route = "whole-matrix room route" if whole_matrix else "distributed face"
+    memory.admit(label, ((route, memory.Price(
+        xla=memory.Term(max(0, new) if whole_matrix else 0.0,
+                        0.0 if whole_matrix else max(0, new) * int(mesh.size),
                         "compiled principal-pivot program"),
-        ranks=int(mesh.size), label=label)),), memory.room())
+        ranks=int(mesh.size), label=label,
+        whole=int(operands[0].shape[-1]) if whole_matrix else 0)),), room)
     if hasattr(fn, "finish"):
         return lambda *args: fn.finish(args, executable(*args))
     return executable
 
 
 @lru_cache(maxsize=8)
-def _programs(mesh, n, n_logical):
+def _programs(mesh, n, n_logical, linear):
     face = NamedSharding(mesh, P("x", "y"))
     rows = NamedSharding(mesh, P("x"))
     replicated = NamedSharding(mesh, P())
     logical = jnp.arange(n) < n_logical
     # One RHS copy per y column keeps its layout legal without gathering A.
     nrhs = int(mesh.shape["y"])
-    # The normal matrix is a capacity object: use the leg's whole-mesh LU,
-    # including on room-routed legs, rather than gathering a principal face.
-    backend = resolve_backend("solve_lu", "distributed", mesh, n=n,
-                              size_route=False)
-    linear = plan("solve_lu", mesh, backend=backend, n=n,
-                  batched_route="auto")
+    # The eager caller admitted this plan against its current room. Plan
+    # equality excludes that room, but includes the selected backend: cached
+    # programs keep only geometry and never bypass a later call's admission.
 
     def normalize(a, b):
         diagonal = jnp.diag(a)
@@ -110,8 +114,9 @@ def solve_nonnegative_quadratic(a, b, *, mesh, n_logical, maxiter=None):
         Real float64 ``(n_pad,)`` on ``P('x')``, replicated along y. Units
         are objective / x. Consumed by donation, as ``a`` is.
     mesh : jax.sharding.Mesh
-        The named x/y device mesh. Principal systems use its distributed
-        LU provider; no dense matrix is gathered onto a host or device.
+        The named x/y device mesh. Principal systems keep a distributed-face
+        interface. The shared LU service stages a whole matrix only where
+        its room route fits the run's current per-rank budget; no host gather.
     n_logical : int
         Physical variable count in ``[1,n_pad]``. Pad variables are fixed
         exactly to zero and are excluded from convergence checks.
@@ -131,8 +136,8 @@ def solve_nonnegative_quadratic(a, b, *, mesh, n_logical, maxiter=None):
     Block principal pivots exchange variables with negative primal or dual
     values. Three unsuccessful block pivots switch to one variable per
     pivot until the violation count decreases. Only scalar convergence
-    information leaves the mesh. Every masked principal matrix remains on
-    the original face; inactive rows/columns are identity, so the physical
+    information leaves the mesh. Every masked principal system uses the
+    original padded face interface; inactive rows/columns are identity, so the physical
     active submatrix has its exact SPD solution without dynamic gathering.
     """
     n, n_logical = int(a.shape[0]), int(n_logical)
@@ -146,12 +151,17 @@ def solve_nonnegative_quadratic(a, b, *, mesh, n_logical, maxiter=None):
     maxiter = 20 * n_logical if maxiter is None else int(maxiter)
     if maxiter < 1:
         raise ValueError("nonnegative quadratic maxiter must be positive")
-    normalize, solve, inspect, pivot, finish = _programs(mesh, n, n_logical)
+    # Re-resolve before consulting the geometry cache: a warm executable
+    # must not admit a whole matrix against an earlier call's larger room.
+    linear = plan("solve_lu", mesh, backend="distributed", n=n,
+                  batched_route="auto", budget_bytes=memory.room())
+    normalize, solve, inspect, pivot, finish = _programs(mesh, n, n_logical, linear)
     normalize = _compile(normalize, (a, b), mesh, "nonnegative quadratic scaling")
     h, c, scale, free, valid = normalize(a, b)
     if not bool(np.asarray(valid)):
         raise ValueError("nonnegative quadratic requires finite data and positive diagonal")
-    solve = _compile(solve, (h, c, free), mesh, "nonnegative quadratic principal solve")
+    solve = _compile(solve, (h, c, free), mesh, "nonnegative quadratic principal solve",
+                     whole_matrix=linear.backend == "one_device")
     # Shape-only dummy outputs avoid executing a solve merely to price checks.
     z = jax.jit(jnp.zeros_like, out_shardings=c.sharding)(c)
     inspect = _compile(inspect, (h, c, z, free), mesh, "nonnegative quadratic KKT check")
