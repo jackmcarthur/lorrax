@@ -210,13 +210,24 @@ def test_streamed_facade_releases_all_moments_after_first_sample():
         "jax": SimpleNamespace(lax=SimpleNamespace(with_sharding_constraint=lambda a, _s: a)),
         "P": lambda *args: args, "NamedSharding": lambda _mesh, spec: spec,
         "WLadderWedge": SimpleNamespace,
-        "load_bse_data_from_restart_sharded": lambda *a, **k: {"V_q0": np.zeros((8, 8)), "n_rmu": 7},
+        "load_bse_data_from_restart_sharded": lambda *a, **k: {
+            "V_q0": np.zeros((8, 8)), "n_rmu": 7, "W_q": np.ones((8, 8, 2, 1, 1))},
         "_psi_at_rest_2d": lambda data, _mesh: data, "_symmetry_tables": lambda _path: sym,
         "_accumulate_columns": accumulate, "gather_to_host": lambda a: a,
         "_assert_pad_block_is_zero": zero_padding}
     moment_visits = []
+    consumed = []
+
+    def prepare_owned(data, include_w, _mesh, *, consume_W_q=False):
+        assert include_w and consume_W_q and data['W_q'] is not None
+        consumed.append(data)
+        data['W_R'],data['W_q']=data['W_q'],None
+        return data
+
+    namespace['ensure_W_R'] = prepare_owned
 
     def sweep(_data, _mesh, qrows, zrows, **kwargs):
+        assert _data is consumed[-1] and _data['W_q'] is None and _data['W_R'] is not None
         for iz, z in enumerate(zrows):
             for iq, q in enumerate(qrows):
                 for start, count, probes in kwargs["probe_blocks_for_q"](iq, q):
@@ -255,6 +266,7 @@ def test_streamed_facade_releases_all_moments_after_first_sample():
     assert result.wc is None and result.response_fields is None
     assert len(moment_visits) == 2*4
     materialized = namespace["compute_wc_qwedge"]("unused", [0j, 1j, 2j], mesh, **kwargs)
+    assert len(consumed)==2 and consumed[0] is not consumed[1]
     np.testing.assert_array_equal(materialized.wc, np.stack(seen))
     for name in ("M0", "M1", "M2", "M3"):
         assert materialized.response_fields[name].shape == (2, 8, 8)
