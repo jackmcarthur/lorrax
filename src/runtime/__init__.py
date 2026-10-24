@@ -2594,7 +2594,7 @@ def finalize_process(rc: int = 0):
             # owns the coordination service and can remove it as soon as its
             # own client is closed.  Synchronize immediately beforehand so a
             # fast rank cannot strand a peer in report/effect completion and
-            # provoke WatchJobStateAsync connection-refused noise during an
+            # provoke WatchTasksAsync connection-refused noise during an
             # otherwise clean production shutdown.  This is the shared
             # collective seam, not a driver-specific sleep or stderr filter.
             from common.collectives import barrier as _barrier
