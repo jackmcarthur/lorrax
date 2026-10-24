@@ -153,11 +153,8 @@ def solve_nonnegative_quadratic(a, b, *, mesh, n_logical, maxiter=None):
         raise ValueError("nonnegative quadratic requires finite data and positive diagonal")
     solve = _compile(solve, (h, c, free), mesh, "nonnegative quadratic principal solve")
     # Shape-only dummy outputs avoid executing a solve merely to price checks.
-    z = jax.jit(jnp.zeros_like, out_shardings=c.sharding)(c)
+    z = jax.ShapeDtypeStruct(c.shape, c.dtype, sharding=c.format)
     inspect = _compile(inspect, (h, c, z, free), mesh, "nonnegative quadratic KKT check")
-    bad = jax.jit(jnp.zeros_like, out_shardings=free.sharding)(free)
-    block = jax.device_put(np.array(True), NamedSharding(mesh, P()))
-    pivot = _compile(pivot, (free, bad, block), mesh, "nonnegative quadratic pivot")
     finish = _compile(finish, (z, scale), mesh, "nonnegative quadratic result")
     best, patience = n_logical + 1, 3
     for _ in range(maxiter):
