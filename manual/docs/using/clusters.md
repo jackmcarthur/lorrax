@@ -155,7 +155,7 @@ The Al₂O₃ P1 test also exposed a compiler failure after screening, despite m
 
 The mean-diagonal dummy modes also explain Cr80's printed retained-rank counts: P16 reports 11165–11166 including 12 processor pads, P9 reports 11159–11160 including 6, and P4 reports 11153–11154 with none. All imply the same 11153–11154 physical-rank range; zero dummy ζ rows contribute no physical operator. This interprets diagnostics, not an adjustment to scientific outputs.
 
-The [new capacity receipt](../assets/cluster-references/2026-10-24/completed_capacity_checks.txt) preserves source pins, measured stages and unaligned comparison scopes.
+The [new capacity receipt](../assets/cluster-references/2026-10-24/completed_capacity_checks.txt) and [compact measurement manifest](../assets/cluster-references/2026-10-24/completed_capacity_checks.json) preserve source pins, measured stages and unaligned comparison scopes.
 
 ### Repeating a capacity measurement {: #capacity-receipt }
 

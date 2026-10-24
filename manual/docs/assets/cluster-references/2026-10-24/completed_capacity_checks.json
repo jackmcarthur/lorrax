@@ -1,0 +1,301 @@
+{
+  "schema": "lorrax.completed-capacity-checks.v1",
+  "date": "2026-10-24",
+  "units": {
+    "time": "seconds",
+    "memory": "decimal_GB",
+    "energy": "eV"
+  },
+  "hardware": {
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "jax": "0.12.0.1",
+    "jaxlib": "0.12.0.1",
+    "cores_per_rank": 16,
+    "OMP_threads": 14,
+    "BLAS_threads": 1,
+    "planning_budget_GB": 66.35
+  },
+  "scope": "Complete fixed-input GW reproductions; authenticated kinetic/ionic and dipole preprocessing reused. Not a convergence, cold/warm scaling or allocation-cost benchmark.",
+  "measurements": [
+    {
+      "case": "cr_al2o3_80",
+      "source": "3a3aee27cab873087e93c67ada81edb10a0b369c",
+      "status": "COMPLETE_CANONICAL_INTEGRITY_AND_NUMERICAL_REPRODUCIBILITY_PASS",
+      "atoms": 80,
+      "nspinor": 2,
+      "kgrid": [
+        2,
+        2,
+        2
+      ],
+      "full_k": 8,
+      "stored_parents": 4,
+      "sum_bands": 2370,
+      "sum_band_carrier": 2370,
+      "physical_centroids": 23700,
+      "packed_centroids": 23700,
+      "QP_bands_1based": [
+        1,
+        399
+      ],
+      "EQP_rows": 1596,
+      "Sigma_PAIR_shape": [
+        2,
+        4,
+        399,
+        399
+      ],
+      "sigma_range_eV": [
+        -75,
+        2.75
+      ],
+      "active_gpus": 4,
+      "nodes": 1,
+      "mesh": [
+        2,
+        2
+      ],
+      "wall_seconds": 2481.21,
+      "pool_used_peak_GB_per_rank": 76.87,
+      "host_high_water_GB_per_rank": 32.51,
+      "stage_seconds": {
+        "setup": 8.06,
+        "isdf": 544.43,
+        "screening": 575.2,
+        "self_energy": 1350.3,
+        "qp": 3.1,
+        "tau_sweep": 1297.25
+      },
+      "stage_pool_used_peak_GB_per_rank": {
+        "isdf": 76.87,
+        "screening": 58.07,
+        "self_energy": 73.46
+      },
+      "full_dynamic_coverage": true,
+      "out_of_range_fallback": false,
+      "energy_alignment": false,
+      "phase_alignment": false,
+      "EQP_comparison": {
+        "eqp0.dat": {
+          "full_prefix_max_abs_eV": 4.080000000072914e-07,
+          "full_prefix_RMS_eV": 3.837446575654431e-08,
+          "frontier_392_399_max_abs_eV": 4.799999864246729e-08
+        },
+        "eqp1.dat": {
+          "full_prefix_max_abs_eV": 3.874000000791966e-06,
+          "full_prefix_RMS_eV": 2.3157751350145662e-07,
+          "frontier_392_399_max_abs_eV": 3.5000001119556146e-08
+        }
+      },
+      "historical_recipe": "../2026-10-23/cr_al2o3_80/manifest.json",
+      "driver_receipt_SHA256": "3f2f24192ba1ef19a6ead7943752a7d2962ee420773904d411f2fdea1387ab3b",
+      "canonical_readback_SHA256": "0b9893bf2b48a4f05ce9a0ac64d0c6e8d08720d3d588daa96eaf8b6e876ed173"
+    },
+    {
+      "case": "cr_al2o3_80",
+      "source": "3a3aee27cab873087e93c67ada81edb10a0b369c",
+      "status": "COMPLETE_CANONICAL_INTEGRITY_AND_NUMERICAL_REPRODUCIBILITY_PASS",
+      "atoms": 80,
+      "nspinor": 2,
+      "kgrid": [
+        2,
+        2,
+        2
+      ],
+      "full_k": 8,
+      "stored_parents": 4,
+      "sum_bands": 2370,
+      "sum_band_carrier": 2370,
+      "physical_centroids": 23700,
+      "packed_centroids": 23706,
+      "QP_bands_1based": [
+        1,
+        399
+      ],
+      "EQP_rows": 1596,
+      "Sigma_PAIR_shape": [
+        2,
+        4,
+        399,
+        399
+      ],
+      "sigma_range_eV": [
+        -75,
+        2.75
+      ],
+      "active_gpus": 9,
+      "nodes": 3,
+      "mesh": [
+        3,
+        3
+      ],
+      "wall_seconds": 1388.43,
+      "pool_used_peak_GB_per_rank": 57.05,
+      "host_high_water_GB_per_rank": 19.81,
+      "stage_seconds": {
+        "setup": 7.71,
+        "isdf": 330.73,
+        "screening": 434.37,
+        "self_energy": 612.2,
+        "qp": 3.27,
+        "tau_sweep": 594.73
+      },
+      "stage_pool_used_peak_GB_per_rank": {
+        "isdf": 57.05,
+        "screening": 48.56,
+        "self_energy": 36.52
+      },
+      "full_dynamic_coverage": true,
+      "out_of_range_fallback": false,
+      "energy_alignment": false,
+      "phase_alignment": false,
+      "EQP_comparison": {
+        "eqp0.dat": {
+          "full_prefix_max_abs_eV": 4.1500000236283086e-07,
+          "full_prefix_RMS_eV": 4.120758625745612e-08,
+          "frontier_392_399_max_abs_eV": 4.799999864246729e-08
+        },
+        "eqp1.dat": {
+          "full_prefix_max_abs_eV": 8.970000003216683e-06,
+          "full_prefix_RMS_eV": 4.597465460608187e-07,
+          "frontier_392_399_max_abs_eV": 3.700000128503689e-08
+        }
+      },
+      "historical_recipe": "../2026-10-23/cr_al2o3_80/manifest.json",
+      "driver_receipt_SHA256": "1f8f29e4983b52c230d7fa5e5c7c7858ce6d6074d3dfd7bbc7507d20dbed4d16",
+      "canonical_readback_SHA256": "9abf3455122c5db41bb7133e77303ccbc466b92d5219a583ace6b28a0baccb68"
+    },
+    {
+      "case": "si_soc",
+      "source": "3a3aee27cab873087e93c67ada81edb10a0b369c",
+      "status": "COMPLETE_CANONICAL_INTEGRITY_AND_NUMERICAL_REPRODUCIBILITY_PASS",
+      "atoms": 2,
+      "nspinor": 2,
+      "kgrid": [
+        4,
+        4,
+        4
+      ],
+      "full_k": 64,
+      "stored_parents": 8,
+      "sum_bands": 52,
+      "sum_band_carrier": 52,
+      "physical_centroids": 528,
+      "packed_centroids": 528,
+      "QP_bands_1based": [
+        1,
+        16
+      ],
+      "EQP_rows": 128,
+      "active_gpus": 1,
+      "allocated_gpus": 4,
+      "nodes": 1,
+      "mesh": [
+        1,
+        1
+      ],
+      "wall_seconds": 70.98,
+      "pool_used_peak_GB_per_rank": 18.17,
+      "host_high_water_GB_per_rank": 3.22,
+      "full_dynamic_coverage": true,
+      "out_of_range_fallback": false,
+      "energy_alignment": false,
+      "phase_alignment": false,
+      "frontier_bands_1based": [
+        8,
+        9
+      ],
+      "EQP_comparison": {
+        "eqp0.dat": {
+          "full_prefix_max_abs_eV": 1.3010000001756339e-06,
+          "full_prefix_RMS_eV": 4.1205633348205183e-07,
+          "frontier_max_abs_eV": 1.3010000001756339e-06
+        },
+        "eqp1.dat": {
+          "full_prefix_max_abs_eV": 9.439999999472093e-07,
+          "full_prefix_RMS_eV": 2.9892573283199453e-07,
+          "frontier_max_abs_eV": 9.439999999472093e-07
+        }
+      },
+      "historical_recipe": "../2026-10-23/si_soc/manifest.json",
+      "driver_receipt_SHA256": "09a418116375543c91c1eb9f09223767a4fa5a0a7752def5f26da62825622d91",
+      "canonical_readback_SHA256": "59e4f0878d6a5cce1b656565e68b81399e1af8ac3e93e6b3f53e347ab6d27bbb"
+    },
+    {
+      "case": "al2o3_10",
+      "source": "df10cadce9d3125e562e3a9e63eca2b45ac0befb",
+      "status": "COMPLETE_CANONICAL_INTEGRITY_AND_NUMERICAL_REPRODUCIBILITY_PASS",
+      "atoms": 10,
+      "nspinor": 1,
+      "kgrid": [
+        4,
+        4,
+        4
+      ],
+      "full_k": 64,
+      "stored_parents": 13,
+      "sum_bands": 154,
+      "sum_band_carrier": 154,
+      "physical_centroids": 1584,
+      "packed_centroids": 1584,
+      "QP_bands_1based": [
+        1,
+        30
+      ],
+      "EQP_rows": 390,
+      "active_gpus": 1,
+      "allocated_gpus": 4,
+      "nodes": 1,
+      "mesh": [
+        1,
+        1
+      ],
+      "wall_seconds": 50.1,
+      "pool_used_peak_GB_per_rank": 25.4,
+      "host_high_water_GB_per_rank": 6.3,
+      "full_dynamic_coverage": true,
+      "out_of_range_fallback": false,
+      "energy_alignment": false,
+      "phase_alignment": false,
+      "frontier_bands_1based": [
+        24,
+        25
+      ],
+      "EQP_comparison": {
+        "eqp0.dat": {
+          "full_prefix_max_abs_eV": 1.8590000010476615e-06,
+          "full_prefix_RMS_eV": 4.380164321786228e-07,
+          "frontier_max_abs_eV": 3.589999995057269e-07
+        },
+        "eqp1.dat": {
+          "full_prefix_max_abs_eV": 1.937000000395983e-06,
+          "full_prefix_RMS_eV": 4.144592152055095e-07,
+          "frontier_max_abs_eV": 3.020000001185963e-07
+        }
+      },
+      "historical_recipe": "../2026-10-23/al2o3_10/manifest.json",
+      "driver_receipt_SHA256": "9bc535e9ad2c0a3f1b342d16dec673795593a99696eb8b43208f3dde77ac2419",
+      "canonical_readback_SHA256": "cf1278fec4b286861fb0da8a7ec536783d7243c336ab0fa4c48c9238b287d5cc"
+    }
+  ],
+  "numerical_acceptance": {
+    "existing_EQP_max_abs_limit_eV": 5e-05,
+    "existing_complex_Sigma_max_abs_limit_eV": 0.002,
+    "worst_measured_EQP_max_abs_eV": 8.970000003216683e-06,
+    "worst_measured_raw_complex_Sigma_max_abs_eV": 3.14043e-06,
+    "independent_review_SHA256": "e6e15681af57921d8fa42ea9d1c5ab0588c2859c3832f9819f02e27988c5a608",
+    "no_gate_changed": true
+  },
+  "count_conclusions": {
+    "si_soc": "One active GPU is the legal minimum for this fixed case; four GPUs were allocated.",
+    "al2o3_10": "One active GPU is the legal minimum for this fixed case; four GPUs were allocated.",
+    "cr_al2o3_80": "Four is the smallest completed count tested; no smaller count was run. Nine offers measured headroom and lower observed wall time in this pair."
+  },
+  "qualifications": [
+    "Cr80 magnetic/structural convergence and original GN invalid-mode policy unchanged. Global TRS conservatively disabled because matching SCF charge identity was unavailable; not a newly measured physical TRS verdict.",
+    "Physical versus processor-pad extents are explicit; no centroid truncation or scientific-output rank adjustment.",
+    "Historical and current sources/cache histories differ. No performance ratio against the historical P16 run is certified.",
+    "GW totals exclude preprocessing/queue/allocation startup; active count is distinct from reserved GPU/node billing.",
+    "Full outputs/HDF5 and driver/readback receipts remain in the private evidence archive. This compact manifest contains no large payloads."
+  ]
+}
