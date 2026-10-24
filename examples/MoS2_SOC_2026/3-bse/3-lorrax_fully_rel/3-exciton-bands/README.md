@@ -41,7 +41,12 @@ Instructions
    Plan for roughly three hours for the full path, plus the near-Gamma scan;
    the latter completed in 25 min 37 s from a cold launch on four Frontier
    GPU ranks. The full-path estimate is a planning allowance, not a measured
-   benchmark for every machine.
+   benchmark for every machine. The executed full path used two independently
+   checked four-rank halves, taking 89 and 95 minutes, run concurrently on
+   one eight-GCD Frontier allocation. Their elapsed times sum to about
+   3 h 4 min, including duplicated M, an extra K anchor, two stored-route
+   certification solves and repeated preparation. That sum is not a measured
+   single-four-rank full-path wall time.
 
 3. Source the shared tutorial environment and plot:
 
@@ -67,9 +72,10 @@ Exchange certification
 
 The runner uses `--vq-mode refit --refit-window bse` and the existing
 `visualization` certificate grade, whose exchange-comparison gate is 1 meV.
-Matched on-grid checks on the 24 × 24 and 30 × 30 integration grids gave
-0.01963 and 0.02086 meV, respectively. These pass the visualization gate
-and exceed the 0.01 meV reference gate. They measure refitted versus stored
+The completed 256-root full path gave a worst on-grid difference of
+0.04416 meV in each half; the eight-root near-Gamma scan gave 0.01412 meV.
+These pass the visualization gate and exceed the 0.01 meV reference gate.
+They measure refitted versus stored
 exchange eigenvalues, not the error of the exciton energies against a
 converged calculation or a comparison between the two integration grids.
 The solver uses a tighter absolute residual budget on both members of each
@@ -93,7 +99,16 @@ momenta; the maxima at Gamma and K were 7.14 and 5.78 meV. This exercise
 uses the cheaper 24 × 24 grid without claiming integration-grid convergence.
 The exchange certification above is a separate comparison. At each Q,
 check the highest requested level against the matched independent-particle
-threshold; requesting 256 roots does not itself certify continuum coverage.
+threshold. In the completed path, the highest of 256 levels is above that
+threshold at 21 of 25 Q points. Four points retain only levels below it,
+with a largest shortfall of 131.8 meV. At Gamma and K the window extends
+152 and 113 meV above the threshold, respectively.
+
+The independently computed M overlap and the two Gamma endpoints agree
+for all 256 levels at the printed energy precision, within the 0.5 meV
+closure budget. The near-Gamma scan's eight Gamma energies also match
+the corresponding full-path levels at printed precision. The merged path
+keeps the 25 physical momenta without shifting or averaging energies.
 
 For a bright exciton doublet in two dimensions, long-range exchange can
 produce a leading linear term in |Q| for the longitudinal combination,
