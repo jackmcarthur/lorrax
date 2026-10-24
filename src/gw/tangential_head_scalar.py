@@ -79,17 +79,17 @@ def _shared_poles(model,mesh):
 
 
 @lru_cache(maxsize=None)
-def _scalar_ritz_program(gram_keep):
+def _scalar_ritz_program():
+    """Share each pencil geometry across runtime retention-cut refinements."""
     from .tangential_pencil import assemble_tangential_pencil
     from .tangential_reduction import reduce_tangential_pencil
     from .tangential_gates import apply_tangential_zero_policy, retained_moment_identity
     from .tangential_local import _mm
     from .tangential_recipe import shared_real_pole_gates_v1_r3b as canonical_gates
-    gates = dict(canonical_gates,normalized_gram_keep=dict(
-        canonical_gates['normalized_gram_keep'],threshold=float(gram_keep)))
-
     @jax.jit
-    def execute(points, values, slopes, m1, m3):
+    def execute(points, values, slopes, m1, m3, gram_keep):
+        gates = dict(canonical_gates,normalized_gram_keep=dict(
+            canonical_gates['normalized_gram_keep'],threshold=gram_keep))
         direction = jnp.ones((1,1,points.size),jnp.complex128)
         finite = [(points, direction, values[None,None], slopes[None,None])]
         qi = jnp.ones((1,1,1),jnp.complex128)
@@ -135,10 +135,10 @@ def scalar_head_ritz(z, values, slopes, *, moment_m1, moment_m3, gram_keep=None,
     gram_keep = canonical_keep if gram_keep is None else float(gram_keep)
     if not 0 < gram_keep <= canonical_keep:
         raise ValueError('GATE scalar_head_keep: retention may only refine the common cut')
-    program = _scalar_ritz_program(gram_keep)
+    program = _scalar_ritz_program()
     args=(
         jnp.asarray(points),jnp.asarray(outputs),jnp.asarray(derivatives),
-        jnp.asarray(moment_m1),jnp.asarray(moment_m3))
+        jnp.asarray(moment_m1),jnp.asarray(moment_m3),jnp.asarray(gram_keep,jnp.float64))
     result,priced=_execute(program,args,mesh=mesh,side=len(points)+1,label='Ritz')
     model,reduction,zero,retained = jax.device_get(result)
     for name in ('gram_diagonal_positive','gram_valid','retained_metric_positive','ritz_eigh_finite'):

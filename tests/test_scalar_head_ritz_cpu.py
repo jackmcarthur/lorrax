@@ -71,8 +71,8 @@ def test_scalar_shared_ritz_refuses_nonfinite_retained_identity(monkeypatch):
     from gw import tangential_head_scalar as owner
     jax.config.update('jax_enable_x64',True)
     real_factory=owner._scalar_ritz_program
-    def factory(cut):
-        real=real_factory(cut)
+    def factory():
+        real=real_factory()
         def inject(*args):
             model,diagnostics,zero,retained=real(*args)
             retained=dict(retained)
@@ -269,3 +269,37 @@ def test_shared_certificate_optional_samples_preserve_body_default_results():
         np.testing.assert_allclose(before,after,rtol=1e-14,atol=1e-14)
     np.testing.assert_allclose(extended[4][:,0,0,0],values,rtol=1e-14,atol=1e-14)
     np.testing.assert_allclose(extended[4][:,1,0,0],slopes,rtol=1e-14,atol=1e-14)
+
+
+def test_scalar_retention_trials_share_one_trace_and_still_change_retained_rank(monkeypatch):
+    """The three inherited cuts are runtime data, with genuine rank changes."""
+    import json
+    from pathlib import Path
+    import jax
+    from gw import tangential_head_scalar as owner
+    from gw import tangential_reduction as reduction
+    from gw.qsgw_head import head_quadrature_rule
+    jax.config.update('jax_enable_x64',True)
+    def decode(v):
+        if isinstance(v,dict):
+            return complex(v['real'],v['imag']) if set(v)=={'real','imag'} else {k:decode(x) for k,x in v.items()}
+        return [decode(x) for x in v] if isinstance(v,list) else v
+    raw=decode(json.loads((Path(__file__).parent/'data/ladder_head_conditioning_actions.json').read_text()))
+    obs=raw['observations'];z=np.asarray(obs['z'])
+    quadrature=set(map(complex,np.r_[*[1j*head_quadrature_rule(n)[0] for n in (24,48,96)]]))
+    ids=np.array([i for i,p in enumerate(z[:raw['fit_prefix']]) if p not in quadrature])
+    calls=[];original=reduction.reduce_tangential_pencil
+    def traced(*a,**k):
+        calls.append(True)
+        return original(*a,**k)
+    monkeypatch.setattr(reduction,'reduce_tangential_pencil',traced)
+    owner._scalar_ritz_program.cache_clear()
+    ranks=[]
+    for cut in (1e-8,1e-10,1e-12):
+        model=owner.scalar_head_ritz(z[ids],np.asarray(obs['Wc'])[ids],np.asarray(obs['dWc_ds'])[ids],
+            moment_m1=obs['M1'],moment_m3=obs['M3'],gram_keep=cut)
+        assert model['provenance']['gram_keep']==cut
+        ranks.append(len(model['Omega_p']))
+    assert len(calls)==1
+    assert len(set(ranks))>1
+    owner._scalar_ritz_program.cache_clear()
