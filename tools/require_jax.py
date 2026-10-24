@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Refuse any LORRAX launch unless JAX and JAXLIB are in the supported series.
+"""Refuse any LORRAX launch unless JAX and JAXLIB are in the platform's window.
 
 Package metadata is inspected without importing JAX, so this preflight cannot
 initialize a CPU client, start distributed coordination, or consume the one
 MPI initialization owned by XLA.
 
-The window is ``SUPPORTED_MIN`` / ``SUPPORTED_MAX_EXCLUSIVE`` in
-``src/runtime/jax_support.py``, loaded from that file by path: it imports
-only the standard library at module scope, and loading it by path keeps the
-``runtime`` package (and its jaxlib import) out of this process.
+The windows are ``SUPPORTED_WINDOWS`` in ``src/runtime/jax_support.py``, keyed
+by the leg ``lxkit.legs.startup_gpu_leg`` names (``JAX_PLATFORMS``'s first
+entry, else the installed jaxlib GPU plugin's leg, else ``cpu``).  Both files
+are loaded by path: each imports only the standard library at module scope,
+and loading them by path keeps the ``runtime`` package (and its jaxlib import)
+out of this process.
 """
 from __future__ import annotations
 
@@ -21,14 +23,17 @@ from pathlib import Path
 
 
 _FALSE_VALUES = {"", "0", "false", "no", "off"}
-_JAX_SUPPORT = Path(__file__).resolve().parents[1] / "src" / "runtime" / "jax_support.py"
+_ROOT = Path(__file__).resolve().parents[1]
+_JAX_SUPPORT = _ROOT / "src" / "runtime" / "jax_support.py"
+_LEGS = _ROOT / "services" / "lxkit" / "src" / "lxkit" / "legs.py"
 
 
-def _window() -> tuple[tuple[int, ...], tuple[int, ...]]:
-    spec = importlib.util.spec_from_file_location("_lorrax_jax_support", _JAX_SUPPORT)
+def _load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module          # dataclasses resolve their module by name
     spec.loader.exec_module(module)
-    return tuple(module.SUPPORTED_MIN), tuple(module.SUPPORTED_MAX_EXCLUSIVE)
+    return module
 
 
 def _version(distribution: str) -> str:
@@ -55,35 +60,38 @@ def main() -> int:
         )
         return 86
 
-    lo, hi = _window()
-    series = ".".join(str(v) for v in lo[:2])
+    support = _load("_lorrax_jax_support", _JAX_SUPPORT)
+    leg = _load("_lorrax_legs", _LEGS).startup_gpu_leg()
+    key = leg.key if leg is not None else "cpu"
+    window = support.describe_window(key)
     try:
         versions = {name: _version(name) for name in ("jax", "jaxlib")}
-        wrong = {
-            name: version
-            for name, version in versions.items()
-            if not (lo <= _release(version) < hi)
-        }
+        releases = {name: _release(version) for name, version in versions.items()}
     except RuntimeError as exc:
         print(f"JAX_ENV_REFUSED: {exc}", file=sys.stderr)
         return 86
+    wrong = {name: versions[name] for name, vi in releases.items()
+             if not support.in_window(vi, key)}
+    if not wrong and releases["jax"][:2] != releases["jaxlib"][:2]:
+        wrong = dict(versions)
 
     if wrong:
         rendered = ", ".join(f"{name}={version}" for name, version in wrong.items())
         print(
-            f"JAX_ENV_REFUSED: required jax/jaxlib {series}.x; got " + rendered,
+            f"JAX_ENV_REFUSED: required jax/jaxlib of one series, {window}, on the "
+            f"{key} leg; got " + rendered,
             file=sys.stderr,
         )
         print(
-            f"Fix: activate a JAX/JAXLIB {series} environment built from this "
-            "checkout's uv.lock before launch.",
+            "Fix: activate a JAX/JAXLIB environment built from this checkout's "
+            "uv.lock (Frontier: config/frontier/constraints.txt) before launch.",
             file=sys.stderr,
         )
         return 86
 
     print(
         "JAX_ENV_OK "
-        f"jax={versions['jax']} jaxlib={versions['jaxlib']} "
+        f"jax={versions['jax']} jaxlib={versions['jaxlib']} leg={key} "
         f"python={sys.executable} "
         f"LX_BASE_MODULE={os.environ.get('LX_BASE_MODULE', '<direct-launch>')}",
         flush=True,

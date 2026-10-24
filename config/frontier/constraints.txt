@@ -1,0 +1,17 @@
+# The Frontier ROCm Python environment ($HOME/envs/lx-jax091-rocm7141): the
+# validated GPU stack, pinned in one place.  docs/installation/frontier.md
+# passes this file to every pip install in that venv as a constraints file
+# (pip install -c), so no later install there can move jax/jaxlib off 0.9.1.
+# src/runtime/jax_support.py accepts 0.9.1 on the ROCm leg only
+# (SUPPORTED_WINDOWS).  The venv is pip-built, not a uv project environment:
+# uv sync manages the checkout's .venv from uv.lock (JAX 0.12) and must not be
+# pointed at this venv (no --active, no UV_PROJECT_ENVIRONMENT).
+#
+# AMD index (https://repo.amd.com/rocm/whl-multi-arch/); installed as
+# rocm[libraries,device-gfx90a] (pip constraints cannot carry extras).
+rocm==7.14.1
+jax_rocm7_plugin==0.9.1+rocm7.14.1
+jax_rocm7_pjrt==0.9.1+rocm7.14.1
+# PyPI: the matching frontend and jaxlib.
+jax==0.9.1
+jaxlib==0.9.1

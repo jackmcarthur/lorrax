@@ -14,7 +14,7 @@ Always required, on CPU and GPU alike.
 | Component | Requirement | What it is for |
 |---|---|---|
 | Python | ≥ 3.12 | The runtime; uv installs its own 3.12 |
-| JAX, jaxlib | `>= 0.12.0, < 0.13.0` | Every array operation. Any other minor series refuses at startup, and there is no override |
+| JAX, jaxlib | `>= 0.12.0, < 0.13.0`; on AMD GPUs also exactly `0.9.1` | Every array operation. Any other version refuses at startup, and there is no override. 0.9.1 is accepted only with the ROCm plugin installed or selected ([Frontier](#frontier)) |
 | Python packages | `h5py >= 3.14`, `numpy >= 2.3.1`, `scipy >= 1.16`, `matplotlib`, `xmlschema`, `xsdata` | File I/O, the QE schema reader and plots; pinned in `pyproject.toml` and `uv.lock` |
 | MPI | the site MPI | Communication between processes; both FFI legs link the same `libmpi` |
 | HDF5 | parallel HDF5 ≥ 1.12, built with `HDF5_IS_PARALLEL` | Parallel reads and writes of the large files; both legs link the HDF5 the run maps |
@@ -403,7 +403,11 @@ AMD's multi-architecture wheel index supplies
 `jax_rocm7_plugin`/`jax_rocm7_pjrt==0.9.1+rocm7.14.1`; PyPI supplies
 `jax==0.9.1` and `jaxlib==0.9.1`. That recipe installs the editable workspace
 packages from `pyproject.toml`, then the root package, and records the final
-package manifest. No CUDA extra is installed.
+package manifest. No CUDA extra is installed. `config/frontier/constraints.txt`
+holds these pins: export it as `PIP_CONSTRAINT` for any later `pip install` in
+that environment, and do not point `uv sync` at it, since `uv.lock` holds JAX
+0.12. JAX 0.9.1 is accepted on AMD GPUs only; the same environment run with
+`JAX_PLATFORMS=cpu` still counts as AMD, because its ROCm plugin is installed.
 
 The normal PyPI `h5py` wheel is supported; no MPI-enabled `h5py` build is
 needed. Its private serial HDF5 libraries are separate from the one pinned
@@ -515,6 +519,6 @@ Process-count rules, the per-GPU memory budget and how many GPUs a calculation n
     - `partial sealed-bundle override refused`: only one leg of a sealed pair is pinned. Unset both pins, or pin both legs of one bundle.
     - `mixed native providers`: the two legs come from different bundles. Select both from one bundle.
     - `GATE native-closure: got …; want …; fix: …`: the process maps a library other than the recorded one. Remove what maps it (an `LD_PRELOAD`, a package built against another MPI), or rebuild the leg.
-    - `JAX_ENV_REFUSED`, or the `runtime.jax_support` refusal before the first `jit`: JAX or jaxlib outside the 0.12 series. Install the 0.12 series.
+    - `JAX_ENV_REFUSED`, or the `runtime.jax_support` refusal before the first `jit`: JAX or jaxlib outside the 0.12 series (on AMD GPUs, outside the 0.12 series and 0.9.1). Install the 0.12 series.
     - `GATE mathdx-headers`: a CUDA run without `nvidia-mathdx`. Run `uv sync --extra cuda13` (or `cuda12`).
 

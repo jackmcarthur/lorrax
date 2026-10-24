@@ -63,7 +63,9 @@ from lxkit.legs import (
     leg_for_jax_platform,
     leg_for_platform,
     leg_for_vendor,
+    installed_plugin_leg,
     process_accelerator_leg,
+    startup_gpu_leg,
 )
 from lxkit.cache import atomic_write_bytes, user_cache_dir
 from lxkit.placement import (device_put_process_local, device_put_process_local_cached,
@@ -94,9 +96,13 @@ def mark_varying(x, axes):
 def varying_axes(x):
     """The mesh axes ``x`` is device-varying over inside ``shard_map`` (empty
     outside one): ``jax.typeof(x).manual_axis_type.varying`` (JAX 0.10 removed
-    ``ShapedArray.vma``, which held the same set)."""
+    ``ShapedArray.vma``, which held the same set).  JAX 0.9.1, still accepted
+    on the ROCm leg (``runtime.jax_support.SUPPORTED_WINDOWS``), has only
+    ``vma``; a type with neither raises rather than reading as empty."""
     import jax
-    return frozenset(jax.typeof(x).manual_axis_type.varying)
+    aval = jax.typeof(x)
+    manual = getattr(aval, "manual_axis_type", None)
+    return frozenset(manual.varying if manual is not None else aval.vma)
 
 __all__ = [
     # gate
@@ -115,7 +121,7 @@ __all__ = [
     # the platform legs of the native-provider ABI
     "legs", "memory", "LEGS", "PlatformLeg", "accelerator_leg_to_open_first",
     "accelerator_legs", "leg_device_present", "leg_for_jax_platform", "leg_for_platform", "leg_for_vendor",
-    "process_accelerator_leg",
+    "process_accelerator_leg", "installed_plugin_leg", "startup_gpu_leg",
     # native-provider policy (the tables remain with each caller)
     "native_provider",
     # the per-user persistent-cache root

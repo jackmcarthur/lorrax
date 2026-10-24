@@ -195,8 +195,17 @@ def ordered_psum_scatter(x, axis_name, *, scatter_dimension: int = 0, tiled: boo
 
 
 def _all_gather_invariant(part, axis_name):
-    """Tiled all_gather typed invariant over ``axis_name``: one gather, no extra collective."""
+    """Tiled all_gather typed invariant over ``axis_name``: one gather, no extra collective.
+
+    JAX 0.12 spells it ``all_gather(..., to="invarying")``.  JAX 0.9.1, still
+    accepted on the ROCm leg (``runtime.jax_support.SUPPORTED_WINDOWS``),
+    refuses that ``to`` value and has the private ``all_gather_invariant``,
+    which 0.10 removed; no other series is accepted at startup."""
+    import jax.version
     from jax import lax
+    if tuple(jax.version.__version_info__[:2]) == (0, 9):
+        from jax._src.lax.parallel import all_gather_invariant
+        return all_gather_invariant(part, axis_name, tiled=True)
     return lax.all_gather(part, axis_name, tiled=True, to="invarying")
 
 
