@@ -31,7 +31,12 @@ srun -N 1 -n 4 -c 16 --threads-per-core=1 --cpu-bind=threads --gpus-per-node=4 \
 | a GPU job step | all six components, PASS or FAIL | 0 / 1 |
 | a CPU job step (or `--cpu-only`) | components 1, 2 and 4; the verdict says it is not a GPU certification | 0 / 1 |
 
-Exit 2 means the check itself broke. Every rank writes `rank<N>.json` and rank 0
+`lorrax-postinstall` (written by `install_deps.sh`) builds the NVRTC kernel
+store and then runs this check with four ranks. When every rank has reported
+and the verdict is a GPU PASS, rank 0 writes the verdict to
+`runtime.install_verification_stamp(<GPU model>)`. Until that file exists, the
+startup block of every GPU run warns INSTALL NOT VERIFIED. A FAIL removes the
+file. Exit 2 means the check itself broke. Every rank writes `rank<N>.json` and rank 0
 writes `verdict.json` and `report.txt` under
 `$SCRATCH/.cache/lorrax/perfcheck/<job>.<step>/` (or `--out`). The whole check
 takes about two minutes on four A100s.
@@ -52,7 +57,30 @@ SMT siblings a mask without `--threads-per-core=1` contains) is a warning.
 
 ## Calibration
 
-References and thresholds are constants at the top of the script. The table
-below is what they were set from (Perlmutter, 4 ranks).
+References and thresholds are constants at the top of the script. They were set
+from the runs below (Perlmutter, 4 ranks, slowest rank, 2026-10-23). "Fast" is an
+`install_deps.sh` install on Lustre `$SCRATCH` (JAX 0.12); "module" is the
+published `lorrax_A` module on `/global/common` (JAX 0.9.1).
 
-(filled from the validation runs)
+| install, node | warm open ms | venv walk /s | cold XLA compile, 36 programs | NVRTC build | verdict |
+|---|---|---|---|---|---|
+| fast, GPU node, n = 3 | 0.015–0.157 | 20,234–20,670 | 7.63–7.97 s (spread 4.4%) | 5.8–6.6 s | PASS |
+| module, GPU node, n = 2 | 3.27–3.93 | 587–988 | 11.8–12.3 s (1.5–1.6x) | 16.5–32.6 s | FAIL: slow filesystem |
+| fast, CPU node, n = 5 | 0.015–0.24 | — | — | — | PASS (CPU only) |
+| module, CPU node, n = 5 | 1.37–4.6 | — | — | — | FAIL: slow filesystem |
+
+Compute-node open medians from the filesystem survey: `/global/common`
+(DVS) 3.5 ms, `$HOME` 10.6 ms, CFS 9.6 ms, `$SCRATCH` 0.24 ms, node-local
+`/tmp` 0.005 ms. A login node reads every one of them at about 0.07 ms.
+
+Injected faults on the fast install, GPU node:
+
+| fault | verdict, first diagnosis |
+|---|---|
+| `OMP_NUM_THREADS=256` | FAIL, 4 binding: a 256-thread OpenMP team on 16 CPUs |
+| `--cpu-bind=none` | FAIL, 4 binding: ranks share CPUs |
+| `CUDA_FORCE_PTX_JIT=1` | FAIL, 3 kernels: CUDA_FORCE_PTX_JIT is set |
+| `ISDF_JAX_CACHE_DIR` on a read-only tree | FAIL, 2 caches: compile cache not writable |
+| empty NVRTC image cache | FAIL, 2 caches: cubin store missing, with the command that builds it |
+| a `$HOME` directory first on `LD_LIBRARY_PATH` | FAIL, 1 filesystem: 2.4 ms per failed lookup on DVS |
+| the docs `srun` line with `OMP_NUM_THREADS` unset | PASS: `select_gpu.sh` cuts each rank's CPU mask to one hardware thread per core and sets `OMP_NUM_THREADS` to the core count minus 2. Without that wrapper (the module), the check warns that the OpenMP team runs on SMT siblings; that cost about 8% of a stage (n = 1) |
