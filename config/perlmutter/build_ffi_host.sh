@@ -174,7 +174,8 @@ fi
 # expectations from ffi_site.cmake, so the build fails if any gate does.
 # ---------------------------------------------------------------------------
 [[ "${1:-}" == "--fresh" ]] && { echo "[build_ffi_host] --fresh: wiping $BUILD"; rm -rf "${BUILD:?}"; }
-(cd "$SRC" && cmake --preset perlmutter-host --fresh -B "$BUILD" \
+GEN=(); command -v ninja >/dev/null 2>&1 && GEN=(-G Ninja)   # /usr/bin on the login nodes
+(cd "$SRC" && cmake --preset perlmutter-host --fresh -B "$BUILD" "${GEN[@]}" \
     -DLORRAX_HOST_HAVE_SCALAPACK="$SCALAPACK")
 cmake --build "$BUILD" --parallel "${LORRAX_BUILD_JOBS:-8}"
 

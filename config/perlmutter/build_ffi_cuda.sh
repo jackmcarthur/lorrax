@@ -72,7 +72,9 @@ fi
 # SONAME), then runs scripts/verify_ffi_build.sh, so the build fails if any
 # gate does.
 [[ "${1:-}" == "--fresh" ]] && rm -rf "${BUILD:?}"
-(cd "$SRC" && cmake --preset perlmutter-cuda --fresh -B "$BUILD")
+# Ninja where it exists (/usr/bin on the login nodes): 17 s instead of 24 s.
+GEN=(); command -v ninja >/dev/null 2>&1 && GEN=(-G Ninja)
+(cd "$SRC" && cmake --preset perlmutter-cuda --fresh -B "$BUILD" "${GEN[@]}")
 cmake --build "$BUILD" --parallel "${LORRAX_BUILD_JOBS:-16}"
 SO="$BUILD/liblorrax_ffi.so"
 [[ -f "$SO" ]] || { echo "[build_ffi_cuda] FAILED: no .so produced" >&2; exit 1; }
