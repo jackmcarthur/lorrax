@@ -1140,6 +1140,24 @@ def _enforced_records() -> list[ClosureRecord]:
     return _in_dlopen_order([e.record for e in _ENFORCED.values()])
 
 
+def _staged_copy(path: Path) -> Path:
+    """The module's node-local copy of a venv file, when the lorrax module staged one
+    (``config/perlmutter/module/launch/lorrax_stage_local.py``: ``LORRAX_STAGED_SITE``
+    mirrors ``LORRAX_STAGE_VENV_SITE``); else ``path``.  JAX resolves ``nvidia`` to the
+    copy, so the closure must open the copy too, or one family is mapped twice.  The
+    gate still checks the copy is byte-identical to the recorded file."""
+    staged = os.environ.get("LORRAX_STAGED_SITE")
+    venv = os.environ.get("LORRAX_STAGE_VENV_SITE")
+    if not (staged and venv):
+        return path
+    try:
+        rel = Path(os.path.realpath(path)).relative_to(os.path.realpath(venv))
+    except ValueError:
+        return path
+    cand = Path(staged) / rel
+    return cand if cand.is_file() else path
+
+
 def _preload_closure(record: ClosureRecord, unusable_cls: Type[OSError]) -> None:
     """Open the record's files by exact path, dependencies first, skipping a
     family an already-enforced leg answers for (merged by the same rule the gate
@@ -1154,7 +1172,7 @@ def _preload_closure(record: ClosureRecord, unusable_cls: Type[OSError]) -> None
         if e.family in prior or e.role == "attest":
             continue      # already open (the same file, or yielded); attest: JAX's to map
         try:
-            handles.append(ctypes.CDLL(str(e.path), mode=ctypes.RTLD_GLOBAL))
+            handles.append(ctypes.CDLL(str(_staged_copy(e.path)), mode=ctypes.RTLD_GLOBAL))
         except OSError as exc:
             raise _gate(unusable_cls, f"{e.path} (recorded for {e.soname} in "
                         f"{record.origin}) failed to load: {exc}",
