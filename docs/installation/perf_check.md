@@ -83,7 +83,10 @@ sets them (`runtime.set_default_env`: the GPU leg's `xla_flag_defaults` in
 pass off), appended to the launch's `XLA_FLAGS`; a flag the launch already
 sets wins. Component 6 prints the effective value. Without them, XLA's GEMM
 autotuner spent 310 s on the first f64 8192² GEMM of a laptop GPU (4.1 s at
-level 0).
+level 0). On an 80 GB A100 the same f64 8192² GEMM runs at 3.70 TFLOP/s at
+level 0 against 19.2 at XLA's default level 4, and the 36-program cold compile
+takes 5.79 s against 7.78 s; the 80 GB references are those level-0 values
+(re-measured 2026-10-24, n = 3). The 40 GB references predate the flags.
 
 ## Calibration
 

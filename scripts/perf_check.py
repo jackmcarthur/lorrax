@@ -80,13 +80,20 @@ REFERENCE: dict = {
     # 0.12.0.1), slowest rank of 4, n=3 (ref1-3): compile_cold 7.63/7.64/7.97 s (spread 4.4%),
     # warm 0.687/0.699/0.690, NVRTC 5.78/5.80/6.62 (14.5%; the first run on the node is the
     # high one), GEMM 19.22-19.29, FFT 1.023-1.027 ms; import 3.7/3.7/18.6 s (first touch).
+    # compile_cold and GEMM re-measured with LORRAX's XLA flags (autotune 0, remat off), as the
+    # probes now run: job 60201235, nid200448, 2026-10-24, c5d4071eb image, lorrax-postinstall
+    # x3: compile_cold 5.785/5.808/5.767 s, GEMM 3.6995/3.6994/3.6994 TF (warm 0.688/0.695/
+    # 0.681, NVRTC 5.54-5.58, FFT 1.022-1.024: inside the old references, kept).  Same node,
+    # launch XLA_FLAGS=--xla_gpu_autotune_level=4: compile_cold 7.78 s, GEMM 19.22 TF.
     "NVIDIA A100-SXM4-80GB": {
-        "import_s": 18.6, "compile_cold_s": 7.64, "compile_warm_s": 0.693,
-        "nvrtc_s": 5.83, "gemm_tflops": 19.26, "fft_ms": 1.025, "host_gemm_s": None,
+        "import_s": 18.6, "compile_cold_s": 5.79, "compile_warm_s": 0.693,
+        "nvrtc_s": 5.83, "gemm_tflops": 3.70, "fft_ms": 1.025, "host_gemm_s": None,
     },
     # job 60190769, nid002136, 2026-10-23, 581a81831, n=3: compile_cold 7.68/7.75/8.02 s,
     # warm 0.696-0.703, NVRTC 5.75/6.78/7.03 (22%), GEMM 19.28-19.29, FFT 1.240-1.241 ms,
-    # import 3.7/3.8/10.6 s (first touch).
+    # import 3.7/3.8/10.6 s (first touch).  NOT re-measured with LORRAX's XLA flags: on 80GB
+    # they took GEMM 19.2 -> 3.70 TF and compile_cold 7.78 -> 5.79 s, so a 40GB run now FAILs
+    # GEMM against this reference until it is re-measured.
     "NVIDIA A100-SXM4-40GB": {
         "import_s": 10.6, "compile_cold_s": 7.75, "compile_warm_s": 0.699,
         "nvrtc_s": 6.78, "gemm_tflops": 19.29, "fft_ms": 1.240, "host_gemm_s": None,
