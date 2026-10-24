@@ -60,6 +60,13 @@ def test_band_request_every_tool(tmp_path, monkeypatch, request_lines, expected)
     left, _, _ = prune_band_ranges(args, wfn.nelec, wfn.nbands - wfn.nelec)
     seen["centroids (left window)"] = left
 
+    from gw.gw_config import _DECK_NAMED_KEYS, missing_deck_keys
+    named = read_lorrax_input(str(deck))[_DECK_NAMED_KEYS]
+    assert missing_deck_keys(named, "number_bands", "band_request",
+                             "ncond_request", "centroids_file") == []
+    assert missing_deck_keys({"nval"}, "band_request", "number_bands") == [
+        "ncond is required (or number_bands_protected)", "number_bands is required"]
+
     windows = {k: v for k, v in seen.items() if k != "centroids (left window)"}
     assert set(windows.values()) == {expected}, seen
     assert left == (0, 18 + expected[1]), seen

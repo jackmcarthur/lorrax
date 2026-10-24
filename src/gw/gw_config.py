@@ -1008,9 +1008,10 @@ def resolve_eigh_backend(params) -> str:
 ZETA_RCOND_DEFAULT: float = 1e-8
 
 _DEFAULTS = {
-    # System geometry
-    "nval": 5,
-    "ncond": 5,
+    # The QP request: nval and ncond, or number_bands_protected below.  No
+    # default (None until the input file names them; missing_deck_keys).
+    "nval": None,
+    "ncond": None,
     # The QP request as one band count (owner 2026-09-29, the documented
     # form): every occupied band plus conduction bands up to this total.
     # Exclusive with nval/ncond (GATE band_request_forms); resolved against
@@ -2056,6 +2057,8 @@ _NULLABLE_BOOL = frozenset({
 #: and silently truncated it — is a band edge nobody can reason about.  A
 #: non-integral value raises out of ``configparser.getint`` by name.
 _NULLABLE_INT = frozenset({
+    "nval",
+    "ncond",
     "zeta_nband",
     "number_bands_protected",
     "sys_dim",
@@ -3064,6 +3067,43 @@ def protected_band_window(total, nband, n_occ, print_fn=print):
     return n_occ, total - n_occ
 
 
+def missing_deck_keys(named, *keys) -> list:
+    """The refusal lines (``"<key> is required"``) for the ``keys`` the input file does not name.
+
+    ``named`` is the set of keys the input file names (``params[_DECK_NAMED_KEYS]``
+    or ``LorraxConfig.raw_input_keys``).  Besides plain key names, ``keys``
+    takes the three band forms:
+
+    * ``"band_request"``: ``nval`` and ``ncond``, or ``number_bands_protected``;
+    * ``"ncond_request"``: ``ncond``, or ``number_bands_protected``;
+    * ``"number_bands"``: ``number_bands`` (or its alias ``nband``), or both
+      ``number_bands_chi`` and ``number_bands_sigma``.
+    """
+    named = {str(k).lower() for k in (named or ())}
+    protected = "number_bands_protected" in named
+    lines = []
+    for key in keys:
+        if key in ("band_request", "ncond_request"):
+            want = ("nval", "ncond") if key == "band_request" else ("ncond",)
+            if not protected:
+                lines += [f"{k} is required (or number_bands_protected)"
+                          for k in want if k not in named]
+        elif key == "number_bands":
+            if not (named & set(_UMBRELLA_KEYS)
+                    or set(_SPECIFIC_KEYS) <= named):
+                lines.append("number_bands is required")
+        elif key not in named:
+            lines.append(f"{key} is required")
+    return lines
+
+
+def require_deck_keys(named, *keys, error=ValueError) -> None:
+    """Refuse an input file that does not name every key of ``keys`` (:func:`missing_deck_keys`)."""
+    lines = missing_deck_keys(named, *keys)
+    if lines:
+        raise error("\n".join(lines))
+
+
 #: Reserved params slot: True once :func:`resolve_band_request` has run.
 _BAND_REQUEST_RESOLVED = "_band_request_resolved"
 
@@ -3093,8 +3133,8 @@ def _assemble_input_config(
         filename, head, input_dir, memory, mpa, params, paths, ppm, sc, screening, sigma):
     """Produce the typed configuration from its resolved groups."""
     resolved = cls(
-        nval=int(params["nval"]),
-        ncond=int(params["ncond"]),
+        nval=None if params["nval"] is None else int(params["nval"]),
+        ncond=None if params["ncond"] is None else int(params["ncond"]),
         number_bands_protected=_band_request_form(params, _effective_named_keys),
         nband=int(_bands.isdf),
         bands=_bands,
@@ -4998,8 +5038,9 @@ class LorraxConfig:
     """Unified, immutable configuration for a LORRAX GW calculation; see docs/dev/gw_config_contracts.md."""
 
     # --- System geometry (top-level; hot path) ---
-    nval: int
-    ncond: int
+    #: None under number_bands_protected until :meth:`with_band_request`.
+    nval: int | None
+    ncond: int | None
     #: The LOADED band extent = ``bands.isdf`` = ``max(chi, sigma)``.  On
     #: every deck that names only the umbrella (or only the transitional
     #: ``nband`` alias) this is exactly the umbrella, which is why the whole

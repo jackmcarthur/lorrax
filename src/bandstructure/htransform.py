@@ -564,7 +564,7 @@ def write_fine_grid_bands(params, *, ctilde, B_at_mu, enk_sigma, meta, wfn, mesh
 def main(argv=None):
     parser = add_band_character_arguments(argparse.ArgumentParser(
         allow_abbrev=False, description="Hamiltonian interpolation driver"))
-    parser.add_argument("-i", "--input", default="cohsex_test.in", help="Input file")
+    parser.add_argument("-i", "--input", required=True, help="Input file")
     parser.add_argument("-wfn", "--wfn-file", default=None, help="Override WFN file (e.g. WFN_qp.h5)")
     parser.add_argument("--plot", action="store_true", help="Show interpolated band plot")
     qp_group = parser.add_mutually_exclusive_group()
@@ -621,6 +621,15 @@ def main(argv=None):
         report.devices(mesh_role="basis axes X x Y")
 
         params = read_cohsex_input(args.input)
+        from gw.gw_config import _DECK_NAMED_KEYS, missing_deck_keys
+        _missing = missing_deck_keys(params[_DECK_NAMED_KEYS], "centroids_file",
+                                     "band_request")
+        # The k path, except on the diagnostic routes (fine grid, grid moments).
+        if not (params.get("kpoints_crystal_b") or params.get("get_centroids_fi")
+                or args.moments_grid):
+            _missing.append("K_POINTS crystal_b is required")
+        if _missing:
+            parser.error("\n".join(_missing))
         # The deck's linalg dial selects the eigensolver and the batch route.
         eigh_backend = resolve_eigh_backend(params)
         distrib_la_batched_route = resolve_distrib_la_batched_route(params)

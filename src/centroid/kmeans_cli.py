@@ -23,8 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(allow_abbrev=False,
         description="Weighted k-means for ISDF sampling points.",
     )
-    p.add_argument("n_centroids", type=int, nargs="?", default=400,
-                   help="Number of centroids (default 400).")
+    p.add_argument("n_centroids", type=int,
+                   help="Number of centroids N_c (required).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--plot", action="store_true",
                    help="Emit a 3D matplotlib plot of centroids over ρ "
@@ -256,8 +256,9 @@ def _resolve_deck(args) -> tuple[dict | None, str]:
                 stacklevel=2)
         return None, "WFN.h5"
     from file_io.paths import resolve_input_path
-    from gw.gw_config import read_lorrax_input
+    from gw.gw_config import _DECK_NAMED_KEYS, read_lorrax_input, require_deck_keys
     deck = read_lorrax_input(args.input)
+    require_deck_keys(deck[_DECK_NAMED_KEYS], "ncond_request")
     # Every planner of this run prices against the deck's device budget, as
     # in gwjax; 0 (the default) keeps the card's collective auto-detection.
     deck_gb = float(deck.get("memory_per_device_gb", 0.0) or 0.0)

@@ -215,7 +215,7 @@ def kmeans_settings_rows(args, *, source) -> list:
     m_cand = int(math.ceil(n_c * oversample)) if oversample > 1.0 else n_c
     current = args.density_mode == "current"
     rows = [
-        Setting("n_centroids", str(n_c), "cli" if n_c != 400 else "default",
+        Setting("n_centroids", str(n_c), "cli",
                 "point budget: the centroids requested"),
         Setting("oversample", f"{oversample:g}", source("--oversample"),
                 f"{m_cand} k-means candidates, pruned by pivoted Cholesky"

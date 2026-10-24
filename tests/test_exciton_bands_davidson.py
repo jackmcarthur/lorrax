@@ -143,7 +143,8 @@ def _deck_args(p, lines, check=False):
     import tempfile
     from bse import exciton_bands as exb
     fd = tempfile.NamedTemporaryFile("w", suffix=".in", delete=False)
-    fd.write("[cohsex]\nsys_dim = 3\nnumber_val_bands_fine = 3\nnumber_cond_bands_fine = 3\n"
+    fd.write("[cohsex]\nsys_dim = 3\nnval = 5\nncond = 5\ncentroids_file = centroids_frac.txt\n"
+             "number_val_bands_fine = 3\nnumber_cond_bands_fine = 3\n"
              + "".join(f"{line}\n" for line in lines))
     fd.close()
     args = p.parse_args(["-i", fd.name])

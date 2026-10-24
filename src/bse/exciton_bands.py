@@ -1445,6 +1445,8 @@ def deck_settings(ap, args):
             args.input, settings_ap.parse_args([]), EXB_KEYS,
             required=("number_val_bands_fine", "number_cond_bands_fine"),
             params=params, named=named)
+        from gw.gw_config import require_deck_keys
+        require_deck_keys(named, "band_request", "centroids_file", error=DeckError)
         settings.eqp = eqp_file(params, named, args.input)
         if settings.degeneracy_check_override:
             settings.band_degeneracy = "off"

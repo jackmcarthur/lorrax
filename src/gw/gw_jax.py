@@ -106,7 +106,7 @@ from .gw_config import (
 	uses_full_bispinor_tangential, uses_bare_transverse_tangential,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response,
 	infer_material_class, resolve_mpa_sampling_alpha,
-	validate_material_inputs)
+	require_deck_keys, validate_material_inputs)
 from .gw_init import (prepare_isdf_and_wavefunctions,
                       prepare_band_metadata,
 	                  check_band_extrapolation_floor,
@@ -282,6 +282,8 @@ def _open_production_report(args):
             _config_provenance.append(text)
     print0 = _config_print
     config = LorraxConfig.from_input_file(args.input, print_fn=print0)
+    require_deck_keys(config.raw_input_keys, "number_bands", "band_request",
+                      "centroids_file")
     input_dir = config.input_dir
     qp_solver = config.qp_solver     # how QP energies are extracted from Σ
     mode = config.compute_mode       # the self-energy ansatz
