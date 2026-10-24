@@ -34,6 +34,17 @@ def _c128(*dims, shard: int = 1) -> float:
     return _C128 * n / max(int(shard), 1)
 
 
+def zstore_layout(q_count, mu_slots, g_carrier, *, n_vertex, n_ranks,
+                  host_budget_bytes):
+    """Return complex128 store bytes per rank and its host/disk placement.
+
+    ``mu_slots`` includes every allocated batch slot, and ``g_carrier``
+    includes the G-tile padding. The quota is the original plan's host share.
+    """
+    store = n_vertex * _c128(q_count, mu_slots, g_carrier, shard=n_ranks)
+    return float(store), 'host' if store <= host_budget_bytes else 'disk'
+
+
 def centroid_fft_tile_geometry(
     *, nk: int, band_chunk: int, p_band: int,
 ) -> tuple[int, int]:
@@ -174,21 +185,25 @@ class MuBatchPlan:
 
 def log_mubatch_plan(plan: "MuBatchPlan", *, summary: bool = False,
                      fit: str | None = None) -> None:
-    """Log a route-G μ-batch plan: its table at DEBUG with its fields as the
-    ``isdf.mubatch_plan`` receipt, or with ``summary`` (the fit that runs the
-    plan already logged) its MEMORY MODEL rows (``zeta fit``: the mu batches
-    and the estimate; ``resident psi``); ``fit`` names the fit when a run has
-    two (``zeta fit (charge)``, ``zeta fit (transverse)``)."""
+    """Log the analytic proposal, or the selected batch/storage summary.
+
+    The DEBUG table is the ``isdf.mubatch_plan`` receipt. The MEMORY MODEL
+    summary retains the proposal's analytic HWM, labelled as such; the fit
+    books its executable separately. ``fit`` distinguishes charge/current fits.
+    """
     if not summary:
         fields = {f.name: getattr(plan, f.name)
                   for f in dataclasses.fields(plan) if f.repr}
-        log.debug(plan.format(), extra=record("isdf.mubatch_plan", **fields))
+        log.debug("Analytic proposal:\n" + plan.format(),
+                  extra=record("isdf.mubatch_plan", **fields))
     else:
         n_batch = int(plan.n_batch)
         suffix = f" ({fit})" if fit else ""
         log.info(f"{n_batch} mu batch{'es' if n_batch != 1 else ''} of {int(plan.b)} "
-                 f"centroids, Z store on the {plan.placement}; estimate "
-                 f"{plan.hwm_bytes / 1e9:.2f} GB per device",
+                 f"centroids, Z store on the {plan.placement} "
+                 f"({plan.store_bytes / 1e9:.3f} GB/rank); owner planes "
+                 f"{plan.c_out} rows x {plan.n_blk} block(s); analytic proposal "
+                 f"estimate {plan.hwm_bytes / 1e9:.2f} GB per device",
                  extra=block("memory", label="zeta fit" + suffix))
         psi = next((v for k, v in plan.breakdown.items() if "resident" in k), None)
         if psi:
@@ -352,10 +367,11 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     g_tile = int(max(P_, (0.25 * target // max(per_g, 1.0)) // P_ * P_))
     g_tile = min(g_tile, math.ceil(N_G / P_) * P_)
     n_Gt = math.ceil(N_G / g_tile)
-    store = n_v * _c128(Q, n_batch * b, n_Gt * g_tile, shard=P_)
     from common.gpu_utils import host_bytes_per_process
     host_budget = host_bytes_per_process(_ZSTORE_HOST_FRAC)
-    placement = 'host' if store <= host_budget else 'disk'
+    store, placement = zstore_layout(
+        Q, n_batch * b, n_Gt * g_tile, n_vertex=n_v, n_ranks=P_,
+        host_budget_bytes=host_budget)
     br = dict(base)
     br.update(ws(b, n_pg, c_out, n_blk))
     hwm = sum(br.values())
