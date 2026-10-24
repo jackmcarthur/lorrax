@@ -12,11 +12,11 @@
 #   push, use the commit's SHA in the URL instead of the branch name.)
 #
 #   PREFIX     where the install goes (default $SCRATCH/lorrax): any persistent
-#              filesystem, fast or slow; it holds one 2.4 GB archive, so it
+#              filesystem, fast or slow; it holds one 2.56 GB archive, so it
 #              needs about 2.5 GB.  Every job reads that archive once per node
 #              and runs from a node-local copy (below), so a slow filesystem
 #              (CFS, $HOME, /global/common) costs about 7 s per node instead of
-#              a 2-3.5x slower run.
+#              a 2.2-2.6x slower hsuite run.
 #   --ref REF  the LORRAX branch, tag or commit to install (default main).
 #              Ignored when the script runs from inside a checkout: the image is
 #              then built from that checkout's HEAD commit (not from uncommitted
