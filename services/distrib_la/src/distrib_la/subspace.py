@@ -47,6 +47,16 @@ def subspace_route(leg_key=None):
     return SUBSPACE_ROUTE.get(leg_key, "xla")
 
 
+def _host_callback(work, result_shape, *args):
+    """``jax.pure_callback`` that hands ``work`` NumPy arrays.  JAX passes a
+    callback ``jax.Array`` arguments; a slice or reshape of one dispatches a new
+    computation to the CPU device that is running the caller's while loop, and
+    the two wait on each other (the CPU Davidson stall: every thread in a futex,
+    0-3% CPU).  ``np.asarray`` of a callback argument is a host view, no dispatch."""
+    return jax.pure_callback(lambda *a: work(*(np.asarray(x) for x in a)),
+                             result_shape, *args)
+
+
 @dataclass(frozen=True)
 class CpuSubspacePlan:
     capacity: int
@@ -67,7 +77,7 @@ class CpuSubspacePlan:
             n = min(m, self.n_eig)
             values[:n], vectors[:m, :n] = e[:n], c[:, :n]
             return values, vectors
-        return jax.pure_callback(work, (
+        return _host_callback(work, (
             jax.ShapeDtypeStruct((self.n_eig,), jnp.float64),
             jax.ShapeDtypeStruct((self.capacity, self.n_eig), jnp.complex128)), h, active)
 
@@ -77,7 +87,7 @@ class CpuSubspacePlan:
             out = np.zeros((self.capacity, p.shape[0]), np.complex128)
             out[start:start+count] = v[start:start+count].reshape(count, -1).conj() @ p.reshape(p.shape[0], -1).T if count else 0
             return out
-        return jax.pure_callback(work, jax.ShapeDtypeStruct((self.capacity, p.shape[0]), jnp.complex128), v, p, start, active)
+        return _host_callback(work, jax.ShapeDtypeStruct((self.capacity, p.shape[0]), jnp.complex128), v, p, start, active)
 
     def reconstruct(self, v, hv, c, active, template, *, columns=None, compute_image=True, start=0):
         columns = template.shape[0] if columns is None else columns
@@ -91,7 +101,7 @@ class CpuSubspacePlan:
                     hout[:columns] = (coeff @ hv[start:start+count].reshape(count, -1)).reshape(hout[:columns].shape)
             return out, hout
         spec = jax.ShapeDtypeStruct(template.shape, jnp.complex128)
-        return jax.pure_callback(work, (spec, spec), v, hv, c, active, columns, start)
+        return _host_callback(work, (spec, spec), v, hv, c, active, columns, start)
 
     def orthogonalize(self, v, p, active, *, start=0):
         start, active = _orthogonalization_range(start, active, self.capacity)
@@ -106,7 +116,7 @@ class CpuSubspacePlan:
                     coefficients = basis.conj() @ out.T
                     out -= coefficients.T @ basis
             return out.reshape(p.shape)
-        return jax.pure_callback(work, jax.ShapeDtypeStruct(p.shape, p.dtype),
+        return _host_callback(work, jax.ShapeDtypeStruct(p.shape, p.dtype),
                                  v, p, start, active)
 
     def store(self, v, hv, p, hp, start, count):
@@ -125,7 +135,7 @@ class CpuSubspacePlan:
                 out[:m, start:start+count] = panel
                 out[start:start+count, :m] = panel.conj().T
             return out
-        return jax.pure_callback(work, jax.ShapeDtypeStruct(h.shape, h.dtype), v, hv, h, active, start, count)
+        return _host_callback(work, jax.ShapeDtypeStruct(h.shape, h.dtype), v, hv, h, active, start, count)
 
     def qr(self, rows):
         flat = rows.reshape(rows.shape[0], -1)
