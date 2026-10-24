@@ -1380,6 +1380,16 @@ def _ppm_store_fields_program(consume):
                    donate_argnums=(1, 3) if consume else ())
 
 
+@lru_cache(maxsize=1)
+def _ppm_single_pole_program():
+    """Transfer a fresh q-major field into its singleton pole-axis carrier.
+
+    Eager newaxis/reshape creates another whole field. This donated bitcast
+    reuses the input buffer; the caller rebinds each field before the next.
+    """
+    return jax.jit(lambda a: a[None], donate_argnums=(0,))
+
+
 def _add_static_ppm_term(
         sigma_c_kij, sigma_static_host, mesh_xy, band_axis: PaddedAxis):
     """Add one static invalid-pole term to every cumulative band count."""
@@ -1607,8 +1617,18 @@ def compute_sigma_c_ppm_omega_grid(
         screening_diagrams, "value", screening_diagrams))
     # In memory, no store (owner 2026-09-23): the executor reads the same
     # sharded fields a store round trip would have returned.
+    if consume_ppm:
+        pole_axis = _ppm_single_pole_program()
+        Omega_p = pole_axis(Omega_p)
+        B_p = pole_axis(B_p)
+        if B_odd_p is not None:
+            B_odd_p = pole_axis(B_odd_p)
+    else:
+        Omega_p, B_p = Omega_p[None], B_p[None]
+        if B_odd_p is not None:
+            B_odd_p = B_odd_p[None]
     poles = MemoryPoleSource(
-        Omega_p[None], B_p[None], None if B_odd_p is None else B_odd_p[None],
+        Omega_p, B_p, B_odd_p,
         consume=consume_ppm, n_mu_logical=int(meta.n_rmu), mesh_xy=mesh_xy, q_wedge=ppm.q_wedge,
         provenance={
             "fit_protocol": "two_point_ppm",

@@ -166,3 +166,19 @@ def test_real_pipeline_observers_disable_support_and_model_consumption(monkeypat
             assert not published['poles'].B_q.is_deleted()
             np.testing.assert_array_equal(np.asarray(published['poles'].Wc0_q),np.asarray(W0-V))
             assert ('W_supports' in published)==observing
+
+
+def test_owned_single_pole_axis_has_no_second_field_allocation():
+    from gw.ppm_sigma import _ppm_single_pole_program
+    mesh=Mesh(np.array(jax.devices()[:4]).reshape(2,2),('x','y'))
+    sh=NamedSharding(mesh,P(None,'x','y'))
+    host=np.arange(2*20*20).reshape(2,20,20).astype(complex)
+    field=jax.device_put(host,sh)
+    program=_ppm_single_pole_program()
+    compiled=program.lower(field).compile()
+    ma=compiled.memory_analysis()
+    assert ma.alias_size_in_bytes==ma.output_size_in_bytes
+    result=compiled(field)
+    result.block_until_ready()
+    assert field.is_deleted()
+    np.testing.assert_array_equal(np.asarray(result),host[None])
