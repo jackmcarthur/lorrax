@@ -1212,10 +1212,9 @@ def _mathdx_common() -> dict:
 
 
 def cubin_cache_dir() -> str:
-    """Where the compiled mathdx kernels are kept: ``$SCRATCH/.cache/lorrax/kconv_mathdx/<ffi-tag>``,
-    or ``~/.cache/lorrax/kconv_mathdx/<ffi-tag>`` where the site defines no ``SCRATCH``;
-    ``<ffi-tag>`` is the enforced native closure identity
-    (``common.jax_compile_cache.native_cache_tag``).
+    """Where the compiled mathdx kernels are kept: ``kconv_mathdx/images`` in the per-user
+    cache tree (``lxkit.user_cache_root``: ``$SCRATCH/.cache/lorrax``, else
+    ``~/.cache/lorrax``).
 
     Always on, and separate from the XLA compile cache
     (``common.jax_compile_cache``, one namespace per jax, jaxlib, FFI bundle
@@ -1230,10 +1229,13 @@ def cubin_cache_dir() -> str:
     release's read-only store (:func:`seed_cubin_cache`).
     """
     from lxkit import user_cache_dir
-    from common.jax_compile_cache import native_cache_tag
-    # One store per native closure: an image built against one NVRTC/hipRTC and
-    # library set is never offered to another (lxkit.native_provider).
-    d = str(user_cache_dir("kconv_mathdx") / native_cache_tag())
+    # One directory per user for every build and install: each image's file name
+    # carries its full key, which names the RTC library by file name, size and
+    # wheel version but not by location (common/rtc_build.h), so an image built
+    # from one checkout, venv or module is a hit from any other, and one built by
+    # another toolchain can never be read.  (A per-native-closure subdirectory
+    # here made every rebuild of the FFI start cold.)
+    d = str(user_cache_dir("kconv_mathdx") / "images")
     seed_cubin_cache(str(CUBIN_STORE), d)
     return d
 

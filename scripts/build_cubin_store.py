@@ -1,10 +1,15 @@
 """Build the NVRTC k-convolution images of the release grid list into the per-user cache.
 
+    python scripts/build_cubin_store.py --jobs N [GRID ...]     # N workers on this node's GPUs
     lx run -N 1 -G 4 -n 4 -- env SCRATCH=<fresh dir> python scripts/build_cubin_store.py [GRID ...]
 
+A GPU is needed: the images are built by the k-convolution handlers inside XLA custom calls,
+on the first call on a CUDA device of the right architecture (a Perlmutter login node's A100
+builds the same sm_80 images as a compute node's).  The work is NVRTC on one CPU thread per
+process, so ``--jobs N`` runs N workers sharing the visible GPUs (:func:`fan_out`).
 Each process takes every ``nproc``-th (grid, image) task on its own GPU (a 1 x 1 mesh, no
 collectives), calls the router factory on tiny operands, and so leaves the image in
-``ffi.fft.cubin_cache_dir()`` (``$SCRATCH/.cache/lorrax/kconv_mathdx``, seeded first from
+``ffi.fft.cubin_cache_dir()`` (``kconv_mathdx/images`` in the per-user cache, seeded first from
 the source tree's store, so only missing images compile).  The image key holds the mode,
 k-grid, ``n_s``, right width, precision and variant (``kconv_mathdx_cuda_ffi.cc`` ``build``),
 never ``N_mu``, bands or P, so the operands are as small as the factories accept.  The
@@ -235,9 +240,52 @@ class Calls:
         self.run(lambda g, w, **k: f(g, g, w, w, **k), G, W, **kw)
 
 
+def _visible_gpus() -> list[str]:
+    """The GPU ordinals this process may use: ``CUDA_VISIBLE_DEVICES``, else ``nvidia-smi -L``."""
+    env = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if env is not None:
+        return [g for g in env.split(",") if g.strip()]
+    import subprocess
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [str(i) for i, line in enumerate(out.splitlines()) if line.startswith("GPU ")]
+
+
+def fan_out(jobs: int, names) -> int:
+    """Run ``jobs`` workers on this node, round-robin over its GPUs; the worst return code.
+
+    NVRTC compiles on one CPU thread per process and the device only loads the
+    image, so several workers share a GPU: each starts without XLA's up-front pool
+    (``XLA_PYTHON_CLIENT_PREALLOCATE=false``; the operands are tiny) and takes every
+    ``jobs``-th task.  Concurrent workers publish into the one cache directory by
+    tmp+rename (``common/rtc_build.h``), so they cannot tear an image.
+    """
+    import subprocess
+    gpus = _visible_gpus()
+    if not gpus:
+        print("[cubin-store] no GPU visible (CUDA_VISIBLE_DEVICES / nvidia-smi); the images are "
+              "built by the k-convolution handlers on a CUDA device, so nothing to do here",
+              flush=True)
+        return 1
+    procs = []
+    for w in range(jobs):
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpus[w % len(gpus)],
+                   XLA_PYTHON_CLIENT_PREALLOCATE="false",
+                   LORRAX_CUBIN_STORE_WORKER=f"{w}/{jobs}")
+        procs.append(subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), *names],
+                                      env=env))
+    return max(p.wait() for p in procs)
+
+
 def main(names) -> int:
-    rank = int(os.environ.get("SLURM_PROCID", "0"))
-    nproc = int(os.environ.get("SLURM_NTASKS", "1"))
+    worker = os.environ.get("LORRAX_CUBIN_STORE_WORKER")
+    if worker:
+        rank, nproc = (int(v) for v in worker.split("/"))
+    else:
+        rank = int(os.environ.get("SLURM_PROCID", "0"))
+        nproc = int(os.environ.get("SLURM_NTASKS", "1"))
     from runtime.source_closure import ensure_source_closure
     ensure_source_closure(print_fn=lambda *a, **k: None)     # the service packages (lxkit, ...)
     from ffi import fft as F
@@ -267,4 +315,12 @@ def main(names) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:] or list(GRIDS)))
+    argv = sys.argv[1:]
+    jobs = 0
+    if argv[:1] == ["--jobs"]:
+        jobs, argv = int(argv[1]), argv[2:]
+    grids = argv or list(GRIDS)
+    unknown = [g for g in grids if g not in GRIDS]
+    if unknown:
+        sys.exit(f"build_cubin_store: unknown grid(s) {unknown}; known: {sorted(GRIDS)}")
+    sys.exit(fan_out(jobs, grids) if jobs > 0 else main(grids))

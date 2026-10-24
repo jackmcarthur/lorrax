@@ -247,9 +247,18 @@ def devices_lines(facts: Mapping, *, mesh_role: str | None,
         count = re.match(r"\s*(\d+)", str(value))
         plain = re.sub(r";\s*applied to [^)]*", "", str(value))
         named.append(f"{short} {count.group(1)} threads" if count else f"{short} {plain}")
-    cpu = (f"{affinity} cores per rank" if affinity is not None
-           else "unknown cores per rank")
-    rows.append(("CPU", cpu + (", " + ", ".join(named) if named else "")))
+    # Physical cores and logical CPUs separately: under SMT a mask holding both
+    # hardware threads of 16 cores is 32 logical CPUs, and OpenMP and XLA's CPU
+    # pool size themselves from the logical count.
+    physical = threads.get("physical_cores")
+    if affinity is None:
+        cpu = "unknown CPUs per rank"
+    elif physical is None:
+        cpu = f"{affinity} logical CPUs per rank (physical cores unknown: no core topology)"
+    else:
+        cpu = f"{physical} physical cores / {affinity} logical CPUs per rank"
+    how = threads.get("rank_threads") or "threads not set by select_gpu.sh"
+    rows.append(("CPU", cpu + (", " + ", ".join(named) if named else "") + f"; {how}"))
     lines = kv_lines(rows)
     if memory.get("total"):
         lines += kv_lines((("memory budget", f"{memory['budget'] / 1e9:.2f} GB per device"),))

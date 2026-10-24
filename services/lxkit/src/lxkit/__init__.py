@@ -65,7 +65,7 @@ from lxkit.legs import (
     leg_for_vendor,
     process_accelerator_leg,
 )
-from lxkit.cache import atomic_write_bytes, user_cache_dir
+from lxkit.cache import atomic_write_bytes, user_cache_dir, user_cache_root
 from lxkit.placement import (device_put_process_local, device_put_process_local_cached,
                              device_put_process_tiles, placement_cache_stats)
 from lxkit.collectives import (install_reduction_guard, install_reduction_guard_from_env,
@@ -119,5 +119,5 @@ __all__ = [
     # native-provider policy (the tables remain with each caller)
     "native_provider",
     # the per-user persistent-cache root
-    "atomic_write_bytes", "user_cache_dir",
+    "atomic_write_bytes", "user_cache_dir", "user_cache_root",
 ]

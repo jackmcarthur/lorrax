@@ -12,6 +12,12 @@
 #              when the script runs from inside a checkout, which it then uses.
 #   --with-xc  also install the patched jax_xc 0.0.11 (the nscf driver only).
 #   --no-ffi   skip building the two native libraries.
+#   --cubins SET  which NVRTC kernel images to build ahead of the first run, on
+#              this node's GPU (a Perlmutter login node has one A100, the
+#              compute nodes' architecture): hsuite (default: the test suite's
+#              k-grids), all (every grid of scripts/build_cubin_store.py), or
+#              none.  Without a GPU the step is skipped and each image compiles
+#              on first use instead (about 7 s per image per rank).
 #
 # Runs on a login node in a few minutes (about 90 s with warm uv and ccache
 # caches); no allocation is needed.
@@ -38,12 +44,14 @@ set -euo pipefail
 UV_VERSION=0.13.5
 REPO=https://github.com/jackmcarthur/lorrax.git
 
-PREFIX="" REF=main WITH_XC=0 BUILD_FFI=1
+PREFIX="" REF=main WITH_XC=0 BUILD_FFI=1 CUBINS=hsuite
 while (($#)); do
     case "$1" in
         --ref) REF="$2"; shift 2 ;;
         --with-xc) WITH_XC=1; shift ;;
         --no-ffi) BUILD_FFI=0; shift ;;
+        --cubins) CUBINS="$2"; shift 2
+            [[ "$CUBINS" =~ ^(hsuite|all|none)$ ]] || { echo "install_deps: --cubins hsuite|all|none, not $CUBINS" >&2; exit 2; } ;;
         -h|--help) awk 'NR > 1 && !/^#/ {exit} NR > 1' "$0"; exit 0 ;;
         -*) echo "install_deps: unknown option $1" >&2; exit 2 ;;
         *) PREFIX="$1"; shift ;;
@@ -105,7 +113,28 @@ if ((BUILD_FFI)); then
     bash "$ROOT/config/perlmutter/build_ffi_cuda.sh" --fresh
 fi
 
-# --- 6. the environment file ------------------------------------------------
+# --- 6. NVRTC kernel images -------------------------------------------------
+# Into the per-user image cache (kconv_mathdx/images under $SCRATCH/.cache/lorrax),
+# where every later install and rebuild finds them: an image's key names its
+# toolchain, never the install path.
+if ((BUILD_FFI)) && [[ "$CUBINS" != none ]]; then
+    if nvidia-smi -L >/dev/null 2>&1; then
+        case "$CUBINS" in
+            hsuite) GRIDS="probe na_fixture h2_fixture" ;;
+            all) GRIDS="" ;;
+        esac
+        JOBS=$(( $(nproc) / 16 )); ((JOBS < 1)) && JOBS=1; ((JOBS > 8)) && JOBS=8
+        say "building the NVRTC kernel images ($CUBINS) on this node's GPU with $JOBS workers"
+        # shellcheck disable=SC2086  # GRIDS is a word list
+        (cd "$ROOT" && source config/perlmutter/gpu_env.sh && \
+            "$PY" scripts/build_cubin_store.py --jobs "$JOBS" $GRIDS) \
+            || say "kernel image build failed (non-fatal): each image compiles on first use instead"
+    else
+        say "no GPU on this node: NVRTC kernel images will compile on first use (about 7 s each)"
+    fi
+fi
+
+# --- 7. the environment file ------------------------------------------------
 ENVF="$PREFIX/lorrax-env.sh"
 {
     echo "# LORRAX on Perlmutter, written by install_deps.sh. Source before srun."
