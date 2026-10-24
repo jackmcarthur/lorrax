@@ -194,11 +194,11 @@ route; the request is still honoured.
 On ROCm, `local_eigh` also routes single complex128 matrices of side
 128–3120 through the existing native batched provider with batch one. The
 reflector, triangle selection and finite/info checks stay the same. The
-3072-state tutorial Gram failed in the fused reflector/jaxlib expression
-and passed in the fused reflector/native expression. Both solvers passed
-on the same separately materialized reflected matrix, so the compiler or
-layout cause is unresolved; this is a measured composition repair, with no
-universal driver or speed claim. Its workspace is priced by the same
+3072-state tutorial Gram failed in the fused reflector/jaxlib expression.
+Both solvers passed on the same separately materialized reflected matrix,
+and the native vectors passed the back-transform residual on the input.
+The compiler or layout cause is unresolved; the route changes the solve
+boundary without a universal driver or speed claim. Its workspace is priced by the same
 batched row. Real single matrices, CPU/CUDA and out-of-window sizes retain
 their previous routes.
 

@@ -61,11 +61,11 @@ eigenspaces against ``jnp.linalg.eigh`` on the same GCD).
 SINGLE COMPLEX MATRICES: the same ROCm row takes batch 1 in its measured
 n=128..3120 window, with an explicit leading batch axis at the native call.
 On the actual 3072-state tutorial Gram, the fused reflector/jaxlib expression
-was non-finite while the fused reflector/native-batch-1 expression passed the
-independent spectrum, residual and orthogonality gates. Both drivers passed
-when fed the SAME separately materialized reflected B, so this evidence
-isolates a composition boundary, not a universal jaxlib driver defect; the
-compiler/layout cause is unresolved. The HAH construction, UPLO contract and
+was non-finite. Both drivers passed when fed the SAME separately materialized
+reflected B, and native vectors passed the back-transform residual on A.
+This is evidence of a composition-sensitive failure, not a universal jaxlib
+driver defect; the compiler/layout cause is unresolved. This route changes
+only the solve boundary to the existing provider. The HAH construction, UPLO contract and
 failure gates are unchanged. CPU, CUDA, real single matrices and the existing
 small/large-n exclusions retain their previous routes.
 
@@ -132,8 +132,8 @@ class BatchedEighRow(NamedTuple):
 #: ``jnp.linalg.eigh``.  ROCM windows, one MI250X GCD (pool logs eigh_bench1, eigh_bench2;
 #: speedup = jnp.linalg.eigh / target): heevd | syevd, b = 2: 1.9x at n = 40..312, 1.36x at
 #: 1960, 1.18x at 3120; b = 16: 10.7x | 12.0x at n = 40, 9.3x | 9.6x at n = 312; b = 64,
-#: n = 128: 29.7x | 30.0x. Complex batch 1 is a correctness route for the
-#: measured fused-reflector failure above, not a speed claim. Outside: n = 16 jaxlib's
+#: n = 128: 29.7x | 30.0x. Complex batch 1 addresses the composition-sensitive
+#: fused-reflector failure above, not a speed claim. Outside: n = 16 jaxlib's
 #: small-n path wins (0.6-0.8x); n = 32 is mixed (c128 1.1-1.27x at b <= 16 but 0.78x at
 #: b = 64; f64 0.84-1.08x), so min_n = 40, the smallest n measured to win at every batch
 #: (1.86x at b = 2); n > 3120 not measured.  heevdj (eigh_bench3) only
