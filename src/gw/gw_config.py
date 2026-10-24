@@ -3023,6 +3023,47 @@ def _band_request_form(params, named_keys):
     return value
 
 
+def protected_band_window(total, nband, n_occ, print_fn=print):
+    """``(nval, ncond)`` of ``number_bands_protected = total`` on a WFN with ``n_occ`` occupied bands.
+
+    nval = every occupied band, ncond = the total minus it.  The one resolver
+    of the protected form: :meth:`LorraxConfig.with_band_request` (gw,
+    kin-ion, dipole) and :func:`resolve_band_request` (the tools that read
+    the input file as a dict) both call it.
+    """
+    total, n_occ = int(total), int(n_occ)
+    if not n_occ <= total <= int(nband):
+        raise ValueError(
+            f"GATE band_request_forms: number_bands_protected={total} must lie in "
+            f"[{n_occ} (the occupied bands), {int(nband)} (number_bands)].")
+    print_fn(f"  QP request: number_bands_protected={total} -> nval={n_occ} "
+             f"(every occupied band), ncond={total - n_occ}")
+    return n_occ, total - n_occ
+
+
+#: Reserved params slot: True once :func:`resolve_band_request` has run.
+_BAND_REQUEST_RESOLVED = "_band_request_resolved"
+
+
+def resolve_band_request(params, wfn, print_fn=print) -> dict:
+    """Resolve the deck's band request in ``params`` (in place) against the WFN, and return it.
+
+    The dict twin of :meth:`LorraxConfig.with_band_request`, for the tools
+    that read the input file with :func:`read_lorrax_input` (BSE,
+    exciton-bands, centroids, htransform): under ``number_bands_protected``
+    nval and ncond become the occupied count and the rest of the total.
+    Idempotent; a deck in the nval/ncond form is returned unchanged.
+    """
+    if params.get(_BAND_REQUEST_RESOLVED):
+        return params
+    total = params.get("number_bands_protected")
+    if total not in (None, ""):
+        params["nval"], params["ncond"] = protected_band_window(
+            total, params["nband"], wfn.nelec, print_fn)
+    params[_BAND_REQUEST_RESOLVED] = True
+    return params
+
+
 def _assemble_input_config(
         _bands, _effective_named_keys, _occ_family, _occ_width, _qp_rot_k_storage,
         _resolved_do_g0, _restart_q_storage, _zeta_nband, backend, bse, cls, debug,
@@ -5122,15 +5163,9 @@ class LorraxConfig:
         total = self.number_bands_protected
         if total is None:
             return self
-        n_occ = int(wfn.nelec)
-        if not n_occ <= int(total) <= int(self.nband):
-            raise ValueError(
-                f"GATE band_request_forms: number_bands_protected={int(total)} must lie in "
-                f"[{n_occ} (the occupied bands), {int(self.nband)} (number_bands)].")
         from dataclasses import replace as _replace
-        print_fn(f"  QP request: number_bands_protected={int(total)} -> nval={n_occ} "
-                 f"(every occupied band), ncond={int(total) - n_occ}")
-        return _replace(self, nval=n_occ, ncond=int(total) - n_occ)
+        nval, ncond = protected_band_window(total, self.nband, wfn.nelec, print_fn)
+        return _replace(self, nval=nval, ncond=ncond)
 
     @property
     def occ_broadening_ry(self) -> float:
