@@ -339,3 +339,10 @@ chmod -R a-w "$PREFIX"
 rm -rf "$STAGE"
 echo "[elpa] done: $PREFIX"
 verify "$PREFIX"
+# The closure in an empty environment (env -i must bind the private OpenBLAS copy through the
+# library's own search path), ldd -r here, and a 64x64 1-stage eigensolve against LAPACK
+# (scripts/dep_check.py elpa; SKIPPED where MPI cannot start, then verify.sh runs it).
+"$VENV/bin/python" "$LORRAX_ROOT/scripts/dep_check.py" elpa "$PREFIX" \
+        --blas "$PREFIX/lib/libopenblas.so.0" --solve || {
+    _bad="$PREFIX.REFUSED.$(date +%s)"; mv "$PREFIX" "$_bad"
+    echo "[elpa] FAILED its smoke test (above); moved aside to $_bad, nothing will use it" >&2; exit 1; }

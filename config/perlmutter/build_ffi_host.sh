@@ -219,6 +219,10 @@ unset _dynsyms
 # shifter cannot bind-mount $HOME; run it inside an allocation:
 #   LORRAX_GATE_FFTW_PY=<venv>/bin/python src/ffi/cpp/gate_one_fftw.sh <host.so>
 
+"$LORRAX_VENV_PY" "$LORRAX_ROOT/scripts/dep_check.py" ffi "$SO_FILE" || {
+    echo "[build_ffi_host] FAILED: the library resolves dependencies outside the install (above)" >&2
+    exit 1; }
+
 # Build provenance beside the artifact — see the note in src/ffi/cpp/build.sh.
 _closure_sha="$("$LORRAX_VENV_PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["record_sha256"])' "$SO_FILE.closure.json")"
 "$LORRAX_ROOT/src/ffi/cpp/stage/stamp_provenance.sh" "$SO_FILE" \

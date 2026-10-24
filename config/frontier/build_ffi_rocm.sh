@@ -105,6 +105,8 @@ GATE_TAG=build_ffi_rocm \
         echo "[build_ffi_rocm] FAILED: the library does not meet the build contract." >&2
         echo "[build_ffi_rocm] The .so is left on disk for inspection; do not pin it." >&2
         exit 1; }
+"$VENV/bin/python" "$ROOT/scripts/dep_check.py" ffi "$SO" || {
+    echo "[build_ffi_rocm] FAILED: the library resolves dependencies outside the install." >&2; exit 1; }
 "$ROOT/src/ffi/cpp/stage/stamp_provenance.sh" "$SO" \
     leg=rocm site=frontier rocm_module="$ROCM_MOD" mpi="$MPICH_MOD" hdf5="$HDF5_MOD" \
     venv="$VENV" \

@@ -91,6 +91,13 @@ sys.exit(0 if ok else 1)
 PYEOF
 CLOSURE_SHA="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["record_sha256"])' "$SO.closure.json")"
 
+# cuSOLVERMp / cuBLASMp / NCCL: library version == the header compiled against, the FFI binds
+# the venv's copy; the leg carries sm_80 cubins; nothing resolves outside the install.
+"$PY" "$LORRAX_ROOT/scripts/dep_check.py" nvidia --site-packages "$SITE" --ffi "$SO" \
+    || die "a CUDA library does not match its header (above)"
+"$PY" "$LORRAX_ROOT/scripts/dep_check.py" ffi "$SO" --arch sm_80 \
+    || die "the leg's cubins or closure are wrong (above)"
+
 "$SRC/stage/stamp_provenance.sh" "$SO" \
     leg=cuda nvcc="$("$SITE/nvidia/cu13/bin/nvcc" --version | tail -1)" cuda_root="$SITE/nvidia/cu13" \
     cusolvermp="$CUSOLVERMP_VERSION" cublasmp="$CUBLASMP_VERSION" \

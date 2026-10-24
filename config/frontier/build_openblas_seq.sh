@@ -39,4 +39,10 @@ make -C "$SRC" -s -j"$JOBS" CC=gcc FC=gfortran $FLAGS libs netlib shared
 # shellcheck disable=SC2086
 make -C "$SRC" -s PREFIX="$PREFIX" $FLAGS install
 echo "$TAG $FLAGS" > "$PREFIX/LORRAX_BUILD_FLAGS"
+# Symbols, thread honouring (this build must run 1 thread under OPENBLAS_NUM_THREADS=2),
+# a small dgemm/dsyev against a pure-Python reference: scripts/dep_check.py blas.
+_lrx="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+_py="${LORRAX_DEP_CHECK_PY:-$_lrx/.venv/bin/python}"; [[ -x "$_py" ]] || _py=python3
+"$_py" "$_lrx/scripts/dep_check.py" blas "$PREFIX/lib/libopenblas.so" --expect-threads 1 || {
+    echo "[openblas-seq] FAILED: $PREFIX/lib/libopenblas.so does not pass its smoke test (above)" >&2; exit 1; }
 echo "[openblas-seq] $PREFIX/lib/libopenblas.so ($(cat "$PREFIX/LORRAX_BUILD_FLAGS"))"

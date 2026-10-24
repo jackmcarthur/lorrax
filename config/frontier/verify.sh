@@ -54,6 +54,16 @@ srun -N1 -n1 -c7 --threads-per-core=1 --cpu-bind=cores --exclusive \
 srun -N1 -n1 -c7 --threads-per-core=1 --cpu-bind=cores --exclusive \
     env -u LORRAX_FFI_EXPECT_PEER_SO LORRAX_FFI_EXPECT_BACKENDS=phdf5,elpa,kdft \
     bash "$LORRAX_ROOT/scripts/verify_ffi_build.sh" --leg rocm "$_rocm_so"
+# ELPA: closure in an empty environment and a 64x64 eigensolve vs LAPACK (scripts/dep_check.py).
+_elpa="$(sed -n 's/^LORRAX_ELPA_ROCM_DIR:[^=]*=//p' "$(dirname "$_rocm_so")/CMakeCache.txt" 2>/dev/null || true)"
+if [[ -n "$_elpa" && -d "$_elpa" ]]; then
+    srun -N1 -n1 -c7 --threads-per-core=1 --cpu-bind=cores --exclusive \
+        "$VIRTUAL_ENV/bin/python" "$LORRAX_ROOT/scripts/dep_check.py" elpa "$_elpa" \
+        --blas "$_elpa/lib/libopenblas.so.0" --solve
+else
+    echo "[frontier verify] FAILED ELPA: no LORRAX_ELPA_ROCM_DIR in $(dirname "$_rocm_so")/CMakeCache.txt -- fix: rebuild the rocm leg (config/frontier/build_ffi_rocm.sh)" >&2
+    exit 1
+fi
 # The GPU request supplies Slurm's per_task binding, one GCD per rank.
 srun -N1 -n4 -c7 --threads-per-core=1 --cpu-bind=cores --exclusive \
     --gpus-per-task=1 env JAX_PLATFORMS=rocm \

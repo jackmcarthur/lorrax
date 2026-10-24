@@ -222,6 +222,17 @@ fi
 LORRAX_GATE_ONE_MPI=on GATE_TAG=build_mpiw.pm "$ONE_MPI_GATE" \
     "$SO" 'libmpi_gnu_'
 
+# The live half of the ABI handshake: JAX's CPU collectives through MPItrampoline and this
+# candidate adapter, 2 ranks (scripts/dep_check.py mpi-allreduce).  Inside an allocation only.
+if [[ -n "${SLURM_JOB_ID:-}" && -x "$LORRAX_ROOT/.venv/bin/python" ]]; then
+    ( export LORRAX_MPIWRAPPER_SO="$SO"; source "$LORRAX_ROOT/config/perlmutter/cpu_mpi_env.sh" >/dev/null
+      srun -N 1 -n 2 -c 2 "$LORRAX_ROOT/.venv/bin/python" "$LORRAX_ROOT/scripts/dep_check.py" mpi-allreduce ) || {
+        echo "[build_mpiw.pm] ERROR: the candidate adapter fails a 2-rank allreduce (above); not published" >&2
+        exit 1; }
+else
+    echo "[build_mpiw.pm] SKIPPED 2-rank allreduce: no allocation or no $LORRAX_ROOT/.venv" >&2
+fi
+
 ARTIFACT_SHA="$(sha256sum "$SO" | awk '{print $1}')"
 BUILDER_SHA="$(sha256sum "$LORRAX_ROOT/config/perlmutter/build_mpiwrapper.sh" | awk '{print $1}')"
 PRELUDE_SHA="$(sha256sum "$LORRAX_ROOT/config/perlmutter/cpu_mpi_env.sh" | awk '{print $1}')"

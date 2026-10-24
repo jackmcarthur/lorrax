@@ -83,12 +83,20 @@ srun -N 1 -n 1 -c "$cpus" --gpus-per-node=4 "${STORE_RUN[@]}" "$PY" -u "$SRC/scr
 store_rc=$?
 say "kernel store rc=$store_rc in $((SECONDS - t0)) s"
 
+say "dependency check: 64x64 distributed cuSOLVERMp Cholesky (4 ranks)"
+srun -N 1 -n 4 --gpus-per-node=4 "${RUN[@]}" "$PY" -u "$SRC/scripts/dep_check.py" cholesky
+dep_rc=$?
+
 say "performance self-check (4 ranks, the production launch line)"
 t0=$SECONDS
 srun -N 1 -n 4 --gpus-per-node=4 "${RUN[@]}" "$PY" -u "$SRC/scripts/perf_check.py"
 check_rc=$?
 say "self-check rc=$check_rc in $((SECONDS - t0)) s"
 
+if ((dep_rc != 0)); then
+    say "INSTALL NOT VERIFIED: the distributed Cholesky failed (its [dep-check] line above names the fix)"
+    exit 1
+fi
 if ((check_rc == 0 && store_rc == 0)); then
     say "INSTALL VERIFIED"
     exit 0
