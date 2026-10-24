@@ -69,6 +69,16 @@ only the solve boundary to the existing provider. The HAH construction, UPLO con
 failure gates are unchanged. CPU, CUDA, real single matrices and the existing
 small/large-n exclusions retain their previous routes.
 
+A finite single complex128 ROCm matrix that still produces non-finite pairs is
+retried on the SAME reflected matrix by the existing Jacobi eigensolver. The
+device conditional adds no host synchronization. A missing required target
+still refuses; invalid inputs never enter this retry, and failure of both
+solvers remains non-finite. The compiled conditional prices its overlapping
+XLA buffers. Callers add provider scratch separately through the shared
+workspace owner: JAX allocates Jacobi scratch inside its FFI handler.
+Batched callers retain their existing
+result-check and retry policy.
+
 VALID, NOT IDENTICAL.  The batched driver and jaxlib's loop are both backward stable, not
 bitwise equal: on exactly degenerate eigenvalues they return different orthonormal bases of
 the same eigenspaces, and elsewhere they differ at rounding level.  No caller may depend on
@@ -231,14 +241,25 @@ def _native_batched_eigh(row, a):
 
 def _solve(b):
     """The solve of a full Hermitian stack: the leg's batched target where its row covers the
-    stack, else ``jnp.linalg.eigh`` (exactly the call the reflector route always made)."""
+    stack, else ``jnp.linalg.eigh``. A finite single complex128 ROCm matrix whose
+    preferred solver returns non-finite pairs is retried by the existing
+    Jacobi owner on this SAME matrix. Both failures remain non-finite."""
     row = batched_eigh_row(b.shape, b.dtype)
     if row is None:
-        return jnp.linalg.eigh(b)
-    if b.ndim == 2:
+        result = jnp.linalg.eigh(b)
+    elif b.ndim == 2:
         w, v = _native_batched_eigh(row, b[None])
-        return w[0], v[0]
-    return _native_batched_eigh(row, b)
+        result = w[0], v[0]
+    else:
+        return _native_batched_eigh(row, b)
+    if (b.ndim != 2 or b.dtype != jnp.complex128
+            or _process_leg_key() != "ROCM"):
+        return result
+    w, v = result
+    retry = (jnp.all(jnp.isfinite(b))
+             & ~(jnp.all(jnp.isfinite(w)) & jnp.all(jnp.isfinite(v))))
+    return jax.lax.cond(retry, lambda _: tuple(eigh_local_jacobi(b)),
+                        lambda _: (w, v), operand=None)
 
 
 def _full(a, UPLO, symmetrize_input):

@@ -15,6 +15,7 @@ def test_single_matrix_native_promotion_preserves_triangles_and_reflector(monkey
     jax, le = _owner()
     import jax.numpy as jnp
     monkeypatch.setattr(le, '_process_leg_key', lambda: 'ROCM')
+    monkeypatch.setattr(le, 'eigh_local_jacobi', jnp.linalg.eigh)
     row = le.BATCHED_EIGH_ROUTE['ROCM']
     # A small CPU oracle exercises the same production driver; shape-only
     # admission below separately pins the actual measured n=128..3120 window.
@@ -82,6 +83,8 @@ def test_single_matrix_keeps_native_refusal_and_failure_marking(monkeypatch):
     import jax.numpy as jnp
     import distrib_la.loader as loader
     monkeypatch.setattr(le, '_process_leg_key', lambda: 'ROCM')
+    monkeypatch.setattr(le, 'eigh_local_jacobi', lambda a: (
+        jnp.full(a.shape[:-1], jnp.nan), jnp.full_like(a, jnp.nan)))
     row = le.BATCHED_EIGH_ROUTE['ROCM']
     win = row.windows['complex128']._replace(min_n=2)
     monkeypatch.setitem(le.BATCHED_EIGH_ROUTE, 'ROCM', row._replace(
@@ -94,12 +97,52 @@ def test_single_matrix_keeps_native_refusal_and_failure_marking(monkeypatch):
     for silent in (False, True):
         def failed(_target, b, _driver, _tile):
             return (jnp.zeros(b.shape[:-1]), jnp.full_like(b, jnp.nan) if silent
-                    else jnp.broadcast_to(jnp.eye(2), b.shape),
+                    else jnp.broadcast_to(jnp.eye(2, dtype=b.dtype), b.shape),
                     jnp.zeros(b.shape[:-2], dtype=jnp.int32) if silent else
                     jnp.ones(b.shape[:-2], dtype=jnp.int32))
         monkeypatch.setattr(le, '_batched_call', failed)
         w, v = le.eigh_local(a)
         assert np.isnan(w).all() and np.isnan(v).all()
+
+
+def test_single_matrix_retry_uses_same_input_only_after_a_finite_input_failure(monkeypatch):
+    jax, le = _owner()
+    import jax.numpy as jnp
+    monkeypatch.setattr(le, '_process_leg_key', lambda: 'ROCM')
+    row = le.BATCHED_EIGH_ROUTE['ROCM']
+    monkeypatch.setitem(le.BATCHED_EIGH_ROUTE, 'ROCM', row._replace(windows={
+        **row.windows, 'complex128': row.windows['complex128']._replace(min_n=2)}))
+    monkeypatch.setattr(le, '_require_target', lambda _target: None)
+    retries = []
+
+    def native(_target, a, _driver, _tile):
+        w, v = jnp.linalg.eigh(a)
+        # The vendor's observed silent mode: finite values, NaN vectors, info=0.
+        bad = jnp.real(a[..., 0, 0]) < 0
+        return w, jnp.where(bad[..., None, None], jnp.nan, v), jnp.zeros(
+            a.shape[:-2], dtype=jnp.int32)
+
+    def jacobi(a):
+        jax.debug.callback(lambda x: retries.append(np.asarray(x).copy()), a)
+        return jnp.linalg.eigh(a)
+
+    monkeypatch.setattr(le, '_batched_call', native)
+    monkeypatch.setattr(le, 'eigh_local_jacobi', jacobi)
+    solve = jax.jit(le._solve)
+    good = jnp.asarray([[2., .3j], [-.3j, 4.]], dtype=jnp.complex128)
+    failed = good - 5 * jnp.eye(2)
+    for a in (good, failed):
+        w, v = solve(a)
+        jax.block_until_ready((w, v))
+        np.testing.assert_allclose(a @ v, v * w[None], atol=2e-14)
+        np.testing.assert_allclose(v.conj().T @ v, np.eye(2), atol=2e-14)
+    invalid = good.at[0, 0].set(jnp.nan)
+    w, v = solve(invalid)
+    jax.block_until_ready((w, v))
+    jax.effects_barrier()
+    assert len(retries) == 1
+    np.testing.assert_array_equal(retries[0], failed)
+    assert not (np.isfinite(w).all() and np.isfinite(v).all())
 
 
 def test_cpu_and_cuda_dispatch_stays_identical_to_jaxlib(monkeypatch):
@@ -115,3 +158,15 @@ def test_cpu_and_cuda_dispatch_stays_identical_to_jaxlib(monkeypatch):
         actual = le.eigh_local(a)
         for got, want in zip(actual, expected):
             np.testing.assert_array_equal(got, want)
+
+
+def test_rocm_complex64_keeps_the_previous_solver(monkeypatch):
+    _jax, le = _owner()
+    import jax.numpy as jnp
+    monkeypatch.setattr(le, '_process_leg_key', lambda: 'ROCM')
+    def forbidden(*_args):
+        raise AssertionError('The measured complex128 retry must not change complex64')
+    monkeypatch.setattr(le, 'eigh_local_jacobi', forbidden)
+    a = jnp.asarray([[2., .3j], [-.3j, 4.]], dtype=jnp.complex64)
+    for got, expected in zip(le._solve(a), jnp.linalg.eigh(a)):
+        np.testing.assert_array_equal(got, expected)

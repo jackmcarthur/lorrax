@@ -9,6 +9,8 @@ def _setup(monkeypatch, capacity, roots):
     from distrib_la import local_eigh as owner
     from distrib_la.active_subspace import LocalSubspacePlan
     monkeypatch.setattr(owner, '_process_leg_key', lambda: 'ROCM')
+    import jax.numpy as jnp
+    monkeypatch.setattr(owner, 'eigh_local_jacobi', jnp.linalg.eigh)
     return jax, owner, LocalSubspacePlan(capacity, roots, 0,
                                        handlers='devsize', leg_key='ROCM')
 
@@ -68,6 +70,8 @@ def test_capacity_inside_window_keeps_native_and_failure_mask(monkeypatch):
     def failed(_row,b):
         return jnp.full(b.shape[:-1],jnp.nan),jnp.full_like(b,jnp.nan)
     monkeypatch.setattr(owner,'_native_batched_eigh',failed)
+    monkeypatch.setattr(owner,'eigh_local_jacobi',lambda b: (
+        jnp.full(b.shape[:-1],jnp.nan),jnp.full_like(b,jnp.nan)))
     e,v = plan.eigh(jnp.asarray(a),jnp.int32(7))
     assert np.isnan(e).all() and np.isnan(v[:7]).any()
 
