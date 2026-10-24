@@ -101,6 +101,8 @@ OPEN_WALL_BUDGET_S = 25.0
 WALK_FAIL_PER_S = 5000.0
 WALK_MAX_ENTRIES = 20000
 WALK_BUDGET_S = 8.0
+#: Fewer NVRTC images for this GPU than this in the run's cache + store = no store.
+MIN_STORE_IMAGES = 10
 #: Filesystem types that are slow for many-small-file/exec workloads when they
 #: hold the runtime (diagnosis wording only; numbers decide).
 NETWORK_FS = {"dvs", "nfs", "nfs4", "gpfs", "lustre", "cifs", "smb3", "fuse.sshfs",
@@ -334,6 +336,35 @@ def probe_open_latency(sample: list[tuple[str, str]]) -> dict:
             res["groups"][group] = {"example": p, **fs_of(p)}
     res["wall_s"] = time.perf_counter() - t0
     return res
+
+
+def probe_path_lookups(n: int = 20) -> dict:
+    """Failed-lookup (ENOENT) latency of every LD_LIBRARY_PATH and PATH directory.
+
+    The dynamic loader of every process -- each ptxas/nvlink XLA execs per compiled module,
+    each dlopen -- tries every LD_LIBRARY_PATH entry for every library it resolves (libc,
+    libm, ...).  An entry on a slow mount turns that into thousands of failed opens: a
+    cudart shim directory on DVS $HOME cost 5495 failed opens and +24 s of one stage
+    (ri_rootcause).  Names are unique per lookup, so no negative-dentry cache answers."""
+    out: dict = {}
+    for var in ("LD_LIBRARY_PATH", "PATH"):
+        rows = []
+        for d in dict.fromkeys(x for x in os.environ.get(var, "").split(":") if x):
+            if not os.path.isdir(d):
+                rows.append({"dir": d, "missing": True})
+                continue
+            ms = []
+            for i in range(n):
+                p = os.path.join(d, f"libperfcheck-{os.getpid()}-{i}.so.1")
+                t0 = time.perf_counter()
+                try:
+                    os.close(os.open(p, os.O_RDONLY))
+                except OSError:
+                    pass
+                ms.append((time.perf_counter() - t0) * 1e3)
+            rows.append({"dir": d, **_stats(ms), **fs_of(d)})
+        out[var] = rows
+    return out
 
 
 def probe_walk(root: str) -> dict:
@@ -668,6 +699,59 @@ print("PROBE_JSON " + json.dumps(out, default=str), flush=True)
 """
 
 
+PROBE_STORE = r"""
+import json, os, sys, time
+out = {}
+import runtime  # noqa: F401
+try:
+    from runtime.source_closure import ensure_source_closure
+    ensure_source_closure(print_fn=lambda *a, **k: None)
+except Exception as e:
+    out["source_closure_error"] = f"{type(e).__name__}: {e}"
+import numpy as np
+import jax
+jax.config.update("jax_enable_x64", True)
+try:
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from ffi import fft as F
+    mesh = Mesh(np.asarray(jax.local_devices()[:1]).reshape(1, 1), ("x", "y"))
+    out["cubin_dir"] = F.cubin_cache_dir()          # the run's real image cache, seeded from the store
+    out["store"] = str(F.CUBIN_STORE)
+    t0 = time.perf_counter()
+    out["router"] = F.require_kconv(mesh, announce=False)   # runs the (2,1,1) probe kernel
+    kg, nk, m = (3, 3, 3), 27, 2                             # an hsuite grid (bcc Na)
+    X = jax.device_put(np.ones((nk, m, m), np.complex128), NamedSharding(mesh, P(None, "x", "y")))
+    f = jax.jit(F.make_kfft_klead(mesh, kg, P(None, None, None, "x", "y"), kind="fftn", norm="ortho"))
+    jax.block_until_ready(f(X))
+    out["s"] = time.perf_counter() - t0
+except Exception as e:
+    out["error"] = f"{type(e).__name__}: {e}"[:600]
+print("PROBE_JSON " + json.dumps(out, default=str), flush=True)
+"""
+
+
+def kconv_log(text: str) -> list[tuple[str, str]]:
+    """[(hit|built, kgrid)] from the k-convolution handlers' own log lines."""
+    out = []
+    for m in re.finditer(r"\[kconv_mathdx\] (disk-cache hit|NVRTC (?:re)?built)[^\n]*?kgrid=\(([0-9,]+)\)", text):
+        out.append(("hit" if m.group(1).startswith("disk") else "built", m.group(2)))
+    return out
+
+
+def count_images(dirs: list[str], sm: int | None) -> dict:
+    """Images per directory and how many are for ``sm`` (flat directories; no walk)."""
+    res = {}
+    for d in dirs:
+        if not d or not os.path.isdir(d):
+            res[d] = {"n": 0, "for_sm": 0, "present": False}
+            continue
+        names = [e.path for e in os.scandir(d) if e.name.endswith(".cubin")]
+        archs = [cubin_arch(p) for p in names[:2000]]
+        res[d] = {"n": len(names), "for_sm": sum(1 for a in archs if a == sm) if sm else len(names),
+                  "present": True}
+    return res
+
+
 def run_probe(code: str, args: list[str], env: dict, timeout: float) -> tuple[dict, str, float]:
     """Run a probe in a fresh interpreter; (json, stderr+stdout tail, wall)."""
     t0 = time.perf_counter()
@@ -929,8 +1013,33 @@ def open_verdict(opens: list[dict]) -> dict:
 STAGE_FIX = ("stage the runtime node-local (see manual: docs/installation/perf_check.md#filesystem)")
 
 
-def judge_filesystem(fs0: dict, opens: list[dict], imports: list[dict], ref: dict) -> dict:
+def judge_lookups(lookups: list[dict]) -> tuple[str, list[str]]:
+    """Slow failed lookups in LD_LIBRARY_PATH (FAIL) or PATH (WARN) directories, slowest rank."""
+    worst_by: dict = {}
+    for lk in lookups:
+        for var in ("LD_LIBRARY_PATH", "PATH"):
+            for row in lk.get(var) or []:
+                if row.get("missing") or not row.get("n"):
+                    continue
+                key = (var, row["dir"])
+                if key not in worst_by or row["median_ms"] > worst_by[key]["median_ms"]:
+                    worst_by[key] = row
+    st, lines = "PASS", []
+    for (var, d), row in sorted(worst_by.items(), key=lambda t: -t[1]["median_ms"]):
+        if row["median_ms"] < OPEN_FAIL_MS:
+            continue
+        sev = "FAIL" if var == "LD_LIBRARY_PATH" else "WARN"
+        st = worst(st, sev)
+        lines.append(f"slow {var} entry: {d} on {row.get('fstype')} costs {row['median_ms']:.2f} ms per "
+                     "failed lookup, and every exec (ptxas/nvlink per XLA module) and dlopen probes it "
+                     "for each library: remove it, or move it to node-local storage")
+    return st, lines
+
+
+def judge_filesystem(fs0: dict, opens: list[dict], imports: list[dict], ref: dict,
+                     lookups: list[dict] | None = None) -> dict:
     lines, st = [], "PASS"
+    s_lk, l_lk = judge_lookups(lookups or [])
     v = open_verdict(opens)
     warm = v.get("warm") or {}
     walk = ((fs0.get("walk") or {}).get("reps") or [{}, {}])[-1]
@@ -995,6 +1104,12 @@ def judge_filesystem(fs0: dict, opens: list[dict], imports: list[dict], ref: dic
         if pfx.get("fstype") in NETWORK_FS:
             st = worst(st, "WARN")
             lines.append("PYTHONPYCACHEPREFIX is on a network filesystem: point it at node-local storage")
+    if l_lk:
+        if s_lk == "FAIL" and st != "FAIL":
+            lines = l_lk + lines
+        else:
+            lines += l_lk
+        st = worst(st, s_lk)
     return comp("1 filesystem", st, lines, met)
 
 
@@ -1036,16 +1151,35 @@ def judge_caches(caches: dict, ranks: list[dict]) -> dict:
         st = worst(st, "WARN")
         lines.append(f"compile-cache namespace {ns} is not content-keyed (k3): a module candidate and "
                      "its published copy will not share entries")
-    store = caches.get("store") or {}
-    if store.get("present"):
-        if not store.get("for_arch"):
+    r0 = next((r for r in ranks if r.get("rank") == 0), {})
+    spr = r0.get("store_probe")
+    build_cmd = (f"srun -N 1 -n 1 --gpus-per-node=4 {shlex.quote(sys.executable)} "
+                 f"{ROOT}/scripts/build_cubin_store.py --jobs 16")
+    if spr is not None:
+        sm = r0.get("sm")
+        imgs = spr.get("images") or {}
+        n_sm = sum(v.get("for_sm", 0) for v in imgs.values())
+        log = spr.get("log") or []
+        probe_built = [k for s, k in log if s == "built" and k == "2,1,1"]
+        built = [k for s, k in log if s == "built"]
+        where = ", ".join(f"{d}: {v.get('for_sm', 0)}/{v.get('n', 0)}" for d, v in imgs.items())
+        if spr.get("error"):
             st = "FAIL"
-            lines.append(f"cold or misnamed caches: cubin store {store.get('path')} has "
-                         f"{store.get('n')} images, none for sm_{store.get('sm')}; rebuild it on this "
-                         "GPU (scripts/build_cubin_store.py)")
-    elif store:
-        lines.append(f"no cubin store at {store.get('path')}: the first run NVRTC-builds its kernels "
-                     "(~6 s each per rank)")
+            lines.append(f"cubin store probe failed: {spr['error'][:200]}")
+        elif n_sm < MIN_STORE_IMAGES:
+            st = "FAIL"
+            lines.append(f"cubin store missing: {n_sm} NVRTC images for sm_{sm} ({where}); every rank "
+                         "NVRTC-builds each kernel on first use (~6 s each, ~10^4 header opens; the module's "
+                         f"stage measured 259 s without images, 59 s with): run {build_cmd}")
+        elif probe_built:
+            st = "FAIL"
+            lines.append(f"cold or misnamed caches: {n_sm} images for sm_{sm} present but the router's probe "
+                         "kernel was NVRTC-built, not loaded: the image key (toolchain, headers) does not "
+                         f"match this install; rebuild: {build_cmd}")
+        else:
+            lines.append(f"cubin images for sm_{sm}: {where}; probe kernels "
+                         f"{'loaded from the cache' if not built else 'partly built: ' + ','.join(built)} "
+                         f"({fmt(spr.get('s'), '.1f')} s)")
     # second-process cache hits
     for r in ranks:
         w = r.get("bench_warm") or {}
@@ -1221,15 +1355,11 @@ def libs_static(mapped: list[str]) -> dict:
             dup.append(f"{fam}: {', '.join(paths)}")
     traps = []
     ld = [d for d in os.environ.get("LD_LIBRARY_PATH", "").split(":") if d]
-    slow_dirs = [d for d in ld if fs_of(d)["fstype"] in NETWORK_FS - {"lustre"} and os.path.isdir(d)]
     missing = [d for d in ld if not os.path.isdir(d)]
     if missing:
-        traps.append({"severity": "WARN", "text": f"LD_LIBRARY_PATH names {len(missing)} missing "
-                      f"directories ({', '.join(missing[:3])}): every dlopen probes them"})
-    if slow_dirs:
-        traps.append({"severity": "WARN", "text": f"LD_LIBRARY_PATH searches {len(slow_dirs)} directories "
-                      f"on network filesystems before system paths (first: {slow_dirs[0]} on "
-                      f"{fs_of(slow_dirs[0])['fstype']}): every dlopen of every library stats them"})
+        traps.append({"severity": "INFO", "text": f"LD_LIBRARY_PATH names {len(missing)} missing "
+                      f"directories ({', '.join(missing[:3])})"})
+    # slow LD_LIBRARY_PATH entries are measured (failed-lookup latency) in component 1
     for d in ld:
         hits = [f for f in CUDA_FAMILIES if glob.glob(os.path.join(d, f + ".*"))]
         if hits and "site-packages" not in d and "lorrax-launch" not in d and "cudart-hmem" not in d \
@@ -1358,6 +1488,7 @@ def rank_main(args, ctx: dict, topo: dict, out: Path) -> dict:
     wait_all(out, "start", nranks)
     res["open"] = probe_open_latency(sample)
     res["open"]["sample"] = len(sample)
+    res["lookups"] = probe_path_lookups()
     mark(out, "open", rank)
     wait_all(out, "open", nranks)
     if rank == 0:
@@ -1399,6 +1530,16 @@ def rank_main(args, ctx: dict, topo: dict, out: Path) -> dict:
         if warm.get("error"):
             warm["log_tail"] = text_w[-3000:]
         res["bench_warm"] = warm
+        if rank == 0:
+            # The run's real NVRTC image cache (real SCRATCH): does a probe kernel load from it?
+            senv = single_process_env(os.environ)
+            senv["ISDF_JAX_CACHE_DIR"] = str(base / "jax_store")
+            sp_, text_s, wall_s = run_probe(PROBE_STORE, [], senv, timeout=600)
+            sp_["wall_s"] = wall_s
+            sp_["log"] = kconv_log(text_s)
+            if sp_.get("error"):
+                sp_["log_tail"] = text_s[-2000:]
+            res["store_probe"] = sp_
         if not args.keep:
             shutil.rmtree(base, ignore_errors=True)
         else:
@@ -1416,6 +1557,9 @@ def rank_main(args, ctx: dict, topo: dict, out: Path) -> dict:
         res["device_kind"] = kinds[0] if kinds else None
         bc = res.get("bench_cold") or {}
         res["caches"] = static_caches(sm, bc.get("namespace"))
+        spr = res.get("store_probe")
+        if spr and not spr.get("error"):
+            spr["images"] = count_images([spr.get("cubin_dir"), spr.get("store")], sm)
         fat = {}
         for leg in ("CUDA",):
             p = ((bc.get("ffi") or {}).get(leg) or {}).get("path") or os.environ.get("LORRAX_FFI_SO")
@@ -1436,7 +1580,8 @@ def judge_all(ranks: list[dict], cpu_only: bool) -> tuple[str, list[dict], dict]
     ref = REFERENCE.get(kind)
     ref = ref if ref and any(v is not None for v in ref.values()) else None
     comps = [judge_filesystem(r0.get("fs") or {}, [r.get("open") or {} for r in ranks],
-                              [r.get("imports") or {} for r in ranks], ref or {}),
+                              [r.get("imports") or {} for r in ranks], ref or {},
+                              [r.get("lookups") or {} for r in ranks]),
              judge_caches(r0.get("caches") or {}, ranks)]
     gpu = all(r.get("gpu") for r in ranks)
     if gpu:
