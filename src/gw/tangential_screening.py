@@ -139,6 +139,43 @@ def _authenticated_constructor_resume(root, identity, recipe, *, photon=False, c
     return ('photon_layout' in header) == photon
 
 
+def _authenticate_committed_body(header, root, identity, recipe, coulomb_sha256):
+    """Bind interrupted-head reuse to its current recipe and bare interaction.
+
+    The store validator below authenticates the model payload with the current
+    capacity ledger. These small existing receipts additionally bind the
+    physical inputs omitted from the state identity; no bank payload is read.
+    Missing legacy provenance refuses rather than inferring a compatible V.
+    """
+    def refuse(reason):
+        raise ValueError(f"GATE tangential_committed_resume: {reason}; use a fresh run directory")
+
+    if header.get("identity") != identity or _json(header.get("recipe")) != _json(recipe):
+        refuse("current identity or resolved recipe differs from the committed body")
+    if not isinstance(coulomb_sha256, str) or not coulomb_sha256:
+        refuse("current bare Coulomb digest is missing")
+    try:
+        bank = json.loads((root / "bank_receipt.json").read_text())
+        moments = json.loads((root / "moments_receipt.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError("GATE tangential_committed_resume: producer provenance is missing or invalid; "
+                         "use a fresh run directory") from exc
+    if (any(row.get("identity") != identity or row.get("completion") is not True
+            for row in (bank, moments)) or moments.get("bank_complete") is not True
+            or bank.get("coulomb_identity") != moments.get("coulomb_identity")
+            or (bank.get("coulomb_identity") or {}).get("sha256") != coulomb_sha256):
+        refuse("producer receipts do not bind the current bare Coulomb operator")
+    # These per-parent receipts are inside the authenticated model header,
+    # so adjacent JSON files cannot accidentally authenticate another body.
+    parents = [row for batch in header.get("construction_receipts", ())
+               for row in batch.get("receipt", {}).get("q_receipts", ())]
+    if (len(parents) != header.get("n_q_irr")
+            or any(row.get("identity") != identity
+                   or row.get("constructor", {}).get("coulomb", {}).get("sha256") != coulomb_sha256
+                   for row in parents)):
+        refuse("committed parent receipts do not bind the current bare Coulomb operator")
+
+
 # What the sector constructor publishes into a map directory.
 _SECTOR_OUTPUTS = ('sectors.json', 'CC.h5', 'TT.h5', 'CT_C.h5', 'CT_T.h5')
 
@@ -647,13 +684,18 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         assert_committed(h5, path=model)
                         complete = "final_commit" in h5
                         raw = h5["header_json"][()] if complete else b"{}"
-                    bound = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw)).get("identity")
+                    stored_header = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
+                    bound = stored_header.get("identity")
                 except (OSError, ValueError, KeyError, AttributeError):
                     complete = False
-            if complete and sc_scratch and not photon and bound == identity:
-                # An SC map's committed model of this very map (the file tier
-                # persists it): Sigma reads it; nothing upstream is rebuilt.
-                log.info(f"tangential output: committed model of this map retained at {model}; reusing it")
+            if complete and (sc_scratch or config.restart) and not photon and bound == identity:
+                # A head failure can leave a committed body before restart
+                # membership is registered. Explicit restart may resume it;
+                # the committed branch below still validates the full payload
+                # against this identity and the current capacity ledger.
+                _authenticate_committed_body(
+                    stored_header, root, identity, recipe, coulomb["sha256"])
+                log.info(f"tangential output: committed model of the current operator retained at {model}; reusing it")
                 return "committed"
             if complete:
                 log.info(f"tangential output: complete model retained at {model}; refusing rebuild")
