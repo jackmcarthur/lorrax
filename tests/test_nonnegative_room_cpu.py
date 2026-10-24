@@ -43,6 +43,10 @@ def _controls():
     for budget in (128 << 20, 64 << 20):
         memory.set_budget(budget, linalg="distributed")
         for n in (2, 7):
+            # Low-symmetry nodes may have one free variable per centroid.
+            # The shared room-only LU policy still admits a fitting matrix;
+            # a generic backup tag must not veto it after route admission.
+            memory.set_nmu(n)
             rng = np.random.default_rng(31+n)
             matrix = rng.normal(size=(2*n, n))
             a = matrix.T @ matrix + np.eye(n)*.2
@@ -76,6 +80,7 @@ def _controls():
         owner._compile(product, (aa,), mesh, "actual local matrix", whole_matrix=True)
     print(json.dumps(dict(cases=len(errors), max_absolute_error=max(errors),
                           budgets=decisions, output_layout="P(x)",
+                          centroid_scale_principal_route_admitted=True,
                           insufficient_room_refuses_before_donation=True,
                           compiled_whole_matrix_over_room_refuses=True)))
 

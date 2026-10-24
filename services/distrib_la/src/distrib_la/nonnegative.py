@@ -30,8 +30,7 @@ def _compile(fn, operands, mesh, label, *, whole_matrix=False):
         xla=memory.Term(max(0, new) if whole_matrix else 0.0,
                         0.0 if whole_matrix else max(0, new) * int(mesh.size),
                         "compiled principal-pivot program"),
-        ranks=int(mesh.size), label=label,
-        whole=int(operands[0].shape[-1]) if whole_matrix else 0)),), room)
+        ranks=int(mesh.size), label=label)),), room)
     if hasattr(fn, "finish"):
         return lambda *args: fn.finish(args, executable(*args))
     return executable
