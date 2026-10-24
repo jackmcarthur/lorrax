@@ -51,9 +51,7 @@ the band energies from the NSCF output; a one-shot's `eqp0.dat` and the
 | stop rule | `sc_tol_ev = 1e-3` | 1 meV is the reproducibility the default `sigma_quadrature_eps` is chosen for; judge convergence by states near $E_F$ ([self-consistency §7](../self_consistency.md#7-metals)) |
 
 State `sys_dim = 3`; the metal q = 0 cell is three-dimensional only
-(`vcoul.py`), so a 2-D metal is not supported. `fermi_reference = mp1_fixed_n`
-is required on a metal (the name is historical; with Fermi–Dirac it is the
-fixed-N μ).
+(`vcoul.py`), so a 2-D metal is not supported.
 
 ## What the code derives
 
@@ -103,7 +101,6 @@ ncond = 8
 number_bands = 35
 compute_mode = tangential
 occ_smearing_width_ry = 0.02
-fermi_reference = mp1_fixed_n
 qp_solver = self_consistent
 sc_tol_ev = 1e-3
 use_band_extrapolation = false

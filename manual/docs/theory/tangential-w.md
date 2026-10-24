@@ -7,7 +7,7 @@ The correlation part of W as one set of real poles, shared by every matrix eleme
 
 ## <span class="n">1</span> W as a sum of poles {: #dyson }
 
-The screened interaction is usually computed from the independent-particle response through a Dyson equation. It also has a closed form, with no inverse, in terms of the wavefunctions, their energies and the Coulomb interaction. That form is a sum of poles, and the rest of the page builds a small model of it.
+This page develops the first of the two formalisms introduced on [Analytic structure of W](w-structure.md), and it is the preferred full-frequency treatment of GW in LORRAX. The screened interaction is usually computed from the independent-particle response through a Dyson equation. It also has a closed form, with no inverse, in terms of the wavefunctions, their energies and the Coulomb interaction. That form is a sum of poles, and the rest of the page builds a small model of it.
 {: .intro }
 
 The density response $\chi$, the independent-particle response $\chi^0$ and the screened interaction are related by the Dyson equations

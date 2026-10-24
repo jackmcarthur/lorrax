@@ -825,7 +825,7 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
                 "  SC head occupations: WFN consistency max|Δf| = "
                 f"{deviation:.3e}, mu_check = "
                 f"{check_state.mu_ry * RYD_TO_EV:.8f} eV (wfn.efermi "
-                f"{inputs.wfn.efermi * RYD_TO_EV:.6f} eV is the midgap/VBM "
+                f"{inputs.wfn.efermi * RYD_TO_EV:.6f} eV is the midgap "
                 "convention, reported not asserted)")
     return SCState(
         H_qp_dft=device_put_process_local(H0, rep),

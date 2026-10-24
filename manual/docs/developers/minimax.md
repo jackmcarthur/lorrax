@@ -113,7 +113,6 @@ Every rule is fixed by a handful of numbers, all known before any $G$ or $W$ is 
 | $R$ | $\Delta_{\max}/\Delta_{\min}$, the dimensionless range of decay rates | derived | — |
 | $\varepsilon_\chi$ | absolute error of $1/\Delta$, in Ry⁻¹ | [`minimax_target_error`](../drivers/gw/keywords.md#minimax_target_error) | $10^{-6}$ |
 | $N_{\max}$ | node cap of the static and probe rules | [`minimax_max_nodes`](../drivers/gw/keywords.md#minimax_max_nodes) | 64 |
-| $\mu$ | energy reference of the exponentials | [`minimax_energy_reference`](../drivers/gw/keywords.md#minimax_energy_reference) | midgap |
 | $\omega_p$ | plasmon-pole probe frequency (imaginary for GN, real for HL) | `ppm_omega_p` | 2 Ry (GN) |
 | $z=\omega+i\varpi$ | sample frequencies of $W$ (MPA lines, tangential supports) | the sample plan of the screening route | — |
 | $\eta$ | broadening of Σ, the distance of every pole from the real axis | [`sigma_regularization_ev`](../drivers/gw/keywords.md#sigma_regularization_ev) | 0.25 eV |

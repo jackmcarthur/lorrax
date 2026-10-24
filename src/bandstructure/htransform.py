@@ -59,7 +59,7 @@ from .fh_interp import (                                             # noqa: F40
 logger = get_logger(__name__)
 
 
-def metal_fermi_reference_ry(wfn):
+def metal_dft_efermi_ry(wfn):
     """A metal's DFT E_F (Ry), the zero of its path energies; ``None`` for an
     insulator, whose zero stays the VBM.
 
@@ -130,9 +130,10 @@ def plot_bands(result):
             ax.scatter(np.full(nb_keep, xpos), gamma_exact_ev, marker='o', facecolors='none', edgecolors='red', label=label_exact)
         ax.scatter(np.full(nb_keep, xpos), energies_ev[idx], marker='x', color='black', label=label_ht)
 
-    ax.axhline(fermi_energy * RYD_TO_EV, color='red', linestyle='--', linewidth=1.0, alpha=0.7, label='$E_F$')
+    ax.axhline(fermi_energy * RYD_TO_EV, color='red', linestyle='--', linewidth=1.0, alpha=0.7,
+               label=str(result.get("energy_zero", "VBM")))
     ax.set_xlabel('k-path arc length (2π-scaled)')
-    ax.set_ylabel('Energy (eV)')
+    ax.set_ylabel(_energy_axis_label(result))
     ax.set_title('Hamiltonian-transform bands')
     ax.grid(True, which='both', axis='y', linestyle='--', alpha=0.3)
     ax.legend(loc='best', fontsize='small')
@@ -140,15 +141,21 @@ def plot_bands(result):
     plt.show() 
 
 
-def plot_colored_bands(result, values, *, label, path, signed, e_fermi_ry,
-                       clip=1.0):
+def _energy_axis_label(result):
+    """The y label of a path plot: its energies are relative to the VBM (an
+    insulator) or to the DFT E_F (a metal), as ``result["energy_zero"]`` says."""
+    zero = result.get("energy_zero", "VBM")
+    return ("Energy relative to the VBM (eV)" if zero == "VBM"
+            else f"Energy relative to {zero} (eV)")
+
+
+def plot_colored_bands(result, values, *, label, path, signed, clip=1.0):
     """Path bands colored by one band value on a linear scale clipped at ``clip``."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     _kf, x_path, node_indices, node_labels, _g = result["kpath_data"]
-    energies = (np.asarray(result["energies_sorted"])
-                + result["energy_reference_ry"] - e_fermi_ry) * RYD_TO_EV
+    energies = np.asarray(result["energies_sorted"]) * RYD_TO_EV
     nq, nb = energies.shape
     fig, ax = plt.subplots(figsize=(6, 5))
     sc = ax.scatter(np.repeat(x_path[:nq], nb), energies.ravel(),
@@ -162,7 +169,7 @@ def plot_colored_bands(result, values, *, label, path, signed, e_fermi_ry,
     ax.set_xticks(ticks, [(lbl or "") for lbl in node_labels])
     ax.axhline(0.0, color='k', ls='--', lw=0.8)
     ax.set_xlim(x_path[0], x_path[nq - 1])
-    ax.set_ylabel(r'$E - E_F$ (eV; $E_F$ of the coarse grid)')
+    ax.set_ylabel(_energy_axis_label(result))
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -352,7 +359,7 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
                                f"bands_{c.replace(':', '_')}.png")
             if jax.process_index() == 0:
                 plot_colored_bands(result, values, label=label, path=png,
-                                   signed=signed, e_fermi_ry=mu_c, clip=clip_c)
+                                   signed=signed, clip=clip_c)
             files.append((f"bands colored by {c}", "written", png))
         npz = os.path.join(input_dir, "band_operators_path.npz")
         if jax.process_index() == 0:
@@ -408,7 +415,8 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
 
 def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path,
                         *, band_start: int = 0, nb_fit: int | None = None,
-                        energy_reference_ry: float | None = None):
+                        energy_reference_ry: float | None = None,
+                        energy_zero: str | None = None):
     if energies_on_path is None or kpath_frac is None or x_path is None:
         return
     # Same family as ``bse_io.write_eigenvectors_stream``: a WRITER must not
@@ -420,6 +428,8 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path,
         fh.write('# idx_k idx_b kx ky kz s energy_eV\n')
         if energy_reference_ry is not None:
             fh.write(f'# energy_reference_eV={float(energy_reference_ry) * RYD_TO_EV:.17g}\n')
+        if energy_zero is not None:
+            fh.write(f'# energy_zero={energy_zero}\n')
         if nb_fit is not None:
             fh.write(
                 f"# absolute_band_window=[{int(band_start)},"
@@ -744,7 +754,7 @@ def main(argv=None):
                                  quality_record_fn=_quality_records.append,
                                  sym=sym, return_coeffs=bool(args.color),
                                  B_at_mu=B_at_mu,
-                                 fermi_reference_ry=metal_fermi_reference_ry(wfn))
+                                 metal_efermi_ry=metal_dft_efermi_ry(wfn))
         if len(_quality_records) != 1:
             raise RuntimeError(
                 "htransform returned "
@@ -805,6 +815,7 @@ def main(argv=None):
                 band_start=result["band_start"],
                 nb_fit=result["nb_fit"],
                 energy_reference_ry=result["energy_reference_ry"],
+                energy_zero=result.get("energy_zero"),
             )
         _write_progress.step()
         _write_progress.finish()

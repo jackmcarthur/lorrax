@@ -121,15 +121,6 @@ Node cap of the static and HL-probe rules.
 A static rule that misses its target at the cap refuses. The GN probe and the tangential bank ignore it; the GN probe stops at 64 nodes ([minimax](../../theory/time-frequency.md#frame-keys)).
 {: .kw-details }
 
-### `minimax_energy_reference` {: .kw data-type="enum" data-default="midgap" }
-Energy zero of the band energies in the χ⁰ time rules. It cancels from $\chi^0$.
-
-`none` (aliases `raw`, `zero`) uses the raw energies. A number in the input file reaches the resolver as a string and refuses when the first rule is built ([minimax](../../theory/time-frequency.md#frame-keys)).
-{: .kw-details }
-
-`midgap` `vbm` `cbm` `none`
-{: .kw-values }
-
 ### `ladder_probe_chunk` {: .kw data-type="int" data-default="0" }
 Probe columns per block of the ladder solve (`w_bse`, `w_rpa_resolvent`).
 
@@ -252,15 +243,6 @@ Fermi–Dirac $k_BT$ of a metal's occupations, in Ry.
 
 Required when the WFN occupations are fractional and refused when they are integer; `WFN.h5` does not store it. See [Metals](../../theory/metals.md).
 {: .kw-details }
-
-### `fermi_reference` {: .kw data-type="enum" data-default="midgap" }
-Origin $E_F$ of the Σ frequency axis.
-
-An insulator takes `midgap` or `vbm`; a metal requires `mp1_fixed_n` (fixed-$N$ chemical potential), which refuses on an insulator.
-{: .kw-details }
-
-`midgap` `vbm` `mp1_fixed_n`
-{: .kw-values }
 
 ### `occ_broadening` {: .kw data-type="float" data-default="0.0" }
 First-order Methfessel–Paxton width of the smeared QSGW head on an insulator, in eV.

@@ -60,6 +60,8 @@ More ranks divide face storage and can reduce the number of whole matrices assig
 
 These are fresh fixed-input $G_0W_0$ runs from **23 October 2026**, pinned to source [`2d2ca2f104`](https://github.com/jackmcarthur/lorrax/commit/2d2ca2f104a085876a573e8b1278a7874c479b98). They use native full head corrections, default accuracy and automatic batch/layout selection. They establish completed workloads, not k-grid/band/basis convergence or minimum processor counts.
 
+The downloadable decks preserve that historical source. For main at or after [`5e4f1bdab`](https://github.com/jackmcarthur/lorrax/commit/5e4f1bdabf4fd9643733a43966bf252f31426953), remove `fermi_reference = mp1_fixed_n` from the Fe deck; the metal chemical-potential reference is now automatic. Keep the original line when reproducing the pinned source.
+
 Memory values below use decimal GB. Wall time is the GW driver's `total run`, including setup and compilation but excluding centroid/dipole/kinetic preprocessing, queue wait and allocation startup. All GPU rows use A100-80GB cards and the automatic local-linalg budget (66.35 GB in the saved receipts). Persistent compilation caches were shared; the counts below make their state explicit.
 
 | System | Full k grid / stored parents | Occupied bands | Sum bands | Physical $N_\mu$ | $n_s$ | Method | Resources | GW wall | Pool peak/rank |

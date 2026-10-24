@@ -31,7 +31,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache, partial
 import os
-from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -1226,43 +1225,15 @@ def solve_laplace_minimax_imag_interval(
 #  minimax engine, not one of its consumers).
 # ---------------------------------------------------------------------------
 
-def resolve_minimax_energy_reference(
-    enk_v: jax.Array,
-    enk_c: jax.Array,
-    *,
-    reference: str | float | int | None = "midgap",
-    reference_fn: Callable[[jax.Array, jax.Array], float] | None = None,
-) -> float:
-    """Resolve the minimax energy reference used to shift band energies.
+def resolve_minimax_energy_reference(enk_v: jax.Array, enk_c: jax.Array) -> float:
+    """The midgap ``0.5*(max E_v + min E_c)`` the band energies are shifted by.
 
-    This shift is algebraically neutral for χ0/W (only E_c-E_v enters), but
-    exposing it at the top-level minimax pipeline keeps reference conventions
-    explicit and synchronized with sigma paths.
+    This shift is algebraically neutral for χ0/W (only E_c-E_v enters); one
+    fixed reference keeps the exponentials and the Sigma paths in step.
     """
-    if reference_fn is not None:
-        return float(reference_fn(enk_v, enk_c))
-
-    if reference is None:
-        return 0.0
-    if isinstance(reference, (int, float)):
-        return float(reference)
-
-    ref = str(reference).strip().lower()
-    if ref in ("none", "raw", "zero"):
-        return 0.0
-
-    enk_v_host = np.asarray(jax.device_get(enk_v), dtype=np.float64)
-    enk_c_host = np.asarray(jax.device_get(enk_c), dtype=np.float64)
-    vbm_ref = float(np.max(enk_v_host))
-    cbm_ref = float(np.min(enk_c_host))
-
-    if ref == "midgap":
-        return 0.5 * (vbm_ref + cbm_ref)
-    if ref == "vbm":
-        return vbm_ref
-    if ref == "cbm":
-        return cbm_ref
-    raise ValueError(f"Unknown minimax energy reference '{reference}'. Expected midgap/vbm/cbm/none or float.")
+    vbm = float(np.max(np.asarray(jax.device_get(enk_v), dtype=np.float64)))
+    cbm = float(np.min(np.asarray(jax.device_get(enk_c), dtype=np.float64)))
+    return 0.5 * (vbm + cbm)
 
 
 # ---------------------------------------------------------------------------
@@ -1292,8 +1263,7 @@ def build_static_quadrature(wfns, minimax_config, *,
     # therefore every MPA sample frequency) depend on process count.  Spectral
     # extrema are physics and end at the logical union carried alongside it.
     enk_c = wfns.enk[:, s.cond_all_logical]
-    e_ref = resolve_minimax_energy_reference(
-        enk_v, enk_c, reference=minimax_config.energy_reference)
+    e_ref = resolve_minimax_energy_reference(enk_v, enk_c)
 
     # Interval derivation for 1/x on the band-energy span [x_min, x_max].
     # (Inlined from the former minimax_screening.build_static_minimax_window_pair;

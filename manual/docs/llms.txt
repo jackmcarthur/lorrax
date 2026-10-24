@@ -32,6 +32,7 @@
 - [Contour deformation](https://jackmcarthur.github.io/lorrax/theory/contour-deformation/): manual/docs/theory/contour-deformation.md
 - [Frequency treatments of Σ](https://jackmcarthur.github.io/lorrax/theory/frequency-treatments/): manual/docs/theory/frequency-treatments.md
 - [ISDF and V(q)](https://jackmcarthur.github.io/lorrax/theory/isdf/): manual/docs/theory/isdf.md
+- [Ladder vertex corrections](https://jackmcarthur.github.io/lorrax/theory/ladder-w/): manual/docs/theory/ladder-w.md
 - [Metals](https://jackmcarthur.github.io/lorrax/theory/metals/): manual/docs/theory/metals.md
 - [Physics overview](https://jackmcarthur.github.io/lorrax/theory/physics/): manual/docs/theory/physics.md
 - [The q → 0 head](https://jackmcarthur.github.io/lorrax/theory/q0-head/): manual/docs/theory/q0-head.md
@@ -41,6 +42,7 @@
 - [Time–frequency transforms](https://jackmcarthur.github.io/lorrax/theory/time-frequency/): manual/docs/theory/time-frequency.md
 - [Velocity operator](https://jackmcarthur.github.io/lorrax/theory/velocity-operator/): manual/docs/theory/velocity-operator.md
 - [Short- and long-range W](https://jackmcarthur.github.io/lorrax/theory/w-range-splitting/): manual/docs/theory/w-range-splitting.md
+- [Analytic structure of W](https://jackmcarthur.github.io/lorrax/theory/w-structure/): manual/docs/theory/w-structure.md
 - [MoS₂ with spin–orbit coupling](https://jackmcarthur.github.io/lorrax/tutorials/mos2-soc/): manual/docs/tutorials/mos2-soc.md
 - [For BerkeleyGW users](https://jackmcarthur.github.io/lorrax/using/berkeleygw-users/): manual/docs/using/berkeleygw-users.md
 - [Running on clusters](https://jackmcarthur.github.io/lorrax/using/clusters/): manual/docs/using/clusters.md

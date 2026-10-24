@@ -49,7 +49,9 @@ LORRAX computes quasiparticle energies $E^{\mathrm{QP}}_{n\bk}$ in the GW approx
 | [Physics overview](theory/physics.md) | The equations LORRAX evaluates, from $G$ to $W$ to Σ to the BSE |
 | [Frequency treatments of Σ](theory/frequency-treatments.md) | `x_only`, `cohsex`, `gn_ppm`, `hl_ppm`, `tangential` |
 | [Time–frequency transforms](theory/time-frequency.md) | The frequency convolutions of χ⁰ and Σ as sums over time nodes: sampling, minimax rules and the windows of Σ |
-| [Tangential W model](theory/tangential-w.md) | $W^c$ as one set of poles shared by every matrix element |
+| [Analytic structure of W](theory/w-structure.md) | $W^c$ as the resolvent of a particle–hole Hamiltonian, and the two formalisms built on it |
+| [Tangential W model](theory/tangential-w.md) | The preferred full-frequency model: $W^c$ as one set of poles shared by every matrix element |
+| [Ladder vertex corrections](theory/ladder-w.md) | $W$ with the electron–hole ladder, from matrix-free resolvent solves |
 | [The q → 0 head](theory/q0-head.md) | The singular head of $V$ and $W$ as a mini-BZ cell average with local fields, from the velocity matrix elements |
 | [Short- and long-range W](theory/w-range-splitting.md) | $W$ carried to a finer k grid: the smooth part interpolated through $\bR$, the long-range plane-wave channels screened in G space and added back (`c1`, `srlr`) |
 | [Metals](theory/metals.md) | Fermi–Dirac occupations in χ⁰, the head and Σ, and the intraband term |

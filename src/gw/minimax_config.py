@@ -10,7 +10,7 @@ class MinimaxConfig:
     """Canonical minimax settings shared by χ₀ screening and Σ^c windows.
 
     One frozen, all-scalar (hashable) currency for both quadrature
-    consumers.  Screening builds it with an ``energy_reference``; the
+    consumers.  Screening builds it with the χ₀ rule controls; the
     Σ^c-window path builds it with the crossing-quadrature controls
     (``crossing_max_nodes`` / ``crossing_eps_q``).  Each side leaves the
     other's knobs at their defaults — the merged class carries the union
@@ -19,7 +19,6 @@ class MinimaxConfig:
 
     target_error: float = 1.0e-6
     max_nodes: int = 64
-    energy_reference: str | float | int | None = "midgap"
     crossing_max_nodes: int = 500
     crossing_eps_q: float = 1.0e-3
 

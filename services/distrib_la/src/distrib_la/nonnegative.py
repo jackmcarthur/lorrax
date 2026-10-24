@@ -9,44 +9,63 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from lxkit import memory
 from distrib_la._result_check import checked_program
-from distrib_la.plan import plan
+from distrib_la.plan import plan, _exchange
+from distrib_la.resolve import resolve_backend, mesh_platform
+from distrib_la.workspace import local_lu_workspace, lu_workspace_query
 
 
-def _compile(fn, operands, mesh, label, *, whole_matrix=False):
-    """Admit the new bytes of the exact executable before running it."""
+def _lower(fn, operands, mesh, label, *, linear=None, agree=False):
+    """Compile and price the complete program plus its native workspace."""
     executable = fn.lower(*operands).compile()
     analysis = executable.memory_analysis()
     if analysis is None:
         raise RuntimeError(f"{label}: compiler returned no memory price")
     new = (int(analysis.output_size_in_bytes) + int(analysis.temp_size_in_bytes)
            - int(analysis.alias_size_in_bytes))
-    room = memory.room()
-    if whole_matrix and new > room:
-        raise RuntimeError(f"GATE nonnegative_quadratic_capacity: {label} needs "
-                           f"{new} new executable bytes per rank, over room {room}; "
-                           "this leg has no whole-mesh LU provider beyond its room route")
-    route = "whole-matrix room route" if whole_matrix else "distributed face"
-    memory.admit(label, ((route, memory.Price(
-        xla=memory.Term(max(0, new) if whole_matrix else 0.0,
-                        0.0 if whole_matrix else max(0, new) * int(mesh.size),
-                        "compiled principal-pivot program"),
-        ranks=int(mesh.size), label=label)),), room)
-    if hasattr(fn, "finish"):
-        return lambda *args: fn.finish(args, executable(*args))
-    return executable
+    vendor, outside = 0, memory.Term()
+    if linear is not None and mesh_platform(mesh) == 'CUDA':
+        n = int(operands[0].shape[0])
+        if linear.backend == 'one_device':
+            vendor = local_lu_workspace(mesh, n, operands[0].dtype)
+        else:
+            # One RHS column per rank leaves exactly one getrs chunk, so
+            # the native query is cap-independent; no cap state is posted.
+            vendor = lu_workspace_query(mesh, n, int(mesh.shape['y']), operands[0].dtype, 0)
+            outside = memory.contexts()
+    if agree:
+        # Positive metadata only: the shared budget hook rejects negative values.
+        figures = _exchange(f'nonnegative/{linear.backend}/{operands[0].shape[0]}',
+                            dict(xla=max(0, new), vendor=vendor))
+        new = max(row['xla'] for row in figures)
+        vendor = max(row['vendor'] for row in figures)
+    price = memory.Price(
+        xla=(memory.Term(max(0, new), source='compiled one-system principal program')
+             if linear is not None and linear.backend == 'one_device' else
+             memory.Term(0.0, max(0, new) * int(mesh.size), 'compiled principal-pivot program')),
+        vendor=memory.Term(float(vendor), source='native LU workspace query'),
+        outside=outside, ranks=int(mesh.size), label=label,
+        whole=(int(operands[0].shape[0]) if linear is not None
+               and linear.backend == 'one_device' and mesh_platform(mesh) == 'CUDA' else 0))
+    run = (lambda *args: fn.finish(args, executable(*args))) if hasattr(fn, 'finish') else executable
+    return run, price
+
+
+def _compile(fn, operands, mesh, label):
+    run, price = _lower(fn, operands, mesh, label)
+    memory.admit(label, (("distributed face", price),), memory.room())
+    return run
 
 
 @lru_cache(maxsize=8)
 def _programs(mesh, n, n_logical, linear):
+    # Plan equality excludes room. This is one system with nrhs=Py<=n,
+    # so a concrete provider always has the same one-round executable.
     face = NamedSharding(mesh, P("x", "y"))
     rows = NamedSharding(mesh, P("x"))
     replicated = NamedSharding(mesh, P())
     logical = jnp.arange(n) < n_logical
     # One RHS copy per y column keeps its layout legal without gathering A.
     nrhs = int(mesh.shape["y"])
-    # The eager caller admitted this plan against its current room. Plan
-    # equality excludes that room, but includes the selected backend: cached
-    # programs keep only geometry and never bypass a later call's admission.
 
     def normalize(a, b):
         diagonal = jnp.diag(a)
@@ -100,6 +119,37 @@ def _programs(mesh, n, n_logical, linear):
     )
 
 
+def _principal(mesh, n, n_logical, linear, operands, programs):
+    """Admit the complete first provider with a real, lazily priced mesh backup."""
+    label = 'nonnegative quadratic principal solve'
+    run, price = _lower(programs[1], operands, mesh, label, linear=linear,
+                        agree=linear.backend == 'one_device')
+    held = {linear.backend: (run, programs)}
+
+    def backup():
+        backend = resolve_backend('solve_lu', 'distributed', mesh, n=n, size_route=False)
+        other = plan('solve_lu', mesh, backend=backend, n=n, batched_route='auto')
+        bundle = _programs(mesh, n, n_logical, other)
+        run, price = _lower(bundle[1], operands, mesh, label, linear=other, agree=True)
+        held['distributed face'] = (run, bundle)
+        return price
+
+    routes = [(linear.backend, price)]
+    if linear.backend == 'one_device' and mesh_platform(mesh) == 'CUDA':
+        routes.append(('distributed face', backup))
+    room = memory.room()
+    if linear.backend == 'one_device' and price.bytes() > room:
+        # A whole matrix is eligible only within the planning room.
+        if mesh_platform(mesh) != 'CUDA':
+            raise RuntimeError(f"GATE nonnegative_quadratic_capacity: {label} needs "
+                               f"{price.bytes()} new bytes per rank, over room {room}; "
+                               "this leg has no whole-mesh LU provider beyond its room route")
+        routes = [('distributed face', backup())]
+    chosen = memory.admit(label, routes, room)
+    run, bundle = held[chosen]
+    return run, *bundle[2:]
+
+
 def solve_nonnegative_quadratic(a, b, *, mesh, n_logical, maxiter=None):
     """Minimize ``0.5*x.T@a@x - b.T@x`` with ``x >= 0``.
 
@@ -113,9 +163,9 @@ def solve_nonnegative_quadratic(a, b, *, mesh, n_logical, maxiter=None):
         Real float64 ``(n_pad,)`` on ``P('x')``, replicated along y. Units
         are objective / x. Consumed by donation, as ``a`` is.
     mesh : jax.sharding.Mesh
-        The named x/y device mesh. Principal systems keep a distributed-face
-        interface. The shared LU service stages a whole matrix only where
-        its room route fits the run's current per-rank budget; no host gather.
+        The named x/y device mesh. The CUDA leg uses its existing local
+        capacity route where the complete program and native scratch fit;
+        a whole-mesh LU is its lazy backup. No matrix is gathered to hosts.
     n_logical : int
         Physical variable count in ``[1,n_pad]``. Pad variables are fixed
         exactly to zero and are excluded from convergence checks.
@@ -135,8 +185,8 @@ def solve_nonnegative_quadratic(a, b, *, mesh, n_logical, maxiter=None):
     Block principal pivots exchange variables with negative primal or dual
     values. Three unsuccessful block pivots switch to one variable per
     pivot until the violation count decreases. Only scalar convergence
-    information leaves the mesh. Every masked principal system uses the
-    original padded face interface; inactive rows/columns are identity, so the physical
+    information leaves the mesh. Every masked principal matrix returns to
+    the original face; inactive rows/columns are identity, so the physical
     active submatrix has its exact SPD solution without dynamic gathering.
     """
     n, n_logical = int(a.shape[0]), int(n_logical)
@@ -150,17 +200,18 @@ def solve_nonnegative_quadratic(a, b, *, mesh, n_logical, maxiter=None):
     maxiter = 20 * n_logical if maxiter is None else int(maxiter)
     if maxiter < 1:
         raise ValueError("nonnegative quadratic maxiter must be positive")
-    # Re-resolve before consulting the geometry cache: a warm executable
-    # must not admit a whole matrix against an earlier call's larger room.
-    linear = plan("solve_lu", mesh, backend="distributed", n=n,
-                  batched_route="auto", budget_bytes=memory.room())
+    room = memory.room()
+    backend = (resolve_backend("solve_lu", "distributed", mesh, n=n, room=room)
+               if mesh_platform(mesh) == 'CUDA' else 'distributed')
+    linear = plan("solve_lu", mesh, backend=backend, n=n,
+                  batched_route="auto", budget_bytes=room)
     normalize, solve, inspect, pivot, finish = _programs(mesh, n, n_logical, linear)
     normalize = _compile(normalize, (a, b), mesh, "nonnegative quadratic scaling")
     h, c, scale, free, valid = normalize(a, b)
     if not bool(np.asarray(valid)):
         raise ValueError("nonnegative quadratic requires finite data and positive diagonal")
-    solve = _compile(solve, (h, c, free), mesh, "nonnegative quadratic principal solve",
-                     whole_matrix=linear.backend == "one_device")
+    solve, inspect, pivot, finish = _principal(
+        mesh, n, n_logical, linear, (h, c, free), (normalize, solve, inspect, pivot, finish))
     # Shape-only dummy outputs avoid executing a solve merely to price checks.
     z = jax.ShapeDtypeStruct(c.shape, c.dtype, sharding=c.format)
     inspect = _compile(inspect, (h, c, z, free), mesh, "nonnegative quadratic KKT check")

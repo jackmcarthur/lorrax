@@ -65,9 +65,10 @@ Two environment variables change only the engine inside a route, for A/B compari
 All k-axis kernels compute one operation, the pair correlation or convolution of two k-periodic centroid operators:
 
 $$
-U_\bq(\mu,\nu)=\sum_\bk\overline{A_\bk(\mu,\nu)}\,B_{\bk+\bq}(\mu,\nu)=\frac{1}{N_k}F_k\Big[\overline{F_k^{-1}A}\cdot F_k^{-1}B\Big](\bq),
-\qquad
-\sum_\bq A_{\bk-\bq}B_\bq=\frac{1}{N_k}F_k\Big[F_k^{-1}A\cdot F_k^{-1}B\Big](\bk).
+\begin{aligned}
+U_\bq(\mu,\nu)&=\sum_\bk\overline{A_\bk(\mu,\nu)}\,B_{\bk+\bq}(\mu,\nu)=\frac{1}{N_k}F_k\Big[\overline{F_k^{-1}A}\cdot F_k^{-1}B\Big](\bq),\\
+\sum_\bq A_{\bk-\bq}B_\bq&=\frac{1}{N_k}F_k\Big[F_k^{-1}A\cdot F_k^{-1}B\Big](\bk).
+\end{aligned}
 $$
 
 Each use differs only in the $\bR$-space step between the transforms. On CUDA the kernels hold a tile of k columns in shared memory from the load through both transforms to the store, so each operand is read from device memory once and the result written once. They also unfold the parent-k operator to the full grid inside the load, so no full-k copy of $G$ or $W$ is written.
@@ -88,7 +89,10 @@ Each use differs only in the $\bR$-space step between the transforms. On CUDA th
 One minimax node of the independent-particle response, read from the parent Greens:
 
 $$
-acc[o]\mathrel{+}=\alpha_o\sum_{ab}\overline{\hat G^c_{ab}(\bR)}\,\hat G^v_{ab}(\bR)\quad(+\text{c.c. when } \texttt{complete}),\qquad \hat G(\bR)=F_k^{-1}\big[U_\bk\,G_{{\rm row}(\bk)}\,U_\bk^\dagger\big].
+\begin{aligned}
+acc[o]&\mathrel{+}=\alpha_o\sum_{ab}\overline{\hat G^c_{ab}(\bR)}\,\hat G^v_{ab}(\bR)\quad(+\text{c.c. when } \texttt{complete}),\\
+\hat G(\bR)&=F_k^{-1}\big[U_\bk\,G_{{\rm row}(\bk)}\,U_\bk^\dagger\big].
+\end{aligned}
 $$
 
 For real weights $\overline{G_\bk(\mu,\nu)}=G_\bk(\nu,\mu)$, so the conjugate supplies the reversed endpoint order of the second Green in (1.7). The forward transform is applied once, after the node sum.
@@ -161,8 +165,10 @@ Modes 2–5 also accept complex64 operands on CUDA (both operands the same dtype
 The screened direct term of the BSE matvec, for each trial vector $X$:
 
 $$
-(WX)_{cv\bk}=\frac{1}{N_k}\sum_{\mu\nu ts}\psi^*_{c\bk}(t,\mu)\,\psi_{v\bk}(s,\nu)\sum_{\bk'}W_{\mu\nu}(\bk-\bk')\,T_{\bk'}(t\mu,s\nu),\qquad
-T_{\bk'}(t\mu,s\nu)=\sum_{c'v'}\psi_{c'\bk'}(t,\mu)\,\psi^*_{v'\bk'}(s,\nu)\,X_{c'v'\bk'}.
+\begin{aligned}
+(WX)_{cv\bk}&=\frac{1}{N_k}\sum_{\mu\nu ts}\psi^*_{c\bk}(t,\mu)\,\psi_{v\bk}(s,\nu)\sum_{\bk'}W_{\mu\nu}(\bk-\bk')\,T_{\bk'}(t\mu,s\nu),\\
+T_{\bk'}(t\mu,s\nu)&=\sum_{c'v'}\psi_{c'\bk'}(t,\mu)\,\psi^*_{v'\bk'}(s,\nu)\,X_{c'v'\bk'}.
+\end{aligned}
 $$
 
 `bse.bse_stack_matvec.make_w_term(mesh, nkx, nky, nkz)` returns `w_term(X, psi_c_X, psi_v_Y, W_R)` with `X` `(b, n_c, n_v, nk)` at `P(None,'x','y',None)`, `psi_c_X` `(nk, n_c, n_s, μ)` at `P(None,None,None,'x')`, `psi_v_Y` `(nk, n_v, n_s, ν)` at `P(None,None,None,'y')` and `W_R` `(μ, ν, nkx, nky, nkz)` at `P('x','y',None,None,None)`, already in R space. The body is a `lax.scan` over trials with no collective inside, so one $T$-sized buffer is live regardless of the trial count; one reduce-scatter per trial block finishes it. The W term is chosen at trace time from three routes, the first that serves, and announced once (`[bse] W term:`):

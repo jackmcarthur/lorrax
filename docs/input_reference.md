@@ -57,7 +57,6 @@ The material class is inferred from the WFN occupations; no deck key selects it.
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `fermi_reference` | str | `midgap` | `vbm` or `midgap` on an insulator. On a metal, `mp1_fixed_n` (the fixed-N chemical potential) is required, and it is refused on an insulator. The value is resolved once, in `gw.efermi.resolve_sigma_efermi_ry`, and stamped as `omega_reference_provenance` in `sigma_mnk.h5`. |
 | `occ_smearing_width_ry` | float | unset | The Fermi–Dirac kBT (Ry) of a metal's occupations, f = 1/(1 + exp((E − μ)/kBT)); QE `smearing = 'fd'` matches it at `degauss = kBT`. It is required when the WFN occupations identify a metal and refused when they identify an insulator. It is the one width every metallic occupation solve uses. |
 | `occ_broadening` | float (eV) | `0.0` | First-order Methfessel–Paxton broadening for the smeared QSGW head on an insulator, in BerkeleyGW's convention z = (E − E_F)/(2·occ_broadening); `0` gives step occupations. With `qp_solver = self_consistent` and a head mode in `sc_head_update`, each map solves its own fixed-N table at entry. A value > 0 beside `occ_smearing_width_ry` refuses (`GATE metal_sc_head_update_disabled`). |
 | `occupation_clamp_tol` | float | `1e-8` | Snaps an MP1 occupation within `tol` of 0 or 1 to exactly 0 or 1. It is applied inside the fixed-N root, so μ is solved for the clamped table. Unclamped, the table's support edge is where `exp(−x²)` underflows, `x = 27.2971`, a float64 property; at `1e-8` it is `\|x\| < 4.30834`. The overshoot lobe beyond [0, 1] is never touched. Range [0, 1e-3]; `0` disables it. Fermi–Dirac tables ignore it. It decides which values exist in the table; the branch support (`gw.efermi.band_in_occupation_window`, \|w\| ≥ 10⁻⁵, the retired `occupation_window_threshold`) decides which bands enter a branch; at the default `tol` the clamp only moves values that support already excludes. |
@@ -120,7 +119,6 @@ the QE-schema receipt and the occupied two-component DFT states
 | `screening_method` | str | `minimax` | χ0 frequency treatment. `minimax` is the only value. |
 | `minimax_target_error` | float | `1e-6` | Target error of the χ0 time/frequency quadrature. MPA applies it to the static, imaginary-axis and damped-line samples. |
 | `minimax_max_nodes` | int | `64` | Node cap of one interval minimax solve, and the per-panel Gauss-order cap on an MPA damped line. |
-| `minimax_energy_reference` | str | `midgap` | Energy reference of the minimax transition range: `midgap` or `vbm`. |
 | `mpa_n_poles` | int | `8` | MPA pole count, 1–16; each sampling line carries this many points. |
 | `mpa_sampling_alpha` | int | unset (derived) | Exponent of the nested partition ω_n = ω_m·s_n^α: `1` or `2`. When omitted it is `1` for an insulator and `2` for a metal; the startup report prints the value and its provenance. |
 | `mpa_sampling_schedule` | str | `nested` | Continuation above eight poles: `nested`, or `leon` (the Leon/Yambo qPPS schedule). |

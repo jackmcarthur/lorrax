@@ -302,6 +302,47 @@ def lu_workspace_bytes(mesh, n, dtype) -> int:
                              unit=(int(n) // px + mb) * nb * item).fixed)
 
 
+@lru_cache(maxsize=128)
+def local_lu_workspace(mesh, n, dtype) -> int:
+    """Dynamic scratch of one CUDA JAX GETRF, beside its compiled buffers.
+
+    JAX's scalar LU uses this same legacy cuSOLVER buffer-size query and
+    allocates its result through the FFI scratch allocator. CPU scratch is
+    already in its compiled program; no CUDA library is loaded on that leg.
+    """
+    n = operator.index(n)
+    dtype = np.dtype(dtype)
+    letters = {'float32': 'S', 'float64': 'D', 'complex64': 'C', 'complex128': 'Z'}
+    if not 0 < n <= np.iinfo(np.int32).max or dtype.name not in letters:
+        raise ValueError('local LU workspace needs 0 < n <= INT_MAX and a real/complex floating dtype')
+    platform = mesh_platform(mesh)
+    if platform == 'cpu':
+        return 0
+    if platform != 'CUDA':
+        raise NotImplementedError('local LU workspace query is available on CUDA and CPU')
+    from distrib_la.loader import get_lib
+    letter = letters[dtype.name]
+    lib = get_lib('CUDA')
+    create, destroy = lib.cusolverDnCreate, lib.cusolverDnDestroy
+    create.argtypes, create.restype = [ctypes.POINTER(ctypes.c_void_p)], ctypes.c_int
+    destroy.argtypes, destroy.restype = [ctypes.c_void_p], ctypes.c_int
+    query = getattr(lib, f'cusolverDn{letter}getrf_bufferSize')
+    query.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                      ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+    query.restype = ctypes.c_int
+    handle, size = ctypes.c_void_p(), ctypes.c_int()
+    rc = create(ctypes.byref(handle))
+    if rc:
+        raise RuntimeError(f'cusolverDnCreate failed with status {rc}')
+    try:
+        rc = query(handle, int(n), int(n), None, int(n), ctypes.byref(size))
+        if rc or size.value < 0:
+            raise RuntimeError(f'local LU workspace query failed with status {rc}, n={n}, size={size.value}')
+        return int(size.value) * dtype.itemsize
+    finally:
+        destroy(handle)
+
+
 def lu_workspace_query(mesh, n, nrhs, dtype, cap) -> int:
     """Device bytes per rank the next cuSOLVERMp ``n x nrhs`` solve_lu allocates beside its
     operands with ``cap`` posted (``Plan.chunk_room``): the native size query

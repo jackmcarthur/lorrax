@@ -314,7 +314,7 @@ def eval_sigma_c_at_dft_energies(
     instead, on the band mesh ``mesh_xy``.
 
     ``efermi_ry`` is the reference the Sigma body was built with.
-    None keeps the loader's midgap/VBM ``wfn.efermi`` (the insulating PPM
+    None keeps the loader's midgap ``wfn.efermi`` (the insulating PPM
     convention). A metallic caller MUST pass the same fixed-N mu its body
     used: mixing references samples Sigma at energies shifted by
     (mu - efermi_midgap) — measured +2.79 eV on the sodium deck, showing
@@ -325,7 +325,7 @@ def eval_sigma_c_at_dft_energies(
     provenance falls back to the ``efermi_ry is None`` proxy below, which
     is right for every caller that has not been routed through the
     resolver yet and WRONG for one that has: the proxy labels any explicit
-    reference "fixed-N mu", so an MPA run at ``fermi_reference = midgap``
+    reference "fixed-N mu", so an insulating MPA run (midgap)
     would be stamped as a metal's chemical potential.  Pass it.
 
     Returns ``(sigma_c_at_dft_ev, omega_dft_rel_ev, efermi_dft_ev,

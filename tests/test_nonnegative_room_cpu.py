@@ -74,10 +74,13 @@ def _controls():
     assert not aa.is_deleted() and not bb.is_deleted()
     # A changed live set after route selection also has a strict executable
     # check: fixed whole-matrix scratch cannot be priced as 1/P face storage.
+    linear = original("solve_lu", mesh, backend="distributed", n=2,
+                      batched_route="auto", budget_bytes=64 << 20)
     monkeypatch.setattr(memory, "room", lambda: 0)
     product = jax.jit(lambda a: a @ a, out_shardings=face)
     with pytest.raises(RuntimeError, match="GATE nonnegative_quadratic_capacity"):
-        owner._compile(product, (aa,), mesh, "actual local matrix", whole_matrix=True)
+        owner._principal(mesh, 2, 2, linear, (aa,),
+                         (None, product, None, None, None))
     print(json.dumps(dict(cases=len(errors), max_absolute_error=max(errors),
                           budgets=decisions, output_layout="P(x)",
                           centroid_scale_principal_route_admitted=True,
