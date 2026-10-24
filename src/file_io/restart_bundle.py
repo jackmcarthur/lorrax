@@ -31,7 +31,7 @@ from runtime.padding import (authenticate_axis, authenticate_padded_axis,
 from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSION,
     BAND_WINDOW_CARRIER_DATASET, CHARGE_ZETA_IDENTITY_DATASET,
     COULOMB_POLICY_DATASET, DOWNFOLD_PROVENANCE_GROUP,
-    RESTART_LOGICAL_SHAPE_ATTR, RESTART_PADDED_AXES_ATTR,
+    RESTART_LOGICAL_SHAPE_ATTR, RESTART_CARRIER_SHAPE_ATTR, RESTART_PADDED_AXES_ATTR,
     _decode_charge_zeta_identity, _loaded_band_axis, _validate_shape_receipt,
     coulomb_policy_from_config, compare_coulomb_policy, parse_coulomb_policy,
     format_coulomb_policy)
@@ -714,10 +714,15 @@ def _metadata_band_count(f):
             ds = f[name]
             _validate_shape_receipt(name, ds)
             expected_ndim = 2 if name == "enk_full" else 4
-            if len(ds.shape) != expected_ndim or ds.shape[axis] not in (count, carried):
+            if len(ds.shape) != expected_ndim:
+                raise ValueError(f"Restart dataset {name!r}: expected {expected_ndim} axes, got {ds.shape}.")
+            band_carrier = carried
+            if RESTART_LOGICAL_SHAPE_ATTR in ds.attrs:
+                band_carrier = int(np.asarray(ds.attrs[RESTART_CARRIER_SHAPE_ATTR])[axis])
+            if ds.shape[axis] < count or ds.shape[axis] not in (count, band_carrier):
                 raise ValueError(
                     f"Restart dataset {name!r}: band extent {ds.shape} disagrees "
-                    f"with logical/carrier band counts {count}/{carried}.")
+                    f"with logical/carrier band counts {count}/{band_carrier}.")
             # Current writers trim the disk band axis; earlier schema-2
             # writers may retain its carrier. An explicit axis receipt must
             # agree with the physical window. Appending on another mesh may

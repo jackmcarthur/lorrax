@@ -119,6 +119,28 @@ def test_appended_faces_keep_their_own_producer_padding(monkeypatch, tmp_path):
     assert read_metadata(path)['logical_band_count'] == 5
 
 
+def test_older_retained_append_uses_authenticated_dataset_carrier(monkeypatch, tmp_path):
+    path = _bundle(tmp_path/'retained_portable.h5')
+    with h5py.File(path, 'a') as f:
+        # Before logical-band disk trimming, append could retain another
+        # mesh's band carrier while the original global window stayed put.
+        # Those shape receipts describe storage and authenticate mu padding;
+        # they do not declare the six stored bands to be six physical bands.
+        for name, shape, mu_axis, band_axis in (
+                ('psi_parent_y', (1, 6, 2, 7), 3, 1),
+                ('psi_parent_y_mun', (1, 2, 7, 6), 2, 3)):
+            del f[name]
+            ds = f.create_dataset(name, shape=shape, dtype='c16')
+            producer = list(shape); producer[mu_axis] = 8
+            ds.attrs[RESTART_LOGICAL_SHAPE_ATTR] = shape
+            ds.attrs[RESTART_CARRIER_SHAPE_ATTR] = producer
+            ds.attrs[RESTART_PADDED_AXES_ATTR] = [[mu_axis, 7, 8, 2]]
+        f['psi_parent_y'][0, 4, 0, 0] = 1
+        f['psi_parent_y_mun'][0, 0, 0, 4] = 1
+    _watch_psi(monkeypatch, forbid=True)
+    assert read_metadata(path)['logical_band_count'] == 5
+
+
 def test_legacy_last_populated_band_and_all_zero_fallback_are_bounded(monkeypatch, tmp_path):
     path = _bundle(tmp_path/'legacy.h5', paired=False, receipts=False,
                    logical=8, carrier=8, disk=8, parents=2, mu=131073)
@@ -146,7 +168,7 @@ def test_legacy_last_populated_band_and_all_zero_fallback_are_bounded(monkeypatc
 
 @pytest.mark.parametrize('fault', ['fractional', 'reversed', 'carrier', 'psi_extent',
                                  'energy_extent', 'shape_receipt', 'partial_receipt',
-                                 'band_axis', 'transverse'])
+                                 'band_axis', 'short_carrier', 'transverse'])
 def test_torn_logical_and_storage_receipts_refuse_without_wavefunction_reads(monkeypatch, tmp_path, fault):
     path = _bundle(tmp_path/'bad.h5', transverse=True)
     with h5py.File(path, 'a') as f:
@@ -167,6 +189,11 @@ def test_torn_logical_and_storage_receipts_refuse_without_wavefunction_reads(mon
             f['psi_parent_y'].attrs[RESTART_LOGICAL_SHAPE_ATTR] = [1, 4, 2, 7]
         elif fault == 'partial_receipt':
             del f['psi_parent_y'].attrs[RESTART_LOGICAL_SHAPE_ATTR]
+        elif fault == 'short_carrier':
+            del f['psi_parent_y']
+            ds = f.create_dataset('psi_parent_y', shape=(1, 4, 2, 7), dtype='c16')
+            ds.attrs[RESTART_LOGICAL_SHAPE_ATTR] = ds.shape
+            ds.attrs[RESTART_CARRIER_SHAPE_ATTR] = ds.shape
         else:
             # Self-consistent dataset receipt that contradicts the physical
             # window: declaring eight real bands cannot turn its pad into ψ.
