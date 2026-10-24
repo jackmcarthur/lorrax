@@ -540,24 +540,25 @@ def test_auditor_env_grammar_can_fail():
 
 def test_runtime_env_falsy_reads_blank_as_unset():
     """R6.  ``""`` used to be in ``_FALSY_TOKENS``, so
-    ``export LORRAX_MALLOC_TUNE=`` DISABLED a default-on knob."""
+    ``export LORRAX_MALLOC_TUNE=`` DISABLED a default-on knob (that knob
+    is gone; the check stands on a neutral name)."""
     assert "" not in _runtime._FALSY_TOKENS
     for blank in ("", " ", "\t", "\n"):
-        with _Env(LORRAX_MALLOC_TUNE=blank):
-            assert _runtime._env_falsy("LORRAX_MALLOC_TUNE") is False
-            assert _runtime._env_falsy("LORRAX_MALLOC_TUNE", "0") is True
+        with _Env(LORRAX_TEST_KNOB=blank):
+            assert _runtime._env_falsy("LORRAX_TEST_KNOB") is False
+            assert _runtime._env_falsy("LORRAX_TEST_KNOB", "0") is True
 
 
 def test_runtime_env_falsy_still_honours_real_falsy_tokens():
     """The half of the parser the fix must NOT have broken."""
     for tok in ("0", "off", "OFF", "false", " no ", "No"):
-        with _Env(LORRAX_MALLOC_TUNE=tok):
-            assert _runtime._env_falsy("LORRAX_MALLOC_TUNE") is True, tok
+        with _Env(LORRAX_TEST_KNOB=tok):
+            assert _runtime._env_falsy("LORRAX_TEST_KNOB") is True, tok
     for tok in ("1", "on", "yes", "true"):
-        with _Env(LORRAX_MALLOC_TUNE=tok):
-            assert _runtime._env_falsy("LORRAX_MALLOC_TUNE") is False, tok
-    with _Env(LORRAX_MALLOC_TUNE=None):
-        assert _runtime._env_falsy("LORRAX_MALLOC_TUNE") is False
+        with _Env(LORRAX_TEST_KNOB=tok):
+            assert _runtime._env_falsy("LORRAX_TEST_KNOB") is False, tok
+    with _Env(LORRAX_TEST_KNOB=None):
+        assert _runtime._env_falsy("LORRAX_TEST_KNOB") is False
 
 
 # ===========================================================================

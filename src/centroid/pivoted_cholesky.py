@@ -43,7 +43,6 @@ Spin stays explicit through the projector and vertex contraction owned by
 from __future__ import annotations
 
 import math
-import os
 import threading
 import time
 from functools import lru_cache, partial
@@ -1629,14 +1628,6 @@ def _build_gram_q0_kbatch(
     n_dev_total = mesh_xy.devices.size
     n_x = int(mesh_xy.shape['x']) if 'x' in mesh_xy.axis_names else 1
     n_y = int(mesh_xy.shape['y']) if 'y' in mesh_xy.axis_names else 1
-    # LORRAX_GRAM_COL_BLOCK: historical name, now an explicit square-tile
-    # width; a falsy token
-    # means "no override", i.e. the shape-sized tile below.  This USED to be a
-    # bare presence test — ``=0`` and ``=off`` are the two spellings a user
-    # reaches for to DISABLE a knob, and they did the opposite or crashed.
-    env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
-    if env_cb.lower() in ("", "0", "false", "no", "off"):
-        env_cb = ""
     nk_, _, ns_, M_cols = (int(x) for x in psi_a_rmu_Y.shape)
     del psi_a_rmu_Y
     from runtime.padding import padded_axis
@@ -1645,26 +1636,8 @@ def _build_gram_q0_kbatch(
         specs=((PartitionSpec('x', None), 0),
                (PartitionSpec(None, 'y'), 1))).divisor
     block_source = "fixed tile"
-    if env_cb:
-        block_source = "LORRAX_GRAM_COL_BLOCK override"
-        try:
-            requested_block = int(env_cb)
-            if requested_block <= 0:
-                raise ValueError
-        except ValueError:
-            raise ValueError(
-                f"LORRAX_GRAM_COL_BLOCK={env_cb!r} is neither a positive "
-                f"integer tile width nor a falsy token "
-                f"('', 0, false, no, off)."
-            ) from None
-        # A manual width is rounded UP so the square tile divides BOTH mesh
-        # axes, and capped at the candidate extent.
-        col_block = min(M_cols, padded_axis(
-            max(_GRAM_MIN_COL_BLOCK, requested_block), tile_divisor,
-            name="pivoted-Cholesky column block").carrier)
-    else:
-        col_block = gram_tile_width(nk_, ns_, M_cols, divisor=tile_divisor,
-                                    x_shards=n_x, y_shards=n_y)
+    col_block = gram_tile_width(nk_, ns_, M_cols, divisor=tile_divisor,
+                                x_shards=n_x, y_shards=n_y)
 
     if left_slice is None:
         with timing.section("right.load"):

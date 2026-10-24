@@ -27,9 +27,6 @@ class ArenaPolicy(unittest.TestCase):
         scope=patch('runtime.blas_env.os',SimpleNamespace(environ=self.env))
         scope.start()
         self.addCleanup(scope.stop)
-        scope=patch('runtime.blas_env.env_falsy',return_value=False)
-        scope.start()
-        self.addCleanup(scope.stop)
 
     def test_accelerator_does_not_open_libc(self):
         with patch('ctypes.CDLL', side_effect=AssertionError('unexpected libc open')):
@@ -50,11 +47,6 @@ class ArenaPolicy(unittest.TestCase):
             with self.subTest(values=values), \
                     patch('ctypes.CDLL',side_effect=AssertionError('unexpected libc open')):
                 self.assertFalse(tune_cpu_malloc_arenas('cpu')['applied'])
-
-    def test_existing_malloc_optout(self):
-        with patch('runtime.blas_env.env_falsy',return_value=True), \
-                patch('ctypes.CDLL',side_effect=AssertionError('unexpected libc open')):
-            self.assertFalse(tune_cpu_malloc_arenas('cpu')['applied'])
 
     def test_missing_or_rejecting_glibc(self):
         with patch('ctypes.CDLL',return_value=object()):

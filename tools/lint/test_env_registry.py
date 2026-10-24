@@ -245,9 +245,10 @@ def test_python_scan_sees_the_tree_at_all():
 def test_cpp_scan_sees_the_tree_at_all():
     hits = cpp_read_sites()
     lorrax = [n for n in hits if n.startswith("LORRAX_")]
-    assert len(lorrax) >= 15, (
+    assert len(lorrax) >= 5, (
         "the C++ regex scan found only %d LORRAX_* reads — baseline is "
-        "~28; suspect the regex or the extension list" % len(lorrax))
+        "~7 since the 2026-10 env prune; suspect the regex or the extension "
+        "list" % len(lorrax))
 
 
 # ---------------------------------------------------------------------------

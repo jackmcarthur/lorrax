@@ -200,21 +200,7 @@ inline void scalapack_log_providers_once() {
 //  route and for XLA-adjacent BLAS) is untouched; the previous local
 //  value is restored when the scope closes.
 //
-//  Env: LORRAX_SCALAPACK_MKL_THREADS (values case-insensitive)
-//        unset / "" / "auto" -> min(mkl_get_max_threads(), 4) [measured best]
-//        "0" / "off"         -> leave MKL threading alone (pre-AW behaviour)
-//        <positive integer>  -> pin exactly N inside the handlers
-//        anything else       -> ONE loud stderr line naming the value and
-//                               this grammar, then the "auto" policy.
-//        Rationale (audit fix/zq 2026-07-28): a typo ("Auto", "on", "4x",
-//        a negative number) used to fall through atoi() to 0 == "off",
-//        i.e. silently inherit the global MKL_NUM_THREADS (28 in
-//        production) — the measured-24x-slower configuration this knob
-//        exists to prevent, with a mysteriously slow eigh as the only
-//        symptom.  Doctrine 3/pattern #8: a malformed explicit request
-//        must not silently select the known-bad policy; falling back to
-//        AUTO is the safe direction and the announcement makes it
-//        diagnosable.
+//  Policy: min(mkl_get_max_threads(), 4) inside the handlers [measured best].
 // ---------------------------------------------------------------------------
 // Mechanism (resolver, pin RAII, str_ieq) is shared — see the header note in
 // cpp/common/mkl_thread_pin.h.  These aliases keep every existing
@@ -229,45 +215,10 @@ using mklpin::str_ieq;
 // Threads to pin inside ScaLAPACK handlers; 0 = leave MKL alone.
 inline int scalapack_mkl_threads() {
     static int resolved = [] {
-        const auto auto_policy = [] {
-            auto get_max = mkl_get_max_threads_ptr();
-            if (get_max == nullptr) return 0;  // not MKL — no pin
-            const int cur = get_max();
-            return cur > 4 ? 4 : 0;            // cap only if it would shrink
-        };
-        // Strict full-string grammar via the SHARED parser
-        // (mklpin::parse_thread_knob — the parse used to exist three times,
-        // here + mklblas + mklfft, and had drifted; 2026-07-31 audit).
-        // Only the parse is shared: atoi() previously mapped any typo to
-        // 0 == "off" (the measured-24x-slower policy) and silently accepted
-        // trailing junk ("4x" -> 4).  min 0: "0" == "off" (documented).
-        const char* v = std::getenv("LORRAX_SCALAPACK_MKL_THREADS");
-        const mklpin::ThreadKnob k = mklpin::parse_thread_knob(v, 0, 4096);
-        switch (k.kind) {
-            case mklpin::ThreadKnob::kOff: return 0;
-            case mklpin::ThreadKnob::kInt: return k.value;
-            case mklpin::ThreadKnob::kBad: break;   // announce below
-            case mklpin::ThreadKnob::kAuto:
-            default: return auto_policy();
-        }
-        // Unrecognized value: announce loudly ONCE (this init runs once
-        // per process; rank-scoped since the 2026-07-31 announce-hygiene
-        // pass — one line per JOB, not per rank) and take the safe
-        // direction — AUTO, never "off" (see the grammar note above;
-        // audit fix/zq 2026-07-28).
-        if (mklpin::announce_here()) {
-            std::fprintf(
-                stderr,
-                "*** LORRAX_SCALAPACK_MKL_THREADS='%s' is not a recognized "
-                "value (accepted, case-insensitive: 'auto', 'off', '0', or a "
-                "positive integer <= 4096).  Falling back to 'auto' (cap the "
-                "handler-local MKL team at 4) — NOT to 'off', which would "
-                "silently inherit the global MKL_NUM_THREADS (measured 24x "
-                "slower pzheevd at the 12x12 production grid, workstream AW). "
-                "***\n",
-                v);
-        }
-        return auto_policy();
+        auto get_max = mkl_get_max_threads_ptr();
+        if (get_max == nullptr) return 0;  // not MKL — no pin
+        const int cur = get_max();
+        return cur > 4 ? 4 : 0;            // cap only if it would shrink
     }();
     return resolved;
 }

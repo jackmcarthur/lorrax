@@ -16,7 +16,7 @@ bits), one rank, and integer or boolean operands.
 
 Memory.  The library reduce-scatter writes a ``1/n`` output; the ordered one
 also needs the ``all_to_all`` output, a second buffer the size of the operand.
-Above ``slab_bytes`` (default 8 MiB, ``LORRAX_ORDERED_SLAB_MB``) the operand is
+Above ``slab_bytes`` (8 MiB) the operand is
 reduced in slabs inside a ``fori_loop`` (the all-reduce in place, in the operand's own
 buffer, as the library all-reduce is), so the extra transient is a few slabs whatever
 the operand size.  Every element is still summed ``c[0] + ... +
@@ -59,12 +59,8 @@ _GUARD = {"mode": None}
 
 
 def slab_bytes() -> int:
-    """``LORRAX_ORDERED_SLAB_MB`` (float MiB, default 8; malformed or ``<= 0``: the default)."""
-    try:
-        mb = float(os.environ.get("LORRAX_ORDERED_SLAB_MB", "") or 0)
-    except ValueError:
-        mb = 0.0
-    return int(mb * (1 << 20)) if mb > 0 else DEFAULT_SLAB_BYTES
+    """The slab size of the rank-order reductions (:data:`DEFAULT_SLAB_BYTES`, 8 MiB)."""
+    return DEFAULT_SLAB_BYTES
 
 
 def ordered_transient_bytes() -> int:

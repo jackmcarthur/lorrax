@@ -64,7 +64,7 @@
 // WHAT IS DELIBERATELY *NOT* HERE.  Each family's thread-count POLICY stays
 // in that family, because the policies are genuinely different and the
 // measurements behind them are not transferable:
-//   scalapack  LORRAX_SCALAPACK_MKL_THREADS  cap at 4  (pzheevd starves MPI
+//   scalapack  (fixed policy)                cap at 4  (pzheevd starves MPI
 //                                             progress: 24x at the 12x12 grid)
 //   mklblas    LORRAX_MKLBLAS_THREADS        ambient omp_get_max_threads()
 //   mklfft     LORRAX_FFT_FFI_THREADS        ambient, then pin(1) per member

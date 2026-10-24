@@ -265,7 +265,7 @@ void retire_read_buf(PhdfCtx* ctx);
 
 // After a synchronous read: keep ``read_buf`` for the next read when it is
 // within the per-file bound (32 MiB) or when it fits the process-wide
-// retained budget (``LORRAX_PHDF5_READ_STAGING_RETAIN_MB``, default 256);
+// retained budget (256 MiB);
 // otherwise retire it.  A buffer above the per-file bound used to be
 // retired after every read and re-pinned by the next: the Fe V2 tangential
 // constructor paid 16 x ~50 MB re-pins per run, 0.25 s of handler time on

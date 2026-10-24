@@ -135,27 +135,8 @@ static int team_threads() {
 // 1 MiB L2 — the dimension-by-dimension radix passes of the small 3-D FFT
 // then run in cache and the big tile is streamed ONCE per direction
 // (measured: the strided→strided form, whose radix passes all stream the
-// full tile, ran 2.8× slower single-thread).  LORRAX_FFT_FFI_CHUNK
-// overrides for experiments; the
-// unit gate sweeps it and exercises ragged chunks explicitly.
+// full tile, ran 2.8× slower single-thread).
 static int64_t chunk_elems(int64_t nk) {
-    const char* v = std::getenv("LORRAX_FFT_FFI_CHUNK");
-    if (v && *v) {
-        char* end = nullptr;
-        const long long parsed = std::strtoll(v, &end, 10);
-        if (end != v && *end == '\0' && parsed >= 1 &&
-            parsed <= (1LL << 30)) {
-            return static_cast<int64_t>(parsed);
-        }
-        static std::atomic<bool> warned{false};
-        // Rank-scoped announce (P1.13) — was an every-rank print.
-        if (!warned.exchange(true) && mklpin::announce_here()) {
-            std::fprintf(stderr,
-                         "*** LORRAX_FFT_FFI_CHUNK='%s' unrecognized — using "
-                         "the auto policy. ***\n",
-                         v);
-        }
-    }
     const int64_t c = (512LL * 1024) / (16 * std::max<int64_t>(nk, 1));
     return std::max<int64_t>(c, 64);
 }

@@ -93,31 +93,9 @@ from .pjrt_log_filter import (begin_clean_shutdown_log_filter as
 
 
 # Canonical LORRAX boolean grammar for env knobs — ONE token set, case- and
-# whitespace-insensitive, shared by every knob in this module.  Before the
-# consolidation (release audit 2026-07-28) LORRAX_MALLOC_TUNE,
-# LORRAX_FAILFAST and the (now removed) LORRAX_GLOO_IFNAME check each parsed a
-# different subset, so e.g. LORRAX_MALLOC_TUNE=OFF (or "False", "no", " 0 ")
-# silently left the tuning ENABLED — the falsy-parse bug class this
-# workstream had already fixed once for LORRAX_CHECK_REPLICA.
-#
-# BLANK IS NOT FALSE.  ``""`` used to be in this tuple, which made
-# ``export LORRAX_MALLOC_TUNE=`` DISABLE a default-on knob while every other
-# live vocabulary in the tree — ``ffi/gate.py`` ("unset or whitespace
-# always maps to the gate's declared default"),
-# ``file_io._slab_io_ffi._env_flag`` and ``gw.gw_config.env_bool``
-# (which ``isdf.core`` imports since P1.3) —
-# reads blank as UNSET and returns the knob's default.  A blank export is
-# what a shell leaves behind for an unset variable expansion
-# (``export X=$UNDEFINED``), so under the old rule a harness typo in the
-# variable *name* silently turned the knob off.
-# ONE PARSER (2026-08-22).  This used to be a second grammar with a third
-# behaviour: an UNRECOGNISED token resolved to "not falsy", i.e. it left a
-# default-on knob silently ON while `gw_config.env_bool` and
-# `_slab_io_ffi._env_flag` both resolved the same token to OFF, and none of
-# the three said anything.  `runtime.env_flags` now owns the table and the
-# announcement; this is one negation over it, kept because the call sites
-# here read naturally as "is this turned off" and inverting at each site is
-# how a reader loses which way the default points.
+# whitespace-insensitive, owned by ``runtime.env_flags``.  Blank is UNSET, not
+# false (a blank export is what a shell leaves for an unset expansion), and an
+# unrecognised token is announced.  ``_env_falsy`` is one negation over it.
 from .env_flags import ENV_FALSE as _FALSY_TOKENS   # noqa: F401
 from .env_flags import env_falsy as _env_falsy      # noqa: F401
 
@@ -417,11 +395,8 @@ def install_failfast_excepthook() -> None:
     look like success now looks like a failure.
 
     No-op in single-process runs (normal traceback + rc 1 already works,
-    and ``os._exit`` would suppress useful teardown).  Opt out with
-    ``LORRAX_FAILFAST=0``.
+    and ``os._exit`` would suppress useful teardown).
     """
-    if _env_falsy("LORRAX_FAILFAST"):
-        return
     if _resolve_proc_count() <= 1:
         return
 
@@ -449,7 +424,7 @@ def install_failfast_excepthook() -> None:
             f"*** Exiting rc=1 WITHOUT teardown so this failure reaches "
             f"the job's exit code.  Peer ranks are blocked in a "
             f"collective this rank will never join; srun will now kill "
-            f"the step.  (Disable with LORRAX_FAILFAST=0.)\n\n")
+            f"the step.\n\n")
         # Production drivers intentionally route ordinary ``sys.stdout`` to
         # /dev/null.  Ask that runtime boundary for the original launcher
         # stream so the redundant stdout copy remains real; this is lazy to
@@ -1157,8 +1132,6 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
        the clock.  A run on a real GPU node NEVER reaches arm 2: the device
        nodes exist, and the CUDA driver cannot work without them.
 
-    Opt out with ``LORRAX_CPU_SKIP_GPU_PLUGINS=0``; the opt-out announces
-    itself, because "startup got a minute slower" is otherwise invisible.
     """
     plat = os.environ.get("JAX_PLATFORMS", "").strip().lower()
     plats = [p.strip() for p in plat.split(",") if p.strip()]
@@ -1186,21 +1159,6 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
         # No platform stated at all, or a GPU is stated and present: leave
         # jax's discovery exactly as it is.  Guessing here would be the one
         # way this function could cost someone a GPU.
-        return False
-
-    if _env_falsy("LORRAX_CPU_SKIP_GPU_PLUGINS"):
-        _record_demotion(
-            "LORRAX_CPU_SKIP_GPU_PLUGINS is off, so jax discovered and "
-            "loaded the CUDA PJRT plugin on this CPU-only run, which "
-            "measured 76.9 s of extra cold start on a Frontera node "
-            "(job 7882076).")
-        if announce:
-            _gpu_plugin_say(
-                "[runtime] LORRAX_CPU_SKIP_GPU_PLUGINS=0: jax will discover "
-                "and load the CUDA PJRT plugin on this CPU-only run.  "
-                "Measured cost of loading it on a cold Frontera node: 76.9 s "
-                "(job 7882076, cell c4_knob0 -- 10.5 s to this line, 87.4 s to "
-                "cuInit failing).")
         return False
 
     import sys
@@ -1257,13 +1215,12 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
     _record_demotion(
         f"GPU PJRT plugin discovery was skipped ({arm}), so no CUDA library "
         f"was loaded; the measured saving on a cold Frontera node is 76.9 s "
-        f"(job 7882076), and LORRAX_CPU_SKIP_GPU_PLUGINS=0 restores it.")
+        f"(job 7882076).")
     if announce:
         _gpu_plugin_say(
             f"[runtime] {arm}: skipping GPU PJRT plugin discovery (no CUDA "
             f"libraries are loaded; measured 76.9 s of cold start on "
-            f"Frontera, job 7882076).  LORRAX_CPU_SKIP_GPU_PLUGINS=0 "
-            f"restores it.")
+            f"Frontera, job 7882076).")
     if plats != ["cpu"]:
         # Arm 2: this IS the CPU demotion, taken early.  Do the rest of what
         # fallback_to_cpu_if_no_gpu_backend() does on demotion, so the run's
@@ -1293,7 +1250,7 @@ def tune_blas_threading() -> bool:
     ``tests/test_runtime_blas_env.py`` holds that order.  A copy mapped
     before (numpy imported first) cannot be tuned in-process: GATE blas_spin
     in :func:`bootstrap` refuses that process unless the launch exported the
-    variable or ``LORRAX_BLAS_TUNE=0`` declines the tuning.
+    variable.
 
     WHY, the cost, and the per-library witness: ``runtime.blas_env``.
     """
@@ -1339,29 +1296,14 @@ def tune_glibc_malloc() -> bool:
     within noise (~4% on the r-chunk wall at 40 nodes), and steady-state RSS
     dropped 2.3 -> 1.7 GB/rank as a bonus.
 
-    Knobs: ``LORRAX_MALLOC_TUNE=0`` disables; ``LORRAX_MALLOC_MMAP_MB`` /
-    ``LORRAX_MALLOC_TRIM_MB`` override the thresholds (MB).
+    Thresholds: ``M_MMAP_THRESHOLD`` 1 MiB, ``M_TRIM_THRESHOLD`` 128 MiB.
     """
-    if _env_falsy("LORRAX_MALLOC_TUNE"):
-        _MALLOC_TUNE.update(applied=False,
-                            reason="disabled by LORRAX_MALLOC_TUNE")
-        _record_demotion(
-            "glibc malloc tuning is DISABLED by LORRAX_MALLOC_TUNE, so long "
-            "XLA:CPU runs regain the per-r-chunk RSS ramp that OOM-killed "
-            "jobs 7874803, 7875070 and 7875071 (workstream T).")
-        if _resolve_proc_id() == 0:
-            print("[runtime] glibc malloc tuning DISABLED by "
-                  "LORRAX_MALLOC_TUNE: long XLA:CPU runs regain the "
-                  "per-r-chunk RSS ramp this tuning removes (workstream T).",
-                  flush=True)
-        return False
     reason = None
     mmap_mb = trim_mb = None
     try:
         import ctypes
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        mmap_mb = int(os.environ.get("LORRAX_MALLOC_MMAP_MB", "1"))
-        trim_mb = int(os.environ.get("LORRAX_MALLOC_TRIM_MB", "128"))
+        mmap_mb, trim_mb = 1, 128
         ok = libc.mallopt(_M_MMAP_THRESHOLD, mmap_mb * 1024 * 1024)
         ok &= libc.mallopt(_M_TRIM_THRESHOLD, trim_mb * 1024 * 1024)
         if not ok:
@@ -2748,8 +2690,8 @@ def default_blas_threads() -> str | None:
     Tempting, and why not: "all available threads" -- that is what unset
     means, and it is the slow case; or setting OMP_NUM_THREADS here too --
     OpenMP runtimes already initialised in the FFI handlers do not re-read
-    it, and the handlers have their own caps (LORRAX_MKLBLAS_THREADS,
-    LORRAX_SCALAPACK_MKL_THREADS).
+    it, and the handlers have their own caps (LORRAX_MKLBLAS_THREADS, and
+    the ScaLAPACK handlers' fixed cap of 4).
     """
     if _BLAS_AUTO:
         return _BLAS_AUTO[0]
@@ -2848,8 +2790,6 @@ def _thread_env() -> dict:
         "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS"),
         "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS"),
         "LORRAX_MKLBLAS_THREADS": os.environ.get("LORRAX_MKLBLAS_THREADS"),
-        "LORRAX_SCALAPACK_MKL_THREADS": os.environ.get(
-            "LORRAX_SCALAPACK_MKL_THREADS"),
     }
 
 
@@ -3232,7 +3172,6 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
     f["blas_tune"] = dict(_BLAS_TUNE)
     import sys as _sys
     f["failfast"] = bool(getattr(_sys, "_lorrax_failfast_installed", False))
-    f["failfast_env"] = os.environ.get("LORRAX_FAILFAST")
     return f
 
 
@@ -3562,9 +3501,7 @@ def format_startup_report(f: dict) -> list:
     add(f"  Inside the FFI handlers the BLAS team size is "
         f"LORRAX_MKLBLAS_THREADS={t.get('LORRAX_MKLBLAS_THREADS')!r} for the "
         f"batched GEMM, where unset means the ambient thread count, and "
-        f"LORRAX_SCALAPACK_MKL_THREADS="
-        f"{t.get('LORRAX_SCALAPACK_MKL_THREADS')!r} for the ScaLAPACK "
-        f"handlers, where unset means a cap of 4 because pzheevd measured "
+        f"a cap of 4 for the ScaLAPACK handlers, because pzheevd measured "
         f"11.28 s per q at 14 MKL threads against 0.463 s at 4.")
     aff = t.get("affinity")
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
@@ -3623,9 +3560,8 @@ def format_startup_report(f: dict) -> list:
             "leaving its peers blocked in a collective that rank will never "
             "join.")
     elif P > 1:
-        add(f"  WARNING: the fail-fast excepthook is NOT installed "
-            f"(LORRAX_FAILFAST={f.get('failfast_env')!r}), so a rank that "
-            f"dies can leave the job hanging and still exit rc=0.")
+        add("  WARNING: the fail-fast excepthook is NOT installed, so a "
+            "rank that dies can leave the job hanging and still exit rc=0.")
     else:
         add("  The fail-fast excepthook is not installed because a "
             "single-process run already fails with a traceback and rc=1.")

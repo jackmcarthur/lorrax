@@ -117,9 +117,8 @@ def env_bool(name: str, default: bool, *, print_fn=print) -> bool:
 def env_falsy(name: str, default: str = "1", *, print_fn=print) -> bool:
     """True when knob ``name`` reads as OFF.  The inverse spelling.
 
-    ``runtime`` has several knobs whose call sites read naturally as *"is
-    this turned off"* (``LORRAX_MALLOC_TUNE``, ``LORRAX_CPU_SKIP_GPU_PLUGINS``)
-    and inverting at each site is how a reader loses track of which
+    Some knobs' call sites read naturally as *"is this turned off"* (a
+    default-on knob) and inverting at each site is how a reader loses track of which
     direction the default points.  This is one negation over
     :func:`env_bool`, not a second grammar — which is the whole point:
     before 2026-08-22 it was a second grammar, and an unrecognised token

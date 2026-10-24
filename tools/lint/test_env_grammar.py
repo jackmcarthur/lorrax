@@ -479,20 +479,21 @@ def test_defect2_malloc_trim_off_disables_trim():
 
 
 def test_defect2_agrees_with_its_documented_sibling():
-    """MALLOC_TRIM and MALLOC_TUNE must answer the same for every token.
+    """``env_bool`` and ``runtime._env_falsy`` must answer the same for every token.
 
-    They are advertised as a pair in ``docs/reference/env_vars.md``; the
-    defect was that only one of them honoured ``OFF``.
+    The defect was that one of a documented pair of knobs (both since
+    removed) honoured ``OFF`` and the other did not; the check stands on a
+    neutral name.
     """
     for tok in FALSE_SPELLINGS + TRUE_SPELLINGS:
-        with _Env(LORRAX_MALLOC_TRIM=tok, LORRAX_MALLOC_TUNE=tok):
-            trim = gw_config.env_bool("LORRAX_MALLOC_TRIM", True)
-            tune = not _runtime._env_falsy("LORRAX_MALLOC_TUNE")
-            assert trim is tune, (
-                "%r: MALLOC_TRIM=%s but MALLOC_TUNE=%s" % (tok, trim, tune))
-    with _Env(LORRAX_MALLOC_TRIM=None, LORRAX_MALLOC_TUNE=None):
-        assert gw_config.env_bool("LORRAX_MALLOC_TRIM", True) is True
-        assert _runtime._env_falsy("LORRAX_MALLOC_TUNE") is False
+        with _Env(LORRAX_TEST_KNOB=tok):
+            on = gw_config.env_bool("LORRAX_TEST_KNOB", True)
+            not_off = not _runtime._env_falsy("LORRAX_TEST_KNOB")
+            assert on is not_off, (
+                "%r: env_bool=%s but not env_falsy=%s" % (tok, on, not_off))
+    with _Env(LORRAX_TEST_KNOB=None):
+        assert gw_config.env_bool("LORRAX_TEST_KNOB", True) is True
+        assert _runtime._env_falsy("LORRAX_TEST_KNOB") is False
 
 
 def test_blank_is_unset_in_every_vocabulary_including_runtime():
