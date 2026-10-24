@@ -1,7 +1,7 @@
 # Perlmutter (NERSC)
 
 This page installs LORRAX on NERSC Perlmutter, the reference platform (4×A100
-GPU nodes, CUDA 13.2, JAX 0.9.1). There are two routes. A **clone** works on
+GPU nodes, CUDA 13.2, JAX 0.12.0.1). There are two routes. A **clone** works on
 any NERSC account: you build the native pair yourself and run with plain
 `srun`; use it for development. A **module** is one prebuilt venv, source
 snapshot and sealed FFI bundle that users load with `module load`; it is the
@@ -85,7 +85,7 @@ build.
 - the staged cuSOLVERMp 0.9.1 and cuBLASMp 0.10;
 - the cuBLAS, cuSOLVER, cuFFT and CUDA runtime files that the venv's JAX
   plugin loads (the `nvidia-*-cu13` wheels);
-- NCCL: the `nvidia-nccl-cu13` 2.30.7 wheel (the `uv.lock` pin), on every
+- NCCL: the `nvidia-nccl-cu13` 2.32.3 wheel (the `uv.lock` pin), on every
   route. The CUDA leg compiles and links against it, and `build_ffi_cuda.sh`
   refuses another wheel version or a record whose NCCL is not that wheel. The
   HPC SDK's `comm_libs` NCCL (2.29.3) is never used;
@@ -177,7 +177,7 @@ The module sets:
 
 The bundle's manifest carries each leg's dependency closure. Its libraries
 are the toolkit's CUDA math files (the module venv has no CUDA math wheels),
-the venv's `nvidia-nccl-cu13` 2.30.7 wheel (the same NCCL as a clone), the
+the venv's `nvidia-nccl-cu13` 2.32.3 wheel (the same NCCL as a clone), the
 sealed cuSOLVERMp/cuBLASMp copies, and the pinned MPI and HDF5. Every start-up enforces that closure exactly as for a clone
 ([the dependency closure](ffi-build.md#closure)). The module's
 `LD_LIBRARY_PATH` serves JAX and the external system libraries; it cannot
@@ -196,9 +196,9 @@ The recipe is `config/perlmutter/module/`; it works for any install prefix.
 | what | pinned in |
 |---|---|
 | Python 3.12 (uv-managed, under the prefix), `cudatoolkit/13.2` (nvcc; no library at run time) | `module/stack.sh` |
-| every Python package, the CUDA wheels included (JAX 0.9.1 `cuda13`, cuBLAS, cuFFT, cuSOLVER, cuSPARSE, CUDA runtime, NVRTC, cuDNN, nvidia-mathdx): the clone's set | the checkout's `uv.lock`, extra `cuda13` |
+| every Python package, the CUDA wheels included (JAX 0.12.0.1 `cuda13`, cuBLAS, cuFFT, cuSOLVER, cuSPARSE, CUDA runtime, NVRTC, cuDNN, nvidia-mathdx): the clone's set | the checkout's `uv.lock`, extra `cuda13` |
 | cuSOLVERMp, cuBLASMp | `build_ffi_cuda.sh` (repeated in `stack.sh`) |
-| NCCL: `nvidia-nccl-cu13` 2.30.7 (the clone's `uv.lock` pin) | `build_ffi_cuda.sh`, `stack.sh` |
+| NCCL: `nvidia-nccl-cu13` 2.32.3 (the clone's `uv.lock` pin) | `build_ffi_cuda.sh`, `stack.sh` |
 | Cray MPICH, LibSci | `ffi_mpi.sh` |
 | parallel HDF5 | `build_ffi_cuda.sh`, `build_ffi_host.sh` |
 

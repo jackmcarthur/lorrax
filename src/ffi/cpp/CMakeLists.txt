@@ -22,6 +22,12 @@ cmake_minimum_required(VERSION 3.22)
 # ============================================================================
 set(LORRAX_FFI_PLATFORM "" CACHE STRING
     "Which FFI library to configure: cuda | host | rocm (REQUIRED, no default)")
+# Site paths for a CMakePresets.json preset (config/<site>/ffi_site.cmake).
+set(LORRAX_SITE_FILE "" CACHE FILEPATH "Per-site library paths, included before configuring")
+if(LORRAX_SITE_FILE)
+    include("${LORRAX_SITE_FILE}")
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/LorraxPostBuild.cmake")
 
 if(LORRAX_FFI_PLATFORM STREQUAL "cuda")
 # ============================== CUDA leg ====================================
@@ -692,6 +698,17 @@ message(STATUS "  CUDART     = ${CUDART_LIBRARY}")
 message(STATUS "  HDF5       = ${HDF5_LIBRARIES}")
 message(STATUS "  MPI        = ${LORRAX_MPI_LIBRARY}")
 
+# The cuSOLVERMp/cuBLASMp stage is the engine-private set; NCCL is the JAX
+# plugin's (a process library, never preloaded).
+get_filename_component(_nccl_dir "${NCCL_LIBRARY}" REALPATH)
+get_filename_component(_nccl_dir "${_nccl_dir}" DIRECTORY)
+lorrax_leg_post_build(lorrax_ffi cuda
+    PRIVATE_DIRS "${CUSOLVERMP_LIBDIR}"
+    PROCESS_DIRS "${_nccl_dir}"
+    LINKED ${HDF5_LIBRARIES} "${LORRAX_MPI_LIBRARY}" "${CUDART_LIBRARY}"
+           "${CUSOLVER_LIBRARY}" "${CUBLAS_LIBRARY}" "${CUFFT_LIBRARY}"
+           "${NVRTC_LIBRARY}")
+
 elseif(LORRAX_FFI_PLATFORM STREQUAL "host")
 # ============================== host leg ====================================
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LorraxParallelHdf5.cmake")
@@ -1308,6 +1325,8 @@ target_link_options(lorrax_ffi_host PRIVATE
     "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports_host.map")
 set_property(TARGET lorrax_ffi_host APPEND PROPERTY
     LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exports_host.map")
+
+lorrax_leg_post_build(lorrax_ffi_host host LINKED ${_host_link_libs})
 
 message(STATUS "lorrax_ffi_host will build sources:")
 foreach(_s ${LORRAX_FFI_HOST_SOURCES})

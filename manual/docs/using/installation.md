@@ -101,7 +101,7 @@ Not used on Perlmutter: the site Python or conda (uv installs its own CPython 3.
 | Component | Version | How |
 |---|---|---|
 | JAX, jaxlib, the CUDA 13 plugin and PJRT | 0.12.0.1 | `uv sync --extra cuda13`, from `uv.lock` |
-| CUDA runtime libraries | `nvidia-cublas` 13.6, `nvidia-cufft` 12.3, `nvidia-cusolver` 12.2, `nvidia-cuda-runtime` 13.3, `nvidia-nccl-cu13` 2.30.7 | the same `uv sync`; these, not the toolkit's copies, are what runs |
+| CUDA runtime libraries | `nvidia-cublas` 13.8, `nvidia-cufft` 12.4, `nvidia-cusolver` 12.3, `nvidia-cuda-runtime` 13.4, `nvidia-nccl-cu13` 2.32.3 | the same `uv sync`; these, not the toolkit's copies, are what runs |
 | cuFFTDx headers | `nvidia-mathdx==25.6.0` | the same `uv sync`; the k-convolution kernels are compiled from them at run time |
 | cuSOLVERMp, cuBLASMp | `nvidia-cusolvermp-cu13==0.9.1.9318.post1`, `nvidia-cublasmp-cu13==0.10.0.3695` | `build_ffi_cuda.sh` installs the wheels with `uv pip install --no-deps --target <clone>/.build/cusolvermp-<ver>/` and links against them |
 | h5py | 3.16, the PyPI wheel with its own serial HDF5 | small serial files; every parallel read and write goes through the FFI's parallel-HDF5 handlers, so h5py is **not** built against the site HDF5 |

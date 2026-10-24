@@ -33,6 +33,7 @@ done
 
 "$CMAKE" --fresh -S "$SRC" -B "$LORRAX_LOCAL_BUILD" -G Ninja \
     -DLORRAX_FFI_PLATFORM=cuda \
+    -DLORRAX_FFI_POST_BUILD=OFF \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_MAKE_PROGRAM="$LORRAX_LOCAL_ENV/bin/ninja" \
     -DCMAKE_C_COMPILER="$(command -v gcc)" \

@@ -77,10 +77,17 @@ docs = [
 # cuFFTDx kernels at run time from this wheel's headers (header-only, no
 # binaries, no dependencies).  A CUDA run without it refuses at startup
 # (GATE mathdx-headers).  Pinned to the version the kernels were validated on.
+#
+# cuSOLVERMp / cuBLASMp (cuda13 only): the CUDA leg's distributed eigh/LU
+# engines, which config/perlmutter/build_ffi_cuda.sh compiles and links against
+# and whose files the leg's closure record names.  Pinned exactly: the leg is
+# built and validated against these, and build_ffi_cuda.sh asserts them.
 cuda12 = ["jax[cuda12]>=0.12.0,<0.13.0",
           "nvidia-mathdx==25.6.0; sys_platform == 'linux'"]
 cuda13 = ["jax[cuda13]>=0.12.0,<0.13.0",
-          "nvidia-mathdx==25.6.0; sys_platform == 'linux'"]
+          "nvidia-mathdx==25.6.0; sys_platform == 'linux'",
+          "nvidia-cusolvermp-cu13==0.9.1.9318.post1; sys_platform == 'linux'",
+          "nvidia-cublasmp-cu13==0.10.0.3695; sys_platform == 'linux'"]
 
 [project.scripts]
 lorrax-gw = "gw.gw_jax:main"

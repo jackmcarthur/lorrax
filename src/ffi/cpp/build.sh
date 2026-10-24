@@ -166,6 +166,7 @@ fi
 
 cmake "${SCRIPT_DIR}" \
     -DLORRAX_FFI_PLATFORM=cuda \
+    -DLORRAX_FFI_POST_BUILD=OFF \
     -DCMAKE_BUILD_TYPE=Release \
     -DPython3_EXECUTABLE="${PYTHON_EXE}" \
     -DNVHPC_ROOT="${NVHPC_ROOT}" \
