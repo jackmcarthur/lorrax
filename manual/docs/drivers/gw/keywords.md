@@ -526,7 +526,7 @@ Per-device memory budget for the chunk planners, in GB. `0` detects it.
 ### `linalg` {: .kw data-type="enum" data-default="local" }
 Layout of the dense solves (ζ, the $W$ Dyson solve, eigensolvers).
 
-`local` keeps whole $N_\mu \times N_\mu$ matrices per task; `distributed` block-distributes them. Changes no result and does not invalidate a restart.
+`local` requests whole-parent W solves and automatic eigensolvers; capacity-aware stages may use a whole-mesh provider when a local matrix does not fit. `distributed` requests the platform's distributed profile, subject to its available providers and size/room policy. Read the selected per-stage route; see [cluster linear algebra](../../using/clusters.md#linalg). Changes no scientific model and does not invalidate a restart.
 {: .kw-details }
 
 `local` `distributed`

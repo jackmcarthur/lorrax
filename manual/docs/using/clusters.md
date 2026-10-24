@@ -57,7 +57,7 @@ Use the packed centroid extent and the resolved band carrier in these estimates.
 
 The full output of a stage, its current input fields and one compiled work arena can overlap. Their simultaneous residency matters more than a sum of unrelated stage peaks. A pool reservation, pool-used high-water, live-buffer count and host RSS are different measurements; retain their labels when comparing runs.
 
-Automatic row streaming bounds a Green's-function or convolution intermediate while preserving the full band sum. It does not reduce the scientific band window, centroid basis or k grid, and a full operator output can remain quadratic in $N_\mu$. Many small band dot products would discard the dense matrix-multiply structure and can repeat communication. The useful stream axis is the large centroid-row intermediate; band and transfer staging remain separate concerns.
+Automatic row streaming bounds a Green's-function or convolution intermediate while preserving the full band sum. It does not reduce the scientific band window, centroid basis or k grid, and a full operator output can remain quadratic in $N_\mu$. Orbit ownership can impose a minimum row block; the actual outputs and minimum block still enter admission. Many small band dot products would discard the dense matrix-multiply structure and can repeat communication. The useful stream axis is the large centroid-row intermediate; band and transfer staging remain separate concerns.
 
 ### Choosing the first job {: #first-job }
 
@@ -67,7 +67,9 @@ The table below records the **smallest completed measurement in the published ev
 
 ## Local or distributed linear algebra {: #linalg }
 
-The deck key `linalg` (default `local`) requests the layout of dense solves. Under `local` each GPU solves whole $N_\mu\times N_\mu$ matrices for its share of the irreducible q points, with no distributed factorization. On CUDA, `distributed` can factor each matrix over the whole mesh through cuSOLVERMp, dividing its leading storage by $P$ while communicating inside every factorization. Provider availability differs by platform: Frontier currently has whole-matrix ROCm LU, while its ELPA eigensolver can use the whole mesh.
+The deck key `linalg` (default `local`) requests an execution preference. `local` requests the whole-parent W solve and automatic eigensolvers; capacity-aware calls can use a whole-mesh provider when their local matrices do not fit. In particular, the charge-factor eigensolver passes its available room to the shared planner. `distributed` requests the platform's distributed profile, whose size/room policy may still choose a whole-matrix route when appropriate. Read the selected provider and route for each stage.
+
+On CUDA, cuSOLVERMp can factor a matrix over the mesh, dividing its leading storage by $P$ while communicating during the factorization. Provider availability differs by platform: Frontier currently has whole-matrix ROCm LU, while its ELPA eigensolver can use the whole mesh. A `local` deck therefore does not establish that every factorization ran on one GPU, and a `distributed` deck does not establish that every platform has distributed LU.
 
 `local` is a request, not a guarantee. For a W Dyson batch of $Q$ stored q rows, the local-route model includes the face-tiled V, χ and W plus whole copies for $\lceil Q/P\rceil$ q points and one LU pair,
 
