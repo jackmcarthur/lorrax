@@ -8,7 +8,7 @@ which also gives the `srun` lines for a clone and a module); JAX and the GPU
 memory pool are in the [environment overview](../overview.md#gpu-pool).
 
 Perlmutter's GPU nodes carry four A100 40 GB or 80 GB cards; LORRAX runs
-there bare-host on CUDA 13.2 with JAX and JAXLIB 0.9.1. Certified scope: GPU
+there bare-host on CUDA 13.2 with JAX and JAXLIB 0.12.0.1. Certified scope: GPU
 runs on 1–4 nodes × 4 A100 at P = 4 and P = 16; CPU runs with `impl=mpi` on
 the Milan nodes (Cray MPICH 9.0.1), with collective exactness at P = 4 (one
 and two nodes) and P = 16 (four nodes), and a P = 4 GN-PPM GW run matching
@@ -116,7 +116,7 @@ srun --jobid=$JOBID -N 2 -n 4 -c 16 --threads-per-core=1 --cpu-bind=threads bash
   set -euo pipefail
   export OMP_NUM_THREADS=14
   . "$LORRAX_CHECKOUT/config/perlmutter/cpu_mpi_env.sh"
-  python3 -u "$LORRAX_CHECKOUT/tools/require_jax09.py"
+  python3 -u "$LORRAX_CHECKOUT/tools/require_jax.py"
   python3 -u -m gw.gw_jax -i gw.in'
 ```
 

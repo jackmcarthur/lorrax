@@ -21,7 +21,7 @@ HOW TO RUN IT (Perlmutter; needs a GPU node and BOTH pins):
     lx run -G 1 -n 1 env \
         LORRAX_FFI_SO=<device .so> LORRAX_FFI_HOST_SO=<host .so> \
         PROBE_DIR=<scratch dir> \
-        bash -c 'tools/require_jax09.py && \
+        bash -c 'tools/require_jax.py && \
                  python3 -u src/ffi/cpp/gate_one_odr.py'
 
 `JAX_PLATFORMS=cuda,cpu` is the whole setup, and `runtime.set_default_env`

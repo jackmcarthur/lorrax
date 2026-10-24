@@ -2,7 +2,7 @@
 
 This lane builds and runs LORRAX on one Ubuntu machine with an NVIDIA driver: a workstation, a laptop under WSL2, or a rented single-node GPU box. Everything comes from pip wheels except two things the machine provides, the kernel driver and the distro OpenMPI. `jax[cuda13]` installs the whole CUDA 13 userspace, `nvcc` included, into `site-packages/nvidia/cu13`, and that prefix serves as the CUDA toolkit root. Parallel HDF5 is built once from source, because Ubuntu's packaged HDF5 (1.10) is below the 1.12 floor of [Building the FFI libraries](../../docs/installation/ffi-build.md).
 
-The pins match the Perlmutter lane (JAX 0.9.1, cuSOLVERMp 0.9.1, CUDA 13). They live in `stack.sh`, which every script sources.
+The pins match the Perlmutter lane (JAX 0.12.0.1, cuSOLVERMp 0.9.1, CUDA 13). They live in `stack.sh`, which every script sources.
 
 ## Requirements
 

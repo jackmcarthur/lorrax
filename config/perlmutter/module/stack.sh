@@ -48,7 +48,7 @@ MODULE_VERSION="${LORRAX_MODULE_VERSION:-0.1.0}"
 # --- pins --------------------------------------------------------------------
 PYTHON_VERSION="3.12"
 TOOLKIT_MODULE="cudatoolkit/13.2"
-JAX_VERSION="0.9.1"                  # asserted against the lock by setup_env.sh
+JAX_VERSION="0.12.0.1"               # asserted against the lock by setup_env.sh
 LOCK_EXTRA="cuda13"                  # the extra a clone syncs (uv sync --extra cuda13)
 CUSOLVERMP_VERSION="0.9.1.9318.post1" # also pinned in ../build_ffi_cuda.sh
 CUBLASMP_VERSION="0.10.0.3695"        # also pinned in ../build_ffi_cuda.sh

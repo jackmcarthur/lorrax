@@ -90,6 +90,14 @@ def mark_varying(x, axes):
     from jax import lax
     return lax.pcast(x, axes, to="varying")
 
+
+def varying_axes(x):
+    """The mesh axes ``x`` is device-varying over inside ``shard_map`` (empty
+    outside one): ``jax.typeof(x).manual_axis_type.varying`` (JAX 0.10 removed
+    ``ShapedArray.vma``, which held the same set)."""
+    import jax
+    return frozenset(jax.typeof(x).manual_axis_type.varying)
+
 __all__ = [
     # gate
     "Gate", "MODE_SPELLINGS", "MODE_HELP", "FFI_PLATFORM_MAP",
@@ -100,7 +108,7 @@ __all__ = [
     "unknown_target", "not_loadable", "missing_symbol",
     # JAX utilities
     "device_put_process_local", "device_put_process_local_cached",
-    "device_put_process_tiles", "placement_cache_stats", "mark_varying",
+    "device_put_process_tiles", "placement_cache_stats", "mark_varying", "varying_axes",
     "ordered_psum", "ordered_psum_scatter", "ordered_reduce", "ordered_sum", "ordered_norm",
     "ordered_transient_bytes", "install_reduction_guard",
     "install_reduction_guard_from_env", "reduction_trace",

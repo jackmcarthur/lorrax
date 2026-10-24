@@ -123,7 +123,7 @@ from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from jax import shard_map as _shard_map_fn
-from lxkit import mark_varying
+from lxkit import mark_varying, varying_axes
 from lxkit import ordered_psum
 
 from common.contract_bands import reduce_scatter_to_band_block
@@ -717,7 +717,7 @@ def _rank_partial(A):
     The custom call's result carries only the varying axes jax infers for it (the XLA route
     gets 'x' from the einsum with ψ^X_c), so the missing ones are declared here.
     """
-    have = getattr(getattr(jax, "typeof", lambda a: None)(A), "vma", None) or frozenset()
+    have = varying_axes(A)
     miss = tuple(a for a in ("x", "y") if a not in have)
     return mark_varying(A, miss) if miss else A
 

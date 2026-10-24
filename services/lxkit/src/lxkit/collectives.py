@@ -195,21 +195,12 @@ def ordered_psum_scatter(x, axis_name, *, scatter_dimension: int = 0, tiled: boo
 
 
 def _all_gather_invariant(part, axis_name):
-    """Tiled all_gather typed invariant over ``axis_name`` (jax's ``all_gather_invariant``;
-    without it, the exact one-owner psum of the gathered value)."""
+    """Tiled all_gather typed invariant over ``axis_name``: one gather, no extra collective."""
     from jax import lax
-    try:
-        from jax._src.lax.parallel import all_gather_invariant
-    except ImportError:                                  # pragma: no cover - older/newer jax
-        import jax.numpy as jnp
-        full = lax.all_gather(part, axis_name, tiled=True)
-        return lax.psum(jnp.where(lax.axis_index(axis_name) == 0, full, jnp.zeros((), full.dtype)),
-                        axis_name)  # exact-reduce: one owner (rank 0), zeros elsewhere
-    return all_gather_invariant(part, axis_name, tiled=True)
+    return lax.all_gather(part, axis_name, tiled=True, to="invarying")
 
 
 def _ordered_psum_leaf(x, axis_name, slab):
-    import jax
     import jax.numpy as jnp
     from jax import lax
     x = jnp.asarray(x)
@@ -222,8 +213,9 @@ def _ordered_psum_leaf(x, axis_name, slab):
     # Under shard_map(check_vma=True) lax.psum's result is replicated (invariant) over
     # axis_name; an all_gather's is typed varying.  Match psum's type where the operand
     # varies over the reduced axes (out_specs=P() would refuse otherwise).
+    from lxkit import varying_axes
     names = axis_name if isinstance(axis_name, (tuple, list)) else (axis_name,)
-    invariant = bool(set(names) & set(getattr(jax.typeof(x), "vma", ()) or ()))
+    invariant = bool(set(names) & varying_axes(x))
     if L * item <= slab or L < 2 * n:
         pad = (-L) % n
         if pad:

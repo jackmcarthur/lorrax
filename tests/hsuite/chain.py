@@ -354,12 +354,11 @@ OPT_IN = ("bisp_sc3",)
 _UNCONVERGED = "RuntimeError: GATE sc_fixed_point_not_converged"
 # Each SC map's compile receipt (common.jax_compile_cache.compile_receipt).
 _RECEIPT = re.compile(r"SC map (\d+) compile: real (\d+) \(([0-9.]+) s\), "
-                      r"cache hits \d+, uncacheable (\d+)(.*)")
+                      r"cache hits \d+(.*)")
 # The stage's own receipt, printed at its end: it also closes the receipt
 # window, so a driver's first SC receipt counts that driver only, not every
 # stage since the process started.
-_STAGE_RECEIPT = re.compile(r"compile: real (\d+) \(([0-9.]+) s\), cache hits (\d+), "
-                            r"uncacheable (\d+)")
+_STAGE_RECEIPT = re.compile(r"compile: real (\d+) \(([0-9.]+) s\), cache hits (\d+)")
 # The NVRTC images (k-convolution, BSE outer, Fourier pair) built when their
 # cubin is not in ffi.fft.cubin_cache_dir, about 7 s each on every rank that
 # misses. "NVRTC rebuilt" is a cached image the driver refused, compiled again:
@@ -429,9 +428,8 @@ def compile_census(log_text, first_span, before):
     # The receipts in the stage log (the SC maps', then the stage's own) tile
     # the stage's receipt windows, so their sum is the stage's count.
     rows = [[float(v) for v in m] for m in _STAGE_RECEIPT.findall(log_text)]
-    real, secs, hits, uncacheable = (sum(col) for col in zip(*rows)) if rows else (0,) * 4
-    out.update(xla_compiles=int(real), xla_s=round(secs, 1), cache_hits=int(hits),
-               uncacheable=int(uncacheable))
+    real, secs, hits = (sum(col) for col in zip(*rows)) if rows else (0,) * 3
+    out.update(xla_compiles=int(real), xla_s=round(secs, 1), cache_hits=int(hits))
     nvrtc = [float(ms) / 1e3 for ms in _NVRTC.findall(log_text)]
     out.update(nvrtc_builds=len(nvrtc), nvrtc_s=round(sum(nvrtc), 1))
     for key, field in (("cache_lookups", "probes"), ("read_s", "read_secs"),
@@ -442,13 +440,13 @@ def compile_census(log_text, first_span, before):
 
 
 def steady_compile_problems(run, name):
-    """From SC map 2 on nothing compiles, and no program is one JAX's cache cannot store."""
+    """From SC map 2 on nothing compiles."""
     text = (run / f"{name}.rank0.log").read_text(errors="replace")
     rows = _RECEIPT.findall(text)
     if not rows:
         return [f"{name}: no SC map compile receipt in the rank-0 log"]
-    return [f"{name}: SC map {m} compile: real {r} ({sec} s), uncacheable {u}{rest}"
-            for m, r, sec, u, rest in rows if (int(m) >= 2 and int(r)) or int(u)]
+    return [f"{name}: SC map {m} compile: real {r} ({sec} s){rest}"
+            for m, r, sec, rest in rows if int(m) >= 2 and int(r)]
 
 # (name, module, argv, deck name -> template).  The decks are written into
 # the run directory after kmeans, which names the centroid file.

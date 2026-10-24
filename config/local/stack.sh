@@ -25,7 +25,7 @@ LORRAX_LOCAL_BUILD="${LORRAX_LOCAL_BUILD:-$LORRAX_LOCAL_ROOT/src/ffi/cpp/build_l
 LORRAX_LOCAL_PHDF5_VERSION="${LORRAX_LOCAL_PHDF5_VERSION:-1.14.6}"
 LORRAX_LOCAL_PHDF5="${LORRAX_LOCAL_PHDF5:-$LORRAX_LOCAL_NATIVE/phdf5-$LORRAX_LOCAL_PHDF5_VERSION}"
 
-LORRAX_LOCAL_JAX_VERSION="${LORRAX_LOCAL_JAX_VERSION:-0.9.1}"
+LORRAX_LOCAL_JAX_VERSION="${LORRAX_LOCAL_JAX_VERSION:-0.12.0.1}"
 # Perlmutter's lane pins cuBLASMp 0.10.0.3695; that wheel is on neither
 # pypi.org nor pypi.nvidia.com as of 2026-08-26, so this lane pins the
 # newest published cu13 wheel instead.  compat.h guards the API delta.

@@ -132,8 +132,6 @@ every rank:
   uses the runtime's cache: `ISDF_JAX_CACHE_DIR` if exported, else the
   runtime's namespace for `np4`
   ([env_vars §2e](../../docs/reference/env_vars.md#2e-compile-cache)).
-  Programs that carry a host callback compile again in every run, because JAX
-  never stores them (`uncacheable` below).
 - **The NVRTC cubin cache** (`kconv_mathdx/`). A release links its prebuilt
   images into it from `<source root>/cubin_store`; NVRTC builds any other
   image the first time a process meets its key
@@ -155,7 +153,7 @@ every run is JAX-cold.
 - `cache_lookups`, `read_s`, `fingerprint_s` and `agreement_s` come from
   `common.jax_compile_cache`. The last two are the cross-rank compile
   agreement: the module hash, and the exchange.
-- `xla_compiles`, `xla_s`, `cache_hits` and `uncacheable` are the sums of the
+- `xla_compiles`, `xla_s` and `cache_hits` are the sums of the
   compile receipts in the stage log. Each stage ends with its own receipt,
   which also closes the receipt window, so an SC driver's map-0 receipt counts
   that driver only.

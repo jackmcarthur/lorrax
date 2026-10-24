@@ -3,7 +3,7 @@
 `uv sync --extra cuda13` Python environment, the native FFI pair, and the machine routes for Perlmutter, Frontera and other sites.
 {: .page-summary }
 
-A LORRAX installation has three parts: a Python 3.12 environment with the JAX 0.9 series, a pair of native libraries built from `src/ffi/cpp/`, and a launcher that gives each process one device. All three are required at every process count, one process included.
+A LORRAX installation has three parts: a Python 3.12 environment with the JAX 0.12 series, a pair of native libraries built from `src/ffi/cpp/`, and a launcher that gives each process one device. All three are required at every process count, one process included.
 
 ## Requirements {: #requirements }
 
@@ -14,7 +14,7 @@ Always required, on CPU and GPU alike.
 | Component | Requirement | What it is for |
 |---|---|---|
 | Python | ≥ 3.12 | The runtime; uv installs its own 3.12 |
-| JAX, jaxlib | `>= 0.9.0, < 0.10.0` | Every array operation. Any other minor series refuses at startup, and there is no override |
+| JAX, jaxlib | `>= 0.12.0, < 0.13.0` | Every array operation. Any other minor series refuses at startup, and there is no override |
 | Python packages | `h5py >= 3.14`, `numpy >= 2.3.1`, `scipy >= 1.16`, `matplotlib`, `xmlschema`, `xsdata` | File I/O, the QE schema reader and plots; pinned in `pyproject.toml` and `uv.lock` |
 | MPI | the site MPI | Communication between processes; both FFI legs link the same `libmpi` |
 | HDF5 | parallel HDF5 ≥ 1.12, built with `HDF5_IS_PARALLEL` | Parallel reads and writes of the large files; both legs link the HDF5 the run maps |
@@ -100,7 +100,7 @@ Not used on Perlmutter: the site Python or conda (uv installs its own CPython 3.
 
 | Component | Version | How |
 |---|---|---|
-| JAX, jaxlib, the CUDA 13 plugin and PJRT | 0.9.1 | `uv sync --extra cuda13`, from `uv.lock` |
+| JAX, jaxlib, the CUDA 13 plugin and PJRT | 0.12.0.1 | `uv sync --extra cuda13`, from `uv.lock` |
 | CUDA runtime libraries | `nvidia-cublas` 13.6, `nvidia-cufft` 12.3, `nvidia-cusolver` 12.2, `nvidia-cuda-runtime` 13.3, `nvidia-nccl-cu13` 2.30.7 | the same `uv sync`; these, not the toolkit's copies, are what runs |
 | cuFFTDx headers | `nvidia-mathdx==25.6.0` | the same `uv sync`; the k-convolution kernels are compiled from them at run time |
 | cuSOLVERMp, cuBLASMp | `nvidia-cusolvermp-cu13==0.9.1.9318.post1`, `nvidia-cublasmp-cu13==0.10.0.3695` | `build_ffi_cuda.sh` installs the wheels with `uv pip install --no-deps --target <clone>/.build/cusolvermp-<ver>/` and links against them |
@@ -252,6 +252,6 @@ Process-count rules, the per-GPU memory budget and how many GPUs a calculation n
     - `partial sealed-bundle override refused`: only one leg of a sealed pair is pinned. Unset both pins, or pin both legs of one bundle.
     - `mixed native providers`: the two legs come from different bundles. Select both from one bundle.
     - `GATE native-closure: got …; want …; fix: …`: the process maps a library other than the recorded one. Remove what maps it (an `LD_PRELOAD`, a package built against another MPI), or rebuild the leg.
-    - `JAX09_ENV_REFUSED`, or the `runtime.jax_support` refusal before the first `jit`: JAX or jaxlib outside the 0.9 series. Install the 0.9 series.
+    - `JAX_ENV_REFUSED`, or the `runtime.jax_support` refusal before the first `jit`: JAX or jaxlib outside the 0.12 series. Install the 0.12 series.
     - `GATE mathdx-headers`: a CUDA run without `nvidia-mathdx`. Run `uv sync --extra cuda13` (or `cuda12`).
 

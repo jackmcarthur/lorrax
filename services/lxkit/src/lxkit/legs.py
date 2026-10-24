@@ -179,9 +179,10 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         device_globs=("/dev/nvidia[0-9]*", "/dev/nvidiactl",
                       "/usr/lib/wsl/lib/libcuda.so.1"),
         jax_plugin_prefix="xla_cuda",
-        # Claims 683 (autotune 0) and 4179 (LLVM module parallelism).
-        xla_flag_defaults=(("--xla_gpu_autotune_level", "0"),
-                           ("--xla_gpu_enable_llvm_module_compilation_parallelism", "true")),
+        # Claim 683 (autotune 0).  XLA removed
+        # --xla_gpu_enable_llvm_module_compilation_parallelism before jaxlib 0.12
+        # (claim 4179 measured it on 0.9.1) and aborts on the unknown flag.
+        xla_flag_defaults=(("--xla_gpu_autotune_level", "0"),),
         xla_allocator="cuda_async",
         xla_allocators=("default", "platform", "bfc", "cuda_async"),
         device_memory_api="cuda_driver",
