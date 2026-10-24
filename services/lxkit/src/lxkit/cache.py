@@ -24,17 +24,23 @@ __all__ = ["atomic_write_bytes", "user_cache_dir", "user_cache_root"]
 
 
 def user_cache_root() -> Path:
-    """The per-user tree every LORRAX cache lives in: ``$SCRATCH/.cache/lorrax``
-    when ``SCRATCH`` names a writable directory, else
-    ``${XDG_CACHE_HOME:-~/.cache}/lorrax``.
+    """The per-user tree every LORRAX cache lives in: ``LORRAX_CACHE_ROOT`` when
+    set, else ``$SCRATCH/.cache/lorrax`` when ``SCRATCH`` names a writable
+    directory, else ``${XDG_CACHE_HOME:-~/.cache}/lorrax``.
 
-    The rule is the site convention, not a knob: HPC centres export ``SCRATCH``
+    The default follows the site convention: HPC centres export ``SCRATCH``
     for the fast, large, per-user file system, and a home directory is small and
     often slow on compute nodes.  An exported ``SCRATCH`` that is missing or
     read-only falls back to the user cache directory instead of failing the
-    first write.  ``config/perlmutter/gpu_env.sh`` applies the same rule to
+    first write.  ``LORRAX_CACHE_ROOT`` is the fix the install self-check
+    (``scripts/perf_check.py``) names when that default is slow per file (a
+    cluster whose only cache candidate is an NFS or DVS home).
+    ``config/perlmutter/gpu_env.sh`` applies the same rule to
     ``CUDA_CACHE_PATH``.
     """
+    explicit = os.environ.get("LORRAX_CACHE_ROOT", "").strip()
+    if explicit:
+        return Path(explicit)
     scratch = os.environ.get("SCRATCH", "")
     if scratch and os.path.isdir(scratch) and os.access(scratch, os.W_OK | os.X_OK):
         return Path(scratch) / ".cache" / "lorrax"

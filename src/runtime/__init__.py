@@ -2836,7 +2836,9 @@ def install_verification_stamp(device_kind: str):
         tag = native_cache_tag()
     except Exception:                                         # noqa: BLE001
         tag = "noffi"
-    root = str(Path(__file__).resolve().parents[2])
+    # The path as imported, not its realpath: a runtime image restored through a
+    # symlink (scripts/runtime_image.sh, node-local room elsewhere) is the same install.
+    root = str(Path(__file__).absolute().parents[2])
     install = hashlib.sha256(f"{root}|{tag}".encode()).hexdigest()[:16]
     model = re.sub(r"[^A-Za-z0-9]+", "-", str(device_kind)).strip("-") or "unknown"
     return user_cache_dir("perfcheck") / f"verified_{install}_{model}.json"

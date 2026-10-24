@@ -378,6 +378,64 @@ def probe_path_lookups(n: int = 20) -> dict:
     return out
 
 
+def cache_dirs() -> dict[str, str]:
+    """The persistent caches a run reads and writes per program and per kernel (the same
+    locations ``static_caches`` checks for writability)."""
+    explicit = (os.environ.get("ISDF_JAX_CACHE_DIR") or "").strip()
+    return {"jax_compile": explicit or user_cache_root("jax_compile"),
+            "cubin": user_cache_root("kconv_mathdx")}
+
+
+def probe_cache_latency(n: int = 20) -> dict:
+    """Per-file cost of the cache directories, as a run pays it: open()+close() of up to 60
+    existing entries (two passes, the second judged) and the same missing name looked up
+    again and again (the compile cache tests every program's key before compiling it; the
+    test suite compiles ~2400 programs, and every NVRTC image is one file).  A cache on a
+    DVS or NFS home costs 3-10 ms per lookup on a compute node (ri_diagnose)."""
+    out: dict = {}
+    for label, d in cache_dirs().items():
+        probe = d
+        while probe and not os.path.isdir(probe):
+            probe = os.path.dirname(probe)
+        files = bounded_files(Path(d), (), 60, max_depth=4) if os.path.isdir(d) else []
+        passes = []
+        for _ in range(2):
+            ms = []
+            for p in files:
+                t0 = time.perf_counter()
+                try:
+                    os.close(os.open(p, os.O_RDONLY))
+                except OSError:
+                    continue
+                ms.append((time.perf_counter() - t0) * 1e3)
+            passes.append(_stats(ms))
+        absent = os.path.join(probe or "/", f".perfcheck-absent-{socket.gethostname()}")
+        miss = []
+        for _ in range(n + 1):
+            t0 = time.perf_counter()
+            try:
+                os.stat(absent)
+            except OSError:
+                pass
+            miss.append((time.perf_counter() - t0) * 1e3)
+        out[label] = {"path": d, "probed": probe, "open": passes[-1], "open_first": passes[0],
+                      "miss": _stats(miss[1:]), **fs_of(probe or "/"),
+                      "explicit": label == "jax_compile" and bool((os.environ.get("ISDF_JAX_CACHE_DIR") or "").strip())}
+    return out
+
+
+def launch_info() -> dict:
+    """How this rank was launched: through the runtime image's lorrax-run or not."""
+    image = os.environ.get("LORRAX_IMAGE_ROOT") or ""
+    prefix = os.environ.get("LORRAX_PREFIX") or ""
+    run = os.path.join(prefix, "bin", "lorrax-run") if prefix else ""
+    return {"image_root": image or None,
+            "image_realpath": os.path.realpath(image) if image else None,
+            "image_fs": fs_of(image) if image else None,
+            "prefix": prefix or None, "runtime": os.environ.get("LORRAX_RUNTIME"),
+            "lorrax_run": run if run and os.path.isfile(run) else None}
+
+
 def probe_walk(root: str) -> dict:
     """Entries/s of os.walk + lstat over the venv, twice; the second (warm) pass is judged.
     Python's import system does exactly this kind of directory scanning and stat-ing."""
@@ -1029,6 +1087,22 @@ def open_verdict(opens: list[dict]) -> dict:
 STAGE_FIX = ("stage the runtime node-local (see manual: docs/installation/perf_check.md#filesystem)")
 
 
+def stage_fix(launch: dict | None) -> str:
+    """The filesystem fix for how this check was launched (``launch_info``)."""
+    launch = launch or {}
+    if launch.get("image_root"):
+        fs = launch.get("image_fs") or {}
+        return (f"lorrax-run ran the runtime image from {launch.get('image_realpath')} ({fs.get('fstype')} at "
+                f"{fs.get('mount')}), a shared copy: this node had no node-local directory with room (see the "
+                "[lorrax image] line); free about 9 GB in /tmp, or set LORRAX_IMAGE_ROOTS to a node-local "
+                "directory with room")
+    if launch.get("lorrax_run"):
+        return (f"launch with lorrax-run, which runs every job from a node-local copy of the install: "
+                f"srun ... {launch['lorrax_run']} python ... (not the tree's select_gpu.sh)")
+    return ("reinstall with config/perlmutter/install_deps.sh (a runtime image every job restores "
+            "node-local), or keep the install on a fast filesystem; " + STAGE_FIX)
+
+
 def judge_lookups(lookups: list[dict]) -> tuple[str, list[str]]:
     """Slow failed lookups in LD_LIBRARY_PATH (FAIL) or PATH (WARN) directories, slowest rank."""
     worst_by: dict = {}
@@ -1049,12 +1123,15 @@ def judge_lookups(lookups: list[dict]) -> tuple[str, list[str]]:
         slow = sorted(((d, r) for d, r in rows if r["median_ms"] >= OPEN_FAIL_MS),
                       key=lambda t: -t[1]["median_ms"])
         if slow:
-            # PATH is searched only for bare command names (XLA execs ptxas by absolute path): info.
-            st = worst(st, "FAIL" if var == "LD_LIBRARY_PATH" else "INFO")
+            # PATH is searched only for bare command names (XLA execs ptxas by absolute path), but
+            # every rank's shell and its tools search it: a warning.
+            st = worst(st, "FAIL" if var == "LD_LIBRARY_PATH" else "WARN")
             names = "; ".join(f"{d} ({r.get('fstype')}, {r['median_ms']:.1f} ms)" for d, r in slow)
+            who = ("every exec (ptxas/nvlink per XLA module) and dlopen probes each of them for each library"
+                   if var == "LD_LIBRARY_PATH" else
+                   "every bare command name a rank's shell or tools run probes each of them")
             lines.append(f"slow {var}: {len(slow)} of {len(rows)} entries cost >= {OPEN_FAIL_MS} ms per failed "
-                         f"lookup, and every exec (ptxas/nvlink per XLA module) and dlopen probes each of them "
-                         f"for each library: {names}. Drop them, or stage the libraries node-local")
+                         f"lookup, and {who}: {names}. Drop them, or stage the libraries node-local")
         elif rows:
             mx = max(r["median_ms"] for _, r in rows)
             lines.append(f"{var}: {len(rows)} entries, failed lookup <= {mx:.3f} ms each")
@@ -1064,6 +1141,7 @@ def judge_lookups(lookups: list[dict]) -> tuple[str, list[str]]:
 def judge_filesystem(fs0: dict, opens: list[dict], imports: list[dict], ref: dict,
                      lookups: list[dict] | None = None) -> dict:
     lines, st = [], "PASS"
+    fix = stage_fix(fs0.get("launch"))
     s_lk, l_lk = judge_lookups(lookups or [])
     v = open_verdict(opens)
     warm = v.get("warm") or {}
@@ -1081,7 +1159,7 @@ def judge_filesystem(fs0: dict, opens: list[dict], imports: list[dict], ref: dic
         w = (v.get("where") or {}).get(g) or next(iter((v.get("where") or {}).values()), {})
         lines.append(f"slow filesystem: {med:.2f} ms per open (warm median, slowest rank; worst group {g} "
                      f"{s['median_ms']:.2f} ms) on {w.get('fstype')} at {w.get('mount')}; a cold run opens "
-                     f"~10^4 install files serially; {STAGE_FIX}")
+                     f"~10^4 install files serially; {fix}")
     elif med is not None and med > OPEN_PASS_MS:
         st = "WARN"
         lines.append(f"open latency {med:.2f} ms (warm median) is between PASS {OPEN_PASS_MS} and FAIL "
@@ -1091,7 +1169,7 @@ def judge_filesystem(fs0: dict, opens: list[dict], imports: list[dict], ref: dic
         w = fs0.get("walk") or {}
         if st != "FAIL":
             lines.insert(0, f"slow filesystem: venv walk+lstat {wps:.0f} entries/s < {WALK_FAIL_PER_S:.0f} on "
-                         f"{w.get('fstype')} at {w.get('mount')}; {STAGE_FIX}")
+                         f"{w.get('fstype')} at {w.get('mount')}; {fix}")
         st = "FAIL"
     if s_imp == "FAIL":
         st = "FAIL"
@@ -1157,6 +1235,41 @@ def cache_misses(probe: dict) -> tuple[int | None, int | None]:
             sum(v for k, v in ev.items() if k.endswith("cache_hits")))
 
 
+def judge_cache_latency(lats: list[dict]) -> tuple[str, list[str]]:
+    """Per-file cost of the cache directories, slowest rank: the warm open median of existing
+    entries or the mean repeated failed lookup, whichever is larger (same thresholds as the
+    install's files)."""
+    worst_by: dict = {}
+    for lat in lats:
+        for label, row in lat.items():
+            miss = row.get("miss") or {}
+            miss_ms = miss.get("total_s", 0) * 1e3 / miss["n"] if miss.get("n") else None
+            vals = [v for v in ((row.get("open") or {}).get("median_ms"), miss_ms) if v is not None]
+            if not vals:
+                continue
+            row = {**row, "cost_ms": max(vals), "miss_ms": miss_ms}
+            if label not in worst_by or row["cost_ms"] > worst_by[label]["cost_ms"]:
+                worst_by[label] = row
+    st, lines = "PASS", []
+    slow = {k: r for k, r in worst_by.items() if r["cost_ms"] > OPEN_PASS_MS}
+    for label, r in slow.items():
+        sev = "FAIL" if r["cost_ms"] >= OPEN_FAIL_MS else "WARN"
+        st = worst(st, sev)
+        knob = "ISDF_JAX_CACHE_DIR" if r.get("explicit") else "LORRAX_CACHE_ROOT"
+        root = r["path"] if r.get("explicit") else os.path.dirname(r["path"].rstrip("/"))
+        lines.insert(0, f"slow cache root: the {label} cache {r['path']} is on {r.get('fstype')} at {r.get('mount')}, "
+                     f"{r['cost_ms']:.2f} ms per open or lookup (slowest rank; open "
+                     f"{fmt((r.get('open') or {}).get('median_ms'), '.3f')} ms, failed lookup "
+                     f"{fmt(r.get('miss_ms'), '.3f')} ms); a run looks up every XLA program it compiles (~2400 in the "
+                     f"test suite) and opens every NVRTC image there. Fix: export {knob}=<a directory on a fast "
+                     f"filesystem, e.g. Lustre scratch> in the launch shell (now {root}), then rerun lorrax-postinstall "
+                     "so the kernel store is built there")
+    if worst_by and not slow:
+        lines.append("cache directories: " + ", ".join(
+            f"{k} {r['cost_ms']:.3f} ms per open/lookup ({r.get('fstype')})" for k, r in worst_by.items()))
+    return st, lines
+
+
 def judge_caches(caches: dict, ranks: list[dict]) -> dict:
     lines, st = [], "PASS"
     for label in ("jax_compile", "cubin"):
@@ -1172,6 +1285,9 @@ def judge_caches(caches: dict, ranks: list[dict]) -> dict:
             st = worst(st, "WARN")
             lines.append(f"{label} cache {c.get('path')} is on {c.get('fstype')} "
                          f"(1 MB write+fsync+read {fmt(c.get('write_s'), '.3f')} s)")
+    st_lat, l_lat = judge_cache_latency([r.get("cache_latency") or {} for r in ranks])
+    st = worst(st, st_lat)
+    lines += l_lat
     ns = caches.get("namespace")
     if ns and not ns.endswith("_k3"):
         st = worst(st, "WARN")
@@ -1422,7 +1538,11 @@ def cache_location_check(path: str) -> dict:
 
 def user_cache_root(name: str) -> str:
     """``lxkit.user_cache_dir(name)``'s rule (mirrored: this file imports nothing of LORRAX):
-    ``$SCRATCH/.cache/lorrax`` when SCRATCH is a writable directory, else the XDG cache."""
+    LORRAX_CACHE_ROOT, else ``$SCRATCH/.cache/lorrax`` when SCRATCH is a writable directory,
+    else the XDG cache."""
+    explicit = os.environ.get("LORRAX_CACHE_ROOT", "").strip()
+    if explicit:
+        return os.path.join(explicit, name)
     s = os.environ.get("SCRATCH", "")
     if s and os.path.isdir(s) and os.access(s, os.W_OK | os.X_OK):
         return os.path.join(s, ".cache", "lorrax", name)
@@ -1522,12 +1642,14 @@ def rank_main(args, ctx: dict, topo: dict, out: Path) -> dict:
     res["open"] = probe_open_latency(sample)
     res["open"]["sample"] = len(sample)
     res["lookups"] = probe_path_lookups()
+    res["cache_latency"] = probe_cache_latency()
     mark(out, "open", rank)
     wait_all(out, "open", nranks)
     if rank == 0:
         res["fs"] = {"paths": {label: {"path": p, **fs_of(p)} for label, p in (
             ("site-packages", str(site_packages())), ("source", str(ROOT)),
             ("python", os.path.realpath(sys.executable)))}}
+        res["fs"]["launch"] = launch_info()
         res["fs"]["walk"] = probe_walk(str(site_packages()))
         pfx = os.environ.get("PYTHONPYCACHEPREFIX")
         res["fs"]["pycache_prefix"] = {"path": pfx, **fs_of(pfx)} if pfx else None

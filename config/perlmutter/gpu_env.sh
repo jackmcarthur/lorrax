@@ -37,9 +37,12 @@ fi
 export MPICH_GPU_SUPPORT_ENABLED=0
 
 # The per-user cache tree, by the rule lxkit.user_cache_root applies to the
-# JAX compile cache and the NVRTC image cache: $SCRATCH/.cache/lorrax when
-# SCRATCH is a writable directory, else ${XDG_CACHE_HOME:-~/.cache}/lorrax.
-if [ -n "${SCRATCH:-}" ] && [ -d "$SCRATCH" ] && [ -w "$SCRATCH" ]; then
+# JAX compile cache and the NVRTC image cache: LORRAX_CACHE_ROOT when set, else
+# $SCRATCH/.cache/lorrax when SCRATCH is a writable directory, else
+# ${XDG_CACHE_HOME:-~/.cache}/lorrax.
+if [ -n "${LORRAX_CACHE_ROOT:-}" ]; then
+    _lorrax_cache="$LORRAX_CACHE_ROOT"
+elif [ -n "${SCRATCH:-}" ] && [ -d "$SCRATCH" ] && [ -w "$SCRATCH" ]; then
     _lorrax_cache="$SCRATCH/.cache/lorrax"
 else
     _lorrax_cache="${XDG_CACHE_HOME:-$HOME/.cache}/lorrax"
@@ -54,7 +57,10 @@ export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-$_lorrax_cache/cuda_jit}"
 _lorrax_py="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}"
 _lorrax_here="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ -n "$_lorrax_py" ] || { [ -x "$_lorrax_here/.venv/bin/python" ] && _lorrax_py="$_lorrax_here/.venv/bin/python"; }
-_lorrax_cudart="$("${_lorrax_py:-python3}" - <<'PY' 2>/dev/null
+# A runtime-image install (install_deps.sh; LORRAX_RUNTIME=image) has no venv on
+# the login node: lorrax-run links libcudart.so inside each node's restored image.
+_lorrax_cudart=""
+[ "${LORRAX_RUNTIME:-}" = image ] || _lorrax_cudart="$("${_lorrax_py:-python3}" - <<'PY' 2>/dev/null
 import glob, os, sysconfig
 hits = sorted(glob.glob(os.path.join(sysconfig.get_paths()["purelib"], "nvidia", "cu*", "lib", "libcudart.so.[0-9]*")))
 print(os.path.realpath(hits[0]) if hits else "")
