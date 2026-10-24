@@ -19,10 +19,17 @@ def _process_leg_key():
     return None if leg is None else leg.key
 
 
+def _inexact_dtype(dtype):
+    return (dtype if jnp.issubdtype(dtype, jnp.inexact) else
+            jnp.dtype('float64' if dtype.itemsize == 8 else 'float32'))
+
+
 def svd_local(a, full_matrices=True, compute_uv=True):
     """JAX SVD of a rank-local matrix/stack, using the ROCm QR driver."""
     if _process_leg_key() != "ROCM":
         return jnp.linalg.svd(a, full_matrices=full_matrices, compute_uv=compute_uv)
+    a = jnp.asarray(a)
+    a = a.astype(_inexact_dtype(a.dtype))
     try:
         from jax.lax.linalg import SvdAlgorithm
     except ImportError:                             # JAX 0.9.1 enum location
@@ -46,9 +53,7 @@ def lstsq_local(a, b, rcond=None):
         raise ValueError("lstsq_local wants a(m,n), b(m,) or b(m,nrhs)")
     if not a.size:
         return jnp.linalg.lstsq(a, b, rcond=rcond)
-    dtype = jnp.result_type(a, b)
-    if not jnp.issubdtype(dtype, jnp.inexact):
-        dtype = jnp.dtype('float64' if dtype.itemsize == 8 else 'float32')
+    dtype = _inexact_dtype(jnp.result_type(a, b))
     a, b = a.astype(dtype), b.astype(dtype)
     vector = b.ndim == 1
     if vector:

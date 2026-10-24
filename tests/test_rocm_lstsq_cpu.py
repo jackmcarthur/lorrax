@@ -54,6 +54,12 @@ def test_qr_algorithm_is_explicit_and_other_legs_preserve_jax(monkeypatch):
     monkeypatch.setattr(owner, '_process_leg_key', lambda: 'ROCM')
     a = np.array([[2., 1j], [-.5j, 3.], [1., .3]], complex)
     b = np.array([1., 2j, 3.])
+    for integer in (np.int32, np.int64):
+        raw = np.asarray([[1, 2], [3, 4]], dtype=integer)
+        singular = owner.svd_local(raw, compute_uv=False)
+        expected_singular = jnp.linalg.svd(raw, compute_uv=False)
+        assert singular.dtype == expected_singular.dtype
+        np.testing.assert_allclose(singular, expected_singular, rtol=3e-7)
     graph = jax.make_jaxpr(lambda x: owner.svd_local(x, full_matrices=False))(a)
     calls = [eq for eq in graph.jaxpr.eqns if eq.primitive.name == 'svd']
     assert len(calls) == 1 and calls[0].params['algorithm'].value == 'QR'
