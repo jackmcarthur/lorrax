@@ -47,6 +47,29 @@ def test_scalar_shared_ritz_refuses_nonphysical_gram_and_invalid_actions():
                          moment_m3=np.sum(omega**3*residue))
     with pytest.raises(ValueError,match='matching nonempty'):
         scalar_head_ritz(z,values,slopes[:-1],moment_m1=1,moment_m3=1)
+    with pytest.raises(ValueError,match='GATE scalar_head_keep'):
+        scalar_head_ritz(z,values,slopes,moment_m1=1,moment_m3=1,gram_keep=1e-3)
+
+
+def test_scalar_shared_ritz_refuses_nonfinite_retained_identity(monkeypatch):
+    import jax
+    import jax.numpy as jnp
+    from gw import tangential_head_scalar as owner
+    jax.config.update('jax_enable_x64',True)
+    real_factory=owner._scalar_ritz_program
+    def factory(cut):
+        real=real_factory(cut)
+        def inject(*args):
+            model,diagnostics,zero,retained=real(*args)
+            retained=dict(retained)
+            retained[next(iter(retained))]=jnp.array([jnp.nan])
+            return model,diagnostics,zero,retained
+        return inject
+    monkeypatch.setattr(owner,'_scalar_ritz_program',factory)
+    z=np.array([0j,.2j,.7j])
+    value,slope=_measure(z,np.array([.3]),np.array([.5]))
+    with pytest.raises(ValueError,match='GATE scalar_head_retained_moments'):
+        owner.scalar_head_ritz(z,value,slope,moment_m1=.15,moment_m3=.0135)
 
 
 def test_scalar_cell_actions_match_independent_rank_one_completed_hamiltonian():

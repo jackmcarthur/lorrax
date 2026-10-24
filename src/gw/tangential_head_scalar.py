@@ -13,13 +13,15 @@ import numpy as np
 
 
 @lru_cache(maxsize=None)
-def _scalar_ritz_program():
+def _scalar_ritz_program(gram_keep):
     from distrib_la import eigh_local
     from .tangential_pencil import assemble_tangential_pencil
     from .tangential_reduction import reduce_tangential_pencil
     from .tangential_gates import apply_tangential_zero_policy, retained_moment_identity
     from .tangential_local import _mm
-    from .tangential_recipe import shared_real_pole_gates_v1_r3b as gates
+    from .tangential_recipe import shared_real_pole_gates_v1_r3b as canonical_gates
+    gates = dict(canonical_gates,normalized_gram_keep=dict(
+        canonical_gates['normalized_gram_keep'],threshold=float(gram_keep)))
 
     def eigh(a, *, cut=None):
         return tuple(eigh_local(a))
@@ -41,7 +43,7 @@ def _scalar_ritz_program():
     return execute
 
 
-def scalar_head_ritz(z, values, slopes, *, moment_m1, moment_m3):
+def scalar_head_ritz(z, values, slopes, *, moment_m1, moment_m3, gram_keep=None):
     """Construct a physical scalar head from exact response actions.
 
     ``z``, ``values`` and ``slopes`` are matching vectors, in Ry and bare
@@ -51,6 +53,8 @@ def scalar_head_ritz(z, values, slopes, *, moment_m1, moment_m3):
     partners explicitly so the scalar real-residue closure is preserved.
     Mandatory shared physical gates fire here; sample and inverse-moment
     accuracy must additionally be measured by the caller before publication.
+    ``gram_keep`` may refine the common retention cut downwards; all Gram
+    validity, retained-metric and zero-weight predicates remain unchanged.
     """
     z,values,slopes = (np.asarray(a,np.complex128).reshape(-1) for a in (z,values,slopes))
     if not len(z) or values.shape != z.shape or slopes.shape != z.shape:
@@ -64,7 +68,12 @@ def scalar_head_ritz(z, values, slopes, *, moment_m1, moment_m3):
         points.append(point);outputs.append(value);derivatives.append(derivative)
         if point.imag != 0:
             points.append(point.conjugate());outputs.append(value.conjugate());derivatives.append(derivative.conjugate())
-    program = _scalar_ritz_program()
+    from .tangential_recipe import shared_real_pole_gates_v1_r3b as gates
+    canonical_keep = gates['normalized_gram_keep']['threshold']
+    gram_keep = canonical_keep if gram_keep is None else float(gram_keep)
+    if not 0 < gram_keep <= canonical_keep:
+        raise ValueError('GATE scalar_head_keep: retention may only refine the common cut')
+    program = _scalar_ritz_program(gram_keep)
     model,reduction,zero,retained = jax.device_get(program(
         jnp.asarray(points),jnp.asarray(outputs),jnp.asarray(derivatives),
         jnp.asarray(moment_m1),jnp.asarray(moment_m3)))
@@ -73,8 +82,8 @@ def scalar_head_ritz(z, values, slopes, *, moment_m1, moment_m3):
             raise ValueError(f'GATE scalar_head_{name}: shared Hermite/Ritz predicate failed; no PSD repair')
     if not np.all(zero['zero_policy']):
         raise ValueError('GATE scalar_head_zero_ritz: shared positive-weight policy failed; no pole clipping')
-    from .tangential_recipe import shared_real_pole_gates_v1_r3b as gates
-    if any(np.max(a)>gates['retained_subspace_moments']['threshold'] for a in retained.values()):
+    if not all(np.all(np.isfinite(a)) and np.all(a<=gates['retained_subspace_moments']['threshold'])
+               for a in retained.values()):
         raise ValueError('GATE scalar_head_retained_moments: shared retained-space identity failed')
     factors,poles,active = model
     poles = poles[0,active[0]]
@@ -86,4 +95,4 @@ def scalar_head_ritz(z, values, slopes, *, moment_m1, moment_m3):
             zero={k:np.asarray(v).tolist() for k,v in zero.items()},
             retained={k:np.asarray(v).tolist() for k,v in retained.items()}),
         provenance=dict(solve_mode='shared-Hermite-Ritz-scalar-v1',n_valid=len(omega),
-            support_count=len(z),pencil_width=len(points)+1))
+            support_count=len(z),pencil_width=len(points)+1,gram_keep=gram_keep))
