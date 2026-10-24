@@ -13,5 +13,6 @@ for input in WFN.h5 data-file-schema.xml centroids.txt dipole.h5 kin_ion.h5 tmp 
 done
 input=${1:-gw.in}
 prefix=${2:-exciton_bands}
-lorrax_run bse.exciton_bands -i "$input" --vq-mode interp --q-per-segment 1 \
+lorrax_run bse.exciton_bands -i "$input" --vq-mode refit --refit-window bse \
+    --cert-grade reference --q-per-segment 1 \
     --out-prefix "$prefix" --report-file "$prefix.out" > "$prefix.log" 2>&1
