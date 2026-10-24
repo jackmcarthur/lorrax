@@ -3979,6 +3979,25 @@ def _fix_sphere_wrap(zx):
                  f"sphere-derived center")
 
 
+def _zeta_parent_qpoints(restart_file, nq, kgrid):
+    """Stored ζ parent labels from its paired interaction's authenticated tables.
+
+    The copied WFN header names stored k rows, which need not be the q-IBZ
+    parents the ζ writer selected. Reading their prefix is not a q map.
+    """
+    from symmetry_maps import read_tensor, read_tables
+    _, header = read_tensor(restart_file, "V_qmunu", metadata_only=True)
+    if header.table_hash is None:
+        raise ValueError("GATE vq_zeta_q_labels: IBZ ζ needs the paired V q-star tables")
+    tables = read_tables(restart_file, "V_qmunu")
+    q = np.asarray(tables.q_irr_frac, dtype=np.float64)
+    if (q.shape != (int(nq), 3)
+            or int(tables.n_q_full) != int(np.prod(kgrid))):
+        raise ValueError("GATE vq_zeta_q_labels: ζ parent extent/grid disagrees "
+                         "with the paired V q-star tables")
+    return np.array(q, copy=True)
+
+
 def read_vq_payload(restart_file: str, zeta_file: str, *,
                      mesh: Mesh | None = None, log_fn=print, input_file=None,
                      require_slab: bool = True,
@@ -3998,6 +4017,9 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     every stored ζ tile.  The pure-refit caller sets it false: that route reads
     ζ metadata and the producer's solve provenance but reconstructs ζ(Q) from
     the canonical full-BZ WFN source, so an IBZ-only ζ file is sufficient.
+    Those stored ζ parents are labeled by the paired V tensor's authenticated
+    q-star table, not a prefix of the copied WFN k list. The same sphere/cutoff
+    check applies after labeling; no ζ or interaction payload is read for it.
 
     THE THREE BIG q-STACKS STAY ON DISK.  ``ZG`` (nq, n_μ, ngkmax),
     ``Vqmunu`` and ``W0`` (nq, n_μ, n_μ) are read-only and every consumer
@@ -4067,6 +4089,7 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
             f"Regenerate the fit with full-BZ zeta, or wait for the IBZ-zeta "
             f"unfold (deferred; must route through the one SymMaps sym-action).")
     if not require_full_bz_zeta and zx["nq"] != zx["nk"]:
+        qraw = _zeta_parent_qpoints(restart_file, zx["nq"], zx["kgrid"])
         log_fn(
             f"  [vq_interp] pure refit accepts IBZ-only ζ metadata: "
             f"nq={zx['nq']}, full-BZ nk={zx['nk']}. Stored ZG is not read; "
@@ -4118,7 +4141,9 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
                  f"run_gates' per-q makeVq-vs-disk check (sigma_freq_debug_output) "
                  f"verifies it.")
         qraw = qfull
-    zx["qfr_raw"] = qraw[: zx["nq"]]
+    if qraw.shape != (zx["nq"], 3):
+        raise ValueError("GATE vq_zeta_q_labels: no exact stored ζ q-row labeling")
+    zx["qfr_raw"] = qraw
     zx["qfr"] = zx["qfr_raw"] - np.round(zx["qfr_raw"])  # BGW-wrapped, pre half-fix
     kg = zx["kgrid"]
     zx["k_int"] = np.rint(zx["qfr_raw"] * kg[None, :]).astype(int) % kg[None, :]
