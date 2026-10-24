@@ -1,0 +1,202 @@
+{
+  "case": "si_soc",
+  "status": "COMPLETE_CANONICAL_OUTPUTS_PASS_ALL_4_RANKS",
+  "source_commit": "2d2ca2f104a085876a573e8b1278a7874c479b98",
+  "input_files": {
+    "WFN.h5": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/200_gnppm_native_head_20261023/qe/WFN.h5",
+      "realpath": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/200_gnppm_native_head_20261023/qe/WFN.h5",
+      "bytes": 18735264,
+      "sha256": "e6106f763039d4a1654b0035724ecfae3ae00cd671f9a7cce4669473362d7a3a"
+    },
+    "data-file-schema.xml": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/200_gnppm_native_head_20261023/qe/data-file-schema.xml",
+      "realpath": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/200_gnppm_native_head_20261023/qe/data-file-schema.xml",
+      "bytes": 101310,
+      "sha256": "1a6a6e00aa160cd4c1971fc55ce47656d44c372e006b12887be80f37d00c559e"
+    },
+    "Si.upf": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/200_gnppm_native_head_20261023/qe/Si.upf",
+      "realpath": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/200_gnppm_native_head_20261023/qe/Si.upf",
+      "bytes": 291215,
+      "sha256": "cc91a6be43c3c89daf6c34410096e8d870f25152dbfb513bcf01afa5ab53eabf",
+      "upf_header": {
+        "element": "Si",
+        "pseudo_type": "NC",
+        "is_ultrasoft": "F",
+        "is_paw": "F",
+        "has_so": "T",
+        "functional": "PBE",
+        "z_valence": "    4.00",
+        "relativistic": "full"
+      }
+    }
+  },
+  "input_metadata": {
+    "occupied": 8,
+    "nspinor": 2,
+    "stored_bands": 128,
+    "fft_grid": [
+      24,
+      24,
+      24
+    ]
+  },
+  "resolved_request": {
+    "kgrid": [
+      4,
+      4,
+      4
+    ],
+    "sum_bands": 52,
+    "centroid_count": 528,
+    "centroid_fit_window": "0:16,0:52",
+    "nval": 8,
+    "ncond": 8,
+    "protected_bands_1based": [
+      1,
+      16
+    ],
+    "frontier_reference": [
+      8,
+      9
+    ]
+  },
+  "nk_full": 64,
+  "nk_stored": 8,
+  "sum_band_carrier_P4": 52,
+  "physical_centroids": 528,
+  "packed_centroid_extent": null,
+  "packed_extent_note": "Not emitted in saved production report; no guessed extent.",
+  "centroid_command": "python -m centroid.kmeans_cli 528 --seed 42 --fit-window 0:16,0:52 -i gw.in",
+  "launch": {
+    "ranks": 4,
+    "nodes": 1,
+    "gpu_model": "NVIDIA A100-SXM4-80GB",
+    "cores_per_rank": 16,
+    "threads_per_core": 1,
+    "budget_gb": 66.35,
+    "deck": "gw.in",
+    "original_wfn_relative_path": "../qe/WFN.h5",
+    "OMP_NUM_THREADS": 14,
+    "BLAS_threads": 1,
+    "cpu_binding": "threads"
+  },
+  "native_libraries": {
+    "cuda_sha256": "bf46de448d60525dfce7d64a00a2621d621e7526e381e001fa4093a29dd9cafa",
+    "host_sha256": "17932d83c572f8f6a119cbdc03f8f064e5ac9a279010c7bda1a1aa90fcf486ca"
+  },
+  "main_wall_seconds": 59.52,
+  "stages": [
+    {
+      "stage": "setup",
+      "wall_seconds": 13.27,
+      "fraction_percent": 22.3,
+      "reported_device_peak_GB": null
+    },
+    {
+      "stage": "ISDF basis and Coulomb metric",
+      "wall_seconds": 25.96,
+      "fraction_percent": 43.62,
+      "reported_device_peak_GB": 9.71
+    },
+    {
+      "stage": "Screening",
+      "wall_seconds": 9.21,
+      "fraction_percent": 15.47,
+      "reported_device_peak_GB": 0.17
+    },
+    {
+      "stage": "Self-energy",
+      "wall_seconds": 10.41,
+      "fraction_percent": 17.49,
+      "reported_device_peak_GB": 0.32
+    },
+    {
+      "stage": "Quasiparticle bands",
+      "wall_seconds": 0.58,
+      "fraction_percent": 0.97,
+      "reported_device_peak_GB": 0.08
+    },
+    {
+      "stage": "other driver work",
+      "wall_seconds": 0.09,
+      "fraction_percent": 0.15,
+      "reported_device_peak_GB": 0.08
+    },
+    {
+      "stage": "total run",
+      "wall_seconds": 59.52,
+      "fraction_percent": 100.0,
+      "reported_device_peak_GB": 9.71
+    }
+  ],
+  "compile_cache": {
+    "real_compiles": 134,
+    "summed_compile_seconds": 29.7,
+    "hits": 126,
+    "uncacheable": 0,
+    "state": "Existing shared persistent JAX/native caches; explicit mixed compile/hit counts. These are references, not a controlled cold/warm speed comparison."
+  },
+  "reported_device_peak": {
+    "GB_decimal_rounded": 9.71,
+    "stage": "zeta",
+    "scope": "Production per-stage JAX pool high-water, max across ranks; not NVML reserved memory or total physical CUDA/native-private workspace."
+  },
+  "reported_host_ru_maxrss_GB": {
+    "max": 2.43,
+    "min": 2.4
+  },
+  "exact_native_pointer_peak_available": false,
+  "sigma_shape": [
+    2,
+    8,
+    16,
+    16
+  ],
+  "eqp": [
+    {
+      "file": "eqp0.dat",
+      "kpoints": 8,
+      "rows": 128,
+      "bands": [
+        1,
+        16
+      ],
+      "finite": true
+    },
+    {
+      "file": "eqp1.dat",
+      "kpoints": 8,
+      "rows": 128,
+      "bands": [
+        1,
+        16
+      ],
+      "finite": true
+    }
+  ],
+  "dynamic_coverage": [
+    "coverage       COMPLETE: margins 2.17 eV below and 2.01 eV above the requested bands"
+  ],
+  "preprocessing": "Fresh centroids/dipole/kinetic-ionic/GW chain.",
+  "evidence_archive": "/global/cfs/cdirs/m4598/jackm/lorrax_evidence/gwjax_shared_pole_20261023/gnppm_references_main_2d2",
+  "evidence_manifest_sha256": "b6797e00fff1384c80b3b5edeb9103a9e796762b4a66641b5ee8656d7b592f62",
+  "report_sha256": "5a5731b1951537a1f1258bf4da99c01c6306edaa20752e6a25ad82028d782300",
+  "scope": "Fixed-input native GNPPM G0W0 through canonical Sigma/QP; no convergence, BGW equality, 40 GB fit or hard-cap claim.",
+  "included_text_files": {
+    "qe_scf.in": "cc500ac7e08495ece47a0344e461e1b5182c548aae516cf744c584442e791a8d",
+    "gw.in": "0c1f8912878e77074f70f6bb0f0332b3719bf240ab556df11aaa1b257a091d9a",
+    "centroids_frac_528.txt": "7e5f6bfc414b752c85be83c2bb466e86c7daaae452be83e1c8270fbce245f957",
+    "qe_nscf.in": "de690d5f59674ad1dcdd1fee1e32d6a1b87cc07e39d25404726dafc5a33b8288",
+    "qe_pw2bgw.in": "42f764125eed719c58fb24e0f24fd389e8f7d74e5578a057a89da962222a6fc0"
+  },
+  "dft_context": {
+    "qe_pw2bgw.in": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Si/00_si_444_sym_soc_128b/qe/nscf/pw2bgw.in",
+      "bytes": 432,
+      "sha256": "42f764125eed719c58fb24e0f24fd389e8f7d74e5578a057a89da962222a6fc0",
+      "provenance": "Exact converter deck from the raw-DFT parent named in Si200/manifest.yaml. Original parent WFN.h5 and imported Si200 WFN.h5 both have the WFN SHA recorded above. Copied without modification; no generated replacement input."
+    }
+  }
+}

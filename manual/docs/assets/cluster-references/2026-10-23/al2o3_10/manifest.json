@@ -1,0 +1,210 @@
+{
+  "case": "al2o3_10",
+  "status": "COMPLETE_CANONICAL_OUTPUTS_PASS_ALL_4_RANKS",
+  "source_commit": "2d2ca2f104a085876a573e8b1278a7874c479b98",
+  "input_files": {
+    "WFN.h5": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/qe/WFN.h5",
+      "realpath": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/qe/WFN.h5",
+      "bytes": 332521620,
+      "sha256": "9bbae7c6f6ad9b8d51e4fa1f01a500588244799a136bc326173ce7676120b1e1"
+    },
+    "data-file-schema.xml": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/qe/data-file-schema.xml",
+      "realpath": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/qe/data-file-schema.xml",
+      "bytes": 172301,
+      "sha256": "baaf207f739021a7751619421b8f325704d9fdcddb97c9491d6f461dddcec12f"
+    },
+    "Al.upf": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/qe/nscf/Al.upf",
+      "realpath": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/assets/pseudopotentials/standard/Al.upf",
+      "bytes": 346080,
+      "sha256": "0674454d87460e8184c858c6628332728daa8f5c130dda89521593a240bc3da0",
+      "upf_header": {
+        "element": "Al",
+        "pseudo_type": "NC",
+        "is_ultrasoft": "F",
+        "is_paw": "F",
+        "has_so": "T",
+        "functional": "PBE",
+        "z_valence": "    3.00",
+        "relativistic": "full"
+      }
+    },
+    "O.upf": {
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Al2O3/01_pbe80_nosoc_prim10_cr80_20261001/qe/nscf/O.upf",
+      "realpath": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/assets/pseudopotentials/standard/O.upf",
+      "bytes": 174630,
+      "sha256": "8c6886f443f3bfe7b8d18f2f6b28dd8749746d996499a542fff9666da34d7cf6",
+      "upf_header": {
+        "element": "O ",
+        "pseudo_type": "NC",
+        "is_ultrasoft": "F",
+        "is_paw": "F",
+        "has_so": "T",
+        "functional": "PBE",
+        "z_valence": "    6.00",
+        "relativistic": "full"
+      }
+    }
+  },
+  "input_metadata": {
+    "occupied": 24,
+    "nspinor": 1,
+    "stored_bands": 224,
+    "fft_grid": [
+      60,
+      60,
+      60
+    ]
+  },
+  "resolved_request": {
+    "kgrid": [
+      4,
+      4,
+      4
+    ],
+    "sum_bands": 154,
+    "centroid_count": 1584,
+    "centroid_fit_window": "0:30,0:154",
+    "nval": 24,
+    "ncond": 6,
+    "protected_bands_1based": [
+      1,
+      30
+    ],
+    "frontier_reference": [
+      24,
+      25
+    ]
+  },
+  "nk_full": 64,
+  "nk_stored": 13,
+  "sum_band_carrier_P4": 156,
+  "physical_centroids": 1584,
+  "packed_centroid_extent": null,
+  "packed_extent_note": "Not emitted in saved production report; no guessed extent.",
+  "centroid_command": "python -m centroid.kmeans_cli 1584 --seed 42 --fit-window 0:30,0:154 -i gw.in",
+  "launch": {
+    "ranks": 4,
+    "nodes": 1,
+    "gpu_model": "NVIDIA A100-SXM4-80GB",
+    "cores_per_rank": 16,
+    "threads_per_core": 1,
+    "budget_gb": 66.35,
+    "deck": "gw.in",
+    "original_wfn_relative_path": "../qe/WFN.h5",
+    "OMP_NUM_THREADS": 14,
+    "BLAS_threads": 1,
+    "cpu_binding": "threads"
+  },
+  "native_libraries": {
+    "cuda_sha256": "bf46de448d60525dfce7d64a00a2621d621e7526e381e001fa4093a29dd9cafa",
+    "host_sha256": "17932d83c572f8f6a119cbdc03f8f064e5ac9a279010c7bda1a1aa90fcf486ca"
+  },
+  "main_wall_seconds": 39.23,
+  "stages": [
+    {
+      "stage": "setup",
+      "wall_seconds": 14.31,
+      "fraction_percent": 36.47,
+      "reported_device_peak_GB": null
+    },
+    {
+      "stage": "ISDF basis and Coulomb metric",
+      "wall_seconds": 13.88,
+      "fraction_percent": 35.38,
+      "reported_device_peak_GB": 19.03
+    },
+    {
+      "stage": "Screening",
+      "wall_seconds": 4.48,
+      "fraction_percent": 11.41,
+      "reported_device_peak_GB": 1.14
+    },
+    {
+      "stage": "Self-energy",
+      "wall_seconds": 5.96,
+      "fraction_percent": 15.19,
+      "reported_device_peak_GB": 2.35
+    },
+    {
+      "stage": "Quasiparticle bands",
+      "wall_seconds": 0.57,
+      "fraction_percent": 1.46,
+      "reported_device_peak_GB": 0.24
+    },
+    {
+      "stage": "other driver work",
+      "wall_seconds": 0.04,
+      "fraction_percent": 0.09,
+      "reported_device_peak_GB": 0.24
+    },
+    {
+      "stage": "total run",
+      "wall_seconds": 39.23,
+      "fraction_percent": 100.0,
+      "reported_device_peak_GB": 19.03
+    }
+  ],
+  "compile_cache": {
+    "real_compiles": 10,
+    "summed_compile_seconds": 2.4,
+    "hits": 271,
+    "uncacheable": 0,
+    "state": "Existing shared persistent JAX/native caches; explicit mixed compile/hit counts. These are references, not a controlled cold/warm speed comparison."
+  },
+  "reported_device_peak": {
+    "GB_decimal_rounded": 19.03,
+    "stage": "zeta",
+    "scope": "Production per-stage JAX pool high-water, max across ranks; not NVML reserved memory or total physical CUDA/native-private workspace."
+  },
+  "reported_host_ru_maxrss_GB": {
+    "max": 4.46,
+    "min": 4.45
+  },
+  "exact_native_pointer_peak_available": false,
+  "sigma_shape": [
+    2,
+    13,
+    30,
+    30
+  ],
+  "eqp": [
+    {
+      "file": "eqp0.dat",
+      "kpoints": 13,
+      "rows": 390,
+      "bands": [
+        1,
+        30
+      ],
+      "finite": true
+    },
+    {
+      "file": "eqp1.dat",
+      "kpoints": 13,
+      "rows": 390,
+      "bands": [
+        1,
+        30
+      ],
+      "finite": true
+    }
+  ],
+  "dynamic_coverage": [
+    "coverage       COMPLETE: margins 2.03 eV below and 2.08 eV above the requested bands"
+  ],
+  "preprocessing": "Fresh final GW; authenticated centroids/dipole/kinetic-ionic outputs reused from fresh Al02 preparation.",
+  "evidence_archive": "/global/cfs/cdirs/m4598/jackm/lorrax_evidence/gwjax_shared_pole_20261023/gnppm_references_main_2d2",
+  "evidence_manifest_sha256": "b6797e00fff1384c80b3b5edeb9103a9e796762b4a66641b5ee8656d7b592f62",
+  "report_sha256": "248762d2cd34b9554ba0dcb2141cba905457e949660e955fd7b36084dae93694",
+  "scope": "Fixed-input native GNPPM G0W0 through canonical Sigma/QP; no convergence, BGW equality, 40 GB fit or hard-cap claim.",
+  "included_text_files": {
+    "qe_scf.in": "08715e728990a198f6cd01a2480dfa58bae55c9c0b08c847b9744bb4879bfa81",
+    "gw.in": "3a8be59bcec38818fa32f8eb556496f11878aada3db1db55064f58ca9ecc72b0",
+    "qe_pw2bgw.in": "b4c76cc3f30b5bf78c086fe242f1f15abc76a9ad62f6c85f7c8ec91fa9272d88",
+    "centroids_frac_1584.txt": "f259fac0d7ef9cac81eda623a7e34a0502e6c3b29091062e6f181131e7007b29",
+    "qe_nscf.in": "f0339594850807a124ad27707b6dcd72a87f43419f274f5167f1e4c6db1a0144"
+  }
+}

@@ -202,7 +202,7 @@ Copy `config/perlmutter/` and replace the site-specific pieces:
 | `site.toml` (NCCL plugin and libfabric settings) | the site's NCCL network plugin and its recommended variables, or nothing on a single node |
 | `gpu_env.sh` (`no_vni`, GTL off, the `libcudart` link) | the site's equivalents; on a single machine, `config/local/launch.sh` with `mpirun` |
 | `select_gpu.sh` | keep it; it reads Slurm's variables, or `LORRAX_GPU_DEVICE` elsewhere |
-| cuSOLVERMp 0.9.1 and cuBLASMp 0.10.0 wheels | the same wheels; where cuBLASMp 0.10 is not available, 0.9.1.3056 (the `config/local/` pin) |
+| cuSOLVERMp 0.9.1 and cuBLASMp 0.10.0 wheels | the same wheels, from pypi.org |
 
 Build each leg with a site script that ends the way the Perlmutter and `config/local/` scripts do: CMake with explicit `-D` paths, then `src/ffi/cpp/stage/write_checkout_closure.py` on the library, which writes the `.closure.json` every startup requires (a leg without one refuses with `no closure record`), then `scripts/verify_ffi_build.sh`. On a cluster without Cray compiler wrappers, `config/local/build_ffi.sh` and `build_ffi_host.sh` are the closer template: plain `gcc`/`g++`, nvcc from the wheels, and the system MPI and ScaLAPACK. Check the result with the test suite ([below](#check)).
 
