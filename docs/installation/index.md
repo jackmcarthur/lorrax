@@ -10,7 +10,7 @@ libraries](ffi-build.md) on any other site); the [Quickstart](../quickstart.md) 
 
 A LORRAX process needs three things.
 
-1. **Python ≥ 3.12 with the JAX/JAXLIB 0.9 series** and the packages
+1. **Python ≥ 3.12 with the JAX/JAXLIB 0.12 series** and the packages
    `pyproject.toml` pins. On NVIDIA GPUs the CUDA extra (`cuda12` or
    `cuda13`) also installs `nvidia-mathdx`, whose headers the k-convolution
    kernels are compiled from at run time ([k-convolution](../architecture/kconv.md)).
@@ -31,11 +31,11 @@ A LORRAX process needs three things.
 
 ## The JAX contract {#jax}
 
-LORRAX supports exactly the JAX/JAXLIB 0.9 series:
+LORRAX supports exactly the JAX/JAXLIB 0.12 series:
 
 ```text
-jax     >= 0.9.0, < 0.10.0
-jaxlib  >= 0.9.0, < 0.10.0
+jax     >= 0.12.0, < 0.13.0
+jaxlib  >= 0.12.0, < 0.13.0
 ```
 
 Patch upgrades inside the series are allowed; any other minor generation of
@@ -47,8 +47,9 @@ window:
 
 1. `pyproject.toml` constrains the base, `cuda12`, `cuda13` and development
    installs;
-2. `tools/require_jax09.py` checks the installed package metadata before a
-   launcher's first JAX import, without importing JAX;
+2. `tools/require_jax.py` checks the installed package metadata before a
+   launcher's first JAX import, without importing JAX (it reads the window
+   from `runtime/jax_support.py`);
 3. `runtime.jax_support.enforce()`, step 5b of
    `runtime.initialize_communicator_stack` (after the first `jax.devices()`,
    before the first `jit`), checks both live packages and the parameter names
@@ -58,7 +59,7 @@ window:
    container build can report an allowed version over a different
    `jax._src`.
 
-JAX 0.9 does not certify a native library: the library's CUDA major, its
+JAX does not certify a native library: the library's CUDA major, its
 handler ABI and its dependency closure are checked separately when it loads
 ([the ABI rule](ffi-build.md#abi)).
 
@@ -66,7 +67,7 @@ handler ABI and its dependency closure are checked separately when it loads
 
 | platform | default route | page |
 |---|---|---|
-| NERSC Perlmutter (A100, CUDA 13.2, JAX 0.9.1) | the module stack: one venv, one source snapshot and one sealed FFI bundle, loaded with `module load`; a development clone builds its own pair and runs with plain `srun` | [Perlmutter](perlmutter.md) |
+| NERSC Perlmutter (A100, CUDA 13.2, JAX 0.12.0.1) | the module stack: one venv, one source snapshot and one sealed FFI bundle, loaded with `module load`; a development clone builds its own pair and runs with plain `srun` | [Perlmutter](perlmutter.md) |
 | TACC Frontera (CPU) | a clone with the host leg from `config/frontera/build_ffi_host.sh`, run inside the site's apptainer image | [Frontera](../environment/machines/frontera.md), `config/frontera/README.md` |
 | a workstation, laptop or rented GPU box (one node, NVIDIA driver) | a clone built with `config/local/`: CUDA 13 from pip wheels, parallel HDF5 built once, both legs built by its scripts | `config/local/README.md` |
 | any other machine | a clone: `uv sync` with the platform's JAX extra, both legs built and sealed from the stage scripts | [Building the FFI libraries](ffi-build.md) |
@@ -84,7 +85,7 @@ explains how to port one.
 | `partial sealed-bundle override refused` | only one leg of the bundle's pair is pinned (`LORRAX_FFI_HOST_SO` with `LORRAX_FFI_SO` or `LORRAX_FFI_ROCM_SO`) | unset both, or pin both legs of one sealed bundle |
 | `mixed native providers` | the two selected legs claim different bundle manifests | select both legs from one bundle |
 | `GATE native-closure: got …; want …; fix: …` | the leg has no or a stale dependency record, or the process maps a library other than the recorded one, or two copies of one | the message's fix; the table in [the dependency closure](ffi-build.md#closure) |
-| `JAX09_ENV_REFUSED` (from `tools/require_jax09.py`), or the `runtime.jax_support` refusal before the first `jit` | JAX or JAXLIB outside the 0.9 series, or a `jax._src` of the wrong shape | install the 0.9 series (§ [JAX contract](#jax)) |
+| `JAX_ENV_REFUSED` (from `tools/require_jax.py`), or the `runtime.jax_support` refusal before the first `jit` | JAX or JAXLIB outside the 0.12 series, or a `jax._src` of the wrong shape | install the 0.12 series (§ [JAX contract](#jax)) |
 | `GATE mathdx-headers` | a CUDA run without `nvidia-mathdx` in the venv | `uv sync --extra cuda13` (or `cuda12`) |
 
 An unsealed library from a build tree loads with a `LEGACY-UNSEALED`

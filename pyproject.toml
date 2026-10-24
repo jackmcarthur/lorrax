@@ -29,10 +29,10 @@ dependencies = [
     # how the Perlmutter GPU leg came to run four minors below it unnoticed.
     #
     # One generation everywhere.  The tracked lock and Perlmutter module use
-    # 0.9.1; the series window permits patch releases while refusing old
-    # CUDA-12/JAX-0.7 launchers and unmeasured 0.10+ stacks at startup.
-    "jax>=0.9.0,<0.10.0",
-    "jaxlib>=0.9.0,<0.10.0",
+    # 0.12.0.1; the series window permits patch releases while refusing older
+    # launchers and unmeasured 0.13+ stacks at startup.
+    "jax>=0.12.0,<0.13.0",
+    "jaxlib>=0.12.0,<0.13.0",
     "matplotlib>=3.10.3",
     "numpy>=2.3.1",
     "scipy>=1.16.0",
@@ -69,7 +69,7 @@ docs = [
 # CPU-ONLY installs need NEITHER extra: the base `jax`/`jaxlib` dependency is
 # the CPU build, which is what the host-platform FFI leg runs against.
 #
-# Perlmutter uses the bare-host CUDA-13/JAX-0.9 module; Frontera's RTX lane
+# Perlmutter uses the bare-host CUDA-13/JAX-0.12 module; Frontera's RTX lane
 # uses the CUDA-12 extra.  Both remain in the same JAX generation.
 #
 # nvidia-mathdx is REQUIRED on every NVIDIA GPU (owner ruling, decisions.md
@@ -77,10 +77,17 @@ docs = [
 # cuFFTDx kernels at run time from this wheel's headers (header-only, no
 # binaries, no dependencies).  A CUDA run without it refuses at startup
 # (GATE mathdx-headers).  Pinned to the version the kernels were validated on.
-cuda12 = ["jax[cuda12]>=0.9.0,<0.10.0",
+#
+# cuSOLVERMp / cuBLASMp (cuda13 only): the CUDA leg's distributed eigh/LU
+# engines, which config/perlmutter/build_ffi_cuda.sh compiles and links against
+# and whose files the leg's closure record names.  Pinned exactly: the leg is
+# built and validated against these, and build_ffi_cuda.sh asserts them.
+cuda12 = ["jax[cuda12]>=0.12.0,<0.13.0",
           "nvidia-mathdx==25.6.0; sys_platform == 'linux'"]
-cuda13 = ["jax[cuda13]>=0.9.0,<0.10.0",
-          "nvidia-mathdx==25.6.0; sys_platform == 'linux'"]
+cuda13 = ["jax[cuda13]>=0.12.0,<0.13.0",
+          "nvidia-mathdx==25.6.0; sys_platform == 'linux'",
+          "nvidia-cusolvermp-cu13==0.9.1.9318.post1; sys_platform == 'linux'",
+          "nvidia-cublasmp-cu13==0.10.0.3695; sys_platform == 'linux'"]
 
 [project.scripts]
 lorrax-gw = "gw.gw_jax:main"
@@ -142,8 +149,8 @@ jax = [
     # CPU/base only — see [project.optional-dependencies] cuda12 / cuda13 for
     # the per-site GPU variant.  Do not re-pin a CUDA major here.
     # Same window as [project.dependencies] and src/runtime/jax_support.py.
-    "jax>=0.9.0,<0.10.0",
-    "jaxlib>=0.9.0,<0.10.0",
+    "jax>=0.12.0,<0.13.0",
+    "jaxlib>=0.12.0,<0.13.0",
 ]
 build = [
     "scikit-build-core>=0.11.0",

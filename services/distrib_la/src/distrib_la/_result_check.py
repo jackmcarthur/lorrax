@@ -12,9 +12,8 @@ check retries where the operands survive; a result that still fails is
 NaN-poisoned on every rank, named on rank 0's stderr (GATE
 distrib_la_result_check) and raised. The device returns each check's
 errors with its flag (:func:`checked`) and the host prints the notices after
-the call, so no program carries a host callback: JAX's persistent compile
-cache never stores a program with one, and every checked program would
-compile again in every process. There is no dial.
+the call, so no program carries a host callback, and no checked program
+stops at every call for a device-to-host round trip. There is no dial.
 
 Acceptance (:func:`accept`) is on backward errors, which a backward-stable
 solver keeps near n * eps whatever the condition number:
@@ -592,7 +591,7 @@ def checked_program(fn, mesh, out_shardings, in_shardings=None, compiler_options
 
 
 #: Sites whose traced status took the host-callback fallback (warned once each).
-_UNCACHEABLE: set = set()
+_HOST_CALLBACK_SITES: set = set()
 
 
 def raise_if_failed(status, op, n, dtype, site):
@@ -603,20 +602,20 @@ def raise_if_failed(status, op, n, dtype, site):
     together; only the printing depends on the rank. A traced status goes to
     the enclosing :func:`checked_program`, if any; a traced status outside
     one prints its notices through a host callback (the only program that
-    keeps one, and so is not stored by JAX's persistent cache: it warns once
-    per site, naming it).
+    keeps one, and so waits on the host at every call: it warns once per
+    site, naming it).
     """
     if isinstance(status[0], jax.core.Tracer):
         if _program_context() is not None:
             _program_context()[1].append((status, (op, int(n), dtype, site)))
         else:
-            if site not in _UNCACHEABLE and jax.process_index() == 0:
-                print(f"distrib_la: UNCACHEABLE: a checked {op} at {site} is traced outside "
+            if site not in _HOST_CALLBACK_SITES and jax.process_index() == 0:
+                print(f"distrib_la: HOST CALLBACK: a checked {op} at {site} is traced outside "
                       f"distrib_la.checked_program, so the program holding it carries a host callback "
-                      f"and JAX's persistent cache never stores it (it compiles again in every "
-                      f"process); build that program with distrib_la.checked_program",
+                      f"and waits on the host at every call; build that program with "
+                      f"distrib_la.checked_program",
                       file=sys.stderr, flush=True)
-            _UNCACHEABLE.add(site)
+            _HOST_CALLBACK_SITES.add(site)
             jax.debug.callback(lambda failed, errors: _notices((failed, errors), op, int(n), dtype, site,
                                                                final=True), *status)
         return

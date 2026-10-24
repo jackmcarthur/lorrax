@@ -117,7 +117,7 @@ per process (`ensure_jax_compile_cache`, step 7 of
 | location | `$SCRATCH/.cache/lorrax/jax_compile/<namespace>/np{P}`. The namespace names jax, jaxlib, the FFI bundle and the key schema (`cache_namespace`), never the LORRAX commit, which reaches a program only through its HLO |
 | writes | process 0 only, every program it compiles (threshold 0 s). Every rank reads, so at $P > 1$ the directory must be on a filesystem every node sees |
 | ranks | on a miss every rank compiles the module itself (claim 683). Every rank asks for rank 0's key. JAX strips the device assignment from a GPU key. A CPU key would also carry the device assignment and the process's own devices (the head of the serialized topology), so no peer key matched rank 0's and on a warm CPU P4 run ranks 1–3 compiled all 642 programs. At $P > 1$ `_install_rank_invariant_cpu_key` strips both, and every rank hits 630 of 633 requests, as rank 0 does (claim 4221). JAX's per-fusion XLA caches are off at $P > 1$ |
-| never stored | a program with a host callback: it compiles again in every process, and the counter prints `UNCACHEABLE <module>` the first time. A checked dense solve stays callback-free inside [`distrib_la.checked_program`](../services/distrib_la/api.md#dense-factorizations). The hsuite has three (claim 4139) |
+| host callbacks | stored like any other program since JAX 0.12 (`compiler._cache_write` refused them through 0.9). A checked dense solve stays callback-free inside [`distrib_la.checked_program`](../services/distrib_la/api.md#dense-factorizations), which spares it a host round trip per call |
 | pruning | default location only. Rank 0 touches every entry it reads and, in a daemon thread at most every 6 h, removes entries and other namespaces unused for 7 days, and the least recently used namespaces earlier past 2 GiB or 200 000 files, never one used in 5 days |
 
 | change | what goes cold |
@@ -155,15 +155,15 @@ GPU-only; a CPU run gets none.
 | flag | leg | effect | claim |
 |---|---|---|---|
 | `--xla_gpu_autotune_level=0` | CUDA | cold compile −12.9 % (Na) and −16.3 % (Si) at P4, execution within noise | 683 |
-| `--xla_gpu_enable_llvm_module_compilation_parallelism=true` | CUDA | XLA splits each module's LLVM IR into parts compiled in parallel; hsuite release-cold XLA compile 219.5 → 195.2 s, programs of 0.5 s or more −22 %, programs under 50 ms +10 %; results bitwise, device peak unchanged | 4179 |
+| `--xla_gpu_enable_llvm_module_compilation_parallelism=true` | CUDA, no longer set | measured on JAX 0.9.1: XLA split each module's LLVM IR into parts compiled in parallel; hsuite release-cold XLA compile 219.5 → 195.2 s. XLA removed the flag before jaxlib 0.12 (openxla/xla 194f1fe5d9) and aborts on it, so the leg no longer declares it; the 0.12 cold compile is unmeasured | 4179 |
 | `--xla_gpu_autotune_level=0` | ROCM | MI250X P4 seeded cold: XLA compile gnppm 21.8 → 18.3 s, exciton_bands 15.1 → 13.3 s against level 4; warm walls within noise; d/zgemm n = 1024–8192 steady state identical (zgemm 8192: 39.6 TF/s at both) | runtime lane 2026-10-14 (pool logs runtime_a2_flags, runtime_a3) |
 | `--xla_gpu_disable_async_collectives=ALLCOLLECTIVES` | ROCM | every collective runs on the compute stream, in program order. With async collectives an all-reduce on the collective stream and a collective of another communicator on the compute stream are in flight together, and RCCL deadlocks across ranks (all GCDs at 100 %, every rank waiting on the same executable): `qsgw_head._drude_tensor_kernel` (psum over x,y beside psum over y) hung bisp_sc 3/3, the Coulomb-root program hung sp_export 1/1; a 25-line repro of that kernel hangs at iteration 1 and runs 300/300 with the flag. bisp_sc PASS 189.2 s with it (A100 173.7 s) | disteigh lane 2026-10-15 (pool logs disteigh_bisp1-3, disteigh_repro_async/sync) |
 | `rematerialization` added to `--xla_disable_hlo_passes` (`runtime.disable_xla_rematerialization`) | all | On a GPU leg with a readable card total (CUDA, ROCm) a module that then does not fit the device refuses before it runs ([memory model](memory-model.md#module-does-not-fit)); on CPU nothing checks | — |
 
 Not declared for ROCM, each measured on MI250X at P4 (gnppm XLA compile,
 278 programs): `--xla_gpu_force_compilation_parallelism=7` 18.4 s against
-18.3 s, and the LLVM-module flag, which XLA's AMDGPU compiler cannot act on
-(it does not link split modules). Where a ROCm compile goes (gnppm, XLA
+18.3 s, and the LLVM-module flag (since removed from XLA), which XLA's AMDGPU
+compiler could not act on (it does not link split modules). Where a ROCm compile goes (gnppm, XLA
 VLOG timers): HLO passes 4.0 s, backend 12.1 s, of which LLVM AMDGPU codegen
 and HSACO link (`CompileToHsaco`) 6.1 s. Per program that is about 66 ms,
 against 88 ms per program on the A100-80 release-cold hsuite (claim 4212), so
@@ -270,7 +270,7 @@ each large compile; threads overlap whole compiles.
 
 | lever | state | claim |
 |---|---|---|
-| the three uncacheable programs | open: they compile in every process until their host callbacks go | 4139 |
+| the three host-callback programs | closed by JAX 0.12, which stores them; they compiled in every process on 0.9 (claim 4139). Unmeasured on GPU | 4139 |
 | more `compile_ahead` sites | open, none without reordering its owner: the static and direct bank streams wait on the frequency rule, which the moments build; the distrib_la stacks take the call's batch; the ζ kernels compile inside the memory check's loop | — |
 | merging the largest families | not carried: they are distinct by physics (χ integrate's 11 programs are the four-current family blocks and node sets, the MPA window runner's bisp_sc programs the sectors' pole-panel widths, the tangential rounds one per sector), and merging their shapes adds masked work | 4155 |
 | keep the in-memory caches between hsuite stages | rejected: warm 161.5 s against 161.9 s | 4130 |
@@ -287,9 +287,9 @@ alone is 199.2 s (claim 4212).
 
 | line | printed | read it as |
 |---|---|---|
-| `<stage> compile: real R (S s), cache hits H, uncacheable U [names]` | rank 0, at the end of each driver and SC map (`compile_receipt`) | from SC map 2 on, R > 0 means the map recompiled a program it had; U > 0 compiles in every process |
+| `<stage> compile: real R (S s), cache hits H` | rank 0, at the end of each driver and SC map (`compile_receipt`) | from SC map 2 on, R > 0 means the map recompiled a program it had |
 | `disk-cache hit`, `NVRTC built` | rank 0, one per image, under `[kconv_mathdx]`, `[kconv_outer]` or `[fourier_plan]` | the k-convolution line also prints `NVRTC rebuilt (cached image refused)`; it and the Fourier pair print `store FAILED` where the cubin could not be written |
-| the `Environment` startup line | always | both XLA flags with their provenance, and the agreement's state |
+| the `Environment` startup line | always | the leg's XLA flags with their provenance, and the agreement's state |
 | the cache directory; `[kconv]` | with `LORRAX_DEBUG_PRINT=1` | the `[kconv]` line names the wheel root and the cubin cache's image count, including the images linked from the store |
 | every compile with its seconds | with `JAX_LOG_COMPILES=1` | — |
 
@@ -307,4 +307,4 @@ fail on a program built per call, per value or per context.
 | `persistent compile cache OFF (…)`, `DISABLED: cannot arm …` | the opt-out, `MAX_SIZE=0`, or a directory that cannot be made | [registry §2e](../reference/env_vars.md#2e-compile-cache) |
 | `compile-storm telemetry OFF`, `jax-compat: …` | at $P = 1$, a `jax._src` surface the counter or the fit gate wraps is absent or renamed | the [JAX contract](../installation/index.md#jax); the startup check refuses an unsupported JAX first |
 | `GATE compile-agreement`, `REFUSED: jax-support.private-arity` | at $P > 1$, the compile agreement or the device-fit gate cannot install: without them a rank-divergent compile hangs the mesh | the [JAX contract](../installation/index.md#jax) |
-| `distrib_la: UNCACHEABLE` | a checked solve traced outside `checked_program`, so its program keeps a host callback | build that program with `distrib_la.checked_program` |
+| `distrib_la: HOST CALLBACK` | a checked solve traced outside `checked_program`, so its program keeps a host callback and waits on the host at every call | build that program with `distrib_la.checked_program` |

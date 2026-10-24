@@ -25,12 +25,12 @@ LORRAX_LOCAL_BUILD="${LORRAX_LOCAL_BUILD:-$LORRAX_LOCAL_ROOT/src/ffi/cpp/build_l
 LORRAX_LOCAL_PHDF5_VERSION="${LORRAX_LOCAL_PHDF5_VERSION:-1.14.6}"
 LORRAX_LOCAL_PHDF5="${LORRAX_LOCAL_PHDF5:-$LORRAX_LOCAL_NATIVE/phdf5-$LORRAX_LOCAL_PHDF5_VERSION}"
 
-LORRAX_LOCAL_JAX_VERSION="${LORRAX_LOCAL_JAX_VERSION:-0.9.1}"
-# Perlmutter's lane pins cuBLASMp 0.10.0.3695; that wheel is on neither
-# pypi.org nor pypi.nvidia.com as of 2026-08-26, so this lane pins the
-# newest published cu13 wheel instead.  compat.h guards the API delta.
+LORRAX_LOCAL_JAX_VERSION="${LORRAX_LOCAL_JAX_VERSION:-0.12.0.1}"
+# The same cuSOLVERMp/cuBLASMp pair as the cuda13 extra in pyproject.toml
+# (the Perlmutter lane); cuSOLVERMp 0.9.1.9318.post1 itself requires
+# cuBLASMp >= 0.10.0.3695.
 LORRAX_LOCAL_CUSOLVERMP_VERSION="${LORRAX_LOCAL_CUSOLVERMP_VERSION:-0.9.1.9318.post1}"
-LORRAX_LOCAL_CUBLASMP_VERSION="${LORRAX_LOCAL_CUBLASMP_VERSION:-0.9.1.3056}"
+LORRAX_LOCAL_CUBLASMP_VERSION="${LORRAX_LOCAL_CUBLASMP_VERSION:-0.10.0.3695}"
 # nvidia-mathdx: header-only cuFFTDx, REQUIRED on NVIDIA GPUs (the k-convolution
 # router's only CUDA backend; docs/architecture/decisions.md 2026-09-24).
 LORRAX_LOCAL_MATHDX_VERSION="${LORRAX_LOCAL_MATHDX_VERSION:-25.6.0}"

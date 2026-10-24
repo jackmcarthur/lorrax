@@ -9,19 +9,17 @@
 #   python/                          uv-managed CPython the venv is built on
 #   venv/                            the runtime venv (setup_env.sh); LORRAX_MODULE_VENV
 #                                    names another absolute path
-#   native/                          cuSOLVERMp stage, shared by builds
-#                                    (not build/: the sealer refuses search paths
-#                                    through a directory named build)
 #   releases/source-<rev8>/          git-archive snapshots (publish.sh)
 #   releases/<rev8>-bundle-<id12>/   sealed FFI bundles (publish.sh)
 #   modulefiles/<name>/<version>.lua the published module (publish.sh)
 #
-# The CUDA runtime and math libraries are a clone's: the wheels of the
-# checkout's uv.lock `cuda13` extra (JAX's cuda13 plugin, nvidia-cublas,
+# The CUDA toolchain, runtime and math libraries are a clone's: the wheels of
+# the checkout's uv.lock `cuda13` extra (JAX's cuda13 plugin, nvidia-cublas,
 # -cufft, -cusolver, -cusparse, -cuda-runtime, -cuda-nvrtc, -nvjitlink,
-# cuDNN, NCCL, nvidia-mathdx), installed by setup_env.sh exactly as locked.
-# The site's cudatoolkit module supplies nvcc for building the legs, and the
-# modulefile loads it so PATH and CUDA_HOME are those of a clone shell; none
+# -cuda-nvcc, cuDNN, NCCL, nvidia-mathdx, cuSOLVERMp/cuBLASMp), installed by
+# setup_env.sh exactly as locked; the legs are compiled with that nvcc.  The
+# modulefile loads the site's cudatoolkit module so PATH and CUDA_HOME are
+# those of a clone shell; none
 # of its CUDA libraries is on the module's LD_LIBRARY_PATH or in a leg's
 # closure.  The FFI legs are built by ../build_ffi_{host,cuda}.sh, whose MPI
 # and HDF5 pins (../ffi_mpi.sh) this file does not repeat.
@@ -48,11 +46,11 @@ MODULE_VERSION="${LORRAX_MODULE_VERSION:-0.1.0}"
 # --- pins --------------------------------------------------------------------
 PYTHON_VERSION="3.12"
 TOOLKIT_MODULE="cudatoolkit/13.2"
-JAX_VERSION="0.9.1"                  # asserted against the lock by setup_env.sh
+JAX_VERSION="0.12.0.1"               # asserted against the lock by setup_env.sh
 LOCK_EXTRA="cuda13"                  # the extra a clone syncs (uv sync --extra cuda13)
 CUSOLVERMP_VERSION="0.9.1.9318.post1" # also pinned in ../build_ffi_cuda.sh
 CUBLASMP_VERSION="0.10.0.3695"        # also pinned in ../build_ffi_cuda.sh
-NCCL_VERSION="2.30.7"                # nvidia-nccl-cu13: the uv.lock pin, on every route
+NCCL_VERSION="2.32.3"                # nvidia-nccl-cu13: the uv.lock pin, on every route
                                      # (also ../build_ffi_cuda.sh); never comm_libs NCCL;
                                      # asserted against the lock by setup_env.sh
 # shellcheck disable=SC1091

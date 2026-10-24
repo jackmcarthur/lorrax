@@ -5,6 +5,36 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-23 — JAX/JAXLIB 0.12 series (was 0.9)
+
+- **Changed.** `jax` and `jaxlib` are `>= 0.12.0, < 0.13.0`, locked at 0.12.0.1
+  (with the cuda12/cuda13 plugin and PJRT wheels). Every other minor series,
+  0.9 included, refuses at startup. The lock also updates the CUDA/NCCL wheels and native math-library pins.
+  Re-run `uv sync` (with the site's extra); rebuild the Perlmutter module
+  (`config/perlmutter/module/stack.sh` pins 0.12.0.1).
+- **XLA flag removed.** XLA dropped `--xla_gpu_enable_llvm_module_compilation_parallelism`
+  and aborts at backend start on an unknown flag (`Unknown flag in XLA_FLAGS`).
+  The CUDA leg no longer appends it, and the startup block no longer reports it.
+  Remove it from any `XLA_FLAGS` a launcher or module sets. Its measured 0.9.1
+  gain (hsuite release-cold XLA compile 219.5 → 195.2 s) is unmeasured on 0.12.
+- **Rebuild both FFI legs.** jaxlib 0.12 ships XLA FFI API 0.5 (0.9.1 shipped 0.3);
+  the legs compile against the runtime jaxlib's headers. Seal a new bundle.
+- **Renamed.** `tools/require_jax09.py` is `tools/require_jax.py`, and its lines are
+  `JAX_ENV_OK` / `JAX_ENV_REFUSED` (were `JAX09_ENV_*`). Launchers that call
+  the old path or grep the old tokens must change. It now reads its window from
+  `runtime/jax_support.py`.
+- **Compile cache.** JAX 0.12 stores programs that carry a host callback
+  (`io_callback`, `jax.debug.callback`), which 0.9 recompiled in every process.
+  The compile receipt drops its `uncacheable U [names]` field and the
+  `UNCACHEABLE` notice; the hsuite census drops `uncacheable`. distrib_la's
+  fallback notice is `distrib_la: HOST CALLBACK`. Cache namespaces name jax and
+  jaxlib, so 0.12 starts cold.
+- **Results.** The original upgrade branch has a recorded four-rank GPU driver
+  check; qualification of the combined current-main source is separate. JAX
+  0.10–0.12 changed numerics in functions this tree calls (complex `abs` now
+  lowers through scaled `hypot`), so retain the existing reference tolerances
+  while checking last-digit differences against 0.9.
+
 ## 2026-10-23 — W_BSE uses physical resonant and antiresonant pairs
 
 The ladder density response now retains the distinct physical transitions

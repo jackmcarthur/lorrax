@@ -500,12 +500,6 @@ _X64_ENV = "JAX_ENABLE_X64"
 #: first JAX backend exists, while a deployment-provided value must win.
 _XLA_FLAGS_ENV = "XLA_FLAGS"
 _XLA_GPU_AUTOTUNE_FLAG = "--xla_gpu_autotune_level"
-#: XLA compiles each module's LLVM IR in parallel parts; the same merge and
-#: the same rule as the autotune level (a caller's value wins), results bitwise
-#: and the device peak unchanged (sandbox claim 4179).  Not
-#: ``--xla_gpu_force_compilation_parallelism``, which forces a thread count
-#: and slowed cold compile 3.0 % (claim 684).
-_XLA_GPU_LLVM_PARALLEL_FLAG = "--xla_gpu_enable_llvm_module_compilation_parallelism"
 #: The VALUES are per leg (``PlatformLeg.xla_flag_defaults``): the same flag
 #: can be a measured win on one vendor and a no-op or a loss on another.
 
@@ -515,8 +509,6 @@ _XLA_GPU_LLVM_PARALLEL_FLAG = "--xla_gpu_enable_llvm_module_compilation_parallel
 _XLA_GPU_AUTOTUNE = {
     "value": None,
     "provenance": "runtime.set_default_env has not run",
-    "llvm_parallel": None,
-    "llvm_parallel_provenance": "runtime.set_default_env has not run",
     "applicable": None,
     "xla_flags": None,
 }
@@ -551,9 +543,8 @@ def set_default_xla_gpu_autotune(*, platform: str = "gpu") -> dict:
     The flags and their values are the leg's ``xla_flag_defaults``
     (:data:`lxkit.LEGS`; evidence in ``docs/architecture/compilation.md``
     section 3).  CUDA: ``--xla_gpu_autotune_level=0`` (sandbox claims
-    683--684: cold compile shorter, execution inside run-to-run noise) and
-    ``--xla_gpu_enable_llvm_module_compilation_parallelism=true`` (claim
-    4179).  ROCm: see its row.  The leg is the one ``JAX_PLATFORMS`` selects,
+    683--684: cold compile shorter, execution inside run-to-run noise).
+    ROCm: see its row.  The leg is the one ``JAX_PLATFORMS`` selects,
     else the installed plugin's (:func:`_gpu_leg`).  All are GPU-only XLA
     flags: a forced CPU startup leaves ``XLA_FLAGS`` byte-for-byte unchanged
     so the host/FFTW chain never depends on a GPU parser accepting them.
@@ -562,9 +553,9 @@ def set_default_xla_gpu_autotune(*, platform: str = "gpu") -> dict:
     either accepted spelling is neither rewritten nor appended, and its last
     value is recorded as caller provenance; a missing one is appended as
     exactly one token, preserving every unrelated flag.  The returned dict is
-    a copy of the receipt the startup report consumes: ``value`` and
-    ``llvm_parallel`` are the two historical flags, ``flags`` every flag the
-    leg declares or the caller set, ``leg`` the leg key.
+    a copy of the receipt the startup report consumes: ``value`` is the
+    autotune level, ``flags`` every flag the leg declares or the caller set,
+    ``leg`` the leg key.
     """
     if platform not in ("gpu", "cpu"):
         raise ValueError(f"platform must be 'gpu' or 'cpu', got {platform!r}")
@@ -572,7 +563,7 @@ def set_default_xla_gpu_autotune(*, platform: str = "gpu") -> dict:
     raw = os.environ.get(_XLA_FLAGS_ENV, "")
     leg = _gpu_leg() if platform == "gpu" else None
     declared = dict(leg.xla_flag_defaults) if leg is not None else {}
-    named = [_XLA_GPU_AUTOTUNE_FLAG, _XLA_GPU_LLVM_PARALLEL_FLAG]
+    named = [_XLA_GPU_AUTOTUNE_FLAG]
     names = named + [f for f in declared if f not in named]
     supplied = {f: _xla_flag_value(raw, f) for f in names}
     flags = {}
@@ -601,8 +592,6 @@ def set_default_xla_gpu_autotune(*, platform: str = "gpu") -> dict:
     _XLA_GPU_AUTOTUNE.update({
         "value": flags[_XLA_GPU_AUTOTUNE_FLAG][0],
         "provenance": flags[_XLA_GPU_AUTOTUNE_FLAG][1],
-        "llvm_parallel": flags[_XLA_GPU_LLVM_PARALLEL_FLAG][0],
-        "llvm_parallel_provenance": flags[_XLA_GPU_LLVM_PARALLEL_FLAG][1],
         "applicable": applicable,
         "leg": leg.key if leg is not None else None,
         "flags": {f: {"value": v, "provenance": why} for f, (v, why) in flags.items()},
@@ -994,10 +983,12 @@ def set_default_gpu_pool() -> None:
             f"usual source.")
 
 
-#: The four values jaxlib accepts for ``XLA_PYTHON_CLIENT_ALLOCATOR``.
-#: Read straight off ``jaxlib/xla_client.py``'s own tuple in
-#: ``generate_pjrt_gpu_plugin_options()``; anything else raises there.
-ALLOCATOR_SPELLINGS = ("default", "platform", "bfc", "cuda_async")
+#: The six values jaxlib accepts for ``XLA_PYTHON_CLIENT_ALLOCATOR``.
+#: Read straight off ``jaxlib/xla_client.py``'s own ``allowed_allocators``
+#: tuple in ``generate_pjrt_gpu_plugin_options()``; anything else raises
+#: there.  Which of them a leg's plugin can build is
+#: ``PlatformLeg.xla_allocators`` (:func:`_check_allocator_on_leg`).
+ALLOCATOR_SPELLINGS = ("default", "platform", "bfc", "cuda_async", "vmm", "address")
 
 #: How jaxlib normalises the value before that comparison: ``.lower()``,
 #: and **no** ``.strip()``.  Mirrored exactly below, so this check accepts
@@ -2603,7 +2594,7 @@ def finalize_process(rc: int = 0):
             # owns the coordination service and can remove it as soon as its
             # own client is closed.  Synchronize immediately beforehand so a
             # fast rank cannot strand a peer in report/effect completion and
-            # provoke WatchJobStateAsync connection-refused noise during an
+            # provoke WatchTasksAsync connection-refused noise during an
             # otherwise clean production shutdown.  This is the shared
             # collective seam, not a driver-specific sleep or stderr filter.
             from common.collectives import barrier as _barrier
@@ -3313,9 +3304,7 @@ def format_startup_report(f: dict) -> list:
     _at = f.get("xla_gpu_autotune") or {}
     if _at.get("applicable"):
         add(f"  XLA GPU autotuning resolved to level {_at.get('value')!r} "
-            f"from {_at.get('provenance')}; LLVM module compilation "
-            f"parallelism resolved to {_at.get('llvm_parallel')!r} from "
-            f"{_at.get('llvm_parallel_provenance')}; the complete resolved "
+            f"from {_at.get('provenance')}; the complete resolved "
             f"XLA_FLAGS value is {_at.get('xla_flags')!r}.")
     else:
         add(f"  The XLA GPU autotune level is not active: "
@@ -3677,9 +3666,7 @@ def format_production_startup_report(f: dict) -> list:
     if autotune.get("applicable"):
         autotune_text = (
             f"XLA GPU autotune={autotune.get('value')} "
-            f"({autotune.get('provenance')}) | LLVM module parallelism="
-            f"{autotune.get('llvm_parallel')} "
-            f"({autotune.get('llvm_parallel_provenance')})")
+            f"({autotune.get('provenance')})")
     else:
         autotune_text = "XLA GPU autotune inactive"
     compile_cache = f.get("compile_cache") or {}

@@ -2,7 +2,7 @@
 
 This lane builds and runs LORRAX on one Ubuntu machine with an NVIDIA driver: a workstation, a laptop under WSL2, or a rented single-node GPU box. Everything comes from pip wheels except two things the machine provides, the kernel driver and the distro OpenMPI. `jax[cuda13]` installs the whole CUDA 13 userspace, `nvcc` included, into `site-packages/nvidia/cu13`, and that prefix serves as the CUDA toolkit root. Parallel HDF5 is built once from source, because Ubuntu's packaged HDF5 (1.10) is below the 1.12 floor of [Building the FFI libraries](../../docs/installation/ffi-build.md).
 
-The pins match the Perlmutter lane (JAX 0.9.1, cuSOLVERMp 0.9.1, CUDA 13). They live in `stack.sh`, which every script sources.
+The pins match the Perlmutter lane (JAX 0.12.0.1, cuSOLVERMp 0.9.1, CUDA 13). They live in `stack.sh`, which every script sources.
 
 ## Requirements
 
@@ -75,7 +75,6 @@ QE is not part of this lane. Copy `WFN.h5` files from another machine, since the
 
 ## How this lane differs from Perlmutter
 
-- **cuBLASMp.** This lane pins 0.9.1.3056, the newest published CUDA 13 wheel. Perlmutter's 0.10.0.3695 is not on pip. To change it, set `LORRAX_LOCAL_CUBLASMP_VERSION`.
 - **NVTX** is a separate wheel (`nvidia-nvtx`) that the JAX closure does not pull in, so `setup_env.sh` installs it.
 - **NCCL, cuDNN and NVSHMEM** keep their own wheel prefixes beside `nvidia/cu13`. `stack.sh` puts each on the runtime library path, and `build_ffi.sh` names NCCL explicitly.
 - **MPI and the distro libraries.** The distro OpenMPI, ScaLAPACK and OpenBLAS live in the system directory that `libmpi` resolves to. `stack.sh` pins that directory, so the dependency closure records them and the run uses the same files.

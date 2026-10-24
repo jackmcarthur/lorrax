@@ -615,10 +615,10 @@ _ALLOC = "XLA_PYTHON_CLIENT_ALLOCATOR"
 
 def test_allocator_env_accepts_exactly_what_jaxlib_accepts():
     """R7.  jaxlib compares ``os.getenv(...).lower()`` against
-    ``('default', 'platform', 'bfc', 'cuda_async')`` — after ``.lower()`` and
-    WITHOUT stripping."""
+    ``('default', 'platform', 'bfc', 'cuda_async', 'vmm', 'address')`` — after
+    ``.lower()`` and WITHOUT stripping."""
     assert _runtime.ALLOCATOR_SPELLINGS == (
-        "default", "platform", "bfc", "cuda_async")
+        "default", "platform", "bfc", "cuda_async", "vmm", "address")
     for tok in ("default", "platform", "bfc", "cuda_async",
                 "BFC", "Cuda_Async"):
         with _Env(**{_ALLOC: tok}):
@@ -696,7 +696,7 @@ def test_allocator_spellings_match_the_installed_jaxlib_if_present():
         return
     with open(hits[0], encoding="utf-8") as fh:
         text = fh.read()
-    marker = "if allocator not in ("
+    marker = "allowed_allocators = ("
     assert marker in text, hits[0]
     frag = text.split(marker, 1)[1].split(")", 1)[0]
     found = tuple(p.strip().strip("'\"") for p in frag.split(",") if p.strip())

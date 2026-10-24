@@ -1,24 +1,25 @@
-"""Startup refusal for a JAX/JAXLIB stack outside the 0.9 series.
+"""Startup refusal for a JAX/JAXLIB stack outside the 0.12 series.
 
 This is the in-process backstop for the package constraints and the tracked
-``tools/require_jax09.py`` launch preflight.  All three must agree.  It checks
+``tools/require_jax.py`` launch preflight.  All three must agree (the
+preflight reads its window from this file).  It checks
 both JAX and JAXLIB after backend initialization but before the first physics
 ``jit``, then checks the private-API shapes used by the persistent compile
 cache.  There is no unsupported-version escape hatch: production and developer
-driver invocations run the same 0.9 contract.
+driver invocations run the same 0.12 contract.
 
 The stricter policy was restored on 2026-08-25 after a staged CUDA-12/JAX-0.7
-launcher survived an earlier environment consolidation.  The current
-Perlmutter lane is bare-host CUDA 13.2 with JAX/JAXLIB 0.9.1, so the former
-CUDA-12 reachability argument no longer applies.  Historical measurements of
-0.5/0.7 remain useful below only as negative controls for the API-shape gate.
+launcher survived an earlier environment consolidation.  The window moved
+from 0.9 to 0.12 on 2026-10-23 (the 0.12 column below).  Historical
+measurements of 0.5/0.7/0.9 remain useful below only as negative controls for
+the API-shape gate.
 
 Why a version-number check ALONE would be the wrong instrument
 --------------------------------------------------------------
 Two measured facts make the version string untrustworthy as the sole evidence:
 
 1. **The string need not describe the API.**  NVIDIA date-stamps its
-   source-built containers.  ``0.5.3.dev20260806`` is stamped the same day
+   source-built containers.  ``0.5.3.dev20260806`` was stamped the same day
    0.9.1 shipped, so a naive ``>=`` on the stamp is meaningless; the honest
    reading is ``jax.version.__version_info__ == (0, 5, 3)`` with
    ``_release_version is None``, i.e. a dev build off the 0.5.3 line.
@@ -53,7 +54,7 @@ The first version gate was wired in 2026-08-06 after four compatibility shims
 were removed from ``common/jax_compile_cache.py``.  The old 0.5 and 0.7
 measurements below are retained as negative controls: they prove that a
 version-stamped but API-incompatible build is rejected before compilation.
-They no longer define a supported production lane; only 0.9 does.
+They no longer define a supported production lane; only 0.12 does.
 
 WHY IT LIVES IN ``runtime/`` — moved from ``common/`` 2026-08-06
 ----------------------------------------------------------------
@@ -110,12 +111,12 @@ __all__ = [
 # The declared support window.  ONE place, and it is the thing pyproject.toml
 # means.  Widening it is a decision that should show up in a diff.
 #
-# The owner requires one generation everywhere.  0.9.1 is the currently
-# deployed and locked release; the declared series leaves patch upgrades
-# possible while refusing 0.8 and 0.10 at startup.
+# The owner requires one generation everywhere.  0.12.0.1 is the locked
+# release; the declared series leaves patch upgrades possible while refusing
+# 0.11 and 0.13 at startup.  tools/require_jax.py reads these two names.
 # --------------------------------------------------------------------------
-SUPPORTED_MIN = (0, 9, 0)
-SUPPORTED_MAX_EXCLUSIVE = (0, 10, 0)
+SUPPORTED_MIN = (0, 12, 0)
+SUPPORTED_MAX_EXCLUSIVE = (0, 13, 0)
 
 # --------------------------------------------------------------------------
 # The private-API shapes this tree is WRITTEN AGAINST.
@@ -124,19 +125,27 @@ SUPPORTED_MAX_EXCLUSIVE = (0, 10, 0)
 # re-measured the same day by importing jax._src inside FOUR container tags on
 # a Perlmutter A100 (JID 56405158) — which corrected two rows:
 #
-#   hook                              0.5.3   0.7.0   0.7.2   0.9.0   0.9.1
-#   --------------------------------  ------  ------  ------  ------  -----
-#   _hash_accelerator_config          3       2       2       2       2
-#   _hash_serialized_compile_options  3       3       3       3       3
-#   get_executable_and_time           3       4       4       4       4
-#   is_executable_in_cache            2       2       2       2       2
-#   backend_compile_and_load          ABSENT  pres.   pres.   pres.   pres.
-#   compilation_cache_check_contents  ABSENT  ABSENT  ABSENT  ABSENT  pres.†
-#   VerificationCache                 ABSENT  ABSENT  ABSENT  ABSENT  pres.†
+#   hook                              0.5.3   0.7.0   0.7.2   0.9.0   0.9.1   0.12.0.1
+#   --------------------------------  ------  ------  ------  ------  -----   --------
+#   _hash_accelerator_config          3       2       2       2       2       2
+#   _hash_serialized_compile_options  3       3       3       3       3       3
+#   get_executable_and_time           3       4       4       4       4       5‡
+#   is_executable_in_cache            2       2       2       2       2       2
+#   backend_compile_and_load          ABSENT  pres.   pres.   pres.   pres.   pres.
+#   compilation_cache_check_contents  ABSENT  ABSENT  ABSENT  ABSENT  pres.†  pres.
+#   VerificationCache                 ABSENT  ABSENT  ABSENT  ABSENT  pres.†  pres.
 #
 #   † the 0.9.1 column is the Frontera venv, measured earlier and NOT
 #     re-measured here.  Every container column IS re-measured, and the
 #     containers are what the GPU leg runs.
+#   ‡ 0.12.0.1 is the PyPI wheel, measured on the WSL CPU box 2026-10-23
+#     (the 0.9.1 PyPI wheel, measured beside it, matches the 0.9.1 column).
+#     ``get_executable_and_time`` gained a fifth parameter, ``host_callbacks``,
+#     which ``compiler._cache_read`` passes positionally.  In the same release
+#     ``compiler._cache_write`` stopped refusing modules with host callbacks,
+#     so such programs now persist (measured: an ``io_callback`` jit hits from
+#     a fresh process and its callback runs).  Every other name in
+#     REQUIRED_PRIVATE_PARAMS below is unchanged from 0.9.1.
 #
 # The ``backend_compile_and_load`` ABSENT is why the try/except around
 # ``_install_compile_counter`` degrades SILENTLY on the 0.5.3 GPU leg: the
@@ -186,7 +195,8 @@ REQUIRED_PRIVATE_PARAMS: dict[tuple[str, str], tuple[tuple[str, ...], str]] = {
     ("jax._src.cache_key", "_hash_serialized_compile_options"):
         (("hash_obj", "compile_options_obj", "strip_device_assignment"), "cache"),
     ("jax._src.compilation_cache", "get_executable_and_time"):
-        (("cache_key", "compile_options", "backend", "executable_devices"), "cache"),
+        (("cache_key", "compile_options", "backend", "executable_devices",
+          "host_callbacks"), "cache"),
     ("jax._src.compilation_cache", "is_executable_in_cache"):
         (("backend", "cache_key"), "cache"),
     ("jax._src.compiler", "compile_or_get_cached"):
@@ -385,9 +395,10 @@ def enforce(*, announce=None) -> None:
             got="; ".join(version_problems),
             want=f"jax and jaxlib >= {_fmt(SUPPORTED_MIN)}, "
                  f"< {_fmt(SUPPORTED_MAX_EXCLUSIVE)} (same window as "
-                 f"pyproject.toml and tools/require_jax09.py)",
-            fix="on Perlmutter select LX_BASE_MODULE=lorrax_A; elsewhere "
-                "install matching jax and jaxlib 0.9.x packages",
+                 f"pyproject.toml and tools/require_jax.py)",
+            fix=f"install matching jax and jaxlib {_fmt(SUPPORTED_MIN[:2])}.x "
+                "packages (uv sync from this checkout's lock); on Perlmutter, "
+                "a base module built from that lock",
         )
     if symbol_problems:
         _refuse(
@@ -395,7 +406,7 @@ def enforce(*, announce=None) -> None:
             got="; ".join(symbol_problems),
             want="the jax._src symbols common/jax_compile_cache.py resolves at "
                  "call time",
-            fix="use the certified JAX/JAXLIB 0.9 environment whose private "
+            fix="use the certified JAX/JAXLIB 0.12 environment whose private "
                 "surface matches this tree",
         )
     _refuse(
@@ -405,6 +416,6 @@ def enforce(*, announce=None) -> None:
              "against (see REQUIRED_PRIVATE_PARAMS); at P > 1 the compile "
              "agreement and the device-fit gate keep a rank-divergent "
              "compile from hanging the mesh",
-        fix="use the certified JAX/JAXLIB 0.9 environment; the compile-cache "
+        fix="use the certified JAX/JAXLIB 0.12 environment; the compile-cache "
             "patches cannot safely run against this private surface",
     )

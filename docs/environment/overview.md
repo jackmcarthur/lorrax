@@ -25,7 +25,7 @@ library is built and selected).
 
 | platform | stack | launched by |
 |---|---|---|
-| Perlmutter GPU (A100 40/80 GB) | bare-host CUDA 13.2, a JAX/JAXLIB 0.9.1 venv and a sealed FFI bundle, selected by a module ([Perlmutter installation](../installation/perlmutter.md#module)) | `srun` ([task geometry](machines/perlmutter.md#required-gpu-task-geometry)) |
+| Perlmutter GPU (A100 40/80 GB) | bare-host CUDA 13.2, a JAX/JAXLIB 0.12.0.1 venv and a sealed FFI bundle, selected by a module ([Perlmutter installation](../installation/perlmutter.md#module)) | `srun` ([task geometry](machines/perlmutter.md#required-gpu-task-geometry)) |
 | Perlmutter CPU (Milan) | the same venv, CPU platform, MPI collectives | `srun` ([CPU runs](machines/perlmutter.md#cpu)) |
 | Frontera CPU (CLX) | apptainer image + staged runtime bundle + Intel MPI (layers below) | `config/frontera/templates/gw_dev.sbatch` |
 | another SLURM cluster | `config/<cluster>/` | [`config/README.md`](../../config/README.md) §Porting |
@@ -42,7 +42,7 @@ Bottom to top; every script is in `config/frontera/`.
 |---|---|---|---|---|
 | 1 | host OS, SLURM, Intel MPI 2020.4 | the machine | — | — |
 | 2 | container image (`py312.sif`) | not vendored ([ledger](machines/frontera.md#not-yet-vendored)) | 1 | outside the container, jax wheels fail with `GLIBC_2.28 not found` (host glibc 2.17) |
-| 3 | uv venv (`$WORK/lorrax_env/.venv`, jax 0.9.1) | not vendored; `pyproject.toml` is the dependency authority | 2 | `ModuleNotFoundError` at the first import |
+| 3 | uv venv (`$WORK/lorrax_env/.venv`, jax 0.12.0.1) | not vendored; `pyproject.toml` is the dependency authority | 2 | `ModuleNotFoundError` at the first import |
 | 4 | mpi4py + parallel-h5py overlay with `sitecustomize.py` | `build_mpi_overlay.sh` (`fetch` on login, `build` in the SIF) | 2, 3, host MPI + parallel HDF5 | a driver that does not end through `runtime.run_main_and_finalize()` exits rc=1 after succeeding ("MPI routine after finalizing MPICH") |
 | 5 | MPIwrapper with `lorrax_thread.patch` (`MPI_THREAD_MULTIPLE`) | `build_mpiwrapper.sh --fresh` on a login node; verifies the patch in the disassembly | host gcc/gfortran + Intel MPI | `MPITRAMPOLINE_LIB` unset: MPItrampoline refuses at startup; an unpatched wrapper loads and reintroduces a multi-node segfault/hang class |
 | 6 | host FFI `.so` (`liblorrax_ffi_host.so`) | `build_ffi_host.sh` | 2, host MPI, CBLAS/ScaLAPACK | refusal at startup, naming the `.so` |
@@ -80,7 +80,7 @@ default, the block is what ran. Rank 0 of a P=4 Perlmutter run:
 
 Read, in order:
 
-1. **JAX generation.** Both `jax` and `jaxlib` must be 0.9.x (§2).
+1. **JAX generation.** Both `jax` and `jaxlib` must be 0.12.x (§2).
 2. **Matmul precision.** `highest` or `float32`; anything else is a warning line (§2).
 3. **Mesh.** The axis names every `PartitionSpec` uses; a mesh of the wrong shape is the first suspect for a slow or wrong distributed run.
 4. **Memory pool.** The live `bytes_limit`, the allocator pair, and the check `bytes_limit = f × cuDeviceTotalMem`. A `WARNING: the live client does NOT hold LORRAX's pool` means something built the CUDA client before the runtime set the policy (§2.1).
@@ -90,7 +90,7 @@ Read, in order:
 
 ## 2. JAX configuration
 
-**One JAX generation.** Only the JAX/JAXLIB 0.9 series runs, enforced at
+**One JAX generation.** Only the JAX/JAXLIB 0.12 series runs, enforced at
 install, before import and before the first `jit`
 ([the JAX contract](../installation/index.md#jax)).
 

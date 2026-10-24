@@ -1,6 +1,6 @@
 """JAX's persistent compile cache, armed once per process by the runtime.
 
-JAX 0.9.1 does the caching: ``jax_compilation_cache_dir`` names the store,
+JAX 0.12 does the caching: ``jax_compilation_cache_dir`` names the store,
 the key hashes the module, the compile options, XLA flags, jaxlib and the
 backend version, process 0 is the only writer, and on GPU the key is the
 same on every rank (the device assignment is stripped). What this file adds
@@ -135,10 +135,7 @@ class _CacheState:
         self.cpu_heap_trims = 0
         self.cpu_heap_trim_bytes = 0
         self.cpu_heap_trim_secs = 0.0
-        # Compiles of modules with host callbacks, which JAX's persistent
-        # cache never writes (compiler._cache_write): name -> [count, secs].
-        self.uncacheable: dict = {}
-        self.receipt_mark = (0, 0.0, 0, {})   # compile_receipt's last window edge
+        self.receipt_mark = (0, 0.0, 0)   # compile_receipt's last window edge
         self.read_secs = 0.0   # time spent loading executables from disk
         self.namespace = ""    # default-policy namespace ("" when explicit/off)
         self.vendor_caches: list = []   # runtime_kernel_caches variables this process set
@@ -399,7 +396,7 @@ def _install_observation_patch() -> None:
     """Count persistent-cache probes and hits; rank 0 touches what it hits.
 
     ``get_executable_and_time`` is ``(cache_key, compile_options, backend,
-    executable_devices)`` on the supported 0.9.1 wheel (``runtime.jax_support``
+    executable_devices, host_callbacks)`` on the supported 0.12 wheel (``runtime.jax_support``
     asserts the arity at startup). ``*passthrough`` forwards the rest
     untouched; ``wraps`` keeps ``__wrapped__`` for that startup check.
     """
@@ -876,7 +873,7 @@ def _install_compile_counter() -> None:
     ``compile_or_get_cached`` is every compile request (the persistent-cache
     lookup included) and ``backend_compile_and_load`` every real compile;
     both are module attributes of ``jax._src.compiler`` on the supported
-    0.9.1 wheel. A request publishes this rank's fingerprint under its
+    0.12 wheel. A request publishes this rank's fingerprint under its
     global request number; a real compile checks the other ranks' records
     (:func:`_check_compile_record`). The request number is taken under one
     lock in request order on the main thread, or is the slot
@@ -953,30 +950,11 @@ def _install_compile_counter() -> None:
             ahead.executable.set_result(executable)
         return executable
 
-    def _uncacheable(module, host_callbacks, seconds):
-        # backend_compile_and_load(backend, module, devices, options, host_callbacks)
-        if not host_callbacks:
-            return
-        try:
-            attr = module.operation.attributes["sym_name"]
-            module_name = str(getattr(attr, "value", attr)).strip('"')
-        except Exception:                                  # noqa: BLE001
-            module_name = "<unnamed-module>"
-        row = _STATE.uncacheable.setdefault(module_name, [0, 0.0])
-        row[0] += 1
-        row[1] += seconds
-        if row[0] == 1 and _STATE.proc_idx == 0:
-            _say(f"UNCACHEABLE {module_name}: {len(host_callbacks)} host callbacks "
-                 f"({seconds:.1f} s); JAX's persistent cache never stores it, so it "
-                 f"compiles again in every process")
-
     @functools.wraps(_orig)
     def _counting(*args, **kwargs):
         current = getattr(_STATE._compile_local, "current", None)
         if _STATE.compile_agreement_enabled and current is not None:
             _check_compile_record(*current)
-        module = args[1] if len(args) > 1 else kwargs.get("module")
-        callbacks = args[4] if len(args) > 4 else kwargs.get("host_callbacks")
         backend = args[0] if args else kwargs.get("backend")
         _cpu_compile_heap(backend)
         t0 = time.monotonic()
@@ -987,7 +965,6 @@ def _install_compile_counter() -> None:
             with _STATE._compile_event_lock:
                 _STATE.compiles += 1
                 _STATE.compile_secs += time.monotonic() - t0
-                _uncacheable(module, callbacks, time.monotonic() - t0)
 
     setattr(_compiler, _COMPILE_REQUEST_POINT, _requested)
     setattr(_compiler, _COMPILE_ENTRY_POINT, _counting)
@@ -1085,24 +1062,21 @@ def compile_threads() -> int:
 def compile_receipt(label: str, emit=None) -> str:
     """Print this window's compile receipt on rank 0 and start the next window.
 
-    ``<label> compile: real R (S s), cache hits H, uncacheable U [names]``:
-    XLA compiles, their seconds, persistent-cache hits and compiles of modules
-    JAX's cache cannot store (host callbacks), since the previous receipt.  The
-    SC loop prints one per map and each driver one at its end, so a run that is
-    killed still reports every finished map.  A map past the second with R > 0
-    recompiled something it already had; U > 0 recompiles in every process.
+    ``<label> compile: real R (S s), cache hits H``: XLA compiles, their
+    seconds and persistent-cache hits since the previous receipt.  The SC loop
+    prints one per map and each driver one at its end, so a run that is killed
+    still reports every finished map.  A map past the second with R > 0
+    recompiled something it already had.  (Through JAX 0.9 the line also
+    counted host-callback modules, which JAX's cache refused to store; from
+    0.12 ``compiler._cache_write`` stores them like any other module.)
     ``emit`` writes the line (the SC map's record), else :func:`_say`.
     """
     s = _STATE
-    compiles, secs, hits, seen = s.receipt_mark
-    names = sorted(n for n, row in s.uncacheable.items() if row[0] > seen.get(n, 0))
-    uncacheable = sum(row[0] - seen.get(n, 0) for n, row in s.uncacheable.items())
+    compiles, secs, hits = s.receipt_mark
     line = (f"{label} compile: real {s.compiles - compiles} ({s.compile_secs - secs:.1f} s), "
-            f"cache hits {s.hits - hits}, uncacheable {uncacheable}"
-            + (f" [{', '.join(names)}]" if names else "")
+            f"cache hits {s.hits - hits}"
             + (f", demoted {', '.join(sorted(s.demotions))}" if s.demotions else ""))
-    s.receipt_mark = (s.compiles, s.compile_secs, s.hits,
-                      {n: row[0] for n, row in s.uncacheable.items()})
+    s.receipt_mark = (s.compiles, s.compile_secs, s.hits)
     if s.proc_idx == 0:
         (emit or _say)(line)
     return line
@@ -1461,7 +1435,7 @@ def ensure_jax_compile_cache() -> None:
                 f"device-fit gate not installed at P={n_proc} "
                 f"({type(exc).__name__}: {exc}); want both armed, because "
                 f"without them a rank-divergent compile hangs the mesh with "
-                f"no message; fix: the certified JAX 0.9 environment "
+                f"no message; fix: the certified JAX 0.12 environment "
                 f"(runtime.jax_support).") from exc
         if proc_idx == 0:
             _say(f"compile-storm telemetry OFF: the XLA compile counter did "

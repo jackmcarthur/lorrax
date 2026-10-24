@@ -1,0 +1,47 @@
+{
+  "version": 4,
+  "cmakeMinimumRequired": {"major": 3, "minor": 23, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "leg",
+      "hidden": true,
+      "description": "Flags every leg shares; a site preset adds LORRAX_SITE_FILE (config/<site>/ffi_site.cmake) for its library paths.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "Python3_EXECUTABLE": "${sourceDir}/../../../.venv/bin/python",
+        "LORRAX_FFI_HAVE_PHDF5": "ON",
+        "LORRAX_FFI_POST_BUILD": "ON"
+      }
+    },
+    {
+      "name": "host",
+      "hidden": true,
+      "inherits": "leg",
+      "binaryDir": "${sourceDir}/build_host",
+      "cacheVariables": {"LORRAX_FFI_PLATFORM": "host"}
+    },
+    {
+      "name": "cuda",
+      "hidden": true,
+      "inherits": "leg",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "LORRAX_FFI_PLATFORM": "cuda",
+        "LORRAX_FFI_HAVE_CAL": "OFF",
+        "HDF5_PREFER_PARALLEL": "ON"
+      }
+    },
+    {
+      "name": "perlmutter-host",
+      "inherits": "host",
+      "displayName": "Perlmutter host leg (liblorrax_ffi_host.so)",
+      "cacheVariables": {"LORRAX_SITE_FILE": "${sourceDir}/../../../config/perlmutter/ffi_site.cmake"}
+    },
+    {
+      "name": "perlmutter-cuda",
+      "inherits": "cuda",
+      "displayName": "Perlmutter CUDA leg (liblorrax_ffi.so)",
+      "cacheVariables": {"LORRAX_SITE_FILE": "${sourceDir}/../../../config/perlmutter/ffi_site.cmake"}
+    }
+  ]
+}
