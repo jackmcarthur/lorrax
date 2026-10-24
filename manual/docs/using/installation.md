@@ -133,7 +133,7 @@ Fresh installs that follow this page, each with its own empty cache root, on one
 | `$SCRATCH` | 48.3 s | 6.9 / 235 / 43 s | 12.2 / 37.0 / 10.8 / 328.9 s |
 | CFS, `--in-place`, without `lorrax-run` | 63.1 s | self-check fails: 6.74 ms per file open | 145.0 / 120.1 / 11.7 s; imports alone 238 s |
 
-The prefix's filesystem no longer matters, and the kernel store built by `lorrax-postinstall` takes the cold suite from about 524 s to 329 s.
+Wherever the prefix lives, the cold suite takes the same 328–330 s; the same tree run in place from CFS is several times slower before it reaches the first GPU stage.
 
 #### Options {: #perlmutter-options }
 
