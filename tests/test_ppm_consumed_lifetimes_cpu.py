@@ -170,6 +170,8 @@ def test_real_pipeline_observers_disable_support_and_model_consumption(monkeypat
 
 def test_owned_single_pole_axis_has_no_second_field_allocation():
     from gw.ppm_sigma import _ppm_single_pole_program
+    if jax.device_count() < 4:
+        pytest.skip("needs 4 devices")
     mesh=Mesh(np.array(jax.devices()[:4]).reshape(2,2),('x','y'))
     sh=NamedSharding(mesh,P(None,'x','y'))
     host=np.arange(2*20*20).reshape(2,20,20).astype(complex)

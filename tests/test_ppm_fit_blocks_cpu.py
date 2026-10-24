@@ -52,6 +52,8 @@ def test_q_windows_preserve_point_fit_and_weighted_census(side, ordered):
 def test_q_scan_temporary_size_does_not_duplicate_the_full_outputs():
     """Doubling q doubles the output, while a one-q work arena stays bounded."""
     from gw import minimax_screening as M
+    if jax.device_count() < 4:
+        pytest.skip("needs 4 devices")
     mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
     sh = NamedSharding(mesh, P(None, 'x', 'y'))
     records = []

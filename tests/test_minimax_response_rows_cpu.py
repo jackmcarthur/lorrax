@@ -146,6 +146,8 @@ def test_charge_factory_dials_do_not_reuse_another_backend(monkeypatch):
     from common import fft_helpers
     from ffi import fft as F
     from gw import w_isdf as W
+    if jax.device_count() < 4:
+        pytest.skip("needs 4 devices")
     mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
     grid, plan, *_ = fixture(mesh, 1, False)
     made = []
