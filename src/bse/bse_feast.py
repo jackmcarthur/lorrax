@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from distrib_la import lstsq_local
 from solvers.quadrature import feast_ellipse_quadrature as _feast_ellipse_quadrature_generic
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
 from .bse_stack_matvec import build_bse_stack_matvec, build_bse_stack_matvec_full
@@ -527,7 +528,7 @@ def _gmres_solve_core(matvec, b, diag_h, z, operands, max_iter, tol, *,
     # columns of the padded Hessenberg get min-norm y=0.  ONE call, on the
     # H the loop exited with — the same matrix the historical per-iteration
     # spelling ended on, hence the same y to the bit.
-    y = jnp.linalg.lstsq(H, g, rcond=None)[0]
+    y = lstsq_local(H, g, rcond=None)[0]
 
     x = x0 + jnp.tensordot(y, Z, axes=(0, 0))
     return x, k_final

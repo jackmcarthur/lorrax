@@ -386,3 +386,16 @@ the LORRAX loader also reaches the handler.
    (`cusolvermp_eigh_test.py`) that asserts the
    residual ($AZ - Z\,\mathrm{diag}(w)$, or the factor's reconstruction) on a
    real mesh, and update the tables on this page.
+
+### Local SVD and least squares
+
+`svd_local` and `lstsq_local` own device-local SVD driver selection. ROCm
+uses JAX's explicit QR-SVD (`hipsolver_gesvd`) for the padded complex
+Hessenberg solve shared by FEAST and the ladder response. Frontier's default
+small-matrix Jacobi SVD stalled in actual GMRES execution; this selects a
+stable SVD driver, without forming normal equations or changing tolerance.
+CPU and CUDA retain their existing JAX calls. The least-squares result uses
+JAX's singular-value cutoff (`eps * max(m,n)` when `rcond=None`) and the
+minimum-norm solution, including rank-deficient matrices and zero padded
+columns. The existing true-residual gates still decide whether a solve is
+usable. No callback, host matrix transfer or new tuning option is added.
