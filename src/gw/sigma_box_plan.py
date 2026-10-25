@@ -184,7 +184,7 @@ def _live_states(branch):
     indices = np.flatnonzero(live.reshape(-1)).astype(np.int32)
     if not indices.size:
         raise ValueError(f"Sigma box branch {branch.tag!r} has no live states")
-    return energy, energy.reshape(-1)[indices], indices
+    return energy, energy.reshape(-1)[indices], indices, live
 
 
 def _product_geometry(branches, eta, edge_factor):
@@ -194,9 +194,9 @@ def _product_geometry(branches, eta, edge_factor):
     excursion = 0.0
     state_rows = []
     for branch in branches:
-        shape, energy, indices = _live_states(branch)
+        shape, energy, indices, support = _live_states(branch)
         excursion = max(excursion, -min(float(np.min(energy)), 0.0))
-        state_rows.append((shape, energy, indices))
+        state_rows.append((shape, energy, indices, support))
     state_edge = float(edge_factor) * eta
     edges = sigma_pole_edges(branches, state_edge, excursion)
     return state_rows, {
@@ -1630,7 +1630,7 @@ def plan_sigma_windows(
     state_rows, geometry = _product_geometry(branch_rows, eta, edge)
 
     specs, branch_reports = [], []
-    for branch, (state_shape, raw_energy, flat_indices) in zip(
+    for branch, (state_shape, raw_energy, flat_indices, support) in zip(
             branch_rows, state_rows):
         positions = np.asarray(branch.omega_idx, dtype=np.int64)
         frequencies = omega_grid[positions]
@@ -1710,6 +1710,7 @@ def plan_sigma_windows(
                     "branch": branch,
                     "state_indices": flat_indices[local],
                     "state_shape": state_shape.shape,
+                    "state_support": support,
                     "state_interval": (float(state_lo), float(state_hi)),
                     "pole_indices": pole_indices,
                     "pole_bounds": (float(pole_lo), float(pole_hi)),
@@ -1742,14 +1743,13 @@ def plan_sigma_windows(
 
     output = []
     for spec, fit in zip(specs, fits):
-        mask = np.zeros(int(np.prod(spec["state_shape"])), dtype=bool)
-        mask[np.asarray(spec["state_indices"], np.int64)] = True
         external_sign = -1 if spec["branch"].neg_omega_half else 1
         window = _SigmaWindow(
             name=spec["name"],
             nodes=sigma_box_executor_nodes(
                 fit, spec["pole_sign"], _spec_eta(spec, eta)),
-            mask_A=mask.reshape(spec["state_shape"]),
+            mask_A=spec["state_support"],
+            E_min=spec["state_interval"][0], E_max=spec["state_interval"][1],
             E_ref_A=spec["E_ref_A"], E_ref_B=spec["E_ref_B"],
             omega_sign=int(spec["pole_sign"]) * external_sign,
             project="full", prefactor=-1.0,

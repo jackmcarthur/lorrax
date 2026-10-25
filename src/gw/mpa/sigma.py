@@ -1427,15 +1427,15 @@ def _sigma_window_table(accumulator, synthesis, plan, capacity):
     inputs of :meth:`DeviceOmegaAccumulator.window_table` (nodes padded to
     ``capacity``, the states the window's frequencies own (on the grid, its
     frequencies on the full axis), sign, prefactor, reference sum) and the
-    window operands -- the active pole count, the band mask
-    (flattened, padded to the widest branch), the two reference energies and
+    window operands -- the active pole count, the exact state interval,
+    the two reference energies and
     the synthesis's pole intervals (``WSynthesis.window_intervals``).
     """
-    masks = [np.asarray(row.window.mask_A, dtype=bool).reshape(-1) for row in plan]
-    width = max((m.size for m in masks), default=0)
     extras = dict(
         active=[np.int32(len(row.pole_indices)) for row in plan],
-        mask=[np.pad(m, (0, width - m.size)) for m in masks],
+        state_bounds=[np.asarray((row.window.E_min if row.window.E_min is not None else -np.inf,
+                                  row.window.E_max if row.window.E_max is not None else np.inf))
+                      for row in plan],
         e_ref_a=[np.float64(row.window.E_ref_A) for row in plan],
         e_ref_b=[np.float64(row.window.E_ref_B) for row in plan])
     if synthesis.window_intervals is not None:
@@ -1448,17 +1448,33 @@ def _sigma_window_table(accumulator, synthesis, plan, capacity):
     return accumulator.window_table(windows, capacity=capacity, extras=extras)
 
 
-@lru_cache(maxsize=None)
-def _window_selector(shape, weighted):
-    """A window's band selector from its table row's flattened mask (and the branch weight)."""
-    size = int(np.prod(shape))
+def _window_parent_inputs(row, plan, sharding):
+    """One branch's parent energies, support and signed occupation weight.
 
-    def select(mask, weight):
-        selector = jnp.reshape(mask[:size], shape)
+    Host support is selected by the typed parent map before its device
+    placement; no full-k mask is uploaded just to discard the child rows.
+    """
+    def place(value):
+        value = plan.parent_rows(value)
+        return value if isinstance(value, jax.Array) else device_put_process_local(value, sharding)
+    return (place(row.E_A), place(row.window.mask_A),
+            None if row.band_weight is None else place(row.band_weight))
+
+
+@lru_cache(maxsize=None)
+def _window_selector(weighted, interval):
+    """Current parent-state selector: exact branch support and ``(lo, hi]``.
+
+    Explicit one-window masks without an interval keep their original
+    semantics. A fractional or signed MP weight is multiplied only after
+    the same support/interval selection as the box planner.
+    """
+    def select(mask, energy, weight, bounds):
+        selector = (mask & (energy > bounds[0]) & (energy <= bounds[1])
+                    if interval else mask)
         if not weighted:
             return selector
-        return (selector.astype(jnp.float64)
-                * jnp.reshape(jnp.asarray(weight, jnp.float64), shape))
+        return selector.astype(jnp.float64) * jnp.reshape(weight, selector.shape)
     return jax.jit(select)
 
 
@@ -1746,24 +1762,23 @@ def _integrate_sigma_batches(
                     n_nodes = window_table.nodes[window_index]
                     window_index += 1
                     active_count = operands["active"]
-                    selector = _window_selector(np.shape(win.mask_A), weight is not None)(
-                        operands["mask"], weight)
                     e_ref_a, e_ref_b = operands["e_ref_a"], operands["e_ref_b"]
                 else:
                     pole_indices, bounds, phase_real, active_count = selected
                     # One of a few window widths: placed once per distinct value.
                     active_count = device_put_process_local_cached(active_count, small)
-                    if weight is None:
-                        selector = jnp.asarray(win.mask_A)
-                    else:
-                        selector = (jnp.asarray(win.mask_A, jnp.float64)
-                                    * jnp.reshape(
-                                        jnp.asarray(weight, jnp.float64),
-                                        np.asarray(win.mask_A).shape))
                     e_ref_a, e_ref_b = jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B)
-                E_A_call = k_unfold_plan.parent_rows(row.E_A)
-                selector = k_unfold_plan.parent_rows(
-                    jnp.reshape(selector, np.shape(row.E_A)))
+                interval = win.E_min is not None or win.E_max is not None
+                # Place only the current window's parent support. The host
+                # plan shares branch support and retains no dense mask per
+                # interval; no all-window device bank is constructed either.
+                E_A_call, support, parent_weight = _window_parent_inputs(row, k_unfold_plan, small)
+                state_bounds = (operands["state_bounds"] if synthesis else
+                                device_put_process_local_cached(np.asarray((
+                                    -np.inf if win.E_min is None else win.E_min,
+                                    np.inf if win.E_max is None else win.E_max)), small))
+                selector = _window_selector(weight is not None, interval)(
+                    support, E_A_call, parent_weight, state_bounds)
                 target = accumulator if accumulators is None else accumulators[row.space]
                 if not synthesis:
                     pole_indices, bounds, phase_real = (

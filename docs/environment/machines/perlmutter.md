@@ -144,7 +144,12 @@ srun --jobid=$JOBID -N 2 -n 4 -c 16 --threads-per-core=1 --cpu-bind=threads bash
 ```
 
 `cpu_mpi_env.sh` checks the adapter's source pin, MPI ABI and SHA-256
-manifest; refuses a stale Frontera overlay, a conflicting MPI or PMI
+manifest. Build and launch share `config/perlmutter/cpu_mpi_config.sh`;
+the recipe fingerprints this CPU configuration, builder, prelude and one-MPI
+gate, so changing unrelated CUDA/site defaults does not invalidate a CPU
+adapter. A change to those CPU recipe files requires a fresh adapter build;
+older manifests are not accepted through a compatibility bypass.
+The prelude refuses a stale Frontera overlay, a conflicting MPI or PMI
 preload, `JAX_PLATFORMS` other than `cpu` and more than one CPU device per
 process; and sets:
 

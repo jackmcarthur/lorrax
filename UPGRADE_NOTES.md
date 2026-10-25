@@ -5,6 +5,15 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-25 — Refresh the Perlmutter CPU MPI adapter manifest
+
+Run `config/perlmutter/build_mpiwrapper.sh` once on a CPU compute node, then
+source `config/perlmutter/cpu_mpi_env.sh` as before. The adapter manifest now
+fingerprints the dedicated `cpu_mpi_config.sh` together with the builder,
+prelude and one-MPI gate; older manifests refuse with the rebuild command.
+Future CUDA-only or unrelated site-default changes no longer invalidate the
+CPU adapter. CPU defaults, MPI ABI and all provenance checks are unchanged.
+
 ## 2026-10-25 — Rebuild native libraries for the cuSOLVERMp release floor
 
 Rebuild all native legs and seal a new bundle: the required contract is now

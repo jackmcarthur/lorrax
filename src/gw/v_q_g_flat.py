@@ -904,7 +904,6 @@ def _compute_V_q_g_flat_tiles(
     # kernel still needs the buffer; the contents are simply unread.
     g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
     for s in specs:
-        s['V'] = jnp.zeros((n_q_ibz, s['nL'], s['nR']), jnp.complex128, device=V_sh)
         s['g0'] = jnp.zeros((n_q_ibz, s['nL']), jnp.complex128, device=g0_sh)
         s['parts'] = []
     # Process-local placement, NOT plain ``jax.device_put``: the latter
@@ -954,6 +953,8 @@ def _compute_V_q_g_flat_tiles(
             elif s['write_g0'] and not use_ibz:
                 s['g0'] = jax.lax.with_sharding_constraint(shell[:, :, 0], g0_sh)
     else:
+        for s in specs:
+            s['V'] = jnp.zeros((n_q_ibz, s['nL'], s['nR']), jnp.complex128, device=V_sh)
         reads = [_make_read_q_tile(ld, n, mesh_xy) for ld, n in zip(loaders, mu_pad)]
 
         # ---- q-tile loop: read (sync) → contract → next --------------------

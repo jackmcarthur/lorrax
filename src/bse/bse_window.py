@@ -109,12 +109,11 @@ PAD_EPS_GUARD_RY = 1.0e3
 def pad_zone_mask_np(n_cond, n_val, n_cond_pad, n_val_pad, nk, dtype=np.float64):
     """``(1, nc_pad, nv_pad, nk)`` 1.0 on physical transitions, 0.0 on pad.
 
-    THE spelling for "restrict a BSE pair-basis vector to the physical
-    block", derived BY COUNT from the logical/padded extents the loader
-    puts in the bundle — never by thresholding an energy.  Callers that
-    seed a Krylov space with random numbers over the PADDED shape must
-    apply this, or they hand the solver a start vector with support in a
-    block whose eigenvalues are the ``PAD_EPS_GUARD_RY`` sentinel.
+    Host diagnostic mask, derived BY COUNT from the logical/padded
+    extents the loader puts in the bundle — never by thresholding an
+    energy. Production seeds use rectangular support counts or apply
+    :func:`restrict_to_physical_transitions` inside their device program,
+    so this full host array is not retained beside the Krylov space.
 
     Vectors built from ψ (dipoles, ``w_omega_chain``'s seed block) already
     have exact zeros there by the bilinearity above and need no mask.
@@ -129,9 +128,25 @@ def pad_zone_mask(data, dtype=None):
     nk = int(data["nkx"]) * int(data["nky"]) * int(data["nkz"])
     if dtype is None:
         dtype = data["eps_c"].dtype
-    return jnp.asarray(pad_zone_mask_np(
-        int(data["n_cond"]), int(data["n_val"]),
-        int(data["n_cond_pad"]), int(data["n_val_pad"]), nk), dtype=dtype)
+    return restrict_to_physical_transitions(
+        jnp.ones((1, int(data["n_cond_pad"]), int(data["n_val_pad"]), nk), dtype=dtype),
+        int(data["n_cond"]), int(data["n_val"]))
+
+
+def restrict_to_physical_transitions(x, n_cond, n_val):
+    """Zero mesh padding in ``(..., nc_pad, nv_pad, nk)`` by band counts.
+
+    Apply inside the seed program: the two band predicates broadcast over
+    k and all leading axes, without a host transition mask.
+    """
+    nc, nv = x.shape[-3:-1]
+    if (any(not isinstance(n, (int, np.integer)) or isinstance(n, bool)
+            for n in (n_cond, n_val)) or
+            not (0 <= n_cond <= nc and 0 <= n_val <= nv)):
+        raise ValueError('physical transition counts must be within padded band extents')
+    physical = ((jnp.arange(nc)[:, None, None] < n_cond)
+                & (jnp.arange(nv)[None, :, None] < n_val))
+    return jnp.where(physical, x, jnp.zeros((), x.dtype))
 
 
 def n_pad_transitions(data) -> int:

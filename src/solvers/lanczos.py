@@ -802,22 +802,46 @@ def _build_block_tridiag(alpha_all, beta_all, max_iter: int, bs: int,
     return T if capacity is not None else (T + jnp.conj(T).T) * 0.5
 
 
-def _supported_start_block(n, bs, seed, support):
+def _supported_start_block(n, bs, seed, support, *, vector_shape=None,
+                           support_shape=None, subspace_plan=None):
     """The random complex ``(n, bs)`` start block and the supported count.
 
     One spelling of ``support`` (see :func:`block_lanczos_eig_jit`) for
     both block routes: the Gaussian draw covers the supported entries only,
     in row-major order, and is scattered into zeros on the rest.
     """
-    active = (None if support is None
-              else np.flatnonzero(np.asarray(support).reshape(-1)))
+    if support_shape is not None:
+        if support is not None:
+            raise ValueError('Lanczos accepts support or support_shape, not both')
+        vector_shape = (int(n),) if vector_shape is None else tuple(vector_shape)
+        support_shape = tuple(support_shape)
+        if (len(support_shape) != len(vector_shape) or
+                any(not isinstance(s, (int, np.integer)) or isinstance(s, bool)
+                    or not 0 < s <= p for s, p in zip(support_shape, vector_shape))):
+            raise ValueError('Lanczos support_shape must be positive integer extents within vector_shape')
+        n_active = int(np.prod(support_shape))
+        draw_shape = (*support_shape, bs)
+        active = None
+    else:
+        active = (None if support is None
+                  else np.flatnonzero(np.asarray(support).reshape(-1)))
+        n_active = int(n) if active is None else int(active.size)
+        draw_shape = (n_active, bs)
     if active is not None and int(np.size(support)) != int(n):
         raise ValueError('Lanczos support must have n entries')
-    n_active = int(n) if active is None else int(active.size)
     key = jax.random.PRNGKey(seed)
     k1, k2 = jax.random.split(key)
-    Q0 = (jax.random.normal(k1, (n_active, bs), dtype=jnp.float64)
-          + 1j * jax.random.normal(k2, (n_active, bs), dtype=jnp.float64))
+    Q0 = (jax.random.normal(k1, draw_shape, dtype=jnp.float64)
+          + 1j * jax.random.normal(k2, draw_shape, dtype=jnp.float64))
+    if support_shape is not None:
+        # The row-major draw is identical to (n_active, bs). Keeping its
+        # physical axes visible lets GSPMD generate only local RNG tiles.
+        rows = jnp.moveaxis(Q0, -1, 0)
+        if subspace_plan is not None and subspace_plan is not False:
+            rows = subspace_plan.constrain(rows)
+        rows = jnp.pad(rows, ((0, 0), *tuple(
+            (0, p-s) for s, p in zip(support_shape, vector_shape))))
+        Q0 = rows.reshape(bs, n).T
     if active is not None:
         Q0 = jnp.zeros((int(n), bs), dtype=Q0.dtype).at[active].set(Q0)
     return Q0, n_active
@@ -835,6 +859,7 @@ def block_lanczos_eig_jit(
     vector_shape=None,
     structured_vectors=False,
     support=None,
+    support_shape=None,
 ) -> tuple[jax.Array, jax.Array]:
     """JIT-compiled block Lanczos using ``lax.fori_loop``.
 
@@ -876,10 +901,15 @@ def block_lanczos_eig_jit(
         section, "THE WINDOW INCLUDES THE CURRENT BLOCK Q_j".
         Default ``FULL_REORTH`` (-1) = the whole basis.
 
+    support_shape : tuple of int, optional
+        Logical rectangular extents inside ``vector_shape``. Draw only those
+        entries in row-major order and embed them in exact-zero padding.
+        Counts stay on the host; no transition mask or index array is made.
+        Mutually exclusive with ``support``.
     support : host array of ``vector_shape``, optional
         1 on the entries the operator acts on, 0 on layout padding the
         operator leaves invariant at exactly zero (the BSE mesh pad,
-        ``bse.bse_window.pad_zone_mask_np``).  The start block is drawn on
+        supplied by a general nonrectangular operator). The start block is drawn on
         the supported entries only, in their row-major order, so it and
         every Krylov block are the same numbers whatever pad the process
         mesh adds, and the α-Hermiticity scale is the operator's own rather
@@ -897,15 +927,17 @@ def block_lanczos_eig_jit(
     whole space and the extremal Ritz values are dense-quality.
     """
     bs = int(block_size)
+    vector_shape = (int(n),) if vector_shape is None else tuple(vector_shape)
+    if int(np.prod(vector_shape)) != int(n):
+        raise ValueError('Lanczos vector_shape must contain n elements')
     # Initial orthonormal block via QR of random complex Gaussian.
-    Q0, n_active = _supported_start_block(n, bs, seed, support)
+    Q0, n_active = _supported_start_block(
+        n, bs, seed, support, vector_shape=vector_shape,
+        support_shape=support_shape, subspace_plan=subspace_plan)
     max_iter = max(1, min(int(max_iter), n_active // bs))
     subspace_plan = _resolve_subspace_plan(
         subspace_plan, (max_iter + 1) * bs, n_eig,
         max_block_size=max(bs, n_eig))
-    vector_shape = (int(n),) if vector_shape is None else tuple(vector_shape)
-    if int(np.prod(vector_shape)) != int(n):
-        raise ValueError('Lanczos vector_shape must contain n elements')
     n_reorth = resolve_n_reorth(n_reorth, int(max_iter))
     T_size = bs * int(max_iter)
     _announce_reorth("block_lanczos_eig_jit", int(max_iter), n_reorth)
@@ -976,6 +1008,7 @@ def block_lanczos_eig_jit_converged(
     vector_shape=None,
     structured_vectors=False,
     support=None,
+    support_shape=None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Convergence-driven block Lanczos via ``lax.while_loop``.
 
@@ -993,7 +1026,7 @@ def block_lanczos_eig_jit_converged(
     the ``while_loop`` carry includes the running iteration count and
     the previous Ritz values for comparison.
 
-    ``n_reorth`` and ``support`` carry exactly the meaning
+    ``n_reorth``, ``support`` and ``support_shape`` carry exactly the meaning
     :func:`block_lanczos_eig_jit` documents.
 
     Returns (eigenvalues, eigenvectors, n_iter_done) — the third value
@@ -1001,7 +1034,12 @@ def block_lanczos_eig_jit_converged(
     ``max_iter``).
     """
     bs = int(block_size)
-    Q0, n_active = _supported_start_block(n, bs, seed, support)
+    vector_shape = (int(n),) if vector_shape is None else tuple(vector_shape)
+    if int(np.prod(vector_shape)) != int(n):
+        raise ValueError('Lanczos vector_shape must contain n elements')
+    Q0, n_active = _supported_start_block(
+        n, bs, seed, support, vector_shape=vector_shape,
+        support_shape=support_shape, subspace_plan=subspace_plan)
     # Krylov-exhaustion clamp — same rationale as block_lanczos_eig_jit:
     # past floor(n/bs) blocks the residual collapses and QR manufactures
     # junk directions with arbitrary (even sub-spectrum) Ritz values.
@@ -1009,9 +1047,6 @@ def block_lanczos_eig_jit_converged(
     subspace_plan = _resolve_subspace_plan(
         subspace_plan, (M + 1) * bs, n_eig,
         max_block_size=max(bs, n_eig))
-    vector_shape = (int(n),) if vector_shape is None else tuple(vector_shape)
-    if int(np.prod(vector_shape)) != int(n):
-        raise ValueError('Lanczos vector_shape must contain n elements')
     T_size = bs * M
     n_reorth = resolve_n_reorth(n_reorth, M)
     _announce_reorth("block_lanczos_eig_jit_converged", M, n_reorth)

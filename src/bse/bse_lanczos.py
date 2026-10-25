@@ -538,15 +538,13 @@ def solve_bse_sharded(
         return eigenvalues, eigenvectors, jnp.int32(apps)
 
     from distrib_la import plan_subspace
-    from .bse_window import pad_zone_mask_np
     lanczos_vector_shape = (nc_pad, nv_pad, nk)
     # The Krylov space lives on the physical transitions, as in
     # exciton_bands: the start block has no support on the mesh pad, which
     # the operator keeps at exactly zero, so the recurrence and its
     # α-Hermiticity scale are the same numbers at every P.  The depth
     # counts physical transitions.
-    lanczos_support = pad_zone_mask_np(
-        data["n_cond"], data["n_val"], nc_pad, nv_pad, nk)[0]
+    lanczos_support = (int(data["n_cond"]), int(data["n_val"]), nk)
     n_phys = int(data["n_cond"]) * int(data["n_val"]) * nk
     lanczos_depth = max(1, min(int(max_iter), n_phys // bs))
     lanczos_plan = plan_subspace(
@@ -613,13 +611,13 @@ def solve_bse_sharded(
                     rtol=rtol, atol=atol, check_every=check_every,
                     n_reorth=n_reorth,
                     subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
-                    structured_vectors=True, support=lanczos_support,
+                    structured_vectors=True, support_shape=lanczos_support,
                 )
             evs, evecs = block_lanczos_eig_jit(
                 matvec_block, n_flat, n_eig=n_eig,
                 block_size=1, max_iter=max_iter, n_reorth=n_reorth,
                 subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
-                structured_vectors=True, support=lanczos_support,
+                structured_vectors=True, support_shape=lanczos_support,
             )
             return evs, evecs, jnp.int32(N_ITER_NOT_MEASURED)
         else:
@@ -644,14 +642,14 @@ def solve_bse_sharded(
                     rtol=rtol, atol=atol, check_every=check_every,
                     n_reorth=n_reorth,
                     subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
-                    structured_vectors=True, support=lanczos_support,
+                    structured_vectors=True, support_shape=lanczos_support,
                 )
             else:
                 evs, evecs = block_lanczos_eig_jit(
                     matvec_block, n_flat, n_eig=n_eig,
                     block_size=bs, max_iter=max_iter, n_reorth=n_reorth,
                     subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
-                    structured_vectors=True, support=lanczos_support,
+                    structured_vectors=True, support_shape=lanczos_support,
                 )
                 return evs, evecs, jnp.int32(N_ITER_NOT_MEASURED)
 

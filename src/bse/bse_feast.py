@@ -36,7 +36,8 @@ from .bse_preconditioner import compute_pair_amplitude
 from .bse_davidson_helpers import build_bse_exact_diagonal
 import common.timing as timing
 from common.units import RYD_TO_EV
-from .bse_io import (load_bse_data_from_restart_sharded, make_w_densifier, pad_zone_mask_np)
+from .bse_io import (load_bse_data_from_restart_sharded, make_w_densifier)
+from .bse_window import restrict_to_physical_transitions
 from file_io.restart_bundle import (_find_restart_file)
 from common.log import get_logger
 
@@ -1233,16 +1234,12 @@ def estimate_spectral_bounds_sharded(
     # as e_max and blow the Chebyshev half-width every KPM/FEAST consumer
     # of this function scales by.  The mask is BY COUNT, from the logical
     # extents the loader put in the bundle.
-    _pad_mask = jnp.asarray(
-        pad_zone_mask_np(n_cond, n_val, n_cond_pad, n_val_pad, nk),
-        dtype=jnp.float64)
-
     @jax.jit
     def _make_random_vector(key_in):
         k1, k2 = jax.random.split(key_in)
         q = jax.random.normal(k1, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float64)
         q = q + 1j * jax.random.normal(k2, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float64)
-        q = q * _pad_mask
+        q = restrict_to_physical_transitions(q, n_cond, n_val)
         q = q / jnp.linalg.norm(q)
         return jax.lax.with_sharding_constraint(q, sh.X)
 

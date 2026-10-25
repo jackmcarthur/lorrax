@@ -159,7 +159,7 @@ _LOGGER = log     # the module logger, where a ``log`` parameter or local shadow
 from .bse_preconditioner import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
 from .exchange_path import exchange_tiles, exchange_tile_momentum
-from .bse_window import (apply_eqp_to_bse_window, pad_zone_mask_np,
+from .bse_window import (apply_eqp_to_bse_window,
                          require_valence_pad_guard)
 from . import vq_interp
 from .report_lines import (exciton_band_results_lines, galerkin_rows,
@@ -336,7 +336,7 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     # zero, so the recurrence and its α-Hermiticity scale are the same
     # numbers at every P (the pad's PAD_EPS_GUARD_RY diagonal used to set
     # the scale on a padded mesh).  The depth counts physical transitions.
-    support = pad_zone_mask_np(n_cond, n_val, nc_pad, nv_pad, nk)[0]
+    support_shape = (int(n_cond), int(n_val), nk)
     n_phys = int(n_cond) * int(n_val) * nk
     lanczos_depth = max(1, min(int(max_iter), n_phys // int(block_size)))
     lanczos_plan = plan_subspace(
@@ -383,7 +383,7 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                     max_iter=max_iter, n_reorth=n_reorth,
                     subspace_plan=lanczos_plan,
                     vector_shape=(nc_pad, nv_pad, nk), structured_vectors=True,
-                    support=support)
+                    support_shape=support_shape)
             _labels, _payload = split_alpha_sink(_sink)
             alpha_labels[:] = _labels
             return carry, (evs[:n_eig].real, _payload)
