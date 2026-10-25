@@ -70,11 +70,11 @@ __all__ = ["get_lib", "has_target", "probe_target", "loaded_lib_path",
 #: A MIRROR of ``src/ffi/cpp/common/lorrax_ffi_abi.h`` in the LORRAX repo,
 #: which is the definition and carries the bump rule.  This package is
 #: independently installable and must not reach into that tree at import time,
-#: so the number is copied — and ``tests/test_so_acceptance.py`` parses the
+#: so the number is copied — and ``tests/test_cusolvermp_release_floor.py`` parses the
 #: header whenever the monorepo is reachable and FAILS if the two disagree.
 #: That is the whole mechanism keeping a copy honest: a copy nothing compares
 #: is how the ten dispatch sites drifted.
-LORRAX_FFI_ABI_VERSION = 12
+LORRAX_FFI_ABI_VERSION = 13
 
 #: platform -> the C entry point reporting the library's ABI.  Per leg,
 #: because both libraries are dlopened RTLD_GLOBAL and already share sixteen
@@ -459,7 +459,7 @@ def get_lib(platform: str) -> ctypes.CDLL:
     path = _locate_so(platform)
     lib, actual_origin = _native.open_and_attest(
         path, platform=platform, expected_abi=LORRAX_FFI_ABI_VERSION,
-        abi_symbols=_ABI_SYMBOLS,
+        abi_symbols=_ABI_SYMBOLS, strict_unstamped=True,
         build_hint=str(_PLATFORMS[platform]["build_hint"]),
         unusable_cls=LibraryUnusable, mismatch_cls=AbiMismatch)
     _bind_c_abi(lib, platform)

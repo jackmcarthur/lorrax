@@ -5,6 +5,20 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-25 — Rebuild native libraries for the cuSOLVERMp release floor
+
+Rebuild all native legs and seal a new bundle: the required contract is now
+ABI 13. ABI 12 libraries can lack the refusal of cuSOLVERMp versions older
+than 0.9.1, even when their recorded dependencies are intact. Unstamped native
+libraries now refuse through the same gate. Those vendor
+releases have known large-matrix eigenvector failures; the new guard refuses
+them before creating a grid or allocating solver workspace.
+
+CUDA12 installs now pin released cuSOLVERMp 0.9.1.9318.post1 and cuBLASMp
+0.10.0.3695, matching CUDA13. Refresh the site's package installation and
+native staging before rebuilding; custom prefixes must supply cuSOLVERMp
+0.9.1 or newer. No input-deck or mathematical convention changes.
+
 ## 2026-10-24 — BSE spin channels are explicit in operators and caches
 
 Scalar optical singlet and triplet solves now carry `exchange_channel`

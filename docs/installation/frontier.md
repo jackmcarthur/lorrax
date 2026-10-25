@@ -96,7 +96,7 @@ The scripts select the pinned compiler/MPI/HDF5 stack themselves and use
 | host | `src/ffi/cpp/build_host/liblorrax_ffi_host.so` | Host MPI/HDF5 operations, CPU linear algebra and FFTW |
 | ROCm | `src/ffi/cpp/build_rocm/liblorrax_ffi_rocm.so` | GPU operations through HIP, rocBLAS/rocSOLVER, ELPA and the ROCm FFT kernels |
 
-A GPU process loads both. The current native contract is ABI 12 (including nested collective HDF5 dataset paths); rebuild
+A GPU process loads both. The current native contract is ABI 13 (including nested collective HDF5 dataset paths and the CUDA provider release floor); rebuild
 both legs after the SLATE-to-mesh-context change, rather than reusing an
 ABI-10 pair. Each build also writes the library's
 `<leg>.closure.json` and `PROVENANCE` records.

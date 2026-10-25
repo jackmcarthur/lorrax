@@ -122,6 +122,13 @@
 //                the artifact and then fail to create that required path;
 //                refuse it at load, before any data mutation instead.
 //
+//   ABI 12 -> 13 (2026-10-25, required cuSOLVERMp release floor).
+//                CUDA contexts must reject cuSOLVERMp < 0.9.1 before grid
+//                creation or workspace allocation on every grid. Older
+//                providers have known large-N eigenvector failures. An
+//                ABI-12 library can lack this refusal even with a valid
+//                dependency closure; require the rebuilt native contract.
+//
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
@@ -150,4 +157,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 12
+#define LORRAX_FFI_ABI_VERSION 13

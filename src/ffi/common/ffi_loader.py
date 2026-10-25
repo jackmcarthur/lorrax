@@ -323,9 +323,9 @@ class FfiLibraryNotBuilt(FileNotFoundError):
 #: also carries the bump rule and the history of the two bumps in two days that
 #: motivated the mechanism.  A C++ macro cannot be imported, so a mirror across
 #: this boundary is unavoidable; what IS avoidable is the mirror drifting
-#: silently, and ``tests/test_ffi_abi_stamp.py`` parses the header and fails if
+#: silently, and ``tests/test_cusolvermp_release_floor.py`` parses the header and fails if
 #: these two numbers disagree.
-LORRAX_FFI_ABI_VERSION = 12
+LORRAX_FFI_ABI_VERSION = 13
 
 #: platform -> the C entry point that reports the library's ABI.  Per leg on
 #: purpose: both libraries are dlopened RTLD_GLOBAL in a GPU process and
@@ -772,7 +772,7 @@ def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
     path = _locate_so(platform)
     lib, actual_origin = _native.open_and_attest(
         path, platform=platform, expected_abi=LORRAX_FFI_ABI_VERSION,
-        abi_symbols=_ABI_SYMBOLS,
+        abi_symbols=_ABI_SYMBOLS, strict_unstamped=True,
         build_hint=str(_PLATFORMS[platform]["build_hint"]),
         unusable_cls=FfiLibraryUnusable, mismatch_cls=FfiAbiMismatch)
     _set_argtypes(lib, platform)

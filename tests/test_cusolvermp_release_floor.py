@@ -1,14 +1,50 @@
 """Released-provider refusal and staging consistency; no CUDA client or kernels."""
+import ast
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import tomllib
+from types import SimpleNamespace
 
 import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_native_provider_floor_requires_the_stamped_contract(tmp_path):
+    """Old or unstamped libraries cannot bypass the newly required native guard."""
+    from lxkit import native_provider
+    from lxkit.legs import LEGS
+
+    header = (ROOT / 'src/ffi/cpp/common/lorrax_ffi_abi.h').read_text()
+    abi = int(re.search(r'^#define LORRAX_FFI_ABI_VERSION (\d+)$', header, re.MULTILINE)[1])
+    assert abi >= 13
+    for relative in ('src/ffi/common/ffi_loader.py',
+                     'services/distrib_la/src/distrib_la/loader.py'):
+        tree = ast.parse((ROOT / relative).read_text())
+        mirrors = [node.value.value for node in tree.body if isinstance(node, ast.Assign)
+                   and any(isinstance(name, ast.Name) and name.id == 'LORRAX_FFI_ABI_VERSION'
+                           for name in node.targets)]
+        assert mirrors == [abi], relative
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute) and node.func.attr == 'open_and_attest']
+        assert len(calls) == 1
+        assert any(kw.arg == 'strict_unstamped' and isinstance(kw.value, ast.Constant)
+                   and kw.value.value is True for kw in calls[0].keywords), relative
+
+    for platform, leg in LEGS.items():
+        options = dict(expected_abi=abi, abi_symbols={platform: leg.abi_symbol},
+                       build_hint='rebuild from this source', strict_unstamped=True)
+        path = str(tmp_path / leg.so_name)
+        old = SimpleNamespace(**{leg.abi_symbol: lambda: 12})
+        with pytest.raises(OSError, match='speaks abi=12'):
+            native_provider.check_abi(old, platform, path, **options)
+        with pytest.raises(OSError, match='no handler-ABI stamp'):
+            native_provider.check_abi(SimpleNamespace(), platform, path, **options)
+        current = SimpleNamespace(**{leg.abi_symbol: lambda: abi})
+        native_provider.check_abi(current, platform, path, **options)
 
 
 def test_loaded_cusolvermp_release_refuses_before_grid(tmp_path):
