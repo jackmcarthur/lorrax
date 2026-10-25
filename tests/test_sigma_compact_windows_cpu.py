@@ -60,14 +60,15 @@ def test_parent_selection_keeps_host_payload_off_devices(monkeypatch):
         owner.parent_rows(irr, 4, values[:5])
 
 
-@pytest.mark.parametrize('side', [2, 3])
-def test_compact_planner_selectors_and_window_fold_match_literal(side):
+def check_compact_window_fold(mesh, observe=None):
     from gw.centroid_k_unfold import parent_rows
     from gw.greens_function_kernel import _weighted_tau_phases
     from gw.mpa.sigma import _sigma_window_table, _window_parent_inputs, _window_selector
     from gw.ppm_accumulators import DeviceOmegaAccumulator
     from common.collectives import device_put_process_local
-    mesh = _mesh(side);rep = NamedSharding(mesh, P())
+    rep = NamedSharding(mesh, P())
+    side = int(mesh.shape['x'])
+    carrier = -(-6 // side) * side
     rows, geometry, energy, base, weight, omega = _plan()
     assert len(rows) > 3  # coarse support really split; no inferred omega interval
     assert len({id(row.window.mask_A) for row in rows}) == 1
@@ -79,15 +80,17 @@ def test_compact_planner_selectors_and_window_fold_match_literal(side):
         np.array([2, 0, 1, 2, 1, 0], np.int32), 4))
     source_rows = [5, 4, 3, 0]
     rng = np.random.default_rng(651)
-    psi = rng.normal(size=(4, 9, 6)) + 1j*rng.normal(size=(4, 9, 6))
+    psi = rng.normal(size=(4, 9, carrier)) + 1j*rng.normal(size=(4, 9, carrier))
+    psi[..., 6:] = 0
     psi_d = device_put_process_local(psi, rep)
     acc = DeviceOmegaAccumulator.grid(device_put_process_local(omega, rep),
-        shape=(4, 4, 6, 6), sharding=NamedSharding(mesh, P(None, None, 'x', 'y')),
+        shape=(4, 4, carrier, carrier), sharding=NamedSharding(mesh, P(None, None, 'x', 'y')),
         omega_axis=0)
     table = _sigma_window_table(acc, SimpleNamespace(window_intervals=None), rows,
                                 max(len(row.window.nodes.t) for row in rows))
     assert 'x_mask' not in table.fields and table.fields['x_state_bounds'].shape == (len(rows), 2)
-    counter = acc.window_counter();expected = np.zeros((4, 4, 6, 6), complex)
+    counter = acc.window_counter();expected = np.zeros((4, 4, carrier, carrier), complex)
+    selector_error = fold_error = 0.
 
     @jax.jit
     def tau(e, selector, psi, ref, t, _active):
@@ -105,12 +108,18 @@ def test_compact_planner_selectors_and_window_fold_match_literal(side):
                         and np.isfinite(weight[k, n]) and abs(weight[k, n]) > 0
                         and row.window.E_min < energy[k, n] <= row.window.E_max):
                     literal[k, n] = weight[k, n]
-        np.testing.assert_array_equal(np.asarray(selector), literal[source_rows])
+        for shard in selector.addressable_shards:
+            np.testing.assert_array_equal(np.asarray(shard.data), literal[source_rows][shard.index])
+        if observe is not None:
+            observe('selector', _window_selector(True, True).lower(
+                support, e, w, operands['state_bounds']).compile())
+            observe('fold', acc.run_window(tau, (e, selector, psi_d, operands['e_ref_a']),
+                t, coeff, n_active, operands['active'], compile_only=True))
         acc.run_window(tau, (e, selector, psi_d, operands['e_ref_a']),
             t, coeff, n_active, operands['active'])
         win = row.window
         for ti, alpha in zip(win.nodes.t, win.nodes.alpha):
-            sigma = np.zeros((4, 6, 6), complex)
+            sigma = np.zeros((4, carrier, carrier), complex)
             for k in range(4):
                 for n in range(9):
                     selected = literal[source_rows[k], n]
@@ -120,19 +129,31 @@ def test_compact_planner_selectors_and_window_fold_match_literal(side):
             for index, value in zip(row.omega_idx, row.omega_abs):
                 expected[index] += (win.prefactor*alpha
                     *np.exp(-1j*(win.E_ref_A+win.E_ref_B-win.omega_sign*value)*ti))*sigma
-    np.testing.assert_allclose(np.asarray(acc.finalize()), expected, rtol=2e-12, atol=2e-12)
+    for shard in acc.finalize().addressable_shards:
+        actual, reference = np.asarray(shard.data), expected[shard.index]
+        np.testing.assert_allclose(actual, reference, rtol=2e-12, atol=2e-12)
+        fold_error = max(fold_error, float(np.max(np.abs(actual-reference), initial=0.)))
     explicit = np.array([[True, False, True]])
     # An existing explicit one-window selector is not reinterpreted by a
     # synthetic interval, even at nonfinite sentinel energies.
     np.testing.assert_array_equal(_window_selector(False, False)(
         explicit, np.array([[-np.inf, 0., np.nan]]), None, np.array([-np.inf, np.inf])), explicit)
+    return dict(windows=len(rows), shared_support_arrays=len({id(r.window.mask_A) for r in rows}),
+        table_bytes=int(table.nbytes), parent_selector_shape=list(e.shape),
+        physical_targets=6, target_carrier=carrier, max_abs_fold_error=fold_error,
+        noncontiguous_frequency_owner=True, signed_weights=True, exact_edge_ties=True)
 
 
-def test_window_table_never_reads_full_k_summed_band_masks(monkeypatch):
+@pytest.mark.parametrize('side', [2, 3])
+def test_compact_planner_selectors_and_window_fold_match_literal(side):
+    check_compact_window_fold(_mesh(side))
+
+
+def check_window_table_storage(mesh, monkeypatch):
     from gw.mpa.sigma import _sigma_window_table
     from gw.ppm_accumulators import DeviceOmegaAccumulator
     from common.collectives import device_put_process_local
-    mesh = _mesh(2);rep = NamedSharding(mesh, P())
+    rep = NamedSharding(mesh, P());side = int(mesh.shape['x'])
     # Shape-only 20^3/20k support: a one-byte broadcast view, never allocated.
     support = np.broadcast_to(np.array(True), (8000, 20000))
     row = SimpleNamespace(window=SimpleNamespace(mask_A=support, E_min=-np.inf,
@@ -141,7 +162,7 @@ def test_window_table_never_reads_full_k_summed_band_masks(monkeypatch):
         pole_indices=np.array([0]), bounds=np.zeros((1, 6)), omega_idx=np.array([0, 2]),
         omega_abs=np.array([.1, .3]))
     acc = DeviceOmegaAccumulator.grid(device_put_process_local(np.array([.1, .2, .3]), rep),
-        shape=(3, 1, 2, 2), sharding=NamedSharding(mesh, P(None, None, 'x', 'y')),
+        shape=(3, 1, side, side), sharding=NamedSharding(mesh, P(None, None, 'x', 'y')),
         omega_axis=0)
     original = np.asarray
     def guarded(value, *args, **kwargs):
@@ -153,3 +174,11 @@ def test_window_table_never_reads_full_k_summed_band_masks(monkeypatch):
         table = _sigma_window_table(acc, SimpleNamespace(window_intervals=None), [row]*14, 1)
     assert table.nbytes < 4096
     assert all(value.size < 200 for value in table.fields.values())
+
+    return dict(full_k=8000, summed_bands=20000, windows=14, table_bytes=int(table.nbytes),
+        old_x_mask_bytes=14*8000*20000, state_bounds_bytes=int(table.fields['x_state_bounds'].nbytes),
+        full_mask_accessed=False)
+
+
+def test_window_table_never_reads_full_k_summed_band_masks(monkeypatch):
+    check_window_table_storage(_mesh(2), monkeypatch)
