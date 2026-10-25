@@ -921,35 +921,15 @@ def _endpoint_panel_kernel(mesh, mesh_axis, is_local, n_sym_spatial):
     parts = int(mesh.shape[mesh_axis])
     # The permutation is already routed below. The common ψ owner applies
     # its phase/TR/spin rule with an identity local gather afterwards.
-    pairs = [(i, (i + 1) % parts) for i in range(parts)]
-
     @partial(shard_map, mesh=mesh, in_specs=(spec,) + (P(),) * 7,
              out_specs=spec, check_vma=False)
     def route(x, irr, sym, perm, wraps, q, spin, active):
         nlocal = x.shape[1]
-        selected = perm[sym]
         identity = jnp.broadcast_to(
             jnp.arange(perm.shape[1]) % nlocal, perm.shape)
         owner = jax.lax.axis_index(mesh_axis)
-        target_sources = jax.lax.dynamic_slice_in_dim(
-            jnp.asarray(selected), owner * nlocal, nlocal, axis=1)
-        offsets = target_sources % nlocal
-        def gather_step(carry, step):
-            current, output = carry
-            held_owner = (owner - step) % parts
-            gathered = jnp.take_along_axis(current, offsets[:, :, None, None], axis=1)
-            output = jnp.where((target_sources // nlocal == held_owner)[:, :, None, None],
-                               gathered, output)
-            if not is_local:
-                current = jax.lax.cond(
-                    step + 1 < parts,
-                    lambda a: jax.lax.ppermute(a, mesh_axis, pairs),
-                    lambda a: a, current)
-            return (current, output), None
-        current = x[irr]
-        (_, output), _ = jax.lax.scan(
-            gather_step, (current, jnp.zeros_like(current)),
-            jnp.arange(1 if is_local else parts), unroll=1)
+        output = _permute_isdf_rows_local(x[irr], perm[sym], mesh_axis=mesh_axis,
+                                          parts=parts, is_local=is_local)
         result = unfold_wavefunction_local(
             output, irr_idx=np.arange(len(irr)), sym_idx=sym,
             k_irr_frac=q[irr], local_perm=identity, L_table=wraps,
@@ -959,6 +939,35 @@ def _endpoint_panel_kernel(mesh, mesh_axis, is_local, n_sym_spatial):
                                             nlocal, axis=0)
         return jnp.where(mask[None, :, None, None], result, 0)
     return jax.jit(route)
+
+
+def _permute_isdf_rows_local(current, source_map, *, mesh_axis, parts, is_local):
+    """Route ISDF centroid rows inside a manual region with one local bank.
+
+    ``current[q,mu_local,...]`` and ``source_map[q,mu]`` keep all spectator
+    axes. The ring used by endpoint factors also covers a single Fourier leg,
+    including q=1; no full centroid row is gathered or q carrier enlarged.
+    """
+    nlocal = int(current.shape[1])
+    owner = jax.lax.axis_index(mesh_axis)
+    sources = jax.lax.dynamic_slice_in_dim(source_map, owner*nlocal, nlocal, axis=1)
+    shape = sources.shape + (1,)*(current.ndim-2)
+    offsets = (sources % nlocal).reshape(shape)
+    pairs = [(i, (i+1) % parts) for i in range(parts)]
+
+    def step(carry, i):
+        held, output = carry
+        gathered = jnp.take_along_axis(held, offsets, axis=1)
+        output = jnp.where((sources//nlocal == (owner-i) % parts).reshape(shape),
+                           gathered, output)
+        if not is_local:
+            held = jax.lax.cond(i+1 < parts,
+                lambda a: jax.lax.ppermute(a, mesh_axis, pairs), lambda a: a, held)
+        return (held, output), None
+
+    (_, output), _ = jax.lax.scan(step, (current, jnp.zeros_like(current)),
+        jnp.arange(1 if is_local else parts), unroll=1)
+    return output
 
 
 def _apply_unfold_phase_and_trs_local(
@@ -1867,10 +1876,12 @@ def _get_unfold_isdf_one_leg_jit(
     if hit is not None:
         return hit
 
-    idx_j = jnp.asarray(idx)
-    rows_j = jnp.asarray(rows)
-    perm_j = jnp.asarray(perm)
-    trs_j = jnp.asarray(trs)
+    # This factory can first run under an outer trace. Cache only immutable
+    # host geometry, never arrays created as that trace's temporary values.
+    idx_j = np.array(idx, copy=True)
+    rows_j = np.array(rows, copy=True)
+    perm_j = np.array(perm, copy=True)
+    trs_j = np.array(trs, copy=True)
     in_sh = NamedSharding(
         mesh_xy,
         P(None, 'x') if preselected else P(None, ('x', 'y'), None))
@@ -1881,6 +1892,16 @@ def _get_unfold_isdf_one_leg_jit(
     q_parent_sh = NamedSharding(mesh_xy, P(None, None))
     wraps_sh = NamedSharding(mesh_xy, P(None, 'x', None))
 
+    parts = int(mesh_xy.shape['x'])
+    is_local = certify_endpoint_locality(perm[rows], mesh=mesh_xy,
+                                         mesh_axis='x')['is_local']
+
+    @partial(shard_map, mesh=mesh_xy, in_specs=(P(None, 'x'), P()),
+             out_specs=P(None, 'x'), check_vma=False)
+    def permute_rows(leg, source_map):
+        return _permute_isdf_rows_local(leg, source_map, mesh_axis='x',
+                                        parts=parts, is_local=is_local)
+
     def _spatial(
             zeta, source_slot_runtime, tau_runtime,
             q_parent_runtime, wraps_runtime):
@@ -1888,9 +1909,7 @@ def _get_unfold_isdf_one_leg_jit(
         selected = (parent if preselected else jnp.take_along_axis(
             parent, source_slot_runtime[:, None, None], axis=2,
             mode='promise_in_bounds')[:, :, 0])
-        gathered = jnp.take_along_axis(
-            selected, perm_j[rows_j], axis=1,
-            mode='promise_in_bounds')
+        gathered = permute_rows(selected, perm_j[rows_j])
         q_per_full = q_parent_runtime[idx_j]
         L_per_full = wraps_runtime[rows_j]
         qL = jnp.einsum('qi,qmi->qm', q_per_full, L_per_full)
