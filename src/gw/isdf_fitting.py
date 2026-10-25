@@ -771,11 +771,11 @@ def fit_zeta_to_h5(
             with timing.section("zeta_fit.write_headers"):
                 with SlabIO(path, mode='w', mesh=mesh_xy):
                     pass
-                if jax.process_index() == 0:
+                def headers():
                     copy_mf_header(_wfn_src_path, path, dst_mode='a')
                     write_isdf_header(path, _isdf_hdr, mode='a')
-                from common.collectives import barrier
-                barrier("zeta_fit_headers_written", print_fn=print_fn)
+                from common.collectives import rank0_transaction
+                rank0_transaction(path, stage="zeta_fit_headers", write=headers)
         channels.append(ZetaChannel(v, L_q, lu_piv, _kind, _write_file, output_files[v]))
     del _face_gemm
     gc.collect()
@@ -804,9 +804,11 @@ def fit_zeta_to_h5(
     for ch in channels:
         if zetas[ch.vertex].pending_file is not None:
             zetas[ch.vertex].pending_file["complete"] = True
-        elif ch.write and jax.process_index() == 0:
+        elif ch.write:
             from file_io.isdf_header import mark_zeta_done
-            mark_zeta_done(ch.output_file)
+            from common.collectives import rank0_transaction
+            rank0_transaction(ch.output_file, stage="zeta_fit_complete",
+                              write=lambda: mark_zeta_done(ch.output_file))
     _track_peak_mb = 0
     try:
         _st = jax.local_devices()[0].memory_stats() or {}
