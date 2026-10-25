@@ -115,6 +115,13 @@
 //                gone.  An ABI-10 library would refuse every new ctx_key as "not
 //                a slate context"; refused by name at load instead.
 //
+//   ABI 11 -> 12 (2026-10-25, nested collective HDF5 dataset paths).
+//                The required ds_name contract now includes parent-group
+//                creation inside the same collective transaction (W0_lr/Ft).
+//                No C signature moved. An ABI-11 provider could invalidate
+//                the artifact and then fail to create that required path;
+//                refuse it at load, before any data mutation instead.
+//
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
@@ -139,4 +146,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 11
+#define LORRAX_FFI_ABI_VERSION 12
