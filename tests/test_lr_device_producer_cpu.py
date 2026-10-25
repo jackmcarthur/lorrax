@@ -75,9 +75,11 @@ def test_device_producer_matches_literal_schur_and_sharded_writer(tmp_path,monke
     quotes=[]
     def quote(exe):
         text=exe.as_text()
+        channel_carrier=-(-nl//side)*side
         for width in {mu,mu if basis is None else basis.n_packed}:
-            for shape in ((nq,nl,width),(nq,width,nl),(nq*nl,width),(width,nq*nl)):
-                assert 'c128['+','.join(map(str,shape))+']' not in text,text
+            for channels in {nl,channel_carrier}:
+                for shape in ((nq,channels,width),(nq,width,channels),(nq*channels,width),(width,nq*channels)):
+                    assert 'c128['+','.join(map(str,shape))+']' not in text,text
         quotes.append(text)
         return original_quote(exe)
     monkeypatch.setattr(aot_memory,'compiled_new_bytes',quote)
