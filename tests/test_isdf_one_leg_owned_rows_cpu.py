@@ -59,6 +59,14 @@ def check_one_leg_owned_rows(monkeypatch, mesh, *, single=False, local=False):
     base[:,physical:]=0
     source_g=np.tile(np.array([[-1,0,1],[0,0,0],[0,0,0]])[None],(len(q),1,1))
     captures=[]
+    def concrete_metadata(owner):
+        def place(*a,**kw):
+            value=owner(*a,**kw)
+            assert not isinstance(value,jax.core.Tracer), 'one-leg metadata placement entered an outer trace'
+            return value
+        return place
+    monkeypatch.setattr(maps,'device_put_process_local',concrete_metadata(maps.device_put_process_local))
+    monkeypatch.setattr(maps,'device_put_process_local_cached',concrete_metadata(maps.device_put_process_local_cached))
     original=maps._get_unfold_isdf_one_leg_jit
     def observe(**kw):
         program=original(**kw)

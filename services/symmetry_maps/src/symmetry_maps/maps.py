@@ -1845,19 +1845,25 @@ def unfold_isdf_one_leg(
     tau_sh = NamedSharding(mesh_xy, P(None))
     q_parent_sh = NamedSharding(mesh_xy, P(None, None))
     wraps_sh = NamedSharding(mesh_xy, P(None, 'x', None))
-    source_slot_dev = device_put_process_local(source_slot, slot_sh)
-    tau_spatial_dev = device_put_process_local(tau_spatial, tau_sh)
-    q_parent_dev = device_put_process_local(q_parent, q_parent_sh)
-    wraps_dev = device_put_process_local(wraps, wraps_sh)
+    R_sh = NamedSharding(mesh_xy, P(None, None))
+    # As in the operator transport, a first call may occur under an outer
+    # trace. Place only host geometry in this concrete scope; zeta remains
+    # a runtime operand and no traced single-device shard enters assembly.
+    with jax.ensure_compile_time_eval():
+        source_slot_dev = device_put_process_local_cached(source_slot, slot_sh)
+        tau_spatial_dev = device_put_process_local_cached(tau_spatial, tau_sh)
+        q_parent_dev = device_put_process_local_cached(q_parent, q_parent_sh)
+        wraps_dev = device_put_process_local_cached(wraps, wraps_sh)
+        if action == 'polar':
+            R_dev = device_put_process_local_cached(np.asarray(R_column), R_sh)
     if action == "scalar":
         return fn(
             zeta_ibz, source_slot_dev, tau_spatial_dev,
             q_parent_dev, wraps_dev)
-    R_sh = NamedSharding(mesh_xy, P(None, None))
     return fn(
         zeta_ibz, source_slot_dev, tau_spatial_dev,
         q_parent_dev, wraps_dev,
-        device_put_process_local(np.asarray(R_column), R_sh))
+        R_dev)
 
 
 _UNFOLD_ISDF_ONE_LEG_JIT_CACHE: dict = {}
