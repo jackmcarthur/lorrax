@@ -5,31 +5,25 @@
 # NVHPC SDK install).  PyPI ships standalone ``nvidia-cusolvermp-cu12``
 # wheels that are smaller (~30–110 MB), don't drag in the rest of the
 # HPC SDK, and decouple cuSolverMp upgrades from the NVHPC release
-# cadence.  We use this to ship cuSolverMp 0.7.2 (the first version
-# with both the CAL→NCCL ABI fix AND the 0.7.0/0.7.1 race-condition
-# follow-up) on top of the JAX 25.04 container's CUDA 12.9 runtime.
+# cadence. The default is the full released 0.9.1 CUDA-12 provider, which
+# fixes the large-N eigenvector failures of 0.4.2--0.9.0. Stage its matching
+# cuBLASMp with cusolvermp_stage_cublasmp_redist.sh and NCCL >= 2.29.2.
 #
-# Run on a NERSC login node (no container, no GPU):
-#
-#   src/ffi/cpp/stage/cusolvermp_stage_pypi.sh                 # 0.7.2 default
-#   CUSOLVERMP_VERSION=0.8.0.3126 src/ffi/cpp/stage/cusolvermp_stage_pypi.sh
+# Run on a login node (no container, no GPU):
+#   src/ffi/cpp/stage/cusolvermp_stage_pypi.sh
 #
 # Override defaults with env vars:
-#   CUSOLVERMP_VERSION   PyPI version, default 0.7.2.888
-#   CUSOLVERMP_SHORT     short name for the staging dir, default 0.7.2
-#   NVHPC_CUDA           CUDA toolkit subdir, default 12.9 (matches the
-#                        JAX 25.04-py3 container's libcudart.so.12.9.37)
-#   LORRAX_FFI_NVHPC_DIR root of staging tree, default
-#                        /pscratch/sd/${USER:0:1}/${USER}/lorrax_nvhpc
+#   CUSOLVERMP_VERSION   PyPI version, default 0.9.1.9318.post1
+#   CUSOLVERMP_SHORT     stage tag, default first three version components
+#   NVHPC_CUDA           CUDA toolkit subdir, default 12.9
+#   LORRAX_FFI_NVHPC_DIR root of the staging tree
 #
-# Note: cuSolverMp 0.8.0+ requires NCCL ≥ 2.27 (ncclCommWindowRegister
-# symbol).  The JAX 25.04 container ships NCCL 2.26.3, so 0.8.0 won't
-# dlopen there — stage NCCL 2.27+ separately or stay on 0.7.x.
+# A pre-0.9.1 stage is not supported, even where its small-case tests pass.
 
 set -euo pipefail
 
-: "${CUSOLVERMP_VERSION:=0.7.2.888}"
-# Strip the trailing build number for the short tag (e.g. 0.7.2.888 → 0.7.2).
+: "${CUSOLVERMP_VERSION:=0.9.1.9318.post1}"
+# Strip the trailing build number for the short tag (e.g. 0.9.1.9318.post1 → 0.9.1).
 : "${CUSOLVERMP_SHORT:=$(echo "${CUSOLVERMP_VERSION}" | cut -d. -f1-3)}"
 : "${NVHPC_CUDA:=12.9}"
 : "${LORRAX_FFI_NVHPC_DIR:=/pscratch/sd/${USER:0:1}/${USER}/lorrax_nvhpc}"
@@ -74,27 +68,14 @@ cp "${TMPDIR}/extracted/nvidia/cu12/lib/libcusolverMp.so.0" \
 ln -sf "libcusolverMp.so.${CUSOLVERMP_SHORT}.0" "${LIB_DIR}/libcusolverMp.so.0"
 ln -sf "libcusolverMp.so.0"                     "${LIB_DIR}/libcusolverMp.so"
 
-# Header: 0.7.x wheels ship one; 0.7.2 in particular doesn't (only the
-# .so).  Reuse 0.6.0's header if absent — the C symbols our FFI calls
-# (cusolverMpCreate, cusolverMpCreateDeviceGrid, cusolverMpGetVersion,
-# cusolverMpGetrf, cusolverMpGetrs, cusolverMpPotrf, cusolverMpPotrs)
-# are ABI-stable across 0.6 → 0.7+; only the cusolverMpCreateDeviceGrid
-# COMM-PARAMETER TYPE changed (cal_comm_t → ncclComm_t), and our patched
-# FFI casts at the call site so the C declaration's tag doesn't matter.
+# The released wheel supplies its own matching API header. Do not substitute
+# a header from an old CAL provider when staging a supported NCCL release.
 WHEEL_HEADER="${TMPDIR}/extracted/nvidia/cu12/include/cusolverMp.h"
-if [[ -f "${WHEEL_HEADER}" ]]; then
-    cp "${WHEEL_HEADER}" "${INC_DIR}/cusolverMp.h"
-    echo "[stage] using wheel header"
-else
-    LEGACY_HEADER="${LORRAX_FFI_NVHPC_DIR}/25.5_cuda12.9/math_libs/${NVHPC_CUDA}/targets/x86_64-linux/include/cusolverMp.h"
-    if [[ -f "${LEGACY_HEADER}" ]]; then
-        cp "${LEGACY_HEADER}" "${INC_DIR}/cusolverMp.h"
-        echo "[stage] wheel had no header; reused 0.6.0's at ${LEGACY_HEADER}"
-    else
-        echo "[stage] FAILED: no header in wheel and no 0.6.0 fallback at ${LEGACY_HEADER}"
-        exit 2
-    fi
+if [[ ! -f "${WHEEL_HEADER}" ]]; then
+    echo "[stage] FAILED: released cuSOLVERMp wheel lacks cusolverMp.h"
+    exit 2
 fi
+cp "${WHEEL_HEADER}" "${INC_DIR}/cusolverMp.h"
 
 echo "[stage] done."
 ls -la "${LIB_DIR}/libcusolverMp.so"* "${INC_DIR}/cusolverMp.h"

@@ -208,11 +208,10 @@ fi
 # silently decides which implementation runs — nothing fails, nothing warns.
 # On Perlmutter 25.5_cuda12.9 is cuSolverMp 0.6.0, which returns WRONG
 # getrf/getrs answers on any Px>1 AND Py>1 mesh (site_config.sh ~L80), while
-# 0.7.2_cuda12.9 carries both the CAL->NCCL ABI fix and the race fix and is
-# what site_config selects.  Hardcoding 25.5 here silently overrode that
-# choice for every run launched through this script: a wrong-answer path,
-# not a performance one.
-: "${LORRAX_NVHPC_SUBPATH:=0.7.2_cuda12.9/math_libs/12.9/lib64}"
+# the supported 0.9.1 stage also fixes later large-N eigenvector errors.
+# Keep this fallback aligned with site_config; explicitly selected older
+# stages are refused by the native provider before grid creation.
+: "${LORRAX_NVHPC_SUBPATH:=0.9.1_cuda12.9/math_libs/12.9/lib64}"
 if [[ ! -e "${NVHPC_HOST}/${LORRAX_NVHPC_SUBPATH}/libcusolverMp.so" ]]; then
     echo "run_shifter.sh: LORRAX_NVHPC_SUBPATH='${LORRAX_NVHPC_SUBPATH}' does not" >&2
     echo "  name a cuSOLVERMp stage under ${NVHPC_HOST}." >&2

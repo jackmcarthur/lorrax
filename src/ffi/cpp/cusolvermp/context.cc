@@ -185,14 +185,14 @@ int64_t create_context(int rank, int world_size,
     //
     //    The same FFI binary supports BOTH paths: detect the loaded
     //    library version via cusolverMpGetVersion (an int returned as
-    //    MAJOR*1000 + MINOR*100 + PATCH, e.g. 600/700/720/800), choose
-    //    the correct comm type, and warn on known-broken combinations.
+    //    MAJOR*10000 + MINOR*100 + PATCH, e.g. 600/702/800/901), choose
+    //    the correct comm type, and refuse unsupported releases.
     int mp_version = 0;
     throw_if_cusolver(cusolverMpGetVersion(ctx->handle, &mp_version),
                       "cusolverMpGetVersion");
     ctx->cusolvermp_version = mp_version;
-    const int mp_major = mp_version / 1000;
-    const int mp_minor = (mp_version / 100) % 10;
+    const int mp_major = mp_version / 10000;
+    const int mp_minor = (mp_version / 100) % 100;
     const int mp_patch = mp_version % 100;
     const bool use_nccl_comm_path = (mp_version >= 700);
 
@@ -217,28 +217,27 @@ int64_t create_context(int rank, int world_size,
             p, q, grid_layout_col_major ? "col-major" : "row-major");
     }
 
-    // Known-broken combinations:
-    //   * 0.6.x + Px>1 AND Py>1: getrf/getrs return silent wrong answers.
-    //     Reproduced 2026-05-09 across (N, NRHS) on a 2x2 mesh; the
-    //     cuSolverMp 0.7.0 release notes' "non-square grid" fix is in
-    //     fact the CAL→NCCL ABI shift below and applies to ALL 2D grids
-    //     (square or not) once the comm type is correct.  1×N and N×1
-    //     are unaffected because the broken degenerate-block-cyclic path
-    //     isn't triggered there.  LORRAX meshes are square, so this
-    //     REFUSES on every rank (the predicate is rank-independent).
+    // Supported-release floor. NVIDIA's 0.9.1 release notes fix large-N
+    // SYEVD/STEDC internal errors and silently incorrect eigenvectors in
+    // 0.4.2--0.9.0. The onset depends on N and the grid: require the fixed
+    // release, not a guessed size threshold. This checks the LOADED provider
+    // before any grid or workspace is created, including manual/legacy stages.
+    // Keep the existing gate name for callers that classify this refusal.
+    // https://docs.nvidia.com/cuda/cusolvermp/release_notes/index.html#cusolvermp-v0-9-1
     //   * 0.8.0 + NCCL < 2.27: dlopen fails with "undefined symbol:
     //     ncclCommWindowRegister".  We can't reach this point if the
     //     symbol is missing (load fails before this constructor runs),
     //     but a soft warning at NCCL < 2.27 is still useful for any
     //     future cusolverMp ≥ 0.8 binary.
-    if (mp_version < 700 && p > 1 && q > 1) {
+    if (mp_version < 901) {
         std::ostringstream os;
         os << "GATE cusolvermp_2d_grid_version: got cuSOLVERMp " << mp_major
            << "." << mp_minor << "." << mp_patch << " on a " << p << "x" << q
-           << " process grid; want cuSOLVERMp >= 0.7.0 on any grid with Px > 1"
-           << " and Py > 1 (0.6.x getrf/getrs return wrong answers there,"
-           << " silently); fix: load cuSOLVERMp >= 0.7 (the lorrax_A bundle"
-           << " ships 0.9.1); doc: docs/architecture/ffi_layout.md §4.";
+           << " process grid; want released cuSOLVERMp >= 0.9.1 for the supported"
+           << " distributed provider (0.4.2--0.9.0 can return silently incorrect"
+           << " eigenvectors at large N); fix: stage the released cuSOLVERMp"
+           << " 0.9.1/cuBLASMp pair and rebuild the CUDA leg; doc: "
+           << "docs/architecture/ffi_layout.md §4.";
         throw std::runtime_error(os.str());
     }
     if (rank == 0) {

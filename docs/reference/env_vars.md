@@ -203,7 +203,7 @@ variables, not environment variables.
 
 | var | default | class | grammar and effect |
 |---|---|---|---|
-| `LORRAX_NVHPC_SUBPATH` | `0.7.2_cuda12.9/math_libs/12.9/lib64` (`config/perlmutter/site_config.sh`) | launch | The cuSOLVERMp stage a run loads. It selects a communication path, not only a version, and every stage exports the same SONAME, so a mismatch links cleanly and warns about nothing: read [`ffi_layout.md` §4](../architecture/ffi_layout.md) before changing it. |
+| `LORRAX_NVHPC_SUBPATH` | `0.9.1_cuda12.9/math_libs/12.9/lib64` (`config/perlmutter/site_config.sh`) | launch | The cuSOLVERMp stage a run loads. It selects a communication path, not only a version, and every stage exports the same SONAME, so a mismatch links cleanly and warns about nothing: read [`ffi_layout.md` §4](../architecture/ffi_layout.md) before changing it. |
 | `LORRAX_NVHPC_ROOT` / `LORRAX_NVHPC_MOUNT` | none; `build.sh` refuses when unset | build | The stage the `.so` is compiled against, and its bind-mount point (`/lorrax_nvhpc`). |
 | `LORRAX_PLATFORM` | `gpu` (`run_shifter.sh`) | launch | `gpu`, or `cpu`/`host`. Decides `MPICH_GPU_SUPPORT_ENABLED` for the Shifter launch; on the CPU leg it must be 0 or Cray MPICH aborts in `MPI_Init_thread`. |
 | `LORRAX_MPICH_GPU_SUPPORT` | derived from `LORRAX_PLATFORM` | launch | `0` or `1`; anything else refuses. Carries the value across Shifter's mpich module, which unsets `MPICH_GPU_SUPPORT_ENABLED`. |

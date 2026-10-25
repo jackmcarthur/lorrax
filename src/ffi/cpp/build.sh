@@ -26,11 +26,11 @@ BUILD_DIR="${LORRAX_FFI_BUILD_DIR:-${SCRIPT_DIR}/build}"
 # The default here was `/lorrax_nvhpc/25.5_cuda12.9`, i.e. cuSolverMp 0.6.0,
 # which config/perlmutter/site_config.sh documents as silently returning
 # WRONG getrf/getrs answers on any Px>1 AND Py>1 mesh — while site_config's
-# LORRAX_NVHPC_SUBPATH selects 0.7.2 for the RUN.  Every stage exports the
+# LORRAX_NVHPC_SUBPATH selected 0.7.2 for the RUN. Every stage exports the
 # same SONAME (libcusolverMp.so.0), so building against one and running
 # against the other links cleanly and warns about nothing.  It has been
-# latent rather than live only because 0.7.2 happens to come first on
-# LD_LIBRARY_PATH; that is luck, one path edit deep.
+# latent rather than live only because 0.7.2 came first on LD_LIBRARY_PATH.
+# Supported stages now require >=0.9.1, including its large-N EIGH fixes.
 #
 # THERE IS NO SAFE DEFAULT, which is the reason this refuses instead of
 # picking a better one.  The stages differ in more than a version number:

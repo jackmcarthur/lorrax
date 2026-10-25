@@ -52,20 +52,13 @@ LORRAX_SHIFTER_MODULES="gpu,mpich"
 # math_libs/<cuda>/lib64/libcusolverMp.so + the matching
 # math_libs/<cuda>/targets/x86_64-linux/include/cusolverMp.h.
 #
-# 0.7.2_cuda12.9: standalone PyPI wheel ``nvidia-cusolvermp-cu12==0.7.2.888``
-# extracted into $HOME/software/lorrax_nvhpc/0.7.2_cuda12.9/...  This
-# is the working baseline: it includes the CAL→NCCL ABI fix (release 0.7.0)
-# AND the race-condition follow-up (release 0.7.2) so distributed LU on a
-# 2D process grid actually returns correct answers.  Validated on Px=Py=2
-# at machine precision for getrf/getrs across multiple (N, NRHS) configs.
-#
-# 25.5_cuda12.9: the older NVHPC-25.5 install, cuSolverMp 0.6.0.  Kept
-# alongside 0.7.2 for fallback; load with LORRAX_NVHPC_SUBPATH override
-# in a shell.  0.6.0 silently returns wrong answers for getrf/getrs on
-# any Px>1 AND Py>1 mesh — the patched FFI prints a runtime warning
-# (see src/ffi/cpp/cusolvermp/context.cc) but the warning can't fix the
-# bug.  Use 1xN / Nx1 mesh if you must run 0.6.0.
-LORRAX_NVHPC_SUBPATH="0.7.2_cuda12.9/math_libs/12.9/lib64"
+# 0.9.1_cuda12.9: released nvidia-cusolvermp-cu12==0.9.1.9318.post1,
+# paired with cuBLASMp 0.10.0.3695. Stage both and NCCL >= 2.29.2.
+# Older cuSOLVERMp 0.4.2--0.9.0 can produce silently wrong eigenvectors
+# at large N; the native provider refuses versions below 0.9.1 on every grid.
+# This is the legacy container stage; the current bare-host installer uses
+# the exact CUDA-13 wheel pair from pyproject.toml instead.
+LORRAX_NVHPC_SUBPATH="0.9.1_cuda12.9/math_libs/12.9/lib64"
 
 # Where Shifter bind-mounts Cray MPICH libs inside the container when
 # --module=mpich is active.  Standard NERSC layout.

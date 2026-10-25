@@ -377,21 +377,25 @@ prints `[lorrax cusolverMp] library X.Y.Z, NCCL …, comm path: NCCL|CAL`.
   search path must therefore hold exactly one cuSOLVERMp: the sealed bundle
   loads its own by exact path, and `run_shifter.sh` puts exactly one NVHPC
   stage on `LD_LIBRARY_PATH`.
-* **A `HAVE_CAL=OFF` build refuses a pre-0.7 library** at context creation. A
-  `HAVE_CAL=ON` build carries both paths and `DT_NEEDED` `libcal.so.0`.
-* **0.6.x is wrong on a 2-D grid.** With `Px > 1` and `Py > 1` its
-  `getrf`/`getrs` return wrong answers, so context creation refuses that
-  pairing (`GATE cusolvermp_2d_grid_version`). LORRAX meshes are square, so a
-  `HAVE_CAL=ON` build with a pre-0.7 library runs only at P = 1.
-* **≥ 0.8 needs NCCL ≥ 2.27** (`ncclCommWindowRegister`); the handler warns
-  when the loaded NCCL is older.
+* **The supported provider requires cuSOLVERMp ≥ 0.9.1 on every grid.**
+  Context creation checks the loaded library before creating a grid or
+  workspace (the existing `GATE cusolvermp_2d_grid_version` tag is retained).
+  NVIDIA documents large-problem internal errors and silently wrong
+  eigenvectors in 0.4.2–0.9.0, fixed in
+  [0.9.1](https://docs.nvidia.com/cuda/cusolvermp/release_notes/index.html#cusolvermp-v0-9-1).
+  The onset depends on the grid, so LORRAX requires the fixed release rather
+  than guessing a safe matrix-size threshold. The CAL rows above describe
+  historical ABI compatibility, not a supported older provider.
+* **Use the matching released pair and NCCL.** Both CUDA extras pin
+  cuSOLVERMp 0.9.1 and cuBLASMp 0.10.0; that pair requires NCCL ≥ 2.29.2.
+  A new native CUDA build is required when changing the provider stage.
 
 **Container stages.** `build.sh` refuses (exit 2) when neither
 `LORRAX_NVHPC_ROOT` nor `LORRAX_NVHPC_SUBPATH` names a stage, listing the
 stages under `/lorrax_nvhpc` with the flag each needs. It also refuses a stage
 without `cal.h` unless `LORRAX_FFI_HAVE_CAL` is set explicitly. The single
 source of truth is `LORRAX_NVHPC_SUBPATH` (`config/perlmutter/site_config.sh`,
-default `0.7.2_cuda12.9/math_libs/12.9/lib64`). `run_shifter.sh` exports it
+default `0.9.1_cuda12.9/math_libs/12.9/lib64`). `run_shifter.sh` exports it
 with `LORRAX_NVHPC_ROOT` derived from its first component, so a build launched
 there agrees with its runs.
 

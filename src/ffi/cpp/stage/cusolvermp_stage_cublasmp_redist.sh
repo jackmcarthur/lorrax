@@ -13,7 +13,7 @@
 # mesh (found 2026-07-10; the cublasmp FFI backend had been dead since
 # the 0.7.2 cuSOLVERMp stage on 2026-05-10).
 #
-# Pairing rule (comm ABI generations must match):
+# Historical comm-ABI pairing (supported providers now require cuSOLVERMp >= 0.9.1):
 #   cuSOLVERMp <= 0.6.x  <->  cuBLASMp <= 0.4.x   (CAL)
 #   cuSOLVERMp >= 0.7.0  <->  cuBLASMp >= 0.5.0   (NCCL)
 #
@@ -22,17 +22,17 @@
 #   src/ffi/cpp/stage/cusolvermp_stage_cublasmp_redist.sh
 #
 # Overrides:
-#   CUBLASMP_VERSION      default 0.5.1.65  (full redist version string)
+#   CUBLASMP_VERSION      default 0.10.0.3695  (full redist version string)
 #   CUBLASMP_CUDA         default cuda12
 #   LORRAX_FFI_NVHPC_DIR  default $HOME/software/lorrax_nvhpc
-#   LORRAX_CUSOLVERMP_STAGE  default 0.7.2_cuda12.9 (stage dir to add to)
+#   LORRAX_CUSOLVERMP_STAGE  default 0.9.1_cuda12.9 (stage dir to add to)
 
 set -euo pipefail
 
-: "${CUBLASMP_VERSION:=0.5.1.65}"
+: "${CUBLASMP_VERSION:=0.10.0.3695}"
 : "${CUBLASMP_CUDA:=cuda12}"
 : "${LORRAX_FFI_NVHPC_DIR:=$HOME/software/lorrax_nvhpc}"
-: "${LORRAX_CUSOLVERMP_STAGE:=0.7.2_cuda12.9}"
+: "${LORRAX_CUSOLVERMP_STAGE:=0.9.1_cuda12.9}"
 
 STAGE="${LORRAX_FFI_NVHPC_DIR}/${LORRAX_CUSOLVERMP_STAGE}/math_libs/12.9"
 ARCHIVE="libcublasmp-linux-x86_64-${CUBLASMP_VERSION}_${CUBLASMP_CUDA}-archive"
@@ -58,19 +58,8 @@ cp -a "${ARCHIVE}/lib/"libcublasmp.so* "${STAGE}/lib64/"
 mkdir -p "${STAGE}/targets/x86_64-linux/include"
 cp -a "${ARCHIVE}/include/cublasmp.h" "${STAGE}/targets/x86_64-linux/include/"
 
-# libcublasmp NEEDs libnvshmem_host.so.3, and RUNPATH is NOT transitive:
-# liblorrax_ffi.so's runpath doesn't apply when the loader resolves
-# cublasmp's own deps, so nvshmem must sit in the same staged lib64
-# (which is on LD_LIBRARY_PATH).  Copy it from the HPC-SDK stage.
-NVSHMEM_SRC="${LORRAX_FFI_NVHPC_DIR}/25.5_cuda12.9/math_libs/12.9/lib64"
-if [[ -e "${NVSHMEM_SRC}/libnvshmem_host.so.3" ]]; then
-    cp -a "${NVSHMEM_SRC}/"libnvshmem_host.so* \
-          "${NVSHMEM_SRC}/"nvshmem_bootstrap_uid.so* \
-          "${STAGE}/lib64/"
-else
-    echo "[stage] WARNING: libnvshmem_host.so.3 not found at ${NVSHMEM_SRC};"
-    echo "        stage it manually or libcublasmp will fail to load."
-fi
+# The supported 0.10 cuBLASMp redistributable uses NCCL. Older CAL/NVSHMEM
+# stages are historical artifacts, not dependencies to copy into this stage.
 
 echo "[stage] done.  ${STAGE}/lib64:"
 ls -l "${STAGE}/lib64/" | grep cublasmp

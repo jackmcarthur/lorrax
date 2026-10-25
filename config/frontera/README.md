@@ -27,7 +27,7 @@ production-certified (2026-07 campaign, scorecard AM-AU).
 | OS glibc | 2.31+ | **2.17** (CentOS 7) → JAX must run in-container |
 | GPU | A100, NVLink | **RTX 5000** (Turing sm_75, 16 GB, **no NVLink**, PCIe P2P intra-socket only) |
 | Driver | current | **535.113.01** (CUDA 12.2) → **CUDA 12**, not 13 |
-| cuSOLVERMp source | NVHPC SDK (+ CAL) | **pip** `nvidia-cusolvermp-cu12` 0.9 (**NCCL-native, no CAL**) |
+| cuSOLVERMp source | NVHPC SDK (+ CAL) | **pip** `nvidia-cusolvermp-cu12` 0.9.1 with cuBLASMp 0.10.0 (**NCCL-native, no CAL**) |
 | MPI | Cray MPICH | Intel MPI / MVAPICH2-X (host, hybrid-mounted); `module load phdf5` |
 
 ## GPUs: not a target

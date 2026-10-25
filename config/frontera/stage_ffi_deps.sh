@@ -21,8 +21,10 @@ set -euo pipefail
 
 : "${LORRAX_VENV:=$WORK/lorrax_env/.venv}"
 : "${LORRAX_FFI_STAGE:=$WORK/lorrax_ffi}"
-: "${LORRAX_CUSOLVERMP_PIN:=nvidia-cusolvermp-cu12}"   # add ==0.9.* to pin
-: "${LORRAX_CUBLASMP_PIN:=nvidia-cublasmp-cu12}"
+# Same released CUDA-12 pair as pyproject.toml; an unversioned install can
+# retain an older already-installed provider with known large-N EIGH failures.
+: "${LORRAX_CUSOLVERMP_PIN:=nvidia-cusolvermp-cu12==0.9.1.9318.post1}"
+: "${LORRAX_CUBLASMP_PIN:=nvidia-cublasmp-cu12==0.10.0.3695}"
 UVBIN="${UV_BIN:-$WORK/bin/uv}"
 
 PY="$LORRAX_VENV/bin/python"

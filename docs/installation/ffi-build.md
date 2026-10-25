@@ -36,15 +36,16 @@ each of those into a build failure.
 
 ## Dependencies
 
-None of these are declared in `pyproject.toml` except `nvidia-mathdx`.
+The CUDA extras declare `nvidia-mathdx` and the matching cuSOLVERMp/cuBLASMp
+wheel pair. The system dependencies below are supplied by the site.
 
 | dependency | minimum | leg |
 |---|---|---|
 | NVIDIA GPU | sm_80 | CUDA |
 | CUDA toolkit | 12.x or 13.x, the same major as the JAX wheel (the `cuda12` or `cuda13` extra); Perlmutter builds with the locked CUDA-13 wheels | CUDA |
 | JAX and jaxlib | 0.12.x ([the JAX contract](index.md#jax)); the XLA FFI headers come from the JAX that will load the library | both |
-| cuSOLVERMp | 0.7 (NCCL-native); 0.8 and later need NCCL ≥ 2.27 | CUDA |
-| cuBLASMp | the version staged with cuSOLVERMp | CUDA |
+| cuSOLVERMp | 0.9.1 (fixes large-N eigenvector failures in 0.4.2–0.9.0); the locked pair needs NCCL ≥ 2.29.2 | CUDA |
+| cuBLASMp | 0.10.0.3695, the version pinned with cuSOLVERMp | CUDA |
 | parallel HDF5 | 1.12, built with `HDF5_IS_PARALLEL` | both |
 | MPI | the site MPI, named explicitly | both |
 | BLAS + ScaLAPACK | any one flavour (LibSci, MKL, OpenBLAS + netlib ScaLAPACK) | host |
@@ -56,10 +57,10 @@ None of these are declared in `pyproject.toml` except `nvidia-mathdx`.
   `cusolvermp_stage_nvhpc.sh` (an NVHPC SDK install) and
   `cusolvermp_stage_cublasmp_redist.sh` (the cuBLASMp redistributable).
   Every version exports the same SONAME, `libcusolverMp.so.0`, so the stage
-  a leg is built against must be the stage its runs load. Versions ≥ 0.7
+  a leg is built against must be the stage its runs load. Supported versions ≥ 0.9.1
   communicate through NCCL, ship no `cal.h`, and need
-  `-DLORRAX_FFI_HAVE_CAL=OFF`; 0.6.x returns wrong `getrf`/`getrs` results on
-  any mesh with both $P_x > 1$ and $P_y > 1$
+  `-DLORRAX_FFI_HAVE_CAL=OFF`. Context creation refuses older releases
+  before grid or workspace creation
   ([the communication path](../architecture/ffi_layout.md#4-the-cusolvermp-version-picks-the-communication-path)).
 - **Parallel HDF5.** Point CMake at it with `-DHDF5_ROOT=<prefix>` (or
   `$HDF5_ROOT` / `$HDF5_DIR`); CMake refuses an HDF5 without

@@ -12,8 +12,8 @@
 // at all tested sizes — the bug was specific to the 2D distributed LU
 // kernel in cuSOLVERMp itself.
 //
-// **Resolved in cuSOLVERMp 0.7.2** (current default; see
-// ``stage_pypi.sh``).  Validated end-to-end on the MoS2 3×3 D3h
+// **Resolved in cuSOLVERMp 0.7.2** (historical validation; supported stages
+// now require >=0.9.1 for later large-N EIGH fixes). Validated on the MoS2 3×3 D3h
 // bispinor smoke (2×2 mesh, transverse γ̃^i channels) — eqp0
 // matches the legacy per-q ``jnp.linalg.solve`` path to float ULP.
 // See ``isdf_fitting._resolve_solver_kind_transverse`` for the
