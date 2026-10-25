@@ -201,7 +201,8 @@ static ffi::Error orthogonalize(lrx::gpu::Stream s, B v, B p, I active, R out, R
     return ffi::Error::Success();
 }
 
-static ffi::Error check_subtract(B v, B p, B coefficients, I range, R out) {
+static ffi::Error prepare_subtract(lrx::gpu::Stream s, B v, B p, B coefficients,
+                                   I range, R out) {
     if (range.dimensions()[0] != 2 || !fits(v.dimensions()[0]) || !fits(v.dimensions()[1]) ||
         !fits(p.dimensions()[0]))
         return ffi::Error::InvalidArgument("active subspace subtract descriptor/dimension overflow");
@@ -210,14 +211,17 @@ static ffi::Error check_subtract(B v, B p, B coefficients, I range, R out) {
         out->dimensions()[1] != p.dimensions()[1])
         return ffi::Error::InvalidArgument("active subspace subtract buffer geometry");
     if (out->typed_data() != p.typed_data())
-        return ffi::Error::InvalidArgument("active subspace subtract requires declared P output alias");
+        LORRAX_GPU_CHECK(lrx::gpu::memcpy_async(out->typed_data(), p.typed_data(),
+                                                static_cast<size_t>(p.dimensions()[0]) *
+                                                    p.dimensions()[1] * 16,
+                                                lrx::gpu::kDeviceToDevice, s));
     return ffi::Error::Success();
 }
 
 static ffi::Error subtract(lrx::gpu::Stream s, B v, B p, B coefficients, I range, R out,
                            ScratchResult scratch, std::string_view cubin_dir) {
     (void)scratch;
-    FFI_RETURN_IF_ERROR(check_subtract(v, p, coefficients, range, out));
+    FFI_RETURN_IF_ERROR(prepare_subtract(s, v, p, coefficients, range, out));
     const Fns* f = nullptr;
     FFI_RETURN_IF_ERROR(kernels(cubin_dir, &f));
     return combine(f, s, out->typed_data(), v.typed_data(), coefficients.typed_data(),
@@ -226,11 +230,10 @@ static ffi::Error subtract(lrx::gpu::Stream s, B v, B p, B coefficients, I range
 
 static ffi::Error subtract_gram(lrx::gpu::Stream s, B v, B p, B coefficients, I range, R out,
                                 R next, ScratchResult scratch, std::string_view cubin_dir) {
-    FFI_RETURN_IF_ERROR(check_subtract(v, p, coefficients, range, out));
+    FFI_RETURN_IF_ERROR(prepare_subtract(s, v, p, coefficients, range, out));
     if (next->dimensions()[0] != coefficients.dimensions()[0] ||
-        next->dimensions()[1] != coefficients.dimensions()[1] ||
-        next->typed_data() != coefficients.typed_data())
-        return ffi::Error::InvalidArgument("active subspace subtract/Gram requires declared C output alias");
+        next->dimensions()[1] != coefficients.dimensions()[1])
+        return ffi::Error::InvalidArgument("active subspace subtract/Gram coefficient buffer geometry");
     const Fns* f = nullptr;
     FFI_RETURN_IF_ERROR(kernels(cubin_dir, &f));
     const int cap = v.dimensions()[0], b = p.dimensions()[0];
