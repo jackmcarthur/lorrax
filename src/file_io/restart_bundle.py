@@ -2573,16 +2573,12 @@ class _ZetaGTiles:
         if not self._distributed:
             return device_put_process_local(
                 self[q_offset:q_offset + q_count], sharding)
-        if self._mu == self._mu_disk:
-            return self._loader.load(
-                q=np.arange(q_offset, q_offset + q_count, dtype=np.int32),
-                sharding=sharding.spec)
-        # The stored extent with μ unsharded, then zero rows to the carrier on ``sharding``.
-        spec = tuple(sharding.spec) + (None,) * (3 - len(tuple(sharding.spec)))
-        disk = self._loader.load(q=np.arange(q_offset, q_offset + q_count, dtype=np.int32),
-                                 sharding=P(spec[0], None, spec[2]))
-        return jax.jit(lambda z: jnp.pad(z, ((0, 0), (0, self._mu - self._mu_disk), (0, 0))),
-                       out_shardings=sharding)(disk)
+        # SlabIO zero-fills the requested carrier outside the disk extent.
+        # Keep the consumer's ownership at the read, including a one-q tail:
+        # reading the odd disk extent first cannot shard its centroid axis.
+        return self._loader.load(
+            q=np.arange(q_offset, q_offset + q_count, dtype=np.int32),
+            mu=(0, self._mu), sharding=sharding.spec)
 
     # -- ownership -----------------------------------------------------
     def close(self) -> None:
