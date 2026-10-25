@@ -192,26 +192,6 @@ def trs_check_mode() -> str:
         f"got {raw!r}")
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    value = float(raw)
-    if not np.isfinite(value) or value <= 0.0:
-        raise ValueError(f"{name} must be finite and positive; got {raw!r}")
-    return value
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    value = int(raw)
-    if value < 0:
-        raise ValueError(f"{name} must be non-negative; got {raw!r}")
-    return value
-
-
 def _is_reporting_process() -> bool:
     try:
         import jax
@@ -939,8 +919,8 @@ def _enforce_policy(
 def cached_density_symmetry_check(loader) -> DensitySymmetryReport:
     """Cached entry point used by ``WfnLoader``: process cache, then stamp."""
     mode = trs_check_mode()
-    tol = _env_float("LORRAX_TRS_TOL", TOL_TRS)
-    max_k = _env_int("LORRAX_TRS_MAX_K", MAX_K_DEFAULT)
+    tol = TOL_TRS
+    max_k = MAX_K_DEFAULT
     nocc = int(loader.physical_density_band_stop)
     key = _cache_key(loader, nocc, tol, max_k)
     report = _CACHE.get(key)

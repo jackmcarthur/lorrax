@@ -106,7 +106,7 @@ from .gw_config import (
 	uses_full_bispinor_tangential, uses_bare_transverse_tangential,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response,
 	infer_material_class, resolve_mpa_sampling_alpha,
-	validate_material_inputs)
+	require_deck_keys, validate_material_inputs)
 from .gw_init import (prepare_isdf_and_wavefunctions,
                       prepare_band_metadata,
 	                  check_band_extrapolation_floor,
@@ -282,6 +282,8 @@ def _open_production_report(args):
             _config_provenance.append(text)
     print0 = _config_print
     config = LorraxConfig.from_input_file(args.input, print_fn=print0)
+    require_deck_keys(config.raw_input_keys, "number_bands", "band_request",
+                      "centroids_file")
     input_dir = config.input_dir
     qp_solver = config.qp_solver     # how QP energies are extracted from Σ
     mode = config.compute_mode       # the self-energy ansatz
@@ -871,8 +873,11 @@ def _install_oneshot_head(
 def _persist_screening(
         V_q, W_by_role, centroid_indices, config, head_resolver, mesh_xy, meta, mode,
         print0, qp_solver, sym, tensors_filename, photon_response=None,
-        material_class=None, head_response=None):
-    """Persist the screened static body and head on the canonical q set."""
+        material_class=None, head_response=None, static_solve_inputs=None):
+    """Persist the screened static body and head on the canonical q set.
+
+    ``static_solve_inputs`` (pole routes) lets ``restart_static_w`` run the
+    one static Dyson solve whose W0 and srlr channels share one χ₀(0)."""
     try:
         from .gw_output import stamp_w0_route
         stamp_w0_route(tensors_filename, config)        # read by the BSE's GATE bse_mpa_w0
@@ -880,7 +885,8 @@ def _persist_screening(
                 and qp_solver is not QPSolver.SELF_CONSISTENT):
             W_static = restart_static_w(
                 mode, W_by_role, V_q, config=config, meta=meta, mesh_xy=mesh_xy,
-                material_class=material_class, head_source=head_resolver, print_fn=print0)
+                material_class=material_class, head_source=head_resolver, print_fn=print0,
+                static_solve_inputs=static_solve_inputs)
             if W_static is None:
                 return
             with timing.section("gw_jax.persist_w0"):
@@ -1837,7 +1843,12 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 		_persist_screening(
 		    V_q, W_by_role, centroid_indices, config, head_resolver, mesh_xy, meta, mode, print0,
 		    qp_solver, sym, tensors_filename, photon_response=photon_response,
-		    material_class=material_class, head_response=oneshot_head_response)
+		    material_class=material_class, head_response=oneshot_head_response,
+		    static_solve_inputs=(dict(
+		        wfns=wfns_screening, quad=quad, e_ref=e_ref, sym=sym,
+		        centroid_indices=centroid_indices,
+		        occupation_state=oneshot_occupation_state)
+		        if mode.is_pole_route and quad is not None else None))
 		(
 		    static_head_terms) = _prepare_static_head(
 		    config, do_screened, head_resolver, meta, mode, qp_solver,

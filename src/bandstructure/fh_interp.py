@@ -16,9 +16,6 @@ covariant under the space group.
 
 ``h_transform`` runs that on a k path; ``bandstructure.bse_setup`` runs the
 same fH on a fine grid for the BSE.  The CLI is ``bandstructure.htransform``.
-
-This module reads one environment variable, ``LORRAX_EXTRA_RANK_PAD``, through
-:func:`resolve_extra_rank_pad` (test-only pad invariance, rule 2b).
 """
 import os
 import time
@@ -34,6 +31,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common import Meta
 from common import timing
 from common.band_degeneracy import DEGENERACY_TOL_RY
+from common.log import get_logger
 from common.units import RYD_TO_EV
 from file_io.restart_bundle import read_eqp_energies
 from runtime.padding import spec_divisor
@@ -66,6 +64,8 @@ from common.collectives import (
 from runtime.padding import padded_axis
 from distrib_la import eigh_local
 
+logger = get_logger(__name__)
+
 
 def _build_mesh_xy() -> Mesh:
     """The run's ('x','y') mesh — the one the module-top startup call built.
@@ -92,29 +92,6 @@ def _build_mesh_xy() -> Mesh:
 # A QP run reuses a DFT fit only when this file (or a link the user placed
 # here) carries the exact provenance; no other directory is searched.
 GALERKIN_BASIS_FILE = "galerkin_dft.h5"
-
-
-def resolve_extra_rank_pad() -> int:
-    """``LORRAX_EXTRA_RANK_PAD`` (default 0) — TEST-ONLY pad-invariance knob.
-
-    The one env resolver for the rank axis's extra null directions (see
-    the block comment at the use site); blank/unset → 0, negative or
-    non-integer REFUSES naming the variable.  Never set in production.
-    """
-    raw = os.environ.get("LORRAX_EXTRA_RANK_PAD")
-    if raw is None or not raw.strip():
-        return 0
-    try:
-        extra = int(raw)
-    except ValueError:
-        raise ValueError(
-            f"LORRAX_EXTRA_RANK_PAD={raw!r} is not an integer.  Accepted: "
-            f"a non-negative int, or unset/blank for 0 (no extra pad).") \
-            from None
-    if extra < 0:
-        raise ValueError(
-            f"LORRAX_EXTRA_RANK_PAD must be >= 0; got {extra}")
-    return extra
 
 
 def validate_centroid_subset_idx(selection, n_parent: int) -> np.ndarray:
@@ -242,7 +219,6 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     """
     if log_fn is None:
         log_fn = lambda *args, **kwargs: None
-    extra_rank_pad = resolve_extra_rank_pad()
     nodes = (np.asarray(centroid_indices, dtype=np.int64).reshape(-1, 3)
              if wfn_path is None else htransform_nodes(
                  wfn, centroid_indices, band_range, wfn_path=wfn_path,
@@ -254,7 +230,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                 os.fspath(basis_path), wfn=wfn, meta=meta,
                 centroid_indices=centroid_indices, node_indices=nodes,
                 band_range=band_range, bispinor=bispinor, refit_rcond=qr_eps,
-                mesh_xy=mesh_xy, extra_rank_pad=extra_rank_pad)
+                mesh_xy=mesh_xy)
         except GalerkinBasisMismatch as exc:
             log_fn(f"  [galerkin-basis] REFIT: {basis_path} was fitted for "
                    f"other inputs ({exc}); fitting in memory, the file is "
@@ -277,7 +253,6 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         band_chunk_size=band_chunk_size,
         bispinor=bispinor,
         refit_rcond=qr_eps,
-        extra_rank_pad=extra_rank_pad,
         rank_record_fn=rank_record_fn,
     )
     if publish:
@@ -1350,6 +1325,77 @@ def load_wfns_and_enk_for_sigma(wfn, sym, nval: int, ncond: int, nband: int):
     return nsigmarange, jnp.asarray(enk_sigma).transpose(1, 0)
 
 
+def qp_window_energies(eqp_path: str, sym, band_window: tuple[int, int],
+                       enk_dft, nelec: int) -> jax.Array:
+    """QP energies on the htransform window, scissored above the eqp file.
+
+    Inside the bands the eqp file covers, the energies are its QP energies
+    (:func:`file_io.restart_bundle.read_eqp_energies`).  When the window
+    reaches above the file's top band ``b_qp``, the bands ``[b_qp, end)``
+    keep their DFT energies plus one rigid conduction scissor,
+
+        E_n(k) = E_DFT,n(k) + Δ_c,   Δ_c = <E_QP − E_DFT> over the file's
+                                           conduction bands [nelec, b_qp),
+
+    the k-weighted mean of :func:`gw.scissor.fit_scissor` with
+    ``conduction_rigid_mean`` (the law the SC loop applies to its sum-band
+    tail), logged at INFO.  Without it the window would mix QP levels below
+    ``b_qp`` with unshifted DFT levels above it.
+
+    Parameters
+    ----------
+    eqp_path : str
+        BerkeleyGW-format eqp file (eV).
+    sym : SymMaps
+        The deck WFN's symmetry tables (full-BZ placement of the file).
+    band_window : (int, int)
+        Absolute half-open band window of the htransform fit.
+    enk_dft : array, (nb, nk_full), Ry
+        DFT energies of ``band_window`` on the full BZ.
+    nelec : int
+        Number of occupied bands; the scissor is fitted on the corrected
+        bands at and above it.
+
+    Returns
+    -------
+    jax.Array, (nb, nk_full), Ry
+    """
+    from file_io.restart_bundle import read_bgw_eqp
+    from gw.scissor import fit_scissor
+
+    start, end = int(band_window[0]), int(band_window[1])
+    _kpts, _e_dft, e_qp, band_offset = read_bgw_eqp(eqp_path)
+    qp_stop = int(band_offset) + int(e_qp.shape[1])
+    if end <= qp_stop:
+        return read_eqp_energies(eqp_path, sym, band_window)
+    name = os.path.basename(eqp_path)
+    if qp_stop <= max(start, int(nelec)):
+        raise ValueError(
+            f"{name} ends at band {qp_stop}, below the first conduction band "
+            f"{int(nelec)}; a scissor for the window [{start}, {end}) needs "
+            "QP-corrected conduction bands.")
+    corrected = np.asarray(read_eqp_energies(eqp_path, sym, (start, qp_stop)))
+    dft = np.asarray(enk_dft, dtype=np.float64)
+    n_corr = qp_stop - start
+    first_c = max(int(nelec) - start, 0)
+    nk = dft.shape[1]
+    fit_mask = np.zeros((nk, n_corr), dtype=bool)
+    fit_mask[:, first_c:] = True
+    fit = fit_scissor(
+        dft[:n_corr].T * RYD_TO_EV, corrected.T * RYD_TO_EV,
+        np.zeros((nk, n_corr), dtype=bool), fit_mask,
+        k_weights=np.ones(nk), conduction_rigid_mean=True)
+    out = dft.copy()
+    out[:n_corr] = corrected
+    out[n_corr:] = dft[n_corr:] + fit.beta_c_ev / RYD_TO_EV
+    logger.info(
+        f"  [QP scissor] bands [{qp_stop}, {end}) lie above {name}: DFT "
+        f"{fit.beta_c_ev:+.4f} eV, the mean QP-DFT shift of its conduction "
+        f"bands [{start + first_c}, {qp_stop}) (rms {fit.rmse_c_ev:.4f} eV "
+        f"over {fit.n_fit_c} states)")
+    return jnp.asarray(out)
+
+
 @partial(jax.jit, static_argnames=("band_offset",))
 def _apply_qp_block_to_compact_state(
         ctilde, enk_sigma, U_mnk, E_qp_nk, *, band_offset: int):
@@ -1523,7 +1569,9 @@ def generate_kpath_from_qe_segments(params: dict, wfn) -> tuple[jnp.ndarray, np.
     for i in range(len(nodes_crys) - 1):
         k0 = nodes_crys[i]
         k1 = nodes_crys[i + 1]
-        n = max(1, int(segments[i + 1].get("n", 1)))
+        # QE's crystal_b: a corner's count is the number of steps to the
+        # NEXT corner; the last corner's count is unused.
+        n = max(1, int(segments[i].get("n", 1)))
         for t in range(1, n + 1):
             alpha = t / float(n)
             pts_crys.append((1.0 - alpha) * k0 + alpha * k1)
@@ -1584,6 +1632,9 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
         wfn, sym = setup_wfn_and_sym(wfn_file, mesh_xy=mesh_xy)
     else:
         wfn, sym = wfn_sym
+    # number_bands_protected resolves here as in gw (once per params dict).
+    from gw.gw_config import resolve_band_request
+    resolve_band_request(params, wfn, log_fn)
     nval = int(params["nval"])
     ncond = int(params["ncond"])
     nband = int(params["nband"])
@@ -1709,7 +1760,8 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
         if not os.path.isfile(eqp_path):
             raise SystemExit(f"FATAL: --eqp-file was given but not found: {eqp_path}")
         try:
-            enk_sigma = read_eqp_energies(eqp_path, sym, nsigmarange)
+            enk_sigma = qp_window_energies(
+                eqp_path, sym, nsigmarange, enk_sigma, int(wfn.nelec))
             log_fn(
                 f"Using DIAGONAL QP APPROXIMATION from "
                 f"{os.path.basename(eqp_path)} for band window "

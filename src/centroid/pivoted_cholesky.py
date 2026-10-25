@@ -43,7 +43,6 @@ Spin stays explicit through the projector and vertex contraction owned by
 from __future__ import annotations
 
 import math
-import os
 import threading
 import time
 from functools import lru_cache, partial
@@ -412,23 +411,6 @@ def gram_tile_width(nk: int, nspinor: int, n_points: int, *, divisor: int,
 # The kernel's INFO, read on the host
 # ═══════════════════════════════════════════════════════════════════════
 
-#: What the select does when the pool is numerically flat BUT still has
-#: candidates to hand back.  ``deliver`` (default) hands back the requested
-#: set with a loud note naming the certified rank and its downstream cost;
-#: ``strict`` restores the 2026-08-07 refusal verbatim.  See
-#: :func:`refuse_unless_select_certified` guard (2b) and
-#: ``docs/architecture/rank_truncation_policy.md`` §7 for why the default moved.
-#:
-#: Deliberately NOT ``LORRAX_RANK_POLICY``: that dial governs a truncation's
-#: CONDITIONING against a certified kappa ceiling, and this one governs
-#: whether a rank-deficient candidate POOL is an error.  Measured, they point
-#: opposite ways on the same deck, and one name for both would make either
-#: setting wrong for the other.
-SELECT_MODES = ("deliver", "strict")
-SELECT_MODE_DEFAULT: str = "deliver"
-SELECT_MODE_ENV = "LORRAX_CENTROID_SELECT"
-
-
 def refuse_unless_select_certified(
     piv,
     rank: int,
@@ -460,8 +442,8 @@ def refuse_unless_select_certified(
     is measured ANTI-correlated with BerkeleyGW agreement on the deck where
     it matters — the refusal blocked the most accurate configuration on
     record while passing one 20-56x worse.  It reports, loudly, with the
-    downstream cost named, and ``LORRAX_CENTROID_SELECT=strict`` restores the
-    old refusal.  ``docs/architecture/rank_truncation_policy.md`` §7 owns this.
+    downstream cost named.  ``docs/architecture/rank_truncation_policy.md`` §7
+    owns this.
 
     It is a free function, and public, for one reason: every one of these
     refusals needs a constructible-FALSE twin, and building one through
@@ -575,17 +557,10 @@ def refuse_unless_select_certified(
     # ``take`` is false, ``newcol`` is exactly zero and ``d`` is unchanged,
     # so no divisor can run away.  The selection continues by the same
     # deterministic rule (largest frozen residual, ties to the lowest index)
-    # and ``rank`` still counts only certified directions.  The refusal is
-    # kept verbatim behind LORRAX_CENTROID_SELECT=strict.
+    # and ``rank`` still counts only certified directions.
     #
     # docs/architecture/rank_truncation_policy.md §7 owns this ruling.
     if rank_i < int(n_keep):
-        mode = (os.environ.get(SELECT_MODE_ENV) or SELECT_MODE_DEFAULT
-                ).strip().lower()
-        if mode not in SELECT_MODES:
-            raise ValueError(
-                f"{SELECT_MODE_ENV}={mode!r} is not one of {SELECT_MODES}.  "
-                f"A mis-spelled mode is not silently 'deliver'.")
         note = (
             f"pivoted-Cholesky: asked for {int(n_keep)} {unit}, DELIVERED "
             f"{n_sel}, but only {rank_i} of them add an independent "
@@ -606,12 +581,7 @@ def refuse_unless_select_certified(
             f"  NOT the fix on this deck: widening the prune window "
             f"(a wider left leg in --fit-window) changes sigTOT by "
             f"<2x here and never recovers the orbit-mode loss.  If you want "
-            f"a rank-clean set, LOWER N to {rank_i}.\n"
-            f"  strict : {SELECT_MODE_ENV}=strict restores the 2026-08-07 "
-            f"refusal.")
-        if mode == "strict":
-            raise RuntimeError("pivoted-Cholesky REFUSES ("
-                               + SELECT_MODE_ENV + "=strict):\n" + note)
+            f"a rank-clean set, LOWER N to {rank_i}.")
         for line in note.splitlines():
             log.info("  [pivoted_cholesky] " + line)
 
@@ -638,9 +608,8 @@ def refuse_unless_select_certified(
 #: Above this many delivered points the point-granularity rank is reported
 #: as "not measured" rather than measured: the check is a dense
 #: ``eigvalsh`` on the kept sub-Gram, O(n³), and at the MoS₂-class point
-#: (n ≈ 13 000) that is minutes and gigabytes.  Raise it deliberately via
-#: ``LORRAX_CENTROID_POINT_RANK_CAP`` when the answer is worth the wait.
-#: 4096 covers every deck in the project's fixtures and the whole frontier
+#: (n ≈ 13 000) that is minutes and gigabytes.  A caller that wants the
+#: answer anyway passes ``cap``.  4096 covers every deck in the project's fixtures and the whole frontier
 #: ladder (whose largest set is 1908).
 POINT_RANK_CAP_DEFAULT = 4096
 
@@ -661,14 +630,12 @@ def point_granularity_rank(G, keep_mask, *, tol_rel=None, cap=None):
     keep_mask = np.asarray(keep_mask, dtype=bool)
     n_pts = int(keep_mask.sum())
     if cap is None:
-        env = os.environ.get("LORRAX_CENTROID_POINT_RANK_CAP")
-        cap = int(env) if env else POINT_RANK_CAP_DEFAULT
+        cap = POINT_RANK_CAP_DEFAULT
     if n_pts == 0:
         return None, 0, "empty point set"
     if n_pts > int(cap):
         return (None, n_pts,
-                f"skipped: {n_pts} points exceeds the O(n^3) cap {int(cap)} "
-                f"(raise LORRAX_CENTROID_POINT_RANK_CAP to measure anyway)")
+                f"skipped: {n_pts} points exceeds the O(n^3) cap {int(cap)}")
     try:
         sub = np.asarray(jax.device_get(G))[np.ix_(keep_mask, keep_mask)]
     except Exception as exc:                                  # noqa: BLE001
@@ -866,16 +833,14 @@ def prune_candidates_by_pivoted_cholesky(
     owns walltime across all ranks.
 
     ``tol_rel`` overrides the select's stopping tolerance (relative to the
-    largest initial Gram diagonal).  ``None`` reads
-    ``LORRAX_CENTROID_PC_TOL`` from the environment and falls back to
+    largest initial Gram diagonal).  ``None`` is
     ``sqrt(eps)`` — the number this kernel has always computed for its rank
     report, kept as the default so no existing deck's reported rank moves.
     LAPACK ``?pstrf``'s own policy is ``n·eps``; pass it explicitly to get
     it.
 
     REFUSES on a non-PSD Gram, structural pool exhaustion, or a pivot outside
-    the candidate range.  Numerical rank deficiency is reported by default;
-    ``LORRAX_CENTROID_SELECT=strict`` promotes it to a refusal.  The policy is
+    the candidate range.  Numerical rank deficiency is reported.  The policy is
     owned once by :func:`refuse_unless_select_certified`.
     """
     if group_block and orbit_id is None:
@@ -901,10 +866,6 @@ def prune_candidates_by_pivoted_cholesky(
     M = int(cand_idx.shape[0])
     n_tot = int(wfn.nbands)
     asymmetric = (band_range_left is not None and band_range_right is not None)
-    if tol_rel is None:
-        _env_tol = os.environ.get("LORRAX_CENTROID_PC_TOL")
-        tol_rel = float(_env_tol) if _env_tol else None
-
     if not asymmetric:
         # Legacy (n_val, n_cond) path — left = (0, n_val), right = (n_val, n_val + n_cond).
         if n_val is None:
@@ -1667,14 +1628,6 @@ def _build_gram_q0_kbatch(
     n_dev_total = mesh_xy.devices.size
     n_x = int(mesh_xy.shape['x']) if 'x' in mesh_xy.axis_names else 1
     n_y = int(mesh_xy.shape['y']) if 'y' in mesh_xy.axis_names else 1
-    # LORRAX_GRAM_COL_BLOCK: historical name, now an explicit square-tile
-    # width; a falsy token
-    # means "no override", i.e. the shape-sized tile below.  This USED to be a
-    # bare presence test — ``=0`` and ``=off`` are the two spellings a user
-    # reaches for to DISABLE a knob, and they did the opposite or crashed.
-    env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
-    if env_cb.lower() in ("", "0", "false", "no", "off"):
-        env_cb = ""
     nk_, _, ns_, M_cols = (int(x) for x in psi_a_rmu_Y.shape)
     del psi_a_rmu_Y
     from runtime.padding import padded_axis
@@ -1683,26 +1636,8 @@ def _build_gram_q0_kbatch(
         specs=((PartitionSpec('x', None), 0),
                (PartitionSpec(None, 'y'), 1))).divisor
     block_source = "fixed tile"
-    if env_cb:
-        block_source = "LORRAX_GRAM_COL_BLOCK override"
-        try:
-            requested_block = int(env_cb)
-            if requested_block <= 0:
-                raise ValueError
-        except ValueError:
-            raise ValueError(
-                f"LORRAX_GRAM_COL_BLOCK={env_cb!r} is neither a positive "
-                f"integer tile width nor a falsy token "
-                f"('', 0, false, no, off)."
-            ) from None
-        # A manual width is rounded UP so the square tile divides BOTH mesh
-        # axes, and capped at the candidate extent.
-        col_block = min(M_cols, padded_axis(
-            max(_GRAM_MIN_COL_BLOCK, requested_block), tile_divisor,
-            name="pivoted-Cholesky column block").carrier)
-    else:
-        col_block = gram_tile_width(nk_, ns_, M_cols, divisor=tile_divisor,
-                                    x_shards=n_x, y_shards=n_y)
+    col_block = gram_tile_width(nk_, ns_, M_cols, divisor=tile_divisor,
+                                x_shards=n_x, y_shards=n_y)
 
     if left_slice is None:
         with timing.section("right.load"):

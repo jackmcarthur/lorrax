@@ -103,6 +103,52 @@ SCRIPT = textwrap.dedent(r'''
     sx = K.sigma_x(jax.device_put(W[1], qpar3), sx, T)               # twice: 2 x the one-call value
     ref = sum(np.einsum("kmnl,kl->kmn", con(rows(q)[0], W[1, q]), rows(q)[3]) for q in range(nk))
     out.update(sigma_x_twice=err(sx, 2 * ref))
+    # dSigma/dE accumulators (dacc): each row m bound to its own omega entry d_idx[k, m] (gw.cd.sigma.derivative_x);
+    # the dense reference is the *_dx laws with laws.row_apply.  acc and own are bitwise those without dacc.
+    d_idx = rng.integers(0, nE, (nk, m)).astype(np.int32)
+    Td = dict(T, d_idx=put(d_idx))
+    xd_of = lambda x: np.take_along_axis(x, np.repeat(d_idx[:, :, None], x.shape[2], axis=2), axis=1)
+    same = lambda a, b: all(np.array_equal(np.asarray(p), np.asarray(q)) for p, q in zip(a, b))
+    dx = laws.imag_node_kernels_dx
+    plain, deriv = (zeros(nE, nk, m, m), zeros(nk, m)), (zeros(nE, nk, m, m), zeros(nk, m), zeros(nk, m, m))
+    for a0 in (0, 2):
+        Wc, dWc = jax.device_put(W[a0:a0 + 2], qpar4), jax.device_put(dW[a0:a0 + 2], qpar4)
+        plain = K.real(Wc, dWc, jnp.asarray(z[a0:a0 + 2]), jnp.int32(3 + a0), *plain, T, (full, full), (False, True))
+        deriv = K.real(Wc, dWc, jnp.asarray(z[a0:a0 + 2]), jnp.int32(3 + a0), *deriv[:2], Td, (full, full), (False, True),
+                       dacc=deriv[2])
+    ref = 0
+    for q in range(nk):
+        rho, x, xo, fq = rows(q)
+        for iz in range(nz):
+            for A, D, neg in ((con(rho, W[iz, q]), con(rho, dW[iz, q]), False),
+                              (con(rho, W[iz, qneg[q]].T), con(rho, dW[iz, qneg[q]].T), True)):
+                sel = laws.real_knot_select(3 + iz, laws.hermite_branch_coefficients(xd_of(x), fq, h, neg, derivative=True))
+                ref = ref + np.asarray(laws.row_apply(laws.real_knot_operators(z[iz], A, D), sel))
+    out.update(real_dacc=err(deriv[2], ref), real_dacc_bitwise=float(not same(plain, deriv[:2])))
+    plain, deriv = (zeros(nE, nk, m, m), zeros(nk, m)), (zeros(nE, nk, m, m), zeros(nk, m), zeros(nk, m, m))
+    for a0 in (0, 2):
+        Wc = jax.device_put(W[a0:a0 + 2], qpar4)
+        plain = K.imag(Wc, put(u[a0:a0 + 2]), put(w[a0:a0 + 2]), *plain, T)
+        deriv = K.imag(Wc, put(u[a0:a0 + 2]), put(w[a0:a0 + 2]), *deriv[:2], Td, dacc=deriv[2])
+    ref = 0
+    for q in range(nk):
+        rho, x, xo, fq = rows(q)
+        for iz in range(nz):
+            ops, wts = laws.imag_node_terms(con(rho, W[iz, q]), u[iz], w[iz], xd_of(x), fq, eta, kernel=dx)
+            ref = ref + np.asarray(laws.row_apply(ops, wts))
+    out.update(imag_dacc=err(deriv[2], ref), imag_dacc_bitwise=float(not same(plain, deriv[:2])))
+    W0, dW0 = jax.device_put(W[0], qpar3), jax.device_put(dW[0], qpar3)
+    plain = K.anchor(W0, dW0, zeros(nE, nk, m, m), zeros(nk, m), T)
+    deriv = K.anchor(W0, dW0, zeros(nE, nk, m, m), zeros(nk, m), Td, dacc=zeros(nk, m, m))
+    ref = 0
+    for q in range(nk):
+        rho, x, xo, fq = rows(q)
+        _, cp, cm = laws.anchor_part(con(rho, W[0, q]), con(rho, dW[0, q]), x, fq, eta, beta)
+        xd = xd_of(x)
+        ref = ref + np.asarray(laws.anchor_part_dx(cp, cm, xd, fq, eta, beta, apply_fn=laws.row_apply)
+                               - laws.anchor_subtraction(cp, cm, laws.imag_anchor_sums(u_all, w_all, xd, fq, eta, beta,
+                                                                                       kernel=dx), apply_fn=laws.row_apply))
+    out.update(anchor_dacc=err(deriv[2], ref), anchor_dacc_bitwise=float(not same(plain, deriv[:2])))
     print("CDKERNELS", out)
     assert max(out.values()) < 1e-12, out
 ''')

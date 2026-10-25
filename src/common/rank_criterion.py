@@ -671,7 +671,7 @@ def rank_report(spectrum, rtol, *, label="truncation",
 # ═══════════════════════════════════════════════════════════════════════
 
 #: The three modes, in decreasing authority.  Same vocabulary as
-#: ``common/spectral_closure.MODES`` and ``common/band_degeneracy.MODES`` —
+#: ``common/band_degeneracy.MODES`` —
 #: deliberately, because a user who has met one should not have to learn a
 #: second spelling for "this guard is off".
 POLICY_MODES = ("refuse", "warn", "off")

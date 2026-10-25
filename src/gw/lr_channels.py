@@ -332,8 +332,13 @@ WINDOW_OUTER = 0.9
 #: Highest polynomial degree of the F̃ fit; lowered until the monomial count
 #: is at most half the fitted q (a determined least-squares problem).
 MAX_DEG_F = 4
-#: Highest degree in |q|² of the radial P fit.
+#: Highest order in |q|² of the P fit: the head runs to |q|^{2(MAX_DEG_P+1)},
+#: the other elements to |q|^{2 MAX_DEG_P}.
 MAX_DEG_P = 3
+#: Highest total degree of the direction-resolved P terms (every monomial of
+#: the components of q); above it, up to the order of MAX_DEG_P, the terms
+#: are radial, |q|^{2k}.
+MAX_DEG_P_DIR = MAX_DEG_F
 
 
 def window(qn, r_a, r_b):
@@ -353,19 +358,66 @@ def _monomials(q, deg, scale):
     return np.stack(cols, axis=1)
 
 
+def _p_terms(dim, degrees, d_dir):
+    """The columns of one class of P elements: every monomial (a tuple of
+    component indices) of total degree d ≤ d_dir, and the radial |x|^d (an
+    int) for the even d above it."""
+    from itertools import combinations_with_replacement
+    terms = []
+    for d in degrees:
+        if d <= d_dir:
+            terms += list(combinations_with_replacement(range(dim), d))
+        elif d % 2 == 0:
+            terms.append(int(d))
+    return terms
+
+
+def _p_design(x, terms):
+    """(n, len(terms)) values of :func:`_p_terms`' columns at x = q/r_fit."""
+    r2 = np.sum(x * x, axis=1)
+    return np.stack([r2 ** (t // 2) if isinstance(t, int)
+                     else np.prod(x[:, list(t)], axis=1) for t in terms], axis=1)
+
+
+def _full_column_rank(A, rtol=1e-8):
+    """True when A's columns, normalized, are independent to ``rtol``."""
+    if A.shape[1] > A.shape[0]:
+        return False
+    An = A / np.maximum(np.linalg.norm(A, axis=0), 1e-300)
+    s = np.linalg.svd(An, compute_uv=False)
+    return bool(s[-1] > rtol * s[0])
+
+
 def fit_model(qc, Ft, P, *, r_mu, S_cart, c0, sys_dim, r_fit):
     """Fit the smooth long-range model on the coarse q with 0 < |q| < r_fit.
 
     * F̃_aμ(q) e^{+iq·r_μ} — complex polynomial in Cartesian q (in-plane for a
       slab), one per (a, μ); the Bloch phase of the home-cell centroid is
       removed first so what is fitted is smooth.
-    * P_ab(q) = |q|^{m_ab} y_ab(|q|²), y a polynomial in |q|², m = 2 on the
-      literal-G = 0 channel's row and column (charge neutrality), anchored
-      by one least-squares row to the head tensor: y_00(0) = S̄ (S's mean
-      diagonal over the periodic directions), y_0a(0) = 0.  A soft anchor,
-      because the ISDF-projected P_00/q² need not tend to S exactly (MoS₂
-      9×9: hard anchor −0.2434, soft −0.2368, 12×12 truth −0.2393 at
-      |q| = 0.101 bohr⁻¹).
+    * P(q) with its q-direction dependence, in the periodic components of q
+      (x = q/r_fit).  Three classes of elements, each a least-squares
+      polynomial with every monomial up to a direction-resolved degree and
+      radial |q|^{2k} terms above it, up to the order of MAX_DEG_P:
+
+      - head P_00 (the literal-G = 0 channel c0): even degrees 2 … 2(degP+1),
+        fitted as P_00/|q|² so the degree-2 part is q·S·q with S a full
+        tensor, softly anchored to the head tensor S_cart (the restart's
+        S_cart_head, S_eff(0) under head_correction = full) by one row per
+        component, weighted so the penalty is ‖S_fit − Re S‖²_F / dim (for an
+        isotropic deviation, the single row y_00(0) = S̄ of the radial fit
+        this replaced).  Soft, because the ISDF-projected P_00/q² need not
+        tend to S exactly (MoS₂ 9×9 radial fit: hard anchor −0.2434, soft
+        −0.2368, 12×12 truth −0.2393 at |q| = 0.101 bohr⁻¹).
+      - wings P_0a, P_a0 (a slab's G_z ≠ 0 against G_z = 0): degrees 1 … 2(degP+1),
+        no constant (charge neutrality).
+      - the G_z ≠ 0 block P_ab: degrees 0 … 2·degP.
+
+      The direction-resolved degree of each class is lowered from
+      MAX_DEG_P_DIR until the class has at most half as many columns as
+      fitted q and its columns are independent on the coarse points; at the
+      floor (head 2, others 0) the fit is the radial one in |q|², with the
+      head's leading term still q·S·q.  degP is at most one less than the
+      number of distinct |q|.
 
     qc (n_q, 3) Cartesian WS-representative q, bohr⁻¹; Ft (n_q, n_L, N);
     P (n_q, n_L, n_L); r_mu (N, 3) Cartesian centroids, bohr; S_cart (3, 3);
@@ -390,36 +442,103 @@ def fit_model(qc, Ft, P, *, r_mu, S_cart, c0, sys_dim, r_fit):
     res_F = np.linalg.norm(A @ cF - Y) / max(np.linalg.norm(Y), 1e-300)
 
     n_L = P.shape[-1]
-    q2 = qn[sel] ** 2
     shells = np.unique(np.round(qn[sel], 6)).size
     degP = max(0, min(MAX_DEG_P, shells - 1))
-    m = np.zeros((n_L, n_L), int)
-    m[c0, :] = m[:, c0] = 2
+    x = qc[sel, :dim] / r_fit
+    x2 = np.sum(x * x, axis=1)
     Pf = P[sel].reshape(sel.size, -1)
-    rad = np.stack([q2 ** j for j in range(degP + 1)], axis=1)  # (n_fit, degP+1)
-    cP = np.zeros((degP + 1, n_L * n_L), np.complex128)
-    S_iso = float(np.trace(np.real(S_cart)[:dim, :dim])) / dim
-    for mm in (0, 2):
-        cols = np.flatnonzero(m.ravel() == mm)
-        A_P, b_P = rad, Pf[:, cols] / q2[:, None] ** (mm // 2)
-        if mm == 2:     # one anchor row: y(0) = S on the head, 0 on its wings
-            A_P = np.vstack([A_P, np.eye(1, degP + 1)])
-            b_P = np.vstack([b_P, (cols == c0 * n_L + c0)[None] * S_iso])
-        cP[:, cols] = np.linalg.lstsq(A_P, b_P, rcond=None)[0]
-    model = dict(cF=cF, deg=deg, cP=cP, degP=degP, m=m, c0=int(c0),
+    budget = sel.size // 2
+    cls_idx = np.full((n_L, n_L), 2)               # 0 head, 1 wings, 2 G_z block
+    cls_idx[c0, :] = cls_idx[:, c0] = 1
+    cls_idx[c0, c0] = 0
+    S_re = np.real(np.asarray(S_cart))[:dim, :dim]
+    S_re = 0.5 * (S_re + S_re.T)
+
+    def head_anchor(terms):
+        # q·S·q: the coefficient of x_i x_j/|x|² is S_ii, or 2 S_ij for i < j;
+        # weights make the penalty ‖S_fit − S‖²_F / dim.
+        rows, rhs = [], []
+        for k, t in enumerate(terms):
+            if isinstance(t, tuple) and len(t) == 2:
+                i, j = t
+                w = 1.0 / np.sqrt(dim if i == j else 2 * dim)
+                rows.append(w * np.eye(1, len(terms), k)[0])
+                rhs.append(w * (S_re[i, i] if i == j else 2.0 * S_re[i, j]))
+        return np.asarray(rows), np.asarray(rhs)
+
+    classes = []
+    for kind, degrees, d_min, step in ((0, range(2, 2 * degP + 3, 2), 2, 2),
+                                       (1, range(1, 2 * degP + 3), 0, 1),
+                                       (2, range(0, 2 * degP + 1), 0, 1)):
+        cols = np.flatnonzero(cls_idx.ravel() == kind)
+        if cols.size == 0:
+            continue
+        top = max(d_min, min(MAX_DEG_P_DIR, max(degrees)))
+        for d_dir in range(top - (top - d_min) % step, d_min - 1, -step):
+            terms = _p_terms(dim, degrees, d_dir)
+            A = _p_design(x, terms)
+            b = Pf[:, cols]
+            if kind == 0:               # P_00/|q|² against x^α/|x|²
+                A, b = A / x2[:, None], b / (x2 * r_fit ** 2)[:, None]
+                ra, rb = head_anchor(terms)
+                A, b = np.vstack([A, ra]), np.vstack([b, rb[:, None]])
+            if d_dir == d_min or (len(terms) <= budget and _full_column_rank(A)):
+                break
+        coef = np.linalg.lstsq(A, b, rcond=None)[0]
+        classes.append(dict(cols=cols, terms=terms, coef=coef, head=kind == 0,
+                            d_dir=int(d_dir)))
+    model = dict(cF=cF, deg=deg, P_classes=classes, degP=degP, c0=int(c0),
                  r_fit=float(r_fit), r_mu=r_mu, dim=dim, n_L=n_L, N=Ft.shape[-1])
     Pm = model_P(model, qc[sel])
     res_P = np.linalg.norm(Pm - P[sel]) / np.linalg.norm(P[sel])
+    S_fit = model_head_tensor(model)
+    lam = float(np.max(np.linalg.eigvalsh(S_fit)))
+    if lam > 1e-3 * float(np.max(np.abs(np.linalg.eigvalsh(S_fit)))):
+        # P <= 0 makes S <= 0.  A positive direction means P_00/q² near Γ is
+        # not q·S·q + a polynomial on these coarse q (a metal, where P_00 → const,
+        # or too few q), so the model's W^LR near Γ is an extrapolation.
+        import warnings
+        warnings.warn(
+            f"GATE srlr_head_fit_sign: got the fitted head tensor's largest "
+            f"eigenvalue {lam:+.4f} > 0 (anchor S diagonal "
+            f"{np.round(np.diag(S_re), 4).tolist()}); want S_fit <= 0 as P <= 0; "
+            "why: the coarse P_00/q^2 is not q.S.q plus a polynomial near Gamma; "
+            "fix: a denser coarse GW grid.", RuntimeWarning, stacklevel=2)
     return model, dict(n_fit=int(sel.size), deg_F=deg, deg_P=degP,
-                       relres_F=float(res_F), relres_P=float(res_P))
+                       deg_P_dir=tuple(c["d_dir"] for c in classes),
+                       S_fit=S_fit, relres_F=float(res_F), relres_P=float(res_P))
+
+
+def model_head_tensor(model):
+    """The fitted head's q² tensor S_fit (dim × dim): P_00 → q·S_fit·q as q → 0."""
+    dim = model["dim"]
+    S = np.zeros((dim, dim))
+    for c in model["P_classes"]:
+        if not c["head"]:
+            continue
+        for k, t in enumerate(c["terms"]):
+            if isinstance(t, tuple) and len(t) == 2:
+                i, j = t
+                val = float(np.real(c["coef"][k, 0]))
+                if i == j:
+                    S[i, i] = val
+                else:
+                    S[i, j] = S[j, i] = 0.5 * val
+    return S
 
 
 def model_P(model, qc):
     """P_m(q) (n, n_L, n_L) from :func:`fit_model`'s coefficients."""
-    q2 = np.sum(np.asarray(qc, dtype=np.float64) ** 2, axis=1)
-    rad = np.stack([q2 ** j for j in range(model["degP"] + 1)], axis=1)
-    Pm = (rad @ model["cP"]) * q2[:, None] ** (model["m"].ravel()[None, :] // 2)
-    Pm = Pm.reshape(-1, model["n_L"], model["n_L"])
+    qc = np.asarray(qc, dtype=np.float64)
+    x = qc[:, :model["dim"]] / model["r_fit"]
+    n_L = model["n_L"]
+    Pm = np.zeros((len(qc), n_L * n_L), np.complex128)
+    for c in model["P_classes"]:
+        val = _p_design(x, c["terms"]) @ c["coef"]
+        if c["head"]:                   # |q|² Σ c x^α/|x|² = r_fit² Σ c x^α
+            val = val * model["r_fit"] ** 2
+        Pm[:, c["cols"]] = val
+    Pm = Pm.reshape(-1, n_L, n_L)
     return 0.5 * (Pm + np.conj(np.swapaxes(Pm, -1, -2)))
 
 

@@ -835,8 +835,7 @@ def _compute_V_q_g_flat_tiles(
     ngkmax = int(gvec_components.shape[-1])
 
     # ---- μ padding to mesh-product per loader ---------------------------
-    # ``padded_mu_extent`` = the same round-up (+ test-only
-    # LORRAX_EXTRA_MU_PAD rows) as ``Meta.n_rmu_padded`` — the V tiles
+    # ``padded_mu_extent`` = the same round-up as ``Meta.n_rmu_padded`` — the V tiles
     # built here must match the ψ-side μ extent exactly.
     from runtime.padding import padded_mu_extent
     mu_pad = [padded_mu_extent(int(ld.n_rmu), mesh_xy) for ld in loaders]

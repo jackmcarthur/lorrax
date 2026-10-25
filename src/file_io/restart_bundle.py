@@ -1207,10 +1207,7 @@ def read_interaction_orbits(src: str, mu_L: int, print_fn):
 def read_downfold_inputs(filename, input_file, mesh_xy):
     """Return authenticated geometry, full-k faces and linear interactions."""
     if not input_file:
-        directory = os.path.dirname(filename)
-        if os.path.basename(directory) == "tmp":
-            directory = os.path.dirname(directory)
-        input_file = os.path.join(directory, "cohsex.in")
+        raise ValueError("parent_input_file is required")
     geom = read_downfold_geometry(filename)
     state = load_restart_state_from_h5(filename, mesh_xy)
     psi, = unfold_parent_faces((state.psi_nmu_parent,), filename, input_file, mesh_xy)
@@ -2009,9 +2006,8 @@ class BispinorVqReader:
         what makes sharded reads with spec P(None,'x','y') divide
         cleanly under any 2D mesh factorisation.
 
-        Routed through ``runtime.padding.padded_mu_extent`` so the
-        test-only LORRAX_EXTRA_MU_PAD knob stays consistent with the
-        ψ-side / write-side extents."""
+        Routed through ``runtime.padding.padded_mu_axis``, the one μ
+        round-up the ψ-side / write-side extents use."""
         from runtime.padding import padded_mu_axis
         return (padded_mu_axis(int(n_L), self._mesh).carrier,
                 padded_mu_axis(int(n_R), self._mesh).carrier)

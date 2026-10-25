@@ -583,10 +583,9 @@ static ffi::Future WriteDispatchImpl(
     // collective transfer requires every rank at the call).  Purely
     // rank-local: no communication, unlike the Python host backend's
     // allgather-keyed dedup, because coord + axis_flat determine the
-    // duplicate set exactly.  Same env knob as the host backend:
-    // LORRAX_PHDF5_DEDUP_REPLICAS=0 disables.
+    // duplicate set exactly.
     bool replica_dup = false;
-    if (ctx->dedup_replicas) {
+    {
         std::vector<char> axis_used(mesh_shape.size(), 0);
         for (size_t i = 0; i < axis_flat.size(); ++i) {
             int64_t ax = axis_flat[i];

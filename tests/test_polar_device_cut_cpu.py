@@ -106,9 +106,9 @@ def _device_cut_equals_host_cut():
         assert np.array_equal(np.asarray(devL), hostL)
 
 
-def _singular_cut_word_matches_the_host_cut():
-    """LORRAX_CHECK_COUNTS=1 (set by the caller) makes the public path refuse unless the device word
-    equals the host cut."""
+def _singular_cut_public_path_retains_within_the_cap():
+    """The public singular path on the device word retains 1..max_rank columns per row (the word's
+    agreement with the host cut is _device_cut_equals_host_cut's)."""
     import distrib_la
     mesh, perp, _ = _stacks("face", 3)
     plan = _plan(mesh)
@@ -147,18 +147,16 @@ def _agreed_spectrum_is_bitwise_the_replica(shape):
     assert np.array_equal(got.view(np.uint64), want.view(np.uint64)), shape
 
 
-def test_the_device_cut_equals_the_host_sequence(monkeypatch):
+def test_the_device_cut_equals_the_host_sequence():
     """The device-word cuts (partner cut on face and batch layouts, singular and leading cuts over
-    random spectra, the public singular path under LORRAX_CHECK_COUNTS) equal the host sequence,
-    the retained spectra are the true eigenvalues read on request, and the agreed spectrum comes
-    back as the replica's exact bits."""
-    monkeypatch.setenv("LORRAX_CHECK_COUNTS", "1")
+    random spectra) equal the host sequence, the public singular path stays within its cap, the
+    retained spectra are the true eigenvalues read on request, and the agreed spectrum comes back
+    as the replica's exact bits."""
     for layout, real_rows in (("face", None), ("batch", 3)):
         for cutoff, tol in ((0.3, 1e-3), (0.3, 0.0), (0.7, 1e-6), (2.0, 1e-6)):
             _partner_cut_equals_the_host_sequence(layout, real_rows, cutoff, tol)
     _device_cut_equals_host_cut()
-    _singular_cut_word_matches_the_host_cut()
-    monkeypatch.delenv("LORRAX_CHECK_COUNTS")          # the check itself reads the host spectrum
+    _singular_cut_public_path_retains_within_the_cap()
     _retained_spectra_are_read_only_on_request()
     for shape in ((312,), (4, 312), (2, 3, 17)):
         _agreed_spectrum_is_bitwise_the_replica(shape)

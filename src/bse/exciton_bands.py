@@ -876,10 +876,10 @@ def apply_q_per_segment(params, q_per_segment, log=log.debug) -> int:
             f"exciton_bands: --q-per-segment={floor} is not a point count.  "
             f"1 is the identity (every deck count is already >= 1) and 16 is "
             f"the default.")
-    # segs[0] is the path's first corner; segs[i>0] carries the count for the
-    # segment that ENDS at it (generate_kpath_from_qe_segments).
-    deck_counts = [max(1, int(s.get("n", 1))) for s in segs[1:]]
-    for seg, n_deck in zip(segs[1:], deck_counts):
+    # QE's crystal_b: segs[i] carries the count of the segment that STARTS
+    # at it; the last corner's count is unused (generate_kpath_from_qe_segments).
+    deck_counts = [max(1, int(s.get("n", 1))) for s in segs[:-1]]
+    for seg, n_deck in zip(segs[:-1], deck_counts):
         seg["n"] = max(n_deck, floor)
     raised = [(i, a, max(a, floor))
               for i, a in enumerate(deck_counts, start=1) if a < floor]
@@ -1446,6 +1446,8 @@ def deck_settings(ap, args):
             args.input, settings_ap.parse_args([]), EXB_KEYS,
             required=("number_val_bands_fine", "number_cond_bands_fine"),
             params=params, named=named)
+        from gw.gw_config import require_deck_keys
+        require_deck_keys(named, "band_request", "centroids_file", error=DeckError)
         settings.eqp = eqp_file(params, named, args.input)
         if settings.degeneracy_check_override:
             settings.band_degeneracy = "off"
@@ -1767,6 +1769,9 @@ def main(argv=None):
             _wfn_name = os.path.join(
                 os.path.dirname(os.path.abspath(args.input)), _wfn_name)
         wfn, sym = ht.setup_wfn_and_sym(_wfn_name, mesh_xy=mesh_xy)
+        # The deck's Sigma window: number_bands_protected resolves as in gw.
+        from gw.gw_config import resolve_band_request
+        resolve_band_request(params, wfn, log)
         from distrib_la import plan as _linalg_plan
         _fine_plan = _linalg_plan(
             "eigh", mesh_xy, backend=args.eigh_backend, n=None,

@@ -107,8 +107,10 @@ replacement; the SLATE backend left LORRAX on 2026-10-23.
   table's ROCm entries are the resolution only: `distributed` eigh names
   ELPA (`distrib_la._elpa`, `config/frontier/build_elpa_hip.sh`) behind the
   leg's size row. ROCm has no distributed LU library: `distributed` LU is the
-  room route alone ([size route](#size-route)), and without a room it refuses
-  as "no default backend ... room route alone".
+  room route alone ([size route](#size-route)), and past the room (or without one) it
+  refuses: "solve_lu on ROCM has no distributed library, only one whole matrix per
+  device within the caller's room ...; use fewer ISDF centroids, more device memory
+  per rank, or a CUDA run".
 
 ### The guard ladder {#guard-ladder}
 

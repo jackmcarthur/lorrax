@@ -829,8 +829,12 @@ def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
             f"  long-range subspace G_L: {n_L} plane wave(s) per q"
             + (f" (G_z = -{c0}..{c0})" if sys_dim == 2 else " (G = 0)"),
             f"  fit on {info['n_fit']} coarse q: F~ degree {info['deg_F']} "
-            f"(rel. residual {info['relres_F']:.4f}), P degree {info['deg_P']} in q^2 "
+            f"(rel. residual {info['relres_F']:.4f}), P degree {info['deg_P']} in q^2, "
+            f"direction-resolved to degree {'/'.join(str(d) for d in info['deg_P_dir'])} "
             f"(rel. residual {info['relres_P']:.4f})",
+            "  P head q.S.q, fitted S diagonal "
+            + " ".join(f"{s:.4f}" for s in np.diag(info["S_fit"]))
+            + ", anchor " + " ".join(f"{s:.4f}" for s in np.diag(np.real(S_cart))[:info["S_fit"].shape[0]]),
             f"  window w(q): 1 below {r_a:.4f}, 0 above {r_b:.4f} bohr^-1 "
             f"(q_ins {q_ins:.4f})",
             f"  model used at {n_on_c} of {n_c} coarse q and {n_on_f} of {n_f} fine q, "
@@ -1746,6 +1750,7 @@ def _interpolate_bse_data_to_grid(
     from bandstructure.bse_setup import compute_wfns_fi
     from gw.gw_config import (
         read_lorrax_input,
+        resolve_band_request,
         resolve_distrib_la_batched_route,
     )
 
@@ -1771,6 +1776,10 @@ def _interpolate_bse_data_to_grid(
     params = read_lorrax_input(input_file)
     _distrib_la_batched_route = resolve_distrib_la_batched_route(
         params, override=distrib_la_batched_route)
+    # The deck's Sigma window: number_bands_protected resolves as in gw.
+    from .bse_window import _parse_wfn_path
+    wfn_sym = ht.setup_wfn_and_sym(_parse_wfn_path(input_file), mesh_xy=mesh_xy)
+    resolve_band_request(params, wfn_sym[0], log_fn)
     fine_shift = tuple(float(x) for x in fine_shift)
     nc_coarse = coarse_conduction_count(params, n_cond, log_fn=log_fn)
     n_extra_guard = 0
@@ -1783,7 +1792,6 @@ def _interpolate_bse_data_to_grid(
 
     # The restart and fresh htransform WFN first meet at this seam.
     from file_io.qp_wfn import refuse_conflicting_qp_state_sources
-    from .bse_window import _parse_wfn_path
     refuse_conflicting_qp_state_sources(
         wfn_path=_parse_wfn_path(input_file),
         state_artifact_path=restart_file,
@@ -1814,11 +1822,9 @@ def _interpolate_bse_data_to_grid(
     # ── The coarse velocity, authenticated BEFORE the fit ────────────────
     # It must be the deck WFN's own (basis and fingerprint): a fine grid's
     # dipole.h5 has the bundle's nk and the WRONG gauge, and refuses here.
-    wfn_sym = velocity = None
+    velocity = None
     if velocity_file is not None:
         from bandstructure.orbital import stored_velocity
-        wfn_sym = ht.setup_wfn_and_sym(_parse_wfn_path(input_file),
-                                       mesh_xy=mesh_xy)
         velocity = stored_velocity(
             velocity_file, wfn=wfn_sym[0], wfn_path=_parse_wfn_path(input_file),
             sym=wfn_sym[1], mesh=mesh_xy) + (velocity_file,)

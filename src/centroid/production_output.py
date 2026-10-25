@@ -81,6 +81,19 @@ def prune_band_ranges(args, n_val: int, n_cond: int):
             "(occupied + Sigma conduction) x all bands")
 
 
+def resolve_sigma_ncond(args, wfn, print_fn=print) -> None:
+    """Set ``args.sigma_ncond`` from the input file's parameters (``args.sigma_deck``).
+
+    Its ``ncond``, or ``number_bands_protected`` resolved against the WFN as
+    gw resolves it (``gw.gw_config.resolve_band_request``); left as is when
+    no input file was given.
+    """
+    deck = getattr(args, "sigma_deck", None)
+    if deck is not None:
+        from gw.gw_config import resolve_band_request
+        args.sigma_ncond = int(resolve_band_request(deck, wfn, print_fn)["ncond"])
+
+
 class CentroidRankNotEstablished(RuntimeWarning):
     """The point budget stopped the select before the pool was spent."""
 
@@ -202,7 +215,7 @@ def kmeans_settings_rows(args, *, source) -> list:
     m_cand = int(math.ceil(n_c * oversample)) if oversample > 1.0 else n_c
     current = args.density_mode == "current"
     rows = [
-        Setting("n_centroids", str(n_c), "cli" if n_c != 400 else "default",
+        Setting("n_centroids", str(n_c), "cli",
                 "point budget: the centroids requested"),
         Setting("oversample", f"{oversample:g}", source("--oversample"),
                 f"{m_cand} k-means candidates, pruned by pivoted Cholesky"

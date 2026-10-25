@@ -182,8 +182,8 @@ K_POINTS {{crystal_b}}
   0.400000  0.400000  0.000000  1  # M
 """
 
-# The same corners with two interior points per segment (the counts on X and
-# M are the steps of the segment that ends there).  The 5 x 5 x 1 coarse grid
+# The same corners with two interior points per segment (QE's crystal_b: each
+# count is the steps to the next corner).  The 5 x 5 x 1 coarse grid
 # has spacing 0.2, so the points at multiples of 2/15 are OFF the grid: the
 # htransform stage then evaluates the interpolant, not just f(eps) at a grid
 # point (star covariance, the WS images, the top-block solve, the back-map).
@@ -192,9 +192,9 @@ K_POINTS {{crystal_b}}
 _PATH_OFFGRID = """
 K_POINTS {{crystal_b}}
 3
-  0.000000  0.000000  0.000000  1  # G
+  0.000000  0.000000  0.000000  3  # G
   0.400000  0.000000  0.000000  3  # X
-  0.400000  0.400000  0.000000  3  # M
+  0.400000  0.400000  0.000000  1  # M
 """
 
 # Five k-points per side leave the Galerkin basis no room below the full

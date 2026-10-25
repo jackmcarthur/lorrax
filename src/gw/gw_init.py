@@ -27,7 +27,6 @@ from common.log import get_logger
 log = get_logger(__name__)
 
 from common import rank_criterion
-from common import spectral_closure
 from common import jax_profile
 # Named-barrier helper: annotates failures with the barrier name and
 # no-ops at P=1; also avoids relying on ``jax.experimental.multihost_utils``
@@ -40,10 +39,8 @@ from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
 
 # The env grammar and the XLA memory reading come from their owners in
 # ``runtime`` (L3, jax-free); the deck vocabulary from ``gw_config``.
-from runtime.env_flags import env_bool
 from runtime.xla_memory import classify_xla_pool, resolve_xla_gpu_memory_env
 from .gw_config import (
-	active_zeta_truncating_knobs,
 	refuse_unsupported_bispinor_gw,
 	uses_bare_tt_gamma_head,
 	uses_coupled_photon_head,
@@ -261,12 +258,8 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	outcome than the (contrived) same-path-same-size-different-content
 	case.
 
-	``zeta_rcond`` records the EFFECTIVE value, i.e. after
-	``LORRAX_ZETA_RCOND`` is applied exactly as
-	``isdf/core._factor_c_q_face`` applies it.  Recording the cfg value
-	instead would be a correctness hole: a rerun that drops the env
-	override would match the provenance and silently reuse a ζ fit at a
-	different conditioning cutoff.  ``zeta_ridge`` is retired and refused
+	``zeta_rcond`` records the input key, the only route to the
+	conditioning cutoff.  ``zeta_ridge`` is retired and refused
 	unless 0; it is still stamped (``repr(0.0)``) so stored stamps compare.
 
 	``write_ibz_only`` is the REQUESTED value.  ``fit_zeta_to_h5`` may
@@ -315,7 +308,6 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		cfg.bispinor
 		and not (int(vertex_mu_L) == 0 and not _carrier_bispinor))
 	_ti = dict(transverse_identity or {}) if _couple_transverse else {}
-	from isdf.core import deprecated_env_record as _dep_env_record
 	if float(cfg.backend.zeta_ridge) != 0.0:
 		raise ValueError("zeta_ridge is retired (2026-09-25): the charge ζ solve is the rank-truncated pseudo-inverse and zeta_rcond sets its cut; remove the key.")
 	# ``wfn._filename`` is the same source path fit_zeta_to_h5 copies
@@ -359,18 +351,8 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'nspinor':              int(meta.nspinor_wfnfile),
 		'zeta_cutoff_ry':       round(float(zeta_cutoff), 9),
 		'bare_coulomb_cutoff':  round(float(zeta_vcoul_cutoff), 9),
-		# EFFECTIVE (env-overridden) values, recorded via the SAME
-		# non-empty-env-wins rule the factor sites apply
-		# (isdf/core.deprecated_env_record → _env_override_raw — ONE
-		# implementation, no inline mirror to drift; audit fix/zq
-		# 2026-07-28): the env forms are DEPRECATED (scorecard AV) but
-		# still win when non-empty, so the provenance must keep recording
-		# what the fit actually used.  The recorded string is
-		# byte-identical to the historical format in every case that
-		# ever produced a reusable ζ.
 		'zeta_ridge':           repr(cfg.backend.zeta_ridge),
-		'zeta_rcond':           _dep_env_record(
-			"LORRAX_ZETA_RCOND", cfg.backend.zeta_rcond),
+		'zeta_rcond':           repr(cfg.backend.zeta_rcond),
 		'charge_zeta_solve':    str(cfg.backend.charge_zeta_solve),
 		# GAUGE of the charge-channel factor.  Every ζ fit applies a
 		# whole-tile factor, stamped with its historical spelling
@@ -538,11 +520,10 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 
 	Returns ``True`` only when EVERY one of these holds:
 
-	  1. ``LORRAX_FORCE_REFIT`` is not set to a truthy value;
-	  2. the file exists and its ``isdf_header`` is readable;
-	  3. ``zeta_is_done`` is True (the writer flipped it after the last
+	  1. the file exists and its ``isdf_header`` is readable;
+	  2. ``zeta_is_done`` is True (the writer flipped it after the last
 	     H5Dwrite drained — a crashed fit leaves it False);
-	  4. ``fit_provenance`` is present AND byte-identical to this run's —
+	  3. ``fit_provenance`` is present AND byte-identical to this run's —
 	     with TWO named exceptions, both announced when they fire.  The
 	     legacy-key table below: a stamp that differs ONLY by keys added
 	     after it was written is read as having run each of those keys'
@@ -552,8 +533,8 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 	     file has many names, so two spellings that resolve to the same
 	     file are not a difference (:func:`_same_wfn_file`) — while two
 	     that resolve to different files refit, naming BOTH paths;
-	  5. the on-disk centroid table equals this run's centroid indices;
-	  6. (``n_rmu_expected`` given) the ζ DATASET's μ extent equals it.
+	  4. the on-disk centroid table equals this run's centroid indices;
+	  5. (``n_rmu_expected`` given) the ζ DATASET's μ extent equals it.
 	     The header and the dataset are written by two different calls,
 	     so a file can carry a good header over a ζ of the wrong shape.
 	     :func:`_check_zeta_h5_matches_basis` RAISES on that for the
@@ -567,16 +548,6 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 	sits in front of a multi-hour step whose silent misuse produced a
 	−135 eV QP gap once already (job 7874375, the restart-window bug).
 	"""
-	# Canonical boolean grammar (gw_config.env_bool, imported at module
-	# scope with the rest of this layer's env helpers — this site used to
-	# lazily import isdf.core._env_bool, the ONE other parser, which P1.3
-	# retired): under the old hand-rolled
-	# ``not in ('', '0', 'false', 'False')`` parse, ``=off``/``=no``
-	# counted as truthy and forced a multi-hour refit (audit fix/zq
-	# 2026-07-28).
-	if env_bool('LORRAX_FORCE_REFIT', False):
-		log.info("    [zeta reuse] LORRAX_FORCE_REFIT set — refitting.")
-		return False
 	if not os.path.exists(zeta_h5_path):
 		return False
 	try:
@@ -1126,16 +1097,6 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 		for b in edges))
 
 
-#: Env override for the band-sum degeneracy guard: ``snap`` (or ``off``)
-#: downgrades the refusal below.  Same three-mode vocabulary as
-#: ``common.band_degeneracy.MODES`` and the BSE's ``band_degeneracy``; it is
-#: an ENV knob rather than a deck key because it is an escape hatch for a
-#: deck you are debugging, not a property of the calculation you would want
-#: recorded in the input file.  Never set it to make a gate pass
-#: (``docs/reference/env_vars.md``).
-_BAND_DEGENERACY_ENV = "LORRAX_BAND_DEGENERACY"
-
-
 def assert_isdf_window_is_the_max(band_slices, band_range_right, zeta_nband,
 								  *, meta, log=print):
 	"""THE SIZING RULE, ENFORCED AT THE SEAM THAT CONSUMES IT.
@@ -1289,8 +1250,7 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 	  construction has no history, which is precisely the argument that made
 	  ``zeta_nband``'s edge strict on 2026-08-11.
 
-	``LORRAX_BAND_DEGENERACY=snap`` (or ``off``) downgrades the refusal for
-	both, and says so in the log when it does.  The two counts are checked
+	The two counts are checked
 	INDEPENDENTLY and the message names the legal edges for the one that
 	failed, so a deck with two bad edges learns about both.
 	"""
@@ -1309,18 +1269,12 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 	# only array that can say whether they slice a multiplet is the full
 	# ladder.  Same array and same answer as gw_init.py's other call site.
 	gaps = _bd.boundary_min_gaps(enk, is_full_spectrum=True)
-	override = os.environ.get(_BAND_DEGENERACY_ENV, "").strip().lower()
-	if override and override not in _bd.MODES:
-		raise ValueError(
-			f"{_BAND_DEGENERACY_ENV}={override!r} is not one of "
-			f"{_bd.MODES}.  A guard override with an unrecognised value is "
-			f"not silently ignored.")
 	for edge, key, what in (
 			(int(band_slices.b4_chi), "number_bands_chi", "chi0/W band sum"),
 			(int(band_slices.b4_sigma), "number_bands_sigma",
 			 "Sigma band sum")):
 		named = key in cfg.bands.named
-		mode = override or ("strict" if named else "snap")
+		mode = "strict" if named else "snap"
 		# The PADDED edge cuts nothing real: ψ above b_id_4_user is zero, so
 		# the boundary there is between a real band and a pad band and the
 		# gap is meaningless.  Ask about the LOGICAL count instead, which is
@@ -1338,16 +1292,9 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 				raise _bd.BandWindowDegeneracyError(
 					f"{detail}  This edge was requested BY NAME (`{key}` = "
 					f"{logical}), so unverifiable closure is refused.  Increase the "
-					f"WFN band count, choose a lower certified `{key}`, or set "
-					f"{_BAND_DEGENERACY_ENV}=snap to continue diagnostically.")
-			if mode == "off":
-				log(f"    *** {detail}  ({_BAND_DEGENERACY_ENV}=off: NOT "
-				    "CHECKED.) ***")
-			else:
-				log(f"    *** {detail}  Continuing because this legacy umbrella "
-				    "edge is grandfathered to a warning"
-				    + (f" ({_BAND_DEGENERACY_ENV}={override} was set)."
-				       if override else ".") + " ***")
+					f"WFN band count or choose a lower certified `{key}`.")
+			log(f"    *** {detail}  Continuing because this legacy umbrella "
+			    "edge is grandfathered to a warning. ***")
 			continue
 		gap_mev = float(gaps[logical]) * 13605.693122994
 		if gap_mev > _bd.DEGENERACY_TOL_RY * 13605.693122994:
@@ -1368,10 +1315,7 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 			f"Sigma spread, which is an identity violation and has no "
 			f"convergence knob.  Legal edges for THIS count near {logical}: "
 			f"{near or 'none in range'}.")
-		if mode == "off":
-			log(f"    *** {detail}  ({_BAND_DEGENERACY_ENV}=off: NOT "
-			    f"CHECKED.) ***")
-		elif mode == "snap":
+		if mode == "snap":
 			# THROUGH ``sanity.warn``, not a bare log line.  This branch is
 			# the one that measures a defect and PROCEEDS, and until now its
 			# output carried none of the markers the rest of the tree's
@@ -1391,19 +1335,15 @@ def check_band_sum_degeneracy(wfn, cfg, band_slices, *, log=print):
 			from common import sanity
 			sanity.warn(
 				f"{detail}  Continuing: "
-				+ (f"{_BAND_DEGENERACY_ENV}={override} was set."
-				   if override else
-				   f"this edge arrived through the umbrella `number_bands`, "
-				   f"which is grandfathered to a warning.  Set `{key}` "
-				   f"explicitly to have it enforced."),
+				f"this edge arrived through the umbrella `number_bands`, "
+				f"which is grandfathered to a warning.  Set `{key}` "
+				f"explicitly to have it enforced.",
 				print_fn=log)
 		else:
 			raise _bd.BandWindowDegeneracyError(
 				f"{detail}  This edge was requested BY NAME (`{key}` = "
 				f"{logical}), so it is enforced rather than warned about.  "
-				f"Set `{key}` to one of the legal edges above, or set "
-				f"{_BAND_DEGENERACY_ENV}=snap to continue anyway (it logs "
-				f"loudly, and it changes the physics rather than fixing it).")
+				f"Set `{key}` to one of the legal edges above.")
 
 
 @dataclass(frozen=True)
@@ -1761,34 +1701,11 @@ def _gate_fresh_zeta_rank_findings(
 	"""Dispose deferred rank findings before a fresh ζ channel is stamped.
 
 	The ζ truncations execute inside jitted kernels and therefore record through
-	the incumbent ``spectral_closure`` and ``rank_criterion`` services.  Every
+	the incumbent ``rank_criterion`` service.  Every
 	fresh charge or transverse writer must cross this host seam immediately
 	after its fit, before provenance makes that artifact reusable.  Accepted
 	restart artifacts never call this function.
 	"""
-	_sc_mode = spectral_closure.resolve_mode(
-		os.environ.get(spectral_closure.MODE_ENV))
-	# Read findings before the disposition clears them, so the clean/fired
-	# banner below cannot contradict the service result.
-	_sc_fired = bool(spectral_closure.pending())
-	spectral_closure.raise_if_pending(
-		finding_context, mode=_sc_mode, log=print_fn)
-	if _sc_mode == "off":
-		log.info("    ζ rank-cut closure: guard is OFF "
-		         "(LORRAX_SPECTRAL_CLOSURE=off) — NOT CHECKED, which is an "
-		         "absence and not a pass.")
-	elif _sc_fired:
-		log.info(f"    ζ rank-cut closure: guard fired above and the "
-		         f"straddled block was DROPPED whole (mode={_sc_mode}, "
-		         f"direction={spectral_closure.DEFAULT_DIRECTION}).  ζ's "
-		         f"retained span is point-group invariant; the rank it "
-		         f"carries is LOWER than the one zeta_rcond alone would have "
-		         f"chosen, and its κ_eff is correspondingly better.")
-	else:
-		log.debug(f"    ζ rank-cut closure: ARMED (mode={_sc_mode}, rtol="
-		         f"{spectral_closure.DEFAULT_RTOL:.1e}) and SILENT — no cut "
-		         f"fell inside a degenerate block of C_q on any q.")
-
 	_rp_mode = rank_criterion.resolve_policy_mode(
 		os.environ.get(rank_criterion.POLICY_MODE_ENV))
 	_rp_fired = bool(rank_criterion.pending())
@@ -1844,7 +1761,7 @@ def _reuse_zeta_faces(
     log.info("  isdf_header/zeta_is_done is True, the centroid table")
     log.info("  matches, and fit_provenance is identical to this run's")
     log.info("  inputs (band windows, cutoffs, solver knobs, source WFN).")
-    log.info("  Set LORRAX_FORCE_REFIT=1 to refit unconditionally.")
+    log.info("  Delete or move the ISDF tensor file to refit.")
     log.info("  " + "=" * 68)
     log.info("")
     if not cfg.bispinor:
@@ -1949,21 +1866,7 @@ def _fit_charge_zeta_channel(
     if not _reuse_charge:
         _gate_fresh_zeta_rank_findings(
             "the ζ fit's rank truncation", print_fn=print_fn)
-    _trunc = active_zeta_truncating_knobs()
-    if not _reuse_charge and _trunc:
-        _names = ", ".join(f"{k}={v}" for k, v in _trunc)
-        log.info("")
-        log.info("  " + "!" * 68)
-        log.info(f"  *** LORRAX SANITY: {_names} truncated this ζ fit. ***")
-        log.info(f"  {zeta_h5_path} is INCOMPLETE and is NOT being stamped")
-        log.info( "  with fit_provenance, so no later run can reuse it.  The")
-        log.info( "  writer also left isdf_header/zeta_is_done False, so no")
-        log.info( "  restart path will trust it either.  Profiling only —")
-        log.info( "  delete this file before any production run from this")
-        log.info( "  directory.")
-        log.info("  " + "!" * 68)
-        log.info("")
-    elif not _reuse_charge and zeta_g is not None and zeta_g.pending_file is not None:
+    if not _reuse_charge and zeta_g is not None and zeta_g.pending_file is not None:
         zeta_g.pending_file["provenance"] = _provenance
     elif (not _reuse_charge and jax.process_index() == 0
           and (zeta_g is None or _write_zeta_file)):
@@ -1975,7 +1878,7 @@ def _fit_charge_zeta_channel(
                      f"will be refit on the next run.")
     if not _reuse_charge:
         barrier("zeta_provenance")
-    return peak_bytes, _trunc, zeta_g
+    return peak_bytes, zeta_g
 
 
 def _report_zeta_fit_peak(
@@ -2015,7 +1918,7 @@ def _report_zeta_fit_peak(
 
 def _fit_transverse_zeta_channels(
         _band_norms, _cent_T_idx, _chunks_T, _meta_T, _provenance_T,
-        _reuse_T, _trunc, _write_ibz_only_transverse,
+        _reuse_T, _write_ibz_only_transverse,
         _zeta_T_paths, _zeta_cutoff, band_range_left, band_range_right, band_slices, cfg,
         mesh_xy, print_fn, representation, sym, wfn, zeta_contract):
     """Fit the missing current channels on route G; return their wavefunction view.
@@ -2105,7 +2008,7 @@ def _fit_transverse_zeta_channels(
         _gate_fresh_zeta_rank_findings(
             f"the μ_L={mu} transverse ζ fit's rank truncation",
             transverse=True, print_fn=print_fn)
-        if write_T and not _trunc and jax.process_index() == 0:
+        if write_T and jax.process_index() == 0:
             try:
                 from file_io.isdf_header import stamp_fit_provenance
                 stamp_fit_provenance(_zeta_T_paths[mu], _provenance_T(mu))
@@ -2162,7 +2065,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		mu_L: path for mu_L, path in
 		enumerate(zeta_contract.zeta_transverse_paths, start=1)
 	}
-	(peak_bytes, _trunc, zeta_g) = _fit_charge_zeta_channel(
+	(peak_bytes, zeta_g) = _fit_charge_zeta_channel(
 	    _band_norms, _provenance, _reuse_charge, _write_ibz_only_charge, _zeta_cutoff,
 	    band_range_left, band_range_right, centroid_indices, cfg, chunks, k_unfold_plan,
 	    mesh_xy, meta, print_fn, psi_mun_parent, psi_nmu_parent, representation, sym, wfn,
@@ -2185,7 +2088,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	if cfg.bispinor and getattr(cfg.paths, "centroids_file_current", None):
 	    transverse_wfn_data, tt_tiles = _fit_transverse_zeta_channels(
 	        _band_norms, _cent_T_idx, _chunks_T, _meta_T, _provenance_T,
-	        _reuse_T, _trunc, _write_ibz_only_transverse, _zeta_T_paths,
+	        _reuse_T, _write_ibz_only_transverse, _zeta_T_paths,
 	        _zeta_cutoff, band_range_left, band_range_right, band_slices, cfg, mesh_xy, print_fn,
 	        representation, sym, wfn, zeta_contract)
 	    if tt_tiles is not None:
@@ -2898,16 +2801,6 @@ def _prepare_fitted_zeta(
     				transverse_wfn_data['centroid_indices']),
     			n_rmu_logical=int(_meta_receipt_T.n_rmu),
     			n_rmu_padded=int(_meta_receipt_T.n_rmu_padded)))
-    if env_bool("LORRAX_EXIT_AFTER_ZETA", False, print_fn=print0):
-    	if jax.process_index() == 0:
-    		log.info("*** LORRAX EARLY EXIT: LORRAX_EXIT_AFTER_ZETA=1 "
-    		      "— stopping after fit_zeta.  V_q, W, and Σ were "
-    		      "NOT computed; this run produced no self-energy. "
-    		      "***")
-    		import sys as _sys
-    		print("*** LORRAX EARLY EXIT (LORRAX_EXIT_AFTER_ZETA) ***",
-    		      file=_sys.stderr, flush=True)
-    	raise SystemExit(0)
     return (zeta_path, mem_est, transverse_wfn_data, transverse_basis_receipt)
 
 def _prepare_fresh_carriers(

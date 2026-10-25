@@ -632,14 +632,19 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
         # no-P-scaling wall this name exists to escape.
         requested = _DISTRIBUTED_DEFAULT.get((op, mesh_platform(mesh_xy)))
         if requested is None:
-            room_leg = (op, mesh_platform(mesh_xy)) in ONE_DEVICE_BY_ROOM
+            platform = mesh_platform(mesh_xy)
+            if (op, platform) in ONE_DEVICE_BY_ROOM:
+                from distrib_la._one_device import one_device_bytes
+                need = ("" if n is None else
+                        f": n={int(n)} needs {one_device_bytes(op, int(n)) / 1e9:.2f} GB/rank")
+                raise ValueError(
+                    f"{op} on {platform} has no distributed library, only one whole matrix per "
+                    f"device within the caller's room (budget_bytes"
+                    f"{'; none given' if room is None else ''}){need}; use fewer ISDF "
+                    f"centroids, more device memory per rank, or a CUDA run.")
             raise ValueError(
-                f"{op} backend 'distributed' has no default backend on "
-                f"platform {mesh_platform(mesh_xy)!r} "
-                f"(defined for: {sorted(_DISTRIBUTED_DEFAULT)})"
-                + (f"; on this leg it is the room route alone: n={n} needs the caller's "
-                   f"room per rank (budget_bytes) and one whole matrix's one-device "
-                   f"program within it" if room_leg else "") + ".")
+                f"{op} backend 'distributed' is not available on platform {platform!r} "
+                f"(it is defined for {sorted(_DISTRIBUTED_DEFAULT)}); use backend 'native'.")
     if requested == "auto":
         if op == "eigh" or mesh_is_cpu(mesh_xy):
             return NATIVE
@@ -685,7 +690,7 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
     # cuSOLVERMp 0.7.2 returns status=7 (CUSOLVER_STATUS_INTERNAL_ERROR)
     # from cusolverMpSyevd at EVERY n tried — 64, 256, 1024, 4096 — on a
     # real 4-process 2x2 CUDA mesh.  Reproduced twice (jobid 56447670, both
-    # the plain and the LORRAX_FFI_PROFILE=1 decomposition legs;
+    # the plain and the LORRAX_DEBUG_PRINT=1 (per-phase profile) decomposition legs;
     # _reports/perf_gpu2x2_decomp.json + perf_gpu2x2prof_decomp.json, rows
     # "g2. distributed_eigh jobz='N'").
     #

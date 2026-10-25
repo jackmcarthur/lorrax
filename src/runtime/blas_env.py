@@ -32,7 +32,7 @@ THE GATE.  :func:`enforce` (GATE ``blas_spin``, called by
 untuned and the caller made no choice: that happens only when numpy was
 imported before any LORRAX package and the launch did not export the
 variable.  An exported value (any value) is the caller's choice and is
-honoured; ``LORRAX_BLAS_TUNE=0`` declines the tuning and the gate with it.
+honoured.
 
 PLATFORM-NEUTRAL.  This is a host-CPU property of OpenBLAS, identical under
 the cpu, CUDA and ROCM legs, so it is not a ``lxkit.LEGS`` field and not a
@@ -46,7 +46,6 @@ from __future__ import annotations
 import os
 import sys
 
-from .env_flags import env_falsy
 
 VAR = "OPENBLAS_THREAD_TIMEOUT"
 DEFAULT = "1"
@@ -74,9 +73,6 @@ def tune_cpu_malloc_arenas(platforms: str) -> dict:
     backend = getattr(bridge, "_default_backend", None)
     if platforms.strip().lower() != "cpu" or backend not in (None, "cpu"):
         result["reason"] = "not a resolved CPU client"
-        return result
-    if env_falsy("LORRAX_MALLOC_TUNE"):
-        result["reason"] = "disabled by LORRAX_MALLOC_TUNE"
         return result
     if "MALLOC_ARENA_MAX" in os.environ:
         result["reason"] = "caller supplied MALLOC_ARENA_MAX"
@@ -164,9 +160,6 @@ def tune_at_import(env=os.environ) -> bool:
     caller = env.get(VAR)
     STATE.update(numpy_already_imported=already, caller_value=caller,
                  preloaded=mapped_openblas())
-    if env_falsy("LORRAX_BLAS_TUNE"):
-        STATE.update(applied=False, reason="disabled by LORRAX_BLAS_TUNE")
-        return False
     env.setdefault(VAR, DEFAULT)
     STATE.update(applied=True, timeout=env[VAR], reason=None)
     return True
@@ -223,8 +216,6 @@ def enforce() -> list:
     """GATE ``blas_spin``: refuse when an OpenBLAS copy in this process is
     proven untuned and the caller chose nothing.  Returns the census."""
     rows = census()
-    if STATE.get("applied") is False:          # LORRAX_BLAS_TUNE=0: declined
-        return rows
     bad = [r for r in rows if r["state"] == "untuned"]
     if bad:
         libs = ", ".join(f"{r['lib']} ({r['witness']})" for r in bad)
@@ -235,5 +226,5 @@ def enforce() -> list:
             f"Untuned, the Fe V2 rank-0 rule build measured 264.7 s against "
             f"131.8 s. Remedy: import runtime (or any LORRAX driver package, "
             f"e.g. gw) before numpy, or export {VAR}=1 in the launch "
-            f"environment; LORRAX_BLAS_TUNE=0 runs untuned on purpose.")
+            f"environment.")
     return rows

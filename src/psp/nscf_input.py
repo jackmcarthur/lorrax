@@ -1,6 +1,6 @@
 """psp/nscf_input.py — Parse NSCF input file.
 
-Simple INI-style format:
+Simple INI-style format (save_dir, nbnd and kgrid are required):
 
     [nscf]
     save_dir = path/to/QE.save
@@ -26,11 +26,15 @@ import os
 from dataclasses import dataclass
 
 
+#: Keys an input file must name: no default stands in for them.
+REQUIRED_KEYS = ("save_dir", "nbnd", "kgrid")
+
+
 @dataclass
 class NSCFInput:
     save_dir: str
-    nbnd: int = 100
-    kgrid: tuple[int, int, int] = (4, 4, 4)
+    nbnd: int
+    kgrid: tuple[int, int, int]
     nosym: bool = False
     output: str = "WFN.h5"
     tol: float = 1e-8
@@ -56,12 +60,14 @@ def read_nscf_input(filename: str) -> NSCFInput:
     def resolve(path):
         return path if os.path.isabs(path) else os.path.join(input_dir, path)
 
-    kgrid_str = sec.get("kgrid", "4 4 4")
-    kgrid = tuple(int(x) for x in kgrid_str.split())
+    missing = [f"{key} is required" for key in REQUIRED_KEYS if key not in sec]
+    if missing:
+        raise ValueError("\n".join(missing))
+    kgrid = tuple(int(x) for x in sec.get("kgrid").split())
 
     return NSCFInput(
-        save_dir=resolve(sec.get("save_dir", ".")),
-        nbnd=sec.getint("nbnd", 100),
+        save_dir=resolve(sec.get("save_dir")),
+        nbnd=sec.getint("nbnd"),
         kgrid=kgrid,
         nosym=sec.getboolean("nosym", False),
         output=resolve(sec.get("output", "WFN.h5")),

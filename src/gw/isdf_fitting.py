@@ -28,8 +28,7 @@ from runtime import debug_print_enabled
 # announcement for anything outside it).
 # See gw/gw_config.py's module comment and tools/lint/test_env_grammar.py for
 # the drift gate.
-from .gw_config import (ZETA_RCOND_DEFAULT,
-                        active_zeta_truncating_knobs)
+from .gw_config import ZETA_RCOND_DEFAULT
 
 from isdf.core import (
     c_q_from_psi_sm,
@@ -352,15 +351,8 @@ def _fit_mubatch(
     progress = LoopProgress(n_batch, title="zeta fitting",
                             item_name="μ-batch",
                             max_updates=min(n_batch, 20)).start()
-    _max = os.environ.get("LORRAX_MAX_RCHUNKS", "").strip()
-    _max_n = int(_max) if _max else None
-    if _max_n is not None and _max_n < 1:
-        raise ValueError(
-            f"LORRAX_MAX_RCHUNKS={_max!r} must be >= 1; unset it to fit every "
-            "μ batch.")
     t_batch = 0.0
     n_run = 0
-    n_go = n_batch if _max_n is None else min(n_batch, _max_n)
 
     def launch(beta):
         """Dispatch batch β (asynchronous); the caller writes it later."""
@@ -378,10 +370,10 @@ def _fit_mubatch(
     with timing.section("zeta_fit.mubatch.loop"):
         # One batch of lookahead: β+1 is on the device while β is written.
         pending = launch(0)
-        for beta in range(n_go):
+        for beta in range(n_batch):
             t0 = time.perf_counter()
             rows = pending
-            pending = launch(beta + 1) if beta + 1 < n_go else None
+            pending = launch(beta + 1) if beta + 1 < n_batch else None
             for store, r in zip(stores, rows):
                 store.write_batch(beta, r)
                 if len(stores) > 1:
@@ -408,9 +400,6 @@ def _fit_mubatch(
                 log.debug(f"[mubatch_dbg] batch={beta + 1}/{n_batch} "
                          f"{1e3 * (time.perf_counter() - t0):.0f}ms "
                          f"write_total={sum(st.t_write for st in stores):.2f}s")
-    if n_go < n_batch:
-        log.info(f"[mubatch_dbg] LORRAX_MAX_RCHUNKS={_max_n} reached after "
-                 f"μ-batch {n_run}; the fit is truncated.")
     progress.finish()
     del cbar
     log.debug(_host_mem("pre-V_q (Z store full)"))
@@ -811,17 +800,11 @@ def fit_zeta_to_h5(
         from isdf import cplus
         log.info(cplus.rank_text(_charge_rank), extra=block("isdf", label="zeta rank"))
     # ``isdf_header/zeta_is_done`` is the file's own claim that the writer
-    # finished; a truncating knob (gw_config.ZETA_TRUNCATING_ENV_KNOBS) leaves
-    # it False so no restart or reuse path trusts a PARTIAL ζ.
-    _trunc = active_zeta_truncating_knobs()
-    if _trunc:
-        log.info(f"  *** LORRAX SANITY: {_trunc} truncated this ζ fit "
-                 f"({n_run} of {n_total} μ batches); ζ is PARTIAL"
-                 + (" and its files are NOT marked complete." if _write_file else "."))
+    # finished.
     for ch in channels:
         if zetas[ch.vertex].pending_file is not None:
-            zetas[ch.vertex].pending_file["complete"] = not bool(_trunc)
-        elif ch.write and not _trunc and jax.process_index() == 0:
+            zetas[ch.vertex].pending_file["complete"] = True
+        elif ch.write and jax.process_index() == 0:
             from file_io.isdf_header import mark_zeta_done
             mark_zeta_done(ch.output_file)
     _track_peak_mb = 0

@@ -4986,18 +4986,11 @@ def report_trs_velocity_parity(
             f"reach.  The velocity operator is ODD under time reversal and "
             f"every term of v^Q = v^DFT + d_k Sigma - i[A, Sigma] carries "
             f"that same parity (gw/qsgw_head.py module docstring, eq. 2), "
-            f"so this is a sign, not a convention.  Set "
-            f"LORRAX_ALLOW_TRS_VELOCITY_PARITY_BREAK=1 to proceed anyway "
-            f"and leave a trace.",
+            f"so this is a sign, not a convention.",
             print_fn=print_fn)
-        from .gw_config import env_bool
-        if not env_bool("LORRAX_ALLOW_TRS_VELOCITY_PARITY_BREAK", False,
-                        print_fn=print_fn):
-            raise sanity.SanityError(
-                f"{name}: time-reversal parity is inverted ({rel:.3e}); "
-                f"see gw/qsgw_head.py eq. (2).  Override with "
-                f"LORRAX_ALLOW_TRS_VELOCITY_PARITY_BREAK=1.")
-        return False
+        raise sanity.SanityError(
+            f"{name}: time-reversal parity is inverted ({rel:.3e}); "
+            f"see gw/qsgw_head.py eq. (2).")
     if rel > _TRS_VELOCITY_PARITY_FLOOR:
         sanity.warn(
             f"{name} time-reversal parity residual is above the roundoff "

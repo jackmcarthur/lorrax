@@ -14,7 +14,7 @@ Goals
 1. Export the native screened interaction as a BerkeleyGW BSE kernel.
 2. Solve the native BSE and compare absorption with and without electron-hole
    interactions.
-3. Compare the fully relativistic spectra with the BerkeleyGW track.
+3. Compare the fully relativistic spectra with the plane-wave track.
 4. Plot exciton bands along Gamma–K and inspect the dispersion
    close to Gamma.
 
@@ -41,7 +41,7 @@ Instructions
    Tamm–Dancoff transition space. The outputs include `eigenvalues.dat`,
    `eigenvectors.h5`, `absorption_eh.dat` and `absorption_noeh.dat`.
 
-5. After the adjacent fully relativistic BerkeleyGW reference has run, plot
+5. After the adjacent fully relativistic plane-wave reference has run, plot
    the interacting and independent-particle spectra:
 
    ```bash
@@ -70,16 +70,16 @@ eight conduction bands; the exported kernel uses twelve valence and twelve
 conduction bands. The saved coarse manifold has a 49.79 meV global upper DFT
 gap, allowing the unweighted velocity interpolation route.
 
-The reciprocal-basis polarization is `(1, 1, 0)`, matching the BerkeleyGW
-reference default. BerkeleyGW uses finite-shift velocity matrix elements;
+The reciprocal-basis polarization is `(1, 1, 0)`, matching the plane-wave
+reference default. The plane-wave code uses finite-shift velocity matrix elements;
 LORRAX uses its analytic velocity operator. The Gaussian width is 0.15 eV,
-and the native spectra run from 0 to 17 eV in 0.01 eV steps. BerkeleyGW chooses
+and the native spectra run from 0 to 17 eV in 0.01 eV steps. The plane-wave code chooses
 each file's end point automatically.
 
 Comparison
 ----------
 
-The saved fine-grid onset is 2.511 eV in LORRAX, versus 1.592 eV in BerkeleyGW.
+The saved fine-grid onset is 2.511 eV in LORRAX, versus 1.592 eV in the plane-wave code.
 These are different interpolations from 3 × 3 × 1 to shifted 8 × 8 × 1,
 without an explicit fine-grid GW+BSE reference to rank their accuracy.
 Convergence of all retained

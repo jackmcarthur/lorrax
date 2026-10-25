@@ -13,7 +13,7 @@ Goals
 
 1. Prepare the ISDF points and mean-field matrix elements.
 2. Calculate screening, self-energy and a QP bandstructure.
-3. Compare the outputs and stage timings with the BerkeleyGW track.
+3. Compare the outputs and stage timings with the plane-wave track.
 
 Instructions
 ------------
@@ -38,7 +38,8 @@ Instructions
 
 4. Go to `2-sigma` and run `bash 01-run_sigma.run`. LORRAX evaluates
    screening and self-energy together. The script also writes the exported
-   `eps0mat.h5` and `epsmat.h5` into `1-epsilon`. Check `sigma.out` for
+   `eps0mat.h5` and `epsmat.h5` into `1-epsilon`, with a 25 Ry cutoff
+   (`epsmat_ecut = 25.0`). Check `sigma.out` for
    completion and `COMPLETE` on-shell coverage of all 48 requested QP bands.
 
 5. Go to `3-bs`, run `bash 01-run_inteqp.run`, then plot the bandstructure:
@@ -50,7 +51,9 @@ Instructions
 
    The path is Gamma–M–K–Gamma with the workshop's 106 points and 40 plotted
    bands. Compare the DFT and QP curves and the times spent in each GW stage.
-   The plot comparison needs the adjacent fully relativistic BerkeleyGW run.
+   The plot comparison needs the adjacent fully relativistic plane-wave run.
+   Dots mark the 3 × 3 × 1 coarse k-points on the path, where the QP
+   energies are computed directly rather than interpolated.
 
 6. Return to the tutorial root and continue in `3-bse/3-lorrax_fully_rel`.
 
@@ -73,10 +76,9 @@ high-frequency response; BerkeleyGW uses the density sum rule.
 The screening bases also differ. BerkeleyGW builds and inverts its dielectric
 matrix at 9 Ry. LORRAX screens in the 996-point ISDF basis with 45 Ry
 bare-Coulomb and ζ spheres; 45 Ry is not a plane-wave χ cutoff.
-`epsmat_ecut = 9.0` selects a block of the already-screened inverse dielectric
-matrix for export. It does not rerun native GW at 9 Ry. Matching the exported
-dimensions therefore does not match the internal screening basis, and the
-workshop comparison does not isolate interpolation.
+`epsmat_ecut = 25.0` selects a 25 Ry block of the already-screened inverse
+dielectric matrix for export. It does not rerun native GW at 25 Ry, and the
+exported matrix does not reproduce the internal screening basis.
 
 `sigma_omega_min_ev = -65.0` eV, relative to the Sigma Fermi reference,
 includes the deep Mo semicore states. `mc_average_vcoul_body = false` uses

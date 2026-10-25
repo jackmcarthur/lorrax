@@ -102,10 +102,6 @@ rulings override anything here.
   `LORRAX SANITY` line saying the knob is not in force, or, with
   `refuse=True` (knobs that gate correctness), raises naming the variable. It
   never applies a default silently.
-- **`active_zeta_truncating_knobs`** lists the env knobs in force that stop the
-  ζ fit early (`ZETA_TRUNCATING_ENV_KNOBS`: `LORRAX_MAX_RCHUNKS`). Its readers
-  keep a truncated ζ from being stamped as complete, so a later production run
-  cannot reuse it.
 - **Normalizers.** `coerce_compute_mode`, `coerce_screening_diagrams`,
   `coerce_head_correction` and `coerce_bispinor_gw_mode` accept the enum, its
   `.value` or a string; `_normalize_placement` (`head_channel.normalize_placement`)
@@ -301,9 +297,7 @@ rulings override anything here.
   only on a multi-device mesh where one tile exceeds
   `qsgw_density.BAND_TILE_BUDGET_FRACTION` of the per-device budget and the
   distributed backend resolves, else `native`
-  (`sc_iteration._resolve_sc_eigh`). `LORRAX_SC_MAX_ITER`,
-  `LORRAX_SC_TOL_EV` and `LORRAX_SC_DUMP_DIR` override
-  their deck keys and print a deprecation note when set. The loop: [self-consistency](../self_consistency.md).
+  (`sc_iteration._resolve_sc_eigh`). The loop: [self-consistency](../self_consistency.md).
 - **`BSEConfig`**: `get_centroids_fi` gates the htransform-driven fine-k
   wavefunction recovery (`bandstructure.bse_setup.compute_wfns_fi`).
 - **`LorraxConfig`** is the frozen record built once and threaded through the

@@ -1349,89 +1349,23 @@ def _resolve_solver_kind(vertex_mu_L: int, solver_kind: str, **_) -> str:
 
 
 # ---------------------------------------------------------------------------
-# DEPRECATED env overrides of input-file keys (scorecard AV; pattern #8).
-#
-# ``zeta_rcond`` is THE conditioning knob of the charge ζ solve
-# — physics policy, not machine capability — so its home is the input file,
-# where they are parsed, validated, echoed into the run log and captured by
-# ζ-fit provenance.  The env forms predate the keys and used to win SILENTLY
-# (the env read had the key's value as its *fallback*), which is exactly the
-# env-coupled-behavior failure class: a sweep run whose central parameter is
-# not in its own input file.  No live harness depends on the env forms
-# (audited 2026-07-27: the one historical user is the completed one-off
-# run_B_c1998_rcond10/run72.sbatch).  They keep working this release, but
-# the override is announced LOUDLY, once per process per variable.
-_env_override_warned: set = set()
-
-
-def _env_override_raw(env_name: str) -> str | None:
-    """THE non-empty-env-wins rule of the deprecated env twins, in ONE place: the raw env string when it is set and non-blank (that value wins this release), else ``None`` (the input key is used); see docs/architecture/zeta_fit_face_psi_cct.md."""
-    raw = os.environ.get(env_name)
-    if raw is None or raw.strip() == "":
-        return None
-    return raw
-
-
-def deprecated_env_record(env_name: str, key_value) -> str:
-    """The string ζ-fit provenance records for a deprecated env-twin knob: the raw env string when the env form wins (the exact rule the factor sites apply, via :func:`_env_override_raw`), else ``repr(key_value)``; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    raw = _env_override_raw(env_name)
-    return raw if raw is not None else repr(key_value)
-
-
-# Canonical boolean env grammar — ONE parser, imported, not copied.
-#
-# This module used to carry its own ``_env_bool`` for conditioning telemetry.
-# The rank receipt is now mandatory production output, so it has no env gate.
-# ``runtime.env_flags.env_bool`` has the identical vocabulary plus the
-# once-per-(name,value) ``*** LORRAX SANITY`` announcement on unrecognised
-# tokens.  (P1.3 grammar unification, 2026-07-31; the drift gate is
-# ``tools/lint/test_env_grammar.py``, which scans this file as an OWNED file.)
-from runtime.env_flags import env_bool
+# Boolean env reads here would go through runtime.env_flags.env_bool; none remain (the drift gate
+# ``tools/lint/test_env_grammar.py`` scans it as an OWNED file).
 from gw.gw_config import ZETA_RCOND_DEFAULT
 
 
-def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
-    """Input key is the source of truth; a non-empty env var still overrides, but prints a deprecation notice on rank 0 (once per process); see docs/architecture/zeta_fit_face_psi_cct.md."""
-    raw = _env_override_raw(env_name)
-    if raw is None:
-        return float(key_value)
-    val = float(raw)
-    if env_name not in _env_override_warned:
-        _env_override_warned.add(env_name)
-        log.warning(
-            f"DEPRECATED env override: {env_name}={raw} overrides "
-            f"input key {key_name}={key_value!r}",
-            extra=log_message(
-                "deprecated_env_override",
-                found=(env_name, str(raw)),
-                lines=("the input file is the record; the env form still wins "
-                       "this release, but it is loud on purpose (env grants "
-                       "capability; it must not silently select policy)",),
-                fix=f"put '{key_name} = {raw}' in the deck instead"))
-    return val
-
-
-def _closure_mode():
-    # The DRIVER reads the dial and passes it: ``common.spectral_closure`` is
-    # L2 mathematics and ``tools/lint/test_layering.py`` requires it to be a
-    # function of its arguments.  The variable's NAME is still declared once,
-    # in the guard module, so nothing is duplicated but the lookup itself.
-    return spectral_closure.resolve_mode(os.environ.get(spectral_closure.MODE_ENV))
-
-
 def _policy_mode():
-    # The DRIVER reads the dial and passes it — same rule as _closure_mode.
+    # The DRIVER reads the dial and passes it: ``common.rank_criterion`` is
+    # L2 mathematics and ``tools/lint/test_layering.py`` requires it to be a
+    # function of its arguments.
     return rank_criterion.resolve_policy_mode(os.environ.get(rank_criterion.POLICY_MODE_ENV))
 
 
 def _close_the_cut(spectrum, keep, *, where: str):
     """Move a ζ rank cut off any degenerate block it slices, by DROPPING the block; ``(keep, figures)``, the figures for :func:`_report_the_cut`; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    mode = _closure_mode()
-    if mode == "off":
-        return keep, {}
     keep_new, n_pre, n_post = spectral_closure.close_keep_mask(
         spectrum, keep, rtol=spectral_closure.DEFAULT_RTOL)
-    return (keep_new if mode == "snap" else keep), {"closure": (n_pre, n_post)}
+    return keep_new, {"closure": (n_pre, n_post)}
 
 
 def _report_the_cut(figures, *, where: str, kappa_certified, rcond: float) -> None:
@@ -1442,7 +1376,6 @@ def _report_the_cut(figures, *, where: str, kappa_certified, rcond: float) -> No
     """
     if "closure" in figures:
         n_pre, n_post = figures["closure"]
-        mode = _closure_mode()
         # ``!=``, not ``>``: the default direction moves the rank DOWN.  A ``>``
         # here would have read every firing as silence after the flip, which is
         # the shape of a guard that reports a clean bill for the wrong reason.
@@ -1454,12 +1387,10 @@ def _report_the_cut(figures, *, where: str, kappa_certified, rcond: float) -> No
                 "block is DROPPED, owner ruling 2026-08-10).  A cut through a "
                 "degenerate block retains a symmetry-ARBITRARY slice of an "
                 "eigenspace, so zeta's span differs between q and Sq and the "
-                f"k-star identity fails for W and Sigma_x alike.  Mode={mode}.",
+                "k-star identity fails for W and Sigma_x alike.",
                 extra=log_message(
                     "spectral_closure_cut",
                     found=("retained rank/q", f"{n_pre} closes at {n_post}")))
-            if mode == "strict":
-                spectral_closure.note_device_snap(where, n_pre.max(), n_post.max())
     if "certify" in figures:
         kappa, n_drop, dropped_w, over = figures["certify"]
         if np.any(over):
@@ -1543,7 +1474,7 @@ def _factor_c_q_face(C_q, mesh_xy, n_rmu_logical, zeta_rcond=ZETA_RCOND_DEFAULT)
     from common.gpu_utils import shared_device_room
     nq, n, _ = C_q.shape
     n_log = int(n_rmu_logical)
-    rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
+    rcond = float(zeta_rcond)
     room = shared_device_room("isdf zeta charge factor")
     reserve = memory.contexts().at(int(mesh_xy.size)) if int(mesh_xy.size) > 1 else 0
     from distrib_la import room_or_exhausted
@@ -1703,8 +1634,7 @@ def _replicated_factor_q_chunk(nq: int, n_rmu: int) -> int:
 # fastloop mini-deck (nq=4, μ≈400 → ~2.6e8 ≈ 0.1 s) stays on the pure
 # replicated execution, while every production fit from the b300 deck up
 # folds.  A module CONSTANT on purpose — this is machine capability, not
-# physics policy, and the AV audit retired policy env twins;
-# LORRAX_ZETA_QPARALLEL (below) is the schedule escape hatch / test hook.
+# physics policy, and the AV audit retired policy env twins.
 _QPARALLEL_MIN_NQ_MU3 = 5.0e9
 
 
@@ -1712,13 +1642,9 @@ def _qparallel_factor_ok(nq: int, n_rmu_logical: int, mesh_xy: Mesh) -> bool:
     """True when the replicated charge factor should EXECUTE q-parallel; see docs/architecture/zeta_fit_face_psi_cct.md."""
     if int(mesh_xy.devices.size) <= 1:
         return False
-    raw = os.environ.get("LORRAX_ZETA_QPARALLEL", "auto")
-    raw = raw.strip().lower() if raw else "auto"
-    if raw in ("", "auto"):
-        return (int(nq) >= 2
-                and float(nq) * float(n_rmu_logical) ** 3
-                >= _QPARALLEL_MIN_NQ_MU3)
-    return env_bool("LORRAX_ZETA_QPARALLEL", False)
+    return (int(nq) >= 2
+            and float(nq) * float(n_rmu_logical) ** 3
+            >= _QPARALLEL_MIN_NQ_MU3)
 
 
 # =============================================================================
@@ -2113,8 +2039,7 @@ def _qparallel_announce_transverse(nq: int, n_rmu: int, n_log: int,
     log.debug(f"  [zeta transverse factor] hoisted per-q LU, q-parallel "
               f"execution: nq={nq} scattered over {ndev} devices "
               f"(ceil(nq/P)={blk} whole ({n_log},{n_log}) tile(s)/device); "
-              f"factors are bit-identical to the all-ranks execution "
-              f"(LORRAX_ZETA_QPARALLEL=0 restores it)",
+              f"factors are bit-identical to the all-ranks execution",
               extra=record("isdf.transverse_factor_plan", nq=int(nq), devices=ndev,
                            q_per_device=blk, n_log=int(n_log)))
     if ndev > int(nq):

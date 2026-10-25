@@ -721,7 +721,6 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
     if word[-1]:
         raise ValueError("nonfinite singular spectrum")
     count = _word_counts(word, agreed.ndim)
-    _check_device_counts(count, lambda: host_cut(read.host()))
     return _retained_columns(v, read, count, mesh=eigh_plan.mesh,
                              column_extent=column_extent, layout=layout,
                              device_counts=device_counts)
@@ -786,7 +785,7 @@ def leading_eigenvectors_above(perp, top, cutoff, *, real, eigh_plan, column_ext
     ``(Q, counts)``: ``Q`` the retained directions on ``perp``'s carrier, as
     ``retain_leading_eigenvectors(*leading_eigenvectors(perp, m), counts)``
     returns them, or ``None`` when every count is zero; ``counts`` a per-row tuple.
-    Identical decisions to the host sequence (``LORRAX_CHECK_COUNTS=1`` checks it).
+    Identical decisions to the host sequence.
     """
     layout = _direction_input(perp, eigh_plan, real_rows)
     if perp.ndim != 3 or top.ndim != 3 or perp.shape[0] != top.shape[0]:
@@ -836,15 +835,6 @@ def leading_eigenvectors_above(perp, top, cutoff, *, real, eigh_plan, column_ext
     counts = tuple(int(v) for v in word[:-3])
     full = tuple(m if real_rows is None or i < real_rows else 0 for i in range(b))
 
-    def host_counts():
-        # The host sequence this replaces: the threshold on the full spectra, then
-        # retain_leading_eigenvectors' closure.
-        top_rows, rows = top_read.host(), read.host()
-        widths = tuple(int(np.sum(rows[i] > float(cutoff) ** 2 * float(top_rows[i][0])))
-                       if i < real else 0 for i in range(b))
-        return _leading_counts(tuple(rows[i][:full[i]] for i in range(b)), widths,
-                               multiplet_tol=multiplet_tol, real_rows=real_rows, batched=True)
-    _check_device_counts(counts, host_counts)
     if max(counts) == 0:
         return None, counts
     # The two selects of the host sequence, on the same carriers: perp's full
@@ -943,27 +933,9 @@ def _leading_selection(W, s, q, r, *, eigh_plan, column_extent, layout, multiple
         _refuse_nonfinite_spectrum(W, read.host(), mesh=eigh_plan.mesh,
                                    what="leading eigenvalue spectra")
     count = _word_counts(word, agreed.ndim)
-    _check_device_counts(count, lambda: _leading_counts(
-        read.host(), r, multiplet_tol=multiplet_tol, real_rows=real_rows,
-        batched=agreed.ndim > 1, rcond=rcond))
     return _retained_columns(q, read, count, mesh=eigh_plan.mesh,
                              column_extent=column_extent, layout=layout,
                              device_counts=device_counts)
-
-
-def _check_device_counts(count, host_count):
-    """``LORRAX_CHECK_COUNTS=1``: refuse unless the device cut equals the host cut.
-
-    ``host_count()`` recomputes the cut on the host from the family's spectrum
-    (the read the device word otherwise avoids).
-    """
-    import os
-    if os.environ.get("LORRAX_CHECK_COUNTS", "0") in ("", "0"):
-        return
-    want = host_count()
-    if not np.array_equal(np.asarray(count, np.int64), np.asarray(want, np.int64)):
-        raise ValueError(f"GATE spectral_cut_agreement: device counts {np.asarray(count)} "
-                         f"!= host counts {np.asarray(want)}")
 
 
 def _as_extent(n) -> int:

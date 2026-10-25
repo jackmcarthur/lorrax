@@ -2946,11 +2946,11 @@ class SymMaps:
                 f"operations alone, and global time reversal is OFF for this "
                 f"WFN (the [2c-TRS] line gives QE's reason: a t_rev row, an "
                 f"SCF moment of 1e-4 muB/cell or more, or no QE schema or "
-                f"SCF found), so k <-> -k folding must not be used. Fix: for "
-                f"a nonmagnetic reference, co-stage the WFN-generating NSCF "
-                f"*.save and its SCF *.save beside WFN.h5 (its directory or "
-                f"the two above it); for a magnet, regenerate the k mesh "
-                f"without time-reversal reduction. Doc: "
+                f"SCF found), so k <-> -k folding must not be used. Fix: "
+                f"stage the WFN-generating NSCF's data-file-schema.xml (its "
+                f"<prefix>.save) and the SCF's <prefix>.save beside WFN.h5 "
+                f"(its directory or the two above it), so the k mesh unfolds "
+                f"with the operations QE reduced it by. Doc: "
                 f"docs/preprocessing.md#magnetic."
             )
 

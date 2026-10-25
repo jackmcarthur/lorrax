@@ -68,7 +68,6 @@ package continues to provide its format probe without that closure.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Sequence
 
@@ -172,7 +171,7 @@ class ZetaLoader:
         h5 open mode for the collective handle (``'r'``).
 
     Raises ``ValueError`` at open when ``isdf_header/zeta_is_done`` is false
-    (``LORRAX_ALLOW_PARTIAL_ZETA=1`` overrides), when the ζ dataset holds
+    when the ζ dataset holds
     fewer μ rows than the header's ``n_rmu``, or when the header ``ngkmax``
     disagrees with the dataset's G axis.
 
@@ -242,17 +241,14 @@ class ZetaLoader:
         # RESOURCE_EXHAUSTED in Stage C) was indistinguishable from a
         # complete one and its undefined trailing q-blocks flowed straight
         # into V_q → W → Σ with rc=0.  Refuse at open instead.
-        _allow_partial = bool(int(
-            os.environ.get("LORRAX_ALLOW_PARTIAL_ZETA", "0") or "0"))
-        if mode == "r" and not bool(self.zeta_is_done) and not _allow_partial:
+        if mode == "r" and not bool(self.zeta_is_done):
             raise ValueError(
                 f"{self._path} has isdf_header/zeta_is_done=False: the ζ fit "
                 f"that wrote it did not finish, so its trailing q-blocks are "
                 f"undefined.  Reading it would produce a physically "
                 f"meaningless V_q / W / Σ without any error.  Delete the file "
                 f"and re-run the fit (restart=false), or point at a complete "
-                f"ζ.  Set LORRAX_ALLOW_PARTIAL_ZETA=1 to override for "
-                f"debugging.")
+                f"ζ.")
         # Header-vs-dataset agreement.  The two are written by different
         # calls (``write_isdf_header`` then the SlabIO append); a crash
         # between them, or a stale header surviving a rewrite, leaves a

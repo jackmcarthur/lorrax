@@ -22,8 +22,9 @@ polar_factor(A, mesh, ...) -> (L, s)
     Square distributed polar/SVD through a Hermitian dilation and one planned
     Hermitian eigensolve.  The planned form separates eager resolution from
     the trace-safe operation used in streamed k-point loops.
-``plan(op, mesh, *, backend='auto', n=None, batched_route='batch_reshard') -> Plan``
-    Resolve once, then call.  ``Plan(A)`` for one tile at ``P('x','y')``,
+``plan(op, mesh, *, backend='auto', n=None, batched_route=None, budget_bytes=None, price_only=False) -> Plan``
+    Resolve once, then call.  ``batched_route=None`` means ``'batch_reshard'``,
+    or ``'auto'`` when ``budget_bytes`` is given.  ``Plan(A)`` for one tile at ``P('x','y')``,
     ``Plan.batched(A_stack)`` for ``P(None,'x','y')``.  Eigenvalues come
     back replicated, eigenvectors as COLUMNS, on every backend.
 ``Plan.batched_route`` / ``BATCHED_ROUTES`` / ``BATCHED_SCAN_UNROLL``
@@ -59,8 +60,9 @@ layout='face', enable_active_range=False) -> GemmPlan``
     ``GemmPlan.prepare_active_range(lo, hi)`` returns a callable with the same
     operand, weighting and accumulation contract but no runtime bounds
     operands. The face layout runs :func:`panel_matmul`; the local panel
-    products, like the axis layout's, use cuBLAS pointer views on CUDA and
-    bounded JAX dot panels elsewhere.
+    products, like the axis layout's, use the device-bounds active-range
+    kernel on CUDA and ROCm and bounded JAX dot panels on cpu
+    (``ACTIVE_LOCAL_ROUTE``).
     See ``docs/services/distrib_la/api.md`` § Active ranges.
 ``hermitian_part(a)``, ``hermitian_block(block, off, corner)``, ``join_columns(a, b)``, ``diagonal_like(values, like)``, ``on_face(fn, out, *operands, **static)``
     Block glue for stacked ``[b, R, R]`` operators and ``[b, n, R]`` panels

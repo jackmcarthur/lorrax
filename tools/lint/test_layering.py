@@ -862,27 +862,8 @@ def test_the_env_scan_separates_reads_from_writes():
 # the value DOWN instead) — module scope is the import-time-crash class and
 # is banned outright.
 
-_L1_LIBRARY_ENV_READS = {
-    # Debug-only support-box trace.  Accuracy is a deck key; no numerical
-    # policy is read here.
-    "gw.sigma_box_plan": {
-        "LORRAX_UNIFORM_RULE_TRACE",
-    },
-    # resolve_extra_rank_pad — one resolver, refuse-on-garbage; the entry
-    # layer passes the resolved value down.  It moved with the fH library
-    # half (ARCH M7).
-    "bandstructure.fh_interp": {
-        "LORRAX_EXTRA_RANK_PAD",
-    },
-    # resolve_fi_fshoulder_tol — the f-shoulder gate's floor, one resolver,
-    # refuse-on-garbage, resolved once and passed down.  It is deliberately
-    # NOT a driver flag: the gate catches a returned band that is ABSENT from
-    # fH, which is not a
-    # tolerance question, and the only value that changes its verdict is a
-    # negative one, whose whole purpose is reproducing a known-bad run.
-    "bandstructure.bse_setup": {
-        "LORRAX_FI_FSHOULDER_TOL",
-    },
+#: Empty since the 2026-10 env prune: no L1 library reads the environment.
+_L1_LIBRARY_ENV_READS: dict = {
 }
 
 
@@ -1013,7 +994,7 @@ def test_the_l1_env_read_ratchet_rejects_a_new_unregistered_policy(sources):
         + "\ndef resolve_audit_negative_control():\n"
         + "    return os.environ.get('LORRAX_UNREGISTERED_POLICY', '')\n")
     live = {key for key, _line in scan_l1_env_reads(injected)}
-    assert live - _L1_LIBRARY_ENV_READS[mod] == {
+    assert live - _L1_LIBRARY_ENV_READS.get(mod, set()) == {
         "LORRAX_UNREGISTERED_POLICY"
     }, "the exact-set ratchet failed to detect a newly introduced policy read"
 

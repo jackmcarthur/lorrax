@@ -143,6 +143,8 @@ def test_response_wrapper_uses_prepared_operands(monkeypatch):
     from gw.minimax_screening import MinimaxNodes
     from lxkit import memory
     helpers = runpy.run_path(str(Path(__file__).with_name('test_minimax_response_rows_cpu.py')))
+    if jax.device_count() < 4:
+        pytest.skip("needs 4 devices")
     mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
     grid, plan, psi, e, v, c = helpers['fixture'](mesh, 2, True)
     np_, ns, mu, nb = psi.shape

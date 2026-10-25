@@ -1,0 +1,52 @@
+help([[
+LORRAX @REF8@ on NERSC Perlmutter: the node-local runtime image of install_deps.sh.
+Install prefix: @PREFIX@ (the image archive in images/, lorrax-run, lorrax-postinstall).
+
+Run: every srun command starts with lorrax-run, which restores the image on each
+node once (about 7 s) and runs the rank from node-local /tmp:
+  srun -N 1 -n 4 --gpus-per-node=4 lorrax-run python -u -m gw.gw_jax -i input.in
+
+This module sets what @PREFIX@/lorrax-env.sh sets (config/perlmutter/gpu_env.sh for
+an image runtime).  Recipe: config/perlmutter/module/install_image_module.sh and
+docs/installation/perlmutter.md, section 1.4.
+]])
+whatis("Name: LORRAX")
+whatis("Version: @REF8@ (runtime image)")
+family("lorrax")
+
+local prefix = "@PREFIX@"
+setenv("LORRAX_PREFIX", prefix)
+setenv("LORRAX_RUNTIME", "image")
+prepend_path("PATH", prefix .. "/bin")
+-- For lx, which reads these two from the base module: a site directory whose
+-- select_gpu.sh / in_container.sh enter the image through lorrax-run
+-- (install_image_module.sh), and the image tree's source on PYTHONPATH, which
+-- lx replaces with the checkout cwd is in.
+setenv("LORRAX_ROOT", "@STUB@")
+setenv("LORRAX_SHIFTER", "env PYTHONPATH=@TREE@/lorrax/src")
+
+-- gpu_env.sh, as it applies to an image runtime (it adds no cudart shim there).
+-- Slurm needs this before srun creates a step; existing numeric steps keep their
+-- launch choice, and pushenv restores the caller's value on unload.
+local numeric_step = (os.getenv("SLURM_STEP_ID") or ""):match("^%d+$")
+                  or (os.getenv("SLURM_STEPID") or ""):match("^%d+$")
+if not numeric_step and os.getenv("SLURM_NETWORK") ~= "" then
+    pushenv("SLURM_NETWORK", os.getenv("SLURM_NETWORK") or "no_vni")
+end
+-- Neither FFI leg links Cray's GTL; the site's craype-accel-nvidia80 exports 1,
+-- and MPI_Init then aborts.
+setenv("MPICH_GPU_SUPPORT_ENABLED", "0")
+-- The CUDA JIT cache beside the other LORRAX caches (lxkit.cache): never $HOME's
+-- default ~/.nv, and a value the caller set is kept.
+if (os.getenv("CUDA_CACHE_PATH") or "") == "" then
+    local root = os.getenv("LORRAX_CACHE_ROOT") or ""
+    if root == "" then
+        local scratch = os.getenv("SCRATCH") or ""
+        if scratch ~= "" then
+            root = scratch .. "/.cache/lorrax"
+        else
+            root = (os.getenv("XDG_CACHE_HOME") or (os.getenv("HOME") .. "/.cache")) .. "/lorrax"
+        end
+    end
+    setenv("CUDA_CACHE_PATH", root .. "/cuda_jit")
+end

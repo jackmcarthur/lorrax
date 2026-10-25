@@ -11,7 +11,7 @@ mode = export
 source_restart = ${restart_bundles[0]}
 parent_input_file = gw.in
 output_dir = ../1-epsilon
-epsmat_ecut = 9.0
+epsmat_ecut = 25.0
 q0_vector = 0.001 0 0
 EOF
 lorrax_run gw.epsmat_cli -i epsmat.in >> ../1-epsilon/epsilon.out 2>&1

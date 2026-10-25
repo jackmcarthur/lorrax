@@ -5244,8 +5244,7 @@ def run_self_consistency(
     resume = (_read_sc_checkpoint(state_init, inputs, history_depth, max_iter)
               if max_iter > 1 else None)
     _, eigvalsh_kshard = _kshard_eigh_kernels(inputs.mesh_xy)
-    # E-history dump dir from config.sc (LORRAX_SC_DUMP_DIR env is a
-    # deprecated override, applied at config construction).
+    # E-history dump dir from config.sc (input key sc_dump_dir).
     _dump_dir = inputs.config.sc.dump_dir
     if resume is None:
         _clear_sc_eqp_snapshots(inputs.input_dir, print_fn=print_fn)
