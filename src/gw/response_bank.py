@@ -3078,8 +3078,14 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
     budget less that room.  Every rank computes the same group.
     """
     from common.gpu_utils import device_budget_bytes
+    from runtime.aot_memory import agreed_chunk
     ledger = meta.tangential_capacity
-    device_room = ledger.room_bytes_per_rank(ledger.live_stages)
+    # These compiled prices can differ between ranks. Agree them before
+    # choosing the first group signature, not only after check_chunk has
+    # already built a size-dependent executable.
+    stream_workspace = -agreed_chunk(-int(stream_workspace))
+    selection = tuple(-agreed_chunk(-int(value)) for value in selection)
+    device_room = agreed_chunk(ledger.room_bytes_per_rank(ledger.live_stages))
     fixed = max(int(stream_workspace), int(selection[0]) + int(selection[1]))
     fits = lambda g: (ledger.preview(resident_bytes_per_rank=g*carry_per_sample+int(selection[0]),
         workspace_bytes_per_rank=max(stream_workspace, int(selection[1])),
@@ -3088,7 +3094,7 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
     size = 1   # at one sample the admission refuses with the actual compiled bytes
     while size < n_samples and fits(size+1):
         size += 1
-    return size, fixed, device_room, int(device_budget_bytes()) - device_room
+    return agreed_chunk(size), fixed, device_room, int(device_budget_bytes()) - device_room
 
 
 def response_bank_residence(meta, *, segments, n_samples, carry_per_sample, group_size, host_reserved=0):
