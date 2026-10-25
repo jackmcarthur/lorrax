@@ -82,12 +82,37 @@ def test_serial_body_or_metadata_failure_never_commits_on_second_close(tmp_path)
     io = SlabIO(path, mesh=mesh, mode='w')
     io.write_attr('partial', np.int32(2))
     io.stamp_dataset_attrs('missing', {'must_fail': True})
-    with pytest.raises(KeyError, match='missing'):
+    with pytest.raises(RuntimeError, match='GATE io_global_commit:.*missing'):
         io.close()
     io.close()
     assert read_commit_state(path) == 0
     with pytest.raises(ValueError, match='GATE io_global_commit'):
         SlabIO(path, mesh=mesh, mode='r')
+
+
+def test_metadata_materialization_failure_precedes_publication(tmp_path, monkeypatch):
+    from file_io import _slab_io_ffi as transport
+    path, mesh = str(tmp_path/'materialize.h5'), _mesh()
+    io = SlabIO(path, mesh=mesh, mode='w')
+    io.write_attr('must_not_land', np.int32(3))
+    io.stamp_dataset_attrs('missing', {'unmaterializable': object()})
+
+    def failed_materialization(_value):
+        raise TypeError('injected metadata materialization failure')
+
+    with monkeypatch.context() as guard:
+        guard.setattr(transport, '_host_attr_value', failed_materialization)
+        with pytest.raises(RuntimeError, match='metadata materialization failure'):
+            io.close()
+    io.close()
+    assert io._backend._owner_token is None
+    assert read_commit_state(path) == 0
+    with h5py.File(path, 'r') as h5:
+        assert 'must_not_land' not in h5
+    # Failed publication does not leave a live owner or poison another file.
+    with SlabIO(str(tmp_path/'independent.h5'), mesh=mesh, mode='w'):
+        pass
+    assert read_commit_state(tmp_path/'independent.h5') == 1
 
 
 def test_serial_data_close_failure_leaves_receipt_incomplete(tmp_path):

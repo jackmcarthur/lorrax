@@ -2290,6 +2290,43 @@ def _apply_dataset_attrs(h5, pending) -> None:
             ds.attrs[key] = _host_attr_value(value)
 
 
+def _publish_metadata(path, attrs, ds_attrs) -> None:
+    """Publish deferred small metadata and the receipt after data close.
+
+    Both transports call this only after closing and releasing their data
+    handle successfully. Device metadata is materialized on every rank
+    before rank 0 reopens the file; the completion receipt is written last.
+    """
+    from common.collectives import rank0_transaction
+    from .commit_state import open_h5_settled, set_commit_state
+    from .hdf5_owner import STACK_H5PY, open_scope
+
+    deferred_hosts, dataset_attr_hosts = [], []
+
+    def materialize():
+        deferred_hosts.extend((name, np.asarray(jax.device_get(value)))
+                              for name, value in attrs)
+        dataset_attr_hosts.extend((name, {
+            key: _host_attr_value(value) for key, value in values.items()})
+            for name, values in ds_attrs)
+
+    def publish():
+        with open_scope(path, STACK_H5PY, "a", where="SlabIO metadata publication"), \
+                _journal.op_scope("attr_w", path, stack=_J_H5PY,
+                                  mode="a", cnt=(len(attrs), len(ds_attrs))), \
+                open_h5_settled(path, "a") as h5:
+            for name, host in deferred_hosts:
+                if name in h5:
+                    del h5[name]
+                h5.create_dataset(name, data=host)
+            _apply_dataset_attrs(h5, dataset_attr_hosts)
+            h5.flush()
+            set_commit_state(h5, True)
+
+    rank0_transaction(path, stage="SlabIO.metadata_commit",
+                      validate=materialize, write=publish)
+
+
 # ---------------------------------------------------------------------------
 # Backend
 # ---------------------------------------------------------------------------
@@ -3590,12 +3627,11 @@ class _FfiBackend(_DatasetGeometry):
         # still held across it would make this method refuse itself, and
         # correctly so.  Unconditional (not inside ``if self.fh``) so a
         # double close or a handle that never opened still releases.
-        from .hdf5_owner import STACK_H5PY, note_close, open_scope
+        from .hdf5_owner import note_close
         if getattr(self, "_owner_token", None) is not None:
             note_close(self.path, self._owner_token)
             self._owner_token = None
-        from common.collectives import agree_io_error, rank0_transaction
-        from .commit_state import open_h5_settled, set_commit_state
+        from common.collectives import agree_io_error
 
         # Phase 1: no process may materialize metadata or publish anything
         # until every process has completed data teardown successfully.
@@ -3612,34 +3648,5 @@ class _FfiBackend(_DatasetGeometry):
         # make ranks take different collective sequences.
         if self.mode == "r":
             return native_timing
-        deferred_hosts = []
-        dataset_attr_hosts = []
-
-        def _materialize():
-            for name, value in attrs:
-                deferred_hosts.append((name, np.asarray(jax.device_get(value))))
-            for name, values in ds_attrs:
-                dataset_attr_hosts.append((name, {
-                    key: _host_attr_value(value) for key, value in values.items()}))
-
-        def _publish():
-            if self.mode == "r" and not (attrs or ds_attrs):
-                return
-            import h5py
-            with open_scope(self.path, STACK_H5PY, "a",
-                            where="_FfiBackend.close deferred-attr reopen"), \
-                    _journal.op_scope("attr_w", self.path, stack=_J_H5PY,
-                                      mode="a", cnt=(len(attrs), len(ds_attrs))), \
-                    open_h5_settled(self.path, "a") as h5:
-                for name, host in deferred_hosts:
-                    if name in h5:
-                        del h5[name]
-                    h5.create_dataset(name, data=host)
-                _apply_dataset_attrs(h5, dataset_attr_hosts)
-                # Phase 2: all metadata precedes the durable completion bit.
-                h5.flush()
-                set_commit_state(h5, True)
-
-        rank0_transaction(self.path, stage="SlabIO.metadata_commit",
-                          validate=_materialize, write=_publish)
+        _publish_metadata(self.path, attrs, ds_attrs)
         return native_timing

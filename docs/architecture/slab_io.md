@@ -278,7 +278,8 @@ open instead of closing it and reopening in `"a"`.
    `GATE io_global_commit: path=…; stage=…; failing rank=R; …`, naming the
    lowest failing rank, and nothing is published.
 5. `"r"` handles return here.
-6. `rank0_transaction(stage="SlabIO.metadata_commit")`. Every rank pulls the
+6. The shared `_slab_io_ffi._publish_metadata` owner calls
+   `rank0_transaction(stage="SlabIO.metadata_commit")`. Every rank pulls the
    deferred values to host. Rank 0 then reopens the file with h5py `"a"`,
    writes the `write_attr` datasets and the dataset attributes, flushes, and
    sets the receipt to 1 last. Its verdict is agreed across ranks.
