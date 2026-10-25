@@ -642,15 +642,9 @@ def main(argv=None):
 
         _wfn_path = (params["wfn_file"] if os.path.isabs(params["wfn_file"])
                      else os.path.join(input_dir, params["wfn_file"]))
-        _qp_rotations_path = None
-        if args.qp_rotations:
-            _qp_rotations_path = (
-                args.qp_rotations if os.path.isabs(args.qp_rotations)
-                else os.path.join(input_dir, args.qp_rotations))
-        _eqp_path = None
-        if args.eqp_file:
-            _eqp_path = (args.eqp_file if os.path.isabs(args.eqp_file)
-                         else os.path.join(input_dir, args.eqp_file))
+        _qp_rotations_path = (_output_path(args.qp_rotations)
+                              if args.qp_rotations else None)
+        _eqp_path = _output_path(args.eqp_file) if args.eqp_file else None
         from file_io.qp_wfn import refuse_conflicting_qp_state_sources
         refuse_conflicting_qp_state_sources(
             wfn_path=_wfn_path, eqp_file=_eqp_path,
@@ -745,9 +739,7 @@ def main(argv=None):
             raise RuntimeError(
                 "htransform initialize_wfns did not return exactly one Galerkin "
                 f"rank record; got {len(_rank_records)}.")
-        _centroid_path = params.get("centroids_file", "centroids_frac.txt")
-        _centroid_path = (_centroid_path if os.path.isabs(_centroid_path) else
-                          os.path.join(input_dir, _centroid_path))
+        _centroid_path = _output_path(params.get("centroids_file", "centroids_frac.txt"))
         report.setup_rows(centroid_file=_centroid_path,
                           centroids=_centroid_records[0], n_rmu=int(meta.n_rmu),
                           rank_record=_rank_records[0])
@@ -871,9 +863,6 @@ def main(argv=None):
         from common.collectives import barrier
         barrier("htransform.outputs_written")
         wfn.close()
-        _wfn_path = params["wfn_file"]
-        _wfn_path = (_wfn_path if os.path.isabs(_wfn_path) else
-                     os.path.join(input_dir, _wfn_path))
         _file_rows = [
             ("input deck", "read", args.input),
             ("DFT wavefunctions", "read", _wfn_path),
@@ -882,8 +871,6 @@ def main(argv=None):
              os.path.join(input_dir, GALERKIN_BASIS_FILE)),
         ]
         if args.eqp_file:
-            _eqp_path = (args.eqp_file if os.path.isabs(args.eqp_file) else
-                         os.path.join(input_dir, args.eqp_file))
             _file_rows.append(("QP energies", "read", _eqp_path))
         _file_rows.append(("interpolated bands", "written", output_path))
         run.complete(files=_file_rows + _moment_files)
