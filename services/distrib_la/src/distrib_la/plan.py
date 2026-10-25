@@ -778,7 +778,8 @@ _AGREE_GEN: dict = {}
 
 def _exchange(tag: str, payload: dict) -> list:
     """Every process's ``payload`` (JSON), in process order, through the coordination service's
-    key-value store: a host exchange, no device work and no device sync.  One process: itself."""
+    key-value store: a host exchange, no device work and no device sync. Each process reads
+    the completed rank directory once, not P individual keys. One process: itself."""
     import json
     if jax.process_count() == 1:
         return [payload]
@@ -788,10 +789,16 @@ def _exchange(tag: str, payload: dict) -> list:
     gen = _AGREE_GEN[tag] = _AGREE_GEN.get(tag, -1) + 1
     base = f"distrib_la/measured/{tag}/{gen}"
     me = int(jax.process_index())
-    client.key_value_set(f"{base}/{me}", json.dumps(payload))
-    return [json.loads(_wait_for_bootstrap(client, f"{base}/{r}", me,
-                                           "every rank's measured route costs"))
-            for r in range(jax.process_count())]
+    count = int(jax.process_count())
+    client.key_value_set_bytes(f"{base}/rank/{me}", json.dumps(payload).encode())
+    if client.key_value_increment(f"{base}/arrived", 1) == count:
+        client.key_value_set_bytes(f"{base}/complete", b"1")
+    _wait_for_bootstrap(client, f"{base}/complete", me, "every rank's measured route costs")
+    rows = {int(key.rsplit('/',1)[-1]): value
+            for key, value in client.key_value_dir_get_bytes(f"{base}/rank")}
+    if set(rows) != set(range(count)):
+        raise RuntimeError('distrib_la measured route costs: completed directory has missing ranks')
+    return [json.loads(rows[r]) for r in range(count)]
 
 
 def _agreed(values: list, need_library: bool = True):
