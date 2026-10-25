@@ -34,21 +34,27 @@ and how to add a target: ``AGENTS.md``.
 FFI_DIAL_ENV = (
     "LORRAX_BANDS_GEMM_FFI",
 )
-# The k-convolution router has no dial: it chooses its backend from the
-# mesh's device vendor only, so it adds nothing here.
+# The k-convolution router has no environment dial. Its explicit reference
+# context and startup demotions still change what a factory builds.
 
 
 def ffi_dial_key() -> tuple:
-    """The one cache-key component capturing every factory-time FFI dial.
+    """The one cache-key component capturing factory-time FFI choices.
 
     ``contract_bands`` reads its backend dial at factory time, so a kernel
     cache that omits it serves a stale backend after a mid-process flip.
+    FFT factories also retain their explicit reference context and startup
+    demotions. ROCm's native k-box and reference routes both have the public
+    backend tag ``'xla'``, so that tag alone cannot distinguish their programs.
     Consumers fold the returned tuple into their cache keys
     (``gw.ppm_tau_kernel``, ``gw.cohsex_sigma``, ``gw.w_isdf``).  Tier-1
     lexical: no JAX backend init.
     """
     from ffi.gemm import gemm_ffi_enabled as bands_gemm_ffi_enabled
-    return (("bands_gemm_ffi", bands_gemm_ffi_enabled()),)
+    from ffi import fft
+    return (("bands_gemm_ffi", bands_gemm_ffi_enabled()),
+            ("kconv_context", (bool(fft._XLA_REFERENCE),
+                               bool(fft._MATHDX_DOWN), bool(fft._KDFT_DOWN))))
 
 
 __all__ = ["FFI_DIAL_ENV", "ffi_dial_key"]

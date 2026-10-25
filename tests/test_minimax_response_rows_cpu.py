@@ -141,19 +141,20 @@ def test_rows_full_and_independent_reference(monkeypatch, side, ns, anti, n_out)
                         assert len(kernel.row_plan.windows) == 1
 
 
-def test_charge_factory_dials_do_not_reuse_another_backend(monkeypatch):
+@pytest.mark.parametrize('platform', ['cpu', 'ROCM'])
+def test_charge_factory_dials_do_not_reuse_another_backend(monkeypatch, platform):
     """A reference/native context change must rebind the shared FFT factory."""
     from common import fft_helpers
     from ffi import fft as F
+    from ffi import gate
     from gw import w_isdf as W
+    monkeypatch.setattr(gate, 'mesh_ffi_platform', lambda mesh: platform)
+    monkeypatch.setattr(F, '_MATHDX_DOWN', [])
+    monkeypatch.setattr(F, '_KDFT_DOWN', [])
     mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
     grid, plan, *_ = fixture(mesh, 1, False)
-    made = []
-
     def factory(*args, **kwargs):
-        result = object()
-        made.append(result)
-        return result
+        return object()
 
     monkeypatch.setattr(fft_helpers, 'make_kconv_chi_unfold', factory)
     for owner in (lambda: W._charge_stream_kconv(mesh, grid, plan),
@@ -165,5 +166,17 @@ def test_charge_factory_dials_do_not_reuse_another_backend(monkeypatch):
             assert owner()[0] is reference
         assert native is not reference
         assert owner()[0] is native
-    assert len(made) == 4
+        # A startup demotion changes the emitted program even when the
+        # vendor's broad backend tag stays unchanged. Failure text itself
+        # must not cause a new compilation for the same demoted route.
+        for flag in (F._MATHDX_DOWN, F._KDFT_DOWN):
+            W._CHARGE_KCONV.clear()
+            normal = owner()[0]
+            flag.append('startup provider probe failed')
+            demoted = owner()[0]
+            assert demoted is not normal
+            flag[0] = 'another diagnostic for the same demotion'
+            assert owner()[0] is demoted
+            flag.clear()
+            assert owner()[0] is normal
     W._CHARGE_KCONV.clear()
