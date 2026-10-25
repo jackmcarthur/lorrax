@@ -2486,8 +2486,8 @@ class _ZetaGTiles:
       per rank.
     * ``__getitem__`` — the LOCAL plan, unchanged in what it returns:
       ``ZetaLoader.read_zeta_G_local(key)`` is the same h5py hyperslab,
-      the same host numpy, the same bytes.  It is ALSO the only plan when
-      the SlabIO probe declines.
+      the same host numpy, the same bytes. Header-only loaders retain this
+      explicit diagnostic surface; their distributed reads refuse.
 
     The layout CONTRACT is read once, from the loader
     (``gvec_components``/``ngk``/``ngkmax``, the sentinel Miller pad,
@@ -2517,9 +2517,8 @@ class _ZetaGTiles:
     is a diagnostics rewrite, not a transport change.
     """
 
-    def __init__(self, loader: ZetaLoader, *, path: str, distributed: bool, mu_carrier=None):
+    def __init__(self, loader: ZetaLoader, *, path: str, mu_carrier=None):
         self._loader = loader
-        self._distributed = bool(distributed)
         self._mu_disk = int(loader.n_rmu_disk)
         # ``mu_carrier``: the μ axis zero-padded to the payload's centroid carrier.
         self._mu = self._mu_disk if mu_carrier is None else int(mu_carrier)
@@ -2564,15 +2563,11 @@ class _ZetaGTiles:
     def read_q_slab(self, q_offset: int, q_count: int, *, sharding):
         """``(q_count, n_mu, ngkmax)`` on ``sharding``.
 
-        Distributed: ``ZetaLoader.load`` → ``SlabIO.read_slab`` with a
-        per-rank hyperslab.  Local: the h5py chunk placed with
-        ``device_put_process_local`` — bit-identical, since both plans
-        return the same on-disk elements and neither reduces.
+        ``ZetaLoader.load`` → ``SlabIO.read_slab`` with a per-rank
+        hyperslab. Header-only/local readers serve explicit diagnostics
+        through ``__getitem__``; they cannot supply production slabs.
         """
         q_offset, q_count = int(q_offset), int(q_count)
-        if not self._distributed:
-            return device_put_process_local(
-                self[q_offset:q_offset + q_count], sharding)
         # SlabIO zero-fills the requested carrier outside the disk extent.
         # Keep the consumer's ownership at the read, including a one-q tail:
         # reading the odd disk extent first cannot shard its centroid axis.
@@ -2593,25 +2588,6 @@ class _ZetaGTiles:
         no-op and the ownership statement stays true from either end.
         """
         self._loader.close()
-
-
-def _zeta_mesh_for_loader(mesh, log_fn=print):
-    """``(mesh_or_None, distributed)`` — the ζ transport decision, once.
-
-    ``ZetaLoader``'s data path is SlabIO, which REFUSES at open on a
-    stack whose phdf5 FFI is absent. A supplied production mesh therefore
-    refuses an unavailable transport instead of constructing a whole-q host
-    replica. With no mesh, explicit bounded host diagnostics keep their local
-    reader; they do not select the production interpolation transport.
-    """
-    if mesh is None:
-        return None, False
-    from file_io.slab_io import probe_availability
-    ok, stage, reason = probe_availability()
-    if not ok:
-        raise ValueError(f"VQ sharded payload requires SlabIO at stage '{stage}' "
-                         f"({reason}); a whole-q host replica is not a production transport")
-    return mesh, True
 
 
 def open_zeta(path, **kwargs):
@@ -4113,10 +4089,8 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     parent-face and q-star readers. The returned cache owns one zeta handle,
     released by the consuming VQ cache's close operation.
 
-    ``mesh`` selects the ζ TRANSPORT (see :func:`_zeta_mesh_for_loader`):
-    with a mesh, ``prepare_coarse`` reads per-rank SlabIO hyperslabs and
-    refuses an unavailable sharded transport. Without a mesh, only explicit
-    bounded host diagnostics use the local reader.
+    The canonical ``ZetaLoader`` owns transport: a mesh opens SlabIO or
+    refuses; without a mesh, only explicit local diagnostics are available.
     """
     from bse.vq_interp import (
         assert_slab_scope,
@@ -4127,11 +4101,9 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     # pad centroids are inert (zero ψ and ζ rows).
     zx.update(read_coarse_interactions(restart_file, input_file, mesh,
                                        include_interactions=include_interactions))
-    _mesh_for_loader, _distributed = _zeta_mesh_for_loader(mesh, log_fn=log_fn)
-    zl = open_zeta(zeta_file, mesh=_mesh_for_loader)
+    zl = open_zeta(zeta_file, mesh=mesh)
     zx["_zeta_loader"] = zl
-    zx["zeta_distributed"] = _distributed
-    zx["ZG"] = _ZetaGTiles(zl, path=zeta_file, distributed=_distributed,
+    zx["ZG"] = _ZetaGTiles(zl, path=zeta_file,
                            mu_carrier=int(zx["psi"].shape[-1]))
     # ``ngk_per_q`` is ``isdf_header/ngk`` (the per-q ζ SPHERE size).
     # ``zl.ngk`` is a DIFFERENT array — ``mf_header/kpoints/ngk``, the

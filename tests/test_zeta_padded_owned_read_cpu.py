@@ -83,7 +83,7 @@ def check_zeta_padded_reads(mesh, path):
         with ZetaLoader(path, mesh=mesh) as loader:
             logical, ng = int(loader.n_rmu), int(loader.n_G_sph_disk)
             carrier = -(-logical//world)*world
-            tiles = _ZetaGTiles(loader, path=str(path), distributed=True, mu_carrier=carrier)
+            tiles = _ZetaGTiles(loader, path=str(path), mu_carrier=carrier)
             cases = ((world, 1, P(None, ('x', 'y'), None)),
                      (1, min(3, world), P(None, ('x', 'y'), None)),
                      (world, 1, P(None, 'x', 'y')),
@@ -138,3 +138,20 @@ def test_real_zeta_reader_p64_owned_padding(tmp_path):
     run = subprocess.run([sys.executable, '-c', command, str(tmp_path/'zeta64.h5')],
                          env=env, capture_output=True, text=True, timeout=90)
     assert run.returncode == 0, run.stdout+run.stderr
+
+
+def test_header_only_zeta_cannot_enter_the_distributed_slab_path(tmp_path):
+    from zeta_loader import ZetaLoader
+    from file_io.restart_bundle import _ZetaGTiles
+    path = tmp_path/'header_only.h5'
+    write_zeta_fixture(path, 4)
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ('x', 'y'))
+    with ZetaLoader(path) as loader:
+        tiles = _ZetaGTiles(loader, path=str(path), mu_carrier=16)
+        with patch.object(loader, 'read_zeta_G_local', side_effect=AssertionError('whole slab host read')):
+            with pytest.raises(RuntimeError, match='HEADER-ONLY'):
+                tiles.read_q_slab(0, 1, sharding=NamedSharding(mesh, P(None, None, None)))
+        # Explicit local diagnostics retain the existing tiny read contract.
+        got = tiles[0]
+        assert got.shape == (16, loader.n_G_sph_disk)
+        assert np.isfinite(got).all() and not np.any(got[13:])
