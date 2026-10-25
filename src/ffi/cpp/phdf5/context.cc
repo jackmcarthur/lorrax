@@ -1065,8 +1065,19 @@ hid_t ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
             throw std::runtime_error(
                 "phdf5 ensure_dataset: H5Screate_simple failed for '" + ds_name + "'");
         }
+        // Nested dataset paths have the same contract as the serial
+        // h5py transport: create their parents inside this collective
+        // transaction, rather than opening another HDF5 writer beforehand.
+        hid_t lcpl = H5Pcreate(H5P_LINK_CREATE);
+        if (lcpl < 0 || H5Pset_create_intermediate_group(lcpl, 1) < 0) {
+            if (lcpl >= 0) H5Pclose(lcpl);
+            H5Sclose(filespace);
+            throw std::runtime_error(
+                "phdf5 ensure_dataset: parent-group property creation failed for '" + ds_name + "'");
+        }
         dset = H5Dcreate(ctx->file_id, ds_name.c_str(), native,
-                         filespace, H5P_DEFAULT, ctx->dcpl_id, H5P_DEFAULT);
+                         filespace, lcpl, ctx->dcpl_id, H5P_DEFAULT);
+        H5Pclose(lcpl);
         H5Sclose(filespace);
         if (dset < 0) {
             throw std::runtime_error(

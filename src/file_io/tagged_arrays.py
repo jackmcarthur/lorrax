@@ -1253,31 +1253,22 @@ def write_lr_channels_to_h5(filename, *, Ft, P, gvec, v, q_frac, n_z, sys_dim,
     if any(arrays[key].shape != shape for key, shape in shapes.items()):
         raise ValueError('LR channel metadata disagrees with its form-factor rows')
 
-    def _write():
-        with h5py.File(filename, "a") as f:
-            set_commit_state(f, False)
-            if LR_CHANNELS_GROUP in f:
-                del f[LR_CHANNELS_GROUP]
-            g = f.create_group(LR_CHANNELS_GROUP)
-            for k, a in arrays.items():
-                g.create_dataset(k, data=a)
-            g.attrs["n_z"] = int(n_z)
-            g.attrs["sys_dim"] = int(sys_dim)
-            g.attrs["head_kernel"] = str(head_kernel)
-            g.attrs["convention"] = (
-                "F_a(mu) = zeta_q(mu, G_a)/sqrt(Omega); W0 = J + Ft^H "
-                "[diag(1/v) - P]^-1 Ft (gw.lr_channels)")
-    rank0_transaction(filename, stage="restart.lr_channels.metadata", write=_write)
     from .slab_io import SlabIO
     name = f"{LR_CHANNELS_GROUP}/Ft"
+    # SlabIO owns invalidation, data close and the final commit publication.
+    # All small metadata joins its deferred reopen; no other HDF5 writer
+    # touches this path before or while the collective handle is live.
     with SlabIO(filename, mode='a', mesh=mesh) as io:
         io.create_dataset(name, shape=tuple(Ft.shape[:-1])+(int(n_rmu_logical),),
                           dtype=Ft.dtype)
         io.write_slab(name, Ft)
-    def commit():
-        with h5py.File(filename, 'a') as f:
-            set_commit_state(f, True)
-    rank0_transaction(filename, stage="restart.lr_channels.commit", write=commit)
+        for key, value in arrays.items():
+            io.write_attr(f"{LR_CHANNELS_GROUP}/{key}", value)
+        io.stamp_dataset_attrs(LR_CHANNELS_GROUP, {
+            'n_z': int(n_z), 'sys_dim': int(sys_dim),
+            'head_kernel': str(head_kernel),
+            'convention': "F_a(mu) = zeta_q(mu, G_a)/sqrt(Omega); W0 = J + Ft^H "
+                          "[diag(1/v) - P]^-1 Ft (gw.lr_channels)"})
 
 
 def write_head_wings_to_h5(

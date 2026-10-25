@@ -1,5 +1,6 @@
 """Static LR producer and restart use distributed rows, exact Schur equations."""
 from types import SimpleNamespace
+from pathlib import Path
 import runtime
 from runtime.source_closure import ensure_source_closure
 ensure_source_closure()
@@ -93,6 +94,18 @@ def test_device_producer_matches_literal_schur_and_sharded_writer(tmp_path,monke
     np.testing.assert_allclose(captured['P'],expectedP,rtol=3e-14,atol=3e-14)
     assert captured['n_rmu_logical']==logical
     path=tmp_path/'restart.h5'
+    # CPU emulation lacks the native append preflight. Apply that actual
+    # contract before the real emulated transport: the previous writer's
+    # manual invalidation must be rejected before it can reopen SlabIO.
+    from file_io import slab_io
+    from file_io.commit_state import assert_committed
+    original_slab=slab_io.SlabIO
+    def committed_open(filename,*,mode,mesh):
+        if mode in ('a','r') and Path(filename).exists():
+            with h5py.File(filename,'r') as f:
+                assert_committed(f,path=filename)
+        return original_slab(filename,mode=mode,mesh=mesh)
+    monkeypatch.setattr(slab_io,'SlabIO',committed_open)
     write_lr_channels_to_h5(path,**captured)
     with h5py.File(path) as f:
         np.testing.assert_allclose(f['W0_lr/Ft'][()],expected,rtol=3e-14,atol=3e-14)
