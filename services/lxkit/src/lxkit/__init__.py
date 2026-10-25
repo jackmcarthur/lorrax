@@ -69,6 +69,7 @@ from lxkit.legs import (
     startup_gpu_leg,
 )
 from lxkit.cache import atomic_write_bytes, user_cache_dir, user_cache_root
+from lxkit.callbacks import host_debug_callback, host_io_callback, host_pure_callback
 from lxkit.placement import (device_put_process_local, device_put_process_local_cached,
                              device_put_process_tiles, placement_cache_stats)
 from lxkit.collectives import (install_reduction_guard, install_reduction_guard_from_env,
@@ -118,6 +119,7 @@ __all__ = [
     "device_put_process_tiles", "placement_cache_stats", "mark_varying", "varying_axes",
     "ordered_psum", "ordered_psum_scatter", "ordered_reduce", "ordered_sum", "ordered_norm",
     "ordered_transient_bytes", "install_reduction_guard",
+    "host_pure_callback", "host_io_callback", "host_debug_callback",
     "install_reduction_guard_from_env", "reduction_trace",
     # the platform legs of the native-provider ABI
     "legs", "memory", "LEGS", "PlatformLeg", "accelerator_leg_to_open_first",

@@ -36,7 +36,7 @@ import sys
 import traceback
 
 import jax
-from lxkit import ordered_norm, ordered_sum
+from lxkit import host_debug_callback, ordered_norm, ordered_sum
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -616,7 +616,7 @@ def raise_if_failed(status, op, n, dtype, site):
                       f"distrib_la.checked_program",
                       file=sys.stderr, flush=True)
             _HOST_CALLBACK_SITES.add(site)
-            jax.debug.callback(lambda failed, errors: _notices((failed, errors), op, int(n), dtype, site,
+            host_debug_callback(lambda failed, errors: _notices((failed, errors), op, int(n), dtype, site,
                                                                final=True), *status)
         return
     failed = _flag(status, n, dtype)          # every rank: the failure and notice bits, one read

@@ -27,10 +27,9 @@ import math
 from functools import partial
 
 import jax
-from lxkit import ordered_psum
+from lxkit import host_io_callback, ordered_psum
 import jax.numpy as jnp
 from jax import lax
-from jax.experimental import io_callback
 from jax.sharding import Mesh, PartitionSpec
 
 from jax import shard_map
@@ -119,7 +118,7 @@ def _group_progress_effect(
 
     return lax.cond(
         finished,
-        lambda values: io_callback(
+        lambda values: host_io_callback(
             _host_report, result_shape, values, ordered=True),
         lambda values: jnp.int32(0),
         payload,

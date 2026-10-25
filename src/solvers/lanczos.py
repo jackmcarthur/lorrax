@@ -40,6 +40,7 @@ import jax.numpy as jnp
 from jax import lax
 import numpy as np
 from distrib_la import eigh_local
+from lxkit import host_debug_callback
 
 from common.log import get_logger
 
@@ -370,7 +371,7 @@ def _emit_alpha_herm(name: str, alpha_im, alpha_re,
     if _ALPHA_SINK is not None:
         _ALPHA_SINK.append((name, form, dev, scale, worst))
         return
-    jax.debug.callback(
+    host_debug_callback(
         lambda d, s, w: _report_alpha_herm(name, form, d, s, w),
         dev, scale, worst)
 

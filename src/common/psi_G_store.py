@@ -36,7 +36,7 @@ from typing import NamedTuple
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.experimental import io_callback
+from lxkit import host_io_callback
 from common.collectives import to_transpose_partner
 from lxkit import ordered_psum_scatter
 from jax import shard_map
@@ -508,7 +508,7 @@ class PsiGStore:
         def _local(g_index_dev, kvecs_frac_dev, r_start, bc_idx):
             x_idx = jax.lax.axis_index('x')
             y_idx = jax.lax.axis_index('y')
-            psi_G_bc = io_callback(
+            psi_G_bc = host_io_callback(
                 _read_host, out_sds, x_idx, y_idx, bc_idx, ordered=False)
             return to_rchunk_inner(
                 psi_G_bc, g_index_dev, fft_grid,
@@ -751,7 +751,7 @@ class PsiGStore:
             in_specs=(P(None, None), P(None, None), P()),
             out_specs=band_sphere_spec(), check_vma=False)
         def _local(g_index, kvecs_frac, bc_idx):
-            psi_G = io_callback(
+            psi_G = host_io_callback(
                 _read_host, out_sds, jax.lax.axis_index('x'),
                 jax.lax.axis_index('y'), bc_idx, ordered=False)
 
