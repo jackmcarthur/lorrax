@@ -1846,16 +1846,16 @@ def unfold_isdf_one_leg(
     q_parent_sh = NamedSharding(mesh_xy, P(None, None))
     wraps_sh = NamedSharding(mesh_xy, P(None, 'x', None))
     R_sh = NamedSharding(mesh_xy, P(None, None))
-    # As in the operator transport, a first call may occur under an outer
-    # trace. Place only host geometry in this concrete scope; zeta remains
-    # a runtime operand and no traced single-device shard enters assembly.
-    with jax.ensure_compile_time_eval():
-        source_slot_dev = device_put_process_local_cached(source_slot, slot_sh)
-        tau_spatial_dev = device_put_process_local_cached(tau_spatial, tau_sh)
-        q_parent_dev = device_put_process_local_cached(q_parent, q_parent_sh)
-        wraps_dev = device_put_process_local_cached(wraps, wraps_sh)
-        if action == 'polar':
-            R_dev = device_put_process_local_cached(np.asarray(R_column), R_sh)
+    # Promote geometry in the caller's trace, then pass it as nested-kernel
+    # arguments. Never close an outer jit over a non-addressable global array,
+    # or assemble traced per-device shards in Python. The placement owner's
+    # tracer branch emits a device reshard; eager local inputs use its shards.
+    source_slot_dev = device_put_process_local(jnp.asarray(source_slot), slot_sh)
+    tau_spatial_dev = device_put_process_local(jnp.asarray(tau_spatial), tau_sh)
+    q_parent_dev = device_put_process_local(jnp.asarray(q_parent), q_parent_sh)
+    wraps_dev = device_put_process_local(jnp.asarray(wraps), wraps_sh)
+    if action == 'polar':
+        R_dev = device_put_process_local(jnp.asarray(R_column), R_sh)
     if action == "scalar":
         return fn(
             zeta_ibz, source_slot_dev, tau_spatial_dev,

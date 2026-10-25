@@ -59,10 +59,13 @@ def check_one_leg_owned_rows(monkeypatch, mesh, *, single=False, local=False):
     base[:,physical:]=0
     source_g=np.tile(np.array([[-1,0,1],[0,0,0],[0,0,0]])[None],(len(q),1,1))
     captures=[]
+    traced_metadata=[]
     def concrete_metadata(owner):
         def place(*a,**kw):
             value=owner(*a,**kw)
-            assert not isinstance(value,jax.core.Tracer), 'one-leg metadata placement entered an outer trace'
+            traced=isinstance(a[0],jax.core.Tracer)
+            traced_metadata.append(traced)
+            assert not isinstance(value,jax.core.Tracer) or traced, 'host metadata created traced Python shards'
             return value
         return place
     monkeypatch.setattr(maps,'device_put_process_local',concrete_metadata(maps.device_put_process_local))
@@ -127,6 +130,7 @@ def check_one_leg_owned_rows(monkeypatch, mesh, *, single=False, local=False):
                     np.testing.assert_allclose(actual,wanted,rtol=2e-13,atol=2e-13)
                     worst=max(worst,float(np.max(np.abs(actual-wanted))))
                     assert np.isfinite(actual).all()
+    assert any(traced_metadata), 'nested kernel geometry was closed over instead of passed as traced arguments'
     return dict(single_q=single,local_map=local,n_mu=nmu,n_mu_logical=physical,
                 largest_absolute_error=worst,hlo=captures)
 
