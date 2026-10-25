@@ -1027,31 +1027,41 @@ def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
     return v, c, V0, W, V_full
 
 
-def read_coarse_interactions(filename, input_file, mesh_xy, *, pad_mu=False):
-    """Return canonical coarse ψ host cache and sharded full-q V/W arrays.
+def read_coarse_interactions(filename, input_file, mesh_xy, *, include_interactions=True):
+    """Return canonical coarse ψ and optional full-q V/W on the mesh.
 
-    Only one k row is replicated for each host transfer. Interaction arrays
-    stay XY sharded and are never restored on a one-device shadow mesh.
-    ``pad_mu``: ψ on the mesh's centroid carrier (``padded_mu_extent``, exact
-    zero pad columns), the extent the V/W arrays already have, so every
-    (μ, ν) face its consumers build tiles the mesh; else the logical count.
+    ψ is ``(full_k, physical_band, spin, mu_carrier)`` at
+    ``P(None,None,None,('x','y'))``. The logical centroid count is explicit;
+    carrier columns are exact zeros. V/W retain ``P(None,'x','y')``.
+    ``include_interactions=False`` serves a pure refit, whose caller already
+    owns the stored exchange used by its certificate and does not consume W.
     """
     from common.collectives import resolve_mesh
     if mesh_xy is None:
         mesh_xy = resolve_mesh()
     m = read_metadata(filename)
-    full = read_wavefunctions(filename, input_file, mesh_xy)
-    width = m["centroid_count"]
-    carrier = int(padded_mu_extent(width, mesh_xy)) if pad_mu else int(width)
-    host = np.zeros(full.shape[:-1]+(carrier,), dtype=full.dtype)
-    replicate = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, P()))
-    for k in range(full.shape[0]):
-        host[k, ..., :width] = np.asarray(replicate(full[k, ..., :width]))
-    return {"psi": host, "kgrid": m["grid"], "enk": m["energies"],
-            "band_window": m["band_window"],
-            "Vqmunu": read_interaction(filename, "bare", mesh_xy),
-            "W0": (read_interaction(filename, "screened", mesh_xy)
-                   if m["screened_ready"] else None)}
+    nb = int(m["logical_band_count"])
+    full = read_wavefunctions(filename, input_file, mesh_xy, bands=np.arange(nb))
+    width = int(m["centroid_count"])
+    carrier = int(padded_mu_extent(width, mesh_xy))
+    out = NamedSharding(mesh_xy, P(None, None, None, ('x', 'y')))
+
+    @functools.partial(jax.jit, out_shardings=out)
+    def canonical(a):
+        # Keep every intermediate on a legal carrier, including odd logical
+        # widths: slicing to ``width`` before padding can force replication.
+        masked = jnp.where(jnp.arange(a.shape[-1]) < width, a, 0)
+        return jnp.pad(masked[..., :min(carrier, a.shape[-1])],
+            ((0, 0), (0, 0), (0, 0), (0, max(0, carrier-a.shape[-1]))))
+
+    payload = {"psi": canonical(full), "kgrid": m["grid"],
+               "enk": m["energies"][:, :nb], "band_window": m["band_window"],
+               "n_mu_logical": width}
+    if include_interactions:
+        payload["Vqmunu"] = read_interaction(filename, "bare", mesh_xy)
+        payload["W0"] = (read_interaction(filename, "screened", mesh_xy)
+                         if m["screened_ready"] else None)
+    return payload
 
 
 def read_downfold_geometry(filename: str) -> dict:
@@ -4083,7 +4093,8 @@ def _zeta_parent_qpoints(restart_file, nq, kgrid):
 def read_vq_payload(restart_file: str, zeta_file: str, *,
                      mesh: Mesh | None = None, log_fn=print, input_file=None,
                      require_slab: bool = True,
-                     require_full_bz_zeta: bool = True) -> dict:
+                     require_full_bz_zeta: bool = True,
+                     include_interactions: bool = True) -> dict:
     """Load the coarse-grid ζ/ψ/tile data into a plain-dict bundle ``zx``.
 
     q-LABELING (the two wrap traps, KNOWN_SANDBOX_ERRORS 2026-07-17):
@@ -4103,16 +4114,11 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     q-star table, not a prefix of the copied WFN k list. The same sphere/cutoff
     check applies after labeling; no ζ or interaction payload is read for it.
 
-    THE THREE BIG q-STACKS STAY ON DISK.  ``ZG`` (nq, n_μ, ngkmax),
-    ``Vqmunu`` and ``W0`` (nq, n_μ, n_μ) are read-only and every consumer
-    slices them on the q axis, so they are kept as LAZY handles and
-    pulled per q-chunk instead of being materialised per process.  At
-    the converged MoS2 reference (nq = 144, n_μ = 2412, ngkmax = 8603) ζ
-    alone is **47.8 GB**; four ranks per Perlmutter GPU node (251 GB) cannot
-    hold it, which is what confined the exciton driver to ``--vq-mode
-    ongrid``.  Lazy, the resident host cost is ψ (3.7 GB) plus one q-chunk.
-    Same principle as the ψ(G) host cache in the GW path: large read-only
-    caches are pulled per slice, never carried.
+    ψ stays on the fully sharded centroid carrier. ``ZG`` remains a lazy
+    sphere-tile transport; V/W are sharded full-q arrays for interpolation.
+    A pure-refit caller sets ``include_interactions=False``: it consumes
+    only ψ and ζ metadata here and already owns the stored certification V.
+    Full real-space coordinate grids are not part of this payload.
 
     The zeta service owns its metadata and bounded tile transport. Static
     interactions and family wavefunctions use this module's canonical
@@ -4132,7 +4138,8 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     # ψ, ζ and the centroid coordinates on the mesh's centroid carrier: a logical count
     # that does not tile the mesh left every (μ, ν) face of vq_interp replicated. The
     # pad centroids are inert (zero ψ and ζ rows).
-    zx.update(read_coarse_interactions(restart_file, input_file, mesh, pad_mu=True))
+    zx.update(read_coarse_interactions(restart_file, input_file, mesh,
+                                       include_interactions=include_interactions))
     _mesh_for_loader, _distributed = _zeta_mesh_for_loader(mesh, log_fn=log_fn)
     zl = open_zeta(zeta_file, mesh=_mesh_for_loader)
     zx["_zeta_loader"] = zl
@@ -4155,7 +4162,8 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     zx["bvec"] = np.asarray(zl.bvec) * blat
     zx["celvol"] = float(np.real(zl.cell_volume))
     rmu_idx = np.asarray(zl.r_mu_fft_idx).astype(int)
-    zx["n_mu_logical"] = int(rmu_idx.shape[0])
+    if int(rmu_idx.shape[0]) != int(zx["n_mu_logical"]):
+        raise ValueError("VQ restart and zeta metadata disagree on logical centroids")
     rmu_idx = np.pad(rmu_idx, ((0, int(zx["psi"].shape[-1]) - rmu_idx.shape[0]), (0, 0)))
     zx["zeta_cutoff"] = float(zl.zeta_cutoff_ry)
     ifmax = np.asarray(zl.ifmax)
@@ -4231,11 +4239,6 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     zx["k_int"] = np.rint(zx["qfr_raw"] * kg[None, :]).astype(int) % kg[None, :]
     zx["k_lookup"] = {tuple(v): i for i, v in enumerate(zx["k_int"])}
     assert len(zx["k_lookup"]) == zx["nq"], "duplicate k labels in rk list"
-    rx = np.arange(zx["nx"]) / zx["nx"]
-    ry = np.arange(zx["ny"]) / zx["ny"]
-    rz = np.arange(zx["nz"]) / zx["nz"]
-    RX, RY, RZ = np.meshgrid(rx, ry, rz, indexing="ij")
-    zx["rfrac"] = np.stack([RX.ravel(), RY.ravel(), RZ.ravel()], 1)
     dims = np.array([zx["nx"], zx["ny"], zx["nz"]])
     zx["rmu_frac"] = rmu_idx / dims[None, :]     # centroid frac coords s_μ
     zx["rmu_flat"] = ((rmu_idx[:, 0] * zx["ny"]) + rmu_idx[:, 1]) * zx["nz"] \
