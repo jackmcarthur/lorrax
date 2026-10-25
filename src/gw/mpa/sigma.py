@@ -1400,8 +1400,7 @@ class SynthesisTau:
         from gw.ppm_tau_kernel import sigma_pass_price
         plan = sigma_pass_price(self._spatial)
         if plan is not None:
-            # The priced pass (sigma_spin_block's x blocks, or the sub-tile
-            # kernel's row passes), from the window executable
+            # The priced row passes, from the window executable
             # (runtime.aot_memory): its new bytes beside the synthesis's resident
             # operands plus the synthesis GEMM's native workspace.
             from lxkit import memory

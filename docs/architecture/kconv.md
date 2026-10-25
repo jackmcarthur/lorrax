@@ -334,9 +334,9 @@ of the 45 within 1.02×.
 into that pair's $n_s^2$ bank columns before it forms $U g U^\dagger$ in place. An output spin
 block $d < n_s$ has only $d^2$ columns a pair, so the raw cells have no slot; holding the whole
 group and storing the block would transform $(n_s/d)^2$ times the columns (4× at $n_s = 2$,
-$d = 1$). No current caller asks for $d < n_s$: `gw.greens_function_kernel.sigma_spin_block`'s
-$d$ selects x blocks of the whole group (`_xblock`), so the chain serves older trees through the
-legacy `_block` target, and $n_s = 4$ where no tile-table tile fits two blocks per SM.
+$d = 1$). The bounded scalar Σ owner retains the whole spin group in each
+orbit-aligned row pass. The chain still serves $n_s = 4$ where no tile-table
+tile fits two blocks per SM; the legacy `_block` target serves older trees.
 
 **Early failure.** The startup probe compiles mode 3 only; each arm's image first compiles at
 its first call, and an NVRTC failure there is loud and sticky (no XLA demotion). Prebuilding the

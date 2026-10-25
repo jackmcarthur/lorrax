@@ -132,7 +132,7 @@ The Σ(ω) quadrature is reused whole ([Σ quadrature](../theory/sigma-quadratur
 `ppm_tau_kernel.get_shared_sigma_tau_kernel` takes a caller's `_sigma_kij`. The windows,
 the box rules (`sigma_box_plan.plan_sigma_windows`, :1539), `ppm_tau_kernel.build_shared_w_tau` (:333)
 and `DeviceOmegaAccumulator` (`ppm_accumulators.py:76`) are unchanged. Only the τ body's
-middle differs from the ISDF one (`get_sigma_spatial_kernel`):
+middle differs from the bounded ISDF row owner (`_sigma_subtile_kernel`):
 
     sigma_kij(...):
         G   = build_G_tau(ψ_mun, ψ_nmu, E_A, i·t, mask=mask_A, e_ref=E_ref_A)   # the G builder

@@ -19,7 +19,8 @@ jax.config.update('jax_enable_x64', True)
 
 @pytest.mark.parametrize('side,ns,ordered,layout', [
     (2, 1, False, 'axis'), (2, 2, True, 'face'),
-    (3, 1, True, 'face'), (3, 2, False, 'axis')])
+    (3, 1, True, 'face'), (3, 2, False, 'axis'),
+    (2, 4, True, 'face')])
 def test_untyped_full_q_matches_typed_rows_and_literal_sum(monkeypatch, side, ns, ordered, layout):
     """Same complete public Sigma, ragged carriers and several orbit windows."""
     from common.centroid_basis import PackedCentroidBasis
