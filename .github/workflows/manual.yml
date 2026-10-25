@@ -27,6 +27,22 @@ jobs:
           cache: pip
           cache-dependency-path: manual/requirements.txt
       - run: pip install -r manual/requirements.txt
+      - name: Check manual figure assets
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          image_types = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg', '.pdf'}
+          assets = Path('manual/docs/assets')
+          required = [assets / ('figures/tutorial-mos2-exciton-bands.' + ext)
+                      for ext in ('png', 'pdf')]
+          images = set(required) | {p for p in assets.rglob('*') if p.suffix.lower() in image_types}
+          invalid = [str(p) for p in images if not p.is_file() or not p.stat().st_size]
+          if invalid:
+              raise SystemExit('Missing or empty manual figures: ' + ', '.join(invalid))
+          tutorial = Path('manual/docs/tutorials/mos2-soc.md').read_text()
+          if any(p.name not in tutorial for p in required):
+              raise SystemExit('The MoS2 tutorial must retain its executed exciton figure links')
+          PY
       - run: mkdocs build --strict -f manual/mkdocs.yml -d "$GITHUB_WORKSPACE/_site"
       - uses: actions/upload-pages-artifact@v3
         with:
