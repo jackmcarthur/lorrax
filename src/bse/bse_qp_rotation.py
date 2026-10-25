@@ -338,8 +338,8 @@ def report_lines(qp):
     )
 
 
-def qp_window_dipoles(dipole_cart, delta_e, qp):
-    """Per-transition dipoles of the QP window, ``(3, nk, nc, nv)``.
+def qp_window_dipoles(dipole_cart, delta_e, qp, *, mesh_xy, output_shape):
+    """Per-transition dipoles and gaps on the padded QP c/v matrix face.
 
     The QP velocity is the interband-commutator one of
     ``gw.qsgw_head.interband_commutator_velocity``,
@@ -356,7 +356,7 @@ def qp_window_dipoles(dipole_cart, delta_e, qp):
 
     At ``U = I`` the second term is exactly zero and the first is the
     ``eqp_corrections`` dipole ``v_cv / ΔE_cv`` (``slice_dipole_to_bse_window``),
-    bit for bit.  Omitted: the explicit ``∂_k ΔH`` of the covariant
+    with the same energy denominator.  Omitted: the explicit ``∂_k ΔH`` of the covariant
     derivative ``D_k ΔH`` (the ``parallel_transport`` velocity), which enters
     only through the cross-gap mixing ``θ`` (``qp["diagnostics"]``) and is
     first order in it.  The pure DFT velocity ``U^H v^DFT U / ΔE'`` would also
@@ -366,25 +366,69 @@ def qp_window_dipoles(dipole_cart, delta_e, qp):
     Parameters
     ----------
     dipole_cart : (3, nk, nb_file, nb_file) complex — ``<mk|v|nk>`` of
-        ``load_dipole_h5`` (DFT basis, full BZ, the restart's gauge).
+        ``load_dipole_h5`` over the COMPLETE active square (DFT gauge).
     delta_e : (nk, nb_file, nb_file) float — ``E_m - E_n`` (Ry, DFT).
     qp : dict from :func:`load_qp_rotation`.
     """
+    from common.collectives import device_put_process_local
+    from common.gpu_utils import device_budget_bytes
+    from lxkit import memory
+    from runtime.aot_memory import compiled_price
+    from distrib_la import matmul_workspace_bytes_per_rank
+    device_budget_bytes()
     q0, q1 = (int(b) for b in qp["band_range"])
-    split = int(qp["n_occ"]) - q0
-    v = np.asarray(dipole_cart[:, :, q0:q1, q0:q1])
-    de = np.asarray(delta_e[:, q0:q1, q0:q1])
-    W = np.zeros_like(v)
-    W[:, :, split:, :split] = v[:, :, split:, :split] / de[None, :, split:, :split]
-    W[:, :, :split, split:] = v[:, :, :split, split:] / de[None, :, :split, split:]
-    same = v.copy()
-    same[:, :, split:, :split] = 0.0
-    same[:, :, :split, split:] = 0.0
-    uc_h = np.conj(np.swapaxes(np.asarray(qp["U_cond"]), -1, -2))[None]
-    uv = np.asarray(qp["U_val"])[None]
-    de_qp = (np.asarray(qp["eps_c"])[:, :, None]
-             - np.asarray(qp["eps_v"])[:, None, :])
-    return uc_h @ W @ uv + (uc_h @ same @ uv) / de_qp[None]
+    split, logical = int(qp["n_occ"]) - q0, q1 - q0
+    nc, nv = map(int, output_shape)
+    width = int(dipole_cart.shape[-1])
+    if dipole_cart.shape[-2] != width or width < logical:
+        raise ValueError("QP dipoles require the complete active band square")
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    u_val, u_cond = (device_put_process_local(np.pad(np.asarray(qp[name], dtype=np.complex128),
+        ((0, 0), (0, width - logical), (0, n - int(qp[name].shape[-1])))), face)
+        for name, n in (("U_val", nv), ("U_cond", nc)))
+    rep = NamedSharding(mesh_xy, P())
+    args = (dipole_cart, delta_e, u_cond, u_val,
+            device_put_process_local(qp["eps_c"], rep),
+            device_put_process_local(qp["eps_v"], rep))
+    program = _qp_dipole_program(mesh_xy, split, logical,
+                                 int(qp["n_cond"]), int(qp["n_val"]))
+    executable = program.lower(*args).compile()
+    batch = 3 * int(dipole_cart.shape[1])
+    shapes = (((batch, width, width), (batch, width, nv)),
+              ((batch, nc, width), (batch, width, nv)))
+    # Both terms of (3) contain these two GEMMs. Charge every queried
+    # native workspace, even if independent branches may execute together.
+    scratch = 2 * sum(matmul_workspace_bytes_per_rank(mesh_xy, pair, np.complex128,
+        backend="distributed", batched_route="auto") for pair in shapes)
+    quote = compiled_price(compiled=executable, ranks=int(mesh_xy.size), face=True,
+                           source="QP optical window", extra=scratch)
+    memory.admit("QP optical window", (("Eq. (3) GEMMs", quote),), memory.room(bucketed=False))
+    return executable(*args)
+
+
+@functools.lru_cache(maxsize=16)
+def _qp_dipole_program(mesh_xy, split, logical, nc, nv):
+    """Equation (3) through the shared all-rank matrix contraction owner."""
+    import distrib_la as dla
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    def product(a, b, transa="N"):
+        return dla.matmul(a, b, mesh=mesh_xy, transa=transa,
+                          backend="distributed", batched_route="auto")
+    def compute(v, de, uc, uv, ec, ev):
+        nk, width = int(v.shape[1]), int(v.shape[-1])
+        i, j = jnp.arange(width)[:, None], jnp.arange(width)[None, :]
+        physical = (i < logical) & (j < logical)
+        cross = physical & ((i < split) != (j < split))
+        w = jnp.where(cross[None, None], v / jnp.where(cross[None], de, 1.)[None], 0.)
+        same = jnp.where((physical & ~cross)[None, None], v, 0.)
+        repeat = lambda u: jnp.broadcast_to(u[None], (3, *u.shape)).reshape(3 * nk, *u.shape[1:])
+        uv, uc = repeat(uv), repeat(uc)
+        rotate = lambda a: product(uc, product(a.reshape(3 * nk, width, width), uv), "C").reshape(3, nk, uc.shape[-1], uv.shape[-1])
+        delta = jnp.pad(ec, ((0, 0), (0, uc.shape[-1] - nc)))[:, :, None] - jnp.pad(ev, ((0, 0), (0, uv.shape[-1] - nv)))[:, None, :]
+        live = (jnp.arange(uc.shape[-1])[:, None] < nc) & (jnp.arange(uv.shape[-1])[None, :] < nv)
+        delta = jnp.where(live[None], delta, jnp.inf)
+        return rotate(w) + rotate(same) / delta[None], delta
+    return jax.jit(compute, out_shardings=(NamedSharding(mesh_xy, P(None, None, "x", "y")), face))
 
 
 def load_qp_rotation(restart_file, input_file, qp_rotations_file, *, header,

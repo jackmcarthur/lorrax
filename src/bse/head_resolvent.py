@@ -275,13 +275,14 @@ def build_head_dipole(v_cvk, delta_cvk, *, n_cond_pad=None, n_val_pad=None):
 
     Reuses ``absorption_common.build_dipole_vector_bse`` for the pad-and-
     transpose so there is one spelling of the ``(3, nk, nc, nv) ->
-    (3, nc_pad, nv_pad, nk)`` reshape in the tree, not two.  Returns a numpy
-    array (host); :func:`build_head_rhs` puts it on device.
+    (3, nc_pad, nv_pad, nk)`` reshape in the tree, not two. Device operands
+    retain their pair sharding through the reshape and RHS construction.
     """
-    from .absorption_common import build_dipole_vector_bse
+    from .absorption_common import build_dipole_vector_bse, _is_jax_array
 
-    v = np.asarray(v_cvk, dtype=np.complex128)
-    dE = np.asarray(delta_cvk, dtype=np.float64)
+    xp = jnp if _is_jax_array(v_cvk) or _is_jax_array(delta_cvk) else np
+    v = xp.asarray(v_cvk, dtype=xp.complex128)
+    dE = xp.asarray(delta_cvk, dtype=xp.float64)
     if v.ndim != 4 or v.shape[0] != 3:
         raise ValueError(
             f"build_head_dipole: v_cvk must be (3, nk, nc, nv); got {v.shape}")
@@ -289,7 +290,7 @@ def build_head_dipole(v_cvk, delta_cvk, *, n_cond_pad=None, n_val_pad=None):
         raise ValueError(
             f"build_head_dipole: delta_cvk must be {v.shape[1:]} to match "
             f"v_cvk; got {dE.shape}")
-    if not np.all(dE > 0.0):
+    if not bool(gather_to_host(xp.all(dE > 0.0))):
         raise ValueError(
             "build_head_dipole: delta_cvk has a non-positive entry.  d = v/Delta "
             "diverges there and the head tensor would be meaningless; the "
@@ -303,14 +304,15 @@ def build_head_dipole(v_cvk, delta_cvk, *, n_cond_pad=None, n_val_pad=None):
 def payload_delta(data: dict) -> np.ndarray:
     """The operator's OWN transition energies ``eps_c - eps_v`` in the pair
     layout ``(c, v, k)`` — the diagonal ``Delta`` that ``H_bar`` actually
-    carries, on the host.
+    carries, on device pair faces.
 
     Used only to report :attr:`HeadTensorResult.delta_mismatch`; the ``Delta``
     that builds ``d`` stays the caller's (module docstring).
     """
-    eps_c = np.asarray(jax.device_get(data["eps_c"]))     # (k, c)
-    eps_v = np.asarray(jax.device_get(data["eps_v"]))     # (k, v)
-    return np.transpose(eps_c[:, :, None] - eps_v[:, None, :], (1, 2, 0))
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    mesh = data["eps_c"].sharding.mesh
+    return jax.jit(lambda ec, ev: (ec[:, :, None] - ev[:, None, :]).transpose(1, 2, 0),
+        out_shardings=NamedSharding(mesh, P("x", "y", None)))(data["eps_c"], data["eps_v"])
 
 
 def build_head_rhs(d_pair, sh, *, physical_branches=False):
@@ -335,11 +337,11 @@ def build_head_rhs(d_pair, sh, *, physical_branches=False):
     ``y``).  This engine has no stage 3 — three Cartesian columns stay
     replicated through the solve and are contracted to a 3x3 scalar.
     """
-    d = np.asarray(d_pair, dtype=np.complex128)
+    d = jnp.asarray(d_pair, dtype=jnp.complex128)
     if d.ndim != 4 or d.shape[0] != 3:
         raise ValueError(
             f"build_head_rhs: d_pair must be (3, c, v, k); got {d.shape}")
-    dev = device_put_process_local(np.ascontiguousarray(d), sh.X)
+    dev = device_put_process_local(d, sh.X)
     return jax.lax.with_sharding_constraint(
         jnp.stack([dev, jnp.conj(dev) if physical_branches else -dev],
                   axis=0).astype(jnp.complex128), sh.X_full)
@@ -460,10 +462,9 @@ def solve_head_tensor(op: HeadOperator, data: dict, d_pair, z_values, *,
     (``unroll=1``) is what keeps ONE Krylov workspace alive at a time.
     """
     sh = op.sh
-    d = np.asarray(d_pair, dtype=np.complex128)
     physical = bool(data.get("physical_branches", False))
     if rhs is None:
-        rhs = build_head_rhs(d, sh, physical_branches=physical)
+        rhs = build_head_rhs(d_pair, sh, physical_branches=physical)
 
     solver = _get_block_gmres_solver(op.matvec, sh, max_iter, tol, rhs.dtype,
                                      resid_relative_to, with_slope=bool(with_slope),
@@ -526,14 +527,15 @@ def head_delta_mismatch(delta_d, data: dict) -> float:
     O(QP-shift/gap) error in the head.
     """
     dH = payload_delta(data)                                  # (c, v, k)
-    dd = np.transpose(np.asarray(delta_d, dtype=np.float64), (1, 2, 0))
+    dd = jnp.asarray(delta_d, dtype=jnp.float64).transpose(1, 2, 0)
     if dd.shape != dH.shape:
         raise ValueError(
             f"head_delta_mismatch: delta_d transposes to {dd.shape}, the "
             f"payload's Delta is {dH.shape}; the dipole and the operator are "
             f"not on the same (c, v, k) window.")
-    scale = float(np.max(np.abs(dH))) or 1.0
-    return float(np.max(np.abs(dd - dH))) / scale
+    live = jnp.isfinite(dd)
+    scale = float(gather_to_host(jnp.max(jnp.where(live, jnp.abs(dH), 0.)))) or 1.0
+    return float(gather_to_host(jnp.max(jnp.where(live, jnp.abs(dd - dH), 0.)))) / scale
 
 
 # ---------------------------------------------------------------------------

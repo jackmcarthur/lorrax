@@ -10,6 +10,11 @@ Dipole matrix elements fix the $\bq \to 0$ head of $W$, the one element of the s
 
 The utility writes the Cartesian velocity matrix elements $\langle m\bk|\hat v_a|n\bk\rangle$ to `dipole.h5` for every full-BZ $\bk$, and by default the link matrices and Berry connection between neighbouring k points to `parallel_transport.h5`. GW reads `dipole.h5` for the head, the BSE for its optical dipoles, and the self-consistent QSGW head reads both.
 
+Optical consumers read their selected conduction–valence window directly onto
+the distributed band matrix. A QP-rotated BSE reads the full active square,
+since mixing occupied and empty states also needs same-class velocity entries.
+The file format and its band-coverage and WFN-basis checks are unchanged.
+
 <div class="glance" markdown>
 
 Invoke

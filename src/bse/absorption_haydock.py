@@ -195,8 +195,8 @@ def haydock_coefficients(data, mesh_xy, d_block_np, n_iter):
     sh = make_bse_shardings(mesh_xy)
     kgrid = (int(data["nkx"]), int(data["nky"]), int(data["nkz"]))
     W_R = ensure_W_R(data, mesh_xy)
-    d_np = np.ascontiguousarray(d_block_np, dtype=np.complex128)
-    d_seed = jax.make_array_from_callback(d_np.shape, sh.X, lambda idx: d_np[idx])
+    from common.collectives import device_put_process_local
+    d_seed = device_put_process_local(d_block_np, sh.X)
     alphas, betas, norms = haydock_program(
         mesh_xy, kgrid, int(n_iter), data.get("exchange_channel", "singlet"))(
         d_seed, data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],

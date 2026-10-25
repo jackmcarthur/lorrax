@@ -1223,39 +1223,85 @@ def read_downfold_inputs(filename, input_file, mesh_xy):
     return geom, state, tensors
 
 
-def load_dipole_h5(path: str | Path, *, wfn_path):
-    """Load dipole.h5 (psp.get_dipole_mtxels output).
+@functools.lru_cache(maxsize=16)
+def _dipole_delta_program(mesh_xy, nr, nc, from_energies):
+    """Selected E_row-E_col with inert carrier slots; no field is cached."""
+    def delta(a, b):
+        d = a[:, :, None] - b[:, None, :] if from_energies else a
+        live = ((jnp.arange(d.shape[1])[None, :, None] < nr)
+                & (jnp.arange(d.shape[2])[None, None, :] < nc))
+        return jnp.where(live, d, jnp.inf)
+    return jax.jit(delta, out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
 
-    ``wfn_path`` is the WFN whose ψ the caller contracts the dipole against;
-    a basis mismatch refuses (``file_io.dipole.require_dipole_basis``).
 
-    Returns
-    -------
-    dipole_cart : (3, nk, nb, nb) complex128 — ⟨mk|v̂_α|nk⟩ (Ry), the
-                  velocity i[H, r] (p alone for a ``--skip-vnl`` file).
-    deltaE      : (nk, nb, nb) float64       — E_b - E_b' (Ry), derived from
-                  ``band_energies`` (``file_io.dipole.delta_e``).
-    attrs       : dict with ``nbands, nk``.
+def load_dipole_h5(path: str | Path, *, wfn_path, mesh_xy,
+                   band_rows=None, band_cols=None, band_shape=None):
+    """Read a selected velocity window through the canonical SlabIO owner.
+
+    ``band_rows`` and ``band_cols`` are absolute half-open band ranges.  The
+    default is the complete stored axis; QP rotations request their complete
+    active square, whereas an optical source requests only its c/v rectangle.
+    ``band_shape`` may name the consumer's legal padded extents.  Both matrix
+    axes stay distributed, at ``P(None, None, 'x', 'y')``; returned energy
+    differences have ``P(None, 'x', 'y')``.  Padding contains zero velocity and
+    infinite Delta, so it contributes no transitions.  Attributes retain the
+    file's provenance and include the selected logical band ranges.
+
+    Basis, format and band-coverage admission precede every field read.
+    Energies are read as two selected vectors, never as a host band square.
     """
     if not Path(path).is_file():
         raise FileNotFoundError(
-            f"dipole file {path!s} not found.  This is a PRODUCED input, not a "
-            f"deck file that ships with the system: build it from the deck's "
-            f"WFN with\n"
-            f"    python3 -u -m psp.get_dipole_mtxels -i <deck>.in --skip-vnl "
-            f"--out {Path(path).name}\n"
-            f"``--skip-vnl`` writes the momentum operator only, which is the "
-            f"arm that matches BerkeleyGW's ``use_momentum``; drop it to get "
-            f"the full velocity including the nonlocal commutator.")
-    from .dipole import delta_e, require_dipole_basis, require_dipole_format
+            f"dipole file {path!s} not found; build it from the deck's WFN "
+            "with python -m psp.get_dipole_mtxels -i <deck>.in")
+    from .dipole import (BAND_ENERGIES_DATASET, LEGACY_DELTA_E_DATASET,
+                         require_dipole_bands, require_dipole_basis,
+                         require_dipole_format)
+    from .slab_io import SlabIO
     with h5py.File(str(path), "r") as f:
         attrs = dict(f.attrs)
         require_dipole_format(attrs, dipole_path=path)
-        require_dipole_basis(attrs, dipole_path=path, wfn_path=wfn_path)
-        dipole_cart = np.asarray(f["dipole_cart"][:], dtype=np.complex128)
-        deltaE = delta_e(f)
-        attrs["nbands"], attrs["nk"] = int(attrs["nbands"]), int(attrs["nk"])
-    return dipole_cart, deltaE, attrs
+        if wfn_path is not None:
+            require_dipole_basis(attrs, dipole_path=path, wfn_path=wfn_path)
+        shape = tuple(f["dipole_cart"].shape)
+        if len(shape) != 4 or shape[0] != 3 or shape[2] != shape[3]:
+            raise ValueError(f"{path}: dipole_cart must be (3, nk, nb, nb), got {shape}")
+        _, nk, nb, _ = shape
+        rows = (0, nb) if band_rows is None else tuple(map(int, band_rows))
+        cols = (0, nb) if band_cols is None else tuple(map(int, band_cols))
+        for window in (rows, cols):
+            require_dipole_bands(attrs, nb, *window, dipole_path=path,
+                                 where="selected dipole window")
+        has_energies = BAND_ENERGIES_DATASET in f
+        energy_name = BAND_ENERGIES_DATASET if has_energies else LEGACY_DELTA_E_DATASET
+        expected = (nk, nb) if has_energies else (nk, nb, nb)
+        if energy_name not in f or tuple(f[energy_name].shape) != expected:
+            raise ValueError(f"{path}: {energy_name} must have shape {expected}")
+    nr, nc = rows[1] - rows[0], cols[1] - cols[0]
+    spec = P(None, None, "x", "y")
+    carriers = tuple(int(padded_axis(n, mesh_xy, name="dipole band window",
+                        spec=spec, axis=i + 2).carrier) for i, n in enumerate((nr, nc)))
+    rp, cp = carriers if band_shape is None else tuple(map(int, band_shape))
+    if rp < nr or cp < nc or rp % int(mesh_xy.shape["x"]) or cp % int(mesh_xy.shape["y"]):
+        raise ValueError("dipole band_shape must cover the selected window and tile its X/Y axes")
+    with SlabIO(path, mode="r", mesh=mesh_xy) as io:
+        velocity = io.read_slab("dipole_cart", shape=(3, nk, rp, cp),
+            offset=(0, 0, rows[0], cols[0]), valid_shape=(3, nk, nr, nc),
+            dtype=np.complex128, partition_spec=spec)
+        if has_energies:
+            er = io.read_slab(energy_name, shape=(nk, rp), offset=(0, rows[0]),
+                valid_shape=(nk, nr), dtype=np.float64, partition_spec=P(None, "x"))
+            ec = io.read_slab(energy_name, shape=(nk, cp), offset=(0, cols[0]),
+                valid_shape=(nk, nc), dtype=np.float64, partition_spec=P(None, "y"))
+            delta = _dipole_delta_program(mesh_xy, nr, nc, True)(er, ec)
+        else:
+            delta = io.read_slab(energy_name, shape=(nk, rp, cp),
+                offset=(0, rows[0], cols[0]), valid_shape=(nk, nr, nc),
+                dtype=np.float64, partition_spec=P(None, "x", "y"))
+            delta = _dipole_delta_program(mesh_xy, nr, nc, False)(delta, None)
+    attrs.update(nbands=int(attrs["nbands"]), nk=int(nk),
+                 band_rows=rows, band_cols=cols, stored_bands=int(nb))
+    return velocity, delta, attrs
 
 
 def require_screened_bundle(filename, *, include_w=True, print_fn=print):
@@ -2599,51 +2645,29 @@ def read_dipole_metadata(path):
     from .dipole import require_dipole_format
     with h5py.File(path, "r") as f:
         attrs = dict(f.attrs)
+        attrs["stored_bands"] = int(f["dipole_cart"].shape[-1])
     require_dipole_format(attrs, dipole_path=path)
     return attrs
 
 
 def read_dipole_cv_block(path, *, nelec: int, mesh: Mesh):
-    """The static head's (c, v) block of ``dipole.h5``, read through SlabIO.
+    """Static-head c/v rectangle on matrix faces, using the same file reader.
 
-    Returns ``(v_cvk, dE_cv)`` = ``dipole_cart[:, :, nelec:, :nelec]``
-    ``(3, nk, nc, nv)`` complex128 and ``E_c − E_v`` ``(nk, nc, nv)``
-    float64 (derived from ``band_energies``), replicated on ``mesh``.  Each rank reads only
-    its share of the c rows, so the file is read once in total rather than
-    once per rank (Fe 8^3 P64 read its whole 2.65 GB dipole on all 64
-    ranks, claim 2592), and one all-gather of the block replaces the
-    per-rank copy of the whole ``(nb, nb)`` file.  COLLECTIVE over ``mesh``.
+    Carrier slots have zero velocity and infinite Delta.  The consuming
+    S-tensor contraction reduces only its 3x3 result, never gathers a CV bank.
+    WFN/operator provenance is checked by the head's existing admission owner.
     """
-    from runtime.padding import padded_axis
-    from .dipole import LEGACY_DELTA_E_DATASET, delta_e_cv, require_dipole_format
-    from .slab_io import SlabIO
+    from .dipole import require_dipole_format
     with h5py.File(path, "r") as f:
         require_dipole_format(f.attrs, dipole_path=path)
         _, nk, nb, _ = f["dipole_cart"].shape
-        nv = max(0, min(int(nelec), int(nb)))
-        nc = int(nb) - nv
-        dE_cv = delta_e_cv(f, nv=nv, nc=nc) if nc and nv else None
-    if nc == 0 or nv == 0:
-        return (jnp.zeros((3, nk, nc, nv), jnp.complex128),
-                jnp.zeros((nk, nc, nv), jnp.float64))
-    xy = tuple(mesh.axis_names)
-    c_axis = padded_axis(nc, mesh, name="dipole c rows")
-    ncp = int(c_axis.carrier)
-    rep = NamedSharding(mesh, P())
-    with SlabIO(path, mode="r", mesh=mesh) as io:
-        v = io.read_slab("dipole_cart", shape=(3, nk, ncp, nv),
-                         offset=(0, 0, nv, 0), valid_shape=(3, nk, nc, nv),
-                         dtype=np.complex128,
-                         partition_spec=P(None, None, xy, None))
-        if dE_cv is None:           # a file written before 2026-09-25
-            e = io.read_slab(LEGACY_DELTA_E_DATASET, shape=(nk, ncp, nv),
-                             offset=(0, nv, 0), valid_shape=(nk, nc, nv),
-                             dtype=np.float64, partition_spec=P(None, xy, None))
-    if dE_cv is not None:
-        v = jax.jit(lambda a: a[:, :, :nc], out_shardings=rep)(v)
-        return v, device_put_process_local(dE_cv, rep)
-    return jax.jit(lambda a, b: (a[:, :, :nc], b[:, :nc]),
-                   out_shardings=(rep, rep))(v, e)
+    nv = max(0, min(int(nelec), int(nb)))
+    if nv == 0 or nv == nb:
+        return (jnp.zeros((3, nk, nb - nv, nv), jnp.complex128),
+                jnp.zeros((nk, nb - nv, nv), jnp.float64))
+    v, de, _ = load_dipole_h5(path, wfn_path=None, mesh_xy=mesh,
+                             band_rows=(nv, nb), band_cols=(0, nv))
+    return v, de
 
 
 @functools.lru_cache(maxsize=8)

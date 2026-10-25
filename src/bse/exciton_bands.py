@@ -554,7 +554,7 @@ def _report_alpha_over_path(labels, alpha_all, log=log.debug):
 # stacks: htransform conduction caches + V_Q tiles for the whole path
 # ===========================================================================
 def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
-                              *, log=log.debug):
+                              *, mesh_xy, log=log.debug):
     """``conj(d)`` on the BSE window, ``(nk, nc_pad, nv_pad, 3)`` complex.
 
     The cell-averaged exchange head is
@@ -587,28 +587,30 @@ def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
     ``GATE dipole_format_version`` refuses older files); the head is
     quadratic in ``d``, so an older operator would enter at full strength.
     """
-    from .absorption_common import (build_dipole_vector_bse, slice_dipole_to_bse_window)
+    from .absorption_common import build_dipole_vector_bse
+    from common.collectives import gather_to_host
     from file_io.restart_bundle import (load_dipole_h5)
     from .bse_io import resolve_n_occ
     from .bse_window import _parse_wfn_path
 
     path = args.dipole if getattr(args, "dipole", None) else \
         os.path.join(os.path.dirname(os.path.abspath(args.input)), "dipole.h5")
-    dipole_cart, deltaE, attrs = load_dipole_h5(
-        path, wfn_path=_parse_wfn_path(args.input))
+    n_occ = resolve_n_occ(None, input_file=args.input)
+    velocity, deltaE, attrs = load_dipole_h5(
+        path, wfn_path=_parse_wfn_path(args.input), mesh_xy=mesh_xy,
+        band_rows=(n_occ, n_occ + n_cond), band_cols=(n_occ - n_val, n_occ),
+        band_shape=(nc_pad, nv_pad))
     skip_vnl = attrs.get("skip_vnl")
     from file_io.dipole import require_dipole_k_grid
     require_dipole_k_grid(attrs, nk, dipole_path=path)
-    n_occ = resolve_n_occ(None, input_file=args.input)
-    d_alpha, _ = slice_dipole_to_bse_window(dipole_cart, deltaE,
-                                            n_occ, n_val, n_cond)
+    d_alpha = velocity / deltaE[None]
     d_vec = build_dipole_vector_bse(d_alpha, n_cond_pad=nc_pad,
                                     n_val_pad=nv_pad)      # (3, c, v, k)
     log(f"  [head-tensor] dipoles from {os.path.basename(path)} "
         f"(nk={attrs['nk']}, nbands={attrs['nbands']}, n_occ={n_occ}, "
         f"skip_vnl={skip_vnl!r}); "
-        f"max|d|^2 = {float(np.max(np.abs(d_vec)**2)):.4g} bohr^2")
-    return np.conj(np.transpose(d_vec, (3, 1, 2, 0)))      # (k, c, v, 3)
+        f"max|d|^2 = {float(gather_to_host(jnp.max(jnp.abs(d_vec)**2))):.4g} bohr^2")
+    return jnp.conj(d_vec.transpose(3, 1, 2, 0))      # (k, c, v, 3)
 
 
 def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
@@ -2446,7 +2448,7 @@ def main(argv=None):
         head_args = ()
         if head_mbz:
             D_head = build_head_dipole_operand(
-                args, nk, nc_pad, nv_pad, n_val, n_cond, log=log)
+                args, nk, nc_pad, nv_pad, n_val, n_cond, mesh_xy=mesh_xy, log=log)
             head_args = (jnp.asarray(D_head),
                          jnp.asarray(M_stack, dtype=jnp.float64))
         solver = _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad,

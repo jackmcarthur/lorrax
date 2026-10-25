@@ -349,16 +349,24 @@ def _coarse_velocity(model: dict, input_file: str, dipole_file: str, *, bands,
     """The coarse WFN's dipole.h5 over the whole window, checked against the restart."""
     from bse.bse_window import _parse_wfn_path
     from file_io.dipole import require_dipole_k_grid
-    from file_io.restart_bundle import load_dipole_h5
+    from file_io.restart_bundle import load_dipole_h5, read_dipole_metadata
     b_lo, b_hi = bands
-    dipole_cart, delta_e, attrs = load_dipole_h5(dipole_file, wfn_path=_parse_wfn_path(input_file))
+    stored = int(read_dipole_metadata(dipole_file)["stored_bands"])
+    if stored < b_hi:
+        raise _gate("td_dipole_bands", f"{dipole_file} has {stored} bands",
+                    f">= {b_hi}", "rerun psp.get_dipole_mtxels with more bands")
+    dipole_cart, delta_e, attrs = load_dipole_h5(
+        dipole_file, wfn_path=_parse_wfn_path(input_file),
+        mesh_xy=model["psi_X"].sharding.mesh,
+        band_rows=(b_lo, b_hi), band_cols=(b_lo, b_hi))
     nk = int(np.prod(model["kgrid"]))
     require_dipole_k_grid(attrs, nk, dipole_path=dipole_file)
-    if int(dipole_cart.shape[-1]) < b_hi:
-        raise _gate("td_dipole_bands", f"{dipole_file} has {dipole_cart.shape[-1]} bands",
-                    f">= {b_hi}", "rerun psp.get_dipole_mtxels with more bands")
-    v = dipole_cart[:, :, b_lo:b_hi, b_lo:b_hi]
-    de_file = delta_e[:, b_lo:b_hi, b_lo:b_hi]
+    # The TD position model is explicitly host-owned over its active window;
+    # this is a bounded-window handoff, never a read of the full file's bands.
+    from common.collectives import gather_to_host
+    nb = b_hi - b_lo
+    v = np.asarray(gather_to_host(dipole_cart))[:, :, :nb, :nb]
+    de_file = np.asarray(gather_to_host(delta_e))[:, :nb, :nb]
     de_restart = e_dft_ry[:, :, None] - e_dft_ry[:, None, :]
     dev = float(np.abs(de_file - de_restart).max())
     if dev > 1e-8:
