@@ -210,6 +210,16 @@ spectral-bound Lanczos of FEAST and KPM on either route, Haydock, and
 The exchange runs outside the scan: a k-summed encode to
 $(n_{trials}, N_\mu)$, one product with $V_{q0}$, a broadcast decode.
 
+For a finite-Q exchange refit, `vq_interp.refit_vq` keeps the streamed
+$\zeta_Q(\mu,G)$ accumulator sharded over all ranks and contracts
+$V_{\mu\nu}=\sum_G\zeta^*_{\mu G}v_G\zeta_{\nu G}$ with the
+producer's `gw.v_q_g_flat` G-panel kernel. The result stays on the
+`P('x','y')` face; neither $\zeta$ nor $V$ is gathered to a host. Input
+centroid padding is masked before contraction and converted directly to the
+consumer's legal face carrier. New carries and padding are inside the
+executable priced before it runs. Full real-space host reconstructions are
+explicit diagnostics and refuse above the fixed tile limit.
+
 **The W term** has three routes, chosen at trace time by what the device
 serves and printed once (`[bse] W term:`, `[bse] W term decode:`):
 

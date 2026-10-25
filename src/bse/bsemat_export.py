@@ -287,7 +287,8 @@ def exchange_tile(Q, qflag, *, data, input_file, restart, grid, n_rmu, n_rmu_pad
         from . import vq_interp
         zx = vq_interp.read_vq_payload(restart, os.path.join(os.path.dirname(restart), "zeta_q.h5"),
                                        mesh=mesh_xy, log_fn=_log, input_file=input_file,
-                                       require_slab=False, require_full_bz_zeta=False)
+                                       require_slab=False, require_full_bz_zeta=False,
+                                       include_interactions=False)
         rst = vq_interp.refit_prepare(input_file, mesh_xy, zx, log_fn=_log, policy=zx.get("policy"),
                                       keep_idx=None, window_mode="bse")
         route, refit = "refit", (rst["zx_fit"], rst)

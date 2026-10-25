@@ -311,8 +311,28 @@ def flat_idx(zx, gv):
         + gv[2] % zx["nz"]
 
 
+def _diagnostic_host_bound(name, nbytes):
+    """Refuse oversized legacy host diagnostics before their first allocation."""
+    from runtime.tiles import TILE_BYTES
+    if int(nbytes) > TILE_BYTES:
+        raise ValueError(f'{name}: host diagnostic needs {int(nbytes)/1e9:.3f} GB; '
+                         f'the fixed diagnostic limit is {TILE_BYTES/1e9:.3f} GB. '
+                         'Use the sharded production calculation at this size.')
+
+
+def _diagnostic_phase(zx, q, sign):
+    """One bounded diagnostic phase, without retaining full real-space coordinates."""
+    axes = [np.exp(sign*2j*np.pi*float(zx['qfr'][q, i])*
+                   np.arange(int(zx[key]))/int(zx[key]))
+            for i, key in enumerate(('nx', 'ny', 'nz'))]
+    return (axes[0][:, None, None]*axes[1][None, :, None]*
+            axes[2][None, None, :]).reshape(-1)
+
+
 def recon(zx, q):
     """ζ_q(μ, r) in the lab frame on the full FFT grid (gates only)."""
+    _diagnostic_host_bound('recon', 96*int(zx['n_mu'])*int(zx['n_rtot'])
+        + 16*int(zx['n_mu'])*int(zx['ngkmax']) + 32*int(zx['n_rtot']))
     ZGq = zx["ZG"][q]
     box = np.zeros((zx["n_mu"], zx["n_rtot"]), dtype=np.complex128)
     fi = flat_idx(zx, zx["gvec"][q])
@@ -321,12 +341,14 @@ def recon(zx, q):
     R = np.fft.ifftn(box.reshape(zx["n_mu"], zx["nx"], zx["ny"], zx["nz"]),
                      axes=(1, 2, 3), norm="backward"
                      ).reshape(zx["n_mu"], zx["n_rtot"])
-    return R * np.exp(2j * np.pi * (zx["rfrac"] @ zx["qfr"][q]))[None, :]
+    return R * _diagnostic_phase(zx, q, +1)[None, :]
 
 
 def to_sphere(zx, zr, q):
-    """rows(r) → rows(G) on sphere(q) (gates + refit)."""
-    ph = np.exp(-2j * np.pi * (zx["rfrac"] @ zx["qfr"][q]))
+    """rows(r) → rows(G) on sphere(q), for bounded host diagnostics only."""
+    _diagnostic_host_bound('to_sphere', 80*int(zr.shape[0])*int(zx['n_rtot'])
+        + 16*int(zr.shape[0])*int(zx['ngkmax']) + 32*int(zx['n_rtot']))
+    ph = _diagnostic_phase(zx, q, -1)
     box = np.fft.fftn((zr * ph[None, :]).reshape(-1, zx["nx"], zx["ny"],
                                                  zx["nz"]),
                       axes=(1, 2, 3), norm="backward"
@@ -515,6 +537,18 @@ def build_cq_q_chunk(*, nq, nb, ns, n_mu, n_r, mesh_xy):
     return chunk
 
 
+def _coarse_device_psi(zx, mesh_xy):
+    """Require the loader's canonical all-rank centroid carrier."""
+    psi = zx['psi']
+    expected = NamedSharding(mesh_xy, P(None, None, None, ('x', 'y')))
+    if (not isinstance(psi, jax.Array) or psi.ndim != 4 or psi.dtype != jnp.complex128
+            or psi.shape != (int(zx['nk']), int(zx['nb']), int(zx['ns']), int(zx['n_mu']))
+            or not psi.sharding.is_equivalent_to(expected, 4)):
+        raise ValueError('V(q) requires canonical device wavefunctions from read_vq_payload; '
+                         'a replicated host wavefunction bank is not supported')
+    return psi
+
+
 def build_cq(zx, mesh_xy: Mesh, q_chunk=None):
     """C_q Gram rebuild from ψ at centroids (reference ``build_cq``,
     order-robust R-space route, arithmetic verbatim — evaluated on device,
@@ -533,10 +567,11 @@ def build_cq(zx, mesh_xy: Mesh, q_chunk=None):
     fixture but **53.6 GB at the converged 12×12 / n_μ = 2412 reference**,
     which no single device holds.  R and q stay unsharded, so BOTH
     contractions (the q-Fourier accumulation and the R-Fourier transform
-    back) are device-local: no collectives, only the final host gather.
+    back) retain the face layout; the result remains on device.
     The einsums replace the original reshape-matmuls verbatim — a reshape
     that flattens ns·n_μ·n_μ·ns would destroy the face sharding."""
     nq, nb, ns, n_mu = zx["nq"], zx["nb"], zx["ns"], zx["n_mu"]
+    psi = _coarse_device_psi(zx, mesh_xy)
     kg = zx["kgrid"]
     Rall = np.array([[rx, ry, rz] for rx in range(kg[0])
                      for ry in range(kg[1]) for rz in range(kg[2])])
@@ -547,7 +582,7 @@ def build_cq(zx, mesh_xy: Mesh, q_chunk=None):
                                    mesh_xy=mesh_xy)
     EqR_np = np.exp(2j * np.pi * (zx["qfr"] @ Rw.T))
     rep = NamedSharding(mesh_xy, P())
-    # (μ, ν) face.  n_mu is the raw k-means centroid count, so the face is
+    # (μ, ν) face. The loader supplies the padded centroid carrier, so the face is
     # legal only when it divides the mesh axis; _ns degrades (loudly) when it
     # does not.  Pk carries the k-chunk on the leading axis, P_R the R index —
     # different leading extents, same face, so both are fitted separately.
@@ -575,14 +610,11 @@ def build_cq(zx, mesh_xy: Mesh, q_chunk=None):
     # would materialise the whole 53.6 GB on one device first and only then
     # reshard — the allocation that OOMs an 80 GB card at n_μ = 2412.
     P_R = jnp.zeros((nR, ns, n_mu, n_mu, ns), jnp.complex128, device=face5)
-    # Process-local placement of the host chunks (scorecard AA.1): every
-    # rank reads the same file / computes the same phases, so plain
-    # ``device_put``'s hidden assert_equal all-gather (P × chunk bytes,
-    # once per q-chunk) verifies a tautology.  LORRAX_CHECK_REPLICA=1
-    # re-arms the assertion.
+    # The loader owns the canonical all-rank centroid sharding. Keep those
+    # device chunks distributed; only the small phase table starts on hosts.
     for q0 in range(0, nq, q_chunk):
         sl = slice(q0, min(q0 + q_chunk, nq))
-        P_R = _pr_acc(P_R, device_put_process_local(zx["psi"][sl], rep),
+        P_R = _pr_acc(P_R, psi[sl],
                       device_put_process_local(EqR_np[sl], rep))
     # Return C_q as a MESH-SHARDED device array on the (μ, ν) FACE
     # (``face3`` = ``P(None, 'x', 'y')`` — q replicated, μ over 'x', ν over 'y'),
@@ -605,6 +637,10 @@ def kq_index(zx, ki, qi):
 # gate battery (reference run_gates; every value printed; any FAIL stops)
 # ===========================================================================
 def run_gates(zx, C_q):
+    _diagnostic_host_bound('run_gates',
+        96*int(zx['n_mu'])*int(zx['n_rtot'])
+        + 32*min(48, int(zx['nq']))*int(zx['n_mu'])*int(zx['ngkmax'])
+        + 64*int(zx['nq'])*int(zx['n_mu'])**2)
     ok = True
 
     def log(k, v, tol=None):
@@ -1930,6 +1966,11 @@ def build_hdir(zx, q0, nvw=3, ncw=3):
     # question about the same object, so it keeps the subscript out of
     # the guarded body rather than teaching that matcher an exception.
     _nq_expected = int(np.prod(np.asarray(kg, dtype=np.int64)))
+    _npair = int(zx['nk'])*int(ncw)*int(nvw)
+    _diagnostic_host_bound('build_hdir', 16*(4*_npair**2
+        + 3*_nq_expected*int(zx['n_mu'])**2
+        + 8*int(zx['nk'])*(int(nvw)+int(ncw))*int(zx['ns'])*int(zx['n_mu'])
+        + 2*int(zx['nk'])*(int(ncw)**2+int(nvw)**2)*int(zx['n_mu'])))
     _nq_w0 = int(zx["W0"].shape[0])
     if _nq_w0 != _nq_expected:
         raise ValueError(
@@ -1949,8 +1990,8 @@ def build_hdir(zx, q0, nvw=3, ncw=3):
                      for kp in range(zx["nk"])] for k in range(zx["nk"])])
     D = np.array([zx["enk"][kqs[k], c] - zx["enk"][k, v]
                   for k in range(zx["nk"]) for c in cs for v in vs])
-    psic = np.ascontiguousarray(zx["psi"][:, cs])
-    psiv = np.ascontiguousarray(zx["psi"][:, vs])
+    psic = np.ascontiguousarray(_to_host(zx["psi"][:, jnp.asarray(cs)]))
+    psiv = np.ascontiguousarray(_to_host(zx["psi"][:, jnp.asarray(vs)]))
     psic_kq = psic[kqs]
     # ``zx["W0"]`` is a lazy h5py dataset (see read_vq_payload) and the q
     # lookup below is an unsorted permutation, which h5py cannot fancy-index.
@@ -2608,12 +2649,9 @@ def refit_ongrid_null(zx, rst, V_stored, kgrid_vq, mesh_xy, log_fn=log.debug,
         # need no gather.
         V_ref = jax.device_put(
             V_stored[:, :, ix % kg[0], iy % kg[1], iz % kg[2]], sh)
-        n_mu = min(int(V_ref.shape[0]), int(zx["n_mu"]))
-        V_new = refit_vq(zx, rst, qfr, mesh_xy, log_fn=lambda *_: None)
-        pad = np.zeros(tuple(int(v) for v in V_ref.shape), dtype=np.complex128)
-        pad[:n_mu, :n_mu] = V_new[:n_mu, :n_mu]
-        V_new_d = device_put_process_local(pad, sh)
-        rel = float(jnp.linalg.norm(V_new_d - V_ref)
+        V_new = refit_vq(zx, rst, qfr, mesh_xy, log_fn=lambda *_: None,
+                        n_mu_out=int(V_ref.shape[0]))
+        rel = float(jnp.linalg.norm(V_new - V_ref)
                     / jnp.maximum(jnp.linalg.norm(V_ref), 1e-300))
         out.append(((ix, iy, iz), rel))
         worst = max(worst, rel)
@@ -2684,6 +2722,12 @@ def _refit_kernels(nk, nb, ns, n_mu, mesh_xy: Mesh):
     @partial(jax.jit, out_shardings=face)
     def _x(psi_m_mu, psi_mu):
         # X[k,m,n,μ] = Σ_s conj(u^{ht}_{m,k−q,s}(μ)) u_{n,k,s}(μ)  (spin-traced)
+        # htransform targets are physical centroids; the restart loader
+        # carries them padded over all ranks. Pad inside the face program.
+        if psi_m_mu.shape[-1] > n_mu:
+            raise ValueError("htransform centroid extent exceeds the restart carrier")
+        psi_m_mu = jnp.pad(psi_m_mu, ((0, 0), (0, 0), (0, 0),
+                                      (0, n_mu-psi_m_mu.shape[-1])))
         X = jnp.einsum("kmsu,knsu->kmnu", jnp.conj(psi_m_mu), psi_mu)
         return jnp.pad(X.reshape(m, n_mu), ((0, m_pad - m), (0, n - n_mu)))[None]
 
@@ -2758,12 +2802,15 @@ def close_refit_state(rst: dict) -> None:
 
 
 def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=log.debug,
-             m_leg: str = "htransform"):
+             m_leg: str = "htransform", *, n_mu_out=None):
     """Ground-truth V at TILE momentum ``q_tile_frac`` via a per-Q ζ refit.
 
     Tile-momentum labeling matches ``V_qmunu`` / ``eval_vq``: the pair
     density carries conduction at wrap(k − q).  Returns the (n_μ, n_μ)
-    host tile (Hermitian by construction).
+    complex128 device face at ``P('x','y')`` (Hermitian by construction).
+    ``n_mu_out`` names the consumer's padded centroid carrier; by default
+    the producer's G-flat carrier is retained. No zeta or V host gather is
+    part of this operation.
 
     ``m_leg``: ``"htransform"`` (production — works at ANY q) or
     ``"stored"`` (on-grid q only: the m-leg is the stored grid ψ at the
@@ -2779,6 +2826,7 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=log.debug,
 
     t0 = _time.time()
     nk, nb, ns, n_mu = zx["nk"], zx["nb"], zx["ns"], zx["n_mu"]
+    psi = _coarse_device_psi(zx, mesh_xy)
     rank = rst["rank"]
     qw = np.asarray(q_tile_frac, dtype=np.float64)
     qw = qw - np.round(qw)
@@ -2807,7 +2855,7 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=log.debug,
         kqs = np.array([
             int(rst["sym"].find_qpoint_index(k_frac - qw))
             for k_frac in rst["k_frac"]], dtype=np.int64)
-        psi_m_mu = jnp.asarray(zx["psi"][kqs])
+        psi_m_mu = psi[kqs]
         c_m = None
     else:
         # IMPORTED IN THE BRANCH THAT USES IT.  ``bandstructure.bse_setup``
@@ -2832,7 +2880,7 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=log.debug,
         psi_m_mu = jnp.asarray(bundle.psi_rmu_Y)      # (nk, nb, ns, n_μ)
         c_m = jnp.asarray(bundle.coeffs_fi)           # (nk, rank, nb)
 
-    Xf = x_face(psi_m_mu, jnp.asarray(zx["psi"]))
+    Xf = x_face(psi_m_mu, psi)
     X4 = Xf[0, :nk * nb * nb, :n_mu].reshape(nk, nb, nb, n_mu)
     # THE PRODUCER'S FACTOR, once per Q: the rank-truncated pseudo-inverse of the charge fit
     # (isdf.core._factor_c_q_face, which reports its cut), its eigh placed by distrib_la's
@@ -2895,13 +2943,14 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=log.debug,
             receipt["fh"], receipt["zeta"])
         log_fn(f"  [refit] Galerkin full-r residual {receipt['fh']:.3e} (fH) "
                f"/ {receipt['zeta']:.3e} (zeta window)")
-    zt = _to_host(gflat_acc[0])[:n_mu]
     # The producer's kernel on a bulk deck, this module's slab one otherwise;
     # ``rst["v_on_set"]`` is built once in refit_prepare.  See make_v_on_set.
     v = rst.get("v_on_set", None)
     v = v(qw, GS) if v is not None else v_slab_on_set(zx, qw, GS)
-    A = zt * np.sqrt(v)[None, :]
-    V = np.conj(A) @ A.T
+    from gw.v_q_g_flat import coulomb_gram_gflat
+    V = coulomb_gram_gflat(gflat_acc, v, mesh_xy=mesh_xy,
+                           n_mu_logical=int(zx.get("n_mu_logical", n_mu)),
+                           n_mu_out=n_mu_out)
     log_fn(f"  [refit] q_tile={np.array2string(qw, precision=4)}: "
            f"|G_sphere|={GS.shape[1]}, {_time.time()-t0:.1f}s")
     return V

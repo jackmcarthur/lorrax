@@ -2103,7 +2103,8 @@ def main(argv=None):
                 zx = vq_interp.read_vq_payload(restart_file, zeta_path,
                                                 mesh=mesh_xy, log_fn=log, input_file=args.input,
                                                 require_slab=False,
-                                                require_full_bz_zeta=False)
+                                                require_full_bz_zeta=False,
+                                                include_interactions=False)
                 prep = eval_vq = pinvF = coeffs_packed = None
                 if head_mbz:
                     raise SystemExit(
