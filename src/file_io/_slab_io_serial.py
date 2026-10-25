@@ -94,7 +94,7 @@ from common.collectives import mesh_is_emulated, process_count
 from common.log import get_logger
 
 from . import h5_journal as _journal
-from ._slab_io_ffi import (_DatasetGeometry, _apply_dataset_attrs,
+from ._slab_io_ffi import (_DatasetGeometry, _publish_metadata,
                            _normalize_slab_request, _normalize_valid_shape,
                            _normalize_window_tables, _replace_inode_for_write,
                            _sharding_to_axis_info, _shard_divisors,
@@ -869,8 +869,7 @@ class _SerialBackend(_DatasetGeometry):
         if self._closed:
             return
         self._closed = True
-        from .hdf5_owner import note_close, open_scope
-        from .commit_state import set_commit_state
+        from .hdf5_owner import note_close
         attrs, ds_attrs = self._deferred_attrs, self._deferred_ds_attrs
         self._deferred_attrs, self._deferred_ds_attrs = [], []
         try:
@@ -888,21 +887,4 @@ class _SerialBackend(_DatasetGeometry):
         error = getattr(self, '_context_error', None) or getattr(self, '_write_error', None)
         if error is not None:
             raise error
-        import h5py
-
-        with open_scope(self.path, STACK_H5PY, "a",
-                        where="_SerialBackend.close deferred-attr reopen"), \
-                _journal.op_scope(
-                    "attr_w", self.path, stack=STACK_H5PY, mode="a",
-                    cnt=(len(attrs), len(ds_attrs))), \
-                h5py.File(self.path, "a") as h5:
-            for name, value in attrs:
-                if name in h5:
-                    del h5[name]
-                host = value
-                if not isinstance(host, np.ndarray):
-                    host = np.asarray(jax.device_get(host))
-                h5.create_dataset(name, data=host)
-            _apply_dataset_attrs(h5, ds_attrs)
-            h5.flush()
-            set_commit_state(h5, True)
+        _publish_metadata(self.path, attrs, ds_attrs)
