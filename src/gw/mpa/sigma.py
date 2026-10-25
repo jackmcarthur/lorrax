@@ -1514,7 +1514,8 @@ def _integrate_sigma_batches(
     ``q_wedge``: the slabs are on the q wedge (GN-PPM, owner 2026-09-25);
     W(τ) is built on the wedge and read by the Sigma convolution through the
     wedge's unfold tables (mathdx mode 9), whose device tables ride the
-    residue argument.
+    residue argument. A full-zone scalar source uses the identity table of
+    the same row owner; this changes neither source storage nor its read.
 
     ``request`` (``gw.ppm_sigma.OnShellRequest``): the sweep folds the on-shell
     pair and diagonal slots (``gw.ppm_accumulators``) at its energies; its
@@ -1558,7 +1559,17 @@ def _integrate_sigma_batches(
             psi_proj_xr, sigma_axis, axis=1)
         psi_proj_yn = pad_to_axis(
             psi_proj_yn, sigma_axis, axis=3)
-        scalar_subtile = (tau_kernel_factory is None and (synthesis or q_wedge is not None))
+        if tau_kernel_factory is None and not synthesis and q_wedge is None:
+            # Full-zone scalar residues use the same bounded row owner as
+            # an irreducible wedge. This is metadata for an identity load,
+            # not another W tensor; source reads and the canonical->packed
+            # I/O seam remain with their existing owners.
+            from symmetry_maps import QirrOperator
+            n_mu = int(face_kwargs["face_shape"][2])
+            n_q = int(np.prod((meta.nkx, meta.nky, meta.nkz)))
+            q_wedge = dataclasses.replace(QirrOperator.whole_zone(
+                jax.ShapeDtypeStruct((n_q, n_mu, n_mu), jnp.complex128)), values=None)
+        scalar_subtile = tau_kernel_factory is None
         subtile_faces = ((psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn)
                          if scalar_subtile else None)
         if synthesis and tau_kernel_factory is not None:
