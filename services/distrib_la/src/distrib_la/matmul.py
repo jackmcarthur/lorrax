@@ -24,7 +24,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax import shard_map
 from distrib_la.plan import (BATCHED_ROUTE_CHOICES, BATCHED_ROUTE_DEFAULT,
                              ROUTE_BATCH_RESHARD, ensure_sharding)
-from distrib_la.resolve import mesh_key
 
 __all__ = ["MATMUL_BACKEND_CHOICES", "matmul", "resolve_matmul_backend",
            "contract_faces"]
@@ -36,7 +35,6 @@ MATMUL_BACKEND_CHOICES = (
 """Public provider vocabulary accepted by :func:`matmul` and its resolver."""
 
 _OP_CODE = {"N": 0, "T": 1, "C": 2}
-_RESHARD_CACHE: dict = {}
 #: The face GEMM every platform resolves to: :func:`distrib_la.panel_matmul`.
 PANEL = "panel_matmul"
 
@@ -221,70 +219,66 @@ def _panel(mesh, A, B, C, *, alpha, beta, transa, transb):
 
 
 def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb):
+    fn = _batch_reshard_program(mesh, int(A.shape[0]), A.dtype,
+                               alpha, beta, transa, transb, C is not None)
+    return fn(A, B, C) if C is not None else fn(A, B)
+
+
+@lru_cache(maxsize=64)
+def _batch_reshard_program(mesh, nb, dtype, alpha, beta, transa, transb, has_c):
+    """Cache only static geometry and scalars, never a caller's matrix."""
     from distrib_la._batch_reshard import (_batch_to_face, _face_to_batch,
                                            _real_rows)
 
     px, py = _mesh_shape(mesh)
     ptotal = px * py
-    nb = int(A.shape[0])
     nb_pad = ((nb + ptotal - 1) // ptotal) * ptotal
     pad = nb_pad - nb
-    has_c = C is not None
-    key = (mesh_key(mesh), tuple(A.shape), tuple(B.shape),
-           None if C is None else tuple(C.shape), str(A.dtype), alpha, beta,
-           transa, transb)
-    fn = _RESHARD_CACHE.get(key)
-    if fn is None:
-        def _gemm(a, b, c):
-            if transa != "N":
-                a = jnp.swapaxes(a, -1, -2)
-                if transa == "C":
-                    a = jnp.conj(a)
-            if transb != "N":
-                b = jnp.swapaxes(b, -1, -2)
-                if transb == "C":
-                    b = jnp.conj(b)
-            d = jnp.asarray(alpha, A.dtype) * jnp.matmul(a, b)
+    def _gemm(a, b, c):
+        if transa != "N":
+            a = jnp.swapaxes(a, -1, -2)
+            if transa == "C":
+                a = jnp.conj(a)
+        if transb != "N":
+            b = jnp.swapaxes(b, -1, -2)
+            if transb == "C":
+                b = jnp.conj(b)
+        d = jnp.asarray(alpha, dtype) * jnp.matmul(a, b)
+        if c is not None:
+            d = d + jnp.asarray(beta, dtype) * c
+        return d
+
+    def _body(a, b, c):
+        if pad:
+            a = jnp.pad(a, ((0, pad), (0, 0), (0, 0)))
+            b = jnp.pad(b, ((0, pad), (0, 0), (0, 0)))
             if c is not None:
-                d = d + jnp.asarray(beta, A.dtype) * c
-            return d
+                c = jnp.pad(c, ((0, pad), (0, 0), (0, 0)))
+        a = _face_to_batch(a, px=px, py=py)
+        b = _face_to_batch(b, px=px, py=py)
+        if c is not None:
+            c = _face_to_batch(c, px=px, py=py)
+        # Synthetic rows of a ragged batch are exchanged but never multiplied.
+        d = (_real_rows(_gemm, (a, b, c), nbatch=nb, py=py) if pad
+             else _gemm(a, b, c))
+        d = _batch_to_face(d, px=px, py=py)
+        return d[:nb]
 
-        def _body(a, b, c):
-            if pad:
-                a = jnp.pad(a, ((0, pad), (0, 0), (0, 0)))
-                b = jnp.pad(b, ((0, pad), (0, 0), (0, 0)))
-                if c is not None:
-                    c = jnp.pad(c, ((0, pad), (0, 0), (0, 0)))
-            a = _face_to_batch(a, px=px, py=py)
-            b = _face_to_batch(b, px=px, py=py)
-            if c is not None:
-                c = _face_to_batch(c, px=px, py=py)
-            # Synthetic rows of a ragged batch are exchanged but never multiplied:
-            # the same scalar cond-in-loop skip as the eigh/cholesky/solve route.
-            d = (_real_rows(_gemm, (a, b, c), nbatch=nb, py=py) if pad
-                 else _gemm(a, b, c))
-            d = _batch_to_face(d, px=px, py=py)
-            return d[:nb]
+    if has_c:
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P(None, "x", "y"),) * 3,
+                 out_specs=P(None, "x", "y"), check_vma=False)
+        def _local(a, b, c):
+            return _body(a, b, c)
+    else:
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P(None, "x", "y"),) * 2,
+                 out_specs=P(None, "x", "y"), check_vma=False)
+        def _local(a, b):
+            return _body(a, b, None)
 
-        if has_c:
-            @partial(shard_map, mesh=mesh,
-                     in_specs=(P(None, "x", "y"),) * 3,
-                     out_specs=P(None, "x", "y"), check_vma=False)
-            def _local(a, b, c):
-                return _body(a, b, c)
-        else:
-            @partial(shard_map, mesh=mesh,
-                     in_specs=(P(None, "x", "y"),) * 2,
-                     out_specs=P(None, "x", "y"), check_vma=False)
-            def _local(a, b):
-                return _body(a, b, None)
-
-        # Exchanges prevent reliable face-input/output aliasing.  Requesting
-        # donation here emits the same unusable-donation warning avoided by
-        # the other batch_reshard operations.
-        fn = jax.jit(_local)
-        _RESHARD_CACHE[key] = fn
-    return fn(A, B, C) if has_c else fn(A, B)
+    # Exchanges prevent reliable face-input/output aliasing.
+    return jax.jit(_local)
 
 
 def staged_fits(mesh, a_shape, b_shape, dtype, transa, transb, budget_bytes) -> bool:
