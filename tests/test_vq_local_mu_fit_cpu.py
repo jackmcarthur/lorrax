@@ -3,6 +3,9 @@ import numpy as np
 import pytest
 from contextlib import nullcontext
 import re
+import os
+import subprocess
+import sys
 
 import runtime
 from runtime.source_closure import ensure_source_closure
@@ -11,6 +14,19 @@ import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 jax.config.update('jax_enable_x64', True)
+
+
+def _assert_evaluator_hlo(text,mu,ng,stencil_shape):
+    # Parameter 2 is the public evaluator's small q-stencil matrix pinvF.
+    stencil_parameters={line for line in text.split('ENTRY ',1)[1].splitlines()
+        if re.search(r'\bparameter\(2\)',line) and
+        f'c128[{",".join(map(str,stencil_shape))}]' in line}
+    for line in text.splitlines():
+        if line in stencil_parameters:
+            continue
+        for dimensions in re.findall(r'=\s*c128\[([0-9,]*)\]',line):
+            shape=tuple(map(int,dimensions.split(','))) if dimensions else ()
+            assert shape not in ((mu,ng),(ng,mu)), 'evaluator materialized a global mu/G factor'
 
 
 def _assert_local(array, expected, *, rtol=2e-11, atol=2e-11, zero_from=None):
@@ -226,9 +242,10 @@ def check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, *, reference=Fa
     evaluator=V.make_eval_vq(zx,prep,des,mesh,mu)
     out=evaluator(target,prep['V_SRc'],pinv,packed)
     text=evaluator.lower(target,prep['V_SRc'],pinv,packed).compile().as_text()
-    for dimensions in re.findall(r'=\s*c128\[([0-9,]*)\]',text):
-        shape=tuple(map(int,dimensions.split(','))) if dimensions else ()
-        assert shape not in ((mu,ng),(ng,mu)), 'evaluator materialized a global mu/G factor'
+    # pinvF is intentionally small replicated q-stencil geometry. At P64
+    # its (nR=7,nq=64) shape can coincide with (G=7,mu=64); identify that
+    # input by its actual argument position, not by a shape exemption.
+    _assert_evaluator_hlo(text,mu,ng,pinv.shape)
     xy=(bvec.T@(target[:,None]+gs))[:2]/(2*V.ALPHA)
     phi=np.array([np.ones(ng),xy[1],xy[0]]).T
     m=(phi@expected_coeff).T
@@ -261,3 +278,22 @@ def test_interpolation_diagnostics_and_transport_refuse_before_large_materializa
     huge=dict(nq=100,n_mu=100000,ngkmax=10)
     with pytest.raises(ValueError,match='fixed diagnostic limit'):
         V.prepare_coarse(huge,None,Mesh(np.asarray(jax.devices()[:1]).reshape(1,1),('x','y')))
+
+
+def test_p64_stencil_metadata_is_distinct_from_a_global_form_factor():
+    stencil='ENTRY main {\n %pinv = c128[7,64] parameter(2)\n}'
+    _assert_evaluator_hlo(stencil,64,7,(7,64))
+    with pytest.raises(AssertionError,match='global mu/G'):
+        _assert_evaluator_hlo(stencil+'\n %factor = c128[64,7] transpose(%pinv)',64,7,(7,64))
+    code=r'''
+import importlib.util,numpy as np,jax,pytest
+from jax.sharding import Mesh
+s=importlib.util.spec_from_file_location('mu_identity','tests/test_vq_local_mu_fit_cpu.py')
+t=importlib.util.module_from_spec(s);s.loader.exec_module(t)
+mesh=Mesh(np.asarray(jax.devices()).reshape(8,8),('x','y'))
+with pytest.MonkeyPatch.context() as p:
+ t.check_clean_fit_and_evaluator(p,mesh,False,reference=True)
+'''
+    env=dict(os.environ,JAX_PLATFORMS='cpu',XLA_FLAGS='--xla_force_host_platform_device_count=64')
+    run=subprocess.run([sys.executable,'-c',code],env=env,text=True,capture_output=True,timeout=180)
+    assert run.returncode==0,run.stdout+run.stderr
