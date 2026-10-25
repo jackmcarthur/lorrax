@@ -187,6 +187,13 @@ def _sphere_inverse(sphere_index: jax.Array, n_rtot: int) -> jax.Array:
         slots, mode='drop', unique_indices=True))(sphere_index)
 
 
+def _flat_box_indices(inverse: jax.Array, ngk: int) -> jax.Array:
+    """Flatten row/sphere indices, retaining wide row offsets when necessary."""
+    n_k, stride = int(inverse.shape[0]), int(ngk) + 1
+    dtype = jnp.int64 if n_k * stride - 1 > np.iinfo(np.int32).max else jnp.int32
+    return jnp.arange(n_k, dtype=dtype)[:, None] * stride + inverse.astype(dtype)
+
+
 def _gather_box(psi: jax.Array, inverse: jax.Array, *,
                 fft_grid: Sequence[int]) -> jax.Array:
     """ψ(G) ``(n_k, nb, ns, ngk)`` + inverse ``(n_k, n_rtot)`` → box."""
@@ -196,8 +203,7 @@ def _gather_box(psi: jax.Array, inverse: jax.Array, *,
     zero = jnp.zeros((n_k, nb, ns, 1), dtype=psi.dtype)
     psi_t = jnp.transpose(jnp.concatenate([psi, zero], axis=-1), (1, 2, 0, 3))
     psi_flat = psi_t.reshape(nb, ns, n_k * k_stride)
-    flat_index = (jnp.arange(n_k, dtype=jnp.int32)[:, None] * k_stride
-                  + inverse)                                   # (n_k, n_rtot)
+    flat_index = _flat_box_indices(inverse, ngk)                  # (n_k, n_rtot)
     # ``mode='clip'``: every index is in range by construction (the zero
     # slot sits at ``ngk``), and clip skips take's fill mask.
     gathered = jnp.take(psi_flat, flat_index, axis=2, mode='clip')

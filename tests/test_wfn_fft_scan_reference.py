@@ -59,5 +59,37 @@ def test_requires_distributed_launcher():
     pytest.skip("run this module directly with the configured MPI/GPU launcher")
 
 
+def test_flat_box_indices_preserve_large_offsets():
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from common.wfn_transforms import _box_kernel, _flat_box_indices
+
+    with jax.enable_x64():
+        huge = jnp.array([[0, 1_500_000_000], [1_499_999_999, 1_500_000_000]],
+                         dtype=jnp.int32)
+        wide = jax.jit(lambda x: _flat_box_indices(x, 1_500_000_000))(huge)
+        np.testing.assert_array_equal(wide, [[0, 1_500_000_000], [3_000_000_000, 3_000_000_001]])
+        assert wide.dtype == jnp.int64
+        inverse = jnp.array([[0, 1], [2, 3]], dtype=jnp.int32)
+        ordinary = _flat_box_indices(inverse, 3)
+        np.testing.assert_array_equal(ordinary, [[0, 1], [6, 7]])
+        assert ordinary.dtype == jnp.int32
+        for ngk, dtype in ((1_073_741_823, jnp.int32), (1_073_741_824, jnp.int64)):
+            boundary = _flat_box_indices(jnp.full((2, 2), ngk, jnp.int32), ngk)
+            np.testing.assert_array_equal(boundary, [[ngk, ngk], [2 * ngk + 1, 2 * ngk + 1]])
+            assert boundary.dtype == dtype
+        # Independent sparse scatter checks the actual ordinary box gather.
+        psi = np.arange(2 * 2 * 2 * 3).reshape(2, 2, 2, 3).astype(np.complex128)
+        sphere = np.array([[0, 2, 5], [1, 3, 4]], dtype=np.int32)
+        expected = np.zeros((2, 2, 2, 6), dtype=np.complex128)
+        for k in range(2):
+            for g, cell in enumerate(sphere[k]):
+                expected[k, :, :, cell] = psi[k, :, :, g]
+        actual = jax.jit(lambda x, i: _box_kernel(x, i, fft_grid=(2, 3, 1)))(
+            jnp.asarray(psi), jnp.asarray(sphere))
+        np.testing.assert_array_equal(actual, expected.reshape(2, 2, 2, 2, 3, 1))
+
+
 if __name__ == "__main__":
     main()
