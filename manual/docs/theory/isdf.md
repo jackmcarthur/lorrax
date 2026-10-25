@@ -103,9 +103,7 @@ $$
 C_\bq^{+} = B B^\dagger, \qquad B = U_{\mathrm{keep}}\,\Lambda_{\mathrm{keep}}^{-1/2}, \qquad \kappa_{\mathrm{eff}} = \lambda_{\max}/\lambda_{\min}^{\mathrm{kept}} \le 1/\epsilon_\zeta \tag{2.5}
 $$
 
-The cut is never placed inside a degenerate multiplet: it moves down and drops the whole block ([`LORRAX_SPECTRAL_CLOSURE`](../using/environment.md)). With an orbit-closed centroid set $C_\bq$ commutes with the point group, so a cut between blocks keeps $C_{S\bq}$ and $C_\bq$ related by the symmetry; a cut through a block would break the k-star identity of $W$ and $\Sigma$. Each run prints `[zeta rank_truncate]` with `n_keep`, `kappa` and the largest discarded eigenvalue per $\bq$. A cut that discards a direction at an achieved $\kappa_{\mathrm{eff}}$ above the certified $10^{8}$ prints `[rank-policy]` lines and refuses after the fit ([`LORRAX_RANK_POLICY`](../using/environment.md#lorrax_rank_policy)); reduce $N_\mu$ or raise `zeta_rcond`.
-
-`zeta_rcond` has a deprecated environment twin, [`LORRAX_ZETA_RCOND`](../using/environment.md), which wins when set and is recorded in the fit provenance.
+The cut is never placed inside a degenerate multiplet. It moves down and drops the whole block, and the run logs a `[spectral-closure]` warning. With an orbit-closed centroid set $C_\bq$ commutes with the point group, so a cut between blocks keeps $C_{S\bq}$ and $C_\bq$ related by the symmetry. A cut through a block would break the k-star identity of $W$ and $\Sigma$. Each run prints `[zeta rank_truncate]` with `n_keep`, `kappa` and the largest discarded eigenvalue per $\bq$. A cut that discards a direction at an achieved $\kappa_{\mathrm{eff}}$ above the certified $10^{8}$ prints `[rank-policy]` lines and refuses after the fit ([`LORRAX_RANK_POLICY`](../using/environment.md#lorrax_rank_policy)); reduce $N_\mu$ or raise `zeta_rcond`.
 
 !!! note
     `zeta_rcond`, the WFN, the centroid table, the band windows, the cutoffs and the spinor count form the fit provenance stamped in `zeta_q.h5`; a rerun reuses the fit only when all of them match. `zeta_ridge` is retired: any nonzero value refuses.

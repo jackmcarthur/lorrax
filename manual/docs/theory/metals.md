@@ -166,7 +166,7 @@ The production metal model is the tangential $W$ with occupation-weighted Σ bra
 
 ### <span class="n">4.1</span> The metal model of W {: #sigma-w }
 
-A metal input file sets `compute_mode = tangential`. The tangential bank carries the signed metallic weights through its occupation envelope ([Tangential W model §6.3](tangential-w.md#bank-accuracy)). The scalar head is fitted on the metal plan of §2.2, with the tangential Γ body evaluated on it ([The q → 0 head §3.1](q0-head.md#poles-samples)).
+A metal input file sets `compute_mode = tangential`. Left at `auto`, `compute_mode` refuses on a metal, and the message names `compute_mode = tangential`. The tangential bank carries the signed metallic weights through its occupation envelope ([Tangential W model §6.3](tangential-w.md#bank-accuracy)). The scalar head is fitted on the metal plan of §2.2, with the tangential Γ body evaluated on it ([The q → 0 head §3.1](q0-head.md#poles-samples)).
 
 ### <span class="n">4.2</span> Occupation-weighted Σ branches {: #sigma-branches }
 
@@ -204,6 +204,7 @@ Treatments and routes that assume a gap or integer occupations refuse a metallic
 
 | Route | On a metal | Gate |
 |---|---|---|
+| `compute_mode = auto` | refuses, unless `do_screened = false` makes it `x_only` | none (the message names `compute_mode = tangential`) |
 | `compute_mode = x_only` | runs | — |
 | `compute_mode = tangential` | production | — |
 | `compute_mode = gn_ppm` | refuses | `gn_ppm_refuses_metals` |

@@ -57,14 +57,14 @@ $$
 \big\{\psi_{n\bk_{\mathrm{co}}}(\br_\mu),\, E^{\mathrm{QP}}_{n\bk_{\mathrm{co}}}\big\} \;\longrightarrow\; \big\{\psi_{n\bk_{\mathrm{fi}}}(\br_\mu),\, E^{\mathrm{QP}}_{n\bk_{\mathrm{fi}}}\big\}, \qquad n \in [\,n_{\mathrm{occ}} - n_v,\; n_{\mathrm{occ}} + n_c\,) \tag{1.3}
 $$
 
-The method, its basis keys and its quality checks are on the [htransform](../../utilities/htransform.md#how) page. Each fine axis must be at least the coarse one; nesting is not required. The GW input file's `nval`, `ncond` and `number_bands` fix the interpolation window, and fewer than four conduction bands above the BSE window draw a warning.
+The method, its basis keys and its quality checks are on the [htransform](../../utilities/htransform.md#how) page. Each fine axis must be at least the coarse one; nesting is not required. The GW input file's `nval` and `ncond` (or `number_bands_protected`, resolved as in GW) and `number_bands` fix the interpolation window, and fewer than four conduction bands above the BSE window draw a warning.
 
 ### <span class="n">1.4</span> Static W, the q → 0 head and densification {: #grid-w }
 
 `bse_head._inject_q0_head` · `bse_densify.make_w_densifier`
 {: .in-code }
 
-$W_\bq(\mu,\nu;0)$ is the bundle's stored W0 (a Dyson $W(0)$, or $V + W^c(0)$ of a tangential model), or, without one, a static Dyson rebuild on every call. The $\bq \to 0$ head enters as a rank-one term on the $\bq = 0$ tiles, with $g_0(\mu) = \zeta_{\bq=0,\mu}(\bG = 0)$; input file `vhead` and `whead_0freq` override the bundle's values:
+$W_\bq(\mu,\nu;0)$ is the bundle's stored W0 (a Dyson $W(0)$, which a one-shot tangential run also stores, or $V + W^c(0)$ of the tangential model on a QSGW or bispinor run), or, without one, a static Dyson rebuild on every call. The $\bq \to 0$ head enters as a rank-one term on the $\bq = 0$ tiles, with $g_0(\mu) = \zeta_{\bq=0,\mu}(\bG = 0)$; input file `vhead` and `whead_0freq` override the bundle's values:
 
 $$
 V_{\bq=0}(\mu,\nu) \mathrel{+}= \frac{V^{\mathrm{head}}}{\Omega_{\mathrm{cell}}}\, g_0^*(\mu)\, g_0(\nu), \qquad
@@ -77,11 +77,11 @@ $$
 W_{\bq_{\mathrm{fi}}}(\mu,\nu;0) = \underbrace{\mathrm{FFT}_{\bR \to \bq_{\mathrm{fi}}}\,\mathrm{IFFT}_{\bq_{\mathrm{co}} \to \bR}\big[W_{\bq_{\mathrm{co}}} - W^{\mathrm{LR}}_{\bq_{\mathrm{co}}}\big]}_{[W^{\mathrm{SR}}]^{\mathrm{interp}}_{\bq_{\mathrm{fi}}}} + W^{\mathrm{LR}}_{\bq_{\mathrm{fi}}} \tag{1.5}
 $$
 
-With `w_head_densify = c1` (the default) the long-range part is the head alone, $W^{\mathrm{LR}}_\bq = h(\bq)\, g_0^*(\mu)\, g_0(\nu)/\Omega_{\mathrm{cell}}$, with $h(\bq) = \bar W_{00}\,s(\bq)/\langle s\rangle_{\Gamma_c}$ and $s(\bq) = v(\bq)/\big(1 - v(\bq)\,\bq\cdot S\cdot\bq\big)$ inside the coarse Γ cell $\Gamma_c$ and zero outside. Here $\bar W_{00}$ is the $W^{\mathrm{head}}$ of (1.4). With `srlr` it is $w(|\bq|)\,\tilde\zeta^\dagger_\bq D_\bq\tilde\zeta_\bq/\Omega_{\mathrm{cell}}$ with $D_\bq = [v_L^{-1} - P_\bq]^{-1}$, built from the ISDF coefficients $\zeta_{\bq\mu}(\bG_L)$ at the long-range plane waves $\bG_L$, dressed by the short-range local fields and fitted from the bundle's `W0_lr`. Γ keeps the `c1` head. Both routes, the plane waves $\bG_L$ and the window are derived on [Short- and long-range W](../../theory/w-range-splitting.md). Without `kgrid_fine` only the last transform, $W_\bR = \mathrm{IFFT}_{\bq\to\bR}W_\bq$, runs.
+The long-range part is the `srlr` model (`w_head_densify = srlr`, the only model), $W^{\mathrm{LR}}_\bq = w(|\bq|)\,\tilde\zeta^\dagger_\bq D_\bq\tilde\zeta_\bq/\Omega_{\mathrm{cell}}$ with $D_\bq = [v_L^{-1} - P_\bq]^{-1}$, built from the ISDF coefficients $\zeta_{\bq\mu}(\bG_L)$ at the long-range plane waves $\bG_L$, dressed by the short-range local fields and fitted from the bundle's `W0_lr`. Γ lies on both grids and takes the head $h(\bq) = \bar W_{00}\,s(\bq)/\langle s\rangle_{\Gamma_c}$, with $s(\bq) = v(\bq)/\big(1 - v(\bq)\,\bq\cdot S\cdot\bq\big)$, averaged over the fine grid's Γ cell. Here $\bar W_{00}$ is the $W^{\mathrm{head}}$ of (1.4) and $\Gamma_c$ is the coarse Γ cell. The model, the plane waves $\bG_L$, the window and the Γ head are derived on [Short- and long-range W](../../theory/w-range-splitting.md). Without `kgrid_fine` only the last transform, $W_\bR = \mathrm{IFFT}_{\bq\to\bR}W_\bq$, runs.
 
 <figure class="flowchart" markdown>
 [![Static W for the BSE](../../assets/figures/b4.png)](../../assets/figures/b4.png)
-<figcaption><strong>Fig. B4.</strong> Static $W$ for the BSE: the static $W$ and the polarizability in plane waves on the GW grid (stage 1), the Schur complement on the long-range plane waves (stage 2), and the fine-grid assembly with the $\bq = 0$ head (stage 3). With the default `w_head_densify = c1` only the head is held back ([Short- and long-range W §5](../../theory/w-range-splitting.md#c1)).</figcaption>
+<figcaption><strong>Fig. B4.</strong> Static $W$ for the BSE: the static $W$ and the polarizability in plane waves on the GW grid (stage 1), the Schur complement on the long-range plane waves (stage 2), and the fine-grid assembly with the $\bq = 0$ head (stage 3). At Γ the head is re-attached on the fine grid ([Short- and long-range W §5](../../theory/w-range-splitting.md#c1)).</figcaption>
 </figure>
 
 ### <span class="n">1.5</span> The exchange tile on the fine grid {: #grid-v }

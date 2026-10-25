@@ -131,7 +131,7 @@ System dimension; may only confirm the input file's `sys_dim`. A contradiction r
 
 **Input keys**
 
-### `number_bands` {: .kw data-type="int" data-default="GW input file" }
+### `number_bands` {: .kw data-type="int" data-default="100" }
 Top of the $\chi^0$ and $\Sigma$ band sums of the GW run. Alias `nband`. Kin-ion only stamps it, because the quasiparticle Hamiltonian needs the one-body matrix on the protected bands alone.
 
 ### `wfn_file` {: .kw data-type="string" data-default="WFN.h5" }
@@ -205,6 +205,7 @@ Before reading the slab GW refuses a file that is in the folded-Hartree format, 
     - An input file without `sys_dim`, or with an unknown key.
     - `--sys_dim` that contradicts the input file's `sys_dim`. Fix the input file.
     - `bispinor_gw = full_static_cohsex` without `bispinor = true`.
+    - An input file without `nval` and `ncond` (or `number_bands_protected`), with one line per key (`nval is required (or number_bands_protected)`).
     - `number_bands_protected` below the occupied-band count or above `number_bands`.
     - A `WFN.h5` with fewer bands than $n_\mathrm{occ} + \texttt{ncond}$.
     - A `WFN.h5` whose `grid_rho` differs from the wavefunction FFT box.

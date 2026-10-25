@@ -22,13 +22,13 @@ An exciton of momentum $\bQ$ is built from transitions that remove an electron a
 `fh_interp.generate_kpath_from_qe_segments`
 {: .in-code }
 
-The input file's `K_POINTS` block lists corners $\bQ_0,\dots,\bQ_m$ in crystal coordinates, each with a count $n_i$. Segment $i$ runs from $\bQ_{i-1}$ to $\bQ_i$ and takes the count on the line of the corner where it ends, raised to the floor `--q-per-segment`:
+The input file's `K_POINTS` block lists corners $\bQ_0,\dots,\bQ_m$ in crystal coordinates, each with a count $n_i$. Segment $i$ runs from $\bQ_i$ to $\bQ_{i+1}$ and takes the count on the line of the corner where it starts, as in Quantum ESPRESSO's `crystal_b`, raised to the floor `--q-per-segment`:
 
 $$
-\bQ_{i,t} = \Big(1-\frac{t}{n_i}\Big)\bQ_{i-1} + \frac{t}{n_i}\,\bQ_i, \qquad t = 1,\dots,n_i, \qquad n_i \leftarrow \max(n_i,\, n_\mathrm{floor}) \tag{1.1}
+\bQ_{i,t} = \Big(1-\frac{t}{n_i}\Big)\bQ_i + \frac{t}{n_i}\,\bQ_{i+1}, \qquad t = 1,\dots,n_i, \qquad n_i \leftarrow \max(n_i,\, n_\mathrm{floor}) \tag{1.1}
 $$
 
-The path starts at $\bQ_0$ and the count on its line is unused. The path coordinate is the cumulative Cartesian length, in bohr⁻¹. `--extra-q` points are appended after the path and solved in the same scan.
+The path starts at $\bQ_0$, and the count on the last corner's line is unused. The path coordinate is the cumulative Cartesian length, in bohr⁻¹. `--extra-q` points are appended after the path and solved in the same scan.
 
 ### <span class="n">1.2</span> Pair basis and Hamiltonian {: #ham }
 
@@ -252,23 +252,23 @@ On the native grid of §4.1, $W^{\mathrm{LR}}$ is just the injected $\Gamma$ hea
 
 ### <span class="n">4.3</span> Coarse W with `--w-coarse-grid` {: #w-coarse }
 
-`gw.head_densify.attach_head_channel`
+`bse_densify._srlr_terms`
 {: .in-code }
 
-`--w-coarse-grid` samples the native $W$ on a sub-grid that divides the BSE grid and interpolates it back, to test a cheap coarse $W$ against a fine exciton grid. Only `c1` is implemented: the $\Gamma$ head is subtracted, the head-free body is decimated and zero-padded in $\bR$ (the trigonometric interpolant $T$), and a head channel is re-attached at every fine $\bq$ inside the coarse $\Gamma$ cell $\Gamma_c$:
+`--w-coarse-grid` samples the native $W$ on a sub-grid that divides the BSE grid and interpolates it back, to test a cheap coarse $W$ against a fine exciton grid. It uses the `srlr` model of the `kgrid_fine` route (4.4). The long-range model $\mathrm{LR}_m$ is fitted on the sub-grid from the restart's `W0_lr`, decimated to it, and subtracted from every sub-grid tile. The remainder is zero-padded in $\bR$ (the trigonometric interpolant $T$), and the model is added back at every fine $\bq \neq 0$:
 
 $$
-W^{\mathrm{fine}}_\bq = T\big[W - W^{\mathrm{LR}}\big]_\bq + \frac{S(\bq)}{\Omega}\,g_0^*\,g_0, \qquad S(\bq) \propto \frac{v(\bq)}{1 - v(\bq)\,\bq^{T}\mathsf{S}\,\bq}\ \ (\bq\in\Gamma_c), \qquad S(\bq) = 0\ \ (\bq\notin\Gamma_c) \tag{4.3}
+W^{\mathrm{fine}}_\bq = T\big[W - w\,\mathrm{LR}_m\big]_\bq + w(|\bq|)\,\mathrm{LR}_m(\bq) \tag{4.3}
 $$
 
-$\mathsf S$ is the $\bq\to0$ response tensor; $S(\Gamma)$ is the average over the fine mini-BZ cell (`--w-head-gamma-cell fine`), and the scale is pinned to the restart's $w^{\mathrm{head}}$. On equal grids the result is the native $W$ bit for bit. The route is compared with `srlr` on [Short- and long-range W §3.3](../../theory/w-range-splitting.md#c1).
+$\Gamma$ lies on both grids and keeps the restart's exact head $w^{\mathrm{head}}$. On equal grids the native $W$ is used unchanged. A downfolded bundle refuses (`GATE srlr_downfold`), because `W0_lr` belongs to the native centroid set.
 
 ### <span class="n">4.4</span> Fine BSE grid with `kgrid_fine` {: #w-fine }
 
 `bse_densify._interpolate_bse_data_to_grid`
 {: .in-code }
 
-With the input key `kgrid_fine` the loader moves the whole problem to the finer grid before the driver starts: states and energies by H-transform, $W$ by the same interpolant with `w_head_densify = c1` (as in 4.3) or `srlr`, which subtracts a fitted long-range model $\mathrm{LR}_m$ with window $w(|\bq|)$ from every coarse tile and adds it back at every fine $\bq$:
+With the input key `kgrid_fine` the loader moves the whole problem to the finer grid before the driver starts: states and energies by H-transform, $W$ by the `srlr` model of 4.3 (`w_head_densify = srlr`, the only model), which subtracts a fitted long-range model $\mathrm{LR}_m$ with window $w(|\bq|)$ from every coarse tile and adds it back at every fine $\bq$:
 
 $$
 W_{\bq_f} = T\big[W - w\,\mathrm{LR}_m\big]_{\bq_f} + w\,\mathrm{LR}_m(\bq_f) \tag{4.4}
@@ -329,7 +329,7 @@ The levels are converted from Ry to eV and written by rank 0 to `<prefix>.dat`, 
 | $w_x$ | exchange weight, 2 scalar, 1 spinor |
 | $\alpha$, $v^{\mathrm{LR}}$ | Gaussian split width; long-range Coulomb |
 | $d^a_{cv\bk}$, $M_{ab}(\bQ)$ | velocity dipoles; mini-BZ cell moment |
-| $T$, $S(\bq)$, $\Gamma_c$ | trigonometric interpolant; head channel; coarse $\Gamma$ cell |
+| $T$, $\mathrm{LR}_m$, $w(\lvert\bq\rvert)$ | trigonometric interpolant; fitted long-range model; its window |
 
 ## References {: #refs }
 

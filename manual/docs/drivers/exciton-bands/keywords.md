@@ -43,15 +43,21 @@ Must fit inside the input file's H-transform window below its guard bands.
 {: .kw-details }
 
 ### `nval` {: .kw data-type="int" data-default="required" }
-Valence bands of the H-transform window, $[n_\mathrm{elec}-n_\mathrm{val},\, n_\mathrm{elec}+n_\mathrm{cond})$.
+Valence bands of the H-transform window, $[n_\mathrm{elec}-n_\mathrm{val},\, n_\mathrm{elec}+n_\mathrm{cond})$. Required unless `number_bands_protected` is given.
 
 Under `--refit-window zeta` the window must be the GW run's ζ-fit window exactly; it is also the window `--refit-window bse` fits on.
 {: .kw-details }
 
 ### `ncond` {: .kw data-type="int" data-default="required" }
-Conduction bands of the H-transform window.
+Conduction bands of the H-transform window. Required unless `number_bands_protected` is given.
 
 Keep at least `number_cond_bands_fine` + 4: fewer than four guard bands above the BSE conduction window warns, and more than 16 warns too.
+{: .kw-details }
+
+### `number_bands_protected` {: .kw data-type="int" data-default="instead of nval, ncond" }
+The same window as one band count, every occupied band plus conduction bands up to this total. Resolved against the WFN as in [GW](../gw/keywords.md#number_bands_protected).
+
+It gives `nval` = $n_\mathrm{elec}$ and `ncond` = total − $n_\mathrm{elec}$, and must lie between $n_\mathrm{elec}$ and `number_bands`.
 {: .kw-details }
 
 **Q path**
@@ -59,7 +65,7 @@ Keep at least `number_cond_bands_fine` + 4: fewer than four guard bands above th
 ### `K_POINTS` {: .kw data-type="block" data-default="required" }
 The path corners: a line starting `K_POINTS`, the corner count, then one line per corner with three crystal coordinates, a point count and an optional `#label`.
 
-The count on a corner's line is the number of points on the segment that ends there; the first corner's count is unused.
+The count on a corner's line is the number of steps from that corner to the next one, as in Quantum ESPRESSO's `crystal_b`. The last corner's count is unused.
 {: .kw-details }
 
 **Restart and layout**
@@ -204,13 +210,13 @@ Fine BSE grid `"NX NY NZ"`: the loader moves the whole problem onto it before th
 The exchange-tile grid stays the coarse restart grid. Refuses with `eqp_corrections`.
 {: .kw-details }
 
-### `w_head_densify` {: .kw data-type="enum" data-default="c1" }
+### `w_head_densify` {: .kw data-type="enum" data-default="srlr" }
 Treatment of the long-range part of $W$ when it is densified. Shared with [`bse`](../bse/keywords.md).
 
-`--w-coarse-grid` implements `c1` only; `srlr` runs on the `kgrid_fine` path. `legacy` refuses by name.
+`srlr` is the only model, under `--w-coarse-grid` and on the `kgrid_fine` path. It is fitted from the restart's `W0_lr`, so a restart without that group refuses. `c1` and `legacy` were removed and refuse with one line.
 {: .kw-details }
 
-`c1` `srlr`
+`srlr`
 {: .kw-values }
 
 ### `--w-coarse-grid` {: .kw data-type="str" data-default="—" }
@@ -220,13 +226,10 @@ Each axis must divide the BSE grid. Equal to the BSE grid, it changes nothing.
 {: .kw-details }
 
 ### `--w-head-densify` {: .kw data-type="enum" data-default="w_head_densify" }
-Overrides the input file's `w_head_densify` for `--w-coarse-grid`. Only `c1` is accepted.
+Overrides the input file's `w_head_densify` for `--w-coarse-grid`. Only `srlr` is accepted.
 
-### `--w-head-gamma-cell` {: .kw data-type="enum" data-default="fine" }
-Mini-BZ cell over which the re-attached $\Gamma$ head is averaged. `coarse` is a deliberately wrong control for tests.
-
-`fine` `coarse`
-{: .kw-values }
+### `--w-head-gamma-cell` {: .kw data-type="enum" data-default="retired" }
+Removed with the `c1` head model. It refuses with one line.
 
 **Restart and layout**
 

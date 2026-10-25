@@ -375,10 +375,9 @@ The native libraries allocate workspace outside XLA's memory planner, so a stage
 | variable | effect |
 |---|---|
 | `LORRAX_FFI_SO`, `LORRAX_FFI_HOST_SO`, `LORRAX_FFI_ROCM_SO` | absolute path of the CUDA, CPU or ROCm native library. A pinned path that is missing or of another ABI refuses instead of falling through to a search |
-| `LORRAX_FFI_ABI_STRICT=1` | refuse a library with no ABI stamp |
-| `LORRAX_SCALAPACK_MKL_THREADS` | MKL thread count inside ScaLAPACK calls (default `min(current, 4)`) |
 | `LORRAX_DEBUG_PRINT=1` | print the ScaLAPACK workspace per call |
-| `LORRAX_CHECK_COUNTS=1` | refuse unless the device-side spectral cut equals the host-side cut (polar functions) |
+
+Inside ScaLAPACK calls the MKL thread team is capped at four threads, and the previous setting is restored afterwards. A library with no ABI stamp loads with a one-time `LEGACY-UNSEALED` warning, unless a build manifest is found beside it, in which case it refuses.
 
 ## Invariants and gotchas {: #gotchas }
 

@@ -113,7 +113,10 @@ The delivered number of centroids may be slightly below `n_centroids`, because t
 The input file passes through the GW reader, so with `-i` an unknown key or a missing `sys_dim` refuses.
 
 ### `ncond` {: .kw data-type="int" data-default="required" }
-Number of protected conduction bands, the conduction bands whose quasiparticle energies GW corrects. Required unless `number_bands_protected` is given. The default left window ends at $n_\mathrm{val}+\texttt{ncond}$, every occupied band plus the protected conduction bands.
+Number of protected conduction bands, the conduction bands whose quasiparticle energies GW corrects. With `-i`, required unless `number_bands_protected` is given. The default left window ends at $n_\mathrm{val}+\texttt{ncond}$, every occupied band plus the protected conduction bands.
+
+### `number_bands_protected` {: .kw data-type="int" data-default="instead of ncond" }
+The protected window as one band count, every occupied band plus conduction bands up to this total. Resolved against the WFN as in [GW](../drivers/gw/keywords.md#number_bands_protected), so the default left window ends at this total.
 
 ### `sys_dim` {: .kw data-type="int" data-default="required" }
 Checked by the input file reader only; the selection does not use it.
@@ -124,7 +127,7 @@ Optional
 **Band windows**
 
 ### `-i`, `--input` {: .kw data-type="path" data-default="unset" }
-GW input file. Supplies `wfn_file` and `ncond`, the number of protected conduction bands.
+GW input file. Supplies `wfn_file` and the protected window, `ncond` or `number_bands_protected`.
 
 With it the left window is every occupied band plus the protected conduction bands, and the right window every band in `WFN.h5`. Without it the WFN is `./WFN.h5` and the left window widens to every band, with a warning.
 {: .kw-details }
@@ -168,20 +171,6 @@ Wavefunction file, relative to the input file directory.
 ### `memory_per_device_gb` {: .kw data-type="float" data-default="0.0" }
 Device budget for the planners' prices; `0` keeps auto-detection.
 
-**Environment**
-
-### `LORRAX_CENTROID_SELECT` {: .kw data-type="env" data-default="deliver" }
-What a numerically flat pool does: `deliver` reports the rank shortfall, `strict` refuses.
-
-Any other value refuses.
-{: .kw-details }
-
-`deliver` `strict`
-{: .kw-values }
-
-### `LORRAX_CENTROID_PC_TOL` {: .kw data-type="env" data-default="sqrt(eps)" }
-Pivoted-Cholesky stopping floor, relative to the largest initial Gram diagonal.
-
 **Four-current runs**
 
 ### `--density-mode` {: .kw data-type="enum" data-default="scalar" }
@@ -215,8 +204,8 @@ The GW run hashes the table's contents. A new table, even with the same count, i
     - A window that reaches past the bands in `WFN.h5`, or whose top band exceeds half the plane-wave basis ($0.5\,n_{\bG,\max}\,n_\mathrm{spinor}$). Raise the cutoff or lower the band count.
     - A Gram that is not positive semidefinite: the Schur residual falls below minus the noise floor.
     - A pool that runs out of candidates before the request is met, or a point budget smaller than every orbit. Raise `--oversample` or lower `n_centroids`.
-    - A rank shortfall under `LORRAX_CENTROID_SELECT=strict`, or any value of that variable other than `deliver` and `strict`.
-    - An input file (`-i`) without `sys_dim`, or with an unknown key.
+    - No `n_centroids` on the command line.
+    - An input file (`-i`) without `sys_dim`, or with an unknown key, or without `ncond` or `number_bands_protected` (`ncond is required (or number_bands_protected)`).
 
 A pool that is numerically flat (fewer certified directions than points) is reported, not refused: the extra points are kept as quadrature points.
 

@@ -10,6 +10,8 @@ The BSE and exciton-bands drivers call the [H-transform](htransform.md) in memor
 
 The transformed Hamiltonian is built from every band from the lowest valence band up to the input file's band count, and the bands the BSE uses are returned from inside it. Inside the BSE drivers the H-transform adds no guard bands of its own, so the input file's band count must leave at least four bands above the highest conduction band the BSE uses. The exciton-bands route warns when there are fewer than four, or more than sixteen, since a very wide window asks the shared basis to represent states the kernel never uses. The method and the shared keys are on the [overview](htransform.md).
 
+When the BSE loader fills the `kgrid_fine` grid with QP energies from `eqp_corrections` or `eqp_co_corrections`, a window that reaches above the eqp file's top band gets the same rigid conduction scissor on the bands above it as [`--eqp-file`](htransform.md#-eqp-file), with the same `[QP scissor]` log line.
+
 ## Keywords {: #keywords }
 
 Defaults are read from the keyword schema (`src/gw/gw_config.py`).

@@ -54,7 +54,7 @@ These hold for every kernel on this page unless its section says otherwise.
 
 `ffi.fft.require_kconv(mesh)` runs once at startup from `runtime.initialize_communicator_stack`: on CUDA it finds the wheel, checks every target in `ffi.fft.KCONV_TARGETS` in the loaded library and compiles and runs one probe kernel; on cpu it runs each host engine once. Inside the context manager `ffi.fft.xla_reference()` every factory takes the XLA backend on any platform; this is how each vendor route is held to relative $10^{-12}$ of the reference (`tests/test_kconv_xla_gate.py`).
 
-Two environment variables change only the engine inside a route, for A/B comparison: `LORRAX_BSE_OUTER_KSUM` (`dmma` default, `fma`) and, on ROCm, `LORRAX_KDFT_OUTER` (`measured` default, `all`).
+On ROCm the variable `LORRAX_KDFT_OUTER` (`measured` by default, or `all`) changes only the engine inside a route, for A/B comparison. The CUDA BSE outer k sum always runs on the FP64 tensor cores (DMMA).
 
 **GEMMs.** The Green build goes through `distrib_la` plans, which resolve their provider per platform ([distrib_la](distrib_la.md)). The band projection's host GEMM has one dial, `LORRAX_BANDS_GEMM_FFI` (`on` default, `off`), which exists only on cpu meshes: off is an announced debug fallback to the XLA einsum. On GPU meshes XLA's `dot` already calls cuBLAS and the dial does not apply. `LORRAX_MKLBLAS_THREADS` (`auto`, `off`, or an integer) sets the BLAS thread team inside that handler.
 

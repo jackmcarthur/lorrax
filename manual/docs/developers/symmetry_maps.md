@@ -93,7 +93,8 @@ The verdict is measured once per WFN and consumed everywhere. For a two-componen
 | `discover_qe_schema_paths(*wfn_paths)` | candidate schemas beside the WFN and in nearby `*.save/` directories |
 | `qe_xml_seitz_to_bgw(rotation, fractional_translation)` | one QE translation in BerkeleyGW `tnp` units |
 
-`LORRAX_TRS_CHECK` (`1`/`on` default, or `strict`: a broken or inconclusive verdict raises), `LORRAX_TRS_TOL` (default $10^{-6}$) and `LORRAX_TRS_MAX_K` (default 12) tune the measurement. With `strict` unset, a raw-pair failure when QE reports zero moment raises `GATE trs_qe_nonmagnetic_wfn_consistent`; other failures turn time reversal off with a warning.
+`LORRAX_TRS_CHECK` (`1` or `on` by default, or `strict`, under which a broken or inconclusive verdict raises) is the only environment control of the measurement. The tolerance is fixed at $10^{-6}$ (`TOL_TRS`) and the measurement uses at most 12 k points (`MAX_K_DEFAULT`).
+ With `strict` unset, a raw-pair failure when QE reports zero moment raises `GATE trs_qe_nonmagnetic_wfn_consistent`; other failures turn time reversal off with a warning.
 
 ## Grid algebra {: #grid-algebra }
 

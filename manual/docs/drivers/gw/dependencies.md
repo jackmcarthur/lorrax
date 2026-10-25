@@ -76,7 +76,7 @@ File formats are on the [Files](files.md) page.
 !!! cache "tmp/zeta_q.h5"
     **Reused when** `restart = false`, `zeta_is_done` is true and `fit_provenance` is present<br>
     **and matching** this run's provenance JSON (WFN path spelling, a q-wedge equivalence and legacy keys at their legacy values excepted), the stored centroid table element by element, and the ζ dataset's $N_\mu$. The WFN is identified by resolved path and byte size. Device count is not in the provenance, so a fit at one process count is reused at another.<br>
-    <span class="refuse">Refits on miss, per channel. `LORRAX_FORCE_REFIT=1` forces a refit.</span>
+    <span class="refuse">Refits on miss, per channel. Delete the file to force a refit.</span>
 
 !!! cache "tmp/mpa/&lt;label&gt;_tangential/"
     **Reused when** a QSGW map finds its own committed `model.h5`, or a complete response bank of the same identity and the same $V_\bq$ digest<br>

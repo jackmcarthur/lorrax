@@ -45,10 +45,10 @@ The treatments differ in the poles: one per matrix element (plasmon-pole models)
 | `compute_mode = hl_ppm` | Hybertsen–Louie plasmon pole |
 | `compute_mode = tangential` | tangential model, full frequency (preferred) |
 
-`compute_mode` defaults to `auto`, which reads the legacy keys: `use_ppm_sigma = true` gives `gn_ppm` (or `hl_ppm` when `ppm_model = hl`), otherwise `do_screened` gives `cohsex` or `x_only`. `auto` never selects `tangential`, so the production route names it in the input file. The key-by-key entry is on the GW keyword page: [`compute_mode`](../drivers/gw/keywords.md#compute_mode). Other W models are on [this page](multipole-w.md).
+`compute_mode` defaults to `auto`, which resolves to `gn_ppm`, or to `x_only` under the deprecated `do_screened = false`. The deprecated `use_ppm_sigma = true` still gives `gn_ppm`, or `hl_ppm` with `ppm_model = hl`. `auto` never selects `tangential`, so the production route names it in the input file. The key-by-key entry is on the GW keyword page: [`compute_mode`](../drivers/gw/keywords.md#compute_mode). Other W models are on [this page](multipole-w.md).
 
 !!! note
-    The material class is read from the WFN occupations. On a metal `cohsex`, `gn_ppm` and `hl_ppm` refuse; `compute_mode = tangential` is the production metal model. See [Metals §5](metals.md#refusals).
+    The material class is read from the WFN occupations. On a metal `cohsex`, `gn_ppm` and `hl_ppm` refuse, and so does `auto` unless it resolves to `x_only`. The refusal of `auto` names `compute_mode = tangential`, the production metal model. See [Metals §5](metals.md#refusals).
 
 ## <span class="n">2</span> Comparison {: #compare }
 
@@ -147,7 +147,7 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
 
     The same two-point fit with the probe on the real axis above every transition, so $\omega_p^2W^c(\omega_p)$ reads the first-moment ($f$-sum) coefficient from the band-summed response.
 
-    Two W solves, the probe on the full zone. Missing: a default probe. `ppm_omega_p` defaults to the GN value 2 Ry, which lies inside the spectrum of most input files and refuses; set it above the largest $\chi^0$ transition.
+    Two W solves, the probe on the full zone. Unset, `ppm_omega_p` is 200 Ry under `hl_ppm`. A probe at or below the largest $\chi^0$ transition refuses.
 
     $$
     \Omega^2=-\omega_p^2\,\frac{W^c(\omega_p)}{W^c(0)-W^c(\omega_p)},\qquad \omega_p>\Delta_{\max} \tag{2.1}
@@ -164,7 +164,6 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
 
     ```ini
     compute_mode = hl_ppm
-    ppm_omega_p  = 200.0
     ```
 
 === "Tangential"
@@ -196,7 +195,7 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
 
     The ω′ integral is rotated onto the imaginary axis, and the residues of the Green's-function poles that the rotation crosses are added from $W$ just above the real axis. LORRAX uses it as a reference for the pole models and for comparisons with BerkeleyGW and Yambo. Full page: [Contour deformation](contour-deformation.md).
 
-    $W^c$ is the exact ISDF RPA value at every point, with no pole model: a tan-mapped Gauss–Legendre rule on the imaginary axis (96 nodes by default) with a two-pole anchor at $i\eta$, and a uniform knot line $x_j+i\eta$, $h\le\eta/4$, on which each residue is read by cubic Hermite interpolation. It runs with `head_correction = off` and without band extrapolation.
+    $W^c$ is the exact ISDF RPA value at every point, with no pole model: a tan-mapped Gauss–Legendre rule on the imaginary axis (96 nodes by default) with a two-pole anchor at $i\eta$, and a uniform knot line $x_j+i\eta$, $h\le\eta/4$, on which each residue is read by cubic Hermite interpolation. It runs one-shot, with `head_correction = off` and without band extrapolation, and refuses `qp_solver = self_consistent`.
 
     $$
     \Sigma^c(E)=A(E)+\sum_iI_i(E)-S_A(E)+\sum_jR_j(E) \tag{2.1}
@@ -414,7 +413,7 @@ $$
 \Sigma^{c}_{mn\bk}(E_{m\bk}),\quad \Sigma^{c}_{mn\bk}(E_{n\bk}),\quad \frac{\partial\Sigma^{c}_{nn\bk}}{\partial\omega}\Big|_{E_{n\bk}} \tag{6.3}
 $$
 
-and the derivative is the exact $\omega$-derivative of the same quadrature, not a finite difference. `sigma_omega_grid_debug = true` (default `false`) folds onto the uniform `sigma_omega_step_ev` grid instead. The $\bq\to0$ head is added in closed form after the sweep ([The q → 0 head §4.3](q0-head.md#sigma-c)).
+and the derivative is the exact $\omega$-derivative of the same quadrature, not a finite difference. The contour-deformation route accumulates its derivative in closed form in the same way ([Contour deformation §6.4](contour-deformation.md#on-shell)). `sigma_omega_grid_debug = true` (default `false`) folds onto the uniform `sigma_omega_step_ev` grid instead. The $\bq\to0$ head is added in closed form after the sweep ([The q → 0 head §4.3](q0-head.md#sigma-c)).
 
 ## Notation {: #notation }
 

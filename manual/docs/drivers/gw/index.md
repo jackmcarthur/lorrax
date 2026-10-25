@@ -114,7 +114,7 @@ Two treatments are for production runs: the tangential model, full frequency, fo
     compute_mode = gn_ppm
     ```
 
-    **Note** Refuses metallic occupations.
+    **Note** What `compute_mode = auto` runs. Refuses metallic occupations.
 
 ??? treatment "Other treatments: debugging and comparison"
     ??? treatment supported "x_only · Exchange only · static"
@@ -141,10 +141,10 @@ Two treatments are for production runs: the tangential model, full frequency, fo
         compute_mode = cohsex
         ```
 
-        **Note** What `compute_mode = auto` runs. Refuses metallic occupations.
+        **Note** Refuses metallic occupations.
 
     ??? treatment in-progress "hl_ppm · Hybertsen–Louie plasmon pole · plasmon pole"
-        The same two-point fit with the probe on the real axis above every $\chi^0$ transition, $\omega_p>\Delta_{\max}$, so the pole carries the $f$-sum coefficient. Missing: a default probe; the GN default of 2 Ry lies inside the spectrum of most input files and refuses.
+        The same two-point fit with the probe on the real axis above every $\chi^0$ transition, $\omega_p>\Delta_{\max}$, so the pole carries the $f$-sum coefficient. Unset, `ppm_omega_p` is 200 Ry under `hl_ppm`, and a probe inside the $\chi^0$ spectrum refuses.
 
         $$
         \Omega^2_{\bq}(\mu,\nu)=-\omega_p^2\,\frac{W^c_{\bq}(\mu,\nu;\omega_p)}{W^c_{\bq}(\mu,\nu;0)-W^c_{\bq}(\mu,\nu;\omega_p)}
@@ -152,7 +152,6 @@ Two treatments are for production runs: the tangential model, full frequency, fo
 
         ```ini
         compute_mode = hl_ppm
-        ppm_omega_p  = 200.0
         ```
 
         **Note** Refuses metallic occupations and time-reversal-broken input files.
@@ -172,7 +171,7 @@ Two treatments are for production runs: the tangential model, full frequency, fo
         use_band_extrapolation      = false
         ```
 
-        **Note** Refuses the $\bq\to0$ head, band extrapolation and `linalg = distributed` (implementation limits).
+        **Note** Refuses the $\bq\to0$ head, band extrapolation, `linalg = distributed` and `qp_solver = self_consistent` (implementation limits).
 
 ## Accuracy and convergence {: #accuracy }
 
@@ -198,8 +197,9 @@ A refusal names the key or file and the fix. The ones most runs meet are listed 
 
 !!! refuses "Common"
     - No `sys_dim`. Add `sys_dim = 3` (bulk) or `2` (slab). 
+    - No `number_bands`, no `centroids_file`, or no band request (`nval` and `ncond`, or `number_bands_protected`). The message lists each missing key. 
     - An unknown key, or a `;` comment after a value. Delete the key; comments start with `#`. 
-    - Fractional WFN occupations (a metal) with `compute_mode = cohsex`, `gn_ppm` or `hl_ppm`, without `occ_smearing_width_ry`, or with `sc_head_update = interband_commutator`. 
+    - Fractional WFN occupations (a metal) with `compute_mode` left at `auto` (the message names `compute_mode = tangential`) or set to `cohsex`, `gn_ppm` or `hl_ppm`, without `occ_smearing_width_ry`, or with `sc_head_update = interband_commutator`. 
     - A `kin_ion.h5` that is missing, has too few bands, or was built for another `sys_dim`, spinor count, k-point count or `bispinor` setting, or in the retired format with Hartree folded in. Rerun kin-ion. Its WFN fingerprint is not compared. 
     - A missing `dipole.h5` with the head on, or one built with another velocity operator, with or without the nonlocal commutator. Under `head_correction = full`, also one from another WFN or band window; on the direct-head path that mismatch only warns, unless `LORRAX_SANITY=strict`. Rerun dipole on this input file and WFN. 
     - A centroid table whose fit windows drop an occupied band. Rerun centroids with windows that start at band 0. 
@@ -215,6 +215,7 @@ A refusal names the key or file and the fix. The ones most runs meet are listed 
     - A key of the [other W models](../../theory/multipole-w.md#keywords) under `compute_mode = tangential`, and with the head off every head-fit sampling key. Delete them. 
     - `sigma_regularization_ev` that is not finite and positive. 
     - `screening_diagrams = w_bse | w_rpa_resolvent` outside its supported treatments, on a centroid set that is not orbit-closed, or (`w_bse`) on a time-reversal-broken WFN. 
+    - `sigma_frequency_integration = contour_deformation` with `qp_solver = self_consistent`, or with the deprecated `self_consistent = true` (`GATE cd_self_consistent_unimplemented`). 
     - `sc_initial_qp_rotations_file` without `qp_solver = self_consistent`. 
     - `sc_head_update` other than `off` with `head_correction = off`; `occ_broadening > 0` outside a QSGW run with a velocity head, or beside `occ_smearing_width_ry`. 
     - `use_band_extrapolation = true` or a bracket scheme named on a run with no dynamic Σ stage; a bracket scheme named with extrapolation off. 

@@ -10,7 +10,7 @@ A `bool` variable follows `runtime.env_flags.env_bool`: unset or blank gives the
 
 ## Site and libraries {: #ffi }
 
-A sealed deployment (the Perlmutter module, a cloud bundle) needs none of these: the loader finds the bundle manifest beside its `lib/` directory. The two legs of the native library are described on [Installation](installation.md#ffi).
+A sealed deployment (the Perlmutter module, a cloud bundle) needs none of these: the loader finds the bundle manifest beside its `lib/` directory. The legs of the native library are described on [Installation](installation.md#ffi).
 
 ### `LORRAX_SITE_PROFILE` {: .kw data-type="env · string" data-default="unset" }
 Names the site profile `config/<name>/site.toml`, ahead of `NERSC_HOST` and `LMOD_SYSTEM_NAME`.
@@ -28,6 +28,12 @@ Unset, `src/ffi/cpp/build/liblorrax_ffi.so`. Pinning a leg of a sealed bundle re
 Path of the host leg, `liblorrax_ffi_host.so`.
 
 Unset, `src/ffi/cpp/build_host/liblorrax_ffi_host.so`. Same sealed-pair rule as `LORRAX_FFI_SO`.
+{: .kw-details }
+
+### `LORRAX_FFI_ROCM_SO` {: .kw data-type="env · path" data-default="in-tree build" }
+Path of the ROCm leg, `liblorrax_ffi_rocm.so`.
+
+Unset, `src/ffi/cpp/build_rocm/liblorrax_ffi_rocm.so`. It takes the place of `LORRAX_FFI_SO` on an AMD GPU, and a sealed bundle pairs it with `LORRAX_FFI_HOST_SO` under the same rule.
 {: .kw-details }
 
 ### `LORRAX_FFTW3_SO` {: .kw data-type="env · path" data-default="unset" }
@@ -113,7 +119,7 @@ For debugging, profiling and tuning a new machine; never set in a production run
     | Variable | Default | Effect |
     |---|---|---|
     | `LORRAX_CHECKOUT` | unset | The checkout whose `src/` the launcher runs. A path without `src/runtime/__init__.py`, or a runtime imported from elsewhere, refuses. |
-    | `LORRAX_DEBUG_PRINT`{: #lorrax_debug_print } | `0` | The one verbosity switch, read by Python and the native layer: timing-section entry and exit, cache-miss explanations, memory probes, HDF5 inventories and timings, native-provider diagnostics, the per-rank GPU binding of `select_gpu.sh`. |
+    | `LORRAX_DEBUG_PRINT`{: #lorrax_debug_print } | `0` | The one verbosity switch, read by Python and the native layer: timing-section entry and exit, cache-miss explanations, memory probes, HDF5 inventories and timings, the per-rank slab-I/O timing logs, native-provider diagnostics, the cuSOLVERMp eigensolver phase profile, the ELPA pool report, the per-rank GPU binding of `select_gpu.sh`. |
     | `LORRAX_STAGE_SYNC` | `0` | Restores every timing-only device wait, so each stage row of the timing table is its own device time. |
     | `ISDF_JAX_PROFILE_DIR` | unset | Directory of `jax.profiler` traces of the timed sections. |
     | `ISDF_JAX_PROFILE_SECTIONS` | every section | Comma list of substrings selecting the sections that open a trace. Name them above four processes: a trace live across a multi-node parallel-HDF5 write crashes rank 0. |
@@ -126,6 +132,10 @@ For debugging, profiling and tuning a new machine; never set in a production run
     | `LORRAX_FFT_FFI_THREADS` | `auto` | OpenMP team of the host FFT chunk loop; same grammar, integers 1–4096. |
     | `LORRAX_PHDF5_STRIPE_COUNT` | clamp(P, 4, 128) | Lustre stripe count of new files, which is also the MPI-IO aggregator count; a non-integer or negative value refuses. |
     | `LORRAX_PHDF5_STRIPE_SIZE_FS` | P/16 MiB, 1–4 | Lustre stripe size in `lfs setstripe -S` spelling (`4M`); an unknown suffix refuses. |
+    | `LORRAX_BANDS_GEMM_FFI` | `1` | On a CPU mesh the band contractions run through the vendor-BLAS batched-GEMM handler of the host leg, and a missing handler refuses at startup. `0` is an announced debug opt-out onto XLA's own dot lowering, which runs 1.6 to 1.9 times slower. An unrecognised value is announced and taken as the default. A GPU run ignores it, since XLA already calls cuBLAS there. |
+    | `LORRAX_KDFT_OUTER` | `measured` | On a ROCm mesh, `all` sends the BSE outer load and its fused decode to the kdft kernels wherever they fit, past the measured routing rule. The ROCm gate tests and benchmarks set it. Any value other than `measured` or `all` refuses. |
+    | `LORRAX_KDFT_KBOX_ARM` | unset (the rule) | `single`, `split`, `split2` or `split3` forces that arm of the ROCm k-box r-space kernel where it fits, for the gate tests and benchmarks. An arm that cannot hold the grid falls back to the rule, and any other value is the rule. |
+    | `LORRAX_GPU_DEVICE` | unset | Comma list of device ordinals, one per local rank, that `select_gpu.sh` uses ahead of `CUDA_VISIBLE_DEVICES` and the Slurm GPU lists. A launcher sets it to place several one-GPU steps on different devices of a node, which Slurm does not do. A list with no entry for some rank refuses. |
 
 ## Variables of other software {: #external }
 

@@ -10,7 +10,7 @@ page: keywords
 
 <div class="workflow-map" data-driver="nscf" data-page="keywords"></div>
 
-The input file is an INI file with one `[nscf]` section, keys written `key = value`; paths resolve relative to the input file. Defaults are read from the keyword schema (`src/psp/nscf_input.py`) and the driver argparse (`src/psp/run_nscf.py`). A command-line flag of the same meaning overrides the input file value. Without `-i`, `--save` is required and the same defaults apply.
+The input file is an INI file with one `[nscf]` section, keys written `key = value`; paths resolve relative to the input file. Defaults are read from the keyword schema (`src/psp/nscf_input.py`) and the driver argparse (`src/psp/run_nscf.py`). A command-line flag of the same meaning overrides the input file value. Without `-i`, `--save`, `--nbnd` and `--nk` are required, and the other defaults are the same.
 
 Every Hamiltonian parameter not listed here comes from the QE `.save` and cannot be changed from the input file: the cutoffs `ecutwfc` and `ecutrho`, the FFT grid, the structure and symmetry, `nelec`, the spinor representation (`noncolin`, `lspinorb`) and `assume_isolated`.
 

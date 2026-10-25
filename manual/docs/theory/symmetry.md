@@ -106,7 +106,7 @@ $$
 The partner pairs are stored $\bk/{-\bk}$ rows, spatial images of a stored partner, and time-reversal-invariant points, at most 12 k. $r$ is invariant to band phases and to rotations inside degenerate blocks. With QE's moment exactly 0 a failed pair refuses, because $\Theta$ is then exact and the WFN is inconsistent; at $0 < |m| < 10^{-4}\,\mu_B$, or when only a spatial image fails, time reversal is switched off with a warning.
 
 !!! note
-    A completed verdict is stamped in the user cache (`wfn_trs`), keyed on the file, a digest of its header and the tolerances, so a rerun on the same WFN skips the measurement. `LORRAX_TRS_CHECK=strict` makes a broken or inconclusive verdict refuse; `LORRAX_TRS_TOL` and `LORRAX_TRS_MAX_K` set the tolerance and the k cap ([`LORRAX_TRS_CHECK`](../using/environment.md#lorrax_trs_check)).
+    A completed verdict is stamped in the user cache (`wfn_trs`), keyed on the file, a digest of its header and the tolerances, so a rerun on the same WFN skips the measurement. `LORRAX_TRS_CHECK=strict` makes a broken or inconclusive verdict refuse ([`LORRAX_TRS_CHECK`](../using/environment.md#lorrax_trs_check)). The tolerance is fixed at $10^{-6}$ and the measurement uses at most 12 k points.
 
 ### <span class="n">2.2</span> QE schema provenance {: #sym-schema }
 

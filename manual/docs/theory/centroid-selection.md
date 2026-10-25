@@ -118,7 +118,7 @@ $$
 d(\br_a) = K(\br_a,\br_a) - \sum_{\mu\nu} K(\br_a,\br_\mu)\,[K^{-1}]_{\mu\nu}\,K(\br_\nu,\br_a) \tag{3.2}
 $$
 
-The code updates $d$ by rank-1 Cholesky steps. Candidates below the floor $\sqrt{\epsilon}\,\max_a K(\br_a,\br_a)$ are never picked; `LORRAX_CENTROID_PC_TOL` replaces $\sqrt{\epsilon}$.
+The code updates $d$ by rank-1 Cholesky steps. Candidates below the floor $\sqrt{\epsilon}\,\max_a K(\br_a,\br_a)$, with $\epsilon$ the double-precision machine epsilon, are never picked.
 
 ### <span class="n">3.3</span> Whole orbits {: #cs-orbits }
 
@@ -139,7 +139,7 @@ The rank is the number of pivots taken above the floor, printed as `pool rank=`.
 - `stop: pool spent`: no unpicked candidate is above the floor. The rank is that of the pool, a lower bound on the rank of the pair set; a larger pool can raise it.
 - `stop: point budget`: the budget ran out while candidates still carried directions. The rank of the pair set is not measured, and the run warns `CentroidRankNotEstablished`.
 
-Numerical rank deficiency is reported; `LORRAX_CENTROID_SELECT=strict` makes it a refusal.
+Numerical rank deficiency is reported and never refuses.
 
 ### <span class="n">4.2</span> Choosing N_μ {: #cs-target }
 

@@ -7,7 +7,7 @@
 
 <figure class="flowchart" markdown>
 [![Static W for the BSE](../assets/figures/b4.png)](../assets/figures/b4.png)
-<figcaption><strong>Fig. B4.</strong> Static $W$ for the BSE on a fine k grid. Stage 1 forms the static $W$ on the GW grid and the polarizability in plane waves, in blocks of the long-range vectors $\bG_L$ and the rest $\bG_S$. Stage 2 takes the Schur complement on the $\bG_L$ block, which gives the long-range polarizability $P$, the screened interaction $D$, the local-field factor $\Lambda$ and the long-range part $W^{\mathrm{LR}}$. Stage 3 Fourier-interpolates the short-range part, evaluates the fitted long-range part at every fine $\bq$, and adds the $\bq=0$ head. A tangential GW run has no split and supports only `c1`.</figcaption>
+<figcaption><strong>Fig. B4.</strong> Static $W$ for the BSE on a fine k grid. Stage 1 forms the static $W$ on the GW grid and the polarizability in plane waves, in blocks of the long-range vectors $\bG_L$ and the rest $\bG_S$. Stage 2 takes the Schur complement on the $\bG_L$ block, which gives the long-range polarizability $P$, the screened interaction $D$, the local-field factor $\Lambda$ and the long-range part $W^{\mathrm{LR}}$. Stage 3 Fourier-interpolates the short-range part, evaluates the fitted long-range part at every fine $\bq$, and adds the $\bq=0$ head. A self-consistent or bispinor tangential GW run writes no split.</figcaption>
 </figure>
 
 ## <span class="n">1</span> Overview {: #overview }
@@ -28,11 +28,11 @@ Both parts are written with the plane-wave coefficients $\zeta_{\bq\mu}(\bG)$ of
 - **Interpolation (§4).** The long-range part is fitted as a smooth function of $\bq$ and evaluated at every fine $\bq$, and the short-range part is Fourier-interpolated.
 - **The head at Γ (§4.3).** The $\bq=0$ element, which no grid point samples, is added separately as a mini-BZ average from the [q → 0 head](q0-head.md).
 
-Because the long-range part is subtracted on the coarse grid and added back on the fine grid, every coarse point is reproduced, and an error in its fit only changes how smooth the interpolated short-range part is. This route is selected by `w_head_densify = srlr`. The default, `c1`, treats only the head (§5). Fig. 1 compares the two on a one-dimensional sketch.
+Because the long-range part is subtracted on the coarse grid and added back on the fine grid, every coarse point is reproduced, and an error in its fit only changes how smooth the interpolated short-range part is. This route is selected by `w_head_densify = srlr`, the default and only model. Fig. 1 compares it on a one-dimensional sketch with the head-only model `c1`, which was removed on 2026-10-22 (§5).
 
 <figure class="flowchart" markdown>
 [![W along a line through Γ: the split and the two routes](../assets/figures/theory-wrange-split.png)](../assets/figures/theory-wrange-split.png)
-<figcaption><strong>Fig. 1.</strong> A schematic in arbitrary units, not a calculation. The upper panel shows $W_\bq$ along a line through $\Gamma$, its long-range part multiplied by the window $w(|\bq|)$ of §4.2 (grey, right axis), and the short-range part $W^{\mathrm{SR}}_\bq$ that is interpolated. The lower panel shows what each route puts on a four times finer grid. The `c1` points follow the Fourier interpolation of the coarse values, which contain the $1/q^2$ rise at their own $\bq$, and add a head only inside the coarse $\Gamma$ cell. The `srlr` points follow the exact curve. The sketch uses the exact long-range term, where LORRAX fits it in $\bq$ (§4.1).</figcaption>
+<figcaption><strong>Fig. 1.</strong> A schematic in arbitrary units, not a calculation. The upper panel shows $W_\bq$ along a line through $\Gamma$, its long-range part multiplied by the window $w(|\bq|)$ of §4.2 (grey, right axis), and the short-range part $W^{\mathrm{SR}}_\bq$ that is interpolated. The lower panel shows what `srlr` and the removed `c1` model put on a four times finer grid. The `c1` points follow the Fourier interpolation of the coarse values, which contain the $1/q^2$ rise at their own $\bq$, and add a head only inside the coarse $\Gamma$ cell. The `srlr` points follow the exact curve. The sketch uses the exact long-range term, where LORRAX fits it in $\bq$ (§4.1).</figcaption>
 </figure>
 
 ## <span class="n">2</span> The long-range plane waves {: #channels }
@@ -146,18 +146,18 @@ On the coarse grid we now have $W^{\mathrm{SR}}$ and the long-range arrays $\til
 
 Near $\Gamma$ both $\tilde\zeta$ and $P$ are smooth in $\bq$ once their known factors are removed, and we expand them about $\bq=0$. The fit is local. It uses only the coarse points inside the ball $|\bq|<0.9\,q_{\mathrm{ins}}$, with $q_{\mathrm{ins}}$ the inscribed radius of the zone, and the result is used only inside the window of §4.2, which vanishes at the same radius. Here $\bq$ means the shortest vector $\bq+\bG_{\mathrm{ws}}$, in-plane for a slab, which is unique inside the ball, so the umklapp at the zone boundary never enters the fit. Near the boundary $W$ is Fourier-interpolated whole.
 
-Each coefficient $\tilde\zeta_{\bq\mu}(\bG_L)$ carries the Bloch phase $e^{-i\bq\cdot\br_\mu}$ of its centroid. With the phase removed, its Taylor series in $\bq$ is the expansion of the dressed ISDF vector in moments about $\br_\mu$, and LORRAX keeps terms up to fourth order in the components of $\bq$. This is the same expansion that gives the dipole and quadrupole terms of the long-range electron–phonon vertex [10, 14, 15], with the coefficients fitted to the coarse points instead of computed from Born charges and quadrupole tensors. $P$ vanishes as $q^2$ on the row and column of $\bG_{\mathrm{ws}}$, because the charge response starts at second order, and is fitted as that factor times a polynomial in $q^2$ of degree up to three, so its head runs from $q^2$ to $q^8$. The fit of $P$ depends on $|\bq|$ only. These orders are upper limits. The degree of the coefficient fit is lowered until the fit has at least twice as many points as coefficients, and the degree of $P$ in $q^2$ is at most one less than the number of distinct $|\bq|$ in the ball, so on a small grid both fits are of low order.
+Each coefficient $\tilde\zeta_{\bq\mu}(\bG_L)$ carries the Bloch phase $e^{-i\bq\cdot\br_\mu}$ of its centroid. With the phase removed, its Taylor series in $\bq$ is the expansion of the dressed ISDF vector in moments about $\br_\mu$, and LORRAX keeps terms up to fourth order in the components of $\bq$. This is the same expansion that gives the dipole and quadrupole terms of the long-range electron–phonon vertex [10, 14, 15], with the coefficients fitted to the coarse points instead of computed from Born charges and quadrupole tensors. The fit of $P$ follows the direction of $\bq$ as well as its length. Each element is a least-squares polynomial in the periodic Cartesian components of $\bq$, with every monomial up to a direction-resolved degree of at most four and radial terms $|\bq|^{2k}$ above it. The elements fall into three classes. The head $P(\bG_{\mathrm{ws}},\bG_{\mathrm{ws}})$ vanishes as $q^2$, because the charge response starts at second order, and is fitted with the even orders $q^2$ to $q^8$, so its leading term is $\bq\cdot S_{\mathrm{fit}}\cdot\bq$ with $S_{\mathrm{fit}}$ a full tensor. In a slab the wings between $G_z=0$ and $G_z\neq0$ run from first order to $q^8$ with no constant term, which charge neutrality forbids, and the block between the $G_z\neq0$ shells runs from a constant to $q^6$. In bulk $N_L=1$ and only the head is fitted. These orders are upper limits. The degree of the coefficient fit is lowered until the fit has at least twice as many points as coefficients. The degree of $P$ in $q^2$ is at most one less than the number of distinct $|\bq|$ in the ball, and the direction-resolved degree of each class is lowered until the class has at most half as many terms as points and its terms are independent on the coarse points. On a small grid both fits are therefore of low order, and at the lowest order the fit of $P$ is radial in $q^2$ with the head still led by $\bq\cdot S_{\mathrm{fit}}\cdot\bq$.
 
-The head of $P$ is softly anchored to the [q → 0 head](q0-head.md#s-tensor), $P(\bG_{\mathrm{ws}},\bG_{\mathrm{ws}})\to\bar S\,q^2$ with $\bar S$ the mean diagonal of $\mathrm{Re}\,S$ over the periodic directions, and its wings start at $q^4$. On MoS₂ 9×9 at $|\bq|=0.101$ bohr⁻¹ the fitted head is $-0.2368$ against $-0.2393$ on a direct 12×12 grid. At each fine $\bq$ the fitted $P$ is screened with the exact kernel (2.1) and projected with the fitted coefficients,
+The head of $P$ is softly anchored to the tensor $S$ of the [q → 0 head](q0-head.md#s-tensor). One extra row per tensor component pulls $S_{\mathrm{fit}}$ toward $\mathrm{Re}\,S$, weighted so that the penalty is $\|S_{\mathrm{fit}}-\mathrm{Re}\,S\|_F^2/d$ over the $d$ periodic directions. The anchor is soft because the ISDF-projected $P$ need not tend to $S$ exactly. With the earlier radial fit, on MoS₂ 9×9 at $|\bq|=0.101$ bohr⁻¹, the fitted head was $-0.2368$ against $-0.2393$ on a direct 12×12 grid. The wings have no anchor. Since $P\le0$, a positive eigenvalue of $S_{\mathrm{fit}}$ means the coarse head is not $\bq\cdot S\cdot\bq$ plus a polynomial near $\Gamma$, as in a metal or on too few points, and the run warns (`GATE srlr_head_fit_sign`). At each fine $\bq$ the fitted $P$ is screened with the exact kernel (2.1) and projected with the fitted coefficients,
 
 $$
 W^{\mathrm{LR}}_{\bq_{\mathrm{fi}}}(\mu,\nu)=\frac{1}{V_{\mathrm{cell}}}\sum_{\bG_L,\bG_L'}\tilde\zeta^*_{\bq_{\mathrm{fi}}\mu}(\bG_L)\,D_{\bq_{\mathrm{fi}}}(\bG_L,\bG_L')\,\tilde\zeta_{\bq_{\mathrm{fi}}\nu}(\bG_L'),\qquad
 D_{\bq_{\mathrm{fi}}}=\big(1-v_L P_{\bq_{\mathrm{fi}}}\big)^{-1}v_L \tag{4.1}
 $$
 
-The log prints a short block when the interpolation runs: the coarse and fine grids, the size $N_L$ of $\bG_L$, the fit degrees and residuals, the window radii, and how many coarse and fine $\bq$ used the model and how many were skipped ($w=0$, interpolant only).
+The log prints a short block when the interpolation runs: the coarse and fine grids, the size $N_L$ of $\bG_L$, the fit degrees and residuals, the diagonals of $S_{\mathrm{fit}}$ and of its anchor, the window radii, and how many coarse and fine $\bq$ used the model and how many were skipped ($w=0$, interpolant only).
 
-On the MoS₂ monolayer, 9×9 to 12×12:
+The block below was logged on the MoS₂ monolayer, 9×9 to 12×12, with the earlier radial fit of $P$. The current fit also prints on the third line the direction-resolved degrees of the head, wing and $G_z$ classes, separated by slashes after `direction-resolved to degree`, and adds a fourth line `P head q.S.q, fitted S diagonal ..., anchor ...`.
 
 ```text
 W interpolation (srlr): coarse 9x9x1 -> fine 12x12x1
@@ -197,14 +197,14 @@ $$
 W_{\Gamma}(\mu,\nu)=\big[W^{\mathrm{SR}}\big]^{\mathrm{interp}}_\Gamma(\mu,\nu)+W^{\mathrm{LR}}_\Gamma(\mu,\nu)+\frac{h_{\mathrm{fi}}}{V_{\mathrm{cell}}}\,\zeta^*_{\Gamma\mu}(\mathbf 0)\,\zeta_{\Gamma\nu}(\mathbf 0) \tag{4.4}
 $$
 
-The long-range plane waves and the head describe the same singular element from two sides. In bulk, with $P(\bG_{\mathrm{ws}},\bG_{\mathrm{ws}})\approx\bar S\,q^2$, (4.1) reproduces the integrand that the head page averages over the mini-BZ, $8\pi/\big(q^2(1-8\pi\bar S)\big)$. In a slab it is $(8\pi z_c/q)\big(1+O(q)\big)$, and screening sets in only at finite $q$. $P$ already contains the local fields that the head page adds through its own Schur complement, and with `head_correction = full` the anchor $S$ is the folded tensor $S^{\mathrm{eff}}(0)$.
+The long-range plane waves and the head describe the same singular element from two sides. In bulk, with $P(\bG_{\mathrm{ws}},\bG_{\mathrm{ws}})\approx\bq\cdot S\cdot\bq$, (4.1) reproduces the integrand that the head page averages over the mini-BZ, $8\pi/\big(q^2-8\pi\,\bq\cdot S\cdot\bq\big)$. In a slab it is $(8\pi z_c/q)\big(1+O(q)\big)$, and screening sets in only at finite $q$. $P$ already contains the local fields that the head page adds through its own Schur complement, and with `head_correction = full` the anchor $S$ is the folded tensor $S^{\mathrm{eff}}(0)$.
 
 ## <span class="n">5</span> The fine Γ head {: #c1 }
 
 `gw.head_densify.build_fine_head_scalars`
 {: .in-code }
 
-The head $h_{\mathrm{fi}}$ of (4.4) is the fine-$\Gamma$ entry of the head scalars below. Until 2026-10-22 the same formula was also a model of its own, `w_head_densify = c1`, which held back only the $\Gamma$ head, Fourier-interpolated the coarse values at $\bq\neq0$ as they are, divergent element included, and added the head as a rank-one term at every fine point inside the coarse $\Gamma$ cell $\Gamma_c$. That model was removed; `srlr` keeps (5.1) at the fine $\Gamma$ only,
+The head $h_{\mathrm{fi}}$ of (4.4) is the fine-$\Gamma$ entry of the head scalars below. Until 2026-10-22 the same formula was also a model of its own, `w_head_densify = c1`, which held back only the $\Gamma$ head, Fourier-interpolated the coarse values at $\bq\neq0$ as they are, divergent element included, and added the head as a rank-one term at every fine point inside the coarse $\Gamma$ cell $\Gamma_c$. That model was removed, and `srlr` keeps (5.1) at the fine $\Gamma$ only,
 
 $$
 W_{\bq_{\mathrm{fi}}}(\mu,\nu)=\big[W\big]^{\mathrm{interp}}_{\bq_{\mathrm{fi}}}(\mu,\nu)+\frac{h(\bq_{\mathrm{fi}})}{V_{\mathrm{cell}}}\,\zeta^*_{\Gamma\mu}(\mathbf 0)\,\zeta_{\Gamma\nu}(\mathbf 0),\qquad
@@ -226,16 +226,17 @@ GW writes the long-range arrays and the BSE loader reads them when it densifies.
 `gw.screening.compute_static_w`
 {: .in-code }
 
-The arrays are computed in the static step of the RPA screening, beside the Dyson solve, and saved by the W0 writer when `write_restart_tensors = true` (the default). Every scheme that solves the static Dyson equation writes them, the plasmon-pole models included.
+The arrays are computed in the static step of the RPA screening, beside the Dyson solve, and saved by the W0 writer when `write_restart_tensors = true` (the default). Every scheme that solves the static Dyson equation writes them, the plasmon-pole models included. A one-shot scalar tangential run solves that equation once more for the purpose, so its W0 and `W0_lr` come from the same $\chi^0(0)$.
 
 | GW run | W0 in the bundle | `W0_lr` |
 |---|---|---|
 | `compute_mode = cohsex`, `gn_ppm` or `hl_ppm` | Dyson $W(0)$ | written |
 | the same with `mc_average_placement` other than `off` | Dyson $W(0)$, two-solve head placement | not written |
-| `compute_mode = tangential` | $V+W^c(0)$ evaluated from the poles | not written |
+| `compute_mode = tangential`, one-shot scalar | Dyson $W(0)$ from one extra static $\chi^0$ build and solve | written |
+| `compute_mode = tangential`, self-consistent or `bispinor = true` | $V+W^c(0)$ evaluated from the poles | not written |
 | `x_only` | none | not written |
 
-Even on the first row the arrays are skipped silently when `sys_dim` is neither 2 nor 3, when `tmp/zeta_q.h5` is absent, or when the $\bq$ list was reduced without a wedge, and they are withheld with a warning when $P$ fails the check of §3.2. The BSE also needs W0 stored on its irreducible wedge, which `restart_q_storage = auto` gives only for an orbit-closed centroid set on a reduced $\bq$ path.
+Even on the rows marked written the arrays are skipped silently when `sys_dim` is neither 2 nor 3, when `tmp/zeta_q.h5` is absent, or when the $\bq$ list was reduced without a wedge, and they are withheld with a warning when $P$ fails the check of §3.2. The BSE also needs W0 stored on its irreducible wedge, which `restart_q_storage = auto` gives only for an orbit-closed centroid set on a reduced $\bq$ path.
 
 ### <span class="n">6.2</span> Keys and refusals in the BSE {: #keys }
 
@@ -255,15 +256,17 @@ The densification runs in the BSE loader whenever the input file's `kgrid_fine` 
 
 !!! refuses
     - `w_head_densify = c1` or `legacy`: "`w_head_densify = c1` was removed: srlr is the only model".
-    - No `W0_lr` group in the bundle (`GATE srlr_restart_channels`). Rerun GW with a static Dyson W0, for example `compute_mode = cohsex`, `gn_ppm` or `hl_ppm`.
+    - No `W0_lr` group in the bundle (`GATE srlr_restart_channels`). Rerun GW on a route that writes it (§6.1), for example `compute_mode = cohsex`, `gn_ppm`, `hl_ppm` or a one-shot scalar `tangential`.
     - W0 stored on the full zone, so `W0_lr` has no unfold tables (`GATE srlr_wedge_tables`).
     - A downfolded bundle (`GATE srlr_downfold`), because `W0_lr` belongs to the native centroid set.
     - `W0_lr` written for another `sys_dim`, another $\bq$ wedge or another centroid count.
     - Fewer than two coarse points in the fit radius (`GATE srlr_fit_points`), or no $S$ tensor (`GATE srlr_head_tensor`).
     - Symmetry rows not in the bundle's flat FFT order (`GATE srlr_q_order`), or a slab relabelling that leaves the set of $\bG_L$ (`GATE srlr_channel_relabel`).
 
+The fit of §4.1 also has one warning that lets the run continue. When the fitted head tensor $S_{\mathrm{fit}}$ has a positive eigenvalue above $10^{-3}$ of its largest magnitude, the run warns with `GATE srlr_head_fit_sign`, since $P\le0$ requires $S_{\mathrm{fit}}\le0$. The long-range part near $\Gamma$ is then an extrapolation, as on a metal or a very coarse grid, and a denser coarse GW grid is the remedy.
+
 !!! note "Today and intended"
-    `srlr` is the default and only model since 2026-10-22. The tangential GW route's restart has no `W0_lr`, so a `kgrid_fine` BSE on it refuses by name; use the bundle of a static Dyson run on the same input file (`cohsex`, `gn_ppm`, `hl_ppm`), since the BSE reads only the static $W(0)$. The intended state is that the tangential route writes the arrays of its own $W(0)$.
+    `srlr` is the default and only model since 2026-10-22. A one-shot scalar tangential GW run now writes `W0_lr` from one extra static solve, so a `kgrid_fine` BSE works on its ISDF tensor file. The self-consistent and bispinor tangential routes still write none, and a `kgrid_fine` BSE on them refuses by name. For those, use the ISDF tensor file of a static Dyson run or a one-shot scalar tangential run on the same input file, since the BSE reads only the static $W(0)$.
 
 ## <span class="n">7</span> A measured example {: #example }
 
@@ -296,8 +299,8 @@ BerkeleyGW direct is its absorption on the directly computed fine-grid kernel, a
 | $V^{\mathrm{SR}}$, $V^{\mathrm{LR}}$, $W^{\mathrm{SR}}$, $W^{\mathrm{LR}}$ | short- and long-range parts of $V$ and $W$ |
 | $P_\bq(\bG_L,\bG_L')$, $D_\bq(\bG_L,\bG_L')$, $\Lambda$ | long-range polarizability with local fields; screened interaction between the $\bG_L$; local-field factor |
 | $w(\lvert\bq\rvert)$, $q_{\mathrm{ins}}$ | window; inscribed radius of the zone |
-| $S$, $\bar S$, $\varepsilon_M$ | long-wavelength polarizability tensor; its mean diagonal over the periodic directions; macroscopic dielectric function |
-| $h(\bq)$, $s(\bq)$, $\Gamma_c$ | `c1` head; its integrand; coarse $\Gamma$ cell |
+| $S$, $S_{\mathrm{fit}}$, $\varepsilon_M$ | long-wavelength polarizability tensor; the $q^2$ tensor of the fitted head of $P$ (§4.1); macroscopic dielectric function |
+| $h(\bq)$, $s(\bq)$, $\Gamma_c$ | head of §5 (the removed `c1` model's head); its integrand; coarse $\Gamma$ cell |
 | $V_{\mathrm{cell}}$, $N_k$ | cell volume; number of k points |
 
 ## References {: #refs }

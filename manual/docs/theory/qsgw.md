@@ -94,7 +94,7 @@ $\langle m\bk|V^{\mathrm H}|n\bk\rangle$ is contracted with the mean-field orbit
 `sigma_dispatch.compute_sigma_xc`
 {: .in-code }
 
-$\chi^0 \to W \to \Sigma^c(\omega)$ and $\Sigma^x$ are rebuilt from $\psi^{\mathrm{QP}}$, $E^{\mathrm{QP}}$ and $f$ through the run's own frequency treatment, with $\Sigma^c = i\,G^{\gtrless}W^c$, $t\gtrless0$ ([GW theory](../drivers/gw/theory.md), [frequency treatments](frequency-treatments.md)). With the production tangential $W$, every map rebuilds the pole model from its own states ([Tangential W model](tangential-w.md)). The $\bq\to0$ head follows the map on the QP velocity chosen by `sc_head_update` ([the q → 0 head](q0-head.md), [velocity operator](velocity-operator.md)). The band-extrapolation fit is redone on every map. Each map costs one full $\chi^0\to W\to\Sigma$ evaluation.
+$\chi^0 \to W \to \Sigma^c(\omega)$ and $\Sigma^x$ are rebuilt from $\psi^{\mathrm{QP}}$, $E^{\mathrm{QP}}$ and $f$ through the run's own frequency treatment, with $\Sigma^c = i\,G^{\gtrless}W^c$, $t\gtrless0$ ([GW theory](../drivers/gw/theory.md), [frequency treatments](frequency-treatments.md)). With the production tangential $W$, every map rebuilds the pole model from its own states ([Tangential W model](tangential-w.md)). Contour deformation refuses under `qp_solver = self_consistent` (`GATE cd_self_consistent_unimplemented`), because it has not yet been validated inside the map ([Contour deformation §1.1](contour-deformation.md#select)). The $\bq\to0$ head follows the map on the QP velocity chosen by `sc_head_update` ([the q → 0 head](q0-head.md), [velocity operator](velocity-operator.md)). The band-extrapolation fit is redone on every map. Each map costs one full $\chi^0\to W\to\Sigma$ evaluation.
 
 ### <span class="n">2.5</span> Assembly {: #om-assemble }
 
@@ -309,7 +309,7 @@ Full entries are on the [GW input keywords](../drivers/gw/keywords.md) page. Def
 | [`sc_history_depth`](../drivers/gw/keywords.md#sc_history_depth) | `20` | Anderson history $m$. |
 | [`sc_mixing`](../drivers/gw/keywords.md#sc_mixing) | `1.0` | Retired; any other value refuses. |
 | [`number_bands_protected`](../drivers/gw/keywords.md#number_bands_protected) | unset | $b_3$ as a total band count (§3.1). |
-| [`ncond`](../drivers/gw/keywords.md#ncond), [`nval`](../drivers/gw/keywords.md#nval) | `5`, `5` | `ncond` gives $b_3 = n_{\mathrm{occ}} + n_{\mathrm{cond}}$; `nval` sets the semicore floor. |
+| [`ncond`](../drivers/gw/keywords.md#ncond), [`nval`](../drivers/gw/keywords.md#nval) | required, or `number_bands_protected` | `ncond` gives $b_3 = n_{\mathrm{occ}} + n_{\mathrm{cond}}$; `nval` sets the semicore floor. |
 | [`sc_semicore`](../drivers/gw/keywords.md#sc_semicore) | `dft` | Semicore block pinned (`dft`) or moving (`qp`). |
 | [`sc_frozen_core_bands`](../drivers/gw/keywords.md#sc_frozen_core_bands) | `0` | Lowest bands held at their mean-field block. |
 | [`sc_head_update`](../drivers/gw/keywords.md#sc_head_update) | `off`; resolved when unnamed | QP velocity of the head on each map. |

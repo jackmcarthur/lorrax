@@ -42,8 +42,6 @@ where $N_k$ counts the **full** k grid and $n_s$ is 1 for scalar, 2 for spinor a
 
 For many-band runs, inspect the wavefunction route too. A two-axis distribution such as `psi_k(n_X,s,mu_Y)` reduces both large axes, giving leading storage proportional to $1/P$. A faster band-complete carrier `psi_k(n,s,mu_Y)` scales as $1/\sqrt P$; bounded panels offer another way to stage a contraction. Record the actual selected carrier and panels: they have different memory and communication costs.
 
-Ordinary minimax screening and scalar self-energy calculations choose between these two layouts from their compiled memory prices. The band-complete layout gathers once and reuses local products; the face layout exchanges bounded band panels during each row and quadrature pass. Both have useful regimes: lowering the budget can save wavefunction storage at a communication cost. Row windows follow the fixed tile and centroid-orbit geometry, so lowering the budget does not keep shrinking them. Full-zone scalar pole files use this same choice. No extra input switch is needed.
-
 ## Local or distributed linear algebra {: #linalg }
 
 The deck key `linalg` (default `local`) requests the layout of dense solves. Under `local` each GPU solves whole $N_\mu\times N_\mu$ matrices for its share of the irreducible q points, with no distributed factorization; under `distributed` each matrix is factored over the whole mesh (cuSOLVERMp), which divides its memory by $P$ but communicates inside every factorization.

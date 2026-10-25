@@ -112,7 +112,7 @@ This is a heuristic summary. The construction of the basis, the choice of $f$ an
     </div>
 
 !!! note
-    Because $f'\to0$ at $E^{\mathrm{top}}$, the top fitted bands are compressed and, at the $\bk$ where they reach $E^{\mathrm{top}}$, absent from $f(H)$. The driver therefore fits `--guard-bands` (default 4) bands above the returned window and never returns them. A returned band that touches the flat part of $f$ refuses.
+    Because $f'\to0$ at $E^{\mathrm{top}}$, the top fitted bands are compressed and, at the $\bk$ where they reach $E^{\mathrm{top}}$, absent from $f(H)$. The driver therefore fits `--guard-bands` (default 4) bands above the returned window and never returns them. A returned band whose $f$ is exactly zero at some $\bk$ refuses.
 
 ## Running {: #run }
 
@@ -150,12 +150,6 @@ Required unless `number_bands_protected` is given. Returned conduction bands. Re
 On the BSE routes this is the whole $f(H)$ window, with no automatic guard bands.
 {: .kw-details }
 
-### `number_bands` {: .kw data-type="int" data-default="required" }
-Bands loaded from the WFN; above it ψ is zero-padded. Alias `nband`.
-
-With guard bands the driver raises it to $n_{\mathrm{occ}}+$`ncond`$+N_{\mathrm{guard}}$. On the BSE routes it must cover the input file window.
-{: .kw-details }
-
 **Shared keys**
 
 ### `sys_dim` {: .kw data-type="int" data-default="required" }
@@ -188,6 +182,9 @@ Diagonal QP: the window's $E_{n\bk_{\mathrm{co}}}$ are replaced by the GW run's 
 The states are unchanged, so off-diagonal QP mixing is absent. A missing or unparsable file refuses.
 {: .kw-details }
 
+When the fitted window, guard bands included, reaches above the file's top band, the bands above it keep their DFT energies plus one rigid scissor. The shift is the mean of $E^{\mathrm{QP}}-E^{\mathrm{DFT}}$ over the file's conduction bands at every $\bk_{\mathrm{co}}$, and the log reports it with its RMS spread in one `[QP scissor]` line. The scissor is a good filler for guard bands. A returned band far above the GW window can have a QP shift of the opposite sign, so give the eqp file every returned band whose QP energy matters.
+{: .kw-details }
+
 ### `qp_rotations_file` {: .kw data-type="path" data-default="none" }
 Full QP Hamiltonian from `qp_wfn_rotations.h5`: $f(H^{\mathrm{QP}})=U\,f(E^{\mathrm{QP}})\,U^\dagger$ in the same DFT basis.
 
@@ -195,6 +192,12 @@ The QP block must lie inside the fitted window, start at its lower edge and cont
 {: .kw-details }
 
 **Band window and basis**
+
+### `number_bands` {: .kw data-type="int" data-default="100" }
+Bands loaded from the WFN. Above it ψ is zero-padded. Alias `nband`.
+
+With guard bands the driver raises it to $n_{\mathrm{occ}}+$`ncond`$+N_{\mathrm{guard}}$. On the BSE routes it must cover the input file window.
+{: .kw-details }
 
 ### `--guard-bands` {: .kw data-type="int" data-default="4" }
 $N_{\mathrm{guard}}$: bands fitted above the returned window and not returned.
@@ -235,14 +238,6 @@ Device budget of the basis fit's planner.
 
 ### `bispinor` {: .kw data-type="bool" data-default="false" }
 Ignored for the basis: the canonical spinor WFN is always the interpolation basis.
-
-**Environment**
-
-### `LORRAX_FI_FSHOULDER_TOL` {: .kw data-type="env" data-default="0.0" }
-Floor of $\min_{\bk}|f(E_{n\bk_{\mathrm{co}}})|/\max|f|$ over returned bands in the f-shoulder gate. Negative disables the gate.
-
-### `LORRAX_EXTRA_RANK_PAD` {: .kw data-type="env" data-default="0" }
-Test only: extra exact-null basis directions for pad-invariance tests.
 
 ## Output format {: #output }
 
@@ -303,6 +298,7 @@ galerkin_dft.h5
     - `htransform_qr_eps` outside (0, 1); `htransform_rank_multiplier` in (0, 1); `htransform_qrcp_seed` outside uint32.
     - `--eqp-file` together with `--qp-rotations`, or either with a QP WFN (`-wfn WFN_qp.h5`).
     - An `--eqp-file` that is missing or not a wedge `eqp1.dat`.
+    - An `--eqp-file` that ends below the first conduction band when the fitted window reaches above it, since no conduction scissor can be fitted. Rerun GW with conduction bands in the QP window.
     - A `qp_rotations_file` file whose QP block does not start at the fitted window's lower edge inside it, or whose WFN fingerprint, bands, grid or $\bk$ coordinates differ.
     - An input file without `sys_dim`, or with an unknown key.
 

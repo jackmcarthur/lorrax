@@ -36,12 +36,12 @@ ncond          = 8
 
 K_POINTS {crystal_b}
 3
-  0.0000 0.0000 0.0000  1  #G
+  0.0000 0.0000 0.0000 40  #G
   0.5000 0.0000 0.0000 40  #X
-  0.5000 0.5000 0.0000 40  #M
+  0.5000 0.5000 0.0000  1  #M
 ```
 
-This path has $1+40+40=81$ points: each corner's count is the number of points on the segment that *ends* at that corner (see [`K_POINTS {crystal_b}`](#k-points)).
+This path has $1+40+40=81$ points. As in Quantum ESPRESSO, each corner's count is the number of points on the segment that starts at that corner (see [`K_POINTS {crystal_b}`](#k-points)).
 
 ## Band character {: #character }
 
@@ -63,7 +63,7 @@ Required
 ### `K_POINTS {crystal_b}` {: .kw data-type="block" data-default="required" #k-points }
 The $\bk_{\mathrm{fi}}$ path: a corner count, then one line per corner, `kx ky kz n  # label`, in crystal coordinates.
 
-The segment from corner $i$ to corner $i+1$ gets the `n` of corner $i+1$ (default 1), so the first corner's `n` is ignored and the path has $1+\sum_{i\ge2}n_i$ points; this is not Quantum ESPRESSO's convention. With fewer than two corners no `bandstructure.dat` is written.
+The segment from corner $i$ to corner $i+1$ gets the `n` of corner $i$ (default 1), as in Quantum ESPRESSO. The last corner's `n` is unused, and a path of $N$ corners has $1+\sum_{i<N}n_i$ points. With fewer than two corners no `bandstructure.dat` is written.
 {: .kw-details }
 
 Optional

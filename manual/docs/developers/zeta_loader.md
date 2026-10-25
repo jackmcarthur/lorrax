@@ -51,7 +51,8 @@ With a mesh, one collective `SlabIO` handle is opened at construction and held u
 
 Raises `ValueError` at open when:
 
-- `isdf_header/zeta_is_done` is false: the fit that wrote the file did not finish. `LORRAX_ALLOW_PARTIAL_ZETA=1` overrides, for debugging only.
+- `isdf_header/zeta_is_done` is false, because the fit that wrote the file did not finish.
+
 - `zeta_q_G` has fewer μ rows than the header's `n_rmu` (the header and the block come from different runs).
 - the header `ngkmax` differs from the `zeta_q_G` G axis.
 

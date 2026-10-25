@@ -7,7 +7,7 @@
 
 <figure class="flowchart" markdown>
 [![Contour-deformation self-energy](../assets/figures/g17.png)](../assets/figures/g17.png)
-<figcaption><strong>Fig. G17.</strong> Stage 1 lays out the frequency points: a tan-mapped Gauss–Legendre rule on the imaginary axis and a uniform knot line $x_j+i\eta$ above the real axis, with four ghost knots at each end for the slope. Stage 2 evaluates $\chi^0$ at every point from the response bank's quadrature and solves Dyson for $W^c$ and, on the knots, $\partial_sW^c$. Stage 3 contracts $W^c$ with the pair densities into the imaginary-axis sum, the two-pole anchor and the real-axis residues, read by cubic Hermite interpolation in $\lvert x\rvert$. Stage 4 reads the cube at the on-shell energies and takes $Z$ from a central difference.</figcaption>
+<figcaption><strong>Fig. G17.</strong> Stage 1 lays out the frequency points: a tan-mapped Gauss–Legendre rule on the imaginary axis and a uniform knot line $x_j+i\eta$ above the real axis, with four ghost knots at each end for the slope. Stage 2 evaluates $\chi^0$ at every point from the response bank's quadrature and solves Dyson for $W^c$ and, on the knots, $\partial_sW^c$. Stage 3 contracts $W^c$ with the pair densities into the imaginary-axis sum, the two-pole anchor and the real-axis residues, read by cubic Hermite interpolation in $\lvert x\rvert$. Stage 4 reads the cube at the on-shell energies and takes $Z$ from the closed-form derivative accumulated beside it.</figcaption>
 </figure>
 
 ## <span class="n">1</span> Overview {: #overview }
@@ -29,7 +29,7 @@ head_correction             = off
 use_band_extrapolation      = false
 ```
 
-The first landing has four implementation limits, each a named refusal: no $\bq\to0$ head correction, `linalg = local` only, one η, and no band extrapolation. Without the head, Σ at Γ uses only the $\bq=0$ body of $V_\bq$ and $W_\bq$ ([The q → 0 head](q0-head.md)). The other `sigma_w_*` keys, the head-fit sampling keys and the pole-export keys refuse beside it, since this route builds no model of $W$.
+The first landing has five implementation limits, each a named refusal. It has no $\bq\to0$ head correction, runs with `linalg = local` only, uses one η and no band extrapolation, and runs one-shot only, so `qp_solver = self_consistent` refuses. The default `qp_solver = auto` resolves to `one_shot_dft` and needs no line. Without the head, Σ at Γ uses only the $\bq=0$ body of $V_\bq$ and $W_\bq$ ([The q → 0 head](q0-head.md)). The other `sigma_w_*` keys, the head-fit sampling keys and the pole-export keys refuse beside it, since this route builds no model of $W$.
 
 !!! refuses
     - `sigma_frequency_integration` other than `pole_model` or `contour_deformation` (`GATE cd_enum`).
@@ -37,6 +37,7 @@ The first landing has four implementation limits, each a named refusal: no $\bq\
     - `compute_mode` other than `mpa`; `sigma_w_accuracy`, `sigma_w_support_sites_ev`, `write_w`, `write_poles` or any key of the [other W models](multipole-w.md#keywords) named; `screening_diagrams` other than `w_rpa` (`GATE cd_applicability`).
     - `head_correction` other than `off` (`GATE cd_head_unimplemented`); `linalg` other than `local` (`GATE cd_linalg_local`).
     - Band extrapolation on, including by default (`GATE cd_band_extrapolation_unimplemented`); a per-window η in `sigma_omega_patches_ev` (`GATE cd_single_eta`).
+    - `qp_solver = self_consistent`, or `qp_solver = auto` with the deprecated `self_consistent = true` (`GATE cd_self_consistent_unimplemented`).
     - $h$ outside $(0,\eta/4]$ (`GATE cd_knot_step`); fewer than 5 imaginary nodes (`GATE cd_imaginary_nodes`).
 
 ### <span class="n">1.2</span> What is computed where {: #where }
@@ -53,10 +54,10 @@ The screening step does no work: it hands the Σ step $V_\bq$ and the CD keys, a
 | geometry and sampling | `gw.cd.sigma`, `gw.cd.rule` | $\bk-\bq$ tables, file-wedge rows, imaginary rule, knot count (§[3](#imag), §[4](#real)) |
 | χ⁰ rules | `gw.cd.chi0_rules` | one rule request per chunk of points (§[5](#chi0)) |
 | exchange check | `gw.cd.sigma` kernel `sigma_x` | the CD pair densities must reproduce $\Sigma^x$ (§[6.1](#sigma-x)) |
-| imaginary chunks | χ⁰ → Dyson → contraction | $\sum_iI_i$ of (2.3) |
-| real chunks | χ⁰ with ghosts → FD-9 slope → Dyson pair → contraction | anchor and $\sum_jR_j$ of (2.3) |
+| imaginary chunks | χ⁰ → Dyson → contraction | $\sum_iI_i$ of (2.3) and its $E$-derivative |
+| real chunks | χ⁰ with ghosts → FD-9 slope → Dyson pair → contraction | anchor and $\sum_jR_j$ of (2.3) and their $E$-derivatives |
 | assembly | `gw.cd.sigma` | cube on the file wedge, unfolded to the full zone (§[6.3](#assemble)) |
-| finalize | `gw.cd.sigma.cd_on_shell_body` | on-shell values and the finite-difference $Z$ (§[6.4](#on-shell)) |
+| finalize | `gw.cd.sigma.cd_on_shell_body` | on-shell values and the closed-form $Z$ (§[6.4](#on-shell)) |
 
 ## <span class="n">2</span> The contour {: #contour }
 
@@ -318,20 +319,22 @@ The wavefunctions enter as per-device pair slabs, $q$-sharded like $W$ and built
 `symmetry_maps.unfold_file_wedge_band_operator`
 {: .in-code }
 
-The accumulators hold $\Sigma^c_{mn}(E)$ for every requested frequency $E$, every file-wedge $\bk$ and every $(m,n)$ of the Σ window: $A$ and $-S_A$, $\sum_iI_i$ and $\sum_jR_j$ separately. Their sum is padded to the Σ band carrier and unfolded to the full zone with the `transpose` rule. Beside the full matrix the code accumulates the own-energy diagonal $\Sigma^c_{mm}(E_{m\bk})$ for the rows at or above `cd_own_energy_band_min`; it is written to `cd_sigma_own_energy.npz` with its three parts and is not read by the finalize (*inferred* from the writers). `LORRAX_CD_STAR_CERTIFICATE = N` computes $N$ non-identity star members directly and compares them with the unfolded cube.
+The accumulators hold $\Sigma^c_{mn}(E)$ for every requested frequency $E$, every file-wedge $\bk$ and every $(m,n)$ of the Σ window: $A$ and $-S_A$, $\sum_iI_i$ and $\sum_jR_j$ separately. Their sum is padded to the Σ band carrier and unfolded to the full zone with the `transpose` rule. On the default on-shell route three more accumulators hold $\partial_E\Sigma^c_{mn}$ for the anchor, the imaginary axis and the real axis, each row $m$ at its own `pair` frequency (§[6.4](#on-shell)). Their sum takes the same padding and unfold as a one-frequency cube. Beside the full matrix the code accumulates the own-energy diagonal $\Sigma^c_{mm}(E_{m\bk})$ for the rows at or above `cd_own_energy_band_min`; it is written to `cd_sigma_own_energy.npz` with its three parts and is not read by the finalize (*inferred* from the writers). `LORRAX_CD_STAR_CERTIFICATE = N` computes $N$ non-identity star members directly and compares them with the unfolded cube.
 
 ### <span class="n">6.4</span> On-shell finalize {: #on-shell }
 
 `gw.cd.sigma.cd_on_shell_body`
 {: .in-code }
 
-By default the body is evaluated on the on-shell request's frequencies, the sorted distinct union of its energy tables ($E_{n\bk}$ and the evaluation energies, measured from $E_F$), so every table entry is a sample of the cube. The finalize reads the pair and value slots at their entries without interpolation, refusing a lookup more than $10^{-9}$ Ry off. CD has no derivative accumulator, so the slope slot that feeds $Z$ is a central difference of the diagonal,
+By default the body is evaluated on the on-shell request's frequencies, the sorted distinct union of its energy tables ($E_{n\bk}$ and the evaluation energies, measured from $E_F$), so every table entry is a sample of the cube. The finalize reads the pair and value slots at their entries without interpolation, refusing a lookup more than $10^{-9}$ Ry off. The slope slot that feeds $Z$ comes from derivative accumulators that run beside the cube on the same contractions. Every term of (2.3) is a closed form in $x=E-E_{l,\bk-\bq}$, so $\partial_E=\partial_x$ applied to it is the same contraction with differentiated weights,
 
 $$
-\partial_\omega\Sigma^c_{nn}(E)\simeq\frac{\Sigma^c_{nn}(E+\delta)-\Sigma^c_{nn}(E-\delta)}{2\delta},\qquad \delta=0.5\ \mathrm{eV} \tag{6.1}
+\partial_\omega\Sigma^c_{nn}(E)=\partial_xA+\sum_i\partial_xI_i-\partial_xS_A+\sum_j\partial_xR_j,\qquad \partial_x\,a(\lvert x\rvert)=\mathrm{sgn}(x)\,\frac{d}{d\lvert x\rvert}\,a(\lvert x\rvert) \tag{6.1}
 $$
 
-with the probes interpolated linearly between the request's frequencies and clamped to their range; the log counts the clamped states. This is BerkeleyGW's `finite_difference_spacing` rule, where the pole routes use the exact derivative of their quadrature. Under `sigma_omega_grid_debug` the body is evaluated on the input file's ω grid instead. The result then passes through the one finalize every treatment shares ([GW theory](../drivers/gw/theory.md)).
+with $a(\lvert x\rvert)$ the Hermite interpolant (4.3) of each residue. Row $n$ is evaluated at its own `pair` frequency, $E_{n\bk}$ on a one-shot run. The imaginary-node kernels and the closed forms of the anchor are differentiated in $x$. Single terms jump at $x=0$, where the residue changes branch and the anchor logarithm has its branch point. Every law takes the right-hand branch there, so the right derivatives of the terms add up to the derivative of their smooth sum. The slot is therefore the exact derivative of this route's own quadrature, the definition the pole routes use, and the log line says `dSigma/domega from the CD derivative accumulators`.
+
+Under `sigma_omega_grid_debug` the body is evaluated on the input file's ω grid instead, no derivative is accumulated, and $Z$ comes from the ±0.5 eV central difference on that grid (`Z_FINITE_DIFFERENCE_EV`, BerkeleyGW's `finite_difference_spacing` rule). The result then passes through the one finalize every treatment shares ([GW theory](../drivers/gw/theory.md)).
 
 ## <span class="n">7</span> Broadening and regularization {: #broadening }
 
@@ -363,7 +366,7 @@ The table below sets the CD route beside LORRAX's production treatment and besid
 | Dyson solves | one per imaginary node and per knot (with ghosts), per irreducible $\bq$; hundreds | 18 to 40 supports |
 | χ⁰ | response-bank rules per chunk window, tolerance $10^{-8}$, capacity 1088 | one bank rule over all supports, capacity 192 |
 | Σ | band-space contraction, $\bq$-parallel, file wedge | time-node products in $\bR$, folded to frequency |
-| $Z$ | ±0.5 eV central difference | exact derivative of the quadrature |
+| $Z$ | closed-form derivative of the quadrature (6.1) | exact derivative of the quadrature |
 | head, band extrapolation | off (refused) | on |
 | use | reference and comparisons | production |
 
@@ -424,7 +427,6 @@ No input key reaches these; they are hashed into the checkpoint identity through
 | `SIGMA_X_IDENTITY_TOL_MEV` | $10^{-3}$ meV | exchange check |
 | `CD_ON_SHELL_LOOKUP_RY` | $10^{-9}$ Ry | on-shell lookup |
 | `CD_KAPPA_ROUNDING_SHARE`, `CD_FALLBACK_PENCIL_SIZE` | $10^{-2}$, 20 000 | mass gate (5.1), Laplace fallback |
-| `Z_FINITE_DIFFERENCE_EV` | 0.5 eV | δ in (6.1) |
 
 ### <span class="n">10.3</span> Run-time refusals {: #keys-refusals }
 
@@ -446,10 +448,10 @@ Beside the input file, written by rank 0:
 :   Recipe, η, $h$, $J$, reach, node counts, chunks and bytes per point, per-stage seconds, the exchange check, the symmetry certificate, the banded-table widths, the χ⁰ rule census, the memory plan and the checkpoint record.
 
 `cd_sigma_own_energy.npz`
-:   $\Sigma^c_{mm}(E_{m\bk})$ on the own-energy rows and its anchor, imaginary and real parts; $\Sigma^x$ of the CD kernels; the imaginary nodes and weights and the knots.
+:   $\Sigma^c_{mm}(E_{m\bk})$ on the own-energy rows and its anchor, imaginary and real parts; $\Sigma^x$ of the CD kernels; the imaginary nodes and weights and the knots. On the on-shell route it also holds `omega_pair_ry` and `dsigma_c_domega_pair`, the derivative slot of (6.1) at each row's pair frequency.
 
 `cd_leak_ledger.csv`
-:   Per chunk: seconds, device bytes in use, pool high-water and live arrays.
+:   Per chunk: seconds, device bytes in use, the allocator's peak bytes and live arrays.
 
 `cd_partial_imag.npz`, `cd_partial_anchor.npz`
 :   The own-energy parts after the imaginary axis and after the anchor.
@@ -481,7 +483,6 @@ The standard Σ outputs follow from the shared finalize ([GW files](../drivers/g
 | $\Delta_{\min}$, $\Delta_{\max}$ | lowest and highest transition of the response support |
 | $\epsilon_{\mathrm{CD}}$, $\kappa_{\max}$ | χ⁰ rule tolerance; coefficient-mass bound |
 | $\eta$ | `sigma_regularization_ev` |
-| $\delta$ | finite-difference spacing of $Z$ |
 
 ## References {: #refs }
 

@@ -53,7 +53,7 @@ LORRAX computes quasiparticle energies $E^{\mathrm{QP}}_{n\bk}$ in the GW approx
 | [Tangential W model](theory/tangential-w.md) | The preferred full-frequency model: $W^c$ as one set of poles shared by every matrix element |
 | [Ladder vertex corrections](theory/ladder-w.md) | $W$ with the electron–hole ladder, from matrix-free resolvent solves |
 | [The q → 0 head](theory/q0-head.md) | The singular head of $V$ and $W$ as a mini-BZ cell average with local fields, from the velocity matrix elements |
-| [Short- and long-range W](theory/w-range-splitting.md) | $W$ carried to a finer k grid: the smooth part interpolated through $\bR$, the long-range plane-wave channels screened in G space and added back (`c1`, `srlr`) |
+| [Short- and long-range W](theory/w-range-splitting.md) | $W$ carried to a finer k grid: the smooth part interpolated through $\bR$, the long-range plane-wave channels screened in G space and added back (`srlr`) |
 | [Metals](theory/metals.md) | Fermi–Dirac occupations in χ⁰, the head and Σ, and the intraband term |
 | [Band extrapolation](theory/band-extrapolation.md) | $\Sigma^c$ extrapolated over the conduction bands to the complete-basis limit |
 | [Quasiparticle self-consistency](theory/qsgw.md) | The QSGW map and its mixing |

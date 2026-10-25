@@ -80,13 +80,13 @@ ncond           = 12
 
 K_POINTS crystal_b
 4
-  0.000 0.000 0.000  1   #G
+  0.000 0.000 0.000 16   #G
   0.500 0.000 0.500 16   #X
   0.375 0.375 0.750 16   #K
-  0.000 0.000 0.000 16   #G
+  0.000 0.000 0.000  1   #G
 ```
 
-`nval` and `ncond` set the H-transform window. It must hold the BSE window (`number_val_bands_fine`, `number_cond_bands_fine`) with at least four conduction guard bands above it, and under the default `--refit-window zeta` it must be the GW run's ζ-fit window. The count on a corner's line is the number of points on the segment that ends at that corner ([Q path](theory.md#path)).
+`nval` and `ncond` set the H-transform window. It must hold the BSE window (`number_val_bands_fine`, `number_cond_bands_fine`) with at least four conduction guard bands above it, and under the default `--refit-window zeta` it must be the GW run's ζ-fit window. The count on a corner's line is the number of steps from that corner to the next one, as in Quantum ESPRESSO's `crystal_b`, and the last corner's count is unused ([Q path](theory.md#path)).
 
 ## Choosing an exchange route {: #route }
 
@@ -125,6 +125,7 @@ K_POINTS crystal_b
 ## Refusals {: #refusals }
 
 !!! refuses
+    - An input file without `nval` and `ncond` (or `number_bands_protected`) or `centroids_file`, with one line per key (`centroids_file is required`).
     - An input file with no `K_POINTS` block. Add the path block.
     - No `isdf_tensors_*.h5` beside the input file or in its `tmp/`, or more than one. Leave exactly one.
     - A `centroids_file` that does not exist, or whose point count differs from the restart's $N_\mu$. Point it at the table the restart was built on.
@@ -139,6 +140,6 @@ K_POINTS crystal_b
     - A BSE conduction window that does not fit inside the input file's H-transform window. Raise `ncond`.
     - H-transform conduction energies at $\Gamma$ more than 0.05 Ry from the stored ones, or a conduction-subspace overlap below 0.5.
     - `eqp_corrections` on a QP wavefunction, or together with `kgrid_fine` densification. Remove `eqp_corrections`.
-    - A `--w-coarse-grid` that does not divide the BSE grid, or with `w_head_densify = srlr`. `w_head_densify = legacy`.
+    - A `--w-coarse-grid` that does not divide the BSE grid, or on a downfolded bundle (`GATE srlr_downfold`). A restart without `W0_lr` under `--w-coarse-grid` or `kgrid_fine` (`GATE srlr_restart_channels`). `w_head_densify = c1` or `legacy`, and `--w-head-gamma-cell`.
     - `--q-per-segment` below 1.
 

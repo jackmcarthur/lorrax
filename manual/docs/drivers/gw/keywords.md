@@ -70,7 +70,7 @@ Optional
 ### `compute_mode` {: .kw data-type="enum" data-default="auto" }
 Σ treatment. See [frequency treatments](../../theory/frequency-treatments.md).
 
-`tangential` is the production model ([Tangential W model](../../theory/tangential-w.md)). `auto` resolves from the legacy keys to `cohsex` (or `x_only`, `gn_ppm`, `hl_ppm`) and never selects `tangential`. A metal admits `tangential` and `x_only`; `cohsex`, `gn_ppm` and `hl_ppm` refuse. Other W models are described [here](../../theory/multipole-w.md).
+`tangential` is the production model ([Tangential W model](../../theory/tangential-w.md)). `auto` resolves to `gn_ppm`, or to `x_only` under the deprecated `do_screened = false`. The deprecated `use_ppm_sigma = true` still gives `gn_ppm`, or `hl_ppm` with `ppm_model = hl`. On a metal `auto` refuses unless it resolves to `x_only`, and the message names `compute_mode = tangential`. A metal admits `tangential` and `x_only`, and `cohsex`, `gn_ppm` and `hl_ppm` refuse. Other W models are described [here](../../theory/multipole-w.md).
 {: .kw-details }
 
 `x_only` `cohsex` `gn_ppm` `hl_ppm` `tangential`
@@ -88,7 +88,7 @@ Tier of the tangential recipe.
 ### `sigma_frequency_integration` {: .kw data-type="enum" data-default="pole_model" }
 Frequency integration of $\Sigma^c$.
 
-`pole_model` is the time-node route of the pole models. `contour_deformation` integrates on the imaginary axis and adds the real-axis residues, on the exact ISDF $W(z)$; it needs `compute_mode = mpa`, `head_correction = off`, `use_band_extrapolation = false`, `linalg = local` and `screening_diagrams = w_rpa`, and refuses the `sigma_w_*` keys, the head-fit sampling keys, `write_w` and `write_poles`.
+`pole_model` is the time-node route of the pole models. `contour_deformation` integrates on the imaginary axis and adds the real-axis residues, on the exact ISDF $W(z)$; it needs `compute_mode = mpa`, `head_correction = off`, `use_band_extrapolation = false`, `linalg = local` and `screening_diagrams = w_rpa`, and refuses the `sigma_w_*` keys, the head-fit sampling keys, `write_w` and `write_poles`. It runs one-shot only, so `qp_solver = self_consistent` refuses beside it (`GATE cd_self_consistent_unimplemented`).
 {: .kw-details }
 
 `pole_model` `contour_deformation`
@@ -578,10 +578,10 @@ The head-fit sampling keys are listed on [this page](../../theory/multipole-w.md
 
 Read by `compute_mode = gn_ppm | hl_ppm`.
 
-### `ppm_omega_p` {: .kw data-type="float" data-default="2.0" }
+### `ppm_omega_p` {: .kw data-type="float" data-default="2.0 GN, 200 HL" }
 Second probe frequency, in Ry: $i\omega_p$ for GN, real $\omega_p$ for HL.
 
-An HL input file sets it above every $\chi^0$ transition energy.
+Unset, it is 2.0 Ry under `gn_ppm` and 200 Ry under `hl_ppm`. The HL probe must lie above every $\chi^0$ transition energy.
 {: .kw-details }
 
 ### `ppm_invalid_mode` {: .kw data-type="enum" data-default="static_limit" }
@@ -671,8 +671,8 @@ Sphere of the plane-wave $\chi_\bq(\bG,\bG')$ path, in Ry. No driver reads it.
 ### `kgrid_fine` {: .kw data-type="string" data-default="(empty)" }
 [BSE](../bse/keywords.md#fine-grid) and [htransform](../../utilities/htransform-fine-grid.md): fine k grid onto which the BSE problem (or the htransform's fine bands) is interpolated.
 
-### `w_head_densify` {: .kw data-type="enum" data-default="c1" }
-[BSE](../bse/keywords.md): coarse-to-fine treatment of the W head.
+### `w_head_densify` {: .kw data-type="enum" data-default="srlr" }
+[BSE](../bse/keywords.md#w_head_densify): coarse-to-fine interpolation of $W$. `srlr` is the only model. The removed values `c1` and `legacy` refuse with one line.
 
 ### `htransform_rank_multiplier` {: .kw data-type="float" data-default="20.0" }
 [htransform](../../utilities/htransform.md): search ceiling of the QRCP basis.

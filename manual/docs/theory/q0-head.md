@@ -261,7 +261,7 @@ V_\Gamma(\mu,\nu)\mathrel{+}=\frac{\bar v_{00}}{V_{\mathrm{cell}}}\,g^*_0(\mu)\,
 W_\Gamma(\mu,\nu;0)\mathrel{+}=\frac{\bar W_{00}(0)}{V_{\mathrm{cell}}}\,g^*_0(\mu)\,g_0(\nu) \tag{5.1}
 $$
 
-$V^{\mathrm{head}}$ is always added. The screened head is added only when a screened $W_0$ was loaded. The BSE kernel, its densified grids (`w_head_densify`, default `c1`, which reattaches the head inside the coarse Γ cell from `S_cart_head`) and the exciton-band LT tensor are on the [BSE theory](../drivers/bse/theory.md) and [exciton-bands theory](../drivers/exciton-bands/theory.md) pages.
+$V^{\mathrm{head}}$ is always added. The screened head is added only when a screened $W_0$ was loaded. The BSE kernel, its densified grids (`w_head_densify = srlr`, which fits the long-range part of $W$ and reattaches the head at the fine Γ from `S_cart_head`) and the exciton-band LT tensor are on the [BSE theory](../drivers/bse/theory.md) and [exciton-bands theory](../drivers/exciton-bands/theory.md) pages.
 
 ## <span class="n">6</span> Imposed heads and BerkeleyGW {: #bgw }
 

@@ -34,7 +34,10 @@ Without `kgrid_fine` the window is solved on the GW grid, as BerkeleyGW's absorp
 Conduction bands of the BSE window, from the lowest unoccupied band up. BerkeleyGW: `number_cond_bands_fine`.
 
 ### `nval`, `ncond`, `number_bands` {: .kw data-type="int" data-default="required" }
-The GW band window the bundle was written with. The bundle authenticates against them, so they must be the GW run's values.
+The GW band window the bundle was written with. The bundle authenticates against them, so they must be the GW run's values. `number_bands_protected` can stand in for `nval` and `ncond`, and resolves against the WFN as in [GW](../gw/keywords.md#number_bands_protected).
+
+A missing key refuses with one line, for example `nval is required (or number_bands_protected)`.
+{: .kw-details }
 
 ### `centroids_file` {: .kw data-type="path" data-default="required" }
 Centroid table; its content hash authenticates the bundle, and under `kgrid_fine` it is the interpolation's point set.
@@ -116,7 +119,7 @@ Coarse much wider than fine is the expected case: the GW grid carries the conduc
 Accepted and ignored, with a warning: the H-transform always fits every valence band of the GW window.
 
 ### `w_head_densify` {: .kw data-type="enum" data-default="srlr" }
-Long-range model split off $W$ before the densification under `kgrid_fine`. `srlr`, the only model: the plane-wave channels $\bq+\bG_a\to0$ carry the long range from the bundle's `W0_lr`, fitted on the coarse grid and added back at every fine $\bq$. It needs a GW restart with `W0_lr` (a static Dyson $W$: `cohsex`, `gn_ppm`, `hl_ppm`). `c1` and `legacy` were removed and refuse with one line. See [Short- and long-range W](../../theory/w-range-splitting.md).
+Long-range model split off $W$ before the densification under `kgrid_fine`. `srlr`, the only model: the plane-wave channels $\bq+\bG_a\to0$ carry the long range from the bundle's `W0_lr`, fitted on the coarse grid and added back at every fine $\bq$. It needs a GW restart with `W0_lr`. A static Dyson $W$ (`cohsex`, `gn_ppm`, `hl_ppm`) writes it, and so does a one-shot `tangential` run, which solves one static Dyson $W(0)$ for the restart. An `mpa` restart, a QSGW tangential one and a bispinor tangential one have no `W0_lr` and refuse (`GATE srlr_restart_channels`). `c1` and `legacy` were removed and refuse with one line. See [Short- and long-range W](../../theory/w-range-splitting.md).
 
 `srlr`
 {: .kw-values }
@@ -237,4 +240,4 @@ A separate entry point: the TDA screened recursion ($D + w V - W$), at least two
 | `--lanczos` | removed (it changed nothing) |
 | other `--davidson-*`, `--trlan-*`, `--lanczos-*`, `--kpm-*` | the input key of the same name in snake case |
 | `bse_k_grid` | `kgrid_fine` |
-| `--ring-timing`, `w_head_densify = legacy`, `LORRAX_LANCZOS_REORTH` | retired |
+| `--ring-timing`, `w_head_densify = c1` or `legacy` | retired |

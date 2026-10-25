@@ -138,6 +138,7 @@ Centroid pruning refuses a band window above half the plane-wave basis, $\tfrac1
 
 !!! refuses
     - Neither `-i` nor `--save` on the command line.
+    - An input file without `save_dir`, `nbnd` or `kgrid`, or `--save` without `--nbnd` and `--nk`, with one line per key (`nbnd is required`).
     - An input file with no `[nscf]` section.
     - No `data-file-schema.xml` in `save_dir`.
     - No `charge-density.hdf5` in `save_dir`. A QE build without HDF5 writes `charge-density.dat` instead; rebuild QE with HDF5.

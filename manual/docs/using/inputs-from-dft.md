@@ -172,7 +172,7 @@ Keys and defaults: [gw keywords](../drivers/gw/keywords.md).
 !!! refuses
     - `WfnLoader: real-flavor WFN unsupported`: `flavor = 1`. Rerun `pw2bgw.x` with `real_or_complex = 2`.
     - `WfnLoader: spin-polarized WFN unsupported`: `nspin = 2`. Run QE noncollinear.
-    - A full-grid k-point that no permitted operation reaches from the stored ones. For a nonmagnetic WFN, link the NSCF and SCF `.save` in the run directory; for a magnet, link the NSCF schema. With a schema bound, the list was reduced by an operation QE did not record: regenerate it with `K_POINTS automatic`.
+    - A full-grid k-point that no permitted operation reaches from the stored ones. Without a bound schema, link the NSCF `<prefix>.save` with its `data-file-schema.xml` and the SCF `<prefix>.save` in the run directory, so the list unfolds with the operations QE reduced it by. With a schema bound, the list was reduced by an operation QE did not record, and it must be regenerated with `K_POINTS automatic`.
     - No pseudopotentials, or none for one of the atomic numbers in `atyp`. Link the UPF files in the run directory or pass `--pseudo_dir`.
     - `sys_dim` other than 0, 2 or 3.
     - Fully relativistic pseudopotentials on a spinor WFN with no QE `<spinorbit>` record. Link `data-file-schema.xml` in the run directory.

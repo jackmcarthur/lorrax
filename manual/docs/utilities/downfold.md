@@ -296,7 +296,7 @@ The run checks $\zeta_{\bq=0,\sigma}(\bG{=}0)$ against the separately transporte
 
 !!! refuses
     - An input file with no section, a section other than `[downfold]` (for example a GW input file's `[cohsex]`), an unknown key, or INI syntax errors.
-    - `source_restart` or `output_restart` unset; `mu_small` unset, or neither an integer nor `auto`.
+    - `source_restart`, `output_restart` or `parent_input_file` unset; `mu_small` unset, or neither an integer nor `auto`.
     - `source_restart` neither a file nor a directory; no `isdf_tensors_*.h5` under it; more than one. Name the file.
     - `output_restart` equal to `source_restart`. Give the output its own directory.
     - No window; both spellings set; only one of `n_val`/`n_cond` or of the two `band_range_*` keys; a range that is not `lo:hi` or is empty; a window past the bundle's band count.

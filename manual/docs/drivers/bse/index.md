@@ -21,7 +21,7 @@ Reads
 :   GW input file, ISDF tensor file `isdf_tensors_<N_mu>.h5`, `WFN.h5`, centroid table, `eqp1.dat`, `dipole.h5`
 
 Writes
-:   `bse.out`, `eigenvalues*.dat`, `eigenvectors.h5`, `absorption_eh.dat`, `absorption_noeh.dat`; `absorption_haydock.h5`, `absorption_haydock_b{1,2,3}_eh.dat`
+:   `bse.out`, `eigenvalues*.dat`, `eigenvalues*_noeh.dat`, `eigenvectors.h5`, `absorption_eh.dat`, `absorption_noeh.dat`; `absorption_haydock.h5`, `absorption_haydock_b{1,2,3}_eh.dat`
 
 Hamiltonian
 :   Tamm–Dancoff (the default) or full, with the coupling block (`full_bse = true`); the spinor kernel on a spinor WFN, `spin_singlet` (default) or `spin_triplet` on a non-spinor one ([Kernel and Hamiltonian](#kernel))
@@ -42,7 +42,7 @@ Solver
 3. **Eigensolve**
    The route selected on the command line returns exciton energies $\Omega_S$ and, on the default eigensolve route, amplitudes $A^S_{cv\bk}$ in `eigenvectors.h5`.
 4. **Dipoles and spectrum**
-   Velocity matrix elements from `dipole.h5` (`dipole_file`) are put in position form. The eigensolve stores per-state dipoles $d^\alpha_S$ and writes BerkeleyGW's `absorption_eh.dat` and `absorption_noeh.dat` from the computed states; `bse.absorption_haydock` (or `haydock = true`) computes $\varepsilon_2(\omega)$ by a continued fraction, without eigenvectors.
+   Velocity matrix elements from `dipole.h5` (`dipole_file`) are put in position form. The eigensolve stores per-state dipoles $d^\alpha_S$, writes the window's non-interacting transitions to BerkeleyGW's `eigenvalues*_noeh.dat`, and writes `absorption_eh.dat` and `absorption_noeh.dat` from the computed states; `bse.absorption_haydock` (or `haydock = true`) computes $\varepsilon_2(\omega)$ by a continued fraction, without eigenvectors.
 
 </div>
 
@@ -99,7 +99,6 @@ kgrid_fine = 12 12 1
 kgrid_fine_shift = 0.5 0.5 0
 number_cond_bands_coarse = 16
 eqp_co_corrections = eqp1.dat
-w_head_densify = c1
 ```
 
 Under `kgrid_fine` the dipoles are carried to the fine grid with the bands, so the run above works unchanged on that input file ([`kgrid_fine`](keywords.md#kgrid_fine)).
@@ -198,6 +197,7 @@ A downfolded bundle is validated by solving the same BSE on the parent and on th
 ## Refusals {: #refusals }
 
 !!! refuses
+    - An input file without `nval` and `ncond` (or `number_bands_protected`), `number_bands` or `centroids_file`, with one line per key (`centroids_file is required`).
     - No `-i`; an unknown flag; an old flag ("`--n-val` is now input key `number_val_bands_fine`") or an old input key ("`bse_k_grid` is now `kgrid_fine`").
     - A key set on a route that does not read it (for example `number_eigenvalues` or `highest_occupied_band` with `kpm_dos = true`), or two route keys together.
     - `dipole_file` with `full_bse = true`; `spin_singlet`/`spin_triplet` on a spinor WFN; `spinor` that disagrees with the WFN; a collinear spin-polarized WFN.
@@ -210,7 +210,6 @@ A downfolded bundle is validated by solving the same BSE on the parent and on th
     - A window band outside the ζ-fit legs of the GW run (`BseWindowOutsideZetaTrainingError`).
     - `eqp_corrections` on a stamped QP WFN, or an `eqp1.dat` whose k blocks are not the WFN's irreducible wedge.
     - A `dipole.h5` whose `basis` stamp differs from the WFN's.
-    - `kgrid_fine` with an axis smaller than the coarse grid; `w_head_densify = legacy`; `srlr` without `W0_lr` in the bundle.
+    - `kgrid_fine` with an axis smaller than the coarse grid; `w_head_densify = c1` or `legacy`; a bundle without `W0_lr` under `kgrid_fine` (an `mpa`, QSGW tangential or bispinor tangential restart, or a downfolded bundle).
     - Full BSE above transition dimension 4096, or with a non-reciprocal $W$.
     - `bse.absorption_haydock` on fewer than two devices.
-    - The environment variable `LORRAX_LANCZOS_REORTH` (retired).

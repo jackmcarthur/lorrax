@@ -19,9 +19,9 @@ Relative `wfn_file` and `centroids_file` resolve against the input file's direct
 | input file | `-i` | user | The GW input file. Its directory locates the ISDF tensor file. |
 | `isdf_tensors_<N_mu>.h5` | — | gw | ISDF tensor file. Exactly one, beside the input file or in its `tmp/`. Every route; read, never written. |
 | `WFN.h5` | `wfn_file` | nscf, or DFT + pw2bgw | Occupied count, cell volume, bundle authentication; under `kgrid_fine`, the band interpolation. `WFN_qp.h5` from a QSGW run is accepted. |
-| `centroids_frac_<N>.txt` | `centroids_file` | centroids | Content hash authenticates the bundle; under `bse_k_grid`, the interpolation points. On a downfolded bundle, the parent table recorded in the bundle. |
+| `centroids_frac_<N>.txt` | `centroids_file` | centroids | Content hash authenticates the bundle; under `kgrid_fine`, the interpolation points. On a downfolded bundle, the parent table recorded in the bundle. |
 | `eqp1.dat` | `eqp_corrections` | gw | Eigensolve route and `bse.absorption_haydock`. Diagonal QP energies on the irreducible wedge, unfolded on load. Format: [GW files](../gw/files.md#eqp). |
-| `dipole.h5` | `dipole_file` | dipole | Velocity matrix elements and `band_energies`. `bse.bse_jax`: the per-state dipoles, `absorption_eh.dat`/`absorption_noeh.dat` and the Haydock seed (TDA). `bse.absorption_haydock`: always, default `dipole.h5`. |
+| `dipole.h5` | `dipole_file` | dipole | Velocity matrix elements and `band_energies`. `bse.bse_jax`: the per-state dipoles, `eigenvalues*_noeh.dat`, `absorption_eh.dat`/`absorption_noeh.dat` and the Haydock seed (TDA). `bse.absorption_haydock`: always, default `dipole.h5`. |
 | `dipole_qsgw.h5` | `dipole_file` | gw (QSGW) | Same layout, stamped `basis = qp`; pairs only with `WFN_qp.h5`. |
 | `dipole.h5` beside the input file | — | dipole | The head tensor $S$ when the bundle has no `S_cart_head`: under `kgrid_fine`, and in a $W(0)$ rebuild. |
 | `zeta_q.h5` beside the bundle | — | gw | Only for a $W(0)$ rebuild, and for `head_minibz_average = true` under `kgrid_fine`. |
@@ -61,6 +61,9 @@ The bundle's full schema belongs to the [GW Files](../gw/files.md#restart) page.
 
 `eigenvalues.dat`, `eigenvalues_b1.dat` … `eigenvalues_b3.dat`
 :   Eigensolve route: every root in BerkeleyGW's format, under its names: `eigenvalues.dat` for one polarization (an input file `polarization`, or no `dipole_file`), `eigenvalues_b1.dat` … `_b3.dat` for the three Cartesian axes. A triplet run writes the same files and rows, with BerkeleyGW's ` mg ` in the column header.
+
+`eigenvalues_noeh.dat`, `eigenvalues_b1_noeh.dat` … `eigenvalues_b3_noeh.dat`
+:   Eigensolve route with `dipole_file` and the TDA: the window's non-interacting transitions, as BerkeleyGW's `absorption.x` writes them, named per polarization as the eigenvalue files. Four header lines give `neig`, the supercell volume $N_k\Omega_{\mathrm{cell}}$, `nspin, nspinor, nkpt, ncb, nvb` and the column labels. Each row is one transition, in the order $\bk$, $c$, $v$, and holds `ik ic iv is`, then $E_c$, $E_v$ and $E_c - E_v$ in eV, $|d|^2$, and the real and imaginary parts of the window dipole along the polarization. The valence index counts down from the VBM, the energies are the quasiparticle energies wherever they are corrected, and `is` is 1.
 
 `absorption_eh.dat`, `absorption_noeh.dat` (or `absorption_b1_eh.dat` … `_b3_noeh.dat`)
 :   Eigensolve route with `dipole_file` and the TDA: BerkeleyGW's four header lines and `4f16.9` rows ($\omega$, $\varepsilon_2$, $\varepsilon_1$, DOS), named per polarization as the eigenvalue files.

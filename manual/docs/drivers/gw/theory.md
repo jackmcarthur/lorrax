@@ -234,7 +234,7 @@ By default $\Sigma^c$ is evaluated on shell: the sweep folds each node directly 
 
 ### <span class="n">3.5</span> Frequency treatments {: #sig-treat }
 
-`compute_mode` selects the model for $W^c$. `x_only` keeps $\Sigma^x$ alone.
+`compute_mode` selects the model for $W^c$. `x_only` keeps $\Sigma^x$ alone. `auto`, the default, runs GN-PPM on an insulator and refuses a metal, whose message names `compute_mode = tangential`.
 
 | Treatment | Input file | $W$ evaluated at | Model for $W^c(z)$ | Limits |
 |---|---|---|---|---|
@@ -297,7 +297,7 @@ By default $\Sigma^c$ is evaluated on shell: the sweep folds each node directly 
 
     The same one-pole algebra with a real probe above every transition, which reads the first frequency moment from the band-summed response.
 
-    The body uses the GN fit at real $z_p=\omega_p$. The density f-sum rule enters only the $\bq\to0$ head, $\Omega_\mathrm{head}^2=\omega_\mathrm{pl}^2/[1-\epsilon^{-1}_{00}(0)]$. A probe at or below $\Delta_\mathrm{max}$ refuses, and the shared `2.0` Ry default refuses on most spectra: set `ppm_omega_p` above the largest χ⁰ transition.
+    The body uses the GN fit at real $z_p=\omega_p$. The density f-sum rule enters only the $\bq\to0$ head, $\Omega_\mathrm{head}^2=\omega_\mathrm{pl}^2/[1-\epsilon^{-1}_{00}(0)]$. A probe at or below $\Delta_\mathrm{max}$ refuses. Unset, `ppm_omega_p` is 200 Ry under `hl_ppm` (2 Ry under `gn_ppm`).
 
     $$
     W^c_\bq(\mu,\nu;z)=R_\bq(\mu,\nu)\left[\frac{1}{z-\Omega_\bq(\mu,\nu)}-\frac{1}{z+\Omega_\bq(\mu,\nu)}\right],\qquad \Omega^2=-\omega_p^2\,\frac{W^c(\omega_p)}{W^c(0)-W^c(\omega_p)},\qquad \omega_p>\Delta_\mathrm{max} \tag{3.5}

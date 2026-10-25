@@ -315,6 +315,7 @@ The links are stored on the IBZ only when the steps are the three reduced axes a
 ## Refusals {: #refusals }
 
 !!! refuses
+    - No `-i`. An input file without `nval` and `ncond` (or `number_bands_protected`) or `number_bands`, with one line per key (`number_bands is required`).
     - An input file without `sys_dim`, or with an unknown key.
     - `number_bands_protected` beside `nval` or `ncond`, below the occupied-band count or above `number_bands` (`GATE band_request_forms`). 
     - `bispinor_gw = full_static_cohsex` without `bispinor = true`.

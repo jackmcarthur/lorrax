@@ -145,7 +145,7 @@ A collective library's all-reduce adds the $P$ per-rank terms in an order taken 
 | `install_reduction_guard_from_env()` | install it from `LORRAX_REDUCTION_GUARD`; the runtime does this before the drivers import |
 | `reduction_trace() -> list` | the records the guard collected |
 
-Operands above the slab size (default 8 MiB, `LORRAX_ORDERED_SLAB_MB`) are reduced in slabs inside a `fori_loop`; slabbed and one-shot results are bitwise equal. Every floating sum over a mesh axis in LORRAX must use these; a lint enforces it. A raw `lax.psum` is allowed only where the sum is exact at any rank count, marked on the same line with `# exact-reduce: <reason>`. The BSE ring exchange in `src/bse/bse_ring_comm.py` finishes its contraction this way:
+Operands above the fixed slab size of 8 MiB are reduced in slabs inside a `fori_loop`; slabbed and one-shot results are bitwise equal. Every floating sum over a mesh axis in LORRAX must use these; a lint enforces it. A raw `lax.psum` is allowed only where the sum is exact at any rank count, marked on the same line with `# exact-reduce: <reason>`. The BSE ring exchange in `src/bse/bse_ring_comm.py` finishes its contraction this way:
 
 ```python
 U = ordered_psum(U_partial, axis_name="y")   # (batch, mu_local_x, nk), sum over y in rank order
@@ -221,8 +221,8 @@ These are not re-exported from `lxkit` and are imported by path when needed.
 | `SLURM_PROCID`, `PMI_RANK`, `OMPI_COMM_WORLD_RANK` | `rank_id` | the launcher rank, read before `jax.process_index()` |
 | `LORRAX_BANDS_GEMM_FFI` | the CPU GEMM `Gate` | `0` runs the XLA dot fallback, announced |
 | `LORRAX_CHECK_REPLICA=1` | `device_put_process_local` | restore JAX's cross-process equality assertion (and its all-gather) |
-| `LORRAX_ORDERED_SLAB_MB` | ordered reductions | slab size in MiB (default 8) |
-| `LORRAX_REDUCTION_GUARD=log|raise`, `LORRAX_REDUCTION_TRACE=<path>` | `install_reduction_guard_from_env` | record or refuse raw floating `psum`s; dump the trace (`{rank}` expanded) at exit |
+| `LORRAX_REDUCTION_GUARD=log|raise` | `install_reduction_guard_from_env` | record or refuse raw floating `psum`s (the records are read with `reduction_trace()`) |
+
 | `LORRAX_MEMORY_RECEIPTS=calibrate` | `lxkit.memory` | wait on priced stages and read the allocator in every section, for exact receipts |
 | `LORRAX_MEMORY_STRICT=1` | `lxkit.memory` | an unpriced figure raises `GATE memory_unpriced`; a price without provenance is a finding |
 | `LORRAX_MEMORY_TRACE=<path>` | `lxkit.memory` | one JSON line per closed section: live arrays, allocator readings, executables |

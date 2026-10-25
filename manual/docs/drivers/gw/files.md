@@ -259,7 +259,7 @@ tmp/zeta_q.h5
   zeta_q_G                         complex128[N_q, N_mu, ngkmax]    zero past ngk[q]
 ```
 
-$N_q$ is the q-irreducible wedge when the centroid set is orbit-closed, else every q point; the G sphere is $|\bq+\bG|^2\le$ `zeta_cutoff`. The file is written only when `write_restart_tensors = true`. `fit_provenance` is stamped after `zeta_is_done`, and not at all when `LORRAX_MAX_RCHUNKS` truncated the fit. The file is not named by $N_\mu$: two runs in one directory share it.
+$N_q$ is the q-irreducible wedge when the centroid set is orbit-closed, else every q point; the G sphere is $|\bq+\bG|^2\le$ `zeta_cutoff`. The file is written only when `write_restart_tensors = true`. `fit_provenance` is stamped after `zeta_is_done`. The file is not named by $N_\mu$: two runs in one directory share it.
 
 ## Tangential stores {: #tangential-stores }
 
