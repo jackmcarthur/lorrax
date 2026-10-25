@@ -31,6 +31,7 @@ from runtime.padding import (
 )
 from .efermi import band_in_occupation_window
 from .minimax_screening import MinimaxNodes
+from .subtile_stream import _COMPILED, _STREAM_KERNELS, _STREAM_PROGRAMS
 
 
 # ============================================================================
@@ -202,6 +203,7 @@ def _charge_stream_kconv(mesh_xy, kgrid, plan):
         while len(_CHARGE_KCONV) >= 2:
             _CHARGE_KCONV.pop(next(iter(_CHARGE_KCONV)))
         _CHARGE_KCONV[key] = hit
+        _release_evicted_programs()
     return hit
 
 
@@ -232,17 +234,18 @@ def _charge_window_kconv(mesh_xy, kgrid, plan, rows, *, n_out=1, complete=False)
         while len(_CHARGE_KCONV) >= 2:
             _CHARGE_KCONV.pop(next(iter(_CHARGE_KCONV)))
         _CHARGE_KCONV[key] = hit
+        _release_evicted_programs()
     return hit
 
 
 def charge_kconv_table_bytes():
-    """Per-rank bytes of every placed charge kconv table held for reuse (``_CHARGE_KCONV``).
+    """Per-rank bytes of the placed charge tables held by either bounded cache.
 
     They stay on the devices between dispatches, outside any executable's
     buffers, so the response bank reserves them as a live stage.
     """
     seen, total = set(), 0
-    for _, arrays in _CHARGE_KCONV.values():
+    for _, arrays in (*_PLACED_LOAD.values(), *_CHARGE_KCONV.values()):
         for a in arrays:
             if id(a) not in seen:
                 seen.add(id(a))
@@ -460,15 +463,32 @@ def _photon_stream_kconvs(mesh_xy, kgrid, half_plans, parity, rows):
         while len(_PHOTON_KCONV) >= 2:
             _PHOTON_KCONV.pop(next(iter(_PHOTON_KCONV)))
         hit = _PHOTON_KCONV[key] = (kconvs, placed[:3])
+        _release_evicted_programs()
     return hit
 
 
 def placed_kconv_tables_live(tail) -> bool:
     """Whether every placed kconv table a bound program reads (``tail``) is still held
-    by its kconv cache (``_CHARGE_KCONV``, ``_PHOTON_KCONV``); an evicted plan's are not."""
-    held = {id(a) for cache in (_CHARGE_KCONV, _PHOTON_KCONV) for value in cache.values()
+    by a placed-table owner; an evicted plan's are not."""
+    held = {id(a) for cache in (_PLACED_LOAD, _CHARGE_KCONV, _PHOTON_KCONV) for value in cache.values()
             for a in jax.tree.leaves(value) if isinstance(a, jax.Array)}
     return all(id(a) in held for a in jax.tree.leaves(tail) if isinstance(a, jax.Array))
+
+
+def _release_evicted_programs():
+    """Retire cached programs and executables after their last table owner evicts.
+
+    An already running compile or caller may still own its operands; this
+    removes cache ownership, without cancelling work or deleting buffers.
+    """
+    for cache in (_chi_minimax_kernel_cache, _STREAM_KERNELS):
+        for key in [k for k, kernel in cache.items()
+                    if not placed_kconv_tables_live(getattr(kernel, "tail", ()))]:
+            dead = cache.pop(key)
+            state = _STREAM_PROGRAMS.pop(dead, None)
+            programs = tuple(state["variants"].values()) if state else (dead,)
+            for entry in [entry for entry in _COMPILED if entry[0] in programs]:
+                del _COMPILED[entry]
 
 
 class _BoundTail:
