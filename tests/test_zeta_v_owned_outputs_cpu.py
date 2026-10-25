@@ -29,11 +29,13 @@ def test_live_fit_handoff_does_not_allocate_a_discarded_v(monkeypatch, side):
     original_zeros = vq.jnp.zeros
 
     def zeros(shape, *args, **kwargs):
-        allocations.append(tuple(shape))
+        dims = (int(shape),) if isinstance(shape, (int, np.integer)) else tuple(shape)
+        allocations.append(dims)
         return original_zeros(shape, *args, **kwargs)
 
     def contracted(*_args, **_kwargs):
         calls.append('live-fit')
+        vq.jnp.zeros(1)             # providers also warm valid scalar-shape scratch
         assert (q, mu, mu) not in allocations
         return result
 
@@ -83,8 +85,9 @@ def test_grouped_cross_grams_and_shells_allocate_only_output_v(monkeypatch, side
     original_zeros = zm.jnp.zeros
 
     def zeros(shape, *args, **kwargs):
-        if tuple(shape) == (qpad, mu, mu):
-            allocations.append(tuple(shape))
+        dims = (int(shape),) if isinstance(shape, (int, np.integer)) else tuple(shape)
+        if dims == (qpad, mu, mu):
+            allocations.append(dims)
         return original_zeros(shape, *args, **kwargs)
 
     zetas = []
