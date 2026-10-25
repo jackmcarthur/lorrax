@@ -1228,7 +1228,7 @@ def _onto_handle_mesh(A: jax.Array, mesh: Mesh, name: str) -> jax.Array:
     if (getattr(A, "is_fully_addressable", True)
             or getattr(A, "is_fully_replicated", False)):
         return device_put_process_local(
-            gather_to_host(A), _replicated_sharding(mesh, A.ndim))
+            A, _replicated_sharding(mesh, A.ndim))
     sh = A.sharding
     src = getattr(sh, "mesh", None)
     if (isinstance(sh, NamedSharding) and src.devices.shape == mesh.devices.shape
