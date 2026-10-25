@@ -56,7 +56,7 @@ Instructions
    `bash 01-run_exciton_bands.run`, then plot with
    `lorrax_python 02-plot_exciton_bands.py` after sourcing the shared
    `lorrax_env.sh`. This additional LORRAX exercise uses a Gamma-centered
-   24 × 24 × 1 electron-hole integration grid, retaining the same 3 × 3 × 1
+   18 × 18 × 1 electron-hole integration grid, retaining the same 3 × 3 × 1
    screening calculation. It requests 128 levels at 37 momenta from Gamma to K,
    rather than the complete transition space. Check every root's residual
    and whether the plotted levels reach the independent-particle threshold.

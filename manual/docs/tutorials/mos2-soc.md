@@ -44,7 +44,7 @@ four-GPU node for LORRAX.
 | Fine BSE grid | 8 × 8 × 1, shifted by (0.47, 0.37, 0) in grid-step units |
 | Fine BSE bands | Six valence and eight conduction; all 3,072 Tamm–Dancoff roots |
 | Spectrum | 0.15 eV Gaussian width; 0.01 eV spacing |
-| Exciton bands | Γ-centered 24 × 24 × 1 integration grid; six valence and eight conduction bands; 128 roots at 37 Q points on Γ–K |
+| Exciton bands | Γ-centered 18 × 18 × 1 integration grid; six valence and eight conduction bands; 128 roots at 37 Q points on Γ–K |
 
 ## Steps {: #instructions }
 
@@ -89,7 +89,7 @@ lorrax_python 02-plot_exciton_bands.py
 ```
 
 The electron-hole sum retains six valence and eight conduction bands on a
-Γ-centered 24 × 24 × 1 integration grid. H-transform supplies the electron
+Γ-centered 18 × 18 × 1 integration grid. H-transform supplies the electron
 at k + Q; the hole remains at k. Screening and the QP Hamiltonian still
 come from the same 3 × 3 × 1 coarse calculation.
 
@@ -100,8 +100,8 @@ These are actual finite-Q solves with a 0.25 meV Davidson residual budget;
 the plot connects their ordered energies with straight segments. Arbitrary-Q
 exchange refits let the denser path retain the same integration grid.
 Four GPUs were tested and are recommended for this stage. The scan took
-34 min 43 s on four Perlmutter A100 80 GB GPUs, including its preparation
-and certification, with a largest reported stage device peak of 16.35 GB
+24 min 11 s on four Perlmutter A100 80 GB GPUs, including its preparation
+and certification, with a largest reported stage device peak of 9.23 GB
 per rank. This does not establish a minimum GPU count.
 
 The plot shows the lowest 128 levels only on Γ–K and only up to 3.0 eV.
@@ -120,7 +120,7 @@ identify longitudinal/transverse or bright/dark character.
 
 The dashed line marks the matched independent-particle threshold where it
 falls within the displayed range. The root count does not guarantee continuum
-coverage at every Q: the highest retained level reaches it at 15 of 37
+coverage at every Q: the highest retained level reaches it at 27 of 37
 momenta. The lower panel subtracts each level's own Γ energy; dots are
 computed values from the same scan, with no fitted curves.
 [Download the PDF](../assets/figures/tutorial-mos2-exciton-bands.pdf).
@@ -128,8 +128,12 @@ computed values from the same scan, with no fitted curves.
 </figcaption>
 </figure>
 
-These are illustrative results: previous matched 24 × 24 and 30 × 30 controls
-changed the lowest eight levels by up to 7.65 meV at shared momenta. Denser Q
+The 18 × 18 grid retains the K valleys and gives a smoother sampled continuum
+than the tested 16 × 16 grid. Neither is converged: relative to 24 × 24, the
+lowest eight ordered levels shift by up to 30.3 meV at the same Q points.
+The [saved 24 × 24 reference](https://github.com/jackmcarthur/lorrax/tree/main/examples/MoS2_SOC_2026/results/lorrax/exciton/reference_k24)
+allows a direct comparison. The 16 × 16 scan took 14 min 34 s; none of these
+37-point scans meets a five-minute tutorial target. Denser Q
 sampling improves the displayed dispersion, while coarse GW and integration-grid
 convergence require further calculations. The tutorial uses the 1 meV
 **visualization** exchange check; the driver's **reference** default remains

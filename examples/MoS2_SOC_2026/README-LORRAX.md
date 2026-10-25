@@ -137,7 +137,7 @@ The native BSE uses six valence and eight conduction bands on the shifted
 Gaussian broadening. All 3,072 retained Tamm–Dancoff roots are requested.
 
 The additional `3-bse/3-lorrax_fully_rel/3-exciton-bands` stage keeps the same
-six-valence/eight-conduction window and a Gamma-centered `24 24 1`
+six-valence/eight-conduction window and a Gamma-centered `18 18 1`
 integration grid. It solves 128 lowest levels at 37 genuine Q points from
 Gamma to K, with extra sampling near Gamma and a 0.25 meV Davidson budget.
 The figure displays only Gamma–K up to 3.0 eV, with a near-Gamma detail

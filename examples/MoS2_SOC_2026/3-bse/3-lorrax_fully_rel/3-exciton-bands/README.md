@@ -15,7 +15,7 @@ Instructions
 
 1. Finish the native GW calculation and run `../01-link_files.sh`. Read
    `gw.in`: the electron-hole sum uses six valence and eight conduction bands
-   on a Gamma-centered 24 × 24 × 1 integration grid. The 48-band H-transform
+   on a Gamma-centered 18 × 18 × 1 integration grid. The 48-band H-transform
    window includes the same conduction guards as the optical calculation.
 
 2. We tested this stage on four GPUs and recommend that allocation. Run:
@@ -31,11 +31,11 @@ Instructions
    than on the former seven-interval Gamma–K segment. Every momentum is
    evaluated by the driver; no extra points are inserted by the plotter.
 
-   The executed scan took 34 min 43 s on four Perlmutter A100 80 GB GPUs,
+   The executed scan took 24 min 11 s on four Perlmutter A100 80 GB GPUs,
    including restart loading, H-transform, exchange refits, all 37 Q solves
    and the exchange certification. It excludes the preceding GW and
-   preprocessing stages. The largest reported stage device peak was 16.35 GB
-   per rank; host peak was 2.40 GB per rank. Four GPUs are a tested allocation,
+   preprocessing stages. The largest reported stage device peak was 9.23 GB
+   per rank; host peak was 2.56 GB per rank. Four GPUs are a tested allocation,
    rather than a measured minimum.
 
    These coordinates use the supplied cell's reciprocal basis. Its in-plane
@@ -64,19 +64,19 @@ Instructions
    from the same QP transitions at every Q. The plot shows that threshold
    where it falls within the displayed energy range. A root count of 128
    does not by itself guarantee that the continuum is reached at every Q:
-   the highest retained level reaches it at 15 of these 37 momenta.
+   the highest retained level reaches it at 27 of these 37 momenta.
 
 Exchange certification
 ----------------------
 
 The runner uses `--vq-mode refit --refit-window bse`: both H-transform
 and exchange are evaluated at the requested arbitrary Q. A denser Q path
-therefore does not require a finer integration grid. The 24 × 24 grid
+therefore does not require a finer integration grid. The 18 × 18 grid
 controls the electron-hole sum and remains unchanged.
 
 The tutorial explicitly selects the existing `visualization` certificate
-with a 1 meV exchange-comparison gate; the completed scan measured 0.04417 meV.
-All 128 roots converged at every Q, with a largest residual of 0.22844 meV. On-grid Q points compare refitted
+with a 1 meV exchange-comparison gate; the completed scan measured 0.03911 meV.
+All 128 roots converged at every Q within the 0.25 meV residual budget. On-grid Q points compare refitted
 and stored exchange eigenvalues using the same solver. This checks the
 exchange construction, rather than integration-grid convergence. The
 solver uses a tighter residual budget for both members of that comparison.
@@ -94,9 +94,9 @@ produce a leading linear term in |Q| for the longitudinal combination,
 while the transverse partner begins quadratically. The near-Gamma panel
 makes this comparison legible after subtracting the different Gamma energies.
 Level 3 has resolved quadratic curvature over the displayed window: a
-quadratic fit has 0.145 meV RMS error, versus 1.69 meV for a linear fit.
-Level 4 already rises by 1.345 meV at the first nonzero Q, where level 3
-moves only 0.005 meV, illustrating a strong linear contribution. The plot
+quadratic fit has 0.407 meV RMS error, versus 1.95 meV for a linear fit.
+Level 4 already rises by 1.267 meV at the first nonzero Q, where level 3
+moves only 0.008 meV, illustrating a strong linear contribution. The plot
 contains the computed points only, without those diagnostic fits.
 
 The 0.25 meV residual budget applies to each energy; shifts smaller than
@@ -106,10 +106,16 @@ window above resolves it, without determining asymptotic coefficients.
 Energies alone do not establish longitudinal, transverse, bright or dark
 character.
 
-These are illustrative results from a sparse coarse GW grid. Previous
-matched 24 × 24 and 30 × 30 controls changed the lowest eight ordered
-levels by up to 7.65 meV at their shared momenta; they do not establish
-integration-grid convergence. Denser Q sampling improves the visible
-dispersion without improving the underlying GW or electron-hole-sum
-convergence. Completed older full-path outputs are retained as provenance,
-not as inputs to this Gamma–K workflow.
+These are illustrative results from a sparse coarse GW grid. We tested the
+same 37-point path on 16 × 16, 18 × 18 and 24 × 24 integration grids. The
+16 × 16 scan took 14 min 34 s, but samples the continuum less smoothly and
+misses the exact K valleys. We use 18 × 18 as a smaller grid that retains K.
+Relative to the saved [24 × 24 reference](../../../results/lorrax/exciton/reference_k24/),
+the lowest eight ordered levels change by up to 30.3 meV, and the sampled
+continuum threshold changes by −12.4 to +44.3 meV. This is not a converged
+integration-grid calculation. The 24 × 24 scan took 34 min 43 s; none of these
+complete scans meets a five-minute target on the tested four A100 GPUs.
+
+Denser Q sampling improves the visible dispersion without improving the
+underlying GW or electron-hole-sum convergence. Older full-path outputs
+are retained as provenance, not as inputs to this Gamma–K workflow.
