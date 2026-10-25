@@ -584,7 +584,7 @@ def _resolve_stream_program(state, args, *, ahead=False):
         kernel = _stream_variant(state, layout)
         executable = _program_compiled(kernel, args)
         need = -agreed_chunk(-compiled_new_bytes(executable, extra=state["native"]))
-        room = agreed_chunk(int(memory.room()))
+        room = memory.room()
         if layout == "axis" and need > room:
             if force:
                 raise ValueError("GATE response_axis_room: forced axis stream exceeds compiled room")

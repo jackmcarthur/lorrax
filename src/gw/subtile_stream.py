@@ -366,7 +366,8 @@ def prepare_green_operands(operands, mesh, build, *, label, compile_only=False,
     for layout in layouts:
         placement = green_operand_program(mesh, layout).lower(*operands).compile()
         place_new = -agreed_chunk(-compiled_new_bytes(placement))
-        room = agreed_chunk(int(memory.room()))
+        # room() already agrees the minimum across ranks.
+        room = memory.room()
         if layout == "axis" and place_new > room and _force_layout is None:
             continue
         abstract = jax.tree.map(
@@ -380,10 +381,10 @@ def prepare_green_operands(operands, mesh, build, *, label, compile_only=False,
         price = memory.priced(0, f"{label} {layout} sum-band placement + compiled window",
                               spread=needed * mesh.size, ranks=mesh.size)
         candidates.append((layout, price, placement, context))
-        if needed <= agreed_chunk(int(memory.room())):
+        if needed <= memory.room():
             break
     chosen = memory.admit(f"{label} sum-band operands", [(c[0], c[1]) for c in candidates],
-                          agreed_chunk(int(memory.room())))
+                          memory.room())
     layout, _, placement, context = next(c for c in candidates if c[0] == chosen)
     if compile_only:
         return layout, None, context
