@@ -1558,8 +1558,10 @@ _DEFAULTS = {
     # fine-grid step (k_i = (i + dk)/N per axis; 0.5 = half a step).  Empty or
     # zero = Γ-centred.  Only k - k' enters W, so W stays on the unshifted q grid.
     "kgrid_fine_shift": "",
-    # Conduction bands of the coarse (GW) grid fed to the H-transform; empty =
-    # every conduction band of the deck's window (ncond).  The valence side
+    # Conduction bands of the coarse (GW) grid fed to the BSE's H-transform
+    # (kgrid_fine, exciton bands); empty = every conduction band of the deck's
+    # window (ncond).  The standalone htransform does not read it (it fits
+    # ncond + --guard-bands).  The valence side
     # (number_val_bands_coarse) is accepted and ignored: the H-transform fits
     # every valence band of the window.
     "number_cond_bands_coarse": "",

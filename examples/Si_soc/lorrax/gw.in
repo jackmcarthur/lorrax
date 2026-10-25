@@ -15,3 +15,14 @@ number_cond_bands_fine = 8
 number_cond_bands_coarse = 16        # as absorption.inp's number_cond_bands_coarse
 eqp_co_corrections = eqp1.dat
 number_eigenvalues = 16
+
+# htransform's band path: qe/04-bands' L-G-X-U|K-G, which inteqp interpolates onto.
+# QE's crystal_b, each count the steps to the next corner, 202 points.
+K_POINTS {crystal_b}
+6
+  0.500  0.500  0.500  50  # L
+  0.000  0.000  0.000  50  # G
+  0.000  0.500  0.500  50  # X
+  0.250  0.625  0.625   1  # U
+  0.375  0.750  0.375  50  # K
+  0.000  0.000  0.000   1  # G

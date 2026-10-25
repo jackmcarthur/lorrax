@@ -43,7 +43,7 @@ from common.preprocessing_output import StageSequence
 from runtime.run_session import RunSession
 from .production_report import HTransformProductionReport
 from .fh_interp import (
-    GALERKIN_BASIS_FILE, _build_mesh_xy, compact_galerkin_state,
+    GALERKIN_BASIS_FILE, _build_mesh_xy, band_window, compact_galerkin_state,
     h_transform, initialize_kpath, initialize_wfns,
     resolve_qp_hamiltonian_state, setup_wfn_and_sym,
 )
@@ -459,32 +459,6 @@ class _BasisStateLog:
         return self._log(*args, **kwargs)
 
 
-def _apply_coarse_window(params, args, parser) -> None:
-    """``number_cond_bands_coarse``: the conduction bands the H-transform fits,
-    the deck's ncond plus guard bands (it replaces ``--guard-bands``);
-    ``number_val_bands_coarse`` only warns."""
-    _nc_coarse = str(params.get("number_cond_bands_coarse", "") or "").strip()
-    if _nc_coarse:
-        if args.guard_bands != parser.get_default("guard_bands"):
-            parser.error("number_cond_bands_coarse sets the fitted conduction bands, "
-                         "and so the guard bands; drop --guard-bands")
-        try:
-            args.guard_bands = int(_nc_coarse) - int(params["ncond"])
-        except ValueError:
-            parser.error(f"deck key `number_cond_bands_coarse` takes an integer, "
-                         f"got {_nc_coarse!r}")
-        if args.guard_bands < 0:
-            parser.error(f"number_cond_bands_coarse = {_nc_coarse} is below ncond = "
-                         f"{int(params['ncond'])}, the conduction bands written on the path")
-    if str(params.get("number_val_bands_coarse", "") or "").strip():
-        logger.warning("number_val_bands_coarse has no effect: the H-transform always "
-                       "fits every valence band of the window (nval)",
-                       extra=message(id="number_val_bands_coarse_ignored",
-                                     found=("number_val_bands_coarse",
-                                            str(params["number_val_bands_coarse"])),
-                                     fix="remove number_val_bands_coarse"))
-
-
 def write_fine_grid_bands(params, *, ctilde, B_at_mu, enk_sigma, meta, wfn, mesh_xy,
                           a_band, use_low_mem_eigh, output_path, log):
     """The fine-grid bands of ``get_centroids_fi``, written to ``<stem>_fine.h5``.
@@ -520,7 +494,7 @@ def write_fine_grid_bands(params, *, ctilde, B_at_mu, enk_sigma, meta, wfn, mesh
         raise ValueError(
             f"number_val_bands_fine = {nv_fine}, number_cond_bands_fine = {nc_fine}: "
             f"the window [{b_min}, {b_max}) of the {nb_fit} fitted bands is empty or "
-            f"leaves them (nval = {nval}; number_cond_bands_coarse sets the fitted "
+            f"leaves them (nval = {nval}; ncond + --guard-bands sets the fitted "
             f"conduction bands)")
     # The f-shoulder: f(eps) is identically zero at and above max_k eps of the
     # fitted window's top band, so the top of the fine window needs guard bands
@@ -535,7 +509,7 @@ def write_fine_grid_bands(params, *, ctilde, B_at_mu, enk_sigma, meta, wfn, mesh
                 found=("guard bands above the fine window", _n_guard),
                 needs="at least 4: the top of the fine window may otherwise be an "
                       "arbitrary direction out of fH's null space",
-                fix="raise number_cond_bands_coarse (or lower number_cond_bands_fine)"))
+                fix="raise --guard-bands or ncond (or lower number_cond_bands_fine)"))
     shift = parse_kgrid_shift(params.get("kgrid_fine_shift", ""))
     with timing.section("wfns_fi"):
         fine = compute_wfns_fi(
@@ -658,8 +632,7 @@ def main(argv=None):
         # The deck's Sigma window: number_bands_protected resolves as in gw.
         from gw.gw_config import resolve_band_request
         resolve_band_request(params, wfn, log)
-        n_return_bands = int(params["nval"]) + int(params["ncond"])
-        _apply_coarse_window(params, args, parser)
+        n_return_bands, _ = band_window(params, args.guard_bands, log)
         from distrib_la import plan as _linalg_plan
         _fine_enabled = bool(params.get("get_centroids_fi", False))
         _fine_plan = (_linalg_plan(
