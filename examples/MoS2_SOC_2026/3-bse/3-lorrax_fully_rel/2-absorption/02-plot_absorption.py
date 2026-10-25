@@ -1,4 +1,4 @@
-"""Plot the two fully relativistic implementations on the workshop axes."""
+"""Plot LORRAX and the plane-wave code on the workshop axes."""
 from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')
@@ -13,7 +13,7 @@ plt.rcParams.update({'font.size': 9, 'axes.labelsize': 9,
 reference = Path('../../2-fully_rel/2-absorption')
 fig, ax = plt.subplots(figsize=(3, 2.9))
 for directory, label, color in ((Path('.'), 'LORRAX', 'tab:blue'),
-                                (reference, 'BGW', 'tab:orange')):
+                                (reference, 'Plane wave', 'tab:orange')):
     for name, style, kind in (('absorption_eh.dat', '-', 'BSE'),
                               ('absorption_noeh.dat', '--', 'IP')):
         if not (directory / name).exists():

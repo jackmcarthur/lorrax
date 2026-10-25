@@ -117,9 +117,15 @@ XML reader refuses the file ("not well-formed"), hence the `sed`.
 | `sys_dim = 3` | no truncation |
 
 `ht.in` asks for bands 1–24 (`ncond = 16`): htransform fits 4 guard bands above
-the returned window, and those must lie inside the GW QP bands (1–28). With
+the returned window, inside the GW QP bands (1–28). With `--eqp-file`, fitted
+bands above the eqp file's top band take their DFT energies plus the mean QP
+shift of its conduction bands, logged as one `[QP scissor]` line, so a window
+returning all 28 QP bands also runs. `gw.in` itself is not an htransform input:
+htransform reads its BSE key `number_cond_bands_coarse = 16` as its own fitted
+window and refuses it below `ncond = 20`. With
 `--qp-rotations qp_wfn_rotations.h5` instead of `--eqp-file`, htransform
-interpolates the full QP Hamiltonian rather than the diagonal eqp1 corrections.
+interpolates the full QP Hamiltonian rather than the diagonal eqp1 corrections;
+its returned bands must end below the QP block, as in `ht.in`.
 
 ## Expected results
 
