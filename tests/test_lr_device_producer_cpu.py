@@ -63,6 +63,10 @@ def test_device_producer_matches_literal_schur_and_sharded_writer(tmp_path,monke
     def fixture():
         tmp_path.joinpath('tmp').mkdir(exist_ok=True)
         tmp_path.joinpath('tmp/zeta_q.h5').touch()
+        # The GW caller appends channels to an already committed restart.
+        from file_io.commit_state import set_commit_state
+        with h5py.File(tmp_path/'restart.h5', 'w') as f:
+            set_commit_state(f, True)
     rank0_transaction(tmp_path,stage='lr.producer.test.fixture',write=fixture)
     config=SimpleNamespace(input_dir=str(tmp_path),head=SimpleNamespace(mc_average_vcoul_body=False))
     meta=SimpleNamespace(sys_dim=3,mu_basis=basis,kgrid=(3,1,1))
