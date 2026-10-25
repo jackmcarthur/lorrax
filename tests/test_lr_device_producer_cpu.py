@@ -131,4 +131,6 @@ def test_bare_channel_reader_requests_only_owned_mu_columns(monkeypatch,side):
         np.testing.assert_array_equal(np.asarray(shard.data),wanted[shard.index])
     assert result.sharding.is_equivalent_to(NamedSharding(mesh,P(None,None,('x','y'))),3)
     assert nmu==logical and nz==0 and kernel=='point'
-    assert reads
+    owned=NamedSharding(mesh,P(None,None,('x','y'))).addressable_devices_indices_map(result.shape)
+    physical_owner=any((index[-1].start or 0)<logical for index in owned.values())
+    assert bool(reads)==physical_owner
