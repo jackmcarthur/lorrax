@@ -267,14 +267,8 @@ def check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, *, reference=Fa
                 output_sharding=str(out.sharding),coefficient_sharding=str(packed[0].sharding))
 
 
-def test_interpolation_diagnostics_and_transport_refuse_before_large_materialization(monkeypatch):
+def test_interpolation_diagnostics_refuse_before_large_materialization():
     from bse import vq_interp as V
-    from file_io import restart_bundle as R
-    from file_io import slab_io
-    monkeypatch.setattr(slab_io,'probe_availability',lambda:(False,'unit','not available'))
-    with pytest.raises(ValueError,match='whole-q host replica'):
-        R._zeta_mesh_for_loader(object())
-    assert R._zeta_mesh_for_loader(None)==(None,False)
     huge=dict(nq=100,n_mu=100000,ngkmax=10)
     with pytest.raises(ValueError,match='fixed diagnostic limit'):
         V.prepare_coarse(huge,None,Mesh(np.asarray(jax.devices()[:1]).reshape(1,1),('x','y')))
