@@ -1666,6 +1666,9 @@ def main(argv=None):
     # A function-local import: gw_config parses decks, and this module is
     # imported by things that do not.
     from gw.gw_config import (
+        linalg_resolution,
+        read_lorrax_input,
+        resolve_band_request,
         resolve_distrib_la_batched_route,
         resolve_eigh_backend,
     )
@@ -1741,7 +1744,6 @@ def main(argv=None):
             f"mesh_xy.shape={dict(mesh_xy.shape)} (px={args.px}, py={args.py})")
 
         # ── Q path from the ONE K_POINTS crystal_b machinery ─────────────────
-        from gw.gw_config import linalg_resolution, read_lorrax_input
         from bandstructure import fh_interp as ht
         from bandstructure.bse_setup import (compute_wfns_fi,
                                              resolve_conduction_window)
@@ -1770,7 +1772,6 @@ def main(argv=None):
                 os.path.dirname(os.path.abspath(args.input)), _wfn_name)
         wfn, sym = ht.setup_wfn_and_sym(_wfn_name, mesh_xy=mesh_xy)
         # The deck's Sigma window: number_bands_protected resolves as in gw.
-        from gw.gw_config import resolve_band_request
         resolve_band_request(params, wfn, log)
         from distrib_la import plan as _linalg_plan
         _fine_plan = _linalg_plan(

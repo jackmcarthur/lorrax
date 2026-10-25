@@ -613,10 +613,6 @@ def main(argv=None):
         # (file_io.kin_ion).  No rank gathers the (n_orbits, nb, nb) table.
         stages.begin(3, "Artifact write and operator check", name="kin_ion.write")
         log.debug(f"\nWriting to {out_path}...")
-        write_progress = LoopProgress(
-            1, title="kinetic and ionic artifact write",
-            item_name="output artifact")
-        write_progress.start()
         with timing.section("write_h5"):
             write_kin_ion(
                 out_path, H_kin_ion, mesh=mesh_xy, nb=nb_eff,
@@ -627,8 +623,6 @@ def main(argv=None):
                     pseudos=pseudos, nval=nval, ncond=ncond, nband=nband,
                     bispinor=bispinor, vnl_setup=vnl_setup, rank=rank))
         del H_kin_ion
-        write_progress.step()
-        write_progress.finish()
 
         # ---- DOES THIS OPERATOR HAVE THE SYMMETRY OF THESE WAVEFUNCTIONS? ----
         # The detector that needs no metadata: on every degenerate manifold

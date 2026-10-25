@@ -1539,10 +1539,6 @@ def main(argv=None):
 		             + ('' if hubbard_setup is None else ' + i[V_U, r] (prov_hubbard)')
 		             + '; ')
 		note += 'band_energies[k,b] = E_b(k); deltaE = E_b - E_b\' derived on read'
-		write_progress = LoopProgress(
-			1, title="dipole artifact write",
-			item_name="output artifact")
-		write_progress.start()
 		with timing.section("write_h5"):
 			write_dipole(
 				out_path, velocity, band_energies, mesh=RUNTIME.mesh,
@@ -1558,8 +1554,6 @@ def main(argv=None):
 				           hubbard=hubbard_stamp)},
 				finite_q=finite_q)
 		del velocity, finite_q
-		write_progress.step()
-		write_progress.finish()
 		_report_results(report, stages, args=args, out_path=out_path,
 		                bands=band_range(0, head_nbands), nk=nk, operator=_operator,
 		                hubbard_setup=hubbard_setup, vnl_setup=vnl_setup,
