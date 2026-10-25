@@ -2061,8 +2061,9 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             nq, batch_size, name="htransform path-q carrier").pad
         wrapped_k = _prep_kpath(kpath_frac, int(n_pad))
         nq_padded = wrapped_k.shape[0]
-        columns = jax.device_put(jnp.asarray(start_columns(
-            rank, int(coeffs.shape[1]))), rep)
+        from common.collectives import device_put_process_local
+        columns = device_put_process_local(start_columns(
+            rank, int(coeffs.shape[1])), rep)
         route, _kpath_batch = admit_node_route(
             f"htransform path fH(q) top block ({rank}^2)", _kpath_program,
             (wrapped_k[:batch_size], fH_R, ws_code, coeffs, columns),

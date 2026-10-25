@@ -2876,7 +2876,7 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=log.debug,
             ctilde=rst["ctilde"], B_at_mu=rst["B_at_mu"],
             enk_sigma=rst["enk_sigma"], kgrid_co=rst["kgrid_co"],
             band_window_fi=(0, nb), mesh_xy=mesh_xy, q_list=qm_list,
-            return_coeffs=True)
+            return_coeffs=True, n_mu_out=n_mu)
         psi_m_mu = jnp.asarray(bundle.psi_rmu_Y)      # (nk, nb, ns, n_μ)
         c_m = jnp.asarray(bundle.coeffs_fi)           # (nk, rank, nb)
 

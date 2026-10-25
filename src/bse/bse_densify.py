@@ -1801,7 +1801,7 @@ def _interpolate_bse_data_to_grid(
         a_band_index=htransform_a_band,
         batch_size=int(params.get("wfn_fi_q_chunk", 0)),
         htransform_quality_record_fn=htransform_quality_record_fn,
-        return_coeffs=velocity is not None)
+        return_coeffs=velocity is not None, n_mu_out=n_rmu_pad)
     dipoles = None
     if velocity is not None:
         from common.collectives import gather_to_host
@@ -1815,7 +1815,7 @@ def _interpolate_bse_data_to_grid(
                 band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, log_fn=log_fn,
                 a_band_index=htransform_a_band,
                 batch_size=int(params.get("wfn_fi_q_chunk", 0)),
-                return_coeffs=True)
+                return_coeffs=True, n_mu_out=n_rmu_pad)
         dipoles = densified_dipoles(
             velocity, sym=sym, basis=basis, fine=bundle,
             fh_energies=np.asarray(gather_to_host(enk_sigma)).T,

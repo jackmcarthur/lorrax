@@ -256,12 +256,12 @@ def htransform_window(input_file, kpts, *, n_val, n_cond, n_rmu, mesh_xy):
         distrib_la_batched_route=route, htransform_quality_record_fn=receipts.append)
     rep = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, P()))
     psi, enk = np.asarray(rep(bundle.psi_rmu_Y)), np.asarray(rep(bundle.enk_full))
-    if psi.shape[-1] != int(n_rmu):
+    if int(bundle.n_mu_logical) != int(n_rmu):
         raise ValueError(f"GATE bsemat_finite_q_basis: the htransform fitted ψ at {psi.shape[-1]} "
                          f"centroids, the restart stores μ = {n_rmu} (a downfolded bundle needs its "
                          "parent's table)")
     wfn.close()
-    return psi, enk, receipts
+    return psi[..., :int(n_rmu)], enk, receipts
 
 
 def exchange_tile(Q, qflag, *, data, input_file, restart, grid, n_rmu, n_rmu_pad, mesh_xy):

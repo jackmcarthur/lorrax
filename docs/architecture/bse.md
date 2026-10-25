@@ -219,6 +219,12 @@ centroid padding is masked before contraction and converted directly to the
 consumer's legal face carrier. New carries and padding are inside the
 executable priced before it runs. Full real-space host reconstructions are
 explicit diagnostics and refuse above the fixed tile limit.
+Fine-q htransform wavefunctions likewise retain their padded q carrier until
+the bundle epilogue: the existing batch-to-face exchanges establish the X/Y
+centroid layouts before the physical q crop. Physical target counts remain
+metadata; padding is zeroed inside projection, and returned coefficients
+use the canonical Galerkin rank carrier over all ranks. A ragged q or prime
+centroid count therefore cannot silently drop the output sharding.
 
 **The W term** has three routes, chosen at trace time by what the device
 serves and printed once (`[bse] W term:`, `[bse] W term decode:`):
