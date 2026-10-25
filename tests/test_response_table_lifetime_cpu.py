@@ -167,3 +167,41 @@ def test_ordinary_turnover_retires_completed_bank_variants_and_executables(owner
         assert W._chi_minimax_kernel_cache['plain'] is plain
         assert RB._STREAM_KERNELS is W._STREAM_KERNELS
         assert RB._COMPILED is W._COMPILED
+
+
+def test_explicit_retired_program_reuse_does_not_reinsert_an_orphan(owners):
+    from ffi import fft as F
+    W, RB = owners
+    if jax.device_count() < 4:
+        pytest.skip('requires four virtual CPU devices')
+    mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+    with F.xla_reference():
+        grid, plan, *_ = fixture(mesh, 1, False)
+        _, arrays = W._charge_stream_kconv(mesh, grid, plan)
+        table = arrays[0]
+        # A real table-bound compiled program; the independent literal
+        # arithmetic keeps this lifecycle control separate from response math.
+        program = W._BoundTail(jax.jit(lambda x, t: x + t), (table,))
+        W._chi_minimax_kernel_cache['held_control'] = program
+        argument = jnp.ones(table.shape, dtype=jnp.complex128)
+        expected = np.ones(table.shape, complex) + np.asarray(table)
+        first = RB._program_compiled(program, (argument,), ahead=True)
+        assert RB._program_compiled(program, (argument,), ahead=True) is first
+        np.testing.assert_array_equal(np.asarray(first.result()(argument)), expected)
+        for _ in range(2):
+            grid, other, *_ = fixture(mesh, 1, False)
+            W._charge_stream_kconv(mesh, grid, other)
+        assert not W.placed_kconv_tables_live(program.tail)
+        assert 'held_control' not in W._chi_minimax_kernel_cache
+        assert not RB._COMPILED
+        references = [weakref.ref(a) for a in (table, program, first)]
+        for _ in range(2):
+            future = RB._program_compiled(program, (argument,), ahead=True)
+            # No subsequent owner turnover or explicit cleanup is needed.
+            assert not RB._COMPILED, 'retired external program became a global orphan owner'
+            np.testing.assert_array_equal(np.asarray(future.result()(argument)), expected)
+            references.append(weakref.ref(future))
+            del future
+        del arrays, table, program, first
+        gc.collect()
+        assert all(ref() is None for ref in references)

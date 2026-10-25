@@ -485,10 +485,10 @@ def _release_evicted_programs():
         for key in [k for k, kernel in cache.items()
                     if not placed_kconv_tables_live(getattr(kernel, "tail", ()))]:
             dead = cache.pop(key)
-            state = _STREAM_PROGRAMS.pop(dead, None)
-            programs = tuple(state["variants"].values()) if state else (dead,)
-            for entry in [entry for entry in _COMPILED if entry[0] in programs]:
-                del _COMPILED[entry]
+            _STREAM_PROGRAMS.pop(dead, None)
+    for entry in [entry for entry in _COMPILED
+                  if not placed_kconv_tables_live(getattr(entry[0], "tail", ()))]:
+        del _COMPILED[entry]
 
 
 class _BoundTail:

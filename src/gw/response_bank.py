@@ -1108,6 +1108,8 @@ def _program_compiled(kernel, args, *, ahead=False):
     future = _COMPILED.get(key)
     if future is None:
         future = _COMPILED[key] = compile_ahead(kernel, *args)
+        from .w_isdf import _release_evicted_programs
+        _release_evicted_programs()
     return future if ahead else future.result()
 
 
