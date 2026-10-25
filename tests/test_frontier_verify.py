@@ -18,6 +18,11 @@ def test_frontier_verifier_requires_fft_identity_and_propagates_failed_steps(tmp
     (fftw / "libfftw3.so").touch()
     (host / "CMakeCache.txt").write_text(
         f"LORRAX_FFTW3_LIBRARY:UNINITIALIZED={fftw}/libfftw3.so\n")
+    elpa = root / "elpa"
+    elpa.mkdir()
+    rocm_cache = root / "src/ffi/cpp/build_rocm/CMakeCache.txt"
+    rocm_cache.parent.mkdir(parents=True)
+    rocm_cache.write_text(f"LORRAX_ELPA_ROCM_DIR:PATH={elpa}\n")
     (config / "gpu_env.sh").write_text(f'''
 export LORRAX_FFI_HOST_SO='{host}/liblorrax_ffi_host.so'
 export VIRTUAL_ENV='{root}/venv'
@@ -42,17 +47,23 @@ case "$*" in *"--leg rocm"*) exit "${PROBE_ROCM_RC:-0}";; esac
     passed = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
     assert passed.returncode == 0, passed.stderr
     steps = log.read_text().splitlines()
-    assert len(steps) == 3 and all(row.startswith(str(fftw.parent) + "\t") for row in steps)
+    assert len(steps) == 4 and all(row.startswith(str(fftw.parent) + "\t") for row in steps)
     assert "JAX_PLATFORMS=cpu" in steps[0] and "--leg\thost" in steps[0]
     assert "--leg\trocm" in steps[1]
-    assert "-n4" in steps[2] and "--gpus-per-task=1" in steps[2]
-    assert not any(arg.startswith(("--gpu-bind", "--tres-bind")) for arg in steps[2].split("\t"))
-    assert "JAX_PLATFORMS=rocm" in steps[2]
-    assert f"{root}/tests/test_fourier_plan_xla_gate.py" in steps[2]
+    assert "dep_check.py\telpa\t" + str(elpa) in steps[2] and "--solve" in steps[2]
+    assert "-n4" in steps[3] and "--gpus-per-task=1" in steps[3]
+    assert not any(arg.startswith(("--gpu-bind", "--tres-bind")) for arg in steps[3].split("\t"))
+    assert "JAX_PLATFORMS=rocm" in steps[3]
+    assert f"{root}/tests/test_fourier_plan_xla_gate.py" in steps[3]
     log.unlink()
     failed = subprocess.run(["bash", str(script)], env={**env, "PROBE_ROCM_RC": "42"},
                             capture_output=True, text=True)
     assert failed.returncode == 42 and "PASS:" not in failed.stdout
+    assert len(log.read_text().splitlines()) == 2
+    log.unlink()
+    rocm_cache.write_text("")                      # a rocm leg that names no ELPA: refused by name
+    no_elpa = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+    assert no_elpa.returncode != 0 and "FAILED ELPA" in no_elpa.stderr
     assert len(log.read_text().splitlines()) == 2
     log.unlink()
     (fftw / "libfftw3.so").unlink()
