@@ -17,8 +17,8 @@ def mesh_for(side):
     return Mesh(np.array(jax.devices()[:side*side]).reshape(side,side),('x','y'))
 
 
-@pytest.mark.parametrize('side',[2,3])
-def test_device_producer_matches_literal_schur_and_sharded_writer(tmp_path,monkeypatch,side):
+@pytest.mark.parametrize('side,packed',[(2,False),(3,False),(2,True),(3,True)])
+def test_device_producer_matches_literal_schur_and_sharded_writer(tmp_path,monkeypatch,side,packed):
     from gw import lr_channels as LC,w_isdf,restart_q_storage
     from file_io.tagged_arrays import write_lr_channels_to_h5
     from runtime import aot_memory
@@ -43,6 +43,15 @@ def test_device_producer_matches_literal_schur_and_sharded_writer(tmp_path,monke
     fdev=jax.device_put(pad(F),row)
     cdev=jax.device_put(np.pad(chi,((0,0),(0,mu-logical),(0,mu-logical))),face)
     wdev=jax.device_put(np.pad(W,((0,0),(0,mu-logical),(0,mu-logical))),face)
+    basis=None
+    if packed:
+        from common.centroid_basis import PackedCentroidBasis
+        from common.grouped_layout import build_square_grouped_shard_layout
+        groups=np.repeat(np.arange(7),[3,3,2,2,1,1,1])
+        layout=build_square_grouped_shard_layout(groups,(side,side))
+        basis=PackedCentroidBasis(mesh,layout,np.zeros((logical,3),np.int32),mu)
+        cdev=basis.pack_operator(cdev)
+        wdev=basis.pack_operator(wdev)
     q=np.array([[0.,0.,0.],[.2,0.,0.],[-.2,0.,0.]])
     ch=SimpleNamespace(v=v,gvec=np.zeros((nq,nl,3),np.int32))
     monkeypatch.setattr(LC,'read_channel_rows',lambda *a,**kw:(fdev,ch,0,'point',logical))
@@ -55,7 +64,7 @@ def test_device_producer_matches_literal_schur_and_sharded_writer(tmp_path,monke
         tmp_path.joinpath('tmp/zeta_q.h5').touch()
     rank0_transaction(tmp_path,stage='lr.producer.test.fixture',write=fixture)
     config=SimpleNamespace(input_dir=str(tmp_path),head=SimpleNamespace(mc_average_vcoul_body=False))
-    meta=SimpleNamespace(sys_dim=3,mu_basis=None,kgrid=(3,1,1))
+    meta=SimpleNamespace(sys_dim=3,mu_basis=basis,kgrid=(3,1,1))
     original_asarray=np.asarray
     def no_global(a,*args,**kw):
         if isinstance(a,jax.Array) and isinstance(a.sharding,NamedSharding) and a.ndim>=2:
@@ -66,8 +75,9 @@ def test_device_producer_matches_literal_schur_and_sharded_writer(tmp_path,monke
     quotes=[]
     def quote(exe):
         text=exe.as_text()
-        for shape in ((nq,nl,mu),(nq,mu,nl),(nq*nl,mu),(mu,nq*nl)):
-            assert 'c128['+','.join(map(str,shape))+']' not in text,text
+        for width in {mu,mu if basis is None else basis.n_packed}:
+            for shape in ((nq,nl,width),(nq,width,nl),(nq*nl,width),(width,nq*nl)):
+                assert 'c128['+','.join(map(str,shape))+']' not in text,text
         quotes.append(text)
         return original_quote(exe)
     monkeypatch.setattr(aot_memory,'compiled_new_bytes',quote)
