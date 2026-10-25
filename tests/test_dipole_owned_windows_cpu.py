@@ -229,6 +229,12 @@ def test_text_and_spectrum_programs_keep_only_owned_input_tiles():
         complex_shapes=re.findall(r'c128\[([0-9,]+)\]',hlo)
         assert complex_shapes, "expected actual optimized complex HLO"
         assert max(math.prod(map(int,dims.split(','))) for dims in complex_shapes)<=local_elements
+    # The local frequency scan contains no communication. Its small completed
+    # spectrum is reduced once, independently of the number of frequencies.
+    before_entry,entry=programs[-1].as_text().split("\nENTRY ",1)
+    collective=r"(?m)^.* = .*all-reduce\("
+    assert not re.findall(collective,before_entry)
+    assert len(re.findall(collective,entry))==1
 
 
 def test_text_writer_agrees_root_io_failure_before_next_block(tmp_path):

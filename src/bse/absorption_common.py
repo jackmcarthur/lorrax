@@ -673,8 +673,8 @@ def _transition_spectrum_program(mesh, kind):
             kernel = jnp.where(live, kernel, 0.)
             values = jnp.concatenate([jnp.sum(weights * kernel[None], axis=(1, 2, 3)),
                                       jnp.sum(kernel)[None]])
-            return None, jax.lax.psum(values, ("x", "y"))
-        return jax.lax.scan(one, None, omega)[1]
+            return None, values
+        return jax.lax.psum(jax.lax.scan(one, None, omega)[1], ("x", "y"))
     program = jax.shard_map(local, mesh=mesh,
         in_specs=(P(None, None, "x", "y"), P(None, "x", "y"), P(), P()),
         out_specs=P(), check_vma=False)
