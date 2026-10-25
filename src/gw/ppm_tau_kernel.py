@@ -149,14 +149,14 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     None) and the Green's real weights give its partner as conj(G) on the
     mode-7 load (no partner GEMM).
     """
-    from common.contract_bands import contract_bands_block_reshard
-    from common.fft_helpers import make_kconv_klead_unfold, make_kfft_klead_unfold
+    from common.contract_bands import contract_bands_block_reshard, face_row_blocks
+    from common.fft_helpers import make_kconv_klead_unfold, make_kfft_klead_unfold, x_block_rows
     from distrib_la import gemm_plan
     from runtime.tiles import TILE_BYTES
     from .greens_function_kernel import build_G_tau, has_antiunitary_rows, sigma_kconv_scratch
     from .subtile_stream import (GREEN_ROWS_SPEC, orbit_cuts, plan_windows, projection_complete,
                                  scan_passes, window_green_rows, window_load, window_rows,
-                                 window_tables)
+                                 window_tables, _window_table)
 
     kgrid = tuple(int(v) for v in kgrid)
     nk = int(np.prod(kgrid))
@@ -195,17 +195,35 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     conv = make_kconv_klead_unfold(mesh_xy, kgrid, tables,
                                    store_rows=k_unfold_plan.parent_full_rows,
                                    norm="ortho", mult=mult)
+    # An indivisible orbit can exceed the input-row target. Keep its Green
+    # once, but cap the stored output using the whole-spin row pieces the
+    # shared projector owns. CPU/reference FFTs crop only after forming the
+    # full output, so subdivision there would repeat work without this saving.
+    output_row_bytes = 16 * n_parent * ns * ns * nu
+    output_blocks = (None,)
+    if conv.stores_rows_in_kernel and R * output_row_bytes > TILE_BYTES:
+        divisors = (d for d in range(ns, 0, -1) if ns % d == 0)
+        for d in divisors:
+            candidate = face_row_blocks(R, py, (ns // d) ** 2)
+            output_blocks = candidate
+            if max(b[1] * b[3] for b in candidate) * output_row_bytes <= TILE_BYTES:
+                break
+        if len(output_blocks) == 1:
+            output_blocks = (None,)
+    stored_rows = R if output_blocks == (None,) else max(b[1] * b[3] for b in output_blocks)
     project = contract_bands_block_reshard(
         mesh_xy, channels="none", layout="axis", face_shape=(n_parent, nb, px * R, ns),
-        right_face_shape=(n_parent, nb, n_rmu, ns), face_band_extent=face_band_extent)
+        right_face_shape=(n_parent, nb, n_rmu, ns), face_band_extent=face_band_extent,
+        row_block=None if output_blocks == (None,) else stored_rows)
     finish = project.finish
     # ψ rows and columns, the projection faces, and the Green's right operand (one copy of the
     # columns, formed once per node).
     sum_bytes = nb * (local_rows + 2 * nu) if sum_layout == "axis" else 2 * nb * n_rmu / (px * py)
     psi_bytes = 16 * n_parent * ns * (sum_bytes + nb_sig * (local_rows + nu))
-    scratch = sigma_kconv_scratch(kgrid=kgrid, ns=ns, rows=R, n_right=nu, mesh=mesh_xy)
+    scratch = sigma_kconv_scratch(kgrid=kgrid, ns=ns, rows=stored_rows, n_right=nu, mesh=mesh_xy)
     price = dict(d=ns, ns=ns, passes=len(windows), tile=float(TILE_BYTES), scratch=int(scratch),
-                 new=float(R * row_bytes + psi_bytes + scratch))
+                 output_blocks=len(output_blocks), stored_rows=stored_rows,
+                 new=float(R * row_bytes - (R - stored_rows) * output_row_bytes + psi_bytes + scratch))
     from lxkit import memory
     # A static node is priced in its caller's section (Σ exchange, static COHSEX).
     label = "Sigma static" if static else "Sigma tau"
@@ -259,6 +277,8 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
 
         W, Wt, rows, left = W_q, W_pt, rows_all, left_all
         faces_right = right_all
+        output_bounds = (None if output_blocks == (None,) else _window_table(tuple(
+            (b[0], b[0] + (b[3] - 1) * b[2] + b[1]) for b in output_blocks)))
 
         def one_pass(accs, W, Wt, rows, left, w_load, g_pass, rows_live=None):
             # ``rows_live``: a padded window's live rows [lo, hi); the
@@ -275,9 +295,37 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
                 def add(acc, sel=sel, band_range=band_range, w_prep=w_prep, rows=rows):
                     G = green(rows, g_right, E_A, sel, E_min, E_max, E_ref_A, t_node, gemm,
                               band_range)
-                    sigma = conv(G.G, G.transpose, w_prep, conj_partner=G.conj_partner,
-                                 load=g_pass, live=rows_live)
-                    return project.accumulate(faces, sigma, acc=acc)
+                    if output_blocks == (None,):
+                        sigma = conv(G.G, G.transpose, w_prep, conj_partner=G.conj_partner,
+                                     load=g_pass, live=rows_live)
+                        return project.accumulate(faces, sigma, acc=acc)
+
+                    def body(total, j):
+                        # The runtime live operand binds each convolution to
+                        # its scan iteration, preventing loop-invariant lifting
+                        # of all stored outputs beside the whole orbit Green.
+                        bounds = jax.lax.optimization_barrier(jax.lax.dynamic_index_in_dim(
+                            output_bounds, j, 0, keepdims=False))
+                        outer = (jnp.asarray((0, R), jnp.int32)
+                                 if rows_live is None else rows_live)
+                        lo = jnp.maximum(bounds[0], outer[0])
+                        live_rows = jnp.stack((lo, jnp.maximum(lo, jnp.minimum(bounds[1], outer[1]))))
+
+                        def block(total, block_rows):
+                            # The window's live interval is in source rows;
+                            # mode 7 masks positions of the selected output.
+                            # x blocks list those source rows monotonically.
+                            source_rows = jnp.asarray(x_block_rows(block_rows))
+                            stored_live = jnp.stack((jnp.sum(source_rows < live_rows[0]),
+                                                     jnp.sum(source_rows < live_rows[1]))).astype(jnp.int32)
+                            sigma = conv(G.G, G.transpose, w_prep,
+                                conj_partner=G.conj_partner, rows=block_rows,
+                                load=g_pass, live=stored_live)
+                            return project.accumulate(faces, sigma, rows=block_rows, acc=total)
+                        branches = tuple(partial(block, block_rows=b) for b in output_blocks)
+                        return jax.lax.switch(j, branches, total), None
+                    return jax.lax.scan(body, acc, jnp.arange(len(output_blocks), dtype=jnp.int32),
+                                        unroll=1)[0]
                 out.append(add(accs[b]) if live[b] is None
                            else jax.lax.cond(live[b], add, lambda a: a, accs[b]))
             return tuple(out)
@@ -344,8 +392,9 @@ def _get_sigma_kij_kernel(
         raise ValueError("Scalar Sigma node requires typed q metadata; full-zone sources "
                          "use the identity table in the public Sigma executor.")
     from ffi import ffi_dial_key
+    from common.fft_helpers import kconv_backend
     key = (id(mesh_xy), tuple(map(int, kgrid)),
-           ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
+           ffi_dial_key(), kconv_backend(mesh_xy, kgrid), bool(merged_x), brackets, layout, face_shape,
            face_band_extent, bool(energy_windows),
            k_unfold_plan, q_wedge.wedge_key(), bool(static), sum_layout)
     if key in _sigma_kij_kernel_cache:
@@ -440,8 +489,9 @@ def get_shared_sigma_tau_kernel(
         brackets = tuple((int(lo), None if hi is None else int(hi))
                          for lo, hi in brackets)
     from ffi import ffi_dial_key
+    from common.fft_helpers import kconv_backend
 
-    key = (id(mesh_xy), kgrid, ffi_dial_key(),
+    key = (id(mesh_xy), kgrid, ffi_dial_key(), kconv_backend(mesh_xy, kgrid),
            brackets, layout, face_shape, face_band_extent,
            k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key(), sum_layout)
     if _sigma_kij is None and key in _sigma_shared_tau_kernel_cache:

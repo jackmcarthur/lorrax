@@ -579,10 +579,15 @@ group and streamed-bank segment admits its own actual executable; carry
 donation and device/host/file bank residence are unchanged. The minimum face
 route retains `memory.admit`'s existing warn-and-run policy if even it is over
 room. This is a layout choice, not a quadrature or band-window approximation.
-No full-tile Green or `W_prep` exists in these row streams. Full-zone scalar pole sources use an
-identity q-load table and the same bounded row owner; their file format
-does not select a whole-Green fallback. Static (COHSEX), resident-pole and
-shared-pole scalar Σ retain every spin component in each row pass.
+Full-zone scalar pole sources use an identity q-load table and the same row
+owner; their file format does not select a whole-Green fallback. An
+indivisible centroid orbit can require the whole local input window. Native
+CUDA and ROCm k-box mode 7 use the fixed tile geometry to store and project
+large outputs in smaller x blocks, retaining the input Green and `W_prep`
+once and reducing the accumulated projection once. CPU, reference and ROCm
+fallback convolutions form the full output before cropping, so they keep one
+output call. Static (COHSEX), resident-pole and shared-pole scalar Σ retain
+every spin component in each input window and stored block.
 
 **Row passes run as one scan.** The passes of the Σ τ node, the static
 τ = 0 node, the sector node and the charge and four-current χ streams are

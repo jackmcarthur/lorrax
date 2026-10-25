@@ -407,6 +407,11 @@ also store one x block of the left centroids,
 $\lfloor r/b_x\rfloor x_s + x_0 + r \bmod b_x$ (`ffi.fft.x_block_rows`). A
 call reads only its own rows' sources, so a consumer that bounds its output by
 x blocks reads the Green once over all of them.
+The returned mode-7 callable declares `stores_rows_in_kernel`: native CUDA
+and ROCm k-box kernels bound the output allocation; composed CPU/reference
+calls crop a full output. Its `live` interval addresses positions in the
+stored output, so a row-window consumer maps its source interval through
+`x_block_rows` when it also requests a stored block.
 
 **Placed tables.** `symmetry_maps.device_load_tables` places the tables once
 per run (per-k tables replicated, left tables on X, right tables on Y). A
