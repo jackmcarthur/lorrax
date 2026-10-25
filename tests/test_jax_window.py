@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from importlib import metadata, util
 from pathlib import Path
+from types import SimpleNamespace
 
 from lxkit import LEGS, startup_gpu_leg
 from runtime import jax_support as js
@@ -22,6 +23,46 @@ def test_window_table_per_leg():
     key = ("jax._src.compilation_cache", "get_executable_and_time")
     assert js.required_private_params((0, 9, 1))[key][0][-1] == "executable_devices"
     assert js.required_private_params((0, 12, 0))[key][0][-1] == "host_callbacks"
+
+
+def test_final_releases_in_preflight_and_runtime(monkeypatch, capsys):
+    """Both guards reject prereleases even when their numeric tuple is supported."""
+    path = Path(__file__).resolve().parents[1] / "tools" / "require_jax.py"
+    spec = util.spec_from_file_location("require_jax_release_fixture", path)
+    preflight = util.module_from_spec(spec)
+    spec.loader.exec_module(preflight)
+    cpu = SimpleNamespace(installed_plugin_names=lambda: (),
+                          startup_gpu_leg=lambda **kwargs: None)
+    monkeypatch.setattr(preflight, "_load",
+                        lambda name, path: js if path == preflight._JAX_SUPPORT else cpu)
+    versions = {"jax": "0.12.0.1", "jaxlib": "0.12.0.1"}
+    monkeypatch.setattr(metadata, "version", lambda name: versions[name])
+    monkeypatch.setattr(js, "describe", lambda: dict(
+        version=versions["jax"], version_info=(0, 12, 0, 1), file="jax",
+        jaxlib_version=versions["jaxlib"], jaxlib_version_info=(0, 12, 0, 1),
+        jaxlib_file="jaxlib", is_dev_build=False))
+    for version in ("0.12.0.1", "0.12.0.1.post1", "0.12.0.1+vendor.1",
+                    "0.12.0.1.post1+vendor.1"):
+        versions.update(jax=version, jaxlib=version)
+        assert js.release_version_info(version) == (0, 12, 0, 1)
+        assert not js.check_version("cpu", plugin_names=())
+        assert preflight.main() == 0
+    assert js.release_version_info("0.9.1+rocm7.14.1") == (0, 9, 1)
+    for version in ("0.12.1.dev20261023", "0.12.1a1", "0.12.1b1", "0.12.1rc1"):
+        assert not js.release_version_info(version)
+        for package in versions:
+            versions.update(jax="0.12.0.1", jaxlib="0.12.0.1")
+            versions[package] = version
+            assert any("not a final public release" in p
+                       for p in js.check_version("cpu", plugin_names=()))
+            assert preflight.main() == 86
+            assert "JAX_ENV_REFUSED" in capsys.readouterr().err
+    versions.update(jax="0.12.0.1", jaxlib="0.12.0.1")
+    info = js.describe()
+    info["is_dev_build"] = True
+    monkeypatch.setattr(js, "describe", lambda: info)
+    assert any("declares a development build" in p
+               for p in js.check_version("cpu", plugin_names=()))
 
 
 def test_window_leg_is_the_startup_leg(tmp_path, monkeypatch):

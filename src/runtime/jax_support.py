@@ -6,8 +6,9 @@ preflight reads its windows from this file).  It checks
 both JAX and JAXLIB after backend initialization but before the first physics
 ``jit``, then checks the private-API shapes used by the persistent compile
 cache.  There is no unsupported-version escape hatch: production and developer
-driver invocations run the same contract, :data:`SUPPORTED_WINDOWS`: the 0.12
-series on every leg, and exactly 0.9.1 also on ROCm.
+driver invocations run the same contract: final public releases in
+:data:`SUPPORTED_WINDOWS`, the 0.12 series on every leg and exactly 0.9.1
+also on ROCm. Development, alpha, beta and release-candidate builds refuse.
 
 The stricter policy was restored on 2026-08-25 after a staged CUDA-12/JAX-0.7
 launcher survived an earlier environment consolidation.  The window moved
@@ -109,6 +110,7 @@ __all__ = [
     "check_gpu_packages",
     "window_leg",
     "in_window",
+    "release_version_info",
     "check_private_params",
     "check_private_symbols",
 ]
@@ -302,12 +304,22 @@ def _fmt(v: tuple[int, ...]) -> str:
     return ".".join(str(x) for x in v)
 
 
-def _parse_version_info(version: str) -> tuple[int, ...]:
-    """Numeric release prefix, independent of local/dev suffixes."""
-    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", str(version))
-    if match is None:
+def _public_release(version: str) -> str | None:
+    """Final public version, retaining post releases and ignoring vendor tags."""
+    parts = str(version).split("+")
+    if (len(parts) > 2 or not re.fullmatch(r"\d+(?:\.\d+)+(?:\.post\d+)?", parts[0])
+            or (len(parts) == 2 and not re.fullmatch(
+                r"[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*", parts[1]))):
+        return None
+    return parts[0]
+
+
+def release_version_info(version: str) -> tuple[int, ...]:
+    """Final release tuple, or empty for a development/prerelease/invalid version."""
+    public = _public_release(version)
+    if public is None:
         return ()
-    return tuple(int(v) for v in match.groups(default="0"))
+    return tuple(int(v) for v in public.split(".post", 1)[0].split("."))
 
 
 def describe() -> dict[str, Any]:
@@ -323,7 +335,7 @@ def describe() -> dict[str, Any]:
         "is_dev_build": getattr(jv, "_release_version", None) is None,
         "file": jax.__file__,
         "jaxlib_version": jaxlib.__version__,
-        "jaxlib_version_info": _parse_version_info(jaxlib.__version__),
+        "jaxlib_version_info": release_version_info(jaxlib.__version__),
         "jaxlib_file": jaxlib.__file__,
         "shard_map_top_level": hasattr(jax, "shard_map"),
     }
@@ -365,20 +377,12 @@ def check_gpu_packages(jaxlib_version: str, plugin_prefix: str, plugin_names) ->
         return []
     from importlib import metadata
 
-    def public(version):
-        parts = str(version).split("+")
-        if (len(parts) > 2 or not re.fullmatch(
-                r"\d+(?:\.\d+)+(?:a\d+|b\d+|rc\d+)?(?:\.post\d+)?(?:\.dev\d+)?", parts[0])
-                or (len(parts) == 2 and not re.fullmatch(r"[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*", parts[1]))):
-            return None
-        return parts[0]
-
     families = sorted({"jax-" + name.removeprefix("xla_") for name in plugin_names
                        if re.fullmatch(re.escape(plugin_prefix) + r"\d+", name)})
-    expected = public(jaxlib_version)
+    expected = _public_release(jaxlib_version)
     problems = []
     if expected is None:
-        problems.append(f"jaxlib has an unparseable public version {jaxlib_version!r}")
+        problems.append(f"jaxlib {jaxlib_version!r} is not a final public release")
     if not families:
         return problems + [f"{plugin_prefix} plugin/PJRT namespace is not installed"]
     for family in families:
@@ -389,7 +393,7 @@ def check_gpu_packages(jaxlib_version: str, plugin_prefix: str, plugin_names) ->
             except metadata.PackageNotFoundError:
                 problems.append(f"{name} is not installed")
                 continue
-            if expected is None or public(version) != expected:
+            if expected is None or _public_release(version) != expected:
                 problems.append(f"{name} version {version!r}; want jaxlib public version {jaxlib_version!r}")
     return problems
 
@@ -408,13 +412,17 @@ def check_version(leg: str | None = None, *, plugin_names=None) -> list[str]:
         ("jaxlib", tuple(info.get("jaxlib_version_info", ()))[:3],
          info.get("jaxlib_version"), info.get("jaxlib_file")),
     ):
-        if not vi:
+        if not release_version_info(version):
+            problems.append(f"{package} {version!r} is not a final public release")
+        elif not vi:
             problems.append(
                 f"{package} has no parseable version tuple "
                 f"(version string {version!r})")
         elif not in_window(vi, leg):
             problems.append(
                 f"{package} {version} (version_info={vi}) from {path}")
+    if info.get("is_dev_build", False):
+        problems.append(f"jax {info['version']!r} declares a development build")
     if not problems and info["version_info"][:2] != info["jaxlib_version_info"][:2]:
         problems.append(f"jax {info['version']} and jaxlib {info['jaxlib_version']} "
                         f"are different series")
