@@ -1318,6 +1318,25 @@ def require_newton_converged(residual: float, *, where: str) -> None:
             f"{NEWTON_RESIDUAL_MAX:.1e}-Ry residual cap after 50 steps")
 
 
+def band_window(params, guard_bands: int, log=print) -> tuple[int, int]:
+    """The bands htransform returns and the bands it fits.
+
+    Returned: nval + ncond, the input file's band request (resolved by
+    :func:`gw.gw_config.resolve_band_request`, so ``number_bands_protected``
+    works too).  Fitted: that plus ``--guard-bands`` above it.  The BSE's
+    band-interpolation keys ``number_cond_bands_coarse`` and
+    ``number_val_bands_coarse`` set the BSE's window, not this one, so an
+    input file shared with the BSE runs here unchanged.
+    """
+    n_return = int(params["nval"]) + int(params["ncond"])
+    bse_keys = [k for k in ("number_cond_bands_coarse", "number_val_bands_coarse")
+                if str(params.get(k, "") or "").strip()]
+    if bse_keys:
+        log(f"  {', '.join(bse_keys)}: BSE key(s), not read here; htransform fits "
+            f"nval + ncond + {guard_bands} guard bands = {n_return + guard_bands}")
+    return n_return, n_return + int(guard_bands)
+
+
 def load_wfns_and_enk_for_sigma(wfn, sym, nval: int, ncond: int, nband: int):
     nelec = int(wfn.nelec)
     nsigmarange = (int(nelec - nval), int(nelec + ncond))
@@ -1361,7 +1380,6 @@ def qp_window_energies(eqp_path: str, sym, band_window: tuple[int, int],
     jax.Array, (nb, nk_full), Ry
     """
     from file_io.restart_bundle import read_bgw_eqp
-    from gw.scissor import fit_scissor
 
     start, end = int(band_window[0]), int(band_window[1])
     _kpts, _e_dft, e_qp, band_offset = read_bgw_eqp(eqp_path)
@@ -1375,10 +1393,25 @@ def qp_window_energies(eqp_path: str, sym, band_window: tuple[int, int],
             f"{int(nelec)}; a scissor for the window [{start}, {end}) needs "
             "QP-corrected conduction bands.")
     corrected = np.asarray(read_eqp_energies(eqp_path, sym, (start, qp_stop)))
+    return jnp.asarray(scissor_above_qp(enk_dft, corrected, start=start,
+                                        nelec=nelec, name=name))
+
+
+def scissor_above_qp(enk_dft, corrected, *, start: int, nelec: int,
+                     name: str) -> np.ndarray:
+    """``enk_dft`` (nb, nk) Ry with its first rows replaced by ``corrected``
+    (the QP energies of bands ``[start, start + len(corrected))``) and the rows
+    above shifted by the mean QP-DFT shift of the corrected conduction bands,
+    logged as one ``[QP scissor]`` line.  Shared by ``--eqp-file``
+    (:func:`qp_window_energies`) and ``--qp-rotations``
+    (:func:`resolve_qp_hamiltonian_state`)."""
+    from gw.scissor import fit_scissor
+
     dft = np.asarray(enk_dft, dtype=np.float64)
-    n_corr = qp_stop - start
+    corrected = np.asarray(corrected, dtype=np.float64)
+    n_corr, nk = corrected.shape
+    qp_stop, end = start + n_corr, start + dft.shape[0]
     first_c = max(int(nelec) - start, 0)
-    nk = dft.shape[1]
     fit_mask = np.zeros((nk, n_corr), dtype=bool)
     fit_mask[:, first_c:] = True
     fit = fit_scissor(
@@ -1393,7 +1426,7 @@ def qp_window_energies(eqp_path: str, sym, band_window: tuple[int, int],
         f"{fit.beta_c_ev:+.4f} eV, the mean QP-DFT shift of its conduction "
         f"bands [{start + first_c}, {qp_stop}) (rms {fit.rmse_c_ev:.4f} eV "
         f"over {fit.n_fit_c} states)")
-    return jnp.asarray(out)
+    return out
 
 
 @partial(jax.jit, static_argnames=("band_offset",))
@@ -1428,7 +1461,10 @@ def resolve_qp_hamiltonian_state(
     implementation.  A wider fitted window is supported exactly as the
     canonical QP-WFN writer supports it: the complete QP block is replaced,
     while rows outside it retain their DFT orbitals and use the complete SC
-    energy ladder when the artifact supplies it (otherwise DFT energies).
+    energy ladder when the artifact supplies it.  Otherwise the rows above the
+    block take their DFT energies plus the block's mean conduction shift (the
+    ``--eqp-file`` scissor, :func:`scissor_above_qp`), so the whole fitted
+    window is QP-corrected and the returned bands may reach the block's top.
     Cutting through the QP block is refused because a sliced eigenvector
     matrix is not unitary.
 
@@ -1488,11 +1524,24 @@ def resolve_qp_hamiltonian_state(
 
     corrected_range = (q0, q1)
     full_energies = artifact.get("E_full_nk_rydberg")
+    tail = "DFT"
     if full_energies is not None:
         if full_energies.shape[0] != nk or full_energies.shape[1] < fit1:
             raise ValueError("SC energy ladder does not cover the fitted Galerkin window")
         enk_sigma = np.asarray(full_energies[:, fit0:fit1]).T
         corrected_range = (fit0, fit1)
+        tail = "SC"
+    elif q0 == fit0 and q1 < fit1 and q1 > int(wfn.nelec):
+        # Without the SC ladder the rows above the QP block keep their DFT
+        # orbitals and take DFT + the block's mean conduction shift, as
+        # --eqp-file does above the eqp file: the fitted H is then QP-like
+        # over the whole window, and every fitted row counts as corrected.
+        _dft = np.asarray(jax.device_get(enk_sigma))
+        enk_sigma = scissor_above_qp(
+            _dft, np.asarray(E).T, start=q0, nelec=int(wfn.nelec),
+            name=os.path.basename(path)).astype(_dft.dtype)
+        corrected_range = (fit0, fit1)
+        tail = "scissored DFT"
 
     # The Galerkin owner defines the compact state's global placement.  The
     # energy table and both QP companions arrive as identical host arrays on
@@ -1513,7 +1562,7 @@ def resolve_qp_hamiltonian_state(
     say(
         f"  [QP state] {os.path.basename(path)}: full "
         f"H_QP=U diag(E_QP) U^H on bands [{q0},{q1}); "
-        f"{'SC' if full_energies is not None else 'DFT'} tail energies, "
+        f"{tail} tail energies, "
         f"DFT tail orbitals in fitted window [{fit0},{fit1}); "
         f"compact rotation O({nk}*{nb_qp}^2*{int(ctilde.shape[2])}), no "
         "WFN/FFT rebuild")

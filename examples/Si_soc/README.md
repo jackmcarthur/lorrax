@@ -22,7 +22,7 @@ Si_soc/
   pseudo/          Si_FR.UPF (not included, see below)
   qe/              00-kgrid (kgrid.x inputs of the k lists), 01-scf, 02-wfn ... 06-wfnq_fi
   berkeleygw/      07-epsilon, 08-sigma, 09-inteqp, 10-kernel, 11-absorption
-  lorrax/          gw.in (GW and BSE), ht.in (band path)
+  lorrax/          gw.in (GW, BSE and the band path)
 ```
 
 ## Pseudopotential
@@ -90,13 +90,13 @@ $RUN psp.get_dipole_mtxels -i gw.in         # 2. dipole.h5
 $RUN gw.kin_ion_io -i gw.in                 # 3. kin_ion.h5
 $RUN gw.gw_jax -i gw.in                     # 4. eqp0.dat, eqp1.dat, qp_wfn_rotations.h5, tmp/
 $RUN bse.bse_jax -i gw.in                    # 5. the BSE (its keys are in gw.in)
-$RUN bandstructure.htransform -i ht.in --eqp-file eqp1.dat   # bandstructure.dat, as inteqp
+$RUN bandstructure.htransform -i gw.in --eqp-file eqp1.dat   # 6. bandstructure.dat, as inteqp
 ```
 
 `$LORRAX` is a LORRAX clone built for Perlmutter (`config/perlmutter/`); the
 launch line is the one in the Quickstart. `centroid.kmeans_cli` keeps whole
 symmetry orbits, so it writes fewer points than requested: set
-`centroids_file` in both decks to the table it names.
+`centroids_file` in `gw.in` to the table it names.
 
 `ld1.x` writes an unescaped `&INPUT` into `<PP_INFO>`; QE accepts it, LORRAX's
 XML reader refuses the file ("not well-formed"), hence the `sed`.
@@ -115,17 +115,16 @@ XML reader refuses the file ("not well-formed"), hence the `sed`.
 | `kgrid_fine = 10 10 10`, `kgrid_fine_shift = 0.47 0.37 0.31` | `absorption.x`'s `WFN_fi` grid and its kgrid.x shift |
 | `number_val_bands_fine = 8`, `number_cond_bands_fine = 8`, `number_cond_bands_coarse = 16`, `eqp_co_corrections` | the same keys of `absorption.inp` |
 | `sys_dim = 3` | no truncation |
+| `K_POINTS {crystal_b}` | `qe/04-bands`' path, which `inteqp.x` interpolates onto |
 
-`ht.in` asks for bands 1–24 (`ncond = 16`): htransform fits 4 guard bands above
-the returned window, inside the GW QP bands (1–28). With `--eqp-file`, fitted
+htransform takes its band window from `nval`/`ncond`: it returns the GW QP
+bands 1–28 and fits 4 guard bands (29–32) above them (`--guard-bands`); the
+BSE key `number_cond_bands_coarse` is not read. With `--eqp-file`, fitted
 bands above the eqp file's top band take their DFT energies plus the mean QP
-shift of its conduction bands, logged as one `[QP scissor]` line, so a window
-returning all 28 QP bands also runs. `gw.in` itself is not an htransform input:
-htransform reads its BSE key `number_cond_bands_coarse = 16` as its own fitted
-window and refuses it below `ncond = 20`. With
-`--qp-rotations qp_wfn_rotations.h5` instead of `--eqp-file`, htransform
-interpolates the full QP Hamiltonian rather than the diagonal eqp1 corrections;
-its returned bands must end below the QP block, as in `ht.in`.
+shift of its conduction bands, logged as one `[QP scissor]` line. With
+`--qp-rotations qp_wfn_rotations.h5` instead, htransform interpolates the full
+QP Hamiltonian rather than the diagonal eqp1 corrections, and the guard bands
+above the QP block get the same scissor.
 
 ## Expected results
 
@@ -141,9 +140,10 @@ LORRAX `94be1f1`. Energies in eV on the 6×6×6 grid; QP energies are eqp1.
 | Σc(E_DFT) at Γ, VBM / CBM | 0.949 / −3.758 | 1.052 / −3.693 | +103 / +65 meV |
 
 On the L–Γ–X–U|K–Γ path (inteqp against `htransform --eqp-file eqp1.dat`,
-each aligned to its VBM) the top valence bands agree to +10–14 meV on average
-and the lowest conduction bands to −44 to −67 meV; the lowest valence band
-(Γ₆ at −12 eV) is 0.18 eV higher in LORRAX. `--qp-rotations` interpolates the
+each aligned to its VBM; htransform then returned bands 1–24) the top
+valence bands agree to +10–14 meV on average and the lowest conduction bands
+to −44 to −67 meV; the lowest valence band (Γ₆ at −12 eV) is 0.18 eV higher
+in LORRAX. `--qp-rotations` interpolates the
 eigenvalues of the full QP Hamiltonian, T + V_ion + V_H + Σ(E_DFT), without the
 Z factor of eqp1, so its gaps are larger (about eqp0's).
 
