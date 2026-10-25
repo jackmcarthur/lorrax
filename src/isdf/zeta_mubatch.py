@@ -1236,8 +1236,8 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     mu = int(st0.mu_pad)
     V = tuple(_zero_accumulators(mesh, st0.Q_pad, mu, 1,
                                  debug_m=False)[0] for _ in pairs)
-    S = tuple(_zero_accumulators(mesh, st0.Q_pad, mu,
-                                 int(sl.shape[1]), debug_m=False)[2] for _ in zetas)
+    S = tuple(jnp.zeros((st0.Q_pad, mu, int(sl.shape[1])), jnp.complex128,
+                        device=NamedSharding(mesh, _ACC_SPEC)) for _ in zetas)
     factors = [z.factor for z in zetas]
     v_form = v_dev[0]                  # unread by the ζ-forming half
     # No look-ahead: each Z tile is read just before its ζ is formed and
