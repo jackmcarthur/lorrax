@@ -2012,7 +2012,7 @@ def test_the_three_levels_are_each_populated(sources):
 # ===========================================================================
 
 def scan_refit_host_replication(source, mod):
-    """Known production refit tensors never cross a host-conversion seam.
+    """Known production refit, LR and export fields retain device ownership.
 
     This is a focused ownership ratchet, not a general array type checker.
     Small q/energy/index metadata remains legal; the independent runtime
@@ -2023,7 +2023,17 @@ def scan_refit_host_replication(source, mod):
         "bse.exchange_path": {"exchange_tiles", "_host_tile"},
         "file_io.restart_bundle": {"read_coarse_interactions", "read_vq_payload"},
         "gw.v_q_g_flat": {"coulomb_gram_gflat", "_gflat_gram_program"},
+        "gw.lr_channels": {"read_channel_rows", "begin", "finish", "_lr_programs"},
+        "bse.bse_densify": {"_srlr_terms", "_unfold_lr_channels", "_add_rank_lr"},
+        "file_io.tagged_arrays": {"write_lr_channels_to_h5"},
+        "bse.bsemat_export": {
+            "_canonical_psi", "_psi_views", "_band_face", "_rotate_psi",
+            "_gauge_unitaries", "htransform_window", "_parent_columns",
+            "_unfold_to_keys", "head_columns", "head_split_keys", "gauge_map",
+            "_direct_row", "_downfold_stage", "_export_context", "_write_output",
+            "_q0_dipole_rows", "_row_programs"},
     }
+    scopes["file_io.restart_bundle"].add("read_lr_channels")
     if mod not in scopes:
         return []
     tree = ast.parse(source)
@@ -2042,25 +2052,75 @@ def scan_refit_host_replication(source, mod):
             return name(node.value)+'.'+node.attr
         return ''
 
-    large = {"full", "psi", "host", "replicate", "gflat_acc", "zt", "zeta_G",
+    refit = {"full", "psi", "host", "replicate", "gflat_acc", "zt", "zeta_G",
              "Z", "ZG", "V", "V_ref", "V_new", "V_np", "pad", "A"}
+    fields = {
+        "gw.lr_channels": {"F", "F_run", "Fchi", "chiFh", "FchiW", "Ft", "chi0_q", "W_q"},
+        "bse.bse_densify": {"Ft", "A", "A_c", "A_f", "W_q", "rows_full"},
+        "file_io.tagged_arrays": {"Ft"},
+        "bse.bsemat_export": {
+            "psi", "psi_win", "psi_1", "psi_2", "psi_v", "psi_c", "psi_v_b", "psi_c_b",
+            "psi_v_X", "psi_v_Y", "psi_c_X", "psi_c_Y", "psi_rmu_Y", "src_v", "src_c",
+            "U", "Uc", "Uv", "U_file", "U_all", "T_x", "T_y", "T_h", "V_flat", "W_flat",
+            "V_Sq", "W_Sq", "V_h", "W_h", "Vbar", "Wbar", "z_keys", "y_keys", "a_keys",
+            "cols", "columns", "a_parent", "Lp", "Rp"},
+    }
     conversions = {"numpy.asarray", "numpy.array", "numpy.zeros", "numpy.empty",
                    "numpy.ones", "numpy.full", "numpy.copy"}
+    gathers = {'_to_host', 'gather_to_host', 'process_allgather', 'device_get', '_host_tile'}
     hits = []
     for fn in tree.body:
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or fn.name not in scopes[mod]:
             continue
         if fn.name == '_host_tile':
             hits.append((fn.lineno, 'replicated host tile owner'))
+        large = set(fields.get(mod, refit))
+        if fn.name == 'read_lr_channels':
+            large = {'Ft'}  # P, gvec, v and q_frac are small channel metadata.
+        if mod == 'bse.bsemat_export' and fn.name in {'_parent_columns', 'gauge_map', '_unfold_to_keys'}:
+            large.update({'c', 'u', 'out'})
+
+        def payload(expr, *, geometry=False):
+            if isinstance(expr, ast.Name):
+                return expr.id in large
+            if isinstance(expr, ast.Attribute):
+                # A shape/dtype is metadata, but allocating its full shape
+                # still creates a field and is checked with geometry=True.
+                return (geometry or expr.attr not in {'shape', 'dtype', 'ndim', 'size'}) and (expr.attr in large or payload(expr.value, geometry=geometry))
+            if isinstance(expr, ast.Subscript) and _literal(expr.slice) in large:
+                return True
+            return any(payload(child, geometry=geometry) for child in ast.iter_child_nodes(expr))
+
+        # Follow plain aliases of a known field. Do not taint derived scalar
+        # receipts or owned shard.data: their ownership is a different seam.
+        for assignment in ast.walk(fn):
+            if isinstance(assignment, ast.Assign) and isinstance(assignment.value, (ast.Name, ast.Attribute, ast.Subscript)):
+                if payload(assignment.value):
+                    large.update(t.id for t in assignment.targets if isinstance(t, ast.Name))
+        assigned_fields = {id(parent.value) for parent in ast.walk(fn)
+                           if isinstance(parent, ast.Assign)
+                           and any(payload(t) for t in parent.targets)}
         for node in ast.walk(fn):
             if isinstance(node, ast.Call):
                 target = name(node.func)
                 leaf = target.rsplit('.', 1)[-1]
-                if leaf in {'_to_host', 'gather_to_host', 'process_allgather', 'device_get', '_host_tile'}:
+                args = list(node.args)+[k.value for k in node.keywords]
+                is_refit = mod not in fields and fn.name != 'read_lr_channels'
+                if leaf in gathers and (is_refit or any(payload(a) for a in args)):
                     hits.append((node.lineno, target))
-                elif target in conversions and any(isinstance(n, ast.Name) and n.id in large
-                                                   for a in node.args for n in ast.walk(a)):
-                    hits.append((node.lineno, target+' on refit tensor'))
+                elif leaf in {'rep', 'replicate', 'to_host', 'pack_host', 'unpack_host'} and any(payload(a) for a in args):
+                    hits.append((node.lineno, target+' on global field'))
+                elif ((target in conversions or target.startswith('numpy.'))
+                      and target not in {'numpy.shape', 'numpy.ndim', 'numpy.size', 'numpy.result_type'}
+                      and (any(payload(a, geometry=target in conversions-{'numpy.asarray', 'numpy.array', 'numpy.copy'}) for a in args)
+                           or (target in conversions and id(node) in assigned_fields))):
+                    hits.append((node.lineno, target+' on global field'))
+                elif leaf == 'read_zeta_G_local' and node.args and isinstance(node.args[0], ast.Tuple):
+                    index = node.args[0].elts
+                    if (len(index) > 1 and isinstance(index[1], ast.Call)
+                            and name(index[1].func) == 'slice'
+                            and all(_literal(a) is None for a in index[1].args)):
+                        hits.append((node.lineno, 'full-centroid host channel read'))
                 elif (fn.name == 'read_vq_payload' and target == 'numpy.meshgrid'
                       and any(isinstance(n, ast.Name) and n.id in {'rx', 'ry', 'rz'}
                               for a in node.args for n in ast.walk(a))):
@@ -2070,6 +2130,14 @@ def scan_refit_host_replication(source, mod):
                           and t.value.id == 'zx' and _literal(t.slice) == 'rfrac'
                           for t in node.targets)):
                 hits.append((node.lineno, 'retained full-r coordinate mirror'))
+            elif (fn.name == 'read_lr_channels' and isinstance(node, ast.DictComp)
+                  and any(isinstance(n, ast.Constant) and n.value == 'Ft'
+                          for g in node.generators for n in ast.walk(g.iter))):
+                hits.append((node.lineno, 'global LR form-factor host read'))
+            elif (fn.name == 'read_lr_channels' and isinstance(node, ast.Subscript)
+                  and isinstance(node.value, ast.Subscript) and _literal(node.value.slice) == 'Ft'
+                  and isinstance(node.slice, ast.Tuple) and not node.slice.elts):
+                hits.append((node.lineno, 'global LR form-factor host read'))
     return hits
 
 
@@ -2077,7 +2145,7 @@ def test_production_refit_keeps_tensor_transport_on_the_mesh(sources):
     hits = [(mod, *hit) for mod, src in sources.items()
             for hit in scan_refit_host_replication(src, mod)]
     assert not hits, (
-        f"refit ψ/ζ/V must stay on their canonical device faces; no large host "
+        f"refit/LR/export ψ/ζ/V/W fields must keep canonical mesh ownership; no large host "
         f"mirror or fallback is allowed: {hits}")
 
 
@@ -2103,6 +2171,76 @@ def test_the_refit_host_replication_scan_can_fail():
     q_metadata = ('import numpy as np\ndef read_vq_payload():\n'
                   '    labels = np.meshgrid(*[np.arange(k) for k in kgrid])\n')
     assert scan_refit_host_replication(q_metadata, 'file_io.restart_bundle') == []
+
+
+def test_the_lr_and_export_host_field_ratchet_rejects_historical_production():
+    # Exact retired production expressions from 0c93540d. Keeping the
+    # examples here makes the required RED controls work in shallow clones.
+    retired = (
+        ('gw.lr_channels', 'def read_channel_rows():\n'
+         '    F = np.empty((len(q_frac), ch.gvec.shape[1], n_rmu), np.complex128)\n'),
+        ('gw.lr_channels', 'def begin():\n    F_run = basis.pack_host(F, axis=2)\n'),
+        ('gw.lr_channels', 'def begin():\n    Fchi = pref * np.asarray(fchi(F_x, chi0_q))\n'),
+        ('gw.lr_channels', 'def finish():\n    Ft = basis.unpack_host(Ft, axis=2)\n'),
+        ('bse.bse_densify', 'def _srlr_terms():\n'
+         '    A = np.zeros((n, n_L, int(n_rmu_pad)), np.complex128)\n'),
+        ('bse.bse_densify', 'def _unfold_lr_channels():\n'
+         '    rows_full.append(np.asarray(to_host(out)))\n'
+         '    Ft = np.stack(rows_full, axis=1)\n'),
+        ('file_io.restart_bundle', 'def read_lr_channels():\n'
+         '    out = {k: g[k][()] for k in ("Ft", "P", "gvec", "v", "q_frac")}\n'),
+        ('file_io.tagged_arrays', 'def write_lr_channels_to_h5():\n'
+         '    arrays = dict(Ft=np.asarray(Ft), P=np.asarray(P))\n'),
+        ('bse.bsemat_export', 'def htransform_window():\n'
+         '    psi, enk = np.asarray(rep(bundle.psi_rmu_Y)), np.asarray(rep(bundle.enk_full))\n'),
+        ('bse.bsemat_export', 'def _parent_columns():\n'
+         '    c = np.zeros(int(n_rmu_pad), np.complex128)\n'
+         '    c[:n_rmu] = np.asarray(zl.read_zeta_G_local((p, slice(None), lut[g])))\n'),
+        ('bse.bsemat_export', 'def gauge_map():\n    u = np.asarray(rep(u))\n'),
+        ('bse.bsemat_export', 'def head_split_keys():\n'
+         '    y_keys[kk] = np.asarray(rep(sp.y))\n'),
+        ('bse.bsemat_export', 'def _downfold_stage():\n'
+         '    V_h, W_h = np.asarray(rep(V_Sq)), np.asarray(rep(W_Sq))\n'),
+        ('bse.bsemat_export', 'def _export_context():\n'
+         '    psi_v = np.asarray(rep(data["psi_v_X"]))\n'),
+        ('bse.bsemat_export', 'def _write_output():\n'
+         '    psi_1 = np.concatenate([psi_v_b, psi_c_b], axis=1)\n'),
+    )
+    for mod, body in retired:
+        assert scan_refit_host_replication('import numpy as np\n'+body, mod), (mod, body)
+    # Aliasing/import spelling cannot hide a known field conversion.
+    alias = ('from common.collectives import gather_to_host as copy\n'
+             'def finish(Ft):\n    rows = Ft\n    return copy(rows)\n')
+    assert scan_refit_host_replication(alias, 'gw.lr_channels')
+
+
+def test_the_host_field_ratchet_allows_owned_staging_and_small_metadata():
+    safe = {
+        'gw.lr_channels': ('def finish():\n'
+            '    Pm = np.asarray(P_device.addressable_data(0))\n'
+            '    return np.linalg.eigvalsh(Pm)\n'),
+        'bse.bse_densify': ('def _srlr_terms(Ft):\n'
+            '    for shard in Ft.addressable_shards:\n'
+            '        local = np.asarray(shard.data)\n'
+            '        residual = np.linalg.norm(local)\n'
+            '        block = np.zeros((n, n_L, hi-lo), np.complex128)\n'
+            '    D = np.zeros((n, n_L, n_L), np.complex128)\n'),
+        'file_io.restart_bundle': ('def read_lr_channels():\n'
+            '    out = {k: g[k][()] for k in ("P", "gvec", "v", "q_frac")}\n'
+            '    shape = tuple(g["Ft"].shape)\n'),
+        'file_io.tagged_arrays': ('def write_lr_channels_to_h5():\n'
+            '    arrays = dict(P=np.asarray(P), gvec=np.asarray(gvec))\n'
+            '    io.write_slab("W0_lr/Ft", Ft)\n'),
+        'bse.bsemat_export': ('def gauge_map(psi):\n'
+            '    r_mu = np.asarray(centroid_frac)\n'
+            '    el = np.asarray(header["energies"])\n'
+            '    dimensions = np.asarray(psi.shape)\n'
+            '    for shard in psi.addressable_shards:\n'
+            '        tile = np.asarray(shard.data)\n'
+            '    q = np.zeros(3)\n'),
+    }
+    for mod, body in safe.items():
+        assert scan_refit_host_replication('import numpy as np\n'+body, mod) == [], (mod, body)
 
 
 def _main():
