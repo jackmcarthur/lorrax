@@ -37,6 +37,6 @@ Instructions
    which distinguish successful execution from agreement between the codes.
 
 The final BSE folder adds [exciton bands](3-bse/3-lorrax_fully_rel/3-exciton-bands/README.md)
-along Gamma–M–K–Gamma and a near-Gamma zoom. Its 30 × 30 × 1 integration
-grid interpolates the same 3 × 3 × 1 screening calculation; it is a
+along Gamma–K, showing 128 levels up to 3.0 eV and a near-Gamma detail.
+Its 24 × 24 × 1 integration grid interpolates the same 3 × 3 × 1 screening calculation; it is a
 separate grid from the shifted 8 × 8 × 1 optical calculation above.

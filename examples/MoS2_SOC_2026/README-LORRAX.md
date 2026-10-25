@@ -24,7 +24,7 @@ Goals
 2. Export screening and a BSE kernel in BerkeleyGW's file layouts.
 3. Calculate and compare optical absorption with and without electron-hole
    interactions, then compare the fully relativistic results between codes.
-4. Calculate exciton bands along Gamma–M–K–Gamma and inspect their
+4. Calculate exciton bands along Gamma–K and inspect their
    near-Gamma dispersion.
 
 Instructions
@@ -137,21 +137,16 @@ The native BSE uses six valence and eight conduction bands on the shifted
 Gaussian broadening. All 3,072 retained Tamm–Dancoff roots are requested.
 
 The additional `3-bse/3-lorrax_fully_rel/3-exciton-bands` stage keeps the same
-six-valence/eight-conduction window, with 256 lowest roots on a Gamma-centered
-`24 24 1` integration grid at each exciton momentum. Its full-path and
-near-Gamma plots use LORRAX only. The full path has 25 Q points and a 0.25 meV
-Davidson budget; the separate near-Gamma scan keeps eight roots at 0.01 meV,
-with eight steps from Gamma to `(0.003, 0, 0)`, twelve more to `(0.06, 0, 0)`
-and a distant K point retained for certification. The tutorial explicitly
-selects the existing 1 meV `visualization` exchange certificate: matched
-on-grid checks measured about 0.02 meV, above the stricter reference gate.
-The driver's `reference` default is unchanged. The [stage README](3-bse/3-lorrax_fully_rel/3-exciton-bands/README.md)
-explains the sampling, residuals and independent-particle threshold. The
-measured near-Gamma scan took 25 min 37 s on four Frontier GPU ranks;
-allow roughly three hours for the full path in a regular four-GPU allocation.
-Matched lowest-eight levels differ by up to 7.65 meV between the 24 × 24
-and 30 × 30 controls. Neither integration-grid convergence nor continuum
-coverage from the root count alone is assumed.
+six-valence/eight-conduction window and a Gamma-centered `24 24 1`
+integration grid. It solves 128 lowest levels at 37 genuine Q points from
+Gamma to K, with extra sampling near Gamma and a 0.25 meV Davidson budget.
+The figure displays only Gamma–K up to 3.0 eV, with a near-Gamma detail
+from the same scan. The tutorial selects the existing 1 meV `visualization`
+exchange certificate; the driver's `reference` default is unchanged.
+Four GPUs were tested and are recommended. The [stage README](3-bse/3-lorrax_fully_rel/3-exciton-bands/README.md)
+explains the sampling, reciprocal coordinates, residuals and matched
+independent-particle threshold. Neither integration-grid convergence nor
+continuum coverage from the root count alone is assumed.
 
 Comparison
 ----------

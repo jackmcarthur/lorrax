@@ -15,7 +15,7 @@ Goals
 2. Solve the native BSE and compare absorption with and without electron-hole
    interactions.
 3. Compare the fully relativistic spectra with the BerkeleyGW track.
-4. Plot exciton bands along Gamma–M–K–Gamma and inspect the dispersion
+4. Plot exciton bands along Gamma–K and inspect the dispersion
    close to Gamma.
 
 Instructions
@@ -56,8 +56,8 @@ Instructions
    `bash 01-run_exciton_bands.run`, then plot with
    `lorrax_python 02-plot_exciton_bands.py` after sourcing the shared
    `lorrax_env.sh`. This additional LORRAX exercise uses a Gamma-centered
-   30 × 30 × 1 electron-hole integration grid, retaining the same 3 × 3 × 1
-   screening calculation. It requests 64 levels per exciton momentum,
+   24 × 24 × 1 electron-hole integration grid, retaining the same 3 × 3 × 1
+   screening calculation. It requests 128 levels at 37 momenta from Gamma to K,
    rather than the complete transition space. Check every root's residual
    and whether the plotted levels reach the independent-particle threshold.
 
