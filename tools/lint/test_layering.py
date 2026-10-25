@@ -2079,11 +2079,20 @@ def scan_refit_host_replication(source, mod):
             large = {'Ft'}  # P, gvec, v and q_frac are small channel metadata.
         if mod == 'bse.bsemat_export' and fn.name in {'_parent_columns', 'gauge_map', '_unfold_to_keys'}:
             large.update({'c', 'u', 'out'})
+        if mod == 'gw.lr_channels' and fn.name == '_lr_programs':
+            large.update({'f', 'c', 'w', 'G', 'chiFh'})
+
+        def owned_shard(expr):
+            return (isinstance(expr, ast.Subscript)
+                    and isinstance(expr.value, ast.Attribute)
+                    and expr.value.attr == 'addressable_shards')
 
         def payload(expr, *, geometry=False):
             if isinstance(expr, ast.Name):
                 return expr.id in large
             if isinstance(expr, ast.Attribute):
+                if expr.attr == 'data' and owned_shard(expr.value):
+                    return False
                 # A shape/dtype is metadata, but allocating its full shape
                 # still creates a field and is checked with geometry=True.
                 return (geometry or expr.attr not in {'shape', 'dtype', 'ndim', 'size'}) and (expr.attr in large or payload(expr.value, geometry=geometry))
@@ -2095,7 +2104,7 @@ def scan_refit_host_replication(source, mod):
         # receipts or owned shard.data: their ownership is a different seam.
         for assignment in ast.walk(fn):
             if isinstance(assignment, ast.Assign) and isinstance(assignment.value, (ast.Name, ast.Attribute, ast.Subscript)):
-                if payload(assignment.value):
+                if not owned_shard(assignment.value) and payload(assignment.value):
                     large.update(t.id for t in assignment.targets if isinstance(t, ast.Name))
         assigned_fields = {id(parent.value) for parent in ast.walk(fn)
                            if isinstance(parent, ast.Assign)
@@ -2182,6 +2191,8 @@ def test_the_lr_and_export_host_field_ratchet_rejects_historical_production():
         ('gw.lr_channels', 'def begin():\n    F_run = basis.pack_host(F, axis=2)\n'),
         ('gw.lr_channels', 'def begin():\n    Fchi = pref * np.asarray(fchi(F_x, chi0_q))\n'),
         ('gw.lr_channels', 'def finish():\n    Ft = basis.unpack_host(Ft, axis=2)\n'),
+        ('gw.lr_channels', 'def _lr_programs():\n'
+         '    def left(f, c, p):\n        return np.asarray(c)\n'),
         ('bse.bse_densify', 'def _srlr_terms():\n'
          '    A = np.zeros((n, n_L, int(n_rmu_pad)), np.complex128)\n'),
         ('bse.bse_densify', 'def _unfold_lr_channels():\n'
@@ -2220,6 +2231,9 @@ def test_the_host_field_ratchet_allows_owned_staging_and_small_metadata():
             '    Pm = np.asarray(P_device.addressable_data(0))\n'
             '    return np.linalg.eigvalsh(Pm)\n'),
         'bse.bse_densify': ('def _srlr_terms(Ft):\n'
+            '    owned = Ft.addressable_shards[0]\n'
+            '    tile = np.asarray(owned.data)\n'
+            '    tile = np.asarray(Ft.addressable_shards[0].data)\n'
             '    for shard in Ft.addressable_shards:\n'
             '        local = np.asarray(shard.data)\n'
             '        residual = np.linalg.norm(local)\n'
