@@ -976,9 +976,8 @@ def write_bgw_eigenvalues_noeh(directory, ec_eV, ev_eV, d_alpha, *, n_spin,
     ``eigenvalues_b1_noeh.dat`` .. ``_b3`` for the three axes
     (:func:`bgw_noeh_lines`).  ``d_alpha`` ``(3, nk, nc, nv)`` Cartesian.
     Returns the paths written."""
-    import jax
     from contextlib import ExitStack
-    from common.collectives import gather_to_host
+    from common.collectives import gather_to_host, rank0_transaction
     directory = Path(directory)
     if directions is None:
         directions, labels = np.eye(3), BGW_POLARIZATION_SUFFIXES
@@ -987,11 +986,14 @@ def write_bgw_eigenvalues_noeh(directory, ec_eV, ev_eV, d_alpha, *, n_spin,
     nk, nc, nv = int(ec.shape[0]), int(ec.shape[1]), int(ev.shape[1])
     paths = [str(directory / name.replace(".dat", "_noeh.dat"))
              for name in eigenvalue_file_names(labels)]
-    root = int(jax.process_index()) == 0
-    with ExitStack() as stack:
-        files = [stack.enter_context(open(path, "w")) for path in paths] if root else []
-        for f in files:
+    stack, files = ExitStack(), []
+    def open_files():
+        for path in paths:
+            f = stack.enter_context(open(path, "w"))
+            files.append(f)
             f.write("\n".join(_noeh_header(nk, nc, nv, n_spin, n_spinor, vol_supercell)) + "\n")
+    try:
+        rank0_transaction(directory, stage="bse.noeh.open", write=open_files)
         # At most 1024 transitions (48 KiB for three polarizations) leave
         # the device at once. Every rank participates; only rank 0 writes.
         for start in range(0, nk * nc * nv, 1024):
@@ -1002,11 +1004,14 @@ def write_bgw_eigenvalues_noeh(directory, ec_eV, ev_eV, d_alpha, *, n_spin,
             else:
                 idx = np.arange(start, stop)
                 values = d[:, idx // (nc * nv), idx // nv % nc, nv - 1 - idx % nv]
-            if root:
+            def write_block():
                 for k, flat in enumerate(range(start, stop)):
                     ik, ic, iv = flat // (nc * nv), flat // nv % nc, flat % nv
                     for f, value in zip(files, values[:, k]):
                         f.write(_noeh_record(ik, ic, iv, ec[ik, ic], ev[ik, nv - 1 - iv], value) + "\n")
+            rank0_transaction(directory, stage="bse.noeh.block", write=write_block)
+    finally:
+        rank0_transaction(directory, stage="bse.noeh.close", write=stack.close)
     return paths
 
 

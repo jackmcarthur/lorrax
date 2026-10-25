@@ -221,3 +221,13 @@ def test_text_and_spectrum_programs_keep_only_owned_input_tiles():
         complex_shapes=re.findall(r'c128\[([0-9,]+)\]',hlo)
         assert complex_shapes, "expected actual optimized complex HLO"
         assert max(math.prod(map(int,dims.split(','))) for dims in complex_shapes)<=local_elements
+
+
+def test_text_writer_agrees_root_io_failure_before_next_block(tmp_path):
+    """The collective writer cannot leave peers starting its next gather."""
+    import builtins
+    from bse.absorption_common import write_bgw_eigenvalues_noeh
+    with patch.object(builtins,"open",side_effect=OSError("noeh disk-full fixture")):
+        with pytest.raises(RuntimeError,match="bse.noeh.open.*disk-full"):
+            write_bgw_eigenvalues_noeh(tmp_path,np.ones((1,1)),np.zeros((1,1)),
+                np.ones((3,1,1,1),complex),n_spin=1,n_spinor=1,vol_supercell=1.)
