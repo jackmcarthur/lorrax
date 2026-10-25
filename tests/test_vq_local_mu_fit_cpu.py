@@ -2,6 +2,7 @@
 import numpy as np
 import pytest
 from contextlib import nullcontext
+import re
 
 import runtime
 from runtime.source_closure import ensure_source_closure
@@ -118,6 +119,21 @@ def check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, *, reference=Fa
             return 'face' if face_route else 'q-batched'
         return admission(label,choices,*a,**kw)
     monkeypatch.setattr(memory,'admit',choose)
+    from runtime import aot_memory
+    original_price=aot_memory.compiled_price
+    fit_hlos=[]
+    def record_price(*a,**kw):
+        if kw.get('source')=='VQ fit-column reshard and logical mask':
+            text=kw['compiled'].as_text()
+            shapes=[tuple(map(int,s.split(','))) if s else () for s in
+                    re.findall(r'=\s*c128\[([0-9,]*)\]',text)]
+            largest=max(np.prod(s,dtype=np.int64) for s in shapes)
+            assert largest<=nq*mu*ng//side**2, 'fit reshard materialized a global form-factor stack'
+            fit_hlos.append(dict(largest_complex_elements=int(largest),
+                                 all_gather_count=text.count('all-gather('),
+                                 all_to_all_count=text.count('all-to-all(')))
+        return original_price(*a,**kw)
+    monkeypatch.setattr(aot_memory,'compiled_price',record_price)
     face=NamedSharding(mesh,P(None,'x','y'))
     original_asarray=np.asarray
     def local_only(value,*a,**kw):
@@ -185,6 +201,10 @@ def check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, *, reference=Fa
     pinv=V.stencil_pinv(qfr,V.stencil_r7(zx))
     evaluator=V.make_eval_vq(zx,prep,des,mesh,mu)
     out=evaluator(target,prep['V_SRc'],pinv,packed)
+    text=evaluator.lower(target,prep['V_SRc'],pinv,packed).compile().as_text()
+    for dimensions in re.findall(r'=\s*c128\[([0-9,]*)\]',text):
+        shape=tuple(map(int,dimensions.split(','))) if dimensions else ()
+        assert shape not in ((mu,ng),(ng,mu)), 'evaluator materialized a global mu/G factor'
     xy=(bvec.T@(target[:,None]+gs))[:2]/(2*V.ALPHA)
     phi=np.array([np.ones(ng),xy[1],xy[0]]).T
     m=(phi@expected_coeff).T
@@ -200,6 +220,7 @@ def check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, *, reference=Fa
                 n_q=nq,n_G_physical=ng,
                 local_form_factor_bytes=sum(a.nbytes for a in prep['Fch'].values()),
                 largest_mu_block=max(hi-lo for lo,hi in prep['Fch']),
+                fit_hlo=fit_hlos,
                 host_global_copies_forbidden=True,
                 output_sharding=str(out.sharding),coefficient_sharding=str(packed[0].sharding))
 
