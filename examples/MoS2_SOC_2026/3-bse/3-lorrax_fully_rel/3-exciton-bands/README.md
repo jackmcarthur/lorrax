@@ -4,121 +4,112 @@ Hands-on Session: MoS2 Exciton Bands
 Overview
 --------
 
-In this directory, we will follow the exciton energies away from Gamma.
-The electron has momentum k + Q and the hole has momentum k. The GW
-screening and single-particle Hamiltonian still come from the workshop's
-3 × 3 × 1 calculation. No additional shifted DFT calculation is needed.
-This is an additional LORRAX exercise; the adjacent BerkeleyGW workshop
-track does not contain an exciton-dispersion step.
+In this directory, we follow 128 exciton levels from Gamma to K. The electron
+has momentum k + Q and the hole has momentum k. The GW screening and
+single-particle Hamiltonian come from the workshop's 3 × 3 × 1 calculation;
+no additional shifted DFT calculation is needed. This is an additional
+LORRAX exercise alongside the BerkeleyGW workshop track.
 
 Instructions
 ------------
 
 1. Finish the native GW calculation and run `../01-link_files.sh`. Read
-   `gw.in`: it retains six valence and eight conduction bands, samples the
-   electron-hole sum on a Gamma-centered 24 × 24 × 1 grid, and requests
-   256 levels at each Q. The 48-band H-transform window includes the same
-   conduction guards as the optical calculation.
+   `gw.in`: the electron-hole sum uses six valence and eight conduction bands
+   on a Gamma-centered 24 × 24 × 1 integration grid. The 48-band H-transform
+   window includes the same conduction guards as the optical calculation.
 
-2. On the four-GPU allocation, run:
+2. We tested this stage on four GPUs and recommend that allocation. Run:
 
    ```bash
    bash 01-run_exciton_bands.run
-   bash 01-run_exciton_bands.run gw-near-gamma.in near_gamma
    ```
 
-   Inspect `exciton_bands.out`/`.log` and `near_gamma.out`/`.log`. The full
-   path has 25 Q points: Gamma, four steps to `(0.05, 0, 0)`, seven to M,
-   six to K and seven back to Gamma. It requests 256 roots with a 0.25 meV
-   Davidson residual budget. The separate scan keeps eight roots with a
-   0.01 meV budget: eight steps from Gamma to `(0.003, 0, 0)`, twelve more
-   to `(0.06, 0, 0)`, then K as an on-grid certification anchor, for 22 Q
-   points in total. Coordinates are fractional reciprocal coordinates.
-   Both use the same 24 × 24 × 1
-   integration grid, six-valence/eight-conduction window and coarse QP data.
+   Inspect `exciton_bands.out` and `.log`. The deck requests 128 roots at
+   each of 37 actual Q points with a 0.25 meV Davidson residual budget:
+   eight steps from Gamma to `(0.003, 0.003, 0)`, then 28 steps to
+   `K = (1/3, 1/3, 0)`. The largest Q spacing is about four times smaller
+   than on the former seven-interval Gamma–K segment. Every momentum is
+   evaluated by the driver; no extra points are inserted by the plotter.
 
-   Use a regular four-GPU allocation with enough wall time for these scans.
-   Plan for roughly three hours for the full path, plus the near-Gamma scan;
-   the latter completed in 25 min 37 s from a cold launch on four Frontier
-   GPU ranks. The full-path estimate is a planning allowance, not a measured
-   benchmark for every machine. The executed full path used two independently
-   checked four-rank halves, taking 89 and 95 minutes, run concurrently on
-   one eight-GCD Frontier allocation. Their elapsed times sum to about
-   3 h 4 min, including duplicated M, an extra K anchor, two stored-route
-   certification solves and repeated preparation. That sum is not a measured
-   single-four-rank full-path wall time.
+   The executed scan took 34 min 43 s on four Perlmutter A100 80 GB GPUs,
+   including restart loading, H-transform, exchange refits, all 37 Q solves
+   and the exchange certification. It excludes the preceding GW and
+   preprocessing stages. The largest reported stage device peak was 16.35 GB
+   per rank; host peak was 2.40 GB per rank. Four GPUs are a tested allocation,
+   rather than a measured minimum.
+
+   These coordinates use the supplied cell's reciprocal basis. Its in-plane
+   basis vectors meet at 60 degrees, so `(1/3, 1/3, 0)` is a Brillouin-zone
+   corner K and `(1/2, 0, 0)` is an edge midpoint M. Their energy ordering
+   is not a test of the labels.
 
 3. Source the shared tutorial environment and plot:
 
    ```bash
    source ../../../2-gw/3-lorrax_fully_rel/lorrax_env.sh
-   lorrax_python 02-plot_exciton_bands.py --near-gamma-prefix near_gamma
+   lorrax_python 02-plot_exciton_bands.py
    ```
 
-   The plot writes `MoS2_exciton_bands.png` and `.pdf`. Its upper panel
-   shows all requested levels; the lower panel resolves the low-energy
-   structure near Gamma. A matching `exciton_bands_continuum.dat`, when
-   present, adds the independent-particle threshold computed from the
-   same QP transitions at each Q. The plot never substitutes the coarse
-   gap or a DFT gap for that threshold.
+   The plot writes `MoS2_exciton_bands.png` and `.pdf`, showing the lowest
+   128 computed levels only on Gamma–K and only up to 3.0 eV. The lower
+   panel shows the shifts of ordered levels 3 and 4 from each level's own
+   Gamma energy, in meV, through |Q| = 0.1056 Å⁻¹. Dots mark all 11 computed
+   momenta in that detail. Straight segments connect actual ordered energies;
+   no spline, fitted curve or eigenvector connectivity is inserted.
 
-   The upper panel retains the full-path data and its continuum threshold.
-   The lower panel shows the eight near-Gamma levels within 0.12 Å⁻¹;
-   the distant K certification anchor is outside that zoom. These remain
-   ordered energy levels; the plot does not assign optical character.
+   The [saved tables](../../../results/lorrax/exciton/) contain the actual
+   37-point output and matched threshold, with an execution receipt.
+
+   `exciton_bands_continuum.dat` records the independent-particle threshold
+   from the same QP transitions at every Q. The plot shows that threshold
+   where it falls within the displayed energy range. A root count of 128
+   does not by itself guarantee that the continuum is reached at every Q:
+   the highest retained level reaches it at 15 of these 37 momenta.
 
 Exchange certification
 ----------------------
 
-The runner uses `--vq-mode refit --refit-window bse` and the existing
-`visualization` certificate grade, whose exchange-comparison gate is 1 meV.
-The completed 256-root full path gave a worst on-grid difference of
-0.04416 meV in each half; the eight-root near-Gamma scan gave 0.01412 meV.
-These pass the visualization gate and exceed the 0.01 meV reference gate.
-They measure refitted versus stored
-exchange eigenvalues, not the error of the exciton energies against a
-converged calculation or a comparison between the two integration grids.
-The solver uses a tighter absolute residual budget on both members of each
-certification comparison, independently of the plotting budget.
+The runner uses `--vq-mode refit --refit-window bse`: both H-transform
+and exchange are evaluated at the requested arbitrary Q. A denser Q path
+therefore does not require a finer integration grid. The 24 × 24 grid
+controls the electron-hole sum and remains unchanged.
 
-The script accepts `deck`, `prefix` and `grade` as three optional positional
+The tutorial explicitly selects the existing `visualization` certificate
+with a 1 meV exchange-comparison gate; the completed scan measured 0.04417 meV.
+All 128 roots converged at every Q, with a largest residual of 0.22844 meV. On-grid Q points compare refitted
+and stored exchange eigenvalues using the same solver. This checks the
+exchange construction, rather than integration-grid convergence. The
+solver uses a tighter residual budget for both members of that comparison.
+The driver's `reference` default and all global solver defaults are unchanged.
+
+The script accepts `deck`, `prefix` and `grade` as optional positional
 arguments. For example, `bash 01-run_exciton_bands.run gw.in reference
 reference` requests the stricter grade and refuses when its gate is missed.
-The driver's own default remains `reference`; the tutorial selects
-`visualization` explicitly for an illustrative figure. No certificate
-constant or refusal is changed.
 
-Calculation settings
---------------------
-
-The fine integration grid controls the electron-hole sum. It does not
-replace the 3 × 3 × 1 screening data or establish convergence of that
-coarse calculation. Matched 24 × 24 and 30 × 30 near-Gamma scans differed
-by up to 7.65 meV among the lowest eight ordered levels at their four shared
-momenta; the maxima at Gamma and K were 7.14 and 5.78 meV. This exercise
-uses the cheaper 24 × 24 grid without claiming integration-grid convergence.
-The exchange certification above is a separate comparison. At each Q,
-check the highest requested level against the matched independent-particle
-threshold. In the completed path, the highest of 256 levels is above that
-threshold at 21 of 25 Q points. Four points retain only levels below it,
-with a largest shortfall of 131.8 meV. At Gamma and K the window extends
-152 and 113 meV above the threshold, respectively.
-
-The independently computed M overlap and the two Gamma endpoints agree
-for all 256 levels at the printed energy precision, within the 0.5 meV
-closure budget. The near-Gamma scan's eight Gamma energies also match
-the corresponding full-path levels at printed precision. The merged path
-keeps the 25 physical momenta without shifting or averaging energies.
+Interpretation
+--------------
 
 For a bright exciton doublet in two dimensions, long-range exchange can
 produce a leading linear term in |Q| for the longitudinal combination,
-while the transverse partner begins quadratically. Look for those shapes
-in the near-Gamma panel. In the measured 24 × 24 scan, the lowest two
-ordered levels are consistent with quadratic fits over
-0.00086–0.03955 Å⁻¹ (RMS errors below 0.009 meV). The fourth and eighth
-levels rise by about 0.8 meV already at the first nonzero Q and require
-both linear and quadratic terms over the closest four points. The smallest
-shifts of the lowest levels are below the solver's resolution; these
-finite-window fits do not establish asymptotic coefficients. The files
-contain energies without exciton eigenvectors or dipoles, so ordering alone
-does not identify a branch as longitudinal, transverse, bright or dark.
+while the transverse partner begins quadratically. The near-Gamma panel
+makes this comparison legible after subtracting the different Gamma energies.
+Level 3 has resolved quadratic curvature over the displayed window: a
+quadratic fit has 0.145 meV RMS error, versus 1.69 meV for a linear fit.
+Level 4 already rises by 1.345 meV at the first nonzero Q, where level 3
+moves only 0.005 meV, illustrating a strong linear contribution. The plot
+contains the computed points only, without those diagnostic fits.
+
+The 0.25 meV residual budget applies to each energy; shifts smaller than
+0.5 meV do not resolve differences conservatively. In particular, the tiny
+initial shifts of level 3 do not establish its curvature alone. The wider
+window above resolves it, without determining asymptotic coefficients.
+Energies alone do not establish longitudinal, transverse, bright or dark
+character.
+
+These are illustrative results from a sparse coarse GW grid. Previous
+matched 24 × 24 and 30 × 30 controls changed the lowest eight ordered
+levels by up to 7.65 meV at their shared momenta; they do not establish
+integration-grid convergence. Denser Q sampling improves the visible
+dispersion without improving the underlying GW or electron-hole-sum
+convergence. Completed older full-path outputs are retained as provenance,
+not as inputs to this Gamma–K workflow.

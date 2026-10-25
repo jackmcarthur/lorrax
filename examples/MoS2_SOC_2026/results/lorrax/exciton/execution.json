@@ -1,0 +1,47 @@
+{
+  "status": "PASS",
+  "source_sha256": "21ec3f0b5c7c43ebb62552ce387ce7cf298ef6ddef113528eb966b6b96684d54",
+  "continuum_sha256": "fed4fb67f13e224fd33366ba246d4761812c82dd51fb1bb2deab5a1dfa03dd5a",
+  "genuine_distinct_computed_Q": 37,
+  "roots_per_Q": 128,
+  "expected_Q_max_abs_error": 4.761904762173863e-07,
+  "expected_reciprocal_distance_max_abs_error": 4.993814122500329e-07,
+  "largest_Q_step_angstrom_inverse": 0.04685195182196466,
+  "ongrid_exchange_certificate": "# refit-cert: CERTIFIED visualization grade: worst max|dE_S| 0.04417 meV against the 1 meV visualization gate, contracted on-grid gate (refit route vs stored V_qmunu route) over 1 Q",
+  "lowest_energy_ev": 2.355506,
+  "visible_root_count_range_below_3ev": [
+    23,
+    95
+  ],
+  "continuum_reached_Q_count": 15,
+  "root128_minus_continuum_mev_range": [
+    -175.90211600000006,
+    186.6362490000002
+  ],
+  "displayed_max_energy_ev": 3.0,
+  "spline_used": false,
+  "coordinates_checked_against_QE_real_cell": true,
+  "numerical_source_commit": "9eb44f4b25e67510b400a0b841974d8898b0902d",
+  "canonical_deck_sha256": "4cc58639b1f0c4f0161c5d9275cfc38bf906b9a539e08103a9ca63cbe3b340ab",
+  "elapsed_seconds": 2082.86,
+  "elapsed_human": "34 min 43 s",
+  "GPU_configuration": "4 x NVIDIA A100-SXM4-80GB",
+  "largest_reported_stage_device_peak_gb_per_rank": 16.35,
+  "host_peak_gb_per_rank": 2.4,
+  "max_Davidson_residual_mev": 0.22843958753506924,
+  "solver_residual_budget_mev": 0.25,
+  "near_Gamma_detail": {
+    "ordered_levels": [
+      3,
+      4
+    ],
+    "reference": "Each level minus its own Gamma energy",
+    "unit": "meV",
+    "computed_points": 11,
+    "max_Q_angstrom_inverse": 0.10561868
+  },
+  "artifacts": {
+    "exciton_bands.dat": "21ec3f0b5c7c43ebb62552ce387ce7cf298ef6ddef113528eb966b6b96684d54",
+    "exciton_bands_continuum.dat": "fed4fb67f13e224fd33366ba246d4761812c82dd51fb1bb2deab5a1dfa03dd5a"
+  }
+}
