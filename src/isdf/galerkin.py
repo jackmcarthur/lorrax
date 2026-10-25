@@ -1148,6 +1148,14 @@ def iter_galerkin_rchunks(
     n_face = int(factor.shape[1])
     face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     p = int(mesh_xy.shape['x'])
+    # The residual uses the default band carrier, whereas the source may
+    # carry a wider padded tail. Reuse only the same logical block and
+    # carrier; clipped pieces still need their own coefficient map.
+    residual_rows = {
+        (int(lo), int(hi)): phi
+        for (lo, hi), phi in zip(source.band_chunk_ranges, phis)
+        if -(-(int(hi) - int(lo)) // p) * p == bc
+    }
 
     @partial(jax.jit, out_shardings=(row_layout, rep, face))
     def _rows(factor, acc):
@@ -1219,9 +1227,11 @@ def iter_galerkin_rchunks(
         if receipt is not None:
             totals[1] += scalar(fitted)
             for (lo, hi), psi in retained:
-                rows = _coefficient_matrix(
-                    basis.ctilde, n_nodes=n_nodes, nspinor=nspinor,
-                    mesh=mesh_xy, band_range=(lo - b_start, hi - b_start))
+                rows = residual_rows.get((lo, hi))
+                if rows is None:
+                    rows = _coefficient_matrix(
+                        basis.ctilde, n_nodes=n_nodes, nspinor=nspinor,
+                        mesh=mesh_xy, band_range=(lo - b_start, hi - b_start))
                 res2, nrm2 = _run_priced('Galerkin refit residual',
                     _part_residual, (rows, psi, zeta), mesh_xy)
                 totals[2] += scalar(res2)
