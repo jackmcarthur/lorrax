@@ -19,8 +19,9 @@ def main():
     from jax.experimental.multihost_utils import process_allgather
     from common.collectives import device_put_process_local
     from common.wfn_layout import PSI_MUN_SPEC, PSI_NMU_SPEC
-    from gw.ppm_tau_kernel import (_get_sigma_kij_kernel, prepare_sigma_subtile,
-                                  sigma_kconv_tables, sigma_pass_price, _sigma_subtile_operand_program)
+    from gw.ppm_tau_kernel import (_get_sigma_kij_kernel,
+                                  sigma_kconv_tables, sigma_pass_price)
+    from gw.subtile_stream import prepare_green_operands, green_operand_program
     from gw.greens_function_kernel import (build_G_parents, green_right_operand,
                                            face_green_product)
     from distrib_la import gemm_plan
@@ -74,10 +75,10 @@ def main():
             receipts.append(dict(layout=chosen, passes=sigma_pass_price(kernel)['passes'],
                                  temp=ex.memory_analysis().temp_size_in_bytes))
             return ex, [ex], sigma_pass_price(kernel)['scratch']
-        chosen, prepared, ex = prepare_sigma_subtile(faces, mesh, build, _force_layout=layout)
+        chosen, prepared, ex = prepare_green_operands(faces, mesh, build, label="Sigma", _force_layout=layout)
         programs[layout] = ex
         from runtime.aot_memory import compiled_new_bytes
-        place = _sigma_subtile_operand_program(mesh, layout).lower(*faces).compile()
+        place = green_operand_program(mesh, layout).lower(*faces).compile()
         stats = place.memory_analysis()
         needs[layout] = max(compiled_new_bytes(place),
                             int(stats.output_size_in_bytes-stats.alias_size_in_bytes)
@@ -93,10 +94,10 @@ def main():
     forced_room = (needs['face'] + needs['axis']) // 2
     real_room = memory.room
     try:
-        memory.room = lambda: forced_room
+        memory.room = lambda **_: forced_room
         def bounded(layout, abstract):
             return programs[layout], [programs[layout]], sigma_pass_price(kernel)['scratch']
-        chosen, prepared, ex = prepare_sigma_subtile(faces, mesh, bounded)
+        chosen, prepared, ex = prepare_green_operands(faces, mesh, bounded, label="Sigma")
         assert chosen == 'face' and needs[chosen] <= forced_room
         bounded_value = np.asarray(process_allgather(
             ex(prepared, e, select, interaction, g_load), tiled=True))

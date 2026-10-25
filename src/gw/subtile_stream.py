@@ -43,6 +43,7 @@ is the same node at τ = 0 with the static interaction in place of W(τ).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import jax
 import jax.numpy as jnp
@@ -259,6 +260,18 @@ def window_green_rows(rows, mesh, s=None, R=None):
     return jnp.transpose(rows, (0, 2, 1, 3))
 
 
+def _window_table(windows):
+    """Keep the tiny pass schedule opaque before any counter-indexed read.
+
+    XLA's GPU small-loop transform otherwise tries to evaluate the inner
+    scalar barrier while specializing a constant schedule (JAX 0.12), which
+    its HloEvaluator refuses. The outer barrier keeps that table a runtime
+    value; the inner read barrier still protects the R82 read ordering.
+    The table has only three int32 entries per row pass, never matrix data.
+    """
+    return jax.lax.optimization_barrier(jnp.asarray(np.asarray(windows, np.int32)))
+
+
 def scan_passes(windows, step, carry):
     """``carry = step(s, lo, hi, carry)`` over every window (:func:`plan_windows`) in one ``lax.scan``.
 
@@ -266,7 +279,7 @@ def scan_passes(windows, step, carry):
     is one body whatever the pass count, and one window's temporaries are live
     at a time.
     """
-    table = jnp.asarray(np.asarray(windows, np.int32))
+    table = _window_table(windows)
 
     def body(c, w):
         # Read behind a barrier: a counter-indexed slice must not be
@@ -298,6 +311,95 @@ def projection_complete(psi_left, psi_right, mesh):
     left = jax.lax.with_sharding_constraint(psi_left, NamedSharding(mesh, P(None, None, None, "x")))
     right = jax.lax.with_sharding_constraint(psi_right, NamedSharding(mesh, P(None, None, "y", None)))
     return left, right
+
+
+@lru_cache(maxsize=None)
+def green_operand_program(mesh, sum_layout):
+    """Place the newly owned Green/projection operands once per dispatch.
+
+    Input Green faces are ``(parent, spin, μ, band)`` and
+    ``(parent, band, spin, ν)``. Axis outputs have every band local: left
+    μ-major (:func:`green_rows`), right conjugated and merged as the Green
+    product reads it. Face consumers borrow both canonical Green faces;
+    they form the right contraction's conjugation/layout inside their own
+    program, so its workspace is neither copied nor retained by placement.
+    Optional projection faces use :func:`projection_complete` in either layout.
+    The cache holds programs and geometry, never ψ values.
+    """
+    from .greens_function_kernel import green_right_operand
+    if sum_layout not in ("axis", "face"):
+        raise ValueError(f"Green sum-band layout must be face or axis, got {sum_layout!r}")
+
+    @jax.jit
+    def place(left, right, *projection):
+        if len(projection) not in (0, 2):
+            raise ValueError("Green placement needs zero or two projection faces")
+        tail = projection_complete(*projection, mesh) if projection else ()
+        if sum_layout == "face":
+            return tail
+        left, right = band_complete(left, right, mesh)
+        left = green_rows(left, mesh)
+        return left, green_right_operand(right), *tail
+    return place
+
+
+def _with_borrowed_green_faces(layout, operands, placed):
+    """Complete the consumer bundle without dispatching/copying borrowed faces."""
+    return (*operands[:2], *placed) if layout == "face" else placed
+
+
+def prepare_green_operands(operands, mesh, build, *, label, compile_only=False,
+                           _force_layout=None):
+    """Choose and admit a shared Green layout from placement and consumer AOT.
+
+    ``operands`` are two canonical Green faces, optionally followed by two
+    projection faces. ``build(layout, abstract)`` returns the consumer context,
+    compiled consumer programs and their native scratch bytes. Only the chosen
+    placement executes; ``compile_only`` compiles/admit-checks without making ψ
+    banks. The context must contain programs/geometry, never operand values.
+    """
+    from common.gpu_utils import device_budget_bytes
+    from common.log import get_logger
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+
+    device_budget_bytes()
+    layouts = ("axis", "face") if _force_layout is None else (_force_layout,)
+    candidates = []
+    for layout in layouts:
+        placement = green_operand_program(mesh, layout).lower(*operands).compile()
+        place_new = -agreed_chunk(-compiled_new_bytes(placement))
+        # The programs do not key on room; no rounding is needed for this choice.
+        # room() already agrees the minimum across ranks.
+        room = memory.room(bucketed=False)
+        if layout == "axis" and place_new > room and _force_layout is None:
+            continue
+        placed_abstract = jax.tree.map(
+            lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=a.sharding),
+            placement.out_info)
+        source_abstract = jax.tree.map(
+            lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=a.sharding), operands)
+        abstract = _with_borrowed_green_faces(layout, source_abstract, placed_abstract)
+        context, programs, native = build(layout, abstract)
+        consumer_new = max(compiled_new_bytes(p, extra=native) for p in programs)
+        stats = placement.memory_analysis()
+        retained = max(0, int(stats.output_size_in_bytes) - int(stats.alias_size_in_bytes))
+        needed = -agreed_chunk(-max(place_new, retained + consumer_new))
+        price = memory.priced(0, f"{label} {layout} sum-band placement + compiled window",
+                              spread=needed * mesh.size, ranks=mesh.size)
+        candidates.append((layout, price, placement, context))
+        if needed <= memory.room(bucketed=False):
+            break
+    chosen = memory.admit(f"{label} sum-band operands", [(c[0], c[1]) for c in candidates],
+                          memory.room(bucketed=False))
+    layout, _, placement, context = next(c for c in candidates if c[0] == chosen)
+    if compile_only:
+        return layout, None, context
+    get_logger(__name__).info(f"{label} summed bands: {layout} layout")
+    prepared = _with_borrowed_green_faces(layout, operands, placement(*operands))
+    # Placement scratch must be gone before the consumer's scratch is needed.
+    jax.block_until_ready(prepared)
+    return layout, prepared, context
 
 
 def segment_blocks(plan, p, cols):
@@ -364,7 +466,7 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows, prepare, only
     live_outputs = jnp.max(jnp.where(jnp.any(weights != 0, axis=(0, 2)),
                                      jnp.arange(1, n_out + 1, dtype=jnp.int32), 0)).astype(jnp.int32)
     spec_c = P(None, None, "x", "y")
-    table = jnp.asarray(np.asarray(plan.windows, np.int32))
+    table = _window_table(plan.windows)
 
     def window_body(acc, window, segment):
         blocks = segment_blocks(plan, 0, 0)[0] if segment else plan.blocks

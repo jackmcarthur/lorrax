@@ -444,7 +444,8 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         def _parent_sigma(wfns, weights, interaction, prefactor, g_load):
             """One admitted static node, sharing the dynamic sum-band layout chooser."""
             from .wavefunction_bundle import parent_sigma_operands
-            from .ppm_tau_kernel import prepare_sigma_subtile, sigma_pass_price
+            from .ppm_tau_kernel import sigma_pass_price
+            from .subtile_stream import prepare_green_operands
             g_mun, g_nmu, proj_nmu, proj_mun, _, _ = parent_sigma_operands(wfns)
             faces = (g_mun, g_nmu, *_windowed(proj_nmu, proj_mun))
 
@@ -470,7 +471,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
                 compiled = node.lower(prepared, weights, interaction, g_load).compile()
                 return compiled, [compiled], native
 
-            _, prepared, compiled = prepare_sigma_subtile(faces, mesh_xy, build)
+            _, prepared, compiled = prepare_green_operands(faces, mesh_xy, build, label="Sigma")
             return prefactor * compiled(prepared, weights, interaction, g_load)
 
         def _with_tables(op):

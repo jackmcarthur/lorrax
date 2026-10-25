@@ -478,45 +478,24 @@ def fit_gn_ppm_from_wc_pair(
     _fit_bytes = _gn_ppm_fit_bytes_per_q(kernel, Wc0_qmunu, Wc_probe_qmunu, *_kargs)
     _free = _gn_ppm_fit_free_bytes(_nq, *_fit_bytes)
     _qb = _gn_ppm_fit_q_block(_nq, *_fit_bytes, _free)
+    # Price and execute this exact output-carry program, beside the resident
+    # supports. The point-kernel estimate above only proposes its fixed block.
+    from common.gpu_utils import device_budget_bytes
     from lxkit import memory
-    memory.book(memory.priced(_qb * _fit_bytes[0] + 2 * _nq * _fit_bytes[1],
-                              f"GN-PPM fit, q block {_qb}/{_nq}", increment=True))
-
-    # The anti-Hermitian half of the probe, kept only on the ordered path
-    # (one extra (nq, mu, nu) c128 tile, needed again after the tail policy
-    # has fixed the final Omega).
-    a_odd = None
-    _om, _bv, _gd, _aod = [], [], [], []
-    n_good = jnp.asarray(0.0, dtype=jnp.float64)
-    n_modes = jnp.asarray(0.0, dtype=jnp.float64)
-    omega_min = jnp.asarray(jnp.inf, dtype=jnp.float64)
-    omega_max = jnp.asarray(-jnp.inf, dtype=jnp.float64)
-    pair_rel_min = jnp.asarray(jnp.inf, dtype=jnp.float64)
-    for _q0 in range(0, _nq, _qb):
-        _q1 = min(_q0 + _qb, _nq)
-        _blk = ((Wc0_qmunu, Wc_probe_qmunu) if _qb >= _nq else
-                (Wc0_qmunu[_q0:_q1], Wc_probe_qmunu[_q0:_q1]))
-        (_o, _b, _g, _ng, _nm, _omin, _omax, _rmin, *_a) = kernel(*_blk, *_kargs)
-        if ordered:
-            _aod.append(_a[0])
-        _om.append(_o); _bv.append(_b); _gd.append(_g)
-        # Exact integer counts -> summation order is irrelevant.  Each row
-        # counts once per full-zone q of its star (1 on a full-zone fit).
-        _w = _star[_q0:_q1]
-        if np.all(_w == 1):
-            n_good = n_good + _ng
-            n_modes = n_modes + _nm
-        else:
-            n_good = n_good + _star_weighted_count(_g, jnp.asarray(_w, jnp.float64))
-            n_modes = n_modes + (_nm / float(_q1 - _q0)) * float(_w.sum())
-        omega_min = jnp.minimum(omega_min, _omin)
-        omega_max = jnp.maximum(omega_max, _omax)
-        pair_rel_min = jnp.minimum(pair_rel_min, _rmin)
-    cat = lambda xs: xs[0] if len(xs) == 1 else jnp.concatenate(xs, axis=0)
-    omega_vals, B_vals, good = cat(_om), cat(_bv), cat(_gd)
-    if ordered:
-        a_odd = cat(_aod)
-    del _om, _bv, _gd, _aod
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    args = (Wc0_qmunu, Wc_probe_qmunu, _z, _fb, _mask,
+            jnp.asarray(_star, dtype=jnp.int64))
+    program = _gn_ppm_fit_blocks.lower(
+        *args, q_block=_qb, n_log=n_log, ordered=ordered, xy_mesh=xy_mesh).compile()
+    device_budget_bytes()
+    need = -agreed_chunk(-compiled_new_bytes(program))
+    room = agreed_chunk(int(memory.room()))
+    ranks = int(jax.device_count())
+    memory.admit("GN-PPM fit q windows", memory.priced(
+        0, f"GN-PPM compiled output carry, q block {_qb}/{_nq}",
+        spread=need * ranks, ranks=ranks), room)
+    (omega_vals, B_vals, good, a_odd, n_good, n_modes,
+     omega_min, omega_max, pair_rel_min) = program(*args)
 
     fulfilled = n_good / jnp.maximum(n_modes, 1.0)
     # Every host transfer in the fit is a scalar and deliberately outside
@@ -642,9 +621,8 @@ def _gn_ppm_fit_bytes_per_q(kernel, Wc0, Wprobe, *args) -> tuple[int, int]:
 
     ``block_bytes`` is what a q block holds while it runs (its sliced inputs,
     its temp arena and its outputs), from the kernel compiled at q = 1 on the
-    inputs' own sharding; ``output_bytes`` the (q, mu, nu) outputs that stay
-    live until the blocks are concatenated, on the inputs' LOCAL tile (the
-    outputs keep the input layout).  Once per (kernel, tile, layout).
+    inputs' own sharding; ``output_bytes`` the (q, mu, nu) output carry, on the inputs' LOCAL tile (the outputs keep the
+    input layout).  Once per (kernel, tile, layout).
     """
     def one_q(x):
         return jax.ShapeDtypeStruct((1,) + tuple(x.shape[1:]), x.dtype,
@@ -667,13 +645,13 @@ def _gn_ppm_fit_bytes_per_q(kernel, Wc0, Wprobe, *args) -> tuple[int, int]:
 
 def _gn_ppm_fit_free_bytes(nq: int, block_bytes_per_q: int, out_bytes_per_q: int) -> int:
     """The room the fit's q blocks may claim: the fixed tile (``runtime.tiles``),
-    or one q when one q is larger, beside the ``2·nq`` q of outputs every block
-    keeps live, from the shapes alone.
+    or one q when one q is larger, beside the ``nq`` output carry,
+    from the shapes alone.
 
     ``LORRAX_PPM_FIT_ARENA_GIB`` caps it further (a resource cap).
     """
     from runtime.tiles import TILE_BYTES
-    free = max(TILE_BYTES, int(block_bytes_per_q)) + 2 * int(nq) * int(out_bytes_per_q)
+    free = max(TILE_BYTES, int(block_bytes_per_q)) + int(nq) * int(out_bytes_per_q)
     env = os.environ.get("LORRAX_PPM_FIT_ARENA_GIB", "").strip()
     if env:
         from common.collectives import all_gather_processes
@@ -686,15 +664,15 @@ def _gn_ppm_fit_q_block(nq: int, block_bytes_per_q: int, out_bytes_per_q: int,
                         free_bytes: int) -> int:
     """Largest q block that fits ``free_bytes``, cap ``nq``; one q (with a warning) below that.
 
-    Every block's outputs stay live until the concatenation, which writes
-    them once more, so ``2·nq·out`` is reserved before the block is priced.
+    One full output carry is retained; only one block's sliced inputs,
+    outputs and temporaries are new beside it.
     """
-    room = int(free_bytes) - 2 * int(nq) * int(out_bytes_per_q)
+    room = int(free_bytes) - int(nq) * int(out_bytes_per_q)
     qb = room // max(1, int(block_bytes_per_q))
     if qb < 1:
         from lxkit import memory
         memory.admit("GN-PPM fit q block",
-                     memory.priced(int(block_bytes_per_q) + 2 * int(nq) * int(out_bytes_per_q),
+                     memory.priced(int(block_bytes_per_q) + int(nq) * int(out_bytes_per_q),
                                    "closed form"), free_bytes)
     return max(1, min(int(nq), int(qb)))
 
@@ -1044,6 +1022,47 @@ def _gn_ppm_fit_kernel_ordered(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback,
         omega_vals, B_vals, good, n_good, n_modes,
         omega_min, omega_max, pair_rel_min, anti,
     )
+
+
+@partial(jax.jit, static_argnames=("q_block", "n_log", "ordered", "xy_mesh"))
+def _gn_ppm_fit_blocks(Wc0, Wprobe, z, fallback, mu_active_mask, stars,
+                       *, q_block, n_log, ordered, xy_mesh):
+    """Fit fixed-size q windows into one sharded output carry, with no concat.
+
+    Inputs and field outputs are ``(q, mu, nu)`` in Ry, on the input's
+    centroid face. Only one q block's point-kernel work exists beside the
+    final fields. A final overlapping window avoids padding the full inputs;
+    its repeated rows are identical and excluded from the weighted census.
+    """
+    nq, qb = int(Wc0.shape[0]), int(q_block)
+    fields = (jnp.zeros_like(Wc0, dtype=jnp.float64),
+              jnp.zeros_like(Wc0, dtype=jnp.complex128),
+              jnp.zeros_like(Wc0, dtype=bool),
+              jnp.zeros_like(Wc0, dtype=jnp.complex128) if ordered else None)
+    scalars = (jnp.float64(0), jnp.float64(0), jnp.float64(jnp.inf),
+               jnp.float64(-jnp.inf), jnp.float64(jnp.inf))
+    kernel = _gn_ppm_fit_kernel_ordered if ordered else _gn_ppm_fit_kernel
+    args = (z, fallback, n_log, mu_active_mask) + ((xy_mesh,) if ordered else ())
+
+    def step(carry, i):
+        start = jax.lax.optimization_barrier(jnp.minimum(i * qb, nq - qb))
+        new = i * qb - start
+        take = lambda x: jax.lax.dynamic_slice_in_dim(x, start, qb, axis=0)
+        o, b, g, _, nm, omin, omax, rmin, *a = kernel(take(Wc0), take(Wprobe), *args)
+        out = (o, b, g, a[0] if ordered else None)
+        updated = tuple(None if x is None else jax.lax.dynamic_update_slice_in_dim(
+            old, x, start, axis=0) for old, x in zip(carry[:4], out))
+        weight = jnp.where(jnp.arange(qb) >= new, take(stars), 0)
+        ng = _star_weighted_count(g, weight)
+        modes = (nm / qb) * jnp.sum(weight, dtype=jnp.int64).astype(jnp.float64)
+        prev = carry[4:]
+        return (*updated, prev[0] + ng, prev[1] + modes,
+                jnp.minimum(prev[2], omin), jnp.maximum(prev[3], omax),
+                jnp.minimum(prev[4], rmin)), None
+
+    result, _ = jax.lax.scan(step, (*fields, *scalars),
+                             jnp.arange(-(-nq // qb), dtype=jnp.int32), unroll=1)
+    return result
 
 
 @jax.jit

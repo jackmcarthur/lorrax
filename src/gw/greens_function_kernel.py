@@ -514,28 +514,6 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
         conjugate=conjugate)
 
 
-# ---------------------------------------------------------------------------
-# Output x blocks.  Σ = Σ_μ ψ*(μ) [G ⋆ W](μ, ν) ψ(ν) is linear in the output's
-# μ rows, so a Σ consumer whose output tile would not fit stores and projects
-# it in x blocks (mathdx mode 7's stored x block, every spin), each pass
-# reading only its own pairs' Green and W; the Green itself stays whole at the
-# parents.  ``d`` sizes the blocks: (ns/d)² of them, each ~(d/ns)² of the
-# tile, laid on the face projector's slab pieces
-# (``common.contract_bands.face_row_blocks``), so their projections move and
-# multiply what the whole tile's does.  (Output spin blocks of the same size
-# re-read the whole Green per block: the spin action mixes every source of a
-# pair.)
-# ---------------------------------------------------------------------------
-
-def sigma_row_blocks(*, n_rmu, ns, d, mesh):
-    """The x blocks ``(x0, bx, xs, xn)`` of a parent-row Σ tile stored at block size ``d`` (``None``: one whole tile at ``d = ns``)."""
-    if int(d) == int(ns):
-        return (None,)
-    from common.contract_bands import face_row_blocks
-    mx = int(n_rmu) // int(mesh.shape['x'])
-    return face_row_blocks(mx, int(mesh.shape['y']), (int(ns) // int(d)) ** 2)
-
-
 def _green_terms(*, n_parent, n_rmu, ns, n_band, mesh, n_right=None):
     """(T_p, M_axis): one parent Green tile ``16·n_parent·ns²·μ·ν/P``, and one Green build's
     two live SUMMA panels of both ψ orientations, at most ``N_b/p_x`` bands each,
@@ -547,49 +525,6 @@ def _green_terms(*, n_parent, n_rmu, ns, n_band, mesh, n_right=None):
     panels = (32.0 * int(n_parent) * int(ns) * (int(n_band) / px)
               * (int(n_rmu) / px + nu / py))
     return tile, panels
-
-
-def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles, kgrid,
-                     plan=None):
-    """The block size ``d`` (a divisor of ``ns``): a parent-row Σ convolution stores its output in (ns/d)² x blocks.
-
-    New per rank beside what is live: the parent Green ``T_p``, ``partner_tiles`` more of
-    it (1 when the antiunitary partner is its own GEMM, 0 when it is read as conj(G)),
-    the widest stored x block ``T_p·xn·bx/μ_x`` (``(d/ns)²`` of it up to a row per slab
-    piece, :func:`sigma_row_blocks`), the full-k W(τ) out of the k-convolution
-    ``16·N_k·μ²/P``, the panels of the Green and partner builds ``2·M_axis`` and mode 7's
-    run-time scratch for that block (:func:`sigma_kconv_scratch`).  The
-    stored x block is the tiled part: the largest ``d`` whose block fits the fixed tile
-    (``runtime.tiles.TILE_BYTES``) wins, else 1, so every process computes the same
-    ``d`` from the shapes alone.  ``plan`` (a dict) receives ``d``, the pass's new
-    bytes, its scratch and the tile, for the compiled check of the window executable
-    (``gw.mpa.sigma.SynthesisTau.admit``).
-    """
-    if int(ns) <= 1:
-        return 1
-    tile, panels = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=n_band,
-                                mesh=mesh)
-    w_tau = 16.0 * int(n_full) * int(n_rmu) ** 2 / (int(mesh.shape['x']) * int(mesh.shape['y']))
-    from runtime.tiles import TILE_BYTES
-    mx = int(n_rmu) // int(mesh.shape['x'])
-
-    def rows(d):
-        b = sigma_row_blocks(n_rmu=n_rmu, ns=ns, d=d, mesh=mesh)[0]
-        return mx if b is None else b[1] * b[3]
-    scratch = lambda d: sigma_kconv_scratch(kgrid=kgrid, ns=ns, rows=rows(d), mesh=mesh,
-                                            n_right=int(n_rmu) // int(mesh.shape['y']))
-    new = lambda d: ((1.0 + float(partner_tiles) + rows(d) / mx) * tile + w_tau
-                     + (1.0 + float(partner_tiles)) * panels + scratch(d))
-    divisors = sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True)
-    d = next((d for d in divisors if rows(d) / mx * tile <= TILE_BYTES), 1)
-    from lxkit import memory
-    memory.book(memory.priced(new(d),
-                              f"Sigma tau, sigma_spin_block d={d}/{int(ns)}", increment=True),
-                stage="sigma.tau_sweep")
-    if plan is not None:
-        plan.update(d=int(d), ns=int(ns), new=float(new(d)), scratch=int(scratch(d)),
-                    tile=float(TILE_BYTES))
-    return d
 
 
 def chi0_kconv_scratch(*, kgrid, n_parent, n_rmu, ns, mesh, n_right=None):
@@ -612,23 +547,3 @@ def sigma_kconv_scratch(*, kgrid, ns, rows, n_right, mesh):
     if F.kconv_backend(mesh, kgrid) != "mathdx":
         return 0
     return F.klead_unfold_scratch_bytes(kgrid, ns, int(rows) * int(n_right))
-
-
-def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner, kgrid):
-    """Record the price of one fused chi0 node (``w_isdf._get_chi_minimax_kernel_fused``).
-
-    New per rank beside what is live: the valence and conduction parent Greens
-    ``2·(1 + partner)·T_p`` (``partner`` when an antiunitary row reads a conjugate-face
-    tile), the accumulator ``16·n_out·N_k·μ²/P``, the builds' panels
-    ``2·(1 + partner)·M_axis`` (:func:`_green_terms`) and mode 11's run-time scratch
-    (:func:`chi0_kconv_scratch`).  Nothing here is chunked: every term is a whole (μ, ν)
-    tile, and ``distrib_la.panel_matmul`` bounds the panels itself.
-    """
-    tile, panels = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=n_band,
-                                mesh=mesh)
-    acc = 16.0 * int(n_out) * int(n_full) * int(n_rmu) ** 2 / (
-        int(mesh.shape['x']) * int(mesh.shape['y']))
-    from lxkit import memory
-    new = (2.0 * (1.0 + float(bool(partner))) * (tile + panels) + acc
-           + chi0_kconv_scratch(kgrid=kgrid, n_parent=n_parent, n_rmu=n_rmu, ns=ns, mesh=mesh))
-    memory.book(memory.priced(new, "chi0 node, price_chi0_node", increment=True), stage="chi.exec")

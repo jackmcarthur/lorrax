@@ -25,8 +25,8 @@ Placement.  The stored tiles are committed device arrays from the restart
 reader (``V_q0`` from ``read_interaction``; the ``(μ, ν, nkx, nky, nkz)``
 tensor at ``P('x','y',None,None,None)``), so ``jax.device_put`` onto
 ``P('x','y')`` is a reshard with no host copy and no equality all-gather.
-The refit tiles are host arrays, identical on every rank, and go through
-``device_put_process_local``.
+The refit tiles arrive directly on the same device face from the producer's
+G-panel Coulomb Gram; no zeta or Coulomb matrix is gathered to a host.
 """
 from __future__ import annotations
 
@@ -35,7 +35,6 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from common.collectives import device_put_process_local
 from common.log import get_logger
 
 log = get_logger(__name__)
@@ -64,14 +63,6 @@ def _tile_index(q_tile, kgrid):
     """Grid index of a tile momentum on the exchange-tile grid."""
     return tuple(int(i) for i in
                  np.round(q_tile * kgrid).astype(int) % kgrid)
-
-
-def _host_tile(V_np, n_rmu, n_rmu_pad, grid_xy):
-    """A replicated host tile, Hermitised on the logical block and placed."""
-    V_pad = np.zeros((n_rmu_pad, n_rmu_pad), dtype=np.complex128)
-    V_pad[:n_rmu, :n_rmu] = 0.5 * (V_np[:n_rmu, :n_rmu]
-                                   + V_np[:n_rmu, :n_rmu].conj().T)
-    return device_put_process_local(V_pad, grid_xy)
 
 
 def exchange_tiles(Qpath, *, route, mesh_xy, V_q0, V_ongrid, kgrid_vq,
@@ -113,9 +104,9 @@ def exchange_tiles(Qpath, *, route, mesh_xy, V_q0, V_ongrid, kgrid_vq,
                 jax.device_put(V_ongrid[:, :, ix, iy, iz], grid_xy)))
         elif route == "refit":
             zx_fit, rst = refit
-            V_rows.append(_host_tile(
+            V_rows.append(_hermitize(
                 vq_interp.refit_vq(zx_fit, rst, q_tile_np, mesh_xy,
-                                   log_fn=log_fn), n_rmu, n_rmu_pad, grid_xy))
+                                   log_fn=log_fn, n_mu_out=n_rmu_pad)))
         else:
             zx, prep, eval_vq, pinvF, coeffs_packed = interp
             q_tile = jnp.asarray(q_tile_np)
@@ -141,8 +132,9 @@ def exchange_tiles(Qpath, *, route, mesh_xy, V_q0, V_ongrid, kgrid_vq,
     # --vq-mode=both spot checks: the refit ground truth at both_idx.
     for iQ in both_idx:
         zx, rst = both_refit
-        V_np = vq_interp.refit_vq(zx, rst, exchange_tile_momentum(Qpath[iQ]), mesh_xy)
-        V_rows.append(_host_tile(V_np, n_rmu, n_rmu_pad, grid_xy))
+        V = vq_interp.refit_vq(zx, rst, exchange_tile_momentum(Qpath[iQ]), mesh_xy,
+                              n_mu_out=n_rmu_pad)
+        V_rows.append(_hermitize(V))
     V_stack = jax.device_put(jnp.stack(V_rows),
                              NamedSharding(mesh_xy, P(None, "x", "y")))
     M_stack = None

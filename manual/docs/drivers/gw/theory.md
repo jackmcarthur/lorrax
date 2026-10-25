@@ -133,7 +133,7 @@ $$
 
 One LU per $\bq$ and $z$. `linalg = local` (default) solves whole matrices per rank when they fit the device budget and otherwise falls back to the block-distributed solve that `linalg = distributed` always uses ([Parallel algorithms §5.1](../../theory/parallel-algorithms.md#par-dense-dyson)). The static $W_\bq(0)$ is written to the ISDF tensor file for the BSE.
 
-Under `screening_diagrams = w_bse` or `w_rpa_resolvent`, $W$ comes instead from the resolvent identity $W_\bq(z)-V_\bq=V_\bq\chi_\bq(z)V_\bq$ with the particle–hole Hamiltonian $H^\mathrm{RPA}$ (bubbles only) or $H^\mathrm{BSE}$ (plus the statically screened ladder), solved by GMRES at each $z$ (§[2.6](#scr-resolvent)). `w_bse` runs one-shot under COHSEX, GN-PPM and the [tangential model](../../theory/tangential-w.md); `w_rpa_resolvent` under COHSEX and GN-PPM only ([`screening_diagrams`](keywords.md#screening_diagrams)).
+Under `screening_diagrams = w_bse` or `w_rpa_resolvent`, $W$ comes instead from the resolvent identity $W_\bq(z)-V_\bq=V_\bq\chi_\bq(z)V_\bq$ with the particle–hole Hamiltonian $H^\mathrm{RPA}$ (bubbles only) or $H^\mathrm{BSE}$ (plus the statically screened ladder), solved by GMRES at each $z$ (§[2.6](#scr-resolvent)). `w_bse` runs one-shot under COHSEX and GN-PPM (and [one other W model](../../theory/multipole-w.md#sigma)); `w_rpa_resolvent` under COHSEX and GN-PPM only ([`screening_diagrams`](keywords.md#screening_diagrams)).
 
 <figure class="flowchart" markdown>
 [![Screening by the resolvent identity](../../assets/figures/g13.png)](../../assets/figures/g13.png)
@@ -387,7 +387,7 @@ $$
 \chi_{00}(\bq,z)=q_a\,S_{ab}(z)\,q_b+O(q^3) \tag{4.3}
 $$
 
-$S_{ab}$ comes from the velocity matrix elements $\langle m\bk|\hat{\mathbf v}_a|n\bk\rangle$ in `dipole.h5`. Cell averages give $V^\mathrm{head}$ and $W^\mathrm{head}(z)$, which enter $\Sigma^x$, COHSEX and, as a closed-form band-diagonal pole sum, $\Sigma^c$. `head_correction = full` (the default) also folds the RPA wings and body. The ladder route supplies an already microscopic-reducible tensor and restores only its omitted macroscopic channel; its [scalar head](../../theory/ladder-w.md#head) uses the matching Hamiltonian without a second RPA fold. Under QSGW, `sc_head_update` sets how the head follows each map. Detail: [the q → 0 head](../../theory/q0-head.md).
+$S_{ab}$ comes from the velocity matrix elements $\langle m\bk|\hat{\mathbf v}_a|n\bk\rangle$ in `dipole.h5`. Cell averages give $V^\mathrm{head}$ and $W^\mathrm{head}(z)$, which enter $\Sigma^x$, COHSEX and, as a closed-form band-diagonal pole sum, $\Sigma^c$. `head_correction = full` (the default) also folds the wings and the body. Under QSGW, `sc_head_update` sets how the head follows each map. Detail: [the q → 0 head](../../theory/q0-head.md).
 
 ### <span class="n">4.4</span> Band extrapolation {: #qp-bx }
 

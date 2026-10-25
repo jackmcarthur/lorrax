@@ -1754,7 +1754,7 @@ def _compute_ppm_sigma(
         h_transverse, head_resolver, input_dir, iteration_head, mesh_xy, meta, mode,
         occupation_state, omit_v_h, photon_head_sigma_basis, photon_head_sigma_diag,
         print_fn, quad, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns,
-        write_sigma_omega_h5):
+        write_sigma_omega_h5, *, consume_screening=False):
     """Produce the two-point plasmon-pole Sigma result."""
     from .ppm_pipeline import compute_ppm_sigma_pipeline
     if bool(getattr(config, "restart", False)):
@@ -1776,6 +1776,7 @@ def _compute_ppm_sigma(
             f"compute_sigma_xc: PPM mode {mode!r} requires "
             f"W_by_role['probe'] (set by screening_requests_for).")
     ppm_outputs = compute_ppm_sigma_pipeline(
+        consume_screening=consume_screening,
         wfns=wfns,
         V_q=V_q,
         W_static_q=W_static, W_probe_q=W_by_role["probe"],
@@ -1851,11 +1852,15 @@ def compute_sigma_xc(
     material_class: str,
     fixed_quadrature_session=None,
     print_fn: Callable = print,
+    consume_screening: bool = False,
 ) -> SigmaResult:
     """Produce Sigma and Hartree fields; see docs/theory/bispinor-gw.md#dyson.
 
     ``photon_response`` is consumed: its packed V and W are deleted once the
-    static channels have read them.
+    static channels have read them. ``consume_screening`` additionally
+    transfers fresh one-shot PPM supports after persistence/static readers;
+    callers must not read those buffers afterward. V remains borrowed and
+    window-source observers disable this transfer.
     """
     from .cohsex_sigma import compute_cohsex_sigma, compute_sigma_x
     from .ppm_pipeline import compute_ppm_sigma_pipeline
@@ -1895,7 +1900,8 @@ def compute_sigma_xc(
         V_q, W_by_role, W_static, band_slices, config, e_qp_ev, fixed_quadrature_session,
         h_transverse, head_resolver, input_dir, iteration_head, mesh_xy, meta, mode,
         occupation_state, omit_v_h, photon_head_sigma_basis, photon_head_sigma_diag, print_fn,
-        quad, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns, write_sigma_omega_h5)
+        quad, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns, write_sigma_omega_h5,
+        consume_screening=consume_screening)
 
 
 __all__ = [

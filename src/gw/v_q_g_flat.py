@@ -33,7 +33,7 @@ full-zone literal G=0.  The V_q output sharding ``P(None, 'x', 'y')`` matches.
 """
 from __future__ import annotations
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -242,6 +242,100 @@ def _make_q_tile_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
 # Small shared helpers (used by both the charge wrapper and the bispinor
 # tile loop in gw.v_q_bispinor)
 # ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=None)
+def _gflat_gram_program(mesh_xy, n_mu, n_g, n_logical, n_out, g_chunk):
+    """The producer's one-q Coulomb Gram, including new carries and padding."""
+    z_sh = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+    v_sh = NamedSharding(mesh_xy, P())
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
+    out_sh = NamedSharding(mesh_xy, P('x', 'y'))
+    kernel = _make_q_tile_kernel(mesh_xy, n_mu, n_mu, n_g, g_chunk, 1,
+                                 write_g0=False, same_zeta=True)
+
+    @partial(jax.jit, in_shardings=(z_sh, v_sh), out_shardings=out_sh)
+    def gram(zeta, weights):
+        # Mask at the padded input extent: slicing first to an odd logical
+        # extent would destroy divisibility of the distributed mu axis.
+        zeta = jnp.where(jnp.arange(n_mu)[None, :, None] < n_logical, zeta, 0)
+        carry = jnp.zeros((1, n_mu, n_mu), jnp.complex128, device=face)
+        g0 = jnp.zeros((1, n_mu), jnp.complex128, device=g0_sh)
+        value, _ = kernel(carry, g0, zeta, zeta, weights[None, :], jnp.int32(0))
+        value = value[0]
+        # Both source and target are legal carriers. Never stage through
+        # the potentially unshardable n_logical by n_logical matrix.
+        if n_out < n_mu:
+            value = value[:n_out, :n_out]
+        elif n_out > n_mu:
+            value = jnp.pad(value, ((0, n_out-n_mu), (0, n_out-n_mu)))
+        return jax.lax.with_sharding_constraint(value, out_sh)
+    return gram
+
+
+def coulomb_gram_gflat(zeta_G, v, *, mesh_xy, n_mu_logical,
+                       n_mu_out=None, g_chunk=None):
+    """Contract the producer's Coulomb Gram directly to a distributed face.
+
+    Parameters
+    ----------
+    zeta_G : jax.Array
+        Complex128 ``(1, mu_pad, n_G)`` at ``P(None, ('x','y'), None)``.
+        Padding rows are masked before contraction; the input is borrowed.
+    v : array_like
+        ``(n_G,)`` Coulomb weights in the producer's units. Every G column,
+        including G=0, contributes; ``write_g0=False`` suppresses only the
+        separate head-vector output, not its weighted Gram contribution.
+    mesh_xy : jax.sharding.Mesh
+        The existing two-axis process mesh.
+    n_mu_logical : int
+        Physical centroid count, no larger than either carrier.
+    n_mu_out : int, optional
+        Output carrier divisible by both mesh axes. Defaults to ``mu_pad``.
+    g_chunk : int, optional
+        The producer's existing G-panel width; by default its fixed-tile plan.
+
+    Returns
+    -------
+    jax.Array
+        Complex128 ``(n_mu_out, n_mu_out)`` at ``P('x','y')``. No zeta or
+        Coulomb matrix is copied to a host. New carries, tail masking and
+        carrier conversion are inside the executable priced before running.
+    """
+    from common.collectives import device_put_process_local
+    from common.gpu_utils import device_budget_bytes
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+
+    z_sh = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+    if (not isinstance(zeta_G, jax.Array) or zeta_G.ndim != 3
+            or zeta_G.shape[0] != 1 or zeta_G.dtype != jnp.complex128
+            or not zeta_G.sharding.is_equivalent_to(z_sh, 3)):
+        raise ValueError('Coulomb Gram requires complex128 (1, mu_pad, n_G)')
+    n_mu, n_g = map(int, zeta_G.shape[1:])
+    logical = int(n_mu_logical)
+    out = n_mu if n_mu_out is None else int(n_mu_out)
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+    if (n_g < 1 or n_mu % (px*py) or out % px or out % py
+            or not 1 <= logical <= min(n_mu, out)):
+        raise ValueError('Coulomb Gram logical/input/output extents do not fit the mesh')
+    if np.shape(v) != (n_g,):
+        raise ValueError('Coulomb weights must match the stored G sphere')
+    device_budget_bytes()
+    weights = device_put_process_local(v, NamedSharding(mesh_xy, P())).astype(jnp.complex128)
+    _, panel, _ = _plan_vq_tiles(n_q=1, n_rmu_L=n_mu, n_rmu_R=n_mu,
+        ngkmax=n_g, same_zeta=True, n_sub=0, mesh_xy=mesh_xy,
+        g_chunk=g_chunk, budget_bytes=None)
+    program = _gflat_gram_program(mesh_xy, n_mu, n_g, logical, out, panel)
+    executable = program.lower(zeta_G, weights).compile()
+    # Carries are created inside gram, so the compiled figure includes them.
+    # The panel GEMM is XLA-managed; there is no external native scratch here.
+    needed = -agreed_chunk(-compiled_new_bytes(executable))
+    memory.admit('Coulomb G-flat Gram', (('producer G panels', memory.priced(
+        0, 'compiled producer G-flat Gram', spread=needed*int(mesh_xy.size),
+        ranks=int(mesh_xy.size))),), memory.room(bucketed=False))
+    return executable(zeta_G, weights)
+
 
 def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
                         context="V_q / W q-grid reduction",

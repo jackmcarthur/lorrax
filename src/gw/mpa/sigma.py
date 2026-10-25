@@ -1400,8 +1400,7 @@ class SynthesisTau:
         from gw.ppm_tau_kernel import sigma_pass_price
         plan = sigma_pass_price(self._spatial)
         if plan is not None:
-            # The priced pass (sigma_spin_block's x blocks, or the sub-tile
-            # kernel's row passes), from the window executable
+            # The priced row passes, from the window executable
             # (runtime.aot_memory): its new bytes beside the synthesis's resident
             # operands plus the synthesis GEMM's native workspace.
             from lxkit import memory
@@ -1463,6 +1462,22 @@ def _window_selector(shape, weighted):
     return jax.jit(select)
 
 
+def _pack_pole_fields(basis, Omega, B, B_odd, *, consume=False):
+    """Canonical pole fields to this run's packed centroid face.
+
+    ``consume`` is a final-read handoff after the source census; store and
+    borrowed/multi-read inputs keep their buffers. Scalar MPA poles stay
+    scalar, while elementwise GN poles follow the residue permutation.
+    """
+    mu = int(basis.n_canonical)
+    B = basis.pack_operator(B, consume=consume)
+    if B_odd is not None:
+        B_odd = basis.pack_operator(B_odd, consume=consume)
+    if Omega.ndim >= 2 and tuple(Omega.shape[-2:]) == (mu, mu):
+        Omega = basis.pack_operator(Omega, consume=consume)
+    return Omega, B, B_odd
+
+
 def _integrate_sigma_batches(
     wfns,
     batches,
@@ -1484,6 +1499,7 @@ def _integrate_sigma_batches(
     keep_branches=False,
     matrix_counts=None,
     print_fn,
+    consume_poles=False,
 ):
     """One spatial executor for streamed fit slabs: one executable per window.
 
@@ -1497,7 +1513,8 @@ def _integrate_sigma_batches(
     ``q_wedge``: the slabs are on the q wedge (GN-PPM, owner 2026-09-25);
     W(τ) is built on the wedge and read by the Sigma convolution through the
     wedge's unfold tables (mathdx mode 9), whose device tables ride the
-    residue argument.
+    residue argument. A full-zone scalar source uses the identity table of
+    the same row owner; this changes neither source storage nor its read.
 
     ``request`` (``gw.ppm_sigma.OnShellRequest``): the sweep folds the on-shell
     pair and diagonal slots (``gw.ppm_accumulators``) at its energies; its
@@ -1541,14 +1558,24 @@ def _integrate_sigma_batches(
             psi_proj_xr, sigma_axis, axis=1)
         psi_proj_yn = pad_to_axis(
             psi_proj_yn, sigma_axis, axis=3)
-        scalar_subtile = (tau_kernel_factory is None and (synthesis or q_wedge is not None))
+        if tau_kernel_factory is None and not synthesis and q_wedge is None:
+            # Full-zone scalar residues use the same bounded row owner as
+            # an irreducible wedge. This is metadata for an identity load,
+            # not another W tensor; source reads and the canonical->packed
+            # I/O seam remain with their existing owners.
+            from symmetry_maps import QirrOperator
+            n_mu = int(face_kwargs["face_shape"][2])
+            n_q = int(np.prod((meta.nkx, meta.nky, meta.nkz)))
+            q_wedge = dataclasses.replace(QirrOperator.whole_zone(
+                jax.ShapeDtypeStruct((n_q, n_mu, n_mu), jnp.complex128)), values=None)
+        scalar_subtile = tau_kernel_factory is None
         subtile_faces = ((psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn)
                          if scalar_subtile else None)
         if synthesis and tau_kernel_factory is not None:
             # Photon sectors retain their own existing axis-layout contract.
-            from gw.ppm_tau_kernel import sigma_subtile_operands
-            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn = sigma_subtile_operands(
-                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, mesh_xy=mesh_xy)
+            from gw.subtile_stream import green_operand_program
+            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn = green_operand_program(mesh_xy, "axis")(
+                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn)
         spatial_shape = (
             int(k_unfold_plan.n_parent), sigma_axis.carrier, sigma_axis.carrier)
         face_kwargs["face_band_extent"] = sigma_axis.carrier
@@ -1626,12 +1653,10 @@ def _integrate_sigma_batches(
 
         if tau_kernel_factory is not None:
             tau_kernel = tau_kernel_factory(w_synthesis, sigma_axis)
-        elif scalar_subtile:
+        else:
             # The first window prices its complete executable at abstract
             # placement outputs before any full summed-band axis bank exists.
             tau_kernel = None
-        else:
-            tau_kernel = scalar_tau("axis", subtile_faces)
         # The residues' carrier on the wedge: the pair-transpose tables with
         # their device load, placed once per run (see ppm_tau_kernel).
         q_pair = (None if q_wedge is None else dataclasses.replace(
@@ -1689,13 +1714,8 @@ def _integrate_sigma_batches(
             # field once per batch at this read seam.  GN-PPM's pole frequency
             # is per (q, mu, nu) and follows the residues; MPA's scalar poles
             # are left alone.
-            _basis = meta.mu_basis
-            _mu_can = int(_basis.n_canonical)
-            B = _basis.pack_operator(B)
-            if B_odd is not None:
-                B_odd = _basis.pack_operator(B_odd)
-            if Omega.ndim >= 2 and tuple(Omega.shape[-2:]) == (_mu_can, _mu_can):
-                Omega = _basis.pack_operator(Omega)
+            Omega, B, B_odd = _pack_pole_fields(
+                meta.mu_basis, Omega, B, B_odd, consume=consume_poles)
         if B_odd is not None:
             max_b = max(max_b, float(jax.device_get(jnp.max(jnp.abs(B)))))
             max_d = max(
@@ -1763,7 +1783,8 @@ def _integrate_sigma_batches(
                             pole_indices, bounds, phase_real, e_ref_a, e_ref_b, g_load)
 
                 if scalar_subtile and tau_kernel is None:
-                    from gw.ppm_tau_kernel import prepare_sigma_subtile, sigma_pass_price
+                    from gw.ppm_tau_kernel import sigma_pass_price
+                    from gw.subtile_stream import prepare_green_operands
 
                     def build(sum_layout, prepared):
                         kernel = scalar_tau(sum_layout, prepared)
@@ -1793,7 +1814,8 @@ def _integrate_sigma_batches(
                             native = int((sigma_pass_price(kernel) or {}).get("scratch", 0))
                         return kernel, compiled, native
 
-                    _, prepared, tau_kernel = prepare_sigma_subtile(subtile_faces, mesh_xy, build)
+                    _, prepared, tau_kernel = prepare_green_operands(
+                        subtile_faces, mesh_xy, build, label="Sigma")
                     psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn = prepared
                     if synthesis:
                         tau_kernel._right = (psi_coh_yr, psi_proj_yn)
@@ -1853,6 +1875,7 @@ def _integrate_sigma_batches(
                         "  MPA Sigma sweep begin: one executable per window "
                         "prewarmed")
                     sweep_started = True
+                    del programs
             if synthesis:
                 # One executable per window: the node loop runs on device.
                 total = target.run_window(
@@ -1873,6 +1896,11 @@ def _integrate_sigma_batches(
             progress.step(wait=total, count=n_nodes)
             n_tau += n_nodes
             n_sweeps += 1
+            # Compile-only argument lists/defaults must not pin an old ordered
+            # residue branch into the next window's allocation.
+            del compile_window, tau_arguments
+            if not synthesis:
+                del B_branch
         del B, B_odd, Omega
         gc.collect()
     progress.finish()
@@ -2158,12 +2186,13 @@ def _attach_ordered_odd_sigma(total, even):
 
 
 @lru_cache(maxsize=8)
-def _logical_mu_fn(sharding, n_mu):
+def _logical_mu_fn(sharding, n_mu, consume=False):
     """Zero both trailing (mu, nu) axes past the logical extent, in place of layout."""
     def keep(x):
         live = jnp.arange(x.shape[-1]) < n_mu
         return jnp.where(live[:, None] & live[None, :], x, jnp.zeros((), x.dtype))
-    return jax.jit(keep, out_shardings=sharding)
+    return jax.jit(keep, out_shardings=sharding,
+                   donate_argnums=(0,) if consume else ())
 
 
 class MemoryPoleSource:
@@ -2174,7 +2203,8 @@ class MemoryPoleSource:
     zeroed once here; that is what the store round trip gave, since the
     store keeps only the logical extent and its reads zero-fill the padding.
     Batches are device slices of the resident fields.  Nothing is gathered,
-    copied to host, or written.
+    copied to host, or written. ``consume=True`` transfers the input buffers
+    to the pad-safe fields; callers must not read them afterward.
 
     ``axis``: a ``runtime.padding.PaddedAxis`` naming the operator extent
     when it is not the centroid axis -- the plane-wave response sphere
@@ -2187,7 +2217,7 @@ class MemoryPoleSource:
     """
 
     def __init__(self, Omega_p, B_p, B_odd_p=None, *, n_mu_logical=None, mesh_xy,
-                 provenance, q_wedge=None, axis=None):
+                 provenance, q_wedge=None, axis=None, consume=False):
         from runtime.padding import padded_mu_extent
         shape = tuple(int(n) for n in Omega_p.shape)
         n_mu = int(axis.logical if n_mu_logical is None else n_mu_logical)
@@ -2203,9 +2233,19 @@ class MemoryPoleSource:
                 f"MemoryPoleSource: mu extent {shape[2:]} is not the store's "
                 f"read extent ({n_pad}, {n_pad}) for n_mu = {n_mu}")
         keep = _logical_mu_fn(
-            NamedSharding(mesh_xy, P(None, None, "x", "y")), n_mu)
-        self.Omega, self.B = keep(Omega_p), keep(B_p)
-        self.B_odd = None if B_odd_p is None else keep(B_odd_p)
+            NamedSharding(mesh_xy, P(None, None, "x", "y")), n_mu, consume)
+        def field(a):
+            if a is None:
+                return None
+            out = keep(a)
+            if consume:
+                out.block_until_ready()
+                if not a.is_deleted():
+                    a.delete()
+            return out
+        self.Omega = field(Omega_p)
+        self.B = field(B_p)
+        self.B_odd = field(B_odd_p)
         from file_io.mpa_store import refuse_bad_pole_fields
         refuse_bad_pole_fields(
             self.Omega, self.B, self.B_odd, where="MemoryPoleSource")
@@ -2264,6 +2304,7 @@ def integrate_sigma_store(
     keep_branches=False,
     matrix_counts=None,
     print_fn=print,
+    consume_source=False,
 ):
     """Read, unfold, consume, and release one pole range at a time.
 
@@ -2286,6 +2327,11 @@ def integrate_sigma_store(
     plane-wave path's ``get_shared_sigma_tau_kernel(_sigma_kij=...)``); see
     :func:`_integrate_sigma_batches`, which also owns ``keep_branches``.
     """
+    if consume_source and (not isinstance(fit_src, MemoryPoleSource)
+                           or int(n_poles) != 1 or fit_src.n_poles != 1):
+        raise ValueError("GATE sigma_source_final_read: consumed source must be a "
+                         "fresh single-pole MemoryPoleSource; keep consume_source=False "
+                         "for stores or multiple reads")
     batch_size = _bounded_pole_batch_size(pole_batch_size)
 
     q_wedge = getattr(fit_src, "q_wedge", None)
@@ -2308,7 +2354,7 @@ def integrate_sigma_store(
             q_wedge=q_wedge, tau_capacity=tau_capacity,
             tau_kernel_factory=tau_kernel_factory, omega_grid_ry=omega_grid_ry,
             keep_branches=keep_branches, matrix_counts=matrix_counts,
-            print_fn=print_fn)
+            print_fn=print_fn, consume_poles=consume_source)
 
     if isinstance(fit_src, (PoleReader, MemoryPoleSource)):
         return run(fit_src)
@@ -2428,6 +2474,7 @@ def compute_sigma_c_mpa_omega_grid(
     linalg=None,
     keep_branches=False,
     print_fn=print,
+    consume_source=False,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
 
@@ -2435,6 +2482,10 @@ def compute_sigma_c_mpa_omega_grid(
     per-frequency broadening and window labels (``sigma_box_plan.plan_sigma_windows``).
     ``linalg``: the deck's resolved dense layout, which places a tangential
     model's W(τ) synthesis (:func:`_tangential_memory_schedule`).
+    ``consume_source=True`` permits the fresh one-pole in-memory source's
+    FINAL read to transfer its canonical fields into the packed executor,
+    after the census/plan. It requires ``odd_reference=False``; borrowed,
+    stored and multi-read sources keep False.
     ``request`` (``gw.ppm_sigma.OnShellRequest``): where Sigma_c is evaluated;
     the windows are planned on its ``frequencies_ry`` (on which
     ``omega_eta_ry``/``omega_group`` are labelled).  ``omega_grid_ry`` in its
@@ -2472,6 +2523,11 @@ def compute_sigma_c_mpa_omega_grid(
     """
     if sigma_w_model not in ("mpa", "tangential"):
         raise ValueError(f"sigma_w_model must be mpa or tangential; got {sigma_w_model!r}")
+    if consume_source and (not isinstance(fit_src, MemoryPoleSource)
+                           or fit_src.n_poles != 1 or odd_reference):
+        raise ValueError("GATE sigma_source_final_read: want a fresh single-pole "
+                         "MemoryPoleSource and odd_reference=False; keep "
+                         "consume_source=False for borrowed or repeated reads")
     if (request is None) == (omega_grid_ry is None):
         raise ValueError("compute_sigma_c_mpa_omega_grid: pass request (on shell) or "
                          "omega_grid_ry (the grid), not both")
@@ -2735,7 +2791,7 @@ def compute_sigma_c_mpa_omega_grid(
                     tau_capacity=geometry.get("sc_tau_capacity"),
                     tau_kernel_factory=tau_kernel_factory, omega_grid_ry=grid_ry,
                     keep_branches=keep_branches, matrix_counts=band_matrix_counts,
-                    print_fn=print_fn)
+                    print_fn=print_fn, consume_source=consume_source)
         # odd_reference=False: the caller builds its own D=0 reference (the GN
         # arm does, in ppm_pipeline), so a second twin here would be a whole
         # extra sweep whose sigma_c_odd_kij nobody reads.

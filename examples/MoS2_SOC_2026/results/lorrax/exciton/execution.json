@@ -1,0 +1,60 @@
+{
+  "status": "PASS",
+  "source_sha256": "c3f84941700745451dee3f14bae71a99ea54d14b1a94f24793b7a20f5bb4ff3f",
+  "continuum_sha256": "4f73f80094230398f5102bbaa0637b44e435225f5e35878569bb7cef3056bd10",
+  "genuine_distinct_computed_Q": 37,
+  "roots_per_Q": 128,
+  "expected_Q_max_abs_error": 4.761904762173863e-07,
+  "expected_reciprocal_distance_max_abs_error": 4.993814122500329e-07,
+  "largest_Q_step_angstrom_inverse": 0.04685195182196466,
+  "ongrid_exchange_certificate": "# refit-cert: CERTIFIED visualization grade: worst max|dE_S| 0.03911 meV against the 1 meV visualization gate, contracted on-grid gate (refit route vs stored V_qmunu route) over 1 Q",
+  "lowest_energy_ev": 2.348434,
+  "visible_root_count_range_below_3ev": [
+    26,
+    75
+  ],
+  "continuum_reached_Q_count": 27,
+  "root128_minus_continuum_mev_range": [
+    -182.64342599999983,
+    258.3702490000004
+  ],
+  "displayed_max_energy_ev": 3.0,
+  "spline_used": false,
+  "coordinates_checked_against_QE_real_cell": true,
+  "numerical_source_commit": "0c93540d95541b85aa18d07aef0c87d097e52450",
+  "canonical_deck_sha256": "b9c26c49ff8f448dbbba64282946d1cd4c3966b674c7130c9d0afdc40f382188",
+  "elapsed_seconds": 1451.13,
+  "elapsed_human": "24 min 11 s",
+  "GPU_configuration": "4 x NVIDIA A100-SXM4-80GB",
+  "largest_reported_stage_device_peak_gb_per_rank": 9.23,
+  "host_peak_gb_per_rank": 2.56,
+  "solver_residual_budget_mev": 0.25,
+  "near_Gamma_detail": {
+    "ordered_levels": [
+      3,
+      4
+    ],
+    "reference": "Each level minus its own Gamma energy",
+    "unit": "meV",
+    "computed_points": 11,
+    "max_Q_angstrom_inverse": 0.10561868
+  },
+  "artifacts": {
+    "exciton_bands.dat": "c3f84941700745451dee3f14bae71a99ea54d14b1a94f24793b7a20f5bb4ff3f",
+    "exciton_bands_continuum.dat": "4f73f80094230398f5102bbaa0637b44e435225f5e35878569bb7cef3056bd10"
+  },
+  "integration_grid": [
+    18,
+    18,
+    1
+  ],
+  "comparison_to_k24": {
+    "lowest8_max_ordered_shift_mev": 30.313,
+    "continuum_threshold_shift_mev": [
+      -12.4,
+      44.32
+    ],
+    "converged": false
+  },
+  "solver_convergence": "All 37 path solves and finite-K certificate converged within the stated residual budget."
+}

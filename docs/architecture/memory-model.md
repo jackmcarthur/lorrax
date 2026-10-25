@@ -125,9 +125,12 @@ are `(name, Price)` pairs, fastest first; a `Price` has four per-rank terms,
 its provenance. The fastest route that fits its room runs. When none fits, the
 cheapest runs: within the physical limit (room + reserve) with one warning; over
 it with a banner at plan time and again when the stage opens, giving the terms,
-the shortfall and `memory.sizing()`'s `minimum to complete: P = N (X nodes of …)`,
-the smallest square mesh in whole nodes at which every admitted stage's best route
-fits (or `no P suffices`, naming the term no mesh divides). A route that opens
+the shortfall and `memory.sizing()`'s `estimated minimum from this memory quote: P = N`,
+the smallest square mesh at which the current modeled stage quotes fit. This
+is a planning estimate, not a measured capacity limit: a quote may cover a
+checked retry that the run does not execute, and its scaling model is not a
+fresh compilation at every candidate mesh. If no square mesh up to P = 4096
+fits the model, the report says so and names the quoted binding stage. A route that opens
 a provider context under `linalg = local` carries it as its `outside` term
 (`memory.contexts()`). Every decision prints once on rank 0 (`route <site>: <route>
 (<prices>)`) and the run report's Routes table lists each with its count.
@@ -493,21 +496,33 @@ moves; its transient is `M_axis` at the projected band count.
 
 ## The Green-side stages
 
-χ₀ and Σ(τ) read the parent Greens `T_p = 16·n_par·n_s²·μ²/P` through the
-fused k-convolution, which unfolds them on its load, so no full-k Green
-exists. A Green of real weights (real node times) reads its antiunitary
+χ₀ and Σ(τ) read parent Greens through the fused k-convolution, which
+unfolds them on its load, so no full-k Green exists. Both use orbit-closed
+centroid-row windows; one window's parent Green is
+`T_R = 16·n_par·n_s²·R·ν`, with `ν = μ/P_y` and `R` local rows.
+A Green of real weights (real node times) reads its antiunitary
 partner as `conj(G)` on the load; complex times build a conjugate-face
 partner tile (`partner = 1`). Each Green build adds its two live SUMMA
 panels `M_panel` ([§ ψ carriers](#psi-carriers)). New bytes per
 rank beside what is live:
 
 ```text
-χ₀ node   = 2·(1 + partner)·(T_p + M_panel) + 16·n_out·N_k·μ²/P + S_11   nothing chunks
+χ₀ carry  = 16·n_out·N_k·μ²/P
+χ₀ window = 2·(1 + partner)·T_R + 2·16·n_out·N_k·R·ν + ψ rows/panels + S_11
 Σ(τ) row  = 16·[(2 + partner)·n_par·n_s²·ν + N_k·ν + 2·n_q,irr·ν + n_par·n_s·(N_b + 2·N_bΣ)]
 Σ(τ) pass = R·(Σ(τ) row) + ψ + S_7
 ```
 
-`S_11` is mode 11's split-arm scratch, at most one `T_p`
+The ordinary static/GN minimax response keeps its original τ scan inside
+each row window, then performs one forward χ transform after that τ sum.
+It retains the same nodes, weights, edge references, spin trace and q
+completion. The full χ carry remains distributed over every rank; it does
+not retain whole-parent Gv/Gc matrices. The right ψ operand is prepared once
+per call. The executable's actual additional XLA bytes and queried provider
+scratch are admitted beside the live operands and placed unfold tables.
+Row sizes follow the fixed 1 GiB tile, including for small one-window cases.
+
+`S_11` is mode 11's split-arm scratch, at most one `T_R`
 (`greens_function_kernel.chi0_kconv_scratch`); it is 0 on the single pass.
 `S_7` is mode 7's, `min(R·ν, ⌊1 GiB / s⌋)` pairs of `s` B, at most 1 GiB, with
 `s = 16·N_k·n_s²` plus `16·N_k` (the chunk's pair-major `W_R`) on the m7s arm (n_s = 2
@@ -516,23 +531,43 @@ where one padded column fits a block: 14³–21³ on an A100)
 handler rounds an m7s chunk down to whole waves, so the price is its upper bound there); it is 0
 on the single arm (bulk grids below about 14³ at n_s = 1 or 2).
 
-The q-wedge Σ(τ) kernel (`ppm_tau_kernel._sigma_subtile_kernel`) runs each
+The scalar Σ(τ) kernel (`ppm_tau_kernel._sigma_subtile_kernel`) runs each
 rank's tile in row passes of whole centroid orbits (`gw.subtile_stream`):
 `Σ(τ) row` is one local μ row's live set (`ν = μ/P_y`: the parent Green and
 its partner, mode 7's output, `W_prep`, the pass's rows of `W` and its
 partner on the q parents, the pass's ψ rows), and a pass holds the most rows
-whose bytes fit the fixed tile. The scalar q-wedge Σ prices its operand
-placement and complete first window before allocating band-complete ψ. If
-that live set fits, the incumbent axis route keeps its local Green GEMMs.
-Otherwise the summed-band ψ stays on its canonical 2D faces and each row pass
-uses the shared bounded SUMMA Green product; its conjugated, merged right
-operand is formed once on the same 2D face. These sum operands scale as
-`32·n_par·n_s·N_b·μ/P`, beside the original faces. The small QP projector
-still uses its axis carriers, `16·n_par·n_s·N_bΣ·(μ/P_x + μ/P_y)`.
-Admission uses the largest compiled new-byte figure over ranks, plus retained
-placement outputs and native convolution scratch, against current room before
-placement runs. Static SX/COH uses the same choice and scalar node. Photon
-Σ sectors retain their existing contracts.
+whose bytes fit the fixed tile. The ordinary minimax χ and scalar Σ share
+`subtile_stream.green_operand_program` and `prepare_green_operands`. They price
+operand placement and the complete consumer before allocating band-complete ψ.
+If that live set fits, the axis layout gathers each sum band once and keeps
+local Green GEMMs inside every row/node scan. Otherwise the summed-band ψ stays
+on its canonical 2D faces and each row pass uses the shared bounded SUMMA Green
+product. The axis layout forms its conjugated, merged right operand once
+outside all row and node loops. The face layout borrows both canonical
+Green faces directly; its compiled consumer includes any right
+conjugation/layout workspace, without retaining a separately prepared
+whole-wavefunction copy beside every convolution. The two axis banks occupy
+`32·n_par·n_s·N_b·μ/sqrt(P)` bytes beside the original ψ owners. FACE retains
+no additional full Green banks. Σ additionally places its small QP projector on
+axis carriers, `16·n_par·n_s·N_bΣ·(μ/P_x + μ/P_y)`.
+
+Admission uses the largest compiled new-byte figure over ranks: the maximum
+of placement's new bytes and its retained outputs plus the consumer's new
+bytes and queried native convolution scratch, against current room. Placement
+finishes before the consumer starts, so their scratch does not overlap.
+Compile-only calls compile and price these same programs without allocating
+prepared ψ banks; the caches retain programs/geometry, not ψ payloads. Static
+SX/COH uses the same choice and scalar node. Full-zone scalar pole sources
+use the identity q-load of this row owner; their source storage, read and
+canonical-to-packed conversion stay unchanged. Photon Σ sectors retain their
+existing contracts.
+
+These layout selectors use the exact minimum room over ranks. Neither
+program cache keys on room, so rounding it to whole GiB can reject a fitting
+axis layout without saving compilations. The global bucket policy remains
+with the planners whose programs do depend on their bucketed room. Each
+room query already performs its process agreement; compiled prices still
+use a separate maximum agreement.
 
 The charge direct and four-current response row streams use the same choice
 inside `response_bank._compiled`: compile the complete incumbent stream
@@ -547,17 +582,27 @@ group and streamed-bank segment admits its own actual executable; carry
 donation and device/host/file bank residence are unchanged. The minimum face
 route retains `memory.admit`'s existing warn-and-run policy if even it is over
 room. This is a layout choice, not a quadrature or band-window approximation.
-No full-tile Green or `W_prep`
-exists. `sigma_spin_block` (the output spin block `d`, a divisor of `n_s`,
-whose stored x block fits the fixed tile) still sizes the full-zone Σ kernels
-and the static (COHSEX) and PPM spatial kernels.
+Full-zone scalar pole sources use an identity q-load table and the same row
+owner; their file format does not select a whole-Green fallback. An
+indivisible centroid orbit can require the whole local input window. Native
+CUDA and ROCm k-box mode 7 use the fixed tile geometry to store and project
+large outputs in smaller x blocks, retaining the input Green and `W_prep`
+once and reducing the accumulated projection once. CPU, reference and ROCm
+fallback convolutions form the full output before cropping, so they keep one
+output call. Static (COHSEX), resident-pole and shared-pole scalar Σ retain
+every spin component in each input window and stored block.
 
 **Row passes run as one scan.** The passes of the Σ τ node, the static
 τ = 0 node, the sector node and the charge and four-current χ streams are
 equal windows of `R` rows (`subtile_stream.plan_windows`, through
 `plan_passes` on the χ streams): `R` is the orbit-aligned row count nearest
 the fixed tile, and every window ends on an admissible orbit cut. The
-windows run as one `lax.scan` (`scan_passes`, `stream_passes`). Each slices
+windows run as one `lax.scan` (`scan_passes`, `stream_passes`). The tiny
+three-int32 pass descriptors are
+barriered as a complete table before their indexed reads. This keeps the GPU
+small-loop compiler from trying to evaluate a scalar optimization barrier on
+a constant schedule; the protected read and bounded row-window lifetime stay
+the same. Each window slices
 its rows at a traced offset (`window_rows`); its unfold tables are cut from
 the tables placed once per run, on the device (`window_load`, the one
 table-cut owner); and the k-convolutions see only its live rows `[lo, hi)`
@@ -568,8 +613,10 @@ every pass, so compile time does not grow with the pass count: the static
 segment program on the charge stream and at most four on the four-current
 stream (claims 3114, 3122). A rank whose rows fit one
 tile runs one whole pass.
-`price_chi0_node` only prices the χ₀ node: a band chunk of Gv would still
-be a whole `(μ, ν)` tile. On the packed bispinor route the static photon
+The ordinary minimax χ response uses the same window and placement owners;
+its τ sum precedes the final window transform, while the direct response
+bank keeps individual node rows for its value/slope projections. On the
+packed bispinor route the static photon
 response (`V_packed`, `W_packed`, `2·16·Q·(μ + 3μ_T)²/P`) is deleted after
 the static Σ channels read it, before Hartree and the τ sweep.
 
@@ -583,7 +630,7 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | warns; one q |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | tangential screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([tangential model](tangential_model.md), byte model) | warns and admits, when a stage and its named concurrent stages exceed the budget |
-| static / GN-PPM screening | the χ₀ node ([§ Green-side](#the-green-side-stages)); the GN fit's q block (XLA's compiled footprint of one q) | `price_chi0_node` (a price, no choice); `_gn_ppm_fit_q_block`: the fixed tile, at least one q | warns; one q (only under `LORRAX_PPM_FIT_ARENA_GIB`) |
+| static / GN-PPM screening | distributed χ₀ carry and one orbit-closed parent-Green row window ([§ Green-side](#the-green-side-stages)); the GN fit's q block | `w_isdf._run_minimax_chi`: actual compiled additional bytes plus provider scratch; `_gn_ppm_fit_q_block`: the fixed tile, at least one q | warns and admits |
 | Σ(τ) sweep | the resident pole fields, band-complete ψ, then one row pass ([§ Green-side](#the-green-side-stages)) | `subtile_stream.plan_windows`: equal orbit-aligned windows, the pass count from the fixed tile and the shortest window that keeps it | — |
 | matrix-element sweep (V_H, four-current) | the step's slabs, and FFT boxes `(2 + 2·n_comp)·n_s·N_r·16` per band of a band-layout operator | `mtxel_sweep.plan_sweep`: bands in the fewest chunks whose boxes fit the fixed tile | — |
 | ψ loader off the fit plan (ζ reuse, current faces) | one band tile of G-flat rows, samples and faces | `gflat_memory_model.loader_band_chunk`: the fixed tile, at least the automatic 16 | warns; one scan row |
@@ -933,7 +980,7 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
    which names its binder, and `Resident ψ` for the GW carriers.
 4. **On a `memory over budget` warning or a `!! MEMORY: <stage> is PRICED OVER the
    allocator limit` banner**, run at
-   the banner's `minimum to complete` or with more memory per device. For the ζ fit the smallest batch keeps ψ(G)
+   the banner's estimated minimum from the memory quote or with more memory per device. For the ζ fit the smallest batch keeps ψ(G)
    resident; for V_q, more ranks, fewer centroids, or a smaller ζ sphere;
    `vq_g_chunk_size` shrinks only the panel workspace.
 5. **Compare with the run.** `gwjax.out` prints MAJOR-STAGE DEVICE AND HOST

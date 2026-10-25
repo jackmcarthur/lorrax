@@ -138,10 +138,16 @@ class DevicePencils:
                     f"pencil_shapes first.")
             self.prepare([shape])
         run = self._ready[shape].result()
-        zd, cd = jnp.asarray(zps, jnp.complex128), jnp.asarray(columns, jnp.int64)
+        # Attempts belong to individual processes after collective prepare.
+        # Eager jnp.asarray would compile a conversion only on that owner,
+        # while idle peers already wait in the rule-result gather.
+        device = jax.local_devices()[0]
+        zd = jax.device_put(np.asarray(zps, np.complex128), device)
+        cd = jax.device_put(np.asarray(columns, np.int64), device)
 
         def launch(padding, step):
-            return run(zd, cd, jnp.asarray(np.float64(padding)), jnp.asarray(np.float64(step)))
+            return run(zd, cd, jax.device_put(np.float64(padding), device),
+                       jax.device_put(np.float64(step), device))
         ahead = launch(*steps[0])
         for j in range(len(steps)):
             now, ahead = ahead, (launch(*steps[j + 1]) if j + 1 < len(steps) else None)

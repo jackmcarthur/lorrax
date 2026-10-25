@@ -210,6 +210,45 @@ spectral-bound Lanczos of FEAST and KPM on either route, Haydock, and
 The exchange runs outside the scan: a k-summed encode to
 $(n_{trials}, N_\mu)$, one product with $V_{q0}$, a broadcast decode.
 
+For a finite-Q exchange refit, `vq_interp.refit_vq` keeps the streamed
+$\zeta_Q(\mu,G)$ accumulator sharded over all ranks and contracts
+$V_{\mu\nu}=\sum_G\zeta^*_{\mu G}v_G\zeta_{\nu G}$ with the
+producer's `gw.v_q_g_flat` G-panel kernel. The result stays on the
+`P('x','y')` face; neither $\zeta$ nor $V$ is gathered to a host. Input
+centroid padding is masked before contraction and converted directly to the
+consumer's legal face carrier. New carries and padding are inside the
+executable priced before it runs. Full real-space host reconstructions are
+explicit diagnostics and refuse above the fixed tile limit.
+Fine-q htransform wavefunctions likewise retain their padded q carrier until
+the bundle epilogue: the existing batch-to-face exchanges establish the X/Y
+centroid layouts before the physical q crop. Physical target counts remain
+metadata; padding is zeroed inside projection, and returned coefficients
+use the canonical Galerkin rank carrier over all ranks. A ragged q or prime
+centroid count therefore cannot silently drop the output sharding.
+The SR/LR W model also keeps its form-factor rows on all-rank centroid
+shards. The restart reader uses SlabIO for those rows; the unchanged
+polynomial fit acts on each process's owned centroid columns, with only two
+residual norms reduced. Coarse/fine model rows return directly to the
+device and their legal W faces. Channel-pair polarizabilities and head
+parameters remain small replicated metadata.
+GW produces those same rows with the shared distributed GEMM panels.
+The Woodbury equation reduces only its small channel-pair matrix; its
+solve runs on local centroid RHS columns inside the manual shard region.
+The restart writes the canonical device row carrier through SlabIO at its
+physical centroid extent, with no full form-factor host deposit.
+
+The interpolation model uses the same distributed restart payload. After
+cleaning each coarse q block, its form factors are resharded over all ranks
+on the centroid axis. Each process fits only its owned centroid columns;
+the small polynomial normal matrices and q/G geometry are replicated.
+`device_put_process_tiles` packs the local coefficients directly onto the
+global centroid sharding used by the existing arbitrary-Q evaluator. The
+q-owned matrices use the explicit face/batch movement owner on entry and
+exit, so the compiler does not replicate a matrix stack to change layouts.
+The fit inputs are released after packing. Full host form-factor and matrix
+mirrors belong only to explicitly bounded diagnostics; an unavailable
+distributed ζ transport refuses rather than reading full q slabs per rank.
+
 **The W term** has three routes, chosen at trace time by what the device
 serves and printed once (`[bse] W term:`, `[bse] W term decode:`):
 

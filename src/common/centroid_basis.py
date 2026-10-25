@@ -19,7 +19,7 @@ needed for divisibility. No all-gather of the input carrier is used.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import jax
 import jax.numpy as jnp
@@ -231,25 +231,33 @@ class PackedCentroidBasis:
             crop_to=target))
 
     @lru_cache(maxsize=None)
-    def _operator_kernel(self, spec, unpack, q_tile_bytes=256 << 20):
+    def _operator_kernel(self, spec, unpack, q_tile_bytes=256 << 20, consume=False):
         convert = self.unpack_axis if unpack else self.pack_axis
-        @jax.jit
+        @partial(jax.jit, donate_argnums=(0,) if consume else ())
         def kernel(op):
             if (op.ndim < 3 or (len(spec) and spec[0] is not None)
                     or len(spec) < op.ndim
+                    or any(spec[i] is not None for i in range(op.ndim - 2))
                     or any(spec[op.ndim-i] is None for i in (1, 2))):
                 return convert(convert(op, -2, spec=spec), -1, spec=spec)
             from common.staged_reshard import permute_sharded_operator
+            # All batch axes are replicated here. Flatten them INSIDE this
+            # program so q tiling also bounds (pole,q,mu,nu) fields, including
+            # a singleton pole. No eager reshape copy survives the transfer.
+            prefix = tuple(op.shape[:-2])
+            field = op.reshape((int(np.prod(prefix)),) + tuple(op.shape[-2:]))
+            face = P(None, spec[op.ndim - 2], spec[op.ndim - 1])
             conversions = []
-            for axis in (op.ndim - 2, op.ndim - 1):
-                shards = self._shards(spec, axis)
+            for axis in (1, 2):
+                shards = self._shards(face, axis)
                 inverse, forward = self._maps(shards)
                 source = inverse if unpack else forward
                 common = max(self.n_canonical, self.n_packed) // shards
                 target = (self.n_canonical if unpack else self.n_packed) // shards
                 conversions.append((axis, source, common, target))
-            return permute_sharded_operator(op, conversions, self.mesh_xy, spec,
-                                             q_tile_bytes=q_tile_bytes)
+            out = permute_sharded_operator(field, conversions, self.mesh_xy, face,
+                                           q_tile_bytes=q_tile_bytes)
+            return out.reshape(prefix + tuple(out.shape[-2:]))
         return kernel
 
     def pack_axis(self, arr, axis: int, *, spec=None):
@@ -276,18 +284,37 @@ class PackedCentroidBasis:
                 f"{self.n_packed} on axis {axis}; got {arr.shape}.")
         return self._axis_kernel(axis, spec, True)(arr)
 
-    def pack_operator(self, op, *, spec=None):
-        """Both centroid axes (the last two) of a ``(..., mu, nu)`` operator."""
-        if self.is_identity:
-            return op
-        spec = self._spec(op, spec)
-        return self._operator_kernel(spec, False)(op)
+    def pack_operator(self, op, *, spec=None, consume=False):
+        """Both centroid axes of a canonical ``(..., mu, nu)`` operator.
 
-    def unpack_operator(self, op, *, spec=None):
+        ``consume`` transfers its buffer as in :meth:`unpack_operator`.
+        """
         if self.is_identity:
             return op
         spec = self._spec(op, spec)
-        return self._operator_kernel(spec, True)(op)
+        out = self._operator_kernel(spec, False, consume=consume)(op)
+        if consume:
+            out.block_until_ready()
+            if not op.is_deleted():
+                op.delete()
+        return out
+
+    def unpack_operator(self, op, *, spec=None, consume=False):
+        """Packed operator to canonical order; ``consume`` transfers its buffer.
+
+        Identity conversion returns the operand itself. Otherwise an owned
+        input is retired after the conversion, including unequal carriers
+        where XLA cannot alias the output onto it.
+        """
+        if self.is_identity:
+            return op
+        spec = self._spec(op, spec)
+        out = self._operator_kernel(spec, True, consume=consume)(op)
+        if consume:
+            out.block_until_ready()
+            if not op.is_deleted():
+                op.delete()
+        return out
 
 
 __all__ = ["PackedCentroidBasis"]

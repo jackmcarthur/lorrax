@@ -999,9 +999,10 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
         eps_cQ:      (nQ, nk, nc_pad) — pad bands at +PAD_EPS_GUARD_RY
     """
     n_rmu_src = int(bundle.psi_rmu_Y.shape[-1])
-    if n_rmu_src != int(n_rmu):
+    n_rmu_logical = int(getattr(bundle, "n_mu_logical", n_rmu_src))
+    if n_rmu_logical != int(n_rmu):
         raise ValueError(
-            f"exciton_bands: the htransform fitted psi at {n_rmu_src} "
+            f"exciton_bands: the htransform fitted psi at {n_rmu_logical} "
             f"centroid point(s), but the restart bundle stores mu={n_rmu}.  "
               f"The conduction "
               f"caches would be contracted against a W and V in a different "
@@ -1010,8 +1011,8 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
               f"from (a downfolded bundle records the parent's path in its "
               f"downfold_provenance group).")
 
-    shape = (nQ, nk, n_cond, int(bundle.psi_rmu_Y.shape[2]), n_rmu)
-    if n_cond_pad < n_cond or n_rmu_pad < n_rmu:
+    shape = (nQ, nk, n_cond, int(bundle.psi_rmu_Y.shape[2]), n_rmu_src)
+    if n_cond_pad < n_cond or n_rmu_pad < n_rmu_src:
         raise ValueError("conduction stack padding cannot shrink bands or centroids")
     program = _conduction_stack_program(mesh_xy, shape, (n_cond_pad, n_rmu_pad))
     psi, eps = bundle.psi_rmu_Y, bundle.enk_full
@@ -1967,7 +1968,8 @@ def main(argv=None):
             mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
             batch_size=int(params.get("wfn_fi_q_chunk", 0)),
             use_low_mem_eigh=_use_low_mem_eigh, log_fn=log,
-            htransform_quality_record_fn=_path_quality_records.append)
+            htransform_quality_record_fn=_path_quality_records.append,
+            n_mu_out=n_rmu_pad)
         if len(_path_quality_records) != 1:
             raise RuntimeError(
                 "exciton_bands htransform returned "
@@ -2103,7 +2105,8 @@ def main(argv=None):
                 zx = vq_interp.read_vq_payload(restart_file, zeta_path,
                                                 mesh=mesh_xy, log_fn=log, input_file=args.input,
                                                 require_slab=False,
-                                                require_full_bz_zeta=False)
+                                                require_full_bz_zeta=False,
+                                                include_interactions=False)
                 prep = eval_vq = pinvF = coeffs_packed = None
                 if head_mbz:
                     raise SystemExit(

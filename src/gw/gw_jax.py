@@ -992,6 +992,7 @@ def _run_oneshot_sigma(
                 stages.open(3, "Self-energy", name="gw_jax.sigma")) as _stage:
             sigma_result = compute_sigma_xc(
                 mode,
+                consume_screening=True,
                 wfns=wfns_sigma, V_q=V_q, W_by_role=W_by_role,
                 e_qp_ev=np.asarray(enk_dft, dtype=np.float64) * RYD_TO_EV,
                 static_head_terms=static_head_terms,

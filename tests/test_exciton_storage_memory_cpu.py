@@ -99,8 +99,10 @@ def _compiled_stack_controls():
             values = values + 1j*(values[::-1] + .25)
             energies = np.arange(3*4*nc, dtype=np.float64).reshape(12, nc)
             yspec = fit_sharding(mesh, P(None, None, None, "y"), (12, nc, ns, mu))
-            y = jax.device_put(values.reshape(12, nc, ns, mu), yspec)
-            eps = jax.device_put(energies, rep)
+            # The consuming owner receives device-owned buffers. CPU device_put
+            # may otherwise borrow aligned NumPy storage and prevent donation.
+            y = jax.device_put(values.reshape(12, nc, ns, mu), yspec).copy()
+            eps = jax.device_put(energies, rep).copy()
             # P1 explicitly exercises X/Y sharing one underlying allocation.
             tx = y if p == 1 else jax.device_put(values.reshape(12, nc, ns, mu).transpose(0, 3, 1, 2),
                    fit_sharding(mesh, P(None, "x", None, None), (12, mu, nc, ns)))
@@ -142,6 +144,21 @@ def _compiled_stack_controls():
                                 memory={key: int(getattr(memory, key)) for key in
                                         ("argument_size_in_bytes", "output_size_in_bytes",
                                          "temp_size_in_bytes", "alias_size_in_bytes")}))
+        # A padded htransform result names its physical centroid count.
+        # Preserve that authority while consuming its already-legal carrier.
+        logical, carried = 13, (13 if p == 1 else 16)
+        values = np.arange(3*3*2*carried).reshape(3, 3, 2, carried).astype(complex)
+        values[..., logical:] = 0
+        y = jax.device_put(values, fit_sharding(
+            mesh, P(None, None, None, "y"), values.shape))
+        energies = jax.device_put(np.arange(9.).reshape(3, 3), rep)
+        bundle = SimpleNamespace(psi_rmu_Y=y, psi_rmuT_X=None, enk_full=energies,
+                                 n_mu_logical=logical, n_mu_carrier=carried)
+        actual = namespace["build_conduction_stacks"](
+            bundle, 1, 3, 3, 4, logical, carried, mesh)
+        wanted = np.pad(values[None], ((0, 0), (0, 0), (0, 1), (0, 0), (0, 0)))
+        np.testing.assert_array_equal(actual[0], wanted)
+        np.testing.assert_array_equal(actual[1], wanted)
         # A wrong basis must refuse before taking ownership of the buffers.
         bundle = SimpleNamespace(psi_rmu_Y=np.zeros((12, 4, 2, 7)),
                                  psi_rmuT_X=object(), enk_full=np.zeros((12, 4)))

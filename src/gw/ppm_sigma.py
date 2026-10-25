@@ -797,7 +797,6 @@ def ppm_fermi_frame(enk_full, occ_full):
     return jnp.where(jnp.any(~occ_mask), 0.5 * (vbm + cbm), vbm)
 
 
-@jax.jit
 def _prepare_sigma_state(
     enk_full: jax.Array,
     occ_full: jax.Array,
@@ -856,6 +855,37 @@ def _prepare_sigma_state(
     )
 
 
+@lru_cache(maxsize=2)
+def _sigma_state_program(consume):
+    # The same state equations; a fresh owner's Omega/valid buffers become
+    # the derived Omega/mask fields instead of surviving beside them.
+    return jax.jit(_prepare_sigma_state, donate_argnums=(3, 4) if consume else ())
+
+
+@lru_cache(maxsize=2)
+def _support_correlation_program(consume):
+    """Wc = W - V, transferring an owned screened support when requested."""
+    return jax.jit(lambda w, v: w - v, donate_argnums=(0,) if consume else ())
+
+
+def _require_owned_ppm_supports(W0, Wprobe, V):
+    """Refuse aliased owned supports before they can invalidate borrowed V."""
+    from common.collectives import all_gather_processes
+
+    def spans(a):
+        return [(s.device, int(s.data.unsafe_buffer_pointer()),
+                 int(s.data.on_device_size_in_bytes())) for s in a.addressable_shards]
+
+    fields = tuple(spans(a) for a in (W0, Wprobe, V))
+    overlap = any(d == e and x < y + m and y < x + n
+                  for i, j in ((0, 1), (0, 2), (1, 2))
+                  for d, x, n in fields[i] for e, y, m in fields[j])
+    if np.any(all_gather_processes(np.asarray(overlap, dtype=np.int32))):
+        raise ValueError("GATE ppm_support_ownership: consumed W0/Wprobe overlap each "
+                         "other or borrowed V; want independently owned screened "
+                         "supports; fix: keep consume_supports=False for borrowed inputs")
+
+
 # ---------------------------------------------------------------------------
 #  PPM construction
 # ---------------------------------------------------------------------------
@@ -899,6 +929,7 @@ def fit_ppm(
     q_star=None,
     q_partner=None,
     q_wedge=None,
+    consume_supports: bool = False,
 ) -> PPMBuildResult:
     """Fit two-point PPM pole parameters from precomputed W(0) and W(probe).
 
@@ -912,6 +943,8 @@ def fit_ppm(
 
     All input arrays are flat-q (nq, μ, μ).  Returns PPMBuildResult with
     B_q, Omega_q, valid_mask_q sharded as P(None, 'x', 'y').
+    ``consume_supports=True`` transfers disjoint W0/Wprobe buffers into Wc;
+    they must not be read afterward. V remains borrowed.
 
     ``n_mu_logical`` (REQUIRED, = ``meta.n_rmu``): logical centroid
     count.  The fitted tensors keep the padded extent, but pad modes are
@@ -931,8 +964,19 @@ def fit_ppm(
     z = complex(probe_omega)
     t0 = _t.perf_counter()
 
-    Wc0_q = W0_q - V_q
-    Wci_q = Wprobe_q - V_q
+    # The diagnostic reads the original probe before an owned fit transfers it.
+    probe_hermiticity_residual = (float(jax.device_get(
+        _probe_antihermitian_residual(Wprobe_q))) if ordered_orientations else None)
+    if consume_supports:
+        _require_owned_ppm_supports(W0_q, Wprobe_q, V_q)
+    subtract = _support_correlation_program(bool(consume_supports))
+    Wc0_q = subtract(W0_q, V_q)
+    Wci_q = subtract(Wprobe_q, V_q)
+    if consume_supports:
+        jax.block_until_ready((Wc0_q, Wci_q))
+        for field in (W0_q, Wprobe_q):
+            if not field.is_deleted():
+                field.delete()
     fit = fit_gn_ppm_from_wc_pair(
          Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
          n_mu_logical=int(n_mu_logical),
@@ -958,14 +1002,11 @@ def fit_ppm(
     Wc0_q = ensure_sharding(Wc0_q, q_shard)
     t1 = _t.perf_counter()
 
-    probe_hermiticity_residual = None
     odd_even_residue_ratio = None
     if B_odd is not None:
         d_max = float(jax.device_get(jnp.max(jnp.abs(B_odd))))
         b_max = float(jax.device_get(jnp.max(jnp.abs(B))))
         odd_even_residue_ratio = d_max / b_max if b_max > 0.0 else d_max
-        probe_hermiticity_residual = float(jax.device_get(
-            _probe_antihermitian_residual(Wprobe_q)))
         if print_fn is not None:
             log.info(
                 f"  {model_label} ORDERED residues (measured-broken-TR deck): "
@@ -1068,7 +1109,8 @@ def pole_fit_plan(V_q, probe_omega, mesh_xy, *, n_mu_logical: int, fallback_omeg
                  ordered_orientations=bool(ordered), **dict(wedge or {})))
 
 
-def fit_pole_model(W_static_q, W_probe_q, plan: dict, *, print_fn=None) -> PPMBuildResult:
+def fit_pole_model(W_static_q, W_probe_q, plan: dict, *, print_fn=None,
+                   consume_supports=False) -> PPMBuildResult:
     """The pole model of W sampled at the plan's two supports, 0 and ``probe_omega``.
 
     :func:`fit_ppm` on ``(W_static_q, W_probe_q, plan['V_q'])``: per element
@@ -1078,7 +1120,7 @@ def fit_pole_model(W_static_q, W_probe_q, plan: dict, *, print_fn=None) -> PPMBu
     inputs': (nq, mu, mu) at ``P(None, 'x', 'y')``, Ry.
     """
     return fit_ppm(W_static_q, W_probe_q, plan["V_q"], plan["probe_omega"], plan["mesh_xy"],
-                   print_fn=print_fn, **plan["fit"])
+                   print_fn=print_fn, consume_supports=consume_supports, **plan["fit"])
 
 
 def screening_update(W0_at_supports, dchi_at_supports, plan: dict, *, print_fn=None):
@@ -1304,18 +1346,14 @@ def _resolve_ppm_band_plan(wfns, meta, plan, *, where):
 
 
 
-@jax.jit
-def _ppm_as_one_pole_store_fields(
-    state: _SigmaPhysicsState,
-    B_odd_q=None,
-):
-    """Policy-resolved PPM poles in the MPA ``(p,q,mu,nu)`` convention.
+def _ppm_as_one_pole_store_fields(Omega_abs, B_corr, B_mask, B_odd_q):
+    """Policy-resolved ``(q,mu,nu)`` fields, before canonical one-pole packing.
 
     Both ansatzes use
 
     ``Wc(z) = 2*Omega*B/(z**2 - Omega**2)`` and therefore
     ``Wc(0) = -2*B/Omega``.  No residue rescaling or sign flip is needed.
-    ``state.B_mask`` has already applied ``ppm_invalid_mode``; absent modes
+    ``B_mask`` has already applied ``ppm_invalid_mode``; absent modes
     are encoded by the MPA store's ordinary zero-residue convention and their
     frequency is zeroed as well.  An ordered GN fit's ``B_odd_q=D`` is masked
     by the same policy and stored beside ``B`` so the shared executor consumes
@@ -1323,17 +1361,33 @@ def _ppm_as_one_pole_store_fields(
     poles retained here are positive real frequencies, i.e. causal MPA poles
     with zero fitted width.
     """
-    live = jnp.asarray(state.B_mask, dtype=bool)
-    if B_odd_q is not None and tuple(B_odd_q.shape) != tuple(state.B_corr.shape):
+    live = jnp.asarray(B_mask, dtype=bool)
+    if B_odd_q is not None and tuple(B_odd_q.shape) != tuple(B_corr.shape):
         raise ValueError(
             "ordered PPM B_odd_q must match B_q; got "
-            f"{tuple(B_odd_q.shape)} and {tuple(state.B_corr.shape)}")
-    Omega = jnp.where(live, state.Omega_abs, 0.0).astype(jnp.complex128)
-    B = jnp.where(live, state.B_corr, 0.0 + 0.0j).astype(jnp.complex128)
+            f"{tuple(B_odd_q.shape)} and {tuple(B_corr.shape)}")
+    Omega = jnp.where(live, Omega_abs, 0.0).astype(jnp.complex128)
+    B = jnp.where(live, B_corr, 0.0 + 0.0j).astype(jnp.complex128)
     D = (None if B_odd_q is None else
          jnp.where(live, jnp.asarray(B_odd_q), 0.0 + 0.0j)
-         .astype(jnp.complex128)[None, ...])
-    return Omega[None, ...], B[None, ...], D
+         .astype(jnp.complex128))
+    return Omega, B, D
+
+
+@lru_cache(maxsize=2)
+def _ppm_store_fields_program(consume):
+    return jax.jit(_ppm_as_one_pole_store_fields,
+                   donate_argnums=(1, 3) if consume else ())
+
+
+@lru_cache(maxsize=1)
+def _ppm_single_pole_program():
+    """Transfer a fresh q-major field into its singleton pole-axis carrier.
+
+    Eager newaxis/reshape creates another whole field. This donated bitcast
+    reuses the input buffer; the caller rebinds each field before the next.
+    """
+    return jax.jit(lambda a: a[None], donate_argnums=(0,))
 
 
 def _add_static_ppm_term(
@@ -1381,6 +1435,7 @@ def compute_sigma_c_ppm_omega_grid(
     keep_branches=False,
     print_fn=print,
     particle_weights=None,
+    consume_ppm=False,
 ) -> SigmaOmegaResult:
     """Compute GN/HL-PPM Sigma_c through the shared MPA dynamic route.
 
@@ -1424,6 +1479,10 @@ def compute_sigma_c_ppm_omega_grid(
     body from the same sweep (``SigmaOmegaResult.branches``; the invalid-pole
     static term is not in either, so Sigma_c = cond + val + static term).
     False is the incumbent call, bit for bit.
+
+    ``consume_ppm=True`` transfers a fresh model's array buffers into the
+    shared source. Its frozen diagnostic metadata stays readable; its array
+    fields must not be read afterward. Borrowed/TD calls keep False.
     """
     if (request_for is None) == (omega_grid_ry is None):
         raise ValueError("compute_sigma_c_ppm_omega_grid: pass request_for (on shell) "
@@ -1463,7 +1522,7 @@ def compute_sigma_c_ppm_omega_grid(
     if valid_mask is None:
         valid_mask = jnp.ones(ppm.Omega_q.shape, dtype=bool)
     with timing.section("sigma.state"):
-        state = _prepare_sigma_state(
+        state = _sigma_state_program(bool(consume_ppm))(
             enk_full, occ_full, ppm.B_q, ppm.Omega_q, valid_mask,
             jnp.asarray(keep_invalid, dtype=bool))
 
@@ -1532,21 +1591,45 @@ def compute_sigma_c_ppm_omega_grid(
                     plan.bounds, q_wedge=ppm.q_wedge),
                 axis=0)
 
-    Omega_p, B_p, B_odd_p = _ppm_as_one_pole_store_fields(
-        state, ppm.B_odd_q)
+    if consume_ppm:
+        # All invalid-static/bracket readers have completed before Wc0 dies.
+        ppm.Wc0_q.delete()
+        jax.block_until_ready(state)
+        for field in (ppm.Omega_q, ppm.valid_mask_q):
+            if field is not None and not field.is_deleted():
+                field.delete()
+    Omega_p, B_p, B_odd_p = _ppm_store_fields_program(bool(consume_ppm))(
+        state.Omega_abs, state.B_corr, state.B_mask, ppm.B_odd_q)
+    if consume_ppm:
+        jax.block_until_ready((Omega_p, B_p, B_odd_p))
+        for field in (ppm.B_q, ppm.B_odd_q, state.B_corr, state.Omega_abs,
+                      state.B_mask, state.invalid_mask):
+            if field is not None and not field.is_deleted():
+                field.delete()
     if getattr(meta, 'mu_basis', None) is not None:
-        # The store keeps the canonical centroid order (grid-agnostic).
-        Omega_p, B_p = (meta.mu_basis.unpack_operator(Omega_p),
-                        meta.mu_basis.unpack_operator(B_p))
+        # Convert q-major fields separately so the existing q-tiled permutation
+        # bounds its scratch. The singleton pole axis is added only afterward.
+        Omega_p = meta.mu_basis.unpack_operator(Omega_p, consume=consume_ppm)
+        B_p = meta.mu_basis.unpack_operator(B_p, consume=consume_ppm)
         if B_odd_p is not None:
-            B_odd_p = meta.mu_basis.unpack_operator(B_odd_p)
+            B_odd_p = meta.mu_basis.unpack_operator(B_odd_p, consume=consume_ppm)
     diagram_value = str(getattr(
         screening_diagrams, "value", screening_diagrams))
     # In memory, no store (owner 2026-09-23): the executor reads the same
     # sharded fields a store round trip would have returned.
+    if consume_ppm:
+        pole_axis = _ppm_single_pole_program()
+        Omega_p = pole_axis(Omega_p)
+        B_p = pole_axis(B_p)
+        if B_odd_p is not None:
+            B_odd_p = pole_axis(B_odd_p)
+    else:
+        Omega_p, B_p = Omega_p[None], B_p[None]
+        if B_odd_p is not None:
+            B_odd_p = B_odd_p[None]
     poles = MemoryPoleSource(
         Omega_p, B_p, B_odd_p,
-        n_mu_logical=int(meta.n_rmu), mesh_xy=mesh_xy, q_wedge=ppm.q_wedge,
+        consume=consume_ppm, n_mu_logical=int(meta.n_rmu), mesh_xy=mesh_xy, q_wedge=ppm.q_wedge,
         provenance={
             "fit_protocol": "two_point_ppm",
             "pole_model": ansatz_name,
@@ -1575,6 +1658,7 @@ def compute_sigma_c_ppm_omega_grid(
         branches = _population_branches(omega_req, enk_full, state.efermi, populations,
                                         internal=None if internal is None else internal.mask,
                                         particle_weights=particle_weights)
+    del state, valid_mask
     result = compute_sigma_c_mpa_omega_grid(
         wfns, poles, meta, mesh_xy,
         request=request,
@@ -1597,7 +1681,7 @@ def compute_sigma_c_ppm_omega_grid(
         analytic_line=False,
         # No D=0 twin on the GN/HL route: the odd-reference Sigma was a
         # diagnostic-only second sweep, removed by owner decision 2026-09-23.
-        odd_reference=False,
+        odd_reference=False, consume_source=consume_ppm,
         keep_branches=keep_branches,
         print_fn=print_fn)
     sigma_c_kij = result.sigma_c_kij

@@ -170,6 +170,12 @@ order. `ortho.backend` names the resolved implementation:
 | `jax_collectives` | distributed CPU | host callbacks on local tiles, capacity-sized JAX coefficient reductions |
 | `cpu_callback` | one CPU device | both passes in one NumPy callback |
 
+The local subtraction handlers retain the declared aliases when available. If
+the compiler supplies a separate block output because the input is still live,
+they first copy that block on the same device stream; a separate next-Gram
+output is initialized in full after consuming the input coefficients. No
+additional hidden buffer is allocated by either handler.
+
 `native_collectives=True` is opt-in because the NCCL context it reuses (the
 service's cuSOLVERMp context) has its own setup time and device memory;
 planning with it is collective, and its calls must not come from concurrent

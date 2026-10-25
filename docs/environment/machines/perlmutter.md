@@ -24,19 +24,12 @@ nodes (8 × 8 mesh, four physical cores per rank) still aborts in
 `MPI_Allgather` with inconsistent panel counts. The failing run used a fresh
 compile and authenticated inputs; this is not cleared by the P = 4 tests.
 
-The official CPU nightly pair `jax/jaxlib==0.12.1.dev20261023` (XLA
-`4dc8a9012437`) completes full shared-pole GW at P = 64 on two Milan nodes.
-The Fe 8 × 8 × 8 case has 110 summed bands, 1099 centroids and QP bands
-1–22 at 59 irreducible k points. Both a cold run and a fresh-process cached
-run pass the complete finite Σ/EQP checks. Strict comparisons pass for
-P = 64 cold versus P = 16 cold (maximum QP1 difference 0.671 µeV) and for
-P = 64 warm versus cold (0.515 µeV). Every warm rank reports zero new
-driver backend compilations, with startup counted separately.
-
-Those full CPU runs use frozen source `ed16e34dd`, NumPy 2.4.3 and SciPy
-1.17.1 (job 60223103), four physical cores per rank and two BLAS/OpenMP
-threads. This qualifies that private nightly environment; the default lock
-is unchanged and the released 0.12.0.1 CPU P = 64 failure remains.
+A private experimental CPU nightly `jax/jaxlib==0.12.1.dev20261023` completed
+the Fe 8 × 8 × 8, 110-band, 1099-centroid case at P = 64, with cold/cached
+Σ/EQP comparisons (frozen source `ed16e34dd`, job 60223103). This is diagnostic
+evidence only, not shipping qualification or a supported dependency. LORRAX
+supports full releases; its version contract rejects development and prerelease
+builds. The released 0.12.0.1 CPU P = 64 failure remains unresolved, and
 P = 144, including the former compiler/VMA limit, remains uncertified.
 
 ## GPU task geometry {#required-gpu-task-geometry}
@@ -136,7 +129,7 @@ Every multi-process CPU step sources `config/perlmutter/cpu_mpi_env.sh` in
 the rank shell, before Python. The prelude selects the backend and MPI
 adapter, not Python or its wheels. Select a CPU-only environment for this
 checkout explicitly: the tracked lock and standard module use stable
-0.12.0.1; the nightly tests described above use a separate environment.
+0.12.0.1. The private nightly experiment above is not a supported launch path.
 
 ```bash
 export LORRAX_CHECKOUT=/path/to/checkout

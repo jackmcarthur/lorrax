@@ -69,8 +69,13 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             k_unfold_plan=None,
                             occupations: str = "step",
                             ordered: bool = False,
-                            real_times: bool = False):
+                            real_times: bool = False,
+                            sum_layout: str = "face"):
     """Build the face or parent imaginary-time response with vertices applied after unfold.
+
+    ``sum_layout`` selects the prepared Green operands of the ordinary parent
+    kernel; :func:`subtile_stream.prepare_green_operands` owns their placement.
+    It does not alter vertex or finite-temperature kernels.
 
     ``real_times``: every node time is real (the parent kernel then reads a
     complex contour's antiunitary partner as conj(G) on the load).
@@ -88,6 +93,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     # ffi_dial_key(): the factories below read their FFI dials at FACTORY
     # time, so the dials are part of this cache key (``ffi.ffi_dial_key``).
     from ffi import ffi_dial_key
+    from common.fft_helpers import kconv_backend
     complex_contour = bool(complex_contour)
     if layout not in ("face", "axis"):
         raise ValueError(
@@ -116,15 +122,15 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     # The identity-vertex step response on a raw-parent plan reads the two parent
     # Greens straight into the chi0 pass (ffi.fft.make_kconv_chi_unfold, mathdx
     # mode 11): the unfold is the transform's load, the spin trace its Mid, and no
-    # full-k Green exists, so the live set is the two parent Greens.
+    # full-k Green exists; orbit-closed row passes bound both parent Greens.
     fused = (vertex_pairs is None and not fermi_dirac and face_shape is not None
              and right_face_shape is None and k_unfold_plan is not None
              and not isinstance(k_unfold_plan, tuple))
-    cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), n_out,
+    cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), kconv_backend(mesh_xy, kgrid), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)
                                if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)),
-                 fused, bool(real_times) and fused)
+                 fused, bool(real_times) and fused, sum_layout if fused else None)
     if fermi_dirac:
         cache_key = cache_key + ("fermi_dirac", bool(ordered))
     if cache_key in _chi_minimax_kernel_cache:
@@ -137,7 +143,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     if fused:
         kernel = _get_chi_minimax_kernel_fused(
             mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
-            k_unfold_plan=k_unfold_plan, layout=layout, real_times=bool(real_times))
+            k_unfold_plan=k_unfold_plan, layout=sum_layout, real_times=bool(real_times))
     else:
         kernel = _get_chi_minimax_kernel_face(
             mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
@@ -183,7 +189,10 @@ def _charge_stream_kconv(mesh_xy, kgrid, plan):
     literal per program at Fe 20^3 (8000 k, 1792 centroids), compiled into every
     direct, moment and retarded stream of the run.
     """
-    key = (mesh_xy, tuple(int(v) for v in kgrid), plan)
+    from ffi import ffi_dial_key
+    from common.fft_helpers import kconv_backend
+    key = (mesh_xy, tuple(int(v) for v in kgrid), plan, ffi_dial_key(),
+           kconv_backend(mesh_xy, kgrid))
     hit = _CHARGE_KCONV.get(key)
     if hit is None:
         from common.fft_helpers import make_kconv_chi_unfold
@@ -196,7 +205,7 @@ def _charge_stream_kconv(mesh_xy, kgrid, plan):
     return hit
 
 
-def _charge_window_kconv(mesh_xy, kgrid, plan, rows):
+def _charge_window_kconv(mesh_xy, kgrid, plan, rows, *, n_out=1, complete=False):
     """The direct stream's mode-11 call on its ``rows``-row windows and the plan's placed tables.
 
     One call serves every row pass (``gw.subtile_stream.plan_windows``): its
@@ -204,9 +213,12 @@ def _charge_window_kconv(mesh_xy, kgrid, plan, rows):
     the plan's own when one window holds every row), and each pass reads the
     placed tables cut to its window on the device (``subtile_stream.window_load``).
     Returns ``(kconv, arrays)``, the arrays a ``symmetry_maps.DeviceLoadTables``'s
-    fields, cached per (mesh, grid, plan, rows).
+    fields, cached per mesh, grid, plan, rows, outputs/completion and backend.
     """
-    key = ("window", mesh_xy, tuple(int(v) for v in kgrid), plan, int(rows))
+    from ffi import ffi_dial_key
+    from common.fft_helpers import kconv_backend
+    key = ("window", mesh_xy, tuple(int(v) for v in kgrid), plan, int(rows),
+           int(n_out), bool(complete), ffi_dial_key(), kconv_backend(mesh_xy, kgrid))
     hit = _CHARGE_KCONV.get(key)
     if hit is None:
         from common.fft_helpers import make_kconv_chi_unfold
@@ -215,7 +227,7 @@ def _charge_window_kconv(mesh_xy, kgrid, plan, rows):
         side, ns = int(mesh_xy.shape["x"]), int(np.asarray(base.spin).shape[-1])
         local_rows = int(np.asarray(base.lsrc).shape[1]) // (side * ns)
         shape = base if int(rows) == local_rows else window_tables(base, rows, side, ns)
-        hit = (make_kconv_chi_unfold(mesh_xy, kgrid, shape, n_out=1, complete=False, norm="ortho"),
+        hit = (make_kconv_chi_unfold(mesh_xy, kgrid, shape, n_out=n_out, complete=complete, norm="ortho"),
                _placed_load_tables(mesh_xy, plan, base))
         while len(_CHARGE_KCONV) >= 2:
             _CHARGE_KCONV.pop(next(iter(_CHARGE_KCONV)))
@@ -793,77 +805,114 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
                                   face_shape, *, k_unfold_plan, layout="face",
                                   real_times=False):
-    """The step-occupation, identity-vertex response read from the raw-parent Green pair.
+    """χ_R = Στ ατ Tr[conj(Gc_R) Gv_R], on orbit-closed centroid-row windows.
 
-        chi_R(mu, nu) = sum_tau alpha_tau sum_ab conj(Gc'_ab) Gv'_ab   (+ c.c., real contour)
-
-    with ``G' = ifftn_k`` of the typed unfold of each parent Green: one GEMM per Green at
-    the parents, then ``ffi.fft.make_kconv_chi_unfold`` (mathdx mode 11) unfolds both on
-    its load, transforms, traces the spins and accumulates chi_R in place.  The live set
-    is the two parent Greens and the accumulator (priced by
-    ``greens_function_kernel.price_chi0_node``); real node times read the antiunitary
-    partner as ``conj(G)`` on the load, complex ones read the conjugate-face parent
-    Green.  One forward transform after the tau sum.  Same signature and output as
-    :func:`_get_chi_minimax_kernel_face` for ``vertex_pairs=None``.
+    The original τ scan and its one final forward transform run inside each
+    row pass. Only that pass's two parent Greens and χ_R exist; the result
+    keeps its full ``(q, μ_X, ν_Y)`` sharding. The typed load, Green builders
+    and placement loop are the direct response stream's owners. Window sizes
+    follow the fixed tile, never the memory budget or the node weights.
+    Axis inputs are preformed by :func:`subtile_stream.green_operand_program`;
+    face inputs borrow the canonical raw arrays, so the compiled consumer
+    owns any right conjugation/layout workspace.
     """
-    from common.fft_helpers import make_flat_k_fftn, make_kconv_chi_unfold
-    from common.wfn_layout import psi_specs
+    from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
-    from .greens_function_kernel import build_G_tau, price_chi0_node
+    from symmetry_maps import DeviceLoadTables
+    from .greens_function_kernel import build_G_tau, chi0_kconv_scratch
+    from .subtile_stream import (GREEN_ROWS_SPEC, plan_passes, stream_passes, window_load,
+                                 window_rows, window_green_rows)
     from .wavefunction_bundle import CHI_Q_SPEC as _chi_spec, CHI_R_SPEC as _chi_R_spec
 
-    psi_nmu_spec, psi_mun_spec = psi_specs(layout)
+    psi_mun_spec = GREEN_ROWS_SPEC if layout == "axis" else P(None, None, "x", "y")
+    right_spec = P(None, None, "y") if layout == "axis" else P(None, "x", None, "y")
     nk_in, nb_full, n_rmu, ns = (int(v) for v in face_shape)
-    anti = bool(np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial))
-    # Real node times (every step response but the real-axis contours) give Greens of real
-    # weights even when alpha is complex (the ordered imaginary probe): their antiunitary
-    # partner is conj(G), read on the load, so no partner tile is built.
-    real_t = real_times or not complex_contour
-    price_chi0_node(n_parent=nk_in, n_rmu=n_rmu, ns=ns, n_full=nk, n_out=n_out, kgrid=kgrid,
-                    n_band=nb_full, mesh=mesh_xy, partner=anti and not real_t)
     if nk_in != k_unfold_plan.n_parent or k_unfold_plan.n_full != nk:
         raise ValueError("chi parent plan: face k extent or full-k extent disagrees with its plan.")
-    kconv = make_kconv_chi_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
-                                 n_out=n_out, complete=not complex_contour, norm="ortho")
-    chi_fftn = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm='ortho')
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    nu = n_rmu // py
+    anti = bool(np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial))
+    # Complex alpha on real τ (the ordered GN probe) still has real Green weights.
+    real_t = real_times or not complex_contour
+    greens = 4 if anti and not real_t else 2
+    # Proposal: parent Greens, χ_R and its transform, and the window's ψ rows.
+    # The actual executable and provider workspace are admitted before dispatch.
+    row_bytes = 16 * (greens * nk_in * ns * ns * nu + 2 * n_out * nk * nu
+                      + nk_in * ns * nb_full)
+    plan = plan_passes(k_unfold_plan.unfold_load_tables(), mesh_xy, ns=ns,
+                       row_bytes=lambda _: row_bytes, chunk_bytes=1, n_nodes=1)
+    R = int(plan.rows)
+    kconv, arrays = _charge_window_kconv(mesh_xy, kgrid, k_unfold_plan, R,
+                                         n_out=n_out, complete=not complex_contour)
+    chi_fftn = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm="ortho")
     chi_R_shard = NamedSharding(mesh_xy, _chi_R_spec)
     acc_shard = NamedSharding(mesh_xy, P(None, None, "x", "y"))
     rep0, rep1, rep2 = (NamedSharding(mesh_xy, s) for s in (P(), P(None), P(None, None)))
-    # One planned GEMM at the parents, shared by every Gv and Gc build.  Not warmed: it
-    # runs inside this one jit, and a warm-up would hold full-size dummy C and D tiles.
-    g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns, nq=nk_in,
+    g_plan = gemm_plan(mesh_xy, m=px * R * ns, k=nb_full, n=n_rmu * ns, nq=nk_in,
                        dtype=jnp.complex128, layout=layout, enable_active_range=True,
                        warmup=False)
     nodes_shard = MinimaxNodes(t=rep1, alpha=rep1 if n_out == 1 else rep0)
 
-    def integrate(nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin):
+    def integrate(nodes, psi_mun, right, mask_v, mask_c, enk_full, vmax, cmin, placed):
         acc0 = jax.lax.with_sharding_constraint(
             jnp.zeros((n_out, nk, n_rmu, n_rmu), dtype=jnp.complex128), acc_shard)
-        alpha_rows = (nodes.alpha[:, None] if n_out == 1 else jnp.transpose(nodes.alpha))
+        alpha_rows = nodes.alpha[:, None] if n_out == 1 else jnp.transpose(nodes.alpha)
+        # Axis banks or borrowed canonical faces stay outside all rows and τ nodes.
+        load = DeviceLoadTables(*placed)
 
-        def node(acc, xs):
-            t_scalar, alpha_col = xs
-            tau = jnp.real(t_scalar).astype(jnp.float64) if real_t else t_scalar
-            t_c = tau if real_t else jnp.conj(tau)
-            green = lambda t, ref, mask: build_G_tau(
-                psi_mun, psi_nmu, enk_full, t, e_ref=ref, mask=mask, layout=layout,
-                gemm=g_plan, k_unfold_plan=k_unfold_plan, trim_zero_bands=True, unfold=False)
-            Gv = green(-tau, vmax, mask_v)
-            Gc = green(t_c, cmin, mask_c)
-            # A Green of real weights reads its partner as conj(G) on the load.
-            partners = () if Gv.conj_partner else (Gv.transpose, Gc.transpose)
-            return kconv(acc, Gv.G, Gc.G, alpha_col.astype(jnp.complex128), *partners), None
+        def prepare(window):
+            if window is None:
+                left = window_green_rows(psi_mun, mesh_xy) if layout == "axis" else psi_mun
+                return left, load, {}
+            s, lo, hi = window
+            left = (window_green_rows(psi_mun, mesh_xy, s, R) if layout == "axis" else
+                    window_rows(psi_mun, mesh_xy, s, R, axis=2, spec=psi_mun_spec))
+            return (left, window_load(load, mesh_xy, s, lo, hi, R, ns),
+                    dict(live=jnp.stack([lo, hi]).astype(jnp.int32)))
 
-        acc, _ = jax.lax.scan(node, acc0, (nodes.t, alpha_rows), unroll=1)
-        return tuple(chi_fftn(acc[o]) for o in range(n_out))
+        def integrated_rows(ops, _):
+            left, pass_load, live = ops
+            zero = jax.lax.with_sharding_constraint(
+                jnp.zeros((n_out, nk, px * R, n_rmu), jnp.complex128), acc_shard)
+
+            def node(acc, xs):
+                t_scalar, alpha_col = xs
+                tau = jnp.real(t_scalar).astype(jnp.float64) if real_t else t_scalar
+                t_c = tau if real_t else jnp.conj(tau)
+                green = lambda t, ref, mask: build_G_tau(
+                    left, right if layout == "face" else None, enk_full, t,
+                    e_ref=ref, mask=mask, layout=layout,
+                    gemm=g_plan, k_unfold_plan=k_unfold_plan, trim_zero_bands=True,
+                    unfold=False, real_weights=real_t, right=right if layout == "axis" else None)
+                Gv = green(-tau, vmax, mask_v)
+                Gc = green(t_c, cmin, mask_c)
+                partners = () if Gv.conj_partner else (Gv.transpose, Gc.transpose)
+                return kconv(acc, Gv.G, Gc.G, alpha_col.astype(jnp.complex128),
+                             *partners, load=pass_load, **live), None
+
+            acc, _ = jax.lax.scan(node, zero, (nodes.t, alpha_rows), unroll=1)
+            value = jnp.stack([chi_fftn(acc[o]) for o in range(n_out)])
+            # One already-integrated row plane per output. The existing stream
+            # placement writes these with the identity projection (one term).
+            return value[None]
+
+        identity = jnp.eye(n_out, dtype=jnp.complex128)[..., None]
+        acc = stream_passes(acc0, mesh=mesh_xy, plan=plan, weights=identity,
+                            count=jnp.int32(1), node_rows=integrated_rows, prepare=prepare)
+        return tuple(acc[o] for o in range(n_out))
 
     in_shardings = (nodes_shard, NamedSharding(mesh_xy, psi_mun_spec),
-                    NamedSharding(mesh_xy, psi_nmu_spec), rep2, rep2, rep2, rep0, rep0)
-    if n_out >= 2:
-        return jax.jit(integrate, in_shardings=in_shardings,
-                       out_shardings=tuple(chi_R_shard for _ in range(n_out)))
-    return jax.jit(lambda *args: integrate(*args)[0], in_shardings=in_shardings,
-                   out_shardings=chi_R_shard)
+                    NamedSharding(mesh_xy, right_spec), rep2, rep2, rep2, rep0, rep0,
+                    tuple(a.sharding for a in arrays))
+    program = (jax.jit(integrate, in_shardings=in_shardings,
+                       out_shardings=tuple(chi_R_shard for _ in range(n_out))) if n_out >= 2
+               else jax.jit(lambda *args: integrate(*args)[0], in_shardings=in_shardings,
+                            out_shardings=chi_R_shard))
+    kernel = _BoundTail(program, (arrays,))
+    kernel.native_scratch = chi0_kconv_scratch(kgrid=kgrid, n_parent=nk_in,
+        n_rmu=px * R, n_right=n_rmu, ns=ns, mesh=mesh_xy)
+    kernel.row_plan = plan
+    return kernel
 
 
 def _get_chi_fractional_contour_kernel(
@@ -2282,6 +2331,21 @@ def _run_minimax_chi(wfns, meta, mesh_xy, args, *, n_out=1,
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, n_out=n_out, complex_contour=complex_contour,
         real_times=real_times, **_chi_parent_face_kwargs(wfns))
+    if hasattr(kernel, "row_plan"):
+        from .subtile_stream import prepare_green_operands
+
+        def build(sum_layout, prepared):
+            selected = _get_chi_minimax_kernel(
+                mesh_xy, kgrid, n_out=n_out, complex_contour=complex_contour,
+                real_times=real_times, sum_layout=sum_layout, **_chi_parent_face_kwargs(wfns))
+            executable = selected.lower(args[0], *prepared, *args[3:]).compile()
+            return executable, [executable], selected.native_scratch
+
+        _, prepared, executable = prepare_green_operands(
+            args[1:3], mesh_xy, build, label="Minimax response", compile_only=compile_only)
+        if compile_only:
+            return None
+        return executable(args[0], *prepared, *args[3:])
     if compile_only:
         kernel.lower(*args).compile()
         return None

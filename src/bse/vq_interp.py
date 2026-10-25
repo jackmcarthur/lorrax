@@ -12,14 +12,13 @@ digit); this module adds the production seams:
   * ``prepare_coarse`` runs on-device q-BATCHED: the coarse q axis is
     sharded ``P(('x','y'))`` over all mesh devices and each device eighs +
     cleans + splits its own q-shard collective-free, in chunks with one
-    host round-trip each (``auto`` = this batched native path; the
+    local centroid-block copies (``auto`` = this batched native path; the
     distributed-FFI backends ``cusolvermp|scalapack|elpa`` stay available by
     explicit request for tiles too large to eigh replicated).
-  * ``fit_lr_model`` (the b26p LSQ) stays HOST/replicated on purpose: the
-    normal blocks are (n_b ≤ 10)² per (G_z, q) — a few kilobytes, O(10⁶)
-    flops total — and the solved coefficients are (n_b, n_μ) ≈ tens of kB.
-    Sharding them buys nothing and costs collectives; the fit inputs
-    (``Fch``, ``W``) are per-q n_μ×|𝒢| blocks pulled to host once, offline.
+  * ``fit_lr_model`` keeps the small normal matrices (n_b ≤ 10)²
+    replicated, while form factors, polynomial right-hand sides and fitted
+    coefficients stay in the process's owned centroid blocks. The existing
+    placement owner assembles only device-local coefficient shards.
   * ``make_eval_vq`` builds ONE jitted evaluator whose q-DEPENDENT data
     (target Q, the stencil-weight pseudo-inverse, the SR-tile stack, the
     fitted coefficients) are RUNTIME ARGUMENTS — never closure constants —
@@ -103,7 +102,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.collectives import device_put_process_local
+from common.collectives import agree_io_error, device_put_process_local, device_put_process_tiles
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
@@ -311,8 +310,37 @@ def flat_idx(zx, gv):
         + gv[2] % zx["nz"]
 
 
+def _diagnostic_host_bound(name, nbytes):
+    """Refuse oversized legacy host diagnostics before their first allocation."""
+    from runtime.tiles import TILE_BYTES
+    if int(nbytes) > TILE_BYTES:
+        raise ValueError(f'{name}: host diagnostic needs {int(nbytes)/1e9:.3f} GB; '
+                         f'the fixed diagnostic limit is {TILE_BYTES/1e9:.3f} GB. '
+                         'Use the sharded production calculation at this size.')
+
+
+def _put_mu_tiles(tiles, shape, sharding):
+    """Place independent host μ columns using only their addressable blocks."""
+    def tile(index):
+        mu = index[-1]
+        key = (mu.start or 0, mu.stop or shape[-1])
+        return tiles[key][index[:-1]]
+    return device_put_process_tiles(shape, sharding, tile)
+
+
+def _diagnostic_phase(zx, q, sign):
+    """One bounded diagnostic phase, without retaining full real-space coordinates."""
+    axes = [np.exp(sign*2j*np.pi*float(zx['qfr'][q, i])*
+                   np.arange(int(zx[key]))/int(zx[key]))
+            for i, key in enumerate(('nx', 'ny', 'nz'))]
+    return (axes[0][:, None, None]*axes[1][None, :, None]*
+            axes[2][None, None, :]).reshape(-1)
+
+
 def recon(zx, q):
     """ζ_q(μ, r) in the lab frame on the full FFT grid (gates only)."""
+    _diagnostic_host_bound('recon', 96*int(zx['n_mu'])*int(zx['n_rtot'])
+        + 16*int(zx['n_mu'])*int(zx['ngkmax']) + 32*int(zx['n_rtot']))
     ZGq = zx["ZG"][q]
     box = np.zeros((zx["n_mu"], zx["n_rtot"]), dtype=np.complex128)
     fi = flat_idx(zx, zx["gvec"][q])
@@ -321,12 +349,14 @@ def recon(zx, q):
     R = np.fft.ifftn(box.reshape(zx["n_mu"], zx["nx"], zx["ny"], zx["nz"]),
                      axes=(1, 2, 3), norm="backward"
                      ).reshape(zx["n_mu"], zx["n_rtot"])
-    return R * np.exp(2j * np.pi * (zx["rfrac"] @ zx["qfr"][q]))[None, :]
+    return R * _diagnostic_phase(zx, q, +1)[None, :]
 
 
 def to_sphere(zx, zr, q):
-    """rows(r) → rows(G) on sphere(q) (gates + refit)."""
-    ph = np.exp(-2j * np.pi * (zx["rfrac"] @ zx["qfr"][q]))
+    """rows(r) → rows(G) on sphere(q), for bounded host diagnostics only."""
+    _diagnostic_host_bound('to_sphere', 80*int(zr.shape[0])*int(zx['n_rtot'])
+        + 16*int(zr.shape[0])*int(zx['ngkmax']) + 32*int(zx['n_rtot']))
+    ph = _diagnostic_phase(zx, q, -1)
     box = np.fft.fftn((zr * ph[None, :]).reshape(-1, zx["nx"], zx["ny"],
                                                  zx["nz"]),
                       axes=(1, 2, 3), norm="backward"
@@ -515,6 +545,18 @@ def build_cq_q_chunk(*, nq, nb, ns, n_mu, n_r, mesh_xy):
     return chunk
 
 
+def _coarse_device_psi(zx, mesh_xy):
+    """Require the loader's canonical all-rank centroid carrier."""
+    psi = zx['psi']
+    expected = NamedSharding(mesh_xy, P(None, None, None, ('x', 'y')))
+    if (not isinstance(psi, jax.Array) or psi.ndim != 4 or psi.dtype != jnp.complex128
+            or psi.shape != (int(zx['nk']), int(zx['nb']), int(zx['ns']), int(zx['n_mu']))
+            or not psi.sharding.is_equivalent_to(expected, 4)):
+        raise ValueError('V(q) requires canonical device wavefunctions from read_vq_payload; '
+                         'a replicated host wavefunction bank is not supported')
+    return psi
+
+
 def build_cq(zx, mesh_xy: Mesh, q_chunk=None):
     """C_q Gram rebuild from ψ at centroids (reference ``build_cq``,
     order-robust R-space route, arithmetic verbatim — evaluated on device,
@@ -533,10 +575,11 @@ def build_cq(zx, mesh_xy: Mesh, q_chunk=None):
     fixture but **53.6 GB at the converged 12×12 / n_μ = 2412 reference**,
     which no single device holds.  R and q stay unsharded, so BOTH
     contractions (the q-Fourier accumulation and the R-Fourier transform
-    back) are device-local: no collectives, only the final host gather.
+    back) retain the face layout; the result remains on device.
     The einsums replace the original reshape-matmuls verbatim — a reshape
     that flattens ns·n_μ·n_μ·ns would destroy the face sharding."""
     nq, nb, ns, n_mu = zx["nq"], zx["nb"], zx["ns"], zx["n_mu"]
+    psi = _coarse_device_psi(zx, mesh_xy)
     kg = zx["kgrid"]
     Rall = np.array([[rx, ry, rz] for rx in range(kg[0])
                      for ry in range(kg[1]) for rz in range(kg[2])])
@@ -547,7 +590,7 @@ def build_cq(zx, mesh_xy: Mesh, q_chunk=None):
                                    mesh_xy=mesh_xy)
     EqR_np = np.exp(2j * np.pi * (zx["qfr"] @ Rw.T))
     rep = NamedSharding(mesh_xy, P())
-    # (μ, ν) face.  n_mu is the raw k-means centroid count, so the face is
+    # (μ, ν) face. The loader supplies the padded centroid carrier, so the face is
     # legal only when it divides the mesh axis; _ns degrades (loudly) when it
     # does not.  Pk carries the k-chunk on the leading axis, P_R the R index —
     # different leading extents, same face, so both are fitted separately.
@@ -575,14 +618,11 @@ def build_cq(zx, mesh_xy: Mesh, q_chunk=None):
     # would materialise the whole 53.6 GB on one device first and only then
     # reshard — the allocation that OOMs an 80 GB card at n_μ = 2412.
     P_R = jnp.zeros((nR, ns, n_mu, n_mu, ns), jnp.complex128, device=face5)
-    # Process-local placement of the host chunks (scorecard AA.1): every
-    # rank reads the same file / computes the same phases, so plain
-    # ``device_put``'s hidden assert_equal all-gather (P × chunk bytes,
-    # once per q-chunk) verifies a tautology.  LORRAX_CHECK_REPLICA=1
-    # re-arms the assertion.
+    # The loader owns the canonical all-rank centroid sharding. Keep those
+    # device chunks distributed; only the small phase table starts on hosts.
     for q0 in range(0, nq, q_chunk):
         sl = slice(q0, min(q0 + q_chunk, nq))
-        P_R = _pr_acc(P_R, device_put_process_local(zx["psi"][sl], rep),
+        P_R = _pr_acc(P_R, psi[sl],
                       device_put_process_local(EqR_np[sl], rep))
     # Return C_q as a MESH-SHARDED device array on the (μ, ν) FACE
     # (``face3`` = ``P(None, 'x', 'y')`` — q replicated, μ over 'x', ν over 'y'),
@@ -605,6 +645,10 @@ def kq_index(zx, ki, qi):
 # gate battery (reference run_gates; every value printed; any FAIL stops)
 # ===========================================================================
 def run_gates(zx, C_q):
+    _diagnostic_host_bound('run_gates',
+        96*int(zx['n_mu'])*int(zx['n_rtot'])
+        + 32*min(48, int(zx['nq']))*int(zx['n_mu'])*int(zx['ngkmax'])
+        + 64*int(zx['nq'])*int(zx['n_mu'])**2)
     ok = True
 
     def log(k, v, tol=None):
@@ -886,8 +930,8 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
                                without host mirrors
       GS       (3, nG)         fixed LR Miller superset 𝒢(α), G_z-trimmed
                                to the fitted channels (:func:`lr_gset`)
-      Fch      (nq, n_μ, nG)   phase-factored cleaned LR form factors (host —
-                               fit input only, droppable after stage 2)
+      Fch      {(μ0, μ1): (nq, nG, μ1-μ0)} phase-factored LR samples,
+                               host blocks owned by this process only
       W        (nq, nG)        LSQ weights v_LR(q+G) (head slot → 0)
       gz_cols  {gz: cols}      per-G_z column index into GS
 
@@ -895,7 +939,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     ``q_chunk``, sharded ``P(('x','y'))`` on the q axis (each device owns its
     q-shard end to end — eigh, S_q = R g_ε(Λ) R^H, V_c = conj(S)(V_ref −
     V_LR)conj(S), ζ̃-cleaning, and the phase-factored superset gather all
-    run without collectives), with ONE host round-trip per chunk.  The
+    run without collectives), followed by a reshard to all-rank centroid columns for the local fit. The
     per-q sphere is zero-padded to ``ngkmax`` (pad channels carry v = 0, so
     they contribute exact zeros — same arithmetic as the per-q truncation)
     which keeps the whole stage at ≤2 XLA compiles instead of one per
@@ -905,12 +949,9 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     they are honored per-q if explicitly requested.  n_μ is used at its
     LOGICAL extent here; the jitted evaluator pads on output.
 
-    ``q_chunk`` is a CEILING, lowered to keep the host-side ζ read bounded:
-    the chunk is read whole on every process before it is device_put, and at
-    the converged reference (n_μ = 2412, ngkmax = 8603) one q is 332 MB, so
-    48 q is 15.9 GB per rank — 64 GB per 4-rank Perlmutter node, on top of
-    C_q and the two (nq, n_μ, n_μ) host stacks.  It stays a whole number of
-    mesh shards so the q axis still device_puts evenly.
+    ``q_chunk`` bounds the distributed ζ slab. No full q slab or global
+    form-factor stack is read by a host: each process copies only its own
+    centroid columns after the cleaning program completes.
 
     ``keep_host_mirrors=False`` drops ``S`` and ``V_SRc_np``.  They are read
     ONLY by ``run_nulls`` and ``eval_vq_host`` (the LOO ladders), so with the
@@ -923,6 +964,16 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     nq, n_mu = zx["nq"], zx["n_mu"]
     ngkmax = zx["ngkmax"]
     ndev = int(mesh_xy.devices.size)
+    from common.staged_reshard import face_to_batch_reshard, batch_to_face_reshard
+    face_to_q = face_to_batch_reshard(mesh_xy)
+    q_to_face = batch_to_face_reshard(mesh_xy)
+    if n_mu % ndev:
+        raise ValueError('prepare_coarse needs the canonical all-rank centroid carrier')
+    n_mu_logical = int(zx.get('n_mu_logical', n_mu))
+    if not 0 <= n_mu_logical <= n_mu:
+        raise ValueError('prepare_coarse: invalid logical centroid count')
+    if keep_host_mirrors:
+        _diagnostic_host_bound('prepare_coarse host mirrors', 32*nq*n_mu*n_mu)
     # ONE resolved plan for the whole q loop: platform / compiled-capability
     # / coverage / geometry guards all fire here, before any q is touched
     # (see distrib_la.resolve_backend), and the plan then carries the backend,
@@ -972,7 +1023,8 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
         idx_all[q] = np.where(idx < 0, ngkmax, idx)
         W[q] = v_slab_on_set(zx, zx["qfr"][q], GS, kind="slab_lr", alpha=alpha)
 
-    rmu = jnp.asarray(zx["rmu_frac"])                    # (n_μ, 3) trace const
+    rmu = jnp.where(jnp.arange(n_mu)[:, None] < n_mu_logical,
+                    jnp.asarray(zx["rmu_frac"]), 0)        # (n_μ, 3) trace const
     GS_f = jnp.asarray(GS.T.astype(np.float64))          # (nG, 3) trace const
 
     # The two batch kernels are built PER DISTINCT CHUNK LENGTH (at most two:
@@ -992,7 +1044,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     def _make_eigh_batch(qb2, qb3):
         @partial(jax.jit, out_shardings=(qb2, qb3))
         def _eigh_batch(C):
-            C = jax.lax.with_sharding_constraint(C, qb3)
+            C = face_to_q(C)
             lam, R = eigh_local(C)
             return lam, R
         return _eigh_batch
@@ -1000,6 +1052,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     def _clean_split_body(lam, R, ZGq, v_ref, v_lr, idx, qfr_b, mm=None):
         # ``mm``: the face GEMM (distrib_la.matmul) of the face route; None, the q owner's
         # whole-matrix einsums.
+        ZGq = jnp.where(jnp.arange(n_mu)[None, :, None] < n_mu_logical, ZGq, 0)
         # S_q = R g_ε(Λ) R^H  (analytic Tikhonov filter of C_q; §12.3)
         g = lam ** 2 / (lam ** 2
                         + (eps_tik * lam.max(axis=1, keepdims=True)) ** 2)
@@ -1028,7 +1081,10 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
         return S, V_SRc, ph * ztg
 
     def _make_clean_split(qb3):
-        return jax.jit(_clean_split_body, out_shardings=(qb3, qb3, qb3))
+        def split(*args):
+            S, V, F = _clean_split_body(*args)
+            return S, q_to_face(V), F
+        return jax.jit(split, out_shardings=(qb3, NamedSharding(mesh_xy,P(None,'x','y')), qb3))
 
     # The face route (a mesh backup at every whole-matrix site): a
     # chunk whose q count does not divide the mesh (the q-batched layout degrades to
@@ -1061,7 +1117,10 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
                     eigh, split = _kernels(nb)
                     native = eigh_plan.is_native and distrib_la_batched_route == "auto"
                     herm = 0.5 * (c + jnp.conj(jnp.swapaxes(c, -2, -1)))
-                    return split(*(eigh(herm) if native else eigh_plan.batched(herm)), zg, *t)
+                    lam, R = eigh(herm) if native else eigh_plan.batched(herm)
+                    if not native:
+                        R = face_to_q(R)
+                    return split(lam, R, zg, *t)
 
                 def tiles(c, zg, *t):
                     plan, herm, split = _face_parts(nb)
@@ -1069,7 +1128,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
                 whole = lambda: compiled_price(owners, c_abs, zeta(P(("x", "y"), None, None)),
                                                *tables(_qb(nb)[0]), ranks=ndev, face=False,
                                                arguments=True, source="q-owner chunk program")
-                tiled = lambda: compiled_price(tiles, c_abs, zeta(P(None, None, ("x", "y"))),
+                tiled = lambda: compiled_price(tiles, c_abs, zeta(P(None, ("x", "y"), None)),
                                                *tables(rep), ranks=ndev, face=True,
                                                arguments=True, source="face chunk program")
                 _routes[nb] = memory.admit(f"BSE V(q) coarse chunk {nb} x {n_mu}^2", (
@@ -1092,10 +1151,16 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
                 return 0.5 * (c + jnp.conj(jnp.swapaxes(c, -2, -1)))
 
             out = _ns(mesh_xy, P(None, "x", "y"), (nb, n_mu, n_mu), "prepare_coarse.face_S")
+            from runtime.padding import padded_axis
+            gpad = int(padded_axis(ngkmax, mesh_xy, spec=P(None,'x','y'), axis=2,
+                                  name='VQ interpolation sphere G').carrier)
 
-            @partial(jax.jit, out_shardings=(out, out, _ns(mesh_xy, P(None, None, ("x", "y")),
-                                                           (nb, n_mu, nG), "prepare_coarse.face_F")))
+            @partial(jax.jit, out_shardings=(out, out,
+                NamedSharding(mesh_xy, P(None, ('x', 'y'), None))))
             def split(lam, R, ZGq, v_ref, v_lr, idx, qfr_b):
+                ZGq = jnp.pad(ZGq, ((0,0),(0,0),(0,gpad-ngkmax)))
+                v_ref = jnp.pad(v_ref, ((0,0),(0,gpad-ngkmax)))
+                v_lr = jnp.pad(v_lr, ((0,0),(0,gpad-ngkmax)))
                 ZG = jax.lax.with_sharding_constraint(ZGq, face3)
                 return _clean_split_body(lam, R, ZG, v_ref, v_lr, idx, qfr_b, mm=mm)
             _face_programs[key] = (fplan, herm, split)
@@ -1104,7 +1169,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     def _face_chunk(sl, nb):
         fplan, herm, split = _face_parts(nb)
         lam, R = fplan.batched(herm(C_q[sl]))
-        zg = _ns(mesh_xy, P(None, None, ("x", "y")), (nb, n_mu, ngkmax), "prepare_coarse.face_zeta")
+        zg = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
         return split(lam, R, zx["ZG"].read_q_slab(sl.start, nb, sharding=zg),
                      device_put_process_local(v_ref_all[sl], rep),
                      device_put_process_local(v_lr_all[sl], rep),
@@ -1116,7 +1181,39 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     V_SRc_np = (np.empty((nq, n_mu, n_mu), dtype=np.complex128)
                 if keep_host_mirrors else None)
     V_dev_chunks = []
-    Fch = np.empty((nq, n_mu, nG), dtype=np.complex128)
+    mu3 = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+    mu2 = NamedSharding(mesh_xy, P(None, ('x', 'y')))
+    mu_slices = {((idx[-1].start or 0), (idx[-1].stop or n_mu))
+                 for idx in mu3.addressable_devices_indices_map((nq, nG, n_mu)).values()}
+    Fch = {(lo, hi): np.empty((nq, nG, hi-lo), dtype=np.complex128)
+           for lo, hi in sorted(mu_slices)}
+
+    @partial(jax.jit, out_shardings=mu3)
+    def fit_columns(f):
+        # Mask before any host copy, including NaN poison in carrier rows.
+        return jnp.where(jnp.arange(n_mu)[None, None, :] < n_mu_logical,
+                         f.transpose(0, 2, 1), 0)
+
+    def save_fit_columns(sl, f):
+        # A reshard, followed only by reads of this process's local μ blocks.
+        # No process ever obtains another process's polynomial RHS columns.
+        from runtime.aot_memory import compiled_price
+        executable = fit_columns.lower(f).compile()
+        price = compiled_price(compiled=executable, ranks=ndev, face=True,
+                               source='VQ fit-column reshard and logical mask')
+        memory.admit('BSE V(q) fit columns', (('centroid shards', price),),
+                     memory.room(bucketed=False))
+        local = executable(f)
+        error = None
+        try:
+            for shard in local.addressable_shards:
+                mu = shard.index[-1]
+                key = (mu.start or 0, mu.stop or n_mu)
+                Fch[key][sl] = np.asarray(shard.data)
+        except Exception as exc:
+            error = exc
+        agree_io_error(error, path='VQ local fit',
+                       stage=f'vq_interp.fit_columns.{sl.start}.{sl.stop}')
 
     def C_herm(sl):
         """Hermitised C_q, PER CHUNK.  ``C_q`` is a device array sharded on the
@@ -1138,7 +1235,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
                 S_np[sl], V_SRc_np[sl] = _to_host(S_b), _to_host(V_b)
             else:
                 V_dev_chunks.append(V_b)
-            Fch[sl] = _to_host(F_b)
+            save_fit_columns(sl, F_b)
             continue
         (_eigh_batch, _clean_split) = _kernels(nb_lead)
         qb2, qb3 = _qb(nb_lead)
@@ -1154,26 +1251,28 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
             # batched post-eigh pipeline follows either way (single source
             # for the math).
             lam, R = eigh_plan.batched(C_herm(sl))
+            R = face_to_q(R)
         # Process-local placement of the host chunks (scorecard AA.1) —
         # same file / same host tables on every rank, so plain
         # ``device_put``'s hidden assert_equal all-gather (5 × per chunk)
         # verifies a tautology.  LORRAX_CHECK_REPLICA=1 re-arms it.
         #
-        # ζ is the exception: it is NOT a small host table, it is the
-        # 47.8-GB q-stack, and ``device_put_process_local`` still needs
-        # the WHOLE q-chunk in host numpy on every rank before it slices
-        # out that rank's shard (15.9 GB per rank per chunk at the
-        # reference extents).  ``read_q_slab`` asks the ζ reader for the
-        # same chunk on the same sharding and, when the deployment can
-        # serve SlabIO, each rank hyperslabs only its own shard off disk.
-        # Same elements, same layout; it is a transport change.
-        S_b, V_b, F_b = _clean_split(
+        # ζ is read directly into its distributed q-owner layout. A supplied
+        # production mesh requires SlabIO; there is no full-q host fallback.
+        operands = (
             lam, R,
             zx["ZG"].read_q_slab(sl.start, nb_lead, sharding=qb3),
             device_put_process_local(v_ref_all[sl], qb2),
             device_put_process_local(v_lr_all[sl], qb2),
             device_put_process_local(idx_all[sl], qb2),
             device_put_process_local(zx["qfr"][sl], qb2))
+        from runtime.aot_memory import compiled_price
+        executable = _clean_split.lower(*operands).compile()
+        price = compiled_price(compiled=executable, ranks=ndev, face=True,
+                               source='VQ q-owner cleaning and face output')
+        memory.admit('BSE V(q) cleaned chunk', (('staged matrix faces', price),),
+                     memory.room(bucketed=False))
+        S_b, V_b, F_b = executable(*operands)
         # ``_to_host``, not device_get: S_b/V_b/F_b are q-sharded qb3 across
         # the whole mesh, so at P>1 their shards span other processes.  This
         # is the deterministic loop ``_to_host``'s docstring relies on.
@@ -1182,7 +1281,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
             V_SRc_np[sl] = _to_host(V_b)
         else:
             V_dev_chunks.append(V_b)
-        Fch[sl] = _to_host(F_b)
+        save_fit_columns(sl, F_b)
     tail = float(np.exp(-zx["zeta_cutoff"] / (4.0 * alpha ** 2)))
     log.debug(f"  [prep] gset({alpha}) = {nG} G; {n_out} out-of-sphere (q,G) "
               f"channels zero-filled; sphere-tail bound {tail:.1e}"
@@ -1198,6 +1297,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     del V_dev_chunks
     return {"alpha": alpha, "eps_tik": eps_tik, "GS": GS, "S": S_np,
             "V_SRc": V_SRc_dev, "V_SRc_np": V_SRc_np, "Fch": Fch, "W": W,
+            "mu_sharding": mu2, "n_mu": n_mu,
             # the degrees the SUPERSET was built with — lr_design_blocks
             # refuses a wider request against it (silent-narrowing guard)
             "lr_gz_degrees": (degrees if os.environ.get(
@@ -1212,7 +1312,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
 
 
 # ===========================================================================
-# STAGE 2 — the global b26p LR fit (host/replicated; see module docstring)
+# STAGE 2 — one global b26p LR fit on independent local centroid columns
 # ===========================================================================
 def _poly_spec(d):
     """[(a, b)] with a+b ≤ d, graded order."""
@@ -1230,7 +1330,7 @@ def _eval_basis_np(Kpar, spec, alpha):
 def lr_design_blocks(zx, prep, degrees=None):
     """Per-(G_z, q) weighted normal blocks of the LR fit:
         AtA[gz][q] = Φ^T diag(w) Φ     (nb, nb)   real basis
-        AtY[gz][q] = Φ^T diag(w) Y     (nb, n_μ)
+        AtY[gz][μ0,μ1][q] = Φ^T diag(w) Y[:,μ0:μ1]
     with Φ the in-plane design at the (q, G) samples of channel gz,
     w = v_LR(q+G), Y = Fch samples.  Channels with |gz| absent from
     ``degrees`` are model-zero (dropped).  Per-q blocks make LOO refits
@@ -1257,7 +1357,8 @@ def lr_design_blocks(zx, prep, degrees=None):
                 f"silently dropped from the fit.  Rebuild prepare_coarse with "
                 f"the same `degrees`, or set LORRAX_VQ_LR_GZ_TRIM=0.")
     nq = zx["nq"]
-    des = {"specs": {}, "AtA": {}, "AtY": {}, "alpha": prep["alpha"]}
+    des = {"specs": {}, "AtA": {}, "AtY": {}, "alpha": prep["alpha"],
+           "mu_sharding": prep["mu_sharding"], "n_mu": prep["n_mu"]}
     for g, cols in prep["gz_cols"].items():
         if abs(g) not in degrees:
             continue
@@ -1265,7 +1366,8 @@ def lr_design_blocks(zx, prep, degrees=None):
         nb = len(spec)
         assert nb <= 0.6 * len(cols) * nq, f"gz={g}: basis under-determined"
         AtA = np.empty((nq, nb, nb))
-        AtY = np.empty((nq, nb, zx["n_mu"]), dtype=np.complex128)
+        AtY = {key: np.empty((nq, nb, block.shape[-1]), dtype=np.complex128)
+               for key, block in prep["Fch"].items()}
         for q in range(nq):
             qG = zx["qfr"][q][:, None] + prep["GS"][:, cols].astype(np.float64)
             Kpar = (zx["bvec"].T @ qG)[:2]
@@ -1273,7 +1375,8 @@ def lr_design_blocks(zx, prep, degrees=None):
             w = prep["W"][q][cols]
             Pw = Phi * w[:, None]
             AtA[q] = Phi.T @ Pw
-            AtY[q] = Pw.T @ prep["Fch"][q][:, cols].T
+            for key, block in prep['Fch'].items():
+                AtY[key][q] = Pw.T @ block[q, cols]
         des["specs"][g] = spec
         des["AtA"][g] = AtA
         des["AtY"][g] = AtY
@@ -1285,16 +1388,16 @@ def lr_design_blocks(zx, prep, degrees=None):
 
 def fit_lr_model(des, exclude=None):
     """STAGE 2 solve: one ridge-stabilised normal solve per G_z channel
-    over all coarse q except ``exclude``.  Returns {gz: C (nb, n_μ)} —
-    n_μ × 26 complex TOTAL for b26p."""
+    over all coarse q except ``exclude``. Returns per-channel maps from
+    addressable μ intervals to coefficient blocks (nb, local_μ)."""
     nq = next(iter(des["AtA"].values())).shape[0]
     sel = [q for q in range(nq) if q != exclude]
     out = {}
     for g in des["specs"]:
         A = des["AtA"][g][sel].sum(0)
-        Y = des["AtY"][g][sel].sum(0)
         A = A + RIDGE * (np.trace(A) / A.shape[0]) * np.eye(A.shape[0])
-        out[g] = np.linalg.solve(A, Y)
+        out[g] = {key: np.linalg.solve(A, block[sel].sum(0))
+                  for key, block in des['AtY'][g].items()}
     return out
 
 
@@ -1321,7 +1424,8 @@ def stencil_pinv(q_train, Rset):
 def pack_coeffs(des, coeffs):
     """Fitted b26p coefficients as a jit-friendly tuple, in the fixed
     channel order of ``des['specs']`` (dict order is stable per build)."""
-    return tuple(jnp.asarray(coeffs[g]) for g in des["specs"])
+    return tuple(_put_mu_tiles(coeffs[g], (len(des['specs'][g]), des['n_mu']),
+                               des['mu_sharding']) for g in des['specs'])
 
 
 _MBZ_DQ_CACHE: dict = {}
@@ -1662,7 +1766,8 @@ def make_eval_vq(zx, prep, des, mesh_xy: Mesh, n_rmu_pad: int | None = None,
     GS = jnp.asarray(prep["GS"].astype(np.float64))          # (3, nG)
     nG = int(GS.shape[1])
     bvec = jnp.asarray(zx["bvec"])
-    rmu = jnp.asarray(zx["rmu_frac"])                        # (n_μ, 3)
+    rmu = jnp.where(jnp.arange(n_mu)[:, None] < int(zx.get('n_mu_logical', n_mu)),
+                    jnp.asarray(zx["rmu_frac"]), 0)        # (n_μ, 3)
     R7 = jnp.asarray(stencil_r7(zx).astype(np.float64))      # (7, 3)
     alpha = float(prep["alpha"])
     zc = float(np.pi / zx["bvec"][2, 2])
@@ -1752,7 +1857,7 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
     copy of the setup sequence.
 
     Returns a ``SimpleNamespace`` with every handle the per-Q evaluation needs:
-        .zx, .prep, .des, .coeffs        the fitted coarse-side model
+        .zx, .prep, .des, .coeffs        geometry and local fit coefficients
         .eval_vq                         the ONE jitted evaluator (Q runtime arg)
         .pinvF                           stencil pseudo-inverse (Q-independent)
         .coeffs_packed                   jit-friendly coefficient tuple
@@ -1773,8 +1878,7 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
         zeta_file = os.path.join(os.path.dirname(restart_file), "zeta_q.h5")
     # ``mesh_xy`` reaches the ζ reader so ``prepare_coarse``'s q-chunk
     # read is a per-rank SlabIO hyperslab rather than a whole-chunk host
-    # read on every rank.  The reader announces and falls back to the
-    # local h5py plan when the deployment cannot serve SlabIO.
+    # read on every rank. An unavailable sharded transport refuses.
     zx = read_vq_payload(restart_file, zeta_file, mesh=mesh_xy,
                           log_fn=log_fn, input_file=input_file, require_slab=False)
     # THE ONE SITE, moved here from the loader: this function is the b26p
@@ -1791,14 +1895,22 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
                           distrib_la_batched_route=distrib_la_batched_route,
                           keep_host_mirrors=run_diagnostics,
                           fit_ecut=fit_ecut)
-    des = lr_design_blocks(zx, prep)
-    coeffs = fit_lr_model(des)
+    error = None
+    try:
+        des = lr_design_blocks(zx, prep)
+        coeffs = fit_lr_model(des)
+    except Exception as exc:
+        error = exc
+    agree_io_error(error, path=restart_file, stage='vq_interp.local_polynomial_fit')
     if run_diagnostics:
         run_nulls(zx, prep, des, coeffs)
     eval_vq = make_eval_vq(zx, prep, des, mesh_xy, n_rmu_pad,
                            head_minibz_average=head_minibz_average)
     pinvF = jnp.asarray(stencil_pinv(zx["qfr"], stencil_r7(zx)))
     coeffs_packed = pack_coeffs(des, coeffs)
+    if not run_diagnostics:
+        # These local fit inputs are dead once the runtime coefficient tuple exists.
+        del prep['Fch'], des['AtY']
     return SimpleNamespace(
         zx=zx, prep=prep, des=des, coeffs=coeffs, eval_vq=eval_vq,
         pinvF=pinvF, coeffs_packed=coeffs_packed,
@@ -1808,6 +1920,11 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
 def eval_vq_host(zx, prep, des, coeffs, qfrac, train=None):
     """Host-side reference evaluation (LOO ladders, nulls, tests) — the
     same arithmetic as the jitted evaluator, numpy throughout."""
+    _diagnostic_host_bound('eval_vq_host',
+        32*int(zx['nq'])*int(zx['n_mu'])**2
+        + 48*int(zx['n_mu'])*int(prep['GS'].shape[1]))
+    # This explicit, bounded reference is the only global coefficient host copy.
+    coefficients = dict(zip(des['specs'], map(_to_host, pack_coeffs(des, coeffs))))
     if train is None:
         train = list(range(zx["nq"]))
     R7 = stencil_r7(zx)
@@ -1822,7 +1939,7 @@ def eval_vq_host(zx, prep, des, coeffs, qfrac, train=None):
     for g, spec in des["specs"].items():
         cols = prep["gz_cols"][g]
         Phi = _eval_basis_np(Kall[:2][:, cols], spec, prep["alpha"])
-        M[:, cols] = (Phi @ coeffs[g]).T
+        M[:, cols] = (Phi @ coefficients[g]).T
     v = v_slab_on_set(zx, qf, GS, kind="slab_lr", alpha=prep["alpha"])
     qG = qf[None, :] + GS.T.astype(np.float64)
     zt = np.exp(-2j * np.pi * (zx["rmu_frac"] @ qG.T)) * M
@@ -1834,6 +1951,15 @@ def eval_vq_host(zx, prep, des, coeffs, qfrac, train=None):
 # nulls (must hold at machine level before any accuracy number is read)
 # ===========================================================================
 def run_nulls(zx, prep, des, coeffs):
+    _diagnostic_host_bound('run_nulls',
+        64*int(zx['nq'])*int(zx['n_mu'])**2
+        + 32*int(zx['nq'])*int(zx['n_mu'])*int(prep['GS'].shape[1])
+        + 32*min(48, int(zx['nq']))*int(zx['n_mu'])*int(zx['ngkmax']))
+    # The production fit owns local μ columns. Only this bounded reference
+    # materializes the global form factors used by the literal null equations.
+    shape = (int(zx['nq']), int(prep['GS'].shape[1]), int(zx['n_mu']))
+    form_factors = _to_host(_put_mu_tiles(prep['Fch'], shape,
+        NamedSharding(des['mu_sharding'].mesh, P(None, None, ('x', 'y'))))).transpose(0, 2, 1)
     ok = True
 
     def log(k, v, tol):
@@ -1856,7 +1982,7 @@ def run_nulls(zx, prep, des, coeffs):
         relF(np.tensordot(w, prep["V_SRc_np"], axes=(0, 0)),
              prep["V_SRc_np"][q0]), 1e-9)
     log("exact_stencil_Fch_train_point",
-        relF(np.tensordot(w, prep["Fch"], axes=(0, 0)), prep["Fch"][q0]),
+        relF(np.tensordot(w, form_factors, axes=(0, 0)), form_factors[q0]),
         1e-9)
     # own F rebuild == cleaned LR tile (channel machinery consistency;
     # bounded by the out-of-sphere zero-fill)
@@ -1886,7 +2012,7 @@ def run_nulls(zx, prep, des, coeffs):
         sl = slice(q0, min(q0 + 48, zx["nq"]))
         rr.extend(np.asarray(jax.device_get(_rebuild_chunk(
             jnp.asarray(zx["ZG"][sl]), jnp.asarray(v_lr_all[sl]),
-            jnp.asarray(prep["S"][sl]), jnp.asarray(prep["Fch"][sl]),
+            jnp.asarray(prep["S"][sl]), jnp.asarray(form_factors[sl]),
             jnp.asarray(prep["W"][sl]), jnp.asarray(zx["qfr"][sl])))))
     log("F_own_rebuild_vs_cleaned_LR_tile_max", float(np.max(rr)), 1e-6)
     assert ok, "vq_interp null battery FAILED — stop"
@@ -1930,6 +2056,11 @@ def build_hdir(zx, q0, nvw=3, ncw=3):
     # question about the same object, so it keeps the subscript out of
     # the guarded body rather than teaching that matcher an exception.
     _nq_expected = int(np.prod(np.asarray(kg, dtype=np.int64)))
+    _npair = int(zx['nk'])*int(ncw)*int(nvw)
+    _diagnostic_host_bound('build_hdir', 16*(4*_npair**2
+        + 3*_nq_expected*int(zx['n_mu'])**2
+        + 8*int(zx['nk'])*(int(nvw)+int(ncw))*int(zx['ns'])*int(zx['n_mu'])
+        + 2*int(zx['nk'])*(int(ncw)**2+int(nvw)**2)*int(zx['n_mu'])))
     _nq_w0 = int(zx["W0"].shape[0])
     if _nq_w0 != _nq_expected:
         raise ValueError(
@@ -1949,8 +2080,8 @@ def build_hdir(zx, q0, nvw=3, ncw=3):
                      for kp in range(zx["nk"])] for k in range(zx["nk"])])
     D = np.array([zx["enk"][kqs[k], c] - zx["enk"][k, v]
                   for k in range(zx["nk"]) for c in cs for v in vs])
-    psic = np.ascontiguousarray(zx["psi"][:, cs])
-    psiv = np.ascontiguousarray(zx["psi"][:, vs])
+    psic = np.ascontiguousarray(_to_host(zx["psi"][:, jnp.asarray(cs)]))
+    psiv = np.ascontiguousarray(_to_host(zx["psi"][:, jnp.asarray(vs)]))
     psic_kq = psic[kqs]
     # ``zx["W0"]`` is a lazy h5py dataset (see read_vq_payload) and the q
     # lookup below is an unsorted permutation, which h5py cannot fancy-index.
@@ -2608,12 +2739,9 @@ def refit_ongrid_null(zx, rst, V_stored, kgrid_vq, mesh_xy, log_fn=log.debug,
         # need no gather.
         V_ref = jax.device_put(
             V_stored[:, :, ix % kg[0], iy % kg[1], iz % kg[2]], sh)
-        n_mu = min(int(V_ref.shape[0]), int(zx["n_mu"]))
-        V_new = refit_vq(zx, rst, qfr, mesh_xy, log_fn=lambda *_: None)
-        pad = np.zeros(tuple(int(v) for v in V_ref.shape), dtype=np.complex128)
-        pad[:n_mu, :n_mu] = V_new[:n_mu, :n_mu]
-        V_new_d = device_put_process_local(pad, sh)
-        rel = float(jnp.linalg.norm(V_new_d - V_ref)
+        V_new = refit_vq(zx, rst, qfr, mesh_xy, log_fn=lambda *_: None,
+                        n_mu_out=int(V_ref.shape[0]))
+        rel = float(jnp.linalg.norm(V_new - V_ref)
                     / jnp.maximum(jnp.linalg.norm(V_ref), 1e-300))
         out.append(((ix, iy, iz), rel))
         worst = max(worst, rel)
@@ -2684,6 +2812,12 @@ def _refit_kernels(nk, nb, ns, n_mu, mesh_xy: Mesh):
     @partial(jax.jit, out_shardings=face)
     def _x(psi_m_mu, psi_mu):
         # X[k,m,n,μ] = Σ_s conj(u^{ht}_{m,k−q,s}(μ)) u_{n,k,s}(μ)  (spin-traced)
+        # htransform targets are physical centroids; the restart loader
+        # carries them padded over all ranks. Pad inside the face program.
+        if psi_m_mu.shape[-1] > n_mu:
+            raise ValueError("htransform centroid extent exceeds the restart carrier")
+        psi_m_mu = jnp.pad(psi_m_mu, ((0, 0), (0, 0), (0, 0),
+                                      (0, n_mu-psi_m_mu.shape[-1])))
         X = jnp.einsum("kmsu,knsu->kmnu", jnp.conj(psi_m_mu), psi_mu)
         return jnp.pad(X.reshape(m, n_mu), ((0, m_pad - m), (0, n - n_mu)))[None]
 
@@ -2758,12 +2892,15 @@ def close_refit_state(rst: dict) -> None:
 
 
 def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=log.debug,
-             m_leg: str = "htransform"):
+             m_leg: str = "htransform", *, n_mu_out=None):
     """Ground-truth V at TILE momentum ``q_tile_frac`` via a per-Q ζ refit.
 
     Tile-momentum labeling matches ``V_qmunu`` / ``eval_vq``: the pair
     density carries conduction at wrap(k − q).  Returns the (n_μ, n_μ)
-    host tile (Hermitian by construction).
+    complex128 device face at ``P('x','y')`` (Hermitian by construction).
+    ``n_mu_out`` names the consumer's padded centroid carrier; by default
+    the producer's G-flat carrier is retained. No zeta or V host gather is
+    part of this operation.
 
     ``m_leg``: ``"htransform"`` (production — works at ANY q) or
     ``"stored"`` (on-grid q only: the m-leg is the stored grid ψ at the
@@ -2779,6 +2916,7 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=log.debug,
 
     t0 = _time.time()
     nk, nb, ns, n_mu = zx["nk"], zx["nb"], zx["ns"], zx["n_mu"]
+    psi = _coarse_device_psi(zx, mesh_xy)
     rank = rst["rank"]
     qw = np.asarray(q_tile_frac, dtype=np.float64)
     qw = qw - np.round(qw)
@@ -2807,7 +2945,7 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=log.debug,
         kqs = np.array([
             int(rst["sym"].find_qpoint_index(k_frac - qw))
             for k_frac in rst["k_frac"]], dtype=np.int64)
-        psi_m_mu = jnp.asarray(zx["psi"][kqs])
+        psi_m_mu = psi[kqs]
         c_m = None
     else:
         # IMPORTED IN THE BRANCH THAT USES IT.  ``bandstructure.bse_setup``
@@ -2828,11 +2966,11 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=log.debug,
             ctilde=rst["ctilde"], B_at_mu=rst["B_at_mu"],
             enk_sigma=rst["enk_sigma"], kgrid_co=rst["kgrid_co"],
             band_window_fi=(0, nb), mesh_xy=mesh_xy, q_list=qm_list,
-            return_coeffs=True)
+            return_coeffs=True, n_mu_out=n_mu)
         psi_m_mu = jnp.asarray(bundle.psi_rmu_Y)      # (nk, nb, ns, n_μ)
         c_m = jnp.asarray(bundle.coeffs_fi)           # (nk, rank, nb)
 
-    Xf = x_face(psi_m_mu, jnp.asarray(zx["psi"]))
+    Xf = x_face(psi_m_mu, psi)
     X4 = Xf[0, :nk * nb * nb, :n_mu].reshape(nk, nb, nb, n_mu)
     # THE PRODUCER'S FACTOR, once per Q: the rank-truncated pseudo-inverse of the charge fit
     # (isdf.core._factor_c_q_face, which reports its cut), its eigh placed by distrib_la's
@@ -2895,13 +3033,14 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=log.debug,
             receipt["fh"], receipt["zeta"])
         log_fn(f"  [refit] Galerkin full-r residual {receipt['fh']:.3e} (fH) "
                f"/ {receipt['zeta']:.3e} (zeta window)")
-    zt = _to_host(gflat_acc[0])[:n_mu]
     # The producer's kernel on a bulk deck, this module's slab one otherwise;
     # ``rst["v_on_set"]`` is built once in refit_prepare.  See make_v_on_set.
     v = rst.get("v_on_set", None)
     v = v(qw, GS) if v is not None else v_slab_on_set(zx, qw, GS)
-    A = zt * np.sqrt(v)[None, :]
-    V = np.conj(A) @ A.T
+    from gw.v_q_g_flat import coulomb_gram_gflat
+    V = coulomb_gram_gflat(gflat_acc, v, mesh_xy=mesh_xy,
+                           n_mu_logical=int(zx.get("n_mu_logical", n_mu)),
+                           n_mu_out=n_mu_out)
     log_fn(f"  [refit] q_tile={np.array2string(qw, precision=4)}: "
            f"|G_sphere|={GS.shape[1]}, {_time.time()-t0:.1f}s")
     return V
