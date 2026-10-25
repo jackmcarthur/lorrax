@@ -347,9 +347,18 @@ class _SerialBackend(_DatasetGeometry):
             with _journal.op_scope("open", self.path, stack=STACK_H5PY,
                                    mode=mode):
                 self._h5 = h5py.File(self.path, mode)
+                from .commit_state import assert_committed, set_commit_state
+                if mode in ('a', 'r'):
+                    assert_committed(self._h5, path=self.path)
+                if mode != 'r':
+                    set_commit_state(self._h5, False)
         except BaseException:
-            note_close(self.path, self._owner_token)
-            self._owner_token = None
+            try:
+                if getattr(self, '_h5', None) is not None:
+                    self._h5.close()
+            finally:
+                note_close(self.path, self._owner_token)
+                self._owner_token = None
             raise
         # ``fh`` is read by ``SlabIO._handle()`` for the journal's handle
         # field.  There is no ctx address to report — the handle this tier
@@ -360,6 +369,7 @@ class _SerialBackend(_DatasetGeometry):
         self._geom_init()
         self._deferred_attrs: list[tuple[str, object]] = []
         self._deferred_ds_attrs: list[tuple[str, dict]] = []
+        self._closed = False
 
     # ------------------------------------------------------------------
     def _drain_pending(self) -> int:
@@ -542,8 +552,15 @@ class _SerialBackend(_DatasetGeometry):
                         f"GATE slab_io_write_finite: got: a non-finite value in the "
                         f"block of {name!r} at slab start {tuple(starts)}; want: every "
                         f"value finite (write_slab require_finite=True); nothing written")
-        for starts, block in blocks:
-            self._write_block(ds, block, starts, off, vshape)
+        try:
+            for starts, block in blocks:
+                self._write_block(ds, block, starts, off, vshape)
+        except BaseException as exc:
+            # A later shard can fail after an earlier one reached disk. As
+            # with the native writer's sticky worker error, catching the
+            # immediate exception must not bless a partially written file.
+            self._write_error = exc
+            raise
 
     @staticmethod
     def _write_block(ds, block: np.ndarray, starts: Sequence[int],
@@ -849,7 +866,13 @@ class _SerialBackend(_DatasetGeometry):
         with that one must not diverge here.  ``note_close`` is idempotent
         against the token, so a second ``close()`` is a no-op.
         """
+        if self._closed:
+            return
+        self._closed = True
         from .hdf5_owner import note_close, open_scope
+        from .commit_state import set_commit_state
+        attrs, ds_attrs = self._deferred_attrs, self._deferred_ds_attrs
+        self._deferred_attrs, self._deferred_ds_attrs = [], []
         try:
             with _journal.op_scope("close", self.path, stack=STACK_H5PY,
                                    mode=self.mode):
@@ -858,24 +881,28 @@ class _SerialBackend(_DatasetGeometry):
             if self._owner_token is not None:
                 note_close(self.path, self._owner_token)
                 self._owner_token = None
-        if self._deferred_attrs or self._deferred_ds_attrs:
-            import h5py
+        if self.mode == 'r':
+            if attrs or ds_attrs:
+                raise RuntimeError("SlabIO mode='r' acquired deferred write metadata")
+            return
+        error = getattr(self, '_context_error', None) or getattr(self, '_write_error', None)
+        if error is not None:
+            raise error
+        import h5py
 
-            with open_scope(self.path, STACK_H5PY, "a",
-                            where="_SerialBackend.close deferred-attr reopen"), \
-                    _journal.op_scope(
-                        "attr_w", self.path, stack=STACK_H5PY, mode="a",
-                        cnt=(len(self._deferred_attrs),
-                             len(self._deferred_ds_attrs))), \
-                    h5py.File(self.path, "a") as h5:
-                for name, value in self._deferred_attrs:
-                    if name in h5:
-                        del h5[name]
-                    host = value
-                    if not isinstance(host, np.ndarray):
-                        host = np.asarray(jax.device_get(host))
-                    h5.create_dataset(name, data=host)
-                _apply_dataset_attrs(h5, self._deferred_ds_attrs)
-                h5.flush()
-        self._deferred_attrs = []
-        self._deferred_ds_attrs = []
+        with open_scope(self.path, STACK_H5PY, "a",
+                        where="_SerialBackend.close deferred-attr reopen"), \
+                _journal.op_scope(
+                    "attr_w", self.path, stack=STACK_H5PY, mode="a",
+                    cnt=(len(attrs), len(ds_attrs))), \
+                h5py.File(self.path, "a") as h5:
+            for name, value in attrs:
+                if name in h5:
+                    del h5[name]
+                host = value
+                if not isinstance(host, np.ndarray):
+                    host = np.asarray(jax.device_get(host))
+                h5.create_dataset(name, data=host)
+            _apply_dataset_attrs(h5, ds_attrs)
+            h5.flush()
+            set_commit_state(h5, True)

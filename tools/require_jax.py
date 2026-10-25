@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refuse any LORRAX launch unless JAX and JAXLIB are in the platform's window.
+"""Refuse unless JAX and JAXLIB are final releases in the platform's window.
 
 Package metadata is inspected without importing JAX, so this preflight cannot
 initialize a CPU client, start distributed coordination, or consume the one
@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import re
 import sys
 from importlib import metadata
 from pathlib import Path
@@ -42,13 +41,6 @@ def _version(distribution: str) -> str:
         raise RuntimeError(f"{distribution} is not installed") from None
 
 
-def _release(version: str) -> tuple[int, int, int]:
-    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", version)
-    if match is None:
-        raise RuntimeError(f"cannot parse version {version!r}")
-    return tuple(int(v) for v in match.groups(default="0"))
-
-
 def main() -> int:
     support = _load("_lorrax_jax_support", _JAX_SUPPORT)
     legs = _load("_lorrax_legs", _LEGS)
@@ -58,12 +50,13 @@ def main() -> int:
     window = support.describe_window(key)
     try:
         versions = {name: _version(name) for name in ("jax", "jaxlib")}
-        releases = {name: _release(version) for name, version in versions.items()}
+        releases = {name: support.release_version_info(version)
+                    for name, version in versions.items()}
     except RuntimeError as exc:
         print(f"JAX_ENV_REFUSED: {exc}", file=sys.stderr)
         return 86
     wrong = {name: versions[name] for name, vi in releases.items()
-             if not support.in_window(vi, key)}
+             if not vi or not support.in_window(vi, key)}
     if not wrong and releases["jax"][:2] != releases["jaxlib"][:2]:
         wrong = dict(versions)
     gpu_problems = support.check_gpu_packages(
@@ -73,8 +66,8 @@ def main() -> int:
         rendered = ", ".join(f"{name}={version}" for name, version in wrong.items())
         rendered = "; ".join(filter(None, (rendered, *gpu_problems)))
         print(
-            f"JAX_ENV_REFUSED: required jax/jaxlib of one series, {window}, on the "
-            f"{key} leg; got " + rendered,
+            f"JAX_ENV_REFUSED: required final released jax/jaxlib of one series, "
+            f"{window}, on the {key} leg; got " + rendered,
             file=sys.stderr,
         )
         print(

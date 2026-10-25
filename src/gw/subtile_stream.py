@@ -315,13 +315,15 @@ def projection_complete(psi_left, psi_right, mesh):
 
 @lru_cache(maxsize=None)
 def green_operand_program(mesh, sum_layout):
-    """Place two Green faces and an optional projection pair once per dispatch.
+    """Place the newly owned Green/projection operands once per dispatch.
 
     Input Green faces are ``(parent, spin, μ, band)`` and
     ``(parent, band, spin, ν)``. Axis outputs have every band local: left
     μ-major (:func:`green_rows`), right conjugated and merged as the Green
-    product reads it. Face outputs keep both mesh axes distributed. Optional
-    projection faces use :func:`projection_complete` in either layout.
+    product reads it. Face consumers borrow both canonical Green faces;
+    they form the right contraction's conjugation/layout inside their own
+    program, so its workspace is neither copied nor retained by placement.
+    Optional projection faces use :func:`projection_complete` in either layout.
     The cache holds programs and geometry, never ψ values.
     """
     from .greens_function_kernel import green_right_operand
@@ -332,17 +334,18 @@ def green_operand_program(mesh, sum_layout):
     def place(left, right, *projection):
         if len(projection) not in (0, 2):
             raise ValueError("Green placement needs zero or two projection faces")
-        if sum_layout == "axis":
-            left, right = band_complete(left, right, mesh)
-            left = green_rows(left, mesh)
-        else:
-            left = jax.lax.with_sharding_constraint(
-                left, NamedSharding(mesh, P(None, None, "x", "y")))
-            right = jax.lax.with_sharding_constraint(
-                right, NamedSharding(mesh, P(None, "x", None, "y")))
         tail = projection_complete(*projection, mesh) if projection else ()
+        if sum_layout == "face":
+            return tail
+        left, right = band_complete(left, right, mesh)
+        left = green_rows(left, mesh)
         return left, green_right_operand(right), *tail
     return place
+
+
+def _with_borrowed_green_faces(layout, operands, placed):
+    """Complete the consumer bundle without dispatching/copying borrowed faces."""
+    return (*operands[:2], *placed) if layout == "face" else placed
 
 
 def prepare_green_operands(operands, mesh, build, *, label, compile_only=False,
@@ -366,12 +369,17 @@ def prepare_green_operands(operands, mesh, build, *, label, compile_only=False,
     for layout in layouts:
         placement = green_operand_program(mesh, layout).lower(*operands).compile()
         place_new = -agreed_chunk(-compiled_new_bytes(placement))
-        room = agreed_chunk(int(memory.room()))
+        # The programs do not key on room; no rounding is needed for this choice.
+        # room() already agrees the minimum across ranks.
+        room = memory.room(bucketed=False)
         if layout == "axis" and place_new > room and _force_layout is None:
             continue
-        abstract = jax.tree.map(
+        placed_abstract = jax.tree.map(
             lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=a.sharding),
             placement.out_info)
+        source_abstract = jax.tree.map(
+            lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=a.sharding), operands)
+        abstract = _with_borrowed_green_faces(layout, source_abstract, placed_abstract)
         context, programs, native = build(layout, abstract)
         consumer_new = max(compiled_new_bytes(p, extra=native) for p in programs)
         stats = placement.memory_analysis()
@@ -380,15 +388,15 @@ def prepare_green_operands(operands, mesh, build, *, label, compile_only=False,
         price = memory.priced(0, f"{label} {layout} sum-band placement + compiled window",
                               spread=needed * mesh.size, ranks=mesh.size)
         candidates.append((layout, price, placement, context))
-        if needed <= agreed_chunk(int(memory.room())):
+        if needed <= memory.room(bucketed=False):
             break
     chosen = memory.admit(f"{label} sum-band operands", [(c[0], c[1]) for c in candidates],
-                          agreed_chunk(int(memory.room())))
+                          memory.room(bucketed=False))
     layout, _, placement, context = next(c for c in candidates if c[0] == chosen)
     if compile_only:
         return layout, None, context
     get_logger(__name__).info(f"{label} summed bands: {layout} layout")
-    prepared = placement(*operands)
+    prepared = _with_borrowed_green_faces(layout, operands, placement(*operands))
     # Placement scratch must be gone before the consumer's scratch is needed.
     jax.block_until_ready(prepared)
     return layout, prepared, context

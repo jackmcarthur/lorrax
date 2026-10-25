@@ -11,6 +11,7 @@ for input in WFN.h5 data-file-schema.xml centroids.txt dipole.h5 kin_ion.h5 tmp 
     fi
     ln -sfn "../2-absorption/$input" "$input"
 done
+# The default deck evaluates 128 roots at 37 actual Q points on Gamma--K.
 input=${1:-gw.in}
 prefix=${2:-exciton_bands}
 grade=${3:-visualization}

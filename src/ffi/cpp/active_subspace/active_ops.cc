@@ -334,6 +334,12 @@ static ffi::Error subtract_host(cudaStream_t stream, B v, B p, B coefficients,
                                 int cap, int d, int b, int start, int count,
                                 R out, cuDoubleComplex *next_coefficients,
                                 ScratchResult scratch) {
+  // An input/output alias is a compiler optimization, not a requirement on
+  // callers that still need P.  Match orthogonalize's borrowed-input path.
+  if (out->typed_data() != p.typed_data())
+    CUDA(cudaMemcpyAsync(out->typed_data(), p.typed_data(),
+                         int64_t(b) * d * sizeof(cuDoubleComplex),
+                         cudaMemcpyDeviceToDevice, stream));
   if (!count) {
     if (next_coefficients)
       CUDA(cudaMemsetAsync(next_coefficients, 0,
@@ -372,9 +378,6 @@ static ffi::Error validate_subtract_geometry(B v, B p, B coefficients,
       out->dimensions()[1] != d)
     return ffi::Error::InvalidArgument(
         "active subspace subtract buffer geometry");
-  if (out->typed_data() != p.typed_data())
-    return ffi::Error::InvalidArgument(
-        "active subspace subtract requires declared P output alias");
   return ffi::Error::Success();
 }
 
@@ -413,10 +416,9 @@ static ffi::Error subtract_gram(cudaStream_t stream, B v, B p,
   if (!error.success())
     return error;
   if (next_coefficients->dimensions()[0] != coefficients.dimensions()[0] ||
-      next_coefficients->dimensions()[1] != coefficients.dimensions()[1] ||
-      next_coefficients->typed_data() != coefficients.typed_data())
+      next_coefficients->dimensions()[1] != coefficients.dimensions()[1])
     return ffi::Error::InvalidArgument(
-        "active subspace subtract/Gram requires declared C output alias");
+        "active subspace subtract/Gram coefficient buffer geometry");
   int q[2];
   CUDA(cudaMemcpyAsync(q, range.typed_data(), sizeof(q),
                        cudaMemcpyDeviceToHost, stream));

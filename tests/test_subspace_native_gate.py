@@ -16,6 +16,8 @@ and vs ``CpuSubspacePlan`` (host LAPACK) on the same device:
   zero coefficients and +inf values outside the active block, capacity 300 with active
   sizes 1..300 and a real-valued block;
 * normalize (the Davidson whitening) ignoring a NaN tail;
+* subtraction with borrowed inputs and distinct P/C outputs, including an empty
+  window, so compiler alias choices cannot become a correctness requirement;
 * a complete fixed-capacity Davidson solve (``solvers.davidson_fixed``) on a synthetic
   tridiagonal operator: both routes CONVERGED, native eigenvalues vs the XLA plan's, and each
   an eigenvalue of the operator (scipy, whole spectrum);
@@ -189,6 +191,44 @@ def check_store():
     _REPORT["store_bytes_equal"] = 0.0
 
 
+def check_borrowed_subtract():
+    """Exercise separate FFI outputs explicitly, rather than relying on donation."""
+    cap, d, b = 4, 7, 2
+    v, _, c, p = _problem(593, cap=cap, d=d, b=b)
+    nat = _native(cap, b)
+    pspec = jax.ShapeDtypeStruct(p.shape, jnp.complex128)
+    cspec = jax.ShapeDtypeStruct(c.shape, jnp.complex128)
+    for fused in (False, True):
+        outputs = ((pspec, cspec, nat.workspace_specs['blas']) if fused else
+                   (pspec, nat.workspace_specs['blas']))
+        layouts = [(0, 1), (1, 0), (0,)] if fused else [(0, 1), (0,)]
+        # Deliberately omit input_output_aliases: both arguments remain live.
+        call = nat._ffi_call(
+            'lorrax_active_subspace_subtract'+('_gram' if fused else ''),
+            outputs, input_layouts=[(0, 1), (0, 1), (1, 0), (0,)],
+            output_layouts=layouts, vmap_method='sequential')
+        run = jax.jit(call)
+        for start, count in ((1, 2), (2, 0)):
+            vv = _poison(v, start, start + count)
+            pp, cc = jnp.asarray(p), jnp.asarray(c)
+            result = run(vv, pp, cc, jnp.array([start, count], jnp.int32))
+            got = result[0]
+            want = p - c[start:start+count].T @ v[start:start+count]
+            _rel('borrowed_subtract_p', got, want)
+            assert got.unsafe_buffer_pointer() != pp.unsafe_buffer_pointer()
+            assert np.array_equal(np.asarray(pp), p), 'borrowed P was modified'
+            assert np.array_equal(np.asarray(cc), c), 'borrowed C was modified'
+            if fused:
+                nxt = result[1]
+                ref = np.zeros(c.shape, complex)
+                ref[start:start+count] = v[start:start+count].conj() @ want.T
+                if count:
+                    _rel('borrowed_subtract_gram_c', nxt, ref)
+                else:
+                    assert not np.any(np.asarray(nxt))
+                assert nxt.unsafe_buffer_pointer() != cc.unsafe_buffer_pointer()
+
+
 def check_eigh_buckets():
     cap, n_eig = 300, 7
     rng = np.random.default_rng(3)
@@ -314,7 +354,8 @@ def check_davidson():
 CHECKS = ([(f"prefix active={a}", lambda a=a: check_prefix_ops(a)) for a in (1, 12, 17, 35, 64)]
           + [(f"window start={s} count={c}", lambda s=s, c=c: check_windowed_ops(s, c))
              for s, c in ((0, 0), (5, 0), (3, 5), (7, 33), (40, 24), (0, 64))]
-          + [("store", check_store), ("eigh capacity 300", check_eigh_buckets),
+          + [("borrowed subtraction", check_borrowed_subtract),
+             ("store", check_store), ("eigh capacity 300", check_eigh_buckets),
              ("eigh structured", check_eigh_structured),
              ("normalize", check_normalize), ("refusal", check_refusal),
              ("davidson solve", check_davidson)])

@@ -334,9 +334,9 @@ of the 45 within 1.02×.
 into that pair's $n_s^2$ bank columns before it forms $U g U^\dagger$ in place. An output spin
 block $d < n_s$ has only $d^2$ columns a pair, so the raw cells have no slot; holding the whole
 group and storing the block would transform $(n_s/d)^2$ times the columns (4× at $n_s = 2$,
-$d = 1$). No current caller asks for $d < n_s$: `gw.greens_function_kernel.sigma_spin_block`'s
-$d$ selects x blocks of the whole group (`_xblock`), so the chain serves older trees through the
-legacy `_block` target, and $n_s = 4$ where no tile-table tile fits two blocks per SM.
+$d = 1$). The bounded scalar Σ owner retains the whole spin group in each
+orbit-aligned row pass. The chain still serves $n_s = 4$ where no tile-table
+tile fits two blocks per SM; the legacy `_block` target serves older trees.
 
 **Early failure.** The startup probe compiles mode 3 only; each arm's image first compiles at
 its first call, and an NVRTC failure there is loud and sticky (no XLA demotion). Prebuilding the
@@ -407,6 +407,11 @@ also store one x block of the left centroids,
 $\lfloor r/b_x\rfloor x_s + x_0 + r \bmod b_x$ (`ffi.fft.x_block_rows`). A
 call reads only its own rows' sources, so a consumer that bounds its output by
 x blocks reads the Green once over all of them.
+The returned mode-7 callable declares `stores_rows_in_kernel`: native CUDA
+and ROCm k-box kernels bound the output allocation; composed CPU/reference
+calls crop a full output. Its `live` interval addresses positions in the
+stored output, so a row-window consumer maps its source interval through
+`x_block_rows` when it also requests a stored block.
 
 **Placed tables.** `symmetry_maps.device_load_tables` places the tables once
 per run (per-k tables replicated, left tables on X, right tables on Y). A
@@ -661,6 +666,8 @@ wavefunction leg. Its K sum reproduces XLA's batched ZGEMM of the same
 contraction bit for bit on A100. It needs a 64-column bank,
 $64\cdot16\cdot\big((n_{kx}n_{ky}(n_{kz}|1))|1\big)$ bytes, within the
 opt-in memory (`ffi.fft.klead_outer_refusal`).
+
+Both native outer providers require complex128 operands. The BSE route owner keeps complex64 and mixed operands on the existing materialized convolution without casts. The XLA reference composition retains its supported dtypes.
 
 `make_local_kconv_klead_outer_decode` also forms the decode's
 $A[k,c,b,\nu] = \sum_{a,\mu}\overline{\psi_c[k,c,a,\mu]}\,U[k,a,\mu,b,\nu]$ ($\psi_c$ the conduction wavefunctions at the centroids) in the store,

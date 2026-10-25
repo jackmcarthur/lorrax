@@ -531,21 +531,24 @@ where one padded column fits a block: 14³–21³ on an A100)
 handler rounds an m7s chunk down to whole waves, so the price is its upper bound there); it is 0
 on the single arm (bulk grids below about 14³ at n_s = 1 or 2).
 
-The q-wedge Σ(τ) kernel (`ppm_tau_kernel._sigma_subtile_kernel`) runs each
+The scalar Σ(τ) kernel (`ppm_tau_kernel._sigma_subtile_kernel`) runs each
 rank's tile in row passes of whole centroid orbits (`gw.subtile_stream`):
 `Σ(τ) row` is one local μ row's live set (`ν = μ/P_y`: the parent Green and
 its partner, mode 7's output, `W_prep`, the pass's rows of `W` and its
 partner on the q parents, the pass's ψ rows), and a pass holds the most rows
-whose bytes fit the fixed tile. The ordinary minimax χ and scalar q-wedge Σ share
+whose bytes fit the fixed tile. The ordinary minimax χ and scalar Σ share
 `subtile_stream.green_operand_program` and `prepare_green_operands`. They price
 operand placement and the complete consumer before allocating band-complete ψ.
 If that live set fits, the axis layout gathers each sum band once and keeps
 local Green GEMMs inside every row/node scan. Otherwise the summed-band ψ stays
 on its canonical 2D faces and each row pass uses the shared bounded SUMMA Green
-product. In either layout the conjugated, merged right operand is formed once
-outside all row and node loops. The two axis banks occupy
-`32·n_par·n_s·N_b·μ/sqrt(P)` bytes, or `32·n_par·n_s·N_b·μ/P` on faces,
-beside the original ψ owners. Σ additionally places its small QP projector on
+product. The axis layout forms its conjugated, merged right operand once
+outside all row and node loops. The face layout borrows both canonical
+Green faces directly; its compiled consumer includes any right
+conjugation/layout workspace, without retaining a separately prepared
+whole-wavefunction copy beside every convolution. The two axis banks occupy
+`32·n_par·n_s·N_b·μ/sqrt(P)` bytes beside the original ψ owners. FACE retains
+no additional full Green banks. Σ additionally places its small QP projector on
 axis carriers, `16·n_par·n_s·N_bΣ·(μ/P_x + μ/P_y)`.
 
 Admission uses the largest compiled new-byte figure over ranks: the maximum
@@ -554,8 +557,17 @@ bytes and queried native convolution scratch, against current room. Placement
 finishes before the consumer starts, so their scratch does not overlap.
 Compile-only calls compile and price these same programs without allocating
 prepared ψ banks; the caches retain programs/geometry, not ψ payloads. Static
-SX/COH uses the same choice and scalar node. Photon Σ sectors retain their
+SX/COH uses the same choice and scalar node. Full-zone scalar pole sources
+use the identity q-load of this row owner; their source storage, read and
+canonical-to-packed conversion stay unchanged. Photon Σ sectors retain their
 existing contracts.
+
+These layout selectors use the exact minimum room over ranks. Neither
+program cache keys on room, so rounding it to whole GiB can reject a fitting
+axis layout without saving compilations. The global bucket policy remains
+with the planners whose programs do depend on their bucketed room. Each
+room query already performs its process agreement; compiled prices still
+use a separate maximum agreement.
 
 The charge direct and four-current response row streams use the same choice
 inside `response_bank._compiled`: compile the complete incumbent stream
@@ -570,10 +582,15 @@ group and streamed-bank segment admits its own actual executable; carry
 donation and device/host/file bank residence are unchanged. The minimum face
 route retains `memory.admit`'s existing warn-and-run policy if even it is over
 room. This is a layout choice, not a quadrature or band-window approximation.
-No full-tile Green or `W_prep`
-exists. `sigma_spin_block` (the output spin block `d`, a divisor of `n_s`,
-whose stored x block fits the fixed tile) still sizes the full-zone Σ kernels
-and the static (COHSEX) and PPM spatial kernels.
+Full-zone scalar pole sources use an identity q-load table and the same row
+owner; their file format does not select a whole-Green fallback. An
+indivisible centroid orbit can require the whole local input window. Native
+CUDA and ROCm k-box mode 7 use the fixed tile geometry to store and project
+large outputs in smaller x blocks, retaining the input Green and `W_prep`
+once and reducing the accumulated projection once. CPU, reference and ROCm
+fallback convolutions form the full output before cropping, so they keep one
+output call. Static (COHSEX), resident-pole and shared-pole scalar Σ retain
+every spin component in each input window and stored block.
 
 **Row passes run as one scan.** The passes of the Σ τ node, the static
 τ = 0 node, the sector node and the charge and four-current χ streams are

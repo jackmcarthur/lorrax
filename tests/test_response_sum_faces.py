@@ -46,7 +46,7 @@ def main():
                 if layout == 'auto':
                     # Refuse the incumbent executable before dispatch. The
                     # minimum face route keeps the established admit policy.
-                    memory.room = lambda: 0
+                    memory.room = lambda **_: 0
                 handles = []
                 def forced(*args, **kwargs):
                     kernel, fixed = saved_stream(*args, **kwargs,

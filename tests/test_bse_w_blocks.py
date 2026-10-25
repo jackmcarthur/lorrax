@@ -264,10 +264,15 @@ def run_densify_cases(mesh):
     put_w = lambda: device_put_process_local(W.copy(), NamedSharding(mesh, P("x", "y", None, None, None)))
     host = lambda a: np.asarray(multihost_utils.process_allgather(a, tiled=True))
     term = np.einsum("qam,qab,qbn->mnq", np.conj(A), D, A).reshape(W.shape)
+    from runtime.padding import padded_mu_extent
+    ap = padded_mu_extent(N_MU, mesh)
+    A_dev = device_put_process_local(np.pad(A, ((0, 0), (0, 0), (0, ap-N_MU))),
+        NamedSharding(mesh, P(None, None, ('x', 'y'))))
+
     out = {}
     for name, tile in (("whole", None), ("q blocks 4 of 6", 2 * 16 * (N_MU // 2) ** 2 * 4)):
         with _patched(tiles, **({} if tile is None else {"TILE_BYTES": tile})):
-            out[f"densify rank-LR add, {name} vs numpy"] = _rel(host(_add_rank_lr(put_w(), A, D, mesh, -1.0)),
+            out[f"densify rank-LR add, {name} vs numpy"] = _rel(host(_add_rank_lr(put_w(), A_dev, D, mesh, -1.0)),
                                                                W - term)
     g0 = cplx(N_MU)
     S = rng.standard_normal(KGRID)

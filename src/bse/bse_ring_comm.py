@@ -920,8 +920,8 @@ def build_density_snapshot_operator(
     * ``scatter_nu_on_y=True``: the W-column / screened-W(omega) path, where the
       batch axis IS the probe index ``nu`` and we want the assembled tile
       ``W(mu_X, nu_Y)`` with no replicated ``(mu, nu)`` intermediate.  This
-      mirrors the Sigma_PPM reduce-scatter kernel
-      (``gw.ppm_tau_kernel._make_project_ri_reduce_scatter``): the same mesh
+      mirrors the shared band-projection owner
+      (``common.contract_bands.contract_bands_block_reshard``): the same mesh
       axis ``y`` carries BOTH the reduction (finish the V_q0 N-contraction,
       whose partials are scattered across the ``y`` shards) AND the output
       tiling (scatter the ``nu`` batch onto ``y``), fused into ONE

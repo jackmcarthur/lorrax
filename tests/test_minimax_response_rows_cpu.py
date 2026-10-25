@@ -126,9 +126,10 @@ def test_rows_full_and_independent_reference(monkeypatch, side, ns, anti, n_out)
                                        err_msg=f'full/reference contour={contour} real_times={real_times}')
             for tile in (1 << 30, 8192):
                 monkeypatch.setattr(tiles, 'TILE_BYTES', tile)
-                from gw.subtile_stream import green_operand_program
+                from gw.subtile_stream import green_operand_program, _with_borrowed_green_faces
                 for layout in ('face', 'axis'):
-                    prepared = green_operand_program(mesh, layout)(pm, pn)
+                    placed = green_operand_program(mesh, layout)(pm, pn)
+                    prepared = _with_borrowed_green_faces(layout, (pm, pn), placed)
                     kernel = W._get_chi_minimax_kernel_fused(mesh, grid, 6, n_out, contour,
                         (np_, nb, mu, ns), k_unfold_plan=plan, real_times=real_times,
                         layout=layout)
@@ -141,21 +142,22 @@ def test_rows_full_and_independent_reference(monkeypatch, side, ns, anti, n_out)
                         assert len(kernel.row_plan.windows) == 1
 
 
-def test_charge_factory_dials_do_not_reuse_another_backend(monkeypatch):
+@pytest.mark.parametrize('platform', ['cpu', 'ROCM'])
+def test_charge_factory_dials_do_not_reuse_another_backend(monkeypatch, platform):
     """A reference/native context change must rebind the shared FFT factory."""
     from common import fft_helpers
     from ffi import fft as F
+    from ffi import gate
     from gw import w_isdf as W
+    monkeypatch.setattr(gate, 'mesh_ffi_platform', lambda mesh: platform)
+    monkeypatch.setattr(F, '_MATHDX_DOWN', [])
+    monkeypatch.setattr(F, '_KDFT_DOWN', [])
     if jax.device_count() < 4:
         pytest.skip("needs 4 devices")
     mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
     grid, plan, *_ = fixture(mesh, 1, False)
-    made = []
-
     def factory(*args, **kwargs):
-        result = object()
-        made.append(result)
-        return result
+        return object()
 
     monkeypatch.setattr(fft_helpers, 'make_kconv_chi_unfold', factory)
     for owner in (lambda: W._charge_stream_kconv(mesh, grid, plan),
@@ -167,5 +169,17 @@ def test_charge_factory_dials_do_not_reuse_another_backend(monkeypatch):
             assert owner()[0] is reference
         assert native is not reference
         assert owner()[0] is native
-    assert len(made) == 4
+        # A startup demotion changes the emitted program even when the
+        # vendor's broad backend tag stays unchanged. Failure text itself
+        # must not cause a new compilation for the same demoted route.
+        for flag in (F._MATHDX_DOWN, F._KDFT_DOWN):
+            W._CHARGE_KCONV.clear()
+            normal = owner()[0]
+            flag.append('startup provider probe failed')
+            demoted = owner()[0]
+            assert demoted is not normal
+            flag[0] = 'another diagnostic for the same demotion'
+            assert owner()[0] is demoted
+            flag.clear()
+            assert owner()[0] is normal
     W._CHARGE_KCONV.clear()

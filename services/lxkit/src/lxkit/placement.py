@@ -36,11 +36,16 @@ def device_put_process_local(host_array, sharding, *, check: bool | None = None)
     # A traced or already globally sharded array needs a real reshard.
     # Never np.asarray it: that would gather the value this helper exists to
     # keep distributed.
-    if isinstance(host_array, jax.core.Tracer) or (
-            isinstance(host_array, jax.Array) and not host_array.is_fully_addressable):
+    is_device = isinstance(host_array, jax.Array)
+    if isinstance(host_array, jax.core.Tracer) or (is_device and (
+            not host_array.is_fully_addressable or
+            bool(getattr(sharding, "is_fully_addressable", False)))):
         return jax.device_put(host_array, sharding)
 
-    arr = np.asarray(host_array)
+    # A process-local device array also follows the anti-collective contract:
+    # slice only this process's target shards on device, without either a host
+    # replica or JAX's cross-process equality assertion on the global value.
+    arr = host_array if is_device else np.asarray(host_array)
     if jax.process_count() <= 1 or bool(
             getattr(sharding, "is_fully_addressable", False)):
         return jax.device_put(arr, sharding)
@@ -59,11 +64,11 @@ def device_put_process_local(host_array, sharding, *, check: bool | None = None)
         return jax.device_put(arr, sharding)
     shards = []
     for dev, idx in idx_map.items():
-        piece = np.asarray(arr[idx])
+        piece = arr[idx] if is_device else np.asarray(arr[idx])
         # ``np.ascontiguousarray`` promotes a 0-D scalar to shape ``(1,)``.
         # Preserve the scalar shard shape required by a replicated P() value;
         # higher-rank shards still take the contiguous host-staging route.
-        if piece.ndim:
+        if piece.ndim and not is_device:
             piece = np.ascontiguousarray(piece)
         shards.append(jax.device_put(piece, dev))
     return jax.make_array_from_single_device_arrays(shape, sharding, shards)

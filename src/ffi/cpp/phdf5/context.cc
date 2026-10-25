@@ -16,6 +16,8 @@
 //   LORRAX_DEBUG_PRINT            (0)   print native diagnostic detail
 
 #include <cctype>
+#include <cerrno>
+#include <sys/stat.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -341,16 +343,35 @@ void settle_read_buf(PhdfCtx* ctx) {
 //  open_file — collective across all JAX processes.
 // -----------------------------------------------------------------
 // mode_flag: 0 = 'w' (truncate), 1 = 'a' (append / create-if-absent), 2 = 'r'
-static hid_t h5_open_or_create(const std::string& path, int mode_flag, hid_t fapl) {
+static hid_t h5_open_or_create(const std::string& path, int mode_flag, hid_t fapl, MPI_Comm comm) {
     switch (mode_flag) {
         case 0:
             return H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
         case 1: {
-            // Try open, else create.
-            htri_t ok = H5Fis_accessible(path.c_str(), fapl);
-            if (ok > 0) {
+            // An MPI-backed HDF5 accessibility probe may create a zero-byte
+            // file while checking an absent path. Decide once without opening
+            // it, then make every participant enter the same collective call.
+            int rank = 0;
+            MPI_Comm_rank(comm, &rank);
+            int status[2] = {0, 0};  // exists, stat errno
+            if (rank == 0) {
+                struct stat info;
+                if (::stat(path.c_str(), &info) == 0) {
+                    status[0] = 1;
+                } else if (errno != ENOENT) {
+                    status[1] = errno;
+                }
+            }
+            MPI_Bcast(status, 2, MPI_INT, 0, comm);
+            if (status[1] != 0) {
+                throw std::runtime_error("phdf5 append stat failed for '" + path +
+                    "': " + std::strerror(status[1]));
+            }
+            if (status[0]) {
                 return H5Fopen(path.c_str(), H5F_ACC_RDWR, fapl);
             }
+            // A competing create is an error, never a reason to truncate or
+            // silently switch modes after the replicated decision.
             return H5Fcreate(path.c_str(), H5F_ACC_EXCL, H5P_DEFAULT, fapl);
         }
         case 2:
@@ -716,7 +737,7 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     H5Pset_alloc_time(ctx->dcpl_id, H5D_ALLOC_TIME_EARLY);
 
     // --- Open / create the file collectively ---
-    ctx->file_id = h5_open_or_create(path, mode_flag, ctx->fapl_id);
+    ctx->file_id = h5_open_or_create(path, mode_flag, ctx->fapl_id, ctx->comm);
     if (ctx->file_id < 0) {
         std::ostringstream os;
         os << "H5Fcreate/H5Fopen failed for '" << path
@@ -984,8 +1005,19 @@ hid_t ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
             throw std::runtime_error(
                 "phdf5 ensure_dataset: H5Screate_simple failed for '" + ds_name + "'");
         }
+        // Nested dataset paths have the same contract as the serial
+        // h5py transport: create their parents inside this collective
+        // transaction, rather than opening another HDF5 writer beforehand.
+        hid_t lcpl = H5Pcreate(H5P_LINK_CREATE);
+        if (lcpl < 0 || H5Pset_create_intermediate_group(lcpl, 1) < 0) {
+            if (lcpl >= 0) H5Pclose(lcpl);
+            H5Sclose(filespace);
+            throw std::runtime_error(
+                "phdf5 ensure_dataset: parent-group property creation failed for '" + ds_name + "'");
+        }
         dset = H5Dcreate(ctx->file_id, ds_name.c_str(), native,
-                         filespace, H5P_DEFAULT, ctx->dcpl_id, H5P_DEFAULT);
+                         filespace, lcpl, ctx->dcpl_id, H5P_DEFAULT);
+        H5Pclose(lcpl);
         H5Sclose(filespace);
         if (dset < 0) {
             throw std::runtime_error(

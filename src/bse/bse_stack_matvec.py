@@ -382,7 +382,7 @@ def _make_outer_router(mesh_xy, kgrid):
     return route
 
 
-def _w_route(route, rank, mesh_xy, kgrid, n_c):
+def _w_route(route, rank, mesh_xy, kgrid, n_c, *, operand_dtypes):
     """``(name, conv, fused)``: the W term's route for this mesh, grid, leg rank K and band count.
 
     ``'fused'``: the outer-product load forms T and its store contracts U with conj(ψ^X_c)
@@ -392,6 +392,13 @@ def _w_route(route, rank, mesh_xy, kgrid, n_c):
     announced once (``[bse] W term:``, ``[bse] W term decode:``).
     """
     from ffi.gate import announce_once
+    # Both native outer providers accept complex128 only. Keep the existing
+    # materialized convolution for C64 and mixed operands; no hidden casts.
+    if not operand_dtypes or any(jnp.dtype(d) != jnp.dtype(jnp.complex128)
+                                  for d in operand_dtypes):
+        announce_once(("bse", "w_term_dtype", tuple(map(str, operand_dtypes))),
+                      "[bse] W term: XLA encode + k-conv (native outer operands require complex128)")
+        return "xla", None, None
     conv = route(rank)
     if conv is None:
         return "xla", None, None
@@ -833,7 +840,8 @@ def make_w_term(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
         # The route (outer load fused / stored U, or XLA T), then its (μ, ν) block plan:
         # both decided at trace time from the shapes and announced once.
         rank = min(psi_c_X.shape[1], psi_v_Y.shape[1])
-        name, conv, fused = _w_route(outer_route, rank, mesh_xy, (nkx, nky, nkz), psi_c_X.shape[1])
+        name, conv, fused = _w_route(outer_route, rank, mesh_xy, (nkx, nky, nkz), psi_c_X.shape[1],
+            operand_dtypes=(X.dtype, psi_c_X.dtype, psi_v_Y.dtype, W_R.dtype))
         plan = _w_plan(name, rank, W_R, (psi_c_X,), (psi_v_Y,))
         wterm = _blocked_w_term(plan, W_R, _w_layout(name))
         whole = plan[0][1] * plan[1][1] == 1
@@ -1049,7 +1057,8 @@ def build_bse_stack_pair_matvec(
         # shared memory.  The twin runs two chains, summed at the end.
         rank = min(psi_c_X.shape[1], psi_v_Y.shape[1])
         k_rank = 2 * rank if fuse else rank
-        name, conv, fused = _w_route(outer_route, k_rank, mesh_xy, (nkx, nky, nkz), psi_c_X.shape[1])
+        name, conv, fused = _w_route(outer_route, k_rank, mesh_xy, (nkx, nky, nkz), psi_c_X.shape[1],
+            operand_dtypes=(X.dtype, psi_c_X.dtype, psi_c_Y.dtype, psi_v_X.dtype, psi_v_Y.dtype, W_R.dtype))
         mu, nu = (psi_c_X, psi_v_X), (psi_v_Y, psi_c_Y)
         plan = _w_plan(name, k_rank, W_R, mu, nu)
         wterm = _blocked_w_term(plan, W_R, _w_layout(name))

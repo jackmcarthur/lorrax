@@ -45,7 +45,8 @@ def _fixture(tmp_path, monkeypatch):
         kpoints=raw, adot=np.eye(3), blat=1., bvec=np.eye(3), cell_volume=1.,
         r_mu_fft_idx=np.zeros((1, 3), int), zeta_cutoff_ry=1., ifmax=np.ones((1, 4), int))
     monkeypatch.setattr(rb, 'read_coarse_interactions', lambda *_a, **_k:
-        dict(psi=np.zeros((9, 1, 1, 1), complex), kgrid=np.array([3, 3, 1])))
+        dict(psi=np.zeros((9, 1, 1, 1), complex), kgrid=np.array([3, 3, 1]),
+             n_mu_logical=1))
     monkeypatch.setattr(rb, 'open_zeta', lambda *_a, **_k: loader)
     monkeypatch.setattr(rb, '_ZetaGTiles', lambda *_a, **_k: NS(shape=(3, 1, int(ng.max()))))
     monkeypatch.setattr(file_io, 'read_coulomb_policy_from_h5', lambda *_a: None)
@@ -68,7 +69,8 @@ def test_refit_nonminimal_wfn_wedge_uses_authenticated_zeta_parent_labels(tmp_pa
     with pytest.raises(AssertionError, match='q=2: no candidate wrap'):
         rb._fix_sphere_wrap(wrong)
     zx = rb.read_vq_payload(str(path), 'header-only-zeta',
-        require_slab=False, require_full_bz_zeta=False, log_fn=lambda *_a: None)
+        require_slab=False, require_full_bz_zeta=False, include_interactions=False,
+        log_fn=lambda *_a: None)
     np.testing.assert_array_equal(zx['qfr'], parent)
     np.testing.assert_array_equal(zx['gvec'], loader.gvec_components)
     assert zx['nk'] == 9 and zx['nq'] == 3 and zx['zeta_cutoff'] == 1.
@@ -78,7 +80,8 @@ def test_refit_nonminimal_wfn_wedge_uses_authenticated_zeta_parent_labels(tmp_pa
     loader.gvec_components[2, :, 0] = [9, 9, 0]
     with pytest.raises(AssertionError, match='no candidate wrap'):
         rb.read_vq_payload(str(path), 'header-only-zeta',
-            require_slab=False, require_full_bz_zeta=False, log_fn=lambda *_a: None)
+            require_slab=False, require_full_bz_zeta=False, include_interactions=False,
+            log_fn=lambda *_a: None)
 
 
 def test_zeta_parent_metadata_refuses_wrong_extent_grid_or_torn_tables(tmp_path, monkeypatch):
@@ -95,3 +98,21 @@ def test_zeta_parent_metadata_refuses_wrong_extent_grid_or_torn_tables(tmp_path,
         f.create_dataset('V_qmunu', shape=(9, 1, 1), dtype=complex)
     with pytest.raises(ValueError, match='GATE vq_zeta_q_labels'):
         rb._zeta_parent_qpoints(str(legacy), 3, (3, 3, 1))
+
+
+def test_refit_metadata_never_builds_the_full_real_space_grid(tmp_path, monkeypatch):
+    rb, path, loader, _parent = _fixture(tmp_path, monkeypatch)
+    loader.fft_grid = np.array([32768, 32768, 32768])
+    original = np.meshgrid
+
+    def no_real_grid(*axes, **kwargs):
+        if any(np.size(axis) >= 32768 for axis in axes):
+            raise AssertionError('metadata loader constructed a full FFT coordinate grid')
+        return original(*axes, **kwargs)
+
+    monkeypatch.setattr(np, 'meshgrid', no_real_grid)
+    zx = rb.read_vq_payload(str(path), 'header-only-zeta',
+        require_slab=False, require_full_bz_zeta=False, include_interactions=False,
+        log_fn=lambda *_a: None)
+    assert zx['n_rtot'] == 32768**3
+    assert 'rfrac' not in zx and all(k not in zx for k in ('RX', 'RY', 'RZ'))

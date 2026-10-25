@@ -674,8 +674,9 @@ def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
     the body embedding uses), not on the centroid file's rounded spelling.
 
     Returns ``(A_c, D_c, A_f, D_f)``: per coarse / fine q (flat fft order) the
-    rows ``A (n_q, n_L, n_rmu_pad)`` and ``D (n_q, n_L, n_L)`` (window
-    included) of the rank-n_L terms Aᴴ D A.  Host numpy, n_L·N_μ per q.
+    rows ``A (n_q, n_L, mu_carrier)`` and ``D (n_q, n_L, n_L)`` (window
+    included) of the rank-n_L terms Aᴴ D A. A stays sharded over all ranks;
+    only owned centroid blocks enter the unchanged host polynomial fit.
     """
     from ffi import _services
     _services.ensure_on_path()
@@ -684,7 +685,9 @@ def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
     from gw import lr_channels as LC
     from gw.head_correction import resolve_head_S_cart
 
-    lr = read_lr_channels(restart_file)
+    from common.gpu_utils import device_budget_bytes
+    device_budget_bytes()
+    lr = read_lr_channels(restart_file, mesh=mesh_xy)
     if lr is None:
         raise ValueError(
             f"GATE srlr_restart_channels: {restart_file} has no W0_lr group; "
@@ -704,8 +707,8 @@ def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
     if not np.allclose(t.q_irr_frac, lr["q_frac"], atol=1e-10):
         raise ValueError("srlr: the W0_lr rows are not W0's q wedge")
     _, n_L, n_file = lr["Ft"].shape
-    if n_file != n_rmu:
-        raise ValueError(f"srlr: W0_lr carries {n_file} centroids, the bundle {n_rmu}")
+    if int(lr["n_mu_logical"]) != n_rmu:
+        raise ValueError(f"srlr: W0_lr carries {lr['n_mu_logical']} centroids, the bundle {n_rmu}")
     c0 = int(lr["n_z"]) if sys_dim == 2 else 0
     bvec = np.asarray(CoulombGeometry.from_wfn(wfn).bvec, dtype=np.float64)
 
@@ -737,23 +740,67 @@ def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
     if S_cart is None:
         raise ValueError(f"GATE srlr_head_tensor: no S tensor ({_prov}); the P "
                          "model's head anchor needs S_cart_head or dipole.h5.")
-    model, info = LC.fit_model(qc, Ft[..., :n_rmu], Pf, r_mu=r_mu, S_cart=S_cart,
-                               c0=c0, sys_dim=sys_dim, r_fit=r_b)
+    from common.collectives import (agree_io_error, device_put_process_tiles,
+                                    psum_replicate)
+    carrier = int(Ft.shape[-1])
+    r_mu_carrier = np.zeros((carrier, 3), dtype=np.float64)
+    r_mu_carrier[:n_rmu] = r_mu
     gamma = int(np.argmin(np.linalg.norm(qc, axis=1)))
     D0 = LC.screened_lr(Pf[gamma][None], v_c[gamma][None])[0]
+    local_models, local_gamma = {}, {}
+    residual = np.zeros(2)
+    error = None
+    try:
+        for shard in Ft.addressable_shards:
+            mu = shard.index[-1]
+            key = (mu.start or 0, mu.stop or carrier)
+            local = np.asarray(shard.data)
+            model, info = LC.fit_model(qc, local, Pf, r_mu=r_mu_carrier[slice(*key)],
+                S_cart=S_cart, c0=c0, sys_dim=sys_dim, r_fit=r_b)
+            sel = (np.linalg.norm(qc, axis=1) > 1e-9) & (np.linalg.norm(qc, axis=1) < r_b)
+            norm2 = float(np.sum(np.abs(local[sel])**2))
+            residual += (float(info['relres_F'])**2*norm2, norm2)
+            local_models[key], local_gamma[key] = model, local[gamma].copy()
+    except Exception as exc:
+        error = exc
+    agree_io_error(error, path=restart_file, stage='srlr.local_centroid_fit')
+    residual = psum_replicate(residual, mesh_xy)
+    if not np.all(np.isfinite(residual)):
+        raise ValueError('srlr: nonfinite distributed form-factor fit residual')
+    info['relres_F'] = float(np.sqrt(residual[0]/max(residual[1], 1e-300)))
+    mu_sh = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
 
     def terms(qcs, v):
         n = len(qcs)
-        A = np.zeros((n, n_L, int(n_rmu_pad)), np.complex128)
         D = np.zeros((n, n_L, n_L), np.complex128)
         qn = np.linalg.norm(qcs, axis=1)
         w = LC.window(qn, r_a, r_b)
         on = np.flatnonzero((w > 0.0) & (qn > 1e-9))
-        if on.size:
-            A[on, :, :n_rmu] = LC.model_rows(model, qcs[on])
-            D[on] = w[on, None, None] * LC.screened_lr(LC.model_P(model, qcs[on]), v[on])
         g = np.flatnonzero(qn <= 1e-9)
-        A[g], D[g] = Ft[gamma], D0
+        model = next(iter(local_models.values()))
+        if on.size:
+            D[on] = w[on, None, None]*LC.screened_lr(LC.model_P(model, qcs[on]), v[on])
+        D[g] = D0
+        tiles, error = {}, None
+        try:
+            for key, model in local_models.items():
+                block = np.zeros((n, n_L, key[1]-key[0]), np.complex128)
+                if on.size:
+                    block[on] = LC.model_rows(model, qcs[on])
+                block[g] = local_gamma[key]
+                tiles[key] = block
+        except Exception as exc:
+            error = exc
+        agree_io_error(error, path=restart_file, stage=f'srlr.local_rows.{n}')
+        def tile(index):
+            mu = index[-1]
+            key = (mu.start or 0, mu.stop or carrier)
+            return tiles[key][index[:-1]]
+        from lxkit import memory
+        memory.admit('srlr model rows', (('owned centroid rows', memory.priced(
+            0, 'placed long-range row array', spread=16*n*n_L*carrier,
+            ranks=int(mesh_xy.size))),), memory.room(bucketed=False))
+        A = device_put_process_tiles((n, n_L, carrier), mu_sh, tile)
         return A, D, on.size
 
     A_c, D_c, n_on_c = terms(qc, v_c)
@@ -819,21 +866,21 @@ def _unfold_lr_channels(lr, sym, *, coarse_grid, n_rmu, n_rmu_pad, mesh_xy):
     c0 = int(lr["n_z"]) if sys_dim == 2 else 0
     n_qi, n_L, _ = lr["Ft"].shape
     grid = np.asarray(coarse_grid, dtype=np.int64)
-    tp = t.padded(int(n_rmu_pad))
-    to_host = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, P()))
+    carrier = int(lr["Ft"].shape[-1])
+    tp = t.padded(carrier)
     col_sh = NamedSharding(mesh_xy, P(None, "x"))
     rows_full = []
     for a in range(n_L):
-        col = np.zeros((n_qi, int(n_rmu_pad)), np.complex128)
-        col[:, :n_rmu] = lr["Ft"][:, a]
+        col = jax.device_put(lr["Ft"][:, a], col_sh)
         out = unfold_isdf_one_leg(
-            device_put_process_local(col, col_sh),
+            col,
             source_gvec_components=np.asarray(lr["gvec"][:, a], dtype=np.int32),
             sym=sym, sym_idx=tp.sym_idx_q, sym_perm=tp.sym_perm,
             L_table=tp.L_table, q_irr_frac=tp.q_irr_frac, kgrid=tuple(coarse_grid),
             mesh_xy=mesh_xy, component_action="scalar")
-        rows_full.append(np.asarray(to_host(out)))
-    Ft = np.stack(rows_full, axis=1)                       # (nq, n_L, μ_pad)
+        rows_full.append(out)
+    mu3 = NamedSharding(mesh_xy, P(None, None, ("x", "y")))
+    Ft = jax.jit(lambda rows: jnp.stack(rows, axis=1), out_shardings=mu3)(tuple(rows_full))                       # (nq, n_L, μ_pad)
     nq = Ft.shape[0]
 
     # The same star rows the one-leg unfold used: each target channel's
@@ -854,6 +901,7 @@ def _unfold_lr_channels(lr, sym, *, coarse_grid, n_rmu, n_rmu_pad, mesh_xy):
     Pf = np.empty((nq, n_L, n_L), np.complex128)
     vf = np.empty((nq, n_L))
     K_full = np.empty((nq, n_L, 3))
+    orders = np.empty((nq, n_L), dtype=np.int32)
     for iq in range(nq):
         s, p = int(rows[iq]), int(idx[iq])
         Kp = np.asarray(tp.q_irr_frac[p], dtype=np.float64) + lr["gvec"][p]
@@ -868,8 +916,12 @@ def _unfold_lr_channels(lr, sym, *, coarse_grid, n_rmu, n_rmu_pad, mesh_xy):
             raise ValueError(
                 f"GATE srlr_channel_relabel: q {iq} maps the G_z channels to "
                 f"{Kt[order, 2].tolist()}; want the set -n_z..n_z.")
-        Ft[iq], Pf[iq], K_full[iq] = Ft[iq][order], Pq[np.ix_(order, order)], Kt[order]
+        orders[iq], Pf[iq], K_full[iq] = order, Pq[np.ix_(order, order)], Kt[order]
         vf[iq] = np.asarray(lr["v"][p])[order]
+    @partial(jax.jit, out_shardings=mu3)
+    def reorder(rows, order):
+        return jnp.take_along_axis(rows, order[:, :, None], axis=1)
+    Ft = reorder(Ft, device_put_process_local(orders, NamedSharding(mesh_xy, P())))
     return Ft, Pf, vf, K_full, q_full
 
 
@@ -887,14 +939,33 @@ def _add_rank_lr(W_q, A, D, mesh_xy, sign):
     at CrI3 30x30, N_μ 3000, P4).  The last block is clamped onto its
     neighbour, and the q it shares is zeroed in its term.  One block is the
     whole-grid update.
-    # ponytail: A is host-built for every q (n_q·n_L·N_μ/√P per rank); build it
-    # on device from the fit coefficients if that row stack ever matters.
+    A arrives from owned centroid fits on the all-rank carrier and is
+    converted directly to the two W faces, without a host row replica.
     """
     from jax import lax, shard_map
     from common.collectives import device_put_process_local
     from runtime.tiles import tile_units
-    a_x = device_put_process_local(A, NamedSharding(mesh_xy, P(None, None, "x")))
-    a_y = device_put_process_local(A, NamedSharding(mesh_xy, P(None, None, "y")))
+    from common.gpu_utils import device_budget_bytes
+    device_budget_bytes()
+    if not isinstance(A, jax.Array):
+        raise ValueError('long-range rows must remain a distributed device array')
+    n_mu = int(W_q.shape[0])
+    if int(A.shape[-1]) < n_mu:
+        raise ValueError('long-range row carrier is shorter than the W face')
+    def face(axis):
+        @partial(jax.jit, out_shardings=NamedSharding(mesh_xy, P(None, None, axis)))
+        def convert(a):
+            return a[..., :n_mu]
+        from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+        from lxkit import memory
+        executable = convert.lower(A).compile()
+        needed = -agreed_chunk(-compiled_new_bytes(executable))
+        memory.admit(f'srlr rows on {axis} face', (('centroid face', memory.priced(
+            0, 'compiled long-range row conversion', spread=needed*int(mesh_xy.size),
+            ranks=int(mesh_xy.size))),), memory.room(bucketed=False))
+        return executable(A)
+    a_x, a_y = face('x'), face('y')
+
     d = device_put_process_local(D, NamedSharding(mesh_xy, P()))
     w_spec = P("x", "y", None, None, None)
 
@@ -1807,7 +1878,7 @@ def _interpolate_bse_data_to_grid(
         a_band_index=htransform_a_band,
         batch_size=int(params.get("wfn_fi_q_chunk", 0)),
         htransform_quality_record_fn=htransform_quality_record_fn,
-        return_coeffs=velocity is not None)
+        return_coeffs=velocity is not None, n_mu_out=n_rmu_pad)
     dipoles = None
     if velocity is not None:
         from common.collectives import gather_to_host
@@ -1821,7 +1892,7 @@ def _interpolate_bse_data_to_grid(
                 band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, log_fn=log_fn,
                 a_band_index=htransform_a_band,
                 batch_size=int(params.get("wfn_fi_q_chunk", 0)),
-                return_coeffs=True)
+                return_coeffs=True, n_mu_out=n_rmu_pad)
         dipoles = densified_dipoles(
             velocity, sym=sym, basis=basis, fine=bundle,
             fh_energies=np.asarray(gather_to_host(enk_sigma)).T,

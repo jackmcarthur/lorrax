@@ -1,6 +1,6 @@
 # Executed workshop results
 
-The supplied top-level workflow completed on four Perlmutter GPUs. The original
+The GW and optical BSE workflow completed on four Perlmutter GPUs. The original
 fully relativistic plane-wave reference was executed independently on a CPU node.
 The numerical LORRAX source is `f075e4e796f996719a1c9a48ce48d6abb5291424`;
 `f9ef4a6a93c5971a586bbd4b5ccac965e6d2bf05` supplies the EQP text compatibility
@@ -60,3 +60,15 @@ The text tables and plots here are small reference artifacts. Complete HDF5
 screening, kernel, eigenvectors and wavefunction files are retained in the
 executed Perlmutter/CFS archive recorded in the delivered report. Regenerate
 those files with the supplied preparation and run scripts.
+
+The canonical [exciton-band scan](lorrax/exciton/) was executed separately
+from Γ to K at 37 actual momenta, with 128 roots, an 18 × 18 × 1
+integration grid and six valence/eight conduction bands. It took 24 min 11 s
+on four Perlmutter A100 80 GB GPUs, including preparation and certification.
+The [execution receipt](lorrax/exciton/execution.json) records numerical source
+`0c93540d95541b85aa18d07aef0c87d097e52450`, the unchanged output hashes,
+residuals, reciprocal-coordinate checks and continuum coverage.
+
+The [24 × 24 reference](lorrax/exciton/reference_k24/) is retained for
+integration-grid comparisons. The faster 18 × 18 scan is illustrative; the
+lowest eight ordered levels differ by up to 30.3 meV from that reference.

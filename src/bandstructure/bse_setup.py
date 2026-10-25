@@ -44,13 +44,10 @@ _services.ensure_on_path()
 
 from distrib_la import mesh_key as _mesh_key   # noqa: E402
 from common.log import get_logger, message
-# Every extent this module shards is an input datum: n_μ is a k-means centroid
-# count, nb_fi is the caller's band window, and the q-batch is batch_size — so
-# each of them divides the mesh axis only by luck.  ``bse_io`` pads its own μ
-# copy (``padded_mu_extent``); this module never did, which made
-# ``exciton_bands`` unrunnable at EVERY P>1 on any deck whose centroid count is
-# not a multiple of the mesh axis (785 = 5·157 on the MoS2 4×4 deck: job
-# 7882476 cells exb16s/exb64s).  See common/sharding_fit.py.
+from common.collectives import device_put_process_local
+# Physical target and q counts need not divide the process grid. The
+# projection and bundle epilogue below keep their legal carriers until the
+# explicit output layout is established; fit_sharding is not their padding.
 from common.sharding_fit import fit_sharding as _fit
 from runtime.padding import padded_axis
 # The (i,j)-face → q-batch move below is a layout change XLA cannot lower in
@@ -59,6 +56,7 @@ from runtime.padding import padded_axis
 from common.staged_reshard import (
     face_to_batch_reshard as _face_to_batch_reshard,
     face_to_batch_reshard_supported as _face_to_batch_supported,
+    batch_to_face_reshard,
 )
 
 from .fh_interp import (
@@ -317,6 +315,30 @@ def resolve_conduction_window(enk_sigma, *, nb_window: int, nval_in: int,
     return b_min, b_max, n_guard
 
 
+def _project_fine_wfns(lam, U, L, b_min, b_max, nspinor, n_mu, n_mu_out):
+    """Project nodal states directly to a legal padded spin/centroid carrier.
+
+    The back-map packs physical targets at ``s*n_mu + mu``. Reindexing that
+    flat padded carrier avoids an unshardable intermediate of width n_mu;
+    every added centroid is exactly zero, independently of target pad data.
+    """
+    c = U[..., b_min:b_max]
+    nodal = (L @ c) / (-lam[..., None, b_min:b_max])
+    if n_mu_out == n_mu:
+        # Keep the original projection when its physical width already tiles.
+        targets = nodal[..., :nspinor*n_mu, :].reshape(
+            nodal.shape[:-2] + (nspinor, n_mu_out, c.shape[-1]))
+    else:
+        spin = jnp.arange(nspinor)[:, None]
+        mu = jnp.arange(n_mu_out)[None, :]
+        indices = jnp.where(mu < n_mu, spin*n_mu+mu, 0).reshape(-1)
+        targets = jnp.take(nodal, indices, axis=-2)
+        targets = targets.reshape(nodal.shape[:-2] + (nspinor, n_mu_out, c.shape[-1]))
+        targets = jnp.where((mu < n_mu)[..., None], targets, 0)
+
+    return lam[..., b_min:b_max], jnp.moveaxis(targets, -1, -3), c
+
+
 def compute_wfns_fi(
     *,
     ctilde: jax.Array,
@@ -331,6 +353,7 @@ def compute_wfns_fi(
     q_list=None,
     kgrid_shift=None,
     return_coeffs: bool = False,
+    n_mu_out: int | None = None,
     use_low_mem_eigh: bool = False,
     htransform_quality_record_fn=None,
     log_fn=None,
@@ -371,8 +394,13 @@ def compute_wfns_fi(
                    points instead of a uniform grid (wrapped to (−0.5, 0.5]).
         kgrid_shift: with ``kgrid_fine``, kgrid.x's dk ``(dx, dy, dz)`` in
                    fractions of one fine-grid step: k_i = (i + dk)/N.
+        n_mu_out: optional output centroid carrier, at least the physical
+                   target count and divisible by both mesh axes. Defaults to
+                   their least common multiple above that count. Padding is
+                   exact zero inside the priced projection program.
         return_coeffs: also return the eigenvector coefficients
-                   ``.coeffs_fi`` (nk_fi, rank, nb_fi), q-sharded.
+                   ``.coeffs_fi`` (nk_fi, rank, nb_fi), rank-sharded over
+                   all mesh ranks (y,x) (the canonical Galerkin rank carrier).
         use_low_mem_eigh: the deck's ``linalg = distributed``: no rank may
                    hold a whole (rank, rank) matrix, so only the face route
                    is admitted.  Otherwise ``lxkit.memory`` admits the
@@ -385,8 +413,10 @@ def compute_wfns_fi(
 
     Returns:
         SimpleNamespace bundle (matching ``file_io.tagged_arrays`` convention):
-            .psi_rmu_Y:  (nk_fi, nb_fi, ns, n_μ)  P(None, None, None, 'y')
-            .psi_rmuT_X: (nk_fi, n_μ, nb_fi, ns)  P(None, 'x', None, None)
+            .n_mu_logical: physical target count (B_at_mu geometry unchanged)
+            .n_mu_carrier: padded centroid extent of both wavefunction views
+            .psi_rmu_Y:  (nk_fi, nb_fi, ns, mu_out)  P(None, None, None, 'y')
+            .psi_rmuT_X: (nk_fi, mu_out, nb_fi, ns)  P(None, 'x', None, None)
             .enk_full:   (nk_fi, nb_fi)           recovered DFT energies (Ry)
                                                   via ``newton_inv`` of fH_q eigvals
             .lam_fi:     (nk_fi, nb_fi)           raw fH_q eigenvalues (= f(ε_n,q))
@@ -402,8 +432,19 @@ def compute_wfns_fi(
         raise ValueError("pass exactly one of kgrid_fine / q_list")
     nb_co = int(ctilde.shape[1])
     rank = int(ctilde.shape[2])
+    # Galerkin fit/read always supply this rank carrier. Keeping the returned
+    # coefficient bank rank-sharded avoids a ragged-q replication fallback.
+    if return_coeffs and rank % int(mesh_xy.size):
+        raise ValueError('fine-wavefunction coefficients require the canonical Galerkin '
+                         'rank carrier padded over all mesh ranks')
     nspinor = int(B_at_mu.shape[1])
     n_mu = int(B_at_mu.shape[2])
+    # Both canonical views shard mu, on different axes. The source geometry
+    # remains physical; only its returned wavefunction carrier is padded.
+    mu_divisor = int(np.lcm(int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])))
+    mu_out = (-(-n_mu//mu_divisor)*mu_divisor if n_mu_out is None else int(n_mu_out))
+    if n_mu < 1 or mu_out < n_mu or mu_out % mu_divisor:
+        raise ValueError("fine wavefunction centroid carrier must contain the targets and tile both mesh axes")
 
     b_min, b_max = int(band_window_fi[0]), int(band_window_fi[1])
     nb_fi = b_max - b_min
@@ -467,7 +508,7 @@ def compute_wfns_fi(
     ws_table = node_pair_table(B_at_mu, kgrid_co, mesh_xy)
     ws_code, ws_target = ws_table["code"], ws_table["target_code"]
     rep = NamedSharding(mesh_xy, P())
-    columns = jax.device_put(jnp.asarray(start_columns(rank, nb_co)), rep)
+    columns = device_put_process_local(start_columns(rank, nb_co), rep)
 
     # ── q-points (uniform fine grid or explicit list), padded to batch ───
     if q_list is None:
@@ -524,16 +565,12 @@ def compute_wfns_fi(
         the division only touches returned window bands, which the
         f-shoulder gate keeps away from ``f = 0``.
         """
-        c = U[..., b_min:b_max]                                # (..., rank, nb_fi)
-        nodal = (L @ c) / (-lam[..., None, b_min:b_max])       # (..., t, nb_fi)
-        psi = jnp.moveaxis(nodal[..., :nspinor * n_mu, :].reshape(
-            nodal.shape[:-2] + (nspinor, n_mu, nodal.shape[-1])), -1, -3)
-        return lam[..., b_min:b_max], psi, c
+        return _project_fine_wfns(lam, U, L, b_min, b_max, nspinor, n_mu, mu_out)
 
     out_shardings = (
         _fit(mesh_xy, P(('x', 'y'), None), (bs, nb_fi), "bse_setup.lam"),
         _fit(mesh_xy, P(('x', 'y'), None, None, None),
-             (bs, nb_fi, nspinor, n_mu), "bse_setup.psi"),
+             (bs, nb_fi, nspinor, mu_out), "bse_setup.psi"),
         _fit(mesh_xy, P(('x', 'y'), None, None), (bs, rank, nb_fi),
              "bse_setup.coeffs"),
         rep, rep)
@@ -595,10 +632,14 @@ def compute_wfns_fi(
                   [np.asarray(s) for s, _ in block_stats],
                   [np.asarray(r) for _, r in block_stats])
     del fH_R, L_R
-    lam_fi = jnp.concatenate(lam_chunks, axis=0)[:nq]
-    psi_fi = jnp.concatenate(psi_chunks, axis=0)[:nq]
-    coeffs_fi = (jnp.concatenate(c_chunks, axis=0)[:nq]
+    # Retain the legal q carrier until the explicit-output epilogue. An
+    # eager ragged [:nq] can drop q sharding and replicate the full payload.
+    lam_fi = jnp.concatenate(lam_chunks, axis=0)
+    psi_fi = jnp.concatenate(psi_chunks, axis=0)
+    coeffs_fi = (jnp.concatenate(c_chunks, axis=0)
                  if return_coeffs else None)
+    jax.block_until_ready((lam_fi, psi_fi, coeffs_fi))
+    del lam_chunks, psi_chunks, c_chunks, lam_s, psi_s, c_s
     _mesh_id = _mesh_key(mesh_xy)
 
     # ── Newton-invert lam_fi → DFT-equivalent energies ───────────────────
@@ -621,31 +662,68 @@ def compute_wfns_fi(
     # Matches ``common.wfn_transforms.load_centroids_band_chunked``:
     #   psi_rmu_Y:  (nk, nb, ns, n_μ)   P(None, None, None, 'y')   — n_μ on Y
     #   psi_rmuT_X: (nk, n_μ, nb, ns)   P(None, 'x', None, None)   — n_μ on X
-    # Both shard the μ axis (the k-means centroid count), which is exactly
-    # the extent nothing rounds here.  Fit, do not assume.
+    # Both views use the legal centroid carrier produced inside _project;
+    # neither can drop its mu axis because of a prime physical target count.
     out_Y = _fit(mesh_xy, P(None, None, None, 'y'),
-                 (nq, nb_fi, nspinor, n_mu),
+                 (nq, nb_fi, nspinor, mu_out),
                  "bse_setup.psi_rmu_Y")
     out_X = _fit(mesh_xy, P(None, 'x', None, None),
-                 (nq, n_mu, nb_fi, nspinor),
+                 (nq, mu_out, nb_fi, nspinor),
                  "bse_setup.psi_rmuT_X")
 
+    coeff_sh = NamedSharding(mesh_xy, P(None, ('y', 'x'), None))
+
     def _build_bundle():
-        @partial(jax.jit, out_shardings=(out_Y, out_X))
-        def _make_bundle(psi):
-            psi_Y = jax.lax.with_sharding_constraint(psi, out_Y)
-            psi_X = jax.lax.with_sharding_constraint(
-                jnp.transpose(psi, (0, 3, 1, 2)), out_X)
-            return psi_Y, psi_X
+        # The existing staged mover guarantees one shard per intermediate.
+        # A direct q-product -> mu-axis constraint can replicate all of psi.
+        to_face = batch_to_face_reshard(mesh_xy)
+        band_spin = nb_fi*nspinor
+        band_carrier = -(-band_spin//mu_divisor)*mu_divisor
+        coeff_bands = -(-nb_fi//int(mesh_xy.shape['x']))*int(mesh_xy.shape['x'])
+
+        @partial(jax.jit, out_shardings=(out_Y, out_X, rep, rep,
+                                        coeff_sh if return_coeffs else None))
+        def _make_bundle(psi, energies, lam, coeffs):
+            packed = psi.reshape(psi.shape[0], band_spin, mu_out)
+            packed = jnp.pad(packed, ((0, 0), (0, band_carrier-band_spin), (0, 0)))
+            # Face first, then gather only bands; mu remains split throughout.
+            py = jax.lax.with_sharding_constraint(to_face(packed),
+                NamedSharding(mesh_xy, P(None, None, 'y')))
+            px = jax.lax.with_sharding_constraint(
+                to_face(jnp.swapaxes(packed, -1, -2)),
+                NamedSharding(mesh_xy, P(None, 'x', None)))
+            psi_Y = py[:nq, :band_spin].reshape(nq, nb_fi, nspinor, mu_out)
+            psi_X = px[:nq, :, :band_spin].reshape(nq, mu_out, nb_fi, nspinor)
+            if return_coeffs:
+                cp = jnp.pad(jnp.swapaxes(coeffs, -1, -2),
+                    ((0, 0), (0, coeff_bands-nb_fi), (0, 0)))
+                cf = jnp.swapaxes(to_face(cp), -1, -2)
+                # Move only x from bands to rank; y remains on rank. The
+                # product order is therefore (y,x), with no full C replica.
+                c = jax.lax.with_sharding_constraint(cf, coeff_sh)[:nq, :, :nb_fi]
+            else:
+                c = None
+            return psi_Y, psi_X, energies[:nq], lam[:nq], c
         return _make_bundle
 
-    # ``nq`` joins the key here and nowhere else: it is the only kernel whose
-    # closed-over shardings (out_Y / out_X) carry the fine-grid q count.
-    psi_rmu_Y, psi_rmuT_X = _cached_kernel(
+    # Every closed-over carrier/output choice belongs to this geometry key.
+    program = _cached_kernel(
         ("make_bundle", _mesh_id, int(nq), int(nb_fi), int(nspinor),
-         int(n_mu)), _build_bundle)(psi_fi)
+         int(mu_out), int(rank), bool(return_coeffs)), _build_bundle)
+    arguments = (psi_fi, energies_fi, lam_fi, coeffs_fi)
+    executable = program.lower(*arguments).compile()
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    from lxkit import memory
+    needed = -agreed_chunk(-compiled_new_bytes(executable))
+    memory.admit('fine wavefunction bundle', (('staged q/centroid redistribution',
+        memory.priced(0, 'compiled fine-wavefunction epilogue',
+            spread=needed*int(mesh_xy.size), ranks=int(mesh_xy.size))),),
+        memory.room(bucketed=False))
+    psi_rmu_Y, psi_rmuT_X, energies_fi, lam_fi, coeffs_fi = executable(*arguments)
+
     log(f"  bundle: psi_rmu_Y={psi_rmu_Y.shape}, psi_rmuT_X={psi_rmuT_X.shape}")
     out = SimpleNamespace(
+        n_mu_logical=n_mu, n_mu_carrier=mu_out,
         psi_rmu_Y=psi_rmu_Y,
         psi_rmuT_X=psi_rmuT_X,
         enk_full=energies_fi,

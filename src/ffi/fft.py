@@ -2770,8 +2770,10 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
         raise ValueError(f"k-leading unfold conv: tables were cut for a {tuple(tables.mesh_shape)} "
                          f"mesh; this mesh is {mesh_shape}")
     si, sf = ffi_fft_scale("ifftn", norm, nk), ffi_fft_scale("fftn", norm, nk)
+    stores_rows_in_kernel = False
     if kconv_backend(mesh, kgrid) == "mathdx":
         _require_target(KCONV_KLEAD_UNFOLD_TARGET, "CUDA")
+        stores_rows_in_kernel = True
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale=np.float64(si * sf * float(mult)), **_mathdx_common())
 
@@ -2786,6 +2788,7 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
                 *(() if live is None else (live,)), conj_src=np.int64(bool(conj_src)),
                 x0=np.int64(x0), bx=np.int64(bx), xs=np.int64(xs), xn=np.int64(xn), **attrs)
     elif (kbox := rocm_kbox_target(mesh, kg, "kconv_klead_unfold", ns)) is not None:
+        stores_rows_in_kernel = True
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale=np.float64(si * sf * float(mult)), cubin_dir=cubin_cache_dir())
 
@@ -2874,6 +2877,10 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
                 rows = None
         return sharded(bool(conj_partner and needs_partner), rows, load is not None, live is not None)(
             G, Gt, W_prep, *(() if live is None else (live,)), *(() if load is None else tuple(load)))
+    # Native mode-7 outputs have the requested stored rows. The composed
+    # CPU/reference implementation forms the full FFT result before cropping;
+    # a caller must not repeat it merely to reduce an output buffer.
+    apply.stores_rows_in_kernel = stores_rows_in_kernel
     return apply
 
 
