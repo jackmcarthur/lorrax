@@ -58,11 +58,33 @@ More ranks divide face storage and can reduce the number of whole matrices assig
 
 ## Reference runs on Perlmutter {: #examples }
 
-These are fresh fixed-input $G_0W_0$ runs from **23 October 2026**, pinned to source [`2d2ca2f104`](https://github.com/jackmcarthur/lorrax/commit/2d2ca2f104a085876a573e8b1278a7874c479b98). They use native full head corrections, default accuracy and automatic batch/layout selection. They establish completed workloads, not k-grid/band/basis convergence or minimum processor counts.
+### Completed Fe GPU run, 25 October 2026
+
+Ferromagnetic bcc Fe with SOC completed on source [`ba121f1f1`](https://github.com/jackmcarthur/lorrax/commit/ba121f1f1fde23ae4a7f0b8442a894b857bdd3cf) with the required ABI13 native libraries, using released JAX/JAXLIB and CUDA plugin/PJRT `0.12.0.1`, NumPy `2.4.3` and SciPy `1.17.1`. The case has one atom, an 8×8×8 full k grid, 59 stored parents, 110 sum bands (112 padded slots), and 1099 physical centroids (1100 packed slots at P4). Fractional occupations use a 0.02 Ry width. The shared-pole treatment builds 1099 poles per q from 35 samples; the Σ/QP output covers bands 1–22.
+
+| Resources | Automatic budget/rank | GW wall | Pool-used peak/rank | Host high-water/rank |
+|---|---:|---:|---:|---:|
+| 4 A100-40GB GPUs, 1 node | 31.58 GB | 257.65 s | 15.48 GB | 16.30 GB |
+
+| Setup | ISDF / Coulomb | Screening | Self-energy | QP update |
+|---:|---:|---:|---:|---:|
+| 14.98 s | 42.37 s | 126.15 s | 70.98 s | 2.44 s |
+
+The driver time includes setup and compilation; DFT and centroid/dipole/kinetic preprocessing are excluded. Numerical state and private XLA/native/driver cache namespaces start fresh. Rank 0 records 568 driver backend compiles, six cache hits and 51.11 s of backend compilation, excluding eight startup compiles. Compile time overlaps the stage spans. This is one cold control; no warm or matched-source speedup measurement is attached to it.
+
+The 15.48 GB peak is the production pool-used maximum over four ranks. Physical/reserved device high-water was not aggregated. Host high-water is cumulative process `ru_maxrss`, including startup, maximized over ranks; multiplying it by four does not give a simultaneous node peak.
+
+All four producer ranks pass the source/native/version guards and log scans. A separate canonical readback verifies committed Σ/EQP coverage: 59×22 finite rows in each QP file. The unchanged strict Σ/EQP comparison with the earlier `ee695a6a4b` GPU4 control passes: numerical Sigma datasets, including complex derivatives, and both QP files have zero numerical differences. Accuracy convergence and W-operator parity remain separate checks. The `sigma_reads_past_w_support` warning concerns the W model's sampled support range and remains relevant to a separate accuracy study.
+
+The exact [deck](../assets/cluster-references/2026-10-25/fe_gpu4/gw.in) and [run record](../assets/cluster-references/2026-10-25/fe_gpu4/manifest.json) bind the physical input hashes, ABI13 native pair, cache counters and durable evidence archive. The physical centroid table is unchanged from the linked historical Fe assets. Later source revisions and CPU runs require their own qualification.
+
+### Historical source-pinned runs, 23 October 2026
+
+These historical fixed-input $G_0W_0$ runs completed on **23 October 2026**, pinned to source [`2d2ca2f104`](https://github.com/jackmcarthur/lorrax/commit/2d2ca2f104a085876a573e8b1278a7874c479b98). They use native full head corrections, default accuracy and automatic batch/layout selection. They establish completed workloads, not k-grid/band/basis convergence or minimum processor counts.
 
 The downloadable decks preserve that historical source. For main at or after [`5e4f1bdab`](https://github.com/jackmcarthur/lorrax/commit/5e4f1bdabf4fd9643733a43966bf252f31426953), remove `fermi_reference = mp1_fixed_n` from the Fe deck; the metal chemical-potential reference is now automatic. Keep the original line when reproducing the pinned source.
 
-Memory values below use decimal GB. Wall time is the GW driver's `total run`, including setup and compilation but excluding centroid/dipole/kinetic preprocessing, queue wait and allocation startup. All GPU rows use A100-80GB cards and the automatic local-linalg budget (66.35 GB in the saved receipts). Persistent compilation caches were shared; the counts below make their state explicit.
+Memory values below use decimal GB. Wall time is the GW driver's `total run`, including setup and compilation but excluding centroid/dipole/kinetic preprocessing, queue wait and allocation startup. All GPU rows in this historical table use A100-80GB cards and the automatic local-linalg budget (66.35 GB in the saved receipts). Persistent compilation caches were shared; the counts below make their state explicit.
 
 | System | Full k grid / stored parents | Occupied bands | Sum bands | Physical $N_\mu$ | $n_s$ | Method | Resources | GW wall | Pool peak/rank |
 |---|---|---:|---:|---:|---:|---|---|---:|---:|

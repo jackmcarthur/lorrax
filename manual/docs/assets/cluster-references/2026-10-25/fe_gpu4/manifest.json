@@ -1,0 +1,352 @@
+{
+  "acceptance": {
+    "CPU64_qualification": "NOT_ESTABLISHED by this GPU4 case or pair",
+    "W_operator_parity": "NOT_MEASURED",
+    "all4_producer_exit": 0,
+    "all4_source_native_version_core_guards": "PASS",
+    "basis_kgrid_accuracy_convergence": "NOT_MEASURED",
+    "canonical_sigma_eqp": {
+      "assembly_commit": true,
+      "band_span_zero_based": [
+        0,
+        22
+      ],
+      "eqp": {
+        "eqp0.dat": {
+          "bands_zero_based": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21
+          ],
+          "finite": true,
+          "kpoints": 59,
+          "rows": 1298
+        },
+        "eqp1.dat": {
+          "bands_zero_based": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21
+          ],
+          "finite": true,
+          "kpoints": 59,
+          "rows": 1298
+        }
+      },
+      "job": "60250276",
+      "ranks": 4,
+      "scope": "Canonical finite/schema and committed59x22Sigma/EQP coverage only; no cross-run numerical parity claim",
+      "star_parent_count": 59,
+      "status": "PASS",
+      "step": "38"
+    },
+    "cross_run_numeric_parity": "PASS against Fe214 ee695 GPU4, same physical inputs; exact numerical Sigma/QP values. No external BGW or W operator parity claim.",
+    "scanner_records": 8
+  },
+  "cache": {
+    "all4_driver_compiles": [
+      568,
+      568,
+      568,
+      568
+    ],
+    "all4_driver_hits": [
+      6,
+      6,
+      6,
+      6
+    ],
+    "fresh_numerical_state": true,
+    "fresh_private_XLA_native_driver_namespaces": true,
+    "rank0_driver_backend_compile_s": 51.10759724432137,
+    "rank0_driver_compiles": 568,
+    "rank0_driver_hits": 6,
+    "scope": "Per-process Lorrax backend-hook counters; times may overlap stage spans and are not critical-path decomposition. Single cold control; no matchedspeedupcomparison.",
+    "startup_compiles_excluded": 8,
+    "warm_leg": false
+  },
+  "case": "ferromagnetic_bcc_Fe_SOC_8x8x8_GPU4_Fe216_20261025",
+  "centroids_sha256": "a10b4171334efdcb884722f627911d97b58de717794c3256a5f4a080a7f86162",
+  "centroids_site_asset": "../../2026-10-23/fe_8x8x8/centroids_frac_1099.txt",
+  "cpp_tree": "f7c169f8c246ca0847bd1f2d1d4da2ac8a47bf3b",
+  "date": "2026-10-25",
+  "deck_sha256": "78c5f89e29bb95b70c8e10f68c11b1b011538adbd96f050476c48767125599eb",
+  "evidence": {
+    "HDF_open": false,
+    "archive": "/global/cfs/cdirs/m4598/jackm/lorrax_evidence/fe216_gpu_main_ba121_abi13_20261025",
+    "bytes": 4854701708,
+    "every_archived_regular_file_source_byte_checked": true,
+    "files": 100,
+    "manifest_sha256": "8c6907a8987fbeccfafae2c102e3e09cdddb86fea6ff936d608f84f2dbb9d1a9",
+    "numerical_imports": false,
+    "qualification_sha256": "5451b8791579acbb9e6044265e9a9dd5a7b41978af1fa1ed57da07673c365a96",
+    "source_tar": "git archive exact ba121 commit",
+    "status": "READBACK_PASS",
+    "symlinks": 11
+  },
+  "handler_abi": 13,
+  "memory": {
+    "ISDF_s": 42.37,
+    "QP_s": 2.44,
+    "Sigma_s": 70.98,
+    "constructor_s": 42.23,
+    "device_budget_reported_GB": 31.58,
+    "device_pool_used_peak_reported_GB": 15.48,
+    "driver_total_s": 257.65,
+    "host_process_maxrss_bytes_max": 16300032000,
+    "memory_scope": "Production pool-used maximum over four ranks, not physical/reserved device high-water. Host cumulative per-process ru_maxrss includes startup; no P times maximum global-peak claim.",
+    "other_s": 0.73,
+    "payload_main_s_max": 243.73924216197338,
+    "physical_reserved_device_peak": "NOT_AGGREGATED",
+    "screening_s": 126.15,
+    "setup_s": 14.98,
+    "timing_scope": "Single diagnostic run with fresh private cold cache namespaces. No warm or matched performance claim. Allocator VLOG enabled; OS file cache uncontrolled."
+  },
+  "native": {
+    "CUDA": {
+      "closure": "28d3d6657342bbde51cceda9836fd4304ac4f0d54598c0e8b57c4aed97aa06f4",
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/mp_floor_floor_ba121f1f1_20261025/src/ffi/cpp/build/liblorrax_ffi.so",
+      "sha256": "b21b0f0c20afa0ab61e1803a70a65d447d598084f077c15b90e112826b07028f"
+    },
+    "cpu": {
+      "closure": "c294aa43aa47f88e99221e6a9cff315d91ab38246dc6ce6dfbbf04174fa0fc4f",
+      "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/mp_floor_floor_ba121f1f1_20261025/src/ffi/cpp/build_host/liblorrax_ffi_host.so",
+      "sha256": "6e20cd63732bc7505bd3bd53a43c16d48f97a96fe2cc167f8488c09b087ed82c"
+    }
+  },
+  "physical_setup": {
+    "Sigma_QP_band_span_zero_based": [
+      0,
+      22
+    ],
+    "fractional_occupations": true,
+    "full_k_grid": [
+      8,
+      8,
+      8
+    ],
+    "material": "primitive ferromagnetic bcc Fe,1atom,SOC",
+    "nspinor": 2,
+    "occupied_edge": 18,
+    "packed_centroid_slots": 1100,
+    "padded_sum_band_slots": 112,
+    "physical_centroids": 1099,
+    "poles_per_q": 1099,
+    "samples": 35,
+    "smearing_width_ry": 0.02,
+    "stored_parent_q": 59,
+    "sum_bands": 110,
+    "treatment": "tangential shared-pole"
+  },
+  "preprocessed_inputs_reused_only": {
+    "preprocess/centroids_frac.txt": {
+      "bytes": 30900,
+      "resolved": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/205_fm_8x8x8_cpu64_qualification_20261024/preprocess/centroids_frac_1099.txt",
+      "sha256": "a10b4171334efdcb884722f627911d97b58de717794c3256a5f4a080a7f86162"
+    },
+    "preprocess/centroids_frac_1099.txt": {
+      "bytes": 30900,
+      "resolved": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/205_fm_8x8x8_cpu64_qualification_20261024/preprocess/centroids_frac_1099.txt",
+      "sha256": "a10b4171334efdcb884722f627911d97b58de717794c3256a5f4a080a7f86162"
+    },
+    "preprocess/dipole.h5": {
+      "bytes": 302022656,
+      "resolved": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/205_fm_8x8x8_cpu64_qualification_20261024/preprocess/dipole.h5",
+      "sha256": "f41013a1800ea4e85447c81a8cd4a070f2a927c5041a1b4016bc8821edc97c25"
+    },
+    "preprocess/kin_ion.h5": {
+      "bytes": 471236,
+      "resolved": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/205_fm_8x8x8_cpu64_qualification_20261024/preprocess/kin_ion.h5",
+      "sha256": "da42e35cf9993bdc91d7293c4eda790e043567dcbf4293761dfb1669bb4a6da0"
+    },
+    "preprocess/parallel_transport.h5": {
+      "bytes": 2822258326,
+      "resolved": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/205_fm_8x8x8_cpu64_qualification_20261024/preprocess/parallel_transport.h5",
+      "sha256": "4b0cc13f804cee0a49624947f4a6ca4b7e9f2e4de3357a4c62f215be1991fee0"
+    },
+    "qe/Fe.upf": {
+      "bytes": 351837,
+      "resolved": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/205_fm_8x8x8_cpu64_qualification_20261024/qe/Fe.upf",
+      "sha256": "b9b7671a2c667a6f87a7228d30fcc205e339b69f5568fe3f3dba567fdce59a19"
+    },
+    "qe/WFN.h5": {
+      "bytes": 464881020,
+      "resolved": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/205_fm_8x8x8_cpu64_qualification_20261024/qe/WFN.h5",
+      "sha256": "ef8b66a6bd05b5d9b64459070c3645b2e39fe8f3a249afdaba79cc249d82f843"
+    },
+    "qe/data-file-schema.xml": {
+      "bytes": 956157,
+      "resolved": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/205_fm_8x8x8_cpu64_qualification_20261024/qe/data-file-schema.xml",
+      "sha256": "cff410da33d687d998a821d7f881acf9f5165000506814666e88b41074fc7cee"
+    }
+  },
+  "qualification_sha256": "5451b8791579acbb9e6044265e9a9dd5a7b41978af1fa1ed57da07673c365a96",
+  "resources": {
+    "gpu": "NVIDIA A100-SXM4-40GB",
+    "gpus": 4,
+    "machine": "Perlmutter",
+    "mkl_threads": 1,
+    "nodes": 1,
+    "omp_threads": 14,
+    "openblas_threads": 1,
+    "physical_cores_per_rank": 16,
+    "ranks": 4
+  },
+  "restart": false,
+  "source_commit": "ba121f1f1fde23ae4a7f0b8442a894b857bdd3cf",
+  "source_native_attestation": {
+    "abi": 13,
+    "floor_qualification": {
+      "cold_closed_sha256": "ef00f00e2a9787397418725f313cc8ee1573513f8fb169ad9c8df1d5bfac0a2a",
+      "cold_wall_s": 452.7355709929834,
+      "rank_records": 60,
+      "run": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/20261025_cusolvermp_release_floor_abi13_ba121/resume_v3",
+      "stages": 15,
+      "status": "PASS",
+      "warm_closed_sha256": "e16179360effe4af0d4e1669123116bd37034cca74b50da013dddd7f1786d939",
+      "warm_wall_s": 136.46316274098353
+    },
+    "native": {
+      "build": {
+        "closure_sha256": "fbd338a14fb8c6b382b64a23c2940509d475f5128f5f63d33faabcfe429a7359",
+        "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/mp_floor_floor_ba121f1f1_20261025/src/ffi/cpp/build/liblorrax_ffi.so",
+        "sha256": "b21b0f0c20afa0ab61e1803a70a65d447d598084f077c15b90e112826b07028f"
+      },
+      "build_host": {
+        "closure_sha256": "a6f3e1eaccd25e8eb280eeaf14779b15be1fcf46ee6beffdf894f1e213a54523",
+        "path": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/mp_floor_floor_ba121f1f1_20261025/src/ffi/cpp/build_host/liblorrax_ffi_host.so",
+        "sha256": "6e20cd63732bc7505bd3bd53a43c16d48f97a96fe2cc167f8488c09b087ed82c"
+      }
+    },
+    "original_attestation": "/pscratch/sd/j/jackm/cs_claude/gwjax_shared_pole_20261023/cusolvermp_release_floor_abi13_ba121_20261025/external_attestation_ba_abi13.json",
+    "original_attestation_sha256": "36d2806120f524a2755b7aa7f16f68b7e6845f2705f9e924d81edec666ca314b",
+    "qualification_status": "PASS",
+    "scope": "Fresh canonical HOST+CUDA ABI13 pair, actualP4 Mp0.9.1 F64/C128 gate and unpaired default15/60 cold+warm suite PASS; not fullFe/CPU64/P1024 qualification",
+    "source": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/tmp/worktrees/mp_floor_floor_ba121f1f1_20261025",
+    "source_commit": "ba121f1f1fde23ae4a7f0b8442a894b857bdd3cf",
+    "source_receipt": "/pscratch/sd/j/jackm/cs_claude/gwjax_shared_pole_20261023/cusolvermp_release_floor_abi13_ba121_20261025/source_native_candidate.json",
+    "source_receipt_sha256": "2b0e1ce6f68b2f146ea8f7256ae8b801acc14f313f80f31182188be725d2a99a",
+    "venv": "/pscratch/sd/j/jackm/lorrax_gpu_ab/new/lorrax/.venv"
+  },
+  "source_scope": "Exact ba121 source and required ABI13 pair. The source-pinned ee695 GPU4 follow-up has zero numerical differences under the unchanged strict comparison. Later revisions and CPU64 need separate qualification.",
+  "source_tree": "dcc2c4d7f13fd6afa08ecc1d7e81288d94e35a38",
+  "status": "GPU4_PRODUCER_CANONICAL_AND_STRICT_SOURCE_PAIR_PASS",
+  "strict_gpu_source_pair": {
+    "evidence": {
+      "archive": "/global/cfs/cdirs/m4598/jackm/lorrax_evidence/fe214_ee_vs_fe216_ba_strict_pair_20261025",
+      "bytes": 252432,
+      "every_archived_file_source_byte_checked": true,
+      "files": 30,
+      "manifest_sha256": "0aa403e34880fc30ca6f5750ea9fca162988175f7fd1b6810eafdfa0487cb747",
+      "original_input_hashes_rechecked": true,
+      "status": "READBACK_PASS",
+      "summary_sha256": "40fdcfa1ea8f2a7160cdaa2c67105cbd950ec5cd4a2eb866da76617245e1d34a",
+      "symlinks": 3
+    },
+    "summary": {
+      "candidate_case": "Fe216 released GPU4 ABI13",
+      "candidate_source": "ba121f1f1fde23ae4a7f0b8442a894b857bdd3cf",
+      "datasets_pass": 19,
+      "dsigma_dE_max_abs": 0.0,
+      "eqp": {
+        "eqp0.dat": {
+          "dft_max_abs_ev": 0.0,
+          "qp_max_abs_ev": 0.0,
+          "qp_rms_ev": 0.0,
+          "rows": 1298
+        },
+        "eqp1.dat": {
+          "dft_max_abs_ev": 0.0,
+          "qp_max_abs_ev": 0.0,
+          "qp_rms_ev": 0.0,
+          "rows": 1298
+        }
+      },
+      "job": "60250276",
+      "nonrequired_attribute_differences": [
+        "ATTR_VALUE object=/sigma_c_extrap_beta_kn attribute=pooled_fit_seconds status=DIFF",
+        "ATTR_VALUE object=/sigma_c_extrap_inf_kn_ev attribute=pooled_fit_seconds status=DIFF",
+        "ATTR_VALUE object=/sigma_c_extrap_last_kn_ev attribute=pooled_fit_seconds status=DIFF",
+        "ATTR_VALUE object=/sigma_c_extrap_sigma_kn_ev attribute=pooled_fit_seconds status=DIFF"
+      ],
+      "numerical_datasets_exact_zero_mismatches": 18,
+      "objects_pass": 20,
+      "original_inputs_unchanged_bytehashes": true,
+      "reference_case": "Fe214 released GPU4 ABI12",
+      "reference_source": "ee695a6a4b1ccb717fe3082700b19d993cb4d171",
+      "scientific_assembly_identity": "PASS",
+      "scope": "Same physical input, two released GPU4 source revisions. Strict supplied complex raw/conditioned Sigma including derivatives plus both QP files. No external BGW, W operator, accuracy convergence, CPU64 or speedup qualification.",
+      "sigma_numeric_max_abs": 0.0,
+      "status": "STRICT_GPU_PAIR_PASS",
+      "step": "39",
+      "string_dataset_pass": 1,
+      "tolerance_changes": false,
+      "tolerances": {
+        "dft_atol_ev": 1e-10,
+        "eqp_atol_ev": 1e-05,
+        "sigma_atol": 1e-05,
+        "sigma_rtol": 1e-08
+      }
+    }
+  },
+  "timing_s": {
+    "ISDF_Coulomb": 42.37,
+    "QP": 2.44,
+    "Sigma": 70.98,
+    "constructor_in_screening": 42.23,
+    "driver_total": 257.65,
+    "other": 0.73,
+    "payload_main_max": 243.73924216197338,
+    "screening": 126.15,
+    "setup": 14.98
+  },
+  "versions": {
+    "jax": "0.12.0.1",
+    "jax-cuda13-pjrt": "0.12.0.1",
+    "jax-cuda13-plugin": "0.12.0.1",
+    "jaxlib": "0.12.0.1",
+    "numpy": "2.4.3",
+    "nvidia-cublasmp-cu13": "0.10.0.3695",
+    "nvidia-cusolvermp-cu13": "0.9.1.9318.post1",
+    "scipy": "1.17.1"
+  },
+  "warning": "sigma_reads_past_w_support preserved; original W sampled support caveat, no tolerance relaxation"
+}
