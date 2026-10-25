@@ -1654,12 +1654,10 @@ def _integrate_sigma_batches(
 
         if tau_kernel_factory is not None:
             tau_kernel = tau_kernel_factory(w_synthesis, sigma_axis)
-        elif scalar_subtile:
+        else:
             # The first window prices its complete executable at abstract
             # placement outputs before any full summed-band axis bank exists.
             tau_kernel = None
-        else:
-            tau_kernel = scalar_tau("axis", subtile_faces)
         # The residues' carrier on the wedge: the pair-transpose tables with
         # their device load, placed once per run (see ppm_tau_kernel).
         q_pair = (None if q_wedge is None else dataclasses.replace(
