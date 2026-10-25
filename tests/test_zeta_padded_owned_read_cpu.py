@@ -15,7 +15,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 jax.config.update('jax_enable_x64', True)
 
 
-def write_zeta_fixture(path, world, logical=13):
+def write_zeta_fixture(path, world, logical=13, disk_mu=None):
     """Write a tiny complete file for the real header and slab readers."""
     from file_io.isdf_header import IsdfHeader, write_isdf_header
     from file_io.commit_state import set_commit_state
@@ -26,6 +26,8 @@ def write_zeta_fixture(path, world, logical=13):
     q, m, g = np.ogrid[:nq, :logical, :ng]
     values = (10000*q+32*m+g + 1j*(q+2*m-g)).astype(np.complex128)
     values = np.where(g < valid[:, None, None], values, 0)
+    if disk_mu is not None:
+        values = np.pad(values, ((0, 0), (0, int(disk_mu)-logical), (0, 0)))
     fields = {
         'versionnumber': 1, 'flavor': 2,
         'kpoints/nspin': 1, 'kpoints/nspinor': 1, 'kpoints/nrk': nq,
@@ -155,3 +157,33 @@ def test_header_only_zeta_cannot_enter_the_distributed_slab_path(tmp_path):
         got = tiles[0]
         assert got.shape == (16, loader.n_G_sph_disk)
         assert np.isfinite(got).all() and not np.any(got[13:])
+
+
+@pytest.mark.parametrize('side', (2, 3))
+def test_zeta_carrier_is_independent_of_old_processor_padding(tmp_path, side):
+    from zeta_loader import ZetaLoader
+    from file_io.restart_bundle import _ZetaGTiles
+    if jax.device_count() < side*side:
+        pytest.skip('requires nine virtual CPU devices')
+    mesh = Mesh(np.asarray(jax.devices()[:side*side]).reshape(side, side), ('x', 'y'))
+    path = tmp_path/'producer64.h5'
+    write_zeta_fixture(path, side*side, logical=13, disk_mu=64)
+    # Only discarded old processor padding is poisoned. The logical basis
+    # and the target's inert carrier rows retain their exact values.
+    with h5py.File(path, 'a') as f:
+        f['zeta_q_G'][:, 18:] = np.nan
+    check_zeta_padded_reads(mesh, path)
+    carrier = -(-13//int(mesh.size))*int(mesh.size)
+    with ZetaLoader(path) as loader:
+        tiles = _ZetaGTiles(loader, path=str(path), mu_carrier=carrier)
+        local_read = loader.read_zeta_G_local
+        def bounded(key):
+            assert key[1].start == 0 and key[1].stop == carrier
+            return local_read(key)
+        with patch.object(loader, 'read_zeta_G_local', bounded):
+            for key in (0, slice(1, 3)):
+                value = tiles[key]
+                assert value.shape[-2] == carrier and np.isfinite(value).all()
+                assert not np.any(value[..., 13:, :])
+        with pytest.raises(ValueError, match='below the logical 13'):
+            _ZetaGTiles(loader, path=str(path), mu_carrier=12)

@@ -2522,8 +2522,8 @@ class _ZetaGTiles:
         self._mu_disk = int(loader.n_rmu_disk)
         # ``mu_carrier``: the μ axis zero-padded to the payload's centroid carrier.
         self._mu = self._mu_disk if mu_carrier is None else int(mu_carrier)
-        if self._mu < self._mu_disk:
-            raise ValueError(f"zeta_q_G: centroid carrier {self._mu} below the stored {self._mu_disk}")
+        if self._mu < int(loader.n_rmu):
+            raise ValueError(f"zeta_q_G: centroid carrier {self._mu} below the logical {int(loader.n_rmu)}")
         if loader.zeta_layout != 'G_flat':
             raise ValueError(
                 f"vq_interp needs a G-flat ζ ('zeta_q_G'); {path} has "
@@ -2542,21 +2542,19 @@ class _ZetaGTiles:
 
     # -- local plan (host numpy, h5py hyperslab; unchanged semantics) ---
     def __getitem__(self, key):
-        """``zeta_q_G[key]`` as host numpy — the loader's serial handle.
+        """One q row or q slice for a bounded, explicit host diagnostic.
 
-        Delegation, not a re-implementation: ``read_zeta_G_local`` returns
-        exactly what ``dataset[key]`` returns for any h5py key, and the
-        service pins that byte-for-byte against a raw handle.  The
-        post-close refusal is the LOADER's now (this used to be a local
-        ``self._ds is None`` test with its own message), which is what
-        makes "closed" one fact about one owner instead of two objects
-        each with a private opinion.
+        Read only the consumer's centroid extent. Extra processor padding
+        from the writer is not part of the physical basis or host staging.
         """
-        out = self._loader.read_zeta_G_local(key)
-        if self._mu == self._mu_disk:
+        if not isinstance(key, (int, np.integer, slice)):
+            raise TypeError('zeta diagnostic indexing requires one q row or q slice')
+        width = min(self._mu, self._mu_disk)
+        out = self._loader.read_zeta_G_local((key, slice(0, width), slice(None)))
+        if width == self._mu:
             return out
         axis = out.ndim - 2                                  # (.., μ, G)
-        return np.pad(out, [(0, self._mu - self._mu_disk) if i == axis else (0, 0)
+        return np.pad(out, [(0, self._mu - width) if i == axis else (0, 0)
                             for i in range(out.ndim)])
 
     # -- distributed plan (per-rank hyperslab straight into `sharding`) -
