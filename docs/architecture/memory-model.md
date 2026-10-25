@@ -522,6 +522,15 @@ per call. The executable's actual additional XLA bytes and queried provider
 scratch are admitted beside the live operands and placed unfold tables.
 Row sizes follow the fixed 1 GiB tile, including for small one-window cases.
 
+Placed charge tables are counted once across both bounded placement and
+k-convolution caches. Their last eviction retires table-bound minimax and
+response-bank programs, including cached layout variants and executables,
+through the same owner. A caller or an unfinished background compile can
+still retain its own operands until its work finishes; eviction does not
+cancel work or delete borrowed device buffers. Recompiling an explicitly
+held retired program returns its future to the caller without restoring
+global cache ownership of the retired tables.
+
 `S_11` is mode 11's split-arm scratch, at most one `T_R`
 (`greens_function_kernel.chi0_kconv_scratch`); it is 0 on the single pass.
 `S_7` is mode 7's, `min(R·ν, ⌊1 GiB / s⌋)` pairs of `s` B, at most 1 GiB, with

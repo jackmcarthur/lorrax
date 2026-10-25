@@ -15,6 +15,7 @@ Common needs:
 """
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -446,8 +447,8 @@ def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
     in the wrong gauge.  Any other bundle reads ``dipole_file``
     after ``file_io.dipole.require_dipole_k_grid`` and the file's WFN stamp
     against ``wfn_path`` (``file_io.dipole.require_dipole_wfn_fingerprint``),
-    then slices it (:func:`slice_dipole_to_bse_window`) at ``n_occ`` over the
-    loader's resolved window, or, on a ``qp_rotations_file`` bundle
+    and reads only the loader's resolved c/v window. On a
+    ``qp_rotations_file`` bundle
     (``data["qp_rotation"]``), takes the QP-basis dipoles of
     ``bse.bse_qp_rotation.qp_window_dipoles`` from the same checked file,
     which must then hold the velocity p − i[r, V_NL] of H_DFT
@@ -455,9 +456,11 @@ def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
 
     Returns
     -------
-    d_alpha : (3, nk, nc, nv) complex — ⟨ck|v̂_α|vk⟩ / ΔE (bohr).
-    de_cv   : (nk, nc, nv) float — the velocity's own E_c − E_v (Ry); on the
-              QP route, E′_c − E′_v of the QP states.
+    d_alpha : (3, nk, nc_pad, nv_pad) complex, matrix-face sharded
+        ⟨ck|v̂_α|vk⟩ / ΔE (bohr); carrier slots are zero.
+    de_cv : (nk, nc_pad, nv_pad) float, matrix-face sharded
+        The velocity's own E_c − E_v (Ry), QP energies on the rotated route;
+        carrier slots are infinite and do not count as physical transitions.
     """
     import os
     if data.get("densified"):
@@ -472,40 +475,50 @@ def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
                 f"k list, or the right shape in another gauge); fix: pass "
                 f"velocity_file=dipole_file to "
                 f"load_bse_data_from_restart_sharded.")
-        return dip["d_alpha"], dip["de_cv"]
-    from file_io.dipole import (require_dipole_bands, require_dipole_k_grid,
+        from common.collectives import device_put_process_local
+        from jax.sharding import NamedSharding, PartitionSpec as P
+        mesh = data["psi_c_X"].sharding.mesh
+        nc, nv = map(int, dip["de_cv"].shape[-2:])
+        extra = ((0, 0), (0, int(data["n_cond_pad"]) - nc),
+                 (0, int(data["n_val_pad"]) - nv))
+        # The densifier already owns these host-window fields. Place their
+        # existing values once; downstream optical consumers share the same
+        # legal pair carrier as file-backed windows.
+        d = device_put_process_local(np.pad(dip["d_alpha"], ((0, 0), *extra)),
+            NamedSharding(mesh, P(None, None, "x", "y")))
+        de = device_put_process_local(np.pad(dip["de_cv"], extra, constant_values=np.inf),
+            NamedSharding(mesh, P(None, "x", "y")))
+        return d, de
+    from file_io.dipole import (require_dipole_k_grid,
                                 require_dipole_wfn_fingerprint)
-    from file_io.restart_bundle import load_dipole_h5
-    dipole_cart, deltaE, attrs = load_dipole_h5(dipole_file, wfn_path=wfn_path)
-    require_dipole_not_short(attrs, int(dipole_cart.shape[-1]),
-                             n_occ + int(data["n_cond"]), dipole_path=dipole_file)
-    require_dipole_bands(
-        attrs, int(dipole_cart.shape[-1]), n_occ - int(data["n_val"]),
-        n_occ + int(data["n_cond"]), dipole_path=dipole_file, where="BSE window")
+    from file_io.restart_bundle import load_dipole_h5, read_dipole_metadata
+    attrs = read_dipole_metadata(dipole_file)
     require_dipole_k_grid(
         attrs, int(data["nkx"]) * int(data["nky"]) * int(data["nkz"]),
         dipole_path=dipole_file)
     require_dipole_wfn_fingerprint(attrs, dipole_path=dipole_file,
                                    wfn_path=wfn_path,
                                    want=_deck_wfn_fingerprint(wfn_path))
+    mesh = data["psi_c_X"].sharding.mesh
+    nc, nv = int(data["n_cond"]), int(data["n_val"])
+    output_shape = int(data["n_cond_pad"]), int(data["n_val_pad"])
     qp = data.get("qp_rotation")
+    rows = (n_occ, n_occ + nc) if qp is None else qp["band_range"]
+    cols = (n_occ - nv, n_occ) if qp is None else qp["band_range"]
+    velocity, delta, attrs = load_dipole_h5(
+        dipole_file, wfn_path=wfn_path, mesh_xy=mesh,
+        band_rows=rows, band_cols=cols,
+        band_shape=output_shape if qp is None else None)
     if qp is None:
-        return slice_dipole_to_bse_window(dipole_cart, deltaE, n_occ,
-                                          int(data["n_val"]),
-                                          int(data["n_cond"]))
-    # eq. (3) of bse.bse_qp_rotation: the cross-gap split v = [E, W] + v_same
-    # holds for the velocity of H_DFT, not for the momentum alone.
+        return velocity / delta[None], delta
     if bool(attrs.get("skip_vnl", False)):
         raise ValueError(
             f"GATE bse_qp_dipole_velocity: got {dipole_file} with skip_vnl = "
-            f"true (momentum only); want the velocity p - i[r, V_NL] of "
-            f"H_DFT; why: the QP dipole splits v into [E_DFT, W] and its "
-            f"same-class block; fix: rebuild it with "
-            f"python -m psp.get_dipole_mtxels -i <deck>.")
+            "true (momentum only); want the velocity p - i[r, V_NL] of "
+            "H_DFT; rebuild it with python -m psp.get_dipole_mtxels -i <deck>.")
     from .bse_qp_rotation import qp_window_dipoles
-    de_cv = (np.asarray(qp["eps_c"])[:, :, None]
-             - np.asarray(qp["eps_v"])[:, None, :])
-    return qp_window_dipoles(dipole_cart, deltaE, qp), de_cv
+    return qp_window_dipoles(velocity, delta, qp, mesh_xy=mesh,
+                             output_shape=output_shape)
 
 
 def window_transition_energies(data):
@@ -518,13 +531,22 @@ def window_transition_energies(data):
     ``de_cv`` is the velocity's own ΔE, the dipoles' denominator, and stays that
     (DFT energies on the ``eqp`` routes, 0.7 eV low on Si).
     """
-    ec, ev = window_band_energies(data)
-    return ec[:, :, None] - ev[:, None, :]
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    mesh = data["psi_c_X"].sharding.mesh
+    nc, nv = int(data["n_cond"]), int(data["n_val"])
+    def transitions(ec, ev):
+        d = ec[:, :, None] - ev[:, None, :]
+        live = ((jnp.arange(d.shape[1])[None, :, None] < nc)
+                & (jnp.arange(d.shape[2])[None, None, :] < nv))
+        return jnp.where(live, d.real, jnp.inf)
+    return jax.jit(transitions,
+        out_shardings=NamedSharding(mesh, P(None, "x", "y")))(data["eps_c"], data["eps_v"])
 
 
 def window_band_energies(data):
-    """The operator's window energies ``(eps_c (nk, nc), eps_v (nk, nv))`` in Ry
-    on the host, pad rows dropped, valence ascending."""
+    """The operator's skinny window-energy tables on the host, pads dropped."""
     def host(a):
         if getattr(a, "is_fully_addressable", True):
             return np.asarray(a)
@@ -541,8 +563,20 @@ def build_dipole_vector_bse(d_alpha, n_cond_pad=None, n_val_pad=None):
     BSE sharded matvec requires divisibility by the (x, y) mesh shape).
     """
     npol, nk, nc, nv = d_alpha.shape
-    nc_pad = nc if n_cond_pad is None else n_cond_pad
-    nv_pad = nv if n_val_pad is None else n_val_pad
+    nc_pad = nc if n_cond_pad is None else int(n_cond_pad)
+    nv_pad = nv if n_val_pad is None else int(n_val_pad)
+    if nc_pad < nc or nv_pad < nv:
+        raise ValueError("dipole pair carrier cannot be smaller than its input")
+    if _is_jax_array(d_alpha):
+        import jax
+        import jax.numpy as jnp
+        from jax.sharding import NamedSharding, PartitionSpec as P
+        sh = d_alpha.sharding
+        out = (NamedSharding(sh.mesh, P(None, "x", "y", None))
+               if isinstance(sh, NamedSharding) else sh)
+        return jax.jit(lambda d: jnp.pad(d.transpose(0, 2, 3, 1),
+            ((0, 0), (0, nc_pad - nc), (0, nv_pad - nv), (0, 0))),
+            out_shardings=out)(d_alpha)
     out = np.zeros((npol, nc_pad, nv_pad, nk), dtype=d_alpha.dtype)
     out[:, :nc, :nv, :] = np.transpose(d_alpha, (0, 2, 3, 1))
     return out
@@ -600,8 +634,10 @@ def polarization_directions(polarization, wfn_path):
 
 def project_dipoles(d_alpha, directions):
     """``ê · d`` for each direction: ``d_alpha`` (3, ...) Cartesian -> (n_pol, ...)."""
-    d = np.asarray(d_alpha)
-    return np.tensordot(np.asarray(directions, dtype=np.float64), d, axes=(1, 0))
+    if _is_jax_array(d_alpha):
+        import jax.numpy as jnp
+        return jnp.tensordot(jnp.asarray(directions, dtype=jnp.float64), d_alpha, axes=(1, 0))
+    return np.tensordot(np.asarray(directions, dtype=np.float64), np.asarray(d_alpha), axes=(1, 0))
 
 
 def broaden(omegas, centers, weights, width, kind="lorentzian"):
@@ -616,6 +652,53 @@ def broaden(omegas, centers, weights, width, kind="lorentzian"):
     c = np.asarray(centers, dtype=np.float64).reshape(-1)[None, :]
     g = np.exp(-0.5 * ((om - c) / width) ** 2) / (np.sqrt(2.0 * np.pi) * width)
     return g @ np.asarray(weights, dtype=np.float64).reshape(c.shape[1], -1)
+
+
+@lru_cache(maxsize=16)
+def _transition_spectrum_program(mesh, kind):
+    """Sum broadened transitions locally; only the spectrum is reduced."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    def local(d, de, omega, width):
+        live = jnp.isfinite(de)
+        centers = jnp.where(live, de, 0.)
+        weights = jnp.abs(d) ** 2
+        def one(_, om):
+            distance = om - centers
+            if kind == "lorentzian":
+                kernel = width / (jnp.pi * (distance ** 2 + width ** 2))
+            else:
+                kernel = jnp.exp(-.5 * (distance / width) ** 2) / (jnp.sqrt(2 * jnp.pi) * width)
+            kernel = jnp.where(live, kernel, 0.)
+            values = jnp.concatenate([jnp.sum(weights * kernel[None], axis=(1, 2, 3)),
+                                      jnp.sum(kernel)[None]])
+            return None, values
+        return jax.lax.psum(jax.lax.scan(one, None, omega)[1], ("x", "y"))
+    program = jax.shard_map(local, mesh=mesh,
+        in_specs=(P(None, None, "x", "y"), P(None, "x", "y"), P(), P()),
+        out_specs=P(), check_vma=False)
+    return jax.jit(program, out_shardings=NamedSharding(mesh, P()))
+
+
+def _transition_spectrum(d_alpha, de_cv, omegas, width, kind):
+    """Broaden the same physical transitions without gathering a CV bank."""
+    from common.collectives import gather_to_host
+    if kind not in ("lorentzian", "gaussian"):
+        raise ValueError(f"broadening {kind!r}: want lorentzian or gaussian")
+    if _is_jax_array(d_alpha) or _is_jax_array(de_cv):
+        if (not (_is_jax_array(d_alpha) and _is_jax_array(de_cv))
+                or not hasattr(d_alpha.sharding, "mesh")
+                or not hasattr(de_cv.sharding, "mesh")):
+            raise ValueError("transition spectra require both host arrays or both distributed device fields")
+        import jax.numpy as jnp
+        mesh = d_alpha.sharding.mesh
+        return np.asarray(gather_to_host(_transition_spectrum_program(mesh, kind)(
+            d_alpha, de_cv, jnp.asarray(omegas), jnp.asarray(width))))
+    de = np.asarray(de_cv).reshape(-1)
+    live = np.isfinite(de)
+    weights = np.abs(np.asarray(d_alpha)).reshape(d_alpha.shape[0], -1)[:, live].T ** 2
+    return broaden(omegas, de[live], np.column_stack([weights, np.ones(live.sum())]), width, kind)
 
 
 def write_state_spectra(*, energies_Ry, exciton_dipoles, d_alpha, de_cv,
@@ -643,10 +726,10 @@ def write_state_spectra(*, energies_Ry, exciton_dipoles, d_alpha, de_cv,
     D = project_dipoles(np.asarray(exciton_dipoles).T, directions)          # (npol, nS)
     eps2_eh = pref * broaden(om_Ry, e_S, np.abs(D.T) ** 2, w_Ry, kind)       # (nw, npol)
     dos_eh = broaden(omegas_eV, e_S * RYD2EV, np.ones((e_S.size, 1)), width_eV, kind)[:, 0]
-    de = np.asarray(de_cv, dtype=np.float64).reshape(-1)
-    dt = project_dipoles(d_alpha, directions).reshape(len(labels), -1)       # (npol, ntrans)
-    eps2_noeh = pref * broaden(om_Ry, de, np.abs(dt.T) ** 2, w_Ry, kind)
-    jdos = broaden(omegas_eV, de * RYD2EV, np.ones((de.size, 1)), width_eV, kind)[:, 0]
+    transitions = _transition_spectrum(project_dipoles(d_alpha, directions),
+                                        de_cv, om_Ry, w_Ry, kind)
+    eps2_noeh = pref * transitions[:, :-1]
+    jdos = transitions[:, -1] / RYD2EV
     complete = float(e_S.max() * RYD2EV) if e_S.size else float("nan")
     paths = []
     for col, label in enumerate(labels):
@@ -666,7 +749,7 @@ def write_state_spectra(*, energies_Ry, exciton_dipoles, d_alpha, de_cv,
                 f"{e[2]:.6f}); {kind} broadening {float(width_eV):.4f} eV; V_cell = "
                 f"{V_cell:.6f} bohr^3, N_k = {nk}, n_spinor = {n_spinor}; "
                 + (f"{e_S.size} computed states, complete below {complete:.4f} eV"
-                   if tag == "eh" else f"{de.size} window transitions"))
+                   if tag == "eh" else "window transitions"))
     return paths
 
 
@@ -686,12 +769,8 @@ def jdos_from_transitions(d_alpha, de_cv, omegas_Ry, V_cell, n_k, eta_Ry,
     ε₂ uses.  Returns ``(n_omega, 3)``.
     """
     pref = 16.0 * np.pi ** 2 / (V_cell * n_k * n_spin * n_spinor)
-    de_flat = np.asarray(de_cv).flatten()
-    f_alpha = (np.abs(np.asarray(d_alpha)) ** 2).astype(np.float64)
-    # One Lorentzian for the three polarizations (it used to be built per
-    # polarization, whole: 3 x n_omega x n_transitions on the host).
-    return pref * lorentzian_broaden(
-        omegas_Ry, de_flat, f_alpha.reshape(f_alpha.shape[0], -1).T, eta_Ry)
+    return pref * _transition_spectrum(d_alpha, de_cv, omegas_Ry,
+                                       eta_Ry, "lorentzian")[:, :-1]
 
 
 def kramers_kronig_eps1(omegas, eps2):
@@ -842,6 +921,20 @@ def write_bgw_eigenvalues(directory, eigvals_eV, dipoles=None, *, n_spin,
     return paths
 
 
+def _noeh_header(nk, nc, nv, n_spin, n_spinor, vol_supercell):
+    return [f"# neig  = {nk * nc * nv:8d}",
+            f"# vol   = {fortran_e(vol_supercell, 16, 9)}",
+            "# nspin, nspinor, nkpt, ncb, nvb = "
+            + "".join(f"{int(x):8d}" for x in (n_spin, n_spinor, nk, nc, nv)),
+            "#   ik    ic    iv    is         ec (eV)         ev (eV)        eig (eV)"
+            "   abs(dipole)^2      Re(dipole)      Im(dipole)"]
+
+
+def _noeh_record(ik, ic, iv, c, v, d):
+    return f"{ik + 1:6d}{ic + 1:6d}{iv + 1:6d}{1:6d}" + "".join(
+        fortran_e(x, 16, 8) for x in (c, v, c - v, float(abs(d) ** 2), d.real, d.imag))
+
+
 def bgw_noeh_lines(ec_eV, ev_eV, d_pol, *, n_spin: int, n_spinor: int,
                    vol_supercell: float) -> list[str]:
     """The lines of one BerkeleyGW ``eigenvalues*_noeh.dat`` (complex flavor).
@@ -870,19 +963,12 @@ def bgw_noeh_lines(ec_eV, ev_eV, d_pol, *, n_spin: int, n_spinor: int,
     nv = int(ev.shape[1])
     if d.shape != (nk, nc, nv):
         raise ValueError(f"bgw_noeh_lines: dipoles {d.shape} for window ({nk}, {nc}, {nv})")
-    lines = [f"# neig  = {nk * nc * nv:8d}",
-             f"# vol   = {fortran_e(vol_supercell, 16, 9)}",
-             "# nspin, nspinor, nkpt, ncb, nvb = "
-             + "".join(f"{int(x):8d}" for x in (n_spin, n_spinor, nk, nc, nv)),
-             "#   ik    ic    iv    is         ec (eV)         ev (eV)        eig (eV)"
-             "   abs(dipole)^2      Re(dipole)      Im(dipole)"]
+    lines = _noeh_header(nk, nc, nv, n_spin, n_spinor, vol_supercell)
     for ik in range(nk):
         for ic in range(nc):
             for iv in range(nv):
                 c, v, s = ec[ik, ic], ev[ik, nv - 1 - iv], d[ik, ic, nv - 1 - iv]
-                lines.append(f"{ik + 1:6d}{ic + 1:6d}{iv + 1:6d}{1:6d}" + "".join(
-                    fortran_e(x, 16, 8)
-                    for x in (c, v, c - v, float(np.abs(s) ** 2), s.real, s.imag)))
+                lines.append(_noeh_record(ik, ic, iv, c, v, s))
     return lines
 
 
@@ -894,19 +980,62 @@ def write_bgw_eigenvalues_noeh(directory, ec_eV, ev_eV, d_alpha, *, n_spin,
     ``eigenvalues_b1_noeh.dat`` .. ``_b3`` for the three axes
     (:func:`bgw_noeh_lines`).  ``d_alpha`` ``(3, nk, nc, nv)`` Cartesian.
     Returns the paths written."""
+    from contextlib import ExitStack
+    from common.collectives import gather_to_host, rank0_transaction
     directory = Path(directory)
     if directions is None:
         directions, labels = np.eye(3), BGW_POLARIZATION_SUFFIXES
-    d = project_dipoles(np.asarray(d_alpha, dtype=np.complex128), directions)
-    paths = []
-    for name, d_pol in zip(eigenvalue_file_names(labels), d):
-        path = directory / name.replace(".dat", "_noeh.dat")
-        with open(str(path), "w") as f:
-            f.write("\n".join(bgw_noeh_lines(
-                ec_eV, ev_eV, d_pol, n_spin=n_spin, n_spinor=n_spinor,
-                vol_supercell=vol_supercell)) + "\n")
-        paths.append(str(path))
+    d = project_dipoles(d_alpha, directions)
+    ec, ev = np.asarray(ec_eV), np.asarray(ev_eV)
+    nk, nc, nv = int(ec.shape[0]), int(ec.shape[1]), int(ev.shape[1])
+    paths = [str(directory / name.replace(".dat", "_noeh.dat"))
+             for name in eigenvalue_file_names(labels)]
+    stack, files = ExitStack(), []
+    def open_files():
+        for path in paths:
+            f = stack.enter_context(open(path, "w"))
+            files.append(f)
+            f.write("\n".join(_noeh_header(nk, nc, nv, n_spin, n_spinor, vol_supercell)) + "\n")
+    try:
+        rank0_transaction(directory, stage="bse.noeh.open", write=open_files)
+        # At most 1024 transitions (48 KiB for three polarizations) leave
+        # the device at once. Every rank participates; only rank 0 writes.
+        for start in range(0, nk * nc * nv, 1024):
+            stop = min(start + 1024, nk * nc * nv)
+            if _is_jax_array(d):
+                values = gather_to_host(_noeh_block_program(d.sharding.mesh, nc, nv)(
+                    d, np.arange(start, stop, dtype=np.int32)))
+            else:
+                idx = np.arange(start, stop)
+                values = d[:, idx // (nc * nv), idx // nv % nc, nv - 1 - idx % nv]
+            def write_block():
+                for k, flat in enumerate(range(start, stop)):
+                    ik, ic, iv = flat // (nc * nv), flat // nv % nc, flat % nv
+                    for f, value in zip(files, values[:, k]):
+                        f.write(_noeh_record(ik, ic, iv, ec[ik, ic], ev[ik, nv - 1 - iv], value) + "\n")
+            rank0_transaction(directory, stage="bse.noeh.block", write=write_block)
+    finally:
+        rank0_transaction(directory, stage="bse.noeh.close", write=stack.close)
     return paths
+
+
+@lru_cache(maxsize=16)
+def _noeh_block_program(mesh, nc, nv):
+    """Reduce a requested small text block from its owned CV tiles."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    def local(d, idx):
+        ik, ic, iv = idx // (nc * nv), idx // nv % nc, nv - 1 - idx % nv
+        c0 = jax.lax.axis_index("x") * d.shape[2]
+        v0 = jax.lax.axis_index("y") * d.shape[3]
+        owned = (ic >= c0) & (ic < c0 + d.shape[2]) & (iv >= v0) & (iv < v0 + d.shape[3])
+        values = d[:, ik, jnp.clip(ic - c0, 0, d.shape[2] - 1),
+                   jnp.clip(iv - v0, 0, d.shape[3] - 1)]
+        return jax.lax.psum(jnp.where(owned[None], values, 0.), ("x", "y"))
+    program = jax.shard_map(local, mesh=mesh,
+        in_specs=(P(None, None, "x", "y"), P()), out_specs=P(), check_vma=False)
+    return jax.jit(program, out_shardings=NamedSharding(mesh, P()))
 
 
 def write_absorption_h5(

@@ -513,16 +513,16 @@ def _write_all_roots(input_file, energies_ev, dipoles, nk: int, *, noeh=None,
     from .bse_window import _parse_wfn_path
     wfn_path = _parse_wfn_path(input_file)
     directions, labels = polarization_directions(polarization, wfn_path)
+    import h5py
+    with h5py.File(wfn_path, "r") as f:
+        celvol = float(f["mf_header/crystal/celvol"][()])
+        n_spin = int(f["mf_header/kpoints/nspin"][()])
+        n_spinor = int(f["mf_header/kpoints/nspinor"][()])
+    if noeh is not None:
+        write_bgw_eigenvalues_noeh(".", *noeh, n_spin=n_spin, n_spinor=n_spinor,
+                                   vol_supercell=float(nk) * celvol,
+                                   directions=directions, labels=labels)
     if jax.process_index() == 0:
-        import h5py
-        with h5py.File(wfn_path, "r") as f:
-            celvol = float(f["mf_header/crystal/celvol"][()])
-            n_spin = int(f["mf_header/kpoints/nspin"][()])
-            n_spinor = int(f["mf_header/kpoints/nspinor"][()])
-        if noeh is not None:
-            write_bgw_eigenvalues_noeh(".", *noeh, n_spin=n_spin, n_spinor=n_spinor,
-                                       vol_supercell=float(nk) * celvol,
-                                       directions=directions, labels=labels)
         return write_bgw_eigenvalues(".", energies_ev, dipoles, n_spin=n_spin,
                                      n_spinor=n_spinor,
                                      vol_supercell=float(nk) * celvol,

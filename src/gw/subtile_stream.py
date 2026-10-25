@@ -51,6 +51,15 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 
+# The bank's programs, layout metadata and compiled futures share the placed
+# response tables' lifetime. The table owner in w_isdf retires their entries;
+# this lightweight loop owner lets both callers share the dictionaries without
+# making response_bank import the numerical kernels before its first factory.
+_STREAM_KERNELS: dict = {}
+_STREAM_PROGRAMS: dict = {}
+_COMPILED: dict = {}
+
+
 def orbit_cuts(lsrc, side, ns):
     """The local centroid rows a row pass may start at: no row on one side reads the other.
 

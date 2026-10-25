@@ -353,6 +353,25 @@ dipole file's own `band_energies`: DFT energies for `dipole.h5`, $E_{QP}$ for
 `dipole_qsgw.h5`. `eqp_corrections` changes the transition energies of the Hamiltonian,
 not the dipoles.
 
+`file_io.restart_bundle.load_dipole_h5` reads selected band windows through
+SlabIO onto `P(None, None, 'x', 'y')` matrix faces. Ordinary optical sources
+request only their conduction/valence rectangle. A `qp_rotations_file` source
+requests the **complete active square**: the same-class velocity block in
+`qp_window_dipoles` contributes whenever the QP rotation mixes the occupied
+and empty classes. Both terms use the shared distributed matrix product.
+The stored band axis must still start at zero and cover the requested bands.
+Selected windows keep legal mesh carriers; zero velocity and infinite energy
+differences mark padding, including when more physical bands follow the
+window on disk. No carrier slot reads a neighbouring physical file band.
+
+Head seeds, optical contractions and independent-particle spectra keep these
+faces on device. Spectra reduce only the frequency/polarization table; the
+BerkeleyGW noninteracting-transition text writer transfers at most 1024
+transitions at a time and only rank 0 writes. All ranks must enter that writer.
+This removes a whole-file dipole read and downstream CV host copies; it does
+not change the already host-owned QP rotation artifact, the densifier's
+velocity preparation, or TD's active-space position model.
+
 A `kgrid_fine` bundle carries its own dipoles (`bse_densify.densified_dipoles`)
 and never slices a file (`absorption_common.window_dipoles` is the one source
 of both). The deck WFN's velocity, unfolded in the loader's gauge, which is

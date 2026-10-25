@@ -147,7 +147,7 @@ def main():
         live = w_isdf.placed_kconv_tables_live
         try:
             w_isdf.placed_kconv_tables_live = lambda tail: False
-            RB._release_evicted_programs()
+            w_isdf._release_evicted_programs()
             assert not RB._STREAM_PROGRAMS
             assert not any(entry[0] in owned for entry in RB._COMPILED)
         finally:

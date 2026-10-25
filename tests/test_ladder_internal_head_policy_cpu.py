@@ -173,9 +173,11 @@ def test_no_rung_facades_load_bare_only_restart_without_screened_reads(monkeypat
     monkeypatch.setattr(w_ladder,'load_bse_data_from_restart_sharded',load)
     deck=tmp_path/'gw.in';deck.write_text('[cohsex]\nwfn_file = WFN.h5\n')
     if facade=='head':
-        monkeypatch.setattr(restart_bundle,'load_dipole_h5',lambda *a,**k: (None,None,None))
-        monkeypatch.setattr(absorption_common,'slice_dipole_to_bse_window',
-            lambda *a: (np.ones((3,1,1,1)),np.ones((1,1,1))))
+        def dipoles(*a,**kw):
+            assert kw['band_rows']==(1,2) and kw['band_cols']==(0,1)
+            assert kw['band_shape']==(1,1) and kw['mesh_xy'] is mesh
+            return np.ones((3,1,1,1)),np.ones((1,1,1)),{}
+        monkeypatch.setattr(restart_bundle,'load_dipole_h5',dipoles)
         monkeypatch.setattr(head_resolvent,'build_head_operator',lambda *a,**k: 'head-operator')
         result=w_ladder.prepare_ladder_head('bare-only',mesh,input_file=str(deck),
             head_dipole_path='dipole.h5',head_n_occ=1,include_w=False)

@@ -173,8 +173,10 @@ def _S_from_cv(v_cvk, dE_cv, fv_minus_fc, omegas, pref_c, eta_c, *,
     """S(ω) from the (c, v) block: the one body both entry points trace."""
     def S_one(omega_val):
         w_c = omega_val + eta_c
-        denom = dE_cv * (w_c * w_c - dE_cv * dE_cv)
-        W = jnp.where(jnp.abs(denom) > 1e-16, fv_minus_fc / denom, 0.0 + 0.0j)
+        live = jnp.isfinite(dE_cv)
+        de = jnp.where(live, dE_cv, 1.0)
+        denom = de * (w_c * w_c - de * de)
+        W = jnp.where(live & (jnp.abs(denom) > 1e-16), fv_minus_fc / denom, 0.0 + 0.0j)
         W = pref_c * W
         return jnp.einsum('ancv,ncv,bncv->ab', jnp.conj(v_cvk), W, v_cvk, optimize=True)
 

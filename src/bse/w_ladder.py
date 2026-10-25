@@ -751,18 +751,16 @@ def prepare_ladder_head(restart_path, mesh_xy, *, input_file, head_dipole_path,
         # including a body's already prepared W_R, and is never donated here.
         if include_w:
             ensure_W_R(data, True, mesh_xy, consume_W_q=True)
-    from .absorption_common import (slice_dipole_to_bse_window)
     from file_io.restart_bundle import (load_dipole_h5)
     from .head_resolvent import build_head_dipole, build_head_operator
 
     from .bse_window import _parse_wfn_path
-    dipole_cart, delta_e, _ = load_dipole_h5(
-        head_dipole_path, wfn_path=_parse_wfn_path(input_file))
-    n_val = int(data["n_val"])
-    n_cond = int(data["n_cond"])
-    d_alpha, delta_cv = slice_dipole_to_bse_window(
-        dipole_cart, delta_e, int(head_n_occ), n_val, n_cond)
-    velocity_cv = np.asarray(d_alpha) * np.asarray(delta_cv)[None]
+    n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
+    velocity_cv, delta_cv, _ = load_dipole_h5(
+        head_dipole_path, wfn_path=_parse_wfn_path(input_file), mesh_xy=mesh_xy,
+        band_rows=(int(head_n_occ), int(head_n_occ) + n_cond),
+        band_cols=(int(head_n_occ) - n_val, int(head_n_occ)),
+        band_shape=(int(data["n_cond_pad"]), int(data["n_val_pad"])))
     d_pair = build_head_dipole(
         velocity_cv, delta_cv,
         n_cond_pad=int(data["n_cond_pad"]),

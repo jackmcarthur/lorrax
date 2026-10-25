@@ -28,6 +28,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from .efermi import OCCUPATION_WEIGHT_FLOOR, band_in_occupation_window
+from .subtile_stream import _COMPILED, _STREAM_KERNELS, _STREAM_PROGRAMS
 
 
 def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
@@ -556,14 +557,6 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
     return pi_grid, drude, contact
 
 
-#: The run's stream programs by factory arguments (:func:`_response_stream_kernel`).
-_STREAM_KERNELS: dict = {}
-
-
-# Placement policy beside the existing program cache; no state arrays are held.
-_STREAM_PROGRAMS: dict = {}
-
-
 def _stream_variant(state, layout):
     variants = state["variants"]
     if layout not in variants:
@@ -613,7 +606,8 @@ def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key,
     dropped with it (:func:`_release_evicted_programs`), so no table outlives
     its reservation.
     """
-    from .w_isdf import _get_chi_fractional_contour_kernel_face
+    from .w_isdf import (_get_chi_fractional_contour_kernel_face,
+                         _release_evicted_programs)
     key = (mesh_xy, kgrid, n_outputs, shape, _ffi_key, int(_native_scratch),
            _force_sum_layout, tuple(sorted(options.items())))
     kernel = _STREAM_KERNELS.get(key)
@@ -630,18 +624,6 @@ def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key,
                 force=_force_sum_layout, variants={initial: kernel}, last_layout=None)
         _release_evicted_programs()
     return kernel
-
-
-def _release_evicted_programs():
-    """Drop the stream programs, and their executables, that bind an evicted plan's kconv tables."""
-    from .w_isdf import placed_kconv_tables_live
-    for key in [k for k, kernel in _STREAM_KERNELS.items()
-                if not placed_kconv_tables_live(getattr(kernel, "tail", ()))]:
-        dead = _STREAM_KERNELS.pop(key)
-        state = _STREAM_PROGRAMS.pop(dead, None)
-        programs = tuple(state["variants"].values()) if state else (dead,)
-        for entry in [entry for entry in _COMPILED if entry[0] in programs]:
-            del _COMPILED[entry]
 
 
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
@@ -1094,9 +1076,6 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
     return dict(gemm=gemm,eigh=eig,total=gemm+eig,scope="actual-shape ISERV query; GEMM persistent plus concurrent eigh scratch")
 
 
-_COMPILED = {}
-
-
 def _compiled(kernel, args, *, ahead=False):
     """``kernel.lower(*args).compile()`` once per kernel and argument signature, per process.
 
@@ -1129,6 +1108,8 @@ def _program_compiled(kernel, args, *, ahead=False):
     future = _COMPILED.get(key)
     if future is None:
         future = _COMPILED[key] = compile_ahead(kernel, *args)
+        from .w_isdf import _release_evicted_programs
+        _release_evicted_programs()
     return future if ahead else future.result()
 
 

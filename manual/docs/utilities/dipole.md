@@ -10,6 +10,12 @@ Dipole matrix elements fix the $\bq \to 0$ head of $W$, the one element of the s
 
 The utility writes the Cartesian velocity matrix elements $\langle m\bk|\hat v_a|n\bk\rangle$ to `dipole.h5` for every full-BZ $\bk$, and by default the link matrices and Berry connection between neighbouring k points to `parallel_transport.h5`. GW reads `dipole.h5` for the head, the BSE for its optical dipoles, and the self-consistent QSGW head reads both.
 
+Optical consumers read their selected conduction–valence window directly onto
+the distributed band matrix. A QP-rotated BSE reads the full active square,
+since mixing occupied and empty states also needs same-class velocity entries.
+Readers enforce band coverage and match the dipole's DFT/QP basis to the
+physical WFN reference, including for the static head.
+
 <div class="glance" markdown>
 
 Invoke
@@ -244,7 +250,7 @@ dipole.h5
 `dipole_cart[a, k, m, n]` is $\langle m\bk|\hat v_a|n\bk\rangle$. $E_{m\bk} - E_{n\bk}$ is not stored; readers form it from `band_energies`, and the BSE divides by it to put each dipole in position form ([Velocity operator §2](../theory/velocity-operator.md#forms)). `basis` is `"qp"` only when `WFN.h5` carries the QP-WFN stamp. Consumers check the stamps to different depths ([The q → 0 head](../theory/q0-head.md#sources)):
 
 - **GW full head** (`GATE dft_head_dipole_provenance`): refuses a file built for another WFN, band window, spinor model or velocity operator.
-- **GW direct and static heads**: refuse another velocity operator (`GATE static_head_dipole_operator`); another WFN, band window or k count only warns, unless `LORRAX_SANITY=strict`.
+- **GW direct and static heads**: refuse a different DFT/QP basis or velocity operator (`GATE dipole_basis`, `GATE static_head_dipole_operator`); another WFN fingerprint, band window or k count only warns, unless `LORRAX_SANITY=strict`.
 - **`bse.bse_jax`, `bse.absorption_haydock`, `bse.exciton_bands`**: compare only `basis` against the WFN (`exciton_bands` also the k count); the WFN fingerprint is not read.
 
 The fix in every case is to rerun this utility with the run's input file.

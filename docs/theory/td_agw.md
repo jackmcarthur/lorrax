@@ -93,6 +93,12 @@ $\tilde\zeta_0(\mathbf G)$; no $N_\mu^2$ Coulomb tile is formed.
 
 ## Loading a model
 
+The coarse velocity reader selects only the explicit TD active band square
+from `dipole.h5`. The present `td_system.position_from_velocity` model still
+owns that square on the host; reader windowing does not make an arbitrarily
+large TD active space distributed. Its host storage scales as the active
+band count squared, rather than the full dipole file's band count squared.
+
 `tdagw.model.load_td_model(deck, mesh, bands=(b_lo, b_hi))` reads W (with its
 q = 0 head) and, by default, ψ through the BSE restart loader
 (`bse_loading.load_bse_data_from_restart_sharded`), so a deck with

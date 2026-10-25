@@ -550,7 +550,7 @@ def build_S_cart_omega(wfn, sym, meta, params, dipole_path, omega,
     """``S(ω)``, the Cartesian q²-coefficient tensor, from ``dipole.h5``; see docs/theory/bispinor-gw.md#head."""
     from common.chi_from_dipole import compute_S_omega_cv
     from common import timing as _tmg
-    from file_io.restart_bundle import read_dipole_cv_block
+    from file_io.restart_bundle import read_dipole_cv_block, read_dipole_metadata
 
     mesh = (params or {}).get("_mesh")
     if mesh is None:
@@ -563,9 +563,10 @@ def build_S_cart_omega(wfn, sym, meta, params, dipole_path, omega,
     # TODO(metal-head): this legacy one-shot dipole path retains the ifmax
     # step occupation; metallic QSGW uses the explicit weighted PT head.
     with _tmg.section("head.read_dipole"):
-        v_cvk, dE_cv = read_dipole_cv_block(dipole_path, nelec=nelec, mesh=mesh)
+        v_cvk, dE_cv = read_dipole_cv_block(
+            dipole_path, nelec=nelec, mesh=mesh, wfn_path=wfn.path)
     nk_file = int(v_cvk.shape[1])
-    nb = int(v_cvk.shape[2]) + int(v_cvk.shape[3])
+    nb = int(read_dipole_metadata(dipole_path)["stored_bands"])
     with _tmg.section("head.checks"):
         _check_dipole_coverage(
             dipole_path, nb_file=nb, nk_file=nk_file,
