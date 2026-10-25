@@ -964,6 +964,9 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     nq, n_mu = zx["nq"], zx["n_mu"]
     ngkmax = zx["ngkmax"]
     ndev = int(mesh_xy.devices.size)
+    from common.staged_reshard import face_to_batch_reshard, batch_to_face_reshard
+    face_to_q = face_to_batch_reshard(mesh_xy)
+    q_to_face = batch_to_face_reshard(mesh_xy)
     if n_mu % ndev:
         raise ValueError('prepare_coarse needs the canonical all-rank centroid carrier')
     n_mu_logical = int(zx.get('n_mu_logical', n_mu))
@@ -1041,7 +1044,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     def _make_eigh_batch(qb2, qb3):
         @partial(jax.jit, out_shardings=(qb2, qb3))
         def _eigh_batch(C):
-            C = jax.lax.with_sharding_constraint(C, qb3)
+            C = face_to_q(C)
             lam, R = eigh_local(C)
             return lam, R
         return _eigh_batch
@@ -1078,7 +1081,10 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
         return S, V_SRc, ph * ztg
 
     def _make_clean_split(qb3):
-        return jax.jit(_clean_split_body, out_shardings=(qb3, qb3, qb3))
+        def split(*args):
+            S, V, F = _clean_split_body(*args)
+            return S, q_to_face(V), F
+        return jax.jit(split, out_shardings=(qb3, NamedSharding(mesh_xy,P(None,'x','y')), qb3))
 
     # The face route (a mesh backup at every whole-matrix site): a
     # chunk whose q count does not divide the mesh (the q-batched layout degrades to
@@ -1111,7 +1117,10 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
                     eigh, split = _kernels(nb)
                     native = eigh_plan.is_native and distrib_la_batched_route == "auto"
                     herm = 0.5 * (c + jnp.conj(jnp.swapaxes(c, -2, -1)))
-                    return split(*(eigh(herm) if native else eigh_plan.batched(herm)), zg, *t)
+                    lam, R = eigh(herm) if native else eigh_plan.batched(herm)
+                    if not native:
+                        R = face_to_q(R)
+                    return split(lam, R, zg, *t)
 
                 def tiles(c, zg, *t):
                     plan, herm, split = _face_parts(nb)
@@ -1242,6 +1251,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
             # batched post-eigh pipeline follows either way (single source
             # for the math).
             lam, R = eigh_plan.batched(C_herm(sl))
+            R = face_to_q(R)
         # Process-local placement of the host chunks (scorecard AA.1) —
         # same file / same host tables on every rank, so plain
         # ``device_put``'s hidden assert_equal all-gather (5 × per chunk)
@@ -1249,13 +1259,20 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
         #
         # ζ is read directly into its distributed q-owner layout. A supplied
         # production mesh requires SlabIO; there is no full-q host fallback.
-        S_b, V_b, F_b = _clean_split(
+        operands = (
             lam, R,
             zx["ZG"].read_q_slab(sl.start, nb_lead, sharding=qb3),
             device_put_process_local(v_ref_all[sl], qb2),
             device_put_process_local(v_lr_all[sl], qb2),
             device_put_process_local(idx_all[sl], qb2),
             device_put_process_local(zx["qfr"][sl], qb2))
+        from runtime.aot_memory import compiled_price
+        executable = _clean_split.lower(*operands).compile()
+        price = compiled_price(compiled=executable, ranks=ndev, face=True,
+                               source='VQ q-owner cleaning and face output')
+        memory.admit('BSE V(q) cleaned chunk', (('staged matrix faces', price),),
+                     memory.room(bucketed=False))
+        S_b, V_b, F_b = executable(*operands)
         # ``_to_host``, not device_get: S_b/V_b/F_b are q-sharded qb3 across
         # the whole mesh, so at P>1 their shards span other processes.  This
         # is the deterministic loop ``_to_host``'s docstring relies on.

@@ -62,15 +62,16 @@ def test_device_placement_avoids_host_conversion_for_addressable_mesh(monkeypatc
     check_device_placement(monkeypatch,mesh)
 
 
-@pytest.mark.parametrize('side,face_route', [(2,False),(3,False),(2,True),(3,True)])
-def test_clean_fit_and_evaluator_keep_only_local_centroid_columns(monkeypatch, side, face_route):
+@pytest.mark.parametrize('side,face_route,extra_q',
+    [(2,False,0),(3,False,0),(2,True,0),(3,True,0),(2,False,1),(3,False,1)])
+def test_clean_fit_and_evaluator_keep_only_local_centroid_columns(monkeypatch, side, face_route, extra_q):
     if jax.device_count() < side**2:
         pytest.skip('requires nine virtual CPU devices')
     mesh = Mesh(np.asarray(jax.devices()[:side**2]).reshape(side, side), ('x', 'y'))
-    check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, reference=True)
+    check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, reference=True, extra_q=extra_q)
 
 
-def check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, *, reference=False):
+def check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, *, reference=False, extra_q=0):
     """Shared tiny identity; a native MPI proof supplies its actual runtime mesh."""
     from bse import vq_interp as V
     from common.collectives import device_put_process_local
@@ -79,10 +80,12 @@ def check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, *, reference=Fa
     side=int(mesh.shape['x'])
     physical = 13
     mu = int(padded_mu_extent(physical, mesh))
-    nq, ng = side**2, 7
+    nq, ng = side**2+extra_q, 7
     rng = np.random.default_rng(516+side)
     gs = np.array([[0,1,-1,0,0,1,-1], [0,0,0,1,-1,1,-1], [0]*ng])
     qfr = np.array([[i/side, j/side, 0.] for i in range(side) for j in range(side)])
+    if extra_q:
+        qfr=np.vstack((qfr,[[.17*(i+1),.11*(i+1),0.] for i in range(extra_q)]))
     rmu = np.pad(rng.random((physical,3)), ((0,mu-physical),(0,0)))
     z = np.pad(rng.normal(size=(nq,physical,ng))+1j*rng.normal(size=(nq,physical,ng)),
                ((0,0),(0,mu-physical),(0,0)))
@@ -122,16 +125,32 @@ def check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, *, reference=Fa
     from runtime import aot_memory
     original_price=aot_memory.compiled_price
     fit_hlos=[]
+    clean_hlos=[]
+    def complex_sizes(text,*,parameters=False):
+        if parameters:
+            text=text.split('ENTRY ',1)[1]
+        return [int(np.prod(tuple(map(int,s.split(','))) if s else (),dtype=np.int64))
+                for line in text.splitlines() if not parameters or 'parameter(' in line
+                for s in re.findall(r'=\s*c128\[([0-9,]*)\]',line)]
     def record_price(*a,**kw):
         if kw.get('source')=='VQ fit-column reshard and logical mask':
             text=kw['compiled'].as_text()
-            shapes=[tuple(map(int,s.split(','))) if s else () for s in
-                    re.findall(r'=\s*c128\[([0-9,]*)\]',text)]
-            largest=max(np.prod(s,dtype=np.int64) for s in shapes)
-            assert largest<=nq*mu*ng//side**2, 'fit reshard materialized a global form-factor stack'
+            largest=max(complex_sizes(text))
+            local_argument=max(complex_sizes(text,parameters=True))
+            assert largest<=local_argument, 'fit reshard materialized a global form-factor stack'
             fit_hlos.append(dict(largest_complex_elements=int(largest),
+                                 largest_argument_elements=local_argument,
                                  all_gather_count=text.count('all-gather('),
                                  all_to_all_count=text.count('all-to-all(')))
+        if kw.get('source')=='VQ q-owner cleaning and face output':
+            text=kw['compiled'].as_text()
+            largest=max(complex_sizes(text))
+            local_argument=max(complex_sizes(text,parameters=True))
+            assert largest<=local_argument, 'cleaning materialized a global matrix stack'
+            clean_hlos.append(dict(largest_complex_elements=int(largest),
+                                   largest_argument_elements=local_argument,
+                                   all_gather_count=text.count('all-gather('),
+                                   all_to_all_count=text.count('all-to-all(')))
         return original_price(*a,**kw)
     monkeypatch.setattr(aot_memory,'compiled_price',record_price)
     face=NamedSharding(mesh,P(None,'x','y'))
@@ -155,9 +174,10 @@ def check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, *, reference=Fa
     monkeypatch.setattr(collectives,'gather_to_host',forbidden)
     with F.xla_reference() if reference else nullcontext():
         prep=V.prepare_coarse(zx,device_put_process_local(c,face),mesh,
-                              q_chunk=nq,keep_host_mirrors=False,degrees={0:1})
+                              q_chunk=side**2,keep_host_mirrors=False,degrees={0:1})
     assert prep['S'] is prep['V_SRc_np'] is None
-    assert set(prep['Fch'])=={(i*mu//side**2,(i+1)*mu//side**2) for i in range(side**2)}
+    owned=NamedSharding(mesh,P(None,None,('x','y'))).addressable_devices_indices_map((nq,ng,mu))
+    assert set(prep['Fch'])=={(idx[-1].start or 0,idx[-1].stop or mu) for idx in owned.values()}
     assert all(a.shape==(nq,ng,mu//side**2) for a in prep['Fch'].values())
     # Independent Tikhonov cleaning and sphere split before polynomial fitting.
     expected_f=np.zeros((nq,mu,ng),complex)
@@ -190,10 +210,14 @@ def check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, *, reference=Fa
     assert all(block.shape[-1]==mu//side**2 for block in des['AtY'][0].values())
     for excluded in (0,nq-1):
         got=V.pack_coeffs(des,V.fit_lr_model(des,exclude=excluded))[0]
-        a=des['AtA'][0][np.arange(nq)!=excluded].sum(0)
-        # Concatenation is an independent, tiny test reference only.
-        y=np.concatenate([des['AtY'][0][key][np.arange(nq)!=excluded].sum(0)
-                          for key in sorted(des['AtY'][0])],axis=1)
+        a=np.zeros((3,3));y=np.zeros((3,mu),complex)
+        for q in range(nq):
+            if q==excluded:
+                continue
+            xy=(bvec.T@(qfr[q,:,None]+gs))[:2]/(2*V.ALPHA)
+            phi=np.array([np.ones(ng),xy[1],xy[0]]).T
+            a+=phi.T@(vl[q,:,None]*phi)
+            y+=phi.T@(vl[q,:,None]*expected_f[q].T)
         _assert_local(got,np.linalg.solve(
             a+V.RIDGE*np.trace(a)/3*np.eye(3),y),rtol=2e-11,atol=2e-11)
 
@@ -221,6 +245,7 @@ def check_clean_fit_and_evaluator(monkeypatch, mesh, face_route, *, reference=Fa
                 local_form_factor_bytes=sum(a.nbytes for a in prep['Fch'].values()),
                 largest_mu_block=max(hi-lo for lo,hi in prep['Fch']),
                 fit_hlo=fit_hlos,
+                cleaning_hlo=clean_hlos,
                 host_global_copies_forbidden=True,
                 output_sharding=str(out.sharding),coefficient_sharding=str(packed[0].sharding))
 

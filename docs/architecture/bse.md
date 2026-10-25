@@ -232,7 +232,9 @@ on the centroid axis. Each process fits only its owned centroid columns;
 the small polynomial normal matrices and q/G geometry are replicated.
 `device_put_process_tiles` packs the local coefficients directly onto the
 global centroid sharding used by the existing arbitrary-Q evaluator. The
-fit inputs are released after packing. Full host form-factor and matrix
+q-owned matrices use the explicit face/batch movement owner on entry and
+exit, so the compiler does not replicate a matrix stack to change layouts.
+The fit inputs are released after packing. Full host form-factor and matrix
 mirrors belong only to explicitly bounded diagnostics; an unavailable
 distributed ζ transport refuses rather than reading full q slabs per rank.
 
