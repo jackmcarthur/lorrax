@@ -73,6 +73,7 @@ if [[ "$_lorrax_pm_commit" != "$LORRAX_MPIWRAPPER_COMMIT_DEFAULT" || \
     echo "[cpu_mpi_env.pm] ERROR: adapter provenance/toolchain/recipe check failed" >&2
     echo "[cpu_mpi_env.pm]   commit=$_lorrax_pm_commit ABI=$_lorrax_pm_abi MPICH=$_lorrax_pm_mpich" >&2
     echo "[cpu_mpi_env.pm]   upstream_modified=$_lorrax_pm_source_modified recipe_dirty=$_lorrax_pm_recipe_dirty" >&2
+    echo "[cpu_mpi_env.pm] Rebuild with config/perlmutter/build_mpiwrapper.sh." >&2
     return 2
 fi
 if find "$_lorrax_pm_prefix" -perm /222 -print -quit | grep -q .; then

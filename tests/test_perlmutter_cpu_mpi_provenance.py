@@ -130,4 +130,6 @@ def test_relevant_changes_and_untracked_manifests_still_refuse(tmp_path):
         assert result.returncode == 2, (changed, result.stderr)
         want = 'adapter release is writable' if changed == 'writable' else 'provenance/toolchain/recipe check failed'
         assert want in result.stderr, (changed, result.stderr)
+        if changed != 'writable':
+            assert 'Rebuild with config/perlmutter/build_mpiwrapper.sh.' in result.stderr
         assert 'stale Frontera MPI overlay/lifecycle controls' not in result.stderr
