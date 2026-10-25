@@ -531,12 +531,12 @@ where one padded column fits a block: 14³–21³ on an A100)
 handler rounds an m7s chunk down to whole waves, so the price is its upper bound there); it is 0
 on the single arm (bulk grids below about 14³ at n_s = 1 or 2).
 
-The q-wedge Σ(τ) kernel (`ppm_tau_kernel._sigma_subtile_kernel`) runs each
+The scalar Σ(τ) kernel (`ppm_tau_kernel._sigma_subtile_kernel`) runs each
 rank's tile in row passes of whole centroid orbits (`gw.subtile_stream`):
 `Σ(τ) row` is one local μ row's live set (`ν = μ/P_y`: the parent Green and
 its partner, mode 7's output, `W_prep`, the pass's rows of `W` and its
 partner on the q parents, the pass's ψ rows), and a pass holds the most rows
-whose bytes fit the fixed tile. The ordinary minimax χ and scalar q-wedge Σ share
+whose bytes fit the fixed tile. The ordinary minimax χ and scalar Σ share
 `subtile_stream.green_operand_program` and `prepare_green_operands`. They price
 operand placement and the complete consumer before allocating band-complete ψ.
 If that live set fits, the axis layout gathers each sum band once and keeps
@@ -554,8 +554,17 @@ bytes and queried native convolution scratch, against current room. Placement
 finishes before the consumer starts, so their scratch does not overlap.
 Compile-only calls compile and price these same programs without allocating
 prepared ψ banks; the caches retain programs/geometry, not ψ payloads. Static
-SX/COH uses the same choice and scalar node. Photon Σ sectors retain their
+SX/COH uses the same choice and scalar node. Full-zone scalar pole sources
+use the identity q-load of this row owner; their source storage, read and
+canonical-to-packed conversion stay unchanged. Photon Σ sectors retain their
 existing contracts.
+
+These layout selectors use the exact minimum room over ranks. Neither
+program cache keys on room, so rounding it to whole GiB can reject a fitting
+axis layout without saving compilations. The global bucket policy remains
+with the planners whose programs do depend on their bucketed room. Each
+room query already performs its process agreement; compiled prices still
+use a separate maximum agreement.
 
 The charge direct and four-current response row streams use the same choice
 inside `response_bank._compiled`: compile the complete incumbent stream
