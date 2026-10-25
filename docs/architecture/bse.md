@@ -226,6 +226,16 @@ metadata; padding is zeroed inside projection, and returned coefficients
 use the canonical Galerkin rank carrier over all ranks. A ragged q or prime
 centroid count therefore cannot silently drop the output sharding.
 
+The interpolation model uses the same distributed restart payload. After
+cleaning each coarse q block, its form factors are resharded over all ranks
+on the centroid axis. Each process fits only its owned centroid columns;
+the small polynomial normal matrices and q/G geometry are replicated.
+`device_put_process_tiles` packs the local coefficients directly onto the
+global centroid sharding used by the existing arbitrary-Q evaluator. The
+fit inputs are released after packing. Full host form-factor and matrix
+mirrors belong only to explicitly bounded diagnostics; an unavailable
+distributed ζ transport refuses rather than reading full q slabs per rank.
+
 **The W term** has three routes, chosen at trace time by what the device
 serves and printed once (`[bse] W term:`, `[bse] W term decode:`):
 

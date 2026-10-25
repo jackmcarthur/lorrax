@@ -2598,31 +2598,18 @@ def _zeta_mesh_for_loader(mesh, log_fn=print):
     """``(mesh_or_None, distributed)`` — the ζ transport decision, once.
 
     ``ZetaLoader``'s data path is SlabIO, which REFUSES at open on a
-    stack whose phdf5 FFI is absent (``file_io.slab_io``'s module
-    docstring: there is one transport and nothing to demote to).  So the
-    decision of whether to hand the loader a mesh has to be taken BEFORE
-    constructing it, and it is taken here, once, and announced — because
-    "which transport ran" is the single most consequential fact about a
-    large run's I/O and a silent fallback is indistinguishable from a
-    hang (same reasoning, and the same probe, as
-    ``bse_io._bse_slabio_usable``).
-
-    Header-only (``None``) does NOT mean "no reader": the loader still
-    owns every metadata read on ``zeta_q.h5``.  It means the ζ TILES come
-    back through the local h5py plan, which INVARIANTS row 6 licenses as
-    the default — the defect that row records is a family with ONLY a
-    local plan, and after this change ``vq_interp`` has both.
+    stack whose phdf5 FFI is absent. A supplied production mesh therefore
+    refuses an unavailable transport instead of constructing a whole-q host
+    replica. With no mesh, explicit bounded host diagnostics keep their local
+    reader; they do not select the production interpolation transport.
     """
     if mesh is None:
         return None, False
     from file_io.slab_io import probe_availability
     ok, stage, reason = probe_availability()
     if not ok:
-        log_fn(f"  [vq_interp] SlabIO unavailable at probe stage '{stage}' "
-               f"({reason}); reading ζ with the local h5py q-hyperslab plan "
-               f"— memory-correct (one q-chunk per rank, no allgather) and "
-               f"un-sharded, so every rank reads the whole chunk.")
-        return None, False
+        raise ValueError(f"VQ sharded payload requires SlabIO at stage '{stage}' "
+                         f"({reason}); a whole-q host replica is not a production transport")
     return mesh, True
 
 
@@ -4126,10 +4113,9 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     released by the consuming VQ cache's close operation.
 
     ``mesh`` selects the ζ TRANSPORT (see :func:`_zeta_mesh_for_loader`):
-    with a mesh whose stack can serve SlabIO, ``prepare_coarse``'s q-chunk
-    read becomes a per-rank hyperslab; without one, the local h5py plan
-    runs, byte-identical.  It is optional so the host-only diagnostics and
-    the fixture tests keep working on a bare checkout.
+    with a mesh, ``prepare_coarse`` reads per-rank SlabIO hyperslabs and
+    refuses an unavailable sharded transport. Without a mesh, only explicit
+    bounded host diagnostics use the local reader.
     """
     from bse.vq_interp import (
         assert_slab_scope,
