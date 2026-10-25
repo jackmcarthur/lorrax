@@ -765,6 +765,8 @@ def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
         error = exc
     agree_io_error(error, path=restart_file, stage='srlr.local_centroid_fit')
     residual = psum_replicate(residual, mesh_xy)
+    if not np.all(np.isfinite(residual)):
+        raise ValueError('srlr: nonfinite distributed form-factor fit residual')
     info['relres_F'] = float(np.sqrt(residual[0]/max(residual[1], 1e-300)))
     mu_sh = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
 

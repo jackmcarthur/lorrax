@@ -42,11 +42,15 @@ def test_lr_rows_fit_only_owned_columns_and_add_to_legal_face(monkeypatch,side,t
     monkeypatch.setattr(B,'_unfold_lr_channels',lambda *a,**kw:(ft,polar,ch.v,q[:,None],q))
     monkeypatch.setattr(HC,'resolve_head_S_cart',lambda *a,**kw:(-.2*np.eye(3),'literal fixture'))
     original_fit=LC.fit_model
-    widths=[]
+    widths,empty_blocks=[],[]
     def owned_fit(qc,Ft,*a,**kw):
         widths.append(Ft.shape[-1])
         assert Ft.shape[-1]<=carrier//(side*side)
-        return original_fit(qc,Ft,*a,**kw)
+        result=original_fit(qc,Ft,*a,**kw)
+        if not np.any(Ft):
+            assert result[1]['relres_F']==0
+            empty_blocks.append(True)
+        return result
     monkeypatch.setattr(LC,'fit_model',owned_fit)
     original_array=np.asarray
     def no_global(value,*a,**kw):
@@ -59,6 +63,8 @@ def test_lr_rows_fit_only_owned_columns_and_add_to_legal_face(monkeypatch,side,t
         coarse_grid=grid,fine_grid=grid,n_rmu=logical,n_rmu_pad=target,
         mesh_xy=mesh,input_file='unused',centroid_frac=r)
     assert len(widths)==len(ft.addressable_shards)
+    if side>=3:
+        assert empty_blocks
     assert A.sharding.is_equivalent_to(NamedSharding(mesh,P(None,None,('x','y'))),3)
     # Literal global model, after the guarded production fit has completed.
     model,_=original_fit(q,physical,polar,r_mu=r*(2*np.pi),S_cart=-.2*np.eye(3),
