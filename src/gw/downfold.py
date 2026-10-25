@@ -1415,7 +1415,7 @@ def slice_psi_to_centroids(psi_X, psi_Y, keep_idx, mu_small_pad, mesh_xy):
     zero row and column of every Gram, hence a zero eigenvalue that the
     truncation drops — the pad is inert, not merely harmless.
     """
-    keep = jnp.asarray(np.asarray(keep_idx, dtype=np.int32))
+    keep = np.asarray(keep_idx, dtype=np.int32)
     n_keep = int(keep.shape[0])
     pad = int(mu_small_pad) - n_keep
     if pad < 0:
@@ -1428,20 +1428,20 @@ def slice_psi_to_centroids(psi_X, psi_Y, keep_idx, mu_small_pad, mesh_xy):
     x_spec = NamedSharding(mesh_xy, P(None, "x", None, None))
     y_spec = NamedSharding(mesh_xy, P(None, None, None, "y"))
 
-    def _take_x(a):
-        out = jnp.take(a, keep, axis=1)
-        if pad:
-            out = jnp.pad(out, ((0, 0), (0, pad), (0, 0), (0, 0)))
-        return jax.lax.with_sharding_constraint(out, x_spec)
+    from common.staged_reshard import permute_sharded_axis
+    def select(a, axis, name, spec):
+        # Append one zero to each owned mu block. It supplies inert output
+        # padding even when the parent's physical mu count already tiles.
+        local = int(a.shape[axis])//int(mesh_xy.shape[name])
+        indices = (keep//local)*(local+1)+keep%local
+        indices = np.pad(indices, (0, pad), constant_values=local)
+        return permute_sharded_axis(a, axis, indices, mesh_xy, spec,
+                                    pad_to=local+1)
 
-    def _take_y(a):
-        out = jnp.take(a, keep, axis=3)
-        if pad:
-            out = jnp.pad(out, ((0, 0), (0, 0), (0, 0), (0, pad)))
-        return jax.lax.with_sharding_constraint(out, y_spec)
-
-    return (jax.jit(_take_x, out_shardings=x_spec)(psi_X),
-            jax.jit(_take_y, out_shardings=y_spec)(psi_Y))
+    return (jax.jit(lambda a: select(a, 1, 'x', P(None, 'x', None, None)),
+                    out_shardings=x_spec)(psi_X),
+            jax.jit(lambda a: select(a, 3, 'y', P(None, None, None, 'y')),
+                    out_shardings=y_spec)(psi_Y))
 
 
 # ---------------------------------------------------------------------------
@@ -1648,7 +1648,7 @@ def transform_head_vector(g0_L, T_x, q_index: int, mesh_xy, *,
     """
     ax_x, _ = axes
     T_q = jax.lax.with_sharding_constraint(
-        T_x[int(q_index)], NamedSharding(mesh_xy, P(None, ax_x)))
+        jnp.take(T_x, q_index, axis=0), NamedSharding(mesh_xy, P(None, ax_x)))
     g0 = jax.lax.with_sharding_constraint(
         g0_L, NamedSharding(mesh_xy, P(ax_x)))
     out = jnp.einsum("mn,n->m", jnp.conj(T_q), g0, optimize=True)

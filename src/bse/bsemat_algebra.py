@@ -65,26 +65,29 @@ def head_solve(lam, U, z, *, xp=np, rcond=RCOND):
     return a, xp.sum(keep)
 
 
-def head_rows(V, W, z, a, v1, *, rank, xp=np):
-    """E3 residual, E4 and E5 at one q from a solution ``a`` of ``V a = z*``.
-
-    ``a`` may be any solution: r and s do not see its ker V part (E3), so a
-    solve rotated in from the parent q serves the star member's own tiles.
-    ``rank`` is the kept rank of the solve that produced ``a`` (a figure).
-    Shapes and units as :func:`head_split`.
-    """
+def head_row_values(V, W, z, a, v1, *, xp=np):
+    """Array-valued E3 residual, E4 and E5, safe inside a sharded program."""
     zc = xp.conj(z)
-    resid = float(xp.linalg.norm(V @ a - zc) / xp.linalg.norm(zc))
+    resid = xp.linalg.norm(V @ a - zc) / xp.linalg.norm(zc)
     D = W - V
     r = xp.conj(a) @ D                                       # aᴴ(W − V), row
-    s = float(xp.real(r @ a))
-    W11 = float(v1 + v1 * v1 * s)                            # (E4)
+    s = xp.real(r @ a)
+    W11 = v1 + v1 * v1 * s                                  # (E4)
     y = v1 * r - (v1 * v1 * s) * z                           # (E5)
-    head_row = float(v1 * xp.real(z @ a))                    # v₁ z V⁺ z*
-    figures = {"solve_residual": resid, "head_row": head_row,
-               "eps_inv_head": W11 / float(v1), "rank": int(rank),
-               "s": s}
-    return HeadSplit(W11, y, z, figures)
+    head_row = v1 * xp.real(z @ a)                           # v₁ z V⁺ z*
+    return W11, y, resid, head_row, s
+
+
+def head_rows(V, W, z, a, v1, *, rank, xp=np):
+    """E3–E5 and scalar receipts from a solution ``a`` of ``V a = z*``.
+
+    A rotated parent solution serves its star member because the equations
+    do not see its ker V part. Shapes and units are those of head_split.
+    """
+    W11, y, resid, head_row, s = head_row_values(V, W, z, a, v1, xp=xp)
+    figures = {"solve_residual": float(resid), "head_row": float(head_row),
+               "eps_inv_head": float(W11) / float(v1), "rank": int(rank), "s": float(s)}
+    return HeadSplit(float(W11), y, z, figures)
 
 
 def head_split(V, W, z, v1, *, eigh, xp=np, rcond=RCOND):

@@ -14,13 +14,13 @@ The outline, in the order it runs. Once per restart (``_export_context``):
 Then once per file written (``_write_output``; ``run_bsemat_exports`` writes
 several from one load): the q → 0 body, ψ in the file's gauge and band order,
 the optional downfold, and one k′ row of the file at a time: E7 against
-W(k − k′) for all k, then the exchange row, each written as one hyperslab per
-matrix through SlabIO. Every stage is a ``common.timing`` row
+W(k − k′) for all k, then the exchange row, each written from its existing band-face shards through SlabIO. Every stage is a ``common.timing`` row
 (``SHARED_STAGES``, ``OUTPUT_STAGES``).
 
-Staging: W and V stay resident at ``P('x','y',None)``. A row materialises
-C (n_k, n²·μ/√P), W permuted to the row's q order, and the (n_k, n², n²) outputs,
-so device memory is two W copies plus O(n_k n² μ/√P).
+Staging: W and V stay at ``P('x','y',None)``; wavefunctions, gauge
+matrices and head vectors remain on device. A row materialises C
+(n_k, n²·mu/sqrt(P)), W permuted to its q order, and band-face-sharded
+(n_k, n², n²) outputs. SlabIO clips only their inert band padding.
 """
 from __future__ import annotations
 
@@ -51,6 +51,167 @@ ENERGY_MATCH_TOL_RY = 2.0e-3
 
 def _log(msg):
     log.info(msg)
+
+
+def _canonical_psi(psi, mesh_xy, *, n_mu_logical, n_mu_out, rows=None):
+    """Keep a wavefunction bank on its all-rank centroid carrier.
+
+    Inputs and outputs are device arrays; only k-index metadata is host data.
+    Cropping, padding and indexing happen under the explicit output layout.
+    """
+    if not isinstance(psi, jax.Array):
+        raise TypeError("bsemat wavefunctions must remain sharded device arrays")
+    if int(mesh_xy.size)>1 and psi.sharding.is_fully_replicated:
+        raise ValueError("bsemat wavefunctions must arrive on their distributed centroid carrier")
+    physical, carrier = int(n_mu_logical), int(n_mu_out)
+    if carrier < physical or carrier % int(mesh_xy.size):
+        raise ValueError("bsemat centroid carrier must contain the logical axis and tile all ranks")
+    sh = NamedSharding(mesh_xy, P(None, None, None, ("x", "y")))
+    indices = None if rows is None else np.asarray(rows, np.int32)
+
+    @partial(jax.jit, out_shardings=sh)
+    def place(a):
+        if indices is not None:
+            a = jnp.take(a, jnp.asarray(indices), axis=0)
+        a = jnp.where(jnp.arange(a.shape[-1]) < physical, a, 0)
+        width = min(carrier, int(a.shape[-1]))
+        return jnp.pad(a[..., :width],
+                       ((0, 0), (0, 0), (0, 0), (0, carrier-width)))
+    return place(psi)
+
+
+def _psi_views(psi, mesh_xy):
+    """The existing row-contraction's two centroid faces, without host staging."""
+    sx = NamedSharding(mesh_xy, P(None, None, None, "x"))
+    sy = NamedSharding(mesh_xy, P(None, None, None, "y"))
+    return jax.jit(lambda a: (a, a), out_shardings=(sx, sy))(psi)
+
+
+def _band_face(psi, mesh_xy, *, band_carrier, logical_bands):
+    """(k,b,s,mu) -> (k,mu*s,b) on the existing distributed GEMM face."""
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+
+    @partial(jax.jit, out_shardings=face)
+    def pack(a):
+        a = jnp.where(jnp.arange(a.shape[1])[None, :, None, None] < logical_bands, a, 0)
+        a = jnp.pad(a[:, :band_carrier],
+                    ((0, 0), (0, max(0, band_carrier-a.shape[1])), (0, 0), (0, 0)))
+        return a.transpose(0, 3, 2, 1).reshape(a.shape[0], a.shape[-1]*a.shape[2], band_carrier)
+    return pack(psi)
+
+
+def _rotate_psi(psi, U, mesh_xy):
+    """psi_file,m = sum_n psi_LX,n conj(U[m,n]), using the shared GEMM."""
+    import distrib_la as dla
+    nk, nb, ns, mu = map(int, psi.shape)
+    width = int(U.shape[-1])
+    a = _band_face(psi, mesh_xy, band_carrier=width, logical_bands=nb)
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    u = jax.jit(jnp.conj, out_shardings=face)(U)
+    out = dla.matmul(a, u, mesh=mesh_xy, transb="T", batched_route="auto")
+    sh = NamedSharding(mesh_xy, P(None, None, None, ("x", "y")))
+    return jax.jit(lambda a: a.reshape(nk, mu, ns, width).transpose(0, 3, 2, 1)[:, :nb],
+                   out_shardings=sh)(out)
+
+
+def _identity_gauge(nk, nb, mesh_xy):
+    """Identity band gauge on a legal matrix face, including exact-zero pads."""
+    from common.collectives import device_put_process_local
+    width = -(-int(nb)//int(mesh_xy.size))*int(mesh_xy.size)
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    @partial(jax.jit, out_shardings=face)
+    def identity(logical):
+        i = jnp.arange(width)
+        eye = ((i[:, None] == i[None, :]) & (i[:, None] < logical)).astype(jnp.complex128)
+        return jnp.broadcast_to(eye, (nk, width, width))
+    return identity(device_put_process_local(np.asarray(nb, np.int32), NamedSharding(mesh_xy, P())))
+
+
+def _gauge_unitaries(A_r, B, *, nbg, w0, nv, mesh_xy):
+    """The export's least-squares gauge and block polar factors on device faces.
+
+    A/B are (k,band,spin,mu), with the centroid axis distributed. The normal
+    equations and the window unitary use the existing distributed matrix
+    owners; only per-k residuals and singular-value summaries reach the host.
+    """
+    import distrib_la as dla
+    from lxkit import memory
+    nk, nb = int(B.shape[0]), int(B.shape[1])
+    nc, p = nb-int(nv), int(mesh_xy.size)
+    ga, gb = -(-int(nbg)//p)*p, -(-nb//p)*p
+    a = _band_face(A_r, mesh_xy, band_carrier=ga, logical_bands=int(nbg))
+    b = _band_face(B, mesh_xy, band_carrier=gb, logical_bands=nb)
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    rep = NamedSharding(mesh_xy, P())
+    mm = partial(dla.matmul, mesh=mesh_xy, batched_route="auto")
+    gram, rhs = mm(a, a, transa="C"), mm(a, b, transa="C")
+    # The guard-band carrier is an identity extension of the SAME normal
+    # equations. Its zero RHS leaves the logical least-squares fit intact.
+    gram = jax.jit(lambda g: g+jnp.diag((jnp.arange(ga) >= nbg).astype(g.dtype))[None],
+                    out_shardings=face)(gram)
+    eig = dla.plan("eigh", mesh_xy, backend="auto", n=ga,
+                   budget_bytes=memory.room(bucketed=False))
+    lam, vectors = eig.batched(gram)
+    if not bool(jnp.all(jnp.isfinite(lam) & (lam > 0))):
+        raise ValueError("GATE bsemat_gauge_span: the file-band normal matrix is not positive definite")
+    rx = mm(vectors, rhs, transa="C")
+    rx = jax.jit(lambda x, l: x/l[..., None], out_shardings=face)(rx, lam)
+    x = mm(vectors, rx)
+    predicted = mm(a, x)
+
+    @partial(jax.jit, out_shardings=(face, rep, rep))
+    def window(x, prediction, target):
+        xw = jnp.pad(x[:, w0:w0+nb, :gb], ((0, 0), (0, gb-nb), (0, 0)))
+        ssq = lambda z: jnp.sum(jnp.abs(z)**2, axis=(-2, -1))
+        res = jnp.sqrt(ssq(prediction-target)/ssq(target))
+        cross = (jnp.sqrt(ssq(xw[:, :nv, nv:nb]))
+                 + jnp.sqrt(ssq(xw[:, nv:nb, :nv])))/jnp.sqrt(ssq(xw))
+        return xw, res, cross
+    xw, res, cross = window(x, predicted, b)
+    divisor = int(np.lcm(int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])))
+    block = -(-max(int(nv), nc)//divisor)*divisor
+    polar = dla.plan_polar_factor(mesh_xy, n=block, backend="native", rcond=GAUGE_POLAR_RCOND,
+                                  batched_route=dla.ROUTE_BATCH_RESHARD)
+
+    @partial(jax.jit, out_shardings=face)
+    def blocks(x):
+        pad = lambda z: jnp.pad(z, ((0, 0), (0, block-z.shape[1]), (0, block-z.shape[2])))
+        return jnp.concatenate((pad(x[:, :nv, :nv]), pad(x[:, nv:nb, nv:nb])))
+    link, sv = polar.batched(blocks(xw))
+
+    @partial(jax.jit, out_shardings=(face, rep))
+    def assemble(link, sv):
+        u = jnp.zeros((nk, gb, gb), jnp.complex128)
+        u = u.at[:, :nv, :nv].set(link[:nk, :nv, :nv])
+        u = u.at[:, nv:nb, nv:nb].set(link[nk:, :nc, :nc])
+        spread = lambda s: jnp.max((jnp.max(s, axis=1)-jnp.min(s, axis=1))/jnp.max(s, axis=1))
+        return u, jnp.maximum(spread(sv[:nk, :nv]), spread(sv[nk:, :nc]))
+    u, spread = assemble(link, sv)
+    figures = {"lsq_residual_max": float(jnp.max(res)), "sv_spread_max": float(spread),
+               "cross_block_max": float(jnp.max(cross))}
+    return u, figures
+
+
+def _head_programs(mesh_xy, *, rcond=A.RCOND):
+    """The shared E3–E5 equations with device-vector and scalar outputs."""
+    vec = NamedSharding(mesh_xy, P("x"))
+    row = NamedSharding(mesh_xy, P("y"))
+    rep = NamedSharding(mesh_xy, P())
+    solve = jax.jit(lambda l, u, z: A.head_solve(l, u, z, xp=jnp, rcond=rcond),
+                     out_shardings=(vec, rep))
+    rows = jax.jit(lambda v, w, z, a, h: A.head_row_values(v, w, z, a, h, xp=jnp),
+                    out_shardings=(rep, row, rep, rep, rep))
+    return solve, rows
+
+
+def _head_receipt(values, z, rank, v1):
+    """Only E3–E5 scalar figures leave the devices; y remains sharded."""
+    h, y, residual, headrow, s = values
+    return A.HeadSplit(float(h), y, z,
+        dict(solve_residual=float(residual), head_row=float(headrow),
+             eps_inv_head=float(h)/float(v1), rank=int(rank), s=float(s)))
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -211,21 +372,20 @@ def require_offgrid_zeta(restart, nk, exciton_Q):
     return nq
 
 
-def htransform_window(input_file, kpts, *, n_val, n_cond, n_rmu, mesh_xy):
+def htransform_window(input_file, kpts, *, n_val, n_cond, n_rmu, mesh_xy, n_rmu_pad=None):
     """ψ and ε of the BSE window at explicit points, from the deck's htransform.
 
     Built exactly as ``bse.exciton_bands`` builds its conduction caches. The
     fit is ``fh_interp.initialize_wfns`` on the deck's band window, the BSE
     bands are returned from inside it (``bse_setup.resolve_conduction_window``),
     and ``bse_setup.compute_wfns_fi`` runs with ``q_list = kpts`` (crystal). One
-    f(H) covers every band the deck loads. Returns host ``psi`` with shape
+    f(H) covers every band the deck loads. Returns device ``psi`` with shape
     (nk, n_val + n_cond, ns, n_rmu), bands ascending, ``enk`` with shape
     (nk, n_val + n_cond) in Ry, and the receipts. Only the conduction block is
     consumed; the valence block enters the gauge fit
     (docs/how-to/htransform-and-exciton-bands.md §7).
     """
-    from gw.gw_config import (linalg_resolution, read_lorrax_input, resolve_distrib_la_batched_route,
-                              resolve_eigh_backend)
+    from gw.gw_config import linalg_resolution, read_lorrax_input, resolve_distrib_la_batched_route
     from bandstructure import fh_interp as ht
     from bandstructure.bse_setup import compute_wfns_fi, resolve_conduction_window
     from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY
@@ -240,6 +400,9 @@ def htransform_window(input_file, kpts, *, n_val, n_cond, n_rmu, mesh_xy):
         input_file, params, _log, mesh_xy=mesh_xy, centroid_subset_idx=None, wfn_sym=(wfn, sym),
         rank_record_fn=receipts.append, distrib_la_batched_route=route)
     nval_in = int(params["nval"])
+    if n_rmu_pad is None:
+        from runtime.padding import padded_mu_extent
+        n_rmu_pad = int(padded_mu_extent(n_rmu,mesh_xy))
     if nval_in < int(n_val):
         raise ValueError(f"GATE bsemat_finite_q_window: the deck's nval {nval_in} < n_val {n_val}; the "
                          "htransform window must hold the BSE valence bands")
@@ -251,17 +414,18 @@ def htransform_window(input_file, kpts, *, n_val, n_cond, n_rmu, mesh_xy):
         kgrid_co=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
         band_window_fi=(nval_in - int(n_val), b_max), mesh_xy=mesh_xy,
         q_list=np.asarray(kpts, dtype=np.float64),
-        batch_size=int(params.get("wfn_fi_q_chunk", 0)), eigh_backend=resolve_eigh_backend(params),
+        n_mu_out=int(n_rmu_pad),
+        batch_size=int(params.get("wfn_fi_q_chunk", 0)),
         use_low_mem_eigh=linalg_resolution(params).layout == "distributed", log_fn=_log,
-        distrib_la_batched_route=route, htransform_quality_record_fn=receipts.append)
+        htransform_quality_record_fn=receipts.append)
     rep = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, P()))
-    psi, enk = np.asarray(rep(bundle.psi_rmu_Y)), np.asarray(rep(bundle.enk_full))
+    psi, enk = bundle.psi_rmu_Y, np.asarray(rep(bundle.enk_full))
     if int(bundle.n_mu_logical) != int(n_rmu):
         raise ValueError(f"GATE bsemat_finite_q_basis: the htransform fitted ψ at {psi.shape[-1]} "
                          f"centroids, the restart stores μ = {n_rmu} (a downfolded bundle needs its "
                          "parent's table)")
     wfn.close()
-    return psi[..., :int(n_rmu)], enk, receipts
+    return psi, enk, receipts
 
 
 def exchange_tile(Q, qflag, *, data, input_file, restart, grid, n_rmu, n_rmu_pad, mesh_xy):
@@ -342,11 +506,11 @@ def _head_parents(keys, *, tables, sym, grid, n_rmu_pad):
     return tp, q_full, q_parent, idx, need
 
 
-def _parent_columns(need, *, zeta_path, n_qi, n_rmu, n_rmu_pad):
-    """``ζ_{q_p}(μ, G_p)/√Ω`` at every distinct parent slot of ``need`` (host, μ_pad each), and Ω."""
+def _parent_columns(need, *, zeta_path, n_qi, n_rmu, n_rmu_pad, mesh_xy):
+    """``ζ_{q_p}(μ, G_p)/√Ω`` at every distinct parent slot of ``need`` (device, mu_pad each), and Omega."""
     from zeta_loader import ZetaLoader
     cols = {}
-    with ZetaLoader(zeta_path) as zl:
+    with ZetaLoader(zeta_path, mesh=mesh_xy) as zl:
         omega = float(zl.cell_volume)
         gcomp = np.asarray(zl.gvec_components, dtype=np.int64)
         ngk = np.asarray(zl.ngk_per_q, dtype=np.int64)
@@ -358,14 +522,20 @@ def _parent_columns(need, *, zeta_path, n_qi, n_rmu, n_rmu_pad):
             if g not in lut:
                 raise ValueError(f"GATE bsemat_head_in_sphere: wedge q {p} slot {g} "
                                  "is outside the stored ζ sphere; fix: raise the ζ cutoff.")
-            c = np.zeros(int(n_rmu_pad), np.complex128)
-            c[:n_rmu] = np.asarray(zl.read_zeta_G_local((p, slice(None), lut[g])))
-            cols[(p, g)] = c / np.sqrt(omega)
+            # One requested G column, with its centroid axis split over P.
+            if zl.zeta_layout != 'G_flat':
+                raise ValueError('bsemat head columns require the canonical G-flat zeta layout')
+            c = zl.slab_io.read_slab('zeta_q_G', shape=(1, int(n_rmu_pad), 1),
+                dtype=np.complex128, offset=(p, 0, lut[g]), mesh=mesh_xy,
+                partition_spec=P(None, ('x','y'), None))
+            cols[(p, g)] = jax.jit(lambda a: jnp.where(jnp.arange(n_rmu_pad)<n_rmu,
+                a[0,:,0]/np.sqrt(omega), 0),
+                out_shardings=NamedSharding(mesh_xy,P(('x','y'))))(c)
     return cols, omega
 
 
 def _unfold_to_keys(cols, need, keys, *, tp, sym, grid, n_qi, n_rmu_pad, mesh_xy):
-    """Carry parent vectors to their keys by ``symmetry_maps.unfold_isdf_one_leg`` (host, (n_keys, μ_pad)).
+    """Carry parent vectors to their keys by ``symmetry_maps.unfold_isdf_one_leg`` (device, (n_keys, mu_pad)).
 
     ``cols[(p, G_p)]`` is a ζ-like parent column: it moves as ``ζ_q(·, G_p)``
     does (centroid permutation, L and τ phases, conjugation on antiunitary
@@ -373,33 +543,40 @@ def _unfold_to_keys(cols, need, keys, *, tp, sym, grid, n_qi, n_rmu_pad, mesh_xy
     ties) go through separate unfold layers; a parent with no key carries zeros.
     """
     from symmetry_maps import unfold_isdf_one_leg
-    from common.collectives import device_put_process_local
     per_p = {p: sorted({g for (pp, g) in need if pp == p}) for p in range(n_qi)}
     n_layer = max(len(v) for v in per_p.values() if v) if need else 0
-    out = np.zeros((len(keys), int(n_rmu_pad)), np.complex128)
-    rep = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, P()))
+    out = [None]*len(keys)
+    vec = NamedSharding(mesh_xy, P(('x','y')))
+    zero = jax.jit(lambda: jnp.zeros((int(n_rmu_pad),),jnp.complex128),out_shardings=vec)()
     for j in range(n_layer):
-        src = np.zeros((n_qi, 3), np.int64)
-        col = np.zeros((n_qi, int(n_rmu_pad)), np.complex128)
+        src = np.zeros((n_qi,3),np.int64)
+        columns = []
         for p in range(n_qi):
             gl = per_p[p]
             if gl:
-                src[p] = gl[min(j, len(gl) - 1)]
-                col[p] = cols[(p, tuple(int(v) for v in src[p]))]
-        u = unfold_isdf_one_leg(
-            device_put_process_local(col, NamedSharding(mesh_xy, P(None, "x"))),
-            source_gvec_components=src.astype(np.int32), sym=sym, sym_idx=tp.sym_idx_q,
-            sym_perm=tp.sym_perm, L_table=tp.L_table, q_irr_frac=tp.q_irr_frac,
-            kgrid=tuple(int(g) for g in grid), mesh_xy=mesh_xy, component_action="scalar")
-        u = np.asarray(rep(u))
-        for kk, (p, g) in enumerate(need):
-            if src[p].tolist() == list(g):
-                out[kk] = u[keys[kk][0]]
+                src[p] = gl[min(j,len(gl)-1)]
+                columns.append(cols[(p,tuple(int(v) for v in src[p]))])
+            else:
+                columns.append(zero)
+        col = jax.jit(lambda *a:jnp.stack(a),
+            out_shardings=NamedSharding(mesh_xy,P(None,'x')))(*columns)
+        u = unfold_isdf_one_leg(col,
+            source_gvec_components=src.astype(np.int32),sym=sym,sym_idx=tp.sym_idx_q,
+            sym_perm=tp.sym_perm,L_table=tp.L_table,q_irr_frac=tp.q_irr_frac,
+            kgrid=tuple(int(g) for g in grid),mesh_xy=mesh_xy,component_action='scalar')
+        pick = jax.jit(lambda a,i:a[i],out_shardings=vec)
+        for kk,(p,g) in enumerate(need):
+            if src[p].tolist()==list(g):
+                out[kk]=pick(u,keys[kk][0])
+    if any(a is None for a in out):
+        raise ValueError('bsemat head unfold did not fill every requested key')
+    out = jax.jit(lambda *a:jnp.stack(a),
+        out_shardings=NamedSharding(mesh_xy,P(None,('x','y'))))(*out)
     return out
 
 
 def head_columns(keys, *, zeta_path, tables, sym, grid, n_rmu, n_rmu_pad, mesh_xy):
-    """ζ_q(μ, G)/√Ω at each requested ``(iq, G)`` of the full grid (host, (n_keys, μ_pad)).
+    """ζ_q(μ, G)/√Ω at each requested ``(iq, G)`` of the full grid (device, (n_keys, mu_pad)).
 
     Each key's parent column is ``G_p = S⁻¹(q + G) − q_p`` at its wedge q_p, read
     from ``zeta_q.h5`` and carried to q by ``symmetry_maps.unfold_isdf_one_leg``
@@ -411,7 +588,7 @@ def head_columns(keys, *, zeta_path, tables, sym, grid, n_rmu, n_rmu_pad, mesh_x
     tp, q_full, q_parent, _, need = _head_parents(keys, tables=tables, sym=sym, grid=grid,
                                                   n_rmu_pad=n_rmu_pad)
     cols, omega = _parent_columns(need, zeta_path=zeta_path, n_qi=q_parent.shape[0],
-                                  n_rmu=n_rmu, n_rmu_pad=n_rmu_pad)
+                                  n_rmu=n_rmu, n_rmu_pad=n_rmu_pad, mesh_xy=mesh_xy)
     out = _unfold_to_keys(cols, need, keys, tp=tp, sym=sym, grid=grid, n_qi=q_parent.shape[0],
                           n_rmu_pad=n_rmu_pad, mesh_xy=mesh_xy)
     return out, q_full, omega
@@ -468,16 +645,15 @@ def head_split_keys(keys, z_keys, V_flat, W_flat, *, zeta_path, tables, sym, gri
        (``check_rotation``) certifies the rotation where it is consumed.
 
     ``V_flat``/``W_flat`` (μ, ν, n_q) at ``P('x','y',None)``; ``z_keys`` (n_keys, μ_pad)
-    host from :func:`head_columns`; ``v_head_q`` (n_q,) v(q + G₁); ``q_frac`` (n_q, 3) the
+    device from :func:`head_columns`; ``v_head_q`` (n_q,) v(q + G₁); ``q_frac`` (n_q, 3) the
     bundle's full q (crystal), ``head_K`` (n_q, 3) V's head momentum per q and
     ``bvec`` (3, 3) for the shortest-q+G gate. Returns ``W11 (n_keys,)``,
-    ``y_keys (n_keys, μ_pad)`` host, the per-key figures and a stage summary
+    ``y_keys (n_keys, μ_pad)`` device, the per-key figures and a stage summary
     (eigh faces, parent slots, keys, wall).
     """
     import distrib_la as dla
     from ffi import _services
     _services.ensure_on_path()
-    from common.collectives import device_put_process_local
 
     t0 = time.time()
     tp, _, q_parent, idx, need = _head_parents(keys, tables=tables, sym=sym, grid=grid,
@@ -487,14 +663,14 @@ def head_split_keys(keys, z_keys, V_flat, W_flat, *, zeta_path, tables, sym, gri
     parents = sorted({p for p, _ in slots})
     self_iq = _self_images(parents, q_parent=q_parent, idx=idx, tp=tp, sym=sym, grid=grid)
     cols, _ = _parent_columns(slots, zeta_path=zeta_path, n_qi=n_qi, n_rmu=n_rmu,
-                              n_rmu_pad=n_rmu_pad)
+                              n_rmu_pad=n_rmu_pad, mesh_xy=mesh_xy)
 
     face = NamedSharding(mesh_xy, P("x", "y"))
     rs = NamedSharding(mesh_xy, P())
-    rep = jax.jit(lambda a: a, out_shardings=rs)
     tile = jax.jit(lambda a, i: jnp.take(a, i, axis=2), out_shardings=face)
     herm = jax.jit(lambda a: 0.5 * (a + jnp.conj(a).T), out_shardings=face)
-    put = lambda a: device_put_process_local(np.ascontiguousarray(a), rs)
+    solve, rows = _head_programs(mesh_xy, rcond=rcond)
+    conjugate = jax.jit(jnp.conj,out_shardings=NamedSharding(mesh_xy,P(("x","y"))))
 
     # 1. one eigendecomposition per wedge q, as one batched call
     plan = dla.plan("eigh", mesh_xy, backend="distributed" if jax.process_count() > 1 else "native",
@@ -506,7 +682,6 @@ def head_split_keys(keys, z_keys, V_flat, W_flat, *, zeta_path, tables, sym, gri
             jnp.moveaxis(jnp.take(v, i, axis=2), 2, 0)),
             out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))(V_flat, jnp.asarray(iqs))
         lam_all, U_all = plan.batched(stack)
-        lam_all = np.asarray(rep(lam_all))
         del stack
     t_eigh = time.time() - t_e
     pick = jax.jit(lambda u, i: u[i], out_shardings=face)
@@ -521,39 +696,44 @@ def head_split_keys(keys, z_keys, V_flat, W_flat, *, zeta_path, tables, sym, gri
         for (pp, g) in slots:
             if pp != p:
                 continue
-            zr = put(cols[(p, g)])
-            a, rank = A.head_solve(put(lam_all[i]), U_p, zr, xp=jnp, rcond=rcond)
-            sp = A.head_rows(V_p, W_p, zr, a, float(v_head_q[self_iq[p]]), rank=rank, xp=jnp)
+            zr = cols[(p,g)]
+            # The caller's existing cut is shared by every parent/key solve.
+            a, rank = solve(lam_all[i],U_p,zr)
+            v1 = float(v_head_q[self_iq[p]])
+            sp = _head_receipt(rows(V_p,W_p,zr,a,v1),zr,rank,v1)
             A.check_split(sp, where=f"wedge q {p} slot {g}")
-            abar[(p, g)] = np.asarray(rep(jnp.conj(a)))
+            abar[(p,g)] = conjugate(a)
             s_par[(p, g)], rank_par[(p, g)] = sp.figures["s"], sp.figures["rank"]
             par_fig[(p, g)] = sp.figures
     del U_all
     for (p, g) in set(need) - set(slots):
-        abar[(p, g)] = np.zeros(int(n_rmu_pad), np.complex128)     # q = 0 keys: no split
+        abar[(p,g)] = jax.jit(lambda:jnp.zeros(int(n_rmu_pad),jnp.complex128),
+            out_shardings=NamedSharding(mesh_xy,P(("x","y"))))()  # q=0: no split
 
     # 3. a at every key, carried exactly as z
-    a_keys = np.conj(_unfold_to_keys(abar, need, keys, tp=tp, sym=sym, grid=grid, n_qi=n_qi,
+    a_keys = jax.jit(jnp.conj,out_shardings=NamedSharding(mesh_xy,P(None,("x","y"))))(_unfold_to_keys(abar, need, keys, tp=tp, sym=sym, grid=grid, n_qi=n_qi,
                                      n_rmu_pad=n_rmu_pad, mesh_xy=mesh_xy))
 
     # 4. E3 residual, E4, E5 on each key's own tiles
     W11 = np.zeros(len(keys))
-    y_keys = np.zeros((len(keys), int(n_rmu_pad)), np.complex128)
+    y_keys = []
     figs = []
     for kk, (iq, G) in enumerate(keys):
         if iq == 0:
             figs.append({"iq": 0, "G": G, "q0": True})
+            y_keys.append(abar[need[kk]])
             continue
         Kc = (q_frac[iq] + np.asarray(G)) @ bvec
         if abs(np.linalg.norm(Kc) - np.linalg.norm(head_K[iq] @ bvec)) > 1e-8 * np.linalg.norm(Kc):
             raise ValueError(f"GATE bsemat_head_length: key {(iq, G)} is not a shortest q+G")
         par = need[kk]
-        sp = A.head_rows(herm(tile(V_flat, iq)), tile(W_flat, iq), put(z_keys[kk]), put(a_keys[kk]),
-                         float(v_head_q[iq]), rank=rank_par[par], xp=jnp)
+        v1 = float(v_head_q[iq])
+        sp = _head_receipt(rows(herm(tile(V_flat,iq)),tile(W_flat,iq),z_keys[kk],a_keys[kk],v1),
+                           z_keys[kk],rank_par[par],v1)
         A.check_split(sp, where=f"q {iq} G {G}")
         rel = A.check_rotation(sp, s_par[par], where=f"q {iq} G {G} (wedge q {par[0]} slot {par[1]})")
         W11[kk] = sp.W11
-        y_keys[kk] = np.asarray(rep(sp.y))
+        y_keys.append(sp.y)
         figs.append({"iq": int(iq), "G": G, "qlen": float(np.linalg.norm(Kc)),
                      "v1": float(v_head_q[iq]), **sp.figures,
                      "parent": [int(par[0]), list(par[1])], "s_parent_rel": rel})
@@ -565,6 +745,8 @@ def head_split_keys(keys, z_keys, V_flat, W_flat, *, zeta_path, tables, sym, gri
          f"for {stats['parent_slots']} parent slots -> {stats['keys_split']} keys; "
          f"max |s/s_parent - 1| {max((f.get('s_parent_rel', 0.0) for f in figs), default=0.0):.1e}; "
          f"{stats['wall_s']:.2f} s")
+    y_keys = jax.jit(lambda *a:jnp.stack(a),
+        out_shardings=NamedSharding(mesh_xy,P(None,("x","y"))))(*y_keys)
     return W11, y_keys, figs, stats
 
 
@@ -582,14 +764,14 @@ def gauge_map(psi, *, wfn_co, k_rows, bands_abs, centroid_frac, fft_grid, nv, en
               guard=8):
     """Window unitaries ``U[k] (nb, nb)`` with ψ_LX ≈ ψ_file U, valence and conduction blocks.
 
-    ``psi`` (nk_L, nb, ns, μ) host, LORRAX ψ at the centroids (canonical order,
+    ``psi`` (nk_L, nb, ns, μ) device, LORRAX ψ at the centroids (canonical order,
     bands ascending); ``k_rows[j]`` the LORRAX k of WFN row j; ``bands_abs``
     the absolute 0-based file bands of ψ's band axis; ``enk_win`` (nk_L, nb) Ry
     the restart's energies of those bands (gated against the file's). The file states over the
     window plus ``guard`` bands each side are evaluated at the (grid-rounded)
     centroids, ψ_LX is fitted by least squares (the centroids are not a
     quadrature, dipfix), and each block's polar factor is kept. Returns
-    ``(U (nk_wfn, nb, nb) host, figures)``.
+    ``(U (nk_wfn, nb_pad, nb_pad) device face, figures)``.
 
     Device route, all existing LORRAX paths: ``WfnLoader.load(k='ibz')`` reads the
     file's own rows (no unfold; the collective read at P > 1) and the GW face
@@ -626,6 +808,10 @@ def gauge_map(psi, *, wfn_co, k_rows, bands_abs, centroid_frac, fft_grid, nv, en
         raise ValueError(f"GATE bsemat_band_offset: WFN_co row {j} window energies differ "
                          f"from the restart's by {de[j]:.3e} Ry; want the same bands.")
 
+    # The target carrier is legal before the FFT, so its existing explicit
+    # band-to-centroid mover never needs an unshardable physical-mu slice.
+    mu_w = int(padded_axis(n_mu, mesh_xy, name="bsemat gauge centroid axis").carrier)
+    r_mu = np.pad(r_mu, ((0, mu_w-n_mu), (0, 0)))
     # ψ_file(r_μ): (nk_wfn, nbg_pad, ns, μ), bands over XY (zero pad bands).
     with WfnLoader(wfn_co, mesh=mesh_xy) as loader:
         if int(loader.nspinor) != ns or int(loader.nkpts) != nk_w:
@@ -645,49 +831,14 @@ def gauge_map(psi, *, wfn_co, k_rows, bands_abs, centroid_frac, fft_grid, nv, en
             chunk_size=max(1, GAUGE_BOX_CHUNK_BYTES // (ns * int(np.prod(grid)) * 16)))
         del psi_G
 
-    # Least squares ψ_LX ≈ ψ_file X per k, μ over the whole mesh (zero μ pad is inert).
-    mu_w = padded_axis(n_mu, mesh_xy, name="bsemat gauge centroid axis").carrier
-    s_mu = NamedSharding(mesh_xy, P(None, None, None, ("x", "y")))
-    rep = NamedSharding(mesh_xy, P())
-    B = np.zeros((nk_w, nb, ns, mu_w), np.complex128)
-    B[..., :n_mu] = np.asarray(psi)[k_rows][..., :n_mu]
-    B = device_put_process_local(B, s_mu)
-
-    @partial(jax.jit, out_shardings=(rep, rep, rep))
-    def fit(a, b):
-        a = jnp.pad(a, ((0, 0), (0, 0), (0, 0), (0, mu_w - n_mu)))
-        a = jax.lax.with_sharding_constraint(a, s_mu)[:, :nbg]
-        gram = jax.lax.with_sharding_constraint(jnp.einsum("kbsm,kcsm->kbc", jnp.conj(a), a), rep)
-        rhs = jax.lax.with_sharding_constraint(jnp.einsum("kbsm,knsm->kbn", jnp.conj(a), b), rep)
-        x = jnp.linalg.solve(gram, rhs)                                   # (nk, nbg, nb)
-        ssq = lambda m: jnp.sum(jnp.abs(m) ** 2, axis=tuple(range(1, m.ndim)))   # per k
-        res = jnp.sqrt(ssq(b - jnp.einsum("kbn,kbsm->knsm", x, a)) / ssq(b))
-        xw = x[:, w0:w0 + nb]
-        cross = (jnp.sqrt(ssq(xw[:, :nv, nv:])) + jnp.sqrt(ssq(xw[:, nv:, :nv]))) / jnp.sqrt(ssq(xw))
-        return xw, res, cross
-
-    Xw, res, cross = fit(A_r, B)
-    del A_r, B
-
-    # Block polar factors, one (2·nk, n, n) stack at P(None, x, y); zero pad directions drop.
-    n_blk = padded_axis(max(nv, nc), mesh_xy, name="bsemat gauge polar block",
-                        spec=band_sphere_spec(), axis=1).carrier
-    pol = dla.plan_polar_factor(mesh_xy, n=n_blk, backend="native", rcond=GAUGE_POLAR_RCOND,
-                                batched_route=dla.ROUTE_BATCH_RESHARD)
-    pad = lambda m: jnp.pad(m, ((0, 0), (0, n_blk - m.shape[1]), (0, n_blk - m.shape[2])))
-    stack = jax.jit(lambda x: jnp.concatenate([pad(x[:, :nv, :nv]), pad(x[:, nv:, nv:])]),
-                    out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))(Xw)
-    link, sv = pol.batched(stack)
-    link = np.asarray(jax.jit(lambda a: a, out_shardings=rep)(link))
-    sv = np.asarray(sv)
-    U = np.zeros((nk_w, nb, nb), np.complex128)
-    U[:, :nv, :nv] = link[:nk_w, :nv, :nv]
-    U[:, nv:, nv:] = link[nk_w:, :nc, :nc]
-    s_v, s_c = sv[:nk_w, :nv], sv[nk_w:, :nc]
-    spread = max(float(np.max((s.max(1) - s.min(1)) / s.max(1))) for s in (s_v, s_c))
-    fig = {"lsq_residual_max": float(np.max(np.asarray(res))), "sv_spread_max": spread,
-           "cross_block_max": float(np.max(np.asarray(cross))),
-           "energy_mismatch_max_ry": float(np.max(de)), "wall_s": round(time.time() - t0, 3)}
+    # Keep the FFT result on all-rank centroids using the existing exact
+    # band-product mover, then fit only the requested logical band window.
+    from common.staged_reshard import band_to_product_r_reshard
+    A_r = band_to_product_r_reshard(mesh_xy)(A_r)
+    A_r = _canonical_psi(A_r, mesh_xy, n_mu_logical=n_mu, n_mu_out=mu_w)
+    B = _canonical_psi(psi, mesh_xy, n_mu_logical=n_mu, n_mu_out=mu_w, rows=k_rows)
+    U, fig = _gauge_unitaries(A_r, B, nbg=nbg, w0=w0, nv=nv, mesh_xy=mesh_xy)
+    fig.update(energy_mismatch_max_ry=float(np.max(de)), wall_s=round(time.time()-t0, 3))
     return U, fig
 
 
@@ -733,20 +884,19 @@ def _downfold_stage(*, mu_small, rcond, restart, psi_win, psi_1, psi_2, n_rmu, W
     """
     from gw.downfold import (BandWindow, pair_density_gram, select_cur_centroids,
                              slice_psi_to_centroids, build_transfer, congruence, epsilon_w,
-                             record_kept_rank)
+                             record_kept_rank, transform_head_vector)
     from file_io.restart_bundle import read_interaction_orbits
     from runtime.padding import padded_mu_extent
     from common.collectives import device_put_process_local
 
     t0 = time.time()
     sh = lambda *spec: NamedSharding(mesh_xy, P(*spec))
-    put = lambda a, *spec: device_put_process_local(np.ascontiguousarray(a), sh(*spec))
-    rep = jax.jit(lambda a: a, out_shardings=sh())
     nw = int(psi_win.shape[1])
     window = BandWindow(left=(0, nw), right=(0, nw))
     kg = tuple(int(g) for g in grid)
-    psiY = put(psi_win, None, None, None, "y")
-    psiX = put(np.conj(psi_win).transpose(0, 3, 1, 2), None, "x", None, None)
+    psi0X, psiY = _psi_views(psi_win, mesh_xy)
+    psiX = jax.jit(lambda a: jnp.conj(a).transpose(0, 3, 1, 2),
+                   out_shardings=sh(None, "x", None, None))(psi0X)
     S_LL = pair_density_gram(psiX, psiY, window, kgrid=kg, mesh_xy=mesh_xy)
     S_q0 = jax.jit(lambda a: a[0], out_shardings=sh("x", "y"))(S_LL)
     tables = read_interaction_orbits(restart, n_rmu, _log)
@@ -774,29 +924,45 @@ def _downfold_stage(*, mu_small, rcond, restart, psi_win, psi_1, psi_2, n_rmu, W
     V0 = jax.jit(lambda v: v[None], out_shardings=sh(None, "x", "y"))(Vbar)
     Vbar_S = jax.jit(lambda v: v[0], out_shardings=sh("x", "y"))(
         project(V0, *operands(T_x[:1], T_y[:1])))
-    T_h = np.asarray(rep(T_x))                                  # (nq, μ_S_pad, μ_L_pad)
-    zS = np.stack([np.conj(T_h[iq]) @ z_keys[k] for k, (iq, _) in enumerate(keys)])
-    yS = np.stack([np.conj(T_h[iq]) @ y_keys[k] for k, (iq, _) in enumerate(keys)])
-    del T_h
-    t_df = time.time() - t0
+    # Vector transforms and the child split stay on the same device faces.
+    # Only scalar diagnostics are read; no T, V or W host mirror is built.
+    transform = jax.jit(lambda z, t, q: transform_head_vector(z, t, q, mesh_xy),
+                         out_shardings=sh("y"))
+    zdev, ydev = jax.jit(lambda z,y:(z,y),
+        out_shardings=(sh(None,"x"),sh(None,"x")))(z_keys,y_keys)
+    zrows, yrows = [], []
+    for k, (iq, _) in enumerate(keys):
+        zrows.append(transform(zdev[k], T_x, iq))
+        yrows.append(transform(ydev[k], T_x, iq))
+    zS = jax.jit(lambda *a: jnp.stack(a), out_shardings=sh(None, "y"))(*zrows)
+    yS = jax.jit(lambda *a: jnp.stack(a), out_shardings=sh(None, "y"))(*yrows)
+    t_df = time.time()-t0
 
-    # The child split, as a diagnostic of the identity the downfold must keep.
-    V_h, W_h = np.asarray(rep(V_Sq)), np.asarray(rep(W_Sq))
+    import distrib_la as dla
+    eig = dla.plan("eigh", mesh_xy, backend="auto", n=mu_S_pad)
+    lam, vec = eig.batched(V_Sq)
+    pick = jax.jit(lambda a, i: a[i], out_shardings=sh("x", "y"))
+    solve, rows = _head_programs(mesh_xy)
     res, hrow, w11 = [], [], []
     for k, (iq, _) in enumerate(keys):
         if iq == 0:
             continue
-        sp = A.head_split(V_h[iq], W_h[iq], zS[k], float(v_head_q[iq]),
-                          eigh=np.linalg.eigh, xp=np, rcond=A.RCOND)
-        res.append(float(sp.figures["solve_residual"]))
-        hrow.append(float(sp.figures["head_row"]))
-        w11.append(abs(float(sp.W11) / float(W11[k]) - 1.0))
-    del V_h, W_h, V_Sq
-    if max(res) > 1e-6:
-        raise ValueError(f"GATE bsemat_downfold_head_solve: |V_S a - z_S*|/|z_S*| = {max(res):.2e} "
+        a, _ = solve(lam[iq], pick(vec, iq), zS[k])
+        h, _, residual, headrow, _ = rows(pick(V_Sq, iq), pick(W_Sq, iq), zS[k], a,
+                                           float(v_head_q[iq]))
+        res.append(float(residual))
+        hrow.append(float(headrow))
+        w11.append(abs(float(h)/float(W11[k])-1.0))
+    del V_Sq
+    if max(res,default=0.0) > 1e-6:
+        raise ValueError(f"GATE bsemat_downfold_head_solve: |V_S a - z_S*|/|z_S*| = {max(res,default=0.0):.2e} "
                          "> 1e-6; z_S* must lie in range(V_S) = range(Z_S†) by construction.")
-    cut = lambda a: np.ascontiguousarray(np.pad(np.take(a, keep, axis=-1),
-                                                [(0, 0)] * (a.ndim - 1) + [(0, mu_S_pad - mu_S)]))
+    def cut(a):
+        ax, ay = _psi_views(a, mesh_xy)
+        ax = jax.jit(lambda a: jnp.conj(a).transpose(0, 3, 1, 2),
+                      out_shardings=sh(None, "x", None, None))(ax)
+        _, out = slice_psi_to_centroids(ax, ay, keep, mu_S_pad, mesh_xy)
+        return _canonical_psi(out, mesh_xy, n_mu_logical=mu_S, n_mu_out=mu_S_pad)
     eps = np.asarray(eps_W, dtype=np.float64).ravel()
     fig = {"mu_L": int(n_rmu), "mu_S_requested": int(sel.mu_small_requested or mu_S),
            "mu_S": mu_S, "mu_S_pad": mu_S_pad, "N_b": nw, "rcond": float(rcond),
@@ -806,13 +972,13 @@ def _downfold_stage(*, mu_small, rcond, restart, psi_win, psi_1, psi_2, n_rmu, W
            "rank_per_q_max": int(max(r.rank_criterion for r in reports)),
            "eps_W_min": float(np.nanmin(eps)), "eps_W_median": float(np.nanmedian(eps)),
            "eps_W_max": float(np.nanmax(eps)),
-           "child_solve_residual_max": max(res), "child_head_row_min": min(hrow),
-           "child_head_row_max": max(hrow), "child_W11_rel_max": max(w11),
+           "child_solve_residual_max": max(res,default=0.0), "child_head_row_min": min(hrow,default=0.0),
+           "child_head_row_max": max(hrow,default=0.0), "child_W11_rel_max": max(w11,default=0.0),
            "wall_downfold_s": t_df}
     _log(f"[bsemat] downfold: mu_L {n_rmu} -> mu_S {mu_S} (requested {fig['mu_S_requested']}, "
          f"ceiling {fig['ceiling_eigen_rank_pool']} at rcond {rcond:g}); eps_W "
          f"{fig['eps_W_min']:.2e}/{fig['eps_W_median']:.2e}/{fig['eps_W_max']:.2e}; child split: residual "
-         f"{max(res):.1e}, head_row {min(hrow):.6f}-{max(hrow):.6f}, |W11_S/W11 - 1| {max(w11):.1e}; "
+         f"{max(res,default=0.0):.1e}, head_row {min(hrow,default=0.0):.6f}-{max(hrow,default=0.0):.6f}, |W11_S/W11 - 1| {max(w11,default=0.0):.1e}; "
          f"{t_df:.1f} s")
     return dict(W_flat=flat(W_Sq), z_keys=zS, y_keys=yS, Vbar=Vbar_S,
                 psi_1=cut(psi_1), psi_2=cut(psi_2), fig=fig)
@@ -829,6 +995,19 @@ def _exchange_row(T_cv, Ccv, kp, *, omega):
 
 def _ri(a):
     return jnp.stack([a.real, a.imag], axis=-1)[None]
+
+
+def _row_programs(mesh_xy):
+    """Existing E7 contractions with band-face outputs consumed by SlabIO."""
+    out=NamedSharding(mesh_xy,P(None,None,'x',None,'y',None,None))
+    @partial(jax.jit,static_argnames=('omega',),out_shardings=(out,out,out))
+    def direct(*operands,omega):
+        h,w,b=_direct_row.__wrapped__(*operands,omega=omega)
+        return _ri(h),_ri(w),_ri(b)
+    @partial(jax.jit,static_argnames=('omega',),out_shardings=out)
+    def exchange(*operands,omega):
+        return _ri(_exchange_row.__wrapped__(*operands,omega=omega))
+    return direct,exchange
 
 
 # ---------------------------------------------------------------------------
@@ -925,8 +1104,7 @@ def run_bsemat_exports(*, input_file, wfn_co, n_val, n_cond, outputs, rcond=A.RC
     (``_export_context``); each file then applies its own q → 0 body, ψ map,
     downfold and rows (``_write_output``), and files of one shape reuse the
     compiled row kernels. The split reads W only at q ≠ 0, so a per-file q → 0
-    body leaves it exact, and every file equals its one-file export bit for bit
-    (tests/test_bsemat_multi_cpu.py). Each summary carries ``stages`` (the shared
+    body leaves it exact, and each output uses the same row equations and HDF5 schema. Each summary carries ``stages`` (the shared
     stages' and its own walls, s), ``wall_shared_s``, and ``wall_total_s`` from
     the start of the export to the end of that file.
     """
@@ -1016,8 +1194,8 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
     nk = int(np.prod(grid))
     n_rmu, n_rmu_pad = int(data["n_rmu"]), int(data["n_rmu_pad"])
     rep = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, P()))
-    psi_v = np.asarray(rep(data["psi_v_X"]))          # (nk, nv, ns, μ_pad), bands ascending
-    psi_c = np.asarray(rep(data["psi_c_X"]))
+    psi_v = data["psi_v_X"]                         # (nk, nv, ns, μ_pad), bands ascending
+    psi_c = data["psi_c_X"]
     k_int = np.asarray(sym.kvecs_asints, dtype=np.int64)
     fft_int = np.stack(np.meshgrid(*[np.arange(n) for n in grid], indexing="ij"), -1).reshape(-1, 3)
     if k_int.shape != fft_int.shape or not np.array_equal(np.mod(k_int, grid), fft_int):
@@ -1126,7 +1304,8 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
     # ── 4. gauge map ──────────────────────────────────────────────────────
     bw = header.get("band_window")
     b0 = int(np.asarray(bw).reshape(-1)[0]) if bw is not None else 0
-    psi_win = np.concatenate([psi_v, psi_c], axis=1)        # ascending energy
+    psi_win = jax.jit(lambda v, c: jnp.concatenate((v, c), axis=1),
+                       out_shardings=NamedSharding(mesh_xy, P(None, None, None, ("x", "y"))))(psi_v, psi_c)
     enk = np.asarray(header["energies"])
     n_occ_w = int(resolve_n_occ(enk, input_file=input_file))
     bands_abs = b0 + np.arange(n_occ_w - n_val, n_occ_w + n_cond)
@@ -1136,7 +1315,7 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
                                                  params["centroids_file"]),
                                tuple(int(x) for x in wfn.fft_grid))[0]
     nb = n_val + n_cond
-    eye = lambda: np.broadcast_to(np.eye(nb), (nk, nb, nb)).copy()
+    eye = lambda: _identity_gauge(nk, nb, mesh_xy)
     gmap = lambda psi, wfile, rows, e: gauge_map(
         psi, wfn_co=wfile, k_rows=rows, bands_abs=bands_abs, centroid_frac=cent_frac,
         fft_grid=wfn.fft_grid, nv=n_val, enk_win=e, mesh_xy=mesh_xy)
@@ -1146,12 +1325,15 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
         U_file, gfig = eye(), {"gauge_map": "identity (control variant)"}
     _log(f"[bsemat] gauge map ({os.path.basename(wfn_v)}): {gfig}")
     # The two legs of every file row, in its own k order: source ψ and window unitary.
-    src_v, Uv = psi_win[v_rows], U_file[row_of[v_rows]]
+    select = lambda a, rows: _canonical_psi(a, mesh_xy, n_mu_logical=n_rmu,
+        n_mu_out=n_rmu_pad, rows=rows)
+    select_u = lambda a, rows: jax.jit(lambda u: jnp.take(u, jnp.asarray(rows, jnp.int32), axis=0),
+        out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))(a)
+    src_v, Uv = select(psi_win, v_rows), select_u(U_file, row_of[v_rows])
     if qflag == 0:
         psi_h, enk_h, ht_rec = htransform_window(input_file, kpts, n_val=n_val, n_cond=n_cond,
-                                                 n_rmu=n_rmu, mesh_xy=mesh_xy)
-        src_c = np.zeros_like(psi_win)
-        src_c[..., :n_rmu] = psi_h
+                                                 n_rmu=n_rmu, n_rmu_pad=n_rmu_pad, mesh_xy=mesh_xy)
+        src_c = _canonical_psi(psi_h, mesh_xy, n_mu_logical=n_rmu, n_mu_out=n_rmu_pad)
         eps_c = enk_h[:, n_val:]
         if use_gauge_map:
             Uc, gfig_c = gmap(src_c, wfn_co, np.arange(nk), enk_h)
@@ -1161,13 +1343,13 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
         gfig = {"hole_leg": gfig, "electron_leg": gfig_c,
                 "htransform": [str(r)[:400] for r in ht_rec]}
     else:
-        src_c, Uc, eps_c = psi_win[c_rows], U_file[row_of[c_rows]], enk_win[c_rows, n_val:]
+        src_c, Uc, eps_c = select(psi_win, c_rows), select_u(U_file, row_of[c_rows]), enk_win[c_rows, n_val:]
 
     # q = 0 head column check against the bundle's G = 0 vector.
     q0 = [kk for kk, (iq, G) in enumerate(keys) if iq == 0 and G == (0, 0, 0)][0]
     if data.get("g0_X") is not None:
-        g0 = np.asarray(rep(data["g0_X"]))[:n_rmu]
-        dz = np.linalg.norm(z_keys[q0][:n_rmu] * np.sqrt(omega) - g0) / np.linalg.norm(g0)
+        dz = float(jax.jit(lambda z,g:jnp.linalg.norm((z*np.sqrt(omega)-g)[:n_rmu])/
+            jnp.linalg.norm(g[:n_rmu]),out_shardings=NamedSharding(mesh_xy,P()))(z_keys[q0],data["g0_X"]))
         _log(f"[bsemat] q=0 column vs bundle G0 vector: rel. diff {dz:.2e}")
 
     nocc_abs = int(bands_abs[n_val])
@@ -1219,7 +1401,8 @@ def _q0_dipole_rows(ctx, q0_vector, W_flat):
             raise ValueError(f"GATE bsemat_q0_wings_source: {restart} lacks {miss}; the dipole "
                              "q0 body needs the GW bundle's stored q -> 0 wings. fix: rerun GW "
                              "with wing storage, or --q0-body head-less.")
-        Lw, Rw, S_eff, S_d = (np.asarray(f[n][()]) for n in names)
+        wing_shapes = [tuple(f[n].shape) for n in names[:2]]
+        S_eff, S_d = (np.asarray(f[n][()]) for n in names[2:])
     if q0_vector is None:
         eps0 = os.path.join(os.path.dirname(os.path.abspath(bgw_eps)), "eps0mat.h5") if bgw_eps else None
         if not eps0 or not os.path.exists(eps0):
@@ -1228,15 +1411,20 @@ def _q0_dipole_rows(ctx, q0_vector, W_flat):
         with h5py.File(eps0, "r") as e:
             q0_vector = np.asarray(e["eps_header/qpoints/qpts"][()], np.float64)[0]
     q0_cart = np.asarray(q0_vector, np.float64) @ bvec
-    if Lw.shape != (3, n_rmu) or Rw.shape != (n_rmu, 3):
-        raise ValueError(f"GATE bsemat_q0_wing_fold: wings {Lw.shape}/{Rw.shape}, the bundle has {n_rmu} μ")
-    Lp = np.zeros((3, n_rmu_pad), np.complex128); Lp[:, :n_rmu] = Lw
-    Rp = np.zeros((n_rmu_pad, 3), np.complex128); Rp[:n_rmu] = Rw
-    rs = NamedSharding(mesh_xy, P())
-    dip = jax.jit(lambda w, l, r, se, sd: A.q0_dipole_body_rows(
-        w[:, :, 0], l, r, se, sd, q0_cart, omega, xp=jnp), out_shardings=rs)
-    A_d, D_d, fig = dip(W_flat, *(device_put_process_local(np.asarray(x, np.complex128), rs)
-                                  for x in (Lp, Rp, S_eff, S_d)))
+    if wing_shapes != [(3,n_rmu),(n_rmu,3)]:
+        raise ValueError(f"GATE bsemat_q0_wing_fold: wings {wing_shapes}, bundle has {n_rmu} mu")
+    from file_io.slab_io import SlabIO
+    with SlabIO(restart,mode='r',mesh=mesh_xy) as io:
+        Lp = io.read_slab(names[0],shape=(3,n_rmu_pad),dtype=np.complex128,
+                         offset=(0,0),mesh=mesh_xy,partition_spec=P(None,'x'))
+        Rp = io.read_slab(names[1],shape=(n_rmu_pad,3),dtype=np.complex128,
+                         offset=(0,0),mesh=mesh_xy,partition_spec=P('y',None))
+    rs = NamedSharding(mesh_xy,P())
+    ash = NamedSharding(mesh_xy,P(None,('x','y')))
+    dip = jax.jit(lambda w,l,r,se,sd:A.q0_dipole_body_rows(
+        w[:,:,0],l,r,se,sd,q0_cart,omega,xp=jnp),out_shardings=(ash,rs,rs))
+    A_d,D_d,fig = dip(W_flat,Lp,Rp,*(device_put_process_local(np.asarray(x,np.complex128),rs)
+                                   for x in (S_eff,S_d)))
     q0_fig = {k: (complex(np.asarray(v)) if np.iscomplexobj(np.asarray(v)) else float(np.asarray(v)))
               for k, v in fig.items()}
     q0_fig["q0_vector"] = [float(x) for x in q0_vector]
@@ -1244,11 +1432,42 @@ def _q0_dipole_rows(ctx, q0_vector, W_flat):
         raise ValueError(f"GATE bsemat_q0_wing_fold: Ω q̂(S_eff − S_d)q̂ vs q̂ L W R q̂ on this W "
                          f"differs by {q0_fig['fold_gate']:.2e} (R vs Lᴴ {q0_fig['R_vs_LH']:.2e}); "
                          "L's μ order or normalisation is not this bundle's.")
-    out = (np.asarray(A_d)[:, :n_rmu], np.asarray(D_d), q0_fig)
+    out = (A_d,D_d,q0_fig)
     _log(f"[bsemat] q0 body: dipole term along q0 = {q0_fig['q0_vector']} (crystal), "
          f"ε_M = {q0_fig['eps_M']:.4f}, fold gate {q0_fig['fold_gate']:.1e}")
     ctx["q0_dipole"][memo] = out
     return out
+
+
+def _q0_update_operands(update, mesh_xy, *, n_mu, n_mu_pad):
+    """A rank-n q0 update on device, or from only addressable host columns."""
+    from common.collectives import device_put_process_local, device_put_process_tiles
+    a, d = update
+    ash = NamedSharding(mesh_xy,P(None,('x','y')))
+    rep = NamedSharding(mesh_xy,P())
+    if not isinstance(a,jax.Array):
+        a=np.asarray(a,np.complex128)
+    if len(a.shape)!=2 or int(a.shape[1])<n_mu:
+        raise ValueError('bsemat q0 body rows must cover the logical centroid axis')
+    if isinstance(a,jax.Array):
+        @partial(jax.jit,out_shardings=ash)
+        def place(a):
+            a=jnp.where(jnp.arange(a.shape[1])<n_mu,a,0)
+            width=min(int(a.shape[1]),n_mu_pad)
+            return jnp.pad(a[:,:width],((0,0),(0,n_mu_pad-width)))
+        a=place(a)
+    else:
+        host=np.asarray(a,np.complex128)
+        def tile(index):
+            band,mu=index
+            lo,hi=mu.start or 0,mu.stop or n_mu_pad
+            out=np.zeros((len(range(*band.indices(host.shape[0]))),hi-lo),np.complex128)
+            end=min(hi,n_mu)
+            if end>lo:
+                out[:,:end-lo]=host[band,lo:end]
+            return out
+        a=device_put_process_tiles((int(host.shape[0]),n_mu_pad),ash,tile)
+    return a,device_put_process_local(d,rep)
 
 
 def _write_output(ctx, out, *, release):
@@ -1279,12 +1498,9 @@ def _write_output(ctx, out, *, release):
                 A_d, D_d, q0_fig = _q0_dipole_rows(ctx, out["q0_vector"], W_flat)
                 q0_body_update = (A_d, D_d)
             if q0_body_update is not None:
-                A0 = np.zeros((np.asarray(q0_body_update[0]).shape[0], n_rmu_pad), np.complex128)
-                A0[:, :n_rmu] = np.asarray(q0_body_update[0])[:, :n_rmu]
-                rs = NamedSharding(mesh_xy, P())
-                W_flat = ctx["q0_update"](
-                    W_flat, device_put_process_local(A0, rs),
-                    device_put_process_local(np.asarray(q0_body_update[1], np.complex128), rs))
+                A0,D0 = _q0_update_operands(q0_body_update,mesh_xy,
+                                            n_mu=n_rmu,n_mu_pad=n_rmu_pad)
+                W_flat = ctx["q0_update"](W_flat,A0,D0)
                 _log(f"[bsemat] q -> 0 body update of rank {A0.shape[0]} applied")
 
         # ── ψ in the file's gauge, k order and band order ─────────────────
@@ -1292,20 +1508,24 @@ def _write_output(ctx, out, *, release):
             Uc, Uv, gfig = ctx["Uc"], ctx["Uv"], ctx["gfig"]
             if ctx["use_gauge_map"] and not out["use_gauge_map"]:     # control variant beside mapped files
                 nb = n_val + n_cond
-                Uc = Uv = np.broadcast_to(np.eye(nb), (nk, nb, nb)).copy()
+                Uc = Uv = _identity_gauge(nk, nb, mesh_xy)
                 gfig = {"gauge_map": "identity (control variant)"}
                 _log(f"[bsemat] gauge map: {gfig}")
             # ψ_file,n = Σ_m ψ_LX,m conj(U[n, m]); rows of the file in WFN_co order, the hole leg
             # at k − Q and the electron leg at k (the same rows at Q = 0).
-            to_file = lambda src, U: np.einsum("knsr,kmn->kmsr", src, np.conj(U))
-            psi_v_b = to_file(ctx["src_v"], Uv)[:, :n_val][:, ::-1]   # BerkeleyGW: iv = 1 highest
-            psi_c_b = to_file(ctx["src_c"], Uc)[:, n_val:]
-            psi_1 = np.concatenate([psi_v_b, psi_c_b], axis=1) if extended else psi_v_b
-            psi_2 = psi_1 if extended else psi_c_b
-            sx = NamedSharding(mesh_xy, P(None, None, None, "x"))
-            sy = NamedSharding(mesh_xy, P(None, None, None, "y"))
-            put = lambda a, s: device_put_process_local(np.ascontiguousarray(a), s)
-            p1x, p1y, p2x, p2y = put(psi_1, sx), put(psi_1, sy), put(psi_2, sx), put(psi_2, sy)
+            v = _rotate_psi(ctx["src_v"], Uv, mesh_xy)
+            c = _rotate_psi(ctx["src_c"], Uc, mesh_xy)
+            mu_sh = NamedSharding(mesh_xy, P(None, None, None, ("x", "y")))
+            @partial(jax.jit, out_shardings=(mu_sh, mu_sh))
+            def file_bands(v, c):
+                val, cond = v[:, :n_val][:, ::-1], c[:, n_val:]
+                legs = ((jnp.concatenate((val, cond), axis=1),)*2 if extended else (val, cond))
+                divisor = int(np.lcm(int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])))
+                return tuple(jnp.pad(a, ((0,0),(0,-(-a.shape[1]//divisor)*divisor-a.shape[1]),
+                                         (0,0),(0,0))) for a in legs)
+            psi_1, psi_2 = file_bands(v, c)
+            p1x, p1y = _psi_views(psi_1, mesh_xy)
+            p2x, p2y = _psi_views(psi_2, mesh_xy)
 
         z_keys, y_keys, Vbar = ctx["z_keys"], ctx["y_keys"], ctx["Vbar"]
         df_fig = None
@@ -1321,7 +1541,8 @@ def _write_output(ctx, out, *, release):
                 W_flat = dfo["W_flat"]
                 z_keys, y_keys, Vbar, psi_1, psi_2 = (dfo[k] for k in ("z_keys", "y_keys", "Vbar", "psi_1", "psi_2"))
                 df_fig = dfo["fig"]
-                p1x, p1y, p2x, p2y = put(psi_1, sx), put(psi_1, sy), put(psi_2, sx), put(psi_2, sy)
+                p1x, p1y = _psi_views(psi_1, mesh_xy)
+                p2x, p2y = _psi_views(psi_2, mesh_xy)
         V_flat = None
 
         # Exchange operands: C_{n2 n1}(k) = Σ conj(ψ_n2) ψ_n1, T = C V̄_Γ.
@@ -1331,7 +1552,10 @@ def _write_output(ctx, out, *, release):
             T_cv = jnp.einsum("kcvm,mn->kcvn", Ccv, Vbar)
 
         # ── 5. rows ───────────────────────────────────────────────────────
-        n1b, n2b = psi_1.shape[1], psi_2.shape[1]
+        n1b = n2b = n_val+n_cond
+        if not extended:
+            n1b, n2b = n_val, n_cond
+        direct_row, exchange_row = _row_programs(mesh_xy)
         with timing.section("write"):
             if jax.process_index() == 0:
                 F.create_bsemat_file(
@@ -1345,28 +1569,43 @@ def _write_output(ctx, out, *, release):
         fro = np.zeros(4)
         with timing.section("rows"):
             r_sh = NamedSharding(mesh_xy, P())
-            zk, yk, w11k = (device_put_process_local(np.ascontiguousarray(a), r_sh)
-                            for a in (z_keys, y_keys, ctx["W11"]))
+            mu_sh = NamedSharding(mesh_xy, P(None, ("x", "y")))
+            zk, yk = jax.jit(lambda z,y:(z,y),out_shardings=(mu_sh,mu_sh))(z_keys,y_keys)
+            w11k = device_put_process_local(ctx["W11"], r_sh)
             iqp, kyp, lmp = (device_put_process_local(np.ascontiguousarray(a), r_sh)
                              for a in (ctx["iq_pair"].astype(np.int32), ctx["key_pair"].astype(np.int32),
                                        ctx["lam_pair"]))
         t_rows = time.time()
+        # Admit the exact row programs beside their already-resident inputs.
+        # There is one compiled signature per output shape, not one per k'.
+        from lxkit import memory
+        from runtime.aot_memory import compiled_price
+        from common.gpu_utils import device_budget_bytes
+        device_budget_bytes()
+        row_args=(p1x,p1y,p2x,p2y,W_flat,iqp,kyp,zk,yk,w11k,lmp)
+        index0=device_put_process_local(np.asarray(0,np.int32),r_sh)
+        def admit_row(program, operands, label):
+            executable=program.lower(*operands,index0,omega=omega).compile()
+            quote=compiled_price(compiled=executable,ranks=int(mesh_xy.size),face=True,source=label)
+            memory.admit(label,(("band-face row",quote),),memory.room(bucketed=False))
+            return executable
+        direct_exe=admit_row(direct_row,row_args,"bsemat direct row")
+        exchange_exe=admit_row(exchange_row,(T_cv,Ccv),"bsemat exchange row")
         with SlabIO(out_path, mode="a", mesh=mesh_xy) as io:
             F.register_matrices(io, shape)
             for jp in range(nk):
+                index=device_put_process_local(np.asarray(jp,np.int32),r_sh)
                 # Each matrix of row k′ = jp: the replicated (Re, Im) block and its Frobenius
                 # sum (the host read that ends the stage's device work), then one hyperslab.
                 with timing.section("rows"):
-                    h, w_, b = _direct_row(p1x, p1y, p2x, p2y, W_flat, iqp, kyp, zk, yk, w11k, lmp,
-                                           jp, omega=omega)
+                    h, w_, b = direct_exe(*row_args,index)
                 for m, arr in enumerate((h, w_, b)):
                     with timing.section("rows"):
-                        arr = rep(_ri(arr))
                         fro[m] += float(jnp.sum(arr ** 2))
                     with timing.section("write"):
                         io.write_slab(F.MATRICES[m], arr, offset=(jp, 0, 0, 0, 0, 0, 0))
                 with timing.section("exchange"):
-                    arr = rep(_ri(_exchange_row(T_cv, Ccv, jp, omega=omega)))
+                    arr = exchange_exe(T_cv,Ccv,index)
                     fro[3] += float(jnp.sum(arr ** 2))
                 with timing.section("write"):
                     io.write_slab(F.MATRICES[3], arr, offset=(jp, 0, 0, 0, 0, 0, 0))
