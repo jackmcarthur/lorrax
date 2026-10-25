@@ -94,7 +94,7 @@ def main():
     forced_room = (needs['face'] + needs['axis']) // 2
     real_room = memory.room
     try:
-        memory.room = lambda: forced_room
+        memory.room = lambda **_: forced_room
         def bounded(layout, abstract):
             return programs[layout], [programs[layout]], sigma_pass_price(kernel)['scratch']
         chosen, prepared, ex = prepare_green_operands(faces, mesh, bounded, label="Sigma")

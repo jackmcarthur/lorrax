@@ -46,7 +46,7 @@ def test_admission_execution_and_no_payload_cache(monkeypatch, side, projection)
     phase = np.arange(np_ * nb).reshape(np_, nb)
     weight_host = np.cos(phase) + .1j * np.sin(phase)
     weights = put(weight_host, P())
-    monkeypatch.setattr(memory, 'room', lambda: 1 << 40)
+    monkeypatch.setattr(memory, 'room', lambda **_: 1 << 40)
     compiled = {}
     needs = {}
 
@@ -96,7 +96,7 @@ def test_admission_execution_and_no_payload_cache(monkeypatch, side, projection)
 
         assert needs['axis'] > needs['face'], needs
         room = (needs['axis'] + needs['face']) // 2
-        monkeypatch.setattr(memory, 'room', lambda: room)
+        monkeypatch.setattr(memory, 'room', lambda **_: room)
         chosen, prepared, ex = S.prepare_green_operands(faces, mesh, build, label='test Green')
         assert chosen == 'face' and needs[chosen] <= room
         np.testing.assert_allclose(ex(prepared, weights)[0], expected, rtol=3e-12, atol=2e-11)
@@ -153,7 +153,7 @@ def test_response_wrapper_uses_prepared_operands(monkeypatch):
             jnp.asarray(e[v].max()), jnp.asarray(e[c].min()))
     expected = helpers['numpy_response'](grid, plan, psi, e, v, c, t, alpha[None], False, True)[0]
     original = S.prepare_green_operands
-    monkeypatch.setattr(memory, 'room', lambda: 1 << 40)
+    monkeypatch.setattr(memory, 'room', lambda **_: 1 << 40)
     with F.xla_reference():
         for layout in ('axis', 'face'):
             def prepare(*args, **kwargs):
