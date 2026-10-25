@@ -563,7 +563,8 @@ def build_S_cart_omega(wfn, sym, meta, params, dipole_path, omega,
     # TODO(metal-head): this legacy one-shot dipole path retains the ifmax
     # step occupation; metallic QSGW uses the explicit weighted PT head.
     with _tmg.section("head.read_dipole"):
-        v_cvk, dE_cv = read_dipole_cv_block(dipole_path, nelec=nelec, mesh=mesh)
+        v_cvk, dE_cv = read_dipole_cv_block(
+            dipole_path, nelec=nelec, mesh=mesh, wfn_path=wfn.path)
     nk_file = int(v_cvk.shape[1])
     nb = int(read_dipole_metadata(dipole_path)["stored_bands"])
     with _tmg.section("head.checks"):

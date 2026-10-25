@@ -168,6 +168,11 @@ def require_dipole_basis(attrs, *, dipole_path, wfn_path) -> None:
     Contracting one basis's velocities with the other's exciton amplitudes
     keeps every shape and is silently wrong absorption.
     """
+    from pathlib import Path
+    if wfn_path is None or not Path(wfn_path).is_file():
+        raise ValueError(
+            f"GATE dipole_basis: {dipole_path!s} needs the physical operator's "
+            f"existing WFN reference path, got {wfn_path!r}")
     got = attrs.get(DIPOLE_BASIS_ATTR, "dft")
     got = got.decode() if isinstance(got, bytes) else str(got)
     want = wfn_psi_basis(wfn_path)

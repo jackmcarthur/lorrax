@@ -687,6 +687,10 @@ def _transition_spectrum(d_alpha, de_cv, omegas, width, kind):
     if kind not in ("lorentzian", "gaussian"):
         raise ValueError(f"broadening {kind!r}: want lorentzian or gaussian")
     if _is_jax_array(d_alpha) or _is_jax_array(de_cv):
+        if (not (_is_jax_array(d_alpha) and _is_jax_array(de_cv))
+                or not hasattr(d_alpha.sharding, "mesh")
+                or not hasattr(de_cv.sharding, "mesh")):
+            raise ValueError("transition spectra require both host arrays or both distributed device fields")
         import jax.numpy as jnp
         mesh = d_alpha.sharding.mesh
         return np.asarray(gather_to_host(_transition_spectrum_program(mesh, kind)(

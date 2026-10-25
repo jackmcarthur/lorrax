@@ -1234,6 +1234,14 @@ def _dipole_delta_program(mesh_xy, nr, nc, from_energies):
     return jax.jit(delta, out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
 
 
+def _dipole_band_pair(value):
+    """Band selections and carriers are exact integer pairs, never rounded."""
+    a = np.asarray(value)
+    if a.shape != (2,) or not np.issubdtype(a.dtype, np.integer):
+        raise ValueError("dipole band ranges and carriers must be pairs of integers")
+    return tuple(map(int, a))
+
+
 def load_dipole_h5(path: str | Path, *, wfn_path, mesh_xy,
                    band_rows=None, band_cols=None, band_shape=None):
     """Read a selected velocity window through the canonical SlabIO owner.
@@ -1261,14 +1269,13 @@ def load_dipole_h5(path: str | Path, *, wfn_path, mesh_xy,
     with h5py.File(str(path), "r") as f:
         attrs = dict(f.attrs)
         require_dipole_format(attrs, dipole_path=path)
-        if wfn_path is not None:
-            require_dipole_basis(attrs, dipole_path=path, wfn_path=wfn_path)
+        require_dipole_basis(attrs, dipole_path=path, wfn_path=wfn_path)
         shape = tuple(f["dipole_cart"].shape)
         if len(shape) != 4 or shape[0] != 3 or shape[2] != shape[3]:
             raise ValueError(f"{path}: dipole_cart must be (3, nk, nb, nb), got {shape}")
         _, nk, nb, _ = shape
-        rows = (0, nb) if band_rows is None else tuple(map(int, band_rows))
-        cols = (0, nb) if band_cols is None else tuple(map(int, band_cols))
+        rows = _dipole_band_pair((0, nb) if band_rows is None else band_rows)
+        cols = _dipole_band_pair((0, nb) if band_cols is None else band_cols)
         for window in (rows, cols):
             require_dipole_bands(attrs, nb, *window, dipole_path=path,
                                  where="selected dipole window")
@@ -1281,7 +1288,7 @@ def load_dipole_h5(path: str | Path, *, wfn_path, mesh_xy,
     spec = P(None, None, "x", "y")
     carriers = tuple(int(padded_axis(n, mesh_xy, name="dipole band window",
                         spec=spec, axis=i + 2).carrier) for i, n in enumerate((nr, nc)))
-    rp, cp = carriers if band_shape is None else tuple(map(int, band_shape))
+    rp, cp = carriers if band_shape is None else _dipole_band_pair(band_shape)
     if rp < nr or cp < nc or rp % int(mesh_xy.shape["x"]) or cp % int(mesh_xy.shape["y"]):
         raise ValueError("dipole band_shape must cover the selected window and tile its X/Y axes")
     with SlabIO(path, mode="r", mesh=mesh_xy) as io:
@@ -2650,22 +2657,25 @@ def read_dipole_metadata(path):
     return attrs
 
 
-def read_dipole_cv_block(path, *, nelec: int, mesh: Mesh):
+def read_dipole_cv_block(path, *, nelec: int, mesh: Mesh, wfn_path):
     """Static-head c/v rectangle on matrix faces, using the same file reader.
 
     Carrier slots have zero velocity and infinite Delta.  The consuming
     S-tensor contraction reduces only its 3x3 result, never gathers a CV bank.
-    WFN/operator provenance is checked by the head's existing admission owner.
+    The existing basis gate uses the physical operator's WFN reference;
+    operator/window provenance stays with the head's admission owner.
     """
-    from .dipole import require_dipole_format
+    from .dipole import require_dipole_basis, require_dipole_format
     with h5py.File(path, "r") as f:
         require_dipole_format(f.attrs, dipole_path=path)
         _, nk, nb, _ = f["dipole_cart"].shape
     nv = max(0, min(int(nelec), int(nb)))
     if nv == 0 or nv == nb:
+        with h5py.File(path, "r") as f:
+            require_dipole_basis(f.attrs, dipole_path=path, wfn_path=wfn_path)
         return (jnp.zeros((3, nk, nb - nv, nv), jnp.complex128),
                 jnp.zeros((nk, nb - nv, nv), jnp.float64))
-    v, de, _ = load_dipole_h5(path, wfn_path=None, mesh_xy=mesh,
+    v, de, _ = load_dipole_h5(path, wfn_path=wfn_path, mesh_xy=mesh,
                              band_rows=(nv, nb), band_cols=(0, nv))
     return v, de
 

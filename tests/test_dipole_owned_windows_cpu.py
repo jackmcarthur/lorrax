@@ -128,7 +128,7 @@ def test_real_window_reader_padding_and_optical_outputs(tmp_path,side,legacy):
             n_spin=1,n_spinor=2,vol_supercell=28.))+"\n"
         assert Path(file).read_text()==expected_text
     with patch.object(np,"asarray",side_effect=no_global_host):
-        all_v,all_de=read_dipole_cv_block(path,nelec=11,mesh=mesh)
+        all_v,all_de=read_dipole_cv_block(path,nelec=11,mesh=mesh,wfn_path=wfn)
         tensor=compute_S_omega_cv(all_v,all_de,14.,2,1,2,jnp.array([.2+.3j]))
     de_all=e[:,11:,None]-e[:,None,:11]
     weight=4/(14*2*1*2)/(de_all*((.2+.3j)**2-de_all**2))
@@ -142,6 +142,9 @@ def test_qp_full_active_square_includes_same_class_commutator(tmp_path,side):
     mesh=mesh_for(side)
     path=tmp_path/"dipole.h5"
     v,e=write_dipole_fixture(path)
+    wfn=tmp_path/"WFN.h5"
+    with h5py.File(wfn,"w"):
+        pass
     q0,q1,nocc=2,9,4
     n=7
     rng=np.random.default_rng(602+side)
@@ -151,7 +154,7 @@ def test_qp_full_active_square_includes_same_class_commutator(tmp_path,side):
         U_val=u[:,:,:2],U_cond=u[:,:,2:5],eps_v=eqp[:,:2],eps_c=eqp[:,2:5])
     shape=(-(-3//side)*side,-(-2//side)*side)
     with patch.object(np,"asarray",side_effect=no_global_host):
-        velocity,de,_=load_dipole_h5(path,wfn_path=None,mesh_xy=mesh,
+        velocity,de,_=load_dipole_h5(path,wfn_path=wfn,mesh_xy=mesh,
             band_rows=(q0,q1),band_cols=(q0,q1))
         got,delta=qp_window_dipoles(velocity,de,qp,mesh_xy=mesh,output_shape=shape)
     active=v[:,:,q0:q1,q0:q1]
@@ -189,6 +192,11 @@ def test_window_admission_refuses_before_payload_io(tmp_path):
     with patch.object(SlabIO,"read_slab",side_effect=AssertionError("invalid window reached I/O")):
         with pytest.raises(ValueError,match="band_shape"):
             request(band_shape=(4,8))
+        with pytest.raises(ValueError,match="pairs of integers"):
+            request(band_shape=(6.5,8))
+        with pytest.raises(ValueError,match="pairs of integers"):
+            load_dipole_h5(path,wfn_path=wfn,mesh_xy=mesh,
+                band_rows=(11.5,16),band_cols=(4,11))
         for key,value,gate in (("band_min",1,"dipole_band_window"),
                                ("basis","qp","dipole_basis"),
                                ("format_version",1,"dipole_format_version")):
@@ -231,3 +239,38 @@ def test_text_writer_agrees_root_io_failure_before_next_block(tmp_path):
         with pytest.raises(RuntimeError,match="bse.noeh.open.*disk-full"):
             write_bgw_eigenvalues_noeh(tmp_path,np.ones((1,1)),np.zeros((1,1)),
                 np.ones((3,1,1,1),complex),n_spin=1,n_spinor=1,vol_supercell=1.)
+
+
+def test_static_head_uses_the_physical_wfn_basis_before_io(tmp_path):
+    from file_io.qp_wfn import QP_WFN_ATTR, QP_WFN_SCHEME
+    mesh=mesh_for(2)
+    path=tmp_path/"dipole.h5"
+    write_dipole_fixture(path)
+    dft,qp=tmp_path/"DFT.h5",tmp_path/"QP.h5"
+    with h5py.File(dft,"w"):
+        pass
+    with h5py.File(qp,"w") as f:
+        f.attrs[QP_WFN_ATTR]=QP_WFN_SCHEME
+    with patch.object(SlabIO,"read_slab",side_effect=AssertionError("basis mismatch reached I/O")):
+        with pytest.raises(ValueError,match="dipole_basis"):
+            read_dipole_cv_block(path,nelec=11,mesh=mesh,wfn_path=qp)
+        with pytest.raises(ValueError,match="WFN reference path"):
+            load_dipole_h5(path,wfn_path=None,mesh_xy=mesh)
+    dft_v,dft_de=read_dipole_cv_block(path,nelec=11,mesh=mesh,wfn_path=dft)
+    with h5py.File(path,"a") as f:
+        f.attrs['basis']='qp'
+    qp_v,qp_de=read_dipole_cv_block(path,nelec=11,mesh=mesh,wfn_path=qp)
+    np.testing.assert_array_equal(np.asarray(dft_v),np.asarray(qp_v))
+    np.testing.assert_array_equal(np.asarray(dft_de),np.asarray(qp_de))
+
+
+def test_transition_spectrum_refuses_mixed_host_device_fields():
+    from bse.absorption_common import _transition_spectrum
+    mesh=mesh_for(2)
+    d=np.ones((3,1,2,2),complex)
+    de=np.ones((1,2,2))
+    dd=jax.device_put(d,NamedSharding(mesh,P(None,None,"x","y")))
+    ed=jax.device_put(de,NamedSharding(mesh,P(None,"x","y")))
+    for args in ((dd,de),(d,ed)):
+        with pytest.raises(ValueError,match="both host arrays or both distributed"):
+            _transition_spectrum(*args,np.array([.2]),.1,"lorentzian")
