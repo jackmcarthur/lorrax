@@ -16,10 +16,16 @@ by the plane-wave code itself.
 
 Both fine-grid spectra interpolate from the 3 × 3 × 1 coarse grid to the
 shifted 8 × 8 × 1 grid, using different QP and kernel interpolation methods.
-No explicit GW+BSE calculation on the fine grid was performed for this
-exercise. Their difference therefore does not establish which interpolation
-is more accurate; that requires an independent fine-grid reference with
-matched physical settings.
+Of the 0.92 eV between the two onsets, 0.075 eV is the fine-grid QP gap
+(3.233 eV against 3.159 eV) and 0.845 eV the exciton binding energy
+(0.722 eV against 1.567 eV). On the 3 × 3 × 1 grid itself the two codes bind
+alike (1.544 eV and 1.536 eV). LORRAX's binding falls as the BSE grid
+densifies, as the 2D exciton envelope is resolved: 0.860, 0.810, 0.676, 0.594,
+0.539 and 0.526 eV on unshifted 6², 8², 9², 12², 18² and 24² grids. The
+plane-wave dual-grid result keeps the coarse-grid binding. A direct
+6 × 6 × 1 control (DFT on the 6 × 6 grid, LORRAX GW and BSE there, DFT
+energies) binds by 0.928 eV, against 0.856 eV from the same BSE interpolated
+from 3 × 3 × 1. No direct calculation on the shifted 8 × 8 × 1 grid was run.
 
 The separate [9 × 9 → 12 × 12 MoS₂ benchmark](https://jackmcarthur.github.io/lorrax/theory/w-range-splitting/#example)
 uses screening and BSE computed directly on the fine grid, with matched QP
@@ -43,6 +49,12 @@ not identify a particular implementation defect.
 comparisons. [Reader controls](validation/INTEROP_REPORT.txt) preserve the exact
 inputs and scope of the comparisons. Solver convergence, complete frequency
 coverage and file compatibility each have separate checks.
+
+The plots were regenerated on 2026-10-24 from a rerun at main `639be6916`
+plus the htransform changes of `claude/htransform-scissor-mos2`; it reproduces
+every saved table to 6 µeV. That rerun exported `eps0mat.h5`/`epsmat.h5` at
+`epsmat_ecut = 25.0`; the plane-wave reader controls above give the same
+3,072 eigenvalues from the 25 Ry and the 9 Ry exports.
 
 The text tables and plots here are small reference artifacts. Complete HDF5
 screening, kernel, eigenvectors and wavefunction files are retained in the

@@ -160,8 +160,11 @@ Comparison
 The saved fine-grid BSE onset is 2.511 eV in LORRAX, compared with 1.592 eV in
 the plane-wave code. Both interpolate from the sparse 3 × 3 × 1 coarse grid to the
 shifted 8 × 8 × 1 grid, using different QP and kernel interpolation procedures.
-No explicit fine-grid GW+BSE reference was computed, so this difference does
-not establish which method is more accurate. Small solver residuals certify
+Almost all of the difference is the exciton binding energy: the two codes
+bind alike on the 3 × 3 × 1 grid, LORRAX's binding falls as the BSE grid
+densifies, and the plane-wave dual-grid result keeps the coarse-grid value.
+A direct 6 × 6 × 1 control is closer to LORRAX's interpolation; the results
+page gives the numbers. Small solver residuals certify
 the retained eigensolve, not the accuracy of its coarse-to-fine construction.
 The [results page](https://github.com/jackmcarthur/lorrax/blob/main/examples/MoS2_SOC_2026/results/README.md) gives the measured GW and optical
 differences, reader controls and numerical provenance separately.
