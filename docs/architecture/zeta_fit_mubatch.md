@@ -218,6 +218,13 @@ M_q = conj(Z_q) diag(v) Z_qᵀ, applies C⁺ twice to a product formed before th
 solve, so its rounding error grows as ε·κ(C)² instead of ε·κ(C).
 `LORRAX_DEBUG_PRINT` also forms that product and prints the difference.
 
+When ζ is formed on matrix faces, both single-channel and cross-channel
+Coulomb products use the shared distributed GEMM owner for
+`conj(ζ_left) diag(v) ζ_rightᵀ`. Its bounded face product keeps both matrix
+axes distributed; an implicit einsum can otherwise form a partial V with
+one whole centroid axis before slicing the final face. Shell extraction
+and the q-owner LU route retain their existing equations.
+
 The V_q consumer names the columns to keep (`v_q_g_flat._head_shell`): slot 0
 for the full-zone g0, the IBZ one-leg unfold sources, and the head channel's
 slots (`vcoul.head_slot_table(...).sel`). `ZetaG.head_columns(sel)` reads them

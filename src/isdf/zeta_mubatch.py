@@ -1061,6 +1061,17 @@ _FACE_KINDS = ('rank_truncate', 'inverse')
 _FACE_CHAINS: dict = {}     # (kernels, operand signature) -> the face zeta pass's executables
 
 
+def _face_coulomb_gram(mesh, left, weights, right):
+    """``conj(left) diag(weights) right.T`` through the bounded face GEMM owner.
+
+    Inputs are ``(q, mu, G)`` at ``P(None,'x','y')``; the result is a
+    two-axis matrix face. No implicit partial whole-mu output is formed.
+    """
+    from distrib_la import matmul
+    return matmul(jnp.conj(left) * weights[:, None, :], right,
+                  transb="T", mesh=mesh, batched_route="auto")
+
+
 def _face_kernels(mesh, Q, g_tile, with_v, inverse=False):
     """The face channels' per-tile programs: Z (q-owner) -> its first Q rows at
     ``P(None,'x','y')``; ζ = B(BᴴZ) by two face GEMMs (``inverse``: ζ = C⁻¹Z, one); then ζ
@@ -1092,7 +1103,7 @@ def _face_kernels(mesh, Q, g_tile, with_v, inverse=False):
         zeta = jnp.where(mask[:, None, :], zeta, 0)
         if with_v:
             vt = jnp.where(mask, jnp.take(v, jnp.clip(g_idx, 0, v.shape[-1] - 1), axis=1), 0)
-            V = jax.lax.with_sharding_constraint(V + jnp.einsum('qmg,qg,qng->qmn', jnp.conj(zeta), vt, zeta), face)
+            V = jax.lax.with_sharding_constraint(V + _face_coulomb_gram(mesh, zeta, vt, zeta), face)
         hit = (sl[:, None, :] == g_idx[None, :, None]).astype(zeta.dtype)
         S = jax.lax.with_sharding_constraint(S + jnp.einsum('qmg,qgs->qms', zeta, hit), mush)
         return V, S, jax.lax.with_sharding_constraint(zeta, mush)
@@ -1315,8 +1326,8 @@ def _face_pair_kernel(mesh, g_tile, pairs, n_z):
         mask = g_idx[None, :] < ngk[:, None]                                   # (q, g)
         Z = tuple(jnp.where(mask[:, None, :], z, 0) for z in Z)
         cols = jnp.clip(g_idx, 0, v.shape[-1] - 1)
-        V = tuple(jax.lax.with_sharding_constraint(V[i] + jnp.einsum(
-            'qmg,qg,qng->qmn', jnp.conj(Z[a]), jnp.where(mask, jnp.take(v[i], cols, axis=1), 0), Z[b]),
+        V = tuple(jax.lax.with_sharding_constraint(V[i] + _face_coulomb_gram(
+            mesh, Z[a], jnp.where(mask, jnp.take(v[i], cols, axis=1), 0), Z[b]),
             face) for i, (a, b) in enumerate(pairs))
         hit = (sl[:, None, :] == g_idx[None, :, None]).astype(Z[0].dtype)
         S = tuple(jax.lax.with_sharding_constraint(S[a] + jnp.einsum('qmg,qgs->qms', Z[a], hit), mush)
