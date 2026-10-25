@@ -344,6 +344,13 @@ per rank. The fused kernel runs at 2.27× the flop floor.
 Without `full_bse = false`, `the eigensolve` ignores `solver`, `block_size` and
 `lanczos_n_reorth` without a message (`bse/bse_lanczos.py:118-121`).
 
+Block Lanczos seeds name physical support by its logical band/k extents,
+not a host transition mask or index list. The existing subspace layout
+constrains the logical-shaped Gaussian draw before zero-padding; physical
+draw order and the supported-space exhaustion count are unchanged. KPM and
+spectral-bound seeds retain their padded-shape draws and restrict them by
+band counts inside the seed program.
+
 ## Dipoles and absorption
 
 The dipole files hold velocity matrix elements. Absorption uses the position

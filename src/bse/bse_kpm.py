@@ -34,7 +34,8 @@ from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
 from .bse_stack_matvec import build_bse_stack_matvec, build_bse_stack_matvec_full
 from .bse_feast import estimate_spectral_bounds_sharded, ensure_W_R
 from .bse_head import head_shifted_eps_c
-from .bse_io import (load_bse_data_from_restart_sharded, pad_zone_mask_np)
+from .bse_io import load_bse_data_from_restart_sharded
+from .bse_window import restrict_to_physical_transitions
 from file_io.restart_bundle import (_find_restart_file)
 import common.timing as timing
 from common.units import RYD_TO_EV
@@ -99,41 +100,22 @@ def make_bse_random_vector(data, use_tda):
     dtype_real = data["eps_c"].dtype
     dtype_cplx = jnp.complex64 if dtype_real == jnp.float32 else jnp.complex128
 
-    # ONE spelling of "restrict to the physical block" — bse_io owns the
-    # band pad, so it owns the mask.  This was the only masked seed in BSE;
-    # the others are now either masked through the same helper
-    # (bse_feast.estimate_spectral_bounds_sharded), built from ψ and hence
-    # exactly zero on the pad by bilinearity (dipoles, w_omega_chain's seed
-    # block), or restricted by count at construction
-    # (bse_davidson_helpers.init_bse_subspace).
-    mask = jnp.asarray(
-        pad_zone_mask_np(n_cond, n_val, n_cond_pad, n_val_pad, nk),
-        dtype=dtype_real)
-
+    # The window owner restricts both branches by logical band counts
+    # inside the seed program; no transition mask is captured here.
     shape_1 = (1, n_cond_pad, n_val_pad, nk)
 
     if use_tda:
         def fn(key):
             x = 2.0 * jax.random.bernoulli(key, shape=shape_1).astype(dtype_real) - 1.0
-            return (x * mask).astype(dtype_cplx)
+            return restrict_to_physical_transitions(x, n_cond, n_val).astype(dtype_cplx)
     else:
-        # NO SECOND COPY OF THE MASK.  This used to be
-        # ``mask_full = jnp.stack([mask, mask], axis=0)`` — a materialised
-        # (2, 1, nc_pad, nv_pad, nk) duplicate, captured in the closure and
-        # therefore resident for the whole KPM run alongside ``mask``
-        # itself, i.e. 3× one BSE vector of pad mask for a window that is
-        # the SAME on both stack halves.  ``mask`` is (1, nc_pad, nv_pad,
-        # nk) and ``x`` is (2, 1, nc_pad, nv_pad, nk); NumPy broadcasting
-        # aligns trailing axes, so ``x * mask`` expands the mask to
-        # (1, 1, nc_pad, nv_pad, nk) and applies it to both halves —
-        # elementwise-identical to the stacked form, bit for bit, with no
-        # buffer.  (Gated in tests/test_bse_kpm_pad_mask_broadcast.py.)
+        # Both physical branches use the same count-derived support.
         def fn(key):
             k_x, k_y = jax.random.split(key)
             x0 = 2.0 * jax.random.bernoulli(k_x, shape=shape_1).astype(dtype_real) - 1.0
             x1 = 2.0 * jax.random.bernoulli(k_y, shape=shape_1).astype(dtype_real) - 1.0
             x = jnp.stack([x0, x1], axis=0)
-            return (x * mask).astype(dtype_cplx)
+            return restrict_to_physical_transitions(x, n_cond, n_val).astype(dtype_cplx)
 
     return fn
 
