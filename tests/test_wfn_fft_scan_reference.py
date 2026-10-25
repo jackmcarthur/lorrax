@@ -71,6 +71,9 @@ def test_flat_box_indices_preserve_large_offsets():
         wide = jax.jit(lambda x: _flat_box_indices(x, 1_500_000_000))(huge)
         np.testing.assert_array_equal(wide, [[0, 1_500_000_000], [3_000_000_000, 3_000_000_001]])
         assert wide.dtype == jnp.int64
+        clipped = jax.jit(lambda i: jnp.take(jnp.array([11, 17]), i, mode='clip'))(
+            jnp.array([3_000_000_001], dtype=jnp.int64))
+        np.testing.assert_array_equal(clipped, [17])
         inverse = jnp.array([[0, 1], [2, 3]], dtype=jnp.int32)
         ordinary = _flat_box_indices(inverse, 3)
         np.testing.assert_array_equal(ordinary, [[0, 1], [6, 7]])
