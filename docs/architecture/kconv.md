@@ -667,6 +667,8 @@ contraction bit for bit on A100. It needs a 64-column bank,
 $64\cdot16\cdot\big((n_{kx}n_{ky}(n_{kz}|1))|1\big)$ bytes, within the
 opt-in memory (`ffi.fft.klead_outer_refusal`).
 
+Both native outer providers require complex128 operands. The BSE route owner keeps complex64 and mixed operands on the existing materialized convolution without casts. The XLA reference composition retains its supported dtypes.
+
 `make_local_kconv_klead_outer_decode` also forms the decode's
 $A[k,c,b,\nu] = \sum_{a,\mu}\overline{\psi_c[k,c,a,\mu]}\,U[k,a,\mu,b,\nu]$ ($\psi_c$ the conduction wavefunctions at the centroids) in the store,
 so $U$ never reaches HBM: one resident block per SM, two 8-warp groups
