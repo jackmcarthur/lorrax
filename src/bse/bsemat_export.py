@@ -1132,6 +1132,7 @@ def run_bsemat_exports(*, input_file, wfn_co, n_val, n_cond, outputs, rcond=A.RC
         raise
     if all(o["mu_small"] is None for o in outputs):
         ctx["V_flat"] = None                         # past the split only the downfold reads V
+        ctx["psi_win"] = None                        # likewise its unrotated band window
     w1, t_shared = _stage_walls(), time.time() - t0
     shared = {n: w1[f"bsemat.{n}"] - w0.get(f"bsemat.{n}", 0.0)
               for n in SHARED_STAGES if f"bsemat.{n}" in w1}
@@ -1526,6 +1527,7 @@ def _write_output(ctx, out, *, release):
                 return tuple(jnp.pad(a, ((0,0),(0,-(-a.shape[1]//divisor)*divisor-a.shape[1]),
                                          (0,0),(0,0))) for a in legs)
             psi_1, psi_2 = file_bands(v, c)
+            del v, c
             p1x, p1y = _psi_views(psi_1, mesh_xy)
             p2x, p2y = _psi_views(psi_2, mesh_xy)
 
@@ -1545,6 +1547,8 @@ def _write_output(ctx, out, *, release):
                 df_fig = dfo["fig"]
                 p1x, p1y = _psi_views(psi_1, mesh_xy)
                 p2x, p2y = _psi_views(psi_2, mesh_xy)
+                del dfo
+        del psi_1, psi_2                              # final readers are the prepared X/Y faces
         V_flat = None
 
         # Exchange operands: C_{n2 n1}(k) = Σ conj(ψ_n2) ψ_n1, T = C V̄_Γ.
