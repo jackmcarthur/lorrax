@@ -812,8 +812,9 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
     keeps its full ``(q, μ_X, ν_Y)`` sharding. The typed load, Green builders
     and placement loop are the direct response stream's owners. Window sizes
     follow the fixed tile, never the memory budget or the node weights.
-    Inputs are prepared by :func:`subtile_stream.green_operand_program`: left
-    μ-major for axis, spin-major for face; right already conjugated and merged.
+    Axis inputs are preformed by :func:`subtile_stream.green_operand_program`;
+    face inputs borrow the canonical raw arrays, so the compiled consumer
+    owns any right conjugation/layout workspace.
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
@@ -824,7 +825,7 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
     from .wavefunction_bundle import CHI_Q_SPEC as _chi_spec, CHI_R_SPEC as _chi_R_spec
 
     psi_mun_spec = GREEN_ROWS_SPEC if layout == "axis" else P(None, None, "x", "y")
-    right_spec = P(None, None, "y") if layout == "axis" else P(None, "x", "y")
+    right_spec = P(None, None, "y") if layout == "axis" else P(None, "x", None, "y")
     nk_in, nb_full, n_rmu, ns = (int(v) for v in face_shape)
     if nk_in != k_unfold_plan.n_parent or k_unfold_plan.n_full != nk:
         raise ValueError("chi parent plan: face k extent or full-k extent disagrees with its plan.")
@@ -856,7 +857,7 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
         acc0 = jax.lax.with_sharding_constraint(
             jnp.zeros((n_out, nk, n_rmu, n_rmu), dtype=jnp.complex128), acc_shard)
         alpha_rows = nodes.alpha[:, None] if n_out == 1 else jnp.transpose(nodes.alpha)
-        # Both Green operands are placed once outside all rows and τ nodes.
+        # Axis banks or borrowed canonical faces stay outside all rows and τ nodes.
         load = DeviceLoadTables(*placed)
 
         def prepare(window):
@@ -879,9 +880,10 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
                 tau = jnp.real(t_scalar).astype(jnp.float64) if real_t else t_scalar
                 t_c = tau if real_t else jnp.conj(tau)
                 green = lambda t, ref, mask: build_G_tau(
-                    left, None, enk_full, t, e_ref=ref, mask=mask, layout=layout,
+                    left, right if layout == "face" else None, enk_full, t,
+                    e_ref=ref, mask=mask, layout=layout,
                     gemm=g_plan, k_unfold_plan=k_unfold_plan, trim_zero_bands=True,
-                    unfold=False, real_weights=real_t, right=right)
+                    unfold=False, real_weights=real_t, right=right if layout == "axis" else None)
                 Gv = green(-tau, vmax, mask_v)
                 Gc = green(t_c, cmin, mask_c)
                 partners = () if Gv.conj_partner else (Gv.transpose, Gc.transpose)

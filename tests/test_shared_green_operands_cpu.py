@@ -59,8 +59,9 @@ def test_admission_execution_and_no_payload_cache(monkeypatch, side, projection)
             l, r, *projectors = prepared
             if layout == 'axis':
                 l = S.window_green_rows(l, mesh)
-            value = build_G_parents(l, None, phases=weights, layout=layout,
-                gemm=gm, k_unfold_plan=plan, real_weights=False, right=r)
+            value = build_G_parents(l, r if layout == 'face' else None,
+                phases=weights, layout=layout, gemm=gm, k_unfold_plan=plan,
+                real_weights=False, right=r if layout == 'axis' else None)
             # Both antiunitary operands matter. Optional projection faces are
             # returned too, so their exact placement is tested independently.
             return value.G, value.transpose, tuple(projectors)
@@ -81,6 +82,12 @@ def test_admission_execution_and_no_payload_cache(monkeypatch, side, projection)
             chosen, prepared, ex = S.prepare_green_operands(
                 faces, mesh, build, label='test Green', _force_layout=layout)
             assert chosen == layout
+            if layout == 'face':
+                assert prepared[0] is faces[0] and prepared[1] is faces[1]
+                placed = S.green_operand_program(mesh, layout).lower(*faces).compile()
+                assert len(placed.out_info) == (2 if projection else 0)
+                if not projection:
+                    assert compiled_new_bytes(placed) == 0
             got, partner, projectors = ex(prepared, weights)
             np.testing.assert_allclose(got, expected, rtol=3e-12, atol=2e-11)
             np.testing.assert_allclose(partner, expected_partner, rtol=3e-12, atol=2e-11)

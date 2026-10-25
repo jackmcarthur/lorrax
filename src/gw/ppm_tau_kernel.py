@@ -244,19 +244,20 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
         local GEMM at every node (``real_weights=False``): no device predicate
         stops the node loop, and the partner is the one the face route's
         single exchange formed.  A static node's weights are real, so its
-        partner is conj(G), read on the mode-7 load.  ``g_right`` is the
-        GEMM's right operand (``green_right_operand`` of the band-complete
-        columns), formed once per Σ call (:func:`subtile_stream.green_operand_program`): every
-        τ node, row pass and bracket reads it,
+        partner is conj(G), read on the mode-7 load. ``g_right`` is the
+        preformed axis right operand or the borrowed canonical right face.
+        A face build owns its conjugation/layout workspace, rather than
+        retaining a separate full face beside every convolution. For axis,
+        every τ node, row pass and bracket reads the same preformed operand,
         and the partner is ``conj(A·diag(w*)·B)`` from the same two operands.
         """
         options = dict(e_ref=ref, layout=sum_layout, gemm=gemm, k_unfold_plan=k_unfold_plan,
                        band_range=band_range, trim_zero_bands=True, unfold=False,
-                       real_weights=bool(static), right=g_right)
+                       real_weights=bool(static), right=g_right if sum_layout == "axis" else None)
         options["mask" if sel.dtype == jnp.bool_ else "band_weight"] = sel
         if energy_windows:
             options.update(E_min=E_min, E_max=E_max)
-        return build_G_tau(psi_p, None, E, 1j * t, **options)
+        return build_G_tau(psi_p, g_right if sum_layout == "face" else None, E, 1j * t, **options)
 
     def _kernel_impl(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                      E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q, W_pt=None, load=None,
@@ -264,10 +265,10 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
         if load is None or g_load is None:
             raise ValueError("Sigma tau: W on the q wedge and the Green kconv call need their device "
                              "load tables (load, g_load = sigma_kconv_tables)")
-        # The left Green rows arrive μ-major and the right ones as the Green's right
-        # operand (subtile_stream.green_operand_program, once per Σ call).
+        # Axis operands arrive preformed; face operands remain the borrowed
+        # canonical arrays, including the right face's separate spin axis.
         rows_spec = GREEN_ROWS_SPEC if sum_layout == "axis" else P(None, None, "x", "y")
-        right_spec = P(None, None, "y") if sum_layout == "axis" else P(None, "x", "y")
+        right_spec = P(None, None, "y") if sum_layout == "axis" else P(None, "x", None, "y")
         rows_all = jax.lax.with_sharding_constraint(psi_coh_xn, NamedSharding(mesh_xy, rows_spec))
         g_right = jax.lax.with_sharding_constraint(psi_coh_yr, NamedSharding(mesh_xy, right_spec))
         left_all, right_all = projection_complete(psi_proj_xr, psi_proj_yn, mesh_xy)

@@ -542,10 +542,13 @@ operand placement and the complete consumer before allocating band-complete ψ.
 If that live set fits, the axis layout gathers each sum band once and keeps
 local Green GEMMs inside every row/node scan. Otherwise the summed-band ψ stays
 on its canonical 2D faces and each row pass uses the shared bounded SUMMA Green
-product. In either layout the conjugated, merged right operand is formed once
-outside all row and node loops. The two axis banks occupy
-`32·n_par·n_s·N_b·μ/sqrt(P)` bytes, or `32·n_par·n_s·N_b·μ/P` on faces,
-beside the original ψ owners. Σ additionally places its small QP projector on
+product. The axis layout forms its conjugated, merged right operand once
+outside all row and node loops. The face layout borrows both canonical
+Green faces directly; its compiled consumer includes any right
+conjugation/layout workspace, without retaining a separately prepared
+whole-wavefunction copy beside every convolution. The two axis banks occupy
+`32·n_par·n_s·N_b·μ/sqrt(P)` bytes beside the original ψ owners. FACE retains
+no additional full Green banks. Σ additionally places its small QP projector on
 axis carriers, `16·n_par·n_s·N_bΣ·(μ/P_x + μ/P_y)`.
 
 Admission uses the largest compiled new-byte figure over ranks: the maximum

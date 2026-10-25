@@ -126,9 +126,10 @@ def test_rows_full_and_independent_reference(monkeypatch, side, ns, anti, n_out)
                                        err_msg=f'full/reference contour={contour} real_times={real_times}')
             for tile in (1 << 30, 8192):
                 monkeypatch.setattr(tiles, 'TILE_BYTES', tile)
-                from gw.subtile_stream import green_operand_program
+                from gw.subtile_stream import green_operand_program, _with_borrowed_green_faces
                 for layout in ('face', 'axis'):
-                    prepared = green_operand_program(mesh, layout)(pm, pn)
+                    placed = green_operand_program(mesh, layout)(pm, pn)
+                    prepared = _with_borrowed_green_faces(layout, (pm, pn), placed)
                     kernel = W._get_chi_minimax_kernel_fused(mesh, grid, 6, n_out, contour,
                         (np_, nb, mu, ns), k_unfold_plan=plan, real_times=real_times,
                         layout=layout)
