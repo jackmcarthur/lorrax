@@ -615,6 +615,12 @@ The runtime also chooses the JAX coordinator (the step's first host, on a port d
 
 A multi-process CPU run additionally sources `config/perlmutter/cpu_mpi_env.sh`, which sets `JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`, `MPITRAMPOLINE_LIB` to the MPIwrapper library, `LD_PRELOAD=/opt/cray/pe/lib64/libpmi.so.0`, `JAX_NUM_CPU_DEVICES=1` and `MPICH_ASYNC_PROGRESS=1`.
 
+The CPU adapter manifest fingerprints `cpu_mpi_config.sh`, its builder, the
+rank prelude and the one-MPI gate. After updating from an older manifest,
+run `config/perlmutter/build_mpiwrapper.sh` once on a CPU compute node;
+the prelude prints that command if a refresh is required. CUDA-only changes
+to site defaults no longer invalidate the CPU adapter.
+
 ### Perlmutter: the module {: #perlmutter-module }
 
 ```bash
