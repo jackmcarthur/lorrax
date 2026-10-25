@@ -140,7 +140,9 @@ def restrict_to_physical_transitions(x, n_cond, n_val):
     k and all leading axes, without a host transition mask.
     """
     nc, nv = x.shape[-3:-1]
-    if not (0 < int(n_cond) <= nc and 0 < int(n_val) <= nv):
+    if (any(not isinstance(n, (int, np.integer)) or isinstance(n, bool)
+            for n in (n_cond, n_val)) or
+            not (0 <= n_cond <= nc and 0 <= n_val <= nv)):
         raise ValueError('physical transition counts must be within padded band extents')
     physical = ((jnp.arange(nc)[:, None, None] < n_cond)
                 & (jnp.arange(nv)[None, :, None] < n_val))

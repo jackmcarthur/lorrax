@@ -12,7 +12,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from bse.bse_kpm import make_bse_random_vector
-from bse.bse_window import restrict_to_physical_transitions
+from bse.bse_window import pad_zone_mask, restrict_to_physical_transitions
 from distrib_la.subspace import DistributedSubspacePlan
 from solvers.lanczos import (_supported_start_block, block_lanczos_eig_jit,
                              block_lanczos_eig_jit_converged)
@@ -152,3 +152,17 @@ def test_kpm_and_spectral_bound_seeds_preserve_samples_without_host_masks():
     np.testing.assert_allclose(namespace['_make_random_vector'](key), old, rtol=3e-15, atol=3e-15)
     for name in ('bse_kpm.py', 'bse_feast.py', 'bse_lanczos.py', 'exciton_bands.py'):
         assert 'pad_zone_mask_np' not in (ROOT/'src/bse'/name).read_text()
+
+
+def test_physical_masks_preserve_empty_support_and_refuse_noninteger_counts():
+    x = jnp.ones((2, 4, 6, 7), jnp.complex128)
+    data = dict(nkx=7, nky=1, nkz=1, n_cond_pad=4, n_val_pad=6,
+                eps_c=jnp.zeros((7, 4), jnp.float64))
+    for nc, nv in ((0, 5), (3, 0), (0, 0)):
+        assert not np.any(restrict_to_physical_transitions(x, nc, nv))
+        mask = pad_zone_mask(dict(data, n_cond=nc, n_val=nv))
+        assert mask.shape == (1, 4, 6, 7) and mask.dtype == jnp.float64
+        assert not np.any(mask)
+    for nc, nv in ((-1, 5), (3, -1), (5, 5), (3, 7), (2.5, 5), (3, 4.5), (True, 5)):
+        with pytest.raises(ValueError, match='transition counts'):
+            restrict_to_physical_transitions(x, nc, nv)
