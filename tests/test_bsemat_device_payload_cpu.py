@@ -76,7 +76,7 @@ def test_sharded_export_rows_match_literal_all_four_parts(side,ns):
     from bse.bsemat_export import _psi_views, _row_programs
     from bse import bsemat_algebra as A
     mesh=Mesh(np.array(jax.devices()[:side*side]).reshape(side,side),('x','y'))
-    nk,nv,nc,mu=2,3,2,side*side*2
+    nk,nv,nc,mu=2,3,2,side*side*5
     rng=np.random.default_rng(403+side+ns)
     draw=lambda shape:rng.normal(size=shape)+1j*rng.normal(size=shape)
     v,c=draw((nk,nv,ns,mu)),draw((nk,nc,ns,mu))
@@ -107,11 +107,17 @@ def test_sharded_export_rows_match_literal_all_four_parts(side,ns):
         observed=executable(*args,kp)
         full='c128['+','.join(map(str,(nk,cp.shape[1],cp.shape[1],vp.shape[1],vp.shape[1])))+']'
         assert full not in executable.as_text()
+        # The old unconstrained Ccc@W contraction gathered the full mu
+        # height of W while retaining only its column-axis partition.
+        # The actual fixed SUMMA program must keep that mu^2 field tiled.
+        for shape in ((nk,mu,mu//side),(nk,mu//side,mu),(nk,mu,mu)):
+            large='c128['+','.join(map(str,shape))+']'
+            assert large not in executable.as_text()
         for parts,want in zip(observed,exact):
             got=parts[0,...,0]+1j*parts[0,...,1]
             want=want.transpose(0,2,1,4,3)
             np.testing.assert_allclose(np.asarray(got)[:,:nc,:nc,:nv,:nv],want,rtol=3e-13,atol=3e-12)
-            assert parts.sharding.is_equivalent_to(NamedSharding(mesh,P(None,None,'x',None,'y',None,None)),7)
+            assert parts.sharding.is_equivalent_to(NamedSharding(mesh,P(None,None,None,'x',None,'y',None)),7)
             assert not parts.sharding.is_fully_replicated
         got=exchange(jax.device_put(tcp,NamedSharding(mesh,P(None,None,None,'y'))),
                      jax.device_put(cvp,NamedSharding(mesh,P(None,None,None,'y'))),kp,omega=7.)

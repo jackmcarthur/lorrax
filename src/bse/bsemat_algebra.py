@@ -162,7 +162,7 @@ def pair_amplitudes(psi_l, psi_r, xp=np):
     return xp.einsum("knsm,kpsm->knpm", xp.conj(psi_l), psi_r)
 
 
-def direct_parts(Ccc, Cvv, Wq, z, y, W11, *, omega, lam_q, xp=np):
+def direct_parts(Ccc, Cvv, Wq, z, y, W11, *, omega, lam_q, xp=np, matmul=None):
     """E7: BerkeleyGW head, wing and body of a batch of (k, k′) pairs.
 
     Parameters
@@ -174,14 +174,26 @@ def direct_parts(Ccc, Cvv, Wq, z, y, W11, *, omega, lam_q, xp=np):
     W11 : (b,) — plane-wave head of each pair's q (E4).
     omega : float — cell volume, bohr³.
     lam_q : (b,) — |q| on an untruncated 3D deck, 1 with truncation (E1b).
+    matmul : callable, optional
+        Existing matrix-product owner for the two centroid contractions.
+        Accepts ``(A, B, transb='N'|'C')``; the default is xp.matmul.
 
     Returns
     -------
     head, wing, body : (b, nc, nc′, nv, nv′) complex, in BerkeleyGW's units
         (head dimensionless; wing and body bohr², i.e. W/8π).
     """
-    t = xp.einsum("bcdm,bmn->bcdn", Ccc, Wq)
-    full = xp.einsum("bcdn,bwun->bcdwu", t, xp.conj(Cvv))
+    if matmul is None:
+        def matmul(a, b, *, transb="N"):
+            if transb == "C":
+                b = xp.conj(xp.swapaxes(b, -1, -2))
+            return a @ b
+    batch, nc, ncp, mu = Ccc.shape
+    nv, nvp = Cvv.shape[1:3]
+    cc = Ccc.reshape(batch, nc*ncp, mu)
+    vv = Cvv.reshape(batch, nv*nvp, Cvv.shape[-1])
+    t = matmul(cc, Wq)
+    full = matmul(t, vv, transb="C").reshape(batch, nc, ncp, nv, nvp)
     m_c = xp.einsum("bcdm,bm->bcd", Ccc, xp.conj(z))
     m_v = xp.einsum("bwum,bm->bwu", Cvv, xp.conj(z))
     n_c = xp.einsum("bcdm,bm->bcd", Ccc, xp.conj(y))

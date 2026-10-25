@@ -847,9 +847,9 @@ def gauge_map(psi, *, wfn_co, k_rows, bands_abs, centroid_frac, fft_grid, nv, en
 # 5. one k′ row: E7 and the exchange row
 # ---------------------------------------------------------------------------
 
-@partial(jax.jit, static_argnames=("omega",))
+@partial(jax.jit, static_argnames=("omega", "mesh_xy"))
 def _direct_row(psiL_X, psiL_Y, psiR_X, psiR_Y, W_flat, iq_pair, key_pair, z_keys, y_keys,
-                W11_keys, lam_pair, kp, *, omega):
+                W11_keys, lam_pair, kp, *, omega, mesh_xy):
     """BerkeleyGW (head, wing, body) of row k′ = kp for all k, (nk, n2′, n2, n1′, n1) each.
 
     ``psiL`` the n1 (valence-role) leg, ``psiR`` the n2 leg, each (nk, n, ns, μ)
@@ -860,11 +860,22 @@ def _direct_row(psiL_X, psiL_Y, psiR_X, psiR_Y, W_flat, iq_pair, key_pair, z_key
     """
     iq_row, kidx, lam_row = iq_pair[:, kp], key_pair[:, kp], lam_pair[:, kp]
     z_row, y_row, W11_row = z_keys[kidx], y_keys[kidx], W11_keys[kidx]
-    Ccc = A.pair_amplitudes(psiR_X, jnp.broadcast_to(psiR_X[kp], psiR_X.shape), xp=jnp)
-    Cvv = A.pair_amplitudes(psiL_Y, jnp.broadcast_to(psiL_Y[kp], psiL_Y.shape), xp=jnp)
+    # Split the first orbital band before forming pairs. Both partners use
+    # the existing mu-Y face; this is a local X-band selection, not a full
+    # pair tensor followed by a generic reshard.
+    pair = NamedSharding(mesh_xy,P(None,'x',None,'y'))
+    pr = jax.lax.with_sharding_constraint(psiR_Y,pair)
+    pl = jax.lax.with_sharding_constraint(psiL_Y,pair)
+    Ccc = jax.lax.with_sharding_constraint(A.pair_amplitudes(
+        pr,jnp.broadcast_to(psiR_Y[kp],psiR_Y.shape),xp=jnp),pair)
+    Cvv = jax.lax.with_sharding_constraint(A.pair_amplitudes(
+        pl,jnp.broadcast_to(psiL_Y[kp],psiL_Y.shape),xp=jnp),pair)
     Wq = jnp.moveaxis(jnp.take(W_flat, iq_row, axis=2), 2, 0)
+    Wq = jax.lax.with_sharding_constraint(Wq,NamedSharding(mesh_xy,P(None,'x','y')))
+    from distrib_la import matmul
+    product = partial(matmul,mesh=mesh_xy,batched_route='auto')
     head, wing, body = A.direct_parts(Ccc, Cvv, Wq, z_row, y_row, W11_row,
-                                      omega=omega, lam_q=lam_row, xp=jnp)
+                                      omega=omega, lam_q=lam_row, xp=jnp, matmul=product)
     order = lambda a: jnp.transpose(a, (0, 2, 1, 4, 3))
     return order(head), order(wing), order(body)
 
@@ -1001,12 +1012,13 @@ def _ri(a):
 @lru_cache(maxsize=None)
 def _row_programs(mesh_xy):
     """Existing E7 contractions with band-face outputs consumed by SlabIO."""
-    out=NamedSharding(mesh_xy,P(None,None,'x',None,'y',None,None))
+    out=NamedSharding(mesh_xy,P(None,None,None,'x',None,'y',None))
+    exchange_out=NamedSharding(mesh_xy,P(None,None,'x',None,'y',None,None))
     @partial(jax.jit,static_argnames=('omega',),out_shardings=(out,out,out))
     def direct(*operands,omega):
-        h,w,b=_direct_row.__wrapped__(*operands,omega=omega)
+        h,w,b=_direct_row.__wrapped__(*operands,omega=omega,mesh_xy=mesh_xy)
         return _ri(h),_ri(w),_ri(b)
-    @partial(jax.jit,static_argnames=('omega',),out_shardings=out)
+    @partial(jax.jit,static_argnames=('omega',),out_shardings=exchange_out)
     def exchange(*operands,omega):
         return _ri(_exchange_row.__wrapped__(*operands,omega=omega))
     return direct,exchange
