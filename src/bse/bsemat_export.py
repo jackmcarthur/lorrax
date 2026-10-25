@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import os
 import time
-from functools import partial
+from functools import lru_cache, partial
 
 import h5py
 import numpy as np
@@ -192,6 +192,7 @@ def _gauge_unitaries(A_r, B, *, nbg, w0, nv, mesh_xy):
     return u, figures
 
 
+@lru_cache(maxsize=None)
 def _head_programs(mesh_xy, *, rcond=A.RCOND):
     """The shared E3–E5 equations with device-vector and scalar outputs."""
     vec = NamedSharding(mesh_xy, P("x"))
@@ -997,6 +998,7 @@ def _ri(a):
     return jnp.stack([a.real, a.imag], axis=-1)[None]
 
 
+@lru_cache(maxsize=None)
 def _row_programs(mesh_xy):
     """Existing E7 contractions with band-face outputs consumed by SlabIO."""
     out=NamedSharding(mesh_xy,P(None,None,'x',None,'y',None,None))
