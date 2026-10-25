@@ -305,7 +305,7 @@ def fit_model(qc, Ft, P, *, r_mu, S_cart, c0, sys_dim, r_fit):
     ph = np.exp(1j * (qc[sel] @ r_mu.T))                       # (n_fit, N)
     Y = (Ft[sel] * ph[:, None, :]).reshape(sel.size, -1)
     cF = np.linalg.lstsq(A, Y, rcond=None)[0]
-    res_F = np.linalg.norm(A @ cF - Y) / np.linalg.norm(Y)
+    res_F = np.linalg.norm(A @ cF - Y) / max(np.linalg.norm(Y), 1e-300)
 
     n_L = P.shape[-1]
     q2 = qn[sel] ** 2

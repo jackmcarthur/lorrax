@@ -967,10 +967,11 @@ def read_wavefunctions(filename, input_file, mesh_xy, *, bands=None, family="cha
     return unfold_parent_faces((face,), filename, input_file, mesh_xy, family=family)[0]
 
 
-def read_lr_channels(filename):
+def read_lr_channels(filename, *, mesh):
     """W0's dressed long-range channels (group ``W0_lr``, ``gw.lr_channels``), or ``None``.
 
-    Host numpy, one row per W0 wedge q: ``Ft`` (n_q, n_L, n_rmu) canonical
+    Device Ft on all-rank centroid shards, one row per W0 wedge q;
+    small P/channel metadata stay on hosts. ``Ft`` (n_q, n_L, mu_carrier) canonical
     order, ``P`` (n_q, n_L, n_L), ``gvec`` (n_q, n_L, 3), ``v`` (n_q, n_L),
     ``q_frac`` (n_q, 3), ``n_z``, ``sys_dim``, ``head_kernel`` and ``tables``: W0's own unfold
     tables (``None`` when W0 is stored on the full zone).
@@ -980,12 +981,20 @@ def read_lr_channels(filename):
         if LR_CHANNELS_GROUP not in f:
             return None
         g = f[LR_CHANNELS_GROUP]
-        out = {k: g[k][()] for k in ("Ft", "P", "gvec", "v", "q_frac")}
+        out = {k: g[k][()] for k in ("P", "gvec", "v", "q_frac")}
+        shape, dtype = tuple(g["Ft"].shape), g["Ft"].dtype
+        out["n_mu_logical"] = int(shape[-1])
         out.update(n_z=int(g.attrs["n_z"]), sys_dim=int(g.attrs["sys_dim"]),
                    head_kernel=str(g.attrs["head_kernel"]))
         from symmetry_maps import dataset_q_storage, read_tables
         out["tables"] = (read_tables(f, "W0_qmunu")
                          if dataset_q_storage(f["W0_qmunu"]) == "ibz" else None)
+    from runtime.padding import padded_mu_extent
+    from .slab_io import SlabIO
+    with SlabIO(filename, mode="r", mesh=mesh) as io:
+        out["Ft"] = io.read_slab(f"{LR_CHANNELS_GROUP}/Ft",
+            shape=shape[:-1]+(padded_mu_extent(shape[-1], mesh),), dtype=dtype,
+            partition_spec=P(None, None, ("x", "y")))
     return out
 
 

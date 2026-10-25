@@ -225,6 +225,12 @@ centroid layouts before the physical q crop. Physical target counts remain
 metadata; padding is zeroed inside projection, and returned coefficients
 use the canonical Galerkin rank carrier over all ranks. A ragged q or prime
 centroid count therefore cannot silently drop the output sharding.
+The SR/LR W model also keeps its form-factor rows on all-rank centroid
+shards. The restart reader uses SlabIO for those rows; the unchanged
+polynomial fit acts on each process's owned centroid columns, with only two
+residual norms reduced. Coarse/fine model rows return directly to the
+device and their legal W faces. Channel-pair polarizabilities and head
+parameters remain small replicated metadata.
 
 The interpolation model uses the same distributed restart payload. After
 cleaning each coarse q block, its form factors are resharded over all ranks
