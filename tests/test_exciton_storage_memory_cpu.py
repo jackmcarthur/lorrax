@@ -99,8 +99,10 @@ def _compiled_stack_controls():
             values = values + 1j*(values[::-1] + .25)
             energies = np.arange(3*4*nc, dtype=np.float64).reshape(12, nc)
             yspec = fit_sharding(mesh, P(None, None, None, "y"), (12, nc, ns, mu))
-            y = jax.device_put(values.reshape(12, nc, ns, mu), yspec)
-            eps = jax.device_put(energies, rep)
+            # The consuming owner receives device-owned buffers. CPU device_put
+            # may otherwise borrow aligned NumPy storage and prevent donation.
+            y = jax.device_put(values.reshape(12, nc, ns, mu), yspec).copy()
+            eps = jax.device_put(energies, rep).copy()
             # P1 explicitly exercises X/Y sharing one underlying allocation.
             tx = y if p == 1 else jax.device_put(values.reshape(12, nc, ns, mu).transpose(0, 3, 1, 2),
                    fit_sharding(mesh, P(None, "x", None, None), (12, mu, nc, ns)))
