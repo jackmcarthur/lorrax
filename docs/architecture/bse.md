@@ -231,6 +231,11 @@ polynomial fit acts on each process's owned centroid columns, with only two
 residual norms reduced. Coarse/fine model rows return directly to the
 device and their legal W faces. Channel-pair polarizabilities and head
 parameters remain small replicated metadata.
+GW produces those same rows with the shared distributed GEMM panels.
+The Woodbury equation reduces only its small channel-pair matrix; its
+solve runs on local centroid RHS columns inside the manual shard region.
+The restart writes the canonical device row carrier through SlabIO at its
+physical centroid extent, with no full form-factor host deposit.
 
 The interpolation model uses the same distributed restart payload. After
 cleaning each coarse q block, its form factors are resharded over all ranks

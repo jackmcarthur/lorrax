@@ -1224,7 +1224,7 @@ LR_CHANNELS_GROUP = "W0_lr"
 
 
 def write_lr_channels_to_h5(filename, *, Ft, P, gvec, v, q_frac, n_z, sys_dim,
-                            head_kernel):
+                            head_kernel, n_rmu_logical, mesh):
     """Persist W0's dressed long-range channels beside ``W0_qmunu``.
 
     Group ``W0_lr``, one row per solve q (the W0 wedge, ``q_frac`` its
@@ -1233,11 +1233,25 @@ def write_lr_channels_to_h5(filename, *, Ft, P, gvec, v, q_frac, n_z, sys_dim,
     = F̃ χ Fᴴ; ``gvec`` (n_q, n_L, 3) the channel G in that q's frame; ``v``
     (n_q, n_L) v(q+G_a) in Ry·bohr³, the value V carries (``head_kernel``:
     ``point`` or ``minibz_average``).  W0 = J + F̃ᴴ[diag(1/v) − P]⁻¹F̃.
-    Small (n_L rows per q): rank-0 serial write.
+    Ft remains a distributed canonical centroid carrier and is written by
+    SlabIO to its physical mu extent; only channel metadata is rank-0 serial.
     """
-    arrays = dict(Ft=np.asarray(Ft, np.complex128), P=np.asarray(P, np.complex128),
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as PS
+    expected = NamedSharding(mesh, PS(None, None, ('x', 'y')))
+    if (not isinstance(Ft, jax.Array) or Ft.ndim != 3
+            or Ft.dtype != np.dtype(np.complex128)
+            or not Ft.sharding.is_equivalent_to(expected, 3)):
+        raise ValueError("LR form factors require complex128 all-rank centroid shards")
+    if not 0 < int(n_rmu_logical) <= int(Ft.shape[-1]):
+        raise ValueError('LR physical centroid count exceeds its device carrier')
+    arrays = dict(P=np.asarray(P, np.complex128),
                   gvec=np.asarray(gvec, np.int32), v=np.asarray(v, np.float64),
                   q_frac=np.asarray(q_frac, np.float64))
+    nq, nl = map(int, Ft.shape[:2])
+    shapes = dict(P=(nq, nl, nl), gvec=(nq, nl, 3), v=(nq, nl), q_frac=(nq, 3))
+    if any(arrays[key].shape != shape for key, shape in shapes.items()):
+        raise ValueError('LR channel metadata disagrees with its form-factor rows')
 
     def _write():
         with h5py.File(filename, "a") as f:
@@ -1253,8 +1267,17 @@ def write_lr_channels_to_h5(filename, *, Ft, P, gvec, v, q_frac, n_z, sys_dim,
             g.attrs["convention"] = (
                 "F_a(mu) = zeta_q(mu, G_a)/sqrt(Omega); W0 = J + Ft^H "
                 "[diag(1/v) - P]^-1 Ft (gw.lr_channels)")
+    rank0_transaction(filename, stage="restart.lr_channels.metadata", write=_write)
+    from .slab_io import SlabIO
+    name = f"{LR_CHANNELS_GROUP}/Ft"
+    with SlabIO(filename, mode='a', mesh=mesh) as io:
+        io.create_dataset(name, shape=tuple(Ft.shape[:-1])+(int(n_rmu_logical),),
+                          dtype=Ft.dtype)
+        io.write_slab(name, Ft)
+    def commit():
+        with h5py.File(filename, 'a') as f:
             set_commit_state(f, True)
-    rank0_transaction(filename, stage="restart.lr_channels", write=_write)
+    rank0_transaction(filename, stage="restart.lr_channels.commit", write=commit)
 
 
 def write_head_wings_to_h5(

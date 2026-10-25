@@ -543,10 +543,12 @@ class ZetaLoader:
         device round-trip, and — the reason this method exists rather
         than being an alias for :meth:`read_zeta_G_slab` — putting a
         collective behind an ordinary-looking ``ds[q]`` turns any future
-        rank-0-only diagnostic into a HANG instead of an error.  That is
-        the named antipattern.  Every consumer of this is a replicated
-        host-side diagnostic; a caller that wants the distributed read
-        wants :meth:`read_zeta_G_slab`, which says so in its name.
+        rank-0-only diagnostic into a HANG instead of an error. A diagnostic
+        may read the same window on each rank; the skinny LR-channel owner
+        instead requests only its device-owned mu window and selected G
+        columns. This method never assembles a global array. Whole sharded
+        sphere slabs use :meth:`read_zeta_G_slab`, whose name states that
+        collective contract.
 
         The two plans are byte-identical where they overlap: both return
         the same on-disk elements and neither reduces.  The agreement

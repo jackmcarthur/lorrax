@@ -32,6 +32,7 @@ order; the restart group is ``W0_lr`` (``file_io.tagged_arrays.write_lr_channels
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 
 import numpy as np
 from common.log import get_logger
@@ -70,22 +71,30 @@ def dress(F, Fchi, chiFh, FchiW, v):
     """
     G = F + FchiW
     Q = G @ chiFh
-    A = np.eye(Q.shape[-1])[None] + Q * v[:, None, :]
-    Ft = np.linalg.solve(A, G)
-    P = np.linalg.solve(A, Q)
-    return Ft, 0.5 * (P + np.conj(np.swapaxes(P, -1, -2)))
+    return _solve_dressed_rows(G, Q, v)
 
 
-def read_channel_rows(zeta_path, q_frac, *, sys_dim, kgrid, mc_average_vcoul_body):
+def _solve_dressed_rows(G, Q, v):
+    """The small-channel Woodbury solve, independent of centroid ownership."""
+    import jax.numpy as jnp
+    A = jnp.eye(Q.shape[-1])[None] + Q * v[:, None, :]
+    Ft = jnp.linalg.solve(A, G)
+    P = jnp.linalg.solve(A, Q)
+    return Ft, 0.5 * (P + jnp.conj(jnp.swapaxes(P, -1, -2)))
+
+
+def read_channel_rows(zeta_path, q_frac, *, sys_dim, kgrid, mc_average_vcoul_body, mesh_xy):
     """Bare channel rows F (n_q, n_L, n_rmu) in canonical order, and the channel table.
 
-    One host hyperslab of n_L columns per q from ``zeta_q_G`` (the q rows of
+    Owned centroid hyperslabs of n_L columns per q from ``zeta_q_G`` (the q rows of
     the file are the solve's q list); a channel outside the stored sphere is
     a refusal, never a zero.  The lattice (blat·bvec) and Ω are the file's
     own mean-field header.  The channel kernel is the value V carries: the
     head slot takes ``v_q_g_flat.v_head_fn_in_V`` (the mini-BZ average on a
     3D ``mc_average_vcoul_body`` deck), so V_b = V − Fᴴ diag(v) F is V
-    without those slots.  Returns ``(F, channels, n_z, head_kernel)``.
+    without those slots. F returns on the all-rank centroid carrier; physical
+    extent is the fifth return value. No process constructs full host F.
+    Returns ``(F, channels, n_z, head_kernel, n_rmu_logical)``.
     """
     from .v_q_g_flat import v_head_fn_in_V
     from ffi import _services
@@ -110,20 +119,102 @@ def read_channel_rows(zeta_path, q_frac, *, sys_dim, kgrid, mc_average_vcoul_bod
                 f"GATE lr_channel_q_rows: {zeta_path} holds {gcomp.shape[0]} q "
                 f"rows; want the solve's {len(q_frac)}; why: the channel rows "
                 "would pair with another q's χ₀ and W.")
-        F = np.empty((len(q_frac), ch.gvec.shape[1], n_rmu), np.complex128)
+        slots_by_q = []
         for qi in range(len(q_frac)):
             lut = {tuple(g): i for i, g in enumerate(gcomp[qi, :, :ngk[qi]].T)}
             slots = [lut.get(tuple(int(x) for x in g)) for g in ch.gvec[qi]]
-            if any(s is None for s in slots):
+            if any(slot is None for slot in slots):
                 raise ValueError(
                     f"GATE lr_channel_in_sphere: q {qi} channel G "
-                    f"{ch.gvec[qi].tolist()} not all in the ζ sphere; want "
-                    "every long-range channel stored; fix: raise the ζ cutoff.")
+                    f"{ch.gvec[qi].tolist()} not all in the zeta sphere; "
+                    "raise the zeta cutoff.")
             order = np.argsort(slots)
-            cols = zl.read_zeta_G_local((qi, slice(None), list(np.asarray(slots)[order])))
-            F[qi][order] = np.asarray(cols).T
-    return (F / np.sqrt(cell_volume), ch, n_z,
-            "point" if vfn is None else "minibz_average")
+            slots_by_q.append((order, list(np.asarray(slots)[order])))
+        from common.collectives import agree_io_error, device_put_process_tiles
+        from jax.sharding import NamedSharding, PartitionSpec as P
+        from runtime.padding import padded_mu_extent
+        carrier = padded_mu_extent(n_rmu, mesh_xy)
+        shape = (len(q_frac), ch.gvec.shape[1], carrier)
+        def tile(index):
+            mu = index[-1]
+            lo, hi = int(mu.start or 0), min(int(mu.stop or carrier), n_rmu)
+            value = np.zeros((shape[0], shape[1], int(mu.stop or carrier)-lo), np.complex128)
+            if hi > lo:
+                for qi, (order, slots) in enumerate(slots_by_q):
+                    block = zl.read_zeta_G_local((qi, slice(lo, hi), slots))
+                    value[qi, order, :hi-lo] = np.asarray(block).T
+            return value[index[:-1]]/np.sqrt(cell_volume)
+        from common.gpu_utils import device_budget_bytes
+        from lxkit import memory
+        device_budget_bytes()
+        memory.admit('bare LR rows', (('owned centroid channels', memory.priced(
+            0, 'placed bare long-range rows', spread=16*int(np.prod(shape)),
+            ranks=int(mesh_xy.size))),), memory.room(bucketed=False))
+        F, error = None, None
+        try:
+            F = device_put_process_tiles(shape,
+                NamedSharding(mesh_xy, P(None, None, ('x', 'y'))), tile)
+        except Exception as exc:
+            error = exc
+        agree_io_error(error, path=zeta_path, stage='lr_channels.owned_channel_read')
+    return (F, ch, n_z, "point" if vfn is None else "minibz_average", n_rmu)
+
+
+@lru_cache(maxsize=None)
+def _lr_programs(mesh_xy):
+    """The existing three skinny contractions and one Woodbury equation."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    row = NamedSharding(mesh_xy, P(None, None, ('x', 'y')))
+    column = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+    rep = NamedSharding(mesh_xy, P())
+    from distrib_la import matmul
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    row_yx = NamedSharding(mesh_xy, P(None, None, ('y', 'x')))
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+    def channel_face(f):
+        n = int(f.shape[1])
+        pad = -(-n//int(np.lcm(px, py)))*int(np.lcm(px, py))
+        return jax.lax.with_sharding_constraint(
+            jnp.pad(f, ((0, 0), (0, pad-n), (0, 0))), face)
+    def left(f, c, p):
+        out = matmul(channel_face(f), c, mesh=mesh_xy, batched_route='auto')
+        out = jax.lax.with_sharding_constraint(out, row_yx)
+        return p*out[:, :f.shape[1]]
+    def right(c, f, p):
+        out = matmul(c, channel_face(f), transb='C', mesh=mesh_xy, batched_route='auto')
+        out = jax.lax.with_sharding_constraint(out, column)
+        return p*out[:, :, :f.shape[1]]
+    fchi = jax.jit(left, out_shardings=row)
+    chif = jax.jit(right, out_shardings=column)
+    fw = jax.jit(lambda f, w: left(f, w, 1.), out_shardings=row)
+    from jax import shard_map
+    def local_dressing(F, Fchi, chiFh, FchiW, v):
+        G = F+FchiW
+        # Only the channel-pair matrix is reduced. The small solve sees
+        # local mu RHS columns inside this manual region, never global G.
+        Q = jax.lax.psum(G@chiFh, ('x', 'y'))
+        return _solve_dressed_rows(G, Q, v)
+    dressed = jax.jit(shard_map(local_dressing, mesh=mesh_xy,
+        in_specs=(row.spec, row.spec, column.spec, row.spec, P()),
+        out_specs=(row.spec, P()), check_vma=False))
+    return fchi, chif, fw, dressed
+
+
+def _run_lr_program(name, program, *operands):
+    """Admit the exact skinny-row executable; all large fields stay devices."""
+    from common.gpu_utils import device_budget_bytes
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    from lxkit import memory
+    device_budget_bytes()
+    executable = program.lower(*operands).compile()
+    needed = -agreed_chunk(-compiled_new_bytes(executable))
+    ranks = int(operands[0].sharding.mesh.size)
+    memory.admit(name, (('distributed long-range rows', memory.priced(
+        0, 'compiled long-range row program', spread=needed*ranks, ranks=ranks)),),
+        memory.room(bucketed=False))
+    return executable(*operands)
 
 
 def begin(chi0_q, *, config, meta, sym, centroid_indices, wedge, mesh_xy):
@@ -153,36 +244,24 @@ def begin(chi0_q, *, config, meta, sym, centroid_indices, wedge, mesh_xy):
         if reduced:
             return None
         q_frac = np.asarray(q_frac, dtype=np.float64)
-    F, ch, n_z, head_kernel = read_channel_rows(
+    F, ch, n_z, head_kernel, n_rmu = read_channel_rows(
         zeta_path, q_frac, sys_dim=sys_dim, kgrid=meta.kgrid,
-        mc_average_vcoul_body=bool(getattr(config.head, "mc_average_vcoul_body", False)))
-    n_rmu = F.shape[-1]
+        mc_average_vcoul_body=bool(getattr(config.head, "mc_average_vcoul_body", False)),
+        mesh_xy=mesh_xy)
     basis = getattr(meta, "mu_basis", None)
-    rep = NamedSharding(mesh_xy, P())
-    # The rows are host data (n_q·n_L·N_μ·16 B, n_L ≤ 9), packed on the host
-    # and carried as two μ-sharded copies, μ on x and on y (the g0_X/g0_Y
-    # pattern), so each product contracts in χ₀'s and W's (μ_X, ν_Y) layout.
-    if basis is not None and not basis.is_identity:
-        F_run = basis.pack_host(F, axis=2)
-    else:
-        F_run = np.zeros(F.shape[:2] + (int(chi0_q.shape[-1]),), np.complex128)
-        F_run[..., :n_rmu] = F
+    F_run = basis.pack_axis(F, 2) if basis is not None else F
     if int(F_run.shape[-1]) != int(chi0_q.shape[-1]):
         raise ValueError(
-            f"lr_channels: channel rows carry {F_run.shape[-1]} centroids, χ₀ "
+            f"lr_channels: channel rows carry {F_run.shape[-1]} centroids, chi0 "
             f"{chi0_q.shape[-1]}")
-    from common.collectives import device_put_process_local
-    F_x = device_put_process_local(F_run, NamedSharding(mesh_xy, P(None, None, "x")))
-    F_y = device_put_process_local(F_run, NamedSharding(mesh_xy, P(None, None, "y")))
-    # The skinny results (n_q, n_L, N_μ) come back replicated for the host dressing.
-    fchi = jax.jit(lambda f, c: jnp.einsum("qam,qmn->qan", f, c), out_shardings=rep)
-    chif = jax.jit(lambda c, f: jnp.einsum("qmn,qan->qma", c, jnp.conj(f)), out_shardings=rep)
+    fchi, chif, _, _ = _lr_programs(mesh_xy)
     # The physical χ is the solve's prefactor times the stored χ₀:
     # W = (1 − pref·Vχ₀)⁻¹V (gw.w_isdf.solve_w).
     from .w_isdf import _w_solve_pref_scalar
     pref = _w_solve_pref_scalar(meta)
-    Fchi = pref * np.asarray(fchi(F_x, chi0_q))
-    chiFh = pref * np.asarray(chif(chi0_q, F_y))
+    Fchi = _run_lr_program("LR F chi", fchi, F_run, chi0_q, pref)
+    chiFh = _run_lr_program("LR chi Fh", chif, chi0_q, F_run, pref)
+    jax.block_until_ready((Fchi, chiFh))  # complete both reads before chi0 donation
     return dict(F_run=F_run, Fchi=Fchi, chiFh=chiFh, ch=ch, n_z=n_z,
                 head_kernel=head_kernel,
                 q_frac=q_frac, n_rmu=n_rmu, sys_dim=sys_dim, basis=basis,
@@ -196,13 +275,15 @@ def finish(state, W_q):
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     mesh_xy = state["mesh_xy"]
-    fw = jax.jit(lambda f, w: jnp.einsum("qam,qmn->qan", f, w),
-                 out_shardings=NamedSharding(mesh_xy, P()))
+    _, _, fw, dressed = _lr_programs(mesh_xy)
+    FchiW = _run_lr_program("LR F chi W", fw, state['Fchi'], W_q)
     from common.collectives import device_put_process_local
-    FchiW = np.asarray(fw(device_put_process_local(
-        state["Fchi"], NamedSharding(mesh_xy, P(None, None, "x"))), W_q))
-    Ft, Pm = dress(state["F_run"], state["Fchi"], state["chiFh"], FchiW,
-                   state["ch"].v)
+    v = device_put_process_local(state['ch'].v, NamedSharding(mesh_xy, P()))
+    Ft, P_device = _run_lr_program("LR Woodbury dressing", dressed,
+        state['F_run'], state['Fchi'], state['chiFh'], FchiW, v)
+    # P is small channel-pair metadata and deliberately replicated. Only its
+    # local replica leaves the device; no centroid row field is transferred.
+    Pm = np.asarray(P_device.addressable_data(0))
     # P = F χ_b Fᴴ, χ_b = (1 − χV_b)⁻¹χ the response to the positive V_b, is
     # negative definite for the NSD static χ₀ (MoS₂ 9×9: max λ_max/|λ_min| =
     # −9·10⁻⁵).  Γ is excluded: there the G = 0 channel's P vanishes by
@@ -226,10 +307,11 @@ def finish(state, W_q):
         return
     basis = state["basis"]
     if basis is not None and not basis.is_identity:
-        Ft = basis.unpack_host(Ft, axis=2)
+        Ft = basis.unpack_axis(Ft, 2)
     from .restart_q_storage import deposit_lr_channels
     deposit_lr_channels(dict(
-        Ft=Ft[..., :state["n_rmu"]], P=Pm, gvec=state["ch"].gvec,
+        Ft=Ft, n_rmu_logical=int(state["n_rmu"]), mesh=mesh_xy,
+        P=Pm, gvec=state["ch"].gvec,
         v=state["ch"].v, q_frac=state["q_frac"], n_z=int(state["n_z"]),
         sys_dim=int(state["sys_dim"]), head_kernel=state["head_kernel"]))
     log.debug(f"  W long-range channels: {Pm.shape[-1]} per q on {Pm.shape[0]} q "
