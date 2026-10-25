@@ -75,47 +75,61 @@ def parent_rows(irr_idx, n_parent: int, array, *, axis: int = 0):
     antiunitary action.  ``irr_idx`` maps each full-k row to its raw parent
     (``SymMaps.irr_idx_k``); every k plan (the centroid plan here, the
     plane-wave sphere plan) selects through this one function.
+
+    NumPy scalar tables stay on the host through this selection, so a
+    caller can place only the parent rows. JAX tables remain on device.
     """
     irr_idx = np.asarray(irr_idx)
-    src = jnp.asarray(array)
+    host = isinstance(array, np.ndarray)
+    src = array if host else jnp.asarray(array)
     axis = int(axis) % src.ndim
     if int(src.shape[axis]) != int(irr_idx.shape[0]):
         raise ValueError(
             "parent_rows: full-k axis has extent "
             f"{src.shape[axis]}, expected {int(irr_idx.shape[0])}.")
-    return jnp.take(src, _parent_source(irr_idx, int(n_parent)), axis=axis)
+    take = np.take if host else jnp.take
+    return take(src, _parent_source(irr_idx, int(n_parent), host=host), axis=axis)
 
 
 _PARENT_SOURCE = {}
 
 
-def _parent_source(irr_idx, n_parent: int):
-    """The raw-parent -> full-row index table of :func:`parent_rows`, placed once per k plan.
+def _parent_source(irr_idx, n_parent: int, *, host=False):
+    """The raw-parent -> full-row indices, placed lazily once per k plan.
 
     A pure function of ``(irr_idx, n_parent)``; it was rebuilt and transferred
-    on every call (per Σ window and response group).  Placed with the same
-    default placement as before, so selections are bit-identical.
+    on every call (per Σ window and response group). One cache entry keeps
+    the host indices and, only after a JAX consumer needs it, their device
+    placement. Both spellings therefore use exactly the same parent choice.
     """
     key = (irr_idx.dtype.str, irr_idx.shape, np.ascontiguousarray(irr_idx).tobytes(), n_parent)
     hit = _PARENT_SOURCE.get(key)
     if hit is not None:
-        return hit
+        source, placed = hit
+        if host or placed is not None:
+            return source if host else placed
+    else:
+        source = None
     # irr_idx maps full rows to raw WFN parent rows.  Several raw rows may
     # be symmetry-redundant, but every parent used by a child carries the
     # same scalar value.  Scatter picks one child per raw parent without
     # imposing a star-wedge gauge on wavefunctions.
-    source = np.full((int(n_parent),), -1, dtype=np.int32)
-    for full, parent in enumerate(irr_idx):
-        source[int(parent)] = int(full)
-    unused = source < 0
-    if np.any(unused):
-        # Unused raw WFN rows have no full-zone consumer.  Their values
-        # are immaterial but keeping the parent carrier rectangular makes
-        # the direct irr_idx gather simple and stable.  Fill from row zero.
-        source[unused] = 0
+    if source is None:
+        source = np.full((int(n_parent),), -1, dtype=np.int32)
+        for full, parent in enumerate(irr_idx):
+            source[int(parent)] = int(full)
+        unused = source < 0
+        if np.any(unused):
+            # Unused raw WFN rows have no full-zone consumer.  Their values
+            # are immaterial but keeping the parent carrier rectangular makes
+            # the direct irr_idx gather simple and stable.  Fill from row zero.
+            source[unused] = 0
+    if host:
+        _PARENT_SOURCE[key] = source, None
+        return source
     placed = jnp.asarray(source)
     if not isinstance(placed, jax.core.Tracer):
-        _PARENT_SOURCE[key] = placed
+        _PARENT_SOURCE[key] = source, placed
     return placed
 
 

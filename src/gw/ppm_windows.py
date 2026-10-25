@@ -86,7 +86,12 @@ def sigma_regularization_for_config(config) -> SigmaRegularization:
 
 @dataclass(frozen=True)
 class _SigmaWindow:
-    """One window consumed by the shared MPA dynamic-Sigma executor."""
+    """One window consumed by the shared MPA dynamic-Sigma executor.
+
+    ``mask_A`` is shared branch support when ``E_min``/``E_max`` are present:
+    the exact state selector is ``mask_A & (E_A > E_min) & (E_A <= E_max)``.
+    Without those bounds it is the explicit one-window selector.
+    """
 
     name: str
     nodes: MinimaxNodes

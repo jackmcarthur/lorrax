@@ -43,6 +43,16 @@ the accumulator. A window reads its row on device behind a device counter, so
 it transfers nothing. The run prints the table's size per device
 (`Sigma window table: N windows, X MiB per device`).
 
+The summed-band support is separate from `own`, which describes the external
+Sigma targets. The box planner shares one live support mask per causal branch
+and stores each window's exact state bounds `(lo, hi]`; it does not retain a
+dense full-k by summed-band mask per window. The executor selects the current
+window's raw-parent support before placement and applies those bounds on device,
+including the existing finite-state and signed occupation predicates. Only two
+state-bound scalars per window enter `WindowTable`. This avoids a replicated
+`n_window × n_full_k × n_sum_band` bank without changing coarse frequency
+ownership or quadrature nodes.
+
 The derivative row inherits the value's quadrature certificate in the squared
 currency: on one pole through the production rule (`sigma_quadrature_eps =
 1e-4`, η = 0.25 eV), the derivative's error is 1.3 ε·η⁻² on a crossing box and
