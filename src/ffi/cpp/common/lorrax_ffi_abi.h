@@ -125,8 +125,9 @@
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
-// BUMP THIS ON ANY CHANGE TO A HANDLER SIGNATURE.  Concretely, in the same
-// commit as any of:
+// BUMP THIS ON ANY CHANGE TO A REQUIRED HANDLER CONTRACT. This stamp covers
+// required behavior as well as binary signatures; it is not a source-version
+// stamp. Concretely, in the same commit as any of:
 //
 //   * adding, removing or reordering an Arg or a Ret of an existing handler;
 //   * moving a value between Attr and Arg (both recent bumps were this);
@@ -134,11 +135,14 @@
 //   * changing the meaning of a positional value while keeping its type
 //     (the silent one — same arity, different contract, no runtime error at
 //     all, which is worse than the INVALID_ARGUMENT above).
+//   * requiring newly supported behavior, even with the same signature
+//     (e.g. creating ds_name's missing parent groups in SlabIO).
 //
 // DO NOT BUMP for: adding a whole new handler (an old library simply does not
 // export it, and probe_target already reports that precisely); changing a
-// handler's internals; changing which vendor library a handler calls; anything
-// that does not alter what crosses the boundary.
+// handler's internals while preserving its required behavior; changing which
+// vendor library a handler calls; anything that does not alter the required
+// contract across the boundary.
 //
 // The version is deliberately NOT derived from a git hash.  A hash answers
 // "were these built from the same source", which is a stricter question than
