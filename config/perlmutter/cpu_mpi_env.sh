@@ -20,14 +20,14 @@ for _lorrax_pm_source_pin in "${LORRAX_ROOT:-}" "${LORRAX_CHECKOUT:-}"; do
         return 2
     fi
 done
-_lorrax_pm_site="$_lorrax_pm_root/config/perlmutter/site_config.sh"
+_lorrax_pm_cpu_config="$_lorrax_pm_root/config/perlmutter/cpu_mpi_config.sh"
 _lorrax_pm_one_mpi_gate="$_lorrax_pm_root/src/ffi/cpp/gate_one_mpi.sh"
-if [[ ! -r "$_lorrax_pm_site" ]]; then
-    echo "[cpu_mpi_env.pm] ERROR: cannot read $_lorrax_pm_site" >&2
+if [[ ! -r "$_lorrax_pm_cpu_config" ]]; then
+    echo "[cpu_mpi_env.pm] ERROR: cannot read $_lorrax_pm_cpu_config" >&2
     return 2
 fi
 # shellcheck disable=SC1090
-. "$_lorrax_pm_site"
+. "$_lorrax_pm_cpu_config"
 : "${LORRAX_MPIWRAPPER_PREFIX:=$LORRAX_MPIWRAPPER_PREFIX_DEFAULT}"
 : "${LORRAX_MPIWRAPPER_SO:=$LORRAX_MPIWRAPPER_PREFIX/lib64/libmpiwrapper.so}"
 
@@ -52,12 +52,12 @@ _lorrax_pm_recipe_dirty="$(sed -n 's/^lorrax_recipe_dirty=//p' "$_lorrax_pm_mani
 _lorrax_pm_mpich="$(sed -n 's/^cray_mpich_version=//p' "$_lorrax_pm_manifest")"
 _lorrax_pm_builder_sha="$(sed -n 's/^builder_sha256=//p' "$_lorrax_pm_manifest")"
 _lorrax_pm_prelude_sha="$(sed -n 's/^prelude_sha256=//p' "$_lorrax_pm_manifest")"
-_lorrax_pm_site_sha="$(sed -n 's/^site_config_sha256=//p' "$_lorrax_pm_manifest")"
+_lorrax_pm_cpu_config_sha="$(sed -n 's/^cpu_mpi_config_sha256=//p' "$_lorrax_pm_manifest")"
 _lorrax_pm_one_mpi_gate_sha="$(sed -n 's/^one_mpi_gate_sha256=//p' "$_lorrax_pm_manifest")"
 _lorrax_pm_actual_sha="$(sha256sum "$_lorrax_pm_so" | awk '{print $1}')"
 _lorrax_pm_want_builder_sha="$(sha256sum "$_lorrax_pm_root/config/perlmutter/build_mpiwrapper.sh" | awk '{print $1}')"
 _lorrax_pm_want_prelude_sha="$(sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}')"
-_lorrax_pm_want_site_sha="$(sha256sum "$_lorrax_pm_site" | awk '{print $1}')"
+_lorrax_pm_want_cpu_config_sha="$(sha256sum "$_lorrax_pm_cpu_config" | awk '{print $1}')"
 _lorrax_pm_want_one_mpi_gate_sha="$(sha256sum "$_lorrax_pm_one_mpi_gate" | awk '{print $1}')"
 if [[ "$_lorrax_pm_commit" != "$LORRAX_MPIWRAPPER_COMMIT_DEFAULT" || \
       "$_lorrax_pm_abi" != "$LORRAX_MPIWRAPPER_ABI_DEFAULT" || \
@@ -68,7 +68,7 @@ if [[ "$_lorrax_pm_commit" != "$LORRAX_MPIWRAPPER_COMMIT_DEFAULT" || \
       "$_lorrax_pm_mpich" != "${LORRAX_PM_MPICH_DEFAULT##*/}" || \
       "$_lorrax_pm_builder_sha" != "$_lorrax_pm_want_builder_sha" || \
       "$_lorrax_pm_prelude_sha" != "$_lorrax_pm_want_prelude_sha" || \
-      "$_lorrax_pm_site_sha" != "$_lorrax_pm_want_site_sha" || \
+      "$_lorrax_pm_cpu_config_sha" != "$_lorrax_pm_want_cpu_config_sha" || \
       "$_lorrax_pm_one_mpi_gate_sha" != "$_lorrax_pm_want_one_mpi_gate_sha" ]]; then
     echo "[cpu_mpi_env.pm] ERROR: adapter provenance/toolchain/recipe check failed" >&2
     echo "[cpu_mpi_env.pm]   commit=$_lorrax_pm_commit ABI=$_lorrax_pm_abi MPICH=$_lorrax_pm_mpich" >&2
@@ -153,13 +153,13 @@ if [[ "${SLURM_PROCID:-0}" == 0 ]]; then
     echo "[cpu_mpi_env.pm] Async progress needs affinity headroom; placement is launcher-owned."
 fi
 
-unset _lorrax_pm_root _lorrax_pm_site _lorrax_pm_so _lorrax_pm_prefix
+unset _lorrax_pm_root _lorrax_pm_cpu_config _lorrax_pm_so _lorrax_pm_prefix
 unset _lorrax_pm_manifest _lorrax_pm_commit _lorrax_pm_abi
 unset _lorrax_pm_expected_sha _lorrax_pm_actual_sha _lorrax_pm_preload
 unset _lorrax_pm_pmi _lorrax_pm_preloads
 unset _lorrax_pm_source_modified _lorrax_pm_recipe_dirty _lorrax_pm_mpich
-unset _lorrax_pm_builder_sha _lorrax_pm_prelude_sha _lorrax_pm_site_sha
+unset _lorrax_pm_builder_sha _lorrax_pm_prelude_sha _lorrax_pm_cpu_config_sha
 unset _lorrax_pm_want_builder_sha _lorrax_pm_want_prelude_sha
-unset _lorrax_pm_want_site_sha _lorrax_pm_source_pin
+unset _lorrax_pm_want_cpu_config_sha _lorrax_pm_source_pin
 unset _lorrax_pm_one_mpi_gate _lorrax_pm_one_mpi_gate_sha
 unset _lorrax_pm_want_one_mpi_gate_sha

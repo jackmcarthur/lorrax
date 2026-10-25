@@ -99,18 +99,7 @@ LORRAX_FFI_CRAY_DIR_DEFAULT="$HOME/software/lorrax_cray_runtime/stage"
 # src/ffi/cpp/stage/fftw_stage_cray.sh after `module load cray-fftw`.
 LORRAX_FFI_FFTW_DIR_DEFAULT="$HOME/software/lorrax_fftw_cray/stage"
 
-# CPU MPI adapter for JAX's MPItrampoline backend.  This is an unmodified,
-# pinned upstream MPIwrapper build against Cray MPICH; the wrapper is a small
-# ABI adapter, not an MPI implementation.  The builder installs immutable,
-# content-addressed releases and atomically advances ``current`` only after
-# all gates pass, so a failed rebuild cannot remove the live adapter.
-LORRAX_MPIWRAPPER_ROOT_DEFAULT="$HOME/software/lorrax_mpiwrapper_cray"
-LORRAX_MPIWRAPPER_PREFIX_DEFAULT="$LORRAX_MPIWRAPPER_ROOT_DEFAULT/current"
-LORRAX_MPIWRAPPER_COMMIT_DEFAULT="966f4231c96153a08295fc7d0bcbd65e916a73fd"
-LORRAX_MPIWRAPPER_ABI_DEFAULT="2.10.0"
-
-# Reproducible host toolchain for that adapter.  Cray MPICH is still the MPI
-# implementation; MPIwrapper only translates MPItrampoline's stable ABI.
-LORRAX_PM_PRGENV_DEFAULT="PrgEnv-gnu/8.6.0"
-LORRAX_PM_MPICH_DEFAULT="cray-mpich/9.0.1"
-LORRAX_PM_CMAKE_DEFAULT="cmake/3.30.2"
+# Installation shares the CPU defaults; its builder and rank prelude source
+# this smaller owner directly so GPU/site edits do not invalidate an adapter.
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/cpu_mpi_config.sh"
