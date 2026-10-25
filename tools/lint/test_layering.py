@@ -2011,6 +2011,100 @@ def test_the_three_levels_are_each_populated(sources):
 # is unaffected: nothing below starts with ``test_``.
 # ===========================================================================
 
+def scan_refit_host_replication(source, mod):
+    """Known production refit tensors never cross a host-conversion seam.
+
+    This is a focused ownership ratchet, not a general array type checker.
+    Small q/energy/index metadata remains legal; the independent runtime
+    controls also forbid host conversions while the real refit executes.
+    """
+    scopes = {
+        "bse.vq_interp": {"refit_vq", "refit_ongrid_null"},
+        "bse.exchange_path": {"exchange_tiles", "_host_tile"},
+        "file_io.restart_bundle": {"read_coarse_interactions", "read_vq_payload"},
+        "gw.v_q_g_flat": {"coulomb_gram_gflat", "_gflat_gram_program"},
+    }
+    if mod not in scopes:
+        return []
+    tree = ast.parse(source)
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            aliases.update((a.asname or a.name.split('.')[0], a.name) for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            aliases.update((a.asname or a.name, (node.module or '')+'.'+a.name)
+                           for a in node.names)
+
+    def name(node):
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            return name(node.value)+'.'+node.attr
+        return ''
+
+    large = {"full", "psi", "host", "replicate", "gflat_acc", "zt", "zeta_G",
+             "Z", "ZG", "V", "V_ref", "V_new", "V_np", "pad", "A"}
+    conversions = {"numpy.asarray", "numpy.array", "numpy.zeros", "numpy.empty",
+                   "numpy.ones", "numpy.full", "numpy.copy"}
+    hits = []
+    for fn in tree.body:
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or fn.name not in scopes[mod]:
+            continue
+        if fn.name == '_host_tile':
+            hits.append((fn.lineno, 'replicated host tile owner'))
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call):
+                target = name(node.func)
+                leaf = target.rsplit('.', 1)[-1]
+                if leaf in {'_to_host', 'gather_to_host', 'process_allgather', 'device_get', '_host_tile'}:
+                    hits.append((node.lineno, target))
+                elif target in conversions and any(isinstance(n, ast.Name) and n.id in large
+                                                   for a in node.args for n in ast.walk(a)):
+                    hits.append((node.lineno, target+' on refit tensor'))
+                elif (fn.name == 'read_vq_payload' and target == 'numpy.meshgrid'
+                      and any(isinstance(n, ast.Name) and n.id in {'rx', 'ry', 'rz'}
+                              for a in node.args for n in ast.walk(a))):
+                    hits.append((node.lineno, 'full-r coordinate mirror'))
+            elif (fn.name == 'read_vq_payload' and isinstance(node, ast.Assign)
+                  and any(isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+                          and t.value.id == 'zx' and _literal(t.slice) == 'rfrac'
+                          for t in node.targets)):
+                hits.append((node.lineno, 'retained full-r coordinate mirror'))
+    return hits
+
+
+def test_production_refit_keeps_tensor_transport_on_the_mesh(sources):
+    hits = [(mod, *hit) for mod, src in sources.items()
+            for hit in scan_refit_host_replication(src, mod)]
+    assert not hits, (
+        f"refit ψ/ζ/V must stay on their canonical device faces; no large host "
+        f"mirror or fallback is allowed: {hits}")
+
+
+def test_the_refit_host_replication_scan_can_fail():
+    cases = (
+        ('bse.vq_interp', 'def refit_vq():\n    zt = _to_host(gflat_acc[0])\n'),
+        ('bse.vq_interp', 'from common.collectives import gather_to_host as hostcopy\n'
+         'def refit_vq():\n    return hostcopy(zeta_G)\n'),
+        ('bse.vq_interp', 'import numpy as np\ndef refit_ongrid_null():\n'
+         '    pad = np.zeros(V_ref.shape)\n'),
+        ('bse.exchange_path', 'def _host_tile(V_np):\n    return V_np\n'),
+        ('file_io.restart_bundle', 'import numpy as np\ndef read_coarse_interactions():\n'
+         '    host = np.zeros(full.shape)\n    return np.asarray(replicate(full))\n'),
+        ('file_io.restart_bundle', 'import numpy as np\ndef read_vq_payload():\n'
+         '    RX, RY, RZ = np.meshgrid(rx, ry, rz)\n'),
+    )
+    for mod, src in cases:
+        assert scan_refit_host_replication(src, mod), (mod, src)
+    safe = ('import numpy as np\ndef refit_vq():\n'
+            '    q = np.asarray(q_tile_frac)\n'
+            '    return coulomb_gram_gflat(gflat_acc, v)\n')
+    assert scan_refit_host_replication(safe, 'bse.vq_interp') == []
+    q_metadata = ('import numpy as np\ndef read_vq_payload():\n'
+                  '    labels = np.meshgrid(*[np.arange(k) for k in kgrid])\n')
+    assert scan_refit_host_replication(q_metadata, 'file_io.restart_bundle') == []
+
+
 def _main():
     import inspect
 
