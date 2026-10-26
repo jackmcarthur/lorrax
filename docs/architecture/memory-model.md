@@ -522,8 +522,11 @@ per call. The executable's actual additional XLA bytes and queried provider
 scratch are admitted beside the live operands and placed unfold tables.
 Row sizes follow the fixed 1 GiB tile, including for small one-window cases.
 
-Placed charge tables are counted once across both bounded placement and
-k-convolution caches. Their last eviction retires table-bound minimax and
+The bounded charge k-convolution cache is the single owner of placed charge
+tables. Its live row variants share the same plan's eight fields, counted
+once; full-span calls use the same window entry. There is no separate placement
+cache retaining a plan after its last operator retires. That eviction
+retires table-bound minimax and
 response-bank programs, including cached layout variants and executables,
 through the same owner. A caller or an unfinished background compile can
 still retain its own operands until its work finishes; eviction does not

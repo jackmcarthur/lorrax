@@ -2,6 +2,7 @@
 import gc
 import subprocess
 import sys
+import threading
 import weakref
 from dataclasses import replace
 
@@ -22,7 +23,7 @@ def owners(monkeypatch):
     from gw import response_bank as RB, subtile_stream as S, w_isdf as W
     # Isolate before any construction, then exercise real insertions/evictions;
     # no cache clearing is used to establish release after turnover.
-    for name in ('_chi_minimax_kernel_cache', '_CHARGE_KCONV', '_PLACED_LOAD', '_PHOTON_KCONV'):
+    for name in ('_chi_minimax_kernel_cache', '_CHARGE_KCONV', '_PHOTON_KCONV'):
         monkeypatch.setattr(W, name, {})
     for name in ('_STREAM_KERNELS', '_STREAM_PROGRAMS', '_COMPILED'):
         shared = {}
@@ -99,27 +100,37 @@ def test_minimax_reuses_owned_tables_and_releases_retired_plans(owners, side, ns
         assert len(W._chi_minimax_kernel_cache) == 2
 
 
-def test_placed_only_charge_tables_remain_counted_and_live(owners):
+@pytest.mark.parametrize('side,ns,anti', [(2, 1, False), (3, 2, True)])
+def test_charge_variants_share_tables_until_the_last_operator_retires(owners, side, ns, anti):
     from ffi import fft as F
     W, _ = owners
-    if jax.device_count() < 4:
-        pytest.skip('requires four virtual CPU devices')
-    mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+    if jax.device_count() < side*side:
+        pytest.skip('requires nine virtual CPU devices')
+    mesh = Mesh(np.asarray(jax.devices()[:side*side]).reshape(side, side), ('x', 'y'))
     with F.xla_reference():
-        grid, first, *_ = fixture(mesh, 1, False)
-        _, held = W._charge_stream_kconv(mesh, grid, first)
-        grid, second, *_ = fixture(mesh, 1, False)
-        rows = second.n_centroid_packed // 2
+        grid, first, *_ = fixture(mesh, ns, anti)
+        rows = first.n_centroid_packed // side
+        stream, held = W._charge_stream_kconv(mesh, grid, first)
+        window, shared = W._charge_window_kconv(mesh, grid, first, rows)
+        assert stream is window and held is shared and len(W._CHARGE_KCONV) == 1
+        _, completed = W._charge_window_kconv(mesh, grid, first, rows, complete=True)
+        assert completed is held and len(held) == 8
+        unique = {id(a): a for a in held}
+        assert W.charge_kconv_table_bytes() == sum(a.addressable_shards[0].data.nbytes
+                                                 for a in unique.values())
+        references = [weakref.ref(a) for a in held]
+        del unique
+        grid, second, *_ = fixture(mesh, ns, anti)
         W._charge_window_kconv(mesh, grid, second, rows, complete=False)
+        assert W.placed_kconv_tables_live(held), 'one first-plan operator still owns its tables'
         W._charge_window_kconv(mesh, grid, second, rows, complete=True)
-        # Both kconv entries now serve second; first is still actually owned
-        # by the independently bounded placement cache and must be reserved.
-        assert not any(any(a is b for a in held for b in arrays)
-                       for _, arrays in W._CHARGE_KCONV.values())
-        assert W.placed_kconv_tables_live(held)
-        unique = {id(a): a for _, arrays in W._PLACED_LOAD.values() for a in arrays}
+        assert not W.placed_kconv_tables_live(held)
+        unique = {id(a): a for _, arrays in W._CHARGE_KCONV.values() for a in arrays}
         assert W.charge_kconv_table_bytes() == sum(
             a.addressable_shards[0].data.nbytes for a in unique.values())
+        del stream, window, held, shared, completed
+        gc.collect()
+        assert all(ref() is None for ref in references)
 
 
 def test_ordinary_turnover_retires_completed_bank_variants_and_executables(owners):
@@ -205,3 +216,48 @@ def test_explicit_retired_program_reuse_does_not_reinsert_an_orphan(owners):
         del arrays, table, program, first
         gc.collect()
         assert all(ref() is None for ref in references)
+
+
+def test_pending_compile_retains_its_tables_after_operator_retirement(owners, monkeypatch):
+    from common import jax_compile_cache as JCC
+    from ffi import fft as F
+    W, RB = owners
+    if jax.device_count() < 4:
+        pytest.skip('requires four virtual CPU devices')
+    mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+    started, release = threading.Event(), threading.Event()
+    original = JCC._compile_in_slot
+
+    def paused(lowered, entry):
+        started.set()
+        if not release.wait(10):
+            raise TimeoutError('test did not release its pending compile')
+        return original(lowered, entry)
+
+    with F.xla_reference():
+        grid, plan, *_ = fixture(mesh, 1, False)
+        _, arrays = W._charge_stream_kconv(mesh, grid, plan)
+        table = arrays[0]
+        reference = weakref.ref(table)
+        program = W._BoundTail(jax.jit(lambda x, t: x+t), (table,))
+        argument = jnp.ones(table.shape, dtype=jnp.complex128)
+        expected = np.ones(table.shape, complex)+np.asarray(table)
+        monkeypatch.setattr(JCC, '_compile_in_slot', paused)
+        try:
+            future = RB._program_compiled(program, (argument,), ahead=True)
+            assert started.wait(5), 'actual compile worker did not start'
+            for _ in range(2):
+                grid, other, *_ = fixture(mesh, 1, False)
+                W._charge_stream_kconv(mesh, grid, other)
+            assert not W.placed_kconv_tables_live(program.tail) and not RB._COMPILED
+            del arrays, table, program
+            gc.collect()
+            assert not future.done() and not future.cancelled() and reference() is not None
+            release.set()
+            executable = future.result(timeout=30)
+            np.testing.assert_array_equal(np.asarray(executable(argument)), expected)
+            del executable, future
+            gc.collect()
+            assert reference() is None
+        finally:
+            release.set()
