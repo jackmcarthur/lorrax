@@ -103,7 +103,7 @@ def tangential_prices(s, P, ordered):
                                               parent_batch=1, phase=phase, **kw)["resident_bytes_per_rank"])
         # native eigh workspace [model]: syevd ~2 R^2 whole (local); cuSOLVERMp ~3 R^2/P + contexts (face)
         ws = 2 * C * side ** 2 if route == "local" else 3 * C * side ** 2 / P + CTX
-        out[route] = max(rows) + ws
+        out[route] = (max(rows) + ws) * (1.41 if (s.get("calib") and route == "face") else 1.0)
     return out, dict(bound=bound, bound_over_nmu=round(bound / n, 3), side=side,
                      side_over_nmu=round(side / n, 3), ordered=ordered, line=line, imag=imag)
 
@@ -149,7 +149,13 @@ def stages(s, P, mode):
                                                    ("distributed", 6 * n2 / P + CTX)), 0.0)
         st["tangential constructor"] = ("code+model", (("local", t["local"]), ("face", t["face"])), 0.0)
         # Sigma tau: resident pole fields 32 N_q n Kbar / P, Kbar = 1.0 n, plus one row tile
-        st["Sigma tau sweep"] = ("code", (("only", 32 * Q * n * n / P + TILE),), 0.0)
+        if s.get("calib"):
+            # Measured, Al2O3 4^3, P = 4, N_mu 2400 / 6000 (job 60310320): 6.04 / 35.07 GB = 322 / 300 B Q mu^2/P
+            st["Sigma tau sweep"] = ("measured fit", (("only", 300.0 * Q * n * n / P),), 0.0)
+            # Unreceipted "ISDF setup + I/O" peak, same runs: 6.26 / 38.98 GB = 335 / 333 B Q mu^2/P
+            st["ISDF setup + I/O (unpriced)"] = ("measured fit", (("only", 333.0 * Q * n * n / P),), 0.0)
+        else:
+            st["Sigma tau sweep"] = ("code", (("only", 32 * Q * n * n / P + TILE),), 0.0)
     else:  # gn_ppm [model]: chi0 carry at two nodes, the Wc pair, one Green row tile
         st["static/GN-PPM screening"] = ("model", (("only", 2 * nk * n2 / P + 2 * Q * n2 / P + TILE),), 0.0)
         st["Sigma tau sweep"] = ("model", (("only", 2 * Q * n2 / P + TILE),), 0.0)
@@ -189,7 +195,7 @@ def min_p(s, mode):
 
 DECK_KEYS = dict(atoms=int, k=str, spinor=int, nmu=int, nb=int, nv=int, nq=int, ng=int, fft=int,
                  vol_bohr3=float, ecut_ry=float, kfine=str, bse_v=int, bse_c=int, reach=float, eta=float,
-                 trs=int, side_frac=float, zeta_c_face=int)
+                 trs=int, side_frac=float, zeta_c_face=int, calib=int)
 
 
 def deck(text):
@@ -211,6 +217,9 @@ def deck(text):
     s.update(kgrid="x".join(map(str, kg)), nk=nk, nq=(nk + math.prod(2 if g % 2 == 0 else 1 for g in kg)) // 2,
              nk_fine=math.prod(grid(kv["kfine"])) if "kfine" in kv else math.prod(2 * g if g > 1 else 1 for g in kg))
     s["zeta_c_face"] = bool(kv.get("zeta_c_face", 0))
+    # calib=1: scale by the one-node Al2O3 tangential measurements (face constructor x1.41 at the
+    # real side, Sigma tau and the unreceipted ISDF setup peak as fitted Q mu^2/P coefficients)
+    s["calib"] = bool(kv.get("calib", 0))
     for key, field in (("nmu", "nmu"), ("nb", "nb"), ("nv", "nv"), ("nq", "nq"), ("ng", "ng"),
                        ("bse_v", "bse_v"), ("bse_c", "bse_c"), ("reach", "reach"), ("eta", "eta")):
         if key in kv:
