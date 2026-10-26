@@ -600,6 +600,9 @@ once and reducing the accumulated projection once. CPU, reference and ROCm
 fallback convolutions form the full output before cropping, so they keep one
 output call. Static (COHSEX), resident-pole and shared-pole scalar Σ retain
 every spin component in each input window and stored block.
+The spatial callable owns its pass-price metadata. Resident-pole τ wrappers
+reuse that callable's geometry/provider identity; caller-supplied spatial
+programs are not cached, and no raw-object-id price registry remains.
 
 **Row passes run as one scan.** The passes of the Σ τ node, the static
 τ = 0 node, the sector node and the charge and four-current χ streams are

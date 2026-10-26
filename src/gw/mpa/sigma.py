@@ -1649,7 +1649,7 @@ def _integrate_sigma_batches(
                     q_wedge=q_wedge, sum_layout=sum_layout, **face_kwargs)
             from gw.ppm_tau_kernel import sigma_kconv_tables, sigma_pass_price
             sigma_kij = _get_sigma_kij_kernel(
-                mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, brackets=brackets,
+                mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
                 q_wedge=w_synthesis.q_wedge, sum_layout=sum_layout, **face_kwargs)
 
             def scalar_spatial(xn, yr, xr, yn, energies, weight, e_ref, t, interactions,

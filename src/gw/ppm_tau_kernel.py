@@ -43,9 +43,7 @@ log = get_logger(__name__)
 _sigma_kij_kernel_cache: dict[tuple[object, ...], Callable[..., jax.Array]] = {}
 
 
-_sigma_shared_tau_kernel_cache: dict[
-    tuple[object, ...], Callable[..., jax.Array]
-] = {}
+_sigma_shared_tau_kernel_cache: dict[Callable, Callable] = {}
 
 #: The Σ Green kconv call's placed load tables per (mesh, parent plan); bounded.
 #: Plans are run objects, stable across SC maps, so a run places them once.
@@ -370,7 +368,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
 
 
 def _get_sigma_kij_kernel(
-    *, mesh_xy: Mesh, kgrid: tuple[int, int, int], merged_x: bool = True,
+    *, mesh_xy: Mesh, kgrid: tuple[int, int, int],
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
     layout: str = "face", face_shape=None, face_band_extent=None,
     energy_windows: bool = False,
@@ -395,7 +393,7 @@ def _get_sigma_kij_kernel(
     from ffi import ffi_dial_key
     from common.fft_helpers import kconv_backend
     key = (id(mesh_xy), tuple(map(int, kgrid)),
-           ffi_dial_key(), kconv_backend(mesh_xy, kgrid), bool(merged_x), brackets, layout, face_shape,
+           ffi_dial_key(), kconv_backend(mesh_xy, kgrid), brackets, layout, face_shape,
            face_band_extent, bool(energy_windows),
            k_unfold_plan, q_wedge.wedge_key(), bool(static), sum_layout)
     if key in _sigma_kij_kernel_cache:
@@ -404,19 +402,14 @@ def _get_sigma_kij_kernel(
         mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets, face_shape=face_shape,
         face_band_extent=face_band_extent, energy_windows=energy_windows,
         k_unfold_plan=k_unfold_plan, q_wedge=q_wedge, static=static, sum_layout=sum_layout)
+    kernel.price = price
     _sigma_kij_kernel_cache[key] = kernel
-    _SIGMA_PASS_PRICE[id(kernel)] = price
     return kernel
-
-
-#: The row-pass plan per cached Σ kernel (cached for the process,
-#: so its id is stable), for the window executable's compiled check.
-_SIGMA_PASS_PRICE: dict[int, dict | None] = {}
 
 
 def sigma_pass_price(kernel):
     """The analytic Σ pass plan behind ``kernel`` (a Σ_kij or spatial kernel), or None."""
-    return _SIGMA_PASS_PRICE.get(id(kernel), getattr(kernel, "price", None))
+    return getattr(kernel, "price", None)
 
 
 def _wedge_residues(B_poles):
@@ -489,23 +482,15 @@ def get_shared_sigma_tau_kernel(
     if brackets is not None:
         brackets = tuple((int(lo), None if hi is None else int(hi))
                          for lo, hi in brackets)
-    from ffi import ffi_dial_key
-    from common.fft_helpers import kconv_backend
-
-    key = (id(mesh_xy), kgrid, ffi_dial_key(), kconv_backend(mesh_xy, kgrid),
-           brackets, layout, face_shape, face_band_extent,
-           k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key(), sum_layout)
-    if _sigma_kij is None and key in _sigma_shared_tau_kernel_cache:
-        return _sigma_shared_tau_kernel_cache[key]
-
     ensure_jax_compile_cache()
-    q_mu_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
-
     sigma_kij = _sigma_kij if _sigma_kij is not None else _get_sigma_kij_kernel(
-        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True,
+        mesh_xy=mesh_xy, kgrid=kgrid,
         brackets=brackets, layout=layout, face_shape=face_shape,
         face_band_extent=face_band_extent,
         k_unfold_plan=k_unfold_plan, q_wedge=q_wedge, sum_layout=sum_layout)
+    if _sigma_kij is None and sigma_kij in _sigma_shared_tau_kernel_cache:
+        return _sigma_shared_tau_kernel_cache[sigma_kij]
+    q_mu_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
     # On the q wedge W(τ) is read by the pair-transpose rule: an antiunitary
     # row takes the tile built from the conjugated residues (the fitted
     # fields are Hermitian; the time factor is not conjugated).
@@ -541,8 +526,9 @@ def get_shared_sigma_tau_kernel(
             E_A, mask_A, E_ref_A, t_node, W_t, W_pt, load,
             *(() if g_load is None else (g_load,)))
 
+    _tau.price = sigma_pass_price(sigma_kij)
+    # The resolved spatial program owns all geometry/provider identity.
     # Never publish a kernel built around a caller's spatial kernel.
     if _sigma_kij is None:
-        _sigma_shared_tau_kernel_cache[key] = _tau
-    _SIGMA_PASS_PRICE[id(_tau)] = sigma_pass_price(sigma_kij)
+        _sigma_shared_tau_kernel_cache[sigma_kij] = _tau
     return _tau

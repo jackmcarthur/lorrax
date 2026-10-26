@@ -453,7 +453,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
                 key = (sum_layout, interaction.wedge_key())
                 if key not in static_nodes:
                     kernel = _get_sigma_kij_kernel(
-                        mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, layout=layout,
+                        mesh_xy=mesh_xy, kgrid=kgrid, layout=layout,
                         face_shape=_face_shape, face_band_extent=band_extent,
                         k_unfold_plan=k_unfold_plan, q_wedge=interaction, static=True,
                         sum_layout=sum_layout)
