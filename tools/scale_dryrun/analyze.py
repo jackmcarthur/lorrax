@@ -32,12 +32,12 @@ def cell(rows, keep):
 def local_limits():
     """Largest N_mu at which each stage's fastest (whole-matrix) route still fits B_LOCAL."""
     out = {}
-    for spinor in (False, True):
+    for spinor in (False, True):   # here: False = TRS (even), True = broken TRS (ordered)
         for name in ("tangential constructor", "bank round (value+slope)", "W Dyson", "Coulomb roots"):
             lo, hi = 100, 200000
             while hi - lo > 50:
                 mid = (lo + hi) // 2
-                s = D.system(10, 2, spinor, nmu_per_atom=mid / 10)
+                s = D.system(10, 2, spinor, nmu_per_atom=mid / 10, trs=not spinor)
                 s["nmu"] = mid
                 b = dict(D.stages(s, 8, "tangential")[name][1])   # one q-parent per rank: P = N_q = 8
                 fast = list(b.values())[0]
@@ -49,7 +49,7 @@ def local_limits():
 def times(s, P):
     """Ideal-scaling time walls from measured anchors (QSGW_LADDER_ASSESSMENT.md section 2.1)."""
     n, Q = s["nmu"], s["nq"]
-    side = D.pencil_side(s, bool(s["spinor"]))[0]
+    side = D.pencil_side(s, not s.get("trs", True))[0]
     # CrI3 ML 24^2 charge QSGW, 16 A100: W 152 s, Sigma_tau 120 s at N_mu 3300, N_q 61
     scale = (Q / 61) * (n / 3300) ** 3 * (16 / P)
     # Ladder W, Si 4^3 SOC, 4 GPUs: ~300 s per z; probes N_q N_mu, each N_it C_HX (same N_it)
@@ -65,17 +65,21 @@ def times(s, P):
 def main(path):
     d = json.load(open(path))
     print("## First wall per GPU count (GB/rank; GW stages | BSE stages)\n")
-    print("| atoms | N_mu | k | n_s | mode | P=4 | P=16 | P=64 | P=256 | min P (GW) | BSE @P=4/16/64/256 |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|")
-    key = lambda r: (r["atoms"], r["kgrid"], r["spinor"], r["mode"], r["nmu"])
+    key = lambda r: (r["side_frac"], r["atoms"], r["kgrid"], r["spinor"], r["trs"], r["mode"], r["nmu"])
     groups = {}
     for r in d:
         groups.setdefault(key(r), []).append(r)
-    for (a, k, sp, mode, _), rs in groups.items():
+    frac_seen = None
+    for (frac, a, k, sp, trs, mode, _), rs in groups.items():
+        if frac != frac_seen:
+            frac_seen = frac
+            print(f"\n### Tangential reduction at {frac:.1f} x the recipe bound\n")
+            print("| atoms | N_mu | k | n_s | TRS | mode | P=4 | P=16 | P=64 | P=256 | min P (GW) | BSE @P=4/16/64/256 |")
+            print("|---|---|---|---|---|---|---|---|---|---|---|---|")
         rs.sort(key=lambda r: r["P"])
         gw = [cell(r["rows"], lambda st: st not in BSE) for r in rs]
         bse = [cell(r["rows"], lambda st: st in BSE) for r in rs]
-        s = D.system(a, k, sp) if not isinstance(k, str) else next(x for x in D.sweep_decks() if x["kgrid"] == k and x["spinor"] == sp and x["nmu"] == rs[0]["nmu"])
+        s = dict(rs[0]["deck"])
         plans = {}
         for name in D.stages(s, 4, mode):
             if name in BSE:
@@ -85,21 +89,21 @@ def main(path):
             plans[name] = tuple((rt, D.Price(operands=D.Term(grid=grid(name, rt), source="dryrun"), ranks=1))
                                 for rt, _ in D.stages(s, 4, mode)[name][1])
         z = D.memory.sizing(plans, limit_bytes=D.L_PHYS, per_node=4)
-        print(f"| {a} | {rs[0]['nmu']} | {k if isinstance(k, str) else str(k) + '³'} | {2 if sp else 1} | {mode} | " + " | ".join(gw)
+        print(f"| {a} | {rs[0]['nmu']} | {k if isinstance(k, str) else str(k) + '³'} | {2 if sp else 1} | {'yes' if trs else 'no (ordered)'} | {mode} | " + " | ".join(gw)
               + f" | {z['p']} ({z['binding']}) | " + " / ".join(bse) + " |")
     print("\n## Largest N_mu at which the whole-matrix (local) route fits B = 66.4 GB\n")
-    print("| stage | non-spinor (TRS) | spinor (ordered) |\n|---|---|---|")
+    print("| stage | TRS (even route) | broken TRS (ordered) |\n|---|---|---|")
     lim = local_limits()
     for name in ("tangential constructor", "bank round (value+slope)", "W Dyson", "Coulomb roots"):
         print(f"| {name} | {lim[(name, False)]} | {lim[(name, True)]} |")
     print("\n## 100-atom objects (N_mu = 30000, N_b = 3000 / 6000)\n")
     for k in (2, 4):
         for sp in (False, True):
-            s = D.system(100, k, sp)
+            s = D.system(100, k, sp, trs=not sp)
             side, line, imag, _ = D.pencil_side(s, sp)
             n2 = 16 * s["nmu"] ** 2 / 1e9
             t = times(s, 256)
-            z = next(r for r in d if r["atoms"] == 100 and r["kgrid"] == k and r["spinor"] == sp and r["P"] == 256)
+            z = next(r for r in d if r["atoms"] == 100 and r["kgrid"] == k and r["spinor"] == sp and r["P"] == 256 and r["trs"] == (not sp) and r["side_frac"] == 1.0)
             print(f"- k={k}³ n_s={s['ns']} N_q={s['nq']}: one N_mu² matrix {n2:.1f} GB; pencil side R = {side} "
                   f"({side / s['nmu']:.2f} N_mu, {line} line + {imag} imaginary supports); "
                   f"V_q unfold 16 N_k N_mu² = {n2 * s['nk'] / 1e3:.2f} TB; W_fine (k_f={2 * k}³) "

@@ -45,8 +45,14 @@ HOST_PER_RANK = 0.8 * 256e9 / 4     # gflat_memory_model._ZSTORE_HOST_FRAC of a 
 
 
 def system(atoms, kgrid, spinor, *, nmu_per_atom=300, nb_per_atom=30, eta_ev=0.25,
-           reach_ev=10.0, vol_bohr3_per_atom=200.0, ecut_ry=60.0):
-    """Synthetic deck: N_mu = 10 N_b, N_b = 30/atom (x2 spinor), occupied 4/atom (x2), P1 + TRS."""
+           reach_ev=10.0, vol_bohr3_per_atom=200.0, ecut_ry=60.0, trs=True, side_frac=1.0):
+    """Synthetic deck: N_mu = 10 N_b, N_b = 30/atom (x2 spinor), occupied 4/atom (x2), P1.
+
+    ``trs``: time reversal kept (sym.trs_allowed, measured from the WFN); only a broken TRS
+    (magnetic) takes the ordered bank, a nonmagnetic SOC deck stays on the even route.
+    ``side_frac``: the reduction's admitted side as a fraction of the recipe bound
+    (constructor_side_upper_bound); the actual side is min(signed bound, bound), 0.3-0.7 of it
+    in the CrI3/Fe compile notes of tangential_capacity."""
     ns = 2 if spinor else 1
     nk = kgrid ** 3
     nq = {1: 1, 2: 8, 4: 36}[kgrid]
@@ -58,7 +64,7 @@ def system(atoms, kgrid, spinor, *, nmu_per_atom=300, nb_per_atom=30, eta_ev=0.2
     return dict(atoms=atoms, kgrid=kgrid, spinor=spinor, ns=ns, nk=nk, nq=nq, ng=ng,
                 fft=(n1, n1, n1), nmu=nmu_per_atom * atoms, nb=nb, nv=nv, nc=nb - nv,
                 eta=eta_ev, reach=reach_ev, bse_v=atoms * ns, bse_c=atoms * ns,
-                nk_fine=(2 * kgrid) ** 3)
+                nk_fine=(2 * kgrid) ** 3, trs=bool(trs), side_frac=float(side_frac))
 
 
 def pencil_side(s, ordered):
@@ -77,9 +83,13 @@ def pencil_side(s, ordered):
 
 
 def tangential_prices(s, P, ordered):
-    """Local route (one parent whole per rank) and face route (one parent tiled over P)."""
+    """Local route (one parent whole per rank) and face route (one parent tiled over P).
+
+    Selection is priced at the recipe bound, as admitted before the bank is read; the
+    reduction and its eigh at ``side_frac`` of it."""
     n = s["nmu"]
-    side, line, imag, budget = pencil_side(s, ordered)
+    bound, line, imag, budget = pencil_side(s, ordered)
+    side = max(1, math.ceil(s.get("side_frac", 1.0) * bound))
     meta = SimpleNamespace(n_rmu_padded=n)
     px = int(math.isqrt(P))
     mesh = SimpleNamespace(shape={"x": px, "y": P // px})
@@ -87,14 +97,15 @@ def tangential_prices(s, P, ordered):
     for route, layout in (("local", "local"), ("face", "distributed")):
         res = SimpleNamespace(layout=layout)
         rows = []
-        for phase, kw in (("selection", dict(sample_batch=imag + 2)),
-                          ("reduction", dict(sample_batch=1, ritz_budget=budget if ordered else None))):
-            rows.append(tangential_byte_terms(meta, mesh_xy=mesh, resolution=res, pencil_side=side,
+        for phase, r, kw in (("selection", bound, dict(sample_batch=imag + 2)),
+                             ("reduction", side, dict(sample_batch=1, ritz_budget=budget if ordered else None))):
+            rows.append(tangential_byte_terms(meta, mesh_xy=mesh, resolution=res, pencil_side=r,
                                               parent_batch=1, phase=phase, **kw)["resident_bytes_per_rank"])
         # native eigh workspace [model]: syevd ~2 R^2 whole (local); cuSOLVERMp ~3 R^2/P + contexts (face)
         ws = 2 * C * side ** 2 if route == "local" else 3 * C * side ** 2 / P + CTX
         out[route] = max(rows) + ws
-    return out, dict(side=side, side_over_nmu=round(side / n, 3), line=line, imag=imag)
+    return out, dict(bound=bound, bound_over_nmu=round(bound / n, 3), side=side,
+                     side_over_nmu=round(side / n, 3), ordered=ordered, line=line, imag=imag)
 
 
 def stages(s, P, mode):
@@ -123,7 +134,7 @@ def stages(s, P, mode):
     st["W Dyson"] = ("code", (("local", 3 * Q * n2 / P + n2 * (3 * -(-Q // P) + 2)),
                               ("distributed", (3 * Q + 2) * n2 / P + CTX)), 0.0)
     if mode == "tangential":
-        ordered = bool(s["spinor"])   # magnetic / SOC deck: no TRS, ordered bank
+        ordered = not s.get("trs", True)   # tangential_constructor: ordered = not sym.trs_allowed
         t, info = tangential_prices(s, P, ordered)
         s["_pencil"] = info
         # gw.response_bank.parent_span: ~6 faces of 16 n^2/P per parent; under linalg=local a
@@ -171,7 +182,8 @@ def min_p(s, mode):
 
 
 DECK_KEYS = dict(atoms=int, k=str, spinor=int, nmu=int, nb=int, nv=int, nq=int, ng=int, fft=int,
-                 vol_bohr3=float, ecut_ry=float, kfine=str, bse_v=int, bse_c=int, reach=float, eta=float)
+                 vol_bohr3=float, ecut_ry=float, kfine=str, bse_v=int, bse_c=int, reach=float, eta=float,
+                 trs=int, side_frac=float)
 
 
 def deck(text):
@@ -187,7 +199,8 @@ def deck(text):
     kg = grid(kv.get("k", "2"))
     atoms, spinor = kv.get("atoms", 10), bool(kv.get("spinor", 0))
     vol = kv.get("vol_bohr3", 200.0 * atoms)
-    s = system(atoms, 2, spinor, vol_bohr3_per_atom=vol / atoms, ecut_ry=kv.get("ecut_ry", 60.0))
+    s = system(atoms, 2, spinor, vol_bohr3_per_atom=vol / atoms, ecut_ry=kv.get("ecut_ry", 60.0),
+               trs=kv.get("trs", 1), side_frac=kv.get("side_frac", 1.0))
     nk = math.prod(kg)
     s.update(kgrid="x".join(map(str, kg)), nk=nk, nq=(nk + math.prod(2 if g % 2 == 0 else 1 for g in kg)) // 2,
              nk_fine=math.prod(grid(kv["kfine"])) if "kfine" in kv else math.prod(2 * g if g > 1 else 1 for g in kg))
@@ -202,16 +215,18 @@ def deck(text):
 
 
 def sweep_decks():
-    """The generic sweep: 10-100 atoms at k 2^3/4^3, plus the 148-atom MoS2 4x4 / 2 hBN 5x5 slab
-    (3x3x1, N_mu 8k and 16k, slab volume 23350 bohr^3)."""
-    for atoms in (10, 20, 40, 100):
-        for kgrid in (2, 4):
-            for spinor in (False, True):
-                yield system(atoms, kgrid, spinor)
-    for nmu in (8000, 16000):
-        for spinor in (0, 1):
-            yield deck(f"atoms=148,k=3x3x1,spinor={spinor},nmu={nmu},nb={nmu // 10 * (1 + spinor)},"
-                       f"nv={300 * (1 + spinor)},vol_bohr3=23350")
+    """The generic sweep: 10-100 atoms at k 2^3/4^3 (spinor decks with TRS and magnetic), plus the
+    nonmagnetic 148-atom MoS2 4x4 / 2 hBN 5x5 slab (3x3x1, N_mu 8k and 16k, 23350 bohr^3); each
+    at the recipe bound and at 0.6 of it."""
+    for frac in (1.0, 0.6):
+        for atoms in (10, 20, 40, 100):
+            for kgrid in (2, 4):
+                for spinor, trs in ((False, True), (True, True), (True, False)):
+                    yield system(atoms, kgrid, spinor, trs=trs, side_frac=frac)
+        for nmu in (8000, 16000):
+            for spinor in (0, 1):
+                yield deck(f"atoms=148,k=3x3x1,spinor={spinor},nmu={nmu},nb={nmu // 10 * (1 + spinor)},"
+                           f"nv={300 * (1 + spinor)},vol_bohr3=23350,trs=1,side_frac={frac}")
 
 
 def main():
@@ -229,11 +244,15 @@ def main():
     for s0 in decks:
         atoms, kgrid, spinor = s0["atoms"], s0["kgrid"], s0["spinor"]
         for mode in a.modes.split(","):
+            if mode != "tangential" and s0.get("side_frac", 1.0) != 1.0 and not a.deck:
+                continue   # the side fraction prices only the tangential constructor
             s = dict(s0)
             for P in (int(p) for p in a.P.split(",")):
                 rows = evaluate(s, P, mode)
                 top = max(rows, key=lambda r: r["gb"] / r["budget_gb"])
-                out.append(dict(atoms=atoms, kgrid=kgrid, spinor=spinor, mode=mode, P=P,
+                out.append(dict(atoms=atoms, kgrid=kgrid, spinor=spinor, trs=s0.get("trs", True),
+                                side_frac=s0.get("side_frac", 1.0), mode=mode, P=P,
+                                deck={k: v for k, v in s0.items() if not k.startswith("_")},
                                 nmu=s["nmu"], nb=s["nb"], nq=s["nq"], ng=s["ng"],
                                 pencil=s.get("_pencil"), zstore=s.get("_zstore"), rows=rows, binding=top["stage"],
                                 binding_gb=top["gb"], binding_route=top["route"],
@@ -252,7 +271,8 @@ def main():
             for x in r["rows"]:
                 print(f"     {x['stage']:26s} {x['route']:11s} {x['gb']:9.2f} GB/rank {x['verdict']:4s} [{x['src']}]"
                       + (f" host/disk {x['host_gb']:.1f} GB/rank" if x["host_gb"] else ""))
-        print(f"A={r['atoms']:3d} k={r['kgrid']} ns={2 if r['spinor'] else 1} {r['mode']:10s} P={r['P']:3d} "
+        print(f"A={r['atoms']:3d} k={r['kgrid']} ns={2 if r['spinor'] else 1} trs={int(r['trs'])} "
+              f"side={r['side_frac']:.1f}xbound {r['mode']:10s} P={r['P']:3d} "
               f"mu={r['nmu']:6d} | {r['binding']:26s} {r['binding_route']:11s} {r['binding_gb']:9.1f} GB {r['verdict']:4s}"
               + (f" host:{r['host_fail']}" if r["host_fail"] else "")
               + (f" | sizing P={r['sizing']['p']} ({r['sizing']['binding']})" if "sizing" in r else ""))
