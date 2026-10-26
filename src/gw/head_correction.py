@@ -1499,6 +1499,32 @@ class HeadResolver:
                     "epsilon head.")
             self._cache[self._cache_key(sample.omega)] = sample
 
+    def install_epsinv_heads(self, heads, *, source) -> list:
+        """Install heads from given eps^-1_00(q0, omega) values; returns the samples.
+
+        ``heads`` maps omega (Ry, the run's own frequency) to a complex
+        eps^-1_00 that already carries the local fields (BerkeleyGW's
+        eps0mat head, read by ``screening_source = bgw_epsmat``).  Each
+        becomes W(q->0) by the same cell average as ``wcoul0_source =
+        epshead`` (:func:`gw.vcoul.compute_q0_averages`).  Under
+        ``head_correction = off`` nothing is installed.
+        """
+        from gw.gw_config import HeadCorrection
+        from gw.vcoul import compute_q0_averages
+        if self._policy is HeadCorrection.OFF:
+            return []
+        samples = []
+        for omega, head in heads.items():
+            vc0, wcoul0 = compute_q0_averages(
+                self._wfn, jnp.asarray(complex(head), dtype=jnp.complex128), self._meta,
+                S_cart=None, analytic_sphere=_analytic_q0_sphere(self._params),
+                certificate_fn=self._params.get("_q0_certificate_fn"))
+            samples.append(HeadSample(
+                vc0=complex(vc0), wcoul0=complex(wcoul0), source=str(source),
+                omega=complex(omega), response_kind=HeadResponseKind.FULL_LOCAL_FIELDS))
+        self.install_samples(samples)
+        return samples
+
     def at(self, omega) -> HeadSample:
         """Resolve the policy-selected finalized head at ``omega`` in Ry."""
         from gw.gw_config import HeadCorrection

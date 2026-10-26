@@ -49,7 +49,7 @@ def fixture(*, noise=1.e-6, trs=True, half=False):
 
 def test_theta_even_basis_strict_metric_and_plane_wave_roundtrip(monkeypatch):
     ee, src, mesh, arrays, even, v, Wc = fixture()
-    monkeypatch.setattr(ee, "read_q_rows", lambda *_a: arrays)
+    monkeypatch.setattr(ee, "read_q_rows", lambda *_a, **_k: arrays)
     monkeypatch.setattr(ee, "lorrax_v", lambda *_a: v)
     Z, _B, _K, chi, _V, _Wc, diag = ee.q_algebra(src, 0, mesh, rcond=1.e-8)
     np.testing.assert_allclose(np.asarray(Z)[0], even, atol=1.e-15, rtol=1.e-14)
@@ -67,7 +67,7 @@ def test_theta_even_basis_strict_metric_and_plane_wave_roundtrip(monkeypatch):
 
 def test_large_odd_basis_metric_refuses_at_unchanged_gate(monkeypatch):
     ee, src, mesh, arrays, _even, v, _Wc = fixture(noise=.1)
-    monkeypatch.setattr(ee, "read_q_rows", lambda *_a: arrays)
+    monkeypatch.setattr(ee, "read_q_rows", lambda *_a, **_k: arrays)
     monkeypatch.setattr(ee, "lorrax_v", lambda *_a: v)
     with pytest.raises(ValueError, match="epsmat_v_reconstruction"):
         ee.q_algebra(src, 0, mesh, rcond=1.e-8)
