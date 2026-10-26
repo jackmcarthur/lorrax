@@ -85,6 +85,19 @@ _COMPILE_KV_NS = "lorrax/compile_agreement/v2"
 # that skew into a refusal and a hang in a collective H5Fclose.  Tests and
 # bisect probes set their own short deadline.
 _COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S = 0.0
+# The compile census (``LORRAX_COMPILE_CENSUS=1``, debug and tests): at every
+# host-collective seam (:func:`compile_seam`) each rank publishes how many
+# compile requests it has made, and the ranks must agree.  A rank-local
+# compile between two seams (an eager jnp op or a fresh jit on a rank-varying
+# shape: 5a8abc87f, the WS geometry upload that hung CPU64/GPU4) shifts that
+# rank's request numbers, so its next real compile waits for a peer record
+# that never comes while the peers wait in the seam.  The census refuses
+# instead, naming the seam: at the seam when the counts differ, or in the
+# compile wait when a peer is already at this rank's next seam without having
+# made the request this rank is making.
+_CENSUS_ENV = "LORRAX_COMPILE_CENSUS"
+_CENSUS_KV_NS = "lorrax/compile_census/v1"
+_CENSUS_POLL_MS = 500
 
 
 def _deadline_text(timeout_s: float) -> str:
@@ -132,6 +145,10 @@ class _CacheState:
         self.compile_agreement_secs = 0.0
         self._compile_client = None
         self._compile_sequence = 0
+        self.census = False            # LORRAX_COMPILE_CENSUS, read with the agreement
+        self.census_seams = 0          # seams this rank has agreed
+        self._seam_sequence = 0
+        self._last_request = ""        # "module #n", for the census refusal
         self.probe_keys: set[str] = set()
         # Routes demoted at startup, name -> why: they change which programs
         # this run compiles, so the receipts and the startup facts carry them.
@@ -667,18 +684,20 @@ def _check_compile_record(module_name: str, key: str, occurrence: int) -> None:
     reason = ""
     try:
         if s.proc_idx == 0:
-            payloads = collect_rank_records(
-                s._compile_client, prefix, s.n_proc, _timeout_ms(timeout_s),
-                what=f"every rank's record of the {module_name} compile request")
+            payloads = _census_wait(lambda ms: collect_rank_records(
+                s._compile_client, prefix, s.n_proc, ms,
+                what=f"every rank's record of the {module_name} compile request"),
+                _timeout_ms(timeout_s), module_name, occurrence)
             records = [_decode_compile_record(payload, rank)
                        for rank, payload in enumerate(payloads)]
         else:
             # An early peer may wait nearly a whole deadline for rank 0, so a
             # finite deadline is doubled with a handoff allowance.
             peer_wait_s = 2.0 * timeout_s + min(2.0, max(0.1, timeout_s * 0.1)) if timeout_s > 0 else 0.0
-            payload = wait_for_key(
-                s._compile_client, f"{prefix}/rank/0", _timeout_ms(peer_wait_s),
-                what=f"rank 0's record of the {module_name} compile request")
+            payload = _census_wait(lambda ms: wait_for_key(
+                s._compile_client, f"{prefix}/rank/0", ms,
+                what=f"rank 0's record of the {module_name} compile request"),
+                _timeout_ms(peer_wait_s), module_name, occurrence)
             records = [_decode_compile_record(payload, 0)]
     except CompileAgreementError:
         raise
@@ -693,6 +712,86 @@ def _check_compile_record(module_name: str, key: str, occurrence: int) -> None:
     if reason:
         raise CompileAgreementError(
             _format_compile_refusal(module_name, occurrence, reason, records))
+
+
+def _census_wait(fetch, timeout_ms: int, module_name: str, occurrence: int):
+    """``fetch(timeout_ms)``, the agreement's record wait, under the census.
+
+    Without the census this is one call.  With it the wait runs in
+    :data:`_CENSUS_POLL_MS` slices, and between slices reads the records of
+    this rank's NEXT seam: a peer already there that made at most
+    ``occurrence`` requests will never make this one, so this rank's compile
+    is rank-local and is refused with that seam's name.
+    """
+    s = _STATE
+    if not s.census:
+        return fetch(timeout_ms)
+    from ffi.common.broadcast import rank_records
+    started = time.monotonic()
+    while True:
+        try:
+            return fetch(_CENSUS_POLL_MS)
+        except TimeoutError:
+            pass
+        seam = s._seam_sequence
+        for payload in rank_records(s._compile_client, f"{_CENSUS_KV_NS}/seam/{seam}", s.n_proc):
+            peer = json.loads(payload) if payload is not None else None
+            if peer is not None and int(peer["requests"]) <= occurrence:
+                raise CompileAgreementError(
+                    f"compile census: rank {s.proc_idx} requests compile #{occurrence} "
+                    f"({module_name}) before host seam {seam}, but rank {peer['rank']} reached "
+                    f"that seam ({peer['label']}) after {peer['requests']} requests (its last: "
+                    f"{peer['last'] or 'none'}).  A compile only some ranks make between two "
+                    "collectives (an eager jnp op or a fresh jit on a rank-local shape) "
+                    "desynchronizes the ranks; upload with jax.device_put of a NumPy array or "
+                    "pad to an agreed shape.")
+        elapsed = time.monotonic() - started
+        if timeout_ms > 0 and elapsed * 1000 >= timeout_ms:
+            raise TimeoutError(f"the records of compile request #{occurrence} ({module_name}): "
+                               f"not within {timeout_ms / 1000:g} seconds")
+        if int(elapsed) // 60 != int(elapsed - _CENSUS_POLL_MS / 1000) // 60:
+            print(f"  [compile census] rank {s.proc_idx} still waiting for the records of "
+                  f"compile request #{occurrence} ({module_name}), {elapsed:.0f} s", flush=True)
+
+
+def compile_seam(label: str | None = None, *, depth: int = 1) -> None:
+    """A host-collective seam: under the census, the ranks agree their compile counts.
+
+    Every rank enters a seam, in the same order (it is a collective).  Each
+    publishes how many compile requests it has made; any difference is a
+    rank-local compile since the previous seam, refused here by name.  A no-op
+    unless ``LORRAX_COMPILE_CENSUS`` is set and the compile agreement is on
+    (P > 1 with a coordination client).  ``label`` defaults to the caller
+    ``depth`` frames up (the code that called the collective).
+    """
+    s = _STATE
+    if not (s.census and s.compile_agreement_enabled):
+        return
+    from ffi.common.broadcast import collect_rank_records, publish_rank_record
+    if label is None:
+        frame = sys._getframe(depth + 1)
+        label = (f"{frame.f_code.co_filename.rsplit('/src/', 1)[-1]}:{frame.f_lineno} "
+                 f"{frame.f_code.co_name}")
+    with s._compile_event_lock:
+        seam = s._seam_sequence
+        s._seam_sequence += 1
+        record = {"rank": s.proc_idx, "label": label,
+                  "requests": s._compile_sequence, "last": s._last_request}
+    prefix = f"{_CENSUS_KV_NS}/seam/{seam}"
+    publish_rank_record(s._compile_client, prefix, s.proc_idx, s.n_proc,
+                        json.dumps(record, sort_keys=True).encode("utf-8"))
+    records = [json.loads(payload) for payload in collect_rank_records(
+        s._compile_client, prefix, s.n_proc, _timeout_ms(s.compile_agreement_timeout_s),
+        what=f"every rank's compile census at host seam {seam} ({label})")]
+    s.census_seams += 1
+    if len({int(r["requests"]) for r in records}) > 1:
+        rows = "\n".join(f"  rank {r['rank']}: {r['requests']} requests, last "
+                         f"{r['last'] or 'none'}, at {r['label']}" for r in records)
+        raise CompileAgreementError(
+            f"compile census: the ranks reached host seam {seam} having made different "
+            f"numbers of compile requests, so some compiled a program the others did not "
+            f"since the previous seam (an eager jnp op or a fresh jit on a rank-local "
+            f"shape):\n{rows}")
 
 
 def _configure_compile_agreement() -> None:
@@ -734,6 +833,8 @@ def _configure_compile_agreement() -> None:
     s.compile_agreement_timeout_s = timeout_s
     s.compile_agreement_enabled = True
     s.compile_agreement_reason = "enabled"
+    from runtime.env_flags import env_bool
+    s.census = env_bool(_CENSUS_ENV, False)
     if s.proc_idx == 0:
         _debug_say(
             "cross-rank compile agreement enabled before backend compile "
@@ -969,6 +1070,7 @@ def _install_compile_counter() -> None:
                 # the ahead call on every rank, never a new one, so the count
                 # does not depend on which thread won.
                 occurrence = ahead.slot
+            s._last_request = f"{module_name} #{occurrence}"
             if s.compile_agreement_enabled:
                 _publish_compile_record(module_name, key, occurrence)
         local = s._compile_local
@@ -1151,6 +1253,8 @@ def compile_cache_stats() -> dict:
         "compile_agreement_reason": s.compile_agreement_reason,
         "compile_agreement_timeout_s": s.compile_agreement_timeout_s,
         "compile_agreement_checks": s.compile_agreement_checks,
+        "compile_census": s.census, "compile_census_seams": s.census_seams,
+        "compile_requests": s._compile_sequence,
         "compile_fingerprint_secs": s.compile_fingerprint_secs,
         "compile_agreement_secs": s.compile_agreement_secs,
         "compile_threads": compile_threads(),

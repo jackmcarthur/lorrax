@@ -866,7 +866,9 @@ def all_gather_processes(x, *, tiled: bool = False):
         return arr if tiled else arr[None]
     import jax
     from jax.experimental import multihost_utils as _mh
+    from common.jax_compile_cache import compile_seam
 
+    compile_seam(depth=1)      # LORRAX_COMPILE_CENSUS: the ranks' compile counts agree
     if not isinstance(x, jax.Array):
         arr = np.asarray(x)
         if arr.nbytes * process_count() <= _HOST_GATHER_BYTES:
@@ -1085,7 +1087,7 @@ def local_share(items):
 
 def sweep_local_k(ks_local, blk: int, item_shape, per_k, *,
                   lookahead: int | None = None,
-                  print_fn=print, label: str = "k"):
+                  print_fn=print, label: str = "k", idle_k: int | None = None):
     """Run ``per_k(ik)`` over this rank's local k — **ONE host readback**.
 
     ``per_k`` returns k's ``item_shape`` block (``(nb, nb)`` for every caller
@@ -1120,8 +1122,12 @@ def sweep_local_k(ks_local, blk: int, item_shape, per_k, *,
     that still overlaps read *k+1* with compute *k*; it caps the extra
     residency at one box.  Note ``block_until_ready`` is a synchronisation,
     NOT a transfer, so the one-readback contract holds for any lookahead.
+
+    ``idle_k`` is the k a rank with an empty share evaluates and discards, so
+    that every rank compiles ``per_k``'s programs (:func:`gather_k_blocks`
+    passes 0 whenever there is a k).
     """
-    import jax.numpy as jnp
+    import jax
     import numpy as np
 
     ks_local = [int(v) for v in ks_local]
@@ -1136,10 +1142,19 @@ def sweep_local_k(ks_local, blk: int, item_shape, per_k, *,
         blocks.append(per_k(ik))
         if j >= depth:
             blocks[j - depth].block_until_ready()
+    if not ks_local and idle_k is not None:
+        # A rank with no k still compiles per_k's programs (``idle_k``,
+        # discarded): the compile agreement numbers every request, and a rank
+        # that skipped them would request the next program under a number its
+        # peers used for these, then wait for records they never publish (P > nk).
+        jax.block_until_ready(per_k(int(idle_k)))
 
     vals = np.zeros(shape, dtype=np.complex128)
     if blocks:
-        stacked = np.asarray(jnp.stack(blocks))          # <-- the ONE readback
+        # The ONE readback, with no device program: an eager ``jnp.stack``
+        # compiled one concatenate per block count, and the count is this
+        # rank's share of k (2 or 3 at nk=16, P=6), so ranks diverged.
+        stacked = np.stack(jax.device_get(blocks))
         if stacked.shape[1:] != shape[1:]:
             raise ValueError(
                 f"{label}: per_k returned {stacked.shape[1:]} but "
@@ -1186,7 +1201,8 @@ def gather_k_blocks(n_k: int, per_k, *, item_shape, label: str,
     with timing.section(f"{label}_k"):
         vals, idx = sweep_local_k(ks_local, max(1, -(-n_k // world)),
                                   item_shape, per_k, lookahead=lookahead,
-                                  print_fn=print_fn, label=label)
+                                  print_fn=print_fn, label=label,
+                                  idle_k=0 if n_k else None)
     with timing.section(f"{label}_gather"):
         if owner_only:
             return gather_indexed_blocks_to_owner(vals, idx, n_k)
