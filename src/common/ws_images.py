@@ -427,8 +427,9 @@ def pair_ws_local_codes(images: dict, blocks) -> tuple[list[np.ndarray], np.ndar
     count = int(np.max(all_gather_processes(np.array([widths.size], np.int64))))
     widths = np.unique(all_gather_processes(np.pad(widths, (0, count - widths.size))))
     widths = widths[widths > 0]
-    with jax.default_device(jax.local_devices()[0]):
-        a, b, valid = (jnp.asarray(images[k]) for k in ("a", "b", "valid"))
+    device = jax.local_devices()[0]
+    with jax.default_device(device):
+        a, b, valid = (jax.device_put(images[k], device) for k in ("a", "b", "valid"))
         kernels, peak = {}, 0
         for width in widths:
             kernel = _class_ties.lower(
@@ -458,8 +459,10 @@ def pair_ws_local_codes(images: dict, blocks) -> tuple[list[np.ndarray], np.ndar
                 # One compiled shape per block width, including its short
                 # tail. Padded decisions are discarded before interning.
                 disp = np.pad(disp, ((0, width - flat.size), (0, 0)))
+                # Upload local geometry without an eager primitive compile:
+                # different ranks can visit these widths in different orders.
                 masks, first, single = (np.asarray(v)[:, :flat.size] for v in
-                    kernels[width](jnp.asarray(disp), a, b, valid, float(images["tol"])))
+                    kernels[width](jax.device_put(disp, device), a, b, valid, float(images["tol"])))
                 found, block_code = _tie_pattern_codes(masks, first, single, n_t)
                 ids = []
                 for mask in found:
