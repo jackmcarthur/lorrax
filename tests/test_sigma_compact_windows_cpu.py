@@ -60,6 +60,51 @@ def test_parent_selection_keeps_host_payload_off_devices(monkeypatch):
         owner.parent_rows(irr, 4, values[:5])
 
 
+def test_frequency_pieces_share_exact_state_indices_and_escape_attribution(monkeypatch):
+    from gw import sigma_box_plan as owner
+    specs = []
+    original = owner.fit_sigma_box_specs
+
+    def fit(rows, *args, **kwargs):
+        specs.extend(rows)
+        return original(rows, *args, **kwargs)
+
+    monkeypatch.setattr(owner, 'fit_sigma_box_specs', fit)
+    _, _, energy, base, weight, _ = _plan()
+    live = (base & np.isfinite(energy) & np.isfinite(weight) & (np.abs(weight) > 0))
+    groups = {}
+    for spec in specs:
+        lo, hi = spec['state_interval']
+        indices = np.flatnonzero((live & (energy > lo) & (energy <= hi)).reshape(-1))
+        np.testing.assert_array_equal(spec['state_indices'], indices)
+        np.testing.assert_array_equal(spec['states'], energy.reshape(-1)[indices])
+        assert spec['state_shape'] == energy.shape
+        groups.setdefault((lo, hi), []).append(spec)
+        # An exact clipped certificate must still name the same physical
+        # state, including ties and the band immediately above the edge.
+        low, high = 0., .1
+        values = energy.reshape(-1)[indices]
+        outside = np.flatnonzero((values < low) | (values > high))
+        worst = outside[np.argmax(np.maximum(low-values[outside], values[outside]-high))]
+        k, n = np.unravel_index(indices[worst], energy.shape)
+        entry = dict(certified=dict(states_ry=(low, high),
+            poles_ry=spec['pole_extent'][:2],
+            omega_ry=(spec['frequencies'].min(), spec['frequencies'].max())))
+        text = owner._escape_attribution(entry, spec)
+        assert f'state k={k} band={n+1} (Sigma band carrier)' in text
+        assert f'({outside.size} state(s) outside)' in text
+    repeated = [rows for rows in groups.values() if len(rows) > 1]
+    assert repeated
+    for rows in repeated:
+        assert all(row['state_indices'] is rows[0]['state_indices'] for row in rows)
+        assert all(np.shares_memory(row['states'], rows[0]['states']) for row in rows)
+    # Geometry retains only the physical shape, not a full energy array
+    # merely to recover that shape later; E_A's own lifetime is unchanged.
+    shape, _, _, support = owner._live_states(specs[0]['branch'])
+    assert isinstance(shape, tuple) and shape == energy.shape
+    np.testing.assert_array_equal(support, live)
+
+
 def check_compact_window_fold(mesh, observe=None):
     from gw.centroid_k_unfold import parent_rows
     from gw.greens_function_kernel import _weighted_tau_phases

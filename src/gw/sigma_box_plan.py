@@ -184,7 +184,7 @@ def _live_states(branch):
     indices = np.flatnonzero(live.reshape(-1)).astype(np.int32)
     if not indices.size:
         raise ValueError(f"Sigma box branch {branch.tag!r} has no live states")
-    return energy, energy.reshape(-1)[indices], indices, live
+    return energy.shape, energy.reshape(-1)[indices], indices, live
 
 
 def _product_geometry(branches, eta, edge_factor):
@@ -1656,11 +1656,10 @@ def plan_sigma_windows(
             pole_indices, pole_stats = _pole_rows(summaries, selector)
             if not local.size or not owned.size or not pole_indices.size:
                 continue
-            states = raw_energy[local]
-            owned_all = owned
+            states, state_indices = raw_energy[local], flat_indices[local]
             base_name = f"{branch.tag}:{name}"
             pieces, split_report = _coarse_runs(
-                base_name, owned_all, positions, frequencies, omega_eta, omega_grp, fixed,
+                base_name, owned, positions, frequencies, omega_eta, omega_grp, fixed,
                 states, pole_stats, pole_sign, eta, coarse_eps, held_rules)
             if split_report is not None:
                 split_reports.append(split_report)
@@ -1708,8 +1707,8 @@ def plan_sigma_windows(
                         _BOX_SIGN_FRACTION * geometry["state_edge_ry"])
                 spec.update({
                     "branch": branch,
-                    "state_indices": flat_indices[local],
-                    "state_shape": state_shape.shape,
+                    "state_indices": state_indices,
+                    "state_shape": state_shape,
                     "state_support": support,
                     "state_interval": (float(state_lo), float(state_hi)),
                     "pole_indices": pole_indices,
