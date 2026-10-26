@@ -152,8 +152,9 @@ The keys below are input keys of the GW input file, with absorption.inp's names;
 | `number_val_bands_fine`, `number_cond_bands_fine` | same | The BSE window. |
 | `number_cond_bands_coarse` | same | Conduction bands of the GW grid in the band interpolation; default `ncond`. |
 | `number_val_bands_coarse` | accepted, ignored | The H-transform fits every valence band. |
-| `lowest_occupied_band`, `highest_occupied_band` | [`highest_occupied_band`](../drivers/bse/keywords.md#highest_occupied_band) | Default: the WFN's `ifmax`. |
-| `WFN_fi` grid, its kgrid.x shift | [`kgrid_fine`](../drivers/bse/keywords.md#kgrid_fine), [`kgrid_fine_shift`](../drivers/bse/keywords.md#kgrid_fine_shift) | $\psi$, $E^{\mathrm{QP}}$ and $W$ move to $\bk_{\mathrm{fi}}$ by band interpolation; no fine-grid WFN is read. |
+| `highest_occupied_band` | [same](../drivers/bse/keywords.md#highest_occupied_band) | Default: the WFN's `ifmax`. |
+| `lowest_occupied_band` | none | Not read. An input file that names it refuses as an unknown key. |
+| `WFN_fi` grid, its kgrid.x shift | [`kgrid_fine`](../drivers/bse/keywords.md#kgrid_fine), [`kgrid_fine_shift`](../drivers/bse/keywords.md#kgrid_fine_shift) | $\psi$, $E^{\mathrm{QP}}$ and $W$ move to $\bk_{\mathrm{fi}}$ by band interpolation; no fine-grid WFN is read. `kgrid_fine_shift` is kgrid.x's `dk`, in fractions of one step of the fine Monkhorst–Pack grid. |
 | `kernel_k_interpolation`, `delaunay_interpolation`, `greedy_interpolation`, `use_symmetries_fine_grid`, `no_symmetries_fine_grid` | none | |
 | `eqp_corrections`, `eqp_co_corrections` | same | Without / with `kgrid_fine`. A bare key reads `eqp.dat` / `eqp_co.dat`; a value names the file (`eqp1.dat`, LORRAX's or BerkeleyGW's, on the WFN wedge). |
 | `diagonalization`, `diagonalization_primme` | [`solver`](../drivers/bse/keywords.md#solver) with [`number_eigenvalues`](../drivers/bse/keywords.md#number_eigenvalues) | Iterative solvers for the lowest states (`davidson` by default; its exact diagonal is what BerkeleyGW hands PRIMME); no dense TDA diagonalization. |
@@ -168,7 +169,7 @@ The keys below are input keys of the GW input file, with absorption.inp's names;
 | `delta_frequency` | same | Plus `omega_min_ev`, `omega_max_ev` (0, 15 eV). |
 | `number_eigenvalues`, `write_eigenvectors` | same | `write_eigenvectors` < 0 writes every computed state. |
 | `noeh_only` | none | `absorption_noeh.dat` and `eigenvalues*_noeh.dat` are written beside the excitonic files. |
-| `use_dos` | [`kpm_dos = true`](../drivers/bse/keywords.md#kpm_dos) | KPM density of states of $H$. |
+| `use_dos` | [`kpm_dos = true`](../drivers/bse/keywords.md#kpm_dos) | BerkeleyGW's `use_dos` replaces the dipole operator by unity, so its spectrum becomes the density of exciton states. `kpm_dos = true` gives that density of states of $H$ by the kernel polynomial method. |
 | `degeneracy_check_override` | same | `band_degeneracy = off`; `bse.absorption_haydock` always checks `strict`. |
 | `cell_average_cutoff`, `average_w` | none | The heads come from the bundle; under `kgrid_fine`, [`head_minibz_average`](../drivers/bse/keywords.md#head_minibz_average) must match the GW run. |
 | `exchange_factor`, `direct_factor`, `kernel_scaling` | none | |
@@ -189,6 +190,17 @@ Each row is a place where the two codes, given one `WFN.h5`, compute different o
 | $\bk$ list | The `sigma.inp` list. | The WFN wedge, in WFN order. | Join by crystal coordinate modulo a reciprocal lattice vector. |
 
 The imposed-head keys are on [The q → 0 head §6](../theory/q0-head.md#bgw-impose); the extrapolation model is on [Band extrapolation](../theory/band-extrapolation.md#trunc-compare).
+
+### Plasmon-pole and Coulomb settings {: #ppm-coulomb }
+
+A plasmon-pole comparison needs the same pole model, the same treatment of invalid poles and the same bare interaction in both codes.
+
+- **Godby–Needs.** `frequency_dependence 3` corresponds to `compute_mode = gn_ppm`. The second sample sits at the imaginary probe `imaginary_frequency` in the plane-wave code and at [`ppm_omega_p`](../drivers/gw/keywords.md#ppm_omega_p) in LORRAX, both 2 Ry by default. LORRAX's Hybertsen–Louie model is still in progress, so GN is the model to compare.
+- **Invalid poles.** An element whose fit gives no real pole frequency is handled by `invalid_gpp_mode` in the plane-wave code and by [`ppm_invalid_mode`](../drivers/gw/keywords.md#ppm_invalid_mode) in LORRAX. Mode 3, the default in both, drops the pole and adds its static limit (`static_limit`). Mode 0 drops it (`zero`), mode 2 replaces it by a 2 Ry pole (`2ry`), and mode 1 has no LORRAX counterpart. LORRAX's GN model also replaces at most the lowest and highest 0.2 % of the valid pole frequencies by `ppm_fallback_omega` ([Frequency treatments §4.3](../theory/frequency-treatments.md#ppm-invalid)).
+- **The plasmon-pole head.** The plane-wave code fits its pole to the $\bG=\bG'=0$ element of its $\bq_0$ matrix. LORRAX fits one pole to the correlation part of the head at $\omega=0$ and at the probe. The two heads agree when the two $W_{00}$ agree at both frequencies, so a GN comparison imposes `whead_0freq` and `whead_imfreq` together.
+- **The Coulomb hole.** With a plasmon pole the plane-wave code's default `exact_static_ch 0` adds no static remainder, so its unprimed and primed columns both hold the partial sum that LORRAX computes. With `exact_static_ch 1`, compare the primed columns.
+- **Mini-BZ averages of the bare interaction.** LORRAX's default `mc_average_vcoul_body = true` replaces, at every $\bq\neq0$, the element with the smallest $\lvert\bq+\bG\rvert$ by its Monte Carlo average over the mini Brillouin zone, on bulk runs only. The plane-wave code averages the elements below `cell_average_cutoff`. The two compute the same bare interaction only with `cell_average_cutoff 1.0d-12` and `mc_average_vcoul_body = false`. On a static-COHSEX Si comparison the two defaults differ by 136 meV in $\Sigma^x$, and the matched pair by 0.35 meV.
+- **The plane-wave code's own Coulomb table.** [`use_bgw_vcoul`](../drivers/gw/keywords.md#use_bgw_vcoul) `= true` with [`bgw_vcoul_file`](../drivers/gw/keywords.md#bgw_vcoul_file) replaces LORRAX's $v(\bq+\bG)$ by the `vcoul` table written under `write_vcoul`. Take it from the `sigma.x` run, since `epsilon.x` writes it at the shifted $\bq_0$ without averaging. Its first row is the plane-wave code's averaged bare head.
 
 ### Comparing outputs {: #outputs }
 
