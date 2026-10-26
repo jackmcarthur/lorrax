@@ -170,7 +170,7 @@ Frobenius) and the lowest 40 absorption eigenvalues by 0.009 meV on average,
 0.078 meV at most (0.007 % of the QP gap, 1.080 eV). Sigma, unlike
 `kernel.x`, truncates at its own `screened_coulomb_cutoff`.
 
-## 4. The reverse: BerkeleyGW ε⁻¹ onto ζ
+## 4. The reverse: BerkeleyGW ε⁻¹ onto ζ {#project}
 
 $$
 W^{\text{BGW}} = V + Z_\varepsilon^\dagger\,\big(\varepsilon^{-1}_{\text{BGW}}-1\big)\,v_\varepsilon Z_\varepsilon ,
@@ -192,17 +192,59 @@ the round trip returns W − V on the kept span: 1.0e-13 and 1.2e-14 on CrI3 6×
 On a smaller sphere $\|V_\varepsilon BKB^\dagger V_\varepsilon-(W-V)\|/\|W-V\|$
 is the part of W that the cut leaves out (`epsmat_ecut`, §3); it is printed per q.
 
-`mode = project` copies the bundle to `output_dir/tmp`, replaces `W0_qmunu` by
-(E7) at every stored q and stamps `W0_source = bgw_epsmat` with the reference
-path; the source is never written (`GATE epsmat_project_output`). Both
-directions take $v$ at the file's own q and G list, which for q ≠ 0 is V_q's
-own $v$ (the same vector $q+G$) and at Γ is $v(q_0+G')$. At Γ the
-G = 0 row and column of `eps0mat.h5` are dropped: the bundle's Γ body has
-v(G = 0) = 0 and LORRAX carries the head as its rank-one `whead` term, which
-is kept from the bundle (§5). Both modes write `epsmat_<mode>.json` in
-`output_dir`: per q the gate figures, the range of K and, for `project`, the
-Hermiticity of the projected BerkeleyGW W − V (a check of the block
-orientation on BerkeleyGW's own data) and $\|K_{\text{BGW}}-K\|_2/\|K\|_2$.
+`mode = project` copies the bundle to `output_dir/tmp`, writes (E7) at every
+stored q and stamps `W0_source = bgw_epsmat`, the reference path and each
+file's size, mtime and header digest; the source is never written
+(`GATE epsmat_project_output`). Both directions take $v$ at the file's own q
+and G list, which for q ≠ 0 is V_q's own $v$ (the same vector $q+G$) and at Γ
+is $v(q_0+G')$. At Γ the G = 0 row and column of `eps0mat.h5` are dropped: the
+bundle's Γ body has v(G = 0) = 0 and LORRAX carries the head separately.
+BerkeleyGW's own head ε⁻¹₀₀(q0, ω) is stored as `bgw_epsinv_head` (one entry
+per frequency) for the GW driver, and the producer's `whead` is kept for the
+BSE.
+
+**Frequencies.** A `frequency_dependence 0` epsilon (`freq_dep 0`) gives W(0)
+in `W0_qmunu`; a `frequency_dependence 3` epsilon (`freq_dep 3`, the
+Godby–Needs pair ω = 0 and iω_p, `freqs = [(0, 0), (0, ω_p)]` eV) also gives
+W(iω_p) in `Wp_qmunu`, each dataset stamped with its ω in Ry. These are the
+two supports of LORRAX's GN-PPM fit, so the GW driver with
+`screening_source = bgw_epsmat` runs Σ on BerkeleyGW's W with no χ₀ and no
+Dyson solve, its q → 0 head at each ω being BerkeleyGW's ε⁻¹₀₀(q0, ω) through
+the `wcoul0_source = epshead` cell average. Full-frequency files refuse
+(`GATE epsmat_project_freq_dep`), as do two files with different frequency
+tables (`GATE epsmat_project_freqs_differ`).
+
+**q coverage.** Γ is `eps0mat.h5` row 0. A stored q ≠ 0 takes the `epsmat.h5`
+row equal to it up to a lattice vector $G_0$ (ζ̃ read at $G+G_0$), else a row
+$q_f$ with $q_s \equiv Sq_f$ under a WFN symmetry row S (antiunitary rows only
+on a measured time-reversal-invariant WFN), BerkeleyGW's own irreducible q
+list being the usual case. With $G_s = S(q_f+G_f)-q_s$ and the export's
+Fourier phase φ (`parent_gvectors`, which must map every $G_s$ back to its
+$G_f$, `GATE epsmat_project_image`),
+
+$$
+\varepsilon^{-1}_{q_s}(G_s,G_s') = \varphi_s\,\tilde\varepsilon^{-1}_{q_f}(G_f,G_f')\,\bar\varphi_{s'},
+\tag{E7a}
+$$
+
+with $\tilde\varepsilon^{-1}$ the file block, conjugated on an antiunitary row,
+so (E7) runs on the file block with ζ̃ columns scaled by $\bar\varphi$ (and
+both conjugated, then W_c conjugated back, on an antiunitary row). A stored q
+with no such row refuses, naming every one (`GATE epsmat_project_q_coverage`).
+
+**Gates and receipt.** Before any block: the files' q grid, cell volume and
+truncation (`icutv` 0 for `sys_dim = 3`, 6 for 2) match the bundle
+(`GATE epsmat_project_crystal`), ε⁻¹ is `matrix_type 0` with one spin matrix
+(`GATE epsmat_project_matrix_type`) and every row is done
+(`GATE epsmat_project_incomplete`). Per q: V from ζ and v equals the bundle's V
+(`GATE epsmat_v_reconstruction`), every file G lies in the stored ζ sphere
+(`GATE epsmat_project_sphere`), and at every frequency the whitened projection
+$K_{\text{BGW}} = B^\dagger W_c B$ lies in [−1, 0]: a positive eigenvalue above
+1e-3 |K_min| refuses (`GATE epsmat_project_passivity`). `epsmat_project.json`
+holds per q and frequency the range of K, the Hermiticity of the projected
+W − V and, when the bundle has LORRAX's own W(0),
+$\|W_c^{\text{BGW}}-W_c\|/\|W_c\|$. LORRAX's W(0) is not needed: the bundle
+of a `compute_mode = x_only` run (V and ζ) is enough.
 
 ## 5. q → 0
 
@@ -393,5 +435,6 @@ to 1.5 × 10⁻¹⁴.
 
 ## 9. Not exported
 
-* A frequency axis (`freq_dep` 2 or 3): the bundle holds W(0) only.
-* Symmetry-rotated q (§7).
+* A frequency axis (`freq_dep` 2 or 3): the bundle holds W(0) only. The
+  projection (§4) reads `freq_dep` 3.
+* Symmetry-rotated q (§7); the projection (§4) reads them.

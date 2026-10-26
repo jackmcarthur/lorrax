@@ -816,6 +816,104 @@ def refuse_mpa_static_w(filename) -> None:
             "write_restart_tensors = true, and point the BSE at that restart.")
 
 
+#: The datasets ``gw.epsmat_cli mode = project`` writes, by screening role.
+PROJECTED_W_DATASETS = {"static": "W0_qmunu", "probe": "Wp_qmunu"}
+
+
+def read_projected_screening(filename, roles, V_q, mesh_xy):
+    """BerkeleyGW's projected W rows on V's q layout, their heads and provenance.
+
+    ``roles`` maps a screening role (``"static"``, ``"probe"``) to the run's
+    frequency (Ry).  Each role's dataset (:data:`PROJECTED_W_DATASETS`) must
+    carry ``W0_source = bgw_epsmat`` and the run's frequency (GATE
+    ``screening_source_provenance`` / ``screening_source_frequency``); on a
+    q wedge its unfold tables must be V's (GATE ``screening_source_q_rows``).
+    The rows come back on V's own layout: a wedge ``QirrOperator`` sharing
+    V's tables when V is held on the wedge, else the full zone
+    (``QirrOperator.whole_zone``), both at ``P(None, 'x', 'y')`` with V's μ
+    padding.  Returns ``({role: W}, {role: eps^-1_00(q0)}, provenance)``.
+    """
+    import dataclasses
+    from symmetry_maps import QirrOperator, dataset_q_storage
+    from .slab_io import SlabIO
+
+    def refuse(gate, got, want, why, fix):
+        raise ValueError(f"GATE {gate}: got {got}; want {want}; why: {why}; fix: {fix}")
+
+    def attr(ds, key, default=""):
+        v = ds.attrs.get(key, default)
+        return v.decode() if isinstance(v, bytes) else (str(v) if isinstance(v, str) else v)
+
+    fix = ("run gw.epsmat_cli mode = project on BerkeleyGW's eps0mat.h5/epsmat.h5 and "
+           "restart from its output_dir")
+    with h5py.File(filename, "r") as f:
+        _require_current(f)
+        v_storage, v_hash = dataset_q_storage(f["V_qmunu"]), attr(f["V_qmunu"], "qirr_table_hash")
+        shapes, heads_file, omegas_file, provenance = {}, None, None, {}
+        for role, omega in roles.items():
+            name = PROJECTED_W_DATASETS[role]
+            if name not in f:
+                refuse("screening_source_dataset", f"no {name} in {filename}",
+                       f"{name} ({role} W)", f"the {role} role reads it", fix
+                       + (" from a frequency_dependence 3 epsilon" if role == "probe" else ""))
+            ds = f[name]
+            if attr(ds, "W0_source") != "bgw_epsmat":
+                refuse("screening_source_provenance",
+                       f"{name} W0_source = {attr(ds, 'W0_source')!r}", "'bgw_epsmat'",
+                       "screening_source = bgw_epsmat reads BerkeleyGW's projected epsilon "
+                       "and nothing else under its name", fix)
+            om = complex(float(ds.attrs.get("omega_ry_re", np.nan)),
+                         float(ds.attrs.get("omega_ry_im", np.nan)))
+            if not abs(om - complex(omega)) <= 1e-5 * max(1.0, abs(complex(omega))):
+                refuse("screening_source_frequency",
+                       f"{name} at omega = {om} Ry, the run's {role} omega = {complex(omega)} Ry",
+                       "the same frequency", "the pole fit places W at the run's frequency",
+                       "set ppm_omega_p to the epsilon file's imaginary frequency (Ry)")
+            if dataset_q_storage(ds) != v_storage or (
+                    v_storage == "ibz" and attr(ds, "qirr_table_hash") != v_hash):
+                refuse("screening_source_q_rows",
+                       f"{name} q storage {dataset_q_storage(ds)} / tables "
+                       f"{attr(ds, 'qirr_table_hash')}, V {v_storage} / {v_hash}",
+                       "V's stored q rows", "W and V are read row by row together", fix)
+            shapes[role] = (name, tuple(int(s) for s in ds.shape), ds.dtype)
+            provenance[role] = {"dataset": name, "omega_ry": om,
+                                "bgw_files": attr(ds, "bgw_files"),
+                                "bgw_reference": attr(ds, "bgw_reference")}
+        if "bgw_epsinv_head" in f:
+            d = f["bgw_epsinv_head"]
+            heads_file = np.asarray(d[()], dtype=np.complex128).reshape(-1)
+            omegas_file = (np.asarray(d.attrs["omega_ry_re"], dtype=np.float64)
+                           + 1j * np.asarray(d.attrs["omega_ry_im"], dtype=np.float64))
+    heads = {}
+    for role, omega in roles.items():
+        hit = (np.flatnonzero(np.abs(omegas_file - complex(omega))
+                              <= 1e-5 * max(1.0, abs(complex(omega))))
+               if heads_file is not None else np.zeros(0, int))
+        if hit.size != 1:
+            refuse("screening_source_head", f"no BerkeleyGW head at omega = {complex(omega)} Ry "
+                   f"in {filename}", "bgw_epsinv_head at every role's frequency",
+                   "the q->0 head of the projected W is BerkeleyGW's eps^-1_00(q0)", fix)
+        heads[role] = complex(heads_file[int(hit[0])])
+
+    wedge = isinstance(V_q, QirrOperator) and not V_q.is_whole_zone()
+    n_rmu_pad = int(np.shape(getattr(V_q, "values", V_q))[-1])
+    out = {}
+    for role, (name, shape, dtype) in shapes.items():
+        if wedge:
+            if shape[0] != int(V_q.n_wedge):
+                refuse("screening_source_q_rows", f"{name} {shape[0]} rows, V's wedge "
+                       f"{int(V_q.n_wedge)}", "V's stored q rows",
+                       "W and V are read row by row together", fix)
+            off, req, spec = _munu_slab_request(shape, n_rmu_pad)
+            with SlabIO(filename, mode="r", mesh=mesh_xy) as io:
+                values = io.read_slab(name, shape=req, dtype=dtype, offset=off,
+                                      mesh=mesh_xy, partition_spec=spec)
+            out[role] = dataclasses.replace(V_q, values=values, load=None)
+        else:
+            out[role] = QirrOperator.whole_zone(read_munu_tensor_from_h5(filename, name, mesh_xy))
+    return out, heads, provenance
+
+
 def read_interaction(filename, kind, mesh_xy, *, nohead=False):
     """Return a padded, full-q interaction with P(None, x, y) sharding."""
     return read_munu_tensor_from_h5(

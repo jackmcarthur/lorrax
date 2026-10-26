@@ -763,6 +763,16 @@ def compute_screening_model(
     """
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
+    if getattr(config.screening, "source", "compute") == "bgw_epsmat":
+        # THE OTHER FORK OF THIS SEAM: which W satisfies the request is
+        # BerkeleyGW's, projected into the restart by gw.epsmat_cli.
+        requests = screening_requests_for(mode, config)
+        if static_only:
+            requests = [r for r in requests if r.role == "static"]
+        return read_imported_screening(
+            requests, V_q, config=config, sym=sym, mesh_xy=mesh_xy,
+            tensors_filename=tensors_filename, head_resolver=head_resolver,
+            print_fn=print_fn)
     if mode.is_pole_route:
         if static_only:
             return {}
@@ -901,6 +911,54 @@ def compute_screening_model(
         iteration_head_response=iteration_head_response)
 
 
+def read_imported_screening(requests, V_q, *, config, sym, mesh_xy, tensors_filename,
+                            head_resolver, print_fn=print):
+    """``screening_source = bgw_epsmat``: the requested W roles from BerkeleyGW's epsilon.
+
+    ``gw.epsmat_cli mode = project`` wrote W_omega = V + Z_eps^H [(eps^-1_omega
+    - 1) diag(v)] Z_eps into the restart's ISDF tensor file (``W0_qmunu``
+    at omega = 0, ``Wp_qmunu`` at the Godby-Needs i omega_p;
+    docs/theory/bgw_epsmat_export.md section 4).  This reads those rows on
+    V's q layout (``file_io.restart_bundle.read_projected_screening``) in
+    place of chi0 and the Dyson solve, gates each like a computed W
+    (:func:`_gate_w`), and installs BerkeleyGW's eps^-1_00(q0, omega) as the
+    q->0 head at every role's frequency (``HeadResolver.install_epsinv_heads``):
+    the projected rows carry no G = 0 row or column at Gamma.  Returns
+    ``{role: QirrOperator}`` as :func:`compute_screening` does.
+    """
+    from file_io.restart_bundle import read_projected_screening
+    if tensors_filename is None:
+        raise ValueError("GATE screening_source_restart: got no ISDF tensor file; want "
+                         "restart = true on the projection's output_dir; why: the projected "
+                         "W is read from it; fix: set restart = true")
+    roles = {r.role: complex(r.omega_ry) for r in requests}
+    if "probe" in roles and _trs_verdict(sym) is False:
+        raise ValueError(
+            "GATE screening_source_trs: got a measured time-reversal-broken deck; want "
+            "time-reversal symmetry; why: BerkeleyGW's W(i omega_p) carries no odd "
+            "channel, which the ordered GN fit of this deck needs; fix: "
+            "screening_source = compute")
+    with timing.section("W.read_bgw_epsmat"):
+        W_by_role, heads, prov = read_projected_screening(
+            tensors_filename, roles, V_q, mesh_xy)
+    for req in requests:
+        with timing.section("W.gate"):
+            _gate_w(W_by_role[req.role], req, mesh_xy=mesh_xy, print_fn=print_fn,
+                    trs_allowed=_trs_verdict(sym))
+    samples = (head_resolver.install_epsinv_heads(
+        {roles[role]: heads[role] for role in roles}, source="bgw_eps0mat")
+        if head_resolver is not None else [])
+    for role in roles:
+        log.info(f"  screening_source = bgw_epsmat: {role} W from "
+                 f"{prov[role]['dataset']} at omega = {prov[role]['omega_ry']} Ry "
+                 f"(BerkeleyGW {prov[role]['bgw_reference']}); "
+                 f"eps^-1_00(q0) = {heads[role]:.6f}")
+    for smp in samples:
+        log.info(f"  head from BerkeleyGW eps0mat at omega = {smp.omega} Ry: "
+                 f"v(q->0) = {smp.vc0.real:.4f}, W(q->0) = {smp.wcoul0.real:.4f} a.u.")
+    return W_by_role
+
+
 def driver_persists_w0(mode, config) -> bool:
     """Does the DRIVER own the W0 restart flush for this run?
 
@@ -948,6 +1006,10 @@ def driver_persists_w0(mode, config) -> bool:
     that creates them.
     """
     if not mode.needs_screening:
+        return False
+    if getattr(config.screening, "source", "compute") != "compute":
+        # screening_source = bgw_epsmat: the projection wrote W0_qmunu;
+        # the driver read it and must not stamp it as its own.
         return False
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))

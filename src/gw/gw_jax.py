@@ -605,6 +605,9 @@ def _prepare_oneshot_response(
     if (do_screened
             and folds_scalar_head(config)
             and config.screening.diagrams is ScreeningDiagrams.W_RPA
+            # screening_source = bgw_epsmat installs BerkeleyGW's head instead
+            # (gw.screening.read_imported_screening): no DFT head response.
+            and config.screening.source == "compute"
             and not packed_photon_replaces_charge_sigma(config)
             and qp_solver is not QPSolver.SELF_CONSISTENT):
         from .qsgw_head import build_dft_head_response, head_quadrature_omegas

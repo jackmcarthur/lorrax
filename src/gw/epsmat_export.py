@@ -35,7 +35,8 @@ log = get_logger(__name__)
 __all__ = [
     "match_q_umklapp", "zeta_slots", "coulomb_whitener", "q0_body_policy", "q0_dipole_terms",
     "whitened_correlation", "epsinv_block", "project_block", "coulomb_gram",
-    "run_epsmat_export", "run_epsmat_projection",
+    "run_epsmat_export", "run_epsmat_projection", "projection_frequencies",
+    "import_q_plan", "import_gvectors", "import_zeta_face", "W_SOURCE_BGW",
 ]
 
 _XY = ("x", "y")
@@ -470,6 +471,8 @@ class ExportSource(NamedTuple):
     sym: object                  # SymMaps: the shared reciprocal/antiunitary action
     q_full: np.ndarray           # (nk_full, 3), the complete unshifted q grid
     q_tables: object             # validated persisted QirrTables, or None for full storage
+    w0_ready: bool = True        # the bundle carries LORRAX's own ready W0_qmunu
+    storage: str = "full"        # V_qmunu's q storage: "ibz" (the wedge) or "full"
 
 
 def _bundle_file(source_restart):
@@ -485,10 +488,11 @@ def _bundle_file(source_restart):
     return hits[0]
 
 
-def export_q_metadata(bundle, wfn, kgrid, storage):
+def export_q_metadata(bundle, wfn, kgrid, storage, *, with_w0=True):
     """Full-q geometry and the persisted, authenticated parent/action tables.
 
-    Metadata only: neither V nor W is read or unfolded here.
+    Metadata only: neither V nor W is read or unfolded here.  ``with_w0``:
+    W0's tables must be V's (a bundle without W0 checks V alone).
     """
     from symmetry_maps import bgw_integer_q_to_fractional, read_tables, read_tensor
     if not np.array_equal(np.asarray(wfn.kgrid), np.asarray(kgrid)):
@@ -500,7 +504,7 @@ def export_q_metadata(bundle, wfn, kgrid, storage):
     tables = None
     if storage == "ibz":
         _, vh = read_tensor(bundle, "V_qmunu", metadata_only=True)
-        _, wh = read_tensor(bundle, "W0_qmunu", metadata_only=True)
+        _, wh = (read_tensor(bundle, "W0_qmunu", metadata_only=True) if with_w0 else (None, vh))
         tables = read_tables(bundle, "V_qmunu")
         if (vh.table_hash != wh.table_hash or tables.n_q_full != len(q_full)
                 or tables.n_sym_spatial != len(sym.sym_matrices)):
@@ -520,8 +524,13 @@ def export_q_metadata(bundle, wfn, kgrid, storage):
     return sym, np.asarray(q_full), tables
 
 
-def open_export_source(cfg, mesh, *, print_fn=None):
-    """Open the producer's bundle, ζ and Coulomb geometry; refuse unsupported decks."""
+def open_export_source(cfg, mesh, *, print_fn=None, require_w0=True):
+    """Open the producer's bundle, ζ and Coulomb geometry; refuse unsupported decks.
+
+    ``require_w0`` (the export): the bundle must carry a ready ``W0_qmunu``.
+    The projection reads V and ζ only and compares with LORRAX's W(0) when
+    the bundle has one (``ExportSource.w0_ready``).
+    """
     import h5py
     from ffi import _services
     _services.ensure_on_path()
@@ -546,7 +555,8 @@ def open_export_source(cfg, mesh, *, print_fn=None):
     geometry = CoulombGeometry.from_wfn(wfn)
     with h5py.File(bundle, "r") as f:
         kgrid = tuple(int(k) for k in np.asarray(f["kgrid"][()]))
-        if "W0_qmunu" not in f or not bool(f["W0_qmunu"].attrs.get("W0_ready", False)):
+        w0_ready = "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False))
+        if require_w0 and not w0_ready:
             _refuse("epsmat_requires_w0", f"{bundle} without a ready W0_qmunu",
                     "a GW bundle with persisted static W", "ε⁻¹ is built from W(0)",
                     "rerun the producer with write_restart_tensors = true")
@@ -564,7 +574,8 @@ def open_export_source(cfg, mesh, *, print_fn=None):
                 "whead": (np.asarray(f["whead"][()]) if "whead" in f else None),
                 "head_correction": (str(f["whead"].attrs.get("head_correction", ""))
                                     if "whead" in f else str(gw.head.correction.value))}
-        if storage == "ibz" and str(f["W0_qmunu"].attrs.get("q_storage", "full")) != "ibz":
+        if (w0_ready and storage == "ibz"
+                and str(f["W0_qmunu"].attrs.get("q_storage", "full")) != "ibz"):
             _refuse("epsmat_q_storage", "V on the wedge and W0 on the full zone",
                     "one stored q set", "V and W rows are read pairwise",
                     "regenerate the bundle")
@@ -574,7 +585,7 @@ def open_export_source(cfg, mesh, *, print_fn=None):
                 f"bundle (q {q_stored.shape[0]}, μ {n_mu})",
                 "V and W are projected on this ζ", "point zeta_file at the bundle's own ζ")
     mu_pad = int(padded_mu_axis(n_mu, mesh).carrier)
-    sym, q_full, q_tables = export_q_metadata(bundle, wfn, kgrid, storage)
+    sym, q_full, q_tables = export_q_metadata(bundle, wfn, kgrid, storage, with_w0=w0_ready)
     eigh = eigh_plan(mesh, mu_pad)
     n_dev = int(mesh.devices.size)
     log.info(f"  eigh        {eigh.describe()}")
@@ -592,7 +603,8 @@ def open_export_source(cfg, mesh, *, print_fn=None):
     return ExportSource(bundle=bundle, zeta=zl, q_stored=q_stored, kgrid=kgrid,
                         n_mu=n_mu, mu_pad=mu_pad, geometry=geometry, config=gw,
                         head=head, wfn_file=gw.paths.wfn_file, eigh=eigh,
-                        sym=sym, q_full=q_full, q_tables=q_tables)
+                        sym=sym, q_full=q_full, q_tables=q_tables, w0_ready=w0_ready,
+                        storage=storage)
 
 
 def lorrax_v(src, q_frac, miller):
@@ -644,16 +656,19 @@ def _file_q_v(src, q_file, gvecs, is_q0):
     return v
 
 
-def read_q_rows(src, iq, mesh):
+def read_q_rows(src, iq, mesh, *, with_w=True):
     """``(V, W, ζ̃)`` of stored q ``iq``: V/W ``(1, μ_pad, μ_pad)`` at
-    ``P(None,'x','y')`` (zero-padded), ζ̃ ``(1, μ_pad, ngkmax)`` μ-sharded."""
+    ``P(None,'x','y')`` (zero-padded), ζ̃ ``(1, μ_pad, ngkmax)`` μ-sharded.
+    ``with_w = False`` reads no W (``None``)."""
     from file_io.slab_io import SlabIO
     shape = (1, src.mu_pad, src.mu_pad)
+    names = ("V_qmunu", "W0_qmunu") if with_w else ("V_qmunu",)
     with SlabIO(src.bundle, mode="r", mesh=mesh) as io:
-        V, W = (io.read_slab(name, shape=shape, dtype=np.complex128,
+        rows = [io.read_slab(name, shape=shape, dtype=np.complex128,
                              offset=(int(iq), 0, 0), mesh=mesh,
                              partition_spec=P(None, "x", "y"))
-                for name in ("V_qmunu", "W0_qmunu"))
+                for name in names]
+    V, W = rows[0], (rows[1] if with_w else None)
     Z = src.zeta.read_zeta_G_slab(q_offset=int(iq), q_count=1, mu_offset=0,
                                   mu_count=src.mu_pad, mesh=mesh)
     return V, W, Z
@@ -724,24 +739,9 @@ def q_algebra(src, iq, mesh, *, rcond, print_fn=None):
     K (−1 ≼ K ≼ 0 for a passive static response).
     """
     from isdf import cplus
-    V, W, Z = read_q_rows(src, iq, mesh)
-    Z, theta_removed = fixed_q_zeta_basis(src, iq, Z, mesh=mesh)
-    p = _square_side(mesh)
-    sphere = src.zeta.gvecs(q=[int(iq)])[0]
-    ngk = int(src.zeta.ngk_valid(q=[int(iq)])[0])
-    v_sphere = lorrax_v(src, src.q_stored[iq], sphere[:ngk])
-    n_s = _pad_to(max(ngk, 1), p)
-    vs = np.zeros(n_s); vs[:ngk] = v_sphere
-    Zs = zeta_face(Z, np.arange(ngk), mesh=mesh, n_pad=n_s)
-    Vrec = coulomb_gram(Zs, vs, mesh=mesh)
-    del Zs
-    err_v = float(jnp.linalg.norm(Vrec - V)) / float(jnp.linalg.norm(V))
+    Z, V, W, basis = q_basis(src, iq, mesh)
+    err_v, theta_removed = basis["err_v"], basis["zeta_anti_theta_removed"]
     herm_w = 2.0 * float(jnp.linalg.norm(W - hermitian(W))) / float(jnp.linalg.norm(W))
-    if not np.isfinite(err_v) or err_v > V_RECONSTRUCTION_TOL:
-        _refuse("epsmat_v_reconstruction", f"|Zᴴ v Z − V|/|V| = {err_v:.3e} at stored q {iq}",
-                f"<= {V_RECONSTRUCTION_TOL:.0e}",
-                "ε⁻¹ would be scaled by the ratio of two ζ normalizations",
-                "use the bundle's own zeta_q.h5 and producer deck (Coulomb keys)")
     if herm_w > STATIC_W_HERMITIAN_TOL:
         _refuse("epsmat_static_w_hermitian", f"|W − Wᴴ|/|W| = {herm_w:.3e}",
                 f"<= {STATIC_W_HERMITIAN_TOL:.0e}", "W(ω=0) is Hermitian, (E3) with a Hermitian static χ",
@@ -755,9 +755,38 @@ def q_algebra(src, iq, mesh, *, rcond, print_fn=None):
     log.info(f"  q {iq} {np.round(src.q_stored[iq], 6).tolist()}: |V_rec−V|/|V|={err_v:.2e} "
              f"|W−Wᴴ|/|W|={herm_w:.2e} K∈[{ev[0]:.4f}, {ev[-1]:.2e}]")
     diag = {"err_v": err_v, "herm_w": herm_w, "k_min": float(ev[0]), "k_max": float(ev[-1]),
-            "zeta_anti_theta_removed": (None if theta_removed is None else
-                                         np.asarray(theta_removed).tolist())}
+            "zeta_anti_theta_removed": theta_removed}
     return Z, B, K, chi, V, Wc, diag
+
+
+def q_basis(src, iq, mesh, *, with_w=True):
+    """Stored q ``iq``: ``(Z, V, W, figures)`` with V certified against ζ and v.
+
+    ``Z`` ζ̃ ``(1, μ_pad, ngkmax)`` μ-sharded in the producer's fixed-q basis
+    (:func:`fixed_q_zeta_basis`); V and W ``(1, μ_pad, μ_pad)`` faces (W
+    ``None`` with ``with_w = False``).  GATE ``epsmat_v_reconstruction``:
+    ``Zᴴ diag(v) Z`` on the stored sphere is the bundle's V, so ε⁻¹ and W
+    are converted with the producer's own ζ normalization.
+    """
+    V, W, Z = read_q_rows(src, iq, mesh, with_w=with_w)
+    Z, theta_removed = fixed_q_zeta_basis(src, iq, Z, mesh=mesh)
+    p = _square_side(mesh)
+    sphere = src.zeta.gvecs(q=[int(iq)])[0]
+    ngk = int(src.zeta.ngk_valid(q=[int(iq)])[0])
+    v_sphere = lorrax_v(src, src.q_stored[iq], sphere[:ngk])
+    n_s = _pad_to(max(ngk, 1), p)
+    vs = np.zeros(n_s); vs[:ngk] = v_sphere
+    Zs = zeta_face(Z, np.arange(ngk), mesh=mesh, n_pad=n_s)
+    Vrec = coulomb_gram(Zs, vs, mesh=mesh)
+    del Zs
+    err_v = float(jnp.linalg.norm(Vrec - V)) / float(jnp.linalg.norm(V))
+    if not np.isfinite(err_v) or err_v > V_RECONSTRUCTION_TOL:
+        _refuse("epsmat_v_reconstruction", f"|Zᴴ v Z − V|/|V| = {err_v:.3e} at stored q {iq}",
+                f"<= {V_RECONSTRUCTION_TOL:.0e}",
+                "ε⁻¹ would be scaled by the ratio of two ζ normalizations",
+                "use the bundle's own zeta_q.h5 and producer deck (Coulomb keys)")
+    return Z, V, W, {"err_v": err_v, "zeta_anti_theta_removed": (
+        None if theta_removed is None else np.asarray(theta_removed).tolist())}
 
 
 def _check_projection(proj, V_e, chi, Wc, iq, where, mesh):
@@ -1140,23 +1169,264 @@ def run_epsmat_export(cfg, mesh, *, print_fn=None):
 # Projection: BerkeleyGW eps files -> W_μν on the bundle's stored q
 # ---------------------------------------------------------------------------
 
+#: The ``W0_source`` stamp of a projected screening: the GW driver's
+#: ``screening_source = bgw_epsmat`` admits only datasets carrying it.
+W_SOURCE_BGW = "bgw_epsmat"
+#: GATE epsmat_project_passivity.  The whitened correlation K = Bᴴ W_c B of a
+#: passive ε⁻¹ at ω = 0 or ω = iω_p lies in [−1, 0] (a compression of
+#: v^½(ε⁻¹ − 1)v^½); an eigenvalue above this fraction of |K_min| is a sign,
+#: orientation or basis defect, not physics.
+PASSIVITY_TOL = 1.0e-3
+#: The two files' frequency tables must agree to this (eV).
+FREQ_MATCH_TOL_EV = 1.0e-9
+#: BerkeleyGW ``icutv`` by LORRAX ``sys_dim`` (``TRUNC_NONE``, ``TRUNC_SLAB``).
+ICUTV_OF_SYS_DIM_BGW = {3: 0, 2: 6}
+
+
+class ProjectFrequency(NamedTuple):
+    """One BerkeleyGW frequency row LORRAX consumes, and the dataset it becomes."""
+    ifreq: int
+    omega_ry: complex
+    role: str                    # "static" (W(0)) or "probe" (the GN-PPM W(iω_p))
+    dataset: str                 # "W0_qmunu" or "Wp_qmunu"
+
+
+def projection_frequencies(heads):
+    """The frequency rows of BerkeleyGW's files that become W_μν datasets, or refuse.
+
+    ``freq_dep 0`` (epsilon ``frequency_dependence 0``) gives W(0) →
+    ``W0_qmunu``; ``freq_dep 3`` (``frequency_dependence 3``, the Godby–Needs
+    pair ω = 0 and iω_p) gives W(0) and W(iω_p) → ``Wp_qmunu``, the two
+    supports of LORRAX's GN-PPM fit.  BerkeleyGW stores ``freqs (nfreq, 2)``
+    as (Re, Im) in eV.  The full-frequency files (``freq_dep 2``) and two
+    files with different tables refuse.
+    """
+    from common.units import RYD_TO_EV
+    ref = None
+    for name, h in heads.items():
+        dep = int(h["freqs/freq_dep"])
+        f = np.asarray(h["freqs/freqs"], dtype=np.float64).reshape(-1, 2)
+        if dep not in (0, 3):
+            _refuse("epsmat_project_freq_dep", f"{name}.h5 freq_dep {dep}",
+                    "0 (static) or 3 (Godby-Needs: omega = 0 and i omega_p)",
+                    "the static and GN-PPM screening read W at those frequencies only",
+                    "run BerkeleyGW epsilon with frequency_dependence 0 or 3")
+        tol = FREQ_MATCH_TOL_EV
+        shape_ok = f.shape[0] == (1 if dep == 0 else 2) and bool(np.all(np.abs(f[0]) <= tol))
+        if dep == 3 and shape_ok:
+            shape_ok = abs(f[1, 0]) <= tol and f[1, 1] > tol
+        if not shape_ok:
+            _refuse("epsmat_project_freqs", f"{name}.h5 freqs {f.tolist()} eV at freq_dep {dep}",
+                    "[(0, 0)] or [(0, 0), (0, omega_p > 0)]",
+                    "row 0 is W(0) and row 1 the imaginary-axis GN probe",
+                    "project an epsilon file of frequency_dependence 0 or 3")
+        if ref is None:
+            ref = (dep, f, name)
+        elif ref[0] != dep or ref[1].shape != f.shape or np.max(np.abs(ref[1] - f)) > tol:
+            _refuse("epsmat_project_freqs_differ",
+                    f"{ref[2]}.h5 {ref[1].tolist()} vs {name}.h5 {f.tolist()} eV",
+                    "one frequency table", "every q of a W row is one frequency",
+                    "project eps0mat.h5 and epsmat.h5 of one epsilon run")
+    rows = [ProjectFrequency(0, 0j, "static", "W0_qmunu")]
+    if ref[0] == 3:
+        rows.append(ProjectFrequency(1, 1j * float(ref[1][1, 1]) / RYD_TO_EV, "probe", "Wp_qmunu"))
+    return rows
+
+
+def check_bgw_crystal(src, heads):
+    """GATE ``epsmat_project_crystal``: BerkeleyGW's files describe the bundle's crystal.
+
+    Same q grid, the same cell volume, and BerkeleyGW's Coulomb truncation
+    (``icutv``) equal to the producer's ``sys_dim`` (0 bulk, 6 slab); the q
+    rows and G lists are matched one by one later.
+    """
+    sys_dim = int(src.config.sys_dim)
+    want_icutv = ICUTV_OF_SYS_DIM_BGW.get(sys_dim)
+    for name, h in heads.items():
+        grid = tuple(int(x) for x in np.asarray(h["qpoints/qgrid"]).reshape(-1))
+        celvol = float(h["celvol"])
+        icutv = int(h["params/icutv"])
+        bad = []
+        if grid != tuple(int(k) for k in src.kgrid):
+            bad.append(f"qgrid {grid} vs the bundle's {tuple(src.kgrid)}")
+        if abs(celvol - float(src.geometry.cell_volume)) > 1e-8 * float(src.geometry.cell_volume):
+            bad.append(f"cell volume {celvol} vs {float(src.geometry.cell_volume)} bohr^3")
+        if want_icutv is None or icutv != want_icutv:
+            bad.append(f"icutv {icutv} vs sys_dim {sys_dim} (want icutv {want_icutv})")
+        if bad:
+            _refuse("epsmat_project_crystal", f"{name}.h5: " + "; ".join(bad),
+                    "the producer's crystal, q grid and Coulomb truncation",
+                    "W = ε⁻¹ v is projected with LORRAX's v on the bundle's ζ",
+                    "run BerkeleyGW epsilon on the bundle's WFN with the matching truncation")
+
+
+class ImportRow(NamedTuple):
+    """One stored q and the BerkeleyGW block that gives it (theory §4)."""
+    iq_store: int
+    name: str                    # "eps0mat" (Γ, at BerkeleyGW's q0) or "epsmat"
+    iq_file: int
+    g0: np.ndarray               # sym_row 0: ζ̃_{q_file}(G) = ζ̃_{q_store}(G + g0)
+    sym_row: int                 # 0, or the SymMaps row with q_store ≡ S q_file
+
+
+def import_q_plan(src, heads):
+    """The BerkeleyGW block of every stored q, or refuse naming every uncovered q.
+
+    Γ is ``eps0mat`` row 0.  Any other stored q takes an ``epsmat`` row that
+    is the same q up to a reciprocal lattice vector, else one that a
+    symmetry of the WFN maps onto it (``SymMaps.operation_rows``; the
+    antiunitary rows only on a measured time-reversal-invariant deck), the
+    way BerkeleyGW's Sigma unfolds its own irreducible q list.
+    """
+    sym = src.sym
+    n_sym = int(np.asarray(sym.sym_matrices).shape[0])
+    rows = np.arange(2 * n_sym if bool(getattr(sym, "trs_allowed", False)) else n_sym,
+                     dtype=np.int32)
+    S_all = np.asarray(sym.operation_rows(rows)[0], dtype=np.float64)
+    q_file = heads["epsmat"]["qpts"] if "epsmat" in heads else np.zeros((0, 3))
+    gamma = set(np.flatnonzero(np.all(np.abs(src.q_stored) < 1e-12, axis=1)).tolist())
+    plan, missing = [], []
+    for iq, q in enumerate(np.asarray(src.q_stored, dtype=np.float64)):
+        if iq in gamma:
+            plan.append(ImportRow(iq, "eps0mat", 0, np.zeros(3, np.int64), 0))
+            continue
+        if q_file.shape[0] == 0:
+            missing.append(q)
+            continue
+        idx, g0s = match_q_umklapp(q_file, q[None])
+        if int(idx[0]) >= 0:
+            plan.append(ImportRow(iq, "epsmat", int(idx[0]), -g0s[0], 0))
+            continue
+        d = q[None, None, :] - np.einsum("rij,fj->rfi", S_all, q_file)
+        hit = np.all(np.abs(d - np.rint(d)) < 1e-6, axis=-1)
+        if not hit.any():
+            missing.append(q)
+            continue
+        r, f = (int(x) for x in np.argwhere(hit)[0])
+        plan.append(ImportRow(iq, "epsmat", f, np.zeros(3, np.int64), int(rows[r])))
+    if missing:
+        _refuse("epsmat_project_q_coverage",
+                f"{len(missing)} stored q without a BerkeleyGW row: "
+                f"{np.round(np.asarray(missing), 6).tolist()[:8]}",
+                "every stored q an umklapp or symmetry image of an epsmat.h5 q (Γ: eps0mat.h5)",
+                "W is projected per stored q; a missing q has no screening",
+                "run BerkeleyGW epsilon on the irreducible q list of the bundle's WFN and grid")
+    return plan
+
+
+def import_gvectors(src, row, q_file, g_file):
+    """Stored-q G of each file G, the Fourier phase and the TR bit (theory §4).
+
+    ``G_s = S(q_file + G_f) − q_store`` for the row's action S; then
+    ``ε⁻¹_{q_store}(G_s, G_s') = φ_s ε̃(G_f, G_f') φ̄_s'`` with ε̃ the file's
+    block (conjugated on an antiunitary row) and φ the export's own phase
+    (:func:`parent_gvectors`, which must map every G_s back to its G_f).
+    Returns ``(G_s (n, 3) int, φ (n,) or None, anti)``.
+    """
+    from types import SimpleNamespace
+    if row.sym_row == 0:
+        return np.asarray(g_file) + np.asarray(row.g0)[None, :], None, False
+    S = np.asarray(src.sym.operation_rows(int(row.sym_row))[0], dtype=np.float64)
+    q_s = np.asarray(src.q_stored[row.iq_store], dtype=np.float64)
+    gs_f = (np.asarray(q_file)[None, :] + np.asarray(g_file)) @ S.T - q_s[None, :]
+    g_s = np.rint(gs_f).astype(np.int64)
+    plan = QPlan(0, 0, q_s, np.zeros(3, np.int64), None, int(row.sym_row))
+    back, phase, anti = parent_gvectors(
+        SimpleNamespace(sym=src.sym, q_stored=np.asarray(q_file)[None]), plan, g_s)
+    if (not np.allclose(gs_f, g_s, rtol=0.0, atol=1e-6)
+            or not np.array_equal(np.asarray(back), np.asarray(g_file))):
+        _refuse("epsmat_project_image", f"stored q {np.round(q_s, 6).tolist()} from file q "
+                f"{np.round(q_file, 6).tolist()} by row {row.sym_row}",
+                "an exact, invertible G relabel", "the rotated block would mix G vectors",
+                "report the WFN symmetry header")
+    return g_s, phase, bool(anti)
+
+
+def import_zeta_face(Z, slots, phase, anti, *, mesh, n, n_pad):
+    """ζ̃ on the file's G list in the file block's frame: ``(φ̄ ζ̃)^(*)``, a face.
+
+    With ε⁻¹_s = Φ ε̃ Φᴴ (:func:`import_gvectors`) and W_c = Zᴴ(ε⁻¹_s − 1)vZ,
+    the phase moves onto ζ̃ as ``Z' = Φᴴ Z``; on an antiunitary row the
+    block is ε̃ = conj(ε_f), so ``W_c = conj(Z''ᴴ (ε_f − 1) v Z'')`` with
+    ``Z'' = conj(Z')`` (the caller conjugates the projected W_c).
+    """
+    Zf = zeta_face(Z, slots, mesh=mesh, n_pad=n_pad)
+    if phase is not None:
+        ph = np.ones(n_pad, np.complex128)
+        ph[:n] = np.conj(np.asarray(phase))
+        Zf = _scale_columns(mesh)[0](Zf, jnp.asarray(ph))
+    return jnp.conj(Zf) if anti else Zf
+
+
+def projection_price(mu_pad, n_pad, ranks):
+    """Per-rank device bytes of one stored q of the projection (``lxkit.memory.Price``).
+
+    Resident: V, W_c, V + W_c, B and K (five μ faces, 16 μ_pad²/P each), the
+    file block (16 n_pad²/P) and ζ̃ on the eps G list with its phased copy
+    (2 × 16 μ_pad n_pad/P); fixed: the two live SUMMA panels
+    (``PANEL_BYTES`` each).  Theory §8.
+    """
+    from lxkit import memory
+    spread = 5 * 16.0 * mu_pad ** 2 + 16.0 * n_pad ** 2 + 2 * 16.0 * mu_pad * n_pad
+    return memory.priced(2.0 * PANEL_BYTES, "epsmat projection: two SUMMA panels",
+                         spread=spread, ranks=int(ranks))
+
+
+def bgw_file_fingerprint(path, head):
+    """Provenance of one BerkeleyGW file: path, size, mtime and a header digest."""
+    import hashlib
+    import json
+    st = os.stat(path)
+    h = hashlib.sha256()
+    for key in ("qpts", "nmtx", "freqs/freqs", "params/ecuts", "params/icutv", "qpoints/qgrid"):
+        h.update(np.ascontiguousarray(np.asarray(head[key])).tobytes())
+    return json.dumps({"path": os.path.abspath(path), "bytes": int(st.st_size),
+                       "mtime": int(st.st_mtime), "header_sha256": h.hexdigest()})
+
+
+def _copy_qirr_stamp(f, src_name, dst_name):
+    """Give ``dst_name`` the q-wedge stamp of ``src_name`` (same q rows and centroids).
+
+    The projected W rows are written on V's stored rows, so V's unfold tables
+    and closure receipt describe them exactly; the table group is copied,
+    not rebuilt, so the two digests agree by construction.
+    """
+    from symmetry_maps import QIRR_TABLE_SUFFIX
+    if src_name + QIRR_TABLE_SUFFIX not in f:
+        return
+    if dst_name + QIRR_TABLE_SUFFIX in f:
+        del f[dst_name + QIRR_TABLE_SUFFIX]
+    f.copy(f[src_name + QIRR_TABLE_SUFFIX], dst_name + QIRR_TABLE_SUFFIX)
+    for key, val in f[src_name].attrs.items():
+        if str(key) == "q_storage" or str(key).startswith("qirr_"):
+            f[dst_name].attrs[key] = val
+    f[dst_name].attrs["qirr_data_ready"] = True
+
+
 def run_epsmat_projection(cfg, mesh, *, print_fn=None):
     """Project BerkeleyGW's ε⁻¹ onto the bundle's ζ and write a variant bundle.
 
-    For every stored q the matching BerkeleyGW q (an umklapp image; Γ maps
-    to the eps0mat q0) is read block by block and ``W0_qmunu`` of a COPY of
-    the bundle in ``output_dir/tmp`` is replaced by
-    ``V + Z_εᴴ [(ε⁻¹_BGW − 1) diag(v)] Z_ε``; at Γ the G = 0 row and column are
-    dropped (LORRAX carries the head as the rank-one ``whead`` term, kept).
-    Returns per-q figures, including ``|W_BGW − W_LORRAX| / |W_LORRAX − V|``.
+    For every stored q the BerkeleyGW block that gives it (an umklapp or a
+    symmetry image, :func:`import_q_plan`; Γ is the eps0mat q0) is read tile
+    by tile, at every frequency the files carry (:func:`projection_frequencies`),
+    and a COPY of the bundle in ``output_dir/tmp`` receives
+    ``W_ω = V + Z_εᴴ [(ε⁻¹_ω − 1) diag(v)] Z_ε`` (E7): ``W0_qmunu`` at ω = 0
+    and, from a Godby–Needs file, ``Wp_qmunu`` at iω_p.  At Γ the G = 0 row
+    and column are dropped; ``bgw_epsinv_head`` keeps BerkeleyGW's
+    ε⁻¹_00(q0, ω) for the GW driver's head (``screening_source = bgw_epsmat``),
+    and the producer's ``whead`` stays for the BSE.  LORRAX's own W(0) is
+    not needed; when the bundle has one the receipt compares the two.
+    Returns the receipt dict.
     """
     import shutil
     import h5py
     from common.collectives import barrier, process_rank
+    from common.gpu_utils import device_budget_bytes
+    from lxkit import memory
     from file_io import bgw_epsmat as be
     from file_io.slab_io import SlabIO
 
-    src = open_export_source(cfg, mesh)
+    src = open_export_source(cfg, mesh, require_w0=False)
     files = {name: os.path.join(cfg.bgw_reference, f"{name}.h5") for name in ("eps0mat", "epsmat")}
     heads = {name: be.read_epsmat_header(p) for name, p in files.items() if os.path.isfile(p)}
     if "eps0mat" not in heads:
@@ -1169,6 +1439,22 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=None):
                     f"{int(h['params/matrix_type'])}, nmatrix {int(h['params/nmatrix'])}",
                     "ε⁻¹ (matrix_type 0), one spin matrix", "W = ε⁻¹ v",
                     "project an inverse dielectric file")
+        undone = np.flatnonzero(np.asarray(h["qpoints/qpt_done"]).reshape(-1) == 0)
+        if undone.size:
+            _refuse("epsmat_project_incomplete", f"{name}.h5 q rows {undone.tolist()} not done",
+                    "qpt_done = 1 on every row", "an unfinished row holds zeros, not ε⁻¹",
+                    "finish the BerkeleyGW epsilon run")
+    check_bgw_crystal(src, heads)
+    freqs = projection_frequencies(heads)
+    plan = import_q_plan(src, heads)
+    n_rot = sum(r.sym_row != 0 for r in plan)
+    n_g = sum(r.name == "eps0mat" for r in plan)
+    log.info("  frequencies " + ", ".join(
+        f"{f.dataset} <- {f.role} ω = {f.omega_ry:.6f} Ry" for f in freqs))
+    log.info(f"  q plan      {len(plan)} stored q: {n_g} from eps0mat, "
+             f"{len(plan) - n_rot - n_g} umklapp and {n_rot} symmetry images from epsmat")
+    log.info(f"  LORRAX W(0) {'in the bundle: compared' if src.w0_ready else 'absent: not compared'}")
+
     rank0 = process_rank() == 0
     out_tmp = os.path.join(cfg.output_dir, "tmp")
     target = os.path.join(out_tmp, os.path.basename(src.bundle))
@@ -1182,74 +1468,118 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=None):
         if not os.path.lexists(link):
             os.symlink(os.path.abspath(src.zeta._path), link)
     barrier("epsmat.project.copy")
-    gamma = np.flatnonzero(np.all(np.abs(src.q_stored) < 1e-12, axis=1))
+
+    p = _square_side(mesh)
+    n_max = max(int(heads[r.name]["nmtx"][r.iq_file]) for r in plan)
+    device_budget_bytes()
+    price = projection_price(src.mu_pad, _pad_to(n_max, p * p), int(mesh.devices.size))
+    memory.admit("epsmat.project", (("faces", price),), memory.room(bucketed=False))
+    log.info(f"  memory      {price.bytes() / 2**30:.3f} GiB per device per q "
+             f"(nmtx_max {n_max}, μ carrier {src.mu_pad}; {price.describe()})")
+
+    with h5py.File(files["eps0mat"], "r") as f:
+        heads_bgw = [complex(f[be.MATRIX][0, 0, fr.ifreq, 0, 0, 0],
+                             f[be.MATRIX][0, 0, fr.ifreq, 0, 0, 1]) for fr in freqs]
     figs = []
-    comps = heads["eps0mat"]["components"]
     with SlabIO(target, mode="a", mesh=mesh) as io:
-        # Register the copy's W0_qmunu (identical logical shape: reuse), the
-        # parallel tier's precondition for writing into an existing dataset.
-        io.create_dataset("W0_qmunu", shape=(src.q_stored.shape[0], src.n_mu, src.n_mu),
-                          dtype=np.complex128)
-        for iq in range(src.q_stored.shape[0]):
-            is_g = iq in set(gamma.tolist())
-            name = "eps0mat" if is_g else "epsmat"
-            if name not in heads:
-                _refuse("epsmat_project_inputs", f"no {name}.h5 for stored q {iq}",
-                        "BerkeleyGW's file", "every stored q needs its ε⁻¹",
-                        "add the file to bgw_reference")
-            if is_g:
-                iqf, g0 = 0, np.zeros(3, int)
-            else:
-                idx, g0s = match_q_umklapp(heads[name]["qpts"], src.q_stored[iq][None])
-                if int(idx[0]) < 0:
-                    _refuse("epsmat_q_unmatched", f"stored q {np.round(src.q_stored[iq], 6).tolist()}",
-                            f"an umklapp image in {files[name]}",
-                            "a symmetry-rotated ε⁻¹ is not reconstructed here",
-                            "run BerkeleyGW epsilon on the full q list")
-                iqf, g0 = int(idx[0]), -g0s[0]
-            qg, _ = be.read_q_gspace(files[name], iqf)
+        # Register (W0) or create (Wp, or W0 of a bundle without screening):
+        # the parallel tier writes only datasets its handle created.
+        for fr in freqs:
+            io.create_dataset(fr.dataset, shape=(src.q_stored.shape[0], src.n_mu, src.n_mu),
+                              dtype=np.complex128)
+        for row in plan:
+            iq, is_g = row.iq_store, row.name == "eps0mat"
+            h = heads[row.name]
+            Z, V, W_lx, basis = q_basis(src, iq, mesh, with_w=src.w0_ready)
+            B, _ = coulomb_whitener(V, rcond=cfg.rcond, plan=src.eigh)
+            qg, _ = be.read_q_gspace(files[row.name], row.iq_file)
             n = qg.nmtx
-            Z, B, K, chi, V, Wc, qd = q_algebra(src, iq, mesh, rcond=cfg.rcond)
-            # q_BGW = q_store + g0, so ζ̃_{q_BGW}(G) = ζ̃_{q_store}(G + g0).
-            miller = comps[qg.order[:n]] + g0[None, :]
-            slots = zeta_slots(src.zeta.gvecs(q=[iq])[0], src.zeta.ngk_valid(q=[iq])[0],
-                               miller, fill=Z.shape[2])
-            v_eps = _file_q_v(src, heads[name]["qpts"][iqf], comps[qg.order[:n]], is_g)
-            n_pad = _pad_to(n, int(mesh.shape["x"]) ** 2)
-            offset, shape = be.matrix_block_window(iqf, 0, n_pad)
-            with SlabIO(files[name], mode="r", mesh=mesh) as rd:
-                blk = rd.read_slab(be.MATRIX, shape=shape, dtype=np.float64, offset=offset,
-                                   mesh=mesh, partition_spec=P(None, None, None, "x", "y", None))
-            Zf = zeta_face(Z, slots, mesh=mesh, n_pad=n_pad)
-            Wc_bgw = project_block(blk, Zf, v_eps, mesh=mesh, n_valid=n, drop_head=is_g)
-            del Zf, blk
-            W_new = V + Wc_bgw
-            rel = float(jnp.linalg.norm(Wc_bgw - Wc)) / float(jnp.linalg.norm(Wc))
-            # BerkeleyGW's W = ε⁻¹v is Hermitian only in the orientation read here.
-            herm_bgw = (2.0 * float(jnp.linalg.norm(Wc_bgw - hermitian(Wc_bgw)))
-                        / float(jnp.linalg.norm(Wc_bgw)))
-            Kb = whitened_correlation(Wc_bgw, B, mesh=mesh)
-            evb = face_spectrum(Kb, src.eigh)
-            ek = face_spectrum(K, src.eigh)
-            rel_k = float(np.max(np.abs(face_spectrum(Kb - K, src.eigh))) / np.max(np.abs(ek)))
-            io.write_slab("W0_qmunu", W_new, offset=(iq, 0, 0))
-            head_bgw = None
-            if is_g:
-                with h5py.File(files[name], "r") as f:
-                    head_bgw = complex(f[be.MATRIX][0, 0, 0, 0, 0, 0] + 1j * f[be.MATRIX][0, 0, 0, 0, 0, 1])
-            figs.append({"q": np.round(src.q_stored[iq], 6).tolist(), "iq_store": int(iq),
-                         "file": name, "iq_file": iqf, "g0": np.asarray(g0).tolist(), "nmtx": n,
-                         "rel_Wc_bgw_vs_lorrax": rel, "herm_bgw": herm_bgw,
-                         "rel_K_bgw_vs_lorrax": rel_k, "k_bgw_min": float(evb[0]),
-                         "k_bgw_max": float(evb[-1]), "bgw_head": head_bgw, **qd})
-            log.info(f"    stored q {iq} <- {name}[{iqf}] nmtx {n}: "
-                     f"|Wc_BGW − Wc_LX|/|Wc_LX| = {rel:.4e}, |Wc_BGW − h.c.|/|Wc_BGW| = {herm_bgw:.1e}, "
-                     f"‖K_BGW − K‖₂/‖K‖₂ = {rel_k:.4e}, K_BGW∈[{evb[0]:.4f}, {evb[-1]:.2e}]"
-                     + ("" if head_bgw is None else f", BGW ε⁻¹_00(q0) = {head_bgw:.6f}"))
-        io.stamp_dataset_attrs("W0_qmunu", {
-            "W0_source": "bgw_epsmat", "bgw_reference": os.path.abspath(cfg.bgw_reference),
-            "bgw_ecuts_ry": float(heads["eps0mat"]["params/ecuts"]),
-            "bgw_q0_head_epsinv": str(figs[gamma[0]]["bgw_head"]) if gamma.size else "",
-            "q0_head_note": "whead kept from the LORRAX producer; body from BerkeleyGW"})
+            g_file = h["components"][qg.order[:n]]
+            q_file = np.asarray(h["qpts"][row.iq_file], dtype=np.float64)
+            g_s, phase, anti = import_gvectors(src, row, q_file, g_file)
+            sphere = src.zeta.gvecs(q=[iq])[0]
+            ngk = int(src.zeta.ngk_valid(q=[iq])[0])
+            slots = zeta_slots(sphere, ngk, g_s, fill=Z.shape[2])
+            outside = int(np.count_nonzero(slots >= ngk))
+            if outside:
+                _refuse("epsmat_project_sphere",
+                        f"{outside} of {n} BerkeleyGW G at stored q {iq} outside the ζ sphere",
+                        "BerkeleyGW's ecuts within the producer's bare-Coulomb sphere",
+                        "ζ̃ is zero there, so that part of ε⁻¹ would be dropped silently",
+                        "rerun epsilon with a smaller epsilon_cutoff, or GW with a larger "
+                        "bare_coulomb_cutoff")
+            v_eps = (_file_q_v(src, q_file, g_file, True) if is_g
+                     else lorrax_v(src, src.q_stored[iq], g_s))
+            n_pad = _pad_to(n, p * p)
+            Zf = import_zeta_face(Z, slots, phase, anti, mesh=mesh, n=n, n_pad=n_pad)
+            row_figs = {"q": np.round(src.q_stored[iq], 6).tolist(), "iq_store": int(iq),
+                        "file": row.name, "iq_file": int(row.iq_file),
+                        "q_file": np.round(q_file, 6).tolist(), "g0": np.asarray(row.g0).tolist(),
+                        "sym_row": int(row.sym_row), "antiunitary": anti, "nmtx": n,
+                        "err_v": basis["err_v"]}
+            for fr in freqs:
+                offset, shape = be.matrix_block_window(row.iq_file, fr.ifreq, n_pad)
+                with SlabIO(files[row.name], mode="r", mesh=mesh) as rd:
+                    blk = rd.read_slab(be.MATRIX, shape=shape, dtype=np.float64, offset=offset,
+                                       mesh=mesh, partition_spec=P(None, None, None, "x", "y", None))
+                Wc = project_block(blk, Zf, v_eps, mesh=mesh, n_valid=n, drop_head=is_g)
+                del blk
+                if anti:
+                    Wc = jnp.conj(Wc)
+                herm = (2.0 * float(jnp.linalg.norm(Wc - hermitian(Wc)))
+                        / max(float(jnp.linalg.norm(Wc)), 1e-300))
+                ev = face_spectrum(whitened_correlation(Wc, B, mesh=mesh), src.eigh)
+                if not np.all(np.isfinite(ev)) or ev[-1] > PASSIVITY_TOL * max(abs(ev[0]), 1e-300):
+                    _refuse("epsmat_project_passivity",
+                            f"K = Bᴴ W_c B in [{ev[0]:.4e}, {ev[-1]:.4e}] at stored q {iq}, "
+                            f"{fr.role} ω = {fr.omega_ry:.4f} Ry",
+                            f"K_max <= {PASSIVITY_TOL:.0e} |K_min| (−1 ≼ K ≼ 0)",
+                            "a passive ε⁻¹ projects to a non-positive correlation; a positive "
+                            "eigenvalue is a sign, orientation or basis defect",
+                            "report the files and the bundle; do not consume the output")
+                rel = None
+                if fr.role == "static" and W_lx is not None:
+                    Wc_lx = W_lx - V
+                    rel = float(jnp.linalg.norm(Wc - Wc_lx)) / float(jnp.linalg.norm(Wc_lx))
+                io.write_slab(fr.dataset, V + Wc, offset=(iq, 0, 0))
+                row_figs[fr.role] = {"omega_ry": fr.omega_ry, "herm": herm,
+                                     "k_min": float(ev[0]), "k_max": float(ev[-1]),
+                                     "rel_Wc_bgw_vs_lorrax": rel}
+                log.info(f"    stored q {iq} <- {row.name}[{row.iq_file}]"
+                         + (f" by row {row.sym_row}{' (TR)' if anti else ''}" if row.sym_row else "")
+                         + f" nmtx {n} {fr.role}: K∈[{ev[0]:.4f}, {ev[-1]:.1e}], "
+                         f"|Wc − h.c.|/|Wc| = {herm:.1e}"
+                         + ("" if rel is None else f", |Wc_BGW − Wc_LX|/|Wc_LX| = {rel:.4e}"))
+                del Wc
+            figs.append(row_figs)
+            del Z, V, W_lx, B, Zf
+        stamp = {"W0_source": W_SOURCE_BGW,
+                 "bgw_reference": os.path.abspath(cfg.bgw_reference),
+                 "bgw_files": "[" + ", ".join(bgw_file_fingerprint(files[k], heads[k])
+                                              for k in sorted(heads)) + "]",
+                 "bgw_ecuts_ry": float(heads["eps0mat"]["params/ecuts"]),
+                 "bgw_q0": np.asarray(heads["eps0mat"]["qpts"][0], dtype=np.float64),
+                 "q0_head_note": "G = 0 row/column dropped at Gamma; BerkeleyGW's head is "
+                                 "bgw_epsinv_head, the producer's whead is kept for the BSE"}
+        for fr in freqs:
+            io.stamp_dataset_attrs(fr.dataset, {**stamp, "omega_ry_re": fr.omega_ry.real,
+                                                "omega_ry_im": fr.omega_ry.imag,
+                                                "screening_role": fr.role,
+                                                **({"W0_ready": True} if fr.role == "static" else {})})
+    if rank0:
+        with h5py.File(target, "a") as f:
+            for fr in freqs:
+                _copy_qirr_stamp(f, "V_qmunu", fr.dataset)
+            if "bgw_epsinv_head" in f:
+                del f["bgw_epsinv_head"]
+            d = f.create_dataset("bgw_epsinv_head", data=np.asarray(heads_bgw, np.complex128))
+            d.attrs["omega_ry_re"] = np.asarray([fr.omega_ry.real for fr in freqs])
+            d.attrs["omega_ry_im"] = np.asarray([fr.omega_ry.imag for fr in freqs])
+            d.attrs["roles"] = ",".join(fr.role for fr in freqs)
+            d.attrs["bgw_q0"] = np.asarray(heads["eps0mat"]["qpts"][0], dtype=np.float64)
     barrier("epsmat.project.done")
-    return {"path": target, "q": figs}
+    log.info("  BerkeleyGW ε⁻¹_00(q0): " + ", ".join(
+        f"{fr.role} {hb:.6f}" for fr, hb in zip(freqs, heads_bgw)))
+    return {"path": target, "frequencies": [{"role": fr.role, "dataset": fr.dataset,
+                                              "omega_ry": fr.omega_ry} for fr in freqs],
+            "bgw_epsinv_head": heads_bgw, "q": figs}

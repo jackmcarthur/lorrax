@@ -645,6 +645,47 @@ def refuse_unsupported_screening_diagrams(config) -> None:
             f"screening_diagrams.")
 
 
+#: screening_source values: where the W that Sigma consumes comes from.
+SCREENING_SOURCES = ("compute", "bgw_epsmat")
+
+
+def refuse_unsupported_screening_source(config) -> None:
+    """``GATE screening_source_*``: what ``screening_source = bgw_epsmat`` serves.
+
+    BerkeleyGW's projected epsilon is W at omega = 0 (and, from a
+    Godby-Needs epsilon, at i omega_p): the static and GN-PPM screening of a
+    one-shot.  It lives in the restart's ISDF tensor file, so the run is a
+    restart; the W rows are RPA by BerkeleyGW's construction.
+    """
+    source = getattr(config.screening, "source", "compute")
+    if source == "compute":
+        return
+    bad = []
+    if config.compute_mode not in (ComputeMode.COHSEX, ComputeMode.GN_PPM):
+        bad.append(("screening_source_mode", f"compute_mode = {config.compute_mode.value}",
+                    "compute_mode = cohsex or gn_ppm",
+                    "the file holds W at omega = 0 and i omega_p only: the static and "
+                    "Godby-Needs screening"))
+    if not bool(config.restart):
+        bad.append(("screening_source_restart", "restart = false", "restart = true",
+                    "the projected W is read from the restart's ISDF tensor file "
+                    "(tmp/isdf_tensors_<mu>.h5 of the projection's output_dir)"))
+    if config.qp_solver is QPSolver.SELF_CONSISTENT:
+        bad.append(("screening_source_sc", "qp_solver = self_consistent",
+                    "a one-shot", "BerkeleyGW's W is fixed; a self-consistent map rebuilds W"))
+    if config.screening.diagrams is not ScreeningDiagrams.W_RPA:
+        bad.append(("screening_source_diagrams",
+                    f"screening_diagrams = {config.screening.diagrams.value}",
+                    "screening_diagrams = w_rpa", "BerkeleyGW's epsilon is the RPA series"))
+    if bool(getattr(config, "bispinor", False)):
+        bad.append(("screening_source_bispinor", "bispinor = true", "bispinor = false",
+                    "BerkeleyGW's epsilon is the charge response only"))
+    if bad:
+        raise ValueError("; ".join(
+            f"GATE {gid}: got {got}; want {want}; why: {why}; fix: set {want} or "
+            f"screening_source = compute" for gid, got, want, why in bad))
+
+
 def refuse_unsupported_head_dense(config) -> None:
     """Refuse ``head_dense_file`` where the head is not the scalar DFT charge response, at PARSE time.
 
@@ -1611,6 +1652,17 @@ _DEFAULTS = {
     #        w_rpa's own W, not a third physical model.  Same refusal
     #        family as w_bse, PLUS mpa (unlike w_bse, not yet supported).
     "screening_diagrams": "w_rpa",
+    # WHERE THE W THAT SIGMA CONSUMES COMES FROM.
+    #   "compute" (DEFAULT) — this run builds it (chi0, then Dyson).
+    #   "bgw_epsmat" — read from the restart's ISDF tensor file, where
+    #        `gw.epsmat_cli mode = project` wrote BerkeleyGW's epsilon
+    #        projected on zeta: W0_qmunu (omega = 0) and, from a
+    #        Godby-Needs epsilon, Wp_qmunu (i omega_p).  No chi0 and no
+    #        Dyson solve run; the q->0 head is BerkeleyGW's eps^-1_00(q0)
+    #        at each frequency.  compute_mode = cohsex or gn_ppm, one-shot,
+    #        restart = true, screening_diagrams = w_rpa
+    #        (GATE screening_source_*).
+    "screening_source": "compute",
     # w_bse / w_rpa_resolvent only: probe columns of the mu^2 ladder tile
     # solved per block.
     # 0 (default) = a bounded automatic tile, checked against compiled
@@ -1999,6 +2051,7 @@ _NORMALIZE_STR = {
     "sc_head_update",
     "wcoul0_source", "head_correction", "screening_method",
     "screening_diagrams",
+    "screening_source",
     "band_extrapolation_estimator",
     "band_extrapolation_bracket_scheme",
     "linalg",
@@ -2782,6 +2835,7 @@ def _input_response(
         minimax_max_nodes=int(params["minimax_max_nodes"]),
         diagrams=coerce_screening_diagrams(params["screening_diagrams"]),
         ladder_probe_chunk=int(params["ladder_probe_chunk"]),
+        source=str(params["screening_source"]).strip().lower(),
     )
     ppm = PPMConfig(
         model=str(params["ppm_model"]).strip().lower(),
@@ -3224,6 +3278,7 @@ def _apply_input_envelope(
             "(docs/input_reference.md, restart)")
     refuse_unsupported_bgw_metal_q0_treatment(resolved)
     refuse_unsupported_screening_diagrams(resolved)
+    refuse_unsupported_screening_source(resolved)
     refuse_unsupported_head_dense(resolved)
     refuse_unsupported_bispinor_gw(resolved)
     warn_headless_tangential_self_consistency(resolved, print_fn=print_fn)
@@ -4286,6 +4341,10 @@ class ScreeningConfig:
     # which does not branch on ``include_w``). 0 = bounded automatic tile.
     # Deck key: ``ladder_probe_chunk``.
     ladder_probe_chunk: int = 0
+    # WHERE W COMES FROM: "compute" (chi0 + Dyson, every deck) or
+    # "bgw_epsmat" (BerkeleyGW's epsilon projected into the restart file
+    # by gw.epsmat_cli mode = project).  Deck key: screening_source.
+    source: str = "compute"
 
     def __post_init__(self):
         if self.occ_broadening_ev < 0.0:
@@ -4306,6 +4365,12 @@ class ScreeningConfig:
         # ffi/gate.py exists to prevent; the same rule applies to a
         # synonym that resolves to the supported method by accident
         # rather than by design.
+        if self.source not in SCREENING_SOURCES:
+            raise ValueError(
+                f"GATE screening_source_value: got screening_source = "
+                f"{self.source!r}; want one of {SCREENING_SOURCES}; why: W is "
+                f"computed here or read from BerkeleyGW's projected epsilon; "
+                f"fix: set screening_source = compute or bgw_epsmat")
         if self.method != "minimax":
             raise ValueError(
                 f"screening_method = {self.method!r} is not supported.  "
