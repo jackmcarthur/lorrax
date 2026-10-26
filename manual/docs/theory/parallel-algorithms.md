@@ -7,7 +7,7 @@
 
 ## <span class="n">1</span> Process mesh and layouts {: #par-mesh }
 
-Every driver runs on one square mesh of $P = p_x\times p_y$ devices, one process per device. Operator faces divide their leading storage by $P$; whole-matrix batches, gathered panels and padded carriers have additional terms and minimum sizes.
+Every driver runs on one square mesh of $P = p_x\times p_y$ devices, one process per device. Every large object is tiled over the whole mesh, so its bytes per rank fall as $1/P$.
 {: .intro }
 
 ### <span class="n">1.1</span> The mesh {: #par-mesh-grid }
@@ -24,9 +24,7 @@ The run builds one mesh with axes `x` and `y`, $p_x = p_y = \sqrt{P}$, at startu
 
 A two-index operator in the ζ basis or on the points, $V_\bq(\mu,\nu)$, $W_\bq(\mu,\nu;z)$, $G_\bk(\br_\mu,\br_\nu;t)$, is held as a face: the left index on `x`, the right on `y`, the $\bk$ or $\bq$ axis whole on every rank (`P(None,'x','y')`). The k axis is never split, because every k-convolution (§[2](#par-kconv)) needs whole columns.
 
-The orbitals $\psi_{n\bk}(\br_\mu)$ are held at the raw parent k-points only, in faces with bands on one mesh axis and centroids on the other. Keeping both views costs $2\cdot16\,n_{\mathrm{par}}n_sN_\mu N_b/P$ bytes per rank. A selected contraction can additionally prepare band-complete centroid slabs; these and its projection workspace belong in that stage's live set. All extents in these counts are the padded carriers.
-
-Compatible full-span and row-window charge convolutions share the same placed symmetry/transport tables through one bounded operator cache. Changing a window or output count can require another executable, but does not by itself require another copy of the tables. A pending compilation or an external caller retains the operands it still needs.
+The orbitals $\psi_{n\bk}(\br_\mu)$ are held at the raw parent k-points only, in two faces with bands on one mesh axis and centroids on the other, $2\cdot16\,n_{\mathrm{par}}n_sN_\mu N_b/P$ bytes per rank. No band-complete copy is resident; the Σ band projection and the sub-tile streams of §[2.3](#par-kconv-passes) gather one for the length of one call.
 
 ### <span class="n">1.3</span> Band sums as SUMMA {: #par-mesh-summa }
 
@@ -82,7 +80,7 @@ CUDA runs each kernel as one fused nvidia-mathdx pass; ROCm runs the same modes 
 `gw.subtile_stream.plan_windows`
 {: .in-code }
 
-Σ and the χ⁰ bank are linear in the left index $\mu$, so a rank's $(\mu_x,\nu_y)$ tile is processed in row passes: windows of $R$ local rows, each ending on a whole symmetry orbit of centroids so that the unfold stays local. $R$ is the most rows whose working set fits the fixed tile of §[6.2](#par-mem-tile). The passes run as one `lax.scan` over a table of windows, so the scan body does not grow with the pass count. The AXIS Green layout prepares band-complete centroid slabs for local GEMMs; FACE keeps bands distributed and uses panel GEMMs. Their prepared operands and communication differ, while the band sum is the same.
+Σ and the χ⁰ bank are linear in the left index $\mu$, so a rank's $(\mu_x,\nu_y)$ tile is processed in row passes: windows of $R$ local rows, each ending on a whole symmetry orbit of centroids so that the unfold stays local. $R$ is the most rows whose working set fits the fixed tile of §[6.2](#par-mem-tile). The passes run as one `lax.scan` over a table of windows, so the compiled program does not grow with the pass count, and the padded rows of a short window cost no transform work. Within a pass the parent Green's function of the window's rows is one local GEMM over band-complete $\psi$ rows, with no exchange.
 
 ## <span class="n">3</span> The ζ fit in G space {: #par-zeta }
 
@@ -135,8 +133,6 @@ $$
 
 with $B_\bq B_\bq^\dagger = C_\bq^{+}$ the rank-truncated factor of [ISDF §2.4](isdf.md#isdf-rcond), held as a face. The tile moves to the face, both products are distributed GEMMs, and $V_\bq$ accumulates in its final face layout, so no rank holds a whole $(\mu,\nu)$ matrix. ζ is written to `zeta_q.h5` in the same pass only when a consumer reads the file. The current channels instead keep a pivoted LU per $\bq$ on the $\bq$ owners.
 
-A write-only ζ pass applies the same fitted factors and writes the ζ tiles without constructing $V$ or a Coulomb-weight bank. These are omitted outputs, not a different fit or an accuracy setting.
-
 ### <span class="n">3.4</span> Memory and cost {: #par-zeta-cost }
 
 `gw.gflat_memory_model.plan_zeta_route_g`
@@ -147,16 +143,15 @@ The planner prints its choices as `ISDF μ-batch plan` in `gwjax.out`. Per rank,
 | Object or step | Bytes or work per rank | Lives |
 |---|---|---|
 | $\overline{\psi(\bG)}$ slice | $16\,n_pn_bn_sN_{G\psi}/P$ | whole fit, on device |
-| face-tiled $C_\bq^{+}$ factor | $16\,Q N_\mu^2/P$ | whole fit, on device |
-| whole-q factor, when selected | $16\,\lceil Q/P\rceil N_\mu^2$, before pivots/workspace | whole fit, on q owners |
+| $C_\bq^{+}$ factor | $16\,Q N_\mu^2/P$ | whole fit, on device |
 | one batch | the largest of its three stages (projector exchange; unfold cylinder; plane groups) | per batch |
 | Z store | $16\,Q N_\mu N_\bG/P$ | host or disk |
-| finalize tile | leading planning term $6\cdot16\,\lceil Q/P\rceil N_\mu G_{\mathrm{tile}}$; targets a quarter of the budget, with one legal tile as the floor | per tile |
+| finalize tile | $\le 6\cdot16\,\lceil Q/P\rceil N_\mu G_{\mathrm{tile}}$, kept below a quarter of the budget | per tile |
 | projector GEMMs | $2\,n_pn_s^2N_\mu n_bN_{G\psi}/P$ MACs | summed over batches |
 | projector all-to-all | $2\cdot16\,n_pn_s^2N_\mu N_{G\psi}/P$ bytes | summed over batches |
 | owner FFTs and k-convolutions | $O\big(N_\mu N_kn_s^2N_r(\log N_r+\log N_k)/P\big)$ | summed over batches |
 
-The batch is chosen automatically from the resolved budget after the resident terms; the parent chunk and plane-group width use the fixed tile. When even the smallest batch (one orbit per owner, one plane per group) does not fit, the fit warns `memory over budget at zeta mu-batch` and runs that configuration; $\psi(\bG)$ is not streamed.
+The batch takes every byte left after the resident terms; the parent chunk and the plane-group width take the fixed tile. No input key sizes the fit. When even the smallest batch (one orbit per owner, one plane per group) does not fit, the fit warns `memory over budget at zeta mu-batch` and runs that configuration; $\psi(\bG)$ is not streamed.
 
 ## <span class="n">4</span> Time nodes one at a time {: #par-time }
 
@@ -205,9 +200,7 @@ $$
 \Sigma^c_{mn\bk}(\omega_{m\bk})\mathrel{+}=c_\ell(\omega_{m\bk})\,\langle m\bk|\Sigma^c_\bk(t_\ell)|n\bk\rangle, \qquad c_\ell(\omega) = p\,\alpha_\ell\,e^{-i(E_{\mathrm{ref}}-s\,\omega)t_\ell} \tag{4.2}
 $$
 
-and likewise at $\omega_{n\bk}$, on the band diagonal, and for the exact $\partial_\omega$; $s=\pm1$ is the branch and $p$ the window's prefactor. The total is $(2, N_k, N_b, N_b)$ plus diagonals; no history of $\Sigma^c(t)$ is kept, and a frequency grid $(n_\omega, N_k, N_b, N_b)$ exists only under `sigma_omega_grid_debug = true`. Shared-pole synthesis on CUDA can run two nodes per trip, so one node's $W$ synthesis and exchange overlap the other's k-convolutions, when the paired program fits the budget.
-
-Here the output $N_b$ is the requested target-band count, distinct from the bands summed in $G$. A state window uses shared branch support and its exact energy interval $(E_{\mathrm{lo}},E_{\mathrm{hi}}]$, evaluated against the common energies and occupations. Frequency pieces with the same state window share its selection; they do not retain another full k-by-sum-band mask each.
+and likewise at $\omega_{n\bk}$, on the band diagonal, and for the exact $\partial_\omega$; $s=\pm1$ is the branch and $p$ the window's prefactor. The total is $(2, N_k, N_b, N_b)$ plus diagonals; no history of $\Sigma^c(t)$ is kept, and a frequency grid $(n_\omega, N_k, N_b, N_b)$ exists only under `sigma_omega_grid_debug = true`. On CUDA the loop runs two nodes per trip, so one node's $W$ synthesis and exchange overlap the other's k-convolutions, when the paired program fits the budget.
 
 <figure class="flowchart" markdown>
 [![Σ at one time node: the G·W kernel](../assets/figures/g4.png)](../assets/figures/g4.png)
@@ -266,9 +259,7 @@ bounded by the pool reservation and by $M/4$ from below; $T_{\mathrm{ord}}$ = 16
 `runtime.tiles.tile_units`
 {: .in-code }
 
-A fixed-tile loop over $\bk$, $\bq$, bands, centroids, samples or rows takes the most units whose scaling workspace fits 1 GiB per rank, with at least one unit. Its tile comes from shapes, not free memory; a single indivisible unit can exceed the tile. Other planners size from the shared budget, including the ζ batch and $\bG$ tile, response sample groups and tangential synthesis panels. A response group's proposed width is agreed across ranks before a width-dependent program is compiled.
-
-Shape formulas propose a batch; the compiled program and available native workspace queries determine its execution price beside the live operands. A tile bounds that streamed workspace, not all resident inputs, final outputs, solver workspaces or the process's total memory. Some grouped ζ contractions still have incomplete whole-pass admission, and the wide ROCm native triangular-solve scratch has no exported query; neither is covered by a universal fit guarantee. The [cluster sizing guide](../using/clusters.md#resident-memory) separates resident-array tallies from measured peaks.
+A loop that streams over $\bk$, $\bq$, bands, centroids, samples or rows takes the most units whose bytes per rank fit 1 GiB. The count comes from the loop's shapes alone, never from free memory or the budget, so every rank compiles the same loop and results do not depend on the memory a run was given. Some planners still size from the budget: the ζ batch and $\bG$ tile, the response sample group and the tangential synthesis panels.
 
 A price above the budget never refuses: the stage prints one `memory over budget at <stage>` warning, runs at its smallest size, and fails only if the device truly lacks the room. A compiled module larger than the whole card refuses before it runs (`GATE xla_rematerialization`).
 

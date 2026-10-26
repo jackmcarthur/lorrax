@@ -1,9 +1,9 @@
 # For BerkeleyGW users
 
-`WFN.h5` BerkeleyGW's input keys, files and conventions, and what replaces each in LORRAX.
+`WFN.h5` Interoperability between the plane-wave code and LORRAX.
 {: .page-summary }
 
-LORRAX reads the same `WFN.h5` as BerkeleyGW and writes `eqp0.dat` and `eqp1.dat` in BerkeleyGW's format, but none of `epsilon.x`, `sigma.x`, `kernel.x` or `absorption.x` has a one-to-one counterpart. Keys and defaults are owned by the [GW keywords](../drivers/gw/keywords.md) and [BSE keywords](../drivers/bse/keywords.md) pages; every LORRAX key below links to its entry.
+The BerkeleyGW plane-wave implementation is a Fortran code whose GW module consists of `epsilon.x` and `sigma.x`, with `kernel.x` and `absorption.x` for the BSE. LORRAX has the JAX drivers `gw.gw_jax` and `bse.bse_jax`. The two do not correspond exactly, because the Green's function, the screened interaction and the kernel are represented very differently in the ISDF basis and in plane waves. LORRAX nevertheless reads and writes the BerkeleyGW file formats, so the same `WFN.h5` serves both codes, the quasiparticle energies pass between them as `eqp0.dat` and `eqp1.dat`, and the [export tools](../drivers/berkeleygw-export.md) write LORRAX's screening and BSE kernel as `epsmat.h5`, `eps0mat.h5` and `bsemat.h5`. This page maps the plane-wave code's input keys, files and conventions onto LORRAX. Keys and defaults are on the [GW keywords](../drivers/gw/keywords.md) and [BSE keywords](../drivers/bse/keywords.md) pages, and every LORRAX key below links to its entry.
 
 ## How the work divides {: #division }
 

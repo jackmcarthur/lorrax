@@ -521,7 +521,7 @@ k set of `qp_wfn_rotations.h5`.
 {: #solver }
 
 ### `memory_per_device_gb` {: .kw data-type="float" data-default="0.0" }
-Per-device memory budget for the chunk planners, in decimal GB. `0` detects it; a positive value can lower the automatic budget, not raise it. This is a planning budget, not an allocator limit or a guarantee that the smallest available batch fits. See [memory budgets and sizing](../../using/clusters.md#budget).
+Per-device memory budget for the chunk planners, in GB. `0` detects it.
 
 ### `linalg` {: .kw data-type="enum" data-default="local" }
 Layout of the dense solves (ζ, the $W$ Dyson solve, eigensolvers).

@@ -40,27 +40,7 @@ where $N_k$ counts the **full** k grid and $n_s$ is 1 for scalar, 2 for spinor a
 
 **$3G/P$ is a useful first planning target, not a universal peak or a fit guarantee.** Small-k-grid calculations can be dominated by wavefunction staging, ζ-fitting FFT/work buffers, Coulomb factors or solver workspace. Streamed routes may use less. Read the actual compiled/native workspace price for the chosen input and mesh, then measure a complete run. Do not infer a smaller working process count by dividing a measured peak by card capacity.
 
-For many-band runs, inspect the wavefunction route too. A two-axis distribution such as `psi_k(n_X,s,mu_Y)` reduces both large axes, giving leading storage proportional to $1/P$. A band-complete carrier `psi_k(n,s,mu_Y)` can reduce repeated communication but scales as $1/\sqrt P$; bounded panels offer another way to stage a contraction. The faster choice depends on the shapes and provider. Record the actual selected carrier and panels.
-
-### Count the resident arrays {: #resident-memory }
-
-The centroid-sampled wavefunctions and retained interaction fields give a second useful tally. Two wavefunction faces cost approximately
-
-$$
-F_\psi = \frac{2\cdot16\,n_{\mathrm{par}}n_sN_bN_\mu}{P},
-\qquad
-C = \frac{16\,Q N_\mu^2}{P}\quad\text{bytes per rank},
-$$
-
-where $C$ is one face-tiled complex128 **charge-channel** interaction-sized field and $Q$ is its stored q carrier, often the irreducible wedge. Use the actual padded band and centroid extents. $F_\psi$ counts the centroid faces, not the plane-wave coefficients, FFT boxes or temporary band-complete views. $C$ differs from the full-zone, spin-indexed $G/P$ above.
-
-For a one-pole calculation retaining $V$, the pole frequency $\Omega$, the even residue $B$ and the ordered odd residue $D$ on faces, these four fields contribute $4C$; the pole fields are stored as complex128. Thus $F_\psi+4C$ is a **resident-array tally for that live set**, not a peak or a fit bound. Forming an active $B+D$ or $B-D$ while retaining $D$ can add another $C$. With $D$ absent the three retained fields contribute $3C$; an allocated zero-valued $D$ still consumes storage. Shared-pole models, extra current channels and retained outputs need their own counts.
-
-Whole-q factorization routes have a different floor: one complex128 factor costs $16\lceil Q/P\rceil N_\mu^2$ per rank. When $Q<P$, one whole matrix still has to fit on its owner, before pivots and workspace. Increasing $P$ does not divide that matrix further; a distributed factorization uses faces instead.
-
-Row and time streaming bound the Green-function and screened-interaction intermediates; they do not remove the resident fields or the final requested $\Sigma$ matrices. A broad target-band window can therefore cost much more than a narrow QP window using the same sum bands. Shared symmetry/transport tables and state-support selections are reused across compatible kernels and frequency pieces rather than copied for every window.
-
-Check the **complete workflow**. The ζ fit, raw-WFN staging, a whole-matrix solver or native workspace can exceed this tally even when the later streamed self-energy fits. These formulas do not change the empirical resource requirements of the reference runs below; see [Memory and I/O](../theory/parallel-algorithms.md#par-mem) for the planning and measurement distinction.
+For many-band runs, inspect the wavefunction route too. A two-axis distribution such as `psi_k(n_X,s,mu_Y)` reduces both large axes, giving leading storage proportional to $1/P$. A faster band-complete carrier `psi_k(n,s,mu_Y)` scales as $1/\sqrt P$; bounded panels offer another way to stage a contraction. Record the actual selected carrier and panels: they have different memory and communication costs.
 
 ## Local or distributed linear algebra {: #linalg }
 
@@ -78,33 +58,11 @@ More ranks divide face storage and can reduce the number of whole matrices assig
 
 ## Reference runs on Perlmutter {: #examples }
 
-### Completed Fe GPU run, 25 October 2026
-
-Ferromagnetic bcc Fe with SOC completed on source [`ba121f1f1`](https://github.com/jackmcarthur/lorrax/commit/ba121f1f1fde23ae4a7f0b8442a894b857bdd3cf) with the required ABI13 native libraries, using released JAX/JAXLIB and CUDA plugin/PJRT `0.12.0.1`, NumPy `2.4.3` and SciPy `1.17.1`. The case has one atom, an 8×8×8 full k grid, 59 stored parents, 110 sum bands (112 padded slots), and 1099 physical centroids (1100 packed slots at P4). Fractional occupations use a 0.02 Ry width. The shared-pole treatment builds 1099 poles per q from 35 samples; the Σ/QP output covers bands 1–22.
-
-| Resources | Automatic budget/rank | GW wall | Pool-used peak/rank | Host high-water/rank |
-|---|---:|---:|---:|---:|
-| 4 A100-40GB GPUs, 1 node | 31.58 GB | 257.65 s | 15.48 GB | 16.30 GB |
-
-| Setup | ISDF / Coulomb | Screening | Self-energy | QP update |
-|---:|---:|---:|---:|---:|
-| 14.98 s | 42.37 s | 126.15 s | 70.98 s | 2.44 s |
-
-The driver time includes setup and compilation; DFT and centroid/dipole/kinetic preprocessing are excluded. Numerical state and private XLA/native/driver cache namespaces start fresh. Rank 0 records 568 driver backend compiles, six cache hits and 51.11 s of backend compilation, excluding eight startup compiles. Compile time overlaps the stage spans. This is one cold control; no warm or matched-source speedup measurement is attached to it.
-
-The 15.48 GB peak is the production pool-used maximum over four ranks. Physical/reserved device high-water was not aggregated. Host high-water is cumulative process `ru_maxrss`, including startup, maximized over ranks; multiplying it by four does not give a simultaneous node peak.
-
-All four producer ranks pass the source/native/version guards and log scans. A separate canonical readback verifies committed Σ/EQP coverage: 59×22 finite rows in each QP file. The unchanged strict Σ/EQP comparison with the earlier `ee695a6a4b` GPU4 control passes: numerical Sigma datasets, including complex derivatives, and both QP files have zero numerical differences. Accuracy convergence and W-operator parity remain separate checks. The `sigma_reads_past_w_support` warning concerns the W model's sampled support range and remains relevant to a separate accuracy study.
-
-The exact [deck](../assets/cluster-references/2026-10-25/fe_gpu4/gw.in) and [run record](../assets/cluster-references/2026-10-25/fe_gpu4/manifest.json) bind the physical input hashes, ABI13 native pair, cache counters and durable evidence archive. The physical centroid table is unchanged from the linked historical Fe assets. Later source revisions and CPU runs require their own qualification.
-
-### Historical source-pinned runs, 23 October 2026
-
-These historical fixed-input $G_0W_0$ runs completed on **23 October 2026**, pinned to source [`2d2ca2f104`](https://github.com/jackmcarthur/lorrax/commit/2d2ca2f104a085876a573e8b1278a7874c479b98). They use native full head corrections, default accuracy and automatic batch/layout selection. They establish completed workloads, not k-grid/band/basis convergence or minimum processor counts.
+These are fresh fixed-input $G_0W_0$ runs from **23 October 2026**, pinned to source [`2d2ca2f104`](https://github.com/jackmcarthur/lorrax/commit/2d2ca2f104a085876a573e8b1278a7874c479b98). They use native full head corrections, default accuracy and automatic batch/layout selection. They establish completed workloads, not k-grid/band/basis convergence or minimum processor counts.
 
 The downloadable decks preserve that historical source. For main at or after [`5e4f1bdab`](https://github.com/jackmcarthur/lorrax/commit/5e4f1bdabf4fd9643733a43966bf252f31426953), remove `fermi_reference = mp1_fixed_n` from the Fe deck; the metal chemical-potential reference is now automatic. Keep the original line when reproducing the pinned source.
 
-Memory values below use decimal GB. Wall time is the GW driver's `total run`, including setup and compilation but excluding centroid/dipole/kinetic preprocessing, queue wait and allocation startup. All GPU rows in this historical table use A100-80GB cards and the automatic local-linalg budget (66.35 GB in the saved receipts). Persistent compilation caches were shared; the counts below make their state explicit.
+Memory values below use decimal GB. Wall time is the GW driver's `total run`, including setup and compilation but excluding centroid/dipole/kinetic preprocessing, queue wait and allocation startup. All GPU rows use A100-80GB cards and the automatic local-linalg budget (66.35 GB in the saved receipts). Persistent compilation caches were shared; the counts below make their state explicit.
 
 | System | Full k grid / stored parents | Occupied bands | Sum bands | Physical $N_\mu$ | $n_s$ | Method | Resources | GW wall | Pool peak/rank |
 |---|---|---:|---:|---:|---:|---|---|---:|---:|
@@ -132,7 +90,7 @@ Fe retains the default `sigma_reads_past_w_support` warning. Its Σ energy grid 
 
 The 80-atom case is **Al₃₁CrO₄₈ with SOC**: 395 occupied spinor bands, 2370 physical sum bands (2372 padded slots), and 23700 physical centroids (23712 packed slots at P16). A 4-valence/4-conduction frontier still produces the full 1–399 Σ/QP prefix. The explicit −75…2.75 eV Σ range covers that prefix without out-of-grid static fallback; 831 quadrature nodes take 388.23 s. The default GN prescription treats 3.02% invalid modes with `static_limit`, a separate issue from energy-grid coverage.
 
-Its maximum pool-used peak is 52.89 GB/rank in ζ fitting, versus 41.39 GB in screening and 44.85 GB in Σ. One full-zone Green's function at the packed extent is 17.992 GB/rank, so this run peaks at **2.94G/P**. Host high-water is 15.97 GB/rank. The conservative Cplus quote exceeded the then-current planning room; the completed run stayed below the 66.35 GB budget. This saved 23 October/source `2d2ca2f104` record demonstrates the stated 16-GPU workload and does not include a smaller process count. Original structural/symmetry qualifications and the exact inputs are retained in the [case notes](../assets/cluster-references/2026-10-23/cr_al2o3_80/case_notes.txt).
+Its maximum pool-used peak is 52.89 GB/rank in ζ fitting, versus 41.39 GB in screening and 44.85 GB in Σ. One full-zone Green's function at the packed extent is 17.992 GB/rank, so this run peaks at **2.94G/P**. Host high-water is 15.97 GB/rank. The conservative Cplus quote exceeded the then-current planning room; the completed run stayed below the 66.35 GB budget. This demonstrates the stated 16-GPU workload; a smaller process count was not tested. Original structural/symmetry qualifications and the exact inputs are retained in the [case notes](../assets/cluster-references/2026-10-23/cr_al2o3_80/case_notes.txt).
 
 All ranks exited successfully and the canonical Σ and QP outputs were checked for the stated shapes and finite entries. Preserve the input hashes, exact decks, resolved geometry, selected routes, compilation counts and all-rank exit records when repeating a reference.
 
