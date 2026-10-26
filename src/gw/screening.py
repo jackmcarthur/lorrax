@@ -770,7 +770,7 @@ def compute_screening_model(
         if static_only:
             requests = [r for r in requests if r.role == "static"]
         return read_imported_screening(
-            requests, V_q, config=config, sym=sym, mesh_xy=mesh_xy,
+            requests, V_q, config=config, sym=sym, meta=meta, mesh_xy=mesh_xy,
             tensors_filename=tensors_filename, head_resolver=head_resolver,
             print_fn=print_fn)
     if mode.is_pole_route:
@@ -911,7 +911,7 @@ def compute_screening_model(
         iteration_head_response=iteration_head_response)
 
 
-def read_imported_screening(requests, V_q, *, config, sym, mesh_xy, tensors_filename,
+def read_imported_screening(requests, V_q, *, config, sym, meta, mesh_xy, tensors_filename,
                             head_resolver, print_fn=print):
     """``screening_source = bgw_epsmat``: the requested W roles from BerkeleyGW's epsilon.
 
@@ -920,7 +920,9 @@ def read_imported_screening(requests, V_q, *, config, sym, mesh_xy, tensors_file
     at omega = 0, ``Wp_qmunu`` at the Godby-Needs i omega_p;
     docs/theory/bgw_epsmat_export.md section 4).  This reads those rows on
     V's q layout (``file_io.restart_bundle.read_projected_screening``) in
-    place of chi0 and the Dyson solve, gates each like a computed W
+    place of chi0 and the Dyson solve, packs them into the run's centroid
+    order (``meta.mu_basis``, the step V takes in ``gw_init._coulomb_on_wedge``)
+    on V's q rows and tables, gates each like a computed W
     (:func:`_gate_w`), and installs BerkeleyGW's eps^-1_00(q0, omega) as the
     q->0 head at every role's frequency (``HeadResolver.install_epsinv_heads``):
     the projected rows carry no G = 0 row or column at Gamma.  Returns
@@ -938,9 +940,38 @@ def read_imported_screening(requests, V_q, *, config, sym, mesh_xy, tensors_file
             "time-reversal symmetry; why: BerkeleyGW's W(i omega_p) carries no odd "
             "channel, which the ordered GN fit of this deck needs; fix: "
             "screening_source = compute")
+    from symmetry_maps import QirrOperator
+    V_op = QirrOperator.of(V_q)
+    wedge = not V_op.is_whole_zone()
+    basis = getattr(meta, "mu_basis", None)
     with timing.section("W.read_bgw_epsmat"):
-        W_by_role, heads, prov = read_projected_screening(
-            tensors_filename, roles, V_q, mesh_xy)
+        rows, heads, prov = read_projected_screening(
+            tensors_filename, roles, mesh_xy, wedge=wedge, with_bare=True)
+        packed = {role: (values if basis is None else
+                         basis.pack_operator(values, spec=values.sharding.spec))
+                  for role, values in rows.items()}
+        # Certify the layout step where it is consumed: the file's own V rows,
+        # read and packed exactly as the W rows are, must be the run's V.
+        bare = packed.pop("bare")
+        err = (float(jnp.linalg.norm(bare - V_op.values))
+               / max(float(jnp.linalg.norm(V_op.values)), 1e-300)
+               if bare.shape == V_op.values.shape else float("inf"))
+        if not err <= 1e-10:
+            raise ValueError(
+                f"GATE screening_source_basis: got |V_file - V_run|/|V_run| = {err:.3e} after "
+                f"packing the file rows; want <= 1e-10; why: the projected W rows would be "
+                f"paired with V in another centroid or q order; fix: project onto this run's "
+                f"own ISDF tensor file and restart from it")
+        W_by_role = {}
+        for role, values in packed.items():
+            if tuple(values.shape) != tuple(V_op.values.shape):
+                raise ValueError(
+                    f"GATE screening_source_q_rows: got {role} W rows {tuple(values.shape)}, "
+                    f"V {tuple(V_op.values.shape)}; want V's q rows and centroid carrier; "
+                    f"why: W and V are read row by row together; fix: project onto this "
+                    f"run's own ISDF tensor file")
+            W_by_role[role] = (dataclasses.replace(V_op, values=values, load=None) if wedge
+                               else QirrOperator.whole_zone(values))
     for req in requests:
         with timing.section("W.gate"):
             _gate_w(W_by_role[req.role], req, mesh_xy=mesh_xy, print_fn=print_fn,

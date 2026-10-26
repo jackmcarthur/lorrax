@@ -129,17 +129,17 @@ def test_reader_serves_projected_rows_and_refuses_others(tmp_path, monkeypatch):
         d = f.create_dataset("bgw_epsinv_head", data=np.array([0.08 + 0j, 0.5 + 0j]))
         d.attrs["omega_ry_re"] = np.zeros(2)
         d.attrs["omega_ry_im"] = np.array([0.0, 2.0])
-    V = jax.device_put(np.zeros((nq, 8, 8), np.complex128), NamedSharding(mesh, P(None, "x", "y")))
-    W, heads, _ = rb.read_projected_screening(str(path), {"static": 0j, "probe": 2j}, V, mesh)
-    assert np.allclose(np.asarray(W["static"].values)[:, :nmu, :nmu], W0)
-    assert np.allclose(np.asarray(W["probe"].values)[:, :nmu, :nmu], Wp)
-    assert W["static"].is_whole_zone() and heads == {"static": 0.08 + 0j, "probe": 0.5 + 0j}
+    W, heads, _ = rb.read_projected_screening(str(path), {"static": 0j, "probe": 2j}, mesh,
+                                              wedge=False)
+    assert np.allclose(np.asarray(W["static"])[:, :nmu, :nmu], W0)
+    assert np.allclose(np.asarray(W["probe"])[:, :nmu, :nmu], Wp)
+    assert heads == {"static": 0.08 + 0j, "probe": 0.5 + 0j}
     with pytest.raises(ValueError, match="GATE screening_source_frequency"):
-        rb.read_projected_screening(str(path), {"probe": 2.5j}, V, mesh)
+        rb.read_projected_screening(str(path), {"probe": 2.5j}, mesh, wedge=False)
     with h5py.File(path, "a") as f:
         f["W0_qmunu"].attrs["W0_source"] = "lorrax"
         del f["Wp_qmunu"]
     with pytest.raises(ValueError, match="GATE screening_source_provenance"):
-        rb.read_projected_screening(str(path), {"static": 0j}, V, mesh)
+        rb.read_projected_screening(str(path), {"static": 0j}, mesh, wedge=False)
     with pytest.raises(ValueError, match="GATE screening_source_dataset"):
-        rb.read_projected_screening(str(path), {"probe": 2j}, V, mesh)
+        rb.read_projected_screening(str(path), {"probe": 2j}, mesh, wedge=False)
