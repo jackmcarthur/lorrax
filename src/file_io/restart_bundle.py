@@ -820,21 +820,23 @@ def refuse_mpa_static_w(filename) -> None:
 PROJECTED_W_DATASETS = {"static": "W0_qmunu", "probe": "Wp_qmunu"}
 
 
-def read_projected_screening(filename, roles, V_q, mesh_xy):
-    """BerkeleyGW's projected W rows on V's q layout, their heads and provenance.
+def read_projected_screening(filename, roles, mesh_xy, *, wedge, with_bare=False):
+    """BerkeleyGW's projected W rows in the file's canonical order, their heads and provenance.
 
     ``roles`` maps a screening role (``"static"``, ``"probe"``) to the run's
     frequency (Ry).  Each role's dataset (:data:`PROJECTED_W_DATASETS`) must
     carry ``W0_source = bgw_epsmat`` and the run's frequency (GATE
     ``screening_source_provenance`` / ``screening_source_frequency``); on a
     q wedge its unfold tables must be V's (GATE ``screening_source_q_rows``).
-    The rows come back on V's own layout: a wedge ``QirrOperator`` sharing
-    V's tables when V is held on the wedge, else the full zone
-    (``QirrOperator.whole_zone``), both at ``P(None, 'x', 'y')`` with V's μ
-    padding.  Returns ``({role: W}, {role: eps^-1_00(q0)}, provenance)``.
+    The rows are the file's: the stored wedge rows with ``wedge = True`` (the
+    rows V_qmunu holds), else the full zone (unfolded), at ``P(None, 'x', 'y')``
+    in canonical centroid order on the canonical μ carrier, exactly as the
+    restart reads V before the run packs it (``meta.mu_basis``).  ``with_bare``
+    adds the file's own ``V_qmunu`` rows under ``"bare"``, read the same way, so
+    the caller can certify its layout step on V.  Returns
+    ``({role: rows}, {role: eps^-1_00(q0)}, provenance)``.
     """
-    import dataclasses
-    from symmetry_maps import QirrOperator, dataset_q_storage
+    from symmetry_maps import dataset_q_storage
     from .slab_io import SlabIO
 
     def refuse(gate, got, want, why, fix):
@@ -895,22 +897,23 @@ def read_projected_screening(filename, roles, V_q, mesh_xy):
                    "the q->0 head of the projected W is BerkeleyGW's eps^-1_00(q0)", fix)
         heads[role] = complex(heads_file[int(hit[0])])
 
-    wedge = isinstance(V_q, QirrOperator) and not V_q.is_whole_zone()
-    n_rmu_pad = int(np.shape(getattr(V_q, "values", V_q))[-1])
+    if with_bare:
+        with h5py.File(filename, "r") as f:
+            shapes["bare"] = ("V_qmunu", tuple(int(n) for n in f["V_qmunu"].shape),
+                              f["V_qmunu"].dtype)
     out = {}
     for role, (name, shape, dtype) in shapes.items():
-        if wedge:
-            if shape[0] != int(V_q.n_wedge):
-                refuse("screening_source_q_rows", f"{name} {shape[0]} rows, V's wedge "
-                       f"{int(V_q.n_wedge)}", "V's stored q rows",
-                       "W and V are read row by row together", fix)
-            off, req, spec = _munu_slab_request(shape, n_rmu_pad)
+        if wedge and v_storage == "ibz":
+            mu_tag = padded_mu_axis(int(shape[-1]), mesh_xy)
+            off, req, spec = _munu_slab_request(shape, mu_tag.carrier)
             with SlabIO(filename, mode="r", mesh=mesh_xy) as io:
-                values = io.read_slab(name, shape=req, dtype=dtype, offset=off,
-                                      mesh=mesh_xy, partition_spec=spec)
-            out[role] = dataclasses.replace(V_q, values=values, load=None)
+                out[role] = io.read_slab(name, shape=req, dtype=dtype, offset=off,
+                                         mesh=mesh_xy, partition_spec=spec)
+            for axis in (-2, -1):
+                authenticate_axis(out[role], mu_tag, axis=axis,
+                                  where=f"read_projected_screening dataset {name!r}")
         else:
-            out[role] = QirrOperator.whole_zone(read_munu_tensor_from_h5(filename, name, mesh_xy))
+            out[role] = read_munu_tensor_from_h5(filename, name, mesh_xy)
     return out, heads, provenance
 
 
