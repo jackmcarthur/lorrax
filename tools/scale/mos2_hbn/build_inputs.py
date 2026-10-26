@@ -6,7 +6,8 @@ MoS2 band edges carry no strain shift. Mo and B sit on the origin, both hBN
 layers are in-plane identical and mirror images through the Mo plane: the
 supercell keeps the C3 axis and sigma_h of the monolayer.
 
-Usage: python build_inputs.py OUTDIR [--ecut 60] [--nbnd 1700] [--vacuum 15]
+Usage: python build_inputs.py OUTDIR [--ecut 70] [--nbnd 1700] [--vacuum 15] [--kgrid 2 2 1]
+(2x2x1 is the owner's memory-test grid; production needs a denser one.)
 """
 import argparse
 import os
@@ -18,8 +19,8 @@ Z_S = 0.1319282645 * 12.0    # tutorial S height (A), +-1.5831
 D_SBN = 3.30                 # S plane to hBN plane (A), vdW gap
 VALENCE = {"Mo": 14, "S": 6, "B": 3, "N": 5}   # SG15 ONCV (Mo with 4s4p semicore)
 MASS = {"Mo": 95.94, "S": 32.065, "B": 10.811, "N": 14.007}
-PSEUDO = {"Mo": "Mo_ONCV_PBE_FR-1.0.upf", "S": "S_ONCV_PBE_FR-1.1.upf",
-          "B": "B_ONCV_PBE_FR-1.1.upf", "N": "N_ONCV_PBE_FR-1.1.upf"}
+# FR ONCVPSP 3.3.0 set in the sandbox assets (assets/pseudopotentials/standard).
+PSEUDO = {"Mo": "Mo.upf", "S": "S.upf", "B": "B.upf", "N": "N.upf"}
 
 
 def structure(vacuum):
@@ -77,7 +78,8 @@ def pw2bgw_input(nbnd, kgrid=(3, 3, 1)):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("outdir")
-    ap.add_argument("--ecut", type=float, default=60.0)
+    ap.add_argument("--ecut", type=float, default=70.0)
+    ap.add_argument("--kgrid", type=int, nargs=3, default=[2, 2, 1])
     ap.add_argument("--nbnd", type=int, default=1700)
     ap.add_argument("--vacuum", type=float, default=15.0)
     a = ap.parse_args()
@@ -85,10 +87,11 @@ def main():
     nel = sum(VALENCE[s] for s, _ in atoms)
     os.makedirs(f"{a.outdir}/1-scf", exist_ok=True)
     os.makedirs(f"{a.outdir}/2-wfn", exist_ok=True)
-    open(f"{a.outdir}/1-scf/scf.in", "w").write(pw_input("scf", cell, atoms, ecut=a.ecut))
+    open(f"{a.outdir}/1-scf/scf.in", "w").write(
+        pw_input("scf", cell, atoms, ecut=a.ecut, kgrid=a.kgrid))
     open(f"{a.outdir}/2-wfn/wfn.in", "w").write(
-        pw_input("nscf", cell, atoms, ecut=a.ecut, nbnd=a.nbnd))
-    open(f"{a.outdir}/2-wfn/wfn.pp.in", "w").write(pw2bgw_input(a.nbnd))
+        pw_input("nscf", cell, atoms, ecut=a.ecut, nbnd=a.nbnd, kgrid=a.kgrid))
+    open(f"{a.outdir}/2-wfn/wfn.pp.in", "w").write(pw2bgw_input(a.nbnd, a.kgrid))
     vol = abs(np.linalg.det(cell))
     print(f"nat {len(atoms)}  electrons {nel}  occupied spinor bands {nel}  "
           f"a {cell[0, 0]:.5f} A  c {cell[2, 2]:.4f} A  V {vol:.1f} A^3 = {vol / 0.148185:.0f} bohr^3")
