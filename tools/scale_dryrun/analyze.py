@@ -67,15 +67,15 @@ def main(path):
     print("## First wall per GPU count (GB/rank; GW stages | BSE stages)\n")
     print("| atoms | N_mu | k | n_s | mode | P=4 | P=16 | P=64 | P=256 | min P (GW) | BSE @P=4/16/64/256 |")
     print("|---|---|---|---|---|---|---|---|---|---|---|")
-    key = lambda r: (r["atoms"], r["kgrid"], r["spinor"], r["mode"])
+    key = lambda r: (r["atoms"], r["kgrid"], r["spinor"], r["mode"], r["nmu"])
     groups = {}
     for r in d:
         groups.setdefault(key(r), []).append(r)
-    for (a, k, sp, mode), rs in groups.items():
+    for (a, k, sp, mode, _), rs in groups.items():
         rs.sort(key=lambda r: r["P"])
         gw = [cell(r["rows"], lambda st: st not in BSE) for r in rs]
         bse = [cell(r["rows"], lambda st: st in BSE) for r in rs]
-        s = D.system(a, k, sp)
+        s = D.system(a, k, sp) if not isinstance(k, str) else next(x for x in D.sweep_decks() if x["kgrid"] == k and x["spinor"] == sp and x["nmu"] == rs[0]["nmu"])
         plans = {}
         for name in D.stages(s, 4, mode):
             if name in BSE:
@@ -85,7 +85,7 @@ def main(path):
             plans[name] = tuple((rt, D.Price(operands=D.Term(grid=grid(name, rt), source="dryrun"), ranks=1))
                                 for rt, _ in D.stages(s, 4, mode)[name][1])
         z = D.memory.sizing(plans, limit_bytes=D.L_PHYS, per_node=4)
-        print(f"| {a} | {rs[0]['nmu']} | {k}³ | {2 if sp else 1} | {mode} | " + " | ".join(gw)
+        print(f"| {a} | {rs[0]['nmu']} | {k if isinstance(k, str) else str(k) + '³'} | {2 if sp else 1} | {mode} | " + " | ".join(gw)
               + f" | {z['p']} ({z['binding']}) | " + " / ".join(bse) + " |")
     print("\n## Largest N_mu at which the whole-matrix (local) route fits B = 66.4 GB\n")
     print("| stage | non-spinor (TRS) | spinor (ordered) |\n|---|---|---|")

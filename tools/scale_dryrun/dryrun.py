@@ -33,6 +33,8 @@ from gw.tangential_recipe import (ROLE_CODES, imaginary_sample_count,  # noqa: E
 from gw.gflat_memory_model import plan_zeta_route_g  # noqa: E402
 from gw.v_q_g_flat import vq_tile_bytes  # noqa: E402
 
+memory.set_sink(lambda *a, **k: None)   # the planners' banners; this harness prints its own table
+
 GB = 1e9
 C = 16.0
 # A100-80GB, memory-model.md "The rule": B at linalg local / distributed; L = M - O_leg.
@@ -102,6 +104,7 @@ def stages(s, P, mode):
     px = int(math.isqrt(P))
     st = {"psi(G) faces": ("code", (("only", C * nk * nb * ns * ng / P),), 0.0)}
     meta = SimpleNamespace(nk_tot=nk, nspinor=ns, n_rmu_padded=n, n_rmu=n, fft_grid=s["fft"])
+    memory.reset()   # each plan is priced alone, not beside earlier probes in this process
     try:
         z = plan_zeta_route_g(meta=meta, mesh_xy=P, n_q_selected=Q, ngkmax=ng, psi_ngkmax=ng,
                               fit_nb=nb, n_col=nb, n_s=ns, budget_gb=B_LOCAL / GB)
@@ -167,32 +170,88 @@ def min_p(s, mode):
     return memory.sizing(plans, limit_bytes=L_PHYS, per_node=4, platform="Perlmutter A100-80GB")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--json")
-    a = ap.parse_args()
-    out = []
+DECK_KEYS = dict(atoms=int, k=str, spinor=int, nmu=int, nb=int, nv=int, nq=int, ng=int, fft=int,
+                 vol_bohr3=float, ecut_ry=float, kfine=str, bse_v=int, bse_c=int, reach=float, eta=float)
+
+
+def deck(text):
+    """One deck from ``key=val,...`` (DECK_KEYS); unset keys take :func:`system`'s per-atom defaults.
+
+    ``k`` and ``kfine`` are ``n`` or ``n1xn2xn3``; N_q defaults to the TRS count (N_k + N_TRIM)/2."""
+    kv = dict(item.split("=", 1) for item in text.split(",") if item)
+    bad = set(kv) - set(DECK_KEYS)
+    if bad:
+        raise SystemExit(f"unknown deck keys {sorted(bad)}; known: {sorted(DECK_KEYS)}")
+    kv = {key: DECK_KEYS[key](val) for key, val in kv.items()}
+    grid = lambda t: tuple(int(x) for x in t.split("x")) if "x" in t else (int(t),) * 3
+    kg = grid(kv.get("k", "2"))
+    atoms, spinor = kv.get("atoms", 10), bool(kv.get("spinor", 0))
+    vol = kv.get("vol_bohr3", 200.0 * atoms)
+    s = system(atoms, 2, spinor, vol_bohr3_per_atom=vol / atoms, ecut_ry=kv.get("ecut_ry", 60.0))
+    nk = math.prod(kg)
+    s.update(kgrid="x".join(map(str, kg)), nk=nk, nq=(nk + math.prod(2 if g % 2 == 0 else 1 for g in kg)) // 2,
+             nk_fine=math.prod(grid(kv["kfine"])) if "kfine" in kv else math.prod(2 * g if g > 1 else 1 for g in kg))
+    for key, field in (("nmu", "nmu"), ("nb", "nb"), ("nv", "nv"), ("nq", "nq"), ("ng", "ng"),
+                       ("bse_v", "bse_v"), ("bse_c", "bse_c"), ("reach", "reach"), ("eta", "eta")):
+        if key in kv:
+            s[field] = kv[key]
+    if "fft" in kv:
+        s["fft"] = (kv["fft"],) * 3
+    s["nc"] = s["nb"] - s["nv"]
+    return s
+
+
+def sweep_decks():
+    """The generic sweep: 10-100 atoms at k 2^3/4^3, plus the 148-atom MoS2 4x4 / 2 hBN 5x5 slab
+    (3x3x1, N_mu 8k and 16k, slab volume 23350 bohr^3)."""
     for atoms in (10, 20, 40, 100):
         for kgrid in (2, 4):
             for spinor in (False, True):
-                for mode in ("tangential", "gn_ppm"):
-                    s = system(atoms, kgrid, spinor)
-                    for P in (4, 16, 64, 256):
-                        rows = evaluate(s, P, mode)
-                        top = max(rows, key=lambda r: r["gb"] / r["budget_gb"])
-                        out.append(dict(atoms=atoms, kgrid=kgrid, spinor=spinor, mode=mode, P=P,
-                                        nmu=s["nmu"], nb=s["nb"], nq=s["nq"], ng=s["ng"],
-                                        pencil=s.get("_pencil"), zstore=s.get("_zstore"), rows=rows, binding=top["stage"],
-                                        binding_gb=top["gb"], binding_route=top["route"],
-                                        verdict=top["verdict"],
-                                        not_ok=[(r["stage"], r["route"], round(r["gb"], 1)) for r in rows if r["verdict"] != "ok"],
-                                        host_fail=[(r["stage"], round(r["host_gb"], 1)) for r in rows if r["host_verdict"] != "ok"]))
-                    z = min_p(s, mode)
-                    out[-1]["sizing"] = dict(p=z["p"], binding=z["binding"], line=z["line"])
+                yield system(atoms, kgrid, spinor)
+    for nmu in (8000, 16000):
+        for spinor in (0, 1):
+            yield deck(f"atoms=148,k=3x3x1,spinor={spinor},nmu={nmu},nb={nmu // 10 * (1 + spinor)},"
+                       f"nv={300 * (1 + spinor)},vol_bohr3=23350")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--json")
+    ap.add_argument("--deck", action="append",
+                    help="price this deck instead of the sweep: key=val,... with keys " + ",".join(DECK_KEYS)
+                    + " (e.g. atoms=148,k=3x3x1,spinor=1,nmu=12000,nb=2400,nv=600,vol_bohr3=23350)")
+    ap.add_argument("--modes", default="tangential,gn_ppm")
+    ap.add_argument("--P", default="4,16,64,256", help="mesh sizes (square sizes are what LORRAX runs)")
+    ap.add_argument("--stages", action="store_true", help="also print every stage's GB/rank and route")
+    a = ap.parse_args()
+    decks = [deck(t) for t in a.deck] if a.deck else list(sweep_decks())
+    out = []
+    for s0 in decks:
+        atoms, kgrid, spinor = s0["atoms"], s0["kgrid"], s0["spinor"]
+        for mode in a.modes.split(","):
+            s = dict(s0)
+            for P in (int(p) for p in a.P.split(",")):
+                rows = evaluate(s, P, mode)
+                top = max(rows, key=lambda r: r["gb"] / r["budget_gb"])
+                out.append(dict(atoms=atoms, kgrid=kgrid, spinor=spinor, mode=mode, P=P,
+                                nmu=s["nmu"], nb=s["nb"], nq=s["nq"], ng=s["ng"],
+                                pencil=s.get("_pencil"), zstore=s.get("_zstore"), rows=rows, binding=top["stage"],
+                                binding_gb=top["gb"], binding_route=top["route"],
+                                verdict=top["verdict"],
+                                not_ok=[(r["stage"], r["route"], round(r["gb"], 1)) for r in rows if r["verdict"] != "ok"],
+                                host_fail=[(r["stage"], round(r["host_gb"], 1)) for r in rows if r["host_verdict"] != "ok"]))
+            z = min_p(s, mode)
+            out[-1]["sizing"] = dict(p=z["p"], binding=z["binding"], line=z["line"])
     if a.json:
         with open(a.json, "w") as fh:
             json.dump(out, fh, indent=1)
     for r in out:
+        if a.stages:
+            print(f"-- A={r['atoms']} k={r['kgrid']} ns={2 if r['spinor'] else 1} N_mu={r['nmu']} N_b={r['nb']} "
+                  f"N_q={r['nq']} N_G={r['ng']} {r['mode']} P={r['P']} pencil={r['pencil']} zeta={r['zstore']}")
+            for x in r["rows"]:
+                print(f"     {x['stage']:26s} {x['route']:11s} {x['gb']:9.2f} GB/rank {x['verdict']:4s} [{x['src']}]"
+                      + (f" host/disk {x['host_gb']:.1f} GB/rank" if x["host_gb"] else ""))
         print(f"A={r['atoms']:3d} k={r['kgrid']} ns={2 if r['spinor'] else 1} {r['mode']:10s} P={r['P']:3d} "
               f"mu={r['nmu']:6d} | {r['binding']:26s} {r['binding_route']:11s} {r['binding_gb']:9.1f} GB {r['verdict']:4s}"
               + (f" host:{r['host_fail']}" if r["host_fail"] else "")
