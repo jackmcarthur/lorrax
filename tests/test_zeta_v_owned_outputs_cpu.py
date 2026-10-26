@@ -81,14 +81,20 @@ def test_grouped_cross_grams_and_shells_allocate_only_output_v(monkeypatch, side
     keep = np.stack([np.zeros(q, np.int32), ngk - 1], axis=1)
     pairs = ((0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2))
     weights = rng.normal(size=(6, q, ng)) + .2j * rng.normal(size=(6, q, ng))
-    allocations = []
+    allocations, padded_weights = [], []
     original_zeros = zm.jnp.zeros
+    original_pad = zm.pad_to_axis
 
     def zeros(shape, *args, **kwargs):
         dims = (int(shape),) if isinstance(shape, (int, np.integer)) else tuple(shape)
         if dims == (qpad, mu, mu):
             allocations.append(dims)
         return original_zeros(shape, *args, **kwargs)
+
+    def pad(value, plan, axis=0, **kwargs):
+        if axis == 0 and value.ndim == 2 and value.dtype == np.complex128:
+            padded_weights.append(tuple(value.shape))
+        return original_pad(value, plan, axis=axis, **kwargs)
 
     zetas = []
     for ic in range(3):
@@ -119,9 +125,11 @@ def test_grouped_cross_grams_and_shells_allocate_only_output_v(monkeypatch, side
             gvec_components=np.zeros((q, 3, ng), np.int32), path='unused'))
     monkeypatch.setattr(gpu_utils, 'shared_device_room', lambda _s: 1 << 30)
     monkeypatch.setattr(zm.jnp, 'zeros', zeros)
+    monkeypatch.setattr(zm, 'pad_to_axis', pad)
     result = zm.contract_v_group(zetas, pairs, weights, keep=keep)
     jax.block_until_ready((result, [z.shell for z in zetas]))
     assert len(allocations) == (6 if solver == 'lu' else 0)
+    assert len(padded_weights) == (6 if solver == 'lu' else 0)
     for i, (a, b) in enumerate(pairs):
         expected = np.einsum('qmg,qg,qng->qmn', expected_zeta[a, :, :, :ng].conj(),
                              weights[i], expected_zeta[b, :, :, :ng])

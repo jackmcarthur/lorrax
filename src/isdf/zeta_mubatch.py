@@ -1221,20 +1221,20 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
             raise ValueError(
                 "contract_v_group: every ζ must share one store geometry "
                 "and centroid basis (one fit's channels).")
+    keep = np.asarray(keep, dtype=np.int32)
+    if keep.ndim != 2 or keep.shape[0] != st0.Q:
+        raise ValueError(
+            f"contract_v_group: keep must be (Q={st0.Q}, n) slots; got {keep.shape}.")
+    mesh = z0.mesh
+    if all(z.solver_kind in _FACE_KINDS for z in zetas):
+        return _contract_v_group_face(zetas, pairs, v_tables, keep, t0)
     qa, ga = st0.q_axis, st0.g_axis
     v = np.stack([np.asarray(pad_to_axis(pad_to_axis(
         jnp.asarray(t, dtype=jnp.complex128), qa, axis=0), ga, axis=1))
         for t in v_tables])                               # (n_pair, Q_pad, G)
     ngk = np.asarray(pad_to_axis(jnp.asarray(z0.ngk_per_q, jnp.int32), qa, axis=0))
-    keep = np.asarray(keep, dtype=np.int32)
-    if keep.ndim != 2 or keep.shape[0] != st0.Q:
-        raise ValueError(
-            f"contract_v_group: keep must be (Q={st0.Q}, n) slots; got {keep.shape}.")
     sl = np.asarray(pad_to_axis(jnp.asarray(keep, jnp.int32), qa, axis=0))
     from common.collectives import device_put_process_local
-    mesh = z0.mesh
-    if all(z.solver_kind in _FACE_KINDS for z in zetas):
-        return _contract_v_group_face(zetas, pairs, v_tables, keep, t0)
     v_dev = device_put_process_local(v, NamedSharding(mesh, P(None, _XY, None)))
     ngk_dev = device_put_process_local(ngk, NamedSharding(mesh, P(_XY)))
     sl_dev = device_put_process_local(sl, NamedSharding(mesh, P(_XY, None)))
