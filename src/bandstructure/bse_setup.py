@@ -571,8 +571,8 @@ def compute_wfns_fi(
         _fit(mesh_xy, P(('x', 'y'), None), (bs, nb_fi), "bse_setup.lam"),
         _fit(mesh_xy, P(('x', 'y'), None, None, None),
              (bs, nb_fi, nspinor, mu_out), "bse_setup.psi"),
-        _fit(mesh_xy, P(('x', 'y'), None, None), (bs, rank, nb_fi),
-             "bse_setup.coeffs"),
+        (_fit(mesh_xy, P(('x', 'y'), None, None), (bs, rank, nb_fi),
+              "bse_setup.coeffs") if return_coeffs else None),
         rep, rep)
     q_batch_x0 = _fit(mesh_xy, P(('x', 'y'), None, None),
                       (bs, rank, int(columns.shape[1]) + nb_co),
@@ -592,7 +592,8 @@ def compute_wfns_fi(
                 lam, U, steps, res = top_block_eigh(
                     _fourier(q, fH_R, code, route), x0, (b_min, b_max))
                 L = _fourier(q, L_R, target_code, route, hermitian=False)
-                return _project(lam, U, L, b_min, b_max) + (steps, res)
+                lam, psi, c = _project(lam, U, L, b_min, b_max)
+                return lam, psi, c if return_coeffs else None, steps, res
             return node_route_map(route, one, q_batch)
         return _chunk
 
