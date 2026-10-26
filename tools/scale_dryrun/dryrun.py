@@ -119,7 +119,13 @@ def stages(s, P, mode):
     try:
         z = plan_zeta_route_g(meta=meta, mesh_xy=P, n_q_selected=Q, ngkmax=ng, psi_ngkmax=ng,
                               fit_nb=nb, n_col=nb, n_s=ns, budget_gb=B_LOCAL / GB)
-        st["zeta fit (route G)"] = ("code", (("only", z.min_config_bytes),), z.store_bytes)
+        zeta = z.min_config_bytes
+        if s.get("zeta_c_face"):
+            # The planner prices the charge factor whole per q-owner, ceil(Q/P) mu^2; the charge
+            # channel's B runs on the face (isdf.zeta_mubatch._FACE_KINDS, ZetaG._contract_v_face).
+            zeta += C * Q * n * n / P - z.breakdown["C factor"]
+        st["zeta fit (route G)"] = ("code" if not s.get("zeta_c_face") else "code, C on face",
+                                    (("only", zeta),), z.store_bytes)
         s["_zstore"] = dict(placement=z.placement, store_gb_per_rank=round(z.store_bytes / GB, 1), b=z.b, n_batch=z.n_batch)
     except Exception as e:  # reported, never hidden
         st["zeta fit (route G)"] = (f"error {type(e).__name__}: {e}", (("only", float("nan")),), 0.0)
@@ -183,7 +189,7 @@ def min_p(s, mode):
 
 DECK_KEYS = dict(atoms=int, k=str, spinor=int, nmu=int, nb=int, nv=int, nq=int, ng=int, fft=int,
                  vol_bohr3=float, ecut_ry=float, kfine=str, bse_v=int, bse_c=int, reach=float, eta=float,
-                 trs=int, side_frac=float)
+                 trs=int, side_frac=float, zeta_c_face=int)
 
 
 def deck(text):
@@ -204,6 +210,7 @@ def deck(text):
     nk = math.prod(kg)
     s.update(kgrid="x".join(map(str, kg)), nk=nk, nq=(nk + math.prod(2 if g % 2 == 0 else 1 for g in kg)) // 2,
              nk_fine=math.prod(grid(kv["kfine"])) if "kfine" in kv else math.prod(2 * g if g > 1 else 1 for g in kg))
+    s["zeta_c_face"] = bool(kv.get("zeta_c_face", 0))
     for key, field in (("nmu", "nmu"), ("nb", "nb"), ("nv", "nv"), ("nq", "nq"), ("ng", "ng"),
                        ("bse_v", "bse_v"), ("bse_c", "bse_c"), ("reach", "reach"), ("eta", "eta")):
         if key in kv:
