@@ -225,9 +225,13 @@ centroid layouts before the physical q crop. Physical target counts remain
 metadata; padding is zeroed inside projection, and returned coefficients
 use the canonical Galerkin rank carrier over all ranks. A ragged q or prime
 centroid count therefore cannot silently drop the output sharding.
-When coefficients are not requested, the chunk program returns only the
-wavefunctions, eigenvalues and solve receipts; its internal eigenvectors
-remain internal to the priced solve and projection.
+
+With `return_coeffs=False`, the admitted chunk uses `None` for the coefficient
+output and its output sharding. It returns the wavefunctions, eigenvalues
+and solve receipts; internal eigenvectors still serve the same solve and
+projection. The setup's [WS compiler boundary](compilation.md#rank-local-geometry)
+keeps rank-local geometry uploads outside the globally ordered compilation.
+
 The SR/LR W model also keeps its form-factor rows on all-rank centroid
 shards. The restart reader uses SlabIO for those rows; the unchanged
 polynomial fit acts on each process's owned centroid columns, with only two

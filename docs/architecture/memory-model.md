@@ -1,20 +1,22 @@
 # Memory model
 
-A LORRAX calculation needs every stage's per-rank live set to fit the device
-budget and its processes' combined host memory to fit their node. The leading
-device faces are tiled over the `x × y` mesh and fall as `1/P`; fixed tile
-workspaces and replicated host data need separate accounting. This page states, stage by stage,
+A LORRAX calculation needs its per-rank live set to fit available device
+memory and its processes' combined host memory to fit their node. The budget
+is a planning target with the warn-and-run policy below. The leading
+device faces are tiled over the `x × y` mesh; their leading spread terms fall
+as `1/P` at fixed legal carriers. Padding, minimum tiles and replicated data
+set floors, and band-complete ψ copies scale as `1/sqrt(P)`. This page states, stage by stage,
 what is resident per rank, how it scales, and which planner prices it.
-One implementation prices, admits and measures every stage: `lxkit.memory`
-(`services/lxkit/src/lxkit/memory.py`). Prices come from measurement: the
-stage's own program compiled and never run (its `memory_analysis`), the
-provider's size query, or a measured vendor row; a closed form only proposes a
-candidate ([§ Prices from measurement](#measured)). No planner refuses on a price (owner
+Stages share the pricing, admission and measurement API `lxkit.memory`
+(`services/lxkit/src/lxkit/memory.py`). A quote can combine compiled-program
+statistics (`memory_analysis`), provider size queries, measured vendor rows
+and shape-based proposals; its coverage matters
+([§ Prices from measurement](#measured), [known gaps](#pricing-coverage)). No planner refuses on a price (owner
 2026-10-19, `memory.admit`): the fastest route that fits runs; when none fits,
 the cheapest runs with one `RuntimeWarning`, or, when it is over the allocator's
-physical limit, with a loud banner naming the shortfall and the minimum process
-count that completes. What still refuses is not a price: a workspace that cannot
-be measured, a compiled module larger than the device
+physical limit, with a loud banner naming the shortfall and an estimated
+minimum process count from that quote. Separate gates can refuse an unavailable
+workspace query, a compiled module quoted above the device
 ([`GATE xla_rematerialization`](#module-does-not-fit)), a measured vendor row used
 outside its range under `memory.STRICT` (`GATE memory_unpriced`), and the
 correctness gates.
@@ -195,11 +197,14 @@ with `N_k N_b` eigenvalues; there is no host `N_orbit²` or `N_k N_b²` matrix.
 
 ### Prices from measurement {#measured}
 
-- **Programs.** A route or a dispatch is priced by the program that runs it,
+- **Programs.** At compiled-price sites, a route or dispatch is priced by the program that runs it,
   lowered and compiled at its abstract operands: `temp + outputs − alias` plus
   the largest dynamic FFT workspace (`runtime.aot_memory.compiled_new_bytes`):
   cuFFT/hipFFT plans or ROCm's split k-minor provider query, whichever is larger,
-  taking the largest figure any rank read. Where the program then runs, the priced executable is the one
+  taking the largest figure any rank read. These are new-buffer figures beside
+  the live operands, not measurements of total process peak. Removing an unused
+  output can also change temporary storage, so its byte size alone is not the
+  net saving. Where the program then runs, the priced executable is the one
   executed (the response bank, the ζ tile passes, the tangential rounds), so a
   price costs no extra compile. `check_chunk` corrects a chunk once from that
   figure ([§ The compiled check](#the-compiled-check)).
@@ -238,6 +243,24 @@ with `N_k N_b` eigenvalues; there is no host `N_orbit²` or `N_k N_b²` matrix.
   rank without a mesh route beside it: a stage whose only candidates do so
   refuses (`GATE nmu2_no_backup`; `LORRAX_NMU2_BACKUP=report` makes it a
   finding for a census).
+
+### Pricing coverage limits {#pricing-coverage}
+
+`ZetaG.contract_v` records its actual compiled G-tile step or face chain,
+including the prefetched and written tiles, beside already-live factors and
+carries. The grouped live-V path (`contract_v_group`, including its face
+variant) still uses the μ-batch proposal without a complete compiled
+group-pass admission. Its individual factors and GEMMs can have compiled
+prices; those do not price their combined live set or admit the initial V/S
+allocations. The grouped estimate is not a complete capacity certificate.
+
+Wide ROCm local LU/triangular applications have a separate query gap.
+`distrib_la.local_lu._native_tri` selects the blocked native handler when one
+logical matrix's A or RHS span exceeds 2³¹ bytes. That handler queries and
+allocates rocBLAS workspace at execution, but no planner-facing query exposes
+those bytes yet. Compiled layout copies and pivots do not account for that
+dynamic allocation. This affects wide ζ LU formers too; a small-case CPU/CUDA
+pass does not establish complete pricing for that ROCm regime.
 
 ### Why the pool's reserved bytes run past R {#pool-growth}
 
@@ -470,8 +493,9 @@ M_axis / G_tile  = 2·s·r·√P / n_s       grows as √P
 M_panel / G_tile = 4·s·r / n_s          independent of P
 ```
 
-A resident axis copy would overtake one Green tile at `√P = n_s/(2·s·r)`
-and then spend the GW feasibility floor (`4·G_tile`) on wavefunctions. For
+A resident axis copy overtakes one full-centroid Green tile at
+`√P = n_s/(2·s·r)`. These ratios compare layouts; current orbit-row streams
+do not require four whole Green tiles. For
 `μ = 10·N_b` (`r = 0.1`):
 
 | P | n_s=1, s=1 | n_s=2, s=1 | n_s=4, s=1 | n_s=2, s=1/6 |
@@ -487,8 +511,9 @@ A Green build `G = ψ·diag(f)·ψ†` on faces is a batched 2-D SUMMA
 (`distrib_la.panel_matmul`): band panels of at most `N_b/p` columns are
 all-gathered (`A` over `y`, `B` over `x`), every k in each exchange, and
 multiplied into the rank's own tile, so no reduction follows and no rank holds
-a band-complete panel. Two panels are live, the next prefetched; every
-Green-building stage reserves one full-k Green tile, which bounds them.
+a band-complete panel. Two panels are live, the next prefetched. Orbit-row
+streams apply this product to their live row window and price its panels at
+that geometry.
 The Σ projector `ψ†·O·ψ` reshards the two
 projected-band ψ faces to the band-complete orientation for the call and
 contracts each `(μ_x, ν_y)` slab locally, so the μ-sized operator never
@@ -523,7 +548,7 @@ scratch are admitted beside the live operands and placed unfold tables.
 Row sizes follow the fixed 1 GiB tile, including for small one-window cases.
 
 The bounded charge k-convolution cache is the single owner of placed charge
-tables. Its live row variants share the same plan's eight fields, counted
+tables. Its live row variants share the same mesh/plan's eight fields, counted
 once; full-span calls use the same window entry. There is no separate placement
 cache retaining a plan after its last operator retires. That eviction
 retires table-bound minimax and
@@ -532,7 +557,8 @@ through the same owner. A caller or an unfinished background compile can
 still retain its own operands until its work finishes; eviction does not
 cancel work or delete borrowed device buffers. Recompiling an explicitly
 held retired program returns its future to the caller without restoring
-global cache ownership of the retired tables.
+global cache ownership of the retired tables. Retirement follows table
+liveness, not a rank-local future's completion state.
 
 `S_11` is mode 11's split-arm scratch, at most one `T_R`
 (`greens_function_kernel.chi0_kconv_scratch`); it is 0 on the single pass.
@@ -645,8 +671,8 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | warns; one q |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | tangential screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([tangential model](tangential_model.md), byte model) | warns and admits, when a stage and its named concurrent stages exceed the budget |
-| static / GN-PPM screening | distributed χ₀ carry and one orbit-closed parent-Green row window ([§ Green-side](#the-green-side-stages)); the GN fit's q block | `w_isdf._run_minimax_chi`: actual compiled additional bytes plus provider scratch; `_gn_ppm_fit_q_block`: the fixed tile, at least one q | warns and admits |
-| Σ(τ) sweep | the resident pole fields, band-complete ψ, then one row pass ([§ Green-side](#the-green-side-stages)) | `subtile_stream.plan_windows`: equal orbit-aligned windows, the pass count from the fixed tile and the shortest window that keeps it | — |
+| static / GN-PPM screening | distributed χ₀ carry and one orbit-closed parent-Green row window ([§ Green-side](#the-green-side-stages)); the GN fit's q block and output carry | `w_isdf._run_minimax_chi`: actual compiled additional bytes plus provider scratch; `fit_gn_ppm_from_wc_pair`: q-block proposal followed by the complete compiled scan | warns and admits |
+| Σ(τ) sweep | resident pole fields, selected AXIS or borrowed FACE ψ, the small QP projector, then one row pass ([§ Green-side](#the-green-side-stages)) | `subtile_stream.plan_windows`: equal orbit-aligned windows, the pass count from the fixed tile and the shortest window that keeps it | — |
 | matrix-element sweep (V_H, four-current) | the step's slabs, and FFT boxes `(2 + 2·n_comp)·n_s·N_r·16` per band of a band-layout operator | `mtxel_sweep.plan_sweep`: bands in the fewest chunks whose boxes fit the fixed tile | — |
 | ψ loader off the fit plan (ζ reuse, current faces) | one band tile of G-flat rows, samples and faces | `gflat_memory_model.loader_band_chunk`: the fixed tile, at least the automatic 16 | warns; one scan row |
 | kmeans candidate Gram | one square Gram face `16·M²/P`, the k batch's distinct X/Y WFN face sets, and a fixed square projector tile | `centroid.pivoted_cholesky`: k batches price each distinct band interval once; equal or nested windows share one face set and slice it inside the tiled Gram executable. Pruning releases its padded Gram after diagnostics and returns only points and linear-size receipts; slicing a ragged logical Gram for return would replicate it | warns and admits |
@@ -714,6 +740,7 @@ at 128³, independent of whether the request had one or three k rows. The
 actual compiled price includes this bounded storage; identical peak memory
 is not assumed. Full-band chunks keep their previous flat-scan route.
 
+<a id="ws-geometry-memory"></a>
 The htransform WS constructor computes only addressable node×node and
 target×node code tiles. It retains no all-site pair matrix or target×target
 table. For local int16 code bytes `C`, host construction holds `O(C)` data
@@ -825,6 +852,15 @@ For the charge channel, `ZetaG.contract_v` accumulates `V_q` tile by tile as
 it forms ζ from the Z store, keeping ζ only at the columns the head consumers
 name.
 
+Live-fit callers adopt that returned V carry without retaining an unused
+outer zero matrix. Grouped shell carries are allocated directly; their
+constructor does not create a discarded V. All-face groups dispatch before
+q-owner-only weight padding. The ζ-file-only pass calls
+`contract_v(None, with_v=False)`: it applies the same factors, G masks and
+writer layout without constructing or uploading a full zero Coulomb-weight
+table or accumulating V. These lifetime changes do not close the grouped
+[pricing gap](#pricing-coverage).
+
 Its Z-store tile enters as `Z_q_XY(mu,G)` and moves to `Z_q(mu_X,G_Y)`
 through the existing explicit `_to_mu_owner` exchange, cropping padded q
 rows afterwards. A direct sharding constraint here replicated the whole
@@ -851,8 +887,8 @@ The fresh writer persists its unchanged authenticated canonical pre-unfold
 capture, including the existing table/centroid/provenance checks. The late
 `_select_coulomb_q_rows` seam authenticates an already-selected operator against
 the current canonical wedge, then `_coulomb_on_wedge` packs both centroid axes
-and attaches the packed tables. Each executable is compiled, priced and
-admitted before it runs. Screening and Σ retain only
+and attaches the packed tables. These canonical-row selection and packing
+programs are compiled, priced and admitted before they run. Screening and Σ retain only
 `V_qirr(mu_X,nu_Y)` (`16·N_q,irr·μ_packed²/P`). A nonreducing grid retains
 its full-q carrier because every row is required; a full-storage fallback uses
 the existing full unfold, admitted before materialization. Those cases retain
@@ -863,13 +899,15 @@ q-IBZ restart needs that full-zone resident.
 
 ### The compiled check
 
-A planner's closed form chooses its chunk; the chosen executable is compiled
-anyway, and `runtime.aot_memory.check_chunk` reads it before it runs. The
+At sites using `runtime.aot_memory.check_chunk` (listed below), a planner's
+closed form proposes a chunk and the check reads its compiled executable
+before it runs. The
 stage is priced as `fixed + chunk·per_unit` new bytes per rank beside what is
 live. The executable's figure is `temp + outputs − alias` plus cuFFT plan
 scratch (`compiled_new_bytes`), plus what the stage holds beside it that buffer
 assignment cannot see: a donated carry the caller allocated, a native
-handler's run-time scratch, a lookahead copy of the output. Only the compiled figure admits a chunk:
+handler's queried run-time scratch, a lookahead copy of the output. At these
+sites the compiled figure corrects the chunk proposal:
 within the room the chunk runs unchanged, whatever the closed form said. Over
 the room, the slope is corrected from that one point,
 `per_unit = max(per_unit, (compiled − fixed)/chunk)`, the chunk solved
@@ -921,8 +959,9 @@ need 137.04 GB per device (temp 125.49 + arguments 11.55 + outputs 0.22
 - aliased 0.22), and the device has 85.09 GB.  …
 ```
 
-This is a hard device limit, not the budget: such a module cannot run on
-this card. A module
+This gate compares the compiled buffer estimate with the card total, not
+the budget; it is not a measurement of the process's full live set or of
+unqueried native allocations. A module
 between the budget and the card is not refused; the budget only warns. The
 check runs on every GPU leg whose card total is readable (CUDA and ROCm). It does not run at compile, because planners compile
 larger candidates on purpose to read their figures and then shrink
@@ -966,11 +1005,12 @@ scratch buffer when its provider selects a split plan with output layout 1.
 The provider's `lrx_kminor_workspace_bytes_rocm` query uses that same plan;
 `runtime.aot_memory` parses the actual compiled local shape, grid and layout
 and includes the exact bytes. Layout 0 and native transform-only mode 5 need
-no extra arena allocation. Missing query symbols or unparseable native calls
+no extra arena allocation. For these native FFT families, missing query symbols or unparseable calls
 refuse by name instead of admitting a guessed zero. The total adds the
 maximum of this term and the XLA FFT plan workspace, because the calls in the
 executable run serially. Other explicitly priced native workspaces remain
-with their existing owners.
+with their existing owners; the [wide ROCm LU query gap](#pricing-coverage)
+is not covered by this FFT machinery.
 On CPU the host `gw_conv` handler keeps a reused host arena of
 `16·N_k·m_x·m_y` bytes and per-thread compact chunks, outside XLA.
 
@@ -988,8 +1028,11 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
 
 1. **Budget.** Leave `memory_per_device_gb = 0` for the model's budget, or
    set it lower to cap it (a value above it warns).
-2. **Mesh.** Use a square mesh. Every chunked term and the default
-   face-layout centroid copies fall as `1/P`.
+2. **Mesh.** Use a square mesh and price its actual padded carriers.
+   Leading face terms fall as `1/P` in the divisible regime; a q-owned
+   factor's `ceil(Q/P)` stops at one parent. Fixed scratch, replicated
+   metadata, indivisible orbits and minimum tiles set further floors;
+   band-complete ψ copies instead scale as `1/sqrt(P)`.
 3. **Read the receipts** in `gwjax.out`: `ISDF μ-batch plan` for each ζ
    fit (the charge channel, and the current channels with `channels = 3`),
    which names its binder, and `Resident ψ` for the GW carriers.

@@ -145,6 +145,18 @@ A cache hit checks and waits for nothing. A check waits without bound by
 default ([registry](../reference/env_vars.md#2e-compile-cache)). The agreement
 costs 6.2 s on the warm hsuite (161.9 against 155.7 s, claim 4130) and stays on.
 
+<a id="rank-local-geometry"></a>
+**Rank-local geometry.** The WS classifier (`common.ws_images.pair_ws_local_codes`) agrees the union
+of displacement-block widths before every rank compiles and prices the same
+`_class_ties` programs in the same order. Local blocks can then visit those
+widths in different orders, including padding-only stripes. Their NumPy
+geometry operands use direct `jax.device_put` to this process's local device
+before calling the compiled executable. An eager `jnp.asarray` in that loop
+can request a new conversion program on only some ranks, while others enter
+the next host metadata gather; precompiling the classifier alone does not
+order that extra request. The bounded geometry storage and its price are
+described in the [memory model](memory-model.md#ws-geometry-memory).
+
 **The runtime's XLA flags.** The runtime merges the GPU leg's declared
 compile flags (`PlatformLeg.xla_flag_defaults` in `lxkit.LEGS`, merged by
 `runtime.set_default_xla_gpu_autotune`) and one HLO-pass flag into

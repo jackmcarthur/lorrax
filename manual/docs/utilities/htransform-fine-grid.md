@@ -12,6 +12,12 @@ The transformed Hamiltonian is built from every band from the lowest valence ban
 
 When the BSE loader fills the `kgrid_fine` grid with QP energies from `eqp_corrections` or `eqp_co_corrections`, a window that reaches above the eqp file's top band gets the same rigid conduction scissor on the bands above it as [`--eqp-file`](htransform.md#-eqp-file), with the same `[QP scissor]` log line.
 
+## Memory {: #memory }
+
+The fitted basis and transformed Hamiltonian are sized by the **fitted** band/basis window, not just the valence and conduction states returned to the BSE. The fine-q chunk is padded for the mesh, and the returned centroid carriers are padded separately from the physical interpolation points. These zero slots affect storage, not the requested grid or band window.
+
+The fine-grid engine retains the interpolated wavefunctions and energies. Coefficients used to project those wavefunctions stay inside the compiled chunk unless its caller explicitly requests the coefficient output; the normal no-coefficient path omits that unused export and reshard automatically. Read the selected q-batched or FACE route and its compiled memory price; reducing the returned band window alone need not reduce the Hamiltonian or eigensolver workspace. General sizing guidance is on [Running on clusters](../using/clusters.md#resident-memory).
+
 ## Keywords {: #keywords }
 
 Defaults are read from the keyword schema (`src/gw/gw_config.py`).

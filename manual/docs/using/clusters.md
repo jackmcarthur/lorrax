@@ -40,7 +40,27 @@ where $N_k$ counts the **full** k grid and $n_s$ is 1 for scalar, 2 for spinor a
 
 **$3G/P$ is a useful first planning target, not a universal peak or a fit guarantee.** Small-k-grid calculations can be dominated by wavefunction staging, ζ-fitting FFT/work buffers, Coulomb factors or solver workspace. Streamed routes may use less. Read the actual compiled/native workspace price for the chosen input and mesh, then measure a complete run. Do not infer a smaller working process count by dividing a measured peak by card capacity.
 
-For many-band runs, inspect the wavefunction route too. A two-axis distribution such as `psi_k(n_X,s,mu_Y)` reduces both large axes, giving leading storage proportional to $1/P$. A faster band-complete carrier `psi_k(n,s,mu_Y)` scales as $1/\sqrt P$; bounded panels offer another way to stage a contraction. Record the actual selected carrier and panels: they have different memory and communication costs.
+For many-band runs, inspect the wavefunction route too. A two-axis distribution such as `psi_k(n_X,s,mu_Y)` reduces both large axes, giving leading storage proportional to $1/P$. A band-complete carrier `psi_k(n,s,mu_Y)` can reduce repeated communication but scales as $1/\sqrt P$; bounded panels offer another way to stage a contraction. The faster choice depends on the shapes and provider. Record the actual selected carrier and panels.
+
+### Count the resident arrays {: #resident-memory }
+
+The centroid-sampled wavefunctions and retained interaction fields give a second useful tally. Two wavefunction faces cost approximately
+
+$$
+F_\psi = \frac{2\cdot16\,n_{\mathrm{par}}n_sN_bN_\mu}{P},
+\qquad
+C = \frac{16\,Q N_\mu^2}{P}\quad\text{bytes per rank},
+$$
+
+where $C$ is one face-tiled complex128 **charge-channel** interaction-sized field and $Q$ is its stored q carrier, often the irreducible wedge. Use the actual padded band and centroid extents. $F_\psi$ counts the centroid faces, not the plane-wave coefficients, FFT boxes or temporary band-complete views. $C$ differs from the full-zone, spin-indexed $G/P$ above.
+
+For a one-pole calculation retaining $V$, the pole frequency $\Omega$, the even residue $B$ and the ordered odd residue $D$ on faces, these four fields contribute $4C$; the pole fields are stored as complex128. Thus $F_\psi+4C$ is a **resident-array tally for that live set**, not a peak or a fit bound. Forming an active $B+D$ or $B-D$ while retaining $D$ can add another $C$. With $D$ absent the three retained fields contribute $3C$; an allocated zero-valued $D$ still consumes storage. Shared-pole models, extra current channels and retained outputs need their own counts.
+
+Whole-q factorization routes have a different floor: one complex128 factor costs $16\lceil Q/P\rceil N_\mu^2$ per rank. When $Q<P$, one whole matrix still has to fit on its owner, before pivots and workspace. Increasing $P$ does not divide that matrix further; a distributed factorization uses faces instead.
+
+Row and time streaming bound the Green-function and screened-interaction intermediates; they do not remove the resident fields or the final requested $\Sigma$ matrices. A broad target-band window can therefore cost much more than a narrow QP window using the same sum bands. Shared symmetry/transport tables and state-support selections are reused across compatible kernels and frequency pieces rather than copied for every window.
+
+Check the **complete workflow**. The ζ fit, raw-WFN staging, a whole-matrix solver or native workspace can exceed this tally even when the later streamed self-energy fits. These formulas do not change the empirical resource requirements of the reference runs below; see [Memory and I/O](../theory/parallel-algorithms.md#par-mem) for the planning and measurement distinction.
 
 ## Local or distributed linear algebra {: #linalg }
 
@@ -112,7 +132,7 @@ Fe retains the default `sigma_reads_past_w_support` warning. Its Σ energy grid 
 
 The 80-atom case is **Al₃₁CrO₄₈ with SOC**: 395 occupied spinor bands, 2370 physical sum bands (2372 padded slots), and 23700 physical centroids (23712 packed slots at P16). A 4-valence/4-conduction frontier still produces the full 1–399 Σ/QP prefix. The explicit −75…2.75 eV Σ range covers that prefix without out-of-grid static fallback; 831 quadrature nodes take 388.23 s. The default GN prescription treats 3.02% invalid modes with `static_limit`, a separate issue from energy-grid coverage.
 
-Its maximum pool-used peak is 52.89 GB/rank in ζ fitting, versus 41.39 GB in screening and 44.85 GB in Σ. One full-zone Green's function at the packed extent is 17.992 GB/rank, so this run peaks at **2.94G/P**. Host high-water is 15.97 GB/rank. The conservative Cplus quote exceeded the then-current planning room; the completed run stayed below the 66.35 GB budget. This demonstrates the stated 16-GPU workload; a smaller process count was not tested. Original structural/symmetry qualifications and the exact inputs are retained in the [case notes](../assets/cluster-references/2026-10-23/cr_al2o3_80/case_notes.txt).
+Its maximum pool-used peak is 52.89 GB/rank in ζ fitting, versus 41.39 GB in screening and 44.85 GB in Σ. One full-zone Green's function at the packed extent is 17.992 GB/rank, so this run peaks at **2.94G/P**. Host high-water is 15.97 GB/rank. The conservative Cplus quote exceeded the then-current planning room; the completed run stayed below the 66.35 GB budget. This saved 23 October/source `2d2ca2f104` record demonstrates the stated 16-GPU workload and does not include a smaller process count. Original structural/symmetry qualifications and the exact inputs are retained in the [case notes](../assets/cluster-references/2026-10-23/cr_al2o3_80/case_notes.txt).
 
 All ranks exited successfully and the canonical Σ and QP outputs were checked for the stated shapes and finite entries. Preserve the input hashes, exact decks, resolved geometry, selected routes, compilation counts and all-rank exit records when repeating a reference.
 
