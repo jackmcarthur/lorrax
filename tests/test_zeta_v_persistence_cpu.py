@@ -109,6 +109,43 @@ def test_cold_v_and_saved_zeta_reuse_match_literal_gram(monkeypatch, tmp_path):
     assert zeta.pending_file is None
 
 
+@pytest.mark.parametrize("solver", ["rank_truncate", "inverse", "lu"])
+def test_write_only_zeta_has_no_coulomb_weight_bank(monkeypatch, tmp_path, solver):
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from file_io import slab_io
+    from isdf import zeta_mubatch as zm
+    from runtime.padding import padded_axis
+
+    zeta, _v, raw, factor, saved, events, reads = _fixture(monkeypatch, tmp_path)
+    if solver == "rank_truncate":
+        expected = factor @ (factor.conj().swapaxes(-1, -2) @ raw)
+    else:
+        zeta.solver_kind = solver
+        diagonal = np.broadcast_to(np.eye(8, dtype=np.complex128), (2, 8, 8)).copy()
+        zeta.L_q = jax.device_put(diagonal * (2 if solver == "lu" else .5),
+            NamedSharding(zeta.mesh, P(("x", "y"), None, None)
+                          if solver == "lu" else P(None, "x", "y")))
+        if solver == "lu":
+            zeta.lu_piv = jax.device_put(np.tile(np.arange(8, dtype=np.int32), (2, 1)),
+                NamedSharding(zeta.mesh, P(("x", "y"), None)))
+        zeta.store.q_axis = padded_axis(2, 1, name="fixture q")
+        expected = raw / 2
+    original_zeros = zm.np.zeros
+
+    def zeros(shape, *args, **kwargs):
+        assert tuple(np.atleast_1d(shape)) != (2, 7), "write-only pass allocated fake Coulomb weights"
+        return original_zeros(shape, *args, **kwargs)
+
+    monkeypatch.setattr(zm.np, "zeros", zeros)
+    with slab_io.SlabIO(zeta.path, mode="a", mesh=zeta.mesh) as writer:
+        writer.create_dataset("zeta_q_G", shape=raw.shape, dtype=raw.dtype)
+        assert zeta.write_file(writer) is None
+    np.testing.assert_allclose(saved, expected, atol=2e-15, rtol=2e-12)
+    assert reads == [0, 1] and events.count("write") == 2
+    assert "done" not in events and "provenance" not in events
+
+
 @pytest.mark.parametrize("complete,fail_write", [(False, False), (True, True)])
 def test_partial_or_failed_v_pass_cannot_authenticate_file(
         monkeypatch, tmp_path, complete, fail_write):

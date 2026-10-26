@@ -790,7 +790,7 @@ class ZetaG:
     def write_file(self, zeta_io, *, print_fn=None):
         """Stream every G tile once and write ζ = C⁻¹Z into ``zeta_q_G`` (no V)."""
         Q = self.store.Q
-        self.contract_v(np.zeros((Q, self.ngkmax), np.complex128),
+        self.contract_v(None,
                         keep=np.zeros((Q, 1), np.int32), zeta_io=zeta_io,
                         print_fn=print_fn, with_v=False)
 
@@ -804,7 +804,8 @@ class ZetaG:
         first); ζ at them comes back as ``self.shell (Q, μ_pad, n)``.  V and
         the shell are in the canonical (file) centroid order.  With
         ``zeta_io`` the masked ζ tiles are also written to ``zeta_q_G``;
-        ``with_v=False`` (:meth:`write_file`) forms and writes ζ only.
+        ``with_v=False`` (:meth:`write_file`) forms and writes ζ only;
+        ``v_table`` is unused and may be ``None``.
         """
         if self.pending_file is not None and with_v and zeta_io is None:
             return self._contract_v_and_write(v_table, keep=keep, print_fn=print_fn)
@@ -814,8 +815,9 @@ class ZetaG:
         st = self.store
         # Pad q rows and G-tile slots carry v = 0, ngk = 0: inert in V.
         qa, ga = st.q_axis, st.g_axis
-        v = np.asarray(pad_to_axis(pad_to_axis(
+        v = (np.asarray(pad_to_axis(pad_to_axis(
             jnp.asarray(v_table, dtype=jnp.complex128), qa, axis=0), ga, axis=1))
+             if with_v else None)
         ngk = np.asarray(pad_to_axis(jnp.asarray(self.ngk_per_q, jnp.int32), qa, axis=0))
         keep = np.asarray(keep, dtype=np.int32)
         if keep.ndim != 2 or keep.shape[0] != st.Q:
@@ -824,8 +826,8 @@ class ZetaG:
                 f"{keep.shape}.")
         sl = np.asarray(pad_to_axis(jnp.asarray(keep, jnp.int32), qa, axis=0))
         from common.collectives import device_put_process_local
-        v_dev = device_put_process_local(
-            v, NamedSharding(self.mesh, P(_XY, None)))
+        v_dev = (device_put_process_local(v, NamedSharding(self.mesh, P(_XY, None)))
+                 if with_v else None)
         ngk_dev = device_put_process_local(
             ngk, NamedSharding(self.mesh, P(_XY)))
         sl_dev = device_put_process_local(
@@ -932,7 +934,8 @@ class ZetaG:
         keep = np.asarray(keep, dtype=np.int32)
         if keep.ndim != 2 or keep.shape[0] != Q:
             raise ValueError(f"ZetaG.contract_v: keep must be (Q={Q}, n) slots; got {keep.shape}.")
-        v = jnp.asarray(pad_to_axis(jnp.asarray(v_table, dtype=jnp.complex128), st.g_axis, axis=1))
+        v = (jnp.asarray(pad_to_axis(jnp.asarray(v_table, dtype=jnp.complex128), st.g_axis, axis=1))
+             if with_v else None)
         ngk, sl = jnp.asarray(self.ngk_per_q, jnp.int32), jnp.asarray(keep)
         to_face, apply, acc = _face_kernels(mesh, Q, st.g_tile, bool(with_v),
                                             inverse=self.solver_kind == 'inverse')
