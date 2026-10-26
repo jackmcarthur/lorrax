@@ -5,6 +5,15 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-25 — Remove unused dense-host VQ diagnostics
+
+The importable `bse.vq_interp.build_hdir` and `exciton_evs` diagnostics have
+been removed. They had no driver or bounded-diagnostic callers and kept a
+second dense-host BSE Hamiltonian formula. Python scripts importing these
+names must use the canonical BSE operator and solvers for spectra. Driver
+results, deck keys and the reachable VQ checks keep their existing behavior.
+This Python-only removal needs no native-library rebuild.
+
 ## 2026-10-25 — Refresh the Perlmutter CPU MPI adapter manifest
 
 Run `config/perlmutter/build_mpiwrapper.sh` once on a CPU compute node, then
