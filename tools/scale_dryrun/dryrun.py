@@ -1,0 +1,203 @@
+"""Scale dry-run: price every large stage of a synthetic deck with LORRAX's own planners.
+
+Not a production path. Nothing here allocates device memory or compiles: it calls
+the pure pricing functions the run itself uses (lxkit.memory Price/Term/sizing,
+gw.tangential_capacity.tangential_byte_terms, gw.tangential_execution.
+constructor_side_upper_bound, gw.tangential_recipe line/imaginary counts,
+gw.gflat_memory_model.plan_zeta_route_g, gw.v_q_g_flat.vq_tile_bytes) and the
+closed forms written in gw.w_isdf._dyson_route, gw.response_bank.parent_span and
+docs/architecture/memory-model.md (stage inventory). Terms whose production
+price is a compiled executable are modelled from their documented leading terms
+and are tagged ``model``; the rest are tagged ``code``.
+
+    PYTHONPATH=src:services/lxkit/src python tools/scale_dryrun/dryrun.py [--json out.json]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from types import SimpleNamespace
+
+import common.gpu_utils as _gu
+
+# Perlmutter GPU node: 256 GB host, 4 ranks. The planner reads the live host otherwise.
+_gu.host_bytes_per_process = lambda fraction=0.9: fraction * 256e9 / 4
+
+from lxkit import memory  # noqa: E402
+from lxkit.memory import Price, Term  # noqa: E402
+from gw.tangential_capacity import tangential_byte_terms  # noqa: E402
+from gw.tangential_execution import constructor_side_upper_bound  # noqa: E402
+from gw.tangential_recipe import (ROLE_CODES, imaginary_sample_count,  # noqa: E402
+                                  support_line_count, shared_real_pole_v1_r3b as RECIPE)
+from gw.gflat_memory_model import plan_zeta_route_g  # noqa: E402
+from gw.v_q_g_flat import vq_tile_bytes  # noqa: E402
+
+GB = 1e9
+C = 16.0
+# A100-80GB, memory-model.md "The rule": B at linalg local / distributed; L = M - O_leg.
+B_LOCAL, B_DIST, L_PHYS = 66.4 * GB, 63.4 * GB, (80.0 - 3.6) * GB
+CTX = 3.6 * GB                      # lxkit.legs.DISTRIBUTED_CONTEXT_BYTES
+TILE = float(1 << 30)               # runtime.tiles.TILE_BYTES
+HOST_PER_RANK = 0.8 * 256e9 / 4     # gflat_memory_model._ZSTORE_HOST_FRAC of a node, per rank
+
+
+def system(atoms, kgrid, spinor, *, nmu_per_atom=300, nb_per_atom=30, eta_ev=0.25,
+           reach_ev=10.0, vol_bohr3_per_atom=200.0, ecut_ry=60.0):
+    """Synthetic deck: N_mu = 10 N_b, N_b = 30/atom (x2 spinor), occupied 4/atom (x2), P1 + TRS."""
+    ns = 2 if spinor else 1
+    nk = kgrid ** 3
+    nq = {1: 1, 2: 8, 4: 36}[kgrid]
+    vol = vol_bohr3_per_atom * atoms
+    ng = int(vol * ecut_ry ** 1.5 / (6 * math.pi ** 2))      # psi sphere per k
+    n1 = int(round((0.258 * vol * ecut_ry ** 1.5) ** (1 / 3)))  # density FFT box side
+    nb = nb_per_atom * atoms * ns
+    nv = 4 * atoms * ns
+    return dict(atoms=atoms, kgrid=kgrid, spinor=spinor, ns=ns, nk=nk, nq=nq, ng=ng,
+                fft=(n1, n1, n1), nmu=nmu_per_atom * atoms, nb=nb, nv=nv, nc=nb - nv,
+                eta=eta_ev, reach=reach_ev, bse_v=atoms * ns, bse_c=atoms * ns,
+                nk_fine=(2 * kgrid) ** 3)
+
+
+def pencil_side(s, ordered):
+    """constructor_side_upper_bound on a production recipe built from the deck's counts."""
+    n = s["nmu"]
+    imag = imaginary_sample_count(20.0, "production")   # kappa = L/u_min ~ 20 eV / 1 eV
+    line, _ = support_line_count([s["reach"]], 4 * s["eta"], imag, 2)
+    pol = RECIPE["production"]
+    recipe = dict(held=[False] * (line + imag) + [True] * 2,
+                  role=[ROLE_CODES["line"]] * line + [ROLE_CODES["imaginary"]] * imag + [ROLE_CODES["line"]] * 2,
+                  line_direction_cap=math.ceil(n * pol["line_direction_cap_fraction"]),
+                  imaginary_width=math.ceil(n * pol["imaginary_width_fraction"]),
+                  infinity_width=math.ceil(n * pol["infinity_width_fraction"]))
+    side = constructor_side_upper_bound(recipe, ordered=ordered, odd_moments=True, logical_n=n)
+    return side, line, imag, math.ceil(n * pol["pole_budget_fraction"])
+
+
+def tangential_prices(s, P, ordered):
+    """Local route (one parent whole per rank) and face route (one parent tiled over P)."""
+    n = s["nmu"]
+    side, line, imag, budget = pencil_side(s, ordered)
+    meta = SimpleNamespace(n_rmu_padded=n)
+    px = int(math.isqrt(P))
+    mesh = SimpleNamespace(shape={"x": px, "y": P // px})
+    out = {}
+    for route, layout in (("local", "local"), ("face", "distributed")):
+        res = SimpleNamespace(layout=layout)
+        rows = []
+        for phase, kw in (("selection", dict(sample_batch=imag + 2)),
+                          ("reduction", dict(sample_batch=1, ritz_budget=budget if ordered else None))):
+            rows.append(tangential_byte_terms(meta, mesh_xy=mesh, resolution=res, pencil_side=side,
+                                              parent_batch=1, phase=phase, **kw)["resident_bytes_per_rank"])
+        # native eigh workspace [model]: syevd ~2 R^2 whole (local); cuSOLVERMp ~3 R^2/P + contexts (face)
+        ws = 2 * C * side ** 2 if route == "local" else 3 * C * side ** 2 / P + CTX
+        out[route] = max(rows) + ws
+    return out, dict(side=side, side_over_nmu=round(side / n, 3), line=line, imag=imag)
+
+
+def stages(s, P, mode):
+    """{stage: (src, ((route, bytes/rank), ...), host bytes/rank)} at P ranks; fastest route first."""
+    n, Q, nk, ns, nb, ng = s["nmu"], s["nq"], s["nk"], s["ns"], s["nb"], s["ng"]
+    n2 = C * n * n
+    px = int(math.isqrt(P))
+    st = {"psi(G) faces": ("code", (("only", C * nk * nb * ns * ng / P),), 0.0)}
+    meta = SimpleNamespace(nk_tot=nk, nspinor=ns, n_rmu_padded=n, n_rmu=n, fft_grid=s["fft"])
+    try:
+        z = plan_zeta_route_g(meta=meta, mesh_xy=P, n_q_selected=Q, ngkmax=ng, psi_ngkmax=ng,
+                              fit_nb=nb, n_col=nb, n_s=ns, budget_gb=B_LOCAL / GB)
+        st["zeta fit (route G)"] = ("code", (("only", z.min_config_bytes),), z.store_bytes)
+        s["_zstore"] = dict(placement=z.placement, store_gb_per_rank=round(z.store_bytes / GB, 1), b=z.b, n_batch=z.n_batch)
+    except Exception as e:  # reported, never hidden
+        st["zeta fit (route G)"] = (f"error {type(e).__name__}: {e}", (("only", float("nan")),), 0.0)
+    v = vq_tile_bytes(n_q=Q, n_rmu_L=n, n_rmu_R=n, ngkmax=ng, same_zeta=True, n_sub=64,
+                      p_x=px, p_y=P // px, g_chunk=4096)
+    st["V_q accumulate"] = ("code", (("only", v["resident"] + v["per_q"] + v["work"]),), v["host_per_q"])
+    st["V_q unfold"] = ("code", (("only", C * nk * n * n / P),), 0.0)
+    # Coulomb roots V^1/2, V^-1/2 of the q stack (compiled in production) [model]
+    st["Coulomb roots"] = ("model", (("local", n2 * (3 * Q / P + 4 * -(-Q // P))),
+                                     ("distributed", n2 * (5 * Q + 2) / P + CTX)), 0.0)
+    # W Dyson: exactly gw.w_isdf._dyson_route
+    st["W Dyson"] = ("code", (("local", 3 * Q * n2 / P + n2 * (3 * -(-Q // P) + 2)),
+                              ("distributed", (3 * Q + 2) * n2 / P + CTX)), 0.0)
+    if mode == "tangential":
+        ordered = bool(s["spinor"])   # magnetic / SOC deck: no TRS, ordered bank
+        t, info = tangential_prices(s, P, ordered)
+        s["_pencil"] = info
+        # gw.response_bank.parent_span: ~6 faces of 16 n^2/P per parent; under linalg=local a
+        # round holds P parents (whole matrices per rank), on the full mesh one.
+        st["bank round (value+slope)"] = ("code", (("local", min(Q, P) * 6 * n2 / P),
+                                                   ("distributed", 6 * n2 / P + CTX)), 0.0)
+        st["tangential constructor"] = ("code+model", (("local", t["local"]), ("face", t["face"])), 0.0)
+        # Sigma tau: resident pole fields 32 N_q n Kbar / P, Kbar = 1.0 n, plus one row tile
+        st["Sigma tau sweep"] = ("code", (("only", 32 * Q * n * n / P + TILE),), 0.0)
+    else:  # gn_ppm [model]: chi0 carry at two nodes, the Wc pair, one Green row tile
+        st["static/GN-PPM screening"] = ("model", (("only", 2 * nk * n2 / P + 2 * Q * n2 / P + TILE),), 0.0)
+        st["Sigma tau sweep"] = ("model", (("only", 2 * Q * n2 / P + TILE),), 0.0)
+    # BSE with kgrid_fine: coarse W + fine W_q (mu, nu, fine k) on the centroid face + one tile
+    nkf, nvb, ncb = s["nk_fine"], s["bse_v"], s["bse_c"]
+    st["BSE coarse->fine W"] = ("code", (("only", Q * n2 / P + nkf * n2 / P + TILE),), 0.0)
+    st["BSE matvec + Haydock"] = ("model", (("only", 2 * C * nkf * (nvb + ncb) * n / P
+                                             + 3 * C * nkf * nvb * ncb / P),), 0.0)
+    return st
+
+
+def evaluate(s, P, mode):
+    rows = []
+    for name, (src, routes, host) in stages(s, P, mode).items():
+        best = min(routes, key=lambda r: r[1])
+        bud = B_LOCAL if best[0] in ("local", "only") else B_DIST
+        verdict = "ok" if best[1] <= bud else ("warn" if best[1] <= L_PHYS else "OOM")
+        rows.append(dict(stage=name, src=src, route=best[0], fast_route=routes[0][0],
+                         fast_fits=routes[0][1] <= B_LOCAL, gb=best[1] / GB, budget_gb=bud / GB,
+                         verdict=verdict, host_gb=host / GB,
+                         host_verdict="ok" if host <= HOST_PER_RANK else "disk"))
+    return rows
+
+
+def min_p(s, mode):
+    """lxkit.memory.sizing over these prices: each stage's cheapest route as a Term.grid(P)."""
+    names = list(stages(s, 4, mode))
+
+    def grid(name, route):
+        def f(p):
+            return dict(stages(s, p, mode)[name][1]).get(route, float("inf"))
+        return f
+    plans = {name: tuple((r, Price(operands=Term(grid=grid(name, r), source="dryrun"), ranks=1))
+                         for r, _ in stages(s, 4, mode)[name][1]) for name in names}
+    return memory.sizing(plans, limit_bytes=L_PHYS, per_node=4, platform="Perlmutter A100-80GB")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json")
+    a = ap.parse_args()
+    out = []
+    for atoms in (10, 20, 40, 100):
+        for kgrid in (2, 4):
+            for spinor in (False, True):
+                for mode in ("tangential", "gn_ppm"):
+                    s = system(atoms, kgrid, spinor)
+                    for P in (4, 16, 64, 256):
+                        rows = evaluate(s, P, mode)
+                        top = max(rows, key=lambda r: r["gb"] / r["budget_gb"])
+                        out.append(dict(atoms=atoms, kgrid=kgrid, spinor=spinor, mode=mode, P=P,
+                                        nmu=s["nmu"], nb=s["nb"], nq=s["nq"], ng=s["ng"],
+                                        pencil=s.get("_pencil"), zstore=s.get("_zstore"), rows=rows, binding=top["stage"],
+                                        binding_gb=top["gb"], binding_route=top["route"],
+                                        verdict=top["verdict"],
+                                        not_ok=[(r["stage"], r["route"], round(r["gb"], 1)) for r in rows if r["verdict"] != "ok"],
+                                        host_fail=[(r["stage"], round(r["host_gb"], 1)) for r in rows if r["host_verdict"] != "ok"]))
+                    z = min_p(s, mode)
+                    out[-1]["sizing"] = dict(p=z["p"], binding=z["binding"], line=z["line"])
+    if a.json:
+        with open(a.json, "w") as fh:
+            json.dump(out, fh, indent=1)
+    for r in out:
+        print(f"A={r['atoms']:3d} k={r['kgrid']} ns={2 if r['spinor'] else 1} {r['mode']:10s} P={r['P']:3d} "
+              f"mu={r['nmu']:6d} | {r['binding']:26s} {r['binding_route']:11s} {r['binding_gb']:9.1f} GB {r['verdict']:4s}"
+              + (f" host:{r['host_fail']}" if r["host_fail"] else "")
+              + (f" | sizing P={r['sizing']['p']} ({r['sizing']['binding']})" if "sizing" in r else ""))
+
+
+if __name__ == "__main__":
+    main()
