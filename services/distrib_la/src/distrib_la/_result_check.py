@@ -99,6 +99,31 @@ def _face_probe_product(a, probe, *, mesh, adjoint=False):
     return local(a, probe)
 
 
+def _probe_rows(probe, *, mesh, source, target):
+    """Change skinny row ownership; exactly one source contributes each row.
+
+    Matrix faces never move. The existing ordered owner bounds its transport
+    and preserves every nonzero finite probe value; signed zero may canonicalize.
+    """
+    if mesh is None or source == target:
+        return probe
+    n = int(probe.shape[-2])
+    parts, targets = int(mesh.shape[source]), int(mesh.shape[target])
+    if n % parts or n % targets:
+        raise ValueError("probe rows must divide both mesh axes")
+    local_rows, output_rows = n//parts, n//targets
+    @jax.shard_map(mesh=mesh, in_specs=_rows(probe.ndim, source),
+                   out_specs=_rows(probe.ndim, target), check_vma=False)
+    def local(vectors):
+        offsets = (jax.lax.axis_index(target)*output_rows+jnp.arange(output_rows)
+                   - jax.lax.axis_index(source)*local_rows)
+        selected = jnp.take(vectors, jnp.clip(offsets, 0, local_rows-1), axis=-2)
+        valid = ((offsets >= 0) & (offsets < local_rows)).reshape(
+            (1,)*(vectors.ndim-2)+(output_rows, 1))
+        return ordered_psum(jnp.where(valid, selected, 0), source)
+    return local(probe)
+
+
 def _norm(a, mesh=None, spec=None):
     """Frobenius norm of the matrix axes.  With ``mesh`` the ranks' partials are added in
     rank order on ``spec`` (lxkit.ordered_norm), not by an XLA all-reduce in topology order."""
@@ -299,7 +324,8 @@ def eigh_errors(a, values, vectors, *, mesh=None, cut=None):
     gram = _face_probe_product(vectors, vx, mesh=mesh, adjoint=True) - x
     norm_probes = x if mesh is None else jax.lax.with_sharding_constraint(x, NamedSharding(mesh, P()))
     norm_x = jnp.maximum(_norm(norm_probes), jnp.finfo(values.dtype).tiny)  # replicated, per matrix
-    residual = _norm(_face_probe_product(a, vx, mesh=mesh) -
+    vx_y = _probe_rows(vx, mesh=mesh, source="x", target="y")
+    residual = _norm(_face_probe_product(a, vx_y, mesh=mesh) -
                      _face_probe_product(vectors, values[..., :, None] * x, mesh=mesh), mesh, _rows(nd)) / (
         jnp.maximum(_norm(a, mesh, _face(nd)), jnp.finfo(values.dtype).tiny) * norm_x)
     orthogonality = _norm(gram if used is None else jnp.where(used, gram, 0), mesh, _rows(nd, "y" if mesh is not None else "x")) / norm_x
@@ -687,8 +713,9 @@ def solve_errors(sketch, x, mesh=None):
     ``sketch`` is ``matrix_sketch(A) + rhs_sketch(B)``; W^H A X = (A^H W)^H X.
     """
     ahw, norm_a, whb, norm_b = sketch
+    ahw_x = _probe_rows(ahw, mesh=mesh, source="y", target="x")
     projected = ((jnp.conj(jnp.swapaxes(ahw, -1, -2)) @ x) if mesh is None else
-                 jnp.conj(jnp.swapaxes(_face_probe_product(x, ahw, mesh=mesh, adjoint=True), -1, -2))) - whb
+                 jnp.conj(jnp.swapaxes(_face_probe_product(x, ahw_x, mesh=mesh, adjoint=True), -1, -2))) - whb
     nd = x.ndim
     scale = np.sqrt(PROBES) * (norm_a * _norm(x, mesh, _face(nd)) + norm_b)
     # W^H (A X - B): k probe rows, the right-hand-side columns on 'y' as in X

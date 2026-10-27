@@ -183,6 +183,10 @@ Result checks contract each local matrix tile with the same eight fixed
 probe columns and complete the partials through the shared rank-order
 reduction. Normal products keep thin rows on `x`; adjoints keep them on
 `y`. Layout changes move only thin probes/results, never a matrix bank.
+The EIGH residual and LU sketch handoffs select destination-owned rows
+inside a manual region, mask the other source owners, and use the existing
+bounded ordered reduction. Exactly one source contributes each row; no
+implicit cross-axis permutation is needed for these two handoffs.
 Probe seeds, cut masks and acceptance thresholds are unchanged, as are
 local checks; distributed reduction roundoff can change in its last bits.
 
