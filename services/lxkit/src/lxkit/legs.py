@@ -30,8 +30,8 @@ differs between legs and that more than one service needs lives in
   own content and so outlive the compile-cache namespace, like LORRAX's own
   kconv image store (rocFFT's hipRTC kernels: a read-only snapshot through
   ``ROCFFT_RTC_SYS_CACHE_PATH``, new kernels through ``ROCFFT_RTC_CACHE_PATH``),
-  and ``blas_host_warmup``: the dtypes whose first GEMM loads the BLAS
-  library's kernel tables on the host (rocBLAS/Tensile).
+  and ``blas_host_warmup``: synchronous native BLAS code-object initialization
+  before the first collective (rocBLAS/Tensile).
   :mod:`runtime.vendor_kernels` implements both (Cold-start lane, 2026-10-15);
 * the vendor facts the memory model, the network policy and the profiler
   guard implement (owner ``runtime``; Runtime-LEGS lane, 2026-10-15):
@@ -98,10 +98,8 @@ class PlatformLeg:
     #: by ``reader_env`` and writes new kernels to one file per process named
     #: by ``writer_env``, which ``runtime.vendor_kernels`` folds in at exit.
     runtime_kernel_stores: tuple = ()
-    #: dtypes of one 8x8 GEMM each, compiled at runtime start-up and run on a
-    #: helper thread so the BLAS library's host initialisation overlaps the
-    #: driver's imports (() = none).
-    blas_host_warmup: tuple = ()
+    #: preload vendor BLAS code objects synchronously before collectives.
+    blas_host_warmup: bool = False
     #: plan-workspace query in runtime.aot_memory (``"cufft"`` | ``"hipfft"``);
     #: "" = the leg's FFTs take no plan scratch outside buffer assignment.
     fft_plan_scratch: str = ""
@@ -258,13 +256,9 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         # process (several writers on one file on Lustre spin) and are folded
         # into the read-only snapshot at exit (Cold-start lane, 2026-10-15).
         runtime_kernel_stores=(("ROCFFT_RTC_CACHE_PATH", "ROCFFT_RTC_SYS_CACHE_PATH", "rocfft"),),
-        # rocBLAS loads its Tensile tables on a process's first GEMM: 2.84 s
-        # for an 8x8 dgemm, then 0.055 s for the first zgemm, then 0.001 s
-        # (MI250X, autotune 0, P1 probe).  In the hsuite kmeans timeline that
-        # first GEMM comes ~3 s after the communicator warm-up, all of it
-        # driver imports, so a helper thread hides it (Cold-start lane,
-        # 2026-10-15).  cuBLAS ships no such table load: CUDA declares none.
-        blas_host_warmup=("float64", "complex128"),
+        # Preload all current-architecture Tensile code objects before
+        # collectives, rather than racing later first-use GEMM module loads.
+        blas_host_warmup=True,
         # XLA's ROCm FFT thunk takes the hipFFT plan workspace from the BFC
         # arena: on the seven c128 3D boxes probed the arena peak rose by
         # exactly hipfftMakePlanMany's workSize (23.3-131.1 MB, one copy of

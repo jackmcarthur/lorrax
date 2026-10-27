@@ -2016,6 +2016,10 @@ def _open_device_leg_before_collectives() -> None:
             decision["launch_libraries"], os.environ.get("LD_LIBRARY_PATH", ""),
             remedy=decision.get("launch_libraries_remedy", ""),
             unusable_cls=ffi_loader.FfiLibraryUnusable)
+    # The explicit preload must precede both the first Tensile adapter and
+    # RCCL execution. A later small asynchronous GEMM cannot provide this.
+    from .vendor_kernels import start_blas_host_warmup
+    start_blas_host_warmup(proc_idx=int(jax.process_index()), say=_print_rank0)
 
 
 def initialize_communicator_stack(*, platform: str = "gpu",
@@ -2095,6 +2099,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        binds its own NEEDED runtime (``libcudart.so.13``) by SONAME: with
        the closure already mapped it gets the recorded copy, not whatever
        ``LD_LIBRARY_PATH`` offers (a second runtime the closure gate refuses).
+       Then preload the leg's native BLAS code objects synchronously, before
+       any collective or GEMM can create a lazy Tensile adapter.
     6. :func:`common.collectives.prepare_mesh` -- the run's mesh, then
        ``warm_mesh_cliques`` (CPU/MPI) and ``nccl_warmup`` (GPU/NCCL).
        Collective: every rank must reach it.  Needs (4) and (5).
@@ -2115,9 +2121,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        while the compile cache and all compatibility checks remain live.
     7b. :mod:`runtime.vendor_kernels` -- the leg's vendor first-use policy:
        its content-keyed kernel stores (rocFFT on ROCM) before the first FFT,
-       then its BLAS warm-up (rocBLAS/Tensile on ROCM): GEMMs compiled here,
-       after (7) so a warm run reads them from the cache, and run on a helper
-       thread while the driver imports.  No-ops on a leg that declares none.
+       with no asynchronous BLAS work. The preload already completed at
+       (5e). No-ops on a leg that declares none.
     8. The startup report -- LAST, because it reads the live client, and
        the live client does not exist until (5).
     8a. :func:`enforce_x64` on the resolved flag the report just measured.
@@ -2216,17 +2221,16 @@ def initialize_communicator_stack(*, platform: str = "gpu",
             f"({type(exc).__name__}: {exc}); stderr is unfiltered")
     # -- 7b -----------------------------------------------------------------
     try:
-        from .vendor_kernels import arm_runtime_kernel_stores, start_blas_host_warmup
+        from .vendor_kernels import arm_runtime_kernel_stores
         import jax as _jax_vk
         _proc = int(_jax_vk.process_index())
         arm_runtime_kernel_stores(proc_idx=_proc, say=_print_rank0)
         # The last LORRAX environment writes (OPENBLAS_NUM_THREADS when unset) happen here, and
-        # then the environment freezes, before the first native helper thread starts: a later
+        # then the environment freezes, before physics launches native worker threads: a later
         # setenv races native getenv (GATE env-frozen, runtime.env_guard; the rc 139 SIGSEGV).
         default_blas_threads()
         from .env_guard import freeze_process_environment
         freeze_process_environment("runtime.initialize_communicator_stack step 7b")
-        start_blas_host_warmup(proc_idx=_proc, say=_print_rank0)
     except Exception as exc:                                  # noqa: BLE001
         _print_rank0(f"  [runtime] vendor first-use policy not applied "
                      f"({type(exc).__name__}: {exc}); vendor kernels build on first use")

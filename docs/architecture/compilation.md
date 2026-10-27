@@ -199,28 +199,23 @@ rename). From the store the first FFT of a length costs 0.02–0.04 s. hsuite
 kmeans→dipole builds 16 kernels per process, 10.0 s of the cold kmeans wall.
 A "cold" hsuite run (empty compile cache) therefore reads both vendor-kernel
 stores, kconv and rocFFT, as a CUDA cold run reads the kernels cuFFT ships.
-rocBLAS loads its Tensile tables on a process's first GEMM: 2.84 s for an 8x8
-dgemm, then 0.055 s for the first zgemm (P1 probe, autotune 0, either level).
-`PlatformLeg.blas_host_warmup` compiles one 8x8 GEMM per dtype at start-up
-(main thread, so the compile agreement sees the same programs on every rank)
-and runs them on a helper thread, where the load overlaps the driver's
-imports. Before that thread starts the process environment freezes
-(`runtime.env_guard`, `GATE env-frozen`): the thread's `hipModuleLoadData`
-calls `getenv` inside HSA, and glibc's `getenv` takes no lock, so a main-thread
-`os.environ` write that adds a key (and so reallocates `environ`) is a
-use-after-free there. That was the intermittent rc 139 start-up SIGSEGV
-(Frontier, 2026-10-16: 6 of 72 concurrent Fe start-ups, from the SlabIO
-striping export at the first WFN.h5 open; evidence in `runtime.env_guard`). Every LORRAX
-environment write therefore happens before step 7b; a later LORRAX write that
-adds a key refuses, any other code's is announced. With the SlabIO export removed and the
-freeze armed, the same stress (6 concurrent 4-rank start-ups over 3 nodes, hot
-and cold caches) gave 0 of 48 crashes (40 of them through the crash window; the other 8
-sat on frontier00749, whose GCDs 4-7 stall in the same window and is now excluded from
-the pool), and the Fe deck's eqp0/eqp1 were
-unchanged bit for bit (branch `crash/w8`). AMD comgr's code-object cache stays per namespace
-(`runtime_kernel_caches`, `<cache>/vendor/comgr`). Runtime start-up itself
-(`initialize_communicator_stack`, 5.3–8.7 s per process: jax import ~2 s,
-distributed and backend init ~1.5 s, clique warm-up 2.6 s) is not cached.
+`PlatformLeg.blas_host_warmup` preloads the attested rocBLAS dependency
+synchronously at startup step 5e, before the first GEMM or collective.
+The public `rocblas_initialize(void)` loads the current GPU architecture's
+nonexperimental Tensile code objects. A small GEMM only initializes its
+selected kernels, so an asynchronous 8×8 warmup does not establish this
+ordering for later shapes. The preload uses the existing provider's mapped
+dependency scope and restores the caller's HIP device; it opens no second
+runtime. CPU and CUDA have no such preload.
+
+These native code objects and host tables reside outside XLA's executable
+buffers. Their startup time and device-memory cost must be measured on the
+installed SDK; an executable quote does not include them. Preloading Tensile
+does not preload future XLA-generated HSACO modules. The process environment
+still freezes at step 7b (`runtime.env_guard`, `GATE env-frozen`) before
+physics starts native worker threads: HSA's `getenv` can race a later
+`setenv` that reallocates the environment. AMD comgr's code-object cache
+stays per namespace (`runtime_kernel_caches`, `<cache>/vendor/comgr`).
 
 ## 4 Where the time goes
 

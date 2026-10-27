@@ -17,14 +17,13 @@ declares none (CUDA, the host) gets no-ops, so its behaviour is unchanged.
   copy of the snapshot and renames the copy into place, so a reader never sees
   a torn file; two processes folding at once can drop each other's rows, which
   the next run rebuilds.
-* ``PlatformLeg.blas_host_warmup``: rocBLAS loads its Tensile tables on a
-  process's first GEMM (2.84 s on MI250X).  One 8x8 GEMM per declared dtype is
-  compiled here, on the main thread so every rank compiles the same programs
-  in the same order (the compile agreement), and run on a helper thread, so
-  the load overlaps the driver's imports.  The programs hold no collective.
+* ``PlatformLeg.blas_host_warmup``: synchronously preload rocBLAS's current
+  architecture code objects before the first collective.  A small GEMM only
+  loads its selected Tensile kernels; subsequent first-use module loads can
+  otherwise overlap an already-running RCCL kernel.
 
-Nothing here raises: a store that cannot be placed or folded, or a warm-up
-that fails, is named once and the library does what it does without it.
+Stores remain best-effort. A requested BLAS preload that cannot run refuses
+before the first collective rather than restoring asynchronous first use.
 """
 from __future__ import annotations
 
@@ -33,7 +32,6 @@ import os
 import shutil
 import socket
 import sqlite3
-import threading
 import time
 from pathlib import Path
 
@@ -160,54 +158,58 @@ def _fold_at_exit(say) -> None:
 
 
 def start_blas_host_warmup(*, proc_idx: int = 0, say=print) -> dict:
-    """Compile one 8x8 GEMM per ``blas_host_warmup`` dtype here; run them on a helper thread."""
-    try:
-        leg = _process_leg()
-    except Exception:                                      # noqa: BLE001
+    """Preload the attested rocBLAS dependency, on each local HIP device.
+
+    Called at startup step 5e, before any GEMM or collective can initialize
+    a Tensile adapter lazily. The public ``rocblas_initialize(void)`` loads
+    current-architecture code objects; it returns no status value.
+    """
+    leg = _process_leg()
+    if leg is None or not leg.blas_host_warmup:
         return {}
-    dtypes = tuple(leg.blas_host_warmup) if leg is not None else ()
-    if not dtypes or _WARMUP:
+    if _WARMUP:
+        if _WARMUP.get("error"):
+            raise RuntimeError(_WARMUP["error"])
         return dict(_WARMUP)
-    _WARMUP.update(leg=leg.key, dtypes=dtypes, compile_s=None, run_s=None, error=None)
+    import ctypes
+    import jax
+    from ffi.common import ffi_loader
+    # dlsym on the already-attested provider's dependency scope: never open
+    # a bare SONAME or a second HIP/rocBLAS runtime from the system path.
+    lib = ffi_loader.get_lib(leg.key)
+    initialize = lib.rocblas_initialize
+    initialize.argtypes, initialize.restype = [], None
+    get_device, set_device = lib.hipGetDevice, lib.hipSetDevice
+    get_device.argtypes, get_device.restype = [ctypes.POINTER(ctypes.c_int)], ctypes.c_int
+    set_device.argtypes, set_device.restype = [ctypes.c_int], ctypes.c_int
+    previous = ctypes.c_int()
+    if get_device(ctypes.byref(previous)):
+        raise RuntimeError("ROCm BLAS initialization: hipGetDevice failed")
+    devices = sorted({int(d.local_hardware_id) for d in jax.local_devices()})
+    _WARMUP.update(leg=leg.key, method="rocblas_initialize", devices=devices,
+                   run_s=None, error=None, done=False)
+    t0 = time.perf_counter()
+    error = None
     try:
-        import numpy as np
-        import jax
-        import jax.numpy as jnp
-        from jax.sharding import SingleDeviceSharding
-        from lxkit import device_put_process_local
-        dev = jax.local_devices()[0]
-        t0 = time.perf_counter()
-        progs = []
-        for name in dtypes:
-            a = device_put_process_local(np.ones((8, 8), dtype=name), SingleDeviceSharding(dev))
-            progs.append((jax.jit(jnp.matmul).lower(a, a).compile(), a))
-        _WARMUP["compile_s"] = time.perf_counter() - t0
+        for ordinal in devices:
+            if set_device(ordinal):
+                raise RuntimeError(f"ROCm BLAS initialization: hipSetDevice({ordinal}) failed")
+            initialize()
     except Exception as exc:                               # noqa: BLE001
-        _WARMUP["error"] = f"{type(exc).__name__}: {exc}"
-        if proc_idx == 0:
-            say(f"  [vendor-kernels] BLAS warm-up not started ({_WARMUP['error']}); "
-                f"the first GEMM pays the library's host initialisation.")
-        return dict(_WARMUP)
-
-    def _run():
-        t = time.perf_counter()
-        try:
-            for compiled, a in progs:
-                compiled(a, a).block_until_ready()
-            _WARMUP["run_s"] = time.perf_counter() - t
-        except Exception as exc:                           # noqa: BLE001
-            _WARMUP["error"] = f"{type(exc).__name__}: {exc}"
-
-    th = threading.Thread(target=_run, name="lorrax-blas-warmup", daemon=True)
-    _WARMUP["thread"] = th
-    th.start()
+        error = exc
+    finally:
+        if set_device(previous.value) and error is None:
+            error = RuntimeError("ROCm BLAS initialization: restoring HIP device failed")
+    if error is not None:
+        _WARMUP["error"] = f"{type(error).__name__}: {error}"
+        raise error
+    _WARMUP.update(run_s=time.perf_counter() - t0, done=True)
+    if proc_idx == 0:
+        say(f"  [vendor-kernels] ROCm BLAS code objects initialized before collectives "
+            f"({_WARMUP['run_s']:.2f} s)")
     return dict(_WARMUP)
 
 
 def receipt() -> dict:
     """What this process armed and warmed (for the startup facts and a run's stats)."""
-    w = {k: v for k, v in _WARMUP.items() if k != "thread"}
-    th = _WARMUP.get("thread")
-    if th is not None:
-        w["done"] = not th.is_alive()
-    return {"stores": [dict(r) for r in _STORES], "blas_warmup": w}
+    return {"stores": [dict(r) for r in _STORES], "blas_warmup": dict(_WARMUP)}
