@@ -116,10 +116,14 @@ def _nodes(c):
 
 
 def _densify(mesh, c, e, v, *, fh_energies=None, e_file=None, q_perm=None,
-             gate_energies=None, **kw):
+             gate_energies=None, band_offset=0, **kw):
     """``compute_wfns_fi`` + ``densified_dipoles`` on the toy, XLA backend."""
     kc = _grid(KC)
     e_fh = e if fh_energies is None else fh_energies
+    metadata_e = e if e_file is None else e_file
+    if band_offset:
+        metadata_e = np.concatenate((np.full((len(e), band_offset), -100.),
+                                     metadata_e, np.full((len(e), 1), 100.)), axis=1)
     nodes = _nodes(c)
     with xla_reference():
         fine = compute_wfns_fi(
@@ -130,9 +134,10 @@ def _densify(mesh, c, e, v, *, fh_energies=None, e_file=None, q_perm=None,
         if q_perm is not None:
             fine.q_frac = fine.q_frac[q_perm]
         dip = densified_dipoles(
-            (v, e if e_file is None else e_file, "toy dH/dk", "toy.h5"),
+            (v, metadata_e, "toy dH/dk", "toy.h5"),
             sym=_sym(kc), fh_energies=e_fh if gate_energies is None else gate_energies,
-            basis=SimpleNamespace(ctilde=jnp.asarray(c), band_range=(0, NB),
+            basis=SimpleNamespace(ctilde=jnp.asarray(c),
+                                  band_range=(band_offset, band_offset+NB),
                                   basis_at_nodes=nodes),
             fine=fine, coarse_grid=KC, n_val=N_VAL, window_start=B_MIN,
             a_band_index=None,

@@ -1239,8 +1239,9 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
     velocity : tuple
         ``(parents, energies, label, path)``: ``bandstructure.orbital.
         stored_velocity`` of ``path`` (authenticated against the htransform's
-        WFN), ``parents`` (n_parent, 3, nb_file, nb_file) Ry·bohr at the
-        file-wedge rows, ``energies`` (n_parent, nb_file) Ry.
+        WFN), ``parents`` (n_parent, 3, nb_fit, nb_fit) Ry·bohr on
+        ``basis.band_range`` at the file-wedge rows. ``energies`` remains
+        (n_parent, nb_file) Ry, including unfitted bands for edge weighting.
     sym
         The WFN's symmetry maps (``irr_idx_k``, ``unfolded_kpts``, the polar
         time-odd unfold).
@@ -1331,16 +1332,15 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
     parents, e_parent, label, path = velocity
     b0, b1 = (int(b) for b in basis.band_range)
     nb_fit = b1 - b0
-    if int(parents.shape[-1]) < b1:
+    if tuple(parents.shape[-2:]) != (nb_fit, nb_fit):
         raise ValueError(
-            f"GATE densified_velocity_bands: {path} carries "
-            f"{int(parents.shape[-1])} bands; want >= {b1}, the top of the "
-            f"htransform window [{b0},{b1}); why: the velocity is carried "
-            f"through every fitted band; fix: rerun psp.get_dipole_mtxels "
-            f"with number_bands >= {b1}.")
+            f"GATE densified_velocity_bands: {path} supplied operator shape "
+            f"{parents.shape[-2:]}; want ({nb_fit}, {nb_fit}) on the "
+            f"htransform window [{b0},{b1}); read that fitted window before "
+            "unfolding or interpolation.")
     nk_co = int(np.prod(coarse_grid))
     v_full = unfold_file_wedge_polar_matrix(
-        sym, np.asarray(parents)[:, :, b0:b1, b0:b1])         # (nk, 3, nb, nb)
+        sym, np.asarray(parents))                          # (nk, 3, nb, nb)
     e_full = np.asarray(e_parent, dtype=np.float64)[
         np.asarray(sym.irr_idx_k)][:, b0:b1]                   # (nk, nb) Ry
     f_eps, a_f, n_f, shift = f_transform_eigs(
@@ -1370,7 +1370,7 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         g_full = velocity_weight(e_full, *weight)                 # (nk, nb)
         v_full = v_full * (g_full[:, None, :, None] * g_full[:, None, None, :])
 
-    # Four band operators on one replicated carrier (48·nk·nb² B per
+    # Four band operators on one replicated carrier (64·nk·nb² B per
     # device, the htransform's own velocity layout): the three weighted
     # velocity components and f(H) of the velocity's energies.  Band axes
     # padded to the mesh so the image's (x, y) face divides.
@@ -1819,16 +1819,6 @@ def _interpolate_bse_data_to_grid(
     # HLO constant and is process-local by construction.
     keep = None if keep_idx is None else np.asarray(keep_idx, dtype=np.int32)
 
-    # ── The coarse velocity, authenticated BEFORE the fit ────────────────
-    # It must be the deck WFN's own (basis and fingerprint): a fine grid's
-    # dipole.h5 has the bundle's nk and the WRONG gauge, and refuses here.
-    velocity = None
-    if velocity_file is not None:
-        from bandstructure.orbital import stored_velocity
-        velocity = stored_velocity(
-            velocity_file, wfn=wfn_sym[0], wfn_path=_parse_wfn_path(input_file),
-            sym=wfn_sym[1], mesh=mesh_xy) + (velocity_file,)
-
     # ── ψ_{v,c}(k_fine), ε_{v,c}(k_fine): ONE htransform fH ───────────────
     _fit_subset = keep
     (wfn, sym, meta, _mesh, basis,
@@ -1837,6 +1827,14 @@ def _interpolate_bse_data_to_grid(
          centroid_subset_idx=_fit_subset,
          rank_record_fn=htransform_rank_record_fn,
          wfn_sym=wfn_sym, n_guard_bands=n_extra_guard)
+    # Read only the authoritative guarded fit window, after the fit releases
+    # its temporaries. Authentication still precedes every velocity field read.
+    velocity = None
+    if velocity_file is not None:
+        from bandstructure.orbital import stored_velocity
+        velocity = stored_velocity(
+            velocity_file, wfn=wfn, wfn_path=_parse_wfn_path(input_file),
+            sym=sym, mesh=mesh_xy, band_range=basis.band_range) + (velocity_file,)
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     nb_window = int(ctilde.shape[1])
     nval_in = int(params["nval"])          # window-relative CBM index

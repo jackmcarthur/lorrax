@@ -170,14 +170,16 @@ def band_operators(wfn, band_range, mesh, sym, *, pseudos, channels=()):
     return jnp.moveaxis(jnp.concatenate(full, axis=1), 1, 0), names
 
 
-def stored_velocity(path, *, wfn, wfn_path, sym, mesh):
+def stored_velocity(path, *, wfn, wfn_path, sym, mesh, band_range=None):
     """``(parents, energies, label)`` of the WFN's stored velocity at ``path``.
 
     ``dipole.h5`` on a DFT WFN or an SC run's ``dipole_qsgw.h5`` on its
     ``WFN_qp.h5``, authenticated by ``file_io.dipole.velocity_stamp``.
     ``parents`` is ``(n_parent, 3, nb, nb)`` Ry Bohr (bra n, ket m, file band
-    order, every stored band) at the file-wedge rows ``sym.kirr_fullids``,
-    ``energies`` the file's ``band_energies`` there.  A QP velocity with no
+    order, the selected ``band_range`` or every stored band) at the
+    file-wedge rows ``sym.kirr_fullids``. ``energies`` keeps the complete
+    two-dimensional file table there: interpolation also needs the first
+    unfitted band's energy. A QP velocity with no
     Sigma term refuses.  COLLECTIVE over ``mesh``.
     """
     from file_io.dipole import velocity_stamp
@@ -190,8 +192,9 @@ def stored_velocity(path, *, wfn, wfn_path, sym, mesh):
             "(sc_head_update = parallel_transport); why: the DFT velocity "
             "with QP energies is not d(H_QP)/dk (claim 3218)")
     rows = np.asarray(sym.kirr_fullids, dtype=np.int64)
+    bands = (0, int(energies.shape[1])) if band_range is None else band_range
     parents = read_dipole_parent_window(
-        path, rows, 0, int(energies.shape[1]), nk_full=int(sym.nk_tot),
+        path, rows, *bands, nk_full=int(sym.nk_tot),
         mesh=mesh)
     return parents, energies[rows], label
 

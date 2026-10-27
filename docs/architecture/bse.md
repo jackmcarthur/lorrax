@@ -407,6 +407,15 @@ $$v_B(k) = C_k^{T}\, g\, v(k)\, g\, C_k^{*},\qquad
 V_R = \frac{1}{N_k}\sum_k e^{2\pi i k\cdot R}\, v_B(k),\qquad
 v(q) = G_q^{-1}\, U_q^\dagger\, \mathrm{Herm}\Big[\sum_R e^{-2\pi i q\cdot R} V_R\Big]\, U_q\, G_q^{-1} .$$
 
+The input operator read selects the complete guarded **fit** window before
+the parent-window gather. Its width is `nval + ncond` plus the requested
+guards (`number_cond_bands_coarse` can adjust the conduction side), rather
+than every band stored in the WFN or dipole file. The complete two-dimensional
+energy table is retained for the unfitted-edge weighting below. This removes
+the whole-file square from the densifier's read; its selected fit-square
+host banks and replicated four-operator preparation remain a large-fit memory
+floor. A small final BSE c/v window does not shrink that fitted operator.
+
 The weight $g = g(\varepsilon)$ (`bse_densify.velocity_weight`) is
 $1 - e^{-x^2}$, $x = (E_{\rm cut} - \varepsilon)/w$, and zero above
 $E_{\rm cut}$, the lowest energy of the first band above the fit window;
