@@ -45,7 +45,12 @@ def structure(vacuum):
 def pw_input(calc, cell, atoms, *, ecut, nbnd=None, kgrid=(3, 3, 1)):
     species = ["Mo", "S", "B", "N"]
     lines = ["&control", f"   prefix = 'hetero'", "   pseudo_dir = '../pseudos'",
-             f"   calculation = '{calc}'", "   outdir = './'", "/", "&system",
+             f"   calculation = '{calc}'", "   outdir = './'"]
+    if nbnd:
+        # In memory, final portable files only: GPU QE's direct-access wfc records
+        # (one k per rank, ~6 GB at 3400 bands) fail in davcio.
+        lines.append("   disk_io = 'low'")
+    lines += ["/", "&system",
              f"   ecutwfc = {ecut}", "   ibrav = 0", f"   nat = {len(atoms)}",
              f"   ntyp = {len(species)}", "   noncolin = .true.", "   lspinorb = .true."]
     if nbnd:
