@@ -42,7 +42,7 @@ BOHR_TO_ANG = 0.529177210544
 #: Bump it with any change that moves the selected points for fixed inputs:
 #: caches keyed on it (the htransform node cache,
 #: ``bandstructure.fh_interp.htransform_nodes``) are then recomputed.
-KMEANS_VERSION = "kmeans-isdf-v3"
+KMEANS_VERSION = "kmeans-isdf-v4"   # v4: orbit Lloyd sums over grid orbits
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -143,6 +143,63 @@ def _quadform_G(dx, dy, dz, g00, g01, g02, g11, g12, g22):
          + (g02 * dx + g12 * dy + g22 * dz) * dz
 
 
+def static_offsets(offsets) -> tuple[tuple[int, int, int], ...]:
+    """The min-image offset table as a hashable static argument.
+
+    The Lloyd kernels unroll the offsets (and the symmetry images) in
+    Python, so XLA sees one elementwise graph and fuses the whole
+    min-over-images distance into the argmin reduction that consumes it.
+    A traced table forces a ``fori_loop`` instead, whose every trip
+    re-reads and re-writes a materialised ``(P, c_block)`` buffer: on the
+    148-atom MoS2/hBN grid that was ~4 s of HBM traffic per Lloyd step.
+    """
+    return tuple(tuple(int(v) for v in row)
+                 for row in np.asarray(offsets).reshape(-1, 3))
+
+
+def _images_d2(positions, images, metric, offsets):
+    """(P, C) squared min-image distance from each point to the closest of
+    ``S`` images of each of ``C`` centroids.
+
+    ``positions`` (P, 3) and ``images`` (S, C, 3) are fractional;
+    ``offsets`` is a :func:`static_offsets` tuple.  The same arithmetic, in
+    the same order per (point, image, offset), as the traced-table loops it
+    replaced, so the distances are the same numbers.
+    """
+    g00, g01, g02 = metric[0, 0], metric[0, 1], metric[0, 2]
+    g11, g12, g22 = metric[1, 1], metric[1, 2], metric[2, 2]
+    best = None
+    for s in range(images.shape[0]):
+        dx0 = positions[:, None, 0] - images[s, None, :, 0]
+        dx0 = dx0 - jnp.round(dx0)
+        dy0 = positions[:, None, 1] - images[s, None, :, 1]
+        dy0 = dy0 - jnp.round(dy0)
+        dz0 = positions[:, None, 2] - images[s, None, :, 2]
+        dz0 = dz0 - jnp.round(dz0)
+        for nx, ny, nz in offsets:
+            d2 = _quadform_G(dx0 + nx, dy0 + ny, dz0 + nz,
+                             g00, g01, g02, g11, g12, g22)
+            best = d2 if best is None else jnp.minimum(best, d2)
+    return best
+
+
+def _row_min_argmin(values):
+    """``(min, argmin)`` along axis 1 in ONE variadic reduction, so the
+    fused distance producer is neither materialised nor evaluated twice.
+    Ties go to the lowest column, as ``jnp.argmin``."""
+    columns = lax.broadcasted_iota(jnp.int32, values.shape, 1)
+
+    def pick(a, b):
+        (av, ai), (bv, bi) = a, b
+        take_a = (av < bv) | ((av == bv) & (ai < bi))
+        return jnp.where(take_a, av, bv), jnp.where(take_a, ai, bi)
+
+    return lax.reduce(
+        (values, columns),
+        (jnp.array(jnp.inf, values.dtype), jnp.array(values.shape[1], jnp.int32)),
+        pick, (1,))
+
+
 @jax.jit
 def pbc_distance_sq_single(
     positions_frac: jnp.ndarray,
@@ -168,68 +225,67 @@ def pbc_distance_sq_single(
     return lax.fori_loop(0, offsets.shape[0], body, jnp.full_like(dx0, jnp.inf))
 
 
-_DEFAULT_C_BLOCK = 32
-"""C-chunk for the assignment scan — ~30 MB peak per axis at P=1e6 in fp32."""
+_DEFAULT_C_BLOCK = 128
+"""C-chunk for the assignment scan.  The fused distance is reduced inside
+its producer, so no ``(P, c_block)`` buffer exists; the block sets only the
+number of scan trips (one kernel each)."""
 
 
-@partial(jax.jit, static_argnames=['n_c', 'c_block'])
+def _nan_pad_blocks(centroids, n_c, c_block):
+    """``(n_chunks, c_block, 3)`` blocks; NaN rows pad to a whole block and
+    can never win (NaN propagates to the distance, which is masked to inf)."""
+    n_chunks = (n_c + c_block - 1) // c_block
+    n_padded = n_chunks * c_block
+    if n_padded != n_c:
+        pad = jnp.full((n_padded - n_c, 3), jnp.nan, dtype=centroids.dtype)
+        centroids = jnp.concatenate([centroids, pad], axis=0)
+    return centroids.reshape(n_chunks, c_block, 3)
+
+
+def _scan_nearest(positions, blocks, block_d2, c_block, dtype):
+    """Running nearest (d², label) over centroid blocks.
+
+    ``block_d2(block)`` returns the (P, c_block) distances of one block;
+    a block's winner replaces the running one only when strictly closer, so
+    ties keep the lowest label.
+    """
+    def body(carry, block):
+        best_d, best_c, chunk_idx = carry
+        d2 = block_d2(block)
+        local_d, local_c = _row_min_argmin(jnp.where(jnp.isnan(d2), jnp.inf, d2))
+        better = local_d < best_d
+        return (jnp.where(better, local_d, best_d),
+                jnp.where(better, chunk_idx * c_block + local_c, best_c),
+                chunk_idx + 1), None
+
+    P = positions.shape[0]
+    init = (jnp.full((P,), jnp.inf, dtype=dtype),
+            jnp.zeros((P,), dtype=jnp.int32),
+            jnp.int32(0))
+    (best_d2, labels, _), _ = lax.scan(body, init, blocks, unroll=1)
+    return best_d2, labels
+
+
+@partial(jax.jit, static_argnames=['n_c', 'c_block', 'offsets'])
 def assign_labels_chunked(
     positions_frac: jnp.ndarray,
     centroids_frac: jnp.ndarray,
     metric_tensor: jnp.ndarray,
     n_c: int,
     c_block: int = _DEFAULT_C_BLOCK,
-    offsets: jnp.ndarray | None = None,
+    offsets: tuple = ((0, 0, 0),),
 ) -> jnp.ndarray:
     """(P,) int32 nearest-centroid labels under min-image distance.
 
-    Chunked along C so peak memory is ``(P, c_block)`` per axis. Centroids
-    are NaN-padded to a multiple of ``c_block`` so any ``n_c`` works.
+    Chunked along C; ``offsets`` is a :func:`static_offsets` tuple.
+    Centroids are NaN-padded to a multiple of ``c_block`` so any ``n_c``
+    works.
     """
-    if offsets is None:
-        offsets = jnp.zeros((1, 3), dtype=jnp.int32)
-    n_chunks = (n_c + c_block - 1) // c_block
-    n_c_padded = n_chunks * c_block
-    if n_c_padded != n_c:
-        pad = jnp.full((n_c_padded - n_c, 3), jnp.nan, dtype=centroids_frac.dtype)
-        centroids_frac = jnp.concatenate([centroids_frac, pad], axis=0)
-    centroids_blocked = centroids_frac.reshape(n_chunks, c_block, 3)
-
-    g00, g01, g02 = metric_tensor[0, 0], metric_tensor[0, 1], metric_tensor[0, 2]
-    g11, g12, g22 = metric_tensor[1, 1], metric_tensor[1, 2], metric_tensor[2, 2]
-
-    def body(carry, cent_chunk):
-        best_d, best_c, chunk_idx = carry
-        dx0 = positions_frac[:, None, 0] - cent_chunk[None, :, 0]
-        dx0 = dx0 - jnp.round(dx0)
-        dy0 = positions_frac[:, None, 1] - cent_chunk[None, :, 1]
-        dy0 = dy0 - jnp.round(dy0)
-        dz0 = positions_frac[:, None, 2] - cent_chunk[None, :, 2]
-        dz0 = dz0 - jnp.round(dz0)
-
-        def offset_body(i, dchunk):
-            nx, ny, nz = offsets[i, 0], offsets[i, 1], offsets[i, 2]
-            return jnp.minimum(dchunk, _quadform_G(
-                dx0 + nx, dy0 + ny, dz0 + nz, g00, g01, g02, g11, g12, g22))
-
-        d_chunk = lax.fori_loop(
-            0, offsets.shape[0], offset_body, jnp.full_like(dx0, jnp.inf)
-        )
-        # NaN propagates through the offset loop; mask once at the end so
-        # padded centroids never win argmin.
-        d_chunk = jnp.where(jnp.isnan(d_chunk), jnp.inf, d_chunk)
-        local_c = jnp.argmin(d_chunk, axis=1).astype(jnp.int32)
-        local_d = jnp.take_along_axis(d_chunk, local_c[:, None], axis=1)[:, 0]
-        better = local_d < best_d
-        return (jnp.where(better, local_d, best_d),
-                jnp.where(better, chunk_idx * c_block + local_c, best_c),
-                chunk_idx + 1), None
-
-    P = positions_frac.shape[0]
-    init = (jnp.full((P,), jnp.inf, dtype=metric_tensor.dtype),
-            jnp.zeros((P,), dtype=jnp.int32),
-            jnp.int32(0))
-    (_, labels, _), _ = lax.scan(body, init, centroids_blocked, unroll=1)
+    _, labels = _scan_nearest(
+        positions_frac, _nan_pad_blocks(centroids_frac, n_c, c_block),
+        lambda block: _images_d2(positions_frac, block[None], metric_tensor,
+                                 offsets),
+        c_block, metric_tensor.dtype)
     return labels
 
 
@@ -237,52 +293,30 @@ def assign_labels_chunked(
 # Orbit-aware nearest-rep assignment (phase 2)
 # ─────────────────────────────────────────────────────────────────────────
 
-def _orbit_d2_chunk(positions, image_chunk, metric, offsets):
-    """(P, c_block) min-image squared distance from positions to a block of
-    centroid images (one image per (s, μ) pair). Reuses the same
-    fori_loop-over-offsets pattern as assign_labels_chunked."""
-    g00, g01, g02 = metric[0, 0], metric[0, 1], metric[0, 2]
-    g11, g12, g22 = metric[1, 1], metric[1, 2], metric[2, 2]
-    dx0 = positions[:, None, 0] - image_chunk[None, :, 0]
-    dx0 = dx0 - jnp.round(dx0)
-    dy0 = positions[:, None, 1] - image_chunk[None, :, 1]
-    dy0 = dy0 - jnp.round(dy0)
-    dz0 = positions[:, None, 2] - image_chunk[None, :, 2]
-    dz0 = dz0 - jnp.round(dz0)
-
-    def body(i, dchunk):
-        nx, ny, nz = offsets[i, 0], offsets[i, 1], offsets[i, 2]
-        return jnp.minimum(dchunk, _quadform_G(
-            dx0 + nx, dy0 + ny, dz0 + nz, g00, g01, g02, g11, g12, g22))
-    return lax.fori_loop(0, offsets.shape[0], body, jnp.full_like(dx0, jnp.inf))
-
-
 def _orbit_d2_per_point(positions, image_per_point, metric, offsets):
-    """(P,) min-image squared distance with one image per point."""
+    """(P,) min-image squared distance with one image per point;
+    ``offsets`` is a :func:`static_offsets` tuple."""
     g00, g01, g02 = metric[0, 0], metric[0, 1], metric[0, 2]
     g11, g12, g22 = metric[1, 1], metric[1, 2], metric[2, 2]
-    dx0 = positions[:, 0] - image_per_point[:, 0]
-    dx0 = dx0 - jnp.round(dx0)
-    dy0 = positions[:, 1] - image_per_point[:, 1]
-    dy0 = dy0 - jnp.round(dy0)
-    dz0 = positions[:, 2] - image_per_point[:, 2]
-    dz0 = dz0 - jnp.round(dz0)
-
-    def body(i, best):
-        nx, ny, nz = offsets[i, 0], offsets[i, 1], offsets[i, 2]
-        return jnp.minimum(best, _quadform_G(
-            dx0 + nx, dy0 + ny, dz0 + nz, g00, g01, g02, g11, g12, g22))
-    return lax.fori_loop(0, offsets.shape[0], body, jnp.full_like(dx0, jnp.inf))
+    delta = positions - image_per_point
+    delta = delta - jnp.round(delta)
+    dx0, dy0, dz0 = delta[:, 0], delta[:, 1], delta[:, 2]
+    best = None
+    for nx, ny, nz in offsets:
+        d2 = _quadform_G(dx0 + nx, dy0 + ny, dz0 + nz,
+                         g00, g01, g02, g11, g12, g22)
+        best = d2 if best is None else jnp.minimum(best, d2)
+    return best
 
 
-@partial(jax.jit, static_argnames=['n_rep', 'c_block'])
+@partial(jax.jit, static_argnames=['n_rep', 'c_block', 'offsets'])
 def assign_labels_orbit_chunked(
     positions: jnp.ndarray,
     reps: jnp.ndarray,
     metric: jnp.ndarray,
     n_rep: int,
     c_block: int = _DEFAULT_C_BLOCK,
-    offsets: jnp.ndarray | None = None,
+    offsets: tuple = ((0, 0, 0),),
     Rinv: jnp.ndarray | None = None,
     tau: jnp.ndarray | None = None,
     tie_tol: float = 1e-10,
@@ -293,10 +327,11 @@ def assign_labels_orbit_chunked(
     contains the closest image, plus a boolean tie mask of the symmetry
     operations that achieve that minimum (for the winning rep only).
 
-    The scan computes orbit distances via fori_loop(sym,
-    fori_loop(offset, ...)) with a peak buffer of (P, c_block). Once the
-    globally winning rep is known, one final symmetry loop builds its
-    (P, n_sym) tie mask. A losing chunk never needs a tie mask.
+    Each scan trip builds the ``(n_sym, c_block)`` images of one rep block
+    and reduces the fused (point, image, offset) distances straight to the
+    block's nearest rep; ``offsets`` is a :func:`static_offsets` tuple.
+    Once the globally winning rep is known, one final symmetry loop builds
+    its (P, n_sym) tie mask. A losing chunk never needs a tie mask.
 
     Returns
     -------
@@ -304,60 +339,25 @@ def assign_labels_orbit_chunked(
     best_d2  : (P,) fp64   — winning orbit distance²
     tie_mask : (P, n_sym) bool — for the winning rep, the sym ops that tie
     """
-    if offsets is None:
-        offsets = jnp.zeros((1, 3), dtype=jnp.int32)
     if Rinv is None:
         Rinv = jnp.eye(3, dtype=jnp.int32)[None]
         tau = jnp.zeros((1, 3), dtype=positions.dtype)
     n_sym = Rinv.shape[0]
+    reps_blocked = _nan_pad_blocks(reps, n_rep, c_block)
 
-    # NaN-pad reps to a multiple of c_block — same trick as assign_labels_chunked.
-    n_chunks = (n_rep + c_block - 1) // c_block
-    n_rep_padded = n_chunks * c_block
-    if n_rep_padded != n_rep:
-        pad = jnp.full((n_rep_padded - n_rep, 3), jnp.nan, dtype=reps.dtype)
-        reps = jnp.concatenate([reps, pad], axis=0)
-    reps_blocked = reps.reshape(n_chunks, c_block, 3)
+    def block_d2(rep_chunk):
+        # NO WRAP, deliberately: the distance is a minimum-image metric
+        # carrying its own explicit offset table, so folding the image into
+        # [0,1) first would put it on the wrong replica.
+        images = jnp.stack([
+            _sym.r_action_forward_one(rep_chunk, Rinv[s], tau[s], wrap=False)
+            for s in range(n_sym)])
+        return _images_d2(positions, images, metric, offsets)
 
+    best_d2, labels = _scan_nearest(
+        positions, reps_blocked, block_d2, c_block, metric.dtype)
+    winning_rep = reps_blocked.reshape(-1, 3)[labels]
     P = positions.shape[0]
-
-    def body(carry, rep_chunk):
-        best_d, best_label, chunk_idx = carry
-
-        # Pass 1: orbit distance per (point, rep-in-chunk).
-        def sym_loop(s, orbit_d):
-            # NO WRAP, deliberately: `_orbit_d2_chunk` is a minimum-image
-            # metric carrying its own explicit offset table, so folding the
-            # image into [0,1) first would put it on the wrong replica.
-            image_chunk = _sym.r_action_forward_one(
-                rep_chunk, Rinv[s], tau[s], wrap=False)
-            return jnp.minimum(orbit_d, _orbit_d2_chunk(
-                positions, image_chunk, metric, offsets))
-
-        orbit_d = lax.fori_loop(
-            0, n_sym, sym_loop, jnp.full((P, c_block), jnp.inf)
-        )
-        # NaN sentinel for padded reps: NaN propagates through subtract/quadform,
-        # jnp.minimum(NaN, x) = NaN, so masking once at the end suffices.
-        orbit_d = jnp.where(jnp.isnan(orbit_d), jnp.inf, orbit_d)
-
-        local_c = orbit_d.argmin(axis=1).astype(jnp.int32)        # (P,)
-        local_d = jnp.take_along_axis(orbit_d, local_c[:, None], axis=1)[:, 0]
-
-        better = local_d < best_d
-        return (
-            jnp.where(better, local_d, best_d),
-            jnp.where(better, chunk_idx * c_block + local_c, best_label),
-            chunk_idx + 1,
-        ), None
-
-    init = (
-        jnp.full((P,), jnp.inf, dtype=metric.dtype),
-        jnp.zeros((P,), dtype=jnp.int32),
-        jnp.int32(0),
-    )
-    (best_d2, labels, _), _ = lax.scan(body, init, reps_blocked, unroll=1)
-    winning_rep = reps[labels]
 
     def tie_sym_loop(s, tie_mask):
         image_p = _sym.r_action_forward_one(
@@ -376,25 +376,20 @@ def assign_labels_orbit_chunked(
 # ─────────────────────────────────────────────────────────────────────────
 
 def _min_image_delta(delta, metric_tensor, offsets):
-    """The (..., 3) lattice image of ``delta`` minimising δ^T G δ."""
+    """The (..., 3) lattice image of ``delta`` minimising δ^T G δ;
+    ``offsets`` is a :func:`static_offsets` tuple (first strict minimum)."""
     delta = delta - jnp.round(delta)
     g00, g01, g02 = metric_tensor[0, 0], metric_tensor[0, 1], metric_tensor[0, 2]
     g11, g12, g22 = metric_tensor[1, 1], metric_tensor[1, 2], metric_tensor[2, 2]
     dx0, dy0, dz0 = delta[..., 0], delta[..., 1], delta[..., 2]
-
-    def body(i, carry):
-        best_d2, best_delta = carry
-        nx, ny, nz = offsets[i, 0], offsets[i, 1], offsets[i, 2]
+    best_d2, best_delta = jnp.full_like(dx0, jnp.inf), delta
+    for nx, ny, nz in offsets:
         dxi, dyi, dzi = dx0 + nx, dy0 + ny, dz0 + nz
         d2_i = _quadform_G(dxi, dyi, dzi, g00, g01, g02, g11, g12, g22)
         better = d2_i < best_d2
-        return (jnp.where(better, d2_i, best_d2),
-                jnp.where(better[..., None],
-                          jnp.stack([dxi, dyi, dzi], axis=-1), best_delta))
-
-    _, best_delta = lax.fori_loop(
-        0, offsets.shape[0], body, (jnp.full_like(dx0, jnp.inf), delta)
-    )
+        best_d2 = jnp.where(better, d2_i, best_d2)
+        best_delta = jnp.where(better[..., None],
+                               jnp.stack([dxi, dyi, dzi], axis=-1), best_delta)
     return best_delta
 
 
@@ -567,8 +562,13 @@ def make_lloyd_loop(
     The whole loop is one ``lax.while_loop`` that never returns to the
     host, so convergence costs zero syncs per iteration.  Returns
     ``(final_centroids, steps_taken, max_movement_sq)``.
+
+    In orbit mode the points may be one grid point per spatial orbit with
+    the orbit's summed weight (:func:`grid_orbit_representatives`): every
+    member of a point orbit has the same orbit distances and the same
+    rep-frame displacement, so the accumulators are unchanged.
     """
-    offsets = jnp.asarray(offsets, dtype=jnp.int32)
+    offsets = static_offsets(offsets)
     tol_sq = jnp.float64(tolerance) ** 2
     orbit_aware = R is not None
     if orbit_aware:
@@ -818,6 +818,17 @@ def weighted_kmeans_jax(
         )
     centroids = dist.place(centroids, mesh)
 
+    # Orbit mode: Lloyd over one grid point per spatial orbit, carrying the
+    # orbit's summed weight -- n_sym times fewer points, same accumulators.
+    lloyd_positions, lloyd_rho = positions, rho_flat
+    reduced = (grid_orbit_representatives(rho, Rinv, tau) if orbit_aware
+               else None)
+    if reduced is not None:
+        lloyd_positions, lloyd_rho, _ = dist.place_points(
+            reduced[0], reduced[1], rho.shape, mesh, mesh_axis)
+        log.debug(f"Lloyd over {reduced[0].size} grid-orbit representatives "
+                  f"of {n_grid_logical} points")
+
     lloyd = make_lloyd_loop(
         mesh, N_c, max_steps, tolerance, offsets,
         R=R, Rinv=Rinv, tau=tau,
@@ -825,9 +836,13 @@ def weighted_kmeans_jax(
     )
     with timing.section("lloyd"):
         centroids, steps, max_mv_sq = lloyd(
-            positions, centroids, rho_flat, metric_tensor,
+            lloyd_positions, centroids, lloyd_rho, metric_tensor,
         )
         centroids.block_until_ready()
+    if reduced is not None:
+        lloyd_positions.delete()
+        lloyd_rho.delete()
+    offsets = static_offsets(offsets)
     steps = int(steps)
     log.info(f"Lloyd: {steps} steps, max movement = "
              f"{float(jnp.sqrt(max_mv_sq)):.6f}")
@@ -968,6 +983,44 @@ def ensure_unique_centroids(
     return out.astype(float) / fft_grid
 
 
+def grid_orbit_canonical(fft_grid, Rinv, tau) -> np.ndarray:
+    """``(N_grid,)`` flat index of each FFT-grid point's smallest-index
+    orbit member under ``r' = Rinv·r + τ`` (every operation of the group).
+
+    Streams one service-owned grid permutation at a time. Raises the
+    service's ``RuntimeError`` when a translation is off the grid.
+    """
+    grid = np.asarray(fft_grid, dtype=np.int64)
+    canonical = np.arange(int(np.prod(grid)), dtype=np.int64)
+    for operation, shift in zip(np.asarray(Rinv), np.asarray(tau)):
+        reciprocal = np.rint(np.linalg.inv(operation)).astype(np.int64)
+        row = _sym.fft_grid_pullback_perm(
+            reciprocal[None], shift[None] * (2.0*np.pi), grid,
+            validate=True)[0]
+        canonical = np.minimum(canonical, row)
+    return canonical
+
+
+def grid_orbit_representatives(weight, Rinv, tau):
+    """One grid point per spatial orbit and the orbit's summed weight.
+
+    Returns ``(flat_index, orbit_weight)``, or ``None`` when an operation's
+    translation is off the grid (the Lloyd step then keeps every point).
+    Summing is exact for any weight: a point's orbit distance and its
+    folded rep-frame displacement are the same for every orbit member.
+    """
+    weight = np.asarray(weight, dtype=np.float64)
+    try:
+        canonical = grid_orbit_canonical(weight.shape, Rinv, tau)
+    except RuntimeError as exc:
+        log.debug(f"Lloyd keeps every grid point: {exc}")
+        return None
+    flat_index = np.flatnonzero(canonical == np.arange(canonical.size))
+    summed = np.bincount(canonical, weights=weight.reshape(-1),
+                         minlength=canonical.size)
+    return flat_index, summed[flat_index]
+
+
 def _restore_orbit_pool(indices, fft_grid, weight, Rinv, tau, target):
     """Restore snapped duplicate points with complete, unoccupied orbits.
 
@@ -989,13 +1042,7 @@ def _restore_orbit_pool(indices, fft_grid, weight, Rinv, tau, target):
     # Stream permutations to identify free whole orbits. Checking a small
     # final budget remainder must not Fourier-transform every free point or
     # construct every free orbit individually on a million-point grid.
-    canonical = np.arange(total, dtype=np.int64)
-    for operation, shift in zip(np.asarray(Rinv), np.asarray(tau)):
-        reciprocal = np.rint(np.linalg.inv(operation)).astype(np.int64)
-        row = _sym.fft_grid_pullback_perm(
-            reciprocal[None], shift[None] * (2.0*np.pi), grid,
-            validate=True)[0]
-        canonical = np.minimum(canonical, row)
+    canonical = grid_orbit_canonical(grid, Rinv, tau)
     sizes = np.bincount(canonical, minlength=total)
     present = np.bincount(canonical[occupied], minlength=total)
     if np.any((present > 0) & (present != sizes)):

@@ -16,8 +16,9 @@ specific to selecting ISDF centroids and would be wrong to generalise:
   ``NamedSharding`` / ``PartitionSpec``.  Requests 1-3 in this
   workstream's report propose moving them into ``common.collectives``,
   at which point this module keeps only the two items above.
-* :func:`place_grid`, :func:`grid_argmax`, :func:`grid_points` — the
-  grid-sharded seed inputs and small selected-point collectives. A seed
+* :func:`place_grid`, :func:`place_points`, :func:`grid_argmax`,
+  :func:`grid_points` — the grid-sharded seed and Lloyd inputs and small
+  selected-point collectives. A seed
   broadcasts its chosen point without gathering the full grid.
 
 There is deliberately NO ``single_device_mesh`` / ``process_local_mesh``
@@ -177,25 +178,71 @@ def place_grid(rho, mesh: Mesh, grid_axis=MESH_AXES):
     @partial(jax.jit, out_shardings=positions_sharding)
     def positions():
         index = jnp.arange(tag.carrier)
-        fx, fy, fz = (jnp.linspace(0, 1, n, endpoint=False, dtype=jnp.float64)
-                      for n in (nx, ny, nz))
-        xyz = jnp.stack((fx[jnp.minimum(index // (ny*nz), nx-1)],
-                         fy[(index // nz) % ny], fz[index % nz]), axis=-1)
-        return jnp.where((index < tag.logical)[:, None], xyz, 0.)
-
-    weights = np.asarray(rho, dtype=np.float64).reshape(-1)
-
-    def density_tile(index):
-        begin, end = index[0].start or 0, index[0].stop or tag.carrier
-        out = np.zeros(end-begin, dtype=np.float64)
-        valid_end = min(end, tag.logical)
-        if begin < valid_end:
-            out[:valid_end-begin] = weights[begin:valid_end]
-        return out
+        return jnp.where((index < tag.logical)[:, None],
+                         _grid_fractions(index, (nx, ny, nz)), 0.)
 
     density = device_put_process_tiles(
-        (tag.carrier,), NamedSharding(mesh, PartitionSpec(axis)), density_tile)
+        (tag.carrier,), NamedSharding(mesh, PartitionSpec(axis)),
+        _padded_tile(np.asarray(rho, dtype=np.float64).reshape(-1), tag))
     return positions(), density, tag
+
+
+def place_points(flat_index, weights, grid_shape, mesh: Mesh,
+                 grid_axis=MESH_AXES):
+    """:func:`place_grid` for a subset of the grid: the fractional
+    positions of the logical points ``flat_index`` (C order over
+    ``grid_shape``) and their ``weights``, on grid shards.  Padding rows
+    carry zero position and zero weight."""
+    import numpy as np
+    import jax.numpy as jnp
+    from runtime.padding import padded_axis
+
+    axes = require_axes(mesh, grid_axis, 'place_points')
+    axis = axes[0] if len(axes) == 1 else axes
+    shape = tuple(int(n) for n in grid_shape)
+    tag = padded_axis(len(flat_index), n_shards(mesh, axes),
+                      name='k-means points')
+    rows = NamedSharding(mesh, PartitionSpec(axis))
+    index = device_put_process_tiles(
+        (tag.carrier,), rows,
+        _padded_tile(np.asarray(flat_index, dtype=np.int64), tag))
+    density = device_put_process_tiles(
+        (tag.carrier,), rows,
+        _padded_tile(np.asarray(weights, dtype=np.float64), tag))
+
+    @partial(jax.jit, out_shardings=NamedSharding(mesh, PartitionSpec(axis, None)))
+    def positions(index):
+        valid = jnp.arange(tag.carrier) < tag.logical
+        return jnp.where(valid[:, None], _grid_fractions(index, shape), 0.)
+
+    return positions(index), density, tag
+
+
+def _grid_fractions(index, shape):
+    """(n, 3) fractional coordinates of flat C-order grid indices, from the
+    same ``linspace`` values for every placement (``index`` past the grid
+    is clamped; callers mask it)."""
+    import jax.numpy as jnp
+    nx, ny, nz = shape
+    fx, fy, fz = (jnp.linspace(0, 1, n, endpoint=False, dtype=jnp.float64)
+                  for n in (nx, ny, nz))
+    return jnp.stack((fx[jnp.minimum(index // (ny*nz), nx-1)],
+                      fy[(index // nz) % ny], fz[index % nz]), axis=-1)
+
+
+def _padded_tile(values, tag):
+    """``device_put_process_tiles`` callback: this shard's slice of the
+    logical ``values``, zero past ``tag.logical``."""
+    import numpy as np
+
+    def tile(index):
+        begin, end = index[0].start or 0, index[0].stop or tag.carrier
+        out = np.zeros(end-begin, dtype=values.dtype)
+        valid_end = min(end, tag.logical)
+        if begin < valid_end:
+            out[:valid_end-begin] = values[begin:valid_end]
+        return out
+    return tile
 
 
 def grid_points(positions, index, mesh: Mesh, grid_axis=MESH_AXES):
