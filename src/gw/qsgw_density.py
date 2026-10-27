@@ -457,11 +457,40 @@ class DensityScanPlan(NamedTuple):
     g_carrier
         G extent the ``g_split`` all-to-all splits over the mesh; the
         loader's ``ngkmax`` on the other routes.
+    band_chunk
+        This rank's bands per box → ifft → contraction step
+        (:func:`density_band_chunk`): all of them when their boxes fit the
+        fixed tile, else the fewest equal chunks that do.
     """
     route: str
     n_rot: int
     k_tile: int
     g_carrier: int
+    band_chunk: int
+
+
+#: Complex FFT boxes one band holds per spinor component in a density step:
+#: the gathered box, ψ(r), and the contraction's product.
+DENSITY_BOX_COPIES = 3
+
+
+def density_band_chunk(*, n_loc: int, k_tile: int, ns: int,
+                       n_grid: int) -> int:
+    """Bands per density step, from the fixed tile (``runtime.tiles``).
+
+    Unchunked, a step holds ``2·K·n_loc·ns·N_r·16`` bytes of boxes: 54 GB
+    per rank at 208 local bands of a 128×128×250 spinor grid, which was the
+    whole Σ Hartree peak of a 148-atom one-node run.  Bands are
+    independent, so the fewest equal chunks whose boxes fit the tile run one
+    after another; one chunk, this rank's ``n_loc``, when they fit.  From
+    the shapes alone, so every process computes the same chunk.
+    """
+    from runtime.tiles import tile_units
+    n_loc = max(int(n_loc), 1)
+    box = (DENSITY_BOX_COPIES * float(k_tile) * float(ns) * float(n_grid)
+           * 16.0)
+    n_chunks = -(-n_loc // tile_units(box, n_loc))
+    return -(-n_loc // n_chunks)
 
 
 def plan_density_scan(*, mesh: Mesh, n_k: int, nb_carrier: int,
@@ -493,8 +522,13 @@ def plan_density_scan(*, mesh: Mesh, n_k: int, nb_carrier: int,
     from runtime.padding import bounded_partition_tile, padded_axis
 
     n_k, nb_carrier = int(n_k), int(nb_carrier)
+    n_ranks = int(mesh.devices.size)
+    nb_rank = nb_carrier // n_ranks
+    whole_rank = density_band_chunk(n_loc=nb_rank, k_tile=1, ns=ns,
+                                    n_grid=n_grid)
     if not have_U:
-        return DensityScanPlan("local", nb_carrier, 1, int(ngkmax))
+        return DensityScanPlan("local", nb_carrier, 1, int(ngkmax),
+                               whole_rank)
     c128 = 16.0
     from lxkit import memory
     budget = float(budget_bytes or 0.0)
@@ -502,22 +536,24 @@ def plan_density_scan(*, mesh: Mesh, n_k: int, nb_carrier: int,
             ("g_split", memory.priced(float(nb_carrier) ** 2 * c128, "U tile", term="operands"),
              BAND_TILE_BUDGET_FRACTION * budget if budget > 0 else float("inf")),
             ("band_2d", memory.Price())), budget) == "band_2d":
-        return DensityScanPlan("band_2d", nb_carrier, 1, int(ngkmax))
+        return DensityScanPlan("band_2d", nb_carrier, 1, int(ngkmax),
+                               whole_rank)
     n_rot = padded_axis(
         max(int(n_active), 1), mesh, name="density occupied rotated bands",
         spec=band_sphere_spec(), axis=1).carrier
     g_carrier = padded_axis(
         int(ngkmax), mesh, name="density G all-to-all",
         spec=P(None, None, None, ("x", "y")), axis=3).carrier
-    n_ranks = int(mesh.devices.size)
-    nb_rank, n_loc = nb_carrier // n_ranks, n_rot // n_ranks
+    n_loc = n_rot // n_ranks
     sphere = n_k * nb_rank * int(ns) * int(ngkmax) * c128
     step = (2.0 * n_loc * int(ns) * int(n_grid) * c128
             + (nb_rank + 2 * n_loc) * int(ns) * g_carrier * c128
             + float(nb_carrier) ** 2 * c128)
     k_cap = max(1, int(sphere // step))
     k_tile = max(1, bounded_partition_tile(n_k, k_cap, 1))
-    return DensityScanPlan("g_split", n_rot, k_tile, g_carrier)
+    return DensityScanPlan("g_split", n_rot, k_tile, g_carrier,
+                           density_band_chunk(n_loc=n_loc, k_tile=k_tile,
+                                              ns=ns, n_grid=n_grid))
 
 
 def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
@@ -592,18 +628,44 @@ def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
         def tiles(a):
             return None if a is None else a.reshape(n_tiles, K, *a.shape[1:])
 
+        def bands_density(phi_c, f_c, bidx_t):
+            """One band chunk's field: box → ifft → weighted contraction."""
+            n_c = int(phi_c.shape[1])
+            box = _box_kernel(phi_c, bidx_t, fft_grid=grid)
+            psi_r = local_ifftn3(box, axes=(-3, -2, -1), norm="ortho") * scale
+            return density_components_from_psi_r(
+                psi_r.reshape(K * n_c, ns, *grid), f_c.reshape(K * n_c),
+                include_dirac_current=include_current,
+                charge_nspinor=(None if return_spin_matrix else charge_ns),
+                return_spin_density_matrix=return_spin_matrix)
+
         def step(acc, xs):
             psi_t, U_t, occ_t, w_t, bidx_t = xs
             phi, n0 = my_bands(psi_t, U_t)
             f = jax.lax.dynamic_slice_in_dim(occ_t, n0, n_loc, axis=1)
             f = f * (f_spin * w_t)[:, None]
-            box = _box_kernel(phi, bidx_t, fft_grid=grid)
-            psi_r = local_ifftn3(box, axes=(-3, -2, -1), norm="ortho") * scale
-            dens = density_components_from_psi_r(
-                psi_r.reshape(K * n_loc, ns, *grid), f.reshape(K * n_loc),
-                include_dirac_current=include_current,
-                charge_nspinor=(None if return_spin_matrix else charge_ns),
-                return_spin_density_matrix=return_spin_matrix)
+            c = int(plan.band_chunk)
+            if c >= n_loc:
+                dens = bands_density(phi, f, bidx_t)
+            else:
+                # Band chunks, one after another: the boxes are (K, c, ns,
+                # grid), never this rank's whole band set.  Pad bands carry
+                # f = 0 and ψ = 0, so they add exact zeros.
+                n = -(-n_loc // c)
+                pad = n * c - n_loc
+                if pad:
+                    phi = jnp.pad(phi, ((0, 0), (0, pad), (0, 0), (0, 0)))
+                    f = jnp.pad(f, ((0, 0), (0, pad)))
+
+                def chunk(j, a):
+                    lo = j * c
+                    return a + bands_density(
+                        jax.lax.dynamic_slice_in_dim(phi, lo, c, axis=1),
+                        jax.lax.dynamic_slice_in_dim(f, lo, c, axis=1),
+                        bidx_t).astype(field_dtype)
+
+                dens = jax.lax.fori_loop(
+                    0, n, chunk, jnp.zeros(field_shape, dtype=field_dtype))
             if per_k:
                 return acc, dens.astype(field_dtype)
             return acc + dens, None

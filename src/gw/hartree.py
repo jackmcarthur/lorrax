@@ -137,6 +137,44 @@ class ExactHartreeMatrices(NamedTuple):
     tt_metric_sign: float
 
 
+def _book_direct_field_price(psi_G, psi_charge, geom, operator, *,
+                             nk_full: int, nb: int, ranks: int,
+                             with_transverse: bool, sym_perm_bytes: float):
+    """Book this stage's per-rank price to the open section (``lxkit.memory``).
+
+    Resident through the stage, spread over P: the ψ(G) wedge sphere (and
+    its charge-spinor slice when that is a copy), the wedge matrix blocks and
+    their full-BZ star broadcast.  Replicated: the fields and the star
+    pullback table.  Transient, the larger of the two phases, each bounded
+    by the fixed tile: one density band chunk's boxes
+    (:func:`gw.qsgw_density.density_band_chunk`) and the sweep's k step plus
+    its band chunk's boxes (:func:`common.mtxel_sweep.sweep_transient_bytes`).
+    """
+    from lxkit import memory
+    from common.mtxel_sweep import sweep_transient_bytes
+    from gw.qsgw_density import DENSITY_BOX_COPIES, density_band_chunk
+
+    c128, n_grid = 16.0, float(geom.ngrid)
+    nk_w, nb_load, ns, ngk = (int(s) for s in psi_G.shape)
+    n_fields = 4 if with_transverse else 1
+    sphere = float(nk_w * nb_load * ns * ngk) * c128
+    if psi_charge is not psi_G:
+        sphere += float(np.prod(psi_charge.shape)) * c128
+    blocks = (n_fields * (nk_w * float(geom.nb) ** 2 + nk_full * float(nb) ** 2)
+              * c128)
+    fields = 3.0 * n_fields * n_grid * 8.0 + sym_perm_bytes
+    rank_bands = -(-nb_load // max(1, int(ranks)))
+    density = (DENSITY_BOX_COPIES * ns * n_grid * c128 * density_band_chunk(
+        n_loc=rank_bands, k_tile=1, ns=ns, n_grid=int(n_grid)))
+    sweep = sweep_transient_bytes(geom, operator)
+    memory.book(memory.Price(
+        operands=memory.Term(fields, sphere + blocks,
+                             "psi(G) wedge sphere + V_H blocks + fields"),
+        xla=memory.Term(max(density, sweep), 0.0,
+                        "density band-chunk boxes | sweep k step + boxes"),
+        ranks=int(ranks), label="Sigma Hartree", increment=True))
+
+
 def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
                           nb: int, mesh=None,
                           include_transverse: bool = False,
@@ -230,6 +268,8 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
     # the density scan; its receipt (movement of the raw field, residual of
     # the projected one) is the one reported below.
     projections = []
+    sym_perm = sym.fft_grid_pullback(sym.active_symmetry_rows, grid)
+    sym_perm_bytes = float(np.prod(np.shape(sym_perm))) * 4.0
     with timing.section("vh_rho"):
         rho_np = np.asarray(rho_from_wfns(
             psi_G, occ, kweights, mesh=mesh, box_index=box_index,
@@ -238,8 +278,9 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
             include_dirac_current=with_transverse,
             charge_nspinor=(None if charge_nspinor is None else charge_ns),
             sym=sym,
-            sym_perm=sym.fft_grid_pullback(sym.active_symmetry_rows, grid),
+            sym_perm=sym_perm,
             projection_receipt_fn=projections.append), dtype=np.float64)
+    del sym_perm
 
     if with_transverse:
         fields = np.asarray(rho_np, dtype=np.float64)
@@ -382,6 +423,10 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
         four_current_potential_operator(
             geom_matrix, V_H_r, V_T_r, charge_nspinor=charge_ns)
         if with_transverse else local_potential_operator(geom_matrix, V_H_r))
+    _book_direct_field_price(
+        psi_G, psi_charge, geom_matrix, matrix_operator, nk_full=nk, nb=nb,
+        ranks=int(mesh.devices.size), with_transverse=with_transverse,
+        sym_perm_bytes=sym_perm_bytes)
     with timing.section("vh_matrix"):
         H_matrix = sweep_matrix_elements(
             matrix_psi, operator=matrix_operator, geom=geom_matrix,

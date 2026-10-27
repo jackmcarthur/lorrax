@@ -1208,29 +1208,51 @@ def plan_sweep(geom: SweepGeometry, operator) -> SweepPlan:
     The FFT box of a band operator is NOT in the step:
     it runs one k at a time inside the tile and never scales with K.
     """
-    from runtime.padding import bounded_partition_tile, padded_axis
+    from runtime.padding import bounded_partition_tile
 
     c128 = 16.0
     n_ranks = int(geom.p_prod)
     nb_rank = geom.nb // n_ranks
-    g_carrier = padded_axis(
-        geom.ngkmax, geom.mesh, name="matrix-element sweep G all-to-all",
-        spec=P(None, None, None, ("x", "y")), axis=3).carrier
     ops = (operator,) if isinstance(operator, Operator) else tuple(operator)
-    c = sum(max(int(o.ncomp), 1) for o in ops)
-    ket_copies = sum(
-        (2 * max(int(o.ncomp), 1) if o.apply is not None else 0)
-        + (max(int(o.ncomp), 1) if o.apply_g is not None else 0)
-        for o in ops)
+    g_carrier, step = _step_bytes(geom, ops)
     sphere = geom.nk * nb_rank * geom.ns * geom.ngkmax * c128
-    step = ((2 + ket_copies) * nb_rank * geom.ns * g_carrier * c128
-            + 2.0 * c * float(geom.nb) ** 2 * c128)
     k_mem = max(1, bounded_partition_tile(
         geom.nk, max(1, int(sphere // step)), 1))
     peer_block = nb_rank * geom.ns * g_carrier * c128 / n_ranks
     k_tile = next((k for k in range(1, k_mem + 1) if geom.nk % k == 0
                    and k * peer_block >= A2A_BANDWIDTH_BLOCK_BYTES), k_mem)
     return SweepPlan(k_tile, g_carrier, _band_chunk(geom, ops, nb_rank, k_tile * step))
+
+
+def _step_bytes(geom: SweepGeometry, ops: tuple) -> tuple[int, float]:
+    """``(g_carrier, bytes)`` of one k step at :func:`plan_sweep`'s price."""
+    from runtime.padding import padded_axis
+
+    c128 = 16.0
+    nb_rank = geom.nb // int(geom.p_prod)
+    g_carrier = padded_axis(
+        geom.ngkmax, geom.mesh, name="matrix-element sweep G all-to-all",
+        spec=P(None, None, None, ("x", "y")), axis=3).carrier
+    c = sum(max(int(o.ncomp), 1) for o in ops)
+    ket_copies = sum(
+        (2 * max(int(o.ncomp), 1) if o.apply is not None else 0)
+        + (max(int(o.ncomp), 1) if o.apply_g is not None else 0)
+        for o in ops)
+    step = ((2 + ket_copies) * nb_rank * geom.ns * g_carrier * c128
+            + 2.0 * c * float(geom.nb) ** 2 * c128)
+    return g_carrier, step
+
+
+def sweep_transient_bytes(geom: SweepGeometry, operator) -> float:
+    """Per-rank transient of one sweep beside its resident ψ: the planned
+    k tile's step and one band chunk's FFT boxes (:func:`plan_sweep`)."""
+    ops = (operator,) if isinstance(operator, Operator) else tuple(operator)
+    plan = plan_sweep(geom, ops)
+    _, step = _step_bytes(geom, ops)
+    copies = max((2 + 2 * max(int(o.ncomp), 1) for o in ops
+                  if o.apply is not None), default=0)
+    boxes = copies * plan.band_chunk * geom.ns * geom.ngrid * 16.0
+    return plan.k_tile * step + boxes
 
 
 def _band_chunk(geom, ops, nb_rank: int, step_bytes: float) -> int:
