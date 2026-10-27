@@ -9,9 +9,9 @@ variables are in the [registry](../reference/env_vars.md).
 ## 1 The environment freezes at step 7b {#env-freeze}
 
 **Rule.** Every LORRAX write to `os.environ` happens before
-`runtime.initialize_communicator_stack` starts the first native helper thread
-(step 7b, the rocBLAS/BLAS warm-up, `runtime.vendor_kernels`). At that point it
-calls `runtime.env_guard.freeze_process_environment()`. After the freeze:
+`runtime.initialize_communicator_stack` calls
+`runtime.env_guard.freeze_process_environment()` at step 7b, after resolving
+the vendor kernel stores and final BLAS thread defaults. After the freeze:
 - A write from LORRAX's own code (`src/`, `services/*/src`) that **adds** a key
   refuses with `GATE env-frozen`.
 - An adding write from any other code is announced once per key and caller,
@@ -22,11 +22,12 @@ Values that later code needs travel in-process (function arguments,
 `common.sanity.forced_level`), never through the environment. Treat any
 post-freeze warning in a log as a bug (INT7 release notes, issue 5).
 
-**Why** (the rc 139 start-up SIGSEGV). glibc's `getenv` takes no lock. A `setenv`
+**Why** (the historical rc 139 start-up SIGSEGV). glibc's `getenv` takes no lock. A `setenv`
 of a **new** key reallocates the `environ` array and frees the old one, so a
 native thread scanning `environ` reads freed memory. Overwrites swap one pointer
 and unsets shift in place, so neither frees what a reader holds.
-- On Frontier the faulting thread was always `lorrax-blas-warmup`:
+- In the former asynchronous Frontier warm-up, the faulting thread was
+  `lorrax-blas-warmup`:
   `rocblas_dgemm → hipModuleLoadData → libhsa-runtime64 → getenv`.
 - The writer was the main thread: the first `SlabIO` open exported two new keys,
   `LORRAX_PHDF5_STRIPE_COUNT` and `_SIZE_FS`.
@@ -41,6 +42,27 @@ phdf5 derives the same policy) and armed the freeze. The same stress then gave
 ([Compilation §3](compilation.md#3-xla-programs)). HSA, MPI-IO, HDF5 and XLA
 all read the environment from their own threads, so the race is reachable on
 any leg; the rule is leg-neutral. Tests: `tests/test_env_guard.py`.
+
+### ROCm code-object preload {#rocm-preload}
+
+ROCm now calls the public `rocblas_initialize(void)` synchronously on the
+main thread at startup step 5e, before the first GEMM or collective. It uses
+the already-attested provider's dependency scope and restores the caller's
+HIP device. The asynchronous small-GEMM warm-up is gone. CPU and CUDA have
+no such preload. The environment freeze remains at step 7b because HSA,
+MPI-IO, HDF5 and XLA still read environment variables from native threads.
+
+Preloading moves a real cost to startup. In the 2026-10-27 Frontier MI250X
+qualification with SDK 7.14.1, a direct P1 API call took 27.9 s; P4 rank-0
+preload clocks ranged from 24.3 to 118.7 s. These are observed process-local
+clocks, not fixed startup estimates. The P1 probe also observed about 1.0 GB
+of additional device residency and 2.7 GB of host RSS. Those increments are
+outside XLA's executable buffers, are not full-job peaks, and are not
+portable constants. Startup also includes other work: the same P4 jobs'
+small hipRTC gate build ranged from about 0.9 to 90 s per rank. An XLA
+cache hit therefore does not establish a warm vendor startup. See
+[Compilation](compilation.md#3-xla-programs) and the
+[memory budget](memory-model.md#budget) for their separate coverage.
 
 ## 2 Shared caches: atomic, keyed, validated, concurrent-safe {#caches}
 

@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-27 — Preload ROCm BLAS code before collectives
+
+ROCm startup now calls the attested provider's `rocblas_initialize`
+synchronously before the first GEMM or collective, replacing the asynchronous
+small-GEMM warm-up. This adds upfront time and resident vendor code/tables
+outside XLA's executable price; observed costs vary with the installed SDK
+and job. See [startup coverage](docs/architecture/startup_environment.md#rocm-preload).
+CPU and CUDA startup are unchanged. There is no new deck setting or native
+signature, and no rebuild beyond the already-required ABI 15 pair.
+
 ## 2026-10-27 — Bound EIGH column restoration
 
 Checked distributed EIGH now streams eigenvector columns when restoring

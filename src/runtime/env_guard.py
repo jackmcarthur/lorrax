@@ -1,4 +1,4 @@
-"""The process environment is frozen once LORRAX starts native helper threads (GATE env-frozen).
+"""Freeze process-environment additions at startup step 7b (GATE env-frozen).
 
 glibc's ``getenv`` takes no lock.  ``setenv`` of a NEW key reallocates the
 ``environ`` array and frees the old one, so a native thread scanning
@@ -11,21 +11,16 @@ runtime calls ``getenv`` on every code-object load (``hipModuleLoadData``), and
 MPI-IO, HDF5 and XLA read the environment from their own threads, so after
 start-up the race is reachable on any leg.
 
-Measured (2026-10-16, Frontier MI250X, Fe V2 P=4): the intermittent start-up
-SIGSEGV (rc 139, about 10 s in, at the first SlabIO open) was exactly this:
-the rocBLAS warm-up thread (:mod:`runtime.vendor_kernels`) faulted in
-``rocblas_dgemm -> hipModuleLoadData -> libhsa-runtime64 -> getenv`` while
-the main thread exported ``LORRAX_PHDF5_STRIPE_COUNT``/``_SIZE_FS`` (new keys)
-before opening WFN.h5.  Under load the Tensile code-object load is slow, so
-the window widened: 5 crashes in 60 concurrent start-ups.  Evidence (scratch
-/lustre/orion/mat280/scratch/jackmc/crash): native backtraces from an LD_PRELOAD
-SIGSEGV handler in s2/B.3/run.r1.log and s2/F.1/run.r0.log; faulthandler stacks
-naming the faulting thread in s1/{C.2,E.3,F.3}/run.r*.log; the main thread's
-environment writes with the live threads in envtrace/run.r1.log.
+The original Frontier rc 139 fault involved the former asynchronous rocBLAS
+warm-up thread and new striping keys exported at the first SlabIO open.
+ROCm now preloads code objects synchronously through the attested provider's
+``rocblas_initialize`` at step 5e, before collectives. CPU and CUDA do not
+use that preload. The historical evidence and current startup contract are
+owned by ``docs/architecture/startup_environment.md#env-freeze``.
 
 Policy, so the class cannot come back: every LORRAX environment write happens
 before :func:`freeze_process_environment`, which ``runtime.initialize_communicator_stack``
-calls immediately before it starts the first native helper thread (step 7b).
+calls after resolving the last startup environment settings (step 7b).
 Afterwards a write that ADDS a key from LORRAX's own code (``src/`` or
 ``services/*/src`` of this checkout) refuses with ``GATE env-frozen``; one from
 any other code is announced once per key and caller and performed (the residual

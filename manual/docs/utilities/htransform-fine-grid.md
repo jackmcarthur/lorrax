@@ -8,7 +8,9 @@ The BSE and exciton-bands drivers call the [H-transform](htransform.md) in memor
 
 ## Band window {: #window }
 
-The transformed Hamiltonian is built from every band from the lowest valence band up to the input file's band count, and the bands the BSE uses are returned from inside it. Inside the BSE drivers the H-transform adds no guard bands of its own, so the input file's band count must leave at least four bands above the highest conduction band the BSE uses. The exciton-bands route warns when there are fewer than four, or more than sixteen, since a very wide window asks the shared basis to represent states the kernel never uses. The method and the shared keys are on the [overview](htransform.md).
+The transformed Hamiltonian uses the resolved deck's coarse fit window (`nval`, `ncond`, with the coarse conduction override below), and returns the BSE bands from inside it. Extra bands stored in `WFN.h5` do not by themselves enlarge that fit. The BSE route adds no guard bands by default; fewer than four fitted conduction bands above the returned window warns. The exciton-bands route also warns above sixteen, since a very wide fit asks the shared basis to represent states the kernel never uses. The method and the shared keys are on the [overview](htransform.md).
+
+Fine-grid dipole preparation reads the velocity operator's complete guarded fit window before gathering its selected payload. A large stored band count therefore does not force a whole-file square read. The selected operator still has $N_{\mathrm{fit}}^2$ entries per component and k point, with host banks and replicated operator preparation: a very large active fit remains a memory floor even when the returned BSE window is small.
 
 When the BSE loader fills the `kgrid_fine` grid with QP energies from `eqp_corrections` or `eqp_co_corrections`, a window that reaches above the eqp file's top band gets the same rigid conduction scissor on the bands above it as [`--eqp-file`](htransform.md#-eqp-file), with the same `[QP scissor]` log line.
 

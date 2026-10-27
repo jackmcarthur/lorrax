@@ -7,7 +7,7 @@
 
 ## <span class="n">1</span> Process mesh and layouts {: #par-mesh }
 
-Every driver runs on one square mesh of $P = p_x\times p_y$ devices, one process per device. Every large object is tiled over the whole mesh, so its bytes per rank fall as $1/P$.
+Every driver runs on one square mesh of $P = p_x\times p_y$ devices, one process per device. Two-axis faces have leading storage proportional to $1/P$ at legal padded extents. Band-complete carriers scale as $1/\sqrt P$; padding, minimum tiles and replicated state set additional floors.
 {: .intro }
 
 ### <span class="n">1.1</span> The mesh {: #par-mesh-grid }
@@ -24,7 +24,7 @@ The run builds one mesh with axes `x` and `y`, $p_x = p_y = \sqrt{P}$, at startu
 
 A two-index operator in the ζ basis or on the points, $V_\bq(\mu,\nu)$, $W_\bq(\mu,\nu;z)$, $G_\bk(\br_\mu,\br_\nu;t)$, is held as a face: the left index on `x`, the right on `y`, the $\bk$ or $\bq$ axis whole on every rank (`P(None,'x','y')`). The k axis is never split, because every k-convolution (§[2](#par-kconv)) needs whole columns.
 
-The orbitals $\psi_{n\bk}(\br_\mu)$ are held at the raw parent k-points only, in two faces with bands on one mesh axis and centroids on the other, $2\cdot16\,n_{\mathrm{par}}n_sN_\mu N_b/P$ bytes per rank. No band-complete copy is resident; the Σ band projection and the sub-tile streams of §[2.3](#par-kconv-passes) gather one for the length of one call.
+The canonical orbitals $\psi_{n\bk}(\br_\mu)$ are held at the raw parent k-points, in two faces with bands on one mesh axis and centroids on the other, $2\cdot16\,n_{\mathrm{par}}n_sN_\mu N_b/P$ bytes per rank at the padded extents. Some contractions prepare a band-complete carrier for their call or scan, retaining all bands beside one centroid face; that term scales as $1/\sqrt P$. The sub-tile streams of §[2.3](#par-kconv-passes) price that prepared layout against a bounded face route.
 
 ### <span class="n">1.3</span> Band sums as SUMMA {: #par-mesh-summa }
 
@@ -80,7 +80,7 @@ CUDA runs each kernel as one fused nvidia-mathdx pass; ROCm runs the same modes 
 `gw.subtile_stream.plan_windows`
 {: .in-code }
 
-Σ and the χ⁰ bank are linear in the left index $\mu$, so a rank's $(\mu_x,\nu_y)$ tile is processed in row passes: windows of $R$ local rows, each ending on a whole symmetry orbit of centroids so that the unfold stays local. $R$ is the most rows whose working set fits the fixed tile of §[6.2](#par-mem-tile). The passes run as one `lax.scan` over a table of windows, so the compiled program does not grow with the pass count, and the padded rows of a short window cost no transform work. Within a pass the parent Green's function of the window's rows is one local GEMM over band-complete $\psi$ rows, with no exchange.
+Σ and the χ⁰ bank are linear in the left index $\mu$, so a rank's $(\mu_x,\nu_y)$ tile is processed in row passes: windows of $R$ local rows, each ending on a whole symmetry orbit of centroids so that the unfold stays local. $R$ is the most rows whose working set fits the fixed tile of §[6.2](#par-mem-tile). The passes run as one `lax.scan` over a table of windows, so the compiled program does not grow with the pass count. A short terminal window retains the compiled carrier width and masks its inactive rows. A fitting axis layout uses band-complete ψ for local Green GEMMs; the face layout streams bounded SUMMA panels instead.
 
 ## <span class="n">3</span> The ζ fit in G space {: #par-zeta }
 
@@ -242,23 +242,25 @@ Davidson selects its lowest transition energies on the owned band tiles. Each ra
 
 The seed executable includes its final layout conversion in the memory price. A bounded cache reuses it across energy and seed updates with the same shapes, dtypes and shardings; it retains no wavefunction or energy arrays. This removes a setup memory floor; the subsequent matrix-free BSE products and subspace storage still determine the solve's capacity.
 
+Subspace QR still gathers the reduced TSQR factors on each rank: for block width $m$, the stack has up to $Pm^2$ elements. The vector rows remain sharded, but unusually wide orthogonalization has this separate replicated floor. Distributed seeds and selected large-kernel controls do not establish an end-to-end capacity for an arbitrary 144-device calculation.
+
 ## <span class="n">6</span> Memory and I/O {: #par-mem }
 
-Every stage is priced against one per-device budget, every streamed loop takes one fixed tile, and every bulk array moves to and from disk as per-rank hyperslabs.
+Stage planners share one per-device budget. Streamed loops use bounded tiles, and distributed bulk banks move to and from disk as per-rank hyperslabs. These leading storage terms do not bound the complete live set; see the [cluster memory guidance](../using/clusters.md#budget).
 {: .intro }
 
 ### <span class="n">6.1</span> The budget {: #par-mem-budget }
 
-`runtime.planner_budget_bytes`
+`lxkit.memory.resolve`
 {: .in-code }
 
-From the card's memory $M$ and the bytes $O$ held outside XLA's pool (3 GB, plus 3 GB under `linalg = distributed`):
+Let $L$ be the allocator's enforced limit where available. Otherwise it is the card's memory $M$ less the larger of observed outside usage and the platform's outside allowance. With pending provider contexts $O_{\mathrm{pend}}$ not already withheld from $L$, the platform's reserve fraction $r$, and the ordered-reduction transient $T_{\mathrm{ord}}$:
 
 $$
-B = \frac{M - 1.2\,O}{1 + 1.2\cdot0.19} - T_{\mathrm{ord}} \tag{6.1}
+B = (L-O_{\mathrm{pend}})(1-r)-T_{\mathrm{ord}} \tag{6.1}
 $$
 
-bounded by the pool reservation and by $M/4$ from below; $T_{\mathrm{ord}}$ = 16 MiB. The minimum over processes is used, so every rank plans the same shapes. A positive [`memory_per_device_gb`](../drivers/gw/keywords.md#memory_per_device_gb) can only lower $B$; a larger value warns and is ignored. On an A100-40GB, $B$ = 31.6 GB (`local`).
+The default $T_{\mathrm{ord}}$ is 16 MiB. The minimum over processes is used, so every rank plans the same shapes. Outside allowances and reserve fractions are planning inputs, not constant physical peaks. A positive [`memory_per_device_gb`](../drivers/gw/keywords.md#memory_per_device_gb) can only lower $B$; a larger value warns and is ignored. The A100-40GB example is $B$ = 31.6 GB (`local`) under its default-model assumptions; the resolved report value takes precedence.
 
 ### <span class="n">6.2</span> The fixed tile {: #par-mem-tile }
 

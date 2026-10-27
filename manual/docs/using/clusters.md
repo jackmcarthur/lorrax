@@ -20,6 +20,8 @@ The planners share one budget per device. Leave [`memory_per_device_gb`](../driv
 | A100-40GB | 31.6 GB | 28.7 GB |
 | A100-80GB | 66.4 GB | 63.4 GB |
 
+These rounded A100 planning examples use the default-model allowances. The resolved budget depends on the installed platform and live outside usage; the run report takes precedence.
+
 GB means decimal GB throughout this page. On CPU, the budget starts from node memory divided among its ranks. Increasing ranks on one node divides the arrays but also adds a Python/JAX runtime, compiled programs and host staging per rank. Compare the node's combined host usage as well as the largest rank.
 
 Read `TIMING` and the pool/host peaks in `gwjax.out`, together with the `ISDF μ-batch plan`, selected routes and any `memory over budget` warnings. Verbose reports include the detailed stage-memory, price and sizing receipts. A planner can fill the available budget to run a wider batch: its observed peak is not the minimum memory required by that input. When no route fits, admission warns and selects the least-memory available route; it does not guarantee the allocation will succeed. A compiled executable larger than the device refuses before execution.
@@ -44,7 +46,7 @@ For many-band runs, inspect the wavefunction route too. A two-axis distribution 
 
 ## Local or distributed linear algebra {: #linalg }
 
-The deck key `linalg` (default `local`) requests the layout of dense solves. Under `local` each GPU solves whole $N_\mu\times N_\mu$ matrices for its share of the irreducible q points, with no distributed factorization; under `distributed` each matrix is factored over the whole mesh (cuSOLVERMp), which divides its memory by $P$ but communicates inside every factorization.
+The deck key `linalg` (default `local`) requests the layout of dense solves. The shared solver plan chooses among available local and mesh providers using their memory prices and, where qualified, timing models. Local rounds assign whole $N_\mu\times N_\mu$ matrices to individual devices; mesh solves divide the matrix storage over $P$ and communicate within the factorization. The provider depends on the platform; read the selected route in the report.
 
 `local` is a request, not a guarantee. For a W Dyson batch of $Q$ stored q rows, the local-route model includes the face-tiled V, χ and W plus whole copies for $\lceil Q/P\rceil$ q points and one LU pair,
 
