@@ -22,7 +22,46 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-__all__ = ["largest_divisor", "pad_with_sentinels", "cyclic_to_block"]
+__all__ = ["largest_divisor", "pad_with_sentinels", "cyclic_to_block", "face_crop"]
+
+
+def face_crop(q, n: int, *, offsets, mesh):
+    """Crop a distributed matrix face through two dependent local-tile rings.
+
+    Output ``[..., i, j]`` is input ``[..., i+offsets[0], j+offsets[1]]``.
+    The row ring feeds the column ring inside one manual region; no implicit
+    pad-to-logical reshard or bank of all columns is required. Local callers
+    retain the ordinary slice. Both input and output extents divide the mesh.
+    """
+    row, column = offsets
+    if n < 0 or row < 0 or column < 0 or row+n > q.shape[-2] or column+n > q.shape[-1]:
+        raise ValueError("matrix crop lies outside the input")
+    if mesh is None:
+        return q[..., row:row+n, column:column+n]
+    from jax.sharding import PartitionSpec as P
+    from lxkit import permute_rows_local
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    if n % px or n % py:
+        raise ValueError("matrix crop extent must divide both mesh axes")
+    if q.shape[-2:] == (n, n) and offsets == (0, 0):
+        return q
+    spec = P(*((None,) * (q.ndim-2)), 'x', 'y')
+    @jax.shard_map(mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False)
+    def crop(tile):
+        if n == 0:
+            return jnp.zeros(tile.shape[:-2] + (0, 0), tile.dtype)
+        def rows(block, offset, axis, parts):
+            shape = block.shape
+            packed = block.reshape((-1,) + shape[-2:])
+            source = jnp.broadcast_to((jnp.arange(n, dtype=jnp.int32)+offset)[None, :],
+                                      (packed.shape[0], n))
+            selected = permute_rows_local(packed, source, mesh_axis=axis,
+                                          parts=parts, is_local=parts == 1)
+            return selected.reshape(shape[:-2] + (n//parts, shape[-1]))
+        cropped = rows(tile, row, 'x', px)
+        cropped = rows(jnp.swapaxes(cropped, -1, -2), column, 'y', py)
+        return jnp.swapaxes(cropped, -1, -2)
+    return crop(q)
 
 
 def largest_divisor(local: int, cap: int) -> int:

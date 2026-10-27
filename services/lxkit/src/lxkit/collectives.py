@@ -280,15 +280,22 @@ def permute_rows_local(current, source_map, *, mesh_axis, parts, is_local):
     """Select distributed rows inside a manual region with one local bank.
 
     ``current[q, row_local, ...]`` keeps all spectator axes. ``source_map``
-    is ``[q, global_row]``: output row j takes input row source_map[q,j].
+    is ``[q, output_row]``: output row j takes input row source_map[q,j].
+    The output extent may differ from the input; both divide ``parts``.
     The ring visits every owner while retaining only local input/output
     banks. ``is_local`` is an existing caller's locality certificate.
     """
     import jax
     import jax.numpy as jnp
     nlocal = int(current.shape[1])
+    if source_map.shape[1] % parts:
+        raise ValueError("row transport output extent must divide the mesh axis")
+    target = int(source_map.shape[1]) // parts
+    output = jnp.zeros((current.shape[0], target) + current.shape[2:], current.dtype)
+    if target == 0:
+        return output
     owner = jax.lax.axis_index(mesh_axis)
-    sources = jax.lax.dynamic_slice_in_dim(source_map, owner*nlocal, nlocal, axis=1)
+    sources = jax.lax.dynamic_slice_in_dim(source_map, owner*target, target, axis=1)
     shape = sources.shape + (1,)*(current.ndim-2)
     offsets = (sources % nlocal).reshape(shape)
     pairs = [(i, (i+1) % parts) for i in range(parts)]
@@ -303,7 +310,7 @@ def permute_rows_local(current, source_map, *, mesh_axis, parts, is_local):
                 lambda a: jax.lax.ppermute(a, mesh_axis, pairs), lambda a: a, held)
         return (held, output), None
 
-    (_, output), _ = jax.lax.scan(step, (current, jnp.zeros_like(current)),
+    (_, output), _ = jax.lax.scan(step, (current, output),
         jnp.arange(1 if is_local else parts), unroll=1)
     return output
 

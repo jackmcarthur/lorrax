@@ -5,6 +5,15 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-27 — Own padded EIGH output crops
+
+Distributed ELPA and cuSOLVERMp crop padded eigenvectors through the shared
+row transport, with a row ring feeding a column ring. Eigenvalue order and
+eigenvector entries are unchanged; local callers retain ordinary slices.
+This trades narrow compiler halos for uniform local-tile exchanges whose
+cost is included in the actual executable. No deck, backend or native ABI
+changes; the existing ABI 15 pair is reused.
+
 ## 2026-10-27 — Bound EIGH column restoration
 
 Checked distributed EIGH now streams eigenvector columns when restoring

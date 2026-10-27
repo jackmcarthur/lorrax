@@ -29,7 +29,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la import loader
 from distrib_la._collectives import broadcast_bytes
-from distrib_la._cyclic import cyclic_to_block, largest_divisor, pad_with_sentinels
+from distrib_la._cyclic import cyclic_to_block, face_crop, largest_divisor, pad_with_sentinels
 from distrib_la._shape import ipiv_local_len
 from jax import shard_map
 from distrib_la.resolve import mesh_key
@@ -350,7 +350,7 @@ def solve_layout(n: int, p: int) -> tuple[int, int]:
     return p * padded, _largest_block(padded)
 
 
-def drop_sentinels(W, Q, n: int):
+def drop_sentinels(W, Q, n: int, *, mesh=None):
     """The ``n`` live eigenpairs of a :func:`pad_with_sentinels` solve, raw layout.
 
     The sentinels are the ``side - n`` lowest eigenvalues; ``Q``'s rows are
@@ -358,7 +358,7 @@ def drop_sentinels(W, Q, n: int):
     rows, of which the first ``n`` are ``a``'s.
     """
     side = int(W.shape[-1])
-    return W[side - n:], Q[side - n:, :n]
+    return W[side - n:], face_crop(Q, n, offsets=(side-n, 0), mesh=mesh)
 
 
 def retry_block(n: int, p: int) -> int | None:
@@ -542,7 +542,7 @@ def distributed_eigh(
         def _padded(a):
             whole = jax.lax.with_sharding_constraint(pad_with_sentinels(a, side), face)
             W, Q = _call(whole)
-            W, Q = drop_sentinels(W, Q, n)
+            W, Q = drop_sentinels(W, Q, n, mesh=mesh)
             return W, jax.lax.with_sharding_constraint(Q, face)
 
         # NO donate_argnums / input_output_aliases, deliberately: this

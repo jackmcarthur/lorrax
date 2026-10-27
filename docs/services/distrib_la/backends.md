@@ -194,6 +194,15 @@ input/output tiles and the existing index vector, rather than gathering
 all columns of a row block. Stable eigenvalue order and eigenvector values
 are unchanged; the actual executable includes this transport in its price.
 
+Dropping a native eigensolver's sentinel padding uses the same row transport:
+one row ring feeds one column ring inside a manual region. ELPA crops its
+true-column vectors at `(0, side-n)`; cuSOLVERMp crops its raw row vectors
+at `(side-n, 0)`. The replicated eigenvalue slice stays local. The transport
+holds local input/output faces and linear index metadata, including unequal
+input/output tile widths. It exchanges more data than a narrow compiler halo;
+whole-solve timing must assess that cost. Local callers keep ordinary slices.
+This explicit dependency is not a guarantee against vendor runtime stalls.
+
 ## Distributed is a capacity route {#capacity-route}
 
 ### The size route (ROCm) {#size-route}
