@@ -142,3 +142,51 @@ def test_distributed_elpa_prices_its_arena_once_and_local_routes_keep_scratch(mo
                 assert workspace.workspace_bytes_per_rank(policy,'eigh',((n,n),),dtype)>0
     finally:
         workspace.local_eigh_workspace.cache_clear()
+
+
+def test_checked_workspace_prices_only_admitted_gathered_retry(monkeypatch):
+    """Real gathered-program price and room boundary; provider queries are metadata-only.
+
+    The CPU compiler supplies the actual gathered executable's buffer price.
+    An already-resolved ELPA/Mp Plan and their scratch-query surfaces stand in
+    for the GPU libraries, without executing a solver or allocating its fields.
+    Neither gathered eligibility nor its compiled price is mocked.
+    """
+    from dataclasses import replace
+    import jax
+    from jax.sharding import Mesh
+    from distrib_la import plan, workspace, _cusolvermp
+    from distrib_la.plan import (_gathered_admitted, _gathered_program, compiled_bytes,
+                                 GATHERED_EIGH_BYTES)
+
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1,1), ('x','y'))
+    n = 2048
+    # Distinguish the distributed and local CUDA query, including a primary
+    # workspace larger than its retry: the two solves run sequentially.
+    monkeypatch.setattr(_cusolvermp, 'get_or_init_context', lambda _mesh: 17)
+    primary = [512]
+    monkeypatch.setattr(workspace, '_vendor_query',
+                        lambda ctx, *_args: (primary[0] if ctx else 4096, 0))
+    try:
+        for platform, provider in (('ROCM','elpa'), ('CUDA','cusolvermp')):
+            monkeypatch.setattr(workspace, 'mesh_platform', lambda _mesh: platform)
+            workspace.local_eigh_workspace.cache_clear()
+            for dtype in (np.float64, np.complex128):
+                native = plan('eigh', mesh, n=n, backend='off', batched_route='auto')
+                extra = workspace.local_eigh_workspace(mesh, 1, n, dtype)
+                need = compiled_bytes(_gathered_program(mesh), mesh, (n,n), dtype) + extra
+                assert need > GATHERED_EIGH_BYTES  # otherwise room cannot exclude this retry
+                for room in (need-1, need):
+                    policy = replace(native, requested='distributed', backend=provider,
+                                     budget_bytes=room)
+                    included = room == need
+                    assert _gathered_admitted(mesh, (n,n), dtype, room) == included
+                    for primary[0] in (512, 65536):
+                        first = 0 if platform == 'ROCM' else primary[0]
+                        assert workspace.workspace_bytes_per_rank(
+                            policy, 'eigh', ((n,n),), dtype) == first
+                        assert workspace.workspace_bytes_per_rank(
+                            policy, 'eigh', ((n,n),), dtype, checked=True) == (
+                                max(first, extra) if included else first)
+    finally:
+        workspace.local_eigh_workspace.cache_clear()

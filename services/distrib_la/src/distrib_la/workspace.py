@@ -276,7 +276,7 @@ def workspace_bytes_per_rank(plan, op, shapes, dtype, *, checked=False) -> int:
         the query allocates no matrix, result or queried workspace buffer.
     """
     need = int(_workspace_details(plan, op, shapes, dtype)['device_bytes'])
-    if checked and op == 'eigh' and mesh_platform(plan.mesh) == 'CUDA' and not plan.is_native:
+    if checked and op == 'eigh' and mesh_platform(plan.mesh) in ('CUDA', 'ROCM') and not plan.is_native:
         from distrib_la.plan import _gathered_admitted
         n = int(shapes[0][-1])
         if _gathered_admitted(plan.mesh, (n, n), dtype, plan.budget_bytes):
