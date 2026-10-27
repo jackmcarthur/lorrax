@@ -273,6 +273,12 @@ beside its layout copies and outputs; callers do not add a separate estimate.
 This does not change the one-device solve's capacity or provide a distributed
 ROCm LU backend.
 
+The opt-in ROCm fused outer decode is also outside complete workspace coverage.
+The default measured rule keeps the XLA decode because the fused version was
+slower. With `LORRAX_KDFT_OUTER=all`, its phase-slot scratch is not included in
+the compiled quote or a provider query ([kernel owner](kconv.md#bse-outer)).
+An executable price under that override is not a complete capacity certificate.
+
 ### Why the pool's reserved bytes run past R {#pool-growth}
 
 XLA's allocator issues `cuMemAllocFromPoolAsync` and `cuMemFreeAsync` on one

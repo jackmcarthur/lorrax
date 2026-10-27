@@ -714,6 +714,13 @@ fused decode measured 0.33–0.60× the outer load + XLA decode einsum, so the B
 fit (the gate's and the bench's A/B). Beating the chain at $N_k \ge 64$ needs a denser load: the
 kdft register pass (lines in VGPRs, LDS only for the axis exchange) or an MFMA K sum.
 
+The opt-in fused ROCm decode allocates phase slots and item counters through
+`ScratchAllocator` when `plan_phases` selects more than one phase. These buffers
+have neither an explicit FFI result nor a workspace query, so they are absent
+from its compiled memory quote. The default measured rule does not select this
+handler; opting in does not establish complete workspace coverage
+([pricing limits](memory-model.md#pricing-coverage)).
+
 ## 12. Cost {#cost}
 
 Each transform costs $O(n_{\rm col}N_k\log N_k)$ flops. HBM traffic is one
