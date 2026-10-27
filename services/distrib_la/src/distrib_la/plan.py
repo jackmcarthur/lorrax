@@ -1183,8 +1183,9 @@ class Plan:
             f"GATE eigh_capacity_route: {what} needs the whole-mesh (capacity) "
             f"eigh, and the {px}x{py} {mesh_platform(self.mesh)} mesh has none "
             f"({self.capacity_refusal}).  The 'auto' eigh runs whole matrices "
-            f"per rank (route (c)) only where they fit the room.  Fix: more "
-            f"ranks or a larger memory_per_device_gb so route (c) fits, or a "
+            f"per rank (route (c)) only where they fit the room.  More ranks "
+            f"can reduce the batch per rank, but not one whole matrix's memory floor.  "
+            f"Fix: fewer states per matrix, a larger memory_per_device_gb, or a "
             f"leg that carries the platform's distributed eigh.")
 
     @property

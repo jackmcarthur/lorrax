@@ -252,8 +252,10 @@ second measured pool allowance. A stack uses local ROCm eigensolver scratch
 only when its resolved route runs matrices locally; a leading batch dimension
 alone does not select that scratch. Local rocSOLVER/JAX scratch still needs its
 separate workspace price. ELPA's small retained allocations, context resources
-and any fallback beyond its empirical pool remain outside the compiled arena;
-the platform outside allowance and native allocation counters are separate from
+and any fallback beyond its empirical pool remain outside the compiled arena.
+A checked EIGH includes local gathered-retry scratch on CUDA and ROCm only when
+that retry is admitted; sequential primary and retry scratch use their maximum.
+The platform outside allowance and native allocation counters are separate from
 the executable quote. Neither quote nor allowance is a general capacity proof.
 
 `ZetaG.contract_v` records its actual compiled G-tile step or face chain,
