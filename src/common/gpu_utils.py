@@ -33,17 +33,22 @@ def resolve_device_budget_gb(deck_gb: float = 0.0, linalg: str = "local") -> flo
     """THE run budget in decimal GB per device, recorded once in ``lxkit.memory``
     (:func:`lxkit.memory.resolve`): the card total and the bytes outside the allocator now
     from this process's leg readers; CPU: ``MemTotal`` over the processes on the node.
-    Every process must enter."""
+    CPU room also follows live cgroup-aware available RAM beside non-JAX
+    consumers. Every process must enter."""
     import jax
     from lxkit import memory
+    available = None
     if jax.default_backend() == "cpu":
-        total, outside = (_meminfo_gb("MemTotal") or 0.0) * 1e9 / _processes_on_this_node(), 0
+        processes = _processes_on_this_node()
+        total, outside = (_meminfo_gb("MemTotal") or 0.0) * 1e9 / processes, 0
+        devices = max(1, jax.local_device_count())
+        available = lambda: (_meminfo_gb("MemAvailable") or 0.0) * 1e9 / (processes * devices)
     else:
         from runtime.xla_memory import device_total_bytes, outside_pool_bytes
         ordinal = int(getattr(jax.local_devices()[0], "local_hardware_id", 0) or 0)
         total, outside = device_total_bytes(ordinal), outside_pool_bytes(ordinal)
     return memory.resolve(float(deck_gb or 0.0) * 1e9, str(linalg), total=total,
-                          outside=outside,
+                          outside=outside, available=available,
                           agree=lambda v: minimum_process_budget_gb(v / 1e9) * 1e9) / 1e9
 
 

@@ -105,7 +105,7 @@ _ROUTES: dict = {}       # (site, route, reason) -> row
 _DOOMED: dict = {}       # stage -> its over-the-limit banner, repeated when it opens
 _WARNED: dict = {}       # stage kind -> the largest need warned
 _FINDINGS: list = []
-_HOOK: dict = {"sink": None, "agree": None}
+_HOOK: dict = {"sink": None, "agree": None, "available": None}
 _I = dict(source=None, lib=None, handle=None, device=None, mark=-1, poll=-1, live=-1, reads=0, s=0.0)
 _T: dict = {"on": False, "wrote": False, "exe": {}, "last": None, "born": {}}
 _LOCK = threading.Lock()
@@ -595,11 +595,13 @@ def enforced(stats) -> bool:
 
 
 def resolve(deck_bytes: float = 0.0, linalg: str = "local", *, total: Optional[float] = None,
-            outside: Optional[float] = None, agree: Optional[Callable] = None) -> float:
+            outside: Optional[float] = None, agree: Optional[Callable] = None,
+            available: Optional[Callable[[], float]] = None) -> float:
     """THE run budget per device (every process enters): limit = an enforced ``bytes_limit``,
     else ``total`` less what is ``outside`` (>= the leg's allowance), CPU the host share; budget
     = (limit - pending contexts) x (1 - reserve) - T_ord, the minimum over processes (``agree``),
-    never above a positive deck value."""
+    never above a positive deck value. On CPU, ``available`` reads current host
+    bytes per local device, including non-JAX consumers, without a collective."""
     import jax
     from lxkit import ordered_transient_bytes
     _HOOK["agree"] = agree
@@ -621,6 +623,11 @@ def resolve(deck_bytes: float = 0.0, linalg: str = "local", *, total: Optional[f
     reset()
     set_budget(min(deck, rule) if deck > 0 else rule, limit_bytes=lim, linalg=linalg,
                per_node=int(getattr(leg, "node_devices", 1)), platform=str(getattr(device, "device_kind", "") or "cpu"))
+    # A smaller user deck limits JAX allocations, not physical host capacity.
+    # Withhold only the platform reserve from the live host reader.
+    host_reserve = max(0.0, lim - rule)
+    _HOOK["available"] = ((lambda: float(available()) - host_reserve)
+                          if available is not None and (leg is None or not leg.accelerator) else None)
     return float(_RUN["budget"])
 
 
@@ -631,6 +638,7 @@ def set_budget(budget: float, *, limit_bytes: Optional[float] = None, per_node: 
     _RUN.clear()
     _RUN.update(limit=lim, budget=float(budget), reserve=max(0.0, lim - float(budget)),
                 linalg=str(linalg), per_node=int(per_node), platform=str(platform))
+    _HOOK["available"] = None
 
 
 def run() -> dict:
@@ -641,7 +649,10 @@ def run() -> dict:
 
 def room(*, bucketed: bool = True) -> int:
     """limit - reserve - bytes in use, the minimum over processes (all enter), :func:`bucket`-ed."""
-    left = int(_agree(max(0.0, float(_RUN["budget"]) - _in_use())))
+    left = float(_RUN["budget"]) - _in_use()
+    if _HOOK["available"] is not None:
+        left = min(left, float(_HOOK["available"]()))
+    left = int(_agree(max(0.0, left)))
     return bucket(left) if bucketed else left
 
 
@@ -791,3 +802,5 @@ def reset(*, run: bool = False) -> None:
     """Forget the run's records (a new run in this process); ``run``: its figures too."""
     for table in (_RECEIPTS, _PENDING, _ROUTES, _PLANNED, _DOOMED, _WARNED, _FINDINGS) + ((_RUN,) if run else ()):
         table.clear()
+    if run:
+        _HOOK["available"] = None

@@ -302,8 +302,9 @@ def _fit_mubatch(
         stage="zeta route-G mu batch, plane blocks")
     # The stage's price: the batch executable's compiled figure beside the resident set (the
     # analytic working set only chose the chunk).
-    memory.book(memory.priced(compiled_new_bytes(batch_executable, extra=int(
-        batch_executable.memory_analysis().output_size_in_bytes)),
+    fit_new_bytes = compiled_new_bytes(batch_executable, extra=int(
+        batch_executable.memory_analysis().output_size_in_bytes))
+    memory.book(memory.priced(fit_new_bytes,
         "route-G mu batch executable (memory_analysis + FFT plans + outputs)", increment=True))
     if n_run != n_blk:
         kern_args = dict(kern_args, n_blk=n_run)
@@ -322,6 +323,14 @@ def _fit_mubatch(
     # Compilation and WFN loading may have consumed the proposal's host headroom.
     from common.gpu_utils import host_bytes_per_process
     host_budget = min(plan.host_budget_bytes, host_bytes_per_process(_ZSTORE_HOST_FRAC))
+    if jax.default_backend() == 'cpu':
+        # NumPy stores share CPU RAM with the pre-admitted batch; their pages
+        # commit only as it writes, so a later live-room read alone is too late.
+        from runtime.aot_memory import agreed_chunk
+        devices = jax.local_device_count()
+        fit_host_bytes = -agreed_chunk(-int(fit_new_bytes) * devices)
+        host_budget = max(0.0, min(host_budget, memory.room(bucketed=False) * devices)
+                          - fit_host_bytes)
     store_bytes, placement = zstore_layout(
         Q, int(mb.n_batch) * b, int(g_axis.carrier), n_vertex=len(vertices),
         n_ranks=P_, host_budget_bytes=host_budget)

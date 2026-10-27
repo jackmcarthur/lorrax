@@ -43,8 +43,7 @@ import distrib_la
 from common.collectives import (process_count, process_rank, psum_replicate,
                                 single_device_mesh)
 from common.log import get_logger
-from common.gpu_utils import device_budget_bytes
-from lxkit import memory
+from common.gpu_utils import device_budget_bytes, resolve_device_budget_gb
 from file_io import CrystalData
 from file_io.qp_wfn import write_complete_wfn_h5
 from psp.dft_operators import dense_matrix_k, setup_H_k_from_kvec
@@ -176,8 +175,7 @@ def main():
                         help="QE's noncollinear GGA branch (magnetic runs; "
                              "the .save does not record it)")
     args = parser.parse_args()
-    if args.memory_per_device_gb:
-        memory.set_budget(float(args.memory_per_device_gb) * 1e9)
+    resolve_device_budget_gb(args.memory_per_device_gb or 0.0)
     run_dense_h(args.save, args.wfn, args.output, sys_dim=args.sys_dim,
                 pseudo_dir=args.pseudo_dir, nbands=args.nbands,
                 nc_gga_branch=args.nc_gga_branch)
