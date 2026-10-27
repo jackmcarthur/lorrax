@@ -154,6 +154,8 @@ static ffi::Error device_handle(DeviceHandle** out) {
     if (!slot) {
         auto d = std::make_unique<DeviceHandle>();
         LORRAX_LIB_CHECK(api().create_handle(&d->h), 0, "rocblas_create_handle");
+        // No default managed reserve beside the explicitly sized call arena.
+        LORRAX_LIB_CHECK(api().set_workspace(d->h, nullptr, 0), 0, "rocblas_set_workspace(initialize)");
         slot = std::move(d);
     }
     *out = slot.get();
