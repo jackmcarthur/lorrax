@@ -50,9 +50,10 @@
 // moved: never a silent result.
 //
 // Threads: ELPA's OpenMP regions run with omp_threads = the process's CPU
-// affinity count for float64 and 1 for complex128 (the configuration measured and
-// gated; ELPA_ROCM_REPORT.md).
+// affinity count capped by its OpenMP runtime's maximum for float64, and 1 for
+// complex128 (the configuration measured and gated; ELPA_ROCM_REPORT.md).
 #include "../common/ctx_registry.h"
+#include "../common/mkl_thread_pin.h"
 
 #include <sched.h>
 #include <unistd.h>
@@ -234,10 +235,16 @@ static std::once_flag g_init;
 static int g_init_status = ELPA_ERROR;
 
 static int affinity_threads() {
+    using max_threads_fn = int (*)();
+    static const auto get_max = reinterpret_cast<max_threads_fn>(
+        lorrax_ffi::mklpin::resolve_sym("omp_get_max_threads"));
+    // ELPA validates this option against its OpenMP maximum, not CPU affinity.
+    // With no mapped query, retain ELPA's sequential default.
+    const int maximum = get_max ? std::max(1, get_max()) : 1;
     cpu_set_t set;
     CPU_ZERO(&set);
-    if (sched_getaffinity(0, sizeof(set), &set) != 0) return 1;
-    return std::max(1, CPU_COUNT(&set));
+    if (sched_getaffinity(0, sizeof(set), &set) != 0) return maximum;
+    return std::max(1, std::min(maximum, CPU_COUNT(&set)));
 }
 
 static std::string set_int(elpa_t h, const char* k, int v) {

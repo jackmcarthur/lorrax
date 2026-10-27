@@ -5,6 +5,15 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-27 — Respect the OpenMP limit in real ELPA solves
+
+Rebuild and seal the whole native pair to pick up the ROCm ELPA correction.
+Real eigensolves now cap their host thread request by both CPU affinity and
+the loaded OpenMP runtime's maximum. A launch with seven OpenMP threads and
+fourteen hardware threads in its affinity mask previously refused at handle
+setup. Complex solves retain their existing one-thread setting. ABI 15,
+handler signatures, input decks and mathematical conventions are unchanged.
+
 ## 2026-10-27 — Rebuild native libraries for visible local EIGH workspace
 
 Rebuild and seal the whole native pair for ABI 15. The qualified ROCm
