@@ -1,5 +1,5 @@
 {
- "about": "Measured per-stage device peaks (GB per rank, max over ranks; allocator high-water of each LORRAX_MEMORY_TRACE section) of GN-PPM runs on one 4xA100-80GB node, for gw.stage_inventory. Keys are inventory stages; the trace section each came from is in tests/test_stage_inventory_calibration.py.",
+ "about": "Measured per-stage device peaks (GB per rank, max over ranks; allocator high-water of each LORRAX_MEMORY_TRACE section) of GN-PPM and tangential runs on one 4xA100-80GB node, for gw.stage_inventory. Keys are inventory stages; the trace section each came from is in tests/test_stage_inventory_calibration.py.",
  "runs": [
   {
    "name": "MoS2/hBN 148 atoms, 3264 bands, N_mu 16320",
@@ -129,6 +129,41 @@
     "Sigma other": 11.9,
     "Sigma Hartree": 5.89,
     "Coulomb all-q validation": 38.98
+   }
+  },
+  {
+   "name": "Al2O3 10 atoms 4x4x4, 154 bands, N_mu 6000, tangential",
+   "P": 4,
+   "linalg": "local",
+   "source": "claude/planner-accuracy (main 93c2d320e)",
+   "deck": {
+    "nk": 64,
+    "n_parent": 13,
+    "nq": 13,
+    "ns": 1,
+    "nb": 154,
+    "nb_qp": 30,
+    "ng": 7128,
+    "fft": [
+     60,
+     60,
+     60
+    ],
+    "nmu": 6000,
+    "kgrid": [
+     4,
+     4,
+     4
+    ],
+    "trs": true,
+    "sys_dim": 3,
+    "validation_width": 64,
+    "n_pole": 5224
+   },
+   "measured": {
+    "Sigma tau sweep (tangential)": 35.07,
+    "Sigma exchange": 5.12,
+    "Sigma Hartree": 4.03
    }
   }
  ]
