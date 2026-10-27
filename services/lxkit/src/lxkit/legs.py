@@ -58,7 +58,6 @@ Stdlib-only, like the rest of :mod:`lxkit`.
 from __future__ import annotations
 
 import glob
-import math
 import os
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -296,12 +295,6 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         memory_reserve=0.18567,
         node_devices=8,                  # Frontier node: 4 MI250X, 8 GCDs
         peak_reader="bfc",
-        vendor_rows=(
-            (("elpa", "eigh"), MeasuredRow(
-                1.0, lambda n, p, item: (24.0 if item == 16 else 16.0) * (n / math.isqrt(p)) ** 2
-                + 2048.0 * n / math.isqrt(p), "(24|16) (N/p)^2 + 2048 N/p", p=(4, 16),
-                source="ELPA 2026.02.001 allocator-hook high-water, MI250X P 4 and 16 "
-                       "(ELPA_ROCM_REPORT.md, table pool)")),),
         outside_pool_api="hip_runtime_arena",
         collective_library="rccl", collective_net_plugin="librccl-net.so",
         # rocprofv3 --kernel-trace deadlocks RCCL at P=4 (Screening lane, 2026-10-14).
