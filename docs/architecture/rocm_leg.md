@@ -123,13 +123,18 @@ windows:
   eigenvalues and eigenspaces against `jnp.linalg.eigh` on the same GCD,
   1e-12).
 
-Single-GCD complex128 LU from rocSOLVER returned wrong solutions at n = 12288 and
-16384 (residual ~8e-3) with no error raised. It was exact at n ≤ 11616, hence
-`ONE_DEVICE_MAX_N` LU = 8192 (`distrib_la.resolve`).
+Whole-matrix LU uses the one-device capacity route (`distrib_la.resolve`).
+When either A or its RHS spans more than 2³¹ bytes, `distrib_la.local_lu`
+uses rocSOLVER factorization followed by a blocked rocBLAS triangular solve;
+this avoids the offset defect in the unblocked solve. The native handler's
+queried workspace and pivot buffer are explicit XLA results. ROCm has no
+distributed LU provider: the route refuses when one complete solve cannot fit
+the caller's room. The 8192 row is a round-size preference, not an accuracy
+or maximum-size bound.
 
-**CUDA twin.** None needed: jaxlib's cuSOLVER behind `jnp.linalg.eigh`
-(`families` row `rocsolver`, CUDA `xla`). CUDA has no `ONE_DEVICE_MAX_N` row
-yet, so its small distributed eighs and LUs go to cuSOLVERMp.
+**CUDA twin.** Local eigensolves and LU solves use jaxlib's cuSOLVER
+(`families` row `rocsolver`, CUDA `xla`). The room-based capacity route and
+cuSOLVERMp serve the local and distributed placements respectively.
 
 ## 4 Active subspace on the device {#active-subspace}
 
