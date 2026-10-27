@@ -332,17 +332,24 @@ def _executable(program, args):
 #: 8192 x4 2.05 / 6.53 s, 16384 x4 13.7 / 29.0 s. ROCM = MI250X, P4 B1 owned
 #: Householder fixture, max rank of two warm checked calls, rounded up (2026-10-27).
 #: Its small anchors include about 50 ms of capture/control overhead, not isolated provider
-#: time. float64 uses the complex128 row; its 8192/16384 crossover was checked separately.
-#: Platforms without a row decide by memory alone (route (c) where it fits).
-_EIGH_SECONDS = {"CUDA": {"one": ((312, 0.022 / 16), (8192, 2.05), (16384, 13.7)),
-                          "mesh": ((312, 1.97 / 64), (8192, 6.53 / 4), (16384, 29.0 / 4))},
-                 "ROCM": {"one": ((256, .053468), (2048, .185800), (3120, .365155),
-                                  (4096, .858695), (8192, 6.455992), (16384, 42.510331)),
-                          "mesh": ((256, .100177), (2048, .433320), (3120, .753626),
-                                   (4096, 1.042569), (8192, 3.251526), (16384, 14.051309))}}
+#: time. ROCM float64 has separate measured points: its crossover is later than complex128.
+#: CUDA's historical all-dtype row is retained. Unmeasured platform/dtype pairs decide by memory.
+_EIGH_SECONDS = {"CUDA": {"*": {
+                    "one": ((312, 0.022 / 16), (8192, 2.05), (16384, 13.7)),
+                    "mesh": ((312, 1.97 / 64), (8192, 6.53 / 4), (16384, 29.0 / 4))}},
+                 "ROCM": {"complex128": {
+                    "one": ((256, .053468), (2048, .185800), (3120, .365155),
+                            (4096, .858695), (8192, 6.455992), (16384, 42.510331)),
+                    "mesh": ((256, .100177), (2048, .433320), (3120, .753626),
+                             (4096, 1.042569), (8192, 3.251526), (16384, 14.051309))},
+                          "float64": {
+                    "one": ((4096, .434840), (5120, .650189), (6144, 1.007133),
+                            (8192, 2.856915), (16384, 23.574720)),
+                    "mesh": ((4096, .860289), (5120, 1.133111), (6144, 1.448096),
+                             (8192, 2.296368), (16384, 8.148589))}}}
 
 
-def _eigh_seconds(kind, n, ranks=4, platform="CUDA"):
+def _eigh_seconds(kind, n, ranks=4, platform="CUDA", dtype=np.complex128):
     """Expected seconds of one n x n eigh, ``kind`` 'one' (one device) or 'mesh' (``ranks``), or
     None without a measured row: the points log-log interpolated, n^3 past the last, the fixed
     cost below the first. On P <= 4 the mesh's part above its fixed cost scales as 4/P. On P > 4
@@ -350,7 +357,8 @@ def _eigh_seconds(kind, n, ranks=4, platform="CUDA"):
     growth beyond t(16384) scales as 4/P,
     so the curve is continuous (n 100000 at P16: 417 s predicted, 312 s measured, eighmem
     2026-10-18)."""
-    pts = _EIGH_SECONDS.get(str(platform), {}).get(kind)
+    rows = _EIGH_SECONDS.get(str(platform), {})
+    pts = rows.get(np.dtype(dtype).name, rows.get("*", {})).get(kind)
     if pts is None:
         return None
     t = pts[-1][1] * (n / pts[-1][0]) ** 3 if n > pts[-1][0] else pts[0][1]
@@ -430,7 +438,7 @@ def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all", *,
             price = (_stack_bytes(op, mesh, nb, n, dtype, rounds, phase, gathered)
                      + local_eigh_workspace(mesh, tried, n, dtype, batched=True))
             if room_test(lambda r, p=price: p <= r, room):
-                one, on_mesh = (_eigh_seconds(k, n, ranks, platform) for k in ("one", "mesh"))
+                one, on_mesh = (_eigh_seconds(k, n, ranks, platform, dtype) for k in ("one", "mesh"))
                 if (not whole_mesh_available or one is None
                         or -(-nb // ranks) * one <= nb * on_mesh):
                     return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, price, room)

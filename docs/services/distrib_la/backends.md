@@ -275,10 +275,13 @@ stack route. A room-bearing `auto` plan with `batched_route="auto"` uses
 `plan._EIGH_SECONDS`: it compares `ceil(B/P)` local solves with `B` mesh solves.
 The ROCm MI250X P4 complex128 anchors span 256–16384, including about 50 ms of
 diagnostic capture/control cost at the small end. Batch-one ELPA was about
-2–3 times faster at 8192/16384; local solves won through 4096. Float64 shares
-that approximate timing row, with the same large-side winners checked after
-the real ELPA thread-cap repair. This estimates selection cost, not isolated
-provider throughput. The existing conservative P>4 model is retained. ELPA's
+2–3 times faster at 8192/16384; local solves won through 4096. Float64 has its
+own measured row: local solves won through 6144 and ELPA at 8192/16384 after
+the real ELPA thread-cap repair. Below its first 4096 anchor the fixed-cost
+floor favors local solves; unmeasured ROCm float32/complex64 use memory-only
+placement. CUDA retains its historical all-dtype approximation. This estimates
+selection cost, not isolated provider throughput. The existing conservative
+P>4 model is retained. ELPA's
 small, fallback and context allocations remain outside its compiled arena
 ([native workspace coverage](../../architecture/memory-model.md#measured)).
 

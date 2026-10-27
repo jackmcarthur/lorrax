@@ -1,5 +1,7 @@
 """Capacity eigensolves keep the shared provider window and active semantics."""
 import runtime  # noqa: F401
+from runtime.source_closure import ensure_source_closure
+ensure_source_closure()
 import numpy as np
 
 
@@ -247,6 +249,11 @@ def test_measured_stack_placement_keeps_batches_and_unavailable_provider_local(m
                     policy = pm.plan('eigh', mesh, backend='auto', n=n,
                                      budget_bytes=room, batched_route='auto')
                     assert policy.stack_route((1,n,n), dtype).route == pm.ROUTE_BATCH_RESHARD
+                for n in (5120, 6144):
+                    policy = pm.plan('eigh', mesh, backend='auto', n=n,
+                                     budget_bytes=room, batched_route='auto')
+                    expected = pm.ROUTE_BATCH_RESHARD if dtype == np.float64 else pm.ROUTE_SCAN
+                    assert policy.stack_route((1,n,n), dtype).route == expected
 
         # Time alone must not select a provider whose own quote is over the
         # room while the local quote fits. This is not an allocator bound.
@@ -268,3 +275,20 @@ def test_measured_stack_placement_keeps_batches_and_unavailable_provider_local(m
         # the platform's whole-mesh timing row would be faster for B1.
         explicit = replace(policy, requested='one_device', backend='one_device', n=8192)
         assert explicit.stack_route((1,8192,8192), np.complex128).route == pm.ROUTE_BATCH_RESHARD
+
+    monkeypatch.setattr(pm, 'mesh_platform', lambda _mesh: 'ROCM')
+    monkeypatch.setattr(pm, 'resolve_eigh_capacity', lambda *_a, **_k: ('elpa', None))
+    for dtype in (np.float32, np.complex64):
+        for kind in ('one', 'mesh'):
+            assert pm._eigh_seconds(kind, 8192, 4, 'ROCM', dtype) is None
+            assert pm._eigh_seconds(kind, 8192, 4, 'CUDA', dtype) == pm._eigh_seconds(
+                kind, 8192, 4, 'CUDA', np.complex128)
+        policy = pm.plan('eigh', mesh, backend='auto', n=8192,
+                         budget_bytes=room, batched_route='auto')
+        before = len(provider_calls)
+        assert policy.stack_route((1,8192,8192), dtype).route == pm.ROUTE_BATCH_RESHARD
+        assert len(provider_calls) == before
+    # The unchanged interpolation can round an anchor by one floating-point ulp.
+    for kind, n, seconds in (('one',8192,2.05), ('mesh',8192,6.53/4),
+                             ('one',16384,13.7), ('mesh',16384,29/4)):
+        assert pm._eigh_seconds(kind,n,4,'CUDA') == pytest.approx(seconds,rel=2e-15)

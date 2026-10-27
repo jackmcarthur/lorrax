@@ -12,8 +12,10 @@ ROCm local/ELPA costs in the existing stack chooser. Large batch-one solves
 can select ELPA when its quote fits; fitting batches retain local parallelism.
 A missing provider or an over-room provider quote cannot displace a fitting
 local route. Explicit backend resolution and the default `batch_reshard`
-contract are unchanged. No native signatures change; the already-required
-ABI 15 pair is reused.
+contract are unchanged. ROCm float64 and complex128 use separate measured
+costs; unmeasured float32/complex64 keep memory-only placement. CUDA's
+historical timing behavior is preserved. No native signatures change; the
+already-required ABI 15 pair is reused.
 
 ## 2026-10-27 — Respect the OpenMP limit in real ELPA solves
 
