@@ -179,6 +179,13 @@ through NCCL.
 **Handler inventory.** There is no ScaLAPACK Cholesky handler, and no
 native GEMM handler is called.
 
+Result checks contract each local matrix tile with the same eight fixed
+probe columns and complete the partials through the shared rank-order
+reduction. Normal products keep thin rows on `x`; adjoints keep them on
+`y`. Layout changes move only thin probes/results, never a matrix bank.
+Probe seeds, cut masks and acceptance thresholds are unchanged, as are
+local checks; distributed reduction roundoff can change in its last bits.
+
 Restoring zero rows can require sorting eigenvector columns when a live
 value is negative, including a tiny negative roundoff value. The checked
 owner streams local column tiles around the `y` mesh axis through the same

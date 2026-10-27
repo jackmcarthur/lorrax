@@ -36,7 +36,7 @@ import sys
 import traceback
 
 import jax
-from lxkit import ordered_norm, ordered_sum, permute_rows_local
+from lxkit import ordered_norm, ordered_psum, ordered_sum, permute_rows_local
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -68,9 +68,35 @@ def _face(nd):
     return P(*((None,) * (nd - 2)), "x", "y")
 
 
-def _rows(nd):
-    """A tall (..., n, k) stack: rows on 'x' (k probe columns whole)."""
-    return P(*((None,) * (nd - 2)), "x", None)
+def _rows(nd, axis="x"):
+    """A tall (..., n, k) stack: rows on ``axis`` (k probe columns whole)."""
+    return P(*((None,) * (nd - 2)), axis, None)
+
+
+def _face_probe_product(a, probe, *, mesh, adjoint=False):
+    """Face matrix times skinny probes, with the cross-rank sum in rank order.
+
+    Normal: columns contract on y and output rows stay on x. Adjoint:
+    rows contract on x and output rows stay on y. Only the skinny probe
+    input changes between these layouts; matrix tiles never move.
+    """
+    if a.ndim < 2 or probe.ndim < 2:
+        raise ValueError("checked face product needs matrix and probe axes")
+    contracted = a.shape[-2 if adjoint else -1]
+    if probe.shape[-2] != contracted:
+        raise ValueError("checked face product has incompatible contracted extents")
+    leading = np.broadcast_shapes(a.shape[:-2], probe.shape[:-2])
+    if mesh is None:
+        return (jnp.conj(jnp.swapaxes(a, -1, -2)) if adjoint else a) @ probe
+    axis = "x" if adjoint else "y"
+    out_axis = "y" if adjoint else "x"
+    @jax.shard_map(mesh=mesh, in_specs=(_face(a.ndim), _rows(probe.ndim, axis)),
+                   out_specs=_rows(len(leading) + 2, out_axis), check_vma=False)
+    def local(matrix, vectors):
+        if adjoint:
+            matrix = jnp.conj(jnp.swapaxes(matrix, -1, -2))
+        return ordered_psum(matrix @ vectors, axis)
+    return local(a, probe)
 
 
 def _norm(a, mesh=None, spec=None):
@@ -268,13 +294,15 @@ def used_probes(values, dtype, cut=None):
 def eigh_errors(a, values, vectors, *, mesh=None, cut=None):
     """Largest probe residual and orthogonality error of a (stack of) eigh result(s), on the used columns."""
     x, used = used_probes(values, vectors.dtype, cut)
-    vx = vectors @ x
+    vx = _face_probe_product(vectors, x, mesh=mesh)
     nd = a.ndim
-    gram = jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x
-    norm_x = jnp.maximum(_norm(x), jnp.finfo(values.dtype).tiny)      # replicated, per matrix
-    residual = _norm(a @ vx - vectors @ (values[..., :, None] * x), mesh, _rows(nd)) / (
+    gram = _face_probe_product(vectors, vx, mesh=mesh, adjoint=True) - x
+    norm_probes = x if mesh is None else jax.lax.with_sharding_constraint(x, NamedSharding(mesh, P()))
+    norm_x = jnp.maximum(_norm(norm_probes), jnp.finfo(values.dtype).tiny)  # replicated, per matrix
+    residual = _norm(_face_probe_product(a, vx, mesh=mesh) -
+                     _face_probe_product(vectors, values[..., :, None] * x, mesh=mesh), mesh, _rows(nd)) / (
         jnp.maximum(_norm(a, mesh, _face(nd)), jnp.finfo(values.dtype).tiny) * norm_x)
-    orthogonality = _norm(gram if used is None else jnp.where(used, gram, 0), mesh, _rows(nd)) / norm_x
+    orthogonality = _norm(gram if used is None else jnp.where(used, gram, 0), mesh, _rows(nd, "y" if mesh is not None else "x")) / norm_x
     finite = _all_ranks(jnp.all(jnp.isfinite(values)), mesh)
     return (jnp.where(finite, jnp.max(residual), jnp.inf),
             jnp.where(finite, jnp.max(orthogonality), jnp.inf))
@@ -642,13 +670,15 @@ def matrix_sketch(a, mesh=None):
     """Before a factorization or solve that may consume ``a``: (A^H W, ||A||).  ``mesh``: ``a``
     is face-tiled there and its norm is added in rank order."""
     w = probes(a.shape[-1], a.dtype, salt=1)
-    return jnp.conj(jnp.swapaxes(a, -1, -2)) @ w, _norm(a, mesh, _face(a.ndim))
+    return _face_probe_product(a, w, mesh=mesh, adjoint=True), _norm(a, mesh, _face(a.ndim))
 
 
 def rhs_sketch(b, mesh=None):
     """Before a solve that may consume ``b``: (W^H B, ||B||) (``b`` face-tiled on ``mesh``)."""
     w = probes(b.shape[-2], b.dtype, salt=1)
-    return jnp.conj(w.T) @ b, _norm(b, mesh, _face(b.ndim))
+    projected = (jnp.conj(w.T) @ b if mesh is None else
+                 jnp.conj(jnp.swapaxes(_face_probe_product(b, w, mesh=mesh, adjoint=True), -1, -2)))
+    return projected, _norm(b, mesh, _face(b.ndim))
 
 
 def solve_errors(sketch, x, mesh=None):
@@ -657,7 +687,8 @@ def solve_errors(sketch, x, mesh=None):
     ``sketch`` is ``matrix_sketch(A) + rhs_sketch(B)``; W^H A X = (A^H W)^H X.
     """
     ahw, norm_a, whb, norm_b = sketch
-    projected = jnp.conj(jnp.swapaxes(ahw, -1, -2)) @ x - whb
+    projected = ((jnp.conj(jnp.swapaxes(ahw, -1, -2)) @ x) if mesh is None else
+                 jnp.conj(jnp.swapaxes(_face_probe_product(x, ahw, mesh=mesh, adjoint=True), -1, -2))) - whb
     nd = x.ndim
     scale = np.sqrt(PROBES) * (norm_a * _norm(x, mesh, _face(nd)) + norm_b)
     # W^H (A X - B): k probe rows, the right-hand-side columns on 'y' as in X
