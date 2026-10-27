@@ -74,7 +74,8 @@ def _off_cuda(plan, op, shapes, dtype):
     if mesh_platform(plan.mesh) == 'ROCM' and op == 'eigh' and local:
         n = int(shapes[0][-1])
         share = int(shapes[0][0]) if len(shapes[0]) == 3 else 1
-        device = local_eigh_workspace(plan.mesh, share, n, dtype)
+        device = local_eigh_workspace(plan.mesh, share, n, dtype,
+                                      batched=len(shapes[0]) == 3 or getattr(plan, 'backend', None) == ONE_DEVICE)
         src = 'local ROCm eigh workspace (local_eigh_workspace)' if device else src
     return dict(device_bytes=device, host_bytes=0, vendor_device_bytes=device or None,
                 dynamic_xla_scratch_bytes=device, local=local, formula=src,
@@ -82,23 +83,29 @@ def _off_cuda(plan, op, shapes, dtype):
 
 
 @lru_cache(maxsize=None)
-def local_eigh_workspace(mesh, share, n, dtype) -> int:
-    """The device bytes a rank's local eigh of ``share`` (n, n) matrices allocates outside its
-    program's buffers: on CUDA the local share times the native cusolverDn
-    size query (jaxlib's batched syevd FFI has no workspace output), on ROCm the
-    batched rocSOLVER workspace, or outside its window one matrix's at the same measured rate,
-    none on CPU."""
+def local_eigh_workspace(mesh, share, n, dtype, *, batched=False) -> int:
+    """Native scratch outside compiled buffers for a rank's local eigensolve.
+
+    CUDA uses its native size query per local matrix. ROCm's qualified native
+    target owns its exact arena in the compiled program; local batched calls
+    need no extra charge there. Legacy JAX solves outside its window, and a
+    scalar complex128 solve's conditional JAX Jacobi retry, retain the existing
+    measured one-matrix allowance. ``batched`` describes the local call's rank,
+    not a global batch count or a backend selection.
+    """
     platform = mesh_platform(mesh)
     if platform == 'CUDA':
         return int(share) * _vendor_query(0, 'eigh', (int(n),), np.dtype(dtype).str)[0]
-    from distrib_la.local_eigh import BATCHED_EIGH_ROUTE, batched_workspace_bytes
-    got = batched_workspace_bytes((int(share), int(n), int(n)), dtype, platform)
+    from distrib_la.local_eigh import BATCHED_EIGH_ROUTE, batched_eigh_row
     row = BATCHED_EIGH_ROUTE.get(platform)
     win = None if row is None else row.windows.get(np.dtype(dtype).name)
-    if got or win is None:
-        return got
-    # Outside the batched window jaxlib's hipsolver_syevd_ffi solves one matrix per call: one
-    # matrix's rocSOLVER workspace at the window's measured rate (pool log eighc_wsq), plus E.
+    if win is None:
+        return 0
+    native = batched_eigh_row((int(share), int(n), int(n)), dtype, platform)
+    if native is not None and (batched or np.dtype(dtype) != np.dtype('complex128')):
+        return 0
+    # The legacy loop holds one matrix's scratch at a time. The scalar
+    # complex128 native route can still enter the existing JAX Jacobi retry.
     return win.workspace_tiles * int(n) ** 2 * np.dtype(dtype).itemsize + int(n) * 8
 
 
@@ -359,8 +366,11 @@ def eigh_stack_proposal(mesh, shape, dtype) -> int:
     rank's share of the batch (the operand in batch layout, the vectors both ways, the solver's
     work; the CPU compile reads 3.1-4.5 at n 64-512), plus the solver workspace outside the
     program (``local_eigh_workspace``).  A proposal: the run's own program is the price."""
+    from distrib_la.local_eigh import batched_workspace_bytes
     share, n = -(-int(shape[0]) // int(mesh.size)), int(shape[-1])
-    return 5 * share * n * n * np.dtype(dtype).itemsize + local_eigh_workspace(mesh, share, n, dtype)
+    arena = batched_workspace_bytes((share, n, n), dtype, mesh_platform(mesh))
+    return (5 * share * n * n * np.dtype(dtype).itemsize + arena
+            + local_eigh_workspace(mesh, share, n, dtype, batched=True))
 
 
 def eigh_stack_bytes(plan, shape, dtype, phase="all") -> int:
@@ -377,5 +387,5 @@ def eigh_stack_bytes(plan, shape, dtype, phase="all") -> int:
     if plan.batched_route == ROUTE_BATCH_RESHARD:
         return (_stack_bytes('eigh', plan.mesh, nb, n, dtype, 1, phase,
                              _gathered_admitted(plan.mesh, (n, n), dtype, plan.budget_bytes))
-                + local_eigh_workspace(plan.mesh, -(-nb // ranks), n, dtype))
+                + local_eigh_workspace(plan.mesh, -(-nb // ranks), n, dtype, batched=True))
     return plan.mesh_bytes('eigh', nb, n, dtype, phase)

@@ -15,11 +15,12 @@
 //                column-major), i.e. conj(V)^T read row-major
 //   out  w      [..., n]     f64 ascending eigenvalues
 //   out  info   [...]        s32 rocSOLVER info per matrix (0 = converged)
+//   out  arena  [query bytes] u8 vendor workspace + tridiagonal E
 //   attr lower  0/1          which triangle rocSOLVER reads (column-major sense)
 //   attr jacobi 0/1          the driver: {heevd,syevd} (0) or {heevdj,syevdj} (1), the route
 //                row's per-dtype choice (distrib_la.local_eigh.BATCHED_EIGH_ROUTE)
 //   attr tile_bytes          the workspace cap (the fixed tile): the stack runs in chunks whose
-//                rocSOLVER workspace fits it, on one XLA scratch allocation
+//                rocSOLVER workspace fits it, on one explicit u8 result
 // No host-device synchronization: nothing on the device is read back; failed matrices are
 // marked NaN on the device by distrib_la.local_eigh.
 //
@@ -28,7 +29,7 @@
 // API through that library's own dependency scope, so the process keeps one ROCm.  A
 // process without it refuses by GATE rocsolver-mapped.  Workspace: queried once per
 // (device, dtype, n, batch) in rocBLAS size-query mode, then handed to rocBLAS from
-// XLA's scratch allocator on every call (no allocation inside rocSOLVER, stream-ordered),
+// an explicit u8 FFI result on every call (no allocation inside rocSOLVER, stream-ordered),
 // capped by the fixed tile (attr tile_bytes).
 #include "../common/leg.h"
 #if !defined(LRX_LEG_ROCM)
@@ -39,8 +40,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <climits>
+#include <cstring>
+#include <limits>
 #include <map>
-#include <optional>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -131,13 +134,19 @@ static const Api& api() {
     return a;
 }
 
-// One rocBLAS handle per device, created on first use and kept for the process (no
-// teardown-order hazard at exit); its mutex covers set_stream + set_workspace + the call.
+// The same cached shape plan sizes the explicit result and serves execution.
+struct WorkspacePlan {
+    int64_t chunk = 0;
+    size_t vendor = 0;
+    size_t e_offset = 0;
+    size_t total = 0;
+};
+
 struct DeviceHandle {
     RbHandle h = nullptr;
     std::mutex m;
-    // Workspace bytes per (dtype, n, batch, fill), under m.
-    std::map<std::tuple<int, int64_t, int64_t, int>, size_t> ws;
+    std::map<std::tuple<int, int64_t, int64_t, int, int>, size_t> ws;
+    std::map<std::tuple<int, int64_t, int64_t, int, int, int64_t>, WorkspacePlan> plans;
 };
 
 static ffi::Error device_handle(DeviceHandle** out) {
@@ -150,162 +159,212 @@ static ffi::Error device_handle(DeviceHandle** out) {
     if (!slot) {
         auto d = std::make_unique<DeviceHandle>();
         LORRAX_LIB_CHECK(api().create_handle(&d->h), 0, "rocblas_create_handle");
+        LORRAX_LIB_CHECK(api().set_workspace(d->h, nullptr, 0), 0, "rocblas_set_workspace(initialize)");
         slot = std::move(d);
     }
     *out = slot.get();
     return ffi::Error::Success();
 }
 
-static ffi::Error run(lrx::gpu::Stream stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer a,
+static ffi::Error valid_shape(int kind, int64_t n, int64_t batch, int64_t lower,
+                              int64_t jacobi, int64_t tile) {
+    if ((kind != 1 && kind != 3) || n < 0 || n > INT32_MAX || batch < 0 || batch > INT32_MAX ||
+        (lower != 0 && lower != 1) || (jacobi != 0 && jacobi != 1) || tile <= 0)
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+            "GATE rocsolver-eigh-shape: want kind1(f64)/3(c128), n/batch0..INT32_MAX, lower/jacobi0..1, tile>0");
+    const size_t item = kind == 3 ? 16 : 8;
+    if (n && (static_cast<uint64_t>(n) > std::numeric_limits<size_t>::max() / static_cast<uint64_t>(n) / item ||
+              static_cast<uint64_t>(batch) > std::numeric_limits<size_t>::max() / (static_cast<uint64_t>(n) * n * item)))
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, "rocsolver eigh matrix byte span overflow");
+    return ffi::Error::Success();
+}
+
+// Query mode receives null device pointers directly, with no null-pointer
+// offset arithmetic. Normal execution supplies this same driver's live buffers.
+static RbStatus solve(const Api& A, RbHandle h, int kind, int64_t n, int64_t batch,
+                      int fill, bool jacobi, void* v, double* w, double* e, RbInt* info) {
+    const RbInt ni = static_cast<RbInt>(n), nb = static_cast<RbInt>(batch);
+    if (kind == 3) {
+        if (jacobi) return A.zheevdj_sb(h, kEvectOriginal, fill, ni, v, ni, n * n, w, n, info, nb);
+        return A.zheevd_sb(h, kEvectOriginal, fill, ni, v, ni, n * n, w, n, e, n, info, nb);
+    }
+    if (jacobi) return A.dsyevdj_sb(h, kEvectOriginal, fill, ni, static_cast<double*>(v), ni, n * n, w, n, info, nb);
+    return A.dsyevd_sb(h, kEvectOriginal, fill, ni, static_cast<double*>(v), ni, n * n, w, n, e, n, info, nb);
+}
+
+// The caller holds dh->m throughout planning/query/execution.
+static ffi::Error workspace_locked(DeviceHandle* dh, int kind, int64_t n, int64_t batch,
+                                   int fill, int jacobi, size_t* bytes) {
+    const auto key = std::make_tuple(kind, n, batch, fill, jacobi);
+    auto it = dh->ws.find(key);
+    if (it == dh->ws.end()) {
+        const Api& A = api();
+        LORRAX_LIB_CHECK(A.start_query(dh->h), 0, "rocblas_start_device_memory_size_query");
+        size_t need = 0;
+        const RbStatus query = solve(A, dh->h, kind, n, batch, fill, jacobi, nullptr, nullptr, nullptr, nullptr);
+        const RbStatus stopped = A.stop_query(dh->h, &need);
+        // rocBLAS query-mode success may report size_unchanged / size_increased.
+        if ((query != 0 && query != 9 && query != 10) || stopped != 0) {
+            std::ostringstream os;
+            os << "rocsolver eigh workspace query status=" << query
+               << "; rocblas_stop_device_memory_size_query status=" << stopped;
+            return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        }
+        it = dh->ws.emplace(key, need).first;
+    }
+    *bytes = it->second;
+    return ffi::Error::Success();
+}
+
+static ffi::Error plan_locked(DeviceHandle* dh, int kind, int64_t n, int64_t batch,
+                              int fill, int jacobi, int64_t tile, WorkspacePlan* out) {
+    const auto key = std::make_tuple(kind, n, batch, fill, jacobi, tile);
+    auto it = dh->plans.find(key);
+    if (it == dh->plans.end()) {
+        size_t one = 0;
+        FFI_RETURN_IF_ERROR(workspace_locked(dh, kind, n, 1, fill, jacobi, &one));
+        if (one > static_cast<size_t>(tile)) {
+            std::ostringstream os;
+            os << "GATE rocsolver-eigh-tile: one n=" << n << " matrix needs " << one
+               << " B of rocSOLVER workspace, above the " << tile << " B tile";
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+        }
+        WorkspacePlan p;
+        p.chunk = one ? std::min<int64_t>(batch, static_cast<size_t>(tile) / one) : batch;
+        for (;;) {
+            FFI_RETURN_IF_ERROR(workspace_locked(dh, kind, n, p.chunk, fill, jacobi, &p.vendor));
+            const int64_t rest = batch % p.chunk;
+            if (rest) {
+                size_t tail = 0;
+                FFI_RETURN_IF_ERROR(workspace_locked(dh, kind, n, rest, fill, jacobi, &tail));
+                p.vendor = std::max(p.vendor, tail);
+            }
+            if (p.vendor <= static_cast<size_t>(tile)) break;
+            --p.chunk;  // the one-matrix bound above guarantees progress to a fit
+        }
+        constexpr size_t alignment = 256;
+        const size_t e_bytes = jacobi ? 0 : static_cast<size_t>(batch) * n * sizeof(double);
+        if (p.vendor > std::numeric_limits<size_t>::max() - (alignment - 1) - e_bytes)
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, "rocsolver eigh workspace byte span overflow");
+        p.e_offset = (p.vendor + alignment - 1) / alignment * alignment;
+        p.total = p.e_offset + e_bytes;
+        it = dh->plans.emplace(key, p).first;
+    }
+    *out = it->second;
+    return ffi::Error::Success();
+}
+
+static ffi::Error run(lrx::gpu::Stream stream, ffi::AnyBuffer a,
                       ffi::Result<ffi::AnyBuffer> v, ffi::Result<ffi::AnyBuffer> w,
-                      ffi::Result<ffi::Buffer<ffi::S32>> info, int64_t lower, int64_t jacobi,
-                      int64_t tile_bytes) {
+                      ffi::Result<ffi::Buffer<ffi::S32>> info,
+                      ffi::Result<ffi::Buffer<ffi::U8>> arena, int64_t lower,
+                      int64_t jacobi, int64_t tile_bytes) {
     const Api& A = api();
     if (!A.err.empty()) return ffi::Error(ffi::ErrorCode::kFailedPrecondition, A.err);
     const auto dims = a.dimensions();
     const size_t rank = dims.size();
-    if (rank < 2 || dims[rank - 1] != dims[rank - 2]) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "GATE rocsolver-eigh-shape: want [..., n, n]");
-    }
-    const ffi::DataType dt = a.element_type();
-    if (dt != ffi::DataType::C128 && dt != ffi::DataType::F64) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "GATE rocsolver-eigh-dtype: want complex128 or float64 (the route "
-                          "row's dtypes); other dtypes take jnp.linalg.eigh");
-    }
-    if (v->element_type() != dt || v->element_count() != a.element_count() ||
-        w->element_type() != ffi::DataType::F64) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "GATE rocsolver-eigh-results: want v like a and f64 w");
-    }
+    if (rank < 2 || dims[rank - 1] != dims[rank - 2])
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, "GATE rocsolver-eigh-shape: want [..., n, n]");
+    const auto dt = a.element_type();
+    const int kind = dt == ffi::DataType::C128 ? 3 : dt == ffi::DataType::F64 ? 1 : -1;
     const int64_t n = dims[rank - 1];
     int64_t batch = 1;
-    for (size_t i = 0; i + 2 < rank; ++i) batch *= dims[i];
-    if (n == 0 || batch == 0) return ffi::Error::Success();
-    if (n > INT32_MAX || batch > INT32_MAX) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "GATE rocsolver-eigh-int32: n and batch must fit rocblas_int");
+    for (size_t i = 0; i + 2 < rank; ++i) {
+        if (dims[i] < 0 || dims[i] > INT32_MAX || batch > INT32_MAX / std::max<int64_t>(dims[i], 1))
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, "GATE rocsolver-eigh-int32: batch overflow");
+        batch *= dims[i];
     }
-    const size_t esize = (dt == ffi::DataType::C128) ? 16 : 8;
-    if (v->untyped_data() != a.untyped_data()) {
-        LORRAX_GPU_CHECK(lrx::gpu::memcpy_async(v->untyped_data(), a.untyped_data(),
-                                                static_cast<size_t>(batch * n * n) * esize,
-                                                lrx::gpu::kDeviceToDevice, stream));
+    FFI_RETURN_IF_ERROR(valid_shape(kind, n, batch, lower, jacobi, tile_bytes));
+    if (v->element_type() != dt || v->element_count() != a.element_count() ||
+        w->element_type() != ffi::DataType::F64 || w->element_count() != batch * n ||
+        info->element_count() != batch)
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, "GATE rocsolver-eigh-results: want v like a, f64 w and s32 info");
+    if (!n || !batch) {
+        if (arena->element_count() != 0)
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, "GATE rocsolver-eigh-workspace: empty solve needs zero-byte result");
+        return ffi::Error::Success();
     }
-    // E: the tridiagonal off-diagonal rocSOLVER returns (unused), from XLA's scratch.
-    std::optional<void*> e = scratch.Allocate(static_cast<size_t>(batch * n) * sizeof(double));
-    if (!e) return ffi::Error(ffi::ErrorCode::kResourceExhausted, "scratch for E");
-    const int fill = lower ? kFillLower : kFillUpper;
-    const RbInt ni = static_cast<RbInt>(n);
-    double* wp = static_cast<double*>(w->untyped_data());
-    double* ep = static_cast<double*>(*e);
-    RbInt* ip = info->typed_data();
-    char* const v0 = static_cast<char*>(v->untyped_data());
-    const size_t mat_bytes = static_cast<size_t>(n * n) * esize;
-    // One strided-batched solve of `nb` matrices from matrix `first` on.
-    auto call = [&](RbHandle h, int64_t first, int64_t nb) -> RbStatus {
-        void* vv = v0 + first * mat_bytes;
-        double* ww = wp + first * n;
-        double* ee = ep + first * n;
-        RbInt* ii = ip + first;
-        const RbInt b = static_cast<RbInt>(nb);
-        if (dt == ffi::DataType::C128) {
-            if (jacobi) return A.zheevdj_sb(h, kEvectOriginal, fill, ni, vv, ni, n * n, ww, n, ii, b);
-            return A.zheevd_sb(h, kEvectOriginal, fill, ni, vv, ni, n * n, ww, n, ee, n, ii, b);
-        }
-        double* vr = static_cast<double*>(vv);
-        if (jacobi) return A.dsyevdj_sb(h, kEvectOriginal, fill, ni, vr, ni, n * n, ww, n, ii, b);
-        return A.dsyevd_sb(h, kEvectOriginal, fill, ni, vr, ni, n * n, ww, n, ee, n, ii, b);
-    };
-
     DeviceHandle* dh = nullptr;
     FFI_RETURN_IF_ERROR(device_handle(&dh));
-    std::lock_guard<std::mutex> lk(dh->m);
-    LORRAX_LIB_CHECK(A.set_stream(dh->h, stream), 0, "rocblas_set_stream");
-    // Workspace bytes of an nb-matrix call, per (dtype, driver, n, nb, fill): rocBLAS size-query
-    // mode runs only the argument checks and the size computation on the host (nothing is
-    // enqueued, no device memory is read; pointers must be valid).
-    auto workspace = [&](int64_t nb, size_t* bytes) -> ffi::Error {
-        const auto key = std::make_tuple(static_cast<int>(dt) * 2 + (jacobi ? 1 : 0), n, nb, fill);
-        auto it = dh->ws.find(key);
-        if (it == dh->ws.end()) {
-            size_t b = 0;
-            LORRAX_LIB_CHECK(A.start_query(dh->h), 0, "rocblas_start_device_memory_size_query");
-            const RbStatus q = call(dh->h, 0, nb);
-            const RbStatus s = A.stop_query(dh->h, &b);
-            if (s != 0) {
-                std::ostringstream os;
-                os << "rocblas_stop_device_memory_size_query status=" << s << " (solver query " << q << ")";
-                return ffi::Error(ffi::ErrorCode::kInternal, os.str());
-            }
-            it = dh->ws.emplace(key, b).first;
-        }
-        *bytes = it->second;
-        return ffi::Error::Success();
-    };
-    // THE TILE.  rocSOLVER's workspace grows linearly with the batch (pool log eighc_wsq:
-    // 2.3-3.8 n^2 x 16 B per c128 matrix), so the stack runs in chunks of the most matrices
-    // whose workspace fits `tile_bytes` (runtime.tiles.TILE_BYTES, from the route row), all on
-    // one workspace allocation, stream-ordered.  Sizes come from host-side queries only.
-    if (tile_bytes <= 0) {
-        return ffi::Error(ffi::ErrorCode::kInvalidArgument, "GATE rocsolver-eigh-tile: want tile_bytes > 0");
-    }
-    const size_t tile = static_cast<size_t>(tile_bytes);
-    size_t one = 0;
-    FFI_RETURN_IF_ERROR(workspace(1, &one));
-    if (one > tile) {
+    std::lock_guard<std::mutex> lock(dh->m);
+    const int fill = lower ? kFillLower : kFillUpper;
+    WorkspacePlan p;
+    FFI_RETURN_IF_ERROR(plan_locked(dh, kind, n, batch, fill, jacobi, tile_bytes, &p));
+    if (arena->dimensions().size() != 1 || static_cast<size_t>(arena->element_count()) != p.total) {
         std::ostringstream os;
-        os << "GATE rocsolver-eigh-tile: one n=" << n << " matrix needs " << one
-           << " B of rocSOLVER workspace, above the " << tile << " B tile; want n inside the route "
-              "row's window (distrib_la.local_eigh.BATCHED_EIGH_ROUTE)";
+        os << "GATE rocsolver-eigh-workspace: explicit result has " << arena->element_count()
+           << " B, want " << p.total;
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
-    int64_t chunk = std::min<int64_t>(batch, one > 0 ? static_cast<int64_t>(tile / one) : batch);
-    size_t bytes = 0;
-    FFI_RETURN_IF_ERROR(workspace(chunk, &bytes));
-    while (chunk > 1 && bytes > tile) {                 // linear in practice; stay exact anyway
-        --chunk;
-        FFI_RETURN_IF_ERROR(workspace(chunk, &bytes));
+    const size_t item = kind == 3 ? 16 : 8;
+    if (v->untyped_data() != a.untyped_data())
+        LORRAX_GPU_CHECK(lrx::gpu::memcpy_async(v->untyped_data(), a.untyped_data(),
+            static_cast<size_t>(batch) * n * n * item, lrx::gpu::kDeviceToDevice, stream));
+    LORRAX_LIB_CHECK(A.set_stream(dh->h, stream), 0, "rocblas_set_stream");
+    char* buffer = static_cast<char*>(arena->untyped_data());
+    double* ep = jacobi ? nullptr : reinterpret_cast<double*>(buffer + p.e_offset);
+    void* ws = p.vendor ? buffer : nullptr;
+    LORRAX_LIB_CHECK(A.set_workspace(dh->h, ws, p.vendor), 0, "rocblas_set_workspace");
+    RbStatus status = 0;
+    int64_t first = 0;
+    for (; first < batch; first += p.chunk) {
+        const int64_t nb = std::min(p.chunk, batch - first);
+        status = solve(A, dh->h, kind, n, nb, fill, jacobi,
+            static_cast<char*>(v->untyped_data()) + first * static_cast<size_t>(n) * n * item,
+            static_cast<double*>(w->untyped_data()) + first * n,
+            jacobi ? nullptr : ep + first * n, info->typed_data() + first);
+        if (status != 0) break;
     }
-    const int64_t rest = batch % chunk;
-    if (rest) {
-        size_t rb = 0;
-        FFI_RETURN_IF_ERROR(workspace(rest, &rb));
-        bytes = std::max(bytes, rb);
+    const RbStatus detached = A.set_workspace(dh->h, nullptr, 0);
+    if (status != 0) {
+        std::ostringstream os;
+        os << "rocsolver eigh status=" << status << " (n=" << n << ", matrices " << first
+           << " of " << batch << ", ws=" << p.vendor << " B, " << A.path << ")";
+        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
-    void* ws = nullptr;
-    if (bytes > 0) {
-        std::optional<void*> p = scratch.Allocate(bytes);
-        if (!p) return ffi::Error(ffi::ErrorCode::kResourceExhausted, "scratch for rocSOLVER workspace");
-        ws = *p;
-    }
-    LORRAX_LIB_CHECK(A.set_workspace(dh->h, ws, bytes), 0, "rocblas_set_workspace");
-    for (int64_t first = 0; first < batch; first += chunk) {
-        const int64_t nb = std::min(chunk, batch - first);
-        const RbStatus st = call(dh->h, first, nb);
-        if (st != 0) {
-            std::ostringstream os;
-            os << "rocsolver_" << (dt == ffi::DataType::C128 ? "zheevd" : "dsyevd") << (jacobi ? "j" : "")
-               << "_strided_batched status=" << st << " (n=" << n << ", matrices " << first << ".."
-               << first + nb << " of " << batch << ", ws=" << bytes << " B, " << A.path << ")";
-            return ffi::Error(ffi::ErrorCode::kInternal, os.str());
-        }
-    }
+    LORRAX_LIB_CHECK(detached, 0, "rocblas_set_workspace(detach)");
     return ffi::Error::Success();
 }
 
 }  // namespace lorrax_ffi::rocsolver_eigh
 
+extern "C" int lrx_rocsolver_eigh_workspace_bytes(int kind, int64_t n, int64_t batch,
+                                                int lower, int jacobi, int64_t tile,
+                                                uint64_t* out, char* error, size_t capacity) {
+    using namespace lorrax_ffi::rocsolver_eigh;
+    auto report = [&](const std::string& message) {
+        if (error != nullptr && capacity) {
+            const size_t len = std::min(message.size(), capacity - 1);
+            std::memcpy(error, message.data(), len); error[len] = '\0';
+        }
+        return 1;
+    };
+    if (!out) return report("workspace query needs an output pointer");
+    *out = 0;
+    if (auto e = valid_shape(kind, n, batch, lower, jacobi, tile); e.failure()) return report(e.message());
+    if (!n || !batch) return 0;
+    try {
+        if (!api().err.empty()) return report(api().err);
+        DeviceHandle* dh = nullptr;
+        if (auto e = device_handle(&dh); e.failure()) return report(e.message());
+        std::lock_guard<std::mutex> lock(dh->m);
+        WorkspacePlan p;
+        if (auto e = plan_locked(dh, kind, n, batch, lower ? kFillLower : kFillUpper, jacobi, tile, &p); e.failure())
+            return report(e.message());
+        *out = p.total;
+        return 0;
+    } catch (const std::exception& e) { return report(e.what()); }
+}
+
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     RocsolverBatchedEighFfi, lorrax_ffi::rocsolver_eigh::run,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<lrx::gpu::Stream>>()
-        .Ctx<xla::ffi::ScratchAllocator>()
-        .Arg<xla::ffi::AnyBuffer>()                    // a  [..., n, n]
-        .Ret<xla::ffi::AnyBuffer>()                    // v  [..., n, n]
-        .Ret<xla::ffi::AnyBuffer>()                    // w  [..., n] f64
-        .Ret<xla::ffi::Buffer<xla::ffi::S32>>()        // info [...]
-        .Attr<int64_t>("lower")                        // rocSOLVER fill (column-major sense)
-        .Attr<int64_t>("jacobi")                       // 1: {z,d}{heevdj,syevdj} (Jacobi subproblems)
-        .Attr<int64_t>("tile_bytes"));                 // workspace cap: runtime.tiles.TILE_BYTES
+        .Arg<xla::ffi::AnyBuffer>()
+        .Ret<xla::ffi::AnyBuffer>()
+        .Ret<xla::ffi::AnyBuffer>()
+        .Ret<xla::ffi::Buffer<xla::ffi::S32>>()
+        .Ret<xla::ffi::Buffer<xla::ffi::U8>>()
+        .Attr<int64_t>("lower")
+        .Attr<int64_t>("jacobi")
+        .Attr<int64_t>("tile_bytes"));

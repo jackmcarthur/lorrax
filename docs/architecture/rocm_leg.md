@@ -111,8 +111,14 @@ windows:
 
 | dtype | driver | stack ≥ | n | workspace per matrix |
 |---|---|---:|---|---:|
-| complex128 | `heevd` | 2 | 128–3120 | ≤ 4 n² |
-| float64 | `syevd` | 2 | 40–3120 | ≤ 5 n² |
+| complex128 | `heevd` | 1 | 128–3120 | native query |
+| float64 | `syevd` | 2 | 40–3120 | native query |
+
+The native query and execution share one cached chunk plan. Its aligned
+vendor workspace and tridiagonal E are an explicit byte-buffer result,
+so the actual executable owns and prices them. Legacy JAX solves outside
+these windows, and the scalar complex128 JAX Jacobi retry, retain their
+separate measured allowance; this change does not make those prices exact.
 
 - `heevdj` (Jacobi) wins only at n ≤ 312 and is 2.8× slower than `heevd` at
   16 × 312, so no window takes it.

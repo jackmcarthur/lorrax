@@ -149,6 +149,7 @@ def gate_cases(mesh):
     from jax.sharding import NamedSharding, PartitionSpec as P
     from lxkit import device_put_process_local
     from distrib_la import local_eigh as le
+    from common.collectives import agree_io_error
 
     names = tuple(mesh.axis_names)
     ndev = int(np.prod(mesh.devices.shape))
@@ -183,7 +184,29 @@ def gate_cases(mesh):
             new, ref = singleton(new), singleton(ref)
         sm = lambda f: jax.jit(jax.shard_map(lambda t: tuple(f(t)), mesh=mesh, in_specs=spec,
                                              out_specs=(spec, spec)))
-        w, v = sm(new)(x)
+        # The provider query sizes the actual explicit arena; it is neither
+        # hidden FFI scratch nor a second closed-form workspace allowance.
+        error, arena_bytes = None, None
+        try:
+            row = le.BATCHED_EIGH_ROUTE["ROCM"]
+            arena_bytes = le._workspace_bytes((b,n,n), np.dtype(dt), row.windows[dt].driver, row.tile_bytes)
+            assert arena_bytes >= b*n*8
+        except Exception as exc:
+            error = exc
+        label = f"{kind}.{b}.{n}.{dt}.{uplo}.{sym}"
+        agree_io_error(error, path="rocsolver_eigh_gate", stage="workspace.query."+label)
+        error, compiled = None, None
+        try:
+            import re
+            compiled = sm(new).lower(x).compile()
+            native = [line for line in compiled.as_text().splitlines()
+                      if 'custom_call_target="lorrax_rocsolver_batched_eigh"' in line]
+            assert native and any(f"u8[{arena_bytes}]" in line for line in native)
+            assert compiled.memory_analysis().temp_size_in_bytes >= arena_bytes
+        except Exception as exc:
+            error = exc
+        agree_io_error(error, path="rocsolver_eigh_gate", stage="workspace.program."+label)
+        w, v = compiled(x)
         w0, v0 = sm(ref)(x)
         # The matrix both solve, in numpy (eigh_local's _full on the host copy), sliced like
         # this process's shards; each device's block is compared on its own.
@@ -207,6 +230,7 @@ def gate_cases(mesh):
         # known silent zheevd failure also fails the old route (never more matrices than it).
         m["finite"] = m["finite"] and flagged and (new_nan == 0 or (host_ref and new_nan <= ref_nan))
         m["ref_nan"], m["new_nan"] = ref_nan, new_nan
+        m["native_arena_bytes"] = arena_bytes
         out[f"{kind:12s} {dt:10s} b={b:3d} n={n:4d} uplo={uplo} sym={sym}"] = m
     # Outside the row (float64, one matrix): jnp.linalg.eigh unchanged.
     assert le.batched_eigh_row((64, 64), np.float64) is None
@@ -364,7 +388,8 @@ def main() -> int:
               f"orth {m['orth']:.1e} dw {m['dw']:.1e} proj {m['proj']:.1e} (bound ratio {m['proj_ratio']:.1e})"
               + (f"  [failed matrices: old route {m.get('ref_nan', 0)}, new route {m['new_nan']}]"
                  if m.get("ref_nan") or m.get("new_nan") else "")
-              + (f"  [{m['outcome']}]" if "outcome" in m else ""), flush=True)
+              + (f"  [{m['outcome']}]" if "outcome" in m else "")
+              + (f"  [explicit arena {m['native_arena_bytes']} B]" if "native_arena_bytes" in m else ""), flush=True)
     nbad = len(bad)
     print(f"r{jax.process_index()} ROCSOLVER_EIGH_GATE {'PASS' if not bad else 'FAIL'} on "
           f"{tuple(mesh.devices.shape)}: {len(out) - len(bad)}/{len(out)} (tol {TOL:g}, proj {PROJ_TOL:g})",

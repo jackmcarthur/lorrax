@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-27 — Rebuild native libraries for visible local EIGH workspace
+
+Rebuild and seal the whole native pair for ABI 15. The qualified ROCm
+strided-batched EIGH handler now returns its exact queried workspace and
+tridiagonal E in an explicit byte buffer. Query and execution use the same
+cached chunk plan. ABI 14 handlers have a different result list and refuse
+at load. The existing numerical windows, complex reflector and Jacobi retry
+are unchanged; legacy JAX/Jacobi scratch still has its separate allowance.
+CUDA and CPU numerical routes and input decks are unchanged.
+
 ## 2026-10-26 — Rebuild native libraries for visible ROCm workspace
 
 Rebuild and seal the whole native pair: the required contract is ABI 14.

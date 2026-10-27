@@ -51,8 +51,8 @@ distrib_la_result_check after its retries).  hsuite na_sc's exact ISDF C_q stack
 c128[4, 96, 96] (a 40-fold eigenvalue) is one such input (gate case, below the c128 window).
 A re-solve of the failed matrices would need the failure count on the host (one sync per
 call), so the handler has none.  WORKSPACE: the handler runs a stack in chunks whose rocSOLVER
-workspace fits the fixed tile (``BatchedEighRow.tile_bytes``), one XLA scratch allocation;
-:func:`batched_workspace_bytes` prices it from shapes.
+workspace fits the fixed tile (``BatchedEighRow.tile_bytes``). The shared native query
+sizes an explicit u8 result containing that workspace and tridiagonal E; XLA prices it.
 A routed stack whose
 target is not loadable refuses by GATE ``batched_eigh_target`` (no fallback to the loop).
 Gate: ``tests/test_rocsolver_eigh_gate.py`` (residual, orthogonality, eigenvalues and
@@ -124,9 +124,9 @@ class EighWindow(NamedTuple):
     min_batch: int       #: smallest stack (product of the leading axes) it takes
     min_n: int           #: smallest matrix side it takes
     max_n: int           #: largest matrix side it takes
-    workspace_tiles: int  #: rocSOLVER workspace per matrix is at most this many n x n elements
-                          #: (pool log eighc_wsq: c128 2.26-3.80, f64 3.26-4.84), the shape-only
-                          #: price of :func:`batched_workspace_bytes`
+    workspace_tiles: int  #: legacy JAX/Jacobi external-scratch model, n x n elements
+                          #: (pool log eighc_wsq: c128 2.26-3.80, f64 3.26-4.84); the
+                          #: native target uses its exact query and explicit arena instead
 
 
 class BatchedEighRow(NamedTuple):
@@ -183,17 +183,44 @@ def batched_eigh_row(shape, dtype, leg_key=None):
     return row
 
 
+def _workspace_bytes(shape, dtype, driver, tile_bytes, *, lower=1):
+    """Exact explicit native arena, from the execution owner's cached chunk plan.
+
+    Shape-only: the native query may create a handle but allocates no matrix
+    or queried arena. Only the native qualified driver is queried here.
+    """
+    import ctypes
+    from distrib_la.loader import get_lib
+    query_name = "lrx_rocsolver_eigh_workspace_bytes"
+    lib = get_lib("ROCM")
+    if not hasattr(lib, query_name):
+        raise RuntimeError(f"GATE local_eigh_workspace: native provider must export {query_name}; rebuild the whole native pair")
+    query = getattr(lib, query_name)
+    query.argtypes = [ctypes.c_int, ctypes.c_int64, ctypes.c_int64, ctypes.c_int,
+                      ctypes.c_int, ctypes.c_int64, ctypes.POINTER(ctypes.c_uint64),
+                      ctypes.c_void_p, ctypes.c_size_t]
+    query.restype = ctypes.c_int
+    n, batch = int(shape[-1]), math.prod(shape[:-2])
+    kind = {"float64": 1, "complex128": 3}[np.dtype(dtype).name]
+    out, error = ctypes.c_uint64(), ctypes.create_string_buffer(512)
+    status = query(kind, n, batch, int(lower), int(driver.endswith("j")), int(tile_bytes),
+                   ctypes.byref(out), error, ctypes.sizeof(error))
+    if status:
+        raise RuntimeError(f"GATE local_eigh_workspace: shape={shape}, dtype={dtype}, driver={driver}: "
+                           + error.value.decode("utf-8", errors="replace"))
+    return int(out.value)
+
+
 def batched_workspace_bytes(shape, dtype, leg_key=None):
-    """Per-device bytes the leg's batched target adds beside its operand and outputs for a local
-    stack ``shape``, from shapes only (0 when the row does not take it): the rocSOLVER workspace,
-    ``min(tile, b x workspace_tiles x n^2 x itemsize)``, plus the tridiagonal E (b n float64).
-    The tile caps the first term whatever the batch (the handler chunks the stack)."""
+    """The routed native target's explicit arena bytes, not external scratch.
+
+    Zero means this shape does not use the target. A missing or failed query
+    refuses; it is never replaced by a zero or a measured workspace guess.
+    """
     row = batched_eigh_row(shape, dtype, leg_key)
     if row is None:
         return 0
-    win = row.windows[np.dtype(dtype).name]
-    b, n, item = math.prod(shape[:-2]), int(shape[-1]), np.dtype(dtype).itemsize
-    return min(int(row.tile_bytes), b * win.workspace_tiles * n * n * item) + b * n * 8
+    return _workspace_bytes(shape, dtype, row.windows[np.dtype(dtype).name].driver, row.tile_bytes)
 
 
 def _require_target(target):
@@ -211,10 +238,12 @@ def _batched_call(target, a, driver, tile_bytes):
     The handler reads the row-major buffer as column-major, i.e. solves A^T = conj(A), whose
     eigenvectors are conj(V); its in-place result read row-major is conj(V)^T, so V = R^H."""
     real = jnp.finfo(a.dtype).dtype
-    r, w, info = jax.ffi.ffi_call(
+    arena = _workspace_bytes(a.shape, a.dtype, driver, tile_bytes)
+    r, w, info, _arena = jax.ffi.ffi_call(
         target,
         (jax.ShapeDtypeStruct(a.shape, a.dtype), jax.ShapeDtypeStruct(a.shape[:-1], real),
-         jax.ShapeDtypeStruct(a.shape[:-2], jnp.int32)),
+         jax.ShapeDtypeStruct(a.shape[:-2], jnp.int32),
+         jax.ShapeDtypeStruct((arena,), jnp.uint8)),
         vmap_method="broadcast_all")(a, lower=np.int64(1), jacobi=np.int64(driver.endswith("j")),
                                      tile_bytes=np.int64(tile_bytes))
     return w, jnp.conj(jnp.swapaxes(r, -1, -2)), info

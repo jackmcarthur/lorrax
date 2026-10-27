@@ -417,7 +417,7 @@ def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all") -> St
             tried = -(-(-(-nb // rounds)) // ranks)
             from distrib_la.workspace import local_eigh_workspace
             price = (_stack_bytes(op, mesh, nb, n, dtype, rounds, phase, gathered)
-                     + local_eigh_workspace(mesh, tried, n, dtype))
+                     + local_eigh_workspace(mesh, tried, n, dtype, batched=True))
             if room_test(lambda r, p=price: p <= r, room):
                 one, on_mesh = (_eigh_seconds(k, n, ranks, platform) for k in ("one", "mesh"))
                 if one is None or -(-nb // ranks) * one <= nb * on_mesh:
@@ -1855,7 +1855,7 @@ class Plan:
 
         def price(r):
             return memory.priced((_analysis_bytes(run(r)) or 0) + local_eigh_workspace(
-                self.mesh, shares[r], n, A.dtype), f"distrib_la route (c) {phase} program, {r} round(s) (compiled)")
+                self.mesh, shares[r], n, A.dtype, batched=True), f"distrib_la route (c) {phase} program, {r} round(s) (compiled)")
         chosen = memory.admit(f"distrib_la route (c) stack {nb} x {n}^2",
                               tuple((f"{r} round(s)", lambda r=r: price(r)) for r in tries),
                               memory.room(bucketed=False), device=False)

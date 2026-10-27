@@ -250,8 +250,10 @@ ELPA's device pool and per-handle rocBLAS regions are explicit byte-buffer
 results in the compiled eigensolve. They are counted once there, without a
 second measured pool allowance. A stack uses local ROCm eigensolver scratch
 only when its resolved route runs matrices locally; a leading batch dimension
-alone does not select that scratch. Local rocSOLVER/JAX scratch still needs its
-separate workspace price. ELPA's small retained allocations, context resources
+alone does not select that scratch. The qualified native ROCm batched EIGH
+target owns an exact queried arena in its executable. Legacy JAX scratch outside
+its windows and the scalar complex128 Jacobi retry retain a separate measured
+workspace price. ELPA's small retained allocations, context resources
 and any fallback beyond its empirical pool remain outside the compiled arena.
 A checked EIGH includes local gathered-retry scratch on CUDA and ROCm only when
 that retry is admitted; sequential primary and retry scratch use their maximum.

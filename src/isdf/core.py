@@ -1535,7 +1535,7 @@ def _charge_factor_workspace(eig, shape, dtype, *, first, rounds=None):
     if route.route == ROUTE_BATCH_RESHARD and (first or eig.capacity_refusal is not None):
         share = (route.per_rank if rounds is None or not first else
                  eigh_rounds(shape[0], eig.mesh.size, rounds)[0][1])
-        return local_eigh_workspace(eig.mesh, share, int(shape[-1]), dtype)
+        return local_eigh_workspace(eig.mesh, share, int(shape[-1]), dtype, batched=True)
     # A rank-2 query names one distributed solve, never a cached local-stack route.
     return workspace_bytes_per_rank(eig, 'eigh', (tuple(shape[-2:]),), dtype, checked=not first)
 

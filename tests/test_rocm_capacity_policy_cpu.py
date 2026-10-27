@@ -89,8 +89,7 @@ def test_capacity_policy_workspace_includes_jaxlib_outside_window(monkeypatch):
         # The real CPU plan requires no ROCm library; only its query surface
         # is priced for ROCm, without allocating any matrix or workspace.
         policy = plan('eigh',mesh,n=n,backend='off',batched_route='auto')
-        expected = (win.workspace_tiles*n*n*16+n*8 if n<win.min_n else
-                    owner.batched_workspace_bytes((1,n,n),np.complex128,'ROCM'))
+        expected = win.workspace_tiles*n*n*16+n*8  # legacy/scalar Jacobi scratch
         assert expected>0
         assert workspace.local_eigh_workspace(mesh,1,n,np.complex128)==expected
         assert workspace.workspace_bytes_per_rank(
@@ -98,7 +97,7 @@ def test_capacity_policy_workspace_includes_jaxlib_outside_window(monkeypatch):
         for share in (1,3):
             assert workspace.workspace_bytes_per_rank(
                 policy,'eigh',((share,n,n),),np.complex128)==workspace.local_eigh_workspace(
-                    mesh,share,n,np.complex128)
+                    mesh,share,n,np.complex128,batched=True)
     assert owner.batched_eigh_row((72,72),np.complex128,'ROCM') is None
     assert owner.batched_eigh_row((128,128),np.complex128,'ROCM') is not None
 
