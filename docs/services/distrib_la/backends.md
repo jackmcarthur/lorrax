@@ -211,6 +211,15 @@ reductions use the process-column communicator; there are still `n` pivot
 steps. This is a capacity route, without a speedup promise over a local
 solve or a tuned distributed vendor LU.
 
+On 144 MI250X GCDs (18 Frontier nodes), a complex128 solve with 49,153 physical
+rows and equally many RHS columns (both padded to 49,164) took 254.917 s before
+batched panel permutations and 31.684 s after. This is one warmed trial per
+arm with the same input fixture and native providers; timing includes the common
+post-readiness host agreement and excludes construction and compilation.
+The checked executable's per-rank argument-plus-increment quote fell from
+1.369 to 1.113 GB. This is a compiled quote, not a measured process peak or a
+universal four-matrix bound, and the timing is not a strong-scaling study.
+
 `one_device` (`distrib_la._one_device`) keeps the FFI operand contract
 (`P('x','y')` tile or `P(None,'x','y')` stack in, the same layout out). Route
 (c)'s staged exchange moves each matrix whole onto one device, the leg's native

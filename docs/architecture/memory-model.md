@@ -214,8 +214,8 @@ with `N_k N_b` eigenvalues; there is no host `N_orbit²` or `N_k N_b²` matrix.
   `distrib_la.eigh_stack_proposal` (five matrices per rank's share of the batch, plus
   the solver workspace outside the program, `distrib_la.local_eigh_workspace`). The run then admits its own executable before it
   executes: an eager route-(c) attempt, first or retry (`Plan._checked_reshard`),
-  checks its `memory_analysis` plus the solver workspace outside it (CUDA: the native
-  cusolverDn size query; ROCm: the batched row) against the agreed room (`memory.room`,
+  checks its `memory_analysis` plus any separately priced solver workspace
+  against the agreed room (`memory.room`,
   the minimum over ranks); over it, twice the rounds while a rank's share still
   shrinks, each compiled only when the one before is over, and when none fits the
   smallest runs under `admit`'s warning. Every rank runs the largest choice any rank made. A local reduction round is admitted
@@ -276,12 +276,16 @@ the pivot vector. The actual executable's price therefore includes this scratch
 beside its layout copies and outputs; callers do not add a separate estimate.
 The single-device fast path retains its whole-matrix capacity limit. When
 that path does not fit, the shared `native2d` LU keeps coefficient and RHS
-faces distributed and communicates panels of at most 128 columns/rows.
+faces distributed. Column panels have at most 128 columns; each pivot
+exchanges two narrow panel rows, then the completed panel's permutation
+exchanges at most 256 full row pieces once, including prior L and the RHS.
 Its compiled program prices the factor copies and triangular solves. Input
 consumption does not imply that A aliases an output: only the actual compiler
 alias bytes are subtracted. This route removes the whole-matrix memory floor,
 but pivot reductions still have communication latency; neither a fixed
 four-matrix bound nor an unconditional speedup is promised.
+The [matched 144-GCD qualification](../services/distrib_la/backends.md#size-route)
+reports the solve's executable quote separately from timing and process peak.
 
 The opt-in ROCm fused outer decode is also outside complete workspace coverage.
 The default measured rule keeps the XLA decode because the fused version was
@@ -1045,9 +1049,9 @@ and includes the exact bytes. Layout 0 and native transform-only mode 5 need
 no extra arena allocation. For these native FFT families, missing query symbols or unparseable calls
 refuse by name instead of admitting a guessed zero. The total adds the
 maximum of this term and the XLA FFT plan workspace, because the calls in the
-executable run serially. Other explicitly priced native workspaces remain
-with their existing owners; the [wide ROCm LU query gap](#pricing-coverage)
-is not covered by this FFT machinery.
+executable run serially. The [wide ROCm LU and general Fourier arenas](#pricing-coverage)
+are explicit results owned by their providers; callers do not add them again
+as FFT workspace.
 On CPU the host `gw_conv` handler keeps a reused host arena of
 `16·N_k·m_x·m_y` bytes and per-thread compact chunks, outside XLA.
 
