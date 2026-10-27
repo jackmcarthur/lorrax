@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-27 — Bound EIGH column restoration
+
+Checked distributed EIGH now streams eigenvector columns when restoring
+zero rows beside negative live eigenvalues, including negative roundoff
+values. It shares the existing row-permutation transport with symmetry
+maps, retaining local tiles instead of a complete column bank on each row
+owner. Sorting and eigenvector values are preserved. This Python transport
+change introduces no deck setting, native signature or rebuild requirement
+beyond the existing ABI 15 pair.
+
 ## 2026-10-27 — Use measured ROCm EIGH placement costs
 
 Room-bearing `auto` EIGH plans with `batched_route="auto"` now use measured

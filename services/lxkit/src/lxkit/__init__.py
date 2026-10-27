@@ -73,7 +73,7 @@ from lxkit.placement import (device_put_process_local, device_put_process_local_
                              device_put_process_tiles, placement_cache_stats)
 from lxkit.collectives import (install_reduction_guard, install_reduction_guard_from_env,
                                 ordered_norm, ordered_psum, ordered_psum_scatter, ordered_reduce,
-                                ordered_sum, ordered_transient_bytes, reduction_trace)
+                                ordered_sum, ordered_transient_bytes, permute_rows_local, reduction_trace)
 from lxkit.probe import (
     AVAILABLE,
     LibraryNotBuilt,
@@ -117,6 +117,7 @@ __all__ = [
     "device_put_process_local", "device_put_process_local_cached",
     "device_put_process_tiles", "placement_cache_stats", "mark_varying", "varying_axes",
     "ordered_psum", "ordered_psum_scatter", "ordered_reduce", "ordered_sum", "ordered_norm",
+    "permute_rows_local",
     "ordered_transient_bytes", "install_reduction_guard",
     "install_reduction_guard_from_env", "reduction_trace",
     # the platform legs of the native-provider ABI

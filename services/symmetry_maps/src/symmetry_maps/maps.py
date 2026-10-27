@@ -13,6 +13,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from lxkit import device_put_process_local, device_put_process_local_cached
+from lxkit import permute_rows_local as _permute_isdf_rows_local
 from ._compat import deprecated_alias
 from .directed_edges import apply_band_matrix_symmetry
 from jax import shard_map
@@ -939,35 +940,6 @@ def _endpoint_panel_kernel(mesh, mesh_axis, is_local, n_sym_spatial):
                                             nlocal, axis=0)
         return jnp.where(mask[None, :, None, None], result, 0)
     return jax.jit(route)
-
-
-def _permute_isdf_rows_local(current, source_map, *, mesh_axis, parts, is_local):
-    """Route ISDF centroid rows inside a manual region with one local bank.
-
-    ``current[q,mu_local,...]`` and ``source_map[q,mu]`` keep all spectator
-    axes. The ring used by endpoint factors also covers a single Fourier leg,
-    including q=1; no full centroid row is gathered or q carrier enlarged.
-    """
-    nlocal = int(current.shape[1])
-    owner = jax.lax.axis_index(mesh_axis)
-    sources = jax.lax.dynamic_slice_in_dim(source_map, owner*nlocal, nlocal, axis=1)
-    shape = sources.shape + (1,)*(current.ndim-2)
-    offsets = (sources % nlocal).reshape(shape)
-    pairs = [(i, (i+1) % parts) for i in range(parts)]
-
-    def step(carry, i):
-        held, output = carry
-        gathered = jnp.take_along_axis(held, offsets, axis=1)
-        output = jnp.where((sources//nlocal == (owner-i) % parts).reshape(shape),
-                           gathered, output)
-        if not is_local:
-            held = jax.lax.cond(i+1 < parts,
-                lambda a: jax.lax.ppermute(a, mesh_axis, pairs), lambda a: a, held)
-        return (held, output), None
-
-    (_, output), _ = jax.lax.scan(step, (current, jnp.zeros_like(current)),
-        jnp.arange(1 if is_local else parts), unroll=1)
-    return output
 
 
 def _apply_unfold_phase_and_trs_local(

@@ -36,7 +36,7 @@ import sys
 import traceback
 
 import jax
-from lxkit import ordered_norm, ordered_sum
+from lxkit import ordered_norm, ordered_sum, permute_rows_local
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -139,8 +139,21 @@ def deflate_zero_rows(eigh, *, constrain=None, shift=False, mesh=None):
         def reorder(operands):
             w, v = operands
             order = jnp.argsort(w, axis=-1, stable=True)
-            return pin((jnp.take_along_axis(w, order, axis=-1),
-                        jnp.take_along_axis(v, order[..., None, :], axis=-1)))
+            if mesh is None:
+                v = jnp.take_along_axis(v, order[..., None, :], axis=-1)
+            else:
+                @jax.shard_map(mesh=mesh, in_specs=(_face(v.ndim), P()),
+                               out_specs=_face(v.ndim), check_vma=False)
+                def columns(q, source):
+                    shape = q.shape
+                    rows = jnp.swapaxes(q, -1, -2).reshape(-1, shape[-1], shape[-2])
+                    rows = permute_rows_local(
+                        rows, source.reshape(-1, source.shape[-1]), mesh_axis='y',
+                        parts=int(mesh.shape['y']), is_local=int(mesh.shape['y']) == 1)
+                    return jnp.swapaxes(rows.reshape(
+                        shape[:-2] + (shape[-1], shape[-2])), -1, -2)
+                v = columns(v, order)
+            return pin((jnp.take_along_axis(w, order, axis=-1), v))
         return pin(jax.lax.cond(live_negative, reorder, pin, (restored, vectors)))
     return solve
 

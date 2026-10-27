@@ -40,7 +40,7 @@ import sys
 
 __all__ = ["ordered_psum_scatter", "ordered_psum", "ordered_reduce", "ordered_sum", "ordered_norm",
            "slab_bytes", "ordered_transient_bytes", "ORDERED_TRANSIENT_SLABS",
-           "install_reduction_guard", "install_reduction_guard_from_env",
+           "permute_rows_local", "install_reduction_guard", "install_reduction_guard_from_env",
            "reduction_trace", "EXACT_MARKER"]
 
 #: The comment that exempts a raw library reduction: the sum is exact at any rank
@@ -274,6 +274,38 @@ def ordered_psum(x, axis_name, *, slab_bytes: int | None = None):
     import jax
     slab = int(slab_bytes if slab_bytes is not None else globals()["slab_bytes"]())
     return jax.tree_util.tree_map(lambda leaf: _ordered_psum_leaf(leaf, axis_name, slab), x)
+
+
+def permute_rows_local(current, source_map, *, mesh_axis, parts, is_local):
+    """Select distributed rows inside a manual region with one local bank.
+
+    ``current[q, row_local, ...]`` keeps all spectator axes. ``source_map``
+    is ``[q, global_row]``: output row j takes input row source_map[q,j].
+    The ring visits every owner while retaining only local input/output
+    banks. ``is_local`` is an existing caller's locality certificate.
+    """
+    import jax
+    import jax.numpy as jnp
+    nlocal = int(current.shape[1])
+    owner = jax.lax.axis_index(mesh_axis)
+    sources = jax.lax.dynamic_slice_in_dim(source_map, owner*nlocal, nlocal, axis=1)
+    shape = sources.shape + (1,)*(current.ndim-2)
+    offsets = (sources % nlocal).reshape(shape)
+    pairs = [(i, (i+1) % parts) for i in range(parts)]
+
+    def step(carry, i):
+        held, output = carry
+        gathered = jnp.take_along_axis(held, offsets, axis=1)
+        output = jnp.where((sources//nlocal == (owner-i) % parts).reshape(shape),
+                           gathered, output)
+        if not is_local:
+            held = jax.lax.cond(i+1 < parts,
+                lambda a: jax.lax.ppermute(a, mesh_axis, pairs), lambda a: a, held)
+        return (held, output), None
+
+    (_, output), _ = jax.lax.scan(step, (current, jnp.zeros_like(current)),
+        jnp.arange(1 if is_local else parts), unroll=1)
+    return output
 
 
 def _spec_axes(spec) -> tuple:

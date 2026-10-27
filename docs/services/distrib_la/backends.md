@@ -179,6 +179,14 @@ through NCCL.
 **Handler inventory.** There is no ScaLAPACK Cholesky handler, and no
 native GEMM handler is called.
 
+Restoring zero rows can require sorting eigenvector columns when a live
+value is negative, including a tiny negative roundoff value. The checked
+owner streams local column tiles around the `y` mesh axis through the same
+bounded row-permutation transport used by symmetry maps. It retains local
+input/output tiles and the existing index vector, rather than gathering
+all columns of a row block. Stable eigenvalue order and eigenvector values
+are unchanged; the actual executable includes this transport in its price.
+
 ## Distributed is a capacity route {#capacity-route}
 
 ### The size route (ROCm) {#size-route}
