@@ -3806,6 +3806,41 @@ def pair_build_attrs() -> dict:
     return dict(mathdx_root=root, cubin_dir=cubin_cache_dir())
 
 
+def _fourier_plan_workspace_bytes(x_shape, attrs):
+    """Exact arena of the loaded ROCm plan for these local operands/attributes.
+
+    The native query and execution share the existing plan cache. Cached
+    Fourier matrices are plan metadata; no field or workspace is allocated
+    by this query. Failure never becomes a zero-workspace estimate.
+    """
+    import ctypes
+    from ffi.common import ffi_loader
+    library = ffi_loader.get_lib("ROCM")
+    try:
+        query = library.lrx_fourier_plan_workspace_bytes
+    except AttributeError as exc:
+        raise RuntimeError("GATE fourier-plan-workspace: the loaded ROCm leg lacks "
+                           "the plan query; rebuild the whole native pair") from exc
+    i64 = ctypes.POINTER(ctypes.c_int64)
+    query.argtypes = [ctypes.c_int, ctypes.c_int64] + [i64] * 8 + [
+        ctypes.POINTER(ctypes.c_double), i64, ctypes.c_int64, ctypes.c_int64,
+        ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p, ctypes.c_size_t]
+    query.restype = ctypes.c_int
+    arrays = [attrs[k] for k in ("n", "kin", "kout", "in_idx", "out_idx",
+                                "sup_in", "sup_out", "gemm")]
+    size, error = ctypes.c_uint64(), ctypes.create_string_buffer(512)
+    d = len(attrs["n"])
+    status = query(d, math.prod(x_shape[:-d]),
+        *(a.ctypes.data_as(i64) for a in arrays),
+        attrs["scale"].ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        attrs["order"].ctypes.data_as(i64), len(attrs["order"]), int(attrs["sign"]),
+        ctypes.byref(size), error, ctypes.sizeof(error))
+    if status:
+        raise RuntimeError("GATE fourier-plan-workspace: "
+                           + error.value.decode("utf-8", errors="replace"))
+    return int(size.value)
+
+
 def fourier_plan_ffi(x, *, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm, scale,
                      order, sign, leg="CUDA", mathdx_root="", cubin_dir=""):
     """One custom call of ``leg``'s :data:`FOURIER_PLAN_TARGETS` row over the ``len(n)``
@@ -3820,17 +3855,22 @@ def fourier_plan_ffi(x, *, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm,
     CUDA: ``mathdx_root``/``cubin_dir`` build the fused supported pair (the two
     trailing axes' GEMMs back to back as one cuBLASDx kernel, when a block fits
     it on the device); ``""`` runs every GEMM through cuBLAS.  ROCM: ``cubin_dir``
-    caches the remap kernel's hipRTC image (``""``: not cached).
+    caches the remap kernel's hipRTC image (``""``: not cached). Its queried
+    arena is an explicit uint8 result, so AOT prices all temporary native
+    banks and vendor work; callers still receive only the physical output.
     """
     d = len(n)
     out = jax.ShapeDtypeStruct(tuple(x.shape[:-d]) + tuple(int(k) for k in kout), x.dtype)
-    i64 = lambda v: np.asarray(v, dtype=np.int64)
+    i64 = lambda v: np.ascontiguousarray(v, dtype=np.int64)
     build = dict(mathdx_root=mathdx_root, cubin_dir=cubin_dir)
-    return jax.ffi.ffi_call(FOURIER_PLAN_TARGETS[leg], out)(
-        x, n=i64(n), kin=i64(kin), kout=i64(kout), in_idx=i64(in_idx), out_idx=i64(out_idx),
+    attrs = dict(n=i64(n), kin=i64(kin), kout=i64(kout), in_idx=i64(in_idx), out_idx=i64(out_idx),
         sup_in=i64(sup_in), sup_out=i64(sup_out), gemm=i64(gemm),
-        scale=np.asarray(scale, dtype=np.float64), order=i64(order), sign=np.int64(sign),
+        scale=np.ascontiguousarray(scale, dtype=np.float64), order=i64(order), sign=np.int64(sign),
         **{k: build[k] for k in _FOURIER_PLAN_ATTRS[leg]})
+    if leg == "ROCM":
+        workspace = jax.ShapeDtypeStruct((_fourier_plan_workspace_bytes(x.shape, attrs),), jnp.uint8)
+        return jax.ffi.ffi_call(FOURIER_PLAN_TARGETS[leg], (out, workspace))(x, **attrs)[0]
+    return jax.ffi.ffi_call(FOURIER_PLAN_TARGETS[leg], out)(x, **attrs)
 
 
 # ---------------------------------------------------------------------------------------------
