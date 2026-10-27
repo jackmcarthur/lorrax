@@ -2216,10 +2216,11 @@ def _centroid_face_kernels(
         b_start, meta, mu_active_mask, n_rmu, n_rmu_padded, nb_total, out_X, out_Y,
         stage_X_4d, stage_Y_4d):
     """Produce the existing face reshards and logical-extent finalizer."""
-    # One reshard owner for both the bulk and streamed paths.  The input is
-    # band-sharded; the two consumers need independent Y-face and transposed
-    # X-face layouts.  Applying each stage constraint before μ padding avoids
-    # the x-major/y-major involuntary rematerialization documented below.
+    # Pad while bands own all mesh axes and μ is still local. Padding after
+    # moving an axis to μ creates halo exchanges between uneven logical
+    # shards. Both consumers reuse this one legal carrier before their
+    # existing Y-face and transposed X-face reshards.
+    band_owner = NamedSharding(out_Y.mesh, band_sphere_spec())
     @partial(jax.jit, out_shardings=(out_Y, out_X))
     def _reshard_centroid_tile(psi_rmu_band):
         pad_cfg = ((0, 0), (0, 0), (0, 0), (0, n_rmu_padded - n_rmu))
@@ -2227,13 +2228,13 @@ def _centroid_face_kernels(
             psi_rmu_band = jnp.where(
                 jnp.asarray(mu_active_mask)[None, None, None, :],
                 psi_rmu_band, jnp.zeros((), dtype=psi_rmu_band.dtype))
-        psi_rmu = jax.lax.with_sharding_constraint(psi_rmu_band, stage_Y_4d)
+        psi_rmu_band = jax.lax.with_sharding_constraint(psi_rmu_band, band_owner)
         if n_rmu_padded > n_rmu:
-            psi_rmu = jnp.pad(psi_rmu, pad_cfg)
+            psi_rmu_band = jnp.pad(psi_rmu_band, pad_cfg)
+        psi_rmu_band = jax.lax.with_sharding_constraint(psi_rmu_band, band_owner)
+        psi_rmu = jax.lax.with_sharding_constraint(psi_rmu_band, stage_Y_4d)
         psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, out_Y)
         psi_T = jax.lax.with_sharding_constraint(psi_rmu_band, stage_X_4d)
-        if n_rmu_padded > n_rmu:
-            psi_T = jnp.pad(psi_T, pad_cfg)
         psi_rmuT = jnp.conj(psi_T.transpose(0, 3, 1, 2))
         psi_rmuT = jax.lax.with_sharding_constraint(psi_rmuT, out_X)
         return psi_rmu, psi_rmuT
@@ -2598,15 +2599,11 @@ def _load_bulk_centroid_faces(
     # K.1 #7).  The split chains move full/Px + full/Py per rank instead
     # of full/Py + full.  Values are untouched (pad/transpose/conj are
     # elementwise/layout ops): bit-identical outputs, different wires.
-    # ORDERING MATTERS: each chain applies its stage constraint BEFORE the
-    # μ-pad.  Padding first (the original form) gives the pad output ONE
-    # sharding that both chains then consume — the partitioner assigns it
-    # the first chain's b:'y' layout and the second chain's b:'x' demand
-    # becomes exactly the y-major↔x-major device-order move again
-    # (measured: at 8×10 the hoisted pad re-created the involuntary remat
-    # on per-shard c128[144,16,2,640] — wk_AO/gw80 first attempt).  With
-    # the constraint first, the two pads are distinct instructions on
-    # distinctly-sharded operands and each chain stays on its own axis.
+    # The shared pad is explicitly band-all-P before AND after padding.
+    # Without that owner, the historical hoisted pad inherited the first
+    # chain's b:'y' layout and the second b:'x' demand re-created the
+    # rectangular-mesh rematerialization above. The legal all-P carrier now
+    # feeds both independent chains without padding an already μ-sharded axis.
     # Attribution barrier: the process-local WfnLoader work above this line
     # does not synchronize processes, so the first collective inside
     # ``_reshard_centroid_tile`` absorbs ALL process skew accumulated since
