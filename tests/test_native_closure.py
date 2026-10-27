@@ -248,6 +248,41 @@ def tree(tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------- build side
 # ---------------------------------------------------------------- record checks
+def test_record_files_hashes_unknown_or_changed_times_and_keeps_known_fast_path(tmp_path):
+    """A missing timestamp cannot authenticate same-size replacement bytes."""
+    path = tmp_path / "librocblas.so.5"
+    path.write_bytes(b"original")
+    expected = npv._sha256(path)
+    stamp = path.stat().st_mtime_ns
+    calls = []
+
+    def hasher(p):
+        calls.append(p)
+        return npv._sha256(p)
+
+    def record(mtime):
+        entry = npv.ClosureEntry(path.name, path, expected, 8, mtime, "process", "librocblas")
+        return npv.ClosureRecord(tmp_path / "manifest.json", "ROCM", path,
+                                 "0" * 64, (entry,), "0" * 64)
+
+    for mtime, count in ((stamp, 0), (0, 1)):
+        calls.clear()
+        npv.check_record_files(record(mtime), hasher=hasher)
+        assert len(calls) == count
+    # An unchanged file with a new timestamp still passes by its bytes.
+    os.utime(path, ns=(stamp, stamp + 1_000_000_000))
+    calls.clear()
+    npv.check_record_files(record(stamp), hasher=hasher)
+    assert calls == [path]
+    path.write_bytes(b"replaced")
+    os.utime(path, ns=(stamp, stamp + 2_000_000_000))
+    for mtime in (0, stamp):
+        calls.clear()
+        with pytest.raises(_Unusable, match="changed content since the build"):
+            npv.check_record_files(record(mtime), hasher=hasher, unusable_cls=_Unusable)
+        assert calls == [path]
+
+
 # ---------------------------------------------------------------- the gate
 def test_gate_requires_each_recorded_family_mapped_once_as_the_recorded_file(tree, monkeypatch):
     def check(maps, rec=None):
@@ -417,6 +452,15 @@ def test_sealer_device_pairs_keep_source_closure_and_pin_guards(tmp_path, monkey
     assert set(att.libraries)==set(att.closures)=={platform,"cpu"}
     assert att.source_revision==revision and att.private_libraries==(output/"lib"/private.name,)
     assert all(not p.is_symlink() and not p.stat().st_mode&0o222 for p in [manifest,*att.libraries.values(),*att.private_libraries])
+    # Real sealed records omit external mtimes. Both legs must revalidate the
+    # shared runtime bytes, even at the same path and size, before loading.
+    for record in att.closures.values():
+        npv.check_record_files(record, unusable_cls=_Unusable)
+    mpi.write_bytes(b"two MPI")
+    for record in att.closures.values():
+        with pytest.raises(_Unusable, match="changed content since the build"):
+            npv.check_record_files(record, unusable_cls=_Unusable)
+    mpi.write_bytes(b"one MPI")
     specs={name:{"env":LEGS[name].so_env,"so_name":LEGS[name].so_name,"build_hint":"fixture"}
            for name in (platform,"cpu")}
     env={LEGS[name].so_env:str(path) for name,path in att.libraries.items()}
