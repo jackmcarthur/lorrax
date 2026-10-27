@@ -26,7 +26,7 @@ that span devices belonging to other processes. The helpers below therefore:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from typing import Callable, Optional
 import weakref
 
@@ -126,14 +126,24 @@ def init_bse_subspace(
     from common.gpu_utils import device_budget_bytes
     from runtime.aot_memory import compiled_price
     key = jnp.int64(seed)
-    executable = _bse_seed_program.lower(ec, ev, key, sharding=sharding,
-        nc_log=nc_log, nv_log=nv_log, n_eig=n_eig, n_random=n_random, dtype=dtype).compile()
+    signature = tuple(jax.ShapeDtypeStruct(x.shape, x.dtype,
+                      sharding=x.sharding if x.committed else None)
+                      for x in (ec, ev, key))
+    executable = _compiled_bse_seed(signature, sharding, nc_log, nv_log,
+                                    n_eig, n_random, dtype)
     stage = 'BSE initial subspace'
     price = compiled_price(compiled=executable, ranks=int(mesh.size), face=True, source=stage)
     device_budget_bytes()
     memory.book(price, stage=stage)
     memory.admit(stage, price, memory.room(bucketed=False))
     return executable(ec, ev, key)
+
+
+@lru_cache(maxsize=16)
+def _compiled_bse_seed(signature, sharding, nc_log, nv_log, n_eig, n_random, dtype):
+    """AOT once per abstract geometry; no energy tables or seed values retained."""
+    return _bse_seed_program.lower(*signature, sharding=sharding,
+        nc_log=nc_log, nv_log=nv_log, n_eig=n_eig, n_random=n_random, dtype=dtype).compile()
 
 
 @partial(jax.jit, static_argnames=('sharding', 'nc_log', 'nv_log', 'n_eig', 'n_random', 'dtype'))

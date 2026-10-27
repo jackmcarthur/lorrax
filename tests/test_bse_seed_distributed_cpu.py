@@ -1,6 +1,9 @@
 """BSE seed physics and owned storage, including a 144-device abstract case."""
 import math
 import re
+import gc
+import weakref
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +12,7 @@ import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from bse.bse_davidson_helpers import init_bse_subspace, _bse_seed_program
+from bse import bse_davidson_helpers as B
 
 jax.config.update('jax_enable_x64', True)
 
@@ -25,6 +29,52 @@ def _energies(nk, nc, nv, logical):
     ec[:, :logical[0]] = .4 + .07*np.arange(logical[0])[None] + .009*np.arange(nk)[:, None]
     ev[:, :logical[1]] = -.2 - .013*np.arange(logical[1])[None] + .001*np.arange(nk)[:, None]
     return ec, ev
+
+
+def test_repeated_seed_calls_reuse_compilation_without_retaining_inputs(monkeypatch):
+    mesh = _mesh(2)
+    shape = (4, 6, 7)
+    ec, ev = _energies(7, 4, 6, (3, 5, 7))
+    sc, sv = NamedSharding(mesh, P(None, 'x')), NamedSharding(mesh, P(None, 'y'))
+    sh = NamedSharding(mesh, P(None, 'x', 'y', None))
+    source_program = B._bse_seed_program
+    calls = []
+
+    def lower(*args, **kwargs):
+        lowered = source_program.lower(*args, **kwargs)
+        def compile():
+            calls.append(1)
+            return lowered.compile()
+        return SimpleNamespace(compile=compile)
+
+    if hasattr(B, '_compiled_bse_seed'):
+        B._compiled_bse_seed.cache_clear()
+    monkeypatch.setattr(B, '_bse_seed_program', SimpleNamespace(lower=lower))
+    results = []
+    references = []
+    for trial, seed in enumerate((37, 37, 38)):
+        current = ec.copy()
+        if trial:
+            current[:, :2] = current[:, [1, 0]]
+        c, v = jax.device_put(current, sc), jax.device_put(ev, sv)
+        references.extend((weakref.ref(c), weakref.ref(v)))
+        value = B.init_bse_subspace(c, v, 11, n_cond=3, n_val=5,
+            n_random=3, seed=seed, mesh=mesh, sharding=sh)
+        result = np.asarray(value)
+        delta = (current[:, :3, None]-ev[:, None, :5]).reshape(-1)
+        selected = np.lexsort((np.arange(delta.size), delta))[:8]
+        k, ci, vi = np.unravel_index(selected, (7, 3, 5))
+        expected = np.zeros((8, *shape), np.complex128)
+        expected[np.arange(8), ci, vi, k] = 1
+        np.testing.assert_array_equal(result[:8], expected)
+        results.append(result)
+        del c, v, value
+    assert len(calls) == 1, 'identical abstract geometry must lower/compile once'
+    assert not np.array_equal(results[0][:8], results[1][:8])
+    np.testing.assert_array_equal(results[0][8:], results[1][8:])
+    assert not np.array_equal(results[1][8:], results[2][8:])
+    gc.collect()
+    assert all(reference() is None for reference in references)
 
 
 def test_selected_transitions_random_support_and_grid_invariance(monkeypatch):
