@@ -104,7 +104,7 @@ Diagrams summed by $W$: the RPA Dyson series, the ladder-corrected resolvent, or
 {: .kw-values }
 
 ### `screening_source` {: .kw data-type="enum" data-default="compute" }
-Where the $W$ that Σ uses comes from: this run's own $\chi^0$ and Dyson solve, or BerkeleyGW's $\varepsilon^{-1}$.
+Source of the $W$ that Σ uses, either this run's own $\chi^0$ and Dyson solve or BerkeleyGW's $\varepsilon^{-1}$.
 
 `bgw_epsmat` reads the $W$ that `gw.epsmat_cli` `mode = project` wrote into the ISDF tensor file, with `restart = true`, under `cohsex` or `gn_ppm`, one-shot only ([Importing BerkeleyGW's W](../berkeleygw-export.md#import)).
 {: .kw-details }
