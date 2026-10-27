@@ -30,6 +30,12 @@ psi_mun[parent, spin, mu, band]        psi_nmu[parent, band, spin, mu]
 The fit keeps the band-distributed mesh-face copies (bands on one mesh
 axis, centroids on the other) and distributes the band contraction.
 
+The shared sampler first masks logical centroids and pads their carrier
+once while bands own the full mesh product. Explicit band-owner constraints
+before and after padding keep that operation local. Both complementary
+sampling layouts are then formed independently from this legal carrier;
+neither layout is reconstructed from the other finished face.
+
 Canonical ζ files do not encode the layout. The left and right band windows
 are 0/1 weights over the loaded, mesh-padded band extent, so a window edge
 need not divide the mesh. C_q and Z_q use the same weights. Pseudobands are

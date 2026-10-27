@@ -495,6 +495,16 @@ donated insertion, so no final padded-output crop overlaps two complete
 face pairs. Transfer faces and the local full-grid FFT scan remain separate
 workspaces; the fixed tile is a workspace target, not a total-process cap.
 
+Centroid padding stays in the sampler's band-all-ranks layout before the
+two independent face reshards. One padded transfer tile feeds both chains;
+padding an already centroid-sharded face is avoided. In a CPU JAX 0.9.1
+virtual-P4 abstract compile with `N_k=25`, `N_b=8191`, `n_s=2` and
+`μ=2049→2052`, this reduced the insertion executable's temporary allocation
+from 1,075,052,676 to 806,879,360 bytes (about 25%). This is a compiler
+workspace comparison, not a measured process peak or a general capacity
+bound; the actual executable and native workspace queries still set the
+stage's admission price.
+
 With `s = n_par/N_k` (the symmetry reduction) and `r = N_b/μ`, in units of
 the Green tile:
 
