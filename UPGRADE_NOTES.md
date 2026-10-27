@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-27 — Use measured ROCm EIGH placement costs
+
+Room-bearing `auto` EIGH plans with `batched_route="auto"` now use measured
+ROCm local/ELPA costs in the existing stack chooser. Large batch-one solves
+can select ELPA when its quote fits; fitting batches retain local parallelism.
+A missing provider or an over-room provider quote cannot displace a fitting
+local route. Explicit backend resolution and the default `batch_reshard`
+contract are unchanged. No native signatures change; the already-required
+ABI 15 pair is reused.
+
 ## 2026-10-27 — Respect the OpenMP limit in real ELPA solves
 
 Rebuild and seal the whole native pair to pick up the ROCm ELPA correction.

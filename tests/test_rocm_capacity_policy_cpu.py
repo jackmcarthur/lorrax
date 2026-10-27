@@ -189,3 +189,82 @@ def test_checked_workspace_prices_only_admitted_gathered_retry(monkeypatch):
                                 max(first, extra) if included else first)
     finally:
         workspace.local_eigh_workspace.cache_clear()
+
+
+def test_measured_stack_placement_keeps_batches_and_unavailable_provider_local(monkeypatch):
+    """Actual Plan decisions with quote/provider metadata, no matrix execution.
+
+    Positive local/provider quote stand-ins isolate the timing decision; they
+    are not a hardware capacity measurement. Gathered eligibility keeps its
+    real CPU compiler owner. Native matched probes qualify the numerical routes.
+    """
+    from dataclasses import replace
+    import importlib
+    import jax
+    import pytest
+    from jax.sharding import Mesh
+    from lxkit import memory
+    pm = importlib.import_module('distrib_la.plan')
+    if len(jax.devices()) < 4:
+        pytest.skip('requires four virtual CPU devices for the P4 policy')
+    mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2,2), ('x','y'))
+    monkeypatch.setattr(pm, '_STACK_CLASSES', {})
+    monkeypatch.setattr(pm, '_STACK_ROUTES', {})
+    monkeypatch.setattr(memory, '_RUN', {**memory._RUN, 'nmu': 0})
+    provider_calls = []
+    provider_price_override = [None]
+
+    def local_quote(_op, _mesh, nb, n, dtype, rounds, *_args):
+        share = -(-nb // (4*rounds))
+        return 8*share*n*n*np.dtype(dtype).itemsize + 1024
+
+    def provider_quote(policy, op, nb, n, dtype, phase):
+        provider_calls.append((policy.backend, nb, n))
+        if provider_price_override[0] is not None:
+            return provider_price_override[0]
+        return nb*n*n*np.dtype(dtype).itemsize//4 + (1 << 20)
+
+    monkeypatch.setattr(pm, '_stack_bytes', local_quote)
+    monkeypatch.setattr(pm.Plan, 'mesh_bytes', provider_quote)
+    room = 64 << 30
+    for platform, provider in (('ROCM','elpa'), ('CUDA','cusolvermp')):
+        pm._STACK_CLASSES.clear()
+        pm._STACK_ROUTES.clear()
+        monkeypatch.setattr(pm, 'mesh_platform', lambda _mesh: platform)
+        monkeypatch.setattr(pm, 'resolve_eigh_capacity', lambda *_a, **_k: (provider, None))
+        for dtype in (np.float64, np.complex128):
+            for n in (8192, 16384):
+                policy = pm.plan('eigh', mesh, backend='auto', n=n,
+                                 budget_bytes=room, batched_route='auto')
+                assert policy.backend == provider
+                assert policy.stack_route((1,n,n), dtype).route == pm.ROUTE_SCAN
+                for nb in (4, 8):
+                    result = policy.stack_route((nb,n,n), dtype)
+                    assert result.route == pm.ROUTE_BATCH_RESHARD
+                    assert result.program_bytes <= room
+            if platform == 'ROCM':
+                for n in (256, 2048, 3120, 4096):
+                    policy = pm.plan('eigh', mesh, backend='auto', n=n,
+                                     budget_bytes=room, batched_route='auto')
+                    assert policy.stack_route((1,n,n), dtype).route == pm.ROUTE_BATCH_RESHARD
+
+        # Time alone must not select a provider whose own quote is over the
+        # room while the local quote fits. This is not an allocator bound.
+        pm._STACK_CLASSES.clear()
+        pm._STACK_ROUTES.clear()
+        provider_price_override[0] = room + 1
+        priced = pm.plan('eigh', mesh, backend='auto', n=8192,
+                         budget_bytes=room, batched_route='auto')
+        assert priced.stack_route((1,8192,8192), np.complex128).route == pm.ROUTE_BATCH_RESHARD
+        provider_price_override[0] = None
+        monkeypatch.setattr(pm, 'resolve_eigh_capacity', lambda *_a, **_k: (
+            'native', 'test capability metadata: provider unavailable'))
+        absent = pm.plan('eigh', mesh, backend='auto', n=8192,
+                         budget_bytes=room, batched_route='auto')
+        before = len(provider_calls)
+        assert absent.stack_route((1,8192,8192), np.complex128).route == pm.ROUTE_BATCH_RESHARD
+        assert len(provider_calls) == before
+        # An explicit one-device backend is still a local backend even when
+        # the platform's whole-mesh timing row would be faster for B1.
+        explicit = replace(policy, requested='one_device', backend='one_device', n=8192)
+        assert explicit.stack_route((1,8192,8192), np.complex128).route == pm.ROUTE_BATCH_RESHARD
