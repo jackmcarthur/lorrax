@@ -1123,6 +1123,7 @@ def dyson_close_tile(T: jax.Array, V_q0: jax.Array) -> jax.Array:
     and matching native workspace are admitted beside the live operands.
     """
     from dataclasses import replace
+    from common.collectives import single_device_mesh
     from common.gpu_utils import device_budget_bytes
     from distrib_la import (plan, lu_workspace_query,
                             room_or_exhausted)
@@ -1135,7 +1136,7 @@ def dyson_close_tile(T: jax.Array, V_q0: jax.Array) -> jax.Array:
         raise ValueError("ring-lift close requires equal square T and v")
     mesh = getattr(T.sharding, "mesh", None)
     if mesh is None:
-        mesh = Mesh(np.asarray([T.device]).reshape(1, 1), ("x", "y"))
+        mesh = single_device_mesh()
     face = NamedSharding(mesh, P("x", "y"))
     n = int(T.shape[0])
     budget = int(device_budget_bytes())
