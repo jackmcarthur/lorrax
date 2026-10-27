@@ -18,6 +18,8 @@ Only the eigenvalue index comes back block-cyclic; one ``all_to_all``
 """
 from __future__ import annotations
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -74,3 +76,49 @@ def cyclic_to_block(Q, *, n: int, p: int, mb: int, axis: str = "x"):
     out = jax.lax.all_to_all(out, axis, 0, 0, tiled=True)
     out = jnp.take(out, jnp.asarray(recv)[a], axis=0)
     return out.reshape(Q.shape)
+
+
+def face_crop(Q, n: int, *, offsets=(0, 0), mesh=None):
+    """Crop a face to ``n x n`` through two dependent uniform axis transfers.
+
+    Each axis first trades spectator columns for all rows. The resulting
+    product-owned bank has no more elements than the padded local face, so
+    the contiguous row crop is local. The reverse transfer restores row
+    ownership. Only local spectator columns are padded, by at most p-1.
+    """
+    from jax import shard_map
+    from jax.sharding import PartitionSpec as P
+
+    n, offsets = int(n), tuple(map(int, offsets))
+    if n < 0 or len(offsets) != 2 or any(
+            start < 0 or start+n > extent for start, extent in zip(offsets, Q.shape[-2:])):
+        raise ValueError("face crop is outside the input extents")
+    if mesh is None:
+        return Q[..., offsets[0]:offsets[0]+n, offsets[1]:offsets[1]+n]
+    if any(n % int(mesh.shape[axis]) for axis in ("x", "y")):
+        raise ValueError("face crop output must divide both mesh axes")
+    if Q.shape[-2:] == (n, n) and offsets == (0, 0):
+        return Q
+    spec = P(*((None,)*(Q.ndim-2)), "x", "y")
+
+    def rows(current, start, axis):
+        parts = int(mesh.shape[axis])
+        if parts == 1:
+            return current[..., start:start+n, :]
+        columns = int(current.shape[-1])
+        pad = (-columns) % parts
+        current = jnp.pad(current, ((0, 0),)*(current.ndim-1)+((0, pad),))
+        bank = jax.lax.all_to_all(current, axis, current.ndim-1, current.ndim-2, tiled=True)
+        bank = bank[..., start:start+n, :]
+        face = jax.lax.all_to_all(bank, axis, bank.ndim-2, bank.ndim-1, tiled=True)
+        return face[..., :columns]
+
+    @partial(shard_map, mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False)
+    def local(q):
+        if n == 0:
+            return jnp.zeros(q.shape[:-2]+(0, 0), q.dtype)
+        q = rows(q, offsets[0], "x")
+        q = rows(jnp.swapaxes(q, -1, -2), offsets[1], "y")
+        return jnp.swapaxes(q, -1, -2)
+
+    return local(Q)
