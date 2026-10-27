@@ -137,42 +137,57 @@ class ExactHartreeMatrices(NamedTuple):
     tt_metric_sign: float
 
 
-def _book_direct_field_price(psi_G, psi_charge, geom, operator, *,
-                             nk_full: int, nb: int, ranks: int,
-                             with_transverse: bool, sym_perm_bytes: float):
-    """Book this stage's per-rank price to the open section (``lxkit.memory``).
+def _book_density_price(*, nk_w: int, nb_load: int, ns: int, ngkmax: int,
+                        charge_ns: int, with_transverse: bool, grid,
+                        n_sym: int, ranks: int) -> float:
+    """Book the stage's sphere and density phase to the open section, BEFORE
+    ψ is loaded, so the increment's entry reading is what precedes the stage
+    (``lxkit.memory``).  Returns the density transient in bytes.
 
-    Resident through the stage, spread over P: the ψ(G) wedge sphere (and
-    its charge-spinor slice when that is a copy), the wedge matrix blocks and
-    their full-BZ star broadcast.  Replicated: the fields and the star
-    pullback table.  Transient, the larger of the two phases, each bounded
-    by the fixed tile: one density band chunk's boxes
-    (:func:`gw.qsgw_density.density_band_chunk`) and the sweep's k step plus
-    its band chunk's boxes (:func:`common.mtxel_sweep.sweep_transient_bytes`).
+    Spread over P: the ψ(G) wedge sphere, band-padded to the mesh (and its
+    charge-spinor slice when the scalar sweep takes a copy).  Replicated: the
+    fields and the star pullback table.  Transient: one density band chunk's
+    boxes (:func:`gw.qsgw_density.density_band_chunk`), bounded by the tile.
     """
     from lxkit import memory
-    from common.mtxel_sweep import sweep_transient_bytes
     from gw.qsgw_density import DENSITY_BOX_COPIES, density_band_chunk
 
-    c128, n_grid = 16.0, float(geom.ngrid)
-    nk_w, nb_load, ns, ngk = (int(s) for s in psi_G.shape)
+    c128, n_grid = 16.0, float(np.prod(grid))
+    p = max(1, int(ranks))
+    rank_bands = -(-int(nb_load) // p)
+    sphere = float(nk_w * rank_bands * p * ngkmax) * c128
+    ns_sphere = ns + (charge_ns if not with_transverse and charge_ns != ns
+                      else 0)
     n_fields = 4 if with_transverse else 1
-    sphere = float(nk_w * nb_load * ns * ngk) * c128
-    if psi_charge is not psi_G:
-        sphere += float(np.prod(psi_charge.shape)) * c128
-    blocks = (n_fields * (nk_w * float(geom.nb) ** 2 + nk_full * float(nb) ** 2)
-              * c128)
-    fields = 3.0 * n_fields * n_grid * 8.0 + sym_perm_bytes
-    rank_bands = -(-nb_load // max(1, int(ranks)))
+    fields = 3.0 * n_fields * n_grid * 8.0 + float(n_sym) * n_grid * 4.0
     density = (DENSITY_BOX_COPIES * ns * n_grid * c128 * density_band_chunk(
         n_loc=rank_bands, k_tile=1, ns=ns, n_grid=int(n_grid)))
+    memory.book(memory.Price(
+        operands=memory.Term(fields, sphere * ns_sphere,
+                             "psi(G) wedge sphere + fields + star pullback"),
+        xla=memory.Term(density, 0.0, "density band-chunk boxes"),
+        ranks=p, label="Sigma Hartree density", increment=True))
+    return density
+
+
+def _book_sweep_price(geom, operator, *, nk_full: int, nb: int,
+                      n_blocks: int, density_bytes: float, ranks: int):
+    """Book the matrix sweep's part: its output blocks (spread over P) and
+    the part of its transient beyond the density phase's, so the stage's
+    transient is the larger of the two
+    (:func:`common.mtxel_sweep.sweep_transient_bytes`)."""
+    from lxkit import memory
+    from common.mtxel_sweep import sweep_transient_bytes
+
+    blocks = (n_blocks * (geom.nk * float(geom.nb) ** 2
+                          + nk_full * float(nb) ** 2) * 16.0)
     sweep = sweep_transient_bytes(geom, operator)
     memory.book(memory.Price(
-        operands=memory.Term(fields, sphere + blocks,
-                             "psi(G) wedge sphere + V_H blocks + fields"),
-        xla=memory.Term(max(density, sweep), 0.0,
-                        "density band-chunk boxes | sweep k step + boxes"),
-        ranks=int(ranks), label="Sigma Hartree", increment=True))
+        operands=memory.Term(0.0, blocks, "V_H wedge + full-BZ blocks"),
+        xla=memory.Term(max(0.0, sweep - density_bytes), 0.0,
+                        "sweep k step + band-chunk boxes"),
+        ranks=max(1, int(ranks)), label="Sigma Hartree matrix sweep",
+        increment=True))
 
 
 def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
@@ -251,6 +266,13 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
     from gw.qsgw_density import rho_from_wfns
     k_spec, _, nk_irr = star_wedge_kspec(wfn, sym)
     nb_load = max(int(nb), density_band_stop)
+    grid = tuple(int(s) for s in meta.fft_grid)
+    gtab = padded_gvectors(wfn, k=k_spec)
+    density_bytes = _book_density_price(
+        nk_w=nk_irr, nb_load=nb_load, ns=int(meta.nspinor),
+        ngkmax=int(gtab.gvecs.shape[1]), charge_ns=charge_ns,
+        with_transverse=with_transverse, grid=grid,
+        n_sym=len(sym.active_symmetry_rows), ranks=int(mesh.devices.size))
     psi_G = wfn.load(
         bands=(0, nb_load), k=k_spec, sharding=band_sphere_spec(),
         bispinor=(int(meta.nspinor) == 4),
@@ -263,13 +285,11 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
     f_spin = spin_degeneracy_factor(wfn)
     occ, kweights = wedge_density_occupations(
         wfn, sym, k_spec, nb_load, density_band_stop)
-    grid = tuple(int(s) for s in meta.fft_grid)
     # The Dirac current is projected onto the crystal symmetry ONCE, inside
     # the density scan; its receipt (movement of the raw field, residual of
     # the projected one) is the one reported below.
     projections = []
     sym_perm = sym.fft_grid_pullback(sym.active_symmetry_rows, grid)
-    sym_perm_bytes = float(np.prod(np.shape(sym_perm))) * 4.0
     with timing.section("vh_rho"):
         rho_np = np.asarray(rho_from_wfns(
             psi_G, occ, kweights, mesh=mesh, box_index=box_index,
@@ -399,7 +419,6 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
                                     local_potential_operator,
                                     sweep_matrix_elements)
     from common.wfn_layout import band_sphere_spec
-    gtab = padded_gvectors(wfn, k=k_spec)
     # The four-current operator takes its charge block by charge_nspinor
     # from psi_G itself, so a spinor slice is needed only by the scalar
     # sweep; in transverse mode it was a dead second copy of the sphere.
@@ -423,10 +442,10 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
         four_current_potential_operator(
             geom_matrix, V_H_r, V_T_r, charge_nspinor=charge_ns)
         if with_transverse else local_potential_operator(geom_matrix, V_H_r))
-    _book_direct_field_price(
-        psi_G, psi_charge, geom_matrix, matrix_operator, nk_full=nk, nb=nb,
-        ranks=int(mesh.devices.size), with_transverse=with_transverse,
-        sym_perm_bytes=sym_perm_bytes)
+    _book_sweep_price(
+        geom_matrix, matrix_operator, nk_full=nk, nb=nb,
+        n_blocks=2 if with_transverse else 1, density_bytes=density_bytes,
+        ranks=int(mesh.devices.size))
     with timing.section("vh_matrix"):
         H_matrix = sweep_matrix_elements(
             matrix_psi, operator=matrix_operator, geom=geom_matrix,
