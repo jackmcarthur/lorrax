@@ -680,6 +680,12 @@ use the identity q-load of this row owner; their source storage, read and
 canonical-to-packed conversion stay unchanged. Photon Σ sectors retain their
 existing contracts.
 
+The GN-PPM `sigma.tau_sweep` receipt books the selected compiled placement and
+consumer quote before preparing the banks, inside the already-open sweep.
+Its resident entry floor is therefore captured before placement. The older
+analytical node estimate is not added again; explicit native GEMM workspace
+in the executable appears in both admission and the reported price.
+
 These layout selectors use the exact minimum room over ranks. Neither
 program cache keys on room, so rounding it to whole GiB can reject a fitting
 axis layout without saving compilations. The global bucket policy remains
