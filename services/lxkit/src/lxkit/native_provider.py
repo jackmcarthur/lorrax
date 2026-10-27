@@ -889,7 +889,8 @@ def check_record_files(record: ClosureRecord, *,
                        unusable_cls: Type[OSError] = LibraryUnusable,
                        build_hint: str = "", hasher=None) -> None:
     """Every recorded file is still the recorded one: present, same size, and
-    (when its mtime moved) the same SHA-256.  Otherwise the record is stale."""
+    (when its mtime is unknown or moved) the same SHA-256.  Otherwise the
+    record is stale."""
     hasher = hasher or _sha256
     for e in record.entries:
         try:
@@ -904,7 +905,7 @@ def check_record_files(record: ClosureRecord, *,
                         f"{e.path} is {st.st_size} bytes, recorded {e.bytes}",
                         "the recorded file unchanged",
                         _rebuild_fix(record.leg, build_hint))
-        if e.mtime_ns and st.st_mtime_ns != e.mtime_ns and hasher(e.path) != e.sha256:
+        if (not e.mtime_ns or st.st_mtime_ns != e.mtime_ns) and hasher(e.path) != e.sha256:
             raise _gate(unusable_cls, f"stale closure record {record.origin}: "
                         f"{e.path} changed content since the build",
                         f"SHA-256 {e.sha256[:16]}",
