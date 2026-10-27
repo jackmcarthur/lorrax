@@ -103,6 +103,15 @@ Diagrams summed by $W$: the RPA Dyson series, the ladder-corrected resolvent, or
 `w_rpa` `w_bse` `w_rpa_resolvent`
 {: .kw-values }
 
+### `screening_source` {: .kw data-type="enum" data-default="compute" }
+Where the $W$ that Σ uses comes from: this run's own $\chi^0$ and Dyson solve, or BerkeleyGW's $\varepsilon^{-1}$.
+
+`bgw_epsmat` reads the $W$ that `gw.epsmat_cli` `mode = project` wrote into the ISDF tensor file, with `restart = true`, under `cohsex` or `gn_ppm`, one-shot only ([Importing BerkeleyGW's W](../berkeleygw-export.md#import)).
+{: .kw-details }
+
+`compute` `bgw_epsmat`
+{: .kw-values }
+
 ### `write_poles` {: .kw data-type="bool" data-default="false" }
 Exports the stored tangential factors $\tilde b_{j\bq}(\mu)=\sqrt{2\Omega_{j\bq}}\,b_{j\bq}(\mu)$ and $\Omega^2_{j\bq}$ to `tmp/mpa/<map>_poles.h5`, with $b$ the residue-normalised factor of [Tangential W model §2.1](../../theory/tangential-w.md#model-form).
 
