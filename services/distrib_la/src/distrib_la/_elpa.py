@@ -52,7 +52,7 @@ from jax import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la import _mesh_ctx
-from distrib_la._cyclic import cyclic_to_block, face_crop, pad_with_sentinels
+from distrib_la._cyclic import cyclic_to_block, pad_with_sentinels
 from distrib_la.resolve import mesh_key
 
 __all__ = ["distributed_eigh", "eigh_layout", "workspace_bytes", "pool_bytes", "rocblas_bytes"]
@@ -267,7 +267,7 @@ def distributed_eigh(A: jax.Array, *, mesh: Mesh, compute_evecs: bool = True,
         def _padded(a):
             whole = jax.lax.with_sharding_constraint(pad_with_sentinels(a, side), face)
             W, Q = _call(whole)
-            W, Q = W[side - n:], face_crop(Q, n, offsets=(0, side-n), mesh=mesh)
+            W, Q = W[side - n:], Q[:n, side - n:]
             return W, jax.lax.with_sharding_constraint(Q, face)
 
         # No donation: plan.DONATES declares eigh as donating nothing.
