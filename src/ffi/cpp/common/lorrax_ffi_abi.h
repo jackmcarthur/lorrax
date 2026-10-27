@@ -139,6 +139,13 @@
 //                price its intermediate banks and vendor workspace. ABI13
 //                providers lack these required results.
 //
+//   ABI 14 -> 15 (2026-10-27, visible native local EIGH workspace).
+//                RocsolverBatchedEighFfi gains a trailing u8 arena result,
+//                sized by lrx_rocsolver_eigh_workspace_bytes using the same
+//                cached vendor/chunk plan as execution. The arena holds the
+//                native workspace and tridiagonal E, replacing hidden FFI
+//                scratch. ABI14 providers lack this required result.
+//
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
@@ -167,4 +174,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 14
+#define LORRAX_FFI_ABI_VERSION 15

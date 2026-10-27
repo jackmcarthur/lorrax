@@ -57,9 +57,11 @@ def test_single_matrix_window_and_workspace_price_are_the_same_owner(monkeypatch
     assert row is not None and row.windows['complex128'].min_batch == 1
     assert le.batched_eigh_row((1, n, n), np.complex128, 'ROCM') == row
     win = row.windows['complex128']
-    expected = min(row.tile_bytes, win.workspace_tiles*n*n*16)+n*8
-    assert le.batched_workspace_bytes((n, n), np.complex128, 'ROCM') == expected
-    assert le.batched_workspace_bytes((1, n, n), np.complex128, 'ROCM') == expected
+    expected = win.workspace_tiles*n*n*16+n*8  # retained scalar Jacobi allowance
+    arena = 29_483_264  # provider reply, deliberately not the former 4-tile guess
+    monkeypatch.setattr(le, '_workspace_bytes', lambda *_args: arena)
+    assert le.batched_workspace_bytes((n, n), np.complex128, 'ROCM') == arena
+    assert le.batched_workspace_bytes((1, n, n), np.complex128, 'ROCM') == arena
     from types import SimpleNamespace
     from distrib_la import workspace
     from jax.sharding import Mesh
