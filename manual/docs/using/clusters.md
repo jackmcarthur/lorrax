@@ -68,7 +68,7 @@ Memory values below use decimal GB. Wall time is the GW driver's `total run`, in
 |---|---|---:|---:|---:|---:|---|---|---:|---:|
 | Si SOC, 2 atoms | 4×4×4 / 8 | 8 | 52 | 528 | 2 | GN-PPM | 4 GPUs, 1 node | 59.52 s | 9.71 GB |
 | Al₂O₃, 10 atoms | 4×4×4 / 13 | 24 | 154 | 1584 | 1 | GN-PPM | 4 GPUs, 1 node | 39.23 s | 19.03 GB |
-| Ferromagnetic bcc Fe | 8×8×8 / 59 | 18 (fractional) | 110 | 1099 | 2 | Shared-pole | 4 GPUs, 1 node | 353.07 s | 33.43 GB |
+| Ferromagnetic bcc Fe | 8×8×8 / 59 | 18 (fractional) | 110 | 1099 | 2 | Tangential | 4 GPUs, 1 node | 353.07 s | 33.43 GB |
 | Cr:Al₂O₃, 80 atoms | 2×2×2 / 4 | 395 | 2370 | 23700 | 2 | GN-PPM | 16 GPUs, 4 nodes | 915.12 s | 52.89 GB |
 
 | Run | Setup | ISDF / Coulomb | Screening | Self-energy | QP update | Real compiles / cache hits | Summed compile time |
@@ -82,7 +82,7 @@ The Si and Al₂O₃ peaks are the rounded production pool high-water, maximized
 
 The Si request was widened from 48 to 52 sum bands to complete a multiplet. The Al₂O₃ request was widened from 144 to 154 (156 padded band slots); the requested QP matrix covers bands 1–30. Its dynamic Σ grid begins at −24 eV to cover the deep valence states; the final run reports complete coverage. The earlier Al₂O₃ pilot with static fallback for deep states is excluded from this table.
 
-Fe uses 110 physical sum bands (112 padded slots), 1099 physical centroids (1100 packed slots at P4), and the production shared-pole recipe with a pole budget of $1.0N_\mu$: 1099 poles per q from 35 samples. Band 18 is the occupied edge; the finite-temperature density tails are retained. The requested 4-valence/4-conduction frontier gives a Σ/QP prefix of bands 1–22. Its compile row excludes eight additional runtime-startup compiles; compile seconds are cumulative API time on rank 0, not a sum over MPI ranks or a critical-path decomposition.
+Fe uses 110 physical sum bands (112 padded slots), 1099 physical centroids (1100 packed slots at P4), and the production tangential recipe with a pole budget of $1.0N_\mu$: 1099 poles per q from 35 samples. Band 18 is the occupied edge; the finite-temperature density tails are retained. The requested 4-valence/4-conduction frontier gives a Σ/QP prefix of bands 1–22. Its compile row excludes eight additional runtime-startup compiles; compile seconds are cumulative API time on rank 0, not a sum over MPI ranks or a critical-path decomposition.
 
 Fe's 33.43 GB is the post-startup pool-**used** high-water. The default allocator also maps a **77.895 GB pool reservation** at startup, with context/vendor storage outside it; physical process high-water was not sampled. An exact XLA-request ledger gives 33.434 GB after startup and excludes direct native allocations. These measurements do not establish a 40 GB fit. The largest host `VmHWM` is 5.53 GB/rank.
 
