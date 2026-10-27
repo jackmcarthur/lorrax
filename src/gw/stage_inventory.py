@@ -49,7 +49,8 @@ class Deck:
     used (antiunitary Green rows in Σ).  ``hartree_unchunked``: the density scan
     before 2410aa812 boxed every local band at once (reports older than it).  ``sys_dim``
     2: a slab (a second V(q) stack, the long-range channel).  ``validation_width``: q per
-    program of the all-q Coulomb validation (1, its floor; a run admits the widest that fits)."""
+    program of the all-q Coulomb validation (1, its floor; a run admits the widest that fits).
+    ``n_pole``: the tangential store's pole columns per q (``Kmax``; 0: GN-PPM only)."""
     nk: int
     n_parent: int
     nq: int
@@ -63,6 +64,7 @@ class Deck:
     trs: bool = True
     sys_dim: int = 3
     validation_width: int = 1
+    n_pole: int = 0
     hartree_unchunked: bool = False
 
 
@@ -213,8 +215,9 @@ def _stage_prices(d: Deck, P: int) -> tuple:
     st["W"] = (("local", loc + _p("W", F, 0.0, "faces", "", P)),
                ("distributed", dist + _p("W", F, 0.0, "faces", "", P)))
     # Sigma residents (sigma.exchange / tau_sweep entry): V(q), the W pair (the GN-PPM pole
-    # pair in the sweep), faces.
-    sig_res = nV * QM + 2 * QM + F
+    # pair in the sweep), faces; tangential holds B in place of the pair (its poles are read
+    # by the sweep, below).
+    sig_res = nV * QM + (QM if d.n_pole else 2 * QM) + F
     st["Sigma exchange"] = (("only", _p("Sigma exchange", sig_res, _sigma_new(d, P, static=True),
                                         "V(q) + W pair + faces",
                                         "ppm_tau_kernel.sigma_pass_bytes (static)", P)),)
@@ -229,6 +232,20 @@ def _stage_prices(d: Deck, P: int) -> tuple:
                                          "V(q) + GN-PPM pole pair + faces",
                                          "ppm_tau_kernel.sigma_pass_bytes + window executable "
                                          f"excess 0.04 nk Q M [{trace}]", P)),)
+    if d.n_pole:
+        # Tangential Sigma tau (gw.mpa.sigma.SynthesisTau): the pole-residue factor faces read
+        # once per Sigma call, [Q, mu, ns, K] on one mesh axis each (X rows, Y rows), beside
+        # V(q), B and the faces.  Each window executable synthesizes the W(tau) pair on the
+        # irreducible q, [Q, mu, mu] on the face (no full-zone W or G: the Sigma load unfolds
+        # it): the pair, its zero base and the panel updates' copies (6 QM), the two scaled
+        # factor faces b d(tau), then the GN-PPM row pass with its excess.  Al2O3 4^3 P4:
+        # 23.9 GB priced, 24.4 measured (N_mu 6000); 4.8 / 4.3 (N_mu 2400).
+        faces_K = 2 * C16 * d.nq * mu * d.ns * d.n_pole / py
+        st["Sigma tau sweep (tangential)"] = (("only", _p(
+            "Sigma tau sweep (tangential)", nV * QM + QM + F + faces_K,
+            6 * QM + faces_K + _sigma_new(d, P, static=False) + 0.04 * d.nk * d.nq * M,
+            "V(q) + B + faces + pole-factor faces 2·16·Q·mu·ns·K/P_y",
+            f"W(tau) pair synthesis 6 QM + scaled factor faces + row pass [{trace}]", P)),)
     # sigma.exec beyond the sweep (the report's "Sigma other"): the pole synthesis kernel's
     # temp (<= 2.5 QM) and the fit's output beside the pole pair, and the sweep's band-complete
     # psi rows and columns.

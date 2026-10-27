@@ -105,20 +105,20 @@ def tangential_prices(s, P, ordered):
                      side_over_nmu=round(side / n, 3), ordered=ordered, line=line, imag=imag)
 
 
-def inventory_deck(s):
-    """The :class:`gw.stage_inventory.Deck` of a harness deck."""
+def inventory_deck(s, n_pole=0):
+    """The :class:`gw.stage_inventory.Deck` of a harness deck (``n_pole``: tangential's K)."""
     kg = tuple(int(x) for x in str(s["kgrid"]).split("x")) if "x" in str(s["kgrid"]) else (int(s["kgrid"]),) * 3
     return Deck(nk=s["nk"], n_parent=s.get("nparent") or s["nq"], nq=s["nq"], ns=s["ns"], nb=s["nb"],
                 nb_qp=s.get("nb_qp") or min(s["nb"], s["nv"] + 16 * s["ns"]), ng=s["ng"],
                 fft=tuple(s["fft"]), nmu=s["nmu"], kgrid=kg, trs=bool(s.get("trs", True)),
-                sys_dim=s.get("sys_dim", 3))
+                sys_dim=s.get("sys_dim", 3), n_pole=int(n_pole))
 
 
 def stages(s, P, mode):
     """{stage: (src, ((route, bytes/rank), ...), host bytes/rank)} at P ranks; fastest route first."""
     n, Q, nk = s["nmu"], s["nq"], s["nk"]
     n2 = C * n * n
-    d = inventory_deck(s)
+    d = inventory_deck(s, pencil_side(s, not s.get("trs", True))[3] if mode == "tangential" else 0)
     inv = stage_prices(d, P)
     z = zeta_plan(d, P)
     s["_zstore"] = dict(placement=z.placement, store_gb_per_rank=round(z.store_bytes / GB, 1), b=z.b,
@@ -142,12 +142,10 @@ def stages(s, P, mode):
         st["bank round (value+slope)"] = ("code", (("local", min(Q, P) * 6 * n2 / P),
                                                    ("distributed", 6 * n2 / P + CTX)), 0.0)
         st["tangential constructor"] = ("code+model", (("local", t["local"]), ("face", t["face"])), 0.0)
-        if s.get("calib"):
-            # Measured, Al2O3 4^3, P = 4, N_mu 2400 / 6000: the pole-synthesis Sigma tau, 6.04 / 35.07 GB
-            # = 322 / 300 B Q mu^2/P (its own compiled price 42.78 GB, gamma 0.82)
-            st["Sigma tau sweep"] = ("measured fit", (("only", 300.0 * Q * n * n / P),), 0.0)
-        else:
-            st["Sigma tau sweep"] = ("code", (("only", 32 * Q * n * n / P + TILE),), 0.0)
+        # The pole-synthesis Sigma tau: factor faces + the W(tau) pair synthesis (stage_inventory;
+        # Al2O3 4^3 P4 measured 35.07 GB, the 300 B Q mu^2/P of the old calib fit)
+        st["Sigma tau sweep"] = ("code+trace", tuple((r, p.bytes()) for r, p in
+                                                     inv["Sigma tau sweep (tangential)"]), 0.0)
     # BSE with kgrid_fine: coarse W + fine W_q (mu, nu, fine k) on the centroid face + one tile
     nkf, nvb, ncb = s["nk_fine"], s["bse_v"], s["bse_c"]
     st["BSE coarse->fine W"] = ("code", (("only", Q * n2 / P + nkf * n2 / P + TILE),), 0.0)
@@ -206,8 +204,8 @@ def deck(text):
     s.update(kgrid="x".join(map(str, kg)), nk=nk, nq=(nk + math.prod(2 if g % 2 == 0 else 1 for g in kg)) // 2,
              nk_fine=math.prod(grid(kv["kfine"])) if "kfine" in kv else math.prod(2 * g if g > 1 else 1 for g in kg))
     # zeta_c_face: accepted for old command lines; the charge factor is always priced on the face
-    # calib=1: scale the tangential rows by the one-node Al2O3 measurements (face constructor x1.41
-    # at the real side; the pole-synthesis Sigma tau as a fitted Q mu^2/P coefficient).  The old
+    # calib=1: scale the tangential constructor by the one-node Al2O3 measurement (face route
+    # x1.41 at the real side); Sigma tau is priced by stage_inventory either way.  The old
     # "ISDF setup + I/O" fit (333 B Q mu^2/P) was the Coulomb all-q validation at its widest
     # admitted batch (64 q), which fills the room; it is priced at its floor now.
     s["calib"] = bool(kv.get("calib", 0))

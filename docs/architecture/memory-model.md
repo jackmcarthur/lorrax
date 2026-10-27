@@ -1083,7 +1083,11 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
    its measured peak (`tests/test_stage_inventory_calibration.py`). At large N_μ the
    first wall on a 2×2×1 slab is the ζ fit's C_q assembly, `(N_k + n_par)·n_s²·16μ²/P`
    of pair products beside C (1.5 G/P), not Σ(τ): the GN-PPM Σ(τ) node streams rows
-   within the fixed tile, its band-complete ψ falling as `1/sqrt(P)`.
+   within the fixed tile, its band-complete ψ falling as `1/sqrt(P)`. Tangential Σ(τ)
+   holds the pole-residue factor faces `[Q, μ, n_s, K]` on one mesh axis each
+   (`2·16·Q·μ·n_s·K/sqrt(P)`) and synthesizes the W(τ) pair on the irreducible q in
+   every window (about `6·16·Q·μ²/P`); no full-zone G or W is formed. At K ≈ N_μ the
+   factor faces are tangential's wall at large N_μ (148-atom slab, N_μ 60k: P = 225).
 1. **Budget.** Leave `memory_per_device_gb = 0` for the model's budget, or
    set it lower to cap it (a value above it warns).
 2. **Mesh.** Use a square mesh and price its actual padded carriers.
