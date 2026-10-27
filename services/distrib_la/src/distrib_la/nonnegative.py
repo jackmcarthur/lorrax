@@ -135,15 +135,11 @@ def _principal(mesh, n, n_logical, linear, operands, programs):
         return price
 
     routes = [(linear.backend, price)]
-    if linear.backend == 'one_device' and mesh_platform(mesh) == 'CUDA':
+    if linear.backend == 'one_device':
         routes.append(('distributed face', backup))
     room = memory.room()
     if linear.backend == 'one_device' and price.bytes() > room:
         # A whole matrix is eligible only within the planning room.
-        if mesh_platform(mesh) != 'CUDA':
-            raise RuntimeError(f"GATE nonnegative_quadratic_capacity: {label} needs "
-                               f"{price.bytes()} new bytes per rank, over room {room}; "
-                               "this leg has no whole-mesh LU provider beyond its room route")
         routes = [('distributed face', backup())]
     chosen = memory.admit(label, routes, room)
     run, bundle = held[chosen]
@@ -163,7 +159,7 @@ def solve_nonnegative_quadratic(a, b, *, mesh, n_logical, maxiter=None):
         Real float64 ``(n_pad,)`` on ``P('x')``, replicated along y. Units
         are objective / x. Consumed by donation, as ``a`` is.
     mesh : jax.sharding.Mesh
-        The named x/y device mesh. The CUDA leg uses its existing local
+        The named x/y device mesh. Accelerator legs use their existing local
         capacity route where the complete program and native scratch fit;
         a whole-mesh LU is its lazy backup. No matrix is gathered to hosts.
     n_logical : int

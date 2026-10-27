@@ -839,11 +839,11 @@ def _incumbent(p, shapes, single: bool) -> int:
     platform = _resolve.mesh_platform(p.mesh)
     row = _resolve.ONE_DEVICE_MAX_N.get((p.op, platform))
     if row is None:
-        if (p.op, platform) in _resolve._DISTRIBUTED_DEFAULT:
+        if _resolve._DISTRIBUTED_DEFAULT.get((p.op, platform)) not in (None, NATIVE2D):
             return 0
-        # A room-only operation (ROCm LU) has no library to price or run.
-        # Resolution already admitted one whole matrix; preserve that same
-        # owner's bounded round rule instead of inventing a library fallback.
+        # Keep the admitted local fast path when the whole-mesh capacity
+        # provider is native2d (ROCm LU), without compiling that fallback
+        # merely to re-admit a matrix that already fits.
         row = _resolve.one_device_max_n(p.op, platform, p.budget_bytes)
     if single:
         return 1
@@ -1027,6 +1027,7 @@ _IMPL: dict[tuple[str, str], dict[str, Any]] = {
     # stacked entry and no single-tile one, exactly like cuSOLVERMp's
     # batched potrf.  Nothing about calling it is special-cased.
     ("cholesky", NATIVE2D):     dict(one=None, many="cholesky", post=None),
+    ("solve_lu", NATIVE2D):     dict(one=None, many="batched_distributed_solve_lu", post=None),
 }
 
 #: Ops whose ``native`` path is a single JAX call the plan can run itself.
@@ -1060,7 +1061,7 @@ def _native2d_trace_fn(impl: Callable, mesh: Mesh) -> Callable:
     operands remain traced. Reusing this callable lets outer cached kernels
     retain their identity across newly resolved plans.
     """
-    return lambda A, **kw: impl(A, mesh=mesh, **kw)
+    return lambda *args, **kw: impl(*args, mesh=mesh, **kw)
 
 
 def _describe_stack(route: StackRoute) -> str:
@@ -2047,7 +2048,8 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         # whole matrix per rank must fit it, or the leg's library runs.
         resolved = resolve_backend(op, backend, mesh_xy, n=n, room=budget_bytes)
     if (route_defaulted and batched_route == ROUTE_BATCH_RESHARD
-            and _size_routed_library(op, backend, mesh_xy, n, resolved)):
+            and ((op == "solve_lu" and resolved == NATIVE2D)
+                 or _size_routed_library(op, backend, mesh_xy, n, resolved))):
         # Route (c) solves each matrix WHOLE on one device: exactly what the size
         # route just ruled out for this n.  Left as the default it ran a 20480
         # complex LU on one GCD of a plan that reports the leg library (MI250X P4,

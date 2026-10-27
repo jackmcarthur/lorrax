@@ -65,27 +65,42 @@ def _controls():
                 assert np.all(np.asarray(answer)[expected == 0] == 0)
                 errors.append(float(np.max(np.abs(np.asarray(answer)-expected))))
     assert min(decisions[:6]) > max(decisions[6:])  # Current room reaches each new call.
-    # The geometry is warm. Its earlier admitted plan cannot admit a new
-    # solve against zero room, nor consume either input before refusing.
-    memory.set_budget(0, linalg="distributed")
-    aa, bb = jax.device_put(np.eye(2), face), jax.device_put(np.ones(2), rows)
-    with pytest.raises(ValueError, match="room"):
-        owner.solve_nonnegative_quadratic(aa, bb, mesh=mesh, n_logical=2)
-    assert not aa.is_deleted() and not bb.is_deleted()
-    # A changed live set after route selection also has a strict executable
-    # check: fixed whole-matrix scratch cannot be priced as 1/P face storage.
-    linear = original("solve_lu", mesh, backend="distributed", n=2,
+    # A changed live set must select the real mesh provider instead of
+    # retaining an oversized whole-matrix executable. Compare actual
+    # compiled principal programs, then put the room between their prices.
+    monkeypatch.setattr(owner, "plan", original)
+    memory.set_budget(64 << 20, linalg="distributed")
+    n = 512
+    h = jax.device_put(np.eye(n), face)
+    c = jax.device_put(np.linspace(.5, 1.5, n), rows)
+    free = jax.device_put(np.ones(n, dtype=bool), rows)
+    operands = (h, c, free)
+    linear = original("solve_lu", mesh, backend="distributed", n=n,
                       batched_route="auto", budget_bytes=64 << 20)
-    monkeypatch.setattr(memory, "room", lambda: 0)
-    product = jax.jit(lambda a: a @ a, out_shardings=face)
-    with pytest.raises(RuntimeError, match="GATE nonnegative_quadratic_capacity"):
-        owner._principal(mesh, 2, 2, linear, (aa,),
-                         (None, product, None, None, None))
+    whole = owner._programs(mesh, n, n, linear)
+    _, local_price = owner._lower(whole[1], operands, mesh, 'test whole', linear=linear)
+    distributed = original("solve_lu", mesh, backend="native2d", n=n, batched_route="auto")
+    faces = owner._programs(mesh, n, n, distributed)
+    _, face_price = owner._lower(faces[1], operands, mesh, 'test face', linear=distributed)
+    assert 0 < face_price.bytes() < local_price.bytes()
+    room = (face_price.bytes() + local_price.bytes()) / 2
+    monkeypatch.setattr(memory, "room", lambda **kwargs: room)
+    selected = []
+    lower = owner._lower
+    def observe(*args, **kwargs):
+        result = lower(*args, **kwargs)
+        selected.append(kwargs['linear'].backend)
+        return result
+    monkeypatch.setattr(owner, "_lower", observe)
+    solve, *_ = owner._principal(mesh, n, n, linear, operands, whole)
+    np.testing.assert_allclose(solve(*operands), np.asarray(c), rtol=0, atol=1e-12)
+    assert selected == ['one_device', 'native2d']
     print(json.dumps(dict(cases=len(errors), max_absolute_error=max(errors),
                           budgets=decisions, output_layout="P(x)",
                           centroid_scale_principal_route_admitted=True,
-                          insufficient_room_refuses_before_donation=True,
-                          compiled_whole_matrix_over_room_refuses=True)))
+                          compiled_whole_matrix_over_room_uses_mesh=True,
+                          local_program_bytes=local_price.bytes(),
+                          mesh_program_bytes=face_price.bytes(), fallback_room=room)))
 
 
 def test_nonnegative_room_route_and_compiled_capacity_on_p4_cpu():
@@ -95,7 +110,7 @@ def test_nonnegative_room_route_and_compiled_capacity_on_p4_cpu():
     result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--controls"],
                             cwd=root, env=env, text=True, capture_output=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert '"insufficient_room_refuses_before_donation": true' in result.stdout
+    assert '"compiled_whole_matrix_over_room_uses_mesh": true' in result.stdout
 
 
 if __name__ == "__main__" and "--controls" in sys.argv:

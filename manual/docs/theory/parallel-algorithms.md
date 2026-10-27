@@ -225,7 +225,7 @@ $$
 16N_\mu^2\big(3\lceil Q/P\rceil+2\big) + 48\,QN_\mu^2/P \le B \tag{5.1}
 $$
 
-- **Distributed** (`linalg = distributed`, or local not admitted). $A = I - V\chi^0$ is formed on the faces by SUMMA in $\bq$ blocks, and one batched call of the distributed LU (cuSOLVERMp on CUDA, ScaLAPACK on CPU) solves the stack, every matrix over all $P$ ranks.
+- **Distributed** (`linalg = distributed`, or local not admitted). $A = I - V\chi^0$ is formed on the faces by SUMMA in $\bq$ blocks, and one batched call of the distributed LU (cuSOLVERMp on CUDA, ScaLAPACK on CPU, partial-pivot `native2d` on ROCm beyond its local room) solves the stack, every matrix over all $P$ ranks. The ROCm mesh algorithm retains local matrix/RHS faces and bounded panels; scalar pivot exchanges add latency, so the mesh route is a capacity choice.
 
 The two plans agree to round-off. With $Q<P$ the local plan leaves $P-Q$ ranks idle; at one $\bq$ and large $N_\mu$ only the distributed plan holds a matrix. Each decision prints once as `route W Dyson …`.
 

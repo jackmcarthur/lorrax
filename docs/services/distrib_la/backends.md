@@ -78,7 +78,7 @@ local LU on every layout, so it has no field.
 |---|---|---|---|
 | `eigh` | `auto off distributed cusolvermp elpa scalapack one_device` | `native` everywhere | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `one_device` for `n ≤ 16384`, else `elpa` ([size route](#size-route)) |
 | `cholesky` | `auto off native2d cusolvermp` | `cusolvermp` on a CUDA mesh with `P_x ≥ 2` and `P_y ≥ 2` when compiled, else `native` | not in the vocabulary |
-| `solve_lu` | `auto off distributed cusolvermp scalapack one_device` | as `cholesky` (ROCm: `native`) | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `one_device` within the room, refused beyond it ([size route](#size-route)) |
+| `solve_lu` | `auto off distributed native2d cusolvermp scalapack one_device` | as `cholesky` (ROCm: `native`) | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `one_device` within the room, then `native2d` ([size route](#size-route)) |
 | `eigh`, `solve_lu` with a room (`budget_bytes`) | as above | as above | CUDA → `one_device` where one whole matrix's priced program fits the room, else `cusolvermp` ([room leg](#measured-route)) |
 
 A request for `slate` refuses with "`slate` was removed: ..." naming the
@@ -97,20 +97,18 @@ replacement; the SLATE backend left LORRAX on 2026-10-23.
 - `distributed` means "spread one matrix over the whole mesh with this
   platform's distributed library". There is no `distributed` Cholesky, because
   the CPU Cholesky story is a channel policy in the caller, not one library.
-- `native2d` is the pure-JAX 2-D block-distributed tiled Cholesky, on every
-  platform. It is a different algorithm with a different memory profile: at
+- `native2d` provides pure-JAX 2-D block-distributed Cholesky and general
+  partial-pivot LU on every platform. It has a different memory profile: at
   `n = 10⁴` on `P = 128` the replicated route costs 1.6 GB per device and
   `native2d` 5 MB. Its tile decomposition is checked at resolve time.
-- **ROCm is declared, not tested.** The platform key comes from the device
+- **ROCm has its own leg.** The platform key comes from the device
   vendor (`lxkit.device_vendor`: the client's platform and version strings and
   the device kind), so a ROCm mesh resolves as `rocm`, never as CUDA. The
-  table's ROCm entries are the resolution only: `distributed` eigh names
+  table's ROCm entries are the resolution: `distributed` eigh names
   ELPA (`distrib_la._elpa`, `config/frontier/build_elpa_hip.sh`) behind the
-  leg's size row. ROCm has no distributed LU library: `distributed` LU is the
-  room route alone ([size route](#size-route)), and past the room (or without one) it
-  refuses: "solve_lu on ROCM has no distributed library, only one whole matrix per
-  device within the caller's room ...; use fewer ISDF centroids, more device memory
-  per rank, or a CUDA run".
+  leg's size row. ROCm LU keeps the one-device room route, with `native2d`
+  partial pivoting when one complete solve does not fit or no room is
+  supplied. It needs no additional vendor library.
 
 ### The guard ladder {#guard-ladder}
 
@@ -188,10 +186,24 @@ whole cost (the former SLATE eigh on ROCm cost 0.22-0.29 s at `n = 32-128`
 against native 0.0016-0.0045 s). So the ROCM leg declares an eigh size row,
 `resolve.ONE_DEVICE_MAX_N`: `distributed` with a known `n` at or below 16384
 resolves to `one_device`, beyond it to `elpa`. ROCm LU is a room leg
-(`resolve.ONE_DEVICE_BY_ROOM`, as on CUDA, [below](#measured-route)) with no
-library behind it: `distributed` resolves to `one_device` where one matrix's
-priced program fits the caller's room (`budget_bytes`) and refuses by name
-beyond it, or with no room.
+(`resolve.ONE_DEVICE_BY_ROOM`, as on CUDA, [below](#measured-route)):
+`distributed` resolves to `one_device` where one matrix's priced program
+fits the caller's room (`budget_bytes`), and to `native2d` otherwise.
+
+The `native2d` LU is blocked Gaussian elimination with global partial
+pivoting, followed by lower/upper triangular solves. It handles general
+nonsymmetric complex matrices, without normal equations or unpivoted
+factorization. The coefficient and RHS faces remain on all ranks; only
+fixed-width row/column panels and two selected pivot rows are exchanged.
+Leading storage is the local faces plus panels proportional to
+`128 * (n/Px + max(n,nrhs)/Py)` elements. This is a storage model, not a
+whole-process peak bound: the enclosing checked executable is the admission
+price. Identity-pad coefficient rows/columns and zero-pad the RHS as for
+the vendor providers. Every rank follows the same panel/pivot schedule even
+for singular input, which the common result check refuses. Scalar pivot
+reductions use the process-column communicator; there are still `n` pivot
+steps. This is a capacity route, without a speedup promise over a local
+solve or a tuned distributed vendor LU.
 
 `one_device` (`distrib_la._one_device`) keeps the FFI operand contract
 (`P('x','y')` tile or `P(None,'x','y')` stack in, the same layout out). Route

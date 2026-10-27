@@ -129,10 +129,12 @@ Whole-matrix LU uses the one-device capacity route (`distrib_la.resolve`).
 When either A or its RHS spans more than 2³¹ bytes, `distrib_la.local_lu`
 uses rocSOLVER factorization followed by a blocked rocBLAS triangular solve;
 this avoids the offset defect in the unblocked solve. The native handler's
-queried workspace and pivot buffer are explicit XLA results. ROCm has no
-distributed LU provider: the route refuses when one complete solve cannot fit
-the caller's room. The 8192 row is a round-size preference, not an accuracy
-or maximum-size bound.
+queried workspace and pivot buffer are explicit XLA results. When a complete
+solve does not fit the caller's room, `distributed` uses the existing
+`native2d` owner: blocked general LU with global partial pivoting and bounded
+face panels. The 8192 row still describes local round size, not an accuracy
+or maximum-size bound. Pivot steps have communication latency; the mesh
+route provides capacity, with no unconditional speedup claim.
 
 **CUDA twin.** Local eigensolves and LU solves use jaxlib's cuSOLVER
 (`families` row `rocsolver`, CUDA `xla`). The room-based capacity route and

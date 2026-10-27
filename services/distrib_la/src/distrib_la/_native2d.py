@@ -1,4 +1,4 @@
-"""``native2d`` — 2-D block-distributed Cholesky, in pure JAX.
+"""``native2d`` — face-distributed Cholesky and partial-pivot LU in JAX.
 
 Absorbed from LORRAX ``src/common/cholesky_2d.py`` at 96a6399.  It is a
 BACKEND, not a mode of ``native``: a different algorithm with a different
@@ -54,7 +54,8 @@ from lxkit import mark_varying
 from jax import shard_map
 from distrib_la.resolve import mesh_key
 
-__all__ = ["cholesky", "block_size_for", "dense_to_tiles", "tiles_to_dense"]
+__all__ = ["cholesky", "block_size_for", "dense_to_tiles", "tiles_to_dense",
+           "batched_distributed_solve_lu"]
 
 
 def block_size_for(n: int, Pr: int, Pc: int) -> tuple[int, int]:
@@ -280,3 +281,173 @@ def cholesky(A: jax.Array, *, mesh: Mesh,
     return jax.lax.with_sharding_constraint(
         tiles_to_dense(L_tiles, block_size),
         NamedSharding(mesh, P(None, "x", "y")))
+
+
+def _lu_kernel(mesh, n, nrhs, width):
+    """Partial-pivot ``P A = L U`` and ``U X = L^-1 P B`` on x/y faces.
+
+    Only a local-row by ``width`` column panel and a ``width`` by
+    local-column row panel are broadcast. Pivot reductions and row swaps
+    use the x (process-column) communicator; the trailing updates are
+    local GEMMs. No matrix larger than a fixed diagonal panel is replicated.
+    """
+    key = ("solve_lu", mesh_key(mesh), n, nrhs, width)
+    if key in _KERNEL_CACHE:
+        return _KERNEL_CACHE[key]
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    m, nc, rc = n // px, n // py, nrhs // py
+    panels = -(-n // width)
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P(None, "x", "y"), P(None, "x", "y")),
+             out_specs=P(None, "x", "y"), check_vma=False)
+    def local(a, rhs):
+        x, y = lax.axis_index("x"), lax.axis_index("y")
+        rows = x * m + jnp.arange(m)
+        columns = y * nc + jnp.arange(nc)
+        slots = jnp.arange(width)
+
+        def column_panel(a, start):
+            col = start + slots
+            idx = col - y * nc
+            owned = (idx >= 0) & (idx < nc) & (col < n)
+            panel = jnp.take(a, jnp.clip(idx, 0, nc - 1), axis=1)
+            return lax.psum(jnp.where(owned[None, :], panel, 0), "y")
+
+        def row_panel(a, start):
+            row = start + slots
+            idx = row - x * m
+            owned = (idx >= 0) & (idx < m) & (row < n)
+            panel = jnp.take(a, jnp.clip(idx, 0, m - 1), axis=0)
+            return lax.psum(jnp.where(owned[:, None], panel, 0), "x")
+
+        def store_rows(a, values, start):
+            def store(j, a):
+                row = start + j
+                return lax.cond((row < n) & (x == row // m),
+                                lambda a: a.at[row % m].set(values[j]),
+                                lambda a: a, a)
+            return lax.fori_loop(0, width, store, a)
+
+        def store_columns(a, values, start):
+            def store(j, a):
+                col = start + j
+                return lax.cond((col < n) & (y == col // nc),
+                                lambda a: a.at[:, col % nc].set(values[:, j]),
+                                lambda a: a, a)
+            return lax.fori_loop(0, width, store, a)
+
+        def diagonal(panel, start):
+            block = row_panel(panel, start)
+            valid = start + slots < n
+            return jnp.where(valid[:, None] & valid[None, :], block,
+                             jnp.eye(width, dtype=panel.dtype))
+
+        def one(pair):
+            a, b = pair
+
+            def factor_panel(i, carry):
+                a, b = carry
+                start = lax.optimization_barrier(i * width)
+                panel = column_panel(a, start)
+
+                def pivot_column(j, carry):
+                    a, b, panel = carry
+                    k = start + j
+
+                    def pivot(carry):
+                        a, b, panel = carry
+                        magnitude = jnp.where(rows >= k, jnp.abs(panel[:, j]), -jnp.inf)
+                        maximum = lax.pmax(jnp.max(magnitude), "x")
+                        p = lax.pmin(jnp.min(jnp.where(magnitude == maximum, rows, n)), "x")
+                        # Select BEFORE communication: exactly two row pieces,
+                        # never a permutation/gather of the complete face.
+                        rr = jnp.stack((k, p))
+                        idx = jnp.clip(rr - x * m, 0, m - 1)
+                        owned = (rr // m == x)[:, None]
+                        selected = jnp.concatenate((a[idx], b[idx], panel[idx]), axis=1)
+                        selected = lax.psum(jnp.where(owned, selected, 0), "x")
+
+                        def swap(value, first, last):
+                            value = lax.cond(x == k // m,
+                                             lambda v: v.at[k % m].set(last), lambda v: v, value)
+                            return lax.cond(x == p // m,
+                                            lambda v: v.at[p % m].set(first), lambda v: v, value)
+
+                        a = swap(a, selected[0, :nc], selected[1, :nc])
+                        b = swap(b, selected[0, nc:nc + rc], selected[1, nc:nc + rc])
+                        first, last = selected[0, nc + rc:], selected[1, nc + rc:]
+                        panel = swap(panel, first, last)
+                        below = rows > k
+                        multiplier = jnp.where(below, panel[:, j] / last[j], 0)
+                        update = multiplier[:, None] * jnp.where(slots > j, last, 0)[None, :]
+                        panel = panel - update
+                        panel = panel.at[:, j].set(jnp.where(below, multiplier, panel[:, j]))
+                        return a, b, panel
+
+                    return lax.cond(k < n, pivot, lambda c: c, (a, b, panel))
+
+                a, b, panel = lax.fori_loop(0, width, pivot_column, (a, b, panel))
+                l11 = diagonal(panel, start)
+                upper = solve_triangular(l11, row_panel(a, start), lower=True,
+                                         unit_diagonal=True)
+                upper = jnp.where((columns >= start + width)[None, :], upper, 0)
+                lower = jnp.where((rows >= start + width)[:, None], panel, 0)
+                a = a - lower @ upper
+                # The just-factored panel replaces the stale input columns;
+                # U12 replaces only trailing columns of the pivot rows.
+                old_rows = row_panel(a, start)
+                upper = jnp.where((columns >= start + width)[None, :], upper, old_rows)
+                a = store_rows(a, upper, start)
+                a = store_columns(a, panel, start)
+                return a, b
+
+            a, b = lax.fori_loop(0, panels, factor_panel, (a, b))
+
+            def substitute(i, b, *, backward):
+                start = lax.optimization_barrier((panels - 1 - i if backward else i) * width)
+                panel = column_panel(a, start)
+                block = diagonal(panel, start)
+                z = solve_triangular(block, row_panel(b, start), lower=not backward,
+                                     unit_diagonal=not backward)
+                live = rows < start if backward else rows >= start + width
+                panel = jnp.where(live[:, None], panel, 0)
+                b = b - panel @ z
+                return store_rows(b, z, start)
+
+            b = lax.fori_loop(0, panels, partial(substitute, backward=False), b)
+            return lax.fori_loop(0, panels, partial(substitute, backward=True), b)
+
+        return lax.map(one, (a, rhs))
+
+    fn = jax.jit(local)
+    _KERNEL_CACHE[key] = fn
+    return fn
+
+
+def batched_distributed_solve_lu(A, B, *, mesh, block_size=None):
+    """Solve general ``A[q] X[q] = B[q]`` with global partial pivoting.
+
+    ``A`` is ``(q,n,n)`` and ``B`` is ``(q,n,nrhs)``, both at
+    ``P(None,'x','y')``; the result keeps B's shape/layout. Extents are
+    producer-padded to the mesh. Inert rows must carry an identity block
+    in A and zeros in B, as for the other distributed LU providers.
+    Singular factors produce nonfinite results, refused by the plan's
+    existing common result check. No normal equations are formed.
+    """
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    if (A.ndim != 3 or B.ndim != 3 or A.shape[0] != B.shape[0]
+            or A.shape[-1] != A.shape[-2] or A.shape[-1] != B.shape[-2]
+            or A.dtype != B.dtype):
+        raise ValueError("native2d solve_lu requires A(q,n,n), B(q,n,nrhs) of one dtype")
+    if A.dtype not in (jnp.float32, jnp.float64, jnp.complex64, jnp.complex128):
+        raise ValueError("native2d solve_lu requires float32/64 or complex64/128")
+    n, nrhs = int(A.shape[-1]), int(B.shape[-1])
+    if n < 1 or nrhs < 1 or n % px or n % py or nrhs % py:
+        raise ValueError("native2d solve_lu requires positive mesh-padded n and nrhs")
+    width = min(128, n, 128 if block_size is None else int(block_size))
+    if width < 1:
+        raise ValueError("native2d solve_lu block_size must be positive")
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    return _lu_kernel(mesh, n, nrhs, width)(
+        lax.with_sharding_constraint(A, face), lax.with_sharding_constraint(B, face))
