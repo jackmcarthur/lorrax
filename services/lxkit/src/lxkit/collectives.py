@@ -50,8 +50,9 @@ EXACT_MARKER = "exact-reduce:"
 DEFAULT_SLAB_BYTES = 8 << 20
 #: Device bytes an ordered reduction may hold beyond the library collective, in slabs:
 #: the slabbed reduce-scatter's slab copy and its all_to_all output (the all-reduce runs
-#: in the operand's buffer; the one-shot path, used at or below one slab, holds
-#: <= 1.25 slab).  Fixed: it does not grow with the operand.  runtime's memory rule
+#: in the operand's buffer). Small all-reduces gather the original terms when
+#: that bank fits one slab, beside at most two partials: also below two slabs.
+#: Fixed: it does not grow with the operand. runtime's memory rule
 #: reserves :func:`ordered_transient_bytes` out of the planner budget.
 ORDERED_TRANSIENT_SLABS = 2
 _TRACE: list = []
@@ -221,6 +222,14 @@ def _ordered_psum_leaf(x, axis_name, slab):
     from lxkit import varying_axes
     names = axis_name if isinstance(axis_name, (tuple, list)) else (axis_name,)
     invariant = bool(set(names) & varying_axes(x))
+    if n * L * item <= slab:
+        # Small metadata does not need a padded all-to-all/reduce-scatter.
+        # Gather the original terms, then use the same left-to-right rank sum.
+        terms = (_all_gather_invariant(flat, axis_name) if invariant
+                 else lax.all_gather(flat, axis_name, tiled=True))
+        out = _rank_order_sum(terms.reshape(n, L)).reshape(shape)
+        _record("psum", x, n, "gather", (n + 2) * L * item, 0)
+        return out
     if L * item <= slab or L < 2 * n:
         pad = (-L) % n
         if pad:
@@ -259,9 +268,9 @@ def _ordered_psum_leaf(x, axis_name, slab):
 def ordered_psum(x, axis_name, *, slab_bytes: int | None = None):
     """``lax.psum`` with the terms added in rank order on every placement (any pytree).
 
-    Per leaf: an ordered reduce-scatter of the flattened operand, then an
-    ``all_gather`` -- the two halves of a ring all-reduce, with the adds in rank
-    order -- in slabs of at most ``slab_bytes`` (default :func:`slab_bytes`)."""
+    Per leaf, gather the original terms when they fit one slab. Otherwise use
+    an ordered reduce-scatter and ``all_gather`` in bounded slabs. Both add the
+    terms in the same rank order (default slab size: :func:`slab_bytes`)."""
     import jax
     slab = int(slab_bytes if slab_bytes is not None else globals()["slab_bytes"]())
     return jax.tree_util.tree_map(lambda leaf: _ordered_psum_leaf(leaf, axis_name, slab), x)

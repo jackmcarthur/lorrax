@@ -40,8 +40,9 @@ failed with the placement (det lane, 2026-10-16).
 **Rule.** Every floating sum over mesh ranks is added in rank order:
 
 - **Inside `shard_map`:** use `lxkit.ordered_psum` / `lxkit.ordered_psum_scatter`, with the
-  same arguments as `lax.psum` / `lax.psum_scatter`. They use `all_to_all` and `all_gather`
-  (pure data movement), then `c[0] + … + c[P-1]` on each device. Two ranks, one rank and
+  same arguments as `lax.psum` / `lax.psum_scatter`. They move the original terms with
+  `all_gather`, or `all_to_all` followed by `all_gather`, then add
+  `c[0] + … + c[P-1]` on each device. Two ranks, one rank and
   integer operands go straight to the library collective, at no cost, because those sums
   are exact.
 - **Outside `shard_map`:** `jnp.sum`, `tensordot`, `@` or `norm` over a sharded dimension
@@ -57,16 +58,18 @@ failed with the placement (det lane, 2026-10-16).
 all-reduce. For those, dump the optimized HLO (`--xla_dump_to`) and list `all-reduce` ops
 over three or more devices; the op's `stack_frame_id` names the source line.
 
-**Memory.** At or below the slab (`LORRAX_ORDERED_SLAB_MB`, default 8 MiB) the ordered
-sum holds the operand's `all_to_all` copy, about 1.25x the operand. Above it, the
-reduction runs in slabs inside one loop, with the all-reduce in the operand's own buffer
-as the library all-reduce does, so the extra transient is at most two slabs (16 MiB) at
-any size. That bound is the named cap `T_ord` of the memory rule (`lxkit.ordered_transient_bytes`,
+**Memory.** An all-reduce gathers the original rank terms directly when their
+combined size fits the fixed 8 MiB slab. The gathered bank and two partials fit
+within the existing two-slab reservation. Larger terms retain the ordered
+reduce-scatter and all-gather, using slabs inside one loop for large operands.
+The named reservation `T_ord` is two slabs (16 MiB) (`lxkit.ordered_transient_bytes`,
 [memory model](../architecture/memory-model.md#rule)): it comes off the planner budget once. Measured on MI250X compiled programs (det lane, `memgpu.py`): a 64 MiB
 reduce-scatter takes the library's temp plus at most 16 MiB; a slabbed all-reduce takes
 less temp than the library's.
 
-**Cost.** Fe V2 P=4 total 93.07 s against 93.81 s before the change, within noise.
+**Cost.** Gathering all rank terms removes the padded all-to-all step but can
+move more bytes than reduce-scatter followed by all-gather. The memory bound
+does not establish a speedup; compare the actual payload and process count.
 
 ## Why CPU collectives run on MPI {#why-mpi}
 
