@@ -804,7 +804,6 @@ def compute_wc_qwedge(
     probe_chunk: Optional[int] = None,
     input_file: Optional[str] = None,
     route: str = "auto",
-    allow_replicated_dyson: bool = False,
     head_dipole_path: Optional[str] = None,
     head_n_occ: Optional[int] = None,
     head_pref: Optional[float] = None,
@@ -871,15 +870,10 @@ def compute_wc_qwedge(
     * ``"plain"`` — the full operator with the in-tree diagonal
       preconditioner: the historical path, kept selectable for A/B and used
       wherever the closing Dyson cannot run.
-    * ``"auto"`` (default) — ``"lift"`` on a single device, ``"plain"``
-      above it, because the closing Dyson is ``jnp.linalg.solve`` and
-      materialising the ``N_mu x N_mu`` tile per rank is the replication the
-      scaling doctrine forbids.  ``allow_replicated_dyson=True`` takes
-      ``"lift"`` anyway and accepts exactly the per-rank memory class the RPA
-      Dyson's own default (``linalg = local``, ``gw.w_isdf.solve_w``)
-      already has; routing the close through ``distrib_la`` — the twin of that
-      solver's ``distributed`` plan — is the registered follow-on, named here
-      rather than half-built.
+    * ``"auto"`` (default) retains ``"lift"`` on one device and ``"plain"``
+      on a mesh. Explicit ``"lift"`` uses the shared room-resolved dense
+      solve and face GEMM for its closing Dyson. Slopes and moments require
+      the full operator and continue to use ``"plain"``.
     """
     if input_file is None:
         raise ValueError(
@@ -969,20 +963,10 @@ def compute_wc_qwedge(
     n_dev = int(np.prod(mesh_xy.devices.shape))
     if route == "auto":
         route = ("lift" if not (with_slope or with_moments)
-                 and (n_dev == 1 or allow_replicated_dyson) else "plain")
+                 and n_dev == 1 else "plain")
     if route == "lift" and (with_slope or with_moments):
         raise ValueError("Response slopes/moments require route='plain': they are "
                          "actions of the full H, including its Hartree ring.")
-    if route == "lift" and n_dev > 1 and not allow_replicated_dyson:
-        raise NotImplementedError(
-            f"route='lift' closes with jnp.linalg.solve on the N_mu x N_mu "
-            f"tile, a single-device dense solver, but this mesh is "
-            f"{mesh_xy.devices.shape}.  Above one device the close must go "
-            f"through the distributed solver (services/distrib_la), the twin "
-            f"of gw.w_isdf.solve_w's 'distributed' plan; that routing is the "
-            f"registered follow-on.  Pass allow_replicated_dyson=True to "
-            f"accept the per-rank N_mu^2 tile the RPA Dyson's own DEFAULT "
-            f"('local') plan already holds, or route='plain'/'auto'.")
 
     def plan_probes(context):
         nonlocal chunk
@@ -1026,8 +1010,7 @@ def compute_wc_qwedge(
     def _on_z_done(iz, z):
         row = tiles[iz]
         if route == "lift":
-            row = [dyson_close_tile(row[iq], v_by_q[iq],
-                                    allow_replicated_solve=allow_replicated_dyson)
+            row = [dyson_close_tile(row[iq], v_by_q[iq])
                    for iq in range(nq)]
         wc_z = jax.lax.with_sharding_constraint(
             jnp.stack(row, axis=0).astype(jnp.complex128),
@@ -1069,8 +1052,7 @@ def compute_wc_qwedge(
     elif route == "lift":
         # Every accumulated tile is ``T = Pi v``; the ring goes back in here,
         # ONCE per (q, z), through the closing Dyson.
-        tiles = [[dyson_close_tile(tiles[iz][iq], v_by_q[iq],
-                                   allow_replicated_solve=allow_replicated_dyson)
+        tiles = [[dyson_close_tile(tiles[iz][iq], v_by_q[iq])
                   for iq in range(nq)] for iz in range(nz)]
 
     # Stack (nz, nq, mu_pad, nu_pad) and KEEP the pad — see WLadderWedge.wc.
@@ -1113,72 +1095,94 @@ def compute_wc_qwedge(
     )
 
 
-#: ``(shape, dtype, mesh) -> jitted Dyson close``.  Cached for the reason every
-#: other jit in this family is: ``jax.jit`` keys on function identity.
+#: Checked executables by operand signature and shared LU decision, never room or data.
 _DYSON_CACHE: dict = {}
 
 
-def dyson_close_tile(T: jax.Array, V_q0: jax.Array, *,
-                     allow_replicated_solve: bool = False) -> jax.Array:
-    """``W(z) - v = v T (I - T)^{-1}`` — the lift's closing algebra.
+def _dyson_close_program(mesh, linear, n):
+    """The complete right-Dyson body, shared by pricing and execution."""
+    from common.collectives import transpose_xy
+    from distrib_la import checked_program, matmul
+    face = NamedSharding(mesh, P("x", "y"))
+    def close(t, v):
+        a = transpose_xy(jnp.eye(n, dtype=t.dtype) - t, mesh)
+        b = transpose_xy(t, mesh)
+        yt = linear.batched(a[None], b[None])[0]
+        y = transpose_xy(yt, mesh)
+        return matmul(v.astype(t.dtype), y, mesh=mesh, batched_route="auto")
+    return checked_program(close, mesh, face, in_shardings=(face, face))
 
-    ``T = Pi v`` on the padded centroid extent.  The pad rows and columns of
-    ``T`` are identically zero (the probe walk stops at ``n_rmu`` and the
-    identity projector kills pad centroids), so ``I - T`` is block
-    ``[[I - T_ll, 0], [0, I]]`` and the inverse never touches the pad — which is
-    why the identity, and not the zero tile, is the right projector.
 
-    Solved as ``(I - T)^T Y^T = T^T`` and then ``v Y``; a dense ``N_mu^3``.  This
-    is the SAME dense Dyson the RPA production path performs per (q, z)
-    (``gw.mpa.model._solve_wc``), not a new class of object, but ``jnp.linalg``
-    is a single-device solver: above one device this must route through
-    ``distrib_la``, and the caller is refused rather than silently gathering an
-    ``N_mu^2`` tile per rank (the F3 hazard, in its dense-algebra form).
+def dyson_close_tile(T: jax.Array, V_q0: jax.Array) -> jax.Array:
+    """Close ``Wc = v T (I-T)^-1`` on the input centroid face.
 
-    ``allow_replicated_solve=True`` takes that gather DELIBERATELY, and the
-    scope of the concession is exactly the RPA path's own: ``gw.w_isdf.solve_w``
-    has TWO plans and its DEFAULT (``linalg = local``) is a per-q dense
-    LU in which "each rank holds whole (mu, mu) tiles for its q's".  So this
-    flag makes the ladder's close the same memory class as the production RPA
-    close, no better and no worse, and it is opt-in so that the choice is in
-    the caller's log rather than in this function's silence.  The
-    ``distrib_la`` routing — the twin of that solver's ``distributed`` plan —
-    remains the registered follow-on, and is what the P -> 1e3 envelope needs.
+    Zero padded rows/columns of T and v give an identity pad in I-T and exactly
+    zero Wc padding. The right solve is implemented literally by transposing
+    both operands through the shared face mover; no commutation, Hermitian
+    projection or normal equations are used. The complete checked program
+    and matching native workspace are admitted beside the live operands.
     """
-    mesh = V_q0.sharding.mesh if hasattr(V_q0.sharding, "mesh") else None
-    n_dev = int(np.prod(mesh.devices.shape)) if mesh is not None else 1
-    if n_dev > 1 and not allow_replicated_solve:
-        raise NotImplementedError(
-            "dyson_close_tile uses jnp.linalg.solve, a single-device dense "
-            f"solver, but this tile lives on a {mesh.devices.shape} mesh.  The "
-            "N_mu x N_mu Dyson close of the ring lift is the same dense solve "
-            "the RPA path already does per (q, z) and must go through the "
-            "distributed solver (services/distrib_la) at P>1; gathering the "
-            "tile per rank here would be exactly the mu^2-replication the "
-            "scaling doctrine forbids.  Named deferral, not a half-build.  "
-            "allow_replicated_solve=True accepts the gather explicitly (the "
-            "memory class of gw.w_isdf.solve_w's DEFAULT 'local' plan).")
-    key = (tuple(T.shape), str(T.dtype), str(V_q0.dtype), T.sharding)
-    fn = _DYSON_CACHE.get(key)
-    if fn is None:
-        out_sh = T.sharding
+    from dataclasses import replace
+    from common.gpu_utils import device_budget_bytes
+    from distrib_la import (plan, lu_workspace_query,
+                            room_or_exhausted)
+    from distrib_la.workspace import local_lu_workspace
+    from distrib_la.resolve import mesh_platform, resolve_backend
+    from lxkit import memory
+    from runtime.aot_memory import compiled_price
 
-        def _close(T_, V_):
-            n = T_.shape[-1]
-            A = jnp.eye(n, dtype=T_.dtype) - T_
-            # Y = T (I - T)^{-1}  <=>  (I - T)^T Y^T = T^T
-            from distrib_la import solve_local   # 2^31-byte span route (ROCM)
-            Y = solve_local(A.T, T_.T).T
-            # Put the product back on the wedge tile's own sharding: at P>1
-            # the dense solve above is replicated by construction, and letting
-            # GSPMD pick the OUTPUT layout would leave the wedge stack's
-            # with_sharding_constraint to resolve it with a second collective.
-            return jax.lax.with_sharding_constraint(
-                V_.astype(T_.dtype) @ Y, out_sh)
+    if T.ndim != 2 or T.shape[0] != T.shape[1] or V_q0.shape != T.shape:
+        raise ValueError("ring-lift close requires equal square T and v")
+    mesh = getattr(T.sharding, "mesh", None)
+    if mesh is None:
+        mesh = Mesh(np.asarray([T.device]).reshape(1, 1), ("x", "y"))
+    face = NamedSharding(mesh, P("x", "y"))
+    n = int(T.shape[0])
+    budget = int(device_budget_bytes())
+    room = memory.room(bucketed=False)
+    available = room_or_exhausted(room, stage="BSE ring-lift close",
+                                 priced_bytes=max(0, budget-room), available_bytes=budget)
+    linear = plan("solve_lu", mesh, backend="distributed", n=n,
+                  batched_route="auto", budget_bytes=available)
+    operands = (T, V_q0)
+    abstract = jax.ShapeDtypeStruct((1, n, n), T.dtype)
+    held = {}
 
-        fn = jax.jit(_close)
-        _DYSON_CACHE[key] = fn
-    return fn(T, V_q0)
+    def build(linear, label=None):
+        key = (tuple(T.shape), str(T.dtype), str(V_q0.dtype), face,
+               linear.decision(abstract, abstract))
+        if key not in _DYSON_CACHE:
+            call = _dyson_close_program(mesh, linear, n)
+            executable = call.lower(*operands).compile()
+            extra = 0
+            if mesh_platform(mesh) == "CUDA":
+                extra = (local_lu_workspace(mesh, n, T.dtype) if linear.backend == "one_device"
+                         else lu_workspace_query(mesh, n, n, T.dtype, 0))
+            price = compiled_price(compiled=executable, extra=extra,
+                ranks=int(mesh.size), face=linear.backend != "one_device", source="BSE ring-lift close",
+                contexts=False)
+            price = replace(price, whole=n if linear.backend == "one_device" else 0)
+            _DYSON_CACHE[key] = call, executable, price
+        call, executable, price = _DYSON_CACHE[key]
+        if int(mesh.size) > 1:
+            price = price + memory.Price(outside=memory.contexts())
+        held[linear.backend if label is None else label] = call, executable, price
+        return price
+
+    price = build(linear)
+    routes = [(linear.backend, price)]
+    if linear.backend == "one_device":
+        def backup():
+            backend = resolve_backend("solve_lu", "distributed", mesh, n=n, size_route=False)
+            return build(plan("solve_lu", mesh, backend=backend, n=n, batched_route="auto"),
+                         label="distributed face")
+        routes = ([("distributed face", backup())] if price.bytes() > room else
+                  [(linear.backend, price), ("distributed face", backup)])
+    chosen = memory.admit("BSE ring-lift close", routes, room)
+    call, executable, price = held[chosen]
+    memory.book(memory.priced(price.bytes(), "compiled ring-lift close and native workspace",
+                              increment=True), stage="bse.ladder_close")
+    return call.finish(operands, executable(*operands))
 
 
 #: ``(shape, dtype, sharding, nlog) -> jitted worst-pad reduction``.  Cached

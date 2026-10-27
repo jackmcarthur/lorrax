@@ -15,6 +15,16 @@ owner. Sorting and eigenvector values are preserved. This Python transport
 change introduces no deck setting, native signature or rebuild requirement
 beyond the existing ABI 15 pair.
 
+## 2026-10-27 — Ring-lift closing Dyson uses the shared mesh solver
+
+Explicit Python `compute_wc_qwedge(route="lift")` calls can close the right
+Dyson on distributed centroid faces. The complete checked program keeps a
+fitting local solve and falls back to the existing mesh provider otherwise.
+Remove the obsolete `allow_replicated_dyson` and `allow_replicated_solve`
+keywords from Python callers; the replication exception is gone. The default
+`auto` choice on multiple devices remains `plain`, and slopes/moments still
+require the full operator. Decks, algebra and native ABI are unchanged.
+
 ## 2026-10-27 — Use measured ROCm EIGH placement costs
 
 Room-bearing `auto` EIGH plans with `batched_route="auto"` now use measured

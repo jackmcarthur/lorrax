@@ -594,6 +594,14 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
 This changes the screening in $\Sigma=iGW$; it does not add a matching
 self-energy vertex or close the self-consistent Hedin equations.
 
+The optional ring lift closes $W^c=vT(I-T)^{-1}$ through the shared checked
+LU plan and face GEMM. Explicit face transposes preserve the right solve;
+no whole centroid matrix is gathered on every rank. The complete executable
+and native workspace are admitted beside the live response and Coulomb banks.
+A fitting local solve remains available, with the existing mesh provider as
+its capacity backup. `auto` retains `plain` on multiple devices; slopes and
+moments use that full-operator route.
+
 The direct rung scans individual trials within each probe block. Its encoded
 `T(mu,nu,s,s,k)` and FFT/decode scratch are reused, so this largest temporary
 does not acquire the probe-block width. The trial vectors retain their

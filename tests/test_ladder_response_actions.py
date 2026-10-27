@@ -231,6 +231,7 @@ def test_streamed_facade_releases_all_moments_after_first_sample():
     namespace['ensure_W_R'] = prepare_owned
 
     def sweep(_data, _mesh, qrows, zrows, **kwargs):
+        assert kwargs["route"] == "plain"  # Mesh default and exact moments stay unchanged.
         assert _data is consumed[-1] and _data['W_q'] is None and _data['W_R'] is not None
         for iz, z in enumerate(zrows):
             for iq, q in enumerate(qrows):
