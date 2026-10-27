@@ -109,6 +109,9 @@ replacement; the SLATE backend left LORRAX on 2026-10-23.
   leg's size row. ROCm LU keeps the one-device room route, with `native2d`
   partial pivoting when one complete solve does not fit or no room is
   supplied. It needs no additional vendor library.
+  ELPA's real host stages use the smaller of CPU affinity and the mapped
+  OpenMP runtime's maximum thread count; complex stages retain one thread.
+  The handler reads this cap without changing the process's OpenMP settings.
 
 ### The guard ladder {#guard-ladder}
 
