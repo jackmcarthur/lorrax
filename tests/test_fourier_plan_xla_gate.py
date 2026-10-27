@@ -115,6 +115,17 @@ def np_reference(x, kw):
     return y
 
 
+def _relative_max(got, expected):
+    """Keep nonfinite outputs and shape failures visible to the gate verdict."""
+    if got.shape != expected.shape or not (np.isfinite(got).all() and np.isfinite(expected).all()):
+        return float("inf")
+    scale = float(np.max(np.abs(expected)))
+    error = float(np.max(np.abs(got - expected)))
+    if not (np.isfinite(scale) and np.isfinite(error)):
+        return float("inf")
+    return error / scale if scale else error
+
+
 def gate_cases(mesh):
     import jax
     import jax.numpy as jnp
@@ -148,8 +159,8 @@ def gate_cases(mesh):
             for a, b in zip(shards(res["ffi"]), shards(res["xla"])):
                 ref = np_reference(xg[b.index[0]], kw_full)
                 a, b = np.asarray(a.data), np.asarray(b.data)
-                worst = max(worst, float(np.max(np.abs(a - b)) / np.max(np.abs(b))))
-                worst_np = max(worst_np, float(np.max(np.abs(b - ref)) / np.max(np.abs(ref))))
+                worst = max(worst, _relative_max(a, b))
+                worst_np = max(worst_np, _relative_max(b, ref))
             out[name] = dict(rel=worst, rel_np=worst_np, stages=plan.stages)
     finally:
         fp.GEMM_CROSSOVER.clear()
@@ -185,6 +196,22 @@ def main() -> int:
 
 
 # ---- pytest: the contract on CPU ----------------------------------------------------------
+
+def test_relative_verdict_rejects_nonfinite_outputs_and_preserves_finite_errors():
+    expected = np.asarray([1 + 2j, 3 - 4j])
+    assert _relative_max(expected, expected) == 0
+    assert _relative_max(expected + .25, expected) == .05
+    assert _relative_max(np.zeros(2), np.zeros(2)) == 0
+    for nonfinite in (complex(np.nan, 0), complex(np.inf, 0)):
+        bad = expected.copy()
+        bad[0] = nonfinite
+        assert np.isinf(_relative_max(bad, expected))
+        assert np.isinf(_relative_max(expected, bad))
+    huge = np.asarray([complex(1.7e308, 1.7e308)])
+    with np.errstate(over="ignore", invalid="ignore"):
+        assert np.isinf(_relative_max(-huge, huge))
+    assert np.isinf(_relative_max(expected[:1], expected))
+
 
 if __name__ == "__main__":
     sys.exit(main())
