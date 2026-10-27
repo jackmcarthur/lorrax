@@ -2216,11 +2216,35 @@ def _centroid_face_kernels(
         b_start, meta, mu_active_mask, n_rmu, n_rmu_padded, nb_total, out_X, out_Y,
         stage_X_4d, stage_Y_4d):
     """Produce the existing face reshards and logical-extent finalizer."""
-    # Pad while bands own all mesh axes and μ is still local. Padding after
-    # moving an axis to μ creates halo exchanges between uneven logical
-    # shards. Both consumers reuse this one legal carrier before their
-    # existing Y-face and transposed X-face reshards.
-    band_owner = NamedSharding(out_Y.mesh, band_sphere_spec())
+    from jax import shard_map
+    from common.staged_reshard import _band_to_product_r_body
+    mesh = out_Y.mesh
+    p_x, p_y = int(mesh.shape['x']), int(mesh.shape['y'])
+    band_owner = NamedSharding(mesh, band_sphere_spec())
+    perm = [(x*p_y+y, y*p_x+x) for x in range(p_x) for y in range(p_y)
+            if x*p_y+y != y*p_x+x]
+
+    def _faces(a):
+        product = _band_to_product_r_body(a, ('x', 'y'), (p_x, p_y))
+        local_mu = int(product.shape[3])
+        y = (jax.lax.all_gather(product, 'x', axis=3, tiled=True)
+             if p_x > 1 else product)
+        # Preserve a data dependency on the completed Y gather. Without the
+        # barrier the optimizer can cancel slice(gather) and fork the chains.
+        product = jax.lax.dynamic_slice_in_dim(
+            jax.lax.optimization_barrier(y),
+            jax.lax.axis_index('x') * local_mu, local_mu, axis=3)
+        if perm:
+            moved = jax.lax.ppermute(product, ('x', 'y'), perm)
+            x, yy = jax.lax.axis_index('x'), jax.lax.axis_index('y')
+            product = jnp.where(x*p_y+yy == yy*p_x+x, product, moved)
+        x = (jax.lax.all_gather(product, 'y', axis=3, tiled=True)
+             if p_y > 1 else product)
+        return y, jnp.conj(x.transpose(0, 3, 1, 2))
+
+    faces = shard_map(_faces, mesh=mesh, in_specs=(band_sphere_spec(),),
+                      out_specs=(out_Y.spec, out_X.spec), check_vma=False)
+
     @partial(jax.jit, out_shardings=(out_Y, out_X))
     def _reshard_centroid_tile(psi_rmu_band):
         pad_cfg = ((0, 0), (0, 0), (0, 0), (0, n_rmu_padded - n_rmu))
@@ -2232,12 +2256,7 @@ def _centroid_face_kernels(
         if n_rmu_padded > n_rmu:
             psi_rmu_band = jnp.pad(psi_rmu_band, pad_cfg)
         psi_rmu_band = jax.lax.with_sharding_constraint(psi_rmu_band, band_owner)
-        psi_rmu = jax.lax.with_sharding_constraint(psi_rmu_band, stage_Y_4d)
-        psi_rmu = jax.lax.with_sharding_constraint(psi_rmu, out_Y)
-        psi_T = jax.lax.with_sharding_constraint(psi_rmu_band, stage_X_4d)
-        psi_rmuT = jnp.conj(psi_T.transpose(0, 3, 1, 2))
-        psi_rmuT = jax.lax.with_sharding_constraint(psi_rmuT, out_X)
-        return psi_rmu, psi_rmuT
+        return faces(psi_rmu_band)
 
     if mu_active_mask is None:
         # These programs depend only on geometry. Recreating the jit wrapper
@@ -2580,30 +2599,9 @@ def _load_bulk_centroid_faces(
         jax.block_until_ready(psi_rmu_band)
     del psi_G_flat
 
-    # Single global reshard {None, XY, None, None} → {None, None, None, Y}
-    # plus a conjugate-transpose into the rmuT_X layout.  TWO INDEPENDENT
-    # staged chains from the band-sharded input, one per output:
-    #
-    #   psi_rmu :  b:('x','y') → b:'y'  → μ:'y'   (out_Y)
-    #   psi_rmuT:  b:('x','y') → b:'x'  → transpose → μ:'x'  (out_X)
-    #
-    # Each chain is one same-axis band→μ all-to-all after a partial
-    # gather over the OTHER axis — both transitions XLA's partitioner
-    # handles natively.  The previous form derived psi_rmuT from the
-    # FINISHED out_Y tensor, which asked for a μ:'y' → μ:'x' reshard on
-    # the transposed tensor; that is the x-major↔y-major device-order
-    # move XLA cannot lower (upstream b/433785288) and it compiled into
-    # a compiler-flagged "[SPMD] Involuntary full rematerialization" —
-    # an all-gather of the ENTIRE (nk, μ_pad, nb, ns) ψ_rμ on every rank
-    # (1.475 GB/rank at 1998c/nb160/P=80; grows ∝ μ·nb — scorecard K.2,
-    # K.1 #7).  The split chains move full/Px + full/Py per rank instead
-    # of full/Py + full.  Values are untouched (pad/transpose/conj are
-    # elementwise/layout ops): bit-identical outputs, different wires.
-    # The shared pad is explicitly band-all-P before AND after padding.
-    # Without that owner, the historical hoisted pad inherited the first
-    # chain's b:'y' layout and the second b:'x' demand re-created the
-    # rectangular-mesh rematerialization above. The legal all-P carrier now
-    # feeds both independent chains without padding an already μ-sharded axis.
+    # One shared, data-dependent band→product-μ→Y-face→X-face chain.
+    # The explicit product-order permutation keeps rectangular meshes local;
+    # GSPMD no longer chooses independent face chains or a full ψ replica.
     # Attribution barrier: the process-local WfnLoader work above this line
     # does not synchronize processes, so the first collective inside
     # ``_reshard_centroid_tile`` absorbs ALL process skew accumulated since

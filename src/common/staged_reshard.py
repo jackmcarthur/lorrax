@@ -168,6 +168,17 @@ __all__ = [
 _PRODUCT_R_RESHARD: dict[tuple, tuple[Mesh, Callable]] = {}
 
 
+def _band_to_product_r_body(a, axes, sizes):
+    """Manual-region band-product → reversed r-product move, one local tile."""
+    ax_x, ax_y = axes
+    p_x, p_y = sizes
+    if p_y > 1:
+        a = jax.lax.all_to_all(a, ax_y, split_axis=3, concat_axis=1, tiled=True)
+    if p_x > 1:
+        a = jax.lax.all_to_all(a, ax_x, split_axis=3, concat_axis=1, tiled=True)
+    return a
+
+
 def band_to_product_r_reshard(
     mesh: Mesh, *, axes: tuple[str, str] = ("x", "y")
 ) -> Callable:
@@ -224,13 +235,7 @@ def band_to_product_r_reshard(
     r_divisor = spec_divisor(mesh, out_spec, axis=3)
 
     def _body(a):
-        if p_y > 1:
-            a = jax.lax.all_to_all(
-                a, ax_y, split_axis=3, concat_axis=1, tiled=True)
-        if p_x > 1:
-            a = jax.lax.all_to_all(
-                a, ax_x, split_axis=3, concat_axis=1, tiled=True)
-        return a
+        return _band_to_product_r_body(a, axes, (p_x, p_y))
 
     sm = shard_map(
         _body, mesh=mesh, in_specs=(in_spec,), out_specs=out_spec,
