@@ -101,3 +101,44 @@ def test_capacity_policy_workspace_includes_jaxlib_outside_window(monkeypatch):
                     mesh,share,n,np.complex128)
     assert owner.batched_eigh_row((72,72),np.complex128,'ROCM') is None
     assert owner.batched_eigh_row((128,128),np.complex128,'ROCM') is not None
+
+
+def test_distributed_elpa_prices_its_arena_once_and_local_routes_keep_scratch(monkeypatch):
+    """Metadata-only: real Plan route selection, no ROCm library or field.
+
+    The native gate checks the actual ELPA executable's u8 arena. Here an
+    already-resolved ELPA plan is represented on the available CPU mesh to
+    challenge the extra-workspace query, including its misleading rank-3 case.
+    """
+    from dataclasses import replace
+    import jax
+    from jax.sharding import Mesh
+    from distrib_la import plan, workspace
+    from distrib_la.plan import ROUTE_BATCH_RESHARD, ROUTE_SCAN
+    mesh=Mesh(np.asarray(jax.devices()[:1]).reshape(1,1),('x','y'))
+    monkeypatch.setattr(workspace,'mesh_platform',lambda _mesh:'ROCM')
+    workspace.local_eigh_workspace.cache_clear()
+    try:
+        for dtype in (np.float64,np.complex128):
+            n=18436
+            native=plan('eigh',mesh,n=n,backend='off',batched_route='auto')
+            provider=replace(native,requested='distributed',backend='elpa')
+            staged=replace(provider,requested_batched_route='batch_reshard')
+            whole_local=replace(provider,backend='one_device')
+            for batch in (1,3):
+                shape=(batch,n,n)
+                assert provider.known_route(shape,dtype)==ROUTE_SCAN
+                assert staged.known_route(shape,dtype)==ROUTE_BATCH_RESHARD
+                assert workspace.workspace_bytes_per_rank(provider,'eigh',(shape,),dtype)==0
+                expected=workspace.local_eigh_workspace(mesh,batch,n,dtype)
+                assert expected>0
+                for policy in (native,staged,whole_local):
+                    assert workspace.workspace_bytes_per_rank(policy,'eigh',(shape,),dtype)==expected
+            # A rank-2 ELPA solve remains distributed even if its stack
+            # preference is staged. The preference applies only to stacks.
+            for policy in (provider,staged):
+                assert workspace.workspace_bytes_per_rank(policy,'eigh',((n,n),),dtype,checked=True)==0
+            for policy in (native,whole_local):
+                assert workspace.workspace_bytes_per_rank(policy,'eigh',((n,n),),dtype)>0
+    finally:
+        workspace.local_eigh_workspace.cache_clear()

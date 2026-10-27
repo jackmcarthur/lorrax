@@ -61,25 +61,21 @@ def _local_gemm_temp(shapes, dtype, device):
 
 
 def _off_cuda(plan, op, shapes, dtype):
-    """Off CUDA: a host mesh and the XLA dot count their scratch in the compiled program
-    (zero vendor bytes); a ROCm eigh's vendor bytes are the leg's measured rows
-    (``lxkit.memory.vendor``: ELPA distributed, the rocSOLVER batched target locally), and a
-    library without a row is GATE memory_unpriced under STRICT."""
-    from lxkit import leg_for_platform, memory
-    from distrib_la.plan import Plan
+    """Additional scratch outside the compiled program on CPU/ROCm.
+
+    ELPA's pool and rocBLAS regions are explicit results, already priced by
+    the executable. Local ROCm eigensolvers still allocate native scratch.
+    Persistent contexts and ELPA's small/fallback allocations are separate.
+    """
+    from distrib_la.plan import Plan, ROUTE_BATCH_RESHARD
     local = (not isinstance(plan, Plan) or plan.is_native or plan.backend == ONE_DEVICE
-             or len(shapes[0]) == 3)
+             or len(shapes[0]) == 3 and plan.known_route(shapes[0], dtype) == ROUTE_BATCH_RESHARD)
     device, src = 0, 'XLA-managed scratch (compiled program)'
-    if mesh_platform(plan.mesh) == 'ROCM' and op == 'eigh':
-        n, ranks = int(shapes[0][-1]), int(plan.mesh.shape['x']) * int(plan.mesh.shape['y'])
-        if local:
-            share = int(shapes[0][0]) if len(shapes[0]) == 3 else 1
-            device = local_eigh_workspace(plan.mesh, share, n, dtype)
-            src = 'local ROCm eigh workspace (local_eigh_workspace)' if device else src
-        else:
-            term = memory.vendor(leg_for_platform('ROCM'), plan.backend, 'eigh', n, ranks,
-                                 dtype.itemsize)
-            device, src = int(term.fixed), term.source
+    if mesh_platform(plan.mesh) == 'ROCM' and op == 'eigh' and local:
+        n = int(shapes[0][-1])
+        share = int(shapes[0][0]) if len(shapes[0]) == 3 else 1
+        device = local_eigh_workspace(plan.mesh, share, n, dtype)
+        src = 'local ROCm eigh workspace (local_eigh_workspace)' if device else src
     return dict(device_bytes=device, host_bytes=0, vendor_device_bytes=device or None,
                 dynamic_xla_scratch_bytes=device, local=local, formula=src,
                 provider=getattr(plan, 'backend', 'XLA'))
@@ -245,7 +241,7 @@ def matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend='auto',
 
 
 def workspace_bytes_per_rank(plan, op, shapes, dtype, *, checked=False) -> int:
-    """Return a dense-plan device workspace bound without solving (0 off CUDA).
+    """Return dense-plan scratch allocated outside its compiled buffers.
 
     Parameters
     ----------
@@ -268,10 +264,11 @@ def workspace_bytes_per_rank(plan, op, shapes, dtype, *, checked=False) -> int:
     Returns
     -------
     int
-        Device bytes per rank for operation workspace. Mp eigh's dynamic
-        XLA ScratchAllocator allocation is exactly the native query result:
-        aligned vendor workspace plus one private input tile. Host workspace and persistent
-        context/communicator resources are separate (see WORKSPACE.md).
+        Device bytes per rank for additional operation workspace. ELPA's
+        explicit arena is already in the executable's price; its small and
+        fallback allocations and persistent contexts remain separate. Mp
+        eigh's dynamic XLA ScratchAllocator allocation uses its native query.
+        Host workspace and context/communicator resources are separate.
         GEMM workspace persists: budget its maximum across planned calls
         plus the largest concurrent eigh scratch. Local GEMM uses a
         compiler temporary-byte upper bound, without executing the kernel.
