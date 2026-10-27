@@ -29,7 +29,7 @@ MFMA path by the target-id rule, but it has not been measured.
 
 Σ's W synthesis and G builds multiply only the active K range of each row.
 `ACTIVE_LOCAL_ROUTE` (`distrib_la._active_local`) picks the implementation per
-leg: CUDA `native`, ROCm `device`, cpu `interval`.
+leg: CUDA `device`, ROCm `device`, cpu `interval`.
 
 **`device`** (`active_gemm/active_gemm_device_ffi.cc`; targets
 `lorrax_active_gemm_device`, `lorrax_active_gemm_device_out`) is one run-time
@@ -42,10 +42,13 @@ compiled kernel:
 
 **FP64 matrix cores** (lanes mfma, mfma2). Under `LRX_MFMA`, which the host sets
 only for gfx90a and gfx94x target ids, the inner product runs on
-`v_mfma_f64_16x16x4f64`, with complex128 as the exact 4M form. Every other
-target, CUDA included, takes the FMA path from the same text.
-- The block tile is chosen per call from (m, n). The 32×32 entry is used when it
-  pads ≥ 5 % less than 64×64: m = n = 156 covers 160 instead of 192, while 312
+`v_mfma_f64_16x16x4f64`, with complex128 as the exact 4M form. The shared
+device kernel also has a CUDA DMMA arm for compute capability 8.0 or newer;
+other targets use its generic FMA arm. Both GPU legs default to `device`;
+the optional `native` arm uses cuBLAS or rocBLAS.
+- The block tile is chosen per call from (m, n). The 32×32 entry is used when its
+  useful fraction exceeds 64×64 by more than five percentage points:
+  m = n = 156 covers 160 instead of 192, while 312
   stays on 64×64.
 - The next K slab's loads are issued before the current slab's MFMAs (register
   prefetch, no second LDS buffer).
@@ -62,7 +65,7 @@ Fe V2 P=4 Σ τ other went 8.13 → 7.07 / 7.02 s with MFMA (w8), then 7.00 → 
 with the w9 tile and prefetch (mean of 2 runs each); A100 `native` is 7.54 s.
 eqp was within 2.1e-8 eV (w8) and 4.8e-8 eV (w9) of the reference, at run-to-run
 level. Gate: `tests/test_active_local_native_gate.py` (against masked, interval
-and dense, same device, 1e-13), 64/64 at P=1 and on every rank at P=4.
+and dense, same device, 1e-13), at P=1 and on every rank at P=4.
 
 **Rejected on ROCm.**
 - `native` (rocBLAS behind the leg-neutral `cublas/local_active_gemm_ffi.cc`):
@@ -71,11 +74,10 @@ and dense, same device, 1e-13), 64/64 at P=1 and on every rank at P=4.
 - rocBLAS over all K with zeroed weights (the `full` guard): 7.99 s, and it reads
   inactive storage.
 
-**CUDA twin.** `native` (cuBLAS, bounds read on the host per call, two guard
-`cond`s), measured on A100 as idling the GPU ≤ 1.2 %. The `device` source is
-leg-neutral and NVRTC compiles it for sm_80 (FMA path). Adoption means listing
-it in the CUDA leg's sources and gating it. A DMMA (`mma.sync.m8n8k4.f64`) arm
-is sketched in the kernel header, not written.
+**CUDA twin.** The same `device` source is compiled by NVRTC, using its DMMA
+(`mma.sync.m8n8k4.f64`) arm on sm_80 and newer, or generic FMA on older
+devices. The optional `native` cuBLAS handler remains available to the gate;
+it reads bounds on the host per call and uses two guard `cond`s.
 
 ## 2 kdft modes 1 and 10 {#kdft}
 
@@ -151,7 +153,7 @@ native collective refuses by `GATE subspace_native_collectives`. Gate:
 
 | operation | ROCm | CUDA | status |
 |---|---|---|---|
-| Σ active-range GEMM | `active_gemm` device (MFMA on gfx90a/gfx94x, FMA elsewhere) | `cublas_local` native | CUDA adoption of `device` pending a gated run |
+| Σ active-range GEMM | `active_gemm` device (MFMA on gfx90a/gfx94x, FMA elsewhere) | `active_gemm` device (DMMA on sm_80+, FMA elsewhere) | both built |
 | k-box k-convolution, modes 2–5, 7–9, 11 | kdft (hipRTC) | mathdx (NVRTC) | both built |
 | pair convolution / plane FFT, modes 1, 10 | kdft `kbox_parent`, `plane_gather` | mathdx | both built |
 | Local Fourier plan | `fourier_plan_rocm` (rocBLAS + hipFFT, no fused pair) | `fourier_plan_mathdx` | both built |
