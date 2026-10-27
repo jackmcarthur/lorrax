@@ -1638,7 +1638,7 @@ def zeta_sphere_ngkmax(wfn, sym, meta, zeta_cutoff_ry) -> int:
 def _plan_route_g_for_channel(
 		*, meta, cfg, band_slices, mesh_xy, n_q_selected, k_unfold_plan,
 		print_fn=print, zeta_ngkmax=None, psi_ngkmax=None, psi_cylinder=None,
-		n_vertex=1):
+		n_vertex=1, factor_on_face=False):
 	"""Plan ONE ζ family (charge, or the current channels together) on route G.
 
 	Resolves the planner's inputs once for both families: the fit-window
@@ -1685,7 +1685,8 @@ def _plan_route_g_for_channel(
 		n_s=(int(psi_cylinder[1]) if psi_cylinder else int(min(
 			_n_a, math.ceil(2.4 * _r) + 1))),
 		n_vertex=int(n_vertex), n_parent=n_parent,
-		orbit_width=widest_unfold_orbit(k_unfold_plan))
+		orbit_width=widest_unfold_orbit(k_unfold_plan),
+		factor_on_face=bool(factor_on_face))
 	from gw.gflat_memory_model import log_mubatch_plan
 	log_mubatch_plan(mubatch_plan)
 	return {
@@ -2719,7 +2720,9 @@ def _prepare_fresh_parent_faces(
     		zeta_ngkmax=zeta_sphere_ngkmax(
     			wfn, sym, meta, zeta_contract.zeta_cutoff),
     		psi_ngkmax=int(wfn.ngkmax),
-    		psi_cylinder=_route_g_cylinder(wfn, meta))
+    		psi_cylinder=_route_g_cylinder(wfn, meta),
+    		# the charge factor B runs on the face (isdf.core._resolve_solver_kind)
+    		factor_on_face=True)
     _parent_zeta_plan = _candidate_plan if chunks is not None else None
     load_band_chunk = (chunks['band_chunk'] if chunks is not None
                        else zeta_contract.loader_band_chunk)

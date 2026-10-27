@@ -110,6 +110,67 @@ def bracket_selectors(selector, selectors):
 
 
 
+def _sigma_row_bytes(*, nk, n_parent, n_w, nb, nb_sig, ns, nu, partner, static):
+    """One local row's live set: the parent Green and its partner, mode 7's
+    output, W_prep, the pass's slices of W and its partner, the pass's ψ
+    rows (Green and projection) and the projector's ν-contracted rows."""
+    return 16 * ((2 + partner) * n_parent * ns * ns * nu + nk * nu
+                 + (1 + int(not static)) * n_w * nu + n_parent * ns * (nb + 2 * nb_sig))
+
+
+def sigma_row_plan(*, nk, n_parent, n_w, nb, nb_sig, n_rmu, ns, px, py, partner, static, cuts):
+    """``(R, windows)``: the Σ node's row passes (:func:`subtile_stream.plan_windows`).
+
+    Pure in the sizes, so the run (:func:`_sigma_subtile_kernel`) and the memory
+    planner (``gw.stage_inventory``) take one plan.  ``cuts()`` gives the admissible
+    orbit cuts of the local rows (read only when one tile does not hold them all).
+    """
+    from .subtile_stream import plan_windows
+    row = _sigma_row_bytes(nk=nk, n_parent=n_parent, n_w=n_w, nb=nb, nb_sig=nb_sig, ns=ns,
+                           nu=n_rmu // py, partner=partner, static=static)
+    return plan_windows(n_rmu // px, row, cuts)
+
+
+def sigma_pass_bytes(*, nk, n_parent, n_w, nb, nb_sig, n_rmu, ns, px, py, partner, static,
+                     R, passes, sum_layout, stores_rows_in_kernel, scratch):
+    """The Σ node's new bytes per rank beside its residents, and its stored output blocks.
+
+    ``R`` local rows a pass (:func:`sigma_row_plan`); ``stores_rows_in_kernel`` is the mode-7
+    convolution's (``make_kconv_klead_unfold``); ``scratch(rows)`` its run-time scratch
+    (:func:`gw.greens_function_kernel.sigma_kconv_scratch`).  Returns the price dict
+    the kernel books (``new``), with ``blocks``, the projector's row blocks.
+    """
+    from common.contract_bands import face_row_blocks
+    from runtime.tiles import TILE_BYTES
+    local_rows, nu = n_rmu // px, n_rmu // py
+    row_bytes = _sigma_row_bytes(nk=nk, n_parent=n_parent, n_w=n_w, nb=nb, nb_sig=nb_sig,
+                                 ns=ns, nu=nu, partner=partner, static=static)
+    # An indivisible orbit can exceed the input-row target. Keep its Green
+    # once, but cap the stored output using the whole-spin row pieces the
+    # shared projector owns. CPU/reference FFTs crop only after forming the
+    # full output, so subdivision there would repeat work without this saving.
+    output_row_bytes = 16 * n_parent * ns * ns * nu
+    output_blocks = (None,)
+    if stores_rows_in_kernel and R * output_row_bytes > TILE_BYTES:
+        divisors = (d for d in range(ns, 0, -1) if ns % d == 0)
+        for d in divisors:
+            candidate = face_row_blocks(R, py, (ns // d) ** 2)
+            output_blocks = candidate
+            if max(b[1] * b[3] for b in candidate) * output_row_bytes <= TILE_BYTES:
+                break
+        if len(output_blocks) == 1:
+            output_blocks = (None,)
+    stored_rows = R if output_blocks == (None,) else max(b[1] * b[3] for b in output_blocks)
+    # ψ rows and columns, the projection faces, and the Green's right operand (one copy of the
+    # columns, formed once per node).
+    sum_bytes = nb * (local_rows + 2 * nu) if sum_layout == "axis" else 2 * nb * n_rmu / (px * py)
+    psi_bytes = 16 * n_parent * ns * (sum_bytes + nb_sig * (local_rows + nu))
+    scratch = int(scratch(stored_rows))
+    return dict(d=ns, ns=ns, passes=int(passes), tile=float(TILE_BYTES), scratch=scratch,
+                output_blocks=len(output_blocks), stored_rows=stored_rows, blocks=output_blocks,
+                new=float(R * row_bytes - (R - stored_rows) * output_row_bytes + psi_bytes + scratch))
+
+
 def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_extent,
                           energy_windows, k_unfold_plan, q_wedge, static=False,
                           sum_layout="axis"):
@@ -147,12 +208,11 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     None) and the Green's real weights give its partner as conj(G) on the
     mode-7 load (no partner GEMM).
     """
-    from common.contract_bands import contract_bands_block_reshard, face_row_blocks
+    from common.contract_bands import contract_bands_block_reshard
     from common.fft_helpers import make_kconv_klead_unfold, make_kfft_klead_unfold, x_block_rows
     from distrib_la import gemm_plan
-    from runtime.tiles import TILE_BYTES
     from .greens_function_kernel import build_G_tau, has_antiunitary_rows, sigma_kconv_scratch
-    from .subtile_stream import (GREEN_ROWS_SPEC, orbit_cuts, plan_windows, projection_complete,
+    from .subtile_stream import (GREEN_ROWS_SPEC, orbit_cuts, projection_complete,
                                  scan_passes, window_green_rows, window_load, window_rows,
                                  window_tables, _window_table)
 
@@ -173,12 +233,9 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
             f"the Green's {g_tables.lsrc.shape[1]}; the faces carry {n_rmu} centroids x {ns}")
     partner = int(has_antiunitary_rows(k_unfold_plan) and not static)
     n_w = int(w_tables.n_parent)
-    # One local row's live set: the parent Green and its partner, mode 7's
-    # output, W_prep, the pass's slices of W and its partner, the pass's ψ
-    # rows (Green and projection) and the projector's ν-contracted rows.
-    row_bytes = 16 * ((2 + partner) * n_parent * ns * ns * nu + nk * nu
-                      + (1 + int(not static)) * n_w * nu + n_parent * ns * (nb + 2 * nb_sig))
-    R, windows = plan_windows(local_rows, row_bytes, lambda: sorted(
+    sizes = dict(nk=nk, n_parent=n_parent, n_w=n_w, nb=nb, nb_sig=nb_sig, n_rmu=n_rmu, ns=ns,
+                 px=px, py=py, partner=partner, static=static)
+    R, windows = sigma_row_plan(**sizes, cuts=lambda: sorted(
         set(orbit_cuts(g_tables.lsrc, px, ns)) & set(orbit_cuts(w_tables.lsrc, px, 1))))
     whole = len(windows) == 1
     kconv9 = make_kfft_klead_unfold(mesh_xy, kgrid, w_tables, norm="ortho")
@@ -193,35 +250,17 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     conv = make_kconv_klead_unfold(mesh_xy, kgrid, tables,
                                    store_rows=k_unfold_plan.parent_full_rows,
                                    norm="ortho", mult=mult)
-    # An indivisible orbit can exceed the input-row target. Keep its Green
-    # once, but cap the stored output using the whole-spin row pieces the
-    # shared projector owns. CPU/reference FFTs crop only after forming the
-    # full output, so subdivision there would repeat work without this saving.
-    output_row_bytes = 16 * n_parent * ns * ns * nu
-    output_blocks = (None,)
-    if conv.stores_rows_in_kernel and R * output_row_bytes > TILE_BYTES:
-        divisors = (d for d in range(ns, 0, -1) if ns % d == 0)
-        for d in divisors:
-            candidate = face_row_blocks(R, py, (ns // d) ** 2)
-            output_blocks = candidate
-            if max(b[1] * b[3] for b in candidate) * output_row_bytes <= TILE_BYTES:
-                break
-        if len(output_blocks) == 1:
-            output_blocks = (None,)
-    stored_rows = R if output_blocks == (None,) else max(b[1] * b[3] for b in output_blocks)
+    price = sigma_pass_bytes(
+        **sizes, R=R, passes=len(windows), sum_layout=sum_layout,
+        stores_rows_in_kernel=conv.stores_rows_in_kernel,
+        scratch=lambda rows: sigma_kconv_scratch(kgrid=kgrid, ns=ns, rows=rows, n_right=nu,
+                                                 mesh=mesh_xy))
+    output_blocks, stored_rows = price.pop("blocks"), price["stored_rows"]
     project = contract_bands_block_reshard(
         mesh_xy, channels="none", layout="axis", face_shape=(n_parent, nb, px * R, ns),
         right_face_shape=(n_parent, nb, n_rmu, ns), face_band_extent=face_band_extent,
         row_block=None if output_blocks == (None,) else stored_rows)
     finish = project.finish
-    # ψ rows and columns, the projection faces, and the Green's right operand (one copy of the
-    # columns, formed once per node).
-    sum_bytes = nb * (local_rows + 2 * nu) if sum_layout == "axis" else 2 * nb * n_rmu / (px * py)
-    psi_bytes = 16 * n_parent * ns * (sum_bytes + nb_sig * (local_rows + nu))
-    scratch = sigma_kconv_scratch(kgrid=kgrid, ns=ns, rows=stored_rows, n_right=nu, mesh=mesh_xy)
-    price = dict(d=ns, ns=ns, passes=len(windows), tile=float(TILE_BYTES), scratch=int(scratch),
-                 output_blocks=len(output_blocks), stored_rows=stored_rows,
-                 new=float(R * row_bytes - (R - stored_rows) * output_row_bytes + psi_bytes + scratch))
     from lxkit import memory
     # A static node is priced in its caller's section (Σ exchange, static COHSEX).
     label = "Sigma static" if static else "Sigma tau"

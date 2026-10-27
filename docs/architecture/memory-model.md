@@ -1071,6 +1071,19 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
 
 ## Planning a run
 
+0. **Before the run, without a device.** `gw.stage_inventory` prices every GN-PPM
+   stage per rank from the deck's sizes (and the ISDF, ζ, V(q) and Σ stages
+   tangential shares): the residents each stage opens beside, plus its transient
+   from the runtime's own price function (`plan_zeta_route_g`, `dyson_route_prices`,
+   `ppm_tau_kernel.sigma_row_plan`/`sigma_pass_bytes`, `density_band_chunk`), else the
+   arrays `LORRAX_MEMORY_TRACE` shows the stage allocating. `minimum_p(deck)` gives
+   the smallest square mesh and its binding stage in seconds;
+   `tools/scale_dryrun/dryrun.py` prints the table. Every stage of three one-node
+   runs (MoS₂/hBN N_μ 8160 and 16320, Al₂O₃ 4³ N_μ 6000) prices within 0.86–1.22 of
+   its measured peak (`tests/test_stage_inventory_calibration.py`). At large N_μ the
+   first wall on a 2×2×1 slab is the ζ fit's C_q assembly, `(N_k + n_par)·n_s²·16μ²/P`
+   of pair products beside C (1.5 G/P), not Σ(τ): the GN-PPM Σ(τ) node streams rows
+   within the fixed tile, its band-complete ψ falling as `1/sqrt(P)`.
 1. **Budget.** Leave `memory_per_device_gb = 0` for the model's budget, or
    set it lower to cap it (a value above it warns).
 2. **Mesh.** Use a square mesh and price its actual padded carriers.
@@ -1090,8 +1103,9 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
    MEMORY: each stage's device peak (max and min over ranks), the planner's
    price and `γ = peak / price`, or "no planner", the host columns, and the
    section that set the device peak. `γ > 1` is an under-estimate to
-   investigate. No planner prices host memory: the `rise` column names the
-   stage that grew the process.
+   investigate. The run's planner does not price host memory: the `rise` column
+   names the stage that grew the process (`gw.stage_inventory.host_bytes`
+   estimates it before the run: the Z store on the host plus a measured 9 GB/rank).
 
 ## The per-stage receipt
 
