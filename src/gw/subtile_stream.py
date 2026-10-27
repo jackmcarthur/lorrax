@@ -358,7 +358,7 @@ def _with_borrowed_green_faces(layout, operands, placed):
 
 
 def prepare_green_operands(operands, mesh, build, *, label, compile_only=False,
-                           _force_layout=None):
+                           receipt_stage=None, _force_layout=None):
     """Choose and admit a shared Green layout from placement and consumer AOT.
 
     ``operands`` are two canonical Green faces, optionally followed by two
@@ -366,6 +366,8 @@ def prepare_green_operands(operands, mesh, build, *, label, compile_only=False,
     compiled consumer programs and their native scratch bytes. Only the chosen
     placement executes; ``compile_only`` compiles/admit-checks without making ψ
     banks. The context must contain programs/geometry, never operand values.
+    ``receipt_stage`` names an already-open timing section: book the selected
+    admitted price there before placement adds its retained outputs to the floor.
     """
     from common.gpu_utils import device_budget_bytes
     from common.log import get_logger
@@ -401,9 +403,12 @@ def prepare_green_operands(operands, mesh, build, *, label, compile_only=False,
             break
     chosen = memory.admit(f"{label} sum-band operands", [(c[0], c[1]) for c in candidates],
                           memory.room(bucketed=False))
-    layout, _, placement, context = next(c for c in candidates if c[0] == chosen)
+    layout, price, placement, context = next(c for c in candidates if c[0] == chosen)
     if compile_only:
         return layout, None, context
+    if receipt_stage is not None:
+        from dataclasses import replace
+        memory.book(replace(price, increment=True), stage=receipt_stage)
     get_logger(__name__).info(f"{label} summed bands: {layout} layout")
     prepared = _with_borrowed_green_faces(layout, operands, placement(*operands))
     # Placement scratch must be gone before the consumer's scratch is needed.

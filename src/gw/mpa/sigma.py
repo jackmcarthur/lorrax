@@ -1830,7 +1830,8 @@ def _integrate_sigma_batches(
                         return kernel, compiled, native
 
                     _, prepared, tau_kernel = prepare_green_operands(
-                        subtile_faces, mesh_xy, build, label="Sigma")
+                        subtile_faces, mesh_xy, build, label="Sigma",
+                        receipt_stage=None if synthesis else "sigma.tau_sweep")
                     psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn = prepared
                     if synthesis:
                         tau_kernel._right = (psi_coh_yr, psi_proj_yn)

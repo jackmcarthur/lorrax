@@ -104,10 +104,38 @@ def test_admission_execution_and_no_payload_cache(monkeypatch, side, projection)
         assert needs['axis'] > needs['face'], needs
         room = (needs['axis'] + needs['face']) // 2
         monkeypatch.setattr(memory, 'room', lambda **_: room)
-        chosen, prepared, ex = S.prepare_green_operands(faces, mesh, build, label='test Green')
-        assert chosen == 'face' and needs[chosen] <= room
-        np.testing.assert_allclose(ex(prepared, weights)[0], expected, rtol=3e-12, atol=2e-11)
-        del prepared
+        admitted, booked, entry = [], [], []
+        actual_admit, actual_book = memory.admit, memory.book
+        def observe_admit(stage, routes, room, **kwargs):
+            selected = actual_admit(stage, routes, room, **kwargs)
+            admitted.append(next(price for name, price in routes if name == selected))
+            return selected
+        def observe_book(price, stage=None):
+            booked.append((price, stage))
+            floor = memory._in_use()
+            result = actual_book(price, stage=stage)
+            entry.append((floor, tracker['parts'][memory.ENTRY].bytes()))
+            return result
+        with monkeypatch.context() as observation:
+            observation.setattr(memory, 'admit', observe_admit)
+            observation.setattr(memory, 'book', observe_book)
+            tracker = memory.open_tracker('test Sigma sweep')
+            try:
+                for _ in range(2):  # Warm program reuse still needs this call's receipt.
+                    chosen, prepared, ex = S.prepare_green_operands(
+                        faces, mesh, build, label='test Green', receipt_stage='test Sigma sweep')
+                    assert chosen == 'face' and needs[chosen] <= room
+                    np.testing.assert_allclose(ex(prepared, weights)[0], expected, rtol=3e-12, atol=2e-11)
+                    del prepared
+            finally:
+                memory.close_tracker(tracker)
+        assert len(booked) == len(admitted) == 2
+        assert entry[0][0] == entry[0][1]  # The floor was captured before placement.
+        assert len(tracker['parts']) == 2  # One selected price plus its entry floor.
+        for (price, stage), selected in zip(booked, admitted):
+            assert stage == 'test Sigma sweep' and price.increment
+            assert price.bytes() == selected.bytes() == needs['face']
+            assert price.label == selected.label
 
         # A compile-only call must not execute even the selected placement.
         original = S.green_operand_program
@@ -132,8 +160,10 @@ def test_admission_execution_and_no_payload_cache(monkeypatch, side, projection)
 
         monkeypatch.setattr(S, 'green_operand_program', lambda mesh, layout: Program(original(mesh, layout)))
         chosen, prepared, ex = S.prepare_green_operands(
-            faces, mesh, build, label='test Green', compile_only=True)
+            faces, mesh, build, label='test Green', compile_only=True,
+            receipt_stage='compile-only must not book')
         assert chosen == 'face' and prepared is None and not executed
+        assert 'compile-only must not book' not in memory._PLANNED
 
 
 def test_response_wrapper_uses_prepared_operands(monkeypatch):

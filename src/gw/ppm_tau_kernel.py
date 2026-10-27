@@ -224,10 +224,11 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
                  new=float(R * row_bytes - (R - stored_rows) * output_row_bytes + psi_bytes + scratch))
     from lxkit import memory
     # A static node is priced in its caller's section (Σ exchange, static COHSEX).
+    # A dynamic sweep books its selected full-window price at operand placement.
     label = "Sigma static" if static else "Sigma tau"
-    memory.book(memory.priced(price["new"],
-                              f"{label}, {len(windows)} row pass(es)", increment=True),
-                stage=None if static else "sigma.tau_sweep")
+    if static:
+        memory.book(memory.priced(price["new"],
+                                  f"{label}, {len(windows)} row pass(es)", increment=True))
     log.debug(f"{label} stream: {len(windows)} row pass(es) of {R} local rows "
           f"({local_rows} per rank)")
     selectors = (None,) if brackets is None else tuple(
