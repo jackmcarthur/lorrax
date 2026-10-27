@@ -1126,9 +1126,8 @@ def dyson_close_tile(T: jax.Array, V_q0: jax.Array) -> jax.Array:
     from common.collectives import single_device_mesh
     from common.gpu_utils import device_budget_bytes
     from distrib_la import (plan, lu_workspace_query,
-                            room_or_exhausted)
-    from distrib_la.workspace import local_lu_workspace
-    from distrib_la.resolve import mesh_platform, resolve_backend
+                            room_or_exhausted, local_lu_workspace,
+                            mesh_platform, resolve_backend)
     from lxkit import memory
     from runtime.aot_memory import compiled_price
 
