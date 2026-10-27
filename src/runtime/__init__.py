@@ -1644,48 +1644,51 @@ def _enforce_gpu_placement() -> None:
 
 
 def nccl_warmup(mesh_xy) -> None:
-    """Pre-initialise every NCCL communicator we'll need later.
+    """Connect mesh collectives before application work can occupy their streams.
 
-    First call on a new NCCL communicator pays ``ncclCommInitRank`` cost
-    (~1-2 s on A100) — topology discovery.  Each unique ``replica_groups``
-    pattern is a separate communicator.  Our mesh uses three patterns:
-
-      * full-mesh psum     — ``{{0,1,2,3}}``   (used by ``jnp.mean``,
-                                                 reductions with no axis
-                                                 arg, etc.)
-      * 'x'-axis psum      — ``{{0,1},{2,3}}`` (sigma reduce-scatter x
-                                                 stage; also triggered by
-                                                 any axis-'x' psum)
-      * 'y'-axis psum      — ``{{0,2},{1,3}}`` (sigma reduce-scatter y
-                                                 stage; any axis-'y' psum)
-
-    Firing a dummy psum on each pattern at driver init moves the
-    multi-second first-call cost off whatever timed section would
-    otherwise have hit it (most recently: a 1.9 s single ``all-reduce-start``
-    inside ``jit(_mean)/reduce_sum`` during the sigma phase, traced via
-    the profiling stack).  No-op in single-process mode.
+    Warm world/x/y groups with separate all-to-all and vector-sum programs,
+    completing each before the next dispatch. Tiny reductions create the
+    communicators but do not initialize point-to-point receive buffers: their
+    first allocation can synchronize a stream while application collectives
+    already wait on peers. Both small and slab-sized runtime operands are
+    used; no warm-up array is retained. The slab is bounded per rank.
     """
+    import math
     import jax
     import jax.numpy as jnp
+    from jax import lax, shard_map
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from lxkit.collectives import slab_bytes
     if jax.process_count() <= 1:
         return
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    # Each (axis_spec) shape below has its reduction emit a distinct NCCL
-    # communicator at XLA lower time.  ``jnp.sum`` on an array sharded
-    # over the given axes lowers to the right psum; ``jax.lax.psum`` isn't
-    # callable from top-level jit (needs shard_map/pmap context), so we
-    # route the warmup through the implicit-reduction path instead.
-    shape2d = tuple(mesh_xy.shape[ax] for ax in mesh_xy.axis_names)
-    warm_specs = [(shape2d, P(*mesh_xy.axis_names))]       # full-mesh psum
-    for ax in mesh_xy.axis_names:
-        n_ax = int(mesh_xy.shape[ax])
-        warm_specs.append(((n_ax,), P(ax)))                # per-axis psum
-    for shape, spec in warm_specs:
-        sharding = NamedSharding(mesh_xy, spec)
-        # Born sharded: a single-device ``ones`` resharded onto the mesh would
-        # lower JAX's shard slicer once per shape (common.jax_compile_cache).
-        x = jnp.ones(shape, dtype=jnp.float64, device=sharding)
-        _ = jax.jit(jnp.sum)(x).block_until_ready()
+    groups = [tuple(mesh_xy.axis_names), *mesh_xy.axis_names]
+    for axes in groups:
+        names = axes if isinstance(axes, tuple) else (axes,)
+        group = math.prod(int(mesh_xy.shape[name]) for name in names)
+        if group <= 1:
+            continue
+        spec = P(axes)
+        exchange = jax.jit(shard_map(
+            lambda x, axes=axes: lax.all_to_all(x, axes, split_axis=0, concat_axis=0, tiled=True),
+            mesh=mesh_xy, in_specs=(spec,), out_specs=spec, check_vma=False))
+        reduce_spec = P(axes, None)
+        reduce = jax.jit(shard_map(
+            lambda x, axes=axes: lax.psum(x, axes),  # exact-reduce: small integer-valued startup ones
+            mesh=mesh_xy, in_specs=(reduce_spec,), out_specs=P(None, None), check_vma=False))
+        # Each peer receives an integral width. At P144 the global exchange
+        # extent is large, but each local argument/output is at most one slab.
+        for width in (1, max(1, slab_bytes() // (group * 8))):
+            local = group * width
+            x = jnp.ones((group * local,), dtype=jnp.float64,
+                         device=NamedSharding(mesh_xy, spec))
+            y = exchange(x)
+            y.block_until_ready()
+            del x, y
+            x = jnp.ones((group, local), dtype=jnp.float64,
+                         device=NamedSharding(mesh_xy, reduce_spec))
+            y = reduce(x)
+            y.block_until_ready()
+            del x, y
 
 
 def _gpu_is_present() -> bool:
