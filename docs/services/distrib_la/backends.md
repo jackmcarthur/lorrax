@@ -312,6 +312,15 @@ P>4 model is retained. ELPA's
 small, fallback and context allocations remain outside its compiled arena
 ([native workspace coverage](../../architecture/memory-model.md#measured)).
 
+ELPA removes solver padding through `_cyclic.face_crop`. Each axis trades
+spectator columns for whole rows, crops those rows locally, then reverses
+the exchange. The four `all_to_all` calls form one dependent chain. Only
+local spectator columns are padded, by at most the axis size minus one;
+each redistribution bank stays near the owned face size. This replaces
+compiler-generated sparse halo exchanges. The complete executable price
+includes the redistribution buffers: a bounded bank does not imply a lower
+temporary-memory total. The native ABI and solver mathematics are unchanged.
+
 **cuSOLVERMp eigh is block-cyclic by relabeling.** A `P('x','y')` operand is
 one `(n/p, n/p)` tile per rank. Handing cuSOLVERMp the same local buffers with
 a smaller square block `mb | n/p` (`mb ≤ 256`, `_cusolvermp._block_size`)

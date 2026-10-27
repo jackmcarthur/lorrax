@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-27 — Use uniform exchanges to crop ELPA eigenvectors
+
+Removing solver padding now uses four dependent `all_to_all` exchanges in
+the shared cyclic-layout owner, with a local crop between each forward and
+reverse exchange. This keeps each redistribution bank near the owned face
+and removes the implicit sparse halo schedule. Its buffers are included in
+the executable price; this is a communication repair, not a memory-saving
+claim. Eigenvalues, eigenvector ordering and convergence checks are unchanged.
+There is no new setting, native signature or additional rebuild requirement.
+
 ## 2026-10-27 — Preload ROCm BLAS code before collectives
 
 ROCm startup now calls the attested provider's `rocblas_initialize`
