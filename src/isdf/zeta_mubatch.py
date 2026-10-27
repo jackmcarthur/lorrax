@@ -601,7 +601,8 @@ def _tail_program(zeta, value, *, shell=False, q_owned=True):
         if q_owned:
             x = (_finish_shell if shell else _finish_v)(mesh, Q)(x)
         if basis is not None:
-            x = basis.unpack_axis(x, 1) if shell else basis.unpack_operator(x)
+            x = (basis.unpack_axis(x, 1, spec=P(None, _XY, None)) if shell
+                 else basis.unpack_operator(x, spec=P(None, 'x', 'y')))
         return x
     if key not in _kernel_cache:
         _kernel_cache[key] = jax.jit(finish)
@@ -627,7 +628,7 @@ def _write_program(zeta, value, *, q_owned):
     def place(x):
         if q_owned:
             x = _to_mu_owner(mesh, Q, 'mu')(x)
-        return basis.unpack_axis(x, 1) if basis is not None else x
+        return basis.unpack_axis(x, 1, spec=P(None, _XY, None)) if basis is not None else x
     if key not in _kernel_cache:
         _kernel_cache[key] = jax.jit(place)
     return _compile_phase(_kernel_cache[key], value)
@@ -640,7 +641,7 @@ def _debug_program(zeta, *args):
     def compare(F, dense, result):
         other = _finish_v(mesh, Q)(_v_from_m(mesh, solver, n_log)(F, dense))
         if basis is not None:
-            other = basis.unpack_operator(other)
+            other = basis.unpack_operator(other, spec=P(None, 'x', 'y'))
         return jnp.linalg.norm(other - result) / jnp.linalg.norm(result)
     if key not in _kernel_cache:
         _kernel_cache[key] = jax.jit(compare)

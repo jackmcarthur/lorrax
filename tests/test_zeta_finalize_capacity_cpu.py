@@ -143,3 +143,57 @@ def test_store_read_prices_allocated_slots_before_crop():
     assert move.memory_analysis().output_size_in_bytes == 32 * 8 * 16
     assert pack.memory_analysis().output_size_in_bytes == 4 * 8 * 16
     assert peak >= 32 * 8 * 16 > 2 * owner._local_bytes(result)
+
+
+def test_priced_terminal_programs_preserve_nonidentity_centroid_io_order():
+    """Canonical files and V/shell outputs agree across packed, unequal carriers."""
+    from types import SimpleNamespace
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from common.centroid_basis import PackedCentroidBasis
+    from common.grouped_layout import build_square_grouped_shard_layout
+    from isdf import zeta_mubatch as owner
+    from runtime.padding import padded_mu_extent
+    jax.config.update('jax_enable_x64', True)
+    if len(jax.devices('cpu')) < 4:
+        pytest.skip('requires four virtual CPU devices')
+    mesh = Mesh(np.array(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y'))
+    logical, q, qpad, ng = 7, 3, 4, 8
+    layout = build_square_grouped_shard_layout(np.array([0]*5 + [1]*2), (2, 2))
+    basis = PackedCentroidBasis(mesh, layout, np.zeros((logical, 3), np.int32),
+                                int(padded_mu_extent(logical, mesh)))
+    assert not basis.is_identity and basis.n_packed != basis.n_canonical
+    rng = np.random.default_rng(20261027)
+    matrix = np.zeros((q, basis.n_canonical, basis.n_canonical), complex)
+    rows = np.zeros((q, basis.n_canonical, ng), complex)
+    matrix[:, :logical, :logical] = rng.normal(size=(q, logical, logical)) + 1j*rng.normal(size=(q, logical, logical))
+    matrix = (matrix + matrix.swapaxes(-1, -2).conj()) / 2
+    rows[:, :logical] = rng.normal(size=(q, logical, ng)) + 1j*rng.normal(size=(q, logical, ng))
+    packed_matrix = basis.pack_host(basis.pack_host(matrix, axis=1), axis=2)
+    packed_rows = basis.pack_host(rows, axis=1)
+    zeta = SimpleNamespace(mesh=mesh, store=SimpleNamespace(Q=q), mu_basis=basis,
+                           solver_kind='lu', n_rmu_solve=basis.n_packed)
+    qspec, rspec, vspec = P(('x', 'y'), None, None), P(None, ('x', 'y'), None), P(None, 'x', 'y')
+    def operand(host, spec, q_owned):
+        if q_owned:
+            host = np.pad(host, ((0, qpad-q), (0, 0), (0, 0)))
+        return jax.device_put(host, NamedSharding(mesh, spec))
+    for q_owned in (True, False):
+        for shell, packed, expected, spec in ((False, packed_matrix, matrix, vspec),
+                                              (True, packed_rows, rows, rspec)):
+            arg = operand(packed, qspec if q_owned else spec, q_owned)
+            program, _ = owner._tail_program(zeta, arg, shell=shell, q_owned=q_owned)
+            np.testing.assert_array_equal(np.asarray(program(arg)), expected)
+        arg = operand(packed_rows, qspec if q_owned else rspec, q_owned)
+        program, _ = owner._write_program(zeta, arg, q_owned=q_owned)
+        np.testing.assert_array_equal(np.asarray(program(arg)), rows)
+    factor = operand(np.broadcast_to(np.eye(basis.n_packed, dtype=complex),
+                      (q, basis.n_packed, basis.n_packed)), qspec, True)
+    pivots = jax.device_put(np.tile(np.arange(basis.n_packed, dtype=np.int32), (qpad, 1)),
+                           NamedSharding(mesh, P(('x', 'y'), None)))
+    factor = factor, pivots
+    dense = operand(packed_matrix, qspec, True)
+    result = operand(matrix, vspec, False)
+    debug = owner._debug_program(zeta, factor, dense, result)
+    assert float(debug(factor, dense, result)) < 1e-14
