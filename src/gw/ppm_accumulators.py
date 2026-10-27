@@ -134,7 +134,9 @@ def _run_priced(program, *args, mesh, label):
 
     device_budget_bytes()
     executable = compiled_for(program, args)
-    price = compiled_price(compiled=executable, ranks=mesh.size, face=True, source=label)
+    face = all(isinstance(s, NamedSharding) and set(jax.tree.leaves(tuple(s.spec)))
+               == set(s.mesh.axis_names) for s in jax.tree.leaves(executable.output_shardings))
+    price = compiled_price(compiled=executable, ranks=mesh.size, face=face, source=label)
     memory.admit(label, price, memory.room(bucketed=False))
     memory.book(replace(price, increment=True))
     # The next eager phase must see these outputs in its actual resident floor.

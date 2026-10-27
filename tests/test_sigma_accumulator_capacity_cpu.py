@@ -104,3 +104,43 @@ def test_outputs_are_admitted_before_dispatch_beside_prior_accumulators(monkeypa
     assert len(seen) == len(dispatched) == 3 and seen[-1]["room"] == 0
     assert all(np.all(np.asarray(shard.data) == 0)
                for value in jax.tree.leaves(low.finalize()) for shard in value.addressable_shards)
+
+
+def test_sigma_state_forecast_preserves_replicated_energy_storage(monkeypatch):
+    """The mixed state has replicated band energies beside centroid faces."""
+    from gw import ppm_accumulators as owner
+    from gw.ppm_sigma import _sigma_state_program
+    from gw.tangential_execution import compiled_for
+    from lxkit import memory
+    from runtime.aot_memory import compiled_new_bytes
+
+    if len(jax.devices('cpu')) < 4:
+        pytest.skip('requires four virtual CPU devices')
+    mesh = Mesh(np.array(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y'))
+    rep, face = NamedSharding(mesh, P()), NamedSharding(mesh, P(None, 'x', 'y'))
+    energies = np.tile(np.array([-2., -1., 1., 2.]), (3, 1))
+    occupations = (energies < 0).astype(float)
+    args = (jax.device_put(energies, rep), jax.device_put(occupations, rep),
+            jax.device_put(np.ones((3, 8, 8), complex), face),
+            jax.device_put(np.full((3, 8, 8), 2.), face),
+            jax.device_put(np.ones((3, 8, 8), bool), face),
+            jax.device_put(np.asarray(False), rep))
+    program = _sigma_state_program(False)
+    executable = compiled_for(program, args)
+    prices = []
+    real_admit = memory.admit
+    def observe(stage, price, room, **kwargs):
+        prices.append(price)
+        return real_admit(stage, price, room, **kwargs)
+    monkeypatch.setattr(memory, 'admit', observe)
+    memory.set_budget(1 << 30)
+    actual = owner._run_priced(program, *args, mesh=mesh, label='Sigma state forecast')
+    np.testing.assert_array_equal(np.asarray(actual.E_cond), np.maximum(energies, 0))
+    np.testing.assert_array_equal(np.asarray(actual.H_val), np.maximum(-energies, 0))
+    assert actual.E_cond.sharding.is_equivalent_to(rep, 2)
+    assert actual.Omega_abs.sharding.is_equivalent_to(face, 3)
+    assert len(prices) == 1
+    assert prices[0].bytes() == compiled_new_bytes(executable)
+    # Recompiling at more ranks may reduce face fields; this current-program
+    # forecast must not claim that the replicated energies also scale as 1/P.
+    assert prices[0].bytes(16) == prices[0].bytes(4)
