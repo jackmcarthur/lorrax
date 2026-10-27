@@ -16,9 +16,9 @@ Multi-process notes
 JAX 0.5+ refuses to *fetch* (``np.asarray``) or *close over* sharded arrays
 that span devices belonging to other processes. The helpers below therefore:
 
-- ``init_bse_subspace`` calls ``multihost_utils.process_allgather`` on the
-  eps tensors before reading them on host. Each process replicates the
-  full eps; this is cheap (eps is tiny, ~kilobytes).
+- ``init_bse_subspace`` selects transition seeds on owned band tiles and
+  gathers only their bounded energy/index candidates. Gaussian rows are
+  generated at physical shape under the same distributed layout.
 - ``bse_diagonal_precond`` separates its array ``data`` from its jitted
   ``apply`` callable. Planned solvers pass that data explicitly; ``__call__``
   retains the host convenience interface for existing callers.
@@ -35,7 +35,9 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.collectives import gather_to_host
+from lxkit import device_put_process_local
+from common.collectives import single_device_mesh
+from solvers.lanczos import _supported_start_block
 
 from .bse_preconditioner import exchange_spin_weight
 
@@ -63,7 +65,8 @@ def init_bse_subspace(
     composed of two parts:
 
     - The first ``n_eig − n_random`` vectors are unit vectors at the
-      lowest ``(c, v, k)`` transitions sorted by ``E_c − E_v``. Cheap
+      lowest ``(c, v, k)`` transitions sorted by ``E_c − E_v`` (ties by
+      global transition index). Cheap
       and diverse; tends to span the low excitons because H_BSE's
       dominant diagonal is the energy difference.
     - The last ``n_random`` are deterministic complex Gaussian vectors
@@ -88,35 +91,17 @@ def init_bse_subspace(
     n_random : how many of those slots are random (default 5)
     mesh, sharding : if given, the result is shard-constrained to
         ``sharding`` (canonically P(None, "x", "y", None), the stack matvec's).
-    seed : RNG seed (numpy keyed). Default 0 → reproducible.
+    seed : JAX RNG seed. Default 0 → reproducible across process grids.
 
     Returns
     -------
     V : (n_eig, nc, nv, nk) — unit-norm complex jax array, sharded if
         ``sharding`` was provided.
     """
-    eps_c_np = gather_to_host(eps_c)
-    eps_v_np = gather_to_host(eps_v)
-    nk, nc = eps_c_np.shape
-    _, nv = eps_v_np.shape
-
-    # Physical extents.  DROP THE PAD BY COUNT, never by value.
-    #
-    # This used to be `finite = isfinite(flat) & (flat > 1e-12)` with the
-    # comment "skip padded / non-physical bands (zero or negative ΔE)".
-    # That is a value filter and it does not do what it says.  With the
-    # loader's OLD zero ε pad the pad transitions were
-    #     (c_pad, v_pad) -> 0        caught by the filter
-    #     (c_pad, v_real) -> |ε_v|   POSITIVE, sails through
-    #     (c_real, v_pad) -> ε_c     POSITIVE, sails through
-    # and since ΔE_physical = ε_c + |ε_v| exceeds both mixed terms, those
-    # two families sort BELOW every real transition — so the "lowest
-    # transitions" seed picked pad states preferentially, exactly the
-    # states the filter was written to exclude.  The loader now writes a
-    # signed sentinel (``bse_io.PAD_EPS_GUARD_RY``) which makes the value
-    # filter incidentally work, but a filter that is only correct because
-    # of a constant defined in another module is not a filter.  The count
-    # is exact and local: pass ``n_cond``/``n_val`` and slice.
+    nk, nc = eps_c.shape
+    if eps_v.shape[0] != nk:
+        raise ValueError("init_bse_subspace: conduction and valence k counts differ")
+    nv = eps_v.shape[1]
     nc_log = nc if n_cond is None else int(n_cond)
     nv_log = nv if n_val is None else int(n_val)
     if not (0 < nc_log <= nc and 0 < nv_log <= nv):
@@ -127,50 +112,86 @@ def init_bse_subspace(
     if not 0 < n_eig <= physical:
         raise ValueError(f"init_bse_subspace: n_eig={n_eig} must be in [1, {physical}] "
                          "for the logical transition space")
-    # The full manifold is already spanned by every physical unit vector.
-    # Replacing its last few coordinates by random vectors adds no coverage,
-    # worsens conditioning, and makes an avoidable large structured Gram
-    # eigensolve necessary. Keep the exactly orthonormal canonical basis.
     n_random = 0 if n_eig == physical else max(0, min(n_random, n_eig))
     n_pick = n_eig - n_random
+    if sharding is None:
+        if mesh is None:
+            mesh = single_device_mesh()
+        sharding = NamedSharding(mesh, P(None, 'x', 'y', None))
+    mesh = sharding.mesh
+    sc, sv = NamedSharding(mesh, P(None, 'x')), NamedSharding(mesh, P(None, 'y'))
+    ec = device_put_process_local(eps_c, sc)
+    ev = device_put_process_local(eps_v, sv)
+    from lxkit import memory
+    from common.gpu_utils import device_budget_bytes
+    from runtime.aot_memory import compiled_price
+    key = jnp.int64(seed)
+    executable = _bse_seed_program.lower(ec, ev, key, mesh=mesh,
+        nc_log=nc_log, nv_log=nv_log, n_eig=n_eig, n_random=n_random, dtype=dtype).compile()
+    stage = 'BSE initial subspace'
+    price = compiled_price(compiled=executable, ranks=int(mesh.size), face=True, source=stage)
+    device_budget_bytes()
+    memory.book(price, stage=stage)
+    memory.admit(stage, price, memory.room(bucketed=False))
+    rows = executable(ec, ev, key)
+    return jax.device_put(rows, sharding)
 
-    # ── Part 1: lowest PHYSICAL (c, v, k) by energy ───────────────────
-    delta_E = (eps_c_np[:, :nc_log, None]
-               - eps_v_np[:, None, :nv_log])              # (nk, nc_log, nv_log)
-    flat = delta_E.reshape(-1)
-    # Residual value guard: a genuinely non-physical ΔE (NaN, or <= 0 from a
-    # metallic/misordered window) is still skipped.  It is no longer load
-    # bearing for the pad.
-    finite = np.isfinite(flat) & (flat > 1e-12)
-    order = np.argsort(np.where(finite, flat, np.inf))
-    picks = order[:n_pick]
-    k_idx, c_idx, v_idx = np.unravel_index(picks, (nk, nc_log, nv_log))
 
-    V_np = np.zeros((n_eig, nc, nv, nk), dtype=np.complex128)
-    V_np[np.arange(n_pick), c_idx, v_idx, k_idx] = 1.0
+@partial(jax.jit, static_argnames=('mesh', 'nc_log', 'nv_log', 'n_eig', 'n_random', 'dtype'))
+def _bse_seed_program(ec, ev, seed, *, mesh, nc_log, nv_log, n_eig, n_random, dtype):
+    """Lowest-transition unit rows and physical Gaussians on band faces.
 
-    # ── Part 2: random tail, PHYSICAL block only ──────────────────────
-    # Drawn at the logical shape and embedded, so the pad zone stays exact
-    # zero: a random start with support on the pad block hands the solver a
-    # vector inside a decoupled subspace whose eigenvalues are the sentinel.
-    if n_random > 0:
-        rng = np.random.default_rng(seed)
-        rand = (rng.standard_normal((n_random, nc_log, nv_log, nk))
-                + 1j * rng.standard_normal((n_random, nc_log, nv_log, nk)))
-        norms = np.sqrt(
-            np.sum(np.abs(rand) ** 2, axis=(1, 2, 3), keepdims=True))
-        rand = rand / np.maximum(norms, 1e-30)
-        V_np[n_pick:, :nc_log, :nv_log, :] = rand
+    Only score/index candidates, at most ``P * n_pick`` entries, are gathered.
+    The whole seed and the transition energy field remain distributed.
+    """
+    n_pick = n_eig - n_random
+    sh = NamedSharding(mesh, P(None, 'x', 'y', None))
 
-    if sharding is not None:
-        V = jax.make_array_from_callback(
-            V_np.shape,
-            sharding,
-            lambda idx: jnp.asarray(V_np[idx], dtype=dtype),
-        )
-    else:
-        V = jnp.asarray(V_np, dtype=dtype)
-    return V
+    @partial(jax.shard_map, mesh=mesh, in_specs=(P(None, 'x'), P(None, 'y')),
+             out_specs=P(None, 'x', 'y', None), check_vma=False)
+    def unit_rows(ec, ev):
+        nk, lc = ec.shape
+        lv = ev.shape[1]
+        physical = nk*nc_log*nv_log
+        c = jnp.arange(lc, dtype=jnp.int64) + jax.lax.axis_index('x')*lc
+        v = jnp.arange(lv, dtype=jnp.int64) + jax.lax.axis_index('y')*lv
+        k = jnp.arange(nk, dtype=jnp.int64)
+        indices = ((k[:, None, None]*nc_log+c[None, :, None])*nv_log
+                   + v[None, None, :])
+        live = (c[None, :, None] < nc_log) & (v[None, None, :] < nv_log)
+        if n_pick == physical:
+            # The complete physical basis needs no ordering or random tail.
+            picks = jnp.arange(physical, dtype=jnp.int64)
+        elif n_pick:
+            energy = ec[:, :, None]-ev[:, None, :]
+            scores = jnp.where(live & jnp.isfinite(energy) & (energy > 1e-12),
+                               energy, jnp.inf).reshape(-1)
+            ids = jnp.where(live, indices, physical).reshape(-1)
+            scores, ids = jax.lax.sort((scores, ids), num_keys=2)
+            keep = min(n_pick, scores.size)
+            scores = jax.lax.all_gather(scores[:keep], ('x', 'y')).reshape(-1)
+            ids = jax.lax.all_gather(ids[:keep], ('x', 'y')).reshape(-1)
+            _, picks = jax.lax.sort((scores, ids), num_keys=2)
+            picks = picks[:n_pick]
+        else:
+            picks = jnp.empty((0,), dtype=jnp.int64)
+        return ((indices[None] == picks[:, None, None, None]) & live[None]
+                ).transpose(0, 2, 3, 1).astype(dtype)
+
+    starts = unit_rows(ec, ev)
+    if n_random:
+        nk, nc = ec.shape
+        nv = ev.shape[1]
+        shape = (nc, nv, nk)
+        random, _ = _supported_start_block(
+            nc*nv*nk, n_random, seed, None, vector_shape=shape,
+            support_shape=(nc_log, nv_log, nk),
+            constrain=lambda x: jax.lax.with_sharding_constraint(x, sh))
+        random = random.T.reshape(n_random, *shape)
+        norms = jnp.sqrt(jnp.sum(jnp.abs(random)**2, axis=(1, 2, 3), keepdims=True))
+        random /= jnp.maximum(norms, 1e-30)
+        starts = jnp.concatenate((starts, random.astype(dtype)), axis=0)
+    return jax.lax.with_sharding_constraint(starts, sh)
 
 
 # ═══════════════════════════════════════════════════════════════════════

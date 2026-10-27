@@ -803,7 +803,7 @@ def _build_block_tridiag(alpha_all, beta_all, max_iter: int, bs: int,
 
 
 def _supported_start_block(n, bs, seed, support, *, vector_shape=None,
-                           support_shape=None, subspace_plan=None):
+                           support_shape=None, constrain=None):
     """The random complex ``(n, bs)`` start block and the supported count.
 
     One spelling of ``support`` (see :func:`block_lanczos_eig_jit`) for
@@ -837,8 +837,8 @@ def _supported_start_block(n, bs, seed, support, *, vector_shape=None,
         # The row-major draw is identical to (n_active, bs). Keeping its
         # physical axes visible lets GSPMD generate only local RNG tiles.
         rows = jnp.moveaxis(Q0, -1, 0)
-        if subspace_plan is not None and subspace_plan is not False:
-            rows = subspace_plan.constrain(rows)
+        if constrain is not None:
+            rows = constrain(rows)
         rows = jnp.pad(rows, ((0, 0), *tuple(
             (0, p-s) for s, p in zip(support_shape, vector_shape))))
         Q0 = rows.reshape(bs, n).T
@@ -933,7 +933,8 @@ def block_lanczos_eig_jit(
     # Initial orthonormal block via QR of random complex Gaussian.
     Q0, n_active = _supported_start_block(
         n, bs, seed, support, vector_shape=vector_shape,
-        support_shape=support_shape, subspace_plan=subspace_plan)
+        support_shape=support_shape,
+        constrain=(subspace_plan.constrain if subspace_plan else None))
     max_iter = max(1, min(int(max_iter), n_active // bs))
     subspace_plan = _resolve_subspace_plan(
         subspace_plan, (max_iter + 1) * bs, n_eig,
@@ -1039,7 +1040,8 @@ def block_lanczos_eig_jit_converged(
         raise ValueError('Lanczos vector_shape must contain n elements')
     Q0, n_active = _supported_start_block(
         n, bs, seed, support, vector_shape=vector_shape,
-        support_shape=support_shape, subspace_plan=subspace_plan)
+        support_shape=support_shape,
+        constrain=(subspace_plan.constrain if subspace_plan else None))
     # Krylov-exhaustion clamp — same rationale as block_lanczos_eig_jit:
     # past floor(n/bs) blocks the residual collapses and QR manufactures
     # junk directions with arbitrary (even sub-spectrum) Ritz values.

@@ -31,7 +31,7 @@ def _seed_program(mesh, logical, carrier, bs=2):
     def seed():
         q, count = _supported_start_block(
             n, bs, 42, None, vector_shape=carrier,
-            support_shape=logical, subspace_plan=plan)
+            support_shape=logical, constrain=plan.constrain)
         return q.T.reshape(bs, *carrier), jnp.int64(count)
 
     return jax.jit(seed, out_shardings=(sh, NamedSharding(mesh, P())))

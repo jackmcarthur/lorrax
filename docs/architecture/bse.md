@@ -358,6 +358,16 @@ draw order and the supported-space exhaustion count are unchanged. KPM and
 spectral-bound seeds retain their padded-shape draws and restrict them by
 band counts inside the seed program.
 
+Davidson selects its lowest-energy unit starts on the distributed band
+tiles. Only bounded score/index candidates are gathered; neither the full
+transition-energy array nor the dense seed bank is built on host. Equal
+transition energies are ordered by global transition index. Its normalized
+random tail now uses the same physical-shaped JAX Gaussian owner as block
+Lanczos, replacing NumPy draws while keeping the public seed reproducible
+and padding exactly zero. This changes the initial random vectors and may
+change iteration counts; the residual tests and stored science references
+are unchanged. A full physical-manifold request uses its complete unit basis.
+
 ## Dipoles and absorption
 
 The dipole files hold velocity matrix elements. Absorption uses the position
