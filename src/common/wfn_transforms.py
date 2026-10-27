@@ -93,7 +93,9 @@ def _priced_executable(kernel, args, stage, *, extra=0):
     compiled = _EXECUTABLES[key]
     device_budget_bytes()
     ranks = len(jax.tree.leaves(compiled.output_shardings)[0].device_set)
-    price = replace(compiled_price(compiled=compiled, ranks=ranks, face=True,
+    face = all(isinstance(s, NamedSharding) and set(jax.tree.leaves(tuple(s.spec)))
+               == set(s.mesh.axis_names) for s in jax.tree.leaves(compiled.output_shardings))
+    price = replace(compiled_price(compiled=compiled, ranks=ranks, face=face,
                     source=stage, extra=int(extra)), increment=True)
     memory.admit(stage, price, memory.room(bucketed=False))
     memory.book(price)

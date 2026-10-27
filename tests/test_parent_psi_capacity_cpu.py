@@ -164,3 +164,34 @@ def test_generic_finish_admits_crop_and_nonzero_band_mask_without_retaining_meta
     np.testing.assert_array_equal(np.asarray(actual[0]), expected)
     np.testing.assert_array_equal(np.asarray(actual[1]), expected.conj().transpose(0, 3, 1, 2))
     assert not y.is_deleted() and not x.is_deleted(), 'terminal input donation changed'
+
+
+def test_axis_program_sizing_does_not_extrapolate_a_full_mesh_spread(monkeypatch):
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from common import wfn_transforms as W
+    from lxkit import memory
+    from runtime.aot_memory import compiled_new_bytes
+    jax.config.update('jax_enable_x64', True)
+    if len(jax.devices('cpu')) < 4:
+        pytest.skip('needs four virtual CPU devices')
+    mesh = Mesh(np.array(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y'))
+    monkeypatch.setattr(memory, '_RUN', dict(memory._RUN))
+    memory.set_budget(1 << 28)
+    prices = {}
+    real_admit = memory.admit
+    def observe(stage, price, room, **kwargs):
+        prices[stage] = price
+        return real_admit(stage, price, room, **kwargs)
+    monkeypatch.setattr(memory, 'admit', observe)
+    for label, spec in (('axis', P(None, 'y')), ('face', P('x', 'y'))):
+        sharding = NamedSharding(mesh, spec)
+        kernel = jax.jit(lambda x: x+x, out_shardings=sharding)
+        abstract = jax.ShapeDtypeStruct((32, 32), jnp.float64, sharding=sharding)
+        ex = W._priced_executable(kernel, (abstract,), label)
+        assert prices[label].bytes() == compiled_new_bytes(ex)
+    # These are forecasts of the measured current-mesh quote, not recompiled
+    # capacities. Only a program on both axes may assume a 1/P reduction.
+    assert prices['axis'].bytes(16) == prices['axis'].bytes(4)
+    assert prices['face'].bytes(16) < prices['face'].bytes(4)
