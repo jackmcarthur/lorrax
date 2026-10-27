@@ -46,6 +46,12 @@ For many-band runs, inspect the wavefunction route too. A two-axis distribution 
 
 ## Local or distributed linear algebra {: #linalg }
 
+On ROCm, startup keeps independently cached communicator groups by disabling
+XLA communicator splitting. The shared platform defaults supply this before
+the first communicator is acquired; a Frontier run needs no extra flag.
+The policy preserves the solver equations and checks. Native communicator
+resources remain part of the outside-pool budget, not the executable quote.
+
 The deck key `linalg` (default `local`) requests the layout of dense solves. The shared solver plan chooses among available local and mesh providers using their memory prices and, where qualified, timing models. Local rounds assign whole $N_\mu\times N_\mu$ matrices to individual devices; mesh solves divide the matrix storage over $P$ and communicate within the factorization. The provider depends on the platform; read the selected route in the report.
 
 `local` is a request, not a guarantee. For a W Dyson batch of $Q$ stored q rows, the local-route model includes the face-tiled V, χ and W plus whole copies for $\lceil Q/P\rceil$ q points and one LU pair,

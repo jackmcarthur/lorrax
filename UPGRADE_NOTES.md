@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-27 — Keep ROCm communicator ownership stable
+
+ROCm startup now supplies `--xla_gpu_enable_nccl_comm_splitting=false` from
+the shared platform table before communicator acquisition. This avoids
+replacing warmed direct subgroups with parent-shared split communicators,
+which stalled the 144-rank checked ELPA path. The same cold solve and two
+repeats passed with splitting disabled. CPU and CUDA defaults, numerical
+checks and native ABI are unchanged; no run-file setting or additional
+native rebuild is needed. See [startup ownership](docs/architecture/startup_environment.md#rocm-communicators).
+
 ## 2026-10-27 — Make checked probe row layouts explicit
 
 The EIGH residual and LU projected check move their skinny probe rows

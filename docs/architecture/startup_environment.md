@@ -64,6 +64,23 @@ cache hit therefore does not establish a warm vendor startup. See
 [Compilation](compilation.md#3-xla-programs) and the
 [memory budget](memory-model.md#budget) for their separate coverage.
 
+### Stable ROCm communicator ownership {#rocm-communicators}
+
+The shared ROCm leg disables XLA's communicator-splitting optimization at
+startup, before the first communicator is acquired. XLA can otherwise
+replace a warmed direct subgroup with a child sharing a larger parent's
+resources. Actual 144-rank logs showed this replacement before the first
+post-ELPA eigenvector exchange stalled; disabling splitting completed the
+same checked cold solve and two repeats. This preserves the bounded array
+algorithms and their numerical checks. It adds no application warm-up tier.
+
+The runtime supplies this default automatically; Frontier run scripts need
+no extra flag. CPU and CUDA leg defaults are unchanged. This Python policy
+does not change the native ABI or require another build. Independent
+communicators may retain additional resources outside XLA's executable
+buffers, so use the reported memory budget and outside-pool observations.
+See [the XLA flag table](compilation.md#3-xla-programs).
+
 ## 2 Shared caches: atomic, keyed, validated, concurrent-safe {#caches}
 
 A cache that several processes, nodes or checkouts share must meet four rules.
