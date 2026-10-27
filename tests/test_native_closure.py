@@ -360,4 +360,98 @@ def test_gate_requires_each_recorded_family_mapped_once_as_the_recorded_file(tre
 
 # ---------------------------------------------------------------- two legs, one process
 # ---------------------------------------------------------------- sealed bundle
+@pytest.mark.parametrize("platform", ["CUDA", "ROCM"])
+def test_sealer_device_pairs_keep_source_closure_and_pin_guards(tmp_path, monkeypatch, platform):
+    """Real writer/sealer/loader protocol over an ELF metadata fixture.
+
+    Only ELF inspection is replaced; Git source identity, hashes, closure
+    rewriting, immutable publication and loader pair refusal run unchanged.
+    This does not certify any GPU kernel or vendor library.
+    """
+    import hashlib
+    from lxkit import LEGS
+    spec=importlib.util.spec_from_file_location("seal_bundle",REPO/"src/ffi/cpp/stage/seal_bundle.py")
+    sealer=importlib.util.module_from_spec(spec);spec.loader.exec_module(sealer)
+    source=tmp_path/"source";header=source/"src/ffi/cpp/common/lorrax_ffi_abi.h"
+    header.parent.mkdir(parents=True);header.write_text("#define LORRAX_FFI_ABI_VERSION 14\n")
+    subprocess.run(["git","init","-q",str(source)],check=True)
+    subprocess.run(["git","-C",str(source),"add","."],check=True)
+    subprocess.run(["git","-C",str(source),"-c","user.name=fixture","-c","user.email=fixture@example.invalid",
+                    "commit","-qm","immutable native source"],check=True)
+    revision=subprocess.check_output(["git","-C",str(source),"rev-parse","HEAD"],text=True).strip()
+    runtime_dir,private_dir=tmp_path/"runtime",tmp_path/"private"
+    runtime_dir.mkdir();private_dir.mkdir()
+    device=tmp_path/"artifacts"/platform/LEGS[platform].so_name
+    host=tmp_path/"artifacts"/"host"/LEGS["cpu"].so_name
+    for path in (device,host):path.parent.mkdir(parents=True);path.write_bytes(path.name.encode())
+    mpi=runtime_dir/"libmpi_fixture.so.12";mpi.write_bytes(b"one MPI")
+    collective=runtime_dir/("libnccl.so.2" if platform=="CUDA" else "librccl.so.1")
+    collective.write_bytes(b"one plugin collective")
+    private=private_dir/("libcusolverMp.so.0" if platform=="CUDA" else "libelpa_openmp.so.19")
+    private.write_bytes(b"recorded private engine")
+    needed={device.name:[private.name],host.name:[mpi.name],private.name:[mpi.name]}
+    monkeypatch.setattr(npv,"_elf_dynamic",lambda p:{
+        npv._DT_NEEDED:needed.get(Path(p).name,[]),npv._DT_SONAME:[Path(p).name]})
+    writer=_writer();monkeypatch.setattr(writer,"plugin_dirs",lambda *a:[])
+    for path in (device,host):
+        assert writer.main([str(path),"--private-dir",str(private_dir),
+                            "--process-dir",str(runtime_dir)])==0
+        (path.parent/"PROVENANCE").write_text(
+            f"git_rev={revision}\ngit_dirty=no\nsha256={hashlib.sha256(path.read_bytes()).hexdigest()}\n")
+    # Pytest fixtures live under /tmp; retain the production guard against
+    # one designated purgeable directory rather than disabling path checks.
+    purgeable=tmp_path/"purgeable"
+    monkeypatch.setattr(sealer,"_SCRATCH_ROOTS",(str(purgeable),))
+    for name in ("SCRATCH","PSCRATCH","TMPDIR"):monkeypatch.delenv(name,raising=False)
+    search={}
+    monkeypatch.setattr(sealer,"_elf_dynamic",lambda p:(Path(p).name,tuple(needed.get(Path(p).name,[])),
+        search.get(Path(p),[("RUNPATH","$ORIGIN")])))
+    selected={"cuda" if platform=="CUDA" else "rocm":device}
+    def seal(output,**kw):
+        return sealer.seal(root=source,host=host,output=output,private=kw.pop("private",[private]),**selected,**kw)
+    output=tmp_path/"release"
+    assert sealer.main(["--root",str(source),"--"+platform.lower(),str(device),"--host",str(host),
+                        "--output",str(output),"--private-lib",str(private)])==0
+    manifest=output/sealer.MANIFEST
+    att=npv._read_bundle(manifest,expected_abi=14,unusable_cls=_Unusable)
+    assert set(att.libraries)==set(att.closures)=={platform,"cpu"}
+    assert att.source_revision==revision and att.private_libraries==(output/"lib"/private.name,)
+    assert all(not p.is_symlink() and not p.stat().st_mode&0o222 for p in [manifest,*att.libraries.values(),*att.private_libraries])
+    specs={name:{"env":LEGS[name].so_env,"so_name":LEGS[name].so_name,"build_hint":"fixture"}
+           for name in (platform,"cpu")}
+    env={LEGS[name].so_env:str(path) for name,path in att.libraries.items()}
+    assert npv.locate_library(platform,specs=specs,candidates={},expected_abi=14,environ=env)==att.libraries[platform]
+    candidates={name:[path] for name,path in att.libraries.items()}
+    assert npv.locate_library(platform,specs=specs,candidates=candidates,expected_abi=14,environ={})==att.libraries[platform]
+    for missing in (platform,"cpu"):
+        with pytest.raises(_Unusable,match="partial sealed-bundle"):
+            npv.locate_library(platform,specs=specs,candidates=candidates,expected_abi=14,
+                               environ={k:v for k,v in env.items() if k!=LEGS[missing].so_env},unusable_cls=_Unusable)
+    with pytest.raises(_Unusable,match="mixed native provider"):
+        npv.locate_library(platform,specs=specs,candidates={},expected_abi=14,
+                           environ={**env,LEGS['cpu'].so_env:str(host)},unusable_cls=_Unusable)
+    with pytest.raises(_Unusable,match="bundle ABI mismatch"):
+        npv._read_bundle(manifest,expected_abi=15,unusable_cls=_Unusable)
+    with pytest.raises(FileExistsError):seal(output)
+    with pytest.raises(RuntimeError,match="select exactly one"):
+        sealer.seal(root=source,cuda=device,rocm=device,host=host,output=tmp_path/'bad',private=[private])
+    with pytest.raises(SystemExit):
+        sealer._parser().parse_args(["--cuda",str(device),"--rocm",str(device),"--host",str(host),"--output",str(tmp_path/'bad_cli')])
+    search[device]=[("RUNPATH",str(purgeable))]
+    with pytest.raises(RuntimeError,match="scratch or build directory"):seal(tmp_path/"bad_search")
+    del search[device]
+    stamp=host.parent/"PROVENANCE";original=stamp.read_text()
+    stamp.write_text(original.replace(revision,"0"*40))
+    with pytest.raises(RuntimeError,match="bundle source"):seal(tmp_path/"bad_source")
+    stamp.write_text(original)
+    with pytest.raises(RuntimeError,match="incomplete private dependency"):seal(tmp_path/"missing_private",private=[])
+    wrong=tmp_path/"wrong"/private.name;wrong.parent.mkdir();wrong.write_bytes(b"different private engine")
+    with pytest.raises(RuntimeError,match="not the file.*built and.*verified"):
+        seal(tmp_path/"wrong_private",private=[wrong])
+    assert not (tmp_path/"wrong_private").exists() and not list(tmp_path.glob('.wrong_private.tmp-*'))
+    # The output is immutable, but owner tampering must still fail its hash.
+    sealed=att.libraries[platform];sealed.chmod(0o644);sealed.write_bytes(b"changed");sealed.chmod(0o444)
+    with pytest.raises(_Unusable,match="byte-size mismatch|SHA-256 mismatch"):
+        npv._read_bundle(manifest,expected_abi=14,unusable_cls=_Unusable)
+
 # ---------------------------------------------------------------- launch libraries

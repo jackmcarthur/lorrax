@@ -232,3 +232,27 @@ merely because it exists or has a closure JSON.
 The machine wrapper runs `scripts/verify_ffi_build.sh` with the Frontier
 pins before the four-process transform check; use the single wrapper
 command for complete acceptance.
+
+### Publish a sealed pair
+
+After accepting both builds, package them from their clean source checkout
+into a new persistent directory. Use the exact ELPA file named in the ROCm
+leg's closure record:
+
+```bash
+python src/ffi/cpp/stage/seal_bundle.py \
+  --rocm src/ffi/cpp/build_rocm/liblorrax_ffi_rocm.so \
+  --host src/ffi/cpp/build_host/liblorrax_ffi_host.so \
+  --private-lib /path/to/recorded/libelpa_openmp.so.19 \
+  --output /path/to/new-persistent-bundle
+export LORRAX_FFI_ROCM_SO=/path/to/new-persistent-bundle/lib/liblorrax_ffi_rocm.so
+export LORRAX_FFI_HOST_SO=/path/to/new-persistent-bundle/lib/liblorrax_ffi_host.so
+bash config/frontier/verify.sh
+```
+
+Set both pins to the same bundle. The final verification runs in an allocation;
+for copied legs, supply the already verified FFTW prefix as described above.
+Sealing copies ELPA, while MPI, HDF5, OpenBLAS and the ROCm wheel libraries
+remain attested machine dependencies. It preserves their recorded identities
+and does not make the bundle portable to a different library stack. See
+[the sealing contract](ffi-build.md#seal) for source provenance and refusal rules.

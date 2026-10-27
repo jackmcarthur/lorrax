@@ -332,7 +332,8 @@ build-reuse tooling ([the FFI source key](../architecture/startup_environment.md
 
 A private build runs unsealed. To publish a pair for other users, seal it
 from the checkout that built both legs; each leg's `PROVENANCE` must say
-`git_dirty=no` at that checkout's `HEAD`:
+`git_dirty=no` at that checkout's `HEAD`. If the sealing tool comes from a
+newer checkout, pass `--root /path/to/clean-build-checkout` explicitly:
 
 ```bash
 python src/ffi/cpp/stage/seal_bundle.py \
@@ -342,6 +343,11 @@ python src/ffi/cpp/stage/seal_bundle.py \
   --private-lib path/to/libcusolverMp.so.0 \
   --output path/to/new-bundle-dir
 ```
+
+For a ROCm/host pair, replace `--cuda` with
+`--rocm path/to/liblorrax_ffi_rocm.so` and list the exact ELPA library recorded
+by that pair instead of the CUDA private providers. The two device flags are
+mutually exclusive; both use the same manifest and closure checks.
 
 The sealer publishes a new directory (it refuses an existing one) holding
 both legs and the listed private libraries under `lib/`, and one
@@ -356,7 +362,7 @@ full source revision, each file's size and SHA-256, each ELF SONAME and
 - **Private libraries.** Repeat `--private-lib`, dependency first, for every
   engine-private provider in either leg's `DT_NEEDED` closure. Only
   cuSOLVERMp, cuBLASMp, CAL, NVSHMEM and ELPA qualify (`lxkit.native_provider.is_private_redistributable`).
-  MPI, site HDF5, the CUDA runtime and driver, NCCL, and system and compiler
+  MPI, site HDF5, CUDA/ROCm runtimes and drivers, NCCL/RCCL, and system and compiler
   libraries belong to the machine runtime and are refused: a copy in the
   bundle would be a second instance of a library the whole process
   shares.
@@ -382,8 +388,9 @@ full source revision, each file's size and SHA-256, each ELF SONAME and
 the same `lxkit.native_provider` policy) chooses one library per platform:
 
 - **Candidates**, in order: the pin (`LORRAX_FFI_SO` for CUDA,
-  `LORRAX_FFI_HOST_SO` for cpu), the in-tree `src/ffi/cpp/build/` or
-  `build_host/`, then each `sys.path` directory. A sealed bundle is found
+  `LORRAX_FFI_ROCM_SO` for ROCm, `LORRAX_FFI_HOST_SO` for cpu), the matching
+  in-tree `src/ffi/cpp/build/`, `build_rocm/` or `build_host/`, then each
+  `sys.path` directory. A sealed bundle is found
   from its manifest beside the libraries; no variable names the manifest.
 - **Pins.** A pin that is not a file refuses. When a selected leg belongs to
   a sealed bundle, both pins or neither must be set and both legs must come
