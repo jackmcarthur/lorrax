@@ -246,6 +246,9 @@ def _batched_call(target, a, driver, tile_bytes):
          jax.ShapeDtypeStruct((arena,), jnp.uint8)),
         vmap_method="broadcast_all")(a, lower=np.int64(1), jacobi=np.int64(driver.endswith("j")),
                                      tile_bytes=np.int64(tile_bytes))
+    from lxkit import mark_varying, varying_axes
+    axes = tuple(sorted(varying_axes(a)))
+    r, w, info = (mark_varying(value, axes) for value in (r, w, info))
     return w, jnp.conj(jnp.swapaxes(r, -1, -2)), info
 
 

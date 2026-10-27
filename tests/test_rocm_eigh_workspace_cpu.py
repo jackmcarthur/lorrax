@@ -33,7 +33,7 @@ def test_native_query_sizes_the_actual_result_for_both_drivers_and_dtypes(monkey
     monkeypatch.setattr(jax.ffi, 'ffi_call', ffi_call)
     for dtype, kind, driver in ((np.float64, 1, 'syevd'), (np.complex128, 3, 'heevd'),
                                 (np.float64, 1, 'syevdj'), (np.complex128, 3, 'heevdj')):
-        a = jax.ShapeDtypeStruct((2, 3, 40, 40), dtype)
+        a = jax.numpy.zeros((2, 3, 40, 40), dtype)
         w, v, info = owner._batched_call('lorrax_rocsolver_batched_eigh', a, driver, 1 << 30)
         target, outputs, operand, attrs = calls[-1]
         assert operand is a and target == 'lorrax_rocsolver_batched_eigh'
@@ -86,3 +86,31 @@ def test_external_scratch_keeps_legacy_and_scalar_jacobi_allowances(monkeypatch)
             assert owner.batched_workspace_bytes((3,128,128), np.complex128, leg) == 0
     finally:
         workspace.local_eigh_workspace.cache_clear()
+
+
+def test_actual_ffi_abstract_values_preserve_input_varying_axes(monkeypatch):
+    """No numerical FFI mock: trace the real primitive and scalar Jacobi branch.
+
+    CPU cannot execute the ROCm target, so only provider availability and its
+    static byte query are replaced. The foreign-call abstract result contract,
+    manual-axis propagation and conditional branch checks are real JAX.
+    """
+    from distrib_la import local_eigh as owner
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from lxkit import varying_axes
+    import jax.numpy as jnp
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1,1), ('x','y'))
+    monkeypatch.setattr(owner, '_process_leg_key', lambda: 'ROCM')
+    monkeypatch.setattr(owner, '_require_target', lambda *_args: None)
+    monkeypatch.setattr(owner, '_workspace_bytes', lambda *_args, **_kw: 65536)
+    for spec in (P(), P(('x','y'))):
+        def local(a):
+            value = a[0]
+            expected = varying_axes(value)
+            w, v = owner.eigh_local(value)
+            assert varying_axes(w) == varying_axes(v) == expected
+            return w[None], v[None]
+        fn = jax.shard_map(local, mesh=mesh, in_specs=spec, out_specs=(spec,spec))
+        out = jax.eval_shape(fn, jax.ShapeDtypeStruct((1,128,128),np.complex128,
+                                                     sharding=NamedSharding(mesh,spec)))
+        assert out[0].shape == (1,128) and out[1].shape == (1,128,128)
