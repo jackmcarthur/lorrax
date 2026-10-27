@@ -16,11 +16,11 @@ The GW driver's phase invariants and the per-function contracts of
 
 **Rule (owner).** LORRAX has no SLATE backend. The distributed libraries are
 ScaLAPACK (cpu), cuSOLVERMp (CUDA) and ELPA (ROCm eigh); Cholesky beyond
-cuSOLVERMp is `native2d`. ROCm has no distributed LU library: `distributed`
-LU there resolves to `one_device` where one matrix's priced program fits the
-caller's room (`budget_bytes`) and refuses by name beyond it or without a
-room. ROCm Cholesky is `native` / `native2d` only. A request for `slate`
-refuses with "`slate` was removed: ...".
+cuSOLVERMp is `native2d`. ROCm LU keeps `one_device` where a complete
+solve fits the caller's room (`budget_bytes`). The owner's 2026-10-27
+capacity extension uses existing `native2d` with global partial-pivot LU
+beyond that room or without one; SLATE remains removed. ROCm Cholesky is
+`native` / `native2d` only. A request for `slate` refuses by name.
 
 **Why.** SLATE served no route that another library did not serve better:
 ELPA replaced it for ROCm eigh (5-8x at n = 20480-30720,

@@ -111,7 +111,7 @@ OPS = ("eigh", "cholesky", "solve_lu")
 #: measured default for every op at production tile sizes.
 NATIVE = "native"
 
-#: The 2-D block-distributed tiled Cholesky (:mod:`distrib_la._native2d`).
+#: The 2-D block-distributed Cholesky and pivoted LU (:mod:`distrib_la._native2d`).
 #: Also pure JAX and also available on every platform, but a DIFFERENT
 #: algorithm with a different memory profile, which is why it is a backend
 #: and not a mode of ``native``: at n=10k on P=128 the replicated-reshard
@@ -145,7 +145,7 @@ BACKEND_CHOICES = {
     "eigh":     ("auto", "off", "distributed", "cusolvermp", "elpa",
                  "scalapack", ONE_DEVICE),
     "cholesky": ("auto", "off", "native2d", "cusolvermp"),
-    "solve_lu": ("auto", "off", "distributed", "cusolvermp", "scalapack",
+    "solve_lu": ("auto", "off", "distributed", NATIVE2D, "cusolvermp", "scalapack",
                  ONE_DEVICE),
 }
 
@@ -153,7 +153,7 @@ BACKEND_CHOICES = {
 #: repo's one-line "`x` was removed: ..." (docs/dev/renaming.md), not a vocabulary dump.
 REMOVED_BACKENDS = {
     "slate": "the SLATE backend left LORRAX on 2026-10-23 (UPGRADE_NOTES.md); use 'distributed' "
-             "(CPU: scalapack, CUDA: cusolvermp, ROCm: elpa eigh / one_device LU) or "
+             "(CPU: scalapack, CUDA: cusolvermp, ROCm: elpa eigh / native2d LU) or "
              "'native2d' for cholesky",
 }
 EIGH_BACKENDS = BACKEND_CHOICES["eigh"]
@@ -178,12 +178,8 @@ FFI_PLATFORMS = FFI_PLATFORM_MAP
 #: (``ffi.common.families`` 'elpa' row); measured 5-8x faster than the library it
 #: replaced at n = 20480-30720 on MI250X (ELPA_ROCM_REPORT.md).
 #:
-#: ROCM has NO distributed LU library: ``('solve_lu', 'ROCM')`` is the room route
-#: alone (:data:`ONE_DEVICE_BY_ROOM`), so ``distributed`` LU there serves every ``n``
-#: whose one-device program fits the caller's room and refuses beyond it.  One device
-#: was 4-5x faster than the former 2x2 distributed LU wherever both ran: 0.72 / 1.53
-#: / 4.10 s against 3.63 / 10.4 / 16.1 s at n = 8192 / 12288 / 16384 complex128, and
-#: it runs to n = 28672 (22.7 s) on one GCD (ROCSOLVER_LU_REPORT.md section 2).
+#: ROCM retains the efficient one-device room route and uses native2d's
+#: partial-pivot LU beyond it. No additional vendor library is required.
 _DISTRIBUTED_DEFAULT = {
     ("eigh", "cpu"):      "scalapack",
     ("eigh", "CUDA"):     "cusolvermp",
@@ -193,6 +189,7 @@ _DISTRIBUTED_DEFAULT = {
     # on CUDA — the two backends _IMPL already lists for this op.
     ("solve_lu", "cpu"):  "scalapack",
     ("solve_lu", "CUDA"): "cusolvermp",
+    ("solve_lu", "ROCM"): NATIVE2D,
 }
 
 #: ``distributed`` by SIZE — (op, leg) → the largest ``n`` that
@@ -605,18 +602,6 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
 
     px, py = _mesh_shape(mesh_xy)
 
-    if requested == NATIVE2D:
-        # Pure JAX: no library to probe, no one-process-per-device rule,
-        # every platform.  Its one real constraint is that the matrix must
-        # decompose into tiles the mesh divides, and that is checked HERE
-        # rather than at call time for the same reason every other guard is
-        # (bug L-1: a rule enforced only at call time turns a returned
-        # backend name into a broken promise).
-        if n is not None:
-            from distrib_la._native2d import block_size_for
-            block_size_for(int(n), px, py)          # raises with the reason
-        return NATIVE2D
-
     requested_spelling = requested   # keep the user's spelling for messages
     if requested == "distributed" and size_route:
         sized = _size_route(op, mesh_xy, n, room)
@@ -633,18 +618,19 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
         requested = _DISTRIBUTED_DEFAULT.get((op, mesh_platform(mesh_xy)))
         if requested is None:
             platform = mesh_platform(mesh_xy)
-            if (op, platform) in ONE_DEVICE_BY_ROOM:
-                from distrib_la._one_device import one_device_bytes
-                need = ("" if n is None else
-                        f": n={int(n)} needs {one_device_bytes(op, int(n)) / 1e9:.2f} GB/rank")
-                raise ValueError(
-                    f"{op} on {platform} has no distributed library, only one whole matrix per "
-                    f"device within the caller's room (budget_bytes"
-                    f"{'; none given' if room is None else ''}){need}; use fewer ISDF "
-                    f"centroids, more device memory per rank, or a CUDA run.")
             raise ValueError(
                 f"{op} backend 'distributed' is not available on platform {platform!r} "
                 f"(it is defined for {sorted(_DISTRIBUTED_DEFAULT)}); use backend 'native'.")
+    if requested == NATIVE2D:
+        # Pure JAX on every platform, with the same legal face extents as
+        # the vendor providers. Cholesky also needs its internal tile grid.
+        if n is not None:
+            if op == "cholesky":
+                from distrib_la._native2d import block_size_for
+                block_size_for(int(n), px, py)
+            elif int(n) < 1 or int(n) % px or int(n) % py:
+                raise ValueError("native2d solve_lu requires n divisible by both mesh axes")
+        return NATIVE2D
     if requested == "auto":
         if op == "eigh" or mesh_is_cpu(mesh_xy):
             return NATIVE
@@ -831,7 +817,7 @@ def _size_route(op: str, mesh_xy, n, room: int | None = None) -> str | None:
     if bound is None or n is None:
         return None
     px, py = _mesh_shape(mesh_xy)
-    # A room leg with no library (ROCM LU) refuses past the room, below.
+    # Every room leg has a whole-mesh provider, including pure-JAX ROCM LU.
     library = _DISTRIBUTED_DEFAULT.get((op, platform)) or "no library (refused)"
     chosen = ONE_DEVICE if int(n) <= bound else library
     priced = ""

@@ -140,8 +140,9 @@ included (`common/rtc_build.h`).
 | `scalapack_batched_solve_lu_factors`, `_getrf`, `_getrs` | `ScalapackBatched{SolveLuFactors,Getrf,Getrs}HostFfi`, `scalapack/{solve_lu,getrf_getrs}_ffi.cc` | `batched_distributed_solve_lu` | `solve_lu` distributed on cpu |
 | `elpa_eigh` | `ElpaEighFfi`, `elpa/eigh_ffi.cc` | `_elpa` | `linalg = distributed` eigh on ROCm above the size row (the `('eigh','ROCM')` default); ELPA from `config/frontier/build_elpa_hip.sh` over the sequential OpenBLAS of `config/frontier/build_openblas_seq.sh` (`LORRAX_ROCM_BLAS_DIR`) |
 
-ROCm has no distributed LU or Cholesky target: `distributed` LU there is
-`one_device` within the caller's room
+ROCm has no distributed LU or Cholesky FFI target: `distributed` LU there is
+`one_device` within the caller's room and pure-JAX partial-pivot `native2d`
+otherwise
 ([size route](../services/distrib_la/backends.md#size-route)).
 
 The fused LU solves return the factors as a second output that the caller
