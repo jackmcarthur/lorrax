@@ -196,8 +196,11 @@ fits the caller's room (`budget_bytes`), and to `native2d` otherwise.
 The `native2d` LU is blocked Gaussian elimination with global partial
 pivoting, followed by lower/upper triangular solves. It handles general
 nonsymmetric complex matrices, without normal equations or unpivoted
-factorization. The coefficient and RHS faces remain on all ranks; only
-fixed-width row/column panels and two selected pivot rows are exchanged.
+factorization. The coefficient and RHS faces remain on all ranks. Each
+pivot exchanges two rows of the narrow column panel; its exact row
+permutation is accumulated and applied to at most `2 * 128` full row
+pieces once per panel, including the prior lower factor and RHS. Fixed-width
+row/column panels serve the trailing updates and triangular solves.
 Leading storage is the local faces plus panels proportional to
 `128 * (n/Px + max(n,nrhs)/Py)` elements. This is a storage model, not a
 whole-process peak bound: the enclosing checked executable is the admission

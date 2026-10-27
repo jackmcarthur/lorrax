@@ -286,10 +286,11 @@ def cholesky(A: jax.Array, *, mesh: Mesh,
 def _lu_kernel(mesh, n, nrhs, width):
     """Partial-pivot ``P A = L U`` and ``U X = L^-1 P B`` on x/y faces.
 
-    Only a local-row by ``width`` column panel and a ``width`` by
-    local-column row panel are broadcast. Pivot reductions and row swaps
-    use the x (process-column) communicator; the trailing updates are
-    local GEMMs. No matrix larger than a fixed diagonal panel is replicated.
+    Pivot steps exchange only two rows of the column panel. Their composed
+    permutation moves at most ``2 * width`` full row pieces once per panel.
+    Pivot reductions and row swaps use the x (process-column) communicator;
+    the trailing updates are local GEMMs. Storage consists of local faces
+    and fixed-width row/column panels, never a replicated full matrix.
     """
     key = ("solve_lu", mesh_key(mesh), n, nrhs, width)
     if key in _KERNEL_CACHE:
@@ -322,20 +323,16 @@ def _lu_kernel(mesh, n, nrhs, width):
             return lax.psum(jnp.where(owned[:, None], panel, 0), "x")
 
         def store_rows(a, values, start):
-            def store(j, a):
-                row = start + j
-                return lax.cond((row < n) & (x == row // m),
-                                lambda a: a.at[row % m].set(values[j]),
-                                lambda a: a, a)
-            return lax.fori_loop(0, width, store, a)
+            row = start + slots
+            idx = row - x * m
+            idx = jnp.where((idx >= 0) & (idx < m) & (row < n), idx, m)
+            return a.at[idx].set(values, mode="drop")
 
         def store_columns(a, values, start):
-            def store(j, a):
-                col = start + j
-                return lax.cond((col < n) & (y == col // nc),
-                                lambda a: a.at[:, col % nc].set(values[:, j]),
-                                lambda a: a, a)
-            return lax.fori_loop(0, width, store, a)
+            col = start + slots
+            idx = col - y * nc
+            idx = jnp.where((idx >= 0) & (idx < nc) & (col < n), idx, nc)
+            return a.at[:, idx].set(values, mode="drop")
 
         def diagonal(panel, start):
             block = row_panel(panel, start)
@@ -352,11 +349,11 @@ def _lu_kernel(mesh, n, nrhs, width):
                 panel = column_panel(a, start)
 
                 def pivot_column(j, carry):
-                    a, b, panel = carry
+                    panel, pivots = carry
                     k = start + j
 
                     def pivot(carry):
-                        a, b, panel = carry
+                        panel, pivots = carry
                         magnitude = jnp.where(rows >= k, jnp.abs(panel[:, j]), -jnp.inf)
                         maximum = lax.pmax(jnp.max(magnitude), "x")
                         p = lax.pmin(jnp.min(jnp.where(magnitude == maximum, rows, n)), "x")
@@ -365,29 +362,40 @@ def _lu_kernel(mesh, n, nrhs, width):
                         rr = jnp.stack((k, p))
                         idx = jnp.clip(rr - x * m, 0, m - 1)
                         owned = (rr // m == x)[:, None]
-                        selected = jnp.concatenate((a[idx], b[idx], panel[idx]), axis=1)
-                        selected = lax.psum(jnp.where(owned, selected, 0), "x")
-
-                        def swap(value, first, last):
-                            value = lax.cond(x == k // m,
-                                             lambda v: v.at[k % m].set(last), lambda v: v, value)
-                            return lax.cond(x == p // m,
-                                            lambda v: v.at[p % m].set(first), lambda v: v, value)
-
-                        a = swap(a, selected[0, :nc], selected[1, :nc])
-                        b = swap(b, selected[0, nc:nc + rc], selected[1, nc:nc + rc])
-                        first, last = selected[0, nc + rc:], selected[1, nc + rc:]
-                        panel = swap(panel, first, last)
+                        selected = lax.psum(jnp.where(owned, panel[idx], 0), "x")
+                        last = selected[1]
+                        dest = jnp.where(rr // m == x, rr - x * m, m)
+                        panel = panel.at[dest].set(selected[::-1], mode="drop")
                         below = rows > k
                         multiplier = jnp.where(below, panel[:, j] / last[j], 0)
                         update = multiplier[:, None] * jnp.where(slots > j, last, 0)[None, :]
                         panel = panel - update
                         panel = panel.at[:, j].set(jnp.where(below, multiplier, panel[:, j]))
-                        return a, b, panel
+                        return panel, pivots.at[j].set(p)
 
-                    return lax.cond(k < n, pivot, lambda c: c, (a, b, panel))
+                    return lax.cond(k < n, pivot, lambda c: c, (panel, pivots))
 
-                a, b, panel = lax.fori_loop(0, width, pivot_column, (a, b, panel))
+                panel, pivots = lax.fori_loop(
+                    0, width, pivot_column, (panel, start + slots))
+                # Compose the panel's exact GEPP swaps before touching full
+                # faces. Repeated targets retain identical origins and values.
+                targets = jnp.concatenate((start + slots, pivots))
+
+                def compose(j, origins):
+                    k, p = start + j, pivots[j]
+                    first, last = origins[j], origins[width + j]
+                    return jnp.where(targets == k, last,
+                                     jnp.where(targets == p, first, origins))
+
+                origins = lax.fori_loop(0, width, compose, targets)
+                idx = jnp.clip(origins - x * m, 0, m - 1)
+                owned = (origins < n) & (origins // m == x)
+                values = jnp.concatenate((a[idx], b[idx]), axis=1)
+                values = lax.psum(jnp.where(owned[:, None], values, 0), "x")
+                dest = targets - x * m
+                dest = jnp.where((dest >= 0) & (dest < m) & (targets < n), dest, m)
+                a = a.at[dest].set(values[:, :nc], mode="drop")
+                b = b.at[dest].set(values[:, nc:], mode="drop")
                 l11 = diagonal(panel, start)
                 upper = solve_triangular(l11, row_panel(a, start), lower=True,
                                          unit_diagonal=True)

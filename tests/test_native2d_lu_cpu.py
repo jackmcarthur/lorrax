@@ -114,12 +114,19 @@ def test_actual_partitioned_program_has_only_faces_and_bounded_panels(side):
     # Include the production plan's independent pre-donation result check:
     # a bounded backend alone does not certify its enclosing caller.
     checked_executable = checked.lower(a, b).compile()
-    largest = max(171 * 171, 171 * 128, 128 * 171, 128 * 128, 171 * 97)
+    largest = max(171 * 171, 171 * 128, 128 * 171, 128 * 128,
+                  171 * 97, 2 * 128 * (171 + 97))
     for program in (executable, checked_executable):
         for dims in re.findall(r"c128\[([0-9,]+)\]", program.as_text()):
             count = int(np.prod([int(v) for v in dims.split(",")]))
             assert count <= largest, (dims, side, largest)
         assert program.memory_analysis().temp_size_in_bytes < 64 * largest * 16
+    # Scalar pivot loops must not carry whole faces: otherwise XLA copies
+    # both faces at every pivot instead of once for the completed panel.
+    for line in executable.as_text().splitlines():
+        if " while(" in line and '"known_trip_count":{"n":"128"}' in line:
+            assert "c128[171,171]" not in line
+            assert "c128[171,97]" not in line
 
 
 def test_pivot_ties_are_ordered_and_shape_refusals():
@@ -134,3 +141,31 @@ def test_pivot_ties_are_ordered_and_shape_refusals():
     with pytest.raises(ValueError, match="mesh-padded"):
         _native2d.batched_distributed_solve_lu(
             jax.numpy.zeros((1, 3, 3)), jax.numpy.zeros((1, 3, 2)), mesh=mesh)
+
+
+@pytest.mark.parametrize("side", [2, 3, 4, 12])
+def test_deferred_permutation_repeated_pivots_and_prior_lower_columns(side):
+    """An almost full cycle repeatedly chooses the same final pivot row."""
+    from scipy.linalg import lu_factor
+    mesh = _mesh(side)
+    n, nrhs, width = side * 23, side * 3, 17
+    logical = n - 1
+    rng = np.random.default_rng(82)
+    lower = np.eye(logical) + np.tril(
+        .01 * (rng.normal(size=(logical, logical)) +
+               1j * rng.normal(size=(logical, logical))), -1)
+    upper = np.triu(.01 * (rng.normal(size=(logical, logical)) +
+                          1j * rng.normal(size=(logical, logical))), 1)
+    upper += np.diag(np.where(np.arange(logical) % 2, -2., 3.))
+    physical = np.roll(lower @ upper, -1, axis=0)
+    _, pivots = lu_factor(physical)
+    assert np.count_nonzero(pivots[:width] == logical - 1) == width
+    a = np.eye(n, dtype=np.complex128)[None]
+    a[0, :logical, :logical] = physical
+    exact = rng.normal(size=(1, n, nrhs)) + 1j * rng.normal(size=(1, n, nrhs))
+    exact[:, logical:] = 0
+    b = a @ exact
+    result = _native2d.batched_distributed_solve_lu(
+        _put(mesh, a), _put(mesh, b), mesh=mesh, block_size=width)
+    np.testing.assert_allclose(np.asarray(result), exact, atol=5e-13, rtol=0)
+    assert np.array_equal(np.asarray(result)[:, logical:], exact[:, logical:])
