@@ -34,6 +34,9 @@ def _fixture(monkeypatch, tmp_path, *, complete=True, fail_write=False):
     events, reads = [], []
 
     class Writer:
+        retained_previous_write_inputs = 0  # this fixture copies synchronously into NumPy
+        def write_device_scratch(self, _name, _value):
+            return 0
         def __init__(self, path, *, mode, mesh):
             assert mode == "a"
             self.shapes = {}
@@ -71,18 +74,21 @@ def _fixture(monkeypatch, tmp_path, *, complete=True, fail_write=False):
     monkeypatch.setattr(collectives, "process_rank", lambda: 0)
     monkeypatch.setattr(gpu_utils, "shared_device_room", lambda _where: 1 << 30)
     monkeypatch.setattr(memory, "book", lambda _price: None)
-    zmb._FACE_CHAINS.clear()
     zmb._kernel_cache.clear()
     source = np.pad(raw, ((0, 0), (0, 0), (0, 1)))
 
+    store = zmb.ZStore(mesh=mesh, q_axis=padded_axis(2, 1, name="fixture q"),
+        mu_pad=8, g_axis=padded_axis(7, 4, name="fixture G"), b=8,
+        placement="host", n_batch=1)
+    store.write_batch(0, jax.device_put(source,
+        NamedSharding(mesh, P(None, ("x", "y"), None))))
+    original_read = store.read_tile
+
     def read_tile(t):
         reads.append(t)
-        return jax.device_put(source[:, :, t*4:(t+1)*4],
-                             NamedSharding(mesh, P(("x", "y"), None, None)))
+        return original_read(t)
 
-    store = SimpleNamespace(Q=2, Q_pad=2, mu_pad=8, g_tile=4, n_Gt=2,
-        g_axis=padded_axis(7, 4, name="fixture G"), read_tile=read_tile,
-        placement="host", t_read=0.)
+    store.read_tile = read_tile
     zeta = zmb.ZetaG(store, mesh=mesh,
         L_q=jax.device_put(factor, NamedSharding(mesh, P(None, "x", "y"))),
         lu_piv=None, solver_kind="rank_truncate", batched_route="auto",

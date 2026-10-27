@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gc
 import logging
+from dataclasses import replace
 from functools import partial
 from typing import Sequence, TYPE_CHECKING
 
@@ -67,6 +68,7 @@ FULL_BLOCH_TRANSFORM_SCHEME = (
 
 _KERNEL_CACHE: dict = {}
 _RCHUNK_PEAK_CACHE: dict = {}
+_EXECUTABLES: dict = {}
 
 
 def _cached_jit(name: str, key: tuple, build):
@@ -77,6 +79,33 @@ def _cached_jit(name: str, key: tuple, build):
         fn = build()
         _KERNEL_CACHE[full_key] = fn
     return fn
+
+
+def _priced_executable(kernel, args, stage, *, extra=0):
+    """Reuse geometry-only WFN programs; admit new bytes on every load."""
+    from common.gpu_utils import device_budget_bytes
+    from lxkit import memory
+    from runtime.aot_memory import compiled_price
+    key = (kernel, tuple((tuple(a.shape), str(a.dtype), getattr(a, "sharding", None))
+                         for a in jax.tree.leaves(args)))
+    if key not in _EXECUTABLES:
+        _EXECUTABLES[key] = kernel.lower(*args).compile()
+    compiled = _EXECUTABLES[key]
+    device_budget_bytes()
+    ranks = len(jax.tree.leaves(compiled.output_shardings)[0].device_set)
+    price = replace(compiled_price(compiled=compiled, ranks=ranks, face=True,
+                    source=stage, extra=int(extra)), increment=True)
+    memory.admit(stage, price, memory.room(bucketed=False))
+    memory.book(price)
+    return compiled
+
+
+def _finish_centroid_faces(finish, values, nk, *, convert=None):
+    """Admit the exact terminal exchange, crop and logical-band zeroing together."""
+    def body(y, x):
+        return finish(*(convert(y, x) if convert is not None else (y, x)), nk)
+    kernel = _cached_jit('centroid_finish', (finish, int(nk), convert), lambda: jax.jit(body))
+    return jax.block_until_ready(_priced_executable(kernel, values, 'load_centroids.finish_faces')(*values))
 
 
 # Module-level dedup for the device-resident ``(nk, nx, ny, nz) int32``
@@ -2157,25 +2186,27 @@ def _centroid_fft_scan_chunk(
         peak_copies, persistent_bytes, return_parents, stream_tiles):
     """Size the FFT scan chunk from the fixed tile and the shapes.
 
-    ``cs`` is a static scan shape and cache-key component, so it comes from the
-    shapes alone and is the same on every rank (INVARIANTS 21): the scan rows
-    whose transient fits the fixed tile (``runtime.tiles``).  The run budget
-    only guards the floor: this call's allocations (``persistent_bytes``) and
-    one scan row.
+    The fixed tile bounds scan workspace; the current agreed room beside
+    resident fields can reduce it further. At least one row runs with the
+    existing soft warning when the new persistent fields and that row do not fit.
     """
     from runtime.tiles import tile_units
+    from common.gpu_utils import device_budget_bytes
+    from lxkit import memory
+    device_budget_bytes()
+    room = min(int(gpu_mem_bytes), memory.room(bucketed=False))
     min_scan_bytes = nspinor * n_rtot * 16 * peak_copies
-    if int(gpu_mem_bytes) - persistent_bytes < min_scan_bytes:
+    if room - persistent_bytes < min_scan_bytes:
         # G-flat tile or input + X/Y centroid outputs + one FFT scan row: a
         # smaller scan chunk cannot reduce this floor.
-        from lxkit import memory
         memory.admit("centroid load (one FFT scan row)",
                      memory.priced(persistent_bytes + min_scan_bytes, "closed form"),
-                     gpu_mem_bytes, device=False)
+                     room, device=False)
 
     # Translate legacy hints (band_chunk_size, k_chunk_size) into the new
     # flat-row count.  In either arm the tile bound applies last.
-    cs_budget = tile_units(min_scan_bytes, 1 << 62)
+    cs_budget = max(1, min(tile_units(min_scan_bytes, 1 << 62),
+                           int((room - persistent_bytes) // min_scan_bytes)))
     if stream_tiles:
         cs_hint = k_tile * nb_per_band_shard
         cs = max(1, min(cs_hint, cs_budget))
@@ -2267,6 +2298,7 @@ def _centroid_face_kernels(
             (n_rmu, n_rmu_padded, stage_Y_4d, stage_X_4d, out_Y, out_X),
             lambda: _reshard_centroid_tile)
 
+    nb_user_in_range = max(0, int(meta.b_id_4_user) - int(b_start))
     def _finish_faces(psi_rmu_all, psi_rmuT_all, nk_result):
         # Remove fixed-shape stream/loader pad rows before returning the
         # public logical k and band extents.
@@ -2283,7 +2315,6 @@ def _centroid_face_kernels(
         psi_rmuT_all = ensure_sharding(psi_rmuT_all, out_X)
 
         # Zero user-band-pad rows (unchanged contract).
-        nb_user_in_range = max(0, meta.b_id_4_user - b_start)
         if nb_user_in_range < nb_total:
             zero_y = jnp.zeros_like(
                 psi_rmu_all[:, nb_user_in_range:nb_total, :, :])
@@ -2294,6 +2325,8 @@ def _centroid_face_kernels(
             psi_rmuT_all = psi_rmuT_all.at[
                 :, :, nb_user_in_range:nb_total, :].set(zero_x)
         return psi_rmu_all, psi_rmuT_all
+    _finish_faces = _cached_jit('centroid_finish_body',
+        (nb_total, nb_user_in_range, out_Y, out_X), lambda: _finish_faces)
     return _reshard_centroid_tile, _finish_faces
 
 
@@ -2537,11 +2570,11 @@ def _load_streamed_centroid_faces(
             g_index_full, k_tile, kvecs_frac_full, loader, mesh_xy, meta, nb_total, nk_tot,
             psi_rmuT_all, psi_rmu_all, sharding_load, full_k_rows)
     gc.collect()
-    full_faces = _finish_faces(psi_rmu_all, psi_rmuT_all, nk_tot)
+    full_faces = _finish_centroid_faces(_finish_faces, (psi_rmu_all, psi_rmuT_all), nk_tot)
     if not return_parents:
         return full_faces
-    parent_faces = _finish_faces(
-        psi_parent_y, psi_parent_x, int(loader.nkpts))
+    parent_faces = _finish_centroid_faces(_finish_faces,
+        (psi_parent_y, psi_parent_x), int(loader.nkpts))
     return (*full_faces, *parent_faces)
 
 
@@ -2621,7 +2654,7 @@ def _load_bulk_centroid_faces(
         jax.block_until_ready(psi_rmuT_all)
     del psi_rmu_band
     gc.collect()
-    return _finish_faces(psi_rmu_all, psi_rmuT_all, nk_tot)
+    return _finish_centroid_faces(_finish_faces, (psi_rmu_all, psi_rmuT_all), nk_tot)
 
 
 def load_centroids_band_chunked(

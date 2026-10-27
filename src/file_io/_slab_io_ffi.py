@@ -2348,6 +2348,8 @@ class _CollectiveLane:
     errors stay per handle.
     """
 
+    queued_write_inputs = 2
+
     def __init__(self):
         self._dispatcher = None
         self._owner = None                   # the slot whose writes are queued
@@ -2357,7 +2359,7 @@ class _CollectiveLane:
         if self._dispatcher is None:
             from common.async_io import AsyncDispatcher
             self._dispatcher = AsyncDispatcher(
-                name="phdf5-collective-lane", maxsize=2)
+                name="phdf5-collective-lane", maxsize=self.queued_write_inputs)
         return self._dispatcher
 
     def _finish_reads(self) -> None:
@@ -2993,6 +2995,34 @@ class _FfiBackend(_DatasetGeometry):
     # FFI write padding contract: shard ``A`` with equal local blocks,
     # then let C++ clip each rank's file hyperslab to ``valid_shape``,
     # which SlabIO derives from the dataset's own extent.
+    @property
+    def retained_previous_write_inputs(self):
+        return _LANE.queued_write_inputs + 1  # queued plus the worker; caller separate
+
+    def write_device_scratch(self, name, value):
+        """Actual write-call increment for an already file-row-owned operand.
+
+        This narrow query excludes input retention (the lane's capacity above)
+        and host pinned staging. It refuses file-order conversion rather than
+        guessing its transport workspace. No field is dispatched or read.
+        """
+        from runtime.aot_memory import compiled_new_bytes
+        shape = tuple(int(v) for v in value.shape)
+        ds = self._known_shape(name)
+        if ds is None:
+            raise ValueError("write_device_scratch needs registered dataset geometry")
+        valid = tuple(min(a, b) for a, b in zip(shape, ds))
+        axes = _spec_axes(value.sharding.spec, len(shape))
+        plan = _file_order_plan(shape, valid, axes, np.dtype(value.dtype).itemsize,
+                                int(self.mesh.size), tuple(self.mesh.axis_names), ds)
+        if plan not in (None, "as-is"):
+            raise ValueError("write_device_scratch requires an already file-row-owned operand")
+        counts, flat = _sharding_to_axis_info(value.sharding, len(shape))
+        sm = _get_write_sm(self.mesh, value.sharding.spec,
+            mesh_shape=tuple(self.mesh.shape[a] for a in self.mesh.axis_names),
+            axis_count_per_dim=counts, axis_flat=flat, independent=plan == "as-is")
+        return compiled_new_bytes(_compiled_write(sm, value))
+
     def write_slab(
         self,
         name: str,

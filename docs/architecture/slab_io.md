@@ -53,6 +53,11 @@ backend, including CPU runs that leave `JAX_PLATFORMS` unset.
 **Device memory.** `write_slab` holds a reference to its operand until that
 operand's `H5Dwrite` completes. The process's one writer queue holds at most
 two queued writes plus the one in flight, and a further `write_slab` blocks.
+`retained_previous_write_inputs` exposes that same owner capacity (zero for
+synchronous serial I/O); callers price their current producer separately.
+`write_device_scratch` queries the actual write executable for an already
+file-row-owned operand. It excludes retained inputs and host pinned staging,
+and refuses a request needing file-order redistribution.
 
 **Writes leave in file order.** `_file_order_plan` decides how each
 `write_slab` leaves, from the operand's shape, valid extent and sharding and

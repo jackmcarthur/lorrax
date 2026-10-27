@@ -42,25 +42,13 @@ from lxkit import ordered_psum_scatter
 from jax import shard_map
 from common.wfn_layout import (band_sphere_spec, PSI_NMU_SPEC, PSI_MUNT_SPEC,
                                PSI_NMU_ACC_SPEC, PSI_MUNT_ACC_SPEC)
+from common.wfn_transforms import _priced_executable
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from runtime.padding import spec_divisor
 
 _LOG = logging.getLogger("lorrax.psi_G_store")
 
 
-
-_EXECUTABLES: dict = {}
-
-
-def _priced_executable(kernel, args, stage):
-    """``kernel`` compiled for ``args``, once per signature (a stage that cannot bind: no price
-    of its own; the trace measures it)."""
-    key = (kernel, tuple((tuple(a.shape), str(a.dtype), getattr(a, "sharding", None))
-                         for a in jax.tree.leaves(args)))
-    if key not in _EXECUTABLES:
-        _EXECUTABLES[key] = kernel.lower(*args).compile()
-    executable = _EXECUTABLES[key]
-    return executable
 
 def _zero_user_band_pad_in_shard(
     shard_data: np.ndarray,
@@ -1137,7 +1125,8 @@ def load_parent_psi_G(
     from common.collectives import device_put_process_local
     from common.wfn_transforms import (
         load_psi_gflat_padded, _centroid_sampling_geometry,
-        _centroid_sampling_shardings, _centroid_face_kernels)
+        _centroid_sampling_shardings, _centroid_face_kernels, _cached_jit,
+        _finish_centroid_faces)
     from runtime.padding import padded_axis, pad_to_axis, mesh_divisor
 
     if placement not in ("device", "host", "none"):
@@ -1197,11 +1186,12 @@ def load_parent_psi_G(
         r_mu_dev = device_put_process_local(r_mu, rep)
         w_mu_dev = device_put_process_local(w_mu, rep)
 
+        face_shape = (nk, nb_c, int(meta.nspinor), int(mu_pad))
         @partial(jax.jit, out_shardings=(acc_Y, acc_X))
         def _zero_faces():
-            return (jnp.zeros((nk, nb_c, int(meta.nspinor), int(mu_pad)), jnp.complex128),
-                    jnp.zeros((nk, nb_c, int(meta.nspinor), int(mu_pad)), jnp.complex128))
-        acc_y, acc_x = _zero_faces()
+            return jnp.zeros(face_shape, jnp.complex128), jnp.zeros(face_shape, jnp.complex128)
+        zero_faces = _cached_jit('gslot_zero_faces', (face_shape, acc_Y, acc_X), lambda: _zero_faces)
+        acc_y, acc_x = _priced_executable(zero_faces, (), "psi_G_store.gslot.zero_faces")()
         _, finish = _centroid_face_kernels(
             b0, meta, mu_active_mask, n_rmu, int(mu_pad), b1 - b0, out_X, out_Y,
             stage_X, stage_Y)
@@ -1213,12 +1203,17 @@ def load_parent_psi_G(
                           device=NamedSharding(mesh_xy, PSI_NMU_ACC_SPEC))
         acc_x = jnp.zeros((1, 1, 1, P_), jnp.complex128,
                           device=NamedSharding(mesh_xy, PSI_MUNT_ACC_SPEC))
+    jax.block_until_ready((acc_y, acc_x))
 
     ns = int(meta.nspinor) if bispinor else int(loader.nspinor)
     store = host_tile = None
     gspec = NamedSharding(mesh_xy, P(None, None, None, ('x', 'y')))
     if placement == "device":
-        store = jnp.zeros((nk, nb_keep, ns, ngk_c), jnp.complex128, device=gspec)
+        shape = (nk, nb_keep, ns, ngk_c)
+        zero_store = _cached_jit('gslot_zero_store', (shape, gspec),
+            lambda: jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=gspec))
+        store = _priced_executable(zero_store, (), "psi_G_store.gslot.zero_store")()
+        store.block_until_ready()
     elif placement == "host":
         if len(mesh_xy.local_devices) != 1:
             raise ValueError("load_parent_psi_G(placement='host') wants one "
@@ -1227,8 +1222,28 @@ def load_parent_psi_G(
     insert = _gslot_insert_kernel(mesh_xy)
     t_read = t_xform = t_keep = 0.0
     import time as _time
+    consumers, inserts = {}, {}
     for lo in range(b0, b0 + nb_c, w):
+        if lo >= int(loader.nbands):
+            continue                 # preserve the no-read path for wholly padded bands
         wc = min(w, b0 + nb_c - lo)     # the tail chunk: a P multiple, ≤ w
+        first, last = max(lo, keep0), min(lo + wc, keep1)
+        chunk_shape = (nk, wc, ns, ngk_c)
+        chunk_bytes = nk * wc * ns * ngk_c * 16 // P_
+        if wc not in consumers:
+            kern = _gslot_face_kernel(mesh_xy, fft_grid, nk, wc, ns, ngk_c,
+                                      int(mu_pad), int(mu_t), with_faces)
+            abstract = jax.ShapeDtypeStruct(chunk_shape, jnp.complex128,
+                sharding=NamedSharding(mesh_xy, band_sphere_spec()))
+            args = (abstract, sidx, kvecs_dev, r_mu_dev, w_mu_dev, acc_y, acc_x, jnp.int32(0))
+            consumers[wc] = _priced_executable(kern, args,
+                "psi_G_store.gslot.a2a_faces", extra=chunk_bytes)
+        if placement == "device" and first < last and last-first not in inserts:
+            retained = jax.ShapeDtypeStruct((nk, last-first, ns, ngk_c),
+                                          jnp.complex128, sharding=gspec)
+            inserts[last-first] = _priced_executable(insert, (store, retained, jnp.int32(0)),
+                "psi_G_store.gslot.keep", extra=chunk_bytes + (
+                    nk * (last-first) * ns * ngk_c * 16 // P_ if last-first < wc else 0))
         t0 = _time.perf_counter()
         with timing.section("psi_G_store.gslot.read"):
             chunk = load_psi_gflat_padded(
@@ -1241,10 +1256,8 @@ def load_parent_psi_G(
                 chunk = pad_to_axis(chunk, g_axis, axis=-1)
             jax.block_until_ready(chunk)
         t1 = _time.perf_counter()
-        kern = _gslot_face_kernel(mesh_xy, fft_grid, nk, wc, ns, ngk_c,
-                                  int(mu_pad), int(mu_t), with_faces)
         args = (chunk, sidx, kvecs_dev, r_mu_dev, w_mu_dev, acc_y, acc_x, jnp.int32(lo - b0))
-        executable = _priced_executable(kern, args, "psi_G_store.gslot.a2a_faces")
+        executable = consumers[wc]
         with timing.section("psi_G_store.gslot.a2a_faces"):
             g_chunk, acc_y, acc_x = executable(*args)
             del args
@@ -1252,11 +1265,10 @@ def load_parent_psi_G(
             jax.block_until_ready((g_chunk, acc_y, acc_x))
         t2 = _time.perf_counter()
         with timing.section("psi_G_store.gslot.keep"):
-            first, last = max(lo, keep0), min(lo + wc, keep1)
             if placement != "none" and first < last:
                 retained = g_chunk[:, first - lo:last - lo]
                 if placement == "device":
-                    store = insert(store, retained, jnp.int32(first - keep0))
+                    store = inserts[last-first](store, retained, jnp.int32(first - keep0))
                     jax.block_until_ready(store)
                 elif placement == "host":
                     host_tile[:, first - keep0:last - keep0] = np.asarray(
@@ -1269,7 +1281,8 @@ def load_parent_psi_G(
         t_keep += t3 - t2
     faces = None
     if with_faces:
-        faces = finish(*_gslot_faces_kernel(mesh_xy)(acc_y, acc_x), nk)
+        faces = _finish_centroid_faces(finish, (acc_y, acc_x), nk,
+                                      convert=_gslot_faces_kernel(mesh_xy))
         jax.block_until_ready(faces)
     print_fn(f"  ψ(G) one-read: {nk} k × {nb_c} bands × {ngk_c} G slots "
              f"({(b1 - b0)} logical) in chunks of {w}; read {t_read:.2f}s, "

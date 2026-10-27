@@ -12,7 +12,7 @@ Per μ batch ``B``, with conj ψ(G) of the full zone sharded over G slots:
         LR+RL completion; e^{-iq·r}, 2D FFT, ζ-sphere columns, axis phase
         accumulate Z_q(μ, G)
 
-``Z_q(G)`` is written once into :class:`ZStore` (pinned host tiles or a
+``Z_q(G)`` is written once into :class:`ZStore` (pageable host tiles or a
 slab_io file); no accumulator over r and no distributed FFT exist.  ``C_q⁺``
 acts on μ only, so it is applied afterwards on the sphere, G tile by G tile:
 ``ζ_q(G) = C_q⁺ Z_q(G)`` (:class:`ZetaG`, through :mod:`isdf.cplus`).
@@ -506,6 +506,161 @@ def _reorder_rank_major(x, P_: int, n_batch: int, c: int, mu_pad: int, axis: int
     return jax.lax.slice_in_dim(x, 0, mu_pad, axis=axis)
 
 
+def _local_bytes(values):
+    """Bytes of the actual per-device carriers, including every padded slot."""
+    return sum(math.prod(v.sharding.shard_shape(v.shape)) * np.dtype(v.dtype).itemsize
+               for v in jax.tree.leaves(values))
+
+
+def _compile_phase(fn, *args):
+    """Compile a phase and retain its output geometry without allocating its arrays."""
+    key = ('compiled_phase', fn, tuple((tuple(a.shape), str(a.dtype), a.sharding,
+                                       bool(getattr(a, 'weak_type', False)))
+                                      for a in jax.tree.leaves(args)))
+    if key not in _kernel_cache:
+        executable = fn.lower(*args).compile()
+        shapes = jax.tree.map(
+            lambda a, s: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=s),
+            jax.eval_shape(fn, *args), executable.output_shardings)
+        _kernel_cache[key] = executable, shapes
+    return _kernel_cache[key]
+
+
+def _new_bytes(executable):
+    from runtime.aot_memory import compiled_new_bytes
+    return compiled_new_bytes(executable)
+
+
+def _admit_finalize(mesh, carries, peak, label):
+    """One pass-boundary admission before its new carries or first read exist.
+
+    ``peak`` is the largest sequential phase above these carries: its actual
+    executable increment plus the inputs/outputs held by the surrounding loop.
+    Factors and other pre-existing arrays remain in the allocator's live floor.
+    The store's immutable G tile is not silently resized when this is over room.
+    """
+    from common.gpu_utils import device_budget_bytes
+    from lxkit import memory
+    from runtime.aot_memory import agreed_chunk
+    device_budget_bytes()
+    got = -agreed_chunk(-int(_local_bytes(carries) + peak))
+    price = memory.priced(got, label + " (compiled phases and retained carriers)", increment=True)
+    memory.admit(label, price, memory.room(bucketed=False))
+    memory.book(price)
+
+
+def _zero_program(shapes):
+    """The admitted carry allocation, compiled and executed as the same program."""
+    key = ('zero_program', jax.tree.structure(shapes),
+           tuple((a.shape, str(a.dtype), a.sharding) for a in jax.tree.leaves(shapes)))
+    if key not in _kernel_cache:
+        _kernel_cache[key] = jax.jit(
+            lambda: jax.tree.map(lambda a: jnp.zeros(a.shape, a.dtype), shapes),
+            out_shardings=jax.tree.map(lambda a: a.sharding, shapes)).lower().compile()
+    return _kernel_cache[key]
+
+
+def _shape(mesh, spec, shape):
+    return jax.ShapeDtypeStruct(shape, jnp.complex128, sharding=NamedSharding(mesh, spec))
+
+
+def _read_programs(st):
+    """The store read's executed device phases and full allocated-slot peak.
+
+    Host placement first uploads its mu-owned tile; disk placement returns a
+    q-owned slab. Both preserve ``n_batch*b`` slots until the final packed gather.
+    In particular neither intermediate is bounded by the smaller returned tile.
+    """
+    slots = st.n_batch * st.b
+    key = ('store_read', _mesh_id(st.mesh), st.placement, st.Q, st.Q_pad,
+           slots, st.mu_pad, st.g_tile)
+    if key not in _kernel_cache:
+        if st.placement == 'host':
+            raw = _shape(st.mesh, P(None, _XY, None), (st.Q, slots, st.g_tile))
+            move = _rows_to_q_local(st.mesh, st.P, st.n_batch, st.c, slots, st.q_axis)
+        else:
+            raw = _shape(st.mesh, P(None, _XY, None, None), (1, st.Q_pad, slots, st.g_tile))
+            move = _disk_tile(st.mesh, slots)
+        first, moved = _compile_phase(move, raw)
+        pfs = jax.ShapeDtypeStruct((st.mu_pad,), jnp.int32,
+                                  sharding=NamedSharding(st.mesh, P()))
+        second, tile = _compile_phase(_slots_to_packed(st.mesh), moved, pfs)
+        peak = max(_local_bytes(raw) + _new_bytes(first),
+                   _local_bytes(raw) + _local_bytes(moved) + _local_bytes(pfs) + _new_bytes(second))
+        _kernel_cache[key] = first, second, tile, peak
+    return _kernel_cache[key]
+
+
+def _tail_program(zeta, value, *, shell=False, q_owned=True):
+    """The actual terminal exchange/unpack, including its output allocation."""
+    mesh, Q, basis = zeta.mesh, zeta.store.Q, zeta.mu_basis
+    if not q_owned and basis is None:
+        return None, value
+    key = ('finalize_tail', _mesh_id(mesh), Q, id(basis), bool(shell), bool(q_owned))
+    def finish(x):
+        if q_owned:
+            x = (_finish_shell if shell else _finish_v)(mesh, Q)(x)
+        if basis is not None:
+            x = basis.unpack_axis(x, 1) if shell else basis.unpack_operator(x)
+        return x
+    if key not in _kernel_cache:
+        _kernel_cache[key] = jax.jit(finish)
+    return _compile_phase(_kernel_cache[key], value)
+
+
+def _tail_plan(zetas, V, S, *, q_owned):
+    """Price retained converted outputs beside the original group carries."""
+    programs, peak, held = [], 0, 0
+    for z, value, shell in ([(zetas[0], v, False) for v in V]
+                            + [(z, s, True) for z, s in zip(zetas, S)]):
+        ex, output = _tail_program(z, value, shell=shell, q_owned=q_owned)
+        if ex is not None:
+            peak = max(peak, held + _new_bytes(ex))
+            held += _local_bytes(output)
+        programs.append(ex)
+    return programs, peak
+
+
+def _write_program(zeta, value, *, q_owned):
+    mesh, Q, basis = zeta.mesh, zeta.store.Q, zeta.mu_basis
+    key = ('finalize_write', _mesh_id(mesh), Q, id(basis), bool(q_owned))
+    def place(x):
+        if q_owned:
+            x = _to_mu_owner(mesh, Q, 'mu')(x)
+        return basis.unpack_axis(x, 1) if basis is not None else x
+    if key not in _kernel_cache:
+        _kernel_cache[key] = jax.jit(place)
+    return _compile_phase(_kernel_cache[key], value)
+
+
+def _debug_program(zeta, *args):
+    mesh, Q, basis = zeta.mesh, zeta.store.Q, zeta.mu_basis
+    solver, n_log = zeta.solver_kind, zeta.n_rmu_solve
+    key = ('finalize_debug', _mesh_id(mesh), Q, id(basis), solver, n_log)
+    def compare(F, dense, result):
+        other = _finish_v(mesh, Q)(_v_from_m(mesh, solver, n_log)(F, dense))
+        if basis is not None:
+            other = basis.unpack_operator(other)
+        return jnp.linalg.norm(other - result) / jnp.linalg.norm(result)
+    if key not in _kernel_cache:
+        _kernel_cache[key] = jax.jit(compare)
+    return _compile_phase(_kernel_cache[key], *args)[0]
+
+
+def _single_pass_peak(tile, read_peak, step_peak, tail_peak, writer, zeta_io):
+    """Read, compute, write, terminal phases with one read-ahead and writer hold."""
+    write_new = written = write_call = producer = 0
+    if writer is not None:
+        write_new, producer = _new_bytes(writer[0]), _local_bytes(writer[1])
+        written = zeta_io.retained_previous_write_inputs * producer
+        write_call = zeta_io.write_device_scratch('zeta_q_G', writer[1])
+    return write_call + max(read_peak + tile + written,
+               tile + step_peak + tile + written,
+               3 * tile + written + write_new if writer is not None else 0,
+               3 * tile + written + producer if writer is not None else 0,
+               tail_peak + written)
+
+
 class ZStore:
     """Write-once ``Z_q(μ, G)``; the GPU holds only the batch being written.
 
@@ -624,24 +779,26 @@ class ZStore:
         """G tile ``t``, q-local (see class doc)."""
         t0 = time.perf_counter()
         t = int(t)
+        move, pack, _tile, _peak = _read_programs(self)
         if self.placement == 'disk':
             self._io.sync_writes()
             raw = self._io.read_slab(
                 'Z', shape=(1, self.Q_pad, self.n_batch * self.b, self.g_tile),
                 offset=(t, 0, 0, 0), mesh=self.mesh,
                 partition_spec=P(None, _XY, None, None))
-            out = _disk_tile(self.mesh, self.n_batch * self.b)(raw)
+            out = move(raw)
         else:
             nc = self.n_batch * self.c
             local = _host_tile_to_device(
                 self.mesh, P(None, _XY, None), (self.Q, self.P * nc, self.g_tile),
                 {dev: self._host[dev.id][t].reshape(self.Q, nc, self.g_tile)
                  for dev in self.mesh.local_devices})
-            out = _rows_to_q_local(self.mesh, self.P, self.n_batch,
-                                   self.c, self.n_batch * self.b, self.q_axis)(local)
+            out = move(local)
         # Store slot order → packed centroid order (a prefix for contiguous
         # batches, a gather for orbit batches).
-        out = _slots_to_packed(self.mesh)(out, jnp.asarray(self._pfs))
+        from common.collectives import device_put_process_local
+        pfs = device_put_process_local(self._pfs, NamedSharding(self.mesh, P()))
+        out = pack(out, pfs)
         # Not blocked: the caller prefetches tile t+1 behind tile t's work.
         self.bytes_read += self.Q * self.mu_pad * self.g_tile * 16
         self.t_read += time.perf_counter() - t0
@@ -836,21 +993,29 @@ class ZetaG:
         step = _v_tile_kernel(self.mesh, self.solver_kind,
                               self.n_rmu_solve, st.g_tile, debug_m=dbg, with_v=with_v)
         mu = int(st.mu_pad)
-        V, M, shell = _zero_accumulators(self.mesh, st.Q_pad, mu,
-                                         int(sl.shape[1]), debug_m=dbg, with_v=with_v)
+        carry = _accumulator_shapes(self.mesh, st.Q_pad, mu, int(sl.shape[1]),
+                                    debug_m=dbg, with_v=with_v)
+        zeros = _zero_program(carry)
         L_arg = self.factor
+        _, _, tile_shape, read_peak = _read_programs(st)
+        step, outputs = _compile_phase(step, L_arg, tile_shape, v_dev, ngk_dev, sl_dev,
+                                       jnp.int32(0), *carry)
+        tail, tail_peak = _tail_plan([self], [carry[0]] if with_v else [],
+                                      [carry[2]] if with_v else [], q_owned=True)
+        writer = _write_program(self, outputs[3], q_owned=True) if zeta_io is not None else None
+        peak = _single_pass_peak(_local_bytes(tile_shape), read_peak,
+                                 _new_bytes(step), tail_peak, writer, zeta_io)
+        debug = None
+        if dbg:
+            final_shape = tail[0].out_info
+            final_shape = jax.ShapeDtypeStruct(final_shape.shape, final_shape.dtype,
+                                               sharding=tail[0].output_shardings)
+            debug = _debug_program(self, L_arg, carry[1], final_shape)
+            peak = max(peak, _local_bytes(final_shape) + _local_bytes(carry[2]) + _new_bytes(debug))
+        _admit_finalize(self.mesh, carry, max(peak, _new_bytes(zeros) - _local_bytes(carry)),
+                        f"zeta q-owner finalize G tile {st.g_tile}")
+        V, M, shell = zeros()
         nxt = st.read_tile(0)
-        # The pass's price: its tile step compiled (never run) beside the prefetched tile, the
-        # largest any rank read; the tile width is the store's (runtime.aot_memory.check_chunk).
-        from lxkit import memory
-        from runtime.aot_memory import agreed_chunk, compiled_new_bytes
-        tile = math.prod(nxt.sharding.shard_shape(nxt.shape)) * nxt.dtype.itemsize
-        # The executable priced is the one each tile runs (one compile, not a price-only one).
-        step = step.lower(L_arg, nxt, v_dev, ngk_dev, sl_dev, jnp.int32(0), V, M, shell).compile()
-        # Beside the step: the prefetched tile and the last tile the asynchronous writer holds.
-        got = -agreed_chunk(-compiled_new_bytes(step, extra=2 * tile))
-        memory.book(memory.priced(got, f"ζ G-tile step {st.g_tile} (compiled) + the prefetched "
-                                  "and the written tile", increment=True))
         for t in range(st.n_Gt):
             # Tile t+1 is read while tile t is contracted.
             Zt = nxt
@@ -858,7 +1023,7 @@ class ZetaG:
             V, M, shell, zt = step(L_arg, Zt, v_dev, ngk_dev, sl_dev,
                                    jnp.int32(t), V, M, shell)
             if zeta_io is not None:
-                self._write_tile(zeta_io, zt, t * st.g_tile)
+                self._write_tile(zeta_io, zt, t * st.g_tile, program=writer[0])
                 if st.placement == 'disk':
                     # The next store read enters another HDF5 handle; the
                     # asynchronous ζ write must reach MPI-IO first on every
@@ -873,19 +1038,11 @@ class ZetaG:
                             f"{time.perf_counter() - t0:.2f}s (store read "
                             f"{st.t_read:.2f}s); zeta file written")
             return None
-        V = _finish_v(self.mesh, st.Q)(V)
-        shell = _finish_shell(self.mesh, st.Q)(shell)
-        if self.mu_basis is not None:
-            V = self.mu_basis.unpack_operator(V)
-            shell = self.mu_basis.unpack_axis(shell, 1)
+        V = tail[0](V)
+        shell = tail[1](shell)
         self.shell, self.shell_slots = shell, keep
         if M is not None:
-            V_cmc = _v_from_m(self.mesh, self.solver_kind,
-                              self.n_rmu_solve)(L_arg, M)
-            V_cmc = _finish_v(self.mesh, st.Q)(V_cmc)
-            if self.mu_basis is not None:
-                V_cmc = self.mu_basis.unpack_operator(V_cmc)
-            d = float(jnp.linalg.norm(V_cmc - V) / jnp.linalg.norm(V))
+            d = float(debug(L_arg, M, V))
             log.debug(f"  μ-batch V check: conj(C+) M conj(C+) vs zeta-first "
                       f"rel {d:.3e} (production keeps zeta-first)",
                       extra=record("isdf.mubatch_v_check", rel=d))
@@ -940,42 +1097,29 @@ class ZetaG:
         to_face, apply, acc = _face_kernels(mesh, Q, st.g_tile, bool(with_v),
                                             inverse=self.solver_kind == 'inverse')
         mu = int(st.mu_pad)
-        V = jnp.zeros((Q, mu, mu), jnp.complex128, device=NamedSharding(mesh, P(None, 'x', 'y'))) if with_v else None
-        S = jnp.zeros((Q, mu, int(sl.shape[1])), jnp.complex128, device=NamedSharding(mesh, P(None, _XY, None)))
+        carry = (_shape(mesh, P(None, 'x', 'y'), (Q, mu, mu)) if with_v else None,
+                 _shape(mesh, P(None, _XY, None), (Q, mu, int(sl.shape[1]))))
+        zeros = _zero_program(carry)
+        _, _, tile_shape, read_peak = _read_programs(st)
+        e1, face = _compile_phase(to_face, tile_shape)
+        e2, applied = _compile_phase(apply, self.factor, face)
+        e3, outputs = _compile_phase(acc, applied, v, ngk, sl, jnp.int32(0), *carry)
+        step = max(_new_bytes(e1), _local_bytes(face) + _new_bytes(e2),
+                   _local_bytes(applied) + _new_bytes(e3))
+        tail, tail_peak = _tail_plan([self], [carry[0]] if with_v else [],
+                                      [carry[1]] if with_v else [], q_owned=False)
+        writer = _write_program(self, outputs[2], q_owned=False) if zeta_io is not None else None
+        peak = _single_pass_peak(_local_bytes(tile_shape), read_peak, step, tail_peak, writer, zeta_io)
+        _admit_finalize(mesh, carry, max(peak, _new_bytes(zeros) - _local_bytes(carry)),
+                        f"zeta face finalize G tile {st.g_tile}")
+        V, S = zeros()
         nxt = st.read_tile(0)
-        # The pass's price over what is live now (V, S, the first tile): the next tile read
-        # ahead and the chain's largest step: to_face, apply beside the face tile, acc beside
-        # apply's output, each compiled at its operands -- the executables every tile runs.
-        from lxkit import memory
-        from runtime.aot_memory import compiled_new_bytes
-
-        def compiled(fn, *args):
-            ex = fn.lower(*args).compile()
-            return ex, jax.tree.map(lambda o, s: jax.ShapeDtypeStruct(o.shape, o.dtype, sharding=s),
-                                    jax.eval_shape(fn, *args), ex.output_shardings)
-
-        def chain():
-            e1, face = compiled(to_face, nxt)
-            e2, applied = compiled(apply, self.factor, face)
-            return e1, e2, compiled(acc, applied, v, ngk, sl, jnp.int32(0), V, S)[0]
-        sig = (to_face, apply, acc) + tuple((a.shape, str(a.dtype), str(getattr(a, "sharding", None)))
-                                            for a in jax.tree.leaves((nxt, self.factor, v, ngk, sl, V, S)))
-        if sig not in _FACE_CHAINS:
-            _FACE_CHAINS[sig] = chain()
-        e1, e2, e3 = _FACE_CHAINS[sig]
-        out = lambda ex: int(ex.memory_analysis().output_size_in_bytes)
-        step = max(compiled_new_bytes(e1), out(e1) + compiled_new_bytes(e2), out(e2) + compiled_new_bytes(e3))
-        tile = math.prod(nxt.sharding.shard_shape(nxt.shape)) * nxt.dtype.itemsize
-        # Beside the chain: the prefetched tile and the last tile the asynchronous writer holds.
-        memory.book(memory.priced(2 * tile + step, f"zeta face G-tile chain {st.g_tile} (to_face, apply, "
-                                  "acc compiled) + the prefetched and the written tile", increment=True))
         for t in range(st.n_Gt):
             Zt = nxt
             nxt = st.read_tile(t + 1) if t + 1 < st.n_Gt else None
             V, S, zt = e3(e2(self.factor, e1(Zt)), v, ngk, sl, jnp.int32(t), V, S)
             if zeta_io is not None:      # zt is already in the writer's layout (P(None,('x','y'),None), Q rows)
-                zt = self.mu_basis.unpack_axis(zt, 1) if self.mu_basis is not None else zt
-                zeta_io.write_slab('zeta_q_G', zt, offset=(0, 0, int(t * st.g_tile)))
+                self._write_tile(zeta_io, zt, t * st.g_tile, program=writer[0])
                 if st.placement == 'disk':
                     zeta_io.sync_writes()
             del Zt, zt
@@ -983,8 +1127,8 @@ class ZetaG:
         if not with_v:
             self.receipt = f"  μ-batch ζ pass: {where}; zeta file written"
             return None
-        if self.mu_basis is not None:
-            V, S = self.mu_basis.unpack_operator(V), self.mu_basis.unpack_axis(S, 1)
+        V = tail[0](V) if tail[0] is not None else V
+        S = tail[1](S) if tail[1] is not None else S
         self.shell, self.shell_slots = S, keep
         peak = (jax.local_devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0)
         self.receipt = (f"  μ-batch V_q: {where}; zeta file {'written' if zeta_io is not None else 'not written'}; "
@@ -992,11 +1136,14 @@ class ZetaG:
         log.debug(self.receipt, extra=record("isdf.mubatch_v", text=self.receipt.strip()))
         return V
 
-    def _write_tile(self, zeta_io, zt, g0):
+    def _write_tile(self, zeta_io, zt, g0, *, program=None):
         """One masked ζ tile into ``zeta_q_G`` (canonical μ order, clipped)."""
-        zt = _to_mu_owner(self.mesh, self.store.Q, 'mu')(zt)   # the writer's layout
-        if self.mu_basis is not None:
-            zt = self.mu_basis.unpack_axis(zt, 1)
+        if program is not None:
+            zt = program(zt)
+        else:
+            zt = _to_mu_owner(self.mesh, self.store.Q, 'mu')(zt)
+            if self.mu_basis is not None:
+                zt = self.mu_basis.unpack_axis(zt, 1)
         zeta_io.write_slab('zeta_q_G', zt, offset=(0, 0, int(g0)))
 
     def head_columns(self, sel):
@@ -1061,7 +1208,6 @@ _ACC_SPEC = P(_XY, None, None)
 _FACE_KINDS = ('rank_truncate', 'inverse')
 
 
-_FACE_CHAINS: dict = {}     # (kernels, operand signature) -> the face zeta pass's executables
 
 
 def _face_coulomb_gram(mesh, left, weights, right):
@@ -1160,46 +1306,6 @@ def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True):
     return fn
 
 
-def _pair_tile_kernel(mesh, g_tile, pairs):
-    """One G tile of several ζ's: ``V^{ab} += conj(ζ^a) v^{ab} ζ^bᵀ`` per pair,
-    and each ζ's shell gather — the accumulation half of :func:`_v_tile_kernel`
-    over ζ tiles it formed with ``with_v=False``."""
-    pairs = tuple((int(a), int(b)) for a, b in pairs)
-    key = ('pair_tile', _mesh_id(mesh), int(g_tile), pairs)
-    fn = _kernel_cache.get(key)
-    if fn is not None:
-        return fn
-    n_z = 1 + max(max(p) for p in pairs)
-    acc = _ACC_SPEC
-    z_spec, v_spec, n_spec, s_spec = (P(_XY, None, None), P(None, _XY, None),
-                                      P(_XY), P(_XY, None))
-    in_specs = ((z_spec,) * n_z, v_spec, n_spec, s_spec, P(),
-                (acc,) * len(pairs), (acc,) * n_z)
-
-    @partial(shard_map, mesh=mesh, in_specs=in_specs,
-             out_specs=((acc,) * len(pairs), (acc,) * n_z), check_vma=False)
-    def k(Z, v, ngk, sl, t, V, S):
-        n_g = Z[0].shape[-1]
-        g_idx = t * g_tile + jnp.arange(n_g, dtype=jnp.int32)
-        mask = g_idx[None, :] < ngk[:, None]                    # (q, g)
-        cols = jnp.clip(g_idx, 0, v.shape[-1] - 1)
-        V_out = []
-        for i, (a, b) in enumerate(pairs):
-            vt = jnp.where(mask, jnp.take(v[i], cols, axis=1), 0)
-            dV = jnp.einsum('qmg,qg,qng->qmn', jnp.conj(Z[a]), vt, Z[b])
-            V_out.append(V[i] + dV)
-        hit = (sl[:, None, :] == g_idx[None, :, None]).astype(Z[0].dtype)
-        S_out = []
-        for a in range(n_z):
-            dS = jnp.einsum('qmg,qgs->qms', Z[a], hit)
-            S_out.append(S[a] + dS)
-        return tuple(V_out), tuple(S_out)
-
-    fn = jax.jit(k, donate_argnums=(5, 6))
-    _kernel_cache[key] = fn
-    return fn
-
-
 def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     """Several V tiles over several ζ's in ONE pass over the G tiles.
 
@@ -1229,84 +1335,85 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
         raise ValueError(
             f"contract_v_group: keep must be (Q={st0.Q}, n) slots; got {keep.shape}.")
     mesh = z0.mesh
-    if all(z.solver_kind in _FACE_KINDS for z in zetas):
-        return _contract_v_group_face(zetas, pairs, v_tables, keep, t0)
-    qa, ga = st0.q_axis, st0.g_axis
-    v = np.stack([np.asarray(pad_to_axis(pad_to_axis(
-        jnp.asarray(t, dtype=jnp.complex128), qa, axis=0), ga, axis=1))
-        for t in v_tables])                               # (n_pair, Q_pad, G)
-    ngk = np.asarray(pad_to_axis(jnp.asarray(z0.ngk_per_q, jnp.int32), qa, axis=0))
-    sl = np.asarray(pad_to_axis(jnp.asarray(keep, jnp.int32), qa, axis=0))
-    from common.collectives import device_put_process_local
-    v_dev = device_put_process_local(v, NamedSharding(mesh, P(None, _XY, None)))
-    ngk_dev = device_put_process_local(ngk, NamedSharding(mesh, P(_XY)))
-    sl_dev = device_put_process_local(sl, NamedSharding(mesh, P(_XY, None)))
-    form = [_face_former(mesh, st0, z.ngk_per_q) if z.solver_kind == 'rank_truncate' else
-            _v_tile_kernel(mesh, z.solver_kind, z.n_rmu_solve, st0.g_tile, debug_m=False, with_v=False)
-            for z in zetas]
-    stub = [_zero_accumulators(mesh, st0.Q_pad, int(st0.mu_pad), 1,
-                               debug_m=False, with_v=False) for _ in zetas]
-    step = _pair_tile_kernel(mesh, st0.g_tile, pairs)
-    mu = int(st0.mu_pad)
-    V = tuple(_zero_accumulators(mesh, st0.Q_pad, mu, 1,
-                                 debug_m=False)[0] for _ in pairs)
-    S = tuple(jnp.zeros((st0.Q_pad, mu, int(sl.shape[1])), jnp.complex128,
-                        device=NamedSharding(mesh, _ACC_SPEC)) for _ in zetas)
-    factors = [z.factor for z in zetas]
-    v_form = v_dev[0]                  # unread by the ζ-forming half
-    # No look-ahead: each Z tile is read just before its ζ is formed and
-    # dropped after, so a G tile holds one Z tile and the ζ tiles — the six
-    # tile-sized buffers the fit's plan sized g_tile for (MuBatchPlan).
-    for t in range(st0.n_Gt):
-        zt = []
-        for i, z in enumerate(zetas):
-            Zt = z.store.read_tile(t)
-            a, m, sh, zi = form[i](factors[i], Zt, v_form, ngk_dev, sl_dev,
-                                   jnp.int32(t), *stub[i])
-            stub[i] = (a, m, sh)
-            zt.append(zi)
-            del Zt
-        V, S = step(tuple(zt), v_dev, ngk_dev, sl_dev, jnp.int32(t), V, S)
-        del zt
-    out = []
-    for Vp in V:
-        Vp = _finish_v(mesh, st0.Q)(Vp)
-        out.append(z0.mu_basis.unpack_operator(Vp) if z0.mu_basis is not None else Vp)
-    for z, Sa in zip(zetas, S):
-        Sa = _finish_shell(mesh, st0.Q)(Sa)
-        z.shell = z0.mu_basis.unpack_axis(Sa, 1) if z0.mu_basis is not None else Sa
-        z.shell_slots = keep
-    receipt = (f"  μ-batch V_q group: {len(zetas)} ζ, {len(pairs)} tiles, "
-               f"{st0.n_Gt} G tiles, q-local, "
-               f"{time.perf_counter() - t0:.2f}s (store read "
-               f"{sum(z.store.t_read for z in zetas):.2f}s); no ζ file")
-    log.debug(receipt, extra=record("isdf.mubatch_v_group", text=receipt.strip()))
-    return out
+    return _contract_v_group_face(zetas, pairs, v_tables, keep, t0)
+
+
+def _q_lu_former(mesh, n_log, g_tile, Q_pad):
+    """The existing q-owner LU back-solve, returning only its rectangular ζ tile."""
+    key = ('q_lu_form', _mesh_id(mesh), int(n_log), int(g_tile), int(Q_pad))
+    if key not in _kernel_cache:
+        step = _v_tile_kernel(mesh, 'lu', n_log, g_tile, debug_m=False, with_v=False)
+        def form(F, Z, ngk, t):
+            stub = jnp.zeros((Q_pad, 1, 1), jnp.complex128,
+                             device=NamedSharding(mesh, _ACC_SPEC))
+            slots = jnp.zeros((Q_pad, 1), jnp.int32,
+                              device=NamedSharding(mesh, P(_XY, None)))
+            return step(F, Z, None, ngk, slots, t, stub, stub, stub)[3]
+        _kernel_cache[key] = jax.jit(form)
+    return _kernel_cache[key]
 
 
 def _contract_v_group_face(zetas, pairs, v_tables, keep, t0):
-    """:func:`contract_v_group` when every ζ is formed on the face: each ζ tile on the face
-    (:func:`_face_kernels`), each pair's V and each ζ's shell accumulated there, as
-    :meth:`ZetaG._contract_v_face` does for one ζ; no rank holds a whole (μ, μ) V."""
+    """Every grouped V and shell stays on faces, independently of factor layout.
+
+    LU retains its original q-owner solve and exchanges only the rectangular ζ
+    tile. Face factors keep their face solve. This also admits mixed families
+    selected independently while earlier factors remain resident.
+    """
     z0, st0 = zetas[0], zetas[0].store
     mesh, Q, mu = z0.mesh, st0.Q, int(st0.mu_pad)
     pairs = tuple((int(a), int(b)) for a, b in pairs)
-    face, mush = NamedSharding(mesh, P(None, 'x', 'y')), NamedSharding(mesh, P(None, _XY, None))
     v = jnp.stack([jnp.asarray(pad_to_axis(jnp.asarray(t, dtype=jnp.complex128), st0.g_axis, axis=1))
                    for t in v_tables])
     ngk, sl = jnp.asarray(z0.ngk_per_q, jnp.int32), jnp.asarray(np.asarray(keep, np.int32))
-    forms = [_face_kernels(mesh, Q, st0.g_tile, False, inverse=z.solver_kind == 'inverse')[:2]
-             for z in zetas]
     step = _face_pair_kernel(mesh, int(st0.g_tile), pairs, len(zetas))
-    V = tuple(jnp.zeros((Q, mu, mu), jnp.complex128, device=face) for _ in pairs)
-    S = tuple(jnp.zeros((Q, mu, int(sl.shape[1])), jnp.complex128, device=mush) for _ in zetas)
+    V_shape = tuple(_shape(mesh, P(None, 'x', 'y'), (Q, mu, mu)) for _ in pairs)
+    S_shape = tuple(_shape(mesh, P(None, _XY, None), (Q, mu, int(sl.shape[1]))) for _ in zetas)
+    carries = V_shape, S_shape
+    zeros = _zero_program(carries)
+    from common.collectives import device_put_process_local
+    qngk = device_put_process_local(np.asarray(pad_to_axis(
+        jnp.asarray(z0.ngk_per_q, jnp.int32), st0.q_axis, axis=0)),
+        NamedSharding(mesh, P(_XY)))
+    programs, formed, peak, held = [], [], 0, 0
+    for z in zetas:
+        _, _, tile, read_peak = _read_programs(z.store)
+        if z.solver_kind == 'lu':
+            solve, value = _compile_phase(_q_lu_former(
+                mesh, z.n_rmu_solve, st0.g_tile, st0.Q_pad), z.factor, tile, qngk, jnp.int32(0))
+            move, applied = _compile_phase(_to_mu_owner(mesh, Q, 'xy'), value)
+            chain = max(_new_bytes(solve), _local_bytes(value) + _new_bytes(move))
+        elif z.solver_kind in _FACE_KINDS:
+            to_face, apply = _face_kernels(
+                mesh, Q, st0.g_tile, False, inverse=z.solver_kind == 'inverse')[:2]
+            move, value = _compile_phase(to_face, tile)
+            solve, applied = _compile_phase(apply, z.factor, value)
+            chain = max(_new_bytes(move), _local_bytes(value) + _new_bytes(solve))
+        else:
+            raise ValueError(f"unknown grouped zeta factor {z.solver_kind!r}")
+        peak = max(peak, held + read_peak, held + _local_bytes(tile) + chain)
+        programs.append((move, solve))
+        formed.append(applied)
+        held += _local_bytes(applied)
+    step, _ = _compile_phase(step, tuple(formed), v, ngk, sl, jnp.int32(0), *carries)
+    tails, tail_peak = _tail_plan(zetas, V_shape, S_shape, q_owned=False)
+    peak = max(peak, held + _new_bytes(step), tail_peak, _new_bytes(zeros) - _local_bytes(carries))
+    _admit_finalize(mesh, carries, peak,
+                    f"zeta grouped face finalize ({len(zetas)} channels, {len(pairs)} V tiles)")
+    V, S = zeros()
     for t in range(st0.n_Gt):
-        zt = tuple(apply(z.factor, to_face(z.store.read_tile(t))) for z, (to_face, apply) in zip(zetas, forms))
+        zt = []
+        for z, (move, solve) in zip(zetas, programs):
+            Z = z.store.read_tile(t)
+            zt.append(move(solve(z.factor, Z, qngk, jnp.int32(t))) if z.solver_kind == 'lu'
+                      else solve(z.factor, move(Z)))
+            del Z
+        zt = tuple(zt)
         V, S = step(zt, v, ngk, sl, jnp.int32(t), V, S)
         del zt
-    out = [z0.mu_basis.unpack_operator(Vp) if z0.mu_basis is not None else Vp for Vp in V]
-    for z, Sa in zip(zetas, S):
-        z.shell = z0.mu_basis.unpack_axis(Sa, 1) if z0.mu_basis is not None else Sa
+    out = [ex(Vp) if ex is not None else Vp for ex, Vp in zip(tails, V)]
+    for z, ex, Sa in zip(zetas, tails[len(V):], S):
+        z.shell = ex(Sa) if ex is not None else Sa
         z.shell_slots = keep
     receipt = (f"  μ-batch V_q group: {len(zetas)} ζ, {len(pairs)} tiles, {st0.n_Gt} G tiles, "
                f"on the face, {time.perf_counter() - t0:.2f}s; no ζ file")
@@ -1316,8 +1423,8 @@ def _contract_v_group_face(zetas, pairs, v_tables, keep, t0):
 
 def _face_pair_kernel(mesh, g_tile, pairs, n_z):
     """One G tile of several face ζ's: ``V^{ab} += conj(ζ^a) v^{ab} ζ^bᵀ`` per pair at
-    ``P(None,'x','y')`` and each ζ's shell at ``P(None,('x','y'),None)`` (the face twin of
-    :func:`_pair_tile_kernel`, the same equations as :func:`_face_kernels`' accumulation)."""
+    ``P(None,'x','y')`` and each ζ's shell at ``P(None,('x','y'),None)``,
+    the same equations as :func:`_face_kernels`' accumulation."""
     key = ('face_pair', _mesh_id(mesh), int(g_tile), pairs, int(n_z))
     fn = _kernel_cache.get(key)
     if fn is not None:
@@ -1341,26 +1448,9 @@ def _face_pair_kernel(mesh, g_tile, pairs, n_z):
     return fn
 
 
-def _face_former(mesh, st, ngk_per_q):
-    """``contract_v_group``'s ζ former for the charge channel's face factor, in the q-owner
-    kernel's call shape: ζ formed on the face and handed to the pair kernel at ``P(('x','y'), None, None)``."""
-    to_face, apply, acc = _face_kernels(mesh, st.Q, st.g_tile, False)
-    owner = jax.jit(lambda z: jnp.pad(z, ((0, st.Q_pad - st.Q), (0, 0), (0, 0))),
-                    out_shardings=NamedSharding(mesh, _ACC_SPEC))
-    ngk, sl = jnp.asarray(np.asarray(ngk_per_q, np.int32)), jnp.zeros((st.Q, 1), jnp.int32)
-
-    def form(F, Z, v, ngk_dev, sl_dev, t, V, M, S):
-        _, _, zt = acc(apply(F, to_face(Z)), None, ngk, sl, t, None,
-                       jnp.zeros((st.Q, int(st.mu_pad), 1), jnp.complex128,
-                                 device=NamedSharding(mesh, P(None, _XY, None))))
-        return V, M, S, owner(zt)
-    return form
-
-
-def _zero_accumulators(mesh, Q_pad, mu, n_sh, *, debug_m, with_v=True):
-    sh = NamedSharding(mesh, _ACC_SPEC)
+def _accumulator_shapes(mesh, Q_pad, mu, n_sh, *, debug_m, with_v=True):
     vs, ss = (Q_pad, mu, mu), (Q_pad, mu, n_sh)
-    z = lambda shape: jnp.zeros(shape, jnp.complex128, device=sh)
+    z = lambda shape: _shape(mesh, _ACC_SPEC, shape)
     stub = lambda shape: z(shape[:1] + (1,) * (len(shape) - 1))
     if not with_v:                   # ζ only: no V, M or shell is formed
         return stub(vs), stub(vs), stub(ss)

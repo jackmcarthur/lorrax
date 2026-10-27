@@ -66,7 +66,12 @@ class PPMBuildResult:
     q_wedge: object = None
 
 
-def _residue_for_space(space: str, B_q, B_odd_q=None):
+@lru_cache(maxsize=2)
+def _residue_program(space):
+    return jax.jit(lambda b, d: b + d if space == "cond" else b - d)
+
+
+def _residue_for_space(space: str, B_q, B_odd_q=None, *, mesh_xy):
     """The pole residue one Σ branch evolves: ``R_+`` (cond) or ``R_-`` (val).
 
     ``Σ_c(E) = Σ_occ ψψ†⊙R_-/(E−ε+Ω) + Σ_emp ψψ†⊙R_+/(E−ε−Ω)`` — the
@@ -83,7 +88,9 @@ def _residue_for_space(space: str, B_q, B_odd_q=None):
             f"_residue_for_space: space must be 'cond' or 'val'; got {space!r}")
     if B_odd_q is None:
         return B_q
-    return B_q + B_odd_q if space == "cond" else B_q - B_odd_q
+    from .ppm_accumulators import _run_priced
+    return _run_priced(_residue_program(space), B_q, B_odd_q, mesh=mesh_xy,
+                       label="Sigma branch residue")
 
 
 @lru_cache(maxsize=16)
@@ -1521,10 +1528,11 @@ def compute_sigma_c_ppm_omega_grid(
     valid_mask = ppm.valid_mask_q
     if valid_mask is None:
         valid_mask = jnp.ones(ppm.Omega_q.shape, dtype=bool)
+    from .ppm_accumulators import _run_priced
     with timing.section("sigma.state"):
-        state = _sigma_state_program(bool(consume_ppm))(
+        state = _run_priced(_sigma_state_program(bool(consume_ppm)),
             enk_full, occ_full, ppm.B_q, ppm.Omega_q, valid_mask,
-            jnp.asarray(keep_invalid, dtype=bool))
+            jnp.asarray(keep_invalid, dtype=bool), mesh=mesh_xy, label="Sigma state")
 
     regularization_width_ry = (
         float(sigma_cfg.regularization_ev) / RYD_TO_EV)
@@ -1598,8 +1606,9 @@ def compute_sigma_c_ppm_omega_grid(
         for field in (ppm.Omega_q, ppm.valid_mask_q):
             if field is not None and not field.is_deleted():
                 field.delete()
-    Omega_p, B_p, B_odd_p = _ppm_store_fields_program(bool(consume_ppm))(
-        state.Omega_abs, state.B_corr, state.B_mask, ppm.B_odd_q)
+    Omega_p, B_p, B_odd_p = _run_priced(_ppm_store_fields_program(bool(consume_ppm)),
+        state.Omega_abs, state.B_corr, state.B_mask, ppm.B_odd_q,
+        mesh=mesh_xy, label="Sigma pole fields")
     if consume_ppm:
         jax.block_until_ready((Omega_p, B_p, B_odd_p))
         for field in (ppm.B_q, ppm.B_odd_q, state.B_corr, state.Omega_abs,

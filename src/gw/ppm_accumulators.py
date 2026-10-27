@@ -124,6 +124,29 @@ def _zeros_program(sharding, shapes):
                    out_shardings=(sharding,) * len(shapes))
 
 
+def _run_priced(program, *args, mesh, label):
+    """Admit an eager Sigma program beside its live operands, then run that executable."""
+    from dataclasses import replace
+    from common.gpu_utils import device_budget_bytes
+    from gw.tangential_execution import compiled_for
+    from lxkit import memory
+    from runtime.aot_memory import compiled_price
+
+    device_budget_bytes()
+    executable = compiled_for(program, args)
+    price = compiled_price(compiled=executable, ranks=mesh.size, face=True, source=label)
+    memory.admit(label, price, memory.room(bucketed=False))
+    memory.book(replace(price, increment=True))
+    # The next eager phase must see these outputs in its actual resident floor.
+    return jax.block_until_ready(executable(*args))
+
+
+def _allocate_totals(sharding, shapes):
+    """Admit the exact output program beside current residents before allocating it."""
+    return _run_priced(_zeros_program(sharding, shapes), mesh=sharding.mesh,
+                       label="Sigma accumulator outputs")
+
+
 @lru_cache(maxsize=None)
 def _window_counter_program(replicated):
     """The first window's counter, made on device (a compiled constant, no transfer)."""
@@ -369,7 +392,7 @@ class DeviceOmegaAccumulator:
                 f"diagonals {request.n_slot}; got {shapes}")
         # Each rank stores every slot and parent-k point for its assigned
         # block of the two band axes.
-        totals = _zeros_program(sharding, shapes)()
+        totals = _allocate_totals(sharding, shapes)
         self._total = (totals[:len(shape[0])], totals[len(shape[0]):])
 
     @classmethod
@@ -403,7 +426,7 @@ class DeviceOmegaAccumulator:
                     "n_omega")
         # Each rank stores every output frequency and parent-k point for its
         # assigned block of the two band axes.
-        totals = _zeros_program(sharding, shapes)()
+        totals = _allocate_totals(sharding, shapes)
         n_matrix = 1 if reduce is None else len(shape[0])
         self._total = (totals[0] if reduce is None else
                        (totals[:n_matrix], totals[n_matrix:]))

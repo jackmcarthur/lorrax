@@ -125,13 +125,15 @@ Steps 1–3 run per chunk of parents, two collectives per chunk. Every FFT runs 
 `isdf.zeta_mubatch.ZetaG.contract_v`
 {: .in-code }
 
-Each row of $Z_\bq(\mu,\bG)$ is written once to the Z store, $16\,Q\,N_\mu N_\bG/P$ bytes per rank, which never lives on the device: pageable host memory when it fits 0.8 of the node's available memory over its processes, otherwise a SlabIO scratch file beside the ζ file. Then every $\bG$ tile is read once, tile $t+1$ while tile $t$ is contracted, and for the charge channel:
+Each row of $Z_\bq(\mu,\bG)$ is written once to the Z store, $16\,Q\,N_\mu N_\bG/P$ bytes per rank, plus carrier padding. It occupies pageable host memory when all simultaneous stores fit 0.8 of the node's available memory over its processes, otherwise a SlabIO scratch file beside the ζ file. This host share is checked again after loading and compilation, immediately before allocating the stores. Then every $\bG$ tile is read once, tile $t+1$ while tile $t$ is contracted, and for the charge channel:
 
 $$
 \zeta_\bq(\mu,\bG_t) = B_\bq\big(B_\bq^\dagger Z_\bq(\mu,\bG_t)\big), \qquad V_\bq(\mu,\nu)\mathrel{+}=\sum_{\bG\in t}\zeta^*_{\bq\mu}(\bG)\,v(\bq+\bG)\,\zeta_{\bq\nu}(\bG) \tag{3.2}
 $$
 
 with $B_\bq B_\bq^\dagger = C_\bq^{+}$ the rank-truncated factor of [ISDF §2.4](isdf.md#isdf-rcond), held as a face. The tile moves to the face, both products are distributed GEMMs, and $V_\bq$ accumulates in its final face layout, so no rank holds a whole $(\mu,\nu)$ matrix. ζ is written to `zeta_q.h5` in the same pass only when a consumer reads the file. The current channels instead keep a pivoted LU per $\bq$ on the $\bq$ owners.
+
+Grouped current-channel Coulomb products also accumulate on centroid faces. A q-owner LU solves only its rectangular ζ tile before that tile moves to the face contraction; a group can contain both LU and inverse factors. Thus the six current-current outputs keep their $1/P$ face storage even when $Q<P$. The LU factors themselves still have a $16\lceil Q/P\rceil N_\mu^2$-byte floor per channel.
 
 ### <span class="n">3.4</span> Memory and cost {: #par-zeta-cost }
 
@@ -146,12 +148,14 @@ The planner prints its choices as `ISDF μ-batch plan` in `gwjax.out`. Per rank,
 | $C_\bq^{+}$ factor | $16\,Q N_\mu^2/P$ | whole fit, on device |
 | one batch | the largest of its three stages (projector exchange; unfold cylinder; plane groups) | per batch |
 | Z store | $16\,Q N_\mu N_\bG/P$ | host or disk |
-| finalize tile | $\le 6\cdot16\,\lceil Q/P\rceil N_\mu G_{\mathrm{tile}}$, kept below a quarter of the budget | per tile |
+| finalize tile proposal | $6\cdot16\,\lceil Q/P\rceil N_\mu G_{\mathrm{tile}}$, targeted below a quarter of the budget; the complete compiled pass is admitted separately | per tile |
 | projector GEMMs | $2\,n_pn_s^2N_\mu n_bN_{G\psi}/P$ MACs | summed over batches |
 | projector all-to-all | $2\cdot16\,n_pn_s^2N_\mu N_{G\psi}/P$ bytes | summed over batches |
 | owner FFTs and k-convolutions | $O\big(N_\mu N_kn_s^2N_r(\log N_r+\log N_k)/P\big)$ | summed over batches |
 
 The batch takes every byte left after the resident terms; the parent chunk and the plane-group width take the fixed tile. No input key sizes the fit. When even the smallest batch (one orbit per owner, one plane per group) does not fit, the fit warns `memory over budget at zeta mu-batch` and runs that configuration; $\psi(\bG)$ is not streamed.
+
+The final Coulomb pass admits its compiled read, solve and contraction chain before allocating its outputs, including all pair outputs in a grouped current-channel pass. This is a device planning check with the same warn-and-run policy. It does not guarantee that the node's total host memory fits: compiler and vendor-library heaps are separate from the device-array price.
 
 ## <span class="n">4</span> Time nodes one at a time {: #par-time }
 
@@ -268,6 +272,8 @@ The default $T_{\mathrm{ord}}$ is 16 MiB. The minimum over processes is used, so
 {: .in-code }
 
 A loop that streams over $\bk$, $\bq$, bands, centroids, samples or rows takes the most units whose bytes per rank fit 1 GiB. The count comes from the loop's shapes alone, never from free memory or the budget, so every rank compiles the same loop and results do not depend on the memory a run was given. Some planners still size from the budget: the ζ batch and $\bG$ tile, the response sample group and the tangential synthesis panels.
+
+The centroid loader's FFT scan additionally caps that tile by the agreed current room beside its new persistent fields. At least one FFT row runs with a warning if even that floor does not fit. Retained Σ outputs are admitted before allocation: row panels cannot shrink the complete corrected-band matrices, the diagnostic frequency extent, or the complete QP projector. Increasing the summed-band count and increasing the corrected-band window have different memory costs.
 
 A price above the budget never refuses: the stage prints one `memory over budget at <stage>` warning, runs at its smallest size, and fails only if the device truly lacks the room. A compiled module larger than the whole card refuses before it runs (`GATE xla_rematerialization`).
 

@@ -215,7 +215,7 @@ def _fit_mubatch(
     # The planner floors the bins at the widest orbit; the owner streams its
     # rows through the planes at the planned width (or warns and runs).
     from gw.gflat_memory_model import (log_mubatch_plan, route_g_plane_chunk,
-                                       zstore_layout)
+                                       zstore_layout, _ZSTORE_HOST_FRAC)
     plane_from_col = np.asarray(jax.device_get(cyl[2]))
     canon = np.asarray(k_unfold_plan.layout.axis.packed_to_canonical)
     x_cent = np.asarray(centroid_indices, dtype=np.float64) / np.asarray(fft_grid)
@@ -319,12 +319,15 @@ def _fit_mubatch(
         # Debug split timers: the same kernel truncated after each stage.
         for stage in ('source', 'planes', 'kconv'):
             split_kernels[stage] = zmb.make_route_g_kernel(**kern_args, stop_at=stage)
+    # Compilation and WFN loading may have consumed the proposal's host headroom.
+    from common.gpu_utils import host_bytes_per_process
+    host_budget = min(plan.host_budget_bytes, host_bytes_per_process(_ZSTORE_HOST_FRAC))
     store_bytes, placement = zstore_layout(
         Q, int(mb.n_batch) * b, int(g_axis.carrier), n_vertex=len(vertices),
-        n_ranks=P_, host_budget_bytes=plan.host_budget_bytes)
+        n_ranks=P_, host_budget_bytes=host_budget)
     resolved_plan = replace(
         plan, b=b, n_batch=int(mb.n_batch), c_out=int(c_out), n_blk=int(n_blk),
-        store_bytes=store_bytes, placement=placement)
+        store_bytes=store_bytes, placement=placement, host_budget_bytes=host_budget)
     # Preserve the proposal object; only storage/report metadata is resolved here.
     log_mubatch_plan(
         resolved_plan, summary=True,

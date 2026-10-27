@@ -264,13 +264,23 @@ that retry is admitted; sequential primary and retry scratch use their maximum.
 The platform outside allowance and native allocation counters are separate from
 the executable quote. Neither quote nor allowance is a general capacity proof.
 
-`ZetaG.contract_v` records its actual compiled G-tile step or face chain,
-including the prefetched and written tiles, beside already-live factors and
-carries. The grouped live-V path (`contract_v_group`, including its face
-variant) still uses the μ-batch proposal without a complete compiled
-group-pass admission. Its individual factors and GEMMs can have compiled
-prices; those do not price their combined live set or admit the initial V/S
-allocations. The grouped estimate is not a complete capacity certificate.
+`ZetaG.contract_v` and `contract_v_group` admit their compiled finalization
+chains before allocating the V and shell carries. The price includes all
+simultaneously retained channels and pair outputs, the allocated store slots
+before packing, transport and packing temporaries, the operator chain and
+terminal layout conversions. The single-channel pass also retains its
+prefetch and asynchronous writer overlap. These are prices at the current
+store geometry; admission does not retile an already-written store. An
+over-budget minimum therefore warns and runs under the shared policy.
+
+Grouped Coulomb accumulators always use the existing centroid faces,
+including when a channel's LU factor is held on q owners. Such a channel
+solves its rectangular ζ tile on the q owner and moves only that tile to
+the shared face contraction. A family can mix LU and inverse factors.
+The six TT outputs therefore occupy `6·16·Q·μ²/P` bytes per rank rather
+than six whole q-owner matrices. The LU factors still occupy
+`16·ceil(Q/P)·μ²` per channel and retain their `Q < P` floor; a compiled
+output price does not remove that factor floor.
 
 Wide ROCm local LU/triangular applications use the blocked native handler when
 one logical matrix's A or RHS span exceeds 2³¹ bytes. Its shape query and
@@ -518,6 +528,13 @@ rows. The terminal tile is trimmed after its face reshard and before its
 donated insertion, so no final padded-output crop overlaps two complete
 face pairs. Transfer faces and the local full-grid FFT scan remain separate
 workspaces; the fixed tile is a workspace target, not a total-process cap.
+The generic sampler also caps its FFT row count by the exact minimum
+current room beside the new persistent fields, while retaining a minimum
+of one row with the existing warning. This analytical FFT-row guard is not
+a complete compiled price for every loader operation. The raw-parent
+loader separately admits its actual allocation, transform, insert and
+terminal conversion programs before execution, and re-admits them for
+each load even when their geometry executables are reused.
 
 Centroid padding stays in the sampler's band-all-ranks layout before the
 two independent face reshards. One padded transfer tile feeds both chains;
@@ -631,8 +648,19 @@ Green faces directly; its compiled consumer includes any right
 conjugation/layout workspace, without retaining a separately prepared
 whole-wavefunction copy beside every convolution. The two axis banks occupy
 `32·n_par·n_s·N_b·μ/sqrt(P)` bytes beside the original ψ owners. FACE retains
-no additional full Green banks. Σ additionally places its small QP projector on
-axis carriers, `16·n_par·n_s·N_bΣ·(μ/P_x + μ/P_y)`.
+no additional full Green banks. Σ additionally places its QP projector on
+axis carriers, `16·n_par·n_s·N_bΣ·(μ/P_x + μ/P_y)`. This is a retained floor,
+including on FACE, and scales as `1/sqrt(P)` on a square mesh. A large number
+of summed bands and a large corrected-band window are different capacity
+requests; row streaming cannot reduce this complete QP projector.
+
+The on-shell and frequency-grid accumulators admit their actual compiled
+allocation programs before creating the retained outputs. Each subsequent
+accumulator sees the preceding outputs in current device room. The on-shell
+matrix floor is two complex matrices per retained count, proportional to
+`32·n_par·N_bΣ_pad²/P`, plus its retained diagonals; the diagnostic frequency
+grid instead retains its full frequency extent. More time nodes or smaller
+centroid panels do not reduce these output floors.
 
 Admission uses the largest compiled new-byte figure over ranks: the maximum
 of placement's new bytes and its retained outputs plus the consumer's new
@@ -853,8 +881,13 @@ the rows per chunk then fill the budget. No timing model picks a shape. The Z st
 it fits 0.8 of the node's `MemAvailable` over the processes on the node
 (minimum over processes; `MemAvailable` and `MemTotal` are capped by the job's
 memory cgroup, its limit less its usage net of reclaimable page cache,
-`common.gpu_utils._meminfo_gb`); otherwise it is a slab_io scratch dataset. The
-finalize streams it in G tiles sized to a quarter of the budget.
+`common.gpu_utils._meminfo_gb`); otherwise it is a slab_io scratch dataset.
+The allocation boundary refreshes this host share after WFN loading and
+batch compilation, and uses the smaller of the proposal's share and the
+fresh share. The exact store size includes batch-slot and G-tile padding
+and every simultaneous channel. The finalize's G-tile proposal uses a
+quarter of the device budget; the complete compiled pass is admitted
+separately against current room.
 
 - **Over the budget**: when the smallest configuration (ψ(G) resident,
   `b = P`, one plane per group) exceeds the budget, it runs with one warning
@@ -1090,8 +1123,11 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
    MEMORY: each stage's device peak (max and min over ranks), the planner's
    price and `γ = peak / price`, or "no planner", the host columns, and the
    section that set the device peak. `γ > 1` is an under-estimate to
-   investigate. No planner prices host memory: the `rise` column names the
-   stage that grew the process.
+   investigate. Device prices do not bound total host RSS: the `rise` column
+   names the stage that grew the process. Host/disk placement checks use
+   live cgroup-aware available RAM, but do not reserve it against later
+   compiler heaps, vendor-library growth or unrelated allocations. CPU live
+   JAX buffers likewise do not include all NumPy, Python and compiler memory.
 
 ## The per-stage receipt
 

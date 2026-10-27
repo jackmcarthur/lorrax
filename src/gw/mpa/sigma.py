@@ -28,7 +28,7 @@ from file_io.restart_bundle import (
     validate_fit_store,
 )
 from gw.efermi import occupation_floor_reach_ry
-from gw.ppm_accumulators import DeviceOmegaAccumulator
+from gw.ppm_accumulators import DeviceOmegaAccumulator, _run_priced
 from gw.ppm_sigma import (
     BandCountCube, SigmaOmegaResult, _residue_for_space, sigma_band_axis)
 from gw.ppm_tau_kernel import (_get_sigma_kij_kernel,
@@ -1784,7 +1784,7 @@ def _integrate_sigma_batches(
                     pole_indices, bounds, phase_real = (
                         device_put_process_local(x, small)
                         for x in (pole_indices, bounds, phase_real))
-                    B_branch = _residue_for_space(row.space, B, B_odd)
+                    B_branch = _residue_for_space(row.space, B, B_odd, mesh_xy=mesh_xy)
                     if q_wedge is not None:
                         B_branch = dataclasses.replace(q_pair, values=B_branch)
 
@@ -1933,7 +1933,9 @@ def _integrate_sigma_batches(
             full = _wedge_is_full_bz(sym)
             sigma = BandCountCube(
                 matrices=list(matrices), slot_diagonals=list(diagonals),
-                unfold=(lambda value: value) if full else _on_shell_unfold_fn(sym, output_sharding),
+                unfold=((lambda value: value) if full else partial(
+                    _run_priced, _on_shell_unfold_fn(sym, output_sharding), mesh=mesh_xy,
+                    label="Sigma on-shell output unfold")),
                 unfold_rows=((lambda slots: slots) if full else
                              _band_count_rows_fn(sym, mesh_xy)),
                 nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy, request=request,
@@ -2034,7 +2036,8 @@ def _grid_finalize(sigma, sym, bracketed, output_sharding, mesh_xy):
     return BandCountCube(
         matrices=list(matrices), slot_diagonals=[], diagonals=list(diagonals),
         unfold=((lambda value: value) if full else
-                _unfold_sigma_cube_fn(sym, 1, output_sharding)),
+                partial(_run_priced, _unfold_sigma_cube_fn(sym, 1, output_sharding),
+                        mesh=mesh_xy, label="Sigma grid output unfold")),
         unfold_rows=((lambda slots: slots) if full else
                      _band_count_rows_fn(sym, mesh_xy)),
         nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy, request=None)
@@ -2049,7 +2052,8 @@ def _unfold_sigma_cube(sigma, sym, *, k_axis, sharding):
     every rank (CrI3 16x16, 3 x 65 x 256 x 184^2 c128 = 27 GB/rank plus a
     57 GB temp at P64 -- the map-0 OOM).
     """
-    return _unfold_sigma_cube_fn(sym, int(k_axis), sharding)(sigma)
+    return _run_priced(_unfold_sigma_cube_fn(sym, int(k_axis), sharding), sigma,
+                       mesh=sharding.mesh, label="Sigma grid output unfold")
 
 
 # The two finalize executables are built once per (symmetry table, layout),
@@ -2252,7 +2256,7 @@ class MemoryPoleSource:
         def field(a):
             if a is None:
                 return None
-            out = keep(a)
+            out = _run_priced(keep, a, mesh=mesh_xy, label="Sigma logical pole mask")
             if consume:
                 out.block_until_ready()
                 if not a.is_deleted():

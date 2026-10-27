@@ -110,15 +110,11 @@ def test_grouped_cross_grams_and_shells_allocate_only_output_v(monkeypatch, side
             factor = jax.device_put(np.stack([np.diag(1 / row) for row in diagonal[ic]]),
                                    NamedSharding(mesh, P(None, 'x', 'y')))
             piv = None
-        source = np.pad(raw[ic], ((0, qpad-q), (0, 0), (0, 0)))
-
-        def read_tile(t, source=source):
-            return jax.device_put(source[:, :, t*g_tile:(t+1)*g_tile],
-                                 NamedSharding(mesh, P(('x', 'y'), None, None)))
-
-        store = SimpleNamespace(Q=q, Q_pad=qpad, mu_pad=mu, g_tile=g_tile,
-            n_Gt=2, q_axis=padded_axis(q, world, name='q'),
-            g_axis=padded_axis(ng, g_tile, name='G'), read_tile=read_tile, t_read=0.)
+        store = zm.ZStore(mesh=mesh, mu_pad=mu, b=mu, n_batch=1,
+            q_axis=padded_axis(q, world, name='q'),
+            g_axis=padded_axis(ng, g_tile, name='G'), placement='host')
+        store.write_batch(0, jax.device_put(raw[ic],
+            NamedSharding(mesh, P(None, ('x', 'y'), None))))
         zetas.append(zm.ZetaG(store, mesh=mesh, L_q=factor, lu_piv=piv,
             solver_kind=solver, batched_route='auto', n_rmu_solve=logical,
             n_rmu=logical, mu_basis=None, ngk_per_q=ngk,
@@ -128,8 +124,8 @@ def test_grouped_cross_grams_and_shells_allocate_only_output_v(monkeypatch, side
     monkeypatch.setattr(zm, 'pad_to_axis', pad)
     result = zm.contract_v_group(zetas, pairs, weights, keep=keep)
     jax.block_until_ready((result, [z.shell for z in zetas]))
-    assert len(allocations) == (6 if solver == 'lu' else 0)
-    assert len(padded_weights) == (6 if solver == 'lu' else 0)
+    assert not allocations  # LU factors no longer force six whole-q V accumulators.
+    assert not padded_weights
     for i, (a, b) in enumerate(pairs):
         expected = np.einsum('qmg,qg,qng->qmn', expected_zeta[a, :, :, :ng].conj(),
                              weights[i], expected_zeta[b, :, :, :ng])

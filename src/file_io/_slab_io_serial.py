@@ -222,6 +222,11 @@ class _SerialBackend(_DatasetGeometry):
     #: journal lines with this.  Read the note beside ``_FfiBackend.
     #: journal_stack`` for why the entry point does not name a library of its own.
     journal_stack = STACK_H5PY
+    retained_previous_write_inputs = 0
+
+    def write_device_scratch(self, _name, _value):
+        """Synchronous host writes retain no device input or native device work."""
+        return 0
 
     def __init__(self, path: str, mesh: Mesh, *, mode: str) -> None:
         # No default, for the reason given at ``_FfiBackend.__init__``: a

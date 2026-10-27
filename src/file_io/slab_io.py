@@ -465,6 +465,19 @@ class SlabIO:
                 require_finite=require_finite,
             )
 
+    @property
+    def retained_previous_write_inputs(self) -> int:
+        """Maximum queued/processing device operands; the producer is separate."""
+        return self._backend.retained_previous_write_inputs
+
+    def write_device_scratch(self, name, value) -> int:
+        """Quote an already file-row-owned write without dispatch or payload I/O.
+
+        The caller separately prices the lane's retained inputs. Host staging
+        is outside this device-only figure; unsupported resharding refuses.
+        """
+        return self._backend.write_device_scratch(name, value)
+
     # ------------------------------------------------------------------
     @timed("read_slab_sync")
     def read_slab(
