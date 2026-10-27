@@ -80,7 +80,7 @@ CUDA runs each kernel as one fused nvidia-mathdx pass; ROCm runs the same modes 
 `gw.subtile_stream.plan_windows`
 {: .in-code }
 
-Σ and the χ⁰ bank are linear in the left index $\mu$, so a rank's $(\mu_x,\nu_y)$ tile is processed in row passes: windows of $R$ local rows, each ending on a whole symmetry orbit of centroids so that the unfold stays local. $R$ is the most rows whose working set fits the fixed tile of §[6.2](#par-mem-tile). The passes run as one `lax.scan` over a table of windows, so the compiled program does not grow with the pass count. A short terminal window retains the compiled carrier width and masks its inactive rows. A fitting axis layout uses band-complete ψ for local Green GEMMs; the face layout streams bounded SUMMA panels instead.
+Σ and the χ⁰ bank are linear in the left index $\mu$, so a rank's $(\mu_x,\nu_y)$ tile is processed in row passes: windows of $R$ local rows, each ending on a whole symmetry orbit of centroids so that the unfold stays local. $R$ is the most rows whose working set fits the fixed tile of §[6.2](#par-mem-tile). The passes run as one `lax.scan` over a table of windows, so the compiled scan body does not grow with the pass count; the window metadata table still grows. A short terminal window retains the compiled carrier width and masks its inactive rows. A fitting axis layout uses band-complete ψ for local Green GEMMs; the face layout streams bounded SUMMA panels instead.
 
 ## <span class="n">3</span> The ζ fit in G space {: #par-zeta }
 
