@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-26 — Rebuild native libraries for visible ROCm workspace
+
+Rebuild and seal the whole native pair: the required contract is ABI 14.
+The ROCm blocked LU/triangular solves and local Fourier-plan handlers now
+return their queried workspace as an explicit byte-buffer result. This makes
+vendor scratch, LU pivots and Fourier intermediate banks part of the actual
+compiled program's memory price. Older handlers have a different result list
+and refuse at load. CUDA and CPU numerical routes, input decks and mathematical
+conventions are unchanged; their libraries must still carry the matching ABI.
+
 ## 2026-10-25 — Remove unused dense-host VQ diagnostics
 
 The importable `bse.vq_interp.build_hdir` and `exciton_evs` diagnostics have

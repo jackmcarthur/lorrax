@@ -129,6 +129,16 @@
 //                ABI-12 library can lack this refusal even with a valid
 //                dependency closure; require the rebuilt native contract.
 //
+//   ABI 13 -> 14 (2026-10-26, visible ROCm native workspaces).
+//                RocsolverLuSolveFfi and RocsolverTriSolveFfi gain a u8
+//                workspace result sized by the shared native query; mode0
+//                includes its pivot buffer. The handlers no longer allocate
+//                opaque FFI scratch, so the actual compiled program prices
+//                all workspace. lorrax_fourier_plan_rocm likewise gains a u8
+//                arena result and a shape-query export, making XLA own and
+//                price its intermediate banks and vendor workspace. ABI13
+//                providers lack these required results.
+//
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
@@ -157,4 +167,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 13
+#define LORRAX_FFI_ABI_VERSION 14
