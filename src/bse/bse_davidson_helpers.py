@@ -126,25 +126,25 @@ def init_bse_subspace(
     from common.gpu_utils import device_budget_bytes
     from runtime.aot_memory import compiled_price
     key = jnp.int64(seed)
-    executable = _bse_seed_program.lower(ec, ev, key, mesh=mesh,
+    executable = _bse_seed_program.lower(ec, ev, key, sharding=sharding,
         nc_log=nc_log, nv_log=nv_log, n_eig=n_eig, n_random=n_random, dtype=dtype).compile()
     stage = 'BSE initial subspace'
     price = compiled_price(compiled=executable, ranks=int(mesh.size), face=True, source=stage)
     device_budget_bytes()
     memory.book(price, stage=stage)
     memory.admit(stage, price, memory.room(bucketed=False))
-    rows = executable(ec, ev, key)
-    return jax.device_put(rows, sharding)
+    return executable(ec, ev, key)
 
 
-@partial(jax.jit, static_argnames=('mesh', 'nc_log', 'nv_log', 'n_eig', 'n_random', 'dtype'))
-def _bse_seed_program(ec, ev, seed, *, mesh, nc_log, nv_log, n_eig, n_random, dtype):
+@partial(jax.jit, static_argnames=('sharding', 'nc_log', 'nv_log', 'n_eig', 'n_random', 'dtype'))
+def _bse_seed_program(ec, ev, seed, *, sharding, nc_log, nv_log, n_eig, n_random, dtype):
     """Lowest-transition unit rows and physical Gaussians on band faces.
 
     Only score/index candidates, at most ``P * n_pick`` entries, are gathered.
     The whole seed and the transition energy field remain distributed.
     """
     n_pick = n_eig - n_random
+    mesh = sharding.mesh
     sh = NamedSharding(mesh, P(None, 'x', 'y', None))
 
     @partial(jax.shard_map, mesh=mesh, in_specs=(P(None, 'x'), P(None, 'y')),
@@ -191,7 +191,7 @@ def _bse_seed_program(ec, ev, seed, *, mesh, nc_log, nv_log, n_eig, n_random, dt
         norms = jnp.sqrt(jnp.sum(jnp.abs(random)**2, axis=(1, 2, 3), keepdims=True))
         random /= jnp.maximum(norms, 1e-30)
         starts = jnp.concatenate((starts, random.astype(dtype)), axis=0)
-    return jax.lax.with_sharding_constraint(starts, sh)
+    return jax.lax.with_sharding_constraint(starts, sharding)
 
 
 # ═══════════════════════════════════════════════════════════════════════

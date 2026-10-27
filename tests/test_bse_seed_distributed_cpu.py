@@ -79,6 +79,13 @@ def test_selected_transitions_random_support_and_grid_invariance(monkeypatch):
     expected = np.zeros(rows.shape, np.complex128)
     expected[np.arange(29), c, v, k] = 1
     np.testing.assert_array_equal(rows, expected)
+    # A requested alternate output layout belongs to that same priced program,
+    # rather than an extra unpriced copy after the canonical band-face kernel.
+    alternate = NamedSharding(mesh, P(None, 'y', 'x', None))
+    changed = init_bse_subspace(ec, ev, 29, n_cond=3, n_val=5,
+        n_random=0, mesh=mesh, sharding=alternate)
+    assert changed.sharding.is_equivalent_to(alternate, 4)
+    np.testing.assert_array_equal(changed, expected)
 
 
 @pytest.mark.parametrize('side', (2, 3, 12))
@@ -91,7 +98,8 @@ def test_seed_optimized_hlo_keeps_transition_and_random_fields_owned(side):
     ec = jax.ShapeDtypeStruct((nk, nc), jnp.float64, sharding=sc)
     ev = jax.ShapeDtypeStruct((nk, nv), jnp.float64, sharding=sv)
     exe = _bse_seed_program.lower(ec, ev, jax.ShapeDtypeStruct((), jnp.int64),
-        mesh=mesh, nc_log=nc_log, nv_log=nv_log, n_eig=n_eig,
+        sharding=NamedSharding(mesh, P(None, 'x', 'y', None)),
+        nc_log=nc_log, nv_log=nv_log, n_eig=n_eig,
         n_random=n_random, dtype=jnp.complex128).compile()
     text = exe.as_text()
     local_seed = n_eig*nc*nv*nk//mesh.size
