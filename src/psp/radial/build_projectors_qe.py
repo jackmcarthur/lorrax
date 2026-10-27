@@ -427,12 +427,12 @@ def build_local_ionic_potential_on_G_total(
     inv_omega = 1.0 / float(cell_volume)
 
     # ρ_ion(G) on grid
-    rho_ion_G = np.zeros((nx, ny, nz), dtype=np.complex128)
+    taus, zvals = [], []
     for entry in assignments:
         pseudo = entry.get("pseudo")
-        tau = np.asarray(entry.get("position"), dtype=float).reshape(3)
-        Zval = float(getattr(getattr(pseudo, 'pp_header', None), 'z_valence', 0.0)) if pseudo is not None else 0.0
-        rho_ion_G -= Zval * np.exp(-2j * np.pi * (tau[0] * ix + tau[1] * iy + tau[2] * iz))
+        taus.append(np.asarray(entry.get("position"), dtype=float).reshape(3))
+        zvals.append(float(getattr(getattr(pseudo, 'pp_header', None), 'z_valence', 0.0)) if pseudo is not None else 0.0)
+    rho_ion_G = -_structure_factor(taus, fx, fy, fz, weights=zvals)
 
     # SR from UPF
     Vloc_G_sr = np.zeros((nx, ny, nz), dtype=np.complex128)
@@ -501,12 +501,7 @@ def build_local_ionic_potential_on_G_total(
         except Exception:
             pass
 
-        # Species phases
-        S = np.zeros((nx, ny, nz), dtype=np.complex128)
-        for tau in positions:
-            tau = np.asarray(tau, dtype=float).reshape(3)
-            S += np.exp(-2j * np.pi * (tau[0] * ix + tau[1] * iy + tau[2] * iz))
-        Vloc_G_sr += V_sr_on_grid * S
+        Vloc_G_sr += V_sr_on_grid * _structure_factor(positions, fx, fy, fz)
 
     # LR with Gaussian damping
     e2 = 2.0
@@ -536,6 +531,26 @@ def build_local_ionic_potential_on_G_total(
     # Total to real
     V_tot = Vloc_G_sr + Vloc_G_lr
     return _real_ifftn(V_tot)
+
+
+def _structure_factor(positions, fx, fy, fz, weights=None) -> np.ndarray:
+    """``Σ_a w_a exp(-2πi τ_a·G)`` on the (nx, ny, nz) FFT grid.
+
+    The phase separates per crystal axis, so the sum is a (nx·ny × A)
+    by (A × nz) product of 1-D phase tables, not A full-grid complex
+    exponentials (148 atoms on a 128×128×250 grid: ~40 s of host ``exp``).
+    """
+    nx, ny, nz = len(fx), len(fy), len(fz)
+    tau = np.asarray(positions, dtype=float).reshape(-1, 3)
+    if tau.shape[0] == 0:
+        return np.zeros((nx, ny, nz), dtype=np.complex128)
+    w = (np.ones(tau.shape[0]) if weights is None
+         else np.asarray(weights, dtype=float).reshape(-1))
+    ex = w[:, None] * np.exp(-2j * np.pi * np.outer(tau[:, 0], fx))
+    ey = np.exp(-2j * np.pi * np.outer(tau[:, 1], fy))
+    ez = np.exp(-2j * np.pi * np.outer(tau[:, 2], fz))
+    exy = (ex[:, :, None] * ey[:, None, :]).reshape(tau.shape[0], nx * ny)
+    return (exy.T @ ez).reshape(nx, ny, nz)
 
 
 @jax.jit
