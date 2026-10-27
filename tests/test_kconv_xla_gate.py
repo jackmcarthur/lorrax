@@ -74,7 +74,10 @@ ARM_CASES = (
 def _rel(a, b):
     import numpy as np
     a, b = np.asarray(a), np.asarray(b)
-    return float(np.max(np.abs(a - b)) / max(float(np.max(np.abs(b))), 1e-300))
+    if a.shape != b.shape or not (np.isfinite(a).all() and np.isfinite(b).all()):
+        return float("inf")
+    error, scale = float(np.max(np.abs(a - b))), float(np.max(np.abs(b)))
+    return error / max(scale, 1e-300) if np.isfinite(error) and np.isfinite(scale) else float("inf")
 
 
 def _gather(x):

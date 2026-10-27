@@ -114,8 +114,7 @@ def gate_cases(mesh):
             g = jax.jit(shard_map(lambda a, b: f(a, b, tuple(jnp.asarray(t) for t in tl)), mesh=mesh,
                                   in_specs=(spec, spec), out_specs=P(None, "x", "y"), check_vma=False))
             res.append(g(D_l, D_r))
-        rel = jax.jit(lambda a, b: jnp.max(jnp.abs(a - b)) / jnp.maximum(jnp.max(jnp.abs(b)), 1e-300),
-                      out_shardings=NamedSharding(mesh, P()))(*res)
+        rel = jax.jit(_sharded_rel, out_shardings=NamedSharding(mesh, P()))(*res)
         out[f"mode1 sharded {px}x{py} 4x4x4 ns2 cm1"] = float(rel)
     for kg, ns, gate in (((41, 1, 1), 2, "kdft-axis"), ((10, 10, 10), 4, "kdft-kconv-parent-tile")):
         why = F_.kdft_parent_refusal(kg, ns)
@@ -146,6 +145,15 @@ def gate_cases(mesh):
         why = F_.kdft_plane_fft_refusal(nb, nc, nb)
         out[f"mode10 refusal ({nb},{nc}) -> GATE {gate}"] = 0.0 if f"GATE {gate}" in why else float("inf")
     return out
+
+
+def _sharded_rel(a, b):
+    import jax.numpy as jnp
+    if a.shape != b.shape:
+        return jnp.asarray(jnp.inf)
+    error, scale = jnp.max(jnp.abs(a - b)), jnp.max(jnp.abs(b))
+    finite = jnp.isfinite(a).all() & jnp.isfinite(b).all() & jnp.isfinite(error) & jnp.isfinite(scale)
+    return jnp.where(finite, error / jnp.maximum(scale, 1e-300), jnp.inf)
 
 
 def bench(mesh, parent_shapes, plane_shapes, reps):

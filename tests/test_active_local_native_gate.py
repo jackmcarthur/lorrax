@@ -88,10 +88,11 @@ def _fe_bounds(rng, nq, k):
 
 
 def _rel(x, ref):
-    x = np.asarray(x)
-    if not np.all(np.isfinite(x)):
+    x, ref = np.asarray(x), np.asarray(ref)
+    if x.shape != ref.shape or not (np.isfinite(x).all() and np.isfinite(ref).all()):
         return float("inf")
-    return float(np.abs(x - ref).max() / max(np.abs(ref).max(), 1.0))
+    error, scale = float(np.abs(x - ref).max()), float(np.abs(ref).max())
+    return error / max(scale, 1.0) if np.isfinite(error) and np.isfinite(scale) else float("inf")
 
 
 def raw_cases(platform):
@@ -335,8 +336,7 @@ def main() -> int:
     bad = 0
     raw, inval = raw_cases(platform)
     for tag, d in raw.items():
-        worst = max(v[0] for v in d.values())
-        ok = worst <= TOL and max(v[1] for v in d.values()) <= TOL
+        ok = all(np.isfinite(v) and v <= TOL for pair in d.values() for v in pair)
         bad += not ok
         print(f"r{r} {'ok  ' if ok else 'FAIL'} raw {tag}  " +
               "  ".join(f"{k2} {v[0]:.1e}/{v[1]:.1e}" for k2, v in d.items()), flush=True)
