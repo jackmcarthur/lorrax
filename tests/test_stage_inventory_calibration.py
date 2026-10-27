@@ -1,8 +1,8 @@
-"""gw.stage_inventory against measured GN-PPM stage peaks (CPU, no device; seconds).
+"""gw.stage_inventory against measured GN-PPM and tangential stage peaks (CPU, no device; seconds).
 
 ``tests/data/stage_peaks_measured.json`` holds the allocator high-water of each
-``LORRAX_MEMORY_TRACE`` section, max over ranks, of three one-node P = 4 runs
-(MoS₂/hBN 148 atoms at N_μ 8160 and 16320, Al₂O₃ 4×4×4 at N_μ 6000).  Each
+``LORRAX_MEMORY_TRACE`` section, max over ranks, of four one-node P = 4 runs
+(MoS₂/hBN 148 atoms at N_μ 8160 and 16320; Al₂O₃ 4×4×4 at N_μ 6000, GN-PPM and tangential).  Each
 inventory stage is the trace section named in :data:`SECTION`; every stored
 peak must lie within :data:`BAND` of the inventory's price at the run's route, or within
 :data:`SLACK` of it (stages under a GB).
@@ -25,6 +25,7 @@ SECTION = {
     "Sigma exchange": "sigma.exchange",
     "GN-PPM fit": "gn_ppm.fit",
     "Sigma tau sweep": "sigma.tau_sweep",
+    "Sigma tau sweep (tangential)": "sigma.tau_sweep",
     "Sigma other": "sigma.exec",
     "Sigma Hartree": "sigma.hartree",
 }
