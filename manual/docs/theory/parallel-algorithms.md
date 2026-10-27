@@ -125,7 +125,7 @@ Steps 1–3 run per chunk of parents, two collectives per chunk. Every FFT runs 
 `isdf.zeta_mubatch.ZetaG.contract_v`
 {: .in-code }
 
-Each row of $Z_\bq(\mu,\bG)$ is written once to the Z store, $16\,Q\,N_\mu N_\bG/P$ bytes per rank, plus carrier padding. It occupies pageable host memory when all simultaneous stores fit 0.8 of the node's available memory over its processes, otherwise a SlabIO scratch file beside the ζ file. This host share is checked again after loading and compilation, immediately before allocating the stores. Then every $\bG$ tile is read once, tile $t+1$ while tile $t$ is contracted, and for the charge channel:
+Each row of $Z_\bq(\mu,\bG)$ is written once to the Z store, $16\,Q\,N_\mu N_\bG/P$ bytes per rank, plus carrier padding. It occupies pageable host memory when all simultaneous stores fit 0.8 of the node's available memory over its processes, otherwise a SlabIO scratch file beside the ζ file. This host share is checked again after loading and compilation, immediately before allocating the stores. On CPU it is also capped by current physical room and reduced by the compiled fit workspace and lookahead, since NumPy stores and JAX share RAM. Then every $\bG$ tile is read once, tile $t+1$ while tile $t$ is contracted, and for the charge channel:
 
 $$
 \zeta_\bq(\mu,\bG_t) = B_\bq\big(B_\bq^\dagger Z_\bq(\mu,\bG_t)\big), \qquad V_\bq(\mu,\nu)\mathrel{+}=\sum_{\bG\in t}\zeta^*_{\bq\mu}(\bG)\,v(\bq+\bG)\,\zeta_{\bq\nu}(\bG) \tag{3.2}
@@ -264,7 +264,7 @@ $$
 B = (L-O_{\mathrm{pend}})(1-r)-T_{\mathrm{ord}} \tag{6.1}
 $$
 
-The default $T_{\mathrm{ord}}$ is 16 MiB. The minimum over processes is used, so every rank plans the same shapes. Outside allowances and reserve fractions are planning inputs, not constant physical peaks. A positive [`memory_per_device_gb`](../drivers/gw/keywords.md#memory_per_device_gb) can only lower $B$; a larger value warns and is ignored. The A100-40GB example is $B$ = 31.6 GB (`local`) under its default-model assumptions; the resolved report value takes precedence.
+The default $T_{\mathrm{ord}}$ is 16 MiB. The minimum over processes is used, so every rank plans the same shapes. Outside allowances and reserve fractions are planning inputs, not constant physical peaks. On CPU, current room is capped by fresh cgroup-aware host availability less the existing physical reserve, as well as the live-JAX-array budget. Host Z-store placement reserves the selected fit executable's workspace and lookahead before allocating its NumPy stores, since they share RAM with JAX. These snapshots cannot reserve memory against later growth. A positive [`memory_per_device_gb`](../drivers/gw/keywords.md#memory_per_device_gb) can only lower $B$; a larger value warns and is ignored. The A100-40GB example is $B$ = 31.6 GB (`local`) under its default-model assumptions; the resolved report value takes precedence.
 
 ### <span class="n">6.2</span> The fixed tile {: #par-mem-tile }
 

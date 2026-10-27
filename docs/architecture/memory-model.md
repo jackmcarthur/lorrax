@@ -92,8 +92,15 @@ A positive `memory_per_device_gb` can only lower `B` (above it, one warning and
 the run keeps `B`). On CPU `L` is the node's `MemTotal` over the processes on the
 node and the process's devices. The room beside what is allocated now is
 `memory.room() = B − bytes_in_use` (the allocator's own figure; CPU: live arrays),
-the minimum over processes, floored to a whole GiB.
-On CPU the live count is the per-device union of local storage intervals:
+the minimum over processes, floored to a whole GiB. On CPU, room is also
+capped by fresh cgroup-aware `MemAvailable` per local device and node rank,
+less the platform reserve before the optional user budget cap. A lower user
+budget limits JAX allocations independently. This second cap includes committed
+NumPy stores, compiler heaps and other host allocations that are absent from
+the JAX array count; it does not subtract their bytes twice from the array
+budget. It is a current availability snapshot, not a reservation against
+future allocations or a bound on compilation's transient peak.
+On CPU the live-array count is the per-device union of local storage intervals:
 global/local aliases and overlapping views spend the budget once. Reading
 the count neither synchronizes pending kernels nor retains local arrays.
 
@@ -885,7 +892,12 @@ memory cgroup, its limit less its usage net of reclaimable page cache,
 The allocation boundary refreshes this host share after WFN loading and
 batch compilation, and uses the smaller of the proposal's share and the
 fresh share. The exact store size includes batch-slot and G-tile padding
-and every simultaneous channel. The finalize's G-tile proposal uses a
+and every simultaneous channel. CPU host stores share physical memory with
+JAX: their quota is also capped by current CPU room and reserves the final
+selected fit executable's new bytes, including its batch of lookahead,
+before choosing host or disk. Per-device workspace is converted to a
+per-process cost when one CPU process owns multiple virtual devices.
+The finalize's G-tile proposal uses a
 quarter of the device budget; the complete compiled pass is admitted
 separately against current room.
 
@@ -1127,7 +1139,9 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
    names the stage that grew the process. Host/disk placement checks use
    live cgroup-aware available RAM, but do not reserve it against later
    compiler heaps, vendor-library growth or unrelated allocations. CPU live
-   JAX buffers likewise do not include all NumPy, Python and compiler memory.
+   JAX buffers likewise do not include all NumPy, Python and compiler memory;
+   the CPU room cap uses current host availability to account for their
+   committed physical pressure without adding a second allocation ledger.
 
 ## The per-stage receipt
 
