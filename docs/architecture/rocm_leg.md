@@ -167,6 +167,6 @@ native collective refuses by `GATE subspace_native_collectives`. Gate:
 | Local Fourier plan | `fourier_plan_rocm` (rocBLAS + hipFFT, no fused pair) | `fourier_plan_mathdx` | both built |
 | batched local eigh | `rocsolver_batched_eigh` | jaxlib cuSOLVER | by design |
 | distributed eigh | ELPA above `ONE_DEVICE_MAX_N`, one device below | cuSOLVERMp, or one device within the room | by design |
-| distributed LU | one device within the room, refused beyond it | cuSOLVERMp, or one device within the room | no ROCm LU library |
+| distributed LU | one device within the room, otherwise partial-pivot `native2d` | cuSOLVERMp, or one device within the room; `native2d` also available | shared face-distributed capacity route |
 | active subspace | `devsize` | `blas` | both built |
 | parallel HDF5 | `phdf5` | `phdf5` | one source |

@@ -274,8 +274,14 @@ execution share the same blocked rocSOLVER/rocBLAS call sequence. An explicit
 byte-buffer result holds the queried vendor workspace and, for factor-and-solve,
 the pivot vector. The actual executable's price therefore includes this scratch
 beside its layout copies and outputs; callers do not add a separate estimate.
-This does not change the one-device solve's capacity or provide a distributed
-ROCm LU backend.
+The single-device fast path retains its whole-matrix capacity limit. When
+that path does not fit, the shared `native2d` LU keeps coefficient and RHS
+faces distributed and communicates panels of at most 128 columns/rows.
+Its compiled program prices the factor copies and triangular solves. Input
+consumption does not imply that A aliases an output: only the actual compiler
+alias bytes are subtracted. This route removes the whole-matrix memory floor,
+but pivot reductions still have communication latency; neither a fixed
+four-matrix bound nor an unconditional speedup is promised.
 
 The opt-in ROCm fused outer decode is also outside complete workspace coverage.
 The default measured rule keeps the XLA decode because the fused version was
