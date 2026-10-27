@@ -2096,6 +2096,22 @@ def _w_solve_pref_scalar(meta) -> float:
         * float(nspinor_wfnfile))
 
 
+def dyson_route_prices(n, stack, ranks, contexts):
+    """``(local, distributed)`` :class:`lxkit.memory.Price` of the W Dyson solve of
+    ``stack`` q parents at side ``n`` on ``ranks`` devices (:func:`_dyson_route`'s
+    admission, and ``gw.stage_inventory``'s).  ``contexts``: the providers'
+    contexts the distributed route opens (``lxkit.memory.contexts()``)."""
+    from lxkit import memory
+    n2 = 16.0 * n * n
+    local_price = memory.Price(operands=memory.Term(
+        spread=3 * int(stack) * n2, grid=lambda p: n2 * (3 * -(-int(stack) // p) + 2),
+        source="V, chi, W faces + whole for ceil(stack/P) parents + one LU pair"), ranks=ranks)
+    mesh_price = memory.Price(operands=memory.Term(
+        spread=(3 * int(stack) + 2) * n2, source="V, chi, W faces + one face-tiled LU pair"),
+        outside=contexts, ranks=ranks)
+    return local_price, mesh_price
+
+
 def _dyson_route(dyson, n, stack, mesh_xy):
     """``("local" | "distributed", room)``: the deck's W plan, with the local plan
     admitted only where one rank's whole matrices fit (``lxkit.memory.admit``),
@@ -2120,13 +2136,7 @@ def _dyson_route(dyson, n, stack, mesh_xy):
         return "distributed", room
     if ranks <= 1:
         return "local", None
-    n2 = 16.0 * n * n
-    local_price = memory.Price(operands=memory.Term(
-        spread=3 * int(stack) * n2, grid=lambda p: n2 * (3 * -(-int(stack) // p) + 2),
-        source="V, chi, W faces + whole for ceil(stack/P) parents + one LU pair"), ranks=ranks)
-    mesh_price = memory.Price(operands=memory.Term(
-        spread=(3 * int(stack) + 2) * n2, source="V, chi, W faces + one face-tiled LU pair"),
-        outside=memory.contexts(), ranks=ranks)
+    local_price, mesh_price = dyson_route_prices(n, stack, ranks, memory.contexts())
 
     def probe():
         from ffi import _services

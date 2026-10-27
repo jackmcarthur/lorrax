@@ -215,8 +215,14 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                       psi_ngkmax: int, fit_nb: int, n_col: int, n_s: int,
                       budget_gb: float,
                       psi_face_bytes: float = 0.0, n_vertex: int = 1,
-                      n_parent: int | None = None, orbit_width: int = 1) -> MuBatchPlan:
+                      n_parent: int | None = None, orbit_width: int = 1,
+                      factor_on_face: bool = False) -> MuBatchPlan:
     """Size the route-G μ-batch fit (docs/architecture/zeta_fit_mubatch.md).
+
+    ``factor_on_face``: the family's factor is applied on the face (the charge
+    channel's B, ζ = B(BᴴZ), ``isdf.zeta_mubatch._FACE_KINDS``), so a rank holds
+    ``16·Q·μ²/P`` of it; otherwise each q owner holds its whole tile (the current
+    channels' pivoted LU), ``16·⌈Q/P⌉·μ²``.
 
     Per rank: conj ψ(G) on its G slice (full zone), the owner's pair
     projectors D̃ (formed and sent one parent chunk at a time, ``p_chunk``),
@@ -263,7 +269,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     budget = target = float(budget_gb) * 1e9
     n_v = int(n_vertex)
     base = {
-        "C factor": n_v * _c128(Q_loc, mu, mu),
+        "C factor": n_v * (_c128(Q, mu, mu, shard=P_) if factor_on_face else _c128(Q_loc, mu, mu)),
         "centroid faces": float(psi_face_bytes),
         "conj ψ(G) slice": _c128(n_p, nb, ns, Gp),
         "sphere tables": 12.0 * nk * Gp + 4.0 * nk * n_col * n_s + 8.0 * Q * N_G,
@@ -320,9 +326,9 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         return max(stages(b, n_pg, c_out, n_blk), key=lambda d: sum(d.values()))
 
     # The memory split (owner rule): ψ(G) resident iff what is left after
-    # the fixed terms holds it and the smallest batch; then every remaining
-    # byte buys centroids at c_μ bytes each (the per-centroid slope of the
-    # batch working set).  Partially cached ψ is never optimal (the stream
+    # the fixed terms holds it and the smallest batch; then the remaining
+    # bytes buy the widest batch whose working set fits (below).  Partially
+    # cached ψ is never optimal (the stream
     # cost ∝ (1-x)/(M_f - xΨ) is monotone in x), so there is no middle tier.
     psi_bytes = base.pop("conj ψ(G) slice")
     base_total = sum(base.values())
@@ -340,15 +346,19 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     # plane per block.
     need_min = working_set(b_min, 1, 1, n_a)
     b_top = math.ceil(mu / P_) * P_
-    # The batch, at one plane per group (the smallest plane stage): every byte
-    # the fixed terms and ψ(G) leave buys centroids at c_μ bytes each, with
-    # the whole plane axis in one block; with no such b, b = P·c_orb and the
-    # owner plane stage streams rows and plane blocks.
-    c_mu = (batch_bytes(2 * P_, 1) - batch_bytes(P_, 1)) / P_
-    room = M_f - psi_bytes - (batch_bytes(P_, 1) - c_mu * P_)
+    # The batch, at one plane per group (the smallest plane stage): the widest
+    # b whose working set, the whole plane axis in one block, fits the target,
+    # by bisection (the working set is monotone in b and superlinear: a slope
+    # taken at b = P..2P overshoots the target, MoS2/hBN N_mu 8160); with no
+    # such b, b = P·c_orb and the owner plane stage streams rows and plane blocks.
+    fits_at = lambda c: psi_bytes + batch_bytes(P_ * c, 1) <= M_f
     b = b_min
-    if room >= c_mu * b_min:
-        b = min(b_top, int(room // c_mu) // P_ * P_)
+    if fits_at(c_orb):
+        lo, hi = c_orb, b_top // P_            # fits_at(lo); the widest fitting c in [lo, hi]
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            lo, hi = (mid, hi) if fits_at(mid) else (lo, mid - 1)
+        b = P_ * lo
         b = max(b_min, math.ceil(math.ceil(mu / math.ceil(mu / b)) / P_) * P_)   # balance
     # The plane-group width: the most planes whose share of the owner plane
     # stage for one row (plane group, k-convolution and Z rows) fits one tile,

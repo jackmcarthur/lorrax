@@ -1,0 +1,135 @@
+{
+ "about": "Measured per-stage device peaks (GB per rank, max over ranks; allocator high-water of each LORRAX_MEMORY_TRACE section) of GN-PPM runs on one 4xA100-80GB node, for gw.stage_inventory. Keys are inventory stages; the trace section each came from is in tests/test_stage_inventory_calibration.py.",
+ "runs": [
+  {
+   "name": "MoS2/hBN 148 atoms, 3264 bands, N_mu 16320",
+   "P": 4,
+   "linalg": "local",
+   "source": "main fc46898b9 + Sigma Hartree band chunks (since landed as 2410aa812/236e46de2)",
+   "deck": {
+    "nb": 3264,
+    "nmu": 16320,
+    "trs": false,
+    "validation_width": 4,
+    "nk": 4,
+    "n_parent": 2,
+    "nq": 2,
+    "ns": 2,
+    "nb_qp": 832,
+    "ng": 229376,
+    "fft": [
+     128,
+     128,
+     250
+    ],
+    "kgrid": [
+     2,
+     2,
+     1
+    ],
+    "sys_dim": 2
+   },
+   "measured": {
+    "ISDF setup + I/O": 49.62,
+    "zeta C = (psi psi)(psi psi)^H": 43.09,
+    "zeta factor B": 39.26,
+    "V(q)": 23.31,
+    "chi0": 14.56,
+    "W slice to IBZ": 12.36,
+    "W": 25.15,
+    "Sigma exchange": 16.68,
+    "GN-PPM fit": 15.33,
+    "Sigma tau sweep": 17.8,
+    "Sigma other": 22.43,
+    "Sigma Hartree": 19.6
+   }
+  },
+  {
+   "name": "MoS2/hBN 148 atoms, 1632 bands, N_mu 8160",
+   "P": 4,
+   "linalg": "local",
+   "source": "claude/planner-accuracy (main 93c2d320e)",
+   "deck": {
+    "nb": 1632,
+    "nmu": 8160,
+    "trs": true,
+    "validation_width": 4,
+    "nk": 4,
+    "n_parent": 2,
+    "nq": 2,
+    "ns": 2,
+    "nb_qp": 832,
+    "ng": 229376,
+    "fft": [
+     128,
+     128,
+     250
+    ],
+    "kgrid": [
+     2,
+     2,
+     1
+    ],
+    "sys_dim": 2
+   },
+   "measured": {
+    "ISDF setup + I/O": 24.39,
+    "zeta C = (psi psi)(psi psi)^H": 13.77,
+    "zeta factor B": 12.81,
+    "V(q)": 16.25,
+    "chi0": 4.24,
+    "W slice to IBZ": 3.09,
+    "W": 6.29,
+    "Sigma exchange": 4.89,
+    "GN-PPM fit": 3.96,
+    "Sigma tau sweep": 5.5,
+    "Sigma other": 6.45,
+    "Sigma Hartree": 11.92
+   }
+  },
+  {
+   "name": "Al2O3 10 atoms 4x4x4, 154 bands, N_mu 6000",
+   "P": 4,
+   "linalg": "local",
+   "source": "claude/planner-accuracy (main 93c2d320e)",
+   "deck": {
+    "nk": 64,
+    "n_parent": 13,
+    "nq": 13,
+    "ns": 1,
+    "nb": 154,
+    "nb_qp": 30,
+    "ng": 7128,
+    "fft": [
+     60,
+     60,
+     60
+    ],
+    "nmu": 6000,
+    "kgrid": [
+     4,
+     4,
+     4
+    ],
+    "trs": true,
+    "sys_dim": 3,
+    "validation_width": 64
+   },
+   "measured": {
+    "ISDF setup + I/O": 0.47,
+    "zeta C = (psi psi)(psi psi)^H": 14.99,
+    "zeta factor B": 14.27,
+    "V(q)": 23.13,
+    "chi0": 12.01,
+    "W slice to IBZ": 13.06,
+    "W": 11.91,
+    "Sigma exchange": 6.98,
+    "GN-PPM fit": 13.38,
+    "Sigma tau sweep": 11.66,
+    "Sigma other": 11.9,
+    "Sigma Hartree": 5.89,
+    "Coulomb all-q validation": 38.98
+   }
+  }
+ ]
+}
