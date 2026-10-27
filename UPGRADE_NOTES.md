@@ -5,6 +5,14 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-27 — Make checked probe row layouts explicit
+
+The EIGH residual and LU projected check move their skinny probe rows
+through the existing bounded ordered reduction. One source owns each
+destination row; matrix faces retain their layout. Probe counts, seeds,
+cuts and tolerances are unchanged. This shared Python change adds no
+setting, native signature or rebuild requirement.
+
 ## 2026-10-27 — Preload ROCm BLAS code before collectives
 
 ROCm startup now calls the attested provider's `rocblas_initialize`
