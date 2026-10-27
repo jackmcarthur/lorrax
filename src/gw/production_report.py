@@ -132,6 +132,9 @@ def method_rows(config) -> list[tuple[str, str]]:
         screening = {"w_rpa": "RPA screened Coulomb interaction (Dyson series in chi0)",
                      "w_bse": "BSE-screened Coulomb interaction (electron-hole ladder in W)"
                      }.get(diagrams, diagrams)
+        if getattr(config.screening, "source", "compute") == "bgw_epsmat":
+            screening = ("BerkeleyGW's epsilon projected on zeta, read from the ISDF tensor "
+                         "file (screening_source = bgw_epsmat; no chi0, no Dyson solve)")
         omega_p = float(getattr(getattr(config, "ppm", None), "omega_p", 0.0) or 0.0) * RYD_TO_EV
         screening += {
             "gn_ppm": f"; W at z = 0 and z = i {omega_p:.2f} eV for GN-PPM",
@@ -143,10 +146,14 @@ def method_rows(config) -> list[tuple[str, str]]:
         rows.append(("screening", screening))
     head = config.head.correction.value
     source = str(config.head.wcoul0_source)
+    if getattr(config.screening, "source", "compute") == "bgw_epsmat":
+        source = "bgw_eps0mat"
     rows.append(("q->0 head", "off: no q->0 cell term" if head == "off" else
                  f"{head} ({'local fields' if head == 'full' else 'no local fields'}), "
                  + {"s_tensor": "S tensor from dipole.h5",
-                    "epshead": "from the epsilon head"}.get(source, f"source {source}")))
+                    "epshead": "from the epsilon head",
+                    "bgw_eps0mat": "BerkeleyGW's eps^-1_00(q0) at each W frequency",
+                    }.get(source, f"source {source}")))
     dim = int(config.sys_dim)
     rows.append(("Coulomb", _DIM_EFFECT.get(dim, f"{dim}D")))
     if config.bispinor:

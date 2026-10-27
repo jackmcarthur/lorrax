@@ -347,18 +347,87 @@ def _theta_overlap(
 
     si = np.asarray(src_rows, dtype=np.int64)
     ti = np.asarray(dst_rows, dtype=np.int64)
-    theta_up = np.conj(src[:, 1, si])
-    theta_dn = -np.conj(src[:, 0, si])
-    return (np.conj(dst[:, 0, ti]) @ theta_up.T
-            + np.conj(dst[:, 1, ti]) @ theta_dn.T)
+    return _theta_gemm(dst, src, ti, si)
+
+
+_THETA_G_BLOCK = 16384
+
+
+def _theta_on_device() -> bool:
+    try:
+        import jax
+        return bool(jax.config.jax_enable_x64)
+    except Exception:
+        return False
+
+
+def _theta_gemm(dst, src, ti, si) -> np.ndarray:
+    """``conj(dst↑)·(Θsrc)↑ᵀ + conj(dst↓)·(Θsrc)↓ᵀ`` over the matched G rows.
+
+    Two (n_occ × N_G × n_occ) complex GEMMs: ~2 TFLOP at 816 bands and
+    183k G, about 50 s in single-threaded host BLAS (the runtime pins
+    OpenBLAS to one thread).  They run on the local JAX device (a GPU, or
+    XLA:CPU's threaded dot) when x64 is on, as ONE compiled program over
+    zero-padded G blocks of fixed width, so every item and every process
+    use the same executable (:func:`_warm_theta_gemm`); NumPy otherwise.
+    """
+    if not _theta_on_device():
+        return (np.conj(dst[:, 0, ti]) @ np.conj(src[:, 1, si]).T
+                - np.conj(dst[:, 1, ti]) @ np.conj(src[:, 0, si]).T)
+    import jax
+    device = jax.local_devices()[0]
+    acc = None
+    for lo in range(0, ti.size, _THETA_G_BLOCK):
+        t, s = ti[lo:lo + _THETA_G_BLOCK], si[lo:lo + _THETA_G_BLOCK]
+        blocks = []
+        for x in (dst[:, 0, t], src[:, 1, s], dst[:, 1, t], src[:, 0, s]):
+            pad = np.zeros((x.shape[0], _THETA_G_BLOCK), dtype=np.complex128)
+            pad[:, :x.shape[1]] = x
+            blocks.append(jax.device_put(pad, device))
+        # Summed on the host: an eager device add would be a second program
+        # that only item-owning processes compile.
+        part = np.asarray(_theta_block()(*blocks))
+        acc = part if acc is None else acc + part
+    return acc
+
+
+def _warm_theta_gemm(n_rows: int) -> None:
+    """Compile the device overlap program on every process (zeros input)."""
+    if _theta_on_device():
+        import jax
+        zero = jax.device_put(np.zeros((int(n_rows), _THETA_G_BLOCK),
+                                       dtype=np.complex128), jax.local_devices()[0])
+        _theta_block()(zero, zero, zero, zero).block_until_ready()
+
+
+_THETA_BLOCK = None
+
+
+def _theta_block():
+    global _THETA_BLOCK
+    if _THETA_BLOCK is None:
+        import jax
+        import jax.numpy as jnp
+        _THETA_BLOCK = jax.jit(lambda d_up, s_dn, d_dn, s_up: (
+            jnp.conj(d_up) @ jnp.conj(s_dn).T - jnp.conj(d_dn) @ jnp.conj(s_up).T))
+    return _THETA_BLOCK
 
 
 def occupation_operator_residual(
     overlap: np.ndarray,
     target_occupations: np.ndarray,
     source_occupations: np.ndarray,
+    contraction: int = 1,
 ) -> tuple[float, float]:
-    """Distance between target and time-reversed one-particle densities."""
+    """Distance between target and time-reversed one-particle densities.
+
+    ``contraction`` is the length of the dot products behind ``overlap``
+    (spinor x G).  Their roundoff grows like sqrt(length) eps, so the
+    negative-distance guard scales with it: at 816 occupied spinor bands and
+    2 x 229k coefficients, overlaps from rows orthonormal to 1e-13 gave
+    -5e-10 (host BLAS) and -1.3e-9 (GPU), above the length-blind bound
+    128 eps denom = 4.6e-11, and time reversal was switched off.
+    """
     M = np.asarray(overlap, dtype=np.complex128)
     ft = np.asarray(target_occupations, dtype=np.float64).reshape(-1)
     fs = np.asarray(source_occupations, dtype=np.float64).reshape(-1)
@@ -374,7 +443,8 @@ def occupation_operator_residual(
     cross = float(np.einsum(
         "a,b,ab->", ft, fs, np.abs(M) ** 2, optimize=True))
     distance2 = denom - 2.0 * cross
-    roundoff = 128.0 * np.finfo(np.float64).eps * max(1.0, denom)
+    roundoff = (128.0 * np.finfo(np.float64).eps * max(1.0, denom)
+                * np.sqrt(max(1, int(contraction))))
     if distance2 < -roundoff:
         raise ValueError(
             "negative density-operator distance: coefficient rows are not "
@@ -512,11 +582,15 @@ def _check_two_component_trs(
             source, source_g, kpoints[item.source],
             target, target_g, target_k)
         residual, min_singular = occupation_operator_residual(
-            overlap, occupations[item.target_raw], occupations[item.source])
+            overlap, occupations[item.target_raw], occupations[item.source],
+            contraction=2 * int(np.shape(source)[-1]))
         return residual, min_singular, time.perf_counter() - tic
 
     # Items are dealt round-robin; each process reads only its own k pairs.
     rank, world = _evidence_partition(loader)
+    # Every process compiles the one device overlap program here, whether or
+    # not it owns an evidence item, so the compile sequence stays rank-uniform.
+    _warm_theta_gemm(stop)
     n_items = len(evidence)
     residual_row = np.zeros(n_items, dtype=np.float64)
     singular_row = np.zeros(n_items, dtype=np.float64)

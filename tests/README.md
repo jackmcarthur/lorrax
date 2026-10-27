@@ -41,6 +41,7 @@ A new test needs no bootstrap import of its own. Run the unit layer with
 | `test_bse_q0_head_exact_overlap.py` | the q = 0 head content is exact |
 | `test_eqp_fullzone_cpu.py` | the eqp reader: wedge, unfold and full-zone blocks agree |
 | `test_bgw_epsmat_cpu.py` | the BerkeleyGW ε⁻¹ block equals the dense RPA inverse |
+| `test_bgw_w_import_cpu.py` | BerkeleyGW W import: a symmetry-image q projects to the dense Z_cᴴ(ε⁻¹_c − 1)vZ_c (phase and TR conjugation each fail in a red twin); q coverage and frequency rules; the GW reader refuses another W source, frequency or missing probe |
 | `test_sigma_on_shell_cpu.py` | the on-shell Σ fold equals its closed form |
 | `test_tangential_head_ordered_fold.py` | ordered wings equal the direct Lehmann sum |
 | `test_tangential_decoupled.py` | the decoupled face routes equal the local round |

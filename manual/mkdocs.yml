@@ -100,7 +100,7 @@ nav:
           - Input keywords: drivers/nscf/keywords.md
           - Theory: drivers/nscf/theory.md
           - Files: drivers/nscf/files.md
-      - BerkeleyGW export: drivers/berkeleygw-export.md
+      - BerkeleyGW export and import: drivers/berkeleygw-export.md
   - Utilities:
       - centroids: utilities/centroids.md
       - kin-ion: utilities/kin-ion.md

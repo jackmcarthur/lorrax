@@ -93,9 +93,13 @@ def main(argv=None) -> int:
                        f"worst block identity {worst:.2e}")
         else:
             result = run_epsmat_projection(cfg, mesh)
-            worst = max(q["rel_Wc_bgw_vs_lorrax"] for q in result["q"])
-            log.info(f"  wrote {result['path']}: W0_qmunu from BerkeleyGW on "
-                   f"{len(result['q'])} stored q; max |Wc_BGW − Wc_LX|/|Wc_LX| = {worst:.4e}")
+            rels = [q["static"]["rel_Wc_bgw_vs_lorrax"] for q in result["q"]
+                    if q["static"]["rel_Wc_bgw_vs_lorrax"] is not None]
+            names = " and ".join(f["dataset"] for f in result["frequencies"])
+            log.info(f"  wrote {result['path']}: {names} from BerkeleyGW on "
+                   f"{len(result['q'])} stored q"
+                   + (f"; max |Wc_BGW − Wc_LX|/|Wc_LX| = {max(rels):.4e}" if rels else
+                      "; no LORRAX W(0) in the bundle to compare"))
     if rank0:
         import json
         import os
