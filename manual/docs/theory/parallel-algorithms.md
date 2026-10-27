@@ -236,6 +236,12 @@ The two plans agree to round-off. With $Q<P$ the local plan leaves $P-Q$ ranks i
 
 The constructor reduces each irreducible $\bq$'s samples to poles ([Tangential W model §7.8](tangential-w.md#ritz)). Local rounds give one whole parent per rank and solve its pencil with local dense kernels; they are taken whenever the complete selection stack and a conservative pencil price fit the device, under either `linalg`. Otherwise the face route runs a batch of parents on the whole mesh with distributed GEMMs and eigensolves. A local round holds a whole parent's pencil per rank, so its peak does not fall with $P$; the face route is the path past that point.
 
+### <span class="n">5.3</span> BSE trial vectors {: #par-bse-seeds }
+
+Davidson selects its lowest transition energies on the owned band tiles. Each rank contributes only its best candidates' energies and global indices; a stable energy/index ordering selects the requested unit vectors. The full transition-energy tensor and dense trial-vector bank are never assembled on a host. Random trial vectors share Lanczos's physical-shape Gaussian generator, are constructed in their output layout, and have exactly zero padding. This replaces the earlier NumPy random sequence, so the same public seed remains reproducible but can take a different convergence path.
+
+The seed executable includes its final layout conversion in the memory price. A bounded cache reuses it across energy and seed updates with the same shapes, dtypes and shardings; it retains no wavefunction or energy arrays. This removes a setup memory floor; the subsequent matrix-free BSE products and subspace storage still determine the solve's capacity.
+
 ## <span class="n">6</span> Memory and I/O {: #par-mem }
 
 Every stage is priced against one per-device budget, every streamed loop takes one fixed tile, and every bulk array moves to and from disk as per-rank hyperslabs.
