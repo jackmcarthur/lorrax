@@ -31,7 +31,7 @@
 // Plans (device matrices, remap tables, hipFFT plans) are cached per (device, attributes,
 // shape) for the process lifetime.  hipFFT's work areas are NOT owned by the plans
 // (auto-allocation off); rocBLAS's workspace is sized once per plan in rocBLAS size-query mode;
-// both come from XLA's scratch allocator on every call, as do the ping-pong intermediates, each
+// both occupy an explicit uint8 result on every call, as do the ping-pong intermediates, each
 // sized by the largest intermediate it holds (the one deliberate departure from the CUDA leg,
 // which allocates two buffers of the chain's largest extent: Fe's memory law leaves no room
 // for that on MI250X).
@@ -49,6 +49,7 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -59,6 +60,7 @@
 #include <vector>
 
 #include "../common/ffi_helpers.h"
+#include "../common/c_abi.h"
 #include "../common/gpu_runtime.h"
 #include "../common/mkl_thread_pin.h"
 #include "../common/rtc_build.h"
@@ -280,7 +282,7 @@ struct Step {
     double sr = 1.0, si = 0.0;             // remap scale, or GEMM alpha
     FftHandle fft = nullptr;               // one contiguous FFT run, looped `loops` times
     int64_t loops = 1, loop_stride = 0;
-    size_t work = 0;                       // its hipFFT work area, bytes (XLA scratch per call)
+    size_t work = 0;                       // its hipFFT work area, bytes (explicit arena per call)
     int64_t in_ext[3]{}, out_ext[3]{};     // current extents before / after the step
 };
 
@@ -576,8 +578,84 @@ static RbStatus gemm_step(const Api& A, RbHandle h, const Step& st, int d, int64
                       K * R, st.mat, int32_t(K), 0, &beta, Y, int32_t(R), Np * R, int32_t(L));
 }
 
-static ffi::Error run(lrx::gpu::Stream stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer x,
-                      ffi::Result<ffi::AnyBuffer> y, ffi::Span<const int64_t> n, ffi::Span<const int64_t> kin,
+// Query and execution share the same cached plan, including vendor plan sizes.
+static ffi::Error get_plan(int dev, int64_t batch, ffi::Span<const int64_t> n,
+                           ffi::Span<const int64_t> kin, ffi::Span<const int64_t> kout,
+                           ffi::Span<const int64_t> in_idx, ffi::Span<const int64_t> out_idx,
+                           ffi::Span<const int64_t> sup_in, ffi::Span<const int64_t> sup_out,
+                           ffi::Span<const int64_t> gemm, ffi::Span<const double> scale,
+                           ffi::Span<const int64_t> order, int64_t sign, Plan** p) {
+    const std::string key = plan_key(dev, batch, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm, scale,
+                                     order, sign);
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        auto it = g_plans.find(key);
+        if (it == g_plans.end()) {
+            auto np = std::make_unique<Plan>();
+            if (auto e = build_plan(*np, batch, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm, scale,
+                                    order, int(sign));
+                e.failure())
+                return e;
+            it = g_plans.emplace(key, std::move(np)).first;
+        }
+        *p = it->second.get();
+    }
+    return ffi::Error::Success();
+}
+
+// Size-query mode executes no GEMM and never dereferences these null data
+// pointers. Fourier matrices/remap tables remain the existing plan's metadata.
+static ffi::Error size_workspace(int dev, Plan* p) {
+    bool any_gemm = false;
+    for (const Step& st : p->steps) any_gemm |= st.kind == Step::kGemm;
+    if (!any_gemm) return ffi::Error::Success();
+    DeviceHandle* dh = nullptr;
+    FFI_RETURN_IF_ERROR(device_handle(dev, &dh));
+    std::lock_guard<std::mutex> lock(dh->m);
+    if (p->rb_ws_known) return ffi::Error::Success();
+    const Api& A = api();
+    size_t ws = 0;
+    LORRAX_LIB_CHECK(A.rb_start_query(dh->h), 0, "rocblas_start_device_memory_size_query");
+    for (const Step& st : p->steps) {
+        if (st.kind != Step::kGemm) continue;
+        std::string refusal;
+        const RbStatus status = gemm_step(A, dh->h, st, p->d, p->batch, nullptr, nullptr, &refusal);
+        if (!refusal.empty()) { A.rb_stop_query(dh->h, &ws); return bad(refusal); }
+        // rocblas_status_{success,size_increased,size_unchanged}.
+        if (status != 0 && status != 9 && status != 10) {
+            A.rb_stop_query(dh->h, &ws);
+            return err("rocBLAS workspace query failed (" + std::to_string(status) + ")");
+        }
+    }
+    LORRAX_LIB_CHECK(A.rb_stop_query(dh->h, &ws), 0, "rocblas_stop_device_memory_size_query");
+    p->rb_ws = ws;
+    p->rb_ws_known = true;
+    return ffi::Error::Success();
+}
+
+// Serial hipFFT and rocBLAS steps reuse one vendor work region. Both
+// ping-pong banks remain live beside it; every region starts at 256 B.
+static ffi::Error workspace_layout(const Plan& p, size_t* total, size_t offsets[3]) {
+    size_t sizes[3] = {std::max(p.max_work, p.rb_ws), 0, 0};
+    const size_t limit = std::numeric_limits<size_t>::max();
+    for (int i = 0; i < 2; ++i) {
+        if (p.buf_elems[i] < 0 || static_cast<uint64_t>(p.buf_elems[i]) > limit / sizeof(Z))
+            return bad("workspace intermediate byte count overflows size_t");
+        sizes[i + 1] = size_t(p.buf_elems[i]) * sizeof(Z);
+    }
+    *total = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (*total > limit - 255) return bad("workspace alignment overflows size_t");
+        offsets[i] = (*total + 255) & ~size_t(255);
+        if (sizes[i] > limit - offsets[i]) return bad("workspace total overflows size_t");
+        *total = offsets[i] + sizes[i];
+    }
+    return ffi::Error::Success();
+}
+
+static ffi::Error run(lrx::gpu::Stream stream, ffi::AnyBuffer x,
+                      ffi::Result<ffi::AnyBuffer> y, ffi::Result<ffi::Buffer<ffi::U8>> workspace,
+                      ffi::Span<const int64_t> n, ffi::Span<const int64_t> kin,
                       ffi::Span<const int64_t> kout, ffi::Span<const int64_t> in_idx,
                       ffi::Span<const int64_t> out_idx, ffi::Span<const int64_t> sup_in,
                       ffi::Span<const int64_t> sup_out, ffi::Span<const int64_t> gemm,
@@ -598,22 +676,16 @@ static ffi::Error run(lrx::gpu::Stream stream, ffi::ScratchAllocator scratch, ff
 
     int dev = 0;
     LORRAX_GPU_CHECK(lrx::gpu::get_device(&dev));
-    const std::string key = plan_key(dev, batch, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm, scale,
-                                     order, sign);
     Plan* p = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_mu);
-        auto it = g_plans.find(key);
-        if (it == g_plans.end()) {
-            auto np = std::make_unique<Plan>();
-            if (auto e = build_plan(*np, batch, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm, scale,
-                                    order, int(sign));
-                e.failure())
-                return e;
-            it = g_plans.emplace(key, std::move(np)).first;
-        }
-        p = it->second.get();
-    }
+    FFI_RETURN_IF_ERROR(get_plan(dev, batch, n, kin, kout, in_idx, out_idx,
+                                sup_in, sup_out, gemm, scale, order, sign, &p));
+    FFI_RETURN_IF_ERROR(size_workspace(dev, p));
+    size_t total = 0, offsets[3];
+    FFI_RETURN_IF_ERROR(workspace_layout(*p, &total, offsets));
+    if (workspace->element_count() != total)
+        return bad("explicit workspace result has " + std::to_string(workspace->element_count()) +
+                   " bytes; exact plan requires " + std::to_string(total));
+    auto* arena = workspace->typed_data();
     rtc::Function remap_fn = nullptr;
     bool any_gemm = false;
     for (const Step& st : p->steps) {
@@ -622,105 +694,135 @@ static ffi::Error run(lrx::gpu::Stream stream, ffi::ScratchAllocator scratch, ff
         any_gemm |= (st.kind == Step::kGemm);
     }
 
-    void* work = nullptr;                                   // hipFFT's work area for this call
-    if (p->max_work > 0) {
-        auto w = scratch.Allocate(p->max_work);
-        if (!w.has_value()) return err("scratch allocation (hipFFT work area, " + std::to_string(p->max_work) + " B)");
-        work = *w;
-    }
-    void* buf[2] = {nullptr, nullptr};                      // ping-pong; the last step writes y
-    for (int b = 0; b < 2; ++b) {
-        if (p->buf_elems[b] == 0) continue;
-        const size_t bytes = size_t(p->buf_elems[b]) * sizeof(Z);
-        auto sb = scratch.Allocate(bytes);
-        if (!sb.has_value()) {
-            std::ostringstream os;
-            os << "scratch allocation of intermediate " << b << ": " << bytes << " B (batch " << batch
-               << ", " << p->steps.size() << " steps); the caller's memory budget leaves XLA no room";
-            return err(os.str());
-        }
-        buf[b] = *sb;
-    }
+    void* work = std::max(p->max_work, p->rb_ws) ? arena + offsets[0] : nullptr;
+    void* buf[2] = {p->buf_elems[0] ? arena + offsets[1] : nullptr,
+                    p->buf_elems[1] ? arena + offsets[2] : nullptr};
     DeviceHandle* dh = nullptr;
     std::unique_lock<std::mutex> lk;
     if (any_gemm) {
         FFI_RETURN_IF_ERROR(device_handle(dev, &dh));
         lk = std::unique_lock<std::mutex>(dh->m);
         LORRAX_LIB_CHECK(A.rb_set_stream(dh->h, stream), 0, "rocblas_set_stream");
-        if (!p->rb_ws_known) {        // rocBLAS size-query mode: argument checks + sizes, no execution
-            size_t ws = 0;
-            const void* src = x.untyped_data();
-            int which = 0;
-            LORRAX_LIB_CHECK(A.rb_start_query(dh->h), 0, "rocblas_start_device_memory_size_query");
-            for (size_t i = 0; i < p->steps.size(); ++i) {
-                const bool last = (i + 1 == p->steps.size());
-                void* dst = last ? y->untyped_data() : buf[which];
+        LORRAX_LIB_CHECK(A.rb_set_workspace(dh->h, p->rb_ws ? work : nullptr, p->rb_ws), 0, "rocblas_set_workspace");
+    }
+    auto execute = [&]() -> ffi::Error {
+        const void* src = x.untyped_data();
+        int which = 0;
+        for (size_t i = 0; i < p->steps.size(); ++i) {
+            Step& st = p->steps[i];
+            const bool last = (i + 1 == p->steps.size());
+            void* dst = last ? y->untyped_data() : buf[which];
+            if (st.kind == Step::kGemm) {
                 std::string refusal;
-                if (p->steps[i].kind == Step::kGemm) gemm_step(A, dh->h, p->steps[i], d, batch, src, dst, &refusal);
-                if (!refusal.empty()) { A.rb_stop_query(dh->h, &ws); return bad(refusal); }
-                src = dst;
-                which ^= 1;
+                const RbStatus s = gemm_step(A, dh->h, st, d, batch, src, dst, &refusal);
+                if (!refusal.empty()) return bad(refusal);
+                if (s != 0) {
+                    std::ostringstream os;
+                    os << "rocBLAS failed (" << s << ") on axis " << st.axis << " (" << A.rocblas_path << ")";
+                    return err(os.str());
+                }
+            } else if (st.kind == Step::kRemap) {
+                FFI_RETURN_IF_ERROR(launch_remap(remap_fn, src, dst, st.remap, st.sr, st.si, stream));
+            } else {
+                const int dir = p->sign < 0 ? kFftForward : kFftBackward;
+                if (A.fft_set_stream(st.fft, stream) != 0) return err("hipfftSetStream");
+                if (st.work > 0 && A.fft_set_work(st.fft, work) != 0) return err("hipfftSetWorkArea");
+                auto* in = const_cast<Z*>(static_cast<const Z*>(src));
+                auto* out = static_cast<Z*>(dst);
+                for (int64_t l = 0; l < st.loops; ++l)
+                    if (A.fft_exec_z2z(st.fft, in + l * st.loop_stride, out + l * st.loop_stride, dir) != 0)
+                        return err("hipfftExecZ2Z (" + A.hipfft_path + ")");
             }
-            LORRAX_LIB_CHECK(A.rb_stop_query(dh->h, &ws), 0, "rocblas_stop_device_memory_size_query");
-            p->rb_ws = ws;
-            p->rb_ws_known = true;
+            LORRAX_GPU_CHECK(lrx::gpu::peek_at_last_error());
+            src = dst;
+            which ^= 1;
         }
-        void* ws = nullptr;
-        if (p->rb_ws > 0) {
-            auto w = scratch.Allocate(p->rb_ws);
-            if (!w.has_value()) return err("scratch allocation (rocBLAS workspace)");
-            ws = *w;
-        }
-        LORRAX_LIB_CHECK(A.rb_set_workspace(dh->h, ws, p->rb_ws), 0, "rocblas_set_workspace");
+        if (p->steps.empty())
+            LORRAX_GPU_CHECK(lrx::gpu::memcpy_async(y->untyped_data(), x.untyped_data(),
+                                                    size_t(batch) * prod(kin.begin(), d) * sizeof(Z),
+                                                    lrx::gpu::kDeviceToDevice, stream));
+        return ffi::Error::Success();
+    };
+    ffi::Error result = execute();
+    // The handle must never retain an arena borrowed from an FFI result,
+    // including on a numerical/remap/launch failure. Preserve that error.
+    if (any_gemm) {
+        const RbStatus status = A.rb_set_workspace(dh->h, nullptr, 0);
+        if (result.failure()) return result;
+        LORRAX_LIB_CHECK(status, 0, "rocblas_set_workspace (detach)");
     }
-    const void* src = x.untyped_data();
-    int which = 0;
-    for (size_t i = 0; i < p->steps.size(); ++i) {
-        Step& st = p->steps[i];
-        const bool last = (i + 1 == p->steps.size());
-        void* dst = last ? y->untyped_data() : buf[which];
-        if (st.kind == Step::kGemm) {
-            std::string refusal;
-            const RbStatus s = gemm_step(A, dh->h, st, d, batch, src, dst, &refusal);
-            if (!refusal.empty()) return bad(refusal);
-            if (s != 0) {
-                std::ostringstream os;
-                os << "rocBLAS failed (" << s << ") on axis " << st.axis << " (" << A.rocblas_path << ")";
-                return err(os.str());
-            }
-        } else if (st.kind == Step::kRemap) {
-            FFI_RETURN_IF_ERROR(launch_remap(remap_fn, src, dst, st.remap, st.sr, st.si, stream));
-        } else {
-            const int dir = p->sign < 0 ? kFftForward : kFftBackward;
-            if (A.fft_set_stream(st.fft, stream) != 0) return err("hipfftSetStream");
-            if (st.work > 0 && A.fft_set_work(st.fft, work) != 0) return err("hipfftSetWorkArea");
-            auto* in = const_cast<Z*>(static_cast<const Z*>(src));
-            auto* out = static_cast<Z*>(dst);
-            for (int64_t l = 0; l < st.loops; ++l)
-                if (A.fft_exec_z2z(st.fft, in + l * st.loop_stride, out + l * st.loop_stride, dir) != 0)
-                    return err("hipfftExecZ2Z (" + A.hipfft_path + ")");
-        }
-        LORRAX_GPU_CHECK(lrx::gpu::peek_at_last_error());
-        src = dst;
-        which ^= 1;
-    }
-    if (any_gemm) LORRAX_LIB_CHECK(A.rb_set_workspace(dh->h, nullptr, 0), 0, "rocblas_set_workspace");
-    if (p->steps.empty())
-        LORRAX_GPU_CHECK(lrx::gpu::memcpy_async(y->untyped_data(), x.untyped_data(),
-                                                size_t(batch) * prod(kin.begin(), d) * sizeof(Z),
-                                                lrx::gpu::kDeviceToDevice, stream));
-    return ffi::Error::Success();
+    return result;
 }
 
 }  // namespace lorrax_ffi::fourier_plan_rocm
+
+// The descriptor is exactly the execution attributes, plus the local batch.
+// First use builds the existing cached metadata/vendor plans, never field
+// buffers or queried workspace. All subsequent queries reuse that owner.
+extern "C" int LRX_C_ENTRY(lrx_fourier_plan_workspace_bytes)(
+    int d, int64_t batch, const int64_t* n, const int64_t* kin, const int64_t* kout,
+    const int64_t* in_idx, const int64_t* out_idx, const int64_t* sup_in,
+    const int64_t* sup_out, const int64_t* gemm, const double* scale,
+    const int64_t* order, int64_t order_size, int64_t sign,
+    uint64_t* out, char* error, size_t capacity) {
+    using namespace lorrax_ffi::fourier_plan_rocm;
+    auto report = [&](const std::string& message) {
+        if (error != nullptr && capacity > 0) {
+            const size_t length = std::min(message.size(), capacity - 1);
+            std::memcpy(error, message.data(), length);
+            error[length] = '\0';
+        }
+        return 1;
+    };
+    if (out == nullptr) return report("workspace query needs an output pointer");
+    *out = 0;
+    if (d < 1 || d > 3 || batch < 0 || order_size < 1 || order_size > d + 1 ||
+        (sign != -1 && sign != 1) || !n || !kin || !kout || !in_idx || !out_idx ||
+        !sup_in || !sup_out || !gemm || !scale || !order)
+        return report("workspace query needs a complete 1..3-axis descriptor");
+    int64_t ni = 0, no = 0;
+    uint64_t full = 1, input = 1, output = 1;
+    const uint64_t limit = std::numeric_limits<int64_t>::max() / sizeof(Z);
+    for (int a = 0; a < d; ++a) {
+        if (n[a] < 1 || kin[a] < 1 || kout[a] < 1 ||
+            n[a] > kIntMax || kin[a] > kIntMax || kout[a] > kIntMax ||
+            full > limit / uint64_t(n[a]) || input > limit / uint64_t(kin[a]) ||
+            output > limit / uint64_t(kout[a]))
+            return report("workspace query axis/product exceeds the native range");
+        full *= n[a]; input *= kin[a]; output *= kout[a];
+        ni += kin[a]; no += kout[a];
+    }
+    if (uint64_t(batch) > limit / std::max({full, input, output}))
+        return report("workspace query batch byte span overflows int64");
+    if (batch == 0) return 0;
+    try {
+        if (!api().err.empty()) return report(api().err);
+        int dev = 0;
+        if (auto status = lrx::gpu::get_device(&dev); status != lrx::gpu::kSuccess)
+            return report(lrx::gpu::error_string(status));
+        Plan* p = nullptr;
+        if (auto e = get_plan(dev, batch, {n, size_t(d)}, {kin, size_t(d)}, {kout, size_t(d)},
+                              {in_idx, size_t(ni)}, {out_idx, size_t(no)},
+                              {sup_in, size_t(d)}, {sup_out, size_t(d)}, {gemm, size_t(d)},
+                              {scale, size_t(d)}, {order, size_t(order_size)}, sign, &p); e.failure())
+            return report(e.message());
+        if (auto e = size_workspace(dev, p); e.failure()) return report(e.message());
+        size_t total = 0, offsets[3];
+        if (auto e = workspace_layout(*p, &total, offsets); e.failure()) return report(e.message());
+        *out = total;
+        return 0;
+    } catch (const std::exception& e) {
+        return report(e.what());
+    }
+}
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     LorraxFourierPlanRocmFfi, lorrax_ffi::fourier_plan_rocm::run,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<lrx::gpu::Stream>>()
-        .Ctx<xla::ffi::ScratchAllocator>()
         .Arg<xla::ffi::AnyBuffer>()
         .Ret<xla::ffi::AnyBuffer>()
+        .Ret<xla::ffi::Buffer<xla::ffi::U8>>()  // exact native arena, visible to AOT
         .Attr<xla::ffi::Span<const int64_t>>("n")
         .Attr<xla::ffi::Span<const int64_t>>("kin")
         .Attr<xla::ffi::Span<const int64_t>>("kout")

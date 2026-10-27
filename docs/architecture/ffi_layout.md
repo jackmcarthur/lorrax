@@ -559,8 +559,8 @@ leg, `cpp/cufft/fourier_plan_cuda_ffi.cc` with the remap kernel in
   custom call: cuBLAS ZGEMM with a stride-0 matrix and no transposes, the fused
   pair below, one cuFFT Z2Z plan per contiguous run of FFT axes, and remap
   kernels for embed/restrict. Elsewhere it is XLA ops, so a CPU operand in a GPU
-  process takes the XLA leg. A plan with no GEMM stage takes the XLA leg on every
-  platform, set at construction: on A100 the custom call's remap + cuFFT arm is
+  process takes the XLA leg. A plan with no GEMM stage takes the XLA leg unless
+  its device policy selects the native FFT arm (MI250X does): on A100 the custom call's remap + cuFFT arm is
   1.20–1.33× XLA's take-embed + cuFFT at 24²–80² and 24³–64³, and cuFFT itself is
   equal on both legs. `lorrax_fourier_plan`
   (the same handler without the pair's two string attributes) stays in the
@@ -569,8 +569,8 @@ leg, `cpp/cufft/fourier_plan_cuda_ffi.cc` with the remap kernel in
   `lorrax_fourier_plan_rocm` (family `fourier_plan_rocm`; route row
   `ffi.fft.FOURIER_PLAN_TARGETS`): the CUDA leg's executor step for step --
   rocBLAS `zgemm` / `zgemm_strided_batched` with the stride-0 matrix (workspace
-  sized once per plan in rocBLAS size-query mode, then from XLA scratch), one
-  hipFFT Z2Z plan per contiguous FFT run with the work area from XLA scratch,
+  sized once per plan in rocBLAS size-query mode), one
+  hipFFT Z2Z plan per contiguous FFT run,
   and the remap kernel built by hipRTC (`common/rtc_build`, cached under
   `cubin_dir`). No fused pair (cuBLASDx has no ROCm twin): GEMM pairs run as
   two rocBLAS calls. Only the legs present in the process are
@@ -579,9 +579,20 @@ leg, `cpp/cufft/fourier_plan_cuda_ffi.cc` with the remap kernel in
   axes to the GEMM, keeps restrictions on the FFT arm and runs the FFT arm on
   the device leg (measured reverse of A100; numbers in the row's comment).
   Gate: `tests/test_fourier_plan_xla_gate.py` (both legs; ROCM 13/13 at P=1 and
-  P=4, worst 1.2e-15 relative to max|XLA|). Scratch: each ping-pong buffer is
+  P=4, worst 1.2e-15 relative to max|XLA|). Each ping-pong buffer is
   sized by the largest intermediate it holds (the CUDA leg allocates two of the
   chain's largest extent; Fe's pair-convolution budget leaves no room for that).
+  The execution attributes and local batch go to
+  `lrx_fourier_plan_workspace_bytes_rocm`, which reuses the execution plan's
+  geometry and vendor queries. Its exact arena is a trailing uint8 FFI result:
+  two aligned intermediate banks beside one work region shared by serial
+  hipFFT/rocBLAS steps. XLA's buffer assignment therefore prices these bytes
+  without a caller allowance or HLO-name parser. Runtime verifies the arena's
+  exact extent. A failed or missing query refuses; it never guesses zero.
+  The public plan still returns only the transformed field. Cached Fourier
+  matrices/remap tables remain the existing small plan-owned allocations,
+  separate from the per-call arena. This changes the ROCm handler contract
+  (ABI 14); rebuild the whole native pair before using it.
 * **Fused pair.** When the two trailing axes are GEMM axes executed back to
   back, one cuBLASDx kernel per plane does both,
   `Q (N1'×N2') = α·A1 (N1'×K1)·P (K1×K2)·A2ᵀ (K2×N2')`, with the plane, both

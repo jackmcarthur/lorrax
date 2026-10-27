@@ -507,6 +507,11 @@ A stale library missing this query refuses with `GATE kminor-workspace-query`:
 rebuild the ROCm leg in a new build directory. The handler ABI is unchanged.
 CUDA's single-pass mathdx mode 4 has no such buffer.
 
+The separate general ROCm `LocalFourierPlan` executor exposes its queried
+intermediate/vendor arena as a uint8 FFI result, already counted by buffer
+assignment; it needs no additional scratch allowance here
+([the plan owner](ffi_layout.md#local-fourier-plan-localfourierplan)).
+
 Apart from these intermediates the kernels allocate no device workspace
 beyond dynamic shared memory and their static tile tables (`pinfo`, counted
 in the opt-in check).
