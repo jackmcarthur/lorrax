@@ -9,10 +9,13 @@ Usage::
       --output path/to/lorrax-ffi-<revision> \
       --private-lib path/to/libcusolverMp.so.0
 
+Use ``--rocm path/to/liblorrax_ffi_rocm.so`` instead of ``--cuda`` for
+a ROCm/host pair, with the recorded ELPA library as its private dependency.
+
 The output directory must not exist.  Both provider legs and every explicitly
 listed private redistributable library are copied as regular files beneath
 ``lib/``; the JSON manifest is written last and hashes every byte.  MPI, site
-HDF5, CUDA runtime/driver libraries and NCCL are refused as private inputs:
+HDF5, CUDA/ROCm runtime/driver libraries and NCCL/RCCL are refused as private inputs:
 those are supplied and attested by the machine runtime, never vendored here.
 
 Each leg's build wrote ``<leg>.closure.json`` (``write_checkout_closure.py``):
@@ -24,7 +27,7 @@ same closure for the sealed pair as for the checkout it came from.
 This is intentionally a separate pair-sealing step rather than another CMake
 post-build action.  List private libraries dependency-first; the shared
 runtime loader opens their exact paths in this order, so no run-script
-``LD_LIBRARY_PATH`` is needed.  The CUDA and host legs are often built in
+``LD_LIBRARY_PATH`` is needed.  The device and host legs are often built in
 different environments and neither build can certify a pair it cannot see.
 Each build's existing acceptance contract remains necessary; this tool makes
 the deployable unit only after both accepted artifacts exist.
@@ -52,7 +55,7 @@ from runtime.source_closure import ensure_source_closure  # noqa: E402
 
 ensure_source_closure()
 
-from lxkit import native_provider as _native  # noqa: E402
+from lxkit import LEGS, native_provider as _native  # noqa: E402
 
 MANIFEST = "lorrax_ffi_bundle.json"
 SCHEMA = 2      # 2: per-leg dependency closures (lxkit.native_provider)
@@ -252,14 +255,19 @@ def _sealed_closure(leg: Path, platform: str, sealed_private: dict[str, Path],
             "external": body.get("external", [])}
 
 
-def seal(*, root: Path, cuda: Path, host: Path, output: Path,
-         private: list[Path]) -> Path:
+def seal(*, root: Path, cuda: Path | None = None, rocm: Path | None = None,
+         host: Path, output: Path, private: list[Path]) -> Path:
     root = root.resolve(strict=True)
-    cuda = _regular_input(cuda, "CUDA leg")
+    selected = [(name, path) for name, path in (("CUDA", cuda), ("ROCM", rocm)) if path is not None]
+    if len(selected) != 1:
+        raise RuntimeError("select exactly one device leg: --cuda or --rocm")
+    platform, path = selected[0]
+    leg = LEGS[platform]
+    device = _regular_input(path, f"{platform} leg")
     host = _regular_input(host, "host leg")
-    if cuda.name != "liblorrax_ffi.so":
+    if device.name != leg.so_name:
         raise RuntimeError(
-            f"CUDA leg must be named liblorrax_ffi.so, got {cuda.name!r}")
+            f"{platform} leg must be named {leg.so_name}, got {device.name!r}")
     if host.name != "liblorrax_ffi_host.so":
         raise RuntimeError(
             f"host leg must be named liblorrax_ffi_host.so, got {host.name!r}")
@@ -272,19 +280,19 @@ def seal(*, root: Path, cuda: Path, host: Path, output: Path,
             f"refusing to seal from dirty source tree {root}; commit the exact "
             "source that produced both libraries first")
     abi = _abi_from_header(root)
-    _verified_build_identity(cuda, revision)
+    _verified_build_identity(device, revision)
     _verified_build_identity(host, revision)
-    cuda_soname, cuda_needed, cuda_search = _elf_dynamic(cuda)
+    device_soname, device_needed, device_search = _elf_dynamic(device)
     host_soname, host_needed, host_search = _elf_dynamic(host)
-    _refuse_search_path(cuda.name, cuda_search, root=root, leg=True)
+    _refuse_search_path(device.name, device_search, root=root, leg=True)
     _refuse_search_path(host.name, host_search, root=root, leg=True)
-    if cuda_soname != cuda.name or host_soname != host.name:
+    if device_soname != device.name or host_soname != host.name:
         raise RuntimeError(
             "provider-leg SONAMEs must equal their canonical filenames: "
-            f"CUDA={cuda_soname!r}, host={host_soname!r}")
+            f"{platform}={device_soname!r}, host={host_soname!r}")
 
     private_resolved: list[tuple[Path, str, tuple[str, ...]]] = []
-    names = {cuda.name, host.name}
+    names = {device.name, host.name}
     for candidate in private:
         item = _regular_input(candidate, "private library")
         _native.refuse_private_library(item, RuntimeError)
@@ -299,7 +307,7 @@ def seal(*, root: Path, cuda: Path, host: Path, output: Path,
         private_resolved.append((item, soname, needed))
 
     private_names = {soname for _, soname, _ in private_resolved}
-    owners = [(cuda.name, cuda_needed), (host.name, host_needed)] + [
+    owners = [(device.name, device_needed), (host.name, host_needed)] + [
         (soname, needed) for _, soname, needed in private_resolved
     ]
     for owner, needed in owners:
@@ -322,14 +330,14 @@ def seal(*, root: Path, cuda: Path, host: Path, output: Path,
     try:
         libdir = stage / "lib"
         libdir.mkdir()
-        cuda_out = _copy_regular(cuda, libdir / cuda.name)
+        device_out = _copy_regular(device, libdir / device.name)
         host_out = _copy_regular(host, libdir / host.name)
         private_out = [
             (_copy_regular(item, libdir / soname), soname, needed)
             for item, soname, needed in private_resolved
         ]
         sealed_private = {soname: out for out, soname, _ in private_out}
-        closures = {"CUDA": _sealed_closure(cuda, "CUDA", sealed_private, root),
+        closures = {platform: _sealed_closure(device, platform, sealed_private, root),
                     "cpu": _sealed_closure(host, "cpu", sealed_private, root)}
         recorded = {lib["soname"] for body in closures.values()
                     for lib in body["libraries"] if lib.get("bundle_path")}
@@ -344,9 +352,9 @@ def seal(*, root: Path, cuda: Path, host: Path, output: Path,
             "source": {"revision": revision, "dirty": False},
             "ffi_abi": abi,
             "libraries": {
-                "CUDA": {**_entry(cuda_out, Path("lib") / cuda_out.name),
-                         "soname": cuda_soname,
-                         "needed": list(cuda_needed)},
+                platform: {**_entry(device_out, Path("lib") / device_out.name),
+                         "soname": device_soname,
+                         "needed": list(device_needed)},
                 "cpu": {**_entry(host_out, Path("lib") / host_out.name),
                         "soname": host_soname,
                         "needed": list(host_needed)},
@@ -390,7 +398,9 @@ def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--root", type=Path,
                    help="clean LORRAX source root (default: inferred)")
-    p.add_argument("--cuda", required=True, type=Path)
+    device = p.add_mutually_exclusive_group(required=True)
+    device.add_argument("--cuda", type=Path)
+    device.add_argument("--rocm", type=Path)
     p.add_argument("--host", required=True, type=Path)
     p.add_argument("--output", required=True, type=Path)
     p.add_argument(
@@ -405,7 +415,7 @@ def main(argv: list[str] | None = None) -> int:
     if root is None:
         root = _SOURCE_ROOT
     try:
-        manifest = seal(root=root, cuda=ns.cuda, host=ns.host,
+        manifest = seal(root=root, cuda=ns.cuda, rocm=ns.rocm, host=ns.host,
                         output=ns.output, private=ns.private_lib)
     except Exception as exc:  # one named refusal, no partial published bundle
         print(f"[seal ffi bundle] REFUSED: {exc}", file=sys.stderr)
