@@ -59,11 +59,11 @@ _SANCTIONED_EAGER = {
     # bse_io.make_w_densifier.)
     # NOT eager -- a limitation of the syntactic proxy.  The SC density
     # scan's ``_density_scan_body`` returns ``body``, which the caller
-    # (``rho_from_wfns``) wraps in ``shard_map`` itself; ``body>step``'s
-    # local_ifftn3 therefore always sees this rank's own (k-tile, band)
+    # (``rho_from_wfns``) wraps in ``shard_map`` itself; ``body>bands_density``'s
+    # local_ifftn3 therefore always sees this rank's own (k-tile, band chunk)
     # shard.  The lexical chain never names shard_map, so the proxy reports
     # it (0caf385b; flagged since the stage-2 scanner).
-    ("gw/qsgw_density.py", "step"): 1,
+    ("gw/qsgw_density.py", "bands_density"): 1,
 }
 
 
