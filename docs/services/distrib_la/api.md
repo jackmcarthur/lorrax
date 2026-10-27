@@ -672,6 +672,11 @@ nothing and accept `float64` or `complex128` only.
   round. CUDA charges `share` times the cuSOLVERDn size query; CPU returns zero.
 Operand carriers, transpose staging, communication buffers and persistent
 context resources are the caller's to admit.
+`provider_contexts(plan)` returns the current extra vendor-grid allowance as
+an `lxkit.memory.Term`: cuSOLVERMp, ScaLAPACK and ELPA use the run's existing
+context owner; pure-JAX, one-device and panel providers add none. A run that
+already withheld distributed contexts returns zero. Read it at admission,
+not when caching a program's intrinsic workspace price.
 
 ## Round-off tolerance {#roundoff}
 

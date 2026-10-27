@@ -1127,7 +1127,7 @@ def dyson_close_tile(T: jax.Array, V_q0: jax.Array) -> jax.Array:
     from common.gpu_utils import device_budget_bytes
     from distrib_la import (plan, lu_workspace_query,
                             room_or_exhausted, local_lu_workspace,
-                            mesh_platform, resolve_backend)
+                            mesh_platform, resolve_backend, provider_contexts)
     from lxkit import memory
     from runtime.aot_memory import compiled_price
 
@@ -1164,8 +1164,7 @@ def dyson_close_tile(T: jax.Array, V_q0: jax.Array) -> jax.Array:
             price = replace(price, whole=n if linear.backend == "one_device" else 0)
             _DYSON_CACHE[key] = call, executable, price
         call, executable, price = _DYSON_CACHE[key]
-        if int(mesh.size) > 1:
-            price = price + memory.Price(outside=memory.contexts())
+        price = price + memory.Price(outside=provider_contexts(linear))
         held[linear.backend if label is None else label] = call, executable, price
         return price
 

@@ -11,7 +11,7 @@ from lxkit import memory
 from distrib_la._result_check import checked_program
 from distrib_la.plan import plan, _exchange
 from distrib_la.resolve import resolve_backend, mesh_platform
-from distrib_la.workspace import local_lu_workspace, lu_workspace_query
+from distrib_la.workspace import local_lu_workspace, lu_workspace_query, provider_contexts
 
 
 def _lower(fn, operands, mesh, label, *, linear=None, agree=False):
@@ -22,7 +22,7 @@ def _lower(fn, operands, mesh, label, *, linear=None, agree=False):
         raise RuntimeError(f"{label}: compiler returned no memory price")
     new = (int(analysis.output_size_in_bytes) + int(analysis.temp_size_in_bytes)
            - int(analysis.alias_size_in_bytes))
-    vendor, outside = 0, memory.Term()
+    vendor, outside = 0, provider_contexts(linear) if linear is not None else memory.Term()
     if linear is not None and mesh_platform(mesh) == 'CUDA':
         n = int(operands[0].shape[0])
         if linear.backend == 'one_device':
@@ -31,7 +31,6 @@ def _lower(fn, operands, mesh, label, *, linear=None, agree=False):
             # One RHS column per rank leaves exactly one getrs chunk, so
             # the native query is cap-independent; no cap state is posted.
             vendor = lu_workspace_query(mesh, n, int(mesh.shape['y']), operands[0].dtype, 0)
-            outside = memory.contexts()
     if agree:
         # Positive metadata only: the shared budget hook rejects negative values.
         figures = _exchange(f'nonnegative/{linear.backend}/{operands[0].shape[0]}',

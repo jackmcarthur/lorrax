@@ -361,6 +361,7 @@ The native libraries allocate workspace outside XLA's memory planner, so a stage
 | `eigh_stack_proposal(mesh, shape, dtype)` | closed-form route-(c) first attempt, before the run's program is known |
 | `lu_workspace_bytes(mesh, n, dtype)` | measured cuSOLVERMp LU workspace for an $n\times n$ system with $n$ right-hand sides |
 | `lu_workspace_query(mesh, n, nrhs, dtype, cap)` | the library's own size query for the next LU solve |
+| `provider_contexts(plan)` | current extra vendor-grid allowance (`memory.Term`); zero for one-device/pure-JAX providers and when already withheld by the run budget |
 | `route_bytes(mesh, a_shape, b_shape, dtype, transa="N", transb="N", route=..., backend="off")` | what `matmul` allocates beside its operands on `route` |
 | `staged_fits(mesh, a_shape, b_shape, dtype, transa, transb, budget_bytes) -> bool` | whether the staged `matmul` route fits |
 

@@ -152,6 +152,10 @@ a provider context under `linalg = local` carries it as its `outside` term
 Provider contexts are an accelerator allowance. The host leg charges zero
 through the same `lxkit.memory.contexts()` owner; importing the compiled-price
 helper does not initialize a CUDA provider on CPU.
+LU principal solves and ring-lift closes ask `distrib_la.provider_contexts(plan)`
+for the resolved provider's allowance. Only vendor MPI grids add that term;
+`one_device` and `native2d` reuse the ordinary leg context. This run-dependent
+allowance is refreshed outside the cached executable price.
 
 The response bank prices the complete requested q stack of `V^(1/2)` and
 its supported inverse before dispatch. One parent fitting the eigensolver

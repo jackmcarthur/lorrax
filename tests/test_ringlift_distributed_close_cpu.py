@@ -1,6 +1,8 @@
 """Right-Dyson closure: generic complex algebra, face storage and recovery."""
 import importlib
 import re
+from dataclasses import replace
+from types import SimpleNamespace
 
 import jax
 import numpy as np
@@ -92,7 +94,10 @@ def test_actual_room_routes_and_complete_program_quote(monkeypatch):
     # Substitute only the leg policy, preserving real Plans, moves and algebra.
     monkeypatch.setattr(resolve, "mesh_platform", lambda _: "ROCM")
     monkeypatch.setattr(local, "mesh_platform", lambda _: "ROCM")
-    memory.set_budget(1 << 30, linalg="distributed")
+    memory.set_budget(1 << 30, linalg="local")
+    monkeypatch.setattr(memory, "_leg", lambda: SimpleNamespace(
+        accelerator=True, distributed_context=(3.6e9, "test vendor-grid allowance")))
+    assert memory.contexts().at(4) == 3.6e9
     mesh = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
     face = NamedSharding(mesh, P("x", "y"))
     t, v, expected = ringlift_fixture(512)
@@ -110,6 +115,14 @@ def test_actual_room_routes_and_complete_program_quote(monkeypatch):
         result = owner.dyson_close_tile(*operands)
         np.testing.assert_allclose(np.asarray(result), expected, atol=2e-14, rtol=0)
     assert selected == ["one_device", "native2d", "native2d"]
+    from distrib_la import plan, provider_contexts
+    base = plan("solve_lu", mesh, backend="native2d", n=512, batched_route="auto")
+    assert provider_contexts(base).at(4) == 0
+    assert provider_contexts(replace(base, backend="one_device")).at(4) == 0
+    for backend in ("cusolvermp", "elpa", "scalapack"):
+        assert provider_contexts(replace(base, backend=backend)).at(4) == 3.6e9
+    memory.set_budget(1 << 30, linalg="distributed")
+    assert provider_contexts(replace(base, backend="cusolvermp")).at(4) == 0
     for key, (_, executable, price) in owner._DYSON_CACHE.items():
         if key[0] != (512, 512) or key[3] != face:
             continue

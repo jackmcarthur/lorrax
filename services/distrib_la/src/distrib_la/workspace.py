@@ -8,6 +8,17 @@ import numpy as np
 from distrib_la.resolve import ONE_DEVICE, mesh_platform
 
 
+def provider_contexts(plan):
+    """Extra vendor-grid allowance not already withheld by the run budget.
+
+    Pure-JAX, one-device and panel routes reuse the ordinary leg context.
+    This is current run metadata, never part of a cached executable price.
+    """
+    from lxkit import memory
+    return (memory.contexts() if plan.backend in ("cusolvermp", "scalapack", "elpa")
+            else memory.Term())
+
+
 def _shapes(shapes):
     try:
         result = tuple(tuple(operator.index(n) for n in shape) for shape in shapes)
