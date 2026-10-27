@@ -31,8 +31,9 @@
 //     2  L x = b, L row-major lower (M = L^T upper): forward sweep op T
 //     3  L^T x = b (M upper, op N): backward sweep; L^H x = b is mode 3 on conj(b), conj(x)
 // Dtypes: f32, f64, c64, c128.
-// No host-device synchronization; workspace from XLA's scratch, sized by a rocBLAS
-// size-query pass over the same call sequence.
+// No host-device synchronization; an explicit u8 FFI result owns the workspace
+// and mode-0 pivot buffer. Its shape comes from the same native size query used
+// by the handler, so XLA's compiled memory price includes every scratch byte.
 #include "../common/leg.h"
 #if !defined(LRX_LEG_ROCM)
 #  error "rocsolver/lu_solve_ffi.cc is ROCM-leg only (CUDA solves through jaxlib's cuSOLVER, exact at every n measured)"
@@ -44,10 +45,10 @@
 #include <climits>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -191,6 +192,7 @@ struct Ops {
         else { double o = 1.0, m = -1.0; std::memcpy(one, &o, 8); std::memcpy(mone, &m, 8); }
     }
     char* at(void* base, int64_t i, int64_t j, int64_t ld) const {
+        if (base == nullptr) return nullptr;  // query mode: sizes only, no pointer arithmetic
         return static_cast<char*>(base) + static_cast<size_t>(i + j * ld) * es;
     }
     RbStatus getrf(int64_t n, void* a, RbInt* ipiv, RbInt* info) const {
@@ -211,6 +213,12 @@ struct Ops {
     }
 };
 
+static bool failed(RbStatus status, bool query) {
+    // rocblas_status_size_increased / size_unchanged are successful query
+    // outcomes. Invalid pointers, sizes or handles must not price as zero.
+    return status != 0 && (!query || (status != 9 && status != 10));
+}
+
 // Sweeps over the column-major M (n x n, ld n) on one RHS chunk Bc (n x kc, ld n), in place.
 // Returns the first non-success status; in rocBLAS size-query mode (`query`) statuses are
 // size statuses and are not read (the whole sequence is issued).
@@ -228,12 +236,12 @@ struct Sweep {
         for (int64_t s = 0; s <= last; s += bk.nb) {
             const int64_t j0 = forward ? s : last - s, ib = std::min(bk.nb, n - j0), j1 = j0 + ib;
             if ((st = op.trsm(fill, kOpTrans, diag, ib, kc, op.at(const_cast<void*>(M), j0, j0, n), n,
-                              op.at(B, j0, 0, n), n)) && !query) { *where = "trsm(T)"; return st; }
+                              op.at(B, j0, 0, n), n)) && failed(st, query)) { *where = "trsm(T)"; return st; }
             const int64_t r_lo = forward ? j1 : 0, r_hi = forward ? n : j0;
             for (int64_t r0 = r_lo; r0 < r_hi; r0 += rows_per_gemm) {   // B[r] -= M[j0:j1, r]^T X_j
                 const int64_t m = std::min(rows_per_gemm, r_hi - r0);
                 if ((st = op.gemm(kOpTrans, m, kc, ib, op.at(const_cast<void*>(M), j0, r0, n), n,
-                                  op.at(B, j0, 0, n), n, op.at(B, r0, 0, n), n)) && !query) { *where = "gemm(T)"; return st; }
+                                  op.at(B, j0, 0, n), n, op.at(B, r0, 0, n), n)) && failed(st, query)) { *where = "gemm(T)"; return st; }
             }
         }
         return 0;
@@ -245,9 +253,9 @@ struct Sweep {
         for (int64_t j0 = last; j0 >= 0; j0 -= bk.nb) {
             const int64_t ib = std::min(bk.nb, n - j0);
             if ((st = op.trsm(kFillUpper, kOpNone, diag, ib, kc, op.at(const_cast<void*>(M), j0, j0, n), n,
-                              op.at(B, j0, 0, n), n)) && !query) { *where = "trsm(N)"; return st; }
+                              op.at(B, j0, 0, n), n)) && failed(st, query)) { *where = "trsm(N)"; return st; }
             if (j0 > 0 && (st = op.gemm(kOpNone, j0, kc, ib, op.at(const_cast<void*>(M), 0, j0, n), n,
-                                        op.at(B, j0, 0, n), n, B, n)) && !query) { *where = "gemm(N)"; return st; }
+                                        op.at(B, j0, 0, n), n, B, n)) && failed(st, query)) { *where = "gemm(N)"; return st; }
         }
         return 0;
     }
@@ -268,7 +276,7 @@ static RbStatus one_matrix(const Ops& op, const Blocking& bk, int mode, int64_t 
                            void* a, void* b, const RbInt* piv_in, RbInt* ipiv, RbInt* info,
                            bool query, std::string* where) {
     RbStatus st = 0;
-    if (mode == 0 && (st = op.getrf(n, a, ipiv, info)) && !query) { *where = "getrf"; return st; }
+    if (mode == 0 && (st = op.getrf(n, a, ipiv, info)) && failed(st, query)) { *where = "getrf"; return st; }
     const RbInt* pv = mode == 0 ? ipiv : piv_in;
     const Sweep sw{op, bk, n, query, where};
     for (int64_t c0 = 0; c0 < nrhs; c0 += bk.kc) {
@@ -278,10 +286,10 @@ static RbStatus one_matrix(const Ops& op, const Blocking& bk, int mode, int64_t 
             case 0:
                 if ((st = sw.trans(true, kFillUpper, kDiagNonUnit, a, B, kc))) return st;
                 if ((st = sw.trans(false, kFillLower, kDiagUnit, a, B, kc))) return st;
-                if ((st = op.laswp(kc, B, n, n, pv, -1)) && !query) { *where = "laswp(-1)"; return st; }
+                if ((st = op.laswp(kc, B, n, n, pv, -1)) && failed(st, query)) { *where = "laswp(-1)"; return st; }
                 break;
             case 1:
-                if ((st = op.laswp(kc, B, n, n, pv, 1)) && !query) { *where = "laswp(+1)"; return st; }
+                if ((st = op.laswp(kc, B, n, n, pv, 1)) && failed(st, query)) { *where = "laswp(+1)"; return st; }
                 if ((st = sw.trans(true, kFillUpper, kDiagUnit, a, B, kc))) return st;
                 if ((st = sw.trans(false, kFillLower, kDiagNonUnit, a, B, kc))) return st;
                 break;
@@ -296,9 +304,46 @@ static RbStatus one_matrix(const Ops& op, const Blocking& bk, int mode, int64_t 
     return 0;
 }
 
-static ffi::Error run(int mode, lrx::gpu::Stream stream, ffi::ScratchAllocator& scratch,
+// Caller holds dh->m. Query the exact blocked call sequence without allocating
+// matrix or workspace buffers; query mode ignores their null pointers.
+static ffi::Error workspace_locked(DeviceHandle* dh, int mode, int kind,
+                                   int64_t n, int64_t nrhs, size_t* bytes) {
+    const auto key = std::make_tuple(mode, kind, n, nrhs);
+    auto it = dh->ws.find(key);
+    if (it == dh->ws.end()) {
+        const Api& Ap = api();
+        const Ops op(Ap, dh->h, kind);
+        const Blocking bk = blocking(n, nrhs, op.es);
+        std::string where;
+        LORRAX_LIB_CHECK(Ap.start_query(dh->h), 0, "rocblas_start_device_memory_size_query");
+        size_t need = 0;
+        const RbStatus q = one_matrix(op, bk, mode, n, nrhs, nullptr, nullptr,
+                                     nullptr, nullptr, nullptr, true, &where);
+        const RbStatus s = Ap.stop_query(dh->h, &need);
+        if (q != 0 || s != 0) {
+            std::ostringstream os;
+            os << "rocsolver workspace query status=" << q << " at " << where
+               << "; rocblas_stop_device_memory_size_query status=" << s;
+            return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        }
+        it = dh->ws.emplace(key, need).first;
+    }
+    *bytes = it->second;
+    return ffi::Error::Success();
+}
+
+static ffi::Error workspace_extent(int mode, int64_t n, size_t vendor, size_t* total) {
+    constexpr size_t align = 256;
+    const size_t pivots = mode == 0 ? static_cast<size_t>(n) * sizeof(RbInt) : 0;
+    if (vendor > std::numeric_limits<size_t>::max() - (align - 1) - pivots)
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, "rocsolver workspace size overflow");
+    *total = (vendor + align - 1) / align * align + pivots;
+    return ffi::Error::Success();
+}
+
+static ffi::Error run(int mode, lrx::gpu::Stream stream,
                       ffi::AnyBuffer a, ffi::AnyBuffer b, const RbInt* piv_in, void* lu_out,
-                      void* x_out, RbInt* info_out) {
+                      void* x_out, RbInt* info_out, void* workspace, size_t workspace_bytes) {
     const Api& Ap = api();
     if (!Ap.err.empty()) return ffi::Error(ffi::ErrorCode::kFailedPrecondition, Ap.err);
     const auto da = a.dimensions();
@@ -327,6 +372,16 @@ static ffi::Error run(int mode, lrx::gpu::Stream stream, ffi::ScratchAllocator& 
     const Blocking bk = blocking(n, nrhs, kind == kS ? 4 : (kind == kZ ? 16 : 8));
     DeviceHandle* dh = nullptr;
     FFI_RETURN_IF_ERROR(device_handle(&dh));
+    std::lock_guard<std::mutex> lk(dh->m);
+    size_t bytes = 0, total = 0;
+    FFI_RETURN_IF_ERROR(workspace_locked(dh, mode, kind, n, nrhs, &bytes));
+    FFI_RETURN_IF_ERROR(workspace_extent(mode, n, bytes, &total));
+    if (workspace_bytes != total) {
+        std::ostringstream os;
+        os << "GATE rocsolver-lu-workspace: explicit result has " << workspace_bytes
+           << " bytes; native query requires " << total;
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
     const Ops op(Ap, dh->h, kind);
     const size_t a_bytes = static_cast<size_t>(n) * n * op.es, b_bytes = static_cast<size_t>(n) * nrhs * op.es;
     if (lu_out != nullptr && lu_out != a.untyped_data()) {
@@ -335,44 +390,18 @@ static ffi::Error run(int mode, lrx::gpu::Stream stream, ffi::ScratchAllocator& 
     if (x_out != b.untyped_data()) {
         LORRAX_GPU_CHECK(lrx::gpu::memcpy_async(x_out, b.untyped_data(), batch * b_bytes, lrx::gpu::kDeviceToDevice, stream));
     }
-    RbInt* ip = nullptr;
-    if (mode == 0) {
-        std::optional<void*> piv = scratch.Allocate(static_cast<size_t>(n) * sizeof(RbInt));
-        if (!piv) return ffi::Error(ffi::ErrorCode::kResourceExhausted, "scratch for the pivots");
-        ip = static_cast<RbInt*>(*piv);
-    }
+    RbInt* ip = mode == 0 ? reinterpret_cast<RbInt*>(
+        static_cast<char*>(workspace) + total - static_cast<size_t>(n) * sizeof(RbInt)) : nullptr;
     char* const a0 = static_cast<char*>(mode == 0 ? lu_out : const_cast<void*>(a.untyped_data()));
     char* const x0 = static_cast<char*>(x_out);
-    std::lock_guard<std::mutex> lk(dh->m);
     LORRAX_LIB_CHECK(Ap.set_stream(dh->h, stream), 0, "rocblas_set_stream");
     std::string where;
     auto matrix = [&](int64_t q, bool query) {
         return one_matrix(op, bk, mode, n, nrhs, a0 + q * a_bytes, x0 + q * b_bytes,
                           piv_in ? piv_in + q * n : nullptr, ip, info_out ? info_out + q : nullptr, query, &where);
     };
-    // Workspace: one size-query pass over the same call sequence (host only: nothing is enqueued).
-    const auto key = std::make_tuple(mode == 0 ? 0 : 1 + mode, kind, n, nrhs);
-    auto it = dh->ws.find(key);
-    if (it == dh->ws.end()) {
-        size_t bytes = 0;
-        LORRAX_LIB_CHECK(Ap.start_query(dh->h), 0, "rocblas_start_device_memory_size_query");
-        const RbStatus q = matrix(0, true);
-        const RbStatus s = Ap.stop_query(dh->h, &bytes);
-        if (s != 0) {
-            std::ostringstream os;
-            os << "rocblas_stop_device_memory_size_query status=" << s << " (solver query " << q << " at " << where << ")";
-            return ffi::Error(ffi::ErrorCode::kInternal, os.str());
-        }
-        it = dh->ws.emplace(key, bytes).first;
-    }
-    const size_t bytes = it->second;
-    void* ws = nullptr;
-    if (bytes > 0) {
-        std::optional<void*> p = scratch.Allocate(bytes);
-        if (!p) return ffi::Error(ffi::ErrorCode::kResourceExhausted, "scratch for rocBLAS workspace");
-        ws = *p;
-    }
-    LORRAX_LIB_CHECK(Ap.set_workspace(dh->h, ws, bytes), 0, "rocblas_set_workspace");
+    LORRAX_LIB_CHECK(Ap.set_workspace(dh->h, bytes ? workspace : nullptr, bytes), 0, "rocblas_set_workspace");
+    ffi::Error result = ffi::Error::Success();
     for (int64_t q = 0; q < batch; ++q) {
         const RbStatus st = matrix(q, false);
         if (st != 0) {
@@ -380,54 +409,101 @@ static ffi::Error run(int mode, lrx::gpu::Stream stream, ffi::ScratchAllocator& 
             os << "rocsolver lu/tri solve (mode " << mode << "): " << where << " status=" << st << " (n=" << n
                << ", nrhs=" << nrhs << ", matrix " << q << " of " << batch << ", nb=" << bk.nb << ", kc=" << bk.kc
                << ", ws=" << bytes << " B, " << Ap.path << ")";
-            return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+            result = ffi::Error(ffi::ErrorCode::kInternal, os.str());
+            break;
         }
     }
-    return ffi::Error::Success();
+    // Enqueued kernels retain their pointers. The handle must not retain a
+    // borrowed XLA buffer after this call; detaching enqueues no sync.
+    const RbStatus detached = Ap.set_workspace(dh->h, nullptr, 0);
+    if (result.failure()) return result;
+    LORRAX_LIB_CHECK(detached, 0, "rocblas_set_workspace(detach)");
+    return result;
 }
 
-static ffi::Error lu_solve(lrx::gpu::Stream stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer a,
+static ffi::Error lu_solve(lrx::gpu::Stream stream, ffi::AnyBuffer a,
                            ffi::AnyBuffer b, ffi::Result<ffi::AnyBuffer> lu, ffi::Result<ffi::AnyBuffer> x,
-                           ffi::Result<ffi::Buffer<ffi::S32>> info) {
+                           ffi::Result<ffi::Buffer<ffi::S32>> info,
+                           ffi::Result<ffi::Buffer<ffi::U8>> workspace) {
     if (lu->element_type() != a.element_type() || x->element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "GATE rocsolver-lu-dtype: lu, x like a, b");
     }
-    return run(0, stream, scratch, a, b, nullptr, lu->untyped_data(), x->untyped_data(), info->typed_data());
+    return run(0, stream, a, b, nullptr, lu->untyped_data(), x->untyped_data(), info->typed_data(),
+               workspace->typed_data(), workspace->element_count());
 }
 
-static ffi::Error tri_solve(lrx::gpu::Stream stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer a,
+static ffi::Error tri_solve(lrx::gpu::Stream stream, ffi::AnyBuffer a,
                             ffi::AnyBuffer b, ffi::Buffer<ffi::S32> piv, ffi::Result<ffi::AnyBuffer> x,
-                            int64_t mode) {
+                            ffi::Result<ffi::Buffer<ffi::U8>> workspace, int64_t mode) {
     if (x->element_type() != b.element_type()) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "GATE rocsolver-lu-dtype: x like b");
     }
     if (mode == 1 && piv.element_count() != a.element_count() / std::max<int64_t>(1, a.dimensions().back())) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, "GATE rocsolver-lu-piv: want piv [..., n] for mode 1");
     }
-    return run(static_cast<int>(mode), stream, scratch, a, b, mode == 1 ? piv.typed_data() : nullptr,
-               nullptr, x->untyped_data(), nullptr);
+    return run(static_cast<int>(mode), stream, a, b, mode == 1 ? piv.typed_data() : nullptr,
+               nullptr, x->untyped_data(), nullptr, workspace->typed_data(), workspace->element_count());
 }
 
 }  // namespace lorrax_ffi::rocsolver_lu
+
+// Shape-only query, on the same mapped rocSOLVER and per-device handle as
+// execution. No matrix, pivot or queried workspace buffer is allocated.
+extern "C" int lrx_rocsolver_lu_workspace_bytes(int mode, int kind, int64_t n, int64_t nrhs,
+                                               uint64_t* out, char* error, size_t capacity) {
+    using namespace lorrax_ffi::rocsolver_lu;
+    auto report = [&](const std::string& message) {
+        if (error != nullptr && capacity > 0) {
+            const size_t length = std::min(message.size(), capacity - 1);
+            std::memcpy(error, message.data(), length);
+            error[length] = '\0';
+        }
+        return 1;
+    };
+    if (out == nullptr) return report("workspace query needs an output pointer");
+    *out = 0;
+    if (mode < 0 || mode > 3 || kind < kS || kind > kZ || n < 0 || nrhs < 0 ||
+        n > INT32_MAX || nrhs > INT32_MAX)
+        return report("workspace query needs mode0..3, kind0..3, n/nrhs0..INT32_MAX");
+    if (n == 0 || nrhs == 0) return 0;
+    const size_t item = kind == kS ? 4 : kind == kZ ? 16 : 8;
+    if (static_cast<uint64_t>(n) > std::numeric_limits<size_t>::max() /
+            (static_cast<uint64_t>(std::max(n, nrhs)) * item))
+        return report("workspace query matrix byte span overflows size_t");
+    try {
+        const auto& Ap = api();
+        if (!Ap.err.empty()) return report(Ap.err);
+        DeviceHandle* dh = nullptr;
+        if (auto e = device_handle(&dh); e.failure()) return report(e.message());
+        std::lock_guard<std::mutex> lock(dh->m);
+        size_t vendor = 0, total = 0;
+        if (auto e = workspace_locked(dh, mode, kind, n, nrhs, &vendor); e.failure()) return report(e.message());
+        if (auto e = workspace_extent(mode, n, vendor, &total); e.failure()) return report(e.message());
+        *out = total;
+        return 0;
+    } catch (const std::exception& e) {
+        return report(e.what());
+    }
+}
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     RocsolverLuSolveFfi, lorrax_ffi::rocsolver_lu::lu_solve,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<lrx::gpu::Stream>>()
-        .Ctx<xla::ffi::ScratchAllocator>()
         .Arg<xla::ffi::AnyBuffer>()                    // a  [..., n, n]   row-major A (= A^T col-major)
         .Arg<xla::ffi::AnyBuffer>()                    // b  [..., nrhs, n] B^T row-major (= B col-major)
         .Ret<xla::ffi::AnyBuffer>()                    // lu [..., n, n]   (aliased to a)
         .Ret<xla::ffi::AnyBuffer>()                    // x  [..., nrhs, n] (aliased to b)
-        .Ret<xla::ffi::Buffer<xla::ffi::S32>>());      // info [...]
+        .Ret<xla::ffi::Buffer<xla::ffi::S32>>()       // info [...]
+        .Ret<xla::ffi::Buffer<xla::ffi::U8>>());      // explicit workspace + pivots
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     RocsolverTriSolveFfi, lorrax_ffi::rocsolver_lu::tri_solve,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<lrx::gpu::Stream>>()
-        .Ctx<xla::ffi::ScratchAllocator>()
         .Arg<xla::ffi::AnyBuffer>()                    // a   [..., n, n]  read only (LU, or L)
         .Arg<xla::ffi::AnyBuffer>()                    // b   [..., nrhs, n] B^T row-major
         .Arg<xla::ffi::Buffer<xla::ffi::S32>>()        // piv [..., n] 1-based (mode 1; else unused)
         .Ret<xla::ffi::AnyBuffer>()                    // x   [..., nrhs, n] (aliased to b)
+        .Ret<xla::ffi::Buffer<xla::ffi::U8>>()         // explicit workspace
         .Attr<int64_t>("mode"));                       // 1 lu_solve, 2 L x = b, 3 L^T x = b

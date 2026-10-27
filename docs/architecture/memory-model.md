@@ -254,13 +254,14 @@ group-pass admission. Its individual factors and GEMMs can have compiled
 prices; those do not price their combined live set or admit the initial V/S
 allocations. The grouped estimate is not a complete capacity certificate.
 
-Wide ROCm local LU/triangular applications have a separate query gap.
-`distrib_la.local_lu._native_tri` selects the blocked native handler when one
-logical matrix's A or RHS span exceeds 2³¹ bytes. That handler queries and
-allocates rocBLAS workspace at execution, but no planner-facing query exposes
-those bytes yet. Compiled layout copies and pivots do not account for that
-dynamic allocation. This affects wide ζ LU formers too; a small-case CPU/CUDA
-pass does not establish complete pricing for that ROCm regime.
+Wide ROCm local LU/triangular applications use the blocked native handler when
+one logical matrix's A or RHS span exceeds 2³¹ bytes. Its shape query and
+execution share the same blocked rocSOLVER/rocBLAS call sequence. An explicit
+byte-buffer result holds the queried vendor workspace and, for factor-and-solve,
+the pivot vector. The actual executable's price therefore includes this scratch
+beside its layout copies and outputs; callers do not add a separate estimate.
+This does not change the one-device solve's capacity or provide a distributed
+ROCm LU backend.
 
 ### Why the pool's reserved bytes run past R {#pool-growth}
 

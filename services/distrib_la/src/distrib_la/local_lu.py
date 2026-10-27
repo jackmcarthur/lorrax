@@ -103,6 +103,39 @@ def _as_matrix_rhs(a, b):
     return (b[..., None] if vec else b), vec
 
 
+def _workspace_bytes(mode, n, nrhs, dtype):
+    """Native workspace + mode-0 pivots, owned by an explicit FFI result.
+
+    The query uses the execution handler's mapped provider and blocked call
+    sequence. It may create a small handle, but allocates no matrix or queried
+    scratch buffer. The native owner caches sizes by current device and shape.
+    """
+    import ctypes
+    from distrib_la.loader import get_lib
+    kinds = {"float32": 0, "float64": 1, "complex64": 2, "complex128": 3}
+    lib = get_lib("ROCM")
+    name = "lrx_rocsolver_lu_workspace_bytes"
+    if not hasattr(lib, name):
+        raise RuntimeError(f"GATE local_lu_workspace: native provider must export {name}; rebuild the whole native pair")
+    query = getattr(lib, name)
+    query.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64,
+                      ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p, ctypes.c_size_t]
+    query.restype = ctypes.c_int
+    out, error = ctypes.c_uint64(), ctypes.create_string_buffer(512)
+    status = query(mode, kinds[np.dtype(dtype).name], n, nrhs,
+                   ctypes.byref(out), error, ctypes.sizeof(error))
+    if status:
+        raise RuntimeError(f"GATE local_lu_workspace: mode={mode}, n={n}, nrhs={nrhs}, dtype={dtype}: "
+                           + error.value.decode("utf-8", errors="replace"))
+    return int(out.value)
+
+
+def _workspace_result(a, b, mode):
+    size = _workspace_bytes(int(mode), int(a.shape[-1]), int(b.shape[-1]),
+                            np.dtype(a.dtype).name)
+    return jax.ShapeDtypeStruct((size,), jnp.uint8)
+
+
 def _native_solve(row, a, b):
     """One FFI call for the whole stack.  The handler reads the row-major ``a`` as A^T
     (column-major) and factors it in place; ``b`` goes in as B^T row-major (= B column-major)
@@ -110,10 +143,10 @@ def _native_solve(row, a, b):
     _require_target(row.target)
     b, vec = _as_matrix_rhs(a, b)
     bt = jnp.swapaxes(b, -1, -2)
-    _lu, xt, _info = jax.ffi.ffi_call(
+    _lu, xt, _info, _workspace = jax.ffi.ffi_call(
         row.target,
         (jax.ShapeDtypeStruct(a.shape, a.dtype), jax.ShapeDtypeStruct(bt.shape, bt.dtype),
-         jax.ShapeDtypeStruct(a.shape[:-2], jnp.int32)),
+         jax.ShapeDtypeStruct(a.shape[:-2], jnp.int32), _workspace_result(a, b, 0)),
         input_output_aliases={0: 0, 1: 1},
         vmap_method="broadcast_all")(a, bt)
     x = jnp.swapaxes(xt, -1, -2)
@@ -131,8 +164,8 @@ def _native_tri(row, a, b, mode, piv=None, conj=False):
         bt = jnp.conj(bt)
     pv = (jnp.zeros(a.shape[:-1], jnp.int32) if piv is None
           else (piv.astype(jnp.int32) + 1))             # rocSOLVER pivots are 1-based
-    xt = jax.ffi.ffi_call(
-        row.tri_target, jax.ShapeDtypeStruct(bt.shape, bt.dtype),
+    xt, _workspace = jax.ffi.ffi_call(
+        row.tri_target, (jax.ShapeDtypeStruct(bt.shape, bt.dtype), _workspace_result(a, b, mode)),
         input_output_aliases={1: 0}, vmap_method="broadcast_all")(a, bt, pv, mode=np.int64(mode))
     if conj:
         xt = jnp.conj(xt)

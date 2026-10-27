@@ -157,6 +157,71 @@ def _on_rocm():
         return False
 
 
+def test_workspace_query_modes_and_named_refusals(monkeypatch):
+    """All modes use the native size owner and never hide a failed query."""
+    import ctypes
+    from types import SimpleNamespace
+    from distrib_la import loader, local_lu as ll
+
+    calls = []
+
+    def query(mode, kind, n, nrhs, out, error, capacity):
+        calls.append((mode, kind, n, nrhs))
+        if n == 19:
+            ctypes.memmove(error, b"query rejected\0", 15)
+            return 1
+        out._obj.value = 768 + (4 * n if mode == 0 else 0)
+        return 0
+
+    monkeypatch.setattr(loader, "get_lib", lambda leg: SimpleNamespace(
+        lrx_rocsolver_lu_workspace_bytes=query))
+    dtypes = ("float32", "float64", "complex64", "complex128")
+    for mode in range(4):
+        expected = 768 + (4 * 17 if mode == 0 else 0)
+        for dtype in dtypes:
+            assert ll._workspace_bytes(mode, 17, 5, dtype) == expected
+    assert calls == [(mode, kind, 17, 5) for mode in range(4) for kind in range(4)]
+    with pytest.raises(RuntimeError, match="GATE local_lu_workspace.*query rejected"):
+        ll._workspace_bytes(2, 19, 5, "complex128")
+    monkeypatch.setattr(loader, "get_lib", lambda leg: SimpleNamespace())
+    with pytest.raises(RuntimeError, match="must export lrx_rocsolver_lu_workspace_bytes"):
+        ll._workspace_bytes(2, 21, 5, "float64")
+
+
+def test_native_call_declares_queried_workspace_for_matrix_and_vector_rhs(monkeypatch):
+    """Trace the real bridge: even discarded scratch remains an FFI result.
+
+    This checks the Python ABI without executing or emulating a native solve.
+    Numerical and exact workspace-query checks require the ROCm gate.
+    """
+    import jax
+    import jax.numpy as jnp
+    from distrib_la import local_lu as ll
+
+    queries = []
+
+    def query(mode, n, nrhs, dtype):
+        queries.append((mode, n, nrhs, dtype))
+        return 1024 + mode
+
+    monkeypatch.setattr(ll, "_require_target", lambda target: None)
+    monkeypatch.setattr(ll, "_workspace_bytes", query)
+    row = ll.LOCAL_LU_ROUTE["ROCM"]
+    for vector in (False, True):
+        a = jax.ShapeDtypeStruct((2, 17, 17), jnp.complex64)
+        b = jax.ShapeDtypeStruct((2, 17) if vector else (2, 17, 5), jnp.complex64)
+        for mode in range(4):
+            fn = (lambda a, b: ll._native_solve(row, a, b)) if mode == 0 else (
+                lambda a, b: ll._native_tri(row, a, b, mode))
+            traced = jax.make_jaxpr(fn)(a, b)
+            calls = [eq for eq in traced.jaxpr.eqns if eq.primitive.name == "ffi_call"]
+            assert len(calls) == 1
+            scratch = calls[0].outvars[-1].aval
+            assert scratch.shape == (1024 + mode,) and scratch.dtype == jnp.uint8
+            assert traced.out_avals[0].shape == b.shape
+            assert queries[-1] == (mode, 17, 1 if vector else 5, "complex64")
+
+
 @pytest.mark.skipif(not _on_rocm(), reason="GPU (ROCm) regression: needs an MI250X GCD")
 @pytest.mark.parametrize("n,dt", [(11776, "complex128"), (16512, "float64"), (16512, "complex64"),
                                   (23296, "float32")])
