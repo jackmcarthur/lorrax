@@ -329,18 +329,25 @@ def _executable(program, args):
 #: Measured eigh walls by platform, complex128: CUDA = A100-SXM4-80GB, ``dla_sweep`` P4 2x2 (the
 #: rows behind resolve.ONE_DEVICE_BY_ROOM): seconds per matrix on one device (jaxlib cuSOLVER,
 #: one rank's batch) and per call on the whole mesh (cuSOLVERMp 0.9.1): n 312 x64 0.022 / 1.97 s,
-#: 8192 x4 2.05 / 6.53 s, 16384 x4 13.7 / 29.0 s. A platform without a row (ROCm: unmeasured)
-#: decides by memory alone (route (c) where it fits). float64 takes the complex128 row.
+#: 8192 x4 2.05 / 6.53 s, 16384 x4 13.7 / 29.0 s. ROCM = MI250X, P4 B1 owned
+#: Householder fixture, max rank of two warm checked calls, rounded up (2026-10-27).
+#: Its small anchors include about 50 ms of capture/control overhead, not isolated provider
+#: time. float64 uses the complex128 row; its 8192/16384 crossover was checked separately.
+#: Platforms without a row decide by memory alone (route (c) where it fits).
 _EIGH_SECONDS = {"CUDA": {"one": ((312, 0.022 / 16), (8192, 2.05), (16384, 13.7)),
-                          "mesh": ((312, 1.97 / 64), (8192, 6.53 / 4), (16384, 29.0 / 4))}}
+                          "mesh": ((312, 1.97 / 64), (8192, 6.53 / 4), (16384, 29.0 / 4))},
+                 "ROCM": {"one": ((256, .053468), (2048, .185800), (3120, .365155),
+                                  (4096, .858695), (8192, 6.455992), (16384, 42.510331)),
+                          "mesh": ((256, .100177), (2048, .433320), (3120, .753626),
+                                   (4096, 1.042569), (8192, 3.251526), (16384, 14.051309))}}
 
 
 def _eigh_seconds(kind, n, ranks=4, platform="CUDA"):
     """Expected seconds of one n x n eigh, ``kind`` 'one' (one device) or 'mesh' (``ranks``), or
     None without a measured row: the points log-log interpolated, n^3 past the last, the fixed
     cost below the first. On P <= 4 the mesh's part above its fixed cost scales as 4/P. On P > 4
-    the mesh is held at its P4 time up to the last measured n (16384; P16 is unmeasured there,
-    open: a P16 sweep at n 2048-8192), and past it only the growth beyond t(16384) scales as 4/P,
+    the mesh is held at its P4 time up to the last measured n (16384), and past it only the
+    growth beyond t(16384) scales as 4/P,
     so the curve is continuous (n 100000 at P16: 417 s predicted, 312 s measured, eighmem
     2026-10-18)."""
     pts = _EIGH_SECONDS.get(str(platform), {}).get(kind)
@@ -394,10 +401,14 @@ def room_class(cache, key, room, build):
     return value
 
 
-def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all") -> StackRoute:
+def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all", *,
+          whole_mesh_available=True) -> StackRoute:
     """THE placement of an eigh stack (nb, n, n) in ``room`` bytes per rank: the faster of the
     routes whose price fits, priced from their compiled code and native workspace query and timed by
     :func:`_eigh_seconds`, so every rank decides alike with no exchange.
+
+    Only an available whole-mesh provider competes on time. A missing capacity library or
+    an explicitly resolved one-device backend keeps a fitting local route.
 
     Route (c) at the most whole matrices per rank whose compiled program (:func:`_stack_bytes`)
     fits, ceil(nb/P) one-device solves; else the whole mesh (``mesh_bytes()``: the plan's own
@@ -420,9 +431,13 @@ def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all") -> St
                      + local_eigh_workspace(mesh, tried, n, dtype, batched=True))
             if room_test(lambda r, p=price: p <= r, room):
                 one, on_mesh = (_eigh_seconds(k, n, ranks, platform) for k in ("one", "mesh"))
-                if one is None or -(-nb // ranks) * one <= nb * on_mesh:
+                if (not whole_mesh_available or one is None
+                        or -(-nb // ranks) * one <= nb * on_mesh):
                     return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, price, room)
-                break
+                mesh_price = mesh_bytes()
+                if mesh_price is not None and room_test(lambda r, p=mesh_price: p <= r, room):
+                    return StackRoute(provider, 0, 1, mesh_price, room)
+                return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, price, room)
             per_rank = room_test(lambda r, k=per_rank, p=price: min(k - 1, max(1, k * r // p)), room)
     return StackRoute(provider, 0, 1, mesh_bytes(), room)
 
@@ -1407,7 +1422,8 @@ class Plan:
 
     def _decide_stack(self, op, nb, n, dtype, phase, traced=True) -> StackRoute:
         return place(op, self.mesh, nb, n, dtype, int(self.budget_bytes), self.batched_route,
-                     lambda: self.mesh_bytes(op, nb, n, dtype, phase), phase)
+                     lambda: self.mesh_bytes(op, nb, n, dtype, phase), phase,
+                     whole_mesh_available=self.capacity_refusal is None and self.backend != ONE_DEVICE)
 
     def mesh_bytes(self, op, nb, n, dtype, phase="all") -> int | None:
         """The bytes per rank of this plan's own program for an (nb, n, n) stack off route (c):

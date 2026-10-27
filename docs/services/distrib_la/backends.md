@@ -224,9 +224,11 @@ sees. The size route is declared in a leg row, printed once per decision
 (rank 0) and kept in `Plan.describe()`. An explicit `elpa` is still honoured
 as named. `one_device` refuses (`GATE one_device`) on a leg without a row or
 beyond the bound. The capacity provider of an `auto` plan with a room
-(`resolve_eigh_capacity`) stays the library. It runs only stacks of which not
-one whole matrix per rank fits the room, and `one_device` would need exactly
-that.
+(`resolve_eigh_capacity`) stays the library. The shared stack chooser compares
+its measured cost with fitting local rounds, and selects it on time only when
+the provider's own quote fits. An unavailable provider cannot displace a fitting
+local route. If no local round fits, the mesh route remains the minimum-footprint
+candidate with the existing over-budget reporting policy.
 
 Measured at P4 2×2 MI250X, complex128, steady s (pool log `distla_bound1`):
 
@@ -268,12 +270,17 @@ compile. Each decision is a route-ledger line. The result is what
 Vendor workspaces allocated at run time (jaxlib's cuSOLVER `getrf`/`getrs`
 scratch) are outside the analysis.
 
-For a matrix that fits one device, a distributed library's cost is its fixed
-per-call charge, almost all of it inside `cusolverMpSyevd`, which the local
-kernel does not pay. That is why `auto` eigh resolves to native and route (c)
-is the default stack route: `distributed` is for a matrix too large for one
-device or a mesh spanning nodes, never for speed. Measurements behind the
-rule are in the docstring of `distrib_la.resolve._announce_eigh_fixed_cost`.
+Without a room, `auto` eigh resolves to native and route (c) remains the default
+stack route. A room-bearing `auto` plan with `batched_route="auto"` uses
+`plan._EIGH_SECONDS`: it compares `ceil(B/P)` local solves with `B` mesh solves.
+The ROCm MI250X P4 complex128 anchors span 256–16384, including about 50 ms of
+diagnostic capture/control cost at the small end. Batch-one ELPA was about
+2–3 times faster at 8192/16384; local solves won through 4096. Float64 shares
+that approximate timing row, with the same large-side winners checked after
+the real ELPA thread-cap repair. This estimates selection cost, not isolated
+provider throughput. The existing conservative P>4 model is retained. ELPA's
+small, fallback and context allocations remain outside its compiled arena
+([native workspace coverage](../../architecture/memory-model.md#measured)).
 
 **cuSOLVERMp eigh is block-cyclic by relabeling.** A `P('x','y')` operand is
 one `(n/p, n/p)` tile per rank. Handing cuSOLVERMp the same local buffers with

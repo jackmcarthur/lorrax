@@ -96,14 +96,14 @@ if plan.batch_in_sharding is not None:
     U = distrib_la.ensure_sharding(U, plan.batch_in_sharding)
 ```
 
-**Native Cholesky and LU.** Under `backend="native"`, `Plan(A)` implements `eigh` only; single-matrix `cholesky` and `solve_lu` raise `NotImplementedError`, because the replicated native form is a policy of the calling stage. Reach them through `batched_route="batch_reshard"`, through `backend="native2d"` (Cholesky), or through an FFI backend.
+**Native Cholesky and LU.** Under `backend="native"`, `Plan(A)` implements `eigh` only; single-matrix `cholesky` and `solve_lu` raise `NotImplementedError`, because the replicated native form is a policy of the calling stage. Reach them through `batched_route="batch_reshard"`, through `backend="native2d"` (Cholesky or partial-pivot LU), or through an FFI backend.
 
 ### Result checks {: #result-checks }
 
 The distributed libraries can return wrong eigenvectors with a success status, so no distributed result is returned unchecked.
 
 - Exact-zero rows of an eigh operand are replaced by distinct negative diagonal sentinels and returned as exact zero eigenvalues with unit vectors, on every route.
-- Every distributed eigh is checked against 8 fixed probe columns $X$: $\lVert(AZ - Z\,\mathrm{diag}(w))X\rVert/(\lVert A\rVert\lVert X\rVert)$ and $\lVert(Z^\dagger Z - I)X\rVert/\lVert X\rVert$ must be within `roundoff_tol(n)`. A failure is retried (unshifted at a smaller block, shifted by $s\,I$, then gathered on every rank when $n \le 1448$ complex), each retry noted on rank 0's stderr.
+- Every distributed eigh is checked against 8 fixed probe columns $X$: $\lVert(AZ - Z\,\mathrm{diag}(w))X\rVert/(\lVert A\rVert\lVert X\rVert)$ and $\lVert(Z^\dagger Z - I)X\rVert/\lVert X\rVert$ must be within `roundoff_tol(n)`. A failure is retried (unshifted at a smaller block, shifted by $s\,I$, then gathered on every rank only when the compiled gathered program plus local workspace is within the gathered allowance or caller's room), each retry noted on rank 0's stderr.
 - A caller that keeps only $w > c\,\max(w)$ passes `cut=c` to `batched`, so only the kept columns are checked.
 - Every distributed LU and Cholesky is checked on its solution through sketches taken before the library consumes the operands; there is no retry.
 - A result that still fails is NaN-poisoned on every rank, and an eager call prints and raises `GATE distrib_la_result_check` naming the op, `n` and the call site.
@@ -124,7 +124,7 @@ The caller chooses `batched_route` from `BATCHED_ROUTE_CHOICES = ("auto", "batch
 
 ### Eigh stacks with a room {: #eigh-room }
 
-A caller holding a face stack passes its free memory per rank, `plan("eigh", mesh, n=n, backend=request, budget_bytes=room)`, and the service decides each stack (`StackRoute`): route (c) in as few slices as fit the room, otherwise the whole-mesh distributed backend. Every rank decides alike from shapes and the room alone. Under `backend="auto"` with no distributed backend available on the mesh, a stack that needs the whole mesh is refused by name (`GATE eigh_capacity_route`).
+A caller holding a face stack passes its free memory per rank, `plan("eigh", mesh, n=n, backend="auto", budget_bytes=room, batched_route="auto")`, and the service decides each stack (`StackRoute`). It prices route (c) in as few slices as fit, then compares its measured timing model with the available whole-mesh provider's model. A faster provider is selected only when its own quote fits too. If no local slice fits, the minimum-footprint whole-mesh route keeps the existing over-budget reporting policy. Every rank uses the same shapes, room and fixed timing table; no runtime timing tuner runs. When the distributed provider is unavailable, a fitting local route stays available; a stack that needs the missing provider refuses by name (`GATE eigh_capacity_route`). Explicit backend resolution and the default `batch_reshard` route retain their separate contracts.
 
 | name | purpose |
 |---|---|
@@ -152,14 +152,14 @@ X = run(F_b, Z_face)                                       # per call: only Z mo
 
 | op | `BACKEND_CHOICES[op]` | `auto` resolves to | `distributed` resolves to |
 |---|---|---|---|
-| `eigh` | `auto off distributed cusolvermp elpa scalapack one_device` | `native` | CPU `scalapack`; CUDA `cusolvermp`; ROCm `one_device` for $n \le 16384$, else `elpa` |
+| `eigh` | `auto off distributed cusolvermp elpa scalapack one_device` | `native` without a room; with a room, the capacity provider and per-stack chooser above | CPU `scalapack`; CUDA `cusolvermp`; ROCm `one_device` for $n \le 16384$, else `elpa` |
 | `cholesky` | `auto off native2d cusolvermp` | `cusolvermp` on a CUDA mesh with $P_x, P_y \ge 2$ when compiled, else `native` | not offered |
-| `solve_lu` | `auto off distributed cusolvermp scalapack one_device` | as `cholesky` (ROCm: `native`) | CPU `scalapack`; CUDA `cusolvermp`; ROCm `one_device` within the room, refused beyond it |
+| `solve_lu` | `auto off distributed native2d cusolvermp scalapack one_device` | as `cholesky` (ROCm: `native`) | CPU `scalapack`; CUDA `cusolvermp`; ROCm `one_device` within the supplied room, `native2d` otherwise |
 
 - `off` (alias `native`, the constant `NATIVE`) is the pure-JAX path, `jnp.linalg.eigh` or the caller's own Cholesky and LU.
-- `native2d` is a pure-JAX 2-D block-distributed tiled Cholesky on every platform. At $n = 10^4$, $P = 128$ it uses 5 MB per device against 1.6 GB for the replicated route. `auto` never picks it.
+- `native2d` provides pure-JAX 2-D block-distributed Cholesky and general partial-pivot LU on every platform. Coefficient and RHS faces stay distributed, with bounded panels; pivot communication adds latency. It is also the ROCm `distributed` LU capacity provider when one complete solve does not fit the supplied room.
 - `one_device` moves each matrix whole onto one device (route (c)'s exchange), solves it there with the native kernel and returns the face layout. It keeps the FFI operand contract, so a `distributed` call site runs it unchanged. On CUDA, given a room, `distributed` resolves to `one_device` when one whole matrix's program fits the room, else to `cusolvermp`.
-- `auto` eigh is always native: a q-batched local eigh solves $P$ matrices at once, while a distributed library solves one matrix $P$ ways and walks the batch serially. `distributed` is a capacity route, for a matrix too large for one device.
+- `auto` eigh without a room remains native. With a room and `batched_route="auto"`, the fixed measured CUDA/ROCm models compare $\lceil B/P\rceil$ local solves against $B$ mesh solves. Large batch-one ROCm solves can favor ELPA while batches of at least $P$ fitting matrices favor local parallelism. The complex128 timing row is also a float64 approximation; its large crossover was checked, but it is neither an isolated-provider benchmark nor a capacity certificate.
 
 Geometry guards: cuSOLVERMp eigh and ELPA need a square mesh; cuSOLVERMp Cholesky and LU need $P_x \ge 2$ and $P_y \ge 2$; ScaLAPACK needs a square or 1-D mesh. cuSOLVERMp eigh with `compute_evecs=False` is refused (the library returns an error status at every $n$): always ask for eigenvectors.
 
