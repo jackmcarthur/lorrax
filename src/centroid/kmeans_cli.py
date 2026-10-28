@@ -69,6 +69,22 @@ def build_parser() -> argparse.ArgumentParser:
                         "for --density-mode current; pass explicitly to "
                         "override (e.g. multiple current-mode runs at "
                         "different n_centroids).")
+    # Selector-study switches (ISDF_RANK_SCALING §10).  Each default is the
+    # production selector, bit for bit.
+    p.add_argument("--prune-q-shells", type=int, default=0, metavar="K",
+                   help="Prune on the pair Gram summed over q = 0 and K "
+                        "nonzero q of the k grid (one per |q| shell, spread "
+                        "from the shortest shell to the longest; each q "
+                        "weighted 1/(K+1)) instead of the q = 0 Gram alone. "
+                        "Charge mode only. Default 0: q = 0.")
+    p.add_argument("--weight-power", type=float, default=0.5, metavar="P",
+                   help="k-means mass = (diag q=0 Gram)^P. 0.5 (default) is "
+                        "the feature norm; a smaller P flattens the mass "
+                        "toward low-density regions such as a slab's vacuum.")
+    p.add_argument("--prune-normalize", type=float, default=0.0, metavar="G",
+                   help="Prune on D^-G Gram D^-G, D = diag Gram (floored at "
+                        "1e-12 max). 0 (default) is the plain Gram; 0.5 is "
+                        "the amplitude-blind correlation matrix.")
     return p
 
 
@@ -341,9 +357,15 @@ def _resolve_weight(args, wfn, sym, R, tau, dist_mesh=None):
     if R is not None:
         from .charge_density import symmetrize_on_grid
         metric_diagonal = symmetrize_on_grid(metric_diagonal, R, tau)
-    weight = np.sqrt(metric_diagonal)
+    power = float(args.weight_power)
+    if power == 0.5:
+        weight = np.sqrt(metric_diagonal)
+        mass = "sqrt"
+    else:
+        weight = np.maximum(metric_diagonal, 0.0) ** power
+        mass = f"power {power:g} of"
     label = (
-        f"sqrt(diag q=0 {mode} Gram), left={left_range}, "
+        f"{mass}(diag q=0 {mode} Gram), left={left_range}, "
         f"right={right_range}, unit band weights")
     return weight, label, (left_range, right_range)
 
@@ -436,10 +458,23 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
         verbose=(debug_print_enabled() and process_rank() == 0),
         band_range_left=left_range,
         band_range_right=right_range,
+        gram_normalize=float(args.prune_normalize),
     )
+    q_note = ""
+    if int(args.prune_q_shells) > 0:
+        from .pivoted_cholesky import prune_q_union
+        kwargs["q_union"] = prune_q_union(wfn, sym, int(args.prune_q_shells))
+        q_note = (" + q " + ", ".join(
+            "(" + ",".join(f"{v:.4g}" for v in q) + ")"
+            for q in kwargs["q_union"][0]) + f", each weight 1/"
+            f"{len(kwargs['q_union'][0]) + 1}")
     log.info(f"  prune window: left={left_range} right={right_range} "
              f"[{range_label}]; Gram="
-             f"{'Σ_i Z_i Z_i† (i=1,2,3)' if args.density_mode == 'current' else 'charge'}")
+             f"{'Σ_i Z_i Z_i† (i=1,2,3)' if args.density_mode == 'current' else 'charge'}"
+             f" at q = 0{q_note}"
+             + (f"; normalized D^-{float(args.prune_normalize):g} G "
+                f"D^-{float(args.prune_normalize):g}"
+                if float(args.prune_normalize) else ""))
 
     with timing.section("prune"):
         keep_idx, rank, *_, unpicked = prune_candidates_by_pivoted_cholesky(
@@ -720,6 +755,11 @@ def _select_and_report(args, run, stages):
     kgrid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
     shift = tuple(float(v) for v in np.asarray(wfn.shift).reshape(-1)[:3])
     prune_state = "pivoted Cholesky" if pruned else "not applied"
+    if pruned and int(args.prune_q_shells) > 0:
+        prune_state += (f" on the q-union Gram (q = 0 + {int(args.prune_q_shells)}"
+                        " |q| shells)")
+    if pruned and float(args.prune_normalize):
+        prune_state += f"; Gram normalized D^-{float(args.prune_normalize):g}"
     rank_law = (None if args.density_mode == "current" else
                 rank_law_estimate(
                     left=prune_left, right=prune_right, nspinor=wfn.nspinor,

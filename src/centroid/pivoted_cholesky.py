@@ -270,6 +270,102 @@ def _candidate_gram_zero_kernel(mesh_xy: Mesh, n_points: int):
     return _zero
 
 
+@lru_cache(maxsize=None)
+def _face_band_slice_kernel(mesh_xy: Mesh, lo: int, hi: int):
+    """Band rows ``[lo, hi)`` of an X/Y face pair, shardings kept."""
+    x_sh = NamedSharding(mesh_xy, PartitionSpec(None, "x", None, None))
+    y_sh = NamedSharding(mesh_xy, PartitionSpec(None, None, None, "y"))
+
+    @partial(jax.jit, in_shardings=(x_sh, y_sh), out_shardings=(x_sh, y_sh))
+    def _slice(X, Y):
+        return X[:, :, lo:hi, :], Y[:, lo:hi, :, :]
+
+    return _slice
+
+
+@lru_cache(maxsize=None)
+def _face_q_phase_kernel(mesh_xy: Mesh):
+    """``X·e^{iq·r_a}``, ``Y·e^{-iq·r_b}``: the k+q faces in the periodic gauge.
+
+    With full-Bloch faces the pair ``ψ_{mk} ψ*_{n,k+q}`` carries ``e^{-iq·r}``;
+    these phases make the q-Gram that of ``u_{mk} u*_{n,k+q}``, the function
+    the ζ_q fit represents, so every q term sees the points in one cell.
+    """
+    x_sh = NamedSharding(mesh_xy, PartitionSpec(None, "x", None, None))
+    y_sh = NamedSharding(mesh_xy, PartitionSpec(None, None, None, "y"))
+    rep = NamedSharding(mesh_xy, PartitionSpec())
+
+    @partial(jax.jit, in_shardings=(x_sh, y_sh, rep),
+             out_shardings=(x_sh, y_sh), donate_argnums=(0, 1))
+    def _phase(X, Y, ph):
+        return X * ph[None, :, None, None], Y * jnp.conj(ph)[None, None, None, :]
+
+    return _phase
+
+
+@lru_cache(maxsize=None)
+def _gram_scale_kernel(sharding):
+    """``s_a G_ab s_b`` on the row-sharded select carrier."""
+    rep = NamedSharding(sharding.mesh, PartitionSpec())
+
+    @partial(jax.jit, in_shardings=(sharding, rep), out_shardings=sharding,
+             donate_argnums=(0,))
+    def _scale(G, s):
+        return G * s[:, None] * s[None, :]
+
+    return _scale
+
+
+def prune_q_union(wfn, sym, n_shells: int):
+    """``(q_frac, partner)`` of the q-union prune Gram.
+
+    The k grid's q are reduced to their shortest image and grouped into
+    shells of equal |q|; ``n_shells`` shells are taken evenly from the
+    shortest to the longest, one representative q each.  ``partner[i, k]``
+    is the full-BZ row of ``k + q_i``.  An orbit-closed point set fits every
+    member of a star as well as its representative, so one q per shell is
+    enough; the representative choice only steers the greedy order.
+    """
+    del sym
+    kfull = np.asarray(wfn.kvecs(k="full_bz"), dtype=np.float64)
+    nk = int(kfull.shape[0])
+    kgrid = [int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3]]
+    avec = np.asarray(wfn.avec, dtype=np.float64)
+    bvec = np.asarray(wfn.bvec, dtype=np.float64)
+    if not np.allclose(avec @ bvec.T, np.eye(3), atol=1e-6):
+        bvec = bvec.T
+    if not np.allclose(avec @ bvec.T, np.eye(3), atol=1e-6):
+        raise ValueError("prune_q_union: avec and bvec are not dual lattices")
+    bmat = float(wfn.blat) * bvec                      # rows b_i, bohr^-1
+    grid = np.stack(np.meshgrid(*[np.arange(n) / n for n in kgrid],
+                                indexing="ij"), -1).reshape(-1, 3)
+    images = np.stack(np.meshgrid(*([np.arange(-1, 2)] * 3), indexing="ij"),
+                      -1).reshape(-1, 3)
+    cand = grid[:, None, :] + images[None, :, :]
+    length = np.linalg.norm(cand @ bmat, axis=-1)
+    best = np.argmin(length, axis=1)
+    rows = np.arange(grid.shape[0])
+    qs, qlen = cand[rows, best], np.round(length[rows, best], 8)
+    shells = np.unique(qlen[qlen > 1e-8])
+    if shells.size == 0:
+        raise ValueError("prune_q_union: the k grid has no nonzero q")
+    pick = np.unique(np.rint(np.linspace(
+        0, shells.size - 1, int(n_shells))).astype(int))
+    q_frac = np.asarray([qs[np.flatnonzero(qlen == shells[i])[0]]
+                         for i in pick])
+    partner = np.empty((q_frac.shape[0], nk), dtype=np.int32)
+    for i, q in enumerate(q_frac):
+        diff = kfull[None, :, :] - (kfull[:, None, :] + q)
+        diff -= np.rint(diff)
+        dist = np.abs(diff).max(axis=-1)
+        partner[i] = np.argmin(dist, axis=1)
+        if (np.any(dist[np.arange(nk), partner[i]] > 1e-6)
+                or np.unique(partner[i]).size != nk):
+            raise ValueError(
+                f"prune_q_union: k + q is not a full-BZ row for q={q}")
+    return q_frac, partner
+
+
 def _resolve_candidate_gamma_mode(gamma_mode: str, *, bispinor: bool) -> str:
     """Validate the candidate feature family before loading wavefunctions."""
     mode = str(gamma_mode).strip().lower()
@@ -783,8 +879,15 @@ def prune_candidates_by_pivoted_cholesky(
     tol_rel: float | None = None,
     n_point_budget: int | None = None,
     group_block: bool = False,
+    q_union=None,
+    gram_normalize: float = 0.0,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
+
+    ``q_union`` (:func:`prune_q_union`) adds the k+q Grams of a few q to the
+    q = 0 Gram, each weighted 1/(K+1).  ``gram_normalize = g`` pivots on
+    ``D^-g G D^-g`` (D = diag G floored at 1e-12 max): g = 0.5 ranks points by
+    direction alone, so low-amplitude (vacuum) candidates compete.
 
     Requires a 2-D mesh ``('x', 'y')`` (single-device callers pass a 1×1
     mesh — same shape gw_jax uses). Wavefunction loading goes through
@@ -954,12 +1057,22 @@ def prune_candidates_by_pivoted_cholesky(
             band_norms=band_norms,
             k_weights=k_weights,
             gamma_mode=gamma_mode,
+            q_union=q_union,
         )
         # Reshard ('x','y') → row-sharded for the column-major pivot scan.
         G = jax.lax.with_sharding_constraint(
             G, NamedSharding(mesh, PartitionSpec(select_axis, None)),
         )
         G.block_until_ready()
+        if float(gram_normalize):
+            d = np.real(np.asarray(jnp.diag(G)))
+            d_live = d[:M]
+            floor = 1e-12 * float(d_live.max())
+            scale = np.ones(d.shape[0], dtype=np.float64)
+            scale[:M] = (np.maximum(d_live, floor) / float(d_live.max())) ** (
+                -float(gram_normalize))
+            G = _gram_scale_kernel(G.sharding)(G, scale)
+            G.block_until_ready()
     # M_pad is whatever the builder produced (round_up(M, n_dev)); the trailing
     # n_pad rows/cols are zero-padding, NOT candidates.
     M_pad = int(G.shape[0])
@@ -1273,8 +1386,15 @@ def build_gram_q0_via_loadwfns(
     k_weights: np.ndarray | None = None,
     band_chunk_size: int = 64,
     memory_per_device_gb: float | None = None,
+    q_union=None,
 ) -> jnp.ndarray:
     """Accumulate the exact q=0 Gram over fixed-tile full-BZ k batches.
+
+    ``q_union = (q_frac, partner)`` adds, per batch, the Grams of the pairs
+    ``u_{mk} u*_{n,k+q}`` for each listed q: the right window is reloaded at
+    the partner rows ``partner[i][batch]`` and phased into the periodic gauge,
+    the left window is the batch's own faces.  q = 0 and each q weigh
+    1/(K+1).
 
     The only persistent result is the P(x,y) candidate Gram. The shared WFN
     sampler returns X/Y faces for this batch alone. k weights retain their
@@ -1323,6 +1443,16 @@ def build_gram_q0_via_loadwfns(
         return padded_axis(width, tile, name="candidate WFN band accumulator").carrier
     nb_faces = bands(nb_r) + (
         0 if _left_band_slice(left, right) is not None else bands(nb_l))
+    q_weight = 1.0
+    if q_union is not None:
+        if _left_band_slice(left, right) is None or band_norms is not None:
+            raise ValueError(
+                "the q-union Gram needs the left window inside the right one "
+                "and no band norms")
+        q_frac, partner = q_union
+        q_weight = 1.0 / (1 + len(q_frac))
+        # The batch's faces, their left copy and one k+q right face at once.
+        nb_faces = 2 * bands(nb_r) + bands(nb_l)
     per_k = 16*ns*mu*nb_faces*(1.0/px+1.0/py)
     k_limit = tile_units(per_k, nk)
     n_chunks = -(-nk // k_limit)
@@ -1347,6 +1477,12 @@ def build_gram_q0_via_loadwfns(
         k1 = min(nk, k0+k_batch)
         rows = (None if n_chunks == 1 and nk == nk_full else
                 tuple(int(k) for k in selected_rows[k0:k1]))
+        q_partners = None
+        if q_union is not None:
+            batch = (np.arange(nk_full) if rows is None
+                     else np.asarray(rows, dtype=np.int64))
+            q_partners = [(tuple(int(k) for k in partner[i][batch]),
+                           q_frac[i], q_weight) for i in range(len(q_frac))]
         block = _build_gram_q0_kbatch(
             wfn, sym, cand_idx, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
             bispinor=bispinor, gamma_mode=gamma_mode, verbose=verbose,
@@ -1354,7 +1490,7 @@ def build_gram_q0_via_loadwfns(
             band_norms=band_norms, k_weights=weights[k0:k1],
             band_chunk_size=band_chunk_size,
             memory_per_device_gb=memory_per_device_gb, full_k_rows=rows,
-            hermitian_fold=False)
+            hermitian_fold=False, q0_weight=q_weight, q_partners=q_partners)
         result = block if result is None else _candidate_gram_add_kernel(mesh_xy)(result, block)
         jax.block_until_ready(result)
         # The sum reuses the running accumulator, not both input buffers.
@@ -1369,6 +1505,54 @@ def build_gram_q0_via_loadwfns(
     result = _candidate_gram_hermitian_fold_kernel(mesh_xy)(result)
     result.block_until_ready()
     return result
+
+
+def _add_q_partner_grams(G, psi_r_X, psi_r_Y, left_slice, q_partners, *,
+                         wfn, sym, meta, cand_idx, bispinor, mesh_xy,
+                         right_range, band_chunk_size, kw_np, col_block,
+                         gamma_mode):
+    """``G + Σ_q w_q G_q`` with ``G_q`` the Gram of ``u_{mk} u*_{n,k+q}``.
+
+    The left window is the batch's own right faces (band rows
+    ``left_slice``); the right window is reloaded at the batch's k+q rows
+    and phased into the periodic gauge (:func:`_face_q_phase_kernel`).
+    """
+    from common.wfn_transforms import load_centroids_band_chunked
+    from isdf import gram_q0_tiled_from_psi_sm
+    if left_slice is None:
+        raise ValueError("the q-union Gram needs the left window inside the "
+                         "right one")
+    M = int(cand_idx.shape[0])
+    M_cols = int(psi_r_Y.shape[3])
+    left_X, left_Y = _face_band_slice_kernel(
+        mesh_xy, int(left_slice[0]), int(left_slice[1]))(psi_r_X, psi_r_Y)
+    r_frac = (np.asarray(cand_idx, dtype=np.float64)
+              / np.asarray(wfn.fft_grid, dtype=np.float64))
+    for rows_q, q_frac, w_q in q_partners:
+        with timing.section("q_union.load"):
+            q_Y, q_X = load_centroids_band_chunked(
+                wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
+                band_chunk_size=band_chunk_size,
+                k_chunk_size=len(rows_q), full_k_rows=tuple(rows_q),
+            )
+        phase = np.ones(M_cols, dtype=np.complex128)
+        phase[:M] = np.exp(2j * np.pi * (r_frac @ np.asarray(q_frac)))
+        with timing.section("q_union.sum"):
+            q_X, q_Y = _face_q_phase_kernel(mesh_xy)(q_X, q_Y, phase)
+            G_q = gram_q0_tiled_from_psi_sm(
+                _candidate_gram_zero_kernel(mesh_xy, M_cols)(),
+                left_X, left_Y, q_X, q_Y,
+                jnp.asarray(kw_np * float(w_q), dtype=jnp.float64),
+                mesh_xy=mesh_xy, tile_width=col_block,
+                gamma_mode=gamma_mode, left_bands=None,
+            )
+            del q_X, q_Y
+            G = _candidate_gram_add_kernel(mesh_xy)(G, G_q)
+            G.block_until_ready()
+        G_q.delete()
+        del G_q
+    del left_X, left_Y
+    return G
 
 
 @lru_cache(maxsize=None)
@@ -1400,8 +1584,15 @@ def _build_gram_q0_kbatch(
     memory_per_device_gb: float | None = None,
     full_k_rows=None,
     hermitian_fold: bool = True,
+    q0_weight: float = 1.0,
+    q_partners=None,
 ) -> jnp.ndarray:
     """Build the q=0 candidate Gram on a 2-D mesh using gw_jax's data path.
+
+    ``q_partners``: ``(rows, q_frac, weight)`` per extra q; each adds the
+    Gram of ``u_{mk} u*_{n,k+q}`` (right window reloaded at ``rows``, the
+    k+q partners of this batch) times ``weight``; q = 0 enters times
+    ``q0_weight``.
 
     Two band-window call modes:
 
@@ -1544,7 +1735,7 @@ def _build_gram_q0_kbatch(
             raise ValueError(
                 "k_weights must be finite, nonnegative, and sum to one; "
                 f"got sum={kw_np.sum():.17g}")
-    kw = jnp.asarray(kw_np, dtype=jnp.float64)
+    kw = jnp.asarray(kw_np * float(q0_weight), dtype=jnp.float64)
 
     # Memory budget for the band-+k-chunker. ``load_centroids_band_chunked``
     # reads ``meta.memory_per_device_gb`` to size the FFT-box per chunk; if
@@ -1698,6 +1889,13 @@ def _build_gram_q0_kbatch(
             mesh_xy=mesh_xy, tile_width=col_block,
             gamma_mode=gamma_mode, left_bands=left_slice,
         )
+        if q_partners:
+            G = _add_q_partner_grams(
+                G, psi_r_rmuT_X, psi_r_rmu_Y, left_slice, q_partners,
+                wfn=wfn, sym=sym, meta=meta, cand_idx=cand_idx,
+                bispinor=bispinor, mesh_xy=mesh_xy, right_range=right_range,
+                band_chunk_size=band_chunk_size, kw_np=kw_np,
+                col_block=col_block, gamma_mode=gamma_mode)
         # Standalone calls retain their Hermitian result. The k-batch owner
         # requests raw blocks and performs this same fold after summation.
         if hermitian_fold:
