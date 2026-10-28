@@ -23,7 +23,17 @@ KMEANS_STAGES = (
 
 def validate_mode_policy(args) -> None:
     """Refuse current-mode switches that change its physical metric."""
+    if int(getattr(args, "prune_q_shells", 0)) < 0:
+        raise ValueError("--prune-q-shells must be >= 0")
+    if float(getattr(args, "weight_power", 0.5)) <= 0.0:
+        raise ValueError("--weight-power must be positive")
+    if float(getattr(args, "prune_normalize", 0.0)) < 0.0:
+        raise ValueError("--prune-normalize must be >= 0")
     if args.density_mode == "current":
+        if int(getattr(args, "prune_q_shells", 0)) > 0:
+            raise ValueError(
+                "--prune-q-shells is a charge-Gram option; current-mode "
+                "selection prunes on the q = 0 transverse Gram")
         if args.no_symmetries:
             raise ValueError(
                 "current centroid selection requires the crystal's "
@@ -241,6 +251,19 @@ def kmeans_settings_rows(args, *, source) -> list:
                         source("--no-symmetries"),
                         "literal points" if args.no_symmetries else
                         "closed under the decorated-atom space group"))
+    shells = int(getattr(args, "prune_q_shells", 0))
+    if shells:
+        rows.append(Setting("prune_q_shells", str(shells), "cli",
+                            f"prune Gram summed over q = 0 and {shells} "
+                            "nonzero q shells"))
+    power = float(getattr(args, "weight_power", 0.5))
+    if power != 0.5:
+        rows.append(Setting("weight_power", f"{power:g}", "cli",
+                            "k-means mass = (diag q=0 Gram)^P"))
+    normalize = float(getattr(args, "prune_normalize", 0.0))
+    if normalize:
+        rows.append(Setting("prune_normalize", f"{normalize:g}", "cli",
+                            "prune on D^-G Gram D^-G"))
     return rows
 
 
