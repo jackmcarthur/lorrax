@@ -217,7 +217,7 @@ Fixes one N,N shape, $D_q = \alpha A_q B_q + \beta C_q$ for $q < n_q$, with `A (
 - `alpha` and `beta` are compile-time constants. `out=` donates an existing buffer for its storage and is legal only with `beta = 0`. Pass `C` or `out`, not both.
 - `warmup=True` compiles and runs an axis plan once on dummy operands so a timed loop pays nothing; `warmup=False` defers compilation to the first call, for a plan used inside one outer `jit`.
 - `backend="off"` is refused: a planned GEMM exists to avoid whole operands on every device.
-- For `layout="axis"`, `out_spec=P(None,'x',None)` or `P(None,None,'y')` keeps one centroid axis sharded, and `reduction_axis="x"` or `"y"` contracts a tiled axis with a local GEMM and a `psum_scatter`. `local_gemm_plan(mesh, *, m, k, n, nq, dtype, alpha, beta, reduction_axis, out_spec, enable_active_range, warmup)` builds this layout directly.
+- For `layout="axis"`, `out_spec=P(None,'x',None)` or `P(None,None,'y')` keeps one centroid axis sharded; `local_gemm_plan`'s `out_spec=P(None,None,('x','y'))` or `P(None,None,('y','x'))` tiles `n` over the whole flattened mesh with `A` replicated, one local GEMM per rank; and `reduction_axis="x"` or `"y"` contracts a tiled axis with a local GEMM and a `psum_scatter`. `local_gemm_plan(mesh, *, m, k, n, nq, dtype, alpha, beta, reduction_axis, out_spec, enable_active_range, warmup)` builds this layout directly.
 
 The COHSEX Green's function in `src/gw/cohsex_sigma.py` plans one face GEMM per run, contracting bands for each k point:
 

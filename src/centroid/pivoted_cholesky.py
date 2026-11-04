@@ -859,6 +859,30 @@ def _unpicked_over_floor(d_final, d0max, tol_rel) -> float:
     return float(np.max(d_final, initial=0.0)) / (tol * float(d0max))
 
 
+def check_pair_space_window(wfn: "WfnLoader", max_band: int) -> None:
+    """Refuse a band window past half the plane-wave basis.
+
+    For centroid pruning to be meaningful, the pair-product space must be
+    significantly smaller than the full plane-wave basis; once we include
+    > 50 % of the available PW degrees of freedom, the candidate-vs-grid
+    distinction blurs and the user should be pruning the real-space grid
+    directly.  Shared by the Gram and the sketch prune.
+    """
+    ngk_max = int(np.max(wfn.ngk)) if hasattr(wfn, 'ngk') else None
+    nspinor = int(wfn.nspinor)
+    if ngk_max is not None:
+        npw_basis = ngk_max * nspinor  # size of the plane-wave basis per k
+        if max_band > 0.5 * npw_basis:
+            raise ValueError(
+                f"Requested band window touches band {max_band}, which "
+                f"exceeds 50 % of the plane-wave basis size "
+                f"({0.5 * npw_basis:.0f} = 0.5 · ngk_max · nspinor = "
+                f"0.5 · {ngk_max} · {nspinor}). Centroid pruning is "
+                f"ill-posed in this regime — prune on the full real-space "
+                f"grid directly instead."
+            )
+
+
 def prune_candidates_by_pivoted_cholesky(
     wfn: "WfnLoader",
     sym: symmetry_maps.SymMaps,
@@ -988,24 +1012,7 @@ def prune_candidates_by_pivoted_cholesky(
             )
         max_band = max(int(band_range_left[1]), int(band_range_right[1]))
 
-    # Plane-wave-basis sanity check. For centroid pruning to be
-    # meaningful, the pair-product space must be significantly smaller
-    # than the full plane-wave basis; once we include > 50 % of the
-    # available PW degrees of freedom, the candidate-vs-grid distinction
-    # blurs and the user should be pruning the real-space grid directly.
-    ngk_max = int(np.max(wfn.ngk)) if hasattr(wfn, 'ngk') else None
-    nspinor = int(wfn.nspinor)
-    if ngk_max is not None:
-        npw_basis = ngk_max * nspinor  # size of the plane-wave basis per k
-        if max_band > 0.5 * npw_basis:
-            raise ValueError(
-                f"Requested band window touches band {max_band}, which "
-                f"exceeds 50 % of the plane-wave basis size "
-                f"({0.5 * npw_basis:.0f} = 0.5 · ngk_max · nspinor = "
-                f"0.5 · {ngk_max} · {nspinor}). Centroid pruning is "
-                f"ill-posed in this regime — prune on the full real-space "
-                f"grid directly instead."
-            )
+    check_pair_space_window(wfn, max_band)
 
     select_axis = dist.require_axes(mesh, dist.MESH_AXES,
                                     "prune_candidates_by_pivoted_cholesky")
@@ -1369,6 +1376,200 @@ def _gram_meta_band_counts(wfn_nelec: int, max_band: int,
     return occupied, int(max_band) - occupied
 
 
+def _candidate_band_carrier(width: int, mesh_xy: Mesh, band_chunk_size: int) -> int:
+    """Band rows the shared sampler's accumulator holds for one window.
+
+    The accumulator rounds a window of ``width`` bands up to whole transfer
+    tiles of ``min(width, band_chunk_size)`` bands padded to the mesh size.
+    """
+    from runtime.padding import padded_axis
+    tile = padded_axis(min(width, max(1, int(band_chunk_size))), int(mesh_xy.size),
+                       name="candidate WFN band tile").carrier
+    return padded_axis(width, tile, name="candidate WFN band accumulator").carrier
+
+
+def _candidate_k_schedule(wfn, sym, k_weights, per_k: float):
+    """The fixed-tile full-BZ k batches shared by the Gram and the sketch.
+
+    Parameters
+    ----------
+    wfn, sym
+        The open loader and its ``SymMaps``.
+    k_weights : (nk_tot,) float or None
+        Normalized nonnegative full-BZ weights; ``None`` is uniform.
+    per_k : float
+        Per-rank bytes of one k row of the batch's WFN faces.
+
+    Returns
+    -------
+    ``(rows, weights, nk, nk_full, k_batch, n_chunks)``: the positive-weight
+    full-BZ rows in batch order and their weights, their count, the full-BZ
+    count, the rows per batch (the most whose faces fit
+    :data:`runtime.tiles.TILE_BYTES`) and the batch count.  Several batches
+    hold whole symmetry stars, so the loader reads each raw parent once per
+    band tile; one batch keeps the canonical full-BZ order.
+    """
+    from runtime.tiles import tile_units
+    nk_full = int(sym.nk_tot)
+    weights = (np.full(nk_full, 1.0/nk_full) if k_weights is None
+               else np.asarray(k_weights, dtype=np.float64))
+    if (weights.shape != (nk_full,) or not np.isfinite(weights).all()
+            or np.any(weights < 0)
+            or not np.isclose(weights.sum(), 1.0, rtol=1e-12, atol=1e-14)):
+        raise ValueError("candidate Gram needs normalized nonnegative full-BZ k weights")
+    selected_rows = np.flatnonzero(weights > 0)
+    weights = weights[selected_rows]
+    nk = int(selected_rows.size)
+    k_limit = tile_units(per_k, nk)
+    n_chunks = -(-nk // k_limit)
+    k_batch = -(-nk // n_chunks)
+    if n_chunks > 1:
+        # Whole stars per batch: the loader reads a raw parent once per band
+        # tile of the batch that holds its children.
+        w_full = np.zeros(nk_full, dtype=np.float64)
+        w_full[selected_rows] = weights
+        selected_rows = np.concatenate([
+            children for _, children in wfn.full_k_parent_groups(selected_rows)
+        ]).astype(np.int64)
+        weights = w_full[selected_rows]
+    return selected_rows, weights, nk, nk_full, k_batch, n_chunks
+
+
+def _load_candidate_faces(
+    wfn: "WfnLoader",
+    sym: symmetry_maps.SymMaps,
+    cand_idx,
+    mesh_xy: Mesh,
+    *,
+    left_range: tuple[int, int],
+    right_range: tuple[int, int],
+    n_val: int | None,
+    n_cond: int | None,
+    bispinor: bool,
+    band_norms,
+    band_chunk_size: int,
+    memory_per_device_gb: float | None,
+    full_k_rows,
+    gamma_mode: str,
+    verbose: bool,
+):
+    """One k batch's candidate WFN faces through the shared sampler.
+
+    The one loader path of both candidate metrics (the Gram and the sketch):
+    ``common.wfn_transforms.load_centroids_band_chunked`` on a ``Meta`` for
+    the windows, with the pseudoband clamp ``ψ /= max(norm, 1)`` on both
+    faces when ``band_norms`` is given.  A left window inside the right one
+    is not loaded again: it is the right faces' band rows ``left_slice``.
+
+    Returns
+    -------
+    ``(meta, left_slice, psi_l_Y, psi_l_X, psi_r_Y, psi_r_X)``.  ``*_Y`` is
+    ``(nk, nb, ns, M_pad)`` at ``P(None, None, None, 'y')``; ``*_X`` is
+    the conjugate ``(nk, M_pad, nb, ns)`` at ``P(None, 'x', None, None)``.
+    The left pair is ``None`` when ``left_slice`` is not.
+    """
+    from common.meta import Meta
+    from common.wfn_transforms import load_centroids_band_chunked
+    nb_left = left_range[1] - left_range[0]
+    nb_right = right_range[1] - right_range[0]
+    max_band = max(left_range[1], right_range[1])
+    # Meta.nval is physical occupancy, not the width of the left feature
+    # window.  Explicit windows may cross the occupied boundary.
+    meta_nval, meta_ncond = _gram_meta_band_counts(
+        wfn.nelec, max_band, n_val, n_cond)
+    M = int(cand_idx.shape[0])
+    cand_idx = jnp.asarray(cand_idx, dtype=jnp.int64)
+    meta = Meta.from_system(
+        wfn, sym,
+        nval=meta_nval, ncond=meta_ncond,
+        nband=max_band,
+        n_rmu=M,
+        bispinor=bispinor,
+    )
+
+    # Memory budget for the band-+k-chunker. ``load_centroids_band_chunked``
+    # reads ``meta.memory_per_device_gb`` to size the FFT-box per chunk; if
+    # the caller didn't pin a budget, auto-detect device HBM the same way
+    # gw_config does so the prune path tracks whatever the rest of LORRAX
+    # is using.
+    if memory_per_device_gb is None or memory_per_device_gb <= 0:
+        from common.gpu_utils import device_budget_bytes
+        memory_per_device_gb = device_budget_bytes() / 1e9
+    meta.memory_per_device_gb = minimum_process_budget_gb(memory_per_device_gb)
+
+    # Prune must not retain the full-k G-flat WFN beside both final centroid
+    # faces.  One batch streams one raw parent at a time (k tile 1).  A k
+    # batch of whole stars is one k tile: the loader's union read then takes
+    # each raw parent once per band tile, and the tile's G-flat and sampled
+    # faces are a band-tile fraction of the batch faces its planner priced.
+    prune_k_tile = 1 if full_k_rows is None else len(full_k_rows)
+
+    # Optional pseudoband norms — same clamp recipe as isdf_fitting.
+    if band_norms is not None:
+        band_norms_np = np.asarray(band_norms, dtype=np.float64)
+        if band_norms_np.shape[0] < max_band:
+            raise ValueError(
+                f"band_norms has {band_norms_np.shape[0]} entries but "
+                f"the left/right windows touch band {max_band}"
+            )
+        norms_l = np.maximum(
+            band_norms_np[left_range[0]:left_range[1]], 1.0,
+        )
+        norms_r = np.maximum(
+            band_norms_np[right_range[0]:right_range[1]], 1.0,
+        )
+        norms_l_j = jnp.asarray(norms_l, dtype=jnp.float64)
+        norms_r_j = jnp.asarray(norms_r, dtype=jnp.float64)
+    else:
+        norms_l_j = None
+        norms_r_j = None
+
+    if verbose:
+        log.debug(f"[pivoted_cholesky] 2-D Gram build via load_wfns: "
+              f"nk_tot={sym.nk_tot}, left={left_range} (nb={nb_left}), "
+              f"right={right_range} (nb={nb_right}), M={M}, "
+              f"gamma_mode={gamma_mode}, "
+              f"norms={'on' if band_norms is not None else 'off'}, "
+              f"backend=WfnLoader(auto), "
+              f"budget={meta.memory_per_device_gb:g} GB/device, "
+              f"band chunk={band_chunk_size}, "
+              f"transfer_k_tile={prune_k_tile}")
+
+    # ---- Left window (the right window when the left is inside it) ----
+    left_slice = _left_band_slice(left_range, right_range)
+    first_range, first_norms = (
+        (right_range, norms_r_j) if left_slice is not None
+        else (left_range, norms_l_j))
+    with timing.section("left.load"):
+        psi_a_rmu_Y, psi_a_rmuT_X = load_centroids_band_chunked(
+            wfn, sym, meta, cand_idx, bispinor, mesh_xy, first_range,
+            band_chunk_size=band_chunk_size,
+            k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
+        )
+        if first_norms is not None:
+            # Y shape (nk, nb, ns, n_rmu); X shape (nk, n_rmu, nb, ns)
+            psi_a_rmu_Y = psi_a_rmu_Y / first_norms[None, :, None, None]
+            psi_a_rmuT_X = psi_a_rmuT_X / first_norms[None, None, :, None]
+        psi_a_rmu_Y.block_until_ready()
+    if left_slice is not None:
+        # One load serves both windows: the left faces are the right faces'
+        # band rows [lo, hi), bit for bit what a separate load would give.
+        return meta, left_slice, None, None, psi_a_rmu_Y, psi_a_rmuT_X
+    with timing.section("right.load"):
+        psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
+            wfn, sym, meta, cand_idx, bispinor, mesh_xy,
+            right_range,
+            band_chunk_size=band_chunk_size,
+            k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
+        )
+        if norms_r_j is not None:
+            psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
+            psi_r_rmuT_X = (
+                psi_r_rmuT_X / norms_r_j[None, None, :, None])
+        psi_r_rmu_Y.block_until_ready()
+    return meta, None, psi_a_rmu_Y, psi_a_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X
+
+
 def build_gram_q0_via_loadwfns(
     wfn: "WfnLoader",
     sym: symmetry_maps.SymMaps,
@@ -1408,8 +1609,7 @@ def build_gram_q0_via_loadwfns(
     batch reads each raw WFN parent once per band tile instead of once per
     child; one batch keeps the canonical full-BZ order.
     """
-    from runtime.padding import padded_axis, padded_mu_extent
-    from runtime.tiles import tile_units
+    from runtime.padding import padded_mu_extent
     if band_range_left is None or band_range_right is None:
         if n_val is None or n_cond is None:
             raise ValueError("supply n_val/n_cond or both explicit band windows")
@@ -1420,27 +1620,14 @@ def build_gram_q0_via_loadwfns(
     nb_l, nb_r = int(left[1]-left[0]), int(right[1]-right[0])
     if min(nb_l, nb_r) <= 0:
         raise ValueError("candidate Gram band windows must be nonempty")
-    nk_full = int(sym.nk_tot)
-    weights = (np.full(nk_full, 1.0/nk_full) if k_weights is None
-               else np.asarray(k_weights, dtype=np.float64))
-    if (weights.shape != (nk_full,) or not np.isfinite(weights).all()
-            or np.any(weights < 0)
-            or not np.isclose(weights.sum(), 1.0, rtol=1e-12, atol=1e-14)):
-        raise ValueError("candidate Gram needs normalized nonnegative full-BZ k weights")
-    selected_rows = np.flatnonzero(weights > 0)
-    weights = weights[selected_rows]
-    nk = int(selected_rows.size)
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
     mu = padded_mu_extent(int(cand_idx.shape[0]), mesh_xy)
     ns = 4 if bispinor else int(wfn.nspinor)
     # The current sampler's band accumulator rounds to its transfer tile.
     # Price that padding, both returned faces, and both distinct windows;
     # a left window inside the right one is a slice of the right faces.
-    p_band = int(mesh_xy.size)
     def bands(width):
-        tile = padded_axis(min(width, max(1, int(band_chunk_size))), p_band,
-                           name="candidate WFN band tile").carrier
-        return padded_axis(width, tile, name="candidate WFN band accumulator").carrier
+        return _candidate_band_carrier(width, mesh_xy, band_chunk_size)
     nb_faces = bands(nb_r) + (
         0 if _left_band_slice(left, right) is not None else bands(nb_l))
     q_weight = 1.0
@@ -1454,18 +1641,8 @@ def build_gram_q0_via_loadwfns(
         # The batch's faces, their left copy and one k+q right face at once.
         nb_faces = 2 * bands(nb_r) + bands(nb_l)
     per_k = 16*ns*mu*nb_faces*(1.0/px+1.0/py)
-    k_limit = tile_units(per_k, nk)
-    n_chunks = -(-nk // k_limit)
-    k_batch = -(-nk // n_chunks)
-    if n_chunks > 1:
-        # Whole stars per batch: the loader reads a raw parent once per band
-        # tile of the batch that holds its children.
-        w_full = np.zeros(nk_full, dtype=np.float64)
-        w_full[selected_rows] = weights
-        selected_rows = np.concatenate([
-            children for _, children in wfn.full_k_parent_groups(selected_rows)
-        ]).astype(np.int64)
-        weights = w_full[selected_rows]
+    selected_rows, weights, nk, nk_full, k_batch, n_chunks = (
+        _candidate_k_schedule(wfn, sym, k_weights, per_k))
     if verbose:
         log.debug(f"[candidate Gram k batches] nk={nk}, batch={k_batch}, "
               f"chunks={n_chunks}, WFN faces<= {per_k*k_batch/2**30:.2f} "
@@ -1662,8 +1839,6 @@ def _build_gram_q0_kbatch(
     """
     # Lazy imports — these modules pull in the full gw_jax dep chain and
     # we don't want to charge the single-device prune path for it.
-    from common.meta import Meta
-    from common.wfn_transforms import load_centroids_band_chunked
     from isdf import gram_q0_tiled_from_psi_sm
 
     gamma_mode = _resolve_candidate_gamma_mode(
@@ -1703,23 +1878,7 @@ def _build_gram_q0_kbatch(
         raise ValueError(
             f"Empty band window: left={left_range} right={right_range}"
         )
-    # Meta's nband must cover whichever of left/right reaches higher.
-    max_band = max(left_range[1], right_range[1])
-    # Meta.nval is physical occupancy, not the width of the left feature
-    # window.  Explicit windows may cross the occupied boundary.
-    meta_nval, meta_ncond = _gram_meta_band_counts(
-        wfn.nelec, max_band, n_val, n_cond)
-
-    M = int(cand_idx.shape[0])
     cand_idx = jnp.asarray(cand_idx, dtype=jnp.int64)
-
-    meta = Meta.from_system(
-        wfn, sym,
-        nval=meta_nval, ncond=meta_ncond,
-        nband=max_band,
-        n_rmu=M,
-        bispinor=bispinor,
-    )
 
     nk_selected = int(sym.nk_tot) if full_k_rows is None else len(full_k_rows)
     if k_weights is None:
@@ -1737,78 +1896,14 @@ def _build_gram_q0_kbatch(
                 f"got sum={kw_np.sum():.17g}")
     kw = jnp.asarray(kw_np * float(q0_weight), dtype=jnp.float64)
 
-    # Memory budget for the band-+k-chunker. ``load_centroids_band_chunked``
-    # reads ``meta.memory_per_device_gb`` to size the FFT-box per chunk; if
-    # the caller didn't pin a budget, auto-detect device HBM the same way
-    # gw_config does so the prune path tracks whatever the rest of LORRAX
-    # is using.
-    if memory_per_device_gb is None or memory_per_device_gb <= 0:
-        from common.gpu_utils import device_budget_bytes
-        memory_per_device_gb = device_budget_bytes() / 1e9
-    meta.memory_per_device_gb = minimum_process_budget_gb(memory_per_device_gb)
-
-    # Prune must not retain the full-k G-flat WFN beside both final centroid
-    # faces.  One batch streams one raw parent at a time (k tile 1).  A k
-    # batch of whole stars is one k tile: the loader's union read then takes
-    # each raw parent once per band tile, and the tile's G-flat and sampled
-    # faces are a band-tile fraction of the batch faces its planner priced.
-    prune_k_tile = 1 if full_k_rows is None else len(full_k_rows)
-
-    # Optional pseudoband norms — same clamp recipe as isdf_fitting.
-    if band_norms is not None:
-        band_norms_np = np.asarray(band_norms, dtype=np.float64)
-        if band_norms_np.shape[0] < max_band:
-            raise ValueError(
-                f"band_norms has {band_norms_np.shape[0]} entries but "
-                f"the left/right windows touch band {max_band}"
-            )
-        norms_l = np.maximum(
-            band_norms_np[left_range[0]:left_range[1]], 1.0,
-        )
-        norms_r = np.maximum(
-            band_norms_np[right_range[0]:right_range[1]], 1.0,
-        )
-        norms_l_j = jnp.asarray(norms_l, dtype=jnp.float64)
-        norms_r_j = jnp.asarray(norms_r, dtype=jnp.float64)
-    else:
-        norms_l_j = None
-        norms_r_j = None
-
-    if verbose:
-        log.debug(f"[pivoted_cholesky] 2-D Gram build via load_wfns: "
-              f"nk_tot={sym.nk_tot}, left={left_range} (nb={nb_left}), "
-              f"right={right_range} (nb={nb_right}), M={M}, "
-              f"gamma_mode={gamma_mode}, "
-              f"norms={'on' if band_norms is not None else 'off'}, "
-              f"backend=WfnLoader(auto), "
-              f"budget={meta.memory_per_device_gb:g} GB/device, "
-              f"band chunk={band_chunk_size}, "
-              f"transfer_k_tile={prune_k_tile}")
-
-    # ---- Left window (the right window when the left is inside it) ----
-    left_slice = _left_band_slice(left_range, right_range)
-    first_range, first_norms = (
-        (right_range, norms_r_j) if left_slice is not None
-        else (left_range, norms_l_j))
-    with timing.section("left.load"):
-        psi_a_rmu_Y, psi_a_rmuT_X = load_centroids_band_chunked(
-            wfn, sym, meta, cand_idx, bispinor, mesh_xy, first_range,
+    meta, left_slice, psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X = (
+        _load_candidate_faces(
+            wfn, sym, cand_idx, mesh_xy, left_range=left_range,
+            right_range=right_range, n_val=n_val, n_cond=n_cond,
+            bispinor=bispinor, band_norms=band_norms,
             band_chunk_size=band_chunk_size,
-            k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
-        )
-        if first_norms is not None:
-            # Y shape (nk, nb, ns, n_rmu); X shape (nk, n_rmu, nb, ns)
-            psi_a_rmu_Y = psi_a_rmu_Y / first_norms[None, :, None, None]
-            psi_a_rmuT_X = psi_a_rmuT_X / first_norms[None, None, :, None]
-        psi_a_rmu_Y.block_until_ready()
-    if left_slice is not None:
-        # One load serves both windows: the left faces are the right faces'
-        # band rows [lo, hi), bit for bit what a separate load would give.
-        psi_r_rmu_Y, psi_r_rmuT_X = psi_a_rmu_Y, psi_a_rmuT_X
-        psi_l_rmu_Y = psi_l_rmuT_X = None
-    else:
-        psi_l_rmu_Y, psi_l_rmuT_X = psi_a_rmu_Y, psi_a_rmuT_X
-    del psi_a_rmuT_X
+            memory_per_device_gb=memory_per_device_gb,
+            full_k_rows=full_k_rows, gamma_mode=gamma_mode, verbose=verbose))
 
     # ---- 2-D tiled path ----
     # The full open-spin pair tensors are (nk, ns, ns, M, M): 98 GB EACH at
@@ -1819,8 +1914,7 @@ def _build_gram_q0_kbatch(
     n_dev_total = mesh_xy.devices.size
     n_x = int(mesh_xy.shape['x']) if 'x' in mesh_xy.axis_names else 1
     n_y = int(mesh_xy.shape['y']) if 'y' in mesh_xy.axis_names else 1
-    nk_, _, ns_, M_cols = (int(x) for x in psi_a_rmu_Y.shape)
-    del psi_a_rmu_Y
+    nk_, _, ns_, M_cols = (int(x) for x in psi_r_rmu_Y.shape)
     from runtime.padding import padded_axis
     tile_divisor = padded_axis(
         1, mesh_xy, name="Gram square-tile divisor",
@@ -1829,20 +1923,6 @@ def _build_gram_q0_kbatch(
     block_source = "fixed tile"
     col_block = gram_tile_width(nk_, ns_, M_cols, divisor=tile_divisor,
                                 x_shards=n_x, y_shards=n_y)
-
-    if left_slice is None:
-        with timing.section("right.load"):
-            psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
-                wfn, sym, meta, cand_idx, bispinor, mesh_xy,
-                right_range,
-                band_chunk_size=band_chunk_size,
-                k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
-            )
-            if norms_r_j is not None:
-                psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
-                psi_r_rmuT_X = (
-                    psi_r_rmuT_X / norms_r_j[None, None, :, None])
-            psi_r_rmu_Y.block_until_ready()
 
     # A price over the budget warns and runs (TASTE 96). The standalone fold
     # needs its input plus two local-Gram scratch slots while faces are live.

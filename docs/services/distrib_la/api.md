@@ -456,7 +456,10 @@ trace-safe: no new `jit` inside the caller's trace.
 | `axis` | `A (q, m_X, k)`, `B (q, k, n_Y)`, `D (q, m_X, n_Y)`; complete local `k` | a local product, no collective (`local_gemm_plan`) |
 
 For `layout='axis'`, `out_spec=P(None,'x',None)` or `P(None,None,'y')` keeps
-one centroid axis sharded, and `reduction_axis='x'` or `'y'` contracts a tiled
+one centroid axis sharded; `local_gemm_plan`'s `out_spec=P(None,None,('x','y'))`
+or `P(None,None,('y','x'))` tiles `n` over the whole flattened mesh with `A`
+replicated (one local GEMM per rank, no collective: the candidate-sketch
+deflation in `centroid.sketch_select`); and `reduction_axis='x'` or `'y'` contracts a tiled
 axis with a local GEMM and a `psum_scatter` (two-axis output only).
 
 ### Active ranges {#active-ranges}

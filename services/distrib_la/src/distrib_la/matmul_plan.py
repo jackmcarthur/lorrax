@@ -386,6 +386,12 @@ def local_gemm_plan(mesh: Mesh, *, m: int, k: int, n: int, nq: int,
                     enable_active_range=False, warmup: bool = True) -> GemmPlan:
     """Warm a local product on CPU/GPU while retaining output axis shards.
 
+    ``out_spec`` is ``P(None,'x','y')`` (default), ``P(None,'x',None)``,
+    ``P(None,None,'y')``, or a column face over the whole flattened mesh,
+    ``P(None,None,('x','y'))`` / ``P(None,None,('y','x'))``: ``A (q, m, k)``
+    replicated, ``B (q, k, n)`` and ``D (q, m, n)`` with ``n`` tiled over
+    every rank, one local GEMM per rank and no collective.
+
     ``enable_active_range`` supports replicated K and a two-axis output, using
     the same ``GemmPlan.active_range`` API as the distributed face backend.
     Reduction-axis and single-axis-output plans retain dense behavior only.
@@ -409,10 +415,15 @@ def _local_plan(mesh: Mesh, *, m, k, n, nq, dtype, alpha, beta,
         raise ValueError("local_gemm_plan: alpha/beta must be real for real dtype")
     px, py = _mesh_shape(mesh)
     out_spec = P(None, "x", "y") if out_spec is None else out_spec
-    if out_spec not in (P(None, "x", "y"), P(None, "x", None), P(None, None, "y")):
+    flat_columns = (len(out_spec) == 3 and out_spec[1] is None
+                    and isinstance(out_spec[2], tuple)
+                    and sorted(out_spec[2]) == sorted(mesh.axis_names))
+    if not flat_columns and out_spec not in (
+            P(None, "x", "y"), P(None, "x", None), P(None, None, "y")):
         raise ValueError("local_gemm_plan: output must retain its centroid axis shards")
     for extent, axis in zip((m, n), out_spec[1:]):
-        if axis is not None and extent % mesh.shape[axis]:
+        names = () if axis is None else (axis,) if isinstance(axis, str) else tuple(axis)
+        if names and extent % int(np.prod([mesh.shape[a] for a in names])):
             raise ValueError("local_gemm_plan: output extent does not tile its mesh axis")
     a_spec, b_spec = P(None, out_spec[1], None), P(None, None, out_spec[2])
     if reduction_axis is not None and out_spec != P(None, "x", "y"):

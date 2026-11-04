@@ -85,6 +85,25 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Prune on D^-G Gram D^-G, D = diag Gram (floored at "
                         "1e-12 max). 0 (default) is the plain Gram; 0.5 is "
                         "the amplitude-blind correlation matrix.")
+    # Centroid-select A/B (branch only; landing keeps one and deletes the
+    # other path).
+    p.add_argument("--select", choices=("cholesky", "sketch"),
+                   default="cholesky",
+                   help="Pool pruning: 'cholesky' (default) pivots on the "
+                        "dense M x M pair Gram; 'sketch' runs orbit-blocked "
+                        "QRCP on a Khatri-Rao Gaussian sketch of the pair "
+                        "matrix (r' x M, charge mode only).")
+    p.add_argument("--sketch-rows", type=int, default=0, metavar="R",
+                   help="Sketch rows r' for --select sketch, at least "
+                        "n_centroids. 0 (default): N + max(64, ceil(0.1 N)).")
+    p.add_argument("--sketch-block", type=int, default=0, metavar="B",
+                   help="Orbits gathered per sketch-select block. 0 "
+                        "(default): max(1, 1024 // largest orbit).")
+    p.add_argument("--sketch-gamma", type=float, default=0.7, metavar="G",
+                   help="In-block acceptance cut of --select sketch: an "
+                        "orbit is admitted while its in-block mean residual "
+                        "is at least G times the block's leading score "
+                        "(0 < G <= 1; default 0.7).")
     return p
 
 
@@ -141,6 +160,7 @@ from .production_output import (
     prune_band_ranges,
     rank_law_estimate,
     resolve_sigma_ncond,
+    sketch_pruning_label,
     validate_mode_policy,
 )
 
@@ -476,9 +496,19 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
                 f"D^-{float(args.prune_normalize):g}"
                 if float(args.prune_normalize) else ""))
 
+    if args.select == "sketch":
+        from .sketch_select import prune_candidates_by_sketch
+        for key in ("n_point_budget", "group_block", "gram_normalize"):
+            kwargs.pop(key)
+        kwargs.update(n_point_budget=int(N_c), seed=int(args.seed),
+                      sketch_rows=int(args.sketch_rows),
+                      sketch_block=int(args.sketch_block),
+                      sketch_gamma=float(args.sketch_gamma))
+        prune = prune_candidates_by_sketch
+    else:
+        prune = prune_candidates_by_pivoted_cholesky
     with timing.section("prune"):
-        keep_idx, rank, *_, unpicked = prune_candidates_by_pivoted_cholesky(
-            **kwargs)
+        keep_idx, rank, *_, unpicked = prune(**kwargs)
     indices = np.asarray(keep_idx, dtype=np.int64)
     log.info(f"After pruning: {indices.shape[0]} centroids (rank={rank})")
     return indices, int(rank), float(unpicked)
@@ -760,6 +790,8 @@ def _select_and_report(args, run, stages):
                         " |q| shells)")
     if pruned and float(args.prune_normalize):
         prune_state += f"; Gram normalized D^-{float(args.prune_normalize):g}"
+    if pruned and args.select == "sketch":
+        prune_state = sketch_pruning_label(args)
     rank_law = (None if args.density_mode == "current" else
                 rank_law_estimate(
                     left=prune_left, right=prune_right, nspinor=wfn.nspinor,

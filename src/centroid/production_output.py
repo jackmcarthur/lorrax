@@ -29,6 +29,22 @@ def validate_mode_policy(args) -> None:
         raise ValueError("--weight-power must be positive")
     if float(getattr(args, "prune_normalize", 0.0)) < 0.0:
         raise ValueError("--prune-normalize must be >= 0")
+    if getattr(args, "select", "cholesky") == "sketch":
+        if args.density_mode == "current":
+            raise ValueError(
+                "--select sketch implements the charge Gram only; prune "
+                "current-mode pools with --select cholesky")
+        if (int(getattr(args, "prune_q_shells", 0)) > 0
+                or float(getattr(args, "prune_normalize", 0.0))):
+            raise ValueError(
+                "--prune-q-shells and --prune-normalize act on the dense Gram; "
+                "use them with --select cholesky")
+        if not 0.0 < float(args.sketch_gamma) <= 1.0:
+            raise ValueError("--sketch-gamma must lie in (0, 1]")
+        if int(args.sketch_rows) < 0 or int(args.sketch_block) < 0:
+            raise ValueError("--sketch-rows and --sketch-block must be >= 0")
+        if 0 < int(args.sketch_rows) < int(args.n_centroids):
+            raise ValueError("--sketch-rows must be at least n_centroids")
     if args.density_mode == "current":
         if int(getattr(args, "prune_q_shells", 0)) > 0:
             raise ValueError(
@@ -264,7 +280,29 @@ def kmeans_settings_rows(args, *, source) -> list:
     if normalize:
         rows.append(Setting("prune_normalize", f"{normalize:g}", "cli",
                             "prune on D^-G Gram D^-G"))
+    if getattr(args, "select", "cholesky") == "sketch":
+        rows.append(Setting("select", "sketch", "cli",
+                            "orbit-blocked QRCP on a Khatri-Rao Gaussian sketch"))
+        rows.append(Setting("sketch_rows", str(int(args.sketch_rows) or "auto"),
+                            source("--sketch-rows"), "r' = N + max(64, ceil(0.1 N))"
+                            if not int(args.sketch_rows) else "sketch rows r'"))
+        rows.append(Setting("sketch_block", str(int(args.sketch_block) or "auto"),
+                            source("--sketch-block"), "orbits per block; auto: "
+                            "max(1, 1024 // largest orbit)"))
+        rows.append(Setting("sketch_gamma", f"{float(args.sketch_gamma):g}",
+                            source("--sketch-gamma"), "in-block acceptance cut"))
     return rows
+
+
+def sketch_pruning_label(args) -> str:
+    """The centroid header's ``pruning:`` value for ``--select sketch``."""
+    from .sketch_select import sketch_rows_default
+    rows = int(args.sketch_rows) or sketch_rows_default(int(args.n_centroids))
+    block = int(args.sketch_block) or "auto"
+    return (f"sketched QRCP (Khatri-Rao Gaussian sketch, r'={rows}, "
+            f"seed={int(args.seed)}, block={block} orbits, "
+            f"gamma={float(args.sketch_gamma):g}; pool rank estimated on the "
+            f"sketch, r' >= budget)")
 
 
 def rank_text(*, prune_rank, written: int, pool: int, unpicked) -> str:
@@ -322,5 +360,6 @@ __all__ = [
     "pool_rank_warning",
     "prune_band_ranges",
     "rank_law_estimate",
+    "sketch_pruning_label",
     "validate_mode_policy",
 ]
