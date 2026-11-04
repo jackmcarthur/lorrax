@@ -3,7 +3,7 @@
 Write BerkeleyGW 4.0 files from a finished LORRAX run, and run LORRAX's Σ or BSE on BerkeleyGW's screened interaction.
 {: .page-summary }
 
-LORRAX keeps the screened interaction in the ISDF basis, as $V_\bq(\mu,\nu)$ and the static $W_\bq(\mu,\nu;0)$ in the ISDF tensor file `tmp/isdf_tensors_<N_mu>.h5`, with the interpolation vectors $\zeta_{\bq\mu}$ beside it. Two utilities turn that file into the plane-wave files BerkeleyGW reads, and the first of them also reads BerkeleyGW's screening back into it ([Importing BerkeleyGW's W](#import)). All of them work on one `WFN.h5` shared by the two codes.
+LORRAX keeps the screened interaction in the ISDF basis, as $V_\bq(\mu,\nu)$ and the static $W_\bq(\mu,\nu;0)$ in the ISDF tensor file `tmp/isdf_tensors_<N_mu>.h5`, with the interpolation vectors $\zeta_{\bq\mu}$ beside it. Two utilities turn that file into the plane-wave files BerkeleyGW reads, and the first of them also converts BerkeleyGW's screening back into it ([Running Σ or the BSE on BerkeleyGW's W](#import)). All of them work on one `WFN.h5` shared by the two codes.
 
 | Utility | Writes | Read by |
 |---|---|---|
@@ -35,50 +35,80 @@ This is not a fit. It is the plane-wave RPA inverse dielectric matrix of the pol
 - **G cutoff.** `epsmat_ecut` (Ry) sets $|\bq+\bG|^2\le E_\varepsilon$; `0`, the default, keeps the full Coulomb sphere. A smaller cutoff writes the leading block of the full inverse; BerkeleyGW's epsilon at a smaller cutoff instead inverts the smaller block of $\varepsilon$. The two differ by the local fields beyond the cut.
 - **BerkeleyGW reference.** `bgw_reference`, a directory holding BerkeleyGW's own `eps0mat.h5`/`epsmat.h5` on the same WFN, supplies the $\bq$ list, $\bq_0$, cutoffs and G order, and the export checks them.
 - **$\bq\to0$.** The head comes from the ISDF tensor file's $q\to0$ response tensor $S$ and the wings from its dipole wings (`q0_head = s_tensor`, `q0_wings = dipole`, the defaults).
-- **The reverse direction.** `mode = project` reads BerkeleyGW's files instead ([Importing BerkeleyGW's W](#import)).
+- **The reverse direction.** `mode = project` reads BerkeleyGW's files instead ([Running Σ or the BSE on BerkeleyGW's W](#import)).
 
 Every key, with its default, is listed by `python -m gw.epsmat_cli --print-schema`.
 
-## Importing BerkeleyGW's W {: #import }
+## Running Σ or the BSE on BerkeleyGW's W {: #import }
 
-`gw.epsmat_cli` with `mode = project` reads BerkeleyGW's `eps0mat.h5` and `epsmat.h5`, computed on the same `WFN.h5`, and projects the screened interaction they describe onto the ISDF vectors of a finished LORRAX run. LORRAX's GW driver can then evaluate Σ on BerkeleyGW's $W$, and its BSE can use BerkeleyGW's static $W$, without building screening of its own.
+BerkeleyGW and LORRAX describe the screened interaction in two different bases. BerkeleyGW's `epsilon.x` stores $\varepsilon^{-1}_\bq(\bG,\bG')$ as a dense matrix over plane waves, one for each $\bq$, out to `epsilon_cutoff`; for silicon at 25 Ry that is a matrix of about 570 × 570 per $\bq$. LORRAX leaves plane waves behind once the ISDF fit is done. Its self-energy and BSE code expect $W_\bq(\mu,\nu)$, an $N_\mu\times N_\mu$ matrix in the basis of the interpolation vectors $\zeta_{\bq\mu}$, so a BerkeleyGW file cannot be handed to them as it is. It has to be converted first, by contracting the plane-wave matrix with the Fourier components $\tilde\zeta_{\bq\mu}(\bG)$:
+
+$$
+W_\bq(\mu,\nu) = V_\bq(\mu,\nu) + \sum_{\bG\bG'} \tilde\zeta^{\,*}_{\bq\mu}(\bG)\,\big[\varepsilon^{-1}_\bq(\bG,\bG')-\delta_{\bG\bG'}\big]\,v(\bq+\bG')\,\tilde\zeta_{\bq\nu}(\bG').
+$$
+
+Nothing that Σ needs is lost in this step. LORRAX expands every pair density $\psi^*_{m\bk-\bq}\psi_{n\bk}$ in the same $\zeta_{\bq\mu}$, so the self-energy only ever uses $W$ between two of those vectors, and the sum above computes exactly that. What the conversion has to get right is bookkeeping: the Coulomb potential $v(\bq+\bG)$ that LORRAX itself uses, BerkeleyGW's ordering and orientation of the $\bG$ vectors, and the $\bq$-points that BerkeleyGW did not compute directly.
+
+`gw.epsmat_cli` with `mode = project` performs the conversion one $\bq$ at a time, spread over all ranks, and writes the result into a copy of a LORRAX ISDF tensor file. A GW run restarted from that copy evaluates Σ on BerkeleyGW's $W$ without computing any screening of its own. A BSE run started in the same place uses BerkeleyGW's static $W$ in its direct term.
+
+Three inputs are needed: a `WFN.h5` shared by both codes, a BerkeleyGW epsilon run on it, and a LORRAX run on it that saved its ISDF tensor file. The LORRAX run does not have to compute screening. A run with `compute_mode = x_only` and `write_restart_tensors = true` fits $\zeta$ and builds $V$, which is all the conversion uses.
 
 ```ini
+# epsmat.in, run in the directory where the Σ or BSE calculation will run
 [epsmat]
 mode              = project
-source_restart    = ../lorrax_run          # a finished LORRAX run, or its ISDF tensor file
-parent_input_file = ../lorrax_run/gw.in    # the input file that produced it
-output_dir        = .                      # the directory of the Σ or BSE run; never the producer's
-bgw_reference     = ../bgw/epsilon         # holds eps0mat.h5 and epsmat.h5
+source_restart    = ../lorrax_x          # the LORRAX run, or its tmp/isdf_tensors_<N_mu>.h5
+parent_input_file = ../lorrax_x/gw.in    # the input file of that run
+output_dir        = .
+bgw_reference     = ../bgw/epsilon       # the directory with eps0mat.h5 and epsmat.h5
 ```
 
-The producer needs only $V$ and $\zeta$, so a run with `compute_mode = x_only` and `write_restart_tensors = true` is enough. The projection copies its ISDF tensor file to `output_dir/tmp/` and writes into the copy:
-
-| Dataset | Content | Written when |
-|---|---|---|
-| `W0_qmunu` | $W_\bq(\mu,\nu;0)$ | always |
-| `Wp_qmunu` | $W_\bq(\mu,\nu;i\omega_p)$ | the epsilon ran with `frequency_dependence 3` (Godby–Needs) |
-| `bgw_epsinv_head` | BerkeleyGW's $\varepsilon^{-1}_{00}(\bq_0,\omega)$ at each frequency | always |
-
-BerkeleyGW's irreducible $\bq$ list is accepted as it is. Each stored LORRAX $\bq$ is matched to a $\bq$ of `epsmat.h5` up to a reciprocal lattice vector, or else to a symmetry image under the operations of the WFN. Γ comes from `eps0mat.h5` at BerkeleyGW's $\bq_0$, without its $\bG=0$ row and column, since the head is applied separately. `output_dir/epsmat_project.json` records the row used for every $\bq$ and, when the producer has its own $W(0)$, the relative difference between the two codes' $W^c$.
-
-**Σ on BerkeleyGW's W.** A GW input file in `output_dir` with `restart = true` and [`screening_source`](gw/keywords.md#screening_source) `= bgw_epsmat` runs Σ with no $\chi^0$ and no Dyson solve. `compute_mode = gn_ppm` fits the plasmon pole to $W(0)$ and $W(i\omega_p)$, and `compute_mode = cohsex` uses $W(0)$. [`ppm_omega_p`](gw/keywords.md#ppm_omega_p) must equal the epsilon's imaginary frequency, 2 Ry by default in both codes. The $\bq\to0$ head at each frequency is BerkeleyGW's $\varepsilon^{-1}_{00}(\bq_0,\omega)$, averaged over the Γ cell as under `wcoul0_source = epshead`.
-
-**The BSE on BerkeleyGW's W.** `bse.bse_jax` in `output_dir` uses BerkeleyGW's $W(0)$ for the direct term, with no new key. Its $\bq\to0$ head remains the producer's.
-
 ```
-gw.gw_jax -i gw.in              # producer, any run with write_restart_tensors = true
-gw.epsmat_cli -i epsmat.in      # mode = project
-gw.gw_jax -i gw.in              # in output_dir: restart = true, screening_source = bgw_epsmat
-bse.bse_jax -i gw.in            # in output_dir: the BSE on BerkeleyGW's W(0)
+gw.gw_jax -i gw.in           # in ../lorrax_x: x_only, saves its ISDF tensor file
+gw.epsmat_cli -i epsmat.in   # here: converts BerkeleyGW's W into tmp/
+gw.gw_jax -i gw.in           # here: restart = true, screening_source = bgw_epsmat
+bse.bse_jax -i gw.in         # here (optional): BSE on BerkeleyGW's W(0)
 ```
 
-On Si 4×4×4 with spin–orbit coupling, GN-PPM $\Sigma^c$ on BerkeleyGW's $W$ differs from $\Sigma^c$ on LORRAX's own $W$ by 0.66 meV on average over 128 states, and COHSEX by 0.70 meV. An export followed by an import returns LORRAX's $W$ to $10^{-15}$ at every $\bq\neq0$, and to $10^{-12}$ through symmetry images.
+The GW input file for the third step differs from an ordinary one in two keys, `restart = true` and [`screening_source`](gw/keywords.md#screening_source) `= bgw_epsmat`. With `compute_mode = gn_ppm`, LORRAX fits its plasmon pole to BerkeleyGW's $W(0)$ and $W(i\omega_p)$; with `compute_mode = cohsex` it uses $W(0)$ alone.
+
+The silicon test below shows what to expect: Si 4 × 4 × 4 with spin–orbit coupling, 28 bands, $N_\mu = 960$, the same `WFN.h5` for both codes, run on four GPUs.
+
+| Comparison | Result |
+|---|---|
+| BerkeleyGW's $W^c(0)$ against LORRAX's own, at $\bq\neq0$ | relative difference $3\times10^{-6}$ to $8\times10^{-6}$ |
+| LORRAX's $W$ written by the export, then read back by the import | equal to $10^{-15}$; $10^{-12}$ when the $\bq$ is reached by a symmetry operation |
+| GN-PPM $\Sigma^c$ on BerkeleyGW's $W$ against $\Sigma^c$ on LORRAX's $W$, 128 states | 0.66 meV on average, 0.78 meV at most |
+| COHSEX Σ, same comparison | 0.70 meV on average, 0.82 meV at most |
+| Lowest four BSE excitation energies, same comparison | equal to $10^{-5}$ eV |
+| Time for the conversion (8 $\bq$, two frequencies) | 28 s, including start-up |
+
+### Questions about running it {: #import-questions }
+
+**Why would I use BerkeleyGW's W instead of LORRAX's?** Two situations come up most. One is a comparison between the codes: with the screening fixed to BerkeleyGW's, any remaining difference in the quasiparticle or exciton energies comes from Σ or the BSE alone. The other is reuse, when a converged BerkeleyGW epsilon calculation already exists for the system.
+
+**Which BerkeleyGW epsilon runs can be used?** Runs with `frequency_dependence 0` (static) or `frequency_dependence 3` (Godby–Needs, which stores $\omega=0$ and $\omega=i\omega_p$). A static file supports COHSEX and the BSE; a Godby–Needs file supports those and GN-PPM as well. Full-frequency files (`frequency_dependence 2`) are refused.
+
+**Does the BerkeleyGW $\bq$ list have to match LORRAX's?** No. The irreducible list that `kgrid.x` writes for the shared `WFN.h5` works as it is. Each $\bq$ that LORRAX stores is matched to a BerkeleyGW $\bq$ either directly, up to a reciprocal lattice vector, or through a symmetry operation of the crystal, including the phase that a fractional translation contributes. If some $\bq$ cannot be reached either way, the projection stops and lists every missing one.
+
+**What has to be the same in the two calculations?** The `WFN.h5` file and its $\bk$ grid, and the Coulomb truncation: no truncation in BerkeleyGW for [`sys_dim`](gw/keywords.md#sys_dim) `= 3`, and `cell_slab_truncation` for `sys_dim = 2`. BerkeleyGW's `epsilon_cutoff` cannot exceed LORRAX's [`bare_coulomb_cutoff`](gw/keywords.md#bare_coulomb_cutoff), which defaults to the wavefunction cutoff. For GN-PPM, [`ppm_omega_p`](gw/keywords.md#ppm_omega_p) has to equal the imaginary frequency in BerkeleyGW's file. Both codes default to 2 Ry, so this only matters when one of them was changed.
+
+**How is $\bq\to0$ handled?** The $\bG=\bG'=0$ element of $W$ at $\bq\to0$, the head, cannot be stored as an ordinary matrix element because $v(\bq)$ is singular there, so both codes treat it separately. For Σ, LORRAX uses the value of $\varepsilon^{-1}_{00}$ that BerkeleyGW computed at its small $\bq_0$, separately for each frequency, and averages the resulting $W$ over the small cell around Γ, as `sigma.x` also does. The BSE keeps the head that the LORRAX run computed.
+
+**Will the quasiparticle energies then match `sigma.x`?** Closer, but not exactly. Once both codes use the same $W$, the remaining difference comes from how each code evaluates Σ, for instance the frequency broadening and the ISDF representation of the pair densities. In the silicon test, $\Sigma^c$ near the gap (bands 7 to 10) differed from `sigma.x` by 8.1 meV on average with BerkeleyGW's $W$, against 8.7 meV with LORRAX's own.
+
+**Is spin–orbit coupling supported?** Yes. The silicon test above uses two-component wavefunctions.
+
+**How much does the conversion cost?** Far less than the screening it replaces. For each $\bq$ and frequency it performs a few dense matrix products between $N_\mu$ and BerkeleyGW's number of $\bG$ vectors, plus one $N_\mu\times N_\mu$ eigenvalue solve for the passivity check described below; no χ⁰ and no Dyson solve are needed. The memory needed per GPU is printed before the first $\bq$; in the silicon test it was 0.15 GiB.
+
+**How can I check that the conversion worked?** `output_dir/epsmat_project.json` lists, for every stored $\bq$, which BerkeleyGW $\bq$ and which symmetry operation produced it. When the producer run computed its own $W(0)$, the file also gives the relative difference between the two codes' $W^c$; values near $10^{-5}$ at $\bq\neq0$ are normal, while Γ differs by a few percent because BerkeleyGW's Γ matrix includes the head–wing coupling that LORRAX treats separately. The run also checks every converted matrix for passivity: at each $\bq$ and frequency, the screening may only reduce the bare interaction.
+
+**Are BerkeleyGW's files modified?** No. The projection reads `eps0mat.h5` and `epsmat.h5` and writes only to `output_dir`. The producer's ISDF tensor file is copied, never changed.
 
 !!! refuses
-    - The projection, by `GATE epsmat_project_*`: no `eps0mat.h5`; a file that is not $\varepsilon^{-1}$ with one spin matrix; an unfinished $\bq$ row; a $\bq$ grid, cell volume or Coulomb truncation that differs from the producer's; `frequency_dependence` other than 0 or 3; frequency tables that disagree between the two files; a stored $\bq$ with no image in `epsmat.h5`; BerkeleyGW G vectors outside the producer's $\zeta$ sphere; a projected correlation outside $[-1,0]$.
-    - The GW driver, by `GATE screening_source_*`: a `compute_mode` other than `cohsex` or `gn_ppm`; `restart = false`; a self-consistent run; `screening_diagrams` other than `w_rpa`; `bispinor = true`; an ISDF tensor file without the projected $W$ the treatment needs, so GN-PPM from a static epsilon refuses; `ppm_omega_p` different from the file's frequency; GN-PPM on a time-reversal-broken WFN; a projected $W$ whose centroid order does not match the run's $V$.
-    - Full-frequency epsilons, the Hybertsen–Louie and tangential models, and self-consistent runs are not supported.
+    The projection stops with `GATE epsmat_project_*` when `eps0mat.h5` is missing; when a file holds something other than $\varepsilon^{-1}$ for one spin matrix, or has an unfinished $\bq$ row; when the $\bq$ grid, cell volume or Coulomb truncation differs from the LORRAX run; when `frequency_dependence` is not 0 or 3, or the two files list different frequencies; when a stored $\bq$ has no BerkeleyGW counterpart; when BerkeleyGW's $\bG$ vectors reach past LORRAX's Coulomb cutoff; or when a converted matrix fails the passivity check.
+
+    The GW run stops with `GATE screening_source_*` when `compute_mode` is not `cohsex` or `gn_ppm`, when `restart = false`, for a self-consistent run, for `screening_diagrams` other than `w_rpa`, for `bispinor = true`, when the ISDF tensor file lacks the converted $W$ it needs (GN-PPM from a static file, for example), when `ppm_omega_p` differs from the file's frequency, for GN-PPM on a WFN without time-reversal symmetry, and when the converted $W$ is not in the same centroid order as the run's $V$.
 
 ## BSE kernel {: #bsemat }
 
