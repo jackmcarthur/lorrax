@@ -18,7 +18,7 @@ each library builds its own MPI or NCCL grid from the process ranks. LORRAX
 builds only square meshes, `P_x = P_y = p`.
 
 A matrix never lives whole on one rank unless the caller asks for it. The
-service names five layouts:
+service names seven layouts:
 
 | layout | shape | `PartitionSpec` | per-rank piece |
 |---|---|---|---|
@@ -27,6 +27,11 @@ service names five layouts:
 | batch | `(B_p, n, n)` | `P(('x','y'),None,None)` | `B_p/P` whole matrices |
 | axis (GEMM operands) | `A (q, m, k)`, `B (q, k, n)` | `P(None,'x',None)`, `P(None,None,'y')` | rows of A, columns of B, complete `k` |
 | row face (`contract_faces`) | `(b, m, K)` | `P(None,'x',None)` / `P(None,'y',None)` | rows on one axis, complete `K` |
+| column face, flattened mesh | `(q, R, n)` | `P(None,None,flat)` | `n/P` complete columns |
+| row slab, flattened mesh | `(n, m)` | `P(flat,None)` | `n/P` complete rows |
+
+`flat` is every mesh axis, `('x','y')` or `('y','x')`; the first axis is major
+in the rank order ([the flattened mesh](#flat-mesh)).
 
 `B_p = ⌈B/P⌉·P` is the batch padded to the device count; pad rows are zero.
 Face extents must tile the mesh (`n % P_x == n % P_y == 0`); the service never
@@ -396,7 +401,7 @@ rank. `is_batch_layout` tests the layout.
 
 ## Matrix products
 
-Three entry points cover GEMM, chosen by how often the shape repeats and where
+Four entry points cover GEMM, chosen by how often the shape repeats and where
 the call sits:
 
 | entry | for | phases |
@@ -404,6 +409,7 @@ the call sits:
 | `matmul` | an eager product of any shape | resolves on every call |
 | `gemm_plan` / `local_gemm_plan` | one fixed shape called many times inside a `jit` or `lax.scan` (Green build, Σ projection) | eager plan, trace-safe call |
 | `panel_matmul`, `batch_gram`, `contract_faces` | face products whose contraction axis must never be gathered whole on a rank | trace-safe, no provider |
+| `project_out`, `column_norms`, `replicated_gram` | the flattened mesh: a column face updated in place by a replicated basis, and the Gram of row slabs on every rank (the centroid sketch select) | trace-safe, no provider |
 
 ### `matmul`
 
@@ -569,6 +575,80 @@ row faces `(b, m, K)` at `P(None,'x',None)` and `P(None,'y',None)` (or
 `(b, μ, s, K)`, spin merged into μ) with replicated weights `(b, K)` and
 interval `[start, stop)`. The output is `(b, m, m)` at `P(None,'x','y')`;
 every product is local, with no collective and no provider.
+
+### The flattened mesh: `project_out`, `column_norms`, `replicated_gram` {#flat-mesh}
+
+Two layouts spread one axis over every rank. On the **column face** `(q, R, n)`
+at `P(None,None,flat)` each rank holds `n/P` complete columns. On the **row
+slab** `(n, m)` at `P(flat,None)` it holds `n/P` complete rows. The centroid
+sketch keeps its sketch `Y` as a column face and gathers each block's columns
+as row slabs (`centroid.sketch_select`). None of the three ops below creates a
+native context: the local products are XLA's dot.
+
+**`project_out(Y, Q, n_valid=None, *, mesh, panel_bytes, spec, chunk=128,
+norms=True)`** computes
+
+$$
+Y \leftarrow (1 - Q_m Q_m^\dagger)\cdots(1 - Q_1 Q_1^\dagger)\,Y
+$$
+
+on a column face. $Q_c$ is the $c$-th block of `chunk` columns of a replicated
+`Q (q, R, t)`. For orthonormal columns this is the projector
+$1 - QQ^\dagger$; in general it is block modified Gram–Schmidt. With `norms`,
+it also returns $d_{b,a} = \lVert Y'_{b,:,a}\rVert^2$, `(q, n)` real at
+`P(None,flat)`.
+
+- **In place.** Each rank streams its `n/P` columns in panels `(q, R, w)` of
+  at most `panel_bytes`, `w` the even split into the fewest such panels. One
+  `shard_map` holds the panel loop, which writes each updated panel back into
+  its carry, so the program holds one panel, its update and `W` beside `Y`.
+  - Per chunk and panel there are two local GEMMs, $W = Q_c^\dagger Y_p$ and
+    $Y_p + Q_c W'$ with $W' = -W$. The addition folds into the GEMM (β = 1),
+    and the negation touches only the small `W`.
+  - A whole-face `local_gemm_plan` update cannot alias its output with `Y`
+    inside an outer `jit`. The sketch measured 2.2× the sketch on device that
+    way at N_μ = 45k.
+- **Donation.** `Y` is donated. An eager call consumes it through a cached
+  `jit`. Inside a caller's `jit`, the `shard_map` runs in the caller's
+  program, in place when that `jit` donates `Y`.
+- **`n_valid`** (an integer, or a replicated traced scalar) is the live width
+  of `Q`. ⌈`n_valid`/`chunk`⌉ chunks run, and the columns at or past `n_valid`
+  never enter, whatever they hold. `t` must be a multiple of `chunk`.
+- **Every column is updated once.** The last panel is clamped to end at
+  `n/P`. The columns it shares with the panel before are masked out of its `W`
+  and keep their norms.
+- **`column_norms(Y, *, mesh, panel_bytes, spec)`** returns the same `d` from
+  the same panels. It leaves `Y` untouched and does not donate it.
+
+Measured on one A100-80GB at the per-rank shape of a P4 N_μ = 45k select
+(BFC@0.90): R = 49536 rows, 16875 local columns, a 1 GiB panel (13 panels of
+1299 columns), and 330 directions in three 128-column chunks.
+
+| deflation | per call | compiled temporaries | `Y` aliased |
+|---|---|---|---|
+| the sketch's own panel loop (before `project_out`) | 379.2 ms | 1.17 GiB (0.09 of the block) | yes |
+| `project_out` | 378.3 ms | 1.17 GiB | yes |
+
+- Every column off the panel overlap matches the old loop bitwise. The old
+  loop projected the 12 overlap columns twice; they differ by 4·10⁻¹⁶ of
+  max|Y|.
+- Pass a fixed tile as `panel_bytes`, not less: at a quarter tile the same
+  deflation took 463 ms, because the `(128 × w)` product keeps too few SMs
+  busy.
+- At P4 on MoS₂/hBN N_μ = 30k, the select's deflation takes 12.4 s and the
+  device peak is 8.67 GiB, as before, and the centroids are bitwise identical.
+
+**`replicated_gram(a, b=None, *, axes, mesh=None)`** returns $a^\dagger b$
+(`b = a` when omitted) on every rank, for row slabs split over `axes`.
+
+- **Rank order.** Each rank forms its local $a_r^\dagger b_r$, and the
+  partials are added $r = 0, 1, \dots$ with `lxkit.ordered_psum`. The bits
+  depend on the rank count, not on which devices hold which ranks.
+- **Two entries.** With `mesh=None` it runs inside the caller's `shard_map`
+  on the rank's slabs `(n/P, m)`. With `mesh` it takes the global `(n, m)` at
+  `P(axes, None)`, refuses any other layout, and returns `(m, k)` at `P()`.
+- **Users.** The sketch's block Gram $C^\dagger C$ and its CholQR2 Gram use it
+  (m ≤ 1024 columns).
 
 ## The polar factor and spectral directions
 

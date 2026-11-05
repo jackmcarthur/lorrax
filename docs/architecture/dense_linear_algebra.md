@@ -268,6 +268,13 @@ whole on each device. The tangential Σ uses it when the replicated pole
 columns do not fit and whole parents do
 ([tangential model §8](tangential_model.md)).
 
+**The flattened mesh.** A column face `(q, R, n)` at `P(None,None,flat)` has
+every column whole on one rank, so a replicated basis acts on it with local
+GEMMs only: `project_out` applies $Y \leftarrow (1 - QQ^\dagger)Y$ in place,
+streamed over one-tile column panels, and `replicated_gram` forms $a^\dagger b$
+of row slabs with the partials added in rank order. The centroid sketch select
+runs on both ([API](../services/distrib_la/api.md#flat-mesh)).
+
 ## 4 The eigh routes {#eigh-routes}
 
 A Hermitian stack $(B, n, n)$ on the face has two routes.

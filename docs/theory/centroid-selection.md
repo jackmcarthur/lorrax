@@ -113,12 +113,13 @@ with one independent draw per component and unit band weights.
 
 The selection is orbit-blocked near-greedy QRCP on Y. Per block, orbits are
 scored by the mean residual of their members; the top b orbits' columns C are
-gathered as row slabs and H = C^H C is formed; orbits are admitted while their
+gathered as row slabs and H = C^H C is formed (`distrib_la.replicated_gram`,
+the ranks' partials added in rank order); orbits are admitted while their
 in-block score is at least gamma times the block's leading score
 (`--sketch-gamma`, 0.7) and they fit the remaining budget, each member pivoted
 by pivoted Cholesky on H. The admitted directions are orthonormalized by
-CholQR2 and Y is deflated once, Y ← Y − QQ^H Y, streamed over one-tile column
-panels. b = `--sketch-block`, by default max(1, ⌊m_b/|O|max⌋) with m_b ≤ 1024
+CholQR2 and Y is deflated once, Y ← Y − QQ^H Y, in place over one-tile column
+panels (`distrib_la.project_out`). b = `--sketch-block`, by default max(1, ⌊m_b/|O|max⌋) with m_b ≤ 1024
 columns and one fixed tile of r' rows; b = 1 with gamma = 1 is the sequential
 greedy order. After t directions a Gaussian sketch keeps on average
 (r' − t)/r' of a column's true residual, so every residual, the floor test and
