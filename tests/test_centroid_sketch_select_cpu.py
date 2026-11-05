@@ -10,6 +10,12 @@
     no remaining orbit fits the leftover budget, and with one orbit per block
     and gamma = 1 the pivot order is the group-block pivoted Cholesky order
     on Y^H Y.  Transverse mode refuses.
+(d) The reported residuals carry the shrink correction: after t directions
+    the Gaussian sketch keeps (r'-t)/r' of a column's true residual, and the
+    select reads d r'/(r'-t).  Over the unpicked columns the corrected median
+    is within the selection bias of the exact residual on the true Gram (the
+    columns left behind are those the sketch happened to underestimate:
+    about -17% at r'-t = 64 here, against -49% uncorrected).
 
 CPU only; needs four virtual devices
 (``XLA_FLAGS=--xla_force_host_platform_device_count=4``).
@@ -28,7 +34,7 @@ def _mesh(shape):
 
 
 def _faces(mesh, psi):
-    """Loader-layout faces of host ``psi (nk, nb, ns, M)``: Y and conjugate X."""
+    """Gram-layout faces of host ``psi (nk, nb, ns, M)``: Y and conjugate X."""
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
     from runtime.padding import padded_mu_extent
@@ -41,23 +47,37 @@ def _faces(mesh, psi):
             jax.device_put(x, NamedSharding(mesh, P(None, "x", None, None))))
 
 
+def _cand_face(mesh, psi):
+    """The loader's ``faces='cand'`` layout of host ``psi`` (the sketch's face)."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from centroid.sketch_select import CAND
+    from runtime.padding import padded_mu_extent
+    nk, nb, ns, M = psi.shape
+    y = np.zeros((nk, nb, ns, padded_mu_extent(M, mesh)), np.complex128)
+    y[..., :M] = psi
+    return jax.device_put(y, NamedSharding(mesh, P(None, None, None, CAND)))
+
+
 def _random_psi(rng, nk, nb, ns, M):
     return rng.standard_normal((nk, nb, ns, M)) + 1j * rng.standard_normal((nk, nb, ns, M))
 
 
 def _sketch(mesh, psi_r, psi_l, *, left, weights, n_rows, factors, seed=7):
     import jax
-    from centroid.sketch_select import _zero_kernel, sketch_from_faces
+    from centroid.sketch_select import _zero_kernel, sketch_from_faces, sketch_row_carrier
     from runtime.padding import padded_mu_extent
-    r_y, _ = _faces(mesh, psi_r)
-    l_y = None if psi_l is None else _faces(mesh, psi_l)[0]
     nk = psi_r.shape[0]
-    Y = _zero_kernel(mesh, n_rows, padded_mu_extent(psi_r.shape[3], mesh))()
+    Y = _zero_kernel(mesh, sketch_row_carrier(n_rows, mesh),
+                     padded_mu_extent(psi_r.shape[3], mesh))()
     Y = sketch_from_faces(
-        Y, r_y, l_y, mesh, sqrt_w=np.sqrt(weights), k_ids=np.arange(nk) + 3,
+        Y, _cand_face(mesh, psi_r), None if psi_l is None else _cand_face(mesh, psi_l),
+        mesh, n_rows=n_rows, sqrt_w=np.sqrt(weights), k_ids=np.arange(nk) + 3,
         k_pos=np.arange(nk), key_data=np.asarray(jax.random.key_data(
             jax.random.key(seed))), left_slice=left, factors=factors)
-    return np.asarray(Y)[0, :, :psi_r.shape[3]]
+    Y = np.asarray(Y)
+    assert not Y[0, n_rows:].any()
+    return Y[0, :n_rows, :psi_r.shape[3]]
 
 
 def test_exhaustive_sketch_reproduces_the_candidate_gram():
@@ -110,14 +130,15 @@ def _orbits(rng, M):
 def _select(mesh, Y_host, gid, n_groups, budget, n_slots, gamma):
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from centroid.sketch_select import CAND, sketch_block_select
+    from centroid.sketch_select import CAND, sketch_block_select, sketch_row_carrier
     from runtime.padding import padded_mu_extent
     r, M = Y_host.shape
-    y = np.zeros((1, r, padded_mu_extent(M, mesh)), np.complex128)
-    y[0, :, :M] = Y_host
+    y = np.zeros((1, sketch_row_carrier(r, mesh), padded_mu_extent(M, mesh)), np.complex128)
+    y[0, :r, :M] = Y_host
     Y = jax.device_put(y, NamedSharding(mesh, P(None, None, CAND)))
     return sketch_block_select(Y, mesh, group_id=gid, n_groups=n_groups,
-                               point_budget=budget, n_slots=n_slots, gamma=gamma)
+                               point_budget=budget, n_slots=n_slots, gamma=gamma,
+                               n_rows=r)
 
 
 def test_sketch_select_is_mesh_independent_orbit_closed_and_greedy():
@@ -167,3 +188,33 @@ def test_sketch_select_is_mesh_independent_orbit_closed_and_greedy():
             None, None, np.zeros((4, 3), np.int64), 2, mesh4,
             band_range_left=(0, 1), band_range_right=(0, 1),
             gamma_mode="transverse")
+
+
+def test_sketch_residuals_are_unbiased():
+    import jax
+    jax.config.update("jax_enable_x64", True)
+    from centroid.sketch_select import sketch_rows_default
+    mesh = _mesh((2, 2))
+    rng = np.random.default_rng(5)
+    nk, ns, nb_r, M, budget = 2, 2, 8, 96, 40
+    weights = np.asarray([0.5, 0.5])
+    psi_r = _random_psi(rng, nk, nb_r, ns, M)
+    left = (0, 4)
+    Z = _sketch(mesh, psi_r, None, left=left, weights=weights,
+                n_rows=nk * 4 * nb_r, factors="exhaustive")
+    G = Z.conj().T @ Z
+    n_rows = sketch_rows_default(budget)
+    Y = _sketch(mesh, psi_r, None, left=left, weights=weights,
+                n_rows=n_rows, factors="gaussian", seed=19)
+    piv, rank, d_final, *_ = _select(mesh, Y, np.arange(M, dtype=np.int32), M,
+                                     budget, 4, 0.7)
+    rest = np.setdiff1d(np.arange(M), piv)
+    S = np.asarray(piv)
+    true = (np.real(np.diag(G))[rest] - np.real(np.einsum(
+        "as,sa->a", G[np.ix_(rest, S)],
+        np.linalg.solve(G[np.ix_(S, S)], G[np.ix_(S, rest)]))))
+    ratio = np.median(d_final[rest] / true)
+    shrink = (n_rows - rank) / n_rows
+    assert rank == budget
+    assert 0.75 < ratio < 1.18, (ratio, shrink)
+    assert abs(np.log(ratio)) < 0.5 * abs(np.log(shrink)), (ratio, shrink)

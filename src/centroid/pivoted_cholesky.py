@@ -1452,6 +1452,7 @@ def _load_candidate_faces(
     full_k_rows,
     gamma_mode: str,
     verbose: bool,
+    faces: str = "xy",
 ):
     """One k batch's candidate WFN faces through the shared sampler.
 
@@ -1463,10 +1464,12 @@ def _load_candidate_faces(
 
     Returns
     -------
-    ``(meta, left_slice, psi_l_Y, psi_l_X, psi_r_Y, psi_r_X)``.  ``*_Y`` is
-    ``(nk, nb, ns, M_pad)`` at ``P(None, None, None, 'y')``; ``*_X`` is
-    the conjugate ``(nk, M_pad, nb, ns)`` at ``P(None, 'x', None, None)``.
-    The left pair is ``None`` when ``left_slice`` is not.
+    ``(meta, left_slice, psi_l_Y, psi_l_X, psi_r_Y, psi_r_X)``.  With
+    ``faces='xy'`` (the Gram) ``*_Y`` is ``(nk, nb, ns, M_pad)`` at
+    ``P(None, None, None, 'y')`` and ``*_X`` the conjugate ``(nk, M_pad, nb,
+    ns)`` at ``P(None, 'x', None, None)``.  With ``faces='cand'`` (the
+    sketch) ``*_Y`` is at ``P(None, None, None, ('y','x'))`` and ``*_X`` is
+    ``None``.  The left pair is ``None`` when ``left_slice`` is not.
     """
     from common.meta import Meta
     from common.wfn_transforms import load_centroids_band_chunked
@@ -1540,32 +1543,33 @@ def _load_candidate_faces(
     first_range, first_norms = (
         (right_range, norms_r_j) if left_slice is not None
         else (left_range, norms_l_j))
-    with timing.section("left.load"):
-        psi_a_rmu_Y, psi_a_rmuT_X = load_centroids_band_chunked(
-            wfn, sym, meta, cand_idx, bispinor, mesh_xy, first_range,
+    def _load(band_range):
+        out = load_centroids_band_chunked(
+            wfn, sym, meta, cand_idx, bispinor, mesh_xy, band_range,
             band_chunk_size=band_chunk_size,
-            k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
+            k_chunk_size=prune_k_tile, full_k_rows=full_k_rows, faces=faces,
         )
+        return (out, None) if faces == "cand" else out
+
+    with timing.section("left.load"):
+        psi_a_rmu_Y, psi_a_rmuT_X = _load(first_range)
         if first_norms is not None:
             # Y shape (nk, nb, ns, n_rmu); X shape (nk, n_rmu, nb, ns)
             psi_a_rmu_Y = psi_a_rmu_Y / first_norms[None, :, None, None]
-            psi_a_rmuT_X = psi_a_rmuT_X / first_norms[None, None, :, None]
+            if psi_a_rmuT_X is not None:
+                psi_a_rmuT_X = psi_a_rmuT_X / first_norms[None, None, :, None]
         psi_a_rmu_Y.block_until_ready()
     if left_slice is not None:
         # One load serves both windows: the left faces are the right faces'
         # band rows [lo, hi), bit for bit what a separate load would give.
         return meta, left_slice, None, None, psi_a_rmu_Y, psi_a_rmuT_X
     with timing.section("right.load"):
-        psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
-            wfn, sym, meta, cand_idx, bispinor, mesh_xy,
-            right_range,
-            band_chunk_size=band_chunk_size,
-            k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
-        )
+        psi_r_rmu_Y, psi_r_rmuT_X = _load(right_range)
         if norms_r_j is not None:
             psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
-            psi_r_rmuT_X = (
-                psi_r_rmuT_X / norms_r_j[None, None, :, None])
+            if psi_r_rmuT_X is not None:
+                psi_r_rmuT_X = (
+                    psi_r_rmuT_X / norms_r_j[None, None, :, None])
         psi_r_rmu_Y.block_until_ready()
     return meta, None, psi_a_rmu_Y, psi_a_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X
 

@@ -498,6 +498,9 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 
     if args.select == "sketch":
         from .sketch_select import prune_candidates_by_sketch
+        if int(args.prune_q_shells) > 0 or float(args.prune_normalize):
+            raise ValueError("--prune-q-shells and --prune-normalize reshape the "
+                             "Cholesky Gram; --select sketch sketches the plain q = 0 Gram")
         for key in ("n_point_budget", "group_block", "gram_normalize"):
             kwargs.pop(key)
         kwargs.update(n_point_budget=int(N_c), seed=int(args.seed),

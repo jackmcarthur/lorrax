@@ -2083,8 +2083,12 @@ def _centroid_stream_geometry(
 def _centroid_resident_bytes(
         band_tile, bispinor, k_tile, loader, max_parent_star, mesh_xy, n_rmu, n_rmu_padded,
         n_rtot, nb_accum, nb_total, nk_accum, nk_tot, nspinor, p_band, parent_stream_active,
-        psi_G_flat, return_parents, stream_tiles):
-    """Produce the existing resident-memory estimate and padded band extent."""
+        psi_G_flat, return_parents, stream_tiles, *, cand_faces: bool = False):
+    """Produce the existing resident-memory estimate and padded band extent.
+
+    ``cand_faces`` prices the single ``faces='cand'`` output, whose centroid
+    axis is split over every rank, instead of the ``'y'`` and ``'x'`` faces.
+    """
     from runtime.padding import padded_axis
     # G-flat input. Streaming retains one fixed child tile, one raw parent,
     # and at most one physical symmetry star of int32 FFT indices beside the
@@ -2145,14 +2149,16 @@ def _centroid_resident_bytes(
     mu_y_local = padded_axis(
         n_rmu_padded, n_y,
         name="centroid Y-shard memory carrier").carrier // n_y
+    face_mu_local = (
+        padded_axis(n_rmu_padded, n_x * n_y,
+                    name="centroid flat-mesh memory carrier").carrier // (n_x * n_y)
+        if cand_faces else mu_x_local + mu_y_local)
     output_local_bytes = (
-        nk_accum * nb_accum * nspinor * 16
-        * (mu_x_local + mu_y_local)
+        nk_accum * nb_accum * nspinor * 16 * face_mu_local
     )
     if return_parents:
         output_local_bytes += (
-            int(loader.nkpts) * nb_accum * nspinor * 16
-            * (mu_x_local + mu_y_local)
+            int(loader.nkpts) * nb_accum * nspinor * 16 * face_mu_local
         )
     tile_band_output_local_bytes = 0
     tile_face_local_bytes = 0
@@ -2161,8 +2167,7 @@ def _centroid_resident_bytes(
             k_tile * nb_per_band_shard * nspinor * n_rmu * 16
         )
         tile_face_local_bytes = (
-            k_tile * band_tile * nspinor * 16
-            * (mu_x_local + mu_y_local)
+            k_tile * band_tile * nspinor * 16 * face_mu_local
         )
     # A caller-provided G-flat tensor is already allocated; only price it
     # here when this call will allocate it.
@@ -2248,7 +2253,14 @@ def _centroid_sampling_indices(
 def _centroid_face_kernels(
         b_start, meta, mu_active_mask, n_rmu, n_rmu_padded, nb_total, out_X, out_Y,
         stage_X_4d, stage_Y_4d):
-    """Produce the existing face reshards and logical-extent finalizer."""
+    """Produce the existing face reshards and logical-extent finalizer.
+
+    ``out_X = None`` is the ``faces='cand'`` layout: ``out_Y`` is then
+    ``P(None, None, None, ('y','x'))`` and the reshard returns the
+    band-to-product move alone, ``(face, None)``: every rank keeps its own
+    centroid block with every band, and neither the ``'y'`` gather nor the
+    conjugate ``X`` face is formed.
+    """
     from jax import shard_map
     from common.staged_reshard import _band_to_product_r_body
     mesh = out_Y.mesh
@@ -2256,9 +2268,13 @@ def _centroid_face_kernels(
     band_owner = NamedSharding(mesh, band_sphere_spec())
     perm = [(x*p_y+y, y*p_x+x) for x in range(p_x) for y in range(p_y)
             if x*p_y+y != y*p_x+x]
+    cand_only = out_X is None
 
     def _faces(a):
         product = _band_to_product_r_body(a, ('x', 'y'), (p_x, p_y))
+        if cand_only:
+            # P(None, None, None, ('y','x')): the move's own output layout.
+            return product
         local_mu = int(product.shape[3])
         y = (jax.lax.all_gather(product, 'x', axis=3, tiled=True)
              if p_x > 1 else product)
@@ -2276,9 +2292,11 @@ def _centroid_face_kernels(
         return y, jnp.conj(x.transpose(0, 3, 1, 2))
 
     faces = shard_map(_faces, mesh=mesh, in_specs=(band_sphere_spec(),),
-                      out_specs=(out_Y.spec, out_X.spec), check_vma=False)
+                      out_specs=(out_Y.spec if cand_only
+                                 else (out_Y.spec, out_X.spec)),
+                      check_vma=False)
 
-    @partial(jax.jit, out_shardings=(out_Y, out_X))
+    @partial(jax.jit, out_shardings=(out_Y if cand_only else (out_Y, out_X)))
     def _reshard_centroid_tile(psi_rmu_band):
         pad_cfg = ((0, 0), (0, 0), (0, 0), (0, n_rmu_padded - n_rmu))
         if mu_active_mask is not None:
@@ -2290,6 +2308,13 @@ def _centroid_face_kernels(
             psi_rmu_band = jnp.pad(psi_rmu_band, pad_cfg)
         psi_rmu_band = jax.lax.with_sharding_constraint(psi_rmu_band, band_owner)
         return faces(psi_rmu_band)
+
+    if cand_only:
+        # The callers take a (Y, X) pair; the cand layout has no X face.
+        _reshard_cand = _reshard_centroid_tile
+
+        def _reshard_centroid_tile(psi_rmu_band):
+            return _reshard_cand(psi_rmu_band), None
 
     if mu_active_mask is None:
         # These programs depend only on geometry. Recreating the jit wrapper
@@ -2307,25 +2332,29 @@ def _centroid_face_kernels(
         nk_result = int(nk_result)
         if int(psi_rmu_all.shape[0]) > nk_result:
             psi_rmu_all = psi_rmu_all[:nk_result]
-            psi_rmuT_all = psi_rmuT_all[:nk_result]
+            if not cand_only:
+                psi_rmuT_all = psi_rmuT_all[:nk_result]
         if int(psi_rmu_all.shape[1]) > nb_total:
             psi_rmu_all = psi_rmu_all[:, :nb_total, :, :]
-            psi_rmuT_all = psi_rmuT_all[:, :, :nb_total, :]
+            if not cand_only:
+                psi_rmuT_all = psi_rmuT_all[:, :, :nb_total, :]
         # A matching concrete face needs no copy; slices still reshard when needed.
         from distrib_la import ensure_sharding
         psi_rmu_all = ensure_sharding(psi_rmu_all, out_Y)
-        psi_rmuT_all = ensure_sharding(psi_rmuT_all, out_X)
+        if not cand_only:
+            psi_rmuT_all = ensure_sharding(psi_rmuT_all, out_X)
 
         # Zero user-band-pad rows (unchanged contract).
         if nb_user_in_range < nb_total:
             zero_y = jnp.zeros_like(
                 psi_rmu_all[:, nb_user_in_range:nb_total, :, :])
-            zero_x = jnp.zeros_like(
-                psi_rmuT_all[:, :, nb_user_in_range:nb_total, :])
             psi_rmu_all = psi_rmu_all.at[
                 :, nb_user_in_range:nb_total, :, :].set(zero_y)
-            psi_rmuT_all = psi_rmuT_all.at[
-                :, :, nb_user_in_range:nb_total, :].set(zero_x)
+            if not cand_only:
+                zero_x = jnp.zeros_like(
+                    psi_rmuT_all[:, :, nb_user_in_range:nb_total, :])
+                psi_rmuT_all = psi_rmuT_all.at[
+                    :, :, nb_user_in_range:nb_total, :].set(zero_x)
         return psi_rmu_all, psi_rmuT_all
     _finish_faces = _cached_jit('centroid_finish_body',
         (nb_total, nb_user_in_range, out_Y, out_X), lambda: _finish_faces)
@@ -2335,9 +2364,97 @@ def _centroid_face_kernels(
 def _centroid_stream_kernels(
         _reshard_centroid_tile, centroid_idx_np, cs, loader, mesh_xy, meta, n_rmu_padded,
         nb_accum, nk_accum, nspinor, out_X, out_Y):
-    """Produce the existing donated tile-insertion and sampling kernels."""
+    """Produce the existing donated tile-insertion and sampling kernels.
+
+    ``out_X = None`` (``faces='cand'``) keeps one accumulator; the pair
+    contract stays, with ``None`` in the ``X`` slot.
+    """
     from common import timing
     nk_parent = int(loader.nkpts)
+    if out_X is None:
+        _zero_faces, _zero_parent_faces, _insert_tile = _centroid_cand_kernels(
+            _reshard_centroid_tile, meta, n_rmu_padded, nb_accum, nk_accum,
+            nk_parent, nspinor, out_Y)
+    else:
+        _zero_faces, _zero_parent_faces, _insert_tile = _centroid_xy_kernels(
+            _reshard_centroid_tile, meta, n_rmu_padded, nb_accum, nk_accum,
+            nk_parent, nspinor, out_X, out_Y)
+
+    def _sample_and_insert_one(
+            acc_y, acc_x, psi_G_one, g_index_one, output_row, b_rel,
+            kvecs_one):
+        kvecs_one = jnp.asarray(kvecs_one).reshape(1, 3)
+        with timing.section("load_centroids.gflat_to_rmu"):
+            psi_rmu_band = gflat_to_rmu(
+                psi_G_one, g_index_one, centroid_idx_np,
+                mesh=mesh_xy, fft_grid=meta.fft_grid,
+                kvecs_frac=kvecs_one, norm="ortho", chunk_size=cs)
+            jax.block_until_ready(psi_rmu_band)
+        del kvecs_one
+
+        with timing.section("load_centroids.reshard_insert"):
+            acc_y, acc_x = _insert_tile(
+                acc_y, acc_x, psi_rmu_band,
+                jnp.int32(output_row), jnp.int32(b_rel),
+                valid_k=1,
+                valid_b=min(int(psi_G_one.shape[1]), nb_accum - b_rel))
+            jax.block_until_ready((acc_y, acc_x))
+        del psi_rmu_band
+        return acc_y, acc_x
+    return _zero_faces, _zero_parent_faces, _insert_tile, _sample_and_insert_one
+
+
+def _centroid_cand_kernels(
+        _reshard_centroid_tile, meta, n_rmu_padded, nb_accum, nk_accum, nk_parent,
+        nspinor, out_Y):
+    """The ``faces='cand'`` zero and donated insertion kernels (one accumulator).
+
+    Same contract as :func:`_centroid_xy_kernels` with ``None`` in every
+    ``X`` slot: ``_zero_faces() -> (acc, None)`` and
+    ``_insert_tile(acc, None, tile, k0, b0, *, valid_k, valid_b) -> (acc, None)``.
+    """
+    @partial(jax.jit, out_shardings=out_Y)
+    def _zero_face():
+        return jnp.zeros((nk_accum, nb_accum, nspinor, n_rmu_padded),
+                         dtype=jnp.complex128)
+
+    @partial(jax.jit, out_shardings=out_Y)
+    def _zero_parent_face():
+        return jnp.zeros((nk_parent, nb_accum, nspinor, n_rmu_padded),
+                         dtype=jnp.complex128)
+
+    @partial(jax.jit, donate_argnums=(0,), out_shardings=out_Y,
+             static_argnames=("valid_k", "valid_b"))
+    def _insert_one(acc_y, psi_rmu_band, k0, b0, *, valid_k, valid_b):
+        tile_y, _ = _reshard_centroid_tile(psi_rmu_band)
+        # Slice only after bands have left the mesh (see the X/Y kernel).
+        tile_y = tile_y[:valid_k, :valid_b]
+        zero = jnp.int32(0)
+        return jax.lax.dynamic_update_slice(acc_y, tile_y, (k0, b0, zero, zero))
+
+    zero_key = (nb_accum, nspinor, n_rmu_padded, out_Y, None)
+    _zero_face = _cached_jit(
+        'centroid_zero_faces', (nk_accum, *zero_key), lambda: _zero_face)
+    _zero_parent_face = _cached_jit(
+        'centroid_zero_parent_faces', (nk_parent, *zero_key), lambda: _zero_parent_face)
+    if getattr(meta, 'mu_basis', None) is None:
+        _insert_one = _cached_jit(
+            'centroid_insert_tile', (_reshard_centroid_tile, out_Y, None),
+            lambda: _insert_one)
+
+    def _insert_tile(acc_y, acc_x, psi_rmu_band, k0, b0, *, valid_k, valid_b):
+        del acc_x
+        return _insert_one(acc_y, psi_rmu_band, k0, b0,
+                           valid_k=valid_k, valid_b=valid_b), None
+
+    return (lambda: (_zero_face(), None), lambda: (_zero_parent_face(), None),
+            _insert_tile)
+
+
+def _centroid_xy_kernels(
+        _reshard_centroid_tile, meta, n_rmu_padded, nb_accum, nk_accum, nk_parent,
+        nspinor, out_X, out_Y):
+    """The ``Y``/``X`` face zero and donated insertion kernels."""
     @partial(jax.jit, out_shardings=(out_Y, out_X))
     def _zero_faces():
         return (
@@ -2389,29 +2506,7 @@ def _centroid_stream_kernels(
         _insert_tile = _cached_jit(
             'centroid_insert_tile', (_reshard_centroid_tile, out_Y, out_X),
             lambda: _insert_tile)
-
-    def _sample_and_insert_one(
-            acc_y, acc_x, psi_G_one, g_index_one, output_row, b_rel,
-            kvecs_one):
-        kvecs_one = jnp.asarray(kvecs_one).reshape(1, 3)
-        with timing.section("load_centroids.gflat_to_rmu"):
-            psi_rmu_band = gflat_to_rmu(
-                psi_G_one, g_index_one, centroid_idx_np,
-                mesh=mesh_xy, fft_grid=meta.fft_grid,
-                kvecs_frac=kvecs_one, norm="ortho", chunk_size=cs)
-            jax.block_until_ready(psi_rmu_band)
-        del kvecs_one
-
-        with timing.section("load_centroids.reshard_insert"):
-            acc_y, acc_x = _insert_tile(
-                acc_y, acc_x, psi_rmu_band,
-                jnp.int32(output_row), jnp.int32(b_rel),
-                valid_k=1,
-                valid_b=min(int(psi_G_one.shape[1]), nb_accum - b_rel))
-            jax.block_until_ready((acc_y, acc_x))
-        del psi_rmu_band
-        return acc_y, acc_x
-    return _zero_faces, _zero_parent_faces, _insert_tile, _sample_and_insert_one
+    return _zero_faces, _zero_parent_faces, _insert_tile
 
 
 def _sample_centroid_parent_groups(
@@ -2675,8 +2770,23 @@ def load_centroids_band_chunked(
     k_domain: str = "full_bz",
     return_ibz_parents: bool = False,
     full_k_rows=None,
+    faces: str = "xy",
 ) -> tuple[jax.Array, ...]:
-    """Produce centroid faces from bounded WFN tiles; see docs/architecture/zeta_fit_face_psi_cct.md."""
+    """Produce centroid faces from bounded WFN tiles; see docs/architecture/zeta_fit_face_psi_cct.md.
+
+    ``faces='xy'`` (default) returns the ``(Y, X)`` pair: ``Y (nk, nb, ns,
+    mu)`` at ``P(None, None, None, 'y')`` and the conjugate ``X (nk, mu, nb,
+    ns)`` at ``P(None, 'x', None, None)``.  ``faces='cand'`` returns one
+    array ``(nk, nb, ns, mu)`` at ``P(None, None, None, ('y','x'))``: the
+    band-to-product move alone, every rank holding its own centroid block
+    with every band, ``2 sqrt(P)`` times smaller per rank than the pair
+    (the candidate sketch of ``centroid.sketch_select``).
+    """
+    faces = str(faces).strip().lower()
+    if faces not in ("xy", "cand"):
+        raise ValueError(f"load_centroids_band_chunked: faces must be 'xy' or 'cand'; got {faces!r}")
+    if faces == "cand" and return_ibz_parents:
+        raise ValueError("load_centroids_band_chunked: faces='cand' returns no IBZ parent faces")
     (b_start, b_end, nb_total, domain, return_parents, nk_tot, nspinor, mu_basis, mu_active_mask, n_rmu, centroid_idx_np, n_rtot) = _centroid_sampling_geometry(
         band_range, centroid_indices, k_domain, meta, psi_G_flat, return_ibz_parents, sym, wfn)
     if full_k_rows is not None:
@@ -2694,13 +2804,16 @@ def load_centroids_band_chunked(
         k_chunk_size = min(nk_tot, max(1, int(k_chunk_size or nk_tot)))
     (sharding_load, p_band, peak_copies, gpu_mem_bytes, out_Y, out_X, stage_Y_4d, stage_X_4d, n_rmu_padded, loader) = _centroid_sampling_shardings(
         mesh_xy, meta, mu_basis, n_rmu, wfn)
+    if faces == "cand":
+        out_Y = NamedSharding(mesh_xy, P(None, None, None, ('y', 'x')))
+        out_X = None
     (stream_tiles, k_tile, band_tile, nk_accum, nb_accum, parent_groups, parent_stream_active, max_parent_star) = _centroid_stream_geometry(
         band_chunk_size, domain, k_chunk_size, loader, nb_total, nk_tot, p_band, psi_G_flat,
         return_parents, full_k_rows)
     (nb_per_band_shard, nb_accum, persistent_bytes) = _centroid_resident_bytes(
         band_tile, bispinor, k_tile, loader, max_parent_star, mesh_xy, n_rmu, n_rmu_padded,
         n_rtot, nb_accum, nb_total, nk_accum, nk_tot, nspinor, p_band, parent_stream_active,
-        psi_G_flat, return_parents, stream_tiles)
+        psi_G_flat, return_parents, stream_tiles, cand_faces=(faces == "cand"))
     (cs) = _centroid_fft_scan_chunk(
         band_tile, domain, gpu_mem_bytes, k_tile, n_rtot, nb_per_band_shard, nspinor,
         peak_copies, persistent_bytes, return_parents, stream_tiles)
@@ -2715,12 +2828,14 @@ def load_centroids_band_chunked(
             f"({b_start}, {b_end}) lies entirely past the file's "
             f"band extent ({int(loader.nbands)})")
     if stream_tiles:
-        return _load_streamed_centroid_faces(
+        result = _load_streamed_centroid_faces(
             _finish_faces, _reshard_centroid_tile, b_start, band_tile, bispinor, bispinor_lift,
             centroid_idx_np, cs, domain, g_index_full, k_tile, kvecs_frac_full, loader, mesh_xy,
             meta, n_rmu_padded, nb_accum, nb_total, nk_accum, nk_tot, nspinor, out_X, out_Y,
             parent_groups, return_parents, sharding_load, full_k_rows)
-    return _load_bulk_centroid_faces(
-        _finish_faces, _reshard_centroid_tile, b_end, b_start, bispinor, bispinor_lift,
-        centroid_idx_np, cs, domain, g_index_full, kvecs_frac_full, loader, mesh_xy, meta,
-        nk_tot, psi_G_flat, sharding_load)
+    else:
+        result = _load_bulk_centroid_faces(
+            _finish_faces, _reshard_centroid_tile, b_end, b_start, bispinor, bispinor_lift,
+            centroid_idx_np, cs, domain, g_index_full, kvecs_frac_full, loader, mesh_xy, meta,
+            nk_tot, psi_G_flat, sharding_load)
+    return result[0] if faces == "cand" else result
