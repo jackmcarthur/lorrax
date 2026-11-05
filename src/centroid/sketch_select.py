@@ -449,13 +449,66 @@ def build_sketch_q0_via_loadwfns(
 # Orbit-blocked near-greedy QRCP on the sketch
 # ═══════════════════════════════════════════════════════════════════════
 
+def _panel_plan(n_rows_pad: int, m_loc: int) -> tuple[int, int]:
+    """``(w, n_panels)``: local column panels of at most a quarter fixed tile of ``R`` rows.
+
+    The deflation and the column norms stream each rank's ``m_loc`` columns
+    in ``n_panels`` panels of ``w`` columns, so no program holds a second
+    copy of the sketch (a whole-block GEMM update or ``|Y|^2`` would).  The
+    last panel is clamped to end at ``m_loc``; the columns it shares with
+    the previous panel are projected twice, which a projection leaves
+    unchanged.
+    """
+    from runtime.tiles import TILE_BYTES
+    cap = max(1, min(int(m_loc), int(TILE_BYTES) // (4 * _C128 * int(n_rows_pad))))
+    n_panels = -(-int(m_loc) // cap)
+    return -(-int(m_loc) // n_panels), n_panels
+
+
+def _paneled(mesh: Mesh, n_rows_pad: int, m_pad: int, body, *, write: bool):
+    """One ``shard_map`` streaming each rank's ``Y`` block over local column panels.
+
+    ``body(Yp, *extra) -> Yp'`` acts on one local panel ``(1, R, w)``;
+    with ``write`` the panel is updated in place in the rank's block.  Each
+    panel's column norms ``||Yp'[:, a]||^2`` fill ``d``.  The update lives
+    inside one manual region on purpose: a whole-face product (or one
+    ``shard_map`` per panel) cannot alias its output with the sketch and
+    holds a second copy of it, measured 2.2x the sketch at N_mu = 45k.
+    Returns the shard_map ``(Y, *extra) -> (Y, d)`` (``Y`` at
+    ``P(None, None, CAND)``, ``d (M_pad,)`` at ``P(CAND)``).
+    """
+    m_loc = int(m_pad) // int(mesh.size)
+    w, n_panels = _panel_plan(int(n_rows_pad), m_loc)
+
+    def local(Y, *extra):
+        def panel(j, carry):
+            Y, d = carry
+            start = jnp.minimum(j * w, m_loc - w).astype(jnp.int32)
+            Yp = body(lax.dynamic_slice_in_dim(Y, start, w, axis=2), *extra)
+            dp = jnp.sum(jnp.real(Yp[0]) ** 2 + jnp.imag(Yp[0]) ** 2, axis=0)
+            if write:
+                Y = lax.dynamic_update_slice_in_dim(Y, Yp, start, axis=2)
+            return Y, lax.dynamic_update_slice_in_dim(d, dp, start, axis=0)
+
+        return lax.fori_loop(0, n_panels, panel, (Y, jnp.zeros((m_loc,), jnp.float64)))
+
+    def spec(extra):
+        return shard_map(local, mesh=mesh,
+                         in_specs=(P(None, None, CAND),) + (P(),) * extra,
+                         out_specs=(P(None, None, CAND), P(CAND)), check_vma=False)
+
+    return spec
+
+
 @lru_cache(maxsize=None)
-def _residual_kernel(mesh: Mesh):
-    """``d(a) = ||Y[:, a]||^2`` at ``P(CAND)`` (a local column sum)."""
-    @partial(jax.jit, out_shardings=NamedSharding(mesh, P(CAND)))
+def _residual_kernel(mesh: Mesh, n_rows_pad: int, m_pad: int):
+    """``d(a) = ||Y[:, a]||^2`` at ``P(CAND)``, streamed over local column panels (Y unchanged)."""
+    run = _paneled(mesh, n_rows_pad, m_pad, lambda Yp: Yp, write=False)(0)
+
     def residual(Y):
-        return jnp.sum(jnp.abs(Y[0]) ** 2, axis=0)
-    return residual
+        return run(Y)[1]
+
+    return jax.jit(residual, out_shardings=NamedSharding(mesh, P(CAND)))
 
 
 def _right_solve_upper_h(B, L):
@@ -650,28 +703,28 @@ def _deflate_kernel(mesh: Mesh, n_rows_pad: int, m_pad: int, t_pad: int):
     ``Q (R, t_pad)`` is the block's replicated orthonormal basis, zero beyond
     its first ``n_dir`` columns; ``ceil(n_dir / _CHUNK)`` chunks are applied
     (a sequence of chunk projections equals the block projection because the
-    chunks are mutually orthogonal).  Both products are
-    ``distrib_la.local_gemm_plan`` on the candidate columns, one local GEMM
-    per rank and no collective.  Returns ``(Y, d, trace)``: the deflated
-    sketch, ``d = ||Y[:, a]||^2`` at ``P(CAND)`` and the replicated residual
-    trace over ``active`` columns (a diagnostic).
+    chunks are mutually orthogonal).  The sketch is streamed over local
+    column panels inside one ``shard_map`` (:func:`_paneled`): two local
+    GEMMs per chunk and panel, ``W = Q_c^H Y_p`` and ``Y_p -= Q_c W``, no
+    collective, and the program holds one panel beside ``Y``, never a
+    second sketch.  Returns ``(Y, d, trace)``: the deflated sketch,
+    ``d = ||Y[:, a]||^2`` at ``P(CAND)`` and the replicated residual trace
+    over ``active`` columns (a diagnostic).
     """
     cand = NamedSharding(mesh, P(None, None, CAND))
-    R = int(n_rows_pad)
-    project = distrib_la.local_gemm_plan(
-        mesh, m=_CHUNK, k=R, n=m_pad, nq=1, dtype=jnp.complex128,
-        out_spec=P(None, None, CAND), warmup=False)
-    update = distrib_la.local_gemm_plan(
-        mesh, m=R, k=_CHUNK, n=m_pad, nq=1, dtype=jnp.complex128,
-        alpha=-1.0, beta=1.0, out_spec=P(None, None, CAND), warmup=False)
+    del t_pad   # the basis carrier width; chunks are cut from it at run time
+
+    def body(Yp, Q, n_chunks):
+        def chunk(c, Yp):
+            Qc = lax.dynamic_slice_in_dim(Q, c * _CHUNK, _CHUNK, axis=1)
+            W = jnp.matmul(jnp.conj(Qc.T), Yp[0], precision=lax.Precision.HIGHEST)
+            return Yp - jnp.matmul(Qc, W, precision=lax.Precision.HIGHEST)[None]
+        return lax.fori_loop(0, n_chunks, chunk, Yp)
+
+    run = _paneled(mesh, n_rows_pad, m_pad, body, write=True)(2)
 
     def deflate(Y, Q, n_dir, active):
-        def chunk(c, Y):
-            Qc = lax.dynamic_slice_in_dim(Q, c * _CHUNK, _CHUNK, axis=1)
-            return update(Qc[None], project(jnp.conj(Qc.T)[None], Y), C=Y)
-
-        Y = lax.fori_loop(0, (n_dir + _CHUNK - 1) // _CHUNK, chunk, Y)
-        d = jnp.sum(jnp.abs(Y[0]) ** 2, axis=0)
+        Y, d = run(Y, Q, (n_dir + _CHUNK - 1) // _CHUNK)
         return Y, d, jnp.sum(jnp.where(active, d, 0.0))
 
     out = (cand, NamedSharding(mesh, P(CAND)), NamedSharding(mesh, P()))
@@ -749,7 +802,7 @@ def sketch_block_select(Y, mesh: Mesh, *, group_id, n_groups: int,
     chosen = put(np.zeros((G + 1,)), bool)
     remaining = put(int(point_budget), np.int32)
 
-    d = _residual_kernel(mesh)(Y)
+    d = _residual_kernel(mesh, n_rows_pad, m_pad)(Y)
     d0 = np.asarray(_mh.process_allgather(d, tiled=True))[:M]
     d0max = float(d0.max())
     trG = float(d0.sum())
