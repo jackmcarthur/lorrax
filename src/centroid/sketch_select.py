@@ -27,13 +27,15 @@ selection).  Per block:
 
 1. orbits are scored by the mean residual of their members;
 2. the top ``b`` orbits' columns ``C`` are gathered as row slabs of the
-   flattened mesh and their block Gram ``H = C^H C`` is formed;
+   flattened mesh and their block Gram ``H = C^H C`` is formed
+   (``distrib_la.replicated_gram``, rank-ordered);
 3. orbits are admitted in order while their in-block score stays above
    ``gamma`` times the block's leading score and they fit the point budget,
    each member pivoted by pivoted Cholesky on ``H`` (largest residual first);
 4. the admitted directions are orthonormalized by CholQR2 on the row slabs
-   and every column is deflated once, ``Y <- Y - Q (Q^H Y)``, through
-   ``distrib_la``'s planned local GEMM with ``Y`` donated.
+   (its Gram again ``distrib_la.replicated_gram``) and every column is
+   deflated once, ``Y <- Y - Q (Q^H Y)``, in place with ``Y`` donated
+   (``distrib_la.project_out``: each rank's columns in one-tile panels).
 
 Residuals are read through the sketch's shrinkage: after ``t`` orthonormal
 directions are removed, a Gaussian sketch keeps on average the fraction
@@ -522,67 +524,27 @@ def build_sketch_q0_via_loadwfns(
 # Orbit-blocked near-greedy QRCP on the sketch
 # ═══════════════════════════════════════════════════════════════════════
 
-def _panel_plan(n_rows_pad: int, m_loc: int) -> tuple[int, int]:
-    """``(w, n_panels)``: local column panels of at most one fixed tile of ``R`` rows.
+def _panel_bytes() -> int:
+    """Panel bytes of the deflation and the column norms: one fixed tile, not less.
 
-    The deflation and the column norms stream each rank's ``m_loc`` columns
-    in ``n_panels`` panels of ``w`` columns, so no program holds a second
-    copy of the sketch (a whole-block GEMM update or ``|Y|^2`` would).  One
-    tile, not less: on an A100 at the N_mu = 45k P4 shape (R = 49536) a
-    block's deflation takes 380 ms at w = 1299 (whole-block 387 ms) and
-    463 ms at a quarter tile, where the projection's (128 x w) output keeps
-    too few SMs busy.  The last panel is clamped to end at ``m_loc``; the
-    columns it shares with the previous panel are projected twice, which a
-    projection leaves unchanged.
+    ``distrib_la.project_out`` and ``column_norms`` stream each rank's
+    columns in panels of this many bytes, so no program holds a second copy
+    of the sketch.  On an A100 at the N_mu = 45k P4 shape (R = 49536) a
+    block's deflation takes 380 ms at one tile (w = 1299 columns;
+    whole-block 387 ms) and 463 ms at a quarter tile, where the projection's
+    (128 x w) output keeps too few SMs busy.
     """
     from runtime.tiles import TILE_BYTES
-    cap = max(1, min(int(m_loc), int(TILE_BYTES) // (_C128 * int(n_rows_pad))))
-    n_panels = -(-int(m_loc) // cap)
-    return -(-int(m_loc) // n_panels), n_panels
-
-
-def _paneled(mesh: Mesh, n_rows_pad: int, m_pad: int, body, *, write: bool):
-    """One ``shard_map`` streaming each rank's ``Y`` block over local column panels.
-
-    ``body(Yp, *extra) -> Yp'`` acts on one local panel ``(1, R, w)``;
-    with ``write`` the panel is updated in place in the rank's block.  Each
-    panel's column norms ``||Yp'[:, a]||^2`` fill ``d``.  The update lives
-    inside one manual region on purpose: a whole-face product (or one
-    ``shard_map`` per panel) cannot alias its output with the sketch and
-    holds a second copy of it, measured 2.2x the sketch at N_mu = 45k.
-    Returns the shard_map ``(Y, *extra) -> (Y, d)`` (``Y`` at
-    ``P(None, None, CAND)``, ``d (M_pad,)`` at ``P(CAND)``).
-    """
-    m_loc = int(m_pad) // int(mesh.size)
-    w, n_panels = _panel_plan(int(n_rows_pad), m_loc)
-
-    def local(Y, *extra):
-        def panel(j, carry):
-            Y, d = carry
-            start = jnp.minimum(j * w, m_loc - w).astype(jnp.int32)
-            Yp = body(lax.dynamic_slice_in_dim(Y, start, w, axis=2), *extra)
-            dp = jnp.sum(jnp.real(Yp[0]) ** 2 + jnp.imag(Yp[0]) ** 2, axis=0)
-            if write:
-                Y = lax.dynamic_update_slice_in_dim(Y, Yp, start, axis=2)
-            return Y, lax.dynamic_update_slice_in_dim(d, dp, start, axis=0)
-
-        return lax.fori_loop(0, n_panels, panel, (Y, jnp.zeros((m_loc,), jnp.float64)))
-
-    def spec(extra):
-        return shard_map(local, mesh=mesh,
-                         in_specs=(P(None, None, CAND),) + (P(),) * extra,
-                         out_specs=(P(None, None, CAND), P(CAND)), check_vma=False)
-
-    return spec
+    return int(TILE_BYTES)
 
 
 @lru_cache(maxsize=None)
-def _residual_kernel(mesh: Mesh, n_rows_pad: int, m_pad: int):
+def _residual_kernel(mesh: Mesh):
     """``d(a) = ||Y[:, a]||^2`` at ``P(CAND)``, streamed over local column panels (Y unchanged)."""
-    run = _paneled(mesh, n_rows_pad, m_pad, lambda Yp: Yp, write=False)(0)
 
     def residual(Y):
-        return run(Y)[1]
+        return distrib_la.column_norms(Y, mesh=mesh, panel_bytes=_panel_bytes(),
+                                       spec=P(None, None, CAND))[0]
 
     return jax.jit(residual, out_shardings=NamedSharding(mesh, P(CAND)))
 
@@ -655,8 +617,7 @@ def _select_block_kernel(mesh: Mesh, m_pad: int, n_rows_pad: int, n_rows: int,
         cols = jnp.take(Y[0], jnp.clip(local, 0, m_loc - 1), axis=1)
         cols = jnp.where(own[None, :], cols, jnp.zeros((), Y.dtype))
         C = lax.psum_scatter(cols, CAND, scatter_dimension=0, tiled=True)  # exact-reduce: one owner per column, zeros elsewhere
-        H = ordered_psum(jnp.conj(C.T) @ C, CAND)
-        return C, H
+        return C, distrib_la.replicated_gram(C, axes=CAND)
 
     block_sm = shard_map(_block, mesh=mesh, in_specs=(P(None, None, CAND), P()),
                          out_specs=(P(CAND, None), P()), check_vma=False)
@@ -666,7 +627,7 @@ def _select_block_kernel(mesh: Mesh, m_pad: int, n_rows_pad: int, n_rows: int,
         Cs = jnp.take(C, jnp.clip(sel, 0, m_b - 1), axis=1)
         Cs = jnp.where(pad[None, :], jnp.zeros((), C.dtype), Cs)
         X = _right_solve_upper_h(Cs, L_sel)
-        H2 = ordered_psum(jnp.conj(X.T) @ X, CAND)
+        H2 = distrib_la.replicated_gram(X, axes=CAND)
         H2 = jnp.where(pad[:, None] | pad[None, :], jnp.zeros((), H2.dtype), H2)
         H2 = H2 + jnp.diag(pad.astype(H2.dtype))
         X = _right_solve_upper_h(X, jnp.linalg.cholesky(H2))
@@ -773,36 +734,26 @@ def _select_block_kernel(mesh: Mesh, m_pad: int, n_rows_pad: int, n_rows: int,
 
 
 @lru_cache(maxsize=None)
-def _deflate_kernel(mesh: Mesh, n_rows_pad: int, m_pad: int, t_pad: int):
+def _deflate_kernel(mesh: Mesh):
     """``Y <- Y - Q (Q^H Y)`` once, :data:`_CHUNK` columns of ``Q`` at a time; Y donated.
 
     ``Q (R, t_pad)`` is the block's replicated orthonormal basis, zero beyond
     its first ``n_dir`` columns; ``ceil(n_dir / _CHUNK)`` chunks are applied
     (a sequence of chunk projections equals the block projection because the
-    chunks are mutually orthogonal).  The sketch is streamed over local
-    column panels inside one ``shard_map`` (:func:`_paneled`): two local
-    GEMMs per chunk and panel, ``W = Q_c^H Y_p`` and ``Y_p -= Q_c W``, no
-    collective, and the program holds one panel beside ``Y``, never a
-    second sketch.  Returns ``(Y, d, trace)``: the deflated sketch,
-    ``d = ||Y[:, a]||^2`` at ``P(CAND)`` and the replicated residual trace
-    over ``active`` columns (a diagnostic).
+    chunks are mutually orthogonal).  ``distrib_la.project_out`` streams
+    each rank's columns in one-tile panels inside one ``shard_map``: two
+    local GEMMs per chunk and panel, no collective, and the program holds one
+    panel beside ``Y``, never a second sketch.  Returns ``(Y, d, trace)``:
+    the deflated sketch, ``d = ||Y[:, a]||^2`` at ``P(CAND)`` and the
+    replicated residual trace over ``active`` columns (a diagnostic).
     """
     cand = NamedSharding(mesh, P(None, None, CAND))
-    del t_pad   # the basis carrier width; chunks are cut from it at run time
-
-    def body(Yp, Q, n_chunks):
-        def chunk(c, Yp):
-            Qc = lax.dynamic_slice_in_dim(Q, c * _CHUNK, _CHUNK, axis=1)
-            W = jnp.matmul(jnp.conj(Qc.T), Yp[0], precision=lax.Precision.HIGHEST)
-            # Y_p + (-Q_c) W: the addition folds into the GEMM (beta = 1);
-            # the subtraction form costs an extra pass over the panel.
-            return Yp + jnp.matmul(-Qc, W, precision=lax.Precision.HIGHEST)[None]
-        return lax.fori_loop(0, n_chunks, chunk, Yp)
-
-    run = _paneled(mesh, n_rows_pad, m_pad, body, write=True)(2)
 
     def deflate(Y, Q, n_dir, active):
-        Y, d = run(Y, Q, (n_dir + _CHUNK - 1) // _CHUNK)
+        Y, d = distrib_la.project_out(Y, Q[None], n_dir, mesh=mesh,
+                                      panel_bytes=_panel_bytes(),
+                                      spec=P(None, None, CAND), chunk=_CHUNK)
+        d = d[0]
         return Y, d, jnp.sum(jnp.where(active, d, 0.0))
 
     out = (cand, NamedSharding(mesh, P(CAND)), NamedSharding(mesh, P()))
@@ -880,7 +831,7 @@ def sketch_block_select(Y, mesh: Mesh, *, group_id, n_groups: int,
     chosen = put(np.zeros((G + 1,)), bool)
     remaining = put(int(point_budget), np.int32)
 
-    d = _residual_kernel(mesh, n_rows_pad, m_pad)(Y)
+    d = _residual_kernel(mesh)(Y)
     d0 = np.asarray(_mh.process_allgather(d, tiled=True))[:M]
     d0max = float(d0.max())
     trG = float(d0.sum())
@@ -890,7 +841,7 @@ def sketch_block_select(Y, mesh: Mesh, *, group_id, n_groups: int,
 
     select = _select_block_kernel(mesh, m_pad, n_rows_pad, r_true, G, s_max,
                                   n_slots, float(gamma))
-    deflate = _deflate_kernel(mesh, n_rows_pad, m_pad, t_pad)
+    deflate = _deflate_kernel(mesh)
     piv_parts, dtk_parts, traces = [], [], []
     n_blocks = 0
     t_done = 0

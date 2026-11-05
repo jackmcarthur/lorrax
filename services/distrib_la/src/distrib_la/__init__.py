@@ -64,6 +64,16 @@ layout='face', enable_active_range=False) -> GemmPlan``
     kernel on CUDA and ROCm and bounded JAX dot panels on cpu
     (``ACTIVE_LOCAL_ROUTE``).
     See ``docs/services/distrib_la/api.md`` § Active ranges.
+``project_out(Y, Q, n_valid=None, *, mesh, panel_bytes, spec, chunk=128, norms=True)``, ``column_norms(Y, *, mesh, panel_bytes, spec)``
+    ``Y <- (1 - Q Q^H) Y`` IN PLACE on a column face ``(q, R, n)`` at
+    ``P(None,None,flat)`` (every mesh axis flattened), ``Q`` replicated,
+    ``chunk`` columns of ``Q`` at a time, each rank's columns streamed in
+    panels of at most ``panel_bytes``; and the column norms, streamed the same
+    way.  No program holds a second copy of ``Y``.
+``replicated_gram(a, b=None, *, axes, mesh=None)``
+    ``a^H b`` for row slabs split over ``axes``, on every rank, the partials
+    added in rank order; inside a caller's ``shard_map`` (``mesh=None``) or in
+    global view at ``P(axes, None)``.
 ``hermitian_part(a)``, ``hermitian_block(block, off, corner)``, ``join_columns(a, b)``, ``diagonal_like(values, like)``, ``on_face(fn, out, *operands, **static)``
     Block glue for stacked ``[b, R, R]`` operators and ``[b, n, R]`` panels
     that keeps each result on its operand's ``('x','y')`` face. Eager
@@ -117,6 +127,7 @@ from distrib_la.matmul import (
     resolve_matmul_backend, route_bytes, staged_fits)
 from distrib_la.matmul_plan import GemmPlan, gemm_plan, local_gemm_plan
 from distrib_la._panel_matmul import batch_gram, panel_matmul
+from distrib_la._column_panels import column_norms, project_out, replicated_gram
 from distrib_la.plan import RoomExhausted, room_class, room_or_exhausted, room_test  # noqa: E402
 from distrib_la.plan import (
     BATCHED_ROUTE_CHOICES,
@@ -185,6 +196,8 @@ __all__ = [
     "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES", "contract_faces",
     # planned N,N GEMM (trace-safe, for hot loops)
     "GemmPlan", "gemm_plan", "local_gemm_plan", "panel_matmul", "batch_gram",
+    # in-place column-panel projection and the replicated Gram (flattened mesh)
+    "project_out", "column_norms", "replicated_gram",
     # the batched route toggle and its dial
     "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
     "ROUTE_BATCH_RESHARD", "BATCHED_ROUTE_CHOICES", "BATCHED_ROUTE_DEFAULT",
