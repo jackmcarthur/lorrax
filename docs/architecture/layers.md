@@ -161,12 +161,14 @@ readers above it (`epsreader`, `mf_header`, `sigma_output`, `tagged_arrays`,
    lifts into any code unchanged. Its orbit canonicalisation comes through the
    `symmetry_maps` public API, which rule 6 governs. The registered fix is to inject
    the orbit map as a parameter, which is a signature change.
-3. **Pivoted Cholesky: split.** `centroid/pivoted_cholesky.py` is L1: it owns
-   ψ-based Gram construction, ISDF candidate policy and reporting. The greedy
-   recurrence and its rank/PSD certificates are `common/pivoted_cholesky.py`
-   at L2, which knows only matrices, group labels, active rows and a
-   caller-supplied mesh. Centroid construction and GW downfolding both call
-   the L2 owner directly (`test_pivoted_cholesky_selection_has_one_l2_owner`).
+3. **Pivoted Cholesky: one L2 owner.** The greedy recurrence and its
+   rank/PSD certificates are `common/pivoted_cholesky.py` at L2, which knows
+   only matrices, group labels, active rows and a caller-supplied mesh. GW
+   downfolding calls it directly
+   (`test_pivoted_cholesky_selection_has_one_l2_owner`). The centroid prune is
+   L1: `centroid/sketch_select.py` (ψ-based sketch and its orbit-blocked QRCP)
+   and `centroid/candidates.py` (candidate faces, k batches, orbit emission,
+   the shared select refusal).
 4. **`solvers/sternheimer_solve.py`: filed L2, and it fails its own test.** It
    applies `psp.dft_operators.apply_H_k_from_G` in its matvec. It stays at L2
    with the violation named (R2), because reclassifying it would hide the

@@ -300,9 +300,9 @@ class BandWindow:
 
     ``left`` is the window of the CONJUGATED leg of the pair density
     ``ρ_{mn} = conj(ψ_m) ψ_n`` (m), ``right`` is the window of the plain leg
-    (n).  Same convention as ``centroid.pivoted_cholesky``'s
-    ``band_range_left`` / ``band_range_right``, whose legacy ``(n_val,
-    n_cond)`` spelling is ``left = (0, n_val)``, ``right = (n_val, n_val +
+    (n).  Same convention as the centroid prune's
+    ``band_range_left`` / ``band_range_right``; the ``(n_val,
+    n_cond)`` spelling means ``left = (0, n_val)``, ``right = (n_val, n_val +
     n_cond)``.
 
     THE LEG MAPPING INTO ``c_q_downfold``, AND THE SIGN OF q IT FIXES.
@@ -531,7 +531,7 @@ class SelectionReport:
                 f"while retiring all its members, so this counts orbits and "
                 f"is not comparable to mu_S={self.mu_small} points.  The "
                 f"comparable number is the line below "
-                f"(centroid.pivoted_cholesky.point_granularity_rank exists "
+                f"(a point-granularity rank is reported "
                 f"because this confusion already shipped once)")
                if self.orbit_mode else
                (f" POINTS   <- necessary, NOT sufficient (~3x the eigenvalue "
@@ -674,7 +674,7 @@ def centroid_orbit_id(sym_perm) -> np.ndarray:
     takes, read as a graph instead of as a predicate.  Two centroids carry the
     same label iff some op maps one to the other, so a set of centroids is
     orbit-closed exactly when it is a union of label classes, which is the
-    property ``centroid.pivoted_cholesky``'s ``orbit_id`` mode delivers by
+    property the centroid sketch select's whole-orbit mode delivers by
     construction.
 
     Labels are CONTIGUOUS from 0 and ordered by first appearance, so
@@ -745,7 +745,7 @@ def _floor_selection_to_orbits(
 
     Returns ``(keep_idx, realized, requested, n_orbits_kept, orbit_rank)``.
     """
-    from centroid.pivoted_cholesky import refuse_unless_select_certified
+    from centroid.candidates import refuse_unless_select_certified
 
     rank_i = int(rank)
     if rank_i < 1:
@@ -880,7 +880,7 @@ def select_cur_centroids(
     and what is delivered is the largest union of WHOLE ORBITS whose point
     total does not exceed it.  The pivot loop picks one representative per
     orbit and retires that orbit's whole membership
-    (``centroid.pivoted_cholesky``'s ``orbit_id`` mode), so the delivered set
+    (the centroid sketch select's whole-orbit mode), so the delivered set
     is orbit-closed by construction, no completion is needed, no re-
     certification is forced and the ceiling refusal can only fire on the number
     the user typed.  Both numbers are printed, loudly, on every run.
@@ -904,7 +904,7 @@ def select_cur_centroids(
     moves it, the same way a band-window resolver moves the counts.
     """
     from centroid import distribution as dist
-    from centroid.pivoted_cholesky import refuse_unless_select_certified
+    from centroid.candidates import refuse_unless_select_certified
     from common.pivoted_cholesky import make_sharded_pivoted_cholesky_select
     from common.collectives import gather_to_host
 

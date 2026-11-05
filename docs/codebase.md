@@ -31,7 +31,7 @@ else.
 | `gw` | L1 | the GW and QSGW driver: ζ orchestration, $V_q$, screening (tangential, MPA, plasmon pole, ladder), Σ, the $q\to0$ heads, SC maps, downfolding | `python -m gw.gw_jax`, `gw.kin_ion_io`, `gw.downfold_cli`, `gw.epsmat_cli`, `gw.eqp_bgw`, `gw.plane_wave_pipeline` (opt-in) | `bse`, `bandstructure`, `file_io`, `psp`, `centroid`, `isdf`, `lxkit.deck_doctor` |
 | `bse` | L1 | the Bethe–Salpeter equation: kernels, TDA and full solvers, absorption, exciton bands, the $W_\mathrm{BSE}$ ladder | `python -m bse.bse_jax`, `bse.exciton_bands`, `bse.absorption_haydock`, `bse.bse_feast`, `bse.bse_kpm`, `bse.bse_w_exact` | `gw.screening_bse`, `file_io.restart_bundle` (both lazily) |
 | `bandstructure` | L1 | band interpolation (htransform), fine-k wavefunctions for the BSE, band operators | `python -m bandstructure.htransform` | `bse` |
-| `centroid` | L1 (`kmeans_isdf` L2, `distribution` L3) | ISDF centroid selection: weighted k-means, pivoted-Cholesky pruning, the sampling metric | `python -m centroid.kmeans_cli` | `gw`, `bandstructure` (htransform nodes) |
+| `centroid` | L1 (`kmeans_isdf` L2, `distribution` L3) | ISDF centroid selection: weighted k-means, sketched QRCP pruning, the sampling metric | `python -m centroid.kmeans_cli` | `gw`, `bandstructure` (htransform nodes) |
 | `isdf` | L1 | ζ-fit primitives (pair Grams, $C_q$ conditioning, the μ-batch route) and the nodal htransform basis | library | `gw`, `bandstructure`, `bse`, `centroid` |
 | `psp` | L1 | the plane-wave DFT layer: $T$, $V_\mathrm{loc}$, $V_\mathrm{NL}$, DFT+U and XC operators, pseudopotentials, radial tables, the preprocessing and mean-field drivers | `python -m psp.get_dipole_mtxels`, `psp.run_nscf`, `psp.run_dense_h`, `psp.run_sternheimer`, `psp.get_DFT_mtxels`, `psp.kpm_dos`, `psp.orbital_magnetization` | `gw`, `bandstructure`, `common`, `file_io`, `solvers` |
 | `postprocess` | L1 | WFN → `WFN_qp.h5` rotation | `python -m postprocess.rotate_wfn_to_qp` | nothing |
@@ -207,14 +207,15 @@ else.
 | Module | Role |
 |---|---|
 | `__init__.py` | Package marker for centroid selection. |
+| `candidates.py` | The prune's candidate plumbing: WFN faces at the candidates, k batches, orbit emission and the select refusal. |
 | `charge_density.py` | Averages a grid field over the space group (`symmetrize_on_grid`). |
 | `distribution.py` | Distributes centroid work and selected points. |
 | `kmeans_cli.py` | Command-line entry point for centroid generation. |
 | `kmeans_isdf.py` | Implements centroid selection and refinement. |
 | `kmeans_plot.py` | Produces centroid diagnostics and plots. |
-| `pivoted_cholesky.py` | Selects centroid candidates by pivoted Cholesky. |
 | `production_output.py` | Writes centroid-production reports and provenance. |
 | `sampling_metric.py` | Resolves stored-k sampling weights and quadrature tables. |
+| `sketch_select.py` | Prunes the candidate pool by orbit-blocked QRCP on a Gaussian sketch of the q = 0 pair matrix. |
 
 ## `src/file_io`
 

@@ -1,22 +1,25 @@
 """Sketched whole-orbit QRCP pruning of over-sampled ISDF candidate points.
 
-The pivoted-Cholesky prune (:mod:`centroid.pivoted_cholesky`) forms the dense
-``M x M`` q=0 pair Gram of the candidate pool and pivots on it,
+The prune keeps the candidates that add the most independent directions to
+the q=0 pair Gram of the candidate pool,
 
     G[a,a'] = sum_k w_k sum_{l in L, b in B} conj(rho_lbk(a)) rho_lbk(a'),
     rho_lbk(a) = sum_s conj(psi_lks(a)) psi_bks(a),
 
-which is QRCP on the pair matrix ``Z`` (rows ``(k,l,b)``, columns the
-candidates) restricted to the pool.  This module replaces ``G`` by the
-Khatri-Rao structured Gaussian sketch ``Y = Omega Z`` of ``r'`` rows,
+i.e. QRCP on the pair matrix ``Z`` (rows ``(k,l,b)``, columns the
+candidates) restricted to the pool, without ever forming ``G``: it works on
+the Khatri-Rao structured Gaussian sketch ``Y = Omega Z`` of ``r'`` rows,
 
     Y_j(a) = r'^(-1/2) sum_k sqrt(w_k) sum_s (sum_l g^L_jkl conj psi_lks(a))
                                              (sum_b g^B_jkb psi_bks(a)),
 
 with ``g ~ CN(0,1)`` drawn per k row and sketch row from
 ``jax.random.fold_in`` (the same numbers on every rank and mesh, never stored
-beyond one k), so ``E[Y^H Y] = G`` with the Gram's own conjugation, k weights
-and band norms.
+beyond one k), so ``E[Y^H Y] = G`` with the Gram's conjugation, k weights and
+band norms.  The current channel (``gamma_mode='transverse'``, bispinors)
+sketches the stacked-current Gram ``sum_i Z_i^H Z_i`` of
+``Z_i(a) = <psi^L(a)|alpha^i|psi^B(a)>``, one independent draw per
+component (:func:`sketch_vertices`).
 
 The selection is orbit-blocked near-greedy QRCP on ``Y``
 (``docs/theory/centroid-selection.md``; Lu & Ying's randomized ISDF point
@@ -82,7 +85,7 @@ from jax.experimental import multihost_utils as _mh
 from jax.scipy.linalg import solve_triangular
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from ffi import _services      # noqa: F401  (path bootstrap; see pivoted_cholesky)
+from ffi import _services      # noqa: F401  (path bootstrap; see candidates)
 
 _services.ensure_on_path()
 
@@ -94,15 +97,15 @@ from common.collectives import device_put_process_local         # noqa: E402
 from common.log import get_logger                               # noqa: E402
 
 from . import distribution as dist                              # noqa: E402
-from .pivoted_cholesky import (                                 # noqa: E402
-    _candidate_band_carrier,
-    _candidate_k_schedule,
-    _emit_complete_groups,
-    _left_band_slice,
-    _load_candidate_faces,
-    _unpicked_over_floor,
+from .candidates import (                                       # noqa: E402
+    candidate_band_carrier,
+    candidate_k_schedule,
     check_pair_space_window,
+    emit_complete_groups,
+    left_band_slice,
+    load_candidate_faces,
     refuse_unless_select_certified,
+    unpicked_over_floor,
 )
 
 log = get_logger(__name__)
@@ -201,28 +204,61 @@ def _zero_kernel(mesh: Mesh, n_rows_pad: int, m_pad: int):
 
 
 def _factor_rows(key, rows, n: int, factors: str, *, k_pos=None, which=0,
-                 n_left=1, n_right=1, n_rows=1):
+                 n_left=1, n_right=1, n_rows=1, vertex=0, n_k=1):
     """Sketch factor rows ``g[j, :]`` (``(len(rows), n)`` complex128, replicated).
 
     ``factors='gaussian'``: row ``j`` is ``CN(0,1)`` from ``fold_in(key, j)``,
     so a row's numbers do not depend on the tiling or the mesh.
     ``factors='exhaustive'``: ``Omega`` is the identity on the pair index
-    ``j = (k n_L + l) n_B + b`` (``r' = N_k n_L n_B``), scaled by ``r'^(1/4)``
-    so ``Y^H Y = G`` exactly -- the exactness check of the construction.
+    ``j = ((v N_k + k) n_L + l) n_B + b`` (``r' = n_v N_k n_L n_B``, one block
+    of rows per vertex ``v``), scaled by ``r'^(1/4)`` so ``Y^H Y`` is the
+    Gram exactly -- the exactness check of the construction.
     """
     if factors == "gaussian":
         return jax.vmap(lambda j: jax.random.normal(
             jax.random.fold_in(key, j), (int(n),), dtype=jnp.complex128))(rows)
-    k_of = rows // (n_left * n_right)
-    sel = (rows // n_right) % n_left if which == 0 else rows % n_right
-    hit = (k_of == k_pos)[:, None] & (sel[:, None] == jnp.arange(int(n))[None, :])
+    pair = rows - vertex * (n_k * n_left * n_right)
+    k_of = pair // (n_left * n_right)
+    sel = (pair // n_right) % n_left if which == 0 else pair % n_right
+    own = (pair >= 0) & (k_of == k_pos)
+    hit = own[:, None] & (sel[:, None] == jnp.arange(int(n))[None, :])
     return hit.astype(jnp.complex128) * (float(n_rows) ** 0.25)
+
+
+#: The q = 0 feature channels the sketch can carry: the charge pair density
+#: (vertex 1) and the three stacked Dirac currents ``alpha^i``, i = 1, 2, 3
+#: (``--density-mode current``).
+GAMMA_MODES = ("charge", "transverse")
+
+
+def sketch_vertices(gamma_mode: str) -> tuple:
+    """The channel's spin vertices as static ``((perm, phase), ...)`` host tuples.
+
+    ``vertex[a, b] = phase[a] delta_{b, perm[a]}`` (``common.gamma_matrices``).
+    ``charge``: the identity (2 or 4 components; ``perm=None``).
+    ``transverse``: ``alpha^1, alpha^2, alpha^3`` on four-component bispinors,
+    each sketched with its own Gaussian factors so ``E[Y^H Y] = sum_i Z_i^H Z_i``,
+    ``Z_i(a) = <psi^L(a)| alpha^i |psi^B(a)>``: the stacked-current Gram the
+    current ζ channels fit.
+    """
+    mode = str(gamma_mode).strip().lower()
+    if mode == "charge":
+        return ((None, None),)
+    if mode == "transverse":
+        from common.gamma_matrices import gamma_perm_phase_host
+        out = []
+        for mu in (1, 2, 3):
+            perm, phase = gamma_perm_phase_host(mu)
+            out.append((tuple(int(p) for p in perm),
+                        tuple(complex(c) for c in phase)))
+        return tuple(out)
+    raise ValueError(f"gamma_mode must be one of {GAMMA_MODES}; got {gamma_mode!r}")
 
 
 @lru_cache(maxsize=None)
 def _sketch_kernel(mesh: Mesh, nb_r: int, ns: int, m_pad: int, n_rows_pad: int,
                    n_rows: int, width: int, left: tuple | None, nb_l: int,
-                   factors: str):
+                   factors: str, vertices: tuple = ((None, None),), n_k: int = 1):
     """One k batch's Khatri-Rao accumulation ``Y += Omega_k Z_k`` (Y donated).
 
     Operands: ``Y (1, R, M_pad)`` at ``P(None,None,CAND)``; right face
@@ -233,11 +269,16 @@ def _sketch_kernel(mesh: Mesh, nb_r: int, ns: int, m_pad: int, n_rows_pad: int,
     ``sqrt_w (nk,)``, ``k_ids (nk,)`` (full-BZ rows, the PRNG stream),
     ``k_pos (nk,)`` (positions in the selected-row order), the key data and
     the row-tile ``starts`` / ``valid_from`` ``(n_tiles,)``.  Per k and row
-    tile the two factor GEMMs ``(ns, t, nb) x (ns, nb, M_pad)`` run through
-    ``distrib_la``'s planned local GEMM on the candidate columns; the spin
-    sum of their Hadamard product is added into ``Y``'s rows.  Rows below
-    ``valid_from`` (the clamped last tile's overlap) add nothing; rows
-    ``>= r'`` of the carrier are never written.
+    tile and vertex ``(perm, phase)`` the two factor GEMMs
+    ``(ns, t, nb) x (ns, nb, M_pad)`` run through ``distrib_la``'s planned
+    local GEMM on the candidate columns, and
+    ``sum_a phase[a] (g^L conj psi)[a] (g^B psi)[perm[a]]`` is added into
+    ``Y``'s rows (the identity vertex: the spin sum of the Hadamard product).
+    Each vertex draws its own factors (``fold_in(key_k, 2v)``, ``2v + 1``;
+    vertex 0 keeps the charge streams).  ``n_k`` is the total k count of the
+    exhaustive check's row blocks.  Rows below ``valid_from`` (the clamped
+    last tile's overlap) add nothing; rows ``>= r'`` of the carrier are
+    never written.
     """
     cand = NamedSharding(mesh, P(None, None, CAND))
     plan_l = distrib_la.local_gemm_plan(
@@ -258,20 +299,29 @@ def _sketch_kernel(mesh: Mesh, nb_r: int, ns: int, m_pad: int, n_rows_pad: int,
             A_op = (B_op[:, left[0]:left[1], :] if nested
                     else jnp.transpose(face_l, (1, 0, 2)))    # (ns, nb_l, M)
             key_k = jax.random.fold_in(key, k_id)
-            key_l, key_b = jax.random.fold_in(key_k, 0), jax.random.fold_in(key_k, 1)
 
             def one_tile(Y, tile):
                 start, first_new = tile
                 rows = start + jnp.arange(width, dtype=jnp.int32)
-                g_l = _factor_rows(key_l, rows, nb_l, factors, k_pos=kp, which=0,
-                                   n_left=nb_l, n_right=nb_r, n_rows=n_rows)
-                g_b = _factor_rows(key_b, rows, nb_r, factors, k_pos=kp, which=1,
-                                   n_left=nb_l, n_right=nb_r, n_rows=n_rows)
-                # sum_l g^L conj(psi_l) = conj(sum_l conj(g^L) psi_l)
-                a_l = jnp.conj(plan_l(jnp.broadcast_to(
-                    jnp.conj(g_l)[None], (ns, width, nb_l)), A_op))
-                a_b = plan_r(jnp.broadcast_to(g_b[None], (ns, width, nb_r)), B_op)
-                contrib = (w_k * scale) * jnp.sum(a_l * a_b, axis=0)
+                contrib = jnp.zeros((width, int(m_pad)), jnp.complex128)
+                for v, (perm, phase) in enumerate(vertices):
+                    key_l = jax.random.fold_in(key_k, 2 * v)
+                    key_b = jax.random.fold_in(key_k, 2 * v + 1)
+                    kw = dict(k_pos=kp, n_left=nb_l, n_right=nb_r, n_rows=n_rows,
+                              vertex=v, n_k=n_k)
+                    g_l = _factor_rows(key_l, rows, nb_l, factors, which=0, **kw)
+                    g_b = _factor_rows(key_b, rows, nb_r, factors, which=1, **kw)
+                    # sum_l g^L conj(psi_l) = conj(sum_l conj(g^L) psi_l)
+                    a_l = jnp.conj(plan_l(jnp.broadcast_to(
+                        jnp.conj(g_l)[None], (ns, width, nb_l)), A_op))
+                    a_b = plan_r(jnp.broadcast_to(g_b[None], (ns, width, nb_r)), B_op)
+                    if perm is None:
+                        contrib = contrib + jnp.sum(a_l * a_b, axis=0)
+                    else:
+                        ph = jnp.asarray(phase, jnp.complex128)[:, None, None]
+                        contrib = contrib + jnp.sum(
+                            ph * a_l * a_b[jnp.asarray(perm, jnp.int32)], axis=0)
+                contrib = (w_k * scale) * contrib
                 contrib = jnp.where((rows >= first_new)[:, None], contrib,
                                     jnp.zeros((), contrib.dtype))
                 zero = jnp.int32(0)
@@ -291,11 +341,14 @@ def _sketch_kernel(mesh: Mesh, nb_r: int, ns: int, m_pad: int, n_rows_pad: int,
 
 def sketch_from_faces(Y, psi_r, psi_l, mesh: Mesh, *, n_rows: int, sqrt_w,
                       k_ids, k_pos, key_data, left_slice,
-                      factors: str = "gaussian"):
+                      factors: str = "gaussian", gamma_mode: str = "charge",
+                      n_k: int | None = None):
     """Add one k batch's sketch rows to ``Y`` (donated) from its WFN faces.
 
-    Implements ``Y_j(a) += r'^(-1/2) sum_k sqrt(w_k) sum_s (g^L conj psi)(g^B psi)``
-    (module docstring) for the batch's k rows.
+    Implements ``Y_j(a) += r'^(-1/2) sum_k sqrt(w_k) sum_v sum_s
+    phase_v[s] (g^L_v conj psi)[s] (g^B_v psi)[perm_v[s]]`` over the
+    channel's vertices (:func:`sketch_vertices`; the charge channel is one
+    identity vertex) for the batch's k rows.
 
     Parameters
     ----------
@@ -315,6 +368,11 @@ def sketch_from_faces(Y, psi_r, psi_l, mesh: Mesh, *, n_rows: int, sqrt_w,
         ``jax.random.key_data`` of the run's key.
     factors : {'gaussian', 'exhaustive'}
         ``'exhaustive'`` is the identity sketch of the exactness check.
+    gamma_mode : {'charge', 'transverse'}
+        The feature channel; ``'transverse'`` needs four-component faces.
+    n_k : int or None
+        Total k rows of the exhaustive check's row blocks (``None``: this
+        batch's).
 
     Returns
     -------
@@ -323,6 +381,9 @@ def sketch_from_faces(Y, psi_r, psi_l, mesh: Mesh, *, n_rows: int, sqrt_w,
     from runtime.tiles import tile_plan
     _, n_rows_pad, m_pad = (int(v) for v in Y.shape)
     nk, nb_r, ns, _ = (int(v) for v in psi_r.shape)
+    vertices = sketch_vertices(gamma_mode)
+    if vertices[0][0] is not None and ns != 4:
+        raise ValueError(f"the transverse sketch needs four-component faces; got ns={ns}")
     if left_slice is not None:
         left = (int(left_slice[0]), int(left_slice[1]))
         nb_l = left[1] - left[0]
@@ -341,7 +402,8 @@ def sketch_from_faces(Y, psi_r, psi_l, mesh: Mesh, *, n_rows: int, sqrt_w,
     rep = NamedSharding(mesh, P())
     put = lambda a, dt: device_put_process_local(np.asarray(a, dtype=dt), rep)  # noqa: E731
     kernel = _sketch_kernel(mesh, nb_r, ns, m_pad, n_rows_pad, int(n_rows),
-                            int(width), left, nb_l, str(factors))
+                            int(width), left, nb_l, str(factors), vertices,
+                            int(nk if n_k is None else n_k))
     args = (Y, psi_r, psi_l, put(sqrt_w, np.float64), put(k_ids, np.int32),
             put(k_pos, np.int32), put(key_data, np.uint32),
             put(starts, np.int32), put(valid_from, np.int32))
@@ -352,9 +414,9 @@ def sketch_from_faces(Y, psi_r, psi_l, mesh: Mesh, *, n_rows: int, sqrt_w,
 
 def _face_bytes_per_k(mesh: Mesh, *, ns: int, m_pad: int, left, right) -> float:
     """Per-rank bytes of one k row of the batch's candidate faces (``faces='cand'``)."""
-    nb_faces = _candidate_band_carrier(right[1] - right[0], mesh, 64) + (
-        0 if _left_band_slice(left, right) is not None
-        else _candidate_band_carrier(left[1] - left[0], mesh, 64))
+    nb_faces = candidate_band_carrier(right[1] - right[0], mesh, 64) + (
+        0 if left_band_slice(left, right) is not None
+        else candidate_band_carrier(left[1] - left[0], mesh, 64))
     return float(_C128 * ns * m_pad * nb_faces) / int(mesh.size)
 
 
@@ -371,6 +433,7 @@ def build_sketch_q0_via_loadwfns(
     band_norms=None,
     k_weights=None,
     bispinor: bool = False,
+    gamma_mode: str = "charge",
     band_chunk_size: int = 64,
     memory_per_device_gb: float | None = None,
     factors: str = "gaussian",
@@ -378,12 +441,11 @@ def build_sketch_q0_via_loadwfns(
 ):
     """The q=0 candidate sketch over fixed-tile full-BZ k batches.
 
-    The k batches, their weights and the band norms are the candidate Gram's
-    own (:func:`centroid.pivoted_cholesky._candidate_k_schedule`,
-    :func:`~centroid.pivoted_cholesky._load_candidate_faces`); the loader
-    delivers the one face the sketch reads, ``faces='cand'``: every rank's
-    own candidate columns with every band, so neither the Gram's ``'y'``
-    gather nor its conjugate ``X`` face is formed.
+    The k batches and their weights come from
+    :func:`centroid.candidates.candidate_k_schedule` and the faces from
+    :func:`~centroid.candidates.load_candidate_faces`: the loader delivers
+    the one face the sketch reads, ``faces='cand'``, every rank's own
+    candidate columns with every band.
 
     Parameters
     ----------
@@ -393,10 +455,17 @@ def build_sketch_q0_via_loadwfns(
     n_rows : sketch rows ``r'``.
     seed : the PRNG seed (``jax.random.key``).
     band_range_left, band_range_right : 0-based half-open band windows.
-    band_norms, k_weights, bispinor, band_chunk_size, memory_per_device_gb :
-        as :func:`centroid.pivoted_cholesky.build_gram_q0_via_loadwfns`.
+    band_norms : (nbands,) or None
+        Pseudoband norms; both faces are divided by ``max(norm, 1)`` (charge
+        channel only).
+    k_weights : (nk_tot,) or None
+        Normalized nonnegative full-BZ quadrature weights (``None``: uniform).
+    bispinor : the four-component carrier (required by ``'transverse'``).
+    gamma_mode : ``'charge'`` (the pair density) or ``'transverse'`` (the
+        three stacked Dirac currents, :func:`sketch_vertices`).
+    band_chunk_size, memory_per_device_gb : the loader's band tile and budget.
     factors : ``'gaussian'`` (production) or ``'exhaustive'``
-        (``n_rows = N_k n_L n_B``; ``Y^H Y = G`` exactly).
+        (``n_rows = n_v N_k n_L n_B``; ``Y^H Y`` is the Gram exactly).
 
     Returns
     -------
@@ -413,29 +482,31 @@ def build_sketch_q0_via_loadwfns(
     m_pad = padded_mu_extent(M, mesh_xy)
     ns = 4 if bispinor else int(wfn.nspinor)
     per_k = _face_bytes_per_k(mesh_xy, ns=ns, m_pad=m_pad, left=left, right=right)
-    rows_sel, weights, nk, nk_full, k_batch, n_chunks = _candidate_k_schedule(
+    rows_sel, weights, nk, nk_full, k_batch, n_chunks = candidate_k_schedule(
         wfn, sym, k_weights, per_k)
-    if factors == "exhaustive" and int(n_rows) != nk * nb_l * nb_r:
-        raise ValueError(f"the exhaustive sketch needs r' = N_k n_L n_B = "
-                         f"{nk * nb_l * nb_r}; got {int(n_rows)}")
+    n_v = len(sketch_vertices(gamma_mode))
+    if factors == "exhaustive" and int(n_rows) != n_v * nk * nb_l * nb_r:
+        raise ValueError(f"the exhaustive sketch needs r' = n_v N_k n_L n_B = "
+                         f"{n_v * nk * nb_l * nb_r}; got {int(n_rows)}")
     key_data = np.asarray(jax.random.key_data(jax.random.key(int(seed))))
     Y = _zero_kernel(mesh_xy, sketch_row_carrier(n_rows, mesh_xy), int(m_pad))()
     for k0 in range(0, nk, k_batch):
         k1 = min(nk, k0 + k_batch)
         rows = (None if n_chunks == 1 and nk == nk_full else
                 tuple(int(k) for k in rows_sel[k0:k1]))
-        _, left_slice, psi_l, _, psi_r, _ = _load_candidate_faces(
+        _, left_slice, psi_l, psi_r = load_candidate_faces(
             wfn, sym, cand_idx, mesh_xy, left_range=left, right_range=right,
-            n_val=None, n_cond=None, bispinor=bispinor, band_norms=band_norms,
+            bispinor=bispinor, band_norms=band_norms,
             band_chunk_size=band_chunk_size,
             memory_per_device_gb=memory_per_device_gb, full_k_rows=rows,
-            gamma_mode="charge", verbose=verbose, faces="cand")
+            verbose=verbose)
         with timing.section("sketch.kron"):
             Y = sketch_from_faces(
                 Y, psi_r, psi_l, mesh_xy, n_rows=int(n_rows),
                 sqrt_w=np.sqrt(weights[k0:k1]), k_ids=rows_sel[k0:k1],
                 k_pos=np.arange(k0, k1), key_data=key_data,
-                left_slice=left_slice, factors=factors)
+                left_slice=left_slice, factors=factors, gamma_mode=gamma_mode,
+                n_k=nk)
             Y.block_until_ready()
         for face in (psi_l, psi_r):
             if face is not None and not face.is_deleted():
@@ -744,7 +815,7 @@ def sketch_block_select(Y, mesh: Mesh, *, group_id, n_groups: int,
                         verbose: bool = False):
     """Orbit-blocked near-greedy QRCP on the sketch under a point budget.
 
-    The semantics of ``common.pivoted_cholesky``'s group-block select on
+    The semantics of a greedy group-block pivoted Cholesky on
     ``Y^H Y``: whole groups only; a group is admitted only if it fits the
     remaining point budget; groups are ranked by mean residual over their
     members (residuals above the floor); every member of an admitted group
@@ -874,7 +945,7 @@ def sketch_block_select(Y, mesh: Mesh, *, group_id, n_groups: int,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# End-to-end wrapper (the return contract of the pivoted-Cholesky prune)
+# End-to-end wrapper: the centroid driver's prune
 # ═══════════════════════════════════════════════════════════════════════
 
 def _memory_proposal(mesh: Mesh, *, n_rows_pad: int, m_pad: int, ns: int,
@@ -940,17 +1011,17 @@ def prune_candidates_by_sketch(
 ):
     """End-to-end pruning: WFN faces -> sketch -> orbit-blocked QRCP -> keep.
 
-    The drop-in counterpart of
-    :func:`centroid.pivoted_cholesky.prune_candidates_by_pivoted_cholesky`
-    (``group_block=True`` semantics): the same windows, k weights, band norms,
-    budget in points, whole orbits, and refusal policy
-    (:func:`~centroid.pivoted_cholesky.refuse_unless_select_certified`).
+    The centroid driver's prune: windows, k weights and band norms define
+    the feature Gram; the budget is in points and only whole orbits are
+    delivered; an uncertifiable selection refuses
+    (:func:`centroid.candidates.refuse_unless_select_certified`).
 
     ``sketch_rows`` (``r'``; 0: :func:`sketch_rows_default`) must be at least
     the point budget: a rank-``r'`` sketch cannot certify more directions.
     ``sketch_block`` is the orbits per block (0: :func:`sketch_block_default`);
     ``sketch_gamma`` the in-block acceptance cut; ``seed`` the PRNG seed.
-    Charge mode only: ``gamma_mode='transverse'`` refuses in one line.
+    ``gamma_mode='transverse'`` (``bispinor=True``) prunes the current
+    channel's pool on the stacked-current Gram, with unit band weights.
 
     Returns ``(keep_idx, rank, d_final, d_taken, trR_over_trG, psd_info,
     unpicked)``.  ``rank`` counts directions above the floor ``tol_rel *
@@ -960,9 +1031,15 @@ def prune_candidates_by_sketch(
     boundary; ``psd_info = (0.0, -1, -1)`` (PSD by construction);
     ``unpicked`` the largest never-picked residual over the floor.
     """
-    if str(gamma_mode).strip().lower() != "charge":
-        raise ValueError("--select sketch implements the charge Gram only; prune "
-                         "current-mode (transverse) pools with --select cholesky")
+    mode = str(gamma_mode).strip().lower()
+    if mode not in GAMMA_MODES:
+        raise ValueError(f"gamma_mode must be one of {GAMMA_MODES}; got {gamma_mode!r}")
+    if mode == "transverse" and not bispinor:
+        raise ValueError("the transverse (current) sketch needs the four-component "
+                         "bispinor carrier (--density-mode current)")
+    if mode == "transverse" and band_norms is not None:
+        raise ValueError("the transverse sketch weighs every band in its windows "
+                         "by one; band_norms must be None")
     if not 0.0 < float(sketch_gamma) <= 1.0:
         raise ValueError(f"--sketch-gamma must lie in (0, 1]; got {sketch_gamma}")
     dist.require_axes(mesh, dist.MESH_AXES, "prune_candidates_by_sketch")
@@ -999,7 +1076,7 @@ def prune_candidates_by_sketch(
     m_pad = padded_mu_extent(M, mesh)
     ns = 4 if bispinor else int(wfn.nspinor)
     per_k = _face_bytes_per_k(mesh, ns=ns, m_pad=m_pad, left=left, right=right)
-    k_batch = _candidate_k_schedule(wfn, sym, k_weights, per_k)[4]
+    k_batch = candidate_k_schedule(wfn, sym, k_weights, per_k)[4]
     m_b = n_slots * s_max
     proposal = _memory_proposal(mesh, n_rows_pad=n_rows_pad, m_pad=m_pad, ns=ns,
                                 nb_r=right[1] - right[0],
@@ -1011,6 +1088,7 @@ def prune_candidates_by_sketch(
     log.info(f"[centroid-sketch] state=start candidates={M} groups={n_groups} "
              f"point_budget={budget} rows={n_rows} row_carrier={n_rows_pad} "
              f"block_orbits={n_slots} block_columns={m_b} gamma={float(sketch_gamma):g} "
+             f"channel={mode} "
              f"seed={int(seed)} proposal_GiB/rank: operands="
              f"{terms['operands'] / 2**30:.2f} "
              f"(sketch {_C128 * n_rows_pad * m_pad / mesh.size / 2**30:.2f}) "
@@ -1021,7 +1099,8 @@ def prune_candidates_by_sketch(
         Y = build_sketch_q0_via_loadwfns(
             wfn, sym, cand_idx, mesh, n_rows=n_rows, seed=int(seed),
             band_range_left=left, band_range_right=right, band_norms=band_norms,
-            k_weights=k_weights, bispinor=bispinor, verbose=verbose)
+            k_weights=k_weights, bispinor=bispinor, gamma_mode=mode,
+            verbose=verbose)
     t1 = time.perf_counter()
     log.info(f"[centroid-sketch] phase=build state=done rows={n_rows} "
              f"candidates={M} carrier={m_pad} wall_s={t1 - t0:.3f}")
@@ -1036,7 +1115,7 @@ def prune_candidates_by_sketch(
         raise RuntimeError(
             f"sketch select REFUSES: point budget {budget} is smaller than every "
             f"complete group (minimum size {int(sizes.min())})")
-    keep_idx, _, order, piv_used = _emit_complete_groups(cand_idx, dense_id, piv)
+    keep_idx, _, order, piv_used = emit_complete_groups(cand_idx, dense_id, piv)
     refuse_unless_select_certified(
         piv_used, rank, psd_info, n_keep=int(keep_idx.shape[0]), M=M,
         M_pad=m_pad, orbit_id=None, d0max=d0max, tol_rel=tol_rel)
@@ -1052,7 +1131,7 @@ def prune_candidates_by_sketch(
              f"device_peak_GiB={'n/a' if peak is None else f'{peak / 2**30:.2f}'} "
              f"host_peak_GiB={host_peak / 2**30:.2f}")
     return (keep_idx, int(rank), d_final, d_taken, trR_over_trG, psd_info,
-            _unpicked_over_floor(d_final, d0max, tol_rel))
+            unpicked_over_floor(d_final, d0max, tol_rel))
 
 
 __all__ = [

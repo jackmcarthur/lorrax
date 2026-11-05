@@ -17,39 +17,22 @@ KMEANS_STAGES = (
     ("weighted k-means", "kmeans"),
     ("orbit snap and unfold", "snap_unfold"),
     ("Lloyd-state release", "release_before_prune"),
-    ("Gram and pivoted Cholesky", "prune"),
+    ("sketch and QRCP prune", "prune"),
 )
 
 
 def validate_mode_policy(args) -> None:
-    """Refuse current-mode switches that change its physical metric."""
-    if int(getattr(args, "prune_q_shells", 0)) < 0:
-        raise ValueError("--prune-q-shells must be >= 0")
-    if float(getattr(args, "weight_power", 0.5)) <= 0.0:
+    """Refuse selector switches outside their domain, and current-mode
+    switches that change its physical metric."""
+    if float(getattr(args, "weight_power", 5.0 / 6.0)) <= 0.0:
         raise ValueError("--weight-power must be positive")
-    if float(getattr(args, "prune_normalize", 0.0)) < 0.0:
-        raise ValueError("--prune-normalize must be >= 0")
-    if getattr(args, "select", "cholesky") == "sketch":
-        if args.density_mode == "current":
-            raise ValueError(
-                "--select sketch implements the charge Gram only; prune "
-                "current-mode pools with --select cholesky")
-        if (int(getattr(args, "prune_q_shells", 0)) > 0
-                or float(getattr(args, "prune_normalize", 0.0))):
-            raise ValueError(
-                "--prune-q-shells and --prune-normalize act on the dense Gram; "
-                "use them with --select cholesky")
-        if not 0.0 < float(args.sketch_gamma) <= 1.0:
-            raise ValueError("--sketch-gamma must lie in (0, 1]")
-        if int(args.sketch_rows) < 0 or int(args.sketch_block) < 0:
-            raise ValueError("--sketch-rows and --sketch-block must be >= 0")
-        if 0 < int(args.sketch_rows) < int(args.n_centroids):
-            raise ValueError("--sketch-rows must be at least n_centroids")
+    if not 0.0 < float(args.sketch_gamma) <= 1.0:
+        raise ValueError("--sketch-gamma must lie in (0, 1]")
+    if int(args.sketch_rows) < 0 or int(args.sketch_block) < 0:
+        raise ValueError("--sketch-rows and --sketch-block must be >= 0")
+    if 0 < int(args.sketch_rows) < int(args.n_centroids):
+        raise ValueError("--sketch-rows must be at least n_centroids")
     if args.density_mode == "current":
-        if int(getattr(args, "prune_q_shells", 0)) > 0:
-            raise ValueError(
-                "--prune-q-shells is a charge-Gram option; current-mode "
-                "selection prunes on the q = 0 transverse Gram")
         if args.no_symmetries:
             raise ValueError(
                 "current centroid selection requires the crystal's "
@@ -150,7 +133,7 @@ def pool_rank_warning(*, pool: int, written: int, unpicked: float | None,
     """The warning for a select the point budget stopped, else ``None``.
 
     ``unpicked`` is the largest never-picked residual over the floor
-    (``prune_candidates_by_pivoted_cholesky``); above 1 the pool still held
+    (``prune_candidates_by_sketch``); above 1 the pool still held
     directions when the budget ran out, so the pair-space rank is unmeasured.
     """
     if unpicked is None or float(unpicked) <= 1.0:
@@ -160,7 +143,7 @@ def pool_rank_warning(*, pool: int, written: int, unpicked: float | None,
            f"{rank_law[0]:.0f} (written/estimate = "
            f"{int(written) / rank_law[0]:.2f}).")
     return (f"pair-space rank not established: the point budget stopped the "
-            f"pivoted Cholesky at {int(written)} points while unpicked "
+            f"sketched QRCP at {int(written)} points while unpicked "
             f"candidates of the {int(pool)}-point pool still carry "
             f"{float(unpicked):.3g}x its floor, so {int(written)} centroids "
             f"are not a complete ISDF basis.{law}  Raise the request or the "
@@ -244,8 +227,8 @@ def kmeans_settings_rows(args, *, source) -> list:
         Setting("n_centroids", str(n_c), "cli",
                 "point budget: the centroids requested"),
         Setting("oversample", f"{oversample:g}", source("--oversample"),
-                f"{m_cand} k-means candidates, pruned by pivoted Cholesky"
-                if oversample > 1.0 else "no pivoted-Cholesky pruning"),
+                f"{m_cand} k-means candidates, pruned by sketched QRCP"
+                if oversample > 1.0 else "no pruning"),
         Setting("density_mode", str(args.density_mode), source("--density-mode"),
                 "transverse current Gram (gamma^{1,2,3} ISDF)" if current
                 else "charge Gram (gamma^0 ISDF)"),
@@ -267,35 +250,22 @@ def kmeans_settings_rows(args, *, source) -> list:
                         source("--no-symmetries"),
                         "literal points" if args.no_symmetries else
                         "closed under the decorated-atom space group"))
-    shells = int(getattr(args, "prune_q_shells", 0))
-    if shells:
-        rows.append(Setting("prune_q_shells", str(shells), "cli",
-                            f"prune Gram summed over q = 0 and {shells} "
-                            "nonzero q shells"))
-    power = float(getattr(args, "weight_power", 0.5))
-    if power != 0.5:
-        rows.append(Setting("weight_power", f"{power:g}", "cli",
-                            "k-means mass = (diag q=0 Gram)^P"))
-    normalize = float(getattr(args, "prune_normalize", 0.0))
-    if normalize:
-        rows.append(Setting("prune_normalize", f"{normalize:g}", "cli",
-                            "prune on D^-G Gram D^-G"))
-    if getattr(args, "select", "cholesky") == "sketch":
-        rows.append(Setting("select", "sketch", "cli",
-                            "orbit-blocked QRCP on a Khatri-Rao Gaussian sketch"))
-        rows.append(Setting("sketch_rows", str(int(args.sketch_rows) or "auto"),
-                            source("--sketch-rows"), "r' = N + max(64, ceil(0.1 N))"
-                            if not int(args.sketch_rows) else "sketch rows r'"))
-        rows.append(Setting("sketch_block", str(int(args.sketch_block) or "auto"),
-                            source("--sketch-block"), "orbits per block; auto: "
-                            "max(1, 1024 // largest orbit)"))
-        rows.append(Setting("sketch_gamma", f"{float(args.sketch_gamma):g}",
-                            source("--sketch-gamma"), "in-block acceptance cut"))
+    rows.append(Setting("weight_power", f"{float(args.weight_power):.4g}",
+                        source("--weight-power"),
+                        "k-means mass = (diag q=0 Gram)^P"))
+    rows.append(Setting("sketch_rows", str(int(args.sketch_rows) or "auto"),
+                        source("--sketch-rows"), "r' = N + max(64, ceil(0.1 N))"
+                        if not int(args.sketch_rows) else "sketch rows r'"))
+    rows.append(Setting("sketch_block", str(int(args.sketch_block) or "auto"),
+                        source("--sketch-block"), "orbits per block; auto: "
+                        "max(1, 1024 // largest orbit)"))
+    rows.append(Setting("sketch_gamma", f"{float(args.sketch_gamma):g}",
+                        source("--sketch-gamma"), "in-block acceptance cut"))
     return rows
 
 
 def sketch_pruning_label(args) -> str:
-    """The centroid header's ``pruning:`` value for ``--select sketch``."""
+    """The centroid header's ``pruning:`` value."""
     from .sketch_select import sketch_rows_default
     rows = int(args.sketch_rows) or sketch_rows_default(int(args.n_centroids))
     block = int(args.sketch_block) or "auto"
@@ -306,9 +276,9 @@ def sketch_pruning_label(args) -> str:
 
 
 def rank_text(*, prune_rank, written: int, pool: int, unpicked) -> str:
-    """What the pivoted Cholesky measured, in one row value."""
+    """What the sketched QRCP measured, in one row value."""
     if prune_rank is None:
-        return "not measured (no pivoted-Cholesky pruning)"
+        return "not measured (no pruning)"
     if unpicked is not None and float(unpicked) <= 1.0:
         return (f"at least {int(prune_rank)} (pool spent: largest unpicked residual "
                 f"{float(unpicked):.3g} x the floor); {int(prune_rank)} of "

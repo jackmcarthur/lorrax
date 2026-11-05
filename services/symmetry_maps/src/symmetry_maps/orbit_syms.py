@@ -669,9 +669,9 @@ def unfold_orbit_unique_with_id(reps_np: np.ndarray,
 
     orbit_id is the integer encoding of each candidate's canonical
     (lex-smallest) orbit member, then run through ``np.unique`` to make
-    them dense [0, n_orbits). This is the right key for the orbit-aware
-    pivoted Cholesky: two kmeans reps that drifted into the same physical
-    orbit during Lloyd get identical orbit_ids, so PC sees them as one
+    them dense [0, n_orbits). This is the right key for the orbit-blocked
+    centroid select: two kmeans reps that drifted into the same physical
+    orbit during Lloyd get identical orbit_ids, so the select sees them as one
     orbit (not two).
     """
     Rinv = np.asarray(Rinv); tau = np.asarray(tau)

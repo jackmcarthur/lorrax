@@ -58,7 +58,7 @@ LORRAX computes quasiparticle energies $E^{\mathrm{QP}}_{n\bk}$ in the GW approx
 | [Band extrapolation](theory/band-extrapolation.md) | $\Sigma^c$ extrapolated over the conduction bands to the complete-basis limit |
 | [Quasiparticle self-consistency](theory/qsgw.md) | The QSGW map and its mixing |
 | [ISDF and V(q)](theory/isdf.md) | Fitting $\zeta_{\bq\mu}(\br)$ and building $V_\bq(\mu,\nu)$ |
-| [Centroid selection](theory/centroid-selection.md) | Weighted k-means and pivoted-Cholesky pruning |
+| [Centroid selection](theory/centroid-selection.md) | Weighted k-means and sketched column-pivoted QR pruning |
 | [Symmetry](theory/symmetry.md) | Space-group operations, time reversal, the k and q wedges and the transport of each object to the full grid |
 | [Velocity operator](theory/velocity-operator.md) | $\hat v = \partial_\bk H$ with the nonlocal term, and the Berry connection from parallel-transport links |
 | [Orbital magnetization](theory/orbital-magnetization.md) | The modern-theory orbital moment per band and per cell, from the velocity matrix (under development) |

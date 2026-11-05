@@ -44,44 +44,6 @@ def _numpy_group_pc(G, labels, active, budget):
     return np.array(selected), np.count_nonzero(taken), factor
 
 
-def test_grouped_complex_pc_full_rank_and_exhausted_tail():
-    import jax
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-    from common.pivoted_cholesky import make_sharded_group_block_pivoted_cholesky_select
-
-    mesh = Mesh(np.array(jax.local_devices()[:1]), ("x",))
-    labels = np.repeat(np.arange(7), [1, 2, 3, 4, 5, 4, 3])
-    labels = np.r_[labels, 7, 7].astype(np.int32)
-    active = np.arange(24) < 22
-    for feature_rank in (3, 22):
-        rng = np.random.default_rng(200+feature_rank)
-        features = rng.normal(size=(22, feature_rank))+1j*rng.normal(size=(22, feature_rank))
-        G = np.zeros((24, 24), complex)
-        G[:22, :22] = features@features.conj().T
-        expected_piv, expected_rank, expected_L = _numpy_group_pc(G, labels, active, 20)
-        kernel = make_sharded_group_block_pivoted_cholesky_select(
-            mesh, 24, 20, 7, mesh_axis="x")
-        result = kernel(
-            jax.device_put(G, NamedSharding(mesh, P("x", None))),
-            jax.device_put(labels, NamedSharding(mesh, P("x"))),
-            jax.device_put(active, NamedSharding(mesh, P("x"))))
-        piv, L, rank, d_final, d_taken, trace, info = jax.device_get(result)
-        selected = piv[piv >= 0]
-        assert int(rank) == expected_rank
-        assert np.array_equal(selected[:rank], expected_piv[:rank])
-        assert len(selected) <= 20 and len(selected) == len(np.unique(selected))
-        assert np.all(selected < 22)
-        for group in np.unique(labels[selected]):
-            assert np.sum(labels[selected] == group) == np.sum((labels == group) & active)
-        np.testing.assert_allclose(L, expected_L, rtol=1e-11, atol=1e-11)
-        remainder = G-L@L.conj().T
-        assert np.linalg.eigvalsh(remainder).min() > -1e-10
-        assert np.all(np.isfinite(d_final)) and np.all(np.isfinite(trace))
-        assert np.max(np.abs(L[:, d_taken == 0]), initial=0) == 0
-        if feature_rank == 3:
-            np.testing.assert_allclose(remainder, 0, atol=1e-11)
-
-
 def test_duplicate_pool_repair_closure_density_order_and_grid_capacity():
     # A nonsymmorphic glide: (x,y,z) -> (x+1/2,-y,z). Construct the
     # independent integer-grid orbits directly, without the symmetry service.

@@ -451,7 +451,7 @@ def steady_compile_problems(run, name):
 # the run directory after kmeans, which names the centroid file.
 STAGES = (
     ("kmeans", "centroid.kmeans_cli",
-     ["6", "--seed", "42", "--oversample", "1.5",
+     ["6", "--seed", "42",
       "--fit-window", "0:3,0:7", "--density-mode", "scalar"]),
     ("kin_ion", "gw.kin_ion_io", ["-i", "gnppm.in"]),
     ("dipole", "psp.get_dipole_mtxels", ["-i", "gnppm.in"]),

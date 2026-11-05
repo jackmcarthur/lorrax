@@ -39,21 +39,24 @@ and flags that change what a driver computes.
 Selects the $N_\mu$ real-space interpolation points $r_\mu$ of the ISDF
 factorization $\psi^*_m(r)\psi_n(r) \approx \sum_\mu \zeta_\mu(r)\,
 \psi^*_m(r_\mu)\psi_n(r_\mu)$ ([theory](theory/physics.md)). Weighted k-means
-runs on the real-space FFT grid with the importance
+runs on the real-space FFT grid with the mass
 
-$$w(r) = \Big[\sum_k w_k \sum_{m\in L,\,n\in R} |\psi^\dagger_{mk}(r)\psi_{nk}(r)|^2\Big]^{1/2},$$
+$$w(r) = \Big[\sum_k w_k \sum_{m\in L,\,n\in R} |\psi^\dagger_{mk}(r)\psi_{nk}(r)|^2\Big]^{P},$$
 
-unit band weights over the left/right fit windows $L, R$ (occupations do not
-enter), for $\lceil N_\mu \cdot \text{oversample}\rceil$ candidates. Pivoted
-Cholesky on the pair-density Gram over the same windows then prunes the pool
-to $N_\mu$; every emitted point updates the Schur residual. In `current` mode
-the feature rows are the three Dirac-current components and the Gram is the
-transverse one. With orbit mode the candidates are closed under the decorated
-atoms' spatial Seitz group (improper and nonsymmorphic operations included) and
-pruning admits only whole orbits that fit the budget. Numerical flatness of the
-pool is reported, not refused, because an over-complete interpolation set can
-be accurate; non-PSD input, pool exhaustion and invalid pivots refuse
-([rank policy](architecture/rank_truncation_policy.md)). The header's `pool
+$P$ = `--weight-power` (5/6: Lloyd's point density goes as $w^{3/5}$, so the
+points follow the feature norm), unit band weights over the left/right fit
+windows $L, R$ (occupations do not enter), for
+$\lceil N_\mu \cdot \text{oversample}\rceil$ candidates. Orbit-blocked QRCP on
+a Khatri–Rao Gaussian sketch of the $q = 0$ pair matrix over the same windows
+then prunes the pool to $N_\mu$
+([centroid selection](theory/centroid-selection.md#sketched-prune)). In
+`current` mode the sketch stacks the three Dirac-current components, one
+Gaussian draw each. With orbit mode the candidates are closed under the
+decorated atoms' spatial Seitz group (improper and nonsymmorphic operations
+included) and pruning admits only whole orbits that fit the budget. Numerical
+flatness of the pool is reported, not refused, because an over-complete
+interpolation set can be accurate; a point budget below every orbit and invalid
+pivots refuse ([rank policy](architecture/rank_truncation_policy.md)). The header's `pool
 rank=` line names the stop: `pool spent` (no unpicked candidate's residual
 is above the floor, so the count is the pool's rank, a lower bound on the
 pair-set rank) or `point budget` (the pool still held directions; the rank is
@@ -77,14 +80,17 @@ refused before loading if they do not fit.
 | flag | default | meaning |
 |---|---|---|
 | `n_centroids` (positional) | 400 | centroids after pruning |
-| `--oversample` | 1.5 | k-means candidate factor; 1.0 disables pruning |
+| `--oversample` | 3 | k-means candidate factor; 1.0 disables pruning |
 | `-i` / `--input` | unset | GW deck; left window = occupied + its `ncond`, right window = every WFN band; without `-i` the left window widens to every band and says so |
 | `--fit-window L0:L1,R0:R1` | unset | explicit left/right windows for candidates and pruning, in place of the deck's |
 | `--density-mode` | `scalar` | `scalar` charge Gram; `current` transverse three-current Gram (needs the symmetries; suffix `_current`) |
 | `--no-symmetries` | off | literal points; by default the set is closed under the atom group whenever it has more than one operation |
-| `--seed` | 0 | k-means start |
+| `--weight-power P` | 5/6 | k-means mass $= (\operatorname{diag} K_{q=0})^P$ |
+| `--sketch-rows` | 0 (auto) | sketch rows $r' \ge N_\mu$; auto $N_\mu + \max(64, \lceil 0.1 N_\mu\rceil)$ |
+| `--sketch-block` | 0 (auto) | orbits per select block; auto $\max(1, \lfloor m_b / \lvert O\rvert_{\max}\rfloor)$, $m_b \le 1024$ columns and one fixed tile of $r'$ rows |
+| `--sketch-gamma` | 0.7 | in-block acceptance cut $\gamma$, $0 < \gamma \le 1$ |
+| `--seed` | 0 | k-means start and the sketch |
 | `--out-suffix` | `''` / `_current` | table and report suffix |
-| `LORRAX_CENTROID_SELECT` (env) | `deliver` | `strict` refuses a numerically flat pool |
 
 Both windows must start at band 0 and hold every occupied band; a window that
 drops one refuses (`CentroidWindowDropsOccupiedError`), here and when `gw_jax`

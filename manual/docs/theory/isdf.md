@@ -167,7 +167,7 @@ The error of the ISDF basis is set by how $N_\mu$ compares with the numerical ra
 
 ### <span class="n">4.1</span> The pair-set rank {: #isdf-rank }
 
-`centroid.pivoted_cholesky.point_granularity_rank`
+`centroid.sketch_select.sketch_block_select`
 {: .in-code }
 
 $r(L,B)$ is the numerical rank of the positive pair-density Gram for left bands $1..L$ and right bands $1..B$: eigenvalues above $\sqrt{\epsilon}$ times the largest diagonal. The centroid selector prints it as `pool rank=`. On the Si complete-basis WFNs it follows one law (102 points, 5.6 % RMS log residual):

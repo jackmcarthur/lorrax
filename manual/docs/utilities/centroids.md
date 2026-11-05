@@ -1,6 +1,6 @@
 # Centroids utility
 
-`centroid.kmeans_cli` The ISDF interpolation points, selected by weighted k-means and pruned by pivoted Cholesky.
+`centroid.kmeans_cli` The ISDF interpolation points, selected by weighted k-means and pruned by column-pivoted QR on a Gaussian sketch.
 {: .page-summary }
 
 <div class="workflow-map" data-driver="centroids" data-page="files"></div>
@@ -60,10 +60,10 @@ This spin-traced density is the charge density that standard GW screens, and the
 
 <figure class="flowchart" markdown>
 [![ISDF centroid selection](../assets/figures/k1.png)](../assets/figures/k1.png)
-<figcaption><strong>Fig. K1.</strong> The four stages of the selection, left to right in each row: the feature weight $w(\br)$ from the band-window densities, weighted Lloyd k-means for an oversampled candidate pool, the pair-density Gram on the candidates, and the greedy pivoted-Cholesky loop that keeps whole symmetry orbits until the point budget is spent.</figcaption>
+<figcaption><strong>Fig. K1.</strong> The four stages of the selection, left to right in each row: the feature weight $w(\br)$ from the band-window densities, weighted Lloyd k-means for an oversampled candidate pool, the Gaussian sketch of the pair densities on the candidates, and the blocked column-pivoted QR that keeps whole symmetry orbits until the point budget is spent.</figcaption>
 </figure>
 
-The weight is the diagonal of the $\bq = 0$ pair-density Gram over the left and right band windows $L$ and $R$, $s(\br) = \sum_\bk w_\bk\,\rho^L_\bk(\br)\,\rho^R_\bk(\br) = K(\br,\br)$, and Lloyd's mass is $w(\br) = s(\br)^{1/2}$; occupations do not enter. Lloyd places $\lceil 1.5\,N_\mu\rceil$ candidates as orbit representatives. Each representative is snapped to the FFT grid and then unfolded by the space group of the decorated atoms, so every orbit lands exactly on grid points. Pivoted Cholesky on $K(\br_a,\br_b)$ then keeps the candidates that add the most independent directions, admitting or rejecting whole orbits, never single points, until $N_\mu$ points are used. The written set is therefore closed under every spatial operation, including improper and nonsymmorphic ones ([Centroid selection §5](../theory/centroid-selection.md#cs-symmetry)). The objective, the Gram and the limits of the method are on [Centroid selection](../theory/centroid-selection.md); the fit that consumes the points is on [ISDF and V(q)](../theory/isdf.md).
+The weight is the diagonal of the $\bq = 0$ pair-density Gram over the left and right band windows $L$ and $R$, $s(\br) = \sum_\bk w_\bk\,\rho^L_\bk(\br)\,\rho^R_\bk(\br) = K(\br,\br)$, and Lloyd's mass is $w(\br) = s(\br)^{5/6}$, which places points with density $\propto s^{1/2}$; occupations do not enter. Lloyd places $\lceil 3\,N_\mu\rceil$ candidates as orbit representatives. Each representative is snapped to the FFT grid and then unfolded by the space group of the decorated atoms, so every orbit lands exactly on grid points. Column-pivoted QR on a Gaussian sketch of the candidates' pair densities, whose expected Gram is $K(\br_a,\br_b)$, then keeps the candidates that add the most independent directions, admitting or rejecting whole orbits, never single points, until $N_\mu$ points are used. The written set is therefore closed under every spatial operation, including improper and nonsymmorphic ones ([Centroid selection §5](../theory/centroid-selection.md#cs-symmetry)). The objective, the Gram and the limits of the method are on [Centroid selection](../theory/centroid-selection.md); the fit that consumes the points is on [ISDF and V(q)](../theory/isdf.md).
 
 !!! note
     The selection must be made against the band window that $\Sigma^c$ and $\chi^0$ consume. The default right window is every band in `WFN.h5`, and the default left window is the occupied bands plus the input file's `ncond` protected conduction bands, so always pass `-i`. For the count, the header's `rank law:` line estimates the $N_\mu$ that gives 1 meV RMS error in $\Sigma^x$, $N_\mu \approx 0.5\min\big(N_\bk L B,\ 445\,L^{0.107}B^{0.322},\ 0.97\,N_\bG(4E_\mathrm{wfc})\big)$, with $L$ and $B$ the window widths (per Kramers pair on a spinor WFN).
@@ -140,7 +140,7 @@ Both windows must start at band 0 and reach the occupied-band count.
 
 **Selection**
 
-### `--oversample` {: .kw data-type="float" data-default="1.5" }
+### `--oversample` {: .kw data-type="float" data-default="3" }
 Candidate factor: k-means places $\lceil n_{\mathrm{centroids}} \cdot \mathrm{oversample}\rceil$ points before pruning.
 
 `1.0` disables pruning. Without pruning the symmetric unfold can return more than `n_centroids` points.
@@ -152,8 +152,23 @@ Select points without imposing the crystal's symmetries.
 By default the points respect every spatial symmetry of the decorated atoms whenever there is more than one, improper and nonsymmorphic operations included. Electronic and time-reversal data are not consulted.
 {: .kw-details }
 
+### `--weight-power` {: .kw data-type="float" data-default="5/6" }
+Exponent $P$ of the k-means mass $w(\br) = s(\br)^P$; must be positive.
+
+Lloyd places points with density $\propto w^{3/5}$, so the default makes the point density follow the feature norm $s^{1/2}$.
+{: .kw-details }
+
+### `--sketch-rows` {: .kw data-type="int" data-default="0 (auto)" }
+Rows $r'$ of the pruning sketch, at least `n_centroids`. `0` takes $N_\mu + \max(64, \lceil 0.1\,N_\mu\rceil)$.
+
+### `--sketch-block` {: .kw data-type="int" data-default="0 (auto)" }
+Orbits gathered per select block. `0` fills at most 1024 candidate columns, fewer when one fixed memory tile holds fewer columns of $r'$ rows.
+
+### `--sketch-gamma` {: .kw data-type="float" data-default="0.7" }
+In-block acceptance cut in $(0, 1]$: an orbit enters the block while its residual score is at least this fraction of the block's leading score.
+
 ### `--seed` {: .kw data-type="int" data-default="0" }
-Seed of the k-means++ initialization.
+Seed of the k-means++ initialization and of the pruning sketch.
 
 When `n_centroids` exceeds $0.1\,N_r$ ($N_r$ the number of FFT grid points), the start is density-weighted random instead of k-means++.
 {: .kw-details }
@@ -202,8 +217,8 @@ The GW run hashes the table's contents. A new table, even with the same count, i
     - A `--fit-window` that is malformed, empty, beyond the window top, or that does not start at band 0 and reach the occupied-band count.
     - `--density-mode current` with `--no-symmetries`, with `--oversample` at or below 1, or on a WFN with one spinor component.
     - A window that reaches past the bands in `WFN.h5`, or whose top band exceeds half the plane-wave basis ($0.5\,n_{\bG,\max}\,n_\mathrm{spinor}$). Raise the cutoff or lower the band count.
-    - A Gram that is not positive semidefinite: the Schur residual falls below minus the noise floor.
-    - A pool that runs out of candidates before the request is met, or a point budget smaller than every orbit. Raise `--oversample` or lower `n_centroids`.
+    - A point budget smaller than every orbit. Raise `n_centroids`.
+    - `--sketch-rows` below `n_centroids`, `--sketch-gamma` outside $(0, 1]$, or a `--weight-power` that is not positive.
     - No `n_centroids` on the command line.
     - An input file (`-i`) without `sys_dim`, or with an unknown key, or without `ncond` or `number_bands_protected` (`ncond is required (or number_bands_protected)`).
 

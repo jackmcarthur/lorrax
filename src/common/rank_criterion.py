@@ -894,7 +894,7 @@ def certify_numbers(*, kappa_eff, n_dropped, n_total, discarded_weight,
 #: Relative floor for "this probe adds an independent direction".
 #:
 #: ``sqrt(eps) ≈ 1.49e-8`` — the classical modified-Gram-Schmidt rank
-#: threshold, and the same number ``centroid/pivoted_cholesky`` already stops
+#: threshold, and the same number ``centroid/candidates`` already stops
 #: its greedy on.  It is applied RELATIVE to the probe's own scale
 #: (:func:`probe_is_independent`), never as an absolute norm.
 PROBE_RTOL: float = 1.4901161193847656e-08
@@ -936,7 +936,7 @@ def probe_is_independent(norm_after, norm_before, scale=0.0, *,
 # ═══════════════════════════════════════════════════════════════════════
 #
 # Same division of labour ``common/spectral_closure`` documents and
-# ``centroid/pivoted_cholesky`` states: a jitted kernel cannot raise, so it
+# ``centroid/candidates`` states: a jitted kernel cannot raise, so it
 # REPORTS through a host callback and the next host seam REFUSES.  Without
 # this the ζ gate would mean one thing at the htransform host site and
 # another at the ζ device site, which is exactly the "one seam refuses and

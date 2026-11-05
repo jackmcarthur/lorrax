@@ -29,10 +29,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plot", action="store_true",
                    help="Emit a 3D matplotlib plot of centroids over ρ "
                         "(default off — most prod runs don't want a popup).")
-    p.add_argument("--oversample", type=float, default=1.5,
-                   help="k-means runs for ⌈n_centroids·oversample⌉ then "
-                        "prunes via pivoted Cholesky (default 1.5). Set to "
-                        "1.0 to disable pivoted-Cholesky pruning.")
+    p.add_argument("--oversample", type=float, default=3.0,
+                   help="k-means runs for ⌈n_centroids·oversample⌉ candidates, "
+                        "then the sketched QRCP prune keeps n_centroids "
+                        "(default 3). Set to 1.0 to disable pruning.")
     p.add_argument("-i", "--input", default=None,
                    help="GW deck. Its wfn_file is the WFN read (default "
                         "./WFN.h5) and its ncond sets the left window, every "
@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "deck the left window widens to every band.")
     p.add_argument("--fit-window", default=None, metavar="L0:L1,R0:R1",
                    help="Explicit 0-based half-open left/right band windows "
-                        "shared by candidate construction and Gram pruning "
+                        "shared by candidate construction and pruning "
                         "(for example 0:16,0:28), in place of the deck's. "
                         "Physical occupancy still comes from WFN.nelec.")
     p.add_argument("--no-symmetries", action="store_true",
@@ -69,38 +69,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "for --density-mode current; pass explicitly to "
                         "override (e.g. multiple current-mode runs at "
                         "different n_centroids).")
-    # Selector-study switches (ISDF_RANK_SCALING §10).  Each default is the
-    # production selector, bit for bit.
-    p.add_argument("--prune-q-shells", type=int, default=0, metavar="K",
-                   help="Prune on the pair Gram summed over q = 0 and K "
-                        "nonzero q of the k grid (one per |q| shell, spread "
-                        "from the shortest shell to the longest; each q "
-                        "weighted 1/(K+1)) instead of the q = 0 Gram alone. "
-                        "Charge mode only. Default 0: q = 0.")
-    p.add_argument("--weight-power", type=float, default=0.5, metavar="P",
-                   help="k-means mass = (diag q=0 Gram)^P. 0.5 (default) is "
-                        "the feature norm; a smaller P flattens the mass "
-                        "toward low-density regions such as a slab's vacuum.")
-    p.add_argument("--prune-normalize", type=float, default=0.0, metavar="G",
-                   help="Prune on D^-G Gram D^-G, D = diag Gram (floored at "
-                        "1e-12 max). 0 (default) is the plain Gram; 0.5 is "
-                        "the amplitude-blind correlation matrix.")
-    # Centroid-select A/B (branch only; landing keeps one and deletes the
-    # other path).
-    p.add_argument("--select", choices=("cholesky", "sketch"),
-                   default="cholesky",
-                   help="Pool pruning: 'cholesky' (default) pivots on the "
-                        "dense M x M pair Gram; 'sketch' runs orbit-blocked "
-                        "QRCP on a Khatri-Rao Gaussian sketch of the pair "
-                        "matrix (r' x M, charge mode only).")
+    p.add_argument("--weight-power", type=float, default=5.0 / 6.0, metavar="P",
+                   help="k-means mass = (diag q=0 Gram)^P. Lloyd places "
+                        "points with density ~ mass^(3/5), so 5/6 (default) "
+                        "gives a point density ~ (diag Gram)^(1/2), the "
+                        "feature norm; 0.5 weights the mass by the norm.")
     p.add_argument("--sketch-rows", type=int, default=0, metavar="R",
-                   help="Sketch rows r' for --select sketch, at least "
+                   help="Rows r' of the pruning sketch, at least "
                         "n_centroids. 0 (default): N + max(64, ceil(0.1 N)).")
     p.add_argument("--sketch-block", type=int, default=0, metavar="B",
                    help="Orbits gathered per sketch-select block. 0 "
                         "(default): max(1, 1024 // largest orbit).")
     p.add_argument("--sketch-gamma", type=float, default=0.7, metavar="G",
-                   help="In-block acceptance cut of --select sketch: an "
+                   help="In-block acceptance cut of the pruning select: an "
                         "orbit is admitted while its in-block mean residual "
                         "is at least G times the block's leading score "
                         "(0 < G <= 1; default 0.7).")
@@ -168,7 +149,7 @@ from .production_output import (
 def _release_lloyd_before_prune(*arrays) -> None:
     """Synchronize and release the completed Lloyd device state.
 
-    Pivoted-Cholesky immediately loads a new WFN working set, and the prune
+    The prune immediately loads a new WFN working set, and it
     consumes none of the returned labels or preparation grids: snapping has
     already copied the centroid coordinates and candidate indices to the host.
     Make that lifecycle boundary explicit and report BFC's measured effect.
@@ -224,7 +205,7 @@ log = get_logger(__name__)
 def _resolve_sigma_window(args, wfn) -> tuple[int, int]:
     """``(n_val, n_cond)`` of the σ window — the bands the ISDF must span.
 
-    Single source of truth for both consumers: the pivoted-Cholesky prune
+    Single source of truth for both consumers: the prune
     band ranges and the ``band_range`` k-means weight.
 
     KEEP THESE TWO EXPLICIT.  ``n_cond`` defaulting to ``n_val`` gave every
@@ -446,72 +427,43 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
 
 
 def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
-    """Pivoted-Cholesky prune of the over-sampled candidate pool to
+    """Sketched QRCP prune of the over-sampled candidate pool to
     ``n_centroids`` (``N_c``).
 
-    Greedy pivoting on the pair-density Gram keeps the candidates that add
-    the most independent interpolation directions over the σ band window;
-    the rank is the number it actually certified. Returns
+    Orbit-blocked near-greedy QRCP on a Khatri-Rao Gaussian sketch of the
+    q = 0 pair matrix (:func:`centroid.sketch_select.prune_candidates_by_sketch`)
+    keeps the candidates that add the most independent interpolation
+    directions over the σ band window; the rank is the number it certified.
+    ``--density-mode current`` prunes on the stacked-current Gram.  Returns
     ``(indices, rank, unpicked)``, the last the largest never-picked residual
     over the floor (at most 1: the pool is spent).
     """
-    from .pivoted_cholesky import prune_candidates_by_pivoted_cholesky
     from .sampling_metric import full_k_quadrature_weights
+    from .sketch_select import prune_candidates_by_sketch
 
-    # ``N_c`` is a point budget.  The block selector admits only whole orbits
-    # that fit, then deflates by every point in each admitted orbit.
-    log.debug(f"\nPivoted-Cholesky prune: {n_unique} → {N_c}"
+    # ``N_c`` is a point budget.  The select admits only whole orbits that
+    # fit, then deflates by every point in each admitted orbit.
+    log.debug(f"\nSketched QRCP prune: {n_unique} → {N_c}"
               f"{' (whole-orbit blocks)' if orbit_id is not None else ''}")
 
     n_val, n_cond = _resolve_sigma_window(args, wfn)     # one resolver
     left_range, right_range, range_label = prune_band_ranges(
         args, n_val, n_cond)
-    kwargs: dict = dict(
-        wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=N_c, mesh=mesh,
-        orbit_id=orbit_id,
-        n_point_budget=(int(N_c) if orbit_id is not None else None),
-        group_block=(orbit_id is not None),
-        bispinor=(args.density_mode == "current"),
-        gamma_mode=("transverse" if args.density_mode == "current"
-                    else "charge"),
-        k_weights=full_k_quadrature_weights(wfn, sym),
-        verbose=(debug_print_enabled() and process_rank() == 0),
-        band_range_left=left_range,
-        band_range_right=right_range,
-        gram_normalize=float(args.prune_normalize),
-    )
-    q_note = ""
-    if int(args.prune_q_shells) > 0:
-        from .pivoted_cholesky import prune_q_union
-        kwargs["q_union"] = prune_q_union(wfn, sym, int(args.prune_q_shells))
-        q_note = (" + q " + ", ".join(
-            "(" + ",".join(f"{v:.4g}" for v in q) + ")"
-            for q in kwargs["q_union"][0]) + f", each weight 1/"
-            f"{len(kwargs['q_union'][0]) + 1}")
+    current = args.density_mode == "current"
     log.info(f"  prune window: left={left_range} right={right_range} "
              f"[{range_label}]; Gram="
-             f"{'Σ_i Z_i Z_i† (i=1,2,3)' if args.density_mode == 'current' else 'charge'}"
-             f" at q = 0{q_note}"
-             + (f"; normalized D^-{float(args.prune_normalize):g} G "
-                f"D^-{float(args.prune_normalize):g}"
-                if float(args.prune_normalize) else ""))
-
-    if args.select == "sketch":
-        from .sketch_select import prune_candidates_by_sketch
-        if int(args.prune_q_shells) > 0 or float(args.prune_normalize):
-            raise ValueError("--prune-q-shells and --prune-normalize reshape the "
-                             "Cholesky Gram; --select sketch sketches the plain q = 0 Gram")
-        for key in ("n_point_budget", "group_block", "gram_normalize"):
-            kwargs.pop(key)
-        kwargs.update(n_point_budget=int(N_c), seed=int(args.seed),
-                      sketch_rows=int(args.sketch_rows),
-                      sketch_block=int(args.sketch_block),
-                      sketch_gamma=float(args.sketch_gamma))
-        prune = prune_candidates_by_sketch
-    else:
-        prune = prune_candidates_by_pivoted_cholesky
+             f"{'Σ_i Z_i Z_i† (i=1,2,3)' if current else 'charge'} at q = 0")
     with timing.section("prune"):
-        keep_idx, rank, *_, unpicked = prune(**kwargs)
+        keep_idx, rank, *_, unpicked = prune_candidates_by_sketch(
+            wfn=wfn, sym=sym, cand_idx=cand_idx, n_keep=N_c, mesh=mesh,
+            orbit_id=orbit_id, n_point_budget=int(N_c),
+            bispinor=current, gamma_mode=("transverse" if current else "charge"),
+            k_weights=full_k_quadrature_weights(wfn, sym),
+            verbose=(debug_print_enabled() and process_rank() == 0),
+            band_range_left=left_range, band_range_right=right_range,
+            seed=int(args.seed), sketch_rows=int(args.sketch_rows),
+            sketch_block=int(args.sketch_block),
+            sketch_gamma=float(args.sketch_gamma))
     indices = np.asarray(keep_idx, dtype=np.int64)
     log.info(f"After pruning: {indices.shape[0]} centroids (rank={rank})")
     return indices, int(rank), float(unpicked)
@@ -539,7 +491,7 @@ class _NoStages:
 
 def select_points(args, wfn_path, *, keep_weight=None, stages=None):
     """THE selection, as :func:`main` runs it: weight, weighted k-means in
-    orbits, snap and unfold, then the pivoted-Cholesky prune of the
+    orbits, snap and unfold, then the sketched QRCP prune of the
     over-sampled pool.  ``args`` is this module's parsed namespace (with
     ``sigma_ncond``); every rank must enter.  Returns a namespace with the
     FFT-grid ``indices`` (``(n, 3)``), their fractional ``snapped`` positions
@@ -560,8 +512,7 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
         log.debug(f"Over-sampling: k-means M = {M_cand}, prune to "
                   f"n_centroids = {N_c} (ratio {oversample:g})")
     else:
-        log.debug(f"Using n_centroids = {N_c} clusters (no pivoted-Cholesky "
-                  "pruning)")
+        log.debug(f"Using n_centroids = {N_c} clusters (no pruning)")
 
     stages.begin(1, "Feature weight", name="centroid.feature_weight")
     with timing.section("setup.wfn_io"):
@@ -585,7 +536,7 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
                     found=("requested centroids",
                            f"n_centroids = {N_c} of {n_rtot} FFT-grid points"),
                     needs="candidate coverage and Gram conditioning checked",
-                    fix="read the pivoted-Cholesky rank in the centroid header"))
+                    fix="read the pool rank in the centroid header"))
 
     fft_grid = tuple(int(x) for x in wfn.fft_grid)
 
@@ -675,7 +626,7 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
     prune_rank = unpicked = None
     n_pool = int(n_unique)
     if stages.total == 3:
-        stages.begin(3, "Pivoted-Cholesky selection", name="centroid.select")
+        stages.begin(3, "Sketched QRCP selection", name="centroid.select")
     if oversample > 1.0 and n_unique > N_c:
         release_arrays = [labels, centroids]
         # ``weight`` is also the plot payload.  Retain it when plotting, but
@@ -787,14 +738,7 @@ def _select_and_report(args, run, stages):
             "unit band weights")
     kgrid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
     shift = tuple(float(v) for v in np.asarray(wfn.shift).reshape(-1)[:3])
-    prune_state = "pivoted Cholesky" if pruned else "not applied"
-    if pruned and int(args.prune_q_shells) > 0:
-        prune_state += (f" on the q-union Gram (q = 0 + {int(args.prune_q_shells)}"
-                        " |q| shells)")
-    if pruned and float(args.prune_normalize):
-        prune_state += f"; Gram normalized D^-{float(args.prune_normalize):g}"
-    if pruned and args.select == "sketch":
-        prune_state = sketch_pruning_label(args)
+    prune_state = sketch_pruning_label(args) if pruned else "not applied"
     rank_law = (None if args.density_mode == "current" else
                 rank_law_estimate(
                     left=prune_left, right=prune_right, nspinor=wfn.nspinor,
@@ -811,7 +755,7 @@ def _select_and_report(args, run, stages):
             "complete ISDF basis",
             extra=message(
                 id="centroid_rank_not_established",
-                found=("pivoted Cholesky", f"stopped by the point budget at "
+                found=("sketched QRCP", f"stopped by the point budget at "
                        f"{n_unique} points of a {n_pool}-point pool"),
                 lines=(rank_warning,),
                 fix="raise n_centroids or --oversample until the rank reads "

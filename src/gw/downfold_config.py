@@ -87,8 +87,7 @@ DOWNFOLD_DEFAULTS = {
     #
     #   n_val / n_cond          -> left = (0, n_val), right = (n_val,
     #                              n_val + n_cond).  The legacy
-    #                              valence/conduction spelling, identical to
-    #                              ``centroid.pivoted_cholesky``'s.
+    #                              valence/conduction spelling.
     #   band_range_left/right   -> "lo:hi", half-open, ABSOLUTE band indices
     #                              into the stored wavefunctions / energies.
     #

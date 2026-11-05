@@ -529,7 +529,9 @@ M_panel = 2·16·n_par·n_s·μ·(N_b/p_x)·(1/p_x + 1/p_y)    one Green build's
 ```
 
 The shared centroid sampler's band-complete X/Y outputs use `M_axis` with
-the requested k rows. Its persistent streamed outputs have exactly the
+the requested k rows; `load_centroids_band_chunked(faces='cand')` returns
+instead one face `(N_k, N_b, n_s, μ)` at `P(None, None, None, ('y','x'))`,
+`16·N_k·N_b·n_s·μ/P`, the layout of the kmeans candidate sketch. Its persistent streamed outputs have exactly the
 requested k and band extents; only transfer/FFT tiles carry terminal pad
 rows. The terminal tile is trimmed after its face reshard and before its
 donated insertion, so no final padded-output crop overlaps two complete
@@ -761,8 +763,7 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | Σ(τ) sweep | resident pole fields, selected AXIS or borrowed FACE ψ, the small QP projector, then one row pass ([§ Green-side](#the-green-side-stages)) | `subtile_stream.plan_windows`: equal orbit-aligned windows, the pass count from the fixed tile and the shortest window that keeps it | — |
 | matrix-element sweep (V_H, four-current) | the step's slabs, and FFT boxes `(2 + 2·n_comp)·n_s·N_r·16` per band of a band-layout operator | `mtxel_sweep.plan_sweep`: bands in the fewest chunks whose boxes fit the fixed tile | — |
 | ψ loader off the fit plan (ζ reuse, current faces) | one band tile of G-flat rows, samples and faces | `gflat_memory_model.loader_band_chunk`: the fixed tile, at least the automatic 16 | warns; one scan row |
-| kmeans candidate Gram | one square Gram face `16·M²/P`, the k batch's distinct X/Y WFN face sets, and a fixed square projector tile | `centroid.pivoted_cholesky`: k batches price each distinct band interval once; equal or nested windows share one face set and slice it inside the tiled Gram executable. Pruning releases its padded Gram after diagnostics and returns only points and linear-size receipts; slicing a ragged logical Gram for return would replicate it | warns and admits |
-| kmeans candidate sketch (`--select sketch`, branch A/B) | the sketch `16·R·M/P` (`R` = r′ rounded up to `P`) on the flattened-mesh candidate face; the k batch's one `faces='cand'` WFN face `16·N_k·N_b·n_s·M/P` (no `'y'` gather, no X face); a transposed right face and a fixed row tile; per select block the gather buffer `16·R·m_b`, the row slabs and their CholQR copies `3·16·R·t/P`, the replicated block basis `16·R·t` (`m_b` ≤ 1024 columns and one fixed tile of `R` rows, `t` = `m_b` rounded to the 128-column deflation chunk), and one streamed column panel of at most a fixed tile (the deflation and the column norms; a whole-block update would hold a second sketch) | `centroid.sketch_select`: a closed-form proposal admitted first, then each executable (build per k batch, select block, one-pass chunked deflation) at its compiled price | warns and admits |
+| kmeans candidate sketch | the sketch `16·R·M/P` (`R` = r′ rounded up to `P`) on the flattened-mesh candidate face; the k batch's one `faces='cand'` WFN face `16·N_k·N_b·n_s·M/P` (no `'y'` gather, no X face); a transposed right face and a fixed row tile; per select block the gather buffer `16·R·m_b`, the row slabs and their CholQR copies `3·16·R·t/P`, the replicated block basis `16·R·t` (`m_b` ≤ 1024 columns and one fixed tile of `R` rows, `t` = `m_b` rounded to the 128-column deflation chunk), and one streamed column panel of at most a fixed tile (the deflation and the column norms; a whole-block update would hold a second sketch) | `centroid.sketch_select`: a closed-form proposal admitted first, then each executable (build per k batch, select block, one-pass chunked deflation) at its compiled price | warns and admits |
 | moment bank, sample and line q spans | `(per_q·w + 16)` faces for a batch of `w` q parents; a streamed sample's span holds its value and slope rows, unpack and prefetch, `6·w` faces | `response_bank.parent_span`: under `linalg = local` (one whole matrix per rank) at least P parents per round, else the most within the fixed tile; rounds balanced | the ledger warns |
 | sector Σ(τ) sweep (bispinor) | band-complete ψ, then one row pass: the four-spinor parent Green and partner, the kconv call's Σ rows, W(t)'s pass rows | `subtile_stream.plan_windows` (`mpa.sector_sigma.sector_tau_factory`): equal windows within the fixed tile | — |
 | direct Γ head (bulk metals) | the compiled per-sample footprint × samples per call, split over every rank | `photon_direct_head.direct_gamma_chunk_plan`: the fixed tile, at least 2¹⁰ samples per rank, at most one 2¹⁷ replicate per call | — |
@@ -1062,7 +1063,7 @@ unqueried native allocations. A module
 between the budget and the card is not refused; the budget only warns. The
 check runs on every GPU leg whose card total is readable (CUDA and ROCm). It does not run at compile, because planners compile
 larger candidates on purpose to read their figures and then shrink
-([the compiled check](#the-compiled-check), the kmeans Gram width); a
+([the compiled check](#the-compiled-check)); a
 candidate that never runs is never refused.
 
 ### What compiled statistics miss

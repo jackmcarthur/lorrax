@@ -1113,7 +1113,7 @@ def test_no_module_imports_a_lower_numbered_layer(sources):
 
 
 def test_pivoted_cholesky_selection_has_one_l2_owner(sources):
-    """The centroid and downfold routes share the numerical implementation."""
+    """Downfold selects through the one numerical implementation."""
     selector_names = {
         "pivoted_cholesky_select",
         "make_sharded_pivoted_cholesky_select",
@@ -1129,7 +1129,7 @@ def test_pivoted_cholesky_selection_has_one_l2_owner(sources):
         "make_sharded_pivoted_cholesky_select": ["common.pivoted_cholesky"],
     }
 
-    for caller in ("centroid.pivoted_cholesky", "gw.downfold"):
+    for caller in ("gw.downfold",):
         imports = {
             alias.name
             for node in ast.walk(ast.parse(sources[caller]))

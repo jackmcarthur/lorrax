@@ -278,14 +278,18 @@ Each channel is fitted separately,
 $\rho^I_{mn}(\mathbf r)\approx\sum_\lambda\zeta^I_\lambda(\mathbf r)\rho^I_{mn}(\mathbf r_\lambda)$,
 on two centroid sets: `centroids_file` for $I=0$ and
 `centroids_file_current` for $I=1,2,3$
-(`kmeans_cli --density-mode current`). The current k-means weight is
+(`kmeans_cli --density-mode current`). The current k-means mass is
 
 $$
-m_J(\mathbf r)=\Bigl[\sum_{k,i}w_k\,\mathrm{Tr}\bigl(D_{L,k}\alpha^iD_{R,k}\alpha^i\bigr)/\alpha_{\rm FS}^2\Bigr]^{1/2},\qquad
+m_J(\mathbf r)=\Bigl[\sum_{k,i}w_k\,\mathrm{Tr}\bigl(D_{L,k}\alpha^iD_{R,k}\alpha^i\bigr)/\alpha_{\rm FS}^2\Bigr]^{P},\qquad
 D_{B,k}=\sum_{n\in B}|\Psi_{nk}\rangle\langle\Psi_{nk}|,
 $$
 
-and the charge weight has $1$ for $\alpha^i$. Current fit matrices are
+with $P$ = `--weight-power` (5/6), and the charge mass has $1$ for $\alpha^i$.
+The current pool is pruned on the stacked-current Gram $\sum_i Z_i^\dagger Z_i$,
+$Z_i(\mathbf r_a)=\langle\Psi^L(\mathbf r_a)|\alpha^i|\Psi^R(\mathbf r_a)\rangle$,
+sketched with one Gaussian draw per component and unit band weights
+([sketched prune](centroid-selection.md#sketched-prune)). Current fit matrices are
 $s$ times a least-squares Gram, semidefinite with $s=-1$ only for Cartesian
 $\alpha^2$, and are solved by ridged pivoted LU; the charge one is positive
 semidefinite

@@ -137,18 +137,21 @@ that site; `—` means uncertified, and the site warns instead of refusing.
 | `isdf/core._transverse_lu_math` (ridge) | transverse CCT | no truncation | — | κ ≥ 1e12 refuses | refuse |
 | `common/zeta_projection.least_squares_transfer` | small-basis Gram `G_S` | caller `rcond` | `μ_S` | 1e8 | refuse (κ arm only: the route reduces over q before host, so it has no per-q trace for the weight arm) |
 | `gw/epsmat_export.coulomb_whitener` `epsmat V+` | Coulomb Gram `V_q`, PSD | `rcond` (`[epsmat]`) | `N_μ` | 1e8 (κ(V) 6.2e7 unbound at 1e-8, CrI3 6×6) | refuse ([export](../theory/bgw_epsmat_export.md#2-whitening-passivity-and-what-is-represented)) |
-| `centroid/pivoted_cholesky` select | candidate Gram, PSD | `√ε` relative | candidate count | — | reports; see below |
+| `centroid/sketch_select` select | sketched candidate Gram `Y^H Y`, PSD by construction | `√ε` relative | point budget (`r′` ≥ budget) | — | reports; see below |
 | `bse/bse_w_exact` TRIM probes | probe independence | relative | block size | — | refuse on deficiency, naming k, block and norm |
 
 ### Where rank deficiency must not refuse
 
-The centroid pivoted-Cholesky pool is over-complete by design, and its
+The centroid candidate pool is over-complete by design, and its
 numerical rank deficiency is anti-correlated with accuracy: the Si
 960-point anchor set (numerical rank 799) gives the best BerkeleyGW agreement
 on record for that deck (Σ MAE 0.644 meV). The select therefore reports the
 deficiency with its consequence (the ζ back-solve will truncate about that
-many modes per q) and refuses only what is structurally unsafe: a non-PSD
-Gram, an exhausted candidate pool, a pivot outside the candidate range.
+many modes per q) and refuses only what is structurally unsafe: a pivot
+outside the candidate range, or a point budget smaller than every orbit. The
+sketch is PSD by construction; the shared refusal
+(`centroid.candidates.refuse_unless_select_certified`) also refuses a non-PSD
+Gram and an exhausted pool for `gw.downfold`'s pivoted Cholesky.
 Orbit-mode selection admits a complete orbit only when it fits the remaining
 point budget and applies a pivot update for every member, so its rank and
 delivered count are both in points. The selection window must still cover

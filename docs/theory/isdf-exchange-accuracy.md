@@ -31,7 +31,7 @@ includes.
 **Pair-set rank \(r(B)\).** The numerical rank of the selector's positive
 feature Gram \(K(\mathbf r,\mathbf r')\) (centroid selection, "What is being
 optimized?"). The rank counts eigenvalues above \(\sqrt{\epsilon}\) times the
-largest diagonal (`centroid/pivoted_cholesky.point_granularity_rank`). It is
+largest diagonal. It is
 measured on a 9000-point candidate pool (request \(N_c=6000\)) and printed as
 `pool rank=` in `kmeans.out`. Once \(N_\mu\ge r(B)\), extra points
 add no new directions at that tolerance.
@@ -147,7 +147,7 @@ reference on bands 1–412 to 0.002 meV (claim 2865).
 - **r(B) approaches the density sphere.** \(r\) grows to 4335 at the complete basis, 0.95 of the 4573 plane waves in the 100 Ry (\(4E_{\rm wfc}\)) sphere. The rank is measured on a candidate pool, so it is a lower bound. On an 8700-point pool, B = 1074 gives 4335; on 6503 points it gives 4167. At B = 412 the pool changes it by 0.3 % (9000 → 13 650 points); at B = 692, by 5.5 % (5670 → 13 650).
 - **Consequence.** An all-band Σ_x needs \(N_\mu \approx r \approx N_G(4E_{\rm wfc})\). The ISDF basis is then as large as the plane-wave density basis, and its compression over that basis is gone. What remains is the factor \(N_r/N_G(4E_{\rm wfc}) \approx 3\) between the FFT grid and the sphere. ISDF compresses a truncated band sum: \(r(64) = 0.39\,N_G(4E_{\rm wfc})\).
 - **Per band.** At the complete basis 1.0 r is 4 centroids per band, against 27.6 at B = 64.
-- **Running it.** The pruner refuses a band window above half the plane-wave basis (`centroid/pivoted_cholesky.py`). The measurement hid that guard in a harness without a source edit. At B ≥ 850 a 13 650-point pool ran out of memory on 40 GB A100s, so the pool was 8700 points.
+- **Running it.** The pruner refuses a band window above half the plane-wave basis (`centroid/candidates.check_pair_space_window`). The measurement hid that guard in a harness without a source edit. At B ≥ 850 a 13 650-point pool ran out of memory on 40 GB A100s, so the pool was 8700 points.
 
 ## Why the old 960-point set failed
 
@@ -188,7 +188,7 @@ keeps. The full window costs +13 % wall and +15 GB peak in the selection.
   Only `--fit-window` narrows it; keep its right leg at or above
   `max(number_bands_chi, number_bands_sigma)` of every deck the centroid file
   serves ([flags](../drivers.md#centroids-centroidkmeans_cli)). `kmeans.out` prints
-  the `pool rank=` line. `centroid/pivoted_cholesky.py`
+  the `pool rank=` line. `centroid/candidates.check_pair_space_window`
   refuses a window whose top band exceeds half the plane-wave basis
   (`max_band > 0.5·ngk_max·n_spinor`): raise the cutoff or lower the band
   count.

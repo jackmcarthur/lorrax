@@ -125,6 +125,5 @@ A rerun of Si 4³ scalar (537 bands, 8 k): max |Δε| 2.92e-7 Ry, 1 − subspace
   basis: [ISDF exchange accuracy, out to the complete basis](../theory/isdf-exchange-accuracy.md#out-to-the-complete-basis).
 - **Blocked today:** the kmeans pruner refuses a band window whose top band
   exceeds half the plane-wave basis, `0.5 · ngk_max · nspinor`
-  (`centroid/pivoted_cholesky.py:1043`,
-  `prune_candidates_by_pivoted_cholesky`). Pivoted-Cholesky pruning on a
+  (`centroid/candidates.py`, `check_pair_space_window`). Pruning a
   complete-basis pair set therefore refuses; `--oversample 1.0` skips pruning.

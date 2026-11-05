@@ -1,7 +1,7 @@
 # Centroid selection: coverage, conditioning and cost
 
 The production selector is periodic weighted Lloyd clustering, followed by
-grid snapping, symmetry-orbit closure and optional candidate-Gram pruning.
+grid snapping, symmetry-orbit closure and optional sketched-QRCP pruning.
 This page distinguishes its objective from possible replacements. The fit
 and its conditioning are owned by [ISDF](isdf-zeta-vq.md) and the
 [rank policy](../architecture/rank_truncation_policy.md); the rule for the selected
@@ -38,11 +38,6 @@ speed at high rank counts even when the grid storage divides by P.
 
 ## What is being optimized?
 
-The candidate Gram accumulates k batches and square tiles sized from the
-shapes alone (`runtime.tiles`), with the original weights; batching changes
-floating-point summation grouping rather than the training metric, and the
-memory budget never changes that grouping or the selected set.
-
 Write the feature at position r as
 
 \[
@@ -51,8 +46,9 @@ Write the feature at position r as
  K(r,r')=\sum_{kmni}f_{kmni}(r)f_{kmni}(r')^*.
 \]
 
-The windows m in L and n in R are explicit; this uses the R-dagger/L
-orientation of `isdf.core._gram_q0_fold_local`. Charge has one vertex I;
+The windows m in L and n in R are explicit; this R-dagger/L orientation is
+the one the candidate sketch reproduces in expectation
+([below](#sketched-prune)). Charge has one vertex I;
 current candidate selection stacks the three Hermitian vertices alpha_i.
 This **positive feature Gram** is not the signed transverse fit matrix.
 Nor is it the frequency-sample Gram of the W interpolation pencil.
@@ -62,7 +58,8 @@ Their eigenvalues are different diagnostics.
 s(r)=K(r,r)/alpha_fs^2 for current on the FFT grid. This global positive
 scale changes neither Lloyd minimizers nor relative pivot/rank criteria;
 absolute Gram magnitudes must retain the distinction.
-`centroid.kmeans_cli` uses w(r)=sqrt(s(r)) as Lloyd's mass.
+`centroid.kmeans_cli` uses w(r)=s(r)^P as Lloyd's mass, P = `--weight-power`
+(5/6).
 Thus the objective is
 
 \[
@@ -86,8 +83,56 @@ not prove that replacing the weight alone improves GW.
 
 In a three-dimensional high-resolution continuum approximation, scalar
 weighted quantization gives point density proportional to w^(3/5), hence
-s^(3/10) for the default weight. This asymptotic statement need not hold
-after orbit closure, snapping or pruning, or for a thin slab/vacuum grid.
+s^(3P/5) = s^(1/2), the feature norm, for the default P = 5/6. This asymptotic
+statement need not hold after orbit closure, snapping or pruning, or for a
+thin slab/vacuum grid.
+
+## The sketched prune {#sketched-prune}
+
+`centroid.sketch_select` prunes the snapped, orbit-closed pool to the point
+budget N without forming K on the candidates. With Z the pair matrix (rows
+(k, m, n), columns the M candidates, K = Z^H Z on the pool), it builds a
+Khatri–Rao Gaussian sketch Y = ΩZ of r' = N + max(64, ⌈0.1 N⌉) rows
+(`--sketch-rows`),
+
+\[
+ Y_j(a)=r'^{-1/2}\sum_k\sqrt{w_k}\sum_s
+ \Big(\sum_{m\in L}g^L_{jkm}\,\psi^*_{mks}(a)\Big)
+ \Big(\sum_{n\in R}g^R_{jkn}\,\psi_{nks}(a)\Big),\qquad
+ g\sim\mathcal{CN}(0,1),
+\]
+
+so E[Y^H Y] = K with the same k weights, windows and band norms. The draws
+are `jax.random.fold_in` streams per k row and sketch row (`--seed`), the
+same on every mesh and k batching. The k batches and row tiles are sized from
+the shapes alone (`runtime.tiles`), with the original weights; batching
+changes floating-point summation grouping rather than the training metric,
+and the memory budget never changes that grouping or the selected set. The
+current channel sketches sum_i Z_i^H Z_i, Z_i(a) = <psi^L(a)|alpha^i|psi^R(a)>,
+with one independent draw per component and unit band weights.
+
+The selection is orbit-blocked near-greedy QRCP on Y. Per block, orbits are
+scored by the mean residual of their members; the top b orbits' columns C are
+gathered as row slabs and H = C^H C is formed; orbits are admitted while their
+in-block score is at least gamma times the block's leading score
+(`--sketch-gamma`, 0.7) and they fit the remaining budget, each member pivoted
+by pivoted Cholesky on H. The admitted directions are orthonormalized by
+CholQR2 and Y is deflated once, Y ← Y − QQ^H Y, streamed over one-tile column
+panels. b = `--sketch-block`, by default max(1, ⌊m_b/|O|max⌋) with m_b ≤ 1024
+columns and one fixed tile of r' rows; b = 1 with gamma = 1 is the sequential
+greedy order. After t directions a Gaussian sketch keeps on average
+(r' − t)/r' of a column's true residual, so every residual, the floor test and
+`pool rank=` read d r'/(r' − t), unbiased for a column the selection has not
+conditioned on. Only whole orbits are delivered, so the written set stays
+closed under the decorated-atom space group. The per-rank bytes are the
+[memory model](../architecture/memory-model.md)'s kmeans candidate sketch row.
+
+Measured on MoS₂/hBN, 3264 bands, P4 A100-80GB: N_μ = 45k selects in 44 s
+at an 18 GB device peak, 90k in 183 s at 62 GB. Against converged Σ_x
+(`x_only`) references it reaches 5 meV RMS at N_μ ≈ 1.5–1.9 S,
+S = (L^(1/3) + B^(1/3))^3 with L and B the band windows in orbitals; pivoted
+Cholesky on the dense candidate Gram (w = s^(1/2), pool 1.5 N) needs
+1.8–2.5 S.
 
 ## What full-grid pivoting would fix, and what it would not
 
@@ -135,7 +180,8 @@ psi_nk(r) psi_nk(r')^dagger. Then the feature Gram above is
 For scalar wavefunctions this reduces to D_L(r,r') D_R(r,r')*.
 For spinors it is an open-spin contraction, not the product of two scalar
 densities. The imaginary current vertex needs the conjugated endpoint;
-`isdf.core` already owns that positive-Gram contraction. Do not substitute
+`centroid.sketch_select.sketch_vertices` already owns that positive-Gram
+contraction, in sketched form. Do not substitute
 the signed transverse C_q contraction or fold spin into the band sum.
 
 For a block of chosen points, `isdf.pair_kernels.pair_projectors_lr` forms
@@ -224,27 +270,10 @@ only on one axis of a 4x4 mesh occupies 31.5 GB per rank. Two such faces
 already exceed a 40 GB GPU. Streaming or a different all-rank layout is
 necessary before claiming that this candidate count fits.
 
-The tiled candidate Gram stores each tile with one unconditional dynamic
-update of its donated destination. Static row and column edge epilogues
-preserve the padded tile arithmetic and column-outer/row-inner schedule.
-Keeping the destination outside a tail conditional avoids copying the
-entire local Gram at every tile. The complex scalar, spinor and transverse feature oracle
-in `tests/test_gram_tiled_alias.py` checks partial edges, exact tiles and
-oversized tiles against an independent direct transition-feature sum.
-
-K-batch accumulation keeps each Gram raw, then applies the original
-Hermitian fold once after the real-weighted sum and after releasing WFN
-faces. The fold is real-linear; deferring it preserves the exact metric
-while avoiding overlap between its two local-Gram scratch buffers and a
-second running Gram. Floating-point association may reorder near-tied
-pivots. The standalone batch builder still folds by default. Conservative
-deferred-pipeline pricing is `max(faces + 2*Gram + tile, 3*Gram)` per device;
-the standalone folded path retains `faces + 3*Gram + tile`.
-
 ## Decision criteria
 
 First separate input reads, diagonal construction, Lloyd assignment/update,
-candidate Gram and pruning in a real selector timing. Benchmark proposed
+the candidate sketch and its QRCP in a real selector timing. Benchmark proposed
 arithmetic against that breakdown. Exact periodic distance and a cheaper
 equivalent assignment are useful independently of a new physics objective.
 Then compare global blocked selection or continuous refinement at fixed M
