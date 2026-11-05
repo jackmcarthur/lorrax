@@ -49,7 +49,9 @@ to working precision (CholQR2 below ``kappa = eps^(-1/2)``, which the floor
 
 Memory: ``16 r' M/P`` for the sketch, the k batch's WFN face on the same
 flattened-mesh candidate layout, a fixed-tile block (``16 r' m_b`` gather
-buffer, ``16 r' m_b/P`` slabs) and a replicated block basis ``16 r' m_b``.
+buffer, ``16 r' m_b/P`` slabs), a replicated block basis ``16 r' m_b``, and
+one column panel of at most a fixed tile while the deflation and the column
+norms stream each rank's block (never a second copy of the sketch).
 
 Shapes and shardings (``CAND`` is the flattened mesh, y-major):
 
@@ -450,17 +452,20 @@ def build_sketch_q0_via_loadwfns(
 # ═══════════════════════════════════════════════════════════════════════
 
 def _panel_plan(n_rows_pad: int, m_loc: int) -> tuple[int, int]:
-    """``(w, n_panels)``: local column panels of at most a quarter fixed tile of ``R`` rows.
+    """``(w, n_panels)``: local column panels of at most one fixed tile of ``R`` rows.
 
     The deflation and the column norms stream each rank's ``m_loc`` columns
     in ``n_panels`` panels of ``w`` columns, so no program holds a second
-    copy of the sketch (a whole-block GEMM update or ``|Y|^2`` would).  The
-    last panel is clamped to end at ``m_loc``; the columns it shares with
-    the previous panel are projected twice, which a projection leaves
-    unchanged.
+    copy of the sketch (a whole-block GEMM update or ``|Y|^2`` would).  One
+    tile, not less: on an A100 at the N_mu = 45k P4 shape (R = 49536) a
+    block's deflation takes 380 ms at w = 1299 (whole-block 387 ms) and
+    463 ms at a quarter tile, where the projection's (128 x w) output keeps
+    too few SMs busy.  The last panel is clamped to end at ``m_loc``; the
+    columns it shares with the previous panel are projected twice, which a
+    projection leaves unchanged.
     """
     from runtime.tiles import TILE_BYTES
-    cap = max(1, min(int(m_loc), int(TILE_BYTES) // (4 * _C128 * int(n_rows_pad))))
+    cap = max(1, min(int(m_loc), int(TILE_BYTES) // (_C128 * int(n_rows_pad))))
     n_panels = -(-int(m_loc) // cap)
     return -(-int(m_loc) // n_panels), n_panels
 
@@ -718,7 +723,9 @@ def _deflate_kernel(mesh: Mesh, n_rows_pad: int, m_pad: int, t_pad: int):
         def chunk(c, Yp):
             Qc = lax.dynamic_slice_in_dim(Q, c * _CHUNK, _CHUNK, axis=1)
             W = jnp.matmul(jnp.conj(Qc.T), Yp[0], precision=lax.Precision.HIGHEST)
-            return Yp - jnp.matmul(Qc, W, precision=lax.Precision.HIGHEST)[None]
+            # Y_p + (-Q_c) W: the addition folds into the GEMM (beta = 1);
+            # the subtraction form costs an extra pass over the panel.
+            return Yp + jnp.matmul(-Qc, W, precision=lax.Precision.HIGHEST)[None]
         return lax.fori_loop(0, n_chunks, chunk, Yp)
 
     run = _paneled(mesh, n_rows_pad, m_pad, body, write=True)(2)
@@ -880,7 +887,7 @@ def _memory_proposal(mesh: Mesh, *, n_rows_pad: int, m_pad: int, ns: int,
     fixed row tile ``TILE_BYTES``), the select block (the gather buffer
     ``16 R m_b``, the slabs and their CholQR copies ``3 16 R t / P`` and the
     replicated basis ``16 R t``, ``t`` the chunk-padded block width) and the
-    deflation (the projection ``16 _CHUNK M_pad / P``, twice).  The
+    deflation (one streamed panel and its update, two fixed tiles).  The
     executables are admitted at their own compiled prices when they run.
     """
     from lxkit import memory
@@ -890,7 +897,7 @@ def _memory_proposal(mesh: Mesh, *, n_rows_pad: int, m_pad: int, ns: int,
     build = (_C128 * ns * nb_r * m_pad, float(TILE_BYTES))         # spread, fixed
     select = (3 * _C128 * n_rows_pad * t_pad,
               _C128 * n_rows_pad * (m_b + t_pad))
-    deflate = (2 * _C128 * _CHUNK * m_pad, 0.0)
+    deflate = (0.0, 2.0 * TILE_BYTES)
     xla = max((build, select, deflate), key=lambda t: t[0] / ranks + t[1])
     return memory.Price(
         operands=memory.Term(0.0, float(faces_per_rank * ranks + _C128 * n_rows_pad * m_pad),
