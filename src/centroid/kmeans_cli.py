@@ -85,6 +85,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "orbit is admitted while its in-block mean residual "
                         "is at least G times the block's leading score "
                         "(0 < G <= 1; default 0.7).")
+    p.add_argument("--pool", choices=("kmeans", "random"), default="kmeans",
+                   help="Candidate pool before the prune. 'kmeans' (default): "
+                        "Lloyd-converged weighted k-means. 'random': the "
+                        "same number of grid points drawn without "
+                        "replacement with probability ~ mass, no Lloyd "
+                        "steps (selector study, ISDF_RANK_SCALING §10.11 "
+                        "row 13).")
     return p
 
 
@@ -368,7 +375,42 @@ def _resolve_weight(args, wfn, sym, R, tau, dist_mesh=None):
     label = (
         f"{mass}(diag q=0 {mode} Gram), left={left_range}, "
         f"right={right_range}, unit band weights")
+    if args.pool == "random":
+        label += "; pool: weighted draw without replacement, no Lloyd steps"
     return weight, label, (left_range, right_range)
+
+
+def _weighted_random_pool(weight, fft_grid, Rinv, tau, orbit_aware,
+                          n_points, seed):
+    """Fractional grid points of a pool drawn without replacement ~ ``weight``.
+
+    With symmetries the draw is over whole spatial orbits, each with
+    probability ~ its summed weight, kept in draw order while the unfolded
+    total fits ``n_points``: the symmetric form of a point draw, with no two
+    draws in one orbit.  No Lloyd steps.  The same on every rank.
+    """
+    grid = tuple(int(v) for v in fft_grid)
+    w = np.maximum(np.asarray(weight, dtype=np.float64).reshape(-1), 0.0)
+    if orbit_aware:
+        from .kmeans_isdf import grid_orbit_canonical
+        canonical = grid_orbit_canonical(grid, Rinv, tau)
+        reps = np.flatnonzero(canonical == np.arange(canonical.size))
+        mass = np.bincount(canonical, weights=w, minlength=canonical.size)[reps]
+        size = np.bincount(canonical, minlength=canonical.size)[reps]
+    else:
+        reps, mass, size = np.arange(w.size), w, np.ones(w.size, dtype=np.int64)
+    live = mass > 0
+    reps, mass, size = reps[live], mass[live], size[live]
+    order = np.random.default_rng(int(seed)).choice(
+        reps.size, size=min(reps.size, int(n_points)), replace=False,
+        p=mass / mass.sum())
+    keep = order[:np.searchsorted(np.cumsum(size[order]), int(n_points),
+                                  side="right")]
+    log.info(f"Weighted random pool: {keep.size} "
+             + ("orbits" if orbit_aware else "points")
+             + f", {int(size[keep].sum())} points of {int(n_points)}")
+    return (np.column_stack(np.unravel_index(reps[keep], grid)).astype(float)
+            / np.asarray(grid, dtype=float))
 
 
 def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
@@ -595,25 +637,35 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
             f"{n_rtot} logical FFT-grid points")
         kmeans_target = n_rtot
 
-    stages.begin(2, "Weighted k-means", name="centroid.kmeans")
-    row("target", f"{M_cand} candidates = {kmeans_target} orbit representatives "
-                  f"x {n_sym} operations" if orbit_aware else
-                  f"{kmeans_target} candidates (literal points)")
-    with timing.section("kmeans") as kmeans_section:
-        labels, centroids, _lloyd_steps, _lloyd_move_sq = weighted_kmeans_jax(
-            avec_ang, weight, N_c=kmeans_target, seed=args.seed,
-            mesh=mesh, mesh_axis=mesh_axis,
-            init_method=init_method,
-            R=R, Rinv=Rinv, tau=tau,
-            return_labels=False,
-        )
-        # The host materialises ``centroids`` immediately below.  Watch every
-        # returned device value here so this phase measures completion rather
-        # than asynchronous dispatch; this is one semantic boundary, not an
-        # inner-loop synchronization point.
-        kmeans_section.watch(
-            labels, centroids, _lloyd_steps, _lloyd_move_sq)
-    centroids_frac = np.asarray(centroids)
+    if args.pool == "random":
+        stages.begin(2, "Weighted random pool", name="centroid.kmeans")
+        with timing.section("kmeans"):
+            centroids_frac = _weighted_random_pool(
+                weight, fft_grid, Rinv, tau, orbit_aware, M_cand, args.seed)
+        labels = centroids = None
+        row("target", f"{M_cand} candidates drawn without replacement "
+                      f"~ mass, {centroids_frac.shape[0]} "
+                      + ("orbits" if orbit_aware else "points") + ", no Lloyd steps")
+    else:
+        stages.begin(2, "Weighted k-means", name="centroid.kmeans")
+        row("target", f"{M_cand} candidates = {kmeans_target} orbit representatives "
+                      f"x {n_sym} operations" if orbit_aware else
+                      f"{kmeans_target} candidates (literal points)")
+        with timing.section("kmeans") as kmeans_section:
+            labels, centroids, _lloyd_steps, _lloyd_move_sq = weighted_kmeans_jax(
+                avec_ang, weight, N_c=kmeans_target, seed=args.seed,
+                mesh=mesh, mesh_axis=mesh_axis,
+                init_method=init_method,
+                R=R, Rinv=Rinv, tau=tau,
+                return_labels=False,
+            )
+            # The host materialises ``centroids`` immediately below.  Watch every
+            # returned device value here so this phase measures completion rather
+            # than asynchronous dispatch; this is one semantic boundary, not an
+            # inner-loop synchronization point.
+            kmeans_section.watch(
+                labels, centroids, _lloyd_steps, _lloyd_move_sq)
+        centroids_frac = np.asarray(centroids)
 
     with timing.section("snap_unfold"):
         centroid_indices, centroids_snapped, n_unique, orbit_id_arr = \

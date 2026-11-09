@@ -253,6 +253,9 @@ def kmeans_settings_rows(args, *, source) -> list:
     rows.append(Setting("weight_power", f"{float(args.weight_power):.4g}",
                         source("--weight-power"),
                         "k-means mass = (diag q=0 Gram)^P"))
+    if getattr(args, "pool", "kmeans") != "kmeans":
+        rows.append(Setting("pool", str(args.pool), source("--pool"),
+                            "weighted draw without replacement, no Lloyd steps"))
     rows.append(Setting("sketch_rows", str(int(args.sketch_rows) or "auto"),
                         source("--sketch-rows"), "r' = N + max(64, ceil(0.1 N))"
                         if not int(args.sketch_rows) else "sketch rows r'"))
