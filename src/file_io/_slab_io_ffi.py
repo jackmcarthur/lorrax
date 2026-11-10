@@ -1476,6 +1476,58 @@ def _file_order_move_supported(spec, shape, k, mesh):
     return not present or int(shape[k]) % int(mesh.size) == 0
 
 
+def _write_route(shape, vshape, spec, itemsize, mesh, ds_shape):
+    """How ``write_slab`` sends one operand: ``None``, ``"as-is"`` or a piece plan.
+
+    :func:`_file_order_plan`, demoted to the collective write (``None``) where
+    the explicit row exchange would not preserve the global order
+    (:func:`_file_order_move_supported`).  ``write_slab`` dispatches on it and
+    ``write_device_scratch`` prices it, so the two cannot disagree.
+    """
+    shape = tuple(int(d) for d in shape)
+    plan = _file_order_plan(shape, tuple(int(v) for v in vshape),
+                            _spec_axes(spec, len(shape)), int(itemsize),
+                            int(mesh.size), tuple(mesh.axis_names),
+                            tuple(int(d) for d in ds_shape))
+    if plan not in (None, "as-is") and not _file_order_move_supported(spec, shape, plan[0], mesh):
+        return None
+    return plan
+
+
+def _file_order_piece_bytes(value, vshape, plan, mesh, write_bytes):
+    """Per-rank new bytes of a ``(k, rows, lead)`` write, compiled and never run.
+
+    The exchange programs are the ones :func:`_file_order_pieces` runs (one per
+    distinct piece height), lowered at ``value``'s abstract shape and
+    sharding; each is priced with its file-row output plus
+    ``write_bytes(piece)``, the write call that consumes it.  The pieces the
+    lane holds afterwards are the caller's (``retained_previous_write_inputs``).
+    """
+    from runtime.aot_memory import compiled_new_bytes
+    k, rows, lead = plan
+    n, p = len(value.shape), int(mesh.size)
+    shape = tuple(int(d) for d in value.shape)
+    spec = value.sharding.spec
+    whole = _spec_axes(spec, n)[k] is not None
+    lead_axis = max((a for a in range(k) if int(vshape[a]) > 1), default=None)
+    steps = tuple(lead if a == lead_axis else 1 for a in range(k))
+    schedule = _piece_schedule(k, vshape, steps, rows)
+    counter = jax.ShapeDtypeStruct((), jnp.int32, sharding=NamedSharding(mesh, P()))
+    rows_spec = NamedSharding(mesh, P(*([None] * k), tuple(mesh.axis_names),
+                                      *([None] * (n - k - 1))))
+    peak = 0
+    for take_k in sorted({shape[k] if whole else min(rows, int(vshape[k]) - c0)
+                          for c0 in range(0, int(vshape[k]), rows)}):
+        height = -(-take_k // p) * p
+        sizes = steps + (take_k,) + shape[k + 1:]
+        take = _file_order_take(mesh, shape, value.dtype, k, sizes, height, spec, schedule)
+        piece = jax.ShapeDtypeStruct(steps + (height,) + shape[k + 1:], value.dtype,
+                                     sharding=rows_spec)
+        peak = max(peak, compiled_new_bytes(take.lower(value, counter).compile())
+                   + int(write_bytes(piece)))
+    return peak
+
+
 def _file_order_pieces(A, off, vshape, plan, mesh):
     """Yield ``(piece, offset, valid_shape)`` for a ``(k, rows, lead)`` plan."""
     k, rows, lead = plan
@@ -3000,11 +3052,15 @@ class _FfiBackend(_DatasetGeometry):
         return _LANE.queued_write_inputs + 1  # queued plus the worker; caller separate
 
     def write_device_scratch(self, name, value):
-        """Actual write-call increment for an already file-row-owned operand.
+        """Per-rank new device bytes of ``write_slab(name, value)`` at offset 0.
 
-        This narrow query excludes input retention (the lane's capacity above)
-        and host pinned staging. It refuses file-order conversion rather than
-        guessing its transport workspace. No field is dispatched or read.
+        The route is ``write_slab``'s own (:func:`_write_route`): a collective or
+        as-is write costs its write call; a file-order piece plan adds the
+        bounded row exchange it runs (:func:`_file_order_piece_bytes`).  An
+        operand whose per-rank file runs are below ``_FILE_ORDER_MIN_RUN`` --
+        a small ζ tile at P > 1 -- takes the piece route.  Input retention
+        (the lane's capacity above) and host pinned staging are the caller's.
+        Programs are compiled, never run; no field is dispatched or read.
         """
         from runtime.aot_memory import compiled_new_bytes
         shape = tuple(int(v) for v in value.shape)
@@ -3012,16 +3068,21 @@ class _FfiBackend(_DatasetGeometry):
         if ds is None:
             raise ValueError("write_device_scratch needs registered dataset geometry")
         valid = tuple(min(a, b) for a, b in zip(shape, ds))
-        axes = _spec_axes(value.sharding.spec, len(shape))
-        plan = _file_order_plan(shape, valid, axes, np.dtype(value.dtype).itemsize,
-                                int(self.mesh.size), tuple(self.mesh.axis_names), ds)
-        if plan not in (None, "as-is"):
-            raise ValueError("write_device_scratch requires an already file-row-owned operand")
-        counts, flat = _sharding_to_axis_info(value.sharding, len(shape))
-        sm = _get_write_sm(self.mesh, value.sharding.spec,
-            mesh_shape=tuple(self.mesh.shape[a] for a in self.mesh.axis_names),
-            axis_count_per_dim=counts, axis_flat=flat, independent=plan == "as-is")
-        return compiled_new_bytes(_compiled_write(sm, value))
+        mesh_shape = tuple(self.mesh.shape[a] for a in self.mesh.axis_names)
+
+        def call(x, independent):
+            counts, flat = _sharding_to_axis_info(x.sharding, len(x.shape))
+            sm = _get_write_sm(self.mesh, x.sharding.spec, mesh_shape=mesh_shape,
+                               axis_count_per_dim=counts, axis_flat=flat,
+                               independent=independent)
+            return compiled_new_bytes(_compiled_write(sm, x))
+
+        plan = _write_route(shape, valid, value.sharding.spec,
+                            np.dtype(value.dtype).itemsize, self.mesh, ds)
+        if plan in (None, "as-is"):
+            return call(value, plan == "as-is")
+        return _file_order_piece_bytes(value, valid, plan, self.mesh,
+                                       lambda piece: call(piece, True))
 
     def write_slab(
         self,
@@ -3096,14 +3157,8 @@ class _FfiBackend(_DatasetGeometry):
         # File order.  Each write leaves as file-order row blocks, written
         # independently, or -- when no bounded way to cut it exists -- as it
         # is, collectively (_file_order_plan says which and why).
-        plan = _file_order_plan(tuple(A.shape), vshape,
-                                _spec_axes(A.sharding.spec, A.ndim),
-                                jnp.dtype(A.dtype).itemsize, int(self.mesh.size),
-                                tuple(self.mesh.axis_names), ds_shape)
-        if (plan not in (None, "as-is")
-                and not _file_order_move_supported(A.sharding.spec, A.shape,
-                                                   plan[0], self.mesh)):
-            plan = None
+        plan = _write_route(A.shape, vshape, A.sharding.spec,
+                            jnp.dtype(A.dtype).itemsize, self.mesh, ds_shape)
         if plan is None:
             self._dispatch_write(name, A, off, vshape, ds_shape, mesh_shape,
                                  independent=False, require_finite=require_finite)
