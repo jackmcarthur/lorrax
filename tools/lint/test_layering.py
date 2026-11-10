@@ -715,7 +715,7 @@ _DRIVER_MAIN_STATEMENTS = {
     "gw.gw_jax": (("main", "_run_gw_stages"), 57),
     "bse.bse_jax": (("main",), 27),
     "bse.exciton_bands": (("main",), 389),
-    "bandstructure.htransform": (("main",), 118),
+    "bandstructure.htransform": (("main",), 117),
     "gw.kin_ion_io": (("main",), 119),
     "psp.get_dipole_mtxels": (("main",), 206),
     "tdagw.tdgw_jax": (("main",), 12),

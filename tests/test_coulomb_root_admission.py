@@ -1,8 +1,8 @@
 """P1/P4 complex PSD roots, padded support and actual-price route admission."""
 import weakref
 from unittest.mock import patch
-import numpy as np
 import runtime
+import numpy as np
 
 
 def main():
