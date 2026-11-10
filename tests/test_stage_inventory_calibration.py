@@ -1,11 +1,12 @@
 """gw.stage_inventory against measured GN-PPM and tangential stage peaks (CPU, no device; seconds).
 
 ``tests/data/stage_peaks_measured.json`` holds the allocator high-water of each
-``LORRAX_MEMORY_TRACE`` section, max over ranks, of four one-node P = 4 runs
-(MoS₂/hBN 148 atoms at N_μ 8160 and 16320; Al₂O₃ 4×4×4 at N_μ 6000, GN-PPM and tangential).  Each
-inventory stage is the trace section named in :data:`SECTION`; every stored
-peak must lie within :data:`BAND` of the inventory's price at the run's route, or within
-:data:`SLACK` of it (stages under a GB).
+``LORRAX_MEMORY_TRACE`` section, max over ranks, of five one-node P = 4 runs
+(MoS₂/hBN 148 atoms at N_μ 8160 and 16320; Al₂O₃ 4×4×4 at N_μ 6000, GN-PPM, and tangential
+on both Σ factor routes).  Each inventory stage is the trace section named in
+:data:`SECTION`; every stored peak must lie within :data:`BAND` of the inventory's price
+at the run's route, or within :data:`SLACK` of it (stages under a GB); a stage in
+:data:`TIGHT` within its own band.
 """
 import json
 import pathlib
@@ -31,6 +32,8 @@ SECTION = {
 }
 #: measured / priced, per stage; or |measured - priced| at most SLACK GB.
 BAND, SLACK = (0.75, 1.3), 0.5
+#: Stages pinned closer: tangential Σ τ on the axis (replicated pole columns) and face routes.
+TIGHT = {"Sigma tau sweep (tangential)": (0.95, 1.05)}
 DATA = pathlib.Path(__file__).parent / "data" / "stage_peaks_measured.json"
 
 
@@ -48,7 +51,8 @@ def test_stage_inventory_prices_measured_peaks(run):
         routes = dict(prices[stage])
         priced = routes.get(run["linalg"], next(iter(routes.values()))).bytes() / 1e9
         ratio = measured / priced
-        if not (BAND[0] <= ratio <= BAND[1] or abs(measured - priced) <= SLACK):
+        lo, hi = TIGHT.get(stage, BAND)
+        if not (lo <= ratio <= hi or (stage not in TIGHT and abs(measured - priced) <= SLACK)):
             off.append(f"{stage} ({SECTION[stage]}): measured {measured:.2f} GB, "
                        f"priced {priced:.2f} GB, ratio {ratio:.2f}")
     assert not off, f"{run['name']}: " + "; ".join(off)

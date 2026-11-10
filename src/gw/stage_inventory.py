@@ -50,7 +50,9 @@ class Deck:
     before 2410aa812 boxed every local band at once (reports older than it).  ``sys_dim``
     2: a slab (a second V(q) stack, the long-range channel).  ``validation_width``: q per
     program of the all-q Coulomb validation (1, its floor; a run admits the widest that fits).
-    ``n_pole``: the tangential store's pole columns per q (``Kmax``; 0: GN-PPM only)."""
+    ``n_pole``: the tangential store's pole columns per q (``Kmax``; 0: GN-PPM only).
+    ``tangential_route``: ``"auto"``, the Σ schedule's own choice (replicated pole columns
+    where they fit, else the face panels); ``"face"`` or ``"axis"`` holds it there."""
     nk: int
     n_parent: int
     nq: int
@@ -66,6 +68,7 @@ class Deck:
     validation_width: int = 1
     n_pole: int = 0
     hartree_unchunked: bool = False
+    tangential_route: str = "auto"
 
 
 def _pad(n: int, p: int) -> int:
@@ -159,8 +162,10 @@ def _tangential_route(d: Deck, P: int, *, budget: float) -> dict:
     header = {"n_q_irr": d.nq, "Kmax": d.n_pole}
     mesh = SimpleNamespace(shape={"x": px, "y": py}, size=P, axis_names=("x", "y"))
     unit = C16 * d.nk * (d.ns * mu) ** 2 / P               # tangential_recipe's U
-    layout, best = tangential_panel_route(meta, header, mesh_xy=mesh, layout="face",
-                                          budget=budget, unit=unit)
+    route = d.tangential_route
+    layout, best = tangential_panel_route(meta, header, mesh_xy=mesh,
+                                          layout="face" if route == "auto" else route,
+                                          budget=budget, unit=unit, prefer_axis=route == "auto")
     b, c = (1, combined_divisor(px, py)) if best is None else best[2:]
     return dict(layout=layout, b=b, c=c,
                 resident=_tangential_resident_bytes(meta, header, mesh_xy=mesh, layout=layout),

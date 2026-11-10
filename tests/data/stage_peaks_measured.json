@@ -165,6 +165,42 @@
     "Sigma exchange": 5.12,
     "Sigma Hartree": 4.03
    }
+  },
+  {
+   "name": "Al2O3 10 atoms 4x4x4, 154 bands, N_mu 6000, tangential, face route",
+   "P": 4,
+   "linalg": "local",
+   "source": "claude/planner-accuracy-r1 (main 94dfe4cbc); the Sigma factors held on the face route by a test-only wrapper (axis replicated columns priced out, whole parents refused)",
+   "deck": {
+    "nk": 64,
+    "n_parent": 13,
+    "nq": 13,
+    "ns": 1,
+    "nb": 154,
+    "nb_qp": 30,
+    "ng": 7128,
+    "fft": [
+     60,
+     60,
+     60
+    ],
+    "nmu": 6000,
+    "kgrid": [
+     4,
+     4,
+     4
+    ],
+    "trs": true,
+    "sys_dim": 3,
+    "validation_width": 64,
+    "n_pole": 5224,
+    "tangential_route": "face"
+   },
+   "measured": {
+    "Sigma tau sweep (tangential)": 28.55,
+    "Sigma exchange": 5.12,
+    "Sigma Hartree": 4.03
+   }
   }
  ]
 }

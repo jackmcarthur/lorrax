@@ -903,6 +903,14 @@ def _w_extents(meta, extents):
     return tuple(int(e) for e in extents)
 
 
+#: Parent tiles the Σ window holds at its W(τ) realization peak, per parent of the panel:
+#: the compiled window's temp on Al₂O₃ 4×4×4, N_μ 6000, P4 (13 parents, 5224 pole
+#: columns; LORRAX_MEMORY_TRACE and its scheduled HLO), 21.10 GB on the face route and
+#: 24.36 GB less the relaid axis factor (3.26) on the axis route, against 1.872 GB of
+#: parent tiles: 11.27 on both.
+_W_PAIR_TILES = 11.3
+
+
 def _tangential_panel_cost(meta, header, b, c, *, mesh_xy, layout="face", extents=None):
     """Price the new buffers of one b-parent x c-column synthesis panel.
 
@@ -920,20 +928,34 @@ def _tangential_panel_cost(meta, header, b, c, *, mesh_xy, layout="face", extent
     multiple = combined_divisor(px,py)
     c = padded_axis(c,multiple,name="tangential_K_chunk").carrier
     faces = 16 * b * c*(rows+cols) / (px*py)
-    # Parent, partner and fixed-size group accumulators coexist. The
-    # compiled reservation below measures actual aliases and exchange
-    # scratch; this bound also informs the panel-size search.
-    peak = 6*b*tile + 8*b + 40*b*c*(rows+cols)/(px*py) + 64*b*c
+    # (The square form is the scalar's own float expression.)
+    axis_faces = (16*b*rows*c*(1/px+1/py) if rows == cols
+                  else 16*b*c*(rows/px + cols/py))
+    if extents is not None:
+        # A photon sector (sector_sigma's own realization, not measured here):
+        # parent, partner and fixed-size group accumulators coexist; on the axis
+        # layout the retained axis factors, the reader's face carrier and the
+        # weighted GEMM operands.
+        peak = 6*b*tile + 8*b + 40*b*c*(rows+cols)/(px*py) + 64*b*c
+        if layout == "axis":
+            peak += 2*axis_faces
+            faces = axis_faces
+        return dict(resident_bytes_per_rank=int(np.ceil(faces)),
+                    workspace_bytes_per_rank=int(np.ceil(peak-faces)))
+    # The scalar window's peak is the W(τ) pair's realization (realize_pair:
+    # the little-group realization and the fixed-q TRS projection), past the
+    # GEMM: its two output tiles, their masked copies, the projected pair and
+    # the per-group partials, _W_PAIR_TILES parent tiles in all.  The face
+    # GEMM's own panels (distrib_la.panel_matmul, bounded by one tile) are
+    # dead by then; the weights and poles scale with the columns.
+    workspace = _W_PAIR_TILES*b*tile + 8*b + 64*b*c
     if layout == "axis":
-        # (The square form is the scalar's own float expression.)
-        axis_faces = (16*b*rows*c*(1/px+1/py) if rows == cols
-                      else 16*b*c*(rows/px + cols/py))
-        # Retained axis factors, the reader's face carrier, and weighted
-        # GEMM operands coexist.
-        peak += axis_faces + axis_faces
         faces = axis_faces
+        # The GEMM's relaid copy of one axis factor stays live across the
+        # window's node loop, beside the pair.
+        workspace += 16*b*c*rows/px
     return dict(resident_bytes_per_rank=int(np.ceil(faces)),
-                workspace_bytes_per_rank=int(np.ceil(peak-faces)))
+                workspace_bytes_per_rank=int(np.ceil(workspace)))
 
 
 def _tangential_resident_bytes(meta, header, *, mesh_xy, layout, extents=None):
@@ -977,7 +999,8 @@ def _tangential_local_price(meta, header, *, mesh_xy, extents=None, factors=1):
     return int(resident), int(workspace)
 
 
-def tangential_panel_route(meta, header, *, mesh_xy, layout, budget, unit, extents=None):
+def tangential_panel_route(meta, header, *, mesh_xy, layout, budget, unit, extents=None,
+                           prefer_axis=True):
     """``(layout, best)``: the factor placement and synthesis panel the budget admits.
 
     ``best`` is ``(cost, -b·c, b, c)`` (``cost``: panel passes per τ node) for
@@ -985,7 +1008,8 @@ def tangential_panel_route(meta, header, *, mesh_xy, layout, budget, unit, exten
     the resident factors.  ``budget``: the bytes per rank left beside the Σ
     call's ambient stages; ``unit``: the ledger's U, the bound on one NEW
     projector panel.  Pure in the shapes, so :func:`_tangential_memory_schedule`
-    and the memory planner (``gw.stage_inventory``) take one route.
+    and the memory planner (``gw.stage_inventory``) take one route.  ``prefer_axis=False``
+    keeps ``layout`` (the planner pricing a route the run was held to).
     """
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
     nq, kmax = int(header["n_q_irr"]), int(header["Kmax"])
@@ -1033,7 +1057,7 @@ def tangential_panel_route(meta, header, *, mesh_xy, layout, budget, unit, exten
     # orientation) make it local. Take that placement whenever it needs no
     # more panel passes than the face schedule (the sector route measured
     # Fe 4^3 Sigma tau 69.4 -> 42.0 s).
-    if layout == "face":
+    if layout == "face" and prefer_axis:
         replicated = search("axis")
         if replicated is not None and (best is None or replicated[0] <= best[0]):
             layout, best = "axis", replicated

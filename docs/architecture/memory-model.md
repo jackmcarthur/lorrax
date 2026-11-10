@@ -1131,9 +1131,10 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
    `ppm_tau_kernel.sigma_row_plan`/`sigma_pass_bytes`, `density_band_chunk`), else the
    arrays `LORRAX_MEMORY_TRACE` shows the stage allocating. `minimum_p(deck)` gives
    the smallest square mesh and its binding stage in seconds;
-   `tools/scale_dryrun/dryrun.py` prints the table. Every stage of three one-node
-   runs (MoS₂/hBN N_μ 8160 and 16320, Al₂O₃ 4³ N_μ 6000) prices within 0.86–1.22 of
-   its measured peak (`tests/test_stage_inventory_calibration.py`). At large N_μ the
+   `tools/scale_dryrun/dryrun.py` prints the table. Every stage of five one-node
+   runs (MoS₂/hBN N_μ 8160 and 16320, Al₂O₃ 4³ N_μ 6000 GN-PPM, and tangential on both Σ
+   factor routes) prices within 0.86–1.22 of its measured peak, tangential Σ(τ) within
+   5 % (`tests/test_stage_inventory_calibration.py`). At large N_μ the
    first wall on a 2×2×1 slab is the ζ fit's C_q assembly, `(N_k + n_par)·n_s²·16μ²/P`
    of pair products beside C (1.5 G/P), not Σ(τ): the GN-PPM Σ(τ) node streams rows
    within the fixed tile, its band-complete ψ falling as `1/sqrt(P)`. Tangential Σ(τ)
@@ -1142,8 +1143,11 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
    `mpa.sigma.tangential_panel_route`: the pole columns replicated (factors on one
    mesh axis each, `2·16·Q·μ·n_s·K/sqrt(P)`, the faster route) where they fit, else
    the 2-D face layout (`32·Q·μ·n_s·K/P`) in b-parent × c-column panels; the
-   inventory prices the route it takes (148-atom slab, N_μ 60k, K = N_μ: face
-   panels from P = 36; the pencil binds, P = 121).
+   inventory prices the route it takes. Either way the window's peak is the W(τ) pair's
+   little-group realization, ~11.3 parent tiles `16·b·μ²/P` (`mpa.sigma._W_PAIR_TILES`;
+   the face GEMM's panels are dead by then), plus one relaid axis factor on the replicated
+   route (148-atom slab, N_μ 60k, K = N_μ: Σ(τ) fits from P = 25; the pencil binds,
+   P = 121).
 1. **Budget.** Leave `memory_per_device_gb = 0` for the model's budget, or
    set it lower to cap it (a value above it warns).
 2. **Mesh.** Use a square mesh and price its actual padded carriers.
