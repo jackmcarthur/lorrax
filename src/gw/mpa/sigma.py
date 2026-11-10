@@ -977,6 +977,69 @@ def _tangential_local_price(meta, header, *, mesh_xy, extents=None, factors=1):
     return int(resident), int(workspace)
 
 
+def tangential_panel_route(meta, header, *, mesh_xy, layout, budget, unit, extents=None):
+    """``(layout, best)``: the factor placement and synthesis panel the budget admits.
+
+    ``best`` is ``(cost, -b·c, b, c)`` (``cost``: panel passes per τ node) for
+    ``b`` parents × ``c`` pole columns a panel, or None when none fits beside
+    the resident factors.  ``budget``: the bytes per rank left beside the Σ
+    call's ambient stages; ``unit``: the ledger's U, the bound on one NEW
+    projector panel.  Pure in the shapes, so :func:`_tangential_memory_schedule`
+    and the memory planner (``gw.stage_inventory``) take one route.
+    """
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    nq, kmax = int(header["n_q_irr"]), int(header["Kmax"])
+    sector = extents is not None
+    multiple = combined_divisor(px,py)
+
+    def workspace(b, c, layout):
+        return _tangential_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,
+                                       layout=layout,extents=extents)["workspace_bytes_per_rank"]
+
+    def search(layout):
+        best = None
+        if sector:
+            left = budget - _tangential_resident_bytes(
+                meta, header, mesh_xy=mesh_xy, layout=layout, extents=extents)
+            return (1, -nq*kmax, nq, kmax) if workspace(nq, kmax, layout) <= left else None
+        for b in range(1,nq+1):
+            left = budget - _tangential_resident_bytes(
+                meta, header, mesh_xy=mesh_xy, layout=layout)
+            # The physical logical-U bound applies to every NEW projector
+            # matrix, even when orbit packing pads the endpoint carrier. The
+            # pre-existing full-q Sigma output is accounted separately above.
+            if 16*b*meta.mu_basis.n_packed**2/(px*py) > unit:
+                continue
+            # workspace(j column multiples) = intercept + j*slope; both ends are
+            # ceilinged byte counts, so a non-positive slope carries no width
+            # information. Integer floor division keeps the sizing exact.
+            p1, p2 = workspace(b, multiple, layout), workspace(b, 2*multiple, layout)
+            slope, intercept = p2 - p1, 2*p1 - p2
+            if slope <= 0:
+                continue
+            c = min(kmax, multiple*((left - intercept)//slope))
+            if c < 1:
+                continue
+            cost = ((nq+b-1)//b)*((kmax+c-1)//c)
+            candidate = (cost,-b*c,b,c)
+            if best is None or candidate[:2] < best[:2]:
+                best = candidate
+        return best
+
+    best = search(layout)
+    # The factors do not depend on tau; only the causal weight does. Face
+    # factors make every tau's GEMM a per-q distributed SUMMA that
+    # re-broadcasts the same panels; pole columns replicated (axis
+    # orientation) make it local. Take that placement whenever it needs no
+    # more panel passes than the face schedule (the sector route measured
+    # Fe 4^3 Sigma tau 69.4 -> 42.0 s).
+    if layout == "face":
+        replicated = search("axis")
+        if replicated is not None and (best is None or replicated[0] <= best[0]):
+            layout, best = "axis", replicated
+    return layout, best
+
+
 def _tangential_memory_schedule(meta, header, *, mesh_xy, layout="face", stage="sigma",
                                  linalg=None, extents=None, factors=1):
     """Price the resident factors, size the τ panels from what is left, admit.
@@ -1039,51 +1102,8 @@ def _tangential_memory_schedule(meta, header, *, mesh_xy, layout="face", stage="
                         - admission["aggregate_bytes_per_rank"])
     multiple = combined_divisor(px,py)
 
-    def workspace(b, c, layout):
-        return _tangential_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,
-                                       layout=layout,extents=extents)["workspace_bytes_per_rank"]
-
-    def search(layout):
-        best = None
-        if sector:
-            left = budget - _tangential_resident_bytes(
-                meta, header, mesh_xy=mesh_xy, layout=layout, extents=extents)
-            return (1, -nq*kmax, nq, kmax) if workspace(nq, kmax, layout) <= left else None
-        for b in range(1,nq+1):
-            left = budget - _tangential_resident_bytes(
-                meta, header, mesh_xy=mesh_xy, layout=layout)
-            # The physical logical-U bound applies to every NEW projector
-            # matrix, even when orbit packing pads the endpoint carrier. The
-            # pre-existing full-q Sigma output is accounted separately above.
-            if 16*b*meta.mu_basis.n_packed**2/(px*py) > U:
-                continue
-            # workspace(j column multiples) = intercept + j*slope; both ends are
-            # ceilinged byte counts, so a non-positive slope carries no width
-            # information. Integer floor division keeps the sizing exact.
-            p1, p2 = workspace(b, multiple, layout), workspace(b, 2*multiple, layout)
-            slope, intercept = p2 - p1, 2*p1 - p2
-            if slope <= 0:
-                continue
-            c = min(kmax, multiple*((left - intercept)//slope))
-            if c < 1:
-                continue
-            cost = ((nq+b-1)//b)*((kmax+c-1)//c)
-            candidate = (cost,-b*c,b,c)
-            if best is None or candidate[:2] < best[:2]:
-                best = candidate
-        return best
-
-    best = search(layout)
-    # The factors do not depend on tau; only the causal weight does. Face
-    # factors make every tau's GEMM a per-q distributed SUMMA that
-    # re-broadcasts the same panels; pole columns replicated (axis
-    # orientation) make it local. Take that placement whenever it needs no
-    # more panel passes than the face schedule (the sector route measured
-    # Fe 4^3 Sigma tau 69.4 -> 42.0 s).
-    if layout == "face":
-        replicated = search("axis")
-        if replicated is not None and (best is None or replicated[0] <= best[0]):
-            layout, best = "axis", replicated
+    layout, best = tangential_panel_route(meta, header, mesh_xy=mesh_xy, layout=layout,
+                                          budget=budget, unit=U, extents=extents)
     # Where the replicated columns do not fit, whole parents per rank keep
     # the contraction local and move only W (one tile per node), against the
     # face SUMMA's per-node re-gather of every factor panel.
