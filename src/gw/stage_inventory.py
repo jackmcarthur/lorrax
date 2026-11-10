@@ -147,6 +147,27 @@ class _quiet:
         self._w.__exit__(*exc)
 
 
+def _tangential_route(d: Deck, P: int, *, budget: float) -> dict:
+    """The tangential Sigma call's factor layout and synthesis panel (mpa.sigma's own route)."""
+    from types import SimpleNamespace
+    from gw.mpa.sigma import (_tangential_panel_cost, _tangential_resident_bytes,
+                              tangential_panel_route)
+    from runtime.padding import combined_divisor
+    px, py = _mesh(P)
+    mu = _pad(d.nmu, P)
+    meta = SimpleNamespace(mu_basis=SimpleNamespace(n_packed=mu))
+    header = {"n_q_irr": d.nq, "Kmax": d.n_pole}
+    mesh = SimpleNamespace(shape={"x": px, "y": py}, size=P, axis_names=("x", "y"))
+    unit = C16 * d.nk * (d.ns * mu) ** 2 / P               # tangential_recipe's U
+    layout, best = tangential_panel_route(meta, header, mesh_xy=mesh, layout="face",
+                                          budget=budget, unit=unit)
+    b, c = (1, combined_divisor(px, py)) if best is None else best[2:]
+    return dict(layout=layout, b=b, c=c,
+                resident=_tangential_resident_bytes(meta, header, mesh_xy=mesh, layout=layout),
+                workspace=_tangential_panel_cost(meta, header, b, c, mesh_xy=mesh,
+                                                 layout=layout)["workspace_bytes_per_rank"])
+
+
 def stage_prices(d: Deck, P: int) -> dict:
     """``{stage: ((route, Price), ...)}`` per rank at ``P`` ranks; cheapest route first where
     a stage has two.  Stage names are the report's TIMING rows."""
@@ -233,19 +254,24 @@ def _stage_prices(d: Deck, P: int) -> tuple:
                                          "ppm_tau_kernel.sigma_pass_bytes + window executable "
                                          f"excess 0.04 nk Q M [{trace}]", P)),)
     if d.n_pole:
-        # Tangential Sigma tau (gw.mpa.sigma.SynthesisTau): the pole-residue factor faces read
-        # once per Sigma call, [Q, mu, ns, K] on one mesh axis each (X rows, Y rows), beside
-        # V(q), B and the faces.  Each window executable synthesizes the W(tau) pair on the
-        # irreducible q, [Q, mu, mu] on the face (no full-zone W or G: the Sigma load unfolds
-        # it): the pair, its zero base and the panel updates' copies (6 QM), the two scaled
-        # factor faces b d(tau), then the GN-PPM row pass with its excess.  Al2O3 4^3 P4:
-        # 23.9 GB priced, 24.4 measured (N_mu 6000); 4.8 / 4.3 (N_mu 2400).
-        faces_K = 2 * C16 * d.nq * mu * d.ns * d.n_pole / py
+        # Tangential Sigma tau (gw.mpa.sigma): the pole-residue factors read once per Sigma
+        # call and the W(tau) synthesis in every window executable, on the route the run's own
+        # schedule takes (mpa.sigma.tangential_panel_route: replicated pole columns, factors
+        # on one mesh axis each, where they fit; else the 2-D face layout, 32 Q mu K / P, in
+        # b-parent x c-column panels), priced by its _tangential_resident_bytes /
+        # _tangential_panel_cost.  The window also holds the W(tau) pair on the irreducible q
+        # (2 QM) and the GN-PPM row pass with its excess, which bound the panel from below.
+        # No full-zone G or W is formed (the Sigma load unfolds the pair).
+        # Large-Q memory item (not implemented): synthesizing W(tau) on each row pass's rows
+        # instead of every local row would drop the pair's 2·16·Q·mu²/P to 2·16·Q·R·mu/P.
+        tan = _tangential_route(d, P, budget=BUDGET["local"] - (nV * QM + QM + F))
+        floor = 2 * QM + _sigma_new(d, P, static=False) + 0.04 * d.nk * d.nq * M
         st["Sigma tau sweep (tangential)"] = (("only", _p(
-            "Sigma tau sweep (tangential)", nV * QM + QM + F + faces_K,
-            6 * QM + faces_K + _sigma_new(d, P, static=False) + 0.04 * d.nk * d.nq * M,
-            "V(q) + B + faces + pole-factor faces 2·16·Q·mu·ns·K/P_y",
-            f"W(tau) pair synthesis 6 QM + scaled factor faces + row pass [{trace}]", P)),)
+            "Sigma tau sweep (tangential)", nV * QM + QM + F + tan["resident"],
+            max(tan["workspace"], floor),
+            f"V(q) + B + faces + pole factors ({tan['layout']} layout)",
+            f"synthesis panel b={tan['b']} c={tan['c']} (mpa.sigma._tangential_panel_cost), "
+            f"at least the W pair + row pass [{trace}]", P)),)
     # sigma.exec beyond the sweep (the report's "Sigma other"): the pole synthesis kernel's
     # temp (<= 2.5 QM) and the fit's output beside the pole pair, and the sweep's band-complete
     # psi rows and columns.
