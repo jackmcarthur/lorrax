@@ -308,13 +308,13 @@ def lu_workspace_bytes(mesh, n, dtype) -> int:
     CUDA leg's measured row, 11.2 local panels at its blocks (``lxkit.memory.vendor``). Shapes
     only: no vendor query -- cuSOLVERMp's bufferSize builds a cuBLASMp grid (an NCCL communicator
     split) per call, which deadlocked a rank in libfabric's memory hooks (run30k, 2026-10-19)."""
-    from distrib_la._cusolvermp import lu_blocks
+    from distrib_la._cusolvermp import lu_layout
     from lxkit import leg_for_platform, memory
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
-    mb, nb = lu_blocks(int(n), px, py)
+    side, mb, nb = lu_layout(int(n), px, py)
     item = np.dtype(dtype).itemsize
-    return int(memory.vendor(leg_for_platform("CUDA"), "cusolvermp", "solve_lu", int(n), px * py, item,
-                             unit=(int(n) // px + mb) * nb * item).fixed)
+    return int(memory.vendor(leg_for_platform("CUDA"), "cusolvermp", "solve_lu", side, px * py, item,
+                             unit=(side // px + mb) * nb * item).fixed)
 
 
 @lru_cache(maxsize=128)
@@ -364,10 +364,11 @@ def lu_workspace_query(mesh, n, nrhs, dtype, cap) -> int:
     (``lrx_lu_workspace_bytes``: getrf, the getrs chunk ``cap`` admits, pivots) on the solve's own
     context and descriptors, which sizes and caches the plan the solve then runs; cached per cap.
     Collective: every rank asks at the same point."""
-    from distrib_la._cusolvermp import get_or_init_context, lu_blocks, rhs_block
+    from distrib_la._cusolvermp import get_or_init_context, lu_layout, rhs_layout
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
-    mb, nb = lu_blocks(int(n), px, py)
-    sizes = (int(n), int(nrhs), mb, nb, mb, rhs_block(int(n), int(nrhs), px, py, mb))
+    side, mb, nb = lu_layout(int(n), px, py)
+    cols, nb_b = rhs_layout(int(nrhs), py, mb != side // px)
+    sizes = (side, cols, mb, nb, mb, nb_b)
     return _vendor_query(get_or_init_context(mesh, col_major=False), 'solve_lu', sizes + (int(cap),), dtype)[0]
 
 
