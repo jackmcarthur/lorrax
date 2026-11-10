@@ -1672,7 +1672,7 @@ class Plan:
         state, never in the program: the caller posts before the dispatch and withdraws after."""
         if self.op == "solve_lu" and self.backend == "cusolvermp":
             from distrib_la._cusolvermp import post_getrs_room
-            post_getrs_room(n, nrhs, nbytes)
+            post_getrs_room(n, nrhs, nbytes, mesh=self.mesh)
 
     def _checked_solve(self, call):
         from distrib_la._result_check import checked, matrix_sketch, rhs_sketch, solve_errors

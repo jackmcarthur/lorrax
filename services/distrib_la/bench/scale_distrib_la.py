@@ -301,8 +301,8 @@ def run_case(op, n, dname, mesh, args, nrhs=None):
         row.update(info)
         row["nb"], row["grid"], row["layout"] = layout(op, p.backend, n, px, py, dname)
         if op == "solve_lu" and p.backend == "cusolvermp":
-            from distrib_la._cusolvermp import lu_blocks
-            row["nb"] = lu_blocks(n, px, py)[0]
+            from distrib_la._cusolvermp import lu_layout
+            row["nb"] = lu_layout(n, px, py)[1]
         walls, metrics = [], []
         if op == "eigh":
             A = herm(mesh, n, dt, 5)

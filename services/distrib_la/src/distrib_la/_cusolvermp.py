@@ -263,58 +263,107 @@ _BLOCK_MIN = 128
 #: and 83.5 GB at 40960, and complex128 nrhs=n ran out of device memory from
 #: n=30720 (dlascale pmA/pmB).  At or below the bound one tile per rank stays (the
 #: measured faster layout there, comment above), so no existing call changes.
+#: A relabeled tile with no divisor in [_BLOCK_MIN, _BLOCK_MAX] is padded at its
+#: end (lu_layout), never left at one tile: N_mu 60012 on 6x6 (tile 10002 =
+#: 2*3*1667) fell back to one tile and its getrs asked 83.5 GB/rank.
 _LU_RELABEL_LOCAL_MIN = 8192
 
 
-def rhs_block(n: int, nrhs: int, Px: int, Py: int, mb: int) -> int:
-    """The RHS column block ``nb_b``: one block per process column at one tile per
-    rank; a divisor of the local RHS width <= :data:`_BLOCK_MAX` when the LU is
-    relabeled, so the handler can solve the RHS in chunks whose getrs workspace
-    fits (cpp/cusolvermp/batched_solve_lu_ffi.cc, getrs_chunking).  Columns are
-    independent and read and written through the same map: no movement."""
+def _padded_tile(local: int) -> int:
+    """The smallest tile edge ``>= local`` with a divisor in [:data:`_BLOCK_MIN`,
+    :data:`_BLOCK_MAX`]; at most ``_BLOCK_MIN - 1`` more (a multiple of 128 is one)."""
+    return next(m for m in range(local, local + _BLOCK_MIN)
+                if _largest_block(m) >= _BLOCK_MIN)
+
+
+def lu_layout(n: int, Px: int, Py: int) -> tuple[int, int, int]:
+    """``(side, mb, nb)`` of the LU descriptors for an ``n x n`` operand.
+
+    One tile per rank (``side = n``) on a non-square mesh, at 1x1, for tiles up to
+    :data:`_BLOCK_MAX`, and on 2x2 up to :data:`_LU_RELABEL_LOCAL_MIN`.  Otherwise
+    a square relabeled block: the largest divisor <= :data:`_BLOCK_MAX` of the
+    tile, padded first to :func:`_padded_tile` where it has none in
+    [:data:`_BLOCK_MIN`, :data:`_BLOCK_MAX`] (10002 -> 10004, block 244).  Each
+    rank pads its own tile at its end (:func:`_pad_tile`), so the solve sees
+    ``Pi (A + I_pad) Pi^T``: no data movement, X's live rows in place.  At one
+    tile per rank on 4x4 (n 30000, run30k, 2026-10-19) getrf/getrs ran in 4
+    serialized 7500-wide panel steps across nodes and the RHS could not be
+    chunked: SMs idle."""
+    local = n // Px
+    if Px != Py or Px == 1 or local <= _BLOCK_MAX or (Px < 4 and local <= _LU_RELABEL_LOCAL_MIN):
+        return n, local, n // Py
+    tile = _padded_tile(local)
+    block = _largest_block(tile)
+    return Px * tile, block, block
+
+
+def rhs_layout(nrhs: int, Py: int, relabeled: bool) -> tuple[int, int]:
+    """``(cols, nb_b)``: the RHS width the solve runs at and its column block.  One block
+    per process column at one tile per rank; relabeled, a divisor of the local width
+    <= :data:`_BLOCK_MAX`, the local width padded like A's tile where it has none in
+    [:data:`_BLOCK_MIN`, :data:`_BLOCK_MAX`], so the handler can solve the RHS in chunks
+    whose getrs workspace fits (cpp/cusolvermp/batched_solve_lu_ffi.cc, getrs_chunking).
+    Columns are independent; padded columns are zero and dropped."""
     local = nrhs // Py
-    return local if mb == n // Px else largest_divisor(local, _BLOCK_MAX)
+    if not relabeled or local <= _BLOCK_MAX:
+        return nrhs, local
+    tile = _padded_tile(local)
+    return Py * tile, _largest_block(tile)
 
 
-def _announce_lu(kind, mesh, nq, n, nrhs, mb_a, nb_a, mb_b=None, nb_b=None):
+def _pad_tile(local, rows: int, cols: int, *, eye: bool):
+    """Inside a shard_map: the local ``(..., a, b)`` tile zero-padded at its end to
+    ``(..., rows, cols)``; with ``eye``, ones on the padded diagonal of the ranks on
+    the mesh diagonal (``x == y``), the ranks that hold A's diagonal."""
+    a, b = int(local.shape[-2]), int(local.shape[-1])
+    if (a, b) == (rows, cols):
+        return local
+    out = jnp.pad(local, [(0, 0)] * (local.ndim - 2) + [(0, rows - a), (0, cols - b)])
+    if eye:
+        r = jax.lax.broadcasted_iota(jnp.int32, (rows, cols), 0)
+        c = jax.lax.broadcasted_iota(jnp.int32, (rows, cols), 1)
+        on = jax.lax.axis_index("x") == jax.lax.axis_index("y")
+        out = out + jnp.where((r == c) & (r >= a) & on, 1, 0).astype(out.dtype)
+    return out
+
+
+def _announce_lu(kind, mesh, nq, n, side, nrhs, mb_a, nb_a, mb_b=None, nb_b=None, cols=None):
     """One rank-0 line per distributed LU program built: its descriptors, so a run's log shows
-    the layout it solved at (run30k 2026-10-19: a stalled Dyson LU printed none)."""
+    the layout it solved at (run30k 2026-10-19: a stalled Dyson LU printed none).  A warning
+    where a tile above :data:`_LU_RELABEL_LOCAL_MIN` still solves at one tile per rank (only a
+    non-square mesh now): its getrf/getrs workspaces grow with the tile."""
     if int(jax.process_index()) != 0:
         return
     Px, Py = (int(v) for v in _validate_mesh(mesh))
     rhs = ("" if nb_b is None else
-           f"; B {n}x{nrhs} mb_b {mb_b} nb_b {nb_b}, {(nrhs // Py) // max(1, nb_b)} RHS block(s) per rank "
-           "(getrs chunks them within the room posted for the solve, else 2 GiB)")
-    relabel = "relabeled block-cyclic" if (mb_a, nb_a) != (n // Px, n // Py) else "one tile per rank"
+           f"; B {n}x{nrhs} at {side}x{cols}, mb_b {mb_b} nb_b {nb_b}, {(cols // Py) // max(1, nb_b)} "
+           "RHS block(s) per rank (getrs chunks them within the room posted for the solve, else 2 GiB)")
+    one = (mb_a, nb_a) == (side // Px, side // Py)
+    pad = f", tiles padded {n // Px} -> {side // Px}" if side != n else ""
     _LOG.debug(f"  [distrib_la.cusolvermp] {kind} {nq} x {n}^2 on the {Px}x{Py} mesh: A mb {mb_a} nb {nb_a} "
-               f"({relabel}){rhs}.")
+               f"({'one tile per rank' if one else 'relabeled block-cyclic'}{pad}){rhs}.")
+    if one and n // Px > _LU_RELABEL_LOCAL_MIN:
+        _LOG.warning(f"[distrib_la.cusolvermp] {kind} of {nq} x {n}^2 on the {Px}x{Py} mesh solves at one "
+                     f"{n // Px}x{n // Py} tile per rank: its getrf/getrs workspace grows with the tile "
+                     "(83.5 GB/rank at tile 10002) and may not fit; use a square mesh.")
 
 
-def post_getrs_room(n: int, nrhs: int, nbytes) -> bool:
+def post_getrs_room(n: int, nrhs: int, nbytes, *, mesh: Mesh) -> bool:
     """Post ``nbytes`` per rank (``None`` withdraws it) as the room the getrs chunks of a fused
-    ``n x nrhs`` solve may take beside everything else its program holds: the handler solves in
-    the widest chunks whose workspace fits the ranks' smallest figure, 2 GiB without one
-    (cpp/cusolvermp/batched_solve_lu_ffi.cc, getrs_chunk).  Run-time state read by the next solve
-    of that shape, never an attribute, so the compiled program does not carry the room.  False
-    where the loaded library predates the entry (it keeps 2 GiB)."""
+    ``n x nrhs`` solve on ``mesh`` may take beside everything else its program holds: the handler
+    solves in the widest chunks whose workspace fits the ranks' smallest figure, 2 GiB without one
+    (cpp/cusolvermp/batched_solve_lu_ffi.cc, getrs_chunk).  Posted at the padded shape the
+    handler sees (:func:`lu_layout`).  Run-time state read by the next solve of that shape, never
+    an attribute, so the compiled program does not carry the room.  False where the loaded
+    library predates the entry (it keeps 2 GiB)."""
     fn = getattr(loader.get_lib("CUDA"), "lrx_lu_getrs_room", None)
     if fn is None:
         return False
+    Px, Py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    side, mb, _ = lu_layout(int(n), Px, Py)
+    cols, _ = rhs_layout(int(nrhs), Py, mb != side // Px)
     fn.argtypes, fn.restype = (ctypes.c_int64,) * 3, ctypes.c_int
-    return fn(int(n), int(nrhs), -1 if nbytes is None else max(0, int(nbytes))) == 0
-
-
-def lu_blocks(n: int, Px: int, Py: int) -> tuple[int, int]:
-    """``(mb, nb)`` of the LU descriptors: one tile per rank, or a square relabeled
-    block on a square mesh from 4x4 up, or where the local edge exceeds
-    :data:`_LU_RELABEL_LOCAL_MIN` (the 2x2 bound, measured on one node). At one tile
-    per rank on 4x4 (n 30000, run30k, 2026-10-19) getrf/getrs ran in 4 serialized
-    7500-wide panel steps across nodes and the RHS could not be chunked: SMs idle."""
-    one = (n // Px, n // Py)
-    if Px != Py or Px == 1 or (Px < 4 and n // Px <= _LU_RELABEL_LOCAL_MIN):
-        return one
-    block = _largest_block(n // Px)
-    return (block, block) if block >= _BLOCK_MIN else one
+    return fn(side, cols, -1 if nbytes is None else max(0, int(nbytes))) == 0
 
 
 def _largest_block(local: int) -> int:
@@ -345,8 +394,7 @@ def solve_layout(n: int, p: int) -> tuple[int, int]:
     block = _largest_block(local)
     if local <= _BLOCK_MAX or block >= _BLOCK_MIN:
         return n, block
-    padded = next(m for m in range(local + 1, local + _BLOCK_MIN + 1)
-                  if _largest_block(m) >= _BLOCK_MIN)
+    padded = _padded_tile(local)
     return p * padded, _largest_block(padded)
 
 
@@ -634,6 +682,7 @@ class CusolverMpBatchedLU:
     ipiv: jax.Array
     mesh: Mesh
     n: int
+    side: int          # the padded edge the factors live at (lu_layout); n when unpadded
     mb: int
     nb: int
     nbatch: int
@@ -661,16 +710,16 @@ def batched_distributed_getrf(
 
     loader.get_lib("CUDA")
     ctx_key = context_key(mesh, col_major=False)
-    mb, nb = lu_blocks(n, Px, Py)
-    ipiv_len = ipiv_local_len(n, Px, mb)
-    key = ("getrf", _mesh_key(mesh), A.dtype, nq, n, mb, nb,
+    side, mb, nb = lu_layout(n, Px, Py)
+    ipiv_len = ipiv_local_len(side, Px, mb)
+    key = ("getrf", _mesh_key(mesh), A.dtype, nq, n, side, mb, nb,
            int(ctx_key))
     jit_getrf = _JIT_CACHE.get(key)
     if jit_getrf is None:
-        _announce_lu("getrf", mesh, nq, n, None, mb, nb)
-        LU_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
+        _announce_lu("getrf", mesh, nq, n, side, None, mb, nb)
+        LU_local_T = jax.ShapeDtypeStruct((nq, side // Py, side // Px), A.dtype)
         ipiv_local = jax.ShapeDtypeStruct((nq, ipiv_len), jnp.int64)
-        attrs = dict(nq=nq, n=n, mb=mb, nb=nb,
+        attrs = dict(nq=nq, n=side, mb=mb, nb=nb,
                      ipiv_len=ipiv_len, ctx_key=int(ctx_key))
 
         @partial(shard_map, mesh=mesh,
@@ -678,7 +727,8 @@ def batched_distributed_getrf(
                  out_specs=(P(None, "y", "x"), P(None, ("x", "y"))),
                  check_vma=False)
         def _getrf(local_A):
-            local_A_T = jnp.transpose(local_A, (0, 2, 1))
+            local_A_T = _pad_tile(jnp.transpose(local_A, (0, 2, 1)),
+                                  side // Py, side // Px, eye=True)
             return jax.ffi.ffi_call(
                 _GETRF_TARGET, (LU_local_T, ipiv_local),
                 input_output_aliases={0: 0},
@@ -689,7 +739,7 @@ def batched_distributed_getrf(
 
     LU_raw_T, ipiv = jit_getrf(A)
     return CusolverMpBatchedLU(
-        raw=LU_raw_T, ipiv=ipiv, mesh=mesh, n=n, mb=mb, nb=nb,
+        raw=LU_raw_T, ipiv=ipiv, mesh=mesh, n=n, side=side, mb=mb, nb=nb,
         nbatch=nq)
 
 
@@ -716,18 +766,21 @@ def batched_distributed_getrs(
 
     loader.get_lib("CUDA")
     ctx_key = context_key(mesh, col_major=False)
-    mb_b, nb_b = LU.mb, rhs_block(LU.n, nrhs, Px, Py, LU.mb)
-    ipiv_len = ipiv_local_len(LU.n, Px, LU.mb)
-    key = ("getrs", _mesh_key(mesh), B.dtype, LU.nbatch, LU.n, nrhs,
+    side = LU.side
+    cols, nb_b = rhs_layout(nrhs, Py, LU.mb != side // Px)
+    mb_b = LU.mb
+    ipiv_len = ipiv_local_len(side, Px, LU.mb)
+    key = ("getrs", _mesh_key(mesh), B.dtype, LU.nbatch, LU.n, side, nrhs, cols,
            LU.mb, LU.nb, mb_b, nb_b, int(ctx_key))
     jit_getrs = _JIT_CACHE.get(key)
     if jit_getrs is None:
-        _announce_lu("getrs", mesh, LU.nbatch, LU.n, nrhs, LU.mb, LU.nb, mb_b, nb_b)
+        _announce_lu("getrs", mesh, LU.nbatch, LU.n, side, nrhs, LU.mb, LU.nb, mb_b, nb_b, cols)
         X_local_T = jax.ShapeDtypeStruct(
-            (LU.nbatch, nrhs // Py, LU.n // Px), B.dtype)
-        attrs = dict(nq=LU.nbatch, n=LU.n, nrhs=nrhs,
+            (LU.nbatch, cols // Py, side // Px), B.dtype)
+        attrs = dict(nq=LU.nbatch, n=side, nrhs=cols,
                      mb_a=LU.mb, nb_a=LU.nb, mb_b=mb_b, nb_b=nb_b,
                      ipiv_len=ipiv_len, ctx_key=int(ctx_key))
+        live = (LU.n // Px, nrhs // Py)
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(P(None, "y", "x"), P(None, ("x", "y")),
@@ -735,12 +788,13 @@ def batched_distributed_getrs(
                  out_specs=P(None, "x", "y"),
                  check_vma=False)
         def _getrs(local_LU, local_ipiv, local_B):
-            local_B_T = jnp.transpose(local_B, (0, 2, 1))
+            local_B_T = _pad_tile(jnp.transpose(local_B, (0, 2, 1)),
+                                  cols // Py, side // Px, eye=False)
             X_T = jax.ffi.ffi_call(
                 _GETRS_TARGET, X_local_T,
                 input_output_aliases={2: 0},
             )(local_LU, local_ipiv, local_B_T, **attrs)
-            return jnp.transpose(X_T, (0, 2, 1))
+            return jnp.transpose(X_T, (0, 2, 1))[:, :live[0], :live[1]]
 
         jit_getrs = jax.jit(_getrs, donate_argnums=(2,))
         _JIT_CACHE[key] = jit_getrs
@@ -1005,27 +1059,34 @@ def batched_distributed_solve_lu(
     loader.get_lib("CUDA")
     ctx_key = context_key(mesh, col_major=False)
 
-    mb_a, nb_a = lu_blocks(n, Px, Py)
-    mb_b, nb_b = mb_a, rhs_block(n, nrhs, Px, Py, mb_a)
+    side, mb_a, nb_a = lu_layout(n, Px, Py)
+    cols, nb_b = rhs_layout(nrhs, Py, mb_a != side // Px)
+    mb_b = mb_a
 
     key = ("solve_lu", _mesh_key(mesh), A.dtype,
-           nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, int(ctx_key))
+           nq, n, side, nrhs, cols, mb_a, nb_a, mb_b, nb_b, int(ctx_key))
     jit_solve = _JIT_CACHE.get(key)
     if jit_solve is None:
-        _announce_lu("solve_lu", mesh, nq, n, nrhs, mb_a, nb_a, mb_b, nb_b)
-        X_local_T = jax.ShapeDtypeStruct((nq, nrhs // Py, n // Px), B.dtype)
-        LU_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
-        attrs = dict(nq=nq, n=n, nrhs=nrhs,
+        _announce_lu("solve_lu", mesh, nq, n, side, nrhs, mb_a, nb_a, mb_b, nb_b, cols)
+        X_local_T = jax.ShapeDtypeStruct((nq, cols // Py, side // Px), B.dtype)
+        LU_local_T = jax.ShapeDtypeStruct((nq, side // Py, side // Px), A.dtype)
+        attrs = dict(nq=nq, n=side, nrhs=cols,
                      mb_a=mb_a, nb_a=nb_a, mb_b=mb_b, nb_b=nb_b,
                      ctx_key=int(ctx_key))
+        live = (n // Px, nrhs // Py)
 
         @partial(shard_map, mesh=mesh,
                  in_specs=(P(None, "x", "y"), P(None, "x", "y")),
                  out_specs=P(None, "x", "y"),
                  check_vma=False)
         def _solve(local_A, local_B):
-            local_A_T = jnp.transpose(local_A, (0, 2, 1))
-            local_B_T = jnp.transpose(local_B, (0, 2, 1))
+            # A padded tile carries the identity on its padded diagonal and B
+            # zero rows and columns there (lu_layout), so X's live block is
+            # A's solution and its padded rows are zero.
+            local_A_T = _pad_tile(jnp.transpose(local_A, (0, 2, 1)),
+                                  side // Py, side // Px, eye=True)
+            local_B_T = _pad_tile(jnp.transpose(local_B, (0, 2, 1)),
+                                  cols // Py, side // Px, eye=False)
             # getrf and getrs work in place: the factors overwrite A and X
             # overwrites B, both declared, so XLA copies an operand only
             # while something still reads it.
@@ -1033,7 +1094,7 @@ def batched_distributed_solve_lu(
                 _SOLVE_LU_TARGET, (X_local_T, LU_local_T),
                 input_output_aliases={0: 1, 1: 0},
             )(local_A_T, local_B_T, **attrs)
-            return jnp.transpose(X_T, (0, 2, 1))
+            return jnp.transpose(X_T, (0, 2, 1))[:, :live[0], :live[1]]
 
         jit_solve = jax.jit(_solve, donate_argnums=(0, 1))
         _JIT_CACHE[key] = jit_solve
