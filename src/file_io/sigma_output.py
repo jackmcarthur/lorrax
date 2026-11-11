@@ -1844,6 +1844,37 @@ def write_sigma_omega_h5(
 	return abs_path
 
 
+#: On a run with ``onsite_breit = true`` the transverse direct-field slot
+#: holds the on-site Breit matrix H_OS (on a scalar deck it holds H_OS alone);
+#: this attribute, the setup's canonical provenance JSON, says so on
+#: ``hartree_transverse_kij_ev`` and on the aggregate ``hartree_kij_ev``.
+ONSITE_BREIT_PROVENANCE_ATTR = "onsite_breit_provenance"
+
+
+def stamp_onsite_breit_provenance_h5(filepath, provenance):
+	"""Stamp an existing ``sigma_mnk.h5``'s direct field as including H_OS.
+
+	Adds :data:`ONSITE_BREIT_PROVENANCE_ATTR` to ``hartree_transverse_kij_ev``
+	and ``hartree_kij_ev``; values are not touched.  Refuses a file without
+	the component-aware transverse dataset (the term would then be invisible
+	to a reader).  CALL ON RANK 0 ONLY, with a barrier after (h5py, like
+	:func:`append_qsgw_datasets_h5`).
+	"""
+	abs_path = os.path.abspath(filepath)
+	text = str(provenance)
+	if not text:
+		raise ValueError(
+			"stamp_onsite_breit_provenance_h5: empty on-site Breit provenance")
+	with h5py.File(abs_path, "a") as h5:
+		if "hartree_transverse_kij_ev" not in h5:
+			raise ValueError(
+				f"{abs_path}: on-site Breit term is on but the file has no "
+				"hartree_transverse_kij_ev to carry it")
+		for name in ("hartree_kij_ev", "hartree_transverse_kij_ev"):
+			if name in h5:
+				h5[name].attrs[ONSITE_BREIT_PROVENANCE_ATTR] = text
+
+
 
 
 

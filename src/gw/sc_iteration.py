@@ -543,11 +543,22 @@ class SCExactHartree:
     Keeping the scalar and transverse pieces separate preserves
     ``sigma_mnk.h5``'s decomposition; :attr:`total` is the only combination
     that enters the Hamiltonian.
+
+    ON-SITE BREIT (``onsite_breit = true``, design note ``ONSITE_INCODE.md``
+    section 4).  ``transverse_dft`` already CONTAINS H_OS[D_i]
+    (``H_T + H_OS`` on a bispinor deck, ``H_OS`` alone on a scalar deck).
+    ``onsite_dft`` is that on-site matrix alone, ``(nk_loop, nb, nb)`` Ry,
+    replicated, on the same k-set as the others, for the debug dump and the
+    log only; :attr:`total` does NOT add it again.  ``onsite_record`` is the
+    map's ``gw.hartree.OnsiteBreitField`` with ``matrix`` and
+    ``projections`` dropped (host-side D, h, pieces, setup, report).
     """
 
     scalar_dft: jax.Array
     transverse_dft: jax.Array | None
     efermi_ry: float
+    onsite_dft: jax.Array | None = None
+    onsite_record: object | None = None
 
     @property
     def total(self):
@@ -716,6 +727,10 @@ def _sc_output_tables_on_loop_kset(
                     kstar.select(exact_hartree_full.transverse_dft)
                     if exact_hartree_full.transverse_dft is not None
                     else None),
+                onsite_dft=(
+                    kstar.select(exact_hartree_full.onsite_dft)
+                    if exact_hartree_full.onsite_dft is not None
+                    else None),
             )
         )
         # A (nb,) head diagonal holds for every k; (nk, nb) ones are selected.
@@ -733,7 +748,7 @@ def _sc_output_tables_on_loop_kset(
             "loop k-set")
     if exact_loop is not None:
         expected_bands = tuple(int(n) for n in np.shape(delta_h_qp)[-2:])
-        for name in ("scalar_dft", "transverse_dft"):
+        for name in ("scalar_dft", "transverse_dft", "onsite_dft"):
             value = getattr(exact_loop, name)
             if value is None:
                 continue
@@ -1994,6 +2009,11 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
     pristine DFT-basis ``kin_ion_dft``.
 
     No mixing: straight rho_out feedback, by owner ruling (2026-08-04).
+
+    With ``onsite_breit = true`` the on-site Breit matrix H_OS[D_i] is built
+    from the same full-BZ ``U_qp`` and ``occupations_full`` and lands in the
+    transverse slot (``H_T + H_OS``, or ``H_OS`` alone on a scalar deck);
+    see :class:`SCExactHartree`.
     """
     from gw.efermi import occupied_band_count
     from gw.qsgw_density import rho_from_wfns
@@ -2006,6 +2026,8 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
                                     local_potential_operator,
                                     sweep_matrix_elements)
     from psp.dft_operators import padded_gvectors
+    from gw.hartree import onsite_breit_field, onsite_breit_setup_for
+    from .sigma_dispatch import onsite_breit_into_transverse
 
     # ONE resident ψ(G) serves the density AND the sweep: the QP window
     # [b0, b3), read by the loader directly at its band-sharded carrier.
@@ -2033,6 +2055,13 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
                 if inputs.sym.parent_k_domain == "full_bz" else
                 np.asarray(inputs.wfn.kweights, dtype=np.float64))
     kweights = kweights / kweights.sum()
+    # The on-site Breit D (below) is a plain full-BZ sum: keep the FULL-BZ
+    # rotation (nk_full, nb, nb) at band_rotation_spec and the full-BZ
+    # occupations on the density's own band cut [0, nb_logical) (b0 = 0,
+    # run_sc_driver; the tail above it is refused just below by
+    # _density_window_occupations) before the parent-row selection.
+    U_full_bz = U_qp
+    occ_full_bz = jnp.asarray(occupations_full)[:, :nb_logical]
     rows = jnp.asarray(inputs.sym.kirr_fullids, dtype=jnp.int32)
     U_qp = jnp.take(U_qp, rows, axis=0)
     occ = jnp.take(jnp.asarray(occupations_full), rows, axis=0)
@@ -2162,10 +2191,39 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
     H_scalar = physical_hartree(H_scalar, 'scalar')
     if H_transverse is not None:
         H_transverse = physical_hartree(H_transverse, 'transverse')
+
+    # ON-SITE BREIT, H_OS[D_i] (design note ONSITE_INCODE.md sections 2-4):
+    # from THIS map's orbitals and occupations, the same (U, f) as rho_i and
+    # J_i above, on the full BZ at the logical window; straight feedback, no
+    # mixing; kin_ion_dft stays pristine, so nothing is counted twice.
+    H_onsite = onsite_record = None
+    # Sigma carries the bare TT exchange on every bispinor route (gw_jax
+    # refuses bispinor = true without the transverse bundle), never otherwise.
+    setup = onsite_breit_setup_for(
+        inputs.config, inputs.wfn, input_dir=inputs.input_dir,
+        tt_exchange=bool(inputs.config.bispinor))
+    if setup is not None:
+        # P[k,a,n] = <phi~_a(k)|psi_nk>                           (DFT bands, full BZ)
+        # D[a,b]   = sum_k w_k sum_i f_ik (P U)_ai conj((P U)_bi)  (U = <DFT_n|QP_i>, f of QP_i)
+        # h        = h^dir[D] + h^x[D]                             (section 3 keys)
+        # H_OS[k]  = P[k]^dagger h P[k]                            (Ry, DFT basis)
+        field = onsite_breit_field(
+            inputs.wfn, inputs.sym, setup,
+            band_range=inputs.band_slices.sigma_range, mesh=inputs.mesh_xy,
+            U=U_full_bz, occupations=occ_full_bz, print_fn=inputs.print_fn)
+        H_onsite = field.matrix
+        # H_T <- H_T + H_OS   (bispinor, paw)   or   H_T <- H_OS   (scalar, onsite_only)
+        H_transverse = onsite_breit_into_transverse(
+            H_transverse, H_onsite,
+            like=H_scalar if H_transverse is None else H_transverse,
+            double_counting=setup.double_counting)
+        onsite_record = field._replace(matrix=None, projections=None)
     return SCExactHartree(
         scalar_dft=H_scalar,
         transverse_dft=H_transverse,
-        efermi_ry=float(efermi_ry))
+        efermi_ry=float(efermi_ry),
+        onsite_dft=H_onsite,
+        onsite_record=onsite_record)
 
 
 def _residency_census(named) -> None:
@@ -3315,6 +3373,20 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             _sanity.check_finite(
                 "H_T[SC] transverse", exact_hartree_dft.transverse_dft,
                 print_fn=inputs.print_fn)
+        if exact_hartree_dft.onsite_dft is not None:
+            _sanity.check_finite(
+                "H_OS[SC] on-site Breit", exact_hartree_dft.onsite_dft,
+                print_fn=inputs.print_fn)
+            _onsite_setup = exact_hartree_dft.onsite_record.setup
+            _record_sc(
+                inputs,
+                f"    density-SC: H_T includes the on-site Breit term "
+                f"H_OS[D] of iteration {state.iteration} orbitals "
+                f"(max|H_OS| = "
+                f"{float(jnp.max(jnp.abs(exact_hartree_dft.onsite_dft))) * RYD_TO_EV * 1.0e3:.4f}"
+                f" meV; double_counting = {_onsite_setup.double_counting}, "
+                f"exchange = {_onsite_setup.exchange}, projector = "
+                f"{_onsite_setup.projector})")
         log.info(
             f"    density-SC: rebuilt exact scalar"
             f"{' + transverse' if exact_hartree_dft.transverse_dft is not None else ''} "
@@ -3962,6 +4034,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
              ("H_T[SC] transverse", (
                  exact_hartree_dft.transverse_dft
                  if exact_hartree_dft is not None else None)),
+             ("H_OS[SC] on-site Breit", (
+                 exact_hartree_dft.onsite_dft
+                 if exact_hartree_dft is not None else None)),
              # THE ω-CUBE.  (nω, nk, nb, nb) and the largest object the
              # loop carries; it is the one whose retention across
              # iterations ``residual_fn`` now drops, so its measured
@@ -4461,6 +4536,41 @@ def _dump_sc_sigma_lorentz(inputs: SCInputs, state_out: SCState,
                "(CC, CT+TC, TT; input QP basis, eV)")
 
 
+def _dump_sc_onsite_breit(inputs: SCInputs, state_out: SCState,
+                          *, call_index: int, role: str) -> None:
+    """Persist this map's on-site Breit matrix, D, h and moments.
+
+    ``onsite_breit_iterNNNN.h5`` beside ``sigma_lorentz_iterNNNN.h5``, under
+    the same switch (``sigma_lorentz_debug_output``).  ``dH_kij`` is the
+    matrix that entered H: H_OS[D_i], DFT basis, loop k-set, logical window
+    (``gw.hartree.OnsiteBreitField`` record for D, h, pieces and keys).
+    Every rank joins the gather and the writer.
+    """
+    if not inputs.config.debug.sigma_lorentz_debug_output:
+        return
+    exact = state_out.outputs.exact_hartree_dft
+    if exact is None or exact.onsite_dft is None:
+        return
+    from common.collectives import gather_to_host
+    from file_io.onsite_breit_output import write_onsite_breit_h5
+
+    dH_kij_ry = np.asarray(gather_to_host(exact.onsite_dft))
+    kpoints = np.asarray(inputs.sym.unfolded_kpts)
+    if inputs.kstar is not None and not inputs.kstar.is_identity:
+        kpoints = np.asarray(gather_to_host(
+            inputs.kstar.select(jnp.asarray(kpoints))))
+    path = os.path.join(
+        inputs.input_dir, f"onsite_breit_iter{int(call_index):04d}.h5")
+    write_onsite_breit_h5(
+        path, field=exact.onsite_record, dH_kij_ry=dH_kij_ry,
+        kpoints=kpoints, kset=state_out.outputs.sigma_result.kset,
+        band_start_1based=int(inputs.band_slices.b0) + 1,
+        attrs={"call_index": int(call_index), "role": str(role),
+               "basis": "dft", "driver": "sc_iteration"})
+    _record_sc(inputs, f"  SC on-site Breit: {path} "
+               "(H_OS entering H, D, h; DFT basis)")
+
+
 def _band_ranges(mask, *, band_offset: int) -> str:
     """Format bands selected at every k as compact 1-based ranges."""
     mask = np.asarray(mask, dtype=bool)
@@ -4867,6 +4977,8 @@ def _write_sc_eqp_snapshot(
     rotation_path = _dump_sc_rotation(
         inputs, state_out, call_index=call_index)
     _dump_sc_sigma_lorentz(
+        inputs, state_out, call_index=call_index, role=role)
+    _dump_sc_onsite_breit(
         inputs, state_out, call_index=call_index, role=role)
 
     if role != "trial" and not verdict.converged:
@@ -6775,11 +6887,19 @@ def run_sc_driver(
         inputs, state_final, call_index=max(len(rms_history) - 1, 0),
         eqp_paths=(config.paths.eqp0_file, config.paths.eqp1_file))
     qp_energies_ry = np.asarray(state_final.map_output_ev) / RYD_TO_EV
+    # The on-site Breit term rides the transverse slot on both SC routes
+    # (density-SC rebuild, or the fixed-density seam in sigma_dispatch);
+    # the per-run cached setup names it on the file.
+    from .hartree import onsite_breit_setup_for
+    onsite_setup = onsite_breit_setup_for(
+        config, wfn, input_dir=input_dir, tt_exchange=bool(config.bispinor))
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
         state_final, config=config, meta=meta, mesh_xy=mesh_xy,
         input_dir=input_dir, sym=sym,
         exact_hartree_dft=state_final.outputs.exact_hartree_dft,
         sigma_basis_U=state_final.outputs.sigma_basis_U,
+        onsite_breit_provenance=(
+            None if onsite_setup is None else onsite_setup.provenance),
         print_fn=print_fn,
     )
 
@@ -7047,9 +7167,14 @@ def dump_sigma_omega_h5_final(
     sym=None,
     exact_hartree_dft: SCExactHartree | None = None,
     sigma_basis_U=None,
+    onsite_breit_provenance: str | None = None,
     print_fn: Callable = print,
 ) -> str | None:
     """Write the converged ``sigma_mnk.h5`` once after SC convergence.
+
+    ``onsite_breit_provenance`` (the on-site Breit setup's provenance, or
+    None when the term is off) is stamped on the transverse direct field,
+    which then includes H_OS.
 
     Pulls the loop-k-set on-shell Σ_c from
     ``state.outputs.sigma_result``
@@ -7155,6 +7280,10 @@ def dump_sigma_omega_h5_final(
         print_fn=print_fn,
     )
     log.debug(f"  Σ_c(ω) tensor: {path}")
+    if onsite_breit_provenance is not None:
+        from .sigma_dispatch import stamp_onsite_breit_sigma_h5
+        stamp_onsite_breit_sigma_h5(path, onsite_breit_provenance,
+                                    print_fn=print_fn)
     # THE QSGW CUBE, WRITTEN WHERE IT IS STILL IN ITS OWN BASIS.  Under
     # self-consistency ``sigma_xc_kij_ry`` is Σ_x + Σ_c^QSGW built from
     # ``wfns_qp``, i.e. the QP basis — the same basis the Σ_c(ω) cube

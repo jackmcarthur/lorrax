@@ -559,6 +559,127 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym):
 
 
 # ---------------------------------------------------------------------------
+# On-site Breit term in the transverse direct-field slot
+# ---------------------------------------------------------------------------
+
+_ONSITE_BREIT_INTO_TRANSVERSE: dict = {}
+
+
+def onsite_breit_into_transverse(h_transverse, h_onsite, *, like,
+                                 double_counting: str):
+    """The transverse direct-field slot with the on-site Breit matrix in it.
+
+    Design note ``ONSITE_INCODE.md`` sections 3 and 4 (breit salvage)::
+
+        H_T <- H_T + H_OS[D]    bispinor deck, onsite_breit_double_counting = paw
+        H_T <- H_OS[D]          scalar deck, onsite_only (no smooth alpha.A in the run)
+
+    The one combiner for every caller (the one-shot / fixed-density seam
+    :func:`_sigma_hartree_fields` and the density-SC rebuild
+    ``sc_iteration.rebuild_hartree_dft_basis``).
+
+    Parameters
+    ----------
+    h_transverse : jax.Array or None, (nk, nb, nb) complex, Ry
+        The smooth transverse Hartree ``<m|alpha.A[J]|n>``; ``None`` on a
+        scalar deck.  Any sharding.
+    h_onsite : jax.Array, (nk, nb, nb) complex, Ry
+        ``gw.hartree.OnsiteBreitField.matrix``: DFT band basis, full BZ in
+        ``sym.unfolded_kpts`` order, the same band window as ``like``,
+        replicated ``P(None, None, None)``.
+    like : jax.Array, (nk, nb, nb)
+        The direct-field matrix whose sharding and dtype the result takes:
+        ``h_transverse`` itself, or the scalar V_H on a scalar deck.
+    double_counting : str
+        The resolved ``onsite_breit_double_counting`` (``setup.double_counting``):
+        ``paw`` needs a smooth transverse field, ``onsite_only`` must have none.
+
+    Returns
+    -------
+    jax.Array, (nk, nb, nb), Ry, at ``like.sharding`` and ``like.dtype``.
+
+    One cached jit per (sharding, dtype, arity) with explicit
+    ``out_shardings``: an eager ``+`` of a replicated and a band-sharded
+    operand leaves the output layout to the partitioner (QUALITY_PATTERNS #4).
+    """
+    if (double_counting == "paw") != (h_transverse is not None):
+        raise RuntimeError(
+            f"on-site Breit: onsite_breit_double_counting = {double_counting} "
+            f"but the run's smooth transverse field is "
+            f"{'absent' if h_transverse is None else 'present'}; the key "
+            "pairing (gw.hartree.onsite_breit_setup_for) and the direct-field "
+            "owner disagree")
+    if tuple(h_onsite.shape) != tuple(like.shape):
+        raise ValueError(
+            f"on-site Breit: H_OS has shape {tuple(h_onsite.shape)}, the "
+            f"direct-field slot {tuple(like.shape)}; the two must share the "
+            "full-BZ k rows and the band window")
+    target = like.sharding
+    dtype = jnp.dtype(like.dtype)
+    key = (target, dtype, h_transverse is None)
+    fn = _ONSITE_BREIT_INTO_TRANSVERSE.get(key)
+    if fn is None:
+        if h_transverse is None:
+            @jax.jit(out_shardings=target)
+            def fn(onsite):
+                return onsite.astype(dtype)
+        else:
+            @jax.jit(out_shardings=target)
+            def fn(base, onsite):
+                return base.astype(dtype) + onsite.astype(dtype)
+        _ONSITE_BREIT_INTO_TRANSVERSE[key] = fn
+    if h_transverse is None:
+        return fn(h_onsite)
+    return fn(h_transverse, h_onsite)
+
+
+def _static_onsite_breit(config, wfn, sym, band_slices, mesh_xy, *, input_dir,
+                         v_h, h_transverse, print_fn):
+    """``H_T`` with the static on-site Breit term ``H_OS[D_DFT]``, DFT basis.
+
+    One-shot GW and SC with ``density_self_consistent = false``: D is built
+    from the WFN's own occupations (``U = 1``), on the same window
+    ``[b0, b3)`` that :func:`_compute_live_hartree` cuts from its matrix::
+
+        P[k, a, n] = <phi~_a(k)|psi_nk>                       n in [b0, b3)
+        D          = sum_k w_k sum_n f_nk P_an P*_bn          (DFT occupations)
+        H_OS[k]    = P[k]^dagger (h^dir[D] + h^x[D]) P[k]     (Ry)
+
+    Returns ``(h_transverse, provenance)``; ``(h_transverse, None)`` unchanged
+    when ``onsite_breit`` is off.
+    """
+    from .hartree import onsite_breit_field, onsite_breit_setup_for
+
+    # Sigma carries the bare TT exchange on every bispinor route (gw_jax
+    # refuses bispinor = true without the transverse bundle), never otherwise.
+    setup = onsite_breit_setup_for(
+        config, wfn, input_dir=input_dir, tt_exchange=bool(config.bispinor))
+    if setup is None:
+        return h_transverse, None
+    with timing.section("sigma.onsite_breit") as sec:
+        field = onsite_breit_field(
+            wfn, sym, setup,
+            band_range=(int(band_slices.b0), int(band_slices.b3)),
+            mesh=mesh_xy, print_fn=print_fn)
+        h_onsite = field.matrix
+        h_transverse = onsite_breit_into_transverse(
+            h_transverse, h_onsite,
+            like=v_h if h_transverse is None else h_transverse,
+            double_counting=setup.double_counting)
+        sec.watch(h_transverse)
+    from common import sanity as _sanity
+    _sanity.check_finite("H_OS on-site Breit (static, DFT density)", h_onsite,
+                         print_fn=print_fn)
+    max_mev = float(jnp.max(jnp.abs(h_onsite))) * RYD_TO_EV * 1.0e3
+    log.info(
+        "  direct field: H_T includes the static on-site Breit term "
+        f"H_OS[D_DFT] (max|H_OS| = {max_mev:.4f} meV; double_counting = "
+        f"{setup.double_counting}, exchange = {setup.exchange}, projector = "
+        f"{setup.projector})")
+    return h_transverse, setup.provenance
+
+
+# ---------------------------------------------------------------------------
 # Dynamic-Sigma finalization (shared by every frequency ansatz)
 # ---------------------------------------------------------------------------
 
@@ -1370,8 +1491,14 @@ def _static_sigma_channels(
 
 def _sigma_hartree_fields(
         band_slices, config, hartree_basis_rotation, mesh_xy, meta, omit_v_h, print_fn,
-        sig_x, sym, wfn):
-    """Produce the exact Hartree fields in the Sigma basis."""
+        sig_x, sym, wfn, input_dir):
+    """Produce the exact Hartree fields in the Sigma basis.
+
+    Returns ``(sig_h, v_h_scalar, h_transverse, onsite_provenance)``; the
+    last is the on-site Breit setup's provenance string when that term rides
+    ``h_transverse``, else ``None``.
+    """
+    onsite_provenance = None
     if omit_v_h:
         sig_h = jnp.asarray(0, dtype=sig_x.dtype)
         h_transverse = None
@@ -1381,6 +1508,11 @@ def _sigma_hartree_fields(
                 config, meta, band_slices, mesh_xy,
                 wfn=wfn, sym=sym)
             sec.watch(sig_h, h_transverse)
+        # Static on-site Breit, DFT basis, BEFORE the rotation below so the
+        # QP-basis rotation acts on H_T + H_OS together.
+        h_transverse, onsite_provenance = _static_onsite_breit(
+            config, wfn, sym, band_slices, mesh_xy, input_dir=input_dir,
+            v_h=sig_h, h_transverse=h_transverse, print_fn=print_fn)
         sig_h = jnp.asarray(sig_h, dtype=sig_x.dtype)
         if hartree_basis_rotation is not None:
             rotation = _place_band_rotation(
@@ -1395,7 +1527,7 @@ def _sigma_hartree_fields(
     if h_transverse is not None:
         sig_h = sig_h + h_transverse
         sig_h.block_until_ready()
-    return sig_h, v_h_scalar, h_transverse
+    return sig_h, v_h_scalar, h_transverse, onsite_provenance
 
 
 def _static_sigma_result(
@@ -1878,9 +2010,9 @@ def compute_sigma_xc(
         for packed in {id(a): a for a in (photon_response.V_packed,
                                           photon_response.W_packed)}.values():
             packed.delete()
-    (sig_h, v_h_scalar, h_transverse) = _sigma_hartree_fields(
+    (sig_h, v_h_scalar, h_transverse, onsite_provenance) = _sigma_hartree_fields(
         band_slices, config, hartree_basis_rotation, mesh_xy, meta, omit_v_h, print_fn, sig_x,
-        sym, wfn)
+        sym, wfn, input_dir)
     if mode is ComputeMode.X_ONLY or mode is ComputeMode.COHSEX:
         return _static_sigma_result(
             h_transverse, mode, omit_v_h, photon_head_sigma_basis, photon_head_sigma_diag, sig_coh,
@@ -1892,23 +2024,48 @@ def compute_sigma_xc(
             f"compute_sigma_xc: dynamic mode {mode!r} requires e_qp_ev "
             "(QP energies for the QSGW Σ_c evaluation).")
     if mode.is_pole_route:
-        return _compute_mpa_sigma(
+        result = _compute_mpa_sigma(
             W_by_role, band_slices, config, e_qp_ev, fixed_quadrature_session, h_transverse,
             input_dir, iteration_head, material_class, mesh_xy, meta, occupation_state, omit_v_h,
             print_fn, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns,
             write_sigma_omega_h5, wfns_transverse, mu_bases)
-    return _compute_ppm_sigma(
-        V_q, W_by_role, W_static, band_slices, config, e_qp_ev, fixed_quadrature_session,
-        h_transverse, head_resolver, input_dir, iteration_head, mesh_xy, meta, mode,
-        occupation_state, omit_v_h, photon_head_sigma_basis, photon_head_sigma_diag, print_fn,
-        quad, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns, write_sigma_omega_h5,
-        consume_screening=consume_screening)
+    else:
+        result = _compute_ppm_sigma(
+            V_q, W_by_role, W_static, band_slices, config, e_qp_ev, fixed_quadrature_session,
+            h_transverse, head_resolver, input_dir, iteration_head, mesh_xy, meta, mode,
+            occupation_state, omit_v_h, photon_head_sigma_basis, photon_head_sigma_diag, print_fn,
+            quad, sig_h, sig_x, sigma_lorentz, sym, v_h_scalar, wfn, wfns, write_sigma_omega_h5,
+            consume_screening=consume_screening)
+    if onsite_provenance is not None and result.sigma_omega_h5_path:
+        stamp_onsite_breit_sigma_h5(result.sigma_omega_h5_path,
+                                    onsite_provenance, print_fn=print_fn)
+    return result
+
+
+def stamp_onsite_breit_sigma_h5(path, provenance: str, *,
+                                print_fn: Callable = print) -> None:
+    """Stamp ``sigma_mnk.h5``'s transverse direct field as holding H_OS.
+
+    QUALITY_PATTERNS #10: ``hartree_transverse_kij_ev`` (and the aggregate
+    ``hartree_kij_ev``) of a run with ``onsite_breit = true`` include the
+    on-site Breit matrix; the attribute ``onsite_breit_provenance`` (the
+    setup's canonical JSON) says so.  Collective: rank 0 writes, every rank
+    meets the barrier.
+    """
+    from common.collectives import barrier
+    from file_io.sigma_output import stamp_onsite_breit_provenance_h5
+
+    if jax.process_index() == 0:
+        stamp_onsite_breit_provenance_h5(path, provenance)
+    barrier("sigma.onsite_breit_stamp", print_fn=print_fn)
 
 
 __all__ = [
     "SigmaResult",
     "finalize_dynamic_sigma",
     "compute_sigma_xc",
+    "onsite_breit_into_transverse",
+    "stamp_onsite_breit_sigma_h5",
     "ROTATED_TO_DFT_FIELDS",
     "SIGMA_BASIS_FIELDS",
     "DFT_BASIS_FIELDS",
