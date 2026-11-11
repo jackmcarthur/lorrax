@@ -28,7 +28,7 @@ else.
 
 | package | level | owns | entry points | imported by |
 |---|---|---|---|---|
-| `gw` | L1 | the GW and QSGW driver: ζ orchestration, $V_q$, screening (tangential, MPA, plasmon pole, ladder), Σ, the $q\to0$ heads, SC maps, downfolding | `python -m gw.gw_jax`, `gw.kin_ion_io`, `gw.downfold_cli`, `gw.epsmat_cli`, `gw.eqp_bgw`, `gw.plane_wave_pipeline` (opt-in) | `bse`, `bandstructure`, `file_io`, `psp`, `centroid`, `isdf`, `lxkit.deck_doctor` |
+| `gw` | L1 | the GW and QSGW driver: ζ orchestration, $V_q$, screening (tangential, MPA, plasmon pole, ladder), Σ, the $q\to0$ heads, SC maps, downfolding | `python -m gw.gw_jax`, `gw.kin_ion_io`, `gw.downfold_cli`, `gw.epsmat_cli`, `gw.onsite_breit_cli`, `gw.eqp_bgw`, `gw.plane_wave_pipeline` (opt-in) | `bse`, `bandstructure`, `file_io`, `psp`, `centroid`, `isdf`, `lxkit.deck_doctor` |
 | `bse` | L1 | the Bethe–Salpeter equation: kernels, TDA and full solvers, absorption, exciton bands, the $W_\mathrm{BSE}$ ladder | `python -m bse.bse_jax`, `bse.exciton_bands`, `bse.absorption_haydock`, `bse.bse_feast`, `bse.bse_kpm`, `bse.bse_w_exact` | `gw.screening_bse`, `file_io.restart_bundle` (both lazily) |
 | `bandstructure` | L1 | band interpolation (htransform), fine-k wavefunctions for the BSE, band operators | `python -m bandstructure.htransform` | `bse` |
 | `centroid` | L1 (`kmeans_isdf` L2, `distribution` L3) | ISDF centroid selection: weighted k-means, sketched QRCP pruning, the sampling metric | `python -m centroid.kmeans_cli` | `gw`, `bandstructure` (htransform nodes) |
@@ -84,7 +84,7 @@ else.
 | `gw_init.py` | Loads inputs and orchestrates initialization stages. |
 | `gw_jax.py` | Main GWJAX command-line driver. |
 | `gw_output.py` | Serializes driver results and provenance. |
-| `hartree.py` | The direct (Hartree) field of the occupied states, as band matrices. |
+| `hartree.py` | The direct (Hartree) field of the occupied states, as band matrices; the on-site Breit field assembly (`onsite_breit_setup_for`, `onsite_breit_field`). |
 | `head_channel.py` | Places head-channel data on nonzero-q layouts. |
 | `head_correction.py` | Constructs the Gamma-point head correction. |
 | `head_densify.py` | Densifies arrays whose divergent head is stored separately. |
@@ -106,6 +106,7 @@ else.
 | `mpa/sigma_windows.py` | Derives MPA Σ frequency windows from the fitted pole geometry. |
 | `mpa/small_eig.py` | Eigenvalues of small non-symmetric complex matrices in JAX. |
 | `mpa/tiling.py` | Walks the fit stage over (q, ν-column) blocks under its memory rule. |
+| `onsite_breit_cli.py` | Driver: the on-site Breit operator at the DFT level, applied once, `onsite_breit.h5`; `python -m gw.onsite_breit_cli`. |
 | `photon_direct_head.py` | First-order direct bulk photon head from the dipole vertex. |
 | `photon_layout.py` | Defines the packed current-channel array layout. |
 | `photon_sigma.py` | Evaluates self-energy contributions in the packed current layout. |
@@ -238,6 +239,7 @@ else.
 | `kin_ion.py` | Writes `kin_ion.h5`; its readers are in `restart_bundle`. |
 | `mf_header.py` | Reads mean-field metadata headers. |
 | `mpa_store.py` | Frequency-resolved W restart tensors and the multipole (MPA) $B/\Omega$ fit store. |
+| `onsite_breit_output.py` | Writes and reads the on-site Breit debug file `onsite_breit.h5` (rank 0, atomic rename). |
 | `parallel_transport.py` | Reads and writes parallel-transport data. |
 | `paths.py` | Resolves configured input and output paths. |
 | `qe_save_reader.py` | Reads bounded Quantum ESPRESSO save-directory metadata. |
@@ -325,6 +327,7 @@ A namespace package (no `__init__.py`).
 | `ionic_gspace.py` | G-space setup of the ionic potentials and core charge. |
 | `kpm_dos.py` | KPM density of states of the DFT Hamiltonian; a driver. |
 | `nscf_input.py` | Parses an NSCF input file. |
+| `onsite_breit.py` | The on-site Breit (spin–other-orbit) mean field of one open shell per atom: sidecar reader, shell algebra, ortho-atomic projector setup, projection table, density matrix and band-matrix kernels. |
 | `operator_checks.py` | Preflight checks before DFT operators are built. |
 | `orbital_magnetization.py` | Orbital magnetization (modern theory) from a spinor WFN; a driver. Theory: `psp/orbital_magnetization_THEORY.md`. |
 | `orbital_response.py` | Orbital moments from a given velocity. |

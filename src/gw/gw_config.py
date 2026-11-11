@@ -1396,6 +1396,17 @@ _DEFAULTS = {
     # consumer call; a WFN whose QE schema declares DFT+U refuses without them.
     "hubbard_input": "",
     "hubbard_occupations": "",
+    # On-site Breit (spin-other-orbit) mean field of one open shell per atom
+    # (psp.onsite_breit; assembled by gw.hartree.onsite_breit_field).  The two
+    # double-counting keys have NO default: "" is "unset" and refuses when
+    # onsite_breit = true (refuse_unsupported_onsite_breit).  Every
+    # onsite_breit_* key named while onsite_breit = false refuses.
+    "onsite_breit": False,
+    "onsite_breit_files": "",
+    "onsite_breit_double_counting": "",
+    "onsite_breit_exchange": "",
+    "onsite_breit_projector": "ortho-atomic",
+    "onsite_breit_pseudo_dir": "",
     "do_G0": True,
     # Deprecated (2026-07-08): ``self_consistent = true`` is honored as an
     # alias for ``qp_solver = self_consistent`` via auto-resolution.  SC is
@@ -2065,6 +2076,11 @@ _NORMALIZE_STR = {
     # the same reason: its wrong value would otherwise surface as a refusal
     # in the post-SC artifact dump, after the whole self-consistency.
     "qp_rotations_k_storage",
+    # The on-site Breit enums; their values are checked by the one owner,
+    # psp.onsite_breit.resolve_onsite_keys (refuse_unsupported_onsite_breit).
+    "onsite_breit_double_counting",
+    "onsite_breit_exchange",
+    "onsite_breit_projector",
 }
 
 # Tri-state booleans: _DEFAULTS value is None (= unset), an explicit
@@ -3185,6 +3201,12 @@ def _assemble_input_config(
         bispinor_gw=coerce_bispinor_gw_mode(params["bispinor_gw"]),
         hubbard_input=str(params["hubbard_input"] or ""),
         hubbard_occupations=str(params["hubbard_occupations"] or ""),
+        onsite_breit=bool(params["onsite_breit"]),
+        onsite_breit_files=str(params["onsite_breit_files"] or ""),
+        onsite_breit_double_counting=str(params["onsite_breit_double_counting"] or ""),
+        onsite_breit_exchange=str(params["onsite_breit_exchange"] or ""),
+        onsite_breit_projector=str(params["onsite_breit_projector"] or ""),
+        onsite_breit_pseudo_dir=str(params["onsite_breit_pseudo_dir"] or ""),
         do_G0=_resolved_do_g0,
         self_consistent=bool(params["self_consistent"]),
         use_ppm_sigma=bool(params["use_ppm_sigma"]),
@@ -3283,6 +3305,7 @@ def _apply_input_envelope(
     refuse_unsupported_screening_source(resolved)
     refuse_unsupported_head_dense(resolved)
     refuse_unsupported_bispinor_gw(resolved)
+    refuse_unsupported_onsite_breit(resolved, _named_keys)
     warn_headless_tangential_self_consistency(resolved, print_fn=print_fn)
     announce_legacy_sigma_axis_keys(
         _named_keys, resolved.compute_mode, resolved.qp_solver,
@@ -4155,6 +4178,74 @@ def warn_headless_tangential_self_consistency(config, print_fn=print) -> None:
         "the signed Gamma head remains the production path for ordered "
         "stores.  See docs/input_reference.md and "
         "docs/architecture/decisions.md (2026-09-18).")
+
+
+#: The keys that only ``onsite_breit = true`` reads.
+ONSITE_BREIT_DEPENDENT_KEYS = (
+    "onsite_breit_files", "onsite_breit_double_counting", "onsite_breit_exchange",
+    "onsite_breit_projector", "onsite_breit_pseudo_dir")
+
+
+def _onsite_breit_gate(got: str, want: str, why: str, fix: str) -> ValueError:
+    return ValueError(
+        f"GATE onsite_breit_keys: {why.split(';')[0]}\n"
+        f"  got:  {got}\n  want: {want}\n  why:  {why}\n  fix:  {fix}\n"
+        "  doc:  docs/input_reference.md (onsite_breit); ONSITE_INCODE.md section 3")
+
+
+def refuse_unsupported_onsite_breit(config, named_keys=frozenset()) -> None:
+    """Parse-time checks of the on-site Breit keys (``GATE onsite_breit_keys``).
+
+    ``onsite_breit = false``: a dependent key the deck NAMED refuses (the
+    dependent-key rule of ``bispinor_gw``: a selector never stands inert
+    beside a disabled switch).  ``onsite_breit = true``: the sidecar list
+    must name at least one file, both double-counting keys must be set, and
+    their values and pairing with ``bispinor`` go through the one owner,
+    ``psp.onsite_breit.resolve_onsite_keys`` (the pairing with Sigma's
+    transverse exchange is checked where Sigma is known,
+    ``gw.hartree.onsite_breit_setup_for``).  A self-consistent run needs the
+    live density rebuild, because D is rebuilt from each map's orbitals there.
+    The projector name and the files themselves are checked when the setup
+    is built (the WFN is needed).
+    """
+    if not bool(getattr(config, "onsite_breit", False)):
+        named = sorted(k for k in ONSITE_BREIT_DEPENDENT_KEYS if k in set(named_keys))
+        if named:
+            raise _onsite_breit_gate(
+                f"onsite_breit = false with {', '.join(named)} named",
+                "onsite_breit = true, or none of the onsite_breit_* keys",
+                "a dependent key beside a disabled switch is inert; a deck that names it "
+                "expects an on-site term this run would silently omit",
+                "set onsite_breit = true, or delete the onsite_breit_* lines")
+        return
+    if not str(config.onsite_breit_files).split():
+        raise _onsite_breit_gate(
+            "onsite_breit = true, onsite_breit_files = ''",
+            "onsite_breit_files = <El>.onsite_breit.json ... (deck-relative, one per species)",
+            "the radial integrals of the operator come only from the sidecar files",
+            "name the sidecar files (breit_salvage/onsite_sidecar/make_sidecar.py)")
+    missing = [k for k in ("onsite_breit_double_counting", "onsite_breit_exchange")
+               if not str(getattr(config, k)).strip()]
+    if missing:
+        raise _onsite_breit_gate(
+            f"onsite_breit = true, {' and '.join(missing)} unset",
+            "onsite_breit_double_counting = onsite_only | paw and "
+            "onsite_breit_exchange = full | paw | off, both named",
+            "the double counting with the smooth alpha.A field and with Sigma's transverse "
+            "exchange has no default; a wrong choice counts a term twice or subtracts one "
+            "that is not there",
+            "set both keys (onsite_only with bispinor = false, paw with bispinor = true)")
+    from psp.onsite_breit import resolve_onsite_keys
+    resolve_onsite_keys(config.onsite_breit_double_counting, config.onsite_breit_exchange,
+                        bispinor=bool(config.bispinor))
+    if (config.qp_solver is QPSolver.SELF_CONSISTENT
+            and not bool(config.density_self_consistent)):
+        raise _onsite_breit_gate(
+            "onsite_breit = true, qp_solver = self_consistent, density_self_consistent = false",
+            "density_self_consistent = true (or qp_solver = one_shot_dft)",
+            "the on-site density matrix is rebuilt from each map's orbitals beside the live "
+            "Hartree field; a frozen density would mix two orbital states",
+            "set density_self_consistent = true")
 
 
 def refuse_unsupported_bispinor_gw(config) -> None:
@@ -5159,6 +5250,15 @@ class LorraxConfig:
     #: of use by ``psp.hubbard_ops.resolve_hubbard_input``.
     hubbard_input: str
     hubbard_occupations: str
+    #: On-site Breit inputs (deck spellings; files and pseudo dir deck-relative).
+    #: Checked at parse time by :func:`refuse_unsupported_onsite_breit`;
+    #: resolved into a setup by ``gw.hartree.onsite_breit_setup_for``.
+    onsite_breit: bool
+    onsite_breit_files: str
+    onsite_breit_double_counting: str
+    onsite_breit_exchange: str
+    onsite_breit_projector: str
+    onsite_breit_pseudo_dir: str
     do_G0: bool
     self_consistent: bool         # deprecated alias; ``qp_solver`` is canonical
     use_ppm_sigma: bool           # legacy mirror; ``compute_mode`` is canonical

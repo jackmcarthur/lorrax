@@ -23,6 +23,8 @@ sit beside it too: they hand the BSE interaction to TDGW's real-time propagation
 finished bundle's static W to and from BerkeleyGW's ε⁻¹ files.
 So does [`bse.bsemat_cli`](#bsemat-bsebsemat_cli): it writes a
 finished bundle's static W as BerkeleyGW 4.0's `bsemat.h5`.
+[`gw.onsite_breit_cli`](#on-site-breit-gwonsite_breit_cli) sits beside it
+too: it builds the on-site Breit operator at the DFT level and applies it once.
 
 Every driver brings up the runtime with one module-top call,
 `runtime.initialize_communicator_stack` (mesh, communicators, startup report).
@@ -256,6 +258,60 @@ which both BSE drivers read unmodified. Invoke:
 [The downfold page](downfold.md) owns the equations, the procedure, the
 outputs and the refusals; the `[downfold]` keys are in the
 [input reference](input_reference.md#downfold-the-downfold-input-file).
+
+## on-site Breit — `gw.onsite_breit_cli`
+
+Builds the on-site Breit (spin–other-orbit) mean field of one open shell per
+atom from the DFT occupations and writes it with its pieces to
+`onsite_breit.h5` beside the deck. With $P[k,a,n] = \langle\tilde\phi_a(k)|\psi_{nk}\rangle$
+(the ortho-atomic projector of the deck's UPFs, full BZ),
+
+$$D_{ab} = \sum_k w_k \sum_n f_{nk} P_{kan} P^*_{kbn},\qquad
+h = h^\mathrm{dir}[D] + h^\mathrm{x}[D],\qquad
+H_\mathrm{OS}(k) = P_k^\dagger h P_k \;\;(\mathrm{Ry}),$$
+
+with the direct and exchange parts combined as `onsite_breit_double_counting`
+and `onsite_breit_exchange` say ([input reference](input_reference.md)). Under
+`onsite_breit_double_counting = paw` (a bispinor deck) the matrix applied is
+$\langle m|\alpha\cdot A[J]|n\rangle + H_\mathrm{OS}$, the smooth transverse
+direct field from `gw.hartree.direct_field_matrices` with the GW run's
+carrier; under `onsite_only` it is $H_\mathrm{OS}$. It is then applied once:
+per full-BZ k, $E', U = \mathrm{eigh}(\mathrm{diag}(E_\mathrm{DFT}) + \mathrm{Herm}(\Delta H))$
+(`distrib_la.eigh_local`), the new states are occupied (an insulator: the
+lowest `nelec` bands; a metal: the fixed-N Fermi–Dirac state of
+`occ_smearing_width_ry` from `gw.efermi`, compared with the same smearing at
+$E_\mathrm{DFT}$; a metal with no declared smearing skips the moments after
+the application and says so), and $D' = D[U, f']$ is measured. The log gives,
+per shell-atom, Tr D, 2⟨S⟩, ⟨L⟩, the l·m̂ and l·s coefficients of h by piece in
+meV, max|H_OS|, and ⟨L⟩·m̂ and 2⟨S⟩·m̂ before and after along the shell's own
+spin direction. The field is the same assembly the GW driver calls
+(`gw.hartree.onsite_breit_field`). No Σ exists at this level, so
+`onsite_breit_exchange = paw` refuses here by design.
+
+Invoke: `python3 -m gw.onsite_breit_cli -i cohsex.in [--out onsite_breit.h5] [--no-apply]`.
+The deck needs `onsite_breit = true` and its keys; the band window is the GW
+run's QP window $[0, n_\mathrm{elec} + n_\mathrm{cond})$, resolved as `gw.kin_ion_io`
+resolves it, and occupied weight above it refuses (`GATE onsite_breit_band_cut`).
+
+| flag | default | meaning |
+|---|---|---|
+| `-i` / `--input` | required | the GW deck (`wfn_file`, the `onsite_breit_*` keys, `bispinor`, smearing) |
+| `--out` | `onsite_breit.h5` beside the deck | the debug file (`file_io.onsite_breit_output`, rank 0 writes) |
+| `--no-apply` | off | skip the one-shot application and the moments after it |
+| `--report-file` | `onsite_breit.out` beside the output | the run report |
+
+`onsite_breit.h5`: `dH_kij_ev` (nk, nb, nb), the matrix applied (DFT basis,
+full BZ in `sym.unfolded_kpts` order); `dH_{dir_ae,dir_ps,x_ae,x_ps}_ev` (the
+raw pieces' band matrices, so arms can be recombined), `dH_smooth_ev` (`paw`),
+`P_kan` (the projection table); `density_matrix_ab` and its shell-atom blocks
+`density_matrix_Iab` (with `shell_dim_I`), `h_Iab_ev/<piece>`, `moments/`
+(N, ⟨S⟩, ⟨L⟩ per shell-atom), the shell-atom labels, `kpoints_crys`,
+`kirr_fullids`, `irr_idx_k`; after the application `E_dft_kn_ev`,
+`E_applied_kn_ev`, `density_matrix_applied_ab`, `density_matrix_reference_ab`
+and `occupations_applied_kn`. Attributes: the keys, the setup provenance, the
+sidecar SHA-256s, the WFN fingerprint, the generator commit, the k-set and the
+band window. Not included: $i[r, H_\mathrm{OS}]$ in any velocity; the
+operator's limits are listed in the log.
 
 ## epsmat — `gw.epsmat_cli`
 

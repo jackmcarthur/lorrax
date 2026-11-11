@@ -13,9 +13,22 @@
 re-exports it as ``compute_hartree_matrix``.  The SC rebuild
 (``gw.sc_iteration.rebuild_hartree_dft_basis``) is a second copy of this
 chain and moves here in ARCH wave 3.
+
+The on-site Breit field (design note ``ONSITE_INCODE.md`` section 2) is
+assembled here too, by one function for the three callers (the one-shot
+Hamiltonian, the SC rebuild and ``gw.onsite_breit_cli``)::
+
+    P[k, a, n]  = <phi~_a(k)|psi_nk>                     projection table, full BZ
+    D[a, b]     = sum_k w_k sum_i f_ik (P U)_ai conj((P U)_bi)
+    h           = h^dir[D] + h^x[D]                        (keys of section 3)
+    H_OS[k]     = P[k]^dagger h P[k]                       (Ry, DFT band basis)
+
+(:func:`onsite_breit_setup_for`, :func:`onsite_breit_field`; the physics
+library is ``psp.onsite_breit``).
 """
 from __future__ import annotations
 
+import os
 from typing import NamedTuple
 
 import numpy as np
@@ -31,7 +44,10 @@ from file_io.kin_ion import broadcast_star_wedge
 
 __all__ = [
     "ExactHartreeMatrices",
+    "OnsiteBreitField",
     "direct_field_matrices",
+    "onsite_breit_field",
+    "onsite_breit_setup_for",
     "star_wedge_kspec",
     "wedge_density_occupations",
 ]
@@ -497,3 +513,396 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
             current_projection.n_antiunitary_rows),
         tt_metric_sign=tt_metric_sign,
     )
+
+
+# ===========================================================================
+#  On-site Breit field (ONSITE_INCODE.md sections 2-4)
+# ===========================================================================
+#
+# ONE ASSEMBLY FOR THREE CALLERS.  The one-shot Hamiltonian
+# (``gw.sigma_dispatch``), the SC rebuild (``gw.sc_iteration``) and the
+# DFT-level driver (``gw.onsite_breit_cli``) call :func:`onsite_breit_field`;
+# the physics (sidecar, kernels, projector, moments) is ``psp.onsite_breit``.
+#
+# WHY THE FULL BZ.  P is computed from the two-component DFT psi(G) the loader
+# unfolds (``WfnLoader.load(k="full_bz")``: rotation, tau phase, spinor
+# rotation and the time-reversal conjugation of every full-BZ row, by the
+# symmetry service), so D is the plain zone sum and carries the magnetic
+# group because the unfolded states do.  No second symmetry action exists.
+# Row k of every array here is row k of ``sym.unfolded_kpts``, the order of
+# the SC loop's full-BZ U and occupations (``rebuild_hartree_dft_basis``
+# takes ``U_qp[sym.kirr_fullids]`` from the same table); the loader's own
+# ``kvecs(k="full_bz")`` is compared with it before P is built.
+
+class OnsiteBreitField(NamedTuple):
+    """The on-site Breit field of one density matrix (:func:`onsite_breit_field`).
+
+    ``matrix`` (nk_full, nb, nb) complex128, Ry: H_OS in the DFT band basis of
+    the window, full BZ in ``sym.unfolded_kpts`` order, replicated
+    ``P(None, None, None)``.  ``density_matrix`` and ``h_block`` (R_os, R_os)
+    host complex128 in the shell basis (``h`` in Ry; only the shell-atom
+    diagonal blocks are nonzero in ``h``).  ``pieces``: per shell-atom dicts
+    ``dir_ae, dir_ps, x_ae, x_ps, total`` (Ry; a ``*_ps`` is ``None`` without
+    a ``ps`` tensor) of ``psp.onsite_breit.onsite_potential``.
+    ``projections`` (nk_full, R_os, nb) complex128, replicated: P.
+    ``setup``: the ``psp.onsite_breit.OnsiteSetup``.  ``report``: the log lines.
+    """
+
+    matrix: object
+    density_matrix: object
+    h_block: object
+    pieces: list
+    projections: object
+    setup: object
+    report: list
+
+
+#: (WFN fingerprint, sidecar (path, sha256) pairs, pseudo dir, projector,
+#: double counting, exchange) -> OnsiteSetup.  By value, so every SC map of
+#: a run (a fresh call, the same inputs) reuses one setup and one compiled
+#: projection program (``psp.onsite_breit`` keys its kernels by setup).
+_ONSITE_SETUPS: dict = {}
+#: (WFN fingerprint, global band range, setup provenance, mesh) -> the
+#: projection table P (nk_full, R_os, nb), replicated.  psi_DFT and the
+#: projector are fixed for a run (only U and f move), so P is one pass.
+_ONSITE_PROJECTIONS: dict = {}
+
+#: Hermiticity budget of D and H_OS, relative to their largest entry.
+ONSITE_HERMITICITY_RTOL = 1.0e-10
+#: Slack on the eigenvalue range of each shell block of D: with orthonormal
+#: projector rows and orthonormal states, D's eigenvalues lie inside the
+#: occupation range [min(0, f), max(1, f)].
+ONSITE_DENSITY_EIGEN_TOL = 1.0e-6
+
+
+def _onsite_gate(rule, got, want, why, fix):
+    return ValueError(
+        f"GATE {rule}: {why.split(';')[0]}\n  got:  {got}\n  want: {want}\n"
+        f"  why:  {why}\n  fix:  {fix}\n  doc:  src/gw/hartree.py (onsite_breit_field); "
+        "ONSITE_INCODE.md")
+
+
+def _file_sha256(path) -> str:
+    import hashlib
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _onsite_upf_paths(pseudo_dir: str) -> dict:
+    """``{element: UPF path}`` of the pseudo dir, refusing an ambiguous one.
+
+    ``psp.pseudos.load_pseudopotentials`` keys by element, so two UPFs of one
+    element (a Gaunt-stamped and a plain one, say) would leave the projector
+    to whichever sorts last; that refuses here instead.
+    """
+    import glob
+    from psp.pseudos import load_pseudopotentials
+    pseudos = load_pseudopotentials(pseudo_dir)
+    files = (glob.glob(os.path.join(pseudo_dir, "*.upf"))
+             or glob.glob(os.path.join(pseudo_dir, "*.UPF")))
+    if not pseudos or len(files) != len(pseudos):
+        raise _onsite_gate(
+            "onsite_breit_projector",
+            f"onsite_breit_pseudo_dir = {pseudo_dir}: {len(files)} UPF files, "
+            f"{len(pseudos)} species ({sorted(pseudos)})",
+            "exactly one readable *.upf per species of the WFN",
+            "the ortho-atomic projector is built from the PP_PSWFC of every species; an "
+            "absent or ambiguous UPF is another projector",
+            "point onsite_breit_pseudo_dir at a directory with one UPF per species")
+    return {el: str(p._source_path) for el, p in pseudos.items()}
+
+
+def onsite_breit_setup_for(config, wfn, *, input_dir, tt_exchange: bool):
+    """The on-site Breit setup of this run, or ``None`` when ``onsite_breit = false``.
+
+    Parameters
+    ----------
+    config : gw.gw_config.LorraxConfig
+        Reads ``onsite_breit``, ``onsite_breit_files``,
+        ``onsite_breit_double_counting``, ``onsite_breit_exchange``,
+        ``onsite_breit_projector``, ``onsite_breit_pseudo_dir`` and ``bispinor``.
+    wfn : wfn_loader.WfnLoader
+    input_dir : str
+        The deck directory; sidecar files and the pseudo dir are relative to
+        it (the pseudo dir defaults to it).
+    tt_exchange : bool
+        Whether this run's Sigma carries the bare transverse (TT) exchange
+        on pseudo-orbitals (``exchange = paw`` needs it, ``full`` must not
+        have it).  ``False`` at the DFT level.
+
+    Returns
+    -------
+    psp.onsite_breit.OnsiteSetup or None
+        Built once per (WFN, sidecar contents, pseudo dir, keys): a module
+        cache keyed by value, so the SC maps share it.  Every species of the
+        WFN needs a UPF in the pseudo dir (loaded with
+        ``psp.pseudos.load_pseudopotentials``); sidecars are read with
+        ``require_ps`` when either key is ``paw``.  Refusals: the keys
+        (``GATE onsite_breit_keys``, through
+        ``psp.onsite_breit.resolve_onsite_keys``), a missing sidecar
+        (``GATE onsite_breit_sidecar``), an absent or ambiguous UPF
+        (``GATE onsite_breit_projector``), and every refusal of
+        ``psp.onsite_breit.build_onsite_setup``.
+    """
+    if not bool(getattr(config, "onsite_breit", False)):
+        return None
+    from common.parallel_transport import wfn_fingerprint
+    from psp.onsite_breit import build_onsite_setup, read_sidecar, resolve_onsite_keys
+
+    dc, ex = resolve_onsite_keys(
+        config.onsite_breit_double_counting, config.onsite_breit_exchange,
+        bispinor=bool(config.bispinor), tt_exchange=bool(tt_exchange))
+    base = os.path.abspath(str(input_dir))
+    files = tuple(os.path.normpath(os.path.join(base, f))
+                  for f in str(config.onsite_breit_files).split())
+    absent = [f for f in files if not os.path.isfile(f)]
+    if not files or absent:
+        raise _onsite_gate(
+            "onsite_breit_sidecar", f"onsite_breit_files = {config.onsite_breit_files!r} "
+            f"(missing: {absent})", "one existing <El>.onsite_breit.json per species, deck-relative",
+            "the radial integrals of the operator come only from the sidecar files",
+            "fix onsite_breit_files")
+    pseudo_dir = os.path.normpath(os.path.join(
+        base, str(config.onsite_breit_pseudo_dir or "").strip() or "."))
+    projector = str(config.onsite_breit_projector or "").strip()
+    key = (wfn_fingerprint(wfn), tuple((f, _file_sha256(f)) for f in files),
+           pseudo_dir, projector, dc, ex)
+    setup = _ONSITE_SETUPS.get(key)
+    if setup is not None:
+        return setup
+    with timing.section("onsite_setup"):
+        upf_paths = _onsite_upf_paths(pseudo_dir)
+        need_ps = dc == "paw" or ex == "paw"
+        sidecars = [read_sidecar(f, require_ps=need_ps) for f in files]
+        setup = build_onsite_setup(wfn, upf_paths, sidecars, projector=projector,
+                                   double_counting=dc, exchange=ex)
+    _ONSITE_SETUPS[key] = setup
+    log.info(f"onsite_breit setup: projector {setup.projector}, double_counting = {dc}, "
+             f"exchange = {ex}, {len(setup.shell_atoms)} shell-atoms, R_os = {setup.R_os}, "
+             f"UPFs from {pseudo_dir}")
+    for sc in sidecars:
+        log.info(f"  sidecar {sc['element']}: {sc['path']} sha256 {sc['sha256']}")
+    for sa in setup.shell_atoms:
+        log.info(f"  shell-atom atom {sa['atom']} {sa['element']} {sa['label']} (l={sa['l']}): "
+                 f"rows [{sa['start']}, {sa['stop']}) of the on-site axis")
+    if ex == "paw":
+        log.info("  onsite_breit_exchange = paw assumes the on-site part of Sigma's TT exchange "
+                 "equals h^x_PS: NOT VALIDATED (ONSITE_INCODE.md section 3)")
+    log.info("  not included: i[r, H_OS] in the velocity (dipole, head, orbital moment); "
+             "on-site spin-spin and orbit-orbit; exchange with other shells (ONSITE_INCODE.md "
+             "section 8)")
+    return setup
+
+
+def _book_onsite_price(*, nk: int, nb_carrier: int, ngkmax: int, r_os: int,
+                       ranks: int) -> None:
+    """Book the projection pass to the open section before psi is loaded.
+
+    Spread over P: the full-BZ two-component sphere ``(nk, nb_carrier, 2,
+    ngkmax)`` c128 (``lxkit.memory``, the ``_book_density_price`` pattern).
+    Replicated: the projection table ``(nk, R_os, nb_carrier)`` c128 and the
+    G table with its mask.  The per-k Loewdin rows are a scan carry.
+    """
+    from lxkit import memory
+    c128 = 16.0
+    sphere = float(nk) * float(nb_carrier) * 2.0 * float(ngkmax) * c128
+    table = float(nk) * float(r_os) * float(nb_carrier) * c128
+    gtab = float(nk) * float(ngkmax) * (3 * 4.0 + 8.0)
+    memory.book(memory.Price(
+        operands=memory.Term(table + gtab, sphere,
+                             "full-BZ psi(G) sphere + on-site projection table + G table"),
+        ranks=max(1, int(ranks)), label="on-site Breit projection", increment=True))
+
+
+def _onsite_projection_table(wfn, sym, setup, band_range, mesh):
+    """``P[k, a, n] = <phi~_a(k)|psi_nk>`` (nk_full, R_os, nb), replicated, cached.
+
+    psi is the two-component DFT sphere of the GLOBAL band range, unfolded to
+    the full BZ by the loader and band-sharded at ``band_sphere_spec``; the
+    loader pads the band axis to the mesh carrier with zero bands, whose
+    projections are zero, and the table is stripped back to the logical nb
+    columns by the carrier's receipt.  psi is dropped before returning.
+    """
+    from common.parallel_transport import wfn_fingerprint
+    from common.wfn_layout import band_sphere_spec
+    from psp.dft_operators import padded_gvectors
+    from psp.onsite_breit import onsite_projections
+    from runtime.padding import authenticate_axis, padded_axis, strip_axis
+
+    key = (wfn_fingerprint(wfn), tuple(band_range), setup.provenance, mesh)
+    hit = _ONSITE_PROJECTIONS.get(key)
+    if hit is not None:
+        return hit
+    nk = int(sym.nk_tot)
+    b_lo, b_hi = band_range
+    gtab = padded_gvectors(wfn, k="full_bz")
+    kv, k_sym = np.asarray(gtab.kvecs), np.asarray(sym.unfolded_kpts, dtype=np.float64)
+    if kv.shape != (nk, 3) or not np.array_equal(kv, k_sym):
+        raise _onsite_gate(
+            "onsite_breit_k_order", f"loader full-BZ k table {kv.shape} vs sym.unfolded_kpts "
+            f"{k_sym.shape} (equal: {kv.shape == k_sym.shape and np.array_equal(kv, k_sym)})",
+            "WfnLoader.kvecs(k='full_bz') == sym.unfolded_kpts, row by row",
+            "P, U and the occupations are paired by full-BZ row; another order pairs a state "
+            "with another k's projections", "use the loader's own symmetry() for sym")
+    band_axis = padded_axis(b_hi - b_lo, mesh, name="on-site projection band sphere",
+                            spec=band_sphere_spec(), axis=1)
+    _book_onsite_price(nk=nk, nb_carrier=band_axis.carrier,
+                       ngkmax=int(gtab.gvecs.shape[1]), r_os=setup.R_os,
+                       ranks=int(mesh.devices.size))
+    psi_G = wfn.load(bands=(b_lo, b_hi), k="full_bz", sharding=band_sphere_spec(),
+                     bispinor=False)
+    authenticate_axis(psi_G, band_axis, axis=1, where="onsite_breit_field psi(G)")
+    with timing.section("onsite_projections"):
+        P_carrier = onsite_projections(psi_G, gtab.gvecs, gtab.mask, gtab.kvecs, setup,
+                                       mesh=mesh)
+    del psi_G
+    P_table = strip_axis(P_carrier, band_axis, axis=2)
+    _ONSITE_PROJECTIONS[key] = P_table
+    return P_table
+
+
+def _onsite_dft_occupations(wfn, nk: int, band_range, kweights):
+    """The WFN's canonical full-BZ occupations on the window (nk, nb), host.
+
+    ``wfn.physical_density_occupations(k="full_bz")`` (unit below the
+    density band stop when it returns ``None``).  Occupied weight at or
+    above the window top would be dropped from D: it refuses
+    (``GATE onsite_breit_band_cut``, the budget of the SC density cut).
+    """
+    from gw.qsgw_density import DENSITY_TAIL_ELECTRON_TOL, density_tail_electrons
+    from psp.get_DFT_mtxels import spin_degeneracy_factor
+    b_lo, b_hi = band_range
+    stop = int(wfn.physical_density_band_stop)
+    rows = wfn.physical_density_occupations(k="full_bz")
+    occ = np.zeros((nk, max(stop, b_hi)), dtype=np.float64)
+    occ[:, :stop] = 1.0 if rows is None else np.asarray(rows, dtype=np.float64)[:, :stop]
+    dropped = float(density_tail_electrons(occ, kweights, spin_degeneracy_factor(wfn))[b_hi])
+    if not np.isfinite(dropped) or dropped > DENSITY_TAIL_ELECTRON_TOL:
+        raise _onsite_gate(
+            "onsite_breit_band_cut", f"bands at or above {b_hi} carry {dropped:.3e} electrons",
+            f"<= {DENSITY_TAIL_ELECTRON_TOL:.0e} electrons above the window [{b_lo}, {b_hi})",
+            "D is built from the window's states only; an occupied state above it would be "
+            "silently dropped", "widen the window (ncond)")
+    return occ[:, b_lo:b_hi]
+
+
+def _onsite_density_gate(D, occ, setup) -> None:
+    """Finite, Hermitian, and each shell block's spectrum inside the occupation range."""
+    D = np.asarray(D)
+    scale = max(float(np.abs(D).max()) if D.size else 0.0, 1.0)
+    herm = float(np.abs(D - D.conj().T).max()) if D.size else 0.0
+    if not np.all(np.isfinite(D)) or herm > ONSITE_HERMITICITY_RTOL * scale:
+        raise _onsite_gate(
+            "onsite_breit_density", f"finite {bool(np.all(np.isfinite(D)))}, max|D - D^+| = {herm:.2e}",
+            f"finite and max|D - D^+| <= {ONSITE_HERMITICITY_RTOL:g} max(1, max|D|)",
+            "D is a density matrix; a non-Hermitian or non-finite D is a broken projection "
+            "or rotation", "check the projection table and U")
+    f_lo = min(0.0, float(jnp.min(occ)))
+    f_hi = max(1.0, float(jnp.max(occ)))
+    for sa in setup.shell_atoms:
+        sl = slice(sa["start"], sa["stop"])
+        ev = np.linalg.eigvalsh(0.5 * (D[sl, sl] + D[sl, sl].conj().T))
+        if ev.min() < f_lo - ONSITE_DENSITY_EIGEN_TOL or ev.max() > f_hi + ONSITE_DENSITY_EIGEN_TOL:
+            raise _onsite_gate(
+                "onsite_breit_density",
+                f"atom {sa['atom']} {sa['element']} {sa['label']}: eigenvalues of D in "
+                f"[{ev.min():+.6f}, {ev.max():+.6f}]",
+                f"inside the occupation range [{f_lo:g}, {f_hi:g}] +- {ONSITE_DENSITY_EIGEN_TOL:g}",
+                "orthonormal projector rows and orthonormal states bound D by the occupations; "
+                "outside it the rows or the states are not orthonormal",
+                "check the Loewdin rows (UPF, mask) and the normalisation of psi and U")
+
+
+def onsite_breit_field(wfn, sym, setup, *, band_range, mesh, U=None, occupations=None,
+                       print_fn=None) -> OnsiteBreitField:
+    """D, h and H_OS on the full BZ for the bands ``[band_range[0], band_range[1])``.
+
+    Parameters
+    ----------
+    wfn : wfn_loader.WfnLoader
+    sym : symmetry_maps.SymMaps
+        ``wfn.symmetry()``; its ``unfolded_kpts`` order is the k order of
+        every array in and out.
+    setup : psp.onsite_breit.OnsiteSetup
+        :func:`onsite_breit_setup_for`.
+    band_range : (int, int)
+        GLOBAL band indices, like ``band_slices.sigma_range``; nb = b1 - b0.
+    mesh : jax.sharding.Mesh
+        The run's mesh.
+    U : (nk_full, nb, nb) complex, optional
+        ``U[k, n, i] = <DFT_n|QP_i>``, full-BZ rows in sym order, replicated
+        or mesh-sharded (contracted at its own layout).
+    occupations : (nk_full, nb) float, optional
+        Occupations of the states i (the map's fixed-N state for a metal).
+        ``U`` and ``occupations`` both ``None``: the DFT level, U = 1 and the
+        WFN's canonical occupations.  ``U`` without ``occupations`` refuses.
+    print_fn : callable, optional
+        Where the report lines go (default ``log.info``; rank 0 by the
+        session's handlers).  Every call reports.
+
+    Returns
+    -------
+    OnsiteBreitField
+
+    The physics, in order (design note section 2)::
+
+        P[k, a, n] = <phi~_a(k)|psi_nk>                         (cached per run)
+        w_k        = 1 / nk_full
+        D[a, b]    = sum_k w_k sum_i f_ik (P U)_{k a i} conj((P U)_{k b i})
+        h_I        = h^dir[D_I] + h^x[D_I]                       (section 3 keys; Ry)
+        H_OS[k]    = P[k]^dagger h P[k]                          (Ry)
+
+    Gates (``QUALITY_PATTERNS`` #7): D finite, Hermitian and bounded by the
+    occupations (``GATE onsite_breit_density``); H_OS finite and Hermitian
+    (``GATE onsite_breit_matrix``).
+    """
+    from psp.onsite_breit import (RY_TO_MEV, onsite_band_matrix, onsite_block_potential,
+                                  onsite_density_matrix, onsite_report_lines)
+
+    b_lo, b_hi = int(band_range[0]), int(band_range[1])
+    nb, nk = b_hi - b_lo, int(sym.nk_tot)
+    if nb <= 0 or b_lo < 0:
+        raise ValueError(f"onsite_breit_field: empty or negative band range {band_range}")
+    if U is not None and occupations is None:
+        raise ValueError("onsite_breit_field: U needs the occupations of its states")
+    emit = log.info if print_fn is None else print_fn
+    with timing.section("onsite_field"):
+        # P[k, a, n] = <phi~_a(k)|psi_nk>, full BZ in sym.unfolded_kpts order
+        P_table = _onsite_projection_table(wfn, sym, setup, (b_lo, b_hi), mesh)
+        # w_k = 1 / N_k on the full BZ
+        kweights = np.full(nk, 1.0 / nk, dtype=np.float64)
+        # f_ik: the map's occupations, or the WFN's at the DFT level (U = 1)
+        occ = (_onsite_dft_occupations(wfn, nk, (b_lo, b_hi), kweights)
+               if occupations is None else occupations)
+        if tuple(np.shape(occ)) != (nk, nb if U is None else int(np.shape(U)[2])):
+            raise ValueError(f"onsite_breit_field: occupations {np.shape(occ)} do not match "
+                             f"(nk_full={nk}, {nb if U is None else np.shape(U)[2]})")
+        if U is not None and tuple(np.shape(U))[:2] != (nk, nb):
+            raise ValueError(f"onsite_breit_field: U {np.shape(U)} is not (nk_full={nk}, nb={nb}, .)")
+        # D[a, b] = sum_k w_k sum_i f_ik (P U)_{k a i} conj((P U)_{k b i})
+        D = onsite_density_matrix(P_table, kweights, occ, setup, U=U, mesh=mesh)
+        _onsite_density_gate(D, occ, setup)
+        # h_I = h^dir[D_I] + h^x[D_I] (block-diagonal over shell-atoms, Ry)
+        h_block, pieces = onsite_block_potential(D, setup)
+        # H_OS[k, n, n'] = sum_ab conj(P[k, a, n]) h[a, b] P[k, b, n'] (Ry)
+        H_os = onsite_band_matrix(P_table, h_block, mesh=mesh)
+        h_max = float(jnp.max(jnp.abs(H_os)))
+        h_anti = float(jnp.max(jnp.abs(H_os - jnp.conj(jnp.swapaxes(H_os, -1, -2)))))
+        if not np.isfinite(h_max) or h_anti > ONSITE_HERMITICITY_RTOL * max(h_max, 1e-300):
+            raise _onsite_gate(
+                "onsite_breit_matrix", f"max|H_OS| = {h_max:.3e} Ry, max|H - H^+| = {h_anti:.3e} Ry",
+                f"finite and max|H - H^+| <= {ONSITE_HERMITICITY_RTOL:g} max|H_OS|",
+                "H_OS = P^+ h P with Hermitian h is Hermitian; otherwise h or P is broken",
+                "check the on-site potential pieces and the projection table")
+    report = onsite_report_lines(D, pieces, setup) + [
+        f"onsite_breit H_OS: bands [{b_lo}, {b_hi}) (global), {nk} full-BZ k, "
+        f"D from {'the WFN occupations (U = 1)' if U is None else 'the map (U, f)'}, "
+        f"double_counting = {setup.double_counting}, exchange = {setup.exchange}, "
+        f"max|H_OS| = {h_max * RY_TO_MEV:.5f} meV, max|H - H^+| = {h_anti * RY_TO_MEV:.1e} meV"]
+    for line in report:
+        emit(line)
+    return OnsiteBreitField(matrix=H_os, density_matrix=np.asarray(D), h_block=h_block,
+                            pieces=pieces, projections=P_table, setup=setup, report=report)

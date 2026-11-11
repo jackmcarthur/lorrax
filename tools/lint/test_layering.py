@@ -606,6 +606,7 @@ _DRIVER_PLUMBING_BUDGET = {
     "gw.eqp_bgw": 0,
     "postprocess.rotate_wfn_to_qp": 0,
     "gw.downfold_cli": 0,
+    "gw.onsite_breit_cli": 0,
     "tdagw.tdgw_jax": 0,
 
     # --- not clean, with the reason ---------------------------------------
@@ -717,6 +718,7 @@ _DRIVER_MAIN_STATEMENTS = {
     "bse.exciton_bands": (("main",), 389),
     "bandstructure.htransform": (("main",), 117),
     "gw.kin_ion_io": (("main",), 119),
+    "gw.onsite_breit_cli": (("main",), 17),
     "psp.get_dipole_mtxels": (("main",), 206),
     "tdagw.tdgw_jax": (("main",), 12),
 }
