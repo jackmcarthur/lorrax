@@ -36,6 +36,7 @@ with the run.
 
 | var | default | class | grammar and effect |
 |---|---|---|---|
+| `LORRAX_DIAG_BISPINOR_CARRIER` | unset (`normalized_rkb`) | routing-affecting (diagnostic) | Stripped, lower-cased: `normalized_rkb`, `raw` (charge and current on the raw kinetic-balance lift, stamp `raw_kinetic_balance_four_current_diag_v1`) or `pauli` (charge vertices on the large block `[psi_L; 0]`, current vertices on the raw lift, stamp `large_block_pauli_charge_v1`); any other value refuses (`common/four_current_model.py::diagnostic_bispinor_carrier`). Bispinor runs only; a carrier comparison, not physics for production. |
 | `LORRAX_WFN_BACKEND` | unset (auto) | routing-affecting | Stripped, lower-cased: `eager` or `phdf5` forces the WFN read backend (`services/wfn_loader/src/wfn_loader/loader.py::_auto_pick_backend`); `phdf5_host` refuses; any other value takes the auto pick without comment. A mesh-less loader always reads eager. At P>1 with no loadable FFI the auto pick refuses, and `eager` is the way through. |
 
 ---

@@ -35,11 +35,44 @@ module imports nothing from the GW driver so it can be used at artifact
 altitude.
 """
 
+import os
 from dataclasses import dataclass
 
 NORMALIZED_RKB_FOUR_CURRENT_REPRESENTATION = (
     "normalized_rkb_four_current_v1")
 SOURCE_WFN_CHARGE_REPRESENTATION = "source_wfn_normalized_charge_v1"
+# Diagnostic carriers (LORRAX_DIAG_BISPINOR_CARRIER, docs/reference/env_vars.md
+# section 1b).  Each has its own stamp, so a zeta, restart bundle, SC checkpoint
+# or Hall artifact written on another carrier is refused or refit.
+DIAG_BISPINOR_CARRIER_ENV = "LORRAX_DIAG_BISPINOR_CARRIER"
+DIAG_BISPINOR_CARRIERS = ("normalized_rkb", "raw", "pauli")
+RAW_KINETIC_BALANCE_FOUR_CURRENT_DIAG_REPRESENTATION = (
+    "raw_kinetic_balance_four_current_diag_v1")
+LARGE_BLOCK_PAULI_CHARGE_REPRESENTATION = "large_block_pauli_charge_v1"
+_DIAG_ANNOUNCED = set()
+
+
+def diagnostic_bispinor_carrier() -> str:
+    """The bispinor carrier selected by ``LORRAX_DIAG_BISPINOR_CARRIER``.
+
+    Unset or blank is ``normalized_rkb`` (main's carrier, unchanged).
+    ``raw``: charge and current on the raw kinetic-balance lift.
+    ``pauli``: two-component charge (large block, zero small block) in every
+    charge vertex, raw-lift current in every current vertex.  Any other value
+    refuses.
+    """
+    raw = os.environ.get(DIAG_BISPINOR_CARRIER_ENV, "")
+    mode = str(raw).strip().lower() or "normalized_rkb"
+    if mode not in DIAG_BISPINOR_CARRIERS:
+        raise ValueError(
+            f"{DIAG_BISPINOR_CARRIER_ENV}={raw!r}; expected one of "
+            f"{list(DIAG_BISPINOR_CARRIERS)} (unset = normalized_rkb)")
+    if mode != "normalized_rkb" and mode not in _DIAG_ANNOUNCED:
+        _DIAG_ANNOUNCED.add(mode)
+        print(f"*** LORRAX DIAG: {DIAG_BISPINOR_CARRIER_ENV}={mode}: "
+              "diagnostic bispinor carrier, not main's normalized RKB",
+              flush=True)
+    return mode
 
 
 @dataclass(frozen=True)
@@ -72,7 +105,8 @@ def resolve_four_current_representation(
     sites keep naming the mode they resolved -- when a phase-3 mode needs a
     different carrier, this is the one function that has to learn about it.
     """
-    from common.bispinor_init import NORMALIZED_RKB_LIFT
+    from common.bispinor_init import (
+        LARGE_BLOCK_LIFT, NORMALIZED_RKB_LIFT, RAW_KINETIC_BALANCE_LIFT)
 
     if not bool(bispinor):
         return FourCurrentRepresentation(
@@ -82,6 +116,28 @@ def resolve_four_current_representation(
             current_lift=None,
             scalar_head_bispinor=False,
             charge_representation=SOURCE_WFN_CHARGE_REPRESENTATION,
+        )
+    diag = diagnostic_bispinor_carrier()
+    if diag == "raw":
+        return FourCurrentRepresentation(
+            charge_bispinor=True,
+            charge_lift=RAW_KINETIC_BALANCE_LIFT,
+            current_bispinor=True,
+            current_lift=RAW_KINETIC_BALANCE_LIFT,
+            scalar_head_bispinor=True,
+            charge_representation=(
+                RAW_KINETIC_BALANCE_FOUR_CURRENT_DIAG_REPRESENTATION),
+        )
+    if diag == "pauli":
+        # The current lift must be raw: the direct field then takes the
+        # charge from the leading (unscaled psi_L) block of the current sphere.
+        return FourCurrentRepresentation(
+            charge_bispinor=True,
+            charge_lift=LARGE_BLOCK_LIFT,
+            current_bispinor=True,
+            current_lift=RAW_KINETIC_BALANCE_LIFT,
+            scalar_head_bispinor=True,
+            charge_representation=LARGE_BLOCK_PAULI_CHARGE_REPRESENTATION,
         )
     return FourCurrentRepresentation(
         charge_bispinor=True,

@@ -545,6 +545,9 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym):
         transverse_truncation_2d=(int(config.sys_dim) == 2),
         nb=int(band_slices.b3), mesh=mesh_xy,
         include_transverse=include_transverse,
+        # Diagnostic pauli carrier: the charge is the leading psi_L block.
+        charge_nspinor=(int(wfn.nspinor) if include_transverse
+                        and representation.charge_lift == "large" else None),
         bispinor_lift=(representation.current_lift or "raw"),
         return_sharded=True)
     charge = exact.charge if include_transverse else exact
