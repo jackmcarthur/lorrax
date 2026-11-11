@@ -17,6 +17,7 @@ from __future__ import annotations
 import atexit
 import ctypes
 import logging
+import math
 import threading
 from dataclasses import dataclass
 from functools import partial
@@ -279,17 +280,29 @@ def _padded_tile(local: int) -> int:
 def lu_layout(n: int, Px: int, Py: int) -> tuple[int, int, int]:
     """``(side, mb, nb)`` of the LU descriptors for an ``n x n`` operand.
 
-    One tile per rank (``side = n``) on a non-square mesh, at 1x1, for tiles up to
-    :data:`_BLOCK_MAX`, and on 2x2 up to :data:`_LU_RELABEL_LOCAL_MIN`.  Otherwise
-    a square relabeled block: the largest divisor <= :data:`_BLOCK_MAX` of the
-    tile, padded first to :func:`_padded_tile` where it has none in
-    [:data:`_BLOCK_MIN`, :data:`_BLOCK_MAX`] (10002 -> 10004, block 244).  Each
+    One tile per rank (``side = n``) at 1x1, for tiles up to :data:`_BLOCK_MAX`, on
+    2x2 up to :data:`_LU_RELABEL_LOCAL_MIN`, and on a non-square mesh up to
+    :data:`_LU_RELABEL_LOCAL_MIN`; a non-square mesh past it is refused (ValueError),
+    as eigh and Cholesky refuse one: relabeling needs mb == nb on a square grid, and
+    one tile there asks a getrf/getrs workspace that grows with the tile (83.5 GB/rank
+    at tile 10002).  Otherwise a square relabeled block: the largest divisor <=
+    :data:`_BLOCK_MAX` of the tile, padded first to :func:`_padded_tile` where it has
+    none in [:data:`_BLOCK_MIN`, :data:`_BLOCK_MAX`] (10002 -> 10004, block 244).  Each
     rank pads its own tile at its end (:func:`_pad_tile`), so the solve sees
     ``Pi (A + I_pad) Pi^T``: no data movement, X's live rows in place.  At one
     tile per rank on 4x4 (n 30000, run30k, 2026-10-19) getrf/getrs ran in 4
     serialized 7500-wide panel steps across nodes and the RHS could not be
     chunked: SMs idle."""
     local = n // Px
+    if Px != Py and max(local, n // Py) > _LU_RELABEL_LOCAL_MIN:
+        k = math.isqrt(Px * Py)
+        squares = " or ".join(f"{s}x{s} ({s * s} ranks)" for s in sorted({max(2, k), k + 1}))
+        raise ValueError(
+            f"distributed solve_lu: mesh {Px}x{Py} is not square and the {n // Px}x{n // Py} tile "
+            f"of n = {n} is past {_LU_RELABEL_LOCAL_MIN}: cuSOLVERMp can run only one tile per rank "
+            "there, whose getrf/getrs workspace grows with the tile (83.5 GB/rank at tile 10002).  "
+            f"Use a square mesh, e.g. {squares}, or a native solve_lu backend "
+            "(w_dyson_solver = local).")
     if Px != Py or Px == 1 or local <= _BLOCK_MAX or (Px < 4 and local <= _LU_RELABEL_LOCAL_MIN):
         return n, local, n // Py
     tile = _padded_tile(local)
@@ -329,9 +342,9 @@ def _pad_tile(local, rows: int, cols: int, *, eye: bool):
 
 def _announce_lu(kind, mesh, nq, n, side, nrhs, mb_a, nb_a, mb_b=None, nb_b=None, cols=None):
     """One rank-0 line per distributed LU program built: its descriptors, so a run's log shows
-    the layout it solved at (run30k 2026-10-19: a stalled Dyson LU printed none).  A warning
-    where a tile above :data:`_LU_RELABEL_LOCAL_MIN` still solves at one tile per rank (only a
-    non-square mesh now): its getrf/getrs workspaces grow with the tile."""
+    the layout it solved at (run30k 2026-10-19: a stalled Dyson LU printed none).  A tile past
+    :data:`_LU_RELABEL_LOCAL_MIN` never solves at one tile per rank (:func:`lu_layout` refuses
+    a non-square mesh there)."""
     if int(jax.process_index()) != 0:
         return
     Px, Py = (int(v) for v in _validate_mesh(mesh))
@@ -342,10 +355,6 @@ def _announce_lu(kind, mesh, nq, n, side, nrhs, mb_a, nb_a, mb_b=None, nb_b=None
     pad = f", tiles padded {n // Px} -> {side // Px}" if side != n else ""
     _LOG.debug(f"  [distrib_la.cusolvermp] {kind} {nq} x {n}^2 on the {Px}x{Py} mesh: A mb {mb_a} nb {nb_a} "
                f"({'one tile per rank' if one else 'relabeled block-cyclic'}{pad}){rhs}.")
-    if one and n // Px > _LU_RELABEL_LOCAL_MIN:
-        _LOG.warning(f"[distrib_la.cusolvermp] {kind} of {nq} x {n}^2 on the {Px}x{Py} mesh solves at one "
-                     f"{n // Px}x{n // Py} tile per rank: its getrf/getrs workspace grows with the tile "
-                     "(83.5 GB/rank at tile 10002) and may not fit; use a square mesh.")
 
 
 def post_getrs_room(n: int, nrhs: int, nbytes, *, mesh: Mesh) -> bool:

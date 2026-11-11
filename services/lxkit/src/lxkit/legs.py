@@ -206,10 +206,18 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         node_devices=4,                  # Perlmutter GPU node: 4 A100
         peak_reader="pool",
         vendor_rows=(
+            # n is the local tile edge L = side / Px (distrib_la.workspace.lu_workspace_model).
+            # runs/lu_workspace_pricing_20261111: complex128, nrhs = n, the default getrs room;
+            # each solve's mempool high-water equals lrx_lu_workspace_bytes to 0.1 MB.
             (("cusolvermp", "solve_lu"), MeasuredRow(
-                11.2, None, "local LU panels (n/Px + mb) nb", n=(4096, 30000),
-                p=(4, 4), source="lrx_lu_workspace_bytes 9.64-11.16 panels (getrf, getrs "
-                "nrhs = n, pivots), 2x2 A100, 2026-10-19, max taken; 4x4 unmeasured")),)),
+                10.0, None, "local LU panels (L + mb) nb, one tile per rank", n=(2048, 12000),
+                p=(4, 4), source="lrx_lu_workspace_bytes one tile per rank, 9.59-10.45 panels "
+                "at L 2048-12000 (getrf, getrs, pivots), 2x2 A100, 2026-11-11")),
+            (("cusolvermp", "solve_lu relabeled"), MeasuredRow(
+                11.2, None, "local LU panels (L + mb) mb, relabeled", n=(1024, 15000),
+                p=(4, 4), source="lrx_lu_workspace_bytes relabeled blocks 128-256, 11.05-11.16 "
+                "panels at L 10004-15000, 0.04-1.81 GB (under the 2 GiB getrs room) at L "
+                "1024-8192, 2x2 A100, 2026-11-11")),)),
     "ROCM": PlatformLeg(
         key="ROCM", vendor="rocm",
         so_name="liblorrax_ffi_rocm.so", so_env="LORRAX_FFI_ROCM_SO",

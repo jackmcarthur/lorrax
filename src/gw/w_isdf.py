@@ -2096,11 +2096,13 @@ def _w_solve_pref_scalar(meta) -> float:
         * float(nspinor_wfnfile))
 
 
-def dyson_route_prices(n, stack, ranks, contexts):
+def dyson_route_prices(n, stack, ranks, contexts, lu_workspace=None):
     """``(local, distributed)`` :class:`lxkit.memory.Price` of the W Dyson solve of
     ``stack`` q parents at side ``n`` on ``ranks`` devices (:func:`_dyson_route`'s
     admission, and ``gw.stage_inventory``'s).  ``contexts``: the providers'
-    contexts the distributed route opens (``lxkit.memory.contexts()``)."""
+    contexts the distributed route opens (``lxkit.memory.contexts()``);
+    ``lu_workspace``: its provider's solve workspace outside XLA
+    (:func:`dyson_lu_workspace`)."""
     from lxkit import memory
     n2 = 16.0 * n * n
     local_price = memory.Price(operands=memory.Term(
@@ -2108,8 +2110,23 @@ def dyson_route_prices(n, stack, ranks, contexts):
         source="V, chi, W faces + whole for ceil(stack/P) parents + one LU pair"), ranks=ranks)
     mesh_price = memory.Price(operands=memory.Term(
         spread=(3 * int(stack) + 2) * n2, source="V, chi, W faces + one face-tiled LU pair"),
-        outside=contexts, ranks=ranks)
+        vendor=lu_workspace or memory.Term(), outside=contexts, ranks=ranks)
     return local_price, mesh_price
+
+
+def dyson_lu_workspace(n, px, py, platform="CUDA"):
+    """The distributed W Dyson's solve workspace outside XLA per rank (:class:`lxkit.memory.Term`)
+    on a ``px x py`` mesh: cuSOLVERMp's on CUDA, ``distrib_la.workspace.lu_workspace_model``
+    (the shapes against the leg's measured rows; the source names the row); nothing for the
+    other providers, whose solve allocates inside its program.  Raises ``lu_layout``'s
+    ValueError where cuSOLVERMp refuses the mesh (non-square, tile past 8192)."""
+    from lxkit import memory
+    if platform != "CUDA":
+        return memory.Term(source=f"{platform} solve_lu: workspace inside the program")
+    from ffi import _services
+    _services.ensure_on_path()
+    from distrib_la import lu_workspace_model
+    return lu_workspace_model(int(n), int(px), int(py), 16)
 
 
 def _dyson_route(dyson, n, stack, mesh_xy):
@@ -2121,33 +2138,43 @@ def _dyson_route(dyson, n, stack, mesh_xy):
 
     Local holds V, χ and W whole for its ⌈stack/P⌉ parents and one LU working
     pair, beside the face-tiled V, χ and W; distributed holds the faces and
-    one face-tiled LU pair. Priced from the shapes against the fixed device
+    one face-tiled LU pair, plus its provider's solve workspace outside XLA
+    (:func:`dyson_lu_workspace`). Priced from the shapes against the fixed device
     budget; distributed LU room is also capped by the current agreed allocator
     room. φ in the memory rule covers XLA's temporaries.
     """
     from common.gpu_utils import device_budget_bytes
+    from distrib_la import mesh_platform
     from lxkit import memory
     ranks = int(mesh_xy.size)
     site = f"W Dyson {int(stack)} x {int(n)}^2"
     faces = 16.0 * n * n * 3 * int(stack) / ranks
     budget = device_budget_bytes()
     room = min(max(0, int(budget - faces)), memory.room()) if ranks > 1 else None
-    if dyson == "distributed":
-        return "distributed", room
     if ranks <= 1:
-        return "local", None
-    local_price, mesh_price = dyson_route_prices(n, stack, ranks, memory.contexts())
+        return ("distributed", room) if dyson == "distributed" else ("local", None)
+    try:
+        lu_ws, refused = dyson_lu_workspace(n, mesh_xy.shape['x'], mesh_xy.shape['y'],
+                                            mesh_platform(mesh_xy)), None
+    except ValueError as exc:
+        lu_ws, refused = None, exc
+    if dyson == "distributed":
+        if refused is not None:
+            raise refused
+        return "distributed", room
+    local_price, mesh_price = dyson_route_prices(n, stack, ranks, memory.contexts(), lu_ws)
 
     def probe():
         from ffi import _services
         _services.ensure_on_path()
         from distrib_la import resolve_backend
         resolve_backend("solve_lu", "distributed", mesh_xy, n=int(n), room=room)
-    route = memory.admit(site, (("local", local_price), ("distributed", mesh_price)),
-                         budget, probe=probe)
+    routes = (("local", local_price),) + (() if refused else (("distributed", mesh_price),))
+    route = memory.admit(site, routes, budget, probe=probe)
     if route == "local" and local_price.bytes() > budget:
         raise RuntimeError(f"GATE w_dyson_capacity: {site} has no admitted route; "
-                           f"whole-parent algebra needs {int(local_price.bytes())} bytes/rank "
+                           + (f"the distributed solve is refused ({refused}); " if refused else "")
+                           + f"whole-parent algebra needs {int(local_price.bytes())} bytes/rank "
                            f"over budget {int(budget)} and its distributed fallback did not fit")
     return ("local", None) if route == "local" else ("distributed", room)
 
