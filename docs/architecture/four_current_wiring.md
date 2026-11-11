@@ -17,8 +17,8 @@ is the q-IBZ count, $N_k$ the full k count, and $P$ the process count.
 
 `bispinor_gw ∈ {bare_transverse, full_static_cohsex, full_tangential}`
 (`gw_config.BispinorGWMode`). The value selects which Lorentz blocks are
-screened and who contracts Σ; every value resolves to the same normalized
-RKB carrier. The retired spellings `charge_hall_cubature`,
+screened and who contracts Σ; every value resolves to the same carrier, the
+Pauli four-current (two-component charge, raw-lift current). The retired spellings `charge_hall_cubature`,
 `pauli_reference_bare_transverse` and
 `isometric_kinetic_balance_bare_transverse` refuse by name
 (`_RETIRED_BISPINOR_GW_MODES`, read by `coerce_bispinor_gw_mode`), and each
@@ -95,7 +95,7 @@ flowchart TD
   end
   subgraph INIT["gw_init"]
     C["charge + current centroids"]
-    L["four-spinor parents (charge and current: normalized RKB lift)"]
+    L["four-spinor parents (charge: [psi_L;0]; current: raw RKB lift)"]
     Z["zeta_q.h5 + zeta_q_mu{1,2,3}.h5"]
     VQ["v_q_bispinor.h5: 7 unique tiles + photon_g0_vectors"]
   end
@@ -156,13 +156,18 @@ refuses it at any value. The TT overlay is decided by
 returns a frozen `FourCurrentRepresentation` with the fields
 `charge_bispinor`, `charge_lift`, `current_bispinor`, `current_lift`,
 `scalar_head_bispinor` and `charge_representation`. It has two outcomes:
-scalar (all false, source-WFN charge) and bispinor (charge and currents on
-the normalized RKB lift `normalized_rkb`, stamp
-`normalized_rkb_four_current_v1`;
-[theory](../theory/bispinor-gw.md#lift)). `model` is accepted and ignored.
+scalar (all false, source-WFN charge) and bispinor (charge on the
+large-block carrier `large_block`, $[\psi_L;0]$, and the two-spinor q→0 head,
+`scalar_head_bispinor = False`; currents on the raw kinetic-balance lift
+`raw`; stamp `pauli_charge_rkb_current_v1`;
+[theory](../theory/bispinor-gw.md#carrier)). `model` is accepted and ignored.
+Every loader call that lifts names its carrier: `bispinor_lift` has no
+default, and `bispinor = True` without one refuses.
 The resolver exists because the lift and the stamp are what the ζ, restart
-bundle, SC checkpoint and Hall-artifact authenticators compare, and they
-need one producer. It
+bundle, SC checkpoint, tangential-store and Hall-artifact authenticators
+compare, and they need one producer. The stamp is also written to
+`sigma_mnk.h5` (attribute `four_current_carrier`) and to the text output
+headers (`common.provenance.set_run_provenance`). It
 is not stored on the config: consumers call it, so grep for the function
 name.
 
@@ -423,7 +428,8 @@ driver entry.
 | `full_tangential_trs` | `screening.refuse_full_tangential_with_trs` (driver entry, on the measured symmetry) | `full_tangential` on a WFN with time reversal; use `bare_transverse` |
 | `bispinor_self_consistency_requires_live_four_current` | `refuse_unsupported_bispinor_gw` | bispinor QSGW with `density_self_consistent = false` |
 | `bare_tt_gamma_restart_unstamped` | same | `restart = true` where the bare TT overlay is on (`x_only`, B with GN/HL): restart $V$ does not stamp it |
-| `restart_bispinor_charge_carrier` | `gw_init._restart_charge_basis` | `restart = true` on a bundle whose `charge_representation` stamp is not `normalized_rkb_four_current_v1` (every bispinor bundle written before this name, including the 2026-10-05 `isometric_kinetic_balance_four_current_v1` bundles) |
+| `restart_bispinor_charge_carrier` | `gw_init._restart_charge_basis` | `restart = true` on a bundle whose `charge_representation` stamp is not `pauli_charge_rkb_current_v1` (every bispinor bundle written before 2026-11-11, on the normalized four-component carrier or earlier) |
+| `tangential_store` (stale identity) | `file_io.tangential_store._check_identity` | a bank, model or sector store whose identity lacks `four_current_carrier = pauli_charge_rkb_current_v1` (built on an earlier carrier) |
 | `full_tangential_envelope` | same | `full_tangential` without bispinor, MPA, `sigma_w_model = tangential` and `w_rpa` |
 | `bispinor_gw_requires_bispinor` | same | `full_static_cohsex` with `bispinor = false` |
 | `static_bispinor_photon_head_slab_only` | same | P-screened with `head_correction = full` and `sys_dim ≠ 2` |

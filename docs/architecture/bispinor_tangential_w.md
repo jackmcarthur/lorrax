@@ -89,8 +89,9 @@ untreated fit.
 
 ## 2 The carrier
 
-Every vertex of the four-current route acts on the normalized RKB lift of the
-two-component wavefunction ([bispinor GW](../theory/bispinor-gw.md)). The charge
+Every charge vertex of the four-current route acts on the two-component
+wavefunction (the large-block carrier $[\psi_L;0]$) and every current vertex on
+its raw kinetic-balance lift ([bispinor GW](../theory/bispinor-gw.md#carrier)). The charge
 and current densities are fitted on two separate centroid bases, $n_C$ and
 $n_T$ packed centroids. They are never merged.
 

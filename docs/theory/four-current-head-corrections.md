@@ -9,7 +9,7 @@ in the [input reference](../input_reference.md). The $S$ convention is
 [its own page](s-tensor-convention.md).
 
 Rydberg units throughout. The carrier, the vertices $\tilde\gamma^I$ and the
-channels C ($I=0$) and T ($I=1..3$) are [Bispinor GW §1](bispinor-gw.md#lift);
+channels C ($I=0$) and T ($I=1..3$) are [Bispinor GW §1](bispinor-gw.md#carrier);
 every current vertex carries one factor of $\alpha_{FS}/2$.
 
 ## 1. Routes, and what each channel carries {#four-current-phase-status}
@@ -391,7 +391,7 @@ first order in the long-wavelength vertex:
   static limit, the Fermi–Dirac zero-Matsubara $\Pi(0,0)$
   (`response_bank.photon_static_contact`), whose diagonal transitions carry
   $-D$. The two producers differ in the current vertex and the Fermi
-  surface (dipole velocity and tetrahedron atoms against the normalized-lift
+  surface (dipole velocity and tetrahedron atoms against the raw-lift
   current and Fermi–Dirac weights), so neither can borrow
   the other's limit.
 

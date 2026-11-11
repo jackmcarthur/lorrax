@@ -406,13 +406,13 @@ The $\Sigma^c$ band sum of the dynamic treatments (GN-PPM, HL-GPP, tangential) i
 `common.bispinor_init.lift_to_4spinor`
 {: .in-code }
 
-The small component follows from the large one by restricted kinetic balance, normalized so that the lift is an isometry (bands stay orthonormal, the density integrates to the electron count):
+The small component follows from the large one by restricted kinetic balance:
 
 $$
-\Psi_{n\bk}(\bG)=r(\bk+\bG)\begin{pmatrix}\psi_{n\bk}(\bG)\\ \tfrac{\alpha}{2}\,\boldsymbol\sigma\cdot(\bk+\bG)\,\psi_{n\bk}(\bG)\end{pmatrix},\qquad r=\Big(1+\tfrac{\alpha^2}{4}\lvert\bk+\bG\rvert^2\Big)^{-1/2} \tag{5.1}
+\Psi_{n\bk}(\bG)=\begin{pmatrix}\psi_{n\bk}(\bG)\\ \tfrac{\alpha}{2}\,\boldsymbol\sigma\cdot(\bk+\bG)\,\psi_{n\bk}(\bG)\end{pmatrix} \tag{5.1}
 $$
 
-with $\alpha$ the fine-structure constant and $\bk+\bG$ in bohr⁻¹. Negative-energy states are absent (no-pair). The sources are $\rho_{mn}=\Psi^\dagger_m\Psi_n$ and $J^i_{mn}=\Psi^\dagger_m\alpha^i\Psi_n$, and in Coulomb gauge the bare interaction is
+with $\alpha$ the fine-structure constant and $\bk+\bG$ in bohr⁻¹. Negative-energy states are absent (no-pair). The current is taken on this four-spinor, $J^i_{mn}=\Psi^\dagger_m\alpha^i\Psi_n$, which is exactly the Pauli current (orbital plus spin magnetization). The charge is the two-component density of `WFN.h5`, $\rho_{mn}=\psi^\dagger_m\psi_n$, in the Hartree field, the charge screening, $\Sigma^{CC}$ and the q→0 head, exactly as with `bispinor = false`. The fully relativistic pseudopotential already contains the spin–orbit and Darwin terms of the Coulomb interaction between electrons, so a four-component charge would count them twice (in bcc Fe it lowered the orbital moment by about 8 %). What the pseudopotential lacks are the current (Breit) terms, and those are what `bispinor = true` adds. Charge and current together satisfy continuity exactly. In Coulomb gauge the bare interaction is
 
 $$
 D=\begin{pmatrix}v&0\\0&t\end{pmatrix},\qquad t_{ij}=-v\,\big(\delta_{ij}-\hat K_i\hat K_j\big),\qquad \mathbf K=\bq+\bG \tag{5.2}

@@ -14,7 +14,7 @@ Hartree atomic units, $c=1/\alpha_{\rm FS}$. The code runs in Rydberg; its
 one relativistic constant, $\alpha_{\rm FS}/2=1/(2mc)$, is the same number in
 both (`common.bispinor_init.HALFALPHA`).
 
-## 1. Carrier {#lift}
+## 1. Carrier {#carrier}
 
 A positive-energy Dirac state splits into a large and a small two-spinor
 related by kinetic balance:
@@ -26,54 +26,69 @@ X=\frac{\alpha_{\rm FS}}{2}\,\boldsymbol\sigma\cdot\mathbf p .
 $$
 
 $\psi_L$ is the noncollinear DFT two-spinor (spin–orbit in the
-pseudopotential). Every vertex, charge and current, takes one carrier, the
-normalized RKB lift (`NORMALIZED_RKB_LIFT`;
-`common.four_current_model.resolve_four_current_representation`,
-`common.bispinor_init.lift_to_4spinor`):
+pseudopotential). The carrier is the Pauli four-current
+(`common.four_current_model.resolve_four_current_representation`,
+`common.bispinor_init.lift_to_4spinor`; stamp
+`pauli_charge_rkb_current_v1`):
+
+* **charge vertices** — $V_H$ and its matrix elements, the charge ζ,
+  $\Pi_{00}$, $W_C$, $\Sigma^{CC}$ and the q→0 charge head — take the
+  two-component density $\rho_{mn}=\psi_{Lm}^\dagger\psi_{Ln}$. Inside the
+  four-component container that is $\Psi_C=[\psi_L;0]$ (`LARGE_BLOCK_LIFT`);
+  the direct field reads the leading Pauli block of the current carrier;
+  the q→0 head is the two-spinor dipole (`scalar_head_bispinor = False`).
+* **current vertices** — $\boldsymbol\alpha\cdot\mathbf A$, the current ζ,
+  the bare and screened TT exchange, CT/TC — take the raw restricted
+  kinetic-balance (RKB) lift (`RAW_KINETIC_BALANCE_LIFT`)
 
 $$
-\Psi=\begin{pmatrix}I\\X\end{pmatrix}(I+X^\dagger X)^{-1/2}\psi_L,\qquad
-\Psi(\mathbf G)=r(\mathbf G)\begin{pmatrix}\psi_L(\mathbf G)\\
-\tfrac{\alpha_{\rm FS}}{2}\,\boldsymbol\sigma\cdot(\mathbf k+\mathbf G)\,\psi_L(\mathbf G)\end{pmatrix},\qquad
-r=\Bigl(1+\tfrac{\alpha_{\rm FS}^2}{4}|\mathbf k+\mathbf G|^2\Bigr)^{-1/2},
+\Psi(\mathbf G)=\begin{pmatrix}\psi_L(\mathbf G)\\
+\tfrac{\alpha_{\rm FS}}{2}\,\boldsymbol\sigma\cdot(\mathbf k+\mathbf G)\,\psi_L(\mathbf G)\end{pmatrix},
 $$
 
-with $\mathbf k+\mathbf G$ Cartesian in bohr⁻¹. Because
-$(\boldsymbol\sigma\cdot\mathbf K)^2=K^2$, the inverse square root is the
-scalar $r$ on each plane wave. The lift is an isometry,
-$\langle\Psi_m|\Psi_n\rangle=\langle\psi_{Lm}|\psi_{Ln}\rangle$: the lifted
-bands stay orthonormal and the four-component density integrates to the
-electron count. Negative-energy states are absent (no-pair).
+with $\mathbf k+\mathbf G$ Cartesian in bohr⁻¹. On it
+$c\,\Psi^\dagger\boldsymbol\alpha\Psi=\mathrm{Re}(\psi_L^\dagger\mathbf p\psi_L)+\tfrac12\nabla\times(\psi_L^\dagger\boldsymbol\sigma\psi_L)$
+is exactly the Pauli current (convective plus spin magnetization, $g=2$), and
+under two-component dynamics with local potentials
+$\partial_t\psi_L^\dagger\psi_L+\nabla\cdot\mathbf j_{\rm Pauli}=0$: the pair
+(two-component charge, raw-lift current) is a conserved four-current. At
+$q=0$, $\langle\Psi_m|c\,\alpha_i|\Psi_n\rangle=\langle\psi_{Lm}|p_i|\psi_{Ln}\rangle$,
+so the two-spinor charge head and the current vertex are one velocity
+operator. Negative-energy states are absent (no-pair).
+
+**Why the charge is two-component.** A fully relativistic norm-conserving
+pseudopotential is generated from a Dirac–Kohn–Sham atom whose Dirac equation
+holds the Hartree potential of every electron; ONCVPSP renormalizes the large
+component to unit norm and unscreens with the two-component
+$V_H[\rho_{\rm ps}]$ only. Its spin–orbit splittings and Darwin shifts are
+those of the screened atom, valence electrons included. A four-component
+charge in $V_H$ (normalized or not) adds, to $O(\alpha^2)$,
+
+$$
+\delta V=\tfrac{\alpha^2}{8}\nabla^2V_H+\tfrac{\alpha^2}{4}\,\boldsymbol\sigma\cdot(\nabla V_H\times\mathbf p),
+$$
+
+the valence–valence Darwin and spin-same-orbit terms, a second time (its
+exchange counterpart enters $\Sigma^{CC}$). For bcc Fe the spin-same-orbit
+term lowers $\xi_{3d}$ by 8.8 % (radial integral on the Fe pseudo-atom); the
+orbital moment moved by −7.1 % at first order on DFT states (4³), −7.9 % (8³)
+and −9.3 % after one GW map (8³), against exactly 0 for the two-component
+charge ([decisions](../architecture/decisions.md#pauli-four-current)). The
+spin-other-orbit, orbit-orbit and spin–spin terms (Breit) are in no
+Dirac–Coulomb pseudopotential; GW supplies them through the current vertices
+and all of the transverse kernel $t$. Core–valence Breit is outside any
+valence-only treatment.
 
 **Name and references.** $[I;X]\psi_L$ is restricted kinetic balance (RKB),
 the small component of Stanton and Havriliak, J. Chem. Phys. 81, 1910 (1984),
-doi:10.1063/1.447865. The factor $(I+X^\dagger X)^{-1/2}$ is the
-renormalization of the normalized elimination of the small component (NESC),
-Dyall, J. Chem. Phys. 106, 9618 (1997), doi:10.1063/1.473860, and of exact
-two-component (X2C) theory, Kutzelnigg and Liu, J. Chem. Phys. 123, 241102
-(2005), doi:10.1063/1.2137315; Iliaš and Saue, J. Chem. Phys. 126, 064102
-(2007), doi:10.1063/1.2436882. In an orthonormal plane-wave basis, with the
-small component written directly as $X\psi_L$, the X2C renormalization
-$R=(S^{-1}\tilde S)^{-1/2}$ reduces to $(I+X^\dagger X)^{-1/2}$. The lift
-is therefore the X2C positive-energy column $[I;X]R$ with the RKB decoupling
-$X=\boldsymbol\sigma\cdot\mathbf p/2c$ (Hartree units) in place of the
-exact one. It is not the free-particle Foldy–Wouthuysen state
-(Phys. Rev. 78, 29 (1950), doi:10.1103/PhysRev.78.29), whose
-$X=c\,\boldsymbol\sigma\cdot\mathbf p/(E+c^2)$ agrees with the RKB $X$ only
-to leading order in $p/c$. Until the 2026-10-05 rename the code called this
-construction the "isometric" lift (stamp
-`isometric_kinetic_balance_four_current_v1`); the construction is the same.
-
-The fully relativistic pseudopotential is a Dirac–Coulomb atom with no
-Breit term. The Coulomb and Hartree terms use the normalized four-component
-wavefunctions, as prior four-component GW does (owner, 2026-10-05). GW
-supplies all of the transverse kernel $t$.
-
-One exception remains: the scalar Γ-head dipole (`psp.get_dipole_mtxels`,
-`dipole.h5`) is built on the raw lift $[\psi_L;X\psi_L]$. Its relative
-difference is of the order of the raw norm excess
-$(\alpha_{\rm FS}^2/4)\langle p^2\rangle$, at most $1.5\times10^{-4}$ on
-CrI₃ (CLAIMS 3228).
+doi:10.1063/1.447865. The raw lift is not normalized: its norm is
+$1+(\alpha_{\rm FS}^2/4)\langle p^2\rangle$, which no vertex sees, because the
+current is $O(c^{-1})$ and the charge does not take the small block. The
+normalized lift $[I;X](I+X^\dagger X)^{-1/2}\psi_L$ (X2C/NESC
+renormalization; carrier of every vertex from 2026-10-05 to 2026-11-11, stamp
+`normalized_rkb_four_current_v1`) changes the current only at
+$O(\alpha^2\langle p^2\rangle)$ relative and is removed with the
+four-component charge.
 
 The stored vertices are $\tilde\gamma^I=\gamma^0\gamma^I$:
 $\tilde\gamma^0=1_4$, $\tilde\gamma^i=\alpha^i=\bigl(\begin{smallmatrix}0&\sigma^i\\\sigma^i&0\end{smallmatrix}\bigr)$
@@ -85,7 +100,7 @@ current channels T. Densities are $\Psi^\dagger\tilde\gamma^I\Psi$.
 For states $m,n$:
 
 $$
-\rho_{mn}=\Psi_m^\dagger\Psi_n,\qquad
+\rho_{mn}=\psi_{Lm}^\dagger\psi_{Ln},\qquad
 J^i_{mn}=\Psi_m^\dagger\alpha^i\Psi_n
 =\tfrac{\alpha_{\rm FS}}{2}\bigl[\psi_{Lm}^\dagger p^i\psi_{Ln}+(p^i\psi_{Lm})^\dagger\psi_{Ln}\bigr]
 +\tfrac{\alpha_{\rm FS}}{2}\bigl[\nabla\times(\psi_{Lm}^\dagger\boldsymbol\sigma\psi_{Ln})\bigr]^i+O(c^{-3}).
@@ -115,9 +130,9 @@ $$
 ## 3. Order in $1/c$ {#counting}
 
 Kinetic balance gives $\psi_S=O(c^{-1})\psi_L$, hence
-$J^T\equiv P^T\mathbf J=O(c^{-1})$, while $\rho=\rho^{LL}+\rho^{SS}=O(1)$.
-Its $O(c^{-2})$ parts, $\rho^{SS}$ and the $r^2$ renormalization of
-$\rho^{LL}$, are kept.
+$J^T\equiv P^T\mathbf J=O(c^{-1})$, while $\rho=\psi_L^\dagger\psi_L=O(1)$
+has no $O(c^{-2})$ part: the pseudopotential already holds the Coulomb-derived
+$c^{-2}$ terms (§1).
 
 The polarization $\Pi$ (the code's $\chi_0$) has sectors CC, CT, TC, TT
 ($\Pi_{00},\Pi_{0T},\Pi_{T0},\Pi_{TT}$), one source at each end:
@@ -183,8 +198,8 @@ two-component GW is recovered exactly; this is a gate for any change here.
 
 ## 5. `bare_transverse` {#bare-transverse}
 
-Two-component GW builds $\rho$ from $\psi_L$ and uses $v$ alone. It drops
-the $c^{-2}$ part of the four-component charge (§3) and the transverse
+Two-component GW builds $\rho$ from $\psi_L$ and uses $v$ alone; so does the
+charge sector here (§1). Two-component GW drops the transverse
 exchange $J^TtJ^T$ (Breit: spin-other-orbit, orbit-orbit, spin–spin) with
 its direct part $\boldsymbol\alpha\cdot\mathbf A$. `bare_transverse` adds
 them. The transverse exchange acts on every occupied state, its vertex grows

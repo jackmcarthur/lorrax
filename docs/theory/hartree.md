@@ -17,10 +17,12 @@ $$
 
 $f_{n\mathbf k}$ is the physical occupation, fractional on a metal; the
 screening band window does not truncate the density. On bispinor decks
-$\psi$ is the normalized RKB four-component lift
-([carrier](bispinor-gw.md#lift)), and $\rho$ and $J$ come from one scan of
-it: the direct field is the full four-current Hartree
-$V_H[\rho]+\boldsymbol\alpha\cdot\mathbf A[J]$ on one carrier, and
+$\psi$ is loaded once on the current carrier, the raw kinetic-balance lift
+$[\psi_L;(\alpha_{\rm FS}/2)\boldsymbol\sigma\cdot\mathbf p\,\psi_L]$
+([carrier](bispinor-gw.md#carrier)): $\rho$ is its leading Pauli block,
+$\rho=\psi_L^\dagger\psi_L$, and $J$ takes all four components, from one
+scan. The charge part of the direct field is therefore the two-spinor
+$V_H$ to round-off (2×10⁻⁸ meV on bcc Fe), and
 $\int\rho$ is the electron count exactly. The signed Dirac
 current $J$ exists only for four-component bispinors. It is a current, not a
 second charge density, and enters only through the transverse projector

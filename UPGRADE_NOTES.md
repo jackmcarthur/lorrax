@@ -5,6 +5,48 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-11 — Bispinor runs: two-component charge, Pauli current
+
+With `bispinor = true`, every charge term (Hartree field, charge screening
+$\Pi_{00}$/$W_C$, $\Sigma^{CC}$ and the q→0 head) now uses the two-component
+density of `WFN.h5`, and only the current terms ($\boldsymbol\alpha\cdot\mathbf A$,
+transverse exchange, CT/TC) use the four-component kinetic-balance spinor,
+whose current is the Pauli current. From 2026-10-05 to this change every
+vertex used the normalized four-component spinor. Its charge counted the
+spin–orbit and Darwin terms of the electron–electron Coulomb interaction a
+second time; the fully relativistic pseudopotential already holds them.
+
+Which results move: every bispinor result computed with the old carrier
+carries a spurious reduction of the 3d spin–orbit constant of about 8–9 %
+(Fe, Ni; about 10 % for Cr 3d). In bcc Fe the orbital moment moved by
+−7.1 % (first order, 4×4×4), −7.9 % (8×8×8) and −9.3 % (one GW iteration,
+8×8×8) against the charge-only run; with the two-component charge the
+first-order change is exactly 0, and the bispinor-minus-charge difference that
+remains is the current (Breit) part, about −0.5 % at 4×4×4 after one GW
+iteration. The 2026-10-05 note that the normalized result was within 0.2 % of
+the raw-lift one was accurate, but both were about 9.6 % below the charge-only
+run. Gaps and QP energies move by the spin–same-orbit term of each state
+(the I 4d spin–orbit splitting of CrI₃ by 8 meV). The current terms are
+unchanged (transverse Σ to 0.004 meV). Two-component (`bispinor = false`) runs
+are unchanged bit for bit.
+
+What to do: rerun bispinor workflows from preprocessing. `dipole.h5` for a
+bispinor input file is now the two-spinor dipole (the same file as for
+`bispinor = false`); a four-spinor `dipole.h5` or `parallel_transport.h5` is
+refused by its provenance check. A `restart = true` run on an ISDF tensor file
+written with the old carrier refuses with `GATE
+restart_bispinor_charge_carrier`; a self-consistency checkpoint from the old
+carrier is not continued (the run starts fresh), tangential stores refuse with
+`GATE tangential_store: stale input/SC identity`, and ζ files refit. Outputs
+name the carrier: the startup block (`bispinor carrier`), a
+`# four_current_carrier = pauli_charge_rkb_current_v1` line in the text output
+headers and the `four_current_carrier` entry of `sigma_mnk.h5`. A
+self-consistent bispinor run with `sigma_lorentz_debug_output = true` no longer
+stops in the final `sigma_diag.dat` writer; its sector columns are in
+`sigma_lorentz_iter*.h5`. No input-file key changes. See
+[decisions](docs/architecture/decisions.md#pauli-four-current) and
+[bispinor GW](docs/theory/bispinor-gw.md#carrier).
+
 ## 2026-10-27 — Keep ROCm communicator ownership stable
 
 ROCm startup now supplies `--xla_gpu_enable_nccl_comm_splitting=false` from

@@ -12,6 +12,44 @@ The GW driver's phase invariants and the per-function contracts of
 `gw.gw_config` are developer reference, not rulings:
 [GW driver and configuration contracts](../dev/gw_config_contracts.md).
 
+## 2026-11-11 — Bispinor charge vertices take the two-component density; current vertices the Pauli current {#pauli-four-current}
+
+**Rule (owner).** Every charge vertex of a bispinor run — the Hartree
+density and its matrix elements, the charge ζ, $\Pi_{00}$, $W_C$,
+$\Sigma^{CC}$ and the q→0 charge head — takes $\psi_L^\dagger\psi_L$ (the
+large-block carrier $[\psi_L;0]$; the two-spinor `dipole.h5`). Every current
+vertex — $\boldsymbol\alpha\cdot\mathbf A$, the current ζ, bare and screened
+TT, CT/TC — takes the raw kinetic-balance lift
+$[\psi_L;(\alpha_{\rm FS}/2)\boldsymbol\sigma\cdot\mathbf p\,\psi_L]$, whose
+$c\Psi^\dagger\boldsymbol\alpha\Psi$ is the Pauli current and is conserved
+with that charge ([theory](../theory/bispinor-gw.md#carrier)). Stamp
+`pauli_charge_rkb_current_v1`; stores on another carrier refuse.
+
+**Why.** A fully relativistic pseudopotential is built from a Dirac–Kohn–Sham
+atom whose Dirac equation held the Hartree potential of all electrons, and its
+unscreening removes only the two-component $V_H[\rho_{\rm ps}]$; its
+spin–orbit and Darwin terms are those of the screened atom. A four-component
+charge (normalized or raw) adds $(\alpha^2/8)\nabla^2V_H +
+(\alpha^2/4)\boldsymbol\sigma\cdot(\nabla V_H\times\mathbf p)$, the
+valence–valence Darwin and spin-same-orbit terms, a second time; on the Fe
+pseudo-atom the second lowers $\xi_{3d}$ by 8.8 %. Measured on bcc Fe: the
+four-component charge changed the orbital moment by −7.1 % at first order on
+DFT states (4³), −7.9 % (8³) and −9.3 % after one GW map (8³); the
+two-component charge changes it by exactly 0 at first order, and the current
+channel is insensitive to the lift (transverse Σ equal to 0.004 meV).
+Evidence: `$S2/runs/Fe/04_symmetric_small_bispinor_2026-09-17/120_tier1_direct_field_20261110/`,
+`$S2/runs/Fe/202_fm_8x8x8_tangential_reference_20261023/30_breit_carrier_arms_20261110/post/`
+($S2 = `/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14`).
+This restores the 2026-10-04 large-block carrier (d031c3dd6) and supersedes
+the 2026-10-05 ruling that charge and current share the normalized
+four-component carrier.
+
+**Deletes.** The normalized RKB lift (`NORMALIZED_RKB_LIFT`, its factor and
+its K jet), the stamp `normalized_rkb_four_current_v1`, the four-spinor q→0
+charge dipole, the `"raw"` default of every lift argument (a bispinor load now
+names its carrier or refuses), and the direct field's `charge_nspinor` and
+`bispinor_lift` arguments.
+
 ## 2026-10-23 — SLATE is removed; ROCm LU is one device within the room {#no-slate}
 
 **Rule (owner).** LORRAX has no SLATE backend. The distributed libraries are
@@ -149,25 +187,6 @@ pencil extent's (`round_tables`, in the SC session).
 the CT span widths (`cross_span_widths`) still hold a maximum from map 1,
 bounded by the pole budget; the writer width is a store carrier, not a
 program shape.
-
-## 2026-10-05 — Bispinor Coulomb and Hartree use the normalized four-component wavefunctions {#four-component-carrier}
-
-**Rule (owner).** The Coulomb interaction and the Hartree field are evaluated
-with the normalized four-component wavefunctions
-$\Psi=[I;X](I+X^\dagger X)^{-1/2}\psi_L$, $X=(\alpha_{\rm FS}/2)\boldsymbol\sigma\cdot\mathbf p$
-(the normalized RKB lift; name and references in
-[theory](../theory/bispinor-gw.md#lift)), as prior four-component GW does. The current vertices take the same carrier,
-so the direct field is the four-current Hartree $V_H[\rho]+\boldsymbol\alpha\cdot\mathbf A[J]$
-of one $\Psi$ ([theory](../theory/bispinor-gw.md#lift)).
-
-**Why.** The fully relativistic pseudopotential is a Dirac–Coulomb atom with
-no Breit term; it does not stand in for the two-electron relativistic terms.
-
-**Deletes.** The large-block charge carrier $(\psi_L,0)$, its stamp, and the
-direct field's separate charge spinor block.
-
-**Not yet conforming.** The scalar Γ-head dipole (`psp.get_dipole_mtxels`)
-is built on the raw lift $[\psi_L;X\psi_L]$.
 
 ## 2026-10-01 — Per-pass loops are scans over device tables {#scan-pass-loops}
 

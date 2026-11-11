@@ -162,7 +162,7 @@ else.
 | `__init__.py` | Package marker for shared LORRAX utilities. |
 | `async_io.py` | A single-worker host dispatcher with bounded back-pressure. |
 | `band_degeneracy.py` | Finds degeneracy blocks and validates band-window boundaries. |
-| `bispinor_init.py` | The kinetic-balance lifts (raw and normalized RKB): small-component spinors from the large components. |
+| `bispinor_init.py` | The two bispinor carriers: the raw kinetic-balance lift (current vertices) and the large-block carrier $[\psi_L;0]$ (charge vertices). |
 | `centroid_basis.py` | The in-memory centroid order: whole symmetry orbits per shard. |
 | `chi_from_dipole.py` | Builds response data from dipole matrix elements. |
 | `collectives.py` | Wraps process collectives and communicator warm-up. |

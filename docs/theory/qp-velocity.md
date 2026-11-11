@@ -70,13 +70,13 @@ $$v_a = 2(k+G)_a \;+\; s\,\frac{\partial V_\mathrm{NL}(k)}{\partial k_a}
 ([outputs](../how-to/berkeleygw-users.md#outputs)). The velocity is computed,
 not differenced: it is exact at each $k$ for the given states.
 
-**Bispinors.** With `bispinor = true`, `dipole.h5` is built on the raw
-kinetic-balance four-spinor $\Psi = (\Psi_L, (\alpha_\mathrm{fs}/2)\,\sigma\cdot p\,\Psi_L)$
-($\alpha_\mathrm{fs}$ the fine-structure constant). The GW vertices use the
-normalized RKB lift ([carrier](bispinor-gw.md#lift)); the dipole is the one
-exception ([decisions](../architecture/decisions.md#four-component-carrier)).
-The kinetic velocity acts on all four components and $V_\mathrm{NL}$ on the
-two large ones (`common.mtxel_sweep.dipole_operator`).
+**Bispinors.** With `bispinor = true`, `dipole.h5` is the two-spinor
+dipole, as for `bispinor = false`: the q→0 head is a charge vertex, and every
+charge vertex takes $\psi_L^\dagger\psi_L$
+([carrier](bispinor-gw.md#carrier),
+[decisions](../architecture/decisions.md#pauli-four-current)). On the
+current carrier $\langle\Psi_m|c\,\alpha_i|\Psi_n\rangle=\langle\psi_{Lm}|p_i|\psi_{Ln}\rangle$,
+so the same velocity serves the current vertex at $q=0$.
 
 ## 3. The quasiparticle Hamiltonian adds a nonlocal term
 
