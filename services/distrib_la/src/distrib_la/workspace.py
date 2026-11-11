@@ -302,19 +302,41 @@ def workspace_bytes_per_rank(plan, op, shapes, dtype, *, checked=False) -> int:
     return need
 
 
-def lu_workspace_bytes(mesh, n, dtype) -> int:
-    """Device bytes per rank one cuSOLVERMp solve_lu of an n x n system against n right-hand
-    sides allocates beside its operands (cudaMallocAsync, outside XLA's pool), per matrix: the
-    CUDA leg's measured row, 11.2 local panels at its blocks (``lxkit.memory.vendor``). Shapes
-    only: no vendor query -- cuSOLVERMp's bufferSize builds a cuBLASMp grid (an NCCL communicator
-    split) per call, which deadlocked a rank in libfabric's memory hooks (run30k, 2026-10-19)."""
+#: The getrs room a solve takes with none posted (cpp/cusolvermp/batched_solve_lu_ffi.cc,
+#: kGetrsDefaultCap): its RHS chunks take up to this beside the getrf workspace.
+GETRS_DEFAULT_ROOM = 2 << 30
+
+
+def lu_workspace_model(n, px, py, itemsize):
+    """:class:`lxkit.memory.Term`: device bytes per rank one cuSOLVERMp solve_lu of an n x n
+    system against n right-hand sides allocates beside its operands (cudaMallocAsync, outside
+    XLA's pool), from the shapes alone, at the layout the solve runs (``lu_layout``; a
+    non-square mesh it refuses raises its ValueError here).  The CUDA leg's measured rows
+    (``lxkit.memory.vendor``, local tile L): one tile per rank, 10.0 local panels (L + mb) nb
+    (19.2-19.7 tiles, 2x2); relabeled, 11.2 panels at its block, at least the getrs room with
+    none posted (:data:`GETRS_DEFAULT_ROOM`; measured 0.04-1.81 GB at L 1024-15000).  The source
+    names the row, EXTRAPOLATED outside its measured L and P.  For a planner off the device
+    (no native build); on one, :func:`lu_workspace_query` is the figure."""
     from distrib_la._cusolvermp import lu_layout
     from lxkit import leg_for_platform, memory
-    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    px, py, item = int(px), int(py), int(itemsize)
     side, mb, nb = lu_layout(int(n), px, py)
-    item = np.dtype(dtype).itemsize
-    return int(memory.vendor(leg_for_platform("CUDA"), "cusolvermp", "solve_lu", side, px * py, item,
-                             unit=(side // px + mb) * nb * item).fixed)
+    local = side // px
+    one = mb == local
+    term = memory.vendor(leg_for_platform("CUDA"), "cusolvermp", "solve_lu" if one else "solve_lu relabeled",
+                         local, px * py, item, unit=(local + mb) * nb * item)
+    if one or term.fixed >= GETRS_DEFAULT_ROOM:
+        return term
+    return memory.Term(float(GETRS_DEFAULT_ROOM), source=f"the 2 GiB getrs room (above {term.source})")
+
+
+def lu_workspace_bytes(mesh, n, dtype) -> int:
+    """Device bytes per rank one cuSOLVERMp solve_lu of an n x n system against n right-hand
+    sides allocates beside its operands, per matrix: :func:`lu_workspace_model` at ``mesh``.
+    Shapes only: no vendor query -- cuSOLVERMp's bufferSize builds a cuBLASMp grid (an NCCL
+    communicator split) per call, which deadlocked a rank in libfabric's memory hooks (run30k,
+    2026-10-19)."""
+    return int(lu_workspace_model(n, mesh.shape['x'], mesh.shape['y'], np.dtype(dtype).itemsize).fixed)
 
 
 @lru_cache(maxsize=128)

@@ -336,7 +336,10 @@ zero and read the solver's `info` after every `syevd`, `potrf`, `potrs`,
 `getrf` and `getrs` and return a nonzero value as an error naming the
 routine (`src/ffi/cpp/cusolvermp/info.h`). LU and Cholesky keep one tile per rank,
 because block-cyclic `getrs`/`potrs` are 2–3× slower and `getrf` gains
-nothing.
+nothing. LU past an 8192-row tile (and past 256 rows on a square mesh from 4×4) runs relabeled
+block-cyclic instead (`_cusolvermp.lu_layout`): at one tile per rank its workspace is
+about 19 local tiles (31 GB at tile 10004). A non-square mesh cannot relabel, so
+there a tile past 8192 is refused, naming the square meshes that would run it.
 
 ## Inside the ScaLAPACK handlers {#inside-the-scalapack-handlers}
 

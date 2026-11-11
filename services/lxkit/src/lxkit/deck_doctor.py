@@ -276,6 +276,28 @@ def _backend_lines(
     return lines
 
 
+def _lu_workspace_lines(config, *, n_rmu: int, science_mesh: tuple[int, int]) -> list[str]:
+    """The distributed W Dyson's cuSOLVERMp LU workspace per rank on the science mesh, from
+    the shapes (``gw.w_isdf.dyson_lu_workspace``: the CUDA leg's measured rows; the line names
+    the row), at the q-padded centroid count the planner prices.  A mesh cuSOLVERMp refuses
+    fails a deck that asks for the distributed Dyson; under local it is reported (the run
+    admits only the local Dyson)."""
+    px, py = science_mesh
+    if px * py <= 1:
+        return []
+    from gw.w_isdf import dyson_lu_workspace
+    n = -(-int(n_rmu) // (px * py)) * (px * py)
+    head = f"LU_WORKSPACE site=W-Dyson provider=cusolvermp mesh={px}x{py} n={n}"
+    try:
+        term = dyson_lu_workspace(n, px, py)
+    except ValueError as exc:
+        if config.backend.w_dyson_solver == "distributed":
+            _fail("LX-DECK-LU-MESH", str(exc), "a square science mesh for the distributed W Dyson",
+                  "launch on a square rank count, or set w_dyson_solver = local")
+        return [f"{head} refused (only the local Dyson is admitted): {exc}"]
+    return [f"{head} bytes_per_rank={term.fixed / 1e9:.2f} GB model={term.source}"]
+
+
 def inspect_deck(args) -> None:
     """Run the source, deck, artifact and geometry preflights."""
     deck = Path(args.deck).expanduser().resolve()
@@ -366,6 +388,8 @@ def inspect_deck(args) -> None:
           f"pad={band_axis.pad} nelec={nelec} "
           f"ncond={config.ncond}")
 
+    for line in _lu_workspace_lines(config, n_rmu=n_rmu, science_mesh=(px, py)):
+        print(line)
     for line in _device_lines(gpu=args.gpu):
         print(line)
     for line in _backend_lines(
