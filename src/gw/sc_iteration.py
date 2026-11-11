@@ -1849,7 +1849,7 @@ def _dft_psi_sphere(inputs):
     representation = resolve_four_current_representation(
         bool(inputs.config.bispinor), inputs.config.bispinor_gw)
     carrier_bispinor = bool(representation.current_bispinor)
-    carrier_lift = representation.current_lift or "raw"
+    carrier_lift = representation.current_lift
     # The device placement is mesh-specific.  Keeping the mesh in the key
     # prevents a later calculation in the same process from reusing a buffer
     # whose devices belong to an earlier runtime.
@@ -2054,8 +2054,10 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
     representation = resolve_four_current_representation(
         bool(inputs.config.bispinor), inputs.config.bispinor_gw)
     include_current = bool(representation.current_bispinor)
-    # One carrier for charge and current (docs/theory/bispinor-gw.md#lift).
-    charge_ns = int(psi_G.shape[2])
+    # psi_G is on the current carrier (_dft_psi_sphere); the charge is its
+    # leading Pauli block psi_L (docs/theory/bispinor-gw.md#carrier).
+    charge_ns = (int(inputs.wfn.nspinor) if include_current
+                 else int(psi_G.shape[2]))
     # One density-scan shape per SC run: the rotated band count only grows
     # (a metal's occupied count drifts map to map; Fe 4^3 map 2 recompiled).
     from .qsgw_density import density_active_band_count
@@ -2113,8 +2115,8 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
                 tt_metric_sign=float(COULOMB_GAUGE_TT_SIGN))
 
     gtab = padded_gvectors(inputs.wfn, k=inputs.sym.parent_k_domain)
-    # Both branches sweep the resident sphere itself: the charge is every
-    # loaded component.
+    # Both branches sweep the resident sphere itself: the four-current
+    # operator reads the charge from the leading charge_ns components.
     geom_matrix = SweepGeometry(
         mesh=inputs.mesh_xy, fft_grid=grid,
         ngkmax=int(psi_G.shape[3]), nb=nb_logical,

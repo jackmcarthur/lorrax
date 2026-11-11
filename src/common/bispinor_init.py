@@ -7,6 +7,16 @@ where α is the fine-structure constant, σ are the Pauli matrices, and the
 momentum is Cartesian in bohr⁻¹.  The caller that owns the WFN-file convention
 must therefore fold ``blat`` into the stored dimensionless ``bvec`` exactly
 once before entering this module.
+
+A bispinor run uses two four-component carriers of the same two-component
+ψ_L (docs/theory/bispinor-gw.md#carrier); ``common.four_current_model`` says
+which vertex takes which:
+
+* ``RAW_KINETIC_BALANCE_LIFT``, ``[ψ_L; (α/2) σ·p ψ_L]``: every current
+  vertex.  ``c Ψ† α Ψ`` on it is exactly the Pauli current (convective plus
+  spin magnetization), conserved together with the charge ``ψ_L† ψ_L``.
+* ``LARGE_BLOCK_LIFT``, ``[ψ_L; 0]``: every charge vertex, so the charge
+  density and the scalar (CC) channel see ``ψ_L† ψ_L``.
 """
 
 import jax.numpy as jnp
@@ -15,9 +25,8 @@ from common.gamma_matrices import paulis
 
 
 # Half the fine-structure constant α (Hartree atomic units).  Single home
-# for the bispinor small-component scale — both the non-batched reference
-# ``get_small_psi_component`` and the k-batched ``lift_to_4spinor`` (the
-# WfnLoader production path) use it.
+# for the bispinor small-component scale, used by the k-batched
+# ``lift_to_4spinor`` (the WfnLoader production path).
 HALFALPHA = 0.00364867628215
 # The full fine-structure constant is derived here, beside the lift scale,
 # rather than re-spelled by current-vertex consumers.
@@ -34,15 +43,15 @@ NO_PAIR_DIRAC_CURRENT_MODEL = (
 KINETIC_BALANCE_LIFT_PROVENANCE = (
     "psi_S=(alpha_fs/2)*sigma.p*psi_L"
 )
-NORMALIZED_RKB_LIFT_PROVENANCE = (
-    "Psi=[I;X](I+X^dagger*X)^(-1/2)*psi_L;X=(alpha_fs/2)*sigma.p"
-)
+LARGE_BLOCK_LIFT_PROVENANCE = "Psi=[psi_L;0]"
+# The carrier of every current vertex (docs/theory/bispinor-gw.md#carrier).
 RAW_KINETIC_BALANCE_LIFT = "raw"
-# The carrier of every bispinor vertex (docs/theory/bispinor-gw.md#lift).
-NORMALIZED_RKB_LIFT = "normalized_rkb"
+# The carrier of every charge vertex: psi_L in the large block and a zero
+# small block (docs/theory/bispinor-gw.md#carrier).
+LARGE_BLOCK_LIFT = "large_block"
 LIFT_PROVENANCE = {
     RAW_KINETIC_BALANCE_LIFT: KINETIC_BALANCE_LIFT_PROVENANCE,
-    NORMALIZED_RKB_LIFT: NORMALIZED_RKB_LIFT_PROVENANCE,
+    LARGE_BLOCK_LIFT: LARGE_BLOCK_LIFT_PROVENANCE,
 }
 DIRAC_ALPHA_VERTEX_PROVENANCE = (
     "j=c*psi^dagger*alpha*psi; raw_paramagnetic_vertex_no_contact"
@@ -65,7 +74,7 @@ def apply_dirac_velocity_to_ket(psi):
     Returns (3,...,band,4,G). This is the paramagnetic Dirac velocity;
     nonlocal-potential and QP corrections belong to their existing owners.
     c=2/alpha_fs in Rydberg units. The input must already carry the selected
-    kinetic-balance representation; no normalization or second lift occurs.
+    current carrier (the raw kinetic-balance lift); no second lift occurs.
     """
     from common.gamma_matrices import gamma1, gamma2, gamma3
     if psi.ndim < 3 or psi.shape[-2] != 4:
@@ -73,14 +82,6 @@ def apply_dirac_velocity_to_ket(psi):
     return (2.0 / ALPHA_FS) * jnp.stack(tuple(
         jnp.einsum('st,...ntg->...nsg', alpha, psi)
         for alpha in (gamma1, gamma2, gamma3)))
-
-
-def _normalized_rkb_factor(K_cart_bohr_inv):
-    """The sole pointwise ``(I + X^dagger X)^(-1/2)`` spelling."""
-    K = jnp.asarray(K_cart_bohr_inv)
-    h2 = jnp.float64(HALFALPHA) ** 2
-    return jnp.reciprocal(jnp.sqrt(
-        jnp.float64(1.0) + h2 * jnp.sum(K * K, axis=-1)))
 
 
 def sigma_dot_cartesian(psi_L, vector_cart):
@@ -110,159 +111,20 @@ def sigma_dot_cartesian(psi_L, vector_cart):
         optimize=True)
 
 
-def kinetic_balance_lift_jet(
-    psi_L,
-    K_cart_bohr_inv,
-    *,
-    representation: str = RAW_KINETIC_BALANCE_LIFT,
-    cartesian_K_derivative_axes: tuple[int, ...] | None = None,
-):
-    r"""Return one representation-aware kinetic-balance endpoint jet.
-
-    ``psi_L`` is the large block *in the selected representation* at the
-    expansion point.  For ``raw`` it is the source Pauli spinor.  For
-    ``normalized_rkb`` it is already ``r(K) psi_source``; the function must not
-    normalize it a second time.  Holding ``psi_source`` fixed, the lifted
-    endpoint is
-
-    ``Psi(K) = [I; h sigma.K] psi_L(K)``, ``h=ALPHA_FS/2``.
-
-    ``K_cart_bohr_inv`` has shape ``(..., G, 3)`` in bohr^-1, paired with
-    ``psi_L`` of shape ``(..., band, 2, G)``.  The returned value has shape
-    ``(..., band, 4, G)``.
-
-    With ``cartesian_K_derivative_axes=None`` the historical return contract
-    is retained: ``(Psi, dPsi_dK)`` with the Cartesian derivative axis first.
-    The raw branch is the historical operation sequence unchanged.  Supplying
-    one or two axes returns only that ``K`` first- or second-derivative family.
-    This helper never inserts the signs from ``K_bra=k-q``: the downstream
-    operator supplies one minus at q-first order and none at q-second order.
-    The bounded selector lets that operator consume a derivative immediately
-    instead of materializing a three- or nine-WFN jet.
-
-    For the normalized_rkb representation,
-
-    ``r=(1+h^2 K^2)^(-1/2)``,
-    ``r_a/r=-h^2 K_a r^2``, and
-    ``r_ab/r=-h^2 delta_ab r^2+3 h^4 K_a K_b r^4``.
-
-    These analytic factors include both product-rule terms in the endpoint
-    derivative.  For the raw affine embedding the selected second derivative
-    is exact zero.  Bra/ket orientation and vertex/contact prefactors remain
-    with the downstream operator owner.
-    """
-    psi = jnp.asarray(psi_L)
-    K = jnp.asarray(K_cart_bohr_inv)
-    sigma_K_psi = sigma_dot_cartesian(psi, K)
-    halfalpha = jnp.complex128(HALFALPHA)
-    lifted = jnp.concatenate((psi, halfalpha * sigma_K_psi), axis=-2)
-
-    mode = str(representation).strip().lower()
-    # Validate through the one representation/provenance owner.  Keeping the
-    # returned string unused is deliberate: this numerical helper does not
-    # manufacture an artifact identity.
-    kinetic_balance_lift_provenance(mode)
-    axes = (None if cartesian_K_derivative_axes is None else tuple(
-        int(axis) for axis in cartesian_K_derivative_axes))
-    if axes is not None and len(axes) not in (1, 2):
-        raise ValueError(
-            "kinetic_balance_lift_jet cartesian_K_derivative_axes must "
-            f"contain one or two axes; got {axes}")
-    if axes is not None and any(axis < 0 or axis >= 3 for axis in axes):
-        raise ValueError(
-            "kinetic_balance_lift_jet Cartesian axes must lie in [0,3); "
-            f"got {axes}")
-
-    if axes is None and mode == RAW_KINETIC_BALANCE_LIFT:
-        # Historical raw path: preserve its operation sequence and returned
-        # bytes.  New selected-family code stays entirely off this branch.
-        dpsi_small = halfalpha * jnp.einsum(
-            "aij,...bjg->...abig", paulis, psi, optimize=True)
-        cart_axis = psi.ndim - 3
-        dpsi_small = jnp.moveaxis(dpsi_small, cart_axis, 0)
-        dpsi_dK = jnp.concatenate(
-            (jnp.zeros_like(dpsi_small), dpsi_small), axis=-2)
-        return lifted, dpsi_dK
-
-    def raw_first(axis: int):
-        small = halfalpha * jnp.einsum(
-            "ij,...bjg->...big", paulis[axis], psi, optimize=True)
-        return jnp.concatenate((jnp.zeros_like(small), small), axis=-2)
-
-    if mode == RAW_KINETIC_BALANCE_LIFT:
-        if len(axes) == 1:
-            return raw_first(axes[0])
-        return jnp.zeros_like(lifted)
-
-    h2 = jnp.float64(HALFALPHA) ** 2
-    r = _normalized_rkb_factor(K)
-    r2 = r * r
-
-    def first(axis: int):
-        r_a_over_r = -h2 * K[..., axis] * r2
-        return (r_a_over_r[..., None, None, :] * lifted
-                + raw_first(axis))
-
-    if axes is None:
-        return lifted, jnp.stack(tuple(first(axis) for axis in range(3)))
-    if len(axes) == 1:
-        return first(axes[0])
-
-    a, b = axes
-    r_a_over_r = -h2 * K[..., a] * r2
-    r_b_over_r = -h2 * K[..., b] * r2
-    r_ab_over_r = (
-        -h2 * jnp.asarray(a == b, dtype=jnp.float64) * r2
-        + 3.0 * h2 * h2 * K[..., a] * K[..., b] * r2 * r2)
-    return (
-        r_ab_over_r[..., None, None, :] * lifted
-        + r_a_over_r[..., None, None, :] * raw_first(b)
-        + r_b_over_r[..., None, None, :] * raw_first(a))
-
-
-def get_small_psi_component(gvecs, kvec, bvec_cart_bohr, psi_G):
-    """Compute the small (lower) spinor component from the large (upper).
-
-    Computes (α/2)(σ·(k+G)) ψ_nk(G) for bispinor functionality.
-
-    Args:
-        gvecs: (ngk, 3) integer G-vectors in crystal coordinates
-        kvec: (3,) k-vector in crystal coordinates
-        bvec_cart_bohr: (3, 3) Cartesian reciprocal lattice vectors in
-            bohr⁻¹ (rows = b1, b2, b3)
-        psi_G: (nb, nspinor, ngk) wavefunction coefficients (large component)
-
-    Returns:
-        psi_small: (nb, 2, ngk) small-component spinor coefficients
-
-    Note:
-        Not @jax.jit because ngk varies per k-point → recompilation overhead.
-        Possible improvements: σ·v with v = p + [r, V_NL + Σ], DKH4 contribution.
-    """
-    # Compatibility wrapper only.  The σ·p algebra has one implementation:
-    # the k-batched production kernel below.
-    return lift_to_4spinor(
-        psi_G[None, ...],
-        gvecs[None, ...],
-        kvec[None, ...],
-        bvec_cart_bohr,
-    )[0, :, 2:4, :]
-
-
 def lift_to_4spinor(
     psi_2, gvecs, kvecs, bvec_cart_bohr, *,
-    representation: str = RAW_KINETIC_BALANCE_LIFT,
+    representation: str,
 ):
-    """k-batched 2-spinor ψ → 4-spinor ψ via the small-component lift.
+    """k-batched 2-spinor ψ → 4-spinor ψ for one bispinor carrier.
 
-    Appends ``ψ_S = (α/2)(σ·(k+G)) ψ_L`` to the large components.
-    The default ``representation='raw'`` is the historical map, unchanged.
-    ``representation='normalized_rkb'`` applies the pointwise scalar
+    ``representation`` has no default: a bispinor load names the vertex it
+    serves (``common.four_current_model.resolve_four_current_representation``).
 
-    ``r(G) = 1/sqrt(1 + [(α/2)|k+G|]^2)``
+    * ``'raw'`` (``RAW_KINETIC_BALANCE_LIFT``, the current carrier) appends
+      ``ψ_S = (α/2)(σ·(k+G)) ψ_L`` to the large components.
+    * ``'large_block'`` (``LARGE_BLOCK_LIFT``, the charge carrier) appends
+      zeros, so ``Ψ†Ψ = ψ_L†ψ_L`` exactly.
 
-    to both upper and lower blocks.  Since ``(σ·K)†(σ·K)=|K|² I``, this is
-    exactly ``[I;X](I+X†X)^(-1/2)`` without a redundant 2×2 matrix inverse.
     Pure ``jnp`` (no jit / sharding here — the caller wraps it; see
     ``WfnLoader._get_bispinor_lift_jit``).
 
@@ -282,6 +144,8 @@ def lift_to_4spinor(
         (rows = b1, b2, b3).  This API does not accept the WFN file's raw
         dimensionless ``bvec`` because silently omitting ``blat`` rescales
         every small component.
+    representation : {'raw', 'large_block'}
+        The carrier (keyword only, required).
 
     Returns
     -------
@@ -290,13 +154,11 @@ def lift_to_4spinor(
     """
     mode = str(representation).strip().lower()
     kinetic_balance_lift_provenance(mode)
+    if mode == LARGE_BLOCK_LIFT:
+        return jnp.concatenate([psi_2, jnp.zeros_like(psi_2)], axis=2)
     # (k + G) in cartesian, per (k, g).
     pkG = gvecs + kvecs[:, None, :]                          # (n_k, ngkmax, 3)
     p_cart = pkG @ bvec_cart_bohr                             # (n_k, ngkmax, 3)
     psi_S = jnp.complex128(HALFALPHA) * sigma_dot_cartesian(
         psi_2, p_cart)
-    lifted = jnp.concatenate([psi_2, psi_S], axis=2)
-    if mode == RAW_KINETIC_BALANCE_LIFT:
-        return lifted
-    r = _normalized_rkb_factor(p_cart)
-    return lifted * r[:, None, None, :]
+    return jnp.concatenate([psi_2, psi_S], axis=2)

@@ -851,7 +851,7 @@ class UniformGaugeMatrixElements(NamedTuple):
 def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
                            vnl_setup,
                            include_contact: bool = True,
-                           kinetic_balance_lift: str = "raw") -> Operator:
+                           kinetic_balance_lift: str) -> Operator:
     r"""One apply-to-ket owner for current and exact uniform contact.
 
     The first three packed components are
@@ -873,8 +873,10 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
     separate current/contact drivers.
 
     ``kinetic_balance_lift`` names the representation already carried by
-    ``psi_n``.  The historical default is raw and remains on its old exact
-    operations and cache key.  The vertex is the q = 0 (long-wavelength)
+    ``psi_n`` and must be the current carrier, the raw kinetic-balance lift
+    (``common.four_current_model``); it has no default.  On that lift
+    ``psi_4[:, :2]`` is exactly ``psi_L``, the ket the V_NL derivative acts
+    on.  The vertex is the q = 0 (long-wavelength)
     velocity operator by design; no k/q-dependent nonlocal current vertex
     is planned.
 
@@ -902,7 +904,6 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
 
     from common.bispinor_init import (
         HALFALPHA,
-        NORMALIZED_RKB_LIFT,
         RAW_KINETIC_BALANCE_LIFT,
         kinetic_balance_lift_provenance,
     )
@@ -918,11 +919,12 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
     alpha_vertices = tuple(gamma_perm_phase(i) for i in (1, 2, 3))
     halfalpha = jnp.asarray(HALFALPHA, dtype=jnp.float64)
     lift_mode = str(kinetic_balance_lift).strip().lower()
-    lift_provenance = kinetic_balance_lift_provenance(lift_mode)
-    normalized_lift = lift_mode == NORMALIZED_RKB_LIFT
-    if lift_mode not in (
-            RAW_KINETIC_BALANCE_LIFT, NORMALIZED_RKB_LIFT):
-        raise AssertionError("kinetic-balance lift owner admitted a bad mode")
+    kinetic_balance_lift_provenance(lift_mode)
+    if lift_mode != RAW_KINETIC_BALANCE_LIFT:
+        raise ValueError(
+            "uniform_gauge_operator is a current vertex and takes the raw "
+            "kinetic-balance lift (common.four_current_model); got "
+            f"kinetic_balance_lift={kinetic_balance_lift!r}")
 
     def op(psi_n, gvec, gmask, bidx, kvec):
         del bidx
@@ -960,8 +962,6 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
         ("uniform_gauge_current_contact" if contact_enabled
          else "uniform_gauge_current"), geom.ngkmax, geom.ns,
         float(blat), id(vnl_setup))
-    if normalized_lift:
-        operator_key += ("kinetic_balance", lift_provenance)
     return Operator(
         apply=op, post=1.0,
         ncomp=(12 if contact_enabled else 3),
@@ -971,7 +971,7 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
 def _gauge_hamiltonian_operator_fingerprint(
     *, wfn, vnl_setup, band_start: int, band_stop: int,
     geom: SweepGeometry,
-    kinetic_balance_lift: str = "raw",
+    kinetic_balance_lift: str,
 ) -> str:
     """Compose the one uniform Hamiltonian operator identity.
 
@@ -1019,7 +1019,7 @@ def _gauge_hamiltonian_operator_fingerprint(
 def _uniform_gauge_sweep_fingerprint(
     *, wfn, vnl_setup, band_start: int, band_stop: int,
     geom: SweepGeometry,
-    kinetic_balance_lift: str = "raw",
+    kinetic_balance_lift: str,
 ) -> str:
     """Validate one uniform sweep manifold and return its sole identity."""
     start, stop = int(band_start), int(band_stop)
@@ -1051,7 +1051,7 @@ def sweep_uniform_current_matrix_elements(
     box_index,
     kvecs,
     use_scan: bool = True,
-    kinetic_balance_lift: str = "raw",
+    kinetic_balance_lift: str,
 ) -> UniformGaugeCurrentMatrixElements:
     """Select only ``Gamma_raw`` from the canonical uniform-gauge sweep.
 

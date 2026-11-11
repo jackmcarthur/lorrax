@@ -526,13 +526,22 @@ def load_parallel_transport_head(
                 f"the velocity gate judged bands [0,{judged}) only; the head "
                 f"needs [0,{expected_nb}) (regenerate with this deck)"
             )
-        if ints["effective_nspinor"] != int(meta.nspinor):
+        # The links feed the charge head: on a bispinor run they are the
+        # two-spinor links (scalar_head_bispinor, common.four_current_model).
+        from common.four_current_model import (
+            resolve_four_current_representation)
+        head_bispinor = resolve_four_current_representation(
+            int(meta.nspinor) == 4, None).scalar_head_bispinor
+        head_nspinor = 4 if head_bispinor else int(meta.nspinor_wfnfile)
+        if ints["effective_nspinor"] != head_nspinor:
             refusals.append(
                 f"effective_nspinor={ints['effective_nspinor']} != current "
-                f"{int(meta.nspinor)}"
+                f"head {head_nspinor}"
             )
-        if bool(ints["bispinor"]) != bool(int(meta.nspinor) == 4):
-            refusals.append("bispinor convention differs from current run")
+        if bool(ints["bispinor"]) != bool(head_bispinor):
+            refusals.append(
+                "bispinor convention differs from current run (a bispinor "
+                "run's head takes the two-spinor links since 2026-11-11)")
         if not np.array_equal(kgrid, expected_kgrid):
             refusals.append(
                 f"kgrid={tuple(kgrid)} != current {tuple(expected_kgrid)}")
@@ -4275,11 +4284,15 @@ def head_hall_operator_stamps(config, *, meta) -> dict:
     (:func:`_head_velocity_operator`) plus the current's kinetic-balance
     lift, in :func:`file_io.static_gauge_head.hall_operator_stamps` form.
     """
+    from common.four_current_model import resolve_four_current_representation
     from file_io.static_gauge_head import hall_operator_stamps
-    representation, velocity = _head_velocity_operator(config, meta)
+    _, velocity = _head_velocity_operator(config, meta)
+    # The Hall artifact is a current-vertex product: it is always on the
+    # current carrier, also when a two-spinor deck reads it.
     return hall_operator_stamps(
         **velocity,
-        kinetic_balance_lift=representation.current_lift or "raw")
+        kinetic_balance_lift=resolve_four_current_representation(
+            True, getattr(config, "bispinor_gw", None)).current_lift)
 
 
 def head_dipole_operator_stamps(config, *, wfn, meta, fallback_dir) -> dict:

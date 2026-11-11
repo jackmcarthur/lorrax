@@ -1627,7 +1627,7 @@ def _refuse_spinor_zero_fill(ns_want: int, ns_have: int, *, origin: str):
 
 def load_kpoint_fftbox_local(wfn, meta, k_idx, nb, *, b_lo: int = 0,
                              bispinor: bool = False,
-                             bispinor_lift: str = "raw"):
+                             bispinor_lift: str | None = None):
     """One k-point's ψ in the FFT box, **process-local**; see docs/architecture/zeta_fit_face_psi_cct.md."""
     loader = wfn  # reuse top-level WfnLoader; do NOT re-open (would re-slurp coeffs)
     psi = loader.load_process_local(
@@ -1699,7 +1699,7 @@ def get_enk_bandrange(wfn, sym, bandrange, sigma_bandrange, nspinor=None):
 def read_Gvecs_to_devices(
     wfn, sym, bandrange, meta: "Meta", bispinor: bool, mesh_xy: Mesh,
     k_range: tuple[int, int] | None = None,
-    *, bispinor_lift: str = "raw",
+    *, bispinor_lift: str | None = None,
 ):
     """G-space wfns on a 2-D mesh, band-sharded, scattered to FFT box; see docs/architecture/zeta_fit_face_psi_cct.md."""
     del sym
@@ -1737,7 +1737,7 @@ def load_psi_gflat_padded(
     pad_to: int | None = None,
     k="full_bz",
     sharding: P = band_sphere_spec(),
-    bispinor_lift: str = "raw",
+    bispinor_lift: str | None = None,
 ) -> "jax.Array | None":
     """One capped + zero-padded ψ(G-flat) load — THE shared load dance; see docs/architecture/zeta_fit_face_psi_cct.md."""
     b_lo, b_hi = int(bands[0]), int(bands[1])
@@ -1836,7 +1836,7 @@ def iter_psi_rchunk_bandwise(
     band_chunk_ranges: list[tuple[int, int]] | None = None,
     band_pad_to: int | None = None,
     product_r_spec: P | None = None,
-    bispinor_lift: str = "raw",
+    bispinor_lift: str | None = None,
 ):
     """Generator: yield ``(bc_range, psi_bc_r)`` one band chunk at a time; see docs/architecture/zeta_fit_face_psi_cct.md."""
     del sym
@@ -2547,7 +2547,7 @@ def _sample_centroid_parent_groups(
                     bispinor=False, pad_to=band_tile,
                     k=IBZRows((int(parent),)),
                     sharding=sharding_load,
-                    bispinor_lift="raw")
+                    bispinor_lift=None)
                 # A terminal band tile can lie wholly beyond mnband.
                 if parent_psi is None:
                     continue
@@ -2766,7 +2766,7 @@ def load_centroids_band_chunked(
     k_chunk_size: int | None = None,
     *,
     psi_G_flat: jax.Array | None = None,
-    bispinor_lift: str = "raw",
+    bispinor_lift: str | None = None,
     k_domain: str = "full_bz",
     return_ibz_parents: bool = False,
     full_k_rows=None,

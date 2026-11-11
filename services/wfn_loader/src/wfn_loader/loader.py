@@ -959,7 +959,7 @@ class WfnLoader:
         parent: int,
         full_k: int,
         bispinor: bool = False,
-        bispinor_lift: str = "raw",
+        bispinor_lift: str | None = None,
     ) -> jax.Array:
         """Realize one full-BZ child from one already-loaded raw parent.
 
@@ -986,10 +986,7 @@ class WfnLoader:
                 "WfnLoader.unfold_parent_to_full_k(bispinor=True) "
                 "requires a 2-spinor WFN; file has nspinor="
                 f"{int(self.nspinor)}.")
-        if not bispinor and str(bispinor_lift).strip().lower() != "raw":
-            raise ValueError(
-                "bispinor_lift selects a four-spinor transform and requires "
-                "bispinor=True")
+        _check_bispinor_lift(bispinor, bispinor_lift)
         parent = int(parent)
         full_k = int(full_k)
         sym = self._ensure_sym()
@@ -1868,7 +1865,7 @@ class WfnLoader:
         k: KSpec = "full_bz",
         sharding: PartitionSpec | None = None,
         bispinor: bool = False,
-        bispinor_lift: str = "raw",
+        bispinor_lift: str | None = None,
     ) -> jax.Array:
         """ψ(G) for a (band_range, k-set) window.
 
@@ -1897,10 +1894,7 @@ class WfnLoader:
             raise ValueError(
                 f"WfnLoader.load(bispinor=True) requires a 2-spinor WFN; "
                 f"file has nspinor={int(self.nspinor)}.")
-        if not bispinor and str(bispinor_lift).strip().lower() != "raw":
-            raise ValueError(
-                "bispinor_lift selects a four-spinor transform and requires "
-                "bispinor=True")
+        _check_bispinor_lift(bispinor, bispinor_lift)
 
         b_lo, b_hi = int(bands[0]), int(bands[1])
         nb_logical = b_hi - b_lo
@@ -1987,7 +1981,7 @@ class WfnLoader:
         bands: tuple[int, int],
         k: KSpec = "full_bz",
         bispinor: bool = False,
-        bispinor_lift: str = "raw",
+        bispinor_lift: str | None = None,
     ) -> jax.Array:
         """ψ(G) for THIS PROCESS ALONE — a **single-device** ``jax.Array``.
 
@@ -2028,10 +2022,7 @@ class WfnLoader:
             raise ValueError(
                 f"load_process_local(bispinor=True) requires a 2-spinor WFN; "
                 f"file has nspinor={int(self.nspinor)}.")
-        if not bispinor and str(bispinor_lift).strip().lower() != "raw":
-            raise ValueError(
-                "bispinor_lift selects a four-spinor transform and requires "
-                "bispinor=True")
+        _check_bispinor_lift(bispinor, bispinor_lift)
         b_lo, b_hi = int(bands[0]), int(bands[1])
         if b_hi <= b_lo:
             raise ValueError(f"empty band range: {bands}")
@@ -2117,7 +2108,7 @@ class WfnLoader:
         k: KSpec = "full_bz",
         sharding: PartitionSpec | None = None,
         bispinor: bool = False,
-        bispinor_lift: str = "raw",
+        bispinor_lift: str | None = None,
     ) -> Iterator[tuple[tuple[int, int], jax.Array]]:
         """Yield ``((bc_lo, bc_hi), psi)`` for a chunked sweep over bands."""
         if chunk <= 0:
@@ -2137,16 +2128,16 @@ class WfnLoader:
         *,
         k: KSpec,
         sharding: NamedSharding | None,
-        representation: str = "raw",
+        representation: str,
     ) -> jax.Array:
-        """ψ (2-spinor) → ψ (4-spinor) by appending the small components.
+        """ψ (2-spinor) → ψ (4-spinor) by appending the lower components.
 
-        Computes the lower-2 spinor components via
-        ``(α/2) σ·(k+G) ψ_L`` on G-flat directly — no FFT box.  Sharding
-        propagates through (the lift is k-vectorised + band-broadcast;
-        no cross-rank op).  Matches the legacy
-        :func:`common.bispinor_init.get_small_psi_component` byte-for-byte
-        but is vectorised across k.
+        ``representation`` names the bispinor carrier
+        (:func:`common.bispinor_init.lift_to_4spinor`): the raw
+        kinetic-balance lift ``(α/2) σ·(k+G) ψ_L`` or the large-block
+        carrier (zero lower block), on G-flat directly — no FFT box.
+        Sharding propagates through (the lift is k-vectorised +
+        band-broadcast; no cross-rank op).
 
         Pad rows of ψ are zero → small components of pad rows are also
         zero (clean propagation, no per-k mask needed).
@@ -2233,18 +2224,35 @@ class WfnLoader:
 # Bispinor small-component lift kernel
 # ---------------------------------------------------------------------------
 #
-# 2-spinor ψ (..., 2, ngkmax) → 4-spinor ψ (..., 4, ngkmax) via
-# (α/2) σ · (k+G) ψ_L applied to the upper components.  The constant + σ·p
-# contraction live once in :func:`common.bispinor_init.lift_to_4spinor`
-# (same math as :func:`common.bispinor_init.get_small_psi_component`, but
-# vectorised across k).  The loader only owns the jit-cache-by-sharding
-# wrapper below.
+# 2-spinor ψ (..., 2, ngkmax) → 4-spinor ψ (..., 4, ngkmax) for the named
+# carrier (the raw kinetic-balance lift (α/2) σ · (k+G) ψ_L, or the
+# large-block carrier's zero lower block).  The constant + σ·p contraction
+# lives once in :func:`common.bispinor_init.lift_to_4spinor` (vectorised
+# across k).  The loader only owns the jit-cache-by-sharding wrapper below.
+
+
+def _check_bispinor_lift(bispinor: bool, bispinor_lift) -> None:
+    """A bispinor load names its carrier; a two-component load names none.
+
+    ``bispinor_lift`` has no default: the charge and current vertices take
+    different carriers (``common.four_current_model``), so a default would
+    silently pick one of them for a caller that never chose.
+    """
+    if bispinor and bispinor_lift is None:
+        raise ValueError(
+            "WfnLoader: bispinor=True requires bispinor_lift (the carrier "
+            "named by common.four_current_model."
+            "resolve_four_current_representation)")
+    if not bispinor and bispinor_lift is not None:
+        raise ValueError(
+            "bispinor_lift selects a four-spinor transform and requires "
+            "bispinor=True")
 
 
 @functools.lru_cache(maxsize=None)
 def _get_bispinor_lift_jit(
     sharding: NamedSharding | None,
-    representation: str = "raw",
+    representation: str,
 ):
     """Cache one jit'd copy of the bispinor lift per output sharding.
 
@@ -2275,9 +2283,9 @@ def _bispinor_lift_kernel(
     bvec_cart_bohr: jax.Array,
     *,
     sharding: NamedSharding | None,
-    representation: str = "raw",
+    representation: str,
 ) -> jax.Array:
-    """Append small components → 4-spinor ψ.
+    """Append the lower components of the named carrier → 4-spinor ψ.
 
     psi_2: (n_k, nb, 2, ngkmax) c128
     gvecs: (n_k, ngkmax, 3)  float64 (already cast)

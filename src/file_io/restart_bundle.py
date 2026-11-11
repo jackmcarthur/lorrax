@@ -2841,23 +2841,31 @@ def read_dipole_parent_window(path, parent_rows, band_start, band_stop, *,
     return out
 
 
-def dipole_operator_mismatches(path, *, skip_vnl, vnl_mode, hubbard=None):
+def dipole_operator_mismatches(path, *, skip_vnl, vnl_mode, hubbard=None,
+                               bispinor=None):
     """``[(stamp, file value, run value)]`` for the velocity-operator stamps of
     ``dipole.h5`` that differ from the run's; an absent stamp counts as different
     (the operator that built the file cannot be named).  ``hubbard`` (``'none'``
     or ``psp.hubbard_ops``' JSON) joins them when given; an absent
-    ``prov_hubbard`` predates V_U and reads as ``'none'``.  Empty when all agree."""
+    ``prov_hubbard`` predates V_U and reads as ``'none'``.  ``bispinor`` (the
+    head's ``scalar_head_bispinor``) joins them when given and the file stamps
+    ``prov_bispinor``: a four-spinor dipole is not a bispinor run's charge head
+    since 2026-11-11.  Empty when all agree."""
     from psp.get_dipole_mtxels import _prov_ne
     from .dipole import require_dipole_format
     want = {"prov_skip_vnl": skip_vnl, "prov_vnl_mode": vnl_mode}
     with h5py.File(str(path), "r") as h5:
         require_dipole_format(h5.attrs, dipole_path=path)
-        attrs = {k: h5.attrs[k] for k in (*want, "prov_hubbard") if k in h5.attrs}
+        attrs = {k: h5.attrs[k] for k in (*want, "prov_hubbard", "prov_bispinor")
+                 if k in h5.attrs}
     bad = [(k, attrs.get(k, "<absent>"), v) for k, v in want.items()
            if k not in attrs or _prov_ne(attrs[k], v)]
     got_hub = attrs.get("prov_hubbard", "none")
     if hubbard is not None and _prov_ne(got_hub, str(hubbard)):
         bad.append(("prov_hubbard", got_hub, hubbard))
+    if (bispinor is not None and "prov_bispinor" in attrs
+            and _prov_ne(attrs["prov_bispinor"], bool(bispinor))):
+        bad.append(("prov_bispinor", attrs["prov_bispinor"], bool(bispinor)))
     return bad
 
 

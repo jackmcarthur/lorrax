@@ -27,7 +27,7 @@ def main():
     p.add_argument('--wfn', default=str(Path(__file__).parent / 'hsuite/fixture/WFN.h5'))
     p.add_argument('--case', choices=('all', 'narrow', 'multi', 'pad', 'raw', 'parents', 'bulk'), default='all')
     p.add_argument('--backend', choices=('auto', 'eager', 'phdf5'), default='auto')
-    p.add_argument('--lift', choices=('none', 'raw', 'normalized_rkb'), default='none')
+    p.add_argument('--lift', choices=('none', 'raw', 'large_block'), default='none')
     args = p.parse_args()
     mesh = stack.mesh
     started = time.perf_counter()
@@ -83,9 +83,9 @@ def main():
                     small = .00364867628215*np.stack((
                         z*up+(x-1j*y)*down,
                         (x+1j*y)*up-z*down), axis=1)
+                    if args.lift == 'large_block':
+                        small = np.zeros_like(small)
                     coeff = np.concatenate((coeff, small), axis=1)
-                    if args.lift == 'normalized_rkb':
-                        coeff /= np.sqrt(1+.00364867628215**2*np.sum(momentum**2, axis=1))[None, None, :]
                 phases = np.exp(2j*np.pi*(physical_K@positions.T))/np.sqrt(np.prod(grid))
                 expected[out, :real_hi-lo, :, :len(coords)] = np.einsum('bsg,gm->bsm', coeff, phases)
         return expected
@@ -97,7 +97,7 @@ def main():
         if requested_case == 'all':
             cases = [(name, 'none') for name in ('narrow', 'multi', 'pad', 'parents', 'bulk')]
             if int(wfn.nspinor) == 2:
-                cases += [('narrow', name) for name in ('raw', 'normalized_rkb')]
+                cases += [('narrow', name) for name in ('raw', 'large_block')]
         for args.case, args.lift in cases:
             if args.lift != 'none' and int(wfn.nspinor) != 2:
                 raise ValueError('bispinor oracle requires a two-component fixture')
@@ -133,14 +133,14 @@ def main():
             psi = None
             if args.case == 'bulk':
                 psi = load_psi_gflat_padded(wfn, (lo, hi), mesh_xy=mesh,
-                    bispinor=args.lift != 'none', k='full_bz', bispinor_lift=args.lift if args.lift != 'none' else 'raw')
+                    bispinor=args.lift != 'none', k='full_bz', bispinor_lift=args.lift if args.lift != 'none' else None)
             before = time.perf_counter()
             output = load_centroids_band_chunked(wfn, sym, meta, coords,
                 args.lift != 'none', mesh, (lo, hi), band_chunk_size=3,
                 k_chunk_size=None if args.case == 'bulk' else (1 if args.case == 'parents' else 2),
                 k_domain='ibz' if raw else 'full_bz', full_k_rows=full_rows,
                 return_ibz_parents=args.case == 'parents', psi_G_flat=psi,
-                bispinor_lift=args.lift if args.lift != 'none' else 'raw')
+                bispinor_lift=args.lift if args.lift != 'none' else None)
             jax.block_until_ready(output)
             sample_seconds = time.perf_counter()-before
             reference = fourier_reference(wfn, sym, coords, lo, hi, user_end,

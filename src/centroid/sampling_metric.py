@@ -370,6 +370,10 @@ def build_feature_metric_diagonal(
         f"{sym_rows.size} symmetry row(s); budget "
         f"{budget / 2**30:.2f} GiB/rank")
 
+    # The transverse metric samples the current channel, on its carrier.
+    from common.four_current_model import resolve_four_current_representation
+    current_lift = resolve_four_current_representation(
+        mode == "transverse", None).current_lift
     t0 = time.perf_counter()
     row_fields = jnp.zeros((sym_rows.size, n_grid), dtype=jnp.float64)
     for c0 in range(0, parents_used.size, k_chunk):
@@ -383,7 +387,8 @@ def build_feature_metric_diagonal(
             with timing.section("metric.load"):
                 psi_g = wfn.load(bands=(lo, hi), k=k_spec,
                                  sharding=band_sphere_spec(),
-                                 bispinor=(mode == "transverse"))
+                                 bispinor=(mode == "transverse"),
+                                 bispinor_lift=current_lift)
                 psi_g.block_until_ready()
             for w, (w_lo, w_hi) in enumerate(windows):
                 unit = ((bands >= w_lo) & (bands < w_hi)).astype(np.float64)

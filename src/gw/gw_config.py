@@ -215,19 +215,20 @@ _RETIRED_BISPINOR_GW_MODES: dict[str, tuple[str, str, str]] = {
     "pauli_reference_bare_transverse": (
         "bispinor_gw_pauli_reference_retired",
         "bispinor_gw = bare_transverse",
-        "this was a carrier-comparison mode, not a physics mode: it kept "
-        "the normalized QE Pauli two-spinor for charge/CC while the "
-        "current vertices stayed raw kinetic balance, and it could never "
-        "restart or write restart tensors.  All shipped modes use the raw "
-        "kinetic-balance carrier; a carrier study "
-        "belongs in a branch, not in the deck grammar (lane J section 2)"),
+        "the carrier it selected (the Pauli two-spinor for charge/CC, raw "
+        "kinetic balance for the current vertices) is the carrier of every "
+        "shipped mode since 2026-11-11, so the spelling selects nothing "
+        "(docs/architecture/decisions.md#pauli-four-current)"),
     "isometric_kinetic_balance_bare_transverse": (
         "bispinor_gw_isometric_kinetic_balance_retired",
         "bispinor_gw = bare_transverse",
         "this was a carrier-comparison mode whose own scalar q->0 head was "
         "the two-spinor artifact -- a mode that admits its own head is not "
-        "a calculation.  Its lift, then named 'isometric', is the normalized "
-        "RKB carrier every shipped mode now uses (lane J section 2)"),
+        "a calculation.  Its lift, then named 'isometric', became the "
+        "normalized RKB carrier, which was removed on 2026-11-11: a "
+        "four-component charge double counts the spin-orbit terms of the "
+        "fully relativistic pseudopotential "
+        "(docs/architecture/decisions.md#pauli-four-current)"),
 }
 
 

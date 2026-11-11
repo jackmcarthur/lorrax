@@ -406,8 +406,9 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'wfn_file':             os.path.realpath(wfn_path) if wfn_path else '',
 		'wfn_bytes':            wfn_bytes,
 	}
-	# Additive only for a non-raw carrier; raw stamps remain byte-for-byte
-	# reusable.
+	# Every bispinor zeta names its carrier (common.four_current_model), so a
+	# zeta fit on another carrier -- the normalized RKB lift before
+	# 2026-11-11 -- refits.
 	if carrier_lift is not None:
 		prov['bispinor_lift'] = str(carrier_lift)
 	# Stamp only the path whose physics changed.  Equal-window charge fits and
@@ -1854,7 +1855,7 @@ def _fit_charge_zeta_channel(
                 zeta_cutoff_ry=_zeta_cutoff,
                 layout="face",
                 print_fn=print_fn,
-                bispinor_lift=(representation.charge_lift or "raw"),
+                bispinor_lift=representation.charge_lift,
                 k_unfold_plan=k_unfold_plan,
                 psi_nmu_parent=psi_nmu_parent,
                 psi_mun_parent=psi_mun_parent,
@@ -1949,7 +1950,7 @@ def _fit_transverse_zeta_channels(
                 band_chunk=int(_chunks_T['mubatch'].band_chunk),
                 centroid_indices=_cent_T_idx, placement="device", bispinor=True,
                 store_band_range=zeta_contract.fit_band_range,
-                bispinor_lift=(representation.current_lift or "raw"),
+                bispinor_lift=representation.current_lift,
                 k_domain=sym.parent_k_domain, print_fn=print_fn)
         faces = _psi.faces
         parent_psi = _psi._replace(faces=None)
@@ -1987,7 +1988,7 @@ def _fit_transverse_zeta_channels(
             band_range_left=band_range_left, band_range_right=band_range_right,
             band_norms=_band_norms,
             distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
-            bispinor_lift=(representation.current_lift or "raw"),
+            bispinor_lift=representation.current_lift,
             write_ibz_only=_write_ibz_only_transverse,
             zeta_cutoff_ry=_zeta_cutoff,
             layout="face",
@@ -2742,7 +2743,7 @@ def _prepare_fresh_parent_faces(
     			centroid_indices=centroid_indices, placement="device",
                         store_band_range=zeta_contract.fit_band_range,
     			bispinor=bool(int(meta.nspinor) == 4),
-    			bispinor_lift=(representation.charge_lift or "raw"),
+    			bispinor_lift=representation.charge_lift,
     			k_domain=sym.parent_k_domain, print_fn=print0)
     		parent_y, parent_x = _parent_psi.faces
     		chunks['parent_psi'] = _parent_psi._replace(faces=None)
@@ -2760,7 +2761,7 @@ def _prepare_fresh_parent_faces(
     			band_chunk_size=load_band_chunk,
     			k_chunk_size=(chunks['centroid_k_chunk'] if chunks is not None
     			              else zeta_contract.loader_k_chunk),
-    			bispinor_lift=(representation.charge_lift or "raw"),
+    			bispinor_lift=representation.charge_lift,
     			k_domain=sym.parent_k_domain)
     from .wavefunction_bundle import parent_faces
     _parent_green_faces = parent_faces(parent_y, parent_x, mesh_xy=mesh_xy,
@@ -2797,7 +2798,7 @@ def _prepare_fitted_zeta(
     			wfn_fingerprint_binding=(
     				basis_wfn_fingerprint_binding),
     			role='transverse', bispinor=True,
-    			bispinor_lift=(representation.current_lift or "raw"),
+    			bispinor_lift=representation.current_lift,
     			band_interval=_basis_band_interval,
     			fft_grid=_meta_receipt_T.fft_grid,
     			centroid_fft_idx=(
@@ -2995,7 +2996,7 @@ def _prepare_fresh_isdf(
     	wfn=wfn,
     	wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
     	role='charge', bispinor=bool(int(meta.nspinor) == 4),
-    	bispinor_lift=(representation.charge_lift or "raw"),
+    	bispinor_lift=representation.charge_lift,
     	band_interval=_basis_band_interval,
     	fft_grid=meta.fft_grid, centroid_fft_idx=centroid_indices,
     	n_rmu_logical=int(meta.n_rmu),
@@ -3090,7 +3091,8 @@ def _restart_charge_basis(
     		f"GATE restart_bispinor_charge_carrier: {tensors_filename} "
     		f"charge_representation={_stamped.get('charge_representation')!r}; "
     		f"want {_charge.charge_representation!r} "
-    		f"(docs/theory/bispinor-gw.md#lift); fix: restart = false.")
+    		f"(the bispinor carrier changed on 2026-11-11, "
+    		f"docs/theory/bispinor-gw.md#carrier); fix: restart = false.")
     _have_c = _stamped.get('centroids_charge_md5')
     if _have_c is None:
     	log.info(
@@ -3129,7 +3131,7 @@ def _restart_charge_basis(
     			basis_wfn_fingerprint_binding),
     		role='charge',
     		bispinor=bool(int(meta.nspinor) == 4),
-    		bispinor_lift=(_charge.charge_lift or "raw"),
+    		bispinor_lift=_charge.charge_lift,
     		band_interval=_basis_band_interval,
     		fft_grid=meta.fft_grid,
     		centroid_fft_idx=centroid_indices,

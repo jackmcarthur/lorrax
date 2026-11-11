@@ -194,8 +194,6 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
                           nb: int, mesh=None,
                           include_transverse: bool = False,
                           transverse_truncation_2d: bool | None = None,
-                          charge_nspinor: int | None = None,
-                          bispinor_lift: str = "raw",
                           print_fn=None,
                           return_sharded: bool = False):
     """The exact FFT-grid ⟨mk|V_H|nk⟩ for all k — **(nk, nb, nb) Ry**.
@@ -224,6 +222,14 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
     ``transverse_truncation_2d`` (the GW boundary); None retains the shared
     convention for standalone diagnostic callers.
 
+    Carrier (docs/theory/bispinor-gw.md#carrier): on a bispinor ``meta``
+    (``nspinor = 4``) ψ is loaded once on the current carrier, the raw
+    kinetic-balance lift ``[ψ_L; (α/2)σ·p ψ_L]``; the charge density and
+    ``⟨m|V_H|n⟩`` take its leading Pauli block ``ψ_L`` (two-component
+    charge), the Dirac current and ``⟨m|α·A|n⟩`` take all four components.
+    The charge part therefore equals the two-spinor V_H to round-off.  There
+    is no carrier argument: the bispinor path has one carrier.
+
     By default returns the full-BZ matrix as a host ``numpy`` array replicated
     on every rank for diagnostic callers. Live GW consumers pass
     ``return_sharded=True`` and retain ``P(None,'x','y')`` through the
@@ -242,12 +248,15 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
     density_band_stop = int(wfn.physical_density_band_stop)
     nk = int(sym.nk_tot)
     with_transverse = bool(include_transverse)
-    charge_ns = (int(meta.nspinor) if charge_nspinor is None
-                 else int(charge_nspinor))
-    if not 0 < charge_ns <= int(meta.nspinor):
+    from common.four_current_model import resolve_four_current_representation
+    bispinor = int(meta.nspinor) == 4
+    representation = resolve_four_current_representation(bispinor, None)
+    # The charge is the Pauli block psi_L of the current carrier.
+    charge_ns = int(wfn.nspinor) if bispinor else int(meta.nspinor)
+    if bispinor and charge_ns != 2:
         raise ValueError(
-            "charge_nspinor must select a nonempty leading spinor block; "
-            f"got {charge_ns} for meta.nspinor={int(meta.nspinor)}")
+            "the bispinor direct field needs a two-component Pauli WFN; "
+            f"WFN.nspinor={charge_ns}")
     if with_transverse and int(meta.nspinor) != 4:
         raise ValueError(
             "transverse direct Hartree requires the canonical four-component "
@@ -275,8 +284,8 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
         n_sym=len(sym.active_symmetry_rows), ranks=int(mesh.devices.size))
     psi_G = wfn.load(
         bands=(0, nb_load), k=k_spec, sharding=band_sphere_spec(),
-        bispinor=(int(meta.nspinor) == 4),
-        bispinor_lift=bispinor_lift)
+        bispinor=bispinor,
+        bispinor_lift=representation.current_lift)
     box_index = wfn.box_index(k=k_spec)
     density_label = ("occupied bands" if exact_unit_occupations else
                      "WFN bands with canonical fractional occupations")
@@ -296,7 +305,7 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
             fft_grid=grid, cell_volume=float(wfn.cell_volume),
             spin_degeneracy=f_spin,
             include_dirac_current=with_transverse,
-            charge_nspinor=(None if charge_nspinor is None else charge_ns),
+            charge_nspinor=(charge_ns if bispinor else None),
             sym=sym,
             sym_perm=sym_perm,
             projection_receipt_fn=projections.append), dtype=np.float64)

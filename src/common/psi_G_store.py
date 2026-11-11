@@ -168,7 +168,7 @@ class PsiGStore:
         band_chunk_ranges: tuple[tuple[int, int], ...],
         meta,
         bispinor: bool = False,
-        bispinor_lift: str = "raw",
+        bispinor_lift: str | None = None,
         band_pad_to: int | None = None,
         k_domain: str = "full_bz",
     ):
@@ -177,7 +177,7 @@ class PsiGStore:
         self.band_chunk_ranges = tuple(tuple(bc) for bc in band_chunk_ranges)
         self.meta = meta
         self.bispinor = bool(bispinor)
-        self.bispinor_lift = str(bispinor_lift)
+        self.bispinor_lift = bispinor_lift
         # Which k rows the store holds: the unfolded full BZ (the production
         # ζ-fit source) or the WFN file's own raw parent rows.  A parent-k
         # consumer wants the IBZ rows themselves, not their images, and the
@@ -884,7 +884,7 @@ def build_psi_G_store(
     meta,
     band_chunk_ranges,
     bispinor: bool = False,
-    bispinor_lift: str = "raw",
+    bispinor_lift: str | None = None,
     band_pad_to: int | None = None,
     k_domain: str = "full_bz",
 ) -> PsiGStore:
@@ -1091,7 +1091,7 @@ def load_parent_psi_G(
     centroid_indices=None,
     placement: str = "device",
     bispinor: bool = False,
-    bispinor_lift: str = "raw",
+    bispinor_lift: str | None = None,
     k_domain: str = "ibz",
     mu_tile_bytes: int = 256 * 2**20,
     store_band_range: tuple[int, int] | None = None,

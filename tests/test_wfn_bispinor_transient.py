@@ -22,7 +22,7 @@ def main():
         worst = 0.
         for rows in ((0, 1, 0), (int(wfn.nkpts)-1, 2)):
             request = IBZRows(rows)
-            for lift in ('raw', 'normalized_rkb'):
+            for lift in ('raw', 'large_block'):
                 value = wfn.load(bands=(1, 4), k=request, bispinor=True,
                                  bispinor_lift=lift)
                 value.block_until_ready()
@@ -39,9 +39,9 @@ def main():
                         up,down = large[:, 0],large[:, 1]
                         small = .00364867628215*np.stack((
                             z*up+(x-1j*y)*down, (x+1j*y)*up-z*down), axis=1)
+                        if lift == 'large_block':
+                            small = np.zeros_like(small)
                         lifted = np.concatenate((large, small), axis=1)
-                        if lift == 'normalized_rkb':
-                            lifted /= np.sqrt(1+.00364867628215**2*np.sum(cart**2,axis=1))[None,None,:]
                         expected[out, :3, :, :ng] = lifted
                 for shard in value.addressable_shards:
                     actual = np.asarray(shard.data); ref = expected[shard.index]
@@ -52,7 +52,8 @@ def main():
                 value.delete()
                 assert inventory(wfn) == before, '4c subset retained a G/index table'
         full_rows = (int(wfn.symmetry().nk_tot)-1, 0, 2)
-        value = wfn.load(bands=(1, 4), k=full_rows, bispinor=True)
+        value = wfn.load(bands=(1, 4), k=full_rows, bispinor=True,
+                         bispinor_lift='raw')
         value.block_until_ready(); value.delete()
         assert inventory(wfn) == before, '4c full-zone subset retained a G/index table'
         metric = build_feature_metric_diagonal(wfn, wfn.symmetry(), (0, 2), (1, 3),

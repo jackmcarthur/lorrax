@@ -159,7 +159,7 @@ class WavefunctionBasisReceipt:
         wfn,
         role: str,
         bispinor: bool,
-        bispinor_lift: str = "raw",
+        bispinor_lift: str | None = None,
         band_interval,
         fft_grid,
         centroid_fft_idx,
@@ -182,7 +182,7 @@ class WavefunctionBasisReceipt:
         wfn_fingerprint_binding,
         role: str,
         bispinor: bool,
-        bispinor_lift: str = "raw",
+        bispinor_lift: str | None = None,
         band_interval,
         fft_grid,
         centroid_fft_idx,
@@ -205,7 +205,7 @@ class WavefunctionBasisReceipt:
         wfn_fingerprint_binding,
         role: str,
         bispinor: bool,
-        bispinor_lift: str,
+        bispinor_lift: str | None,
         band_interval,
         fft_grid,
         centroid_fft_idx,
@@ -229,6 +229,10 @@ class WavefunctionBasisReceipt:
                 f"WFN: stop={stop}, WFN.nbands={int(nbands)}")
         source_nspinor = int(getattr(wfn, "nspinor", 0))
         use_bispinor = bool(bispinor)
+        if use_bispinor and bispinor_lift is None:
+            raise ValueError(
+                "WavefunctionBasisReceipt bispinor source must name its "
+                "carrier (common.four_current_model); bispinor_lift=None")
         if use_bispinor and source_nspinor != 2:
             raise ValueError(
                 "WavefunctionBasisReceipt bispinor source must carry two "
@@ -283,7 +287,7 @@ class WavefunctionBasisReceipt:
         wfn,
         role: str,
         bispinor: bool,
-        bispinor_lift: str = "raw",
+        bispinor_lift: str | None = None,
         band_interval,
         fft_grid,
         centroid_fft_idx,

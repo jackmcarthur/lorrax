@@ -1055,9 +1055,12 @@ def main(argv=None):
 			parser.error(
 				"--static-gauge-hall-only requires bispinor=true so the canonical "
 				"kinetic-balance four-current is present")
-		# This producer owns the scalar charge/head vertex.  One carrier for both
-		# shipped bispinor_gw values, resolved in ONE place so this stage cannot
-		# disagree with the ISDF fits or Sigma about what a four-spinor is.
+		# This producer owns the scalar charge/head vertex.  It is a charge
+		# vertex, so a bispinor deck gets the two-spinor dipole
+		# (scalar_head_bispinor = False; docs/theory/bispinor-gw.md#carrier),
+		# resolved in ONE place so this stage cannot disagree with the ISDF
+		# fits or Sigma.  Only --static-gauge-hall-only (a current product)
+		# loads the current carrier.
 		bispinor = resolve_four_current_representation(
 			four_current_bispinor, bispinor_gw_mode).scalar_head_bispinor
 

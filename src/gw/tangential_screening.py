@@ -255,6 +255,11 @@ def tangential_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
         occupations=census["occupation_sha256"],
         centroids=hashlib.sha256(np.asarray(centroid_indices, np.int64).tobytes()).hexdigest(),
         recipe_hash=recipe["recipe_hash"], gate_hash=recipe["gate_hash"])
+    if int(meta.nspinor) == 4:
+        # A bank, model or sector store built on another bispinor carrier
+        # (before 2026-11-11: the normalized four-component charge) refuses.
+        from common.four_current_model import PAULI_FOUR_CURRENT_REPRESENTATION
+        identity["four_current_carrier"] = PAULI_FOUR_CURRENT_REPRESENTATION
     if str(label).startswith("sc_"):
         # The SC state labels do not name the WFN (bind_tangential_sc_identity),
         # so an SC map's bank, model and sector manifest bind the source WFN's

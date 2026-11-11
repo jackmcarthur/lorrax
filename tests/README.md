@@ -48,6 +48,7 @@ A new test needs no bootstrap import of its own. Run the unit layer with
 | `test_response_bank_blocks_cpu.py` | four-block χ₀ equals the exact ordered-pair scan |
 | `test_cd_kernels.py` | contour-deformation kernels equal a dense per-q sum |
 | `test_trs_qe_decides.py` | QE's data decides the 2c time-reversal verdict |
+| `test_bispinor_pauli_carrier.py` | the bispinor carrier: large-block charge norm and zero lower block, raw-lift small component and norm against a NumPy oracle, q = 0 current = two-spinor velocity, unnamed-lift refusals; run directly at P4, the direct field's charge part equals the two-spinor V_H to round-off |
 | `test_pair_ws_cpu.py` | `common.ws_images`: the table holds every minimal image |
 | `test_orbital_modern_route.py` | htransform's orbital totals: sum-over-states, star weights, per-parent sum |
 | `test_ordered_collectives.py` | `lxkit.ordered_psum` is the rank-order fold |

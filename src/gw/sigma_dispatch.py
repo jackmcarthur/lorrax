@@ -526,12 +526,11 @@ def _rotate_v_h_to_qp(v_h_dft, U, *, mesh: Mesh):
 def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym):
     """Build the sole Hartree representation: exact, live, and G-space."""
     from dataclasses import replace
-    from common.four_current_model import resolve_four_current_representation
     from .kin_ion_io import compute_hartree_matrix
     from file_io.qe_save_reader import dft_sys_dim
 
-    representation = resolve_four_current_representation(
-        config.bispinor, config.bispinor_gw)
+    # The carrier (two-component charge, raw-lift current) is the direct
+    # field's own (gw.hartree.direct_field_matrices).
     include_transverse = bool(config.bispinor)
     hartree_meta = (replace(meta, nspinor=4, npol=4)
                     if include_transverse and int(meta.nspinor) != 4 else meta)
@@ -545,7 +544,6 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym):
         transverse_truncation_2d=(int(config.sys_dim) == 2),
         nb=int(band_slices.b3), mesh=mesh_xy,
         include_transverse=include_transverse,
-        bispinor_lift=(representation.current_lift or "raw"),
         return_sharded=True)
     charge = exact.charge if include_transverse else exact
     window = (slice(None),

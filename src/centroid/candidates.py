@@ -456,11 +456,16 @@ def load_candidate_faces(
                   f"budget={meta.memory_per_device_gb:g} GB/device, "
                   f"band chunk={band_chunk_size}, transfer_k_tile={k_tile}")
 
+    # A bispinor candidate set samples the current channel: its carrier is
+    # the current lift (common.four_current_model).
+    from common.four_current_model import resolve_four_current_representation
+    lift = resolve_four_current_representation(bispinor, None).current_lift
+
     def load(window):
         face = load_centroids_band_chunked(
             wfn, sym, meta, cand_idx, bispinor, mesh_xy, window,
             band_chunk_size=band_chunk_size, k_chunk_size=k_tile,
-            full_k_rows=full_k_rows, faces="cand")
+            full_k_rows=full_k_rows, faces="cand", bispinor_lift=lift)
         scale = norms(window)
         if scale is not None:
             face = face / scale[None, :, None, None]

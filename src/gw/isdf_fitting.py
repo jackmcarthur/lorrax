@@ -159,7 +159,7 @@ def _fit_mubatch(
                 wfn=wfn, mesh_xy=mesh_xy, meta=meta, band_range=(b_lo, b_hi),
                 band_chunk=int(plan.band_chunk), centroid_indices=None,
                 placement="device", bispinor=bool(bispinor),
-                bispinor_lift=(bispinor_lift if bispinor else "raw"),
+                bispinor_lift=(bispinor_lift if bispinor else None),
                 k_domain=_pd, print_fn=print_fn)
         _br = tuple(int(v) for v in parent_psi.band_range)
         if _br[0] != b_lo or _br[1] < b_hi:
@@ -469,7 +469,7 @@ def fit_zeta_to_h5(
     band_range_right: tuple[int, int] | None = None,
     band_norms: np.ndarray | None = None,
     bispinor: bool = False,
-    bispinor_lift: str = "raw",
+    bispinor_lift: str | None = None,
     solver_kind: str = 'auto',
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
     distrib_la_batched_route: str = "batch_reshard",

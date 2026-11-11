@@ -415,7 +415,9 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
         params.get("hubbard_input", ""), params.get("hubbard_occupations", ""),
         wfn=wfn, base_dir=os.path.dirname(os.path.abspath(dipole_path)),
         caller="gw.head_correction dipole")
-    bad = dipole_operator_mismatches(dipole_path, hubbard=hubbard, **operator)
+    bad = dipole_operator_mismatches(
+        dipole_path, hubbard=hubbard,
+        bispinor=params.get("_charge_bispinor"), **operator)
     if bad:
         detail = "; ".join(f"{k}: file={got!r} run={want!r}"
                            for k, got, want in bad)
