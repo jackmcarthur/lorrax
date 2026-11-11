@@ -334,9 +334,14 @@ sentinels below the Gershgorin bound, so they are the lowest eigenpairs and
 are dropped before the result leaves the wrapper. The cuSOLVERMp handlers
 zero and read the solver's `info` after every `syevd`, `potrf`, `potrs`,
 `getrf` and `getrs` and return a nonzero value as an error naming the
-routine (`src/ffi/cpp/cusolvermp/info.h`). LU and Cholesky keep one tile per rank,
-because block-cyclic `getrs`/`potrs` are 2–3× slower and `getrf` gains
-nothing.
+routine (`src/ffi/cpp/cusolvermp/info.h`). Cholesky keeps one tile per rank
+(square meshes only), because block-cyclic `potrs` is 2–3× slower. LU keeps one tile per rank for
+tiles of at most 256 and, on 2×2 and 3×3, up to an 8192-wide tile; above that it runs
+block-cyclic by the same relabeling, padded like the eigh where the tile has no block in
+[128, 256] (`_cusolvermp.lu_layout`, `rhs_layout`). The one-tile `getrf`/`getrs` workspace grows
+with the tile: just below the threshold (tile 8191, complex128, `nrhs = n`) it is 20.7 GB per rank
+on 2×2 and 27.2 GB on 3×3, against 1.8 and 0.3 GB relabeled at tile 8198 (A100-80GB, 2026-11-11);
+`lu_workspace_query` prices both exactly.
 
 ## Inside the ScaLAPACK handlers {#inside-the-scalapack-handlers}
 
