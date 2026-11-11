@@ -1710,6 +1710,10 @@ def write_sigma_omega_h5(
 		return shape[:-2] + (logical_nb, logical_nb)
 
 	with SlabIO(abs_path, mode="w", mesh=mesh) as io:
+		# Run-level identities (the bispinor carrier), as in the text headers.
+		from common.provenance import run_provenance
+		for key, value in run_provenance().items():
+			io.write_attr(key, np.asarray(value.encode()))
 		# Creation-time promise, before the later live assemble_eqp append.
 		# If the run stops after this writer closes but before that append, a
 		# reader sees an expected-receipt artifact with no receipt and fails closed.

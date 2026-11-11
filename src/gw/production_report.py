@@ -157,8 +157,13 @@ def method_rows(config) -> list[tuple[str, str]]:
     dim = int(config.sys_dim)
     rows.append(("Coulomb", _DIM_EFFECT.get(dim, f"{dim}D")))
     if config.bispinor:
+        from common.four_current_model import (
+            PAULI_FOUR_CURRENT_REPRESENTATION, PAULI_FOUR_CURRENT_SUMMARY)
         rows.append(("bispinor", "charge + transverse current; bispinor_gw = "
                      + config.bispinor_gw.value))
+        rows.append(("bispinor carrier",
+                     f"{PAULI_FOUR_CURRENT_REPRESENTATION}: "
+                     f"{PAULI_FOUR_CURRENT_SUMMARY}"))
     if sc:
         dsc = bool(config.density_self_consistent)
         rows.append(("Hartree", "V_H rebuilt from each map's density" if dsc else

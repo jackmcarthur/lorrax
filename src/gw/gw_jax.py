@@ -284,6 +284,12 @@ def _open_production_report(args):
     config = LorraxConfig.from_input_file(args.input, print_fn=print0)
     require_deck_keys(config.raw_input_keys, "number_bands", "band_request",
                       "centroids_file")
+    # The bispinor carrier travels with every output file (text headers and
+    # sigma_mnk.h5); the restart bundle stamps it on its own.
+    from common.four_current_model import PAULI_FOUR_CURRENT_REPRESENTATION
+    from common.provenance import set_run_provenance
+    set_run_provenance(four_current_carrier=(
+        PAULI_FOUR_CURRENT_REPRESENTATION if config.bispinor else None))
     input_dir = config.input_dir
     qp_solver = config.qp_solver     # how QP energies are extracted from Σ
     mode = config.compute_mode       # the self-energy ansatz
