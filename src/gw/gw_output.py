@@ -1926,8 +1926,10 @@ def write_results(
         total_label="sigXC" if results.use_ppm else "sigTOT",
         hartree_label=(
             "Hdir" if results.h_transverse is not None else "VH"),
+        # The sector columns close against sigXC; an SC run writes no sigXC
+        # (c_omitted), and its per-map sectors are in sigma_lorentz_iter*.h5.
         sigma_lorentz_skn_eV=(
-            None if results.sigma_lorentz_diag_skn_ry is None
+            None if results.sigma_lorentz_diag_skn_ry is None or c_omitted
             else r2e * _wedge_sectors(results.sigma_lorentz_diag_skn_ry)),
         sigma_c_odd_kn_eV=(
             None if results.sigma_c_odd_diag_at_dft_ry is None
