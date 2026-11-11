@@ -186,8 +186,10 @@ are counted. It is built once from the DFT ladder
   4 eV is 16 deck broadenings at the default η = 0.25 eV, so a coarse window
   never reads a band the near grid resolves.
 - Under `nval` / `ncond`: every occupied state below the minimum energy of the
-  lowest requested valence band (nelec − nval at each k; `sigma_omega_min_ev`
-  can only lower the floor). The rule is on energy, so a coarse state inside
+  lowest requested valence band, band nelec − nval with nelec the
+  occupied-band boundary `max(ifmax)`, on a metal as on an insulator: the
+  bottom of the QP window's valence range (`sigma_omega_min_ev` can only
+  lower the floor). The rule is on energy, so a coarse state inside
   the near grid's lower pad reads the near grid.
 
 Only the MPA and tangential Σ, scalar or four-current sector, read coarse
