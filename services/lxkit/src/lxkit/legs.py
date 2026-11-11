@@ -129,6 +129,10 @@ class PlatformLeg:
     #: 1.2 margin: a route that opens them carries it as its ``outside`` term.
     distributed_context: tuple = (3.6e9, "cuSOLVERMp/cuBLASMp contexts + NCCL: 3.0 GB measured "
                                          "at P4 (5.9 vs 2.9 outside) x 1.2")
+    #: ``(bytes, provenance)``: each further provider context a process holds beside the first
+    #: (cuSOLVERMp keeps one per grid layout), outside the allocator and outside the budget's
+    #: withholding (``lxkit.memory.contexts(layouts=...)``).
+    second_context: tuple = (0.0, "")
     #: collective library of the leg's XLA collectives; the section of
     #: ``config/<site>/site.toml`` that runtime.network_env applies ("" = none).
     collective_library: str = ""
@@ -205,14 +209,21 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         memory_reserve=0.18567,
         node_devices=4,                  # Perlmutter GPU node: 4 A100
         peak_reader="pool",
+        second_context=(1.98e9, "the second cuSOLVERMp context (row-major grid: LU, potrf; "
+                                "eigh's is column-major): 1.65 GB/rank outside the pool, 2x2 "
+                                "3.40 -> 5.05 GB (distrib_la shape audit 2026-11-11) x 1.2"),
         vendor_rows=(
             # n is the local tile edge L = side / Px (distrib_la.workspace.lu_workspace_model).
             # runs/lu_workspace_pricing_20261111: complex128, nrhs = n, the default getrs room;
             # each solve's mempool high-water equals lrx_lu_workspace_bytes to 0.1 MB.
+            # One tile per rank grows with n times the tile, i.e. with Px at a fixed tile:
+            # 2x2 9.64-10.45 local panels (4.82-5.23 per Px), 3x3 at L 8191 27.2 GB (4.22 per
+            # Px; distrib_la shape audit 2026-11-11), 6x6 at L 10002 83.5 GB (4.35 per Px).
             (("cusolvermp", "solve_lu"), MeasuredRow(
-                10.0, None, "local LU panels (L + mb) nb, one tile per rank", n=(2048, 12000),
-                p=(4, 4), source="lrx_lu_workspace_bytes one tile per rank, 9.59-10.45 panels "
-                "at L 2048-12000 (getrf, getrs, pivots), 2x2 A100, 2026-11-11")),
+                5.0, None, "LU panels Px (L + mb) nb = 2 n (n/Py), one tile per rank",
+                n=(2048, 12000), p=(4, 36), source="lrx_lu_workspace_bytes one tile per rank, "
+                "4.82-5.23 per Px at L 2048-12000 on 2x2, 4.22 at L 8191 on 3x3, 4.35 at L 10002 "
+                "on 6x6 (getrf, getrs, pivots), A100, 2026-11-11")),
             (("cusolvermp", "solve_lu relabeled"), MeasuredRow(
                 11.2, None, "local LU panels (L + mb) mb, relabeled", n=(1024, 15000),
                 p=(4, 4), source="lrx_lu_workspace_bytes relabeled blocks 128-256, 11.05-11.16 "

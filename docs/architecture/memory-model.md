@@ -243,12 +243,19 @@ with `N_k N_b` eigenvalues; there is no host `N_orbit²` or `N_k N_b²` matrix.
   `distrib_la.lu_workspace_query`) or a measured row (`lxkit.LEGS`
   `vendor_rows`) within its stated range; outside it, a warning (`GATE
   memory_unpriced` under `LORRAX_MEMORY_STRICT`). The cuSOLVERMp LU rows are
-  per local tile at the solve's own layout (`distrib_la.workspace.lu_workspace_model`):
-  one tile per rank about 19 tiles, relabeled 11.2 panels but at least the
-  2 GiB getrs room; a solve's mempool high-water equals the query to 0.1 MB
-  (2×2, 2026-11-11). The W Dyson's distributed route, its admission and
-  `gw.stage_inventory` carry it (`gw.w_isdf.dyson_lu_workspace`), and so does
-  `lx doctor` (`LU_WORKSPACE`).
+  per local tile at the solve's own layout (`distrib_la.workspace.lu_workspace_model`),
+  every dtype at the complex rate: one tile per rank 5.0 panels `Px (L + mb) nb`
+  (it grows with n times the tile), relabeled 11.2 panels but at least the 2 GiB
+  getrs room (conservative: 0.44–0.68 GB measured); a solve's mempool high-water
+  equals the query to 0.1 MB (2×2, 2026-11-11). The layout is the room's: one tile
+  per rank on 2×2, 3×3 and non-square meshes where its priced bytes fit the solve
+  plan's room (`_cusolvermp.lu_one_tile`; no room, the getrs room), else relabeled
+  (non-square: refused). The W Dyson's distributed route, its admission and
+  `gw.stage_inventory` carry it at the run's room (`gw.w_isdf.dyson_room`,
+  `dyson_lu_workspace`), and so does `lx doctor` (`LU_WORKSPACE`, both ends).
+  cuSOLVERMp holds one context per grid layout (eigh's column-major, LU's and
+  potrf's row-major): `distrib_la.provider_contexts` and the W Dyson price both
+  (`memory.contexts(layouts=2)`, the leg's `second_context`, 1.65 GB measured).
   The response bank resolves its Dyson plan at the actual operand batch:
   stored parents or a streamed moment span, while the physical prefactor
   still uses the full q count. The agreed allocator room already includes

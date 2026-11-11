@@ -196,7 +196,7 @@ def _dyson_plan(mesh_xy, n, backend, route, room):
     lu = plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route, budget_bytes=room)
     if room is not None and lu.backend != "one_device":
         face = 16 * int(n) * int(n) // int(mesh_xy.size)
-        need = face + (lu_workspace_bytes(mesh_xy, n, np.complex128) if lu.backend == "cusolvermp"
+        need = face + (lu_workspace_bytes(mesh_xy, n, np.complex128, room) if lu.backend == "cusolvermp"
                        else min(2_000_000_000, face))
         if need > room:
             raise RuntimeError(f"GATE response_dyson_capacity: the Dyson LU n={n} on the {lu.backend} "
@@ -1166,9 +1166,9 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                         # getrf, its pivots and one block column (cap 0: the native's narrowest
                         # chunk) sit beside the chunks: the cap is what the room leaves past them.
                         lu.chunk_room(n_lu, n_lu, 0)
-                        cap = allocator.bucket(room - lu_workspace_query(mesh_xy, n_lu, n_lu, np.complex128, 0))
+                        cap = allocator.bucket(room - lu_workspace_query(mesh_xy, n_lu, n_lu, np.complex128, 0, lu.budget_bytes))
                         lu.chunk_room(n_lu, n_lu, cap)
-                        new += lu_workspace_query(mesh_xy, n_lu, n_lu, np.complex128, cap)
+                        new += lu_workspace_query(mesh_xy, n_lu, n_lu, np.complex128, cap, lu.budget_bytes)
                     except BaseException:
                         lu.chunk_room(n_lu, n_lu, None)
                         raise
@@ -3052,7 +3052,7 @@ def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, 
         workspace = int(native)
         if lu is not None and lu.backend == "cusolvermp":
             from distrib_la import lu_workspace_bytes
-            workspace += lu_workspace_bytes(mesh_xy, int(n), np.complex128)
+            workspace += lu_workspace_bytes(mesh_xy, int(n), np.complex128, lu.budget_bytes)
         phases.append((int(memory.argument_size_in_bytes) + kept,
                        compiled_new_bytes(executable) + workspace))
     return tuple(max(p[i] for p in phases) for i in (0, 1))

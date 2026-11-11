@@ -288,14 +288,28 @@ def _lu_workspace_lines(config, *, n_rmu: int, science_mesh: tuple[int, int]) ->
     from gw.w_isdf import dyson_lu_workspace
     n = -(-int(n_rmu) // (px * py)) * (px * py)
     head = f"LU_WORKSPACE site=W-Dyson provider=cusolvermp mesh={px}x{py} n={n}"
+    # The layout is the run's room's (distrib_la._cusolvermp.lu_one_tile), which the deck does
+    # not fix: the line prices both ends, the 2 GiB getrs room and an unbounded one.
     try:
-        term = dyson_lu_workspace(n, px, py)
+        low = dyson_lu_workspace(n, px, py)
     except ValueError as exc:
-        if config.backend.w_dyson_solver == "distributed":
+        try:
+            high = dyson_lu_workspace(n, px, py, room=1 << 62)
+        except ValueError:
+            high = None
+        if high is None and config.backend.w_dyson_solver == "distributed":
             _fail("LX-DECK-LU-MESH", str(exc), "a square science mesh for the distributed W Dyson",
                   "launch on a square rank count, or set w_dyson_solver = local")
-        return [f"{head} refused (only the local Dyson is admitted): {exc}"]
-    return [f"{head} bytes_per_rank={term.fixed / 1e9:.2f} GB model={term.source}"]
+        if high is None:
+            return [f"{head} refused (only the local Dyson is admitted): {exc}"]
+        return [f"{head} one tile per rank only, admitted where the run's room holds "
+                f"{high.fixed / 1e9:.2f} GB/rank (else refused) model={high.source}"]
+    high = dyson_lu_workspace(n, px, py, room=1 << 62)
+    line = f"{head} bytes_per_rank={low.fixed / 1e9:.2f} GB model={low.source}"
+    if high.fixed > low.fixed:
+        line += (f"; one tile per rank where the run's room holds it: {high.fixed / 1e9:.2f} GB "
+                 f"model={high.source}")
+    return [line]
 
 
 def inspect_deck(args) -> None:

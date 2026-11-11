@@ -77,7 +77,7 @@ def main():
     if one[n // p] / GB > args.ref_limit_gb:
         base._log(f"  one-tile reference skipped: {one[n // p] / GB:.1f} GB/rank > {args.ref_limit_gb}")
         return 0 if res < 1e-12 else 1
-    cm.lu_layout = lambda n, Px, Py: (n, n // Px, n // Py)
+    cm.lu_layout = lambda n, Px, Py, *_, **__: (n, n // Px, n // Py)
     cm.rhs_layout = lambda nrhs, Py, relabeled: (nrhs, nrhs // Py)
     X_ref, wall_ref = solve()
     diff = float(jax.jit(lambda x, r: jnp.linalg.norm(x - r) / jnp.linalg.norm(r))(X, X_ref))

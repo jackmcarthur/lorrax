@@ -1157,7 +1157,7 @@ def dyson_close_tile(T: jax.Array, V_q0: jax.Array) -> jax.Array:
             extra = 0
             if mesh_platform(mesh) == "CUDA":
                 extra = (local_lu_workspace(mesh, n, T.dtype) if linear.backend == "one_device"
-                         else lu_workspace_query(mesh, n, n, T.dtype, 0))
+                         else lu_workspace_query(mesh, n, n, T.dtype, 0, linear.budget_bytes))
             price = compiled_price(compiled=executable, extra=extra,
                 ranks=int(mesh.size), face=linear.backend != "one_device", source="BSE ring-lift close",
                 contexts=False)
