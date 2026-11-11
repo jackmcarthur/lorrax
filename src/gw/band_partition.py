@@ -87,12 +87,14 @@ def semicore_floor(energies_ev, *, n_below_k, nval, mu_ev, clip_ev, omega_min_re
     read Sigma_c(omega) on the coarse windows instead of the near grid.
 
     ``energies_ev`` (nk, nb) absolute eV on the loaded k set; ``n_below_k``
-    the states below mu at each k (``n_occ`` on an insulator).  It sets no
+    the occupied-band boundary ``n_occ`` (``max(ifmax)``, the QP window's
+    valence top; the caller passes it on a metal as on an insulator), so
+    band ``n_occ - nval`` is the window's lowest valence band.  It sets no
     band count: b3 and the zeta fit are the counted bands, as on main.
 
     * nval/ncond (owner, 2026-09-29): every occupied state below the minimum
-      energy of the lowest requested valence band, ``n_below_k - nval`` at
-      each k (``omega_min`` only lowers it); none when ``nval`` covers every
+      energy of the lowest requested valence band, ``n_below_k - nval``
+      (``omega_min`` only lowers it); none when ``nval`` covers every
       occupied band.  Energy-based, so a coarse state inside the near grid's
       lower pad reads the near grid.
     * ``n_protected`` (``number_bands_protected``): every occupied band below

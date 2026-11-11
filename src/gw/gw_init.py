@@ -3497,7 +3497,14 @@ def coarse_class_for_deck(config, wfn, print0):
             clamp_tol=float(config.occupation_clamp_tol)).mu_ry) * RYD_TO_EV
     else:
         mu = 0.5 * (float(e[:, n_occ - 1].max()) + float(e[:, n_occ].min()))
-    below = np.count_nonzero(e < mu, axis=1) if metal else np.full(e.shape[0], n_occ)
+    # The lowest requested valence band is band n_occ - nval, the bottom of the
+    # QP window's valence range (BAND WINDOWS 'valence'), on a metal as on an
+    # insulator.  A metal's per-k count of states below mu is smaller than
+    # n_occ = max(ifmax) at most k, and counting nval down from it put the Fe
+    # 8^3 floor (nval = 10) between 3p1/2 and 3p3/2: half a shell held at
+    # DFT, half moved 0.74 eV onto it, and the crossing pair left a 28 meV
+    # SC residual floor (runs/Fe/04_*/160_sc_rootcause_20261111).
+    below = np.full(e.shape[0], n_occ)
     coarse = semicore_floor(
         e, n_below_k=below, nval=int(config.nval), mu_ev=mu, clip_ev=WINDOW_CLIP_EV,
         omega_min_rel_ev=config.sigma.omega_min_ev,
