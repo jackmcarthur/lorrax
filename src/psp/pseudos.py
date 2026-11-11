@@ -78,6 +78,52 @@ def load_pseudopotentials(work_dir: str = ".") -> dict:
     return pseudos
 
 
+# gaunt_pp (breit_salvage/gaunt_pp/build_correction.py) writes this line into
+# PP_INFO of every UPF whose PP_DIJ it changed.
+_GAUNT_STAMP = re.compile(r"Modified by gaunt_pp on (\S+): variant '([^']+)'")
+
+
+def _pp_info_text_from_file(path: str) -> str:
+    """The raw PP_INFO body of the UPF at ``path`` (text up to ``</PP_INFO>``)."""
+    lines = []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if "</PP_INFO>" in line:
+                break
+            lines.append(line)
+    return "".join(lines)
+
+
+def gaunt_stamp(pseudo) -> str | None:
+    """The gaunt_pp variant a UPF was corrected with, or None if unstamped.
+
+    A gaunt_pp UPF carries the frozen-core Gaunt exchange as a full 2×2 ΔD
+    per (ℓ, j) channel added to PP_DIJ, and says so in PP_INFO::
+
+        Modified by gaunt_pp on 2026-11-10: variant 'gaunt_core_so'.
+
+    Parameters
+    ----------
+    pseudo : parsed UPF object (:func:`load_pseudopotentials`).  PP_INFO is
+        read from ``pseudo.pp_info.value`` (the loader keeps the text before
+        PP_INPUTFILE); when the stamp is not found there and the object
+        carries ``_source_path``, the file's raw PP_INFO is searched too.
+
+    Returns
+    -------
+    str or None
+        The variant as written (``'gaunt_core_so'``, ``'gaunt_core_full'``,
+        ``'gaunt_coreval_so'``, ``'gaunt_coreval_full'``), or None.
+    """
+    info = getattr(getattr(pseudo, "pp_info", None), "value", None) or ""
+    m = _GAUNT_STAMP.search(info)
+    if m is None:
+        path = getattr(pseudo, "_source_path", None)
+        if path and os.path.isfile(path):
+            m = _GAUNT_STAMP.search(_pp_info_text_from_file(path))
+    return m.group(2) if m is not None else None
+
+
 # ---------------------------------------------------------------------------
 # Atom ↔ pseudopotential assignment
 # ---------------------------------------------------------------------------
