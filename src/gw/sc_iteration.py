@@ -2471,6 +2471,20 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
     everyone = everyone & ~semicore
     quasiparticle = (None if z_in_kn is None else
                      quasiparticle_mask(np.broadcast_to(z_in_kn, energies_loop.shape)))
+    if quasiparticle is not None and session is not None:
+        # The quasiparticle classification is taken once, at the first map that
+        # has a Z, and held for the loop like the partition.  A window-top state
+        # whose Z sits at 1 otherwise enters and leaves R map to map; its reads
+        # (E_in +/- 5 eV) then move every W line site placed over R by up to
+        # 0.2 eV, each move re-plans the line, and the re-plan kicks that same
+        # state: Fe 4^3 ncond = 8 ran a period-4 cycle at 0.19 eV and never
+        # converged; with the class held it converges in 14 maps
+        # (runs/Fe/04_*/160_sc_rootcause_20261111 r1, r9, r15).
+        held_qp = session.get("quasiparticle_requested")
+        if held_qp is None or np.shape(held_qp) != quasiparticle.shape:
+            session["quasiparticle_requested"] = np.array(quasiparticle, dtype=bool)
+        else:
+            quasiparticle = np.asarray(held_qp, dtype=bool)
     states = everyone if quasiparticle is None else everyone & quasiparticle
     no_qp = everyone & ~states
     if plan is None:

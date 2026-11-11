@@ -458,7 +458,11 @@ once and holds it (`gw/qp_support.py`).
 semicore states, that the W model treats as active
 ($\max_k E^{\rm DFT}_{nk} \ge E_F - 15$ eV,
 `tangential_recipe.active_band_mask`, evaluated once on the DFT ladder) and
-that had a quasiparticle at the previous map, $Z \in (0, 1]$. The one-shot's
+that had a quasiparticle, $Z \in (0, 1]$, at the first map with a Z (map 1, from
+map 0's Σ); that class is then held for the loop, as the partition is. A
+window-top state whose Z sits at 1 would otherwise enter and leave R from map
+to map and move every W line site with its reads (Fe 4³, `ncond` = 8: a
+period-4 cycle at 0.19 eV). The one-shot's
 set keeps its active semicore states (§2). A state with
 $Z \notin (0, 1]$ sits within about η of a pole cluster of its $\Sigma_{nn}$
 and has no quasiparticle. Its energy never moves the grid, and off the grid
