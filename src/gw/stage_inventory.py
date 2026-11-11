@@ -35,6 +35,8 @@ GB = 1e9
 BUDGET = {"local": 66.35 * GB, "distributed": 63.4 * GB}
 #: lxkit.legs CUDA distributed context (cuSOLVERMp/NCCL), outside the pool.
 CONTEXT = 3.6 * GB
+#: lxkit.legs CUDA second_context: cuSOLVERMp's other grid layout (LU's beside eigh's).
+SECOND_CONTEXT = 1.98 * GB
 #: A100 opt-in shared memory per block: the mathdx mode-7 single arm (no run-time scratch).
 OPTIN_SMEM = 166912
 
@@ -182,7 +184,7 @@ def stage_prices(d: Deck, P: int) -> dict:
 
 @lru_cache(maxsize=4096)
 def _stage_prices(d: Deck, P: int) -> tuple:
-    from gw.w_isdf import dyson_lu_workspace, dyson_route_prices
+    from gw.w_isdf import dyson_lu_workspace, dyson_room, dyson_route_prices
     u = _units(d, P)
     px, py = _mesh(P)
     M, QM, F, PsiG, n2, mu = u["M"], u["QM"], u["F"], u["PsiG"], u["n2"], u["mu"]
@@ -239,13 +241,19 @@ def _stage_prices(d: Deck, P: int) -> tuple:
     st["W slice to IBZ"] = (("only", _p("W slice to IBZ", nV * QM + F + d.nk * M, QM,
                                         "V(q) + faces + chi0", f"wedge slice [{trace}]", P)),)
     # The distributed route adds cuSOLVERMp's solve workspace outside XLA (w_isdf.dyson_lu_workspace:
-    # the measured rows at the run's lu_layout); a mesh cuSOLVERMp refuses leaves the local route.
+    # the measured rows at the layout its plan runs in the run's room, w_isdf.dyson_room) and both
+    # cuSOLVERMp contexts (the eigh grid's and the LU grid's); a mesh cuSOLVERMp refuses leaves the
+    # local route.
+    contexts = CONTEXT + SECOND_CONTEXT
     try:
-        lu_ws = dyson_lu_workspace(mu, px, py) if P > 1 else memory.Term(source="one rank: no mesh LU")
+        room = dyson_room(mu, d.nq, P, BUDGET["distributed"], contexts,
+                          BUDGET["distributed"] - 3 * d.nq * M - F)
+        lu_ws = (dyson_lu_workspace(mu, px, py, room=room) if P > 1
+                 else memory.Term(source="one rank: no mesh LU"))
     except ValueError:
         lu_ws = None
-    loc, dist = dyson_route_prices(mu, d.nq, P, memory.Term(CONTEXT, source="lxkit.legs CUDA contexts"),
-                                   lu_ws)
+    loc, dist = dyson_route_prices(mu, d.nq, P, memory.Term(
+        contexts, source="lxkit.legs CUDA contexts, both cuSOLVERMp grids"), lu_ws)
     st["W"] = (("local", loc + _p("W", F, 0.0, "faces", "", P)),) + (
         () if lu_ws is None else (("distributed", dist + _p("W", F, 0.0, "faces", "", P)),))
     # Sigma residents (sigma.exchange / tau_sweep entry): V(q), the W pair (the GN-PPM pole

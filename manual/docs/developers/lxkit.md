@@ -39,7 +39,7 @@ A *leg* is one native library that registers LORRAX's FFI targets under one XLA 
 | `platform_from_env` | `(default="CUDA") -> str` | the platform key from the first entry of `JAX_PLATFORMS`, without touching the backend; for code that runs before `jax.distributed.initialize` |
 | `FFI_PLATFORM_MAP` | `Mapping[str, str]` | vendor to platform key, `{"cpu": "cpu", "cuda": "CUDA", "rocm": "ROCM"}` |
 | `LEGS` | `Mapping[str, PlatformLeg]` | every leg, by platform key |
-| `PlatformLeg` | frozen dataclass | one leg's facts: library file and its path variable (`so_name`, `so_env`), build directory, ABI symbol, the `JAX_PLATFORMS` names and device nodes that select it, XLA flag and allocator defaults, the memory model's `outside_allowance`, `memory_reserve`, `node_devices` and `distributed_context`, collective library and measured vendor workspace rows |
+| `PlatformLeg` | frozen dataclass | one leg's facts: library file and its path variable (`so_name`, `so_env`), build directory, ABI symbol, the `JAX_PLATFORMS` names and device nodes that select it, XLA flag and allocator defaults, the memory model's `outside_allowance`, `memory_reserve`, `node_devices`, `distributed_context` and `second_context`, collective library and measured vendor workspace rows |
 | `leg_for_vendor` | `(vendor) -> PlatformLeg | None` | the leg of a `device_vendor` string |
 | `leg_for_platform` | `(platform) -> PlatformLeg` | the leg of a platform key, else the host leg |
 | `leg_for_jax_platform` | `(name) -> PlatformLeg | None` | the device leg a `JAX_PLATFORMS` entry selects |

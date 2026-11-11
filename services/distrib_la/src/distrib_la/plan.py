@@ -1379,7 +1379,16 @@ class Plan:
             if decided.route != ROUTE_BATCH_RESHARD:
                 self.require_capacity(
                     f"the eigh stack {shape} ({_describe_stack(decided)})")
-                if decided.program_bytes is not None and room_test(
+                if decided.program_bytes is None:
+                    # place() fell to the whole mesh (no route (c) fit) and its program did not
+                    # lower (mesh_bytes None): nothing prices it, so it is never run unadmitted.
+                    raise RuntimeError(
+                        f"GATE distrib_la_unpriced: got: the eigh stack {shape} "
+                        f"{np.dtype(dtype).name} on the whole {self.backend} mesh, whose program "
+                        f"did not lower on this host (no price); want: its compiled price against "
+                        f"the room {int(self.budget_bytes) / 1e9:.2f} GB/rank; why: route (c) does "
+                        f"not fit and an unpriced stack would run unadmitted; caller: {_plan_caller()}")
+                if room_test(
                         lambda r, p=decided.program_bytes: p > r, decided.room):
                     # Over the room (an over-budget stage exhausted it, or the mesh is over it):
                     # the whole mesh is the smallest route; the one policy warns.  Its bytes are
@@ -1672,7 +1681,18 @@ class Plan:
         state, never in the program: the caller posts before the dispatch and withdraws after."""
         if self.op == "solve_lu" and self.backend == "cusolvermp":
             from distrib_la._cusolvermp import post_getrs_room
-            post_getrs_room(n, nrhs, nbytes, mesh=self.mesh)
+            post_getrs_room(n, nrhs, nbytes, mesh=self.mesh, room=self.budget_bytes)
+
+    def lu_one_tile(self, n: int) -> bool:
+        """Whether this cuSOLVERMp plan's ``n x n`` solves keep one tile per rank: their priced
+        workspace and tiles within its room (:func:`distrib_la._cusolvermp.lu_one_tile`; no
+        room, the 2 GiB getrs room), recorded as a room test (:func:`room_test`).  A non-square
+        mesh it does not fit is refused there, by name."""
+        from distrib_la._cusolvermp import lu_one_tile
+        px, py = int(self.mesh.shape["x"]), int(self.mesh.shape["y"])
+        if self.budget_bytes is None:
+            return lu_one_tile(int(n), px, py)
+        return bool(room_test(lambda r: lu_one_tile(int(n), px, py, r), int(self.budget_bytes)))
 
     def _checked_solve(self, call):
         from distrib_la._result_check import checked, matrix_sketch, rhs_sketch, solve_errors
@@ -1750,8 +1770,17 @@ class Plan:
                 and _is_batch_layout(A, self.mesh)):
             # Whole matrices already live on their ranks: only the local kernel can
             # serve them, whatever the plan's route (no movement, one batched solve).
+            # Checked as polar's batch route is: a non-Hermitian member skips the solver and
+            # comes back as a NaN spectrum, refused here by name (the replicated values, every
+            # rank reads its own copy).  The face chain's residual probes and retries are not run.
             from distrib_la._batch_reshard import batch_layout_eigh_call
-            return batch_layout_eigh_call("eigh", self.mesh, A)
+            from distrib_la._result_check import call_site
+            W, Z = batch_layout_eigh_call("checked_eigh", self.mesh, A)
+            if not np.all(np.isfinite(np.asarray(W.addressable_shards[0].data))):
+                raise RuntimeError(
+                    f"distrib_la eigh (batch layout): a member of the {tuple(A.shape)} stack is "
+                    f"not Hermitian to roundoff or not finite; refused (caller {call_site()})")
+            return W, Z
         traced = isinstance(A, jax.core.Tracer)
         if self.op == "eigh" and _route is None and in_checked_retry():
             _rounds = None       # an outer first-route choice never changes its checked backup
@@ -1787,6 +1816,9 @@ class Plan:
             return self._library_plan().batched(A, *args, **kwargs)
         ops = tuple(ensure_sharding(x, self.batch_in_sharding)
                     for x in (A, *args))
+        if self.op == "solve_lu" and self.backend == "cusolvermp":
+            # The layout the room admits, as a keyword: the program caches key on it.
+            kwargs = {**kwargs, "one_tile": self.lu_one_tile(int(A.shape[-1]))}
         if route == ROUTE_BACKEND_BATCHED:
             many, post = self._entry("many", rounds=rounds)
             if many is None:
@@ -1966,7 +1998,10 @@ class Plan:
 
 def _size_routed_library(op: str, requested: str, mesh_xy: Mesh, n, resolved: str) -> bool:
     """``distributed`` resolved to the leg's library BY SIZE: ``n`` past the leg's
-    one-device row (:data:`distrib_la.resolve.ONE_DEVICE_MAX_N`).  Recorded on the
+    one-device row (:data:`distrib_la.resolve.ONE_DEVICE_MAX_N`), or on a room leg
+    (:data:`distrib_la.resolve.ONE_DEVICE_BY_ROOM`, the caller gave no room) past the
+    largest whole matrix the run's planning budget holds (``lxkit.memory.run()``: a value
+    every rank shares; none before the run resolves it, then no bound).  Recorded on the
     route ledger (:func:`new_stack_routes`) when true.  A shape rule: no exchange."""
     from distrib_la import resolve as _resolve
     if (str(requested).strip().lower() != "distributed" or n is None
@@ -1974,6 +2009,10 @@ def _size_routed_library(op: str, requested: str, mesh_xy: Mesh, n, resolved: st
         return False
     platform = _resolve.mesh_platform(mesh_xy)
     bound = _resolve.ONE_DEVICE_MAX_N.get((op, platform))
+    if bound is None and (op, platform) in _resolve.ONE_DEVICE_BY_ROOM:
+        from lxkit import memory
+        budget = memory.run().get("budget")
+        bound = None if budget is None else _resolve.one_device_max_n(op, platform, int(budget))
     if bound is None or int(n) <= int(bound):
         return False
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])

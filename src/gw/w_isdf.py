@@ -2114,19 +2114,37 @@ def dyson_route_prices(n, stack, ranks, contexts, lu_workspace=None):
     return local_price, mesh_price
 
 
-def dyson_lu_workspace(n, px, py, platform="CUDA"):
+def dyson_lu_workspace(n, px, py, platform="CUDA", room=None):
     """The distributed W Dyson's solve workspace outside XLA per rank (:class:`lxkit.memory.Term`)
     on a ``px x py`` mesh: cuSOLVERMp's on CUDA, ``distrib_la.workspace.lu_workspace_model``
-    (the shapes against the leg's measured rows; the source names the row); nothing for the
-    other providers, whose solve allocates inside its program.  Raises ``lu_layout``'s
-    ValueError where cuSOLVERMp refuses the mesh (non-square, tile past 8192)."""
+    at the layout its solve plan runs in ``room`` (:func:`dyson_room`; the shapes against the
+    leg's measured rows; the source names the row); nothing for the other providers, whose
+    solve allocates inside its program.  Raises ``lu_layout``'s ValueError where cuSOLVERMp
+    refuses the mesh (non-square, one tile over the room)."""
     from lxkit import memory
     if platform != "CUDA":
         return memory.Term(source=f"{platform} solve_lu: workspace inside the program")
     from ffi import _services
     _services.ensure_on_path()
     from distrib_la import lu_workspace_model
-    return lu_workspace_model(int(n), int(px), int(py), 16)
+    return lu_workspace_model(int(n), int(px), int(py), 16, room)
+
+
+def dyson_contexts(platform="CUDA"):
+    """The provider contexts the distributed W Dyson prices outside the pool: on CUDA both
+    cuSOLVERMp grids a GW process holds (``distrib_la.provider_contexts``), else the leg's."""
+    from lxkit import memory
+    return memory.contexts(layouts=2 if platform == "CUDA" else 1)
+
+
+def dyson_room(n, stack, ranks, budget, contexts=0.0, allocator_room=None):
+    """The distributed W Dyson plan's room per rank beside its V, chi, W faces and its provider
+    contexts (``contexts`` bytes), capped by the allocator's current room: what its solve plan
+    gets as ``budget_bytes`` (the size route's cap, and the room cuSOLVERMp's one tile per rank
+    must fit, ``distrib_la._cusolvermp.lu_one_tile``), so the admission prices the layout it runs."""
+    faces = 16.0 * n * n * 3 * int(stack) / int(ranks)
+    room = max(0, int(budget - faces - float(contexts)))
+    return room if allocator_room is None else min(room, int(allocator_room))
 
 
 def _dyson_route(dyson, n, stack, mesh_xy):
@@ -2148,21 +2166,22 @@ def _dyson_route(dyson, n, stack, mesh_xy):
     from lxkit import memory
     ranks = int(mesh_xy.size)
     site = f"W Dyson {int(stack)} x {int(n)}^2"
-    faces = 16.0 * n * n * 3 * int(stack) / ranks
     budget = device_budget_bytes()
-    room = min(max(0, int(budget - faces)), memory.room()) if ranks > 1 else None
     if ranks <= 1:
-        return ("distributed", room) if dyson == "distributed" else ("local", None)
+        return ("distributed", None) if dyson == "distributed" else ("local", None)
+    platform = mesh_platform(mesh_xy)
+    contexts = dyson_contexts(platform)
+    room = dyson_room(n, stack, ranks, budget, contexts.fixed, memory.room())
     try:
         lu_ws, refused = dyson_lu_workspace(n, mesh_xy.shape['x'], mesh_xy.shape['y'],
-                                            mesh_platform(mesh_xy)), None
+                                            platform, room), None
     except ValueError as exc:
         lu_ws, refused = None, exc
     if dyson == "distributed":
         if refused is not None:
             raise refused
         return "distributed", room
-    local_price, mesh_price = dyson_route_prices(n, stack, ranks, memory.contexts(), lu_ws)
+    local_price, mesh_price = dyson_route_prices(n, stack, ranks, contexts, lu_ws)
 
     def probe():
         from ffi import _services

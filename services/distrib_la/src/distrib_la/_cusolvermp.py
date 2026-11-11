@@ -256,18 +256,20 @@ _mesh_key = mesh_key
 _BLOCK_MAX = 256
 _BLOCK_MIN = 128
 
-#: LU above this local edge runs block-cyclic BY RELABELING too (square meshes):
-#: the same local buffers read with a square block <= _BLOCK_MAX, so cuSOLVERMp
-#: factors Pi A Pi^T and solves for Pi B, and X comes back in A's row order with
-#: no data movement (Pi' = Pi).  At one tile per rank the getrf/getrs workspaces
-#: grow with the tile: A100-80GB P4 f64 nrhs=n peaked at 53.0 GB/rank at n=30720
-#: and 83.5 GB at 40960, and complex128 nrhs=n ran out of device memory from
-#: n=30720 (dlascale pmA/pmB).  At or below the bound one tile per rank stays (the
-#: measured faster layout there, comment above), so no existing call changes.
-#: A relabeled tile with no divisor in [_BLOCK_MIN, _BLOCK_MAX] is padded at its
-#: end (lu_layout), never left at one tile: N_mu 60012 on 6x6 (tile 10002 =
-#: 2*3*1667) fell back to one tile and its getrs asked 83.5 GB/rank.
-_LU_RELABEL_LOCAL_MIN = 8192
+#: LU runs block-cyclic BY RELABELING too (square meshes) where one tile per rank
+#: does not fit its room (lu_one_tile): the same local buffers read with a square
+#: block <= _BLOCK_MAX, so cuSOLVERMp factors Pi A Pi^T and solves for Pi B, and X
+#: comes back in A's row order with no data movement (Pi' = Pi).  At one tile per
+#: rank the getrf/getrs workspaces grow with n times the tile: A100-80GB P4 f64
+#: nrhs=n peaked at 53.0 GB/rank at n=30720 and 83.5 GB at 40960, complex128
+#: nrhs=n ran out of device memory from n=30720 (dlascale pmA/pmB), and N_mu
+#: 60012 on 6x6 (tile 10002) asked 83.5 GB/rank.  Relabeled, the workspace is a
+#: few panels of the block (0.04-1.81 GB at tiles 1024-15000, 2x2).  The former
+#: fixed bound (one tile up to tile 8192 on 2x2 and 3x3) was a cliff: tile 8191
+#: asked 20.7 GB/rank on 2x2 and 27.2 on 3x3, tile 8198 1.8 and 0.3 (distrib_la
+#: shape audit 2026-11-11).  One tile is 1.5-2x faster where it fits, so the
+#: room decides.  A relabeled tile with no divisor in [_BLOCK_MIN, _BLOCK_MAX] is
+#: padded at its end (lu_layout), never left at one tile.
 
 
 def _padded_tile(local: int) -> int:
@@ -277,33 +279,52 @@ def _padded_tile(local: int) -> int:
                 if _largest_block(m) >= _BLOCK_MIN)
 
 
-def lu_layout(n: int, Px: int, Py: int) -> tuple[int, int, int]:
+def lu_one_tile(n: int, Px: int, Py: int, room=None) -> bool:
+    """Whether a cuSOLVERMp solve_lu of an ``n x n`` operand keeps one tile per rank.
+
+    Always at 1-D (``Px == 1``) and for tiles up to :data:`_BLOCK_MAX`; never on a square
+    mesh from 4x4 (there getrf/getrs ran in serialized tile-wide panel steps across nodes and
+    the RHS could not be chunked, SMs idle: n 30000 on 4x4, run30k, 2026-10-19).  On 2x2,
+    3x3 and a non-square mesh: where its priced bytes per rank
+    (:func:`distrib_la.workspace.lu_one_tile_bytes`, the workspace beside its A and B tiles)
+    fit ``room`` (the solve plan's room per rank beside its other operands; None: the 2 GiB
+    getrs room the handler takes with none posted).  A square mesh relabels otherwise; a
+    non-square one cannot (relabeling needs mb == nb on a square grid) and is refused
+    (ValueError), as eigh and Cholesky refuse one, naming the square meshes that run it."""
+    from distrib_la.workspace import GETRS_DEFAULT_ROOM, lu_one_tile_bytes
+    n, Px, Py = int(n), int(Px), int(Py)
+    if Px == 1 or n // Px <= _BLOCK_MAX:
+        return True
+    if Px == Py and Px >= 4:
+        return False
+    room = GETRS_DEFAULT_ROOM if room is None else int(room)
+    need = lu_one_tile_bytes(n, Px, Py)
+    if need <= room:
+        return True
+    if Px == Py:
+        return False
+    k = math.isqrt(Px * Py)
+    squares = " or ".join(f"{s}x{s} ({s * s} ranks)" for s in sorted({max(2, k), k + 1}))
+    raise ValueError(
+        f"distributed solve_lu: mesh {Px}x{Py} is not square, and one tile per rank (the only "
+        f"cuSOLVERMp layout there) of n = {n} at tile {n // Px}x{n // Py} needs {need / 1e9:.2f} "
+        f"GB/rank (getrf/getrs workspace + its A and B tiles) over the room {room / 1e9:.2f} "
+        f"GB/rank.  Use a square mesh, e.g. {squares}, or a native solve_lu backend "
+        "(w_dyson_solver = local).")
+
+
+def lu_layout(n: int, Px: int, Py: int, room=None, *, one_tile: bool | None = None) -> tuple[int, int, int]:
     """``(side, mb, nb)`` of the LU descriptors for an ``n x n`` operand.
 
-    One tile per rank (``side = n``) at 1x1, for tiles up to :data:`_BLOCK_MAX`, on
-    2x2 up to :data:`_LU_RELABEL_LOCAL_MIN`, and on a non-square mesh up to
-    :data:`_LU_RELABEL_LOCAL_MIN`; a non-square mesh past it is refused (ValueError),
-    as eigh and Cholesky refuse one: relabeling needs mb == nb on a square grid, and
-    one tile there asks a getrf/getrs workspace that grows with the tile (83.5 GB/rank
-    at tile 10002).  Otherwise a square relabeled block: the largest divisor <=
-    :data:`_BLOCK_MAX` of the tile, padded first to :func:`_padded_tile` where it has
-    none in [:data:`_BLOCK_MIN`, :data:`_BLOCK_MAX`] (10002 -> 10004, block 244).  Each
-    rank pads its own tile at its end (:func:`_pad_tile`), so the solve sees
-    ``Pi (A + I_pad) Pi^T``: no data movement, X's live rows in place.  At one
-    tile per rank on 4x4 (n 30000, run30k, 2026-10-19) getrf/getrs ran in 4
-    serialized 7500-wide panel steps across nodes and the RHS could not be
-    chunked: SMs idle."""
+    One tile per rank (``side = n``) where :func:`lu_one_tile` keeps it in ``room``
+    (``one_tile``: that decision, already taken; a non-square mesh it does not fit is refused
+    there).  Otherwise a square relabeled block: the largest divisor <= :data:`_BLOCK_MAX`
+    of the tile, padded first to :func:`_padded_tile` where it has none in
+    [:data:`_BLOCK_MIN`, :data:`_BLOCK_MAX`] (10002 -> 10004, block 244).  Each rank pads
+    its own tile at its end (:func:`_pad_tile`), so the solve sees ``Pi (A + I_pad) Pi^T``:
+    no data movement, X's live rows in place."""
     local = n // Px
-    if Px != Py and max(local, n // Py) > _LU_RELABEL_LOCAL_MIN:
-        k = math.isqrt(Px * Py)
-        squares = " or ".join(f"{s}x{s} ({s * s} ranks)" for s in sorted({max(2, k), k + 1}))
-        raise ValueError(
-            f"distributed solve_lu: mesh {Px}x{Py} is not square and the {n // Px}x{n // Py} tile "
-            f"of n = {n} is past {_LU_RELABEL_LOCAL_MIN}: cuSOLVERMp can run only one tile per rank "
-            "there, whose getrf/getrs workspace grows with the tile (83.5 GB/rank at tile 10002).  "
-            f"Use a square mesh, e.g. {squares}, or a native solve_lu backend "
-            "(w_dyson_solver = local).")
-    if Px != Py or Px == 1 or local <= _BLOCK_MAX or (Px < 4 and local <= _LU_RELABEL_LOCAL_MIN):
+    if (lu_one_tile(n, Px, Py, room) if one_tile is None else one_tile):
         return n, local, n // Py
     tile = _padded_tile(local)
     block = _largest_block(tile)
@@ -342,9 +363,9 @@ def _pad_tile(local, rows: int, cols: int, *, eye: bool):
 
 def _announce_lu(kind, mesh, nq, n, side, nrhs, mb_a, nb_a, mb_b=None, nb_b=None, cols=None):
     """One rank-0 line per distributed LU program built: its descriptors, so a run's log shows
-    the layout it solved at (run30k 2026-10-19: a stalled Dyson LU printed none).  A tile past
-    :data:`_LU_RELABEL_LOCAL_MIN` never solves at one tile per rank (:func:`lu_layout` refuses
-    a non-square mesh there)."""
+    the layout it solved at (run30k 2026-10-19: a stalled Dyson LU printed none).  One tile per
+    rank runs only where it fits its room (:func:`lu_one_tile`; a non-square mesh it does not
+    fit is refused there)."""
     if int(jax.process_index()) != 0:
         return
     Px, Py = (int(v) for v in _validate_mesh(mesh))
@@ -357,19 +378,19 @@ def _announce_lu(kind, mesh, nq, n, side, nrhs, mb_a, nb_a, mb_b=None, nb_b=None
                f"({'one tile per rank' if one else 'relabeled block-cyclic'}{pad}){rhs}.")
 
 
-def post_getrs_room(n: int, nrhs: int, nbytes, *, mesh: Mesh) -> bool:
+def post_getrs_room(n: int, nrhs: int, nbytes, *, mesh: Mesh, room=None) -> bool:
     """Post ``nbytes`` per rank (``None`` withdraws it) as the room the getrs chunks of a fused
     ``n x nrhs`` solve on ``mesh`` may take beside everything else its program holds: the handler
     solves in the widest chunks whose workspace fits the ranks' smallest figure, 2 GiB without one
     (cpp/cusolvermp/batched_solve_lu_ffi.cc, getrs_chunk).  Posted at the padded shape the
-    handler sees (:func:`lu_layout`).  Run-time state read by the next solve of that shape, never
-    an attribute, so the compiled program does not carry the room.  False where the loaded
-    library predates the entry (it keeps 2 GiB)."""
+    handler sees (:func:`lu_layout` in the solve plan's ``room``).  Run-time state read by the
+    next solve of that shape, never an attribute, so the compiled program does not carry the
+    room.  False where the loaded library predates the entry (it keeps 2 GiB)."""
     fn = getattr(loader.get_lib("CUDA"), "lrx_lu_getrs_room", None)
     if fn is None:
         return False
     Px, Py = int(mesh.shape["x"]), int(mesh.shape["y"])
-    side, mb, _ = lu_layout(int(n), Px, Py)
+    side, mb, _ = lu_layout(int(n), Px, Py, room)
     cols, _ = rhs_layout(int(nrhs), Py, mb != side // Px)
     fn.argtypes, fn.restype = (ctypes.c_int64,) * 3, ctypes.c_int
     return fn(side, cols, -1 if nbytes is None else max(0, int(nbytes))) == 0
@@ -424,9 +445,10 @@ def retry_block(n: int, p: int) -> int | None:
     The largest divisor of the solve tile (:func:`solve_layout`) at most half
     the default block. The checked eigh solves there again when the default
     layout's result fails its check; the solve side, its operand and its
-    output are the first attempt's, and the vendor workspace of a smaller
-    block is not larger (n 7912, P4, complex: 284 MB at block 86, 317 MB at
-    172), so the retry needs no more memory than the attempt it replaces. One
+    output are the first attempt's.  Its vendor workspace is queried at its own
+    block beside the default's and the larger priced (``distrib_la.workspace``):
+    measured not larger at n 7912, P4, complex (284 MB at block 86, 317 MB at
+    172), never measured at the smallest blocks this admits (down to 8). One
     tile per rank is never a retry: its workspace is 2.0 GB there and its wall
     exceeds the default's at large n/p. Below block 8 there is none (blocks
     1-4 ran 5-34x slower than one tile).
@@ -701,6 +723,7 @@ def batched_distributed_getrf(
     A: jax.Array,
     *,
     mesh: Mesh,
+    one_tile: bool | None = None,
 ) -> CusolverMpBatchedLU:
     """Factor ``A[q]`` once via cuSOLVERMp ``getrf``.
 
@@ -719,7 +742,7 @@ def batched_distributed_getrf(
 
     loader.get_lib("CUDA")
     ctx_key = context_key(mesh, col_major=False)
-    side, mb, nb = lu_layout(n, Px, Py)
+    side, mb, nb = lu_layout(n, Px, Py, one_tile=one_tile)
     ipiv_len = ipiv_local_len(side, Px, mb)
     key = ("getrf", _mesh_key(mesh), A.dtype, nq, n, side, mb, nb,
            int(ctx_key))
@@ -1016,6 +1039,7 @@ def batched_distributed_solve_lu(
     B: jax.Array,
     *,
     mesh: Mesh,
+    one_tile: bool | None = None,
 ) -> jax.Array:
     """Solve ``A[q] X[q] = B[q]`` via per-q cuSOLVERMp ``getrf`` + ``getrs``.
 
@@ -1036,6 +1060,10 @@ def batched_distributed_solve_lu(
     Input sharding: both ``A`` and ``B`` in ``P(None, 'x', 'y')``.  Output
     has the same shape and sharding as ``B``.  ``A`` is donated — XLA may
     reuse its buffer for the LU factors (which we then discard).
+
+    ``one_tile``: :func:`lu_one_tile` in the plan's room (``Plan`` passes it, so the
+    program caches key on the decision, never the room); None decides it in the 2 GiB
+    getrs room.
 
     Restrictions: A (Nq, N, N), B (Nq, N, NRHS) with N % Px == 0,
     N % Py == 0, NRHS % Py == 0 — square N on both sides because
@@ -1068,7 +1096,7 @@ def batched_distributed_solve_lu(
     loader.get_lib("CUDA")
     ctx_key = context_key(mesh, col_major=False)
 
-    side, mb_a, nb_a = lu_layout(n, Px, Py)
+    side, mb_a, nb_a = lu_layout(n, Px, Py, one_tile=one_tile)
     cols, nb_b = rhs_layout(nrhs, Py, mb_a != side // Px)
     mb_b = mb_a
 
