@@ -134,12 +134,12 @@ from .kmeans_isdf import (
 )
 from .production_output import (
     KMEANS_STAGES,
+    centroid_budget,
     format_centroid_header,
     kmeans_results_lines,
     kmeans_settings_rows,
     pool_rank_warning,
     prune_band_ranges,
-    rank_law_estimate,
     resolve_sigma_ncond,
     sketch_pruning_label,
     validate_mode_policy,
@@ -739,17 +739,15 @@ def _select_and_report(args, run, stages):
     kgrid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
     shift = tuple(float(v) for v in np.asarray(wfn.shift).reshape(-1)[:3])
     prune_state = sketch_pruning_label(args) if pruned else "not applied"
-    rank_law = (None if args.density_mode == "current" else
-                rank_law_estimate(
-                    left=prune_left, right=prune_right, nspinor=wfn.nspinor,
-                    kgrid=kgrid, ng=wfn.ng, ecutwfc=wfn.ecutwfc,
-                    ecutrho=wfn.ecutrho))
+    budget = (None if args.density_mode == "current" else
+              centroid_budget(left=prune_left, right=prune_right,
+                              nspinor=wfn.nspinor))
     rank_warning = pool_rank_warning(
-        pool=n_pool, written=n_unique, unpicked=unpicked, rank_law=rank_law)
+        pool=n_pool, written=n_unique, unpicked=unpicked, budget=budget)
     if rank_warning is not None:
         # Graded: a WARNING only when the budget stop leaves the set below the
-        # rank-law estimate (written/estimate < 1); at or above it, or with no
-        # estimate (current mode), a NOTE.
+        # safe 4·S budget (written/budget < 1); at or above it, or with no
+        # budget (current mode), a NOTE.
         log.warning(
             f"pair-space rank not established: {n_unique} centroids are not a "
             "complete ISDF basis",
@@ -760,8 +758,8 @@ def _select_and_report(args, run, stages):
                 lines=(rank_warning,),
                 fix="raise n_centroids or --oversample until the rank reads "
                     "'pool spent'",
-                kind=(None if rank_law is not None
-                      and n_unique / float(rank_law[0]) < 1.0 else "NOTE")))
+                kind=(None if budget is not None
+                      and n_unique / float(budget[0]) < 1.0 else "NOTE")))
     header = format_centroid_header(
         feature_fit=feature_fit, source_wfn=wfn_path,
         weight_label=weight_label,
@@ -772,7 +770,7 @@ def _select_and_report(args, run, stages):
         prune_left=prune_left, prune_right=prune_right,
         prune_label=prune_label, orbit_aware=orbit_aware, n_sym=n_sym,
         density_mode=args.density_mode, pool=n_pool, unpicked=unpicked,
-        rank_law=rank_law)
+        budget=budget)
     # ONE writer.  Every rank used to reach this savetxt on the same shared
     # path.  It survived P=16 only because all ranks write identical bytes —
     # which is precisely the latent form of the bug that DID bite at P=64 in
@@ -806,7 +804,7 @@ def _select_and_report(args, run, stages):
         out_file=out_file, orbit_aware=orbit_aware, n_sym=n_sym,
         windows=(prune_left, prune_right), window_label=prune_label,
         density_mode=args.density_mode, prune_rank=prune_rank,
-        unpicked=unpicked, rank_law=rank_law))
+        unpicked=unpicked, budget=budget))
 
     if args.plot:
         from .kmeans_plot import plot_density_and_centroids, interpolate_density
