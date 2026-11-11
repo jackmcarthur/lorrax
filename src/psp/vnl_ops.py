@@ -17,6 +17,7 @@ autodiff-safe behaviour at K=0.
 from __future__ import annotations
 
 import functools
+import os
 from dataclasses import dataclass
 import numpy as np
 import jax
@@ -27,7 +28,7 @@ from psp.radial.build_projectors_qe import (
 )
 from psp.radial.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
 from runtime.padding import padded_axis
-from common.log import get_logger, message
+from common.log import block as log_block, get_logger, message
 
 log = get_logger(__name__)
 
@@ -325,6 +326,89 @@ def resolve_soc_mode(pseudos, wfn=None, *, nspinor,
     return False
 
 
+def gaunt_upf_gate(pseudos, wfn=None, *, soc: bool, nspinor: int,
+                   caller: str = "", print_fn=None) -> dict[str, str]:
+    """GATE gaunt_upf_j_averaged: a Gaunt-corrected UPF is valid only j-resolved.
+
+    gaunt_pp adds the frozen-core Gaunt exchange to PP_DIJ as a full 2×2 ΔD
+    per (ℓ, j) channel (two ONCV projectors per channel).  The j-RESOLVED
+    E block (``build_E_blocks_full(soc=True)``) contracts the whole D
+    sub-block of each j group and carries it.  The j-AVERAGED block (QE
+    ``average_pp``, ``soc=False``) reads only diag(D) of each (ℓ, radial
+    index) pair and silently drops the off-diagonal ΔD, so that use is
+    refused.  When the operator is j-resolved, one line names the variant,
+    so the run log records that the core Gaunt term is in V_NL.
+
+    Parameters
+    ----------
+    pseudos : dict, element → parsed UPF.
+    wfn : WFNReader or CrystalData, optional — ``atom_types`` restricts the
+        check to species present in the cell (all species without it);
+        ``spinorbit`` names how the verdict was reached in the refusal.
+    soc : bool — the :func:`resolve_soc_mode` verdict.
+    nspinor : int — the wavefunctions' spinor count (reported only).
+
+    Returns
+    -------
+    dict
+        element → gaunt_pp variant of every stamped, j-channelled UPF in the
+        cell; empty when none is stamped.  A ``coreval_*`` variant also
+        holds the reference valence shells (the on-site module reads it).
+
+    Raises
+    ------
+    ValueError
+        ``GATE gaunt_upf_j_averaged`` when ``soc`` is False and the dict is
+        non-empty.
+    """
+    from psp.pseudos import gaunt_stamp, symbol_to_Z
+
+    types = getattr(wfn, "atom_types", None)
+    present = (None if types is None
+               else {int(z) for z in np.asarray(types).ravel()})
+    stamped = {}
+    for el, p in sorted((pseudos or {}).items()):
+        if present is not None and symbol_to_Z(el) not in present:
+            continue
+        # A file without ℓ>0 j channels never takes the averaging path:
+        # build_E_blocks_full keeps its whole D there.
+        if not pseudo_has_j_channels(p):
+            continue
+        variant = gaunt_stamp(p)
+        if variant is not None:
+            stamped[el] = variant
+    if not stamped:
+        return stamped
+    listing = ", ".join(
+        f"{el} ({os.path.basename(getattr(pseudos[el], '_source_path', '') or '?')}, "
+        f"variant '{v}')" for el, v in stamped.items())
+    tag = f"[{caller}] " if caller else ""
+    if not soc:
+        how = ("from QE <spinorbit> = false"
+               if getattr(wfn, "spinorbit", None) is not None
+               else "forced by nspinor=1 (no QE <spinorbit> record)")
+        raise ValueError(
+            f"GATE gaunt_upf_j_averaged: a Gaunt-corrected "
+            f"pseudopotential would be read j-averaged ({caller or 'V_NL'})\n"
+            f"  got:  V_NL j-AVERAGED ({how}, nspinor={int(nspinor)}) with "
+            f"Gaunt-stamped UPF {listing}\n"
+            f"  want: the j-RESOLVED V_NL (QE lspinorb = .true., nspinor=2 "
+            f"WFN) for every Gaunt-stamped UPF\n"
+            f"  why:  gaunt_pp stores the core Gaunt term as a full 2x2 dD per "
+            f"(l, j) channel in PP_DIJ, valid only j-resolved; the j-averaged "
+            f"operator (QE average_pp) reads only diag(D) of each channel and "
+            f"silently drops the off-diagonal dD\n"
+            f"  fix:  run with spin-orbit on (lspinorb = .true., nspinor=2), or "
+            f"use the original unstamped UPF for a j-averaged run")
+    text = (f"{tag}V_NL: Gaunt-corrected PP_DIJ, j-resolved (full 2x2 dD per "
+            f"(l, j)): {listing}; the frozen-core Gaunt term is in V_NL.")
+    if print_fn is not None:
+        print_fn(text)
+    else:
+        log.info(text, extra=log_block("detail", label="V_NL Gaunt"))
+    return stamped
+
+
 def build_vnl_setup(
     wfn, sym=None, meta=None, pseudos=None,
     n_q: int | None = None,
@@ -371,6 +455,11 @@ def build_vnl_setup(
 
     soc_resolved = resolve_soc_mode(
         pseudos, wfn, nspinor=int(nspinor),
+        caller="build_vnl_setup", print_fn=print_fn)
+    # The one place the verdict is known: every V_NL consumer (kin_ion,
+    # dipoles, NSCF, Sternheimer, ...) builds its E blocks here.
+    gaunt = gaunt_upf_gate(
+        pseudos, wfn, soc=soc_resolved, nspinor=int(nspinor),
         caller="build_vnl_setup", print_fn=print_fn)
 
     B = float(wfn.blat) * np.asarray(wfn.bvec, dtype=float)
@@ -571,6 +660,9 @@ def build_vnl_setup(
                       f"from QE <spinorbit>")
     else:
         provenance = "j-AVERAGED, forced by nspinor=1 (QE average_pp)"
+    if gaunt:
+        provenance += "; Gaunt-corrected PP_DIJ: " + ", ".join(
+            f"{el} '{v}'" for el, v in gaunt.items())
     setup.soc_provenance = provenance
     if compute_contact:
         # Authenticate the exact host values before device transfer.  This is
