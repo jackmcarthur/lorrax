@@ -278,6 +278,20 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
         name, _ = _reserve(meta, "head", resident,
             3*stats.output_size_in_bytes+stats.temp_size_in_bytes+native)
         ledger.live_stages = ambient+(name,)
+    # A metal's static row is the z -> 0 limit at fixed q (qsgw_head.metal_static_rows):
+    # its body is the exact static Gamma W, whose chi0 carries the intraband -df/dE
+    # term that exists only at z = 0 for q = 0 (qsgw_head._metal_static_head builds
+    # it; the MPA producer's static rows already take it).  The tangential model is
+    # fitted at z != 0, where that term is absent, so its W(Gamma, 0) under-screens
+    # the Fermi-surface density: folding the static wings through it gave
+    # kappa_eff^2 = -0.485 on Fe 4^3 SC map 1 against +1.625 through the exact body
+    # (runs/Fe/04_*/160_sc_rootcause_20261111 r3d).
+    static_body = None
+    if (full and not micro and response is not None and material_class == "metal"
+            and response.static_chi_body_gamma is not None):
+        from .w_isdf import solve_w
+        static_body = solve_w(args[-1], jnp.array(response.static_chi_body_gamma, copy=True),
+                              meta, mesh_xy)[0]
     # Each point's Gamma body is resident only while its 3x3 fold is formed;
     # the mini-BZ cell averages of all points then share one draw
     # (finalize_iteration_head_rows), bit-identical to one call per point.
@@ -295,6 +309,8 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
             if full:
                 value = evaluate(jnp.asarray(nodes[index], jnp.complex128), *args)
                 total = value[0]
+                if static_body is not None and abs(complex(nodes[index])) <= 1e-14:
+                    total = static_body
             if response is None:
                 samples.append(head_resolver.at(point))
             else:
@@ -304,7 +320,7 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
             if full:
                 del value
         if full and not micro:
-            del args, b, poles, counts
+            del args, b, poles, counts, static_body
     if terms:
         rows = [t for t in terms if isinstance(t, dict)]
         with timing.section("head.cell_average", announce=True,
