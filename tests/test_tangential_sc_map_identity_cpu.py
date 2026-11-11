@@ -48,7 +48,7 @@ def _controls(*, expect_collision=False):
         rep, face = NamedSharding(mesh, P()), NamedSharding(mesh, P(None, "x", "y"))
         wfns = NS(enk=jax.device_put(energy, rep), occ=jax.device_put(occupations, rep),
                   slices=NS(b0=0, b4_logical=n))
-        meta = NS(b_id_4_chi_user=n,
+        meta = NS(b_id_4_chi_user=n, nspinor=2,
                   tangential_recipe=dict(recipe_hash="same-recipe", gate_hash="same-gates"))
         occ = NS(occ_hash=hashlib.sha256(occupations.tobytes()).hexdigest())
         cache_before = dict(response_bank._OPERATOR_DIGESTS)
