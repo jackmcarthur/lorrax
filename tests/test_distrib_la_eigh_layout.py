@@ -27,6 +27,7 @@ from distrib_la._cusolvermp import (  # noqa: E402
 from distrib_la._elpa import _TILE, eigh_layout  # noqa: E402
 from distrib_la._panel_matmul import _interleaved_width  # noqa: E402
 from distrib_la._result_check import deflate_zero_rows  # noqa: E402
+from distrib_la.resolve import _check_geometry  # noqa: E402
 
 
 def _hermitian(n, rank, seed):
@@ -244,8 +245,31 @@ def _panel_problems():
     return bad
 
 
-@pytest.mark.parametrize("family", ["eigh", "elpa", "lu", "rhs", "panels"])
+def _geometry_problems():
+    """Mesh-geometry refusals (resolve guard 5): exactly the meshes a library cannot run.  The
+    cuSOLVERMp and ELPA eigh and the cuSOLVERMp Cholesky need a square mesh, ScaLAPACK a square or
+    1-D one; nothing else is refused here (the 1-D cuSOLVERMp LU/Cholesky guard precedes it)."""
+    rules = {("eigh", "cusolvermp"): lambda px, py: px != py,
+             ("eigh", "elpa"): lambda px, py: px != py,
+             ("cholesky", "cusolvermp"): lambda px, py: px != py,
+             ("solve_lu", "cusolvermp"): lambda px, py: False,
+             ("eigh", "scalapack"): lambda px, py: px > 1 and py > 1 and px != py,
+             ("solve_lu", "scalapack"): lambda px, py: px > 1 and py > 1 and px != py}
+    bad = []
+    for (op, backend), refuse in rules.items():
+        for px, py in _MESHES:
+            try:
+                _check_geometry(op, backend, px, py)
+                refused = False
+            except ValueError:
+                refused = True
+            if refused != refuse(px, py):
+                bad.append(("geometry", op, backend, px, py, refused))
+    return bad
+
+
+@pytest.mark.parametrize("family", ["eigh", "elpa", "lu", "rhs", "panels", "geometry"])
 def test_every_layout_is_valid_or_refused(family):
     bad = {"eigh": _eigh_problems, "elpa": _elpa_problems, "lu": _lu_problems,
-           "rhs": _rhs_problems, "panels": _panel_problems}[family]()
+           "rhs": _rhs_problems, "panels": _panel_problems, "geometry": _geometry_problems}[family]()
     assert not bad, f"{len(bad)} invalid {family} layouts, first: {bad[:10]}"
