@@ -681,6 +681,54 @@ def scaled_head_fold(S_direct, fold, fold_scale) -> jax.Array:
     return S_direct + 0.5 * (M @ fold + fold @ jnp.swapaxes(M, -1, -2))
 
 
+def pin_static_head(S_omega, omegas, epsilon_inf):
+    """Pin the head's static limit to a given eps_inf, keeping its frequency shape.
+
+    ``S'(z) = (M S(z) + S(z) M^T)/2`` with ``M = S_t S(0)^-1`` and
+    ``S_t = -(eps_inf - 1)/(8 pi)`` (the S convention, ``eps = 1 - 8 pi
+    qhat.S.qhat``, docs/theory/s-tensor-convention.md).  At ``z = 0`` this is
+    ``S_t`` exactly, so the head's static macroscopic dielectric tensor is
+    ``eps_inf``; on a cubic crystal ``M = r 1`` and every node is scaled by
+    ``r = (eps_inf - 1)/(eps(0) - 1)``.  It is the amplitude scaling of the
+    head polarizability (its f-sum weight scales by the same ``M``), the
+    symmetrized product of :func:`scaled_head_fold`.
+
+    Parameters
+    ----------
+    S_omega : array, (n_omega, 3, 3) complex, 1/(Ry bohr^2)
+        Folded (or direct) head at the response nodes, replicated.
+    omegas : sequence of complex, Ry
+        The nodes; exactly one must be ``z = 0``.
+    epsilon_inf : sequence of 9 floats
+        Target Cartesian tensor, row-major (``HeadConfig.epsilon_inf``).
+
+    Returns
+    -------
+    (S_pinned (n_omega, 3, 3), M (3, 3), eps_computed (3, 3))
+    """
+    S = np.asarray(S_omega, dtype=np.complex128)
+    z = np.asarray(omegas, dtype=np.complex128).reshape(-1)
+    static = np.flatnonzero(np.abs(z) <= 1.0e-14)
+    if S.shape != (z.size, 3, 3) or static.size != 1:
+        raise ValueError(
+            "GATE head_epsilon_inf_static_row: the pinned head needs exactly "
+            f"one z = 0 row among its nodes (got {static.size} of {z.size}, "
+            f"S {S.shape})")
+    S0 = S[static[0]]
+    S0 = 0.5 * (S0 + S0.T)
+    if np.abs(S0.imag).max() > 1.0e-8 * np.abs(S0.real).max():
+        raise ValueError(
+            "GATE head_epsilon_inf_static_row: the static head is not real "
+            f"(max |Im S(0)| = {np.abs(S0.imag).max():.3e})")
+    S0 = S0.real
+    S_t = -(np.asarray(epsilon_inf, dtype=float).reshape(3, 3)
+            - np.eye(3)) / (8.0 * np.pi)
+    # M S0 = S_t  <=>  S0 M^T = S_t^T (S0 symmetric)
+    M = np.linalg.solve(S0, S_t.T).T
+    pinned = 0.5 * (M @ S + S @ M.T)
+    return pinned, M, np.eye(3) - 8.0 * np.pi * S0
+
+
 def fold_cartesian_head_wings_sharded(
     S_direct: jax.Array,
     Y_x: jax.Array,

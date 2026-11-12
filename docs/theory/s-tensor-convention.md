@@ -122,3 +122,31 @@ same filling, and `HEAD_DENSE_MIN_CONDUCTION` conduction bands
 (`GATE head_dense_window`); a file not authenticated by its own WFN
 (`GATE dft_head_dipole_provenance`). A file of the GW mesh's own WFN is the
 GW mesh.
+
+## Pinned static head
+
+`head_epsilon_inf` replaces the static limit of the head by a given tensor
+\(\varepsilon_\infty\) (for example the experimental clamped-ion value) and
+keeps the computed frequency shape:
+
+$$
+S'(z)=\tfrac12\left(MS(z)+S(z)M^{\mathsf T}\right),\qquad
+M=S_tS(0)^{-1},\qquad S_t=-\frac{\varepsilon_\infty-1}{8\pi},
+$$
+
+applied to the folded head at every response node
+(`head_correction.pin_static_head`, called from
+`qsgw_head.head_samples_from_s`). At \(z=0\) it gives \(S_t\), so
+\(\varepsilon(0)=\varepsilon_\infty\); on a cubic crystal it is the
+amplitude scaling \(S'=rS\), \(r=(\varepsilon_\infty-1)/(\varepsilon(0)-1)\),
+which scales the head's f-sum weight by \(r\) as well. Rejected alternatives:
+a frequency rescaling \(z\to z/s\) that keeps the f-sum weight (it needs the
+pole structure of S, which the folded tangential head does not carry), and a
+shift of \(W(\Gamma)\) alone at \(z=0\) (it breaks the head's
+Kramers–Kronig shape between the static and dynamic nodes).
+
+Scope: the pin acts on the q = 0 cell only. W at every q ≠ 0 keeps the
+computed screening, so its effect on Σ is the cell weight times
+\(1/\varepsilon_\infty-1/\varepsilon(0)\) and vanishes like
+\(N_k^{-1/3}\) as the mesh is refined. It is a finite-mesh head choice, not a
+change of the screening model.

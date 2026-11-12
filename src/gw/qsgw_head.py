@@ -3695,6 +3695,23 @@ def head_samples_from_s(
         raise ValueError(
             f"S_cart_omega must be ({len(omegas)},3,3), got {S_host.shape}."
         )
+    epsilon_inf = getattr(config.head, "epsilon_inf", None)
+    if epsilon_inf is not None:
+        if intraband is not None:
+            raise ValueError(
+                "GATE head_epsilon_inf_metal: head_epsilon_inf is an "
+                "insulator's static screening; a metal has none")
+        from gw.head_correction import pin_static_head
+        S_host, M, eps0 = pin_static_head(S_host, omegas, epsilon_inf)
+        if jax.process_index() == 0:
+            log.info(
+                "  head_epsilon_inf: computed eps(0) principal = "
+                + "/".join(f"{x:.10g}" for x in np.linalg.eigvalsh(eps0))
+                + "; pinned to "
+                + "/".join(f"{x:.10g}" for x in np.linalg.eigvalsh(
+                    np.asarray(epsilon_inf, dtype=float).reshape(3, 3)))
+                + "; M principal = "
+                + "/".join(f"{x:.10g}" for x in np.linalg.eigvals(M).real))
     params = {
         "vhead": config.head.vhead,
         "whead_0freq": config.head.whead_0freq,

@@ -728,6 +728,78 @@ def refuse_unsupported_head_dense(config) -> None:
             "  doc:  docs/input_reference.md, head_dense_file.")
 
 
+def parse_head_epsilon_inf(text) -> tuple[float, ...] | None:
+    """``head_epsilon_inf`` -> 9 Cartesian floats (row-major) or None.
+
+    One value is isotropic, three are the Cartesian diagonal, nine the full
+    Cartesian tensor.  The tensor must be real symmetric with every
+    eigenvalue above 1 (a stable insulator's static screening).
+    """
+    raw = str(text or "").replace(",", " ").split()
+    if not raw:
+        return None
+    try:
+        values = [float(x) for x in raw]
+    except ValueError as exc:
+        raise ValueError(
+            f"head_epsilon_inf = {text!r}: expected 1, 3 or 9 numbers") from exc
+    if len(values) == 1:
+        eps = np.diag(values * 3)
+    elif len(values) == 3:
+        eps = np.diag(values)
+    elif len(values) == 9:
+        eps = np.asarray(values, dtype=float).reshape(3, 3)
+    else:
+        raise ValueError(
+            f"head_epsilon_inf = {text!r}: expected 1, 3 or 9 numbers, "
+            f"got {len(values)}")
+    if not np.allclose(eps, eps.T, rtol=0.0, atol=1.0e-10 * np.abs(eps).max()):
+        raise ValueError(
+            f"head_epsilon_inf = {text!r}: the tensor must be symmetric")
+    if not np.all(np.linalg.eigvalsh(eps) > 1.0):
+        raise ValueError(
+            f"head_epsilon_inf = {text!r}: every principal value must exceed 1")
+    return tuple(float(x) for x in eps.reshape(-1))
+
+
+def refuse_unsupported_head_epsilon_inf(config) -> None:
+    """``GATE head_epsilon_inf_scope``: where a pinned static head is defined, at PARSE time.
+
+    The pin rescales the folded scalar RPA charge head of the tangential
+    route (``gw.head_correction.pin_static_head``).  A head that is off,
+    overridden, read from BerkeleyGW, supplied by a density resolvent or
+    four-current, or built on another frequency route would ignore it.
+    Metals refuse at the head build (``GATE head_epsilon_inf_metal``).
+    """
+    if getattr(config.head, "epsilon_inf", None) is None:
+        return
+    why = None
+    if config.head.correction is HeadCorrection.OFF:
+        why = "head_correction = off builds no head"
+    elif coerce_compute_mode(config.compute_mode) is not ComputeMode.TANGENTIAL:
+        why = (f"compute_mode = {coerce_compute_mode(config.compute_mode).value}; "
+               "the pin is implemented on the tangential head only")
+    elif config.screening.diagrams is not ScreeningDiagrams.W_RPA:
+        why = (f"screening_diagrams = {config.screening.diagrams.value} "
+               "builds its head from the density resolvent")
+    elif bool(config.bispinor):
+        why = "bispinor = true: the four-current head is not the scalar charge head"
+    elif getattr(config.screening, "source", "compute") != "compute":
+        why = "screening_source is not compute: the head is BerkeleyGW's"
+    elif any(getattr(config.head, k) is not None
+             for k in ("vhead", "whead_0freq", "whead_imfreq")):
+        why = "vhead/whead_0freq/whead_imfreq override the head it would pin"
+    if why is not None:
+        raise ValueError(
+            "GATE head_epsilon_inf_scope: head_epsilon_inf pins the static "
+            "head this deck does not build.\n"
+            f"  got:  {why}\n"
+            "  want: compute_mode = tangential, screening_diagrams = w_rpa, "
+            "head_correction = full, bispinor = false, no head overrides\n"
+            "  fix:  drop head_epsilon_inf, or change the head settings\n"
+            "  doc:  docs/input_reference.md, head_epsilon_inf.")
+
+
 def sigma_channels_for(mode) -> frozenset[SigmaChannel]:
     """The Σ channels ``mode`` builds, per :data:`MODE_SIGMA_CHANNELS`."""
     resolved = coerce_compute_mode(mode)
@@ -1572,6 +1644,13 @@ _DEFAULTS = {
     # for bit.  Its S_d replaces the GW mesh's; the local-field fold is the GW
     # mesh's, scaled by S_d,dense S_d,mesh^-1 (gw.head_correction.scaled_head_fold).
     "head_dense_file": "",
+    # Pinned static macroscopic dielectric tensor of the head (insulators,
+    # tangential RPA): "" = the computed head.  One number (isotropic), three
+    # (Cartesian diagonal) or nine (Cartesian, row-major).  The folded head
+    # S(z) at every response node becomes (M S(z) + S(z) M^T)/2 with
+    # M = S_t S(0)^-1 and S_t = -(eps_inf - 1)/(8 pi)
+    # (gw.head_correction.pin_static_head).
+    "head_epsilon_inf": "",
     # Metals: Fermi-liquid damping of the head's dynamic Drude term,
     # eps_intra = -omega_p^2/(z (z + i M(z))), M(z) = gamma0 (-i z)/(Gamma - i z):
     # rate gamma0 omega^2/(omega^2 + Gamma^2) on the real axis, zero at the
@@ -2823,6 +2902,7 @@ def _input_head(
         use_bgw_vcoul=bool(params["use_bgw_vcoul"]),
         bgw_vcoul_file=(str(params["bgw_vcoul_file"]) or None),
         bgw_vcoul_sym_wfn=(str(params["bgw_vcoul_sym_wfn"]) or None),
+        epsilon_inf=parse_head_epsilon_inf(params["head_epsilon_inf"]),
     )
     return (head, _resolved_do_g0)
 
@@ -3282,6 +3362,7 @@ def _apply_input_envelope(
     refuse_unsupported_screening_diagrams(resolved)
     refuse_unsupported_screening_source(resolved)
     refuse_unsupported_head_dense(resolved)
+    refuse_unsupported_head_epsilon_inf(resolved)
     refuse_unsupported_bispinor_gw(resolved)
     warn_headless_tangential_self_consistency(resolved, print_fn=print_fn)
     announce_legacy_sigma_axis_keys(
@@ -4318,6 +4399,9 @@ class HeadConfig:
     use_bgw_vcoul: bool
     bgw_vcoul_file: str | None
     bgw_vcoul_sym_wfn: str | None
+    #: Pinned static eps_inf of the head, 9 Cartesian floats row-major, or
+    #: None for the computed head (``head_epsilon_inf``).
+    epsilon_inf: tuple[float, ...] | None = None
 
     @property
     def uses_bgw_metal_q0shift(self) -> bool:
