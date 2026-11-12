@@ -589,7 +589,10 @@ def reshard_rounds_call(op: str, mesh: Mesh, A, *, rounds: int, shifted: bool = 
             return program
         from distrib_la._result_check import shifted as shift
         from distrib_la.matmul import matmul
-        return shift(program, matmul=partial(matmul, mesh=mesh))
+        # The staged route needs no provider: 'off' makes it legal on a non-square mesh, where
+        # route (c) runs (any other name resolves the face GEMM, which refuses px != py).  On a
+        # square mesh the staged route computes the same thing either way.
+        return shift(program, matmul=partial(matmul, mesh=mesh, backend="off"))
     if rounds == 1:
         return slice_program()(A)
     key = ("rounds", op, mesh_key(mesh), nb, n, str(A.dtype), rounds, bool(shifted))
