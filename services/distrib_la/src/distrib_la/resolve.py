@@ -386,6 +386,16 @@ def _platform_phrase(platforms: tuple[str, ...]) -> str:
 def _check_geometry(op: str, backend: str, px: int, py: int) -> None:
     """Guard 5 — mesh-geometry constraints, per (op, backend).  Raises
     ValueError with the reason; silent-pass otherwise."""
+    if op == "cholesky" and backend == "cusolvermp" and px != py:
+        # cusolverMpPotrf needs square blocks (mb == nb); the one-tile-per-rank
+        # descriptors give mb = n/px, nb = n/py.  The wrapper refuses this at
+        # call time (_cusolvermp.batched_distributed_cholesky); refusing here
+        # keeps a 2x4 plan from resolving to a call that cannot run.
+        raise ValueError(
+            f"cholesky backend 'cusolvermp' needs a SQUARE mesh: cusolverMpPotrf needs "
+            f"square blocks (mb == nb), and one tile per rank gives mb = n/{px}, "
+            f"nb = n/{py} on the {px}x{py} mesh.  Use a square mesh, 'auto' (demotes "
+            f"with an announcement) or 'native2d'.")
     if op == "eigh" and backend in ("cusolvermp", "elpa"):
         # These FFI eigh wrappers reject p != q; for cusolvermp this is
         # a DEADLOCK guard (cusolverMpSyevd hangs in a collective on
@@ -423,18 +433,19 @@ _AUTO_CAPABILITY_DEMOTE_ANNOUNCED: set[tuple[str, str]] = set()
 
 def _announce_auto_geometry_demote(op: str, px: int, py: int) -> None:
     """Rank-0, once-per-(op, geometry) announcement that ``auto`` demoted a
-    compiled cusolvermp to native because the mesh is 1-D ('auto' may
-    demote but must announce).  Mesh geometry cannot differ per rank, so
-    rank 0 speaks for all."""
+    compiled cusolvermp to native because the mesh does not fit it: 1-D, or
+    non-square for cholesky ('auto' may demote but must announce).  Mesh
+    geometry cannot differ per rank, so rank 0 speaks for all."""
     key = (op, int(px), int(py))
     if key in _AUTO_GEOMETRY_DEMOTE_ANNOUNCED:
         return
     _AUTO_GEOMETRY_DEMOTE_ANNOUNCED.add(key)
+    why = ("is 1-D (block-cyclic 2-D layout needs px >= 2 and py >= 2)" if px < 2 or py < 2
+           else "is not square (cusolverMpPotrf needs square blocks, mb == nb)")
     if _process_index() == 0:
         _LOG.info(
             f"  [distrib_la.resolve] {op} backend 'auto': cusolvermp is "
-            f"compiled but the {px}x{py} mesh is 1-D (block-cyclic 2-D "
-            f"layout needs px >= 2 and py >= 2) — demoting to native.  "
+            f"compiled but the {px}x{py} mesh {why} — demoting to native.  "
             f"An explicit 'cusolvermp' request on this mesh refuses "
             f"instead.")
 
@@ -639,7 +650,8 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
         if candidate is None:
             return NATIVE                  # this leg's policy: no FFI auto
         target, _ = _SPEC[(op, candidate)]
-        if px >= 2 and py >= 2 and loader.has_target(target, platform):
+        fits = px >= 2 and py >= 2 and not (op == "cholesky" and px != py)
+        if fits and loader.has_target(target, platform):
             return candidate
         # 'auto' MAY demote, but must announce.  The only demote here that
         # is not the documented default policy ("native unless a compiled
@@ -647,9 +659,9 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
         # compiled, mesh 1-D.  Mesh geometry is identical on every rank, so
         # a rank-0 line suffices; deduped so repeated plan() calls do not
         # spam.
-        if loader.has_target(target, platform) and not (px >= 2 and py >= 2):
+        if loader.has_target(target, platform) and not fits:
             _announce_auto_geometry_demote(op, px, py)
-        elif px >= 2 and py >= 2:
+        elif fits:
             # Geometry was fine, so the ONLY reason we are here is that the
             # handler could not be resolved.  See the docstring of
             # _announce_auto_capability_demote for why this used to be
