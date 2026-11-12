@@ -245,7 +245,8 @@ with `N_k N_b` eigenvalues; there is no host `N_orbit²` or `N_k N_b²` matrix.
   memory_unpriced` under `LORRAX_MEMORY_STRICT`). The cuSOLVERMp LU rows are
   per local tile at the solve's own layout (`distrib_la.workspace.lu_workspace_model`),
   every dtype at the complex rate: one tile per rank 5.0 panels `Px (L + mb) nb`
-  (it grows with n times the tile), relabeled 11.2 panels but at least the 2 GiB
+  (it grows with n times the tile) on a square mesh, `L (0.82 n + 1.53 nb)` + 32 MiB
+  on a non-square one (1.03–1.20× of measured), relabeled 11.2 panels but at least the 2 GiB
   getrs room (conservative: 0.44–0.68 GB measured); a solve's mempool high-water
   equals the query to 0.1 MB (2×2, 2026-11-11). The layout is the room's: one tile
   per rank on 2×2, 3×3 and non-square meshes where its priced bytes fit the solve

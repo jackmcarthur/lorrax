@@ -328,14 +328,30 @@ def _lu_row(name):
     return dict(leg_for_platform("CUDA").vendor_rows)[("cusolvermp", name)]
 
 
+#: The non-square one-tile row's unit (CUDA leg "solve_lu non-square"): L (a n + b nb) complex
+#: words plus a fixed c bytes.
+_LU_NONSQUARE = (0.82, 1.53, 32 << 20)
+
+
+def _lu_one_tile_unit(n, px, py):
+    """(row name, unit bytes) of one tile per rank: square, the CUDA leg's Px (L + mb) nb panels
+    (mb = L); non-square, L (0.82 n + 1.53 nb) + 32 MiB."""
+    local, nb = n // px, n // py
+    if px == py:
+        return "solve_lu", px * 2 * local * nb * _LU_ITEM
+    a, b, c = _LU_NONSQUARE
+    return "solve_lu non-square", local * (a * n + b * nb) * _LU_ITEM + c
+
+
 def lu_one_tile_bytes(n, px, py) -> float:
     """Bytes per rank a cuSOLVERMp solve_lu of an n x n system against n right-hand sides
-    needs at one tile per rank: its workspace (the CUDA leg's one-tile row, 2 n (n/Py)
-    complex panels: Px (L + mb) nb) and its A and B tiles.  What ``_cusolvermp.lu_one_tile``
-    holds against the solve's room, with no warning outside the row's range (a decision,
-    not a price: :func:`lu_workspace_model` is)."""
+    needs at one tile per rank: its workspace (the CUDA leg's one-tile row for the mesh's
+    shape) and its A and B tiles.  What ``_cusolvermp.lu_one_tile`` holds against the
+    solve's room, with no warning outside the row's range (a decision, not a price:
+    :func:`lu_workspace_model` is)."""
     n, px, py = int(n), int(px), int(py)
-    return (_lu_row("solve_lu").ratio * 2 * n * (n // py) + 2 * (n // px) * (n // py)) * _LU_ITEM
+    name, unit = _lu_one_tile_unit(n, px, py)
+    return _lu_row(name).ratio * unit + 2 * (n // px) * (n // py) * _LU_ITEM
 
 
 def lu_workspace_model(n, px, py, itemsize=_LU_ITEM, room=None):
@@ -344,7 +360,8 @@ def lu_workspace_model(n, px, py, itemsize=_LU_ITEM, room=None):
     XLA's pool), from the shapes alone, at the layout the solve runs in ``room`` (``lu_layout``;
     a non-square mesh it refuses raises its ValueError here).  The CUDA leg's measured rows
     (``lxkit.memory.vendor``, local tile L), every dtype at the complex rate (:data:`_LU_ITEM`;
-    ``itemsize`` is not read): one tile per rank, 5.0 panels Px (L + mb) nb; relabeled, 11.2
+    ``itemsize`` is not read): one tile per rank, 5.0 panels Px (L + mb) nb on a square mesh,
+    L (0.82 n + 1.53 nb) + 32 MiB on a non-square one; relabeled, 11.2
     panels (L + mb) mb, floored at the getrs room the handler may take with none posted
     (:data:`GETRS_DEFAULT_ROOM`).  The source names the row, EXTRAPOLATED outside its
     measured L and P.  For a planner off the device (no native build); on one,
@@ -355,8 +372,9 @@ def lu_workspace_model(n, px, py, itemsize=_LU_ITEM, room=None):
     side, mb, nb = lu_layout(int(n), px, py, room)
     local = side // px
     one = mb == local
-    term = memory.vendor(leg_for_platform("CUDA"), "cusolvermp", "solve_lu" if one else "solve_lu relabeled",
-                         local, px * py, _LU_ITEM, unit=(px if one else 1) * (local + mb) * nb * _LU_ITEM)
+    name, unit = (_lu_one_tile_unit(side, px, py) if one
+                  else ("solve_lu relabeled", (local + mb) * nb * _LU_ITEM))
+    term = memory.vendor(leg_for_platform("CUDA"), "cusolvermp", name, local, px * py, _LU_ITEM, unit=unit)
     if one or term.fixed >= GETRS_DEFAULT_ROOM:
         return term
     # Conservative on purpose: relabeled solves measured 0.44 / 0.68 GB at tiles 10004 / 15000

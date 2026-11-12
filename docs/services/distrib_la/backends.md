@@ -344,6 +344,10 @@ runs relabeled block-cyclic (`_cusolvermp.lu_layout`, 0.3–1.8 GB at tile 8198)
 non-square mesh cannot relabel, so there one tile over the room is refused, naming the
 square meshes that would run it.
 
+On a non-square mesh one tile per rank does not grow with Px: it is priced from its own
+row, `L (0.82 n + 1.53 nb)` complex words plus 32 MiB (2×3 at n 24594 5.74 GB measured,
+4×2 at n 16384 1.45), 1.03–1.20× of measured on 2×3, 3×2, 2×4 and 4×2.
+
 ## Inside the ScaLAPACK handlers {#inside-the-scalapack-handlers}
 
 These failures live in `src/ffi/cpp/scalapack/`, below every Python guard: the

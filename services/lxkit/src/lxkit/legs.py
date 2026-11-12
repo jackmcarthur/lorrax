@@ -224,6 +224,14 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
                 n=(2048, 12000), p=(4, 36), source="lrx_lu_workspace_bytes one tile per rank, "
                 "4.82-5.23 per Px at L 2048-12000 on 2x2, 4.22 at L 8191 on 3x3, 4.35 at L 10002 "
                 "on 6x6 (getrf, getrs, pivots), A100, 2026-11-11")),
+            # A non-square mesh's one tile does not grow with Px: 2.7-4.3 tiles, 4.7-15x under
+            # the square row (2x3 n 24594 5.74 GB, 4x2 n 16384 1.45).  Fit over 2x3, 3x2, 2x4,
+            # 4x2 and scaled to cover every point: priced / measured 1.03-1.20.
+            (("cusolvermp", "solve_lu non-square"), MeasuredRow(
+                1.0, None, "L (0.82 n + 1.53 nb) + 32 MiB, one tile per rank, non-square mesh",
+                n=(200, 12297), p=(6, 8), source="lrx_lu_workspace_bytes one tile per rank, "
+                "2x3 / 3x2 / 2x4 / 4x2 at L 3954-12297, 0.58-5.74 GB (f64 half), A100, distrib_la "
+                "shape rerun 2026-11-11")),
             (("cusolvermp", "solve_lu relabeled"), MeasuredRow(
                 11.2, None, "local LU panels (L + mb) mb, relabeled", n=(1024, 15000),
                 p=(4, 4), source="lrx_lu_workspace_bytes relabeled blocks 128-256, 11.05-11.16 "
