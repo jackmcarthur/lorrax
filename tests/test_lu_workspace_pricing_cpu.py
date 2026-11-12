@@ -33,6 +33,20 @@ def test_lu_layout_follows_the_room():
         lu_layout(16400, 2, 4)
 
 
+def test_non_square_one_tile_priced_from_its_own_row():
+    from distrib_la._cusolvermp import lu_layout
+    from distrib_la.workspace import lu_workspace_model
+    big = int(40 * GB)
+    # distrib_la shape rerun 2026-11-11 (complex128, nrhs = n, mempool high-water, GB/rank).
+    for (px, py, n), measured in {(2, 3, 11862): 1.49, (2, 3, 16380): 2.69, (2, 3, 24594): 5.74,
+                                  (3, 2, 11862): 1.16, (3, 2, 16380): 2.07, (2, 4, 15816): 2.15,
+                                  (2, 4, 16384): 2.29, (4, 2, 15816): 1.37, (4, 2, 16384): 1.45}.items():
+        assert 1.0 <= lu_workspace_model(n, px, py, room=big).fixed / (measured * GB) <= 1.25
+    # Ran at 4.4-11.9 GB on the earlier tree; the square row refused them in 40 GB.
+    for px, py, n in ((3, 2, 24594), (2, 3, 36000), (3, 2, 36000)):
+        assert lu_layout(n, px, py, big)[1] == n // px
+
+
 def test_w_dyson_distributed_route_prices_lu_workspace_and_both_contexts():
     from distrib_la.workspace import GETRS_DEFAULT_ROOM
     from gw.stage_inventory import CONTEXT, SECOND_CONTEXT, Deck, stage_prices
