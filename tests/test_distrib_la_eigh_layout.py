@@ -20,9 +20,10 @@ jax = pytest.importorskip("jax")
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp  # noqa: E402
 
+from distrib_la import _cusolvermp  # noqa: E402
 from distrib_la._column_panels import _panel_width  # noqa: E402
 from distrib_la._cusolvermp import (  # noqa: E402
-    _BLOCK_MAX, _BLOCK_MIN, _LU_RELABEL_LOCAL_MIN, _largest_block, drop_sentinels, lu_layout,
+    _BLOCK_MAX, _BLOCK_MIN, _largest_block, drop_sentinels, lu_layout,
     pad_with_sentinels, retry_block, rhs_layout, solve_layout)
 from distrib_la._elpa import _TILE, eigh_layout  # noqa: E402
 from distrib_la._panel_matmul import _interleaved_width  # noqa: E402
@@ -112,14 +113,34 @@ def _primes(limit):
 
 _PRIMES = _primes(N_MAX)
 
+#: The LU one-tile rule.  With a room (``_cusolvermp.lu_one_tile``): one tile on 2x2, 3x3 and a
+#: non-square mesh where its priced bytes fit the solve plan's room, checked with no room (the
+#: 2 GiB getrs room) and at 40 GB.  Before it, a fixed relabel bound on the local tile.
+_LU_ROOM_RULE = hasattr(_cusolvermp, "lu_one_tile")
+_LU_ROOMS = (None, 40 * 10 ** 9) if _LU_ROOM_RULE else (None,)
+_LU_BAND = getattr(_cusolvermp, "_LU_RELABEL_LOCAL_MIN", 8192)   # the fixed bound's tile band
+
+
+def _lu_one_tile_expected(n, px, py, room):
+    """Whether the LU rule allows one tile per rank for ``n`` on ``px x py`` in ``room``."""
+    local = n // px
+    if px == 1 or local <= _BLOCK_MAX:
+        return True
+    if not _LU_ROOM_RULE:
+        return px != py or (px < 4 and local <= _LU_BAND)
+    if px == py and px >= 4:
+        return False
+    from distrib_la.workspace import GETRS_DEFAULT_ROOM, lu_one_tile_bytes
+    return lu_one_tile_bytes(n, px, py) <= (GETRS_DEFAULT_ROOM if room is None else room)
+
 
 def _tiles(t_max, dense=4096, sample=1500):
-    """Every tile up to ``dense``, the band around the LU relabel threshold, and above it a fixed
-    sample: primes and two/three/six times a prime (the tiles with no block in [128, 256]),
-    multiples of 128 and their neighbours, and uniform draws, all up to ``t_max``."""
+    """Every tile up to ``dense``, the band around the former fixed LU relabel bound (8192), and
+    above it a fixed sample: primes and two/three/six times a prime (the tiles with no block in
+    [128, 256]), multiples of 128 and their neighbours, and uniform draws, all up to ``t_max``."""
     rng = np.random.default_rng(t_max)
     out = set(range(1, min(dense, t_max) + 1))
-    out |= set(range(_LU_RELABEL_LOCAL_MIN - 200, _LU_RELABEL_LOCAL_MIN + 250))
+    out |= set(range(_LU_BAND - 200, _LU_BAND + 250))
     for mult in (1, 2, 3, 6):
         cand = mult * _PRIMES[(mult * _PRIMES > dense) & (mult * _PRIMES <= t_max)]
         if cand.size:
@@ -171,11 +192,10 @@ def _elpa_problems():
 
 
 def _lu_problems():
-    """cuSOLVERMp LU: one tile per rank only on a non-square mesh, at 1x1, for tiles up to 256,
-    or on 2x2/3x3 up to the relabel threshold; otherwise a square block in [128, 256] that
-    divides the padded tile, padding under 128 rows per rank.  A refusal is valid.  One tile
-    above the threshold on a non-square mesh or at 1x1 is the planner branch's
-    (claude/lu-workspace-pricing: price the LU workspace, refuse the non-square one-tile)."""
+    """cuSOLVERMp LU: one tile per rank only where the rule allows it (:func:`_lu_one_tile_expected`:
+    1-D, tiles up to 256, and on 2x2, 3x3 and non-square meshes where it fits the room); otherwise
+    a square block in [128, 256] that divides the padded tile, padding under 128 rows per rank.
+    A refusal is valid; under the room rule only on a non-square mesh that one tile does not fit."""
     bad = []
     for px, py in _MESHES:
         step = px * py // math.gcd(px, py)
@@ -184,19 +204,24 @@ def _lu_problems():
         for s in sample:
             n = step * s
             local = n // px
-            try:
-                side, mb, nb = lu_layout(n, px, py)
-            except (ValueError, RuntimeError):
-                continue
-            if (side, mb, nb) == (n, local, n // py):
-                if not (px != py or px == 1 or local <= _BLOCK_MAX
-                        or (px < 4 and local <= _LU_RELABEL_LOCAL_MIN)):
-                    bad.append(("lu one tile", px, py, n))
-                continue
-            tile = side // px
-            if not (px == py and mb == nb and _BLOCK_MIN <= mb <= _BLOCK_MAX and side % px == 0
-                    and tile % mb == 0 and 0 <= tile - local < _BLOCK_MIN):
-                bad.append(("lu", px, py, n, side, mb, nb))
+            for room in _LU_ROOMS:
+                one = _lu_one_tile_expected(n, px, py, room)
+                try:
+                    side, mb, nb = lu_layout(n, px, py) if room is None else lu_layout(n, px, py, room)
+                except (ValueError, RuntimeError):
+                    if _LU_ROOM_RULE and (px == py or one):
+                        bad.append(("lu refused", px, py, n, room))
+                    continue
+                if (side, mb, nb) == (n, local, n // py):
+                    if not one:
+                        bad.append(("lu one tile", px, py, n, room))
+                    continue
+                tile = side // px
+                if not (px == py and mb == nb and _BLOCK_MIN <= mb <= _BLOCK_MAX and side % px == 0
+                        and tile % mb == 0 and 0 <= tile - local < _BLOCK_MIN):
+                    bad.append(("lu", px, py, n, room, side, mb, nb))
+                if _LU_ROOM_RULE and one:
+                    bad.append(("lu relabeled where one tile fits", px, py, n, room))
     return bad
 
 
