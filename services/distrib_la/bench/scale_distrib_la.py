@@ -302,7 +302,11 @@ def run_case(op, n, dname, mesh, args, nrhs=None):
         row["nb"], row["grid"], row["layout"] = layout(op, p.backend, n, px, py, dname)
         if op == "solve_lu" and p.backend == "cusolvermp":
             from distrib_la._cusolvermp import lu_layout
-            row["nb"] = lu_layout(n, px, py)[1]
+            room = getattr(p, "budget_bytes", None)
+            try:    # the layout in the plan's room; a mesh the room refuses is refused by the solve
+                row["nb"] = (lu_layout(n, px, py) if room is None else lu_layout(n, px, py, room))[1]
+            except ValueError:
+                row["nb"] = None
         walls, metrics = [], []
         if op == "eigh":
             A = herm(mesh, n, dt, 5)
