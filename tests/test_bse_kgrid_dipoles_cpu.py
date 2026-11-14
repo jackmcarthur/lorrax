@@ -194,10 +194,12 @@ def test_on_grid_identity_and_off_grid_dipoles():
         _densify(mesh, c, e, v, fh_energies=e_qp, gate_energies=e)
 
 
-def _densify_qp(mesh, c, c_qp, e, e_qp, v, *, state_rows=True):
-    """The densifier's QP route on the toy: fH on C_QP / E_QP, velocity on C / E.
+def _densify_qp(mesh, c, c_qp, e, e_qp, v, *, state_rows=True, rotated_nodes=True):
+    """The densifier's QP route on the toy: fH on C_QP / E_QP and the QP states at
+    the nodes (the back-map targets), velocity on C / E with the DFT nodes.
 
-    The rank axis is zero-padded to the mesh (the Galerkin carrier).
+    The rank axis is zero-padded to the mesh (the Galerkin carrier).  The toy's
+    orbitals are its nodes, so the node states are the compact rows.
     """
     kc = _grid(KC)
     pad = (-c.shape[2]) % int(mesh.size)
@@ -205,7 +207,8 @@ def _densify_qp(mesh, c, c_qp, e, e_qp, v, *, state_rows=True):
     nodes = _nodes(c)
     with xla_reference():
         fine = compute_wfns_fi(
-            ctilde=jnp.asarray(c_qp), B_at_mu=nodes, enk_sigma=jnp.asarray(e_qp.T),
+            ctilde=jnp.asarray(c_qp), B_at_mu=_nodes(c_qp) if rotated_nodes else nodes,
+            enk_sigma=jnp.asarray(e_qp.T),
             kgrid_co=KC, kgrid_fine=KF, band_window_fi=(B_MIN, B_MAX),
             mesh_xy=mesh, return_coeffs=True)
         dip = densified_dipoles(
@@ -228,7 +231,9 @@ def test_qp_rotated_compact_states_keep_the_dft_velocity():
     for a U inside the window's valence and conduction spans the r-form dipoles
     are the DFT ones rotated by U.  A U that mixes a band across the window edge
     passes the on-grid state identity against the QP rows and fires it against
-    the DFT rows (the red twin).
+    the DFT rows (the red twin).  A U across the gap gives fine psi at the shared
+    k in the QP valence and conduction spans separately; with the unrotated
+    states at the back-map targets (the red twin) psi stays the DFT orbitals.
     """
     from bandstructure.fh_interp import _apply_qp_block_to_compact_state
     mesh, h = _mesh(), _model()
@@ -237,7 +242,8 @@ def test_qp_rotated_compact_states_keep_the_dft_velocity():
     c, e, v = _states(h, kc)
     e_qp = e + SHIFT * (np.arange(NB) >= B_MIN + N_VAL)[None, :]
     for pairs, crosses in (([(2, 3, 0.4), (4, 5, 0.3)], False),
-                           ([(1, 2, 0.35), (4, 5, 0.3)], True)):
+                           ([(1, 2, 0.35), (4, 5, 0.3)], True),
+                           ([(3, 4, 0.3)], "gap")):
         U = np.tile(np.eye(NB, dtype=complex), (nk, 1, 1))
         for a, b, t in pairs:
             U[:, a, a] = U[:, b, b] = np.cos(t)
@@ -262,6 +268,17 @@ def test_qp_rotated_compact_states_keep_the_dft_velocity():
         ko = [int(j[0]) for _, j in hit if j.size]
         np.testing.assert_allclose(np.asarray(fine.enk_full)[shared],
                                    np.sort(e_qp[ko], axis=1)[:, B_MIN:B_MAX], atol=1e-10)
+        if crosses == "gap":
+            def spans(f):
+                psi = np.asarray(f.psi_rmu_Y)[shared][:, :, 0, :c.shape[2]]
+                o = np.einsum("qna,qma->qnm", c_qp[ko, B_MIN:B_MAX].conj(), psi)
+                return [np.linalg.svd(o[:, sl, sl], compute_uv=False)
+                        for sl in (slice(0, N_VAL), slice(N_VAL, None))]
+            for sv in spans(fine):
+                np.testing.assert_allclose(sv, 1.0, atol=1e-8)
+            _, twin = _densify_qp(mesh, c, c_qp, e, e_qp, v, rotated_nodes=False)
+            assert min(float(sv.min()) for sv in spans(twin)) < 0.99
+            continue
         if crosses:
             with pytest.raises(ValueError, match="GATE densified_dipole_on_grid"):
                 _densify_qp(mesh, c, c_qp, e, e_qp, v, state_rows=False)
