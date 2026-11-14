@@ -61,6 +61,65 @@ DIRAC_ALPHA_VERTEX_PROVENANCE = (
 )
 
 
+# The current VERTEX (deck key ``bispinor_current_vertex``), a separate
+# choice from the lift above, which it never changes.  ``kinetic``: every
+# current vertex reads the raw lift (sigma.p only).  ``convective``: channel
+# a reads Psi^(a) = [psi_L; chi + (HALFALPHA/2) sigma^a gamma_a],
+# gamma_a = i[V_NL, r_a] psi_L (:func:`convective_carrier`), whose pair
+# current adds the nonlocal convective current to the Pauli current.
+KINETIC_CURRENT_VERTEX = "kinetic"
+CONVECTIVE_CURRENT_VERTEX = "convective"
+#: The provenance token of each vertex (``kinetic`` writes none, so the
+#: outputs of a default run are those of the parent commit).
+CURRENT_VERTEX_PROVENANCE = {
+    KINETIC_CURRENT_VERTEX: None,
+    CONVECTIVE_CURRENT_VERTEX: "convective_vnl_v1",
+}
+
+
+def convective_carrier(psi_raw, sigma_gamma, label: int, *, vertex: str):
+    r"""The current carrier of Cartesian channel ``label`` under ``vertex``.
+
+    $\Psi^{(a)} = \Psi_{\rm raw} + [0;\ \tfrac12{\tt HALFALPHA}\,\sigma^a\gamma_a]$,
+    so $\Psi^{(a)\dagger}_m\alpha^a\Psi^{(a)}_n = \Psi^\dagger_m\alpha^a\Psi_n
+    + \tfrac12{\tt HALFALPHA}(\psi^\dagger_m\gamma_{a,n} + \gamma^\dagger_{a,m}\psi_n)$
+    ($\sigma^a\sigma^a = 1$): the Pauli current plus the convective current
+    of the nonlocal velocity $i[V_{\rm NL}, r_a]$
+    (``breit_salvage/BISPINOR_CONVECTIVE_VERTEX_PLAN.md`` section 1).  In
+    units of the lift, ``HALFALPHA * (2 p_a + d_a V_NL^Ry)`` is the
+    q = 0 channel-a vertex.
+
+    Parameters
+    ----------
+    psi_raw : (..., nb, 4, nG) complex
+        The raw lift ``[psi_L; HALFALPHA sigma.(k+G) psi_L]``
+        (:func:`lift_to_4spinor`, ``representation='raw'``).
+    sigma_gamma : (3, ..., nb, 2, nG) complex
+        ``sigma^a gamma_a`` from :func:`psp.vnl_ops.convective_velocity_field`
+        on the same psi_L, Ry bohr.  Unread for ``kinetic``.
+    label : {1, 2, 3}
+        The Cartesian channel a (x, y, z).
+    vertex : {'kinetic', 'convective'}
+        ``kinetic`` returns ``psi_raw`` itself (the same object: the parent
+        commit's carrier bit for bit).
+
+    Returns
+    -------
+    (..., nb, 4, nG) complex
+    """
+    mode = str(vertex).strip().lower()
+    if mode not in CURRENT_VERTEX_PROVENANCE:
+        raise ValueError(f"unknown current vertex {vertex!r}; expected one of "
+                         f"{sorted(CURRENT_VERTEX_PROVENANCE)}")
+    if mode == KINETIC_CURRENT_VERTEX:
+        return psi_raw
+    a = int(label)
+    if a not in (1, 2, 3):
+        raise ValueError(f"convective carrier label must be 1, 2 or 3; got {label!r}")
+    increment = jnp.complex128(0.5 * HALFALPHA) * sigma_gamma[a - 1]
+    return psi_raw.at[..., 2:, :].add(increment)
+
+
 def kinetic_balance_lift_provenance(representation: str) -> str:
     """Return the authenticated provenance for one lift selector."""
     mode = str(representation).strip().lower()

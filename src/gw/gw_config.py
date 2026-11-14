@@ -1405,6 +1405,11 @@ _DEFAULTS = {
     # transverse exchange.  Nothing reads it but the stamp, so a run records
     # its semicore treatment (none / excluded bands / fold).
     "bispinor_semicore_fold": False,
+    # The current vertex of a bispinor run (refuse_unsupported_bispinor_current_vertex):
+    # kinetic = every current vertex reads the raw sigma.p lift; convective =
+    # channel a adds the nonlocal convective current of i[V_NL, r_a]
+    # (common.bispinor_init.convective_carrier).  Research branch, stage A.
+    "bispinor_current_vertex": "kinetic",
     # DFT+U mean field (QE ortho-atomic): the pw.x input carrying the HUBBARD
     # card, and that run's prefix.save/occup.txt.  Read by psp.hubbard_ops'
     # one resolver, which the dipole/velocity producer and every velocity
@@ -3203,6 +3208,7 @@ def _assemble_input_config(
         bispinor_transverse_exchange_skip_bands=int(
             params["bispinor_transverse_exchange_skip_bands"]),
         bispinor_semicore_fold=bool(params["bispinor_semicore_fold"]),
+        bispinor_current_vertex=str(params["bispinor_current_vertex"]).strip().lower(),
         hubbard_input=str(params["hubbard_input"] or ""),
         hubbard_occupations=str(params["hubbard_occupations"] or ""),
         do_G0=_resolved_do_g0,
@@ -3320,6 +3326,7 @@ def _apply_input_envelope(
     refuse_unsupported_head_dense(resolved)
     refuse_unsupported_bispinor_gw(resolved)
     refuse_unsupported_bispinor_transverse_terms(resolved)
+    refuse_unsupported_bispinor_current_vertex(resolved)
     warn_headless_tangential_self_consistency(resolved, print_fn=print_fn)
     announce_legacy_sigma_axis_keys(
         _named_keys, resolved.compute_mode, resolved.qp_solver,
@@ -4333,9 +4340,87 @@ def bispinor_transverse_terms_stamp(config) -> str | None:
     if not bool(getattr(config, "bispinor", False)):
         return None
     on = lambda flag: "on" if bool(flag) else "off"
-    return (f"hartree={on(config.bispinor_transverse_hartree)}; "
-            f"exchange={on(config.bispinor_transverse_exchange)}; "
-            f"semicore={bispinor_semicore_treatment(config)}")
+    stamp = (f"hartree={on(config.bispinor_transverse_hartree)}; "
+             f"exchange={on(config.bispinor_transverse_exchange)}; "
+             f"semicore={bispinor_semicore_treatment(config)}")
+    # The current vertex rides the same line on every channel; the default
+    # (kinetic) adds nothing, so a default run's stamp is the parent's.
+    vertex = bispinor_current_vertex_stamp(config)
+    return stamp if vertex is None else f"{stamp}; vertex={vertex}"
+
+
+def bispinor_current_vertex_stamp(config) -> str | None:
+    """The current-vertex token of a bispinor run: ``None`` (kinetic) or ``convective_vnl_v1``.
+
+    Read by :func:`bispinor_transverse_terms_stamp`, which carries it to the
+    text headers, the ``sigma_mnk.h5`` attribute, the run report and the SC
+    checkpoint identity.
+    """
+    from common.bispinor_init import CURRENT_VERTEX_PROVENANCE
+    if not bool(getattr(config, "bispinor", False)):
+        return None
+    return CURRENT_VERTEX_PROVENANCE[
+        str(getattr(config, "bispinor_current_vertex", "kinetic"))]
+
+
+def refuse_unsupported_bispinor_current_vertex(config) -> None:
+    """Refuse ``bispinor_current_vertex`` where it cannot act (stage A gates).
+
+    ``convective`` needs ``bispinor = true``, ``bispinor_gw =
+    bare_transverse`` off the packed photon route, and ``restart = false``
+    (no transverse store is stamped with the vertex yet).  Three gates live
+    where their facts exist: the trivial symmetry view (the unreduced
+    centroid set) in ``gw_init``; the pseudopotential files of the run's
+    Hamiltonian against ``kin_ion.h5``
+    (:func:`psp.pseudos.refuse_pseudopotential_mismatch`); separable
+    norm-conserving files (:func:`psp.pseudos.refuse_nonseparable_for_convective`).
+    Until the zeta fit, the transverse Hartree field and the exchange read
+    the per-channel carriers (stage A commits 3-5), ``convective`` refuses
+    here (``GATE bispinor_current_vertex_stage``) rather than run labelled
+    with a vertex it does not compute.
+    """
+    from common.bispinor_init import (CURRENT_VERTEX_PROVENANCE,
+                                      CONVECTIVE_CURRENT_VERTEX)
+    vertex = str(getattr(config, "bispinor_current_vertex", "kinetic"))
+    if vertex not in CURRENT_VERTEX_PROVENANCE:
+        raise ValueError(
+            "GATE bispinor_current_vertex: unknown value.\n"
+            f"  got:  bispinor_current_vertex = {vertex}\n"
+            f"  want: one of {', '.join(sorted(CURRENT_VERTEX_PROVENANCE))}\n"
+            "  doc:  docs/input_reference.md, bispinor_current_vertex.")
+    if vertex != CONVECTIVE_CURRENT_VERTEX:
+        return
+    mode = coerce_bispinor_gw_mode(config.bispinor_gw)
+    problems = []
+    if not bool(config.bispinor):
+        problems.append("bispinor = false")
+    if mode is not BispinorGWMode.BARE_TRANSVERSE:
+        problems.append(f"bispinor_gw = {mode.value}")
+    if bool(config.bispinor) and uses_static_photon_response(config):
+        problems.append("packed photon route")
+    if bool(config.restart):
+        problems.append("restart = true")
+    if problems:
+        raise ValueError(
+            "GATE bispinor_current_vertex_route: the convective current vertex "
+            "is set where it cannot act.\n"
+            f"  got:  bispinor_current_vertex = convective with {'; '.join(problems)}\n"
+            "  want: bispinor = true, bispinor_gw = bare_transverse off the packed "
+            "photon route (compute_mode = x_only or tangential), restart = false\n"
+            "  why:  only the bare transverse exchange and the transverse Hartree "
+            "field read the per-channel carriers, and no transverse store is "
+            "stamped with the vertex\n"
+            "  doc:  docs/input_reference.md, bispinor_current_vertex.")
+    raise ValueError(
+        "GATE bispinor_current_vertex_stage: the convective current vertex is "
+        "built up to its field producer only.\n"
+        "  got:  bispinor_current_vertex = convective\n"
+        "  want: kinetic, until the zeta fit, the transverse Hartree field and "
+        "the exchange read the per-channel carriers (research branch "
+        "claude/bispinor-convective-vertex-20261114, stage A commits 3-5)\n"
+        "  why:  a run would be labelled convective_vnl_v1 and still compute "
+        "the kinetic vertex\n"
+        "  doc:  docs/input_reference.md, bispinor_current_vertex.")
 
 
 def refuse_unsupported_bispinor_transverse_terms(config) -> None:
@@ -5299,6 +5384,10 @@ class LorraxConfig:
     bispinor_transverse_exchange: bool
     bispinor_transverse_exchange_skip_bands: int
     bispinor_semicore_fold: bool
+    #: The current vertex, ``kinetic`` or ``convective`` (the deck key of the
+    #: same name; :func:`refuse_unsupported_bispinor_current_vertex`,
+    #: :func:`bispinor_current_vertex_stamp`).
+    bispinor_current_vertex: str
     #: DFT+U velocity inputs (deck-relative spellings); resolved at the point
     #: of use by ``psp.hubbard_ops.resolve_hubbard_input``.
     hubbard_input: str

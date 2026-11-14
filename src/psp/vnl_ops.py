@@ -1564,6 +1564,64 @@ def apply_vnl_velocity_to_ket(psi_G, Z, dZ, E_super):
     return t1 + t2
 
 
+def convective_velocity_field(psi_G, Z, dZ, E_super):
+    r"""$\sigma^a\, i[V_{\rm NL}, r_a]\,\psi$ for the three Cartesian labels, one projector pass.
+
+    The field of the convective current vertex (docs/theory/bispinor-gw.md,
+    carrier; branch ``claude/bispinor-convective-vertex-20261114``).  Label
+    ``a`` is the small-block increment of the four-spinor carrier of
+    Cartesian channel ``a`` up to its scale,
+    $\Psi^{(a)} = [\psi_L;\ \chi + \tfrac12{\tt HALFALPHA}\,\sigma^a\gamma_a]$
+    with $\gamma_a = i[V_{\rm NL}, r_a]\psi_L = \partial_{K_a}V_{\rm NL}\psi_L$
+    (Ry bohr); since $\sigma^a\sigma^a = 1$ the channel-``a`` pair current
+    gains exactly $\tfrac12{\tt HALFALPHA}(\psi_m^\dagger\gamma_{a,n} +
+    \gamma_{a,m}^\dagger\psi_n)$, the nonlocal convective current
+    (``breit_salvage/NONLOCAL_CURRENT_ATOM.md``, form C).  The scale is
+    applied where the carrier is formed
+    (:func:`common.bispinor_init.convective_carrier`), so the alpha scale
+    reaches it.
+
+    The commutator is built from the projector overlaps
+    $\langle\beta|\psi\rangle = Z^\dagger\psi$ and
+    $\langle(\mathbf r-\boldsymbol\tau)\beta|\psi\rangle = i(\partial_K Z)^\dagger\psi$:
+    $i[V, r_a] = i(Z E Y_a^\dagger - Y_a E Z^\dagger)$ with the moment
+    projectors $Y_a = i\,\partial_{K_a}Z$, which is
+    :func:`apply_vnl_velocity_to_ket` (the operator of the run's
+    Hamiltonian: the caller passes the ``Z``, ``dZ``, ``E_super`` of the
+    same :class:`VNLSetup` that made ``kin_ion.h5``).  It is NOT the
+    September ``sigma . v`` lift: all of $\partial_a V_{\rm NL}$ sits behind
+    $\sigma^a$ alone, with the full j-resolved ``E``.
+
+    Parameters
+    ----------
+    psi_G : (nb, 2, nG) complex
+        Two-component large-block states on one k's G list (unit norm,
+        ``sum_G |psi|^2 = 1``), any band subset; replicated or local.
+    Z : (total_R, nG) complex
+        Projector rows at this k (:func:`build_vnl_kdata_from_kvec`).
+    dZ : (3, total_R, nG) complex
+        Their Cartesian K derivatives (``compute_dZ=True``), bohr.  Any
+        ``(3, total_R, nG)`` with ``dZ = -i Y`` for moment projectors ``Y``
+        works, e.g. ``Y_a = (x_a - tau_a) beta`` built on a real-space grid.
+    E_super : (2, 2, total_R, total_R) complex or CompactVNLCoupling
+        The D matrix, Ry.
+
+    Returns
+    -------
+    (3, nb, 2, nG) complex
+        ``sigma^a gamma_a`` for ``a = x, y, z``, Ry bohr, same layout as
+        ``psi_G``.
+    """
+    from common.gamma_matrices import paulis
+    if psi_G.ndim != 3 or int(psi_G.shape[1]) != 2:
+        raise ValueError(
+            "convective_velocity_field acts on two-component psi_L "
+            f"(nb, 2, nG); got {tuple(psi_G.shape)}")
+    gamma = apply_vnl_velocity_to_ket(psi_G, Z, dZ, E_super)
+    return jnp.einsum("aij,anjG->aniG", jnp.asarray(paulis), gamma,
+                      optimize=True)
+
+
 @jax.jit
 def vnl_velocity_matrix(psi_G, Z, dZ, E_super):
     """⟨m | ∂V_NL/∂K_cart^α | n⟩ matrix elements at one k.  Returns (3, nb, nb).
