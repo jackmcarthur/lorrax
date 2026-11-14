@@ -1721,10 +1721,15 @@ def write_sigma_omega_h5(
 		return shape[:-2] + (logical_nb, logical_nb)
 
 	with SlabIO(abs_path, mode="w", mesh=mesh) as io:
-		# Run-level identities (the bispinor carrier), as in the text headers.
+		# Run-level identities (the bispinor carrier, the transverse terms),
+		# as in the text headers: ROOT ATTRIBUTES.  ``io.write_attr`` despite
+		# its name lands a small root DATASET, so until 2026-11-14 these
+		# stamps were datasets and no attribute reader found them; the root
+		# group "/" takes them through the same deferred rank-0 reopen.
 		from common.provenance import run_provenance
-		for key, value in run_provenance().items():
-			io.write_attr(key, np.asarray(value.encode()))
+		_run_ids = run_provenance()
+		if _run_ids:
+			io.stamp_dataset_attrs("/", _run_ids)
 		# Creation-time promise, before the later live assemble_eqp append.
 		# If the run stops after this writer closes but before that append, a
 		# reader sees an expected-receipt artifact with no receipt and fails closed.
