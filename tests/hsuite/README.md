@@ -141,7 +141,7 @@ regenerate command.
 `--only` accepts driver-stage names from the table; unknown names, including
 the removed `na_kin_ion`, refuse rather than pass an empty selection. The Na
 chain alone is `--only na_dipole na_sc` and uses the same fixed input.
-`--regenerate` rewrites driver output references only, never the Na input.
+`--regenerate` rewrites driver output references only, never the Na input. Under `--regenerate missing` a stage without a reference prints `reference missing; written to reference/<stage>.npz` and is listed in `summary.json` `references_written_missing`; that run is no verdict for it. The `bisp_bt` reference (`bbt_eqp0/1.dat`, `bbt_sigma.h5`, `sigma_lorentz_oneshot.h5`) comes from the first P4 run on the hardening branch and is committed only after a numeric review of its transverse terms.
 `reference/walls.json` is a historical regeneration receipt, not a current
 stage-count or timing assertion.
 

@@ -91,3 +91,11 @@ def test_linearity_law_is_s_squared():
                                                           scale=s, rtol=1e-6))
     with pytest.raises(KeyError):
         linearity_problems({}, good, charge, scale=s, rtol=1e-6)
+
+
+def test_missing_reference_is_reported_not_passed():
+    from tests.hsuite import chain
+    written = chain.reference_missing_line("bisp_bt", written=True)
+    assert "reference missing" in written and "numeric review" in written
+    failed = chain.reference_missing_line("bisp_bt", written=False)
+    assert failed.startswith("bisp_bt: reference missing")

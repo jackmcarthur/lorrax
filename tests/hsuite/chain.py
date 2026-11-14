@@ -998,6 +998,19 @@ def twin_problems(run, name, rule):
     return problems
 
 
+def reference_missing_line(name, *, written):
+    """One line for a stage with no stored reference (``reference/<name>.npz``).
+
+    ``written``: ``--regenerate missing`` wrote it from this run, which is not
+    a verdict; the file is committed only after a numeric review.  Otherwise
+    the stage fails with this line.
+    """
+    if written:
+        return (f"hsuite {name}: reference missing; written to reference/{name}.npz "
+                "from this run (not a verdict: commit it after a numeric review)")
+    return f"{name}: reference missing (run --regenerate missing, then review and commit it)"
+
+
 def _save(name, got):
     np.savez(REFERENCE / f"{name}.npz", **{k.replace("/", "|"): v
                                            for k, v in got.items()})
@@ -1041,7 +1054,7 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
         print(watchdog.rank_map_line(rank_session._resolve_proc_count(), _coordinator(),
                                      placements), flush=True)
     env = _env(cache_dir)
-    walls, problems, ranks, census = {}, [], {}, {}
+    walls, problems, ranks, census, regenerated = {}, [], {}, {}, []
     t_all = time.monotonic()
     for name, module, argv in STAGES:
         if name not in only if only else name in OPT_IN:
@@ -1087,13 +1100,17 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
             got = {"centroids": pts}
         else:
             got = captured(where, name, rule)
-        if regenerate == "all" or (regenerate == "missing" and _load(name) is None):
+        missing = _load(name) is None
+        if regenerate == "all" or (regenerate == "missing" and missing):
             REFERENCE.mkdir(exist_ok=True)
             _save(name, got)
+            if missing:
+                print(reference_missing_line(name, written=True), flush=True)
+                regenerated.append(name)
             continue
         ref = _load(name)
         if ref is None:
-            problems.append(f"{name}: no stored reference (run --regenerate)")
+            problems.append(reference_missing_line(name, written=False))
             continue
         if name == "kmeans":
             # The centroid set is compared as a set: row order is not a
@@ -1108,6 +1125,7 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
     summary = {"walls_s": walls, "problems": problems, "regenerate": regenerate,
                "ranks": rank_session._resolve_proc_count(),
                "stage_count": len(ranks), "rank_records": ranks, "compile_s": census,
+               "references_written_missing": regenerated,
                "cache_dir": _cache_dir()}
     if LONE_FAILURE:
         # The others are blocked in a collective: no final join.
