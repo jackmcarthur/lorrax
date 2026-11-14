@@ -1643,9 +1643,41 @@ def current_component_action(sym, rows, basis_rows):
     return np.where(anti, B @ action @ B.T, B @ action @ B.conj().T)
 
 
-def _monomial(action, tol=1e-10):
+#: Decimals ``R_cart`` is rounded to (:meth:`SymMaps.syms_crystal_to_cartesian`): no entry of
+#: a Cartesian action is known below this quantum, so no test on it may be tighter.
+R_CART_DECIMALS = 10
+#: The monomial test's tolerance in units of the action's own noise
+#: (:func:`cartesian_action_noise`).  Lattice rounding leaves off-pattern entries of 0.5 to
+#: 0.6 of that noise (cells typed with six to nine digits); a unique axis tilted off z by
+#: more than about six times the noise is a real violation and still refuses.
+MONOMIAL_NOISE_MARGIN = 8.0
+#: A Cartesian action farther than this from an isometry is refused before the basis test:
+#: the tolerance at which this module accepts an operation as a symmetry of the atoms and
+#: of the k grid (``validate_atomic_symmetries``, ``validate_kgrid_unfolding``).
+CARTESIAN_ACTION_NOISE_MAX = 1.0e-6
+
+
+def cartesian_action_noise(action):
+    """How far a Cartesian action table is from exact isometries: ``max |R Rᵀ − 1|``.
+
+    The integer operations are exact; their Cartesian form ``Aᵀ S A⁻ᵀ`` is orthogonal only as
+    far as the lattice vectors themselves are symmetric (a cell typed with nine digits:
+    2e-10) and is then rounded to ``R_CART_DECIMALS`` decimals, which floors the result.
+    """
+    R = np.asarray(action, dtype=np.float64)
+    defect = float(np.max(np.abs(R @ np.swapaxes(R, -1, -2) - np.eye(R.shape[-1]))))
+    return max(defect, 10.0 ** -R_CART_DECIMALS)
+
+
+def _monomial(action, tol):
     nz = np.abs(action) > tol
     return bool(np.all(nz.sum(-1) == 1) and np.all(nz.sum(-2) == 1))
+
+
+def _largest_off_pattern(action):
+    """The largest entry that is not its row's leading one (zero for a monomial action)."""
+    mag = np.sort(np.abs(np.asarray(action)), axis=-1)
+    return float(np.max(mag[..., :-1]))
 
 
 def select_current_basis(sym):
@@ -1659,16 +1691,37 @@ def select_current_basis(sym):
     rule serves hexagonal and tetragonal decks.  Refuses a group with
     neither.  Decide it from the PHYSICAL group (the WFN's), never from a
     reduced computational group.
+
+    "Monomial" is decided at the accuracy of the Cartesian action itself,
+    ``MONOMIAL_NOISE_MARGIN`` times :func:`cartesian_action_noise`: the action
+    is ``R_cart``, rounded to ``R_CART_DECIMALS`` decimals from lattice
+    vectors that carry the input file's digits.  A fixed 1e-10 refused bulk
+    CrCl3 (R-3, cell typed with nine digits) by 8e-18.
     """
     rows = np.unique(np.concatenate([np.asarray(sym.sym_idx_k).ravel(),
                                      np.asarray(sym.sym_idx_q).ravel()]))
+    noise = cartesian_action_noise(current_component_action(sym, rows, None))
+    if noise > CARTESIAN_ACTION_NOISE_MAX:
+        raise ValueError(
+            "GATE current_fit_basis_isometry: got Cartesian operations "
+            f"max|R R^T - 1| = {noise:.3e} from an isometry ({len(rows)} rows); want <= "
+            f"{CARTESIAN_ACTION_NOISE_MAX:.0e}; why: the WFN's lattice vectors and its integer "
+            "operations do not describe one crystal to that accuracy, so no component basis "
+            "can be tested; fix: regenerate the WFN from a cell that has the symmetry")
+    tol = MONOMIAL_NOISE_MARGIN * noise
+    worst = {}
     for name, basis in (("circular", CIRCULAR_CURRENT_ROWS), ("cartesian", None)):
-        if _monomial(current_component_action(sym, rows, basis)):
+        action = current_component_action(sym, rows, basis)
+        if _monomial(action, tol):
             return name, basis
+        worst[name] = _largest_off_pattern(action)
     raise ValueError(
         "GATE current_fit_basis: got a group whose current action is monomial in neither the "
-        f"circular nor the Cartesian basis ({len(rows)} rows); want one of the two; "
-        "why: separate current fits are covariant only in a monomial basis; fix: none in-tree")
+        f"circular nor the Cartesian basis ({len(rows)} rows; largest off-pattern entry "
+        f"{worst['circular']:.3e} circular, {worst['cartesian']:.3e} Cartesian, against "
+        f"{tol:.3e} = {MONOMIAL_NOISE_MARGIN:g} x the action's noise {noise:.3e}); want one "
+        "of the two; why: separate current fits are covariant only in a monomial basis; "
+        "fix: none in-tree (a unique axis must lie along Cartesian z)")
 
 
 def unfold_isdf_one_leg(
@@ -3020,7 +3073,7 @@ class SymMaps:
         ntran = int(wfn.ntran)
         mtrx = np.asarray(wfn.sym_matrices[:ntran])
         R_spatial = np.einsum('ij,njk,kl->nil', A_T, mtrx, A_T_inv)
-        R_spatial = np.around(R_spatial, decimals=10)
+        R_spatial = np.around(R_spatial, decimals=R_CART_DECIMALS)
         # Match the existing 2·ntran-row convention for downstream consumers.
         R_full = np.concatenate([R_spatial, -R_spatial], axis=0)
         return R_full
