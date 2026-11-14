@@ -304,8 +304,9 @@ bispinor_transverse_exchange = false
 RESTART_DECKS.update({
     "bisp_bt.in": _bt_deck("bbt", "sigma_lorentz_debug_output = true\n"),
     "bisp_bt_null.in": _bt_deck("bbtn", BT_NULL_KEYS),
-    # The twin: the same deck on the two-component WFN path, its own kin_ion
-    # and dipole (the scalar stages'), its own fresh fit on the same centroids.
+    # The twin: the same deck on the two-component WFN path, the scalar
+    # kin_ion.h5, dipole_bisp's two-spinor dipole.h5 of the same window, its
+    # own fresh fit on the same centroids.
     "bt_twin.in": (_bt_deck("btw")
                    .replace("bispinor = true\n", "bispinor = false\n")
                    .replace("centroids_file_current = {centroids}\n", "")
@@ -378,8 +379,10 @@ NA_SC_TOL_EV = "1.5"
 # Scratch the lead removes before a stage.  The four-current QSGW is a
 # fresh model in a run directory that already holds the scalar tangential
 # models (checked at sp_export), and a fresh run refuses to overwrite a
-# completed model (GATE tangential_output).
-_CLEAR_BEFORE = {"bisp_sc": ("tmp/mpa",), "bisp_sc3": ("tmp/mpa",)}
+# completed model (GATE tangential_output).  The same holds for every
+# bare_transverse stage: each is a fresh tangential one-shot after another.
+_CLEAR_BEFORE = {name: ("tmp/mpa",) for name in (
+    "bt_twin", "bisp_bt", "bisp_bt_null", "bisp_sc", "bisp_sc3")}
 # Stages that run only when --only names them, and have no reference.
 OPT_IN = ("bisp_sc3",)
 _UNCONVERGED = "RuntimeError: GATE sc_fixed_point_not_converged"
@@ -505,12 +508,17 @@ STAGES = (
     ("cohsex", "gw.gw_jax", ["-i", "cohsex.in"]),
     ("sp_export", "gw.gw_jax", ["-i", "sp_export.in"]),
     ("kin_ion_bisp", "gw.kin_ion_io", ["-i", "bisp_sc.in", "-o", "kin_ion_bisp.h5"]),
-    # The null test's two-component twin, on the scalar dipole.h5 (written by
-    # the dipole stage; dipole_bisp below rewrites it).
-    ("bt_twin", "gw.gw_jax", ["-i", "bt_twin.in"]),
     # The direct head authenticates the dipole's representation stamp, so
     # the four-component route writes its own (over the scalar one).
     ("dipole_bisp", "psp.get_dipole_mtxels", ["-i", "bisp_sc.in"]),
+    # The null test's two-component twin.  It runs AFTER dipole_bisp and reads
+    # its dipole.h5: the head authenticates the file's band window
+    # (prov_nval/ncond/nband) against the deck, and the scalar dipole stage
+    # wrote it for gnppm.in (nval = 3), not for this window (nval = 1;
+    # GATE dft_head_dipole_provenance on eeeac8866).  dipole_bisp's file is the
+    # two-spinor dipole of this exact window (prov_bispinor = false), the
+    # head both null runs then read: one file for both sides.
+    ("bt_twin", "gw.gw_jax", ["-i", "bt_twin.in"]),
     # bare_transverse one-shots: the reference stage, then every transverse
     # term off, compared with bt_twin (CHECKS "twin") rather than a reference.
     ("bisp_bt", "gw.gw_jax", ["-i", "bisp_bt.in"]),
@@ -858,6 +866,12 @@ def captured(run, name, rule):
     for fname in rule.get("eqp", []):
         got[fname] = _eqp(run / fname)
     for fname in rule.get("h5", []):
+        if not (run / fname).is_file():
+            # A file the stage did not write fails as a comparison ("... not
+            # in the reference" / the reference's members "missing") instead
+            # of raising on the lead rank alone while the others wait.
+            got[f"{fname}:FILE_NOT_WRITTEN"] = np.zeros(0)
+            continue
         for key, value in _h5_members(run / fname).items():
             got[f"{fname}:{key}"] = value
     for fname in rule.get("shapes", []):
@@ -974,6 +988,9 @@ def twin_problems(run, name, rule):
     if rule is None:
         return []
     mine_file, twin_file, pairs, zeros = rule
+    absent = [f for f in (mine_file, twin_file) if not (run / f).is_file()]
+    if absent:
+        return [f"{name}: {f} was not written" for f in absent]
     mine, twin = _h5_members(run / mine_file), _h5_members(run / twin_file)
     problems = []
     for member, twin_member in pairs:

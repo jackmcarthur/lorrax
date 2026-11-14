@@ -41,7 +41,17 @@ def test_null_decks_differ_by_the_representation_only():
         "bispinor_transverse_hartree", "bispinor_transverse_exchange"}
     assert twin["centroids_file"] == null["centroids_file"]
     names = [name for name, _module, _argv in chain.STAGES]
-    assert names.index("bt_twin") < names.index("dipole_bisp") < names.index("bisp_bt_null")
+    # bt_twin reads dipole_bisp's file (the window the head authenticates).
+    assert (names.index("kin_ion") < names.index("dipole_bisp") < names.index("bt_twin")
+            < names.index("bisp_bt") < names.index("bisp_bt_null") < names.index("bisp_sc"))
+    # Each is a fresh tangential one-shot after another one (tmp/mpa cleared).
+    assert all(chain._CLEAR_BEFORE[n] == ("tmp/mpa",)
+               for n in ("bt_twin", "bisp_bt", "bisp_bt_null"))
+    for deck in ("bt_twin.in", "bisp_bt.in", "bisp_bt_null.in"):
+        keys = _deck_keys(chain.RESTART_DECKS[deck])
+        dip = _deck_keys(chain.RESTART_DECKS["bisp_sc.in"])     # dipole_bisp's input file
+        assert all(keys[k] == dip[k] for k in ("nval", "ncond", "number_bands",
+                                               "wfn_file", "sys_dim")), deck
 
 
 def test_twin_comparator_fails_on_a_carrier_sized_difference(tmp_path, capsys):
@@ -100,3 +110,14 @@ def test_missing_reference_is_reported_not_passed():
     assert "reference missing" in written and "numeric review" in written
     failed = chain.reference_missing_line("bisp_bt", written=False)
     assert failed.startswith("bisp_bt: reference missing")
+
+
+def test_unwritten_h5_is_a_comparison_failure_not_a_crash(tmp_path):
+    from tests.hsuite import chain
+    got = chain.captured(tmp_path, "bisp_bt", {"h5": ["sigma_lorentz_oneshot.h5"]})
+    assert list(got) == ["sigma_lorentz_oneshot.h5:FILE_NOT_WRITTEN"]
+    problems = chain.compare("bisp_bt", got, {"sigma_lorentz_oneshot.h5:sigma_lorentz_skij_ev": got[
+        "sigma_lorentz_oneshot.h5:FILE_NOT_WRITTEN"]})
+    assert any("missing" in p for p in problems) and any("not in the reference" in p for p in problems)
+    assert chain.twin_problems(tmp_path, "bisp_bt_null", ("a.h5", "b.h5", (), ())) == [
+        "bisp_bt_null: a.h5 was not written", "bisp_bt_null: b.h5 was not written"]
