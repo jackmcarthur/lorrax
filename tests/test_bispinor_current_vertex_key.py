@@ -2,9 +2,9 @@
 
 CPU, pytest.  ``bispinor_current_vertex`` (docs/input_reference.md): the
 default ``kinetic`` leaves the stamp and the carrier of the parent commit
-unchanged (the same object); ``convective`` refuses where it cannot act and,
-until stage A reads the per-channel carriers, everywhere
-(``GATE bispinor_current_vertex_stage``).  ``kin_ion.h5``'s UPF stamp
+unchanged (the same object); ``convective`` runs on the completed route (a
+bare_transverse x_only one-shot without tensor files) and refuses each
+departure from it (``GATE bispinor_current_vertex_route``).  ``kin_ion.h5``'s UPF stamp
 (``pseudopotential_md5``) and its refusal on another or an absent stamp; the
 refusal of ultrasoft/PAW files; the carrier's increment sits in the small
 block alone with the scale HALFALPHA / 2.
@@ -50,20 +50,30 @@ def test_key_default_stamp_and_gates(tmp_path):
     assert bispinor_transverse_terms_stamp(default) == "hartree=on; exchange=on; semicore=none"
     named = _config(tmp_path, _BISPINOR + "bispinor_current_vertex = kinetic\n")
     assert bispinor_transverse_terms_stamp(named) == bispinor_transverse_terms_stamp(default)
-    # The stamp a convective run will carry (the gate keeps it from running today).
-    as_convective = SimpleNamespace(**{**vars(default), "bispinor_current_vertex": "convective"})
-    assert bispinor_transverse_terms_stamp(as_convective) == (
+    # The completed route: a bare_transverse x_only one-shot without tensor files.
+    route = (_BISPINOR.replace("compute_mode = tangential", "compute_mode = x_only")
+             + "write_restart_tensors = false\n")
+    conv = _config(tmp_path, route + "bispinor_current_vertex = convective\n")
+    assert conv.bispinor_current_vertex == "convective"
+    assert bispinor_transverse_terms_stamp(conv) == (
         "hartree=on; exchange=on; semicore=none; vertex=convective_vnl_v1")
 
     with pytest.raises(ValueError, match="GATE bispinor_current_vertex: unknown"):
         _config(tmp_path, _BISPINOR + "bispinor_current_vertex = velocity\n")
-    for deck in (_BISPINOR.replace("bispinor = true", "bispinor = false"),
-                 _BISPINOR + "bispinor_gw = full_tangential\n",
-                 _BISPINOR + "restart = true\n"):
-        with pytest.raises(ValueError, match="GATE bispinor_current_vertex_route"):
+    # Each departure from the route refuses on its own (one control per term).
+    for deck, why in ((route.replace("bispinor = true", "bispinor = false"), "bispinor = false"),
+                      (_BISPINOR + "write_restart_tensors = false\nbispinor_gw = full_tangential\n",
+                       "bispinor_gw = full_tangential"),
+                      # (x_only + restart is refused earlier by GATE bare_tt_gamma_restart_unstamped)
+                      (_BISPINOR + "write_restart_tensors = false\nrestart = true\n", "restart = true"),
+                      (_BISPINOR + "write_restart_tensors = false\n", "compute_mode = tangential"),
+                      (route.replace("qp_solver = one_shot_dft", "qp_solver = self_consistent"),
+                       "qp_solver = self_consistent"),
+                      (route.replace("write_restart_tensors = false", "write_restart_tensors = true"),
+                       "write_restart_tensors = true")):
+        with pytest.raises(ValueError, match="GATE bispinor_current_vertex_route") as err:
             _config(tmp_path, deck + "bispinor_current_vertex = convective\n")
-    with pytest.raises(ValueError, match="GATE bispinor_current_vertex_stage"):
-        _config(tmp_path, _BISPINOR + "bispinor_current_vertex = convective\n")
+        assert why in str(err.value), (why, str(err.value))
 
 
 def test_pseudopotential_stamp_and_refusals(tmp_path):

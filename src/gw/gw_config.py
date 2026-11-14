@@ -4373,18 +4373,21 @@ def bispinor_current_vertex_stamp(config) -> str | None:
 def refuse_unsupported_bispinor_current_vertex(config) -> None:
     """Refuse ``bispinor_current_vertex`` where it cannot act (stage A gates).
 
-    ``convective`` needs ``bispinor = true``, ``bispinor_gw =
-    bare_transverse`` off the packed photon route, and ``restart = false``
-    (no transverse store is stamped with the vertex yet).  Three gates live
-    where their facts exist: the trivial symmetry view (the unreduced
-    centroid set) in ``gw_init``; the pseudopotential files of the run's
-    Hamiltonian against ``kin_ion.h5``
-    (:func:`psp.pseudos.refuse_pseudopotential_mismatch`); separable
-    norm-conserving files (:func:`psp.pseudos.refuse_nonseparable_for_convective`).
-    Until the zeta fit, the transverse Hartree field and the exchange read
-    the per-channel carriers (stage A commits 3-5), ``convective`` refuses
-    here (``GATE bispinor_current_vertex_stage``) rather than run labelled
-    with a vertex it does not compute.
+    ``convective`` runs on the route stage A completed: ``bispinor = true``,
+    ``bispinor_gw = bare_transverse`` off the packed photon route,
+    ``compute_mode = x_only`` (no screened current channel reads the
+    carriers), a one-shot (``qp_solver = one_shot_dft``: the SC rebuild
+    reads one current carrier), ``restart = false`` and
+    ``write_restart_tensors = false`` (no tensor file holds three current
+    families).  There the zeta fit (``gw.gw_init._fit_transverse_zeta_by_label``),
+    the bare transverse exchange (``gw.photon_sigma`` per-label classes) and
+    the transverse Hartree field (``gw.hartree.direct_field_matrices``, three
+    passes) read the per-channel carriers.  Three gates live where their
+    facts exist: the trivial symmetry view (the unreduced centroid set, in
+    ``gw.gw_jax``); the pseudopotential files of the run's Hamiltonian
+    against ``kin_ion.h5`` (:func:`psp.pseudos.refuse_pseudopotential_mismatch`);
+    separable norm-conserving files
+    (:func:`psp.pseudos.refuse_nonseparable_for_convective`).
     """
     from common.bispinor_init import (CURRENT_VERTEX_PROVENANCE,
                                       CONVECTIVE_CURRENT_VERTEX)
@@ -4407,27 +4410,25 @@ def refuse_unsupported_bispinor_current_vertex(config) -> None:
         problems.append("packed photon route")
     if bool(config.restart):
         problems.append("restart = true")
+    if config.compute_mode is not ComputeMode.X_ONLY:
+        problems.append(f"compute_mode = {config.compute_mode.value}")
+    if config.qp_solver is not QPSolver.ONE_SHOT_DFT:
+        problems.append(f"qp_solver = {config.qp_solver.value}")
+    if bool(config.write_restart_tensors):
+        problems.append("write_restart_tensors = true")
     if problems:
         raise ValueError(
             "GATE bispinor_current_vertex_route: the convective current vertex "
             "is set where it cannot act.\n"
             f"  got:  bispinor_current_vertex = convective with {'; '.join(problems)}\n"
             "  want: bispinor = true, bispinor_gw = bare_transverse off the packed "
-            "photon route (compute_mode = x_only or tangential), restart = false\n"
-            "  why:  only the bare transverse exchange and the transverse Hartree "
-            "field read the per-channel carriers, and no transverse store is "
-            "stamped with the vertex\n"
+            "photon route, compute_mode = x_only, qp_solver = one_shot_dft, "
+            "restart = false, write_restart_tensors = false\n"
+            "  why:  the zeta fit, the bare transverse exchange and the transverse "
+            "Hartree field read the per-channel carriers on that route only; the "
+            "screened current channels, the SC rebuild and the tensor files read "
+            "one current carrier\n"
             "  doc:  docs/input_reference.md, bispinor_current_vertex.")
-    raise ValueError(
-        "GATE bispinor_current_vertex_stage: the convective current vertex is "
-        "built up to its field producer only.\n"
-        "  got:  bispinor_current_vertex = convective\n"
-        "  want: kinetic, until the zeta fit, the transverse Hartree field and "
-        "the exchange read the per-channel carriers (research branch "
-        "claude/bispinor-convective-vertex-20261114, stage A commits 3-5)\n"
-        "  why:  a run would be labelled convective_vnl_v1 and still compute "
-        "the kinetic vertex\n"
-        "  doc:  docs/input_reference.md, bispinor_current_vertex.")
 
 
 def refuse_unsupported_bispinor_transverse_terms(config) -> None:

@@ -285,10 +285,20 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
         ngkmax=int(gtab.gvecs.shape[1]), charge_ns=charge_ns,
         with_transverse=with_transverse, grid=grid,
         n_sym=len(sym.active_symmetry_rows), ranks=int(mesh.devices.size))
-    psi_G = wfn.load(
-        bands=(0, nb_load), k=k_spec, sharding=band_sphere_spec(),
-        bispinor=bispinor,
-        bispinor_lift=representation.current_lift)
+    # The convective current vertex (a current-vertex field on the loader,
+    # common.four_current_model.current_lifts): channel a's current and its
+    # alpha^a A_a matrix element come from carrier a, three passes of the
+    # same scan and sweep; the charge and V_H from the first pass's psi_L
+    # (every carrier has the same large block).  One pass otherwise.
+    from common.four_current_model import current_lifts
+    lifts = current_lifts(representation, wfn) if bispinor else (None,) * 3
+    per_label = with_transverse and len(set(lifts)) > 1
+
+    def load_psi(lift):
+        return wfn.load(
+            bands=(0, nb_load), k=k_spec, sharding=band_sphere_spec(),
+            bispinor=bispinor, bispinor_lift=lift)
+    psi_G = load_psi(lifts[0] if per_label else representation.current_lift)
     box_index = wfn.box_index(k=k_spec)
     density_label = ("occupied bands" if exact_unit_occupations else
                      "WFN bands with canonical fractional occupations")
@@ -302,9 +312,9 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
     # the projected one) is the one reported below.
     projections = []
     sym_perm = sym.fft_grid_pullback(sym.active_symmetry_rows, grid)
-    with timing.section("vh_rho"):
-        rho_np = np.asarray(rho_from_wfns(
-            psi_G, occ, kweights, mesh=mesh, box_index=box_index,
+    def density(psi):
+        return np.asarray(rho_from_wfns(
+            psi, occ, kweights, mesh=mesh, box_index=box_index,
             fft_grid=grid, cell_volume=float(wfn.cell_volume),
             spin_degeneracy=f_spin,
             include_dirac_current=with_transverse,
@@ -312,6 +322,15 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
             sym=sym,
             sym_perm=sym_perm,
             projection_receipt_fn=projections.append), dtype=np.float64)
+    with timing.section("vh_rho"):
+        rho_np = density(psi_G)
+        if per_label:
+            # J_a = sum f Psi^(a)+ alpha^a Psi^(a): component a of pass a.
+            rho_np = np.array(rho_np, copy=True)
+            for a in (2, 3):
+                del psi_G
+                psi_G = load_psi(lifts[a - 1])
+                rho_np[a] = density(psi_G)[a]
     del sym_perm
 
     if with_transverse:
@@ -329,7 +348,7 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
             "is absent): "
             f"||J0||={current_g0_l2:.6e}, ||J||={current_l2:.6e}, "
             f"ratio={current_g0_relative:.6e}; periodic TT sets G=0 to zero")
-        if len(projections) != 1:
+        if len(projections) != (3 if per_label else 1):
             raise RuntimeError(
                 "direct_field_matrices: the density scan projected the Dirac "
                 f"current {len(projections)} times; want exactly one "
@@ -460,15 +479,37 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
         n_blocks=2 if with_transverse else 1, density_bytes=density_bytes,
         ranks=int(mesh.devices.size))
     with timing.section("vh_matrix"):
-        H_matrix = sweep_matrix_elements(
-            matrix_psi, operator=matrix_operator, geom=geom_matrix,
-            gvecs=gtab.gvecs, gmask=gtab.mask,
-            box_index=box_index, kvecs=gtab.kvecs)
-        if with_transverse:
-            H_vh, H_vt = H_matrix[:, 0], H_matrix[:, 1]
+        if per_label:
+            # <m|V_H|n> once (pass 1), sum_a <Psi^(a)_m|alpha^a A_a|Psi^(a)_n>
+            # over the three carriers; psi_G holds carrier 3 from the scan.
+            H_vt = None
+            zero = jnp.zeros_like(V_H_r)
+            for a in (3, 2, 1):
+                if a != 3:
+                    del psi_G, matrix_psi, psi_charge
+                    psi_G = load_psi(lifts[a - 1])
+                    matrix_psi = psi_charge = psi_G
+                only_a = jnp.zeros_like(V_T_r).at[a - 1].set(V_T_r[a - 1])
+                H_matrix = sweep_matrix_elements(
+                    matrix_psi, operator=four_current_potential_operator(
+                        geom_matrix, V_H_r if a == 1 else zero, only_a,
+                        charge_nspinor=charge_ns),
+                    geom=geom_matrix, gvecs=gtab.gvecs, gmask=gtab.mask,
+                    box_index=box_index, kvecs=gtab.kvecs)
+                if a == 1:
+                    H_vh = H_matrix[:, 0]
+                H_vt = H_matrix[:, 1] if H_vt is None else H_vt + H_matrix[:, 1]
+                del H_matrix
         else:
-            H_vh = H_matrix
-        del H_matrix
+            H_matrix = sweep_matrix_elements(
+                matrix_psi, operator=matrix_operator, geom=geom_matrix,
+                gvecs=gtab.gvecs, gmask=gtab.mask,
+                box_index=box_index, kvecs=gtab.kvecs)
+            if with_transverse:
+                H_vh, H_vt = H_matrix[:, 0], H_matrix[:, 1]
+            else:
+                H_vh = H_matrix
+            del H_matrix
         # Live GW keeps the matrix at P(None,'x','y') and star-broadcasts on
         # device. Diagnostic callers explicitly request the host boundary.
         if return_sharded:
