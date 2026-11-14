@@ -173,6 +173,14 @@ def test_alpha_switch_grammar_and_two_component_refusal(monkeypatch):
     diag.refuse_on_two_component(bispinor=True)
     with pytest.raises(ValueError, match="GATE bispinor_diag_switch_route"):
         diag.refuse_on_two_component(bispinor=False)
+    monkeypatch.delenv("LORRAX_DIAG_ALPHA_FS_SCALE")
+    for name, key in diag.RETIRED_SWITCHES.items():
+        monkeypatch.setenv(name, "off")
+        with pytest.raises(ValueError, match="GATE bispinor_diag_switch_retired") as err:
+            diag.refuse_on_two_component(bispinor=True)
+        assert key in str(err.value)
+        monkeypatch.delenv(name)
+    diag.refuse_on_two_component(bispinor=True)
     for bad in ("0", "nan", "two", "-1"):
         monkeypatch.setenv("LORRAX_DIAG_ALPHA_FS_SCALE", bad)
         with pytest.raises(ValueError, match="LORRAX_DIAG_ALPHA_FS_SCALE"):

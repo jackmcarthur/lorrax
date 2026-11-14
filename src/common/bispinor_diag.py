@@ -18,7 +18,8 @@ two-component run (:func:`refuse_on_two_component`).
 The transverse terms themselves are deck keys since 2026-11-14
 (``bispinor_transverse_hartree``, ``bispinor_transverse_exchange``,
 ``bispinor_transverse_exchange_skip_bands``; docs/input_reference.md).  Their
-former environment switches are removed: one mechanism per quantity.
+former environment switches are removed (a set one refuses, naming its key):
+one mechanism per quantity.
 
 This module imports nothing from LORRAX so ``common.bispinor_init`` can read
 the scale at import.
@@ -56,6 +57,32 @@ def alpha_fs_scale() -> float:
     return scale
 
 
+#: The retired environment switches of 2bde04a7d and the deck keys that
+#: replaced them.  A set one refuses (:func:`refuse_retired_switches`): read
+#: silently as nothing, it would label a run "off" that still carries the term.
+RETIRED_SWITCHES = {
+    "LORRAX_DIAG_TT_EXCHANGE": "bispinor_transverse_exchange = false",
+    "LORRAX_DIAG_TRANSVERSE_HARTREE": "bispinor_transverse_hartree = false",
+    "LORRAX_DIAG_TT_EXCHANGE_SKIP_BANDS": "bispinor_transverse_exchange_skip_bands = N",
+}
+
+
+def refuse_retired_switches() -> None:
+    """Refuse any set retired switch, naming the input-file key that replaced it."""
+    found = [name for name in RETIRED_SWITCHES
+             if str(os.environ.get(name, "")).strip()]
+    if found:
+        raise ValueError(
+            "GATE bispinor_diag_switch_retired: a removed environment switch "
+            "is set.\n"
+            f"  got:  {', '.join(f'{n}={os.environ[n]!r}' for n in found)}\n"
+            "  want: the input-file key instead: "
+            + "; ".join(f"{n} is now {RETIRED_SWITCHES[n]}" for n in found) + "\n"
+            "  why:  the switch is no longer read; the run would carry the "
+            "term while you think it is off\n"
+            "  doc:  docs/input_reference.md, bispinor_transverse_hartree.")
+
+
 def active_switches() -> str | None:
     """One line naming the set switch, or ``None`` when it is inert."""
     scale = alpha_fs_scale()
@@ -63,7 +90,8 @@ def active_switches() -> str | None:
 
 
 def refuse_on_two_component(*, bispinor: bool) -> None:
-    """Refuse a set switch on a two-component run, where it scales nothing."""
+    """Refuse a retired switch, and a set switch on a two-component run."""
+    refuse_retired_switches()
     active = active_switches()
     if active is not None and not bispinor:
         raise ValueError(
