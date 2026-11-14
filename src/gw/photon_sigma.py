@@ -377,7 +377,9 @@ def _contract_lorentz_blocks_by_label(blocks, *, families, term, response, Gij,
             raise ValueError(
                 "per-label photon families must be current families on the "
                 f"response's current plan; label {label} is not")
-    ordered = list(dict.fromkeys(families[A] for pair in blocks for A in pair))
+    # Families are unhashable dataclasses: keep first appearance by identity.
+    ordered = list({id(families[A]): families[A]
+                    for pair in blocks for A in pair}.values())
     band_axis, placed = place_photon_families(tuple(ordered), mesh_xy)
     operands = {id(f): op for f, op in zip(ordered, placed)}
     classes = {}
