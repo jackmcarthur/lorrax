@@ -2842,7 +2842,7 @@ def read_dipole_parent_window(path, parent_rows, band_start, band_stop, *,
 
 
 def dipole_operator_mismatches(path, *, skip_vnl, vnl_mode, hubbard=None,
-                               bispinor=None):
+                               bispinor=None, bispinor_run=False):
     """``[(stamp, file value, run value)]`` for the velocity-operator stamps of
     ``dipole.h5`` that differ from the run's; an absent stamp counts as different
     (the operator that built the file cannot be named).  ``hubbard`` (``'none'``
@@ -2850,8 +2850,11 @@ def dipole_operator_mismatches(path, *, skip_vnl, vnl_mode, hubbard=None,
     ``prov_hubbard`` predates V_U and reads as ``'none'``.  ``bispinor`` (the
     head's ``scalar_head_bispinor``) joins them when given and the file stamps
     ``prov_bispinor``: a four-spinor dipole is not a bispinor run's charge head
-    since 2026-11-11.  Empty when all agree."""
-    from psp.get_dipole_mtxels import _prov_ne
+    since 2026-11-11.  On a bispinor run (``bispinor_run``) an ABSENT
+    ``prov_bispinor`` is a mismatch too: a file that predates the stamp was
+    written by the four-spinor dipole of the old carrier, and its shape is
+    the two-spinor one's.  Empty when all agree."""
+    from .dipole import prov_ne as _prov_ne
     from .dipole import require_dipole_format
     want = {"prov_skip_vnl": skip_vnl, "prov_vnl_mode": vnl_mode}
     with h5py.File(str(path), "r") as h5:
@@ -2863,9 +2866,12 @@ def dipole_operator_mismatches(path, *, skip_vnl, vnl_mode, hubbard=None,
     got_hub = attrs.get("prov_hubbard", "none")
     if hubbard is not None and _prov_ne(got_hub, str(hubbard)):
         bad.append(("prov_hubbard", got_hub, hubbard))
-    if (bispinor is not None and "prov_bispinor" in attrs
-            and _prov_ne(attrs["prov_bispinor"], bool(bispinor))):
-        bad.append(("prov_bispinor", attrs["prov_bispinor"], bool(bispinor)))
+    if bispinor is not None and "prov_bispinor" in attrs:
+        if _prov_ne(attrs["prov_bispinor"], bool(bispinor)):
+            bad.append(("prov_bispinor", attrs["prov_bispinor"], bool(bispinor)))
+    elif bool(bispinor_run):
+        bad.append(("prov_bispinor", "<absent>",
+                    False if bispinor is None else bool(bispinor)))
     return bad
 
 
@@ -4392,10 +4398,10 @@ def check_dipole_provenance(
         WFN_FINGERPRINT_SCHEME,
         _DIPOLE_Q0_OPERATOR_SCHEME,
         _PROV_ATTRS,
-        _prov_ne,
         _prov_show,
         wfn_fingerprint,
     )
+    from .dipole import prov_ne as _prov_ne
     from common import sanity
     from common.parallel_transport import fingerprint_from_binding
 

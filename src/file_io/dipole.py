@@ -185,6 +185,19 @@ def require_dipole_basis(attrs, *, dipole_path, wfn_path) -> None:
             f"dipole_qsgw.h5 pairs only with a QP WFN.")
 
 
+def prov_ne(got, expected) -> bool:
+    """True when a ``prov_*`` attribute differs from the run's value.
+
+    A string compares as text (an HDF5 ``bytes`` attribute decoded); any
+    other value as an integer (bools and band counts).  The one comparator of
+    the dipole stamps (``file_io.restart_bundle``).
+    """
+    if isinstance(expected, str):
+        got = got.decode() if isinstance(got, bytes) else str(got)
+        return got != expected
+    return int(np.asarray(got)) != int(expected)
+
+
 def require_dipole_format(attrs, *, dipole_path) -> None:
     """Refuse a ``dipole.h5`` written before :data:`DIPOLE_FORMAT_VERSION`.
 

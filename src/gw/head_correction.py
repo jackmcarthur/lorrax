@@ -417,7 +417,8 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
         caller="gw.head_correction dipole")
     bad = dipole_operator_mismatches(
         dipole_path, hubbard=hubbard,
-        bispinor=params.get("_charge_bispinor"), **operator)
+        bispinor=params.get("_charge_bispinor"),
+        bispinor_run=bool(params.get("_bispinor_run", False)), **operator)
     if bad:
         detail = "; ".join(f"{k}: file={got!r} run={want!r}"
                            for k, got, want in bad)
@@ -1430,6 +1431,7 @@ class HeadResolver:
             "hubbard_input": getattr(config, "hubbard_input", ""),
             "hubbard_occupations": getattr(config, "hubbard_occupations", ""),
             "_charge_bispinor": representation.scalar_head_bispinor,
+            "_bispinor_run": bool(config.bispinor),
             "wcoul0_source": head.wcoul0_source,
             "wcoul0_eta": head.wcoul0_eta,
             "vhead": head.vhead,

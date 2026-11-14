@@ -670,13 +670,6 @@ def _resolve_dipole_nb_written(wfn, *, ncond, nband) -> int:
 
 
 
-def _prov_ne(got, expected) -> bool:
-    if isinstance(expected, str):
-        got = got.decode() if isinstance(got, bytes) else str(got)
-        return got != expected
-    return int(np.asarray(got)) != int(expected)
-
-
 def _prov_show(v) -> str:
     if isinstance(v, bytes):
         v = v.decode()
