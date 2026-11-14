@@ -1893,10 +1893,13 @@ def _interpolate_bse_data_to_grid(
     if qp_rotations_file is not None:
         # f(H_QP) in the nodal basis: the QP block of the compact rows rotated
         # by U, its energies E_QP; refuses a block outside the fitted window.
-        ctilde, enk_sigma, _ = ht.resolve_qp_hamiltonian_state(
+        # The states at the nodes and at the back-map targets (the centroids,
+        # where ψ_fine is read) take the same rotation.
+        ctilde, enk_sigma, _, B_at_mu = ht.resolve_qp_hamiltonian_state(
             basis=basis, enk_sigma=enk_sigma, sym=sym, meta=meta, wfn=wfn,
             wfn_path=_parse_wfn_path(input_file),
-            qp_rotations_file=qp_rotations_file, log_fn=log_fn)
+            qp_rotations_file=qp_rotations_file, log_fn=log_fn,
+            nodes=B_at_mu)
     nb_window = int(ctilde.shape[1])
     nval_in = int(params["nval"])          # window-relative CBM index
     b_min, b_max = nval_in - n_val, nval_in + n_cond
