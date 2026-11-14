@@ -28,6 +28,7 @@ def resolve_input_paths(params: dict, input_dir: str) -> dict:
 		"parallel_transport_file", "static_gauge_hall_file",
 		"mpa_fit_reuse_file",
 		"sigma_diag_file", "eqp0_file", "eqp1_file", "report_file",
+		"pseudo_dir",
 	]
 	for key in path_keys:
 		if key in params:
