@@ -1207,8 +1207,14 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
                       mesh_xy, log_fn=log.debug, full_window: bool = False,
                       qp_states: bool = False, pair_rule: str = "mask",
                       pair_gap_ev: float = 0.05,
-                      mixing_receipt: bool = False, probe=None) -> dict:
+                      mixing_receipt: bool = False, probe=None,
+                      state_ctilde=None) -> dict:
     r"""r-form dipoles of a ``kgrid_fine`` bundle, in the gauge of its own ψ.
+
+    ``state_ctilde``: the compact rows of the coarse states the fH was built
+    on when they are not ``basis.ctilde`` (``qp_rotations_file``: the QP rows
+    C_QP = Uᵀ C); the on-grid state identity reads them, the operator images
+    keep ``basis.ctilde`` and the velocity's own DFT rows.
 
     ``probe``: on a shifted fine grid, a ``compute_wfns_fi`` bundle (with
     coefficients) at the coarse k, on which the on-grid identities are read;
@@ -1524,12 +1530,12 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         on_grid_rel, state_dev, defect, n_on_grid = _dipole_on_grid_identity(
             out, basis.ctilde, fine.coeffs_fi, ops_host=(v_full, f_full),
             k_coarse=sym.unfolded_kpts, q_fine=q_frac, window_start=window_start,
-            fh_energies=fh_energies)
+            fh_energies=fh_energies, state_ctilde=state_ctilde)
     else:
         on_grid_rel, state_dev, defect, n_on_grid = _dipole_on_grid_identity(
             out_probe, basis.ctilde, probe.coeffs_fi, ops_host=(v_full, f_full),
             k_coarse=sym.unfolded_kpts, q_fine=q_probe, window_start=window_start,
-            fh_energies=fh_energies)
+            fh_energies=fh_energies, state_ctilde=state_ctilde)
         del out_probe
     v_window = v_win if full_window else None                   # (3, nq, nb, nb)
     del out, f_win
@@ -1620,7 +1626,8 @@ def _coefficients_by_q(coeffs, carrier, mesh_xy):
 
 
 def _dipole_on_grid_identity(out, ctilde, coeffs, *, ops_host, k_coarse,
-                             q_fine, window_start, fh_energies):
+                             q_fine, window_start, fh_energies,
+                             state_ctilde=None):
     """The two on-grid identities of :func:`densified_dipoles`.
 
     ``out`` (carrier, 4, nb_fi, nb_fi) is ``interpolate_band_operator``'s
@@ -1634,6 +1641,10 @@ def _dipole_on_grid_identity(out, ctilde, coeffs, *, ops_host, k_coarse,
     :data:`DENSIFIED_DIPOLE_DEGEN_RY` of the two edge levels included)
     have ``σ(W_S) = 1``, and the four images are ``W^† O(k) W``.  Only
     the shared rows are gathered.
+
+    ``state_ctilde`` (default ``ctilde``): the rows the window states are
+    read against, the QP rows of a ``qp_rotations_file`` fH; the images keep
+    ``ctilde``, the operator's own rows (any isometry W serves there).
 
     Returns ``(image rel deviation, max|σ(W_window) − 1|, max|C Cᴴ − I| over
     the shared k, n_shared)``.
@@ -1661,6 +1672,8 @@ def _dipole_on_grid_identity(out, ctilde, coeffs, *, ops_host, k_coarse,
     O = np.asarray(gather_to_host(out[fi]))                     # (n, 4, nb_fi, nb_fi)
     nb_fi = int(U.shape[2])
     W = np.einsum("nma,nai->nmi", np.conj(C), U)                # ⟨ψ_m(k)|ψ_i(q)⟩
+    W_state = W if state_ctilde is None else np.einsum(
+        "nma,nai->nmi", np.conj(np.asarray(gather_to_host(state_ctilde[co]))), U)
     e_fh = np.asarray(fh_energies, dtype=np.float64)[co]          # (n, nb_fit)
     sigma = []
     for n_, e_k in enumerate(e_fh):
@@ -1668,7 +1681,7 @@ def _dipole_on_grid_identity(out, ctilde, coeffs, *, ops_host, k_coarse,
         lo = e_sorted[window_start] - DENSIFIED_DIPOLE_DEGEN_RY
         hi = e_sorted[window_start + nb_fi - 1] + DENSIFIED_DIPOLE_DEGEN_RY
         rows = np.flatnonzero((e_k >= lo) & (e_k <= hi))
-        sigma.append(np.linalg.svd(W[n_, rows], compute_uv=False))
+        sigma.append(np.linalg.svd(W_state[n_, rows], compute_uv=False))
     sigma = np.concatenate(sigma)
     gram = np.einsum("nma,npa->nmp", C, np.conj(C))
     defect = float(np.max(np.abs(gram - np.eye(gram.shape[1])[None])))
@@ -1694,6 +1707,7 @@ def _interpolate_bse_data_to_grid(
     htransform_rank_record_fn=None,
     htransform_quality_record_fn=None,
     eqp_file: str | None = None,
+    qp_rotations_file: str | None = None,
     velocity_file: str | None = None,
     velocity_full_window: bool = False,
     velocity_pair_rule: str = "mask",
@@ -1751,6 +1765,16 @@ def _interpolate_bse_data_to_grid(
         The wedge ``eqp1.dat`` (``eqp_corrections``).  Its QP energies enter the fH
         through ``initialize_wfns``, the one reader on this path, so the fine
         ε are quasiparticle; the coarse bundle's ε are not re-sliced after.
+    qp_rotations_file : str or None
+        The GW run's ``qp_wfn_rotations.h5`` (``qp_rotations_file``, exclusive
+        with ``eqp_file``).  The htransform's compact states take the QP block
+        (``fh_interp.resolve_qp_hamiltonian_state``, C_QP = Uᵀ C_DFT), so the fH
+        is f(H_QP) = U f(E_QP) Uᴴ and the fine ψ, ε are its eigenstates, while
+        W, V, the ISDF tensors and the long-range anchor stay the bundle's.
+        The velocity is carried in the DFT rows it was measured in: its
+        lattice image Cᵀ v C* equals C_QPᵀ (Uᴴ v U) C_QP* for a unitary U, and
+        the fine QP states take it from there; the on-grid state identity is
+        read against the rotated rows.
     velocity_file : str or None
         The COARSE WFN's ``dipole.h5`` (``dipole_file``).  Authenticated against
         the deck WFN before the fit, then carried through the same htransform
@@ -1866,6 +1890,13 @@ def _interpolate_bse_data_to_grid(
             velocity_file, wfn=wfn, wfn_path=_parse_wfn_path(input_file),
             sym=sym, mesh=mesh_xy, band_range=basis.band_range) + (velocity_file,)
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
+    if qp_rotations_file is not None:
+        # f(H_QP) in the nodal basis: the QP block of the compact rows rotated
+        # by U, its energies E_QP; refuses a block outside the fitted window.
+        ctilde, enk_sigma, _ = ht.resolve_qp_hamiltonian_state(
+            basis=basis, enk_sigma=enk_sigma, sym=sym, meta=meta, wfn=wfn,
+            wfn_path=_parse_wfn_path(input_file),
+            qp_rotations_file=qp_rotations_file, log_fn=log_fn)
     nb_window = int(ctilde.shape[1])
     nval_in = int(params["nval"])          # window-relative CBM index
     b_min, b_max = nval_in - n_val, nval_in + n_cond
@@ -1927,9 +1958,12 @@ def _interpolate_bse_data_to_grid(
             coarse_grid=coarse_grid, n_val=n_val, window_start=b_min,
             a_band_index=htransform_a_band, mesh_xy=mesh_xy, log_fn=log_fn,
             full_window=velocity_full_window,
-            qp_states=eqp_file is not None and bool(velocity_position_fix),
+            qp_states=(eqp_file is not None or qp_rotations_file is not None)
+            and bool(velocity_position_fix),
             pair_rule=velocity_pair_rule, pair_gap_ev=velocity_pair_gap_ev,
-            mixing_receipt=eqp_file is not None, probe=probe)
+            mixing_receipt=eqp_file is not None or qp_rotations_file is not None,
+            probe=probe,
+            state_ctilde=None if qp_rotations_file is None else ctilde)
         del probe
         del bundle.coeffs_fi, velocity
 

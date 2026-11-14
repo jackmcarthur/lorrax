@@ -5,6 +5,18 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-14 — Fine-grid BSE in the QP basis of the GW run (`qp_rotations_file` with `kgrid_fine`)
+
+`qp_rotations_file` now runs under `kgrid_fine`.  The band interpolation is
+built from f(H_QP) = U f(E_QP) U^H on the coarse grid, so the fine states and
+energies are quasiparticle while W, V, the ISDF tensors and the long-range
+anchor stay the GW run's own (before, `GATE bse_qp_rotations_k_grid` refused,
+and the only route was a GW rerun on `WFN_qp.h5`, which rebuilds W from the QP
+states).  The QP block must lie inside the interpolated band window: raise
+`number_cond_bands_coarse` if the run refuses.  Use `dipole_position_fix =
+true`.  TD-aGW's full-window velocity still refuses.  Runs without
+`qp_rotations_file`, and `qp_rotations_file` on the native grid, are unchanged.
+
 ## 2026-11-14 — Fine-grid BSE on a q grid that symmetry does not reduce
 
 `kgrid_fine` now runs on an ISDF tensor file whose W0 is stored on the full
