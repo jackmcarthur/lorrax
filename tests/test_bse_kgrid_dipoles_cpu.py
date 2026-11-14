@@ -193,3 +193,83 @@ def test_on_grid_identity_and_off_grid_dipoles():
     with pytest.raises(ValueError, match="GATE densified_dipole_on_grid"):
         _densify(mesh, c, e, v, fh_energies=e_qp, gate_energies=e)
 
+
+def _densify_qp(mesh, c, c_qp, e, e_qp, v, *, state_rows=True):
+    """The densifier's QP route on the toy: fH on C_QP / E_QP, velocity on C / E.
+
+    The rank axis is zero-padded to the mesh (the Galerkin carrier).
+    """
+    kc = _grid(KC)
+    pad = (-c.shape[2]) % int(mesh.size)
+    c, c_qp = (np.pad(x, ((0, 0), (0, 0), (0, pad))) for x in (c, c_qp))
+    nodes = _nodes(c)
+    with xla_reference():
+        fine = compute_wfns_fi(
+            ctilde=jnp.asarray(c_qp), B_at_mu=nodes, enk_sigma=jnp.asarray(e_qp.T),
+            kgrid_co=KC, kgrid_fine=KF, band_window_fi=(B_MIN, B_MAX),
+            mesh_xy=mesh, return_coeffs=True)
+        dip = densified_dipoles(
+            (v, e, "toy dH/dk", "toy.h5"), sym=_sym(kc), fh_energies=e_qp,
+            basis=SimpleNamespace(ctilde=jnp.asarray(c), band_range=(0, NB),
+                                  basis_at_nodes=nodes),
+            fine=fine, coarse_grid=KC, n_val=N_VAL, window_start=B_MIN,
+            a_band_index=None, mesh_xy=mesh, log_fn=lambda *a: None,
+            qp_states=True,
+            state_ctilde=jnp.asarray(c_qp) if state_rows else None)
+    return dip, fine
+
+
+def test_qp_rotated_compact_states_keep_the_dft_velocity():
+    """``qp_rotations_file`` under ``kgrid_fine``: the fH takes C_QP = Uᵀ C (the
+    production ``fh_interp`` overlay) and the velocity stays in its DFT rows.
+
+    Cᵀ v C* = C_QPᵀ (Uᴴ v U) C_QP* for a unitary U, so the operator image needs no
+    rotation.  At the shared k the fine states are the QP states with E_QP, and
+    for a U inside the window's valence and conduction spans the r-form dipoles
+    are the DFT ones rotated by U.  A U that mixes a band across the window edge
+    passes the on-grid state identity against the QP rows and fires it against
+    the DFT rows (the red twin).
+    """
+    from bandstructure.fh_interp import _apply_qp_block_to_compact_state
+    mesh, h = _mesh(), _model()
+    kc = _grid(KC)
+    nk = len(kc)
+    c, e, v = _states(h, kc)
+    e_qp = e + SHIFT * (np.arange(NB) >= B_MIN + N_VAL)[None, :]
+    for pairs, crosses in (([(2, 3, 0.4), (4, 5, 0.3)], False),
+                           ([(1, 2, 0.35), (4, 5, 0.3)], True)):
+        U = np.tile(np.eye(NB, dtype=complex), (nk, 1, 1))
+        for a, b, t in pairs:
+            U[:, a, a] = U[:, b, b] = np.cos(t)
+            U[:, a, b] = -np.exp(-0.7j) * np.sin(t)
+            U[:, b, a] = np.exp(0.7j) * np.sin(t)
+        np.testing.assert_allclose(np.einsum("kmn,kml->knl", U.conj(), U),
+                                   np.tile(np.eye(NB), (nk, 1, 1)), atol=1e-14)
+        c_qp, _ = _apply_qp_block_to_compact_state(
+            jnp.asarray(c), jnp.asarray(e.T), jnp.asarray(U), jnp.asarray(e_qp),
+            band_offset=0)
+        c_qp = np.asarray(c_qp)
+        v_qp = np.einsum("kmn,kxmp,kpl->kxnl", U.conj(), v, U)
+        np.testing.assert_allclose(
+            np.einsum("kma,kxmp,kpb->kxab", c_qp, v_qp, c_qp.conj()),
+            np.einsum("kma,kxmp,kpb->kxab", c, v, c.conj()), atol=1e-13)
+        dip, fine = _densify_qp(mesh, c, c_qp, e, e_qp, v)
+        assert dip["n_on_grid"] == 9
+        assert dip["on_grid_state_dev"] < 1e-8 and dip["on_grid_rel"] < 1e-12
+        hit = [(i, np.flatnonzero(np.all(np.abs((kc - q + 0.5) % 1.0 - 0.5) < 1e-8,
+                                         axis=1))) for i, q in enumerate(fine.q_frac)]
+        shared = [i for i, j in hit if j.size]
+        ko = [int(j[0]) for _, j in hit if j.size]
+        np.testing.assert_allclose(np.asarray(fine.enk_full)[shared],
+                                   np.sort(e_qp[ko], axis=1)[:, B_MIN:B_MAX], atol=1e-10)
+        if crosses:
+            with pytest.raises(ValueError, match="GATE densified_dipole_on_grid"):
+                _densify_qp(mesh, c, c_qp, e, e_qp, v, state_rows=False)
+            continue
+        cf = np.asarray(fine.coeffs_fi)[shared][:, :c.shape[2]]
+        w = np.einsum("qna,qam->qnm", c[ko, B_MIN:B_MAX].conj(), cf)
+        de = e[ko, B_MIN + N_VAL:B_MAX, None] - e[ko, None, B_MIN:B_MIN + N_VAL]
+        dx = v[ko][:, :, B_MIN + N_VAL:B_MAX, B_MIN:B_MIN + N_VAL] / de[:, None]
+        ref = np.einsum("qcd,qxce,qef->xqdf", w[:, N_VAL:, N_VAL:].conj(), dx,
+                        w[:, :N_VAL, :N_VAL])
+        assert _rel(np.asarray(dip["d_alpha"])[:, shared], ref) < 1e-8

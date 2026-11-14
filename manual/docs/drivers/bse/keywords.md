@@ -77,7 +77,7 @@ A bare key reads BerkeleyGW's file name beside the input file (`eqp.dat`, `eqp_c
 {: .kw-details }
 
 ### `qp_rotations_file` {: .kw data-type="path" data-default="—" }
-The GW run's `qp_wfn_rotations.h5`: solve in the eigenbasis of its $H_{QP}$; the window counts QP states. Exclusive with the eqp keys; refuses `kgrid_fine`.
+The GW run's `qp_wfn_rotations.h5`: solve in the eigenbasis of its $H_{QP}$; the window counts QP states. Exclusive with the eqp keys. Under `kgrid_fine` the band interpolation is built from $f(H_{QP}) = U f(E_{QP}) U^\dagger$ on the coarse grid, so the fine states and energies are quasiparticle while $W$, $V$ and the ISDF tensors stay the GW run's own; the QP block must lie inside the interpolated band window (raise `number_cond_bands_coarse`), and the full-window velocity of TD-aGW refuses (`GATE bse_qp_rotations_k_grid`). Set `dipole_position_fix = true` there: the fine QP states mix DFT bands.
 
 ### `wfn_file` {: .kw data-type="path" data-default="WFN.h5" }
 WFN for the occupied count, the cell volume, the spinor count, bundle authentication and the band interpolation; relative to the input file.

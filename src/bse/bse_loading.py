@@ -288,14 +288,17 @@ def load_bse_data_from_restart_sharded(
         eps_v = jnp.asarray(enk_full[:, read_val])
         eps_c = jnp.asarray(enk_full[:, read_cond])
     else:
-        if densify_pending:
+        if densify_pending and velocity_full_window:
             raise ValueError(
                 f"GATE bse_qp_rotations_k_grid: got qp_rotations_file with "
-                f"kgrid_fine = {fine_grid} on a {(nkx, nky, nkz)} restart; "
-                f"want the native grid.  why: the densifying htransform takes "
-                f"QP energies only (eqp_corrections), so the fine ψ and velocity would "
-                f"stay in the DFT basis.  fix: run the native grid, or "
-                f"densify a restart built from WFN_qp.h5.")
+                f"kgrid_fine = {fine_grid} and the full-window velocity "
+                f"(TD-aGW); want the BSE window dipoles only.  why: the "
+                f"vv'/cc' velocity and position of the QP f(H) fine states "
+                f"are not validated on this route.  fix: run TD-aGW on the "
+                f"native grid, or on a restart built from WFN_qp.h5.")
+        # Under kgrid_fine the artifact is read here for its window only: the
+        # window counts QP states, and the densifier rotates the htransform's
+        # compact states (f(H_QP), bse_densify).  ψ is not read on that route.
         from .bse_qp_rotation import load_qp_rotation
         qp_rotation = load_qp_rotation(
             restart_file, input_file, qp_rotations_file, header=header,
@@ -328,7 +331,7 @@ def load_bse_data_from_restart_sharded(
     screened_w = None                # relaid out as W_q: one W layout survives
     if not need_W:
         W_q = no_w_operand(mesh_xy)
-    if qp_rotation is not None:
+    if qp_rotation is not None and not densify_pending:
         from .bse_qp_rotation import rotate_window_psi
         psi_v_X, psi_c_X = rotate_window_psi(
             psi_v_X, psi_c_X, qp_rotation, mesh_xy, log=_log0)
@@ -481,6 +484,8 @@ def load_bse_data_from_restart_sharded(
             htransform_rank_record_fn=htransform_rank_record_fn,
             htransform_quality_record_fn=htransform_quality_record_fn,
             eqp_file=None if eqp_file is None else os.path.abspath(eqp_file),
+            qp_rotations_file=(None if qp_rotation is None
+                               else qp_rotation["path"]),
             velocity_file=(None if velocity_file is None
                            else os.path.abspath(velocity_file)),
             velocity_full_window=bool(velocity_full_window),
