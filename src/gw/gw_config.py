@@ -3278,6 +3278,17 @@ def _apply_input_envelope(
                 f"no link artifact {links}; {dipole} exists")
         else:
             mode, why = "off", "no link artifact and no dipole.h5"
+        # A bare_transverse METAL (the deck's Fermi-Dirac width marks it; the
+        # width is required on a metal and refused on an insulator) takes
+        # dft_velocity unnamed: its parallel_transport head is admitted only
+        # when named, until a metal null leg (Fe 4^3, both transverse keys
+        # false against two-component) has run (coordinator, 2026-11-14).
+        if (mode == "parallel_transport"
+                and uses_bare_transverse_tangential(resolved)
+                and resolved.occ_smearing_width_ry is not None):
+            mode, why = "dft_velocity", (
+                f"{links} exists, but a bare_transverse metal takes "
+                "parallel_transport only when named")
         if mode != "off":
             resolved = _dc_replace(resolved, sc=_dc_replace(
                 resolved.sc, head_update=mode))

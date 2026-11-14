@@ -38,7 +38,13 @@ def test_unnamed_head_update_is_the_same_on_both_representations(tmp_path):
     resolved = [_head(tmp_path, d) for d in decks]
     assert [c.sc.head_update for c in resolved] == ["parallel_transport"] * 2
     assert _head(tmp_path, decks[1] + "sc_head_update = off\n").sc.head_update == "off"
-    # The bare_transverse metal admits its default head (the Drude route).
-    assert uses_metal_direct_drude_head(resolved[1])
+    # A bare_transverse metal (Fermi-Dirac width given) takes dft_velocity
+    # unnamed; parallel_transport only when named, and then it is admitted.
+    metal = "occ_smearing_width_ry = 0.01\n"
+    assert _head(tmp_path, decks[0] + metal).sc.head_update == "parallel_transport"
+    assert _head(tmp_path, decks[1] + metal).sc.head_update == "dft_velocity"
+    named = _head(tmp_path, decks[1] + metal + "sc_head_update = parallel_transport\n")
+    assert named.sc.head_update == "parallel_transport"
+    assert uses_metal_direct_drude_head(named)
     assert uses_metal_direct_drude_head(
         replace(resolved[1], sc=replace(resolved[1].sc, head_update="dft_velocity")))
