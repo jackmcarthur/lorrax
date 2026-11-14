@@ -44,7 +44,7 @@ def test_null_decks_differ_by_the_representation_only():
     assert names.index("bt_twin") < names.index("dipole_bisp") < names.index("bisp_bt_null")
 
 
-def test_twin_comparator_fails_on_a_carrier_sized_difference(tmp_path):
+def test_twin_comparator_fails_on_a_carrier_sized_difference(tmp_path, capsys):
     import h5py
     from tests.hsuite import chain
 
@@ -63,6 +63,7 @@ def test_twin_comparator_fails_on_a_carrier_sized_difference(tmp_path):
     write("mine.h5", hartree_scalar_kij_ev=m + 1e-6, sigma_sx_kij_ev=m,
           sigma_c_kij_ev=pair, hartree_transverse_kij_ev=np.zeros_like(m))
     assert chain.twin_problems(tmp_path, "bisp_bt_null", rule) == []
+    assert "hartree_scalar_kij_ev max|diff|" in capsys.readouterr().out
     # The old carrier moved V_H by meV; 0.1 meV must already fail.
     write("mine.h5", hartree_scalar_kij_ev=m, sigma_sx_kij_ev=m + 1e-4,
           sigma_c_kij_ev=pair, hartree_transverse_kij_ev=1e-12 + np.zeros_like(m))

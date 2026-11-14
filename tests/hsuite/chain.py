@@ -987,6 +987,9 @@ def twin_problems(run, name, rule):
             problems.append(f"{name}: {member} shape {a.shape} != twin {b.shape}")
             continue
         diff = float(np.max(np.abs(a - b))) if a.size else 0.0
+        # The measured margin, printed pass or fail (the record of the null test).
+        print(f"hsuite {name}: {member} max|diff| vs {twin_file}:{twin_member} "
+              f"= {diff:.3e} eV (bound {ATOL['null_ev']:.0e})", flush=True)
         if not np.isfinite(diff) or diff > ATOL["null_ev"]:
             problems.append(f"{name}: {member} differs from the two-component "
                             f"twin by {diff:.3e} eV > {ATOL['null_ev']:.0e}")
