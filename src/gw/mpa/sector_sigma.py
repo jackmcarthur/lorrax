@@ -288,7 +288,10 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     local_rows, nu = m // px, n // py
     lefts, rights = lorentz_class_vertices(keys)
     vertices = ([gamma_perm_phase_host(A) for A in lefts], [gamma_perm_phase_host(B) for B in rights])
-    n_a, n_b = (1 if lefts == (0,) else 3), (1 if rights == (0,) else 3)
+    # The class's own vertex counts: 1 for the charge endpoint, 3 for a whole
+    # current endpoint, 1 for one current label (the convective vertex's
+    # per-carrier classes, gw.photon_sigma._contract_lorentz_blocks_by_label).
+    n_a, n_b = len(lefts), len(rights)
     g_tables = plans[0].unfold_load_tables(right_plan=None if plans[1] is plans[0] else plans[1])
     partner = int(has_antiunitary_rows(plans[0]))
     mult = -1.0 / np.sqrt(float(meta.nk_tot))
