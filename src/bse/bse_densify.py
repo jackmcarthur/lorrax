@@ -620,12 +620,16 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
         f"{(fine_grid[0]*fine_grid[1]*fine_grid[2])/n_c:.6f}; more points than "
         f"weight means boundary/common-cell sharing), of "
         f"{fine_grid[0]*fine_grid[1]*fine_grid[2]} fine q total")
+    # A zero injected head (head_correction = off) re-attaches a zero channel;
+    # the two ratios below are then undefined and are printed as such.
+    scale = (f"×{S_fine[0, 0, 0]/float(whead):.3f}" if float(whead) else "×n/a")
+    rule = (f"{100.0*abs(zone/target - 1.0):.1f}%" if target else "n/a, zero head")
     log_fn(
         f"[w-head] S(Γ_fine) = {S_fine[0, 0, 0]:.4f} vs injected "
-        f"{float(whead):.4f} Ry·bohr³ (×{S_fine[0, 0, 0]/float(whead):.3f} "
+        f"{float(whead):.4f} Ry·bohr³ ({scale} "
         f"for a {(fine_grid[0]*fine_grid[1]*fine_grid[2])/n_c:.0f}× finer "
         f"cell); SUM RULE: zone average {zone:.6f} vs the grid-independent "
-        f"{target:.6f} ({100.0*abs(zone/target - 1.0):.1f}% — a midpoint "
+        f"{target:.6f} ({rule} — a midpoint "
         f"quadrature error that shrinks under refinement, 0 when fine == "
         f"coarse) [gamma_cell={gamma_cell}]")
     if abs(ratio - 1.0) > 0.05:
