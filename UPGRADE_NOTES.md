@@ -5,6 +5,47 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-14 — Bispinor transverse terms are input-file keys; head default; stamps
+
+New input-file keys for `bispinor = true` (docs/input_reference.md):
+`bispinor_transverse_hartree` and `bispinor_transverse_exchange` (default
+`true`: each switches one transverse term, the direct field
+$\langle\boldsymbol\alpha\cdot\mathbf A\rangle$ or the bare transverse exchange
+$\Sigma^B$, to an exact zero), `bispinor_transverse_exchange_skip_bands`
+(default `0`: the lowest N bands leave the occupied sum of $\Sigma^B$, for
+closed semicore shells) and `bispinor_semicore_fold` (record only). With the
+defaults every result is unchanged. Every bispinor output now records
+`bispinor_transverse_terms = hartree=…; exchange=…; semicore=…` (text headers,
+`sigma_mnk.h5` and the `sigma_lorentz_*.h5` sector files, the run report, the
+SC checkpoint identity, so a bispinor SC checkpoint from before this change
+does not continue).
+
+Which results move:
+- An unnamed `sc_head_update` on a `bispinor_gw = bare_transverse`
+  self-consistent insulator now resolves as on a two-component input file
+  (`parallel_transport` where the link file exists, else `dft_velocity`); it
+  was `off`. Every self-consistent bare_transverse result that did not name
+  the key moves (its head is now rebuilt each map). Name
+  `sc_head_update = off` to reproduce an old one. A bare_transverse metal
+  takes `dft_velocity` unnamed, `parallel_transport` only when named.
+  Two-component and `full_tangential` input files are unchanged.
+
+What to change:
+- The environment switches `LORRAX_DIAG_TT_EXCHANGE`,
+  `LORRAX_DIAG_TRANSVERSE_HARTREE` and `LORRAX_DIAG_TT_EXCHANGE_SKIP_BANDS`
+  (branch `claude/bispinor-diag-switches-20261114` only) are removed; a set one
+  refuses (`GATE bispinor_diag_switch_retired`) and names its key.
+  `LORRAX_DIAG_ALPHA_FS_SCALE` stays (diagnostic, environment only).
+- A `dipole.h5` with no `prov_bispinor` stamp now refuses on a bispinor run
+  (`GATE static_head_dipole_operator`): regenerate it with
+  `python -m psp.get_dipole_mtxels`. Two-component runs still read it.
+- `GATE tangential_passivity` now prints its numbers (lambda_min, lambda_max,
+  the anti-Hermitian norm, the broken bound, the gate receipt) on several
+  lines; a script that matched the old one-line text must match
+  `GATE tangential_passivity:` only. The tolerance is unchanged.
+- With `sigma_lorentz_debug_output = true` a bispinor one-shot also writes
+  `sigma_lorentz_oneshot.h5`.
+
 ## 2026-11-11 — Bispinor runs: two-component charge, Pauli current
 
 With `bispinor = true`, every charge term (Hartree field, charge screening
