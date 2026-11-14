@@ -25,9 +25,18 @@ def read_sc_sigma_lorentz_h5(path):
 
 def write_sc_sigma_lorentz_h5(path, components_skij_ev, rotation_kij,
 							 kpoints_crys, *, call_index, role, kset,
-							 band_start_1based):
-	"""Atomically publish CC, CT+TC and TT matrices from one SC map."""
+							 band_start_1based, basis="input_qp"):
+	"""Atomically publish CC, CT+TC and TT matrices from one SC map or a one-shot.
+
+	``basis`` is ``input_qp`` for an SC map (``U_dft_to_qp_kij`` its input
+	rotation) and ``dft`` for a one-shot (identity rotation).  The run-level
+	identities (``common.provenance.run_provenance``: the bispinor carrier,
+	``bispinor_transverse_terms``, ``bispinor_diag``) are written as root
+	attributes, as in ``sigma_mnk.h5``, so a sector file records the carrier
+	and the transverse terms that produced it.
+	"""
 	from common.collectives import rank0_atomic_file_transaction
+	from common.provenance import run_provenance
 	from .commit_state import set_commit_state
 
 	parts = np.asarray(components_skij_ev, dtype=np.complex128)
@@ -44,7 +53,9 @@ def write_sc_sigma_lorentz_h5(path, components_skij_ev, rotation_kij,
 			h5.create_dataset("U_dft_to_qp_kij", data=rotation)
 			h5.create_dataset("kpoints_crys", data=kpoints)
 			h5.attrs["sectors"] = ("CC", "CT+TC", "TT")
-			h5.attrs["basis"] = "input_qp"
+			h5.attrs["basis"] = str(basis)
+			for key, value in run_provenance().items():
+				h5.attrs[key] = np.asarray(value.encode())
 			h5.attrs["kset"] = kset
 			h5.attrs["role"] = role
 			h5.attrs["call_index"] = int(call_index)

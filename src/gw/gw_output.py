@@ -2098,6 +2098,6 @@ def write_oneshot_sigma_lorentz(config, input_dir, sigma_result, sym, band_slice
     write_sc_sigma_lorentz_h5(
         path, parts, rotation, np.asarray(sym.unfolded_kpts), call_index=0,
         role="one_shot", kset=sigma_result.kset,
-        band_start_1based=int(band_slices.b0) + 1)
+        band_start_1based=int(band_slices.b0) + 1, basis="dft")
     print_fn(f"  Lorentz sector matrices: {path} (CC, CT+TC, TT; DFT basis, eV)")
     return path

@@ -31,9 +31,19 @@ def test_oneshot_writes_sector_matrices_with_identity_rotation(tmp_path):
         assert write_oneshot_sigma_lorentz(cfg(bisp, debug), str(tmp_path), result,
                                             sym, slices, said.append) is None
     assert not list(tmp_path.iterdir())
-    path = write_oneshot_sigma_lorentz(cfg(True, True), str(tmp_path), result, sym,
-                                        slices, said.append)
+    from common.provenance import set_run_provenance
+    stamp = "hartree=on; exchange=off; semicore=excluded_bands:8"
+    set_run_provenance(four_current_carrier="pauli_charge_rkb_current_v1",
+                       bispinor_transverse_terms=stamp)
+    try:
+        path = write_oneshot_sigma_lorentz(cfg(True, True), str(tmp_path), result, sym,
+                                            slices, said.append)
+    finally:
+        set_run_provenance()
     with h5py.File(path, "r") as h5:
+        assert h5.attrs["basis"] == "dft"
+        assert h5.attrs["bispinor_transverse_terms"].decode() == stamp
+        assert h5.attrs["four_current_carrier"].decode() == "pauli_charge_rkb_current_v1"
         assert np.allclose(h5["sigma_lorentz_skij_ev"][()], parts * RYD_TO_EV, rtol=0, atol=1e-12)
         assert np.array_equal(h5["U_dft_to_qp_kij"][()],
                               np.broadcast_to(np.eye(nb), (nk, nb, nb)))
