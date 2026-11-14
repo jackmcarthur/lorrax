@@ -288,7 +288,8 @@ sigma_omega_h5_file = {prefix}_sigma.h5
 # The bare_transverse one-shots (the default bispinor_gw): CC screening on the
 # two-component charge (the Pauli carrier) plus the transverse direct field
 # and the bare transverse exchange Sigma^B, fresh fit, on the bisp_sc window.
-# bisp_bt keeps both terms and is the one-shot reference stage.  bisp_bt_null turns both off and
+# bisp_bt keeps both terms and is the one-shot reference stage; it writes the
+# sector matrices (sigma_lorentz_oneshot.h5, TT = Sigma^B).  bisp_bt_null turns both off and
 # must equal bt_twin, the two-component run of the same deck (the null test).
 def _bt_deck(prefix, body=""):
     return (_bisp_deck(prefix, """restart = false
@@ -301,7 +302,7 @@ BT_NULL_KEYS = """bispinor_transverse_hartree = false
 bispinor_transverse_exchange = false
 """
 RESTART_DECKS.update({
-    "bisp_bt.in": _bt_deck("bbt"),
+    "bisp_bt.in": _bt_deck("bbt", "sigma_lorentz_debug_output = true\n"),
     "bisp_bt_null.in": _bt_deck("bbtn", BT_NULL_KEYS),
     # The twin: the same deck on the two-component WFN path, its own kin_ion
     # and dipole (the scalar stages'), its own fresh fit on the same centroids.
@@ -551,7 +552,7 @@ CHECKS = {
     # Judged through bisp_bt_null (no stored reference of its own).
     "bt_twin": {"twin": None},
     "bisp_bt": {"eqp": ["bbt_eqp0.dat", "bbt_eqp1.dat"],
-                "h5": ["bbt_sigma.h5"]},
+                "h5": ["bbt_sigma.h5", "sigma_lorentz_oneshot.h5"]},
     # The null test: matrices against the twin, the transverse direct field
     # exactly zero.  (bispinor file member, two-component file member).
     "bisp_bt_null": {"twin": ("bbtn_sigma.h5", "btw_sigma.h5", (

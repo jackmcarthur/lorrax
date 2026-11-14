@@ -2058,3 +2058,46 @@ def write_results(
     if results.tensors_filename:
         log.debug(f"  Restart:      {results.tensors_filename}")
     log.debug("")
+
+
+def write_oneshot_sigma_lorentz(config, input_dir, sigma_result, sym, band_slices,
+                                print_fn):
+    """Write a bispinor one-shot's sector matrices (``sigma_lorentz_debug_output``).
+
+    The SC maps' file format (``file_io.sigma_output.write_sc_sigma_lorentz_h5``):
+    ``sigma_lorentz_skij_ev`` ``(3, nk, nb, nb)`` complex eV, sectors CC,
+    CT+TC, TT, on the full BZ (``kpoints_crys`` = ``sym.unfolded_kpts``), in the
+    DFT basis, so ``U_dft_to_qp_kij`` is the identity, ``call_index`` 0 and
+    ``role`` ``one_shot``.  On ``bispinor_gw = bare_transverse`` the TT sector
+    is Sigma^B itself.  Collective (the gather; every rank calls it), rank 0
+    writes.  Off the key, on a two-component run, or on a route that forms no
+    sector matrices, nothing is written.
+
+    Returns
+    -------
+    str or None
+        The path written, ``<input_dir>/sigma_lorentz_oneshot.h5``.
+    """
+    if not (config.bispinor and config.debug.sigma_lorentz_debug_output):
+        return None
+    parts_ry = sigma_result.sigma_lorentz_skij_ry
+    if parts_ry is None:
+        print_fn("  sigma_lorentz_debug_output: this route forms no sector "
+                 "matrices; nothing written")
+        return None
+    if sigma_result.kset != SIGMA_KSET_FULL_BZ:
+        raise ValueError(
+            "GATE oneshot_sigma_lorentz_kset: a one-shot's sector matrices "
+            f"are on the full BZ; got kset {sigma_result.kset!r}")
+    from common.collectives import gather_to_host
+    from file_io.sigma_output import write_sc_sigma_lorentz_h5
+    parts = np.asarray(gather_to_host(parts_ry)) * RYD_TO_EV
+    nk, nb = int(parts.shape[1]), int(parts.shape[-1])
+    rotation = np.broadcast_to(np.eye(nb, dtype=np.complex128), (nk, nb, nb))
+    path = os.path.join(input_dir, "sigma_lorentz_oneshot.h5")
+    write_sc_sigma_lorentz_h5(
+        path, parts, rotation, np.asarray(sym.unfolded_kpts), call_index=0,
+        role="one_shot", kset=sigma_result.kset,
+        band_start_1based=int(band_slices.b0) + 1)
+    print_fn(f"  Lorentz sector matrices: {path} (CC, CT+TC, TT; DFT basis, eV)")
+    return path

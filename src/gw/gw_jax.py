@@ -150,6 +150,7 @@ from .gw_output import (
 	print_system_summary,
 	write_freq_debug,
 	write_qp_wfn_oneshot,
+	write_oneshot_sigma_lorentz,
 	write_qsgw_qp_ladders,
 	write_results,
 )
@@ -1539,8 +1540,16 @@ def _assemble_gw_results(
 def _write_gw_results(
         _t_out, config, e_eval_ev, final_static_head_terms, grid_debug, head_at_dft_ry,
         input_dir, meta, omega_dft_rel_ev, print0, qp_solver,
-        results, rotations_written, sym, wfn):
-    """Write the QP and diagnostic results on the reporting rank."""
+        results, rotations_written, sym, wfn, *, sigma_result, band_slices,
+        one_shot):
+    """Write the QP and diagnostic results on the reporting rank.
+
+    A bispinor one-shot also writes its sector matrices under
+    ``sigma_lorentz_debug_output`` (collective, before the rank-0 block).
+    """
+    if one_shot:
+        write_oneshot_sigma_lorentz(
+            config, input_dir, sigma_result, sym, band_slices, print0)
     if meta.rank == 0:
         write_freq_debug(
             results, config=config,
@@ -1918,7 +1927,8 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 		_write_gw_results(
 		    _t_out, config, e_eval_ev, final_static_head_terms, grid_debug, head_at_dft_ry, input_dir,
 		    meta, omega_dft_rel_ev, print0, qp_solver, results,
-		    rotations_written, sym, wfn)
+		    rotations_written, sym, wfn, sigma_result=sigma_result,
+		    band_slices=band_slices, one_shot=sc_result is None)
 	(_wall) = _close_timing(_pre_main, _t_main, meta, print0)
 	_report_final_observables(
 	    E_full, band_slices, config, enk_dft, head_sigma_split_skn_ry,
