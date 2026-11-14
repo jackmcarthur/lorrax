@@ -1639,7 +1639,11 @@ def convective_field(setup: VNLSetup):
     per call; three labels cost three passes (the price of one carrier per
     channel in stage A).
     """
+    from common.bispinor_diag import convective_field_scale
     E = setup.E_super
+    # A validation instrument (1 unless LORRAX_DIAG_CONVECTIVE_FIELD_SCALE is
+    # set; stamped as bispinor_diag): 0 makes convective_a the raw lift.
+    scale = convective_field_scale()
 
     def field(psi_2, gvecs, kvecs, ngk, label):
         a = int(label)
@@ -1654,7 +1658,8 @@ def convective_field(setup: VNLSetup):
                                dtype=jnp.float64)
             rows.append(convective_velocity_field(
                 psi_2[i], kd.Z * mask[None, :], kd.dZ * mask[None, None, :], E)[a - 1])
-        return jnp.stack(rows)
+        out = jnp.stack(rows)
+        return out if scale == 1.0 else out * scale
     return field
 
 

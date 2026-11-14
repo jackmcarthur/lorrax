@@ -2161,6 +2161,11 @@ class WfnLoader:
         self._current_vertex_field = field
         self._current_vertex_identity = str(identity)
 
+    @property
+    def current_vertex_identity(self) -> str | None:
+        """The attached current-vertex field's identity, ``None`` without one."""
+        return self._current_vertex_identity
+
     def _add_convective_increment(self, psi_2, lifted, *, k, label, sharding):
         """``lifted`` (the raw lift of ``psi_2``) plus channel ``label``'s increment.
 

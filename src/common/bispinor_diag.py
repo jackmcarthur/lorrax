@@ -83,10 +83,43 @@ def refuse_retired_switches() -> None:
             "  doc:  docs/input_reference.md, bispinor_transverse_hartree.")
 
 
+def convective_field_scale() -> float:
+    """``LORRAX_DIAG_CONVECTIVE_FIELD_SCALE``: a finite float >= 0, 1.0 unset.
+
+    Multiplies the convective vertex's field i[V_NL, r_a] psi
+    (``psp.vnl_ops.convective_field``) and nothing else: 0 makes every
+    ``convective_a`` carrier the raw lift itself, so a convective run must
+    then reproduce the kinetic run on the same (Cartesian, trivial-view)
+    route to round-off -- the wiring identity of the three per-channel
+    fits, exchange classes and Hartree passes.  Read when the field is built.
+    """
+    raw = os.environ.get("LORRAX_DIAG_CONVECTIVE_FIELD_SCALE", "")
+    text = str(raw).strip()
+    if not text:
+        return 1.0
+    try:
+        scale = float(text)
+    except ValueError:
+        scale = math.nan
+    if not (math.isfinite(scale) and scale >= 0.0):
+        raise ValueError(
+            f"LORRAX_DIAG_CONVECTIVE_FIELD_SCALE={raw!r}; expected a finite "
+            "number >= 0 (unset = 1)")
+    if scale != 1.0:
+        _announce("LORRAX_DIAG_CONVECTIVE_FIELD_SCALE", repr(scale))
+    return scale
+
+
 def active_switches() -> str | None:
-    """One line naming the set switch, or ``None`` when it is inert."""
+    """One line naming the set switches, or ``None`` when they are inert."""
+    parts = []
     scale = alpha_fs_scale()
-    return None if scale == 1.0 else f"LORRAX_DIAG_ALPHA_FS_SCALE={scale!r}"
+    if scale != 1.0:
+        parts.append(f"LORRAX_DIAG_ALPHA_FS_SCALE={scale!r}")
+    field = convective_field_scale()
+    if field != 1.0:
+        parts.append(f"LORRAX_DIAG_CONVECTIVE_FIELD_SCALE={field!r}")
+    return "; ".join(parts) or None
 
 
 def refuse_on_two_component(*, bispinor: bool) -> None:

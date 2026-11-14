@@ -66,6 +66,26 @@ class FourCurrentRepresentation:
     charge_representation: str
 
 
+def current_lifts(representation: FourCurrentRepresentation, loader=None) -> tuple:
+    """The carrier of each Cartesian current channel ``(lift_1, lift_2, lift_3)``.
+
+    The kinetic vertex (every default run): ``(current_lift,) * 3``, one
+    carrier for all three channels, exactly as before.  The convective vertex
+    (``bispinor_current_vertex = convective``): ``convective_1..3``, one
+    carrier per channel, which the loader serves only when a current-vertex
+    field is attached (``WfnLoader.attach_current_vertex_field``; the GW
+    driver attaches it on that key alone).  The attached field is therefore
+    the one switch every current consumer reads: the zeta fit, the
+    transverse exchange families and the transverse Hartree passes.
+    """
+    from common.bispinor_init import CONVECTIVE_LIFTS
+    if not representation.current_bispinor:
+        return (None, None, None)
+    if loader is not None and getattr(loader, "current_vertex_identity", None):
+        return tuple(sorted(CONVECTIVE_LIFTS, key=CONVECTIVE_LIFTS.get))
+    return (representation.current_lift,) * 3
+
+
 def resolve_four_current_representation(
     bispinor: bool,
     model,

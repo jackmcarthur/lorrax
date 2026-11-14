@@ -33,7 +33,7 @@ from common import jax_profile
 # being attribute-reachable off a bare ``import jax`` (an import-order
 # accident).  (audit fix/zq 2026-07-28)
 from common.collectives import barrier
-from common.four_current_model import resolve_four_current_representation
+from common.four_current_model import current_lifts, resolve_four_current_representation
 from runtime import debug_print_enabled
 from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
 
@@ -782,13 +782,15 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 
 def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
                          band_slices, band_chunk_size, k_chunk_size=None,
-                         faces=None, plan=None):
+                         faces=None, plan=None, lift=None):
 	"""Sample the current family's packed basis using the same raw-parent loader as charge.
 
 	``faces`` = ``(psi_y, psi_x)`` from the fit's one ψ(G) read
 	(``common.psi_G_store.load_parent_psi_G``); without them (every current
 	ζ reused) the faces are sampled here.  ``plan`` is the family's typed
-	parent transport when the fit planner already built it.
+	parent transport when the fit planner already built it.  ``lift``
+	names the carrier (default the current lift; ``convective_a`` for channel
+	a of the convective vertex, :func:`_transverse_wfn_data_by_label`).
 	"""
 	from common.wfn_transforms import load_centroids_band_chunked, get_enk_bandrange
 	from .wavefunction_bundle import (parent_faces, wavefunctions_face_from_restart,
@@ -805,7 +807,8 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 			psi_y, psi_x = load_centroids_band_chunked(
 				wfn, sym, meta_T, cent_T_idx, True, mesh_xy,
 				band_range=band_slices.full_range, band_chunk_size=int(band_chunk_size),
-				k_chunk_size=k_chunk_size, bispinor_lift=representation.current_lift,
+				k_chunk_size=k_chunk_size,
+				bispinor_lift=(lift or representation.current_lift),
 				k_domain=sym.parent_k_domain)
 	nmu, mun = parent_faces(psi_y, psi_x, mesh_xy=mesh_xy,
 	                         layout="face")
@@ -818,6 +821,29 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 	carrier = build_packed_parent_green_carrier(
 		wfns, nmu, mun, plan=plan, mesh_xy=mesh_xy)
 	return dict(meta=meta_T, centroid_indices=cent_T_idx, green_parent=carrier)
+
+
+def _transverse_wfn_data_by_label(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
+                                  band_slices, band_chunk_size, lifts, *,
+                                  k_chunk_size=None, faces_by_label=None, plan=None):
+	"""The convective vertex's three current families, one per Cartesian channel.
+
+	Channel a's faces are sampled on its own carrier ``lifts[a-1]``
+	(``convective_a``), all on ONE parent plan, so the exchange's
+	class kernels pair any two of them (``gw.photon_sigma``).  Returns the
+	:func:`_transverse_wfn_data` dict of channel 1 with
+	``green_parent_by_label = {1: ..., 2: ..., 3: ...}``.
+	"""
+	by_label, first = {}, None
+	for a in (1, 2, 3):
+		data = _transverse_wfn_data(
+			wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy, band_slices,
+			band_chunk_size, k_chunk_size=k_chunk_size,
+			faces=(faces_by_label or {}).get(a), plan=plan, lift=lifts[a - 1])
+		plan = data['green_parent'].plan
+		by_label[a] = data['green_parent']
+		first = first or data
+	return dict(first, green_parent_by_label=by_label)
 
 
 def resolve_zeta_fit_edge(band_slices, zeta_nband):
@@ -1497,6 +1523,14 @@ def _resolve_zeta_fit_contract(
 		# here and carried on meta.
 		from symmetry_maps import select_current_basis
 		_basis_name, meta.current_basis_rows = select_current_basis(wfn.symmetry())
+		if getattr(wfn, "current_vertex_identity", None):
+			# The convective vertex has one carrier per CARTESIAN channel, so
+			# every fit term must be (a, a) (common.gamma_matrices.
+			# current_fit_terms with rows None).  It runs on the trivial view
+			# only (gw_jax GATE bispinor_current_vertex_view), where every
+			# basis is covariant; the physical group's choice is overridden.
+			_basis_name, meta.current_basis_rows = (
+				"cartesian (convective current vertex, trivial view)", None)
 		log.debug(f"  current fit basis: {_basis_name} (the physical group's current "
 		         f"action is monomial in it; symmetry_maps.select_current_basis)")
 		from common.centroid_basis import PackedCentroidBasis
@@ -1546,7 +1580,7 @@ def _resolve_zeta_fit_contract(
 			zeta_vcoul_cutoff=zeta_vcoul_cutoff,
 			write_ibz_only=write_ibz_only_transverse,
 			band_norms=band_norms, carrier_bispinor=True,
-			carrier_lift=representation.current_lift,
+			carrier_lift=current_lifts(representation, wfn)[mu_L - 1],
 			vertex_mu_L=mu_L, transverse_identity=transverse_identity)
 		for mu_L in ((1, 2, 3) if cfg.bispinor else ()))
 	q_irr_identity = bool(sym.q_irr_is_full_identity)
@@ -1773,6 +1807,14 @@ def _reuse_zeta_faces(
         f"{int(zeta_contract.meta_transverse.n_rmu)} transverse "
         "centroids for σ^B (the ζ_T fit is skipped, but Σ^B still "
         "needs ψ(r_{μ_T})).")
+    lifts = current_lifts(resolve_four_current_representation(
+        cfg.bispinor, cfg.bispinor_gw), wfn)
+    if len(set(lifts)) > 1:
+        return zeta_h5_path, mem_est, _transverse_wfn_data_by_label(
+            wfn, sym, zeta_contract.meta_transverse,
+            zeta_contract.centroids_transverse, cfg, mesh_xy, band_slices,
+            zeta_contract.loader_band_chunk, lifts,
+            k_chunk_size=zeta_contract.loader_k_chunk)
     return zeta_h5_path, mem_est, _transverse_wfn_data(
         wfn, sym, zeta_contract.meta_transverse,
         zeta_contract.centroids_transverse, cfg, mesh_xy, band_slices,
@@ -1933,6 +1975,13 @@ def _fit_transverse_zeta_channels(
     from gw.isdf_fitting import fit_zeta_to_h5
     log.debug(f"\n  [bispinor] resolving ζ^{{μ_L=1,2,3}} on current-density "
              f"centroids: {cfg.paths.centroids_file_current}")
+    lifts = current_lifts(representation, wfn)
+    if len(set(lifts)) > 1:
+        return _fit_transverse_zeta_by_label(
+            _band_norms, _cent_T_idx, _chunks_T, _meta_T, _provenance_T,
+            _reuse_T, _write_ibz_only_transverse, _zeta_T_paths, _zeta_cutoff,
+            band_range_left, band_range_right, band_slices, cfg, mesh_xy,
+            print_fn, lifts, sym, wfn, zeta_contract)
     missing = [mu for mu in (1, 2, 3) if not _reuse_T[mu - 1]]
     for mu in (1, 2, 3):
         if _reuse_T[mu - 1]:
@@ -1998,6 +2047,115 @@ def _fit_transverse_zeta_channels(
     del parent_psi
     tt_tiles = None
     try:
+        if tt_from_fit:
+            tt_tiles = _bispinor_current_tiles(
+                [zetas[mu] for mu in (1, 2, 3)], cfg=cfg, meta_T=_meta_T,
+                wfn=wfn, sym=sym, centroid_T_idx=_cent_T_idx, mesh_xy=mesh_xy,
+                print_fn=print_fn)
+    finally:
+        for zeta_g in zetas.values():
+            zeta_g.close()
+    for mu in missing:
+        _gate_fresh_zeta_rank_findings(
+            f"the μ_L={mu} transverse ζ fit's rank truncation",
+            transverse=True, print_fn=print_fn)
+        if write_T and jax.process_index() == 0:
+            try:
+                from file_io.isdf_header import stamp_fit_provenance
+                stamp_fit_provenance(_zeta_T_paths[mu], _provenance_T(mu))
+            except Exception as exc:
+                log.info(f"    [zeta provenance] μ_L={mu} not stamped "
+                         f"({exc}); this ζ_T will be refit on the next "
+                         f"run.")
+        barrier(f"zeta_provenance_mu{mu}")
+    return transverse_wfn_data, tt_tiles
+
+
+def _fit_transverse_zeta_by_label(
+        _band_norms, _cent_T_idx, _chunks_T, _meta_T, _provenance_T,
+        _reuse_T, _write_ibz_only_transverse,
+        _zeta_T_paths, _zeta_cutoff, band_range_left, band_range_right, band_slices, cfg,
+        mesh_xy, print_fn, lifts, sym, wfn, zeta_contract):
+    """The convective vertex's current fit: channel a on its own carrier, alone.
+
+    The same route-G fit as :func:`_fit_transverse_zeta_channels` (kernels
+    unchanged), run once per channel: one ψ(G) read on ``convective_a``
+    samples channel a's faces and feeds its μ-batch loop, which fits
+    ``zeta_q_mu{a}`` with the Cartesian term (a, a) only
+    (``meta.current_basis_rows`` is None on this vertex).  Three launches
+    instead of one shared loop; the TT tiles are formed from the three live
+    ζ as before.  A mixed-carrier term (the circular basis) would need the
+    route-G kernel to take two ψ(G) operands, which it does not.
+    """
+    from gw.isdf_fitting import fit_zeta_to_h5
+    from common.psi_G_store import load_parent_psi_G
+    if _meta_T.current_basis_rows is not None:
+        raise ValueError(
+            "GATE bispinor_current_vertex_basis: the convective vertex fits "
+            "Cartesian channels only (meta.current_basis_rows must be None)")
+    missing = [mu for mu in (1, 2, 3) if not _reuse_T[mu - 1]]
+    tt_from_fit = len(missing) == 3
+    write_T = (bool(getattr(cfg, 'write_restart_tensors', True))
+               or not tt_from_fit)
+    plan = _chunks_T['k_unfold_plan'] if _chunks_T is not None else None
+    by_label, first, zetas = {}, None, {}
+    try:
+        for mu in (1, 2, 3):
+            faces = parent_psi = None
+            if mu in missing:
+                with timing.section("gw_jax.load_centroid_wfns_current"):
+                    _psi = load_parent_psi_G(
+                        wfn=wfn, mesh_xy=mesh_xy, meta=_meta_T,
+                        band_range=band_slices.full_range,
+                        band_chunk=int(_chunks_T['mubatch'].band_chunk),
+                        centroid_indices=_cent_T_idx, placement="device", bispinor=True,
+                        store_band_range=zeta_contract.fit_band_range,
+                        bispinor_lift=lifts[mu - 1],
+                        k_domain=sym.parent_k_domain, print_fn=print_fn)
+                faces = _psi.faces
+                parent_psi = _psi._replace(faces=None)
+                wfn.release_read_staging()
+                del _psi
+            else:
+                log.info(f"  [zeta reuse] μ_L={mu} accepted at "
+                         f"{_zeta_T_paths[mu]}; fit skipped independently.")
+            data = _transverse_wfn_data(
+                wfn, sym, _meta_T, _cent_T_idx, cfg, mesh_xy, band_slices,
+                (_chunks_T['band_chunk'] if _chunks_T is not None
+                 else zeta_contract.loader_band_chunk),
+                k_chunk_size=(_chunks_T['centroid_k_chunk'] if _chunks_T is not None
+                              else zeta_contract.loader_k_chunk),
+                faces=faces, plan=plan, lift=lifts[mu - 1])
+            del faces
+            parent = data['green_parent']
+            plan = parent.plan
+            by_label[mu] = parent
+            first = first or data
+            if mu not in missing:
+                continue
+            log.debug(f"  [bispinor] μ_L={mu} on carrier {lifts[mu - 1]} → its own route-G loop")
+            with timing.section("gw_jax.zeta_fit_transverse"), \
+                 jax_profile.trace_section("zeta_fit_transverse"):
+                _, fitted = fit_zeta_to_h5(
+                    wfn=wfn, sym=sym, meta=_meta_T, centroid_indices=_cent_T_idx,
+                    mesh_xy=mesh_xy, output_files={mu: _zeta_T_paths[mu]},
+                    k_unfold_plan=parent.plan,
+                    psi_nmu_parent=parent.psi_nmu, psi_mun_parent=parent.psi_mun,
+                    bispinor=True,
+                    band_range_left=band_range_left, band_range_right=band_range_right,
+                    band_norms=_band_norms,
+                    distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
+                    bispinor_lift=lifts[mu - 1],
+                    write_ibz_only=_write_ibz_only_transverse,
+                    zeta_cutoff_ry=_zeta_cutoff,
+                    layout="face",
+                    mubatch_plan=_chunks_T['mubatch'], parent_psi=parent_psi,
+                    write_zeta_file=write_T, current_basis_rows=None,
+                    print_fn=print_fn)
+            del parent_psi
+            zetas[mu] = fitted[mu]
+        transverse_wfn_data = dict(first, green_parent_by_label=by_label)
+        tt_tiles = None
         if tt_from_fit:
             tt_tiles = _bispinor_current_tiles(
                 [zetas[mu] for mu in (1, 2, 3)], cfg=cfg, meta_T=_meta_T,
@@ -2798,7 +2956,7 @@ def _prepare_fitted_zeta(
     			wfn_fingerprint_binding=(
     				basis_wfn_fingerprint_binding),
     			role='transverse', bispinor=True,
-    			bispinor_lift=representation.current_lift,
+    			bispinor_lift=current_lifts(representation, wfn)[0],
     			band_interval=_basis_band_interval,
     			fft_grid=_meta_receipt_T.fft_grid,
     			centroid_fft_idx=(
@@ -2852,7 +3010,8 @@ def _prepare_fresh_carriers(
     			slices=band_slices, mesh_xy=mesh_xy,
     			basis_receipt=transverse_basis_receipt)
     	wfns_transverse = replace(
-    		wfns_transverse, green_parent=parent_T)
+    		wfns_transverse, green_parent=parent_T,
+    		green_parent_by_label=transverse_wfn_data.get('green_parent_by_label'))
     	if transverse_basis_receipt is not None:
     		transverse_basis_receipt.assert_matches_carrier(
     			wfns_transverse, where="fresh current parent faces")

@@ -297,6 +297,10 @@ class Wavefunctions:
     #: Raw-parent faces in the same packed centroid order as every operator.
     #: They are the only stored faces when all consumers support parents.
     green_parent: ParentGreenCarrier | None = None
+    #: The convective current vertex only: channel a's parent faces on its
+    #: own carrier ``convective_a`` (``{1: ..., 2: ..., 3: ...}``, one plan);
+    #: ``green_parent`` is then channel 1's.  ``None`` on every other run.
+    green_parent_by_label: dict | None = None
     #: The canonical face layout is static pytree metadata.
     layout: str = "face"
     def __post_init__(self) -> None:
@@ -323,7 +327,7 @@ class Wavefunctions:
 # treedef, and a compiled carrier round-trip cannot silently discard one.
 jax.tree_util.register_dataclass(
     Wavefunctions,
-    data_fields=['psi_nmu', 'psi_mun', 'green_parent', 'enk', 'occ'],
+    data_fields=['psi_nmu', 'psi_mun', 'green_parent', 'green_parent_by_label', 'enk', 'occ'],
     meta_fields=['slices', 'layout'],
 )
 
