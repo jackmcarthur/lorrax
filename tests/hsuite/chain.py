@@ -74,6 +74,10 @@ ATOL = {
     "sc_sigma_ev": 1.0e-3,
     # ... per point at least this fraction of |Sigma(omega)| (SC_SIGMA_H5 frequency grids).
     "sc_sigma_pole_rel": 1.0e-4,
+    # The null test (bisp_bt_null against bt_twin, same P, same centroids):
+    # every transverse term off must reproduce the two-component matrices
+    # element by element; the physics audit's gate is 0.05 meV.
+    "null_ev": 5.0e-5,
 }
 # The SC stages' sigma h5 files, compared at ATOL["sc_sigma_ev"], and the
 # GN-PPM one: its output window holds the deep occupied bands 1-2 of the
@@ -281,6 +285,33 @@ sigma_omega_h5_file = {prefix}_sigma.h5
 """)
 
 
+# The bare_transverse one-shots (the default bispinor_gw): CC screening on the
+# two-component charge (the Pauli carrier) plus the transverse direct field
+# and the bare transverse exchange Sigma^B, fresh fit, on the bisp_sc window.
+# bisp_bt keeps both terms and is the one-shot reference stage.  bisp_bt_null turns both off and
+# must equal bt_twin, the two-component run of the same deck (the null test).
+def _bt_deck(prefix, body=""):
+    return (_bisp_deck(prefix, """restart = false
+qp_solver = one_shot_dft
+""" + body).replace("bispinor_gw = full_tangential\n",
+                     "bispinor_gw = bare_transverse\n"))
+
+
+BT_NULL_KEYS = """bispinor_transverse_hartree = false
+bispinor_transverse_exchange = false
+"""
+RESTART_DECKS.update({
+    "bisp_bt.in": _bt_deck("bbt"),
+    "bisp_bt_null.in": _bt_deck("bbtn", BT_NULL_KEYS),
+    # The twin: the same deck on the two-component WFN path, its own kin_ion
+    # and dipole (the scalar stages'), its own fresh fit on the same centroids.
+    "bt_twin.in": (_bt_deck("btw")
+                   .replace("bispinor = true\n", "bispinor = false\n")
+                   .replace("centroids_file_current = {centroids}\n", "")
+                   .replace("bispinor_gw = bare_transverse\n", "")
+                   .replace("kin_ion_file = kin_ion_bisp.h5", "kin_ion_file = kin_ion.h5")),
+})
+
 RESTART_DECKS.update({
     "bisp_sc.in": _bisp_deck("bsc", """restart = false
 qp_solver = self_consistent
@@ -473,9 +504,16 @@ STAGES = (
     ("cohsex", "gw.gw_jax", ["-i", "cohsex.in"]),
     ("sp_export", "gw.gw_jax", ["-i", "sp_export.in"]),
     ("kin_ion_bisp", "gw.kin_ion_io", ["-i", "bisp_sc.in", "-o", "kin_ion_bisp.h5"]),
+    # The null test's two-component twin, on the scalar dipole.h5 (written by
+    # the dipole stage; dipole_bisp below rewrites it).
+    ("bt_twin", "gw.gw_jax", ["-i", "bt_twin.in"]),
     # The direct head authenticates the dipole's representation stamp, so
     # the four-component route writes its own (over the scalar one).
     ("dipole_bisp", "psp.get_dipole_mtxels", ["-i", "bisp_sc.in"]),
+    # bare_transverse one-shots: the reference stage, then every transverse
+    # term off, compared with bt_twin (CHECKS "twin") rather than a reference.
+    ("bisp_bt", "gw.gw_jax", ["-i", "bisp_bt.in"]),
+    ("bisp_bt_null", "gw.gw_jax", ["-i", "bisp_bt_null.in"]),
     ("bisp_sc", "gw.gw_jax", ["-i", "bisp_sc.in"]),
     ("bisp_sc3", "gw.gw_jax", ["-i", "bisp_sc3.in"]),
     # BSE after SP-full: the final map's W0 = V + Wc_CC(0) (charge sector
@@ -510,6 +548,17 @@ CHECKS = {
                   "h5": ["spx_sigma.h5", "tmp/mpa/oneshot_w.h5"],
                   "shapes": ["tmp/mpa/oneshot_poles.h5"]},
     "kin_ion_bisp": {"h5": ["kin_ion_bisp.h5"]},
+    # Judged through bisp_bt_null (no stored reference of its own).
+    "bt_twin": {"twin": None},
+    "bisp_bt": {"eqp": ["bbt_eqp0.dat", "bbt_eqp1.dat"],
+                "h5": ["bbt_sigma.h5"]},
+    # The null test: matrices against the twin, the transverse direct field
+    # exactly zero.  (bispinor file member, two-component file member).
+    "bisp_bt_null": {"twin": ("bbtn_sigma.h5", "btw_sigma.h5", (
+        ("hartree_scalar_kij_ev", "hartree_kij_ev"),
+        ("sigma_sx_kij_ev", "sigma_sx_kij_ev"),
+        ("sigma_c_kij_ev", "sigma_c_kij_ev")),
+        ("hartree_transverse_kij_ev",))},
     "dipole_bisp": {"h5": ["dipole.h5"]},
     "bisp_sc": {"eqp": ["bsc_eqp0.dat", "bsc_eqp1.dat"],
                 "h5": ["bsc_sigma.h5"],
@@ -911,6 +960,43 @@ def compare(name, got, ref):
     return problems
 
 
+def twin_problems(run, name, rule):
+    """The null test: this stage's matrices against its two-component twin's.
+
+    ``rule`` is ``(mine.h5, twin.h5, ((member, twin member), ...), zeros)``:
+    each pair must agree element by element within ``ATOL["null_ev"]`` (eV;
+    both runs read one WFN, so the DFT band gauge is the same and the raw
+    matrices compare), and every member in ``zeros`` must be exactly zero.
+    The twin's ``hartree_kij_ev`` is the scalar name of the bispinor run's
+    ``hartree_scalar_kij_ev``.
+    """
+    if rule is None:
+        return []
+    mine_file, twin_file, pairs, zeros = rule
+    mine, twin = _h5_members(run / mine_file), _h5_members(run / twin_file)
+    problems = []
+    for member, twin_member in pairs:
+        a = mine.get(member)
+        b = twin.get(twin_member, twin.get(member))
+        if a is None or b is None:
+            problems.append(f"{name}: {member} missing in "
+                            f"{mine_file if a is None else twin_file}")
+            continue
+        if a.shape != b.shape:
+            problems.append(f"{name}: {member} shape {a.shape} != twin {b.shape}")
+            continue
+        diff = float(np.max(np.abs(a - b))) if a.size else 0.0
+        if not np.isfinite(diff) or diff > ATOL["null_ev"]:
+            problems.append(f"{name}: {member} differs from the two-component "
+                            f"twin by {diff:.3e} eV > {ATOL['null_ev']:.0e}")
+    for member in zeros:
+        value = mine.get(member)
+        if value is not None and np.any(value):
+            problems.append(f"{name}: {member} is not exactly zero "
+                            f"(max {float(np.max(np.abs(value))):.3e})")
+    return problems
+
+
 def _save(name, got):
     np.savez(REFERENCE / f"{name}.npz", **{k.replace("/", "|"): v
                                            for k, v in got.items()})
@@ -988,6 +1074,10 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
             continue
         rule = CHECKS.get(name, {})
         problems += missing_lines(where, name)
+        if "twin" in rule:
+            # Judged against another stage of this run, not a reference.
+            problems += twin_problems(where, name, rule["twin"])
+            continue
         if name == "kmeans":
             found = list(where.glob("centroids_frac_*.txt"))
             pts = np.loadtxt(found[0]) if len(found) == 1 else np.zeros((0, 3))

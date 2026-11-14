@@ -64,13 +64,16 @@ four-component stages retain that coverage and their numerical references.
 | cohsex | `gw.gw_jax` | static COHSEX one-shot, restarted |
 | sp_export | `gw.gw_jax` | tangential one-shot with `write_w`/`write_poles` (the file-model path), restarted; the W bank is compared by value, the pole model by member shapes |
 | kin_ion_bisp | `gw.kin_ion_io` | four-component kinetic-balance kinetic + ionic matrix elements |
+| bt_twin | `gw.gw_jax` | the null test's two-component twin: the `bisp_bt` deck with `bispinor = false` (tangential one-shot, fresh ζ on the same centroids, the scalar `kin_ion.h5` and `dipole.h5`); no reference of its own, judged through `bisp_bt_null` |
 | dipole_bisp | `psp.get_dipole_mtxels` | the four-component dipole the direct head authenticates |
+| bisp_bt | `gw.gw_jax` | `bispinor_gw = bare_transverse` tangential one-shot (the default bispinor route), fresh charge + transverse ζ: CC screening on the two-component (Pauli) charge, the transverse direct field and the bare transverse exchange Σ^B; the one-shot reference stage, so its reference moves with the carrier and with either transverse term |
+| bisp_bt_null | `gw.gw_jax` | the null test: `bisp_bt` with `bispinor_transverse_hartree = false` and `bispinor_transverse_exchange = false`; `hartree_scalar_kij_ev`, `sigma_sx_kij_ev` and `sigma_c_kij_ev` must equal `bt_twin`'s element by element within `chain.ATOL["null_ev"]` = 0.05 meV, and `hartree_transverse_kij_ev` must be exactly zero (`chain.twin_problems`; no stored reference) |
 | bisp_sc | `gw.gw_jax` | `bispinor_gw = full_tangential` through the SC driver, 2 maps: fresh charge + transverse ζ (both on the charge centroid set), ordered CC/CT/TC/TT sector poles, direct four-current Γ head, `sc_head_update = dft_velocity`, live four-current density, the default band extrapolation (on the CC class); map 0 is the one-shot |
 | bse_bisp | `bse.bse_jax` | TDA Davidson after `bisp_sc` on the four-component restart: the final map's W0 = V + W_c,CC(0) (charge sector only) |
 | na_dipole | `psp.get_dipole_mtxels` | the default dipole: q→0 velocity plus the parallel-transport link artifact |
 | na_sc | `gw.gw_jax` | metal tangential QSGW, 2 maps to a 1.5 eV criterion, production defaults: Fermi-Dirac fixed-N occupations and metal head, `number_bands_protected = 8` (QP matrix 1–8, tail 9–13), 2s and 2p read on two coarse windows at η 5 eV, `sc_semicore = dft`, the rigid tail with min(Z, 1/Z) weights, spectral_shell extrapolation, held Σ windows re-planned on escape, `write_qsgw_datasets`, the unnamed `sc_head_update`, which resolves to `parallel_transport` (the 3³ links fail `GATE pt_head_window_hybridized`, so the map runs with the Σ term D_kΔH zeroed) with its per-map head block, distributed linalg |
 
-The default chain has 15 driver stages (60 rank records at P4). Na reads the
+The default chain has 18 driver stages (72 rank records at P4). Na reads the
 fixed kinetic/ionic input; it is not counted as an executed or compared stage.
 Its 56 orbit-closed centroids (fitted on the ζ legs, 8 × 13) are also stored
 in `fixture_na/`.
@@ -120,8 +123,11 @@ Not covered:
   with every multiplet degenerate), but `na_sc` converges at its 1.5 eV
   criterion after map 1, and the two more maps a tighter criterion needs
   would take the suite past its wall budget;
-- the bispinor charge route (`bare_transverse`), `full_static_cohsex`,
-  and the 2-D slab head.
+- `full_static_cohsex` and the 2-D slab head;
+- the linearity of the transverse terms in alpha^2: the scale is an
+  import-time constant (`LORRAX_DIAG_ALPHA_FS_SCALE`), and every stage runs in
+  one process, so it is a separate two-process P4 leg
+  (`tests/test_bispinor_transverse_terms.py` module docstring).
 
 The bispinor stages run last: their fresh ζ fit rewrites the `tmp/` restart
 the scalar restarted steps read.
