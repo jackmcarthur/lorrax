@@ -1622,6 +1622,72 @@ def convective_velocity_field(psi_G, Z, dZ, E_super):
                       optimize=True)
 
 
+def convective_field(setup: VNLSetup):
+    r"""The loader's current-vertex field from one :class:`VNLSetup` (``WfnLoader.attach_current_vertex_field``).
+
+    Returns ``field(psi_2, gvecs, kvecs, ngk, label)``: for each row k,
+    $\sigma^a\,i[V_{\rm NL}, r_a]\,\psi_L$ of channel ``a = label``
+    (:func:`convective_velocity_field`) with the projectors ``Z``, ``dZ``
+    built at that k on the loader's G rows and zeroed on the pad rows
+    (``>= ngk[k]``; the loader's pad sentinel G gives finite projector
+    values there, which would otherwise re-expand into pad slots).
+
+    Parameters of ``field``: ``psi_2 (n_k, nb, 2, ngkmax)`` complex (any
+    band sharding; the projector pass is per band), ``gvecs (n_k, ngkmax, 3)``
+    int, ``kvecs (n_k, 3)`` crystal, ``ngk (n_k,)`` int, ``label`` in 1..3.
+    Returns ``(n_k, nb, 2, ngkmax)`` complex, Ry bohr.  One projector pass
+    per call; three labels cost three passes (the price of one carrier per
+    channel in stage A).
+    """
+    E = setup.E_super
+
+    def field(psi_2, gvecs, kvecs, ngk, label):
+        a = int(label)
+        if a not in (1, 2, 3):
+            raise ValueError(f"convective field label must be 1, 2 or 3; got {label!r}")
+        rows = []
+        for i in range(int(psi_2.shape[0])):
+            kd = _build_vnl_kdata_core(
+                np.asarray(kvecs[i], dtype=float), np.asarray(gvecs[i], dtype=int),
+                setup, compute_dZ=True)
+            mask = jnp.asarray(np.arange(int(gvecs.shape[1])) < int(ngk[i]),
+                               dtype=jnp.float64)
+            rows.append(convective_velocity_field(
+                psi_2[i], kd.Z * mask[None, :], kd.dZ * mask[None, None, :], E)[a - 1])
+        return jnp.stack(rows)
+    return field
+
+
+def build_vnl_setup_from_pseudo_dir(wfn, pseudo_dir: str, *, kin_ion_md5):
+    """The convective vertex's own :class:`VNLSetup`, refused unless it is the Hamiltonian's.
+
+    Loads the UPF files of ``pseudo_dir`` (``psp.pseudos.load_pseudopotentials``),
+    refuses ultrasoft/PAW (``GATE convective_vertex_pseudo_type``) and files
+    other than the ones ``kin_ion.h5`` was built from (``kin_ion_md5``, its
+    ``pseudopotential_md5`` attribute; ``GATE convective_vertex_pseudopotentials``),
+    then builds the setup exactly as ``gw.kin_ion_io`` does
+    (:func:`build_vnl_setup` with the WFN's ``ecutwfc`` and ``nspinor``;
+    j-resolution read from QE's ``<spinorbit>``).
+
+    Returns ``(setup, md5_stamp)``; the stamp is the field's identity for
+    ``WfnLoader.attach_current_vertex_field``.
+    """
+    from psp.pseudos import (load_pseudopotentials, pseudopotential_md5_stamp,
+                             refuse_nonseparable_for_convective,
+                             refuse_pseudopotential_mismatch)
+    pseudos = load_pseudopotentials(str(pseudo_dir))
+    if not pseudos:
+        raise ValueError(
+            "GATE convective_vertex_pseudopotentials: no *.upf in "
+            f"pseudo_dir = {pseudo_dir!r}; the convective vertex needs the "
+            "files of the run's Hamiltonian (docs/input_reference.md, pseudo_dir)")
+    refuse_nonseparable_for_convective(pseudos)
+    refuse_pseudopotential_mismatch(kin_ion_md5, pseudos,
+                                    consumer="convective current vertex")
+    setup = build_vnl_setup(wfn, pseudos=pseudos, nspinor=int(wfn.nspinor))
+    return setup, pseudopotential_md5_stamp(pseudos)
+
+
 @jax.jit
 def vnl_velocity_matrix(psi_G, Z, dZ, E_super):
     """⟨m | ∂V_NL/∂K_cart^α | n⟩ matrix elements at one k.  Returns (3, nb, nb).

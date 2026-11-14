@@ -1410,6 +1410,12 @@ _DEFAULTS = {
     # channel a adds the nonlocal convective current of i[V_NL, r_a]
     # (common.bispinor_init.convective_carrier).  Research branch, stage A.
     "bispinor_current_vertex": "kinetic",
+    # The UPF files the convective vertex builds its own V_NL projectors from
+    # (psp.vnl_ops.build_vnl_setup_from_pseudo_dir); empty = the input
+    # file's directory, as gw.kin_ion_io.  Read only by
+    # bispinor_current_vertex = convective, and refused unless they are the
+    # files kin_ion.h5 was built from.
+    "pseudo_dir": "",
     # DFT+U mean field (QE ortho-atomic): the pw.x input carrying the HUBBARD
     # card, and that run's prefix.save/occup.txt.  Read by psp.hubbard_ops'
     # one resolver, which the dipole/velocity producer and every velocity
@@ -3209,6 +3215,7 @@ def _assemble_input_config(
             params["bispinor_transverse_exchange_skip_bands"]),
         bispinor_semicore_fold=bool(params["bispinor_semicore_fold"]),
         bispinor_current_vertex=str(params["bispinor_current_vertex"]).strip().lower(),
+        pseudo_dir=str(params["pseudo_dir"] or ""),
         hubbard_input=str(params["hubbard_input"] or ""),
         hubbard_occupations=str(params["hubbard_occupations"] or ""),
         do_G0=_resolved_do_g0,
@@ -5388,6 +5395,9 @@ class LorraxConfig:
     #: same name; :func:`refuse_unsupported_bispinor_current_vertex`,
     #: :func:`bispinor_current_vertex_stamp`).
     bispinor_current_vertex: str
+    #: UPF directory of the convective vertex's V_NL (deck-relative, resolved;
+    #: empty = the input file's directory).
+    pseudo_dir: str
     #: DFT+U velocity inputs (deck-relative spellings); resolved at the point
     #: of use by ``psp.hubbard_ops.resolve_hubbard_input``.
     hubbard_input: str
