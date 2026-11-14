@@ -2933,12 +2933,22 @@ def validate_kin_ion_against_run(
 	nk: int | None = None,
 	band_stop: int | None = None,
 	nspinor: int | None = None,
+	pseudos: dict | None = None,
 	print_fn=print,
 ) -> dict:
 	"""Validate pristine kinetic+ionic provenance before its slab is read.
 
-	kin_ion is an operator on psi_L, so no four-current carrier enters it."""
+	kin_ion is an operator on psi_L, so no four-current carrier enters it.
+	``pseudos``: the UPF files a consumer builds its own V_NL projectors
+	from (the convective current vertex); their md5s must equal the file's
+	``pseudopotential_md5``, an absent stamp being a mismatch
+	(:func:`psp.pseudos.refuse_pseudopotential_mismatch`)."""
 	attrs = read_kin_ion_provenance(h5_path)
+	if pseudos is not None:
+		from psp.pseudos import refuse_pseudopotential_mismatch
+		refuse_pseudopotential_mismatch(
+			attrs.get("pseudopotential_md5"), pseudos,
+			consumer="convective current vertex")
 	if bool(attrs.get("has_hartree", False)):
 		raise ValueError(
 			"kin_ion.h5 has has_hartree=True: this retired format folds V_H "

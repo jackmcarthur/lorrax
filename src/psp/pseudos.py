@@ -78,6 +78,81 @@ def load_pseudopotentials(work_dir: str = ".") -> dict:
     return pseudos
 
 
+def pseudopotential_md5_stamp(pseudos: dict) -> str:
+    """``"El=<md5>;..."`` of the UPF files behind ``pseudos``, sorted by element.
+
+    The identity of the V_NL a producer built: ``kin_ion.h5`` stamps it
+    (attribute ``pseudopotential_md5``) and the convective current vertex,
+    which applies i[V_NL, r] from its own projector setup, compares it
+    (:func:`refuse_pseudopotential_mismatch`), because this project swaps
+    files in the one-body Hamiltonian and species names and the spin-orbit
+    verdict do not tell two files apart.  A pseudo without a source file
+    (built in memory) stamps ``El=unknown``, which matches nothing.
+    """
+    import hashlib
+    parts = []
+    for element in sorted(pseudos):
+        path = getattr(pseudos[element], "_source_path", None)
+        if path and os.path.isfile(path):
+            with open(path, "rb") as handle:
+                digest = hashlib.md5(handle.read()).hexdigest()
+        else:
+            digest = "unknown"
+        parts.append(f"{element}={digest}")
+    return ";".join(parts)
+
+
+def refuse_pseudopotential_mismatch(stored, pseudos: dict, *, consumer: str) -> None:
+    """Refuse a V_NL that is not the one the run's ``kin_ion.h5`` was built from.
+
+    ``stored`` is the ``pseudopotential_md5`` attribute of ``kin_ion.h5``
+    (``None`` when the file predates it: a mismatch, regenerate);
+    ``pseudos`` the files the consumer is about to build its projectors
+    from.  ``GATE convective_vertex_pseudopotentials``.
+    """
+    current = pseudopotential_md5_stamp(pseudos)
+    stored_text = None if stored is None else (
+        stored.decode() if isinstance(stored, bytes) else str(stored))
+    if stored_text is not None and stored_text == current and "unknown" not in current:
+        return
+    raise ValueError(
+        "GATE convective_vertex_pseudopotentials: the nonlocal velocity would "
+        "come from other pseudopotential files than the run's Hamiltonian.\n"
+        f"  got:  kin_ion.h5 pseudopotential_md5 = {stored_text or '<absent>'}; "
+        f"{consumer} = {current}\n"
+        "  want: the same files (the same md5 per element)\n"
+        "  why:  the vertex i[V_NL, r] must be the commutator of the V_NL in "
+        "H; a swapped file gives a current that no continuity equation of "
+        "the run satisfies\n"
+        "  fix:  regenerate kin_ion.h5 from the files the vertex reads, or "
+        "point the vertex at the files kin_ion.h5 was made from")
+
+
+def refuse_nonseparable_for_convective(pseudos: dict) -> None:
+    """The convective vertex needs separable norm-conserving files.
+
+    i[V_NL, r] is applied as Z E Y† - Y E Z† from the projectors; an
+    ultrasoft or PAW file carries an overlap S and augmentation charges the
+    vertex does not have.  ``GATE convective_vertex_pseudo_type``.
+    """
+    bad = []
+    for element, pp in sorted(pseudos.items()):
+        header = pp.pp_header
+        kind = str(getattr(header.pseudo_type, "value", header.pseudo_type) or "").upper()
+        flags = [str(getattr(header, name, "") or "").strip().upper()[:1]
+                 for name in ("is_ultrasoft", "is_paw")]
+        if kind not in ("NC", "SL") or "T" in flags:
+            bad.append(f"{element} ({kind or '?'})")
+    if bad:
+        raise ValueError(
+            "GATE convective_vertex_pseudo_type: the convective current vertex "
+            "needs norm-conserving separable pseudopotentials.\n"
+            f"  got:  {', '.join(bad)}\n"
+            "  want: pseudo_type NC (or SL), not ultrasoft or PAW\n"
+            "  why:  i[V_NL, r] is built from the projectors alone; an overlap "
+            "S and augmentation charges have no counterpart in the vertex")
+
+
 # ---------------------------------------------------------------------------
 # Atom ↔ pseudopotential assignment
 # ---------------------------------------------------------------------------

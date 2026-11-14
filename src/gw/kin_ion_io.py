@@ -89,7 +89,8 @@ from gw.gw_config import (
     coerce_bispinor_gw_mode,
     read_lorrax_input as read_cohsex_input,
 )
-from psp.pseudos import load_pseudopotentials, build_atom_pp_assignments
+from psp.pseudos import (load_pseudopotentials, build_atom_pp_assignments,
+                         pseudopotential_md5_stamp)
 from psp.dft_operators import padded_gvectors, vnl_matrix_from_kdata
 from psp.radial.build_projectors_qe import build_local_ionic_potential_on_G_total
 from psp.get_DFT_mtxels import compute_kinetic_k, compute_local_V_k
@@ -246,7 +247,9 @@ def _kin_ion_provenance(*, args, wfn, wfn_path, sym, meta, nb, nk_irr,
     ``nk`` is the LOGICAL full-BZ count every consumer means by nk; ``nrk``
     is the stored star-wedge row count.  ``soc`` and ``soc_provenance``
     record which V_NL projectors were built (``nspinor`` alone does not
-    say).  ``wfn_fingerprint``, ``ngkmax`` and ``generator_commit`` say what
+    say); ``pseudopotential_md5`` which UPF files (element=md5), read by
+    the convective current vertex (:func:`psp.pseudos.refuse_pseudopotential_mismatch`).
+    ``wfn_fingerprint``, ``ngkmax`` and ``generator_commit`` say what
     the file was made from: ``wfn_file`` is a basename and identifies
     nothing.  ``generator_commit`` forks git (~1 s), so only rank 0, whose
     copy is the one SlabIO lands, computes it.
@@ -260,6 +263,7 @@ def _kin_ion_provenance(*, args, wfn, wfn_path, sym, meta, nb, nk_irr,
         "sys_dim": sys_dim,
         "truncation_2d": ctx.truncation_2d,
         "pseudopotentials": str(list(pseudos.keys())),
+        "pseudopotential_md5": pseudopotential_md5_stamp(pseudos),
         "input_file": os.path.basename(args.input),
         "wfn_file": os.path.basename(wfn_path),
         "nval": nval,
