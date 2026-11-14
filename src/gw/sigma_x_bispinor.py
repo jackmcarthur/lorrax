@@ -84,7 +84,8 @@ def compute_sigma_x_bispinor(
         from jax.sharding import NamedSharding, PartitionSpec as P
         if verbose:
             print_fn("  Sigma^B: bispinor_transverse_exchange = false; the bare "
-                     "transverse exchange is not computed (exact zero)")
+                     "transverse exchange is not computed (exact zero); the "
+                     "transverse zeta fit and the TT V tiles are still built")
         return jax.jit(
             lambda: jnp.zeros((int(meta.nk_tot), nb_sigma, nb_sigma),
                               dtype=jnp.complex128),
