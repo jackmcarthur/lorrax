@@ -293,7 +293,19 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
     ``(n_parent, carrier, carrier)`` on the QP window's band carrier.
     ``placed``: the families' node operands from :func:`place_photon_families`
     (placed here when ``None``).
+
+    ``families`` is the pair ``(charge, current)`` (Lorentz label 0 takes
+    the first, 1..3 the second), or a mapping ``{label: family}`` in which
+    each label has its own carrier (the convective current vertex: label a
+    on ``convective_a``).  Keys are grouped by the pair of families at their
+    two endpoints, one class kernel each; for a pair this is the grouping
+    by (charge, current) endpoint, unchanged.
     """
+    if isinstance(families, dict):
+        yield from _contract_lorentz_blocks_by_label(
+            blocks, families=families, term=term, response=response, Gij=Gij,
+            meta=meta, mesh_xy=mesh_xy, admit_kernel=admit_kernel)
+        return
     from .cohsex_sigma import _occ_diag_full
     from .photon_layout import photon_q0_low_rank_block
     from gw.mpa.sector_sigma import sector_node
@@ -341,6 +353,56 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
             head = _photon_head_class_kernel(mesh_xy, meta.nk_tot, left, right)(
                 left.green_parent, right.green_parent, weights, factor, head_blocks, vertices)
         yield keys[0], result, head
+
+
+def _contract_lorentz_blocks_by_label(blocks, *, families, term, response, Gij,
+                                      meta, mesh_xy, admit_kernel=None):
+    r"""The classes of :func:`contract_lorentz_blocks` when each label has its own family.
+
+    Key $(A,B)$ contracts channel A's carrier at the left endpoint (the
+    pair current $\Psi^{(A)\dagger}_m\alpha^A\Psi^{(A)}_l$) with channel B's
+    at the right one, so keys are grouped by ``(family[A], family[B])``,
+    one class kernel per distinct pair (nine for three current carriers).
+    Every family must ride the response's current plan (one centroid basis,
+    one parent transport), which the class tables are built from.  No head
+    diagnostics on this route.
+    """
+    from .cohsex_sigma import _occ_diag_full
+    from gw.mpa.sector_sigma import sector_node
+    if term != _TERM_X:
+        raise ValueError("per-label photon families: the bare exchange term only")
+    plan = response.family_plans[1]
+    for label, family in families.items():
+        if int(label) == 0 or family.green_parent.plan is not plan:
+            raise ValueError(
+                "per-label photon families must be current families on the "
+                f"response's current plan; label {label} is not")
+    ordered = list(dict.fromkeys(families[A] for pair in blocks for A in pair))
+    band_axis, placed = place_photon_families(tuple(ordered), mesh_xy)
+    operands = {id(f): op for f, op in zip(ordered, placed)}
+    classes = {}
+    for A, B in blocks:
+        classes.setdefault((id(families[A]), id(families[B])), []).append((A, B))
+    for keys in classes.values():
+        keys = tuple(keys)
+        left, right = families[keys[0][0]], families[keys[0][1]]
+        slices = left.slices
+        weights = _occ_diag_full(Gij, slices.nb_sigma, slices.nb_full)
+        weights = jax.lax.with_sharding_constraint(
+            jnp.broadcast_to(weights, (meta.nk_tot, slices.nb_full)), NamedSharding(mesh_xy, P()))
+        lefts = tuple(dict.fromkeys(A for A, _ in keys))
+        rights = tuple(dict.fromkeys(B for _, B in keys))
+        tables = _class_w_tables((plan, plan), response.qgrid_policy, lefts, rights, mesh_xy)
+        pair = _class_parents(mesh_xy, response.layout, lefts, rights)(response.V_packed)
+        node = sector_node(left, right, keys, meta, mesh_xy, (tables,), band_axis, static=True)
+        kernel = _photon_class_kernel(node)
+        arguments = (*operands[id(left)][0], *operands[id(right)][1], weights, pair, 1.0,
+                     node.loads())
+        if admit_kernel is not None:
+            admit_kernel(kernel, arguments, keys[0])
+        result = kernel(*arguments)
+        del pair
+        yield keys[0], result, None
 
 
 def place_photon_families(families, mesh_xy):

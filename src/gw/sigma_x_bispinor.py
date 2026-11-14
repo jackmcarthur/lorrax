@@ -106,9 +106,18 @@ def compute_sigma_x_bispinor(
         Gij, meta, wfns_transverse.slices,
         print_fn=print_fn if verbose else None)
     sigma = None
+    # The convective current vertex carries one family per Cartesian label
+    # (gw.gw_init._transverse_wfn_data_by_label); every other run one family.
+    by_label = getattr(wfns_transverse, "green_parent_by_label", None)
+    if by_label:
+        from dataclasses import replace
+        families = {a: replace(wfns_transverse, green_parent=parent, green_parent_by_label=None)
+                    for a, parent in sorted(by_label.items())}
+    else:
+        families = (wfns_transverse, wfns_transverse)
     for key, value, _ in contract_lorentz_blocks(
             [(a,b) for a in (1,2,3) for b in (1,2,3)],
-            families=(wfns_transverse,wfns_transverse), term=_TERM_X,
+            families=families, term=_TERM_X,
             response=response, Gij=Gij, meta=meta, mesh_xy=mesh_xy):
         sigma = value if sigma is None else sigma + value
     sigma = unfold_file_wedge_band_operator(sym, sigma, trs_rule="transpose")
