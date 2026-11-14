@@ -776,12 +776,14 @@ from `qsgw_head.qp_velocity` (§3); the one-shot and the fixed DFT head
 |---|---|---|
 | `off` | the fixed DFT response on the DFT fixed-N Fermi–Dirac state, with its Drude term and Thomas–Fermi slot (`sc_iteration._fixed_dft_head_occupation_state`) | every metal deck |
 | `dft_velocity` | the `dipole.h5` velocity rotated into each map's QP basis, the current μ and tetrahedron weights; the dynamic Drude tensor at $\omega \ne 0$, Thomas–Fermi at $\omega = 0$; `full` folds it through intraband wings and the static Γ body | tangential decks with `head_correction = full` (scalar, `bare_transverse`, `full_tangential`) |
-| `parallel_transport` | the same head on $U^\dagger(v^{\rm DFT} + D_k\Delta H)U$, so the Drude term sees the QP Fermi velocity | tangential scalar decks and `full_tangential`, `head_correction = full` |
+| `parallel_transport` | the same head on $U^\dagger(v^{\rm DFT} + D_k\Delta H)U$, so the Drude term sees the QP Fermi velocity | tangential decks with `head_correction = full` (scalar, `bare_transverse` since 2026-11-14, `full_tangential`) |
 | `interband_commutator` | refused (`GATE sc_head_interband_commutator_insulator_only`) | — |
 
 Any other metal combination refuses (`GATE metal_sc_head_update_disabled`,
 `gw_config.uses_metal_direct_drude_head`): a folded bispinor metal head has no
-derived completion, and the `bare_transverse` head has no link consumer.
+derived completion.  The `bare_transverse` head is the two-spinor dipole and
+links of the Pauli carrier, the scalar object, so it takes `parallel_transport`
+and resolves an unnamed `sc_head_update` as a two-component deck does.
 `full` on an ordered (time-reversal-broken) metal folds like a
 time-reversal-even one ([metal head §5](theory/metal-q0-head.md#5-limits-of-the-model));
 `occ_broadening > 0` next to a metal width refuses

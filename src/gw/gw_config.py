@@ -3251,7 +3251,11 @@ def _apply_input_envelope(
             "not production QSGW)")
     # The QSGW head follows the owner's velocity rule (2026-09-29): an unnamed
     # sc_head_update takes the best head this scalar or four-current deck
-    # can build.
+    # can build.  A bare_transverse bispinor deck resolves exactly as a
+    # two-component one (2026-11-14): its charge head is the two-spinor
+    # dipole and links of the Pauli carrier, the same object (it was `off`
+    # before, which made SC two-component-versus-bispinor differences
+    # include a head-update difference).
     # parallel_transport, v = U^dagger (p + i[r, V_NL] + i[r, DeltaSigma]) U
     # with the Sigma term from this map's DeltaH, where the link artifact
     # exists (zero on a map whose links cannot serve it, owner 2026-09-30);
@@ -3260,6 +3264,7 @@ def _apply_input_envelope(
             and "sc_head_update" not in _named_keys
             and resolved.sc.head_update == "off"
             and (not bool(resolved.bispinor)
+                 or uses_bare_transverse_tangential(resolved)
                  or uses_full_bispinor_tangential(resolved))
             and bool(resolved.do_G0)
             and resolved.sigma.w_model == "tangential"
@@ -4898,7 +4903,9 @@ def uses_metal_direct_drude_head(config) -> bool:
     its own direct sector head from the same QP-rotated dipole velocity
     (``response_bank.compute_photon_bank``).
 
-    ``parallel_transport`` is admitted on scalar and four-current decks:
+    ``parallel_transport`` is admitted on scalar, bare-transverse and
+    four-current decks (bare-transverse since 2026-11-14: its charge head is
+    the two-spinor dipole and links of the Pauli carrier, the scalar object):
     the same head on the QSGW velocity ``U^dagger (v_DFT + D_k DeltaH) U``,
     whose finite-link covariant derivative carries ``i[DeltaH, r]`` at this
     map, so the Drude term sees the QP Fermi velocity.  The four-current
@@ -4910,8 +4917,6 @@ def uses_metal_direct_drude_head(config) -> bool:
         return False
     if config.head.correction is not HeadCorrection.FULL:
         return False
-    if config.sc.head_update == "parallel_transport":
-        return not config.bispinor or uses_full_bispinor_tangential(config)
     return (not config.bispinor or uses_bare_transverse_tangential(config)
             or uses_full_bispinor_tangential(config))
 
@@ -5134,11 +5139,11 @@ def validate_material_inputs(config, material_class):
                 "  got:  a per-map velocity head rebuild (QP velocity, "
                 "tetrahedron Fermi-surface weights, Drude term, Thomas-Fermi "
                 "static head)\n"
-                "  want: sc_head_update = off, or dft_velocity with "
-                "tangential and head_correction = full, or "
-                "parallel_transport on a scalar or "
-                "bispinor_gw = full_tangential deck\n"
-                "  why:  the bare-transverse head has no link consumer\n"
+                "  want: sc_head_update = off, or dft_velocity / "
+                "parallel_transport with tangential and head_correction = "
+                "full on a scalar, bare_transverse or full_tangential deck\n"
+                "  why:  the per-map metal head is built only on the "
+                "tangential direct Drude route\n"
                 "  doc:  docs/self_consistency.md, 'Metals: direct Drude head'")
         if width_ry is None:
             raise ValueError(
