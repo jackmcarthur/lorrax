@@ -542,6 +542,7 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym):
         wfn, sym, hartree_meta,
         truncation_2d=(dft_sys_dim(wfn, fallback=config.sys_dim) == 2),
         transverse_truncation_2d=(int(config.sys_dim) == 2),
+        transverse_hartree=bool(getattr(config, "bispinor_transverse_hartree", True)),
         nb=int(band_slices.b3), mesh=mesh_xy,
         include_transverse=include_transverse,
         return_sharded=True)

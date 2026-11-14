@@ -288,8 +288,17 @@ def _open_production_report(args):
     # sigma_mnk.h5); the restart bundle stamps it on its own.
     from common.four_current_model import PAULI_FOUR_CURRENT_REPRESENTATION
     from common.provenance import set_run_provenance
-    set_run_provenance(four_current_carrier=(
-        PAULI_FOUR_CURRENT_REPRESENTATION if config.bispinor else None))
+    # The transverse terms the deck selected (bispinor_transverse_*) and the
+    # one diagnostic switch (common.bispinor_diag, refused on a
+    # two-component run) are stamped beside the carrier; None drops a field.
+    from common import bispinor_diag
+    from .gw_config import bispinor_transverse_terms_stamp
+    bispinor_diag.refuse_on_two_component(bispinor=bool(config.bispinor))
+    set_run_provenance(
+        four_current_carrier=(
+            PAULI_FOUR_CURRENT_REPRESENTATION if config.bispinor else None),
+        bispinor_transverse_terms=bispinor_transverse_terms_stamp(config),
+        bispinor_diag=bispinor_diag.active_switches())
     input_dir = config.input_dir
     qp_solver = config.qp_solver     # how QP energies are extracted from Σ
     mode = config.compute_mode       # the self-energy ansatz

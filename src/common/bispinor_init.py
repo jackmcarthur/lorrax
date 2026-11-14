@@ -21,13 +21,16 @@ which vertex takes which:
 
 import jax.numpy as jnp
 
+from common.bispinor_diag import alpha_fs_scale as _diag_alpha_fs_scale
 from common.gamma_matrices import paulis
 
 
 # Half the fine-structure constant α (Hartree atomic units).  Single home
 # for the bispinor small-component scale, used by the k-batched
 # ``lift_to_4spinor`` (the WfnLoader production path).
-HALFALPHA = 0.00364867628215
+# LORRAX_DIAG_ALPHA_FS_SCALE (common.bispinor_diag) multiplies it; the factor
+# is exactly 1.0 when the variable is unset, so the value is bit-identical.
+HALFALPHA = 0.00364867628215 * _diag_alpha_fs_scale()
 # The full fine-structure constant is derived here, beside the lift scale,
 # rather than re-spelled by current-vertex consumers.
 ALPHA_FS = 2.0 * HALFALPHA

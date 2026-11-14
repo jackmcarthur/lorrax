@@ -194,6 +194,7 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
                           nb: int, mesh=None,
                           include_transverse: bool = False,
                           transverse_truncation_2d: bool | None = None,
+                          transverse_hartree: bool = True,
                           print_fn=None,
                           return_sharded: bool = False):
     """The exact FFT-grid ⟨mk|V_H|nk⟩ for all k — **(nk, nb, nb) Ry**.
@@ -220,7 +221,9 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
     mixing it with V_loc's is a large systematic error inside a ~500 eV
     cancellation. The beyond-DFT transverse field uses
     ``transverse_truncation_2d`` (the GW boundary); None retains the shared
-    convention for standalone diagnostic callers.
+    convention for standalone diagnostic callers.  ``transverse_hartree``
+    (the deck key ``bispinor_transverse_hartree``) False makes the field an
+    exact zero (``psp.dft_operators.transverse_potential_from_current``).
 
     Carrier (docs/theory/bispinor-gw.md#carrier): on a bispinor ``meta``
     (``nspinor = 4``) ψ is loaded once on the current carrier, the raw
@@ -354,7 +357,8 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
                 jnp.asarray(wfn.bvec, dtype=jnp.float64),
                 float(wfn.blat), bool(truncation_2d if transverse_truncation_2d is None
                                       else transverse_truncation_2d),
-                tt_metric_sign=tt_metric_sign)
+                tt_metric_sign=tt_metric_sign,
+                transverse_hartree=bool(transverse_hartree))
             V_T_r = jnp.asarray(np.asarray(V_T_r, dtype=np.float64),
                                 dtype=jnp.float64)
         del fields, current_np, current_g0

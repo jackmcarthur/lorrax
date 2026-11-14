@@ -164,6 +164,13 @@ def method_rows(config) -> list[tuple[str, str]]:
         rows.append(("bispinor carrier",
                      f"{PAULI_FOUR_CURRENT_REPRESENTATION}: "
                      f"{PAULI_FOUR_CURRENT_SUMMARY}"))
+        from .gw_config import bispinor_transverse_terms_stamp
+        rows.append(("bispinor transverse terms",
+                     bispinor_transverse_terms_stamp(config)))
+        from common.bispinor_diag import active_switches
+        _diag = active_switches()
+        if _diag is not None:
+            rows.append(("bispinor DIAG", _diag + " (not a production run)"))
     if sc:
         dsc = bool(config.density_self_consistent)
         rows.append(("Hartree", "V_H rebuilt from each map's density" if dsc else

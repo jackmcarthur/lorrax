@@ -37,6 +37,7 @@ with the run.
 | var | default | class | grammar and effect |
 |---|---|---|---|
 | `LORRAX_WFN_BACKEND` | unset (auto) | routing-affecting | Stripped, lower-cased: `eager` or `phdf5` forces the WFN read backend (`services/wfn_loader/src/wfn_loader/loader.py::_auto_pick_backend`); `phdf5_host` refuses; any other value takes the auto pick without comment. A mesh-less loader always reads eager. At P>1 with no loadable FFI the auto pick refuses, and `eager` is the way through. |
+| `LORRAX_DIAG_ALPHA_FS_SCALE` | unset (`1`) | routing-affecting (diagnostic) | Finite positive float s; anything else refuses. Multiplies the fine-structure constant at its one home (`common/bispinor_init.py::HALFALPHA`), read at import: the kinetic-balance lift and every current vertex scale with it (J by s, the transverse direct field and Sigma^B by s^2); charge vertices do not contain it. Stores do not record the scale: use `restart = false` and set it for every step of the workflow. A set value is announced, stamped as `bispinor_diag` in every output header and the run report, and refused on a two-component run (`GATE bispinor_diag_switch_route`). Bispinor runs only. Validation only (the linearity test, docs/input_reference.md `bispinor_transverse_hartree`). The transverse terms themselves are deck keys (`bispinor_transverse_*`); their former environment switches are removed. |
 
 ---
 

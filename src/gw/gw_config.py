@@ -1391,6 +1391,20 @@ _DEFAULTS = {
     # Orthogonal four-current screening policy.  The historical
     # charge-screened + bare-transverse exchange path remains the default.
     "bispinor_gw": "bare_transverse",
+    # The transverse (Breit/Gaunt) terms of a bispinor run, one key each
+    # (refuse_unsupported_bispinor_transverse_terms): the transverse direct
+    # field <m|alpha.A[J]|n> and the bare transverse exchange Sigma^B.  Both
+    # off is the two-component run (the null test).
+    "bispinor_transverse_hartree": True,
+    "bispinor_transverse_exchange": True,
+    # Bands [0, N) leave the occupied sum of Sigma^B only (closed same-n
+    # semicore shells); the charge exchange, density and current keep them.
+    "bispinor_transverse_exchange_skip_bands": 0,
+    # Record only: the deck declares that its one-body (pseudopotential /
+    # kin_ion) file carries a frozen semicore fold of the closed shells'
+    # transverse exchange.  Nothing reads it but the stamp, so a run records
+    # its semicore treatment (none / excluded bands / fold).
+    "bispinor_semicore_fold": False,
     # DFT+U mean field (QE ortho-atomic): the pw.x input carrying the HUBBARD
     # card, and that run's prefix.save/occup.txt.  Read by psp.hubbard_ops'
     # one resolver, which the dipole/velocity producer and every velocity
@@ -3184,6 +3198,11 @@ def _assemble_input_config(
         do_screened=bool(params["do_screened"]),
         bispinor=bool(params["bispinor"]),
         bispinor_gw=coerce_bispinor_gw_mode(params["bispinor_gw"]),
+        bispinor_transverse_hartree=bool(params["bispinor_transverse_hartree"]),
+        bispinor_transverse_exchange=bool(params["bispinor_transverse_exchange"]),
+        bispinor_transverse_exchange_skip_bands=int(
+            params["bispinor_transverse_exchange_skip_bands"]),
+        bispinor_semicore_fold=bool(params["bispinor_semicore_fold"]),
         hubbard_input=str(params["hubbard_input"] or ""),
         hubbard_occupations=str(params["hubbard_occupations"] or ""),
         do_G0=_resolved_do_g0,
@@ -3284,6 +3303,7 @@ def _apply_input_envelope(
     refuse_unsupported_screening_source(resolved)
     refuse_unsupported_head_dense(resolved)
     refuse_unsupported_bispinor_gw(resolved)
+    refuse_unsupported_bispinor_transverse_terms(resolved)
     warn_headless_tangential_self_consistency(resolved, print_fn=print_fn)
     announce_legacy_sigma_axis_keys(
         _named_keys, resolved.compute_mode, resolved.qp_solver,
@@ -4257,6 +4277,103 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "  doc:  docs/input_reference.md, bispinor_gw.")
 
 
+#: The deck keys of the transverse terms (``bispinor_transverse_*``).
+BISPINOR_TRANSVERSE_KEYS = (
+    "bispinor_transverse_hartree",
+    "bispinor_transverse_exchange",
+    "bispinor_transverse_exchange_skip_bands",
+    "bispinor_semicore_fold",
+)
+
+
+def bispinor_semicore_treatment(config) -> str:
+    """How this run treats the closed semicore shells in the transverse exchange.
+
+    ``none``, ``excluded_bands:N`` (global bands [0, N) out of Sigma^B's
+    occupied sum), ``fold`` (the deck declares a semicore fold in its
+    one-body file), or both joined by ``+``.  Later treatments (named shells,
+    a nonlocal-velocity vertex) add their own token here, beside
+    ``gw.sigma_x_bispinor.transverse_exchange_occupations``.
+    """
+    parts = []
+    skip = int(config.bispinor_transverse_exchange_skip_bands)
+    if skip:
+        parts.append(f"excluded_bands:{skip}")
+    if bool(config.bispinor_semicore_fold):
+        parts.append("fold")
+    return "+".join(parts) or "none"
+
+
+def bispinor_transverse_terms_stamp(config) -> str | None:
+    """The transverse terms this run computes, as one stamp line.
+
+    ``None`` on a two-component run.  On a bispinor run the line is written
+    whatever the deck named: run provenance ``bispinor_transverse_terms``
+    (every text output header and a ``sigma_mnk.h5`` attribute), the SC
+    checkpoint identity and the run report, so every output records which
+    transverse terms and which semicore treatment produced it, e.g.
+    ``hartree=on; exchange=on; semicore=excluded_bands:8``.
+    """
+    if not bool(getattr(config, "bispinor", False)):
+        return None
+    on = lambda flag: "on" if bool(flag) else "off"
+    return (f"hartree={on(config.bispinor_transverse_hartree)}; "
+            f"exchange={on(config.bispinor_transverse_exchange)}; "
+            f"semicore={bispinor_semicore_treatment(config)}")
+
+
+def refuse_unsupported_bispinor_transverse_terms(config) -> None:
+    """Refuse a ``bispinor_transverse_*`` key where it cannot act.
+
+    The direct-field key acts in
+    ``psp.dft_operators.transverse_potential_from_current``, the one producer
+    of <m|alpha.A[J]|n> for the one-shot and the SC rebuild, so it needs
+    ``bispinor = true`` only.  The two exchange keys act in
+    ``gw.sigma_x_bispinor`` only: on ``bispinor_gw = full_tangential`` and
+    on the packed photon routes the transverse exchange is another object,
+    and a run stamped ``exchange=off`` there would still carry it.  The
+    upper bound of the band count (below the occupied count, on a gap) is
+    checked where the bands exist (:func:`gw.gw_init.transverse_exchange_skip_bands`).
+    """
+    named = frozenset(getattr(config, "raw_input_keys", ()) or ())
+    given = [k for k in BISPINOR_TRANSVERSE_KEYS if k in named]
+    if given and not bool(config.bispinor):
+        raise ValueError(
+            "GATE bispinor_transverse_terms_route: a transverse-term key is "
+            "set on a two-component run.\n"
+            f"  got:  {', '.join(given)}, bispinor = false\n"
+            "  want: bispinor = true, or the keys left out\n"
+            "  why:  a two-component run has no transverse terms to switch\n"
+            "  doc:  docs/input_reference.md, bispinor_transverse_hartree.")
+    skip = int(config.bispinor_transverse_exchange_skip_bands)
+    if skip < 0:
+        raise ValueError(
+            "GATE bispinor_transverse_exchange_skip_bands: a band count.\n"
+            f"  got:  bispinor_transverse_exchange_skip_bands = {skip}\n"
+            "  want: an integer >= 0 (0 keeps every occupied band)\n"
+            "  why:  it counts bands from the bottom of the Sigma window")
+    exchange_changed = (not bool(config.bispinor_transverse_exchange)) or skip > 0
+    if not (exchange_changed and bool(config.bispinor)):
+        return
+    mode = coerce_bispinor_gw_mode(config.bispinor_gw)
+    packed = uses_static_photon_response(config)
+    if mode is not BispinorGWMode.BARE_TRANSVERSE or packed:
+        raise ValueError(
+            "GATE bispinor_transverse_exchange_route: a transverse-exchange "
+            "key is set on a route whose transverse exchange it does not "
+            "reach.\n"
+            "  got:  bispinor_transverse_exchange = "
+            f"{str(bool(config.bispinor_transverse_exchange)).lower()}, "
+            f"bispinor_transverse_exchange_skip_bands = {skip}; "
+            f"bispinor_gw = {mode.value}, packed photon route = {bool(packed)}\n"
+            "  want: bispinor_gw = bare_transverse off the packed photon "
+            "route (compute_mode = tangential, x_only, or a bulk "
+            "plasmon-pole run)\n"
+            "  why:  only gw.sigma_x_bispinor reads the keys; elsewhere the "
+            "run would be labelled without the term and still carry it\n"
+            "  doc:  docs/input_reference.md, bispinor_transverse_exchange.")
+
+
 def refuse_explicit_gij(Gij) -> None:
     """Require diagonal occupation data for the parent Green contraction."""
     if Gij is None:
@@ -5156,6 +5273,16 @@ class LorraxConfig:
     do_screened: bool
     bispinor: bool
     bispinor_gw: BispinorGWMode
+    #: The transverse terms of a bispinor run (the deck keys of the same
+    #: names; :func:`refuse_unsupported_bispinor_transverse_terms`,
+    #: :func:`bispinor_transverse_terms_stamp`): the direct field
+    #: <m|alpha.A[J]|n>, the bare transverse exchange Sigma^B, and the count
+    #: of lowest bands left out of Sigma^B's occupied sum; and the record-only
+    #: declaration that the one-body file carries a semicore fold.
+    bispinor_transverse_hartree: bool
+    bispinor_transverse_exchange: bool
+    bispinor_transverse_exchange_skip_bands: int
+    bispinor_semicore_fold: bool
     #: DFT+U velocity inputs (deck-relative spellings); resolved at the point
     #: of use by ``psp.hubbard_ops.resolve_hubbard_input``.
     hubbard_input: str

@@ -173,9 +173,35 @@ def poisson_potential_from_rhoG(
     return jnp.real(local_ifftn3(V_G, axes=(-3, -2, -1), norm='ortho'))
 
 
+def transverse_potential_from_current(
+    current_r: jnp.ndarray,
+    bdot: jnp.ndarray,
+    bvec: jnp.ndarray,
+    blat: float,
+    truncation_2d: bool,
+    *,
+    tt_metric_sign: float,
+    transverse_hartree: bool,
+) -> jnp.ndarray:
+    """The transverse direct field (:func:`_transverse_potential_from_current`).
+
+    The one producer of ``A[J]`` for the one-shot (``gw.hartree``) and the SC
+    rebuild (``gw.sc_iteration``), so the deck key
+    ``bispinor_transverse_hartree`` acts here and nowhere else: True returns
+    the compiled function's result; False returns an exact zero field of the
+    same shape ``(3, nx, ny, nz)``, dtype and placement without solving, so
+    ``<m|alpha.A|n>`` is zero in every consumer.
+    """
+    if not bool(transverse_hartree):
+        return jnp.zeros(jnp.shape(current_r), dtype=jnp.float64)
+    return _transverse_potential_from_current(
+        current_r, bdot, bvec, blat, truncation_2d,
+        tt_metric_sign=tt_metric_sign)
+
+
 @functools.partial(jax.jit,
                    static_argnames=("blat", "truncation_2d", "tt_metric_sign"))
-def transverse_potential_from_current(
+def _transverse_potential_from_current(
     current_r: jnp.ndarray,
     bdot: jnp.ndarray,
     bvec: jnp.ndarray,

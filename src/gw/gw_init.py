@@ -3527,6 +3527,51 @@ def coarse_class_for_deck(config, wfn, print0):
     return coarse
 
 
+def transverse_exchange_skip_bands(config, wfn, print0):
+    """The deck's ``bispinor_transverse_exchange_skip_bands``, checked on the DFT ladder.
+
+    The count N removes global bands [0, N) from the occupied sum of the
+    bare transverse exchange Sigma^B (``gw.sigma_x_bispinor``): the closed
+    same-n semicore shells whose pseudo-orbitals give a spurious 3d-semicore
+    transverse exchange (BISPINOR_PHYSICS_AUDIT repair 2).  N must count
+    occupied bands only and end on a gap of at least ``SEMICORE_GAP_EV``
+    (the code's semicore separation, ``gw.band_partition``) at every stored
+    k: a count inside a manifold would cut a shell and make Sigma^B depend
+    on the gauge of the multiplet.
+
+    Returns
+    -------
+    int
+        N, 0 when the key is not set.  The one value
+        ``meta.transverse_exchange_skip_bands`` carries.
+    """
+    from common.units import RYD_TO_EV
+    from .band_partition import SEMICORE_GAP_EV
+    n_skip = int(config.bispinor_transverse_exchange_skip_bands)
+    if n_skip == 0:
+        return 0
+    n_occ = int(wfn.nelec)
+    e = np.asarray(wfn.energies[0], dtype=np.float64) * RYD_TO_EV   # (nk, nb) eV
+    gap = (float(e[:, n_skip].min() - e[:, n_skip - 1].max())
+           if n_skip < n_occ else float("nan"))
+    if not (n_skip < n_occ and gap >= SEMICORE_GAP_EV):
+        raise ValueError(
+            "GATE bispinor_transverse_exchange_skip_bands: the excluded bands "
+            "are not a closed manifold below the valence.\n"
+            f"  got:  bispinor_transverse_exchange_skip_bands = {n_skip}; "
+            f"occupied bands {n_occ}; gap above band {n_skip} = {gap:.3f} eV\n"
+            f"  want: N < {n_occ} with a gap >= {SEMICORE_GAP_EV:g} eV between "
+            "bands N and N+1 at every k (whole semicore shells)\n"
+            "  why:  a count inside a manifold cuts a shell, and Sigma^B then "
+            "depends on the gauge of the multiplet\n"
+            "  fix:  count the semicore shells from the bottom (2(2l+1) bands "
+            "per shell and atom)")
+    print0(f"  bispinor transverse exchange: bands 1-{n_skip} leave the "
+           f"occupied sum of Sigma^B (gap above them {gap:.2f} eV); charge "
+           "exchange, density and current keep them")
+    return n_skip
+
+
 def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn):
     """Produce the physical and padded band windows on the packed centroid basis."""
     from common import Meta
@@ -3555,6 +3600,10 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
     meta.sys_dim = config.sys_dim
     meta.coarse_class = coarse
     meta.bispinor = charge_bispinor
+    if bool(config.bispinor):
+        meta.transverse_exchange = bool(config.bispinor_transverse_exchange)
+        meta.transverse_exchange_skip_bands = transverse_exchange_skip_bands(
+            config, wfn, print0)
     band_slices = BandSlices.from_band_edges(
         *meta.band_edges, b4_chi=meta.b_id_4_chi,
         b4_sigma=meta.b_id_4_sigma, b4_logical=meta.b_id_4_user)

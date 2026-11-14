@@ -2112,7 +2112,9 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
                 jnp.asarray(inputs.wfn.bvec, dtype=jnp.float64),
                 float(inputs.wfn.blat),
                 bool(getattr(inputs.config, "sys_dim", 3) == 2),
-                tt_metric_sign=float(COULOMB_GAUGE_TT_SIGN))
+                tt_metric_sign=float(COULOMB_GAUGE_TT_SIGN),
+                transverse_hartree=bool(getattr(
+                    inputs.config, "bispinor_transverse_hartree", True)))
 
     gtab = padded_gvectors(inputs.wfn, k=inputs.sym.parent_k_domain)
     # Both branches sweep the resident sphere itself: the four-current
@@ -5125,6 +5127,11 @@ def _sc_checkpoint_identity(inputs, shape, history_depth):
         from common.four_current_model import resolve_four_current_representation
         identity["carrier"] = resolve_four_current_representation(
             True, inputs.config.bispinor_gw).charge_representation
+        # Nor one mapped with other transverse terms or semicore treatment
+        # (the deck digest misses an unnamed default that later changes).
+        from .gw_config import bispinor_transverse_terms_stamp
+        identity["transverse_terms"] = bispinor_transverse_terms_stamp(
+            inputs.config)
     return identity
 
 

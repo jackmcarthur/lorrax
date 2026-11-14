@@ -64,6 +64,13 @@ class Meta:
     # The dynamic SC run's coarse (semicore) Σ read class
     # (gw.band_partition.CoarseClass), from the DFT ladder by gw_init; None elsewhere.
     coarse_class: object = None
+    # The bare transverse exchange Sigma^B of a bispinor run
+    # (gw.sigma_x_bispinor), from the deck keys bispinor_transverse_exchange
+    # and bispinor_transverse_exchange_skip_bands by gw_init: whether it is
+    # added, and how many of the lowest Sigma-window bands (global [0, N))
+    # leave its occupied sum.  The defaults are the full term.
+    transverse_exchange: bool = True
+    transverse_exchange_skip_bands: int = 0
 
     @property
     def mu_solve_extent(self) -> int:
