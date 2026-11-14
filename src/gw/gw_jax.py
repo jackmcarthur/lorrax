@@ -1544,12 +1544,10 @@ def _write_gw_results(
         one_shot):
     """Write the QP and diagnostic results on the reporting rank.
 
-    A bispinor one-shot also writes its sector matrices under
-    ``sigma_lorentz_debug_output`` (collective, before the rank-0 block).
+    A bispinor one-shot then writes its sector matrices under
+    ``sigma_lorentz_debug_output`` (collective, every rank), AFTER the eqp,
+    sigma and QP files: a failing debug writer must not cost the run them.
     """
-    if one_shot:
-        write_oneshot_sigma_lorentz(
-            config, input_dir, sigma_result, sym, band_slices, print0)
     if meta.rank == 0:
         write_freq_debug(
             results, config=config,
@@ -1588,6 +1586,9 @@ def _write_gw_results(
             print_fn=print0,
         )
         timing.record("gw_jax.output", time.perf_counter() - _t_out)
+    if one_shot:
+        write_oneshot_sigma_lorentz(
+            config, input_dir, sigma_result, sym, band_slices, print0)
 
 
 def _record_process_wall(_pre_main, _t_main):

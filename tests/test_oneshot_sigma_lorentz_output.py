@@ -50,3 +50,22 @@ def test_oneshot_writes_sector_matrices_with_identity_rotation(tmp_path):
         assert h5.attrs["role"] == "one_shot" and int(h5.attrs["call_index"]) == 0
         assert list(h5.attrs["sectors"]) == ["CC", "CT+TC", "TT"]
     assert "sigma_lorentz_oneshot.h5" in said[-1]
+
+
+def test_debug_writer_runs_after_the_primary_outputs():
+    """In ``gw_jax._write_gw_results`` the sector writer follows ``write_results``.
+
+    Read from the source (the driver needs the native library to import): a
+    raising debug writer must not cost the run its eqp and sigma files.
+    """
+    import ast
+    from pathlib import Path
+    src = Path(__file__).resolve().parents[1] / "src" / "gw" / "gw_jax.py"
+    tree = ast.parse(src.read_text())
+    fn = next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == "_write_gw_results")
+    calls = [(n.lineno, n.func.id) for n in ast.walk(fn)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id in ("write_results", "write_oneshot_sigma_lorentz")]
+    order = [name for _line, name in sorted(calls)]
+    assert order == ["write_results", "write_oneshot_sigma_lorentz"], order
