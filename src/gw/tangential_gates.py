@@ -191,6 +191,48 @@ def _passivity_response_checks(response, *, eigh, gates):
             "passivity_max": maximum, "passivity_antihermitian_relative": anti}
 
 
+def passivity_refusal(passive, slot, q, *, gates, eta_ev, ordered, gate_hash):
+    """The ``GATE tangential_passivity`` refusal text for one failed q, with its numbers.
+
+    ``passive`` is :func:`_passivity_response_checks`' dict of ``[b]`` arrays
+    (any array type the host can read); ``slot`` indexes the failed parent.
+    The text names the measured minimum and maximum eigenvalue of the
+    Hermitian part of the V-whitened ``-Wc(i eta)``, its relative
+    anti-Hermitian norm, which bound failed, and the receipt (gate row and
+    its thresholds, the recipe's gate-table hash, eta, the route), so a
+    refusal settles from the log whether the lower or the upper bound broke.
+    The tolerance itself is unchanged.
+    """
+    row = gates["passivity"]
+    threshold = dict(row["threshold"])
+    lo = float(np.asarray(passive["passivity_min"])[slot])
+    hi = float(np.asarray(passive["passivity_max"])[slot])
+    anti = float(np.asarray(passive["passivity_antihermitian_relative"])[slot])
+    broken = []
+    if not np.isfinite(lo) or lo < threshold["eigenvalue_min"]:
+        broken.append(f"lambda_min {lo:.6e} < {threshold['eigenvalue_min']:.1e}")
+    if not np.isfinite(hi) or hi > threshold["eigenvalue_max"]:
+        broken.append(f"lambda_max - 1 = {hi - 1.0:.6e} > "
+                      f"{threshold['eigenvalue_max'] - 1.0:.1e}")
+    limit = threshold.get("antihermitian_relative_max")
+    if not np.isfinite(anti) or (limit is not None and anti > limit):
+        broken.append(f"anti-Hermitian {anti:.6e} > {limit}")
+    return (
+        "GATE tangential_passivity: the fitted pole model of the charge W is "
+        f"not passive at q={q}.\n"
+        f"  got:  lambda_min = {lo:.10e}, lambda_max = {hi:.10e} "
+        f"(lambda_max - 1 = {hi - 1.0:.3e}), anti-Hermitian relative = "
+        f"{anti:.3e}; broken: {'; '.join(broken) or 'non-finite spectrum'}\n"
+        "  want: 0 <= V-whitened -W(i eta) <= I: lambda_min >= "
+        f"{threshold['eigenvalue_min']:g}, lambda_max <= "
+        f"{threshold['eigenvalue_max']!r}"
+        + ("" if limit is None else f", anti-Hermitian <= {limit:g}") + "\n"
+        f"  receipt: gate {row.get('name', 'passivity')} version "
+        f"{row.get('version', '?')}, gate_hash {gate_hash}, eta = {eta_ev:g} eV, "
+        f"{'ordered (signed particle-hole)' if ordered else 'raw latent'} model\n"
+        "  why:  passive screening")
+
+
 def tangential_reciprocity(value, reference, *, gates):
     """Check W(s).T=W(s) where held input data have this extra symmetry.
 

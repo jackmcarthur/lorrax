@@ -469,7 +469,10 @@ def construct_tangential_poles(bank, moments, meta, config, *, mesh_xy, output, 
             with phase("gates"):
                 for slot, q in enumerate(ids[:real]):
                     if not passive["passivity"][slot]:
-                        raise ValueError(f"GATE tangential_passivity: got: failed at q={q}; want: 0 <= V-whitened -W(i eta) <= I; why: passive screening")
+                        from gw.tangential_gates import passivity_refusal
+                        raise ValueError(passivity_refusal(
+                            passive, slot, q, gates=gates, eta_ev=float(recipe["eta_ev"]),
+                            ordered=ordered, gate_hash=recipe["gate_hash"]))
                     if not ordered and not np.all(reciprocity["passed"][slot]):
                         raise ValueError(f"GATE tangential_model_reciprocity: got: { {k: v[slot].tolist() for k, v in reciprocity.items()} } at q={q}; want: model preserves transpose symmetry of symmetric held data; why: conjugate-port closure must survive reduction")
             with phase("receipts"):
