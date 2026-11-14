@@ -68,6 +68,11 @@ def compute_sigma_x_bispinor(
                                      mesh_xy=mesh_xy)
     response = StaticPhotonResponse(layout, packed, packed, "none", "bare_transverse",
         qgrid_policy=policy, family_plans=(plan,plan))
+    # Diagnostic switches (common.bispinor_diag); both inert when unset.
+    from common.bispinor_diag import tt_exchange_enabled, tt_exchange_skip_bands
+    skip_bands = tt_exchange_skip_bands()
+    if skip_bands:
+        Gij = _drop_lowest_occupied(Gij, skip_bands, wfns_transverse.slices)
     sigma = None
     for key, value, _ in contract_lorentz_blocks(
             [(a,b) for a in (1,2,3) for b in (1,2,3)],
@@ -75,5 +80,39 @@ def compute_sigma_x_bispinor(
             response=response, Gij=Gij, meta=meta, mesh_xy=mesh_xy):
         sigma = value if sigma is None else sigma + value
     sigma = unfold_file_wedge_band_operator(sym, sigma, trs_rule="transpose")
-    return _replicate_band_sigma(sigma, mesh_xy)[:, :wfns_transverse.slices.nb_sigma,
-                                                :wfns_transverse.slices.nb_sigma]
+    sigma = _replicate_band_sigma(sigma, mesh_xy)[:, :wfns_transverse.slices.nb_sigma,
+                                                 :wfns_transverse.slices.nb_sigma]
+    if not tt_exchange_enabled():
+        # LORRAX_DIAG_TT_EXCHANGE=off: the contraction ran, so shape, dtype
+        # and sharding are the production ones; only the value is removed.
+        sigma = sigma * 0.0
+    return sigma
+
+
+def _drop_lowest_occupied(Gij, n_skip, slices):
+    """``Gij`` with the ``n_skip`` lowest bands of the Sigma window unoccupied.
+
+    LORRAX_DIAG_TT_EXCHANGE_SKIP_BANDS only.  ``Gij`` is the diagonal
+    occupation projector ``(nk, nb_sigma, nb_sigma)`` on the Sigma window's
+    local band index (global band ``slices.b0 + i``); the contraction reads its
+    diagonal as the occupied weights (``cohsex_sigma._occ_diag_full``), so
+    zeroing rows ``[0, n_skip)`` removes those intermediate states from the
+    exchange sum and nothing else.  The mask is a compile-time constant and
+    the result keeps the input's sharding.
+    """
+    import jax
+    nb = int(Gij.shape[-1])
+    n_skip = int(n_skip)
+    if not 0 < n_skip < nb:
+        raise ValueError(
+            f"LORRAX_DIAG_TT_EXCHANGE_SKIP_BANDS={n_skip} must lie in "
+            f"(0, {nb}), the Sigma window's band count")
+    keep = np.ones((1, nb, 1), dtype=np.float64)
+    keep[:, :n_skip, :] = 0.0
+    print(f"*** LORRAX DIAG: Sigma^B occupied sum drops Sigma-window bands "
+          f"[0, {n_skip}) = global bands [{int(slices.b0)}, "
+          f"{int(slices.b0) + n_skip})", flush=True)
+    sharding = getattr(Gij, "sharding", None)
+    mask = jax.jit(lambda g: g * keep) if sharding is None else jax.jit(
+        lambda g: g * keep, out_shardings=sharding)
+    return mask(Gij)

@@ -288,8 +288,21 @@ def _open_production_report(args):
     # sigma_mnk.h5); the restart bundle stamps it on its own.
     from common.four_current_model import PAULI_FOUR_CURRENT_REPRESENTATION
     from common.provenance import set_run_provenance
-    set_run_provenance(four_current_carrier=(
-        PAULI_FOUR_CURRENT_REPRESENTATION if config.bispinor else None))
+    # Diagnostic bispinor switches (common.bispinor_diag): refused off the
+    # route they act on, and stamped beside the carrier; None when unset.
+    from common import bispinor_diag
+    _bispinor_diag = bispinor_diag.active_switches()
+    if _bispinor_diag is not None:
+        bispinor_diag.refuse_outside_bare_transverse(
+            bispinor=bool(config.bispinor),
+            bare_transverse=(
+                config.bispinor_gw.value == "bare_transverse"),
+            packed_route=bool(config.bispinor
+                              and uses_static_photon_response(config)))
+    set_run_provenance(
+        four_current_carrier=(
+            PAULI_FOUR_CURRENT_REPRESENTATION if config.bispinor else None),
+        bispinor_diag=_bispinor_diag)
     input_dir = config.input_dir
     qp_solver = config.qp_solver     # how QP energies are extracted from Σ
     mode = config.compute_mode       # the self-energy ansatz

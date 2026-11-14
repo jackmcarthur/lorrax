@@ -173,9 +173,36 @@ def poisson_potential_from_rhoG(
     return jnp.real(local_ifftn3(V_G, axes=(-3, -2, -1), norm='ortho'))
 
 
+def transverse_potential_from_current(
+    current_r: jnp.ndarray,
+    bdot: jnp.ndarray,
+    bvec: jnp.ndarray,
+    blat: float,
+    truncation_2d: bool,
+    *,
+    tt_metric_sign: float,
+) -> jnp.ndarray:
+    """The transverse direct field (:func:`_transverse_potential_from_current`).
+
+    A plain wrapper so the diagnostic switch ``LORRAX_DIAG_TRANSVERSE_HARTREE``
+    (``common.bispinor_diag``) is read per call, outside the compiled program.
+    Unset, it returns the compiled function's result unchanged.  ``off``
+    returns an exact zero field of the same shape and dtype: the one-shot and
+    the SC rebuild both take their field here, so ``<m|alpha.A|n>`` is zero in
+    every consumer.
+    """
+    from common.bispinor_diag import transverse_hartree_enabled
+    A_r = _transverse_potential_from_current(
+        current_r, bdot, bvec, blat, truncation_2d,
+        tt_metric_sign=tt_metric_sign)
+    if not transverse_hartree_enabled():
+        A_r = jnp.zeros_like(A_r)
+    return A_r
+
+
 @functools.partial(jax.jit,
                    static_argnames=("blat", "truncation_2d", "tt_metric_sign"))
-def transverse_potential_from_current(
+def _transverse_potential_from_current(
     current_r: jnp.ndarray,
     bdot: jnp.ndarray,
     bvec: jnp.ndarray,
