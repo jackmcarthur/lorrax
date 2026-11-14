@@ -392,6 +392,10 @@ class WfnLoader:
         self._gvecs_raw = self._file["wfns/gvecs"]       # (ngktot, 3) int
         # kpt_starts = cumulative (exclusive prefix) sum of ngk.
         self._kpt_starts = kpt_starts(self.ngk)
+        # The convective current vertex's field (attach_current_vertex_field):
+        # ``None`` until a caller that owns the pseudopotentials attaches it.
+        self._current_vertex_field = None
+        self._current_vertex_identity = None
 
         # Lazy state.
         self._sym = None
@@ -1058,8 +1062,12 @@ class WfnLoader:
                     static["tr_mask_per_full"][full_k],
                 )
         if bispinor:
+            from common.bispinor_init import RAW_KINETIC_BALANCE_LIFT, convective_lift_label
+            label = convective_lift_label(bispinor_lift)
+            child_2 = child
             child = _parent_bispinor_lift_kernel(
-                self._mesh, str(bispinor_lift).strip().lower())(
+                self._mesh, (RAW_KINETIC_BALANCE_LIFT if label
+                             else str(bispinor_lift).strip().lower()))(
                     child,
                     g_parent,
                     static["reciprocal_per_full"][full_k],
@@ -1067,6 +1075,12 @@ class WfnLoader:
                     static["kvec_per_full"][full_k],
                     static["bvec_cart_bohr"],
                 )
+            if label:
+                # The child's G rows are the loader's full-BZ rows of full_k
+                # (the pairing load(k=[full_k]) lifts with).
+                child = self._add_convective_increment(
+                    child_2, child, k=[full_k], label=label,
+                    sharding=getattr(child, "sharding", None))
         return child
 
     def little_group_rows(self, parent: int) -> np.ndarray:
@@ -2122,6 +2136,55 @@ class WfnLoader:
     # ------------------------------------------------------------------
     # Bispinor lift (G-flat)
     # ------------------------------------------------------------------
+    def attach_current_vertex_field(self, field, *, identity: str) -> None:
+        r"""Attach the field of the convective current vertex (carriers ``convective_a``).
+
+        ``field(psi_2, gvecs, kvecs, ngk, label)`` returns
+        $\sigma^a\,i[V_{\rm NL}, r_a]\,\psi_L$ for Cartesian channel ``label``
+        on the loader's own G-flat rows: ``psi_2 (n_k, nb, 2, ngkmax)``
+        complex, ``gvecs (n_k, ngkmax, 3)`` int (pad sentinel rows),
+        ``kvecs (n_k, 3)`` crystal, ``ngk (n_k,)`` logical counts; the result
+        has ``psi_2``'s shape and is zero on the pad rows.  The service
+        imports no pseudopotential code: the caller that owns V_NL builds the
+        field (``psp.vnl_ops.convective_field``) and attaches it once.
+        ``identity`` names it (the run's UPF md5 stamp); attaching a second,
+        different field refuses, so one loader never mixes two V_NL.
+        """
+        if not callable(field):
+            raise TypeError("WfnLoader.attach_current_vertex_field: field must be callable")
+        if (self._current_vertex_field is not None
+                and self._current_vertex_identity != str(identity)):
+            raise ValueError(
+                "WfnLoader: a current-vertex field is already attached "
+                f"({self._current_vertex_identity!r}); refusing a second one "
+                f"({identity!r})")
+        self._current_vertex_field = field
+        self._current_vertex_identity = str(identity)
+
+    def _add_convective_increment(self, psi_2, lifted, *, k, label, sharding):
+        """``lifted`` (the raw lift of ``psi_2``) plus channel ``label``'s increment.
+
+        :func:`common.bispinor_init.convective_carrier`; ``k`` names the rows
+        of ``psi_2`` (the loader's own ``gvecs`` / ``kvecs`` / ``ngk_valid``
+        for them).
+        """
+        from common.bispinor_init import convective_carrier
+        if self._current_vertex_field is None:
+            raise ValueError(
+                "GATE convective_vertex_field: a convective carrier was "
+                f"requested (label {label}) but no current-vertex field is "
+                "attached to this loader (WfnLoader.attach_current_vertex_field)")
+        sg = self._current_vertex_field(
+            psi_2, np.asarray(self.gvecs(k=k, cache=False)),
+            np.asarray(self.kvecs(k=k), dtype=np.float64),
+            np.asarray(self.ngk_valid(k=k)), int(label))
+        # convective_carrier reads entry label-1 of the per-label sequence only.
+        per_label = tuple(sg if a == int(label) else None for a in (1, 2, 3))
+        out = convective_carrier(lifted, per_label, int(label), vertex="convective")
+        if sharding is not None:
+            out = jax.device_put(out, sharding)
+        return out
+
     def _apply_bispinor_lift(
         self,
         psi_2: jax.Array,
@@ -2152,13 +2215,22 @@ class WfnLoader:
         # lift converts to the Cartesian momentum its API requires.
         bvec_cart_bohr = (
             float(self.blat) * np.asarray(self.bvec, dtype=np.float64))
-        return _bispinor_lift_kernel(
+        # A convective carrier is the raw lift plus its channel's increment
+        # (attach_current_vertex_field); lift_to_4spinor never sees its name.
+        from common.bispinor_init import RAW_KINETIC_BALANCE_LIFT, convective_lift_label
+        label = convective_lift_label(representation)
+        lifted = _bispinor_lift_kernel(
             psi_2,
             jnp.asarray(gvecs, dtype=jnp.float64),
             jnp.asarray(kvecs_np),
             jnp.asarray(bvec_cart_bohr),
-            sharding=sharding, representation=representation,
+            sharding=sharding,
+            representation=(RAW_KINETIC_BALANCE_LIFT if label else representation),
         )
+        if not label:
+            return lifted
+        return self._add_convective_increment(
+            psi_2, lifted, k=k, label=label, sharding=sharding)
 
     # ------------------------------------------------------------------
     # Eager unfold core
