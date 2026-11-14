@@ -77,6 +77,38 @@ CURRENT_VERTEX_PROVENANCE = {
 }
 
 
+#: The loader's carrier names of the convective vertex, one per Cartesian
+#: channel (``WfnLoader.load(bispinor_lift='convective_a')`` with a field
+#: attached by ``WfnLoader.attach_current_vertex_field``).  They are not
+#: lifts of :func:`lift_to_4spinor`, which never sees them: the loader lifts
+#: ``raw`` and adds the increment of :func:`convective_carrier`.
+CONVECTIVE_LIFTS = {f"convective_{a}": a for a in (1, 2, 3)}
+CONVECTIVE_LIFT_PROVENANCE = {
+    name: (KINETIC_BALANCE_LIFT_PROVENANCE
+           + f"+(alpha_fs/4)*sigma^{a}*i[V_NL,r_{a}]*psi_L")
+    for name, a in CONVECTIVE_LIFTS.items()}
+
+
+def convective_lift_label(representation) -> int | None:
+    """The Cartesian channel of a convective carrier name, ``None`` for any other."""
+    if representation is None:
+        return None
+    return CONVECTIVE_LIFTS.get(str(representation).strip().lower())
+
+
+def carrier_provenance(representation: str) -> str:
+    """The provenance of any bispinor carrier name: the two lifts and the convective carriers.
+
+    What stamps a carrier (wavefunction-basis receipts, zeta provenance) reads
+    this; :func:`kinetic_balance_lift_provenance` stays the lift's own
+    validator, so ``lift_to_4spinor`` never accepts a convective name.
+    """
+    mode = str(representation).strip().lower()
+    if mode in CONVECTIVE_LIFT_PROVENANCE:
+        return CONVECTIVE_LIFT_PROVENANCE[mode]
+    return kinetic_balance_lift_provenance(mode)
+
+
 def convective_carrier(psi_raw, sigma_gamma, label: int, *, vertex: str):
     r"""The current carrier of Cartesian channel ``label`` under ``vertex``.
 

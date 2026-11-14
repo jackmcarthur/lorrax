@@ -390,6 +390,33 @@ def _report_head_and_photon_policy(config, report):
             report.progress(f"Photon head    : {_head_record}")
 
 
+def _attach_convective_current_vertex(wfn, config, input_dir, *, trivial_view):
+    """Attach the convective vertex's field to the loader (stage A: trivial view only).
+
+    The field is i[V_NL, r_a] from the run's own UPF files
+    (``psp.vnl_ops.build_vnl_setup_from_pseudo_dir``, refused unless their
+    md5s are ``kin_ion.h5``'s); every ``convective_a`` carrier the loader
+    serves then adds it (``WfnLoader.attach_current_vertex_field``).
+    """
+    if not trivial_view:
+        raise ValueError(
+            "GATE bispinor_current_vertex_view: the convective current vertex "
+            "runs on the unreduced (trivial) symmetry view only.\n"
+            "  got:  an orbit-closed centroid set (the reduced view)\n"
+            "  want: centroids that are not orbit-closed "
+            "(centroid.kmeans_cli --no-symmetries)\n"
+            "  why:  sigma^a phi_a with a fixed Cartesian a is not covariant "
+            "under an operation that is not a signed axis permutation\n"
+            "  doc:  docs/input_reference.md, bispinor_current_vertex.")
+    from file_io import read_kin_ion_provenance
+    from psp.vnl_ops import build_vnl_setup_from_pseudo_dir, convective_field
+    stored = read_kin_ion_provenance(config.paths.kin_ion_file).get("pseudopotential_md5")
+    setup, identity = build_vnl_setup_from_pseudo_dir(
+        wfn, config.pseudo_dir or input_dir, kin_ion_md5=stored)
+    wfn.attach_current_vertex_field(convective_field(setup), identity=identity)
+    log.info(f"  current vertex: convective_vnl_v1 (V_NL of {identity})")
+
+
 def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_provenance):
     """Produce wavefunctions, symmetry, centroid basis and output paths."""
     wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
@@ -421,6 +448,9 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
                 f"orbit-closed centroid set; fix: regenerate the centroids with "
                 f"kmeans (orbit-closed), or use screening_diagrams = w_rpa; doc: "
                 f"docs/architecture/symmetry_register.md §7.")
+    if config.bispinor and config.bispinor_current_vertex == "convective":
+        _attach_convective_current_vertex(wfn, config, input_dir,
+                                          trivial_view=bool(nonclosed))
     # Before any basis, bank or constructor: the w_bse ladder and HL-PPM
     # refuse an ordered store, and full_tangential a store with time
     # reversal, here, on the final symmetry verdict.

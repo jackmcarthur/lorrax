@@ -69,7 +69,7 @@ class WavefunctionBasisReceipt:
     bispinor_lift_provenance: str | None
 
     def __post_init__(self) -> None:
-        from common.bispinor_init import LIFT_PROVENANCE
+        from common.bispinor_init import CONVECTIVE_LIFT_PROVENANCE, LIFT_PROVENANCE
         from common.parallel_transport import WFN_FINGERPRINT_SCHEME
         from common.wfn_transforms import FULL_BLOCH_TRANSFORM_SCHEME
 
@@ -125,7 +125,8 @@ class WavefunctionBasisReceipt:
         lift = self.bispinor_lift_provenance
         if lift is not None:
             lift = str(lift)
-        if lift is not None and lift not in LIFT_PROVENANCE.values():
+        if lift is not None and lift not in (*LIFT_PROVENANCE.values(),
+                                             *CONVECTIVE_LIFT_PROVENANCE.values()):
             raise ValueError(
                 "WavefunctionBasisReceipt has an unknown sampled-spinor "
                 f"transform {lift!r}")
@@ -213,7 +214,7 @@ class WavefunctionBasisReceipt:
         n_rmu_padded: int,
     ) -> "WavefunctionBasisReceipt":
         """Shared receipt construction after canonical source identity."""
-        from common.bispinor_init import kinetic_balance_lift_provenance
+        from common.bispinor_init import carrier_provenance
         from common.parallel_transport import (
             WFN_FINGERPRINT_SCHEME,
             fingerprint_from_binding,
@@ -277,7 +278,7 @@ class WavefunctionBasisReceipt:
             source_identity=FULL_BLOCH_TRANSFORM_SCHEME,
             nspinor_sampled=4 if use_bispinor else source_nspinor,
             bispinor_lift_provenance=(
-                kinetic_balance_lift_provenance(bispinor_lift)
+                carrier_provenance(bispinor_lift)
                 if use_bispinor else None),
         )
 
