@@ -696,15 +696,13 @@ def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
             "tree (a static-Dyson W0, e.g. compute_mode = cohsex); srlr is "
             "the only W interpolation.")
     t = lr["tables"]
-    if t is None:
-        raise ValueError(
-            "GATE srlr_wedge_tables: W0 is stored on the full zone, so the "
-            "W0_lr rows carry no unfold tables; want: restart_q_storage = ibz.")
     sys_dim = int(lr["sys_dim"])
     if sys_dim != int(meta.sys_dim):
         raise ValueError(f"srlr: W0_lr was written for sys_dim {sys_dim}, "
                          f"the deck says {int(meta.sys_dim)}")
-    if not np.allclose(t.q_irr_frac, lr["q_frac"], atol=1e-10):
+    # A full-zone W0 (no unfold tables) has one W0_lr row per zone q, each its
+    # own identity image; _unfold_lr_channels checks that and passes them on.
+    if t is not None and not np.allclose(t.q_irr_frac, lr["q_frac"], atol=1e-10):
         raise ValueError("srlr: the W0_lr rows are not W0's q wedge")
     _, n_L, n_file = lr["Ft"].shape
     if int(lr["n_mu_logical"]) != n_rmu:
@@ -854,6 +852,12 @@ def _unfold_lr_channels(lr, sym, *, coarse_grid, n_rmu, n_rmu_pad, mesh_xy):
     G_z.  Returns ``Ft (n_q, n_L, n_rmu_pad)``, ``P (n_q, n_L, n_L)``, the
     split's kernel ``v (n_q, n_L)`` (a function of |K|), the target channel
     momenta ``K (n_q, n_L, 3)`` and ``q_full (n_q, 3)``, both crystal.
+
+    A W0 stored on the full zone (``tables`` None: a q grid the WFN's symmetry
+    does not reduce) has one row per zone q.  Its unfold is the identity: each
+    row is its own image, F̃, P, v and K = q + G pass through unchanged (no τ
+    phase, no conjugation).  The rows must be the whole coarse zone in flat fft
+    order (GATE ``srlr_wedge_tables``).
     """
     from ffi import _services
     _services.ensure_on_path()
@@ -867,21 +871,27 @@ def _unfold_lr_channels(lr, sym, *, coarse_grid, n_rmu, n_rmu_pad, mesh_xy):
     n_qi, n_L, _ = lr["Ft"].shape
     grid = np.asarray(coarse_grid, dtype=np.int64)
     carrier = int(lr["Ft"].shape[-1])
-    tp = t.padded(carrier)
-    col_sh = NamedSharding(mesh_xy, P(None, "x"))
-    rows_full = []
-    for a in range(n_L):
-        col = jax.device_put(lr["Ft"][:, a], col_sh)
-        out = unfold_isdf_one_leg(
-            col,
-            source_gvec_components=np.asarray(lr["gvec"][:, a], dtype=np.int32),
-            sym=sym, sym_idx=tp.sym_idx_q, sym_perm=tp.sym_perm,
-            L_table=tp.L_table, q_irr_frac=tp.q_irr_frac, kgrid=tuple(coarse_grid),
-            mesh_xy=mesh_xy, component_action="scalar")
-        rows_full.append(out)
     mu3 = NamedSharding(mesh_xy, P(None, None, ("x", "y")))
-    Ft = jax.jit(lambda rows: jnp.stack(rows, axis=1), out_shardings=mu3)(tuple(rows_full))                       # (nq, n_L, μ_pad)
-    nq = Ft.shape[0]
+    if t is None:
+        # Full-zone W0: identity tables, the rows are already the zone.
+        Ft, q_src, tp = lr["Ft"], np.asarray(lr["q_frac"], dtype=np.float64), None
+        nq = int(n_qi)
+    else:
+        tp = t.padded(carrier)
+        col_sh = NamedSharding(mesh_xy, P(None, "x"))
+        rows_full = []
+        for a in range(n_L):
+            col = jax.device_put(lr["Ft"][:, a], col_sh)
+            out = unfold_isdf_one_leg(
+                col,
+                source_gvec_components=np.asarray(lr["gvec"][:, a], dtype=np.int32),
+                sym=sym, sym_idx=tp.sym_idx_q, sym_perm=tp.sym_perm,
+                L_table=tp.L_table, q_irr_frac=tp.q_irr_frac, kgrid=tuple(coarse_grid),
+                mesh_xy=mesh_xy, component_action="scalar")
+            rows_full.append(out)
+        Ft = jax.jit(lambda rows: jnp.stack(rows, axis=1), out_shardings=mu3)(tuple(rows_full))                       # (nq, n_L, μ_pad)
+        nq = Ft.shape[0]
+        q_src = tp.q_irr_frac
 
     # The same star rows the one-leg unfold used: each target channel's
     # momentum, its τ phase c_a (P transforms as c_a c_b* P, conjugated on
@@ -894,23 +904,39 @@ def _unfold_lr_channels(lr, sym, *, coarse_grid, n_rmu, n_rmu_pad, mesh_xy):
             "GATE srlr_q_order: SymMaps' q rows are not the bundle's flat fft "
             "order; the unfolded rows would land on other q.")
     q_full = bgw_integer_q_to_fractional(q_int, grid)
-    S_all = np.asarray(sym.sym_mats_k, dtype=np.int64)
-    n_sp = int(np.asarray(sym.sym_matrices).shape[0])
-    tau = np.asarray(sym.translations, dtype=np.float64)
-    idx, rows = np.asarray(tp.irr_idx_q), np.asarray(tp.sym_idx_q)
+    if tp is None:
+        dq = q_src - q_full if q_src.shape == q_full.shape else None
+        if dq is None or not np.allclose(dq - np.round(dq), 0.0, atol=1e-10):
+            raise ValueError(
+                f"GATE srlr_wedge_tables: W0 is stored on the full zone but "
+                f"W0_lr carries {q_src.shape[0]} rows that are not the "
+                f"{q_full.shape[0]} coarse q in flat fft order; want: one row "
+                f"per zone q (an unreduced q grid) or restart_q_storage = ibz; "
+                f"why: without unfold tables a row can only stand for its own "
+                f"q; fix: rerun GW with restart_q_storage = ibz.")
+        idx, rows = np.arange(nq), None
+    else:
+        S_all = np.asarray(sym.sym_mats_k, dtype=np.int64)
+        n_sp = int(np.asarray(sym.sym_matrices).shape[0])
+        tau = np.asarray(sym.translations, dtype=np.float64)
+        idx, rows = np.asarray(tp.irr_idx_q), np.asarray(tp.sym_idx_q)
     Pf = np.empty((nq, n_L, n_L), np.complex128)
     vf = np.empty((nq, n_L))
     K_full = np.empty((nq, n_L, 3))
     orders = np.empty((nq, n_L), dtype=np.int32)
     for iq in range(nq):
-        s, p = int(rows[iq]), int(idx[iq])
-        Kp = np.asarray(tp.q_irr_frac[p], dtype=np.float64) + lr["gvec"][p]
-        ph = tau_phase_row(S_all[s % n_sp], tau[s % n_sp], Kp)
-        c = np.ones(n_L, np.complex128) if ph is None else ph
-        Pq = c[:, None] * lr["P"][p] * np.conj(c)[None, :]
-        if s >= n_sp:
-            Pq = np.conj(Pq)
-        Kt = (S_all[s] @ Kp.T).T
+        p = int(idx[iq])
+        Kp = np.asarray(q_src[p], dtype=np.float64) + lr["gvec"][p]
+        if rows is None:                                   # identity image
+            Pq, Kt = np.asarray(lr["P"][p]), Kp
+        else:
+            s = int(rows[iq])
+            ph = tau_phase_row(S_all[s % n_sp], tau[s % n_sp], Kp)
+            c = np.ones(n_L, np.complex128) if ph is None else ph
+            Pq = c[:, None] * lr["P"][p] * np.conj(c)[None, :]
+            if s >= n_sp:
+                Pq = np.conj(Pq)
+            Kt = (S_all[s] @ Kp.T).T
         order = np.argsort(Kt[:, 2], kind="stable") if sys_dim == 2 else np.arange(1)
         if sys_dim == 2 and not np.allclose(Kt[order, 2], np.arange(-c0, c0 + 1)):
             raise ValueError(

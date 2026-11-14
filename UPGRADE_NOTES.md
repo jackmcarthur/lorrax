@@ -29,6 +29,15 @@ row's own wings and κ_TF² (`qsgw_head.metal_static_gamma_body`), so
 - **Decks.** No change.
 - **Test.** `tests/test_metal_static_fold.py`.
 
+## 2026-11-14 — Fine-grid BSE on a q grid that symmetry does not reduce
+
+`kgrid_fine` now runs on an ISDF tensor file whose W0 is stored on the full
+zone because the WFN's symmetry does not reduce the q grid (a no-symmetry
+reference, such as a hybrid-start run).  Its `W0_lr` rows are read with
+identity unfold tables, so existing files work without a GW rerun; before,
+`GATE srlr_wedge_tables` refused them.  A full-zone W0 on a grid that does
+reduce still refuses.  Results on symmetry-reduced files are unchanged.
+
 ## 2026-11-14 — Bispinor transverse terms are input-file keys; head default; stamps
 
 New input-file keys for `bispinor = true` (docs/input_reference.md):
