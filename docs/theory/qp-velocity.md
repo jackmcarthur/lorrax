@@ -162,6 +162,58 @@ that the outer link's top $N_\mathrm{head}$ singular values all exceed 0.5;
 otherwise the head window is hybridized with bands outside it
 (`GATE pt_head_window_hybridized`) and the links cannot serve the term (§6).
 
+## 4a. The band-diagonal part is exact; only the remainder rides the links
+
+**What the links miss.** A centred difference at mesh step $b$ returns,
+for a term of $\Delta H$ that couples Wannier-like orbitals a distance
+$s$ apart, $\sin(b\cdot s)/b$ in place of $s$: $2/\pi$ of it for one lattice
+vector on a 4-point line, nothing for two. The kinetic term is quadratic in
+$k$, so the rebuild of $v_\mathrm{DFT}$ (§6) passes on any grid and cannot
+see this. A rigid shift of the empty states, $\Delta H = \Delta\,P_c$, is a
+long-range operator (the range of $P_c$), and the links alone recover only
+part of its commutator: 0.32 of it on Si $4^3$, 0.44 on NiO $4^3$, 0.98 on
+CrCl$_3$ $6\times6\times1$ (fourth order, flat bands).
+
+**The split.** In the DFT basis write $\Delta H = D + R$ with
+$D = \sum_n \bar d_n |n\rangle\langle n|$, where $\bar d_n$ is the mean of
+$\mathrm{Re}\,\Delta H_{ll}$ over the group of $n$: the contiguous DFT bands
+at that $k$ closer than 0.1 eV (`gw.qsgw_head.BAND_DIAGONAL_GROUP_TOL_RY`).
+For non-degenerate DFT eigenstates $A_{nm} = i v_{nm}/(E_m - E_n)$ exactly,
+so the commutator of $D$ needs no $k$ derivative between groups:
+
+$$\big(i[D, r]\big)_{nm} = v_{nm}\,\frac{\bar d_n - \bar d_m}{E_n - E_m}
+\quad(\text{different groups}),\qquad
+\big(i[D, r]\big)_{nm} = \delta_{nm}\,\partial_k \bar d_g
+\quad(\text{same group } g).$$
+
+The intraband $\partial_k\bar d_g$ is the group mean of the diagonal of the
+link derivative of $D$ (a trace over the group, so frame-independent). Only
+$R$ goes through the links: $i[\Delta H, r] = i[D, r] + D_k R$
+(`gw.qsgw_head.sigma_commutator`). An exact multiplet is always one group,
+so $D$ does not depend on the frame chosen inside it, and inside a group
+$\bar d$ is constant and the first formula has nothing to divide. The window
+keeps the analytic term off near-degenerate pairs, where
+$|b\cdot v_{nm}| > |E_n - E_m|$ and a large exact $v\,\Delta d/\Delta E$
+would have to cancel against a link term that cannot resolve it.
+
+**What it buys and where it stops.** A scissor is all $D$ and is exact.
+Whatever $\Delta H$ does beyond rescaling the DFT bands is in $R$ and keeps
+the link deficit; a $\Delta H$ that is short-ranged in real space but has a
+band diagonal (a local potential has no commutator at all) is split into
+two long-range pieces whose link error no longer cancels. On a
+tight-binding model (`tests/test_qsgw_sigma_commutator_cpu.py`) with a
+scissor on states rotated by a first-order cross-gap mixing $\theta$, the
+split's error on the head elements grows as about $2\theta$ while the links
+alone miss 90 %; the two cross near $\theta \approx 0.5$. Each map prints
+$\lVert R\rVert/\lVert\Delta H\rVert$ and the shares `Sigma_d` (exact) and
+`Sigma_R` (links) of the head. The general cure is the commutator of
+$\Delta H$ as a real-space kernel, which has no such split.
+
+**Self-test.** At load, every `parallel_transport` run on an insulator
+prints what the links alone and what the route recover of a scissor's
+commutator, weight $1/(E_c - E_v)^3$ (`gw.qsgw_head.scissor_capture`), beside
+$\epsilon_\mathrm{link}$.
+
 ## 5. The Marzari–Vanderbilt stencil
 
 A finite-difference gradient from a set of steps $b$ with weights $w_b$ is
@@ -231,13 +283,15 @@ $$\epsilon_\mathrm{link} = \frac{\lVert v^\mathrm{links} - v_\mathrm{DFT}\rVert}
 Above `--parallel-transport-validation-rtol` (default $5\times10^{-3}$) the
 dipole step warns and still writes the artifact.
 
-Only $D_k\Delta H$ goes through the links; $v_\mathrm{DFT}$ is exact. Each SC
-map therefore bounds the head's link error by
+Only the remainder $D_k R$ (§4a) goes through the links; $v_\mathrm{DFT}$ and
+the band-diagonal part are exact. Each SC map prints
 
-$$\mathrm{bound} = \epsilon_\mathrm{link}\;\frac{\lVert D_k\Delta H\rVert}{\lVert v_\mathrm{DFT}\rVert}$$
+$$\mathrm{bound} = \epsilon_\mathrm{link}\;\frac{\lVert D_k R\rVert}{\lVert v_\mathrm{DFT}\rVert}$$
 
 on the same elements (`gw.qsgw_head.link_correction_bound`; 0 on a map that
-starts from DFT, where $\Delta H = 0$). The second factor is small: at the
+starts from DFT, where $\Delta H = 0$). It is the error of the $v_\mathrm{DFT}$
+rebuild carried over to $D_k R$, which the scissor test of §4a shows can be
+far smaller than the deficit on a nonlocal term. The second factor is small: at the
 SC fixed point of a scalar Fe $4^3$ run (35 bands, 26 protected),
 $\lVert D_k\Delta H\rVert/\lVert v_\mathrm{DFT}\rVert = 6.05\times10^{-2}$, so a
 link error of a few percent bounds the head's error at a few $10^{-3}$.
@@ -267,7 +321,7 @@ switch to another head mid-run.
 |---|---|---|---|
 | `off` | none: the fixed DFT response | `dipole.h5` | every deck |
 | `dft_velocity` | $U^\dagger v_\mathrm{DFT}\,U$ | `dipole.h5`, or the artifact's velocity stage | insulators; metals with the tangential W and `head_correction = full` |
-| `parallel_transport` | $U^\dagger(v_\mathrm{DFT} + D_k\Delta H)\,U$ | the full link artifact | insulators; metals with the tangential W on a scalar or `full_tangential` deck |
+| `parallel_transport` | $U^\dagger(v_\mathrm{DFT} + i[D, r] + D_k R)\,U$ (§4a) | the full link artifact | insulators; metals with the tangential W on a scalar or `full_tangential` deck |
 | `interband_commutator` | $U^\dagger(v_\mathrm{DFT} + [\Delta H, \mathcal W])\,U$ | the artifact's velocity stage (`vnl_included = 1`) | insulators only |
 
 When `sc_head_update` is not named on an SC deck with the tangential W and

@@ -368,7 +368,7 @@ and the artifact are owned by [the velocity operator](theory/qp-velocity.md).
 |---|---|---|
 | `off` | none: the DFT head, fixed for the run (under `head_correction = full` folded through each map's W) | — |
 | `dft_velocity` | $U^\dagger v^{\rm DFT} U$ | the velocity stage of `parallel_transport.h5` when the file exists, else `dipole.h5`; on a metal always `dipole.h5` |
-| `parallel_transport` | $U^\dagger (v^{\rm DFT} + D_k\Delta H) U$, with $D_k$ from finite links | `parallel_transport.h5` with links |
+| `parallel_transport` | $U^\dagger (v^{\rm DFT} + D_k\Delta H) U$: the band-diagonal part of $\Delta H$ exactly, the remainder by finite links ([§4a](theory/qp-velocity.md#4a-the-band-diagonal-part-is-exact-only-the-remainder-rides-the-links)) | `parallel_transport.h5` with links |
 | `interband_commutator` | $U^\dagger (v^{\rm DFT} + [\Delta H, \mathcal W]) U$, no links; insulators only | the velocity stage of `parallel_transport.h5`, stamped `vnl_included = 1` |
 
 **Default.** An unnamed `sc_head_update` on a tangential SC deck (scalar, or

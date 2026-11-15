@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable
 
 import jax
@@ -293,6 +294,13 @@ class ParallelTransportHeadData:
     #: window-hybridization gate); the links are then dropped and every map
     #: runs ``U^dagger v_DFT U`` (:func:`qp_velocity`).  None: served.
     link_unserved: str | None = None
+    #: ``(nk, nb_links)`` DFT energies (Ry) and occupations of the outer link
+    #: band set, host-resident, ascending along bands (the artifact's
+    #: ``dft_energies_ry_full`` / ``dft_occupations_full``).  The exact
+    #: band-diagonal part of the Sigma term (:func:`sigma_commutator`) groups
+    #: and divides by them.
+    energies_dft_kn_ry: np.ndarray | None = None
+    occupations_dft_kn: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -441,6 +449,8 @@ def load_parallel_transport_head(
     """
     from file_io.parallel_transport import (
         COLLAPSED_POSITION_DATASET,
+        ENERGIES_DATASET,
+        OCCUPATIONS_DATASET,
         SCHEMA_VERSION,
         VELOCITY_DFT_DATASET,
         load_full_bz_links,
@@ -633,6 +643,12 @@ def load_parallel_transport_head(
         # preflight in ``sc_iteration.load_head_velocity_source`` reads it
         # off the returned object.
         singular_values = load_link_singular_values(io, nb_logical=nb_outer)
+        # The outer set's DFT energies and occupations (O(nk*nb) real, host):
+        # the exact band-diagonal part of the Sigma term reads them.
+        energies_outer, occupations_outer = (np.asarray(io.read_slab(
+            name, shape=(int(meta.nk_tot), nb_outer),
+            partition_spec=P(None, None), as_numpy=True), dtype=np.float64)
+            for name in (ENERGIES_DATASET, OCCUPATIONS_DATASET))
         collapsed_position = None
         if collapsed_axes(expected_kgrid):
             # A collapsed axis has no link stencil; its connection is the
@@ -678,6 +694,12 @@ def load_parallel_transport_head(
             f"{forward_neighbors.shape}, expected prefix "
             f"{expected_prefix} and at least {expected_nb} bands."
         )
+    if np.any(np.diff(energies_outer, axis=1) < 0.0):
+        raise ValueError(
+            f"GATE pt_energies_unsorted: {path}: dft_energies_ry_full is not "
+            "ascending along bands at some k; the band-diagonal split of the "
+            "Sigma term groups contiguous bands by energy (regenerate the "
+            "artifact with get_dipole_mtxels)")
     # TIME-REVERSAL PARITY, MEASURED HERE AND NOT ASSUMED DOWNSTREAM.  The
     # head lane differentiates this velocity and adds ``d_k Sigma`` and
     # ``-i[A, Sigma]`` to it, all three terms carrying the SAME odd parity
@@ -718,6 +740,8 @@ def load_parallel_transport_head(
         collapsed_position=collapsed_position,
         nb_links=nb_outer,
         velocity_kinetic_cart=velocity_kinetic,
+        energies_dft_kn_ry=energies_outer,
+        occupations_dft_kn=occupations_outer,
     )
 
 
@@ -977,6 +1001,293 @@ def covariant_link_derivative(
         collapsed_position=collapsed_position,
     )
     return reduced_covector_to_cartesian(reduced, bvec_cart)
+
+
+# ---------------------------------------------------------------------------
+# The Sigma term i[DeltaH, r]: exact band-diagonal part + links for the rest
+# ---------------------------------------------------------------------------
+
+#: Energy window (Ry) that groups DFT bands for the band-diagonal split of
+#: :func:`sigma_commutator`: consecutive bands closer than this at one k
+#: share a group (0.1 eV).  The split is exact for any value (the groups only
+#: decide how much of ``DeltaH`` rides the links); the window keeps the
+#: analytic term off near-degenerate pairs, where ``|b.v_nm| > |E_n - E_m|``
+#: and a large exact ``v_nm Delta d/Delta E`` would have to cancel against a
+#: link term that cannot resolve it.  The stored NiO and CrCl3 QSGW heads move
+#: by under 1e-3 between 0.05, 0.1 and 0.5 eV (the lead's pathway report,
+#: section 2.7).
+BAND_DIAGONAL_GROUP_TOL_RY: float = 0.1 / 13.6056980659
+
+
+def _band_group_kernel(mesh: Mesh, *, nb_live: int, tol_ry: float) -> Callable:
+    key = ("band_diagonal_groups", id(mesh), int(nb_live), float(tol_ry))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    tile = NamedSharding(mesh, P(None, "x", "y"))
+    nbl, tol = int(nb_live), float(tol_ry)
+
+    @jax.jit
+    def _kernel(delta, e):
+        nk, nbs = int(delta.shape[0]), int(delta.shape[-1])
+        band = jnp.arange(nbs)
+        live = band < nbl
+        # Contiguous groups along the ascending band axis: a new group starts
+        # where the gap to the previous band exceeds tol (padding: one
+        # group per padded slot, value zero).
+        gap = jnp.concatenate(
+            [jnp.full((nk, 1), jnp.inf), e[:, 1:] - e[:, :-1]], axis=1)
+        start = (gap > tol) | ~live[None, :]
+        gid = jnp.cumsum(start.astype(jnp.int32), axis=1) - 1
+        d = jnp.where(live[None, :], jnp.real(jnp.diagonal(
+            delta, axis1=-2, axis2=-1)), 0.0)
+
+        def _mean(values, ids):
+            s = jax.ops.segment_sum(values, ids, num_segments=nbs)
+            c = jax.ops.segment_sum(jnp.ones_like(values), ids,
+                                    num_segments=nbs)
+            return (s / jnp.maximum(c, 1.0))[ids]
+
+        dbar = jnp.where(live[None, :], jax.vmap(_mean)(d, gid), 0.0)
+        idx = jnp.arange(nbs)
+        diag_op = jnp.zeros_like(delta).at[:, idx, idx].set(
+            dbar.astype(delta.dtype))
+        diag_op = jax.lax.with_sharding_constraint(diag_op, tile)
+        remainder = jax.lax.with_sharding_constraint(delta - diag_op, tile)
+        return diag_op, remainder, dbar, gid
+
+    _KERNEL_CACHE[key] = _kernel
+    return _kernel
+
+
+def _band_diagonal_commutator_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
+    key = ("band_diagonal_commutator", id(mesh), int(nb_logical))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    _mesh_xy(mesh)
+    out = NamedSharding(mesh, P(None, None, "x", "y"))
+    tile = NamedSharding(mesh, P(None, "x", "y"))
+    nbl = int(nb_logical)
+
+    @jax.jit
+    def _kernel(v, dbar, e, gid, intraband):
+        nbs = int(v.shape[-1])
+        band = jnp.arange(nbs)
+        live = band < nbl
+        cross = ((gid[:, :, None] != gid[:, None, :])
+                 & live[None, :, None] & live[None, None, :])
+        de = e[:, :, None] - e[:, None, :]
+        ratio = jnp.where(cross, (dbar[:, :, None] - dbar[:, None, :])
+                          / jnp.where(cross, de, 1.0), 0.0)
+        ratio = jax.lax.with_sharding_constraint(ratio, tile)
+        X = v * ratio[None].astype(v.dtype)
+        X = X.at[:, :, band, band].add(
+            jnp.where(live[None, None, :], intraband, 0.0).astype(v.dtype))
+        return jax.lax.with_sharding_constraint(X, out)
+
+    _KERNEL_CACHE[key] = _kernel
+    return _kernel
+
+
+def _group_mean_diagonal(values_ak, gid):
+    """Group mean of a ``(3, nk, nb)`` band diagonal over ``gid`` (nk, nb)."""
+    nbs = int(gid.shape[-1])
+
+    def _mean(values, ids):
+        s = jax.ops.segment_sum(values, ids, num_segments=nbs)
+        c = jax.ops.segment_sum(jnp.ones_like(values), ids, num_segments=nbs)
+        return (s / jnp.maximum(c, 1.0))[ids]
+
+    return jax.vmap(jax.vmap(_mean), in_axes=(0, None))(values_ak, gid)
+
+
+def sigma_commutator(
+    delta_h_dft,
+    velocity_dft_cart,
+    energies_dft_kn_ry,
+    forward_links,
+    forward_neighbors,
+    *,
+    mesh: Mesh,
+    kgrid,
+    bvec_cart,
+    nb_logical: int,
+    nb_links: int,
+    collapsed_position=None,
+    group_tol_ry: float = BAND_DIAGONAL_GROUP_TOL_RY,
+):
+    r"""The Sigma term ``i[DeltaH, r]`` of the QSGW velocity, head block.
+
+    Split ``DeltaH`` in the DFT band basis into a band-diagonal part and a
+    remainder (``docs/theory/qp-velocity.md`` section 4a),
+
+        ``DeltaH = D + R,   D = sum_n dbar_n |n><n|,``
+
+    with ``dbar_n`` the mean of ``Re DeltaH_ll`` over the group of ``n``
+    (contiguous DFT bands at one k closer than ``group_tol_ry``; an exact
+    multiplet is always one group, so ``D`` does not depend on the frame
+    chosen inside it).  For ``D`` the commutator needs no k derivative
+    across groups, because ``A_nm = i v_nm/(E_m - E_n)`` exactly for
+    non-degenerate DFT eigenstates:
+
+        ``(i[D, r])_nm = v_nm (dbar_n - dbar_m)/(E_n - E_m)``  (different groups),
+        ``(i[D, r])_nm = delta_nm d_k dbar_g``                 (same group g).
+
+    The intraband term ``d_k dbar_g`` is the group mean of the diagonal of
+    the link derivative of ``D`` (gauge-invariant: a trace over the group).
+    Only ``R`` goes through the links, ``D_k R``
+    (:func:`covariant_link_derivative`).  A scissor ``DeltaH = Delta P_c``
+    is all ``D`` and is therefore exact; the link route alone returns
+    ``sin(b.s)/b`` of a term of range ``s``.
+
+    Collapsed axes: ``D_k R`` uses the stored ``Z_a`` there as before; the
+    ``D`` term uses ``v`` along every Cartesian axis (on a slab the two
+    agree up to the vacuum tail of the wrapped position).
+
+    Shapes: ``delta_h_dft`` (nk, nb_o, nb_o) ``P(None, x, y)`` on the outer
+    link set (``nb_links`` logical bands, outer storage ``nb_o``);
+    ``velocity_dft_cart`` (3, nk, nb_s, nb_s) ``P(None, None, x, y)``, head
+    block (``nb_logical`` logical bands), Ry bohr; ``energies_dft_kn_ry``
+    (nk, nb_links) host, Ry, ascending.  Two link derivatives (``R`` and
+    ``D``) per call.
+
+    Returns ``(correction, link_part, remainder_fraction)``: the head-block
+    Sigma term (3, nk, nb_s, nb_s) Ry bohr, its link part ``D_k R``, and
+    ``||R||_F/||DeltaH||_F`` over the outer set (0 for a scissor).
+    """
+    delta = jnp.asarray(delta_h_dft, dtype=jnp.complex128)
+    nk, nbo = int(delta.shape[0]), int(delta.shape[-1])
+    nbl_links = int(nb_links)
+    e_host = np.asarray(energies_dft_kn_ry, dtype=np.float64)
+    if e_host.ndim != 2 or e_host.shape[0] != nk or e_host.shape[1] < nbl_links:
+        raise ValueError(
+            f"energies_dft_kn_ry must be (nk={nk}, >= {nbl_links}); got "
+            f"{e_host.shape}")
+    if nbl_links > nbo or int(nb_logical) > nbl_links:
+        raise ValueError(
+            f"need nb_logical <= nb_links <= outer storage; got "
+            f"{nb_logical}, {nbl_links}, {nbo}")
+    e_outer = np.zeros((nk, nbo))
+    e_outer[:, :nbl_links] = e_host[:, :nbl_links]
+    diag_op, remainder, dbar, gid = _band_group_kernel(
+        mesh, nb_live=nbl_links, tol_ry=float(group_tol_ry))(
+        delta, jnp.asarray(e_outer))
+    derive = partial(covariant_link_derivative, forward_links=forward_links,
+                     forward_neighbors=forward_neighbors, mesh=mesh,
+                     kgrid=kgrid, bvec_cart=bvec_cart,
+                     collapsed_position=collapsed_position)
+    head = partial(head_band_block, nb_head=int(nb_logical), mesh=mesh,
+                   nb_outer=nbl_links)
+    link_part = head(derive(remainder))
+    intraband = _group_mean_diagonal(jnp.real(jnp.diagonal(
+        derive(diag_op), axis1=-2, axis2=-1)), gid)
+    v = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
+    nbs = int(v.shape[-1])
+    width = min(nbs, nbo)
+
+    def _head_vec(a, fill):
+        a = a[..., :width]
+        pad = nbs - width
+        return (jnp.pad(a, [(0, 0)] * (a.ndim - 1) + [(0, pad)],
+                        constant_values=fill) if pad else a)
+
+    # Padded head slots get their own group ids (no cross term reaches them:
+    # the kernel masks every band >= nb_logical).
+    gid_head = _head_vec(gid, -1)
+    exact_part = _band_diagonal_commutator_kernel(
+        mesh, nb_logical=int(nb_logical))(
+        v, _head_vec(dbar, 0.0), _head_vec(jnp.asarray(e_outer), 0.0),
+        gid_head, _head_vec(intraband, 0.0))
+    norm = jnp.sqrt(jnp.sum(jnp.abs(delta) ** 2))
+    remainder_fraction = float(jax.device_get(
+        jnp.sqrt(jnp.sum(jnp.abs(remainder) ** 2))
+        / jnp.maximum(norm, 1.0e-300))) if float(jax.device_get(norm)) > 0 else 0.0
+    return exact_part + link_part, link_part, remainder_fraction
+
+
+def scissor_capture(source, *, mesh: Mesh, kgrid, shift_ry: float = 0.1):
+    r"""Scissor self-test of the Sigma-term route on this run's links.
+
+    Replaces ``DeltaH`` by a rigid shift of the empty states,
+    ``DeltaH = Delta P_c`` (DFT basis, the whole outer link set), whose
+    commutator is known exactly:
+    ``<v|i[DeltaH, r]|c> = v^DFT_vc Delta/(E_c - E_v)``.  Returns
+    ``(f_links, f_route)``, the fraction of it recovered by the link
+    derivative alone (:func:`covariant_link_derivative`, the route before the
+    band-diagonal split) and by :func:`sigma_commutator` (the route every map
+    takes), both
+
+        ``f = sum w Re(conj(x) y) / sum w |x|^2,   w = 1/(E_c - E_v)^3``
+
+    over the valence-conduction pairs of the head block (``x`` exact, ``y``
+    the route), the static-head weight.  ``None`` on a source without links
+    or without a direct gap at every k (a metal).
+    """
+    if getattr(source, "forward_links", None) is None:
+        return None
+    e = np.asarray(source.energies_dft_kn_ry, dtype=np.float64)
+    occ = np.asarray(source.occupations_dft_kn, dtype=np.float64)
+    nbl, nbo_l = int(source.nb_logical), int(source.nb_links or source.nb_logical)
+    n_occ = int(np.count_nonzero(occ[0] > 0.5))
+    if not (0 < n_occ < nbl) or np.any(np.count_nonzero(occ > 0.5, axis=1) != n_occ):
+        return None
+    if float(np.min(e[:, n_occ] - e[:, n_occ - 1])) <= 1.0e-6:
+        return None
+    from common.parallel_transport import band_storage_extent
+    nbo = band_storage_extent(mesh, nbo_l)
+    nk = int(e.shape[0])
+    band = np.arange(nbo)
+    shift = np.where((band >= n_occ) & (band < nbo_l), float(shift_ry), 0.0)
+
+    @partial(jax.jit, out_shardings=NamedSharding(mesh, P(None, "x", "y")))
+    def _scissor(s):
+        return jnp.zeros((nk, nbo, nbo), dtype=jnp.complex128).at[
+            :, band, band].set(s.astype(jnp.complex128)[None, :])
+
+    scissor = _scissor(jnp.asarray(shift))
+    common = dict(mesh=mesh, kgrid=tuple(int(n) for n in kgrid),
+                  bvec_cart=source.reciprocal_lattice_cart,
+                  collapsed_position=source.collapsed_position)
+    links_only = head_band_block(covariant_link_derivative(
+        scissor, source.forward_links, source.forward_neighbors, **common),
+        nbl, mesh=mesh, nb_outer=nbo_l)
+    route, _, _ = sigma_commutator(
+        scissor, source.velocity_dft_cart, e, source.forward_links,
+        source.forward_neighbors, nb_logical=nbl, nb_links=nbo_l, **common)
+    v = jnp.asarray(source.velocity_dft_cart, dtype=jnp.complex128)
+    nbs = int(v.shape[-1])
+    eh = np.zeros((nk, nbs))
+    eh[:, :min(nbs, nbo_l)] = e[:, :min(nbs, nbo_l)]
+    return tuple(float(x) for x in jax.device_get(_scissor_fraction_kernel(
+        mesh, n_occ=n_occ, nb_logical=nbl)(
+        v, jnp.asarray(eh), float(shift_ry), links_only, route)))
+
+
+def _scissor_fraction_kernel(mesh: Mesh, *, n_occ: int, nb_logical: int) -> Callable:
+    key = ("scissor_fraction", id(mesh), int(n_occ), int(nb_logical))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    tile = NamedSharding(mesh, P(None, "x", "y"))
+    nv, nbl = int(n_occ), int(nb_logical)
+
+    @jax.jit
+    def _kernel(v, e, shift, *routes):
+        band = jnp.arange(int(v.shape[-1]))
+        vc = ((band[:, None] < nv) & (band[None, :] >= nv)
+              & (band[None, :] < nbl))[None]
+        de = jax.lax.with_sharding_constraint(
+            e[:, None, :] - e[:, :, None], tile)       # E_c - E_v at [v, c]
+        safe = jnp.where(vc, de, 1.0)
+        w = jnp.where(vc, 1.0 / safe ** 3, 0.0)[None]
+        exact = v * jnp.where(vc, shift / safe, 0.0)[None]
+        den = jnp.sum(w * jnp.abs(exact) ** 2)
+        return jnp.stack([jnp.sum(w * jnp.real(jnp.conj(exact) * y)) / den
+                          for y in routes])
+
+    _KERNEL_CACHE[key] = _kernel
+    return _kernel
 
 
 def _active_rotation_kernel(mesh: Mesh, nb_active: int) -> Callable:
@@ -3968,9 +4279,12 @@ class QPVelocity:
     ``dipole_qsgw.h5`` both take this array and the map's ``U``, so the SC
     screening and the BSE dipoles see one velocity.  ``base`` is ``v_DFT``;
     ``correction`` the Sigma term added (None when absent or zeroed);
-    ``bound`` the link bound (information); ``zeroed`` why the links
-    cannot serve the term on any map of this run (None: served);
-    ``label`` the terms in words (the dipole file's ``velocity`` stamp).
+    ``bound`` the link bound (information; on ``parallel_transport``
+    ``(link_error, |D_k R|/|v_DFT|, bound, |R|/|DeltaH|)``); ``zeroed`` why
+    the links cannot serve the term on any map of this run (None: served);
+    ``label`` the terms in words (the dipole file's ``velocity`` stamp);
+    ``correction_parts`` the Sigma term's ``(name, array)`` pieces when it has
+    several (``Sigma_d`` exact band-diagonal, ``Sigma_R`` links), else None.
     """
 
     dft_cart: jax.Array
@@ -3979,6 +4293,7 @@ class QPVelocity:
     bound: tuple | None
     zeroed: str | None
     label: str
+    correction_parts: tuple | None = None
 
 
 def qp_velocity(
@@ -3997,6 +4312,7 @@ def qp_velocity(
     link_error: float | None = None,
     velocity_base_cart=None,
     link_unserved: str | None = None,
+    energies_dft_kn_ry=None,
 ) -> QPVelocity:
     """The owner of the SC velocity: ``v_DFT`` plus this map's Sigma term.
 
@@ -4004,7 +4320,10 @@ def qp_velocity(
     ``sc_head_update = dft_velocity``: ``delta_h_dft`` is unused.  With
     ``velocity_base_cart`` (``interband_commutator``) ``velocity_dft_cart``
     already holds ``v + [DeltaH, W]``.  ``parallel_transport`` adds
-    ``D_k DeltaH`` whenever the source carries links.  A source whose links
+    ``i[DeltaH, r]`` whenever the source carries links: the band-diagonal
+    part of ``DeltaH`` exactly and the remainder ``D_k R`` through the links
+    (:func:`sigma_commutator`; ``energies_dft_kn_ry`` (nk, nb_links) are the
+    outer set's DFT energies, Ry).  A source whose links
     are incomplete or fail the stencil or window-hybridization gate carries
     none and names the reason in ``link_unserved``: the term is then zero
     on every map of the run, ``U^dagger v_DFT U``, with no refusal and no
@@ -4013,7 +4332,7 @@ def qp_velocity(
     logged :func:`link_correction_bound`.
     """
     v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
-    base, correction, bound = v_dft_basis, None, None
+    base, correction, bound, parts = v_dft_basis, None, None, None
     if velocity_base_cart is not None:
         # interband_commutator hands v + [DeltaH, W]: its Sigma term is the
         # difference from the DFT velocity p + i[r, V_NL].
@@ -4025,34 +4344,39 @@ def qp_velocity(
             raise ValueError(
                 "forward_neighbors are required when forward_links are present"
             )
-        # On an outer link set the derivative is taken there and restricted
-        # to the head's bands (identity when the two sets agree).
-        correction = head_band_block(covariant_link_derivative(
-            delta_h_dft,
-            forward_links,
-            forward_neighbors,
-            mesh=mesh,
-            kgrid=kgrid,
-            bvec_cart=bvec_cart,
-            collapsed_position=collapsed_position,
-        ), int(nb_logical), mesh=mesh,
-            nb_outer=int(nb_links or nb_logical))
+        if energies_dft_kn_ry is None:
+            raise ValueError(
+                "parallel_transport Sigma term needs the outer set's DFT "
+                "energies (ParallelTransportHeadData.energies_dft_kn_ry)")
+        # Exact band-diagonal part + links for the remainder only; on an
+        # outer link set the derivative is taken there and restricted to the
+        # head's bands (identity when the two sets agree).
+        correction, link_part, remainder_fraction = sigma_commutator(
+            delta_h_dft, v_dft_basis, energies_dft_kn_ry,
+            forward_links, forward_neighbors, mesh=mesh, kgrid=kgrid,
+            bvec_cart=bvec_cart, nb_logical=int(nb_logical),
+            nb_links=int(nb_links or nb_logical),
+            collapsed_position=collapsed_position)
+        parts = (("Sigma_d", correction - link_part), ("Sigma_R", link_part))
         if link_error is not None:
+            # Only D_k R rides the links, so only it carries their error.
             bound = link_correction_bound(
-                correction, v_dft_basis, occupations_qp_kn,
-                link_error=link_error)
+                link_part, v_dft_basis, occupations_qp_kn,
+                link_error=link_error) + (remainder_fraction,)
         v_dft_basis = v_dft_basis + correction
     if velocity_base_cart is not None:
         label = ("v_DFT + [DeltaH, W] (interband_commutator; intraband "
                  "connection omitted)")
     elif forward_links is not None:
-        label = "v_DFT + D_k DeltaH (parallel_transport links)"
+        label = ("v_DFT + i[DeltaH, r] (parallel_transport: band-diagonal "
+                 "part exact, remainder D_k R on the links)")
     elif zeroed is not None:
         label = f"v_DFT (D_k DeltaH zeroed: {zeroed})"
     else:
         label = "v_DFT (dft_velocity: no Sigma term)"
     return QPVelocity(dft_cart=v_dft_basis, base=base, correction=correction,
-                      bound=bound, zeroed=zeroed, label=label)
+                      bound=bound, zeroed=zeroed, label=label,
+                      correction_parts=parts)
 
 
 @dataclass(frozen=True)
@@ -4101,7 +4425,9 @@ def head_velocity_terms(
     pieces = ([("p", velocity_kinetic_cart),
                ("V_NL", base - velocity_kinetic_cart)]
               if velocity_kinetic_cart is not None else [("p + V_NL", base)])
-    if correction is not None:
+    if velocity.correction_parts is not None:
+        pieces.extend(velocity.correction_parts)
+    elif correction is not None:
         pieces.append(("Sigma", correction))
     names, shares = velocity_term_shares(
         v_qp, [(name, rotate_velocity_active_to_qp(

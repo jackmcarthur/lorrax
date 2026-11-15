@@ -3523,11 +3523,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             velocity_base_cart=(pt.velocity_dft_cart
                                 if isinstance(pt, InterbandCommutatorHeadData)
                                 else None),
-            link_unserved=getattr(pt, "link_unserved", None))
+            link_unserved=getattr(pt, "link_unserved", None),
+            energies_dft_kn_ry=getattr(pt, "energies_dft_kn_ry", None))
         # The dipole write reads only v and its label: the Sigma term and
         # v_DFT are not carried past this map's head.
         qsgw_velocity = (replace(velocity, base=None,
-                                 correction=None),
+                                 correction=None, correction_parts=None),
                          U_full, wfns_qp.enk[:, :nb_storage],
                          int(pt.nb_logical))
     if pt is not None and uses_direct_bispinor_tangential_head(inputs.config):
@@ -4217,11 +4218,12 @@ def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
                      f"{np.sqrt(max(v, 0.0)):.4f}" for v in total) + " eV")
                     if metal else ""))
     if bound is not None:
-        link_error, ratio, value = bound
+        link_error, ratio, value, remainder = bound
         lines.append(
             f"      link bound: rel_err(links) {link_error:.3e} x "
-            f"|D_k dH|/|v_DFT| {ratio:.3e} = {value:.3e} (information; "
-            "falls with the k grid)")
+            f"|D_k R|/|v_DFT| {ratio:.3e} = {value:.3e} (information; "
+            "falls with the k grid); Sigma_d = exact band-diagonal part, "
+            f"Sigma_R = links on the remainder, |R|/|dH| = {remainder:.3e}")
     if zeroed is not None:
         lines.append(f"      Sigma term zeroed: {zeroed}")
     if (bound is not None or zeroed is not None) and (
@@ -6277,6 +6279,21 @@ def load_head_velocity_source(
         f"{vgate['transition_overlap_real']:+.6f}"
         f"{vgate['transition_overlap_imag']:+.2e}j; "
         f"full-matrix max_abs={vgate['max_abs']:.3e} diagnostic only)")
+    # Scissor self-test: what the links alone, and what the route every map
+    # takes, recover of an exactly known commutator, DeltaH = Delta P_c.
+    from .qsgw_head import scissor_capture
+    capture = scissor_capture(source, mesh=mesh, kgrid=wfn.kgrid)
+    if capture is None:
+        log.info("  SC head: scissor self-test skipped (no direct gap at "
+                 "every k: a metal)")
+    else:
+        log.info(
+            "  SC head: scissor self-test (DeltaH = Delta P_c, exact "
+            "v_vc Delta/(E_c-E_v), weight 1/dE^3): links alone recover "
+            f"f = {capture[0]:.4f}, the Sigma-term route (exact band-diagonal "
+            f"part + links on the remainder) f = {capture[1]:.4f}; link "
+            f"error on v_DFT {vgate['link_relative_error']:.3e} "
+            "(the v_DFT rebuild cannot see the scissor deficit)")
     return source
 
 
