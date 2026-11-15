@@ -29,6 +29,15 @@ row's own wings and κ_TF² (`qsgw_head.metal_static_gamma_body`), so
 - **Decks.** No change.
 - **Test.** `tests/test_metal_static_fold.py`.
 
+## 2026-11-14 — Fine-grid BSE refuses a head-off ISDF tensor file
+
+`kgrid_fine` now refuses an ISDF tensor file whose screened head is zero (GW
+`head_correction = off`), `GATE kgrid_fine_zero_head`.  On such a file the fine
+grid restores the small-q attraction while the QP energies keep no head: NiO
+d-d excitons fell 0.42 eV from 4^3 to 12^3 against a head-on file of the same
+run, an a/n drift that looks like k convergence.  Rerun GW with the head on, or
+solve on the GW grid.  Native-grid BSE is unchanged.
+
 ## 2026-11-14 — Fine-grid BSE in the QP basis of the GW run (`qp_rotations_file` with `kgrid_fine`)
 
 `qp_rotations_file` now runs under `kgrid_fine`.  The band interpolation is
