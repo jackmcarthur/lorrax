@@ -290,3 +290,11 @@ def test_qp_rotated_compact_states_keep_the_dft_velocity():
         ref = np.einsum("qcd,qxce,qef->xqdf", w[:, N_VAL:, N_VAL:].conj(), dx,
                         w[:, :N_VAL, :N_VAL])
         assert _rel(np.asarray(dip["d_alpha"])[:, shared], ref) < 1e-8
+
+
+def test_kgrid_fine_refuses_a_zero_head():
+    """GATE kgrid_fine_zero_head fires on a head-off ISDF tensor file and passes a head-on one."""
+    from bse.bse_loading import refuse_zero_head_densify
+    with pytest.raises(ValueError, match="GATE kgrid_fine_zero_head"):
+        refuse_zero_head_densify(0.0, (8, 8, 8))
+    refuse_zero_head_densify(363.144629, (8, 8, 8))

@@ -28,6 +28,25 @@ from common.log import get_logger
 log = get_logger(__name__)
 
 
+def refuse_zero_head_densify(whead_ry_bohr3: float, fine_grid) -> None:
+    """GATE kgrid_fine_zero_head: a densified W needs a nonzero q -> 0 head.
+
+    On the fine grid the srlr model restores the small-q attraction at every
+    fine q != 0, while the Gamma head is scaled to the bundle's own whead; with
+    whead = 0 (GW head_correction = off) the QP energies keep no head and the
+    neutral-excitation cancellation breaks (NiO 4^3 -> 12^3: d-d -0.42 eV
+    against the head-on bundle, an a/n drift).
+    """
+    if float(whead_ry_bohr3) == 0.0:
+        raise ValueError(
+            f"GATE kgrid_fine_zero_head: got kgrid_fine = {tuple(fine_grid)} on an "
+            f"ISDF tensor file whose screened head whead = 0 (GW head_correction = "
+            f"off); want a head-on GW run.  why: the fine grid adds back the small-q "
+            f"attraction but not the head in the QP energies, so excitons sink as "
+            f"1/N_k^(1/3).  fix: rerun GW with head_correction on, or solve on the "
+            f"GW grid (no kgrid_fine).")
+
+
 def no_w_operand(mesh_xy: Mesh) -> jax.Array:
     """The W slot of a kernel without the screened direct term: a (p_x, p_y, 1, 1, 1)
     zero tile at ``P('x','y',None,None,None)``.  No matvec reads it (``kernel='rpa'``
@@ -391,6 +410,7 @@ def load_bse_data_from_restart_sharded(
                      f"V_cell={cell_volume:.2f}): {head_str} "
                      f"[source: {head_src}]")
             if defer_whead and w0_ready and whead is not None:
+                refuse_zero_head_densify(complex(whead[0]).real, fine_grid)
                 head_channel = {
                     "whead": float(complex(whead[0]).real),
                     "cell_volume": float(cell_volume),
