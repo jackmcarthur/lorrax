@@ -145,24 +145,21 @@ def piece_band_matrices(field, mesh) -> dict:
 def smooth_direct_field(config, wfn, sym, meta, setup, nb, mesh):
     """``<m|alpha.A[J]|n>`` (nk, nb, nb) Ry for ``double_counting = paw``, else ``None``.
 
-    The carrier arguments are ``gw.sigma_dispatch._compute_live_hartree``'s:
-    four-current representation, ``charge_nspinor`` (the leading psi_L
-    block on the diagnostic ``large`` charge lift) and ``bispinor_lift``.
+    The call is ``gw.sigma_dispatch._compute_live_hartree``'s: the carrier
+    (two-component charge, raw-lift current) is the direct field's own, and
+    ``bispinor_transverse_hartree`` is honoured.
     """
     if setup.double_counting != "paw":
         return None
     from dataclasses import replace
-    from common.four_current_model import resolve_four_current_representation
     from file_io.qe_save_reader import dft_sys_dim
-    representation = resolve_four_current_representation(config.bispinor, config.bispinor_gw)
     hartree_meta = replace(meta, nspinor=4, npol=4) if int(meta.nspinor) != 4 else meta
     exact = direct_field_matrices(
         wfn, sym, hartree_meta,
         truncation_2d=(dft_sys_dim(wfn, fallback=config.sys_dim) == 2),
         transverse_truncation_2d=(int(config.sys_dim) == 2),
+        transverse_hartree=bool(getattr(config, "bispinor_transverse_hartree", True)),
         nb=nb, mesh=mesh, include_transverse=True,
-        charge_nspinor=(int(wfn.nspinor) if representation.charge_lift == "large" else None),
-        bispinor_lift=(representation.current_lift or "raw"),
         return_sharded=False)
     return np.asarray(exact.transverse, dtype=np.complex128)
 

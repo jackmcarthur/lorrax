@@ -649,7 +649,8 @@ def _static_onsite_breit(config, wfn, sym, band_slices, mesh_xy, *, input_dir,
     # Sigma carries the bare TT exchange on every bispinor route (gw_jax
     # refuses bispinor = true without the transverse bundle), never otherwise.
     setup = onsite_breit_setup_for(
-        config, wfn, input_dir=input_dir, tt_exchange=bool(config.bispinor))
+        config, wfn, input_dir=input_dir,
+        tt_exchange=bool(config.bispinor) and bool(getattr(config, "bispinor_transverse_exchange", True)))
     if setup is None:
         return h_transverse, None
     with timing.section("sigma.onsite_breit") as sec:
