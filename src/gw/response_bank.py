@@ -2185,9 +2185,38 @@ def _gather_group_rules(requests, tree):
         attempts = {node: got for node, got in known[i].items() if got is not _REFUSED}
         refused = [node for node in t.pending(attempts) if node in errors[i]]
         if refused:
-            raise ValueError(errors[i][refused[0]])
+            raise ValueError(_response_fit_refusal(t, refused[0], errors[i][refused[0]]))
         out.append(t.rules(attempts))
     return out
+
+
+def _response_fit_refusal(tree, node, error):
+    """The deck-level refusal of a one-sample response fit (the service's text otherwise).
+
+    The service refuses one bank sample whose complex-time fit over the chi0
+    interval passes no acceptance; its sample sits at ``site + i*height`` of
+    the tangential support. Measured on NiO (CONV_NIO T6, interval 4.3-379 eV,
+    height 2.6 eV): the fit passes up to Re z = 67.0 eV and the mass gate
+    refuses it from 67.7 eV, i.e. from Re z / Im z of about 26; height 3.0 eV
+    admits sites to at least 78 eV.
+    """
+    if len(node) != 1 or "response exponential fit failed" not in error:
+        return error
+    z = complex(np.asarray(tree.z)[node[0]]) * RYD_TO_EV
+    lo, hi = tree.lo * RYD_TO_EV, tree.hi * RYD_TO_EV
+    gate = error.split("refused by: ", 1)[-1] if "refused by: " in error else "see below"
+    return (
+        f"GATE tangential_response_fit: got: the W bank sample z = {z.real:.3f} + "
+        f"{z.imag:.3f}i eV (Re z / Im z = {z.real / z.imag:.1f}) over the chi0 interval "
+        f"[{lo:.3f}, {hi:.3f}] eV, refused by the {gate}; want: a support whose line "
+        f"samples keep Re z / Im z below about 26 (NiO, 2.6 eV height: passes to 67.0 eV, "
+        f"refused from 67.7 eV); why: this sample's W(z) has no accepted exponential "
+        f"rule, so the run cannot build W. The resolver puts its top line site near the "
+        f"highest Sigma read, so a wider QP window raises it. Fix: "
+        f"sigma_w_support_sites_ev = \"<line eV> | <imaginary eV> | <height eV>\": "
+        f"the ladder of a narrower window that ran (its Sigma reads above the top site "
+        f"then use the pole model's extrapolation), or a line height of at least "
+        f"{z.real / 25.0:.2f} eV for this site. Service text: {error}")
 
 
 #: The energy pad (eV) of a held SC response plan: the rule interval and the

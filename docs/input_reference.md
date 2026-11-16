@@ -135,7 +135,7 @@ the QE-schema receipt and the occupied two-component DFT states
 | `ppm_head_omega_h_ry` | float | unset | Direct override of the q→0 head pole Ω_h (Ry). |
 | `ppm_invalid_mode` | str | `static_limit` | Treatment of a mode with no valid Ω² fit: `static_limit` (BerkeleyGW mode 3; alias `infinity`), `zero` (mode 0; alias `skip`) or `2ry` (mode 2). `imaginary` refuses. |
 | `sigma_w_accuracy` | str | `production` | Tangential recipe tier: `production` or `relaxed`. It requires `compute_mode = tangential`. |
-| `sigma_w_support_sites_ev` | str | `""` | Tangential ladder override: `"<line eV list> \| <imaginary eV list>"`, each strictly increasing. Empty keeps the resolver's line rule and the Zolotarev imaginary ladder. The sites enter the recipe hash, so a model built on another ladder refuses. It requires `compute_mode = tangential`. |
+| `sigma_w_support_sites_ev` | str | `""` | Tangential ladder override: `"<line eV list> \| <imaginary eV list>"`, each strictly increasing, with an optional third field `\| <line height eV>` replacing the line height $\max(2.6\,\mathrm{eV},4\eta)$. Empty keeps the resolver's line rule and the Zolotarev imaginary ladder. It is the route past `GATE tangential_response_fit` at wide QP windows: a narrower window's ladder, or a larger height (NiO: 3.0 eV admits line sites to 78 eV). The sites enter the recipe hash, so a model built on another ladder refuses. It requires `compute_mode = tangential`. |
 
 `bispinor_tt_head_correction` is not a deck key: the transverse Γ head comes
 with `head_correction`, and a deck that names the key refuses at parse.

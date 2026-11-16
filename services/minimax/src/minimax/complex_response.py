@@ -690,8 +690,16 @@ class ResponseGroupTree:
             one = np.asarray([pole])
             got = _shared_times(lo, hi, one, tol, None, decay_rate, pencil=self.pencil, **tuned)
             if got is None:
+                # Which acceptance refused it, measured on the refusal path only:
+                # the same scan with the coefficient-mass gate lifted.
+                lifted = _shared_times(lo, hi, one, tol, None, decay_rate,
+                                       capacity=self.capacity, max_kappa=np.inf)
+                gate = (f'coefficient-mass gate (kappa <= {self.max_kappa:g}): a fit exists past it'
+                        if lifted is not None else
+                        f'no node set within capacity {self.capacity} reaches the tolerance')
                 raise ValueError(f'response exponential fit failed: interval={lo, hi}, '
-                                 f'sample={z[members[0]]}, pole={pole}, tolerance={self.rel_tol}')
+                                 f'sample={z[members[0]]}, pole={pole}, tolerance={self.rel_tol}; '
+                                 f'refused by: {gate}')
             sets.append((got[0], one, got[1]))
         rule = _rule(z[members], sets, *((2*self.capacity,) if self._tuned else ()))
         return [dict(rule, members=list(members), reference_ry=self.reference)]

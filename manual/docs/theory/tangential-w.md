@@ -307,7 +307,7 @@ $$
 where $\epsilon_{\mathrm{bank}}$ is the tier's `bank_rule_tolerance`, which is $10^{-8}$ in production, and $A\ge1$ is the occupation amplitude. The squared pole meets the same bound with the weight $(\mathrm{Im}\,p)^3/2|p|$, and both bounds are checked on samples but have not been proven. A group of supports that fails is retried with nodes on the imaginary time axis, at most 192 of them, and is then halved. With smeared occupations the reference is $\Delta_r=0$ and $0\le\mathrm{Re}\,t_i\le\beta$, the decay rate of the occupation tails, which is the inverse smearing temperature, and otherwise $\Delta_r=\Delta_{\min}$. Under self-consistency the rule is reused from map to map while its interval still holds (§[7.11](#bank-sc)).
 
 !!! refuses
-    - A single support whose pole cannot be fitted (`response exponential fit failed`). Use `sigma_w_accuracy = relaxed` or narrow the band window.
+    - A single support whose pole cannot be fitted (`GATE tangential_response_fit`, which names the sample $z$ in eV, its ratio $\mathrm{Re}\,z/\mathrm{Im}\,z$ and the bound of (6.3) that refused it). The usual case is a wide QP window: the top line site follows the highest $\Sigma$ read, and the coefficient-mass bound refuses a line sample once $\mathrm{Re}\,z/\mathrm{Im}\,z$ exceeds about 26 (NiO, 2.6 eV height: 67.0 eV passes, 67.7 eV is refused). Set `sigma_w_support_sites_ev` to a narrower window's ladder, or raise its line height (third field; 3.0 eV admits NiO sites to 78 eV). Otherwise use `sigma_w_accuracy = relaxed` or narrow the band window.
 
 ---
 
