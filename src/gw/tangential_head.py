@@ -283,9 +283,17 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
         native = distrib_la.matmul_workspace_bytes_per_rank(
             mesh_xy, (b.shape, (b.shape[0], b.shape[2], b.shape[1])), np.complex128,
             backend=route[0], batched_route=route[1])
-        # A metal static row: chi_FS and its Dyson solve's faces (solve_w admits its route).
-        static_extra = (6*16*int(b.shape[1])*int(b.shape[1])//mesh_xy.size
-                        if static_body.any() else 0)
+        # A metal static row adds the compiled chi_FS program; solve_w admits its own Dyson route.
+        static_extra = 0
+        if static_body.any() and response.static_surface is not None:
+            from runtime.aot_memory import compiled_new_bytes
+            from .qsgw_head import static_intraband_body_program
+            surface, nb_logical, nspin, nspinor = response.static_surface
+            kernel, operands = static_intraband_body_program(
+                wfns, surface, mesh=mesh_xy, nb_logical=nb_logical,
+                nk_tot=int(meta.nk_tot), nspin=nspin, nspinor=nspinor)
+            static_extra = compiled_new_bytes(kernel.lower(*operands).compile())
+            del kernel, operands
         name, _ = _reserve(meta, "head", resident,
             3*stats.output_size_in_bytes+stats.temp_size_in_bytes+native+static_extra)
         ledger.live_stages = ambient+(name,)

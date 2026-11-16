@@ -2564,6 +2564,16 @@ def static_intraband_body_sharded(
     normalization (Dyson at unit prefactor).  ``(1, n_mu, n_mu)`` complex128,
     ``P(None, 'x', 'y')``; docs/theory/metal-q0-head.md section 3.
     """
+    kernel, operands = static_intraband_body_program(
+        wfns, surface_weight_kn, mesh=mesh, nb_logical=nb_logical,
+        nk_tot=nk_tot, nspin=nspin, nspinor=nspinor)
+    return kernel(*operands)
+
+
+def static_intraband_body_program(wfns, surface_weight_kn, *, mesh: Mesh, nb_logical: int,
+                                  nk_tot: int, nspin: int, nspinor: int):
+    """``(kernel, operands)`` of :func:`static_intraband_body_sharded`, so a caller can
+    price the compiled program before running it."""
     if getattr(wfns, "layout", None) not in ("face", "axis"):
         raise ValueError(
             "static_intraband_body_sharded requires a canonical face or axis layout")
@@ -2577,18 +2587,17 @@ def static_intraband_body_sharded(
     else:
         rows = jnp.moveaxis(weight, 1, 0)
         perm = np.asarray(classes.local_perm, dtype=np.int32)
-    replicated = NamedSharding(mesh, P())
-    body = _static_intraband_body_kernel(
-        mesh, face.layout, plan is not None, window)(
-            face.psi_mun, face.psi_nmu,
-            device_put_process_local(rows, replicated),
-            device_put_process_local(jnp.asarray(perm), replicated))
     prefactor = -2.0 / (
         float(nk_tot)
         * float(max(int(nspin), 1))
         * float(max(int(nspinor), 1))
     )
-    return (prefactor * body).astype(jnp.complex128)
+    replicated = NamedSharding(mesh, P())
+    operands = (face.psi_mun, face.psi_nmu,
+                device_put_process_local(rows, replicated),
+                device_put_process_local(jnp.asarray(perm), replicated),
+                device_put_process_local(jnp.asarray(prefactor, jnp.float64), replicated))
+    return _static_intraband_body_kernel(mesh, face.layout, plan is not None, window), operands
 
 
 def _static_intraband_body_kernel(mesh: Mesh, layout: str, classes: bool,
@@ -2607,7 +2616,7 @@ def _static_intraband_body_kernel(mesh: Mesh, layout: str, classes: bool,
     distributed_bands = layout == "face"
     lo, hi = (int(v) for v in window)
 
-    def _local(psi_mun_local, psi_nmu_local, weight_rows, perm):
+    def _local(psi_mun_local, psi_nmu_local, weight_rows, perm, prefactor):
         mu_x, nu_y = psi_mun_local.shape[2], psi_nmu_local.shape[3]
         if classes:
             perm_x = jax.lax.dynamic_slice_in_dim(
@@ -2632,11 +2641,11 @@ def _static_intraband_body_kernel(mesh: Mesh, layout: str, classes: bool,
         acc, _ = jax.lax.scan(
             row, jnp.zeros((mu_x, nu_y), dtype=jnp.float64),
             (psi_mun_local, psi_nmu_local, weight_rows))
-        return acc[None]
+        return (prefactor * acc).astype(jnp.complex128)[None]
 
     kernel = jax.jit(shard_map(
         _local, mesh=mesh,
-        in_specs=(mun_spec, nmu_spec, P(), P()),
+        in_specs=(mun_spec, nmu_spec, P(), P(), P()),
         out_specs=P(None, "x", "y"), check_vma=False))
     _KERNEL_CACHE[key] = kernel
     return kernel
