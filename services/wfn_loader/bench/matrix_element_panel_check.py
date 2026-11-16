@@ -136,6 +136,7 @@ for nb in map(int,a.bands.split(",")):
             else:
                 write_kin_ion(path,result,mesh=stack.mesh,nb=nb,
                     star=(np.arange(a.nk),np.zeros(a.nk,dtype=int),1),
+                    kpoints=(np.zeros((a.nk,3)),np.zeros((a.nk,3))),
                     attrs={"fixture_kind":"nonphysical_encoded_scaling_probe"})
             stream.write(json.dumps(dict(status="PASS",rank=rank,kind="write",
                 seconds=time.perf_counter()-started,rss_peak_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*1024,

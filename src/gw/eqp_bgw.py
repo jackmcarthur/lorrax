@@ -1138,6 +1138,12 @@ def make_eqp_bgw(
 		raise ValueError(
 			"post-hoc EQP refuses a retired kin_ion with folded Hartree; "
 			"regenerate pristine kin_ion.h5.")
+	# Both files are indexed at kirr_to_kfull below: their unfolded rows
+	# there must be the WFN's own k (file_io.kin_ion, "THE STORED ROW ORDER").
+	from file_io.restart_bundle import check_kpoints_against_run
+	for path in (kin_ion_path, sigma_mnk_path):
+		check_kpoints_against_run(path, kpoints_irr, rows=kirr_to_kfull,
+		                          print_fn=log.info)
 	kin_full = read_kin_ion_full_bz(kin_ion_path)
 	if kin_full.ndim != 3:
 		raise ValueError(f"kin_ion dataset must be (nk, nb, nb); got {kin_full.shape}")

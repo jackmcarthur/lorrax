@@ -81,7 +81,7 @@ from common.scientific_output import (
     band_range, pseudopotential_file_rows,
 )
 from wfn_loader import WfnLoader                                    # noqa: E402
-from file_io.kin_ion import write_kin_ion
+from file_io.kin_ion import star_wedge_kpoints, write_kin_ion
 from file_io.qe_save_reader import dft_sys_dim
 from gw.gw_config import (
     BispinorGWMode,
@@ -616,7 +616,7 @@ def main(argv=None):
         with timing.section("write_h5"):
             write_kin_ion(
                 out_path, H_kin_ion, mesh=mesh_xy, nb=nb_eff,
-                star=star_tables(sym),
+                star=star_tables(sym), kpoints=star_wedge_kpoints(sym),
                 attrs=_kin_ion_provenance(
                     args=args, wfn=wfn, wfn_path=wfn_path, sym=sym, meta=meta,
                     nb=nb_eff, nk_irr=nk_irr, sys_dim=sys_dim, ctx=ctx,

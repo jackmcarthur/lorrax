@@ -82,6 +82,7 @@ from .kin_ion import (
     K_STORAGE_VERSION_ATTR,
     N_SYM_SPATIAL_ATTR,
     SYM_IDX_DATASET,
+    queue_star_kpoints,
 )
 from file_io.restart_bundle import (read_star_map)
 
@@ -1468,6 +1469,7 @@ def write_sigma_omega_h5(
 	hartree_transverse_kij_ev=None,
 	mesh=None,
 	star=None,
+	kpoints=None,
 	star_already_selected=False,
 	omega_reference_ev=None,
 	omega_reference_provenance=None,
@@ -1537,6 +1539,11 @@ def write_sigma_omega_h5(
 	    the COMPLETE arrays, and only then are rows dropped.  Measuring
 	    after the drop would measure nothing — there would be one member
 	    per star left to compare.
+	``kpoints``
+	    Required with ``star``: ``file_io.kin_ion.star_wedge_kpoints(sym)``
+	    of the same ``SymMaps``.  The stored rows are in star order, not
+	    the WFN's k order (``sigma_diag.dat``'s), so the file carries both
+	    k lists in crystal coordinates beside the tables.
 	``star_already_selected``
 	    True only for the SC terminal writer, whose complete retained result
 	    already crossed the map's star-wedge seam.  The rows are validated and
@@ -1774,6 +1781,10 @@ def write_sigma_omega_h5(
 				np.asarray(compact_irr, dtype=np.int32))
 			io.write_attr(SYM_IDX_DATASET,
 				np.asarray(sym_idx_k, dtype=np.int32))
+			queue_star_kpoints(
+				io, kpoints, n_rows=int(np.max(compact_irr)) + 1,
+				nk_full=np.asarray(compact_irr).size,
+				where="write_sigma_omega_h5")
 		def _cube_attrs(name):
 			at = _operator_attrs(name)
 			if on_shell is not None:

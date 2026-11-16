@@ -369,7 +369,7 @@ cases the links are streamed on the full grid, chosen once at dipole time.
 |---|---|---|
 | `eqp0.dat`, `eqp1.dat`, `sigma_diag.dat` | file wedge | coordinates on each block |
 | `sigma_mnk.h5` | file wedge | `kin_ion` stamp contract, plus star-spread attributes measured on the full grid before reduction |
-| `kin_ion.h5` | file wedge | per-dataset `k_storage` and version, `irr_idx_k`, `sym_idx_k`; no attribute means full |
+| `kin_ion.h5` | file wedge | per-dataset `k_storage` and version, `irr_idx_k`, `sym_idx_k`, `kpoints_stored_crys`, `kpoints_full_crys` (readers check the full list: `check_kpoints_against_run`); no attribute means full |
 | `qp_wfn_rotations.h5` | file wedge only when the writer's own round trip reproduces the arrays, otherwise full (`qp_rotations_k_storage = auto`) | `k_storage` |
 | `isdf_tensors.h5` `V_qmunu`, `W0_qmunu` | q parents when reduced (`restart_q_storage = auto`) | per-dataset `q_storage` and the reconstruction tables |
 | `isdf_tensors.h5` `psi_parent_y*` | raw WFN parents, canonical centroids | `psi_parent_k_rows`; a `psi_full_*` dataset refuses |

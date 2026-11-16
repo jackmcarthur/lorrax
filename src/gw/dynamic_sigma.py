@@ -510,10 +510,11 @@ def write_sigma_omega(
 
     # One derivation of the star tables keeps the producer and consumer of
     # the antiunitary conjugation convention together.
-    star = None
+    star = kpoints = None
     if sym is not None:
+        from file_io.kin_ion import star_wedge_kpoints
         from .kin_ion_io import star_tables
-        star = star_tables(sym)
+        star, kpoints = star_tables(sym), star_wedge_kpoints(sym)
 
     from .ppm_sigma import is_on_shell
     if not is_on_shell(sigma_c):
@@ -560,7 +561,7 @@ def write_sigma_omega(
                 hartree_transverse_kij_ev=(
                     None if h_transverse is None
                     else RYD_TO_EV * h_transverse),
-                mesh=mesh_xy, star=star,
+                mesh=mesh_xy, star=star, kpoints=kpoints,
                 star_already_selected=star_already_selected,
                 omega_reference_ev=omega_reference_ev,
                 omega_reference_provenance=omega_reference_provenance,
@@ -585,7 +586,7 @@ def write_sigma_omega(
             hartree_transverse_kij_ev=(
                 None if h_transverse is None
                 else RYD_TO_EV * h_transverse),
-            mesh=mesh_xy, star=star,
+            mesh=mesh_xy, star=star, kpoints=kpoints,
             star_already_selected=star_already_selected,
             omega_reference_ev=omega_reference_ev,
             omega_reference_provenance=omega_reference_provenance,
@@ -621,7 +622,7 @@ def write_sigma_omega(
         hartree_transverse_kij_ev=(
             None if h_transverse is None
             else RYD_TO_EV * h_transverse),
-        mesh=mesh_xy, star=star,
+        mesh=mesh_xy, star=star, kpoints=kpoints,
         star_already_selected=star_already_selected,
         omega_reference_ev=omega_reference_ev,
         omega_reference_provenance=omega_reference_provenance,

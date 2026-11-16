@@ -210,13 +210,17 @@ attribute `omega_ev` (relative, stamped with `omega_reference_ev`), with no
 | `sigma_c_onshell_dsigma_kn` | $(n_k, n_b)$ | the exact $d\Sigma_{c,nn}/d\omega$ at the `pair` energies |
 | `sigma_eval_rel_ev` | $(n_k, n_b)$ | the energy each state's $\Sigma$ was read at, relative to the reference; attribute `sigma_eval_provenance` = `at_e_dft` (one-shot) or `self_consistent_qp` |
 | `irr_idx_k`, `sym_idx_k` | $(n_{k,\mathrm{full}})$ | for each full-grid point, its stored row and the symmetry operation that maps it |
+| `kpoints_stored_crys`, `kpoints_full_crys` | $(n_k, 3)$, $(n_{k,\mathrm{full}}, 3)$ | crystal coordinates of each stored row (its star's WFN k, modulo $\mathbf G$) and of each unfolded row |
 | `sigma_c_extrap_{inf,last,sigma}_kn_ev`, `sigma_c_extrap_beta_kn` | $(n_k, n_b)$ | band-extrapolation fit results, when it ran |
 | `sigma_xc_qsgw_kij_ev` | | only with `write_qsgw_datasets = true`: the Hermitian static QSGW $\Sigma_{xc}$ (and `qp_omega0_ev` only under `sigma_omega_grid_debug = true`) |
 
 Bands are 0-based from band 0. The k axis holds one representative per
 symmetry star of the full grid (`k_storage = "ibz"`); this can be fewer rows
 than the WFN's k list when the WFN stores symmetry-related points (for
-example $k$ and $-k$), and the file stores no k coordinates. The cubes are not
+example $k$ and $-k$). The rows are in star order, which is not the WFN's
+k order on a symmetry-reduced cell: pair them with `sigma_diag.dat` or the
+WFN through `kpoints_stored_crys`, never by row number (files written
+before 2026-11-16 carry no k coordinates). The cubes are not
 degeneracy-averaged. A file whose `lorrax_io_committed` attribute is 0 is an
 interrupted write.
 

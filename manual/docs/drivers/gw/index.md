@@ -200,7 +200,7 @@ A refusal names the key or file and the fix. The ones most runs meet are listed 
     - No `number_bands`, no `centroids_file`, or no band request (`nval` and `ncond`, or `number_bands_protected`). The message lists each missing key. 
     - An unknown key, or a `;` comment after a value. Delete the key; comments start with `#`. 
     - Fractional WFN occupations (a metal) with `compute_mode` left at `auto` (the message names `compute_mode = tangential`) or set to `cohsex`, `gn_ppm` or `hl_ppm`, without `occ_smearing_width_ry`, or with `sc_head_update = interband_commutator`. 
-    - A `kin_ion.h5` that is missing, has too few bands, or was built for another `sys_dim`, spinor count, k-point count or `bispinor` setting, or in the retired format with Hartree folded in. Rerun kin-ion. Its WFN fingerprint is not compared. 
+    - A `kin_ion.h5` that is missing, has too few bands, or was built for another `sys_dim`, spinor count, k-point count or k list (`GATE k_list_mismatch`), or `bispinor` setting, or in the retired format with Hartree folded in. Rerun kin-ion. Its WFN fingerprint is not compared. 
     - A missing `dipole.h5` with the head on, or one built with another velocity operator, with or without the nonlocal commutator. Under `head_correction = full`, also one from another WFN or band window; on the direct-head path that mismatch only warns, unless `LORRAX_SANITY=strict`. Rerun dipole on this input file and WFN. 
     - A centroid table whose fit windows drop an occupied band. Rerun centroids with windows that start at band 0. 
     - A `tmp/zeta_q.h5` left by a run with another centroid count or FFT grid in the same directory. Use a separate run directory or delete the file. 

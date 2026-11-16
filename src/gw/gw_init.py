@@ -3574,6 +3574,14 @@ def transverse_exchange_skip_bands(config, wfn, print0):
 
 def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn):
     """Produce the physical and padded band windows on the packed centroid basis."""
+    if config.nval is None or config.ncond is None:
+        raise ValueError(
+            "GATE band_request_unresolved: got: nval="
+            f"{config.nval}, ncond={config.ncond} (number_bands_protected="
+            f"{getattr(config, 'number_bands_protected', None)}); want: the "
+            "band request resolved against the WFN; why: the band windows are "
+            "counted from nval and ncond. Fix (caller): "
+            "config = config.with_band_request(wfn, print_fn) first.")
     from common import Meta
     from .wavefunction_bundle import BandSlices
     from .gw_config import uses_four_spinor_finite_q_charge
