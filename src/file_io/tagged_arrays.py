@@ -1081,7 +1081,7 @@ def write_restart_state_to_h5(
 
 
 def _stamp_qirr(f, qirr, n_rmu_logical, *, v_touched, w0_placeholder,
-                w0_data):
+                w0_data, w0_name="W0_qmunu"):
     """Stamp the q_irr tables/attrs onto datasets SlabIO has already written.
 
     Rank-0 only, called from inside the one h5py block that owns the
@@ -1117,13 +1117,14 @@ def _stamp_qirr(f, qirr, n_rmu_logical, *, v_touched, w0_placeholder,
                           closure_verdict=verdict, n_rmu_logical=n_log,
                           data_ready=True)
     if w0_data or w0_placeholder:
-        stamp_qirr_tensor(f, "W0_qmunu", tables=tables,
+        stamp_qirr_tensor(f, w0_name, tables=tables,
                           closure_verdict=verdict, n_rmu_logical=n_log,
                           data_ready=bool(w0_data))
 
 
 def write_w0_qmunu_to_h5(
     filename, W0_qmunu, *, n_rmu_logical: int, mesh=None, qirr=None,
+    name: str = "W0_qmunu",
 ):
     """Overwrite or append the W0_qmunu dataset in an existing restart file.
 
@@ -1139,6 +1140,10 @@ def write_w0_qmunu_to_h5(
 
     On the wedge arm the capture's parents ARE the data, so ``W0_qmunu`` is
     ``None`` there: the producer never forms the full-q W0 (TASTE 97).
+
+    ``name`` is the dataset written: ``W0_qmunu`` (the default) or a second
+    static W of the same layout and q storage, e.g. the ladder W(0)
+    (``file_io.restart_bundle.LADDER_W0``), with its own unfold tables.
     """
     from .slab_io import SlabIO
 
@@ -1175,16 +1180,16 @@ def write_w0_qmunu_to_h5(
     # not recreate/mutate W0 and only then report its bad geometry.
     shape = _mu_logical_shape(
         W0_qmunu.shape, (-2, -1), n_rmu_logical,
-        where="write_w0_qmunu_to_h5 dataset 'W0_qmunu'")
+        where=f"write_w0_qmunu_to_h5 dataset {name!r}")
     mu_tag = padded_mu_axis(
         int(n_rmu_logical),
         mesh if mesh is not None else int(jax.device_count()))
     authenticate_axis(
         W0_qmunu, mu_tag, axis=-2,
-        where="write_w0_qmunu_to_h5 dataset 'W0_qmunu'")
+        where=f"write_w0_qmunu_to_h5 dataset {name!r}")
     authenticate_axis(
         W0_qmunu, mu_tag, axis=-1,
-        where="write_w0_qmunu_to_h5 dataset 'W0_qmunu'")
+        where=f"write_w0_qmunu_to_h5 dataset {name!r}")
     ndim = int(W0_qmunu.ndim)
     shape_attrs = _shape_receipt_attrs(
         W0_qmunu.shape, shape,
@@ -1192,15 +1197,15 @@ def write_w0_qmunu_to_h5(
     with SlabIO(filename, mode="a", mesh=mesh,
 ) as io:
         _t0 = time.time()
-        io.create_dataset("W0_qmunu", shape=shape, dtype=W0_qmunu.dtype,
+        io.create_dataset(name, shape=shape, dtype=W0_qmunu.dtype,
                           attrs=shape_attrs)
-        io.write_slab("W0_qmunu", W0_qmunu)
+        io.write_slab(name, W0_qmunu)
         # Same instrument as ``write_restart_state_to_h5`` (AF.4c).  This
         # is the SECOND (nq, mu, mu) tensor the run writes -- another
         # 13.34 GB at c2406 -- and it had no telemetry at all, so a repeat
         # of the writer pathology would have been invisible here even
         # after AF instrumented its sibling.
-        _log_restart_write("W0_qmunu", shape, W0_qmunu.dtype,
+        _log_restart_write(name, shape, W0_qmunu.dtype,
                            time.time() - _t0)
 
     # W0_ready flag is a per-dataset attr read by bse_io.py.  The q_irr
@@ -1212,8 +1217,8 @@ def write_w0_qmunu_to_h5(
             set_commit_state(f, False)
             if qirr is not None and qirr.store_wedge:
                 _stamp_qirr(f, qirr, n_rmu_logical, v_touched=False,
-                            w0_placeholder=False, w0_data=True)
-            f["W0_qmunu"].attrs["W0_ready"] = True
+                            w0_placeholder=False, w0_data=True, w0_name=name)
+            f[name].attrs["W0_ready"] = True
             set_commit_state(f, True)
     rank0_transaction(filename, stage="restart.W0_readiness", write=_publish_w0)
 

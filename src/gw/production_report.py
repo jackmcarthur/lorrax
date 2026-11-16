@@ -126,10 +126,15 @@ def stored_w0_row(config) -> str | None:
         return None
     diagrams = config.screening.diagrams.value
     if diagrams == "w_bse":
-        return ("the RPA W(0) the ladder used as its direct rung (W0_qmunu "
-                "screening_diagrams = w_rpa); the ladder W of this Sigma is not "
-                "stored, so a BSE, TD-aGW or export from this ISDF tensor file "
-                "reads the RPA W(0)")
+        rung = ("W0_qmunu is the RPA W(0) the ladder used as its direct rung "
+                "(screening_diagrams = w_rpa), the default of every reader")
+        if config.compute_mode.is_pole_route:
+            return rung + ("; the ladder W of this Sigma is not stored on this "
+                           "route, so a BSE, TD-aGW or export from this ISDF "
+                           "tensor file reads the RPA W(0)")
+        return rung + ("; the ladder W(0) of this Sigma is stored beside it "
+                       "(W0_ladder_qmunu), read by a BSE or TD-aGW run under "
+                       "bse_screening_diagrams = w_bse")
     if diagrams == "w_rpa_resolvent":
         return ("the Dyson RPA W(0) (W0_qmunu screening_diagrams = w_rpa); the "
                 "resolvent's W is not stored")

@@ -756,13 +756,16 @@ def _metadata_band_count(f):
     return int(f["enk_full"].shape[1])
 
 
-def read_metadata(filename):
+def read_metadata(filename, *, w_series="w_rpa"):
     """Return small, replicated bundle facts in canonical file order.
 
     Energies are (full_k, band) in Ry; the head vector is (centroid,).
     Family shapes describe raw (parent_k, band, spin, centroid) faces;
     ``parent_k_rows`` are the full-BZ rows those faces hold.
+    ``w_series`` selects whose screened body and head the ``screened_*`` and
+    ``head_cartesian`` entries describe (:data:`W_SERIES_DATASETS`).
     """
+    w0_name, whead_name, s_cart_name = W_SERIES_DATASETS[w_series]
     with h5py.File(filename, "r") as f:
         _require_current(f)
         def value(name):
@@ -775,8 +778,8 @@ def read_metadata(filename):
             zeta_fit_windows=value("zeta_fit_windows"),
             centroid_count=int(f["n_rmu_logical"][()]),
             head_vector=value("G0_mu_nu"), bare_head=value("vhead"),
-            screened_head=value("whead"), head_cartesian=value("S_cart_head"),
-            screened_ready=("W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False))),
+            screened_head=value(whead_name), head_cartesian=value(s_cart_name),
+            screened_ready=(w0_name in f and bool(f[w0_name].attrs.get("W0_ready", False))),
             family_shapes={family: tuple(f[name].shape) for family, name in
                 (("charge", "psi_parent_y"), ("current", "psi_parent_y_transverse")) if name in f},
             centroid_hashes={family: f.attrs.get(name) for family, name in
@@ -788,12 +791,12 @@ def read_metadata(filename):
 
 def _interaction_dataset(filename, kind, nohead):
     """The dataset name of a persisted interaction (``bare`` V or ``screened`` W0)."""
-    names = {"bare": "V_qmunu", "screened": "W0_qmunu"}
+    names = {"bare": "V_qmunu", "screened": "W0_qmunu", "screened_ladder": LADDER_W0}
     name = names[kind]
     with h5py.File(filename, "r") as f:
         _require_current(f)
         if name not in f or not bool(f[name].attrs.get(
-                "W0_ready" if kind == "screened" else "V_ready", kind == "bare")):
+                "V_ready" if kind == "bare" else "W0_ready", kind == "bare")):
             raise ValueError(f"{filename}: {kind} interaction was not persisted")
         if nohead and name + "_nohead" in f:
             name += "_nohead"
@@ -834,6 +837,57 @@ W_SERIES_LABELS = {
 #: The stamped members of the screened interaction, in report order.
 W_SERIES_MEMBERS = ("W0_qmunu", "whead", "W0_lr")
 
+#: The ladder W(0) a ``screening_diagrams = w_bse`` GW run stores BESIDE its
+#: RPA rung (``gw.gw_output.persist_ladder_w0``): the static W its Sigma
+#: used, with its own q -> 0 head scalar.  Same layout, q storage and unfold
+#: tables as ``W0_qmunu``.  A BSE reads it only when its deck says
+#: ``bse_screening_diagrams = w_bse``.
+LADDER_W0 = "W0_ladder_qmunu"
+LADDER_WHEAD = "whead_ladder"
+LADDER_S_CART = "S_cart_head_ladder"
+
+#: Per series: (body dataset, head scalar, head Cartesian tensor).
+W_SERIES_DATASETS = {
+    "w_rpa": ("W0_qmunu", "whead", "S_cart_head"),
+    "w_bse": (LADDER_W0, LADDER_WHEAD, LADDER_S_CART),
+}
+
+
+def resolve_bse_w_series(params) -> str:
+    """The deck's ``bse_screening_diagrams``: which stored W(0) the BSE direct term reads.
+
+    ``w_rpa`` (the default): ``W0_qmunu``.  ``w_bse``: the ladder W(0) of a
+    ``screening_diagrams = w_bse`` GW run (:data:`LADDER_W0`); the reader
+    refuses a file without it (``GATE bse_ladder_w0``).  ``params`` is the
+    parsed deck (or ``None``: the default).
+    """
+    value = "w_rpa" if params is None else params.get("bse_screening_diagrams", "w_rpa")
+    value = str(value or "w_rpa").strip().lower()
+    if value not in W_SERIES_DATASETS:
+        raise ValueError(
+            f"bse_screening_diagrams = {value!r} is not a stored screened interaction; "
+            f"want one of: {', '.join(W_SERIES_DATASETS)}.")
+    return value
+
+
+def require_ladder_w0(filename) -> None:
+    """``GATE bse_ladder_w0``: ``bse_screening_diagrams = w_bse`` needs a stored ladder W(0)."""
+    with h5py.File(filename, "r") as f:
+        ready = LADDER_W0 in f and bool(f[LADDER_W0].attrs.get("W0_ready", False))
+        series = _series_attr(f[LADDER_W0]) if LADDER_W0 in f else None
+        head = LADDER_WHEAD in f
+        gw = _series_attr(f, "gw_screening_diagrams")
+    if not ready or not head or series != "w_bse":
+        raise ValueError(
+            f"GATE bse_ladder_w0: bse_screening_diagrams = w_bse needs the ladder W(0), and "
+            f"{filename} does not store it (W0_ladder_qmunu ready: {ready}, stamped "
+            f"{series!r}; whead_ladder: {head}; the GW run's screening_diagrams: {gw!r}); "
+            f"why: the file's W0_qmunu is the RPA W(0), and using it here would run an RPA "
+            f"kernel under the ladder's name; fix: run GW with screening_diagrams = w_bse "
+            f"under compute_mode = cohsex or gn_ppm and write_restart_tensors = true (the "
+            f"tangential route does not store a ladder W(0)), or set "
+            f"bse_screening_diagrams = w_rpa.")
+
 
 def _series_attr(obj, key="screening_diagrams"):
     """A stamped series label, or ``None`` on a file written before the stamp."""
@@ -860,6 +914,9 @@ def read_w0_provenance(filename) -> dict:
         out["present"] = tuple(name for name in W_SERIES_MEMBERS if name in f)
         out["gw"] = _series_attr(f, "gw_screening_diagrams")
         out["gw_compute_mode"] = _series_attr(f, "gw_compute_mode")
+        out["ladder_stored"] = bool(
+            LADDER_W0 in f and f[LADDER_W0].attrs.get("W0_ready", False)
+            and LADDER_WHEAD in f)
     return out
 
 
@@ -874,8 +931,11 @@ def describe_w0_provenance(prov, *, consumer) -> str:
     gw = prov.get("gw")
     if gw is not None and gw != (w0 or "w_rpa"):
         text += (f"; the producing GW run's Sigma used screening_diagrams = {gw} "
-                 f"({W_SERIES_LABELS.get(gw, gw)}), which is NOT stored: this "
-                 f"consumer reads the {W_SERIES_LABELS.get(w0 or 'w_rpa', w0)}")
+                 f"({W_SERIES_LABELS.get(gw, gw)}), which is "
+                 + (f"stored beside it as {LADDER_W0} (a BSE reads it under "
+                    f"bse_screening_diagrams = w_bse)" if prov.get("ladder_stored")
+                    else "NOT stored")
+                 + f": this consumer reads the {W_SERIES_LABELS.get(w0 or 'w_rpa', w0)}")
     return text
 
 
@@ -1200,7 +1260,7 @@ def read_lr_channels(filename, *, mesh):
 
 def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
                      *, nohead=False, full_exchange=False, screened_w=None,
-                     screened=True, read_psi=True):
+                     screened=True, read_psi=True, w_series="w_rpa"):
     """Return canonical BSE ψ faces, Γ exchange and the screened q grid.
 
     A missing stored W is accepted only with an explicit screened body
@@ -1210,7 +1270,13 @@ def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
     densified, whose ψ the fine htransform replaces) returns ``None`` for both
     ψ faces.
     """
-    m = read_metadata(filename)
+    if screened and w_series == "w_bse":
+        if screened_w is not None:
+            raise ValueError(
+                "GATE bse_ladder_w0: bse_screening_diagrams = w_bse reads the stored "
+                "ladder W(0); a rebuilt static W is the RPA one")
+        require_ladder_w0(filename)
+    m = read_metadata(filename, w_series=w_series if screened else "w_rpa")
     if screened and not m["screened_ready"] and screened_w is None:
         raise ValueError(
             "GATE bse_requires_screened_w0: missing stored W0 and no "
@@ -1229,10 +1295,17 @@ def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
     elif screened_w is None:
         # Say which W the direct term reads: after a w_bse GW run the stored
         # W0 is the RPA rung, not the ladder W that run's Sigma used.
-        log.info("  W0 provenance: " + describe_w0_provenance(
-            read_w0_provenance(filename),
-            consumer="the BSE loader's W(0) (BSE direct term, ladder rung, TD-aGW)"))
-        W = read_interaction_qgrid(filename, "screened", mesh_xy, grid, nohead=nohead)
+        if w_series == "w_bse":
+            log.info(f"  W0 provenance: the BSE direct term reads the ladder-corrected "
+                     f"W(0) ({LADDER_W0}, screening_diagrams = w_bse; "
+                     f"bse_screening_diagrams = w_bse), not the RPA W0_qmunu")
+            W = read_interaction_qgrid(filename, "screened_ladder", mesh_xy, grid,
+                                       nohead=False)
+        else:
+            log.info("  W0 provenance: " + describe_w0_provenance(
+                read_w0_provenance(filename),
+                consumer="the BSE loader's W(0) (BSE direct term, ladder rung, TD-aGW)"))
+            W = read_interaction_qgrid(filename, "screened", mesh_xy, grid, nohead=nohead)
     else:
         # A rebuilt (q, μ, ν) body: one relayout; the caller drops its copy.
         W = jax.jit(lambda x: x.reshape(grid + x.shape[-2:]).transpose(3, 4, 0, 1, 2),
