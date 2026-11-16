@@ -47,7 +47,8 @@ CONVENTIONS (design note section 2, in order)
 Units.  Hartree atomic units inside the tensors, ``alpha = 1/c`` taken from
 ``common.bispinor_init.ALPHA_FS`` (the repo's one fine-structure constant,
 ``2 * HALFALPHA = 0.0072973525643``); Rydberg for every potential and band
-matrix returned here (x2); meV only in the log lines (``1e3 * hubbard_ops.RYTOEV``).
+matrix returned here (x2); meV only in the log lines (``1e3 * common.units.RYD_TO_EV``, the constant
+of every writer, so log and files agree).
 
 Shell basis.  ``|a> = phi~_{I mu}(r) (x) |sigma>`` on atom I, complex Y_lm
 (Condon-Shortley), m = -l..l, pure spinors::
@@ -109,11 +110,11 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.bispinor_init import ALPHA_FS
-from psp.hubbard_ops import RYTOEV
+from common.units import RYD_TO_EV
 
 ALPHA = float(ALPHA_FS)
 HA_TO_RY = 2.0
-RY_TO_MEV = 1.0e3 * RYTOEV
+RY_TO_MEV = 1.0e3 * RYD_TO_EV   # the writers' constant (file_io.onsite_breit_output), so log and files agree
 SIDECAR_FORMAT = "lorrax.onsite_breit_sidecar/v1"
 PROVENANCE_SCHEME = "lorrax.onsite_breit/v1"
 DOUBLE_COUNTING_VALUES = ("onsite_only", "paw")
@@ -958,6 +959,7 @@ def onsite_density_matrix(P_table, kweights, occ, setup: OnsiteSetup, *, U=None,
     are used downstream).
     """
     from jax import shard_map
+    from lxkit import ordered_psum
     rep = NamedSharding(mesh, P())
     Pt = jnp.asarray(P_table, dtype=jnp.complex128)
     w = jnp.asarray(kweights, dtype=jnp.float64)
@@ -992,10 +994,10 @@ def onsite_density_matrix(P_table, kweights, occ, setup: OnsiteSetup, *, U=None,
         def per_rank(P_l, U_l, w_l, f_l):
             PU = jnp.einsum("kan,kni->kai", P_l, U_l)
             if rax:
-                PU = jax.lax.psum(PU, rax)
+                PU = ordered_psum(PU, rax)
             D = jnp.einsum("k,ki,kai,kbi->ab", w_l, f_l, PU, jnp.conj(PU))
             red = kax + cax
-            return jax.lax.psum(D, red) if red else D
+            return ordered_psum(D, red) if red else D
 
         fn = _DM_KERNELS[key] = jax.jit(shard_map(
             per_rank, mesh=mesh,

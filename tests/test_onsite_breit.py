@@ -37,6 +37,10 @@ DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "onsite_
 ALPHA_REF = 1.0 / 137.035999084
 SCALE_REF = (ALPHA_REF / ob.ALPHA) ** 2          # module value -> reference value
 HA_TO_MEV = ob.HA_TO_RY * ob.RY_TO_MEV
+# The sidecar's *_mev fields were written by make_sidecar.py with QE's Rydberg
+# (13.605693122994 eV, breit_salvage/onsite_breit/breit_arms.RY); the module logs
+# with common.units.RYD_TO_EV (3.6e-7 relative apart), so the pin uses the generator's.
+HA_TO_MEV_SIDECAR = 2.0 * 13605.693122994
 
 
 def _path(name):
@@ -104,7 +108,7 @@ def test_closed_shell_limit(sc, ref):
                 res = _rel(x, c * ls)
                 dmax = max(np.abs(h["d1"]).max(), np.abs(h["d2"]).max()) / np.abs(x).max()
                 worst_d, worst_res = max(worst_d, dmax), max(worst_res, res)
-                c_mev = c * HA_TO_MEV * SCALE_REF
+                c_mev = c * HA_TO_MEV_SIDECAR * SCALE_REF
                 rv = ref["shells"][f"{el}.onsite_breit.json:{s['label']}:{kind}"]
                 print(f"\n[a] {el} {s['label']} {kind}: max|d1,d2|/|x| = {dmax:.1e}, |x - c l.s|/|x| = {res:.1e}, "
                       f"c = {c * HA_TO_MEV:+.6f} meV (sidecar {s[kind]['x_closed_mev']:+.6f})")

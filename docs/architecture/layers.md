@@ -35,7 +35,7 @@ service through its public API (its top-level package) and nowhere else.
 
 **The drivers**, the modules a physicist opens: `gw/gw_jax.py` ·
 `bse/bse_jax.py` · `bse/exciton_bands.py` · `bandstructure/htransform.py` ·
-`gw/kin_ion_io.py` · `gw/downfold_cli.py` · `centroid/kmeans_cli.py` ·
+`gw/kin_ion_io.py` · `gw/downfold_cli.py` · `gw/onsite_breit_cli.py` · `centroid/kmeans_cli.py` ·
 `psp/{run_nscf,run_dense_h,run_sternheimer,get_DFT_mtxels,get_dipole_mtxels,kpm_dos,orbital_magnetization,finite_q_head_interp}.py` ·
 `bse/{bse_feast,bse_w_exact,bse_kpm}.py` · `gw/eqp_bgw.py` ·
 `postprocess/rotate_wfn_to_qp.py`.
