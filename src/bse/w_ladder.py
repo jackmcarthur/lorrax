@@ -53,7 +53,6 @@ from .bse_w_exact import (
     _get_branch_projection_program,
 )
 from common.collectives import gather_to_host
-
 LADDER_RESPONSE_CONVENTION = "physical-ra-charge-spin-static-head-v3"
 LADDER_INTERNAL_HEAD_POLICY = "screened-transfer-gamma-exact-diagonal-v1"
 
@@ -87,6 +86,22 @@ def ladder_static_head_identity(restart_path, input_file, *, cell_volume):
                 g0_shape=list(g0.shape), g0_sha256=hashlib.sha256(g0.tobytes()).hexdigest())
 
 jax.config.update("jax_enable_x64", True)
+
+
+def require_rpa_rung(restart_path, *, print_fn=None) -> dict:
+    """``GATE w0_series`` for the ladder's direct rung: its W_R must be the RPA W(0).
+
+    ``W_BSE`` is the screened interaction of the particle-hole Hamiltonian
+    whose direct rung is ``-W_RPA(0)`` of the same reference (the Cunningham
+    et al. 2023 ``W-hat``).  The rung is read from ``W0_qmunu``; a W0 of any
+    other series (a stored ladder W, a future self-consistent ladder map)
+    would be a different, unaudited diagram set, and the identity binds only a
+    digest of the array, not its series.  So the series stamp is checked
+    before the restart read (``file_io.restart_bundle.require_w0_series``).
+    """
+    from file_io.restart_bundle import require_w0_series
+    return require_w0_series(restart_path, "w_rpa",
+                             consumer="the ladder's direct rung W_R", print_fn=print_fn)
 
 
 def build_ladder_resolvent(mesh_xy: Mesh, data: dict, *, include_w: bool = True,
@@ -742,6 +757,8 @@ def prepare_ladder_head(restart_path, mesh_xy, *, input_file, head_dipole_path,
     bare interactions only; it never reads or rebuilds a screened W0.
     """
     if data is None:
+        if include_w:
+            require_rpa_rung(restart_path)
         data = load_bse_data_from_restart_sharded(
             restart_path, n_val=10**9, n_cond=10**9, mesh_xy=mesh_xy,
             input_file=input_file, inject_head=False, inject_w_head=include_w,
@@ -898,6 +915,10 @@ def compute_wc_qwedge(
             int(probe_chunk), mesh_xy, name="BSE ladder probe chunk",
             spec=P("y"), axis=0).carrier
 
+    # The rung is the RPA W(0) by construction (W_BSE = W[chi of H with
+    # -W_RPA(0)]); a ladder-stamped W0 would count the ladder twice.
+    if include_w:
+        require_rpa_rung(restart_path)
     # FULL chi0 band window on both legs — the pair basis must span exactly the
     # window the GW chi0 consumed, or the ladder resolvent is solving a smaller
     # problem than the W_R kernel it is fed (band-window parity, bse_w_exact.main).
