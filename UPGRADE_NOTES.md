@@ -76,6 +76,40 @@ identity unfold tables, so existing files work without a GW rerun; before,
 `GATE srlr_wedge_tables` refused them.  A full-zone W0 on a grid that does
 reduce still refuses.  Results on symmetry-reduced files are unchanged.
 
+## 2026-11-11 — Self-consistent metals: semicore floor, held QP request class, static head body
+
+Three fixes for self-consistent runs on metals; insulators are unchanged.
+- The semicore floor of a metal now counts `nval` down from the occupied-band
+  boundary $n_{\rm occ}=\max(\texttt{ifmax})$, as the QP window does and as on
+  an insulator. Before, it counted from the per-$k$ number of states below
+  $\mu$, so with the documented `nval` rule (`nval = 10` on bcc Fe) the floor
+  split a spin–orbit pair of the 3p shell (one half held at DFT, the other
+  moved by $-0.74$ eV). Metal SC results whose floor came from `nval` move;
+  a floor set by `sigma_omega_min_ev` is unchanged.
+- The set of requested states that place the $\Sigma$ support and $W$'s line
+  sites is now taken at the first map with a $Z$ and held for the loop. Before,
+  a QP-window-top state with $Z$ at 1 could enter and leave it between maps and
+  drive a period-4 cycle that never converged.
+- The static Thomas–Fermi row of the metallic tangential head now folds its
+  wings through the exact static $W(\Gamma, z=0)$ body, as the MPA producer
+  does. The fitted tangential model lacks the $q=0$ intraband term and gave a
+  negative $\kappa_{\rm eff}^2$ ("static Schur fold produced nonphysical
+  screening") at SC map 1 on bcc Fe with `dft_velocity` and
+  `parallel_transport`.
+
+No input-file key changes.
+
+## 2026-11-11 — A Gaunt-corrected UPF refuses a j-averaged V_NL
+
+A pseudopotential stamped by gaunt_pp (PP_INFO line "Modified by gaunt_pp
+on …: variant '…'") stores the frozen-core Gaunt term as a full $2\times2$
+$\Delta D$ per $(\ell, j)$ channel in PP_DIJ. The j-averaged V_NL reads only
+the diagonal of $D$ and would drop it, so `build_vnl_setup` now refuses that
+combination (`GATE gaunt_upf_j_averaged`) for every V_NL consumer (kin_ion,
+the dipole velocity, …). Run such a file j-resolved (QE `lspinorb = .true.`,
+nspinor 2), or use the original unstamped file. A j-resolved run prints one
+line naming the variant. Unstamped files are unchanged.
+
 ## 2026-11-11 — Bispinor runs: two-component charge, Pauli current
 
 With `bispinor = true`, every charge term (Hartree field, charge screening
