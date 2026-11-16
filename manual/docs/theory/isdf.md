@@ -159,50 +159,46 @@ On 3-D bulk with `mc_average_vcoul_body = true` (default), the G slot nearest $\
 
 ## <span class="n">4</span> Accuracy {: #isdf-accuracy }
 
-The error of the ISDF basis is set by how $N_\mu$ compares with the numerical rank $r$ of the pair densities it must represent, and by whether the points were selected on those pair densities.
+No formula predicts the $N_\mu$ that a given accuracy needs across materials. A safe budget exists, and the error falls steadily with $N_\mu$, with no plateau, up to the rank of the pair densities.
 {: .intro }
 
 !!! note "Measured"
-    Si 4×4×4 with SOC, 25 Ry, 460-band NSCF, against a plane-wave $\Sigma^x$ with no ISDF; Perlmutter A100. A second system (Si scalar 4³) is shown beside it. Read the numbers as a calibration.
+    The shipped selector (sketched QRCP on a $3N_\mu$ k-means pool, weight $s^{5/6}$), against references converged in $N_\mu$ or computed in plane waves without ISDF; Perlmutter A100. Read the numbers as a calibration.
 
-### <span class="n">4.1</span> The pair-set rank {: #isdf-rank }
+### <span class="n">4.1</span> The centroid budget {: #isdf-budget }
 
-`centroid.sketch_select.sketch_block_select`
+`centroid.production_output.centroid_budget`
 {: .in-code }
 
-$r(L,B)$ is the numerical rank of the positive pair-density Gram for left bands $1..L$ and right bands $1..B$: eigenvalues above $\sqrt{\epsilon}$ times the largest diagonal. The centroid selector prints it as `pool rank=`. On the Si complete-basis WFNs it follows one law (102 points, 5.6 % RMS log residual):
+With $L$ and $B$ the widths of the left and right band windows (Kramers pairs on a spinor WFN), the safe budget for a 5 meV RMS error in $\Sigma^x$ is
 
 $$
-r(L,B) \approx \min\big(445\,L^{0.107}B^{0.322},\; 0.97\,N_\bG(4E_{\mathrm{wfc}})\big), \qquad N_\mu(\text{RMS }\Sigma^x \le 1\text{ meV}) \approx 0.5\,r \tag{4.1}
+N_\mu \approx 4S, \qquad S = \big(L^{1/3} + B^{1/3}\big)^3 \tag{4.1}
 $$
 
-On a spinor WFN, $L$ and $B$ count Kramers pairs. While the window holds fewer than about 500 distinct pair functions, $r$ is that count. $r$ has no plateau: it grows until the right window reaches the complete basis, where it is 0.82–0.98 of the plane waves in the $4E_{\mathrm{wfc}}$ sphere. The law was fitted on one system at one cutoff; on Fe and Ni (80 Ry, spinor) the measured rank is 0.86–0.94 of it.
+On ten materials (Si in 2- and 8-atom cells, GaAs, MgO, bcc Fe, monolayer hBN and MoS₂, CrI₃, NiPS₃, CrSBr), 5 meV RMS over the states within 10 eV of $\mu$ needs between 1.4 S and 4.0 S; bcc Fe sets the constant. Eq. (4.1) therefore over-spends by up to about 2.8× (CrI₃, NiPS₃, Si at 600 bands): up to about 8× the time of the stages that scale as $N_\mu^2$, and about 20× for those that scale as $N_\mu^3$. If cost matters, converge $N_\mu$ on your own system. The centroid selector prints the budget as `budget:` beside the written count.
 
-### <span class="n">4.2</span> Error against N_μ / r {: #isdf-error }
+No count in $S$ alone can be accurate. At equal $S$, an 8-atom Si cell needs 1.48× the centroids of the 2-atom cell: within one cell $N_\mu$ grows roughly as $S^{2/3}$, while across cells at equal windows per atom it is nearly extensive. A form that adds the valence-electron count fitted seven materials and failed on the three held out (MgO, Fe, hBN). The measurements reach $S \approx 2400$, and the largest cells needed only 1.4 S, so the over-spend of Eq. (4.1) is likely larger beyond that.
 
-Plotted against $N_\mu/r(B)$, the $\Sigma^x$ error curves for $B$ = 64 to 412 collapse onto one curve. Against $N_\mu/B$ they spread by 5×, so a rule stated in centroids per band is too few for small $B$ and too many for large $B$.
+### <span class="n">4.2</span> Error against N_μ {: #isdf-error }
+
+On the magnetic slabs of Fig. 4.1, the shipped selector reaches 5 meV RMS at 1.4–1.9 S, the fewest centroids of the materials measured. The largest per-state error stays above 5 meV through 2.5 S: it is limited by which points are selected more than by how many.
 
 <figure class="flowchart" markdown>
-[![Σx error against N_μ/r and N_μ/B](../assets/figures/theory-isdf-exchange-accuracy-error.png)](../assets/figures/theory-isdf-exchange-accuracy-error.png)
-<figcaption><strong>Fig. 4.1.</strong> RMS (top) and max (bottom) of $|\Delta\Sigma^x|$ over bands $1..B$ and 8 irreducible k, against $N_\mu/r(B)$ (left) and $N_\mu/B$ (right). Crosses are sets selected on a different pair set; grey squares are the scalar Si system.</figcaption>
+[![Σx error against N_μ/S](../assets/figures/theory-isdf-sigmax-accuracy.png)](../assets/figures/theory-isdf-sigmax-accuracy.png)
+<figcaption><strong>Fig. 4.1.</strong> RMS (top) and largest (bottom) error of $\Sigma^x$ over the states within 10 eV of $\mu$, against $N_\mu/S$, for CrI₃ 8×8, NiPS₃ 6×4 and CrSBr 16×12, against converged references. The diamonds are the shipped selector; the other arms are the former Cholesky prune (its default labelled "production") and smaller pools. Dashed: 5 meV.</figcaption>
 </figure>
 
-| Target | $N_\mu$ |
-|---|---|
-| $\Sigma^x$ RMS ≤ 1 meV | ≈ 0.5 $r$ |
-| $\Sigma^x$ max ≤ 1 meV | ≈ 1.0–1.3 $r$ |
-| $\Sigma^x$ max ≤ 0.1 meV | ≈ 1.3 $r$ (at $B$ = 296, 412) |
+The transverse exchange $\Sigma^B$ of the current channel ([§5.2](#isdf-bispinor)) converges the same way against an exact plane-wave $\Sigma^B$, with no plateau down to 0.003 %. 1 % RMS needs 1.65 S of current-mode centroids on MoS₂ and 1.11 S on CrI₃.
 
-The valence window carries the largest error at every $N_\mu$, because valence–valence pairs dominate $|M|^2$ at small $\bq+\bG$. Past $r$, extra points add no direction: the rank saturates, and the solve of §2.4 drops the surplus.
+<figure class="flowchart" markdown>
+[![Σ^B error against N_μ/S](../assets/figures/theory-isdf-sigmab-convergence.png)](../assets/figures/theory-isdf-sigmab-convergence.png)
+<figcaption><strong>Fig. 4.2.</strong> Diagonal RMS relative error of the transverse bare exchange $\Sigma^B$ against an exact plane-wave $\Sigma^B$, against current-mode centroids $N_\mu/S$, for MoS₂ 3×3 with SOC ($S$ = 226) and ferromagnetic CrI₃ 6×6 ($S$ = 769), two seeds each. Diamonds mark the counts of two production runs.</figcaption>
+</figure>
 
 ### <span class="n">4.3</span> Out to the complete basis {: #isdf-complete }
 
-On a WFN holding every state of the 25 Ry sphere, the collapse in $N_\mu/r$ holds to $B$ = 1072, and $r$ reaches 0.95 of $N_\bG(4E_{\mathrm{wfc}})$. An all-band $\Sigma^x$ therefore needs $N_\mu \approx N_\bG(4E_{\mathrm{wfc}})$: the ISDF basis is then as large as the plane-wave density basis. ISDF compresses a truncated band sum; at $B$ = 64, $r = 0.39\,N_\bG(4E_{\mathrm{wfc}})$.
-
-<figure class="flowchart" markdown>
-[![Σx error to the complete basis, and r(B)](../assets/figures/theory-isdf-exchange-accuracy-allband.png)](../assets/figures/theory-isdf-exchange-accuracy-allband.png)
-<figcaption><strong>Fig. 4.2.</strong> RMS and max of $|\Delta\Sigma^x|$ against $N_\mu/r(B)$, with $B$ = 692 and 1072 from the complete-basis WFN (squares), and $r(B)$ up to the complete basis at Γ (right); the dotted line is the plane-wave count of the $4E_{\mathrm{wfc}}$ sphere.</figcaption>
-</figure>
+The numerical rank $r$ of the pair-density Gram, its eigenvalues above $\sqrt{\epsilon}$ times the largest diagonal, bounds what more points can add. Past $r$, extra points add no direction, and the solve of §2.4 drops the surplus. The selector reports the rank it certified as `pool rank=` ([Centroid selection §4.1](centroid-selection.md#cs-pool-rank)). $r$ has no plateau: on the Si complete-basis WFNs it grows until the right window reaches the complete basis, where it is 0.82–0.98 of the plane waves in the $4E_{\mathrm{wfc}}$ sphere. An all-band $\Sigma^x$ therefore needs $N_\mu \approx N_\bG(4E_{\mathrm{wfc}})$, as large as the plane-wave density basis: ISDF compresses a truncated band sum.
 
 ### <span class="n">4.4</span> The selection window {: #isdf-selection-window }
 
@@ -256,7 +252,8 @@ With `bispinor = true`, each current channel $i = 1,2,3$ inserts its Dirac verte
 | $C^{+}_\bq$, $\epsilon_\zeta$ | rank-truncated pseudo-inverse; its relative cut `zeta_rcond` |
 | $V_\bq(\mu,\nu)$, $v(\bq+\bG)$ | bare Coulomb interaction in the $\zeta$ basis; the Coulomb kernel (Ry) |
 | $E_V$, $E_\zeta$ | `bare_coulomb_cutoff`, `zeta_cutoff` (Ry) |
-| $r(L,B)$ | numerical rank of the pair set $L \times B$ |
+| $S$ | $(L^{1/3}+B^{1/3})^3$, with $L$ and $B$ the widths of the left and right windows (Kramers pairs on a spinor WFN) |
+| $r$ | numerical rank of the pair-density Gram of the two windows |
 | $N_\bG(4E_{\mathrm{wfc}})$ | plane waves in the density sphere of radius $4E_{\mathrm{wfc}}$ |
 | $N_k$, $\bR$ | number of k-points; Born–von Kármán lattice vectors |
 | $n_s$, $a,b$ | spinor components; spinor indices |

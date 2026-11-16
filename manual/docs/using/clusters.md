@@ -30,7 +30,7 @@ The reported device peak measures memory in the device pool. NVML also sees rese
 
 ## How many processors? {: #how-many }
 
-Start around $N_\mu = 10N_b$ centroids, then converge the basis. The selector retains complete symmetry orbits, and storage may add dummy slots for the mesh. Use the **packed** centroid extent when estimating storage; keep it distinct from the number of physical interpolation points.
+Start from the safe budget $N_\mu \approx 4S$, $S = \big(L^{1/3}+B^{1/3}\big)^3$, with $L$ and $B$ the widths of the left and right band windows ([ISDF §4](../theory/isdf.md#isdf-accuracy)). It over-spends by up to about 2.8×, so converge the basis downward if memory or time is tight. The selector retains complete symmetry orbits, and storage may add dummy slots for the mesh. Use the **packed** centroid extent when estimating storage; keep it distinct from the number of physical interpolation points.
 
 One full-zone complex128 Green's function has size
 
@@ -52,7 +52,7 @@ the first communicator is acquired; a Frontier run needs no extra flag.
 The policy preserves the solver equations and checks. Native communicator
 resources remain part of the outside-pool budget, not the executable quote.
 
-The deck key `linalg` (default `local`) requests the layout of dense solves. The shared solver plan chooses among available local and mesh providers using their memory prices and, where qualified, timing models. Local rounds assign whole $N_\mu\times N_\mu$ matrices to individual devices; mesh solves divide the matrix storage over $P$ and communicate within the factorization. The provider depends on the platform; read the selected route in the report.
+The input key `linalg` (default `local`) requests the layout of dense solves. The shared solver plan chooses among available local and mesh providers using their memory prices and, where qualified, timing models. Local rounds assign whole $N_\mu\times N_\mu$ matrices to individual devices; mesh solves divide the matrix storage over $P$ and communicate within the factorization. The provider depends on the platform; read the selected route in the report.
 
 `local` is a request, not a guarantee. For a W Dyson batch of $Q$ stored q rows, the local-route model includes the face-tiled V, χ and W plus whole copies for $\lceil Q/P\rceil$ q points and one LU pair,
 
@@ -62,13 +62,13 @@ $$
 
 where $Q$ is the actual batch width, distinct from the full k-grid normalization. Provider workspace and live allocations also enter the admission decision. The local route runs when it fits; otherwise the service can use the distributed LU. Eigensolves choose the same way between whole matrices per GPU and the whole-mesh eigensolver, by fit and modelled speed. The choice prints once as `route W Dyson …: local` (or `distributed`) and appears in the report's Routes table.
 
-More ranks divide face storage and can reduce the number of whole matrices assigned to a rank. Independent whole-matrix solves can be faster when they fit; distributed solves are useful when one matrix and its workspace are too large. Read the selected route in the report rather than inferring it from the deck alone.
+More ranks divide face storage and can reduce the number of whole matrices assigned to a rank. Independent whole-matrix solves can be faster when they fit; distributed solves are useful when one matrix and its workspace are too large. Read the selected route in the report rather than inferring it from the input file alone.
 
 ## Reference runs on Perlmutter {: #examples }
 
 These are fresh fixed-input $G_0W_0$ runs from **23 October 2026**, pinned to source [`2d2ca2f104`](https://github.com/jackmcarthur/lorrax/commit/2d2ca2f104a085876a573e8b1278a7874c479b98). They use native full head corrections, default accuracy and automatic batch/layout selection. They establish completed workloads, not k-grid/band/basis convergence or minimum processor counts.
 
-The downloadable decks preserve that historical source. For main at or after [`5e4f1bdab`](https://github.com/jackmcarthur/lorrax/commit/5e4f1bdabf4fd9643733a43966bf252f31426953), remove `fermi_reference = mp1_fixed_n` from the Fe deck; the metal chemical-potential reference is now automatic. Keep the original line when reproducing the pinned source.
+The downloadable input files preserve that historical source. For main at or after [`5e4f1bdab`](https://github.com/jackmcarthur/lorrax/commit/5e4f1bdabf4fd9643733a43966bf252f31426953), remove `fermi_reference = mp1_fixed_n` from the Fe input file; the metal chemical-potential reference is now automatic. Keep the original line when reproducing the pinned source.
 
 Memory values below use decimal GB. Wall time is the GW driver's `total run`, including setup and compilation but excluding centroid/dipole/kinetic preprocessing, queue wait and allocation startup. All GPU rows use A100-80GB cards and the automatic local-linalg budget (66.35 GB in the saved receipts). Persistent compilation caches were shared; the counts below make their state explicit.
 
@@ -100,7 +100,7 @@ The 80-atom case is **Al₃₁CrO₄₈ with SOC**: 395 occupied spinor bands, 2
 
 Its maximum pool-used peak is 52.89 GB/rank in ζ fitting, versus 41.39 GB in screening and 44.85 GB in Σ. One full-zone Green's function at the packed extent is 17.992 GB/rank, so this run peaks at **2.94G/P**. Host high-water is 15.97 GB/rank. The conservative Cplus quote exceeded the then-current planning room; the completed run stayed below the 66.35 GB budget. This demonstrates the stated 16-GPU workload; a smaller process count was not tested. Original structural/symmetry qualifications and the exact inputs are retained in the [case notes](../assets/cluster-references/2026-10-23/cr_al2o3_80/case_notes.txt).
 
-All ranks exited successfully and the canonical Σ and QP outputs were checked for the stated shapes and finite entries. Preserve the input hashes, exact decks, resolved geometry, selected routes, compilation counts and all-rank exit records when repeating a reference.
+All ranks exited successfully and the canonical Σ and QP outputs were checked for the stated shapes and finite entries. Preserve the input hashes, exact input files, resolved geometry, selected routes, compilation counts and all-rank exit records when repeating a reference.
 
-Download the [text input bundle (ZIP)](../assets/cluster-references/Lorrax_GPU_reference_inputs_2026-10-23.zip). The [reproduction notes](../assets/cluster-references/2026-10-23/README.txt) describe the input arrangement and launch sequence. Exact decks and manifests: [Si](../assets/cluster-references/2026-10-23/si_soc/gw.in) / [record](../assets/cluster-references/2026-10-23/si_soc/manifest.json), [Al₂O₃](../assets/cluster-references/2026-10-23/al2o3_10/gw.in) / [record](../assets/cluster-references/2026-10-23/al2o3_10/manifest.json), [Fe](../assets/cluster-references/2026-10-23/fe_8x8x8/gw.in) / [record](../assets/cluster-references/2026-10-23/fe_8x8x8/manifest.json), [Cr:Al₂O₃](../assets/cluster-references/2026-10-23/cr_al2o3_80/gw.in) / [record](../assets/cluster-references/2026-10-23/cr_al2o3_80/manifest.json). The text bundle includes DFT decks and physical centroid tables; large wavefunction and generated matrix files remain in the NERSC evidence archive named in each record.
+Download the [text input bundle (ZIP)](../assets/cluster-references/Lorrax_GPU_reference_inputs_2026-10-23.zip). The [reproduction notes](../assets/cluster-references/2026-10-23/README.txt) describe the input arrangement and launch sequence. Exact input files and manifests: [Si](../assets/cluster-references/2026-10-23/si_soc/gw.in) / [record](../assets/cluster-references/2026-10-23/si_soc/manifest.json), [Al₂O₃](../assets/cluster-references/2026-10-23/al2o3_10/gw.in) / [record](../assets/cluster-references/2026-10-23/al2o3_10/manifest.json), [Fe](../assets/cluster-references/2026-10-23/fe_8x8x8/gw.in) / [record](../assets/cluster-references/2026-10-23/fe_8x8x8/manifest.json), [Cr:Al₂O₃](../assets/cluster-references/2026-10-23/cr_al2o3_80/gw.in) / [record](../assets/cluster-references/2026-10-23/cr_al2o3_80/manifest.json). The text bundle includes DFT input files and physical centroid tables; large wavefunction and generated matrix files remain in the NERSC evidence archive named in each record.
 

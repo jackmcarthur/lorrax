@@ -8,7 +8,7 @@ The BSE and exciton-bands drivers call the [H-transform](htransform.md) in memor
 
 ## Band window {: #window }
 
-The transformed Hamiltonian uses the resolved deck's coarse fit window (`nval`, `ncond`, with the coarse conduction override below), and returns the BSE bands from inside it. Extra bands stored in `WFN.h5` do not by themselves enlarge that fit. The BSE route adds no guard bands by default; fewer than four fitted conduction bands above the returned window warns. The exciton-bands route also warns above sixteen, since a very wide fit asks the shared basis to represent states the kernel never uses. The method and the shared keys are on the [overview](htransform.md).
+The transformed Hamiltonian uses the input file's coarse fit window (`nval`, `ncond`, with the coarse conduction override below), and returns the BSE bands from inside it. Extra bands stored in `WFN.h5` do not by themselves enlarge that fit. The BSE route adds no guard bands by default; fewer than four fitted conduction bands above the returned window warns. The exciton-bands route also warns above sixteen, since a very wide fit asks the shared basis to represent states the kernel never uses. The method and the shared keys are on the [overview](htransform.md).
 
 Fine-grid dipole preparation reads the velocity operator's complete guarded fit window before gathering its selected payload. A large stored band count therefore does not force a whole-file square read. The selected operator still has $N_{\mathrm{fit}}^2$ entries per component and k point, with host banks and replicated operator preparation: a very large active fit remains a memory floor even when the returned BSE window is small.
 

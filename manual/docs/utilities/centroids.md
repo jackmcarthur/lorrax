@@ -54,7 +54,7 @@ $$
 \psi^\dagger_{m\bk}(\br)\,\psi_{n\bk+\bq}(\br) = \sum_{s=\uparrow,\downarrow}\psi^*_{m\bk s}(\br)\,\psi_{n\bk+\bq\,s}(\br).
 $$
 
-This spin-traced density is the charge density that standard GW screens, and the default `--density-mode scalar` selects points for it. The window widths $L$ and $B$ of the rank estimate then count Kramers pairs. A four-component (bispinor) run also screens the transverse current, which needs a second point set selected with `--density-mode current`. That case is more involved and is described on [Centroid selection §5.3](../theory/centroid-selection.md#cs-current).
+This spin-traced density is the charge density that standard GW screens, and the default `--density-mode scalar` selects points for it. The window widths $L$ and $B$ of the count budget then count Kramers pairs. A four-component (bispinor) run also screens the transverse current, which needs a second point set selected with `--density-mode current`. That case is more involved and is described on [Centroid selection §5.3](../theory/centroid-selection.md#cs-current).
 
 ## How the points are chosen {: #what }
 
@@ -66,7 +66,7 @@ This spin-traced density is the charge density that standard GW screens, and the
 The weight is the diagonal of the $\bq = 0$ pair-density Gram over the left and right band windows $L$ and $R$, $s(\br) = \sum_\bk w_\bk\,\rho^L_\bk(\br)\,\rho^R_\bk(\br) = K(\br,\br)$, and Lloyd's mass is $w(\br) = s(\br)^{5/6}$, which places points with density $\propto s^{1/2}$; occupations do not enter. Lloyd places $\lceil 3\,N_\mu\rceil$ candidates as orbit representatives. Each representative is snapped to the FFT grid and then unfolded by the space group of the decorated atoms, so every orbit lands exactly on grid points. Column-pivoted QR on a Gaussian sketch of the candidates' pair densities, whose expected Gram is $K(\br_a,\br_b)$, then keeps the candidates that add the most independent directions, admitting or rejecting whole orbits, never single points, until $N_\mu$ points are used. The written set is therefore closed under every spatial operation, including improper and nonsymmorphic ones ([Centroid selection §5](../theory/centroid-selection.md#cs-symmetry)). The objective, the Gram and the limits of the method are on [Centroid selection](../theory/centroid-selection.md); the fit that consumes the points is on [ISDF and V(q)](../theory/isdf.md).
 
 !!! note
-    The selection must be made against the band window that $\Sigma^c$ and $\chi^0$ consume. The default right window is every band in `WFN.h5`, and the default left window is the occupied bands plus the input file's `ncond` protected conduction bands, so always pass `-i`. For the count, the header's `rank law:` line estimates the $N_\mu$ that gives 1 meV RMS error in $\Sigma^x$, $N_\mu \approx 0.5\min\big(N_\bk L B,\ 445\,L^{0.107}B^{0.322},\ 0.97\,N_\bG(4E_\mathrm{wfc})\big)$, with $L$ and $B$ the window widths (per Kramers pair on a spinor WFN).
+    The selection must be made against the band window that $\Sigma^c$ and $\chi^0$ consume. The default right window is every band in `WFN.h5`, and the default left window is the occupied bands plus the input file's `ncond` protected conduction bands, so always pass `-i`. For the count, the header's `budget:` line gives the safe budget for 5 meV RMS error in $\Sigma^x$, $N_\mu \approx 4S$ with $S = \big(L^{1/3}+B^{1/3}\big)^3$ and $L$ and $B$ the window widths (per Kramers pair on a spinor WFN). No accurate rule exists: the budget over-spends by up to about 2.8×, so if cost matters converge $N_\mu$ on your own system ([ISDF §4](../theory/isdf.md#isdf-accuracy)).
 
 ## Running {: #run }
 
@@ -202,7 +202,7 @@ Feature family used by both k-means and pruning. `scalar` is the charge density 
 <div class="file-list" markdown>
 
 `centroids_frac_<N><suffix>.txt`
-:   The $N$ written points in fractional crystal coordinates, one point per line and snapped to the FFT grid. A header of `#` lines records the source WFN, the band windows, the requested and written counts, the symmetry closure and the rank estimate of the [note](#what) above. Written in the working directory by rank 0.
+:   The $N$ written points in fractional crystal coordinates, one point per line and snapped to the FFT grid. A header of `#` lines records the source WFN, the band windows, the requested and written counts, the symmetry closure, the pool rank and the count budget of the [note](#what) above. Written in the working directory by rank 0.
 
 `kmeans<suffix>.out`
 :   Run report: architecture, the provenance header again, file paths, phase timings and any warnings.

@@ -137,7 +137,7 @@ When the candidates form symmetry orbits, pruning admits orbits, never single po
 
 ## <span class="n">4</span> Rank and the target count {: #cs-rank }
 
-The selector reports how many independent directions it certified and an estimate of the count the target accuracy needs. Both are written into the centroid file's header and `kmeans.out`.
+The selector reports how many independent directions it certified and a safe budget for the count. Both are written into the centroid file's header and `kmeans.out`.
 {: .intro }
 
 ### <span class="n">4.1</span> Pool rank {: #cs-pool-rank }
@@ -151,16 +151,16 @@ Numerical rank deficiency is reported and never refuses.
 
 ### <span class="n">4.2</span> Choosing N_μ {: #cs-target }
 
-`centroid.production_output.rank_law_estimate`
+`centroid.production_output.centroid_budget`
 {: .in-code }
 
-The header also prints the rank-law estimate of the count for a 1 meV RMS error in $\Sigma^x$, with $L$ and $B$ the window widths (per Kramers pair on spinors):
+The header also prints, as `budget:`, the safe budget for a 5 meV RMS error in $\Sigma^x$, with $L$ and $B$ the window widths (per Kramers pair on spinors):
 
 $$
-N_\mu \approx \tfrac12 \min\big(N_k L B,\; 445\,L^{0.107}B^{0.322},\; 0.97\,N_\bG(4E_{\mathrm{wfc}})\big) \tag{4.1}
+N_\mu \approx 4S, \qquad S = \big(L^{1/3} + B^{1/3}\big)^3 \tag{4.1}
 $$
 
-$N_kLB$ bounds the number of pair functions, and $N_\bG(4E_{\mathrm{wfc}})$ is the WFN's density sphere rescaled from `ecutrho` to $4E_{\mathrm{wfc}}$. The law and the measured error against $N_\mu/r$ are on [ISDF §4](isdf.md). The measured pool rank, from a large request with `stop: pool spent`, is preferred to the estimate.
+No accurate count rule holds across materials. Eq. (4.1) reached 5 meV on every material measured and over-spends by up to about 2.8×; if cost matters, converge $N_\mu$ on your own system. The measurements are on [ISDF §4](isdf.md#isdf-accuracy). Points beyond the pool rank add no direction.
 
 ## <span class="n">5</span> Symmetry closure {: #cs-symmetry }
 

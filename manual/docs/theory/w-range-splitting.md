@@ -257,7 +257,7 @@ The densification runs in the BSE loader whenever the input file's `kgrid_fine` 
 !!! refuses
     - `w_head_densify = c1` or `legacy`: "`w_head_densify = c1` was removed: srlr is the only model".
     - No `W0_lr` group in the bundle (`GATE srlr_restart_channels`). Rerun GW on a route that writes it (§6.1), for example `compute_mode = cohsex`, `gn_ppm`, `hl_ppm` or a one-shot scalar `tangential`.
-    - W0 stored on the full zone, so `W0_lr` has no unfold tables (`GATE srlr_wedge_tables`).
+    - W0 stored on the full zone of a $\bq$ grid that the WFN's symmetry reduces, so `W0_lr` has no unfold tables (`GATE srlr_wedge_tables`; rerun GW with `restart_q_storage = ibz`). A full-zone W0 on a grid that does not reduce, a reference computed without symmetry, is read with identity unfold tables.
     - A downfolded bundle (`GATE srlr_downfold`), because `W0_lr` belongs to the native centroid set.
     - `W0_lr` written for another `sys_dim`, another $\bq$ wedge or another centroid count.
     - Fewer than two coarse points in the fit radius (`GATE srlr_fit_points`), or no $S$ tensor (`GATE srlr_head_tensor`).
