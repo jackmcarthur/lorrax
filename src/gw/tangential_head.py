@@ -51,6 +51,15 @@ plan's shifted origin is the static Thomas-Fermi row
 (``qsgw_head.metal_static_rows``).  The signed fold is checked in
 ``tests/test_tangential_head_ordered_fold.py``, the ordered metal in
 ``tests/test_tangential_head_ordered_metal.py``.
+
+Every metal's static row folds through the store's Gamma body dressed by
+the static intraband block, ``W_FS = (I - W chi_FS)^-1 W``
+(``qsgw_head.metal_static_gamma_body``).  The store's q = 0 pair sums have
+no diagonal pairs, so its ``z = 0`` body screens with the interband chi0
+only, and the fold of the intraband wings through it is no Schur complement
+(bcc Fe 8^3 gave ``kappa_eff^2 = -12.9 bohr^-2``).  ``chi_FS`` comes from the
+operands of the row's own wings and ``kappa_TF^2``; checked in
+``tests/test_metal_static_fold.py``.
 """
 from types import SimpleNamespace
 from functools import lru_cache
@@ -178,7 +187,8 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
     from .mpa.sample_plan import plan_z
     from .qsgw_head import (IterationHeadSamples, finalize_iteration_head_rows,
                             head_moment_m1, iteration_head_sample_terms,
-                            metal_response_nodes)
+                            metal_response_nodes, metal_static_gamma_body,
+                            metal_static_rows)
     from .response_bank import _reserve
     from .qgrid_symmetry import tangential_operator_realizer
     import distrib_la
@@ -222,6 +232,11 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
         raise ValueError("GATE tangential_head: response and MPA scalar sample grids differ")
     # A metal's static row takes the body at z = 0, as its head operands do.
     nodes = metal_response_nodes(points, config, metal=material_class == "metal")
+    # The store's Gamma body comes from q = 0 pair sums, which have no diagonal
+    # pairs; a metal's static row folds its intraband wings through that body
+    # dressed by the static intraband block (qsgw_head.metal_static_gamma_body).
+    static_body = (np.asarray(metal_static_rows(points, config))
+                   if material_class == "metal" else np.zeros(len(points), bool))
     full = config.head.correction is HeadCorrection.FULL
     if full and response is None:
         raise ValueError("GATE tangential_head: full head requires the direct response and wings")
@@ -275,8 +290,13 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
         native = distrib_la.matmul_workspace_bytes_per_rank(
             mesh_xy, (b.shape, (b.shape[0], b.shape[2], b.shape[1])), np.complex128,
             backend=route[0], batched_route=route[1])
+        # A metal static row adds chi_FS and its Dyson solve (V, chi, W faces and
+        # one LU pair: w_isdf.dyson_route_prices' distributed form); solve_w
+        # admits the local plan's whole matrices against the device budget itself.
+        static_extra = (6*16*int(b.shape[1])*int(b.shape[1])//mesh_xy.size
+                        if static_body.any() else 0)
         name, _ = _reserve(meta, "head", resident,
-            3*stats.output_size_in_bytes+stats.temp_size_in_bytes+native)
+            3*stats.output_size_in_bytes+stats.temp_size_in_bytes+native+static_extra)
         ledger.live_stages = ambient+(name,)
     # Each point's Gamma body is resident only while its 3x3 fold is formed;
     # the mini-BZ cell averages of all points then share one draw
@@ -294,6 +314,9 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
             total = None
             if full:
                 value = evaluate(jnp.asarray(nodes[index], jnp.complex128), *args)
+                if static_body[index]:
+                    value = metal_static_gamma_body(value, wfns, response,
+                        meta=meta, config=config, mesh=mesh_xy)
                 total = value[0]
             if response is None:
                 samples.append(head_resolver.at(point))

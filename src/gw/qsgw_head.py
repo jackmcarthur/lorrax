@@ -2437,26 +2437,19 @@ def _static_head_wings_kernel_face(mesh: Mesh, layout="face", classes: bool = Fa
     return kernel
 
 
-def _static_head_wings_sharded_face(
-    wfns,
-    surface_weight_kn,
-    *,
-    mesh: Mesh,
-    nb_logical: int,
-    nk_tot: int,
-    nspin: int,
-    nspinor: int,
-):
-    """``layout='face'`` body of :func:`static_head_wings_sharded`.
+def _static_surface_operands(wfns, surface_weight_kn, *, nb_logical: int):
+    """The static row's Fermi-surface operands, one owner for its wings and its body.
 
-    ``C_mu = (2/(Nk*nspin*nspinor)) sum_kn f'(E_kn)|psi_kn(mu)|^2`` is
-    DIAGONAL in mu — no cross-mu (i,j) operator, unlike the dynamic
-    wings — so no gather/ring is needed: each rank sums ``|psi|^2`` over
-    the band-index fraction it already owns locally, then one ``psum``
-    over the mesh axis holding that fraction completes the sum, exactly
-    the report's own words ("local |psi|^2 weighted band sums followed
-    by a psum").  Like the dynamic face wing, this pays the full
-    ``nb_full``-wide sum rather than a windowed one (obstacle #3).
+    Returns ``(face, weight, plan, classes)``.  ``face`` is the bundle whose k
+    axis ``weight`` covers: the raw parents on parents-only storage, else
+    ``wfns``.  ``weight`` is the surface table on the face's stored band extent
+    with the bands past ``nb_logical`` zeroed: ``(nk, nb)``, or on parents-only
+    storage ``E[c, p, n]``, the summed weights of parent ``p``'s rows in
+    operation class ``c`` ``(C, n_parent, nb)``.  ``plan``/``classes`` are the
+    k-unfold plan and its ``OperationClasses`` (``None`` without them).
+    :func:`static_head_wings_sharded` and :func:`static_intraband_body_sharded`
+    both read these operands, so the static wings and the static intraband
+    body share one occupation support and one weight per state.
     """
     surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
     if surface.ndim != 2:
@@ -2504,6 +2497,32 @@ def _static_head_wings_sharded_face(
         weight = jnp.einsum(
             "cr,pr,rn->cpn", member(classes.class_of_row, classes.ops.size),
             member(plan.irr_idx, plan.n_parent), weight)
+    return wfns, weight, plan, classes
+
+
+def _static_head_wings_sharded_face(
+    wfns,
+    surface_weight_kn,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+):
+    """``layout='face'`` body of :func:`static_head_wings_sharded`.
+
+    ``C_mu = (2/(Nk*nspin*nspinor)) sum_kn f'(E_kn)|psi_kn(mu)|^2`` is
+    DIAGONAL in mu — no cross-mu (i,j) operator, unlike the dynamic
+    wings — so no gather/ring is needed: each rank sums ``|psi|^2`` over
+    the band-index fraction it already owns locally, then one ``psum``
+    over the mesh axis holding that fraction completes the sum, exactly
+    the report's own words ("local |psi|^2 weighted band sums followed
+    by a psum").  Like the dynamic face wing, this pays the full
+    ``nb_full``-wide sum rather than a windowed one (obstacle #3).
+    """
+    wfns, weight, plan, classes = _static_surface_operands(
+        wfns, surface_weight_kn, nb_logical=nb_logical)
     weight = device_put_process_local(
         weight, NamedSharding(mesh, P()))
     prefactor = -2.0 / (
@@ -2534,6 +2553,121 @@ def _static_wing_transport(mesh: Mesh) -> Callable:
             move(right, perm, class_axis=0, mu_axis=1, mesh_axis="y")),
         mesh=mesh, in_specs=(P(None, "x"), P(None, "y"), P(None, None)),
         out_specs=(P("x"), P("y")), check_vma=False))
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def static_intraband_body_sharded(
+    wfns,
+    surface_weight_kn,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+):
+    r"""The static intraband block of the Gamma body, ``(1, n_mu, n_mu)`` on the faces.
+
+    .. math:: \chi_{FS}(\mu,\nu) = -\frac{2}{N_k n_{spin} n_{spinor}}
+              \sum_{kn} w_{kn}\, u_{kn}(\mu)\, u_{kn}(\nu),\qquad
+              u_{kn}(\mu) = \sum_s |\psi_{kns}(\mu)|^2,
+
+    the ``z -> 0`` at fixed ``q -> 0`` Lindhard limit of the diagonal pairs
+    (``(f_n - f_n)/(e_n - e_n) -> -w_n``), which a q = 0 pair sum does not
+    contain.  ``w`` is the tetrahedron table of ``kappa_TF^2`` and of
+    :func:`static_head_wings_sharded`, read through the same operands
+    (:func:`_static_surface_operands`), so ``[head, wing; wing, body]`` is
+    ``-sum_s a_s [1/sqrt(Omega); u_s][1/sqrt(Omega); u_s]^T`` plus the
+    interband body: one negative-semidefinite static chi0
+    (docs/theory/metal-q0-head.md section 3).  Physical normalization: the
+    chi0 of the Dyson equation ``W = (I - W_inter chi_FS)^-1 W_inter`` at
+    unit prefactor.  Real values, returned complex128, sharded
+    ``P(None, 'x', 'y')``.
+    """
+    if getattr(wfns, "layout", None) not in ("face", "axis"):
+        raise ValueError(
+            "static_intraband_body_sharded requires a canonical face or axis layout")
+    face, weight, plan, classes = _static_surface_operands(
+        wfns, surface_weight_kn, nb_logical=nb_logical)
+    host = np.asarray(weight)
+    support = np.flatnonzero(np.any(host.reshape(-1, host.shape[-1]) > 0.0, axis=0))
+    window = ((int(support[0]), int(support[-1]) + 1) if support.size else (0, 0))
+    if plan is None:
+        rows, perm = weight[:, None, :], np.zeros((1, 1), dtype=np.int32)
+    else:
+        rows = jnp.moveaxis(weight, 1, 0)
+        perm = np.asarray(classes.local_perm, dtype=np.int32)
+    replicated = NamedSharding(mesh, P())
+    body = _static_intraband_body_kernel(
+        mesh, face.layout, plan is not None, window)(
+            face.psi_mun, face.psi_nmu,
+            device_put_process_local(rows, replicated),
+            device_put_process_local(jnp.asarray(perm), replicated))
+    prefactor = -2.0 / (
+        float(nk_tot)
+        * float(max(int(nspin), 1))
+        * float(max(int(nspinor), 1))
+    )
+    return (prefactor * body).astype(jnp.complex128)
+
+
+def _static_intraband_body_kernel(mesh: Mesh, layout: str, classes: bool,
+                                  window: tuple[int, int]) -> Callable:
+    """Cached shard_map kernel of :func:`static_intraband_body_sharded`.
+
+    Each rank owns one ``(mu_X, nu_Y)`` tile.  A scan over the face's k rows
+    gathers that row's densities over the band axis (the ``mu_X`` side from
+    ``psi_mun`` over ``y``, the ``nu_Y`` side from ``psi_nmu`` over ``x``;
+    nothing to gather on the axis layout), keeps the Fermi-surface band
+    ``window`` and adds ``sum_n u(mu) w_n u(nu)`` to the tile.  With
+    ``classes`` each operation class first reads its source centroids on both
+    sides (``OperationClasses.local_perm``, shard-local, as
+    ``CentroidKUnfoldPlan.transport_classes``).  Peak per rank: the tile and
+    one k row's densities, ``O(n_mu^2/P + C n_mu nb/sqrt(P))``.
+    """
+    key = ("static_intraband_body", id(mesh), layout, bool(classes),
+           tuple(int(v) for v in window))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = _mesh_xy(mesh)
+    from common.wfn_layout import psi_specs
+    nmu_spec, mun_spec = psi_specs(layout)
+    distributed_bands = layout == "face"
+    lo, hi = (int(v) for v in window)
+
+    def _local(psi_mun_local, psi_nmu_local, weight_rows, perm):
+        mu_x, nu_y = psi_mun_local.shape[2], psi_nmu_local.shape[3]
+        if classes:
+            perm_x = jax.lax.dynamic_slice_in_dim(
+                perm, jax.lax.axis_index(ax_x) * mu_x, mu_x, axis=1)
+            perm_y = jax.lax.dynamic_slice_in_dim(
+                perm, jax.lax.axis_index(ax_y) * nu_y, nu_y, axis=1)
+
+        def row(acc, xs):
+            mun, nmu, w = xs                    # (s, mu_X, n), (n, s, nu_Y), (C, nb)
+            left = jnp.sum(jnp.square(jnp.abs(mun)), axis=0)
+            right = jnp.sum(jnp.square(jnp.abs(nmu)), axis=1)
+            if distributed_bands:
+                left = jax.lax.all_gather(left, ax_y, axis=1, tiled=True)
+                right = jax.lax.all_gather(right, ax_x, axis=0, tiled=True)
+            left, right, w = left[:, lo:hi], right[lo:hi], w[:, lo:hi]
+            if classes:
+                left = left[perm_x]                          # (C, mu_X, n)
+                right = jnp.swapaxes(right[:, perm_y], 0, 1)  # (C, n, nu_Y)
+                return acc + jnp.einsum("cmn,cn,cnv->mv", left, w, right), None
+            return acc + jnp.einsum("mn,n,nv->mv", left, w[0], right), None
+
+        acc, _ = jax.lax.scan(
+            row, jnp.zeros((mu_x, nu_y), dtype=jnp.float64),
+            (psi_mun_local, psi_nmu_local, weight_rows))
+        return acc[None]
+
+    kernel = jax.jit(shard_map(
+        _local, mesh=mesh,
+        in_specs=(mun_spec, nmu_spec, P(), P()),
+        out_specs=P(None, "x", "y"), check_vma=False))
     _KERNEL_CACHE[key] = kernel
     return kernel
 
@@ -3244,6 +3378,11 @@ class IterationHeadResponse:
     #: the GW mesh's; the fold is ``head_correction.scaled_head_fold``.
     #: ``None``: the GW mesh is the sum set and the fold is today's.
     fold_scale: jax.Array | None = None
+    #: Metals with static wings only: ``(surface_kn, nb_logical, nspin, nspinor)``,
+    #: the operands of ``static_Y_x``/``static_Z_y`` (:func:`_metal_static_head`),
+    #: from which a route whose Gamma body has no intraband block builds it
+    #: (:func:`metal_static_gamma_body`).
+    static_surface: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -3380,6 +3519,9 @@ def _fold_static_kappa2(response, W_body_gamma, cell_volume, mesh):
             "static Schur effective head is not real: "
             f"f00_eff={value!r}")
     kappa2 = -8.0 * np.pi * value.real
+    if jax.process_index() == 0:
+        log.info(f"  static fold: kappa_TF^2={float(response.static_kappa2_bohr2):.8g} "
+                 f"kappa_eff^2={kappa2:.8g} bohr^-2")
     if not np.isfinite(kappa2) or kappa2 <= 0.0:
         raise ValueError(
             "static Schur fold produced nonphysical screening: "
@@ -3947,23 +4089,61 @@ def _metal_static_head(wfns, surface, occupation_state, omegas, *, mesh,
     ``-df/dE``), which the static screening role and the MPA producer's
     static and shifted-origin Gamma rows consume (``gw.screening``,
     ``gw.mpa.model``).  Both metallic head builders take this one owner.
+    The wings' operands are returned as ``static_surface``
+    (``IterationHeadResponse.static_surface``): a route whose static Gamma
+    body has no intraband block (the tangential store) builds it from them
+    (:func:`metal_static_gamma_body`).
     """
     capacity = 2.0 / (float(max(int(nspin), 1)) * float(max(int(nspinor), 1)))
     kappa2 = (8.0 * np.pi * capacity
               * float(np.sum(np.asarray(surface, dtype=np.float64)))
               / float(meta.nk_tot) / float(meta.cell_volume))
-    static_Y_x = static_Z_y = static_chi_body_gamma = None
+    static_Y_x = static_Z_y = static_chi_body_gamma = static_surface = None
     if wfns is not None and metal_static_rows(omegas, config).any():
         static_Y_x, static_Z_y = static_head_wings_sharded(
             wfns, surface, mesh=mesh, nb_logical=int(nb_logical),
             nk_tot=int(meta.nk_tot), nspin=int(nspin), nspinor=int(nspinor))
+        static_surface = (surface, int(nb_logical), int(nspin), int(nspinor))
     if wfns is not None and any(abs(complex(z)) <= 1.0e-14 for z in omegas):
         from gw.w_isdf import compute_chi0_matsubara
         static_chi_body_gamma = compute_chi0_matsubara(
             wfns, meta, mesh, occupation_state=occupation_state,
             nu_indices=(0,),
             rel_tol=float(config.minimax_config.target_error))[0:1]
-    return kappa2, static_Y_x, static_Z_y, static_chi_body_gamma
+    return kappa2, static_Y_x, static_Z_y, static_chi_body_gamma, static_surface
+
+
+def metal_static_gamma_body(W_gamma, wfns, response, *, meta, config, mesh: Mesh):
+    r"""A metal static row's Gamma body: ``W_FS = (I - W_gamma chi_FS)^-1 W_gamma``.
+
+    ``W_gamma`` ``(1, n_mu, n_mu)`` is a Gamma body at ``z = 0`` built from
+    q = 0 pair sums, whose diagonal pairs vanish, so it screens with the
+    interband chi0 only; its static fold of the intraband wings is then no
+    Schur complement and ``kappa_eff^2`` can go negative (bcc Fe 8^3:
+    -12.9 bohr^-2).  ``chi_FS`` (:func:`static_intraband_body_sharded`) is the
+    missing static block, built from the operands of the row's own wings and
+    ``kappa_TF^2`` (``response.static_surface``); with it the fold is the
+    Schur complement of one NSD static chi0, and
+    ``kappa_eff^2 = (8 pi/Omega) e^T (a^-1 + U^T W_gamma U)^-1 e``
+    (``a = C w``, ``U`` the columns ``u_s``) lies in ``(0, kappa_TF^2]`` for a
+    positive ``W_gamma`` (docs/theory/metal-q0-head.md section 3).  The Dyson solve is ``gw.w_isdf.solve_w``
+    at unit prefactor on the deck's W solver.  Returns ``P(None, 'x', 'y')``.
+    """
+    if response.static_surface is None:
+        raise ValueError(
+            "GATE metal_static_body: a metal static row needs the operands of its "
+            "static wings (IterationHeadResponse.static_surface, _metal_static_head)")
+    from gw.w_isdf import solve_w
+    surface, nb_logical, nspin, nspinor = response.static_surface
+    chi = static_intraband_body_sharded(
+        wfns, surface, mesh=mesh, nb_logical=nb_logical,
+        nk_tot=int(meta.nk_tot), nspin=nspin, nspinor=nspinor)
+    if tuple(chi.shape) != tuple(W_gamma.shape):
+        raise ValueError(
+            "GATE metal_static_body: intraband block and Gamma body extents differ: "
+            f"{tuple(chi.shape)} vs {tuple(W_gamma.shape)}")
+    return solve_w(W_gamma, chi, meta, mesh,
+                   dyson_solver=config.backend.w_dyson_solver, pref=1.0)
 
 
 @dataclass(frozen=True)
@@ -4219,11 +4399,11 @@ def build_iteration_head_response(
             pair_split=pair_split,
         )
     omegas = tuple(complex(z) for z in np.asarray(omegas_ry).reshape(-1))
-    static_Y_x = static_Z_y = static_chi_body_gamma = None
+    static_Y_x = static_Z_y = static_chi_body_gamma = static_surface = None
     static_kappa2 = None
     if surface_weight_qp_kn is not None:
         (static_kappa2, static_Y_x, static_Z_y,
-         static_chi_body_gamma) = _metal_static_head(
+         static_chi_body_gamma, static_surface) = _metal_static_head(
             wfns_qp, surface_weight_qp_kn, occupation_state, omegas,
             mesh=mesh, meta=meta, config=config, nb_logical=nb_logical,
             nspin=int(wfn.nspin), nspinor=normalization_nspinor)
@@ -4244,6 +4424,7 @@ def build_iteration_head_response(
         drude_tensor=drude_tensor,
         fermi_surface=fermi_surface,
         velocity_terms=velocity_terms,
+        static_surface=static_surface,
     )
 
 
@@ -4678,7 +4859,7 @@ def build_dft_head_response(
     normalization_nspinor = int(meta.nspinor_wfnfile)
     surface = None
     static_kappa2 = None
-    static_Y_x = static_Z_y = static_chi_body_gamma = None
+    static_Y_x = static_Z_y = static_chi_body_gamma = static_surface = None
     drude_tensor = fermi_surface = pair_split = None
     if occupation_state is not None:
         if b0 != 0:
@@ -4706,13 +4887,14 @@ def build_dft_head_response(
                 nspinor=normalization_nspinor, bvec_cart=_head_bvec(wfn),
                 kgrid=wfn.kgrid)
             (static_kappa2, static_Y_x, static_Z_y,
-             static_chi_body_gamma) = _metal_static_head(
+             static_chi_body_gamma, static_surface) = _metal_static_head(
                 wfns, surface, occupation_state, z,
                 mesh=mesh, meta=meta, config=config, nb_logical=nb_logical,
                 nspin=int(wfn.nspin), nspinor=normalization_nspinor)
         else:
             (surface, drude_tensor, fermi_surface, pair_split, static_kappa2,
-             static_Y_x, static_Z_y, static_chi_body_gamma) = parts["metal"]
+             static_Y_x, static_Z_y, static_chi_body_gamma,
+             static_surface) = parts["metal"]
     sum_set = None
     if source.dense:
         sum_set = (read_head_sum_set(source, mesh=mesh) if parts is None
@@ -4723,7 +4905,7 @@ def build_dft_head_response(
             velocity_cart=velocity_cart,
             metal=(surface, drude_tensor, fermi_surface, pair_split,
                    static_kappa2, static_Y_x, static_Z_y,
-                   static_chi_body_gamma),
+                   static_chi_body_gamma, static_surface),
             sum_set=sum_set)
     surface_c = None if surface is None else on_carrier(surface)
     S = head_s_tensor_sharded(
@@ -4784,7 +4966,8 @@ def build_dft_head_response(
         sigma_energies_ry=e_host[:, :int(meta.nb_sigma)],
         sigma_occupations=np.asarray(occupations)[:, :int(meta.nb_sigma)],
         efermi_ry=efermi, drude_tensor=drude_tensor,
-        fermi_surface=fermi_surface, fold_scale=fold_scale)
+        fermi_surface=fermi_surface, fold_scale=fold_scale,
+        static_surface=static_surface)
 
 
 def _head_bvec(wfn):
