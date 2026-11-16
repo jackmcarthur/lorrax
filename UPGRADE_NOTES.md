@@ -19,10 +19,13 @@ row's own wings and κ_TF² (`qsgw_head.metal_static_gamma_body`), so
 - **Results.** Insulators are bitwise unchanged (hsuite kmeans, kin_ion,
   dipole, gnppm, sp_export: 189/189 captured arrays sha256-equal to
   43fb302b7). Metals with `head_correction = full` on the tangential route
-  move: hsuite `na_sc` κ² 0.7868 → 0.7764 bohr⁻² (map 0), eqp by at most
-  0.07 meV, on-shell dΣ/dω by at most 1.4e-3; `tests/hsuite/reference/na_sc.npz`
-  is regenerated. Metal decks that refused with "static Schur fold produced
-  nonphysical screening" now run. The MPA route is unchanged.
+  move. hsuite `na_sc` map 0 has κ_TF² = 0.786752 bohr⁻²; the static fold gives
+  κ_eff² = 0.776398 through the dressed body, 0.776259 through the store's body
+  alone and 0.776309 through the exact static Matsubara body. eqp moves by at
+  most 0.07 meV and on-shell dΣ/dω by at most 1.4e-3, and
+  `tests/hsuite/reference/na_sc.npz` is regenerated. bcc Fe 8³ SOC (88 bands,
+  N_μ 871), which refused, now gives κ_eff² = 2.264 bohr⁻² against κ_TF² = 7.869
+  (−12.912 through the store's body alone). The MPA route is unchanged.
 - **Decks.** No change.
 - **Test.** `tests/test_metal_static_fold.py`.
 
