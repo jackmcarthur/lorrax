@@ -252,8 +252,18 @@ one NSD static $\chi^0$, i.e. when the body carries
 $\chi_{FS}=-C\sum w_{kn}u_{kn}u_{kn}^{\sf T}$; then
 $\kappa_{\rm eff}^2=(8\pi/\Omega)\,e^{\sf T}(a^{-1}+U^{\sf T}W_{\rm inter}U)^{-1}e\in(0,\kappa_{TF}^2]$,
 $a=Cw$. A Γ body from $q=0$ pair sums has no $\chi_{FS}$ (bcc Fe $8^3$ gave
-$\kappa_{\rm eff}^2=-12.9$ bohr$^{-2}$), so the tangential route folds the static row
-through $(I-W\chi_{FS})^{-1}W$ (`qsgw_head.metal_static_gamma_body`).
+$\kappa_{\rm eff}^2=-12.9$ bohr$^{-2}$): the tangential model at $z=0$ and the
+MPA origin sample are both such sums. So every route folds the static row through
+$W_{\rm st}=(I-W\chi_{FS})^{-1}W$ (`qsgw_head.metal_static_gamma_body`), applied
+by the one fold owner every route calls (`qsgw_head.iteration_head_sample_terms`).
+$\kappa_{TF}^2$, $Y$ and $\chi_{FS}$ are built together, once per map and from
+one measure, the tetrahedron table (`qsgw_head._metal_static_head`). The static
+screening role ($W(0)$ for a restart or the BSE) takes the $\nu=0$ Matsubara
+response, whose $q=0$ row carries the diagonal pairs at the Fermi–Dirac weight
+$-\partial f/\partial E$; that block is replaced by $\chi_{FS}$ before its Dyson
+solve (`qsgw_head.static_fermi_surface_swap`), so by the Woodbury identity its Γ
+row is the same $W_{\rm st}$ and its head fold takes it as it is. No other static
+Γ body exists.
 The four-current head solves the $4\times4$ Dyson equation
 $W_h=[1-\mathcal D(\mathbf q)(\Pi(\mathbf q,z)-C)]^{-1}\mathcal D(\mathbf q)$
 at every Sobol sample of the cell exterior and every point of the screened
@@ -329,10 +339,9 @@ bank's consumer ([four-current heads §5](four-current-head-corrections.md#direc
   until both seams closed. The intraband wing stays the Drude limit at
   $z\ne0$ (q-independent in the cell, error confined to near-line samples
   $|z|\lesssim q_{\rm cell}u_F$, i.e. to $Z$). The static row's fold takes a
-  Γ body that contains the static intraband block (section 3): an exact $z=0$
-  row builds the static Matsubara body, and the tangential route dresses its
-  store's Γ body with $\chi_{FS}$. Certified by
-  `tests/test_tangential_head_ordered_metal.py` and
+  Γ body that contains the static intraband block (section 3), on every route
+  through `qsgw_head.metal_static_gamma_body`. Certified by
+  `tests/test_tangential_head_ordered_fold.py` and
   `tests/test_metal_static_fold.py`.
 - **Damping and the wings.** $r(z)$ multiplies the $D/z^2$ term of $S$. The
   ordered metal's intraband wing ($\propto1/z$) keeps the undamped Drude
@@ -352,6 +361,8 @@ bank's consumer ([four-current heads §5](four-current-head-corrections.md#direc
 | two-band pair split $\phi$ | `gw.fermi_surface.intraband_pair_fraction` |
 | velocity atoms, $\Pi_{\rm intra}$ ($4\times4$) | `gw.fermi_surface.FermiSurfaceIntraband` |
 | $D$, $S(z)$, static slot, $r(z)$, the $M_1$ rule | `gw.qsgw_head` |
+| static Fermi-surface block $\kappa_{TF}^2$, $Y$, $\chi_{FS}$ | `gw.qsgw_head._metal_static_head` |
+| static Γ body $W_{\rm st}$, every route | `gw.qsgw_head.metal_static_gamma_body` (in `iteration_head_sample_terms`); the static role through `static_fermi_surface_swap` |
 | two-moment pin | `gw.mpa.model._pin_static_head_sample` |
 | cell moment $Q$ and cell draws | `vcoul.minibz` (`minibz_coulomb_moment`) |
 | four-current interband tensor, Hall part, Γ-cell Dyson | `gw.photon_direct_head` |

@@ -394,7 +394,7 @@ class PlaneWaveGW:
         _evaluate_samples(None, sample_plan.plan_routes(plan), quad, config, None, self.mesh,
                           material_class="insulator", sym=self.s.sym, energy_reference=None,
                           occupation_state=None, write_full=write_full, write_wedge=None,
-                          static_gamma_override=None, gamma_row=None, kminq_rows=None,
+                          kminq_rows=None,
                           chi=producer, print_fn=print_fn)
         self.mpa_plan = dict(z_ry=z, n_tau_lines=[len(p) for _, p in sample_plan.plan_routes(plan)["lines"]])
         return z, box[0]

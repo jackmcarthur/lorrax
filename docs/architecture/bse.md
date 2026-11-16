@@ -109,7 +109,9 @@ receipt, reuses the bundle's ζ and V, and solves the static Dyson equation
 $W = (1 - V\chi_0)^{-1}V$ at one frequency through the response owner
 (`gw.screening.compute_screening`). Insulators use the static minimax
 quadrature; Fermi–Dirac occupations use the ν = 0 Matsubara response
-(`w_isdf.compute_chi0_matsubara`). The q→0 head at ω = 0 comes from the head
+(`w_isdf.compute_chi0_matsubara`), whose q = 0 row's Fermi-surface block takes
+the head's tetrahedron measure (`qsgw_head.static_fermi_surface_swap`,
+[metal head §3](../theory/metal-q0-head.md#3-the-cell-average)). The q→0 head at ω = 0 comes from the head
 owner (`qsgw_head.build_dft_head_response`) unless `head_correction = off`. No Σ
 is evaluated, no pole is fitted, and the bundle is not modified: the rebuild
 runs on every BSE call.

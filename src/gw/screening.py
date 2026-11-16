@@ -161,7 +161,7 @@ def compute_static_w(
     role: str = "static",
     force_full_bz: bool = False,
     section: str = "chi0_W",
-    gamma_chi_override: jax.Array | None = None,
+    fermi_surface_swap: jax.Array | None = None,
     head_channel=None,
     ordered_orientations: bool = False,
     occupation_state=None,
@@ -280,6 +280,23 @@ def compute_static_w(
                         nu_indices=(0,), rel_tol=config.minimax_config.target_error,
                         ordered=not sym.trs_allowed)
                     chi0_q.block_until_ready()
+                if fermi_surface_swap is not None:
+                    # The q = 0 row's Fermi-surface block takes the head's measure
+                    # (qsgw_head.static_fermi_surface_swap, physical units; chi0
+                    # carries the Dyson prefactor), so the role's Gamma W is the
+                    # static Gamma body of every metal route.
+                    from .w_isdf import _w_solve_pref_scalar
+                    swap = jnp.asarray(fermi_surface_swap)
+                    expected = (1,) + tuple(int(n) for n in chi0_q.shape[-2:])
+                    if tuple(swap.shape) != expected:
+                        raise ValueError(
+                            "GATE static_fermi_surface_swap: got shape "
+                            f"{tuple(swap.shape)}; want {expected}, the chi0 carrier")
+                    with timing.section(
+                            "chi.gamma_static", announce=True,
+                            label=f"{_w} Gamma Fermi-surface block: head measure"):
+                        chi0_q = chi0_q.at[0].add(swap[0] / _w_solve_pref_scalar(meta))
+                        chi0_q.block_until_ready()
             elif ordered_orientations:
                 # ORDERED ORIENTATIONS (measured-broken-TR deck, imaginary
                 # probe): the kernel's own orientation and its q-negated
@@ -323,24 +340,6 @@ def compute_static_w(
                               f"{int(meta.nk_tot)} q, mu={_mu})"):
                     chi0_q = compute_chi0(wfns, quad, meta, mesh_xy,
                                           energy_reference=e_ref)
-                    chi0_q.block_until_ready()
-            if gamma_chi_override is not None:
-                gamma = jnp.asarray(gamma_chi_override)
-                # The fractional-Gamma producer returns the same canonical
-                # product-padded carrier as chi0_q.  ``meta.n_rmu`` is the
-                # logical prefix and is deliberately smaller on geometries
-                # such as P=36 Bi (2070 -> 2088), so validating against it
-                # rejects the correct producer and would make the following
-                # sharded update shape-incompatible.
-                expected = (1,) + tuple(int(n) for n in chi0_q.shape[-2:])
-                if tuple(gamma.shape) != expected:
-                    raise ValueError(
-                        "Gamma chi override must have shape "
-                        f"{expected}, got {gamma.shape}")
-                with timing.section(
-                        "chi.gamma_static", announce=True,
-                        label=f"{_w} exact static fractional Gamma body"):
-                    chi0_q = chi0_q.at[0].set(gamma[0])
                     chi0_q.block_until_ready()
             # IBZ slice on V_q and χ₀_q.  Both retain the canonical
             # ``P(None, 'x', 'y')`` sharding; the helper locks it in.
@@ -607,15 +606,16 @@ def compute_screening(
     for idx, req in enumerate(requests):
         _w = f"W[{req.role}]"
         if req.role == "static":
+            from .qsgw_head import static_fermi_surface_swap
             W_static = compute_static_w(
                 wfns, V_q, quad, e_ref=e_ref,
                 sym=sym, centroid_indices=centroid_indices,
                 config=config, meta=meta, mesh_xy=mesh_xy,
                 role=req.role, head_channel=head_channel,
                 occupation_state=occupation_state,
-                gamma_chi_override=(
-                    iteration_head_response.static_chi_body_gamma
-                    if iteration_head_response is not None else None))
+                fermi_surface_swap=static_fermi_surface_swap(
+                    iteration_head_response, wfns, occupation_state,
+                    meta=meta, mesh=mesh_xy))
             with timing.section("W.gate"):
                 # On the wedge: the reciprocity half reads each wedge row's
                 # -q partner from the unfold tables, not the full zone.

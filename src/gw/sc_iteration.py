@@ -3586,7 +3586,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # over the full Px*Py mesh and frequency-blocked in each ring.
             wfns_qp=wfns_qp,
             eta_ry=(0.0 if mpa_mode else None),
-            occupation_state=entry_occ_state,
             velocity_kinetic_cart=getattr(pt, "velocity_kinetic_cart", None),
         )
         velocity_kind = (

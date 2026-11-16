@@ -53,8 +53,10 @@ plan's shifted origin is the static Thomas-Fermi row
 ``tests/test_tangential_head_ordered_metal.py``.
 
 A metal's static row folds through the store's Gamma body dressed by its
-static intraband block (``qsgw_head.metal_static_gamma_body``): the store's
-q = 0 pair sums have none (``tests/test_metal_static_fold.py``).
+static intraband block: the store's q = 0 pair sums have none.  The head's
+common fold owner dresses it, on this route as on the MPA route
+(``qsgw_head.iteration_head_sample_terms`` -> ``metal_static_gamma_body``;
+``tests/test_metal_static_fold.py``).
 """
 from types import SimpleNamespace
 from functools import lru_cache
@@ -182,8 +184,7 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
     from .mpa.sample_plan import plan_z
     from .qsgw_head import (IterationHeadSamples, finalize_iteration_head_rows,
                             head_moment_m1, iteration_head_sample_terms,
-                            metal_response_nodes, metal_static_gamma_body,
-                            metal_static_rows)
+                            metal_response_nodes)
     from .response_bank import _reserve
     from .qgrid_symmetry import tangential_operator_realizer
     import distrib_la
@@ -227,10 +228,7 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
         raise ValueError("GATE tangential_head: response and MPA scalar sample grids differ")
     # A metal's static row takes the body at z = 0, as its head operands do.
     nodes = metal_response_nodes(points, config, metal=material_class == "metal")
-    # A metal's static row folds through the body with its intraband block.
-    static_body = (np.asarray(metal_static_rows(points, config))
-                   if material_class == "metal" else np.zeros(len(points), bool))
-    full = config.head.correction is HeadCorrection.FULL
+    full =config.head.correction is HeadCorrection.FULL
     if full and response is None:
         raise ValueError("GATE tangential_head: full head requires the direct response and wings")
     ledger = meta.tangential_capacity
@@ -283,19 +281,9 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
         native = distrib_la.matmul_workspace_bytes_per_rank(
             mesh_xy, (b.shape, (b.shape[0], b.shape[2], b.shape[1])), np.complex128,
             backend=route[0], batched_route=route[1])
-        # A metal static row adds the compiled chi_FS program; solve_w admits its own Dyson route.
-        static_extra = 0
-        if static_body.any() and response.static_surface is not None:
-            from runtime.aot_memory import compiled_new_bytes
-            from .qsgw_head import static_intraband_body_program
-            surface, nb_logical, nspin, nspinor = response.static_surface
-            kernel, operands = static_intraband_body_program(
-                wfns, surface, mesh=mesh_xy, nb_logical=nb_logical,
-                nk_tot=int(meta.nk_tot), nspin=nspin, nspinor=nspinor)
-            static_extra = compiled_new_bytes(kernel.lower(*operands).compile())
-            del kernel, operands
+        # A metal static row's dressing solve (metal_static_gamma_body) admits its own Dyson route.
         name, _ = _reserve(meta, "head", resident,
-            3*stats.output_size_in_bytes+stats.temp_size_in_bytes+native+static_extra)
+            3*stats.output_size_in_bytes+stats.temp_size_in_bytes+native)
         ledger.live_stages = ambient+(name,)
     # Each point's Gamma body is resident only while its 3x3 fold is formed;
     # the mini-BZ cell averages of all points then share one draw
@@ -313,9 +301,6 @@ def build_tangential_head(handle, header, V_q, wfns, meta, config, *,
             total = None
             if full:
                 value = evaluate(jnp.asarray(nodes[index], jnp.complex128), *args)
-                if static_body[index]:
-                    value = metal_static_gamma_body(value, wfns, response,
-                        meta=meta, config=config, mesh=mesh_xy)
                 total = value[0]
             if response is None:
                 samples.append(head_resolver.at(point))

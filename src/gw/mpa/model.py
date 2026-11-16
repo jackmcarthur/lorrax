@@ -902,7 +902,7 @@ def _evaluate_samples(
     wfns, routes, quad, config, meta, mesh_xy, *,
     material_class, sym,
     energy_reference, occupation_state, write_full, write_wedge,
-    static_gamma_override, gamma_row, kminq_rows, write_reflected=None,
+    kminq_rows, write_reflected=None,
     chi=None, print_fn=print,
 ):
     """Evaluate every plan point through its route's kernel.
@@ -1028,11 +1028,6 @@ def _evaluate_samples(
                     "imag", used, omega_ry=point["varpi"],
                     target=config.minimax_config.target_error)
                 values = chi.imag(used)
-            if (
-                point["character"] == "static"
-                and static_gamma_override is not None
-            ):
-                values = values.at[0].set(static_gamma_override[0])
             if ordered and point["character"] == "static":
                 chi_reflected = values
             write_full(point, values)
@@ -1053,8 +1048,10 @@ def _evaluate_samples(
                     "  MPA direct chi0 shifted-origin q row "
                     f"{q_done}/{q_total} complete in {elapsed:.3f} s"),
                 ordered=metal_physical)
-            if static_gamma_override is not None and gamma_row is not None:
-                chi_w = chi_w.at[gamma_row].set(static_gamma_override[0])
+            # The literal origin sample at q = 0 has no diagonal pairs: it is the
+            # interband body.  The head's static row dresses it with the static
+            # intraband block (qsgw_head.metal_static_gamma_body), as on the
+            # tangential route; the body samples stay the literal response.
             write_wedge(point, chi_w)
         else:
             # Far pure-imaginary point: the fractional contour is cheap at
@@ -1284,9 +1281,6 @@ def build_mpa_fit(
     }
     metal = material_class == "metal"
     kminq_rows = _metal_kminq_rows(sym, q_idx) if metal else None
-    static_gamma_override = (
-        iteration_head_response.static_chi_body_gamma
-        if iteration_head_response is not None else None)
     gamma_matches = np.flatnonzero(np.asarray(q_idx, np.int64) == 0)
     gamma_row = int(gamma_matches[0]) if gamma_matches.size == 1 else None
 
@@ -1318,8 +1312,7 @@ def build_mpa_fit(
         energy_reference=energy_reference,
         occupation_state=occupation_state,
         write_full=_write_full, write_wedge=_write_wedge,
-        static_gamma_override=static_gamma_override,
-        gamma_row=gamma_row, kminq_rows=kminq_rows,
+        kminq_rows=kminq_rows,
         write_reflected=_write_reflected if ordered else None,
         print_fn=print_fn)
 
