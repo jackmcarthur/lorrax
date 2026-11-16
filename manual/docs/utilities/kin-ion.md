@@ -193,16 +193,11 @@ kin_ion.h5
     @generator_commit         str
   irr_idx_k                   int32[nk]
   sym_idx_k                   int32[nk]
-  kpoints_stored_crys         float64[n_rk, 3]   crystal k of each stored row (its star's WFN k, mod G)
-  kpoints_full_crys           float64[nk, 3]     crystal k of each unfolded row
 ```
 
 The reader (`file_io.restart_bundle.load_kin_ion_submatrix`) unfolds the stored rows to all $n_\bk$ points through `irr_idx_k` and `sym_idx_k`, conjugating the time-reversed rows. After writing, the utility checks that on every degenerate DFT manifold the written block is a multiple of the identity and reports any block that is not.
 
-!!! warning "The stored rows are not in the WFN's k order"
-    The rows are in star order (the first full-BZ occurrence of each star), which on a symmetry-reduced cell is a permutation of the WFN's k list: on bulk CrCl$_3$ $4^3$ stored row 6 is WFN k 13 and rows 7–13 are WFN k 6–12. A script that reads `kin_ion` directly pairs its rows with WFN-ordered data through `kpoints_stored_crys` (compare modulo a reciprocal lattice vector), never by row number. `sigma_mnk.h5` stores its cubes the same way and carries the same two lists.
-
-Before reading the slab GW refuses a file that is in the folded-Hartree format, has no `bispinor` stamp or a different one, or whose `sys_dim`, `nspinor`, full-BZ count, full-BZ k list (`GATE k_list_mismatch`) or band extent does not match the run. A file written before 2026-11-16 has no k lists and is read with a NOTE, unchecked. The fix is to rerun this utility with the run's input file. The `wfn_fingerprint`, `input_file` and `pseudopotentials` stamps are recorded but not compared: a file built from another WFN with the same shape is read.
+Before reading the slab GW refuses a file that is in the folded-Hartree format, has no `bispinor` stamp or a different one, or whose `sys_dim`, `nspinor`, full-BZ count or band extent does not match the run. The fix is to rerun this utility with the run's input file. The `wfn_fingerprint`, `input_file` and `pseudopotentials` stamps are recorded but not compared: a file built from another WFN with the same shape is read.
 
 ## Refusals {: #refusals }
 
