@@ -264,6 +264,22 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
         raise ValueError(
             "transverse direct Hartree requires the canonical four-component "
             f"kinetic-balance carrier; meta.nspinor={int(meta.nspinor)}")
+    # Diagnostic (LORRAX_DIAG_FOURC_CHARGE=hartree|both): the density and
+    # <m|V_H|n> take all four components of the normalized kinetic-balance
+    # lift (main 23d904a67's literal four-component charge); the current is
+    # then that lift's too (an O(alpha^2) relative change of J).
+    from common.bispinor_diag import fourc_charge_hartree
+    from common.bispinor_init import NORMALIZED_RKB_LIFT
+    density_lift = representation.current_lift
+    if bispinor and fourc_charge_hartree():
+        if not with_transverse:
+            raise ValueError("LORRAX_DIAG_FOURC_CHARGE=hartree needs the "
+                             "four-current direct field (include_transverse)")
+        charge_ns = 4
+        density_lift = NORMALIZED_RKB_LIFT
+        print("*** LORRAX DIAG: direct field on the literal four-component "
+              "charge (normalized kinetic-balance lift, charge_nspinor=4)",
+              flush=True)
     if exact_unit_occupations and nocc > nb:
         raise ValueError(
             f"V_H needs the {nocc} occupied bands but only {nb} were requested")
@@ -288,7 +304,7 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
     psi_G = wfn.load(
         bands=(0, nb_load), k=k_spec, sharding=band_sphere_spec(),
         bispinor=bispinor,
-        bispinor_lift=representation.current_lift)
+        bispinor_lift=(density_lift if bispinor else None))
     box_index = wfn.box_index(k=k_spec)
     density_label = ("occupied bands" if exact_unit_occupations else
                      "WFN bands with canonical fractional occupations")

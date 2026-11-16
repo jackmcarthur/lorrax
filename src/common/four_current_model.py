@@ -40,6 +40,8 @@ from dataclasses import dataclass
 #: 2026-10) refuses by name.
 PAULI_FOUR_CURRENT_REPRESENTATION = "pauli_charge_rkb_current_v1"
 SOURCE_WFN_CHARGE_REPRESENTATION = "source_wfn_normalized_charge_v1"
+#: Diagnostic only (LORRAX_DIAG_FOURC_CHARGE=vertex|both).
+DIAG_FOURC_CHARGE_REPRESENTATION = "diag_fourc_normalized_rkb_charge_rkb_current_v1"
 #: One line naming the carrier, for the rank-0 startup block.
 PAULI_FOUR_CURRENT_SUMMARY = (
     "charge psi_L^dagger psi_L (two-spinor density and q->0 head); current "
@@ -77,7 +79,9 @@ def resolve_four_current_representation(
     sites keep naming the mode they resolved -- when a phase-3 mode needs a
     different carrier, this is the one function that has to learn about it.
     """
-    from common.bispinor_init import LARGE_BLOCK_LIFT, RAW_KINETIC_BALANCE_LIFT
+    from common.bispinor_init import (LARGE_BLOCK_LIFT, NORMALIZED_RKB_LIFT,
+                                      RAW_KINETIC_BALANCE_LIFT)
+    from common.bispinor_diag import fourc_charge_vertex
 
     if not bool(bispinor):
         return FourCurrentRepresentation(
@@ -87,6 +91,18 @@ def resolve_four_current_representation(
             current_lift=None,
             scalar_head_bispinor=False,
             charge_representation=SOURCE_WFN_CHARGE_REPRESENTATION,
+        )
+    if fourc_charge_vertex():
+        # Diagnostic (LORRAX_DIAG_FOURC_CHARGE=vertex|both): literal
+        # four-component charge in every charge vertex; the q->0 charge head
+        # stays the two-spinor dipole.  Own stamp, so no store is shared.
+        return FourCurrentRepresentation(
+            charge_bispinor=True,
+            charge_lift=NORMALIZED_RKB_LIFT,
+            current_bispinor=True,
+            current_lift=RAW_KINETIC_BALANCE_LIFT,
+            scalar_head_bispinor=False,
+            charge_representation=DIAG_FOURC_CHARGE_REPRESENTATION,
         )
     return FourCurrentRepresentation(
         charge_bispinor=True,

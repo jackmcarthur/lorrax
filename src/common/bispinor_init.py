@@ -52,9 +52,16 @@ RAW_KINETIC_BALANCE_LIFT = "raw"
 # The carrier of every charge vertex: psi_L in the large block and a zero
 # small block (docs/theory/bispinor-gw.md#carrier).
 LARGE_BLOCK_LIFT = "large_block"
+# Diagnostic only (LORRAX_DIAG_FOURC_CHARGE, common.bispinor_diag): the
+# normalized kinetic-balance lift of main 23d904a67, a literal four-component
+# charge Psi^dagger Psi with Psi = [I;X](I+X^dagger X)^(-1/2) psi_L.
+NORMALIZED_RKB_LIFT = "normalized_rkb"
+NORMALIZED_RKB_LIFT_PROVENANCE = (
+    "Psi=[I;X](I+X^dagger*X)^(-1/2)*psi_L;X=(alpha_fs/2)*sigma.p")
 LIFT_PROVENANCE = {
     RAW_KINETIC_BALANCE_LIFT: KINETIC_BALANCE_LIFT_PROVENANCE,
     LARGE_BLOCK_LIFT: LARGE_BLOCK_LIFT_PROVENANCE,
+    NORMALIZED_RKB_LIFT: NORMALIZED_RKB_LIFT_PROVENANCE,
 }
 DIRAC_ALPHA_VERTEX_PROVENANCE = (
     "j=c*psi^dagger*alpha*psi; raw_paramagnetic_vertex_no_contact"
@@ -164,4 +171,12 @@ def lift_to_4spinor(
     p_cart = pkG @ bvec_cart_bohr                             # (n_k, ngkmax, 3)
     psi_S = jnp.complex128(HALFALPHA) * sigma_dot_cartesian(
         psi_2, p_cart)
-    return jnp.concatenate([psi_2, psi_S], axis=2)
+    lifted = jnp.concatenate([psi_2, psi_S], axis=2)
+    if mode == NORMALIZED_RKB_LIFT:
+        # (sigma.K)^dagger (sigma.K) = |K|^2, so the normalization is a
+        # pointwise scalar per plane wave (main 23d904a67 spelling).
+        h2 = jnp.float64(HALFALPHA) ** 2
+        r = jnp.reciprocal(jnp.sqrt(
+            jnp.float64(1.0) + h2 * jnp.sum(p_cart * p_cart, axis=-1)))
+        return lifted * r[:, None, None, :]
+    return lifted

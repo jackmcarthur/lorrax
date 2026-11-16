@@ -83,10 +83,43 @@ def refuse_retired_switches() -> None:
             "  doc:  docs/input_reference.md, bispinor_transverse_hartree.")
 
 
+FOURC_CHARGE_VALUES = ("hartree", "vertex", "both")
+
+
+def fourc_charge() -> str | None:
+    """``LORRAX_DIAG_FOURC_CHARGE``: a literal four-component charge
+    (normalized kinetic-balance lift, main 23d904a67's carrier) in the direct
+    field (``hartree``), in every charge vertex of zeta / Sigma_x / W / Sigma_c
+    (``vertex``), or in both.  Unset: the Pauli carrier, bit-identical.
+    Diagnostic of the valence small-component Coulomb double count; never a
+    production result."""
+    text = str(os.environ.get("LORRAX_DIAG_FOURC_CHARGE", "")).strip().lower()
+    if not text:
+        return None
+    if text not in FOURC_CHARGE_VALUES:
+        raise ValueError(
+            f"LORRAX_DIAG_FOURC_CHARGE={text!r}; expected one of "
+            f"{FOURC_CHARGE_VALUES} (unset = Pauli charge)")
+    _announce("LORRAX_DIAG_FOURC_CHARGE", text)
+    return text
+
+
+def fourc_charge_hartree() -> bool:
+    return fourc_charge() in ("hartree", "both")
+
+
+def fourc_charge_vertex() -> bool:
+    return fourc_charge() in ("vertex", "both")
+
+
 def active_switches() -> str | None:
-    """One line naming the set switch, or ``None`` when it is inert."""
+    """One line naming the set switches, or ``None`` when they are inert."""
     scale = alpha_fs_scale()
-    return None if scale == 1.0 else f"LORRAX_DIAG_ALPHA_FS_SCALE={scale!r}"
+    parts = [] if scale == 1.0 else [f"LORRAX_DIAG_ALPHA_FS_SCALE={scale!r}"]
+    fc = fourc_charge()
+    if fc is not None:
+        parts.append(f"LORRAX_DIAG_FOURC_CHARGE={fc}")
+    return "; ".join(parts) if parts else None
 
 
 def refuse_on_two_component(*, bispinor: bool) -> None:
