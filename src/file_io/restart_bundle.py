@@ -649,6 +649,9 @@ def unfold_parent_faces(faces, restart_file, input_file, mesh_xy, *, family="cha
     from gw.gw_config import LorraxConfig
     cfg = LorraxConfig.from_input_file(input_file)
     wfn = WfnLoader(cfg.paths.wfn_file)
+    # The band request resolves against the WFN as gw resolves it
+    # (number_bands_protected -> nval/ncond), before any band window is built.
+    cfg = cfg.with_band_request(wfn, lambda *args: None)
     authenticate_restart_qp_state_source_for_wfn(
         wfn=wfn, state_artifact_path=restart_file, where="BSE parent reader")
     sym = wfn.symmetry()
