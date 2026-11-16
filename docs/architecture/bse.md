@@ -529,12 +529,16 @@ max ε₂ off. The ε₂ prefactor is $16\pi^2/(V N_k n_\mathrm{spin} n_\mathrm{
 continued fraction is scaled by $\lVert d\rVert^2$, as in BerkeleyGW
 (`BSE/absh.f90`, `BSE/haydock.f90`).
 
-Per-state dipoles: `bse_jax the eigensolve full_bse = false spin_singlet = true write_eigenvectors N dipole_file
-dipole.h5` contracts each written eigenvector with the dipole
+Per-state dipoles: `bse_jax the eigensolve write_eigenvectors N dipole_file
+dipole.h5` contracts each eigenvector with the dipole
 (`absorption_common.exciton_dipoles_distributed`, blocked over each rank's own
 eigenvector tile) and stores $\langle 0|\hat r_\alpha|S\rangle$ as
-`exciton_data/dipoles`, shape (1, N, 3, 2), in bohr. Flag rules:
-[drivers](../drivers.md#bse-bsebse_jax).
+`exciton_data/dipoles`, shape (1, N, 3, 2), in bohr. Under `full_bse = true`
+the paired $(X, Y)$ ($X^\dagger X - Y^\dagger Y = 1$) enters as
+$\sum_t X_t d^*_t - Y_t d_t$: the coupling block's exchange term
+$K^x_B = M V M^T$ pairs $Y$ with the conjugate pair density
+(`absorption_common.exciton_dipole_projections`; the f-sum rule is the test).
+Flag rules: [drivers](../drivers.md#bse-bsebse_jax).
 
 In-plane helicity: `helicity_table` adds each written state's circular
 strengths to `bse.out` (`absorption_common.inplane_helicity`, the one place
@@ -850,7 +854,7 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 | `GATE bse_qp_star_tables` | the same | a wedge-stored artifact whose unfold tables are not the WFN's |
 | `GATE bse_qp_star_gauge` | the same; `bse_qp_rotation.certify_star_gauge` | an artifact $H_{QP}(k)$, or a restart centroid band matrix of 1 or $\sigma_z$, that misses its (anti)unitary star image by more than $10^{-10}$ |
 | `GATE bse_qp_dipole_velocity` | `absorption_common.window_dipoles` | `qp_rotations_file dipole_file` with a momentum-only (`skip_vnl`) dipole |
-| `GATE bse_qp_rotations_k_grid` | `bse_loading.load_bse_data_from_restart_sharded` | `qp_rotations_file` with `kgrid_fine` |
+| `GATE bse_qp_rotations_k_grid` | `bse_loading.load_bse_data_from_restart_sharded` | `qp_rotations_file` with `kgrid_fine` and the TD-aGW full-window velocity |
 | `GATE eqp_star_spread` | `restart_bundle.apply_eqp_corrections` (`_eqp_on_full_bz`) | an `eqp_corrections` file whose QP shifts $E_{QP} - E_{DFT}$, averaged over each DFT multiplet, differ across a symmetry star by more than 1 meV (`EQP_STAR_SPREAD_TOL_EV`); the message names the band, its multiplet and the two k. Per-band values are applied as given |
 | `GATE eqp_full_zone_count`, eqp k coverage | the same | an `eqp_corrections` file with more blocks than the full BZ; a full-zone-sized file in which some full-BZ k matches no block or two (crystal coordinates mod G to 1e-6); a file that is neither the wedge nor the full zone |
 | two QP descriptions | `bse_jax.parse_args`, `file_io.qp_wfn.refuse_conflicting_qp_state_sources` | `eqp_corrections` with `qp_rotations_file`; a rotation on a QP WFN deck or on a restart from another WFN |
@@ -875,9 +879,12 @@ a frozen-kernel approximation, not that self-consistent ladder map.
   resident CC model past Σ until the final-map persist.
 - The BSE reads ψ from the restart, which holds the deck WFN's states. `eqp_corrections`
   replaces energies only (`bse/bse_window.py:569`); `qp_rotations_file` rotates ψ
-  into the QP basis on the native grid and refuses `kgrid_fine`, so a densified
-  BSE with QP ψ needs a GW restart generated from `WFN_qp.h5`, with
-  `dipole_qsgw.h5` as its dipole. A `WFN_qp.h5` written before 2026-09-30 from a WFN that stores both
+  into the QP basis on the native grid; under `kgrid_fine` it rotates the
+  htransform's compact states instead (`fh_interp.resolve_qp_hamiltonian_state`,
+  f(H_QP) in the nodal basis), keeping the restart's W, V and ISDF tensors, and
+  refuses only the TD-aGW full-window velocity. A GW restart generated from
+  `WFN_qp.h5` (with `dipole_qsgw.h5`) is the other route; its W is rebuilt from
+  the QP states. A `WFN_qp.h5` written before 2026-09-30 from a WFN that stores both
   k and −k has broken rows; regenerate it
   ([self-consistency §8](../self_consistency.md#8-seeding-restart-and-outputs)).
 - Full BSE through `the eigensolve` is dense and stops at N = 4096

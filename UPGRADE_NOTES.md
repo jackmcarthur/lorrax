@@ -48,6 +48,33 @@ H₂⁻ stage bitwise against main at P4; Si 8³ QSGW identical to main through 
 - **Tests.** `tests/test_semicore_floor_metal.py`, `tests/test_metal_static_fold.py`,
   `tests/test_metal_head_free_electron.py`.
 
+## 2026-11-17 — Full-BSE oscillator strengths: `full_bse = true` takes `dipole_file`
+
+`full_bse = true` with `dipole_file` is no longer refused. Each state's
+⟨0|r|S⟩ now takes both halves of the paired eigenvector,
+Σ_t X_t conj(d_t) − Y_t d_t with X†X − Y†Y = 1
+(`manual/docs/drivers/bse/theory.md` Eq. 5.2), and a full-BSE run writes
+what a TDA run writes: the dipole columns of `eigenvalues_b*.dat`,
+`absorption_eh.dat` / `absorption_noeh.dat`, `exciton_data/dipoles` in its
+`eigenvectors.h5`, and `helicity_table`. The spectrum sums the positive
+roots, as under the TDA. `haydock` still needs the TDA.
+
+- **Results.** No TDA result moves: the TDA contraction is unchanged, and a
+  paired vector with Y = 0 reproduces it bit for bit. On the full BSE the
+  real product route now returns pairs that are Σ-orthonormal inside a
+  degenerate multiplet, and it is taken only when H is real (A and B both
+  real); a complex A with a real or zero B takes the definite pencil, where
+  the product reduction did not hold. The full-BSE eigenvectors come back
+  on the solve mesh's transition axes, as the TDA's do; `eigenvectors.h5` is
+  unchanged.
+- **Files.** `absorption_common.load_eigenvectors_h5` still refuses a
+  full-BSE file (its consumers, TD-aGW and `dump_window_dipoles`, read X
+  alone); the message names `exciton_data/dipoles`.
+- **Decks.** No change.
+- **Test.** `tests/test_bse_full_dipoles_cpu.py`: B = 0 equals the TDA, the
+  f-sum rule with the local-field kernel, equal strength of the ±Ω partner
+  roots, the mesh route, the real product route.
+
 ## 2026-11-16 — a metal's static head row folds through a Γ body with its intraband block
 
 On the tangential route a metal's static (Thomas–Fermi) head row folded the
@@ -107,6 +134,35 @@ row's own wings and κ_TF² (`qsgw_head.metal_static_gamma_body`), so
 - **Results.** No number changes: the hsuite references gained only the new
   k-list members, every old member bitwise. No input-file key, default or
   environment switch changed.
+## 2026-11-14 — Fine-grid BSE refuses a head-off ISDF tensor file
+
+`kgrid_fine` now refuses an ISDF tensor file whose screened head is zero (GW
+`head_correction = off`), `GATE kgrid_fine_zero_head`.  On such a file the fine
+grid restores the small-q attraction while the QP energies keep no head: NiO
+d-d excitons fell 0.42 eV from 4^3 to 12^3 against a head-on file of the same
+run, an a/n drift that looks like k convergence.  Rerun GW with the head on, or
+solve on the GW grid.  Native-grid BSE is unchanged.
+
+## 2026-11-14 — Fine-grid BSE in the QP basis of the GW run (`qp_rotations_file` with `kgrid_fine`)
+
+`qp_rotations_file` now runs under `kgrid_fine`.  The band interpolation is
+built from f(H_QP) = U f(E_QP) U^H on the coarse grid, so the fine states and
+energies are quasiparticle while W, V, the ISDF tensors and the long-range
+anchor stay the GW run's own (before, `GATE bse_qp_rotations_k_grid` refused,
+and the only route was a GW rerun on `WFN_qp.h5`, which rebuilds W from the QP
+states).  The QP block must lie inside the interpolated band window: raise
+`number_cond_bands_coarse` if the run refuses.  Use `dipole_position_fix =
+true`.  TD-aGW's full-window velocity still refuses.  Runs without
+`qp_rotations_file`, and `qp_rotations_file` on the native grid, are unchanged.
+
+## 2026-11-14 — Fine-grid BSE on a q grid that symmetry does not reduce
+
+`kgrid_fine` now runs on an ISDF tensor file whose W0 is stored on the full
+zone because the WFN's symmetry does not reduce the q grid (a no-symmetry
+reference, such as a hybrid-start run).  Its `W0_lr` rows are read with
+identity unfold tables, so existing files work without a GW rerun; before,
+`GATE srlr_wedge_tables` refused them.  A full-zone W0 on a grid that does
+reduce still refuses.  Results on symmetry-reduced files are unchanged.
 
 ## 2026-11-14 — Bispinor transverse terms are input-file keys; head default; stamps
 

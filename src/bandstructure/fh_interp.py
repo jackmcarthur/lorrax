@@ -1447,8 +1447,15 @@ def _apply_qp_block_to_compact_state(
 def resolve_qp_hamiltonian_state(
         *, basis, enk_sigma, sym, meta, wfn, wfn_path: str,
         qp_rotations_file: str, eqp_file: str | None = None,
-        log_fn=None):
+        log_fn=None, nodes=None):
     """Overlay a matched QP block on a reusable mean-field Galerkin fit.
+
+    ``nodes`` (an ``isdf.galerkin.NodalInterp``, optional): the states at the
+    nodes and at the back-map targets take the same block rotation,
+    Phi_QP = Uᵀ Phi; the rotated copy is returned as a fourth value.  A
+    consumer that reads psi at the targets (the BSE fine grid's back-map
+    ``L_R``) needs it: with C_QP beside the unrotated Phi the back-map
+    returns the DFT orbitals with QP energies.
 
     ``basis`` remains the immutable fit artifact.  Only its compact state
     rows are rotated, using the same convention as
@@ -1559,6 +1566,24 @@ def resolve_qp_hamiltonian_state(
         companion_sharding)
     ctilde_qp, enk_qp = _apply_qp_block_to_compact_state(
         ctilde, enk_dev, U_dev, E_dev, band_offset=q0 - fit0)
+    nodes_qp = None
+    if nodes is not None:
+        def _rotate_states(values):
+            if values is None:
+                return None
+            if int(values.shape[0]) != nk or int(values.shape[1]) != nb_fit:
+                raise ValueError(
+                    f"GATE qp_nodal_states: got node/target states of shape "
+                    f"{tuple(values.shape)}; want ({nk}, {nb_fit}, ...) on the "
+                    f"fitted window [{fit0},{fit1}); why: Phi_QP = Uᵀ Phi rotates "
+                    "the same band rows as C; fix: report it.")
+            return _apply_qp_block_to_compact_state(
+                values, enk_dev, U_dev, E_dev, band_offset=q0 - fit0)[0]
+        from isdf.galerkin import NodalInterp
+        nodes_qp = NodalInterp(
+            _rotate_states(nodes.nodal), nodes.node_frac, nodes.lattice_bohr,
+            nodes.sys_dim, nodes.nspinor, target=_rotate_states(nodes.target),
+            target_frac=nodes.target_frac)
     say(
         f"  [QP state] {os.path.basename(path)}: full "
         f"H_QP=U diag(E_QP) U^H on bands [{q0},{q1}); "
@@ -1574,6 +1599,8 @@ def resolve_qp_hamiltonian_state(
     # This exact range comes from the authenticated artifact metadata above;
     # the standalone driver carries it to the active/projected output seam.
     # Do not reconstruct it later from a deck count or an array shape.
+    if nodes is not None:
+        return ctilde_qp, enk_qp, corrected_range, nodes_qp
     return ctilde_qp, enk_qp, corrected_range
 
 

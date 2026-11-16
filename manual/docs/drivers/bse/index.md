@@ -134,7 +134,7 @@ Production runs use the default route, the eigensolve, and `kpm_dos = true` comp
     ```
 
 ??? treatment supported "dense · Full BSE, definite pencil · non-TDA eigenpairs"
-    Builds $A$ and $B$ densely from the matvec and solves the Hermitian-definite pencil, returning paired $(X, Y)$. Limited to a transition dimension of 4096; reads only `number_eigenvalues` and the kernel flags.
+    Builds $A$ and $B$ densely from the matvec and solves the Hermitian-definite pencil, returning paired $(X, Y)$ normalised $X^\dagger X - Y^\dagger Y = 1$. Limited to a transition dimension of 4096; reads `number_eigenvalues`, the kernel flags and the dipole and output keys. With `dipole_file` each state's dipole takes both halves, $\sum_t X^S_t d^*_t - Y^S_t d_t$ ([Theory](theory.md#abs-ds)), and the spectra are written as under the TDA.
 
     ```bash
     # input keys in the -i input file: full_bse = true, number_eigenvalues = 10
@@ -200,7 +200,7 @@ A downfolded bundle is validated by solving the same BSE on the parent and on th
     - An input file without `nval` and `ncond` (or `number_bands_protected`), `number_bands` or `centroids_file`, with one line per key (`centroids_file is required`).
     - No `-i`; an unknown flag; an old flag ("`--n-val` is now input key `number_val_bands_fine`") or an old input key ("`bse_k_grid` is now `kgrid_fine`").
     - A key set on a route that does not read it (for example `number_eigenvalues` or `highest_occupied_band` with `kpm_dos = true`), or two route keys together.
-    - `dipole_file` with `full_bse = true`; `spin_singlet`/`spin_triplet` on a spinor WFN; `spinor` that disagrees with the WFN; a collinear spin-polarized WFN.
+    - `haydock` with `full_bse = true`; `spin_singlet`/`spin_triplet` on a spinor WFN; `spinor` that disagrees with the WFN; a collinear spin-polarized WFN.
     - `eqp_co_corrections` without `kgrid_fine`, `eqp_corrections` with it; a fine-grid key without `kgrid_fine`; `number_cond_bands_coarse` below `number_cond_bands_fine` (`GATE bse_window_outside_coarse`).
     - `--px`/`--py` not given together, not square, or not using every device.
     - No `isdf_tensors_*.h5`, or more than one, in the run directory and its `tmp/` (`GATE bse_restart_ambiguous`).
@@ -210,6 +210,7 @@ A downfolded bundle is validated by solving the same BSE on the parent and on th
     - A window band outside the ζ-fit legs of the GW run (`BseWindowOutsideZetaTrainingError`).
     - `eqp_corrections` on a stamped QP WFN, or an `eqp1.dat` whose k blocks are not the WFN's irreducible wedge.
     - A `dipole.h5` whose `basis` stamp differs from the WFN's.
+    - `kgrid_fine` on an ISDF tensor file whose screened head is zero (GW `head_correction = off`): the fine grid restores the small-$\bq$ attraction but the QP energies keep no head, so excitons sink with the grid (`GATE kgrid_fine_zero_head`).
     - `kgrid_fine` with an axis smaller than the coarse grid; `w_head_densify = c1` or `legacy`; a bundle without `W0_lr` under `kgrid_fine` (an `mpa`, QSGW tangential or bispinor tangential restart, or a downfolded bundle).
     - Full BSE above transition dimension 4096, or with a non-reciprocal $W$.
     - `bse.absorption_haydock` on fewer than two devices.

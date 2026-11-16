@@ -189,9 +189,13 @@ Content: All the arrays
 	Dims(2): 3
 	Dims(3): nevecs
 	Dims(4): nQ
-	Value: LORRAX extension, written by bse.bse_jax write_eigenvectors and dipole_file
-	(TDA only); BerkeleyGW readers ignore it. The per-state exciton dipole
-	<0|r_alpha|S> = sum_t A^S_t conj(d^alpha_t), alpha = x, y, z Cartesian,
+	Value: LORRAX extension, written by bse.bse_jax write_eigenvectors and dipole_file;
+	BerkeleyGW readers ignore it. The per-state exciton dipole
+	<0|r_alpha|S> = sum_t A^S_t conj(d^alpha_t), alpha = x, y, z Cartesian;
+	for a full-BSE file (use_tda = 0) both halves of the pair (X, Y) =
+	(eigenvectors, eigenvectors_deexcitation), normalised X^H X - Y^H Y = 1:
+	sum_t X^S_t conj(d^alpha_t) - sum_t Y^S_t d^alpha_t (the de-excitation's
+	dipole is -conj(d); left and right dipoles coincide),
 	with d^alpha_t = <ck|v_alpha|vk> / (E_ck - E_vk) from dipole.h5
 	(psp.get_dipole_mtxels, the same table absorption_haydock seeds from).
 	Units: bohr. The velocity is in Rydberg atomic units, so d = i<ck|r|vk>

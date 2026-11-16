@@ -656,9 +656,11 @@ def _settings_parser():
     )
     parser.add_argument(
         "--dipole", default=None, metavar="DIPOLE_H5",
-        help="with --write-eigs (TDA): contract each written state against "
-             "this dipole.h5 (psp.get_dipole_mtxels, the file "
-             "absorption_haydock reads) and store <0|r|S> as "
+        help="contract each computed state against this dipole.h5 "
+             "(psp.get_dipole_mtxels, the file absorption_haydock reads): "
+             "the TDA's X, or both halves of the full BSE's (X, Y), "
+             "sum_t X_t d_t* - Y_t d_t.  <0|r|S> goes to the eigenvalue "
+             "files, the absorption spectra and, with --write-eigs, "
              "exciton_data/dipoles in eigenvectors.h5.  Under kgrid_fine it "
              "is the deck (coarse) WFN's dipole.h5: the densifier carries it "
              "through the htransform into the fine states")
@@ -1111,11 +1113,6 @@ def parse_args(argv=None):
         if args.qp_rotations is not None:
             parser.error("haydock = true on a qp_rotations_file bundle is not "
                          "supported: run bse.absorption_haydock's inputs")
-    if args.dipole is not None and not args.tda:
-        parser.error("dipole_file gives the per-state dipoles, the absorption "
-                     "spectra and the Haydock seed of the TDA: drop full_bse (the "
-                     "full-BSE oscillator strength needs both halves of the "
-                     "paired vector)")
     if args.lorentzian_broadening and args.gaussian_broadening:
         parser.error("lorentzian_broadening and gaussian_broadening name two "
                      "profiles; keep one (the default is gaussian, as BerkeleyGW's "
@@ -1123,7 +1120,7 @@ def parse_args(argv=None):
     args.spectrum_prefix = "absorption" if cli.out_prefix is None else cli.out_prefix
     if args.helicity_table and args.dipole is None:
         parser.error("helicity_table reports the per-state dipoles: it needs "
-                     "dipole_file (with write_eigenvectors and the TDA)")
+                     "dipole_file")
     return route, args
 
 
@@ -1187,8 +1184,8 @@ def _haydock_settings(args) -> dict | None:
 
 
 def _spectrum_settings(args) -> dict | None:
-    """The absorption_eh/noeh settings (None without dipole_file or under full_bse)."""
-    if args.dipole is None or not args.tda:
+    """The absorption_eh/noeh settings (None without dipole_file); TDA and full BSE alike."""
+    if args.dipole is None:
         return None
     import numpy as np
     return {"polarization": args.polarization,

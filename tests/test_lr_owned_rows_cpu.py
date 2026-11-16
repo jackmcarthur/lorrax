@@ -119,3 +119,53 @@ def test_lr_restart_reads_only_owned_mu_hyperslabs(tmp_path,monkeypatch,side):
     np.testing.assert_array_equal(np.asarray(value['Ft']),expected)
     assert value['n_mu_logical']==13
     assert value['Ft'].sharding.is_equivalent_to(NamedSharding(mesh,P(None,None,('x','y'))),3)
+
+
+@pytest.mark.parametrize('sys_dim',[3,2])
+def test_lr_full_zone_rows_unfold_as_identity_tables(sys_dim):
+    """A full-zone W0_lr (an unreduced q grid, no unfold tables) unfolds exactly as
+    the wedge route does with one identity operation; rows that are not the zone refuse."""
+    from bse import bse_densify as B
+    from symmetry_maps import QirrTables,bgw_integer_q_to_fractional
+    from vcoul import lr_channels
+    mesh=mesh_for(2)
+    grid=(3,3,3) if sys_dim==3 else (3,3,1)
+    n_z=0 if sys_dim==3 else 1
+    ints=np.stack(np.meshgrid(*[np.arange(n) for n in grid],indexing='ij'),-1).reshape(-1,3)
+    q=bgw_integer_q_to_fractional(ints,np.asarray(grid))
+    ch=lr_channels(q,bvec=np.diag([1.,1.1,.4]),sys_dim=sys_dim,n_z=n_z)
+    nq,n_L=ch.gvec.shape[:2]
+    logical,carrier=13,16
+    rng=np.random.default_rng(1114+sys_dim)
+    shuffle=rng.permutation(n_L)                     # stored channel order is not G_z order
+    Ft=rng.normal(size=(nq,n_L,logical))+1j*rng.normal(size=(nq,n_L,logical))
+    Pq=rng.normal(size=(nq,n_L,n_L))+1j*rng.normal(size=(nq,n_L,n_L))
+    gvec,v=np.asarray(ch.gvec)[:,shuffle],np.asarray(ch.v)[:,shuffle]
+    mu3=NamedSharding(mesh,P(None,None,('x','y')))
+    def payload(rows,tables=None):
+        src=np.pad(Ft[rows],((0,0),(0,0),(0,carrier-logical)))
+        return dict(Ft=jax.device_put(src,mu3),P=Pq[rows],gvec=gvec[rows],v=v[rows],q_frac=q[rows],
+            n_z=n_z,sys_dim=sys_dim,tables=tables)
+    sym=SimpleNamespace(kvecs_asints=ints,q_irr_kgrid_int=ints,irr_idx_q=np.arange(len(ints)),sym_mats_k=np.stack([np.eye(3,dtype=np.int64),-np.eye(3,dtype=np.int64)]),
+        sym_matrices=np.eye(3,dtype=np.int64)[None],translations=np.zeros((1,3)))
+    kw=dict(coarse_grid=grid,n_rmu=logical,n_rmu_pad=carrier,mesh_xy=mesh)
+    zone=np.arange(nq)
+    got=B._unfold_lr_channels(payload(zone),sym,**kw)
+    ident=QirrTables(irr_idx_q=zone,sym_idx_q=np.zeros(nq,dtype=np.int32),q_irr_frac=q,
+        sym_perm=np.tile(np.arange(logical,dtype=np.int32),(2,1)),L_table=np.zeros((2,logical,3),dtype=np.int32),
+        n_sym_spatial=1)
+    ref=B._unfold_lr_channels(payload(zone,ident),sym,**kw)
+    for a,b in zip(got,ref):
+        np.testing.assert_allclose(np.asarray(a),np.asarray(b),rtol=0,atol=1e-14)
+    # Literal: rows pass through, channels in G_z order, K = q + G.
+    order=np.argsort(gvec[...,2],axis=1,kind='stable') if sys_dim==2 else np.zeros((nq,1),int)
+    take=lambda a:np.take_along_axis(a,order[(...,)+(None,)*(a.ndim-2)],axis=1)
+    np.testing.assert_array_equal(np.asarray(got[0])[...,:logical],take(Ft))
+    np.testing.assert_array_equal(got[1],np.stack([Pq[i][np.ix_(o,o)] for i,o in enumerate(order)]))
+    np.testing.assert_array_equal(got[2],take(v))
+    np.testing.assert_allclose(got[3],q[:,None]+take(gvec),rtol=0,atol=0)
+    assert got[0].sharding.is_equivalent_to(mu3,3)
+    # Negative controls: wedge-only rows, and the zone out of fft order, refuse.
+    for rows in (zone[:nq//2],zone[::-1]):
+        with pytest.raises(ValueError,match='GATE srlr_wedge_tables'):
+            B._unfold_lr_channels(payload(rows),sym,**kw)

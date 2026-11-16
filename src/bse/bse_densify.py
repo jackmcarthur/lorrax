@@ -620,12 +620,16 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
         f"{(fine_grid[0]*fine_grid[1]*fine_grid[2])/n_c:.6f}; more points than "
         f"weight means boundary/common-cell sharing), of "
         f"{fine_grid[0]*fine_grid[1]*fine_grid[2]} fine q total")
+    # A zero injected head (head_correction = off) re-attaches a zero channel;
+    # the two ratios below are then undefined and are printed as such.
+    scale = (f"×{S_fine[0, 0, 0]/float(whead):.3f}" if float(whead) else "×n/a")
+    rule = (f"{100.0*abs(zone/target - 1.0):.1f}%" if target else "n/a, zero head")
     log_fn(
         f"[w-head] S(Γ_fine) = {S_fine[0, 0, 0]:.4f} vs injected "
-        f"{float(whead):.4f} Ry·bohr³ (×{S_fine[0, 0, 0]/float(whead):.3f} "
+        f"{float(whead):.4f} Ry·bohr³ ({scale} "
         f"for a {(fine_grid[0]*fine_grid[1]*fine_grid[2])/n_c:.0f}× finer "
         f"cell); SUM RULE: zone average {zone:.6f} vs the grid-independent "
-        f"{target:.6f} ({100.0*abs(zone/target - 1.0):.1f}% — a midpoint "
+        f"{target:.6f} ({rule} — a midpoint "
         f"quadrature error that shrinks under refinement, 0 when fine == "
         f"coarse) [gamma_cell={gamma_cell}]")
     if abs(ratio - 1.0) > 0.05:
@@ -696,15 +700,13 @@ def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
             "tree (a static-Dyson W0, e.g. compute_mode = cohsex); srlr is "
             "the only W interpolation.")
     t = lr["tables"]
-    if t is None:
-        raise ValueError(
-            "GATE srlr_wedge_tables: W0 is stored on the full zone, so the "
-            "W0_lr rows carry no unfold tables; want: restart_q_storage = ibz.")
     sys_dim = int(lr["sys_dim"])
     if sys_dim != int(meta.sys_dim):
         raise ValueError(f"srlr: W0_lr was written for sys_dim {sys_dim}, "
                          f"the deck says {int(meta.sys_dim)}")
-    if not np.allclose(t.q_irr_frac, lr["q_frac"], atol=1e-10):
+    # A full-zone W0 (no unfold tables) has one W0_lr row per zone q, each its
+    # own identity image; _unfold_lr_channels checks that and passes them on.
+    if t is not None and not np.allclose(t.q_irr_frac, lr["q_frac"], atol=1e-10):
         raise ValueError("srlr: the W0_lr rows are not W0's q wedge")
     _, n_L, n_file = lr["Ft"].shape
     if int(lr["n_mu_logical"]) != n_rmu:
@@ -854,6 +856,12 @@ def _unfold_lr_channels(lr, sym, *, coarse_grid, n_rmu, n_rmu_pad, mesh_xy):
     G_z.  Returns ``Ft (n_q, n_L, n_rmu_pad)``, ``P (n_q, n_L, n_L)``, the
     split's kernel ``v (n_q, n_L)`` (a function of |K|), the target channel
     momenta ``K (n_q, n_L, 3)`` and ``q_full (n_q, 3)``, both crystal.
+
+    A W0 stored on the full zone (``tables`` None: a q grid the WFN's symmetry
+    does not reduce) has one row per zone q.  Its unfold is the identity: each
+    row is its own image, F̃, P, v and K = q + G pass through unchanged (no τ
+    phase, no conjugation).  The rows must be the whole coarse zone in flat fft
+    order (GATE ``srlr_wedge_tables``).
     """
     from ffi import _services
     _services.ensure_on_path()
@@ -867,21 +875,27 @@ def _unfold_lr_channels(lr, sym, *, coarse_grid, n_rmu, n_rmu_pad, mesh_xy):
     n_qi, n_L, _ = lr["Ft"].shape
     grid = np.asarray(coarse_grid, dtype=np.int64)
     carrier = int(lr["Ft"].shape[-1])
-    tp = t.padded(carrier)
-    col_sh = NamedSharding(mesh_xy, P(None, "x"))
-    rows_full = []
-    for a in range(n_L):
-        col = jax.device_put(lr["Ft"][:, a], col_sh)
-        out = unfold_isdf_one_leg(
-            col,
-            source_gvec_components=np.asarray(lr["gvec"][:, a], dtype=np.int32),
-            sym=sym, sym_idx=tp.sym_idx_q, sym_perm=tp.sym_perm,
-            L_table=tp.L_table, q_irr_frac=tp.q_irr_frac, kgrid=tuple(coarse_grid),
-            mesh_xy=mesh_xy, component_action="scalar")
-        rows_full.append(out)
     mu3 = NamedSharding(mesh_xy, P(None, None, ("x", "y")))
-    Ft = jax.jit(lambda rows: jnp.stack(rows, axis=1), out_shardings=mu3)(tuple(rows_full))                       # (nq, n_L, μ_pad)
-    nq = Ft.shape[0]
+    if t is None:
+        # Full-zone W0: identity tables, the rows are already the zone.
+        Ft, q_src, tp = lr["Ft"], np.asarray(lr["q_frac"], dtype=np.float64), None
+        nq = int(n_qi)
+    else:
+        tp = t.padded(carrier)
+        col_sh = NamedSharding(mesh_xy, P(None, "x"))
+        rows_full = []
+        for a in range(n_L):
+            col = jax.device_put(lr["Ft"][:, a], col_sh)
+            out = unfold_isdf_one_leg(
+                col,
+                source_gvec_components=np.asarray(lr["gvec"][:, a], dtype=np.int32),
+                sym=sym, sym_idx=tp.sym_idx_q, sym_perm=tp.sym_perm,
+                L_table=tp.L_table, q_irr_frac=tp.q_irr_frac, kgrid=tuple(coarse_grid),
+                mesh_xy=mesh_xy, component_action="scalar")
+            rows_full.append(out)
+        Ft = jax.jit(lambda rows: jnp.stack(rows, axis=1), out_shardings=mu3)(tuple(rows_full))                       # (nq, n_L, μ_pad)
+        nq = Ft.shape[0]
+        q_src = tp.q_irr_frac
 
     # The same star rows the one-leg unfold used: each target channel's
     # momentum, its τ phase c_a (P transforms as c_a c_b* P, conjugated on
@@ -894,23 +908,39 @@ def _unfold_lr_channels(lr, sym, *, coarse_grid, n_rmu, n_rmu_pad, mesh_xy):
             "GATE srlr_q_order: SymMaps' q rows are not the bundle's flat fft "
             "order; the unfolded rows would land on other q.")
     q_full = bgw_integer_q_to_fractional(q_int, grid)
-    S_all = np.asarray(sym.sym_mats_k, dtype=np.int64)
-    n_sp = int(np.asarray(sym.sym_matrices).shape[0])
-    tau = np.asarray(sym.translations, dtype=np.float64)
-    idx, rows = np.asarray(tp.irr_idx_q), np.asarray(tp.sym_idx_q)
+    if tp is None:
+        dq = q_src - q_full if q_src.shape == q_full.shape else None
+        if dq is None or not np.allclose(dq - np.round(dq), 0.0, atol=1e-10):
+            raise ValueError(
+                f"GATE srlr_wedge_tables: W0 is stored on the full zone but "
+                f"W0_lr carries {q_src.shape[0]} rows that are not the "
+                f"{q_full.shape[0]} coarse q in flat fft order; want: one row "
+                f"per zone q (an unreduced q grid) or restart_q_storage = ibz; "
+                f"why: without unfold tables a row can only stand for its own "
+                f"q; fix: rerun GW with restart_q_storage = ibz.")
+        idx, rows = np.arange(nq), None
+    else:
+        S_all = np.asarray(sym.sym_mats_k, dtype=np.int64)
+        n_sp = int(np.asarray(sym.sym_matrices).shape[0])
+        tau = np.asarray(sym.translations, dtype=np.float64)
+        idx, rows = np.asarray(tp.irr_idx_q), np.asarray(tp.sym_idx_q)
     Pf = np.empty((nq, n_L, n_L), np.complex128)
     vf = np.empty((nq, n_L))
     K_full = np.empty((nq, n_L, 3))
     orders = np.empty((nq, n_L), dtype=np.int32)
     for iq in range(nq):
-        s, p = int(rows[iq]), int(idx[iq])
-        Kp = np.asarray(tp.q_irr_frac[p], dtype=np.float64) + lr["gvec"][p]
-        ph = tau_phase_row(S_all[s % n_sp], tau[s % n_sp], Kp)
-        c = np.ones(n_L, np.complex128) if ph is None else ph
-        Pq = c[:, None] * lr["P"][p] * np.conj(c)[None, :]
-        if s >= n_sp:
-            Pq = np.conj(Pq)
-        Kt = (S_all[s] @ Kp.T).T
+        p = int(idx[iq])
+        Kp = np.asarray(q_src[p], dtype=np.float64) + lr["gvec"][p]
+        if rows is None:                                   # identity image
+            Pq, Kt = np.asarray(lr["P"][p]), Kp
+        else:
+            s = int(rows[iq])
+            ph = tau_phase_row(S_all[s % n_sp], tau[s % n_sp], Kp)
+            c = np.ones(n_L, np.complex128) if ph is None else ph
+            Pq = c[:, None] * lr["P"][p] * np.conj(c)[None, :]
+            if s >= n_sp:
+                Pq = np.conj(Pq)
+            Kt = (S_all[s] @ Kp.T).T
         order = np.argsort(Kt[:, 2], kind="stable") if sys_dim == 2 else np.arange(1)
         if sys_dim == 2 and not np.allclose(Kt[order, 2], np.arange(-c0, c0 + 1)):
             raise ValueError(
@@ -1177,8 +1207,14 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
                       mesh_xy, log_fn=log.debug, full_window: bool = False,
                       qp_states: bool = False, pair_rule: str = "mask",
                       pair_gap_ev: float = 0.05,
-                      mixing_receipt: bool = False, probe=None) -> dict:
+                      mixing_receipt: bool = False, probe=None,
+                      state_ctilde=None) -> dict:
     r"""r-form dipoles of a ``kgrid_fine`` bundle, in the gauge of its own ψ.
+
+    ``state_ctilde``: the compact rows of the coarse states the fH was built
+    on when they are not ``basis.ctilde`` (``qp_rotations_file``: the QP rows
+    C_QP = Uᵀ C); the on-grid state identity reads them, the operator images
+    keep ``basis.ctilde`` and the velocity's own DFT rows.
 
     ``probe``: on a shifted fine grid, a ``compute_wfns_fi`` bundle (with
     coefficients) at the coarse k, on which the on-grid identities are read;
@@ -1494,12 +1530,12 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         on_grid_rel, state_dev, defect, n_on_grid = _dipole_on_grid_identity(
             out, basis.ctilde, fine.coeffs_fi, ops_host=(v_full, f_full),
             k_coarse=sym.unfolded_kpts, q_fine=q_frac, window_start=window_start,
-            fh_energies=fh_energies)
+            fh_energies=fh_energies, state_ctilde=state_ctilde)
     else:
         on_grid_rel, state_dev, defect, n_on_grid = _dipole_on_grid_identity(
             out_probe, basis.ctilde, probe.coeffs_fi, ops_host=(v_full, f_full),
             k_coarse=sym.unfolded_kpts, q_fine=q_probe, window_start=window_start,
-            fh_energies=fh_energies)
+            fh_energies=fh_energies, state_ctilde=state_ctilde)
         del out_probe
     v_window = v_win if full_window else None                   # (3, nq, nb, nb)
     del out, f_win
@@ -1590,7 +1626,8 @@ def _coefficients_by_q(coeffs, carrier, mesh_xy):
 
 
 def _dipole_on_grid_identity(out, ctilde, coeffs, *, ops_host, k_coarse,
-                             q_fine, window_start, fh_energies):
+                             q_fine, window_start, fh_energies,
+                             state_ctilde=None):
     """The two on-grid identities of :func:`densified_dipoles`.
 
     ``out`` (carrier, 4, nb_fi, nb_fi) is ``interpolate_band_operator``'s
@@ -1604,6 +1641,10 @@ def _dipole_on_grid_identity(out, ctilde, coeffs, *, ops_host, k_coarse,
     :data:`DENSIFIED_DIPOLE_DEGEN_RY` of the two edge levels included)
     have ``σ(W_S) = 1``, and the four images are ``W^† O(k) W``.  Only
     the shared rows are gathered.
+
+    ``state_ctilde`` (default ``ctilde``): the rows the window states are
+    read against, the QP rows of a ``qp_rotations_file`` fH; the images keep
+    ``ctilde``, the operator's own rows (any isometry W serves there).
 
     Returns ``(image rel deviation, max|σ(W_window) − 1|, max|C Cᴴ − I| over
     the shared k, n_shared)``.
@@ -1631,6 +1672,8 @@ def _dipole_on_grid_identity(out, ctilde, coeffs, *, ops_host, k_coarse,
     O = np.asarray(gather_to_host(out[fi]))                     # (n, 4, nb_fi, nb_fi)
     nb_fi = int(U.shape[2])
     W = np.einsum("nma,nai->nmi", np.conj(C), U)                # ⟨ψ_m(k)|ψ_i(q)⟩
+    W_state = W if state_ctilde is None else np.einsum(
+        "nma,nai->nmi", np.conj(np.asarray(gather_to_host(state_ctilde[co]))), U)
     e_fh = np.asarray(fh_energies, dtype=np.float64)[co]          # (n, nb_fit)
     sigma = []
     for n_, e_k in enumerate(e_fh):
@@ -1638,7 +1681,7 @@ def _dipole_on_grid_identity(out, ctilde, coeffs, *, ops_host, k_coarse,
         lo = e_sorted[window_start] - DENSIFIED_DIPOLE_DEGEN_RY
         hi = e_sorted[window_start + nb_fi - 1] + DENSIFIED_DIPOLE_DEGEN_RY
         rows = np.flatnonzero((e_k >= lo) & (e_k <= hi))
-        sigma.append(np.linalg.svd(W[n_, rows], compute_uv=False))
+        sigma.append(np.linalg.svd(W_state[n_, rows], compute_uv=False))
     sigma = np.concatenate(sigma)
     gram = np.einsum("nma,npa->nmp", C, np.conj(C))
     defect = float(np.max(np.abs(gram - np.eye(gram.shape[1])[None])))
@@ -1664,6 +1707,7 @@ def _interpolate_bse_data_to_grid(
     htransform_rank_record_fn=None,
     htransform_quality_record_fn=None,
     eqp_file: str | None = None,
+    qp_rotations_file: str | None = None,
     velocity_file: str | None = None,
     velocity_full_window: bool = False,
     velocity_pair_rule: str = "mask",
@@ -1721,6 +1765,16 @@ def _interpolate_bse_data_to_grid(
         The wedge ``eqp1.dat`` (``eqp_corrections``).  Its QP energies enter the fH
         through ``initialize_wfns``, the one reader on this path, so the fine
         ε are quasiparticle; the coarse bundle's ε are not re-sliced after.
+    qp_rotations_file : str or None
+        The GW run's ``qp_wfn_rotations.h5`` (``qp_rotations_file``, exclusive
+        with ``eqp_file``).  The htransform's compact states take the QP block
+        (``fh_interp.resolve_qp_hamiltonian_state``, C_QP = Uᵀ C_DFT), so the fH
+        is f(H_QP) = U f(E_QP) Uᴴ and the fine ψ, ε are its eigenstates, while
+        W, V, the ISDF tensors and the long-range anchor stay the bundle's.
+        The velocity is carried in the DFT rows it was measured in: its
+        lattice image Cᵀ v C* equals C_QPᵀ (Uᴴ v U) C_QP* for a unitary U, and
+        the fine QP states take it from there; the on-grid state identity is
+        read against the rotated rows.
     velocity_file : str or None
         The COARSE WFN's ``dipole.h5`` (``dipole_file``).  Authenticated against
         the deck WFN before the fit, then carried through the same htransform
@@ -1836,6 +1890,16 @@ def _interpolate_bse_data_to_grid(
             velocity_file, wfn=wfn, wfn_path=_parse_wfn_path(input_file),
             sym=sym, mesh=mesh_xy, band_range=basis.band_range) + (velocity_file,)
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
+    if qp_rotations_file is not None:
+        # f(H_QP) in the nodal basis: the QP block of the compact rows rotated
+        # by U, its energies E_QP; refuses a block outside the fitted window.
+        # The states at the nodes and at the back-map targets (the centroids,
+        # where ψ_fine is read) take the same rotation.
+        ctilde, enk_sigma, _, B_at_mu = ht.resolve_qp_hamiltonian_state(
+            basis=basis, enk_sigma=enk_sigma, sym=sym, meta=meta, wfn=wfn,
+            wfn_path=_parse_wfn_path(input_file),
+            qp_rotations_file=qp_rotations_file, log_fn=log_fn,
+            nodes=B_at_mu)
     nb_window = int(ctilde.shape[1])
     nval_in = int(params["nval"])          # window-relative CBM index
     b_min, b_max = nval_in - n_val, nval_in + n_cond
@@ -1897,9 +1961,12 @@ def _interpolate_bse_data_to_grid(
             coarse_grid=coarse_grid, n_val=n_val, window_start=b_min,
             a_band_index=htransform_a_band, mesh_xy=mesh_xy, log_fn=log_fn,
             full_window=velocity_full_window,
-            qp_states=eqp_file is not None and bool(velocity_position_fix),
+            qp_states=(eqp_file is not None or qp_rotations_file is not None)
+            and bool(velocity_position_fix),
             pair_rule=velocity_pair_rule, pair_gap_ev=velocity_pair_gap_ev,
-            mixing_receipt=eqp_file is not None, probe=probe)
+            mixing_receipt=eqp_file is not None or qp_rotations_file is not None,
+            probe=probe,
+            state_ctilde=None if qp_rotations_file is None else ctilde)
         del probe
         del bundle.coeffs_fi, velocity
 
