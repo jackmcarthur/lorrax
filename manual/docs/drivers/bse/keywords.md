@@ -77,7 +77,7 @@ A bare key reads BerkeleyGW's file name beside the input file (`eqp.dat`, `eqp_c
 {: .kw-details }
 
 ### `qp_rotations_file` {: .kw data-type="path" data-default="—" }
-The GW run's `qp_wfn_rotations.h5`: solve in the eigenbasis of its $H_{QP}$; the window counts QP states. Exclusive with the eqp keys; refuses `kgrid_fine`.
+The GW run's `qp_wfn_rotations.h5`: solve in the eigenbasis of its $H_{QP}$; the window counts QP states. Exclusive with the eqp keys. Under `kgrid_fine` the band interpolation is built from $f(H_{QP}) = U f(E_{QP}) U^\dagger$ on the coarse grid, so the fine states and energies are quasiparticle while $W$, $V$ and the ISDF tensors stay the GW run's own; the QP block must lie inside the interpolated band window (raise `number_cond_bands_coarse`), and the full-window velocity of TD-aGW refuses (`GATE bse_qp_rotations_k_grid`). Set `dipole_position_fix = true` there: the fine QP states mix DFT bands.
 
 ### `wfn_file` {: .kw data-type="path" data-default="WFN.h5" }
 WFN for the occupied count, the cell volume, the spinor count, bundle authentication and the band interpolation; relative to the input file.
@@ -119,7 +119,7 @@ Coarse much wider than fine is the expected case: the GW grid carries the conduc
 Accepted and ignored, with a warning: the H-transform always fits every valence band of the GW window.
 
 ### `w_head_densify` {: .kw data-type="enum" data-default="srlr" }
-Long-range model split off $W$ before the densification under `kgrid_fine`. `srlr`, the only model: the plane-wave channels $\bq+\bG_a\to0$ carry the long range from the bundle's `W0_lr`, fitted on the coarse grid and added back at every fine $\bq$. It needs a GW restart with `W0_lr`. A static Dyson $W$ (`cohsex`, `gn_ppm`, `hl_ppm`) writes it, and so does a one-shot `tangential` run, which solves one static Dyson $W(0)$ for the restart. An `mpa` restart, a QSGW tangential one and a bispinor tangential one have no `W0_lr` and refuse (`GATE srlr_restart_channels`). `c1` and `legacy` were removed and refuse with one line. See [Short- and long-range W](../../theory/w-range-splitting.md).
+Long-range model split off $W$ before the densification under `kgrid_fine`. `srlr`, the only model: the plane-wave channels $\bq+\bG_a\to0$ carry the long range from the bundle's `W0_lr`, fitted on the coarse grid and added back at every fine $\bq$. It needs a GW restart with `W0_lr`. A static Dyson $W$ (`cohsex`, `gn_ppm`, `hl_ppm`) writes it, and so does a one-shot `tangential` run, which solves one static Dyson $W(0)$ for the restart. An `mpa` restart, a QSGW tangential one and a bispinor tangential one have no `W0_lr` and refuse (`GATE srlr_restart_channels`). A bundle whose $W$ is stored on the full zone, because the WFN carries no symmetry that reduces the $\bq$ grid (a reference computed without symmetry), is read with identity unfold tables and needs no rerun; a full-zone $W$ on a grid that does reduce still needs `restart_q_storage = ibz` (`GATE srlr_wedge_tables`). `c1` and `legacy` were removed and refuse with one line. See [Short- and long-range W](../../theory/w-range-splitting.md).
 
 `srlr`
 {: .kw-values }

@@ -46,6 +46,36 @@ What to change:
 - With `sigma_lorentz_debug_output = true` a bispinor one-shot also writes
   `sigma_lorentz_oneshot.h5`.
 
+## 2026-11-14 — Fine-grid BSE refuses a head-off ISDF tensor file
+
+`kgrid_fine` now refuses an ISDF tensor file whose screened head is zero (GW
+`head_correction = off`), `GATE kgrid_fine_zero_head`.  On such a file the fine
+grid restores the small-q attraction while the QP energies keep no head: NiO
+d-d excitons fell 0.42 eV from 4^3 to 12^3 against a head-on file of the same
+run, an a/n drift that looks like k convergence.  Rerun GW with the head on, or
+solve on the GW grid.  Native-grid BSE is unchanged.
+
+## 2026-11-14 — Fine-grid BSE in the QP basis of the GW run (`qp_rotations_file` with `kgrid_fine`)
+
+`qp_rotations_file` now runs under `kgrid_fine`.  The band interpolation is
+built from f(H_QP) = U f(E_QP) U^H on the coarse grid, so the fine states and
+energies are quasiparticle while W, V, the ISDF tensors and the long-range
+anchor stay the GW run's own (before, `GATE bse_qp_rotations_k_grid` refused,
+and the only route was a GW rerun on `WFN_qp.h5`, which rebuilds W from the QP
+states).  The QP block must lie inside the interpolated band window: raise
+`number_cond_bands_coarse` if the run refuses.  Use `dipole_position_fix =
+true`.  TD-aGW's full-window velocity still refuses.  Runs without
+`qp_rotations_file`, and `qp_rotations_file` on the native grid, are unchanged.
+
+## 2026-11-14 — Fine-grid BSE on a q grid that symmetry does not reduce
+
+`kgrid_fine` now runs on an ISDF tensor file whose W0 is stored on the full
+zone because the WFN's symmetry does not reduce the q grid (a no-symmetry
+reference, such as a hybrid-start run).  Its `W0_lr` rows are read with
+identity unfold tables, so existing files work without a GW rerun; before,
+`GATE srlr_wedge_tables` refused them.  A full-zone W0 on a grid that does
+reduce still refuses.  Results on symmetry-reduced files are unchanged.
+
 ## 2026-11-11 — Bispinor runs: two-component charge, Pauli current
 
 With `bispinor = true`, every charge term (Hartree field, charge screening

@@ -210,6 +210,7 @@ A downfolded bundle is validated by solving the same BSE on the parent and on th
     - A window band outside the ζ-fit legs of the GW run (`BseWindowOutsideZetaTrainingError`).
     - `eqp_corrections` on a stamped QP WFN, or an `eqp1.dat` whose k blocks are not the WFN's irreducible wedge.
     - A `dipole.h5` whose `basis` stamp differs from the WFN's.
+    - `kgrid_fine` on an ISDF tensor file whose screened head is zero (GW `head_correction = off`): the fine grid restores the small-$\bq$ attraction but the QP energies keep no head, so excitons sink with the grid (`GATE kgrid_fine_zero_head`).
     - `kgrid_fine` with an axis smaller than the coarse grid; `w_head_densify = c1` or `legacy`; a bundle without `W0_lr` under `kgrid_fine` (an `mpa`, QSGW tangential or bispinor tangential restart, or a downfolded bundle).
     - Full BSE above transition dimension 4096, or with a non-reciprocal $W$.
     - `bse.absorption_haydock` on fewer than two devices.
