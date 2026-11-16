@@ -186,8 +186,10 @@ are counted. It is built once from the DFT ladder
   4 eV is 16 deck broadenings at the default η = 0.25 eV, so a coarse window
   never reads a band the near grid resolves.
 - Under `nval` / `ncond`: every occupied state below the minimum energy of the
-  lowest requested valence band (nelec − nval at each k; `sigma_omega_min_ev`
-  can only lower the floor). The rule is on energy, so a coarse state inside
+  lowest requested valence band, band nelec − nval with nelec the
+  occupied-band boundary `max(ifmax)`, on a metal as on an insulator: the
+  bottom of the QP window's valence range (`sigma_omega_min_ev` can only
+  lower the floor). The rule is on energy, so a coarse state inside
   the near grid's lower pad reads the near grid.
 
 Only the MPA and tangential Σ, scalar or four-current sector, read coarse
@@ -456,7 +458,11 @@ once and holds it (`gw/qp_support.py`).
 semicore states, that the W model treats as active
 ($\max_k E^{\rm DFT}_{nk} \ge E_F - 15$ eV,
 `tangential_recipe.active_band_mask`, evaluated once on the DFT ladder) and
-that had a quasiparticle at the previous map, $Z \in (0, 1]$. The one-shot's
+that had a quasiparticle, $Z \in (0, 1]$, at the first map with a Z (map 1, from
+map 0's Σ); that class is then held for the loop, as the partition is. A
+window-top state whose Z sits at 1 would otherwise enter and leave R from map
+to map and move every W line site with its reads (Fe 4³, `ncond` = 8: a
+period-4 cycle at 0.19 eV). The one-shot's
 set keeps its active semicore states (§2). A state with
 $Z \notin (0, 1]$ sits within about η of a pole cluster of its $\Sigma_{nn}$
 and has no quasiparticle. Its energy never moves the grid, and off the grid
