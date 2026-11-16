@@ -5,6 +5,34 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-17 — every stored screened W says which series it is (`w_bse` handoff)
+
+A `screening_diagrams = w_bse` run's Σ uses the ladder W, but its ISDF tensor
+file stores the RPA W(0) the ladder used as its direct rung (unchanged). The
+file now says so, and its readers say which W they use.
+
+- **New stamps.** `W0_qmunu`, `whead` and a freshly written `W0_lr` carry
+  `screening_diagrams` (the series of that object; `W0_qmunu` alone carried
+  it before). The file attribute `gw_screening_diagrams` names the series of
+  Σ's W. A `w_bse` file reads `w_rpa` on the members and `w_bse` on the file.
+  BerkeleyGW's projected W (`gw.epsmat_cli mode = project`) is stamped
+  `w_rpa`. Every eqp/Σ text header and `sigma_mnk.h5` of a `w_bse` or
+  `w_rpa_resolvent` run carries `screening_diagrams = …`; `w_rpa` outputs are
+  byte-for-byte unchanged. The run report adds a `stored W(0)` row under the
+  resolvent diagrams.
+- **New log line.** Every W0 reader (BSE loader: BSE direct term, TD-aGW and
+  the ladder's own reload; downfold; epsmat export) prints `W0 provenance:`,
+  naming the W it reads and, after a `w_bse` run, that Σ's ladder W is not
+  stored. A BSE on a `w_bse` file screens with the RPA W(0), as before.
+- **New refusals.** `GATE w0_series`: the ladder's rung, the epsmat export and
+  `bse_w_exact` refuse a `W0_qmunu` that is not `w_rpa`. `GATE w0_series_torn`:
+  a file whose body, head and long-range channels carry different series.
+  Files written before the stamp read as `w_rpa`, with a note.
+- **Progress.** The resolvent stage prints its size once and one line per
+  solved probe block (GMRES iterations, residual, block wall, time left).
+- **Results.** No number changes. **Decks.** No change.
+- **Tests.** `tests/test_w0_series_provenance_cpu.py`,
+  `tests/test_w0_series_report_cpu.py`, `tests/test_ladder_progress_cpu.py`.
 ## 2026-11-17 — Full-BSE oscillator strengths: `full_bse = true` takes `dipole_file`
 
 `full_bse = true` with `dipole_file` is no longer refused. Each state's
