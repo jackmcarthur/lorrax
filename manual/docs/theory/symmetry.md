@@ -316,7 +316,7 @@ The savings are $N_k/n_{\mathrm{parent}}$ and $N_q/N_q^{\mathrm{irr}}$ (Si 4Ã—4Ã
 |---|---|---|
 | `eqp0.dat`, `eqp1.dat`, `sigma_diag.dat` | file wedge | the k coordinates of each block |
 | `sigma_mnk.h5` | file wedge | the star spread measured on the full grid before reduction |
-| `kin_ion.h5` | star wedge | `k_storage = ibz`, `irr_idx_k`, `sym_idx_k`; no attribute means full grid |
+| `kin_ion.h5` | star wedge | `k_storage = ibz`, `irr_idx_k`, `sym_idx_k`, and the k lists `kpoints_stored_crys`, `kpoints_full_crys`; no attribute means full grid |
 | `qp_wfn_rotations.h5` | file wedge when the round trip reproduces the arrays, otherwise full | `k_storage` |
 | `isdf_tensors_<N_mu>.h5` (`V_qmunu`, `W0_qmunu`) | q parents when the set is closed and q reduced | `q_storage` and the unfold tables |
 | `zeta_q.h5` | q parents or full | the q extent |

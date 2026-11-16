@@ -289,7 +289,7 @@ $N_q$ is the q-irreducible wedge; $c$ is 1 on the charge route. `factor` holds $
 `sigma_output.write_sigma_omega_h5`
 {: .in-code }
 
-Written in `gn_ppm`, `hl_ppm` and `tangential`; `cohsex` and `x_only` write none. Energies are in eV, and the `*_rel_ev` axes are relative to `omega_reference_ev`. The cubes are on the star wedge, one row per symmetry star, with the unfold tables beside them; the eqp receipt is on the WFN wedge. Tree of the default on-shell layout:
+Written in `gn_ppm`, `hl_ppm` and `tangential`; `cohsex` and `x_only` write none. Energies are in eV, and the `*_rel_ev` axes are relative to `omega_reference_ev`. The cubes are on the star wedge, one row per symmetry star in star order (not the WFN's, and so not `sigma_diag.dat`'s), with the unfold tables and both k lists beside them; the eqp receipt is on the WFN wedge. Tree of the default on-shell layout:
 
 ```tree
 sigma_mnk.h5
@@ -298,6 +298,8 @@ sigma_mnk.h5
   sigma_evaluation                     bytes            on_shell
   irr_idx_k                            int32[N_k]
   sym_idx_k                            int32[N_k]
+  kpoints_stored_crys                  float64[N_s, 3]                 crystal k of each stored row (its star's WFN k, mod G)
+  kpoints_full_crys                    float64[N_k, 3]                 crystal k of each unfolded row
   sigma_total_kij_ev                   complex128[2, N_s, N_b, N_b]    @pair_slots @k_storage ...
   sigma_c_kij_ev                       complex128[2, N_s, N_b, N_b]
   onshell_<table>_rel_ev               float64[N_s, N_b]               table = pair, eval0, dft0 (+ zero, edge: QSGW, sigma_out_of_grid = static)

@@ -2922,12 +2922,18 @@ def validate_kin_ion_against_run(
 	nk: int | None = None,
 	band_stop: int | None = None,
 	nspinor: int | None = None,
+	kpoints_full_crys=None,
 	print_fn=print,
 ) -> dict:
 	"""Validate pristine kinetic+ionic provenance before its slab is read.
 
-	kin_ion is an operator on psi_L, so no four-current carrier enters it."""
+	kin_ion is an operator on psi_L, so no four-current carrier enters it.
+	``kpoints_full_crys`` (the run's ``(nk, 3)`` full-BZ list, the order it
+	indexes the unfolded slab with) is checked against the file's own
+	(:func:`check_kpoints_against_run`)."""
 	attrs = read_kin_ion_provenance(h5_path)
+	if kpoints_full_crys is not None:
+		check_kpoints_against_run(h5_path, kpoints_full_crys, print_fn=print_fn)
 	if bool(attrs.get("has_hartree", False)):
 		raise ValueError(
 			"kin_ion.h5 has has_hartree=True: this retired format folds V_H "
@@ -3174,6 +3180,48 @@ def read_star_map(h5_path: str, dataset: str = "kin_ion", *, k_axis: int = 0):
 			f"{int(sidx.max())} but the table is 2·{N_SYM_SPATIAL_ATTR} = "
 			f"{2 * n_sym_spatial} rows long.")
 	return irr, sidx, n_sym_spatial
+
+
+def check_kpoints_against_run(h5_path, kpoints_crys, *, rows=None, print_fn=print,
+                              tol=1e-6):
+	"""Refuse a star-wedge file whose full-BZ k list is not this run's.
+
+	``kpoints_crys`` is ``(n, 3)`` crystal coordinates of the rows the caller
+	will index the UNFOLDED array with: its full-BZ list
+	(``wfn.kvecs()``), or with ``rows`` (``(n,)`` full-BZ indices) the subset
+	it takes, e.g. the WFN k at ``kirr_to_kfull``.  Coordinates compare
+	modulo a reciprocal lattice vector.  A file written before the k lists
+	existed (no :data:`file_io.kin_ion.KPOINTS_FULL_DATASET`) is read
+	unchecked with one NOTE.  Returns True when the check ran.
+	"""
+	from file_io.kin_ion import KPOINTS_FULL_DATASET
+	name = os.path.basename(h5_path)
+	with h5py.File(h5_path, "r") as h5:
+		if KPOINTS_FULL_DATASET not in h5:
+			print_fn(f"  NOTE: {name} carries no {KPOINTS_FULL_DATASET} (written "
+			         f"before 2026-11-16); its k order is not checked.")
+			return False
+		full = np.asarray(h5[KPOINTS_FULL_DATASET][()], dtype=np.float64)
+	want = np.asarray(kpoints_crys, dtype=np.float64)
+	got = full if rows is None else full[np.asarray(rows, dtype=np.int64)]
+	if got.shape != want.shape:
+		raise ValueError(
+			f"GATE k_list_mismatch: got: {name} unfolds onto {full.shape[0]} k "
+			f"({got.shape} at the rows asked); want: this run's {want.shape} k "
+			f"list; why: its rows would be paired with other k. Fix: "
+			f"regenerate {name} from this run's WFN.")
+	d = got - want
+	d -= np.rint(d)
+	bad = np.flatnonzero(np.max(np.abs(d), axis=1) > tol)
+	if bad.size:
+		i = int(bad[0])
+		raise ValueError(
+			f"GATE k_list_mismatch: got: {name} row {i} at k = "
+			f"{got[i].tolist()} ({bad.size} of {got.shape[0]} rows differ); "
+			f"want: this run's k = {want[i].tolist()}; why: the file was made "
+			f"on another k list, and its rows would be paired with other k. "
+			f"Fix: regenerate {name} from this run's WFN.")
+	return True
 
 
 def _eval_metadata_from_open_h5(h5):

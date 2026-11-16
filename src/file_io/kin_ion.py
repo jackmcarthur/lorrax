@@ -33,6 +33,17 @@ fixtures were computed independently at every full-BZ k and their rows do
 NOT satisfy the star relation (measured max|Δ| 3.6e-14 … 7.8e+00 Ry), so
 silently treating them as compressible would move physics.  It cannot,
 because the discriminator is an attribute the old writer never wrote.
+
+THE STORED ROW ORDER IS NOT THE WFN's k ORDER.  The star wedge keeps its
+stars in first-full-BZ-occurrence order (``KStarMap.rows``), which on a
+symmetry-reduced cell is a permutation of the WFN's IBZ list (bulk CrCl3
+4³: stored row 6 is WFN k 13, rows 7-13 are WFN k 6-12).  So every
+star-wedge file also carries its k lists in crystal coordinates
+(:data:`KPOINTS_STORED_DATASET`, the parent k of each stored row;
+:data:`KPOINTS_FULL_DATASET`, the full-BZ rows the tables unfold onto),
+and the run's readers check the second against their own k list
+(``restart_bundle.check_kpoints_against_run``).  A consumer that pairs
+stored rows with WFN-ordered data pairs them by the first.
 """
 import os
 
@@ -68,6 +79,53 @@ SYM_IDX_DATASET = "sym_idx_k"
 #: symmetry table at or past it are antiunitary, and that is the whole
 #: content of the conjugation predicate.
 N_SYM_SPATIAL_ATTR = "n_sym_spatial"
+
+#: The k lists of a star-wedge file, crystal coordinates: ``(n_rows, 3)``,
+#: the parent k of each stored row (the WFN k of its star; the full-BZ k
+#: under a trivial symmetry view), and ``(nk_full, 3)``, the full-BZ k the
+#: tables unfold onto, in the unfolded array's row order.  Absent on files
+#: written before 2026-11-16, which stay readable unchecked.
+KPOINTS_STORED_DATASET = "kpoints_stored_crys"
+KPOINTS_FULL_DATASET = "kpoints_full_crys"
+
+
+def star_wedge_kpoints(sym):
+	"""``(stored, full)`` crystal k lists of a star-wedge slab of this run.
+
+	``stored`` is ``(n_rows, 3)``: the parent k (``unfolded_kpts[kirr_fullids]``,
+	the WFN's own k modulo a reciprocal lattice vector) of each star, in
+	the stored row order of
+	``symmetry_maps.star_wedge_rows``.  ``full`` is ``(nk_tot, 3)``:
+	``sym.unfolded_kpts``, the order the unfold returns.
+	"""
+	from ffi import _services
+	_services.ensure_on_path()
+	import symmetry_maps
+	labels, _ = symmetry_maps.star_wedge_rows(sym)
+	full = np.asarray(sym.unfolded_kpts, dtype=np.float64)
+	parents = full[np.asarray(sym.kirr_fullids, dtype=np.int64)]
+	return parents[np.asarray(labels, dtype=np.int64)], full
+
+
+def queue_star_kpoints(io, kpoints, *, n_rows, nk_full, where):
+	"""Queue the two k lists of a star-wedge file on an open ``SlabIO``.
+
+	``kpoints`` is :func:`star_wedge_kpoints`' pair; the shapes are checked
+	against the slab's stored rows and the unfold table's full-BZ extent.
+	"""
+	if kpoints is None:
+		raise ValueError(
+			f"{where}: star tables given without their k lists; pass "
+			f"kpoints=file_io.kin_ion.star_wedge_kpoints(sym).")
+	stored, full = (np.asarray(a, dtype=np.float64) for a in kpoints)
+	if stored.shape != (int(n_rows), 3) or full.shape != (int(nk_full), 3):
+		raise ValueError(
+			f"{where}: k lists {stored.shape} / {full.shape} do not match the "
+			f"{int(n_rows)} stored rows and {int(nk_full)} full-BZ rows of "
+			f"the star tables; pass file_io.kin_ion.star_wedge_kpoints(sym) "
+			f"of the same SymMaps as the tables.")
+	io.write_attr(KPOINTS_STORED_DATASET, stored)
+	io.write_attr(KPOINTS_FULL_DATASET, full)
 
 
 # THE UNFOLD and its antiunitary predicate: docs/architecture/
@@ -139,7 +197,7 @@ def broadcast_star_wedge(A_irr, sym):
 	return broadcast_ibz_to_full_bz(A_irr, *symmetry_maps.star_wedge_tables(sym))
 
 
-def write_kin_ion(path, H_irr, *, mesh, nb, star, attrs) -> None:
+def write_kin_ion(path, H_irr, *, mesh, nb, star, kpoints, attrs) -> None:
 	"""Write ``kin_ion.h5`` through SlabIO from the sweep's shards.
 
 	COLLECTIVE over ``mesh``.  ``H_irr`` is the star-wedge slab
@@ -148,14 +206,18 @@ def write_kin_ion(path, H_irr, *, mesh, nb, star, attrs) -> None:
 	``nb``.  ``star`` is ``(irr_idx_k, sym_idx_k, n_sym_spatial)`` already
 	renumbered onto the stored rows (``symmetry_maps.star_wedge_tables``); the
 	two index tables are filed beside the slab they unfold, and the slab is
-	stamped ``k_storage = "ibz"``.  ``attrs`` are the dataset's provenance
-	attributes; every rank passes them and rank 0's copy lands.
+	stamped ``k_storage = "ibz"``.  ``kpoints`` is
+	:func:`star_wedge_kpoints` of the same ``SymMaps``: the stored and
+	full-BZ k lists filed beside the tables.  ``attrs`` are the dataset's
+	provenance attributes; every rank passes them and rank 0's copy lands.
 	"""
 	irr_idx_k, sym_idx_k, n_sym_spatial = star
 	n_rows = int(H_irr.shape[0])
 	with SlabIO(str(path), mode="w", mesh=mesh) as io:
 		io.write_attr(IRR_IDX_DATASET, np.asarray(irr_idx_k, dtype=np.int32))
 		io.write_attr(SYM_IDX_DATASET, np.asarray(sym_idx_k, dtype=np.int32))
+		queue_star_kpoints(io, kpoints, n_rows=n_rows,
+		                   nk_full=np.asarray(irr_idx_k).size, where="write_kin_ion")
 		io.create_dataset(
 			"kin_ion", shape=(n_rows, int(nb), int(nb)), dtype=np.complex128,
 			attrs={K_STORAGE_ATTR: K_STORAGE_IBZ,

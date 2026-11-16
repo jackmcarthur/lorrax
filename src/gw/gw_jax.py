@@ -1070,6 +1070,7 @@ def _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, 
         nk=meta.nk_tot,
         band_stop=band_slices.b3,
         nspinor=int(wfn.nspinor),
+        kpoints_full_crys=wfn.kvecs(),
         print_fn=print0,
     )
     kin_ion = load_kin_ion_submatrix(
