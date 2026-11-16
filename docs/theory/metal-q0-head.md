@@ -245,6 +245,15 @@ $8\pi\,\hat q\cdot S(0)\cdot\hat q$ is $-151/-91$ with this split, against
 $-2242/-1551$ without it, so $q^2\epsilon_\infty$ at the cell's
 $\operatorname{tr}Q=0.017$ bohr$^{-2}$ is comparable with $\kappa^2=2.33$ rather than
 12–17 times larger (claim 2862).
+
+The static fold of $\kappa^2$ is a Schur complement only when head, wings
+$Y=-C\sum w_{kn}u_{kn}$ ($u=|\psi|^2$ at the centroids) and Γ body are blocks of
+one NSD static $\chi^0$, i.e. when the body carries
+$\chi_{FS}=-C\sum w_{kn}u_{kn}u_{kn}^{\sf T}$; then
+$\kappa_{\rm eff}^2=(8\pi/\Omega)\,e^{\sf T}(a^{-1}+U^{\sf T}W_{\rm inter}U)^{-1}e\in(0,\kappa_{TF}^2]$,
+$a=Cw$. A Γ body from $q=0$ pair sums has no $\chi_{FS}$ (bcc Fe $8^3$ gave
+$\kappa_{\rm eff}^2=-12.9$ bohr$^{-2}$), so the tangential route folds the static row
+through $(I-W\chi_{FS})^{-1}W$ (`qsgw_head.metal_static_gamma_body`).
 The four-current head solves the $4\times4$ Dyson equation
 $W_h=[1-\mathcal D(\mathbf q)(\Pi(\mathbf q,z)-C)]^{-1}\mathcal D(\mathbf q)$
 at every Sobol sample of the cell exterior and every point of the screened
@@ -319,9 +328,12 @@ bank's consumer ([four-current heads §5](four-current-head-corrections.md#direc
   the zone, so only an ordered metal saw it, and that store refused `full`
   until both seams closed. The intraband wing stays the Drude limit at
   $z\ne0$ (q-independent in the cell, error confined to near-line samples
-  $|z|\lesssim q_{\rm cell}u_F$, i.e. to $Z$). The static row's fold takes the
-  row's own Γ body; only an exact $z=0$ row also builds the static Matsubara
-  body. Certified by `tests/test_tangential_head_ordered_metal.py`.
+  $|z|\lesssim q_{\rm cell}u_F$, i.e. to $Z$). The static row's fold takes a
+  Γ body that contains the static intraband block (section 3): an exact $z=0$
+  row builds the static Matsubara body, and the tangential route dresses its
+  store's Γ body with $\chi_{FS}$. Certified by
+  `tests/test_tangential_head_ordered_metal.py` and
+  `tests/test_metal_static_fold.py`.
 - **Damping and the wings.** $r(z)$ multiplies the $D/z^2$ term of $S$. The
   ordered metal's intraband wing ($\propto1/z$) keeps the undamped Drude
   form at $\gamma_0>0$; time reversal cancels it on a non-magnetic metal.

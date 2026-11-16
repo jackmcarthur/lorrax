@@ -5,6 +5,30 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-16 — a metal's static head row folds through a Γ body with its intraband block
+
+On the tangential route a metal's static (Thomas–Fermi) head row folded the
+static intraband wings through the store's Γ body at z = 0, which comes from
+q = 0 pair sums without diagonal pairs and so screens with the interband χ0
+only. That fold is no Schur complement and can give κ_eff² < 0: bcc Fe 8³ SOC
+refused with κ_eff² = −12.9 bohr⁻². The row now folds through
+(I − W χ_FS)⁻¹ W, χ_FS = −C Σ w_kn u_kn u_knᵀ built from the operands of the
+row's own wings and κ_TF² (`qsgw_head.metal_static_gamma_body`), so
+0 < κ_eff² ≤ κ_TF²; the static 3×3 interband fold takes the same body.
+
+- **Results.** Insulators are bitwise unchanged (hsuite kmeans, kin_ion,
+  dipole, gnppm, sp_export: 189/189 captured arrays sha256-equal to
+  43fb302b7). Metals with `head_correction = full` on the tangential route
+  move. hsuite `na_sc` map 0 has κ_TF² = 0.786752 bohr⁻²; the static fold gives
+  κ_eff² = 0.776398 through the dressed body, 0.776259 through the store's body
+  alone and 0.776309 through the exact static Matsubara body. eqp moves by at
+  most 0.07 meV and on-shell dΣ/dω by at most 1.4e-3, and
+  `tests/hsuite/reference/na_sc.npz` is regenerated. bcc Fe 8³ SOC (88 bands,
+  N_μ 871), which refused, now gives κ_eff² = 2.264 bohr⁻² against κ_TF² = 7.869
+  (−12.912 through the store's body alone). The MPA route is unchanged.
+- **Decks.** No change.
+- **Test.** `tests/test_metal_static_fold.py`.
+
 ## 2026-11-14 — Bispinor transverse terms are input-file keys; head default; stamps
 
 New input-file keys for `bispinor = true` (docs/input_reference.md):
