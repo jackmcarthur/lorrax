@@ -199,7 +199,9 @@ def test_head_reuses_micro_samples_and_preserves_direct_response_route(micro):
             head_moment_m1=moment,
             iteration_head_sample_terms=forbidden if micro else
                 lambda _response, index, _body, **_kwargs: samples[index],
-            metal_response_nodes=lambda p, *_a, **_k: p),
+            metal_response_nodes=lambda p, *_a, **_k: p,
+            # The insulating ladder head never takes the metal static row.
+            metal_static_gamma_body=forbidden, metal_static_rows=forbidden),
         "response_bank": NS(_reserve=forbidden),
         "qgrid_symmetry": NS(tangential_operator_realizer=forbidden),
         "distrib_la": NS(),
