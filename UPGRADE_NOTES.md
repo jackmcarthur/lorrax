@@ -5,6 +5,49 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-17 — Self-consistent metals: semicore floor, held quasiparticle class, one static Γ body
+
+Three changes for metals; insulators take none of these paths (every hsuite
+H₂⁻ stage bitwise against main at P4; Si 8³ QSGW identical to main through its
+8 maps).
+
+- **Semicore floor.** On a metal the semicore (coarse-window) floor now counts
+  `nval` down from the occupied-band boundary $n_{\rm occ}=\max(\texttt{ifmax})$,
+  as the QP window does and as on an insulator. It used the per-$k$ number of
+  states below $\mu$, so with the documented `nval = 10` on bcc Fe the floor
+  fell inside the 3p shell: one spin–orbit half was held at DFT while the other
+  moved by $-0.74$ eV onto it, and Fe 8³ stalled at 28–36 meV. Results move for
+  metal decks whose floor comes from `nval`; `number_bands_protected` decks and
+  floors set by `sigma_omega_min_ev` are unchanged.
+- **Held quasiparticle class.** The test $Z\in(0,1]$ that admits a state to the
+  set placing the Σ support and $W$'s line sites is now taken once, at map 1, and
+  held for the loop, as the partition is. A state whose $Z$ crossed the bound
+  between maps entered and left that set, moved the line sites by 0.1–0.5 eV and
+  kicked the loop: bcc Fe 4³ with `sc_head_update = off` cycled at 0.13–0.23 eV
+  for 22 maps and now converges in 14; `dft_velocity` stalled at 4–5 meV for 31
+  maps and now converges in 14; the hsuite Na loop converges in 17 maps to
+  $5\cdot10^{-4}$ eV (main: not converged after 40). Maps 0 and 1 of every run
+  are unchanged; later maps move where a state's classification changes.
+- **One static Γ body.** A metal's static (Thomas–Fermi) head row now takes the
+  same Γ body on every route: the route's own body (tangential model at $z=0$,
+  MPA origin sample) dressed by the static intraband block $\chi_{FS}$, built
+  with $\kappa_{TF}^2$ and the static wings from the tetrahedron table
+  (`qsgw_head._metal_static_head`, `metal_static_gamma_body`), so
+  $0<\kappa_{\rm eff}^2\le\kappa_{TF}^2$ by construction. Before, the MPA route folded
+  its undressed origin sample (no Schur complement), and the default `do_G0`
+  ran a Fermi–Dirac Matsubara sweep over every $q$ at every map only to overwrite
+  Γ rows with a Fermi–Dirac block folded against tetrahedron wings. That sweep is
+  gone. The static screening role ($W(0)$ for a restart or the BSE) takes the
+  tetrahedron block at Γ (`static_fermi_surface_swap`). Results move for MPA
+  metal runs and for a metal's stored $W(0)$ at Γ; the tangential route is
+  unchanged: hsuite `na_sc` maps 0–1 are bitwise main's, at P4 on Frontier.
+- **Reference.** `tests/hsuite/reference/na_sc.npz` is regenerated. Its maps 0
+  and 1 are unchanged; its third map's residual is 0.637 eV instead of 1.111 eV,
+  and the stored eqp and Σ members (all from that map) move with it.
+- **Decks.** No change.
+- **Tests.** `tests/test_semicore_floor_metal.py`, `tests/test_metal_static_fold.py`,
+  `tests/test_metal_head_free_electron.py`.
+
 ## 2026-11-16 — a metal's static head row folds through a Γ body with its intraband block
 
 On the tangential route a metal's static (Thomas–Fermi) head row folded the
@@ -28,6 +71,42 @@ row's own wings and κ_TF² (`qsgw_head.metal_static_gamma_body`), so
   (−12.912 through the store's body alone). The MPA route is unchanged.
 - **Decks.** No change.
 - **Test.** `tests/test_metal_static_fold.py`.
+
+## 2026-11-16 — k lists in kin_ion.h5 and sigma_mnk.h5; named refusals; one completion verdict
+
+- **New datasets.** Every `kin_ion.h5` and `sigma_mnk.h5` carries
+  `kpoints_stored_crys` (the crystal k of each stored row: one row per symmetry
+  star, its star's WFN k modulo $\mathbf G$) and `kpoints_full_crys` (each unfolded
+  full-zone row). On a symmetry-reduced cell the stored rows are a permutation of
+  the WFN's k order (bulk CrCl₃ 4³: stored row 6 is WFN k 13). A script that
+  pairs stored rows with WFN-ordered data by index was silently wrong; unfold
+  through `irr_idx_k` / `sym_idx_k`, or match on these lists.
+- **New refusals.** `GATE k_list_mismatch`: gw's `kin_ion` check and the
+  post-hoc eqp assembly (`gw.eqp_bgw`) compare a file's full-zone list with the
+  run's WFN (modulo $\mathbf G$, $10^{-6}$) and refuse a file made on another k list.
+  Files written before this have no lists and are read unchanged with one NOTE.
+  `GATE band_request_unresolved`: `prepare_band_metadata` refuses a config whose
+  `number_bands_protected` request was not resolved against its WFN (a caller
+  bug, never a user input).
+- **Changed message.** At wide QP windows the one-sample response-fit failure
+  (`ValueError: response exponential fit failed` in `bank.rule_construction`)
+  now reads `GATE tangential_response_fit` and names the sample in eV,
+  $\mathrm{Re}\,z/\mathrm{Im}\,z$, the χ₀ interval, the acceptance that refused, and the
+  route around it: `sigma_w_support_sites_ev` with a narrower window's ladder,
+  or a line height of at least $\mathrm{Re}\,z/25$. Scripts that matched the old
+  text must match the gate name. Passing rules are unchanged.
+- **Fixes.** The BSE ladder $W$ reload (`w_bse`, `w_rpa_resolvent`) works with
+  `number_bands_protected` input files (it died with a `TypeError`). The
+  completion manifest (`GATE gw_artifacts_unpublished`) is read on rank 0 and
+  handed to every rank, so every rank returns the verdict rank 0 logs.
+- **Docs.** `docs/input_reference.md` documents the optional height field of
+  `sigma_w_support_sites_ev`, and says that `restart = true` also reads the
+  one-shot Σ checkpoint (`tmp/sigma_checkpoint_oneshot{_on_shell,}.h5`), which is
+  reused only when its identity matches; delete those two files from a copied
+  `tmp/` to reuse only the tensor files.
+- **Results.** No number changes: the hsuite references gained only the new
+  k-list members, every old member bitwise. No input-file key, default or
+  environment switch changed.
 
 ## 2026-11-14 — Bispinor transverse terms are input-file keys; head default; stamps
 
