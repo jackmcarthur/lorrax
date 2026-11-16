@@ -819,6 +819,102 @@ def refuse_mpa_static_w(filename) -> None:
             "write_restart_tensors = true, and point the BSE at that restart.")
 
 
+#: Which series a stored screened interaction sums (``screening_diagrams``):
+#: the attribute on ``W0_qmunu``, ``whead`` and ``W0_lr`` names the series of
+#: THAT object; the file attribute ``gw_screening_diagrams`` names the series
+#: of the W the producing run's Sigma used (``gw.gw_output.stamp_w0_route``).
+#: Under ``w_bse`` the two differ by design: the stored W(0) is the RPA rung
+#: the ladder was built from, and the ladder W itself is not stored.
+W_SERIES_LABELS = {
+    "w_rpa": "RPA W(0) (Dyson series in chi0)",
+    "w_bse": "ladder-corrected W (BSE electron-hole ladder in chi)",
+    "w_rpa_resolvent": "RPA W from the resolvent route",
+}
+
+#: The stamped members of the screened interaction, in report order.
+W_SERIES_MEMBERS = ("W0_qmunu", "whead", "W0_lr")
+
+
+def _series_attr(obj, key="screening_diagrams"):
+    """A stamped series label, or ``None`` on a file written before the stamp."""
+    value = obj.attrs.get(key)
+    if value is None:
+        return None
+    return str(np.asarray(value).astype(str)).strip().lower() or None
+
+
+def read_w0_provenance(filename) -> dict:
+    """The stored screened interaction's series labels, without reading W.
+
+    Returns ``{"W0_qmunu", "whead", "W0_lr"}`` (each the member's own
+    ``screening_diagrams`` stamp, ``None`` if absent or unstamped), ``"gw"``
+    (the producing run's Sigma series, file attribute
+    ``gw_screening_diagrams``) and ``"gw_compute_mode"``.  ``None`` means the
+    file predates the stamp; every LORRAX producer up to the stamp stored an
+    RPA-series W(0) (the Dyson route, the tangential model at omega = 0, the
+    ladder's RPA rung, or BerkeleyGW's projected epsilon).
+    """
+    with h5py.File(filename, "r") as f:
+        out = {name: (_series_attr(f[name]) if name in f else None)
+               for name in W_SERIES_MEMBERS}
+        out["present"] = tuple(name for name in W_SERIES_MEMBERS if name in f)
+        out["gw"] = _series_attr(f, "gw_screening_diagrams")
+        out["gw_compute_mode"] = _series_attr(f, "gw_compute_mode")
+    return out
+
+
+def describe_w0_provenance(prov, *, consumer) -> str:
+    """One line for a consumer's log: which W it reads, and which W Sigma used."""
+    w0 = prov.get("W0_qmunu")
+    text = (f"{consumer}: stored W0_qmunu is the "
+            + (W_SERIES_LABELS.get(w0, w0) + f" (screening_diagrams = {w0})"
+               if w0 is not None else
+               "RPA W(0) (unstamped: written before the series stamp; every "
+               "producer of that era stored an RPA-series W(0))"))
+    gw = prov.get("gw")
+    if gw is not None and gw != (w0 or "w_rpa"):
+        text += (f"; the producing GW run's Sigma used screening_diagrams = {gw} "
+                 f"({W_SERIES_LABELS.get(gw, gw)}), which is NOT stored: this "
+                 f"consumer reads the {W_SERIES_LABELS.get(w0 or 'w_rpa', w0)}")
+    return text
+
+
+def require_w0_series(filename, want="w_rpa", *, consumer, print_fn=None) -> dict:
+    """``GATE w0_series``: refuse a stored W whose series is not ``want``.
+
+    For a consumer that needs one specific series and would otherwise use
+    whatever ``W0_qmunu`` holds: the ladder's rung (``W_R`` is the RPA W(0) by
+    construction, so a ladder-stamped W0 would count the ladder twice), the
+    BerkeleyGW epsilon export (``epsmat.h5`` is an RPA epsilon), the downfold
+    (cRPA) and the resolvent cross-check CLI.  An unstamped file is read as
+    RPA (see :func:`read_w0_provenance`) and says so.  The members of one
+    file must agree with each other: a W0 body and a head of different series
+    are a torn file, refused for every ``want``.  Returns the provenance.
+    """
+    prov = read_w0_provenance(filename)
+    stamped = {name: prov[name] for name in prov["present"] if prov[name] is not None}
+    if len(set(stamped.values())) > 1:
+        raise ValueError(
+            f"GATE w0_series_torn: {filename} stores screened-interaction members "
+            f"of different series {stamped}; want one series for W0_qmunu, whead "
+            f"and W0_lr; why: the body and its q->0 head or long-range channels "
+            f"would describe two different W; fix: regenerate the ISDF tensor "
+            f"file with one GW run.")
+    got = prov["W0_qmunu"] or "w_rpa"
+    want = str(want).strip().lower()
+    if got != want:
+        raise ValueError(
+            f"GATE w0_series: {consumer} needs the {W_SERIES_LABELS.get(want, want)} "
+            f"(screening_diagrams = {want}), and {filename} stores the "
+            f"{W_SERIES_LABELS.get(got, got)} (W0_qmunu screening_diagrams = {got}); "
+            f"why: using it would compute with a different screened interaction "
+            f"under this consumer's name; fix: point {consumer} at an ISDF tensor "
+            f"file whose W0_qmunu is {want}.")
+    line = describe_w0_provenance(prov, consumer=consumer)
+    (print_fn or log.info)(f"  W0 provenance: {line}")
+    return prov
+
+
 #: The datasets ``gw.epsmat_cli mode = project`` writes, by screening role.
 PROJECTED_W_DATASETS = {"static": "W0_qmunu", "probe": "Wp_qmunu"}
 
@@ -1131,6 +1227,11 @@ def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
     if not screened:
         W = None
     elif screened_w is None:
+        # Say which W the direct term reads: after a w_bse GW run the stored
+        # W0 is the RPA rung, not the ladder W that run's Sigma used.
+        log.info("  W0 provenance: " + describe_w0_provenance(
+            read_w0_provenance(filename),
+            consumer="the BSE loader's W(0) (BSE direct term, ladder rung, TD-aGW)"))
         W = read_interaction_qgrid(filename, "screened", mesh_xy, grid, nohead=nohead)
     else:
         # A rebuilt (q, μ, ν) body: one relayout; the caller drops its copy.
@@ -1205,6 +1306,11 @@ def read_downfold_geometry(filename: str) -> dict:
         if not bool(f["V_qmunu"].attrs.get("V_ready", True)):
             raise ValueError(
                 f"downfold: {filename} says V_ready = False.")
+    # The downfolded U is the stored W0's series; after a w_bse GW run that
+    # is the RPA rung, not the ladder W of the run's Sigma.  Said, not refused.
+    log.info("  W0 provenance: " + describe_w0_provenance(
+        read_w0_provenance(filename), consumer="downfold (U from W0_qmunu)"))
+    with h5py.File(filename, "r") as f:
         geom = {
             "n_rmu_logical": (int(np.asarray(f["n_rmu_logical"])[()])
                               if "n_rmu_logical" in f
