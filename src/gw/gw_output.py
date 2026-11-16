@@ -427,6 +427,93 @@ def stamp_w0_route(tensors_filename: str, config) -> None:
     barrier("restart_w0_route_stamp")
 
 
+def persist_ladder_w0(W_q, *, tensors_filename: str, head_resolver, config, meta,
+                      mesh_xy, sym=None, centroid_indices=None, print_fn=print) -> bool:
+    """Store the ladder W(0) of a ``w_bse`` run BESIDE its RPA rung.
+
+    ``W_q`` is the static role Sigma consumed (``V + Wc^ladder(0)``, a wedge
+    ``QirrOperator`` or a whole-zone array).  It is written as
+    ``file_io.restart_bundle.LADDER_W0`` with the same layout, q storage and
+    unfold tables as ``W0_qmunu`` (the same writer by name), and its q -> 0
+    head scalar at omega = 0 as ``LADDER_WHEAD`` (the resolver's sample: the
+    micro-reducible ladder head under ``head_correction = full``, the head-off
+    sample otherwise), with ``S_cart`` when the sample has one.  Both are
+    stamped ``screening_diagrams = w_bse``.  ``W0_qmunu``, ``whead`` and
+    ``W0_lr`` are untouched: they stay the RPA rung the ladder reads back.
+
+    A BSE reads this W only under ``bse_screening_diagrams = w_bse``
+    (``restart_bundle.read_bse_payload``); the fine-grid interpolation refuses
+    it (no ladder long-range channels are stored).  Returns ``True`` when the
+    datasets were written; ``False`` under the same write policy that skips
+    ``W0_qmunu`` (``write_restart_tensors = false``, or no file).
+    """
+    import h5py
+    from common import timing as _tmg
+    from common.collectives import barrier, process_rank
+    from file_io import write_w0_qmunu_to_h5
+    from file_io.restart_bundle import LADDER_S_CART, LADDER_W0, LADDER_WHEAD
+    from .cohsex_sigma import interaction_operator
+    from .restart_q_storage import (deposit_pre_unfold, resolve_restart_q_storage_for_run,
+                                    take_pre_unfold)
+
+    if not config.do_screened or not restart_tensor_writes_enabled(config, tensors_filename):
+        return False
+    if not os.path.exists(tensors_filename):
+        return False
+    head = head_resolver.at(0.0 + 0.0j)       # resolved before any dataset is touched
+    W_op = interaction_operator(W_q)
+    resolution = resolve_restart_q_storage_for_run(
+        config, sym=sym, centroid_indices=centroid_indices,
+        fft_grid=getattr(meta, "fft_grid", None), print_fn=print_fn,
+        context="ladder W0 restart tensor")
+    capture = None
+    if not W_op.is_whole_zone():
+        # The wedge the ladder was assembled on, offered exactly as the RPA
+        # static leg offers its own (gw.screening.compute_static_w).
+        deposit_pre_unfold(
+            LADDER_W0, W_op.values, n_rmu_logical=int(meta.n_rmu),
+            q_irr_frac=W_op.q_irr_frac, irr_idx_q=W_op.irr_idx, sym_idx_q=W_op.sym_idx,
+            sym_perm=W_op.sym_perm, L_table=W_op.L_table,
+            n_sym_spatial=W_op.n_sym_spatial, mu_basis=getattr(meta, "mu_basis", None))
+        capture = take_pre_unfold(LADDER_W0)
+    qirr = resolution.with_capture(capture)
+    W_full = None
+    if not qirr.store_wedge:
+        W_full = W_op.unfold(mesh_xy)
+        if getattr(meta, "mu_basis", None) is not None:
+            W_full = meta.mu_basis.unpack_operator(W_full)   # files keep canonical order
+    with _tmg.section("persist_ladder_w0.write"):
+        write_w0_qmunu_to_h5(tensors_filename, W_full, n_rmu_logical=int(meta.n_rmu),
+                             mesh=mesh_xy, qirr=qirr, name=LADDER_W0)
+    if process_rank() == 0:
+        with h5py.File(tensors_filename, "a") as f:
+            f[LADDER_W0].attrs["screening_diagrams"] = "w_bse"
+            for name in (LADDER_WHEAD, LADDER_S_CART):
+                if name in f:
+                    del f[name]
+            ds = f.create_dataset(
+                LADDER_WHEAD, data=np.asarray([head.wcoul0], dtype=np.complex128))
+            ds.attrs["omega_grid"] = np.asarray([0.0], dtype=np.float64)
+            ds.attrs["screening_diagrams"] = "w_bse"
+            ds.attrs["head_correction"] = str(getattr(
+                config.head.correction, "value", config.head.correction))
+            ds.attrs["head_source"] = str(head.source)
+            kind = getattr(head, "response_kind", None)
+            if kind is not None:
+                ds.attrs["response_kind"] = str(getattr(kind, "value", kind))
+            if head.S_cart is not None:
+                sd = f.create_dataset(LADDER_S_CART, data=np.asarray(
+                    head.S_cart, dtype=np.complex128).reshape(3, 3))
+                sd.attrs["convention"] = "cartesian_q2_coefficient"
+                sd.attrs["omega_ry"] = 0.0
+    barrier("restart_ladder_w0_stamp")
+    log.info(f"  Ladder W(0) stored for the BSE: {LADDER_W0} + {LADDER_WHEAD} "
+             f"(screening_diagrams = w_bse; whead[0] = {complex(head.wcoul0).real:.3f} a.u.), "
+             f"beside the RPA rung W0_qmunu.  A BSE reads it under "
+             f"bse_screening_diagrams = w_bse.")
+    return True
+
+
 def persist_w0_and_head(
     W_q,
     *,

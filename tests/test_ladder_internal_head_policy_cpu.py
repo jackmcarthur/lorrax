@@ -22,7 +22,7 @@ def test_shared_loader_separates_external_and_internal_head_without_changing_def
     header = dict(grid=(1, 1, 1), centroid_count=2, screened_ready=True,
                   head_vector=g0, bare_head=31., screened_head=np.array([18.+0j]),
                   logical_band_count=2, energies=np.array([[-.2, .5]]))
-    monkeypatch.setattr(restart_bundle, "read_metadata", lambda _p: header)
+    monkeypatch.setattr(restart_bundle, "read_metadata", lambda _p, **_k: header)
     monkeypatch.setattr(restart_bundle, "refuse_mpa_static_w", lambda _p: None)
     v = device_put_process_local(np.eye(2, dtype=complex), NamedSharding(mesh, P("x", "y")))
     w = device_put_process_local(np.ones((2, 2, 1, 1, 1), complex),
@@ -148,7 +148,7 @@ def test_no_rung_facades_load_bare_only_restart_without_screened_reads(monkeypat
     header=dict(grid=(1,1,1),centroid_count=2,screened_ready=False,
         head_vector=None,bare_head=None,screened_head=None,
         logical_band_count=2,energies=np.array([[-.2,.5]]))
-    monkeypatch.setattr(restart_bundle,'read_metadata',lambda _p: header)
+    monkeypatch.setattr(restart_bundle,'read_metadata',lambda _p, **_k: header)
     def forbidden(*a,**k):
         raise AssertionError('no-W facade must not inspect, read or rebuild screened W')
     monkeypatch.setattr(restart_bundle,'refuse_mpa_static_w',forbidden)

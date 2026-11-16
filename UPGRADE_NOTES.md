@@ -73,9 +73,18 @@ file now says so, and its readers say which W they use.
   Files written before the stamp read as `w_rpa`, with a note.
 - **Progress.** The resolvent stage prints its size once and one line per
   solved probe block (GMRES iterations, residual, block wall, time left).
-- **Results.** No number changes. **Decks.** No change.
+- **New key: `bse_screening_diagrams`** (`w_rpa` default, `w_bse`). A `w_bse`
+  GW run under `cohsex` or `gn_ppm` now also stores the ladder W(0) its Σ
+  used (`W0_ladder_qmunu`, `whead_ladder`; one more (n_q, N_μ, N_μ) array in
+  the ISDF tensor file). A BSE or TD-aGW run reads it only when its input
+  file sets `bse_screening_diagrams = w_bse`; the default still reads the RPA
+  W(0). Refusals: `GATE bse_ladder_w0` (no stored ladder W(0), e.g. a file
+  written before this change or by the tangential route) and
+  `GATE bse_ladder_w0_fine_grid` (`kgrid_fine`).
+- **Results.** No number changes with the defaults. **Decks.** No change.
 - **Tests.** `tests/test_w0_series_provenance_cpu.py`,
-  `tests/test_w0_series_report_cpu.py`, `tests/test_ladder_progress_cpu.py`.
+  `tests/test_w0_series_report_cpu.py`, `tests/test_ladder_progress_cpu.py`,
+  `tests/test_bse_ladder_w0_cpu.py`.
 
 ## 2026-11-17 — Full-BSE oscillator strengths: `full_bse = true` takes `dipole_file`
 

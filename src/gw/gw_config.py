@@ -1627,6 +1627,10 @@ _DEFAULTS = {
     # channels) into a fitted model the trigonometric interpolant never sees;
     # ``c1`` and ``legacy`` refuse (runtime.renames.DECK_VALUES).
     "w_head_densify": "srlr",
+    # Which stored static W the BSE direct term reads: ``w_rpa`` (W0_qmunu,
+    # the default) or ``w_bse`` (the ladder W(0) a screening_diagrams = w_bse
+    # GW run stores beside its RPA rung; file_io.restart_bundle.LADDER_W0).
+    "bse_screening_diagrams": "w_rpa",
     "bare_coulomb_cutoff": None,
     # ζ-sphere cutoff (Ry).  When the writer emits zeta_q_G with per-q
     # WFN.h5-style spheres, this is the cutoff used to define the per-q

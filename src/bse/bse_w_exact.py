@@ -1501,7 +1501,7 @@ def main(argv=None) -> None:
         data = load_bse_data_from_restart_sharded(
             restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
             input_file=args.input, inject_head=False,
-            load_v_full=(args.compare_wq or args.w_omega_chain))
+            load_v_full=(args.compare_wq or args.w_omega_chain), w_series="w_rpa")
 
     n_rmu = int(data["V_q0"].shape[0])
     nlog = int(data["n_rmu"])
