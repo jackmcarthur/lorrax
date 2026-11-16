@@ -22,7 +22,7 @@ applier.  The contraction under test is
 3. Time-reversal partner roots: from a general eig of the full H (2N roots, no metric
    assumed), each root at +Omega and its partner at -Omega carry the same strength (1e-9 of
    the largest), and the pencil's roots carry the eig's strengths (1e-9).
-4. The production route: ``solve_bse_nontda_sharded`` returns (X, Y) replicated on the mesh
+4. The production route: ``solve_bse_nontda_sharded`` returns (X, Y) on the mesh's transition axes
    with X^H X - Y^H Y = 1, and ``exciton_dipoles_distributed`` on it equals the host
    contraction (1e-12).
 5. A real H with a degenerate pair: ``solve_nontda_product`` returns Sigma-orthonormal pairs
@@ -239,14 +239,19 @@ def test_production_route_on_mesh():
     ops = _operands()
     n_eig = 12
     omega, evecs, _ = solve_bse_nontda_sharded(_payload(mesh, ops), mesh, n_eig=n_eig)
-    assert isinstance(evecs.sharding, NamedSharding) and tuple(evecs.sharding.spec) == ()
+    assert isinstance(evecs.sharding, NamedSharding)
+    assert tuple(evecs.sharding.spec) == (None, None, "x", "y", None)     # Davidson's root layout
     host = np.asarray(evecs)
     X, Y = host[:, 0], host[:, 1]
     norm = (np.sum(np.abs(X.reshape(n_eig, -1)) ** 2, axis=1)
             - np.sum(np.abs(Y.reshape(n_eig, -1)) ** 2, axis=1))
     assert np.max(np.abs(norm - 1.0)) <= 1e-10
     want = exciton_dipole_projections(X, ops["d"], Y=Y)
-    got = exciton_dipoles_distributed(evecs, build_dipole_vector_bse(ops["d_kcv"]), n_eig)
+    # the dipole block committed on the transition axes, as the driver's window dipoles are
+    from lxkit import device_put_process_local
+    d_block = device_put_process_local(build_dipole_vector_bse(ops["d_kcv"]),
+                                       NamedSharding(mesh, P(None, "x", "y", None)))
+    got = exciton_dipoles_distributed(evecs, d_block, n_eig)
     assert np.max(np.abs(got - want)) <= 1e-12 * np.max(np.abs(want))
 
 

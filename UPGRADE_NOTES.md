@@ -22,7 +22,7 @@ roots, as under the TDA. `haydock` still needs the TDA.
   degenerate multiplet, and it is taken only when H is real (A and B both
   real); a complex A with a real or zero B takes the definite pencil, where
   the product reduction did not hold. The full-BSE eigenvectors come back
-  replicated on the solve mesh, as the TDA's do; `eigenvectors.h5` is
+  on the solve mesh's transition axes, as the TDA's do; `eigenvectors.h5` is
   unchanged.
 - **Files.** `absorption_common.load_eigenvectors_h5` still refuses a
   full-BSE file (its consumers, TD-aGW and `dump_window_dipoles`, read X

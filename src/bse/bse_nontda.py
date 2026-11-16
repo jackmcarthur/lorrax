@@ -52,7 +52,7 @@ Structure-preserving reduction, dispatched on B's symmetry:
 
 Eigenvectors: normalised (X, Y) pairs with the standard ``X^H X - Y^H Y = +1``
 convention (Sigma-orthonormal inside a degenerate multiplet too), stacked
-``(n_eig, 2, nc, nv, nk)`` replicated on the solve mesh, and wired to
+``(n_eig, 2, nc, nv, nk)`` on the solve mesh's transition axes, and wired to
 ``bse_io.write_eigenvectors_stream`` (use_tda=0, honest) and to the per-state
 dipoles ``<0|r|S> = sum_t X_t conj(d_t) - Y_t d_t``
 (``absorption_common.exciton_dipole_projections``).
@@ -547,8 +547,8 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
 
     Returns ``(eigenvalues_Ry (n_eig,), eigenvectors (n_eig, 2, nc, nv, nk),
     n_iter)`` matching the TDA ``solve_bse_sharded`` tuple; the pair axis carries
-    (X, Y) with ``X^H X - Y^H Y = +1``, and the eigenvectors are a replicated
-    array on ``mesh_xy`` (the TDA routes' layout).  The real product route is
+    (X, Y) with ``X^H X - Y^H Y = +1``, and the eigenvectors sit on the transition axes
+    of ``mesh_xy`` (the TDA routes' layout).  The real product route is
     taken only when H itself is real (``_h_is_real``); everything else,
     ``B = 0`` with a complex ``A`` included, takes the definite pencil.
 
@@ -609,14 +609,15 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
 
 
 def _on_mesh(evecs, mesh_xy):
-    """The host ``(n_eig, 2, nc, nv, nk)`` pairs as a replicated array on the
-    solve mesh, the layout the TDA routes return (``bse_lanczos`` pins
-    Davidson to it), so the dipole contraction
-    (``absorption_common.exciton_dipoles_distributed``) and the eigenvector
-    writer read both routes through one path.  Every process holds the same
-    host array (the dense solve runs on every process), and each puts it on its
-    own devices: no collective."""
+    """The host ``(n_eig, 2, nc, nv, nk)`` pairs on the solve mesh's transition
+    axes, ``P(None, None, 'x', 'y', None)``: the layout Davidson returns its
+    roots on (``bse_lanczos``), so the dipole contraction
+    (``absorption_common.exciton_dipoles_distributed``, which shards the dipole
+    block like the eigenvectors and contracts each rank's own tile) and the
+    eigenvector writer read both routes through one path.  Every process holds
+    the same host array (the dense solve runs on every process) and puts its
+    own tiles on its devices: no collective."""
     from jax.sharding import NamedSharding, PartitionSpec as P
     from lxkit import device_put_process_local
     return device_put_process_local(np.asarray(evecs, dtype=np.complex128),
-                                    NamedSharding(mesh_xy, P()))
+                                    NamedSharding(mesh_xy, P(None, None, "x", "y", None)))
