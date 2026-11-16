@@ -7,7 +7,8 @@ Transients come from the runtime's own price functions where one exists:
 - ζ μ-batch loop: :func:`gw.gflat_memory_model.plan_zeta_route_g` (its smallest
   configuration; the loop fills the budget above it),
 - V(q): :func:`gw.v_q_g_flat.vq_tile_bytes`,
-- W Dyson: :func:`gw.w_isdf.dyson_route_prices` (the admission's two routes),
+- W Dyson: :func:`gw.w_isdf.dyson_route_prices` (the admission's two routes; the
+  distributed one with cuSOLVERMp's LU workspace, :func:`gw.w_isdf.dyson_lu_workspace`),
 - Σ_x and Σ τ: :func:`gw.ppm_tau_kernel.sigma_row_plan` / :func:`sigma_pass_bytes`
   (the row passes the kernel books).
 
@@ -34,6 +35,8 @@ GB = 1e9
 BUDGET = {"local": 66.35 * GB, "distributed": 63.4 * GB}
 #: lxkit.legs CUDA distributed context (cuSOLVERMp/NCCL), outside the pool.
 CONTEXT = 3.6 * GB
+#: lxkit.legs CUDA second_context: cuSOLVERMp's other grid layout (LU's beside eigh's).
+SECOND_CONTEXT = 1.98 * GB
 #: A100 opt-in shared memory per block: the mathdx mode-7 single arm (no run-time scratch).
 OPTIN_SMEM = 166912
 
@@ -181,7 +184,7 @@ def stage_prices(d: Deck, P: int) -> dict:
 
 @lru_cache(maxsize=4096)
 def _stage_prices(d: Deck, P: int) -> tuple:
-    from gw.w_isdf import dyson_route_prices
+    from gw.w_isdf import dyson_lu_workspace, dyson_room, dyson_route_prices
     u = _units(d, P)
     px, py = _mesh(P)
     M, QM, F, PsiG, n2, mu = u["M"], u["QM"], u["F"], u["PsiG"], u["n2"], u["mu"]
@@ -237,9 +240,22 @@ def _stage_prices(d: Deck, P: int) -> tuple:
     # W.slice_to_ibz: chi0 still whole-zone beside its q-wedge slice.
     st["W slice to IBZ"] = (("only", _p("W slice to IBZ", nV * QM + F + d.nk * M, QM,
                                         "V(q) + faces + chi0", f"wedge slice [{trace}]", P)),)
-    loc, dist = dyson_route_prices(mu, d.nq, P, memory.Term(CONTEXT, source="lxkit.legs CUDA contexts"))
-    st["W"] = (("local", loc + _p("W", F, 0.0, "faces", "", P)),
-               ("distributed", dist + _p("W", F, 0.0, "faces", "", P)))
+    # The distributed route adds cuSOLVERMp's solve workspace outside XLA (w_isdf.dyson_lu_workspace:
+    # the measured rows at the layout its plan runs in the run's room, w_isdf.dyson_room) and both
+    # cuSOLVERMp contexts (the eigh grid's and the LU grid's); a mesh cuSOLVERMp refuses leaves the
+    # local route.
+    contexts = CONTEXT + SECOND_CONTEXT
+    try:
+        room = dyson_room(mu, d.nq, P, BUDGET["distributed"], contexts,
+                          BUDGET["distributed"] - 3 * d.nq * M - F)
+        lu_ws = (dyson_lu_workspace(mu, px, py, room=room) if P > 1
+                 else memory.Term(source="one rank: no mesh LU"))
+    except ValueError:
+        lu_ws = None
+    loc, dist = dyson_route_prices(mu, d.nq, P, memory.Term(
+        contexts, source="lxkit.legs CUDA contexts, both cuSOLVERMp grids"), lu_ws)
+    st["W"] = (("local", loc + _p("W", F, 0.0, "faces", "", P)),) + (
+        () if lu_ws is None else (("distributed", dist + _p("W", F, 0.0, "faces", "", P)),))
     # Sigma residents (sigma.exchange / tau_sweep entry): V(q), the W pair (the GN-PPM pole
     # pair in the sweep), faces; tangential holds B in place of the pair (its poles are read
     # by the sweep, below).
