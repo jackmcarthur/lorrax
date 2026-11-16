@@ -1675,33 +1675,48 @@ def _published_artifacts(rows):
     left ``sigma_mnk.h5`` at ``lorrax_io_committed = 0``.  Rows are
     ``(label, path, required)``; a present file carrying the commit receipt
     dataset must read 1.
+
+    Rank 0 alone opens the files and every rank receives its manifest and
+    verdict (``common.collectives.rank0_read``, which is also the barrier
+    after the writers' close). Each rank used to open them itself: on a
+    4-node QSGW run (NiO, 600 bands, 2026-11-12) rank 9 of 16 failed this
+    gate while rank 0's manifest, the only one logged, was clean, the
+    concurrent-reopen race ``rank0_read`` documents.
     """
     import h5py
+    from common.collectives import rank0_read
 
-    ok = True
+    def manifest():
+        ok, lines = True, []
+        for label, path, required in rows:
+            if path is None:
+                lines.append(f"    {label}: not requested")
+                continue
+            path = str(path)
+            if not os.path.exists(path):
+                lines.append(f"    {label}: {'MISSING' if required else 'absent'} ({path})")
+                ok = ok and not required
+                continue
+            state = "present"
+            try:
+                with h5py.File(path, "r") as h5:
+                    if "lorrax_io_committed" in h5:
+                        committed = int(np.asarray(h5["lorrax_io_committed"])[0])
+                        state = f"committed={committed}"
+                        if committed != 1:
+                            ok = False
+            except Exception as exc:              # unreadable is not published
+                state = f"unreadable ({type(exc).__name__})"
+                ok = False
+            lines.append(f"    {label}: {state} ({path})")
+        return {"ok": ok, "lines": lines}
+
+    key = next((str(path) for _, path, _ in rows if path is not None), "gw_artifacts")
+    got = rank0_read(key, stage="gw.published_artifacts", read=manifest)
     log.info("  published artifacts:")
-    for label, path, required in rows:
-        if path is None:
-            log.info(f"    {label}: not requested")
-            continue
-        path = str(path)
-        if not os.path.exists(path):
-            log.info(f"    {label}: {'MISSING' if required else 'absent'} ({path})")
-            ok = ok and not required
-            continue
-        state = "present"
-        try:
-            with h5py.File(path, "r") as h5:
-                if "lorrax_io_committed" in h5:
-                    committed = int(np.asarray(h5["lorrax_io_committed"])[0])
-                    state = f"committed={committed}"
-                    if committed != 1:
-                        ok = False
-        except Exception as exc:              # unreadable is not published
-            state = f"unreadable ({type(exc).__name__})"
-            ok = False
-        log.info(f"    {label}: {state} ({path})")
-    return ok
+    for line in got["lines"]:
+        log.info(line)
+    return bool(got["ok"])
 
 
 def _report_file_rows(args, config, input_dir, report, sigma_omega_h5_path, tensors_filename,
