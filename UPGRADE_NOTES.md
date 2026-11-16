@@ -46,6 +46,17 @@ What to change:
 - With `sigma_lorentz_debug_output = true` a bispinor one-shot also writes
   `sigma_lorentz_oneshot.h5`.
 
+## 2026-11-11 — A Gaunt-corrected UPF refuses a j-averaged V_NL
+
+A pseudopotential stamped by gaunt_pp (PP_INFO line "Modified by gaunt_pp
+on …: variant '…'") stores the frozen-core Gaunt term as a full $2\times2$
+$\Delta D$ per $(\ell, j)$ channel in PP_DIJ. The j-averaged V_NL reads only
+the diagonal of $D$ and would drop it, so `build_vnl_setup` now refuses that
+combination (`GATE gaunt_upf_j_averaged`) for every V_NL consumer (kin_ion,
+the dipole velocity, …). Run such a file j-resolved (QE `lspinorb = .true.`,
+nspinor 2), or use the original unstamped file. A j-resolved run prints one
+line naming the variant. Unstamped files are unchanged.
+
 ## 2026-11-11 — Bispinor runs: two-component charge, Pauli current
 
 With `bispinor = true`, every charge term (Hartree field, charge screening
