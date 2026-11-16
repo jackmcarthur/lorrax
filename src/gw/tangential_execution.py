@@ -865,10 +865,13 @@ def _mesh_eigh(mesh, n, backend):
     # (distrib_la resolve guard 1b) may not choose them again. The caller priced the mesh,
     # so the plan names its provider route (a room-0 decision would refuse).
     # Built price-only (room 0 with an 'auto' request is refused at construction), then
-    # pinned to its provider route, which no room decides.
+    # pinned to its provider route, which no room decides: the room is dropped, and a plan
+    # with 'auto' requested and no room takes its provider route for every stack
+    # (Plan.stack_route). Writing the resolved route name into requested_batched_route is
+    # refused by Plan.batched_route, whose grammar is auto|batch_reshard.
     p = distrib_la.plan('eigh', mesh, n=int(n), backend=backend, budget_bytes=0, price_only=True,
                         **({} if backend == 'auto' else dict(batched_route='auto')))
-    return dataclasses.replace(p, requested_batched_route=p.batched_route, price_only=False)
+    return dataclasses.replace(p, budget_bytes=None, price_only=False)
 
 
 def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):
