@@ -61,9 +61,9 @@ Derived: `nelec` (`max(ifmax)`), `vbm`, `cbm`, `efermi` (gap midpoint), all Ry; 
 ### Loading ψ {: #load }
 
 ```python
-loader.load(*, bands, k="full_bz", sharding=None, bispinor=False, bispinor_lift="raw") -> jax.Array
-loader.load_process_local(*, bands, k="full_bz", bispinor=False, bispinor_lift="raw") -> jax.Array
-loader.bands(b_lo, b_hi, *, chunk, k="full_bz", sharding=None, bispinor=False, bispinor_lift="raw")
+loader.load(*, bands, k="full_bz", sharding=None, bispinor=False, bispinor_lift=None) -> jax.Array
+loader.load_process_local(*, bands, k="full_bz", bispinor=False, bispinor_lift=None) -> jax.Array
+loader.bands(b_lo, b_hi, *, chunk, k="full_bz", sharding=None, bispinor=False, bispinor_lift=None)
 ```
 
 | Argument | Meaning |
@@ -71,8 +71,8 @@ loader.bands(b_lo, b_hi, *, chunk, k="full_bz", sharding=None, bispinor=False, b
 | `bands` | half-open `(b_lo, b_hi)` within `[0, nbands)`; empty or out-of-range raises `ValueError` |
 | `k` | a [`KSpec`](#kspec) |
 | `sharding` | output `PartitionSpec`. Default: `P(None, ('x','y'), None, None)` on a multi-device mesh, replicated otherwise |
-| `bispinor` | append the small components, $\psi_S=(\alpha/2)\,\boldsymbol\sigma\cdot(\bk+\bG)\,\psi_L$; requires `nspinor == 2`, output spinor axis 4 |
-| `bispinor_lift` | `"raw"` or `"normalized_rkb"`; anything but `"raw"` requires `bispinor=True` |
+| `bispinor` | append the lower components of the carrier `bispinor_lift` names; requires `nspinor == 2`, output spinor axis 4 |
+| `bispinor_lift` | required with `bispinor=True`, refused without it: `"raw"`, $\psi_S=(\alpha/2)\,\boldsymbol\sigma\cdot(\bk+\bG)\,\psi_L$ (current vertices), or `"large_block"`, $\psi_S=0$ (charge vertices); `common.four_current_model` names which |
 
 **`load`** returns the global array `(n_k, nb_padded, n_s, ngkmax)` complex128. **Collective**: every process requests the same window. The band axis is padded to a multiple of the device count on it; pad rows are zero. G pad columns past `ngk_valid` are zero.
 
@@ -126,7 +126,7 @@ loader.get_gvec_nk(ik) -> np.ndarray                         # (ngk[ik], 3), sto
 
 ```python
 loader.full_k_parent_groups(full_k=None) -> tuple[tuple[int, np.ndarray], ...]
-loader.unfold_parent_to_full_k(parent_psi, *, parent, full_k, bispinor=False, bispinor_lift="raw") -> jax.Array
+loader.unfold_parent_to_full_k(parent_psi, *, parent, full_k, bispinor=False, bispinor_lift=None) -> jax.Array
 loader.little_group_rows(parent) -> np.ndarray
 loader.unfold_parent_by_row(parent_psi, *, parent, row) -> (child, gvecs)
 loader.full_k_box_index_one_dev(full_k) -> jax.Array        # (1, ngkmax)
