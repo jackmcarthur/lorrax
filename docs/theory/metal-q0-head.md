@@ -246,30 +246,14 @@ $-2242/-1551$ without it, so $q^2\epsilon_\infty$ at the cell's
 $\operatorname{tr}Q=0.017$ bohr$^{-2}$ is comparable with $\kappa^2=2.33$ rather than
 12–17 times larger (claim 2862).
 
-The static fold of $\kappa^2$ is a Schur complement only when the head, the
-intraband wings $Y_\mu=-C\sum_{kn}w_{kn}u_{kn}(\mu)$ ($u=|\psi|^2$ at the
-centroids, $C=2/(N_kn_{\rm spin}n_{\rm spinor})$) and the Γ body are blocks of
-one negative-semidefinite static $\chi^0$. Each Fermi-surface state then
-enters as $-a_s[1/\sqrt\Omega;\,u_s][1/\sqrt\Omega;\,u_s]^{\sf T}$, $a_s=Cw_s$,
-so the body must carry the static intraband block
-$\chi_{FS}=-C\sum_{kn}w_{kn}u_{kn}u_{kn}^{\sf T}$, and the fold gives
-
-$$
-\kappa_{\rm eff}^2=\frac{8\pi}{\Omega}\,e^{\sf T}\big(a^{-1}+U^{\sf T}W_{\rm inter}U\big)^{-1}e
-\in(0,\kappa_{TF}^2],
-$$
-
-with $W_{\rm inter}$ the body screened by the interband $\chi^0$ alone and $U$ the
-columns $u_s$. A Γ body from $q=0$ pair sums has no diagonal pairs, hence no
-$\chi_{FS}$: folding the intraband wings through it gave
-$\kappa_{\rm eff}^2=-12.9$ bohr$^{-2}$ on bcc Fe $8^3$. The tangential route
-therefore folds through $W_{FS}=(I-W_{\rm inter}\chi_{FS})^{-1}W_{\rm inter}$
-(`qsgw_head.metal_static_gamma_body`), with $\chi_{FS}$ built from the operands
-of the row's own wings and $\kappa_{TF}^2$ (`qsgw_head.static_intraband_body_sharded`);
-the 3×3 interband fold of the static row takes the same body. An exact $z=0$
-row (the MPA route) folds through the static Matsubara body, whose diagonal
-pairs carry the Fermi–Dirac $-\partial f/\partial E$ rather than the
-tetrahedron weight.
+The static fold of $\kappa^2$ is a Schur complement only when head, wings
+$Y=-C\sum w_{kn}u_{kn}$ ($u=|\psi|^2$ at the centroids) and Γ body are blocks of
+one NSD static $\chi^0$, i.e. when the body carries
+$\chi_{FS}=-C\sum w_{kn}u_{kn}u_{kn}^{\sf T}$; then
+$\kappa_{\rm eff}^2=(8\pi/\Omega)\,e^{\sf T}(a^{-1}+U^{\sf T}W_{\rm inter}U)^{-1}e\in(0,\kappa_{TF}^2]$,
+$a=Cw$. A Γ body from $q=0$ pair sums has no $\chi_{FS}$ (bcc Fe $8^3$ gave
+$\kappa_{\rm eff}^2=-12.9$ bohr$^{-2}$), so the tangential route folds the static row
+through $(I-W\chi_{FS})^{-1}W$ (`qsgw_head.metal_static_gamma_body`).
 The four-current head solves the $4\times4$ Dyson equation
 $W_h=[1-\mathcal D(\mathbf q)(\Pi(\mathbf q,z)-C)]^{-1}\mathcal D(\mathbf q)$
 at every Sobol sample of the cell exterior and every point of the screened
