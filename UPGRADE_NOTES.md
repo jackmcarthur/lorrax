@@ -26,7 +26,7 @@ H₂⁻ stage bitwise against main at P4; Si 8³ QSGW identical to main through 
   kicked the loop: bcc Fe 4³ with `sc_head_update = off` cycled at 0.13–0.23 eV
   for 22 maps and now converges in 14; `dft_velocity` stalled at 4–5 meV for 31
   maps and now converges in 14; the hsuite Na loop converges in 17 maps to
-  $5\cdot10^{-4}$ eV (main: not converged after 40). Maps 0 and 1 of every run
+  $5\cdot10^{-4}$ eV (main stalls at a 0.31 eV residual floor and stops after 17). Maps 0 and 1 of every run
   are unchanged; later maps move where a state's classification changes.
 - **One static Γ body.** A metal's static (Thomas–Fermi) head row now takes the
   same Γ body on every route: the route's own body (tangential model at $z=0$,
