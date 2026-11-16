@@ -97,7 +97,7 @@ Frequency integration of $\Sigma^c$.
 ### `screening_diagrams` {: .kw data-type="enum" data-default="w_rpa" }
 Diagrams summed by $W$: the RPA Dyson series, the ladder-corrected resolvent, or the RPA resolvent.
 
-`w_bse` runs one-shot under `cohsex` and `gn_ppm` (and [one other W model](../../theory/multipole-w.md#sigma)) on a time-reversal-symmetric WFN; `w_rpa_resolvent` under `cohsex` and `gn_ppm` only. Both need an orbit-closed centroid set.
+`w_bse` runs one-shot under `cohsex` and `gn_ppm` (and [one other W model](../../theory/multipole-w.md#sigma)) on a time-reversal-symmetric WFN; `w_rpa_resolvent` under `cohsex` and `gn_ppm` only. Both need an orbit-closed centroid set. The ISDF tensor file keeps the RPA (0)$ that the ladder uses as its rung, not the ladder $, so a BSE run on that file screens its kernel with the RPA (0)$; the log of every reader says which $ it reads.
 {: .kw-details }
 
 `w_rpa` `w_bse` `w_rpa_resolvent`
@@ -133,7 +133,7 @@ A static rule that misses its target at the cap refuses. The GN probe and the ta
 ### `ladder_probe_chunk` {: .kw data-type="int" data-default="0" }
 Probe columns per block of the ladder solve (`w_bse`, `w_rpa_resolvent`).
 
-`0` solves one block; a positive value bounds memory and changes no value.
+`0` lets the code choose a bounded block width and check it against the memory room; a positive value is rounded up to a multiple of the process grid and changes no value.
 {: .kw-details }
 
 ### `sigma_w_support_sites_ev` {: .kw data-type="string" data-default="(empty)" }
