@@ -2203,7 +2203,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
     # refuses bispinor = true without the transverse bundle), never otherwise.
     setup = onsite_breit_setup_for(
         inputs.config, inputs.wfn, input_dir=inputs.input_dir,
-        tt_exchange=bool(inputs.config.bispinor))
+        tt_exchange=bool(inputs.config.bispinor) and bool(getattr(inputs.config, "bispinor_transverse_exchange", True)))
     if setup is not None:
         # P[k,a,n] = <phi~_a(k)|psi_nk>                           (DFT bands, full BZ)
         # D[a,b]   = sum_k w_k sum_i f_ik (P U)_ai conj((P U)_bi)  (U = <DFT_n|QP_i>, f of QP_i)
@@ -6912,7 +6912,8 @@ def run_sc_driver(
     # the per-run cached setup names it on the file.
     from .hartree import onsite_breit_setup_for
     onsite_setup = onsite_breit_setup_for(
-        config, wfn, input_dir=input_dir, tt_exchange=bool(config.bispinor))
+        config, wfn, input_dir=input_dir,
+        tt_exchange=bool(config.bispinor) and bool(getattr(config, "bispinor_transverse_exchange", True)))
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
         state_final, config=config, meta=meta, mesh_xy=mesh_xy,
         input_dir=input_dir, sym=sym,
