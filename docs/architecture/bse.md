@@ -527,12 +527,16 @@ max ε₂ off. The ε₂ prefactor is $16\pi^2/(V N_k n_\mathrm{spin} n_\mathrm{
 continued fraction is scaled by $\lVert d\rVert^2$, as in BerkeleyGW
 (`BSE/absh.f90`, `BSE/haydock.f90`).
 
-Per-state dipoles: `bse_jax the eigensolve full_bse = false spin_singlet = true write_eigenvectors N dipole_file
-dipole.h5` contracts each written eigenvector with the dipole
+Per-state dipoles: `bse_jax the eigensolve write_eigenvectors N dipole_file
+dipole.h5` contracts each eigenvector with the dipole
 (`absorption_common.exciton_dipoles_distributed`, blocked over each rank's own
 eigenvector tile) and stores $\langle 0|\hat r_\alpha|S\rangle$ as
-`exciton_data/dipoles`, shape (1, N, 3, 2), in bohr. Flag rules:
-[drivers](../drivers.md#bse-bsebse_jax).
+`exciton_data/dipoles`, shape (1, N, 3, 2), in bohr. Under `full_bse = true`
+the paired $(X, Y)$ ($X^\dagger X - Y^\dagger Y = 1$) enters as
+$\sum_t X_t d^*_t - Y_t d_t$: the coupling block's exchange term
+$K^x_B = M V M^T$ pairs $Y$ with the conjugate pair density
+(`absorption_common.exciton_dipole_projections`; the f-sum rule is the test).
+Flag rules: [drivers](../drivers.md#bse-bsebse_jax).
 
 In-plane helicity: `helicity_table` adds each written state's circular
 strengths to `bse.out` (`absorption_common.inplane_helicity`, the one place

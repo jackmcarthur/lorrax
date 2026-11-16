@@ -283,18 +283,19 @@ def write_eigenvectors_stream(
     # eigenvalues in eV (BSE/diag.f90's write path; ``eigenvalues.dat``'s
     # header says "eig (eV)") and our solvers return Ry — convert here.
     #
-    # ``dipoles`` (optional, TDA only): the host ``(n_write, 3)`` per-state
-    # ⟨0|r̂_α|S⟩ from ``absorption_common.exciton_dipoles_distributed``, written
-    # beside the eigenvectors as ``exciton_data/dipoles`` (1, n_write, 3, 2) —
-    # a LORRAX extension BGW readers ignore (``eigenvectors.h5.spec``).
+    # ``dipoles`` (optional): the host ``(n_write, 3)`` per-state ⟨0|r̂_α|S⟩
+    # from ``absorption_common.exciton_dipoles_distributed`` (TDA: X; full
+    # BSE: both halves, Σ X conj(d) − Σ Y d), written beside the eigenvectors
+    # as ``exciton_data/dipoles`` (1, n_write, 3, 2) — a LORRAX extension BGW
+    # readers ignore (``eigenvectors.h5.spec``).
     # ``dipole_attrs`` (optional) are written as that dataset's attributes:
     # a kgrid_fine run stamps where its dipoles came from.
     RYD2EV = 13.6056980659
     if dipoles is not None:
         dipoles = np.asarray(dipoles)
-        if not use_tda or dipoles.shape != (int(n_write), 3):
+        if dipoles.shape != (int(n_write), 3):
             raise ValueError(
-                f"write_eigenvectors_stream: dipoles must be the TDA per-state "
+                f"write_eigenvectors_stream: dipoles must be the per-state "
                 f"(n_write, 3) = ({int(n_write)}, 3) array; got shape "
                 f"{dipoles.shape} with use_tda={use_tda}")
     # ``gather_to_host``, not ``device_get``: see the ONE-writer note below for

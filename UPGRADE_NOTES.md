@@ -5,6 +5,33 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-17 — Full-BSE oscillator strengths: `full_bse = true` takes `dipole_file`
+
+`full_bse = true` with `dipole_file` is no longer refused. Each state's
+⟨0|r|S⟩ now takes both halves of the paired eigenvector,
+Σ_t X_t conj(d_t) − Y_t d_t with X†X − Y†Y = 1
+(`manual/docs/drivers/bse/theory.md` Eq. 5.2), and a full-BSE run writes
+what a TDA run writes: the dipole columns of `eigenvalues_b*.dat`,
+`absorption_eh.dat` / `absorption_noeh.dat`, `exciton_data/dipoles` in its
+`eigenvectors.h5`, and `helicity_table`. The spectrum sums the positive
+roots, as under the TDA. `haydock` still needs the TDA.
+
+- **Results.** No TDA result moves: the TDA contraction is unchanged, and a
+  paired vector with Y = 0 reproduces it bit for bit. On the full BSE the
+  real product route now returns pairs that are Σ-orthonormal inside a
+  degenerate multiplet, and it is taken only when H is real (A and B both
+  real); a complex A with a real or zero B takes the definite pencil, where
+  the product reduction did not hold. The full-BSE eigenvectors come back
+  replicated on the solve mesh, as the TDA's do; `eigenvectors.h5` is
+  unchanged.
+- **Files.** `absorption_common.load_eigenvectors_h5` still refuses a
+  full-BSE file (its consumers, TD-aGW and `dump_window_dipoles`, read X
+  alone); the message names `exciton_data/dipoles`.
+- **Decks.** No change.
+- **Test.** `tests/test_bse_full_dipoles_cpu.py`: B = 0 equals the TDA, the
+  f-sum rule with the local-field kernel, equal strength of the ±Ω partner
+  roots, the mesh route, the real product route.
+
 ## 2026-11-16 — a metal's static head row folds through a Γ body with its intraband block
 
 On the tangential route a metal's static (Thomas–Fermi) head row folded the

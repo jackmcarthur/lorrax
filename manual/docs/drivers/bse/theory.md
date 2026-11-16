@@ -350,13 +350,21 @@ The denominator uses the dipole file's own band energies, so `eqp_corrections` c
 `absorption_common.exciton_dipole_projections`
 {: .in-code }
 
-`dipole_file` contracts each written TDA eigenvector with the window's dipoles,
+`dipole_file` contracts each computed eigenvector with the window's dipoles; under `full_bse` both halves of the pair of Eq. (2.3) enter,
 
 $$
-d^\alpha_S = \sum_{cv\bk} A^S_{cv\bk}\, d^{\alpha*}_{cv\bk} = -i\,\langle 0|\hat r_\alpha|S\rangle \tag{5.2}
+d^\alpha_S = \sum_{cv\bk} \left( X^S_{cv\bk}\, d^{\alpha*}_{cv\bk} - Y^S_{cv\bk}\, d^{\alpha}_{cv\bk} \right) = -i\,\langle 0|\hat r_\alpha|S\rangle \tag{5.2}
 $$
 
-Only $|d^\alpha_S|^2$ enters $\varepsilon_2$, and per-state dipoles exist for TDA states only.
+with $X^S = A^S$ and $Y^S = 0$ under the TDA. The exchange term of $B$ pairs $Y$ with the conjugate pair density, so the transition density of $|S\rangle$ is $\sum_t (X^S_t \rho_t + Y^S_t \rho^*_t)$ with $\rho_t = \psi_{c\bk}\psi^*_{v\bk}$, and $\langle c\bk|\hat r_\alpha|v\bk\rangle = -i\,d^\alpha_{cv\bk}$ gives the de-excitation its $-Y^S d^\alpha$. The left eigenvector is $(X^S, -Y^S)$, so the left and right dipoles coincide and only $|d^\alpha_S|^2$ enters $\varepsilon_2$.
+
+With $X^{S\dagger}X^S - Y^{S\dagger}Y^S = 1$ the roots $\pm\Omega_S$ resolve the identity, and the first moment is
+
+$$
+\sum_S \Omega_S\, |d^\alpha_S|^2 = d^{\alpha\dagger} A\, d^\alpha + \mathrm{Re}\left( d^{\alpha\dagger} B\, d^{\alpha*} \right) \tag{5.2a}
+$$
+
+With the local-field kernel alone (`local_fields`) on a time-reversal-symmetric window the kernel terms cancel and the sum is the window's $\sum_{cv\bk} \Delta E_{cv\bk}\, |d^\alpha_{cv\bk}|^2$, the f-sum rule. The TDA misses it by $d^{\alpha\dagger} K^x d^\alpha$; the screened term $W$ breaks it on both routes.
 
 ### <span class="n">5.3</span> Spectrum {: #abs-eps }
 
@@ -369,7 +377,7 @@ $$
 \varepsilon^\alpha_2(\omega) = \kappa\sum_S |d^\alpha_S|^2\, L_\eta(\omega - \Omega_S), \qquad L_\eta(x) = \frac{\eta/\pi}{x^2 + \eta^2}, \qquad \kappa = \frac{16\pi^2}{\Omega_{\mathrm{cell}}\, N_k\, n_{\mathrm{spin}}\, n_{\mathrm{spinor}}} \tag{5.3}
 $$
 
-with $N_k$ the BSE grid and $\eta$ = `energy_resolution`. For spinors $\kappa = 8\pi^2/(\Omega_{\mathrm{cell}} N_k)$.
+with $N_k$ the BSE grid and $\eta$ = `energy_resolution`. For spinors $\kappa = 8\pi^2/(\Omega_{\mathrm{cell}} N_k)$. Under `full_bse` the sum runs over the positive roots; the mirror pole at $-\Omega_S$, of equal weight, is left out, as under the TDA and in BerkeleyGW.
 
 ### <span class="n">5.4</span> Haydock continued fraction {: #abs-haydock }
 

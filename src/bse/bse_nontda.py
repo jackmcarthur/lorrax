@@ -51,8 +51,11 @@ Structure-preserving reduction, dispatched on B's symmetry:
   Solved densely here for parity; used by the real-symmetric gate.
 
 Eigenvectors: normalised (X, Y) pairs with the standard ``X^H X - Y^H Y = +1``
-convention, stacked ``(n_eig, 2, nc, nv, nk)`` and wired to
-``bse_io.write_eigenvectors_stream`` (use_tda=0, honest).
+convention (Sigma-orthonormal inside a degenerate multiplet too), stacked
+``(n_eig, 2, nc, nv, nk)`` replicated on the solve mesh, and wired to
+``bse_io.write_eigenvectors_stream`` (use_tda=0, honest) and to the per-state
+dipoles ``<0|r|S> = sum_t X_t conj(d_t) - Y_t d_t``
+(``absorption_common.exciton_dipole_projections``).
 
 WHAT CHANGED 2026-08-08 (this header used to describe only the dense route)
 ---------------------------------------------------------------------------
@@ -350,10 +353,22 @@ def solve_nontda_definite_pencil(A, B, n_eig, *, pd_rtol=1e-10):
 
 
 def solve_nontda_product(A, B, n_eig):
-    """Real-BSE product reduction (dense): omega^2 = eig((A-B)(A+B)); recover X,Y.
+    """Real-BSE product reduction (dense): omega^2 from (A-B)(A+B); recover X, Y.
 
-    Correct when (A +- B) are Hermitian PD (real / RPA case).  Reference for the
-    matrix-free (A+B)-metric Lanczos over ``make_ab_appliers`` (follow-on)."""
+    Correct when H is real (A and B real symmetric, so (A +- B) are real
+    symmetric PD: the RPA / real-orbital case).  Reference for the
+    matrix-free (A+B)-metric Lanczos over ``make_ab_appliers`` (follow-on).
+
+    The product is solved in its symmetric form,
+    ``S (A-B) S t = omega^2 t`` with ``S = (A+B)^{1/2}``, by ``eigh``: the
+    ``t`` are orthonormal also inside a degenerate multiplet, so
+    ``u = omega^{1/2} S^{-1} t`` and ``w = S t / omega^{1/2}`` give
+    ``X = (u + w)/2``, ``Y = (u - w)/2`` with
+    ``X_i^H X_j - Y_i^H Y_j = delta_ij`` (a general ``eig`` of the
+    non-symmetric product returns an arbitrary basis of a degenerate
+    eigenspace, and each state's oscillator strength then carries the
+    multiplet's cross terms).  Returns ``(omega (n_eig,), Z (2N, n_eig))`` as
+    :func:`solve_nontda_definite_pencil` does."""
     A = np.asarray(A); B = np.asarray(B); N = A.shape[0]
     ApB, AmB = A + B, A - B
     for nm, C in (("A+B", ApB), ("A-B", AmB)):
@@ -361,17 +376,27 @@ def solve_nontda_product(A, B, n_eig):
         if wc.min() <= 0:
             raise ValueError(f"non-TDA product form: ({nm}) not positive definite "
                              f"(min eig {wc.min():.3e}); triplet instability.")
-    mu, U = np.linalg.eig(AmB @ ApB)
-    idx = np.argsort(mu.real)[:n_eig]
-    omega = np.sqrt(np.clip(mu[idx].real, 0.0, None))
-    Z = np.zeros((2 * N, n_eig), dtype=np.complex128)
-    for j, i in enumerate(idx):
-        u = U[:, i]
-        u = u * np.sqrt(omega[j] / np.real(u.conj() @ (ApB @ u)))
-        w_ = (ApB @ u) / omega[j]
-        Z[:N, j], Z[N:, j] = 0.5 * (u + w_), 0.5 * (u - w_)
-    order = np.argsort(omega)
-    return omega[order], Z[:, order]
+    wp, Up = np.linalg.eigh(0.5 * (ApB + ApB.conj().T))
+    S = (Up * np.sqrt(wp)) @ Up.conj().T                          # (A+B)^{1/2}
+    S_inv = (Up / np.sqrt(wp)) @ Up.conj().T
+    M = S @ AmB @ S
+    mu, T = np.linalg.eigh(0.5 * (M + M.conj().T))               # mu = omega^2, ascending
+    omega = np.sqrt(np.clip(mu[:n_eig], 0.0, None))
+    T = T[:, :n_eig]
+    u = (S_inv @ T) * np.sqrt(omega)[None, :]
+    w_ = (S @ T) / np.sqrt(omega)[None, :]
+    Z = np.concatenate([0.5 * (u + w_), 0.5 * (u - w_)], axis=0).astype(np.complex128)
+    return omega, Z
+
+
+def _h_is_real(A, B, *, tol=1e-6) -> bool:
+    """True when ``H = [[A, B], [-B*, -A*]]`` is real to ``tol`` (relative to
+    ``||A||``): the one case the product reduction holds.  A complex-Hermitian
+    ``A`` with a real ``B`` (or ``B = 0``) is not that case: ``A* != A``
+    couples ``Y`` through ``A*``, and the pencil is the route."""
+    scale = max(np.linalg.norm(A), 1e-300)
+    return (np.linalg.norm(np.imag(A)) / scale < tol
+            and np.linalg.norm(np.imag(B)) / scale < tol)
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +547,10 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
 
     Returns ``(eigenvalues_Ry (n_eig,), eigenvectors (n_eig, 2, nc, nv, nk),
     n_iter)`` matching the TDA ``solve_bse_sharded`` tuple; the pair axis carries
-    (X, Y) with ``X^H X - Y^H Y = +1``.
+    (X, Y) with ``X^H X - Y^H Y = +1``, and the eigenvectors are a replicated
+    array on ``mesh_xy`` (the TDA routes' layout).  The real product route is
+    taken only when H itself is real (``_h_is_real``); everything else,
+    ``B = 0`` with a complex ``A`` included, takes the definite pencil.
 
     ``recip_tol`` is the restart preflight's threshold on
     ``max|W(q) - conj(W(-q))| / max|W|`` (:func:`check_restart_reciprocity`);
@@ -569,13 +597,26 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
             tol_mev=mf_tol_mev, log=_log0)
         evecs = np.stack([Z[:N, :].T.reshape(n_eig, nc, nv, nk),
                           Z[N:, :].T.reshape(n_eig, nc, nv, nk)], axis=1)
-        return jnp.asarray(omega), jnp.asarray(evecs), jnp.int32(0)
+        return jnp.asarray(omega), _on_mesh(evecs, mesh_xy), jnp.int32(0)
     A, B = _materialize_A_B(pair, args, sh, nc, nv, nk)
-    b_herm = np.linalg.norm(B - B.conj().T) / max(np.linalg.norm(B), 1e-300)
-    if b_herm < 1e-6:
+    if _h_is_real(A, B):
         omega, Z = solve_nontda_product(A, B, n_eig)           # real / RPA
     else:
         omega, Z = solve_nontda_definite_pencil(A, B, n_eig)   # optical spinor
     evecs = np.stack([Z[:N, :].T.reshape(n_eig, nc, nv, nk),
                       Z[N:, :].T.reshape(n_eig, nc, nv, nk)], axis=1)
-    return jnp.asarray(omega), jnp.asarray(evecs), jnp.int32(0)
+    return jnp.asarray(omega), _on_mesh(evecs, mesh_xy), jnp.int32(0)
+
+
+def _on_mesh(evecs, mesh_xy):
+    """The host ``(n_eig, 2, nc, nv, nk)`` pairs as a replicated array on the
+    solve mesh, the layout the TDA routes return (``bse_lanczos`` pins
+    Davidson to it), so the dipole contraction
+    (``absorption_common.exciton_dipoles_distributed``) and the eigenvector
+    writer read both routes through one path.  Every process holds the same
+    host array (the dense solve runs on every process), and each puts it on its
+    own devices: no collective."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from lxkit import device_put_process_local
+    return device_put_process_local(np.asarray(evecs, dtype=np.complex128),
+                                    NamedSharding(mesh_xy, P()))

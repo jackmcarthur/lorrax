@@ -48,7 +48,7 @@ Optional
 **Kernel and spin**
 
 ### `full_bse` {: .kw data-type="bool" data-default="false" }
-Solve the full $\begin{pmatrix}A&B\\-B^*&-A^*\end{pmatrix}$ problem. Off: the Tamm–Dancoff resonant block $A$, as in BerkeleyGW. `dipole_file`, the spectra and the Haydock recursion need the TDA.
+Solve the full $\begin{pmatrix}A&B\\-B^*&-A^*\end{pmatrix}$ problem. Off: the Tamm–Dancoff resonant block $A$, as in BerkeleyGW. With `dipole_file` the per-state dipoles take both halves of the paired eigenvector ([Theory](theory.md#abs-ds)) and the spectra are written as under the TDA; the Haydock recursion needs the TDA.
 
 ### `spin_singlet`, `spin_triplet` {: .kw data-type="bool" data-default="singlet" }
 Non-spinor WFN only: the singlet kernel $D + 2V - W$ (default) or the triplet kernel $D - W$. BerkeleyGW: `spin_singlet`, `spin_triplet`.
@@ -168,7 +168,7 @@ Davidson internals: the preconditioner diagonal (`exact`, `bare`, `auto`), extra
 **Dipoles, spectra and output files**
 
 ### `dipole_file` {: .kw data-type="path" data-default="—" }
-`dipole.h5` (`psp.get_dipole_mtxels`), relative to the input file. With it, and the TDA, each state's $\langle 0\lvert\hat r\rvert S\rangle$ goes to `eigenvalues_b1.dat`…`_b3.dat` (`eigenvalues.dat` along an input file `polarization`), the spectra below are written, and the Haydock recursion is seeded. Under `kgrid_fine` it is the coarse WFN's file, carried through the band interpolation.
+`dipole.h5` (`psp.get_dipole_mtxels`), relative to the input file. With it each state's $\langle 0\lvert\hat r\rvert S\rangle$ (under `full_bse` from both halves of $(X^S, Y^S)$) goes to `eigenvalues_b1.dat`…`_b3.dat` (`eigenvalues.dat` along an input file `polarization`), the spectra below are written, and on the TDA the Haydock recursion is seeded. Under `kgrid_fine` it is the coarse WFN's file, carried through the band interpolation.
 
 ### `use_momentum`, `use_velocity` {: .kw data-type="bool" data-default="—" }
 BerkeleyGW's operator choice, checked against `dipole_file`'s `skip_vnl` stamp. LORRAX chooses the operator when the dipole file is made: `psp.get_dipole_mtxels --skip-vnl` is the momentum $p$ alone, the default is the velocity $p + i[V_{\mathrm{NL}}, r]$.

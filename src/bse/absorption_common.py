@@ -33,7 +33,7 @@ log = get_logger(__name__)
 RYD2EV = RYD_TO_EV
 
 
-def exciton_dipole_projections(A, d_alpha):
+def exciton_dipole_projections(A, d_alpha, Y=None):
     """⟨0|r̂_α|S⟩ — THE contraction of a BSE eigenvector against the dipole.
 
     THIS IS THE SINGLE SITE.  Every absorption driver that owns explicit
@@ -86,20 +86,47 @@ def exciton_dipole_projections(A, d_alpha):
     bare ``d``: ``Σ_t A_t d_t`` is a different number in modulus too,
     measured at up to 6.8× per element on the committed fixtures.
 
+    THE FULL (NON-TDA) EQUATION.  ``full_bse = true`` returns the paired
+    ``(X, Y)`` of ``[[A, B], [-B*, -A*]] (X, Y) = Ω (X, Y)``, normalised
+    ``X†X − Y†Y = 1`` (``bse_nontda``).  The coupling block's exchange term
+    is ``K^x_B = M V M^T`` (``bse_stack_matvec``, the bare vertex on the
+    encode leg), so ``Y`` multiplies the CONJUGATE pair density: the
+    transition density of ``|S⟩`` is ``Σ_t (X_t ρ_t + Y_t ρ_t*)`` with
+    ``ρ_t = ψ_c conj(ψ_v)``.  With ``⟨vk|r̂|ck⟩ = i conj(d_t)`` and
+    ``⟨ck|r̂|vk⟩ = −i d_t``,
+
+        ``⟨0|r̂_α|S⟩ = i [ Σ_t X^S_t conj(d^α_t) − Σ_t Y^S_t d^α_t ]``,
+
+    and this function returns the bracket (the TDA's phase convention, so
+    ``Y = 0`` reproduces the TDA bit for bit).  The second term is the first
+    with the de-excitation's dipole ``−conj(d)``, BerkeleyGW's
+    ``s_(c→v) = −conj(s_(v→c))`` (``BSE/diag.f90:722-731``); its sign is what
+    the f-sum rule tests (``tests/test_bse_full_dipoles_cpu.py``): with the
+    local-field kernel alone and time reversal,
+    ``Σ_S Ω_S |⟨0|r̂|S⟩|² = Σ_t ΔE_t |d_t|²`` holds for this sign and fails
+    for the other.  The left eigenvector is ``(X, −Y)`` (the σ_z metric), so
+    left and right dipoles coincide and the oscillator strength is the
+    modulus squared, as under the TDA.
+
     Parameters
     ----------
     A : (N, *T) complex
-        Eigenvectors.  Leading axis is the state; the trailing axes are
-        the transition block in whatever order the caller holds it.
+        Eigenvectors (the resonant ``X`` of a paired solve).  Leading axis
+        is the state; the trailing axes are the transition block in
+        whatever order the caller holds it.
     d_alpha : (3, *T) complex
         Dipole ``d^α_t``, with the SAME trailing transition axes as ``A``
         (the two drivers hold them in different orders — ``(nk, nc, nv)``
         and ``(nc, nv, nk)`` — and this function is layout-agnostic
         precisely so neither has to reshape at the call site).
+    Y : (N, *T) complex, optional
+        The coupling half of a full-BSE eigenvector, on ``A``'s axes.
+        ``None`` (the TDA) drops the second term.
 
     Returns
     -------
-    (N, 3) complex128 — ⟨0|r̂_α|S⟩ per state, per polarisation.
+    (N, 3) complex128 — ⟨0|r̂_α|S⟩ per state, per polarisation, up to the
+    common factor ``i`` (``manual/docs/drivers/bse/theory.md`` Eq. 5.2).
 
     DISTRIBUTED OPERANDS.  When ``A`` or ``d_alpha`` is a ``jax.Array`` (the
     solver's eigenvectors, sharded over the transition axes) the same
@@ -107,25 +134,36 @@ def exciton_dipole_projections(A, d_alpha):
     contracts its own (c, v, k) tile and one all-reduce of the (N, 3) result
     follows.  Nothing is gathered, and the result stays a ``jax.Array``.
     """
-    if not (_is_jax_array(A) or _is_jax_array(d_alpha)):
+    distributed = any(_is_jax_array(a) for a in (A, d_alpha, Y))
+    if not distributed:
         A = np.asarray(A)
         d_alpha = np.asarray(d_alpha)
+        Y = None if Y is None else np.asarray(Y)
     if A.shape[1:] != d_alpha.shape[1:]:
         raise ValueError(
             f"eigenvector transition axes {A.shape[1:]} do not match the "
             f"dipole's {d_alpha.shape[1:]}.  Both must be indexed over the "
             f"same (c, v, k) block in the same order; a transpose here is a "
             f"silently wrong oscillator strength, not a broadcast.")
-    if _is_jax_array(A) or _is_jax_array(d_alpha):
+    if Y is not None and Y.shape != A.shape:
+        raise ValueError(
+            f"coupling half Y {Y.shape} does not match the resonant half "
+            f"X {A.shape}: both halves of a paired eigenvector share one "
+            f"transition block")
+    if distributed:
         import jax.numpy as jnp
         axes = tuple(range(1, A.ndim))
-        return jnp.tensordot(A, jnp.conj(d_alpha), axes=(axes, axes)
-                             ).astype(jnp.complex128)
+        out = jnp.tensordot(A, jnp.conj(d_alpha), axes=(axes, axes))
+        if Y is not None:
+            out = out - jnp.tensordot(Y, d_alpha, axes=(axes, axes))
+        return out.astype(jnp.complex128)
     n_state = A.shape[0]
     n_trans = int(np.prod(A.shape[1:])) if A.ndim > 1 else 1
-    return (A.reshape(n_state, n_trans)
-            @ np.conj(d_alpha.reshape(d_alpha.shape[0], n_trans)).T
-            ).astype(np.complex128)
+    d_flat = d_alpha.reshape(d_alpha.shape[0], n_trans)
+    out = A.reshape(n_state, n_trans) @ np.conj(d_flat).T
+    if Y is not None:
+        out = out - Y.reshape(n_state, n_trans) @ d_flat.T
+    return out.astype(np.complex128)
 
 
 def _is_jax_array(x) -> bool:
@@ -143,10 +181,13 @@ def exciton_dipoles_distributed(eigenvectors, d_block, n_states: int):
     """⟨0|r̂_α|S⟩ for the first ``n_states`` rows of the solver's eigenvectors.
 
     ``eigenvectors`` : ``(N, 1, nc_pad, nv_pad, nk)`` (TDA, as the BSE solves
-    return them) or ``(N, nc_pad, nv_pad, nk)``, a ``jax.Array`` sharded over
-    the transition axes.  ``d_block`` : ``(3, nc_pad, nv_pad, nk)``, the
-    ``build_dipole_vector_bse`` layout on the same transition axes (pad rows
-    are zero in both, so they add nothing).
+    return them), ``(N, 2, nc_pad, nv_pad, nk)`` (the full BSE's paired
+    ``(X, Y)``, ``X†X − Y†Y = 1``) or ``(N, nc_pad, nv_pad, nk)``, a
+    ``jax.Array`` on the solve mesh.  ``d_block`` : ``(3, nc_pad, nv_pad,
+    nk)``, the ``build_dipole_vector_bse`` layout on the same transition axes
+    (pad rows are zero in both, so they add nothing).  A paired vector takes
+    both halves, ``Σ_t X_t conj(d_t) − Σ_t Y_t d_t``
+    (:func:`exciton_dipole_projections`).
 
     The contraction is :func:`exciton_dipole_projections` applied to blocks of
     states, a batched GEMM on each rank's (c, v, k) tile plus one (block, 3)
@@ -164,11 +205,12 @@ def exciton_dipoles_distributed(eigenvectors, d_block, n_states: int):
     from common.collectives import gather_to_host
     from common.gpu_utils import device_budget_bytes
 
-    tda_axis = eigenvectors.ndim == 5
-    if tda_axis and int(eigenvectors.shape[1]) != 1:
-        raise NotImplementedError(
-            "exciton dipoles are TDA-only: the full-BSE oscillator strength "
-            "needs both halves of the paired vector (see load_eigenvectors_h5)")
+    pair_axis = eigenvectors.ndim == 5
+    paired = pair_axis and int(eigenvectors.shape[1]) == 2
+    if pair_axis and int(eigenvectors.shape[1]) not in (1, 2):
+        raise ValueError(
+            f"eigenvectors {tuple(eigenvectors.shape)}: the pair axis holds X "
+            f"(TDA, 1) or (X, Y) (full BSE, 2)")
     n_states = int(n_states)
     sharding = eigenvectors.sharding
     local = sharding.shard_shape(eigenvectors.shape)
@@ -190,7 +232,10 @@ def exciton_dipoles_distributed(eigenvectors, d_block, n_states: int):
         # stack is ever made; one compile per distinct (i0, size).
         def contract(A, d):
             A = jax.lax.slice_in_dim(A, i0, i0 + size, axis=0)
-            return exciton_dipole_projections(A[:, 0] if tda_axis else A, d)
+            if not pair_axis:
+                return exciton_dipole_projections(A, d)
+            return exciton_dipole_projections(A[:, 0], d,
+                                              Y=A[:, 1] if paired else None)
         return jax.jit(contract, in_shardings=(sharding, d_sharding),
                        out_shardings=out_sharding)
 
@@ -255,8 +300,9 @@ def load_eigenvectors_h5(path: str | Path):
     layout, written by ``bse_window.write_eigenvectors_stream`` too); this
     reader only ever returned the first.  Reading a non-TDA file and
     contracting ``X`` alone gives the TDA answer for a non-TDA solve,
-    which is wrong by the whole anti-resonant channel — see the
-    ``NotImplementedError`` below for the contraction it would need.
+    which is wrong by the whole anti-resonant channel.  The full-BSE
+    per-state dipoles, contracted from both halves, are the file's
+    ``exciton_data/dipoles`` (:func:`load_exciton_dipoles_h5`).
     ``kpts`` is BerkeleyGW's ``(nk, 3)``.
     """
     with h5py.File(str(path), "r") as f:
@@ -265,19 +311,16 @@ def load_eigenvectors_h5(path: str | Path):
         use_tda = bool(int(f["exciton_header/params/use_tda"][()]))
         if not use_tda:
             raise NotImplementedError(
-                f"{path!s} is a NON-TDA eigenvector file (use_tda = 0), and the "
-                f"sum-over-states absorption route is TDA-only.\n"
-                f"The full-BSE oscillator strength is NOT |Σ_t X_t conj(d_t)|²: "
-                f"it needs both halves of the paired vector and both the left "
-                f"and right solutions,\n"
-                f"    ⟨0|r|S⟩_r = Σ_t X^S_t conj(d_t) − Σ_t Y^S_t d_t\n"
-                f"    ⟨0|r|S⟩_l = Σ_t X̃^S_t conj(d_t) + Σ_t Ỹ^S_t d_t\n"
-                f"    f_S       = Re[ conj(⟨0|r|S⟩_l) · ⟨0|r|S⟩_r ]\n"
-                f"(the anti-resonant dipole is −conj(d) because "
-                f"s_(c→v) = −conj(s_(v→c)), BerkeleyGW BSE/diag.f90:722-731), "
-                f"and no driver in this tree assembles it yet.  Solve with "
-                f"full_bse = false, or add the coupling contraction before reading this "
-                f"file for absorption.")
+                f"{path!s} is a NON-TDA eigenvector file (use_tda = 0): this "
+                f"reader returns the resonant amplitudes X alone, which its "
+                f"consumers (TD-aGW, dump_window_dipoles) contract as TDA "
+                f"states.  For a full-BSE solve that is wrong by the whole "
+                f"anti-resonant channel: the oscillator strength is "
+                f"|Σ_t X^S_t conj(d_t) − Σ_t Y^S_t d_t|² (the de-excitation's "
+                f"dipole is −conj(d), BerkeleyGW BSE/diag.f90:722-731).  The "
+                f"file's exciton_data/dipoles holds exactly that "
+                f"(load_exciton_dipoles_h5); for X-amplitude consumers solve with "
+                f"full_bse = false.")
         spin_kernel = int(f["exciton_header/params/spin_kernel"][()])
         params = {
             "nc": int(f["exciton_header/params/nc"][()]),
@@ -709,7 +752,11 @@ def write_state_spectra(*, energies_Ry, exciton_dipoles, d_alpha, de_cv,
     ε₂(ω) = 16π²/(V N_k n_spinor) Σ_S |ê·⟨0|r|S⟩|² δ(ω − Ω_S) over the computed
     states (eh) and Σ_cvk |ê·d_cvk|² δ(ω − ΔE_cvk) over the window's
     transitions (noeh), the prefactor ``jdos_from_transitions`` and the Haydock
-    route use; δ is a Gaussian of standard deviation ``width_eV`` or a
+    route use.  Under ``full_bse`` the states are the positive roots Ω_S and
+    ⟨0|r|S⟩ takes both halves of the paired vector
+    (:func:`exciton_dipole_projections`); the mirror pole at −Ω_S, of equal
+    weight, is left out on both routes, as BerkeleyGW does, so a coupling
+    block B = 0 writes the TDA's file.  δ is a Gaussian of standard deviation ``width_eV`` or a
     Lorentzian of half width ``width_eV`` (``kind``).  ε₁ by Kramers-Kronig on
     the grid.  Column 4 is the density of the computed exciton states (eh) or of
     the transitions (noeh), per eV.  One pair of files per direction:
