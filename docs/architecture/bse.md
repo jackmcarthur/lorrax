@@ -839,13 +839,25 @@ left (`bse.w_ladder.ResolventProgress`; the first block carries the compile).
 
 `GATE w_bse_requires_measured_trs` (`gw.screening.refuse_w_bse_without_trs`)
 refuses `w_bse` whenever the measured verdict `SymMaps.trs_allowed` is false,
-before any basis, ζ or V. The verdict is measured from the occupied DFT
-subspaces of the WFN (`WfnLoader.trs_holds`), not read from a deck key. It
-therefore excludes every reference whose mean field breaks time reversal:
-ferromagnets and antiferromagnets, collinear or noncollinear, with or without
-spin–orbit coupling (NiO, NiCl$_2$, CrCl$_3$, CrI$_3$ among the project's
-systems), and any spin-polarized WFN whose occupied spin channels are not
-time-reversal images. The tangential adapter repeats the check on the bank
+before any basis, ζ or V. The verdict is `WfnLoader.trs_holds`, not a deck
+key. On a two-component WFN it needs an authenticated Quantum ESPRESSO
+`data-file-schema.xml` beside the WFN
+(`symmetry_maps.density_symmetry_check.qe_trs_off_reason`): it is false when
+QE records an operation composed with time reversal, when the SCF absolute
+magnetization is not below its tolerance, and also when no schema is found
+or none matches, because `WFN.h5` alone does not say whether a spinor
+reference is magnetic. The gate therefore excludes two classes:
+
+1. every reference whose mean field breaks time reversal: ferromagnets and
+   antiferromagnets, collinear or noncollinear, with or without spin–orbit
+   coupling (NiO, NiCl$_2$, CrCl$_3$, CrI$_3$ among the project's systems);
+2. a nonmagnetic spinor WFN that reached the run directory without its
+   schema. Si 4³ with spin–orbit coupling, copied as `WFN.h5` alone, logs
+   `[2c-TRS] WFN.h5: BROKEN (qe-magnetic, … no evidence)` and `w_bse` refuses
+   within seconds. Link `data-file-schema.xml` and the SCF `.save` beside the
+   WFN (manual, Inputs from DFT, "Symmetry record") and the same WFN runs.
+
+The tangential adapter repeats the check on the bank
 (`GATE ladder_tangential_representation`). What remains available on those
 references: `w_rpa` (every route) and `w_rpa_resolvent` (COHSEX, GN-PPM; it
 has no time-reversal gate). The refusal text names the pair gauge of the
