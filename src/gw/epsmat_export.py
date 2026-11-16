@@ -560,6 +560,12 @@ def open_export_source(cfg, mesh, *, print_fn=None, require_w0=True):
             _refuse("epsmat_requires_w0", f"{bundle} without a ready W0_qmunu",
                     "a GW bundle with persisted static W", "ε⁻¹ is built from W(0)",
                     "rerun the producer with write_restart_tensors = true")
+    if w0_ready:
+        # epsmat.h5 is BerkeleyGW's RPA epsilon: only an RPA-series W0 may be
+        # written into it, and the log says which W Sigma used (a w_bse run
+        # stores its RPA rung, not its ladder W).
+        from file_io.restart_bundle import require_w0_series
+        require_w0_series(bundle, "w_rpa", consumer="the epsmat export (an RPA epsilon)")
         storage = str(f["V_qmunu"].attrs.get("q_storage", "full"))
         q_stored = (np.asarray(f["V_qmunu__qirr/q_irr_frac"][()]) if storage == "ibz"
                     else bgw_integer_q_to_fractional(
@@ -1553,7 +1559,8 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=None):
                 del Wc
             figs.append(row_figs)
             del Z, V, W_lx, B, Zf
-        stamp = {"W0_source": W_SOURCE_BGW,
+        # BerkeleyGW's epsilon is the RPA series (file_io.restart_bundle.W_SERIES_LABELS).
+        stamp = {"W0_source": W_SOURCE_BGW, "screening_diagrams": "w_rpa",
                  "bgw_reference": os.path.abspath(cfg.bgw_reference),
                  "bgw_files": "[" + ", ".join(bgw_file_fingerprint(files[k], heads[k])
                                               for k in sorted(heads)) + "]",

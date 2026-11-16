@@ -53,6 +53,9 @@ from .bse_w_exact import (
     _get_branch_projection_program,
 )
 from common.collectives import gather_to_host
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 LADDER_RESPONSE_CONVENTION = "physical-ra-charge-spin-static-head-v3"
 LADDER_INTERNAL_HEAD_POLICY = "screened-transfer-gamma-exact-diagonal-v1"
@@ -87,6 +90,22 @@ def ladder_static_head_identity(restart_path, input_file, *, cell_volume):
                 g0_shape=list(g0.shape), g0_sha256=hashlib.sha256(g0.tobytes()).hexdigest())
 
 jax.config.update("jax_enable_x64", True)
+
+
+def require_rpa_rung(restart_path, *, print_fn=None) -> dict:
+    """``GATE w0_series`` for the ladder's direct rung: its W_R must be the RPA W(0).
+
+    ``W_BSE`` is the screened interaction of the particle-hole Hamiltonian
+    whose direct rung is ``-W_RPA(0)`` of the same reference (the Cunningham
+    et al. 2023 ``W-hat``).  The rung is read from ``W0_qmunu``; a W0 of any
+    other series (a stored ladder W, a future self-consistent ladder map)
+    would be a different, unaudited diagram set, and the identity binds only a
+    digest of the array, not its series.  So the series stamp is checked
+    before the restart read (``file_io.restart_bundle.require_w0_series``).
+    """
+    from file_io.restart_bundle import require_w0_series
+    return require_w0_series(restart_path, "w_rpa",
+                             consumer="the ladder's direct rung W_R", print_fn=print_fn)
 
 
 def build_ladder_resolvent(mesh_xy: Mesh, data: dict, *, include_w: bool = True,
@@ -237,6 +256,81 @@ def _identity_probe_blocks(n_logical: int, n_pad: int, chunk: int):
         probes = np.zeros((chunk, n_pad), dtype=np.float64)
         probes[rows, c0 + rows] = 1.0
         yield c0, n_real, probes
+
+
+class ResolventProgress:
+    """One INFO line per solved (z, q, probe block) of the screening resolvent.
+
+    The stage is ``n_z * n_q * n_blocks`` independent block-GMRES solves
+    (``sweep_q_wedge``); without this a 30-60 min ladder solve cannot be told
+    from a stall.  Each line gives the block's GMRES iteration mean/max (the
+    cost unit: one iteration is one ring matvec per probe column), its
+    largest true residual, the block's wall time, the elapsed time and a
+    linear estimate of the time left.  The first block carries the compile,
+    so the estimate is taken from the later blocks once one exists.  Inputs
+    are host arrays the caller already gathered; nothing here touches a
+    device.  ``clock`` is injectable for the unit cell.
+    """
+
+    def __init__(self, *, label, nz, nq, n_logical, tol, max_iter,
+                 clock=None, emit=None):
+        import time
+        self.label, self.nz, self.nq, self.n_logical = label, int(nz), int(nq), int(n_logical)
+        self.tol, self.max_iter = float(tol), int(max_iter)
+        self._clock = clock or time.perf_counter
+        self._emit = emit or log.info
+        self.t0 = self.t_last = self._clock()
+        self.done = 0
+        self.first_wall = None
+        self.chunk = None
+
+    @property
+    def total(self):
+        """Blocks in the whole sweep, once the probe width is known."""
+        n_blocks = -(-self.n_logical // self.chunk) if self.chunk else 0
+        return self.nz * self.nq * n_blocks
+
+    def update(self, iz, iq, c0, n_real, iters, resids, chunk):
+        """Record one solved block; returns the line it emitted."""
+        now = self._clock()
+        wall, self.t_last = now - self.t_last, now
+        if self.chunk is None:
+            self.chunk = int(chunk)
+        self.done += 1
+        if self.first_wall is None:
+            self.first_wall = wall
+        it = np.asarray(iters)[:n_real]
+        res = np.asarray(resids)[:n_real]
+        elapsed = now - self.t0
+        left = self.total - self.done
+        rate = ((elapsed - self.first_wall) / (self.done - 1) if self.done > 1
+                else self.first_wall)
+        n_blocks = -(-self.n_logical // self.chunk)
+        line = (f"  {self.label}: z {iz + 1}/{self.nz}, q {iq + 1}/{self.nq}, "
+                f"block {c0 // self.chunk + 1}/{n_blocks} ({n_real} columns): "
+                f"GMRES iters mean {float(it.mean()) if it.size else 0.0:.1f} "
+                f"max {int(it.max()) if it.size else 0}/{self.max_iter}, max residual "
+                f"{float(res.max()) if res.size else 0.0:.2e} (tol {self.tol:.0e}); "
+                f"block {wall:.1f} s; done {self.done}/{self.total} in {elapsed:.0f} s"
+                + (f", ~{left * rate:.0f} s left" if left > 0 else ""))
+        self._emit(line)
+        return line
+
+
+def _resolvent_progress(data, *, include_w, nz, nq, n_logical, tol, max_iter):
+    """Announce the resolvent stage's size once, and return its progress meter."""
+    label = "ladder W (w_bse)" if include_w else "RPA resolvent W (w_rpa_resolvent)"
+    nk_tot = int(data["nkx"]) * int(data["nky"]) * int(data["nkz"])
+    n_v, n_c = int(data["n_val"]), int(data["n_cond"])
+    log.info(
+        f"  {label}: {nq} irreducible q x {nz} z; pair space 2 x {n_v} v x {n_c} c x "
+        f"{nk_tot} k = {2 * n_v * n_c * nk_tot} transitions per q; {n_logical} probe "
+        f"columns (N_mu) per (q, z); GMRES tol {float(tol):.0e}, cap {int(max_iter)}; "
+        f"one iteration is one ring matvec per column, ~ N_k N_mu^2 (n_v + n_c) + "
+        f"N_mu^2 N_k log N_k (manual: Ladder vertex corrections, 2.1).  Progress: "
+        f"one line per solved probe block.")
+    return ResolventProgress(label=label, nz=nz, nq=nq, n_logical=n_logical,
+                             tol=tol, max_iter=max_iter)
 
 
 def _probe_scaling_bytes(data, mesh):
@@ -742,6 +836,8 @@ def prepare_ladder_head(restart_path, mesh_xy, *, input_file, head_dipole_path,
     bare interactions only; it never reads or rebuilds a screened W0.
     """
     if data is None:
+        if include_w:
+            require_rpa_rung(restart_path)
         data = load_bse_data_from_restart_sharded(
             restart_path, n_val=10**9, n_cond=10**9, mesh_xy=mesh_xy,
             input_file=input_file, inject_head=False, inject_w_head=include_w,
@@ -898,6 +994,10 @@ def compute_wc_qwedge(
             int(probe_chunk), mesh_xy, name="BSE ladder probe chunk",
             spec=P("y"), axis=0).carrier
 
+    # The rung is the RPA W(0) by construction (W_BSE = W[chi of H with
+    # -W_RPA(0)]); a ladder-stamped W0 would count the ladder twice.
+    if include_w:
+        require_rpa_rung(restart_path)
     # FULL chi0 band window on both legs — the pair basis must span exactly the
     # window the GW chi0 consumed, or the ladder resolvent is solving a smaller
     # problem than the W_R kernel it is fed (band-window parity, bse_w_exact.main).
@@ -956,6 +1056,8 @@ def compute_wc_qwedge(
     moment_tiles = ({name: [None] * nq for name in ("M0", "M1", "M2", "M3")}
                     if with_moments else {})
     moment_fields = {}
+    progress = _resolvent_progress(data, include_w=include_w, nz=nz, nq=nq,
+                                   n_logical=nlog, tol=gmres_tol, max_iter=gmres_max_iter)
 
     if route not in ("auto", "plain", "lift"):
         raise ValueError(
@@ -985,6 +1087,8 @@ def compute_wc_qwedge(
             tiles[iz][iq], W_tile, c0, n_real, n_pad, mesh_xy)
         resid[iz, iq, c0:c0 + n_real] = np.asarray(gather_to_host(resids))[:n_real]
         iters[iz, iq, c0:c0 + n_real] = np.asarray(gather_to_host(its))[:n_real]
+        progress.update(iz, iq, c0, n_real, iters[iz, iq, c0:c0 + n_real],
+                        resid[iz, iq, c0:c0 + n_real], chunk)
         for name, value in (fields or {}).items():
             if name in moment_tiles:
                 moment_tiles[name][iq] = _accumulate_columns(

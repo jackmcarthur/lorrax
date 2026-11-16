@@ -1493,6 +1493,10 @@ def main(argv=None) -> None:
     n_val = args.n_val if args.n_val is not None else 10**9
     n_cond = args.n_cond if args.n_cond is not None else 10**9
 
+    # Both the rung and the cross-check target are the stored RPA W(0).
+    from file_io.restart_bundle import require_w0_series
+    require_w0_series(restart_file, "w_rpa",
+                      consumer="bse_w_exact (rung and W(0) cross-check target)")
     with timing.section("w_exact.load"):
         data = load_bse_data_from_restart_sharded(
             restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,

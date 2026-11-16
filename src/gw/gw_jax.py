@@ -295,11 +295,18 @@ def _open_production_report(args):
     from common import bispinor_diag
     from .gw_config import bispinor_transverse_terms_stamp
     bispinor_diag.refuse_on_two_component(bispinor=bool(config.bispinor))
+    # Which W built Sigma, when it is not the default RPA series: every eqp
+    # header and sigma_mnk.h5 of a w_bse run says so (w_rpa outputs unchanged).
+    _diagrams = config.screening.diagrams
     set_run_provenance(
         four_current_carrier=(
             PAULI_FOUR_CURRENT_REPRESENTATION if config.bispinor else None),
         bispinor_transverse_terms=bispinor_transverse_terms_stamp(config),
-        bispinor_diag=bispinor_diag.active_switches())
+        bispinor_diag=bispinor_diag.active_switches(),
+        screening_diagrams=(
+            _diagrams.value if (config.compute_mode.needs_screening
+                                and _diagrams is not ScreeningDiagrams.W_RPA)
+            else None))
     input_dir = config.input_dir
     qp_solver = config.qp_solver     # how QP energies are extracted from Σ
     mode = config.compute_mode       # the self-energy ansatz

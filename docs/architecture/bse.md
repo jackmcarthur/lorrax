@@ -86,11 +86,30 @@ store it (`gw.screening.driver_persists_w0`, `restart_static_w`):
 | `cohsex`, `gn_ppm`, `hl_ppm` with `screening_diagrams = w_rpa` | the Dyson W(0) |
 | `mpa` with `sigma_w_model = tangential`, scalar store, one-shot | $V + W^c(0)$ of the model (`gw.mpa.sigma.tangential_static_wc`) |
 | the same, `qp_solver = self_consistent` | $V + W^c(0)$ of the accepted final map, evaluated once after the loop |
-| `w_bse`, `w_rpa_resolvent` | the RPA W(0), written by the ladder stage before the ladder runs |
+| `w_bse`, `w_rpa_resolvent` | the RPA W(0), written by the ladder stage before the ladder runs; the resolvent's (ladder) W is not stored |
 | bispinor `mpa`, tangential, `bispinor_gw = bare_transverse`, one-shot or self-consistent | $V + W^c(0)$ of the four-component charge store on the charge V, the same evaluator (charge sector only) |
 | bispinor `mpa`, `bispinor_gw = full_tangential` | $V + W^c_{CC}(0)$ of the CC sector (`gw.mpa.sector_sigma.sector_static_wc`) |
 | `x_only`; `mpa` with `sigma_w_model = mpa` | nothing |
 | tangential on a metal, or `head_correction = full` without an ω = 0 head sample | nothing; the log says why |
+
+**Which W the file holds.** `W0_qmunu`, `whead` and (when written) `W0_lr`
+carry `screening_diagrams`, the series of that object; the file attribute
+`gw_screening_diagrams` is the series of the W the producing run's Σ used
+(`gw.gw_output.stamp_w0_route`). After a `w_bse` run the two differ:
+`W0_qmunu`/`whead` say `w_rpa` (the ladder's rung), the file says `w_bse`,
+and the ladder W itself is in no file a BSE reads. Every W0 reader logs one
+`W0 provenance:` line saying which W it reads and, when they differ, which W
+Σ used (`file_io.restart_bundle.describe_w0_provenance`): the BSE loader
+(direct term, TD-aGW, the ladder's own reload), the downfold. Consumers that
+need one series refuse another (`GATE w0_series`,
+`restart_bundle.require_w0_series`): the ladder's rung (`bse.w_ladder.
+require_rpa_rung`, the RPA W(0) by construction), the epsmat export (an RPA
+ε⁻¹) and `bse_w_exact`. A file whose body and head carry different series
+refuses for every consumer (`GATE w0_series_torn`). An unstamped file
+(written before the stamp) is read as RPA, the only series any producer
+stored, and the log says so. The BSE kernel after a `w_bse` GW run therefore
+screens with the RPA W(0); that is a documented consequence of the handoff,
+not a choice the BSE makes.
 
 W0 is stored on the q parents of `V_qmunu`, with their unfold tables, whenever
 the run's q axis reduces (`restart_q_storage = auto` resolves `ibz`;
@@ -813,6 +832,51 @@ polygon and the ordinary bulk mini-BZ draw. Tangential `w_bse` with a full
 head refuses the bulk analytic-sphere option rather than guessing its
 screened response actions. GN-PPM and legacy MPA head paths are unchanged.
 
+### Cost and progress
+
+Per irreducible q and z the stage solves $N_\mu$ probe columns by block GMRES,
+each iteration one ring matvec per column (manual, Ladder vertex corrections
+§2.1). The stage prints its size once (pairs per q, $N_\mu$, q and z counts,
+tolerance and cap) and one line per solved probe block: GMRES iterations
+(mean, max), largest true residual, block wall, elapsed time and the time
+left (`bse.w_ladder.ResolventProgress`; the first block carries the compile).
+
+### What the time-reversal gate excludes
+
+`GATE w_bse_requires_measured_trs` (`gw.screening.refuse_w_bse_without_trs`)
+refuses `w_bse` whenever the measured verdict `SymMaps.trs_allowed` is false,
+before any basis, ζ or V. The verdict is `WfnLoader.trs_holds`, not a deck
+key. On a two-component WFN it needs an authenticated Quantum ESPRESSO
+`data-file-schema.xml` beside the WFN
+(`symmetry_maps.density_symmetry_check.qe_trs_off_reason`): it is false when
+QE records an operation composed with time reversal, when the SCF absolute
+magnetization is not below its tolerance, and also when no schema is found
+or none matches, because `WFN.h5` alone does not say whether a spinor
+reference is magnetic. The gate therefore excludes two classes:
+
+1. every reference whose mean field breaks time reversal: ferromagnets and
+   antiferromagnets, collinear or noncollinear, with or without spin–orbit
+   coupling (NiO, NiCl$_2$, CrCl$_3$, CrI$_3$ among the project's systems);
+2. a nonmagnetic spinor WFN that reached the run directory without its
+   schema. Si 4³ with spin–orbit coupling, copied as `WFN.h5` alone, logs
+   `[2c-TRS] WFN.h5: BROKEN (qe-magnetic, … no evidence)` and `w_bse` refuses
+   within seconds. Link `data-file-schema.xml` and the SCF `.save` beside the
+   WFN (manual, Inputs from DFT, "Symmetry record") and the same WFN runs.
+
+The tangential adapter repeats the check on the bank
+(`GATE ladder_tangential_representation`). What remains available on those
+references: `w_rpa` (every route) and `w_rpa_resolvent` (COHSEX, GN-PPM; it
+has no time-reversal gate). The refusal text names the pair gauge of the
+antiresonant channel; the physical R/A operator above now carries both
+branches without sewing, but the assembly still assumes time reversal in two
+places, so the gate stays: the wedge unfold of the ladder W uses the
+conjugate rule $W_{-q}=\overline{W_q}$ (`gw.screening_bse._assemble_wedge_w`,
+`trs_rule="conj"`, where the RPA route switches to `pair_transpose` for ordered
+orientations), and the even-$s$ tangential model and its moment gates assume
+$W^c(z)=W^c(-z)$, which a magnetic reference violates. Lifting it needs an
+ordered-response ladder (both orientations kept, as the ordered RPA bank
+does) and its own certification.
+
 ### Self-consistency is a separate, refused extension
 
 The implemented ladder route is single-shot. A self-consistent map would
@@ -831,6 +895,8 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 |---|---|---|
 | `GATE bse_restart_ambiguous` | `restart_bundle._find_restart_file` | more than one `isdf_tensors_*.h5` in the run directory and its `tmp/` |
 | `GATE bse_requires_screened_w0` | `restart_bundle.read_bse_payload` | no stored W0 and no rebuilt one |
+| `GATE w0_series` | `restart_bundle.require_w0_series` (the ladder rung `w_ladder.require_rpa_rung`, `epsmat_export.open_export_source`, `bse_w_exact.main`) | a stored `W0_qmunu` whose `screening_diagrams` is not the series the consumer needs (an unstamped file reads as `w_rpa`) |
+| `GATE w0_series_torn` | the same | `W0_qmunu`, `whead` and `W0_lr` stamped with different series |
 | `GATE bse_static_w_inputs` | `static_screening.build_static_w_from_restart` | a rebuild without `-i` |
 | `GATE bse_static_w_bispinor_sectors` | the same | a four-current bundle without W0: the BSE has no packed CC/CT/TC/TT handoff, and a scalar rebuild would omit the coupled sectors |
 | `GATE bse_static_w_sc_state` | the same | a QSGW deck without final-map W0: the parent WFN is the DFT state |

@@ -111,6 +111,31 @@ def deck_flags(path) -> list[tuple[str, str]]:
     return rows
 
 
+def stored_w0_row(config) -> str | None:
+    """What the ISDF tensor file's ``W0_qmunu`` holds when it is not Sigma's W.
+
+    ``None`` on ``w_rpa`` (the stored W(0) is Sigma's static W).  Under the
+    resolvent diagrams the stage persists the Dyson RPA W(0) before the
+    resolvent runs and never stores the resolvent's W
+    (``gw.screening.driver_persists_w0``), so every later consumer of the
+    file (BSE direct term, TD-aGW, fine-grid long-range model, epsmat and
+    bsemat exports, downfold) reads the RPA W(0).
+    """
+    if not config.compute_mode.needs_screening or not bool(
+            getattr(config, "write_restart_tensors", True)):
+        return None
+    diagrams = config.screening.diagrams.value
+    if diagrams == "w_bse":
+        return ("the RPA W(0) the ladder used as its direct rung (W0_qmunu "
+                "screening_diagrams = w_rpa); the ladder W of this Sigma is not "
+                "stored, so a BSE, TD-aGW or export from this ISDF tensor file "
+                "reads the RPA W(0)")
+    if diagrams == "w_rpa_resolvent":
+        return ("the Dyson RPA W(0) (W0_qmunu screening_diagrams = w_rpa); the "
+                "resolvent's W is not stored")
+    return None
+
+
 def method_rows(config) -> list[tuple[str, str]]:
     """The METHOD block: what this run computes, in plain sentences, from the
     resolved configuration (no key names, no sources)."""
@@ -130,7 +155,9 @@ def method_rows(config) -> list[tuple[str, str]]:
     if config.compute_mode.needs_screening:
         diagrams = config.screening.diagrams.value
         screening = {"w_rpa": "RPA screened Coulomb interaction (Dyson series in chi0)",
-                     "w_bse": "BSE-screened Coulomb interaction (electron-hole ladder in W)"
+                     "w_bse": "BSE-screened Coulomb interaction (electron-hole ladder in W)",
+                     "w_rpa_resolvent": "RPA screened Coulomb interaction from the "
+                                        "resolvent route (check of the ladder machinery)",
                      }.get(diagrams, diagrams)
         if getattr(config.screening, "source", "compute") == "bgw_epsmat":
             screening = ("BerkeleyGW's epsilon projected on zeta, read from the ISDF tensor "
@@ -144,6 +171,9 @@ def method_rows(config) -> list[tuple[str, str]]:
             "tangential": "; W on the tangential frequency samples",
         }.get(mode, "")
         rows.append(("screening", screening))
+        stored = stored_w0_row(config)
+        if stored is not None:
+            rows.append(("stored W(0)", stored))
     head = config.head.correction.value
     source = str(config.head.wcoul0_source)
     if getattr(config.screening, "source", "compute") == "bgw_epsmat":

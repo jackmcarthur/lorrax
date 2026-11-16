@@ -219,6 +219,11 @@ def test_streamed_facade_releases_all_moments_after_first_sample():
         "_psi_at_rest_2d": lambda data, _mesh: data, "_symmetry_tables": lambda _path: sym,
         "_accumulate_columns": accumulate, "gather_to_host": lambda a: a,
         "_assert_pad_block_is_zero": zero_padding}
+    # The rung's series gate runs before the restart read; progress is a log.
+    rung_checks = []
+    namespace["require_rpa_rung"] = rung_checks.append
+    namespace["_resolvent_progress"] = lambda *_a, **_k: SimpleNamespace(
+        update=lambda *_a, **_k: None)
     moment_visits = []
     consumed = []
 
@@ -273,6 +278,7 @@ def test_streamed_facade_releases_all_moments_after_first_sample():
     materialized = namespace["compute_wc_qwedge"]("unused", [0j, 1j, 2j], mesh, **kwargs)
     assert len(consumed)==2 and consumed[0] is not consumed[1]
     assert len(load_policies) == 2
+    assert rung_checks == ["unused", "unused"]
     assert all(policy["inject_head"] is False and policy["inject_w_head"] is True
                and policy["q0_head"] == "diagonal" and policy["native_grid_only"] is True
                and policy["need_W"] is True

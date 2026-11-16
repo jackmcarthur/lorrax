@@ -360,7 +360,7 @@ def restart_tensor_writes_enabled(config, tensors_filename: str) -> bool:
     return False
 
 
-def _stamp_screening_diagrams(tensors_filename: str, config) -> None:
+def _stamp_screening_diagrams(tensors_filename: str, config, *, members=None) -> None:
     """Stamp which diagram set produced this ``W0_qmunu`` (QUALITY_PATTERNS #10).
 
     Data outlives the config that made it, and ``W0_qmunu`` is the most
@@ -375,9 +375,19 @@ def _stamp_screening_diagrams(tensors_filename: str, config) -> None:
     "written by the RPA path", and those are different facts.  Rank-0 h5py
     metadata write, after SlabIO has released the file — the same
     discipline, for the same reason, as the ``W0_ready`` stamp itself.
+
+    Every member of the stored screened interaction is stamped with the same
+    label (``file_io.restart_bundle.W_SERIES_MEMBERS``: the body
+    ``W0_qmunu``, its q→0 head ``whead`` and the long-range channels
+    ``W0_lr``), so a reader can refuse a torn file whose head and body come
+    from different series (``restart_bundle.require_w0_series``).  The label
+    is the series of THESE objects; the run's Sigma series is the separate
+    file attribute of :func:`stamp_w0_route`.  ``members`` names the objects
+    this persist wrote (default: every member present).
     """
     import h5py
     from common.collectives import barrier, process_rank
+    from file_io.restart_bundle import W_SERIES_MEMBERS
 
     diagrams = getattr(
         getattr(config, "screening", None), "diagrams", None)
@@ -385,9 +395,10 @@ def _stamp_screening_diagrams(tensors_filename: str, config) -> None:
         return
     if process_rank() == 0:
         with h5py.File(tensors_filename, "a") as f:
-            if "W0_qmunu" in f:
-                f["W0_qmunu"].attrs["screening_diagrams"] = str(
-                    getattr(diagrams, "value", diagrams))
+            for name in (W_SERIES_MEMBERS if members is None else members):
+                if name in f:
+                    f[name].attrs["screening_diagrams"] = str(
+                        getattr(diagrams, "value", diagrams))
     barrier("restart_screening_diagrams_stamp")
 
 
@@ -396,13 +407,23 @@ def stamp_w0_route(tensors_filename: str, config) -> None:
     attribute, written on every route (including ``mpa``, which persists no
     W0) so the BSE can refuse a W(0) it cannot use
     (``file_io.restart_bundle.refuse_mpa_static_w``).  Rank 0, h5py metadata
-    write, then a barrier, as the W0 stamps."""
+    write, then a barrier, as the W0 stamps.
+
+    Beside it, ``gw_screening_diagrams``: the series of the W this run's
+    Sigma used.  It differs from ``W0_qmunu``'s own ``screening_diagrams``
+    under ``w_bse``, whose stored W(0) is the RPA rung of the ladder, so a
+    consumer of the file can say which W it reads and which W Sigma used
+    (``file_io.restart_bundle.describe_w0_provenance``)."""
     import h5py
     from common.collectives import barrier, process_rank
     mode = getattr(config, "compute_mode", None)
+    diagrams = getattr(getattr(config, "screening", None), "diagrams", None)
     if process_rank() == 0 and mode is not None and os.path.exists(tensors_filename):
         with h5py.File(tensors_filename, "a") as f:
             f.attrs["gw_compute_mode"] = str(getattr(mode, "value", mode))
+            if diagrams is not None and bool(getattr(mode, "needs_screening", True)):
+                f.attrs["gw_screening_diagrams"] = str(
+                    getattr(diagrams, "value", diagrams))
     barrier("restart_w0_route_stamp")
 
 
@@ -665,7 +686,6 @@ def persist_w0_and_head(
         if _lr is not None:
             from file_io import write_lr_channels_to_h5
             write_lr_channels_to_h5(tensors_filename, **_lr)
-    _stamp_screening_diagrams(tensors_filename, config)
     with _tmg.section("persist_w0.write_head"):
         write_head_scalars_to_h5(
             tensors_filename,
@@ -686,6 +706,11 @@ def persist_w0_and_head(
                 getattr(head_static, "response_kind", None)),
             head_source=head_static.source,
         )
+    # Body, head and (when written now) long-range channels carry one series
+    # label; a W0_lr left from an earlier run keeps its own stamp.
+    _stamp_screening_diagrams(
+        tensors_filename, config,
+        members=("W0_qmunu", "whead") + (("W0_lr",) if _lr is not None else ()))
     if head_wings is not None and iteration_head is None and static_head_sample is None:
         from file_io import write_head_wings_to_h5
         L, R = head_wings["L"], head_wings["R"]
