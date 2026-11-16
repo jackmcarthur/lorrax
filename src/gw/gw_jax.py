@@ -907,6 +907,22 @@ def _persist_screening(
     try:
         from .gw_output import stamp_w0_route
         stamp_w0_route(tensors_filename, config)        # read by the BSE's GATE bse_mpa_w0
+        if (config.screening.diagrams is ScreeningDiagrams.W_BSE
+                and qp_solver is not QPSolver.SELF_CONSISTENT):
+            # The stage stored the RPA rung as W0_qmunu; the ladder W(0) Sigma
+            # used goes beside it, for a BSE under bse_screening_diagrams = w_bse.
+            if "static" in W_by_role:
+                from .gw_output import persist_ladder_w0
+                with timing.section("gw_jax.persist_ladder_w0"):
+                    persist_ladder_w0(
+                        W_by_role["static"], tensors_filename=tensors_filename,
+                        head_resolver=head_resolver, config=config, meta=meta,
+                        mesh_xy=mesh_xy, sym=sym, centroid_indices=centroid_indices,
+                        print_fn=print0)
+            else:
+                log.info("  Ladder W(0) NOT stored: this route holds no static ladder role "
+                         "(compute_mode = tangential); a BSE under "
+                         "bse_screening_diagrams = w_bse refuses this ISDF tensor file.")
         if (driver_persists_w0(mode, config)
                 and qp_solver is not QPSolver.SELF_CONSISTENT):
             W_static = restart_static_w(
