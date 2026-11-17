@@ -50,7 +50,7 @@ The pair sum runs over the χ⁰ band manifold, up to `number_bands_chi` (defaul
 `fold_cartesian_head_wings_sharded`
 {: .in-code }
 
-The wings $Y^a(\br_\mu;z)$ and $Z^b(\br_\nu;z)$ have one velocity leg and one pair-density leg $\psi^*_{m\bk}(\br_\mu)\psi_{n\bk}(\br_\mu)$. Eliminating the body from the bordered Dyson equation, against the headless Γ body $W^{\mathrm{body}}_\Gamma(\mu,\nu;z)$ (the Γ row of the Dyson solve, or the [tangential](tangential-w.md) store evaluated at Γ), gives the head with local fields:
+The wings $Y^a(\br_\mu;z)$ and $Z^b(\br_\nu;z)$ have one velocity leg and one pair-density leg $\psi^*_{m\bk}(\br_\mu)\psi_{n\bk}(\br_\mu)$. Eliminating the body from the bordered Dyson equation, against the headless Γ body $W^{\mathrm{body}}_\Gamma(\mu,\nu;z)$ (the Γ row of the Dyson solve, or the [tangential](tangential-w.md) store evaluated at Γ; on a metal's static row that body is first dressed by the static intraband block, [Metals §3.3](metals.md#head-tf)), gives the head with local fields:
 
 $$
 \chi_{00}(\bq,z)=q_aS^{\mathrm{eff}}_{ab}(z)\,q_b,\qquad

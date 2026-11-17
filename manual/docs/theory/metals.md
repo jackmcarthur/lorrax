@@ -97,11 +97,13 @@ $\varpi_0$ is set by one of the head-fit sampling keys ([listed here](multipole-
 `compute_chi0_direct_fractional`
 {: .in-code }
 
-A damped time rule at height $\varpi_0$ would need about $10^6$ nodes. The origin row is therefore the exact ordered-pair sum (2.1) at its literal coordinate $z_0$; its cost is quadratic in bands, so it serves one sample per fit. Static χ⁰ at $z=0$ (the static Γ body of the head) is the zeroth Matsubara frequency, whose factors $fe^{(E-E_F)\tau}$ and $(1-f)e^{-(E-E_F)\tau}$ stay in $(0,1]$, so a degenerate pair carries $-\partial f/\partial E$ without a divided difference:
+A damped time rule at height $\varpi_0$ would need about $10^6$ nodes. The origin row is therefore the exact ordered-pair sum (2.1) at its literal coordinate $z_0$; its cost is quadratic in bands, so it serves one sample per fit. Static χ⁰ at $z=0$, for the static screening role ($W(0)$ for a restart or the BSE), is the zeroth Matsubara frequency, whose factors $fe^{(E-E_F)\tau}$ and $(1-f)e^{-(E-E_F)\tau}$ stay in $(0,1]$, so a degenerate pair carries $-\partial f/\partial E$ without a divided difference:
 
 $$
 \lim_{E'\to E}\frac{f(E)-f(E')}{E'-E}=-\frac{\partial f}{\partial E}=\frac{f(1-f)}{k_BT} \tag{2.3}
 $$
+
+The $q=0$ row's diagonal-pair block is then replaced by the head's $\chi_{FS}$ (§3.3), so that row is the static Γ body every route takes.
 
 ## <span class="n">3</span> The intraband term and the metallic head {: #head }
 
@@ -153,7 +155,7 @@ $$
 \epsilon_\infty=1-8\pi S(0),\qquad \kappa^2=8\pi N_0 \tag{3.4}
 $$
 
-A folded head (`head_correction = full`) uses the folded $S(0)$ and the static fold's $\kappa^2$. The cell is statically screened at the plan's origin $z_0$, not $W=0$.
+A folded head (`head_correction = full`) uses the folded $S(0)$ and the static fold's $\kappa^2$. The fold takes $W_{\mathrm{st}}=(1-W_\Gamma\chi_{FS})^{-1}W_\Gamma$: the route's own Γ body ($q=0$ pair sums with no diagonal pairs: the tangential model at $z=0$, the MPA origin sample), dressed by the static intraband block $\chi_{FS}=-C\sum_{n\bk}w_{n\bk}u_{n\bk}u_{n\bk}^{\sf T}$, $u=\sum_\sigma|\psi|^2$ at the centroids, from the same table as $\kappa^2$ and the static wings. The fold is then a Schur complement, $0<\kappa^2_{\mathrm{eff}}\le\kappa^2$, on every route. The cell is statically screened at the plan's origin $z_0$, not $W=0$.
 
 ### <span class="n">3.4</span> Head routes on a metal {: #head-routes }
 

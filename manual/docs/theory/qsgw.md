@@ -137,7 +137,7 @@ The sum in $\beta$ runs over the empty states of the QP matrix whose Σ was read
 `sc_iteration._pin_semicore_block_to_dft`
 {: .in-code }
 
-Occupied states below a band gap of at least 4 eV form the semicore class. Their Σ is read on held windows at a broadening of 5 eV, and with `sc_semicore = dft` (default) their block of $H$ stays at the mean-field block while their mixing with the other states is kept; `qp` lets them move with their own Σ. `sc_frozen_core_bands = N` (default 0) instead holds the lowest $N$ bands at their mean-field block with no coupling; they stay in every band sum.
+Occupied states below a band gap of at least 4 eV form the semicore class. Under `nval`/`ncond` the floor is instead the lowest energy over $\bk$ of band $n_{\mathrm{occ}}-n_{\mathrm{val}}$, with $n_{\mathrm{occ}}=\max(\texttt{ifmax})$ on a metal as on an insulator; `sigma_omega_min_ev` can only lower it. Their Σ is read on held windows at a broadening of 5 eV, and with `sc_semicore = dft` (default) their block of $H$ stays at the mean-field block while their mixing with the other states is kept; `qp` lets them move with their own Σ. `sc_frozen_core_bands = N` (default 0) instead holds the lowest $N$ bands at their mean-field block with no coupling; they stay in every band sum.
 
 The 5 eV read is what lets the semicore converge (at the input file η the Fe 3s $Z$ leaves $(0,1]$ from map 1 and the loop stalls), and it is a systematic error. Reading at $\eta_{\mathrm{semi}}$ smooths $\Sigma^c$ by a Lorentzian of width $\eta_{\mathrm{semi}}-\eta$; to first order the bias at the state's energy is
 
@@ -206,7 +206,7 @@ Each map writes these lines to `gwjax.out`; none of them but the verdict decides
 | `SC convergence:` | Criterion (5.1), the worst state named, then two RMS figures that are not the test, then `CONVERGED`, `not converged` or `STALLED at floor, not converged`. |
 | `SC matrix residual:` | $r_n$ of §5.2. `FLAG` when $\max\lvert\Delta E\rvert$ exceeds it: two different states were paired. |
 | `SC map gain:` | Above 1, the map is not locally contracting at the named state. On a metal it stays above 1 at Fermi-crossing states, where exchange follows an occupation flip. |
-| `SC window extension`, `SC window no-quasiparticle` | The Σ range grew past a state; a state with $Z\notin(0,1]$ at the previous map has no quasiparticle, never moves the range, and reads the off-range rule. |
+| `SC window extension`, `SC window no-quasiparticle` | The Σ range grew past a state; a state with $Z\notin(0,1]$ at map 1, where the class is taken and then held for the loop, has no quasiparticle, never moves the range, and reads the off-range rule. |
 | `SC fixed quadrature recompute:`, `SC W line sites re-planned`, `Response rule rebuilt at a held map` | A held rule or support moved. Each one changes $F$ between maps; re-plans on most maps stall Anderson. |
 | `SC semicore Z` | $Z$ of the semicore states on their 5 eV windows; it should stay in $(0,1]$. |
 | `fixed point NOT UNIQUE` | Only with `sigma_out_of_grid = static`: states within the jump $\Sigma(E)\to\Sigma(0)$ of a range edge have two fixed points, and the path picks one. Use `cover`. |
