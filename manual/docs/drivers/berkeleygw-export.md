@@ -70,7 +70,7 @@ gw.gw_jax -i gw.in           # here: restart = true, screening_source = bgw_epsm
 bse.bse_jax -i gw.in         # here (optional): BSE on BerkeleyGW's W(0)
 ```
 
-The GW input file for the third step differs from an ordinary one in two keys, `restart = true` and [`screening_source`](gw/keywords.md#screening_source) `= bgw_epsmat`. With `compute_mode = gn_ppm`, LORRAX fits its plasmon pole to BerkeleyGW's $W(0)$ and $W(i\omega_p)$; with `compute_mode = cohsex` it uses $W(0)$ alone.
+The GW input file for the third step differs from an ordinary one in two keys, `restart = true` and [`screening_source`](gw/keywords.md#screening_source) `= bgw_epsmat`. With `compute_mode = gn_ppm`, LORRAX fits its plasmon pole to BerkeleyGW's $W(0)$ and $W(i\omega_p)$; with `compute_mode = cohsex` it uses $W(0)$ alone. The log of that run has a line `W0 provenance:` that names the stored $W(0)$ the self-energy reads.
 
 The silicon test below shows what to expect: Si 4 × 4 × 4 with spin–orbit coupling, 28 bands, $N_\mu = 960$, the same `WFN.h5` for both codes, run on four GPUs.
 
@@ -117,7 +117,7 @@ The silicon test below shows what to expect: Si 4 × 4 × 4 with spin–orbit co
 python -m bse.bsemat_cli -i ../gw/gw.in --wfn-co WFN_co.h5 -o bsemat.h5
 ```
 
-The file holds the direct and exchange kernels of the static BSE on the coarse grid, in BerkeleyGW 4.0 layout. `absorption.x` reads it in place of `kernel.x`'s output. `--wfn-co` is the explicit full-grid coarse WFN that absorption reads (`no_symmetries_coarse_grid`). The kernel is written in that file's coefficient gauge and k order, so BerkeleyGW's interpolation to the fine grid applies unchanged.
+The file holds the direct and exchange kernels of the static BSE on the coarse grid, in BerkeleyGW 4.0 layout. `absorption.x` reads it in place of `kernel.x`'s output. `--wfn-co` is the explicit full-grid coarse WFN that absorption reads (`no_symmetries_coarse_grid`). The kernel is written in that file's coefficient gauge and k order, so BerkeleyGW's interpolation to the fine grid applies unchanged. The direct kernel is screened with the RPA $W(0)$ of the ISDF tensor file, and the log line `W0 provenance:` says so. An input file with [`bse_screening_diagrams = w_bse`](bse/keywords.md#bse_screening_diagrams) refuses (`GATE bsemat_ladder_w0`): the export splits the $\bq\to0$ head with the stored RPA head, which the ladder $W(0)$ does not have.
 
 - `--bgw-eps epsmat.h5` places the $\bq=0$ head exactly as `kernel.x` does at zone-boundary ties.
 - `extended_kernel = true` writes every band block, for absorption beyond the Tamm–Dancoff approximation.
