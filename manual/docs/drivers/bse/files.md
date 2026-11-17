@@ -44,7 +44,7 @@ The bundle's full schema belongs to the [GW Files](../gw/files.md#restart) page.
 | `band_window`, `band_window_split`, `band_window_carrier`, `n_rmu_logical` | Authentication against the input file's band keys and $N_\mu$. |
 | `zeta_fit_windows` | The ζ-fit legs that must hold the BSE window; older bundles fall back on `band_window`. |
 | `V_qmunu` (`V_ready`) | The $V_{\bq=0}(\mu,\nu)$ tile only. |
-| `W0_qmunu` (`W0_ready`) | $W_\bq(\mu,\nu;0)$, unfolded from its q parents to the full grid on load. Absent or not ready: rebuilt in memory. After a GW run with `screening_diagrams = w_bse` it is the RPA $W(0)$, not the ladder $W$; the log line `W0 provenance:` names the $W$ that was read. |
+| `W0_qmunu` (`W0_ready`) | $W_\bq(\mu,\nu;0)$, unfolded from its q parents to the full grid on load. Absent or not ready: rebuilt in memory. After a GW run with `screening_diagrams = w_bse` it is the RPA $W(0)$, not the ladder $W$; the log line `W0 provenance:` names the $W$ that was read. With `bse_screening_diagrams = w_bse` the direct term reads `W0_ladder_qmunu` and `whead_ladder` instead. |
 | `G0_mu_nu`, `vhead`, `whead` | Head vector $g_0(\mu)$ and the head scalars, Ry·bohr³. |
 | `S_cart_head` | Head tensor $S$, under `kgrid_fine`. |
 | `W0_lr/` | Long-range channels, under `w_head_densify = srlr`. |

@@ -97,7 +97,7 @@ Frequency integration of $\Sigma^c$.
 ### `screening_diagrams` {: .kw data-type="enum" data-default="w_rpa" }
 Diagrams summed by $W$: the RPA Dyson series, the ladder-corrected resolvent, or the RPA resolvent.
 
-`w_bse` runs one-shot under `cohsex` and `gn_ppm` (and [one other W model](../../theory/multipole-w.md#sigma)) on a time-reversal-symmetric WFN; `w_rpa_resolvent` under `cohsex` and `gn_ppm` only. Both need an orbit-closed centroid set. The ISDF tensor file keeps the RPA $W(0)$ that the ladder uses as its rung, not the ladder $W$, so a BSE run on that file screens its kernel with the RPA $W(0)$; the log of every reader says which $W$ it reads.
+`w_bse` runs one-shot under `cohsex` and `gn_ppm` (and [one other W model](../../theory/multipole-w.md#sigma)) on a time-reversal-symmetric WFN; `w_rpa_resolvent` under `cohsex` and `gn_ppm` only. Both need an orbit-closed centroid set. The ISDF tensor file keeps the RPA $W(0)$ that the ladder uses as its rung and, under `cohsex` and `gn_ppm`, the ladder $W(0)$ beside it. A BSE run on that file screens its kernel with the RPA $W(0)$ unless its input file sets [`bse_screening_diagrams = w_bse`](../bse/keywords.md#bse_screening_diagrams); the log of every reader says which $W$ it reads.
 {: .kw-details }
 
 `w_rpa` `w_bse` `w_rpa_resolvent`

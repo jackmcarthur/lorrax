@@ -124,6 +124,15 @@ Long-range model split off $W$ before the densification under `kgrid_fine`. `srl
 `srlr`
 {: .kw-values }
 
+### `bse_screening_diagrams` {: .kw data-type="enum" data-default="w_rpa" }
+Which stored static $W$ the direct term of the kernel reads.
+
+`w_rpa` reads `W0_qmunu`, the RPA $W(0)$. `w_bse` reads the ladder $W(0)$ that a GW run with [`screening_diagrams = w_bse`](../gw/keywords.md#screening_diagrams) stores beside it under `cohsex` or `gn_ppm`, so the self-energy and the kernel use the same $W$. A file without it refuses (`GATE bse_ladder_w0`), and so does `kgrid_fine` (`GATE bse_ladder_w0_fine_grid`). The log line `W0 provenance:` names the $W$ that was read.
+{: .kw-details }
+
+`w_rpa` `w_bse`
+{: .kw-values }
+
 ### `head_minibz_average` {: .kw data-type="bool" data-default="false" }
 Read under `kgrid_fine`: rebuilds the $V_{\bq=0}$ tile with the fine grid's mini-BZ head. Must match the GW run.
 
