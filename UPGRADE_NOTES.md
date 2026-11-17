@@ -5,6 +5,18 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-17 — `w_bse`: bispinor refused, the time-reversal refusal says why, the bsemat export reads the RPA W(0) only
+
+Three small changes around `screening_diagrams = w_bse`. No number changes;
+two combinations that ran before now refuse by name.
+
+- **New refusal.** `screening_diagrams = w_bse` with `bispinor = true` refuses
+  at parse (`GATE w_bse_bispinor_uncertified`). It parsed before, and under
+  `bispinor_gw = bare_transverse` ran the charge ladder on four-spinor pair
+  densities, which no test, hsuite stage or reference run covers. Run the
+  ladder on the two-component reference, or keep `w_rpa` for the bispinor
+  run. `w_rpa_resolvent` is unchanged.
+
 ## 2026-11-17 — Self-consistent metals: semicore floor, held quasiparticle class, one static Γ body
 
 Three changes for metals; insulators take none of these paths (every hsuite

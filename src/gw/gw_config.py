@@ -503,6 +503,24 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
         "for the same singular channel; composing the two has not been "
         "derived or certified, so it remains a named refusal",
     ),
+    (
+        # No w_rpa_resolvent twin: that check mode stays open on a bispinor
+        # WFN because its W is the Dyson w_rpa one by construction, which is
+        # how the four-spinor resolvent gets certified.
+        "w_bse_bispinor_uncertified",
+        lambda cfg: bool(getattr(cfg, "bispinor", False)),
+        lambda cfg: "bispinor = true",
+        "bispinor = false: a two-component or scalar reference",
+        "run the ladder on the two-component reference, or keep "
+        "screening_diagrams = w_rpa for the bispinor run",
+        "the ladder's pair space, its time-reversal pair gauge, its head and "
+        "its stored W(0) are tested and gated on scalar and two-component "
+        "references only.  Under bispinor_gw = bare_transverse the packed "
+        "four-current routes step aside and the charge ladder would run on "
+        "four-spinor pair densities, a combination that no unit test, "
+        "hsuite stage or reference run covers; it is refused by name until "
+        "it is certified rather than reported under the ladder's label",
+    ),
 )
 
 

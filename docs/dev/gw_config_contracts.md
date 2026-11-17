@@ -185,7 +185,10 @@ rulings override anything here.
   resolved axes and does nothing for `w_rpa`. Each other value has its own
   table (`_W_BSE_REFUSALS`, `_W_RPA_RESOLVENT_REFUSALS`): `x_only`, `hl_ppm`,
   self-consistency and `mc_average_placement != off` refuse for both, and
-  `compute_mode = mpa` refuses for `w_rpa_resolvent`. A metallic WFN refuses at
+  `compute_mode = mpa` refuses for `w_rpa_resolvent`. `w_bse` refuses
+  `bispinor = true` (`GATE w_bse_bispinor_uncertified`: the ladder is tested
+  on scalar and two-component references only; `w_rpa_resolvent` stays open
+  there, since its W is the Dyson one). A metallic WFN refuses at
   the stage, on its occupations (`GATE {value}_insulators_only`,
   `gw.screening_bse`), because no deck key declares a metal. `w_bse` also
   requires a measured time-reversal verdict (`GATE w_bse_requires_measured_trs`,

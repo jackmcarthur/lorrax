@@ -908,6 +908,7 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 | `GATE w0_series_torn` | the same | `W0_qmunu`, `whead` and `W0_lr` stamped with different series |
 | `GATE bse_ladder_w0` | `restart_bundle.require_ladder_w0` (`bse_loading`, `read_bse_payload`) | `bse_screening_diagrams = w_bse` on a file without a ready `W0_ladder_qmunu` stamped `w_bse` and its `whead_ladder`, or with a rebuilt static W |
 | `GATE bse_ladder_w0_fine_grid` | `bse_loading.load_bse_data_from_restart_sharded` | `bse_screening_diagrams = w_bse` with `kgrid_fine` |
+| `GATE w_bse_bispinor_uncertified` | `gw_config.refuse_unsupported_screening_diagrams` (GW parse) | `screening_diagrams = w_bse` with `bispinor = true`: the ladder is certified on scalar and two-component references only |
 | `GATE bse_static_w_inputs` | `static_screening.build_static_w_from_restart` | a rebuild without `-i` |
 | `GATE bse_static_w_bispinor_sectors` | the same | a four-current bundle without W0: the BSE has no packed CC/CT/TC/TT handoff, and a scalar rebuild would omit the coupled sectors |
 | `GATE bse_static_w_sc_state` | the same | a QSGW deck without final-map W0: the parent WFN is the DFT state |
