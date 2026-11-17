@@ -100,7 +100,10 @@ carry `screening_diagrams`, the series of that object; the file attribute
 and the ladder W itself is in no file a BSE reads. Every W0 reader logs one
 `W0 provenance:` line saying which W it reads and, when they differ, which W
 Σ used (`file_io.restart_bundle.describe_w0_provenance`): the BSE loader
-(direct term, TD-aGW, the ladder's own reload), the downfold. Consumers that
+(direct term, TD-aGW, the ladder's own reload), the downfold, the bsemat
+export and a GW run with `screening_source = bgw_epsmat`
+(`gw.screening.read_imported_screening`). `tests/test_w0_reader_census_cpu.py`
+lists the readers and fails when one loses its line. Consumers that
 need one series refuse another (`GATE w0_series`,
 `restart_bundle.require_w0_series`): the ladder's rung (`bse.w_ladder.
 require_rpa_rung`, the RPA W(0) by construction), the epsmat export (an RPA

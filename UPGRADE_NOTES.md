@@ -27,6 +27,11 @@ two combinations that ran before now refuse by name.
   the shared loader handed it the ladder body, while its head split reads the
   RPA head tensor and wings. It also refuses a `W0_qmunu` that is not `w_rpa`
   (`GATE w0_series`). For the export, drop the key or set it to `w_rpa`.
+- **Every reader of a stored W(0) prints the line.** A GW run with
+  `screening_source = bgw_epsmat` (BerkeleyGW's projected W as Σ's W) now
+  prints `W0 provenance:` as well; the BSE loader (BSE, TD-aGW, exciton
+  bands, the fine-grid model), the ladder's rung, `bse_w_exact`, the downfold
+  and the epsmat export already did.
 
 ## 2026-11-17 — Self-consistent metals: semicore floor, held quasiparticle class, one static Γ body
 

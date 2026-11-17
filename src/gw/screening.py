@@ -984,6 +984,11 @@ def read_imported_screening(requests, V_q, *, config, sym, meta, mesh_xy, tensor
                  f"{prov[role]['dataset']} at omega = {prov[role]['omega_ry']} Ry "
                  f"(BerkeleyGW {prov[role]['bgw_reference']}); "
                  f"eps^-1_00(q0) = {heads[role]:.6f}")
+    # Like every reader of a stored W(0): say which series the file holds.
+    from file_io.restart_bundle import describe_w0_provenance, read_w0_provenance
+    log.info("  W0 provenance: " + describe_w0_provenance(
+        read_w0_provenance(tensors_filename),
+        consumer="Sigma's W (screening_source = bgw_epsmat, BerkeleyGW's projected epsilon)"))
     for smp in samples:
         log.info(f"  head from BerkeleyGW eps0mat at omega = {smp.omega} Ry: "
                  f"v(q->0) = {smp.vc0.real:.4f}, W(q->0) = {smp.wcoul0.real:.4f} a.u.")
