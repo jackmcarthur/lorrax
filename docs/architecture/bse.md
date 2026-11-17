@@ -86,7 +86,7 @@ store it (`gw.screening.driver_persists_w0`, `restart_static_w`):
 | `cohsex`, `gn_ppm`, `hl_ppm` with `screening_diagrams = w_rpa` | the Dyson W(0) |
 | `mpa` with `sigma_w_model = tangential`, scalar store, one-shot | $V + W^c(0)$ of the model (`gw.mpa.sigma.tangential_static_wc`) |
 | the same, `qp_solver = self_consistent` | $V + W^c(0)$ of the accepted final map, evaluated once after the loop |
-| `w_bse`, `w_rpa_resolvent` | the RPA W(0), written by the ladder stage before the ladder runs; the resolvent's (ladder) W is not stored |
+| `w_bse`, `w_rpa_resolvent` | the RPA W(0), written by the ladder stage before the ladder runs. A `w_bse` run under `cohsex` or `gn_ppm` also stores the ladder W(0) Σ used, as `W0_ladder_qmunu` with its head `whead_ladder` (`gw.gw_output.persist_ladder_w0`); the tangential route and `w_rpa_resolvent` store no resolvent W |
 | bispinor `mpa`, tangential, `bispinor_gw = bare_transverse`, one-shot or self-consistent | $V + W^c(0)$ of the four-component charge store on the charge V, the same evaluator (charge sector only) |
 | bispinor `mpa`, `bispinor_gw = full_tangential` | $V + W^c_{CC}(0)$ of the CC sector (`gw.mpa.sector_sigma.sector_static_wc`) |
 | `x_only`; `mpa` with `sigma_w_model = mpa` | nothing |
@@ -107,9 +107,18 @@ require_rpa_rung`, the RPA W(0) by construction), the epsmat export (an RPA
 ε⁻¹) and `bse_w_exact`. A file whose body and head carry different series
 refuses for every consumer (`GATE w0_series_torn`). An unstamped file
 (written before the stamp) is read as RPA, the only series any producer
-stored, and the log says so. The BSE kernel after a `w_bse` GW run therefore
-screens with the RPA W(0); that is a documented consequence of the handoff,
-not a choice the BSE makes.
+stored, and the log says so.
+
+**Which W the BSE reads.** `bse_screening_diagrams` (the BSE's input file;
+`restart_bundle.resolve_bse_w_series`) selects the stored static W of the
+direct term: `w_rpa` (the default) reads `W0_qmunu`, which after a `w_bse` GW
+run is the RPA rung; `w_bse` reads `W0_ladder_qmunu` and `whead_ladder`, the
+ladder W(0) and head of that run's Σ, on the same q storage and unfold
+tables. TD-aGW follows the same key through the loader. The ladder's own
+reload and `bse_w_exact` always read the rung (`w_series = "w_rpa"`), so a
+shared input file cannot feed the ladder its own W. `w_bse` refuses a file
+without the ladder W(0) (`GATE bse_ladder_w0`) and a `kgrid_fine` run
+(`GATE bse_ladder_w0_fine_grid`: no ladder `W0_lr` or head tensor is stored).
 
 W0 is stored on the q parents of `V_qmunu`, with their unfold tables, whenever
 the run's q axis reduces (`restart_q_storage = auto` resolves `ibz`;
@@ -897,6 +906,8 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 | `GATE bse_requires_screened_w0` | `restart_bundle.read_bse_payload` | no stored W0 and no rebuilt one |
 | `GATE w0_series` | `restart_bundle.require_w0_series` (the ladder rung `w_ladder.require_rpa_rung`, `epsmat_export.open_export_source`, `bse_w_exact.main`) | a stored `W0_qmunu` whose `screening_diagrams` is not the series the consumer needs (an unstamped file reads as `w_rpa`) |
 | `GATE w0_series_torn` | the same | `W0_qmunu`, `whead` and `W0_lr` stamped with different series |
+| `GATE bse_ladder_w0` | `restart_bundle.require_ladder_w0` (`bse_loading`, `read_bse_payload`) | `bse_screening_diagrams = w_bse` on a file without a ready `W0_ladder_qmunu` stamped `w_bse` and its `whead_ladder`, or with a rebuilt static W |
+| `GATE bse_ladder_w0_fine_grid` | `bse_loading.load_bse_data_from_restart_sharded` | `bse_screening_diagrams = w_bse` with `kgrid_fine` |
 | `GATE bse_static_w_inputs` | `static_screening.build_static_w_from_restart` | a rebuild without `-i` |
 | `GATE bse_static_w_bispinor_sectors` | the same | a four-current bundle without W0: the BSE has no packed CC/CT/TC/TT handoff, and a scalar rebuild would omit the coupled sectors |
 | `GATE bse_static_w_sc_state` | the same | a QSGW deck without final-map W0: the parent WFN is the DFT state |

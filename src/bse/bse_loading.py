@@ -166,6 +166,7 @@ def load_bse_data_from_restart_sharded(
     need_W: bool = True,
     coupling_legs: bool = True,
     exchange_channel: str | None = None,
+    w_series: Optional[str] = None,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_parent_y/enk_full).
 
@@ -260,10 +261,21 @@ def load_bse_data_from_restart_sharded(
     from common.collectives import _require_addressable
     _require_addressable(mesh_xy, origin="BSE restart reader")
     from file_io.restart_bundle import (read_metadata, read_bse_payload,
-                                        refuse_mpa_static_w)
+                                        refuse_mpa_static_w, require_ladder_w0,
+                                        resolve_bse_w_series)
+    # Which stored W(0) the direct term reads: the deck's bse_screening_diagrams
+    # (w_rpa: W0_qmunu; w_bse: the ladder W(0) of a w_bse GW run).  A caller
+    # that needs one series names it (the ladder's rung passes w_rpa).
+    if not need_W:
+        w_series = "w_rpa"
+    elif w_series is None:
+        w_series = resolve_bse_w_series(
+            _read_lorrax_input_quietly(input_file) if input_file else None)
     if need_W:
         refuse_mpa_static_w(restart_file)            # GATE bse_mpa_w0
-    header = read_metadata(restart_file)
+    if w_series == "w_bse":
+        require_ladder_w0(restart_file)              # GATE bse_ladder_w0
+    header = read_metadata(restart_file, w_series=w_series)
     enk_full = header["energies"]
     nkx, nky, nkz = (int(n) for n in header["grid"])
     n_rmu = header["centroid_count"]
@@ -296,6 +308,13 @@ def load_bse_data_from_restart_sharded(
         raise ValueError("kgrid_fine_shift shifts kgrid_fine, which the deck does not set")
     densify_pending = (fine_grid is not None
                        and (fine_grid != (nkx, nky, nkz) or any(fine_shift)))
+    if densify_pending and w_series == "w_bse":
+        raise ValueError(
+            "GATE bse_ladder_w0_fine_grid: got bse_screening_diagrams = w_bse with "
+            f"kgrid_fine = {fine_grid}; want the native grid.  why: the fine-grid W "
+            "interpolation splits off the long-range channels of the RPA W0 (W0_lr) "
+            "and its head tensor, and the ladder W(0) stores neither.  fix: run the "
+            "native grid, or set bse_screening_diagrams = w_rpa.")
     qp_rotation = None
     if qp_rotations_file is None:
         n_val, n_cond = resolve_band_window(enk_full, n_occ, n_val, n_cond,
@@ -346,7 +365,7 @@ def load_bse_data_from_restart_sharded(
     psi_v_X, psi_c_X, V_q0, W_q, V_q_full = read_bse_payload(
         restart_file, input_file, mesh_xy, read_val, read_cond,
         nohead=use_nohead, full_exchange=load_v_full, screened_w=screened_w,
-        screened=need_W, read_psi=not densify_pending)
+        screened=need_W, read_psi=not densify_pending, w_series=w_series)
     screened_w = None                # relaid out as W_q: one W layout survives
     if not need_W:
         W_q = no_w_operand(mesh_xy)

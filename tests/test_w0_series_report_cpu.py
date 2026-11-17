@@ -16,7 +16,7 @@ def test_stored_w0_row_names_the_rpa_rung(tmp_path):
     rows = dict(method_rows(_config(tmp_path, "w_bse")))
     assert "electron-hole ladder" in rows["screening"]
     assert "RPA W(0) the ladder used as its direct rung" in rows["stored W(0)"]
-    assert "not stored" in rows["stored W(0)"]
+    assert "stored beside it (W0_ladder_qmunu)" in rows["stored W(0)"]
     resolvent = dict(method_rows(_config(tmp_path, "w_rpa_resolvent")))
     assert "resolvent route" in resolvent["screening"]
     assert "Dyson RPA W(0)" in resolvent["stored W(0)"]
