@@ -115,8 +115,11 @@ direct term: `w_rpa` (the default) reads `W0_qmunu`, which after a `w_bse` GW
 run is the RPA rung; `w_bse` reads `W0_ladder_qmunu` and `whead_ladder`, the
 ladder W(0) and head of that run's Σ, on the same q storage and unfold
 tables. TD-aGW follows the same key through the loader. The ladder's own
-reload and `bse_w_exact` always read the rung (`w_series = "w_rpa"`), so a
-shared input file cannot feed the ladder its own W. `w_bse` refuses a file
+reload, `bse_w_exact` and the bsemat export always read the rung
+(`w_series = "w_rpa"`), so a shared input file cannot feed the ladder its own
+W. The bsemat export refuses the key at `w_bse` (`GATE bsemat_ladder_w0`):
+its head split uses the RPA head tensor and wings, which the ladder W(0)
+does not store. `w_bse` refuses a file
 without the ladder W(0) (`GATE bse_ladder_w0`) and a `kgrid_fine` run
 (`GATE bse_ladder_w0_fine_grid`: no ladder `W0_lr` or head tensor is stored).
 
@@ -909,11 +912,12 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 |---|---|---|
 | `GATE bse_restart_ambiguous` | `restart_bundle._find_restart_file` | more than one `isdf_tensors_*.h5` in the run directory and its `tmp/` |
 | `GATE bse_requires_screened_w0` | `restart_bundle.read_bse_payload` | no stored W0 and no rebuilt one |
-| `GATE w0_series` | `restart_bundle.require_w0_series` (the ladder rung `w_ladder.require_rpa_rung`, `epsmat_export.open_export_source`, `bse_w_exact.main`) | a stored `W0_qmunu` whose `screening_diagrams` is not the series the consumer needs (an unstamped file reads as `w_rpa`) |
+| `GATE w0_series` | `restart_bundle.require_w0_series` (the ladder rung `w_ladder.require_rpa_rung`, `epsmat_export.open_export_source`, `bse_w_exact.main`, `bsemat_export.export_w0_provenance`) | a stored `W0_qmunu` whose `screening_diagrams` is not the series the consumer needs (an unstamped file reads as `w_rpa`) |
 | `GATE w0_series_torn` | the same | `W0_qmunu`, `whead` and `W0_lr` stamped with different series |
 | `GATE bse_ladder_w0` | `restart_bundle.require_ladder_w0` (`bse_loading`, `read_bse_payload`) | `bse_screening_diagrams = w_bse` on a file without a ready `W0_ladder_qmunu` stamped `w_bse` and its `whead_ladder`, or with a rebuilt static W |
 | `GATE bse_ladder_w0_fine_grid` | `bse_loading.load_bse_data_from_restart_sharded` | `bse_screening_diagrams = w_bse` with `kgrid_fine` |
 | `GATE w_bse_bispinor_uncertified` | `gw_config.refuse_unsupported_screening_diagrams` (GW parse) | `screening_diagrams = w_bse` with `bispinor = true`: the ladder is certified on scalar and two-component references only |
+| `GATE bsemat_ladder_w0` | `bsemat_export.export_w0_provenance` | the bsemat export with `bse_screening_diagrams = w_bse`: the export's head split reads the RPA head tensor and wings |
 | `GATE bse_static_w_inputs` | `static_screening.build_static_w_from_restart` | a rebuild without `-i` |
 | `GATE bse_static_w_bispinor_sectors` | the same | a four-current bundle without W0: the BSE has no packed CC/CT/TC/TT handoff, and a scalar rebuild would omit the coupled sectors |
 | `GATE bse_static_w_sc_state` | the same | a QSGW deck without final-map W0: the parent WFN is the DFT state |

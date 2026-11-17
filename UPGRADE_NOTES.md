@@ -21,6 +21,12 @@ two combinations that ran before now refuse by name.
   `data-file-schema.xml` (or without the SCF `.save` that fixes the moment)
   gets "no evidence either way" and the files to stage beside the WFN;
   before, every case was sent to `w_rpa`. The condition is unchanged.
+- **bsemat export.** The export prints its own `W0 provenance:` line and
+  always reads the RPA `W0_qmunu`. With `bse_screening_diagrams = w_bse` in
+  its input file it refuses (`GATE bsemat_ladder_w0`): since that key landed
+  the shared loader handed it the ladder body, while its head split reads the
+  RPA head tensor and wings. It also refuses a `W0_qmunu` that is not `w_rpa`
+  (`GATE w0_series`). For the export, drop the key or set it to `w_rpa`.
 
 ## 2026-11-17 — Self-consistent metals: semicore floor, held quasiparticle class, one static Γ body
 

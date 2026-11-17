@@ -1162,6 +1162,33 @@ def run_bsemat_exports(*, input_file, wfn_co, n_val, n_cond, outputs, rcond=A.RC
     return summaries
 
 
+def export_w0_provenance(restart, params, *, print_fn=None) -> dict:
+    """Which stored W the export's direct term reads: the RPA ``W0_qmunu``, always.
+
+    The export splits W's head and wings with the file's RPA head tensor and
+    wings (``S_cart_head``, ``head_wing_L``/``head_wing_R``) and the unfold
+    tables of ``W0_qmunu``; the ladder W(0) of a ``screening_diagrams = w_bse``
+    GW run stores none of them.  ``GATE bsemat_ladder_w0`` therefore refuses
+    ``bse_screening_diagrams = w_bse`` (the shared loader would hand the
+    ladder body to that RPA head), and ``GATE w0_series`` refuses a file whose
+    ``W0_qmunu`` is not the RPA series.  Prints the ``W0 provenance:`` line
+    (``restart_bundle.require_w0_series``) and returns the provenance.
+    """
+    from file_io.restart_bundle import require_w0_series, resolve_bse_w_series
+    if resolve_bse_w_series(params) != "w_rpa":
+        raise ValueError(
+            "GATE bsemat_ladder_w0: got bse_screening_diagrams = w_bse; the bsemat "
+            "export wants w_rpa.  why: the export splits the head and wings of W "
+            "with the file's RPA head tensor and wings and W0_qmunu's unfold "
+            "tables, and the ladder W(0) stores none of them, so the kernel file "
+            "would hold a ladder body on an RPA head.  fix: export with "
+            "bse_screening_diagrams = w_rpa (or without the key); the bsemat "
+            "then carries the RPA W(0).")
+    return require_w0_series(
+        restart, "w_rpa", consumer="the bsemat export's direct term (BerkeleyGW kernel)",
+        print_fn=print_fn or _log)
+
+
 def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_gauge_map,
                     mesh_xy, exciton_Q=(0.0, 0.0, 0.0), wfnq_co=None):
     """The shared stages of an export, once per restart; returns the plain dict ``_write_output`` reads.
@@ -1189,6 +1216,7 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
     restart = _find_restart_file(input_file)
     refuse_mpa_static_w(restart)                         # GATE bse_mpa_w0
     params = _deck_params(input_file)
+    export_w0_provenance(restart, params)       # GATE bsemat_ladder_w0, GATE w0_series
     sys_dim = int(params.get("sys_dim", 3))
     if sys_dim == 3 and str(params.get("mc_average_vcoul_body", "false")).lower() in ("true", "1", "yes"):
         raise ValueError("GATE bsemat_point_head: mc_average_vcoul_body = true puts a cell "
@@ -1203,7 +1231,7 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
     # ── 1. the bundle at full q ───────────────────────────────────────────
     data = load_bse_data_from_restart_sharded(
         restart, n_val, n_cond, mesh_xy=mesh_xy, pad_bands=False, inject_head=False,
-        load_v_full=True, input_file=input_file)
+        load_v_full=True, input_file=input_file, w_series="w_rpa")
     n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
     grid = np.array([data["nkx"], data["nky"], data["nkz"]], dtype=np.int64)
     nk = int(np.prod(grid))

@@ -325,6 +325,7 @@ restart's `zeta_q.h5` stores the full zone (`GATE bsemat_finite_q_offgrid`).
 | `bsemat_head_row` | $v_1\,zV^+z^*>1$: $V-v_1z^\dagger z$ is not positive, so z is not V's head row (slot, conjugation, unfold phase) or $v_1$ is not V's value |
 | `bsemat_head_screening` | $W_{11}/v_1\notin(0,1]$ |
 | `bsemat_point_head` | a 3D deck with `mc_average_vcoul_body = true` (V's head slot holds a cell average at every q) |
+| `bsemat_ladder_w0`, `w0_series` | the input file sets `bse_screening_diagrams = w_bse`, or the stored `W0_qmunu` is not the RPA series: the split uses the RPA head tensor and wings, so the export always reads the RPA $W(0)$ and logs a `W0 provenance:` line |
 | `bsemat_head_in_sphere` | the head slot lies outside the stored ζ sphere |
 | `bsemat_full_grid`, `bsemat_k_bijection`, `bsemat_k_on_grid`, `bsemat_k_order` | WFN_co is not the explicit full grid of the restart, in any order |
 | `bsemat_band_offset` | the WFN_co window energies differ from the restart's by more than 0.05 Ry |
