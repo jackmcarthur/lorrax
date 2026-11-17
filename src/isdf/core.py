@@ -1128,7 +1128,7 @@ def transverse_factor_layout(nq: int, n_rmu: int, mesh_xy: Mesh, n_rmu_logical: 
     def mesh_price():
         lu = distrib_la.plan("solve_lu", mesh_xy, backend="distributed", n=int(n_rmu), batched_route="auto",
                              budget_bytes=shared_device_room("transverse zeta inverse"))
-        vendor = lu_workspace_bytes(mesh_xy, int(n_rmu), jnp.complex128) if lu.backend == "cusolvermp" else 0
+        vendor = lu_workspace_bytes(mesh_xy, int(n_rmu), jnp.complex128, lu.budget_bytes) if lu.backend == "cusolvermp" else 0
         return compiled_price(lambda C: _factor_c_q_transverse_inverse(C, mesh_xy, n_log), c, ranks=ndev,
                               face=True, source="mesh LU inverse on the face") + memory.Price(
             vendor=memory.Term(float(vendor), source=f"{lu.backend} solve_lu workspace (measured row)"),

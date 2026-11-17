@@ -745,7 +745,8 @@ nothing and accept `float64` or `complex128` only.
   destructive tridiagonalization; do not add that tile again. A local eigh
   returns the cuSolverDn workspace plus a 4-byte info word. A distributed
   `gemm` has none: `panel_matmul`'s panels are XLA's. Query collectively on
-  the real mesh; off CUDA it returns 0.
+  the real mesh; off CUDA it returns 0, except a local eigh on ROCm (its native scratch,
+  `local_eigh_workspace`).
   `checked=True` also covers the native scratch of a gathered EIGH retry
   admitted by that plan, for pricing its complete checked executable.
 - `matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend,

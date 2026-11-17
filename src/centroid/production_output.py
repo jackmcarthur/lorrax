@@ -107,29 +107,27 @@ class CentroidRankNotEstablished(RuntimeWarning):
     """The point budget stopped the select before the pool was spent."""
 
 
-def rank_law_estimate(*, left, right, nspinor: int, kgrid, ng: int,
-                      ecutwfc: float, ecutrho: float):
-    """``(N_mu, L, B, terms)`` of the charge pair-set rank law, or ``None``.
+def centroid_budget(*, left, right, nspinor: int):
+    """``(N_mu, L, B, S)`` of the safe charge centroid budget, or ``None``.
 
-    N_mu(1 meV RMS Σ_x) ≈ 0.5·min(P, 445 L^0.107 B^0.322, 0.97 N_G(4E_wfc))
-    (docs/theory/isdf-exchange-accuracy.md#rank-law).  L and B are the left
-    and right window widths, per Kramers pair on a spinor WFN; P = N_k·L·B
-    bounds the pair functions; N_G(4E_wfc) scales the WFN's density sphere
-    ``ng`` at ``ecutrho``.  A Si calibration checked on Fe and Ni 20³.
+    N_mu ≈ 4·S with S = (L^{1/3} + B^{1/3})³, L and B the left and right
+    window widths, per Kramers pair on a spinor WFN.  No accurate count rule
+    holds across materials.  4·S reached 5 meV RMS Σ_x (states within 10 eV
+    of μ) on every material measured (bcc Fe sets the constant, 3.97) and
+    over-spends by up to ~2.8× (CrI3, NiPS3, Si); converge on the system
+    when cost matters (manual: theory/isdf.md#isdf-budget).
     """
     per = 2.0 if int(nspinor) == 2 else 1.0
     L = (int(left[1]) - int(left[0])) / per
     B = (int(right[1]) - int(right[0])) / per
-    if not (L > 0 and B > 0 and float(ecutrho) > 0 and int(ng) > 0):
+    if not (L > 0 and B > 0):
         return None
-    terms = (math.prod(int(n) for n in kgrid) * L * B,
-             445.0 * L ** 0.107 * B ** 0.322,
-             0.97 * int(ng) * (4.0 * float(ecutwfc) / float(ecutrho)) ** 1.5)
-    return 0.5 * min(terms), L, B, terms
+    S = (L ** (1.0 / 3.0) + B ** (1.0 / 3.0)) ** 3
+    return 4.0 * S, L, B, S
 
 
 def pool_rank_warning(*, pool: int, written: int, unpicked: float | None,
-                      rank_law=None) -> str | None:
+                      budget=None) -> str | None:
     """The warning for a select the point budget stopped, else ``None``.
 
     ``unpicked`` is the largest never-picked residual over the floor
@@ -138,10 +136,10 @@ def pool_rank_warning(*, pool: int, written: int, unpicked: float | None,
     """
     if unpicked is None or float(unpicked) <= 1.0:
         return None
-    law = ("" if rank_law is None else
-           f"  The rank law puts N_mu for 1 meV RMS Sigma_x near "
-           f"{rank_law[0]:.0f} (written/estimate = "
-           f"{int(written) / rank_law[0]:.2f}).")
+    law = ("" if budget is None else
+           f"  The safe budget for 5 meV RMS Sigma_x is N_mu ~ 4 S = "
+           f"{budget[0]:.0f} (written/budget = "
+           f"{int(written) / budget[0]:.2f}).")
     return (f"pair-space rank not established: the point budget stopped the "
             f"sketched QRCP at {int(written)} points while unpicked "
             f"candidates of the {int(pool)}-point pool still carry "
@@ -160,7 +158,7 @@ def format_centroid_header(*, feature_fit: str, source_wfn: str,
                            prune_label: str, orbit_aware: bool, n_sym: int,
                            density_mode: str, pool: int,
                            unpicked: float | None = None,
-                           rank_law=None) -> str:
+                           budget=None) -> str:
     """Centroid-table provenance, kept pure so the file contract is gated.
 
     ``rho_power=1`` stays in the ``selection:`` line although ``--rho-power``
@@ -179,13 +177,13 @@ def format_centroid_header(*, feature_fit: str, source_wfn: str,
                 f"exceeds {int(prune_rank)} and is not measured")
         rank_note = (f"\npool rank={int(prune_rank)} of {int(written)} kept "
                      f"pivots on a {int(pool)}-point pool; {stop}")
-    if rank_law is not None:
-        n_mu, L, B, terms = rank_law
+    if budget is not None:
+        n_mu, L, B, S = budget
         rank_note += (
-            f"\nrank law: N_mu(1 meV RMS Sigma_x) ~ 0.5 min(P, 445 L^0.107 "
-            f"B^0.322, 0.97 N_G(4E_wfc)) = 0.5 min({terms[0]:.4g}, "
-            f"{terms[1]:.0f}, {terms[2]:.0f}) = {n_mu:.0f} at L={L:g}, "
-            f"B={B:g}; written/estimate={int(written) / n_mu:.2f}")
+            f"\nbudget: N_mu(5 meV RMS Sigma_x) ~ 4 S, S = (L^1/3 + B^1/3)^3 "
+            f"= {S:.4g}, so {n_mu:.0f} at L={L:g}, B={B:g}; "
+            f"written/budget={int(written) / n_mu:.2f} (safe on every "
+            f"material measured; can over-spend ~2.8x)")
     channel = ("gamma^0 (charge) ISDF" if density_mode == "scalar" else
                "gamma^{1,2,3} (current) ISDF")
     return (
@@ -293,7 +291,7 @@ def kmeans_results_lines(*, requested: int, candidates: int, pool: int,
                          written: int, out_file: str, orbit_aware: bool,
                          n_sym: int, windows, window_label: str,
                          density_mode: str, prune_rank, unpicked,
-                         rank_law=None) -> list[str]:
+                         budget=None) -> list[str]:
     """The kmeans RESULTS block: what was written, the selection funnel, the
     symmetries, the sampling metric and the measured pair-space rank."""
     left, right = windows
@@ -313,14 +311,16 @@ def kmeans_results_lines(*, requested: int, candidates: int, pool: int,
         ("pair-space rank", rank_text(prune_rank=prune_rank, written=written,
                                       pool=pool, unpicked=unpicked)),
     ]
-    if rank_law is not None:
-        n_mu, L, B, _ = rank_law
-        rows.append(("rank law", f"N_mu(1 meV RMS Sigma_x) ~ {n_mu:.0f} at L={L:g}, "
-                                 f"B={B:g}; written/estimate {int(written) / n_mu:.2f}"))
+    if budget is not None:
+        n_mu, L, B, _ = budget
+        rows.append(("count budget", f"N_mu(5 meV RMS Sigma_x) ~ 4 S = {n_mu:.0f} at "
+                                     f"L={L:g}, B={B:g}; written/budget "
+                                     f"{int(written) / n_mu:.2f}"))
     return results_lines(rows)
 
 
 __all__ = [
+    "centroid_budget",
     "CentroidRankNotEstablished",
     "format_centroid_header",
     "KMEANS_STAGES",
@@ -329,7 +329,6 @@ __all__ = [
     "rank_text",
     "pool_rank_warning",
     "prune_band_ranges",
-    "rank_law_estimate",
     "sketch_pruning_label",
     "validate_mode_policy",
 ]

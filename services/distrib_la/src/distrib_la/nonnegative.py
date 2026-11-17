@@ -30,7 +30,7 @@ def _lower(fn, operands, mesh, label, *, linear=None, agree=False):
         else:
             # One RHS column per rank leaves exactly one getrs chunk, so
             # the native query is cap-independent; no cap state is posted.
-            vendor = lu_workspace_query(mesh, n, int(mesh.shape['y']), operands[0].dtype, 0)
+            vendor = lu_workspace_query(mesh, n, int(mesh.shape['y']), operands[0].dtype, 0, linear.budget_bytes)
     if agree:
         # Positive metadata only: the shared budget hook rejects negative values.
         figures = _exchange(f'nonnegative/{linear.backend}/{operands[0].shape[0]}',

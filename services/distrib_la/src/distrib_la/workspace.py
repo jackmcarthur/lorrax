@@ -13,10 +13,16 @@ def provider_contexts(plan):
 
     Pure-JAX, one-device and panel routes reuse the ordinary leg context.
     This is current run metadata, never part of a cached executable price.
+    cuSOLVERMp keeps one context per grid layout for the life of the process
+    (``_cusolvermp.get_or_init_context``): the column-major grid of eigh and the
+    row-major one of LU and potrf.  A process that has run both holds both, so both
+    are priced (``lxkit.memory.contexts(layouts=2)``: the second 1.65 GB/rank outside
+    the pool, 2x2, distrib_la shape audit 2026-11-11).
     """
     from lxkit import memory
-    return (memory.contexts() if plan.backend in ("cusolvermp", "scalapack", "elpa")
-            else memory.Term())
+    if plan.backend == "cusolvermp":
+        return memory.contexts(layouts=2)
+    return memory.contexts() if plan.backend in ("scalapack", "elpa") else memory.Term()
 
 
 def _shapes(shapes):
@@ -178,9 +184,14 @@ def _workspace_details(plan, op, shapes, dtype):
             # buffers (no workspace output): the native size query, process handle.
             device, host = _vendor_query(0, op, (n,), dtype.str)
         else:
-            from distrib_la._cusolvermp import solve_layout
+            from distrib_la._cusolvermp import retry_block, solve_layout
             side, block = solve_layout(n, px)
             device, host = _vendor_query(ctx, op, (side, block), dtype.str)
+            # The checked chain's layout retry solves at a smaller block on the same side
+            # (retry_block, down to 8): its workspace is queried too and the larger priced.
+            retry = retry_block(n, px)
+            if retry is not None:
+                device = max(device, _vendor_query(ctx, op, (side, retry), dtype.str)[0])
         # Mp's workspace is allocated outside XLA, one per member a call holds; the checked
         # chain, its padded operand and the gathered retry are XLA buffers of the compiled
         # program (distrib_la.plan.compiled_bytes), not workspace.
@@ -302,19 +313,84 @@ def workspace_bytes_per_rank(plan, op, shapes, dtype, *, checked=False) -> int:
     return need
 
 
-def lu_workspace_bytes(mesh, n, dtype) -> int:
-    """Device bytes per rank one cuSOLVERMp solve_lu of an n x n system against n right-hand
-    sides allocates beside its operands (cudaMallocAsync, outside XLA's pool), per matrix: the
-    CUDA leg's measured row, 11.2 local panels at its blocks (``lxkit.memory.vendor``). Shapes
-    only: no vendor query -- cuSOLVERMp's bufferSize builds a cuBLASMp grid (an NCCL communicator
-    split) per call, which deadlocked a rank in libfabric's memory hooks (run30k, 2026-10-19)."""
+#: The getrs room a solve takes with none posted (cpp/cusolvermp/batched_solve_lu_ffi.cc,
+#: kGetrsDefaultCap): its RHS chunks take up to this beside the getrf workspace.
+GETRS_DEFAULT_ROOM = 2 << 30
+
+
+#: Every LU price is at the complex rate: the f64 one-tile workspace measured 53.0 / 83.5
+#: GB/rank at tiles 15360 / 20480 on 2x2, 0.70 / 0.62 of it (dlascale pmA/pmB).
+_LU_ITEM = 16
+
+
+def _lu_row(name):
+    from lxkit import leg_for_platform
+    return dict(leg_for_platform("CUDA").vendor_rows)[("cusolvermp", name)]
+
+
+#: The non-square one-tile row's unit (CUDA leg "solve_lu non-square"): L (a n + b nb) complex
+#: words plus a fixed c bytes.
+_LU_NONSQUARE = (0.82, 1.53, 32 << 20)
+
+
+def _lu_one_tile_unit(n, px, py):
+    """(row name, unit bytes) of one tile per rank: square, the CUDA leg's Px (L + mb) nb panels
+    (mb = L); non-square, L (0.82 n + 1.53 nb) + 32 MiB."""
+    local, nb = n // px, n // py
+    if px == py:
+        return "solve_lu", px * 2 * local * nb * _LU_ITEM
+    a, b, c = _LU_NONSQUARE
+    return "solve_lu non-square", local * (a * n + b * nb) * _LU_ITEM + c
+
+
+def lu_one_tile_bytes(n, px, py) -> float:
+    """Bytes per rank a cuSOLVERMp solve_lu of an n x n system against n right-hand sides
+    needs at one tile per rank: its workspace (the CUDA leg's one-tile row for the mesh's
+    shape) and its A and B tiles.  What ``_cusolvermp.lu_one_tile`` holds against the
+    solve's room, with no warning outside the row's range (a decision, not a price:
+    :func:`lu_workspace_model` is)."""
+    n, px, py = int(n), int(px), int(py)
+    name, unit = _lu_one_tile_unit(n, px, py)
+    return _lu_row(name).ratio * unit + 2 * (n // px) * (n // py) * _LU_ITEM
+
+
+def lu_workspace_model(n, px, py, itemsize=_LU_ITEM, room=None):
+    """:class:`lxkit.memory.Term`: device bytes per rank one cuSOLVERMp solve_lu of an n x n
+    system against n right-hand sides allocates beside its operands (cudaMallocAsync, outside
+    XLA's pool), from the shapes alone, at the layout the solve runs in ``room`` (``lu_layout``;
+    a non-square mesh it refuses raises its ValueError here).  The CUDA leg's measured rows
+    (``lxkit.memory.vendor``, local tile L), every dtype at the complex rate (:data:`_LU_ITEM`;
+    ``itemsize`` is not read): one tile per rank, 5.0 panels Px (L + mb) nb on a square mesh,
+    L (0.82 n + 1.53 nb) + 32 MiB on a non-square one; relabeled, 11.2
+    panels (L + mb) mb, floored at the getrs room the handler may take with none posted
+    (:data:`GETRS_DEFAULT_ROOM`).  The source names the row, EXTRAPOLATED outside its
+    measured L and P.  For a planner off the device (no native build); on one,
+    :func:`lu_workspace_query` is the figure."""
     from distrib_la._cusolvermp import lu_layout
     from lxkit import leg_for_platform, memory
-    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
-    side, mb, nb = lu_layout(int(n), px, py)
-    item = np.dtype(dtype).itemsize
-    return int(memory.vendor(leg_for_platform("CUDA"), "cusolvermp", "solve_lu", side, px * py, item,
-                             unit=(side // px + mb) * nb * item).fixed)
+    px, py = int(px), int(py)
+    side, mb, nb = lu_layout(int(n), px, py, room)
+    local = side // px
+    one = mb == local
+    name, unit = (_lu_one_tile_unit(side, px, py) if one
+                  else ("solve_lu relabeled", (local + mb) * nb * _LU_ITEM))
+    term = memory.vendor(leg_for_platform("CUDA"), "cusolvermp", name, local, px * py, _LU_ITEM, unit=unit)
+    if one or term.fixed >= GETRS_DEFAULT_ROOM:
+        return term
+    # Conservative on purpose: relabeled solves measured 0.44 / 0.68 GB at tiles 10004 / 15000
+    # (2x2), well under this floor, but the handler sizes its getrs chunks to the room it is
+    # given (2 GiB with none posted), so the room, not the measured figure, is what it may take.
+    return memory.Term(float(GETRS_DEFAULT_ROOM), source=f"the 2 GiB getrs room (above {term.source})")
+
+
+def lu_workspace_bytes(mesh, n, dtype, room=None) -> int:
+    """Device bytes per rank one cuSOLVERMp solve_lu of an n x n system against n right-hand
+    sides allocates beside its operands, per matrix: :func:`lu_workspace_model` at ``mesh`` in
+    the solve plan's ``room`` (its ``budget_bytes``: the layout the solve runs).
+    Shapes only: no vendor query -- cuSOLVERMp's bufferSize builds a cuBLASMp grid (an NCCL
+    communicator split) per call, which deadlocked a rank in libfabric's memory hooks (run30k,
+    2026-10-19)."""
+    return int(lu_workspace_model(n, mesh.shape['x'], mesh.shape['y'], np.dtype(dtype).itemsize, room).fixed)
 
 
 @lru_cache(maxsize=128)
@@ -358,15 +434,15 @@ def local_lu_workspace(mesh, n, dtype) -> int:
         destroy(handle)
 
 
-def lu_workspace_query(mesh, n, nrhs, dtype, cap) -> int:
+def lu_workspace_query(mesh, n, nrhs, dtype, cap, room=None) -> int:
     """Device bytes per rank the next cuSOLVERMp ``n x nrhs`` solve_lu allocates beside its
     operands with ``cap`` posted (``Plan.chunk_room``): the native size query
     (``lrx_lu_workspace_bytes``: getrf, the getrs chunk ``cap`` admits, pivots) on the solve's own
-    context and descriptors, which sizes and caches the plan the solve then runs; cached per cap.
-    Collective: every rank asks at the same point."""
+    context and descriptors (its layout in the solve plan's ``room``), which sizes and caches
+    the plan the solve then runs; cached per cap.  Collective: every rank asks at the same point."""
     from distrib_la._cusolvermp import get_or_init_context, lu_layout, rhs_layout
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
-    side, mb, nb = lu_layout(int(n), px, py)
+    side, mb, nb = lu_layout(int(n), px, py, room)
     cols, nb_b = rhs_layout(int(nrhs), py, mb != side // px)
     sizes = (side, cols, mb, nb, mb, nb_b)
     return _vendor_query(get_or_init_context(mesh, col_major=False), 'solve_lu', sizes + (int(cap),), dtype)[0]

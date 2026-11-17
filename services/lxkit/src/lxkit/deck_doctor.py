@@ -276,6 +276,42 @@ def _backend_lines(
     return lines
 
 
+def _lu_workspace_lines(config, *, n_rmu: int, science_mesh: tuple[int, int]) -> list[str]:
+    """The distributed W Dyson's cuSOLVERMp LU workspace per rank on the science mesh, from
+    the shapes (``gw.w_isdf.dyson_lu_workspace``: the CUDA leg's measured rows; the line names
+    the row), at the q-padded centroid count the planner prices.  A mesh cuSOLVERMp refuses
+    fails a deck that asks for the distributed Dyson; under local it is reported (the run
+    admits only the local Dyson)."""
+    px, py = science_mesh
+    if px * py <= 1:
+        return []
+    from gw.w_isdf import dyson_lu_workspace
+    n = -(-int(n_rmu) // (px * py)) * (px * py)
+    head = f"LU_WORKSPACE site=W-Dyson provider=cusolvermp mesh={px}x{py} n={n}"
+    # The layout is the run's room's (distrib_la._cusolvermp.lu_one_tile), which the deck does
+    # not fix: the line prices both ends, the 2 GiB getrs room and an unbounded one.
+    try:
+        low = dyson_lu_workspace(n, px, py)
+    except ValueError as exc:
+        try:
+            high = dyson_lu_workspace(n, px, py, room=1 << 62)
+        except ValueError:
+            high = None
+        if high is None and config.backend.w_dyson_solver == "distributed":
+            _fail("LX-DECK-LU-MESH", str(exc), "a square science mesh for the distributed W Dyson",
+                  "launch on a square rank count, or set w_dyson_solver = local")
+        if high is None:
+            return [f"{head} refused (only the local Dyson is admitted): {exc}"]
+        return [f"{head} one tile per rank only, admitted where the run's room holds "
+                f"{high.fixed / 1e9:.2f} GB/rank (else refused) model={high.source}"]
+    high = dyson_lu_workspace(n, px, py, room=1 << 62)
+    line = f"{head} bytes_per_rank={low.fixed / 1e9:.2f} GB model={low.source}"
+    if high.fixed > low.fixed:
+        line += (f"; one tile per rank where the run's room holds it: {high.fixed / 1e9:.2f} GB "
+                 f"model={high.source}")
+    return [line]
+
+
 def inspect_deck(args) -> None:
     """Run the source, deck, artifact and geometry preflights."""
     deck = Path(args.deck).expanduser().resolve()
@@ -366,6 +402,8 @@ def inspect_deck(args) -> None:
           f"pad={band_axis.pad} nelec={nelec} "
           f"ncond={config.ncond}")
 
+    for line in _lu_workspace_lines(config, n_rmu=n_rmu, science_mesh=(px, py)):
+        print(line)
     for line in _device_lines(gpu=args.gpu):
         print(line)
     for line in _backend_lines(

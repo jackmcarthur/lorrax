@@ -572,11 +572,19 @@ def pool_reservation(total: float, leg) -> float:
     return max(float(total) - _outside(leg, "distributed"), 0.5 * float(total))
 
 
-def contexts() -> Term:
-    """The providers' contexts a route opens where the budget did not withhold them (local)."""
+def contexts(layouts: int = 1) -> Term:
+    """The providers' contexts a route opens where the budget did not withhold them: the first
+    (the leg's ``distributed_context``) under ``linalg = local``; each of ``layouts - 1`` further
+    contexts (the leg's ``second_context``: cuSOLVERMp's other grid layout) always, since the
+    budget withholds one."""
     leg = _leg()
     size, src = getattr(leg, "distributed_context", (0.0, "")) if leg.accelerator else (0.0, "")
-    return Term(size if _RUN.get("linalg", "local") == "local" else 0.0, source=src)
+    more, more_src = getattr(leg, "second_context", (0.0, "")) if leg.accelerator else (0.0, "")
+    first = size if _RUN.get("linalg", "local") == "local" else 0.0
+    extra = max(0, int(layouts) - 1) * float(more)
+    if not extra:
+        return Term(first, source=src)
+    return Term(first + extra, source=(f"{src} + " if first else "") + f"{int(layouts) - 1} x {more_src}")
 
 
 def _agree(value: float) -> float:
