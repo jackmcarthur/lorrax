@@ -214,7 +214,7 @@ A refusal names the key or file and the fix. The ones most runs meet are listed 
     - The retired key `sigma_w_model` (use `compute_mode = tangential`); `sigma_w_accuracy`, `sigma_w_support_sites_ev`, `write_poles` or `write_w` without `compute_mode = tangential`. 
     - A key of the [other W models](../../theory/multipole-w.md#keywords) under `compute_mode = tangential`, and with the head off every head-fit sampling key. Delete them. 
     - `sigma_regularization_ev` that is not finite and positive. 
-    - `screening_diagrams = w_bse | w_rpa_resolvent` outside its supported treatments, on a centroid set that is not orbit-closed, or (`w_bse`) on a time-reversal-broken WFN. 
+    - `screening_diagrams = w_bse | w_rpa_resolvent` outside its supported treatments, on a centroid set that is not orbit-closed, or (`w_bse`) on a WFN whose time reversal is broken or, for a two-component WFN, not established by a QE schema. 
     - `sigma_frequency_integration = contour_deformation` with `qp_solver = self_consistent`, or with the deprecated `self_consistent = true` (`GATE cd_self_consistent_unimplemented`). 
     - `sc_initial_qp_rotations_file` without `qp_solver = self_consistent`. 
     - `sc_head_update` other than `off` with `head_correction = off`; `occ_broadening > 0` outside a QSGW run with a velocity head, or beside `occ_smearing_width_ry`. 

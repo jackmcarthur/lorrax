@@ -47,6 +47,19 @@ The dense kernel would be needed at every irreducible $\bq$, and its diagonaliza
 
 [`screening_diagrams`](../drivers/gw/keywords.md#screening_diagrams) selects the diagrams of $W$. `w_rpa` is the Dyson equation of [GW theory §2.4](../drivers/gw/theory.md#scr-w). `w_bse` evaluates (1.1) with $H^{\mathrm{BSE}}$, and `w_rpa_resolvent` evaluates it with $H^{\mathrm{RPA}}$, which reproduces the Dyson result and serves as a check of the resolvent route. The keyword entry lists the frequency treatments each choice supports.
 
+`w_bse` runs one-shot only. `qp_solver = self_consistent` refuses beside it, because every map would need its own RPA rung. It needs an insulator, an orbit-closed centroid set and a WFN on which time reversal holds. On a two-component WFN that verdict is read from the QE `data-file-schema.xml` ([Symmetry record](../using/inputs-from-dft.md#schema)). Without a matching schema time reversal counts as broken and the run refuses (`GATE w_bse_requires_measured_trs`), even for a nonmagnetic crystal.
+
+**What later runs read.** The self-energy uses the ladder $W$ at every frequency and in the $\bq\to0$ head. The static $W(0)$ inside $H^{\mathrm{BSE}}$ is the RPA one, and it is the $W(0)$ the ISDF tensor file keeps: `W0_qmunu`, `whead` and `W0_lr` carry the attribute `screening_diagrams = w_rpa`, and the file attribute `gw_screening_diagrams = w_bse` records the $W$ of the self-energy. A BSE or TD-aGW run, the BerkeleyGW export and the downfold on that file therefore screen with the RPA $W(0)$, and each prints a `W0 provenance:` line that says so.
+
+**Cost and progress.** The stage solves $N_\mu$ probe columns at every irreducible $\bq$ and every $z$. Each column takes a few GMRES iterations, and one iteration is one product (2.1). The stage prints its size once, then one line per solved block of columns with the iteration count, the residual, the wall time and an estimate of the time left. Screening-stage times measured on one node with four A100 GPUs, for silicon with spin–orbit coupling under COHSEX (one $z$, `head_correction = off`):
+
+| $N_k$ | Bands | $N_\mu$ | `w_rpa` | `w_rpa_resolvent` | `w_bse` |
+|---|---|---|---|---|---|
+| $4^3$ | 28 | 480 | 17 s | 62 s | 203 s |
+| $6^3$ | 68 | 756 | 22 s | 963 s | about 63 min, scaled from 623 of 3024 blocks |
+
+[`ladder_probe_chunk`](../drivers/gw/keywords.md#ladder_probe_chunk) bounds the memory of a block and does not change the time.
+
 ## Notation {: #notation }
 
 | Symbol | Meaning |

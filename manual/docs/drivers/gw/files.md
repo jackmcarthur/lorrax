@@ -217,9 +217,9 @@ tmp/isdf_tensors_<N_mu>.h5
   W0_qmunu                         complex128[N_q, N_mu, N_mu]      @W0_ready [@screening_diagrams]
   [W0_qmunu__qirr/]                q-wedge unfold tables
   [vhead]                          complex128       Ry bohr^3
-  [whead]                          complex128[n_w]                  @omega_grid [@head_correction @response_kind @head_source]
+  [whead]                          complex128[n_w]                  @omega_grid [@head_correction @response_kind @head_source @screening_diagrams]
   [S_cart_head]                    complex128[3, 3]                 @convention @omega_ry
-  [W0_lr/]                         Ft P gvec v q_frac               @n_z @sys_dim @head_kernel @convention
+  [W0_lr/]                         Ft P gvec v q_frac               @n_z @sys_dim @head_kernel @convention [@screening_diagrams]
   [tangential_member]             bytes[4]         path, schema, digest, iteration_id
 ```
 
@@ -234,7 +234,7 @@ tmp/isdf_tensors_<N_mu>.h5
 | $N_T$ | rows of `centroids_file_current` |
 | $n_\omega$ | 1 for `cohsex` and `tangential` (the static $W$); 2 for `gn_ppm` and `hl_ppm` ($0$ and the probe) |
 
-`W0_qmunu` is allocated as a zero placeholder with `W0_ready = false` when $V_\bq$ is written, and filled after screening. It stays a placeholder, with no head scalars, under `x_only`; consumers refuse it. A QSGW run writes $W_0$ once, from the accepted map. On `restart = true` the bundle is not rewritten, but $W_0$ and the head scalars are refreshed in place. The head scalars are described in [Stored head scalars](../../theory/q0-head.md#bse-scalars); `W0_lr/` holds the long-range channels of the static Dyson route.
+`W0_qmunu` is allocated as a zero placeholder with `W0_ready = false` when $V_\bq$ is written, and filled after screening. It stays a placeholder, with no head scalars, under `x_only`; consumers refuse it. A QSGW run writes $W_0$ once, from the accepted map. On `restart = true` the bundle is not rewritten, but $W_0$ and the head scalars are refreshed in place. The head scalars are described in [Stored head scalars](../../theory/q0-head.md#bse-scalars); `W0_lr/` holds the long-range channels of the static Dyson route. `screening_diagrams` on `W0_qmunu`, `whead` and `W0_lr/` names the diagrams of that stored $W$, and the file attribute `gw_screening_diagrams` names those of the $W$ the self-energy used. They differ after a `screening_diagrams = w_bse` run, whose stored $W_0$ is the RPA one ([Ladder vertex corrections](../../theory/ladder-w.md#lorrax)). A reader that needs one of them refuses the other (`GATE w0_series`), and a file whose members disagree refuses (`GATE w0_series_torn`).
 
 ## zeta_q.h5 {: #zeta }
 
