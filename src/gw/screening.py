@@ -1159,13 +1159,55 @@ def refuse_w_bse_without_trs(config, sym) -> None:
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
     if diagrams is ScreeningDiagrams.W_BSE and not _trs_verdict(sym):
+        got, fix = _trs_off_cause(sym)
         raise RuntimeError(
             "GATE w_bse_requires_measured_trs: screening_diagrams = w_bse "
-            "uses a time-reversal pair gauge for the ladder's anti-resonant "
-            "channel, but SymMaps.trs_allowed is false.  The measured DFT "
-            "reference therefore does not license that construction; use "
-            "screening_diagrams = w_rpa (or w_rpa_resolvent) until the "
-            "ladder owns a general ordered-response construction.")
+            "needs a DFT reference with time reversal, and SymMaps.trs_allowed "
+            "is false.\n"
+            f"  got:  {got}\n"
+            "  want: a reference whose time reversal QE's own data establishes\n"
+            f"  fix:  {fix}\n"
+            "  why:  the ladder uses a time-reversal pair gauge for its "
+            "anti-resonant channel, which a reference without time reversal "
+            "does not license.\n"
+            "  doc:  docs/architecture/bse.md, 'What the time-reversal gate "
+            "excludes'.")
+
+
+def _trs_off_cause(sym) -> tuple[str, str]:
+    """``(got, fix)`` of ``GATE w_bse_requires_measured_trs``.
+
+    The verdict is off for two kinds of reason with different fixes
+    (``symmetry_maps.density_symmetry_check.qe_trs_off_reason``): QE's data
+    says the reference breaks time reversal, or there is no QE data to say
+    that it holds.  The second is a two-component WFN staged without its
+    ``data-file-schema.xml`` (or without the SCF that fixes the moment):
+    ``WFN.h5`` alone does not say whether a spinor reference is magnetic.
+    """
+    stage = ("stage the data-file-schema.xml of the QE run that wrote the WFN "
+             "(its <prefix>.save) and the SCF's <prefix>.save beside the WFN "
+             "(its directory or the two above it) and rerun; a nonmagnetic "
+             "reference then passes (docs/preprocessing.md#magnetic)")
+    binding = getattr(sym, "qe_symmetry_binding", None)
+    if binding is None:
+        diagnostic = str(getattr(sym, "qe_symmetry_diagnostic",
+                                 "no QE schema receipt")).rstrip(".")
+        return ("no evidence either way: this two-component WFN has no "
+                f"matching QE data-file-schema.xml beside it ({diagnostic}), "
+                "and WFN.h5 alone does not say whether the reference is "
+                "magnetic, so time reversal is taken as off", stage)
+    if (not getattr(binding, "n_antiunitary", 0)
+            and getattr(binding, "scf_absolute_magnetization", 0.0) is None):
+        return ("no evidence either way: the WFN's data-file-schema.xml was "
+                "found, but no SCF schema whose charge density matches it, so "
+                "the absolute magnetization is unknown and time reversal is "
+                "taken as off", stage)
+    return ("the DFT reference breaks time reversal (the [2c-TRS] line of this "
+            "log gives QE's reason: an operation composed with time reversal, "
+            "an SCF moment of 1e-4 muB/cell or more, or a failed Kramers "
+            "check)",
+            "use screening_diagrams = w_rpa (or w_rpa_resolvent) until the "
+            "ladder owns a general ordered-response construction")
 
 
 def refuse_full_tangential_with_trs(config, sym) -> None:

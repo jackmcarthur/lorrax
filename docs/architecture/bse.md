@@ -872,6 +872,11 @@ reference is magnetic. The gate therefore excludes two classes:
    within seconds. Link `data-file-schema.xml` and the SCF `.save` beside the
    WFN (manual, Inputs from DFT, "Symmetry record") and the same WFN runs.
 
+The refusal names which class it met (`screening._trs_off_cause`): for class
+2 its `got:` line says "no evidence either way" and its `fix:` line says
+which files to stage (no schema beside the WFN, or a schema but no SCF whose
+charge density matches it); for class 1 the fix is `w_rpa`.
+
 The tangential adapter repeats the check on the bank
 (`GATE ladder_tangential_representation`). What remains available on those
 references: `w_rpa` (every route) and `w_rpa_resolvent` (COHSEX, GN-PPM; it

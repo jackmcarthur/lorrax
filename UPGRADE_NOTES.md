@@ -16,6 +16,11 @@ two combinations that ran before now refuse by name.
   densities, which no test, hsuite stage or reference run covers. Run the
   ladder on the two-component reference, or keep `w_rpa` for the bispinor
   run. `w_rpa_resolvent` is unchanged.
+- **Refusal text.** `GATE w_bse_requires_measured_trs` now says why the
+  time-reversal verdict is off. A two-component WFN staged without its QE
+  `data-file-schema.xml` (or without the SCF `.save` that fixes the moment)
+  gets "no evidence either way" and the files to stage beside the WFN;
+  before, every case was sent to `w_rpa`. The condition is unchanged.
 
 ## 2026-11-17 — Self-consistent metals: semicore floor, held quasiparticle class, one static Γ body
 
