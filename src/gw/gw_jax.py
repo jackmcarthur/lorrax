@@ -440,6 +440,8 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
     n_rmu = centroid_basis.n_rmu
     tmp_dir = os.path.join(input_dir, "tmp")
     os.makedirs(tmp_dir, exist_ok=True)
+    from file_io.restart_bundle import refuse_tmp_on_dvs
+    refuse_tmp_on_dvs(tmp_dir, config)
     tensors_filename = os.path.join(tmp_dir, f"isdf_tensors_{n_rmu}.h5")
     print_system_summary(
         n_rmu=n_rmu, fft_grid=wfn.fft_grid,

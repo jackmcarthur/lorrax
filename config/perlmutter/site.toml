@@ -46,3 +46,10 @@ beta_Bps = 19.7e9
 t_dispatch_s = 72e-6
 t_scan_step_s = 5.4e-6
 measured = "P16 (4 nodes x 4 A100-80GB), NCCL over OFI/cxi with FI_CXI_RDZV_THRESHOLD=0; all_to_all 1 KB-1 GB, model/measured 0.70-1.16"
+
+# Where a run's collective writes must not go.  Compute nodes mount these through Cray DVS
+# (login nodes mount CFS as GPFS), and DVS serves a collective MPI-IO write at stripe width 1:
+# job 61163888 wrote 440 GB of tmp/zeta_q.h5 to CFS at about 70 MB/s and timed out.
+# file_io.paths.dvs_reason reads this; a run's tmp/ belongs on $PSCRATCH (Lustre).
+[filesystems]
+compute_dvs_roots = ["/global/cfs", "/global/homes", "/global/u1", "/global/u2", "/global/common"]

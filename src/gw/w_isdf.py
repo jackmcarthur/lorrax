@@ -2102,15 +2102,34 @@ def dyson_route_prices(n, stack, ranks, contexts, lu_workspace=None):
     admission, and ``gw.stage_inventory``'s).  ``contexts``: the providers'
     contexts the distributed route opens (``lxkit.memory.contexts()``);
     ``lu_workspace``: its provider's solve workspace outside XLA
-    (:func:`dyson_lu_workspace`)."""
+    (:func:`dyson_lu_workspace`).
+
+    The distributed route (:func:`_get_w_solve_fn_distributed`) peaks at the larger of
+    its two phases.  The solve holds V, the scaled χ, A and the zero-padded copy B of V,
+    and cuSOLVERMp's jit (``distrib_la._cusolvermp.batched_distributed_solve_lu``) forms
+    their transposed, padded tiles A_T and B_T before its in-place FFI, so 6 face stacks
+    beside the vendor workspace.  The A-build before it holds V, χ and A, plus one q
+    block's slices, masked copies and product (6 face tiles a q).  Measured on 2x2 at
+    the 60k P = 36 tile (n 20004, 2 q, 10002 a rank, mempool high-water): build 18.50 GB
+    (priced 19.21), relabeled LU 19.66 (6 stacks 19.21 + vendor 0.45), one tile 49.99
+    (19.21 + 32.01)."""
     from lxkit import memory
+    from isdf.core import _chunk_q
     n2 = 16.0 * n * n
+    stack = int(stack)
     local_price = memory.Price(operands=memory.Term(
-        spread=3 * int(stack) * n2, grid=lambda p: n2 * (3 * -(-int(stack) // p) + 2),
+        spread=3 * stack * n2, grid=lambda p: n2 * (3 * -(-stack // p) + 2),
         source="V, chi, W faces + whole for ceil(stack/P) parents + one LU pair"), ranks=ranks)
+    # The A-build's q block: the solve's own rule (_chunk_q over one q's face panel).
+    tile = n2 / int(ranks)
+    qb = _chunk_q(stack, int(tile))
+    ws = lu_workspace or memory.Term()
+    build_over = max(0.0, (3 * stack + 6 * qb) * tile - 6 * stack * tile - ws.at(int(ranks)))
     mesh_price = memory.Price(operands=memory.Term(
-        spread=(3 * int(stack) + 2) * n2, source="V, chi, W faces + one face-tiled LU pair"),
-        vendor=lu_workspace or memory.Term(), outside=contexts, ranks=ranks)
+        spread=6 * stack * n2,
+        source="V, chi, A, B faces + the LU jit's transposed A_T, B_T (6 stacks)"),
+        xla=memory.Term(build_over, source=f"A-build q block ({qb} q, 6 tiles a q) beyond the LU"),
+        vendor=ws, outside=contexts, ranks=ranks)
     return local_price, mesh_price
 
 
@@ -2138,11 +2157,14 @@ def dyson_contexts(platform="CUDA"):
 
 
 def dyson_room(n, stack, ranks, budget, contexts=0.0, allocator_room=None):
-    """The distributed W Dyson plan's room per rank beside its V, chi, W faces and its provider
+    """The distributed W Dyson plan's room per rank beside what its solve holds and its provider
     contexts (``contexts`` bytes), capped by the allocator's current room: what its solve plan
     gets as ``budget_bytes`` (the size route's cap, and the room cuSOLVERMp's one tile per rank
-    must fit, ``distrib_la._cusolvermp.lu_one_tile``), so the admission prices the layout it runs."""
-    faces = 16.0 * n * n * 3 * int(stack) / int(ranks)
+    must fit, ``distrib_la._cusolvermp.lu_one_tile``), so the admission prices the layout it runs.
+    The solve holds V, χ, A and B and the LU jit's transposed A_T, B_T of every q
+    (:func:`dyson_route_prices`); ``lu_one_tile`` prices one q's transposed pair itself, so the
+    room leaves out 6·stack − 2 faces."""
+    faces = 16.0 * n * n * (6 * int(stack) - 2) / int(ranks)
     room = max(0, int(budget - faces - float(contexts)))
     return room if allocator_room is None else min(room, int(allocator_room))
 
@@ -2155,8 +2177,9 @@ def _dyson_route(dyson, n, stack, mesh_xy):
     1b, ``one_device``) cannot put the whole matrices that did not fit back on a rank.
 
     Local holds V, χ and W whole for its ⌈stack/P⌉ parents and one LU working
-    pair, beside the face-tiled V, χ and W; distributed holds the faces and
-    one face-tiled LU pair, plus its provider's solve workspace outside XLA
+    pair, beside the face-tiled V, χ and W; distributed holds V, χ, A, B and the
+    LU jit's transposed A_T, B_T, or the A-build's q block where that is larger
+    (:func:`dyson_route_prices`), plus its provider's solve workspace outside XLA
     (:func:`dyson_lu_workspace`). Priced from the shapes against the fixed device
     budget; distributed LU room is also capped by the current agreed allocator
     room. φ in the memory rule covers XLA's temporaries.

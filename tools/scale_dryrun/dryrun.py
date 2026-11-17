@@ -207,7 +207,8 @@ def deck(text):
     # calib=1: scale the tangential constructor by the one-node Al2O3 measurement (face route
     # x1.41 at the real side); Sigma tau is priced by stage_inventory either way.  The old
     # "ISDF setup + I/O" fit (333 B Q mu^2/P) was the Coulomb all-q validation at its widest
-    # admitted batch (64 q), which fills the room; it is priced at its floor now.
+    # admitted batch (64 q), which fills the room; stage_inventory now prices the report row as
+    # the larger of the psi load and the validation at the width the run admits.
     s["calib"] = bool(kv.get("calib", 0))
     for key, field in (("nmu", "nmu"), ("nb", "nb"), ("nv", "nv"), ("nq", "nq"), ("ng", "ng"),
                        ("nparent", "nparent"), ("nb_qp", "nb_qp"), ("sys_dim", "sys_dim"),

@@ -227,6 +227,12 @@ class SlabIO:
         else:
             backend_cls = _FfiBackend
         self._stack = backend_cls.journal_stack
+        # A collective MPI-IO write onto DVS runs at stripe width 1 (file_io.paths): every rank
+        # sees the same mounts, so every rank decides the same.  create_dataset refuses there.
+        self._dvs = None
+        if mode != "r" and backend_cls is _FfiBackend:
+            from .paths import dvs_reason
+            self._dvs = dvs_reason(self.path)
         try:
             with self._timing.measure("open"):
                 self._backend = backend_cls(self.path, mesh=mesh, mode=mode)
@@ -335,7 +341,23 @@ class SlabIO:
         Datasets created by this transport are contiguous.  The native
         collective create has no chunk-layout argument, so SlabIO does not
         expose a no-op ``chunks=`` compatibility parameter.
+
+        On DVS (:func:`file_io.paths.dvs_reason`) a dataset over
+        :data:`file_io.paths.DVS_COLLECTIVE_LIMIT` REFUSES, on every rank, before
+        the rendezvous: DVS serves a collective write at stripe width 1.
         """
+        dvs = getattr(self, "_dvs", None)
+        if dvs is not None:
+            from .paths import DVS_COLLECTIVE_LIMIT
+            nbytes = int(np.prod([int(s) for s in shape])) * np.dtype(dtype).itemsize
+            if nbytes > DVS_COLLECTIVE_LIMIT:
+                raise RuntimeError(
+                    f"GATE collective_write_on_dvs: {name!r} in {self.path} is "
+                    f"{nbytes / 1e9:.1f} GB, a collective MPI-IO write, and {dvs}; DVS "
+                    f"serves it at stripe width 1 (job 61163888: 440 GB at about 70 MB/s); "
+                    f"want at most {DVS_COLLECTIVE_LIMIT / 1e9:.1f} GB there; fix: put the "
+                    f"file on striped scratch (Perlmutter: $PSCRATCH), e.g. the run "
+                    f"directory or a tmp/ symlink there")
         with _journal.op_scope("create", self.path, stack=self._stack, ds=name,
                                cnt=tuple(int(s) for s in shape),
                                mode=self.mode, handle=self._handle()):

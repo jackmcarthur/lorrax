@@ -276,6 +276,28 @@ def _backend_lines(
     return lines
 
 
+def _tmp_filesystem_lines(config, deck: Path) -> list[str]:
+    """The run's tmp/ (beside the deck) against DVS as the compute nodes see it
+    (``file_io.paths.dvs_reason``: the mount, else the site profile's ``compute_dvs_roots``,
+    since a login node mounts CFS as GPFS).  It fails a deck that writes the restart tensors
+    there (``file_io.restart_bundle.refuse_tmp_on_dvs``, the run's own gate) and warns
+    otherwise."""
+    from file_io.paths import dvs_reason
+    from file_io.restart_bundle import TMP_ON_DVS_FIX
+    tmp = deck.parent / "tmp"
+    why = dvs_reason(tmp)
+    if why is None:
+        return [f"TMP_FILESYSTEM OK path={tmp}"]
+    if bool(getattr(config, "write_restart_tensors", False)):
+        _fail("LX-DECK-TMP-DVS",
+              f"tmp/ {why}, and write_restart_tensors = true writes the restart tensors there "
+              "by collective MPI-IO (DVS stripe width 1; job 61163888: 440 GB at about 70 MB/s)",
+              "tmp/ on striped scratch",
+              f"{TMP_ON_DVS_FIX}, or set write_restart_tensors = false")
+    return [f"TMP_FILESYSTEM WARNING path={tmp}: {why}; collective writes there run at DVS "
+            f"stripe width 1 and one over 1 GB refuses; fix: {TMP_ON_DVS_FIX}"]
+
+
 def _lu_workspace_lines(config, *, n_rmu: int, science_mesh: tuple[int, int]) -> list[str]:
     """The distributed W Dyson's cuSOLVERMp LU workspace per rank on the science mesh, from
     the shapes (``gw.w_isdf.dyson_lu_workspace``: the CUDA leg's measured rows; the line names
@@ -367,6 +389,8 @@ def inspect_deck(args) -> None:
 
     rows = required_input_paths(config, deck, n_rmu=n_rmu)
     _check_input_rows(rows, already_reported=reported_inputs)
+    for line in _tmp_filesystem_lines(config, deck):
+        print(line)
 
     print(f"CONFIG_MODE compute_mode={config.compute_mode.value} "
           f"qp_solver={config.qp_solver.value} bispinor={config.bispinor}")

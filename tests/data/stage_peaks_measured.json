@@ -10,7 +10,6 @@
     "nb": 3264,
     "nmu": 16320,
     "trs": false,
-    "validation_width": 4,
     "nk": 4,
     "n_parent": 2,
     "nq": 2,
@@ -30,7 +29,7 @@
     "sys_dim": 2
    },
    "measured": {
-    "ISDF setup + I/O": 49.62,
+    "ISDF load": 49.62,
     "zeta C = (psi psi)(psi psi)^H": 43.09,
     "zeta factor B": 39.26,
     "V(q)": 23.31,
@@ -53,7 +52,6 @@
     "nb": 1632,
     "nmu": 8160,
     "trs": true,
-    "validation_width": 4,
     "nk": 4,
     "n_parent": 2,
     "nq": 2,
@@ -73,7 +71,7 @@
     "sys_dim": 2
    },
    "measured": {
-    "ISDF setup + I/O": 24.39,
+    "ISDF load": 24.39,
     "zeta C = (psi psi)(psi psi)^H": 13.77,
     "zeta factor B": 12.81,
     "V(q)": 16.25,
@@ -112,11 +110,10 @@
      4
     ],
     "trs": true,
-    "sys_dim": 3,
-    "validation_width": 64
+    "sys_dim": 3
    },
    "measured": {
-    "ISDF setup + I/O": 0.47,
+    "ISDF load": 0.47,
     "zeta C = (psi psi)(psi psi)^H": 14.99,
     "zeta factor B": 14.27,
     "V(q)": 23.13,
@@ -128,7 +125,8 @@
     "Sigma tau sweep": 11.66,
     "Sigma other": 11.9,
     "Sigma Hartree": 5.89,
-    "Coulomb all-q validation": 38.98
+    "Coulomb all-q validation": 38.98,
+    "ISDF setup + I/O": 38.98
    }
   },
   {
@@ -157,7 +155,6 @@
     ],
     "trs": true,
     "sys_dim": 3,
-    "validation_width": 64,
     "n_pole": 5224
    },
    "measured": {
@@ -192,7 +189,6 @@
     ],
     "trs": true,
     "sys_dim": 3,
-    "validation_width": 64,
     "n_pole": 5224,
     "tangential_route": "face"
    },
@@ -200,6 +196,40 @@
     "Sigma tau sweep (tangential)": 28.55,
     "Sigma exchange": 5.12,
     "Sigma Hartree": 4.03
+   }
+  },
+  {
+   "name": "MoS2/hBN 148 atoms, 9010 bands, N_mu 60012, P 36",
+   "P": 36,
+   "linalg": "distributed",
+   "source": "job 60432704, main 93c2d320e: the report's TIMING device GB (pool high-water per row; no memory trace). W (29.34) is left out: it ran the one-tile LU layout main no longer takes.",
+   "deck": {
+    "nb": 9010,
+    "nmu": 60012,
+    "trs": true,
+    "nk": 4,
+    "n_parent": 2,
+    "nq": 2,
+    "ns": 2,
+    "nb_qp": 832,
+    "ng": 229376,
+    "fft": [
+     128,
+     128,
+     250
+    ],
+    "kgrid": [
+     2,
+     2,
+     1
+    ],
+    "sys_dim": 2
+   },
+   "measured": {
+    "zeta C = (psi psi)(psi psi)^H": 47.23,
+    "V(q)": 20.43,
+    "ISDF setup + I/O": 32.84,
+    "chi0": 27.18
    }
   }
  ]

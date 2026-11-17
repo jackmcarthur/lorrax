@@ -1147,8 +1147,18 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
    the smallest square mesh and its binding stage in seconds;
    `tools/scale_dryrun/dryrun.py` prints the table. Every stage of five one-node
    runs (MoS₂/hBN N_μ 8160 and 16320, Al₂O₃ 4³ N_μ 6000 GN-PPM, and tangential on both Σ
-   factor routes) prices within 0.86–1.22 of its measured peak, tangential Σ(τ) within
-   5 % (`tests/test_stage_inventory_calibration.py`). At large N_μ the
+   factor routes) prices within 0.80–1.22 of its measured peak, tangential Σ(τ) within
+   5 %, and the nine-node MoS₂/hBN N_μ 60012 run at P = 36 within 0.83–1.07 on ζ C, V(q),
+   ISDF setup and χ₀ (`tests/test_stage_inventory_calibration.py`). Three terms grow
+   with the mesh or fill the room, so P = 4 alone does not fix them. χ₀'s axis
+   layout holds band-complete ψ banks of `(p_x + p_y)/2 · F` per rank (6 F on 6×6),
+   beside its `[N_k, μ, μ]` accumulator and one row window
+   (`stage_inventory.chi0_route`). The report's "ISDF setup + I/O" row also holds the
+   all-q Coulomb validation, at the widest q batch that fits (4 q, 25.6 GB at 60k;
+   `stage_inventory.validation_width`). The distributed W Dyson holds six face
+   stacks (V, χ, A, B and the LU jit's transposed A_T, B_T) beside cuSOLVERMp's
+   workspace, or the A-build's q block where that is larger (`w_isdf.dyson_route_prices`;
+   a 2×2 run at the 60k tile measured 0.92–0.98 of it, `tests/test_w_dyson_price_cpu.py`). At large N_μ the
    first wall on a 2×2×1 slab is the ζ fit's C_q assembly, `(N_k + n_par)·n_s²·16μ²/P`
    of pair products beside C (1.5 G/P), not Σ(τ): the GN-PPM Σ(τ) node streams rows
    within the fixed tile, its band-complete ψ falling as `1/sqrt(P)`. Tangential Σ(τ)

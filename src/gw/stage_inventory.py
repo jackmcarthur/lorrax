@@ -52,7 +52,8 @@ class Deck:
     used (antiunitary Green rows in Σ).  ``hartree_unchunked``: the density scan
     before 2410aa812 boxed every local band at once (reports older than it).  ``sys_dim``
     2: a slab (a second V(q) stack, the long-range channel).  ``validation_width``: q per
-    program of the all-q Coulomb validation (1, its floor; a run admits the widest that fits).
+    program of the all-q Coulomb validation; ``"auto"``, the run's own choice (the widest of
+    min(64, nk), /2, ... 1 that fits the budget, floor 1: :func:`validation_width`).
     ``n_pole``: the tangential store's pole columns per q (``Kmax``; 0: GN-PPM only).
     ``tangential_route``: ``"auto"``, the Σ schedule's own choice (replicated pole columns
     where they fit, else the face panels); ``"face"`` or ``"axis"`` holds it there."""
@@ -68,7 +69,7 @@ class Deck:
     kgrid: tuple = (1, 1, 1)
     trs: bool = True
     sys_dim: int = 3
-    validation_width: int = 1
+    validation_width: int | str = "auto"
     n_pole: int = 0
     hartree_unchunked: bool = False
     tangential_route: str = "auto"
@@ -89,6 +90,60 @@ def _units(d: Deck, P: int) -> dict:
     return dict(mu=mu, nb=nb, M=M, QM=d.nq * M, n2=C16 * mu * mu,
                 F=2 * C16 * d.n_parent * nb * d.ns * mu / P,
                 PsiG=C16 * d.n_parent * nb * d.ns * d.ng / P)
+
+
+#: The all-q Coulomb validation's program per q (gw_init._canonical_coulomb_stats: the q and
+#: -q unfolds, their masked difference and the finite-stats pass; Al2O3 4^3 P4 took 64 q in
+#: 36.9 GB above its residents).
+VALIDATION_PER_Q = 4
+
+
+def validation_width(d: Deck, P: int) -> int:
+    """q per program of the all-q Coulomb validation: ``d.validation_width``, or under ``"auto"``
+    the run's own rule (gw_init._canonical_coulomb_stats' memory.admit): the widest of
+    min(64, nk), its halvings, ... 1 whose program fits the room beside V(q) and the faces,
+    floor 1 (the rung that runs where nothing fits)."""
+    if d.validation_width != "auto":
+        return int(d.validation_width)
+    u = _units(d, P)
+    room = BUDGET["local"] - (u["QM"] + u["F"])
+    width = min(64, int(d.nk))
+    while width > 1 and VALIDATION_PER_Q * width * u["M"] > room:
+        width //= 2
+    return max(1, width)
+
+
+def chi0_route(d: Deck, P: int) -> dict:
+    """χ₀'s sum-band layout and its bytes (subtile_stream.prepare_green_operands, the fused minimax
+    kernel w_isdf._get_chi_minimax_kernel_fused), per rank.
+
+    ``axis`` band-completes both centroid faces once per call (green_operand_program): the left
+    ψ rows (nk, μ, s, n) on X alone, F/2 · py, and the right ones on Y alone, F/2 · px, so the
+    banks are (px + py)/2 · F (2 F on 2x2, 6 F on 6x6).  The consumer holds the [nk, μ, μ]
+    accumulator on the face and one row-pass window (plan_windows: rows near TILE_BYTES of the
+    kernel's row_bytes, every local row where they fit).  The run takes ``axis`` where banks and
+    consumer fit the room beside V(q) and the faces, else ``face``, whose consumer forms the
+    right operand's conjugation inside its own program (one F)."""
+    from runtime.tiles import TILE_BYTES
+    u = _units(d, P)
+    px, py = _mesh(P)
+    nV = 2 if d.sys_dim == 2 else 1
+    mu, nb = u["mu"], u["nb"]
+    nu = mu // py
+    # w_isdf._get_chi_minimax_kernel_fused row_bytes: two parent Greens (GN-PPM's real τ), one
+    # output's χ_R and its transform, and the window's ψ row.
+    row = C16 * (2 * d.n_parent * d.ns * d.ns * nu + 2 * d.nk * nu + d.n_parent * d.ns * nb)
+    window = min(float(TILE_BYTES), (mu // px) * row)
+    consumer = d.nk * u["M"] + window
+    residents = nV * u["QM"] + u["F"]
+    banks = (px + py) / 2 * u["F"]
+    if residents + banks + consumer <= BUDGET["local"]:
+        return dict(layout="axis", residents=residents, xla=banks + consumer,
+                    source=f"axis banks (px+py)/2 F + chi0 [nk, mu, mu] + one {window / GB:.2f} GB "
+                           "row window")
+    return dict(layout="face", residents=residents, xla=u["F"] + consumer,
+                source=f"face: right conjugation F + chi0 [nk, mu, mu] + one {window / GB:.2f} GB "
+                       "row window")
 
 
 def _p(stage, operands, xla, src_ops, src_xla, ranks):
@@ -196,16 +251,20 @@ def _stage_prices(d: Deck, P: int) -> tuple:
     # ISDF setup + I/O: gw_jax.load_centroid_wfns.  psi_G_store.gslot.read holds the
     # band-sharded read copy beside the G-sharded slice; a2a_faces' exchange adds its
     # temp and output (one slice each) while forming the two faces.
-    st["ISDF setup + I/O"] = (("only", _p("ISDF setup + I/O", PsiG + F, 3 * PsiG,
-                                          "psi(G) G slice + faces",
-                                          f"read copy + face exchange temp/out, 3 psi(G) slices [{trace}]",
-                                          P)),)
+    load = _p("ISDF load", PsiG + F, 3 * PsiG, "psi(G) G slice + faces",
+              f"read copy + face exchange temp/out, 3 psi(G) slices [{trace}]", P)
+    st["ISDF load"] = (("only", load),)
     # gw_init's canonical Coulomb all-q validation: compiled programs of 64, 32, ... 1 full-zone
     # q, the widest that fits the room admitted (4 M a q: Al2O3 4^3 took 64 q, 36.9 GB, the run's
-    # peak).  It fills the room, so its floor is one q.
-    st["Coulomb all-q validation"] = (("only", _p(
-        "Coulomb all-q validation", QM + F, 4 * d.validation_width * M, "V(q) + faces",
-        f"4 M per q, {d.validation_width} q a program (floor 1) [{trace}]", P)),)
+    # peak; MoS2/hBN 60k P36 took all 4, 25.6 GB).
+    w = validation_width(d, P)
+    check = _p("Coulomb all-q validation", QM + F, VALIDATION_PER_Q * w * M, "V(q) + faces",
+               f"4 M per q, {w} q a program (the widest that fits, floor 1) [{trace}]", P)
+    st["Coulomb all-q validation"] = (("only", check),)
+    # The report's "ISDF setup + I/O" row is gw_jax.isdf outside zeta, V(q) and restart I/O
+    # (production_report): the load and the validation (_finalize_vq_views), so its peak is the
+    # larger of the two.
+    st["ISDF setup + I/O"] = (("only", max(load, check, key=lambda p: p.bytes())),)
     # zeta_fit.CCT: c_q_from_psi_sm's face GEMM (m = n = mu*ns per parent) forms the pair
     # products on the parents and their full-zone unfold, (nk + n_par) ns^2 M, beside one
     # pair of faces, and returns C on the face (QM).
@@ -233,10 +292,10 @@ def _stage_prices(d: Deck, P: int) -> tuple:
     st["V(q)"] = (("only", _p("V(q)", 2 * QM + F, 6 * C16 * q_pad * mu * z.g_tile / P,
                               "B + V accumulator + faces",
                               "plan_zeta_route_g G tile, 6 x 16 Q_pad mu g_tile / P", P)),)
-    # chi.exec: chi0 [nk, mu, mu] on the face (+15 % program temp), the faces' placement
-    # (out 2 F, temp F), beside V(q).
-    st["chi0"] = (("only", _p("chi0", nV * QM + F, 1.15 * d.nk * M + 3 * F, "V(q) + faces",
-                              f"chi0 [nk, mu, mu] + placement [{trace}]", P)),)
+    # chi.exec: the sum-band layout the run takes (chi0_route), beside V(q) and the faces.
+    chi = chi0_route(d, P)
+    st["chi0"] = (("only", _p("chi0", chi["residents"], chi["xla"], "V(q) + faces",
+                              f"{chi['source']} [{trace}; MoS2/hBN 60k P36]", P)),)
     # W.slice_to_ibz: chi0 still whole-zone beside its q-wedge slice.
     st["W slice to IBZ"] = (("only", _p("W slice to IBZ", nV * QM + F + d.nk * M, QM,
                                         "V(q) + faces + chi0", f"wedge slice [{trace}]", P)),)
@@ -254,8 +313,10 @@ def _stage_prices(d: Deck, P: int) -> tuple:
         lu_ws = None
     loc, dist = dyson_route_prices(mu, d.nq, P, memory.Term(
         contexts, source="lxkit.legs CUDA contexts, both cuSOLVERMp grids"), lu_ws)
-    st["W"] = (("local", loc + _p("W", F, 0.0, "faces", "", P)),) + (
-        () if lu_ws is None else (("distributed", dist + _p("W", F, 0.0, "faces", "", P)),))
+    # Beside the solve: the faces and, on a slab, the long-range channel's V (chi0's residents).
+    beside = _p("W", F + (nV - 1) * QM, 0.0, "faces + the slab's second V(q)", "", P)
+    st["W"] = (("local", loc + beside),) + (
+        () if lu_ws is None else (("distributed", dist + beside),))
     # Sigma residents (sigma.exchange / tau_sweep entry): V(q), the W pair (the GN-PPM pole
     # pair in the sweep), faces; tangential holds B in place of the pair (its poles are read
     # by the sweep, below).

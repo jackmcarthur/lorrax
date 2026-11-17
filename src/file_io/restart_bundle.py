@@ -5245,3 +5245,32 @@ def require_parent_screening_consumer(config):
         f"{diagrams} under compute_mode = {mode} has not been ported to raw "
         "parents; use screening_diagrams = w_rpa, or a resolvent diagram "
         "with compute_mode = cohsex or gn_ppm.")
+
+
+#: What every refusal and warning of a tmp/ on DVS says to do.
+TMP_ON_DVS_FIX = ("put the run directory on striped scratch (Perlmutter: $PSCRATCH), or make "
+                  "tmp/ a symlink to a directory there")
+
+
+def refuse_tmp_on_dvs(tmp_dir, config) -> None:
+    """Refuse a run whose tmp/ is on DVS (``file_io.paths.dvs_reason``) when it writes the restart
+    tensors there; warn otherwise.
+
+    tmp/ takes the run's large collective MPI-IO writes (``zeta_q.h5``, deferred during the V
+    pass, and ``isdf_tensors_{n_rmu}.h5``, both under ``write_restart_tensors``), and DVS serves
+    them at stripe width 1: job 61163888 wrote 440 GB of zeta_q.h5 to CFS at about 70 MB/s and
+    timed out in stage 1.  Every rank sees the same mounts, so every rank decides the same."""
+    from .paths import dvs_reason
+    why = dvs_reason(tmp_dir)
+    if why is None:
+        return
+    if bool(getattr(config, "write_restart_tensors", False)):
+        raise RuntimeError(
+            f"GATE tmp_on_dvs: tmp/ {why}, and write_restart_tensors = true writes the restart "
+            f"tensors there by collective MPI-IO, which DVS serves at stripe width 1 (job "
+            f"61163888: a 440 GB zeta_q.h5 at about 70 MB/s, timed out); want tmp/ on striped "
+            f"scratch; fix: {TMP_ON_DVS_FIX}, or set write_restart_tensors = false")
+    log.warning(
+        f"tmp/ {why}: every collective write there (and a restart read) runs at DVS stripe "
+        f"width 1, and file_io.slab_io refuses one over 1 GB; fix: {TMP_ON_DVS_FIX}",
+        extra=log_message("tmp_on_dvs", found=("tmp/", why), fix=TMP_ON_DVS_FIX))
