@@ -14,7 +14,7 @@ re-exports it as ``compute_hartree_matrix``.  The SC rebuild
 (``gw.sc_iteration.rebuild_hartree_dft_basis``) is a second copy of this
 chain and moves here in ARCH wave 3.
 
-The on-site Breit field (design note ``ONSITE_INCODE.md`` section 2) is
+The on-site Breit field (``docs/dev/onsite_breit.md`` section 2) is
 assembled here too, by one function for the three callers (the one-shot
 Hamiltonian, the SC rebuild and ``gw.onsite_breit_cli``)::
 
@@ -529,7 +529,7 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
 
 
 # ===========================================================================
-#  On-site Breit field (ONSITE_INCODE.md sections 2-4)
+#  On-site Breit field (docs/dev/onsite_breit.md sections 2-4)
 # ===========================================================================
 #
 # ONE ASSEMBLY FOR THREE CALLERS.  The one-shot Hamiltonian
@@ -592,7 +592,7 @@ def _onsite_gate(rule, got, want, why, fix):
     return ValueError(
         f"GATE {rule}: {why.split(';')[0]}\n  got:  {got}\n  want: {want}\n"
         f"  why:  {why}\n  fix:  {fix}\n  doc:  src/gw/hartree.py (onsite_breit_field); "
-        "ONSITE_INCODE.md")
+        "docs/dev/onsite_breit.md")
 
 
 def _file_sha256(path) -> str:
@@ -703,9 +703,9 @@ def onsite_breit_setup_for(config, wfn, *, input_dir, tt_exchange: bool):
                  f"rows [{sa['start']}, {sa['stop']}) of the on-site axis")
     if ex == "paw":
         log.info("  onsite_breit_exchange = paw assumes the on-site part of Sigma's TT exchange "
-                 "equals h^x_PS: NOT VALIDATED (ONSITE_INCODE.md section 3)")
+                 "equals h^x_PS: NOT VALIDATED (docs/dev/onsite_breit.md section 3)")
     log.info("  not included: i[r, H_OS] in the velocity (dipole, head, orbital moment); "
-             "on-site spin-spin and orbit-orbit; exchange with other shells (ONSITE_INCODE.md "
+             "on-site spin-spin and orbit-orbit; exchange with other shells (docs/dev/onsite_breit.md "
              "section 8)")
     return setup
 
@@ -860,7 +860,7 @@ def onsite_breit_field(wfn, sym, setup, *, band_range, mesh, U=None, occupations
     -------
     OnsiteBreitField
 
-    The physics, in order (design note section 2)::
+    The physics, in order (docs/dev/onsite_breit.md section 2)::
 
         P[k, a, n] = <phi~_a(k)|psi_nk>                         (cached per run)
         w_k        = 1 / nk_full

@@ -1,4 +1,4 @@
-"""The on-site Breit debug file ``onsite_breit.h5`` (design note ``ONSITE_INCODE.md`` section 6).
+"""The on-site Breit debug file ``onsite_breit.h5`` (``docs/dev/onsite_breit.md`` section 6).
 
 Written by ``gw.onsite_breit_cli`` (``onsite_breit.h5`` beside the deck) and
 by the SC loop (``onsite_breit_iterNNNN.h5`` beside ``sigma_lorentz_iterNNNN.h5``).

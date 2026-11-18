@@ -4249,7 +4249,7 @@ def _onsite_breit_gate(got: str, want: str, why: str, fix: str) -> ValueError:
     return ValueError(
         f"GATE onsite_breit_keys: {why.split(';')[0]}\n"
         f"  got:  {got}\n  want: {want}\n  why:  {why}\n  fix:  {fix}\n"
-        "  doc:  docs/input_reference.md (onsite_breit); ONSITE_INCODE.md section 3")
+        "  doc:  docs/input_reference.md (onsite_breit); docs/dev/onsite_breit.md section 3")
 
 
 def refuse_unsupported_onsite_breit(config, named_keys=frozenset()) -> None:
@@ -4282,7 +4282,7 @@ def refuse_unsupported_onsite_breit(config, named_keys=frozenset()) -> None:
             "onsite_breit = true, onsite_breit_files = ''",
             "onsite_breit_files = <El>.onsite_breit.json ... (deck-relative, one per species)",
             "the radial integrals of the operator come only from the sidecar files",
-            "name the sidecar files (breit_salvage/onsite_sidecar/make_sidecar.py)")
+            "name the sidecar files (write them with python -m psp.onsite_breit_sidecar; docs/dev/onsite_breit.md section 7)")
     missing = [k for k in ("onsite_breit_double_counting", "onsite_breit_exchange")
                if not str(getattr(config, k)).strip()]
     if missing:

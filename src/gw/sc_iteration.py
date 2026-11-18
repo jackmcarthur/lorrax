@@ -544,7 +544,7 @@ class SCExactHartree:
     ``sigma_mnk.h5``'s decomposition; :attr:`total` is the only combination
     that enters the Hamiltonian.
 
-    ON-SITE BREIT (``onsite_breit = true``, design note ``ONSITE_INCODE.md``
+    ON-SITE BREIT (``onsite_breit = true``, ``docs/dev/onsite_breit.md``
     section 4).  ``transverse_dft`` already CONTAINS H_OS[D_i]
     (``H_T + H_OS`` on a bispinor deck, ``H_OS`` alone on a scalar deck).
     ``onsite_dft`` is that on-site matrix alone, ``(nk_loop, nb, nb)`` Ry,
@@ -2194,7 +2194,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
     if H_transverse is not None:
         H_transverse = physical_hartree(H_transverse, 'transverse')
 
-    # ON-SITE BREIT, H_OS[D_i] (design note ONSITE_INCODE.md sections 2-4):
+    # ON-SITE BREIT, H_OS[D_i] (docs/dev/onsite_breit.md sections 2-4):
     # from THIS map's orbitals and occupations, the same (U, f) as rho_i and
     # J_i above, on the full BZ at the logical window; straight feedback, no
     # mixing; kin_ion_dft stays pristine, so nothing is counted twice.

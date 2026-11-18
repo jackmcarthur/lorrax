@@ -9,8 +9,10 @@ devices).  Run::
         python -m pytest tests/test_onsite_breit.py -q -p no:cacheprovider
 
 Data (``tests/data/onsite_breit/``): the species sidecars ``Fe/Cr/Cl.onsite_breit.json``
-and the atomic-limit fixtures written by ``breit_salvage/onsite_sidecar/make_sidecar.py``
-(sha256 in its README), ``reference_values.json`` (numbers of the validated
+and the atomic-limit fixtures written by the earlier sidecar generator
+(``provenance.generator`` in each file; the in-repo generator is
+``psp.onsite_breit_sidecar``, docs/dev/onsite_breit.md section 7),
+``reference_values.json`` (numbers of the validated
 post-processing code ``onsite_ops`` on the same tensors, with recipes), and the
 two CrCl3 UPFs the Cr/Cl sidecars authenticate against.
 
@@ -37,8 +39,8 @@ DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "onsite_
 ALPHA_REF = 1.0 / 137.035999084
 SCALE_REF = (ALPHA_REF / ob.ALPHA) ** 2          # module value -> reference value
 HA_TO_MEV = ob.HA_TO_RY * ob.RY_TO_MEV
-# The sidecar's *_mev fields were written by make_sidecar.py with QE's Rydberg
-# (13.605693122994 eV, breit_salvage/onsite_breit/breit_arms.RY); the module logs
+# The sidecar's *_mev fields were written by the earlier generator with QE's Rydberg
+# (13.605693122994 eV); the module logs
 # with common.units.RYD_TO_EV (3.6e-7 relative apart), so the pin uses the generator's.
 HA_TO_MEV_SIDECAR = 2.0 * 13605.693122994
 
@@ -237,7 +239,7 @@ def test_classical_atomic_limits_and_regression(sc, ref):
         v /= np.linalg.norm(v)
         e = v.conj() @ sum(ob.meanfield_pieces(lam, np.outer(v, v.conj())).values()) @ v
         assert worst < 1e-13 * scale and abs(e) < 1e-13 * scale
-    # atomic limit (ONSITE_BREIT 1.6 T6): Cr3+ b = -0.9499, (l+1/2) dxi_x = +1.0988; Fe2+ -2.2577, +2.6109 meV
+    # atomic limit (reference_values.json "t6"): Cr3+ b = -0.9499, (l+1/2) dxi_x = +1.0988; Fe2+ -2.2577, +2.6109 meV
     lz = ob._lmats(2)[2]
     Lz = ob.shell_operators(2)["L"][2]
     for fx, nup, b_doc, x_doc in (("Cr3plus_uhf3dup", 3, -0.9499, 1.0988), ("Fe2plus_uhf3dup", 5, -2.2577, 2.6109)):

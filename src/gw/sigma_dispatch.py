@@ -565,7 +565,7 @@ def onsite_breit_into_transverse(h_transverse, h_onsite, *, like,
                                  double_counting: str):
     """The transverse direct-field slot with the on-site Breit matrix in it.
 
-    Design note ``ONSITE_INCODE.md`` sections 3 and 4 (breit salvage)::
+    ``docs/dev/onsite_breit.md`` sections 3 and 4::
 
         H_T <- H_T + H_OS[D]    bispinor deck, onsite_breit_double_counting = paw
         H_T <- H_OS[D]          scalar deck, onsite_only (no smooth alpha.A in the run)
