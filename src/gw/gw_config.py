@@ -4262,7 +4262,9 @@ def refuse_unsupported_onsite_breit(config, named_keys=frozenset()) -> None:
     their values and pairing with ``bispinor`` go through the one owner,
     ``psp.onsite_breit.resolve_onsite_keys`` (the pairing with Sigma's
     transverse exchange is checked where Sigma is known,
-    ``gw.hartree.onsite_breit_setup_for``).  A self-consistent run needs the
+    ``gw.hartree.onsite_breit_setup_for``).  ``paw`` also needs the smooth
+    transverse direct field it completes: ``bispinor_transverse_hartree =
+    false`` beside it refuses.  A self-consistent run needs the
     live density rebuild, because D is rebuilt from each map's orbitals there.
     The projector name and the files themselves are checked when the setup
     is built (the WFN is needed).
@@ -4295,8 +4297,17 @@ def refuse_unsupported_onsite_breit(config, named_keys=frozenset()) -> None:
             "that is not there",
             "set both keys (onsite_only with bispinor = false, paw with bispinor = true)")
     from psp.onsite_breit import resolve_onsite_keys
-    resolve_onsite_keys(config.onsite_breit_double_counting, config.onsite_breit_exchange,
-                        bispinor=bool(config.bispinor))
+    dc, _ex = resolve_onsite_keys(
+        config.onsite_breit_double_counting, config.onsite_breit_exchange,
+        bispinor=bool(config.bispinor))
+    if dc == "paw" and not bool(getattr(config, "bispinor_transverse_hartree", True)):
+        raise _onsite_breit_gate(
+            "onsite_breit_double_counting = paw, bispinor_transverse_hartree = false",
+            "bispinor_transverse_hartree = true (or onsite_breit = false)",
+            "paw adds h^dir_AE - h^dir_PS beside the smooth alpha.A direct field; with that "
+            "field switched off (an exact zero) the run would subtract a pseudo direct term "
+            "it does not have",
+            "set bispinor_transverse_hartree = true, or run without the on-site term")
     if (config.qp_solver is QPSolver.SELF_CONSISTENT
             and not bool(config.density_self_consistent)):
         raise _onsite_breit_gate(
