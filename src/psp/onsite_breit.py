@@ -1,7 +1,8 @@
 r"""psp/onsite_breit.py -- on-site Breit (spin-other-orbit) mean field of one open shell per atom.
 
-Physics library (L1) beside ``psp.hubbard_ops``; design note ``ONSITE_INCODE.md``
-(breit salvage, 2026-11-11), sections 2, 3 and 6.  The assembly for the drivers
+Physics library (L1) beside ``psp.hubbard_ops``; theory and file format
+``docs/dev/onsite_breit.md``, sections 2, 3 and 6; the sidecar generator is
+``psp.onsite_breit_sidecar`` (section 7).  The assembly for the drivers
 (``gw.hartree.onsite_breit_field``) and the deck keys live elsewhere; this module
 holds the sidecar reader, the shell algebra, the setup and the band-sized kernels.
 
@@ -42,8 +43,8 @@ PUBLIC API
 ``onsite_report_lines(D, pieces, setup) -> list[str]``
     per shell-atom log lines (Tr D, 2<S>, <L>, max|D - D^dagger|, coefficients in meV).
 
-CONVENTIONS (design note section 2, in order)
----------------------------------------------
+CONVENTIONS (docs/dev/onsite_breit.md section 2, in order)
+----------------------------------------------------------
 Units.  Hartree atomic units inside the tensors, ``alpha = 1/c`` taken from
 ``common.bispinor_init.ALPHA_FS`` (the repo's one fine-structure constant,
 ``2 * HALFALPHA = 0.0072973525643``); Rydberg for every potential and band
@@ -283,7 +284,7 @@ def rotation_matrix(l: int, R: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Mean field (ONSITE_BREIT section 1.3, onsite_ops.g_soo / meanfield)
+# Mean field (docs/dev/onsite_breit.md section 2)
 # ---------------------------------------------------------------------------
 
 def _g_soo(lam: np.ndarray) -> np.ndarray:
@@ -398,7 +399,7 @@ def resolve_onsite_keys(double_counting, exchange, *, bispinor=None, tt_exchange
 
 
 def onsite_potential(D, kernels: dict, *, double_counting: str, exchange: str) -> dict:
-    """On-site Breit potential of one shell-atom, by piece (design note section 3).
+    """On-site Breit potential of one shell-atom, by piece (docs/dev/onsite_breit.md section 3).
 
     Parameters
     ----------
@@ -493,7 +494,7 @@ def decompose_potential(h, l: int, mhat) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Sidecar (design note section 6)
+# Sidecar (docs/dev/onsite_breit.md section 6)
 # ---------------------------------------------------------------------------
 
 def _sha256_file(path) -> str:
@@ -541,7 +542,7 @@ def _closed_shell_check(lam, l, where):
                     f"|x - c l.s|/|x| = {resid:.2e}, c = {c:+.3e} Ha",
                     f"d1 = d2 = 0 and x1 + x2 = c l.s with c > 0, to {CLOSED_SHELL_RTOL:g} relative",
                     "a tensor that fails the closed-shell identity is corrupted or in another index order",
-                    "regenerate the sidecar from its tensor npz")
+                    "regenerate the sidecar (python -m psp.onsite_breit_sidecar)")
     return c
 
 
@@ -571,7 +572,7 @@ def read_sidecar(path, *, require_ps: bool = False) -> dict:
     fmt = raw.get("format")
     if fmt != SIDECAR_FORMAT:
         raise _gate("onsite_breit_sidecar", f"{path}: format = {fmt!r}", f"format = {SIDECAR_FORMAT!r}",
-                    "an unknown sidecar format has unknown conventions", "regenerate with make_sidecar.py")
+                    "an unknown sidecar format has unknown conventions", "regenerate with python -m psp.onsite_breit_sidecar")
     shells = []
     for ish, s in enumerate(raw.get("shells") or []):
         l = int(s["l"])

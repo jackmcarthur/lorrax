@@ -2,7 +2,7 @@
 """The on-site Breit operator at the DFT level: ``onsite_breit.h5``.
 
     D[a, b]  = sum_k w_k sum_n f_nk P[k,a,n] conj(P[k,b,n])     DFT occupations, U = 1
-    h        = h^dir[D] + h^x[D]                                  (keys of ONSITE_INCODE.md section 3)
+    h        = h^dir[D] + h^x[D]                                  (keys of docs/dev/onsite_breit.md section 3)
     H_OS[k]  = P[k]^dagger h P[k]                                 (Ry, DFT band basis, full BZ)
     dH       = H_OS                    (onsite_breit_double_counting = onsite_only)
              = <m|alpha.A[J]|n> + H_OS (paw: the smooth transverse direct field, pseudo, all space)
