@@ -1,6 +1,6 @@
 # On-site Breit operator: design, conventions and the sidecar generator
 
-*Owner page of the on-site Breit (spin–other-orbit) term, `onsite_breit = true`.
+*Owner page of the on-site four-spinor Breit term, `onsite_breit = true`.
 The input keys are listed in the [input reference](../input_reference.md); the
 DFT-level driver `gw.onsite_breit_cli` is described in
 [drivers](../drivers.md#on-site-breit-gwonsite_breit_cli). The code cites this
@@ -12,7 +12,8 @@ projector, kernels), `src/psp/onsite_breit_sidecar.py` (the sidecar generator),
 `gw.hartree.onsite_breit_field` (the one assembly for every caller),
 `src/file_io/onsite_breit_output.py` (debug file). Tests:
 `tests/test_onsite_breit.py`, `tests/test_onsite_breit_field_cpu.py`,
-`tests/test_onsite_breit_sc_seam_cpu.py`, `tests/test_onsite_breit_sidecar.py`.
+`tests/test_onsite_breit_sc_seam_cpu.py`, `tests/test_onsite_breit_sidecar.py`,
+`tests/test_onsite_breit_hartree_pairing_cpu.py`.
 
 ## 1. What is added {#what}
 
@@ -20,17 +21,26 @@ $$
 H = T + V_\mathrm{loc} + V_\mathrm{NL} + V_H[\rho] + \alpha\,\mathbf A[\mathbf J] + H_\mathrm{OS}[D] + \Sigma_{xc}
 $$
 
-$H_\mathrm{OS}[D]$ is the Hartree–Fock mean field of the Breit–Pauli
-spin–other-orbit operator inside one open $(n\,l)$ shell per atom, built from
-the on-site density matrix $D$ of the current orbitals with **all-electron**
-radial integrals. The smooth transverse direct field $\alpha\,\mathbf A[\mathbf J]$
-of a bispinor run is computed from pseudo-orbitals, which carry only part of
-the one-centre transverse integrals: every such integral of a $3d$ shell lies
-inside the pseudization sphere, where norm conservation does not fix the
-radial distribution of the current. The on-site term restores the
-all-electron value of that one-centre part (a PAW-style completion,
-$h_\mathrm{AE}-h_\mathrm{PS}$), or supplies the whole term in a run without
-the smooth field.
+$H_\mathrm{OS}[D]$ is the Hartree–Fock mean field of the transverse (Breit)
+two-body interaction between the four-spinors of one open $(n\,l)$ shell per
+atom, built from the on-site density matrix $D$ of the current orbitals with
+**all-electron** radial functions. Each shell function is lifted to a
+four-spinor exactly as a bispinor run lifts its orbitals
+(`common.bispinor_init`, the raw kinetic-balance lift), and the interaction
+$-\boldsymbol\alpha_1\cdot\boldsymbol\alpha_2/r_{12}$ acts between the lifted
+spinors. No Pauli sub-operator is formed: spin–other-orbit, orbit–orbit and
+spin–spin are all parts of the one current–current integral, and none is
+added or dropped by hand.
+
+The smooth transverse direct field $\alpha\,\mathbf A[\mathbf J]$ of a
+bispinor run is the same interaction on pseudo-orbitals, which carry only part
+of the one-centre transverse integrals: every such integral of a $3d$ shell
+lies inside the pseudization sphere, where norm conservation does not fix the
+radial distribution of the current. Because the on-site operator uses the same
+carrier and the same kernel, its pseudo part $h_\mathrm{PS}$ is the one-centre
+part of what the smooth field computes, and $h_\mathrm{AE}-h_\mathrm{PS}$ is a
+PAW-style completion to the all-electron value. In a run without the smooth
+field the on-site term supplies the whole one-centre term.
 
 The frozen-core Gaunt term is not part of this operator: it is carried by the
 UPF itself (a j-resolved $\Delta D$ in PP_DIJ), and a j-averaged use of such a
@@ -82,50 +92,114 @@ computed from the two-component DFT $\psi(\mathbf G)$ unfolded by the loader
 to the full BZ, so $D$ is the plain zone sum and needs no second symmetry
 action.
 
-**Mean field.** The sidecar tensor (§6) is
+**Lifted spinors and the two-body tensor.** With one radial function $u = rR$
+per shell (the j-average, §7), $\phi_p = (u/r)\,Y_{lm}\,\chi_\sigma$ in the
+shell basis above, the lifted four-spinor and the transition current are
 
 $$
-\Lambda^c_{a a_2 b d} = \langle a(1)\,a_2(2)|\Lambda^c|b(1)\,d(2)\rangle,\qquad
-\boldsymbol\Lambda(1;2) = \frac{\mathbf r_{12}\times\mathbf p_1}{r_{12}^3},
+\Psi_p = \begin{pmatrix}\phi_p\\[2pt] \tfrac{\alpha}{2}\,\boldsymbol\sigma\cdot\mathbf p\,\phi_p\end{pmatrix},\qquad
+\mathbf j_{pr}(\mathbf r) = \Psi_p^\dagger(\mathbf r)\,\boldsymbol\alpha\,\Psi_r(\mathbf r),
 $$
 
-spatial indices only, $c = x,y,z$. With the spin–orbital tensor
+$\boldsymbol\alpha$ the Dirac matrices. The two-body tensor is
 
 $$
-g_{pqrs} = -\alpha^2 \sum_c \Lambda^c_{a_p a_q a_r a_s}\,\delta_{\sigma_p\sigma_r}\,(\sigma^c/2)_{\sigma_q\sigma_s}
-= \langle p(1)\,q(2)|g|r(1)\,s(2)\rangle,\qquad H = \sum_{pqrs} g_{pqrs}\,a^\dagger_p a^\dagger_q a_s a_r,
+G_{pqrs} = \Big\langle p(1)\,q(2)\Big|\,-\frac{\boldsymbol\alpha_1\cdot\boldsymbol\alpha_2}{r_{12}}\Big|r(1)\,s(2)\Big\rangle
+= -\iint \frac{\mathbf j_{pr}(\mathbf r_1)\cdot\mathbf j_{qs}(\mathbf r_2)}{r_{12}}\,d^3r_1\,d^3r_2 ,
 $$
 
-the four pieces are
+written to and read from the sidecar without the $\alpha^2$ that the two
+currents carry. For one radial function every $\mathbf j_{pr}$ is
+divergence-free, so the Gaunt kernel and the transverse (Breit) kernel give
+the same $G$. It has the pair symmetry $G_{pqrs} = G_{qpsr}$ and is Hermitian,
+$G_{pqrs} = G^*_{rspq}$.
+
+**Mean field.**
 
 $$
-\begin{aligned}
-d_1[p,r] &= \textstyle\sum_{qs} g_{pqrs} D_{sq} &&\text{orbit of the test electron in the shell's spin field}\\
-d_2[p,r] &= \textstyle\sum_{qs} g_{qpsr} D_{sq} &&\text{spin of the test electron in the shell's orbital current}\\
-x_1[p,r] &= -\textstyle\sum_{qs} g_{pqsr} D_{sq},\qquad x_2[p,r] = -\sum_{qs} g_{qprs} D_{sq} &&\text{bare exchange}
-\end{aligned}
+h^\mathrm{dir}[p,r] = \alpha^2\sum_{qs} G_{pqrs}\,D_{sq},\qquad
+h^\mathrm{x}[p,r] = -\alpha^2\sum_{qs} G_{pqsr}\,D_{sq}
 $$
 
-and $h^\mathrm{dir} = d_1 + d_2$, $h^\mathrm x = x_1 + x_2$.
-$g = -\alpha^2\,\boldsymbol\Lambda(1;2)\cdot\mathbf s(2)$ is the coupling
-$\alpha\,\mathbf A\cdot\mathbf p$ of electron 1 to the vector potential of the
-spin moment $\boldsymbol\mu = -\alpha\,\mathbf s$ ($g=2$) of electron 2.
+(Hartree; `psp.onsite_breit.meanfield_kernels` precontracts them). These are
+the only two pieces; the potential pieces `dir_ae`, `dir_ps`, `x_ae`, `x_ps`
+of §3 are $h^\mathrm{dir}$ and $h^\mathrm{x}$ of the AE and the PS radial
+function.
 
-**Limits** (unit tests, `tests/test_onsite_breit.py`): a closed shell $D = 1$
-gives $d_1 = d_2 = 0$ and $h^\mathrm x = c\,\mathbf l\cdot\mathbf s$ with
-$c > 0$ (the exchange of a closed shell raises $\xi$); a spherical collinear
-shell gives $d_1 = b\,\mathbf l\cdot\hat{\mathbf m}$ with
+**Separation.** With $R = u/r$ the current separates as
+$\mathbf j_{pr} = \alpha\,[R R'\,\mathbf F_{pr}(\Omega) + (R^2/r)\,\mathbf H_{pr}(\Omega)]$,
+where, with $\Phi_p = Y_{lm}\chi_\sigma$, $A = (\boldsymbol\sigma\cdot\hat{\mathbf r})\Phi$
+and $B = (\boldsymbol\sigma\cdot\nabla_\Omega)\Phi$,
+
+$$
+\mathbf F_{pr} = \tfrac{i}{2}\big[A_p^\dagger\boldsymbol\sigma\Phi_r - \Phi_p^\dagger\boldsymbol\sigma A_r\big],\qquad
+\mathbf H_{pr} = \tfrac{i}{2}\big[B_p^\dagger\boldsymbol\sigma\Phi_r - \Phi_p^\dagger\boldsymbol\sigma B_r\big].
+$$
+
+The two radial shapes are $f_1 = u u' - u^2/r$ (with $\mathbf F$) and
+$f_2 = u^2/r$ (with $\mathbf H$). Their Slater integrals
+$W_L[a,b] = \iint f_a(r_1) f_b(r_2)\, r_<^L/r_>^{L+1}\,dr_1\,dr_2$ lose every
+derivative of $u$ under integration by parts:
+
+$$
+W_L[1,1] = -\tfrac{(L-1)(L+2)}{2}\,N_L + \tfrac{2L+1}{4}\,K,\qquad
+W_L[1,2] = W_L[2,1] = -\tfrac32\,N_L,\qquad
+W_L[2,2] = 2\,N_L,
+$$
+
+$$
+N_L = \iint_{s<r} \frac{u^2(r)\,u^2(s)\,s^{L-1}}{r^{L+2}}\,ds\,dr\quad (L = 0\dots 2l+1),\qquad
+K = \int_0^\infty \frac{u^4}{r^2}\,dr ,
+$$
+
+and
+
+$$
+G_{pqrs} = -\sum_{L=0}^{2l+1} \frac{4\pi}{2L+1} \sum_{M,c,t,t'} W_L[t,t']\;
+a^{t,c}_{pr,LM}\, b^{t',c}_{qs,LM},\qquad
+a^{t,c}_{pr,LM} = \int X^{t,c}_{pr}\,Y_{LM}\,d\Omega,\quad
+b^{t',c}_{qs,LM} = \int X^{t',c}_{qs}\,Y^*_{LM}\,d\Omega,
+$$
+
+$X = (\mathbf F, \mathbf H)$, the angular integrals exact on a Gauss–Legendre
+$\times$ uniform-$\varphi$ rule above the degree $4l+2$
+(`psp.onsite_breit.shell_breit_tensor`). A shell's whole tensor is fixed by
+the $2l+3$ radial numbers $N_0,\dots,N_{2l+1}, K$ (bohr$^{-3}$); $N_1 = I^0$,
+Marvin's
+
+$$
+I^0 = \int_0^\infty\! dr_2\, u^2(r_2)\, r_2^{-3} \int_0^{r_2}\! dr_1\, u^2(r_1).
+$$
+
+**Limits** (unit tests, `tests/test_onsite_breit.py`,
+`tests/test_onsite_breit_sidecar.py`): a closed shell $D = 1$ gives
+$h^\mathrm{dir} = 0$ and $h^\mathrm x = a\,\mathbb 1 + c\,\mathbf l\cdot\mathbf s$
+with $c > 0$ (the exchange of a closed shell raises $\xi$; $c$ equals the
+spin–other-orbit value of the same radial function, the orbit–orbit exchange
+adds only the constant $a$); a spherical collinear shell gives an
+$\mathbf l\cdot\hat{\mathbf m}$ coefficient of $h^\mathrm{dir}$ equal to
 $b = -\tfrac{\alpha^2}{2}(N_\uparrow - N_\downarrow)\,I^0$, $b<0$ (the direct
 term lowers $\xi_\mathrm{eff} = \xi + 2\sigma b$ for majority carriers); one
-electron gives $h_{aa} = 0$; $h[\Theta D\Theta^{-1}] = \Theta h[D]\Theta^{-1}$;
+electron gives $h^\mathrm{dir}_{aa} + h^\mathrm{x}_{aa} = 0$;
+$h[\Theta D\Theta^{-1}] = \Theta h[D]\Theta^{-1}$;
 $h[MDM^\dagger] = M h[D] M^\dagger$ for $M = U_\mathrm{spin}\otimes D^l(R)$.
-Here
 
-$$
-I^0 = \int_0^\infty\! dr_2\, u^2(r_2)\, r_2^{-3} \int_0^{r_2}\! dr_1\, u^2(r_1),\qquad u = rR(r)
-$$
-
-is Marvin's $I^0$ of the shell.
+**The spin–other-orbit operator is contained exactly.** Write
+$h = h_0\otimes\mathbb 1 + \sum_c h_c\otimes\sigma_c$ and let
+$g = -\alpha^2\,\boldsymbol\Lambda(1;2)\cdot\mathbf s(2)$,
+$\boldsymbol\Lambda(1;2) = \mathbf r_{12}\times\mathbf p_1/r_{12}^3$, be the
+Breit–Pauli spin–other-orbit operator, with direct pieces
+$d_1[p,r] = \sum_{qs} g_{pqrs}D_{sq}$ (orbit of the test electron in the
+shell's spin field) and $d_2[p,r] = \sum_{qs} g_{qpsr}D_{sq}$ (spin of the test
+electron in the shell's orbital current). For a pure orbital source
+$D = \mathbb 1\otimes D_0$ the spin-dependent part $h_c$ of $h^\mathrm{dir}$ is
+that of $d_2$; for a pure spin source $D = \sum_c \sigma_c\otimes D_c$ the
+spin-independent part $h_0$ of $h^\mathrm{dir}$ is that of $d_1$ (both to
+$10^{-13}$ relative on the shipped inputs). The rest of $h^\mathrm{dir}$, the
+spin-independent response to the orbital source and the spin-dependent
+response to the spin source, is orbit–orbit and spin–spin. The
+spin–other-orbit tensor is built independently by the generator for this
+check only (§7); no run reads it.
 
 ## 3. Double counting {#double-counting}
 
@@ -190,17 +264,25 @@ atoms). Debug output rides `sigma_lorentz_debug_output`.
 
 ### The sidecar `<El>.onsite_breit.json` {#sidecar}
 
-Format `lorrax.onsite_breit_sidecar/v1`, one per species, written by
+Format `lorrax.onsite_breit_sidecar/v2`, one per species, written by
 `python -m psp.onsite_breit_sidecar` (§7). JSON; every float is written with
-Python `repr` (an exact float64 round trip).
+Python `repr` (an exact float64 round trip). No tensor is stored: the reader
+rebuilds $G$ from the radial numbers of each block (§2).
 
 | field | content |
 |---|---|
-| `format` | `"lorrax.onsite_breit_sidecar/v1"` |
+| `format` | `"lorrax.onsite_breit_sidecar/v2"` |
 | `element` | element symbol (from the UPF's PP_HEADER) |
-| `conventions` | text: basis, index order of $\Lambda$, storage, units, mean-field formulas (§2) |
+| `conventions` | text: basis, lift, $G$, the radial numbers and the $W_L$ formulas, units, mean-field formulas (§2) |
 | `shells` | list of shell objects (the generator writes one) |
-| `provenance` | `generator`, `date`, `code_sha256`, `source_upf` {`path`, `md5`, `sha256`}, `ae_source`, `quadrature`, `checks` {`ae`, `ps`: the §7 check values}; `null_gate` in a null sidecar. Files written by the earlier generator carry `tensor_npz` and `fit` instead of `quadrature`. |
+| `provenance` | `generator`, `date`, `code_sha256`, `source_upf` {`path`, `md5`, `sha256`}, `ae_source`, `quadrature`, `checks` {`ae`, `ps`: the §7 check values}; `null_gate` in a null sidecar. |
+
+A `lorrax.onsite_breit_sidecar/v1` file (the earlier spin–other-orbit tensor
+$\Lambda$, fields `shape`, `lam_re`, `lam_im`) refuses at load
+(`GATE onsite_breit_sidecar`): it holds the spin–other-orbit tensor only and
+not the radial numbers of the four-spinor operator. Regenerate it with
+`python -m psp.onsite_breit_sidecar` from the same inputs (UPF, shell label,
+all-electron radial function).
 
 Shell object:
 
@@ -217,21 +299,24 @@ Tensor block (`ae`, `ps`):
 | field | content |
 |---|---|
 | `reference` | what the radial function is (configuration, source) |
-| `shape` | $[3, n, n, n, n]$, $n = 2l+1$ |
-| `lam_re`, `lam_im` | flat lists, C order over `shape`, of $\mathrm{Re}/\mathrm{Im}\,\Lambda^c_{a a_2 b d}$ (§2), Hartree a.u., **without** $\alpha^2$; rebuild with `(np.array(lam_re) + 1j*np.array(lam_im)).reshape(shape)` |
-| `I0`, `r3`, `I2` | Marvin $I^0$, $\langle r^{-3}\rangle$, Marvin $I^2$ of the normalised radial function (bohr$^{-3}$) |
-| `b1_mev_per_muB` | $-\tfrac{\alpha^2}{2} I^0$ in meV: the $\mathbf l\cdot\hat{\mathbf m}$ coefficient of $d_1$ per unit $N_\uparrow - N_\downarrow$ |
-| `x_closed_mev` | $c$ of $x_1 + x_2 = c\,\mathbf l\cdot\mathbf s$ at $D = 1$ (meV) |
+| `N` | $[N_0, \dots, N_{2l+1}]$ of the normalised radial function (§2), bohr$^{-3}$ |
+| `K` | $\int u^4/r^2\,dr$, bohr$^{-3}$ |
+| `I0`, `r3` | diagnostics: Marvin $I^0 = N_1$, $\langle r^{-3}\rangle$ (bohr$^{-3}$) |
+| `b1_mev_per_muB` | $-\tfrac{\alpha^2}{2} I^0$ in meV: the $\mathbf l\cdot\hat{\mathbf m}$ coefficient of $h^\mathrm{dir}$ per unit $N_\uparrow - N_\downarrow$ of a spherical collinear shell |
+| `x_closed_ls_mev`, `x_closed_shift_mev` | $c$ and $a$ of $h^\mathrm x = a\,\mathbb 1 + c\,\mathbf l\cdot\mathbf s$ at $D = 1$ (meV) |
 
 **Load-time checks** (`GATE onsite_breit_sidecar`, `psp.onsite_breit.read_sidecar`
-and `build_onsite_setup`): the format string; $0 \le l \le 3$; tensor shapes;
-`ae` present, `ps` present when a key says `paw`; the closed-shell identity of
-every tensor ($d_1 = d_2 = 0$ and $h^\mathrm x \propto \mathbf l\cdot\mathbf s$
-with $c>0$, to $10^{-10}$ relative: a corrupted tensor or another index order
-fails it); the element is a species of the WFN; the projector type equals the
-input key; and `projector.chi` equals the j-average of the run's UPF on the
-same mesh to $10^{-8}\max|\chi|$ (a Gaunt-corrected UPF keeps PP_PSWFC and
-passes). The sidecar's SHA-256 is stamped into every output.
+and `build_onsite_setup`): the format string (v1 refuses, above);
+$1 \le l \le 3$; per block the length of `N` ($2l+2$), $N_L > 0$, $K > 0$ and
+`I0` $= N_1$ (the file's integrity); the closed-shell identity of the tensor
+rebuilt from `N`, `K` ($\max|h^\mathrm{dir}| \le 10^{-10}\max|h^\mathrm x|$
+and $h^\mathrm x = a\,\mathbb 1 + c\,\mathbf l\cdot\mathbf s$ to $10^{-10}$
+relative with $c>0$: it holds for any radial numbers, so it tests the angular
+construction of the code that reads the file); `ae` present, `ps` present
+when a key says `paw`; the element is a species of the WFN; the projector type
+equals the input key; and `projector.chi` equals the j-average of the run's
+UPF on the same mesh to $10^{-8}\max|\chi|$ (a Gaunt-corrected UPF keeps
+PP_PSWFC and passes). The sidecar's SHA-256 is stamped into every output.
 
 **The null sidecar** (`--null`): the `ae` block is a copy of the `ps` block,
 so $h_\mathrm{AE} - h_\mathrm{PS} = 0$ exactly in every `paw` combination. A
@@ -278,8 +363,9 @@ radial function of that shell:
   of $(n, l)$ ($\kappa = -(l+1)$: $j = l+\tfrac12$; $\kappa = l$:
   $j = l-\tfrac12$) are read and j-averaged as below. The plot stops at a few
   bohr with six decimals; for the Fe $3d$ shell (537 points, $r\le 5.96$ bohr)
-  the tensor from the plot blocks differs from the one from the full-grid
-  Dirac–Kohn–Sham function by $7\times10^{-7}$ relative (measured).
+  the spin–other-orbit tensor from the plot blocks differed from the one from
+  the full-grid Dirac–Kohn–Sham function by $7\times10^{-7}$ relative
+  (measured with the v1 generator).
   To write a table by hand from the same blocks, average the two columns as
   below; `--ae-oncvpsp` does exactly that.
 
@@ -296,8 +382,30 @@ The pseudo function is the same j-average of the UPF's two PP_CHI partners
 `projector.chi` is the plain average of the same pair, written unchanged for
 the authentication of §6.
 
-**The tensor.** No basis fit: $\Lambda$ is built from the radial function
-directly. Acting on electron 1, $\mathbf r_{12}\times\mathbf p_1/r_{12}^3 =
+**The radial numbers.** No basis fit: `radial_breit` integrates the
+normalised radial function directly,
+
+$$
+N_L = \int_0^\infty dr\, \frac{u^2(r)}{r^{L+2}} \int_0^r ds\, u^2(s)\, s^{L-1}\quad (L = 0\dots 2l+1),\qquad
+K = \int_0^\infty \frac{u^4}{r^2}\,dr,
+$$
+
+the inner integral running. These are all the four-spinor tensor needs (§2):
+the derivative $u'$ in $f_1 = u u' - u^2/r$ is removed by integration by
+parts, so no derivative of the tabulated $u$ enters, and a test against a
+brute-force double integral with the analytic $u'$ of
+$u = r^{l+1}e^{-ar}$ agrees to $2.4\times10^{-9}$ for every $L$, $l = 1,2,3$
+(the floor of the brute-force reference; $3\times10^{-10}$ for $l\le 2$); on
+the tabulated Cl $3p$ AE function, with a spline $u'$, to $5\times10^{-9}$.
+
+**The check tensor (spin–other-orbit, independent check only).** The
+generator also builds the Breit–Pauli spin–other-orbit tensor
+$\Lambda^c_{a a_2 b d} = \langle a(1)\,a_2(2)|(\mathbf r_{12}\times\mathbf p_1)_c/r_{12}^3|b(1)\,d(2)\rangle$
+of the same radial function by a separate route (`shell_tensor`, with its
+mean-field pieces `meanfield_pieces`), to test the four-spinor tensor against
+it before a file is written (§2, "contained exactly"). It is not written to
+the sidecar and no run reads it. Its construction:
+acting on electron 1, $\mathbf r_{12}\times\mathbf p_1/r_{12}^3 =
 i\,(\nabla_1 V)\times\nabla_1$ with
 $V(\mathbf r_1) = \int \rho_{a_2 d}(\mathbf r_2)/r_{12}$ and
 $\rho_{a_2 d} = \phi^*_{a_2}\phi_d$, $\phi_m = (u/r)\,Y_{lm}$. Expanding
@@ -329,38 +437,54 @@ X^{2,c} = \int d\Omega\; Y^*_a Y_b\,\big(-i L_c Y_{LM}\big),\qquad
 X^{3,c} = \int d\Omega\; Y^*_a\,\big(\nabla_\Omega Y_{LM}\times\nabla_\Omega Y_b\big)_c .
 $$
 
-$B_L$ is integrated by parts, so no derivative of the tabulated $u$ enters,
-and $\Lambda$ is Hermitian as a two-body operator by construction. The angular
-integrals are exact (Gauss–Legendre in $\cos\theta$ times a uniform $\varphi$
-rule, above the polynomial degree $4l+2$). The $L=0$ term gives
-$A_0 = -4\pi I^0$, so the $\mathbf l\cdot\hat{\mathbf m}$ coefficient of $d_1$
-equals $-\tfrac{\alpha^2}{2} I^0$ to rounding.
+$B_L$ is integrated by parts, and the angular integrals are exact
+(Gauss–Legendre in $\cos\theta$ times a uniform $\varphi$ rule, above the
+polynomial degree $4l+2$). The $L=0$ term gives $A_0 = -4\pi I^0$, so the
+$\mathbf l\cdot\hat{\mathbf m}$ coefficient of $d_1$ equals
+$-\tfrac{\alpha^2}{2} I^0$ to rounding.
 
 **Quadrature.** Every radial integral, single or running, is a not-a-knot
 cubic spline of $f\,dr/di$ in the grid index $i$, with $dr/di$ from a cubic
 spline of $r(i)$: fourth order in the spacing on the uniform UPF mesh and on
-a logarithmic all-electron mesh alike. On the native grids the tensor is
-converged to $9\times10^{-9}$ (Fe AE, ONCVPSP log mesh, 1229 points) and
-$5\times10^{-9}$ (Cr PS, UPF mesh) relative to an eightfold (fourfold)
-refinement.
+a logarithmic all-electron mesh alike. For $u = r^3 e^{-r}$ a logarithmic grid
+(2001 points) and a uniform grid (6001 points) give the same $N_L$ to
+$3.1\times10^{-9}$ (worst at $N_5$; $2.0\times10^{-10}$ and
+$1.2\times10^{-11}$ on twice and four times refined grids) and the same $K$ to
+$2\times10^{-11}$.
 
-**Checks before writing** (the generator refuses on failure): at $D = 1$,
-$\max|d_1|, \max|d_2| \le 10^{-10}\max|x|$ and
-$\|x_1 + x_2 - c\,\mathbf l\cdot\mathbf s\| \le 10^{-10}\|x_1 + x_2\|$ with
-$c > 0$; for a random Hermitian $D$, $d_1$, $d_2$, $x_1 + x_2$ and their sum
-Hermitian to $10^{-10}$; for $D = \mathrm{diag}(0.9, 0.3)$ per spin,
-$d_1 \propto L_z$ to $10^{-10}$ and $b_1$ from the tensor equal to
-$-\tfrac{\alpha^2}{2}I^0$ to $10^{-8}$. The written file is then re-read with
-`read_sidecar`. On the shipped inputs the residuals are $\sim10^{-15}$.
+**Checks before writing** (`verify_breit`; the generator refuses on failure):
+pair symmetry $G_{pqrs} = G_{qpsr}$ and Hermiticity $G_{pqrs} = G^*_{rspq}$ to
+$10^{-10}\max|G|$; at $D = 1$, $\max|h^\mathrm{dir}| \le 10^{-10}\max|h^\mathrm x|$
+and $h^\mathrm x = a\,\mathbb 1 + c\,\mathbf l\cdot\mathbf s$ to $10^{-10}$ with
+$c > 0$; the two source-resolved identities against the check tensor of the
+same radial function (§2: spin-dependent part of $h^\mathrm{dir}$ for
+$D = \mathbb 1\otimes D_0$ against $d_2$, spin-independent part for
+$D = \sum_c\sigma_c\otimes D_c$ against $d_1$, random Hermitian $D_0$, $D_c$)
+to $10^{-9}$; for $D = \mathrm{diag}(0.9, 0.3)$ per spin, the
+$\mathbf l\cdot\hat{\mathbf m}$ coefficient of $h^\mathrm{dir}$ equal to
+$-\tfrac{\alpha^2}{2}(N_\uparrow - N_\downarrow) I^0$ to $10^{-8}$. The
+written file is then re-read with `read_sidecar`. On the shipped inputs the
+residuals are $\le 10^{-13}$; a $3d$ function used as an $l = 3$ shell
+reaches $3\times10^{-10}$ in the source-resolved identities (the two routes
+integrate different radial integrands).
 
-**Agreement with the earlier sidecars** (`tests/data/onsite_breit/`, made
-with a Gaussian fit of each radial function and analytic two-electron
-integrals; same radial inputs, `tests/test_onsite_breit_sidecar.py`). Fed
-the *fitted* functions themselves, the generator reproduces the files'
-analytic integrals to $\le 3\times10^{-12}$ relative ($9\times10^{-9}$ for the
-27-primitive Fe PS fit, whose evaluation cancels digits); against the files
-with the original radial functions, the difference is the fit error of the
-files:
+**Numbers** (normalised radial functions; closed-shell coefficients in meV):
+
+| shell | $N_0 \dots N_{2l+1}$ (bohr$^{-3}$) | $K$ | $a$ | $c$ |
+|---|---|---|---|---|
+| Ni $3d$ PS (`Ni.ref.upf`) | 0.625797, 0.443372, 0.336881, 0.268826, 0.222299, 0.188805 | 1.149832 | 8.68796 | 0.75376 |
+| Ni $3d$ AE (ONCVPSP `Ni.out`, $n=3$) | 1.193398, 0.751206, 0.532875, 0.407787, 0.328305, 0.273907 | 1.576887 | 13.25660 | 1.25736 |
+| Fe $3d$ AE (`Fe_3d_ae.dat`) | 0.832273, 0.522864, 0.370525, 0.283391, 0.228082, 0.190252 | 1.094696 | 9.21554 | 0.87498 |
+| Cr $3d$ AE (`Cr_3d_ae.dat`) | 0.434874, 0.268997, 0.189204, 0.144144, 0.115754, 0.096425 | 0.552890 | 4.69970 | 0.44947 |
+| Cl $3p$ AE (`Cl_3p_ae.dat`) | 0.208555, 0.112515, 0.078682, 0.060943 | 0.250473 | 0.87050 | 0.16304 |
+
+The Fe, Cr and Cl values are pinned in `tests/test_onsite_breit_sidecar.py`;
+the test data are rebuilt by `tests/data/onsite_breit/make_v2_fixtures.py`.
+
+**The check tensor against the earlier sidecars** (`tests/data/onsite_breit/v1/`,
+made with a Gaussian fit of each radial function and analytic two-electron
+integrals; same radial inputs, `tests/test_onsite_breit_sidecar.py`). The
+difference is the fit error of the files:
 
 | shell | $\max|\Delta\Lambda|/\max|\Lambda|$, AE | PS |
 |---|---|---|
@@ -368,25 +492,36 @@ files:
 | Cr $3d$ | $1.5\times10^{-6}$ | $1.7\times10^{-7}$ |
 | Cl $3p$ | $4.3\times10^{-9}$ | $1.3\times10^{-6}$ |
 
-The projector ($r$, $\chi$) is reproduced bit for bit. The scalar `I0` and
-`I2` of the earlier files carry the trapezoid error of their quadrature (up
-to $6\times10^{-5}$ and $2.3\times10^{-4}$ relative); `x_closed_mev` agrees to
-$2.6\times10^{-4}$ (Fe PS, the fit) and $\le 1.7\times10^{-6}$ elsewhere,
-`b1_mev_per_muB` to $\le 6\times10^{-5}$ (the $I^0$ quadrature, plus
-$3.6\times10^{-7}$ from the meV constant: the earlier files used QE's Rydberg,
-13.605693122994 eV).
+The mean-field pieces of the v1 tensors agree with the post-processing code
+`onsite_ops` (`v1/reference_values.json`) to $10^{-10}$. The projector
+($r$, $\chi$) is reproduced bit for bit. The scalar `I0` of the earlier files
+carries the trapezoid error of their quadrature (up to $6\times10^{-5}$
+relative).
 
 ## 8. Not included {#not-included}
 
-Stated in the log where it matters.
+Stated in the log where it matters. Spin–other-orbit, orbit–orbit and
+spin–spin are all inside the one current–current integral (§2); none of them
+is missing. What is missing:
 
+- **One radial function per shell, j-averaged.** The $j = l\pm\tfrac12$
+  partners are averaged into one $u$ (§7) for the AE and for the PS function
+  alike, so the spin–orbit splitting of the radial functions is absent from
+  the on-site operator; and one function of one configuration per shell (the
+  PAW basis would hold two partial waves per channel).
+- **The all-electron small component is a lift, not the Dirac small
+  component.** $\Psi_p$ carries $\tfrac{\alpha}{2}\boldsymbol\sigma\cdot\mathbf p\,\phi_p$
+  of the AE *large* component (the kinetic-balance lift the plane-wave code
+  uses). The Dirac small component of the all-electron atom differs from it
+  near the nucleus, where the potential is not small against $2c^2$.
 - $i[\mathbf r, H_\mathrm{OS}]$ in the velocity (dipole, head, orbital moment).
   `hubbard_ops.hubbard_velocity_ket` is the machinery; not wired.
-- On-site spin–spin and orbit–orbit (AE − PS) corrections; exchange with
-  other valence shells; inter-site terms beyond the smooth field; screening of
-  the on-site exchange.
-- Two partial waves per channel: the sidecar holds one AE and one PS radial
-  function per shell, of one configuration (the PAW basis would hold two).
+- Exchange with other shells: only the shell's own direct and exchange terms
+  are built (no exchange with other valence shells or with the core, beyond
+  the frozen-core term of the UPF); inter-site terms beyond the smooth field;
+  screening of the on-site exchange.
+- The `exchange = paw` premise (that the on-site part of $\Sigma$'s TT
+  exchange equals $h^\mathrm x_\mathrm{PS}$) is not validated (§3).
 - The frozen-core Gaunt term (carried by the UPF, §1).
 - An energy functional and the double-counting energy.
 - Collinear (nspinor = 1) WFNs and ultrasoft/PAW pseudopotentials: refused.

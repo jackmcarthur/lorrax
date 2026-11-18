@@ -327,7 +327,7 @@ A namespace package (no `__init__.py`).
 | `ionic_gspace.py` | G-space setup of the ionic potentials and core charge. |
 | `kpm_dos.py` | KPM density of states of the DFT Hamiltonian; a driver. |
 | `nscf_input.py` | Parses an NSCF input file. |
-| `onsite_breit.py` | The on-site Breit (spin–other-orbit) mean field of one open shell per atom: sidecar reader, shell algebra, ortho-atomic projector setup, projection table, density matrix and band-matrix kernels. |
+| `onsite_breit.py` | The on-site four-spinor Breit mean field of one open shell per atom: sidecar reader, shell algebra, the transverse two-body tensor of the lifted shell spinors, ortho-atomic projector setup, projection table, density matrix and band-matrix kernels. |
 | `operator_checks.py` | Preflight checks before DFT operators are built. |
 | `orbital_magnetization.py` | Orbital magnetization (modern theory) from a spinor WFN; a driver. Theory: `psp/orbital_magnetization_THEORY.md`. |
 | `orbital_response.py` | Orbital moments from a given velocity. |

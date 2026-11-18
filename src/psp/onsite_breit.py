@@ -1,24 +1,27 @@
-r"""psp/onsite_breit.py -- on-site Breit (spin-other-orbit) mean field of one open shell per atom.
+r"""psp/onsite_breit.py -- on-site four-spinor Breit mean field of one open shell per atom.
 
 Physics library (L1) beside ``psp.hubbard_ops``; theory and file format
 ``docs/dev/onsite_breit.md``, sections 2, 3 and 6; the sidecar generator is
 ``psp.onsite_breit_sidecar`` (section 7).  The assembly for the drivers
-(``gw.hartree.onsite_breit_field``) and the deck keys live elsewhere; this module
-holds the sidecar reader, the shell algebra, the setup and the band-sized kernels.
+(``gw.hartree.onsite_breit_field``) and the input keys live elsewhere; this module
+holds the sidecar reader, the shell algebra, the two-body tensor, the setup and
+the band-sized kernels.
 
 PUBLIC API
 ----------
 ``read_sidecar(path, *, require_ps=False) -> dict``
-    parse and verify ``<El>.onsite_breit.json`` (``lorrax.onsite_breit_sidecar/v1``).
+    parse and verify ``<El>.onsite_breit.json`` (``lorrax.onsite_breit_sidecar/v2``).
+``shell_breit_tensor(l, N, K) -> G (2n, 2n, 2n, 2n)``
+    the transverse two-body tensor of the lifted shell four-spinors (Hartree, no alpha^2).
+``breit_meanfield(G, D) -> dict``
+    ``dir``, ``x`` (Hartree, alpha^2 included) of one tensor for one density matrix.
 ``resolve_onsite_keys(double_counting, exchange, *, bispinor=None, tt_exchange=None) -> (str, str)``
     the one check of the two keys of section 3 (values and pairings).
 ``shell_operators(l) -> dict``
     ``L`` (3), ``S`` (3), ``ls``, ``I`` in the shell basis (complex CS Y_lm, spin-major).
 ``real_to_complex_ylm(l) -> W``
     ``Y^c_mu = sum_i W[i, mu] Y^r_i`` (QE real Y_lm of ``psp.radial.solid_harmonics``).
-``meanfield_pieces(lam, D) -> dict``
-    ``d1, d2, x1, x2`` (Hartree) of one tensor for one density matrix.
-``meanfield_kernels(lam) -> (K_dir, K_x)``
+``meanfield_kernels(G) -> (K_dir, K_x)``
     precontracted ``h[p,r] = sum_{s,q} K[p,r,s,q] D[s,q]`` (Hartree, alpha^2 included).
 ``shell_kernels(sidecar_shell) -> dict``
     ``{"l", "label", "ae": {"dir", "x"}, "ps": {...} | None}`` for one sidecar shell.
@@ -73,19 +76,32 @@ Projection table, density matrix, potential, band matrix::
 
 ``D[a, b] = <a|rho|b>`` (QE's ``ns`` is its transpose).
 
-Mean field.  Sidecar tensor ``Lam[c, a, a2, b, d] = <a(1) a2(2)|Lam^c|b(1) d(2)>``,
-``Lam(1;2) = (r12 x p1)/r12^3``, spatial indices only, c = x, y, z::
+Two-body tensor (section 2).  Each shell function is lifted to a four-spinor
+the way the plane-wave code lifts its orbitals (``common.bispinor_init``, the raw
+kinetic-balance lift), and the transverse (Breit) interaction acts between the
+lifted spinors; no Pauli sub-operator is formed::
 
-    g[p,q,r,s] = -alpha^2 sum_c Lam^c[a_p, a_q, a_r, a_s] delta(s_p, s_r) (sigma^c/2)[s_q, s_s]
-    d1[p,r] =  sum_qs g[p,q,r,s] D[s,q]      orbit of the test electron in the shell's spin field
-    d2[p,r] =  sum_qs g[q,p,s,r] D[s,q]      spin of the test electron in the shell's orbital current
-    x1[p,r] = -sum_qs g[p,q,s,r] D[s,q]
-    x2[p,r] = -sum_qs g[q,p,r,s] D[s,q]
-    h^dir = d1 + d2,    h^x = x1 + x2
+    phi_p = (u/r) Y_lm chi_sigma,      Psi_p = [phi_p ; (alpha/2) sigma.p phi_p]
+    j_pr  = Psi_p^+ alpha_vec Psi_r                      (transition current, Dirac alpha matrices)
+    G[p,q,r,s] = <p(1) q(2)| -alpha_1.alpha_2 / r12 |r(1) s(2)> = - iint j_pr(1).j_qs(2) / r12
+    h^dir[p,r] =  alpha^2 sum_qs G[p,q,r,s] D[s,q]
+    h^x[p,r]   = -alpha^2 sum_qs G[p,q,s,r] D[s,q]
 
-Limits (unit tests): closed shell D = 1 -> d1 = d2 = 0, h^x = c l.s with c > 0;
-spherical collinear shell -> d1 = b L.m, b = -(alpha^2/2)(N_up - N_dn) I0; one
-electron -> h_aa = 0; h[Theta D Theta^-1] = Theta h[D] Theta^-1; h[M D M^+] = M h[D] M^+.
+(G here is without alpha^2; the current carries one alpha per side.)  With one
+radial function u every j_pr is divergence-free, so the Gaunt and the transverse
+kernels give the same G.  ``j_pr = alpha [R R' F_pr + (R^2/r) H_pr]`` (R = u/r) and
+integration by parts leave 2l+3 radial numbers per shell (the sidecar's ``N``, ``K``)::
+
+    N_L = iint_{s<r} u^2(r) u^2(s) s^(L-1) / r^(L+2) ds dr,  L = 0..2l+1   (N_1 = Marvin I0)
+    K   = int u^4 / r^2 dr
+    W_L = [[-(L-1)(L+2)/2 N_L + (2L+1)/4 K, -3/2 N_L], [-3/2 N_L, 2 N_L]]
+    G   = - sum_L 4 pi/(2L+1) sum_{M,c,t,t'} W_L[t,t'] a^{t,c}_{pr,LM} b^{t',c}_{qs,LM}
+
+a = int X^t_pr Y_LM, b = int X^t_qs conj(Y_LM), X = (F, H) (:func:`_angular_currents`).
+
+Limits (unit tests): closed shell D = 1 -> h^dir = 0, h^x = a 1 + c l.s with c > 0;
+spherical collinear shell -> L.m coefficient of h^dir = -(alpha^2/2)(N_up - N_dn) I0;
+one electron -> h_aa = 0; h[Theta D Theta^-1] = Theta h[D] Theta^-1; h[M D M^+] = M h[D] M^+.
 
 Double counting (section 3, two keys, no defaults)::
 
@@ -95,11 +111,14 @@ Double counting (section 3, two keys, no defaults)::
                       paw         : exchange    = h^x_AE - h^x_PS       (Sigma has TT exchange)
                       off         : exchange    = 0
 
-Not included: i[r, H_OS] in the velocity; on-site spin-spin / orbit-orbit;
-exchange with other shells; ultrasoft/PAW; nspinor = 1 (all refused or stated).
+Not included (section 8): one radial function per shell (j-averaged); the AE
+small component is the kinetic-balance lift of the AE large component, not the
+Dirac small component; i[r, H_OS] in the velocity; exchange with other shells;
+ultrasoft/PAW; nspinor = 1 (refused or stated).
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 from dataclasses import dataclass
@@ -116,12 +135,13 @@ from common.units import RYD_TO_EV
 ALPHA = float(ALPHA_FS)
 HA_TO_RY = 2.0
 RY_TO_MEV = 1.0e3 * RYD_TO_EV   # the writers' constant (file_io.onsite_breit_output), so log and files agree
-SIDECAR_FORMAT = "lorrax.onsite_breit_sidecar/v1"
-PROVENANCE_SCHEME = "lorrax.onsite_breit/v1"
+SIDECAR_FORMAT = "lorrax.onsite_breit_sidecar/v2"
+SIDECAR_FORMAT_V1 = "lorrax.onsite_breit_sidecar/v1"   # refused by read_sidecar (spin-other-orbit tensor only)
+PROVENANCE_SCHEME = "lorrax.onsite_breit/v2"
 DOUBLE_COUNTING_VALUES = ("onsite_only", "paw")
 EXCHANGE_VALUES = ("full", "paw", "off")
 CHI_RTOL = 1.0e-8            # section 6: max|chi_upf - chi_sidecar| <= 1e-8 max|chi_upf|
-CLOSED_SHELL_RTOL = 1.0e-10  # section 6: d1 = d2 = 0, h^x proportional to l.s
+CLOSED_SHELL_RTOL = 1.0e-10  # section 6: h^dir = 0, h^x = a 1 + c l.s
 _SIGMA = np.array([[[0, 1], [1, 0]], [[0, -1j], [1j, 0]], [[1, 0], [0, -1]]], dtype=np.complex128)
 
 
@@ -284,70 +304,170 @@ def rotation_matrix(l: int, R: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Mean field (docs/dev/onsite_breit.md section 2)
+# The four-spinor transverse tensor (docs/dev/onsite_breit.md section 2)
 # ---------------------------------------------------------------------------
 
-def _g_soo(lam: np.ndarray) -> np.ndarray:
-    """g[p,q,r,s] = -alpha^2 sum_c Lam^c[a_p,a_q,a_r,a_s] delta(s_p,s_r) (sigma^c/2)[s_q,s_s]  (Hartree)."""
-    lam = np.asarray(lam, dtype=np.complex128)
-    n = lam.shape[1]
-    g = -ALPHA ** 2 * np.einsum("cAQRS,pr,cqs->pAqQrRsS", lam, np.eye(2), _SIGMA / 2, optimize=True)
-    return g.reshape(2 * n, 2 * n, 2 * n, 2 * n)
+def _sphere_rule(l):
+    """Gauss-Legendre in cos(theta) x uniform phi, exact above degree 4l+2 (points (N, 3), weights (N,))."""
+    x, wx = np.polynomial.legendre.leggauss(2 * l + 4)
+    nphi = 4 * l + 8
+    ph = 2 * np.pi * np.arange(nphi) / nphi
+    ct = np.repeat(x, nphi)
+    st = np.sqrt(1.0 - ct ** 2)
+    phr = np.tile(ph, len(x))
+    pts = np.stack([st * np.cos(phr), st * np.sin(phr), ct], axis=1)
+    return pts, np.repeat(wx, nphi) * (2 * np.pi / nphi)
 
 
-def _piece_kernels(lam: np.ndarray) -> dict:
-    """K_piece[p,r,s,q] with piece[p,r] = sum_{s,q} K[p,r,s,q] D[s,q] (Hartree)."""
-    g = _g_soo(lam)
-    return dict(d1=np.einsum("pqrs->prsq", g), d2=np.einsum("qpsr->prsq", g),
-                x1=-np.einsum("pqsr->prsq", g), x2=-np.einsum("qprs->prsq", g))
+def _angular_fields(L, pts):
+    """``Y`` (N, 2L+1), ``iLY = i (L_c Y)`` (N, 2L+1, 3) and ``grad_Omega Y = -i r^ x (L Y)`` (N, 2L+1, 3)."""
+    Y = complex_ylm(L, pts)
+    LY = np.stack([Y @ Lc for Lc in _lmats(L)], axis=-1)                     # (L_c Y_m) = sum_m' Y_m' (l_c)[m', m]
+    grad = -1j * np.cross(pts[:, None, :], LY)
+    return Y, 1j * LY, grad
 
 
-def meanfield_pieces(lam: np.ndarray, D: np.ndarray) -> dict:
-    """The four mean-field pieces of one tensor for one shell density matrix.
+def _angular_currents(l: int):
+    """Angular parts of the transition currents of the lifted shell, on ``_sphere_rule(l + 1)``.
 
-    Parameters
-    ----------
-    lam : (3, n, n, n, n) complex
-        ``Lam[c, a, a2, b, d]``, Hartree a.u., no alpha^2; n = 2l+1.
-    D : (2n, 2n) complex
-        Shell density matrix ``D[a, b] = <a|rho|b>``.
+    With ``Psi_p = [phi_p ; (alpha/2) sigma.p phi_p]``, ``phi_p = R Y_lm chi_sigma``
+    (R = u/r) and ``sigma.p = -i [(sigma.r^) d_r + (sigma.grad_Omega)/r]``::
+
+        j_pr = Psi_p^+ alpha_vec Psi_r = alpha [ R R' F_pr(Omega) + (R^2/r) H_pr(Omega) ]
+        F_pr = (i/2) [ (A_p)^+ sigma Phi_r - Phi_p^+ sigma A_r ],   A = (sigma.r^) Phi
+        H_pr = (i/2) [ (B_p)^+ sigma Phi_r - Phi_p^+ sigma B_r ],   B = (sigma.grad_Omega) Phi
 
     Returns
     -------
-    dict of (2n, 2n) complex128, Hartree: ``d1, d2, x1, x2`` (module docstring).
+    (pts (N, 3), w (N,), F, H) with F, H (N, 2n, 2n, 3) complex128, basis
+    ``p = sigma (2l+1) + (m + l)``.
     """
-    D = np.asarray(D, dtype=np.complex128)
-    return {k: np.einsum("prsq,sq->pr", K, D) for k, K in _piece_kernels(lam).items()}
+    pts, w = _sphere_rule(l + 1)
+    Y, _iLY, grad = _angular_fields(l, pts)
+    n = 2 * l + 1
+    Phi = np.zeros((len(w), 2 * n, 2), np.complex128)
+    SB = np.zeros_like(Phi)
+    for s in range(2):
+        Phi[:, s * n:(s + 1) * n, s] = Y
+        SB[:, s * n:(s + 1) * n, :] = np.einsum("Nmc,ct->Nmt", grad, _SIGMA[:, :, s])   # (sigma.grad_Omega Y) e_s
+    SA = np.einsum("Nc,cst,Npt->Nps", pts, _SIGMA, Phi)                                 # (sigma.r^) Phi
+
+    def cur(Sm):
+        a = np.einsum("Nps,cst,Nrt->Nprc", Sm.conj(), _SIGMA, Phi)
+        b = np.einsum("Nps,cst,Nrt->Nprc", Phi.conj(), _SIGMA, Sm)
+        return 0.5j * (a - b)
+    return pts, w, cur(SA), cur(SB)
 
 
-def meanfield_kernels(lam: np.ndarray):
+@functools.lru_cache(maxsize=None)
+def _breit_angular_blocks(l: int) -> np.ndarray:
+    """``T[L, t, t', p, q, r, s] = -4 pi/(2L+1) sum_{M,c} a^{t,c}_{pr,LM} b^{t',c}_{qs,LM}``, L = 0..2l+1.
+
+    ``a = int X^t_pr Y_LM dOmega``, ``b = int X^t'_qs conj(Y_LM) dOmega``,
+    ``X = (F, H)`` of :func:`_angular_currents`; exact on ``_sphere_rule(l + 1)``
+    (integrand degree <= 4l+2).  Cached per l, read-only.
+    """
+    pts, w, F, H = _angular_currents(l)
+    X = np.stack([F, H])
+    n2 = F.shape[1]
+    T = np.zeros((2 * l + 2, 2, 2) + (n2,) * 4, np.complex128)
+    for L in range(2 * l + 2):
+        YL = complex_ylm(L, pts)
+        a = np.einsum("N,tNprc,NM->tprcM", w, X, YL)
+        b = np.einsum("N,tNqsc,NM->tqscM", w, X, YL.conj())
+        T[L] = -(4 * np.pi / (2 * L + 1)) * np.einsum("tprcM,uqscM->tupqrs", a, b, optimize=True)
+    T.setflags(write=False)
+    return T
+
+
+def breit_radial_W(L: int, N, K) -> np.ndarray:
+    """Slater integrals ``W_L[t, t']`` of the radial shapes ``f1 = u u' - u^2/r``, ``f2 = u^2/r`` (2x2, bohr^-3).
+
+    ``W_L[a, b] = iint f_a(r1) f_b(r2) r_<^L / r_>^(L+1)``; integration by parts
+    leaves ``N_L`` and ``K`` only (no derivative of u)::
+
+        W_L[1,1] = -(L-1)(L+2)/2 N_L + (2L+1)/4 K,   W_L[1,2] = W_L[2,1] = -3/2 N_L,   W_L[2,2] = 2 N_L
+    """
+    NL = float(N[L])
+    w11 = -0.5 * (L - 1) * (L + 2) * NL + 0.25 * (2 * L + 1) * float(K)
+    w12 = -1.5 * NL
+    return np.array([[w11, w12], [w12, 2.0 * NL]])
+
+
+def shell_breit_tensor(l: int, N, K) -> np.ndarray:
+    """Transverse two-body tensor of one shell's lifted four-spinors (module docstring).
+
+    Parameters
+    ----------
+    l : int, 1..3
+    N : (2l+2,) float
+        ``N_L``, L = 0..2l+1, of the normalised radial function (bohr^-3).
+    K : float
+        ``int u^4 / r^2 dr`` (bohr^-3).
+
+    Returns
+    -------
+    (2n, 2n, 2n, 2n) complex128, n = 2l+1:
+    ``G[p,q,r,s] = <p(1) q(2)| -alpha_1.alpha_2 / r12 |r(1) s(2)>`` in Hartree,
+    WITHOUT alpha^2; basis ``p = sigma (2l+1) + (m + l)``, complex CS Y_lm.
+    Gaunt and transverse (Breit) kernels give the same G for one radial function.
+    """
+    l = int(l)
+    if not 1 <= l <= 3:
+        raise ValueError(f"shell_breit_tensor: l = {l}; the on-site operator needs 1 <= l <= 3")
+    N = np.asarray(N, dtype=np.float64)
+    if N.shape != (2 * l + 2,):
+        raise ValueError(f"shell_breit_tensor: N has shape {N.shape}; want ({2 * l + 2},) for l = {l}")
+    W = np.stack([breit_radial_W(L, N, K) for L in range(2 * l + 2)])
+    return np.einsum("Ltu,Ltupqrs->pqrs", W, _breit_angular_blocks(l), optimize=True)
+
+
+# ---------------------------------------------------------------------------
+# Mean field (docs/dev/onsite_breit.md section 2)
+# ---------------------------------------------------------------------------
+
+def meanfield_kernels(G: np.ndarray):
     """Precontracted direct and exchange kernels of one tensor.
 
-    ``h^dir[p, r] = sum_{s,q} K_dir[p,r,s,q] D[s,q]`` (= d1 + d2) and
-    ``h^x[p, r] = sum_{s,q} K_x[p,r,s,q] D[s,q]`` (= x1 + x2), Hartree, alpha^2
-    (``common.bispinor_init.ALPHA_FS``) included.
+    ``h^dir[p, r] = sum_{s,q} K_dir[p,r,s,q] D[s,q]``, ``K_dir[p,r,s,q] = alpha^2 G[p,q,r,s]``;
+    ``h^x[p, r] = sum_{s,q} K_x[p,r,s,q] D[s,q]``, ``K_x[p,r,s,q] = -alpha^2 G[p,q,s,r]``.
+    Hartree, alpha^2 (``common.bispinor_init.ALPHA_FS``) included.
+
+    Parameters
+    ----------
+    G : (2n, 2n, 2n, 2n) complex, :func:`shell_breit_tensor`.
 
     Returns
     -------
     (K_dir, K_x) : two (2n, 2n, 2n, 2n) complex128 arrays.
     """
-    K = _piece_kernels(lam)
-    return K["d1"] + K["d2"], K["x1"] + K["x2"]
+    G = np.asarray(G, dtype=np.complex128)
+    return ALPHA ** 2 * np.einsum("pqrs->prsq", G), -ALPHA ** 2 * np.einsum("pqsr->prsq", G)
 
 
 def _contract(K, D):
     return np.einsum("prsq,sq->pr", K, np.asarray(D, dtype=np.complex128))
 
 
+def breit_meanfield(G: np.ndarray, D: np.ndarray) -> dict:
+    """``{"dir": h^dir[D], "x": h^x[D]}`` (2n, 2n) complex128, Hartree, alpha^2 included."""
+    Kd, Kx = meanfield_kernels(G)
+    return {"dir": _contract(Kd, D), "x": _contract(Kx, D)}
+
+
 def shell_kernels(sc_shell: dict) -> dict:
-    """``{"l", "label", "ae": {"dir", "x"}, "ps": {"dir", "x"} | None}`` (Hartree kernels) of one sidecar shell."""
-    out = {"l": int(sc_shell["l"]), "label": str(sc_shell["label"])}
+    """``{"l", "label", "ae": {"dir", "x"}, "ps": {"dir", "x"} | None}`` (Hartree kernels) of one sidecar shell.
+
+    Built from the block's radial numbers ``N``, ``K`` by :func:`shell_breit_tensor`.
+    """
+    l = int(sc_shell["l"])
+    out = {"l": l, "label": str(sc_shell["label"])}
     for kind in ("ae", "ps"):
         t = sc_shell.get(kind)
         if t is None:
             out[kind] = None
             continue
-        Kd, Kx = meanfield_kernels(t["lam"])
+        Kd, Kx = meanfield_kernels(shell_breit_tensor(l, t["N"], t["K"]))
         out[kind] = {"dir": Kd, "x": Kx}
     return out
 
@@ -525,36 +645,70 @@ def _array(x, shape, what, path):
     return a
 
 
-def _closed_shell_check(lam, l, where):
-    """d1 = d2 = 0 and x1 + x2 = c l.s, c > 0, at D = 1 (relative 1e-10); returns c (Hartree)."""
-    n = 2 * l + 1
-    I = np.eye(2 * n)
-    h = meanfield_pieces(lam, I)
-    x = h["x1"] + h["x2"]
-    ls = shell_operators(l)["ls"]
-    scale = float(np.abs(x).max())
-    dmax = max(float(np.abs(h["d1"]).max()), float(np.abs(h["d2"]).max()))
-    c = float(np.vdot(ls, x).real / np.vdot(ls, ls).real) if l > 0 else 0.0
-    resid = float(np.linalg.norm(x - c * ls) / np.linalg.norm(x)) if scale > 0 else np.inf
-    if not (scale > 0 and dmax <= CLOSED_SHELL_RTOL * scale and resid <= CLOSED_SHELL_RTOL and c > 0):
+def closed_shell_coefficients(G, l: int) -> dict:
+    """h^dir and h^x of a tensor at D = 1, and the fit ``h^x = a 1 + c l.s`` (Hartree).
+
+    Returns ``{"dir_over_x": max|h^dir| / max|h^x|, "a", "c", "resid":
+    |h^x - a 1 - c l.s| / |h^x|, "x_max": max|h^x|}``.
+    """
+    ops = shell_operators(l)
+    h = breit_meanfield(G, ops["I"])
+    x = h["x"]
+    xmax = float(np.abs(x).max())
+    a = float(np.trace(x).real / len(x))
+    c = float(np.vdot(ops["ls"], x).real / np.vdot(ops["ls"], ops["ls"]).real)
+    resid = float(np.linalg.norm(x - a * ops["I"] - c * ops["ls"]) / np.linalg.norm(x)) if xmax > 0 else np.inf
+    return {"dir_over_x": float(np.abs(h["dir"]).max()) / xmax if xmax > 0 else np.inf,
+            "a": a, "c": c, "resid": resid, "x_max": xmax}
+
+
+def _closed_shell_check(G, l, where):
+    """h^dir = 0 and h^x = a 1 + c l.s, c > 0, at D = 1 (relative 1e-10); returns (a, c) (Hartree)."""
+    cs = closed_shell_coefficients(G, l)
+    if not (cs["x_max"] > 0 and cs["dir_over_x"] <= CLOSED_SHELL_RTOL and cs["resid"] <= CLOSED_SHELL_RTOL
+            and cs["c"] > 0):
         raise _gate("onsite_breit_sidecar",
-                    f"{where}: closed shell max|d1|,|d2| = {dmax:.2e} Ha, |x| = {scale:.2e} Ha, "
-                    f"|x - c l.s|/|x| = {resid:.2e}, c = {c:+.3e} Ha",
-                    f"d1 = d2 = 0 and x1 + x2 = c l.s with c > 0, to {CLOSED_SHELL_RTOL:g} relative",
-                    "a tensor that fails the closed-shell identity is corrupted or in another index order",
+                    f"{where}: closed shell max|h_dir|/max|h_x| = {cs['dir_over_x']:.2e}, "
+                    f"|h_x - a 1 - c l.s|/|h_x| = {cs['resid']:.2e}, c = {cs['c']:+.3e} Ha",
+                    f"h_dir = 0 and h_x = a 1 + c l.s with c > 0, to {CLOSED_SHELL_RTOL:g} relative",
+                    "radial numbers that fail the closed-shell identity are corrupted or belong to another "
+                    "construction",
                     "regenerate the sidecar (python -m psp.onsite_breit_sidecar)")
-    return c
+    return cs["a"], cs["c"]
+
+
+def _radial_block(t, l, where, path):
+    """Decode and check the radial numbers ``N`` (2l+2,) and ``K`` of one v2 tensor block."""
+    N = _array(t.get("N", []), (2 * l + 2,), f"{where}.N", path)
+    try:
+        K = float(t["K"])
+        I0 = float(t["I0"])
+    except (KeyError, TypeError, ValueError):
+        raise _gate("onsite_breit_sidecar", f"{path}: {where} has no scalar K / I0",
+                    "K and I0 as numbers (bohr^-3)", "K enters every W_L[1,1]; I0 is N[1]",
+                    "regenerate the sidecar") from None
+    if not (np.all(np.isfinite(N)) and np.all(N > 0) and np.isfinite(K) and K > 0):
+        raise _gate("onsite_breit_sidecar", f"{path}: {where} N = {N.tolist()}, K = {K!r}",
+                    "every N_L > 0 and K > 0 (integrals of positive functions)",
+                    "a non-positive radial integral is a corrupted file", "regenerate the sidecar")
+    if abs(I0 - N[1]) > 1e-12 * abs(N[1]):
+        raise _gate("onsite_breit_sidecar", f"{path}: {where} I0 = {I0!r}, N[1] = {N[1]!r}",
+                    "I0 = N[1] (Marvin's I0 is N_1)", "the diagnostics and the operator disagree",
+                    "regenerate the sidecar")
+    return N, K
 
 
 def read_sidecar(path, *, require_ps: bool = False) -> dict:
-    """Parse and verify one ``<El>.onsite_breit.json`` (``lorrax.onsite_breit_sidecar/v1``).
+    """Parse and verify one ``<El>.onsite_breit.json`` (``lorrax.onsite_breit_sidecar/v2``).
 
-    Checks (``GATE onsite_breit_sidecar``): the format string; every shell's
-    l, projector mesh/chi lengths and tensor shapes ``(3, n, n, n, n)``,
-    n = 2l+1; ``ps`` present when ``require_ps``; the closed-shell identity
-    of every tensor (D = 1: d1 = d2 = 0, x1 + x2 = c l.s, c > 0, 1e-10
-    relative).  The UPF authentication of ``projector.chi`` needs the deck's
-    UPF and is done by :func:`build_onsite_setup`.
+    Checks (``GATE onsite_breit_sidecar``): the format string (a v1 file, which
+    holds the spin-other-orbit tensor only, refuses); every shell's l,
+    projector mesh/chi lengths; per tensor block the length of ``N`` (2l+2),
+    ``N_L > 0``, ``K > 0``, ``I0 = N[1]``; ``ps`` present when ``require_ps``;
+    the closed-shell identity of the tensor built from ``N``, ``K`` (D = 1:
+    max|h^dir| <= 1e-10 max|h^x|, h^x = a 1 + c l.s to 1e-10 relative, c > 0).
+    The UPF authentication of ``projector.chi`` needs the run's UPF and is done
+    by :func:`build_onsite_setup`.
 
     Returns
     -------
@@ -562,24 +716,32 @@ def read_sidecar(path, *, require_ps: bool = False) -> dict:
         ``format, element, conventions, provenance, path, sha256`` and
         ``shells``: a list of ``{"label", "l", "projector": {"type",
         "function", "r", "chi"}, "ae": T, "ps": T | None}`` with
-        ``T = {"reference", "lam" (3,n,n,n,n) complex128, "I0", "r3",
-        "b1_mev_per_muB", "x_closed_mev", "x_closed_ha_check"}``.
+        ``T = {"reference", "N" (2l+2,), "K", "I0", "r3", "b1_mev_per_muB",
+        "x_closed_ls_mev", "x_closed_shift_mev", "x_closed_ls_ha_check",
+        "x_closed_shift_ha_check"}``.
     """
     path = str(path)
     sha = _sha256_file(path)
     with open(path) as f:
         raw = json.load(f)
     fmt = raw.get("format")
+    if fmt == SIDECAR_FORMAT_V1:
+        raise _gate("onsite_breit_sidecar", f"{path}: format = {fmt!r}", f"format = {SIDECAR_FORMAT!r}",
+                    "a v1 sidecar holds the spin-other-orbit tensor only; the on-site operator is now the "
+                    "transverse interaction of the shell's lifted four-spinors, built from the radial numbers "
+                    "N_L and K that a v1 file does not carry",
+                    "regenerate with python -m psp.onsite_breit_sidecar from the same inputs (UPF, shell, "
+                    "all-electron radial function)")
     if fmt != SIDECAR_FORMAT:
         raise _gate("onsite_breit_sidecar", f"{path}: format = {fmt!r}", f"format = {SIDECAR_FORMAT!r}",
                     "an unknown sidecar format has unknown conventions", "regenerate with python -m psp.onsite_breit_sidecar")
     shells = []
     for ish, s in enumerate(raw.get("shells") or []):
         l = int(s["l"])
-        if not 0 <= l <= 3:
-            raise _gate("onsite_breit_sidecar", f"{path}: shell {ish} l = {l}", "0 <= l <= 3",
-                        "the atomic rows exist only to l = 3", "fix the sidecar")
-        n = 2 * l + 1
+        if not 1 <= l <= 3:
+            raise _gate("onsite_breit_sidecar", f"{path}: shell {ish} l = {l}", "1 <= l <= 3",
+                        "an s shell has no orbital current of its own; the atomic rows exist only to l = 3",
+                        "fix the sidecar")
         pj = s.get("projector") or {}
         r = _array(pj.get("r", []), None, "projector.r", path)
         chi = _array(pj.get("chi", []), None, "projector.chi", path)
@@ -597,18 +759,14 @@ def read_sidecar(path, *, require_ps: bool = False) -> dict:
             if t is None:
                 entry[kind] = None
                 continue
-            if "shape" in t and [int(x) for x in t["shape"]] != [3, n, n, n, n]:
-                raise _gate("onsite_breit_sidecar", f"{path}: shell {ish} {kind}.shape = {t['shape']}",
-                            f"[3, {n}, {n}, {n}, {n}] (l = {l})",
-                            "a tensor of the wrong shape is a different basis or a truncated file",
-                            "regenerate the sidecar")
-            lam = (_array(t["lam_re"], (3, n, n, n, n), f"shell {ish} {kind}.lam_re", path)
-                   + 1j * _array(t["lam_im"], (3, n, n, n, n), f"shell {ish} {kind}.lam_im", path))
-            c = _closed_shell_check(lam, l, f"{path}: {s['label']} {kind}")
-            entry[kind] = {"reference": str(t.get("reference", "")), "lam": lam,
+            N, K = _radial_block(t, l, f"shell {ish} {kind}", path)
+            a, c = _closed_shell_check(shell_breit_tensor(l, N, K), l, f"{path}: {s['label']} {kind}")
+            entry[kind] = {"reference": str(t.get("reference", "")), "N": N, "K": K,
                            "I0": float(t["I0"]), "r3": float(t["r3"]),
                            "b1_mev_per_muB": float(t["b1_mev_per_muB"]),
-                           "x_closed_mev": float(t["x_closed_mev"]), "x_closed_ha_check": c}
+                           "x_closed_ls_mev": float(t["x_closed_ls_mev"]),
+                           "x_closed_shift_mev": float(t["x_closed_shift_mev"]),
+                           "x_closed_ls_ha_check": c, "x_closed_shift_ha_check": a}
         if entry["ae"] is None:
             raise _gate("onsite_breit_sidecar", f"{path}: {s['label']} ae = null", "an 'ae' tensor",
                         "the all-electron tensor is the operator", "regenerate the sidecar")
@@ -746,7 +904,7 @@ def build_onsite_setup(wfn, upf_paths: dict, sidecars, *, projector: str, double
         element -> sidecar path, or a sequence of paths (element read from
         each file), or already-read :func:`read_sidecar` dicts.
     projector, double_counting, exchange : str
-        Deck keys ``onsite_breit_projector`` / ``_double_counting`` / ``_exchange``.
+        Input keys ``onsite_breit_projector`` / ``_double_counting`` / ``_exchange``.
 
     Refusals: ``GATE onsite_breit_projector`` (nspinor != 2, ultrasoft/PAW,
     unknown projector name, missing species UPF), ``GATE onsite_breit_sidecar``
@@ -790,7 +948,7 @@ def build_onsite_setup(wfn, upf_paths: dict, sidecars, *, projector: str, double
         if symbol_to_Z(el) not in set(int(z) for z in atom_types) or el not in upf_paths:
             raise _gate("onsite_breit_sidecar", f"{sc['path']}: element {el}",
                         f"a species of the WFN with a UPF ({sorted(upf_paths)})",
-                        "a sidecar for an absent species is a deck error", "fix onsite_breit_files")
+                        "a sidecar for an absent species is an input-file error", "fix onsite_breit_files")
         if el in by_el:
             raise _gate("onsite_breit_sidecar", f"two sidecars for {el}", "one per species",
                         "two operators for one shell", "fix onsite_breit_files")

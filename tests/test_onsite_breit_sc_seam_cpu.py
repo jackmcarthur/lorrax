@@ -173,7 +173,7 @@ def test_sigma_h5_stamp_and_refusal(tmp_path):
         for name in ("hartree_kij_ev", "hartree_scalar_kij_ev",
                      "hartree_transverse_kij_ev"):
             h5.create_dataset(name, data=np.zeros((1, 2, 2), np.complex128))
-    stamp_onsite_breit_provenance_h5(good, '{"scheme":"lorrax.onsite_breit/v1"}')
+    stamp_onsite_breit_provenance_h5(good, '{"scheme":"lorrax.onsite_breit/v2"}')
     with h5py.File(good, "r") as h5:
         for name in ("hartree_kij_ev", "hartree_transverse_kij_ev"):
             assert "onsite_breit" in str(h5[name].attrs[ONSITE_BREIT_PROVENANCE_ATTR])

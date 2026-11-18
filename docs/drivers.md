@@ -261,7 +261,7 @@ outputs and the refusals; the `[downfold]` keys are in the
 
 ## on-site Breit — `gw.onsite_breit_cli`
 
-Builds the on-site Breit (spin–other-orbit) mean field of one open shell per
+Builds the on-site four-spinor Breit mean field of one open shell per
 atom from the DFT occupations and writes it with its pieces to
 `onsite_breit.h5` beside the deck. With $P[k,a,n] = \langle\tilde\phi_a(k)|\psi_{nk}\rangle$
 (the ortho-atomic projector of the deck's UPFs, full BZ),

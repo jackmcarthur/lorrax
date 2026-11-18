@@ -1429,7 +1429,7 @@ _DEFAULTS = {
     # consumer call; a WFN whose QE schema declares DFT+U refuses without them.
     "hubbard_input": "",
     "hubbard_occupations": "",
-    # On-site Breit (spin-other-orbit) mean field of one open shell per atom
+    # On-site four-spinor Breit mean field of one open shell per atom
     # (psp.onsite_breit; assembled by gw.hartree.onsite_breit_field).  The two
     # double-counting keys have NO default: "" is "unset" and refuses when
     # onsite_breit = true (refuse_unsupported_onsite_breit).  Every

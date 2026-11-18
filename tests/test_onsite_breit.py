@@ -1,4 +1,4 @@
-"""On-site Breit operator (``psp.onsite_breit``): identities, limits, refusals, kernels.
+"""On-site four-spinor Breit operator (``psp.onsite_breit``): identities, limits, refusals, kernels.
 
 A CPU/unit cell, exempt from the four-GPU rule (no driver runs; the band
 kernels are checked on a single-device mesh, and on an emulated 2x2 host mesh
@@ -8,13 +8,14 @@ devices).  Run::
     JAX_PLATFORMS=cpu JAX_ENABLE_X64=1 OPENBLAS_THREAD_TIMEOUT=1 \\
         python -m pytest tests/test_onsite_breit.py -q -p no:cacheprovider
 
-Data (``tests/data/onsite_breit/``): the species sidecars ``Fe/Cr/Cl.onsite_breit.json``
-and the atomic-limit fixtures written by the earlier sidecar generator
-(``provenance.generator`` in each file; the in-repo generator is
-``psp.onsite_breit_sidecar``, docs/dev/onsite_breit.md section 7),
-``reference_values.json`` (numbers of the validated
-post-processing code ``onsite_ops`` on the same tensors, with recipes), and the
-two CrCl3 UPFs the Cr/Cl sidecars authenticate against.
+Data (``tests/data/onsite_breit/``): the v2 species sidecars ``Fe/Cr/Cl.onsite_breit.json``
+and the atomic-limit fixtures ``Cr3plus_uhf3dup`` / ``Fe2plus_uhf3dup``, written by
+``make_v2_fixtures.py`` there (``psp.onsite_breit_sidecar``, docs/dev/onsite_breit.md
+section 7); the two CrCl3 UPFs the Cr/Cl sidecars authenticate against; ``v1/``: the
+earlier spin-other-orbit sidecars (here only for the v1 refusal) and
+``v1/reference_values.json`` (numbers of the validated post-processing code
+``onsite_ops``).  The checks against the spin-other-orbit tensor and the radial
+reduction live in ``tests/test_onsite_breit_sidecar.py``.
 
 The reference numbers were computed with alpha = 1/137.035999084; the module
 uses the repo's ``common.bispinor_init.ALPHA_FS`` (2 x 0.00364867628215), which
@@ -39,10 +40,6 @@ DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "onsite_
 ALPHA_REF = 1.0 / 137.035999084
 SCALE_REF = (ALPHA_REF / ob.ALPHA) ** 2          # module value -> reference value
 HA_TO_MEV = ob.HA_TO_RY * ob.RY_TO_MEV
-# The sidecar's *_mev fields were written by the earlier generator with QE's Rydberg
-# (13.605693122994 eV); the module logs
-# with common.units.RYD_TO_EV (3.6e-7 relative apart), so the pin uses the generator's.
-HA_TO_MEV_SIDECAR = 2.0 * 13605.693122994
 
 
 def _path(name):
@@ -56,13 +53,17 @@ def sc():
 
 @pytest.fixture(scope="module")
 def ref():
-    with open(_path("reference_values.json")) as f:
+    with open(_path("v1/reference_values.json")) as f:
         return json.load(f)
 
 
+def _G(block, l):
+    return ob.shell_breit_tensor(l, block["N"], block["K"])
+
+
 def _tensors(sc):
-    """(name, l, lam) of every AE and PS tensor of the three species."""
-    return [(f"{el} {s['label']} {k}", s["l"], s[k]["lam"])
+    """(name, l, G) of every AE and PS tensor of the three species."""
+    return [(f"{el} {s['label']} {k}", s["l"], _G(s[k], s["l"]))
             for el, d in sc.items() for s in d["shells"] for k in ("ae", "ps")]
 
 
@@ -86,72 +87,79 @@ def _rotation(seed):
     return q * np.linalg.det(q)
 
 
-def _all_pieces(lam, D):
-    h = ob.meanfield_pieces(lam, D)
-    Kd, Kx = ob.meanfield_kernels(lam)
-    h["dir"] = np.einsum("prsq,sq->pr", Kd, D)
-    h["x"] = np.einsum("prsq,sq->pr", Kx, D)
+def _all_pieces(G, D):
+    """``dir``, ``x`` and their sum, with the direct contraction of G checked against the kernels."""
+    D = np.asarray(D, dtype=complex)
+    h = ob.breit_meanfield(G, D)
+    a2 = ob.ALPHA ** 2
+    tol = 1e-13 * a2 * np.abs(G).max() * np.abs(D).sum()
+    assert np.abs(h["dir"] - a2 * np.einsum("pqrs,sq->pr", G, D)).max() <= tol
+    assert np.abs(h["x"] + a2 * np.einsum("pqsr,sq->pr", G, D)).max() <= tol
+    h["tot"] = h["dir"] + h["x"]
     return h
 
 
 # ---------------------------------------------------------------- (a) closed shell
-def test_closed_shell_limit(sc, ref):
-    """D = 1: d1 = d2 = 0, x1 + x2 = c l.s (a pure delta-xi), c = the sidecar's x_closed_mev, c > 0."""
+def test_closed_shell_limit(sc):
+    """D = 1: h_dir = 0, h_x = a 1 + c l.s, c > 0; a, c = the sidecar's x_closed_shift_mev, x_closed_ls_mev."""
     worst_d, worst_res = 0.0, 0.0
     for el, d in sc.items():
         for s in d["shells"]:
             l, n2 = s["l"], 2 * (2 * s["l"] + 1)
-            ls = ob.shell_operators(l)["ls"]
+            o = ob.shell_operators(l)
             kern = ob.shell_kernels(s)
             for kind in ("ae", "ps"):
-                h = ob.meanfield_pieces(s[kind]["lam"], np.eye(n2))
-                x = h["x1"] + h["x2"]
-                c = _coef(ls, x)
-                res = _rel(x, c * ls)
-                dmax = max(np.abs(h["d1"]).max(), np.abs(h["d2"]).max()) / np.abs(x).max()
+                h = _all_pieces(_G(s[kind], l), np.eye(n2))
+                x = h["x"]
+                a, c = np.trace(x).real / n2, _coef(o["ls"], x)
+                res = _rel(x, a * o["I"] + c * o["ls"])
+                dmax = np.abs(h["dir"]).max() / np.abs(x).max()
                 worst_d, worst_res = max(worst_d, dmax), max(worst_res, res)
-                c_mev = c * HA_TO_MEV_SIDECAR * SCALE_REF
-                rv = ref["shells"][f"{el}.onsite_breit.json:{s['label']}:{kind}"]
-                print(f"\n[a] {el} {s['label']} {kind}: max|d1,d2|/|x| = {dmax:.1e}, |x - c l.s|/|x| = {res:.1e}, "
-                      f"c = {c * HA_TO_MEV:+.6f} meV (sidecar {s[kind]['x_closed_mev']:+.6f})")
-                assert c > 0 and res < 1e-12 and dmax < 1e-12
-                assert abs(c_mev / s[kind]["x_closed_mev"] - 1) < 1e-10
-                assert abs(c * SCALE_REF / rv["x_closed_ha"] - 1) < 1e-10
-            # the assembled potential at D = 1 (onsite_only, full) is the AE exchange delta-xi in Ry
+                print(f"\n[a] {el} {s['label']} {kind}: max|h_dir|/|h_x| = {dmax:.1e}, |h_x - a - c l.s|/|h_x| = "
+                      f"{res:.1e}, a = {a * HA_TO_MEV:+.6f} meV, c = {c * HA_TO_MEV:+.6f} meV "
+                      f"(sidecar {s[kind]['x_closed_shift_mev']:+.6f}, {s[kind]['x_closed_ls_mev']:+.6f})")
+                assert c > 0 and a > 0 and res < 1e-12 and dmax < 1e-12
+                assert abs(c * HA_TO_MEV / s[kind]["x_closed_ls_mev"] - 1) < 1e-12
+                assert abs(a * HA_TO_MEV / s[kind]["x_closed_shift_mev"] - 1) < 1e-12
+                assert abs(c / s[kind]["x_closed_ls_ha_check"] - 1) < 1e-13
+            # the assembled potential at D = 1 (onsite_only, full) is the AE exchange shift + delta-xi in Ry
             pc = ob.onsite_potential(np.eye(n2), kern, double_counting="onsite_only", exchange="full")
-            c_ae = s["ae"]["x_closed_ha_check"]
-            assert _rel(pc["total"], ob.HA_TO_RY * c_ae * ls) < 1e-12
-    print(f"\n[a] worst: max|d|/|x| {worst_d:.1e}, l.s residual {worst_res:.1e}")
+            want = s["ae"]["x_closed_shift_ha_check"] * o["I"] + s["ae"]["x_closed_ls_ha_check"] * o["ls"]
+            assert _rel(pc["total"], ob.HA_TO_RY * want) < 1e-12
+    print(f"\n[a] worst: max|h_dir|/|h_x| {worst_d:.1e}, residual {worst_res:.1e}")
 
 
-# ---------------------------------------------------------------- (b) Hermiticity, linearity
-def test_hermiticity_and_linearity(sc):
-    worst_h, worst_lin = 0.0, 0.0
-    for name, l, lam in _tensors(sc):
+# ---------------------------------------------------------------- (b) tensor symmetries, Hermiticity, linearity
+def test_pair_symmetry_hermiticity_and_linearity(sc):
+    """G[pqrs] = G[qpsr] (electron exchange) and G[pqrs] = conj G[rspq] (Hermitian two-body operator);
+    h_dir, h_x Hermitian for Hermitian D, linear in D."""
+    worst_g, worst_h, worst_lin = 0.0, 0.0, 0.0
+    for name, l, G in _tensors(sc):
+        sc_g = np.abs(G).max()
+        worst_g = max(worst_g, np.abs(G - G.transpose(1, 0, 3, 2)).max() / sc_g,
+                      np.abs(G - G.transpose(2, 3, 0, 1).conj()).max() / sc_g)
         n2 = 2 * (2 * l + 1)
         D1, D2 = _herm(n2, 1), _herm(n2, 2)
-        h1, h2 = _all_pieces(lam, D1), _all_pieces(lam, D2)
-        h12 = _all_pieces(lam, 0.7 * D1 - 1.3 * D2)
+        h1, h2 = _all_pieces(G, D1), _all_pieces(G, D2)
+        h12 = _all_pieces(G, 0.7 * D1 - 1.3 * D2)
         for k in h1:
-            # x1 and x2 are not Hermitian one by one (only their sum is); d1, d2, dir, x are
-            if k not in ("x1", "x2"):
-                worst_h = max(worst_h, np.linalg.norm(h1[k] - h1[k].conj().T) / np.linalg.norm(h1[k]))
+            worst_h = max(worst_h, np.linalg.norm(h1[k] - h1[k].conj().T) / np.linalg.norm(h1[k]))
             worst_lin = max(worst_lin, _rel(h12[k], 0.7 * h1[k] - 1.3 * h2[k]))
-        assert _rel(h1["dir"], h1["d1"] + h1["d2"]) < 1e-13 and _rel(h1["x"], h1["x1"] + h1["x2"]) < 1e-13
-    print(f"\n[b] max rel anti-Hermitian part {worst_h:.1e}; max rel linearity defect {worst_lin:.1e}")
-    assert worst_h < 1e-12 and worst_lin < 1e-12
+    print(f"\n[b] max rel pair-symmetry / Hermiticity defect of G {worst_g:.1e}; anti-Hermitian part of h "
+          f"{worst_h:.1e}; linearity defect {worst_lin:.1e}")
+    assert worst_g < 1e-14 and worst_h < 1e-12 and worst_lin < 1e-12
 
 
 # ---------------------------------------------------------------- (c) time reversal
 def test_time_reversal(sc):
     """h[Theta D Theta^-1] = Theta h[D] Theta^-1, Theta = U_T K; Theta^2 = -1 on the shell."""
     worst = 0.0
-    for name, l, lam in _tensors(sc):
+    for name, l, G in _tensors(sc):
         UT = ob.time_reversal(l)
         assert np.abs(UT @ UT.conj() + np.eye(len(UT))).max() < 1e-14      # Theta^2 = -1
         for seed in range(3):
             D = _herm(len(UT), 10 + seed)
-            h, hT = _all_pieces(lam, D), _all_pieces(lam, UT @ D.conj() @ UT.conj().T)
+            h, hT = _all_pieces(G, D), _all_pieces(G, UT @ D.conj() @ UT.conj().T)
             for k in h:
                 worst = max(worst, _rel(hT[k], UT @ h[k].conj() @ UT.conj().T))
         # a magnetic shell is not invariant (the check can fail): moment flips sign
@@ -178,13 +186,13 @@ def test_rotation_covariance_and_moment_direction(sc):
             J = [a + b for a, b in zip(o["L"], o["S"])]
             M = ob.rotation_matrix(l, R)
             assert np.abs(M - expm(-1j * th * sum(a * j for a, j in zip(ax, J)))).max() < 1e-10
-    for name, l, lam in _tensors(sc):
+    for name, l, G in _tensors(sc):
         n = 2 * l + 1
         o = ob.shell_operators(l)
         for seed in range(3):
             M = ob.rotation_matrix(l, _rotation(200 + seed))
             D = _herm(2 * n, 30 + seed)
-            h0, h1 = _all_pieces(lam, D), _all_pieces(lam, M @ D @ M.conj().T)
+            h0, h1 = _all_pieces(G, D), _all_pieces(G, M @ D @ M.conj().T)
             for k in h0:
                 worst = max(worst, _rel(h1[k], M @ h0[k] @ M.conj().T))
         # moment along z vs along x: R_y(+90 deg) takes z to x
@@ -195,71 +203,66 @@ def test_rotation_covariance_and_moment_direction(sc):
         Dx = M @ Dz @ M.conj().T
         Sx = [np.trace(Dx @ s).real for s in o["S"]]
         assert abs(Sx[1]) < 1e-12 and abs(Sx[2]) < 1e-12 and Sx[0] == pytest.approx(np.trace(Dz @ o["S"][2]).real)
-        hz, hx = _all_pieces(lam, Dz), _all_pieces(lam, Dx)
+        hz, hx = _all_pieces(G, Dz), _all_pieces(G, Dx)
         for k in hz:
             worst_zx = max(worst_zx, _rel(hx[k], M @ hz[k] @ M.conj().T))
-        Dsph = np.diag([0.9] * n + [0.3] * n).astype(complex)          # spherical collinear: d1 = b L.m
-        d1z = ob.meanfield_pieces(lam, Dsph)["d1"]
-        d1x = ob.meanfield_pieces(lam, M @ Dsph @ M.conj().T)["d1"]
-        bz, bx = _coef(o["L"][2], d1z), _coef(o["L"][0], d1x)
-        assert _rel(d1z, bz * o["L"][2]) < 1e-10 and _rel(d1x, bx * o["L"][0]) < 1e-10
-        assert abs(bx / bz - 1) < 1e-12
+        Dsph = np.diag([0.9] * n + [0.3] * n).astype(complex)          # spherical collinear: L.m coefficient
+        hdz = _all_pieces(G, Dsph)["dir"]
+        hdx = _all_pieces(G, M @ Dsph @ M.conj().T)["dir"]
+        bz, bx = _coef(o["L"][2], hdz), _coef(o["L"][0], hdx)
+        assert abs(bx / bz - 1) < 1e-12 and bz < 0
     print(f"\n[d] max rel covariance error (general axes, all pieces) {worst:.1e}; z -> x {worst_zx:.1e}")
     assert worst < 1e-12 and worst_zx < 1e-12
 
 
 # ---------------------------------------------------------------- (e) classical and atomic limits
-def test_classical_atomic_limits_and_regression(sc, ref):
-    # spherical collinear shell: d1 = b L_z, b = b1 (N_up - N_dn), b1 = -(alpha^2/2) I0 (fit-limited)
+def test_classical_and_atomic_limits(sc, ref):
+    # spherical collinear shell: L.m coefficient of h_dir = b1 (N_up - N_dn), b1 = -(alpha^2/2) I0, I0 = N_1
     for el, d in sc.items():
         for s in d["shells"]:
             l, n = s["l"], 2 * s["l"] + 1
-            Lz = ob.shell_operators(l)["L"][2]
+            o = ob.shell_operators(l)
             for kind in ("ae", "ps"):
-                d1 = ob.meanfield_pieces(s[kind]["lam"], np.diag([0.9] * n + [0.3] * n))["d1"]
-                b = _coef(Lz, d1) / (n * 0.6)
+                hd = _all_pieces(_G(s[kind], l), np.diag([0.9] * n + [0.3] * n))["dir"]
+                b = _coef(o["L"][2], hd) / (n * 0.6)
                 b_cls = -ob.ALPHA ** 2 / 2 * s[kind]["I0"]
-                rv = ref["shells"][f"{el}.onsite_breit.json:{s['label']}:{kind}"]
+                dec = ob.decompose_potential(hd, l, [0, 0, 1])
                 print(f"\n[e] {el} {s['label']} {kind}: b1 = {b * HA_TO_MEV:+.6f} meV/muB, classical "
-                      f"{b_cls * HA_TO_MEV:+.6f} (rel {b / b_cls - 1:+.1e}), sidecar {s[kind]['b1_mev_per_muB']:+.6f}")
-                assert _rel(d1, _coef(Lz, d1) * Lz) < 1e-10
-                assert abs(b / b_cls - 1) < 5e-4
-                assert abs(b * SCALE_REF / rv["b1_tensor_ha"] - 1) < 1e-10
+                      f"{b_cls * HA_TO_MEV:+.6f} (rel {b / b_cls - 1:+.1e}), sidecar {s[kind]['b1_mev_per_muB']:+.6f}; "
+                      f"S.m {dec['Sm'] * HA_TO_MEV:+.5f} meV, rest {dec['rest_rel']:.3f}")
+                assert abs(b / b_cls - 1) < 1e-10 and abs(dec["Lm"] / (n * 0.6) / b_cls - 1) < 1e-10
+                assert abs(b * HA_TO_MEV / s[kind]["b1_mev_per_muB"] - 1) < 1e-12
     # one electron: no self-interaction (h_aa = 0, and <v|h|v> = 0 for a random spin-orbital)
-    for name, l, lam in _tensors(sc):
+    for name, l, G in _tensors(sc):
         n2 = 2 * (2 * l + 1)
         worst, scale = 0.0, 0.0
         for a in range(n2):
             D = np.zeros((n2, n2)); D[a, a] = 1.0
-            h = ob.meanfield_pieces(lam, D)
-            worst = max(worst, abs(sum(h.values())[a, a]))
-            scale = max(scale, np.abs(h["d1"]).max(), np.abs(h["x1"]).max())
+            h = _all_pieces(G, D)
+            worst = max(worst, abs(h["tot"][a, a]))
+            scale = max(scale, np.abs(h["dir"]).max(), np.abs(h["x"]).max())
         g = np.random.default_rng(3)
         v = g.normal(size=n2) + 1j * g.normal(size=n2)
         v /= np.linalg.norm(v)
-        e = v.conj() @ sum(ob.meanfield_pieces(lam, np.outer(v, v.conj())).values()) @ v
+        e = v.conj() @ _all_pieces(G, np.outer(v, v.conj()))["tot"] @ v
         assert worst < 1e-13 * scale and abs(e) < 1e-13 * scale
-    # atomic limit (reference_values.json "t6"): Cr3+ b = -0.9499, (l+1/2) dxi_x = +1.0988; Fe2+ -2.2577, +2.6109 meV
-    lz = ob._lmats(2)[2]
+    # atomic limit, fully spin-up spherical shell of the UHF 3d-up orbital (reference_values.json "t6"):
+    # the L_z coefficient of h_dir is the spin-other-orbit b of onsite_ops (Cr3+ -0.9499, Fe2+ -2.2577 meV);
+    # its I0 is the analytic one of the Gaussian contraction, so the comparison is quadrature-limited.
     Lz = ob.shell_operators(2)["L"][2]
-    for fx, nup, b_doc, x_doc in (("Cr3plus_uhf3dup", 3, -0.9499, 1.0988), ("Fe2plus_uhf3dup", 5, -2.2577, 2.6109)):
+    for fx, nup, b_doc in (("Cr3plus_uhf3dup", 3, -0.9499), ("Fe2plus_uhf3dup", 5, -2.2577)):
         s = ob.read_sidecar(_path(f"{fx}.onsite_breit.json"))["shells"][0]
-        h = ob.meanfield_pieces(s["ae"]["lam"], np.diag([nup / 5] * 5 + [0.0] * 5))
-        b = _coef(Lz, h["d1"])
-        lhd = 2.5 * 2 * _coef(lz, (h["x1"] + h["x2"])[:5, :5])
+        assert s["ps"] is None and s["projector"]["type"] == "none"
+        h = _all_pieces(_G(s["ae"], 2), np.diag([nup / 5] * 5 + [0.0] * 5))
+        b = _coef(Lz, h["dir"])
+        dd = ob.decompose_potential(h["dir"], 2, [0, 0, 1])
+        dx = ob.decompose_potential(h["x"], 2, [0, 0, 1])
         t6 = ref["t6"][fx]
-        print(f"\n[e] {fx}: b = {b * HA_TO_MEV:+.5f} meV (doc {b_doc:+.4f}), (l+1/2) dxi_x = {lhd * HA_TO_MEV:+.5f} "
-              f"meV (doc {x_doc:+.4f}); vs onsite_ops {b * SCALE_REF / t6['b_ha'] - 1:+.1e}, "
-              f"{lhd * SCALE_REF / t6['lhalf_dxi_ha'] - 1:+.1e}")
-        assert abs(b * HA_TO_MEV / b_doc - 1) < 1e-3 and abs(lhd * HA_TO_MEV / x_doc - 1) < 1e-3
-        assert abs(b * SCALE_REF / t6["b_ha"] - 1) < 1e-10 and abs(lhd * SCALE_REF / t6["lhalf_dxi_ha"] - 1) < 1e-10
-    # regression vector: a written-out non-collinear D through the Fe 3D AE tensor, against onsite_ops
-    rg = ref["regression"]
-    D = np.array(rg["D_re"]) + 1j * np.array(rg["D_im"])
-    h = ob.meanfield_pieces(sc["Fe"]["shells"][0]["ae"]["lam"], D)
-    errs = {k: _rel(h[k] * SCALE_REF, np.array(rg[f"{k}_re"]) + 1j * np.array(rg[f"{k}_im"])) for k in h}
-    print(f"\n[e] regression vs onsite_ops (Fe 3D AE): " + ", ".join(f"{k} {v:.1e}" for k, v in errs.items()))
-    assert max(errs.values()) < 1e-10
+        print(f"\n[e] {fx}: b = {b * HA_TO_MEV:+.5f} meV (doc {b_doc:+.4f}, vs onsite_ops {b * SCALE_REF / t6['b_ha'] - 1:+.1e}); "
+              f"h_dir S.m {dd['Sm'] * HA_TO_MEV:+.5f}, h_x L.m {dx['Lm'] * HA_TO_MEV:+.5f} S.m {dx['Sm'] * HA_TO_MEV:+.5f} "
+              f"1 {dx['I'] * HA_TO_MEV:+.5f} meV")
+        assert abs(b * HA_TO_MEV / b_doc - 1) < 1e-3
+        assert abs(b * SCALE_REF / t6["b_ha"] - 1) < 1e-8
 
 
 # ---------------------------------------------------------------- (f) double counting
@@ -267,9 +270,10 @@ def test_double_counting_tables(sc):
     s = sc["Cr"]["shells"][0]
     kern = ob.shell_kernels(s)
     D = _herm(10, 7)
+    Gae, Gps = _G(s["ae"], 2), _G(s["ps"], 2)
     raw = {k: ob.HA_TO_RY * v for k, v in
-           (("dae", _all_pieces(s["ae"]["lam"], D)["dir"]), ("dps", _all_pieces(s["ps"]["lam"], D)["dir"]),
-            ("xae", _all_pieces(s["ae"]["lam"], D)["x"]), ("xps", _all_pieces(s["ps"]["lam"], D)["x"]))}
+           (("dae", _all_pieces(Gae, D)["dir"]), ("dps", _all_pieces(Gps, D)["dir"]),
+            ("xae", _all_pieces(Gae, D)["x"]), ("xps", _all_pieces(Gps, D)["x"]))}
     want = {("onsite_only", "full"): raw["dae"] + raw["xae"],
             ("onsite_only", "paw"): raw["dae"] + raw["xae"] - raw["xps"],
             ("onsite_only", "off"): raw["dae"],
@@ -322,7 +326,7 @@ def setup():
 
 
 # ---------------------------------------------------------------- (g) sidecar refusals
-def test_sidecar_refusals(tmp_path, setup):
+def test_sidecar_refusals(tmp_path, setup, monkeypatch):
     with open(_path("Cl.onsite_breit.json")) as f:
         raw = json.load(f)
 
@@ -335,14 +339,36 @@ def test_sidecar_refusals(tmp_path, setup):
     bad = copy.deepcopy(raw); bad["format"] = "lorrax.onsite_breit_sidecar/v0"
     with pytest.raises(ValueError, match="GATE onsite_breit_sidecar"):
         ob.read_sidecar(write(bad, "fmt.json"))
-    bad = copy.deepcopy(raw)                                                          # corrupted tensor
-    i_big = int(np.argmax(np.abs(bad["shells"][0]["ae"]["lam_re"])))
-    bad["shells"][0]["ae"]["lam_re"][i_big] *= 1.001
-    with pytest.raises(ValueError, match="GATE onsite_breit_sidecar.*\n.*closed shell"):
-        ob.read_sidecar(write(bad, "corrupt.json"))
-    bad = copy.deepcopy(raw); bad["shells"][0]["ae"]["lam_im"] = bad["shells"][0]["ae"]["lam_im"][:-3]
+    # a v1 file (spin-other-orbit tensor only) refuses, in the gate style, naming the regeneration
+    for el in ("Cl", "Cr", "Fe", "Cr3plus_uhf3dup"):
+        with pytest.raises(ValueError, match="GATE onsite_breit_sidecar") as err:
+            ob.read_sidecar(_path(f"v1/{el}.onsite_breit.json"))
+        msg = str(err.value)
+        assert all(k in msg for k in ("got:", "want:", "why:", "fix:", "onsite_breit_sidecar/v1",
+                                      "spin-other-orbit tensor only", "python -m psp.onsite_breit_sidecar"))
+    for what, edit in (("N too short", lambda b: b.__setitem__("N", b["N"][:-1])),
+                       ("N_L <= 0", lambda b: b["N"].__setitem__(3, -b["N"][3])),
+                       ("K <= 0", lambda b: b.__setitem__("K", 0.0)),
+                       ("K missing", lambda b: b.pop("K")),
+                       ("I0 != N[1]", lambda b: b["N"].__setitem__(1, b["N"][1] * 1.001))):
+        bad = copy.deepcopy(raw)
+        edit(bad["shells"][0]["ae"])
+        with pytest.raises(ValueError, match="GATE onsite_breit_sidecar"):
+            ob.read_sidecar(write(bad, "bad.json"))
+    bad = copy.deepcopy(raw); bad["shells"][0]["l"] = 0                                 # an s shell
     with pytest.raises(ValueError, match="GATE onsite_breit_sidecar"):
-        ob.read_sidecar(write(bad, "shape.json"))
+        ob.read_sidecar(write(bad, "l0.json"))
+    # the closed-shell gate fires on a tensor with a broken angular structure (one element perturbed)
+    good = ob.shell_breit_tensor
+
+    def broken(l, N, K):
+        G = good(l, N, K).copy()
+        G[0, 1, 1, 0] *= 1.001
+        return G
+    with monkeypatch.context() as mp:
+        mp.setattr(ob, "shell_breit_tensor", broken)
+        with pytest.raises(ValueError, match="GATE onsite_breit_sidecar.*\n.*closed shell"):
+            ob.read_sidecar(_path("Cl.onsite_breit.json"))
     with pytest.raises(ValueError, match="GATE onsite_breit_sidecar"):                  # ps missing when needed
         ob.read_sidecar(_path("Fe2plus_uhf3dup.onsite_breit.json"), require_ps=True)
     ob.read_sidecar(_path("Fe2plus_uhf3dup.onsite_breit.json"))                          # control

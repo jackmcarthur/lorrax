@@ -1,4 +1,4 @@
-r"""psp/onsite_breit_sidecar.py -- write ``<El>.onsite_breit.json`` (``lorrax.onsite_breit_sidecar/v1``).
+r"""psp/onsite_breit_sidecar.py -- write ``<El>.onsite_breit.json`` (``lorrax.onsite_breit_sidecar/v2``).
 
 The generator of the sidecar that ``psp.onsite_breit.read_sidecar`` reads
 (``onsite_breit = true``).  Physics library (L1) beside ``psp.onsite_breit``;
@@ -25,11 +25,17 @@ PUBLIC API
     ``norm``, ``r3`` = <r^-3>, Marvin ``I0``, ``I2`` of ``u`` (not renormalised).
 ``prepare_radial(r, u) -> (r, u, tail_kappa)``
     tail continuation (grid ending before ``u`` decays) and normalisation.
-``shell_tensor(r, u, l) -> Lam (3, n, n, n, n) complex128``
-    ``Lam[c, a, a2, b, d] = <a(1) a2(2)| (r12 x p1)_c / r12^3 |b(1) d(2)>`` for ``phi_m = (u/r) Y_lm``.
-``tensor_block(r, u, l, reference) -> dict``
-    one sidecar tensor block (``lam_re``, ``lam_im``, ``I0``, ``r3``, ``I2``, ``b1_mev_per_muB``,
-    ``x_closed_mev``) after the closed-shell, Hermiticity and classical-limit checks.
+``radial_breit(r, u, l) -> (N, K)``
+    the 2l+3 radial numbers of the four-spinor tensor (``psp.onsite_breit.shell_breit_tensor``).
+``tensor_block(r, u, l, reference) -> (block, info)``
+    one sidecar tensor block (``N``, ``K``, ``I0``, ``r3``, ``b1_mev_per_muB``, ``x_closed_ls_mev``,
+    ``x_closed_shift_mev``) after :func:`verify_breit`.
+``verify_breit(G, lam, l, I0) -> dict``
+    the checks before writing: pair symmetry, Hermiticity, closed shell, the two
+    source-resolved identities against the spin-other-orbit tensor, the spherical L.m coefficient.
+``shell_tensor(r, u, l) -> Lam (3, n, n, n, n)``;  ``meanfield_pieces(lam, D) -> dict``
+    INDEPENDENT CHECK ONLY: the spin-other-orbit tensor and its four mean-field pieces
+    (``verify_breit``, tests); no run reads them.
 ``upf_shell(upf_path, label) -> dict``
     element, l, mesh, the projector chi (plain j-average) and the PS function (aligned j-average).
 ``javerage(r, u_hi, u_lo, l) -> u``
@@ -37,8 +43,17 @@ PUBLIC API
 ``read_radial_table(path) -> (r, u)``;  ``read_oncvpsp_ae(path, n, l) -> (r, u)``
 ``make_sidecar(upf_path, label, *, ae=None, null=False, ...) -> dict``;  ``write_sidecar(side, path)``
 
-THE TENSOR (docs/dev/onsite_breit.md section 7)
------------------------------------------------
+THE OPERATOR (docs/dev/onsite_breit.md sections 2 and 7)
+--------------------------------------------------------
+The sidecar stores, per radial function, ``N_L`` (L = 0..2l+1) and ``K``::
+
+    N_L = iint_{s<r} u^2(r) u^2(s) s^(L-1) / r^(L+2) ds dr,     K = int u^4 / r^2 dr
+
+from which ``psp.onsite_breit.shell_breit_tensor`` builds the transverse
+two-body tensor of the shell's lifted four-spinors (no derivative of u enters).
+
+THE CHECK TENSOR (spin-other-orbit; independent check only)
+-----------------------------------------------------------
 ``(r12 x p1)/r12^3 = i (grad_1 V) x grad_1`` acting on electron 1, with
 ``V(r1) = int rho_{a2 d}(r2) / r12``, ``rho_{a2 d} = conj(phi_a2) phi_d``.
 Expand ``conj(Y_a2) Y_d = sum_LM c^LM_{a2 d} Y_LM``; then
@@ -59,7 +74,9 @@ and, with ``grad = r^ d_r + (1/r) grad_Omega``, ``grad_Omega Y = -i r^ x (L Y)``
 angular integrals are exact (Gauss-Legendre x uniform-phi rule above the
 polynomial degree 4l+2).  The L = 0 term gives ``A_0 = -4 pi I0``: the l.m
 coefficient of d1 per unit (N_up - N_dn) equals ``-(alpha^2/2) I0`` to
-rounding, which the generator checks.
+rounding.  The four-spinor direct field reproduces d1 for a pure spin source
+and the spin-dependent part of d2 for a pure orbital source, which
+:func:`verify_breit` checks before a file is written.
 """
 from __future__ import annotations
 
@@ -79,24 +96,28 @@ from psp import onsite_breit as ob
 GENERATOR = "psp.onsite_breit_sidecar"
 TAIL_R_OUT = 40.0          # bohr: a function not decayed at the grid end is continued to here
 TAIL_DECAYED = 1.0e-7      # |u(r_end)| below this fraction of max|u|: no continuation
-CHECK_RTOL = 1.0e-10       # closed-shell identity, Hermiticity (the reader's CLOSED_SHELL_RTOL)
-CLASSICAL_RTOL = 1.0e-8    # b1 from the tensor against -(alpha^2/2) I0 (same quadrature)
+CHECK_RTOL = 1.0e-10       # closed-shell identity, pair symmetry, Hermiticity (the reader's CLOSED_SHELL_RTOL)
+SOURCE_RTOL = 1.0e-9       # source-resolved identities of the four-spinor h_dir against the spin-other-orbit tensor
+CLASSICAL_RTOL = 1.0e-8    # spherical L.m coefficient against -(alpha^2/2) I0 (same quadrature)
 
 CONVENTIONS = (
-    "Shell basis |a> = phi_{I mu}(r) x |sigma> on atom I: complex Y_lm (Condon-Shortley), m = -l..l, pure spinors, "
-    "a = sigma*(2l+1) + (m+l), sigma = 0 the first spinor component of the WFN (s_z = +1/2 along Cartesian z of the "
-    "cell). Tensor Lam[c, a, a2, b, d] = <a(1) a2(2)| Lam^c |b(1) d(2)> over the 2l+1 spatial orbitals only, "
-    "Lam(1;2) = (r12 x p1)/r12^3, c = x, y, z; stored as lam_re / lam_im = flat lists in C (row-major) order of an "
-    f"array of shape [3, n, n, n, n], n = 2l+1. Hartree atomic units, WITHOUT the alpha^2 prefactor (alpha = "
-    f"{ob.ALPHA!r}). Spin-orbital two-body tensor g[p,q,r,s] = -alpha^2 sum_c Lam[c, a_p, a_q, a_r, a_s] "
-    "delta(sigma_p, sigma_r) (sigma^c/2)[sigma_q, sigma_s] = <p(1) q(2)|g|r(1) s(2)>, H = sum_pqrs g[pqrs] "
-    "a+_p a+_q a_s a_r. Density matrix D[a,b] = <a|rho|b> = sum_n f_n <a|psi_n><psi_n|b> (QE ns is its transpose). "
-    "Mean field: d1[p,r] = sum_qs g[p,q,r,s] D[s,q]; d2[p,r] = sum_qs g[q,p,s,r] D[s,q]; "
-    "x1[p,r] = -sum_qs g[p,q,s,r] D[s,q]; x2[p,r] = -sum_qs g[q,p,r,s] D[s,q]; h_dir = d1 + d2, h_x = x1 + x2 (Ha). "
-    "I0 = int_0^inf dr2 u(r2)^2 r2^-3 int_0^r2 dr1 u(r1)^2 (Marvin), r3 = <r^-3>, I2 Marvin I^2, all of the "
-    "normalised radial function u = rR by cubic-spline quadrature in the grid index. b1_mev_per_muB = -(alpha^2/2) I0 "
-    "in meV: l.m coefficient of d1 per unit (N_up - N_dn) of a spherical collinear shell. x_closed_mev = c in "
-    "x1 + x2 = c l.s for D = identity (meV). 1 Ha = 2 Ry, 1 Ry = common.units.RYD_TO_EV eV. projector.chi = r*R(r) "
+    "Shell basis |p> = phi_{I mu}(r) x |sigma> on atom I: phi = (u/r) Y_lm, complex Y_lm (Condon-Shortley), "
+    "m = -l..l, pure spinors, p = sigma*(2l+1) + (m+l), sigma = 0 the first spinor component of the WFN (s_z = +1/2 "
+    "along Cartesian z of the cell); one radial function u per shell (the j-average). Lifted four-spinor "
+    "Psi_p = [phi_p ; (alpha/2) sigma.p phi_p] (the raw kinetic-balance lift of common.bispinor_init), transition "
+    "current j_pr = Psi_p^+ alpha_vec Psi_r (Dirac alpha matrices). Two-body tensor G[p,q,r,s] = "
+    "<p(1) q(2)| -alpha_1.alpha_2 / r12 |r(1) s(2)> = -iint j_pr(1).j_qs(2)/r12, Hartree atomic units, WITHOUT the "
+    f"alpha^2 prefactor (alpha = {ob.ALPHA!r}); for one radial function the Gaunt and the transverse (Breit) kernels "
+    "give the same G. Stored per tensor block: N = [N_0 .. N_{2l+1}], N_L = iint_{s<r} u(r)^2 u(s)^2 s^(L-1) / "
+    "r^(L+2) ds dr, and K = int u^4 / r^2 dr (bohr^-3, normalised u, cubic-spline quadrature in the grid index); "
+    "psp.onsite_breit.shell_breit_tensor(l, N, K) rebuilds G (W_L[1,1] = -(L-1)(L+2)/2 N_L + (2L+1)/4 K, "
+    "W_L[1,2] = W_L[2,1] = -3/2 N_L, W_L[2,2] = 2 N_L; G = -sum_L 4 pi/(2L+1) sum_{M,c,t,t'} W_L[t,t'] "
+    "a^{t,c}_{pr,LM} b^{t',c}_{qs,LM}). Density matrix D[a,b] = <a|rho|b> = sum_n f_n <a|psi_n><psi_n|b> (QE ns is "
+    "its transpose). Mean field: h_dir[p,r] = alpha^2 sum_qs G[p,q,r,s] D[s,q]; h_x[p,r] = -alpha^2 sum_qs "
+    "G[p,q,s,r] D[s,q] (Ha). Diagnostics: I0 = N[1] (Marvin), r3 = <r^-3>; b1_mev_per_muB = -(alpha^2/2) I0 in meV, "
+    "the L.m coefficient of h_dir per unit (N_up - N_dn) of a spherical collinear shell; x_closed_ls_mev = c and "
+    "x_closed_shift_mev = a in h_x = a 1 + c l.s for D = identity (meV). 1 Ha = 2 Ry, 1 Ry = common.units.RYD_TO_EV "
+    "eV. projector.chi = r*R(r) "
     "on projector.r (bohr), the plain j-average [(l+1) chi_{l+1/2} + l chi_{l-1/2}]/(2l+1) of the UPF PP_CHI "
     "functions (psp/hubbard_ops.py::j_averaged_atomic_wfcs), no sign flip, no renormalisation. "
     "Generator and theory: psp.onsite_breit_sidecar, docs/dev/onsite_breit.md.")
@@ -206,28 +227,38 @@ def javerage(r, u_hi, u_lo, l):
 
 
 # ---------------------------------------------------------------------------
-# The tensor
+# The radial numbers of the four-spinor tensor
 # ---------------------------------------------------------------------------
 
-def _sphere_rule(l):
-    """Gauss-Legendre in cos(theta) x uniform phi, exact above degree 4l+2 (points (N, 3), weights (N,))."""
-    x, wx = np.polynomial.legendre.leggauss(2 * l + 4)
-    nphi = 4 * l + 8
-    ph = 2 * np.pi * np.arange(nphi) / nphi
-    ct = np.repeat(x, nphi)
-    st = np.sqrt(1.0 - ct ** 2)
-    phr = np.tile(ph, len(x))
-    pts = np.stack([st * np.cos(phr), st * np.sin(phr), ct], axis=1)
-    return pts, np.repeat(wx, nphi) * (2 * np.pi / nphi)
+def radial_breit(r, u, l: int):
+    """``N_L`` (L = 0..2l+1) and ``K`` of a normalised radial function (bohr^-3).
+
+    ``N_L = iint_{s<r} u^2(r) u^2(s) s^(L-1) / r^(L+2) ds dr`` (``N_1`` is Marvin's
+    I0) and ``K = int u^4 / r^2 dr``, by :func:`radial_integral` (the inner
+    integral running).  These fix ``psp.onsite_breit.shell_breit_tensor``.
+
+    Parameters
+    ----------
+    r, u : (N,) float
+        Grid (bohr) and NORMALISED u = r R(r) (:func:`prepare_radial`).
+    l : int
+
+    Returns
+    -------
+    (N (2l+2,) float64, K float)
+    """
+    r = np.asarray(r, dtype=np.float64)
+    u2 = np.asarray(u, dtype=np.float64) ** 2
+    N = []
+    for L in range(2 * int(l) + 2):
+        inner = radial_integral(r, u2 * _pow(r, L - 1.0), cumulative=True)
+        N.append(radial_integral(r, u2 * _pow(r, -(L + 2.0)) * inner))
+    return np.array(N), radial_integral(r, u2 ** 2 * _pow(r, -2.0))
 
 
-def _angular_fields(L, pts):
-    """``Y`` (N, 2L+1), ``iLY = i (L_c Y)`` (N, 2L+1, 3) and ``grad_Omega Y = -i r^ x (L Y)`` (N, 2L+1, 3)."""
-    Y = ob.complex_ylm(L, pts)
-    LY = np.stack([Y @ Lc for Lc in ob._lmats(L)], axis=-1)                   # (L_c Y_m) = sum_m' Y_m' (l_c)[m', m]
-    grad = -1j * np.cross(pts[:, None, :], LY)
-    return Y, 1j * LY, grad
-
+# ---------------------------------------------------------------------------
+# The spin-other-orbit tensor and its mean field: INDEPENDENT CHECK ONLY
+# ---------------------------------------------------------------------------
 
 def _radial_AC(r, u, L):
     """``A_L = int u^2 v_L'/r dr``, ``C_L = int u^2 v_L/r^2 dr`` (normalised u)."""
@@ -244,6 +275,10 @@ def _radial_AC(r, u, L):
 def shell_tensor(r, u, l: int) -> np.ndarray:
     """Spin-other-orbit spatial tensor of one shell ``phi_m = (u/r) Y_lm`` (module docstring).
 
+    INDEPENDENT CHECK ONLY: :func:`verify_breit` compares the four-spinor
+    direct field with this tensor's pieces for pure spin and pure orbital
+    sources; no sidecar stores it and no run reads it.
+
     Parameters
     ----------
     r, u : (N,) float
@@ -258,12 +293,12 @@ def shell_tensor(r, u, l: int) -> np.ndarray:
     """
     r = np.asarray(r, dtype=np.float64)
     u = np.asarray(u, dtype=np.float64)
-    pts, w = _sphere_rule(l)
-    Yl, iLYl, gl = _angular_fields(l, pts)
+    pts, w = ob._sphere_rule(l)
+    Yl, iLYl, gl = ob._angular_fields(l, pts)
     n = 2 * l + 1
     lam = np.zeros((3, n, n, n, n), np.complex128)
     for L in range(0, 2 * l + 1, 2):                  # conj(Y_l) Y_l holds even L <= 2l only
-        YL, iLYL, gL = _angular_fields(L, pts)
+        YL, iLYL, gL = ob._angular_fields(L, pts)
         c = np.einsum("N,NM,Nx,Nd->Mxd", w, YL.conj(), Yl.conj(), Yl)
         A, C = _radial_AC(r, u, L)
         B = -0.5 * (A + C)
@@ -274,47 +309,117 @@ def shell_tensor(r, u, l: int) -> np.ndarray:
     return lam
 
 
+def _g_soo(lam: np.ndarray) -> np.ndarray:
+    """g[p,q,r,s] = -alpha^2 sum_c Lam^c[a_p,a_q,a_r,a_s] delta(s_p,s_r) (sigma^c/2)[s_q,s_s]  (Hartree).
+
+    INDEPENDENT CHECK ONLY: the spin-orbital form of the spin-other-orbit
+    tensor ``g = -alpha^2 Lam(1;2) . s(2)`` (the coupling alpha A.p of electron 1
+    to the vector potential of the spin moment of electron 2).
+    """
+    lam = np.asarray(lam, dtype=np.complex128)
+    n = lam.shape[1]
+    g = -ob.ALPHA ** 2 * np.einsum("cAQRS,pr,cqs->pAqQrRsS", lam, np.eye(2), ob._SIGMA / 2, optimize=True)
+    return g.reshape(2 * n, 2 * n, 2 * n, 2 * n)
+
+
+def _piece_kernels(lam: np.ndarray) -> dict:
+    """K_piece[p,r,s,q] with piece[p,r] = sum_{s,q} K[p,r,s,q] D[s,q] (Hartree).  INDEPENDENT CHECK ONLY."""
+    g = _g_soo(lam)
+    return dict(d1=np.einsum("pqrs->prsq", g), d2=np.einsum("qpsr->prsq", g),
+                x1=-np.einsum("pqsr->prsq", g), x2=-np.einsum("qprs->prsq", g))
+
+
+def meanfield_pieces(lam: np.ndarray, D: np.ndarray) -> dict:
+    """The four mean-field pieces of the spin-other-orbit tensor for one shell density matrix.
+
+    INDEPENDENT CHECK ONLY (:func:`verify_breit` and the tests); the on-site
+    operator of a run is ``psp.onsite_breit.shell_breit_tensor``::
+
+        d1[p,r] =  sum_qs g[p,q,r,s] D[s,q]   orbit of the test electron in the shell's spin field
+        d2[p,r] =  sum_qs g[q,p,s,r] D[s,q]   spin of the test electron in the shell's orbital current
+        x1[p,r] = -sum_qs g[p,q,s,r] D[s,q],  x2[p,r] = -sum_qs g[q,p,r,s] D[s,q]
+
+    Parameters
+    ----------
+    lam : (3, n, n, n, n) complex
+        ``Lam[c, a, a2, b, d]`` (:func:`shell_tensor`), Hartree a.u., no alpha^2; n = 2l+1.
+    D : (2n, 2n) complex
+        Shell density matrix ``D[a, b] = <a|rho|b>``.
+
+    Returns
+    -------
+    dict of (2n, 2n) complex128, Hartree: ``d1, d2, x1, x2``.
+    """
+    D = np.asarray(D, dtype=np.complex128)
+    return {k: np.einsum("prsq,sq->pr", K, D) for k, K in _piece_kernels(lam).items()}
+
+
+def _spin_parts(h, n):
+    """``h = h0 (x) 1 + sum_c h_c (x) sigma_c`` in the basis kron(spin, orbital): returns (h0, [h_x, h_y, h_z])."""
+    t = np.asarray(h).reshape(2, n, 2, n)
+    h0 = 0.5 * np.einsum("smsn->mn", t)
+    hc = [0.5 * np.einsum("ts,smtn->mn", s, t) for s in ob._SIGMA]
+    return h0, hc
+
+
 def _coef(op, M):
     return float((np.vdot(op, M) / np.vdot(op, op)).real)
 
 
-def verify_tensor(lam, l: int, I0: float) -> dict:
-    """Checks a tensor must pass before it is written (raises ``ValueError``).
+def _hermitian(g, n):
+    A = g.normal(size=(n, n)) + 1j * g.normal(size=(n, n))
+    return (A + A.conj().T) / 2
 
-    Closed shell D = 1: max|d1|, max|d2| <= 1e-10 max|x|, x1 + x2 = c l.s
-    (relative residual <= 1e-10), c > 0 (the reader's gate); a random
-    Hermitian D (``default_rng(7)``): d1, d2, x1 + x2 and their sum
-    Hermitian to 1e-10; spherical collinear D = diag(0.9, 0.3): d1 = b L_z
-    and b / (n 0.6) = -(alpha^2/2) I0 to 1e-8.  Returns the diagnostics
-    (``x_closed_ha`` = c).
+
+def verify_breit(G, lam, l: int, I0: float) -> dict:
+    """Checks a four-spinor tensor must pass before it is written (raises ``ValueError``).
+
+    ``G`` from ``psp.onsite_breit.shell_breit_tensor``, ``lam`` the
+    spin-other-orbit tensor of the same radial function (:func:`shell_tensor`,
+    an independent construction).  Relative to max|G| or |h|:
+
+    - pair symmetry ``G[p,q,r,s] = G[q,p,s,r]`` and Hermiticity
+      ``G[p,q,r,s] = conj(G[r,s,p,q])`` to 1e-10;
+    - closed shell D = 1: max|h^dir| <= 1e-10 max|h^x|, h^x = a 1 + c l.s
+      (residual <= 1e-10), c > 0 (the reader's gate);
+    - orbital source ``D = 1_spin (x) D0`` (no spin density): the
+      spin-dependent part of h^dir equals that of d2 to 1e-9;
+    - spin source ``D = sum_c sigma_c (x) D_c`` (no charge): the
+      spin-independent part of h^dir equals that of d1 to 1e-9
+      (D0, D_c random Hermitian, ``default_rng(11)``);
+    - spherical collinear D = diag(0.9, 0.3) per spin: the L.m coefficient of
+      h^dir over n 0.6 equals ``-(alpha^2/2) I0`` to 1e-8.
+
+    Returns the diagnostics (``x_closed_ls_ha`` = c, ``x_closed_shift_ha`` = a).
     """
     n = 2 * l + 1
-    n2 = 2 * n
-    ops = ob.shell_operators(l)
-    h = ob.meanfield_pieces(lam, np.eye(n2))
-    x = h["x1"] + h["x2"]
-    scale = float(np.abs(x).max())
-    dmax = max(float(np.abs(h["d1"]).max()), float(np.abs(h["d2"]).max())) / scale
-    c = _coef(ops["ls"], x)
-    res = float(np.linalg.norm(x - c * ops["ls"]) / np.linalg.norm(x))
-    g = np.random.default_rng(7)
-    A = g.normal(size=(n2, n2)) + 1j * g.normal(size=(n2, n2))
-    hm = ob.meanfield_pieces(lam, (A + A.conj().T) / 2)
-    herm = 0.0
-    for M in (hm["d1"], hm["d2"], hm["x1"] + hm["x2"], sum(hm.values())):
-        herm = max(herm, float(np.linalg.norm(M - M.conj().T) / np.linalg.norm(M)))
-    Lz = ops["L"][2]
-    d1 = ob.meanfield_pieces(lam, np.diag([0.9] * n + [0.3] * n))["d1"]
-    b = _coef(Lz, d1)
-    lz_res = float(np.linalg.norm(d1 - b * Lz) / np.linalg.norm(d1))
-    b1_tensor = b / (n * 0.6)
+    G = np.asarray(G, dtype=np.complex128)
+    sc = float(np.abs(G).max())
+    pair = float(np.abs(G - G.transpose(1, 0, 3, 2)).max()) / sc
+    herm = float(np.abs(G - G.transpose(2, 3, 0, 1).conj()).max()) / sc
+    cs = ob.closed_shell_coefficients(G, l)
+    g = np.random.default_rng(11)
+    D0 = np.kron(np.eye(2), _hermitian(g, n))
+    Ds = sum(np.kron(s, _hermitian(g, n)) for s in ob._SIGMA)
+    hd = ob.breit_meanfield(G, D0)["dir"]
+    _, new_c = _spin_parts(hd, n)
+    _, old_c = _spin_parts(meanfield_pieces(lam, D0)["d2"], n)
+    orb = max(float(np.linalg.norm(a - b)) for a, b in zip(new_c, old_c)) / float(np.linalg.norm(hd))
+    hd = ob.breit_meanfield(G, Ds)["dir"]
+    new0, _ = _spin_parts(hd, n)
+    old0, _ = _spin_parts(meanfield_pieces(lam, Ds)["d1"], n)
+    spin = float(np.linalg.norm(new0 - old0)) / float(np.linalg.norm(hd))
+    hd = ob.breit_meanfield(G, np.diag([0.9] * n + [0.3] * n))["dir"]
+    b1_tensor = _coef(ob.shell_operators(l)["L"][2], hd) / (n * 0.6)
     b1_formula = -ob.ALPHA ** 2 / 2 * I0
-    cls = abs(b1_tensor / b1_formula - 1.0)
-    out = dict(closed_shell_d_over_x=dmax, closed_shell_ls_resid=res, hermiticity_rel=herm, x_closed_ha=c,
-               spherical_lz_resid=lz_res, b1_tensor_over_formula_minus_1=b1_tensor / b1_formula - 1.0)
-    if not (dmax <= CHECK_RTOL and res <= CHECK_RTOL and herm <= CHECK_RTOL and c > 0
-            and lz_res <= CHECK_RTOL and cls <= CLASSICAL_RTOL):
-        raise ValueError(f"onsite_breit_sidecar: tensor verification failed (l = {l}): {out}")
+    out = dict(pair_symmetry_rel=pair, hermiticity_rel=herm, closed_shell_dir_over_x=cs["dir_over_x"],
+               closed_shell_resid=cs["resid"], x_closed_ls_ha=cs["c"], x_closed_shift_ha=cs["a"],
+               orbital_source_vs_d2=orb, spin_source_vs_d1=spin,
+               b1_tensor_over_formula_minus_1=b1_tensor / b1_formula - 1.0)
+    if not (pair <= CHECK_RTOL and herm <= CHECK_RTOL and cs["dir_over_x"] <= CHECK_RTOL
+            and cs["resid"] <= CHECK_RTOL and cs["c"] > 0 and orb <= SOURCE_RTOL and spin <= SOURCE_RTOL
+            and abs(b1_tensor / b1_formula - 1.0) <= CLASSICAL_RTOL):
+        raise ValueError(f"onsite_breit_sidecar: four-spinor tensor verification failed (l = {l}): {out}")
     return out
 
 
@@ -337,23 +442,26 @@ def tensor_block(r, u, l: int, reference: str):
 
     Returns
     -------
-    (block, info) : the JSON-ready dict (``reference, shape, lam_re, lam_im,
-    I0, r3, I2, b1_mev_per_muB, x_closed_mev``) and a dict with the checks,
-    ``tail_kappa`` and the grid size.
+    (block, info) : the JSON-ready dict (``reference, N, K, I0, r3,
+    b1_mev_per_muB, x_closed_ls_mev, x_closed_shift_mev``) and a dict with the
+    :func:`verify_breit` checks, ``tail_kappa`` and the grid size.
     """
     if not 1 <= int(l) <= 3:
         raise ValueError(f"onsite_breit_sidecar: l = {l}; the on-site operator needs 1 <= l <= 3 "
                          "(an s shell has no orbital moment; the atomic rows stop at l = 3)")
+    l = int(l)
     r, u, kappa = prepare_radial(r, u)
     mom = radial_moments(r, u)
-    lam = shell_tensor(r, u, l)
-    chk = verify_tensor(lam, l, mom["I0"])
+    N, K = radial_breit(r, u, l)
+    G = ob.shell_breit_tensor(l, N, K)
+    chk = verify_breit(G, shell_tensor(r, u, l), l, float(N[1]))
     ha_to_mev = ob.HA_TO_RY * ob.RY_TO_MEV
-    block = dict(reference=str(reference), shape=list(lam.shape), lam_re=_flist(lam.real), lam_im=_flist(lam.imag),
-                 I0=mom["I0"], r3=mom["r3"], I2=mom["I2"],
-                 b1_mev_per_muB=float(-ob.ALPHA ** 2 / 2 * mom["I0"] * ha_to_mev),
-                 x_closed_mev=float(chk["x_closed_ha"] * ha_to_mev))
-    return block, dict(chk, tail_kappa=kappa, grid_points=int(len(r)), r_max=float(r[-1]))
+    block = dict(reference=str(reference), N=_flist(N), K=float(K), I0=float(N[1]), r3=mom["r3"],
+                 b1_mev_per_muB=float(-ob.ALPHA ** 2 / 2 * N[1] * ha_to_mev),
+                 x_closed_ls_mev=float(chk["x_closed_ls_ha"] * ha_to_mev),
+                 x_closed_shift_mev=float(chk["x_closed_shift_ha"] * ha_to_mev))
+    return block, dict(chk, I0_marvin_minus_N1=float(mom["I0"] - N[1]), tail_kappa=kappa,
+                       grid_points=int(len(r)), r_max=float(r[-1]))
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +584,7 @@ def _md5(path) -> str:
 
 def make_sidecar(upf_path, label: str, *, ae=None, ae_reference: str = "", ae_source: str = "",
                  null: bool = False, date: str | None = None) -> dict:
-    """Build one ``lorrax.onsite_breit_sidecar/v1`` sidecar (one shell).
+    """Build one ``lorrax.onsite_breit_sidecar/v2`` sidecar (one shell).
 
     Parameters
     ----------
@@ -545,7 +653,7 @@ def write_sidecar(side: dict, path) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m psp.onsite_breit_sidecar",
-                                 description="Write <El>.onsite_breit.json (lorrax.onsite_breit_sidecar/v1); "
+                                 description="Write <El>.onsite_breit.json (lorrax.onsite_breit_sidecar/v2); "
                                              "docs/dev/onsite_breit.md.")
     ap.add_argument("--upf", required=True, help="fully relativistic norm-conserving UPF of the species")
     ap.add_argument("--shell", required=True, help="PP_CHI label of the open shell (e.g. 3D)")
@@ -575,8 +683,9 @@ def main(argv=None) -> int:
     sh = side["shells"][0]
     for kind in ("ae", "ps"):
         b = sh[kind]
-        print(f"{side['element']} {sh['label']} {kind}: I0 = {b['I0']:.6f}, <r^-3> = {b['r3']:.5f}, "
-              f"b1 = {b['b1_mev_per_muB']:+.5f} meV/muB, x_closed = {b['x_closed_mev']:+.5f} meV")
+        print(f"{side['element']} {sh['label']} {kind}: N_L = [{', '.join(f'{x:.6f}' for x in b['N'])}], "
+              f"K = {b['K']:.6f}, <r^-3> = {b['r3']:.5f}, b1 = {b['b1_mev_per_muB']:+.5f} meV/muB, "
+              f"closed-shell h_x = {b['x_closed_shift_mev']:.5f} meV 1 + {b['x_closed_ls_mev']:.5f} meV l.s")
     print(f"wrote {out} (sha256 {sha})")
     return 0
 
