@@ -581,11 +581,14 @@ def _prepare_isdf_carriers(
             "produced (Σ^B would be silently dropped).  Check "
             "centroids_file_current and, on restart, that the restart "
             "file carries psi_parent_y_transverse.")
+    from .v_q_bispinor import bispinor_v_source
+    # The V file, or under write_restart_tensors = false the V this process
+    # holds for that path (v_q_bispinor.ResidentBispinorV).
     bispinor_v_q_path = (
-        os.path.join(tmp_dir, 'v_q_bispinor.h5')
+        bispinor_v_source(os.path.join(tmp_dir, 'v_q_bispinor.h5'))
         if wfns_transverse is not None else None
     )
-    if bispinor_v_q_path is not None and not os.path.exists(bispinor_v_q_path):
+    if isinstance(bispinor_v_q_path, str) and not os.path.exists(bispinor_v_q_path):
         raise RuntimeError(
             f"bispinor: {bispinor_v_q_path} is missing.  The V^{{i,j}} "
             f"tile file is written by the non-restart pipeline "
