@@ -130,8 +130,13 @@ def test_roundtrip_cli_and_committed_sidecars(tmp_path, shells):
         for kind in ("ae", "ps"):
             assert new[kind]["N"] == old[kind]["N"] and new[kind]["K"] == old[kind]["K"]
             assert "lam_re" not in new[kind] and len(new[kind]["N"]) == 2 * l + 2
-            for k in ("x_closed_ls_mev", "x_closed_shift_mev", "b1_mev_per_muB", "I0", "r3"):
+            for k in ("b1_mev_per_muB", "I0", "r3"):
                 assert new[kind][k] == old[kind][k], (el, kind, k)
+            # The closed-shell coefficients are contractions of G whose summation order belongs to the BLAS
+            # build: identical on one machine, 1 ulp apart across machines (Cl ae on a Perlmutter node against
+            # the laptop that wrote the file: 0.16303917307355284 vs 0.16303917307355287).
+            for k in ("x_closed_ls_mev", "x_closed_shift_mev"):
+                assert abs(new[kind][k] / old[kind][k] - 1) < 1e-12, (el, kind, k)
             # r3, I0 against the v1 files (their trapezoid quadrature: <= 6e-5)
             assert abs(new[kind]["r3"] / v1[kind]["r3"] - 1) < 2e-5 and abs(new[kind]["I0"] / v1[kind]["I0"] - 1) < 1e-4
             # the reader's recomputed closed-shell coefficients equal the written ones
