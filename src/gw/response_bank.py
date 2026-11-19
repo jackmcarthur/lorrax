@@ -916,7 +916,14 @@ def authenticate_coulomb(bank_io, qids):
     if resource["basis"] not in ("canonical", "photon") or not np.array_equal(
             resource["q_irr_full_idx"], qids):
         raise ValueError("GATE response_coulomb_identity: wrong basis/q order")
-    if resource.get("path") is None:
+    if resource.get("resident"):
+        # The photon V a write_restart_tensors = false run holds in process.
+        from .v_q_bispinor import bispinor_v_source
+        held = bispinor_v_source(resource["path"])
+        if isinstance(held, str) or held.digest() != resource["sha256"]:
+            raise ValueError("GATE response_coulomb_identity: the resident photon V is not "
+                             "held or its content differs")
+    elif resource.get("path") is None:
         values = _COULOMB_OPERATORS.get(resource.get("operator"))
         if values is None or operator_digest(values, None) != resource["sha256"]:
             raise ValueError("GATE response_coulomb_identity: the bare V operator is not "
@@ -3824,13 +3831,15 @@ def photon_bare_operator(wfns, wfns_transverse, meta, *, path, mu_bases, layout,
     process its own shards, no collective).
     """
     from common.collectives import restore_from_host, spill_to_host
+    from .v_q_bispinor import ResidentBispinorV
     plans = (wfns.green_parent.plan, wfns_transverse.green_parent.plan)
-    stat = os.stat(path)
+    generation = ((path.label, path.generation) if isinstance(path, ResidentBispinorV)
+                  else (lambda st: (int(st.st_size), int(st.st_mtime_ns)))(os.stat(path)))
     # By content, so a later map's endpoint objects of the same bases hit.
     bases = hashlib.sha256(b"".join(
         np.asarray(b.canonical_indices, dtype="<i4").tobytes() + str(int(b.n_packed)).encode()
         for b in mu_bases)).hexdigest()
-    key = (str(path), int(stat.st_size), int(stat.st_mtime_ns), layout, mesh_xy, bases,
+    key = (str(path), *generation, layout, mesh_xy, bases,
            tuple(int(q) for q in plans[0].sym.q_irr_full_idx))
     held = _PHOTON_V_HOST.get(key)
     if held is None:
@@ -3902,8 +3911,12 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
             raise ValueError("GATE photon_bank_centroids: scratch/current endpoint identity differs")
         bank = dict(bank_io, photon_layout=layout)
         with timing.section("bank.coulomb_digest"):
-            v_digest = resource_digest(bank["bispinor_v_q_path"])
+            from .v_q_bispinor import ResidentBispinorV
+            source = bank["bispinor_v_q_path"]
+            resident = isinstance(source, ResidentBispinorV)
+            v_digest = source.digest() if resident else resource_digest(source)
         bank["coulomb"] = dict(path=str(bank["bispinor_v_q_path"]), basis="photon",
+            **(dict(resident=True) if resident else {}),
             q_irr_full_idx=np.asarray(sym.q_irr_full_idx).tolist(), sha256=v_digest)
         census = response_weights(wfns, meta)[-1]
         receipt = _receipt("photon", census, bank)

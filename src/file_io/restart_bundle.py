@@ -2186,12 +2186,18 @@ class BispinorVqReader:
             tile_dataset_name,
         )
         from file_io.slab_io import SlabIO
+        from gw.v_q_bispinor import ResidentBispinorV
         import h5py
-        self._filename = Path(filename)
         self._mesh = mesh_xy
         self._mu_bases = mu_bases
         self.q_tables = {}
         self.q_headers = {}
+        self._resident = filename if isinstance(filename, ResidentBispinorV) else None
+        self._io = None
+        if self._resident is not None:
+            self._from_resident(self._resident, family_plans)
+            return
+        self._filename = Path(filename)
 
         # Small metadata scalars are written via SlabIO.write_attr (which
         # creates a dataset in the file).  Read them via h5py — every rank
@@ -2277,6 +2283,24 @@ class BispinorVqReader:
                         tables.n_q_full != int(np.prod(self.kgrid))):
                     raise ValueError("Bispinor V q-IBZ tables disagree with its geometry.")
 
+        self._authenticate(family_plans)
+        self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy)
+        self._io.__enter__()
+
+    def _from_resident(self, resident, family_plans):
+        """The V a ``write_restart_tensors = false`` run holds in process
+        (:class:`gw.v_q_bispinor.ResidentBispinorV`): its producer checked the
+        geometry, tiles and tables the file validation checks here."""
+        self._filename = Path(resident.label)
+        self.kgrid = resident.kgrid
+        self.n_rmu_C, self.n_rmu_T = resident.n_rmu_C, resident.n_rmu_T
+        self.n_q_total = resident.n_q_total
+        self.q_tables, self.q_headers = dict(resident.q_tables), dict(resident.q_headers)
+        self._authenticate(family_plans)
+
+    def _authenticate(self, family_plans):
+        """Bind the V tables to the run's centroid bases and q plans."""
+        mu_bases = self._mu_bases
         if family_plans is not None:
             from symmetry_maps import (bgw_integer_q_to_fractional,
                                        verify_centroid_orbit_closure)
@@ -2305,14 +2329,12 @@ class BispinorVqReader:
                         and np.array_equal(wraps, plan.L_table)):
                     raise ValueError("Photon V tables differ from the authenticated run; rerun restart=false.")
 
-        self._io = SlabIO(self._filename, mode="r", mesh=mesh_xy)
-        self._io.__enter__()
-
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
-        self._io.__exit__(*exc)
+        if self._io is not None:
+            self._io.__exit__(*exc)
 
     def _zero_tile(self, mu_L: int, nu_L: int) -> jax.Array:
         n_L = self.n_rmu_C if mu_L == 0 else self.n_rmu_T
@@ -2360,11 +2382,17 @@ class BispinorVqReader:
             source = HERMITIAN_PAIRS.get((mu_L, nu_L), (mu_L, nu_L))
             n_L, n_R = self._tile_shape(*source)[1:]
             n_L_p, n_R_p = self._padded_shape_LR(n_L, n_R)
-            tile = self._io.read_slab(
-                tile_dataset_name(*source),
-                shape=(self.n_q_total, n_L_p, n_R_p), mesh=self._mesh,
-                partition_spec=P(None, 'y', 'x') if transpose else P(None, 'x', 'y'),
-                dtype=jnp.complex128)
+            spec = P(None, 'y', 'x') if transpose else P(None, 'x', 'y')
+            if self._resident is not None:
+                tile = self._resident.tile(tile_dataset_name(*source), self._mesh, spec)
+                if tuple(tile.shape) != (self.n_q_total, n_L_p, n_R_p):
+                    raise ValueError(f"resident V tile {tile.shape} is not the reader's carrier "
+                                     f"{(self.n_q_total, n_L_p, n_R_p)} (another process mesh?)")
+            else:
+                tile = self._io.read_slab(
+                    tile_dataset_name(*source),
+                    shape=(self.n_q_total, n_L_p, n_R_p), mesh=self._mesh,
+                    partition_spec=spec, dtype=jnp.complex128)
             if transpose:
                 tile = jnp.conj(jnp.swapaxes(tile, -1, -2))
         if self._mu_bases is not None:

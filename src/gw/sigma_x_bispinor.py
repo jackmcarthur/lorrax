@@ -14,10 +14,14 @@ _HOST_PACKED = {}
 
 
 def _packed_key(path, plan, basis, layout, mesh_xy):
-    stat = os.stat(path)
+    from .v_q_bispinor import ResidentBispinorV
     digest = hashlib.sha256()
     for array in (plan.sym_perm, plan.L_table, basis.canonical_indices):
         digest.update(np.ascontiguousarray(array).tobytes())
+    if isinstance(path, ResidentBispinorV):     # the V this process holds
+        return (path.label, path.generation, 0, digest.hexdigest(), int(layout.packed_extent),
+                tuple(int(device.id) for device in mesh_xy.devices.flat))
+    stat = os.stat(path)
     return (os.path.realpath(path), stat.st_size, stat.st_mtime_ns,
             digest.hexdigest(), int(layout.packed_extent),
             tuple(int(device.id) for device in mesh_xy.devices.flat))

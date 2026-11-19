@@ -2294,8 +2294,13 @@ def _vcoul_transverse_inputs(
 
 def _compute_photon_vq(
         bvec, centroid_indices, cfg, mesh_xy, meta, print_fn, sym, vcoul_cutoff_ry, wfn,
-        zeta_T_paths, zeta_dir, zeta_h5_path):
-    """Produce the four-current Coulomb tiles and their charge and Gamma views."""
+        zeta_T_paths, zeta_dir, zeta_h5_path, *, write_v_file=True):
+    """Produce the four-current Coulomb tiles and their charge and Gamma views.
+
+    ``write_v_file`` is ``restart_tensor_writes_enabled``: without it the tiles
+    stay in the process (``v_q_bispinor.ResidentBispinorV``) and ``tmp/`` gets
+    no ``v_q_bispinor.h5``; the run's V consumers resolve either through
+    ``v_q_bispinor.bispinor_v_source``."""
     from .v_q_bispinor import (
         tile_dataset_name,
     )
@@ -2334,7 +2339,7 @@ def _compute_photon_vq(
              opened(zeta_T_paths[0], tt_tiles is not None) as zt1, \
              opened(zeta_T_paths[1], tt_tiles is not None) as zt2, \
              opened(zeta_T_paths[2], tt_tiles is not None) as zt3:
-            _, photon_g0_vectors = compute_V_q_bispinor_g_flat_to_h5(
+            bispinor_v, photon_g0_vectors = compute_V_q_bispinor_g_flat_to_h5(
                 zeta_C_loader=zc,
                 zeta_T_loaders=(zt1, zt2, zt3),
                 output_h5_path=bispinor_h5_path,
@@ -2358,9 +2363,10 @@ def _compute_photon_vq(
                 cc_tile=cc_tile, tt_tiles=tt_tiles,
                 current_basis_rows=meta.current_basis_rows,
                 mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
+                resident=not write_v_file,
             )
     from file_io.restart_bundle import read_photon_charge
-    V_q_raw = read_photon_charge(bispinor_h5_path, mesh_xy, retain_wedge=True)
+    V_q_raw = read_photon_charge(bispinor_v, mesh_xy, retain_wedge=True)
     # Both views stay on the canonical file carrier, as on the scalar route:
     # Validation and restart I/O keep this order; the final wedge seam packs.
     G0_all = photon_g0_vectors[0]
@@ -2639,7 +2645,7 @@ def _canonical_coulomb_stats(operator, kgrid, *, reciprocity=True):
     return (int(totals[0]), int(totals[1]), float(totals[2]), size), tuple(totals[3:]), gamma
 
 
-def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
+def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None, *, write_v_file=True):
 	"""Produce bare Coulomb and head views; see docs/theory/bispinor-gw.md#dyson."""
 	from .compute_vcoul import compute_all_V_q
 	photon_g0_vectors = None
@@ -2658,7 +2664,7 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	        zeta_h5_path = zeta_h5_path.path
 	    (V_q_raw, G0_all, head_channel, photon_g0_vectors) = _compute_photon_vq(
 	        bvec, centroid_indices, cfg, mesh_xy, meta, print_fn, sym, vcoul_cutoff_ry, wfn,
-	        zeta_T_paths, zeta_dir, zeta_h5_path)
+	        zeta_T_paths, zeta_dir, zeta_h5_path, write_v_file=write_v_file)
 	else:
 	    (V_q_raw, G0_all, head_channel) = _compute_scalar_vq(
 	        bgw_v_grid_fn, bvec, centroid_indices, cfg, mesh_xy, meta, print_fn, sym,
@@ -2865,13 +2871,13 @@ def _prepare_fresh_carriers(
 
 def _prepare_fresh_coulomb(
         basis_T, bgw_v_grid_fn, centroid_indices, cfg, mem_est, mesh_xy, meta, print0, sym,
-        wfn, zeta_path):
+        wfn, zeta_path, *, write_v_file=True):
     """Produce Coulomb tensors and their canonical Gamma vectors."""
     V_qmunu, G0, head_channel, photon_g0_vectors = compute_V_q(
     	zeta_path, wfn, meta, mesh_xy, cfg,
     	mem_est=mem_est, print_fn=print0,
     	bgw_v_grid_fn=bgw_v_grid_fn,
-    	sym=sym, centroid_indices=centroid_indices)
+    	sym=sym, centroid_indices=centroid_indices, write_v_file=write_v_file)
     if photon_g0_vectors is not None:
     	photon_g0_vectors = tuple(
     		(meta.mu_basis if channel == 0 else basis_T).pack_axis(vector, -1)
@@ -3016,7 +3022,7 @@ def _prepare_fresh_isdf(
     del _parent_green_faces
     (V_qmunu, G0, head_channel, photon_g0_vectors) = _prepare_fresh_coulomb(
         basis_T, bgw_v_grid_fn, centroid_indices, cfg, mem_est, mesh_xy, meta, print0, sym, wfn,
-        zeta_path)
+        zeta_path, write_v_file=restart_tensor_writes_enabled(cfg, tensors_filename))
     _write_fresh_restart(
         G0, V_qmunu, _candidate_plan, _to_file_order, band_slices,
         basis_wfn_fingerprint_binding, centroid_indices, cfg, charge_zeta_identity_receipt,
@@ -3366,6 +3372,8 @@ def _prepare_restart_isdf(
             _stamped, _to_run_order, band_slices, basis_T, basis_wfn_fingerprint_binding, cfg,
             mesh_xy, meta, print0, rs, sym, tensors_filename, transverse_basis_receipt, wfn)
     _v_path = os.path.join(tmp_dir, "v_q_bispinor.h5")
+    from .v_q_bispinor import forget_resident_bispinor_v
+    forget_resident_bispinor_v(_v_path)       # a restart reads the file it pairs with
     if cfg.bispinor and os.path.exists(_v_path):
         from file_io.restart_bundle import require_bispinor_v_pairing
         require_bispinor_v_pairing(tensors_filename, _v_path,

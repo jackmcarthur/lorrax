@@ -332,7 +332,9 @@ def restart_tensor_writes_enabled(config, tensors_filename: str) -> bool:
     ONE decision point for a key that gates FOUR writes — the V_q / G0 /
     E_nk flush with its W0 placeholder, the ψ append, the centroid-hash
     stamp (all in ``gw_init.prepare_isdf_and_wavefunctions``) and the W0 +
-    head-scalar write here.  Asking ``config.write_restart_tensors`` at
+    head-scalar write here.  On a bispinor run it also decides whether the
+    four-current V goes to ``tmp/v_q_bispinor.h5`` or stays in the process
+    (``gw.v_q_bispinor.ResidentBispinorV``).  Asking ``config.write_restart_tensors`` at
     four sites would be four chances for one of them to keep writing, and
     a restart file containing three of its five datasets is worse than no
     file at all: the ``W0_ready`` and window guards would pass on it.

@@ -45,7 +45,9 @@ Public surface
 from __future__ import annotations
 
 from contextlib import ExitStack
+import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -644,6 +646,131 @@ class BispinorFitV:
         self.n_rmu_T: int | None = None
 
 
+#: The resident V of this process, by the path its file would have had (one
+#: entry: a run builds its V once).  :func:`bispinor_v_source` resolves it.
+_RESIDENT_V: dict = {}
+_RESIDENT_GENERATION = [0]
+
+
+def _reader_carrier(V, logical, carrier, mesh_xy):
+    """``V`` as :class:`file_io.restart_bundle.BispinorVqReader` reads it back
+    from the file: the logical ``(n_L, n_R)`` block, zero-filled to the
+    reader's carrier extent, at ``P(None,'x','y')``."""
+    (n_L, n_R), (c_L, c_R) = logical, carrier
+
+    def form(v):
+        return jnp.pad(v[:, :n_L, :n_R], ((0, 0), (0, c_L - n_L), (0, c_R - n_R)))
+    return jax.jit(form, out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))(V)
+
+
+class ResidentBispinorV:
+    """The seven unique tiles of :func:`compute_V_q_bispinor_g_flat_to_h5`, held in the process.
+
+    With ``write_restart_tensors = false`` the run promises that ``tmp/``
+    stays empty (``gw.gw_output.restart_tensor_writes_enabled``), and no later
+    run can resume from it, so the four-current V is not written.  Each tile
+    waits on host (``common.collectives.spill_to_host``) in the layout
+    :class:`file_io.restart_bundle.BispinorVqReader` would return from the
+    file, with the q-IBZ tables and centroid hash the file would carry.  The
+    reader accepts this object in place of the path, so every consumer gets
+    the file's tiles bit for bit.  ``label`` is the path the file would have
+    had; :meth:`digest` is the content identity that stands in for the file's
+    sha256 (the photon bank's Coulomb resource).
+    """
+
+    def __init__(self, label, *, mesh_xy, kgrid, n_rmu_C, n_rmu_T, n_q_total):
+        self.label = str(label)
+        self.mesh = mesh_xy
+        self.kgrid = tuple(int(x) for x in kgrid)
+        self.n_rmu_C, self.n_rmu_T = int(n_rmu_C), int(n_rmu_T)
+        self.n_q_total = int(n_q_total)
+        self.q_tables, self.q_headers = {}, {}
+        self.policy = None
+        _RESIDENT_GENERATION[0] += 1
+        #: Process-local generation: the host caches of the packed V key on it.
+        self.generation = _RESIDENT_GENERATION[0]
+        self._tiles = {}
+        self._digest = None
+
+    def __str__(self):
+        return self.label
+
+    def add_tile(self, mu_L, nu_L, V, *, tables, closure_verdict):
+        """Hold one unique tile and its family's tables, as the file stamp would."""
+        from common.collectives import spill_to_host
+        from runtime.padding import padded_mu_axis
+        from symmetry_maps import QIRR_FORMAT_VERSION, QirrHeader, validate_qirr_tables
+        name = tile_dataset_name(mu_L, nu_L)
+        closure_verdict.raise_if_not_closed(f"resident bispinor V {name!r} refuses q_irr storage")
+        _, n_L, n_R = _tile_logical_shape(mu_L, nu_L, n_q_total=self.n_q_total,
+                                          n_rmu_C=self.n_rmu_C, n_rmu_T=self.n_rmu_T)
+        _require_tile_carrier(V, name=name, logical_shape=(self.n_q_total, n_L, n_R))
+        n_mu = n_L                      # unique tiles are square in one family
+        can = tables.logical(n_mu).canonical()
+        header = QirrHeader(
+            q_storage=validate_qirr_tables(can, self.n_q_total, n_mu),
+            format_version=int(QIRR_FORMAT_VERSION), n_q_on_disk=self.n_q_total,
+            n_q_full=can.n_q_full, n_mu=n_mu, n_rmu_logical=n_mu,
+            centroid_hash=closure_verdict.centroid_hash, table_hash=can.digest(),
+            closure_verdict=closure_verdict.as_attr(),
+            closure_worst_residual=float(closure_verdict.worst_residual),
+            closure_tol=float(closure_verdict.tol), data_ready=True, provenance={})
+        family = int(mu_L != 0)
+        if family in self.q_tables and (
+                self.q_tables[family].digest() != header.table_hash
+                or self.q_headers[family].centroid_hash != header.centroid_hash):
+            raise ValueError("V tiles disagree on their family symmetry tables.")
+        if can.n_q_ibz != self.n_q_total or can.n_q_full != int(np.prod(self.kgrid)):
+            raise ValueError("Bispinor V q-IBZ tables disagree with its geometry.")
+        self.q_tables[family], self.q_headers[family] = can, header
+        carrier = (padded_mu_axis(n_L, self.mesh).carrier, padded_mu_axis(n_R, self.mesh).carrier)
+        self._tiles[name] = spill_to_host(_reader_carrier(V, (n_L, n_R), carrier, self.mesh))
+
+    def seal(self, policy):
+        """All seven tiles held: publish this V for its path."""
+        missing = [tile_dataset_name(*p) for p in UNIQUE_TILES
+                   if tile_dataset_name(*p) not in self._tiles]
+        if missing:
+            raise RuntimeError(f"resident bispinor V lacks tiles {missing}")
+        self.policy = dict(policy or {})
+        _RESIDENT_V[os.path.abspath(self.label)] = self
+
+    def tile(self, name, mesh_xy, partition_spec):
+        """One unique tile on the devices, as ``SlabIO.read_slab`` returns it."""
+        from common.collectives import restore_from_host
+        value = restore_from_host(self._tiles[name])
+        want = NamedSharding(mesh_xy, partition_spec)
+        if value.sharding == want:
+            return value
+        return jax.jit(lambda v: v, out_shardings=want)(value)
+
+    def digest(self):
+        """Content identity, the same string on every rank (collective).
+
+        The Coulomb policy and a device digest of each tile
+        (``gw.response_bank.operator_digest``): deterministic for the same
+        inputs and process mesh, where the file route hashes the file."""
+        if self._digest is None:
+            from .response_bank import operator_digest
+            words = ["resident-bispinor-v1", json.dumps(self.policy, sort_keys=True, default=str)]
+            for pair in UNIQUE_TILES:
+                name = tile_dataset_name(*pair)
+                words.append(name + ":" + operator_digest(
+                    self.tile(name, self.mesh, P(None, 'x', 'y')), self.mesh, cache=False))
+            self._digest = hashlib.sha256("\n".join(words).encode()).hexdigest()
+        return self._digest
+
+
+def bispinor_v_source(path):
+    """What the run's V consumers open: the resident V published for ``path``, or ``path``."""
+    return _RESIDENT_V.get(os.path.abspath(os.fspath(path)), path)
+
+
+def forget_resident_bispinor_v(path):
+    """Drop a resident V for ``path`` (a file now owns it, or a restart reads one)."""
+    _RESIDENT_V.pop(os.path.abspath(os.fspath(path)), None)
+
+
 def _bispinor_ibz(sym, centroid_idx, kgrid, fft_grid, context):
     from .v_q_g_flat import _resolve_ibz_q_list
     if sym is None:
@@ -764,7 +891,8 @@ def compute_V_q_bispinor_g_flat_to_h5(
     current_basis_rows=None,
     mc_average_vcoul_body: bool,
     policy: dict | None = None,
-) -> tuple[Path, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
+    resident: bool = False,
+) -> tuple["Path | ResidentBispinorV", tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
     """Stream the 7 unique bispinor V_q^{μ_L, ν_L} tiles to HDF5 via the
     G-flat per-q + G-chunked path.
 
@@ -788,12 +916,17 @@ def compute_V_q_bispinor_g_flat_to_h5(
     ``cc_tile`` (:func:`compute_bispinor_cc_tile`) and ``tt_tiles``
     (:func:`compute_bispinor_tt_tiles`) supply tiles formed from the fits'
     in-memory ζ; the matching loaders are then unused.
+
+    ``resident = True`` (``write_restart_tensors = false``) writes nothing:
+    the tiles go to a :class:`ResidentBispinorV` labelled ``output_h5_path``,
+    published for that path and returned in place of it.
     """
     from file_io.slab_io import SlabIO
     import h5py
     from .v_q_g_flat import _compute_V_q_g_flat_tiles, v_head_fn_in_V
 
     output_h5_path = Path(output_h5_path)
+    forget_resident_bispinor_v(output_h5_path)
     if tt_tiles is None and len(zeta_T_loaders) != 3:
         raise ValueError(
             f"zeta_T_loaders must be length 3 (μ_L=1,2,3); "
@@ -815,11 +948,14 @@ def compute_V_q_bispinor_g_flat_to_h5(
     nq_total = len(_ibz_C[1])
     if len(_ibz_T[1]) != nq_total:
         raise ValueError("Bispinor V families disagree on q-IBZ rows.")
-    with SlabIO(output_h5_path, mode="w", mesh=mesh_xy) as io:
-        io.write_attr("kgrid", np.asarray(kgrid, dtype=np.int64))
-        io.write_attr("n_rmu_C", np.int64(n_rmu_C))
-        io.write_attr("n_rmu_T", np.int64(n_rmu_T))
-        io.write_attr("n_q_total", np.int64(nq_total))
+    held = (ResidentBispinorV(output_h5_path, mesh_xy=mesh_xy, kgrid=kgrid, n_rmu_C=n_rmu_C,
+                              n_rmu_T=n_rmu_T, n_q_total=nq_total) if resident else None)
+    if held is None:
+        with SlabIO(output_h5_path, mode="w", mesh=mesh_xy) as io:
+            io.write_attr("kgrid", np.asarray(kgrid, dtype=np.int64))
+            io.write_attr("n_rmu_C", np.int64(n_rmu_C))
+            io.write_attr("n_rmu_T", np.int64(n_rmu_T))
+            io.write_attr("n_q_total", np.int64(nq_total))
 
     # ONE measured q-row policy for every bispinor consumer (the CC tile of
     # ``cc_tile`` was formed under the same one: a pure function of sym).
@@ -888,6 +1024,15 @@ def compute_V_q_bispinor_g_flat_to_h5(
             v_logical_shape = _tile_logical_shape(
                 mu_L, nu_L, n_q_total=nq_total, n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T)
             _require_tile_carrier(V_acc, name=name, logical_shape=v_logical_shape)
+            if held is not None:
+                from symmetry_maps import QirrTables
+                table = _ibz_C if s_tile['is_charge_cc'] else _ibz_T
+                held.add_tile(mu_L, nu_L, V_acc,
+                    tables=QirrTables(table[2], qgrid_policy.unfold_sym_idx, table[1],
+                                      table[4], table[5], qgrid_policy.n_sym_spatial),
+                    closure_verdict=table[7].verdict)
+                del V_acc, g0_acc
+                continue
             with SlabIO(output_h5_path, mode="a", mesh=mesh_xy) as tile_io:
                 tile_io.create_dataset(name, shape=v_logical_shape,
                                        dtype=V_QMUNU_TILE_DTYPE)
@@ -910,6 +1055,11 @@ def compute_V_q_bispinor_g_flat_to_h5(
 
     if any(vector is None for vector in g0_by_channel):
         raise RuntimeError("bispinor literal-G=0 projection did not produce four channels")
+    if held is not None:
+        # The Gamma vectors are returned below; only a restart reads them
+        # from the file (restart_bundle.read_photon_gamma).
+        held.seal(policy)
+        return held, tuple(g0_by_channel)
     with SlabIO(output_h5_path, mode="a", mesh=mesh_xy) as head_io:
         for channel, vector in enumerate(g0_by_channel):
             name = f"photon_g0_vectors_{channel}"
