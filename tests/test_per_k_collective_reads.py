@@ -78,7 +78,10 @@ def main():
         polar = plan_polar(mesh, n=pt.band_storage_extent(mesh, int(wfn.nbands)),
                            backend='auto', rcond=1.0e-10,
                            batched_route=ROUTE_BATCH_RESHARD)
-        n_centres = int(np.asarray(sym.kirr_fullids).size)
+        reduced = pt.link_symmetry_reduction_applies(
+            sym, tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3)), wfn=wfn)
+        n_centres = (int(np.asarray(sym.kirr_fullids).size) if reduced
+                     else int(sym.nk_tot))
         n_dir = int(pt.wfn_link_stencil(wfn).steps.shape[0])
         one_tile, reads_one = link_stage(wfn, sym, 'links_tile.h5', polar)
 
