@@ -129,8 +129,9 @@ def main():
             scale = float(np.abs(a).max())
             assert scale > 0, name
             np.testing.assert_allclose(b, a, rtol=0, atol=1e-12 * scale, err_msg=name)
-        for attr in ('g_wrap_ibz', 'source_neighbor_full_ids'):
-            np.testing.assert_array_equal(fa.attrs[attr], fb.attrs[attr])
+        assert set(fa.attrs) == set(fb.attrs), (sorted(fa.attrs), sorted(fb.attrs))
+        for attr in fa.attrs:
+            np.testing.assert_array_equal(fa.attrs[attr], fb.attrs[attr], err_msg=attr)
 
     # (b) the rotated coefficients against the raw file.
     with h5py.File(fixture, 'r') as fs, h5py.File(out, 'r') as fo:
