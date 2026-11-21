@@ -5,6 +5,21 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-21 — `centroid.kmeans_cli`: a one-batch sketch reads its k batch as one tile (the build no longer stalls)
+
+When every k row of the candidate sketch fit one k batch (small point counts
+or few k points: KNiF3 at P16 up to 3300 points, the 8-k NiPS3 cell at P4), the
+sketch build streamed one raw WFN parent per collective read: parents x band
+tiles reads where one union read per band tile suffices (64-k nosym KNiF3:
+832 reads instead of 13). On a slow CFS those builds ran past their caps
+(3000 and 3300 points did not finish in 8-22 min while 3750 and 5630, two
+batches, did). Every batch, the single one included, is now read as one k
+tile. The centroid sets do not change (KNiF3 3000 / 3300 / 3750 at P16:
+identical files on GPU before and after); the one-batch build reads 15 times
+instead of 834 per rank (main a4c835ad0). Nothing to change in input files;
+building the set on a CPU node is no longer needed for this. Test:
+`tests/test_centroid_sketch_k_batches.py` (P4 script).
+
 ## 2026-11-17 — `w_bse`: bispinor refused, the time-reversal refusal says why, the bsemat export reads the RPA W(0) only
 
 Three small changes around `screening_diagrams = w_bse`. No number changes;
