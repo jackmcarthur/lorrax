@@ -484,7 +484,7 @@ def build_sketch_q0_via_loadwfns(
     m_pad = padded_mu_extent(M, mesh_xy)
     ns = 4 if bispinor else int(wfn.nspinor)
     per_k = _face_bytes_per_k(mesh_xy, ns=ns, m_pad=m_pad, left=left, right=right)
-    rows_sel, weights, nk, nk_full, k_batch, n_chunks = candidate_k_schedule(
+    rows_sel, weights, nk, _, k_batch, n_chunks = candidate_k_schedule(
         wfn, sym, k_weights, per_k)
     n_v = len(sketch_vertices(gamma_mode))
     if factors == "exhaustive" and int(n_rows) != n_v * nk * nb_l * nb_r:
@@ -494,13 +494,12 @@ def build_sketch_q0_via_loadwfns(
     Y = _zero_kernel(mesh_xy, sketch_row_carrier(n_rows, mesh_xy), int(m_pad))()
     for k0 in range(0, nk, k_batch):
         k1 = min(nk, k0 + k_batch)
-        rows = (None if n_chunks == 1 and nk == nk_full else
-                tuple(int(k) for k in rows_sel[k0:k1]))
         _, left_slice, psi_l, psi_r = load_candidate_faces(
             wfn, sym, cand_idx, mesh_xy, left_range=left, right_range=right,
             bispinor=bispinor, band_norms=band_norms,
             band_chunk_size=band_chunk_size,
-            memory_per_device_gb=memory_per_device_gb, full_k_rows=rows,
+            memory_per_device_gb=memory_per_device_gb,
+            full_k_rows=tuple(int(k) for k in rows_sel[k0:k1]),
             verbose=verbose)
         with timing.section("sketch.kron"):
             Y = sketch_from_faces(

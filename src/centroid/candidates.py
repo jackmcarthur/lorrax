@@ -407,6 +407,8 @@ def load_candidate_faces(
     with every band.  The pseudoband clamp ``ψ /= max(norm, 1)`` is applied
     when ``band_norms`` is given.  A left window inside the right one is not
     loaded again: it is the right face's band rows ``left_slice``.
+    ``full_k_rows`` are the batch's full-BZ rows (from
+    :func:`candidate_k_schedule`), read as one k tile.
 
     Returns
     -------
@@ -435,10 +437,16 @@ def load_candidate_faces(
         from common.gpu_utils import device_budget_bytes
         memory_per_device_gb = device_budget_bytes() / 1e9
     meta.memory_per_device_gb = minimum_process_budget_gb(memory_per_device_gb)
-    # One batch streams one raw parent at a time (k tile 1).  A k batch of
-    # whole stars is one k tile: the loader's union read then takes each raw
-    # parent once per band tile.
-    k_tile = 1 if full_k_rows is None else len(full_k_rows)
+    # The k batch, the single batch included, is one k tile: the loader's
+    # union read takes each raw parent of the batch once per band tile, so
+    # the collective WFN reads number the band tiles of the batch.  Streaming
+    # one raw parent per read (k tile 1) multiplied them by the batch's parent
+    # count (a 64-k nosym WFN: 832 reads instead of 13), each with its own
+    # drain of the async read lane, and on a slow CFS stalled the build.
+    full_k_rows = tuple(int(k) for k in full_k_rows)
+    if not full_k_rows:
+        raise ValueError("load_candidate_faces: the k batch has no full-BZ rows")
+    k_tile = len(full_k_rows)
 
     def norms(window):
         if band_norms is None:
