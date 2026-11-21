@@ -760,9 +760,9 @@ def write_qp_wfn_h5(
     every mesh axis: each rank reads its own ``(nbands, nspinor, w, 2)``
     hyperslab of the source ``wfns/coeffs`` through ``file_io.slab_io``,
     rotates it, and writes the same hyperslab of the output.  No ψ row is
-    gathered anywhere; per-rank device bytes are ``≈ 5·nbands·nspinor·w·16``
-    with ``w = ⌈ngkmax/P⌉`` unless the device budget forces smaller G
-    windows (:func:`_coefficient_window`).  The ``mf_header`` tables
+    gathered anywhere; a window holds as many whole k rows as the fixed tile
+    admits (one collective read and write per window), per-rank device bytes
+    ``≈ 5·nbands·nspinor·w·16`` (:func:`_coefficient_window`).  The ``mf_header`` tables
     (:func:`file_io.wfn_writer.wfn_header_tables`), ``wfns/gvecs`` and the
     root stamps are SlabIO deferred metadata, landed by rank 0 at the first
     handle's close; that close also creates the ``wfns`` group, which the
@@ -960,8 +960,10 @@ def write_complete_wfn_h5(output_path: str, wfn, energies_ry: np.ndarray,
             output_path, wfn, nbands=nbands, energies_ry=energies_ry,
             occupations=occupations, stamps=stamps, mesh=mesh)
         kpt_starts = np.asarray(wfn.kpt_starts, dtype=np.int64)
-        width = _coefficient_window(mesh, nbands=nbands, nspinor=nspinor,
-                                    ngkmax=int(np.max(ngk)))
+        # One k row per window: the coefficients arrive per k from the host.
+        _, width = _coefficient_window(mesh, nbands=nbands, nspinor=nspinor,
+                                       ngkmax=int(np.max(ngk)), nb_active=0,
+                                       nk=1)
         sharding = NamedSharding(
             mesh, P(None, None, tuple(mesh.axis_names), None))
         with SlabIO(output_path, mode="a", mesh=mesh) as dst:
@@ -994,73 +996,116 @@ def _write_rotated_coefficients(src, dst, *, mesh, U_kmn, band_start,
     """Stream ``wfns/coeffs`` from ``src`` to ``dst``, rotating the active block.
 
     One G window at a time: the slab ``(nbands, nspinor, W, 2)`` float64 at
-    file offset ``kpt_starts[k] + g0`` is G-sharded over every mesh axis, so
+    file offset ``kpt_starts[k0] + g0`` is G-sharded over every mesh axis, so
     rank r reads and writes columns ``[r·w, (r+1)·w)`` of it (``W = P·w``).
-    ``valid_shape`` clips each window to its own k's ``ngk``: the pad columns
-    past it read as zero and are never written, so a window cannot reach the
-    neighbouring k.  The shape is the same for every window, so the read,
-    the rotation and the write each compile once.
+    The k rows are contiguous on the file's G axis, so a window holds the
+    ``k_tile`` whole rows :func:`_coefficient_window` admits (one collective
+    read and write per window, not per k); each column carries its row in
+    the window (``-1`` past the last), which picks its ``U``.  ``valid_shape``
+    clips the window to its rows: the pad columns past them read as zero
+    and are never written.  The shape is the same for every window, so the
+    read, the rotation and the write each compile once.
     """
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.collectives import device_put_process_local
 
+    nk = int(ngk.shape[0])
+    if not np.array_equal(np.asarray(kpt_starts[1:]),
+                          np.cumsum(np.asarray(ngk))[:-1]):
+        raise ValueError("wfns/coeffs k rows are not contiguous on the G axis "
+                         "(kpt_starts is not the exclusive prefix sum of ngk)")
     dst.create_dataset("wfns/coeffs",
                        shape=(nbands, nspinor, int(np.sum(ngk)), 2),
                        dtype=np.float64)
-    width = _coefficient_window(mesh, nbands=nbands, nspinor=nspinor,
-                                ngkmax=int(np.max(ngk)))
+    nb_active = int(band_stop) - int(band_start)
+    k_tile, width = _coefficient_window(
+        mesh, nbands=nbands, nspinor=nspinor, ngkmax=int(np.max(ngk)),
+        nb_active=nb_active, nk=nk)
     spec = P(None, None, tuple(mesh.axis_names), None)
-    rotate = _qp_rotation_kernel(mesh, band_start, band_stop)
+    rotate = _qp_rotation_kernel(mesh, band_start, band_stop, k_tile)
     replicated = NamedSharding(mesh, P())
-    for ik in range(int(ngk.shape[0])):
-        U = device_put_process_local(
-            np.asarray(U_kmn[ik], dtype=np.complex128), replicated)
-        for g0 in range(0, int(ngk[ik]), width):
-            offset = (0, 0, int(kpt_starts[ik]) + g0, 0)
-            valid = (nbands, nspinor, min(width, int(ngk[ik]) - g0), 2)
+    columns = NamedSharding(mesh, P(tuple(mesh.axis_names)))
+    for k0 in range(0, nk, k_tile):
+        k1 = min(nk, k0 + k_tile)
+        U = np.zeros((k_tile, nb_active, nb_active), dtype=np.complex128)
+        U[:k1 - k0] = np.asarray(U_kmn[k0:k1], dtype=np.complex128)
+        U = device_put_process_local(U, replicated)
+        bounds = np.asarray(kpt_starts[k0:k1], dtype=np.int64) - int(kpt_starts[k0])
+        n_g = int(kpt_starts[k1 - 1]) + int(ngk[k1 - 1]) - int(kpt_starts[k0])
+        for g0 in range(0, n_g, width):
+            w = min(width, n_g - g0)
+            row = np.full((width,), -1, dtype=np.int32)
+            row[:w] = np.searchsorted(bounds, g0 + np.arange(w), side="right") - 1
+            offset = (0, 0, int(kpt_starts[k0]) + g0, 0)
+            valid = (nbands, nspinor, w, 2)
             slab = src.read_slab(
                 "wfns/coeffs", shape=(nbands, nspinor, width, 2),
                 offset=offset, valid_shape=valid, partition_spec=spec,
                 dtype=np.float64)
-            dst.write_slab("wfns/coeffs", rotate(U, slab),
+            dst.write_slab("wfns/coeffs",
+                           rotate(U, device_put_process_local(row, columns), slab),
                            offset=offset, valid_shape=valid)
 
 
-def _coefficient_window(mesh, *, nbands, nspinor, ngkmax) -> int:
-    """G columns per coefficient window, ``P·w``, from the fixed tile.
+def _coefficient_window(mesh, *, nbands, nspinor, ngkmax, nb_active,
+                        nk) -> tuple[int, int]:
+    """``(k_tile, P·w)``: whole k rows per coefficient window and its G columns, from the fixed tile.
 
-    ``w = ⌈ngkmax/P⌉`` (one window per k) whenever
-    ``5·nbands·nspinor·w·16 B`` fits the fixed tile (``runtime.tiles``) — the
-    read slab, the active block as complex, its rotation, the output slab and
-    the one queued write — and the largest ``w`` that fits otherwise.  The
-    columns are independent, so the window moves no number.
+    A column costs ``5·nbands·nspinor·16 B`` per rank — the read slab, the
+    active block as complex, its rotation, the output slab and the one
+    queued write — and a k row ``⌈ngkmax/P⌉`` columns plus its replicated
+    ``U`` (``nb_active²·16 B``).  When one row fits the fixed tile
+    (``runtime.tiles``) the window holds the most whole rows that fit
+    (``k_tile``) and is ``P·⌈k_tile·ngkmax/P⌉`` wide; otherwise
+    ``k_tile = 1`` and ``w`` is the most columns that fit.  The columns are
+    independent, so the window moves no number.
     """
     from runtime.tiles import tile_units
 
     p = int(mesh.devices.size)
     whole_k = -(-int(ngkmax) // p)
     per_column = 5 * int(nbands) * int(nspinor) * 16
-    return p * tile_units(per_column, whole_k)
+    fit = tile_units(per_column, whole_k)
+    if fit < whole_k:
+        return 1, p * fit
+    k_tile = tile_units(per_column * whole_k + 16 * int(nb_active) ** 2,
+                        max(1, int(nk)))
+    return k_tile, p * (-(-(k_tile * int(ngkmax)) // p))
 
 
 @functools.lru_cache(maxsize=None)
-def _qp_rotation_kernel(mesh, band_start: int, band_stop: int):
-    """``slab[b0:b3] ← Σ_m U[m, n] · slab[m]`` on G-local ``(nb, ns, w, 2)`` slabs."""
+def _qp_rotation_kernel(mesh, band_start: int, band_stop: int, k_tile: int):
+    """``slab[b0:b3, g] ← Σ_m U[row[g], m, n] · slab[m, g]`` on G-local ``(nb, ns, w, 2)`` slabs.
+
+    ``U (k_tile, nb_a, nb_a)`` replicated, ``row (W,)`` the column's k row in
+    the window (``-1``: a pad column, left as read).  Each rank rotates only
+    the rows its own columns hold.
+    """
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
     from jax import shard_map
 
-    spec = P(None, None, tuple(mesh.axis_names), None)
+    axes = tuple(mesh.axis_names)
+    spec = P(None, None, axes, None)
 
-    def local(U, slab):
+    def local(U, row, slab):
         active = jax.lax.complex(slab[band_start:band_stop, ..., 0],
                                  slab[band_start:band_stop, ..., 1])
-        rotated = jnp.einsum("mn,msg->nsg", U, active)
+
+        def one(j, rotated):
+            hit = row == j
+            return jax.lax.cond(
+                jnp.any(hit),
+                lambda r: jnp.where(hit[None, None, :],
+                                    jnp.einsum("mn,msg->nsg", U[j], active), r),
+                lambda r: r, rotated)
+
+        rotated = jax.lax.fori_loop(0, k_tile, one, active)
         return slab.at[band_start:band_stop].set(
             jnp.stack([rotated.real, rotated.imag], axis=-1))
 
-    return jax.jit(shard_map(local, mesh=mesh, in_specs=(P(), spec),
+    return jax.jit(shard_map(local, mesh=mesh, in_specs=(P(), P(axes), spec),
                              out_specs=spec))
 
 
