@@ -5,6 +5,41 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-22 — epsmat export runs again; TD-aGW checkpoints commit through a record; `bse_w_exact` writes once
+
+- **`gw.epsmat_cli` (export and projection) runs again.** Since b6c73a78f
+  (2026-11-16) `open_export_source` read V, the stored q and the heads through
+  an h5py handle its `with` block had already closed, so every export and
+  projection raised `KeyError` (and a bundle without a ready W0 left
+  `q_stored` unbound). The reads are back inside the block. No number
+  changes against the code before b6c73a78f; files written by an export
+  are as before.
+- **TD-aGW checkpoint format (`tdgw.h5`).** LORRAX's integrator carry is now
+  written into two fixed-shape slots, `tdgw_data/checkpoint/lorrax_slots/slot_0`
+  and `slot_1` (allocated once, at the first checkpoint), and committed by the
+  32-byte record `tdgw_data/checkpoint/lorrax_record` (active slot, `it_next`,
+  `step`, `tchkp`): the inactive slot is written in place, flushed, then the
+  record is flipped and flushed. A run killed at any moment restarts from a
+  whole carry (100 of 100 SIGKILL trials consistent), and nothing is ever
+  unlinked: the file holds two carries (50 checkpoints of a 10 MiB carry:
+  21.0 MB; the writer before held one carry, 10.7 MB, and did not grow
+  either). A resume takes `it_next` from the record and prints a line when
+  TDGW's `it_next` differs. Checkpoints written before (`checkpoint/lorrax`)
+  restart as before, bitwise; one that the old writer had already torn (new
+  `it_next` beside the old carry) cannot be detected. TDGW's own three fields
+  are still written one after another, so only LORRAX's restart is covered.
+- **Multi-trial resume.** Every trial's measurement rows are written before
+  any checkpoint (the first trial's carry last), so a resume never copies
+  rows that a killed run had not yet written to trials 2 and up.
+- **`bse.bse_w_exact` column output** is written by rank 0 only (every rank
+  opened it with `"w"` before); a failed write raises on every rank at once
+  (`GATE io_global_commit`).
+
+Nothing to change in input files. Tests: `tests/test_io_hazards.py` (P4
+script), `tests/test_tdgw_checkpoint_interrupt_cpu.py`,
+`tests/test_tdgw_checkpoint_crash_cpu.py` (file size, SIGKILL),
+`tests/tdagw/test_checkpoint_restart_cpu.py` (restart from both formats).
+
 ## 2026-11-22 — Parallel-transport links, the QP-WFN write and the QSGW little-group seed read k tiles; the sketch batch prices its transfer
 
 WFN streams that made one collective read (or write) per k point now move a
