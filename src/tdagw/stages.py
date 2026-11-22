@@ -266,6 +266,9 @@ def _write_chunk(outs: TdOutputs, system: TdSystem, i0, i1, samples, state_fn,
     logical = [np.asarray(a) if np.ndim(a) < 3 else np.take(np.asarray(a), np.arange(nk),
                                                             axis=np.ndim(a) - 3)
                for a in leaves]
+    # Every trial's rows first, then the checkpoints, the first trial's (which
+    # holds the carry, the commit record a resume reads) last: a run killed
+    # in between resumes from the previous carry, whose rows are all on disk.
     for tr, path in enumerate(outs.paths):
         rows = {}
         for name, typ, kw, itr in outs.meas:
@@ -277,9 +280,10 @@ def _write_chunk(outs: TdOutputs, system: TdSystem, i0, i1, samples, state_fn,
                 data = data[:, :system.nk]
             rows[name] = ((sel[0] - itr.start) // itr.step, data)
         tdgw_io.write_samples(path, rows)
+    for tr in reversed(range(len(outs.paths))):
         carry = (dict(leaves=logical, step=step, fingerprint=fingerprint)
                  if tr == 0 else None)
-        tdgw_io.write_checkpoint(path, it_next=i1, tchkp=t_state,
+        tdgw_io.write_checkpoint(outs.paths[tr], it_next=i1, tchkp=t_state,
                                  lessG=1j * np.asarray(rho)[tr, :system.nk], carry=carry)
 
 
@@ -362,6 +366,9 @@ def load_checkpoint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
             f"tdagw.tdgw_jax; why: a TDGW checkpoint holds the state, not the integrator's "
             f"carry (dSigma history, step controller), so the run cannot continue exactly; "
             f"fix: rerun from t0")
+    if rec["torn"] and process_rank() == 0:
+        print(f"  checkpoint {paths[0]}: TDGW's it_next is not the carry's (the writer "
+                 f"stopped between them); resuming from the carry, it_next {rec['it_next']}")
     want = json.loads(restart_fingerprint(deck, system, model, dt))
     got = json.loads(rec["fingerprint"])
     diff = sorted(k for k in set(want) | set(got) if want.get(k) != got.get(k))
