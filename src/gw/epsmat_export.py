@@ -18,6 +18,7 @@ block ``16 n²/P`` B; only vectors and scalars are replicated.
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
 from typing import NamedTuple
@@ -473,6 +474,20 @@ class ExportSource(NamedTuple):
     q_tables: object             # validated persisted QirrTables, or None for full storage
     w0_ready: bool = True        # the bundle carries LORRAX's own ready W0_qmunu
     storage: str = "full"        # V_qmunu's q storage: "ibz" (the wedge) or "full"
+    bundle_io: object = None     # a SlabIO "r" handle on the bundle (held_bundle), or None
+
+
+@contextlib.contextmanager
+def held_bundle(src, mesh):
+    """``src`` with one read handle on its bundle, for a whole q loop.
+
+    :func:`read_q_rows` reads every stored q through it, so a loop over n
+    stored q makes n reads instead of n opens, 2n reads and n closes (each a
+    collective).  The handle is read-only and closes when the block ends.
+    """
+    from file_io.slab_io import SlabIO
+    with SlabIO(src.bundle, mode="r", mesh=mesh) as io:
+        yield src._replace(bundle_io=io)
 
 
 def _bundle_file(source_restart):
@@ -668,15 +683,23 @@ def _file_q_v(src, q_file, gvecs, is_q0):
 def read_q_rows(src, iq, mesh, *, with_w=True):
     """``(V, W, ζ̃)`` of stored q ``iq``: V/W ``(1, μ_pad, μ_pad)`` at
     ``P(None,'x','y')`` (zero-padded), ζ̃ ``(1, μ_pad, ngkmax)`` μ-sharded.
-    ``with_w = False`` reads no W (``None``)."""
+    ``with_w = False`` reads no W (``None``).  With :func:`held_bundle`'s
+    handle (``src.bundle_io``) V and W are one ``read_multi`` on it; without,
+    a handle is opened for this q and closed again."""
     from file_io.slab_io import SlabIO
     shape = (1, src.mu_pad, src.mu_pad)
     names = ("V_qmunu", "W0_qmunu") if with_w else ("V_qmunu",)
-    with SlabIO(src.bundle, mode="r", mesh=mesh) as io:
-        rows = [io.read_slab(name, shape=shape, dtype=np.complex128,
-                             offset=(int(iq), 0, 0), mesh=mesh,
-                             partition_spec=P(None, "x", "y"))
-                for name in names]
+    if src.bundle_io is not None:
+        rows = src.bundle_io.read_multi(
+            [dict(name=name, shape=shape, dtype=np.complex128, offset=(int(iq), 0, 0),
+                  valid_shape=(1, src.n_mu, src.n_mu)) for name in names],
+            partition_spec=P(None, "x", "y"), mesh=mesh)
+    else:
+        with SlabIO(src.bundle, mode="r", mesh=mesh) as io:
+            rows = [io.read_slab(name, shape=shape, dtype=np.complex128,
+                                 offset=(int(iq), 0, 0), mesh=mesh,
+                                 partition_spec=P(None, "x", "y"))
+                    for name in names]
     V, W = rows[0], (rows[1] if with_w else None)
     Z = src.zeta.read_zeta_G_slab(q_offset=int(iq), q_count=1, mu_offset=0,
                                   mu_count=src.mu_pad, mesh=mesh)
@@ -1070,12 +1093,17 @@ def run_epsmat_export(cfg, mesh, *, print_fn=None):
     Every q passes three gates before its block counts: V from ζ and v equals
     the bundle's V, W(0) is Hermitian, and the written block projects back to
     ``V_ε B K Bᴴ V_ε``.  Returns a dict of per-q figures for the report.
+    The bundle is read through one handle (:func:`held_bundle`).
     """
+    with held_bundle(open_export_source(cfg, mesh), mesh) as src:
+        return _run_epsmat_export(cfg, mesh, src)
+
+
+def _run_epsmat_export(cfg, mesh, src):
     from common.collectives import barrier, process_rank
     from file_io import bgw_epsmat as be
     from file_io.slab_io import SlabIO
 
-    src = open_export_source(cfg, mesh)
     q0_body = q0_body_policy(cfg.files, src.config.sys_dim, cfg.q0_body_3d, cfg.q0_wings)
     log.info(f"  q0 body     {q0_body}")
     plans, comps = plan_export(cfg, src)
@@ -1425,8 +1453,14 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=None):
     ε⁻¹_00(q0, ω) for the GW driver's head (``screening_source = bgw_epsmat``),
     and the producer's ``whead`` stays for the BSE.  LORRAX's own W(0) is
     not needed; when the bundle has one the receipt compares the two.
-    Returns the receipt dict.
+    Returns the receipt dict.  The bundle is read through one handle
+    (:func:`held_bundle`).
     """
+    with held_bundle(open_export_source(cfg, mesh, require_w0=False), mesh) as src:
+        return _run_epsmat_projection(cfg, mesh, src)
+
+
+def _run_epsmat_projection(cfg, mesh, src):
     import shutil
     import h5py
     from common.collectives import barrier, process_rank
@@ -1435,8 +1469,7 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=None):
     from file_io import bgw_epsmat as be
     from file_io.slab_io import SlabIO
 
-    src = open_export_source(cfg, mesh, require_w0=False)
-    files = {name: os.path.join(cfg.bgw_reference, f"{name}.h5") for name in ("eps0mat", "epsmat")}
+    files ={name: os.path.join(cfg.bgw_reference, f"{name}.h5") for name in ("eps0mat", "epsmat")}
     heads = {name: be.read_epsmat_header(p) for name, p in files.items() if os.path.isfile(p)}
     if "eps0mat" not in heads:
         _refuse("epsmat_project_inputs", f"no eps0mat.h5 under {cfg.bgw_reference}",
