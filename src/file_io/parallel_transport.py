@@ -478,8 +478,10 @@ def _link_center_tile(mesh, *, nbands: int, nspinor: int, file_nspinor: int,
     (``s_f``), the two-component unfold before a bispinor lift (``s_f``) and
     the replicated nonsymmorphic phase row (``16 ngkmax``, not divided by
     ``P``).  Beside the tile the stage keeps one centre on its ``x`` face
-    and one gathered neighbour (``2 s``).  So a centre costs
-    ``s + n_dir (s + s_f [+ s_f] + 16 ngkmax)`` and the tile is the most
+    and one gathered neighbour (``2 s``), and the tile's solved links wait
+    for their one hyperslab write (``16 nb_pad^2 / P`` per edge).  So a
+    centre costs ``s + n_dir (s + s_f [+ s_f] + 16 ngkmax + 16 nb_pad^2 / P)``
+    and the tile is the most
     centres that fit ``TILE_BYTES - 2 s``.  ``hold`` is False when not even
     one centre fits: the stage then holds one centre and reads its
     neighbours one at a time, the pre-tile pattern (two spheres).  Shapes
@@ -491,7 +493,8 @@ def _link_center_tile(mesh, *, nbands: int, nspinor: int, file_nspinor: int,
     s = 16.0 * nb_pad * int(nspinor) * int(ngkmax) / p
     s_f = 16.0 * nb_pad * int(file_nspinor) * int(ngkmax) / p
     lift = s_f if int(nspinor) != int(file_nspinor) else 0.0
-    per_centre = s + int(n_dir) * (s + s_f + lift + 16.0 * int(ngkmax))
+    links = 16.0 * nb_pad * nb_pad / p
+    per_centre = s + int(n_dir) * (s + s_f + lift + 16.0 * int(ngkmax) + links)
     fit = int((float(TILE_BYTES) - 2.0 * s) // per_centre)
     if fit < 1:
         return 1, False
@@ -559,22 +562,41 @@ def _write_link_stage(
         lambda *faces: jnp.stack(faces),
         out_shardings=NamedSharding(mesh, P(None, "x", "y")))
 
+    # Solved links wait here, one row per edge in (centre, direction) order,
+    # until whole centres are complete; each run of complete centres is one
+    # hyperslab write, not one write per edge.
+    solved = []
+    written = [0]
+    stack_centres = jax.jit(
+        lambda *rows: jnp.stack(rows).reshape(
+            (len(rows) // max(nd, 1), max(nd, 1)) + rows[0].shape),
+        out_shardings=NamedSharding(mesh, P(None, None, "x", "y")))
+
     with SlabIO(path, mode="a", mesh=mesh) as io:
         def flush():
             if not overlaps:
                 return
             link, values = polar_plan.batched(stack_faces(*overlaps))
             for j, (ik, direction) in enumerate(edge_ids):
-                io.write_slab(
-                    LINKS_DATASET, link[j:j+1, None, :, :],
-                    offset=(ik, direction, 0, 0),
-                    global_shape=(nrk, nd, nb, nb))
+                solved.append(link[j])
                 singular_values.append(values[j, :nb])
-            # Complete the whole group's writes before WfnLoader enters
-            # its next collective HDF5 read. No wavefunction is buffered.
-            io.sync_writes()
             overlaps.clear()
             edge_ids.clear()
+
+        def write_complete():
+            """Write the complete centres solved so far as one hyperslab, then
+            finish the write before WfnLoader enters its next collective read."""
+            n_c = len(solved) // nd if nd else 0
+            if n_c == 0:
+                return
+            rows = solved[:n_c * nd]
+            del solved[:n_c * nd]
+            io.write_slab(LINKS_DATASET, stack_centres(*rows),
+                          offset=(written[0], 0, 0, 0),
+                          global_shape=(nrk, nd, nb, nb))
+            written[0] += n_c
+            del rows
+            io.sync_writes()
 
         # A tile of centres and the union of their forward neighbours are two
         # collective reads (the loader's union read, one window per raw
@@ -644,8 +666,16 @@ def _write_link_stage(
                         flush()
                 del center_x
             del center_tile, neighbor_tile
+            # The tile's last solve group closes with the tile, so the tile
+            # is one hyperslab: polar batches are independent matrices.
+            flush()
+            write_complete()
 
         flush()
+        write_complete()
+        if written[0] != (nrk if nd else 0):
+            raise AssertionError(
+                f"parallel-transport links: {written[0]} of {nrk} centres written")
         singular_values_device = (
             jnp.stack(singular_values).reshape(nrk, nd, nb) if nd
             else jnp.zeros((nrk, 0, nb), dtype=jnp.float64))
