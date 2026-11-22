@@ -466,20 +466,36 @@ def initialize_parallel_transport_artifact(
         io.write_attr("velocity_validation_passed", np.int32(0))
 
 
-def _link_center_tile(mesh, *, nbands: int, nspinor: int, ngkmax: int,
-                      n_dir: int, n_centers: int) -> int:
-    """Link centres per collective read, from the fixed tile (``runtime.tiles``).
+def _link_center_tile(mesh, *, nbands: int, nspinor: int, file_nspinor: int,
+                      ngkmax: int, n_dir: int, n_centers: int) -> tuple[int, bool]:
+    """``(tile, hold)``: link centres per collective read, from the fixed tile (``runtime.tiles``).
 
-    One centre brings at most ``1 + n_dir`` one-k spheres (itself and its
-    forward neighbours), each ``16 nb_pad ns ngkmax / P`` bytes per rank on
-    the loader's band-sharded layout; the tile holds the most centres whose
-    spheres fit, so the tile's two reads replace ``1 + n_dir`` reads per
-    centre.  Shapes only: every rank computes the same tile.
+    Per rank, a one-k sphere on the loader's band-sharded layout is
+    ``s = 16 nb_pad ns ngkmax / P`` bytes (``s_f`` at the file's spinor
+    count).  A tile of ``T`` centres holds its ``T`` centre spheres and the
+    union of their forward neighbours, at most ``n_dir T``; while the loader
+    reads that union it also holds, per row, the raw parent window
+    (``s_f``), the two-component unfold before a bispinor lift (``s_f``) and
+    the replicated nonsymmorphic phase row (``16 ngkmax``, not divided by
+    ``P``).  Beside the tile the stage keeps one centre on its ``x`` face
+    and one gathered neighbour (``2 s``).  So a centre costs
+    ``s + n_dir (s + s_f [+ s_f] + 16 ngkmax)`` and the tile is the most
+    centres that fit ``TILE_BYTES - 2 s``.  ``hold`` is False when not even
+    one centre fits: the stage then holds one centre and reads its
+    neighbours one at a time, the pre-tile pattern (two spheres).  Shapes
+    only: every rank computes the same plan.
     """
-    from runtime.tiles import tile_units
-    per_k = 16.0 * band_storage_extent(mesh, int(nbands)) * int(nspinor) \
-        * int(ngkmax) / int(mesh.size)
-    return tile_units((1 + int(n_dir)) * per_k, int(n_centers))
+    from runtime.tiles import TILE_BYTES
+    p = int(mesh.size)
+    nb_pad = band_storage_extent(mesh, int(nbands))
+    s = 16.0 * nb_pad * int(nspinor) * int(ngkmax) / p
+    s_f = 16.0 * nb_pad * int(file_nspinor) * int(ngkmax) / p
+    lift = s_f if int(nspinor) != int(file_nspinor) else 0.0
+    per_centre = s + int(n_dir) * (s + s_f + lift + 16.0 * int(ngkmax))
+    fit = int((float(TILE_BYTES) - 2.0 * s) // per_centre)
+    if fit < 1:
+        return 1, False
+    return min(fit, max(1, int(n_centers))), True
 
 
 @lru_cache(maxsize=None)
@@ -562,12 +578,16 @@ def _write_link_stage(
 
         # A tile of centres and the union of their forward neighbours are two
         # collective reads (the loader's union read, one window per raw
-        # parent), not 1 + nd reads per centre.
-        tile = _link_center_tile(
+        # parent), not 1 + nd reads per centre.  When one centre's spheres do
+        # not fit the tile (``hold`` False), each neighbour is read on its
+        # own as it is used.  With no forward step (a 1x1x1 grid) there is no
+        # edge, so nothing is read.
+        tile, hold = _link_center_tile(
             mesh, nbands=nb, nspinor=4 if bispinor else int(wfn.nspinor),
-            ngkmax=int(wfn.ngkmax), n_dir=nd, n_centers=nrk)
+            file_nspinor=int(wfn.nspinor), ngkmax=int(wfn.ngkmax), n_dir=nd,
+            n_centers=nrk)
         row = _sphere_row_kernel(mesh)
-        for t0 in range(0, nrk, tile):
+        for t0 in range(0, nrk if nd else 0, tile):
             t1 = min(nrk, t0 + tile)
             center_tile = wfn.load(
                 bands=(0, nb),
@@ -575,15 +595,17 @@ def _write_link_stage(
                    else [int(k) for k in source_full[t0:t1]]),
                 sharding=band_sphere_spec(), bispinor=bool(bispinor))
             neighbor_rows = np.unique(source_plus[t0:t1])
-            neighbor_tile = wfn.load(
+            neighbor_tile = (wfn.load(
                 bands=(0, nb), k=[int(k) for k in neighbor_rows],
                 sharding=band_sphere_spec(), bispinor=bool(bispinor))
+                if hold else None)
             neighbor_at = {int(k): j for j, k in enumerate(neighbor_rows)}
 
             for ik_irr in range(t0, t1):
                 center_full = int(source_full[ik_irr])
                 center_ids = (IBZRows((ik_irr,)) if reduced else [center_full])
-                center_x = center_on_x(row(center_tile, np.int32(ik_irr - t0)))
+                center_x = center_on_x(center_tile if t1 - t0 == 1
+                                       else row(center_tile, np.int32(ik_irr - t0)))
                 g_center = wfn.gvecs(k=center_ids)[0]
                 ngk_center = int(wfn.ngk_valid(k=center_ids)[0])
 
@@ -600,8 +622,11 @@ def _write_link_stage(
                         g_neighbor, g_center, wrap,
                         ngk_neighbor=ngk_neighbor, ngk_center=ngk_center)
 
-                    neighbor_xy = row(neighbor_tile,
-                                      np.int32(neighbor_at[neighbor_full]))
+                    neighbor_xy = (
+                        row(neighbor_tile, np.int32(neighbor_at[neighbor_full]))
+                        if hold else wfn.load(
+                            bands=(0, nb), k=neighbor_ids,
+                            sharding=band_sphere_spec(), bispinor=bool(bispinor)))
                     # WfnLoader owns the exact zero band pad.  distrib_la's
                     # polar contract returns the canonical partial isometry
                     # for those null directions; slicing the physical leading
