@@ -36,8 +36,9 @@ import numpy as np
 __all__ = [
     "MATRIX", "DIAGONAL", "TOL_ZERO", "VERSION", "ICUTV_OF_SYS_DIM",
     "QGspace", "kinetic_energies", "gvector_order", "gcutoff", "q_gspace",
-    "matrix_block_window", "create_epsmat_file", "write_q_gspace",
-    "write_q_diagonal", "read_q_gspace", "read_epsmat_header", "midgap_ry",
+    "matrix_block_window", "create_epsmat_file", "write_q_gspace", "write_q_gspaces",
+    "write_q_diagonal", "write_q_diagonals", "read_q_gspace", "read_q_gspaces",
+    "read_epsmat_header", "midgap_ry",
     "matrix_shape", "register_matrix",
 ]
 
@@ -245,24 +246,36 @@ def create_epsmat_file(path, *, wfn_file, qpts, qgrid, nmtx, ecuts, nband,
 
 def write_q_gspace(path, iq, qg, vcoul_ry_bohr3):
     """Write one q's ``ekin``, ``gind_*`` and ``vcoul`` (serial h5py, one rank)."""
-    inv = np.empty_like(qg.order)
-    inv[qg.order] = np.arange(qg.order.size)
+    write_q_gspaces(path, [(iq, qg, vcoul_ry_bohr3)])
+
+
+def write_q_gspaces(path, rows):
+    """:func:`write_q_gspace` for every ``(iq, qg, vcoul)`` of ``rows``, one open."""
     with h5py.File(path, "a") as f:
         g = f["eps_header/gspace"]
-        g["ekin"][iq] = qg.ekin
-        g["gind_eps2rho"][iq] = (qg.order + 1).astype(np.int32)
-        g["gind_rho2eps"][iq] = (inv + 1).astype(np.int32)
-        g["vcoul"][iq, :qg.nmtx] = np.asarray(vcoul_ry_bohr3, dtype=np.float64)[:qg.nmtx]
+        for iq, qg, vcoul_ry_bohr3 in rows:
+            inv = np.empty_like(qg.order)
+            inv[qg.order] = np.arange(qg.order.size)
+            g["ekin"][iq] = qg.ekin
+            g["gind_eps2rho"][iq] = (qg.order + 1).astype(np.int32)
+            g["gind_rho2eps"][iq] = (inv + 1).astype(np.int32)
+            g["vcoul"][iq, :qg.nmtx] = np.asarray(vcoul_ry_bohr3, dtype=np.float64)[:qg.nmtx]
 
 
 def write_q_diagonal(path, iq, diag):
     """Write ``matrix-diagonal`` of one q and set its ``qpt_done`` (serial h5py, one rank)."""
-    d = np.asarray(diag, dtype=np.complex128)
+    write_q_diagonals(path, [(iq, diag)])
+
+
+def write_q_diagonals(path, rows):
+    """:func:`write_q_diagonal` for every ``(iq, diag)`` of ``rows``, one open."""
     with h5py.File(path, "a") as f:
-        f[DIAGONAL][iq, :d.size, 0] = d.real
-        f[DIAGONAL][iq, :d.size, 1] = d.imag
         done = f["eps_header/qpoints/qpt_done"]
-        done[iq] = np.int32(1)
+        for iq, diag in rows:
+            d = np.asarray(diag, dtype=np.complex128)
+            f[DIAGONAL][iq, :d.size, 0] = d.real
+            f[DIAGONAL][iq, :d.size, 1] = d.imag
+            done[iq] = np.int32(1)
 
 
 def read_epsmat_header(path):
@@ -283,10 +296,18 @@ def read_epsmat_header(path):
 
 def read_q_gspace(path, iq):
     """``(QGspace, vcoul)`` of one stored q, the file's own G order (serial h5py)."""
+    return read_q_gspaces(path, [iq])[0]
+
+
+def read_q_gspaces(path, iqs):
+    """:func:`read_q_gspace` of every q in ``iqs`` (a list, in order), one open."""
+    out = []
     with h5py.File(path, "r") as f:
         g = f["eps_header/gspace"]
-        nmtx = int(np.asarray(g["nmtx"][iq]))
-        order = np.asarray(g["gind_eps2rho"][iq], dtype=np.int64) - 1
-        ekin = np.asarray(g["ekin"][iq], dtype=np.float64)
-        vcoul = np.asarray(g["vcoul"][iq, :nmtx], dtype=np.float64)
-    return QGspace(ekin=ekin, order=order, nmtx=nmtx), vcoul
+        for iq in iqs:
+            nmtx = int(np.asarray(g["nmtx"][iq]))
+            order = np.asarray(g["gind_eps2rho"][iq], dtype=np.int64) - 1
+            ekin = np.asarray(g["ekin"][iq], dtype=np.float64)
+            vcoul = np.asarray(g["vcoul"][iq, :nmtx], dtype=np.float64)
+            out.append((QGspace(ekin=ekin, order=order, nmtx=nmtx), vcoul))
+    return out

@@ -947,6 +947,8 @@ def plan_export(cfg, src, *, print_fn=None):
                     "LORRAX's V and W carry v = 0 beyond the bare cutoff",
                     "lower epsmat_ecut or rerun GW with a larger bare_coulomb_cutoff")
         ecuts, ecut_receipt = resolve_ecut(cfg.epsmat_ecut, full, source=src_name)
+        # The reference's G lists of every q in one open (host: 2 · 8 · ng B per q).
+        refs = be.read_q_gspaces(ref, list(range(len(q_file)))) if ref else None
         rows = []
         for i, q in enumerate(q_file):
             if name == "eps0mat":
@@ -961,7 +963,7 @@ def plan_export(cfg, src, *, print_fn=None):
                         "use a bundle containing Gamma")
             qg = be.q_gspace(comps, bdot, q, full, is_q0=(name == "eps0mat"))
             if ref:
-                qref, _ = be.read_q_gspace(ref, i)
+                qref, _ = refs[i]
                 if qref.nmtx != qg.nmtx or not np.array_equal(
                         qref.order[: qref.nmtx], qg.order[: qg.nmtx]):
                     _refuse("epsmat_bgw_gorder", f"{name} q {i}: nmtx {qg.nmtx} vs "
@@ -1120,10 +1122,10 @@ def _run_epsmat_export(cfg, mesh, src):
                 nband=int(src.config.nband),
                 efermi_ry=be.midgap_ry(src.wfn_file, int(src.config.nband)),
                 icutv=be.ICUTV_OF_SYS_DIM[int(src.config.sys_dim)])
-            for r in rows:
-                miller = comps[r.gspace.order[: r.gspace.nmtx]]
-                be.write_q_gspace(path, r.iq_file, r.gspace,
-                                  bare_v_bgw_units(src, r.q_file, miller))
+            be.write_q_gspaces(path, [
+                (r.iq_file, r.gspace,
+                 bare_v_bgw_units(src, r.q_file, comps[r.gspace.order[: r.gspace.nmtx]]))
+                for r in rows])
         barrier(f"epsmat.{name}.skeleton")
         diags, figs = [], []
         with SlabIO(path, mode="a", mesh=mesh) as io:
@@ -1194,8 +1196,7 @@ def _run_epsmat_export(cfg, mesh, src):
                 del Z, chi, V, Wc
             del algebra
         if rank0:
-            for iq_file, d in diags:
-                be.write_q_diagonal(path, iq_file, d)
+            be.write_q_diagonals(path, diags)
         barrier(f"epsmat.{name}.done")
         out[name] = {"path": path, "ecuts": ecuts, "q": figs,
                      **({"q0_body": q0_body} if name == "eps0mat" else {})}
@@ -1568,6 +1569,11 @@ def _run_epsmat_projection(cfg, mesh, src):
     with h5py.File(files["eps0mat"], "r") as f:
         heads_bgw = [complex(f[be.MATRIX][0, 0, fr.ifreq, 0, 0, 0],
                              f[be.MATRIX][0, 0, fr.ifreq, 0, 0, 1]) for fr in freqs]
+    # Every row's G list, one open per file (host: 2 · 8 · ng B per row).
+    gspaces = {}
+    for name in sorted({r.name for r in plan}):
+        iqs = sorted({r.iq_file for r in plan if r.name == name})
+        gspaces.update({(name, iq): g for iq, g in zip(iqs, be.read_q_gspaces(files[name], iqs))})
     figs = []
     with SlabIO(target, mode="a", mesh=mesh) as io, _bgw_readers(files, heads, mesh) as readers:
         # Register (W0) or create (Wp, or W0 of a bundle without screening):
@@ -1580,7 +1586,7 @@ def _run_epsmat_projection(cfg, mesh, src):
             h = heads[row.name]
             Z, V, W_lx, basis = q_basis(src, iq, mesh, with_w=src.w0_ready)
             B, _ = coulomb_whitener(V, rcond=cfg.rcond, plan=src.eigh)
-            qg, _ = be.read_q_gspace(files[row.name], row.iq_file)
+            qg, _ = gspaces[(row.name, row.iq_file)]
             n = qg.nmtx
             g_file = h["components"][qg.order[:n]]
             q_file = np.asarray(h["qpts"][row.iq_file], dtype=np.float64)

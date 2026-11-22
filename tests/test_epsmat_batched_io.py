@@ -188,11 +188,13 @@ def main():
         "export bundle opens": (n(c_es, "slabio_open", bundle), n(c_eb, "slabio_open", bundle)),
         "export bundle reads": (n(c_es, "read_slab", bundle) + n(c_es, "read_multi", bundle),
                                 n(c_eb, "read_slab", bundle) + n(c_eb, "read_multi", bundle)),
+        "export epsmat.h5 h5py opens": (n(c_es, "h5py", "epsmat.h5"), n(c_eb, "h5py", "epsmat.h5")),  # [15]
         "project bundle opens": (n(c_ps, "slabio_open", bundle), n(c_pb, "slabio_open", bundle)),
         "project epsmat.h5 SlabIO opens": (n(c_ps, "slabio_open", "epsmat.h5"),  # [14]
                                            n(c_pb, "slabio_open", "epsmat.h5")),  # [14]
         "project epsmat.h5 matrix reads": (n(c_ps, "read_slab", "epsmat.h5"),  # [14]
                                            n(c_pb, "read_slab", "epsmat.h5")),  # [14]
+        "project epsmat.h5 h5py opens": (n(c_ps, "h5py", "epsmat.h5"), n(c_pb, "h5py", "epsmat.h5")),  # [15]
     }
     print(f"EPSMAT_BATCHED rank={rank} calls (per-q, batched): {report}", flush=True)
     rows_eps = nq_store - 1
