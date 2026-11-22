@@ -356,48 +356,94 @@ def write_samples(path: str, rows: dict):
 LORRAX_CHECKPOINT = "lorrax"
 
 
+#: The carry being written, renamed to :data:`LORRAX_CHECKPOINT` once complete.
+LORRAX_CHECKPOINT_STAGED = "lorrax_staged"
+
+
 def write_checkpoint(path: str, *, it_next: int, tchkp: float, lessG, carry=None):
     """TDGW checkpoint: next measurement index, state time, G^< = i rho.
 
     ``carry`` = dict(leaves=[arrays], step=int, fingerprint=str) also
     writes the integrator's whole carry (logical k) under
     ``checkpoint/lorrax`` (``leaf_<i>`` datasets, attributes ``step``,
-    ``n_leaves``, ``fingerprint``), replacing the previous one, so a run
-    restarted from this file continues the uninterrupted one bitwise.
+    ``n_leaves``, ``fingerprint``, and the ``it_next`` / ``tchkp`` it goes
+    with), replacing the previous one, so a run restarted from this file
+    continues the uninterrupted one bitwise.
+
+    Order, for a run killed part way: the carry into
+    ``checkpoint/lorrax_staged``, marked complete and flushed; the swap
+    (delete the old carry, rename the staged one), flushed; TDGW's three
+    fields last.  The carry is the commit record: :func:`read_checkpoint`
+    takes ``it_next`` and ``tchkp`` from it, so a file killed before the
+    swap resumes from the previous carry with the previous fields, and one
+    killed after it from the new carry.  The caller writes every trial's
+    measurement rows before the first checkpoint (``stages._write_chunk``).
     """
     import h5py
     with h5py.File(path, "a") as f:
         c = f["tdgw_data/checkpoint"]
+        if carry is not None:
+            _write_carry(f, c, carry, it_next=it_next, tchkp=tchkp)
         c["it_next"][...] = it_next
         c["tchkp"][...] = tchkp
         c["lessG_knn"][...] = lessG
-        if carry is not None:
-            if LORRAX_CHECKPOINT in c:
-                del c[LORRAX_CHECKPOINT]
-            g = c.create_group(LORRAX_CHECKPOINT)
-            for i, leaf in enumerate(carry["leaves"]):
-                g.create_dataset(f"leaf_{i:03d}", data=np.asarray(leaf))
-            g.attrs["n_leaves"] = len(carry["leaves"])
-            g.attrs["step"] = int(carry["step"])
-            g.attrs["fingerprint"] = carry["fingerprint"]
+        f.flush()
+
+
+def _write_carry(f, c, carry, *, it_next, tchkp):
+    """Stage the carry, flush, then swap it in (see :func:`write_checkpoint`)."""
+    if LORRAX_CHECKPOINT_STAGED in c:
+        del c[LORRAX_CHECKPOINT_STAGED]
+    g = c.create_group(LORRAX_CHECKPOINT_STAGED)
+    for i, leaf in enumerate(carry["leaves"]):
+        g.create_dataset(f"leaf_{i:03d}", data=np.asarray(leaf))
+    g.attrs["n_leaves"] = len(carry["leaves"])
+    g.attrs["step"] = int(carry["step"])
+    g.attrs["fingerprint"] = carry["fingerprint"]
+    g.attrs["it_next"] = int(it_next)
+    g.attrs["tchkp"] = float(tchkp)
+    g.attrs["complete"] = True
+    f.flush()
+    if LORRAX_CHECKPOINT in c:
+        del c[LORRAX_CHECKPOINT]
+    c.move(LORRAX_CHECKPOINT_STAGED, LORRAX_CHECKPOINT)
+    f.flush()
+
+
+def _complete_carry(g) -> bool:
+    """A staged carry written to its end (its last attribute is ``complete``)."""
+    return bool(g.attrs.get("complete", False))
 
 
 def read_checkpoint(path: str) -> dict:
     """The checkpoint of a ``tdgw.h5`` (read-only): TDGW's fields and LORRAX's carry.
 
-    Returns dict(it_next, tchkp, leaves, step, fingerprint); ``leaves`` is
-    None when the file has no LORRAX carry (a TDGW run's file).
+    Returns dict(it_next, tchkp, leaves, step, fingerprint, torn); ``leaves``
+    is None when the file has no LORRAX carry (a TDGW run's file).  With a
+    carry, ``it_next`` and ``tchkp`` are the carry's own (a carry written
+    before 2026-11-22 has none and takes TDGW's fields); ``torn`` is True
+    when TDGW's ``it_next`` is not the carry's, i.e. the writer was killed
+    between the two, and the resume is the carry's.  A complete staged carry
+    whose swap did not finish is the carry.
     """
     import h5py
     with h5py.File(path, "r") as f:
         c = f["tdgw_data/checkpoint"]
         out = dict(it_next=int(c["it_next"][()]), tchkp=float(c["tchkp"][()]),
-                   leaves=None, step=None, fingerprint=None)
+                   leaves=None, step=None, fingerprint=None, torn=False)
+        g = None
         if LORRAX_CHECKPOINT in c:
             g = c[LORRAX_CHECKPOINT]
+        elif LORRAX_CHECKPOINT_STAGED in c and _complete_carry(c[LORRAX_CHECKPOINT_STAGED]):
+            g = c[LORRAX_CHECKPOINT_STAGED]
+        if g is not None:
             out["leaves"] = [g[f"leaf_{i:03d}"][()] for i in range(int(g.attrs["n_leaves"]))]
             out["step"] = int(g.attrs["step"])
             out["fingerprint"] = str(g.attrs["fingerprint"])
+            if "it_next" in g.attrs:
+                own = int(g.attrs["it_next"])
+                out["torn"] = own != out["it_next"]
+                out["it_next"], out["tchkp"] = own, float(g.attrs["tchkp"])
     return out
 
 
