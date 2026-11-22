@@ -998,7 +998,8 @@ def _write_rotated_coefficients(src, dst, *, mesh, U_kmn, band_start,
     One G window at a time: the slab ``(nbands, nspinor, W, 2)`` float64 at
     file offset ``kpt_starts[k0] + g0`` is G-sharded over every mesh axis, so
     rank r reads and writes columns ``[r·w, (r+1)·w)`` of it (``W = P·w``).
-    The k rows are contiguous on the file's G axis, so a window holds the
+    The k rows are adjacent on the file's G axis (``WfnLoader.kpt_starts`` is
+    by construction the exclusive prefix sum of ``ngk``), so a window holds the
     ``k_tile`` whole rows :func:`_coefficient_window` admits (one collective
     read and write per window, not per k); each column carries its row in
     the window (``-1`` past the last), which picks its ``U``.  ``valid_shape``
@@ -1010,10 +1011,6 @@ def _write_rotated_coefficients(src, dst, *, mesh, U_kmn, band_start,
     from common.collectives import device_put_process_local
 
     nk = int(ngk.shape[0])
-    if not np.array_equal(np.asarray(kpt_starts[1:]),
-                          np.cumsum(np.asarray(ngk))[:-1]):
-        raise ValueError("wfns/coeffs k rows are not contiguous on the G axis "
-                         "(kpt_starts is not the exclusive prefix sum of ngk)")
     dst.create_dataset("wfns/coeffs",
                        shape=(nbands, nspinor, int(np.sum(ngk)), 2),
                        dtype=np.float64)
@@ -1051,10 +1048,14 @@ def _coefficient_window(mesh, *, nbands, nspinor, ngkmax, nb_active,
                         nk) -> tuple[int, int]:
     """``(k_tile, P·w)``: whole k rows per coefficient window and its G columns, from the fixed tile.
 
-    A column costs ``5·nbands·nspinor·16 B`` per rank — the read slab, the
-    active block as complex, its rotation, the output slab and the one
-    queued write — and a k row ``⌈ngkmax/P⌉`` columns plus its replicated
-    ``U`` (``nb_active²·16 B``).  When one row fits the fixed tile
+    A column costs ``max(5 nb, 3 nb + 5 nb_a)·nspinor·16 B`` per rank, ``nb``
+    the file's bands and ``nb_a`` the active ones: the read slab, the output
+    slab and the one queued write (``nb`` each) and, in
+    :func:`_qp_rotation_kernel`, the active block as complex, the loop
+    carry, one row's rotation, its selection and the real/imaginary stack
+    (``nb_a`` each); ``5 nb`` is the bound of a window that rotates no band
+    (:func:`write_complete_wfn_h5`).  A k row is ``⌈ngkmax/P⌉`` columns plus
+    its replicated ``U`` (``nb_active²·16 B``).  When one row fits the fixed tile
     (``runtime.tiles``) the window holds the most whole rows that fit
     (``k_tile``) and is ``P·⌈k_tile·ngkmax/P⌉`` wide; otherwise
     ``k_tile = 1`` and ``w`` is the most columns that fit.  The columns are
@@ -1064,7 +1065,8 @@ def _coefficient_window(mesh, *, nbands, nspinor, ngkmax, nb_active,
 
     p = int(mesh.devices.size)
     whole_k = -(-int(ngkmax) // p)
-    per_column = 5 * int(nbands) * int(nspinor) * 16
+    per_column = (max(5 * int(nbands), 3 * int(nbands) + 5 * int(nb_active))
+                  * int(nspinor) * 16)
     fit = tile_units(per_column, whole_k)
     if fit < whole_k:
         return 1, p * fit
