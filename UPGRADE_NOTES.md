@@ -5,6 +5,35 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-22 — epsmat export/projection and finite-q dipoles read per run, not per q; `--iq-list` default
+
+No number changes: every output below is bitwise identical to the per-q
+route (H2- P4, wedge and full-zone q storage, static and two-frequency
+files). The file layouts do not change.
+
+- **`gw.epsmat_cli`:** one read handle on the bundle for the whole run (V and
+  W of a q in one multi-dataset read; a library without that handler reads
+  them one at a time), one handle per BerkeleyGW file in the projection, and
+  the G lists, Coulomb rows and diagonals of every q in one serial h5py open
+  per file. H2- P4: bundle opens 9 → 1, reads 18 → 9; projection file opens
+  16 → 1, block reads 16 → 8.
+- **Projection memory line and admission.** A Godby-Needs projection reads
+  the frequencies of a q together (up to 1 GiB per rank of file blocks, plus
+  one slice copy); the memory line and `memory.admit` price them. When that
+  does not fit the device room (for example Frontier's 48.99 GB per GCD) the
+  projection reads one frequency at a time, as before.
+- **Finite-q dipoles (`psp.get_dipole_mtxels --with-finite-q`):** the full-zone
+  k are read in tiles of up to 1 GiB per process of raw band windows (plus
+  one row copy) on the device, admitted against the device room; when it
+  does not fit, one k per read, as before. H2-: process-local reads 25 → 1.
+- **`--iq-list` default** is now every stored (reduced-BZ) q; it ran to the
+  full-zone k count and raised `IndexError` on a symmetry-reduced WFN. An
+  index past the stored q refuses (`GATE dipole_finite_q_iq_list`).
+
+Nothing to change in input files. Tests: `tests/test_epsmat_batched_io.py`
+and `tests/test_finite_q_k_tiles.py` (P4 scripts),
+`tests/test_dipole_iq_list_cpu.py`.
+
 ## 2026-11-22 — epsmat export runs again; TD-aGW checkpoints commit through a record; `bse_w_exact` writes once
 
 - **`gw.epsmat_cli` (export and projection) runs again.** Since b6c73a78f
