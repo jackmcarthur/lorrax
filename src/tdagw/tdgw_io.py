@@ -351,33 +351,44 @@ def write_samples(path: str, rows: dict):
                 td[name]["data"][start:start + len(data)] = data
 
 
-#: The group under ``tdgw_data/checkpoint`` holding LORRAX's integrator carry
-#: (TDGW and tdgw-pp read the checkpoint's three datasets and ignore it).
+#: The group under ``tdgw_data/checkpoint`` that held LORRAX's integrator carry
+#: before 2026-11-22 (still read; TDGW and tdgw-pp read the checkpoint's three
+#: datasets and ignore LORRAX's groups).
 LORRAX_CHECKPOINT = "lorrax"
 
 
-#: The carry being written, renamed to :data:`LORRAX_CHECKPOINT` once complete.
-LORRAX_CHECKPOINT_STAGED = "lorrax_staged"
+#: LORRAX's carry since 2026-11-22: two fixed-shape slots under this group
+#: (``slot_0``, ``slot_1``, each ``leaf_<i>`` datasets) and the commit record.
+LORRAX_SLOTS = "lorrax_slots"
+#: The commit record: int64 ``(active slot or -1, it_next, step, tchkp as the
+#: bits of a float64)``, one 32-byte dataset written in one call.
+LORRAX_RECORD = "lorrax_record"
 
 
 def write_checkpoint(path: str, *, it_next: int, tchkp: float, lessG, carry=None):
     """TDGW checkpoint: next measurement index, state time, G^< = i rho.
 
-    ``carry`` = dict(leaves=[arrays], step=int, fingerprint=str) also
-    writes the integrator's whole carry (logical k) under
-    ``checkpoint/lorrax`` (``leaf_<i>`` datasets, attributes ``step``,
-    ``n_leaves``, ``fingerprint``, and the ``it_next`` / ``tchkp`` it goes
-    with), replacing the previous one, so a run restarted from this file
-    continues the uninterrupted one bitwise.
+    ``carry`` = dict(leaves=[arrays], step=int, fingerprint=str) also writes
+    the integrator's whole carry (logical k), so a run restarted from this
+    file continues the uninterrupted one bitwise.
 
-    Order, for a run killed part way: the carry into
-    ``checkpoint/lorrax_staged``, marked complete and flushed; the swap
-    (delete the old carry, rename the staged one), flushed; TDGW's three
-    fields last.  The carry is the commit record: :func:`read_checkpoint`
-    takes ``it_next`` and ``tchkp`` from it, so a file killed before the
-    swap resumes from the previous carry with the previous fields, and one
-    killed after it from the new carry.  The caller writes every trial's
-    measurement rows before the first checkpoint (``stages._write_chunk``).
+    Layout and order (a run killed at any point restarts from a whole carry,
+    and the file does not grow): the first carry creates two slots of the
+    carry's fixed shape (``checkpoint/lorrax_slots/slot_0`` and ``slot_1``,
+    both written, so every dataset is allocated) and the record
+    ``checkpoint/lorrax_record`` with no active slot, then flushes.  Every
+    checkpoint writes the inactive slot in place, flushes, writes the
+    32-byte record naming that slot with its ``it_next``, ``step`` and
+    ``tchkp``, and flushes again; nothing is unlinked or reallocated, so an
+    interrupted write leaves the file's metadata as it was and the active
+    slot untouched.  :func:`read_checkpoint` reads the slot the record names.
+
+    TDGW's own three fields (``it_next``, ``tchkp``, ``lessG_knn``) are
+    written after the record, one dataset after another, as before: a run
+    killed between them leaves TDGW's (and tdgw-pp's) view of the checkpoint
+    torn.  Only LORRAX's restart, which reads the record, is covered.  The
+    caller writes every trial's measurement rows before the first checkpoint
+    (``stages._write_chunk``).
     """
     import h5py
     with h5py.File(path, "a") as f:
@@ -390,60 +401,79 @@ def write_checkpoint(path: str, *, it_next: int, tchkp: float, lessG, carry=None
         f.flush()
 
 
+def _record(slot, it_next, step, tchkp):
+    return np.array([int(slot), int(it_next), int(step),
+                     int(np.float64(tchkp).view(np.int64))], dtype=np.int64)
+
+
 def _write_carry(f, c, carry, *, it_next, tchkp):
-    """Stage the carry, flush, then swap it in (see :func:`write_checkpoint`)."""
-    if LORRAX_CHECKPOINT_STAGED in c:
-        del c[LORRAX_CHECKPOINT_STAGED]
-    g = c.create_group(LORRAX_CHECKPOINT_STAGED)
-    for i, leaf in enumerate(carry["leaves"]):
-        g.create_dataset(f"leaf_{i:03d}", data=np.asarray(leaf))
-    g.attrs["n_leaves"] = len(carry["leaves"])
-    g.attrs["step"] = int(carry["step"])
-    g.attrs["fingerprint"] = carry["fingerprint"]
-    g.attrs["it_next"] = int(it_next)
-    g.attrs["tchkp"] = float(tchkp)
-    g.attrs["complete"] = True
+    """Write the inactive slot in place, flush, flip the record, flush."""
+    leaves = [np.asarray(leaf) for leaf in carry["leaves"]]
+    if LORRAX_SLOTS not in c:
+        g = c.create_group(LORRAX_SLOTS)
+        g.attrs["fingerprint"] = carry["fingerprint"]
+        g.attrs["n_leaves"] = len(leaves)
+        for s in (0, 1):
+            slot = g.create_group(f"slot_{s}")
+            for i, leaf in enumerate(leaves):
+                slot.create_dataset(f"leaf_{i:03d}", data=leaf)
+        c.create_dataset(LORRAX_RECORD, data=_record(-1, -1, 0, 0.0))
+        f.flush()
+    g, rec = c[LORRAX_SLOTS], c[LORRAX_RECORD]
+    if int(g.attrs["n_leaves"]) != len(leaves) or str(g.attrs["fingerprint"]) != carry["fingerprint"]:
+        raise ValueError(
+            f"GATE td_checkpoint_carry_layout: got: {len(leaves)} leaves, fingerprint "
+            f"{'same' if str(g.attrs['fingerprint']) == carry['fingerprint'] else 'changed'}; "
+            f"want: the file's {int(g.attrs['n_leaves'])} leaves and fingerprint; why: the "
+            f"carry slots are allocated once per file")
+    active = int(rec[0])
+    target = g[f"slot_{1 if active == 0 else 0}"]
+    for i, leaf in enumerate(leaves):
+        ds = target[f"leaf_{i:03d}"]
+        if ds.shape != leaf.shape or ds.dtype != leaf.dtype:
+            raise ValueError(
+                f"GATE td_checkpoint_carry_layout: got: leaf {i} {leaf.shape} {leaf.dtype}; "
+                f"want: the slot's {ds.shape} {ds.dtype}; why: the carry slots are "
+                f"allocated once per file, in the carry's fixed shape")
+        ds[...] = leaf
     f.flush()
-    if LORRAX_CHECKPOINT in c:
-        del c[LORRAX_CHECKPOINT]
-    c.move(LORRAX_CHECKPOINT_STAGED, LORRAX_CHECKPOINT)
+    rec[...] = _record(1 if active == 0 else 0, it_next, carry["step"], tchkp)
     f.flush()
-
-
-def _complete_carry(g) -> bool:
-    """A staged carry written to its end (its last attribute is ``complete``)."""
-    return bool(g.attrs.get("complete", False))
 
 
 def read_checkpoint(path: str) -> dict:
     """The checkpoint of a ``tdgw.h5`` (read-only): TDGW's fields and LORRAX's carry.
 
-    Returns dict(it_next, tchkp, leaves, step, fingerprint, torn); ``leaves``
-    is None when the file has no LORRAX carry (a TDGW run's file).  With a
-    carry, ``it_next`` and ``tchkp`` are the carry's own (a carry written
-    before 2026-11-22 has none and takes TDGW's fields); ``torn`` is True
-    when TDGW's ``it_next`` is not the carry's, i.e. the writer was killed
-    between the two, and the resume is the carry's.  A complete staged carry
-    whose swap did not finish is the carry.
+    Returns dict(it_next, tchkp, leaves, step, fingerprint, torn).  ``leaves``
+    is None when the file has no LORRAX carry: a TDGW run's file, or one whose
+    first carry was never committed.  With a slotted carry (written since
+    2026-11-22), ``it_next``, ``tchkp`` and ``step`` are the record's and
+    ``torn`` is True when TDGW's ``it_next`` differs from it (the writer
+    stopped before TDGW's fields); the resume is the record's.  A carry in the
+    format before (``checkpoint/lorrax``) is read as before, from TDGW's
+    fields; a checkpoint that writer had already torn (new ``it_next`` beside
+    the old carry) cannot be detected.
     """
     import h5py
     with h5py.File(path, "r") as f:
         c = f["tdgw_data/checkpoint"]
         out = dict(it_next=int(c["it_next"][()]), tchkp=float(c["tchkp"][()]),
                    leaves=None, step=None, fingerprint=None, torn=False)
-        g = None
-        if LORRAX_CHECKPOINT in c:
+        if LORRAX_RECORD in c:
+            rec = np.asarray(c[LORRAX_RECORD][()], dtype=np.int64)
+            if int(rec[0]) in (0, 1):
+                g = c[LORRAX_SLOTS]
+                slot = g[f"slot_{int(rec[0])}"]
+                out["leaves"] = [slot[f"leaf_{i:03d}"][()] for i in range(int(g.attrs["n_leaves"]))]
+                out["step"] = int(rec[2])
+                out["fingerprint"] = str(g.attrs["fingerprint"])
+                out["torn"] = int(rec[1]) != out["it_next"]
+                out["it_next"], out["tchkp"] = int(rec[1]), float(rec[3:4].view(np.float64)[0])
+        elif LORRAX_CHECKPOINT in c:
             g = c[LORRAX_CHECKPOINT]
-        elif LORRAX_CHECKPOINT_STAGED in c and _complete_carry(c[LORRAX_CHECKPOINT_STAGED]):
-            g = c[LORRAX_CHECKPOINT_STAGED]
-        if g is not None:
             out["leaves"] = [g[f"leaf_{i:03d}"][()] for i in range(int(g.attrs["n_leaves"]))]
             out["step"] = int(g.attrs["step"])
             out["fingerprint"] = str(g.attrs["fingerprint"])
-            if "it_next" in g.attrs:
-                own = int(g.attrs["it_next"])
-                out["torn"] = own != out["it_next"]
-                out["it_next"], out["tchkp"] = own, float(g.attrs["tchkp"])
     return out
 
 

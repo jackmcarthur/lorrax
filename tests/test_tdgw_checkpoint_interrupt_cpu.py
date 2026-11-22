@@ -122,6 +122,34 @@ def test_checkpoint_stopped_anywhere_reads_one_checkpoint(tmp_path, monkeypatch)
     assert seen == {10, 20}, seen
 
 
+def test_first_checkpoint_stopped_anywhere_reads_none_or_it(tmp_path):
+    """The first carry: a stop before its commit reads as no carry, never a partial one."""
+    from tdagw import tdgw_io
+    with pytest.MonkeyPatch.context() as mp:
+        probe = _StopAt(mp, None)
+        _blank(tmp_path / "count.h5")
+        start = probe.count
+        _checkpoint(tdgw_io, tmp_path / "count.h5", 10)
+        n_ops = probe.count - start
+    outcomes = set()
+    for n in range(1, n_ops + 1):
+        path = tmp_path / f"first_{n}.h5"
+        _blank(path)
+        with pytest.MonkeyPatch.context() as mp:
+            stopper = _StopAt(mp, None)
+            stopper.n = n
+            with pytest.raises(_Stop):
+                _checkpoint(tdgw_io, path, 10)
+        rec = tdgw_io.read_checkpoint(path)
+        if rec["leaves"] is None:
+            outcomes.add("none")
+            continue
+        got = _pair(rec)
+        assert len(set(got)) == 1 and got[0] == 10, (n, got)
+        outcomes.add(10)
+    assert outcomes == {"none", 10}, outcomes
+
+
 def test_write_chunk_rows_precede_the_carry(tmp_path, monkeypatch):
     """Two trials: the resumed it_next never runs past rows on disk in either file."""
     stages = pytest.importorskip("tdagw.stages")

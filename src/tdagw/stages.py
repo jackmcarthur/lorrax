@@ -15,6 +15,7 @@ import numpy as np
 
 from common import timing
 from common.collectives import process_rank
+from common.log import get_logger
 from tdagw import propagate as tp
 from tdagw import td_config, tdgw_io
 from tdagw.self_energy import (SelfEnergyModel, dense_kernel_from_tdgw_layout,
@@ -24,6 +25,8 @@ from tdagw.td_config import TdDeck
 __all__ = ["TdSystem", "load_system", "build_self_energy", "open_outputs",
            "sample_spec", "restart_fingerprint", "load_checkpoint", "propagate",
            "describe", "describe_rows", "output_files", "summarize"]
+
+log = get_logger(__name__)
 
 
 class TdSystem(NamedTuple):
@@ -366,9 +369,10 @@ def load_checkpoint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
             f"tdagw.tdgw_jax; why: a TDGW checkpoint holds the state, not the integrator's "
             f"carry (dSigma history, step controller), so the run cannot continue exactly; "
             f"fix: rerun from t0")
-    if rec["torn"] and process_rank() == 0:
-        print(f"  checkpoint {paths[0]}: TDGW's it_next is not the carry's (the writer "
-                 f"stopped between them); resuming from the carry, it_next {rec['it_next']}")
+    if rec["torn"]:
+        log.info(f"  checkpoint {paths[0]}: TDGW's it_next is not the carry record's (the "
+                 f"writer stopped between them); resuming from the record, it_next "
+                 f"{rec['it_next']}")
     want = json.loads(restart_fingerprint(deck, system, model, dt))
     got = json.loads(rec["fingerprint"])
     diff = sorted(k for k in set(want) | set(got) if want.get(k) != got.get(k))
