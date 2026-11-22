@@ -235,12 +235,31 @@ def finite_q_iq_list(requested, nk_red):
 
 
 def finite_q_k_tile(gtab, *, nb, nk, nspinor):
-    """Full-zone k per process-local read of the finite-q preparation: the most
-    whose raw band windows (``16 · nb · ns · ngkmax`` B each, on this process)
-    fit ``runtime.tiles.TILE_BYTES``, at least 1 and at most ``nk``."""
+    """Full-zone k per process-local read of the finite-q preparation.
+
+    The most k whose raw band windows (``16 · nb · ns · ngkmax`` B each, on
+    this process's device) fit ``runtime.tiles.TILE_BYTES``, at least 1 and at
+    most ``nk``, admitted against the device room: the tile holds that many
+    windows plus one sliced k row, and when that does not fit the room the
+    preparation reads one k per call (one window resident), as before
+    2026-11-22.  Every process enters (``memory.room`` agrees the room).
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    from common.gpu_utils import device_budget_bytes
+    from lxkit import memory
     from runtime import tiles
     ngkmax = int(np.asarray(gtab.at(0)[0]).shape[0])
-    return tiles.tile_units(16.0 * int(nb) * int(nspinor) * ngkmax, int(nk))
+    per_k = 16.0 * int(nb) * int(nspinor) * ngkmax
+    tile = tiles.tile_units(per_k, int(nk))
+    if tile <= 1:
+        return 1
+    device_budget_bytes()
+    routes = ((f"{tile} k per read", memory.priced((tile + 1) * per_k, "finite-q k tile: "
+                                                   "raw windows + one row slice")),
+              ("one k per read", memory.priced(per_k, "finite-q one k window")))
+    chosen = memory.admit("dipole.finite_q_k_tile", routes, memory.room(bucketed=False))
+    return tile if chosen == routes[0][0] else 1
 
 
 def compute_finite_q_mtxels(
