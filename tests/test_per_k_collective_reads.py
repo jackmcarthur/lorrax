@@ -14,8 +14,13 @@ over 9 stored k, 2 forward steps, 2 spinors) and bcc Na (27 over 4, 6 steps,
     tile (every centre: 2 reads) and a 7-centre tile (remainders) give the
     same links, singular values and attributes to 1e-12.  A grid with no
     forward step (``n_dir = 0``, a 1x1x1 grid) reads nothing and writes the
-    empty tables.
-(b) The QP-WFN rotation (``file_io.qp_wfn.write_qp_wfn_h5``): the fixed tile,
+    empty tables.  The links are written once per tile of whole centres
+    (once per centre on the per-k path), not once per edge.
+(b) Little-group band representations (``file_io.qp_wfn``): every raw
+    parent at once; identity-only groups need no read and the rest are one
+    read for the fixed tile (one per parent at a tile of one), with the same
+    representations to 1e-12.
+(c) The QP-WFN rotation (``file_io.qp_wfn.write_qp_wfn_h5``): the fixed tile,
     windows of 4 and 3 k rows (a last window with ranks that hold no
     column), one row per window, and G windows narrower than a row; the
     coefficient reads are the windows the plan makes, and the rotated
@@ -95,7 +100,12 @@ def main():
             planner, stencil = pt._link_center_tile, pt.wfn_link_stencil
 
             def links(name, plan=None, no_steps=False):
-                reads, load = [], wfn.load
+                reads, load, writes, write_slab = [], wfn.load, [], SlabIO.write_slab
+
+                def counted_write(self, dataset, *a, **kw):
+                    if dataset == pt.LINKS_DATASET:
+                        writes.append(kw.get('offset'))
+                    return write_slab(self, dataset, *a, **kw)
 
                 def counted(*a, **kw):
                     reads.append(kw.get('k'))
@@ -109,26 +119,31 @@ def main():
                     pt.wfn_link_stencil = lambda w: SimpleNamespace(
                         steps=np.zeros((0, 3), dtype=np.int32))
                 wfn.load = counted
+                SlabIO.write_slab = counted_write
                 try:
                     pt._write_link_stage(str(out), wfn=wfn, sym=sym, mesh=mesh, nbands=nb,
                                          bispinor=False, polar_plan=polar)
                 finally:
                     wfn.load = load
+                    SlabIO.write_slab = write_slab
                     pt._link_center_tile, pt.wfn_link_stencil = planner, stencil
-                return out, len(reads)
+                return out, len(reads), len(writes)
 
             tile, hold = planner(mesh, nbands=nb, nspinor=int(wfn.nspinor),
                                  file_nspinor=int(wfn.nspinor), ngkmax=int(wfn.ngkmax),
                                  n_dir=nd, n_centers=nrk)
-            per_k, reads_per_k = links('per_k', plan=(1, False))
-            fixed, reads_fixed = links('fixed')
-            seven, reads_seven = links('tile7', plan=(7, True))
-            empty, reads_empty = links('no_steps', no_steps=True)
+            per_k, reads_per_k, writes_per_k = links('per_k', plan=(1, False))
+            fixed, reads_fixed, writes_fixed = links('fixed')
+            seven, reads_seven, writes_seven = links('tile7', plan=(7, True))
+            empty, reads_empty, writes_empty = links('no_steps', no_steps=True)
         assert hold and tile == nrk, (fx, tile, hold)
         assert reads_per_k == nrk * (1 + nd), (fx, reads_per_k, nrk, nd)
         assert reads_fixed == 2, (fx, reads_fixed)
         assert reads_seven == 2 * (-(-nrk // 7)), (fx, reads_seven)
-        assert reads_empty == 0, (fx, reads_empty)
+        assert reads_empty == 0 and writes_empty == 0, (fx, reads_empty, writes_empty)
+        # One hyperslab per tile of whole centres (per centre on the per-k path).
+        assert (writes_per_k, writes_fixed, writes_seven) == (nrk, 1, -(-nrk // 7)), (
+            fx, writes_per_k, writes_fixed, writes_seven)
         barrier(f'per_k_reads.{fx}.links')
         same(per_k, fixed, f'{fx} links fixed tile')
         same(per_k, seven, f'{fx} links 7-centre tile')
@@ -136,9 +151,50 @@ def main():
             assert f[pt.SINGULAR_VALUES_DATASET].shape == (nrk, 0, nb), fx
             assert np.asarray(f.attrs['source_steps']).shape == (0, 3), fx
         report.append(f'{fx} links: centres={nrk} n_dir={nd} reads per-k={reads_per_k} '
-                      f'fixed={reads_fixed} tile7={reads_seven} no-steps={reads_empty}')
+                      f'fixed={reads_fixed} tile7={reads_seven} no-steps={reads_empty}; link writes per-k={writes_per_k} '
+                      f'fixed={writes_fixed} tile7={writes_seven}')
 
-        # (b) QP-WFN rotation
+        # (b) little-group band representations, every raw parent at once
+        with WfnLoader(path, mesh=mesh) as wfn:
+            parents = list(range(int(wfn.nkpts)))
+            window = (0, int(wfn.nbands))
+            nontrivial = [q for q in parents if len(wfn.little_group_rows(q)) > 1]
+            lg_tile = qp_wfn._little_group_tile
+
+            def groups(tile_override=None):
+                reads, load = [], wfn.load
+
+                def counted(*a, **kw):
+                    reads.append(kw.get('k'))
+                    return load(*a, **kw)
+                if tile_override is not None:
+                    qp_wfn._little_group_tile = lambda *a, **kw: tile_override
+                wfn.load = counted
+                try:
+                    reps = qp_wfn.little_group_band_representations(
+                        wfn, mesh=mesh, parents=parents, band_start=window[0],
+                        band_stop=window[1])
+                finally:
+                    wfn.load = load
+                    qp_wfn._little_group_tile = lg_tile
+                return reps, len(reads)
+
+            reps_tile, reads_lg = groups()
+            reps_one, reads_lg_one = groups(1)
+        assert reads_lg == (1 if nontrivial else 0), (fx, reads_lg, len(nontrivial))
+        assert reads_lg_one == len(nontrivial), (fx, reads_lg_one, len(nontrivial))
+        for q in parents:
+            a, b = reps_one[q], reps_tile[q]
+            assert [r for r, _, _ in a] == [r for r, _, _ in b], (fx, q)
+            for (_, Da, ua), (_, Db, ub) in zip(a, b):
+                assert ua == ub, (fx, q)
+                np.testing.assert_allclose(Db, Da, rtol=0, atol=1e-12, err_msg=f'{fx} parent {q}')
+            if q not in nontrivial:
+                np.testing.assert_array_equal(b[0][1], np.eye(window[1] - window[0]))
+        report.append(f'{fx} little groups: parents={len(parents)} non-trivial={len(nontrivial)} '
+                      f'reads tile={reads_lg} one per tile={reads_lg_one}')
+
+        # (c) QP-WFN rotation
         with WfnLoader(path, mesh=mesh) as wfn:
             nk, nbf, ns = int(wfn.nkpts), int(wfn.nbands), int(wfn.nspinor)
             ngkmax, na = int(wfn.ngkmax), b1 - b0
