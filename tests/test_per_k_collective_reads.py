@@ -63,8 +63,8 @@ def main():
         root.mkdir(parents=True, exist_ok=True)
     barrier('per_k_reads.mkdir')
     here = Path(__file__).parent / 'hsuite'
-    fixtures = (('h2m', here / 'fixture/WFN.h5', (2, 6)),
-                ('na', here / 'fixture_na/WFN.h5', (3, 9)))
+    fixtures = (('h2m', here / 'fixture/WFN.h5', (2, 6), (0, 9)),
+                ('na', here / 'fixture_na/WFN.h5', (3, 9), (0, 1)))
     report = []
 
     def same(a_path, b_path, what):
@@ -85,7 +85,7 @@ def main():
             for key in fa.attrs:
                 np.testing.assert_array_equal(fa.attrs[key], fb.attrs[key], err_msg=f'{what} {key}')
 
-    for fx, path, (b0, b1) in fixtures:
+    for fx, path, (b0, b1), window in fixtures:
         # (a) links
         with WfnLoader(path, mesh=mesh) as wfn:
             sym = wfn.symmetry()
@@ -157,7 +157,6 @@ def main():
         # (b) little-group band representations, every raw parent at once
         with WfnLoader(path, mesh=mesh) as wfn:
             parents = list(range(int(wfn.nkpts)))
-            window = (0, int(wfn.nbands))
             nontrivial = [q for q in parents if len(wfn.little_group_rows(q)) > 1]
             lg_tile = qp_wfn._little_group_tile
 
