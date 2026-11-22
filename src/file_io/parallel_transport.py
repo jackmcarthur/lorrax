@@ -473,19 +473,24 @@ def _link_center_tile(mesh, *, nbands: int, nspinor: int, file_nspinor: int,
     Per rank, a one-k sphere on the loader's band-sharded layout is
     ``s = 16 nb_pad ns ngkmax / P`` bytes (``s_f`` at the file's spinor
     count).  A tile of ``T`` centres holds its ``T`` centre spheres and the
-    union of their forward neighbours, at most ``n_dir T``; while the loader
-    reads that union it also holds, per row, the raw parent window
-    (``s_f``), the two-component unfold before a bispinor lift (``s_f``) and
-    the replicated nonsymmorphic phase row (``16 ngkmax``, not divided by
-    ``P``).  Beside the tile the stage keeps one centre on its ``x`` face
-    and one gathered neighbour (``2 s``), and the tile's solved links wait
-    for their one hyperslab write (``16 nb_pad^2 / P`` per edge).  So a
-    centre costs ``s + n_dir (s + s_f [+ s_f] + 16 ngkmax + 16 nb_pad^2 / P)``
-    and the tile is the most
-    centres that fit ``TILE_BYTES - 2 s``.  ``hold`` is False when not even
-    one centre fits: the stage then holds one centre and reads its
-    neighbours one at a time, the pre-tile pattern (two spheres).  Shapes
-    only: every rank computes the same plan.
+    union of their forward neighbours, at most ``n_dir T``, and its solved
+    links until their one hyperslab write (``l = 16 nb_pad^2 / P`` per
+    edge).  Two phases bound the stage (measured per rank on KNiF3, 840
+    bands, P4):
+
+    * the union read: the loader holds three copies of each row it reads
+      (raw parent window, unfold input, output; ``s + 2 s_f``, plus ``s_f``
+      for a bispinor lift) and its replicated phase row (``16 ngkmax``), so
+      a centre costs ``s + n_dir (s + 2 s_f [+ s_f] + 16 ngkmax + l)``;
+    * the overlaps: the tile, the links and one edge's working set
+      (``6 s``: the x-face centre, the gathered and masked neighbour, the
+      contraction), so a centre costs ``(1 + n_dir) s + n_dir l``.
+
+    The tile is the most centres that fit ``TILE_BYTES`` in both phases.
+    ``hold`` is False when not even one centre fits: the stage then holds
+    one centre and reads its neighbours one at a time, the pre-tile pattern
+    (its measured peak, about ``8.4 s``, is the edge working set and two
+    held spheres).  Shapes only: every rank computes the same plan.
     """
     from runtime.tiles import TILE_BYTES
     p = int(mesh.size)
@@ -494,8 +499,11 @@ def _link_center_tile(mesh, *, nbands: int, nspinor: int, file_nspinor: int,
     s_f = 16.0 * nb_pad * int(file_nspinor) * int(ngkmax) / p
     lift = s_f if int(nspinor) != int(file_nspinor) else 0.0
     links = 16.0 * nb_pad * nb_pad / p
-    per_centre = s + int(n_dir) * (s + s_f + lift + 16.0 * int(ngkmax) + links)
-    fit = int((float(TILE_BYTES) - 2.0 * s) // per_centre)
+    nd = int(n_dir)
+    read = s + nd * (s + 2.0 * s_f + lift + 16.0 * int(ngkmax) + links)
+    work = (1 + nd) * s + nd * links
+    fit = int(min(float(TILE_BYTES) // read,
+                  (float(TILE_BYTES) - 6.0 * s) // work))
     if fit < 1:
         return 1, False
     return min(fit, max(1, int(n_centers))), True
