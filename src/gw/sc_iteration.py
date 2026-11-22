@@ -856,11 +856,13 @@ def _project_on_little_groups(inputs, H_loop, ks):
         parents = np.asarray(sym.irr_idx_k, dtype=np.int32)[rows]
     frame = np.asarray(sym.sym_idx_k, dtype=np.int32)[rows] >= n_spatial
     b0, b1 = (int(v) for v in inputs.band_slices.sigma_range)
-    reps, out, moved = {}, H_loop.copy(), 0.0
+    out, moved = H_loop.copy(), 0.0
+    # Every distinct parent at once: identity-only groups need no read, the
+    # rest are read in tiles (one collective read per tile, not per parent).
+    reps = little_group_band_representations(
+        inputs.wfn, mesh=inputs.mesh_xy, parents=parents.tolist(),
+        band_start=b0, band_stop=b1)
     for i, (p, conj_frame) in enumerate(zip(parents.tolist(), frame.tolist())):
-        if p not in reps:
-            reps[p] = little_group_band_representations(
-                inputs.wfn, mesh=inputs.mesh_xy, parent=p, band_start=b0, band_stop=b1)
         group = reps[p]
         if len(group) == 1:
             continue
