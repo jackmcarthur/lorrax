@@ -1395,18 +1395,61 @@ def import_zeta_face(Z, slots, phase, anti, *, mesh, n, n_pad):
     return jnp.conj(Zf) if anti else Zf
 
 
-def projection_price(mu_pad, n_pad, ranks):
+def projection_price(mu_pad, n_pad, ranks, n_blocks=1):
     """Per-rank device bytes of one stored q of the projection (``lxkit.memory.Price``).
 
     Resident: V, W_c, V + W_c, B and K (five μ faces, 16 μ_pad²/P each), the
-    file block (16 n_pad²/P) and ζ̃ on the eps G list with its phased copy
-    (2 × 16 μ_pad n_pad/P); fixed: the two live SUMMA panels
-    (``PANEL_BYTES`` each).  Theory §8.
+    ``n_blocks`` file blocks of one read (:func:`frequency_tile`, 16 n_pad²/P
+    each) and ζ̃ on the eps G list with its phased copy (2 × 16 μ_pad n_pad/P);
+    fixed: the two live SUMMA panels (``PANEL_BYTES`` each).  Theory §8.
     """
     from lxkit import memory
-    spread = 5 * 16.0 * mu_pad ** 2 + 16.0 * n_pad ** 2 + 2 * 16.0 * mu_pad * n_pad
+    spread = (5 * 16.0 * mu_pad ** 2 + int(n_blocks) * 16.0 * n_pad ** 2
+              + 2 * 16.0 * mu_pad * n_pad)
     return memory.priced(2.0 * PANEL_BYTES, "epsmat projection: two SUMMA panels",
                          spread=spread, ranks=int(ranks))
+
+
+def frequency_tile(n_pad, ranks, n_freq):
+    """Frequency blocks of one stored q read together: the most whose per-rank
+    bytes (16 n_pad²/P each, the (Re, Im) float64 block) fit
+    ``runtime.tiles.TILE_BYTES``, at least 1 and at most ``n_freq``."""
+    from runtime import tiles
+    return tiles.tile_units(16.0 * float(n_pad) ** 2 / max(int(ranks), 1), int(n_freq))
+
+
+@contextlib.contextmanager
+def _bgw_readers(files, heads, mesh):
+    """One SlabIO read handle per BerkeleyGW file present, for the whole q loop."""
+    from file_io.slab_io import SlabIO
+    with contextlib.ExitStack() as stack:
+        yield {name: stack.enter_context(SlabIO(files[name], mode="r", mesh=mesh))
+               for name in heads}
+
+
+def _frequency_blocks(rd, iq_file, freqs, n_pad, f_tile, mesh):
+    """``(frequency, block)`` of one file q, ``f_tile`` frequencies per read.
+
+    BerkeleyGW's ω axis is contiguous in ``mats/matrix``
+    ``(nq, 1, nfreq, n, n, 2)`` and ``freqs`` are its rows 0, 1, …, so
+    ``f_tile`` consecutive rows are one hyperslab; each block is the
+    ``(1, 1, 1, n_pad, n_pad, 2)`` slice :func:`bgw_epsmat.matrix_block_window`
+    names.  Only one read's blocks are resident at a time.
+    """
+    from file_io import bgw_epsmat as be
+    spec = P(None, None, None, "x", "y", None)
+    if [fr.ifreq for fr in freqs] != list(range(len(freqs))):
+        raise ValueError(f"GATE epsmat_project_freq_rows: got rows {[fr.ifreq for fr in freqs]}; "
+                         "want 0, 1, ...; why: the read takes consecutive ω rows")
+    for f0 in range(0, len(freqs), int(f_tile)):
+        chunk = freqs[f0:f0 + int(f_tile)]
+        offset, shape = be.matrix_block_window(iq_file, chunk[0].ifreq, n_pad)
+        shape = shape[:2] + (len(chunk),) + shape[3:]
+        blks = rd.read_slab(be.MATRIX, shape=shape, dtype=np.float64, offset=offset,
+                            mesh=mesh, partition_spec=spec)
+        for j, fr in enumerate(chunk):
+            yield fr, (blks if len(chunk) == 1 else blks[:, :, j:j + 1])
+        del blks
 
 
 def bgw_file_fingerprint(path, head):
@@ -1513,17 +1556,20 @@ def _run_epsmat_projection(cfg, mesh, src):
 
     p = _square_side(mesh)
     n_max = max(int(heads[r.name]["nmtx"][r.iq_file]) for r in plan)
+    ranks = int(mesh.devices.size)
+    f_tile = frequency_tile(_pad_to(n_max, p * p), ranks, len(freqs))
     device_budget_bytes()
-    price = projection_price(src.mu_pad, _pad_to(n_max, p * p), int(mesh.devices.size))
+    price = projection_price(src.mu_pad, _pad_to(n_max, p * p), ranks, n_blocks=f_tile)
     memory.admit("epsmat.project", (("faces", price),), memory.room(bucketed=False))
     log.info(f"  memory      {price.bytes() / 2**30:.3f} GiB per device per q "
-             f"(nmtx_max {n_max}, μ carrier {src.mu_pad}; {price.describe()})")
+             f"(nmtx_max {n_max}, μ carrier {src.mu_pad}, {f_tile} of {len(freqs)} "
+             f"frequency blocks per read; {price.describe()})")
 
     with h5py.File(files["eps0mat"], "r") as f:
         heads_bgw = [complex(f[be.MATRIX][0, 0, fr.ifreq, 0, 0, 0],
                              f[be.MATRIX][0, 0, fr.ifreq, 0, 0, 1]) for fr in freqs]
     figs = []
-    with SlabIO(target, mode="a", mesh=mesh) as io:
+    with SlabIO(target, mode="a", mesh=mesh) as io, _bgw_readers(files, heads, mesh) as readers:
         # Register (W0) or create (Wp, or W0 of a bundle without screening):
         # the parallel tier writes only datasets its handle created.
         for fr in freqs:
@@ -1559,11 +1605,8 @@ def _run_epsmat_projection(cfg, mesh, src):
                         "q_file": np.round(q_file, 6).tolist(), "g0": np.asarray(row.g0).tolist(),
                         "sym_row": int(row.sym_row), "antiunitary": anti, "nmtx": n,
                         "err_v": basis["err_v"]}
-            for fr in freqs:
-                offset, shape = be.matrix_block_window(row.iq_file, fr.ifreq, n_pad)
-                with SlabIO(files[row.name], mode="r", mesh=mesh) as rd:
-                    blk = rd.read_slab(be.MATRIX, shape=shape, dtype=np.float64, offset=offset,
-                                       mesh=mesh, partition_spec=P(None, None, None, "x", "y", None))
+            for fr, blk in _frequency_blocks(readers[row.name], row.iq_file, freqs, n_pad,
+                                             f_tile, mesh):
                 Wc = project_block(blk, Zf, v_eps, mesh=mesh, n_valid=n, drop_head=is_g)
                 del blk
                 if anti:
