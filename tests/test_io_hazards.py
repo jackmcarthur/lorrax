@@ -19,6 +19,8 @@ dipole, gnppm: a bundle with a ready ``W0_qmunu``) is built once, then:
     stored q reached without a symmetry image (``rel_Wc_bgw_vs_lorrax`` ≤ 1e-10).
 (d) ``bse.bse_w_exact`` (column mode) opens its output for writing on one
     rank only; before, every rank truncated and wrote the same path.
+(e) the same with the output in an unwritable directory: rank 0's failure
+    reaches every rank (``rank0_transaction``), and all raise within 2 min.
 """
 
 
@@ -122,9 +124,35 @@ def main():
     assert sum(len(w) for w in writers) == 1, f"w_exact output opened for writing per rank: {writers}"
     with h5py.File(out, "r") as f:
         assert f["Wc"].shape[0] == 2
+
+    # (e) rank 0's write fails (an unwritable directory): every rank raises
+    # promptly instead of waiting at a barrier (BARRIER_TIMEOUT_S = 1800 s).
+    import time
+    ro = root / "readonly"
+    if rank == 0:
+        ro.mkdir(exist_ok=True)
+        os.chmod(ro, 0o555)
+    barrier("io_hazards.ro")
+    t0, failed = time.monotonic(), None
+    try:
+        os.chdir(run)
+        bse_w_exact.main(["-i", "gnppm.in", "--n-val", "3", "--n-cond", "2",
+                          "--n-cols", "2", "--out", str(ro / "w_exact.h5")])
+    except Exception as exc:                                     # noqa: BLE001
+        failed = f"{type(exc).__name__}: {str(exc)[:120]}"
+    finally:
+        os.chdir(cwd)
+    wall = time.monotonic() - t0
+    outcomes = rank_session.exchange([failed, wall])
+    assert all(o[0] is not None for o in outcomes), outcomes
+    assert max(o[1] for o in outcomes) < 120.0, outcomes
+    if rank == 0:
+        os.chmod(ro, 0o755)
     print(f"IO_HAZARDS PASS rank={rank} export worst identity "
           f"{max(q['projection_err'] for n in rx for q in rx[n]['q']):.1e}; "
-          f"projection direct rows {max(direct):.1e}; w_exact writers {writers}", flush=True)
+          f"projection direct rows {max(direct):.1e}; w_exact writers {writers}; "
+          f"unwritable output: every rank raised within {max(o[1] for o in outcomes):.1f} s "
+          f"({outcomes[0][0]})", flush=True)
     barrier("io_hazards.done")
     if rank == 0:
         shutil.rmtree(root, ignore_errors=True)

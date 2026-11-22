@@ -67,8 +67,8 @@ from .bse_ring_comm import (
     make_bse_shardings,
 )
 from .bse_preconditioner import compute_pair_amplitude
-from common.collectives import (barrier, device_put_process_local, gather_to_host,
-                                process_rank)
+from common.collectives import (device_put_process_local, gather_to_host,
+                                rank0_transaction)
 from common import rank_criterion
 import common.timing as timing
 from common.log import get_logger
@@ -1734,8 +1734,10 @@ def main(argv=None) -> None:
         resids = gather_to_host(resids)[:len(cols)]
         gm_iters = gather_to_host(gm_iters)[:len(cols)]
         # Every rank holds the gathered columns; one process writes the file
-        # (several truncating writers of one path race), the others wait.
-        if process_rank() == 0:
+        # (several truncating writers of one path race).  rank0_transaction
+        # hands rank 0's verdict to every rank, so a failed write raises on
+        # all of them at once instead of leaving them at a barrier.
+        def _write():
             with h5py.File(args.out, "w") as h5:
                 h5.attrs["omega_ev"] = float(args.omega_ev)
                 h5.attrs["eta_ev"] = float(args.eta_ev)
@@ -1747,7 +1749,7 @@ def main(argv=None) -> None:
                 h5.create_dataset("gmres_resid", data=resids)
                 h5.create_dataset("gmres_iters", data=gm_iters.astype(np.int32))
                 h5.create_dataset("Wc", data=wc)
-        barrier("bse_w_exact.out_written")
+        rank0_transaction(args.out, stage="bse_w_exact.out", write=_write)
         log.info(f"Wrote {len(cols)} Wc columns (max gmres_resid={resids.max():.2e}, "
                  f"max gmres_it={int(gm_iters.max())}/{args.gmres_max_iter}) "
                  f"to {args.out}")
