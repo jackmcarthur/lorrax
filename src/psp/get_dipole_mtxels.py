@@ -218,6 +218,22 @@ def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
     return rho_mn, v_sym, alpha_mn
 
 
+def finite_q_iq_list(requested, nk_red):
+    """The finite-q q indices: ``requested``, or every stored q ``0 .. nk_red - 1``.
+
+    The indices are reduced-BZ (stored) rows, the columns of ``sym.kq_map``;
+    an index past them refuses by name (the default once ran to the full-zone
+    count and raised IndexError on a symmetry-reduced WFN).
+    """
+    iq = list(range(int(nk_red))) if requested is None else [int(i) for i in requested]
+    bad = [i for i in iq if not 0 <= i < int(nk_red)]
+    if bad:
+        raise ValueError(f"GATE dipole_finite_q_iq_list: got: --iq-list {bad}; want: stored q "
+                         f"indices 0..{int(nk_red) - 1}; why: q runs over the WFN's stored "
+                         f"(reduced-BZ) k; fix: drop them")
+    return iq
+
+
 def finite_q_k_tile(gtab, *, nb, nk, nspinor):
     """Full-zone k per process-local read of the finite-q preparation: the most
     whose raw band windows (``16 · nb · ns · ngkmax`` B each, on this process)
@@ -865,7 +881,8 @@ def build_parser() -> argparse.ArgumentParser:
 		type=int,
 		nargs='+',
 		default=None,
-		help="Reduced-BZ q-indices for --with-finite-q (default: all 0..nk-1).",
+		help="Reduced-BZ q-indices for --with-finite-q (default: every stored q, "
+		     "0..nk_red-1).",
 	)
 	return parser
 
@@ -1515,7 +1532,8 @@ def main(argv=None):
 		if args.with_finite_q:
 			stages.begin(2, "Finite-q matrix elements", name="dipole.finite_q")
 			log.info("\nComputing finite-q matrix elements (SOS pipeline)...")
-			iq_list = args.iq_list if args.iq_list is not None else list(range(int(sym.nk_tot)))
+			# The stored (reduced-BZ) q: sym.kq_map has one column per stored k.
+			iq_list = finite_q_iq_list(args.iq_list, int(sym.nk_red))
 			with timing.section("finite_q"):
 				(rho_cvkq, v_cvkq, alpha_cvkq, ward_residual_cvkq,
 				 kminq_idx_kq, n_occ_eff, v_lo, c_hi) = compute_finite_q_mtxels(
