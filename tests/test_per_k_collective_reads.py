@@ -149,7 +149,7 @@ def main():
         same(per_k, seven, f'{fx} links 7-centre tile')
         with h5py.File(empty, 'r') as f:
             assert f[pt.SINGULAR_VALUES_DATASET].shape == (nrk, 0, nb), fx
-            assert np.asarray(f.attrs['source_steps']).shape == (0, 3), fx
+            assert f['source_steps'].shape == (0, 3), fx
         report.append(f'{fx} links: centres={nrk} n_dir={nd} reads per-k={reads_per_k} '
                       f'fixed={reads_fixed} tile7={reads_seven} no-steps={reads_empty}; link writes per-k={writes_per_k} '
                       f'fixed={writes_fixed} tile7={writes_seven}')
