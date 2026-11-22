@@ -414,12 +414,32 @@ def sketch_from_faces(Y, psi_r, psi_l, mesh: Mesh, *, n_rows: int, sqrt_w,
     return exe(*args)
 
 
-def _face_bytes_per_k(mesh: Mesh, *, ns: int, m_pad: int, left, right) -> float:
-    """Per-rank bytes of one k row of the batch's candidate faces (``faces='cand'``)."""
+def _batch_bytes_per_k(mesh: Mesh, *, ns: int, m_pad: int, left, right,
+                       ngkmax: int) -> float:
+    """Per-rank bytes one k row of a batch keeps live: its faces and its share of the loader's transfer tile.
+
+    Faces (``faces='cand'``): ``16 ns M_pad nb_faces / P``.  Transfer: the
+    batch is one k tile of the loader (``common.wfn_transforms``
+    ``_centroid_resident_bytes``), so every row of it holds, for one band
+    tile ``b`` at a time, its G-flat rows and the raw parent window
+    (``2 16 ns ngkmax b / P``), the replicated phase row (``16 ngkmax``),
+    the band-sharded centroid samples and their face
+    (``2 16 ns M_pad b / P``).  A batch sized on the faces alone moved all
+    its G-flat rows unpriced (a one-batch sketch: every k at once).
+    """
+    from runtime.padding import padded_axis
+    p = int(mesh.size)
     nb_faces = candidate_band_carrier(right[1] - right[0], mesh, 64) + (
         0 if left_band_slice(left, right) is not None
         else candidate_band_carrier(left[1] - left[0], mesh, 64))
-    return float(_C128 * ns * m_pad * nb_faces) / int(mesh.size)
+    widths = [right[1] - right[0]] + (
+        [] if left_band_slice(left, right) is not None else [left[1] - left[0]])
+    band_tile = max(padded_axis(min(int(w), 64), p, name="candidate WFN band tile").carrier
+                    for w in widths)
+    faces = float(_C128 * ns * m_pad * nb_faces) / p
+    transfer = (float(_C128 * ns * band_tile) * 2.0 * (int(ngkmax) + int(m_pad)) / p
+                + float(_C128 * int(ngkmax)))
+    return faces + transfer
 
 
 def build_sketch_q0_via_loadwfns(
@@ -483,7 +503,8 @@ def build_sketch_q0_via_loadwfns(
     M = int(np.asarray(cand_idx).shape[0])
     m_pad = padded_mu_extent(M, mesh_xy)
     ns = 4 if bispinor else int(wfn.nspinor)
-    per_k = _face_bytes_per_k(mesh_xy, ns=ns, m_pad=m_pad, left=left, right=right)
+    per_k = _batch_bytes_per_k(mesh_xy, ns=ns, m_pad=m_pad, left=left, right=right,
+                               ngkmax=int(wfn.ngkmax))
     rows_sel, weights, nk, _, k_batch, n_chunks = candidate_k_schedule(
         wfn, sym, k_weights, per_k)
     n_v = len(sketch_vertices(gamma_mode))
@@ -922,7 +943,7 @@ def _memory_proposal(mesh: Mesh, *, n_rows_pad: int, m_pad: int, ns: int,
     xla = max((build, select, deflate), key=lambda t: t[0] / ranks + t[1])
     return memory.Price(
         operands=memory.Term(0.0, float(faces_per_rank * ranks + _C128 * n_rows_pad * m_pad),
-                             "sketch 16 R M/P and one k batch's WFN face"),
+                             "sketch 16 R M/P and one k batch's WFN faces and transfer tile"),
         xla=memory.Term(float(xla[1]), float(xla[0]),
                         "sketch build tile / select block / deflation (closed form)"),
         ranks=ranks, label="kmeans candidate sketch (proposal)")
@@ -1025,7 +1046,8 @@ def prune_candidates_by_sketch(
     from common.gpu_utils import device_budget_bytes
     m_pad = padded_mu_extent(M, mesh)
     ns = 4 if bispinor else int(wfn.nspinor)
-    per_k = _face_bytes_per_k(mesh, ns=ns, m_pad=m_pad, left=left, right=right)
+    per_k = _batch_bytes_per_k(mesh, ns=ns, m_pad=m_pad, left=left, right=right,
+                               ngkmax=int(wfn.ngkmax))
     k_batch = candidate_k_schedule(wfn, sym, k_weights, per_k)[4]
     m_b = n_slots * s_max
     proposal = _memory_proposal(mesh, n_rows_pad=n_rows_pad, m_pad=m_pad, ns=ns,
