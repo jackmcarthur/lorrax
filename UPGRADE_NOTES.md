@@ -8,7 +8,7 @@ The binding rulings behind breaking changes are in
 ## 2026-11-22 — epsmat export/projection and finite-q dipoles read per run, not per q; `--iq-list` default
 
 No number changes: every output below is bitwise identical to the per-q
-route (H2- P4, wedge and full-zone q storage, static and two-frequency
+route (H2- P4, wedge q storage, static and two-frequency
 files). The file layouts do not change.
 
 - **`gw.epsmat_cli`:** one read handle on the bundle for the whole run (V and
