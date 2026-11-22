@@ -189,12 +189,18 @@ def main():
         "export bundle reads": (n(c_es, "read_slab", bundle) + n(c_es, "read_multi", bundle),
                                 n(c_eb, "read_slab", bundle) + n(c_eb, "read_multi", bundle)),
         "project bundle opens": (n(c_ps, "slabio_open", bundle), n(c_pb, "slabio_open", bundle)),
+        "project epsmat.h5 SlabIO opens": (n(c_ps, "slabio_open", "epsmat.h5"),  # [14]
+                                           n(c_pb, "slabio_open", "epsmat.h5")),  # [14]
+        "project epsmat.h5 matrix reads": (n(c_ps, "read_slab", "epsmat.h5"),  # [14]
+                                           n(c_pb, "read_slab", "epsmat.h5")),  # [14]
     }
     print(f"EPSMAT_BATCHED rank={rank} calls (per-q, batched): {report}", flush=True)
     rows_eps = nq_store - 1
     assert report["export bundle opens"][1] == 1, report
     # The projection also opens its output, a copy of the bundle with the same name.
     assert report["project bundle opens"][1] == 2, report
+    assert report["project epsmat.h5 SlabIO opens"][1] == 1, report  # [14]
+    assert report["project epsmat.h5 matrix reads"] == (2 * rows_eps, rows_eps), report  # [14]
     for key, (s, b) in report.items():
         assert b < s, (key, report)
     print(f"EPSMAT_BATCHED PASS rank={rank} {n_cmp} datasets bitwise equal; "
