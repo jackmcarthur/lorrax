@@ -560,12 +560,9 @@ def open_export_source(cfg, mesh, *, print_fn=None, require_w0=True):
             _refuse("epsmat_requires_w0", f"{bundle} without a ready W0_qmunu",
                     "a GW bundle with persisted static W", "ε⁻¹ is built from W(0)",
                     "rerun the producer with write_restart_tensors = true")
-    if w0_ready:
-        # epsmat.h5 is BerkeleyGW's RPA epsilon: only an RPA-series W0 may be
-        # written into it, and the log says which W Sigma used (a w_bse run
-        # stores its RPA rung, not its ladder W).
-        from file_io.restart_bundle import require_w0_series
-        require_w0_series(bundle, "w_rpa", consumer="the epsmat export (an RPA epsilon)")
+        # V, the stored q set and the heads are read with or without W0 (the
+        # projection reads V and ζ only), and inside this block: the handle
+        # closes at its end.
         storage = str(f["V_qmunu"].attrs.get("q_storage", "full"))
         q_stored = (np.asarray(f["V_qmunu__qirr/q_irr_frac"][()]) if storage == "ibz"
                     else bgw_integer_q_to_fractional(
@@ -585,6 +582,12 @@ def open_export_source(cfg, mesh, *, print_fn=None, require_w0=True):
             _refuse("epsmat_q_storage", "V on the wedge and W0 on the full zone",
                     "one stored q set", "V and W rows are read pairwise",
                     "regenerate the bundle")
+    if w0_ready:
+        # epsmat.h5 is BerkeleyGW's RPA epsilon: only an RPA-series W0 may be
+        # written into it, and the log says which W Sigma used (a w_bse run
+        # stores its RPA rung, not its ladder W).
+        from file_io.restart_bundle import require_w0_series
+        require_w0_series(bundle, "w_rpa", consumer="the epsmat export (an RPA epsilon)")
     zl = ZetaLoader(zeta_path, mesh=mesh)
     if int(zl.n_q_on_disk) != q_stored.shape[0] or int(zl.n_rmu) != n_mu:
         _refuse("epsmat_zeta_bundle_pair", f"ζ (q {zl.n_q_on_disk}, μ {zl.n_rmu})",
