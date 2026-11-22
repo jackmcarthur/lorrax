@@ -18,6 +18,13 @@ must be equal bit for bit, and the batched run must make fewer calls:
 (15) ``bgw_epsmat`` G lists, Coulomb rows and diagonals: one serial h5py open
      per file for all q (``read_q_gspaces``, ``write_q_gspaces``,
      ``write_q_diagonals``); before, one open per q.
+
+Datasets and attributes are compared, on the wedge (IBZ) bundle and on a
+full-zone one (``restart_q_storage = full``), for the export with and
+without a reference, the static and the two-frequency projection, a
+projection from a bundle whose W0 is not ready, and an export through a
+library without the multi-read handler (``read_q_rows`` falls back to one
+read per dataset).  ``--keep`` keeps the run root for a later step.
 """
 
 
@@ -105,13 +112,19 @@ def main():
                 if name.startswith("read") else
                 (lambda b: lambda path, items: [b(path, [it]) for it in items])(batch))
 
-    def run_cli(tag, route, **kw):
+    def n(c, *key):
+        return sum(v for k, v in c.items() if k[:len(key)] == key)
+    nq_store_ = 9
+
+    def run_cli(tag, route, source=None, parent=None, **kw):
         out = root / tag
+        source = run if source is None else source
+        parent = run / "gnppm.in" if parent is None else parent
         if rank == 0:
             out.mkdir(parents=True, exist_ok=True)
             (root / f"{tag}.in").write_text(
-                "[epsmat]\n" + f"output_dir = {out}\nsource_restart = {run}\n"
-                f"parent_input_file = {run / 'gnppm.in'}\n"
+                "[epsmat]\n" + f"output_dir = {out}\nsource_restart = {source}\n"
+                f"parent_input_file = {parent}\n"
                 + "".join(f"{k} = {v}\n" for k, v in kw.items()))
         barrier(f"epsmat_batched.{tag}")
         saved = {key: getattr(*key) for key in per_q} if route == "per_q" else {}
@@ -126,15 +139,27 @@ def main():
         return out, calls - before
 
     def members(path):
+        """Every dataset's value and every attribute of the file (``name@attr``)."""
         got = {}
+
+        def visit(k, o):
+            if isinstance(o, h5py.Dataset):
+                got[k] = o[()]
+            for a, v in o.attrs.items():
+                got[f"{k}@{a}"] = v
         with orig["h5py.File"](path, "r") as f:
-            f.visititems(lambda k, o: got.__setitem__(k, o[()]) if isinstance(o, h5py.Dataset) else None)
+            for a, v in f.attrs.items():
+                got[f"/@{a}"] = v
+            f.visititems(visit)
         return got
 
     def same(a, b, keys=None):
         A, B = members(a), members(b)
-        keys = sorted(A) if keys is None else keys
-        assert sorted(A) == sorted(B) or keys is not None, (a, set(A) ^ set(B))
+        if keys is None:
+            assert sorted(A) == sorted(B), (a, set(A) ^ set(B))
+            keys = sorted(A)
+        else:
+            keys = [k for k in sorted(A) if k.split("@")[0] in keys]
         bad = [k for k in keys if not np.array_equal(np.asarray(A[k]), np.asarray(B[k]))]
         assert not bad, f"{a.name}: {bad} differ between the per-q and the batched run"
         return len(keys)
@@ -150,9 +175,9 @@ def main():
     gn = root / "gn"
     if rank == 0:
         gn.mkdir(parents=True, exist_ok=True)
-        for n in ("eps0mat", "epsmat"):
-            with orig["h5py.File"](ref / f"{n}.h5", "r") as f, \
-                    orig["h5py.File"](gn / f"{n}.h5", "w") as g:
+        for fname in ("eps0mat", "epsmat"):
+            with orig["h5py.File"](ref / f"{fname}.h5", "r") as f, \
+                    orig["h5py.File"](gn / f"{fname}.h5", "w") as g:
                 for k in f:
                     if k != "mats":
                         f.copy(k, g)
@@ -172,6 +197,103 @@ def main():
     pro_b, c_pb = run_cli("pro_b", "batched", mode="project", bgw_reference=gn)
     bundle = next((run / "tmp").glob("isdf_tensors_*.h5")).name
     n_cmp += same(pro_s / "tmp" / bundle, pro_b / "tmp" / bundle,
+                  keys=["W0_qmunu", "Wp_qmunu", "bgw_epsinv_head"])
+    pkeys = ["W0_qmunu", "bgw_epsinv_head"]
+
+    # Static only: an export without a reference, and a projection of the
+    # static files (one frequency: main's reads exactly).
+    s0, _ = run_cli("exn_s", "per_q", mode="export", files="eps0mat epsmat")
+    b0, _ = run_cli("exn_b", "batched", mode="export", files="eps0mat epsmat")
+    n_cmp += sum(same(s0 / f"{n}.h5", b0 / f"{n}.h5") for n in ("eps0mat", "epsmat"))
+    s0, _ = run_cli("pr0_s", "per_q", mode="project", bgw_reference=ref)
+    b0, _ = run_cli("pr0_b", "batched", mode="project", bgw_reference=ref)
+    n_cmp += same(s0 / "tmp" / bundle, b0 / "tmp" / bundle, keys=pkeys)
+
+    # A library without the multi-read handler: the held handle reads each dataset.
+    def no_multi(self, *a, **kw):
+        raise RuntimeError("GATE slab_io_read_multi: got: (test) no handler")
+    slab_io.SlabIO.read_multi = no_multi
+    try:
+        nm, _ = run_cli("exp_nomulti", "batched", mode="export", files="eps0mat epsmat",
+                        bgw_reference=ref)
+    finally:
+        slab_io.SlabIO.read_multi = counted("read_multi")
+    n_cmp += sum(same(exp_s / f"{n}.h5", nm / f"{n}.h5") for n in ("eps0mat", "epsmat"))
+    # The same route by its test-only switch (gw.epsmat_export.MULTI_READ).
+    ee.MULTI_READ = False
+    try:
+        nm, c_nm = run_cli("exp_switch", "batched", mode="export", files="eps0mat epsmat",
+                           bgw_reference=ref)
+    finally:
+        ee.MULTI_READ = True
+    assert n(c_nm, "read_multi", bundle) == 0 and n(c_nm, "read_slab", bundle) == 18, c_nm
+    n_cmp += sum(same(exp_s / f"{n_}.h5", nm / f"{n_}.h5") for n_ in ("eps0mat", "epsmat"))
+
+    # A small device budget (Frontier's MI250X gives 48.99 GB per GCD, not 80): the
+    # projection's admission is handed exactly the one-frequency price as its room,
+    # so the two-frequency read does not fit and the projection reads one frequency
+    # at a time instead of refusing; the result is the same.
+    from lxkit import memory as lxmem
+    orig_admit = lxmem.admit
+
+    def tight_admit(stage, routes, room_bytes, **kw):
+        if stage == "epsmat.project":
+            room_bytes = min(p.bytes() for _, p, *_ in routes)
+        return orig_admit(stage, routes, room_bytes, **kw)
+    lxmem.admit = tight_admit
+    try:
+        tight, c_t = run_cli("pro_tight", "batched", mode="project", bgw_reference=gn)
+    finally:
+        lxmem.admit = orig_admit
+    assert n(c_t, "read_slab", "epsmat.h5") == 2 * (nq_store_ - 1), c_t
+    n_cmp += same(pro_s / "tmp" / bundle, tight / "tmp" / bundle,
+                  keys=["W0_qmunu", "Wp_qmunu", "bgw_epsinv_head"])
+
+    # A bundle whose W0 is not ready: the projection writes W0 from BerkeleyGW alone.
+    cp = root / "now0"
+    if rank == 0:
+        (cp / "tmp").mkdir(parents=True, exist_ok=True)
+        for f in (run / "tmp").iterdir():
+            if f.name.startswith("isdf_tensors_") or f.name == "zeta_q.h5":
+                shutil.copy2(f, cp / "tmp" / f.name)
+        with orig["h5py.File"](cp / "tmp" / bundle, "a") as f:
+            f["W0_qmunu"].attrs["W0_ready"] = False
+    barrier("epsmat_batched.now0")
+    s0, _ = run_cli("now0_s", "per_q", source=cp, mode="project", bgw_reference=gn)
+    b0, _ = run_cli("now0_b", "batched", source=cp, mode="project", bgw_reference=gn)
+    n_cmp += same(s0 / "tmp" / bundle, b0 / "tmp" / bundle,
+                  keys=["W0_qmunu", "Wp_qmunu", "bgw_epsinv_head"])
+
+    # Full-zone q storage: a fresh GN-PPM bundle on a centroid set that is not
+    # orbit-closed (one point moved), which restart_q_storage = auto stores on
+    # the full zone; then the export and the projection on both routes.
+    full = root / "full"
+    if rank == 0:
+        shutil.copytree(run, full, ignore=shutil.ignore_patterns("tmp", "*.log", "*_sigma*",
+                                                                "*eqp*", "*.out"))
+        cfile = next(full.glob("centroids_frac_*.txt"))
+        pts = np.loadtxt(cfile)
+        pts[-1] = (0.37, 0.11, 0.53)                     # off every orbit of the set
+        np.savetxt(cfile, pts)
+    barrier("epsmat_batched.full")
+    recs, _ = chain.run_stage(full, "gnppm_full", "gw.gw_jax", ["-i", "gnppm.in"],
+                              chain._env(None), 900)
+    assert all(r["rc"] == 0 and not r["hits"] for r in recs), recs
+    fbundle = next((full / "tmp").glob("isdf_tensors_*.h5"))
+    with orig["h5py.File"](fbundle, "r") as f:
+        storage = str(f["V_qmunu"].attrs.get("q_storage", "full"))
+        nq_full = int(f["V_qmunu"].shape[0])
+    assert storage == "full" and nq_full == 25, (storage, nq_full)
+    s0, _ = run_cli("fexp_s", "per_q", source=full, parent=full / "gnppm.in", mode="export",
+                    files="eps0mat epsmat")
+    b0, _ = run_cli("fexp_b", "batched", source=full, parent=full / "gnppm.in", mode="export",
+                    files="eps0mat epsmat")
+    n_cmp += sum(same(s0 / f"{n}.h5", b0 / f"{n}.h5") for n in ("eps0mat", "epsmat"))
+    s0, _ = run_cli("fpro_s", "per_q", source=full, parent=full / "gnppm.in", mode="project",
+                    bgw_reference=gn)
+    b0, _ = run_cli("fpro_b", "batched", source=full, parent=full / "gnppm.in", mode="project",
+                    bgw_reference=gn)
+    n_cmp += same(s0 / "tmp" / fbundle.name, b0 / "tmp" / fbundle.name,
                   keys=["W0_qmunu", "Wp_qmunu", "bgw_epsinv_head"])
 
     h5py.File = orig["h5py.File"]
@@ -208,7 +330,9 @@ def main():
     print(f"EPSMAT_BATCHED PASS rank={rank} {n_cmp} datasets bitwise equal; "
           f"{nq_eps} epsmat q, {nq_store} stored q", flush=True)
     barrier("epsmat_batched.done")
-    if rank == 0:
+    if "--keep" in sys.argv:
+        print(f"EPSMAT_BATCHED kept {root}", flush=True)
+    elif rank == 0:
         shutil.rmtree(root, ignore_errors=True)
     runtime.finalize_process(0)
 

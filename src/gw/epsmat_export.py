@@ -680,6 +680,13 @@ def _file_q_v(src, q_file, gvecs, is_q0):
     return v
 
 
+#: Test-only switch: False makes :func:`read_q_rows` read V and W one dataset
+#: at a time through the held handle, the route a library without the
+#: multi-read handler takes (no Perlmutter or Frontier build lacks it, so
+#: tests/test_epsmat_batched_io.py forces it here).
+MULTI_READ = True
+
+
 def read_q_rows(src, iq, mesh, *, with_w=True):
     """``(V, W, ζ̃)`` of stored q ``iq``: V/W ``(1, μ_pad, μ_pad)`` at
     ``P(None,'x','y')`` (zero-padded), ζ̃ ``(1, μ_pad, ngkmax)`` μ-sharded.
@@ -689,12 +696,24 @@ def read_q_rows(src, iq, mesh, *, with_w=True):
     from file_io.slab_io import SlabIO
     shape = (1, src.mu_pad, src.mu_pad)
     names = ("V_qmunu", "W0_qmunu") if with_w else ("V_qmunu",)
-    if src.bundle_io is not None:
-        rows = src.bundle_io.read_multi(
-            [dict(name=name, shape=shape, dtype=np.complex128, offset=(int(iq), 0, 0),
-                  valid_shape=(1, src.n_mu, src.n_mu)) for name in names],
-            partition_spec=P(None, "x", "y"), mesh=mesh)
-    else:
+    rows = None
+    if src.bundle_io is not None and MULTI_READ:
+        try:
+            rows = src.bundle_io.read_multi(
+                [dict(name=name, shape=shape, dtype=np.complex128, offset=(int(iq), 0, 0),
+                      valid_shape=(1, src.n_mu, src.n_mu)) for name in names],
+                partition_spec=P(None, "x", "y"), mesh=mesh)
+        except RuntimeError as exc:
+            # A library without the multi-read handler (HDF5 < 1.14) refuses before
+            # any collective, alike on every rank: read each dataset, as before.
+            if "GATE slab_io_read_multi" not in str(exc):
+                raise
+    if src.bundle_io is not None and rows is None:
+        rows = [src.bundle_io.read_slab(name, shape=shape, dtype=np.complex128,
+                                        offset=(int(iq), 0, 0), mesh=mesh,
+                                        partition_spec=P(None, "x", "y"))
+                for name in names]
+    elif src.bundle_io is None:
         with SlabIO(src.bundle, mode="r", mesh=mesh) as io:
             rows = [io.read_slab(name, shape=shape, dtype=np.complex128,
                                  offset=(int(iq), 0, 0), mesh=mesh,
@@ -947,8 +966,10 @@ def plan_export(cfg, src, *, print_fn=None):
                     "LORRAX's V and W carry v = 0 beyond the bare cutoff",
                     "lower epsmat_ecut or rerun GW with a larger bare_coulomb_cutoff")
         ecuts, ecut_receipt = resolve_ecut(cfg.epsmat_ecut, full, source=src_name)
-        # The reference's G lists of every q in one open (host: 2 · 8 · ng B per q).
-        refs = be.read_q_gspaces(ref, list(range(len(q_file)))) if ref else None
+        # The reference's G lists of every q in one open; the rows keep them, as
+        # before (the Coulomb column is dropped here).
+        refs = ([qg for qg, _ in be.read_q_gspaces(ref, list(range(len(q_file))))]
+                if ref else None)
         rows = []
         for i, q in enumerate(q_file):
             if name == "eps0mat":
@@ -963,7 +984,7 @@ def plan_export(cfg, src, *, print_fn=None):
                         "use a bundle containing Gamma")
             qg = be.q_gspace(comps, bdot, q, full, is_q0=(name == "eps0mat"))
             if ref:
-                qref, _ = refs[i]
+                qref = refs[i]
                 if qref.nmtx != qg.nmtx or not np.array_equal(
                         qref.order[: qref.nmtx], qg.order[: qg.nmtx]):
                     _refuse("epsmat_bgw_gorder", f"{name} q {i}: nmtx {qg.nmtx} vs "
@@ -1400,12 +1421,15 @@ def projection_price(mu_pad, n_pad, ranks, n_blocks=1):
     """Per-rank device bytes of one stored q of the projection (``lxkit.memory.Price``).
 
     Resident: V, W_c, V + W_c, B and K (five μ faces, 16 μ_pad²/P each), the
-    ``n_blocks`` file blocks of one read (:func:`frequency_tile`, 16 n_pad²/P
-    each) and ζ̃ on the eps G list with its phased copy (2 × 16 μ_pad n_pad/P);
-    fixed: the two live SUMMA panels (``PANEL_BYTES`` each).  Theory §8.
+    file blocks of one read (``n_blocks`` of 16 n_pad²/P each,
+    :func:`frequency_tile`, plus the one-frequency slice copy the projection
+    takes of a read of more than one) and ζ̃ on the eps G list with its phased
+    copy (2 × 16 μ_pad n_pad/P); fixed: the two live SUMMA panels
+    (``PANEL_BYTES`` each).  Theory §8.
     """
     from lxkit import memory
-    spread = (5 * 16.0 * mu_pad ** 2 + int(n_blocks) * 16.0 * n_pad ** 2
+    blocks = int(n_blocks) + (1 if int(n_blocks) > 1 else 0)
+    spread = (5 * 16.0 * mu_pad ** 2 + blocks * 16.0 * n_pad ** 2
               + 2 * 16.0 * mu_pad * n_pad)
     return memory.priced(2.0 * PANEL_BYTES, "epsmat projection: two SUMMA panels",
                          spread=spread, ranks=int(ranks))
@@ -1513,7 +1537,7 @@ def _run_epsmat_projection(cfg, mesh, src):
     from file_io import bgw_epsmat as be
     from file_io.slab_io import SlabIO
 
-    files ={name: os.path.join(cfg.bgw_reference, f"{name}.h5") for name in ("eps0mat", "epsmat")}
+    files = {name: os.path.join(cfg.bgw_reference, f"{name}.h5") for name in ("eps0mat", "epsmat")}
     heads = {name: be.read_epsmat_header(p) for name, p in files.items() if os.path.isfile(p)}
     if "eps0mat" not in heads:
         _refuse("epsmat_project_inputs", f"no eps0mat.h5 under {cfg.bgw_reference}",
@@ -1560,8 +1584,17 @@ def _run_epsmat_projection(cfg, mesh, src):
     ranks = int(mesh.devices.size)
     f_tile = frequency_tile(_pad_to(n_max, p * p), ranks, len(freqs))
     device_budget_bytes()
-    price = projection_price(src.mu_pad, _pad_to(n_max, p * p), ranks, n_blocks=f_tile)
-    memory.admit("epsmat.project", (("faces", price),), memory.room(bucketed=False))
+    # The frequency tile only if it fits the room; else one frequency per read,
+    # the route (and price) before 2026-11-22.
+    routes = [(f"{f_tile} frequencies per read",
+               projection_price(src.mu_pad, _pad_to(n_max, p * p), ranks, n_blocks=f_tile))]
+    if f_tile > 1:
+        routes.append(("one frequency per read",
+                       projection_price(src.mu_pad, _pad_to(n_max, p * p), ranks, n_blocks=1)))
+    chosen = memory.admit("epsmat.project", routes, memory.room(bucketed=False))
+    if chosen != routes[0][0]:
+        f_tile = 1
+    price = dict(routes)[chosen]
     log.info(f"  memory      {price.bytes() / 2**30:.3f} GiB per device per q "
              f"(nmtx_max {n_max}, μ carrier {src.mu_pad}, {f_tile} of {len(freqs)} "
              f"frequency blocks per read; {price.describe()})")
@@ -1569,11 +1602,13 @@ def _run_epsmat_projection(cfg, mesh, src):
     with h5py.File(files["eps0mat"], "r") as f:
         heads_bgw = [complex(f[be.MATRIX][0, 0, fr.ifreq, 0, 0, 0],
                              f[be.MATRIX][0, 0, fr.ifreq, 0, 0, 1]) for fr in freqs]
-    # Every row's G list, one open per file (host: 2 · 8 · ng B per row).
+    # Every row's eps G order, one open per file; only the nmtx entries the loop
+    # uses are kept (host: 8 · nmtx B per row, not the 16 · ng of the full lists).
     gspaces = {}
     for name in sorted({r.name for r in plan}):
         iqs = sorted({r.iq_file for r in plan if r.name == name})
-        gspaces.update({(name, iq): g for iq, g in zip(iqs, be.read_q_gspaces(files[name], iqs))})
+        for iq, (qg, _) in zip(iqs, be.read_q_gspaces(files[name], iqs)):
+            gspaces[(name, iq)] = (qg._replace(ekin=None, order=qg.order[:qg.nmtx].copy()), None)
     figs = []
     with SlabIO(target, mode="a", mesh=mesh) as io, _bgw_readers(files, heads, mesh) as readers:
         # Register (W0) or create (Wp, or W0 of a bundle without screening):
