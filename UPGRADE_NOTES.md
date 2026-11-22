@@ -5,30 +5,47 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
-## 2026-11-21 — Parallel-transport links and the QP-WFN write read k tiles, not one k per collective read
+## 2026-11-22 — Parallel-transport links, the QP-WFN write and the QSGW little-group seed read k tiles; the sketch batch prices its transfer
 
-Two WFN streams made one collective read per k point, which on a slow CFS
-set their wall (lane knif3's dipole step failed on 2026-11-20).
+WFN streams that made one collective read (or write) per k point now move a
+tile of k points per call. No number changes: on lane knif3's KNiF3 input
+(64 k, 840 bands, P4) every dataset of `parallel_transport.h5` is bitwise
+identical to the per-k path and the QP-WFN coefficients agree to 2.5e-15;
+on the hsuite fixtures (H2-, bcc Na; P1 and P4) every link and QP-WFN
+dataset is bitwise identical. Walls below are on a quiet CFS; the gain on a
+slow CFS scales with the call count (lane knif3's dipole step failed on
+2026-11-20).
 
 - **Parallel-transport links** (`psp.get_dipole_mtxels`, default
-  `--parallel-transport-out`): the link stage read each centre and each of
-  its forward neighbours separately, `1 + n_dir` reads per centre. It now
-  reads a tile of centres and the union of their neighbours, two reads per
-  tile; the tile is the most centres whose spheres fit the fixed 1 GiB tile.
-  KNiF3 64 k, 840 bands, P4: WFN reads per rank 257 → 23, link stage
-  75.8 → 51.1 s on a quiet CFS; every dataset of `parallel_transport.h5`
-  bitwise identical.
-- **QP-WFN write** (`write_qp_wfn_h5`: `write_wfn_h5 = true`,
-  `postprocess.rotate_wfn_to_qp`): one coefficient window per k row became
-  as many whole rows per window as the fixed tile admits. KNiF3 P4:
-  coefficient reads 64 → 13 and writes 65 → 14 per rank, `qp_wfn.write`
-  73.2 → 39.4 s; coefficients within 2.5e-15 relative of the per-k write,
-  energies identical.
+  `--parallel-transport-out`): a tile of centres and the union of their
+  forward neighbours are two reads, not `1 + n_dir` reads per centre, and a
+  tile's links are one write, not one per edge. The tile is sized on the
+  measured read phase (the loader holds three copies of each row it reads)
+  and overlap phase against the fixed 1 GiB tile; when one centre does not
+  fit, the stage reads each neighbour as it uses it, as before. A 1x1x1 grid
+  (no forward step) reads nothing. KNiF3 P4: WFN reads per rank 257 → 65,
+  link writes 192 → 32, link stage 73.0 → 61.3 s, stage peak 0.36 → 0.86 GB
+  per rank (inside the tile).
+- **QP-WFN write** (`write_wfn_h5 = true`, `postprocess.rotate_wfn_to_qp`):
+  a coefficient window holds as many whole k rows as the tile admits.
+  KNiF3 P4: coefficient reads 64 → 13 and writes 65 → 14 per rank,
+  `qp_wfn.write` 75.2 → 40.1 s, peak 0.11 → 0.59 GB per rank.
+- **QSGW seeded from a QP-rotations file** (`_project_on_little_groups`):
+  a raw parent whose little group is the identity alone is no longer read
+  (it was read and discarded); the others are read as one tile. KNiF3 (no
+  symmetry): 64 reads → 0.
+- **Centroid sketch k batch** (`centroid.kmeans_cli`): the batch is now
+  priced on the loader's transfer tile (G-flat rows, raw parent window,
+  phase rows, band-sharded samples) as well as the faces, so a large G
+  sphere on few candidates splits into several batches instead of moving
+  every G-flat row at once. Sets may be built in more batches; the sketch
+  is the same to rounding.
 
-Nothing to change in input files or environment. The TR-orphan gauge reads
-of `write_qp_wfn_h5` (two per orphan row, none on any repository fixture or
-on a nosym WFN) are unchanged. Test: `tests/test_per_k_collective_reads.py`
-(P4 script).
+Nothing to change in input files or environment. Not changed: the TR-orphan
+gauge reads of `write_qp_wfn_h5` (no fixture has an orphan row) and the
+per-k host writes of `write_complete_wfn_h5`. Tests:
+`tests/test_per_k_collective_reads.py` (P4 script),
+`tests/test_centroid_batch_price_cpu.py`.
 
 ## 2026-11-21 — `centroid.kmeans_cli`: a one-batch sketch reads its k batch as one tile (the build no longer stalls)
 
