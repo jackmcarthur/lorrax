@@ -54,7 +54,7 @@ from common.parallel_transport import (
 	WFN_FINGERPRINT_SCHEME, build_g_wrap_lookup, wfn_fingerprint,
 )
 from common.wfn_layout import band_sphere_spec
-from common.wfn_transforms import load_kpoint_fftbox_local
+from common.wfn_transforms import iter_kpoint_fftbox_local
 from common.bispinor_init import ALPHA_FS
 from common.log import get_logger, message, record
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
@@ -218,6 +218,15 @@ def _cell_overlap_with_lookup(c_can_m, c_n_k, vket_alpha, vbra_alpha,
     return rho_mn, v_sym, alpha_mn
 
 
+def finite_q_k_tile(gtab, *, nb, nk, nspinor):
+    """Full-zone k per process-local read of the finite-q preparation: the most
+    whose raw band windows (``16 · nb · ns · ngkmax`` B each, on this process)
+    fit ``runtime.tiles.TILE_BYTES``, at least 1 and at most ``nk``."""
+    from runtime import tiles
+    ngkmax = int(np.asarray(gtab.at(0)[0]).shape[0])
+    return tiles.tile_units(16.0 * int(nb) * int(nspinor) * ngkmax, int(nk))
+
+
 def compute_finite_q_mtxels(
     wfn, sym, meta, vnl_setup, gtab,
     *,
@@ -321,15 +330,19 @@ def compute_finite_q_mtxels(
         title="finite-q velocity preparation", item_name="full-BZ k point",
         enabled=progress_fn is not None and jax.process_index() == 0)
     prep_progress.start()
-    for ik in range(nk_full):
+    # ONE k's FFT box at a time, process-local: (nb, ns, nx, ny, nz).  The
+    # rows are read k_tile full-zone k per process-local WFN read (one read
+    # per k before 2026-11-22): the most k whose raw band windows fit
+    # runtime.tiles.TILE_BYTES on this process, the tile's whole extra
+    # residency.
+    k_tile = finite_q_k_tile(gtab, nb=int(nb), nk=nk_full,
+                             nspinor=4 if bispinor else int(meta.nspinor))
+    boxes = iter_kpoint_fftbox_local(wfn, meta, range(nk_full), int(nb), k_tile=k_tile,
+                                     bispinor=bool(bispinor))
+    for ik, psi_k in boxes:
         kvec = jnp.asarray(kpts_full[ik], dtype=jnp.float64)
         G_pad, g_mask = gtab.at(ik)
         Gk_int = jnp.asarray(G_pad, dtype=jnp.int32)                   # (ngkmax, 3)
-        # ONE k's FFT box, process-local: (nb, ns, nx, ny, nz).  The
-        # previous route indexed a resident (nk, nb, ns, nx, ny, nz)
-        # array, i.e. it held EVERY k's box for the whole call.
-        psi_k = load_kpoint_fftbox_local(wfn, meta, ik, int(nb),
-                                         bispinor=bool(bispinor))
         # Gather FFT-box layout → G-sphere coeffs at this k's integer G-list.
         # The mask zeroes the pad columns, which is what makes the finite,
         # K=kvec values of Z/dZ on those columns inert downstream.

@@ -39,6 +39,7 @@ __all__ = [
     "get_enk_bandrange",
     "load_kpoint_fftbox",
     "load_kpoint_fftbox_local",
+    "iter_kpoint_fftbox_local",
     "process_local_mesh",
     "read_Gvecs_to_devices",
     "prepare_rchunk_carrier",
@@ -1641,6 +1642,33 @@ def load_kpoint_fftbox_local(wfn, meta, k_idx, nb, *, b_lo: int = 0,
                      tuple(int(s) for s in meta.fft_grid),
                      mesh=process_local_mesh())
     return psi_box[0]                                # strip the singleton k-axis
+
+
+def iter_kpoint_fftbox_local(wfn, meta, k_list, nb, *, k_tile, b_lo: int = 0,
+                             bispinor: bool = False, bispinor_lift: str | None = None):
+    """:func:`load_kpoint_fftbox_local` of every k of ``k_list``, in order, as
+    ``(k, box)``; ``k_tile`` k per process-local read instead of one.
+
+    The read of a tile holds ``k_tile`` raw band windows on this process
+    (``(nb − b_lo) · ns · ngkmax · 16`` B each, the caller's price); each box is
+    built from its own k row exactly as the one-k loader builds it, and only
+    one box exists at a time.
+    """
+    k_list = [int(k) for k in k_list]
+    step = max(int(k_tile), 1)
+    grid = tuple(int(s) for s in meta.fft_grid)
+    for t0 in range(0, len(k_list), step):
+        ks = k_list[t0:t0 + step]
+        psi = wfn.load_process_local(bands=(int(b_lo), int(nb)), k=ks, bispinor=bool(bispinor),
+                                     bispinor_lift=bispinor_lift)
+        ns_have = int(psi.shape[2])
+        if int(meta.nspinor) > ns_have:
+            _refuse_spinor_zero_fill(int(meta.nspinor), ns_have,
+                                     origin="wfn_transforms.iter_kpoint_fftbox_local")
+        for j, k in enumerate(ks):
+            row = psi if len(ks) == 1 else psi[j:j + 1]
+            yield k, to_box(row, wfn.box_index(k=[k]), grid, mesh=process_local_mesh())[0]
+        del psi
 
 
 def load_kpoint_fftbox(wfn, sym, meta, k_idx, nb):
