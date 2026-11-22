@@ -19,12 +19,14 @@ must be equal bit for bit, and the batched run must make fewer calls:
      per file for all q (``read_q_gspaces``, ``write_q_gspaces``,
      ``write_q_diagonals``); before, one open per q.
 
-Datasets and attributes are compared, on the wedge (IBZ) bundle and on a
-full-zone one (``restart_q_storage = full``), for the export with and
-without a reference, the static and the two-frequency projection, a
-projection from a bundle whose W0 is not ready, and an export through a
-library without the multi-read handler (``read_q_rows`` falls back to one
-read per dataset).  ``--keep`` keeps the run root for a later step.
+Datasets and attributes are compared (the bundle's q storage is the wedge;
+no fixture stores the full zone) for the export with and without a
+reference, the static and the two-frequency projection, a projection from a
+bundle whose W0 is not ready, an export through a library without the
+multi-read handler and the same route forced by ``MULTI_READ = False``
+(``read_q_rows`` reads one dataset at a time), and a projection whose
+admission room is lowered to the one-frequency price (it reads one
+frequency at a time).  ``--keep`` keeps the run root for a later step.
 """
 
 
@@ -262,38 +264,6 @@ def main():
     s0, _ = run_cli("now0_s", "per_q", source=cp, mode="project", bgw_reference=gn)
     b0, _ = run_cli("now0_b", "batched", source=cp, mode="project", bgw_reference=gn)
     n_cmp += same(s0 / "tmp" / bundle, b0 / "tmp" / bundle,
-                  keys=["W0_qmunu", "Wp_qmunu", "bgw_epsinv_head"])
-
-    # Full-zone q storage: a fresh GN-PPM bundle on a centroid set that is not
-    # orbit-closed (one point moved), which restart_q_storage = auto stores on
-    # the full zone; then the export and the projection on both routes.
-    full = root / "full"
-    if rank == 0:
-        shutil.copytree(run, full, ignore=shutil.ignore_patterns("tmp", "*.log", "*_sigma*",
-                                                                "*eqp*", "*.out"))
-        cfile = next(full.glob("centroids_frac_*.txt"))
-        pts = np.loadtxt(cfile)
-        pts[-1] = (0.37, 0.11, 0.53)                     # off every orbit of the set
-        np.savetxt(cfile, pts)
-    barrier("epsmat_batched.full")
-    recs, _ = chain.run_stage(full, "gnppm_full", "gw.gw_jax", ["-i", "gnppm.in"],
-                              chain._env(None), 900)
-    assert all(r["rc"] == 0 and not r["hits"] for r in recs), recs
-    fbundle = next((full / "tmp").glob("isdf_tensors_*.h5"))
-    with orig["h5py.File"](fbundle, "r") as f:
-        storage = str(f["V_qmunu"].attrs.get("q_storage", "full"))
-        nq_full = int(f["V_qmunu"].shape[0])
-    assert storage == "full" and nq_full == 25, (storage, nq_full)
-    s0, _ = run_cli("fexp_s", "per_q", source=full, parent=full / "gnppm.in", mode="export",
-                    files="eps0mat epsmat")
-    b0, _ = run_cli("fexp_b", "batched", source=full, parent=full / "gnppm.in", mode="export",
-                    files="eps0mat epsmat")
-    n_cmp += sum(same(s0 / f"{n}.h5", b0 / f"{n}.h5") for n in ("eps0mat", "epsmat"))
-    s0, _ = run_cli("fpro_s", "per_q", source=full, parent=full / "gnppm.in", mode="project",
-                    bgw_reference=gn)
-    b0, _ = run_cli("fpro_b", "batched", source=full, parent=full / "gnppm.in", mode="project",
-                    bgw_reference=gn)
-    n_cmp += same(s0 / "tmp" / fbundle.name, b0 / "tmp" / fbundle.name,
                   keys=["W0_qmunu", "Wp_qmunu", "bgw_epsinv_head"])
 
     h5py.File = orig["h5py.File"]
