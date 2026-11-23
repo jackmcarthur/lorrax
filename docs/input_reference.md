@@ -92,9 +92,11 @@ k-means avoids this.
 
 ## Screening
 
-There is no deck key for time reversal. `SymMaps.trs_allowed` is measured from
+There is no deck key for time reversal itself. `SymMaps.trs_allowed` is measured from
 the QE-schema receipt and the occupied two-component DFT states
-([symmetry-service contract](services/symmetry_maps.md#contract)).
+([symmetry-service contract](services/symmetry_maps.md#contract)); the
+symmetry tables, ψ and G always follow it. `sigma_w_time_reversal = even`
+changes only which part of the tangential screened interaction is kept.
 
 | key | type | default | meaning |
 |---|---|---|---|
@@ -140,6 +142,7 @@ the QE-schema receipt and the occupied two-component DFT states
 | `ppm_invalid_mode` | str | `static_limit` | Treatment of a mode with no valid Ω² fit: `static_limit` (BerkeleyGW mode 3; alias `infinity`), `zero` (mode 0; alias `skip`) or `2ry` (mode 2). `imaginary` refuses. |
 | `sigma_w_accuracy` | str | `production` | Tangential recipe tier: `production` or `relaxed`. It requires `compute_mode = tangential`. |
 | `sigma_w_support_sites_ev` | str | `""` | Tangential ladder override: `"<line eV list> \| <imaginary eV list>"`, each strictly increasing, with an optional third field `\| <line height eV>` replacing the line height $\max(2.6\,\mathrm{eV},4\eta)$. Empty keeps the resolver's line rule and the Zolotarev imaginary ladder. It is the route past `GATE tangential_response_fit` at wide QP windows: a narrower window's ladder, or a larger height (NiO: 3.0 eV admits line sites to 78 eV). The sites enter the recipe hash, so a model built on another ladder refuses. It requires `compute_mode = tangential`. |
+| `sigma_w_time_reversal` | str | `measured` | Which tangential W a reference whose time reversal is measured broken uses. `measured`: the ordered model (both particle–hole orientations, the odd channel). `even`: the time-reversal-even part $W^{\rm e}_{\mathbf q}(z)=\tfrac12[W_{\mathbf q}(z)+W_{-\mathbf q}(z)^{\mathsf T}]$ ([theory (W 4)](theory/tangential-w-model.md#73-the-odd-channel-in-the-self-energy)): the bank streams the physical W and its minus-q partner, folds every sample and stores a TRS-even bank, so the constructor, Σ, the head body and the stored $W_0$ take the even route and $\Sigma^{\rm odd}$ is dropped; the constructor's $[R,R]$ pencil is about a quarter of the ordered one. Where time reversal holds it changes nothing. Debug-grade: announced at parse and at the recipe, folded into the recipe hash (an ordered bank or model never resumes as even), recorded as `time_reversal_w` in the model header and as `gw_w_time_reversal = even` on the ISDF tensor file. It requires `compute_mode = tangential` (`GATE tangential_applicability`), `bispinor = false` and `screening_diagrams = w_rpa` (`GATE tangential_trs_even_route`), and an insulator (`GATE tangential_trs_even_metal`). |
 
 `bispinor_tt_head_correction` is not a deck key: the transverse Γ head comes
 with `head_correction`, and a deck that names the key refuses at parse.

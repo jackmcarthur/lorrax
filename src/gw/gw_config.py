@@ -1820,6 +1820,11 @@ _DEFAULTS = {
     # fractions, widths and gates are unchanged, and the sites enter
     # recipe_version/recipe_hash so no store crosses ladders on restart.
     "sigma_w_support_sites_ev": "",
+    # ``sigma_w_time_reversal``: measured (the tangential W follows
+    # SymMaps.trs_allowed) | even (on a reference measured time-reversal
+    # broken, W is replaced by its even part (W 4) before the bank is stored;
+    # gw.tangential_recipe.ordered_w_model owns the routing).
+    "sigma_w_time_reversal": "measured",
     "sigma_window_edge_factor": 1.5,
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
@@ -2575,7 +2580,8 @@ def _resolve_tangential_inputs(params):
     from .tangential_recipe import shared_real_pole_v1_r3b as recipe
 
     named = params[_DECK_NAMED_KEYS]
-    for key, choices in (("sigma_w_accuracy", ("production", "relaxed")),):
+    for key, choices in (("sigma_w_accuracy", ("production", "relaxed")),
+                         ("sigma_w_time_reversal", ("measured", "even"))):
         value = str(params[key]).strip().lower()
         if value not in choices:
             raise ValueError(
@@ -2622,6 +2628,31 @@ def _resolve_tangential_inputs(params):
             f"{params['sigma_w_support_sites_ev']!r} with compute_mode={mode!r}; "
             "want: compute_mode=tangential; why: only the tangential "
             "resolver has support ladders to replace")
+    if params["sigma_w_time_reversal"] == "even":
+        if model != "tangential":
+            raise ValueError(
+                "GATE tangential_applicability: sigma_w_time_reversal got: 'even' with "
+                f"compute_mode={mode!r}; want: compute_mode=tangential; why: only the "
+                "tangential bank folds W to its time-reversal-even part")
+        diagrams = coerce_screening_diagrams(params["screening_diagrams"]).value
+        if bool(params["bispinor"]) or diagrams != "w_rpa":
+            raise ValueError(
+                "GATE tangential_trs_even_route: sigma_w_time_reversal got: 'even' with "
+                f"bispinor={bool(params['bispinor'])}, screening_diagrams={diagrams!r}; want: "
+                "bispinor = false and screening_diagrams = w_rpa; why: the even fold is defined "
+                "and verified for the scalar charge W only (no four-current sectors, no ladder W)")
+        _print_deck_report(
+            "\n  ==========================================================\n"
+            "  WARNING -- DEBUG: sigma_w_time_reversal = even.  On a\n"
+            "  reference whose time reversal is MEASURED BROKEN, the\n"
+            "  tangential W is replaced by its time-reversal-even part\n"
+            "  W_e(q,z) = [W_q(z) + W_-q(z)^T]/2 (theory W 4): the odd\n"
+            "  (particle-hole-asymmetric) channel W_odd and its Sigma_odd\n"
+            "  are DROPPED.  The bank, model, Sigma, head body and W0 use\n"
+            "  the TRS-even route; the recipe hash and the ISDF tensor\n"
+            "  file record it.  Where time reversal holds it changes\n"
+            "  nothing.  Leave it at 'measured' for the physical W.\n"
+            "  ==========================================================")
     eta = float(params["sigma_regularization_ev"])
     if not (np.isfinite(eta) and eta > 0.0):
         raise ValueError(
@@ -2935,6 +2966,7 @@ def _input_response(
         cd_own_energy_band_min=int(params["cd_own_energy_band_min"]),
         cd_checkpoint=str(params["cd_checkpoint"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
+        w_time_reversal=str(params["sigma_w_time_reversal"]),
         window_edge_factor=float(params["sigma_window_edge_factor"]),
         quadrature_eps=float(params["sigma_quadrature_eps"]),
         sigma_at_dft_energies=bool(params["sigma_at_dft_energies"]),
@@ -4616,6 +4648,9 @@ class DynamicSigmaConfig:
     #: an explicit support geometry for support-rule studies.  Parsed and
     #: gated by ``gw.tangential_recipe.parse_support_sites``.
     w_support_sites_ev: str = _DEFAULTS["sigma_w_support_sites_ev"]
+    #: ``sigma_w_time_reversal``: "measured" (default) or "even"
+    #: (gw.tangential_recipe.ordered_w_model).
+    w_time_reversal: str = _DEFAULTS["sigma_w_time_reversal"]
     quadrature_eps: float = _DEFAULTS["sigma_quadrature_eps"]
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform

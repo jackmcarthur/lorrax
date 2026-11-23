@@ -1992,6 +1992,26 @@ def _symmetric_part(mesh, sharding):
     return jax.jit(lambda c: 0.5*(c + transpose_xy(c, mesh)), out_shardings=sharding)
 
 
+@lru_cache(maxsize=8)
+def _even_fold_program(mesh, batch):
+    """The time-reversal-even part of one sample (theory W 4), for parents [b, n, n].
+
+    ``(Wc, dWc/ds, Wc_m, dWc_m/ds) -> ((Wc + Wc_m^H)/2, (dWc/ds + dWc_m/ds^H)/2)`` with
+    ``Wc_m = W_q(-conj z) - V_q = conj(W_{-q}(z)) - V_q`` the minus-q partner, so the
+    first output is ``[W_q(z) + W_{-q}(z)^T]/2 - V_q`` (V Hermitian), and
+    ``conj(dW_{-q}/ds(z)) = (dW_q/ds)(-conj z)`` gives the second.  On the imaginary
+    axis the partner is the sample itself and the fold is the Hermitian part.
+    ``batch``: whole matrices per rank (the local line layout), else the x/y face,
+    whose adjoint is one transpose exchange (``transpose_xy``).
+    """
+    from common.collectives import transpose_xy
+    if batch:
+        adjoint = lambda a: jnp.conj(jnp.swapaxes(a, -1, -2))
+    else:
+        adjoint = lambda a: jnp.conj(transpose_xy(a, mesh))
+    return jax.jit(lambda w, dw, wm, dwm: (0.5 * (w + adjoint(wm)), 0.5 * (dw + adjoint(dwm))))
+
+
 def _tr_odd_census(receipt, solve_value, h, chi, value, z, q_full):
     """Measure the time-reversal-odd channel of an ordered bank at q = -q.
 
@@ -3180,15 +3200,23 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # ordered=True stores the physical orientation W_q = FT_q[W].
         ordered = vertex is not None or not bool(sym.trs_allowed)
         tr_odd_census = bool(config.debug.sigma_freq_debug_output)
-        if ordered != bool(header.get("ordered")):
+        # sigma_w_time_reversal = even on a broken reference: the stream stays
+        # ordered (the physical W_q and its minus-q partner), and every sample is
+        # folded to W_e = [W_q(z) + W_q(-conj z)^H]/2 (theory W 4) before the
+        # TRS-layout bank stores it (gw.tangential_recipe.ordered_w_model).
+        from .tangential_recipe import ordered_w_model
+        even = vertex is None and ordered and not ordered_w_model(sym, meta.tangential_recipe)
+        stored_ordered = ordered and not even
+        if stored_ordered != bool(header.get("ordered")):
             raise ValueError("GATE response_representation: got: a bank whose ordered layout disagrees "
-                             "with the measured time reversal; fix: rebuild the bank")
+                             "with the measured time reversal and the recipe's even fold; fix: rebuild the bank")
         # Line-panel samples [p0, p1). On the ordered route each one also needs
         # its minus-q partner W_q(-conj z) = conj(W_{-q}(z)): the exact -q rows of
         # the same stream, conjugated, through parent q's own V (and contact).
-        # An imaginary node is its own partner.
+        # An imaginary node is its own partner. The even fold needs the partner at
+        # every sample off the imaginary axis, the held line samples included.
         p0, p1 = (int(v) for v in header["line_panels"]["sample_span"])
-        partnered = ordered and p1 > p0
+        partnered = ordered and (p1 > p0 or (even and bool(np.any(np.real(z) != 0))))
         if partnered:
             from symmetry_maps import q_negation_index
             negative = np.asarray(q_negation_index((int(meta.nkx), int(meta.nky), int(meta.nkz))), dtype=np.int64)
@@ -3234,6 +3262,14 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         n = meta.mu_basis.n_packed if vertex is None else vertex.n
         if ordered:
             receipt["ordered"] = True
+        if even:
+            receipt["time_reversal_w"] = dict(
+                fold="W_e(z) = [W_q(z) + W_q(-conj z)^H]/2, dW_e/ds(z) = [dW/ds(z) + dW/ds(-conj z)^H]/2 "
+                     "(theory W 4); Herm W on the imaginary axis; odd channel dropped",
+                stream="ordered (physical orientation and the minus-q partner)", stored="TRS-even layout")
+            if partnered:
+                receipt["minus_q_partner"]["dyson"] = ("original parent V for both; folded into the even "
+                                                       "part of every off-axis sample, never stored")
         started = time.monotonic()
         execute = _bank_execution(meta, mesh_xy, receipt, config, photon=vertex is not None)
         ledger = meta.tangential_capacity
@@ -3285,7 +3321,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     def line_selector(execution, width, room):
         if vertex is None:
             from .tangential_directions import charge_line_selection
-            return charge_line_selection(meta, mesh_xy=mesh_xy, ordered=ordered,
+            return charge_line_selection(meta, mesh_xy=mesh_xy, ordered=stored_ordered,
                                          execution=execution, nq=width,
                                          eigh_backend=face_eigh_backend, room=room)
         from .tangential_sectors import sector_line_selection
@@ -3591,6 +3627,19 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         receipt["bank_residence"]["device_bytes_per_rank"] = max(stream_bank.in_flight*pass_carry,
                                                                  3*2*q_width*face_bytes)
 
+    def whole(sample):
+        """The sample's rows are read for every parent at once: no q spans, a line sample
+        without line spans, or an even fold whose streamed minus-q rows lie in other spans."""
+        return (q_width is None or (p0 <= sample < p1 and line_width is None)
+                or (even and mirror is None and complex(z[sample]).real != 0))
+
+    def even_pair(rows, pair, span, bank_handle, sample, layout="face", constant=None):
+        """(W_e, dW_e/ds) of parents ``span`` at one sample from ``pair`` = (W, dW/ds): the
+        fold with the minus-q partner, the Hermitian part on the imaginary axis (theory W 4)."""
+        partner = (pair if complex(z[sample]).real == 0 else
+                   solve(rows, 1, *span, bank_handle, sample, layout=layout, constant=constant))
+        return _even_fold_program(mesh_xy, layout == "batch")(*pair, *partner)
+
     for group in rules["groups"]:
         members = [int(m) for m in group["members"]]
         if all(committed(m) for m in members):
@@ -3621,7 +3670,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             # loop's own order); a line sample without line spans reads every parent.
             raw_group = stream_bank.reader([
                 (2*row, 2*row+2, span) for row, sample in fresh
-                for span in ([None] if q_width is None or (p0 <= sample < p1 and line_width is None) else
+                for span in ([None] if whole(sample) else
                              line_spans() if p0 <= sample < p1 else
                              [(a, min(q1, a+q_width)) for q0, q1, _, _ in dense_spans(sample)
                               for a in range(q0, q1, q_width)])])
@@ -3644,7 +3693,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     raw = _MemberRows(_member_block(raw_group, 2 * row, mesh_xy), 0)
                     raw_group = take = None
                 else:
-                    raw = take(row) if q_width is None or (p0 <= sample < p1 and line_width is None) else None
+                    raw = take(row) if whole(sample) else None
                 if p0 <= sample < p1:
                     # Select from W(z) itself, then act with the minus-q partner on
                     # the same directions; only the panels reach the bank.
@@ -3673,7 +3722,11 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         # freed once their selection blocks are cut.
                         pair = list(solve(rows, 0, *span, bank_handle, sample, layout=line_layout,
                                           constant=constant))
-                        if not ordered and line_width is None:
+                        if even:
+                            # Select from W_e(z) itself (the TRS rule, s-derivatives); no mirrors.
+                            pair = list(even_pair(rows, pair, span, bank_handle, sample,
+                                                  layout=line_layout, constant=constant))
+                        if not stored_ordered and line_width is None:
                             rows = raw = None          # every row of this member is read
                         # Each phase over what is live at its entry: the cut blocks and normal
                         # matrices (the admitted resident) and the eigh stack's own program
@@ -3683,7 +3736,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                             "cut blocks (admitted) + the eigh stack's program", increment=True), stage='bank.line_select')
                         with timing.section('bank.line_select'):
                             lines = sel.select(sample, pair)
-                        if ordered:
+                        if stored_ordered:
                             pair = list(solve(rows, 1, *span, bank_handle, sample, layout=line_layout,
                                               constant=constant))
                             if line_width is None:
@@ -3712,12 +3765,18 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     ledger.live_stages = live
                 else:
                     for q0, q1, need_value, need_slope in dense_spans(sample):
-                        width = q_width or (q1 - q0)
+                        width = (q1 - q0) if whole(sample) else q_width
                         for a in range(q0, q1, width):
                             span = (int(a), int(min(q1, a + width)))
-                            rows = raw if q_width is None else _RowWindow(take(row), a)
+                            rows = raw if whole(sample) else _RowWindow(take(row), a)
+                            if even and not need_value:
+                                raise ValueError(f"GATE tangential_trs_even_resume: sample {sample} has its "
+                                                 "folded value committed without its slope; want: both "
+                                                 "solved from the same rows; fix: rebuild the bank")
                             value, slope = solve(rows, 0, *span, bank_handle, sample,
                                                  need_value=need_value)
+                            if even:
+                                value, slope = even_pair(rows, (value, slope), span, bank_handle, sample)
                             del rows
                             io_started = time.monotonic()
                             if need_slope:

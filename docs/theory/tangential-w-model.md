@@ -610,6 +610,25 @@ by up to 14 meV and closing the gap by 0.77 meV, with no head or small-$q$
 origin (claim 2371) — and the full ordered model reproduces an exact
 contour-deformation reference to 0.017 meV at the own energy (claim 2388).
 
+**Dropping it on request.** `sigma_w_time_reversal = even` builds the model of
+$W^{\rm e}$ (W 4) on a reference whose time reversal is measured broken. With
+$W_{-\mathbf q}(z)^{\mathsf T}=W_{\mathbf q}(-z)=W_{\mathbf q}(-\bar z)^\dagger$
+(W 2, W 3), the producer folds each sample with its minus-q partner,
+
+$$
+W^{\rm e}_{\mathbf q}(z)=\tfrac12\big[W_{\mathbf q}(z)+W_{\mathbf q}(-\bar z)^\dagger\big],\qquad
+\partial_sW^{\rm e}_{\mathbf q}(z)=\tfrac12\big[\partial_sW_{\mathbf q}(z)+(\partial_sW_{\mathbf q})(-\bar z)^\dagger\big],
+\tag{W 35}
+$$
+
+which is $\operatorname{Herm}W_{\mathbf q}(iu)$ on the imaginary axis, and keeps
+the full $W$'s even moments $M_1,M_3$ ($M_0=M_2=0$). By (W 5) $W^{\rm e}$ is a
+matrix Stieltjes function of $s$ with positive residues, so the even pencil of
+§5 applies unchanged; $\Sigma$ loses exactly $\Sigma^{\rm odd}$, and the
+static $W^{\rm e}(0)=W(0)$ because $W^{\rm odd}(0)=0$. The head's wings keep
+their measured ordered-pair weights, so its fold through the even body differs
+from the head of $W^{\rm e}$ at second order in the odd channel.
+
 ## 8 The pole count {#tangential-pole-count}
 
 ### 8.1 Three sizes

@@ -180,6 +180,50 @@ shared_real_pole_gates_ordered_v1["retained_subspace_moments"].update({
 
 ORDERED_GATE_HASH = table_hash(shared_real_pole_gates_ordered_v1)
 
+# ``sigma_w_time_reversal = even`` on a reference measured time-reversal broken:
+# the bank holds the even part W_e = [W_q(z) + W_-q(z)^T]/2 (W 4), a TRS-even
+# matrix Stieltjes function, so every TRS row applies; only the representation
+# row states what was measured and what was forced. A separate table keeps the
+# TRS and ordered hashes, and every stored identity, unchanged.
+TRS_EVEN_GATE_VERSION = "shared_real_pole_gates_trs_even_v1"
+shared_real_pole_gates_trs_even_v1 = copy.deepcopy(shared_real_pole_gates_v1_r3b)
+shared_real_pole_gates_trs_even_v1["representation"] = {
+    "name": "representation",
+    "predicate": ("charge operator from N_spinor in (1, 2), authenticated TRS broken, "
+                  "W folded to its time-reversal-even part (sigma_w_time_reversal = even): "
+                  "the odd channel is dropped by request"),
+    "threshold": {"nspinor": (1, 2), "trs_allowed": False, "time_reversal_w": "even"},
+    "version": TRS_EVEN_GATE_VERSION}
+
+
+def forced_even_w(recipe):
+    """True when ``recipe`` folds a time-reversal-broken W to its even part (W 4)."""
+    return isinstance(recipe, dict) and recipe.get("time_reversal_w") == "even"
+
+
+def ordered_w_model(sym, recipe):
+    """True when the scalar tangential bank and model take the ordered representation.
+
+    The one routing decision of the scalar charge route: time reversal as
+    measured (``SymMaps.trs_allowed``), unless the resolved recipe carries
+    ``time_reversal_w = even`` (``sigma_w_time_reversal = even`` on a
+    reference measured broken), when the bank stores W_e and every consumer
+    takes its TRS-even branch.  The response stream's orientation is not
+    decided here: it stays the measured one (``not sym.trs_allowed``), so the
+    producer samples the physical W_q before folding.
+    """
+    return not bool(sym.trs_allowed) and not forced_even_w(recipe)
+
+
+def scalar_gate_table(*, trs_allowed, recipe=None, charge4=False):
+    """The construction gate table of a scalar (or charge4) tangential model."""
+    if charge4:
+        return charge4_gates(not trs_allowed)
+    if trs_allowed:
+        return shared_real_pole_gates_v1_r3b
+    return (shared_real_pole_gates_trs_even_v1 if forced_even_w(recipe)
+            else shared_real_pole_gates_ordered_v1)
+
 # A four-component charge carrier is a new representation of the same scalar
 # CC operator. Keep the scalar and full photon gate hashes unchanged, so an
 # existing artifact cannot silently acquire the charge4 interpretation.
@@ -559,23 +603,26 @@ class CapacityLedger:
 
 
 def construction_receipt(measurements=None, *, capacity=None, capacity_entry_start=None,
-                         ordered=False, charge4=False):
+                         ordered=False, charge4=False, forced_even=False):
     """Complete receipt skeleton, explicitly marking every absent gate unmeasured.
 
     ``measurements`` maps names to ``gate_receipt`` keyword dictionaries. Dense
     consumers supply measurements; creating this skeleton certifies no physics.
+    ``forced_even``: the TRS-even table of a W folded on a broken reference.
     """
     measurements = {} if measurements is None else measurements
     table = (charge4_gates(ordered) if charge4 else
-             shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b)
+             shared_real_pole_gates_ordered_v1 if ordered else
+             shared_real_pole_gates_trs_even_v1 if forced_even else shared_real_pole_gates_v1_r3b)
     unknown = set(measurements) - set(table)
     if unknown:
         raise ValueError(f"unknown tangential receipt predicates: {sorted(unknown)}")
     result = {"schema": RECEIPT_SCHEMA, "recipe_version": RECIPE_VERSION,
             "recipe_hash": RECIPE_HASH,
             "gate_version": (CHARGE4_GATE_VERSION if charge4 else
-                             ORDERED_GATE_VERSION if ordered else GATE_VERSION),
-            "gate_hash": (table_hash(table) if charge4 else
+                             ORDERED_GATE_VERSION if ordered else
+                             TRS_EVEN_GATE_VERSION if forced_even else GATE_VERSION),
+            "gate_hash": (table_hash(table) if charge4 or forced_even else
                           ORDERED_GATE_HASH if ordered else GATE_HASH),
             "gates": [gate_receipt(name, table=table, **measurements.get(
                 name, {"reason": "measurement not supplied"}))
@@ -619,7 +666,7 @@ def native_query_rows(native_queries):
 
 def build_construction_row(model, counts, diagnostics, *, span, roles, price,
                            coulomb, native_queries, identity, gates, nspinor,
-                           logical_n, ordered, odd_moments, detail=False):
+                           logical_n, ordered, odd_moments, detail=False, forced_even=False):
     """Host view of one constructed parent, and the gate rows it measures.
 
     The constructor has finished q: it holds the model, the device diagnostics
@@ -654,6 +701,10 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
         and the column sort permutation.  Otherwise the spectrum is its size,
         ends and exact-zero count, and the permutation is omitted; at Ni 20^3
         the two were 140 MB of the per-parent rows, encoded on every map.
+    forced_even : bool
+        The bank holds W folded to its even part on a time-reversal-broken
+        reference (``forced_even_w``): the representation row records the
+        measured verdict and the fold.
 
     Returns
     -------
@@ -691,8 +742,9 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
         name: np.asarray(reduction[name]).tolist() for name in (
             "metric_initial_infinity_norm", "metric_inverse_root_iterations",
             "metric_inverse_root_residual_fro", "metric_inverse_root_residual_relative")}
-    representation_value = ({"nspinor": nspinor, "trs_allowed": False, "ordered": True}
-                            if ordered else {"nspinor": nspinor, "trs_allowed": True})
+    representation_value = ({"nspinor": nspinor, "trs_allowed": False, "ordered": True} if ordered else
+                            {"nspinor": nspinor, "trs_allowed": False, "time_reversal_w": "even"}
+                            if forced_even else {"nspinor": nspinor, "trs_allowed": True})
     # The reciprocity row compares nothing on a sample whose held reference is
     # not itself transpose symmetric, so the receipt must say how many records
     # were actually evaluated instead of asserting a literal pass (INVARIANTS 23).
@@ -1403,15 +1455,38 @@ def resolve_tangential_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     if charge4:
         version += '+charge4'
         table = hashlib.sha256((table + '|four-component-spin-traced-v1').encode()).hexdigest()
-    gate_table = (charge4_gates(not census['trs_allowed']) if charge4 else
-                  shared_real_pole_gates_v1_r3b if census['trs_allowed'] else
-                  shared_real_pole_gates_ordered_v1)
+    # sigma_w_time_reversal = even acts only where time reversal is measured
+    # broken; where it holds the recipe is the TRS one, bit for bit.
+    even = (str(getattr(config.sigma, 'w_time_reversal', 'measured')) == 'even'
+            and not census['trs_allowed'])
+    if even:
+        if photon or charge4:
+            raise ValueError("GATE tangential_trs_even_route: got: sigma_w_time_reversal = even on a "
+                             "four-component route; want: the scalar charge W; why: the even fold "
+                             "is defined for the scalar charge bank only")
+        if census['partial_at_mu']:
+            raise ValueError("GATE tangential_trs_even_metal: got: sigma_w_time_reversal = even on a "
+                             "time-reversal-broken metal; want: an insulator, or sigma_w_time_reversal "
+                             "= measured; why: the even fold's metal head and occupation paths are "
+                             "not verified")
+        version += '+trs_even'
+        table = hashlib.sha256((table + '|time_reversal_w=even').encode()).hexdigest()
+        log.warning("  tangential W: sigma_w_time_reversal = even on a reference whose time reversal "
+                    "is MEASURED BROKEN (SymMaps.trs_allowed = False): the bank stores the even part "
+                    "W_e = [W_q(z) + W_-q(z)^T]/2 (theory W 4) and the odd channel is DROPPED from "
+                    "Sigma, the head body and W0 (debug-grade choice; recipe " + version + ")")
+    elif str(getattr(config.sigma, 'w_time_reversal', 'measured')) == 'even':
+        log.info("  tangential W: sigma_w_time_reversal = even, but time reversal is measured to "
+                 "hold: W is already even, nothing changes")
+    gate_table = scalar_gate_table(trs_allowed=census['trs_allowed'], charge4=charge4,
+                                   recipe={'time_reversal_w': 'even'} if even else None)
     result = {
         'role_codes': dict(ROLE_CODES),
         'recipe_version': version, 'recipe_hash': table,
         'support_sites_override': '' if override is None else override['text'],
         'gate_version': (CHARGE4_GATE_VERSION if charge4 else
-                         GATE_VERSION if census['trs_allowed'] else ORDERED_GATE_VERSION),
+                         GATE_VERSION if census['trs_allowed'] else
+                         TRS_EVEN_GATE_VERSION if even else ORDERED_GATE_VERSION),
         'gate_hash': table_hash(gate_table),
         'accuracy': tier, 'accuracy_status': 'NOT_MEASURED',
         'accuracy_reason': 'resolved geometry has no authenticated matching campaign receipt',
@@ -1450,6 +1525,8 @@ def resolve_tangential_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     }
     if charge4:
         result['charge_operator'] = 'four-component-spin-traced-v1'
+    if even:
+        result['time_reversal_w'] = 'even'
     if support_receipt is not None:
         result['support_envelope'] = support_receipt
     if sector_treatment is not None:
@@ -1477,6 +1554,7 @@ def resolve_tangential_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'sector_pole_treatment': 'bispinor-only numerical treatment at twice the chi transition span, held while the current span stays inside it; not a physical pole bound',
         'U_bytes': '16*nk_full*(nspinor*nmu)^2/(Px*Py), logical bytes/rank',
         'metadata': 'sum of replicated metadata array nbytes',
+        'time_reversal_w': 'sigma_w_time_reversal = even on a measured TR-broken reference: W_e = [W_q(z) + W_-q(z)^T]/2 (W 4), odd channel dropped',
     }
     if support_receipt is not None:
         rules.update(imaginary_top='SC high-water envelope of omega_p+3.5 eV',

@@ -260,10 +260,14 @@ def qgrid_trs_policy_from_tangential_store(header, *, announce=True):
     the same entry point as live references, never infer symmetry from fitted b.
     """
     from types import SimpleNamespace
+    from .tangential_recipe import forced_even_w
 
     qt = header["qirr"]
+    # A TRS-even store folded from a broken reference (sigma_w_time_reversal =
+    # even) keeps the MEASURED verdict: its tables are the magnetic group's.
     reference = SimpleNamespace(
-        trs_allowed=header["representation"] == "scalar-trs-even-s",
+        trs_allowed=(header["representation"] == "scalar-trs-even-s"
+                     and not forced_even_w(header.get("recipe"))),
         q_irr_full_idx=np.asarray(header["q_irr_full_idx"]),
         active_symmetry_rows=np.asarray(header["operations"]["authorized_rows"]))
     return qgrid_trs_policy_for(

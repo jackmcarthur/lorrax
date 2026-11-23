@@ -337,8 +337,9 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
     from .tangential_constructor import constructor_route
 
     from .tangential_directions import line_width_bounds
+    from .tangential_recipe import ordered_w_model
     ledger = meta.tangential_capacity
-    ordered = bool(photon) or not bool(sym.trs_allowed)
+    ordered = bool(photon) or ordered_w_model(sym, meta.tangential_recipe)
     nq = len(np.asarray(sym.q_irr_full_idx))
     R = tangential_bank_payload_bytes(meta, recipe=meta.tangential_recipe,
                                        ordered=ordered, nq=nq, mesh_xy=mesh_xy,

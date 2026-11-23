@@ -117,27 +117,26 @@ def construct_tangential_poles(bank, moments, meta, config, *, mesh_xy, output, 
                                           carrier_history)
         from gw.tangential_capacity import round_padding_output_bytes
         from gw.tangential_recipe import (
-            build_construction_row, charge4_gates, construction_receipt,
-            shared_real_pole_gates_v1_r3b as gates,
-            shared_real_pole_gates_ordered_v1,
+            build_construction_row, construction_receipt, forced_even_w, ordered_w_model,
+            scalar_gate_table,
         )
         from common.units import RYD_TO_EV
         from gw.w_isdf import response_coulomb_powers
 
     with phase("setup"):
         recipe = meta.tangential_recipe
-        # Time-reversal-broken scalar states take the ordered particle-hole route.
-        ordered = not bool(bank["tables"]["sym"].trs_allowed)
+        # Time-reversal-broken scalar states take the ordered particle-hole route,
+        # unless the recipe folds W to its even part (ordered_w_model).
+        sym = bank["tables"]["sym"]
+        ordered = ordered_w_model(sym, recipe)
+        forced_even = forced_even_w(recipe) and not bool(sym.trs_allowed)
         # Every charge carrier contracts to one mu x mu CC operator.
         if not charge_representation(meta):
             raise ValueError("GATE tangential_representation: expected an authenticated charge carrier")
         charge4 = recipe.get("charge_operator") == "four-component-spin-traced-v1"
         if (int(meta.nspinor) == 4) != charge4:
             raise ValueError("GATE tangential_representation: charge4 recipe and carrier disagree")
-        if charge4:
-            gates = charge4_gates(ordered)
-        elif ordered:
-            gates = shared_real_pole_gates_ordered_v1
+        gates = scalar_gate_table(trs_allowed=bool(sym.trs_allowed), recipe=recipe, charge4=charge4)
         from gw.tangential_recipe import table_hash
         if recipe["gate_hash"] != table_hash(gates):
             raise ValueError("GATE tangential_representation: recipe gate table differs from charge carrier")
@@ -169,7 +168,7 @@ def construct_tangential_poles(bank, moments, meta, config, *, mesh_xy, output, 
             if _sample_point(recipe, sample_id) != _sample_point(stored_recipe, sample_id):
                 raise ValueError("GATE tangential_bank_state: got: changed z; want: current physical sample point; why: recipe hashes alone do not bind resolved points")
         if bool(header.get("ordered", False)) != ordered:
-            raise ValueError(f"GATE tangential_representation: got: bank ordered={bool(header.get('ordered', False))} with trs_allowed={not ordered}; want: an ordered bank exactly when time reversal is broken (both orientations, -q as its own parent); why: particle-hole pairing across parents")
+            raise ValueError(f"GATE tangential_representation: got: bank ordered={bool(header.get('ordered', False))} with trs_allowed={bool(sym.trs_allowed)}, time_reversal_w={recipe.get('time_reversal_w', 'measured')}; want: an ordered bank exactly when time reversal is broken and W is not folded to its even part (both orientations, -q as its own parent); why: particle-hole pairing across parents")
         # Odd z-moments M0/M2 certify the ordered infinity block; a finite-state
         # ordered bank builds without it and records the moments NOT_MEASURED.
         odd_moments = ordered and bool(header.get("odd_moments", False))
@@ -495,11 +494,11 @@ def construct_tangential_poles(bank, moments, meta, config, *, mesh_xy, output, 
                         native_queries=budget.native_queries, identity=identity,
                         gates=gates, nspinor=int(meta.nspinor), logical_n=logical_n,
                         ordered=ordered, odd_moments=odd_moments,
-                        detail=bool(config.debug.sigma_freq_debug_output))
+                        detail=bool(config.debug.sigma_freq_debug_output), forced_even=forced_even)
                     receipt = construction_receipt(
                         measurements, capacity=ledger,
                         capacity_entry_start=receipt_entry_start, ordered=ordered,
-                        charge4=charge4)
+                        charge4=charge4, forced_even=forced_even)
                     receipt.update(identity=identity, constructor=row)
                     receipts[q] = receipt
                 receipt_entry_start = len(ledger.entries)

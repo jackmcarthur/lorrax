@@ -319,12 +319,15 @@ def _metadata(meta, tables, recipe, identity, ordered=None, *, basis=None, secto
     elif sector not in ("CC", "TT", "CT_C", "CT_T") or int(meta.nspinor) != 4:
         _refuse("sector factors require Nspinor=4 and CC/TT/CT_C/CT_T")
     sym = tables["sym"]
-    # A bank (ordered=None) follows the measured TRS state; a model store
-    # states its representation and must agree with it.
+    # A bank (ordered=None) follows the measured TRS state, or the recipe's
+    # even fold of a broken one (gw.tangential_recipe.ordered_w_model); a
+    # model store states its representation and must agree with it.
+    from gw.tangential_recipe import ordered_w_model
+    routed = ordered_w_model(sym, recipe)
     bank = ordered is None
     if bank:
-        ordered = photon or not bool(sym.trs_allowed)
-    elif (bool(sym.trs_allowed) == bool(ordered)
+        ordered = photon or routed
+    elif (routed != bool(ordered)
           and not (ordered and sector in ("CT_C", "CT_T"))):
         _refuse("ordered representation requires authenticated broken TRS" if ordered
                 else "TRS-broken representation is unsupported")

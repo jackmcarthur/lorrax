@@ -908,7 +908,8 @@ def _persist_screening(
     one static Dyson solve whose W0 and srlr channels share one χ₀(0)."""
     try:
         from .gw_output import stamp_w0_route
-        stamp_w0_route(tensors_filename, config)        # read by the BSE's GATE bse_mpa_w0
+        stamp_w0_route(tensors_filename, config,         # read by the BSE's GATE bse_mpa_w0
+                       recipe=getattr(meta, "tangential_recipe", None))
         if (config.screening.diagrams is ScreeningDiagrams.W_BSE
                 and qp_solver is not QPSolver.SELF_CONSISTENT):
             # The stage stored the RPA rung as W0_qmunu; the ladder W(0) Sigma

@@ -402,7 +402,7 @@ def _stamp_screening_diagrams(tensors_filename: str, config, *, members=None) ->
     barrier("restart_screening_diagrams_stamp")
 
 
-def stamp_w0_route(tensors_filename: str, config) -> None:
+def stamp_w0_route(tensors_filename: str, config, recipe=None) -> None:
     """Stamp the GW route on the restart file: the ``gw_compute_mode`` file
     attribute, written on every route (including ``mpa``, which persists no
     W0) so the BSE can refuse a W(0) it cannot use
@@ -413,9 +413,15 @@ def stamp_w0_route(tensors_filename: str, config) -> None:
     Sigma used.  It differs from ``W0_qmunu``'s own ``screening_diagrams``
     under ``w_bse``, whose stored W(0) is the RPA rung of the ladder, so a
     consumer of the file can say which W it reads and which W Sigma used
-    (``file_io.restart_bundle.describe_w0_provenance``)."""
+    (``file_io.restart_bundle.describe_w0_provenance``).
+
+    With ``recipe`` (the map's resolved tangential recipe) folded to the
+    time-reversal-even W on a broken reference (``sigma_w_time_reversal =
+    even``), the file also carries ``gw_w_time_reversal = even``: its W0 and
+    model are W_e, not the measured W."""
     import h5py
     from common.collectives import barrier, process_rank
+    from .tangential_recipe import forced_even_w
     mode = getattr(config, "compute_mode", None)
     diagrams = getattr(getattr(config, "screening", None), "diagrams", None)
     if process_rank() == 0 and mode is not None and os.path.exists(tensors_filename):
@@ -424,6 +430,10 @@ def stamp_w0_route(tensors_filename: str, config) -> None:
             if diagrams is not None and bool(getattr(mode, "needs_screening", True)):
                 f.attrs["gw_screening_diagrams"] = str(
                     getattr(diagrams, "value", diagrams))
+            if forced_even_w(recipe):
+                f.attrs["gw_w_time_reversal"] = "even"
+            elif "gw_w_time_reversal" in f.attrs:
+                del f.attrs["gw_w_time_reversal"]      # a restart onto an earlier even run's file
     barrier("restart_w0_route_stamp")
 
 
