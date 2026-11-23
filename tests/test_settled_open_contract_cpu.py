@@ -107,3 +107,38 @@ def test_collective_and_swmr_opens_refused_by_name(tmp_path, kwargs):
     key = next(iter(kwargs))
     with pytest.raises(ValueError, match=f"{key}=.*refused"):
         open_h5_settled(p, "r", **kwargs)
+
+
+@pytest.mark.parametrize("mode", ["a", "r+"])
+def test_write_modes_wait_out_a_short_view(tmp_path, mode):
+    from file_io.commit_state import open_h5_settled
+    p = tmp_path / "f.h5"
+    data = _fixture(p)
+    cut = _cut(p, data)
+    t = _restore_later(p, data, cut)
+    t0 = time.monotonic()
+    try:
+        with open_h5_settled(p, mode) as f:
+            waited = time.monotonic() - t0
+            f.attrs["written"] = mode
+    finally:
+        t.join()
+    assert waited > 1.0, waited
+    with h5py.File(p, "r") as f:
+        np.testing.assert_array_equal(f["x"][:], np.arange(1 << 17, dtype=np.float64))
+        assert f.attrs["tag"] == "fixture" and f.attrs["written"] == mode
+
+
+def test_not_hdf5_refused_at_once(tmp_path):
+    from file_io.commit_state import open_h5_settled
+    empty = tmp_path / "empty.h5"
+    empty.write_bytes(b"")
+    text = tmp_path / "text.h5"
+    text.write_bytes(b"not an hdf5 file\n" * 1000)
+    for p in (empty, text, tmp_path / "missing.h5", tmp_path):
+        t0 = time.monotonic()
+        with pytest.raises(OSError) as info:
+            open_h5_settled(p, "r")
+        assert time.monotonic() - t0 < 0.5, p
+        assert "open_h5_settled" not in str(info.value), (p, info.value)
+        assert "truncated file" not in str(info.value), (p, info.value)
