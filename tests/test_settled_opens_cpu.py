@@ -13,7 +13,8 @@ import ast
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[1]
-_OPENER = "src/file_io/commit_state.py"
+_OPENERS = {"src/file_io/commit_state.py",
+            "services/zeta_loader/src/zeta_loader/format.py"}  # the probe's dependency-free copy
 
 
 def _sources():
@@ -35,7 +36,7 @@ def test_every_serial_open_of_an_existing_file_is_settled():
     offenders = []
     for path in _sources():
         rel = path.relative_to(_REPO).as_posix()
-        if rel == _OPENER or "/bench/" in rel:
+        if rel in _OPENERS or "/bench/" in rel:
             continue
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)

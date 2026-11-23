@@ -91,6 +91,35 @@ class ZetaFileProbe:
     r_mu_fft_idx: np.ndarray | None
 
 
+#: The probe's bound on a transiently short size view; the same number as
+#: ``file_io.commit_state.GUARD_SETTLE_S`` (a guard waits seconds, not a minute).
+_PROBE_SETTLE_S = 5.0
+
+
+def _open_settled(p):
+    """``h5py.File(p, "r")``, reopened while HDF5 refuses it as "truncated file".
+
+    A dependency-free copy of ``file_io.commit_state.open_h5_settled`` at the
+    guard bound, because this module promises no jax and no LORRAX: a Lustre
+    client can see a just-written file shorter than the end of file its
+    superblock records for a fraction of a second (Perlmutter scratch,
+    2026-11).  A file still short after ``_PROBE_SETTLE_S`` raises HDF5's own
+    error, which the probe turns into ``readable=False``.  Any other error is
+    raised at once.
+    """
+    import time
+    t0, nap = time.monotonic(), 0.01
+    while True:
+        try:
+            return h5.File(p, "r")
+        except OSError as exc:
+            if ("truncated file" not in str(exc)
+                    or time.monotonic() - t0 > _PROBE_SETTLE_S):
+                raise
+            time.sleep(nap)
+            nap = min(2 * nap, 0.2)
+
+
 def probe_zeta_file(path: str | Path) -> ZetaFileProbe:
     """Read what can be read from ``path``.  **NEVER RAISES.**
 
@@ -105,7 +134,6 @@ def probe_zeta_file(path: str | Path) -> ZetaFileProbe:
     One open, one pass, no jax, no lorrax.  Anything unreadable comes
     back as ``readable=False`` plus :attr:`~ZetaFileProbe.error`.
     """
-    from file_io.commit_state import GUARD_SETTLE_S, open_h5_settled
     try:
         p = os.fspath(path)
     except TypeError as exc:                                # noqa: BLE001
@@ -125,7 +153,7 @@ def probe_zeta_file(path: str | Path) -> ZetaFileProbe:
     zeta_done: bool | None = None
     r_mu: np.ndarray | None = None
     try:
-        with open_h5_settled(p, "r", settle_s=GUARD_SETTLE_S) as f:
+        with _open_settled(p) as f:
             for _name, _mu_axis in _ZETA_DATASETS:
                 dset = f.get(_name)
                 if dset is not None and getattr(dset, "ndim", None) == 3:

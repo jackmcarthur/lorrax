@@ -74,3 +74,26 @@ def test_guard_readers_give_up_within_seconds(tmp_path):
     assert 4.0 < t_guard < commit_state.GUARD_SETTLE_S + 5.0, t_guard
     with pytest.raises(OSError, match="open_h5_settled"):
         commit_state.open_h5_settled(p, "r", settle_s=0.5)
+
+
+def test_zeta_probe_needs_no_lorrax(tmp_path):
+    good = tmp_path / "good.h5"
+    _fixture(good)
+    bad = tmp_path / "bad.h5"
+    _cut(bad, _fixture(bad))
+    code = (
+        "import sys\n"
+        f"sys.path[:] = [{str(_ZETA_SRC)!r}] + [p for p in sys.path if 'site-packages' in p "
+        "or p.endswith(('.zip', 'lib-dynload')) or '/lib/python' in p]\n"
+        "from zeta_loader import probe_zeta_file\n"
+        f"a = probe_zeta_file({str(good)!r}); b = probe_zeta_file({str(bad)!r})\n"
+        f"c = probe_zeta_file({str(tmp_path / 'none.h5')!r}); d = probe_zeta_file({str(tmp_path)!r})\n"
+        "assert a.readable and not b.readable and not c.exists and not d.readable, (a, b, c, d)\n"
+        "assert 'truncated file' in b.error, b.error\n"
+        "bad = [m for m in ('jax', 'file_io', 'common', 'runtime') if m in sys.modules]\n"
+        "assert not bad, bad\n"
+        "print('PROBE_OK')\n")
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         env=env, cwd=str(tmp_path), timeout=120)
+    assert out.returncode == 0 and "PROBE_OK" in out.stdout, out.stdout + out.stderr
