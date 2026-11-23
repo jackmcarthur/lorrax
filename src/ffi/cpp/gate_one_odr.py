@@ -82,6 +82,7 @@ check("the process is CUDA-capable", backend in ("gpu", "cuda"),
 
 from ffi.common import ffi_loader                             # noqa: E402
 from file_io.slab_io import SlabIO                            # noqa: E402
+from file_io.commit_state import open_h5_settled              # noqa: E402
 
 # Touching the cpu library is what triggers the pre-open of the CUDA one.
 ffi_loader.get_lib("cpu")
@@ -118,7 +119,7 @@ with SlabIO(path, mode="w", mesh=mesh) as io:
     io.write_slab("payload", jax.numpy.asarray(truth), offset=(0, 0))
 check("the file was created", os.path.exists(path))
 
-with h5py.File(path, "r") as f:
+with open_h5_settled(path, "r") as f:
     on_disk = np.asarray(f["payload"])
 check("host WRITE landed the right bytes",
       np.allclose(on_disk, truth),
