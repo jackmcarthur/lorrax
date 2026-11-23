@@ -20,9 +20,20 @@ def assert_committed(h5, *, path=None):
 #: How long a reopen waits out a transiently short size view (``open_h5_settled``).
 SETTLE_TIMEOUT_S = 60.0
 
+#: The wait for guard and resume readers (``settle_s=GUARD_SETTLE_S``): paths
+#: whose job is to say "unreadable, rebuild" at once.  The stale views measured
+#: on Perlmutter scratch cleared in 0.2 s; a file still short after this is
+#: treated as unreadable by the caller's own fallback.
+GUARD_SETTLE_S = 5.0
 
-def open_h5_settled(path, mode="r", **kwargs):
+def open_h5_settled(path, mode="r", *, settle_s=None, **kwargs):
     """``h5py.File(path, mode)`` for a file another process just committed.
+
+    ``settle_s`` bounds the wait (default ``SETTLE_TIMEOUT_S``); guard and
+    resume readers pass ``GUARD_SETTLE_S``.  The helper does not read the
+    header or compare sizes itself: it reopens while HDF5's own check in
+    ``H5F__super_read`` refuses with "truncated file" (client size + user
+    block below the superblock's stored end of file).
 
     HDF5 refuses an open when the size this client reports is below the end of
     allocation stored in the superblock (``truncated file: eof < stored_eof``),
@@ -58,6 +69,7 @@ def open_h5_settled(path, mode="r", **kwargs):
 
     import h5py
 
+    limit = SETTLE_TIMEOUT_S if settle_s is None else float(settle_s)
     t0, nap, tries = time.monotonic(), 0.01, 0
     while True:
         try:
@@ -65,7 +77,7 @@ def open_h5_settled(path, mode="r", **kwargs):
         except OSError as exc:
             if "truncated file" not in str(exc):
                 raise
-            if time.monotonic() - t0 > SETTLE_TIMEOUT_S:
+            if time.monotonic() - t0 > limit:
                 raise OSError(
                     f"{exc} [open_h5_settled: {path} still reads shorter than the end "
                     f"of file its own superblock records after {tries + 1} opens over "

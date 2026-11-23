@@ -671,7 +671,7 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             # An interrupted run's directory keeps what authenticates for this
             # map and loses the rest: a published sector handle is reused, a
             # complete bank resumes the constructor, anything else is rebuilt.
-            from file_io.commit_state import open_h5_settled
+            from file_io.commit_state import GUARD_SETTLE_S, open_h5_settled
             import h5py
             from file_io.slab_io import remove_stale_streamed_banks
             # A per-rank streamed store is unlinked as soon as it is opened, so its bytes
@@ -697,7 +697,7 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             complete, bound = False, None
             if model.exists():
                 try:
-                    with open_h5_settled(model, "r") as h5:
+                    with open_h5_settled(model, "r", settle_s=GUARD_SETTLE_S) as h5:
                         assert_committed(h5, path=model)
                         complete = "final_commit" in h5
                         raw = h5["header_json"][()] if complete else b"{}"

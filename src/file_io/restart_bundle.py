@@ -35,7 +35,7 @@ from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSI
     _decode_charge_zeta_identity, _loaded_band_axis, _validate_shape_receipt,
     coulomb_policy_from_config, compare_coulomb_policy, parse_coulomb_policy,
     format_coulomb_policy)
-from .commit_state import open_h5_settled
+from .commit_state import GUARD_SETTLE_S, open_h5_settled
 
 log = get_logger(__name__)
 
@@ -76,7 +76,7 @@ def read_coulomb_policy_from_h5(filename) -> dict | None:
     any rank before the tensors move.
     """
     try:
-        with open_h5_settled(filename, "r") as f:
+        with open_h5_settled(filename, "r", settle_s=GUARD_SETTLE_S) as f:
             if COULOMB_POLICY_DATASET not in f:
                 return None
             return parse_coulomb_policy(f[COULOMB_POLICY_DATASET][()])
@@ -111,7 +111,7 @@ def read_downfold_provenance(filename) -> dict | None:
     plus ``keep_idx`` / ``retained_rank_per_q`` as numpy arrays when present.
     """
     try:
-        with open_h5_settled(filename, "r") as f:
+        with open_h5_settled(filename, "r", settle_s=GUARD_SETTLE_S) as f:
             if DOWNFOLD_PROVENANCE_GROUP not in f:
                 return None
             g = f[DOWNFOLD_PROVENANCE_GROUP]
@@ -1450,7 +1450,7 @@ def read_interaction_orbits(src: str, mu_L: int, print_fn):
     from symmetry_maps import dataset_q_storage, read_tables
 
     try:
-        with open_h5_settled(src, "r") as f:
+        with open_h5_settled(src, "r", settle_s=GUARD_SETTLE_S) as f:
             storage = dataset_q_storage(f["V_qmunu"])
         if storage != "ibz":
             print_fn(
@@ -1633,7 +1633,7 @@ def read_qp_wfn_stamp(path) -> dict | None:
         SIGMA_EVAL_PROVENANCE_ATTR,
     )
     try:
-        with open_h5_settled(str(path), "r") as h5:
+        with open_h5_settled(str(path), "r", settle_s=GUARD_SETTLE_S) as h5:
             raw = h5.attrs.get(QP_WFN_ATTR)
             if raw is None:
                 return None
@@ -1663,7 +1663,7 @@ def read_qp_state_source_provenance(path) -> dict | None:
     """Read a restart source-state record; ``None`` means legacy/unproven."""
     from .qp_wfn import (QP_STATE_SOURCE_DATASET, _validate_qp_state_source)
     try:
-        with open_h5_settled(str(path), "r") as h5:
+        with open_h5_settled(str(path), "r", settle_s=GUARD_SETTLE_S) as h5:
             if QP_STATE_SOURCE_DATASET not in h5:
                 return None
             raw = h5[QP_STATE_SOURCE_DATASET][()]
@@ -4638,7 +4638,7 @@ def check_dipole_provenance(
 
     from .dipole import require_dipole_format
     try:
-        with open_h5_settled(str(path), "r") as h5:
+        with open_h5_settled(str(path), "r", settle_s=GUARD_SETTLE_S) as h5:
             require_dipole_format(h5.attrs, dipole_path=path)
             attrs = {k: h5.attrs[k] for k in _PROV_ATTRS if k in h5.attrs}
             ncond_mismatch = (

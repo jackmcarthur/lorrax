@@ -105,7 +105,7 @@ def probe_zeta_file(path: str | Path) -> ZetaFileProbe:
     One open, one pass, no jax, no lorrax.  Anything unreadable comes
     back as ``readable=False`` plus :attr:`~ZetaFileProbe.error`.
     """
-    from file_io.commit_state import open_h5_settled
+    from file_io.commit_state import GUARD_SETTLE_S, open_h5_settled
     try:
         p = os.fspath(path)
     except TypeError as exc:                                # noqa: BLE001
@@ -125,7 +125,7 @@ def probe_zeta_file(path: str | Path) -> ZetaFileProbe:
     zeta_done: bool | None = None
     r_mu: np.ndarray | None = None
     try:
-        with open_h5_settled(p, "r") as f:
+        with open_h5_settled(p, "r", settle_s=GUARD_SETTLE_S) as f:
             for _name, _mu_axis in _ZETA_DATASETS:
                 dset = f.get(_name)
                 if dset is not None and getattr(dset, "ndim", None) == 3:

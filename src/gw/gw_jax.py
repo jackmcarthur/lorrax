@@ -1737,7 +1737,7 @@ def _published_artifacts(rows):
     from common.collectives import rank0_read
 
     def manifest():
-        from file_io.commit_state import open_h5_settled
+        from file_io.commit_state import GUARD_SETTLE_S, open_h5_settled
         ok, lines = True, []
         for label, path, required in rows:
             if path is None:
@@ -1750,7 +1750,7 @@ def _published_artifacts(rows):
                 continue
             state = "present"
             try:
-                with open_h5_settled(path, "r") as h5:
+                with open_h5_settled(path, "r", settle_s=GUARD_SETTLE_S) as h5:
                     if "lorrax_io_committed" in h5:
                         committed = int(np.asarray(h5["lorrax_io_committed"])[0])
                         state = f"committed={committed}"
