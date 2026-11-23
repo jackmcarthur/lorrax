@@ -73,8 +73,9 @@ def open_h5_settled(path, mode="r", **kwargs):
                     f"interrupted writer) or this node's size view of it is stale; "
                     f"do not reuse it: rerun the stage that writes it]") from exc
             tries += 1
-            print(f"  [open_h5_settled] {path}: refused open {tries} ({exc}); "
-                  f"retrying in {nap:.3f} s", file=sys.stderr, flush=True)
+            if tries == 1 or tries % 25 == 0:      # the first refusal, then about every 5 s
+                print(f"  [open_h5_settled] {path}: refused open {tries} ({exc}); "
+                      f"retrying in {nap:.3f} s", file=sys.stderr, flush=True)
             time.sleep(nap)
             nap = min(2 * nap, 0.2)
             continue
