@@ -11,20 +11,41 @@ On Perlmutter scratch (as on Frontier Lustre in 2026-10) a rank that opens a
 file shortly after it was written collectively can see the file shorter than
 the end of file its own superblock records, and HDF5 refuses the open
 (`truncated file: eof < stored_eof`; every refused eof an exact 1 MiB stripe
-multiple; the data complete). Lane nips3 lost five runs to it, each at
-`zeta_loader` opening `zeta_q.h5` in the Screening stage. The bounded wait of
+multiple; the data complete). Lane nips3 lost runs to it: the three with a
+log all failed at `zeta_loader` opening `zeta_q.h5` in the Screening stage.
 `file_io.commit_state.open_h5_settled`, used since 2026-10-16 for the
 close-time metadata reopens, is now the one route for every serial open of an
-existing file in `src/` and `services/*/src` (147 opens: ζ, the ISDF tensor
+existing file in `src/` and `services/*/src` (148 opens: ζ, the ISDF tensor
 file, model and pole files, QP rotations, QP WFN, dipole, kinetic/ionic,
-parallel transport, Σ, BSE, restart and checkpoint readers). A view that
-stays short for 60 s refuses with an `OSError` that names the cause.
+parallel transport, Σ, BSE, restart and checkpoint readers). It does not read
+the header or compare sizes itself: it reopens while HDF5's own end-of-file
+check refuses with "truncated file", with a back-off (10 ms to 0.2 s), and
+adds no I/O to an open that succeeds. A view that stays short for 60 s
+refuses with an `OSError` that names the cause. Guard and resume readers that
+exist to say "unreadable, rebuild" (the ζ probe, the tangential model resume,
+the `restart_bundle` stamp and provenance readers that return `None`, the
+published-artifacts manifest, the production report's input cells) pass
+`settle_s=GUARD_SETTLE_S` (5 s); the ζ probe keeps its own dependency-free
+copy of the retry (no jax, no LORRAX). `driver="mpio"` and `swmr=True` are
+refused by name.
 
 No number changes. A driver-side read-back retry of the tensor files is no
-longer needed. Not covered: the collective MPI-IO opens of `file_io.slab_io`
-(no failure seen there) and files created with `'w'`. Tests:
-`tests/test_settled_opens_cpu.py`, `tests/test_fresh_file_reads.py` (compute
-node, 2 nodes on scratch).
+longer needed. Not covered:
+- Reads after a successful open. HDF5's serial driver takes the file size
+  once at open and zero-fills a read past it, so a size view that went stale
+  after the open would read silent zeros. The reproduction checked the last
+  rows after every successful open: 140 opens over 2 and 4 nodes, 0 wrong
+  tails. That is evidence, not proof.
+- The collective MPI-IO opens of `file_io.slab_io` (not retried; no failure
+  seen there), files created with `'w'` (nothing read back), and tools and
+  scripts outside `src/` and `services/*/src`.
+- Each rank waits on its own: a rank that finally refuses leaves its peers in
+  the next collective until the barrier limit, as before, only later.
+
+Tests: `tests/test_settled_opens_cpu.py` (source scan, aliases included),
+`tests/test_settled_open_contract_cpu.py` (guard bound, probe without
+LORRAX, refused kwargs, `a`/`r+` waits, non-HDF5 refused at once),
+`tests/test_fresh_file_reads.py` (compute node, 2 nodes on scratch).
 
 ## 2026-11-22 — epsmat export/projection and finite-q dipoles read per run, not per q; `--iq-list` default
 
