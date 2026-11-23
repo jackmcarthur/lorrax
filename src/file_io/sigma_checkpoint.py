@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+from .commit_state import open_h5_settled
 
 SCHEMA = "sigma-sweep-checkpoint-v1"
 SC_SCHEMA = "sc-anderson-checkpoint-v1"

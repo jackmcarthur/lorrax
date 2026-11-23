@@ -51,6 +51,7 @@ from runtime import debug_print_enabled
 from runtime.padding import authenticate_padded_axis, padded_axis
 
 from . import h5_journal as _journal
+from .commit_state import open_h5_settled
 
 log = get_logger(__name__)
 
