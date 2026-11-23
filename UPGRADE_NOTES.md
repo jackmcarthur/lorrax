@@ -5,6 +5,27 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-22 — Every serial HDF5 open of an existing file waits out a short size view, or refuses by name
+
+On Perlmutter scratch (as on Frontier Lustre in 2026-10) a rank that opens a
+file shortly after it was written collectively can see the file shorter than
+the end of file its own superblock records, and HDF5 refuses the open
+(`truncated file: eof < stored_eof`; every refused eof an exact 1 MiB stripe
+multiple; the data complete). Lane nips3 lost five runs to it, each at
+`zeta_loader` opening `zeta_q.h5` in the Screening stage. The bounded wait of
+`file_io.commit_state.open_h5_settled`, used since 2026-10-16 for the
+close-time metadata reopens, is now the one route for every serial open of an
+existing file in `src/` and `services/*/src` (147 opens: ζ, the ISDF tensor
+file, model and pole files, QP rotations, QP WFN, dipole, kinetic/ionic,
+parallel transport, Σ, BSE, restart and checkpoint readers). A view that
+stays short for 60 s refuses with an `OSError` that names the cause.
+
+No number changes. A driver-side read-back retry of the tensor files is no
+longer needed. Not covered: the collective MPI-IO opens of `file_io.slab_io`
+(no failure seen there) and files created with `'w'`. Tests:
+`tests/test_settled_opens_cpu.py`, `tests/test_fresh_file_reads.py` (compute
+node, 2 nodes on scratch).
+
 ## 2026-11-22 — epsmat export/projection and finite-q dipoles read per run, not per q; `--iq-list` default
 
 No number changes: every output below is bitwise identical to the per-q
