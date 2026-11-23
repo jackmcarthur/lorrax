@@ -1087,9 +1087,10 @@ def pole_census(path, *, cuts_ev=CENSUS_CUTS_EV, bins_ev=CENSUS_BINS_EV) -> dict
     (W^c(0) = -sum_j b_j b_j^H / (2 Omega_j^2) per side).  Returns
     :func:`census_summary`.
     """
+    from file_io.commit_state import open_h5_settled
     import h5py
     from common.units import RYD_TO_EV
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         raw = f["header_json"][()]
         header = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
         K = np.asarray(header["K"], np.int64)
@@ -1396,11 +1397,12 @@ _REFIT_GATE_VALUES = ("held_w", "full_m1_defect", "full_m3_defect", "passivity",
 
 def _model_payload_cmp(path_a: str, path_b: str):
     """Two tangential models' payloads (``factor``, ``poles2_ry2``, ``K``): bitwise and max |a - b| (rank 0)."""
+    from file_io.commit_state import open_h5_settled
     if jax.process_index() != 0:
         return None
     import h5py
     out = {}
-    with h5py.File(path_a, "r") as fa, h5py.File(path_b, "r") as fb:
+    with open_h5_settled(path_a, "r") as fa, open_h5_settled(path_b, "r") as fb:
         for key in ("factor", "poles2_ry2"):
             a, b = fa[key][()], fb[key][()]
             same = a.shape == b.shape

@@ -579,10 +579,11 @@ def h5_input_cells(path, kind: str, *, grid=None) -> tuple[str, str, str]:
     """``(bands, k grid, spinor)`` of ``kin_ion.h5`` (``kind`` ``"kin_ion"``) or
     ``dipole.h5`` (``"dipole"``) from attributes and dataset shapes only (no
     dataset is read); a cell the header does not give is ``-``."""
+    from file_io.commit_state import open_h5_settled
     cells = ["-", "-", "-"]
     try:
         import h5py
-        with h5py.File(path, "r") as h5:
+        with open_h5_settled(path, "r") as h5:
             if kind == "kin_ion":
                 attrs = h5["kin_ion"].attrs
                 if "nb" in attrs:

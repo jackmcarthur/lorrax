@@ -783,6 +783,7 @@ def gauge_map(psi, *, wfn_co, k_rows, bands_abs, centroid_frac, fft_grid, nv, en
     go through ``distrib_la.plan_polar_factor(...).batched`` on the batch-reshard
     route, as the parallel-transport links do. ``mesh_xy`` is the run's mesh.
     """
+    from file_io.commit_state import open_h5_settled
     import distrib_la as dla
     from wfn_loader import WfnLoader
     from common.collectives import device_put_process_local
@@ -797,7 +798,7 @@ def gauge_map(psi, *, wfn_co, k_rows, bands_abs, centroid_frac, fft_grid, nv, en
     nb, ns, n_mu = int(psi.shape[1]), int(psi.shape[2]), len(r_mu)
     nc = nb - nv
     k_rows = np.asarray(k_rows, dtype=np.int64)
-    with h5py.File(wfn_co, "r") as w:
+    with open_h5_settled(wfn_co, "r") as w:
         el = np.asarray(w["mf_header/kpoints/el"][()], dtype=np.float64)
     el = el.reshape(-1, el.shape[-2], el.shape[-1])[0]                 # (nk_wfn, mnband) Ry, spin 1
     nk_w, nb_file = el.shape
@@ -1198,6 +1199,7 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
     ``use_gauge_map`` (some file wants the coarse WFN's gauge). W and V stay
     resident flattened at ``P('x','y',None)``; the bundle's own copies are dropped.
     """
+    from file_io.commit_state import open_h5_settled
     _stage("deferred_imports")
     from ffi import _services
     _services.ensure_on_path()
@@ -1270,20 +1272,20 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
         raise ValueError(f"GATE bsemat_k_bijection: {wfn_v} k points do not cover the grid once")
     row_of = np.empty(nk, np.int64)
     row_of[kv_rows] = np.arange(nk)                      # flat grid index -> row of wfn_v
-    with h5py.File(wfn_co, "r") as w:
+    with open_h5_settled(wfn_co, "r") as w:
         el_all = np.asarray(w["mf_header/kpoints/el"][()]).reshape(-1, nk, int(w["mf_header/kpoints/mnband"][()]))[0]
         ecutwfc = float(w["mf_header/kpoints/ecutwfc"][()])
 
     _stage("head_columns")
     # ── 2. head momenta and ζ columns ─────────────────────────────────────
-    with h5py.File(restart, "r") as f:
+    with open_h5_settled(restart, "r") as f:
         tables = read_tables(f, "W0_qmunu")
-    with h5py.File(wfn_co, "r") as w:
+    with open_h5_settled(wfn_co, "r") as w:
         mtrx = np.asarray(w["mf_header/symmetry/mtrx"][()])[:int(w["mf_header/symmetry/ntran"][()])]
     from symmetry_maps import bgw_integer_q_to_fractional
     q_full_L = bgw_integer_q_to_fractional(fft_int, grid)
     if bgw_eps:
-        with h5py.File(bgw_eps, "r") as e:
+        with open_h5_settled(bgw_eps, "r") as e:
             q_wedge = np.asarray(e["eps_header/qpoints/qpts"][()], dtype=np.float64)
         q_src = f"BerkeleyGW eps q list ({bgw_eps})"
     else:
@@ -1428,6 +1430,7 @@ def _q0_dipole_rows(ctx, q0_vector, W_flat):
     (``ctx['q0_dipole']``). ``q0_vector`` (crystal) or ``None`` for the
     ``eps0mat.h5`` beside ``bgw_eps``.
     """
+    from file_io.commit_state import open_h5_settled
     from common.collectives import device_put_process_local
     restart, sys_dim, bgw_eps, bvec = ctx["restart"], ctx["sys_dim"], ctx["bgw_eps"], ctx["bvec"]
     n_rmu, n_rmu_pad, omega, mesh_xy = ctx["n_rmu"], ctx["n_rmu_pad"], ctx["omega"], ctx["mesh_xy"]
@@ -1438,7 +1441,7 @@ def _q0_dipole_rows(ctx, q0_vector, W_flat):
         raise ValueError("GATE bsemat_q0_body_dim: the dipole q0 body term is O(q0) in a slab "
                          "(BerkeleyGW's own body moves 8e-8); fix: --q0-body head-less.")
     names = ("head_wing_L", "head_wing_R", "S_cart_head", "S_cart_head_direct")
-    with h5py.File(restart, "r") as f:
+    with open_h5_settled(restart, "r") as f:
         miss = [n for n in names if n not in f]
         if miss:
             raise ValueError(f"GATE bsemat_q0_wings_source: {restart} lacks {miss}; the dipole "
@@ -1451,7 +1454,7 @@ def _q0_dipole_rows(ctx, q0_vector, W_flat):
         if not eps0 or not os.path.exists(eps0):
             raise ValueError("GATE bsemat_q0_vector: the dipole q0 body is direction dependent; "
                              "give --q0-vector (crystal) or an eps0mat.h5 beside --bgw-eps.")
-        with h5py.File(eps0, "r") as e:
+        with open_h5_settled(eps0, "r") as e:
             q0_vector = np.asarray(e["eps_header/qpoints/qpts"][()], np.float64)[0]
     q0_cart = np.asarray(q0_vector, np.float64) @ bvec
     if wing_shapes != [(3,n_rmu),(n_rmu,3)]:

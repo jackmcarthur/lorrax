@@ -463,6 +463,7 @@ class QirrDest:
         self._owned = None
 
     def __enter__(self):
+        from file_io.commit_state import open_h5_settled
         h5py = _require_h5py()
         if isinstance(self._target, (h5py.File, h5py.Group)):
             return self._target
@@ -470,7 +471,7 @@ class QirrDest:
             raise TypeError(
                 f"qirr_store: expected an h5py File/Group or a path, got "
                 f"{type(self._target).__name__}")
-        self._owned = h5py.File(self._target, self._mode)
+        self._owned = open_h5_settled(self._target, self._mode)
         return self._owned
 
     def __exit__(self, *exc):

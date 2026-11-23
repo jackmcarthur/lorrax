@@ -32,6 +32,7 @@ from typing import NamedTuple
 
 import h5py
 import numpy as np
+from .commit_state import open_h5_settled
 
 __all__ = [
     "MATRIX", "DIAGONAL", "TOL_ZERO", "VERSION", "ICUTV_OF_SYS_DIM",
@@ -175,7 +176,7 @@ def midgap_ry(wfn_file, nband):
     both over every spin and k of the WFN (``el`` in Ry, ``ifmax`` the
     1-based count of occupied bands, ``mf_header/kpoints``).
     """
-    with h5py.File(wfn_file, "r") as w:
+    with open_h5_settled(wfn_file, "r") as w:
         el = np.asarray(w["mf_header/kpoints/el"][()], dtype=np.float64)
         ifmax = np.asarray(w["mf_header/kpoints/ifmax"][()], dtype=np.int64)
     nb = min(int(nband), el.shape[-1])
@@ -207,7 +208,7 @@ def create_epsmat_file(path, *, wfn_file, qpts, qgrid, nmtx, ecuts, nband,
     nmtx = np.asarray(nmtx, dtype=np.int32).reshape(-1)
     freqs = np.asarray(freqs_ev, dtype=np.float64).reshape(-1, 2)
     nq, nfreq, nmax = qpts.shape[0], freqs.shape[0], int(nmtx.max())
-    with h5py.File(wfn_file, "r") as w, h5py.File(path, "w") as f:
+    with open_h5_settled(wfn_file, "r") as w, h5py.File(path, "w") as f:
         w.copy("mf_header", f)
         ng = int(np.asarray(f["mf_header/gspace/ng"][()]))
         i4 = np.int32
@@ -251,7 +252,7 @@ def write_q_gspace(path, iq, qg, vcoul_ry_bohr3):
 
 def write_q_gspaces(path, rows):
     """:func:`write_q_gspace` for every ``(iq, qg, vcoul)`` of ``rows``, one open."""
-    with h5py.File(path, "a") as f:
+    with open_h5_settled(path, "a") as f:
         g = f["eps_header/gspace"]
         for iq, qg, vcoul_ry_bohr3 in rows:
             inv = np.empty_like(qg.order)
@@ -269,7 +270,7 @@ def write_q_diagonal(path, iq, diag):
 
 def write_q_diagonals(path, rows):
     """:func:`write_q_diagonal` for every ``(iq, diag)`` of ``rows``, one open."""
-    with h5py.File(path, "a") as f:
+    with open_h5_settled(path, "a") as f:
         done = f["eps_header/qpoints/qpt_done"]
         for iq, diag in rows:
             d = np.asarray(diag, dtype=np.complex128)
@@ -280,7 +281,7 @@ def write_q_diagonals(path, rows):
 
 def read_epsmat_header(path):
     """Small, replicated facts of an eps file as a dict (serial h5py, any rank)."""
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         h = {k: np.asarray(f[f"eps_header/{k}"][()]) for k in (
             "qpoints/qpts", "qpoints/qgrid", "qpoints/qpt_done", "gspace/nmtx",
             "gspace/nmtx_max", "freqs/freq_dep", "freqs/nfreq", "freqs/freqs",
@@ -302,7 +303,7 @@ def read_q_gspace(path, iq):
 def read_q_gspaces(path, iqs):
     """:func:`read_q_gspace` of every q in ``iqs`` (a list, in order), one open."""
     out = []
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         g = f["eps_header/gspace"]
         for iq in iqs:
             nmtx = int(np.asarray(g["nmtx"][iq]))

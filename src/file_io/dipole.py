@@ -40,6 +40,7 @@ writer wrote them.
 from __future__ import annotations
 
 import numpy as np
+from .commit_state import open_h5_settled
 
 DIPOLE_DATASET = "dipole_cart"
 BAND_ENERGIES_DATASET = "band_energies"
@@ -292,7 +293,7 @@ def velocity_stamp(path, *, wfn, wfn_path) -> tuple[str, str, np.ndarray]:
     def text(value):
         return value.decode() if isinstance(value, bytes) else value
 
-    with h5py.File(str(path), "r") as h5:
+    with open_h5_settled(str(path), "r") as h5:
         attrs = dict(h5.attrs)
         energies = np.asarray(h5[BAND_ENERGIES_DATASET][()], dtype=np.float64)
     require_dipole_format(attrs, dipole_path=path)
@@ -386,7 +387,7 @@ def read_band_energies(path) -> np.ndarray:
     refuses.
     """
     import h5py
-    with h5py.File(str(path), "r") as h5:
+    with open_h5_settled(str(path), "r") as h5:
         require_dipole_format(h5.attrs, dipole_path=path)
         energies = _band_energies(h5)
     if energies is None:

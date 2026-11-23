@@ -332,10 +332,11 @@ def _report_run_facts(report, *, wfn, sym, meta, ctx, bispinor, sys_dim,
 def _degeneracy_check(out_path, wfn, sym, nb_eff) -> dict:
     """Rank 0: does the written operator have the symmetry of these
     wavefunctions?  (``psp.operator_checks.check_degeneracy_consistency``)"""
+    from file_io.commit_state import open_h5_settled
     from psp.operator_checks import check_degeneracy_consistency
     en = np.asarray(wfn.energies)
     en = en[0] if en.ndim == 3 else en          # (nk, nb), Ry
-    with h5py.File(out_path, "r") as h5:
+    with open_h5_settled(out_path, "r") as h5:
         return check_degeneracy_consistency(
             h5["kin_ion"], en[star_wedge_rows(sym)[0], :nb_eff],
             label="kin_ion (T+V_loc+V_NL)")

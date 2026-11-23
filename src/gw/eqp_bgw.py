@@ -960,6 +960,7 @@ def make_eqp_bgw(
 	may be wrong.  "No stamp" and "stamped at E_DFT" used to look
 	identical, and that is the whole defect.  See :func:`compute_eqp_diag`.
 	"""
+	from file_io.commit_state import open_h5_settled
 	wfn_path = wfn_path or os.path.join(run_dir, "WFN.h5")
 	kin_ion_path = kin_ion_path or os.path.join(run_dir, "kin_ion.h5")
 	sigma_mnk_path = sigma_mnk_path or os.path.join(run_dir, "sigma_mnk.h5")
@@ -972,7 +973,7 @@ def make_eqp_bgw(
 	)
 
 	# IBZ k-points + per-state DFT energies (Ry → eV)
-	with h5py.File(wfn_path, "r") as wfn:
+	with open_h5_settled(wfn_path, "r") as wfn:
 		kpoints_irr = np.asarray(wfn["mf_header/kpoints/rk"])
 		nspin = int(np.asarray(wfn["mf_header/kpoints/nspin"]))
 		# energies: (nspin, nk, nbands_total) in Ry

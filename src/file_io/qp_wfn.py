@@ -661,7 +661,7 @@ def qp_rotations_k_storage(h5_path: str, dataset: str = "U_mnk") -> str:
     Absent attr means :data:`~file_io.kin_ion.K_STORAGE_FULL`, which is what
     makes every file written before this format keep its exact meaning.
     """
-    with h5py.File(h5_path, "r") as f:
+    with open_h5_settled(h5_path, "r") as f:
         if dataset not in f:
             raise KeyError(f"Dataset {dataset!r} missing from {h5_path}")
         stored = str(f[dataset].attrs.get(K_STORAGE_ATTR, K_STORAGE_FULL))
@@ -1334,7 +1334,7 @@ def validate_qp_wfn_h5(
         "mf_header/kpoints/occ", "mf_header/kpoints/rk",
         "wfns/gvecs", "wfns/coeffs",
     )
-    with h5py.File(os.fspath(path), "r") as h5:
+    with open_h5_settled(os.fspath(path), "r") as h5:
         missing = [name for name in required if name not in h5]
         if missing:
             raise ValueError(
@@ -1681,3 +1681,4 @@ def authenticate_restart_qp_state_source_for_wfn(
     return record, binding
 
 from . import restart_bundle as _bundle
+from .commit_state import open_h5_settled

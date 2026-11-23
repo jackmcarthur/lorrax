@@ -544,6 +544,7 @@ def run_nscf(
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
+    from file_io.commit_state import open_h5_settled
     parser = argparse.ArgumentParser(allow_abbrev=False, description="LORRAX NSCF: Davidson + Pseudobands → WFN.h5")
     parser.add_argument("-i", "--input", default=None, help="Input file (nscf.in)")
     parser.add_argument("--save", default=None, help="QE .save directory")
@@ -634,7 +635,7 @@ def main():
     kpoints_override = weights_override = None
     if args.ref_wfn:
         import h5py
-        with h5py.File(args.ref_wfn, "r") as f:
+        with open_h5_settled(args.ref_wfn, "r") as f:
             kpoints_override = f["mf_header/kpoints/rk"][:]
             weights_override = f["mf_header/kpoints/w"][:]
 

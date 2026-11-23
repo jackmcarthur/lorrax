@@ -11,7 +11,7 @@ def read_sc_sigma_lorentz_h5(path):
 	"""Read one committed SC-map Lorentz split in its input QP basis."""
 	from .commit_state import assert_committed
 
-	with h5py.File(path, "r") as h5:
+	with open_h5_settled(path, "r") as h5:
 		assert_committed(h5, path=path)
 		parts = np.asarray(h5["sigma_lorentz_skij_ev"])
 		rotation = np.asarray(h5["U_dft_to_qp_kij"])
@@ -85,6 +85,7 @@ from .kin_ion import (
     queue_star_kpoints,
 )
 from file_io.restart_bundle import (read_star_map)
+from .commit_state import open_h5_settled
 
 #: Attr prefix under which the pre-extraction star-spread measurement is
 #: stamped.  Four numbers per dataset — see :func:`sigma_star_spread_stats`
@@ -2052,7 +2053,7 @@ def append_eqp_assembly_receipt_h5(
 			abs_path, STACK_H5PY, "r",
 			where="append_eqp_assembly_receipt_h5 star-map read"):
 		star = read_star_map(abs_path, "sigma_c_kij_ev", k_axis=1)
-		with h5py.File(abs_path, "r") as raw_h5:
+		with open_h5_settled(abs_path, "r") as raw_h5:
 			nk_raw = int(raw_h5["sigma_c_kij_ev"].shape[1])
 	file_rows = np.asarray(file_wedge_full_bz_rows, dtype=np.int64)
 	if file_rows.ndim != 1 or file_rows.shape != (h.shape[0],):
@@ -2091,7 +2092,7 @@ def append_eqp_assembly_receipt_h5(
 	with open_scope(
 			abs_path, STACK_H5PY, "a",
 			where="append_eqp_assembly_receipt_h5"), \
-			h5py.File(abs_path, "a") as h5:
+			open_h5_settled(abs_path, "a") as h5:
 		present, bad = _raw_operator_stamp_errors(h5)
 		if not present:
 			raise ValueError(
@@ -2281,7 +2282,7 @@ def append_qsgw_datasets_h5(
 		return []
 
 	# The file's OWN k storage, learned from a dataset it was created with.
-	with h5py.File(abs_path, "r") as h5:
+	with open_h5_settled(abs_path, "r") as h5:
 		present = [n for n in SIGMA_CUBE_DATASETS if n in h5]
 		omega_ev = (np.asarray(h5["omega_ev"][()])
 		            if "omega_ev" in h5 else None)
@@ -2314,7 +2315,7 @@ def append_qsgw_datasets_h5(
 					f"different k set would make one file mean two things.")
 
 	written = []
-	with h5py.File(abs_path, "a") as h5:
+	with open_h5_settled(abs_path, "a") as h5:
 		for name in QSGW_PLOT_DATASETS:
 			if name not in payload:
 				continue

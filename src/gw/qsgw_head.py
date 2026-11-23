@@ -1393,9 +1393,10 @@ def stamp_qsgw_dipole_provenance(path, *, wfn_qp_path, config, wfn, meta,
         fallback_dir=os.path.dirname(os.path.abspath(str(path))))
 
     def _stamp():
+        from file_io.commit_state import open_h5_settled
         import h5py
         from wfn_loader import WfnLoader
-        with h5py.File(str(path), "r+") as h5:
+        with open_h5_settled(str(path), "r+") as h5:
             nb_written = int(h5.attrs["nbands"])
             wfn_qp = WfnLoader(str(wfn_qp_path))
             for key, value in dipole_provenance(

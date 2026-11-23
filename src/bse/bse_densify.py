@@ -131,6 +131,7 @@ def w_tile_centroid_frac(wfn, centroids_file, keep_idx, n_mu: int, *,
     srlr model rows (:func:`_srlr_terms`); a run computes them once and hands
     the same array to all three.
     """
+    from file_io.commit_state import open_h5_settled
     import h5py
     from file_io.centroids import load_centroids
     from file_io.wfn_basis import centroid_table_md5
@@ -144,7 +145,7 @@ def w_tile_centroid_frac(wfn, centroids_file, keep_idx, n_mu: int, *,
             f"GATE w_pair_centroids: {centroids_file} gives {idx.shape[0]} "
             f"centroid rows for a W tile of {int(n_mu)} rows; the W "
             f"densifier would embed the tile on the wrong positions.")
-    with h5py.File(restart_file, "r") as f:
+    with open_h5_settled(restart_file, "r") as f:
         receipt = f.attrs.get("centroids_charge_md5")
     if receipt is not None:
         receipt = receipt.decode() if isinstance(receipt, bytes) else str(receipt)

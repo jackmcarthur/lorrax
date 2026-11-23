@@ -35,10 +35,23 @@ def open_h5_settled(path, mode="r", **kwargs):
     at once. So this refusal, and only this one, is retried (each refusal
     logged) with bounded
     backoff; a file that stays short for ``SETTLE_TIMEOUT_S`` is truly
-    truncated and the original error is raised. Every other error is raised
-    at once. Close-time metadata opens only; no hot path. Prefer one reader
-    (``common.collectives.rank0_read``): this is for the opens that remain,
-    rank 0's reopen of what other clients wrote and per-rank data reads.
+    truncated and an ``OSError`` naming that cause (HDF5's message, the wait
+    and the open count) is raised. Every other error is raised at once.
+
+    The superblock's stored end of file is the writer's own size receipt,
+    laid down at its last close; HDF5 checks it on every open, so a short
+    view never reaches a reader as a file.  Perlmutter scratch shows the same
+    view (2026-11-20/22, lane nips3: five runs lost; every refused eof an exact
+    1 MiB multiple, a ``zeta_q.h5`` read by ``zeta_loader`` minutes after its
+    collective write, on the writer's node and on others).  So THIS is the one
+    route for every serial HDF5 open of an existing file in ``src/`` and
+    ``services/*/src`` (ζ, the ISDF tensor file's V, W and bank members,
+    model and pole files, QP rotations and QP WFN, dipole, kinetic/ionic,
+    parallel transport, Σ and BSE outputs, restart and checkpoint files;
+    ``tests/test_settled_opens_cpu.py`` holds the line).  Not covered: a
+    file created with ``'w'`` (nothing to read back) and the collective
+    MPI-IO opens of ``file_io.slab_io``. Prefer one reader
+    (``common.collectives.rank0_read``) where a value is replicated.
     """
     import sys
     import time
@@ -53,7 +66,12 @@ def open_h5_settled(path, mode="r", **kwargs):
             if "truncated file" not in str(exc):
                 raise
             if time.monotonic() - t0 > SETTLE_TIMEOUT_S:
-                raise
+                raise OSError(
+                    f"{exc} [open_h5_settled: {path} still reads shorter than the end "
+                    f"of file its own superblock records after {tries + 1} opens over "
+                    f"{time.monotonic() - t0:.1f} s; the file is truncated (an "
+                    f"interrupted writer) or this node's size view of it is stale; "
+                    f"do not reuse it: rerun the stage that writes it]") from exc
             tries += 1
             print(f"  [open_h5_settled] {path}: refused open {tries} ({exc}); "
                   f"retrying in {nap:.3f} s", file=sys.stderr, flush=True)
@@ -90,9 +108,7 @@ def agree_io_refusal(error, *, path, stage):
 
 def read_commit_state(path):
     """The receipt of the file at ``path``: 1, 0, or ``None`` if it carries none."""
-    import h5py
-
-    with h5py.File(str(path), "r") as h5:
+    with open_h5_settled(str(path), "r") as h5:
         if COMMIT_STATE not in h5:
             return None
         return int(h5[COMMIT_STATE][0])

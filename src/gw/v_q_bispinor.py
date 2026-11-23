@@ -789,6 +789,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     (:func:`compute_bispinor_tt_tiles`) supply tiles formed from the fits'
     in-memory ζ; the matching loaders are then unused.
     """
+    from file_io.commit_state import open_h5_settled
     from file_io.slab_io import SlabIO
     import h5py
     from .v_q_g_flat import _compute_V_q_g_flat_tiles, v_head_fn_in_V
@@ -922,7 +923,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # write so BispinorVqReader can reject a torn file without rank
     # coordination.  data_ready=True is deliberately the final mutation.
     if jax.process_index() == 0:
-        with h5py.File(output_h5_path, "a") as f:
+        with open_h5_settled(output_h5_path, "a") as f:
             if policy is not None:
                 import uuid
                 if V_QMUNU_RECEIPT_DATASET in f:

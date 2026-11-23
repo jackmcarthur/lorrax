@@ -288,7 +288,7 @@ def write_state_checkpoint(path, *, identity, schema, state, host=None):
                 f.create_dataset("state", data=np.frombuffer(blob, np.uint8))
                 f.create_dataset("record", data=np.bytes_(text))
                 f.attrs["commit"] = hashlib.sha256(text.encode()).hexdigest()
-            with h5py.File(staging, "r") as f:
+            with open_h5_settled(staging, "r") as f:
                 if hashlib.sha256(bytes(f["record"][()])).hexdigest() != str(f.attrs["commit"]):
                     raise ValueError("checkpoint record does not match its commit")
             os.replace(staging, path)

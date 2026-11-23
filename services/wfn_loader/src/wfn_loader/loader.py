@@ -193,10 +193,11 @@ class WfnProvenance:
 
 def read_wfn_provenance(path: str) -> WfnProvenance:
     """Read one canonical MfHeader into the post-hoc authentication view."""
+    from file_io.commit_state import open_h5_settled
     from file_io.mf_header import read_mf_header_from_file
     resolved = str(Path(path).expanduser().resolve())
     WfnLoader.sync_read_staging()
-    with h5.File(resolved, "r") as handle:
+    with open_h5_settled(resolved, "r") as handle:
         mf = read_mf_header_from_file(handle)
     summary = _occupation_summary(mf)
     energies = np.array(mf.energies, dtype=np.float64, copy=True)
@@ -277,6 +278,7 @@ class WfnLoader:
         backend: Literal["auto", "eager", "phdf5"] = "auto",
         qe_schema: str | Path | None = None,
     ) -> None:
+        from file_io.commit_state import open_h5_settled
         self._path = str(path)
         self._filename = self._path  # legacy WFNReader compat
         self._mesh = mesh
@@ -317,7 +319,7 @@ class WfnLoader:
         self.backend = backend
 
         self.sync_read_staging()
-        self._file = h5.File(self._path, "r")
+        self._file = open_h5_settled(self._path, "r")
 
         # The collective read handle (lazy on first load).  Held here so
         # the file is kept open for the loader's lifetime.

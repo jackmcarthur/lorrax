@@ -28,6 +28,7 @@ from typing import NamedTuple
 
 import h5py as h5
 import numpy as np
+from .commit_state import open_h5_settled
 
 
 class MfHeader(NamedTuple):
@@ -142,7 +143,7 @@ def read_mf_header(path: str | Path) -> MfHeader:
     :func:`read_mf_header_from_file` if you already hold an open
     ``h5py.File`` handle (e.g. inside ``WFNReader.__init__``).
     """
-    with h5.File(str(path), 'r') as f:
+    with open_h5_settled(str(path), 'r') as f:
         return _read_group(f)
 
 
@@ -215,7 +216,7 @@ def copy_mf_header(src_path: str | Path, dst_path: str | Path,
     """
     src_path = str(src_path)
     dst_path = str(dst_path)
-    with h5.File(src_path, 'r') as fs, h5.File(dst_path, dst_mode) as fd:
+    with open_h5_settled(src_path, 'r') as fs, open_h5_settled(dst_path, dst_mode) as fd:
         if 'mf_header' in fd:
             raise ValueError(
                 f"copy_mf_header: {dst_path} already has an 'mf_header' "

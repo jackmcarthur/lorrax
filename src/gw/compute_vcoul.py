@@ -225,6 +225,7 @@ def build_bgw_v_grid_fn(
     Returns ``None`` when the override is disabled, so callers can do
     ``bgw_v_grid_fn = build_bgw_v_grid_fn(...)`` unconditionally.
     """
+    from file_io.commit_state import open_h5_settled
     head = config.head
     if not head.use_bgw_vcoul:
         return None
@@ -252,7 +253,7 @@ def build_bgw_v_grid_fn(
     # the 48 ops from an aux sym-reduced WFN when provided.
     if head.bgw_vcoul_sym_wfn:
         aux_path = resolve_input_path(input_dir, head.bgw_vcoul_sym_wfn)
-        with h5py.File(aux_path, "r") as fsym:
+        with open_h5_settled(aux_path, "r") as fsym:
             sym_real = np.asarray(
                 fsym["mf_header/symmetry/mtrx"][:], dtype=np.int32)
         log.debug(f"    crystal sym ops loaded from {aux_path}: {sym_real.shape[0]}")

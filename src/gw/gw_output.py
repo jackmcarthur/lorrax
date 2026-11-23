@@ -385,6 +385,7 @@ def _stamp_screening_diagrams(tensors_filename: str, config, *, members=None) ->
     file attribute of :func:`stamp_w0_route`.  ``members`` names the objects
     this persist wrote (default: every member present).
     """
+    from file_io.commit_state import open_h5_settled
     import h5py
     from common.collectives import barrier, process_rank
     from file_io.restart_bundle import W_SERIES_MEMBERS
@@ -394,7 +395,7 @@ def _stamp_screening_diagrams(tensors_filename: str, config, *, members=None) ->
     if diagrams is None:
         return
     if process_rank() == 0:
-        with h5py.File(tensors_filename, "a") as f:
+        with open_h5_settled(tensors_filename, "a") as f:
             for name in (W_SERIES_MEMBERS if members is None else members):
                 if name in f:
                     f[name].attrs["screening_diagrams"] = str(
@@ -414,12 +415,13 @@ def stamp_w0_route(tensors_filename: str, config) -> None:
     under ``w_bse``, whose stored W(0) is the RPA rung of the ladder, so a
     consumer of the file can say which W it reads and which W Sigma used
     (``file_io.restart_bundle.describe_w0_provenance``)."""
+    from file_io.commit_state import open_h5_settled
     import h5py
     from common.collectives import barrier, process_rank
     mode = getattr(config, "compute_mode", None)
     diagrams = getattr(getattr(config, "screening", None), "diagrams", None)
     if process_rank() == 0 and mode is not None and os.path.exists(tensors_filename):
-        with h5py.File(tensors_filename, "a") as f:
+        with open_h5_settled(tensors_filename, "a") as f:
             f.attrs["gw_compute_mode"] = str(getattr(mode, "value", mode))
             if diagrams is not None and bool(getattr(mode, "needs_screening", True)):
                 f.attrs["gw_screening_diagrams"] = str(
@@ -447,6 +449,7 @@ def persist_ladder_w0(W_q, *, tensors_filename: str, head_resolver, config, meta
     datasets were written; ``False`` under the same write policy that skips
     ``W0_qmunu`` (``write_restart_tensors = false``, or no file).
     """
+    from file_io.commit_state import open_h5_settled
     import h5py
     from common import timing as _tmg
     from common.collectives import barrier, process_rank
@@ -486,7 +489,7 @@ def persist_ladder_w0(W_q, *, tensors_filename: str, head_resolver, config, meta
         write_w0_qmunu_to_h5(tensors_filename, W_full, n_rmu_logical=int(meta.n_rmu),
                              mesh=mesh_xy, qirr=qirr, name=LADDER_W0)
     if process_rank() == 0:
-        with h5py.File(tensors_filename, "a") as f:
+        with open_h5_settled(tensors_filename, "a") as f:
             f[LADDER_W0].attrs["screening_diagrams"] = "w_bse"
             for name in (LADDER_WHEAD, LADDER_S_CART):
                 if name in f:

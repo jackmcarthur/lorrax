@@ -35,6 +35,7 @@ from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSI
     _decode_charge_zeta_identity, _loaded_band_axis, _validate_shape_receipt,
     coulomb_policy_from_config, compare_coulomb_policy, parse_coulomb_policy,
     format_coulomb_policy)
+from .commit_state import open_h5_settled
 
 log = get_logger(__name__)
 
@@ -75,7 +76,7 @@ def read_coulomb_policy_from_h5(filename) -> dict | None:
     any rank before the tensors move.
     """
     try:
-        with h5py.File(filename, "r") as f:
+        with open_h5_settled(filename, "r") as f:
             if COULOMB_POLICY_DATASET not in f:
                 return None
             return parse_coulomb_policy(f[COULOMB_POLICY_DATASET][()])
@@ -110,7 +111,7 @@ def read_downfold_provenance(filename) -> dict | None:
     plus ``keep_idx`` / ``retained_rank_per_q`` as numpy arrays when present.
     """
     try:
-        with h5py.File(filename, "r") as f:
+        with open_h5_settled(filename, "r") as f:
             if DOWNFOLD_PROVENANCE_GROUP not in f:
                 return None
             g = f[DOWNFOLD_PROVENANCE_GROUP]
@@ -197,7 +198,7 @@ def _validate_band_window_receipts(stored_w, stored_carrier, filename):
 def assert_restart_window_matches(filename, band_slices=None,
                                  n_rmu_logical=None) -> None:
     """Authenticate a current bundle and its logical band and centroid receipts."""
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         _require_current(f)
         from .commit_state import assert_committed
         assert_committed(f, path=filename)
@@ -346,7 +347,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *,
     from common.collectives import device_put_process_local
 
     # ---- pass 1: geometry + the small replicated arrays, serial h5py ----
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         _require_current(f)
         parent_T = "psi_parent_y_transverse" in f
         if parent_T != ("psi_parent_y_transverse_mun" in f):
@@ -572,7 +573,7 @@ def read_munu_tensor_from_h5(filename, name, mesh_xy, *, n_rmu_logical=None):
     """
     from .slab_io import SlabIO
 
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         if name not in f:
             return None
         ds_shape = tuple(int(s) for s in f[name].shape)
@@ -637,7 +638,7 @@ def unfold_parent_faces(faces, restart_file, input_file, mesh_xy, *, family="cha
     from gw.centroid_k_unfold import build_centroid_k_unfold_plan
     from wfn_loader import WfnLoader
 
-    with h5py.File(restart_file, "r") as f:
+    with open_h5_settled(restart_file, "r") as f:
         _require_current(f)
         rows = np.asarray(f["psi_parent_k_rows"])
         digest = f.attrs.get({"charge": "centroids_charge_md5",
@@ -689,7 +690,7 @@ def read_head_metadata(filename):
     The static screened body is stored separately. No wavefunction or dense
     interaction is read to authenticate the internal direct-head operator.
     """
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         _require_current(f)
         def value(name):
             return np.asarray(f[name][()]) if name in f else None
@@ -766,7 +767,7 @@ def read_metadata(filename, *, w_series="w_rpa"):
     ``head_cartesian`` entries describe (:data:`W_SERIES_DATASETS`).
     """
     w0_name, whead_name, s_cart_name = W_SERIES_DATASETS[w_series]
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         _require_current(f)
         def value(name):
             return np.asarray(f[name][()]) if name in f else None
@@ -793,7 +794,7 @@ def _interaction_dataset(filename, kind, nohead):
     """The dataset name of a persisted interaction (``bare`` V or ``screened`` W0)."""
     names = {"bare": "V_qmunu", "screened": "W0_qmunu", "screened_ladder": LADDER_W0}
     name = names[kind]
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         _require_current(f)
         if name not in f or not bool(f[name].attrs.get(
                 "V_ready" if kind == "bare" else "W0_ready", kind == "bare")):
@@ -812,7 +813,7 @@ def refuse_mpa_static_w(filename) -> None:
     restart written before the stamp pass.  Called by the BSE drivers when
     they read W, not by the GW restart path.
     """
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         mode = str(np.asarray(f.attrs.get("gw_compute_mode", "")).astype(str)).lower()
     if mode == "mpa":
         raise ValueError(
@@ -872,7 +873,7 @@ def resolve_bse_w_series(params) -> str:
 
 def require_ladder_w0(filename) -> None:
     """``GATE bse_ladder_w0``: ``bse_screening_diagrams = w_bse`` needs a stored ladder W(0)."""
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         ready = LADDER_W0 in f and bool(f[LADDER_W0].attrs.get("W0_ready", False))
         series = _series_attr(f[LADDER_W0]) if LADDER_W0 in f else None
         head = LADDER_WHEAD in f
@@ -908,7 +909,7 @@ def read_w0_provenance(filename) -> dict:
     RPA-series W(0) (the Dyson route, the tangential model at omega = 0, the
     ladder's RPA rung, or BerkeleyGW's projected epsilon).
     """
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         out = {name: (_series_attr(f[name]) if name in f else None)
                for name in W_SERIES_MEMBERS}
         out["present"] = tuple(name for name in W_SERIES_MEMBERS if name in f)
@@ -1007,7 +1008,7 @@ def read_projected_screening(filename, roles, mesh_xy, *, wedge, with_bare=False
 
     fix = ("run gw.epsmat_cli mode = project on BerkeleyGW's eps0mat.h5/epsmat.h5 and "
            "restart from its output_dir")
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         _require_current(f)
         v_storage, v_hash = dataset_q_storage(f["V_qmunu"]), attr(f["V_qmunu"], "qirr_table_hash")
         shapes, heads_file, omegas_file, provenance = {}, None, None, {}
@@ -1057,7 +1058,7 @@ def read_projected_screening(filename, roles, mesh_xy, *, wedge, with_bare=False
         heads[role] = complex(heads_file[int(hit[0])])
 
     if with_bare:
-        with h5py.File(filename, "r") as f:
+        with open_h5_settled(filename, "r") as f:
             shapes["bare"] = ("V_qmunu", tuple(int(n) for n in f["V_qmunu"].shape),
                               f["V_qmunu"].dtype)
     out = {}
@@ -1097,7 +1098,7 @@ def _interaction_rows(filename, name, mesh_xy, *, gamma_only=False):
     from .slab_io import SlabIO
     from symmetry_maps import dataset_q_storage, read_tables, unfold_isdf_operator
 
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         ds_shape = tuple(int(s) for s in f[name].shape)
         ds_dtype = f[name].dtype
         tables = (read_tables(f, name)
@@ -1208,7 +1209,7 @@ def read_wavefunctions(filename, input_file, mesh_xy, *, bands=None, family="cha
     from .slab_io import SlabIO
     names = {"charge": "psi_parent_y", "current": "psi_parent_y_transverse"}
     name = names[family]
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         _require_current(f)
         shape = tuple(f[name].shape)
         dtype = f[name].dtype
@@ -1237,7 +1238,7 @@ def read_lr_channels(filename, *, mesh):
     tables (``None`` when W0 is stored on the full zone).
     """
     from .tagged_arrays import LR_CHANNELS_GROUP
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         if LR_CHANNELS_GROUP not in f:
             return None
         g = f[LR_CHANNELS_GROUP]
@@ -1353,7 +1354,7 @@ def read_coarse_interactions(filename, input_file, mesh_xy, *, include_interacti
 
 def read_downfold_geometry(filename: str) -> dict:
     """The small, replicated facts, read serially before any tensor moves."""
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         _require_current(f)
         psi_key = "psi_parent_y"
         if psi_key not in f:
@@ -1383,7 +1384,7 @@ def read_downfold_geometry(filename: str) -> dict:
     # is the RPA rung, not the ladder W of the run's Sigma.  Said, not refused.
     log.info("  W0 provenance: " + describe_w0_provenance(
         read_w0_provenance(filename), consumer="downfold (U from W0_qmunu)"))
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         geom = {
             "n_rmu_logical": (int(np.asarray(f["n_rmu_logical"])[()])
                               if "n_rmu_logical" in f
@@ -1449,7 +1450,7 @@ def read_interaction_orbits(src: str, mu_L: int, print_fn):
     from symmetry_maps import dataset_q_storage, read_tables
 
     try:
-        with h5py.File(src, "r") as f:
+        with open_h5_settled(src, "r") as f:
             storage = dataset_q_storage(f["V_qmunu"])
         if storage != "ibz":
             print_fn(
@@ -1549,7 +1550,7 @@ def load_dipole_h5(path: str | Path, *, wfn_path, mesh_xy,
                          require_dipole_bands, require_dipole_basis,
                          require_dipole_format)
     from .slab_io import SlabIO
-    with h5py.File(str(path), "r") as f:
+    with open_h5_settled(str(path), "r") as f:
         attrs = dict(f.attrs)
         require_dipole_format(attrs, dipole_path=path)
         require_dipole_basis(attrs, dipole_path=path, wfn_path=wfn_path)
@@ -1596,7 +1597,7 @@ def load_dipole_h5(path: str | Path, *, wfn_path, mesh_xy,
 
 def require_screened_bundle(filename, *, include_w=True, print_fn=print):
     """Authenticate the GW→BSE handoff, including both persistence receipts."""
-    with h5py.File(filename, "r") as f:
+    with open_h5_settled(filename, "r") as f:
         _require_current(f)
         for name, ready in (("V_qmunu", "V_ready"), ("W0_qmunu", "W0_ready")):
             if name not in f or not bool(f[name].attrs.get(ready, name == "V_qmunu")):
@@ -1632,7 +1633,7 @@ def read_qp_wfn_stamp(path) -> dict | None:
         SIGMA_EVAL_PROVENANCE_ATTR,
     )
     try:
-        with h5py.File(str(path), "r") as h5:
+        with open_h5_settled(str(path), "r") as h5:
             raw = h5.attrs.get(QP_WFN_ATTR)
             if raw is None:
                 return None
@@ -1662,7 +1663,7 @@ def read_qp_state_source_provenance(path) -> dict | None:
     """Read a restart source-state record; ``None`` means legacy/unproven."""
     from .qp_wfn import (QP_STATE_SOURCE_DATASET, _validate_qp_state_source)
     try:
-        with h5py.File(str(path), "r") as h5:
+        with open_h5_settled(str(path), "r") as h5:
             if QP_STATE_SOURCE_DATASET not in h5:
                 return None
             raw = h5[QP_STATE_SOURCE_DATASET][()]
@@ -1715,7 +1716,7 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
         normalize_qp_sc_seed_policy,
     )
     path = os.fspath(h5_path)
-    with h5py.File(path, "r") as h5:
+    with open_h5_settled(path, "r") as h5:
         has_full_energies = QP_ROT_FULL_ENERGIES_DATASET in h5
         has_occupations = QP_ROT_OCCUPATIONS_DATASET in h5
     arrays = read_qp_rotations_full_bz(
@@ -1728,7 +1729,7 @@ def read_qp_rotations_artifact(h5_path: str) -> dict:
             path, datasets=(QP_ROT_FULL_ENERGIES_DATASET,)))
     missing = [name for name in ("U_mnk", "E_qp_nk_rydberg")
                if name not in arrays]
-    with h5py.File(path, "r") as h5:
+    with open_h5_settled(path, "r") as h5:
         missing.extend(name for name in QP_ROT_METADATA_DATASETS
                        if name not in h5)
         if missing:
@@ -2054,7 +2055,7 @@ def read_qp_rotations_full_bz(h5_path: str, datasets=None) -> dict:
     names = tuple(datasets) if datasets is not None else QP_ROT_K_DATASETS
     star = read_star_map(h5_path, names[0])
     out = {}
-    with h5py.File(h5_path, "r") as f:
+    with open_h5_settled(h5_path, "r") as f:
         for name in names:
             if name not in f:
                 continue
@@ -2142,14 +2143,14 @@ def _read_eval_energies_ev(
 	    k-set (the IBZ) and ALL bands, so it is sliced in bands and not
 	    in k.
 	"""
-	with h5py.File(path, "r") as f:
+	with open_h5_settled(path, "r") as f:
 		has_rot = "E_qp_nk_rydberg" in f
 	if has_rot:
 		e = np.asarray(read_qp_rotations_full_bz(
 			path, datasets=("E_qp_nk_rydberg",))["E_qp_nk_rydberg"],
 			dtype=np.float64)
 		return e[np.asarray(kirr_to_kfull, dtype=np.int64)] * RYD_TO_EV
-	with h5py.File(path, "r") as f:
+	with open_h5_settled(path, "r") as f:
 		if "mf_header/kpoints/el" in f:
 			e = np.asarray(f["mf_header/kpoints/el"], dtype=np.float64)
 			return e[0][:, int(band_start):int(band_stop)] * RYD_TO_EV
@@ -2199,7 +2200,7 @@ class BispinorVqReader:
         # would dominate.  Validate all metadata before opening SlabIO: its
         # constructor opens a collective PhdfCtx which only __exit__ can
         # close, so a constructor-time refusal must happen first.
-        with h5py.File(self._filename, "r") as f:
+        with open_h5_settled(self._filename, "r") as f:
             def _read_scalar(name):
                 if name not in f:
                     raise ValueError(
@@ -2393,7 +2394,7 @@ def read_photon_gamma(directory, mesh_xy, bases):
     """Return canonical Gamma one-leg factors, each sharded on μ_X."""
     from .slab_io import SlabIO
     path = os.path.join(directory, "v_q_bispinor.h5")
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         names = tuple(f"photon_g0_vectors_{channel}" for channel in range(len(bases)))
         if any(name not in f or f[name].shape != (1, basis.n_logical)
                for name, basis in zip(names, bases)):
@@ -2407,7 +2408,7 @@ def read_photon_gamma(directory, mesh_xy, bases):
 def read_bispinor_v_receipt(path):
     """The generation receipt a bispinor V file carries (JSON str), or None."""
     from gw.v_q_bispinor import V_QMUNU_RECEIPT_DATASET
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         if V_QMUNU_RECEIPT_DATASET not in f:
             return None
         raw = f[V_QMUNU_RECEIPT_DATASET][()]
@@ -2425,7 +2426,7 @@ def require_bispinor_v_pairing(tensors_filename, v_path, running_policy):
     """
     from .tagged_arrays import BISPINOR_V_RECEIPT_DATASET
     v_receipt = read_bispinor_v_receipt(v_path)
-    with h5py.File(tensors_filename, "r") as f:
+    with open_h5_settled(tensors_filename, "r") as f:
         raw = (np.asarray(f[BISPINOR_V_RECEIPT_DATASET]).tolist()
                if BISPINOR_V_RECEIPT_DATASET in f else None)
     t_receipt = (None if raw is None else
@@ -2508,7 +2509,7 @@ def read_eqp_assembly_receipt(filepath):
 	with open_scope(
 			abs_path, STACK_H5PY, "r",
 			where="read_eqp_assembly_receipt"), \
-			h5py.File(abs_path, "r") as h5:
+			open_h5_settled(abs_path, "r") as h5:
 		expected = (h5[EQP_ASSEMBLY_EXPECTED_DATASET][()]
 			if EQP_ASSEMBLY_EXPECTED_DATASET in h5 else None)
 		canonical_present = EQP_ASSEMBLY_DATASET in h5
@@ -2770,7 +2771,7 @@ def read_eval_energies(filepath):
 	abs_path = os.path.abspath(filepath)
 	with open_scope(
 			abs_path, STACK_H5PY, "r", where="read_eval_energies"), \
-			h5py.File(abs_path, "r") as h5:
+			open_h5_settled(abs_path, "r") as h5:
 		return _eval_metadata_from_open_h5(h5)
 
 
@@ -2933,7 +2934,7 @@ def open_zeta(path, **kwargs):
 def read_dipole_metadata(path):
     """Return small dipole provenance and coverage attributes."""
     from .dipole import require_dipole_format
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         attrs = dict(f.attrs)
         attrs["stored_bands"] = int(f["dipole_cart"].shape[-1])
     require_dipole_format(attrs, dipole_path=path)
@@ -2949,12 +2950,12 @@ def read_dipole_cv_block(path, *, nelec: int, mesh: Mesh, wfn_path):
     operator/window provenance stays with the head's admission owner.
     """
     from .dipole import require_dipole_basis, require_dipole_format
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         require_dipole_format(f.attrs, dipole_path=path)
         _, nk, nb, _ = f["dipole_cart"].shape
     nv = max(0, min(int(nelec), int(nb)))
     if nv == 0 or nv == nb:
-        with h5py.File(path, "r") as f:
+        with open_h5_settled(path, "r") as f:
             require_dipole_basis(f.attrs, dipole_path=path, wfn_path=wfn_path)
         return (jnp.zeros((3, nk, nb - nv, nv), jnp.complex128),
                 jnp.zeros((nk, nb - nv, nv), jnp.float64))
@@ -2989,7 +2990,7 @@ def read_dipole_parent_window(path, parent_rows, band_start, band_stop, *,
     from runtime.padding import padded_axis
     from .dipole import DIPOLE_DATASET, require_dipole_format
     from .slab_io import SlabIO
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         require_dipole_format(f.attrs, dipole_path=path)
         _, nk_file, nb_file, _ = f[DIPOLE_DATASET].shape
     if nk_file != int(nk_full):
@@ -3039,7 +3040,7 @@ def dipole_operator_mismatches(path, *, skip_vnl, vnl_mode, hubbard=None,
     from .dipole import prov_ne as _prov_ne
     from .dipole import require_dipole_format
     want = {"prov_skip_vnl": skip_vnl, "prov_vnl_mode": vnl_mode}
-    with h5py.File(str(path), "r") as h5:
+    with open_h5_settled(str(path), "r") as h5:
         require_dipole_format(h5.attrs, dipole_path=path)
         attrs = {k: h5.attrs[k] for k in (*want, "prov_hubbard", "prov_bispinor")
                  if k in h5.attrs}
@@ -3185,7 +3186,7 @@ def _load_matrix_submatrix(
 	# Authenticate the dataset's own k-storage stamp and star tables before
 	# issuing any collective payload read.
 	star = read_star_map(h5_path, dataset)
-	with h5py.File(h5_path, "r") as h5:
+	with open_h5_settled(h5_path, "r") as h5:
 		if dataset not in h5:
 			raise KeyError(f"Dataset {dataset!r} missing from {h5_path}")
 		nk_stored, nb_total, nb_total2 = h5[dataset].shape
@@ -3228,7 +3229,7 @@ def read_kin_ion_provenance(h5_path: str) -> dict:
 	if not os.path.exists(h5_path):
 		raise FileNotFoundError(f"kin_ion file not found: {h5_path}")
 	star = read_star_map(h5_path, "kin_ion")
-	with h5py.File(h5_path, "r") as h5:
+	with open_h5_settled(h5_path, "r") as h5:
 		if "kin_ion" not in h5:
 			raise KeyError("Dataset 'kin_ion' missing from kin_ion file")
 		ds = h5["kin_ion"]
@@ -3259,7 +3260,7 @@ def read_full_bz_dataset(h5_path: str, dataset: str = "kin_ion"):
 	"""
 	from file_io.kin_ion import (_unfold_if_ibz)
 	star = read_star_map(h5_path, dataset)
-	with h5py.File(h5_path, "r") as h5:
+	with open_h5_settled(h5_path, "r") as h5:
 		if dataset not in h5:
 			raise KeyError(f"Dataset {dataset!r} missing from {h5_path}")
 		arr = np.asarray(h5[dataset][()])
@@ -3304,7 +3305,7 @@ def read_star_map(h5_path: str, dataset: str = "kin_ion", *, k_axis: int = 0):
 		N_SYM_SPATIAL_ATTR,
 		SYM_IDX_DATASET,
 	)
-	with h5py.File(h5_path, "r") as h5:
+	with open_h5_settled(h5_path, "r") as h5:
 		if dataset not in h5:
 			raise KeyError(f"Dataset {dataset!r} missing from {h5_path}")
 		ds = h5[dataset]
@@ -3389,7 +3390,7 @@ def check_kpoints_against_run(h5_path, kpoints_crys, *, rows=None, print_fn=prin
 	"""
 	from file_io.kin_ion import KPOINTS_FULL_DATASET
 	name = os.path.basename(h5_path)
-	with h5py.File(h5_path, "r") as h5:
+	with open_h5_settled(h5_path, "r") as h5:
 		if KPOINTS_FULL_DATASET not in h5:
 			print_fn(f"  NOTE: {name} carries no {KPOINTS_FULL_DATASET} (written "
 			         f"before 2026-11-16); its k order is not checked.")
@@ -4637,7 +4638,7 @@ def check_dipole_provenance(
 
     from .dipole import require_dipole_format
     try:
-        with h5py.File(str(path), "r") as h5:
+        with open_h5_settled(str(path), "r") as h5:
             require_dipole_format(h5.attrs, dipole_path=path)
             attrs = {k: h5.attrs[k] for k in _PROV_ATTRS if k in h5.attrs}
             ncond_mismatch = (
@@ -5279,7 +5280,7 @@ def _decode_isdf_str(v) -> str:
 
 def read_isdf_header(path: str | Path) -> IsdfHeader:
     """Open ``path`` and return its ``isdf_header`` group."""
-    with h5py.File(str(path), 'r') as f:
+    with open_h5_settled(str(path), 'r') as f:
         return _read_isdf_group(f)
 
 

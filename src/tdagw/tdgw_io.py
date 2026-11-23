@@ -118,9 +118,10 @@ def _k_lookup(kpts, kgrid, kshift):
 
 def read_header(tdgw_dir: str):
     """The raw ``tdgw_header`` groups of ``tdgw_dir/tdgw.h5`` (read-only)."""
+    from file_io.commit_state import open_h5_settled
     import h5py
     path = os.path.join(tdgw_dir, "tdgw.h5")
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         g = f["tdgw_header"]
         st, wf, dp = g["structure"], g["wfn_header"], g["dipole"]
         hdr = dict(
@@ -223,8 +224,9 @@ def read_bgw_kernel(path: str, *, ivbm: int, bands: tuple):
     mapped onto the propagated window ``bands`` = (start, stop, step), 1-based
     absolute indices.  cslice/vslice are window positions (TDA).
     """
+    from file_io.commit_state import open_h5_settled
     import h5py
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         hg = f["bse_header"]
         flavor = int(hg["flavor"][()])
         nblocks = int(hg["params/nblocks"][()])
@@ -275,11 +277,12 @@ def read_bgw_kernel(path: str, *, ivbm: int, bands: tuple):
 # ---------------------------------------------------------------------------
 
 def _copy_or_write_header(f, hdr):
+    from file_io.commit_state import open_h5_settled
     import h5py
     g = f.create_group("tdgw_header")
     g.create_dataset("version", data=np.array(TDGW_LAYOUT_VERSION), dtype=np.int32)
     if hdr.get("path"):
-        with h5py.File(hdr["path"], "r") as src:
+        with open_h5_settled(hdr["path"], "r") as src:
             for name in ("structure", "wfn_header", "dipole"):
                 src.copy(src["tdgw_header"][name], g, name=name)
         return g
@@ -343,8 +346,9 @@ def init_output(path: str, hdr: dict, *, t0, tf, mdt, mtsteps, measurements):
 
 def write_samples(path: str, rows: dict):
     """rows: {dset_name: (start, data)}; writes data[...] at rows start:."""
+    from file_io.commit_state import open_h5_settled
     import h5py
-    with h5py.File(path, "a") as f:
+    with open_h5_settled(path, "a") as f:
         td = f["tdgw_data/time_domain"]
         for name, (start, data) in rows.items():
             if len(data):
@@ -390,8 +394,9 @@ def write_checkpoint(path: str, *, it_next: int, tchkp: float, lessG, carry=None
     caller writes every trial's measurement rows before the first checkpoint
     (``stages._write_chunk``).
     """
+    from file_io.commit_state import open_h5_settled
     import h5py
-    with h5py.File(path, "a") as f:
+    with open_h5_settled(path, "a") as f:
         c = f["tdgw_data/checkpoint"]
         if carry is not None:
             _write_carry(f, c, carry, it_next=it_next, tchkp=tchkp)
@@ -454,8 +459,9 @@ def read_checkpoint(path: str) -> dict:
     fields; a checkpoint that writer had already torn (new ``it_next`` beside
     the old carry) cannot be detected.
     """
+    from file_io.commit_state import open_h5_settled
     import h5py
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         c = f["tdgw_data/checkpoint"]
         out = dict(it_next=int(c["it_next"][()]), tchkp=float(c["tchkp"][()]),
                    leaves=None, step=None, fingerprint=None, torn=False)
@@ -483,8 +489,9 @@ def copy_samples(src: str, dst: str, rows: dict):
     TDGW's ``BaseDriver.load_data`` for a restart on the same measurement
     grid; ``src`` is opened read-only.
     """
+    from file_io.commit_state import open_h5_settled
     import h5py
-    with h5py.File(src, "r") as a, h5py.File(dst, "a") as b:
+    with open_h5_settled(src, "r") as a, open_h5_settled(dst, "a") as b:
         ta, tb = a["tdgw_data/time_domain"], b["tdgw_data/time_domain"]
         for name, n in rows.items():
             if n:

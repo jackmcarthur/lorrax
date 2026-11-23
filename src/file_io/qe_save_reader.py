@@ -44,6 +44,7 @@ import numpy as np
 import h5py
 
 from common.log import get_logger
+from .commit_state import open_h5_settled
 
 log = get_logger(__name__)
 
@@ -364,7 +365,7 @@ class CrystalData:
         cd_path = os.path.join(self._save_dir, "charge-density.hdf5")
         if not os.path.isfile(cd_path):
             return ()
-        with h5py.File(cd_path, "r") as f:
+        with open_h5_settled(cd_path, "r") as f:
             return tuple(sorted(f.keys()))
 
     # ------------------------------------------------------------------
@@ -377,7 +378,7 @@ class CrystalData:
         nx, ny, nz = self.fft_grid
         N = nx * ny * nz
 
-        with h5py.File(cd_path, "r") as f:
+        with open_h5_settled(cd_path, "r") as f:
             miller = f["MillerIndices"][:]
             rho_ri = f["rhotot_g"][:]
 
@@ -399,7 +400,7 @@ class CrystalData:
         cd_path = os.path.join(self._save_dir, "charge-density.hdf5")
         nx, ny, nz = self.fft_grid
         out = np.zeros((3, nx, ny, nz), dtype=np.float64)
-        with h5py.File(cd_path, "r") as f:
+        with open_h5_settled(cd_path, "r") as f:
             miller = f["MillerIndices"][:]
             ix, iy, iz = miller[:, 0] % nx, miller[:, 1] % ny, miller[:, 2] % nz
             for i, name in enumerate(("m_x", "m_y", "m_z")):

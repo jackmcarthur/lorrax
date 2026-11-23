@@ -992,10 +992,11 @@ def _stamp_downfold_provenance(filename, cfg, geom, keep_idx, mu_S, *,
     reader that wants to know can ask.  Everything needed to reproduce the
     compression, or to map an index back to the parent, is here.
     """
+    from file_io.commit_state import open_h5_settled
     if process_rank() != 0:
         barrier("downfold.provenance")
         return
-    with h5py.File(filename, "a") as f:
+    with open_h5_settled(filename, "a") as f:
         if "downfold_provenance" in f:
             del f["downfold_provenance"]
         g = f.create_group("downfold_provenance")
@@ -1096,10 +1097,11 @@ def _stamp_isdf_basis(filename, parent_table, kept_table, zeta_file, *,
     path that silently resolves somewhere else.  Every reader treats a
     missing file as "not available" and says so; none of them requires it.
     """
+    from file_io.commit_state import open_h5_settled
     if process_rank() != 0:
         barrier("downfold.isdf_basis")
         return
-    with h5py.File(filename, "a") as f:
+    with open_h5_settled(filename, "a") as f:
         g = f["downfold_provenance"]
         if parent_table:
             g.attrs["parent_centroids_file"] = str(os.path.abspath(parent_table))
@@ -1192,6 +1194,7 @@ def write_downfolded_zeta(src_restart, out_file, T, keep_idx, mu_S, n_q,
 
     Returns the written path, or ``""`` when no ζ was transported.
     """
+    from file_io.commit_state import open_h5_settled
     from file_io.isdf_header import (IsdfHeader, mark_zeta_done, write_isdf_header)
     from file_io.restart_bundle import (read_isdf_header)
     from file_io.mf_header import copy_mf_header
@@ -1317,7 +1320,7 @@ def write_downfolded_zeta(src_restart, out_file, T, keep_idx, mu_S, n_q,
                 os.remove(out_zeta)
             copy_mf_header(src_zeta, out_zeta, dst_mode="w")
             write_isdf_header(out_zeta, small_hdr, mode="a")
-            with h5py.File(out_zeta, "a") as f:
+            with open_h5_settled(out_zeta, "a") as f:
                 ds = f.create_dataset(
                     "zeta_q_G", shape=(nq_disk, int(mu_S), ngkmax),
                     dtype=np.complex128, chunks=(1, int(mu_S), ngkmax))
@@ -1692,6 +1695,7 @@ def _write_centroid_subset(cfg, keep_idx, out_file, parent_table, fft_grid, *,
 
     Returns ``(kept_table_path, parent_table_path)``; either may be ``""``.
     """
+    from file_io.commit_state import open_h5_settled
     if not parent_table:
         return "", ""
     # Validated on EVERY rank — a refusal raised only on rank 0 would hang
@@ -1723,7 +1727,7 @@ def _write_centroid_subset(cfg, keep_idx, out_file, parent_table, fft_grid, *,
                 f"itself; it simply has no stamp to check them against.")
         else:
             md5 = _centroid_table_md5(_frac_to_fft_idx(kept, fft_grid))
-            with h5py.File(out_file, "a") as f:
+            with open_h5_settled(out_file, "a") as f:
                 f.attrs["centroids_charge_md5"] = md5
             log.info(f"  [downfold] wrote {out} ({len(keep_idx)} kept "
                      f"centroids, centroids_charge_md5 {md5[:12]}...) and "

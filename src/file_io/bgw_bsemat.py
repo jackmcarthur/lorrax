@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import h5py
 import numpy as np
+from .commit_state import open_h5_settled
 
 __all__ = ["MATRICES", "VERSION", "FLAVOR", "ICUTV_OF_SYS_DIM", "matrix_shape",
            "create_bsemat_file", "register_matrices", "read_bsemat_header",
@@ -46,7 +47,7 @@ def matrix_shape(nk, n1b, n2b, ns=1):
 
 def read_wfn_k_list(wfn_file):
     """``(kpts (nk, 3) crystal, kgrid (3,), bdot (3, 3) bohr⁻², celvol bohr³)`` of a WFN."""
-    with h5py.File(wfn_file, "r") as w:
+    with open_h5_settled(wfn_file, "r") as w:
         m = w["mf_header"]
         rk = np.asarray(m["kpoints/rk"][()], dtype=np.float64)
         if rk.shape[0] == 3 and rk.shape[1] != 3:
@@ -74,7 +75,7 @@ def create_bsemat_file(path, *, wfn_file, kpts, kgrid, nvb, ncb, extended, icutv
     nk = int(np.asarray(kpts).shape[0])
     shape = matrix_shape(nk, n1b, n2b, ns)
     i4 = np.int32
-    with h5py.File(wfn_file, "r") as w, h5py.File(path, "w") as f:
+    with open_h5_settled(wfn_file, "r") as w, h5py.File(path, "w") as f:
         w.copy("mf_header", f)
         f["bse_header/versionnumber"] = i4(VERSION)
         f["bse_header/flavor"] = i4(FLAVOR)
@@ -108,7 +109,7 @@ def register_matrices(io, shape):
 
 def read_bsemat_header(path):
     """Small header facts of a bsemat file as a dict (serial h5py, any rank)."""
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         out = {k: np.asarray(f["bse_header/" + k][()]) for k in (
             "versionnumber", "flavor", "params/screening", "params/icutv",
             "params/theory", "params/nblocks", "params/nmat", "bands/nvb",

@@ -232,10 +232,11 @@ def window_energies(window: dict) -> tuple[np.ndarray, int]:
 
 def _structure(input_file: str) -> dict:
     """rprim (bohr, rows), atoms, FFT grid, cell volume from the deck's WFN header."""
+    from file_io.commit_state import open_h5_settled
     import h5py
     from gw.gw_config import LorraxConfig
     path = LorraxConfig.from_input_file(input_file).paths.wfn_file
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         cr = f["mf_header/crystal"]
         alat = float(cr["alat"][()])
         avec = np.asarray(cr["avec"][()], dtype=np.float64)

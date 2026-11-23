@@ -65,6 +65,7 @@ from .wfn_basis import (
     WavefunctionBasisReceipt,
     centroid_table_md5,
 )
+from .commit_state import open_h5_settled
 
 
 _GROUP = 'isdf_header'
@@ -78,7 +79,7 @@ def read_zeta_storage_metadata(path: str | Path) -> dict:
     allocating wavefunction caches. Legacy completion/layout defaults match
     :class:`IsdfHeader`.
     """
-    with h5.File(str(path), 'r') as f:
+    with open_h5_settled(str(path), 'r') as f:
         grid = np.asarray(f['mf_header/kpoints/kgrid'][()], dtype=np.int64)
         if grid.shape != (3,) or np.any(grid <= 0):
             raise ValueError(f"invalid ζ kgrid {grid.tolist()} in {path}")
@@ -315,7 +316,7 @@ def write_isdf_header(
     Refuses to overwrite an existing ``isdf_header`` group — the
     caller should delete it explicitly first if a rewrite is needed.
     """
-    with h5.File(str(path), mode) as f:
+    with open_h5_settled(str(path), mode) as f:
         if _GROUP in f:
             raise ValueError(
                 f"write_isdf_header: {path} already has an "
@@ -348,7 +349,7 @@ def mark_zeta_done(path: str | Path) -> None:
     Idempotent: a missing dataset is created; an existing one is
     overwritten in place.
     """
-    with h5.File(str(path), 'a') as f:
+    with open_h5_settled(str(path), 'a') as f:
         if _GROUP not in f:
             raise ValueError(
                 f"mark_zeta_done: {path} has no '{_GROUP}' group")
@@ -371,7 +372,7 @@ def stamp_fit_provenance(path: str | Path, provenance: str) -> None:
     ``provenance`` is a JSON string; see ``gw.gw_init._zeta_fit_provenance``
     for the schema and ``_zeta_reuse_ok`` for the comparison.
     """
-    with h5.File(str(path), 'a') as f:
+    with open_h5_settled(str(path), 'a') as f:
         if _GROUP not in f:
             raise ValueError(
                 f"stamp_fit_provenance: {path} has no '{_GROUP}' group")

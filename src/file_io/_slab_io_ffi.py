@@ -2568,7 +2568,7 @@ class _FfiBackend(_DatasetGeometry):
                 from .hdf5_owner import STACK_H5PY, open_scope
                 with open_scope(path, STACK_H5PY, mode,
                                 where="SlabIO commit-state preflight"), \
-                        h5py.File(path, mode) as h5:
+                        open_h5_settled(path, mode) as h5:
                     assert_committed(h5, path=path)
                     if mode == "a":
                         set_commit_state(h5, False)
@@ -2920,7 +2920,7 @@ class _FfiBackend(_DatasetGeometry):
                         where=f"_FfiBackend._introspect_dataset({name!r})"), \
                 _journal.op_scope("attr_r", self.path, stack=_J_H5PY,
                                   ds=name, mode="r", handle=self.fh):
-            with h5py.File(self.path, "r") as f:
+            with open_h5_settled(self.path, "r") as f:
                 ds = f[name]
                 shape = tuple(int(s) for s in ds.shape)
                 dtype = np.dtype(ds.dtype)
@@ -2997,7 +2997,7 @@ class _FfiBackend(_DatasetGeometry):
                             where=f"_FfiBackend.read_whole({name!r})"), \
                     _journal.op_scope("read", self.path, stack=_J_H5PY,
                                       ds=name, mode="r", handle=self.fh):
-                with h5py.File(self.path, "r") as f:
+                with open_h5_settled(self.path, "r") as f:
                     out = np.asarray(f[name][()])
             return out.astype(want, copy=False) if dtype is not None else out
         # Journaled by ``SlabIO.read_small``, the public entry point — one line

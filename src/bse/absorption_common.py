@@ -271,7 +271,8 @@ def load_exciton_dipoles_h5(path: str | Path):
     Reads ``exciton_data/dipoles`` (a LORRAX extension of the BGW file,
     ``bse/eigenvectors.h5.spec``) without touching the eigenvectors.
     """
-    with h5py.File(str(path), "r") as f:
+    from file_io.commit_state import open_h5_settled
+    with open_h5_settled(str(path), "r") as f:
         if "dipoles" not in f["exciton_data"]:
             raise KeyError(
                 f"{path!s} has no exciton_data/dipoles: it was written without "
@@ -305,7 +306,8 @@ def load_eigenvectors_h5(path: str | Path):
     ``exciton_data/dipoles`` (:func:`load_exciton_dipoles_h5`).
     ``kpts`` is BerkeleyGW's ``(nk, 3)``.
     """
-    with h5py.File(str(path), "r") as f:
+    from file_io.commit_state import open_h5_settled
+    with open_h5_settled(str(path), "r") as f:
         eigvals_eV = np.asarray(f["exciton_data/eigenvalues"][:], dtype=np.float64)
         evecs = np.asarray(f["exciton_data/eigenvectors"][:])  # (nQ,N,nk,nc,nv,ns,2)
         use_tda = bool(int(f["exciton_header/params/use_tda"][()]))
@@ -662,6 +664,7 @@ def polarization_directions(polarization, wfn_path):
     normalized (on a non-orthogonal lattice that is a different direction and
     length).  ``directions`` is ``(n_pol, 3)``, real, unit rows, Cartesian.
     """
+    from file_io.commit_state import open_h5_settled
     if polarization is None:
         return np.eye(3), ("b1", "b2", "b3")
     p = np.asarray(polarization, dtype=np.float64).reshape(-1)
@@ -669,7 +672,7 @@ def polarization_directions(polarization, wfn_path):
         raise ValueError(f"polarization takes three components p1 p2 p3 along b1 b2 b3, "
                          f"not all zero; got {polarization!r}")
     import h5py
-    with h5py.File(wfn_path, "r") as f:
+    with open_h5_settled(wfn_path, "r") as f:
         bvec = np.asarray(f["mf_header/crystal/bvec"][()], dtype=np.float64)  # rows b_i
     e = p @ bvec
     return (e / np.linalg.norm(e))[None, :], ("e",)

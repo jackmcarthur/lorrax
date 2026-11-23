@@ -508,13 +508,14 @@ def _write_all_roots(input_file, energies_ev, dipoles, nk: int, *, noeh=None,
     writes the window transitions to ``eigenvalues*_noeh.dat``
     (``absorption_common.write_bgw_eigenvalues_noeh``); those paths are not
     returned.  Returns the paths (on every rank)."""
+    from file_io.commit_state import open_h5_settled
     from .absorption_common import (eigenvalue_file_names, polarization_directions,
                                     write_bgw_eigenvalues, write_bgw_eigenvalues_noeh)
     from .bse_window import _parse_wfn_path
     wfn_path = _parse_wfn_path(input_file)
     directions, labels = polarization_directions(polarization, wfn_path)
     import h5py
-    with h5py.File(wfn_path, "r") as f:
+    with open_h5_settled(wfn_path, "r") as f:
         celvol = float(f["mf_header/crystal/celvol"][()])
         n_spin = int(f["mf_header/kpoints/nspin"][()])
         n_spinor = int(f["mf_header/kpoints/nspinor"][()])

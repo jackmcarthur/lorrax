@@ -190,6 +190,7 @@ class ZetaLoader:
         mesh: Mesh | None = None,
         mode: str = "r",
     ) -> None:
+        from file_io.commit_state import open_h5_settled
         self._path = str(path)
         self._mesh = mesh
 
@@ -197,7 +198,7 @@ class ZetaLoader:
         bind_isdf_attrs, read_isdf_header_from_file = _isdf_header_binders()
 
         # Read both headers + the ζ dataset shape in one open.
-        with h5.File(self._path, "r") as f:
+        with open_h5_settled(self._path, "r") as f:
             mf = read_mf_header_from_file(f)
             isdf = read_isdf_header_from_file(f)
             _ds_name = ('zeta_q_G' if isdf.zeta_layout == 'G_flat'
@@ -559,6 +560,7 @@ class ZetaLoader:
 
         The handle opens on the FIRST call and closes in :meth:`close`.
         """
+        from file_io.commit_state import open_h5_settled
         self._refuse_unless_g_flat("read_zeta_G_local")
         if self._closed:
             raise RuntimeError(
@@ -567,7 +569,7 @@ class ZetaLoader:
                 f"with close() — re-open the loader if you still need "
                 f"tiles.")
         if self._local_ds is None:
-            self._local_h5 = h5.File(self._path, "r")
+            self._local_h5 = open_h5_settled(self._path, "r")
             self._local_ds = self._local_h5["zeta_q_G"]
         return self._local_ds[key]
 

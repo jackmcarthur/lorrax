@@ -438,9 +438,10 @@ def _fingerprint_h5_attrs(digest, label: str, obj) -> None:
 
 def _fingerprint_wfn_file(digest, path) -> None:
     """Hash semantic WFN content without hashing its pathname or inode."""
+    from file_io.commit_state import open_h5_settled
     import h5py
 
-    with h5py.File(path, "r") as h5:
+    with open_h5_settled(path, "r") as h5:
         _fingerprint_h5_attrs(digest, "/", h5)
 
         # The mean-field header is small relative to the coefficients, so its

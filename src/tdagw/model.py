@@ -756,8 +756,9 @@ def _gamma_row(restart_file: str, kgrid) -> int:
     shares that row order.  (A G-sphere at q ≠ 0 also holds Miller index 0,
     so the G list alone cannot identify Γ.)
     """
+    from file_io.commit_state import open_h5_settled
     import h5py
-    with h5py.File(restart_file, "r") as f:
+    with open_h5_settled(restart_file, "r") as f:
         if "V_qmunu__qirr" in f and "q_irr_frac" in f["V_qmunu__qirr"]:
             q = np.asarray(f["V_qmunu__qirr/q_irr_frac"][()], dtype=np.float64).reshape(-1, 3)
         else:

@@ -37,12 +37,13 @@ import h5py
 import numpy as np
 
 from .bgw_epsmat import DIAGONAL, MATRIX
+from .commit_state import open_h5_settled
 
 class EPSReader:
     def __init__(self, filename):
         """Initialize EPSMATReader with epsmat.h5 file."""
         self._filename = filename
-        self._file = h5py.File(filename, 'r')
+        self._file = open_h5_settled(filename, 'r')
         
         # Read eps_header information
         # Version and flavor

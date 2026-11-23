@@ -2902,6 +2902,7 @@ def _write_fresh_restart(
         tensors_filename, transverse_wfn_data, wfn, wfns_transverse,
         write_restart_state_to_h5):
     """Write the existing authenticated Coulomb and parent-face restart bundle."""
+    from file_io.commit_state import open_h5_settled
     enk_full, _ = get_enk_bandrange(
         wfn, sym, band_slices.full_range,
         (band_slices.b1, band_slices.b3), nspinor=meta.nspinor)
@@ -2967,7 +2968,7 @@ def _write_fresh_restart(
         )
         if jax.process_index() == 0:
                 try:
-                        with h5py.File(tensors_filename, 'a') as _f:
+                        with open_h5_settled(tensors_filename, 'a') as _f:
                                 _f.attrs['centroids_charge_md5'] = (
                                         _centroid_table_md5(centroid_indices))
                                 _f.attrs['charge_representation'] = (

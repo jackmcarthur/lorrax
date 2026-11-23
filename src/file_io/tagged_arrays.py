@@ -29,6 +29,7 @@ from runtime.padding import (
     padded_axis,
     padded_mu_axis,
 )
+from .commit_state import open_h5_settled
 
 
 log = get_logger(__name__)
@@ -143,7 +144,7 @@ def register_tangential_restart_member(
     def _write():
         # r+ cannot accidentally create a missing restart. Model validation
         # has released its handle before this metadata-only transaction.
-        with h5py.File(restart_path, "r+") as h5:
+        with open_h5_settled(restart_path, "r+") as h5:
             assert_committed(h5, path=restart_path)
             present = _member_dataset(h5)
             if present is not None:
@@ -213,7 +214,7 @@ def read_tangential_restart_member(
         member, error = None, None
         try:
             restart_path = restart_path.resolve()
-            with h5py.File(restart_path, "r") as h5:
+            with open_h5_settled(restart_path, "r") as h5:
                 assert_committed(h5, path=restart_path)
                 present = _member_dataset(h5)
                 if present is not None:
@@ -774,7 +775,7 @@ def write_restart_state_to_h5(
         # way to distinguish physical rows from its mesh pad and stays on its
         # historical full-carrier storage path.
         barrier("restart_band_receipt_before_read")
-        with h5py.File(filename, "r") as f:
+        with open_h5_settled(filename, "r") as f:
             schema = (int(np.asarray(f[BAND_WINDOW_SCHEMA_DATASET])[()])
                       if BAND_WINDOW_SCHEMA_DATASET in f else None)
             if schema == BAND_WINDOW_SCHEMA_VERSION and "band_window" in f:
@@ -1064,7 +1065,7 @@ def write_restart_state_to_h5(
     def _publish_readiness():
         if not (w0_touched or v_touched):
             return
-        with h5py.File(filename, "a") as f:
+        with open_h5_settled(filename, "a") as f:
             set_commit_state(f, False)
             if qirr is not None and qirr.store_wedge:
                 _stamp_qirr(f, qirr, n_rmu_logical,
@@ -1213,7 +1214,7 @@ def write_w0_qmunu_to_h5(
     # ``write_restart_state_to_h5``: SlabIO has released the file and no
     # other writer may open it between these two statements.
     def _publish_w0():
-        with h5py.File(filename, "a") as f:
+        with open_h5_settled(filename, "a") as f:
             set_commit_state(f, False)
             if qirr is not None and qirr.store_wedge:
                 _stamp_qirr(f, qirr, n_rmu_logical, v_touched=False,
@@ -1321,7 +1322,7 @@ def write_head_wings_to_h5(
             f"index the restart's logical centroids; fix: pass the ω = 0 wings")
 
     def _write():
-        with h5py.File(filename, "a") as f:
+        with open_h5_settled(filename, "a") as f:
             set_commit_state(f, False)
             for name, data in (("S_cart_head_direct", S_direct),
                                ("head_wing_L", L), ("head_wing_R", R)):
@@ -1393,7 +1394,7 @@ def write_head_scalars_to_h5(
         S_cart = np.asarray(S_cart, dtype=np.complex128).reshape(3, 3)
 
     def _write_heads():
-        with h5py.File(filename, "a") as f:
+        with open_h5_settled(filename, "a") as f:
             set_commit_state(f, False)
             if vhead is not None:
                 if "vhead" in f:

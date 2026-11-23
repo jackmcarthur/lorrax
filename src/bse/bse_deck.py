@@ -170,8 +170,9 @@ def eqp_file(params: dict, named: set, deck_path: str) -> str | None:
 
 def wfn_spin(wfn_path: str) -> tuple[int, int]:
     """``(nspinor, nspin)`` of a BerkeleyGW-format WFN.h5 (``mf_header/kpoints``)."""
+    from file_io.commit_state import open_h5_settled
     import h5py
-    with h5py.File(wfn_path, "r") as f:
+    with open_h5_settled(wfn_path, "r") as f:
         k = f["mf_header/kpoints"]
         return int(k["nspinor"][()]), int(k["nspin"][()])
 
@@ -257,6 +258,7 @@ def check_dipole_operator(params: dict, named: set, dipole_path: str | None) -> 
     dipole file is made (``psp.get_dipole_mtxels``, ``--skip-vnl`` = p alone).
     The keys are therefore checked against the file's ``skip_vnl`` stamp.
     """
+    from file_io.commit_state import open_h5_settled
     given = [k for k in ("use_momentum", "use_velocity")
              if k in named and as_bool(k, params[k])]
     if not given:
@@ -268,7 +270,7 @@ def check_dipole_operator(params: dict, named: set, dipole_path: str | None) -> 
         raise DeckError(f"`{given[0]}` names the operator of the dipole file, and this run "
                         f"reads none (set `dipole_file`)")
     import h5py
-    with h5py.File(dipole_path, "r") as f:
+    with open_h5_settled(dipole_path, "r") as f:
         skip = bool(f.attrs.get("skip_vnl", False))
     momentum = given[0] == "use_momentum"
     if momentum != skip:

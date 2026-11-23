@@ -107,6 +107,7 @@ from ._slab_io_ffi import (_DatasetGeometry, _publish_metadata,
 # to keep in step with the registry's verdict on the same path, so this
 # module imports the one name instead of re-declaring it.
 from .hdf5_owner import STACK_H5PY
+from .commit_state import open_h5_settled
 
 log = get_logger(__name__)
 
@@ -351,7 +352,7 @@ class _SerialBackend(_DatasetGeometry):
         try:
             with _journal.op_scope("open", self.path, stack=STACK_H5PY,
                                    mode=mode):
-                self._h5 = h5py.File(self.path, mode)
+                self._h5 = open_h5_settled(self.path, mode)
                 from .commit_state import assert_committed, set_commit_state
                 if mode in ('a', 'r'):
                     assert_committed(self._h5, path=self.path)

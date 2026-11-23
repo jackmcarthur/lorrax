@@ -546,6 +546,7 @@ def open_export_source(cfg, mesh, *, print_fn=None, require_w0=True):
     The projection reads V and ζ only and compares with LORRAX's W(0) when
     the bundle has one (``ExportSource.w0_ready``).
     """
+    from file_io.commit_state import open_h5_settled
     import h5py
     from ffi import _services
     _services.ensure_on_path()
@@ -568,7 +569,7 @@ def open_export_source(cfg, mesh, *, print_fn=None, require_w0=True):
                 "export a run without the BGW vcoul overlay or head placement")
     wfn = WfnLoader(gw.paths.wfn_file)
     geometry = CoulombGeometry.from_wfn(wfn)
-    with h5py.File(bundle, "r") as f:
+    with open_h5_settled(bundle, "r") as f:
         kgrid = tuple(int(k) for k in np.asarray(f["kgrid"][()]))
         w0_ready = "W0_qmunu" in f and bool(f["W0_qmunu"].attrs.get("W0_ready", False))
         if require_w0 and not w0_ready:
@@ -936,9 +937,10 @@ def plan_export(cfg, src, *, print_fn=None):
     ``q0_vector``. ``epsmat_ecut`` (0: the full sphere) keeps the leading
     ``gcutoff`` G of that order at every q (:func:`resolve_ecut`).
     """
+    from file_io.commit_state import open_h5_settled
     import h5py
     from file_io import bgw_epsmat as be
-    with h5py.File(src.wfn_file, "r") as w:
+    with open_h5_settled(src.wfn_file, "r") as w:
         comps = np.asarray(w["mf_header/gspace/components"][()], dtype=np.int64)
         bdot = np.asarray(w["mf_header/crystal/bdot"][()], dtype=np.float64)
         ecutwfc = float(w["mf_header/kpoints/ecutwfc"][()])
@@ -1529,6 +1531,7 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=None):
 
 
 def _run_epsmat_projection(cfg, mesh, src):
+    from file_io.commit_state import open_h5_settled
     import shutil
     import h5py
     from common.collectives import barrier, process_rank
@@ -1599,7 +1602,7 @@ def _run_epsmat_projection(cfg, mesh, src):
              f"(nmtx_max {n_max}, μ carrier {src.mu_pad}, {f_tile} of {len(freqs)} "
              f"frequency blocks per read; {price.describe()})")
 
-    with h5py.File(files["eps0mat"], "r") as f:
+    with open_h5_settled(files["eps0mat"], "r") as f:
         heads_bgw = [complex(f[be.MATRIX][0, 0, fr.ifreq, 0, 0, 0],
                              f[be.MATRIX][0, 0, fr.ifreq, 0, 0, 1]) for fr in freqs]
     # Every row's eps G order, one open per file; only the nmtx entries the loop
@@ -1694,7 +1697,7 @@ def _run_epsmat_projection(cfg, mesh, src):
                                                 "screening_role": fr.role,
                                                 **({"W0_ready": True} if fr.role == "static" else {})})
     if rank0:
-        with h5py.File(target, "a") as f:
+        with open_h5_settled(target, "a") as f:
             for fr in freqs:
                 _copy_qirr_stamp(f, "V_qmunu", fr.dataset)
             if "bgw_epsinv_head" in f:

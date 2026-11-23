@@ -186,7 +186,8 @@ def _copy_mf_header(f, wfn_path: str, fine_grid=None) -> None:
     ``write_hdf5_mf_header`` puts WFN_fi's there.  ``fine_grid`` =
     ``(kpts (nk, 3), kgrid, shift)`` replaces the k-point list (``nrk``, ``rk``,
     ``w``, ``kgrid``, ``shift``) and drops :data:`_PER_K_BAND_DATA`."""
-    with h5py.File(wfn_path, "r") as src:
+    from file_io.commit_state import open_h5_settled
+    with open_h5_settled(wfn_path, "r") as src:
         src.copy(src["mf_header"], f, "mf_header")
     if fine_grid is None:
         return

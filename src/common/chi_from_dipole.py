@@ -137,8 +137,9 @@ import jax.numpy as jnp
 
 
 def read_dipole_h5(path: str) -> tuple[jnp.ndarray, jnp.ndarray]:
+    from file_io.commit_state import open_h5_settled
     from file_io.dipole import delta_e, require_dipole_format
-    with h5py.File(path, "r") as h5:
+    with open_h5_settled(path, "r") as h5:
         require_dipole_format(h5.attrs, dipole_path=path)
         dipole_np = np.asarray(h5["dipole_cart"])  # (3, nk, nb, nb)
         deltaE_np = delta_e(h5)                    # (nk, nb, nb)

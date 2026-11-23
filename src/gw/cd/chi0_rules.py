@@ -633,11 +633,12 @@ def merge_payloads(parts):
 
 # ------------------------------------------------------------------------------- precompute CLI
 def _energies(args):
+    from file_io.commit_state import open_h5_settled
     if args.energies:
         energy = np.load(args.energies)
     else:
         import h5py
-        with h5py.File(args.wfn, "r") as fh:
+        with open_h5_settled(args.wfn, "r") as fh:
             energy = np.asarray(fh["mf_header/kpoints/el"])[0]
     energy = np.asarray(energy, dtype=np.float64)
     if args.occupations:
@@ -647,7 +648,7 @@ def _energies(args):
         occ[:, :int(args.nocc)] = 1.0
     else:
         import h5py
-        with h5py.File(args.wfn, "r") as fh:
+        with open_h5_settled(args.wfn, "r") as fh:
             occ = np.asarray(fh["mf_header/kpoints/occ"], dtype=np.float64)[0]
     return energy, occ
 
