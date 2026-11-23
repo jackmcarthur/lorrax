@@ -26,6 +26,13 @@ SETTLE_TIMEOUT_S = 60.0
 #: treated as unreadable by the caller's own fallback.
 GUARD_SETTLE_S = 5.0
 
+#: Keyword arguments refused by name.  A collective (``driver="mpio"``) open
+#: retried on the one rank that saw a short size would leave its peers inside
+#: the collective H5Fopen; with ``swmr=True`` HDF5 skips the end-of-file check
+#: this helper relies on.
+_REFUSED_KWARGS = {"driver": ("mpio",), "swmr": (True,)}
+
+
 def open_h5_settled(path, mode="r", *, settle_s=None, **kwargs):
     """``h5py.File(path, mode)`` for a file another process just committed.
 
@@ -69,6 +76,14 @@ def open_h5_settled(path, mode="r", *, settle_s=None, **kwargs):
 
     import h5py
 
+    for key, bad in _REFUSED_KWARGS.items():
+        if key in kwargs and kwargs[key] in bad:
+            raise ValueError(
+                f"open_h5_settled({path!r}): {key}={kwargs[key]!r} is refused: "
+                "the settled open is a serial, one-rank retry (a collective "
+                "mpio open retried on one rank deadlocks its peers; swmr skips "
+                "HDF5's end-of-file check). Open collectively through "
+                "file_io.slab_io.SlabIO instead.")
     limit = SETTLE_TIMEOUT_S if settle_s is None else float(settle_s)
     t0, nap, tries = time.monotonic(), 0.01, 0
     while True:

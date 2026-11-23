@@ -97,3 +97,13 @@ def test_zeta_probe_needs_no_lorrax(tmp_path):
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          env=env, cwd=str(tmp_path), timeout=120)
     assert out.returncode == 0 and "PROBE_OK" in out.stdout, out.stdout + out.stderr
+
+
+@pytest.mark.parametrize("kwargs", [{"driver": "mpio"}, {"swmr": True}])
+def test_collective_and_swmr_opens_refused_by_name(tmp_path, kwargs):
+    from file_io.commit_state import open_h5_settled
+    p = tmp_path / "f.h5"
+    _fixture(p)
+    key = next(iter(kwargs))
+    with pytest.raises(ValueError, match=f"{key}=.*refused"):
+        open_h5_settled(p, "r", **kwargs)
