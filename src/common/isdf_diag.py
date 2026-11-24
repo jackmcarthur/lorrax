@@ -48,15 +48,17 @@ def save(name: str, a) -> None:
 
 def gram_spectrum(C, name: str, n_logical: int) -> None:
     """Eigenvalues (ascending) of C[q] for q in {0, nq//2, nq-1}: ``$LXDIAG_DIR/<name>.npy`` as (3, n)."""
-    if not enabled():
+    if not enabled() or os.environ.get("LXDIAG_GRAM", "1") == "0":
         return
     import jax
     import jax.numpy as jnp
     nq = int(C.shape[0])
     qs = sorted({0, nq // 2, nq - 1})
     out = []
+    print(f"[isdf_diag] gram_spectrum enter: C {tuple(C.shape)} {C.dtype} process {jax.process_index()}", flush=True)
     for q in qs:
         cq = _gather(C[q])
+        print(f"[isdf_diag] gram_spectrum q={q} gathered on process {jax.process_index()}", flush=True)
         if jax.process_index() == 0:
             dev = jax.local_devices()[0]
             lam = jax.device_get(jnp.linalg.eigvalsh(jax.device_put(cq, dev)))
