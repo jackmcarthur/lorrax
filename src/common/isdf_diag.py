@@ -19,6 +19,12 @@ import numpy as np
 _COUNT: dict = {}
 
 
+def _p(msg: str) -> None:
+    """Diagnostic line on stderr (production stdout is /dev/null)."""
+    import sys
+    print(f"[isdf_diag] {msg}", file=sys.stderr, flush=True)
+
+
 def enabled() -> bool:
     return bool(os.environ.get("LXDIAG_DIR"))
 
@@ -43,7 +49,7 @@ def save(name: str, a) -> None:
         n = _COUNT.get(name, 0)
         _COUNT[name] = n + 1
         np.save(os.path.join(d, f"{name}_{n}.npy" if n else f"{name}.npy"), arr)
-        print(f"[isdf_diag] saved {name} shape={arr.shape} dtype={arr.dtype}", flush=True)
+        _p(f"saved {name} shape={arr.shape} dtype={arr.dtype}")
 
 
 def gram_spectrum(C, name: str, n_logical: int) -> None:
@@ -55,14 +61,15 @@ def gram_spectrum(C, name: str, n_logical: int) -> None:
     nq = int(C.shape[0])
     qs = sorted({0, nq // 2, nq - 1})
     out = []
-    print(f"[isdf_diag] gram_spectrum enter: C {tuple(C.shape)} {C.dtype} process {jax.process_index()}", flush=True)
+    _p(f"gram_spectrum enter: C {tuple(C.shape)} {C.dtype}")
     for q in qs:
         cq = _gather(C[q])
-        print(f"[isdf_diag] gram_spectrum q={q} gathered on process {jax.process_index()}", flush=True)
-        if jax.process_index() == 0:
-            dev = jax.local_devices()[0]
-            lam = jax.device_get(jnp.linalg.eigvalsh(jax.device_put(cq, dev)))
-            out.append(np.asarray(lam))
+        # Every process runs the same single-device eigvalsh (no rank-conditional
+        # device work: a rank-0-only compile deadlocked the run, 2026-11-24).
+        dev = jax.local_devices()[0]
+        lam = jax.device_get(jnp.linalg.eigvalsh(jax.device_put(cq, dev)))
+        out.append(np.asarray(lam))
+        _p(f"gram_spectrum q={q} done")
         del cq
     if jax.process_index() == 0:
         d = os.environ["LXDIAG_DIR"]
@@ -70,10 +77,10 @@ def gram_spectrum(C, name: str, n_logical: int) -> None:
         np.savez(os.path.join(d, f"{name}.npz"), lam=np.array(out), q=np.array(qs), n_logical=n_logical)
         for q, lam in zip(qs, out):
             mx = lam.max()
-            print(f"[isdf_diag] {name} q={q} n={lam.size} n_logical={n_logical} lam_max={mx:.4e} "
+            _p(f"{name} q={q} n={lam.size} n_logical={n_logical} lam_max={mx:.4e} "
                   f"lam_min={lam.min():.3e} below 1e-8/1e-12/1e-14 of max: "
                   f"{int((lam < 1e-8 * mx).sum())}/{int((lam < 1e-12 * mx).sum())}/{int((lam < 1e-14 * mx).sum())}",
-                  flush=True)
+                  )
 
 
 def perturb_gram(C):
@@ -91,5 +98,5 @@ def perturb_gram(C):
 
     out = jax.jit(f, out_shardings=C.sharding)(C)
     if jax.process_index() == 0:
-        print(f"[isdf_diag] charge Gram perturbed: C + {eps:.1e}*diag(diag(C)*r)", flush=True)
+        _p(f"charge Gram perturbed: C + {eps:.1e}*diag(diag(C)*r)")
     return out
