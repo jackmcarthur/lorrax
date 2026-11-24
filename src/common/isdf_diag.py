@@ -52,6 +52,18 @@ def save(name: str, a) -> None:
         _p(f"saved {name} shape={arr.shape} dtype={arr.dtype}")
 
 
+def save_host(name: str, arr) -> None:
+    """Write a host array (identical on every process) from process 0."""
+    d = os.environ.get("LXDIAG_DIR")
+    if not d:
+        return
+    import jax
+    if jax.process_index() == 0:
+        os.makedirs(d, exist_ok=True)
+        np.save(os.path.join(d, f"{name}.npy"), np.asarray(arr))
+        _p(f"saved {name} shape={np.shape(arr)}")
+
+
 def gram_spectrum(C, name: str, n_logical: int) -> None:
     """Eigenvalues (ascending) of C[q] for q in {0, nq//2, nq-1}: ``$LXDIAG_DIR/<name>.npy`` as (3, n)."""
     if not enabled() or os.environ.get("LXDIAG_GRAM", "1") == "0":

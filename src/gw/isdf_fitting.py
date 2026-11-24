@@ -740,6 +740,9 @@ def fit_zeta_to_h5(
                 from common import isdf_diag
                 C_q_flat = isdf_diag.perturb_gram(C_q_flat)
                 isdf_diag.gram_spectrum(C_q_flat, "charge_gram_spectrum", int(n_rmu))
+                if mu_basis is not None:
+                    isdf_diag.save_host("mu_packed_to_canonical", np.asarray(mu_basis.layout.axis.packed_to_canonical))
+                    isdf_diag.save_host("mu_active_mask", np.asarray(mu_basis.active_mask))
 
         with timing.section("zeta_fit.cholesky"):
             # The charge channel's rank-truncated pseudo-inverse B (on the face,
