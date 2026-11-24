@@ -735,6 +735,11 @@ def fit_zeta_to_h5(
             # column tile. The mean pad diagonal commutes with that linear
             # completion; factor/conditioning checks see the same stored rows.
             timing.stage_wait(C_q_flat)
+            if v == 0:
+                # Diagnostic branch (lane isdf_cond): inert unless LXDIAG_DIR / LXDIAG_CPERT are set.
+                from common import isdf_diag
+                C_q_flat = isdf_diag.perturb_gram(C_q_flat)
+                isdf_diag.gram_spectrum(C_q_flat, "charge_gram_spectrum", int(n_rmu))
 
         with timing.section("zeta_fit.cholesky"):
             # The charge channel's rank-truncated pseudo-inverse B (on the face,

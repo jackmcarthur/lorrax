@@ -970,6 +970,12 @@ def fit_ppm(
     import time as _t
     z = complex(probe_omega)
     t0 = _t.perf_counter()
+    from common import isdf_diag
+    if isdf_diag.enabled():
+        # Diagnostic branch (lane isdf_cond): the q = 0 slices of the PPM supports and V.
+        isdf_diag.save("ppm_V_q0", V_q[0])
+        isdf_diag.save("ppm_W0_q0", W0_q[0])
+        isdf_diag.save("ppm_Wprobe_q0", Wprobe_q[0])
 
     # The diagnostic reads the original probe before an owned fit transfers it.
     probe_hermiticity_residual = (float(jax.device_get(
