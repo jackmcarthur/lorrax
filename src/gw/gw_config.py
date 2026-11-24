@@ -1317,6 +1317,15 @@ _DEFAULTS = {
     # was not built by the run's compute mode it is omitted and named,
     # rather than manufactured to fill a dataset slot.
     "write_qsgw_datasets": False,
+    # Opt-in self-energy-level treatment of the OFF-DIAGONAL Sigma_c of the
+    # one-shot / QSGW full-matrix H(QP) (lane isdf_cond, 2026-11-24; branch
+    # only).  ``qp_offdiag_sigma_c_cut_ev`` = c > 0 keeps Sigma_c,mn (m != n)
+    # only when both read energies lie below c eV above the Sigma reference
+    # (E_F / midgap); the diagonal and Sigma_x are untouched.  0 = off
+    # (default, bit-identical).  ``qp_offdiag_sigma_c_energy`` = "pair"
+    # (default, 1/2[S(E_m)+S(E_n)]) or "lower" (S_mn at min(E_m, E_n)).
+    "qp_offdiag_sigma_c_cut_ev": 0.0,
+    "qp_offdiag_sigma_c_energy": "pair",
     # ``restart_q_storage``: on WHICH q-set are V_qmunu / W0_qmunu stored?
     # DEFAULT auto — storage FOLLOWS THE WFN FILE.  This is the end state the
     # owner ruled for on 2026-08-08 ~13:20, quoted below, and it became
@@ -3212,6 +3221,8 @@ def _assemble_input_config(
         write_restart_tensors=bool(params["write_restart_tensors"]),
         write_poles=bool(params["write_poles"]),
         write_qsgw_datasets=bool(params["write_qsgw_datasets"]),
+        qp_offdiag_sigma_c_cut_ev=_offdiag_cut(params["qp_offdiag_sigma_c_cut_ev"]),
+        qp_offdiag_sigma_c_energy=_offdiag_energy(params["qp_offdiag_sigma_c_energy"]),
         restart_q_storage_raw=_restart_q_storage,
         qp_rotations_k_storage=_qp_rot_k_storage,
         raw_input_keys=frozenset(sorted(_effective_named_keys)),
@@ -5028,6 +5039,22 @@ class SCConfig:
                 + f"; got {self.head_update!r}.")
 
 
+
+def _offdiag_cut(v) -> float:
+    """``qp_offdiag_sigma_c_cut_ev``: finite and >= 0 (0 = off)."""
+    x = float(v)
+    if not (x == x and abs(x) != float("inf")) or x < 0.0:
+        raise ValueError(f"qp_offdiag_sigma_c_cut_ev must be finite and >= 0 (0 = off), got {v!r}")
+    return x
+
+
+def _offdiag_energy(v) -> str:
+    """``qp_offdiag_sigma_c_energy``: "pair" | "lower"."""
+    x = str(v).strip().lower()
+    if x not in ("pair", "lower"):
+        raise ValueError(f"qp_offdiag_sigma_c_energy must be pair or lower, got {v!r}")
+    return x
+
 @dataclass(frozen=True)
 class MemoryConfig:
     """Per-device memory budget + chunk sizing; see docs/dev/gw_config_contracts.md."""
@@ -5289,6 +5316,10 @@ class LorraxConfig:
     #: ``_DEFAULTS["write_qsgw_datasets"]`` for what each dataset is and
     #: which compute mode produces it.
     write_qsgw_datasets: bool
+    #: Off-diagonal Sigma_c cut (eV above the Sigma reference); 0 = off.
+    qp_offdiag_sigma_c_cut_ev: float
+    #: Evaluation energy of the off-diagonal Sigma_c: "pair" | "lower".
+    qp_offdiag_sigma_c_energy: str
     #: RAW ``restart_q_storage`` request — "auto" (the default) | "ibz".
     #: Validated at parse time and resolved against the centroid set by
     #: ``gw.restart_q_storage``; both requests use canonical q-IBZ storage.

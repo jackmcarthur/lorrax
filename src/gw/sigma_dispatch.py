@@ -753,7 +753,13 @@ def finalize_dynamic_sigma(
             omega_grid_ev, e_qp_rel_ev, mesh_xy,
             band_axis=sigma_band_axis,
             out_of_grid=config.sigma.out_of_grid,
+            offdiag_cut_ev=float(getattr(config, 'qp_offdiag_sigma_c_cut_ev', 0.0)),
+            offdiag_energy=str(getattr(config, 'qp_offdiag_sigma_c_energy', 'pair')),
         )
+        if (float(getattr(config, 'qp_offdiag_sigma_c_cut_ev', 0.0)) > 0.0
+                or str(getattr(config, 'qp_offdiag_sigma_c_energy', 'pair')) != 'pair'):
+            log.info(f"  QSGW off-diagonal Sigma_c: energy {config.qp_offdiag_sigma_c_energy}, cut "
+                     f"{config.qp_offdiag_sigma_c_cut_ev:.2f} eV above the Sigma reference (0 = none)")
         log.info(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)")
 
@@ -793,7 +799,9 @@ def finalize_dynamic_sigma(
                 sigma_xc_qsgw_unextrap, _ = build_qsgw_sigma_xc(
                     twin, sig_x_rep, omega_grid_ev, e_qp_rel_ev, mesh_xy,
                     band_axis=sigma_band_axis,
-                    out_of_grid=config.sigma.out_of_grid)
+                    out_of_grid=config.sigma.out_of_grid,
+                    offdiag_cut_ev=float(getattr(config, 'qp_offdiag_sigma_c_cut_ev', 0.0)),
+                    offdiag_energy=str(getattr(config, 'qp_offdiag_sigma_c_energy', 'pair')))
         elif hasattr(sigma_c_body_omega_unextrap, "at_omega_slots"):
             # The default twin: N3's band diagonal (ppm_pipeline.
             # extrapolate_sigma_body).  The raw columns read the same

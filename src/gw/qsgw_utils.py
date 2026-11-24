@@ -887,6 +887,35 @@ def _qsgw_on_shell_kernel(mesh_xy: Mesh, replicated_output: bool):
     return _kernel
 
 
+@lru_cache(maxsize=8)
+def _qsgw_on_shell_offdiag_kernel(mesh_xy: Mesh, replicated_output: bool, lower: bool, cut_on: bool):
+    """The QSGW kernel with the opt-in off-diagonal treatment (branch only).
+
+    ``e`` is ``(nk, nb_carrier)`` read energies (eV, Sigma-reference
+    relative; pad bands +1e9).  ``lower``: Sigma_mn at min(E_m, E_n);
+    ``cut_on``: Sigma_c,mn (m != n) zero unless both energies < ``cut``.
+    The diagonal keeps the pair value in every variant.
+    """
+    out_3d = NamedSharding(
+        mesh_xy, P(None, None, None) if replicated_output else P(None, "x", "y"))
+
+    @jax.jit
+    def _kernel(pair, sig_x, e, cut):
+        em = e[:, :, None]
+        en = e[:, None, :]
+        avg = 0.5 * (pair[0] + pair[1])
+        Sc = jnp.where(em <= en, pair[0], pair[1]) if lower else avg
+        eye = jnp.eye(pair.shape[-1], dtype=bool)[None]
+        Sc = jnp.where(eye, avg, Sc)
+        if cut_on:
+            keep = eye | ((em < cut) & (en < cut))
+            Sc = jnp.where(keep, Sc, jnp.zeros_like(Sc))
+        M = jax.lax.with_sharding_constraint(Sc + sig_x, out_3d)
+        Mh = 0.5 * (M + jnp.conj(jnp.swapaxes(M, -1, -2)))
+        return jax.lax.with_sharding_constraint(Mh, out_3d)
+    return _kernel
+
+
 def build_qsgw_sigma_xc(
     sigma_c,
     sigma_x_kij_ry: jax.Array,
@@ -897,6 +926,8 @@ def build_qsgw_sigma_xc(
     replicated_output: bool = True,
     band_axis=None,
     out_of_grid: str = "cover",
+    offdiag_cut_ev: float = 0.0,
+    offdiag_energy: str = "pair",
 ) -> tuple[jax.Array, dict[str, float]]:
     """Build the static Hermitian QSGW Σ_xc[k, m, n] from an on-shell Sigma
     (or, ``sigma_omega_grid_debug``, from the Σ_c(ω) cube: :func:`_build_qsgw_sigma_xc_grid`).
@@ -923,7 +954,12 @@ def build_qsgw_sigma_xc(
     omega = np.asarray(omega_ev, dtype=np.float64)
     E = np.asarray(e_qp_kn_ev, dtype=np.float64)
     from .ppm_sigma import is_on_shell
+    _offdiag = float(offdiag_cut_ev) > 0.0 or str(offdiag_energy) != "pair"
     if not is_on_shell(sigma_c):
+        if _offdiag:
+            raise NotImplementedError(
+                "qp_offdiag_sigma_c_cut_ev / qp_offdiag_sigma_c_energy act on the on-shell "
+                "pair only; unset them under sigma_omega_grid_debug")
         return _build_qsgw_sigma_xc_grid(
             sigma_c, sigma_x_kij_ry, omega, E, mesh_xy,
             replicated_output=replicated_output, band_axis=band_axis,
@@ -937,7 +973,17 @@ def build_qsgw_sigma_xc(
         from runtime.padding import authenticate_axis, pad_square
         authenticate_axis(sigma_c.pair, band_axis, axis=-1, where="QSGW on-shell Sigma_c")
         sigma_x_kij_ry = pad_square(sigma_x_kij_ry, band_axis)
-    out = _qsgw_on_shell_kernel(mesh_xy, bool(replicated_output))(sigma_c.pair, sigma_x_kij_ry)
+    if _offdiag:
+        nbc = int(sigma_c.pair.shape[-1])
+        e_pad = np.full((read.shape[0], nbc), 1.0e9, dtype=np.float64)
+        e_pad[:, :read.shape[1]] = read
+        out = _qsgw_on_shell_offdiag_kernel(
+            mesh_xy, bool(replicated_output), str(offdiag_energy) == "lower",
+            float(offdiag_cut_ev) > 0.0)(
+                sigma_c.pair, sigma_x_kij_ry, jnp.asarray(e_pad),
+                jnp.asarray(float(offdiag_cut_ev)))
+    else:
+        out = _qsgw_on_shell_kernel(mesh_xy, bool(replicated_output))(sigma_c.pair, sigma_x_kij_ry)
     from common.timing import stage_wait
     stage_wait(out)   # a timing-only wait (LORRAX_STAGE_SYNC)
     if band_axis is not None and replicated_output:
