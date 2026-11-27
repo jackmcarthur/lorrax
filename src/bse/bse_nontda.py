@@ -74,8 +74,9 @@ WHAT CHANGED 2026-08-08 (this header used to describe only the dense route)
   runs SDY Algorithm 4 (:mod:`solvers.bse_sp_lanczos`) over the fused pair
   applier ``bse_stack_matvec.build_bse_stack_pair_matvec``, at ``O(k N)`` memory
   and a cost set by the spectrum rather than by ``N``.  It is OPT-IN and it
-  REFUSES on a sharded (px*py > 1) mesh — see ``_solve_nontda_matrix_free`` and
-  ``SDY_SOLVER.md`` for the ζ-sharding kernel defect behind that refusal.
+  runs on a sharded mesh (tested 2x2 on CPU against the dense route, to round-off);
+  its only refusals are run-time gates on the operator it applied (see
+  ``_solve_nontda_matrix_free``).
   ``'dense'`` remains the default AND the oracle: it is what the matrix-free
   route is gated against, and the only route returning the complete spectrum.
   Flipping that default is an owner decision with its own A/B; nothing here
@@ -111,8 +112,7 @@ def _dense_refusal(N: int) -> str:
             "assembles A and B, O(N^2).  Alternatives: full_bse = false (the TDA Davidson, the "
             "default eigensolve), feast = true (FEAST windows, refused unless converged to "
             "feast_tol_mev), or a smaller number_val_bands_fine / number_cond_bands_fine.  The matrix-free SDY "
-            "route (bse_nontda solver='matrixfree') has no bse_jax flag and refuses on a "
-            "sharded mesh.")
+            "route (bse_nontda solver='matrixfree') has no bse_jax flag.")
 
 
 def refuse_dense_window(n_cond: int, n_val: int, nk: int, mesh_xy) -> int:
@@ -409,15 +409,15 @@ def _h_is_real(A, B, *, tol=1e-6) -> bool:
 # exist at all, so this is the difference between having a non-TDA capability at
 # production grid and not having one.
 #
-# It is OPT-IN and it stays opt-in until the guard below stops firing.  See
-# ``SDY_SOLVER.md``: the coupling block's screened-direct term ``K^d_B`` is
-# currently WRONG when the ζ axis is sharded (measured: bit-consistent at
-# px·py = 1, 55% different and 69% non-symmetric at 2x2, while the resonant
-# block A and the coupling EXCHANGE term are bit-consistent at both).  A
-# matrix-free non-TDA solve exists to run at scale, i.e. sharded, so shipping it
-# on by default would ship a wrong number on exactly the configuration it is
-# for.  The refusal is not a workaround for that defect -- it is the detector
-# for it, and it will go quiet by itself the day the defect is fixed.
+# It is OPT-IN (no deck flag reaches it) and the owner decides when that
+# changes.  It is NOT refused on a sharded mesh: nothing here reads px*py.  The
+# ring-era defect in the coupling block's screened-direct term ``K^d_B`` (wrong
+# when the ζ axis is sharded; silent at px·py = 1) was fixed in the pair applier
+# (``bse_stack_matvec``, trial-vector gather on 'x' and 'y'), and the route is
+# tested on a 2x2 CPU mesh against the dense route
+# (``tests/test_bse_full_sharded_cpu.py``).  What stays is a run-time detector
+# of the operator's integrity, the symmetry of the kappa metric below: it
+# measures the operator the solve ran, whatever the mesh.
 _MF_METRIC_TOL = 1e-8
 
 #: The matrix-free route's stop: every root's ω residual below this (meV), the
@@ -522,13 +522,12 @@ def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
             f"{float(dg['metric_sym_err']):.3e} (tol {metric_tol:g}).  The "
             "method requires A = A^H and B = B^T; the metric's symmetry is "
             "exactly that pair of conditions, so this number is the operator's "
-            "integrity, not the solver's convergence.  KNOWN CAUSE: the "
-            "coupling block's screened-direct term K^d_B is wrong when the "
-            "zeta axis is sharded (px*py > 1) — see SDY_SOLVER.md.  Re-run "
-            "with one process AND one visible device (px=py=1 requires the "
-            "mesh to consume the whole job: create_mesh_xy refuses a 1x1 "
-            "request on a multi-device job), or use the dense route, until "
-            "that is fixed.")
+            "integrity, not the solver's convergence.  The "
+            "operator this solve applied is not A Hermitian with B complex "
+            "symmetric: the payload (check_restart_reciprocity on W_q) or the "
+            "pair applier is at fault, whatever the mesh.  Fix: run "
+            "solver='dense', whose preflight names a stale restart, and compare "
+            "the A and B it assembles with A = A^H, B = B^T.")
 
     # (3) convergence: restarts stop on the ω residual; a capped stop refuses.
     _l("  [nontda] " + refuse_unconverged_sdy(
@@ -568,8 +567,9 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
     ``'matrixfree'``
         SDY Algorithm 4 (:mod:`solvers.bse_sp_lanczos`) over the fused pair
         applier.  Cost set by the spectrum, not by ``N``; ``O(k N)`` memory.
-        OPT-IN, and it refuses on a sharded mesh today — see
-        ``_solve_nontda_matrix_free`` for why and for when that stops.
+        OPT-IN (no deck flag).  It runs on a sharded mesh; its refusals are
+        run-time gates on the operator it applied (kappa-metric symmetry,
+        definiteness; see ``_solve_nontda_matrix_free``).
         Restart cycles stop when every root's ω residual is below
         ``mf_tol_mev`` (cap ``mf_n_restarts``); a capped stop refuses
         (GATE nontda_converged)."""

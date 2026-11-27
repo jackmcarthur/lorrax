@@ -1,6 +1,6 @@
 """The matrix-free full-BSE route (``solver='matrixfree'``) on an emulated 2x2 CPU mesh.
 
-``bse_nontda.solve_bse_nontda_sharded`` documents the matrix-free route as refusing on a
+``bse_nontda.solve_bse_nontda_sharded`` once documented the matrix-free route as refusing on a
 sharded mesh (the zeta-sharded ``K^d_B`` defect).  No code tests the mesh: the only refusal is the
 run-time gate on the symmetry of the kappa metric ``Re(x^H F(x'))`` (``metric_sym_err``, tolerance
 1e-8), which is ``A = A^H`` and ``B = B^T`` on the operator the solve ran.  These tests settle by
@@ -17,7 +17,9 @@ execution whether the route works sharded, on the smallest payload the existing 
    log line and held to its 1e-8 gate; the measured value is printed (``MEASURED ...``).
 2. The gate is live: the same route with the coupling block made non-symmetric (a fixed real
    antisymmetric perturbation added to ``B``) refuses with the asymmetric-kappa-metric message, so the
-   passing run in 1 is not a gate that cannot fire.
+   passing run in 1 is not a gate that cannot fire.  The message states the measured asymmetry and
+   the fix; it does not name the retired mesh cause, and no docstring of ``bse_nontda`` says the route
+   refuses on a sharded mesh.
 3. The oracle (``tests/bse_full_oracle.py``) assembles ``A`` and ``B`` from the fused pair applier on
    the mesh; ``A = A^H`` and ``B = B^T`` to 1e-12, equal to the production ``_materialize_A_B``, and the
    oracle's reference roots equal the dense route's.
@@ -149,6 +151,21 @@ def test_metric_gate_is_live_on_the_sharded_route(mesh, ops, monkeypatch):
     m = re.search(r"asymmetric at ([0-9.e+-]+)", str(exc.value))
     print(f"MEASURED broken-B refusal: metric_sym_err = {m.group(1)} (gate {METRIC_GATE:g})", flush=True)
     assert float(m.group(1)) > 1e-3
+    msg = str(exc.value)
+    for stale in ("KNOWN CAUSE", "zeta axis is sharded", "one visible device", "SDY_SOLVER"):
+        assert stale not in msg, f"stale cause in the refusal: {stale!r}"
+    assert "A = A^H and B = B^T" in msg and "solver='dense'" in msg
+
+
+def test_no_docstring_claims_a_mesh_refusal():
+    """The route is not refused on a sharded mesh (the runs above), so no text of the module says it is."""
+    import inspect
+    from bse import bse_nontda
+    src = inspect.getsource(bse_nontda)
+    flat = " ".join(src.replace("#", " ").split())
+    for stale in ("refuses on a sharded", "REFUSES on a sharded", "refuses on a sharded mesh today",
+                  "has no bse_jax flag and refuses"):
+        assert stale not in flat, f"stale mesh-refusal claim in bse_nontda: {stale!r}"
 
 
 def test_oracle_assembles_the_sharded_pair_applier(mesh, ops, dense_ref):
