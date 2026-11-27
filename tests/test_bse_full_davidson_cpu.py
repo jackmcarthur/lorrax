@@ -194,6 +194,33 @@ def test_route_options_are_honoured(ops, dense):
     assert np.max(np.abs(np.asarray(dense_rpa) - ref)) > 1e-4
 
 
+def test_padded_window_stays_on_the_physical_transitions(ops):
+    """Three conduction bands padded to four on the 2x2 mesh (zero orbitals, the loader's 1e3 Ry
+    sentinel energy): the start block has no weight on the pad, the solve never puts any there, and
+    the roots are the dense route's."""
+    mesh = _mesh(2)
+
+    def padded():
+        data = _payload(mesh, dict(ops, pc=np.concatenate([ops["pc"][:, :3], np.zeros_like(ops["pc"][:, :1])], axis=1),
+                                   ec=np.concatenate([ops["ec"][:, :3], np.full((NK, 1), 1.0e3)], axis=1)))
+        return dict(data, n_cond=3)
+
+    dense_omega, dense_evecs, _ = solve_bse_nontda_sharded(padded(), mesh, n_eig=N_EIG)
+    omega, evecs, _ = solve_bse_nontda_sharded(padded(), mesh, n_eig=N_EIG, solver="davidson")
+    info = bse_nontda.LAST_DAVIDSON["info"]
+    err = float(np.max(np.abs(np.asarray(omega) - np.asarray(dense_omega))))
+    host = np.asarray(evecs)
+    print(f"MEASURED padded window (3 of 4 conduction bands physical): max|omega - dense| = {err:.3e} Ry, "
+          f"largest pad amplitude {np.max(np.abs(host[:, :, 3])):.1e}, {info['pair_calls']} pair calls, "
+          f"lam_min {info['lam_min']:.6f} Ry", flush=True)
+    assert err <= ROOT_TOL
+    assert np.max(np.abs(host[:, :, 3])) == 0.0                              # exactly zero on the pad
+    assert np.max(np.abs(np.asarray(dense_evecs)[:, :, 3])) <= 1e-12
+    X, Y = _columns(evecs)
+    assert np.max(np.abs(orc.sigma_gram(X, Y) - np.eye(N_EIG))) <= 1e-10
+    assert info["lam_min"] < 1.0                                             # the pad's 1e3 Ry never entered
+
+
 # ---------------------------------------------------------------------------
 # 2. the preconditioner's diagonal
 # ---------------------------------------------------------------------------
