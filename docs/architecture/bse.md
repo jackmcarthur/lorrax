@@ -418,8 +418,8 @@ trials $z = X + \bar Y$ ($s = +1$) and $w = X - \bar Y$ ($s = -1$):
 $F + G = 2(AX + BY)$ and $\overline{G - F} = 2Y_{out}$, exact. It is the
 operator of FEAST and KPM with `full_bse = true`; `bse_nontda` builds the dense
 $(A, B)$ (N ≤ 4096) from pair calls on real identity columns,
-$A = (F + G)/2$, $B = (F - G)/2$, 256 columns a call, and its Davidson and
-matrix-free routes run on the same applier (the Davidson with $s = +1$ only:
+$A = (F + G)/2$, $B = (F - G)/2$, 256 columns a call, and its Davidson
+route runs on the same applier (with $s = +1$ only:
 $\mathrm{pair}(x, -1) = -i\,\mathrm{pair}(ix, +1)$). Its live set, like the TDA matvec's, is one
 T-family per rank whatever the trial width. Against the ring matvec it
 replaced (CPU, one device, $N_k = 4^3$, 8c × 4v, $N_\mu$ = 192, $n_s$ = 2): 552
@@ -446,8 +446,6 @@ $W_{\mu\nu}(q) = \overline{W_{\nu\mu}(q)}$. `bse_nontda.kernel_matvec` applies $
 rows $(b, 2, n_c, n_v, N_k)$ with two such calls per row block. `bse_nontda.payload_w_r` transforms
 $W_q$ once per payload through the memoised donating program and leaves $W_R$ on the payload, so a
 payload is solved twice without a second transform and `keep_W_R` is honoured by both full routes.
-The matrix-free Lanczos (`solver='matrixfree'`, no input key) refuses a partner or a head tensor
-(`GATE nontda_route_option`).
 
 Measured (claim 2874): CrI3
 8×8×1 SOC, 8v × 14c, P4 A100-40GB. One Haydock step (D + V − W on three
@@ -545,9 +543,7 @@ pair applier, with the pieces the Tamm–Dancoff Davidson uses:
 
 Measured on the 128-transition spinor test payload (CPU, 1×1 and an emulated 2×2 mesh, 8 roots and 8
 margin roots, 0.01 meV): 15 iterations and 436 pair calls, 54.5 per root, $2.5\times10^{-12}$ Ry from
-the dense route; the Tamm–Dancoff Davidson takes 207 applications of $A$ there (25.9 per root) and
-the matrix-free Lanczos 22.2 to 35.2 pair calls per root, its Krylov space being close to the whole
-window at that size.
+the dense route; the Tamm–Dancoff Davidson takes 207 applications of $A$ there (25.9 per root).
 
 Measured for the unpaired form and Olsen (CPU, the same payload, dense `eig` as the reference). On
 the payload at $Q = 0$ with the partner set equal to the payload's own orbitals the unpaired form
@@ -1176,7 +1172,7 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 | `GATE sp_davidson_finite` | the same | an operator or preconditioner output with NaN or Inf |
 | `GATE sp_davidson_argument` | the same | `on_indefinite`, `tol`, `margin_lock`, `max_iter`, `n_converge`, the start block's dtype or its row count out of range; the message gives the value and the range |
 | `GATE nontda_davidson_block` | `bse_nontda._solve_nontda_davidson` | `full_bse_instability = continue` with fewer margin roots than unstable or non-positive roots found |
-| `GATE nontda_route_option` | `bse_nontda.solve_bse_nontda_sharded`, `bse_lanczos.solve_bse_sharded` | an unknown solver or option name, or an option another full-BSE route reads (`mf_*` on the Davidson, `davidson_*` or `on_indefinite` on the dense solve), and the matrix-free Lanczos on a payload with a partner or a head tensor; `bse_jax` refuses the matching deck keys at parse time |
+| `GATE nontda_route_option` | `bse_nontda.solve_bse_nontda_sharded`, `bse_lanczos.solve_bse_sharded` | an unknown solver or option name, or an option another full-BSE route reads (`davidson_*` or `on_indefinite` on the dense solve; `solver='matrixfree'`, retired 2026-11-27, is an unknown solver); `bse_jax` refuses the matching deck keys at parse time |
 | `GATE nontda_lower_row` | `bse_nontda.solve_nontda_definite_pencil` | the dense solve at a finite pair momentum: $A_{\rm low}$ not Hermitian, or $B_{\rm low} \ne B^\dagger$, to $10^{-6}$ (relative); the two rows are built from the payload's and the partner's orbitals with one kernel, and disagree when $W$ is not conjugate-reciprocal, $V(Q)$ is not Hermitian or the partner orbitals are not the payload's bands at the other momentum |
 | `GATE exb_full_bse_key` | `bse.exciton_bands._check_full_bse_keys` | `full_bse_solver` or `full_bse_instability` without `full_bse = true`; `solver = block_lanczos` with it; `full_bse_instability`, `davidson_tol_mev` or `solver_max_iter` with `full_bse_solver = dense` |
 | `GATE exb_unserved_key` | `bse.exciton_bands.deck_settings` | `qp_rotations_file` or `highest_occupied_band` named (and not false) in an exciton-bands input file: `bse.bse_jax` keys that change the Hamiltonian and that this driver does not read |
@@ -1223,9 +1219,7 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 - Full BSE through `the eigensolve` is dense by default and stops at N = 4096
   (`_DENSE_N_MAX` in `bse/bse_nontda.py`); `full_bse_solver = davidson` has no size limit in the solve (the eigenvector writer gathers one state at a time). The
   Davidson has run on GPU at 4 and 16 ranks on NiO up to 589,824 transitions (measured above) and
-  on the CPU test payloads; no suite reruns the GPU cases. The matrix-free Lanczos
-  (`solver='matrixfree'`) is not reachable from the CLI, and refuses a finite pair momentum and a head
-  tensor. The finite-$Q$ full BSE exists in `bse.exciton_bands` only (`bse.bse_jax` solves $Q = 0$);
+  on the CPU test payloads; no suite reruns the GPU cases. The finite-$Q$ full BSE exists in `bse.exciton_bands` only (`bse.bse_jax` solves $Q = 0$);
   there `solver = block_lanczos` cannot solve it, `qp_rotations_file` and `highest_occupied_band`
   refuse, and the dense solve stops at 4096 transitions per $Q$. The head tensor under the full BSE
   with an off-grid $Q$ has not been examined: it uses the Tamm–Dancoff path's $Q$-independent dipole

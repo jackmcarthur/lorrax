@@ -72,7 +72,7 @@ bounds), ``bse_kpm`` and the pseudopole and Haydock paths.  The full (non-TDA)
 BSE runs on the same kernels: :func:`build_bse_stack_pair_matvec` is the coupling
 block's applier, and :func:`build_bse_stack_matvec_full` is ``H [X; Y]`` as two
 of its applications in one call (FEAST and KPM without TDA, ``bse_nontda``'s dense
-build and matrix-free route).  ``bse_ring_comm.build_bse_ring_matvec_full`` is the
+build).  ``bse_ring_comm.build_bse_ring_matvec_full`` is the
 screening operator only (``w_ladder``, ``bse_w_exact``).
 ``bse_preconditioner.exchange_spin_weight`` owns the exchange weight for all.
 
@@ -1162,8 +1162,8 @@ def build_bse_stack_pair_matvec(
 
     Note ``F`` and ``G`` are **real**-linear only: ``F(αx) = αAx + ᾱBx̄`` is not
     ``αF(x)`` for complex ``α``.  Every consumer of this callable must therefore
-    keep its Gram-Schmidt coefficients real where they ride the ``U`` basis
-    (``solvers.bse_sp_lanczos`` does; see its two-coefficient reorthogonalisation).
+    keep its coefficients real where they multiply a single pair vector
+    (``solvers.bse_sp_davidson``'s paired form does: its basis is real-form).
 
     Parameters
     ----------

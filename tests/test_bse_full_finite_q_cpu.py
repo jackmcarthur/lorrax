@@ -27,8 +27,7 @@ the dipoles (``d`` for a resonant pair, ``conj(d)`` for an antiresonant one) and
 3. ``Q = 0``: a partner equal to the payload's own orbitals reproduces the paired route's roots,
    and the head tensor in the paired route (dense and Davidson) matches the reference, whose
    ``B`` is complex symmetric with it.
-4. A lower row that does not close the pencil refuses (``GATE nontda_lower_row``), and the
-   matrix-free Lanczos refuses a partner.
+4. A lower row that does not close the pencil refuses (``GATE nontda_lower_row``).
 
 ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 python -m pytest
 tests/test_bse_full_finite_q_cpu.py -s``.
@@ -305,13 +304,3 @@ def test_q0_partner_reproduces_the_paired_route(head_tensor):
     print(f"\nMEASURED Q = 0, head tensor {head_tensor}: paired Davidson {roots['paired davidson calls']} "
           f"pair calls, unpaired (partner = own orbitals) {roots['partner davidson calls']}")
 
-
-# ---------------------------------------------------------------------------
-# 4. refusals
-# ---------------------------------------------------------------------------
-
-def test_matrix_free_lanczos_refuses_a_partner():
-    mesh = _mesh(1)
-    with pytest.raises(ValueError, match="GATE nontda_route_option"):
-        bse_nontda.solve_bse_nontda_sharded(_payload(mesh, _operands()), mesh, n_eig=4,
-                                            solver="matrixfree")

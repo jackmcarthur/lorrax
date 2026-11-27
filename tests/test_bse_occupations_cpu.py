@@ -18,8 +18,8 @@ that file's definition with the weights applied to its kernel part, and ``numpy.
 2. The solves return the lowest roots of ``eig`` on the weighted ``K``: the dense and Davidson full
    routes at finite Q and at ``Q = 0``, and the Tamm-Dancoff Davidson; the returned vectors are
    exactly zero on the masked pairs and no root sits at a masked pair's ``dE``.
-3. Refusals: a partner without weights (``GATE nontda_occupation_weights``), the Lanczos solvers
-   (``GATE bse_occupation_weights``), the matrix-free Lanczos.
+3. Refusals: a partner without weights (``GATE nontda_occupation_weights``) and the Lanczos solvers
+   (``GATE bse_occupation_weights``).
 
 ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 python -m pytest
 tests/test_bse_occupations_cpu.py -s``.
@@ -222,6 +222,3 @@ def test_occupation_refusals():
     with pytest.raises(ValueError, match="GATE bse_occupation_weights"):
         bse_lanczos.solve_bse_sharded(_payload(mesh, q0, w, w, partner=False), mesh, n_eig=4,
                                       solver_kind="lanczos")
-    with pytest.raises(ValueError, match="GATE nontda_route_option"):
-        bse_nontda.solve_bse_nontda_sharded(_payload(mesh, q0, w, w, partner=False), mesh, n_eig=4,
-                                            solver="matrixfree")

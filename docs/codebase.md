@@ -271,7 +271,7 @@ The BSE contract is [BSE](architecture/bse.md); this table only says where each 
 | `bse_kpm.py` | KPM Chebyshev density of states of the BSE Hamiltonian. |
 | `bse_lanczos.py` | `solve_bse_sharded`: TDA Lanczos, Davidson and thick-restart Lanczos; non-TDA hands off to `bse_nontda` (dense, or the Davidson with `full_solver='davidson'`). |
 | `bse_loading.py` | Reads a GW restart into a BSE bundle: window, padding and q = 0 head; builds a missing static W(0) through `gw.static_screening` when the restart has none. |
-| `bse_nontda.py` | Structure-preserving full (non-TDA) eigensolver: the dense build (default), the Davidson route (`full_bse_solver = davidson`) and an opt-in matrix-free Lanczos. At a finite pair momentum (`data['partner']`) it builds the two operand sets of $\mathcal K$ (`operand_sets`), measures all four dense blocks and runs the Davidson's unpaired form; `payload_w_r` transforms $W_q$ once per payload. |
+| `bse_nontda.py` | Structure-preserving full (non-TDA) eigensolver: the dense build (default) and the Davidson route (`full_bse_solver = davidson`). At a finite pair momentum (`data['partner']`) it builds the two operand sets of $\mathcal K$ (`operand_sets`), measures all four dense blocks and runs the Davidson's unpaired form; `payload_w_r` transforms $W_q$ once per payload. |
 | `bse_preconditioner.py` | Transition energies, the exchange pair amplitude and the exchange spin weight. |
 | `bse_ring_comm.py` | The BSE mesh, shardings, folded RPA control, and physical R/A density-response matvec with one shared direct-rung field for both bra decodes. |
 | `bse_stack_matvec.py` | The trial-stack TDA matvec, the non-TDA pair applier (with `partner` an independent antiresonant input and second exchange vertex; with `head_tensor` the exchange head in both blocks), and the full-BSE matvec built on it. |
@@ -351,7 +351,6 @@ Level L2: none of these modules knows what a band or a k point is.
 | `davidson_fixed.py` | Planned block Davidson with local or distributed vector storage. |
 | `lanczos.py` | Lanczos eigensolvers. |
 | `thick_restart_lanczos.py` | Thick-restart Lanczos, fixed shape. |
-| `bse_sp_lanczos.py` | Structure-preserving thick-restart Lanczos for the definite BSE eigenproblem. |
 | `bse_sp_davidson.py` | Structure-preserving block Davidson for the full BSE problem over a pair applier: paired eigenvectors, stability margin, unstable roots; `paired=False` is the form for $\mathcal K z = \Omega\Sigma z$ at a finite pair momentum, and the preconditioner can apply the Olsen correction. |
 | `subspace_numerics.py` | Scale-relative rank discovery shared by the eigensolvers. |
 | `chebyshev.py` | Chebyshev expansion and KPM utilities. |

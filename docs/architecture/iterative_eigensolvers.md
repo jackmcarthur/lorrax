@@ -439,10 +439,8 @@ $\lambda_{\min}=10^{-9}$ Ry): the dense oracle and this solver sit that far
 from the analytic value, together. On the 128-transition spinor payload
 (8 roots and 8 margin roots, 0.01 meV) it takes 15 iterations and 436 pair
 calls, 54.5 per root, against 207 applications of $A$, 25.9 per root, for the
-planned Davidson on the Tamm–Dancoff problem (a factor 2.1), and 22.2 to 35.2
-per root for the structure-preserving Lanczos of `solvers.bse_sp_lanczos`,
-whose Krylov space is close to the whole window at that size
-(`tests/test_bse_full_davidson_cpu.py`).
+planned Davidson on the Tamm–Dancoff problem (a factor 2.1;
+`tests/test_bse_full_davidson_cpu.py`).
 
 The unpaired form, on the same footing (CPU, the dense `eig` of $\Sigma\mathcal K$ as the reference,
 `tests/test_bse_sp_davidson_unpaired_cpu.py`, and `tests/test_bse_full_finite_q_cpu.py` for the
