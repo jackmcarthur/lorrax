@@ -1,6 +1,6 @@
 """What ``full_bse = true`` says it runs, and which eigensolver options it refuses.
 
-``bse_lanczos.solve_bse_sharded(tda=False)`` returns before it reads any Davidson, Lanczos or TRLan
+``bse_lanczos.solve_bse_sharded(tda=False)`` returns before it reads any Davidson or Lanczos
 option: the full route is the dense structure-preserving solve, not an iteration.  The deck layer
 (``bse_jax``) must therefore (1) print that route in the SETTINGS table, not "davidson ... exact
 diagonal preconditioner", and (2) refuse an eigensolver key set away from its default, the unread-key
@@ -35,7 +35,7 @@ def test_full_bse_settings_name_the_dense_route():
 
 @pytest.mark.parametrize("line, key", [
     ("davidson_precond = bare", "davidson_precond"), ("davidson_margin = 4", "davidson_margin"),
-    ("davidson_olsen = true", "davidson_olsen"), ("trlan_m_max = 40", "trlan_m_max"),
+    ("davidson_olsen = true", "davidson_olsen"),
     ("lanczos_rtol = 1e-6", "lanczos_rtol")])
 def test_full_bse_refuses_unread_eigensolver_keys(line, key, capsys):
     """An eigensolver key set away from its default refuses under full_bse; the TDA run still reads it
@@ -51,7 +51,7 @@ def test_full_bse_refuses_unread_eigensolver_keys(line, key, capsys):
 
 @pytest.mark.parametrize("route", ("full_bse = true", "full_bse = true\nfull_bse_solver = davidson"))
 @pytest.mark.parametrize("line, key, instead", [
-    ("solver = block_lanczos", "solver", "full_bse_solver"), ("solver = trlan", "solver", "full_bse_solver"),
+    ("solver = block_lanczos", "solver", "full_bse_solver"),
     ("block_size = 4", "block_size", "Lanczos block")])
 def test_full_bse_refuses_the_shared_keys_no_full_route_reads(route, line, key, instead, capsys):
     """``solver`` and ``block_size`` are shared with the other BSE drivers, which the unread-key rule

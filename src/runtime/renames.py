@@ -124,7 +124,7 @@ _bse_flags(("bse.bse_jax",), {
     "--lanczos": Rename("", "it changed nothing; the eigensolve is the default route"),
     "--feast": "feast",
     "--kpm-dos": "kpm_dos",
-    "--solver": Rename("solver", "values davidson, block_lanczos, trlan"),
+    "--solver": Rename("solver", "values davidson, block_lanczos"),
     "--write-eigs": Rename("write_eigenvectors", "BerkeleyGW's sign convention: < 0 writes "
                                                  "every computed state"),
     "--qp-rotations": "qp_rotations_file",
@@ -140,8 +140,10 @@ _bse_flags(("bse.bse_jax",), {
     "--davidson-olsen": "davidson_olsen",
     "--davidson-eps-shift": "davidson_eps_shift",
     "--davidson-m-max": "davidson_m_max",
-    "--trlan-m-max": "trlan_m_max",
-    "--trlan-n-keep": "trlan_n_keep",
+    "--trlan-m-max": Rename("", "the thick-restart Lanczos was retired 2026-11-27; the Davidson "
+                                "is the Tamm-Dancoff eigensolver"),
+    "--trlan-n-keep": Rename("", "the thick-restart Lanczos was retired 2026-11-27; the Davidson "
+                                 "is the Tamm-Dancoff eigensolver"),
     "--haydock-iter": Rename("number_iterations", "with haydock = true"),
     "--haydock-pol": Rename("polarization", "a vector along b1 b2 b3; unset computes x, y, z"),
     "--haydock-eta-ev": Rename("energy_resolution", "eV, Lorentzian"),

@@ -28,7 +28,8 @@ from runtime.run_session import RunSession
 
 from .bse_deck import (DeckError, Key, check_dipole_operator, check_fine_grid_keys, deck_params,
                        deck_source, eqp_file, key_of, note_extended_kernel, omega_count,
-                       read_settings, spin_kernel)
+                       read_settings, refuse_retired_keys, refuse_retired_solver,
+                       spin_kernel)
 from .bse_preconditioner import bgw_spin_kernel
 from .bse_ring_comm import (
     create_mesh_2d,
@@ -115,8 +116,6 @@ def _preview_lanczos(
     davidson_margin_tol_mev: float | None = None,
     davidson_olsen: bool = False,
     davidson_eps_shift: float | None = None,
-    trlan_m_max: int | None = None,
-    trlan_n_keep: int | None = None,
     tda: bool = True,
     degeneracy_mode: str = DEFAULT_MODE,
     degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
@@ -236,8 +235,8 @@ def _preview_lanczos(
         max_lanczos_iter = max(30, min(200, bse_dim // 2))
     # ``max_lanczos_iter`` is the *total* Krylov dimension upper
     # bound; the block Lanczos divides it by block_size.  No other solver has
-    # a Lanczos block: ``block_size`` never divides the Davidson's or the
-    # TRLan's cap, nor the full-BSE routes'.
+    # a Lanczos block: ``block_size`` never divides the Davidson's cap, nor the
+    # full-BSE routes'.
     block_max_iter = max(1, max_lanczos_iter // (
         max(1, block_size) if (tda and solver_kind == "lanczos") else 1))
     mode = (f"convergence-driven (rtol={rtol:.1e}, every {check_every} iters)"
@@ -252,7 +251,7 @@ def _preview_lanczos(
     elif not tda:
         log.info(f"Full BSE: dense structure-preserving solve of the {bse_dim}-state "
                  f"window (A and B assembled, host eigh of K z = omega Sigma z); "
-                 f"the Davidson, Lanczos and TRLan settings are not read")
+                 f"the Davidson and Lanczos settings are not read")
     elif block_size > 1:
         log.info(f"Block Lanczos [{mode}]: ≤ {block_max_iter} block iter × "
                  f"block_size={block_size} = ≤ {block_max_iter * block_size} Krylov dim")
@@ -292,7 +291,6 @@ def _preview_lanczos(
             davidson_margin=int(davidson_margin),
             davidson_margin_tol_Ry=(None if davidson_margin_tol_mev is None else
                                     float(davidson_margin_tol_mev) / (RYD_TO_EV * 1.0e3)),
-            trlan_m_max=trlan_m_max, trlan_n_keep=trlan_n_keep,
             keep_W_R=haydock is not None,
             full_solver=full_bse_solver, full_on_indefinite=full_bse_instability,
         )
@@ -739,8 +737,7 @@ def _settings_parser():
              "max(30, min(200, bse_dim // 2))).  --solver lanczos: the Krylov "
              "dimension it runs (block iters x --block-size).  --solver "
              "davidson: the CAP on block iterations; the solve stops at its "
-             "residual test (--davidson-tol-mev).  --solver trlan: the matvec "
-             "budget.",
+             "residual test (--davidson-tol-mev).",
     )
     parser.add_argument(
         "--block-size",
@@ -781,17 +778,14 @@ def _settings_parser():
     )
     parser.add_argument(
         "--solver",
-        choices=("lanczos", "davidson", "trlan"),
+        choices=("lanczos", "davidson"),
         default="davidson",
         help="Eigensolver for the lowest --n-eig roots.  ``davidson`` (the "
              "default since 2026-10-20): block Davidson with the exact "
              "diagonal preconditioner, stopped when every root's residual is "
              "below --davidson-tol-mev.  ``lanczos``: single-vector or block "
              "Lanczos at a fixed Krylov dimension (--max-lanczos-iter), or to "
-             "--lanczos-rtol.  ``trlan``: thick-restart Lanczos, the Krylov "
-             "convergence of ``lanczos`` from a basis capped at "
-             "--trlan-m-max slots, for a fixed matvec budget.  Flags of a "
-             "solver that is not selected refuse.",
+             "--lanczos-rtol.  Flags of a solver that is not selected refuse.",
     )
     parser.add_argument(
         "--davidson-precond", choices=("bare", "exact", "auto"),
@@ -861,16 +855,6 @@ def _settings_parser():
              "or non-positive root).  ``refuse`` (default) stops with the measured "
              "lam_min.  ``continue`` solves on, reports the unstable root(s) in the "
              "log and RESULTS, and writes the positive roots above them.",
-    )
-    parser.add_argument(
-        "--trlan-m-max", type=int, default=None,
-        help="Thick-restart Lanczos: basis slots (the memory cap). "
-             "Default max(3*n_eig, 60). The useful range is 3-5x n_eig.",
-    )
-    parser.add_argument(
-        "--trlan-n-keep", type=int, default=None,
-        help="Thick-restart Lanczos: Ritz vectors retained across a restart. "
-             "Default n_eig+10. Must satisfy n_eig <= n_keep < m_max.",
     )
     parser.add_argument(
         "--haydock-iter", type=int, default=0,
@@ -956,7 +940,7 @@ BSE_KEYS = {
     "number_eigenvalues": Key("n_eig", "int"),
     "write_eigenvectors": Key("write_eigs", "int", convert=_write_eigenvectors),
     "helicity_table": Key("helicity_table", "bool"),
-    "solver": Key("solver", choices=("davidson", "block_lanczos", "trlan"),
+    "solver": Key("solver", choices=("davidson", "block_lanczos"),
                   convert=_solver_name),
     "solver_max_iter": Key("max_lanczos_iter", "int"),
     "block_size": Key("block_size", "int"),
@@ -970,8 +954,6 @@ BSE_KEYS = {
     "davidson_olsen": Key("davidson_olsen", "bool"),
     "davidson_eps_shift": Key("davidson_eps_shift", "float"),
     "davidson_m_max": Key("davidson_m_max", "int"),
-    "trlan_m_max": Key("trlan_m_max", "int"),
-    "trlan_n_keep": Key("trlan_n_keep", "int"),
     "haydock": Key("haydock", "bool"),
     "number_iterations": Key("number_iterations", "int"),
     "energy_resolution": Key("haydock_eta_ev", "float"),
@@ -1040,7 +1022,7 @@ _ROUTE_DESTS = {
         "lanczos_rtol", "lanczos_check_every", "n_reorth", "solver",
         "davidson_precond", "davidson_olsen", "davidson_eps_shift",
         "davidson_m_max", "davidson_tol_mev", "davidson_margin",
-        "davidson_margin_tol_mev", "trlan_m_max", "trlan_n_keep",
+        "davidson_margin_tol_mev",
         "full_bse_solver", "full_bse_instability",
         "eqp", "n_occ", "band_degeneracy", "degeneracy_tol_ry", "dipole",
         "dipole_position_fix", "helicity_table", "qp_rotations", "haydock",
@@ -1063,7 +1045,6 @@ _SOLVER_DESTS = {
     "davidson": {"davidson_precond", "davidson_olsen", "davidson_eps_shift",
                  "davidson_m_max", "davidson_tol_mev", "davidson_margin",
                  "davidson_margin_tol_mev"},
-    "trlan": {"trlan_m_max", "trlan_n_keep"},
 }
 
 #: The Davidson settings ``full_bse_solver = davidson`` reads (with the shared
@@ -1082,6 +1063,8 @@ def _deck_settings(input_file, parser):
     schema = _settings_parser()
     try:
         params, named = deck_params(input_file)
+        refuse_retired_keys(params, named)
+        refuse_retired_solver(params, named)
         args, named = read_settings(
             input_file, schema.parse_args([]), BSE_KEYS,
             required=("number_val_bands_fine", "number_cond_bands_fine"),
@@ -1189,15 +1172,15 @@ def parse_args(argv=None):
                 f"read by full_bse_solver = davidson (the structure-preserving Davidson "
                 f"reads solver_max_iter, davidson_tol_mev, davidson_margin, "
                 f"davidson_margin_tol_mev, davidson_m_max, davidson_precond, "
-                f"davidson_olsen and davidson_eps_shift; it has no Lanczos or TRLan "
+                f"davidson_olsen and davidson_eps_shift; it has no Lanczos "
                 f"setting) and would be ignored; drop "
                 f"{'it' if len(unread) == 1 else 'them'}")
         if unread:
             parser.error(
                 f"{', '.join(unread)} {'is' if len(unread) == 1 else 'are'} not "
                 f"read by full_bse = true (the dense structure-preserving solve "
-                f"returns the lowest n_eig roots with no Davidson, Lanczos or "
-                f"TRLan iteration) and would be ignored; drop "
+                f"returns the lowest n_eig roots with no Davidson or "
+                f"Lanczos iteration) and would be ignored; drop "
                 f"{'it' if len(unread) == 1 else 'them'}, set full_bse_solver = davidson "
                 f"for the full-BSE Davidson, or set full_bse = false "
                 f"for the eigensolve that reads {'it' if len(unread) == 1 else 'them'}")
@@ -1303,7 +1286,7 @@ def settings_rows(args, *, source) -> tuple:
                  "block_lanczos" if args.solver == "lanczos" else str(args.solver),
                  "derived" if not use_tda else source("solver"),
                  ("dense structure-preserving solve of the assembled A and B (host eigh); "
-                  "no iteration, so no Davidson, Lanczos or TRLan setting is read"
+                  "no iteration, so no Davidson or Lanczos setting is read"
                   if not use_tda else
                   f"block of {int(args.n_eig)} roots + up to {int(args.davidson_margin)} "
                   f"margin, {args.davidson_precond} "
@@ -1400,7 +1383,7 @@ def _report_environment(report, args):
     report.environment(wfn=wfn, lines=(
         "Transition data: distributed band and centroid blocks on X x Y",
         "Eigensolve path: " + (
-            policy(args.solver, ("lanczos", "davidson", "trlan")) if args.tda else
+            policy(args.solver, ("lanczos", "davidson")) if args.tda else
             "structure-preserving Davidson, full BSE" if args.full_bse_solver == "davidson"
             else "dense structure-preserving solve, full BSE"),
         "Eigenvectors   : " + (
@@ -1510,8 +1493,6 @@ def main(argv=None) -> int:
             davidson_tol_mev=args.davidson_tol_mev,
             davidson_margin=args.davidson_margin,
             davidson_margin_tol_mev=args.davidson_margin_tol_mev,
-            trlan_m_max=args.trlan_m_max,
-            trlan_n_keep=args.trlan_n_keep,
             degeneracy_mode=args.band_degeneracy,
             degeneracy_tol_ry=args.degeneracy_tol_ry,
             tda=use_tda,

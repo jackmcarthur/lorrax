@@ -95,6 +95,29 @@ def deck_params(deck_path: str) -> dict:
     return params, set(params.get(_DECK_NAMED_KEYS, ()))
 
 
+#: Input keys of retired BSE routes.  Named in an input file they refuse:
+#: an unknown key is otherwise left alone, and the run would silently be another one.
+RETIRED_KEYS = {
+    # key: (what it selected, what to do instead)
+    "trlan_m_max": ("the basis size of the thick-restart Lanczos eigensolver",
+                    "drop the key; the Tamm-Dancoff eigensolver is the Davidson (`davidson_m_max` "
+                    "sets its basis capacity)"),
+    "trlan_n_keep": ("the retained Ritz vectors of the thick-restart Lanczos eigensolver",
+                     "drop the key; the Tamm-Dancoff eigensolver is the Davidson"),
+}
+
+
+def refuse_retired_keys(params, named, *, error=DeckError):
+    """``GATE bse_retired_key``: an input key of a retired BSE route refuses."""
+    for key in sorted(named):
+        if key in RETIRED_KEYS:
+            what, fix = RETIRED_KEYS[key]
+            raise error(f"GATE bse_retired_key: `{key}` selected {what}, retired 2026-11-27 "
+                        f"(got: `{key} = {params.get(key)}`; want: the key absent).  "
+                        f"Why: an input key no driver reads is left alone, so the run would "
+                        f"silently be a different calculation.  Fix: {fix}")
+
+
 def read_settings(deck_path: str, defaults: argparse.Namespace,
                   keys: Mapping[str, Key], *, required: tuple[str, ...] = (),
                   params: dict | None = None,
@@ -286,3 +309,22 @@ def omega_count(omega_min_ev: float, omega_max_ev: float, delta_ev: float) -> in
         raise DeckError(f"`omega_max_ev` ({omega_max_ev}) must exceed `omega_min_ev` "
                         f"({omega_min_ev})")
     return int(round((omega_max_ev - omega_min_ev) / delta_ev)) + 1
+
+
+#: Values of the ``solver`` key that selected a retired eigensolver.
+RETIRED_SOLVER_VALUES = {
+    "trlan": "the thick-restart Lanczos",
+}
+
+
+def refuse_retired_solver(params, named, *, error=DeckError):
+    """``GATE bse_retired_key`` for the ``solver`` key: a retired value refuses in one line."""
+    if "solver" not in named:
+        return
+    value = str(params.get("solver")).strip().lower()
+    if value in RETIRED_SOLVER_VALUES:
+        raise error(f"GATE bse_retired_key: `solver = {value}` selected "
+                    f"{RETIRED_SOLVER_VALUES[value]} eigensolver, retired 2026-11-27 "
+                    f"(got: `solver = {params.get('solver')}`; want: `solver = davidson` or the "
+                    f"key absent).  Why: the Davidson is the Tamm-Dancoff eigensolver.  "
+                    f"Fix: remove the `solver` key or set `solver = davidson`")

@@ -291,7 +291,7 @@ $\mathcal K z = \Omega\,\Sigma z$ as it stands: the dense solve, and the
 ## The matvec
 
 `bse_stack_matvec.build_bse_stack_matvec` is the TDA matvec: Lanczos,
-Davidson and thick-restart Lanczos and KPM under `full_bse = false`, the
+Davidson and KPM under `full_bse = false`, the
 spectral-bound Lanczos of FEAST and KPM on either route, Haydock, and
 `bse.exciton_bands` (its `full_bse = true` scan takes the pair applier below).
 It and the pair applier are two entries of one assembly
@@ -461,7 +461,6 @@ per rank. The fused kernel runs at 2.27× the flop floor.
 |---|---|---|---|
 | Davidson (default) | `full_bse = false` (no route flag; `the eigensolve` is an alias) | `solvers.davidson.davidson` with `lock_converged`, the exact diagonal preconditioner and start subspace from `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots, stopped when every residual is below `davidson_tol_mev` (0.01 meV) |
 | Lanczos, block Lanczos | `full_bse = false solver = block_lanczos` | `bse_lanczos.solve_bse_sharded` | spectrum shape; fixed Krylov dimension, CGS2 reorthogonalization, full window by default |
-| thick-restart Lanczos | `full_bse = false solver = trlan` | `solvers.thick_restart_lanczos` | Krylov memory capped at `trlan_m_max` |
 | full BSE, dense (default) | no route flag, `full_bse = true` (`bse.exciton_bands`: input key `full_bse_solver = dense`, the default) | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve of the assembled $A$ and $B$, N ≤ 4096; at a finite pair momentum, of the four assembled blocks of $\mathcal K$ |
 | full BSE, Davidson | `full_bse = true full_bse_solver = davidson` | `solvers.bse_sp_davidson` through `bse.bse_nontda`, with the exact diagonal ($[D; -D]$, or $[D; -D']$ at finite $Q$) and the start subspace of `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots with their $(X, Y)$, no assembly and no size limit, stopped when every residual is below `davidson_tol_mev` (0.01 meV); reports $\lambda_{\min}(\mathcal K)$; at finite $Q$ the unpaired form |
 | FEAST | `feast = true` with `full_bse = true` (the TDA refuses it, `GATE feast_tda_complex`) | `bse.bse_feast` | contour eigensolve in KPM-sized windows; refuses unless every in-window Ritz residual is below `--feast-tol-mev` (0.01 meV, `GATE feast_converged`) |
@@ -475,7 +474,7 @@ Both full routes serve a finite pair momentum through `bse.exciton_bands`
 With `full_bse = true` the dense solve (`full_bse_solver = dense`, the default)
 reads `number_eigenvalues` and the
 kernel only (`bse_lanczos.solve_bse_sharded` returns to `bse_nontda` before it reads any
-solver option). `bse_jax` refuses a `davidson_*`, `trlan_*` or `lanczos_*` key set away from its
+solver option). `bse_jax` refuses a `davidson_*` or `lanczos_*` key set away from its
 default. `solver` other than `davidson` and `block_size` other than 1 refuse under either
 `full_bse_solver` (neither route reads them), and under `dense` so do `davidson_tol_mev` and
 `solver_max_iter`; the refusal names `full_bse_solver` or the key to drop. The dense solve reduces
@@ -541,7 +540,7 @@ pair applier, with the pieces the Tamm–Dancoff Davidson uses:
   The margin must have room for them (`GATE nontda_davidson_block`).
   At a finite $Q$ a root of negative type at $\Omega \ge 0$ (the $-Q$ problem's non-positive roots)
   is also kept in the basis and not returned.
-- **Not read.** The Lanczos and TRLan keys refuse. `davidson_olsen`, a `head_tensor` payload and
+- **Not read.** The Lanczos keys refuse. `davidson_olsen`, a `head_tensor` payload and
   `keep_W_R` are honoured.
 
 Measured on the 128-transition spinor test payload (CPU, 1×1 and an emulated 2×2 mesh, 8 roots and 8

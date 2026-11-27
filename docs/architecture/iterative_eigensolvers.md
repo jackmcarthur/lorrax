@@ -148,20 +148,6 @@ between checks `check_every` blocks apart; it is eigenvalue stability, not an
 eigenpair residual. A consumer that needs a residual evaluates
 $HX - X\Lambda$ itself.
 
-## Thick-restart Lanczos
-
-`solvers.thick_restart_lanczos.thick_restart_lanczos_eig(…, m_max=80,
-n_keep=n_eig+10, …, subspace_plan=None)` bounds memory by restarting: after
-`m_max` steps it keeps `n_keep` Ritz pairs and continues from them, so a
-cycle's projected matrix is an arrowhead (a diagonal block of the kept Ritz
-values plus one coupling row) followed by the ordinary tridiagonal part. It
-requires $0 < $ `n_eig` $\le$ `n_keep` $<$ `m_max`, and its subspace plan has
-`capacity = m_max + 1` (the extra slot holds the residual vector) and
-`n_eig = n_keep`. Two programs compile, one for the first cycle and one for
-every restart cycle. Each step orthogonalizes only the initialized prefix;
-a restart reconstructs the kept rows without slicing the basis, and stale
-slots stay allocated but excluded until they are overwritten.
-
 ## Structure-preserving Davidson {#structure-preserving-davidson}
 
 `solvers.bse_sp_davidson.sp_davidson(apply_pair, X0, *, precondition=None,
@@ -457,7 +443,6 @@ at `epsilon_shift` $10^{-3}$ Ry and 452 at $10^{-6}$ Ry; at finite $Q$ it takes 
 |---|---|---|
 | planned Davidson | `psp.run_nscf` ([NSCF Hamiltonian](nscf_hamiltonian.md)); `bse.bse_lanczos` (`solver = davidson`, the default; also `bse.exciton_bands` per $Q$) | $H_k$ on the G sphere; the BSE Hamiltonian |
 | block Lanczos | `bse.bse_lanczos`, `bse.exciton_bands` (`solver = block_lanczos`) | the BSE Hamiltonian |
-| thick-restart Lanczos | `bse.bse_lanczos` | the BSE Hamiltonian |
 | structure-preserving Davidson | `bse.bse_nontda` (`full_bse = true` with `full_bse_solver = davidson`; `bse.exciton_bands` per $Q$) | the full BSE pair applier $AX+B\bar X$; at a finite pair momentum the Hermitian $\mathcal K$ on pair rows, unpaired form |
 
 Which BSE solver each CLI flag selects is [BSE](bse.md).

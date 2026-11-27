@@ -160,7 +160,8 @@ from common.scientific_output import abs_path, band_range, policy
 from runtime.run_session import RunSession
 from .bse_head import head_shifted_eps_c
 from .bse_deck import (DeckError, Key, check_fine_grid_keys, deck_params, deck_source,
-                       eqp_file, read_settings, spin_kernel)
+                       eqp_file, read_settings, refuse_retired_keys,
+                       refuse_retired_solver, spin_kernel)
 from .bse_deck import _FALSE as _DECK_FALSE
 from .bse_io import (load_bse_data_from_restart_sharded, decimate_W_q_to_subgrid, make_w_densifier, w_pair_embedding, resolve_w_head_densify, PAD_EPS_GUARD_RY)
 from file_io.restart_bundle import (_find_restart_file)
@@ -1781,6 +1782,8 @@ def deck_settings(ap, args):
     settings_ap = _settings_defaults()
     try:
         params, named = deck_params(args.input)
+        refuse_retired_keys(params, named)
+        refuse_retired_solver(params, named)
         settings, named = read_settings(
             args.input, settings_ap.parse_args([]), EXB_KEYS,
             required=("number_val_bands_fine", "number_cond_bands_fine"),

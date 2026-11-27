@@ -445,7 +445,7 @@ def test_options_the_route_cannot_honour_refuse(ops):
     # correction and a kept W_R, refused until 2026-11-27, are honoured: test_olsen_* below.)
     with pytest.raises(ValueError, match="GATE nontda_route_option"):
         bse_lanczos.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, tda=False,
-                                      full_solver="trlan")
+                                      full_solver="lanczos")
     with pytest.raises(ValueError, match="GATE nontda_route_option"):
         bse_lanczos.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, tda=False,
                                       full_on_indefinite="continue")
@@ -522,7 +522,6 @@ def test_input_keys_and_what_they_refuse(capsys):
     assert args.davidson_olsen is True                  # read by the full Davidson since 2026-11-27
     refused = [
         (["full_bse = true", "davidson_olsen = true"], "set full_bse_solver = davidson for the full-BSE Davidson"),
-        (full + ["trlan_m_max = 40"], "`trlan_m_max` is not read by full_bse_solver = davidson"),
         (full + ["lanczos_rtol = 1e-6"], "`lanczos_rtol` is not read by full_bse_solver = davidson"),
         (["full_bse = true", "full_bse_instability = continue"],
          "`full_bse_instability` is read by full_bse_solver = davidson only"),
@@ -650,7 +649,7 @@ def test_driver_writes_both_halves_and_says_what_runs(ops, monkeypatch, tmp_path
     assert "full-BSE Davidson converged: 8/8 roots with residual < 0.01 meV" in text
     assert "pair calls" in text and "dense structure-preserving solve" not in text
     assert "Full BSE: dense structure-preserving solve of the 128-state window" in text_dense
-    assert "Davidson" not in text_dense.replace("the Davidson, Lanczos and TRLan settings are not read", "")
+    assert "Davidson" not in text_dense.replace("the Davidson and Lanczos settings are not read", "")
     line, rows = bse_jax._full_davidson_report()
     assert line.startswith("full-BSE Davidson converged") and rows[0][0] == "stability"
     assert "positive definite" in rows[0][1] and "NOT" not in rows[0][1] and len(rows) == 1
@@ -678,9 +677,9 @@ def test_eps_shift_zero_and_block_size_reach_the_solver_as_written(ops, monkeypa
     with pytest.raises(Stop):
         _drive(str(tmp_path), mesh, ops, monkeypatch, ["full_bse_solver = davidson"])
     assert seen["davidson_eps_shift_Ry"] == 1e-3                       # the default, when not named
-    # the Tamm-Dancoff Davidson and TRLan keep their whole cap under block_size; the block Lanczos divides
+    # the Tamm-Dancoff Davidson keeps its whole cap under block_size; the block Lanczos divides
     args = _parse([])
-    for solver, want in (("davidson", 40), ("trlan", 40), ("lanczos", 10)):
+    for solver, want in (("davidson", 40), ("lanczos", 10)):
         with pytest.raises(Stop):
             bse_jax._preview_lanczos(args.input, NV, NC, n_eig=N_EIG, tda=True, solver_kind=solver,
                                      block_size=4, max_lanczos_iter=40)

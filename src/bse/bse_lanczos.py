@@ -152,8 +152,6 @@ def solve_bse_sharded(
     davidson_m_max: int | None = None,
     davidson_precond: str = "exact",
     davidson_olsen: bool = False,
-    trlan_m_max: int | None = None,
-    trlan_n_keep: int | None = None,
     davidson_n_random_init: int = 5,
     davidson_eps_shift_Ry: float = 1e-3,
     davidson_tol_Ry: float = DAVIDSON_TOL_MEV / RY_TO_MEV,
@@ -165,7 +163,7 @@ def solve_bse_sharded(
     full_solver: str = "dense",
     full_on_indefinite: str = "refuse",
 ) -> Tuple[jax.Array, jax.Array]:
-    """The BSE eigensolve (Lanczos / block / Davidson / TRLan) on any mesh.
+    """The BSE eigensolve (Lanczos / block / Davidson) on any mesh.
 
     The single-device ``solve_bse`` it used to sit beside was deleted with
     ``bse_serial`` (C10, 2026-09-24); a one-device run is this on a 1x1 mesh.
@@ -195,7 +193,7 @@ def solve_bse_sharded(
     solver stack — which returns paired (X, Y) eigenvectors (X^H X - Y^H Y = +1).
     ``full_solver`` picks its route.  ``'dense'`` (default) reads ``n_eig`` and
     ``include_W`` only: it is the dense structure-preserving solve, so every
-    Davidson, Lanczos and TRLan argument below is unread there (``bse_jax``
+    Davidson and Lanczos argument below is unread there (``bse_jax``
     refuses such deck keys under ``full_bse``).  ``'davidson'`` is the
     structure-preserving Davidson (``solvers.bse_sp_davidson``): it reads
     ``max_iter`` (the iteration cap), ``davidson_tol_Ry``, ``davidson_m_max``
@@ -522,83 +520,6 @@ def solve_bse_sharded(
         # residual test, so this is a measured count, not the budget.
         return eigenvalues, eigenvectors, jnp.int32(int(_DAV_HIST["iter"][0]))
 
-
-    # ── Thick-restart Lanczos: fixed-shape, memory-capped Krylov ──────────
-    # Same Krylov convergence as the unrestarted path, from a basis of
-    # ``m_max + 1`` slots instead of ``max_iter + 1``.  On a 1024-dim deck
-    # that trade is a loss (the unrestarted solve already fits); it exists
-    # for production ``bse_dim``, where a 400-vector basis does not.
-    #
-    # Everything is preallocated and every trip count is a compile-time
-    # constant, so the iteration traces at exactly one shape.  It opens NO
-    # shard_map of its own: the subspace algebra is ellipsis einsums whose
-    # batch axis is replicated and whose trailing axes carry ``sh.X``, which
-    # GSPMD lowers to the two CGS2 collectives per step; the only shard_map
-    # in the solve is the one ``matvec_ring`` already owns.
-    if solver_kind == "trlan":
-        from solvers.thick_restart_lanczos import thick_restart_lanczos_eig
-
-        psi_c_X = data["psi_c_X"]; psi_c_Y = data["psi_c_Y"]
-        psi_v_X = data["psi_v_X"]; psi_v_Y = data["psi_v_Y"]
-        eps_c   = head_shifted_eps_c(data["eps_c"], data)
-        eps_v   = data["eps_v"]
-        V_q0    = data["V_q0"]
-        M       = data["M"]
-
-        m_max = int(trlan_m_max) if trlan_m_max else max(3 * n_eig, 60)
-        n_keep = int(trlan_n_keep) if trlan_n_keep else n_eig + 10
-        # ``solver_max_iter`` is read as a budget of matvec APPLICATIONS,
-        # so the A/B against the unrestarted path is like-for-like: both
-        # spend the same number of H applications.
-        per_cycle = m_max - n_keep
-        n_restarts = max(0, -(-(int(max_iter) - m_max) // per_cycle))
-        apps = m_max + n_restarts * per_cycle
-        bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
-        rep_tr = NamedSharding(mesh_xy, P())
-        from distrib_la import plan_subspace
-        trlan_plan = plan_subspace(
-            capacity=m_max + 1, n_eig=n_keep, vector_sharding=bse_sharding)
-
-        log.info(f"Thick-restart Lanczos: n_eig={n_eig} m_max={m_max} "
-                 f"n_keep={n_keep} restarts={n_restarts} -> {apps} matvec "
-                 f"applications, basis {m_max + 1} slots "
-                 f"({(m_max + 1) / (int(max_iter) + 1):.2f}x the unrestarted "
-                 f"basis at the same budget)")
-
-        # ONE jit, tensors as ARGUMENTS.  They span every process, so closing
-        # over them inside the traced loop body would carry them as constants
-        # -- the shape of mistake bse_feast's cached runner makes; inside a
-        # fori_loop it does not raise, it just builds a program that does not
-        # finish compiling.  Measured: 13 min without this, and counting.
-        @partial(
-            jax.jit,
-            in_shardings=(
-                sh.psi_x, None, None, sh.psi_y,      # coupling legs: unread (TDA)
-                sh.eps, sh.eps, sh.W, sh.V, sh.M,
-            ),
-            # Keep Ritz vectors distributed; the streaming writer owns host I/O.
-            out_shardings=(rep_tr, bse_sharding, rep_tr),
-        )
-        def _trlan_run(pcx, pcy, pvx, pvy, ec, ev, WR, Vq0, M):
-            def apply_H(V):
-                V = jax.lax.with_sharding_constraint(V, sh.X)
-                return matvec_ring(V, pcx, pcy, pvx, pvy, ec, ev, WR, Vq0, M)
-            return thick_restart_lanczos_eig(
-                apply_H, (nc_pad, nv_pad, nk),
-                n_eig=n_eig, m_max=m_max, n_keep=n_keep,
-                n_restarts=n_restarts, sharding=bse_sharding,
-                subspace_plan=trlan_plan,
-            )
-
-        eigenvalues, eigenvectors, alpha_im = _trlan_run(
-            psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
-            M)
-        log.info(f"Thick-restart Lanczos: max |Im <q,Hq>| = "
-                 f"{float(alpha_im):.3e} Ry")
-        eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
-        # An HONEST third slot: the matvec applications actually spent, not
-        # an echo of the budget (CONVERGENCE_CENSUS recommendation 2).
-        return eigenvalues, eigenvectors, jnp.int32(apps)
 
     from distrib_la import plan_subspace
     lanczos_vector_shape = (nc_pad, nv_pad, nk)
