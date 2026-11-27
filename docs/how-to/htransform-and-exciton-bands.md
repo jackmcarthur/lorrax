@@ -363,7 +363,8 @@ mesh) at a device peak of 17.2 GiB.
 ## 7. Exciton bands
 
 `bse.exciton_bands` solves the Tamm–Dancoff BSE at nonzero exciton momentum
-$Q$ along the deck's `K_POINTS {crystal_b}` path. The pair basis is
+$Q$ along the deck's `K_POINTS {crystal_b}` path, or the full BSE with
+`full_bse = true` ([below](#the-full-bse-along-the-path)). The pair basis is
 $|vk,\, c\,k{+}Q\rangle$: the electron leg is shifted by $+Q$. The Hamiltonian
 is
 
@@ -441,10 +442,26 @@ plotted). Passing the images of a few off-grid path points measures the
 interpolation error without an external reference. Gates evaluated only on
 grid points cannot see off-grid errors, for the reason given in §3.
 
+**The full BSE along the path.** <a id="the-full-bse-along-the-path"></a>With `full_bse = true`
+each $Q$ solves $\mathcal K z = \Omega\,\Sigma z$ with the resonant pair
+$(c\,k{+}Q,\ v\,k)$ and the antiresonant pair $(v\,k{+}Q,\ c\,k)$; there is no
+$B = B^{\mathsf T}$ and no $\pm\Omega$ pairing at a general $Q$ (the equations are on
+[the BSE page](../architecture/bse.md#the-full-bse-at-a-finite-pair-momentum)). The htransform
+therefore returns the BSE valence bands as well as the conduction bands at every $k+Q$, so `nval`
+must be at least `number_val_bands_fine` (`GATE exb_full_bse_valence_window`). The input keys are
+`full_bse`, `full_bse_solver = dense | davidson` (default `dense`, at most 4096 transitions per $Q$;
+`davidson` is the unpaired structure-preserving Davidson, no size limit, residual stop
+`davidson_tol_mev`) and `full_bse_instability = refuse | continue` (read under `davidson`: a $Q$
+whose $\mathcal K$ is not positive definite refuses, or its unstable roots are logged and the positive
+roots above them written). `solver = block_lanczos` cannot solve the full BSE, and the keys of a
+solver the route does not read refuse (`GATE exb_full_bse_key`). The run logs the smallest stability
+margin $\lambda_{\min}$ of the path, and the `.dat` title says which problem was solved and carries
+that margin.
+
 **Quasiparticle energies.** `eqp_corrections eqp1.dat` corrects both legs: the stored
-valence and conduction energies and the htransform energies. There is no
-`qp_rotations_file` route; a full-QP exciton band structure needs a GW restart
-built from `WFN_qp.h5`.
+valence and conduction energies and the htransform energies. `qp_rotations_file` and
+`highest_occupied_band` refuse in this driver (`GATE exb_unserved_key`); a full-QP exciton band
+structure needs a GW restart built from `WFN_qp.h5`.
 
 **Output.** `<prefix>.dat` (default `exciton_bands.dat`) has a header naming
 the window, grid, `--vq-mode`, refit window and certificate, the conventions

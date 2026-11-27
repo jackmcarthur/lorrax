@@ -167,14 +167,18 @@ slots stay allocated but excluded until they are overwritten.
 `solvers.bse_sp_davidson.sp_davidson(apply_pair, X0, *, precondition=None,
 data=(), n_converge=None, capacity=None, max_iter=100, tol=1e-8,
 stall_patience=20, lock_converged=True, margin_lock=1.0,
-on_indefinite="refuse", metric_tol=1e-8, refusal_notes=None, plan_key=None, verbose=True)`
+on_indefinite="refuse", metric_tol=1e-8, refusal_notes=None, plan_key=None, verbose=True,
+paired=True, precondition_vectors=False)`
 finds the lowest roots of the full (non-Tamm–Dancoff) Bethe–Salpeter problem
 
 $$H\begin{pmatrix}X\\Y\end{pmatrix}=\omega\begin{pmatrix}X\\Y\end{pmatrix},\qquad
 H=\begin{pmatrix}A&B\\-\bar B&-\bar A\end{pmatrix},\qquad A=A^\dagger,\quad B=B^{\mathsf T},$$
 
 with the pairs normalised $X^\dagger X-Y^\dagger Y=1$. It is the solver behind
-`full_bse_solver = davidson` ([BSE](bse.md#solvers)). Its only access to the
+`full_bse_solver = davidson` ([BSE](bse.md#solvers)). The form below, with
+$B = B^{\mathsf T}$ and $\pm\omega$ pairs, is `paired=True`; at a finite pair
+momentum it does not hold, and [the unpaired form](#the-unpaired-form)
+(`paired=False`) takes over. Its only access to the
 operator is the real-linear pair applier (`bse_stack_matvec.build_bse_stack_pair_matvec`),
 
 $$M(x)=Ax+B\bar x=\mathrm{pair}(x,+1),\qquad \mathrm{pair}(x,-1)=-\mathrm i\,M(\mathrm i x), \tag{1}$$
@@ -278,6 +282,56 @@ real roots, positive roots; an unstable root has $X^\dagger X-Y^\dagger Y=0$
 and is scaled to $X^\dagger X+Y^\dagger Y=1$. The restart keeps the unstable
 eigenvectors and their partners.
 
+<a id="the-unpaired-form"></a>**The unpaired form** (`paired=False`). The method above rests on
+$HJ=-JH$ with $J[X;Y]=[\bar Y;\bar X]$: the lower-right block of $H$ is $-\bar A$. At a pair momentum
+$Q\ne0$ it is $-\overline{A(-Q)}$ and the lower-left block is $-B(Q)^\dagger$, so the symmetry holds only
+where a symmetry of the crystal links $Q$ and $-Q$ and the two orbital sets are in matching gauges.
+What always holds is
+
+$$\mathcal K z=\Omega\,\Sigma z,\qquad
+\mathcal K=\begin{pmatrix}A&B\\B^\dagger&A'\end{pmatrix}=\mathcal K^\dagger,\qquad
+\Sigma=\mathrm{diag}(I,-I), \tag{8}$$
+
+whose roots are the excitations $\Omega_i(Q)>0$ with $z^\dagger\Sigma z>0$ and
+$-\Omega_i(-Q)<0$ with $z^\dagger\Sigma z<0$: there are no $\pm$ pairs. The solver runs the same loop
+on (8). `apply_pair(data, Z)` is $\mathcal K$ on pair rows $Z=[X;Y]$, shape $(b,2,\dots)$,
+complex-linear; one row costs two pair calls in the BSE. The basis rows are whole pairs
+$v_j=[x_j;y_j]$, orthonormal in the complex inner product, with images $\mathcal Kv_j$, and every
+coefficient is complex. The projected matrices are $G=V^\dagger\mathcal KV$ (Hermitian, the
+compression of $\mathcal K$) and $\tilde S=V^\dagger\Sigma V$ (Hermitian). The Ritz problem
+$Gc=\Omega\tilde Sc$ is solved as in (3): $G=LL^\dagger$, and the Hermitian
+$L^{-1}\tilde SL^{-\dagger}$ has the eigenvalues $1/\Omega$, positive for roots of positive type. With
+$z=\sum_jc_jv_j$ and $c_i^\dagger\tilde Sc_j=\delta_{ij}$, that is $X_i^\dagger X_j-Y_i^\dagger Y_j=\delta_{ij}$.
+The start block is $[X_0;0]$. Each open root adds one row per iteration, its preconditioned residual
+$[t_X;t_Y]$, with $H_D=\mathrm{diag}(D,-D')$ and $D'$ the diagonal of $A'$. A restart is a unitary
+rotation onto the Ritz vectors and the special sector below, with no pair call. The capacity counts
+pair vectors; a request in real-form vectors (`davidson_m_max`) is halved, so the storage is the
+same.
+
+One row is one application of $\mathcal K$, two pair calls, so the calls per open root and iteration
+equal the paired form's two. What the unpaired form does not have is the partner direction
+$Jv_j$, which the paired form adds for nothing. The certificate is unchanged,
+$\lambda_{\min}(G)\ge\lambda_{\min}(\mathcal K)$. `info['paired']` says which form ran, and
+`info['pair_calls']` counts two per applied row.
+
+For an indefinite $\mathcal K$ (`on_indefinite="continue"`) a general (QZ) solve of the small pencil
+separates three classes: (a) complex roots, which come in conjugate pairs, the member with
+$\mathrm{Im}\,\Omega>0$ returned; (b) real roots of positive type at $\Omega\le0$, returned and
+counted in `n_negative`; (c) real roots of negative type at $\Omega\ge0$, the $-Q$ problem's
+non-positive roots, kept in the basis so that $G$ is positive definite on the rest and not returned.
+The stable roots come from the Cholesky route on the $\tilde S$-orthogonal complement of the three.
+
+<a id="olsen-correction"></a>**The Olsen correction** (`sp_diagonal_precond(olsen=True)` with
+`sp_davidson(precondition_vectors=True)`; the preconditioner then takes the Ritz pair). With
+$t=(H_D-\Omega)^{-1}r$ and $u=(H_D-\Omega)^{-1}z$ the correction is $t-\epsilon u$,
+
+$$\epsilon=\frac{z^\dagger\Sigma t}{z^\dagger\Sigma u},\qquad z^\dagger\Sigma\,(t-\epsilon u)=0,$$
+
+which removes the component along the Ritz pair in the metric $\Sigma$: $(\Sigma z)^\dagger$ is the
+left eigenvector of $H=\Sigma\mathcal K$. With $Y=0$ it is the Tamm–Dancoff Olsen correction
+(`bse_davidson_helpers.bse_diagonal_precond`). It makes a small `epsilon_shift` safe. It applies to
+both forms.
+
 **A host loop on planned buffers.** The planned Davidson above is one
 `lax.while_loop` because its only dense step is a Hermitian eigensolve that
 `distrib_la` serves on every device leg, and because NSCF runs it once per
@@ -314,6 +368,13 @@ HLO is a rank's own tile of the basis
 (`tests/test_bse_sp_davidson_cpu.py`, CPU provider; the device legs run the
 same `DistributedSubspacePlan` with their native tile kernels).
 
+The table is the paired form's. The unpaired form runs the same planned operations (`store`, `gram`,
+`reconstruct`) with complex coefficients, and a block still has $2n_b$ rows: the corrections fill the
+first $n_b$, and a restart may fill all of them. Its `extend` returns a third panel, $V^\dagger\mathcal
+KP$, $V^\dagger\Sigma P$ and $V^\dagger P$ where the paired form returns $V^\dagger MP$ and $V^\dagger
+P$, so the store step makes three ordered reductions instead of two. Its collectives were not
+tabulated from the optimized HLO.
+
 **What a return certifies.** `sp_davidson` returns `(omega, X, Y, info)`;
 `X` and `Y` are `(n_b, *vector_shape)` in the layout of `X0`. `info['status']`
 is `CONVERGED` only when the lowest `n_tested` roots pass (5); the other
@@ -343,7 +404,9 @@ $\lambda_{\min}=-10^{-12}$ of the scale, below what the pencil resolves.
 **Memory.** $W$ and $MW$ hold $2M$ vectors; $M$ counts real-form vectors and
 defaults to $20\,n_{converge}$ (the depth in iterations of the planned
 Davidson's $10\,n_{eig}$, twice its vectors), at least six blocks. The host
-holds $M_r$ and $S$, $2M^2$ reals.
+holds $M_r$ and $S$, $2M^2$ reals. In the unpaired form the capacity counts pair vectors and the
+request is halved: $W$ and $\mathcal KW$ hold the same number of transition vectors, and the host holds
+$G$ and $\tilde S$, complex.
 
 **Measured, and where** (CPU, JAX 0.12, 2026-11-27; the GPU runs at 4 and 16
 ranks on NiO are reported with the route in [bse.md](bse.md)). On the synthetic pencils of `tests/bse_full_oracle.py` at
@@ -364,6 +427,15 @@ per root for the structure-preserving Lanczos of `solvers.bse_sp_lanczos`,
 whose Krylov space is close to the whole window at that size
 (`tests/test_bse_full_davidson_cpu.py`).
 
+The unpaired form, on the same footing (CPU, the dense `eig` of $\Sigma\mathcal K$ as the reference,
+`tests/test_bse_sp_davidson_unpaired_cpu.py`, and `tests/test_bse_full_finite_q_cpu.py` for the
+payload): on synthetic pencils of 240 transitions its roots are
+within $4\times10^{-14}$ eV on one device and on the 2×2 mesh. On a symmetric pencil it takes 232
+pair calls for 6 roots against 248 for the paired form, and on the 128-transition payload at $Q=0$,
+with the partner set equal to the payload's own orbitals, 328 against 376, with the same roots. With
+the Olsen correction on that payload the roots are unchanged: 436 pair calls without it, 438 with it
+at `epsilon_shift` $10^{-3}$ Ry and 452 at $10^{-6}$ Ry; at finite $Q$ it takes 328 with and without.
+
 ## Consumers
 
 | solver | caller | operator |
@@ -371,6 +443,6 @@ whose Krylov space is close to the whole window at that size
 | planned Davidson | `psp.run_nscf` ([NSCF Hamiltonian](nscf_hamiltonian.md)); `bse.bse_lanczos` (`solver = davidson`, the default; also `bse.exciton_bands` per $Q$) | $H_k$ on the G sphere; the BSE Hamiltonian |
 | block Lanczos | `bse.bse_lanczos`, `bse.exciton_bands` (`solver = block_lanczos`) | the BSE Hamiltonian |
 | thick-restart Lanczos | `bse.bse_lanczos` | the BSE Hamiltonian |
-| structure-preserving Davidson | `bse.bse_nontda` (`full_bse = true` with `full_bse_solver = davidson`) | the full BSE pair applier $AX+B\bar X$ |
+| structure-preserving Davidson | `bse.bse_nontda` (`full_bse = true` with `full_bse_solver = davidson`; `bse.exciton_bands` per $Q$) | the full BSE pair applier $AX+B\bar X$; at a finite pair momentum the Hermitian $\mathcal K$ on pair rows, unpaired form |
 
 Which BSE solver each CLI flag selects is [BSE](bse.md).

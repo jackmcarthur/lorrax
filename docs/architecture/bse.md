@@ -182,7 +182,8 @@ The Tamm–Dancoff approximation keeps $A$; the RPA kernel drops $W$ and $W^B$.
 The screened kernel and the Tamm–Dancoff problem are the defaults.
 `spin_triplet = true` selects the scalar triplet; `local_fields = true`
 drops the screened direct term. `full_bse = true` selects the full resonant
-and antiresonant problem.
+and antiresonant problem, at $Q = 0$ in `bse.bse_jax` and at a finite pair
+momentum in `bse.exciton_bands` ([below](#the-full-bse-at-a-finite-pair-momentum)).
 
 The loader records the optical choice in `data['exchange_channel']` through
 the existing deck owner. Stack/pair factories take it explicitly, and the
@@ -230,12 +231,61 @@ uses the analytic sphere. Without `kgrid_fine` the optical BSE does not read
 `head_minibz_average`. With `dipole_file`, the velocity goes through the same
 htransform as ψ ([dipoles](#dipoles-and-absorption)).
 
+### The full BSE at a finite pair momentum
+
+`bse.exciton_bands` with `full_bse = true` solves the full problem at every $Q$ of its path. The
+resonant pair is the Tamm–Dancoff one, $(c\,k{+}Q,\ v\,k)$; the antiresonant pair is
+$(v\,k{+}Q,\ c\,k)$, both labelled by $k$. Their pair functions
+
+$$\phi^{\rm res}_t(r,r') = \psi_{c,k+Q}(r)\,\psi^*_{vk}(r'),\qquad
+\phi^{\rm anti}_t(r,r') = \psi_{v,k+Q}(r)\,\psi^*_{ck}(r')$$
+
+both carry momentum $Q$, so the antiresonant one has the resonant one's Bloch structure, the two
+ISDF encodes add, and one k convolution serves both. With one kernel, $D + w_x V(Q) - W$ (plus the
+head tensor when it is on), projected on the $2N$ pair functions,
+
+$$\mathcal K z = \Omega\,\Sigma z,\qquad
+\mathcal K = \begin{pmatrix} A(Q) & B(Q)\\ B(Q)^\dagger & A'(Q)\end{pmatrix} = \mathcal K^\dagger,\qquad
+A'(Q) = \overline{A(-Q)},\qquad \Sigma = \mathrm{diag}(1,-1).$$
+
+$\mathcal K$ is Hermitian when $W_{\mu\nu}(q) = \overline{W_{\mu\nu}(-q)}$ (the
+`check_restart_reciprocity` preflight, which the driver runs once on $W_q$ before the transform
+donates it) and $V(Q)$ is Hermitian.
+
+At a general $Q$ there is no $B = B^{\mathsf T}$ and no $\pm\Omega$ pairing: the spectrum of
+$\Sigma\mathcal K(Q)$ is $\{\Omega_i(Q) > 0,\ z^\dagger\Sigma z > 0\} \cup \{-\Omega_i(-Q) < 0,\
+z^\dagger\Sigma z < 0\}$. The conjugation $J[X;Y] = [\bar Y;\bar X]$, $HJ = -JH$, on which the
+paired Davidson rests, holds only when a symmetry links $Q$ and $-Q$ and the two orbital sets are in
+matching gauges ($Q = 0$, or $2Q$ a reciprocal lattice vector). The solvers therefore take
+$\mathcal K z = \Omega\,\Sigma z$ as it stands: the dense solve, and the
+[unpaired form](iterative_eigensolvers.md#structure-preserving-davidson) of the Davidson.
+
+- **Diagonals.** $D_t = \varepsilon_{c,k+Q} - \varepsilon_{vk}$ and
+  $D'_t = \varepsilon_{ck} - \varepsilon_{v,k+Q}$. Both conduction energies take the exact screened
+  $q = 0$ head shift (`head_shifted_eps_c`); the coupling block has none, because its overlaps
+  $\langle c\,k{+}Q|v'\,k{+}Q\rangle$ and $\langle c'k|vk\rangle$ vanish.
+- **Exchange.** Both pair densities have momentum $Q$, so one tile $V(Q)$ serves all four blocks.
+  The two pair amplitudes are $M_t(\mu) = \sum_s \psi^*_{c,k+Q,s}(\mu)\,\psi_{vk,s}(\mu)$ for the
+  resonant vertex and $M^b_t(\mu) = \sum_s \psi^*_{ck,s}(\mu)\,\psi_{v,k+Q,s}(\mu)$ for the
+  antiresonant one; they are equal at $Q = 0$.
+- **Head tensor.** The screened head is a diagonal shift on $A$ and $A'$ only: its $q = 0$,
+  $G = G' = 0$ pair densities in $B$ are the overlaps $\langle c\,k|v'k\rangle = 0$, and the mini-BZ
+  average leaves a term of order $q^2 W_{\rm head}(q)$, the order the diagonal form drops in $A$.
+  The exchange head tensor (`head_tensor`, the $G = 0$ term of the exchange) does enter the coupling
+  block, and it follows the exchange term's conjugations. The antiresonant pair density is the
+  conjugate of the resonant one to the order the head keeps, so its vertex is $\bar d$:
+  $$A^{\rm head}_{tt'} = \frac{w_x}{N_k}\,\bar d_a(t)\,M_{ab}\,d_b(t'),\qquad
+  B^{\rm head}_{tt'} = \frac{w_x}{N_k}\,\bar d_a(t)\,M_{ab}\,\bar d_b(t'),$$
+  Hermitian and complex symmetric for a real symmetric $M$. Both full routes carry it, with or
+  without a partner. The head tensor with an off-grid $Q$ under the full BSE has not been examined:
+  it uses the Tamm–Dancoff path's $Q$-independent dipole operand.
+
 ## The matvec
 
 `bse_stack_matvec.build_bse_stack_matvec` is the TDA matvec: Lanczos,
 Davidson and thick-restart Lanczos and KPM under `full_bse = false`, the
 spectral-bound Lanczos of FEAST and KPM on either route, Haydock, and
-`bse.exciton_bands`. Per trial block:
+`bse.exciton_bands` (its `full_bse = true` scan takes the pair applier below). Per trial block:
 
 1. one all-gather of the block over `'y'` then `'x'`: each rank holds every
    trial whole, $(n_c, n_v, N_k)$;
@@ -368,6 +418,23 @@ restart, 1×1 and 2×2).
 `bse.w_ladder` (`w_bse`, `w_rpa_resolvent`), `bse.bse_w_exact` and
 `bse.w_omega_chain`, and refuses `screening=False`.
 
+Two builder options carry the finite-$Q$ and head-tensor forms; without them the builder traces what
+it traced before. `partner=True` returns $\mathrm{couple}(X, Y_c, s) = AX + sBY_c$, with the
+antiresonant amplitude $Y_c$ an independent input in place of $\bar X$ and a second exchange vertex
+$M^b$ after $M$. `head_tensor=True` adds the operands $(D_{\rm head}, M_{\rm head})$ to both blocks.
+The applier gives the upper row of $\mathcal K$. The lower row comes from the same program on the
+partner's operand set (`bse_nontda.operand_sets`: the payload's orbitals $(c$ at $k{+}Q$, $v$ at
+$k)$ and `data['partner']`, $(c$ at $k$, $v$ at $k{+}Q)$, each with its energies and its $M$; the lower row takes
+$\overline{V(Q)}$ and the two vertices exchanged):
+$\overline{(\mathcal K z)_{\rm lower}} = \mathrm{couple}(\bar Y, \bar X, 1, \text{partner operands})$,
+which needs only
+$W_{\mu\nu}(q) = \overline{W_{\nu\mu}(q)}$. `bse_nontda.kernel_matvec` applies $\mathcal K$ to pair
+rows $(b, 2, n_c, n_v, N_k)$ with two such calls per row block. `bse_nontda.payload_w_r` transforms
+$W_q$ once per payload through the memoised donating program and leaves $W_R$ on the payload, so a
+payload is solved twice without a second transform and `keep_W_R` is honoured by both full routes.
+The matrix-free Lanczos (`solver='matrixfree'`, no input key) refuses a partner or a head tensor
+(`GATE nontda_route_option`).
+
 Measured (claim 2874): CrI3
 8×8×1 SOC, 8v × 14c, P4 A100-40GB. One Haydock step (D + V − W on three
 trials) takes 13.2–13.4 ms; 100 steps take 1.28 s; the solve peak is 2159 MiB
@@ -380,11 +447,15 @@ per rank. The fused kernel runs at 2.27× the flop floor.
 | Davidson (default) | `full_bse = false` (no route flag; `the eigensolve` is an alias) | `solvers.davidson.davidson` with `lock_converged`, the exact diagonal preconditioner and start subspace from `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots, stopped when every residual is below `davidson_tol_mev` (0.01 meV) |
 | Lanczos, block Lanczos | `full_bse = false solver = block_lanczos` | `bse_lanczos.solve_bse_sharded` | spectrum shape; fixed Krylov dimension, CGS2 reorthogonalization, full window by default |
 | thick-restart Lanczos | `full_bse = false solver = trlan` | `solvers.thick_restart_lanczos` | Krylov memory capped at `trlan_m_max` |
-| full BSE, dense (default) | no route flag, `full_bse = true` | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve of the assembled $A$ and $B$, N ≤ 4096 |
-| full BSE, Davidson | `full_bse = true full_bse_solver = davidson` | `solvers.bse_sp_davidson` through `bse.bse_nontda`, with the paired exact diagonal and the start subspace of `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots with their $(X, Y)$, no assembly and no size limit, stopped when every residual is below `davidson_tol_mev` (0.01 meV); reports $\lambda_{\min}(\mathcal K)$ |
+| full BSE, dense (default) | no route flag, `full_bse = true` (`bse.exciton_bands`: input key `full_bse_solver = dense`, the default) | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve of the assembled $A$ and $B$, N ≤ 4096; at a finite pair momentum, of the four assembled blocks of $\mathcal K$ |
+| full BSE, Davidson | `full_bse = true full_bse_solver = davidson` | `solvers.bse_sp_davidson` through `bse.bse_nontda`, with the exact diagonal ($[D; -D]$, or $[D; -D']$ at finite $Q$) and the start subspace of `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots with their $(X, Y)$, no assembly and no size limit, stopped when every residual is below `davidson_tol_mev` (0.01 meV); reports $\lambda_{\min}(\mathcal K)$; at finite $Q$ the unpaired form |
 | FEAST | `feast = true` with `full_bse = true` (the TDA refuses it, `GATE feast_tda_complex`) | `bse.bse_feast` | contour eigensolve in KPM-sized windows; refuses unless every in-window Ritz residual is below `--feast-tol-mev` (0.01 meV, `GATE feast_converged`) |
 | density of states | `--kpm-dos`; `--tda` or not | `bse.bse_kpm` | KPM Chebyshev moments |
 | absorption | `python -m bse.absorption_haydock`, or `haydock = true` with `number_iterations` after the eigensolve | `bse.absorption_haydock` | ε₂(ω) by continued fraction on the TDA BSE (D + V − W), no eigenvectors |
+
+Both full routes serve a finite pair momentum through `bse.exciton_bands`
+([the form](#the-full-bse-at-a-finite-pair-momentum); the driver's keys are under *Exciton bands with
+`full_bse`* below); `bse.bse_jax` solves $Q = 0$.
 
 With `full_bse = true` the dense solve (`full_bse_solver = dense`, the default)
 reads `number_eigenvalues` and the
@@ -401,6 +472,14 @@ mode: at $\lambda_{\min}(\mathcal K) = 10^{-8}$ Ry on a 40-transition pencil the
 soft one were wrong by $4.3\times10^{-10}$ Ry and are now right to $4.3\times10^{-13}$ Ry. It
 refuses a $\mathcal K$ whose smallest eigenvalue is below $10^{-10}$ of its largest.
 
+At a finite pair momentum the dense route measures all four blocks (`bse_nontda._materialize_K`: two
+coupled-applier calls per chunk of identity columns) and passes the lower row to
+`solve_nontda_definite_pencil(A, B, n_eig, lower=(B_low, A_low))`. The lower row is measured, not set
+to $B^\dagger$: the solve refuses unless $A_{\rm low}$ is Hermitian and $B_{\rm low} =
+B^\dagger$ to $10^{-6}$ (`GATE nontda_lower_row`; $A$'s own Hermiticity is checked first, as at
+$Q = 0$), then runs the same Cholesky reduction and returns the
+roots of positive type. $B$ has no symmetry there, so `GATE nontda_coupling_symmetric` does not apply.
+
 **Full BSE, Davidson** (`full_bse_solver = davidson`). `bse_nontda._solve_nontda_davidson` runs the
 [structure-preserving Davidson](iterative_eigensolvers.md#structure-preserving-davidson) over the
 pair applier, with the pieces the Tamm–Dancoff Davidson uses:
@@ -413,14 +492,22 @@ pair applier, with the pieces the Tamm–Dancoff Davidson uses:
   transform consumes it, `w_q0_for_precond`), or the bare $\Delta E$ under `davidson_precond = bare`.
   The correction is $t_X = R_X/(D - \Omega + \epsilon)$, $t_Y = -R_Y/(D + \Omega + \epsilon)$
   (`bse_pair_diagonal_precond`); it equals the diagonal of the assembled $A$ to $10^{-12}$ on the
-  test payload.
+  test payload. At a finite pair momentum the diagonal of $H = \Sigma\mathcal K$ is $[D; -D']$, $D'$
+  the exact diagonal of the partner's operand set, and $t_Y = -R_Y/(D' + \Omega + \epsilon)$.
+- **Olsen.** `davidson_olsen = true` is read here. With $t = (H_D - \Omega)^{-1} r$ and
+  $u = (H_D - \Omega)^{-1} z$ the correction is $t - \epsilon u$,
+  $\epsilon = z^\dagger\Sigma t / z^\dagger\Sigma u$, so that $z^\dagger\Sigma(t - \epsilon u) = 0$
+  ($(\Sigma z)^\dagger$ is the left eigenvector of $H = \Sigma\mathcal K$); with $Y = 0$ it is the
+  Tamm–Dancoff correction. The dense solve refuses the key.
 - **Start block, margin, locking.** `init_bse_subspace` on the physical transitions (the mesh padding
   stays exactly zero through the solve), `davidson_margin` roots above `number_eigenvalues`, soft
   locking, `davidson_margin_tol_mev`.
 - **Basis.** At most `davidson_m_max` real-form vectors (default $20\,n_{eig}$, at least six blocks);
   the basis and its images, twice that many trial vectors, are priced and admitted as
   `bse.davidson_basis`. Every vector stays on `P(None, 'x', 'y', None)`; only coefficient matrices
-  cross the mesh.
+  cross the mesh. In the unpaired form (finite $Q$) the capacity counts pair vectors $[x; y]$ and
+  the request is halved, so the storage is the same: $4\times$ the capacity in transition vectors,
+  which is twice the request.
 - **Stop.** Every root's residual $\lVert Hz - \Omega z\rVert/\lVert z\rVert$ below
   `davidson_tol_mev`, within `solver_max_iter` iterations; any other stop refuses before anything is
   written (`GATE nontda_davidson_converged`). The stop line gives the pair calls, also per root, and
@@ -437,14 +524,24 @@ pair applier, with the pieces the Tamm–Dancoff Davidson uses:
   and listed in RESULTS, kept with their vectors in `bse_nontda.LAST_DAVIDSON`, and are not written to
   the eigenvalue or eigenvector files, which hold the `number_eigenvalues` positive roots above them.
   The margin must have room for them (`GATE nontda_davidson_block`).
-- **Not read.** `davidson_olsen` (the paired preconditioner has no Olsen projection), the Lanczos and
-  TRLan keys, a `head_tensor` payload and `keep_W_R` refuse.
+  At a finite $Q$ a root of negative type at $\Omega \ge 0$ (the $-Q$ problem's non-positive roots)
+  is also kept in the basis and not returned.
+- **Not read.** The Lanczos and TRLan keys refuse. `davidson_olsen`, a `head_tensor` payload and
+  `keep_W_R` are honoured.
 
 Measured on the 128-transition spinor test payload (CPU, 1×1 and an emulated 2×2 mesh, 8 roots and 8
 margin roots, 0.01 meV): 15 iterations and 436 pair calls, 54.5 per root, $2.5\times10^{-12}$ Ry from
 the dense route; the Tamm–Dancoff Davidson takes 207 applications of $A$ there (25.9 per root) and
 the matrix-free Lanczos 22.2 to 35.2 pair calls per root, its Krylov space being close to the whole
 window at that size.
+
+Measured for the unpaired form and Olsen (CPU, the same payload, dense `eig` as the reference). On
+the payload at $Q = 0$ with the partner set equal to the payload's own orbitals the unpaired form
+finds the paired form's roots in 328 pair calls against 376. On synthetic pencils of 240 transitions
+its roots are within $4\times10^{-14}$ eV of the dense ones on one device and on the 2×2 mesh; on a
+symmetric pencil it takes 232 pair calls for 6 roots, the paired form 248. With `davidson_olsen` the
+roots are the same: 436 pair calls without it, 438 with it at the default shift ($10^{-3}$ Ry), 452
+at $10^{-6}$ Ry; at finite $Q$ 328 with and without.
 
 Measured on GPU (Perlmutter, one rank per device, NiO $4^3$ spinor, 3150 centroids, 8 roots and 8
 margin roots, 0.01 meV, 2026-11-27, commit 7144c8cb8). At four ranks and 4,096 transitions the
@@ -461,6 +558,22 @@ block on the same kernels (five windows, kept outside the tree). The eigenvector
 four ranks. No suite reruns these NiO results; the hsuite's full-BSE rows (`bse_full`, `bse_full_dense`,
 `exciton_bands_full`) run both solvers on the small H₂⁻ fixture, with a scissor that makes K positive
 definite ([hsuite README](../../tests/hsuite/README.md)).
+
+<!-- GPU-NUMBERS-FINITE-Q: to be filled by the author -->
+
+**Exciton bands with `full_bse`.** `bse.exciton_bands` reads three input keys of `bse.bse_jax` for
+this problem: `full_bse`, `full_bse_solver = dense | davidson` (default `dense`; the dense solve is
+limited to 4096 transitions per $Q$) and `full_bse_instability = refuse | continue`. One htransform
+returns the joint window, the BSE valence bands then the conduction bands, at every $k + Q$
+(`exciton_bands._htransform_window`); `build_pair_stacks` slices it into the conduction stacks and
+the valence stacks $\psi_v(k+Q)$, $\varepsilon_v(k+Q)$ (pad bands at $-$`PAD_EPS_GUARD_RY`). The
+partner's conduction leg is the grid's stored $\psi_c(k)$ with the head-shifted diagonal.
+`build_path_solver_davidson(full=dict(solver=, on_indefinite=))` hands each $Q$'s payload, with
+`data['partner']`, to `bse_lanczos.solve_bse_sharded(tda=False, ...)`; one planned kernel set serves
+the path. `solve_path.stability` holds $(\lambda_{\min}, \text{special roots})$ per $Q$; the run
+logs the smallest margin and writes it into the `.dat` header, whose title says which problem was
+solved. $W$'s $q \leftrightarrow -q$ reciprocity is measured once, before `W_q` is donated. The
+driver's refusals are in the table below.
 
 Block Lanczos seeds name physical support by its logical band/k extents,
 not a host transition mask or index list. The existing subspace layout
@@ -1025,18 +1138,21 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 | two QP descriptions | `bse_jax.parse_args`, `file_io.qp_wfn.refuse_conflicting_qp_state_sources` | `eqp_corrections` with `qp_rotations_file`; a rotation on a QP WFN deck or on a restart from another WFN |
 | band-window degeneracy | `common.band_degeneracy.resolve_band_window` | a window edge inside a multiplet under `band_degeneracy = strict` |
 | route-ignored flag | `bse_jax.parse_args` | a flag set on a route that does not read it; a retired flag |
-| non-TDA reciprocity preflight | `bse_nontda.check_restart_reciprocity` | `the eigensolve` without `full_bse = false`, with W on: a restart whose W fails the q ↔ −q reciprocity check, before the dense build |
+| non-TDA reciprocity preflight | `bse_nontda.check_restart_reciprocity` (also run by `bse.exciton_bands` under `full_bse`) | `the eigensolve` without `full_bse = false`, with W on: a restart whose W fails the q ↔ −q reciprocity check, before the dense build |
 | non-TDA dense size | `bse_nontda` (`_DENSE_N_MAX`) | `the eigensolve` without `full_bse = false` at N = n_c,pad · n_v,pad · N_k > 4096 on the dense solve; the message names `full_bse_solver = davidson`, which has no size limit |
-| `GATE nontda_coupling_symmetric` | `bse_nontda.refuse_asymmetric_coupling`, on both dense solves | the coupling block $B$ is not complex symmetric: $\lVert B - B^{\mathsf T}\rVert / \lVert B\rVert$ above $10^{-6}$ (a structural check, not a convergence tolerance); the message names `check_restart_reciprocity` |
+| `GATE nontda_coupling_symmetric` | `bse_nontda.refuse_asymmetric_coupling`, on both dense solves at $Q = 0$ (not at a finite pair momentum, where $B$ has no symmetry) | the coupling block $B$ is not complex symmetric: $\lVert B - B^{\mathsf T}\rVert / \lVert B\rVert$ above $10^{-6}$ (a structural check, not a convergence tolerance); the message names `check_restart_reciprocity` |
 | `GATE nontda_davidson_converged` | `bse_nontda.refuse_unconverged_davidson` | `full_bse_solver = davidson`: any stop but CONVERGED at `davidson_tol_mev` (the cap `solver_max_iter`, a stall, no new directions), or a pair normalisation $\lvert X_i^\dagger X_j - Y_i^\dagger Y_j - \delta_{ij}\rvert$ above $10^{-8}$; before anything is written |
 | `GATE sp_davidson_definite` | `solvers.bse_sp_davidson.sp_davidson` | `full_bse_solver = davidson` with `full_bse_instability = refuse` (the default): the projected stability matrix is not positive definite, so $\mathcal K$ is not; the message gives the measured $\lambda_{\min}$ in Ry and names `full_bse_instability = continue` |
-| `GATE sp_davidson_operator` | the same | $\mathrm{Re}(P^\dagger M P)$ of a block asymmetric beyond $10^{-8}$: $A$ is not Hermitian or $B$ not symmetric (the dense route's `GATE nontda_coupling_symmetric`, measured on the applied operator) |
+| `GATE sp_davidson_operator` | the same | $\mathrm{Re}(P^\dagger M P)$ of a block asymmetric beyond $10^{-8}$: $A$ is not Hermitian or $B$ not symmetric (the dense route's `GATE nontda_coupling_symmetric`, measured on the applied operator); in the unpaired form $P^\dagger\mathcal K P$ not Hermitian |
 | `GATE sp_davidson_start` | `solvers.bse_sp_davidson.sp_davidson` | a start block $[X_0, iX_0]$ that is rank deficient over the reals; the message gives the rank |
 | `GATE sp_davidson_finite` | the same | an operator or preconditioner output with NaN or Inf |
 | `GATE sp_davidson_argument` | the same | `on_indefinite`, `tol`, `margin_lock`, `max_iter`, `n_converge`, the start block's dtype or its row count out of range; the message gives the value and the range |
 | `GATE nontda_davidson_block` | `bse_nontda._solve_nontda_davidson` | `full_bse_instability = continue` with fewer margin roots than unstable or non-positive roots found |
-| `GATE nontda_route_option` | `bse_nontda.solve_bse_nontda_sharded`, `bse_lanczos.solve_bse_sharded` | an unknown solver or option name, or an option another full-BSE route reads (`mf_*` on the Davidson, `davidson_*` or `on_indefinite` on the dense solve), `davidson_olsen` or `keep_W_R` with the Davidson; `bse_jax` refuses the matching deck keys at parse time |
-| `GATE nontda_head_tensor` | `bse_nontda._solve_nontda_davidson` | a payload with `head_tensor`: the pair applier has no head-tensor term |
+| `GATE nontda_route_option` | `bse_nontda.solve_bse_nontda_sharded`, `bse_lanczos.solve_bse_sharded` | an unknown solver or option name, or an option another full-BSE route reads (`mf_*` on the Davidson, `davidson_*` or `on_indefinite` on the dense solve), and the matrix-free Lanczos on a payload with a partner or a head tensor; `bse_jax` refuses the matching deck keys at parse time |
+| `GATE nontda_lower_row` | `bse_nontda.solve_nontda_definite_pencil` | the dense solve at a finite pair momentum: $A_{\rm low}$ not Hermitian, or $B_{\rm low} \ne B^\dagger$, to $10^{-6}$ (relative); the two rows are built from the payload's and the partner's orbitals with one kernel, and disagree when $W$ is not conjugate-reciprocal, $V(Q)$ is not Hermitian or the partner orbitals are not the payload's bands at the other momentum |
+| `GATE exb_full_bse_key` | `bse.exciton_bands._check_full_bse_keys` | `full_bse_solver` or `full_bse_instability` without `full_bse = true`; `solver = block_lanczos` with it; `full_bse_instability`, `davidson_tol_mev` or `solver_max_iter` with `full_bse_solver = dense` |
+| `GATE exb_unserved_key` | `bse.exciton_bands.deck_settings` | `qp_rotations_file` or `highest_occupied_band` named (and not false) in an exciton-bands input file: `bse.bse_jax` keys that change the Hamiltonian and that this driver does not read |
+| `GATE exb_full_bse_valence_window` | `bse.exciton_bands._htransform_window` | `full_bse = true` with `nval` below `number_val_bands_fine`: the htransform must fit the BSE valence bands for the antiresonant pair's hole state |
 | `GATE bse_w_block_operand` | `bse_stack_matvec.plan_w_blocks` | an 8 × 8 (μ, ν) W-term block whose outer-load handler call still has an operand of $2^{31}$ elements or more (a k grid near $8\cdot 10^6$ points at $n_s$ = 2) |
 | Haydock device count | `absorption_haydock.run_haydock` | fewer than two devices |
 
@@ -1066,7 +1182,12 @@ a frozen-kernel approximation, not that self-consistent ladder map.
   (`_DENSE_N_MAX` in `bse/bse_nontda.py`); `full_bse_solver = davidson` has no size limit in the solve (the eigenvector writer gathers one state at a time). The
   Davidson has run on GPU at 4 and 16 ranks on NiO up to 589,824 transitions (measured above) and
   on the CPU test payloads; no suite reruns the GPU cases. The matrix-free Lanczos
-  (`solver='matrixfree'`) is not reachable from the CLI. No full-BSE route has a finite-$Q$ form
-  or the mini-BZ head tensor. The hsuite's full-BSE rows cover the H₂⁻ fixture only.
+  (`solver='matrixfree'`) is not reachable from the CLI, and refuses a finite pair momentum and a head
+  tensor. The finite-$Q$ full BSE exists in `bse.exciton_bands` only (`bse.bse_jax` solves $Q = 0$);
+  there `solver = block_lanczos` cannot solve it, `qp_rotations_file` and `highest_occupied_band`
+  refuse, and the dense solve stops at 4096 transitions per $Q$. The head tensor under the full BSE
+  with an off-grid $Q$ has not been examined: it uses the Tamm–Dancoff path's $Q$-independent dipole
+  operand. The finite-$Q$ route has CPU measurements only; the hsuite's full-BSE rows cover the H₂⁻
+  fixture only.
 - `compute_mode = mpa` with `screening_diagrams = w_bse` refuses at setup
   (`GATE parent_screening_diagrams`, `file_io/restart_bundle.py`).
