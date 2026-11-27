@@ -11,7 +11,7 @@ The binding rulings behind breaking changes are in
 N ≤ 4096, with two new refusals (below). The new input key `full_bse_solver = davidson` selects a
 structure-preserving block Davidson for the full problem instead
 (`solvers.bse_sp_davidson` through `bse_nontda`): no assembly of $A$ and $B$,
-no size limit, the lowest `number_eigenvalues` roots with their $(X, Y)$,
+no size limit in the solve (the eigenvector writer gathers each state's (X, Y) to the host, one at a time, as for the other routes), the lowest `number_eigenvalues` roots with their $(X, Y)$,
 $X^\dagger X - Y^\dagger Y = 1$. It applies the pair operator
 $AX + B\bar X$ to paired trial vectors, two pair calls per open root per
 iteration, with what the Tamm–Dancoff Davidson has: the exact diagonal as

@@ -426,8 +426,10 @@ pair applier, with the pieces the Tamm–Dancoff Davidson uses:
   written (`GATE nontda_davidson_converged`). The stop line gives the pair calls, also per root, and
   $\lambda_{\min}$.
 - **Output.** The pairs $(X, Y)$ with $X^\dagger X - Y^\dagger Y = 1$ on
-  `P(None, None, 'x', 'y', None)`, the dense route's layout, with no host gather: the eigenvector
-  writer and the dipole contraction read them unchanged.
+  `P(None, None, 'x', 'y', None)`, the dense route's layout. The solve gathers no vector to a host. The eigenvector
+  writer (`bse_window.write_eigenvectors_stream`) then gathers each state's $(X, Y)$ to the host, one
+  state at a time and on every rank, as it does for the other routes; the dipole contraction reads the
+  sharded pairs unchanged.
 - **Stability.** $\lambda_{\min}(M_r) \ge \lambda_{\min}(\mathcal K)$ is measured every iteration. If
   it is not positive the reference state is unstable. `full_bse_instability = refuse` (the default)
   stops with the measured value (`GATE sp_davidson_definite`). `continue` solves on: the unstable
@@ -1045,7 +1047,7 @@ a frozen-kernel approximation, not that self-consistent ladder map.
   k and −k has broken rows; regenerate it
   ([self-consistency §8](../self_consistency.md#8-seeding-restart-and-outputs)).
 - Full BSE through `the eigensolve` is dense by default and stops at N = 4096
-  (`_DENSE_N_MAX` in `bse/bse_nontda.py`); `full_bse_solver = davidson` has no size limit. The
+  (`_DENSE_N_MAX` in `bse/bse_nontda.py`); `full_bse_solver = davidson` has no size limit in the solve (the eigenvector writer gathers one state at a time). The
   Davidson has run on CPU only (the 128-transition test payload, one device and an emulated 2×2
   mesh): no GPU run, no run with more than one process, no material. The matrix-free Lanczos
   (`solver='matrixfree'`) is not reachable from the CLI. No full-BSE route has a finite-$Q$ form
