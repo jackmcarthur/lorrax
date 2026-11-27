@@ -187,10 +187,11 @@ def _scatter_trial_block(WX, mesh_xy):
 
 # ===========================================================================
 # The three stages of the W term, factored so the A block and the coupling
-# block share them.  These are the SAME einsums, in the same order, that
-# ``_w_stack``'s body used inline before the port -- pure code motion, so the
-# shipped TDA path is bit-identical (measured at the port; no test of it is in
-# the tree).
+# block share them.  The Tamm-Dancoff matvec and the pair applier are ONE
+# assembly (``_build_applier``, ``_make_w``): the Tamm-Dancoff trace is the
+# pair's with the coupling encodes absent.  ``tests/test_bse_w_blocks.py``
+# gates every route and block plan of both against an independent NumPy
+# contraction.
 # ===========================================================================
 
 def _encode_T_A(X_b, psi_c_X, psi_v_Y):
@@ -424,35 +425,20 @@ def _fused_decode(fused, L, R, W, pc, pc_t, conj_r):
     return _rank_partial(apply(L, R, W, prep(pc) if pc_t is None else pc_t, conj_r=conj_r))
 
 
-def _tda_block(name, conv, fused, kconv, pc_t):
-    """``block(X_b, mu, nu, W) -> A``: one (μ, ν) block of the TDA W term, decoded through (t, μ).
-
-    ``X_b`` (c_full, v_full, nk) is the whole trial; ``mu = (ψ^X_c,)`` (nk, c_full, ns, μ_b) and
-    ``nu = (ψ^Y_v,)`` (nk, v_full, ns, ν_b) are the block's slices of the legs, ``W`` the block of
-    ``W_R`` in the route's layout (:func:`_w_layout`).  Returns A (nk, c_full, ns, ν_b).  Route
-    ``xla``: T by :func:`_encode_T_A`, :func:`_xla_conv`; ``outer``: T on the load from
-    :func:`_outer_legs`, U stored; ``fused``: :func:`_fused_decode`.
-    """
-    if name == "xla":
-        return lambda X_b, mu, nu, W: _decode_tm(_xla_conv(kconv, _encode_T_A(X_b, mu[0], nu[0]), W), mu[0])
-
-    def outer_load(X_b, mu, nu, W):
-        L, R, cj = _outer_legs(X_b, mu[0], nu[0])
-        if name == "outer":
-            return _decode_tm(conv(L, R, W, conj_r=cj), mu[0])
-        return _fused_decode(fused, L, R, W, mu[0], pc_t, cj)
-    return outer_load
-
-
 def _pair_blocks(name, conv, fused, kconv, pc_t):
-    """``(block_AB, block_A, block_B)``: the coupling pair's W term on one (μ, ν) block.
+    """``(block_AB, block_A, block_B)``: the W term on one (μ, ν) block, decoded through (t, μ).
 
-    ``xs = (X_b, Xb_b, s_b)``: the whole trial, its conjugate and its sign; ``mu = (ψ^X_c, ψ^X_v)`` and
-    ``nu = (ψ^Y_v, ψ^Y_c)``: the block's slices (the B encode's leg swap reads ψ^X_v on μ and
-    ψ^Y_c on ν, :func:`_encode_T_B` / :func:`_outer_legs_B`).  ``block_AB`` is the fused
-    applier's ONE chain of ``T_A + s·T_B`` (legs concatenated along K on the outer load);
-    ``block_A`` and ``block_B`` are the unfused twin's two chains.  Each returns A
-    (nk, c_full, ns, ν_b) for :func:`_blocked_w_term`.
+    ``xs = (X_b, Xb_b, s_b)``: the whole trial, the antiresonant block and its sign; ``mu = (ψ^X_c, ψ^X_v)`` and
+    ``nu = (ψ^Y_v, ψ^Y_c)``: the block's slices of the legs (the B encode's leg swap reads ψ^X_v on μ and
+    ψ^Y_c on ν, :func:`_encode_T_B` / :func:`_outer_legs_B`), ``W`` the block of ``W_R`` in the
+    route's layout (:func:`_w_layout`).  ``block_A`` is the resonant block alone, the
+    Tamm-Dancoff W term: it reads ``xs[0]``, ``mu[0]`` and ``nu[0]`` only, so the Tamm-Dancoff
+    matvec calls it with ``xs = (X_b,)``, ``mu = (ψ^X_c,)``, ``nu = (ψ^Y_v,)``.  ``block_AB`` is the
+    fused applier's ONE chain of ``T_A + s·T_B`` (legs concatenated along K on the outer load);
+    ``block_B`` is the coupling block alone (the unfused twin runs ``block_A`` and ``block_B``).
+    Each returns A (nk, c_full, ns, ν_b) for :func:`_blocked_w_term`.  Route ``xla``: T by
+    :func:`_encode_T_A` / :func:`_encode_T_B`, :func:`_xla_conv`; ``outer``: T on the load from
+    :func:`_outer_legs`, U stored; ``fused``: :func:`_fused_decode`.
     """
     if name == "xla":
         def chain(T, mu, W):
@@ -798,6 +784,249 @@ def _make_v_term(mesh_xy, pair: bool):
                          out_specs=xspec, check_vma=False)
 
 
+def _make_w(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, coupling: bool = False,
+            partner: bool = False, fuse: bool = True):
+    """The screened direct term as ONE ``shard_map`` over ('x', 'y'): the body of
+    the Tamm-Dancoff matvec's W term and of the pair applier's.
+
+    ``coupling=False``: ``w(X, psi_c_X, psi_v_Y, W_R) -> W X``, the resonant
+    block alone (:func:`make_w_term`).  ``coupling=True``: ``w(X, sc, psi_c_X,
+    psi_c_Y, psi_v_X, psi_v_Y, W_R) -> W_A X + sc W_B conj(X)``, the fused pair;
+    with ``partner`` the antiresonant block is an input, ``w(X, Yc, sc, ...)``.
+    ``fuse=False`` is the pair's unfused twin.
+
+    The two differ in ONE place, the block the trial scan calls
+    (:func:`_pair_blocks`): ``block_A`` on ``(X_b,)`` or ``block_AB`` on
+    ``(X_b, Xb_b, s_b)``.  Route, (μ, ν) block plan, the trial block's gather and
+    the one reduce-scatter are the same lines.
+    """
+    nk = nkx * nky * nkz
+    # The W-term k-convolution: the router's outer-product factory when it serves
+    # the band rank K (decided at trace time, announced once), else the local
+    # k-leading factory on an XLA-built T; one call per trial.
+    kconv = make_local_kconv_klead(mesh_xy, (nkx, nky, nkz), norm="ortho")
+    outer_route = _make_outer_router(mesh_xy, (nkx, nky, nkz))
+
+    def _blocks(X, k_rank, mu, nu, W_R, operand_dtypes):
+        """Route, block plan and the three block callables of one trace."""
+        psi_c_X = mu[0]
+        name, conv, fused = _w_route(outer_route, k_rank, mesh_xy, (nkx, nky, nkz), psi_c_X.shape[1],
+            operand_dtypes=operand_dtypes)
+        plan = _w_plan(name, k_rank, W_R, mu, nu)
+        wterm = _blocked_w_term(plan, W_R, _w_layout(name))
+        whole = plan[0][1] * plan[1][1] == 1
+        return wterm, _pair_blocks(name, conv, fused, kconv,
+                                   fused[0](psi_c_X) if name == "fused" and whole else None)
+
+    # ── W term: one shard_map over ('x','y'); body = scan over the trial axis ──
+    def _w_stack(X, psi_c_X, psi_v_Y, W_R):
+        # Local shards: X (n_trials, c_loc, v_loc, nk); psi_c_X (nk, c_full, ns,
+        # μ_loc); psi_v_Y (nk, v_full, ns, ν_loc); W_R (μ_loc, ν_loc, kx,ky,kz).
+        # sqrt_nk follows the input dtype (fp32/fp64) — drop-in for fp32 GMRES.
+        # DTYPE SEAM: this whole W-term inherits X's dtype, so a complex64 matvec
+        # would halve the 655 MB T-tensor and every one of its ~4 HBM round-trips
+        # (the audit's measured ~2× bandwidth lever, JOINT_FINDINGS §4). It is
+        # DELIBERATELY left at complex128 (no c64 here) per owner decision
+        # (2026-07-16); the fp32-GMRES path casts upstream in bse_feast, not here.
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
+
+        # The route (outer load fused / stored U, or XLA T), then its (μ, ν) block plan:
+        # both decided at trace time from the shapes and announced once.
+        rank = min(psi_c_X.shape[1], psi_v_Y.shape[1])
+        mu, nu = (psi_c_X,), (psi_v_Y,)
+        wterm, (_, block, _) = _blocks(
+            X, rank, mu, nu, W_R, (X.dtype, psi_c_X.dtype, psi_v_Y.dtype, W_R.dtype))
+
+        def _body(carry, X_b):                       # X_b: (c_full, v_full, nk)
+            # NO COLLECTIVE IN THIS BODY (survey_C §C1): X_b arrives whole, and
+            # every block's decode returns this rank's (μ_loc, ν_loc) partial.
+            return carry, wterm(mu, nu, partial(block, (X_b,)), sqrt_nk)
+
+        # Once per block of trials: gather, scan, reduce once.  The partial the
+        # scan stacks is (n_trials, c, v, nk), X-sized, never a T-class buffer.
+        _, WX = lax.scan(_body, None, _gather_trial_block(X), unroll=1)
+        return _scatter_trial_block(WX, mesh_xy)
+
+    def _w_pair(X, Yc, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R):
+        # Local shards: X (n_trials, c_loc, v_loc, nk); psi_*_X (…, μ_loc);
+        # psi_*_Y (…, ν_loc); W_R (μ_loc, ν_loc, kx, ky, kz).  ``Yc`` is None
+        # without ``partner``.
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
+
+        # ONE block-level gather, hoisted OUT of the scan: both encodes take
+        # the whole trial block, and Xb = conj(X) is formed locally from it
+        # (conj commutes with the gather exactly, so this is the same array
+        # a second gather of Xb would deliver).  No collective runs per trial.
+        # With ``partner`` the antiresonant block is its own input: a second
+        # gather of an X-class block.
+        X_full = _gather_trial_block(X)                     # (b, c, v, nk)
+        Xb_full = jnp.conj(X_full) if Yc is None else _gather_trial_block(Yc)
+
+        # THE FUSION.  T^A and T^B have identical shape AND identical sharding
+        # (the B encode swaps legs, not layouts), so their sum needs no collective
+        # and no reshard; conv and decode are linear, so one chain serves both
+        # blocks.  On the outer-product load (BSEMAX) the fused chain concatenates
+        # the two blocks' legs along K, so ONE convolution call forms T_A + s T_B in
+        # shared memory.  The twin runs two chains, summed at the end.
+        rank = min(psi_c_X.shape[1], psi_v_Y.shape[1])
+        k_rank = 2 * rank if fuse else rank
+        mu, nu = (psi_c_X, psi_v_X), (psi_v_Y, psi_c_Y)
+        wterm, (block_AB, block_A, block_B) = _blocks(
+            X, k_rank, mu, nu, W_R,
+            (X.dtype, psi_c_X.dtype, psi_c_Y.dtype, psi_v_X.dtype, psi_v_Y.dtype, W_R.dtype))
+
+        def _body_fused(carry, xs):
+            return carry, wterm(mu, nu, partial(block_AB, xs), sqrt_nk)
+
+        def _body_unfused(carry, xs):
+            # THE TWIN.  Two full chains.  Kept only to price the fusion.
+            return carry, (wterm(mu, nu, partial(block_A, xs), sqrt_nk)
+                           + xs[2] * wterm(mu, nu, partial(block_B, xs), sqrt_nk))
+
+        # The sign rides the scan with its trial: one call may mix s = +1 and -1.
+        _, WX = lax.scan(_body_fused if fuse else _body_unfused,
+                         None, (X_full, Xb_full, sc), unroll=1)
+        return _scatter_trial_block(WX, mesh_xy)
+
+    xspec = P(None, "x", "y", None)
+    psi_x, psi_y, wspec = P(None, None, None, "x"), P(None, None, None, "y"), P("x", "y", None, None, None)
+    if not coupling:
+        return _shard_map_fn(_w_stack, mesh=mesh_xy, in_specs=(xspec, psi_x, psi_y, wspec),
+                             out_specs=xspec)
+    legs = (psi_x, psi_y, psi_x, psi_y, wspec)
+    if partner:
+        return _shard_map_fn(_w_pair, mesh=mesh_xy, in_specs=(xspec, xspec, P()) + legs,
+                             out_specs=xspec)
+    return _shard_map_fn(lambda X, sc, *rest: _w_pair(X, None, sc, *rest), mesh=mesh_xy,
+                         in_specs=(xspec, P()) + legs, out_specs=xspec)
+
+
+def _build_applier(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, kernel: str,
+                   exchange_channel: str, head_tensor: bool, coupling: bool,
+                   partner: bool = False, fuse: bool = True):
+    """The ONE assembly of the BSE operator on a trial stack: ``D``, the exchange
+    ``V``, the head tensor and the screened direct term ``W``, for
+
+    * the Tamm-Dancoff matvec ``A X`` (``coupling=False``;
+      :func:`build_bse_stack_matvec`),
+    * the pair applier ``A X + s B conj(X)`` (``coupling=True``) and the coupled
+      applier ``A X + s B Yc`` (``partner=True``;
+      :func:`build_bse_stack_pair_matvec`).
+
+    The Tamm-Dancoff operator is the pair applier without its coupling encodes:
+    the same ``D`` term, the same exchange decode, the same W chain
+    (:func:`_make_w`), with the antiresonant terms absent from the trace (not
+    multiplied by zero).  Returns the jitted callable of the public builder.
+    """
+    if kernel not in ("rpa", "bse"):
+        raise ValueError(f"kernel must be 'rpa' or 'bse', got {kernel!r}")
+    include_W = kernel == "bse"
+
+    sh = make_bse_shardings(mesh_xy)
+    rep = NamedSharding(mesh_xy, P())
+    nk = nkx * nky * nkz
+    # The screened direct term: one shard_map, a scan over trials.
+    w_term = _make_w(mesh_xy, nkx, nky, nkz, coupling=coupling, partner=partner, fuse=fuse)
+    v_term = _make_v_term(mesh_xy, pair=coupling)
+
+    def _apply(X, Yc, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M, Mb,
+               D_head, M_head):
+        # M (transition layout, sh.M): the hoisted exchange pair amplitude,
+        # precomputed once per solve (audit P3).  Without a coupling, psi_c_Y /
+        # psi_v_X are unread (the coupling block's legs).
+        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
+        if coupling:
+            # One sign per trial: a scalar (SDY's F or G) broadcasts.
+            sc = jnp.broadcast_to(jnp.asarray(s).astype(X.dtype), X.shape[:1])
+            Xb = jnp.conj(X) if Yc is None else Yc
+
+        # ── D term: (ε_c − ε_v) · X  (batched, local) — the A block ONLY.  B
+        #    carries no diagonal, so an SDY step applies D twice per step (once in
+        #    F, once in G), not four times.
+        delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]
+        D_term = lax.with_sharding_constraint(delta_E * X, sh.X)
+
+        # ── V term: B1 dense exchange, k-summed encode + broadcast decode ──────
+        # A: K^x = M V M†: conjugated vertex on the encode leg, bare vertex on the
+        #    decode.  Fixed by the transition density <0|ρ̂|Ψ> = Σ A_cvk ψ_ck ψ*_vk;
+        #    the reverse assignment builds conj(K^x), which cannot be covariant
+        #    alongside the (correct, untouched) W term.
+        # B: K^x_B = M V Mb^T — the antiresonant pair density on the encode leg
+        #    (at Q = 0 Mb = M, the BARE vertex: Henneke Eq. 2-20's conjugated
+        #    pairing ⟨M_t|v|conj(M_t')⟩).  DO NOT "improve" this conjugation: the
+        #    exchange conjugation is settled and re-litigating it is a known failure.
+        # The encode carries the scalar-singlet weight (2 scalar, 1 spinor).
+        # Encode k-SUMMED S, U = V_q0 S, decode M U broadcast over k — all against
+        # the rank's own (c, v) tile; ``_exchange_U`` holds the two (b, μ) psums.
+        # One V_q0 solve serves both blocks.
+        w_x = exchange_spin_weight(psi_c_X.shape[2], exchange_channel)
+        if coupling:
+            VX = v_term(X, Xb, sc, M, Mb, V_q0, w_x / sqrt_nk, 1.0 / sqrt_nk)
+        else:
+            VX = v_term(X, M, V_q0, w_x / sqrt_nk, 1.0 / sqrt_nk)
+
+        if head_tensor:
+            # ── Head term: the SAME contraction with (D_head, M_head) in
+            #    place of (M, V_q0, M).  Three Cartesian components stand
+            #    where μ stood, so this is three inner products per trial
+            #    vector and a 3x3 — free next to everything above.  The
+            #    conjugation follows the V term's exactly, and must: the
+            #    encode leg carries the conjugated vertex.
+            # D_head = conj(d), so conj(D_head) is the bare dipole and the
+            # two legs read exactly as the encode / decode M do above; the
+            # antiresonant encode reads conj(d) = D_head (pair docstring).
+            Sh = jnp.einsum("kcva,bcvk->ba", jnp.conj(D_head), X)
+            if coupling:
+                Sh = Sh + sc[:, None] * jnp.einsum("kcva,bcvk->ba", D_head, Xb)
+            Sh = Sh / sqrt_nk * w_x
+            Uh = Sh @ M_head.astype(Sh.dtype).T                   # U_a = M_ab S_b
+            HX = jnp.einsum("kcva,ba->bcvk", D_head, Uh)
+            VX = VX + lax.with_sharding_constraint(HX, sh.X) / sqrt_nk
+
+        if not include_W:
+            return D_term + VX
+
+        if not coupling:
+            WX = w_term(X, psi_c_X, psi_v_Y, W_R)
+        elif Yc is None:
+            WX = w_term(X, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R)
+        else:
+            WX = w_term(X, Yc, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R)
+        return D_term + VX - WX
+
+    # D_head / M_head are small and replicated: three Cartesian channels over
+    # (k, c, v) and a 3x3.  No mesh axis to tile them on.
+    head = (None, None) if head_tensor else ()
+    if not coupling:
+        def _matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
+                    M, D_head=None, M_head=None):
+            return _apply(X, None, None, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
+                          V_q0, M, None, D_head, M_head)
+
+        # psi_c_Y / psi_v_X are not read (the coupling block's legs): unconstrained,
+        # so a TDA payload may pass None for them (the loader's coupling_legs=False).
+        return jax.jit(_matvec, in_shardings=(sh.X, sh.psi_x, None, None, sh.psi_y,
+                                              sh.eps, sh.eps, sh.W, sh.V, sh.M) + head,
+                       out_shardings=sh.X)
+
+    operands = (sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y, sh.eps, sh.eps, sh.W, sh.V, sh.M)
+    if partner:
+        def _couple(X, Yc, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
+                    V_q0, M, Mb, D_head=None, M_head=None):
+            return _apply(X, Yc, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
+                          V_q0, M, Mb, D_head, M_head)
+
+        return jax.jit(_couple, in_shardings=(sh.X, sh.X, rep) + operands + (sh.M,) + head,
+                       out_shardings=sh.X)
+
+    def _pair(X, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M,
+              D_head=None, M_head=None):
+        return _apply(X, None, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
+                      V_q0, M, M, D_head, M_head)
+
+    return jax.jit(_pair, in_shardings=(sh.X, rep) + operands + head, out_shardings=sh.X)
+
+
 def make_w_term(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
     """The screened direct term ``(W X)`` of the TDA matvec as one ``shard_map``.
 
@@ -821,55 +1050,7 @@ def make_w_term(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
     ``_scatter_trial_block``); the route (outer-product load or XLA encode +
     k-leading convolution) is chosen at trace time and announced once.
     """
-    nk = nkx * nky * nkz
-    # The W-term k-convolution: the router's outer-product factory when it serves
-    # the band rank K = min(n_c, n_v) (decided at trace time, announced once),
-    # else the local k-leading factory on an XLA-built T; one call per trial.
-    kconv = make_local_kconv_klead(mesh_xy, (nkx, nky, nkz), norm="ortho")
-    outer_route = _make_outer_router(mesh_xy, (nkx, nky, nkz))
-
-    # ── W term: one shard_map over ('x','y'); body = scan over the trial axis ──
-    def _w_stack(X, psi_c_X, psi_v_Y, W_R):
-        # Local shards: X (n_trials, c_loc, v_loc, nk); psi_c_X (nk, c_full, ns,
-        # μ_loc); psi_v_Y (nk, v_full, ns, ν_loc); W_R (μ_loc, ν_loc, kx,ky,kz).
-        # sqrt_nk follows the input dtype (fp32/fp64) — drop-in for fp32 GMRES.
-        # DTYPE SEAM: this whole W-term inherits X's dtype, so a complex64 matvec
-        # would halve the 655 MB T-tensor and every one of its ~4 HBM round-trips
-        # (the audit's measured ~2× bandwidth lever, JOINT_FINDINGS §4). It is
-        # DELIBERATELY left at complex128 (no c64 here) per owner decision
-        # (2026-07-16); the fp32-GMRES path casts upstream in bse_feast, not here.
-        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
-
-        # The route (outer load fused / stored U, or XLA T), then its (μ, ν) block plan:
-        # both decided at trace time from the shapes and announced once.
-        rank = min(psi_c_X.shape[1], psi_v_Y.shape[1])
-        name, conv, fused = _w_route(outer_route, rank, mesh_xy, (nkx, nky, nkz), psi_c_X.shape[1],
-            operand_dtypes=(X.dtype, psi_c_X.dtype, psi_v_Y.dtype, W_R.dtype))
-        plan = _w_plan(name, rank, W_R, (psi_c_X,), (psi_v_Y,))
-        wterm = _blocked_w_term(plan, W_R, _w_layout(name))
-        whole = plan[0][1] * plan[1][1] == 1
-        block = _tda_block(name, conv, fused, kconv,
-                           fused[0](psi_c_X) if name == "fused" and whole else None)
-
-        def _body(carry, X_b):                       # X_b: (c_full, v_full, nk)
-            # NO COLLECTIVE IN THIS BODY (survey_C §C1): X_b arrives whole, and
-            # every block's decode returns this rank's (μ_loc, ν_loc) partial.
-            return carry, wterm((psi_c_X,), (psi_v_Y,), partial(block, X_b), sqrt_nk)
-
-        # Once per block of trials: gather, scan, reduce once.  The partial the
-        # scan stacks is (n_trials, c, v, nk), X-sized, never a T-class buffer.
-        _, WX = lax.scan(_body, None, _gather_trial_block(X), unroll=1)
-        return _scatter_trial_block(WX, mesh_xy)
-
-    w_stack = _shard_map_fn(
-        _w_stack,
-        mesh=mesh_xy,
-        in_specs=(P(None, "x", "y", None), P(None, None, None, "x"),
-                  P(None, None, None, "y"), P("x", "y", None, None, None)),
-        out_specs=P(None, "x", "y", None),
-    )
-
-    return w_stack
+    return _make_w(mesh_xy, nkx, nky, nkz)
 
 
 def build_bse_stack_matvec(
@@ -919,73 +1100,9 @@ def build_bse_stack_matvec(
         symmetric ``(3, 3)`` cell moment.  Hermiticity of the added term is
         then automatic: ``M`` real symmetric ⇒ ``K^head`` Hermitian.
     """
-    if kernel not in ("rpa", "bse"):
-        raise ValueError(f"kernel must be 'rpa' or 'bse', got {kernel!r}")
-    include_W = kernel == "bse"
-
-    sh = make_bse_shardings(mesh_xy)
-    nk = nkx * nky * nkz
-    # The screened direct term: one shard_map, a scan over trials (``make_w_term``).
-    w_stack = make_w_term(mesh_xy, nkx, nky, nkz)
-
-    v_term = _make_v_term(mesh_xy, pair=False)
-
-    def _matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
-                M, D_head=None, M_head=None):
-        # M (transition layout, sh.M): the hoisted exchange pair amplitude,
-        # precomputed once per solve (audit P3). psi_c_Y / psi_v_X are unused
-        # here — kept for a uniform matvec signature with the ring paths;
-        # psi_c_X / psi_v_Y feed the W-term.
-        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
-        # ── D term: (ε_c − ε_v) · X  (batched, local) ──────────────────────────
-        delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]
-        D_term = lax.with_sharding_constraint(delta_E * X, sh.X)
-
-        # ── V term: B1 dense exchange, k-summed encode + broadcast decode ──────
-        # K^x = M V M†: conjugated vertex on the encode leg, bare vertex on the
-        # decode.  Fixed by the transition density <0|ρ̂|Ψ> = Σ A_cvk ψ_ck ψ*_vk;
-        # the reverse assignment builds conj(K^x), which cannot be covariant
-        # alongside the (correct, untouched) W term.
-        # The encode carries the scalar-singlet weight (2 scalar, 1 spinor).
-        # Encode k-SUMMED S = M† X, U = V_q0 S, decode M U broadcast over k —
-        # all against the rank's own (c, v) tile; ``_exchange_U`` holds the two
-        # (b, μ) psums.
-        w_x = exchange_spin_weight(psi_c_X.shape[2], exchange_channel)
-        VX = v_term(X, M, V_q0, w_x / sqrt_nk, 1.0 / sqrt_nk)
-
-        if head_tensor:
-            # ── Head term: the SAME contraction with (D_head, M_head) in
-            #    place of (M, V_q0, M).  Three Cartesian components stand
-            #    where μ stood, so this is three inner products per trial
-            #    vector and a 3x3 — free next to everything above.  The
-            #    conjugation follows the V term's exactly, and must: the
-            #    encode leg carries the conjugated vertex.
-            # D_head = conj(d), so conj(D_head) is the bare dipole and the
-            # two legs read exactly as the encode / decode M do above.
-            Sh = jnp.einsum("kcva,bcvk->ba", jnp.conj(D_head), X) / sqrt_nk * w_x
-            Uh = Sh @ M_head.astype(Sh.dtype).T                   # U_a = M_ab S_b
-            HX = jnp.einsum("kcva,ba->bcvk", D_head, Uh)
-            VX = VX + lax.with_sharding_constraint(HX, sh.X) / sqrt_nk
-
-        if not include_W:
-            return D_term + VX
-
-        WX = w_stack(X, psi_c_X, psi_v_Y, W_R)
-        return D_term + VX - WX
-
-    # psi_c_Y / psi_v_X are not read (the coupling block's legs): unconstrained,
-    # so a TDA payload may pass None for them (the loader's coupling_legs=False).
-    in_sh = [sh.X, sh.psi_x, None, None, sh.psi_y,
-             sh.eps, sh.eps, sh.W, sh.V, sh.M]
-    if head_tensor:
-        # D_head / M_head are small and replicated: three Cartesian channels
-        # over (k, c, v) and a 3x3.  No mesh axis to tile them on.
-        in_sh += [None, None]
-    return jax.jit(
-        _matvec,
-        in_shardings=tuple(in_sh),
-        out_shardings=sh.X,
-    )
+    return _build_applier(mesh_xy, nkx, nky, nkz, kernel=kernel,
+                          exchange_channel=exchange_channel, head_tensor=head_tensor,
+                          coupling=False)
 
 
 # ===========================================================================
@@ -1064,132 +1181,9 @@ def build_bse_stack_pair_matvec(
         ``W_{mu nu}(q) = conj(W_{nu mu}(q))``.  At ``Q = 0`` the two orbital
         sets coincide, ``Mb = M``, and ``couple(X, conj(X), s) = pair(X, s)``.
     """
-    if kernel not in ("rpa", "bse"):
-        raise ValueError(f"kernel must be 'rpa' or 'bse', got {kernel!r}")
-    include_W = kernel == "bse"
-
-    sh = make_bse_shardings(mesh_xy)
-    rep = NamedSharding(mesh_xy, P())
-    nk = nkx * nky * nkz
-    kconv = make_local_kconv_klead(mesh_xy, (nkx, nky, nkz), norm="ortho")
-    outer_route = _make_outer_router(mesh_xy, (nkx, nky, nkz))
-
-    # ── W term: one shard_map over ('x','y') — the SAME single region the TDA
-    #    stack matvec opens.  No new shard_map is created by the coupling port:
-    #    the B encode is an einsum pair plus one all_gather INSIDE this body.
-    def _w_pair(X, Yc, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R):
-        # Local shards: X (n_trials, c_loc, v_loc, nk); psi_*_X (…, μ_loc);
-        # psi_*_Y (…, ν_loc); W_R (μ_loc, ν_loc, kx, ky, kz).  ``Yc`` is None
-        # without ``partner``.
-        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
-
-        # ONE block-level gather, hoisted OUT of the scan: both encodes take
-        # the whole trial block, and Xb = conj(X) is formed locally from it
-        # (conj commutes with the gather exactly, so this is the same array
-        # a second gather of Xb would deliver).  No collective runs per trial.
-        # With ``partner`` the antiresonant block is its own input: a second
-        # gather of an X-class block.
-        X_full = _gather_trial_block(X)                     # (b, c, v, nk)
-        Xb_full = jnp.conj(X_full) if Yc is None else _gather_trial_block(Yc)
-
-        # THE FUSION.  T^A and T^B have identical shape AND identical sharding
-        # (the B encode swaps legs, not layouts), so their sum needs no collective
-        # and no reshard; conv and decode are linear, so one chain serves both
-        # blocks.  On the outer-product load (BSEMAX) the fused chain concatenates
-        # the two blocks' legs along K, so ONE convolution call forms T_A + s T_B in
-        # shared memory.  The twin runs two chains, summed at the end.
-        rank = min(psi_c_X.shape[1], psi_v_Y.shape[1])
-        k_rank = 2 * rank if fuse else rank
-        name, conv, fused = _w_route(outer_route, k_rank, mesh_xy, (nkx, nky, nkz), psi_c_X.shape[1],
-            operand_dtypes=(X.dtype, psi_c_X.dtype, psi_c_Y.dtype, psi_v_X.dtype, psi_v_Y.dtype, W_R.dtype))
-        mu, nu = (psi_c_X, psi_v_X), (psi_v_Y, psi_c_Y)
-        plan = _w_plan(name, k_rank, W_R, mu, nu)
-        wterm = _blocked_w_term(plan, W_R, _w_layout(name))
-        whole = plan[0][1] * plan[1][1] == 1
-        block_AB, block_A, block_B = _pair_blocks(
-            name, conv, fused, kconv, fused[0](psi_c_X) if name == "fused" and whole else None)
-
-        def _body_fused(carry, xs):
-            return carry, wterm(mu, nu, partial(block_AB, xs), sqrt_nk)
-
-        def _body_unfused(carry, xs):
-            # THE TWIN.  Two full chains.  Kept only to price the fusion.
-            return carry, (wterm(mu, nu, partial(block_A, xs), sqrt_nk)
-                           + xs[2] * wterm(mu, nu, partial(block_B, xs), sqrt_nk))
-
-        # The sign rides the scan with its trial: one call may mix s = +1 and -1.
-        _, WX = lax.scan(_body_fused if fuse else _body_unfused,
-                         None, (X_full, Xb_full, sc), unroll=1)
-        return _scatter_trial_block(WX, mesh_xy)
-
-    psi_specs = (P(None, None, None, "x"), P(None, None, None, "y"),
-                 P(None, None, None, "x"), P(None, None, None, "y"),
-                 P("x", "y", None, None, None))
-    xspec = P(None, "x", "y", None)
-    if partner:
-        w_pair = _shard_map_fn(_w_pair, mesh=mesh_xy, in_specs=(xspec, xspec, P()) + psi_specs,
-                               out_specs=xspec)
-    else:
-        w_pair = _shard_map_fn(lambda X, sc, *legs: _w_pair(X, None, sc, *legs), mesh=mesh_xy,
-                               in_specs=(xspec, P()) + psi_specs, out_specs=xspec)
-
-    v_pair = _make_v_term(mesh_xy, pair=True)
-
-    def _couple(X, Yc, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
-                V_q0, M, Mb, D_head=None, M_head=None):
-        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
-        # One sign per trial: a scalar (SDY's F or G) broadcasts.
-        sc = jnp.broadcast_to(jnp.asarray(s).astype(X.dtype), X.shape[:1])
-        Xb = jnp.conj(X) if Yc is None else Yc
-
-        # ── D term — the A block ONLY.  B carries no diagonal, so an SDY step
-        #    applies D twice per step (once in F, once in G), not four times.
-        delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]
-        D_term = lax.with_sharding_constraint(delta_E * X, sh.X)
-
-        # ── V term: both exchange encodes, one V_q0 solve, one decode ─────────
-        # A: K^x  = M V M†  — CONJUGATED vertex on the encode leg (the settled
-        #    B1 result, bse_stack_matvec's shipped TDA form).
-        # B: K^x_B = M V M^T — the BARE vertex on the encode leg (Henneke
-        #    Eq. 2-20's conjugated pairing ⟨M_t|v|conj(M_t')⟩; the ring path
-        #    spells the same thing as ``apply_V_ring_B``, which conjugates ψ^Y
-        #    on the way in).  DO NOT "improve" this conjugation: the exchange
-        #    conjugation is settled and re-litigating it is a known failure.
-        #    Both encodes and the decode are local on the transition layout
-        #    (``_make_v_term``); one V_q0 solve serves both blocks.
-        w_x = exchange_spin_weight(psi_c_X.shape[2], exchange_channel)
-        VX = v_pair(X, Xb, sc, M, Mb, V_q0, w_x / sqrt_nk, 1.0 / sqrt_nk)
-
-        if head_tensor:
-            # The exchange term with (D_head, M_head) in place of (M, V_q0):
-            # the resonant encode reads d = conj(D_head), the antiresonant
-            # encode conj(d) = D_head, the decode D_head (docstring).
-            Sh = (jnp.einsum("kcva,bcvk->ba", jnp.conj(D_head), X)
-                  + sc[:, None] * jnp.einsum("kcva,bcvk->ba", D_head, Xb)) / sqrt_nk * w_x
-            Uh = Sh @ M_head.astype(Sh.dtype).T                   # U_a = M_ab S_b
-            HX = jnp.einsum("kcva,ba->bcvk", D_head, Uh)
-            VX = VX + lax.with_sharding_constraint(HX, sh.X) / sqrt_nk
-
-        if not include_W:
-            return D_term + VX
-
-        WX = (w_pair(X, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R) if Yc is None else
-              w_pair(X, Yc, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R))
-        return D_term + VX - WX
-
-    operands = (sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y, sh.eps, sh.eps, sh.W, sh.V, sh.M)
-    # D_head / M_head are small and replicated (the Tamm-Dancoff matvec's).
-    head = (None, None) if head_tensor else ()
-    if partner:
-        return jax.jit(_couple, in_shardings=(sh.X, sh.X, rep) + operands + (sh.M,) + head,
-                       out_shardings=sh.X)
-
-    def _pair(X, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M,
-              D_head=None, M_head=None):
-        return _couple(X, None, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
-                       V_q0, M, M, D_head, M_head)
-
-    return jax.jit(_pair, in_shardings=(sh.X, rep) + operands + head, out_shardings=sh.X)
+    return _build_applier(mesh_xy, nkx, nky, nkz, kernel=kernel,
+                          exchange_channel=exchange_channel, head_tensor=head_tensor,
+                          coupling=True, partner=partner, fuse=fuse)
 
 
 # ===========================================================================
