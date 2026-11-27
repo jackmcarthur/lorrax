@@ -44,11 +44,28 @@ and [the eigensolver page](docs/architecture/iterative_eigensolvers.md#the-unpai
   that does not close the Hermitian pencil (`GATE nontda_lower_row`); the matrix-free Lanczos, which
   has no input key, refuses a partner or a head tensor (`GATE nontda_route_option`, no longer for
   `davidson_olsen` or `keep_W_R`).
+- **Settings that were changed or ignored without a word.** `bse.exciton_bands` now reads the
+  Davidson's tuning keys (`davidson_precond`, `davidson_olsen`, `davidson_eps_shift`,
+  `davidson_margin`, `davidson_margin_tol_mev`, `davidson_m_max`); it used to run the defaults
+  whatever the input file said. `bse.bse_jax` honours `davidson_eps_shift = 0` (it became
+  $10^{-3}$ Ry) and no longer divides `solver_max_iter` by `block_size` for the Davidson and
+  TRLan (only the block Lanczos has a block): a Davidson run that named `block_size = 4` now has
+  its whole iteration budget. The standalone `bse.absorption_haydock` refuses `full_bse = true`
+  and `qp_rotations_file` (`GATE haydock_unserved_key`); it ran a Tamm–Dancoff recursion on
+  unrotated states with either.
+- **One applier.** The Tamm–Dancoff matvec and the pair applier are one assembly
+  (`bse_stack_matvec._build_applier`); the Tamm–Dancoff program is unchanged (same lowered HLO
+  text on every W route, same bits). Two things nothing reached are gone: the pair applier's
+  unfused twin (`fuse=False`) and `bse_nontda.make_ab_appliers`.
+- **Driver suite.** Three stages run the full BSE at four ranks: `bse_full` (Davidson),
+  `bse_full_dense` (dense, which must print `bse_full`'s roots) and `exciton_bands_full`
+  (the full BSE at every $Q$ of the suite's path).
 - **Results that move.** None for an existing run that did not name `full_bse` in an exciton-band
   input file, and the default results of `bse.bse_jax` are unchanged (Tamm–Dancoff, and the
   $Q = 0$ full BSE: the paired Davidson and the dense solve take the code path they took). An
   exciton-band input file that did name `full_bse = true` now gets the full BSE where it got the
-  Tamm–Dancoff roots.
+  Tamm–Dancoff roots. Iteration counts move only for input files that named one of the settings
+  of the first bullet.
 - **Measured, CPU only.** The unpaired Davidson's roots equal the dense ones within
   $4\times10^{-14}$ eV on synthetic pencils of 240 transitions. On the 128-transition test payload
   at $Q = 0$ with the partner set equal to the payload's own orbitals, it takes 328 pair calls where

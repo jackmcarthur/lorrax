@@ -285,7 +285,13 @@ $\mathcal K z = \Omega\,\Sigma z$ as it stands: the dense solve, and the
 `bse_stack_matvec.build_bse_stack_matvec` is the TDA matvec: Lanczos,
 Davidson and thick-restart Lanczos and KPM under `full_bse = false`, the
 spectral-bound Lanczos of FEAST and KPM on either route, Haydock, and
-`bse.exciton_bands` (its `full_bse = true` scan takes the pair applier below). Per trial block:
+`bse.exciton_bands` (its `full_bse = true` scan takes the pair applier below).
+It and the pair applier are two entries of one assembly
+(`bse_stack_matvec._build_applier` for $D$, the exchange, the head tensor and
+$W$; `_make_w` for the one `shard_map` of the screened direct term): the
+Tamm–Dancoff operator is the pair applier with the coupling encodes absent
+from the trace, not multiplied by zero. Its lowered program is the one it was
+before the two were joined, character for character, on every W route. Per trial block:
 
 1. one all-gather of the block over `'y'` then `'x'`: each rank holds every
    trial whole, $(n_c, n_v, N_k)$;
