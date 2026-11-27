@@ -69,23 +69,6 @@ from common.log import get_logger
 log = get_logger(__name__)
 
 
-#: Cartesian polarization letters, in the order of the dipole's first axis and
-#: of the ``absorption_haydock_b<1|2|3>_eh.dat`` file suffixes.
-POLARIZATIONS = "xyz"
-
-
-def parse_polarizations(text: str) -> tuple[int, ...]:
-    """``'xyz'``, ``'x'``, ``'xz'`` ... -> Cartesian indices, in order, no repeats."""
-    pols = tuple(POLARIZATIONS.index(ch) for ch in str(text).lower()
-                 if ch in POLARIZATIONS)
-    if not pols or len(set(pols)) != len(pols) or len(pols) != len(str(text)):
-        raise ValueError(
-            f"GATE haydock_polarizations: got {text!r}; want a non-empty subset "
-            f"of {POLARIZATIONS!r} without repeats (e.g. 'x' for cubic crystals "
-            f"or in-plane light, where the other two recursions repeat it)")
-    return pols
-
-
 def haydock_recursion_block(matvec_block, d_block, n_iter, constrain=lambda x: x):
     """Run a block Haydock recurrence (no reorthogonalisation).
 
