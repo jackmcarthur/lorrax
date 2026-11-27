@@ -309,20 +309,18 @@ $$
 
 The exchange goes through the transition density $\rho(\br_\mu)$ and $V_\bQ$; the direct term is a $\bk$-convolution, $\mathrm{IFFT}_{\bk\to\bR}$, a pointwise product with $W_\bR(\mu,\nu)$ and $\mathrm{FFT}_{\bR\to\bk}$, with a $1/\sqrt{N_k}$ on each transform.
 
-### <span class="n">5.2</span> Solvers over the path {: #solve-lanczos }
+### <span class="n">5.2</span> The solver over the path {: #solve-path }
 
-`build_path_solver_davidson`, `build_path_solver`
+`build_path_solver_davidson`
 {: .in-code }
 
-The default solver is the block Davidson of the [`bse`](../bse/theory.md) driver with the exact diagonal preconditioner. It is planned once and applied at every $\bQ$ with that point's operands, and stops when every root's residual is below `davidson_tol_mev`. With `full_bse = true` the dense solve or the structure-preserving Davidson of §1.4 takes its place.
-
-Under `solver = block_lanczos`, for each $\bQ$ the pair amplitude $\psi^*_{c\,\bk+\bQ}(\br_\mu)\psi_{v\bk}(\br_\mu)$ is formed once, then a fixed-depth block Lanczos with full reorthogonalization returns the lowest `number_eigenvalues` Ritz values:
+For each $\bQ$ the pair amplitude $\psi^*_{c\,\bk+\bQ}(\br_\mu)\psi_{v\bk}(\br_\mu)$ is formed once, and the block Davidson of the [`bse`](../bse/theory.md) driver, with the exact diagonal preconditioner, returns the lowest `number_eigenvalues` roots:
 
 $$
-H_\bQ A^{S\bQ} = \Omega_S(\bQ)\,A^{S\bQ}, \qquad S = 1,\dots,n_\mathrm{eig}, \qquad \dim\mathcal K = b\cdot\min\!\big(n_\mathrm{iter},\ \lfloor n_v n_c N_k / b\rfloor\big) \tag{5.2}
+H_\bQ A^{S\bQ} = \Omega_S(\bQ)\,A^{S\bQ}, \qquad S = 1,\dots,n_\mathrm{eig} \tag{5.2}
 $$
 
-$b$ is `block_size` and $n_\mathrm{iter}$ is `solver_max_iter`. The start block has no weight on mesh pad slots. On this route the whole $\bQ$ list, with certification and spot-check rows, is one `lax.scan`: one compile serves every point, and extra points cost one scan row each.
+The solver is planned once and applied at every $\bQ$ with that point's operands, so one compile serves the path, the certification rows and the spot checks. It stops when every root's residual is below `davidson_tol_mev`, and a $\bQ$ that reaches `solver_max_iter` first refuses before anything is written. With `full_bse = true` the dense solve or the structure-preserving Davidson of §1.4 takes its place.
 
 ### <span class="n">5.3</span> Output {: #solve-out }
 

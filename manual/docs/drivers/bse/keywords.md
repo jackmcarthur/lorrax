@@ -51,7 +51,7 @@ Optional
 Solve the full $\begin{pmatrix}A&B\\-B^*&-A^*\end{pmatrix}$ problem. Off: the Tamm–Dancoff resonant block $A$, as in BerkeleyGW. With `dipole_file` the per-state dipoles take both halves of the paired eigenvector ([Theory](theory.md#abs-ds)) and the spectra are written as under the TDA; the Haydock recursion needs the TDA.
 
 ### `full_bse_solver` {: .kw data-type="enum" data-default="dense" }
-Eigensolver of the full BSE; read with `full_bse = true` only. `dense` assembles $A$ and $B$ and solves on the host (up to 4096 transitions). `davidson` is a structure-preserving block Davidson with no size limit; it reads `solver_max_iter`, `davidson_tol_mev`, `davidson_margin`, `davidson_margin_tol_mev`, `davidson_m_max`, `davidson_precond`, `davidson_olsen` and `davidson_eps_shift`. Under `full_bse = true`, `solver` other than `davidson` and `block_size` other than 1 refuse. [Exciton bands](../exciton-bands/keywords.md#full_bse) reads `full_bse` and the two keys below at finite $\bQ$.
+Eigensolver of the full BSE; read with `full_bse = true` only. `dense` assembles $A$ and $B$ and solves on the host (up to 4096 transitions). `davidson` is a structure-preserving block Davidson with no size limit; it reads `solver_max_iter`, `davidson_tol_mev`, `davidson_margin`, `davidson_margin_tol_mev`, `davidson_m_max`, `davidson_precond`, `davidson_olsen` and `davidson_eps_shift`. [Exciton bands](../exciton-bands/keywords.md#full_bse) reads `full_bse` and the two keys below at finite $\bQ$.
 
 `dense` `davidson`
 {: .kw-values }
@@ -163,28 +163,22 @@ Basis control of the band interpolation, on the [htransform](../../utilities/htr
 Number of lowest eigenpairs. BerkeleyGW: `number_eigenvalues`.
 
 ### `solver` {: .kw data-type="enum" data-default="davidson" }
-Eigensolver of the TDA problem. `davidson`: block Davidson with the exact diagonal preconditioner, stopped when every root's residual is below `davidson_tol_mev`. `block_lanczos`: block Lanczos at a fixed Krylov dimension or to `lanczos_rtol`. `trlan`: thick-restart Lanczos within `trlan_m_max` slots. A key that only another solver reads refuses. The full BSE (`full_bse`) does not read it: its solver is `full_bse_solver`, and a value other than `davidson` refuses.
+Eigensolver of the TDA problem. `davidson`, the only value: block Davidson with the exact diagonal preconditioner, stopped when every root's residual is below `davidson_tol_mev`. The key can be left out. `block_lanczos` and `trlan` were retired on 2026-11-27 and refuse (`GATE bse_retired_key`). The full BSE (`full_bse`) picks its solver with `full_bse_solver`.
 
 BerkeleyGW's `diagonalization` (dense), `diagonalization_primme` and `lanczos` (a Lanczos spectrum) are other methods, so their names are not used.
 {: .kw-details }
 
-`davidson` `block_lanczos` `trlan`
+`davidson`
 {: .kw-values }
 
 ### `solver_max_iter` {: .kw data-type="int" data-default="max(30, min(200, N/2))" }
-Iteration budget of every solver, with $N$ the transition count: Davidson's cap on block iterations, Lanczos's Krylov dimension, TRLan's matvec budget.
+Cap on the Davidson's block iterations, on the TDA and under `full_bse_solver = davidson`, with $N$ the transition count.
 
 ### `davidson_tol_mev` {: .kw data-type="float" data-default="0.01" }
 Davidson stopping rule in meV: every root's residual $\lVert Hx - \Omega x\rVert$ below it. A solve that reaches `solver_max_iter` first refuses (`GATE davidson_converged`).
 
 ### `davidson_precond`, `davidson_margin`, `davidson_margin_tol_mev`, `davidson_m_max`, `davidson_olsen`, `davidson_eps_shift` {: .kw data-type="mixed" data-default="exact, 8, davidson_tol_mev, 10·n_eig, false, 1e-3" }
 Davidson internals: the preconditioner diagonal (`exact`, `bare`, `auto`), extra unreported roots and the residual at which they lock, the subspace size, the Olsen correction, the regularization in Ry. `davidson_m_max` counts basis vectors: 10·n_eig by default on the Tamm–Dancoff route, 20·n_eig real-form vectors on the full route (`full_bse_solver = davidson`), which reads all six. `davidson_eps_shift = 0` is used as written.
-
-### `block_size`, `lanczos_rtol`, `lanczos_check_every`, `lanczos_n_reorth` {: .kw data-type="mixed" data-default="1, 0, 4, −1" }
-`block_lanczos` internals: block width, convergence threshold (0 = fixed dimension) and its cadence, reorthogonalization window (−1 = full; keep it for spinor spectra). The block width divides `solver_max_iter` into block iterations under `block_lanczos` only; the Davidson and TRLan budgets do not depend on it.
-
-### `trlan_m_max`, `trlan_n_keep` {: .kw data-type="int" data-default="max(3 n_eig, 60), n_eig + 10" }
-`trlan` internals: basis slots and Ritz vectors kept across a restart.
 
 **Dipoles, spectra and output files**
 
@@ -254,11 +248,13 @@ A separate entry point: the TDA screened recursion ($D + w V - W$), at least two
 | `--eqp` | `eqp_corrections` / `eqp_co_corrections` |
 | `--dipole`, `--qp-rotations` | `dipole_file`, `qp_rotations_file` |
 | `--n-eig`, `--write-eigs` | `number_eigenvalues`, `write_eigenvectors` (BerkeleyGW's sign convention) |
-| `--solver lanczos`, `--max-lanczos-iter`, `--n-reorth` | `solver = block_lanczos`, `solver_max_iter`, `lanczos_n_reorth` |
+| `--max-lanczos-iter` | `solver_max_iter` |
+| `solver = block_lanczos`, `solver = trlan`, `block_size`, `lanczos_rtol`, `lanczos_check_every`, `lanczos_n_reorth`, `trlan_m_max`, `trlan_n_keep` | retired 2026-11-27 (`GATE bse_retired_key`): the Davidson is the TDA eigensolver |
+| `feast`, the `feast_*` and `gmres_*` keys | retired 2026-11-27 (`GATE bse_retired_key`): `full_bse = true` with `full_bse_solver = davidson` |
 | `--haydock-iter`, `--haydock-eta-ev`, `--haydock-n-omega`, `--haydock-pol` | `haydock` + `number_iterations`, `energy_resolution`, `delta_frequency`, `polarization` |
 | `--eta-eV`, `--n-iter`, `--n-omega`, `--pol` (Haydock) | `energy_resolution`, `number_iterations`, `delta_frequency`, `polarization` |
 | `--V-cell`, `--n-spinor`, `--n-spin` (Haydock) | removed: read from the WFN |
 | `--lanczos` | removed (it changed nothing) |
-| other `--davidson-*`, `--trlan-*`, `--lanczos-*`, `--kpm-*` | the input key of the same name in snake case |
+| other `--davidson-*`, `--kpm-*` | the input key of the same name in snake case |
 | `bse_k_grid` | `kgrid_fine` |
 | `--ring-timing`, `w_head_densify = c1` or `legacy` | retired |

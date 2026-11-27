@@ -130,7 +130,7 @@ $s$, $t$ are spinor components. $W$ is the charge-sector interaction, one $W$ fo
 
 ### <span class="n">2.3</span> The full problem {: #ham-full }
 
-`bse_ring_comm.build_bse_ring_matvec_full`
+`bse_stack_matvec.build_bse_stack_matvec_full`
 {: .in-code }
 
 With `full_bse = true`, every route solves the full resonant–antiresonant problem, with $A$ the block of Eq. (2.1) and $B = w_x V^B - W^B$ the coupling block:
@@ -204,29 +204,27 @@ $$
 (HX)_{cv\bk} = \big(E^{\mathrm{QP}}_{c\bk} - E^{\mathrm{QP}}_{v\bk}\big)X_{cv\bk} + (VX)_{cv\bk} - (WX)_{cv\bk} \tag{3.3}
 $$
 
-This stack matvec serves every TDA route and Haydock. The full problem of Eq. (2.3) uses the ring matvec, which applies $A$ and $B$ to the pair $(X, Y)$.
+This stack matvec serves the TDA Davidson and Haydock. The full problem of Eq. (2.3) uses the same kernels through a pair applier, $\mathrm{pair}(X, s) = A X + s\,B \bar X$ (`build_bse_stack_pair_matvec`), from which the products on $(X, Y)$ follow by sums and differences.
 
 ## <span class="n">4</span> Eigensolvers {: #solve }
 
-Every eigenpair route diagonalizes $H$ projected onto a subspace $Q$ built from products $HX$; the routes differ in how $Q$ grows.
+The iterative routes diagonalize $H$ projected onto a subspace $Q$ built from products $HX$; the dense route assembles the whole problem.
 {: .intro }
 
-### <span class="n">4.1</span> Krylov projection {: #solve-krylov }
+### <span class="n">4.1</span> Subspace projection {: #solve-krylov }
 
-`bse_lanczos.solve_bse_sharded`
+`bse_solve.solve_bse_sharded`
 {: .in-code }
 
-Lanczos builds an orthonormal basis $Q = [q_1, \ldots, q_m]$ by the three-term recurrence, so $Q^\dagger H Q$ is tridiagonal; its eigenpairs give the Ritz pairs:
+The Davidson keeps an orthonormal basis $Q = [q_1, \ldots, q_m]$ of start vectors and preconditioned residuals. The eigenpairs of the projected matrix give the Ritz pairs:
 
 $$
-H q_j = \beta_{j-1} q_{j-1} + \alpha_j q_j + \beta_j q_{j+1}, \qquad Q^\dagger H Q\, y_S = \Omega_S\, y_S, \qquad A^S = Q y_S \tag{4.1}
+Q^\dagger H Q\, y_S = \Omega_S\, y_S, \qquad A^S = Q y_S \tag{4.1}
 $$
-
-Reorthogonalization is full CGS2 by default (`lanczos_n_reorth -1`); a narrower window produces ghost eigenvalues that spoil per-state oscillator strengths.
 
 <figure class="flowchart" markdown>
 [![BSE eigenpairs](../../assets/figures/b3.png)](../../assets/figures/b3.png)
-<figcaption><strong>Fig. B3.</strong> BSE eigenpairs. Stage 1: the three TDA solvers diagonalize $H$ in a growing subspace $Q$ (Lanczos: tridiagonal; thick restart: arrowhead after a restart; Davidson: residual corrections). Stage 2: the dense full-BSE pencil for small systems.</figcaption>
+<figcaption><strong>Fig. B3.</strong> BSE eigenpairs. Stage 1: the Davidson diagonalizes $H$ in a growing subspace $Q$ of residual corrections; the figure also draws the Lanczos and thick-restart solvers, which were retired on 2026-11-27. Stage 2: the dense full-BSE pencil for small systems.</figcaption>
 </figure>
 
 ### <span class="n">4.2</span> Comparing the routes {: #solve-routes }
@@ -236,9 +234,8 @@ The tabs give each route's update or projection.
 | Route | Flags | Hamiltonian | Returns | Limits |
 |---|---|---|---|---|
 | Davidson | default | TDA | $\Omega_S$, $A^S$ | memory $2m_{\max}$ vectors |
-| Lanczos | `solver = block_lanczos` | TDA | $\Omega_S$, $A^S$ | Krylov memory $\propto$ `solver_max_iter` |
-| Thick restart | `solver = trlan` | TDA | $\Omega_S$, $A^S$ | extra matvecs for the cap |
-| Full BSE | `full_bse = true` | full | $\Omega_S$, $(X^S, Y^S)$ | $N \le 4096$, dense |
+| Full BSE, dense | `full_bse = true` | full | $\Omega_S$, $(X^S, Y^S)$ | $N \le 4096$ |
+| Full BSE, Davidson | `full_bse = true`, `full_bse_solver = davidson` | full | $\Omega_S$, $(X^S, Y^S)$ | positive definite stability matrix, or `full_bse_instability = continue` |
 
 === "Davidson"
     **Block Davidson** <span class="status production">Production</span>
@@ -258,45 +255,22 @@ The tabs give each route's update or projection.
     python -m bse.bse_jax -i gw.in
     ```
 
-=== "Lanczos"
-    **Block Lanczos** <span class="status supported">Supported</span>
+=== "Full BSE, Davidson"
+    **Structure-preserving Davidson** <span class="status supported">Supported</span>
 
-    The recurrence of Eq. (4.1), optionally with blocks of `block_size` vectors and an early exit on `lanczos_rtol`.
+    The pencil of the dense route, solved without assembling $A$ and $B$. Each trial vector $(X, Y)$ enters the basis with its partner $(\bar Y, \bar X)$, so the projected problem keeps the $\pm\Omega_S$ pairing; every product comes from the pair applier of §3.3.
 
-    Converges the extremal spectrum first, so the low-lying excitons and the spectrum shape come quickly.
-
-    $$
-    Q^\dagger H Q = T_m \ \text{(block-)tridiagonal}, \qquad m = \texttt{max\_lanczos\_iter} \tag{4.2}
-    $$
+    The stability matrix must be positive definite; `full_bse_instability = continue` reports the unstable roots and returns the positive ones.
 
     Subspace
-    :   Krylov, full reorthogonalization
+    :   paired residual corrections, exact diagonal preconditioner
 
     ```bash
-    # input keys in the -i input file: solver = block_lanczos, number_eigenvalues = 10
+    # input keys in the -i input file: full_bse = true, full_bse_solver = davidson
     python -m bse.bse_jax -i gw.in
     ```
 
-=== "Thick restart"
-    **Thick-restart Lanczos** <span class="status supported">Supported</span>
-
-    Lanczos to `trlan_m_max` vectors, then a restart from the `trlan_n_keep` lowest Ritz vectors.
-
-    The projected matrix after a restart is an arrowhead; the convergence is Lanczos's, from bounded memory.
-
-    $$
-    Q^\dagger H Q = \begin{pmatrix} \Theta_{n_{\mathrm{keep}}} & s \\ s^\dagger & T \end{pmatrix} \tag{4.2}
-    $$
-
-    Subspace
-    :   Krylov, capped and restarted
-
-    ```bash
-    # input keys in the -i input file: solver = trlan
-    python -m bse.bse_jax -i gw.in
-    ```
-
-=== "Full BSE"
+=== "Full BSE, dense"
     **Dense definite pencil** <span class="status supported">Supported</span>
 
     $A$ and $B$ are read off the full matvec column by column, and Eq. (2.3) is solved as a Hermitian-definite pencil.

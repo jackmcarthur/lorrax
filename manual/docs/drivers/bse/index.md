@@ -27,7 +27,7 @@ Hamiltonian
 :   Tamm–Dancoff (the default) or full, with the coupling block (`full_bse = true`); the spinor kernel on a spinor WFN, `spin_singlet` (default) or `spin_triplet` on a non-spinor one ([Kernel and Hamiltonian](#kernel))
 
 Solver
-:   Davidson · Lanczos · thick restart · dense full BSE · Haydock
+:   Davidson · full-BSE Davidson · dense full BSE · Haydock
 
 </div>
 
@@ -105,7 +105,7 @@ Under `kgrid_fine` the dipoles are carried to the fine grid with the bands, so t
 
 ## Choosing a solver {: #solver }
 
-Production runs use the default route, the eigensolve, and `kpm_dos = true` computes only the exciton density of states. On the TDA (the default) `solver` picks the iterative solver, Davidson by default; with `full_bse = true` the dense full-BSE solver runs. Expand a row for the method, its keys and its limits.
+Production runs use the default route, the eigensolve, and `kpm_dos = true` computes only the exciton density of states. The TDA (the default) is solved by the block Davidson; with `full_bse = true` the dense full-BSE solver runs, or the structure-preserving Davidson under `full_bse_solver = davidson`. Expand a row for the method, its keys and its limits.
 
 ???+ treatment production "davidson · Block Davidson · TDA eigenpairs"
     Residual corrections preconditioned by the exact diagonal of $H$, on a block of the `number_eigenvalues` lowest roots plus `davidson_margin` margin roots. The solve stops when every reported root's residual is below `davidson_tol_mev` (0.01 meV) and refuses if the iteration cap comes first. The default solver since 2026-10-20.
@@ -115,21 +115,11 @@ Production runs use the default route, the eigensolve, and `kpm_dos = true` comp
     python -m bse.bse_jax -i gw.in
     ```
 
-??? treatment supported "lanczos · Block Lanczos · TDA eigenpairs"
-    Lanczos on the Tamm–Dancoff block $A$ with full CGS2 reorthogonalization. The lowest Ritz pairs of the tridiagonal (block-tridiagonal) projection are the excitons. It runs a fixed Krylov dimension and has no residual test.
+??? treatment supported "davidson · Structure-preserving Davidson · non-TDA eigenpairs"
+    The full problem without assembling $A$ and $B$: a block Davidson on paired trial vectors that keeps the $\pm\Omega$ structure of the full problem, with no size limit. It needs a positive definite stability matrix; `full_bse_instability = continue` reports the unstable roots and returns the positive ones.
 
     ```bash
-    # input keys in the -i input file: solver = block_lanczos, number_eigenvalues = 10
-    python -m bse.bse_jax -i gw.in
-    ```
-
-    **Note** Keep `lanczos_n_reorth -1` (full) for degenerate spinor spectra.
-
-??? treatment supported "trlan · Thick-restart Lanczos · TDA eigenpairs"
-    The same Krylov convergence from a basis capped at `trlan_m_max` slots, restarted from the lowest Ritz vectors. For production sizes where the full Krylov basis does not fit in memory.
-
-    ```bash
-    # input keys in the -i input file: solver = trlan, number_eigenvalues = 20
+    # input keys in the -i input file: full_bse = true, full_bse_solver = davidson, number_eigenvalues = 10
     python -m bse.bse_jax -i gw.in
     ```
 
@@ -212,5 +202,6 @@ A downfolded bundle is validated by solving the same BSE on the parent and on th
     - A `dipole.h5` whose `basis` stamp differs from the WFN's.
     - `kgrid_fine` on an ISDF tensor file whose screened head is zero (GW `head_correction = off`): the fine grid restores the small-$\bq$ attraction but the QP energies keep no head, so excitons sink with the grid (`GATE kgrid_fine_zero_head`).
     - `kgrid_fine` with an axis smaller than the coarse grid; `w_head_densify = c1` or `legacy`; a bundle without `W0_lr` under `kgrid_fine` (an `mpa`, QSGW tangential or bispinor tangential restart, or a downfolded bundle).
-    - Full BSE above transition dimension 4096, or with a non-reciprocal $W$.
+    - The dense full BSE above transition dimension 4096; the full BSE with a non-reciprocal $W$, or with a stability matrix that is not positive definite (the Davidson continues under `full_bse_instability = continue`).
+    - A key of a retired eigensolver: `solver = block_lanczos` or `trlan`, `block_size`, the `lanczos_*`, `trlan_*`, `feast*` and `gmres_*` keys (`GATE bse_retired_key`, with the replacement in the message).
     - `bse.absorption_haydock` on fewer than two devices.

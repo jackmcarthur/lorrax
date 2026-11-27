@@ -12,7 +12,7 @@ page: keywords
 
 The driver takes command-line flags and reads input keys, written `key = value` one per line, from the input file passed with `-i`; the input file also carries the `K_POINTS` path block. Defaults are read from the driver's argparse parser (`src/bse/exciton_bands.py`, `build_parser`) and the keyword schema (`src/gw/gw_config.py`). An unknown flag refuses; a prefix of a flag is not accepted.
 
-The BSE keys it shares with [`bse`](../bse/keywords.md) are input keys under BerkeleyGW's names (`number_val_bands_fine`, `number_cond_bands_fine`, `number_eigenvalues`, `solver`, `davidson_tol_mev`, `block_size`, `solver_max_iter`, `eqp_corrections`, `band_degeneracy`, `degeneracy_tol_ry`, `dipole_file`, the Davidson internals, the three `full_bse` keys, and the spin keys); an old flag refuses with its key. `kgrid_fine_shift` refuses: the $\bk+\bQ$ list is Γ-centred. `qp_rotations_file` and `highest_occupied_band` refuse (`GATE exb_unserved_key`): the states at $\bk+\bQ$ are not rotated into the QP basis, and the band split is the WFN's electron count. The exciton-band flags below stay on the command line.
+The BSE keys it shares with [`bse`](../bse/keywords.md) are input keys under BerkeleyGW's names (`number_val_bands_fine`, `number_cond_bands_fine`, `number_eigenvalues`, `solver`, `davidson_tol_mev`, `solver_max_iter`, `eqp_corrections`, `band_degeneracy`, `degeneracy_tol_ry`, `dipole_file`, the Davidson internals, the three `full_bse` keys, and the spin keys); an old flag refuses with its key. `kgrid_fine_shift` refuses: the $\bk+\bQ$ list is Γ-centred. `qp_rotations_file` and `highest_occupied_band` refuse (`GATE exb_unserved_key`): the states at $\bk+\bQ$ are not rotated into the QP basis, and the band split is the WFN's electron count. The exciton-band flags below stay on the command line.
 
 Required
 {: .kw-group }
@@ -183,12 +183,12 @@ A BSE window edge inside a degenerate multiplet. Shared with [`bse`](../bse/keyw
 Exciton levels per $\bQ$. Shared with [`bse`](../bse/keywords.md), where the default is 5.
 
 ### `solver` {: .kw data-type="enum" data-default="davidson" }
-Per-$\bQ$ eigensolver of the Tamm–Dancoff problem. `davidson`: block Davidson with the exact diagonal preconditioner, stopped on `davidson_tol_mev`. `block_lanczos`: fixed block Lanczos, `block_size` × `solver_max_iter`. Shared with [`bse`](../bse/keywords.md); `trlan` is not offered here.
+Per-$\bQ$ eigensolver of the Tamm–Dancoff problem. `davidson`, the only value: block Davidson with the exact diagonal preconditioner, stopped on `davidson_tol_mev`. The key can be left out. Shared with [`bse`](../bse/keywords.md).
 
-A key that only the other solver reads refuses. The full BSE (`full_bse`) does not read it: its solver is `full_bse_solver`, and `block_lanczos` refuses there.
+`block_lanczos` and the `block_size` key were retired on 2026-11-27 and refuse (`GATE bse_retired_key`). The full BSE (`full_bse`) picks its solver with `full_bse_solver`.
 {: .kw-details }
 
-`davidson` `block_lanczos`
+`davidson`
 {: .kw-values }
 
 ### `davidson_tol_mev` {: .kw data-type="float" data-default="0.01" }
@@ -197,20 +197,11 @@ Davidson stopping rule in meV: every root's residual below it. A $\bQ$ that reac
 ### `davidson_precond`, `davidson_olsen`, `davidson_eps_shift`, `davidson_margin`, `davidson_margin_tol_mev`, `davidson_m_max` {: .kw data-type="mixed" data-default="exact, false, 1e-3, 8, davidson_tol_mev, the solver's" }
 Davidson internals, with the meanings they have in [`bse`](../bse/keywords.md): the preconditioner diagonal, the Olsen correction, the regularization in Ry, the margin roots and the residual at which they lock, the subspace size.
 
-Read by the Tamm–Dancoff Davidson and by `full_bse_solver = davidson`. A named one refuses with `solver = block_lanczos` and with `full_bse_solver = dense`.
+Read by the Tamm–Dancoff Davidson and by `full_bse_solver = davidson`. A named one refuses with `full_bse_solver = dense`.
 {: .kw-details }
 
-### `block_size` {: .kw data-type="int" data-default="8" }
-`solver = block_lanczos` only: block width of the per-$\bQ$ block Lanczos. Shared with [`bse`](../bse/keywords.md), where the default is 1.
-
-With the default solver a value other than 8 refuses.
-{: .kw-details }
-
-### `solver_max_iter` {: .kw data-type="int" data-default="max(30, min(200, N/2)), or 40" }
-Iteration cap. Davidson: block iterations, by default $\max(30, \min(200, N/2))$ with $N$ the physical transition count. Block Lanczos: iterations, 40 by default; the Krylov dimension is block × iterations, capped at $N$.
-
-The block Lanczos always reorthogonalizes fully.
-{: .kw-details }
+### `solver_max_iter` {: .kw data-type="int" data-default="max(30, min(200, N/2))" }
+Cap on the Davidson's block iterations at each $\bQ$, with $N$ the physical transition count.
 
 ### `full_bse` {: .kw data-type="bool" data-default="false" }
 Solve the full BSE at every $\bQ$ of the path, with the coupling block between excitations at $\bQ$ and de-excitations at $-\bQ$ ([Theory](theory.md#full)). Off: the Tamm–Dancoff block $A(\bQ)$. Shared with [`bse`](../bse/keywords.md).

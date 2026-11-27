@@ -61,7 +61,6 @@
 ## Unlisted pages (not in the sidebar)
 
 - [Dependencies](https://jackmcarthur.github.io/lorrax/drivers/bse/dependencies/): manual/docs/drivers/bse/dependencies.md
-- [The FEAST route](https://jackmcarthur.github.io/lorrax/drivers/bse/feast/): manual/docs/drivers/bse/feast.md
 - [Dependencies](https://jackmcarthur.github.io/lorrax/drivers/exciton-bands/dependencies/): manual/docs/drivers/exciton-bands/dependencies.md
 - [Files](https://jackmcarthur.github.io/lorrax/drivers/exciton-bands/files/): manual/docs/drivers/exciton-bands/files.md
 - [exciton-bands driver](https://jackmcarthur.github.io/lorrax/drivers/exciton-bands/): manual/docs/drivers/exciton-bands/index.md

@@ -414,8 +414,7 @@ Inside ScaLAPACK calls the MKL thread team is capped at four threads, and the pr
 | `src/isdf/core.py` | `gemm_plan` in the ζ fit; `plan("solve_lu")` for the transverse ζ factor |
 | `src/bandstructure/htransform.py` | `plan("eigh")` for the fine-grid $f_H$ eigensolves |
 | `src/bse/vq_interp.py`, `src/bse/bsemat_export.py` | eigh of the BSE Coulomb interpolation; `plan_polar_factor` for gauge fixing on export |
-| `src/bse/bse_lanczos.py`, `src/bse/exciton_bands.py` | `plan_subspace` for Lanczos and thick-restart Lanczos |
-| `src/solvers/davidson_fixed.py`, `src/solvers/lanczos.py` | `plan_subspace`, `eigh_local` in the iterative eigensolvers |
+| `src/solvers/davidson_fixed.py`, `src/solvers/bse_sp_davidson.py`, `src/solvers/lanczos.py` | `plan_subspace`, `eigh_local` in the iterative eigensolvers |
 | `src/file_io/parallel_transport.py` | `plan_polar_factor` for the parallel-transport links |
 | `src/psp/run_dense_h.py` | dense DFT Hamiltonian eigh and its `roundoff_tol` check |
 | `src/common/zeta_projection.py` | `eigh_local` of the ζ Gram matrix |
