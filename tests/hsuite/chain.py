@@ -6,8 +6,10 @@ one runtime, one FFI load, one compile cache), in one shared run directory,
 in the order a user runs them:
 
     kmeans -> kin_ion -> dipole -> gwjax GN-PPM one-shot
-           -> BSE -> htransform
-           -> exciton bands -> restarted: COHSEX, tangential one-shot with
+           -> BSE (Tamm-Dancoff, then the full BSE with the Davidson and the
+              dense solver) -> htransform
+           -> exciton bands (Tamm-Dancoff, then the full BSE at every Q)
+           -> restarted: COHSEX, tangential one-shot with
               W and pole exports
            -> bispinor kin_ion, dipole -> four-current tangential QSGW
               (2 maps, fresh zeta; its map 0 is the one-shot)
@@ -211,13 +213,45 @@ htransform_qr_eps = 1e-2
 """
 # bse.exciton_bands: one conduction band, so the window's top band lies below
 # the fitted window's top (compute_wfns_fi refuses otherwise).
-EXCITED_DECK = _EXCITED_BASE + """\
+_EXCITED_BSE = """\
 number_val_bands_fine = 1
 number_cond_bands_fine = 1
 number_eigenvalues = 1
 solver_max_iter = 40
 band_degeneracy = off
-""" + _PATH
+"""
+EXCITED_DECK = _EXCITED_BASE + _EXCITED_BSE + _PATH
+
+# The full (non-Tamm-Dancoff) BSE stages: bse_full and bse_full_dense (bse.bse_jax
+# on the `bse` stage's window) and exciton_bands_full (bse.exciton_bands on the
+# `exciton_bands` stage's window and path).  On the DFT energies this fixture's
+# Tamm-Dancoff roots are negative (-0.89 eV, `bse` and `exciton_bands`
+# references): the resonant block A is not positive definite, so neither is
+# K = [[A, B], [B*, A*]], and the dense solve and the Davidson under
+# full_bse_instability = refuse refuse it by design.  The three stages therefore
+# read the DFT energies with a scissor: every conduction band above the occupied
+# set raised by FULL_BSE_SCISSOR_EV in a BerkeleyGW eqp file written from
+# gnppm_eqp1.dat's own DFT column (write_full_bse_eqp).  With one valence band
+# every transition energy rises by the same amount, so K -> K + s I and
+# lam_min(K) = lam_min(K at DFT) + s: positive whenever s > |lam_min| at DFT,
+# which |B| < 4 eV guarantees for s = 5 eV.  The kernel is unchanged (W and V
+# are those of the GN-PPM restart), so these are regression stages of the full
+# BSE's two solvers and of its finite-Q path, not an exciton calculation.
+FULL_BSE_SCISSOR_EV = 5.0
+FULL_BSE_EQP = "full_bse_eqp.dat"
+_FULL_BSE_COMMON = f"eqp_corrections = {FULL_BSE_EQP}\nfull_bse = true\n"
+# bse_jax refuses a dense solve that names solver_max_iter or davidson_tol_mev
+# away from their defaults (the dense solve has no iteration): the dense input
+# file drops the shared solver_max_iter = 40 that the GN-PPM deck carries.
+BSE_FULL_DECKS = {
+    "bse_full.in": GNPPM_DECK + _FULL_BSE_COMMON + "full_bse_solver = davidson\n",
+    "bse_full_dense.in": (GNPPM_DECK.replace("solver_max_iter = 40\n", "")
+                          + _FULL_BSE_COMMON + "full_bse_solver = dense\n"),
+}
+# exciton_bands reads the same three input keys; its Davidson reads
+# solver_max_iter (it refuses it under the dense solve) and `solver` stays default.
+EXCITED_FULL_DECK = (_EXCITED_BASE + _EXCITED_BSE + _FULL_BSE_COMMON
+                     + "full_bse_solver = davidson\n" + _PATH)
 
 HTRANSFORM_DECK = _EXCITED_BASE + _PATH_OFFGRID
 
@@ -495,6 +529,13 @@ STAGES = (
     # ~1 eV exciton binding of this weakly screened molecule, so the TDA
     # eigenvalues come out negative (-0.94, -0.78 eV).
     ("bse", "bse.bse_jax", ["-i", "gnppm.in", *_P, "--report-file", "bse.out"]),
+    # The full (non-Tamm-Dancoff) BSE on the same window, scissored (see
+    # FULL_BSE_SCISSOR_EV): the structure-preserving Davidson, then the dense
+    # solve; bse_full_dense must reproduce bse_full (CHECKS "stdout_twin").
+    ("bse_full", "bse.bse_jax",
+     ["-i", "bse_full.in", *_P, "--report-file", "bse_full.out"]),
+    ("bse_full_dense", "bse.bse_jax",
+     ["-i", "bse_full_dense.in", *_P, "--report-file", "bse_full_dense.out"]),
     ("htransform", "bandstructure.htransform",
      ["-i", "htransform.in", "--guard-bands", "1", "-o", "htransform.dat",
       "--report-file", "htransform.out"]),
@@ -505,6 +546,11 @@ STAGES = (
     ("exciton_bands", "bse.exciton_bands",
      ["-i", "excited.in", "--vq-mode", "ongrid", "--q-per-segment", "1", *_P,
       "--out-prefix", "exciton", "--report-file", "exciton.out"]),
+    # The full BSE at every Q of the same path (Davidson, scissored: see
+    # FULL_BSE_SCISSOR_EV), own output prefix and report.
+    ("exciton_bands_full", "bse.exciton_bands",
+     ["-i", "excited_full.in", "--vq-mode", "ongrid", "--q-per-segment", "1", *_P,
+      "--out-prefix", "exciton_full", "--report-file", "exciton_full.out"]),
     ("cohsex", "gw.gw_jax", ["-i", "cohsex.in"]),
     ("sp_export", "gw.gw_jax", ["-i", "sp_export.in"]),
     ("kin_ion_bisp", "gw.kin_ion_io", ["-i", "bisp_sc.in", "-o", "kin_ion_bisp.h5"]),
@@ -538,17 +584,26 @@ STAGES = (
 # Stages that run in a subdirectory of the run (their own fixture).
 _STAGE_DIR = {name: NA_DIR for name in ("na_dipole", "na_sc")}
 
+# One exciton root per line of a BSE driver's rank-0 log (bse.report_lines.exciton_energy_lines).
+BSE_ROOT_ROW = r"^\s*S\d+\s+([0-9.+-]+)\s*$"
+
 # What each stage leaves behind and how it is compared.
 #   eqp: eqp files (column compare); h5: numeric members; rows: whitespace
 #   tables (numeric columns after `skip`); text: regex list captured from a
-#   report and compared as floats.
+#   report and compared as floats; stdout_twin: the named stage's stdout_floats
+#   must agree with this stage's within ATOL["bse_ev"] (stdout_twin_problems),
+#   in addition to this stage's own reference.
 CHECKS = {
     "kin_ion": {"h5": ["kin_ion.h5"]},
     "dipole": {"h5": ["dipole.h5"]},
     "gnppm": {"eqp": ["gnppm_eqp0.dat", "gnppm_eqp1.dat"],
               "h5": ["gnppm_sigma.h5"]},
-    "bse": {"stdout_floats": r"^\s*S\d+\s+([0-9.+-]+)\s*$"},
+    "bse": {"stdout_floats": BSE_ROOT_ROW},
+    "bse_full": {"stdout_floats": BSE_ROOT_ROW},
+    # Its own reference, and the same roots as bse_full within ATOL["bse_ev"].
+    "bse_full_dense": {"stdout_floats": BSE_ROOT_ROW, "stdout_twin": "bse_full"},
     "exciton_bands": {"rows": [("exciton.dat", 6)]},
+    "exciton_bands_full": {"rows": [("exciton_full.dat", 6)]},
     "htransform": {"rows": [("htransform.dat", 6)]},
     "cohsex": {"eqp": ["cohsex_eqp0.dat", "cohsex_eqp1.dat"]},
     # The exported W bank is compared by value; the pole model (b, Lambda)
@@ -573,7 +628,7 @@ CHECKS = {
                 "h5": ["bsc_sigma.h5"],
                 "report_floats": ("bsc.out",
                                   r"SC iteration: call=\d+ .*?max\|dE\|=([0-9.e+-]+)")},
-    "bse_bisp": {"stdout_floats": r"^\s*S\d+\s+([0-9.+-]+)\s*$"},
+    "bse_bisp": {"stdout_floats": BSE_ROOT_ROW},
     "na_dipole": {"h5": ["dipole.h5"]},
     "na_sc": {"eqp": ["na_eqp0.dat", "na_eqp1.dat"],
               "h5": ["na_sigma.h5"],
@@ -663,6 +718,9 @@ def write_decks(run):
     (run / "gnppm.in").write_text(GNPPM_DECK.format(centroids=centroids))
     (run / "excited.in").write_text(EXCITED_DECK.format(centroids=centroids))
     (run / "htransform.in").write_text(HTRANSFORM_DECK.format(centroids=centroids))
+    (run / "excited_full.in").write_text(EXCITED_FULL_DECK.format(centroids=centroids))
+    for fname, deck in BSE_FULL_DECKS.items():
+        (run / fname).write_text(deck.format(centroids=centroids))
     for fname, deck in RESTART_DECKS.items():
         (run / fname).write_text(deck.format(centroids=centroids))
     return centroids
@@ -884,10 +942,14 @@ def captured(run, name, rule):
         got[f"{fname}:residuals"] = np.asarray([float(v) for v in re.findall(
             pattern, (run / fname).read_text(errors="replace"))])
     if "stdout_floats" in rule:
-        text = (run / f"{name}.rank0.log").read_text(errors="replace")
-        got["stdout"] = np.asarray([float(v) for v in re.findall(
-            rule["stdout_floats"], text, re.MULTILINE)])
+        got["stdout"] = _stdout_floats(run, name, rule["stdout_floats"])
     return got
+
+
+def _stdout_floats(run, name, pattern):
+    """The numbers ``pattern`` captures from a stage's rank-0 log."""
+    text = (run / f"{name}.rank0.log").read_text(errors="replace")
+    return np.asarray([float(v) for v in re.findall(pattern, text, re.MULTILINE)])
 
 
 def _tol(label):
@@ -1018,6 +1080,60 @@ def twin_problems(run, name, rule):
     return problems
 
 
+def stdout_twin_problems(run, name, twin, pattern=BSE_ROOT_ROW):
+    """Two BSE stages of this run must print the same roots.
+
+    ``bse_full_dense`` against ``bse_full``: the dense and the Davidson solve of
+    one operator, within ``ATOL["bse_ev"]`` (the Davidson stops at 0.01 meV; both
+    print five decimals).  Both rank-0 logs are in ``run``; a stage that was not
+    run (``--only``) or printed no root fails here rather than passing on an
+    empty comparison.  The measured margin is printed, pass or fail.
+    """
+    absent = [s for s in (name, twin) if not (run / f"{s}.rank0.log").is_file()]
+    if absent:
+        return [f"{name}: no rank-0 log of {s} (name it in --only)" for s in absent]
+    mine, other = (_stdout_floats(run, s, pattern) for s in (name, twin))
+    if mine.size == 0 or mine.shape != other.shape:
+        return [f"{name}: {mine.size} roots against {other.size} of {twin}"]
+    diff = float(np.max(np.abs(mine - other)))
+    print(f"hsuite {name}: roots max|diff| vs {twin} = {diff:.3e} eV "
+          f"(bound {ATOL['bse_ev']:.0e})", flush=True)
+    if not np.isfinite(diff) or diff > ATOL["bse_ev"]:
+        return [f"{name}: roots {mine.tolist()} differ from {twin}'s {other.tolist()} "
+                f"by {diff:.3e} eV > {ATOL['bse_ev']:.0e}"]
+    return []
+
+
+def write_full_bse_eqp(run, shift_ev=FULL_BSE_SCISSOR_EV, n_occ=3):
+    """``full_bse_eqp.dat``: DFT energies, bands above ``n_occ`` raised by ``shift_ev``.
+
+    Written from ``gnppm_eqp1.dat`` (BerkeleyGW layout, ``write_bgw_eqp``: a
+    ``(3f13.9, i8)`` header per k, then ``(2i8, 2f15.9)`` rows of spin, band,
+    E_DFT, E_QP): the block structure and the DFT column are the GN-PPM stage's
+    (the WFN's own energies), the QP column is DFT, plus the shift on the
+    conduction bands.  ``n_occ`` is the input file's ``nval``.  The shift is the
+    same at every k, so the star-symmetry check of the eqp reader sees none.
+    """
+    out = []
+    lines = (run / "gnppm_eqp1.dat").read_text().splitlines()
+    i = 0
+    while i < len(lines) and lines[i].strip() and not lines[i].lstrip().startswith("#"):
+        out.append(lines[i])
+        nb = int(lines[i].split()[3])
+        for row in lines[i + 1:i + 1 + nb]:
+            spin, band = int(row[:8]), int(row[8:16])
+            e_dft = float(row[16:31])
+            out.append(f"{spin:8d}{band:8d}{e_dft:15.9f}"
+                       f"{e_dft + (shift_ev if band > n_occ else 0.0):15.9f}")
+        i += 1 + nb
+    (run / FULL_BSE_EQP).write_text("\n".join(out) + "\n")
+
+
+# Files the lead writes before a stage, from earlier stages' outputs.
+_PREPARE = {name: write_full_bse_eqp
+            for name in ("bse_full", "bse_full_dense", "exciton_bands_full")}
+
+
 def reference_missing_line(name, *, written):
     """One line for a stage with no stored reference (``reference/<name>.npz``).
 
@@ -1085,6 +1201,8 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
         if lead:
             for rel in _CLEAR_BEFORE.get(name, ()):
                 shutil.rmtree(run / rel, ignore_errors=True)
+            if name in _PREPARE:
+                _PREPARE[name](where)
         rank_session.exchange(name)
         records, walls[name] = run_stage(where, name, module, argv, env, timeout)
         ranks[name] = [{k: rec[k] for k in ("rank", "rc", "hits", "gates")}
@@ -1108,6 +1226,8 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
             continue
         rule = CHECKS.get(name, {})
         problems += missing_lines(where, name)
+        if "stdout_twin" in rule:
+            problems += stdout_twin_problems(where, name, rule["stdout_twin"])
         if "twin" in rule:
             # Judged against another stage of this run, not a reference.
             problems += twin_problems(where, name, rule["twin"])

@@ -59,8 +59,11 @@ four-component stages retain that coverage and their numerical references.
 | dipole | `psp.get_dipole_mtxels` | dipole with analytic V_NL velocity |
 | gnppm | `gw.gw_jax` | fresh ζ fit, GN-PPM one-shot, `head_correction = full`, spectral_shell band extrapolation, local linalg |
 | bse | `bse.bse_jax` | TDA Davidson on the GN-PPM restart bundle, screened direct term (D + V − W) |
+| bse_full | `bse.bse_jax` | the full (non-Tamm–Dancoff) BSE on the `bse` stage's window (1 valence × 2 conduction bands, 2 roots), `full_bse = true`, `full_bse_solver = davidson` (structure-preserving Davidson, residual stop 0.01 meV, `solver_max_iter = 40`), on the scissored energies below; the rank-0 root table is compared with `chain.ATOL["bse_ev"]` |
+| bse_full_dense | `bse.bse_jax` | the same operator with `full_bse_solver = dense` (assembled K, at most 4096 transitions; its input file drops `solver_max_iter`, which `bse_jax` refuses under the dense solve). It has its own reference, and its roots must equal `bse_full`'s within `chain.ATOL["bse_ev"]` = 0.1 meV (`CHECKS["bse_full_dense"]["stdout_twin"]`, `chain.stdout_twin_problems`; the existing `twin` rule compares h5 members only) |
 | htransform | `bandstructure.htransform` | Galerkin band interpolation on a G–X–M path with two interior points per segment (`htransform.in`): the 5 × 5 × 1 grid has spacing 0.2, so the interior points at multiples of 2/15 are off the grid; the corners are on it |
 | exciton_bands | `bse.exciton_bands` | fH interpolation, then finite-Q TDA (1v × 1c) on the same path |
+| exciton_bands_full | `bse.exciton_bands` | the full BSE at every Q of the same G–X–M path (`--vq-mode ongrid`, `--q-per-segment 1`), `full_bse = true`, `full_bse_solver = davidson`, the same scissor; own `--out-prefix exciton_full` and `--report-file exciton_full.out`, `exciton_full.dat` compared as `exciton.dat` is. K at each Q is built from one joint-window interpolation (valence bands at k + Q for the antiresonant pair) and `W(q) = conj W(−q)` is measured once |
 | cohsex | `gw.gw_jax` | static COHSEX one-shot, restarted |
 | sp_export | `gw.gw_jax` | tangential one-shot with `write_w`/`write_poles` (the file-model path), restarted; the W bank is compared by value, the pole model by member shapes |
 | kin_ion_bisp | `gw.kin_ion_io` | four-component kinetic-balance kinetic + ionic matrix elements |
@@ -73,8 +76,23 @@ four-component stages retain that coverage and their numerical references.
 | na_dipole | `psp.get_dipole_mtxels` | the default dipole: q→0 velocity plus the parallel-transport link artifact |
 | na_sc | `gw.gw_jax` | metal tangential QSGW, 2 maps to a 1.5 eV criterion, production defaults: Fermi-Dirac fixed-N occupations and metal head, `number_bands_protected = 8` (QP matrix 1–8, tail 9–13), 2s and 2p read on two coarse windows at η 5 eV, `sc_semicore = dft`, the rigid tail with min(Z, 1/Z) weights, spectral_shell extrapolation, held Σ windows re-planned on escape, `write_qsgw_datasets`, the unnamed `sc_head_update`, which resolves to `parallel_transport` (the 3³ links fail `GATE pt_head_window_hybridized`, so the map runs with the Σ term D_kΔH zeroed) with its per-map head block, distributed linalg |
 
-The default chain has 18 driver stages (72 rank records at P4). Na reads the
+The default chain has 21 driver stages (84 rank records at P4). Na reads the
 fixed kinetic/ionic input; it is not counted as an executed or compared stage.
+
+The three full-BSE stages run on a scissored spectrum. On the DFT energies this
+fixture's Tamm–Dancoff roots are negative (−0.89 eV in the `bse` and
+`exciton_bands` references), so the resonant block A is not positive definite,
+neither is K = [[A, B], [B\*, A\*]], and the dense solve and the Davidson under
+`full_bse_instability = refuse` refuse it by design. Each of the three stages
+therefore reads `full_bse_eqp.dat` (`eqp_corrections`), which the lead rank
+writes from `gnppm_eqp1.dat` before the stage (`chain.write_full_bse_eqp`): the
+DFT column of that file, with every band above the three occupied ones raised by
+`chain.FULL_BSE_SCISSOR_EV` = 5 eV. With one valence band every transition rises
+by 5 eV, K → K + 5 eV·I, and K is positive definite unless ‖B‖ exceeds about 4 eV.
+The kernel (V and W of the GN-PPM restart) is unchanged. These stages are
+regression stages of the full BSE's two solvers and of the finite-Q path, not an
+exciton calculation; they need the `gnppm` stage's output, so `--only` must name
+`gnppm` (and its predecessors) with them.
 Its 56 orbit-closed centroids (fitted on the ζ legs, 8 × 13) are also stored
 in `fixture_na/`.
 
@@ -143,7 +161,16 @@ the removed `na_kin_ion`, refuse rather than pass an empty selection. The Na
 chain alone is `--only na_dipole na_sc` and uses the same fixed input.
 `--regenerate` rewrites driver output references only, never the Na input. Under `--regenerate missing` a stage without a reference prints `reference missing; written to reference/<stage>.npz` and is listed in `summary.json` `references_written_missing`; that run is no verdict for it. The `bisp_bt` reference (`bbt_eqp0/1.dat`, `bbt_sigma.h5`, `sigma_lorentz_oneshot.h5`) comes from the first P4 run on the hardening branch and is committed only after a numeric review of its transverse terms.
 `reference/walls.json` is a historical regeneration receipt, not a current
-stage-count or timing assertion.
+stage-count or timing assertion. Any `--regenerate` run rewrites it from that
+run's walls (with `--only`, from the stages it ran).
+
+The references of `bse_full`, `bse_full_dense` and `exciton_bands_full`
+(`reference/<stage>.npz`) are generated by one full run of
+`python3 -m tests.hsuite.chain --out DIR --regenerate missing` at P4: only a
+stage without a reference is written, the existing ones are compared as in a
+normal run, and the new files are committed after a numeric review (`bse_full_dense` must
+agree with `bse_full`, which the run checks first). Plain `--regenerate` rewrites
+every reference and should not be used for this.
 
 To replace the fixed Na operator after an intentional WFN, pseudopotential or
 operator change, run `python -m gw.kin_ion_io -i na.in` separately in a staged

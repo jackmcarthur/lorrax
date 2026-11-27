@@ -458,7 +458,9 @@ degenerate root at $103\,\mathrm i$ meV, is refused at iteration 5 by default an
 roots of negative norm at $-33$ meV. The reported $\lambda_{\min}$ agrees within 0.9 meV, and the
 mean of the six lowest d–d roots within 0.1 meV, with a perturbative calculation of the coupling
 block on the same kernels (five windows, kept outside the tree). The eigenvector file with $X$ and $Y$ was written at
-four ranks. The hsuite has no full-BSE row, so none of this is rerun by a suite.
+four ranks. No suite reruns these NiO results; the hsuite's full-BSE rows (`bse_full`, `bse_full_dense`,
+`exciton_bands_full`) run both solvers on the small H₂⁻ fixture, with a scissor that makes K positive
+definite ([hsuite README](../../tests/hsuite/README.md)).
 
 Block Lanczos seeds name physical support by its logical band/k extents,
 not a host transition mask or index list. The existing subspace layout
@@ -1065,6 +1067,6 @@ a frozen-kernel approximation, not that self-consistent ladder map.
   Davidson has run on GPU at 4 and 16 ranks on NiO up to 589,824 transitions (measured above) and
   on the CPU test payloads; no suite reruns the GPU cases. The matrix-free Lanczos
   (`solver='matrixfree'`) is not reachable from the CLI. No full-BSE route has a finite-$Q$ form
-  or the mini-BZ head tensor, and the hsuite has no full-BSE row.
+  or the mini-BZ head tensor. The hsuite's full-BSE rows cover the H₂⁻ fixture only.
 - `compute_mode = mpa` with `screening_diagrams = w_bse` refuses at setup
   (`GATE parent_screening_diagrams`, `file_io/restart_bundle.py`).
