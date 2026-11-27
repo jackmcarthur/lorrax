@@ -250,16 +250,30 @@ refuses (`GATE sp_davidson_operator`); the check runs on every block, the start 
 $\lambda_{\min}\le10^{-13}\max_i|(M_r)_{ii}|$ is a certificate that
 $\mathcal K$ is not positive definite: the reference state is unstable, and
 some root is imaginary, complex, or real and not positive. `on_indefinite =
-"refuse"` (the default) raises `GATE sp_davidson_definite` with the measured
-$\lambda_{\min}$, the iteration, and the option that continues.
+"refuse"` (the default) raises `GATE sp_davidson_definite` with
+$\lambda_{\min}(M_r)$ at the iteration where the sign first showed, the
+iteration, and the option that continues. That number is an upper bound of
+$\lambda_{\min}(\mathcal K)$, not a converged value: a NiO state unstable by
+$-72$ meV was refused at $-41$ meV in iteration 5.
 `"continue"` solves on. A general (QZ) solve of the small pencil identifies
 the unstable sector: complex roots, one representative with
 $\mathrm{Im}\,\omega>0$, $\mathrm{Re}\,\omega\ge0$ per pair or quadruplet, and
 real roots of positive type ($c^\dagger\mathrm iSc>0$) with $\omega\le0$.
+A root near zero is fixed only to $\varepsilon s^2/|\omega|$, $s$ the scale of
+$M_r$, so the real part of a non-real root counts as zero below a multiple of
+that (`ROOT_NOISE`): an imaginary root with a rounding-negative real part is
+still the representative of its pair. Degenerate representatives each take
+their own partner.
 Eigenvectors of roots that are not conjugate partners are $M_r$- and
-$S$-orthogonal, so on the $M_r$-orthogonal complement of that sector $M_r$ is
-positive definite again and the Cholesky solve gives the stable roots with all
-of the properties above. The returned order is unstable roots, non-positive
+$S$-orthogonal. With $K$ the real span of the sector and its partners, the
+complement $\{d:K^{\mathsf T}Sd=0\}=\{d:K^{\mathsf T}M_rd=0\}$ therefore holds
+the stable roots only, $M_r$ is positive definite on it, and the Cholesky
+solve gives the stable roots with all of the properties above. The better
+conditioned of the two descriptions is used: $M_rK$ loses
+$\varepsilon/|\lambda|$ digits in a soft direction of the sector, and the
+stable roots then stall at that level. Real roots of negative norm are
+$\Sigma$-orthonormalised inside a multiplet (a general solve returns any basis
+of it). The returned order is unstable roots, non-positive
 real roots, positive roots; an unstable root has $X^\dagger X-Y^\dagger Y=0$
 and is scaled to $X^\dagger X+Y^\dagger Y=1$. The restart keeps the unstable
 eigenvectors and their partners.
@@ -309,7 +323,22 @@ nontda_davidson_converged`). `info` also holds `pair_calls` (the
 $2n_b$ of the start block included), `pair_calls_per_root`,
 `root_corrections`, `restarts`, `lam_min`, `indefinite_at`, `n_unstable`,
 `n_negative`, `metric_asym`, `orth_err` and the measured `sigma_err`
-$=\max|X_i^\dagger X_j-Y_i^\dagger Y_j-\delta_{ij}|$.
+$=\max|X_i^\dagger X_j-Y_i^\dagger Y_j-\delta_{ij}|$. Under `"continue"` the
+unstable and non-positive roots take block rows; `n_stable_tested` is the
+number of positive roots certified, and a caller that needs `n_converge` of
+them gives the block that many margin rows (`GATE nontda_davidson_block`).
+
+`CONVERGED` certifies eigenpairs, not that they are the lowest. As for the
+planned Davidson, a root whose eigenvector neither the start block nor the
+corrections reach is not found. The BSE start block (the lowest transitions
+and five random vectors) reaches every symmetry sector. One case defeats it:
+an exactly diagonal operator, where a unit start vector is an exact
+eigenvector and the diagonal preconditioner returns the Ritz vector itself.
+There a start with fewer low-transition vectors than requested roots (a margin
+below five) converged to higher eigenpairs in 47 of 432 stress solves, and in
+none of 144 at the default margin of eight. The same stress run met `STALLED`
+with exact roots when a multiplet was larger than the block (3 of 100), and at
+$\lambda_{\min}=-10^{-12}$ of the scale, below what the pencil resolves.
 
 **Memory.** $W$ and $MW$ hold $2M$ vectors; $M$ counts real-form vectors and
 defaults to $20\,n_{converge}$ (the depth in iterations of the planned
