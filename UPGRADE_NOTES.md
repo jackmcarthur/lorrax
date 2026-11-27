@@ -73,7 +73,7 @@ soft locking, restarts under a priced basis, a residual stop.
   `davidson_tol_mev`. The refusal names `full_bse_solver` or the key to drop.
 - **A new refusal on the dense solves.** `GATE nontda_coupling_symmetric`: both
   `solve_nontda_definite_pencil` and `solve_nontda_product` stop when the
-  coupling block has $\lVert B - B^{\mathsf T}Vert / \lVert BVert$ above
+  coupling block has $\lVert B - B^{\mathsf T}\rVert / \lVert B\rVert$ above
   $10^{-6}$. They used to symmetrise $\mathcal K$ (or $A \pm B$) as round-off
   clean-up and return the roots of $(B + B^{\mathsf T})/2$ without saying so.
 - **Python callers.** `bse_nontda.solve_bse_nontda_sharded` takes each

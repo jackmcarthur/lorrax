@@ -1009,9 +1009,7 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 | route-ignored flag | `bse_jax.parse_args` | a flag set on a route that does not read it; a retired flag |
 | non-TDA reciprocity preflight | `bse_nontda.check_restart_reciprocity` | `the eigensolve` without `full_bse = false`, with W on: a restart whose W fails the q ↔ −q reciprocity check, before the dense build |
 | non-TDA dense size | `bse_nontda` (`_DENSE_N_MAX`) | `the eigensolve` without `full_bse = false` at N = n_c,pad · n_v,pad · N_k > 4096 on the dense solve; the message names `full_bse_solver = davidson`, which has no size limit |
-| `GATE nontda_coupling_symmetric` | `bse_nontda.refuse_asymmetric_coupling`, on both dense solves | the coupling block $B$ is not complex symmetric: $\lVert B - B^{\mathsf T}
-Vert / \lVert B
-Vert$ above $10^{-6}$ (a structural check, not a convergence tolerance); the message names `check_restart_reciprocity` |
+| `GATE nontda_coupling_symmetric` | `bse_nontda.refuse_asymmetric_coupling`, on both dense solves | the coupling block $B$ is not complex symmetric: $\lVert B - B^{\mathsf T}\rVert / \lVert B\rVert$ above $10^{-6}$ (a structural check, not a convergence tolerance); the message names `check_restart_reciprocity` |
 | `GATE nontda_davidson_converged` | `bse_nontda.refuse_unconverged_davidson` | `full_bse_solver = davidson`: any stop but CONVERGED at `davidson_tol_mev` (the cap `solver_max_iter`, a stall, no new directions), or a pair normalisation $\lvert X_i^\dagger X_j - Y_i^\dagger Y_j - \delta_{ij}\rvert$ above $10^{-8}$; before anything is written |
 | `GATE sp_davidson_definite` | `solvers.bse_sp_davidson.sp_davidson` | `full_bse_solver = davidson` with `full_bse_instability = refuse` (the default): the projected stability matrix is not positive definite, so $\mathcal K$ is not; the message gives the measured $\lambda_{\min}$ in Ry and names `full_bse_instability = continue` |
 | `GATE sp_davidson_operator` | the same | $\mathrm{Re}(P^\dagger M P)$ of a block asymmetric beyond $10^{-8}$: $A$ is not Hermitian or $B$ not symmetric (the dense route's `GATE nontda_coupling_symmetric`, measured on the applied operator) |
