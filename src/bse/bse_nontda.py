@@ -313,11 +313,42 @@ def _recover_xy(Z, N, n_eig):
     return Z / np.sqrt(np.abs(snorm))[None, :]
 
 
+#: Relative tolerance of the dense route's coupling-block symmetry gate, the same
+#: structural 1e-6 as the Hermiticity gate on A (not a convergence tolerance).
+_B_SYM_TOL = 1e-6
+
+
+def refuse_asymmetric_coupling(B, *, tol=_B_SYM_TOL) -> float:
+    """``GATE nontda_coupling_symmetric``: the coupling block must be complex
+    symmetric, ``B = B^T`` (the pair-exchange symmetry of ``B_{cv k, c'v'k'}``).
+
+    ``K = [[A, B], [B*, A*]]`` is Hermitian only if ``B = B^T``; the dense solves
+    symmetrise ``K`` (or ``A+-B``) as round-off cleanup, which would otherwise
+    replace an asymmetric ``B`` by ``(B + B^T)/2`` unseen.  Refuses on
+    ``||B - B^T|| / ||B|| > tol``; returns the measured value."""
+    B = np.asarray(B)
+    b_sym = float(np.linalg.norm(B - B.T) / max(np.linalg.norm(B), 1e-300))
+    if b_sym > tol:
+        raise ValueError(
+            f"GATE nontda_coupling_symmetric: non-TDA coupling block B is not "
+            f"complex symmetric (got: ||B - B^T|| / ||B|| = {b_sym:.2e}; want: "
+            f"<= {tol:g}).  Why: the pencil K = [[A,B],[B*,A*]] is Hermitian only "
+            f"for B = B^T, and the dense solve would silently replace B by "
+            f"(B + B^T)/2 and return roots of a different operator.  Fix: check "
+            f"the restart's W with bse_nontda.check_restart_reciprocity(data['W_q']) "
+            f"and the pair applier's B (the matrix-free route's kappa-metric gate "
+            f"measures the same property).  The threshold is a structural property "
+            f"of the operator, not a convergence tolerance.")
+    return b_sym
+
+
 def solve_nontda_definite_pencil(A, B, n_eig, *, pd_rtol=1e-10):
     """Dense structure-preserving solve of K z = omega Sigma z (host numpy).
 
     K = [[A,B],[B*,A*]] Hermitian; assert PD (else triplet/charge instability —
     (A-B) not positive definite => imaginary excitations; detected, not hidden).
+    Refuses an A that is not Hermitian and a B that is not complex symmetric
+    (:func:`refuse_asymmetric_coupling`) before it symmetrises K.
     Returns (omega[:n_eig] ascending, Z (2N, n_eig)) with X^H X - Y^H Y = +1."""
     A = np.asarray(A); B = np.asarray(B); N = A.shape[0]
     a_herm = np.linalg.norm(A - A.conj().T) / max(np.linalg.norm(A), 1e-300)
@@ -330,8 +361,9 @@ def solve_nontda_definite_pencil(A, B, n_eig, *, pd_rtol=1e-10):
             f"regenerate the restart with `python3 -u -m gw.gw_jax -i <deck>.in`. "
             f"The threshold is NOT the thing to move: it is a structural "
             f"property of the operator, not a convergence tolerance.")
+    refuse_asymmetric_coupling(B)
     K = np.block([[A, B], [B.conj(), A.conj()]])
-    K = 0.5 * (K + K.conj().T)
+    K = 0.5 * (K + K.conj().T)                       # round-off cleanup, after the gates
     w, U = np.linalg.eigh(K)
     if w.min() <= pd_rtol * max(w.max(), 1e-300):
         raise ValueError(
@@ -370,6 +402,7 @@ def solve_nontda_product(A, B, n_eig):
     multiplet's cross terms).  Returns ``(omega (n_eig,), Z (2N, n_eig))`` as
     :func:`solve_nontda_definite_pencil` does."""
     A = np.asarray(A); B = np.asarray(B); N = A.shape[0]
+    refuse_asymmetric_coupling(B)
     ApB, AmB = A + B, A - B
     for nm, C in (("A+B", ApB), ("A-B", AmB)):
         wc = np.linalg.eigvalsh(0.5 * (C + C.conj().T))

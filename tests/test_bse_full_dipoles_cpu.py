@@ -292,3 +292,21 @@ def test_parse_accepts_full_bse_with_dipoles(tmp_path):
     with pytest.raises(SystemExit):
         bse_jax.parse_args(["-i", _deck(tmp_path, [
             "full_bse = true", "dipole_file = dipole.h5", "haydock", "number_iterations = 10"])])
+
+
+def test_asymmetric_coupling_block_is_refused():
+    """``GATE nontda_coupling_symmetric``: B != B^T is refused by both dense solves, not symmetrised."""
+    rng = np.random.default_rng(7)
+    n = 24
+    Q, _ = np.linalg.qr(rng.standard_normal((n, n)))
+    A = (Q * np.sort(0.4 + 0.2 * rng.random(n))) @ Q.T
+    S = rng.standard_normal((n, n))
+    B = 0.01 * (S + S.T) / np.sqrt(n)                         # real symmetric, H real
+    R = rng.standard_normal((n, n))
+    R = (R - R.T) / np.sqrt(n)                                # antisymmetric
+    for solve in (solve_nontda_definite_pencil, solve_nontda_product):
+        solve(A.astype(complex), B.astype(complex), 4)                      # symmetric: accepted
+        solve(A.astype(complex), (B + 1e-9 * R).astype(complex), 4)         # below the gate: accepted
+        with pytest.raises(ValueError, match="GATE nontda_coupling_symmetric") as exc:
+            solve(A.astype(complex), (B + 1e-3 * R).astype(complex), 4)
+        assert "got:" in str(exc.value) and "want:" in str(exc.value)
