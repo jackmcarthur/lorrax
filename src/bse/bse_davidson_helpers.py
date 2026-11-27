@@ -589,7 +589,91 @@ def bse_diagonal_precond(
     return BSEDiagonalPreconditioner((eps_c, eps_v, diag_H), _impl)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  Full BSE: the paired diagonal preconditioner and its q = 0 slice of W
+# ═══════════════════════════════════════════════════════════════════════
+
+def w_q0_for_precond(data):
+    """The ``q = 0`` slice ``W_q[:, :, 0, 0, 0]`` of a payload's screened tile,
+    stashed on the payload as ``data['_W_q0_for_precond']``.
+
+    The exact diagonal's screened-direct term reads it
+    (:func:`build_bse_exact_diagonal`).  It must be taken before the solve's
+    donated transform consumes ``W_q``, and one stashed object makes the
+    diagonal's identity memo hit on a second solve of the same payload (the
+    two reasons ``bse_lanczos.solve_bse_sharded`` records at its own stash,
+    which uses the same key).  ``(n_mu, n_nu)`` at ``P('x', 'y')``, Ry.
+    """
+    if data.get("_W_q0_for_precond") is None:
+        if data.get("W_q") is None:
+            raise ValueError(
+                "the exact diagonal needs the q=0 slice of W_q, but this payload's "
+                "W_q has already been consumed by the donated ifft and no slice was "
+                "stashed.  Reload the payload.")
+        data["_W_q0_for_precond"] = data["W_q"][:, :, 0, 0, 0]
+    return data["_W_q0_for_precond"]
+
+
+def bse_pair_diagonal_precond(
+    eps_c,
+    eps_v,
+    *,
+    epsilon_shift: float = 1e-3,
+    sharding: Optional[NamedSharding] = None,
+    diag_H=None,
+):
+    """The full-BSE counterpart of :func:`bse_diagonal_precond`: the paired
+    correction ``[t_X; t_Y] = (H_D - omega)^-1 [R_X; R_Y]``.
+
+    ``H_D = diag(D, -D)`` is the diagonal of the full operator
+    ``H = [[A, B], [-B*, -A*]]``: ``A`` is Hermitian, so its diagonal ``D`` is
+    real and the lower block's is ``-D``; the coupling block ``B`` sits off
+    the diagonal of ``H`` and contributes nothing.  ``D`` is therefore the
+    Tamm-Dancoff operator's diagonal, from the same two sources: ``diag_H``
+    from :func:`build_bse_exact_diagonal` (the exact one,
+    ``dE + (w V_x - W_d) / nk``), or the bare ``dE = E_c - E_v`` when
+    ``diag_H`` is None.  The division is
+    ``solvers.bse_sp_davidson.sp_diagonal_precond``:
+
+        t_X = R_X / (D - omega + eps),     t_Y = -R_Y / (D + omega + eps).
+
+    Unlike the Tamm-Dancoff preconditioner it does not normalise its output
+    per row: ``t_X`` and ``t_Y`` are one direction and share one scale, which
+    the solver applies.  Elementwise on the ``(c, v, k)`` shards: no
+    collective.
+
+    Parameters
+    ----------
+    eps_c : (nk, nc) Ry — conduction energies, the operator's (head-shifted).
+    eps_v : (nk, nv) Ry
+    epsilon_shift : Ry, added to both denominators (default 1e-3).
+    sharding : NamedSharding of the ``(nc, nv, nk)`` diagonal, canonically
+        ``P('x', 'y', None)``.
+    diag_H : (nc, nv, nk) real, Ry, or None.
+
+    Returns
+    -------
+    BSEDiagonalPreconditioner
+        ``data = (eps_c, eps_v, diag_H)`` and
+        ``apply(data, RX, RY, omega) -> (tX, tY)`` on ``(m, nc, nv, nk)``
+        blocks with ``omega`` ``(m,)`` complex; pass both parts to the solver.
+        (The bundle's host call is ``precond(RX, RY, omega)`` here.)
+    """
+    from solvers.bse_sp_davidson import sp_diagonal_precond
+    from .bse_preconditioner import energy_diff_cv_k
+    divide = sp_diagonal_precond(epsilon_shift=epsilon_shift)
+
+    def _apply(data, RX, RY, omega):
+        eps_c_in, eps_v_in, diag_in = data
+        D = energy_diff_cv_k(eps_c_in, eps_v_in) if diag_in is None else diag_in
+        if sharding is not None:
+            D = jax.lax.with_sharding_constraint(D, sharding)
+        return divide(D, RX, RY, omega)
+
+    return BSEDiagonalPreconditioner((eps_c, eps_v, diag_H), _apply)
+
+
 __all__ = ["init_bse_subspace", "bse_diagonal_precond", "BSEDiagonalPreconditioner",
            "build_bse_exact_diagonal", "clear_exact_diagonal_memo",
            "exact_diagonal_memo_stats", "resolve_precond_route",
-           "EXACT_PRECOND_AUTO_MIN_DIM"]
+           "EXACT_PRECOND_AUTO_MIN_DIM", "bse_pair_diagonal_precond", "w_q0_for_precond"]

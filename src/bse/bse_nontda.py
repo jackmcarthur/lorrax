@@ -82,6 +82,21 @@ WHAT CHANGED 2026-08-08 (this header used to describe only the dense route)
   route is gated against, and the only route returning the complete spectrum.
   Flipping that default is an owner decision with its own A/B; nothing here
   moved it.
+
+THE DAVIDSON ROUTE (2026-11-27)
+-------------------------------
+``solver='davidson'`` runs the structure-preserving block Davidson
+(:mod:`solvers.bse_sp_davidson`) over the same pair applier, with what the
+Tamm-Dancoff Davidson has: the paired exact diagonal ``[D; -D]`` as
+preconditioner, the start block on the physical transitions, soft locking,
+margin roots, restarts under a priced basis capacity and a residual stop in
+meV that refuses when not met (:func:`_solve_nontda_davidson`).  No assembly,
+no size limit, every vector on the mesh's transition axes.  It is reached from
+``bse_jax`` by ``full_bse_solver = davidson``; the dense route is still what
+``full_bse = true`` runs by default.  A ``K`` that is not positive definite
+refuses with the measured ``lam_min``, or, under ``on_indefinite='continue'``
+(``full_bse_instability = continue``), is solved on with the unstable roots
+reported and kept in :data:`LAST_DAVIDSON`.
 """
 from __future__ import annotations
 
@@ -95,6 +110,9 @@ import jax.numpy as jnp
 from common.fft_helpers import make_kfft_kminor
 from .bse_ring_comm import make_bse_shardings
 from .bse_head import head_shifted_eps_c
+# The Davidson route's residual stop (meV), margin roots and basis admission
+# are the Tamm-Dancoff Davidson's.
+from .bse_lanczos import DAVIDSON_MARGIN_ROOTS, DAVIDSON_TOL_MEV, _price_davidson_basis
 from common.log import get_logger, message
 
 log = get_logger(__name__)
@@ -111,7 +129,9 @@ def _dense_refusal(N: int) -> str:
     """The one refusal text for a dense window over ``_DENSE_N_MAX``."""
     return (f"non-TDA dense window N={N} (n_cond x n_val x nk, mesh-padded) exceeds "
             f"_DENSE_N_MAX={_DENSE_N_MAX}: the dense structure-preserving solve "
-            "assembles A and B, O(N^2).  Alternatives: full_bse = false (the TDA Davidson, the "
+            "assembles A and B, O(N^2).  Alternatives: full_bse_solver = davidson (the "
+            "structure-preserving Davidson for the full BSE: no assembly, no size limit, "
+            "paired (X, Y) eigenvectors), full_bse = false (the TDA Davidson, the "
             "default eigensolve), feast = true (FEAST windows, refused unless converged to "
             "feast_tol_mev), or a smaller number_val_bands_fine / number_cond_bands_fine.  The matrix-free SDY "
             "route (bse_nontda solver='matrixfree') has no bse_jax flag.")
@@ -602,10 +622,236 @@ def _solve_nontda_matrix_free(pair, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
     return omega[order], Z[:, order]
 
 
+# ---------------------------------------------------------------------------
+# The Davidson route — structure-preserving block Davidson over the pair applier
+# ---------------------------------------------------------------------------
+# ``solvers.bse_sp_davidson`` on the same fused pair applier, with the pieces the
+# Tamm-Dancoff Davidson uses (``bse_davidson_helpers``): the start block on the
+# physical transitions, the exact diagonal, soft locking, margin roots, the
+# basis admission.  It keeps every vector on the mesh's transition axes; only
+# coefficient matrices cross it.  Reached from ``bse_jax`` by
+# ``full_bse_solver = davidson``; the dense route stays the default.
+
+#: Largest ``|X_i^H X_j - Y_i^H Y_j - delta_ij|`` accepted on the returned roots.
+#: The solver's normalisation is exact to rounding (1e-12 with ``|Y|^2`` of 1e4),
+#: so a larger value is a broken kernel, not a convergence matter.
+_DAVIDSON_SIGMA_TOL = 1e-8
+
+#: The last Davidson solve of the full BSE, for the driver's report (the role
+#: ``solvers.davidson.LAST_RUN`` has for the Tamm-Dancoff route): ``line`` (the
+#: stop line), ``info`` (the solver's), ``omega_ry`` (every block root, in the
+#: solver's order), ``n_special`` (unstable and non-positive roots, listed
+#: first), ``lam_min_ry``, and ``special_vectors``, the ``(n_special, 2, nc, nv,
+#: nk)`` pairs of those roots on the mesh's transition axes (None when there
+#: are none).
+LAST_DAVIDSON: dict = {}
+
+
+def refuse_unconverged_davidson(info, *, n_eig, tol_mev, budget) -> str:
+    """``GATE nontda_davidson_converged``: the Davidson stop as one line.
+
+    ``info`` is ``solvers.bse_sp_davidson.sp_davidson``'s.  Any stop but
+    CONVERGED on the tested roots refuses before the caller returns
+    eigenpairs, and so does a normalisation ``X_i^H X_j - Y_i^H Y_j`` off the
+    identity by more than ``_DAVIDSON_SIGMA_TOL``.  ``budget`` is the
+    iteration cap the solve ran under.
+    """
+    from solvers.bse_sp_davidson import CONVERGED, STALLED
+    from common.units import RYD_TO_EV
+    ry_mev = RYD_TO_EV * 1.0e3
+    n_test = int(info["n_tested"])
+    res = np.asarray(info["residuals"])[:n_test] * ry_mev
+    n_conv = int(np.sum(np.asarray(info["converged"])[:n_test]))
+    status = int(info["status"])
+    word = ("converged" if status == CONVERGED else
+            "STALLED" if status == STALLED else "NOT converged")
+    worst = float(np.max(res))
+    line = (f"full-BSE Davidson {word}: {n_conv}/{n_test} roots with residual < {tol_mev:g} meV "
+            f"in {int(info['iterations'])}/{int(budget)} iterations, {int(info['pair_calls'])} "
+            f"pair calls ({float(info['pair_calls']) / int(n_eig):.1f} per root), "
+            f"{int(info['restarts'])} restarts; max residual {worst:.3e} meV; "
+            f"lam_min {float(info['lam_min']) * ry_mev:.6g} meV; "
+            f"|X^H X - Y^H Y - 1| {float(info['sigma_err']):.1e}")
+    if status != CONVERGED:
+        raise RuntimeError(
+            f"GATE nontda_davidson_converged: {line} (got: status {info['status_name']}; want: "
+            f"CONVERGED).  Why: an unconverged root is not an eigenpair.  No eigenpairs were "
+            f"returned.  Fix: raise solver_max_iter (davidson_max_iter) or davidson_m_max, "
+            f"loosen davidson_tol_mev, or use the dense route (full_bse_solver = dense) inside "
+            f"its size limit.")
+    if not float(info["sigma_err"]) <= _DAVIDSON_SIGMA_TOL:
+        raise RuntimeError(
+            f"GATE nontda_davidson_converged: {line} (got: |X_i^H X_j - Y_i^H Y_j - delta_ij| = "
+            f"{float(info['sigma_err']):.3e}; want: <= {_DAVIDSON_SIGMA_TOL:g}).  Why: the "
+            f"solver normalises the pairs exactly, so this is a broken subspace kernel, and "
+            f"dipoles of such pairs are wrong.  No eigenpairs were returned.  Fix: run the "
+            f"dense route (full_bse_solver = dense) and report the measured value.")
+    return line
+
+
+def _solve_nontda_davidson(pair, args, data, mesh_xy, sh, n_eig, *, include_W, w_q0,
+                           davidson_tol_mev, davidson_max_iter, davidson_m_max,
+                           davidson_margin, davidson_margin_tol_mev, davidson_precond,
+                           davidson_eps_shift_Ry, davidson_n_random_init, on_indefinite,
+                           davidson_plan_key):
+    """Lowest ``n_eig`` (omega, X, Y) by the structure-preserving Davidson.
+
+    ``pair`` and ``args`` are the fused pair applier and its 9 operands
+    (:func:`_full_matvec_and_args`, the caller's ``include_W``); ``w_q0`` is
+    the ``q = 0`` slice of ``W_q`` for the exact diagonal (None without W or
+    with the bare diagonal).  The options are ``solve_bse_nontda_sharded``'s.
+
+    Returns ``(omega_Ry (n_eig,) host, pairs (n_eig, 2, nc, nv, nk) on
+    P(None, None, 'x', 'y', None), info)``; the snapshot is :data:`LAST_DAVIDSON`.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.units import RYD_TO_EV
+    from solvers.bse_sp_davidson import basis_capacity, sp_davidson
+    from .bse_davidson_helpers import (bse_pair_diagonal_precond, build_bse_exact_diagonal,
+                                       init_bse_subspace, resolve_precond_route)
+
+    ry_mev = RYD_TO_EV * 1.0e3
+    psi_c_X, psi_v_Y, eps_c, eps_v, V_q0, M = (args[i] for i in (0, 3, 4, 5, 7, 8))
+    nk = int(data["nkx"]) * int(data["nky"]) * int(data["nkz"])
+    nc, nv = int(data["n_cond_pad"]), int(data["n_val_pad"])
+    n_cond, n_val = int(data["n_cond"]), int(data["n_val"])
+    channel = data.get("exchange_channel", "singlet")
+    if data.get("head_tensor") is not None:
+        raise ValueError(
+            "GATE nontda_head_tensor: the full-BSE pair applier has no head-tensor term "
+            "(got: a payload with head_tensor; want: none).  Why: the head would be dropped "
+            "from A and B without a word.  Fix: solve this payload with the Tamm-Dancoff "
+            "Davidson (full_bse = false).")
+
+    # The diagonal of H = [[A, B], [-B*, -A*]] is [D; -D], D the diagonal of A
+    # (bse_davidson_helpers.bse_pair_diagonal_precond): the Tamm-Dancoff one.
+    route = resolve_precond_route(davidson_precond, nc * nv * nk)
+    diag_sh = NamedSharding(mesh_xy, P("x", "y", None))
+    diag = None
+    if route == "exact":
+        diag = build_bse_exact_diagonal(eps_c, eps_v, psi_c_X, psi_v_Y, w_q0, M, V_q0, nk,
+                                        sharding=diag_sh, exchange_channel=channel)
+    log.info("full-BSE Davidson preconditioner: " + (
+        f"exact diagonal of A, dE + (V_x{' - W_d' if include_W else ''})/nk" if route == "exact"
+        else "bare dE") + ", paired as [D; -D]")
+    pre = bse_pair_diagonal_precond(eps_c, eps_v, epsilon_shift=float(davidson_eps_shift_Ry),
+                                    sharding=diag_sh, diag_H=diag)
+
+    # Margin roots and the start block on the physical transitions, as the
+    # Tamm-Dancoff route builds them.
+    n_phys = n_cond * n_val * nk
+    n_solve = n_eig + max(0, min(int(davidson_margin), n_phys // 2 - n_eig))
+    X0 = init_bse_subspace(eps_c, eps_v, n_eig=n_solve, n_cond=n_cond, n_val=n_val,
+                           n_random=int(davidson_n_random_init), mesh=mesh_xy, sharding=sh.X)
+    cap = basis_capacity(davidson_m_max, n_solve, n_eig, nc * nv * nk)
+    log.info(f"full-BSE Davidson: {n_eig} roots + {n_solve - n_eig} margin"
+             + ("" if davidson_margin_tol_mev is None else
+                f" (locked at {float(davidson_margin_tol_mev):g} meV)")
+             + f", basis capacity {cap} real-form vectors, storing {2 * cap} trial vectors "
+               f"(basis and images); instability: {on_indefinite}")
+    _price_davidson_basis(cap, X0, mesh_xy)
+    tol_ry = float(davidson_tol_mev) / ry_mev
+    omega, X, Y, info = sp_davidson(
+        lambda payload, Z, s: pair(Z, s, *payload[0]), X0,
+        precondition=lambda payload, RX, RY, om: pre.apply(payload[1], RX, RY, om),
+        data=(args, pre.data), n_converge=n_eig, capacity=cap, max_iter=int(davidson_max_iter),
+        tol=tol_ry, lock_converged=True,
+        margin_lock=(1.0 if davidson_margin_tol_mev is None else
+                     max(1.0, float(davidson_margin_tol_mev) / float(davidson_tol_mev))),
+        on_indefinite=on_indefinite, verbose=False,      # the stop line below is this route's
+        refusal_notes={
+            "definite": "The energy unit here is Ry.  In bse_jax: full_bse_instability = continue "
+                        "(solve_bse_nontda_sharded: on_indefinite='continue').  No eigenpairs "
+                        "were returned.",
+            "operator": "In the BSE: the restart's W (bse_nontda.check_restart_reciprocity on "
+                        "W_q) or the pair applier is at fault; full_bse_solver = dense names a "
+                        "stale restart and assembles A and B to compare with A = A^H, B = B^T."},
+        plan_key=(None if davidson_plan_key is None else (
+            davidson_plan_key, mesh_xy, bool(include_W), channel, route,
+            float(davidson_eps_shift_Ry),
+            tuple((tuple(a.shape), str(a.dtype)) for a in args))))
+
+    line = refuse_unconverged_davidson(info, n_eig=n_eig, tol_mev=float(davidson_tol_mev),
+                                       budget=int(davidson_max_iter))
+    log.info(line)
+    n_special = int(info["n_unstable"]) + int(info["n_negative"])
+    if n_special + n_eig > n_solve:
+        raise RuntimeError(
+            f"GATE nontda_davidson_block: the block of {n_solve} roots holds {n_special} unstable "
+            f"or non-positive root(s) and only {n_solve - n_special} of the {n_eig} requested "
+            f"positive ones (got: davidson_margin = {n_solve - n_eig}; want: >= {n_special}).  "
+            f"Why: the roots returned as excitons are the positive ones above the unstable "
+            f"sector.  Fix: davidson_margin >= {n_special}.")
+    omega = np.asarray(omega)
+    root_sh = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
+    lo, hi = n_special, n_special + n_eig
+    pairs = jax.jit(lambda x, y: jnp.stack([x[lo:hi], y[lo:hi]], axis=1),
+                    out_shardings=root_sh)(X, Y)
+    special = None
+    if n_special:
+        special = jax.jit(lambda x, y: jnp.stack([x[:n_special], y[:n_special]], axis=1),
+                          out_shardings=root_sh)(X, Y)
+        for j in range(n_special):
+            w = complex(omega[j])
+            kind = "unstable" if j < int(info["n_unstable"]) else "non-positive"
+            log.warning(
+                f"full BSE: {kind} root {j + 1}: omega = {w.real * ry_mev:+.6f} "
+                f"{w.imag * ry_mev:+.6f} i meV (residual "
+                f"{float(info['residuals'][j]) * ry_mev:.3e} meV); the reference state is not "
+                f"a minimum (lam_min = {float(info['lam_min']) * ry_mev:.6g} meV)")
+    LAST_DAVIDSON.clear()
+    LAST_DAVIDSON.update(line=line, info=info, omega_ry=omega, n_special=n_special,
+                         lam_min_ry=float(info["lam_min"]), special_vectors=special)
+    return np.real(omega[lo:hi]), pairs, info
+
+
+#: The options each route of ``solve_bse_nontda_sharded`` reads, with their
+#: defaults.  An option set on a route that does not read it refuses.
+_ROUTE_OPTIONS = {
+    "dense": {},
+    "matrixfree": dict(mf_m_max=140, mf_n_keep=40, mf_n_restarts=50, mf_tol_mev=MF_TOL_MEV),
+    "davidson": dict(davidson_tol_mev=DAVIDSON_TOL_MEV, davidson_max_iter=200,
+                     davidson_m_max=None, davidson_margin=DAVIDSON_MARGIN_ROOTS,
+                     davidson_margin_tol_mev=None,
+                     davidson_precond="exact", davidson_eps_shift_Ry=1e-3,
+                     davidson_n_random_init=5, on_indefinite="refuse",
+                     davidson_plan_key=None),
+}
+
+
+def _route_options(solver, options):
+    """``options`` checked against :data:`_ROUTE_OPTIONS` and completed with
+    the route's defaults.  Refuses an unknown solver, an unknown option, and an
+    option another route reads."""
+    if solver not in _ROUTE_OPTIONS:
+        raise ValueError(
+            f"solve_bse_nontda_sharded: solver must be one of "
+            f"{', '.join(repr(s) for s in _ROUTE_OPTIONS)}, got {solver!r}")
+    owner = {key: route for route, opts in _ROUTE_OPTIONS.items() for key in opts}
+    unknown = sorted(key for key in options if key not in owner)
+    if unknown:
+        raise ValueError(
+            f"solve_bse_nontda_sharded: unknown option(s) {unknown} (got: "
+            f"{unknown}; want: one of n_eig, include_W, recip_tol, solver, "
+            f"{', '.join(sorted(owner))}).  Why: an option this "
+            f"route does not read would be dropped silently and the solve would run "
+            f"with a setting you did not ask for.  Fix: correct the spelling, or "
+            f"drop the option.")
+    foreign = sorted(key for key in options if owner[key] != solver)
+    if foreign:
+        raise ValueError(
+            f"GATE nontda_route_option: option(s) "
+            f"{', '.join(f'{key} (read by solver={owner[key]!r})' for key in foreign)} "
+            f"cannot be honoured by solver={solver!r} (got: {foreign}; want: only "
+            f"{sorted(_ROUTE_OPTIONS[solver]) or 'no route option'}).  Why: the solve would "
+            f"run without the setting you asked for.  Fix: name the solver that reads "
+            f"{'it' if len(foreign) == 1 else 'them'}, or drop "
+            f"{'it' if len(foreign) == 1 else 'them'}.")
+    return {**_ROUTE_OPTIONS[solver], **options}
+
+
 def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
-                             recip_tol=_NONTDA_RECIP_TOL, solver="dense",
-                             mf_m_max=140, mf_n_keep=40, mf_n_restarts=50,
-                             mf_tol_mev=MF_TOL_MEV, **unknown):
+                             recip_tol=_NONTDA_RECIP_TOL, solver="dense", **options):
     """Non-TDA (full BSE) lowest-eigenvalue solve — one entry, dispatched on B.
 
     Returns ``(eigenvalues_Ry (n_eig,), eigenvectors (n_eig, 2, nc, nv, nk),
@@ -619,14 +865,17 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
     ``max|W(q) - conj(W(-q))| / max|W|`` (:func:`check_restart_reciprocity`);
     ``None`` measures without refusing.
 
-    ``solver`` selects the route:
+    ``solver`` selects the route; ``options`` are the selected route's
+    (:data:`_ROUTE_OPTIONS` holds the defaults).  An option of another route
+    refuses (GATE nontda_route_option), as does an unknown one.
 
     ``'dense'`` (default)
         Assemble ``A`` and ``B`` and diagonalise on the host.  ``O(N^2)``
         memory, ``2N`` half-applications, hard-walled at
         ``_DENSE_N_MAX``.  This is the ORACLE and it is not going away: it is
-        what the matrix-free route is gated against, and it is the only route
+        what the other routes are gated against, and it is the only route
         that returns the complete spectrum or individual matrix elements.
+        No options.
 
     ``'matrixfree'``
         SDY Algorithm 4 (:mod:`solvers.bse_sp_lanczos`) over the fused pair
@@ -636,19 +885,32 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
         definiteness; see ``_solve_nontda_matrix_free``).
         Restart cycles stop when every root's ω residual is below
         ``mf_tol_mev`` (cap ``mf_n_restarts``); a capped stop refuses
-        (GATE nontda_converged)."""
-    if unknown:
-        raise ValueError(
-            f"solve_bse_nontda_sharded: unknown option(s) {sorted(unknown)} (got: "
-            f"{sorted(unknown)}; want: one of n_eig, include_W, recip_tol, solver, "
-            f"mf_m_max, mf_n_keep, mf_n_restarts, mf_tol_mev).  Why: an option this "
-            f"route does not read would be dropped silently and the solve would run "
-            f"with a setting you did not ask for.  Fix: correct the spelling, or "
-            f"drop the option.")
-    if solver not in ("dense", "matrixfree"):
-        raise ValueError(
-            f"solve_bse_nontda_sharded: solver must be 'dense' or "
-            f"'matrixfree', got {solver!r}")
+        (GATE nontda_converged).  Options ``mf_m_max``, ``mf_n_keep``,
+        ``mf_n_restarts``, ``mf_tol_mev``.
+
+    ``'davidson'``
+        The structure-preserving block Davidson (:mod:`solvers.bse_sp_davidson`)
+        over the same applier, preconditioned by the paired exact diagonal
+        ``[D; -D]`` and started on the lowest physical transitions
+        (``bse_davidson_helpers``).  No assembly and no size limit; two pair
+        calls per open root per iteration; every vector stays on the mesh.
+        ``bse_jax``: ``full_bse_solver = davidson``.  Options:
+        ``davidson_tol_mev`` (0.01; every root's residual
+        ``||H z - omega z|| / ||z||`` below it, else GATE
+        nontda_davidson_converged), ``davidson_max_iter`` (200),
+        ``davidson_m_max`` (basis capacity in real-form vectors; default
+        ``20 n_eig``, storage twice that), ``davidson_margin`` (8 roots solved
+        above ``n_eig`` and not returned), ``davidson_margin_tol_mev`` (their
+        lock; default the tolerance), ``davidson_precond`` (``exact``, ``bare``,
+        ``auto``), ``davidson_eps_shift_Ry`` (1e-3), ``davidson_n_random_init``
+        (5), ``davidson_plan_key`` (reuse the compiled kernels across
+        same-shape payloads) and ``on_indefinite``: ``'refuse'`` (default)
+        raises GATE sp_davidson_definite with the measured ``lam_min`` when
+        ``K = [[A, B], [B*, A*]]`` is found not positive definite;
+        ``'continue'`` solves on, logs the unstable root(s) and returns the
+        ``n_eig`` positive roots above them (:data:`LAST_DAVIDSON` keeps the
+        unstable ones and their vectors)."""
+    opts = _route_options(solver, options)
     sh = make_bse_shardings(mesh_xy)
     _log0 = log.info
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
@@ -660,13 +922,24 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
     if include_W and data.get("W_q") is not None:
         check_restart_reciprocity(data["W_q"], tol=recip_tol, log=_log0,
                                   input_file=data.get("input_file"))
+    w_q0 = None
+    if solver == "davidson" and include_W and opts["davidson_precond"] != "bare":
+        # Before the transform below consumes W_q: the exact diagonal's slice.
+        from .bse_davidson_helpers import w_q0_for_precond
+        w_q0 = w_q0_for_precond(data)
     pair, args = _full_matvec_and_args(data, mesh_xy, sh, include_W=include_W)
     N = nc * nv * nk
+    if solver == "davidson":
+        from common.collectives import replicate_to_mesh
+        omega, pairs, info = _solve_nontda_davidson(
+            pair, args, data, mesh_xy, sh, n_eig, include_W=include_W, w_q0=w_q0, **opts)
+        return (replicate_to_mesh(np.asarray(omega), mesh_xy), pairs,
+                jnp.int32(int(info["iterations"])))
     if solver == "matrixfree":
         omega, Z = _solve_nontda_matrix_free(
             pair, mesh_xy, sh, args, nc, nv, nk, n_eig,
-            m_max=mf_m_max, n_keep=mf_n_keep, n_restarts=mf_n_restarts,
-            tol_mev=mf_tol_mev, log=_log0)
+            m_max=opts["mf_m_max"], n_keep=opts["mf_n_keep"],
+            n_restarts=opts["mf_n_restarts"], tol_mev=opts["mf_tol_mev"], log=_log0)
         evecs = np.stack([Z[:N, :].T.reshape(n_eig, nc, nv, nk),
                           Z[N:, :].T.reshape(n_eig, nc, nv, nk)], axis=1)
         return jnp.asarray(omega), _on_mesh(evecs, mesh_xy), jnp.int32(0)

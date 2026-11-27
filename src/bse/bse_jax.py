@@ -125,8 +125,11 @@ def _preview_lanczos(
     cell_volume: float | None = None,
     kgrid: tuple | None = None,
     report=None,
+    full_bse_solver: str = "dense",
+    full_bse_instability: str = "refuse",
 ) -> dict:
-    if not tda and kgrid is not None:
+    full_davidson = not tda and full_bse_solver == "davidson"
+    if not tda and not full_davidson and kgrid is not None:
         # GATE nontda_dense_size before the restart load and the W transform.
         from math import prod
         from .bse_densify import _resolve_kgrid_fine
@@ -236,7 +239,14 @@ def _preview_lanczos(
     block_max_iter = max(1, max_lanczos_iter // max(1, block_size))
     mode = (f"convergence-driven (rtol={rtol:.1e}, every {check_every} iters)"
             if rtol > 0 else "fixed")
-    if not tda:
+    if full_davidson:
+        log.info(f"Full BSE: structure-preserving Davidson on the {bse_dim}-state window "
+                 f"(paired trial vectors over the pair applier A X + B conj(X), no dense "
+                 f"assembly): {int(n_eig)} roots + up to {int(davidson_margin)} margin, "
+                 f"≤ {block_max_iter} iterations, residual stop {float(davidson_tol_mev):g} meV, "
+                 f"{davidson_precond} diagonal preconditioner; an unstable reference state: "
+                 f"{full_bse_instability}")
+    elif not tda:
         log.info(f"Full BSE: dense structure-preserving solve of the {bse_dim}-state "
                  f"window (A and B assembled, host eigh of K z = omega Sigma z); "
                  f"the Davidson, Lanczos and TRLan settings are not read")
@@ -258,6 +268,10 @@ def _preview_lanczos(
                                 f"{int(block_size)}, at most {block_max_iter} iterations"
                                 + (f", stops at relative change {rtol:.1e}" if rtol > 0
                                    else ""))
+        elif full_davidson:
+            stage_row("solver", f"structure-preserving Davidson for the full BSE, {int(n_eig)} "
+                                f"roots + up to {int(davidson_margin)} margin, at most "
+                                f"{block_max_iter} iterations")
         else:
             stage_row("solver", f"dense structure-preserving full BSE, "
                                 f"{int(n_eig)} of {int(bse_dim)} roots")
@@ -277,6 +291,7 @@ def _preview_lanczos(
                                     float(davidson_margin_tol_mev) / (RYD_TO_EV * 1.0e3)),
             trlan_m_max=trlan_m_max, trlan_n_keep=trlan_n_keep,
             keep_W_R=haydock is not None,
+            full_solver=full_bse_solver, full_on_indefinite=full_bse_instability,
         )
         _sec.watch(eigenvalues, eigenvectors)
         _sec.result(f"{int(n_eig)} roots of the {int(bse_dim)}-state "
@@ -295,6 +310,9 @@ def _preview_lanczos(
     if solver_kind == "davidson" and tda:
         stopped = _davidson_report(n_eig=n_eig, tol_mev=float(davidson_tol_mev),
                                    budget=block_max_iter, dim=bse_dim)
+    stability_rows = ()
+    if full_davidson:
+        stopped, stability_rows = _full_davidson_report()
     ryd2ev = 13.6056980659
     log.info(f"Lowest {n_eig} eigenvalues (Ry): {eigenvalues}")
     log.info(f"Lowest {n_eig} eigenvalues (eV): {eigenvalues * ryd2ev}")
@@ -469,7 +487,8 @@ def _preview_lanczos(
                               f"eigenvectors.h5, {int(n_write)} states"
                               + (" with <0|r|S>" if dipoles is not None else "")),
                 roots_file=_files_text(roots_files), trim=trim,
-                extra_rows=(() if stopped is None else (("eigensolve", stopped),)))
+                extra_rows=(() if stopped is None else (("eigensolve", stopped),))
+                + tuple(stability_rows))
         _emit_results(report, results(True), results(False))
 
     return {
@@ -497,6 +516,29 @@ def _davidson_report(*, n_eig, tol_mev, budget, dim):
              f"{max(30, min(200, int(dim) // 2))} at dim {int(dim)}"),
         refused="No eigenvector, spectrum or Haydock output was written.",
         fix="raise solver_max_iter or davidson_m_max, or loosen davidson_tol_mev")
+
+
+def _full_davidson_report():
+    """The full-BSE Davidson's stop line (the RESULTS ``eigensolve`` row) and
+    its ``stability`` rows, from ``bse_nontda.LAST_DAVIDSON``.  The solve has
+    already refused any stop but CONVERGED (``GATE nontda_davidson_converged``)
+    and, unless ``full_bse_instability = continue``, an indefinite stability
+    matrix (``GATE sp_davidson_definite``).  The rows give ``lam_min`` of
+    ``K = [[A, B], [B*, A*]]`` in meV and every unstable (complex) or
+    non-positive root the solve found; those are not among the roots written."""
+    import numpy as np
+    from .bse_nontda import LAST_DAVIDSON as run
+    ry_mev = RYD_TO_EV * 1.0e3
+    lam, n_special = float(run["lam_min_ry"]) * ry_mev, int(run["n_special"])
+    rows = [("stability", f"lam_min(K) = {lam:.6g} meV: " + (
+        "K = [[A, B], [B*, A*]] is positive definite on the solved space" if n_special == 0
+        and run["info"]["indefinite_at"] is None else
+        "K = [[A, B], [B*, A*]] is NOT positive definite, the reference state is unstable"))]
+    for j, w in enumerate(np.asarray(run["omega_ry"])[:n_special]):
+        w = complex(w) * ry_mev
+        rows.append((f"unstable root {j + 1}", f"omega = {w.real:+.6f} {w.imag:+.6f} i meV; "
+                     "not written to the eigenvalue or eigenvector files"))
+    return run["line"], tuple(rows)
 
 
 def _files_text(paths) -> str:
@@ -798,6 +840,26 @@ def _settings_parser():
              "because Davidson stores V and HV.",
     )
     parser.add_argument(
+        "--full-bse-solver", choices=("dense", "davidson"), default="dense",
+        help="Eigensolver of the full BSE (full_bse = true).  ``dense`` (the "
+             "default): A and B assembled, host eigensolve, N <= 4096.  "
+             "``davidson``: the structure-preserving block Davidson over the pair "
+             "applier A X + B conj(X) (solvers.bse_sp_davidson), no assembly and no "
+             "size limit, stopped when every root's residual is below "
+             "--davidson-tol-mev.  It reads solver_max_iter, davidson_tol_mev, "
+             "davidson_margin, davidson_margin_tol_mev, davidson_m_max (basis "
+             "capacity in real-form vectors, default 20 n_eig; storage twice that), "
+             "davidson_precond and davidson_eps_shift.",
+    )
+    parser.add_argument(
+        "--full-bse-instability", choices=("refuse", "continue"), default="refuse",
+        help="full_bse_solver = davidson: what to do when K = [[A, B], [B*, A*]] is "
+             "found not positive definite (an unstable reference state: an imaginary "
+             "or non-positive root).  ``refuse`` (default) stops with the measured "
+             "lam_min.  ``continue`` solves on, reports the unstable root(s) in the "
+             "log and RESULTS, and writes the positive roots above them.",
+    )
+    parser.add_argument(
         "--trlan-m-max", type=int, default=None,
         help="Thick-restart Lanczos: basis slots (the memory cap). "
              "Default max(3*n_eig, 60). The useful range is 3-5x n_eig.",
@@ -885,6 +947,8 @@ BSE_KEYS = {
     "dipole_file": Key("dipole", "path"),
     "dipole_position_fix": Key("dipole_position_fix", "bool"),
     "full_bse": Key("tda", "bool", convert=lambda full: not full),
+    "full_bse_solver": Key("full_bse_solver", choices=("dense", "davidson")),
+    "full_bse_instability": Key("full_bse_instability", choices=("refuse", "continue")),
     "local_fields": Key("rpa", "bool"),
     "number_eigenvalues": Key("n_eig", "int"),
     "write_eigenvectors": Key("write_eigs", "int", convert=_write_eigenvectors),
@@ -974,6 +1038,7 @@ _ROUTE_DESTS = {
         "davidson_precond", "davidson_olsen", "davidson_eps_shift",
         "davidson_m_max", "davidson_tol_mev", "davidson_margin",
         "davidson_margin_tol_mev", "trlan_m_max", "trlan_n_keep",
+        "full_bse_solver", "full_bse_instability",
         "eqp", "n_occ", "band_degeneracy", "degeneracy_tol_ry", "dipole",
         "dipole_position_fix", "helicity_table", "qp_rotations", "haydock",
         "number_iterations", "delta_frequency", "polarization",
@@ -997,6 +1062,13 @@ _SOLVER_DESTS = {
                  "davidson_margin_tol_mev"},
     "trlan": {"trlan_m_max", "trlan_n_keep"},
 }
+
+#: The Davidson settings ``full_bse_solver = davidson`` reads (with the shared
+#: ``davidson_tol_mev`` and ``solver_max_iter``).  ``davidson_olsen`` is not
+#: among them: the paired preconditioner has no Olsen projection.
+_FULL_DAVIDSON_DESTS = frozenset({
+    "davidson_precond", "davidson_eps_shift", "davidson_m_max", "davidson_tol_mev",
+    "davidson_margin", "davidson_margin_tol_mev"})
 
 
 def _deck_settings(input_file, parser):
@@ -1087,23 +1159,52 @@ def parse_args(argv=None):
                      "of the QP state: the first relabels DFT bands with diagonal "
                      "QP energies, the second rotates them into the eigenbasis of "
                      "H_QP; choose one")
+    if route == "lanczos" and args.tda:
+        full_only = sorted(
+            f"`{dest}`" for dest in ("full_bse_solver", "full_bse_instability")
+            if getattr(args, dest) != schema.get_default(dest))
+        if full_only:
+            parser.error(
+                f"{', '.join(full_only)} {'is' if len(full_only) == 1 else 'are'} read "
+                f"with full_bse = true only (the Tamm-Dancoff eigensolve is selected by "
+                f"`solver`) and would be ignored; set full_bse = true or drop "
+                f"{'it' if len(full_only) == 1 else 'them'}")
     if route == "lanczos" and not args.tda:
-        # full_bse = true takes the dense structure-preserving solve
-        # (bse_lanczos.solve_bse_sharded -> bse_nontda), which reads n_eig and
-        # the kernel only: the same unread-key rule as above.
+        # full_bse = true takes bse_lanczos.solve_bse_sharded -> bse_nontda.  Its
+        # dense solve (full_bse_solver = dense, the default) reads n_eig and the
+        # kernel only; full_bse_solver = davidson reads _FULL_DAVIDSON_DESTS too.
+        # The same unread-key rule as above.
+        full_davidson = args.full_bse_solver == "davidson"
+        read = _FULL_DAVIDSON_DESTS if full_davidson else frozenset()
         unread = sorted(
             f"`{name(dest)}`"
             for dest in {"solver", "max_lanczos_iter"}.union(*_SOLVER_DESTS.values())
-            if name(dest) not in _SHARED_KEYS
+            if dest not in read and name(dest) not in _SHARED_KEYS
             and getattr(args, dest) != schema.get_default(dest))
+        if unread and full_davidson:
+            parser.error(
+                f"{', '.join(unread)} {'is' if len(unread) == 1 else 'are'} not "
+                f"read by full_bse_solver = davidson (the structure-preserving Davidson "
+                f"reads solver_max_iter, davidson_tol_mev, davidson_margin, "
+                f"davidson_margin_tol_mev, davidson_m_max, davidson_precond and "
+                f"davidson_eps_shift; it has no Olsen correction and no Lanczos or TRLan "
+                f"setting) and would be ignored; drop "
+                f"{'it' if len(unread) == 1 else 'them'}")
         if unread:
             parser.error(
                 f"{', '.join(unread)} {'is' if len(unread) == 1 else 'are'} not "
                 f"read by full_bse = true (the dense structure-preserving solve "
                 f"returns the lowest n_eig roots with no Davidson, Lanczos or "
                 f"TRLan iteration) and would be ignored; drop "
-                f"{'it' if len(unread) == 1 else 'them'}, or set full_bse = false "
+                f"{'it' if len(unread) == 1 else 'them'}, set full_bse_solver = davidson "
+                f"for the full-BSE Davidson, or set full_bse = false "
                 f"for the eigensolve that reads {'it' if len(unread) == 1 else 'them'}")
+        if not full_davidson and args.full_bse_instability != "refuse":
+            parser.error(
+                "`full_bse_instability` is read by full_bse_solver = davidson only: the "
+                "dense solve refuses a K = [[A, B], [B*, A*]] that is not positive "
+                "definite and has no continued solve; set full_bse_solver = davidson "
+                "or drop it")
     if route == "lanczos" and args.tda:
         wrong = sorted(
             f"`{name(dest)}`"
@@ -1155,6 +1256,7 @@ def settings_rows(args, *, source) -> tuple:
     use_tda = args.tda
     include_w = not (args.rpa or not args.bse)
     basis_file = args.qp_rotations or args.eqp
+    full_davidson = not use_tda and args.full_bse_solver == "davidson"
     rows = (
         Setting("full_bse", "off" if use_tda else "on", source("full_bse"),
                 "Tamm-Dancoff Hermitian BSE" if use_tda else
@@ -1162,27 +1264,40 @@ def settings_rows(args, *, source) -> tuple:
         Setting("kernel", getattr(args, "kernel_name", "singlet") if include_w else "local_fields",
                 source("spin_singlet", "spin_triplet", "local_fields", "spinor"),
                 getattr(args, "kernel_label", "")),
-        Setting("solver", "dense" if not use_tda else
-                "block_lanczos" if args.solver == "lanczos" else str(args.solver),
-                "derived" if not use_tda else source("solver"),
-                ("dense structure-preserving solve of the assembled A and B (host eigh); "
-                 "no iteration, so no Davidson, Lanczos or TRLan setting is read"
-                 if not use_tda else
-                 f"block of {int(args.n_eig)} roots + up to {int(args.davidson_margin)} "
-                 f"margin, {args.davidson_precond} "
-                 f"diagonal preconditioner; trial-stack matvec"
-                 if args.solver == "davidson" else
-                 f"block size {int(args.block_size)}, {int(args.n_eig)} roots; "
-                 "trial-stack matvec")),
-        (None if not use_tda else      # the dense full solve has no stopping rule to show
+        (Setting("full_bse_solver", "davidson", source("full_bse_solver"),
+                 f"structure-preserving Davidson (paired trial vectors over the pair applier "
+                 f"A X + B conj(X)): block of {int(args.n_eig)} roots + up to "
+                 f"{int(args.davidson_margin)} margin, {args.davidson_precond} diagonal "
+                 f"preconditioner paired as [D; -D]; no dense assembly")
+         if full_davidson else
+         Setting("solver", "dense" if not use_tda else
+                 "block_lanczos" if args.solver == "lanczos" else str(args.solver),
+                 "derived" if not use_tda else source("solver"),
+                 ("dense structure-preserving solve of the assembled A and B (host eigh); "
+                  "no iteration, so no Davidson, Lanczos or TRLan setting is read"
+                  if not use_tda else
+                  f"block of {int(args.n_eig)} roots + up to {int(args.davidson_margin)} "
+                  f"margin, {args.davidson_precond} "
+                  f"diagonal preconditioner; trial-stack matvec"
+                  if args.solver == "davidson" else
+                  f"block size {int(args.block_size)}, {int(args.n_eig)} roots; "
+                  "trial-stack matvec"))),
+        (None if not use_tda and not full_davidson else   # the dense full solve has no stopping rule
          Setting("davidson_tol_mev", f"{float(args.davidson_tol_mev):g}",
                  source("davidson_tol_mev"),
                  "stop when every root's residual is below this (meV)")
-         if args.solver == "davidson" else
+         if full_davidson or args.solver == "davidson" else
          Setting("lanczos_rtol", f"{float(args.lanczos_rtol):g}", source("lanczos_rtol"),
                  f"stop at this relative change, checked every "
                  f"{int(args.lanczos_check_every)} iterations"
                  if args.lanczos_rtol > 0.0 else "fixed Krylov dimension: no convergence test")),
+        (Setting("full_bse_instability", str(args.full_bse_instability),
+                 source("full_bse_instability"),
+                 "K = [[A, B], [B*, A*]] not positive definite: the run refuses with the "
+                 "measured lam_min" if args.full_bse_instability == "refuse" else
+                 "K = [[A, B], [B*, A*]] not positive definite: the solve continues, reports "
+                 "the unstable roots and writes the positive ones above them")
+         if full_davidson else None),
         Setting("qp_rotations_file" if args.qp_rotations else "eqp_corrections",
                 os.path.basename(str(basis_file)) if basis_file else "none",
                 source("qp_rotations_file", "eqp_corrections", "eqp_co_corrections"),
@@ -1255,8 +1370,10 @@ def _report_environment(report, args):
     sym = wfn.symmetry()
     report.environment(wfn=wfn, lines=(
         "Transition data: distributed band and centroid blocks on X x Y",
-        "Eigensolve path: " + policy(
-            args.solver, ("lanczos", "davidson", "trlan")),
+        "Eigensolve path: " + (
+            policy(args.solver, ("lanczos", "davidson", "trlan")) if args.tda else
+            "structure-preserving Davidson, full BSE" if args.full_bse_solver == "davidson"
+            else "dense structure-preserving solve, full BSE"),
         "Eigenvectors   : " + (
             "written to a separate numerical artifact"
             + (" with per-state dipoles <0|r|S>" if args.dipole else "")
@@ -1374,6 +1491,8 @@ def main(argv=None) -> int:
             cell_volume=float(wfn.cell_volume),
             kgrid=tuple(int(n) for n in wfn.kgrid),
             report=report,
+            full_bse_solver=args.full_bse_solver,
+            full_bse_instability=args.full_bse_instability,
         )
 
         wfn.close()

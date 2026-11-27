@@ -162,6 +162,8 @@ def solve_bse_sharded(
     davidson_margin: int = DAVIDSON_MARGIN_ROOTS,
     davidson_margin_tol_Ry: float | None = None,
     davidson_plan_key=None,
+    full_solver: str = "dense",
+    full_on_indefinite: str = "refuse",
 ) -> Tuple[jax.Array, jax.Array]:
     """The BSE eigensolve (Lanczos / block / Davidson / TRLan) on any mesh.
 
@@ -191,9 +193,19 @@ def solve_bse_sharded(
     dispatches to the structure-preserving full-BSE eigensolver
     ``bse_nontda.solve_bse_nontda_sharded`` — the ONE non-TDA seam, no parallel
     solver stack — which returns paired (X, Y) eigenvectors (X^H X - Y^H Y = +1).
-    The full route reads ``n_eig`` and ``include_W`` only: it is the dense
-    structure-preserving solve, so every Davidson, Lanczos and TRLan argument
-    below is unread there (``bse_jax`` refuses such deck keys under ``full_bse``).
+    ``full_solver`` picks its route.  ``'dense'`` (default) reads ``n_eig`` and
+    ``include_W`` only: it is the dense structure-preserving solve, so every
+    Davidson, Lanczos and TRLan argument below is unread there (``bse_jax``
+    refuses such deck keys under ``full_bse``).  ``'davidson'`` is the
+    structure-preserving Davidson (``solvers.bse_sp_davidson``): it reads
+    ``max_iter`` (the iteration cap), ``davidson_tol_Ry``, ``davidson_m_max``
+    (basis capacity in real-form vectors, default ``20 n_eig``),
+    ``davidson_margin``, ``davidson_margin_tol_Ry``, ``davidson_precond``,
+    ``davidson_eps_shift_Ry``, ``davidson_n_random_init``,
+    ``davidson_plan_key`` and ``full_on_indefinite`` (``'refuse'`` or
+    ``'continue'``: what to do when the stability matrix is not positive
+    definite, ``bse_nontda.solve_bse_nontda_sharded``); it refuses
+    ``davidson_olsen`` and ``keep_W_R``, which it cannot honour.
 
     ``davidson_tol_Ry`` is the Davidson stopping rule: every root's residual
     norm ``||H x - θ x||`` below it (times ``max(1, |θ|)``).  For a Hermitian H
@@ -216,8 +228,39 @@ def solve_bse_sharded(
     """
     if not tda:
         from .bse_nontda import solve_bse_nontda_sharded
+        if full_solver == "dense":
+            if full_on_indefinite != "refuse":
+                raise ValueError(
+                    f"GATE nontda_route_option: full_on_indefinite={full_on_indefinite!r} cannot "
+                    "be honoured by the dense full-BSE solve (got: full_solver='dense'; want: "
+                    "full_solver='davidson').  Why: the dense solve refuses a stability matrix "
+                    "that is not positive definite and has no continued solve.  Fix: "
+                    "full_solver='davidson' (bse_jax: full_bse_solver = davidson).")
+            return solve_bse_nontda_sharded(
+                data, mesh_xy, n_eig=n_eig, include_W=include_W)
+        unsupported = [name for name, on in (("davidson_olsen", davidson_olsen),
+                                             ("keep_W_R", keep_W_R)) if on]
+        if full_solver != "davidson" or unsupported:
+            raise ValueError(
+                "GATE nontda_route_option: the full-BSE route cannot honour "
+                + (f"full_solver={full_solver!r}" if full_solver != "davidson" else
+                   " and ".join(unsupported))
+                + " (want: full_solver 'dense' or 'davidson'; with 'davidson', no Olsen "
+                  "correction and no kept W_R).  Why: the paired preconditioner has no Olsen "
+                  "projection and the full solve consumes W_q without leaving W_R on the "
+                  "payload; the solve would run without what you asked for.  Fix: drop the "
+                  "option.")
         return solve_bse_nontda_sharded(
-            data, mesh_xy, n_eig=n_eig, include_W=include_W)
+            data, mesh_xy, n_eig=n_eig, include_W=include_W, solver="davidson",
+            davidson_tol_mev=float(davidson_tol_Ry) * RY_TO_MEV,
+            davidson_max_iter=int(max_iter), davidson_m_max=davidson_m_max,
+            davidson_margin=int(davidson_margin),
+            davidson_margin_tol_mev=(None if davidson_margin_tol_Ry is None else
+                                     float(davidson_margin_tol_Ry) * RY_TO_MEV),
+            davidson_precond=davidson_precond,
+            davidson_eps_shift_Ry=float(davidson_eps_shift_Ry),
+            davidson_n_random_init=int(davidson_n_random_init),
+            on_indefinite=full_on_indefinite, davidson_plan_key=davidson_plan_key)
 
     sh = make_bse_shardings(mesh_xy)
     nc_pad = int(data["n_cond_pad"])
