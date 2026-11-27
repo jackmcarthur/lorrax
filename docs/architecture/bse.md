@@ -179,6 +179,14 @@ and $1$ for spinors,
 whose pair amplitude already sums both components
 (`bse_preconditioner.exchange_spin_weight`, applied at every exchange encode).
 The Tamm–Dancoff approximation keeps $A$; the RPA kernel drops $W$ and $W^B$.
+With occupations $f$ per spin-orbital the pairs are those with $f_v > f_c$ and the kernel is
+scaled on both sides, $A = D + \sqrt{\Delta f}\,K_A\sqrt{\Delta f}$ and
+$B = \sqrt{\Delta f}\,K_B\sqrt{\Delta f'}$ ($\Delta f = f_v - f_c$ of the resonant pairs,
+$\Delta f'$ of the antiresonant ones, the same set at $Q = 0$); a pair with $\Delta f \le 0$ is
+masked, with $10^3$ Ry on its diagonal. The applier carries the weights as operands
+(`occupations=True`; `bse_preconditioner.occupation_weight_cv_k`) and the dense solve and the
+Davidsons solve a payload that has `occupation_weights`. No driver builds them: the loader splits
+the bands at one integer ([Limits](#limits)).
 The screened kernel and the Tamm–Dancoff problem are the defaults.
 `spin_triplet = true` selects the scalar triplet; `local_fields = true`
 drops the screened direct term. `full_bse = true` selects the full resonant
@@ -565,7 +573,21 @@ four ranks. No suite reruns these NiO results; the hsuite's full-BSE rows (`bse_
 `exciton_bands_full`) run both solvers on the small H₂⁻ fixture, with a scissor that makes K positive
 definite ([hsuite README](../../tests/hsuite/README.md)).
 
-<!-- GPU-NUMBERS-FINITE-Q: to be filled by the author -->
+Measured at a finite pair momentum on GPU (Perlmutter, four ranks, one A100 each, 2026-11-27,
+commits 1e1bfe433 and ea0886248; a synthetic 128-transition spinor payload with four independent
+orbital sets, run on the job's own 2×2 process mesh): the four blocks of $\mathcal K$ from the
+production applier equal a NumPy assembly from the pair-function definition to
+$1.9\times10^{-16}$ (relative), with and without the head tensor; the dense solve is within
+$4\times10^{-14}$ eV and the Davidson within $2\times10^{-11}$ eV of `eig` of that matrix (12
+iterations, 328 pair calls for 6 roots); an indefinite $\mathcal K$ refuses and, under `continue`,
+returns its two special roots and the positive roots within $6\times10^{-11}$ eV. In the same jobs
+NiO $4^3$ at $4v\times16c$ gave what it gave before the pair applier changed: Tamm–Dancoff 14
+iterations and 212 matvecs, the full Davidson 15 iterations and 440 pair calls with the eight dense
+roots to the $10^{-8}$ eV printed, and the same with the Olsen correction. On one node, alternating
+runs of the Tamm–Dancoff Davidson at $12v\times32c$ (24,576 transitions, warm compile cache) took
+11.65 s on main against 11.15 s and 12.05 s on the branch for the eigensolve, with the same 14
+iterations, 218 matvecs and roots. The driver itself at four ranks is the hsuite's
+`exciton_bands_full` stage; no material has been run through the finite-$Q$ full BSE.
 
 **Exciton bands with `full_bse`.** `bse.exciton_bands` reads three input keys of `bse.bse_jax` for
 this problem: `full_bse`, `full_bse_solver = dense | davidson` (default `dense`; the dense solve is
@@ -1163,6 +1185,20 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 | Haydock device count | `absorption_haydock.run_haydock` | fewer than two devices |
 
 ## Limits
+
+- Occupations are an operator and solver capability, not an input key. The loader splits the
+  bands at one integer (`highest_occupied_band`, else the WFN's electron count), so a window in
+  which a partially filled band is both a valence and a conduction band cannot be loaded, and the
+  occupations are not read from the WFN. A Python caller that builds the payload sets
+  `occupation_weights` (and the partner's at a finite pair momentum). Per-state dipoles and
+  spectra do not carry $\sqrt{\Delta f}$.
+- At a finite pair momentum the Davidson searches the roots of positive type from a start block
+  $[X_0; 0]$. Its stability margin $\lambda_{\min}$ is a bound from above on
+  $\lambda_{\min}(\mathcal K)$ over the space it built: an instability that shows only as a root
+  of negative type at $\Omega \ge 0$ (a non-positive root of the $-Q$ problem) is not searched
+  for, and `full_bse_instability = refuse` then does not fire. In a crystal with inversion or
+  time reversal $\Omega_i(-Q) = \Omega_i(Q)$, the same instability is the lowest root of
+  positive type at $Q$, and it is found. The dense solve tests $\mathcal K$ itself.
 
 - A four-current bundle is read only with a stored W0: the BSE direct term has
   no packed CC/CT/TC/TT handoff (`gw.static_screening.build_static_w_from_restart`). The stored W0

@@ -389,6 +389,23 @@ unstable and non-positive roots take block rows; `n_stable_tested` is the
 number of positive roots certified, and a caller that needs `n_converge` of
 them gives the block that many margin rows (`GATE nontda_davidson_block`).
 
+The unpaired form has three limits of its own, from a stress run against dense `eig`
+(2026-11-27; the operator, its routes, padding and gates passed without findings).
+(1) Its start block is $[X_0; 0]$ with unit vectors at the lowest $D$, while the roots of a
+decoupled operator order by $(D - D')/2 + \sqrt{((D + D')/2)^2 - |B_{tt}|^2}$. On operators whose
+blocks are exactly diagonal it stopped `CONVERGED` in two iterations on the invariant subspace of
+its unit vectors and returned a root up to 0.1 eV too high at the default margin of eight (26
+cases; 1.4 to 5.5 eV with fewer unit vectors than a multiplet's copies or a soft mode at a high
+diagonal). Every rotated operator (648 solves) gave the roots or a flagged stop. (2)
+$\lambda_{\min}$ bounds $\lambda_{\min}(\mathcal K)$ only over the space built: an indefinite
+$\mathcal K$ whose unstable direction is a root of negative type at $\Omega > 0$ returned
+`CONVERGED` under `refuse` with a positive $\lambda_{\min}$ and the right positive roots. The
+paired form cannot miss this (its start spans both sectors and the soft mode is its lowest root);
+the unpaired form would need one guard root of negative type, which it does not solve for. (3) A
+positive definite $\mathcal K$ with $0 < \lambda_{\min} < 10^{-13}$ of its largest diagonal entry
+is treated as not definite (both forms, the floor above); under `continue` its soft root is then
+logged with the special roots and not returned with the positive ones.
+
 `CONVERGED` certifies eigenpairs, not that they are the lowest. As for the
 planned Davidson, a root whose eigenvector neither the start block nor the
 corrections reach is not found. The BSE start block (the lowest transitions

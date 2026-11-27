@@ -66,11 +66,23 @@ and [the eigensolver page](docs/architecture/iterative_eigensolvers.md#the-unpai
   exciton-band input file that did name `full_bse = true` now gets the full BSE where it got the
   Tamm–Dancoff roots. Iteration counts move only for input files that named one of the settings
   of the first bullet.
-- **Measured, CPU only.** The unpaired Davidson's roots equal the dense ones within
-  $4\times10^{-14}$ eV on synthetic pencils of 240 transitions. On the 128-transition test payload
-  at $Q = 0$ with the partner set equal to the payload's own orbitals, it takes 328 pair calls where
-  the paired form takes 376, same roots. Olsen leaves the roots as they were: 436 pair calls without
-  it, 438 with it at the default shift. No GPU number is reported for the finite-$Q$ route.
+- **Occupation weights, for a Python caller.** A payload with `occupation_weights`
+  ($\sqrt{f_v - f_c}$ per transition) is solved as $A = D + \sqrt{\Delta f}K\sqrt{\Delta f}$, $B$
+  likewise, with zero-weight pairs masked, by the dense full solve and the Davidsons. No input
+  key reaches it: the loader still splits the bands at one integer.
+- **Measured.** CPU: the unpaired Davidson's roots equal the dense ones within
+  $4\times10^{-14}$ eV on synthetic pencils of 240 transitions; on the 128-transition test payload
+  at $Q = 0$ with the partner set equal to the payload's own orbitals it takes 328 pair calls where
+  the paired form takes 376, same roots; Olsen leaves the roots as they were (436 pair calls
+  without it, 438 with it at the default shift). GPU, four ranks: the finite-$Q$ blocks equal the
+  definition to $1.9\times10^{-16}$ and both solves match `eig` on the synthetic payload; NiO
+  $4^3$ at $Q = 0$ reproduces its earlier roots and counts; the driver suite passes with its three
+  new stages. No material has been run through the finite-$Q$ full BSE.
+- **Limits a stress run found in the unpaired Davidson** (the operator passed): on operators with
+  exactly diagonal blocks it can stop on the invariant subspace of its start vectors; its
+  stability margin does not see an instability that is a negative-type root at $\Omega > 0$
+  (in a crystal with inversion or time reversal the same instability is its lowest root, and is
+  found). Both are in [the eigensolver page](docs/architecture/iterative_eigensolvers.md#structure-preserving-davidson).
 
 ## 2026-11-27 — Full BSE: a structure-preserving Davidson (`full_bse_solver = davidson`), unstable roots reported, dense reference in Cholesky form
 
