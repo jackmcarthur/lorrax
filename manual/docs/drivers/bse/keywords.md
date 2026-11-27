@@ -50,6 +50,18 @@ Optional
 ### `full_bse` {: .kw data-type="bool" data-default="false" }
 Solve the full $\begin{pmatrix}A&B\\-B^*&-A^*\end{pmatrix}$ problem. Off: the Tamm–Dancoff resonant block $A$, as in BerkeleyGW. With `dipole_file` the per-state dipoles take both halves of the paired eigenvector ([Theory](theory.md#abs-ds)) and the spectra are written as under the TDA; the Haydock recursion needs the TDA.
 
+### `full_bse_solver` {: .kw data-type="enum" data-default="dense" }
+Eigensolver of the full BSE; read with `full_bse = true` only. `dense` assembles $A$ and $B$ and solves on the host (up to 4096 transitions). `davidson` is a structure-preserving block Davidson with no size limit; it reads `solver_max_iter`, `davidson_tol_mev`, `davidson_margin`, `davidson_margin_tol_mev`, `davidson_m_max`, `davidson_precond` and `davidson_eps_shift`. Under `full_bse = true`, `solver` other than `davidson` and `block_size` other than 1 refuse.
+
+`dense` `davidson`
+{: .kw-values }
+
+### `full_bse_instability` {: .kw data-type="enum" data-default="refuse" }
+What `full_bse_solver = davidson` does when the stability matrix of the full problem is not positive definite. `refuse` stops with the measured lowest eigenvalue; `continue` solves on, reports each unstable root, and writes the positive roots above them. The dense solver always refuses.
+
+`refuse` `continue`
+{: .kw-values }
+
 ### `spin_singlet`, `spin_triplet` {: .kw data-type="bool" data-default="singlet" }
 Non-spinor WFN only: the singlet kernel $D + 2V - W$ (default) or the triplet kernel $D - W$. BerkeleyGW: `spin_singlet`, `spin_triplet`.
 
@@ -151,7 +163,7 @@ Basis control of the band interpolation, on the [htransform](../../utilities/htr
 Number of lowest eigenpairs. BerkeleyGW: `number_eigenvalues`.
 
 ### `solver` {: .kw data-type="enum" data-default="davidson" }
-Eigensolver of the TDA problem. `davidson`: block Davidson with the exact diagonal preconditioner, stopped when every root's residual is below `davidson_tol_mev`. `block_lanczos`: block Lanczos at a fixed Krylov dimension or to `lanczos_rtol`. `trlan`: thick-restart Lanczos within `trlan_m_max` slots. A key that only another solver reads refuses. The full BSE (`full_bse`) uses the dense non-TDA solver.
+Eigensolver of the TDA problem. `davidson`: block Davidson with the exact diagonal preconditioner, stopped when every root's residual is below `davidson_tol_mev`. `block_lanczos`: block Lanczos at a fixed Krylov dimension or to `lanczos_rtol`. `trlan`: thick-restart Lanczos within `trlan_m_max` slots. A key that only another solver reads refuses. The full BSE (`full_bse`) does not read it: its solver is `full_bse_solver`, and a value other than `davidson` refuses.
 
 BerkeleyGW's `diagonalization` (dense), `diagonalization_primme` and `lanczos` (a Lanczos spectrum) are other methods, so their names are not used.
 {: .kw-details }
@@ -166,7 +178,7 @@ Iteration budget of every solver, with $N$ the transition count: Davidson's cap 
 Davidson stopping rule in meV: every root's residual $\lVert Hx - \Omega x\rVert$ below it. A solve that reaches `solver_max_iter` first refuses (`GATE davidson_converged`).
 
 ### `davidson_precond`, `davidson_margin`, `davidson_margin_tol_mev`, `davidson_m_max`, `davidson_olsen`, `davidson_eps_shift` {: .kw data-type="mixed" data-default="exact, 8, davidson_tol_mev, 10·n_eig, false, 1e-3" }
-Davidson internals: the preconditioner diagonal (`exact`, `bare`, `auto`), extra unreported roots and the residual at which they lock, the subspace size, the Olsen correction, the regularization in Ry.
+Davidson internals: the preconditioner diagonal (`exact`, `bare`, `auto`), extra unreported roots and the residual at which they lock, the subspace size, the Olsen correction, the regularization in Ry. `davidson_m_max` counts basis vectors: 10·n_eig by default on the Tamm–Dancoff route, 20·n_eig real-form vectors on the full route (`full_bse_solver = davidson`). `davidson_olsen` is not read on the full route.
 
 ### `block_size`, `lanczos_rtol`, `lanczos_check_every`, `lanczos_n_reorth` {: .kw data-type="mixed" data-default="1, 0, 4, −1" }
 `block_lanczos` internals: block width, convergence threshold (0 = fixed dimension) and its cadence, reorthogonalization window (−1 = full; keep it for spinor spectra).
