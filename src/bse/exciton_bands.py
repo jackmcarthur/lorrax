@@ -150,6 +150,7 @@ from runtime.run_session import RunSession
 from .bse_head import head_shifted_eps_c
 from .bse_deck import (DeckError, Key, check_fine_grid_keys, deck_params, deck_source,
                        eqp_file, read_settings, spin_kernel)
+from .bse_deck import _FALSE as _DECK_FALSE
 from .bse_io import (load_bse_data_from_restart_sharded, decimate_W_q_to_subgrid, make_w_densifier, w_pair_embedding, resolve_w_head_densify, PAD_EPS_GUARD_RY)
 from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
@@ -400,7 +401,8 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
 def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                                nc_pad: int, nv_pad: int, n_cond: int, n_val: int,
                                *, n_eig: int, max_iter: int, tol_mev: float, W_q0,
-                               cert_rows=(), cert_tol_mev=None, exchange_channel="singlet"):
+                               cert_rows=(), cert_tol_mev=None, exchange_channel="singlet",
+                               full=None):
     """The ``solver = davidson`` (default) counterpart of :func:`build_path_solver`:
     the same call signature and outputs, the per-Q lowest ``n_eig`` from
     ``bse_lanczos.solve_bse_sharded``'s Davidson (exact diagonal
@@ -411,12 +413,27 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     ``W_q0`` is the q = 0 slice of W_q, taken before W_q was donated.
     Certification rows use the tighter ``cert_tol_mev`` residual, so a loose
     plotting tolerance cannot dominate the exchange comparison. Both members
-    of each comparison must be included in ``cert_rows``."""
+    of each comparison must be included in ``cert_rows``.
+
+    ``full = dict(solver=, on_indefinite=)`` (``full_bse = true``) solves the
+    full BSE at every Q instead: ``solve_path`` then takes ``partner``, the
+    antiresonant pair's operands ``dict(psi_vQ_X, psi_vQ_Y, eps_vQ, psi_c_X,
+    psi_c_Y, eps_c)`` (valence stacks at k+Q like the conduction ones, and the
+    grid's conduction states with the head-shifted ``eps_c``), and each Q's
+    payload carries them as ``data['partner']`` to
+    ``bse_nontda.solve_bse_nontda_sharded`` (``operand_sets``).  ``solver`` is
+    ``'davidson'`` (the structure-preserving Davidson's unpaired form, no size
+    limit) or ``'dense'`` (the assembled reference, at most 4096
+    transitions).  ``solve_path.stability`` then holds one row per Q,
+    ``(lam_min_ry, n_special)``: the stability margin the Davidson measured
+    (NaN on the dense route, which refuses an indefinite ``K``) and the count
+    of unstable or non-positive roots found under ``on_indefinite='continue'``."""
     from common.collectives import replicate_to_mesh
     from .bse_lanczos import RY_TO_MEV, davidson_stop_line, solve_bse_sharded
     from solvers.davidson import LAST_RUN
     sh = make_bse_shardings(mesh_xy)
     rows_of = {}
+    stability = []
 
     def _row(a, i, sharding):
         if sharding not in rows_of:
@@ -429,9 +446,37 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     static = dict(nkx=nkx, nky=nky, nkz=nkz, n_cond=n_cond, n_val=n_val,
                   n_cond_pad=nc_pad, n_val_pad=nv_pad, exchange_channel=exchange_channel)
 
+    def _solve_full(payload, row_tol, iQ):
+        """One Q of the full BSE; returns the roots and the residuals in meV
+        (None on the dense route, which has no iteration)."""
+        from . import bse_nontda
+        if full["solver"] == "dense":
+            ev, _, _ = solve_bse_sharded(payload, mesh_xy, n_eig=n_eig, tda=False,
+                                         full_solver="dense")
+            stability.append((float("nan"), 0))
+            return ev, None
+        try:
+            ev, _, _ = solve_bse_sharded(
+                payload, mesh_xy, n_eig=n_eig, max_iter=max_iter, tda=False,
+                full_solver="davidson", full_on_indefinite=full["on_indefinite"],
+                davidson_precond="exact", davidson_tol_Ry=row_tol / RY_TO_MEV,
+                davidson_plan_key="exciton_bands_full")
+        except (RuntimeError, ValueError) as exc:
+            raise type(exc)(f"{exc}  (exciton_bands: full BSE at Q row {iQ}; no exciton band "
+                            "file was written.)") from exc
+        last = bse_nontda.LAST_DAVIDSON
+        stability.append((float(last["lam_min_ry"]), int(last["n_special"])))
+        info = last["info"]
+        lo = int(last["n_special"])
+        return ev, np.asarray(info["residuals"])[lo:lo + n_eig] * RY_TO_MEV
+
     def solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
-                   psi_v_X, psi_v_Y, eps_v, W_R, D_head=None, M_Q=None):
+                   psi_v_X, psi_v_Y, eps_v, W_R, D_head=None, M_Q=None, partner=None):
         rows = []
+        del stability[:]
+        if (full is None) != (partner is None):
+            raise ValueError("build_path_solver_davidson: the antiresonant operands "
+                             "(partner) go with full = dict(...), and only with it")
         for iQ in range(int(psi_cQ_X.shape[0])):
             row_tol = (min(tol_mev, cert_tol_mev)
                        if cert_tol_mev is not None and iQ in cert_rows else tol_mev)
@@ -443,7 +488,25 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                            W_q=None, M=pair(c_X, psi_v_X), _W_q0_for_precond=W_q0)
             if D_head is not None:
                 payload["head_tensor"] = (D_head, _row(M_Q, i, NamedSharding(mesh_xy, P())))
+            if partner is not None:
+                # The antiresonant pair (v at k+Q, c at k), bse_nontda.operand_sets.
+                payload["partner"] = dict(
+                    psi_c_X=partner["psi_c_X"], psi_c_Y=partner["psi_c_Y"],
+                    eps_c=partner["eps_c"],
+                    psi_v_X=_row(partner["psi_vQ_X"], i, sh.psi_x),
+                    psi_v_Y=_row(partner["psi_vQ_Y"], i, sh.psi_y),
+                    eps_v=_row(partner["eps_vQ"], i, sh.eps))
             for attempt in range(2):
+                if full is not None:
+                    ev, residual = _solve_full(payload, row_tol, iQ)
+                    if cert_tol_mev is None or iQ not in cert_rows or residual is None:
+                        break
+                    if np.all(np.isfinite(residual)) and np.max(residual) <= cert_tol_mev:
+                        break
+                    scale = max(1.0, float(np.max(np.abs(_gather_host(ev)))))
+                    row_tol = min(row_tol, cert_tol_mev / (2 * scale))
+                    del stability[-1]
+                    continue
                 ev, _, _ = solve_bse_sharded(
                     payload, mesh_xy, n_eig=n_eig, max_iter=max_iter, solver_kind="davidson",
                     davidson_precond="exact", davidson_tol_Ry=row_tol / RY_TO_MEV,
@@ -471,6 +534,7 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
         return replicate_to_mesh(np.stack(rows), mesh_xy), ()
 
     solve_path.alpha_labels = []
+    solve_path.stability = stability
     return solve_path
 
 
@@ -512,7 +576,9 @@ def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, he
                   else args.max_iter),
         tol_mev=args.davidson_tol_mev, W_q0=W_q0, cert_rows=cert_rows,
         exchange_channel=getattr(args, "exchange_channel", "singlet"),
-        cert_tol_mev=0.1 * CERT_TOL_BY_GRADE[args.cert_grade] if cert_rows else None)
+        cert_tol_mev=0.1 * CERT_TOL_BY_GRADE[args.cert_grade] if cert_rows else None,
+        full=(dict(solver=args.full_solver, on_indefinite=args.full_instability)
+              if getattr(args, "full_bse", False) else None))
 
 
 def _report_alpha_over_path(labels, alpha_all, log=log.debug):
@@ -1022,6 +1088,64 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
     return program(psi, eps)
 
 
+def build_pair_stacks(bundle, nQ, nk, n_val, n_cond, n_val_pad, n_cond_pad, n_rmu,
+                      n_rmu_pad, mesh_xy):
+    """The full BSE's stacks from ONE htransform over the joint window: the
+    bundle's bands are the BSE valence bands followed by the conduction bands,
+    both at every k + Q of the path.
+
+    Returns ``(psi_cQ_X, psi_cQ_Y, eps_cQ, psi_vQ_X, psi_vQ_Y, eps_vQ)``: the
+    conduction stacks of :func:`build_conduction_stacks` and the valence ones
+    in the same layout, ``(nQ, nk, nv_pad, ns, n_rmu_pad)`` with mu on x / y
+    and ``eps_vQ`` ``(nQ, nk, nv_pad)``, pad bands at ``-PAD_EPS_GUARD_RY``.
+    The valence states at k + Q are the antiresonant pair's hole leg
+    (``bse_nontda.operand_sets``).  Consumes the bundle's buffers (no
+    donation: both slices read the same arrays).
+    """
+    n_rmu_src = int(bundle.psi_rmu_Y.shape[-1])
+    n_rmu_logical = int(getattr(bundle, "n_mu_logical", n_rmu_src))
+    if n_rmu_logical != int(n_rmu):
+        raise ValueError(
+            f"exciton_bands: the htransform fitted psi at {n_rmu_logical} centroid point(s), "
+            f"but the restart bundle stores mu={n_rmu} (see build_conduction_stacks).")
+    n_bands = int(bundle.psi_rmu_Y.shape[1])
+    if n_bands != n_val + n_cond:
+        raise ValueError(f"exciton_bands: the joint htransform window holds {n_bands} bands, "
+                         f"want {n_val} valence + {n_cond} conduction")
+    if n_cond_pad < n_cond or n_val_pad < n_val or n_rmu_pad < n_rmu_src:
+        raise ValueError("pair stack padding cannot shrink bands or centroids")
+    shape = (nQ, nk, n_bands, int(bundle.psi_rmu_Y.shape[2]), n_rmu_src)
+    psi, eps = bundle.psi_rmu_Y, bundle.enk_full
+    bundle.psi_rmuT_X = bundle.psi_rmu_Y = bundle.enk_full = None
+    conduction = _band_stack_program(mesh_xy, shape, (n_val, n_bands), (n_cond_pad, n_rmu_pad),
+                                     PAD_EPS_GUARD_RY)
+    valence = _band_stack_program(mesh_xy, shape, (0, n_val), (n_val_pad, n_rmu_pad),
+                                  -PAD_EPS_GUARD_RY)
+    return conduction(psi, eps) + valence(psi, eps)
+
+
+def _band_stack_program(mesh_xy, shape, bands, padded, pad_eps):
+    """Reshape, slice the band range ``bands = (b0, b1)`` and pad: the
+    geometry-only program of one band set of a joint-window bundle."""
+    nQ, nk, n_bands, ns, n_rmu = shape
+    b0, b1 = bands
+    n_pad, n_rmu_pad = padded
+    x5 = NamedSharding(mesh_xy, P(None, None, None, None, "x"))
+    y5 = NamedSharding(mesh_xy, P(None, None, None, None, "y"))
+    rep = NamedSharding(mesh_xy, P())
+
+    @partial(jax.jit, out_shardings=(x5, y5, rep))
+    def _stacks(psi, eps):
+        psi = psi.reshape(shape)[:, :, b0:b1]
+        eps = eps.reshape(nQ, nk, n_bands)[:, :, b0:b1]
+        psi = jnp.pad(psi, ((0, 0), (0, 0), (0, n_pad - (b1 - b0)),
+                            (0, 0), (0, n_rmu_pad - n_rmu)))
+        eps = jnp.pad(eps, ((0, 0), (0, 0), (0, n_pad - (b1 - b0))), constant_values=pad_eps)
+        return psi, psi, eps
+
+    return _stacks
+
+
 def _conduction_stack_program(mesh_xy, shape, padded):
     """Geometry-only reshape/pad program; captures no bundle or arrays."""
     nQ, nk, n_cond, ns, n_rmu = shape
@@ -1297,8 +1421,15 @@ def settings_rows(args, *, source) -> tuple:
     rerun = rerun_check_enabled(args)
     return (
         Setting("--vq-mode", str(args.vq_mode), source("--vq-mode"),
-                "exchange V_Q of the finite-Q TDA BSE (D_Q + V_Q - W); other "
+                "exchange V_Q of the finite-Q BSE (D_Q + V_Q - W); other "
                 "choices interp, refit, both, ongrid"),
+        Setting("full_bse", "true" if getattr(args, "full_bse", False) else "false",
+                source("full_bse"),
+                (f"full BSE at every Q, K = [[A(Q), B(Q)], [B(Q)^H, conj A(-Q)]]; "
+                 f"{args.full_solver} solve"
+                 + (f", instability: {args.full_instability}"
+                    if args.full_solver == "davidson" else ""))
+                if getattr(args, "full_bse", False) else "Tamm-Dancoff, the resonant block A(Q)"),
         Setting("--w-coarse-grid", str(args.w_coarse_grid) if args.w_coarse_grid
                 else "none", source("--w-coarse-grid"),
                 "W on a coarse grid, trigonometric densification" if args.w_coarse_grid
@@ -1380,6 +1511,19 @@ EXB_KEYS = {
     "block_size": Key("block_size", "int"),
     "solver_max_iter": Key("max_iter", "int"),
     "dipole_file": Key("dipole", "path"),
+    # The full (non-Tamm-Dancoff) BSE at every Q, bse.bse_jax's three keys.
+    "full_bse": Key("full_bse", "bool"),
+    "full_bse_solver": Key("full_solver", choices=("dense", "davidson")),
+    "full_bse_instability": Key("full_instability", choices=("refuse", "continue")),
+}
+
+#: Deck keys of ``bse.bse_jax`` that change the Hamiltonian and that this
+#: driver cannot honour: named in a deck, they refuse (every other key the
+#: driver does not read is left alone, ``bse_deck``).
+EXB_UNSERVED_KEYS = {
+    "qp_rotations_file": "the htransform's conduction states at k + Q are not rotated into the "
+                         "QP basis",
+    "highest_occupied_band": "the band split is the WFN's electron count",
 }
 
 
@@ -1436,7 +1580,44 @@ def _settings_defaults():
                          "q-linear coefficient IS this dipole, which is why "
                          "the cell-averaged head needs no d(zeta)/dq.")
     ap.add_argument("--degeneracy-check-override", action="store_true")
+    ap.add_argument("--full-bse", action="store_true", dest="full_bse",
+                    help="the full (non-Tamm-Dancoff) BSE at every Q: K z = omega Sigma z "
+                         "with K = [[A(Q), B(Q)], [B(Q)^H, conj A(-Q)]]")
+    ap.add_argument("--full-solver", choices=("dense", "davidson"), default="dense",
+                    dest="full_solver",
+                    help="full_bse only: dense (assembled, at most 4096 transitions per Q) "
+                         "or davidson (structure-preserving Davidson, unpaired form)")
+    ap.add_argument("--full-instability", choices=("refuse", "continue"), default="refuse",
+                    dest="full_instability",
+                    help="full_bse_solver = davidson only: what a K that is not positive "
+                         "definite does at a Q")
     return ap
+
+
+def _check_full_bse_keys(settings, named) -> None:
+    """The full-BSE keys against each other and the solver keys (as ``bse.bse_jax``)."""
+    for key in ("full_bse_solver", "full_bse_instability"):
+        if key in named and not settings.full_bse:
+            raise DeckError(f"GATE exb_full_bse_key: `{key}` is read with `full_bse = true` only "
+                            f"(got: `{key}` without it; want: `full_bse = true`, or drop "
+                            f"`{key}`).  Why: the Tamm-Dancoff solve has no such option and "
+                            "would run without it.")
+    if not settings.full_bse:
+        return
+    if settings.solver != "davidson":
+        raise DeckError("GATE exb_full_bse_key: `solver = block_lanczos` cannot solve the full "
+                        "BSE (got: full_bse = true with solver = block_lanczos; want: the "
+                        "default solver).  Why: the block-Lanczos scan is a Hermitian "
+                        "eigensolver.  Fix: drop `solver`, and pick full_bse_solver = dense "
+                        "or davidson.")
+    if settings.full_solver == "dense":
+        for key in ("full_bse_instability", "davidson_tol_mev", "solver_max_iter"):
+            if key in named:
+                raise DeckError(f"GATE exb_full_bse_key: `{key}` is not read by the dense "
+                                f"full-BSE solve (got: `{key}` with full_bse_solver = dense; "
+                                f"want: full_bse_solver = davidson, or drop `{key}`).  Why: "
+                                "the dense solve has no iteration and refuses an indefinite "
+                                "stability matrix.")
 
 
 def deck_settings(ap, args):
@@ -1457,9 +1638,17 @@ def deck_settings(ap, args):
         from .bse_window import _parse_wfn_path
         kernel = spin_kernel(params, named, _parse_wfn_path(args.input))
         if not kernel["include_w"]:
-            raise DeckError("bse.exciton_bands solves the screened TDA BSE (D_Q + w V_Q - W): "
+            raise DeckError("bse.exciton_bands solves the screened BSE (D_Q + w V_Q - W): "
                             "drop local_fields")
         settings.exchange_channel = kernel["channel"]
+        _check_full_bse_keys(settings, named)
+        for key, why in EXB_UNSERVED_KEYS.items():
+            if key in named and str(params.get(key, "") or "").strip().lower() not in _DECK_FALSE:
+                raise DeckError(f"GATE exb_unserved_key: bse.exciton_bands cannot honour "
+                                f"`{key}` (got: `{key} = {params[key]}`; want: the key absent).  "
+                                f"Why: {why}, so the exciton bands would be those of another "
+                                f"Hamiltonian than the deck states.  Fix: remove `{key}` for "
+                                f"this driver.")
         if "kgrid_fine_shift" in named and any(
                 float(x) for x in str(params["kgrid_fine_shift"]).replace(",", " ").split()):
             raise DeckError("bse.exciton_bands does not take a shifted fine grid yet: its "
@@ -1970,9 +2159,21 @@ def main(argv=None):
         # No-op when kgrid_fine is unset (data grid == meta grid).
         kgrid_co_ct = (int(meta.nkx), int(meta.nky), int(meta.nkz))
         _path_quality_records = []
+        # full_bse: the antiresonant pair (v at k+Q, c at k) needs the BSE
+        # valence bands at k + Q as well, so the SAME htransform returns the
+        # joint window [VBM - n_val + 1, b_max): valence then conduction.
+        full_bse = bool(getattr(args, "full_bse", False))
+        v_min = nval_in - n_val
+        if full_bse and v_min < 0:
+            raise ValueError(
+                f"GATE exb_full_bse_valence_window: the htransform fits {nval_in} valence "
+                f"band(s) and the full BSE needs the {n_val} BSE valence bands at k + Q "
+                f"(got: nval = {nval_in} < number_val_bands_fine = {n_val}; want: nval >= "
+                f"{n_val}).  Why: the antiresonant pair's hole state is interpolated like "
+                f"the conduction states.  Fix: raise nval in {args.input}.")
         bundle = compute_wfns_fi(
             ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
-            kgrid_co=kgrid_co_ct, band_window_fi=(b_min, b_max),
+            kgrid_co=kgrid_co_ct, band_window_fi=((v_min if full_bse else b_min), b_max),
             mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
             batch_size=int(params.get("wfn_fi_q_chunk", 0)),
             use_low_mem_eigh=_use_low_mem_eigh, log_fn=log,
@@ -1985,8 +2186,18 @@ def main(argv=None):
                 "expected one")
         _record_htransform_receipts("exciton_bands.path_htransform",
                                     quality_records=_path_quality_records)
-        psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
-            bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
+        partner = None
+        if full_bse:
+            (psi_cQ_X, psi_cQ_Y, eps_cQ, psi_vQ_X, psi_vQ_Y, eps_vQ) = build_pair_stacks(
+                bundle, nQ, nk, n_val, n_cond, nv_pad, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
+            # The antiresonant pair (v at k+Q, c at k): the grid's conduction
+            # states with the head-shifted diagonal, the valence stacks at k+Q.
+            partner = dict(psi_vQ_X=psi_vQ_X, psi_vQ_Y=psi_vQ_Y, eps_vQ=eps_vQ,
+                           psi_c_X=data["psi_c_X"], psi_c_Y=data["psi_c_Y"],
+                           eps_c=head_shifted_eps_c(data["eps_c"], data))
+        else:
+            psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
+                bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
         continuum_ry = _continuum_threshold_ry(
             eps_cQ, data["eps_v"], n_val=n_val, n_cond=n_cond)
         # The htransform's buffers have now moved into the conduction
@@ -2360,6 +2571,9 @@ def main(argv=None):
             psi_cQ_X = psi_cQ_X[sel]
             psi_cQ_Y = psi_cQ_Y[sel]
             eps_cQ = eps_cQ[sel]
+            if partner is not None:
+                partner.update(psi_vQ_X=partner["psi_vQ_X"][sel],
+                               psi_vQ_Y=partner["psi_vQ_Y"][sel], eps_vQ=partner["eps_vQ"][sel])
 
         # ── W_R once (the k-convolution router's k-minor factory), then the single-compile scan ──
         stages.begin(4, "Direct kernel W_R and the Q-scan solver",
@@ -2384,6 +2598,11 @@ def main(argv=None):
         # is a different array of a different shape and donation is declined
         # anyway.  It also still needs ``data["W_q"]`` to build that sub-grid,
         # which is why the reference is dropped per-branch and not once up here.
+        if full_bse:
+            # K = [[A, B], [B^H, A']] is Hermitian only for W(q) = conj(W(-q));
+            # measured here, before W_q is donated (the per-Q payloads carry W_R).
+            from .bse_nontda import check_restart_reciprocity
+            check_restart_reciprocity(data["W_q"], log=log, input_file=args.input)
         W_q0 = _precond_w_q0(args, data)
         _ifftn_donated = jax.jit(_ifftn, donate_argnums=(0,))
         if args.w_coarse_grid is None:
@@ -2455,9 +2674,11 @@ def main(argv=None):
                               n_cond, n_val, head_mbz, W_q0,
                               cert_rows=tuple(cert_idx) + tuple(range(nQ, nQ + n_cert)))
         tick("w_r_and_build", t0)
+        solve_kw = {} if partner is None else {"partner": partner}
         stages.result(f"W_R on {nkx} x {nky} x {nkz}; "
-                      f"{'block Lanczos' if args.solver == 'lanczos' else 'Davidson'} solver, "
-                      f"{int(args.n_eig)} levels per Q")
+                      + (f"full BSE, {args.full_solver} solver, " if full_bse else
+                         f"{'block Lanczos' if args.solver == 'lanczos' else 'Davidson'} solver, ")
+                      + f"{int(args.n_eig)} levels per Q")
         stages.begin(5, "Q-path eigensolve", name="exb.solve")
         t_c0 = time.time()
         # Exact q=0 direct head: <c k+Q|c' k+Q><v k|v' k> = δδ, so it is the
@@ -2465,7 +2686,16 @@ def main(argv=None):
         eps_cQ = head_shifted_eps_c(eps_cQ, data)
         evs_dev, alpha_dev = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                                     data["psi_v_X"], data["psi_v_Y"],
-                                    data["eps_v"], W_R, *head_args)
+                                    data["eps_v"], W_R, *head_args, **solve_kw)
+        if full_bse:
+            # The stability margin the full solve measured at each Q
+            # (lam_min(K) is at or below it) and the special roots found.
+            stab = np.asarray(solver.stability, dtype=float).reshape(-1, 2)[:nQ]
+            if np.all(np.isfinite(stab[:, 0])):
+                iq = int(np.argmin(stab[:, 0]))
+                log(f"full BSE: smallest stability margin lam_min = "
+                    f"{stab[iq, 0] * RY2EV * 1e3:.4f} meV at Q row {iq} "
+                    f"({int(np.sum(stab[:, 1] > 0))} Q with unstable or non-positive roots)")
         # THE ONLY HOST FETCH LEFT IN THIS DRIVER, and it issues no collective:
         # ``evs_dev`` is the block-Lanczos Ritz table out of a small replicated
         # eigh(T), ``P()``-sharded, so it takes the service's replicated arm (a
@@ -2492,7 +2722,7 @@ def main(argv=None):
             evs2 = _gather_host(
                 solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                        data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R,
-                       *head_args)[0])
+                       *head_args, **solve_kw)[0])
             t_warm = time.time() - t_w0
             tick("solve_scan_warm", t_w0)
             assert np.allclose(evs2, evs_all, atol=1e-10), \
