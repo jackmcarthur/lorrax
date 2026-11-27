@@ -2,12 +2,12 @@
 
 LORRAX finds a few extremal eigenpairs of large operators it never stores as
 matrices: the plane-wave Kohn–Sham Hamiltonian of the NSCF step (Davidson) and
-the BSE Hamiltonian (Davidson, Lanczos, and for the full problem the
+the BSE Hamiltonian (Davidson, and for the full problem the
 [structure-preserving Davidson](#structure-preserving-davidson)). This page
 describes `src/solvers/`'s planned
-Davidson and Lanczos solvers: their API, their fixed-capacity storage, and the
+Davidson solvers: their API, their fixed-capacity storage, and the
 results they certify. It is for a developer calling or changing a solver.
-Read [the active subspace](../services/distrib_la/subspace.md) first: both
+Read [the active subspace](../services/distrib_la/subspace.md) first: the
 solvers keep their basis in its fixed-capacity buffers and do all their dense
 algebra through its plans.
 
@@ -97,56 +97,6 @@ conditional output, which would copy them; only correction-sized blocks do.
 `memory_analysis()` of the compiled solve reports the XLA schedule; native
 context memory, allocator reservations and allocations inside the operator
 callback are outside it.
-
-## Planned Lanczos {#planned-lanczos}
-
-`solvers.lanczos.block_lanczos_eig_jit(matvec, n, n_eig=20, block_size=4,
-max_iter=50, *, …, subspace_plan=None, vector_shape=None,
-structured_vectors=False, support=None)` runs block Lanczos with block width
-$b$; `block_size=1` is the single-vector solver.
-`block_lanczos_eig_jit_converged(…, rtol=1e-6, atol=1e-8, check_every=4)`
-runs the same recurrence in a `lax.while_loop` that stops when the lowest
-`n_eig` Ritz values stop moving.
-
-**Geometry.** With $M_b = \max(1, \min(\texttt{max\_iter}, \lfloor n_a/b\rfloor))$
-block iterations, where $n_a$ is the number of supported entries, the basis
-holds $(M_b + 1)$ blocks: the extra block is the residual block of the last
-step. The subspace plan must therefore have `capacity = (M_b+1)·b` and
-`n_eig` equal to the requested root count, or the solver refuses; a geometry
-change needs a new plan. Distributed callers build the plan with their vector
-sharding before their outer `jit` and pass it in; an omitted plan resolves the
-local or CPU plan, which must not be used for distributed vectors.
-`subspace_plan=False` selects the fixed-shape reference arithmetic used to
-check the planned path.
-
-**Vector layout.** The basis is row-oriented, `(M_b+1, b, *vector_shape)`,
-with `vector_shape = (n,)` by default. The BSE callers pass `vector_shape =
-(n_c, n_v, n_k)` with their X/Y sharding and `structured_vectors=True`, so the
-basis keeps both distributed axes, callbacks see `(b, *vector_shape)` blocks,
-and Ritz vectors return as `(n_eig, *vector_shape)`; the flat default would
-redistribute every block.
-
-**Start block.** A random complex Gaussian block, drawn only on the entries
-`support` marks (the BSE passes its physical transitions) and zero elsewhere,
-then orthonormalized; the supported count $n_a$ bounds the Krylov depth.
-
-**One step.** Apply the operator to block $j$, orthogonalize the result by
-CGS2 against the reorthogonalization window
-$[\max(0, j - n_{\mathrm{reorth}})\,b,\ (j+1)\,b)$ (the current block
-included) with two batched overlap reductions, then factor it by TSQR, which
-exchanges only small $R$ factors, never a vector. `n_reorth = -1` (the
-default) means the whole basis. The planned path is the only route; old
-vectors outside the window and the unused capacity tail cost nothing.
-
-**Ritz pairs.** The projected block-tridiagonal matrix is built from the
-completed blocks only, its eigensolve gets the real dimension `j·b`, and the
-Ritz vectors are reconstructed from the completed rows.
-
-**What a return certifies.** Convergence of the converged variant means
-$\max_i |\lambda_i - \lambda_i^{\mathrm{prev}}| < \mathrm{rtol}\cdot\max(|\lambda_i|, \mathrm{atol})$
-between checks `check_every` blocks apart; it is eigenvalue stability, not an
-eigenpair residual. A consumer that needs a residual evaluates
-$HX - X\Lambda$ itself.
 
 ## Structure-preserving Davidson {#structure-preserving-davidson}
 
@@ -442,7 +392,6 @@ at `epsilon_shift` $10^{-3}$ Ry and 452 at $10^{-6}$ Ry; at finite $Q$ it takes 
 | solver | caller | operator |
 |---|---|---|
 | planned Davidson | `psp.run_nscf` ([NSCF Hamiltonian](nscf_hamiltonian.md)); `bse.bse_lanczos` (`solver = davidson`, the default; also `bse.exciton_bands` per $Q$) | $H_k$ on the G sphere; the BSE Hamiltonian |
-| block Lanczos | `bse.bse_lanczos`, `bse.exciton_bands` (`solver = block_lanczos`) | the BSE Hamiltonian |
 | structure-preserving Davidson | `bse.bse_nontda` (`full_bse = true` with `full_bse_solver = davidson`; `bse.exciton_bands` per $Q$) | the full BSE pair applier $AX+B\bar X$; at a finite pair momentum the Hermitian $\mathcal K$ on pair rows, unpaired form |
 
 Which BSE solver each CLI flag selects is [BSE](bse.md).

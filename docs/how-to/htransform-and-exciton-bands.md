@@ -426,10 +426,8 @@ preconditioner, soft locking, 8 margin roots above `number_eigenvalues`, and a s
 every root's residual is below `davidson_tol_mev` (0.01 meV). One planned
 solver serves the whole path, with each $Q$'s operands as arguments, so it
 compiles once. A $Q$ that stops on the `solver_max_iter` cap refuses
-(`GATE davidson_converged`) before anything is written. `solver = block_lanczos`
-keeps the fixed block Lanczos (pair amplitudes and block Lanczos over the BSE
-stack matvec), one jitted function under one `lax.scan` over the whole $Q$
-list; it has no convergence test. Extra points
+(`GATE davidson_converged`) before anything is written. (The fixed block-Lanczos scan,
+`solver = block_lanczos`, was retired 2026-11-27 and refuses by name.) Extra points
 cost one scan row each, so `--q-per-segment` (default 16) raises each
 segment's point count to at least that floor; `--q-per-segment 1` keeps the
 deck's counts. The cost that grows with the number of $Q$ is the htransform
@@ -453,7 +451,7 @@ must be at least `number_val_bands_fine` (`GATE exb_full_bse_valence_window`). T
 `davidson` is the unpaired structure-preserving Davidson, no size limit, residual stop
 `davidson_tol_mev`) and `full_bse_instability = refuse | continue` (read under `davidson`: a $Q$
 whose $\mathcal K$ is not positive definite refuses, or its unstable roots are logged and the positive
-roots above them written). `solver = block_lanczos` cannot solve the full BSE, and the keys of a
+roots above them written). The keys of a
 solver the route does not read refuse (`GATE exb_full_bse_key`). The run logs the smallest stability
 margin $\lambda_{\min}$ of the path, and the `.dat` title says which problem was solved and carries
 that margin.
@@ -478,9 +476,8 @@ as markers.
 | flag | default | meaning |
 |---|---|---|
 | `number_val_bands_fine` / `number_cond_bands_fine` | 4 / 4 | BSE window, in bands |
-| `solver` / `davidson_tol_mev` | `davidson` / 0.01 | per-$Q$ solver: Davidson to a residual below the tolerance (meV), or `lanczos`, the fixed block-Lanczos scan |
-| `number_eigenvalues` / `solver_max_iter` | 6 / auto | roots per $Q$; iteration cap: Davidson max(30, min(200, n/2)) at transition dimension n, block Lanczos 40 |
-| `block_size` | 8 | block-Lanczos width; `solver = block_lanczos` only, refused otherwise |
+| `solver` / `davidson_tol_mev` | `davidson` / 0.01 | per-$Q$ solver: Davidson to a residual below the tolerance (meV) |
+| `number_eigenvalues` / `solver_max_iter` | 6 / auto | roots per $Q$; iteration cap: Davidson max(30, min(200, n/2)) at transition dimension n |
 | `--band-degeneracy` | `strict` | a window edge inside a multiplet refuses (`snap` widens it, `off` proceeds); checked on the loader window and the htransform conduction window |
 | `--refit-guard-bands` | 4 | guard bands of the refit's $f(H)$ window above the ζ window; 0 must fail the tile identity |
 | `--a-band` | top band | band whose bandwidth sets $a$ in $f$ (§3) |

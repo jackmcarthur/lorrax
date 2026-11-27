@@ -6,9 +6,8 @@ the loader's shardings, the screened kernel real in R space (so H is Hermitian):
 
 1. ``bse_jax``'s deck defaults (``solver = davidson``, ``davidson_precond = exact``,
    ``davidson_tol_mev = 0.01``) through ``bse_lanczos.solve_bse_sharded`` solve 8 + 8 margin
-   roots, stop CONVERGED on the lowest 8 and return those 8, within 0.01 meV of a full-Krylov
-   Lanczos (120 of 128 steps) and of ``eigvalsh`` of the operator assembled from the same
-   matvec.
+   roots, stop CONVERGED on the lowest 8 and return those 8, within 0.01 meV of ``eigvalsh`` of
+   the operator assembled from the same matvec.
 2. ``GATE davidson_converged``: the driver (``bse_jax._preview_lanczos``, loader stubbed)
    capped at 2 iterations refuses, and its run directory stays empty.
 3. ``keep_W_R``: ``absorption_haydock.haydock_coefficients`` on the eigensolve's payload
@@ -106,7 +105,7 @@ def run_cases(mesh):
 
     data = _payload(mesh, ops)
     ev_d, _, it_d = solve_bse_sharded(
-        data, mesh, n_eig=N_EIG, max_iter=200, solver_kind=defaults["solver"],
+        data, mesh, n_eig=N_EIG, max_iter=200,
         davidson_precond=defaults["davidson_precond"],
         davidson_tol_Ry=defaults["davidson_tol_mev"] / RY_MEV, keep_W_R=True)
     ev_d = np.asarray(ev_d).real
@@ -119,12 +118,7 @@ def run_cases(mesh):
     out.update(margin_lock_converged=int(LAST_RUN["status"]) == CONVERGED,
                margin_lock_matvecs=int(LAST_RUN["mv"][0]),
                margin_lock_vs_dense_meV=float(np.max(np.abs(np.asarray(ev_m).real - exact)) * RY_MEV))
-    ev_l, _, _ = solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG,
-                                   max_iter=H.shape[0] - N_EIG, solver_kind="lanczos", block_size=1)
-    ev_l = np.asarray(ev_l).real
-    out["davidson_vs_lanczos_meV"] = float(np.max(np.abs(ev_d - ev_l)) * RY_MEV)
     out["davidson_vs_dense_meV"] = float(np.max(np.abs(ev_d - exact)) * RY_MEV)
-    out["lanczos_vs_dense_meV"] = float(np.max(np.abs(ev_l - exact)) * RY_MEV)
 
     a1, b1, n1 = haydock_coefficients(data, mesh, ops["d"], 20)                # eigensolve's W_R
     a2, b2, n2 = haydock_coefficients(_payload(mesh, ops), mesh, ops["d"], 20)   # standalone
@@ -238,10 +232,9 @@ def main() -> int:
     out = run_cases(mesh)
     checks = {
         f"1 Davidson (deck defaults, {N_EIG} + 8 margin roots) CONVERGED, <= {TOL_MEV} meV "
-        "from full-Krylov Lanczos and dense":
+        "from dense":
             out["davidson_converged"] and out["davidson_roots"] == f"{N_EIG}+8"
-            and out["davidson_vs_lanczos_meV"] <= TOL_MEV
-            and out["davidson_vs_dense_meV"] <= TOL_MEV and out["lanczos_vs_dense_meV"] <= 1e-6,
+            and out["davidson_vs_dense_meV"] <= TOL_MEV,
         "2 GATE davidson_converged refuses a run capped at 2 iterations, nothing written":
             out["capped_davidson_refuses_unwritten"],
         "3 Haydock on the eigensolve's payload == standalone (1e-12)":

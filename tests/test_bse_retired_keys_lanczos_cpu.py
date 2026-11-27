@@ -1,8 +1,10 @@
 """Retired Lanczos routes of the BSE refuse by name (``GATE bse_retired_key``).
 
 The input-file reader leaves a key a driver does not read alone, so after the thick-restart
-Lanczos (``solver = trlan``, ``trlan_m_max``, ``trlan_n_keep``) was retired on 2026-11-27 an
-input file that still names it would run the Davidson in silence.  Each retired key and each
+Lanczos (``solver = trlan``, ``trlan_m_max``, ``trlan_n_keep``) and the block Lanczos
+(``solver = block_lanczos``, ``block_size``, ``lanczos_rtol``, ``lanczos_check_every``,
+``lanczos_n_reorth``) were retired on 2026-11-27 an input file that still names one would run
+the Davidson in silence.  Each retired key and each
 retired ``solver`` value refuses in ``bse_jax``'s parser and in ``bse.exciton_bands.deck_settings``.
 
 ``JAX_PLATFORMS=cpu python -m pytest tests/test_bse_retired_keys_lanczos_cpu.py``.
@@ -22,6 +24,11 @@ RETIRED_LINES = [
     ("trlan_m_max = 40", "trlan_m_max"),
     ("trlan_n_keep = 12", "trlan_n_keep"),
     ("solver = trlan", "solver = trlan"),
+    ("block_size = 8", "block_size"),
+    ("lanczos_rtol = 1e-6", "lanczos_rtol"),
+    ("lanczos_check_every = 2", "lanczos_check_every"),
+    ("lanczos_n_reorth = 10", "lanczos_n_reorth"),
+    ("solver = block_lanczos", "solver = block_lanczos"),
 ]
 
 
@@ -61,3 +68,11 @@ def test_the_davidson_default_and_the_named_davidson_still_parse():
 def test_every_retired_key_has_a_remedy():
     for key, (what, fix) in bse_deck.RETIRED_KEYS.items():
         assert what and fix, key
+
+
+def test_the_retired_keys_refuse_under_full_bse_too(capsys):
+    """The refusal comes before every route check: the full BSE does not read them either."""
+    for line in ("block_size = 4", "solver = block_lanczos"):
+        with pytest.raises(SystemExit):
+            bse_jax.parse_args(["-i", _toy_deck(["full_bse = true", line])])
+        assert "GATE bse_retired_key" in capsys.readouterr().err

@@ -122,6 +122,14 @@ RETIRED_KEYS = {
                     "sets its basis capacity)"),
     "trlan_n_keep": ("the retained Ritz vectors of the thick-restart Lanczos eigensolver",
                      "drop the key; the Tamm-Dancoff eigensolver is the Davidson"),
+    "block_size": ("the block size of the block Lanczos eigensolver",
+                   "drop the key; the Tamm-Dancoff eigensolver is the Davidson"),
+    "lanczos_rtol": ("the Ritz-stability stop of the block Lanczos eigensolver",
+                     "drop the key; the Davidson stops on `davidson_tol_mev`"),
+    "lanczos_check_every": ("the convergence-check cadence of the block Lanczos eigensolver",
+                            "drop the key; the Davidson stops on `davidson_tol_mev`"),
+    "lanczos_n_reorth": ("the reorthogonalisation window of the block Lanczos eigensolver",
+                         "drop the key; the Tamm-Dancoff eigensolver is the Davidson"),
 }
 
 
@@ -331,7 +339,8 @@ def omega_count(omega_min_ev: float, omega_max_ev: float, delta_ev: float) -> in
 
 #: Values of the ``solver`` key that selected a retired eigensolver.
 RETIRED_SOLVER_VALUES = {
-    "trlan": "the thick-restart Lanczos",
+    "trlan": "thick-restart Lanczos",
+    "block_lanczos": "block Lanczos",
 }
 
 
@@ -342,7 +351,7 @@ def refuse_retired_solver(params, named, *, error=DeckError):
     value = str(params.get("solver")).strip().lower()
     if value in RETIRED_SOLVER_VALUES:
         raise error(f"GATE bse_retired_key: `solver = {value}` selected "
-                    f"{RETIRED_SOLVER_VALUES[value]} eigensolver, retired 2026-11-27 "
+                    f"the {RETIRED_SOLVER_VALUES[value]} eigensolver, retired 2026-11-27 "
                     f"(got: `solver = {params.get('solver')}`; want: `solver = davidson` or the "
                     f"key absent).  Why: the Davidson is the Tamm-Dancoff eigensolver.  "
                     f"Fix: remove the `solver` key or set `solver = davidson`")

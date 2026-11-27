@@ -115,7 +115,7 @@ _bse_flags(_BSE_SOLVERS, {
                     "(eqp.dat), a value names the file"),
     "--dipole": "dipole_file",
     "--n-eig": "number_eigenvalues",
-    "--block-size": "block_size",
+    "--block-size": Rename("", "the block Lanczos was retired 2026-11-27; the Davidson is the Tamm-Dancoff eigensolver"),
 })
 _bse_flags(("bse.bse_jax", "bse.absorption_haydock"), {
     "--dipole-position-fix": "dipole_position_fix",
@@ -128,15 +128,15 @@ _bse_flags(("bse.bse_jax",), {
     "--lanczos": Rename("", "it changed nothing; the eigensolve is the default route"),
     "--feast": _FEAST_RETIRED,
     "--kpm-dos": "kpm_dos",
-    "--solver": Rename("solver", "values davidson, block_lanczos"),
+    "--solver": Rename("solver", "the value davidson (the only one)"),
     "--write-eigs": Rename("write_eigenvectors", "BerkeleyGW's sign convention: < 0 writes "
                                                  "every computed state"),
     "--qp-rotations": "qp_rotations_file",
     "--helicity-table": "helicity_table",
     "--max-lanczos-iter": "solver_max_iter",
-    "--lanczos-rtol": "lanczos_rtol",
-    "--lanczos-check-every": "lanczos_check_every",
-    "--n-reorth": "lanczos_n_reorth",
+    "--lanczos-rtol": Rename("", "the block Lanczos was retired 2026-11-27; the Davidson is the Tamm-Dancoff eigensolver"),
+    "--lanczos-check-every": Rename("", "the block Lanczos was retired 2026-11-27; the Davidson is the Tamm-Dancoff eigensolver"),
+    "--n-reorth": Rename("", "the block Lanczos was retired 2026-11-27; the Davidson is the Tamm-Dancoff eigensolver"),
     "--davidson-precond": "davidson_precond",
     "--davidson-tol-mev": "davidson_tol_mev",
     "--davidson-margin": "davidson_margin",
@@ -196,7 +196,7 @@ _bse_flags(("bse.absorption_haydock",), {
 })
 _bse_flags(("bse.exciton_bands",), {
     "--max-iter": "solver_max_iter",
-    "--solver": Rename("solver", "values davidson, block_lanczos"),
+    "--solver": Rename("solver", "the value davidson (the only one)"),
     "--davidson-tol-mev": "davidson_tol_mev",
     # 2026-10-22: it picked the Γ cell of the c1 head model, removed with c1.
     "--w-head-gamma-cell": Rename("", "it tuned the removed c1 head model; srlr is the "

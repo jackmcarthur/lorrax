@@ -14,12 +14,12 @@ NumPy assembly of ``K = [[A, B], [B^H, A']]`` from the pair-function definition
    ``on_indefinite='continue'`` returns the positive roots above the unstable one and counts it.
 3. ``build_pair_stacks`` slices a joint-window bundle into the conduction and valence stacks, with
    the valence pad at ``-PAD_EPS_GUARD_RY``.
-4. The deck keys: ``full_bse`` parses; ``full_bse_solver`` without it, ``solver = block_lanczos``
-   with it, and the ``bse.bse_jax`` keys this driver cannot honour (``qp_rotations_file``,
+4. The deck keys: ``full_bse`` parses; ``full_bse_solver`` without it, and
+   the ``bse.bse_jax`` keys this driver cannot honour (``qp_rotations_file``,
    ``highest_occupied_band``) refuse.  The Davidson's tuning keys (``davidson_olsen``,
    ``davidson_margin``, ``davidson_eps_shift``, ``davidson_precond``, ``davidson_m_max``,
    ``davidson_margin_tol_mev``) are read and reach the solve (same roots, a block of n_eig + 4);
-   they refuse under ``solver = block_lanczos`` and under the dense full solve.
+   they refuse under the dense full solve.
 
 A script on a 1x1 mesh: ``JAX_PLATFORMS=cpu python -m tests.test_exciton_bands_full_bse``.  It skips
 under pytest (importing the driver starts the runtime).
@@ -168,11 +168,9 @@ def run_cases(mesh):
                                              davidson_eps_shift_Ry=1e-3, davidson_margin=8,
                                              davidson_margin_tol_Ry=None, davidson_m_max=None)
         and out["tuned_vs_eig_mev"] <= 0.01 and out["tuned_block"] == N_EIG + 4
-        and refuses(["solver = block_lanczos", "davidson_olsen = true"], check=True)
         and refuses(["full_bse = true", "davidson_margin = 4"], check=True)       # dense reads none
         and not a0.full_bse and a0.full_solver == "dense"
         and refuses(["full_bse_solver = davidson"])
-        and refuses(["full_bse = true", "solver = block_lanczos"])
         and refuses(["full_bse = true", "full_bse_instability = continue"])      # dense has no such option
         and refuses(["qp_rotations_file = rot.h5"]) and refuses(["highest_occupied_band = 4"])
         and not refuses(["full_bse = true"]) and not refuses(["haydock = true"]))

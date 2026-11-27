@@ -1,13 +1,16 @@
-"""Lanczos solvers for BSE.
+"""The Tamm-Dancoff BSE eigensolve: the Davidson on the trial-stack matvec.
 
-The generic Lanczos algorithms live in solvers.lanczos.  This module
-re-exports them and provides ``solve_bse_sharded``, the one BSE solve (any
-mesh, including 1x1), built on the trial-stack matvec.
+(The module keeps the name of the Lanczos solvers it used to hold; they were
+retired 2026-11-27.)  ``solve_bse_sharded`` is the one BSE solve, on any mesh
+(1x1 included): the Davidson of ``solvers.davidson`` with the exact diagonal
+preconditioner on the trial-stack matvec, or, with ``tda=False``, a hand-off to
+``bse_nontda`` (the dense structure-preserving solve or the full-BSE Davidson).
+It also holds the Davidson's stop line, basis pricing and thread gate that the
+BSE drivers share.
 """
 from __future__ import annotations
 
 import os
-from functools import partial
 from typing import Tuple
 
 import jax
@@ -19,46 +22,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.collectives import replicate_to_mesh
 from common.fft_helpers import get_donated_kfft_kminor
 
-from solvers.lanczos import (
-    FULL_REORTH,
-    alpha_herm_sink,
-    block_lanczos_eig_jit,
-    block_lanczos_eig_jit_converged,
-    report_alpha_herm,
-    simple_lanczos_eig,
-    split_alpha_sink,
-)
+from solvers.lanczos import simple_lanczos_eig  # noqa: F401  (re-exported by bse_jax)
 from common.log import get_logger
 
 log = get_logger(__name__)
-
-#: Third element of ``solve_bse_sharded``'s return tuple when the route ran a
-#: FIXED number of iterations and therefore never measured a convergence point.
-#:
-#: The fixed-iteration routes here (``block_lanczos_eig_jit`` at any block
-#: size, ``davidson``) run their full iteration budget unconditionally.  They used
-#: to return ``jnp.int32(max_iter)``, which is the BUDGET wearing a
-#: MEASUREMENT's name: a caller reading ``n_iter_done`` cannot tell "converged
-#: after 200" from "was told to do 200".  Only
-#: ``block_lanczos_eig_jit_converged`` (``rtol > 0``) returns a real count.
-#:
-#: The honest form is a sentinel that cannot be mistaken for a count.  Callers
-#: that want the budget ask for the budget, through ``iters_reported`` below --
-#: which is the only place the two meanings are allowed to meet.
-N_ITER_NOT_MEASURED = -1
-
-
-def iters_reported(n_iter_done, budget: int) -> int:
-    """Map ``n_iter_done`` onto something safe to print or compare.
-
-    Returns the measured count when the route measured one, and the iteration
-    ``budget`` when it did not.  Centralised so "how many iterations did it
-    run" has ONE answer and the sentinel can never leak into arithmetic as
-    ``-1`` (which is what a bare ``int(n_iter_done)`` would hand a caller
-    computing e.g. ``n_done * block_size``).
-    """
-    n = int(n_iter_done)
-    return int(budget) if n < 0 else n
 
 
 from common.units import RYD_TO_EV
@@ -142,13 +109,7 @@ def solve_bse_sharded(
     *,
     n_eig: int = 20,
     max_iter: int = 200,
-    n_reorth: int = FULL_REORTH,
     include_W: bool = True,
-    block_size: int = 1,
-    rtol: float = 0.0,
-    atol: float = 1e-8,
-    check_every: int = 4,
-    solver_kind: str = "davidson",
     davidson_m_max: int | None = None,
     davidson_precond: str = "exact",
     davidson_olsen: bool = False,
@@ -163,23 +124,21 @@ def solve_bse_sharded(
     full_solver: str = "dense",
     full_on_indefinite: str = "refuse",
 ) -> Tuple[jax.Array, jax.Array]:
-    """The BSE eigensolve (Lanczos / block / Davidson) on any mesh.
+    """The BSE eigensolve (the Tamm-Dancoff Davidson, or the full BSE) on any mesh.
 
     The single-device ``solve_bse`` it used to sit beside was deleted with
     ``bse_serial`` (C10, 2026-09-24); a one-device run is this on a 1x1 mesh.
     The per-iteration matvec is the trial-stack matvec, which
     (a) parallelises over (px·py) GPUs,
-    (b) precomputes ``W_R = ifft(W_q)`` once outside the Lanczos loop
+    (b) precomputes ``W_R = ifft(W_q)`` once outside the iteration
         instead of per-iter (the dominant cost in the single-device
         path — 200 × 3D-FFTs of an (n_μ, n_μ, nkx,nky,nkz) tensor).
 
     Vector layout:
-        Trial vector ``X`` is shape ``(1, n_cond_pad, n_val_pad, nk)``
-        sharded ``P(None, "x", "y", None)``. The Lanczos solver
-        operates on a flat ``(n_flat,)`` representation; a thin
-        bridge reshapes + applies ``with_sharding_constraint`` once
-        per matvec, so collectives inside the matvec remain on the
-        ``(x, y)`` mesh.
+        Trial vectors ``X`` have shape ``(m, n_cond_pad, n_val_pad, nk)``
+        sharded ``P(None, "x", "y", None)``; ``apply_H`` applies
+        ``with_sharding_constraint`` once per matvec, so collectives inside
+        the matvec remain on the ``(x, y)`` mesh.
 
     The data dict must come from ``bse_io.load_bse_data_from_restart_sharded``
     and contains psi_{c,v}_{X,Y}, eps_c, eps_v, V_q0 (P("x","y")), W_q
@@ -187,13 +146,13 @@ def solve_bse_sharded(
     applied at load time.
 
     ``tda`` (default True) selects the Tamm-Dancoff resonant-only Hamiltonian
-    (the block/single-vector Lanczos + Davidson paths below).  ``tda=False``
+    (the Davidson below).  ``tda=False``
     dispatches to the structure-preserving full-BSE eigensolver
     ``bse_nontda.solve_bse_nontda_sharded`` — the ONE non-TDA seam, no parallel
     solver stack — which returns paired (X, Y) eigenvectors (X^H X - Y^H Y = +1).
     ``full_solver`` picks its route.  ``'dense'`` (default) reads ``n_eig`` and
     ``include_W`` only: it is the dense structure-preserving solve, so every
-    Davidson and Lanczos argument below is unread there (``bse_jax``
+    Davidson argument below is unread there (``bse_jax``
     refuses such deck keys under ``full_bse``).  ``'davidson'`` is the
     structure-preserving Davidson (``solvers.bse_sp_davidson``): it reads
     ``max_iter`` (the iteration cap), ``davidson_tol_Ry``, ``davidson_m_max``
@@ -265,33 +224,20 @@ def solve_bse_sharded(
     nkz = int(data["nkz"])
     nk = nkx * nky * nkz
     n_flat = nc_pad * nv_pad * nk
-    bs = int(block_size)
-    shape = (bs, nc_pad, nv_pad, nk)
 
     # Trial-stack matvec (scan-inside-shard_map): applies H to the whole
-    # (block_size / Davidson subspace) stack with ONE T-tensor alive regardless
-    # of the stack width — strictly better peak memory than the legacy
-    # ring/gather/simple matvecs (whose T scaled with the stack). Same
-    # (X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0) -> HX
-    # signature, so it is a drop-in for both the bs==1 and block paths below.
-    # The legacy ``matvec_kind`` selector is retired here; see the retirement
-    # note in bse_stack_matvec (ring/gather/simple + selector deletion pending).
+    # Davidson subspace stack with ONE T-tensor alive regardless of the stack
+    # width — strictly better peak memory than the legacy ring/gather/simple
+    # matvecs (whose T scaled with the stack).  The legacy ``matvec_kind``
+    # selector is retired here; see the retirement note in bse_stack_matvec
+    # (ring/gather/simple + selector deletion pending).
     from .bse_stack_matvec import build_bse_stack_matvec
     # ``head_tensor`` (exciton_bands' mini-BZ head): ``(D_head, M_head)`` operands
-    # of the stack matvec's head term, read by the Davidson route only.
+    # of the stack matvec's head term.
     head_tensor = data.get("head_tensor")
-    if head_tensor is not None and solver_kind != "davidson":
-        raise ValueError("solve_bse_sharded: a head_tensor payload is solved by "
-                         "solver_kind='davidson' only")
     # ``occupation_weights`` (n_c, n_v, nk): sqrt(f_v - f_c) of the transitions,
     # the applier's last operand; A = dE + w K w with zero-weight pairs masked.
     occupation_weights = data.get("occupation_weights")
-    if occupation_weights is not None and solver_kind != "davidson":
-        raise ValueError(
-            "GATE bse_occupation_weights: a payload with occupation_weights is solved by "
-            f"solver_kind='davidson' only (got: {solver_kind!r}; want: 'davidson').  Why: the "
-            "Lanczos start vectors are not kept off the masked pairs, whose transitions would "
-            "appear as roots.  Fix: solver = davidson.")
     with timing.section("bse.solve.matvec_build"):
         matvec_ring = build_bse_stack_matvec(
             mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
@@ -323,8 +269,7 @@ def solve_bse_sharded(
     #    slice object every call would miss every time.  One stashed slice
     #    makes the second and later builds free.
     # It costs 1/64 of one W_q and is dropped with the payload.
-    _need_W_q0 = (include_W and solver_kind == "davidson"
-                  and davidson_precond == "exact")
+    _need_W_q0 = include_W and davidson_precond == "exact"
     if _need_W_q0:
         from .bse_davidson_helpers import w_q0_for_precond
         _W_q0 = w_q0_for_precond(data)
@@ -336,7 +281,7 @@ def solve_bse_sharded(
     # There it can never free W_q: W_q is a jit PARAMETER, so its buffer is
     # owned by the caller for the whole call and XLA has no same-shape OUTPUT
     # to alias it to ("donation was always declined").  The result was BOTH
-    # W_q and W_R resident for the entire Lanczos: 2 x (μ_pad/p_x) x
+    # W_q and W_R resident for the entire solve: 2 x (μ_pad/p_x) x
     # (ν_pad/p_y) x nk x 16 bytes per rank (2 x 404 MB at μ=10015 / P=64;
     # ∝ μ²/P, so 2 x 4.1 GB at μ=32k).  Hoisting the transform into its own
     # donated jit lets XLA alias W_R onto W_q's buffer and lets the caller
@@ -378,286 +323,140 @@ def solve_bse_sharded(
         W_R = data["W_q"]
 
     # ── Davidson path: pass resident operator/preconditioner arrays as
-    # explicit operands of the fixed-capacity solve. Returns
-    # the same `(eigenvalues, eigenvectors, n_iter_done)` tuple as the
-    # Lanczos path so callers don't branch — see the RETURN CONVENTION note at
-    # the bottom of this branch for what "the same tuple" has to mean.
-    if solver_kind == "davidson":
-        from solvers.davidson import davidson
-        from .bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
+    # explicit operands of the fixed-capacity solve.  Returns
+    # `(eigenvalues, eigenvectors, n_iter_done)`, the iteration count measured.
+    from solvers.davidson import davidson
+    from .bse_davidson_helpers import bse_diagonal_precond, init_bse_subspace
 
-        psi_c_X = data["psi_c_X"]; psi_c_Y = data["psi_c_Y"]
-        psi_v_X = data["psi_v_X"]; psi_v_Y = data["psi_v_Y"]
-        eps_c   = head_shifted_eps_c(data["eps_c"], data)
-        eps_v   = data["eps_v"]
-        V_q0    = data["V_q0"]
-        M       = data["M"]  # hoisted V-term pair amplitude (P3)
-        # W_R already built above (donated top-level ifft).
+    psi_c_X = data["psi_c_X"]; psi_c_Y = data["psi_c_Y"]
+    psi_v_X = data["psi_v_X"]; psi_v_Y = data["psi_v_Y"]
+    eps_c   = head_shifted_eps_c(data["eps_c"], data)
+    eps_v   = data["eps_v"]
+    V_q0    = data["V_q0"]
+    M       = data["M"]  # hoisted V-term pair amplitude (P3)
+    # W_R already built above (donated top-level ifft).
 
-        operator_data = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                         eps_c, eps_v, W_R, V_q0, M, *(head_tensor or ()),
-                         *(() if occupation_weights is None else (occupation_weights,)))
+    operator_data = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
+                     eps_c, eps_v, W_R, V_q0, M, *(head_tensor or ()),
+                     *(() if occupation_weights is None else (occupation_weights,)))
 
-        def apply_H(solver_data, V):
-            V = jax.lax.with_sharding_constraint(V, sh.X)
-            return matvec_ring(V, *solver_data[0])
+    def apply_H(solver_data, V):
+        V = jax.lax.with_sharding_constraint(V, sh.X)
+        return matvec_ring(V, *solver_data[0])
 
-        bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
-        _refuse_cpu_davidson_threads(mesh_xy)
-        # ── preconditioner route ──────────────────────────────────────
-        # "bare"  : 1/(dE - lam + eps)          -- what LORRAX has always done
-        # "exact" : 1/(diag(H) - lam + eps)     -- what BerkeleyGW hands PRIMME
-        # The exact diagonal is assembled ONCE here (two einsums, ~0.3 GFLOP,
-        # under a third of one matvec).  The per-iteration application is
-        # elementwise on the (c, v, k) shards either way: same shape, same
-        # sharding, ZERO collectives, no new shard_map, no retrace.
-        _diag_H = None
-        if davidson_precond == "exact":
-            # include_W=False (RPA): _W_q0 is None and the build emits no
-            # screened-direct term, so the diagonal is dE + w V_x / nk.
-            from .bse_davidson_helpers import build_bse_exact_diagonal
-            from .bse_davidson_helpers import exact_diagonal_memo_stats
-            _memo_before = exact_diagonal_memo_stats()["hits"]
-            with timing.section("bse.solve.exact_diag"):
-                _diag_H = build_bse_exact_diagonal(
-                    eps_c, eps_v, psi_c_X, psi_v_Y, _W_q0, M, V_q0,
-                    nk, sharding=NamedSharding(mesh_xy, P("x", "y", None)),
-                    exchange_channel=data.get("exchange_channel", "singlet"))
-                _diag_H.block_until_ready()
-            _memoised = exact_diagonal_memo_stats()["hits"] > _memo_before
-            log.info(f"Davidson preconditioner: EXACT diag(H) "
-                     f"(dE + (V_x{' - W_d' if include_W else ''})/nk), "
-                     f"{'from memo (same payload)' if _memoised else 'assembled'}")
-        else:
-            log.info("Davidson preconditioner: bare dE")
-        if davidson_olsen:
-            log.info("Davidson preconditioner: Olsen correction ON")
-        if occupation_weights is not None:
-            # The diagonal of A = dE + w K w; masked pairs parked far above the roots.
-            from .bse_davidson_helpers import occupation_diagonal
-            _diag_H = occupation_diagonal(_diag_H, eps_c, eps_v, occupation_weights,
-                                          sharding=NamedSharding(mesh_xy, P("x", "y", None)))
+    bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
+    _refuse_cpu_davidson_threads(mesh_xy)
+    # ── preconditioner route ──────────────────────────────────────
+    # "bare"  : 1/(dE - lam + eps)          -- what LORRAX has always done
+    # "exact" : 1/(diag(H) - lam + eps)     -- what BerkeleyGW hands PRIMME
+    # The exact diagonal is assembled ONCE here (two einsums, ~0.3 GFLOP,
+    # under a third of one matvec).  The per-iteration application is
+    # elementwise on the (c, v, k) shards either way: same shape, same
+    # sharding, ZERO collectives, no new shard_map, no retrace.
+    _diag_H = None
+    if davidson_precond == "exact":
+        # include_W=False (RPA): _W_q0 is None and the build emits no
+        # screened-direct term, so the diagonal is dE + w V_x / nk.
+        from .bse_davidson_helpers import build_bse_exact_diagonal
+        from .bse_davidson_helpers import exact_diagonal_memo_stats
+        _memo_before = exact_diagonal_memo_stats()["hits"]
+        with timing.section("bse.solve.exact_diag"):
+            _diag_H = build_bse_exact_diagonal(
+                eps_c, eps_v, psi_c_X, psi_v_Y, _W_q0, M, V_q0,
+                nk, sharding=NamedSharding(mesh_xy, P("x", "y", None)),
+                exchange_channel=data.get("exchange_channel", "singlet"))
+            _diag_H.block_until_ready()
+        _memoised = exact_diagonal_memo_stats()["hits"] > _memo_before
+        log.info(f"Davidson preconditioner: EXACT diag(H) "
+                 f"(dE + (V_x{' - W_d' if include_W else ''})/nk), "
+                 f"{'from memo (same payload)' if _memoised else 'assembled'}")
+    else:
+        log.info("Davidson preconditioner: bare dE")
+    if davidson_olsen:
+        log.info("Davidson preconditioner: Olsen correction ON")
+    if occupation_weights is not None:
+        # The diagonal of A = dE + w K w; masked pairs parked far above the roots.
+        from .bse_davidson_helpers import occupation_diagonal
+        _diag_H = occupation_diagonal(_diag_H, eps_c, eps_v, occupation_weights,
+                                      sharding=NamedSharding(mesh_xy, P("x", "y", None)))
 
-        precond_fn = bse_diagonal_precond(
-            eps_c, eps_v, sharding=NamedSharding(mesh_xy, P("x", "y", None)),
-            epsilon_shift=davidson_eps_shift_Ry,
-            diag_H=_diag_H, olsen=davidson_olsen)
-        solver_data = (operator_data, precond_fn.data)
-        precond_apply = precond_fn.apply
+    precond_fn = bse_diagonal_precond(
+        eps_c, eps_v, sharding=NamedSharding(mesh_xy, P("x", "y", None)),
+        epsilon_shift=davidson_eps_shift_Ry,
+        diag_H=_diag_H, olsen=davidson_olsen)
+    solver_data = (operator_data, precond_fn.data)
+    precond_apply = precond_fn.apply
 
-        def apply_precond(payload, R, values, X):
-            return precond_apply(payload[1], R, values, X)
+    def apply_precond(payload, R, values, X):
+        return precond_apply(payload[1], R, values, X)
 
-        # Margin roots (DAVIDSON_MARGIN_ROOTS): solve n_solve, stop on and report
-        # the lowest n_eig.  Fewer when the physical space cannot hold a
-        # 2 x n_solve basis.
-        n_phys = int(data["n_cond"]) * int(data["n_val"]) * nk
-        n_solve = n_eig + max(0, min(int(davidson_margin), n_phys // 2 - n_eig))
-        if occupation_weights is not None:
-            from .bse_davidson_helpers import occupation_start_block
-            X0 = occupation_start_block(
-                eps_c, eps_v, occupation_weights, n_rows=n_solve, n_cond=int(data["n_cond"]),
-                n_val=int(data["n_val"]), mesh=mesh_xy, sharding=bse_sharding)
-        else:
-            X0 = init_bse_subspace(
-                eps_c, eps_v, n_eig=n_solve,
-                n_cond=int(data["n_cond"]), n_val=int(data["n_val"]),
-                n_random=davidson_n_random_init,
-                mesh=mesh_xy, sharding=bse_sharding)
-
-
-        # One fixed-capacity solve replaces the former shape warmup ladder.
-        from solvers.davidson import DEFAULT_M_MAX_FACTOR
-        m_max_warm = max(int(davidson_m_max) if davidson_m_max
-                         else DEFAULT_M_MAX_FACTOR * n_eig, 2 * n_solve)
-        m_max_warm = min(m_max_warm, int(np.prod(X0.shape[1:])))
-        log.info(f"Davidson: {n_eig} roots + {n_solve - n_eig} margin"
-                 + ("" if davidson_margin_tol_Ry is None else
-                    f" (locked at {float(davidson_margin_tol_Ry) * RY_TO_MEV:g} meV)") + ", "
-                 f"m_max={m_max_warm}, storing 2*m_max = {2 * m_max_warm} trial vectors")
-        _price_davidson_basis(m_max_warm, X0, mesh_xy)
-        eigenvalues, eigenvectors = davidson(
-            apply_H, n_eig=n_solve, n_converge=n_eig, precond_fn=apply_precond, X0=X0,
-            # A caller that solves many same-shape payloads (exciton_bands, one per
-            # Q) names the run; the key adds everything the two programs close over.
-            plan_key=(None if davidson_plan_key is None else (
-                davidson_plan_key, mesh_xy, bool(include_W), head_tensor is not None,
-                occupation_weights is not None,
-                data.get("exchange_channel", "singlet"),
-                davidson_precond, bool(davidson_olsen), float(davidson_eps_shift_Ry),
-                tuple((tuple(a.shape), str(a.dtype)) for a in operator_data))),
-            data=solver_data,
-            m_max=m_max_warm,
-            max_iter=max_iter, tol=float(davidson_tol_Ry),
-            verbose=True,
-            # Soft locking: a root under the tolerance adds no correction, so H
-            # is applied only to the open roots' directions.  Si 8^3 lowest 40
-            # at 0.01 meV (dense CPU count): 265 H applications, 800 without.
-            lock_converged=True,
-            margin_lock=(1.0 if davidson_margin_tol_Ry is None else
-                         max(1.0, float(davidson_margin_tol_Ry) / float(davidson_tol_Ry))),
-        )
-
-        from solvers.davidson import (
-            LAST_RUN as _DAV_HIST, instrumentation_summary as _dav_summary)
-        log.debug(_dav_summary())
-
-        # Keep the physical (c, v) axes distributed across all processors.
-        # The writer gathers explicitly when serializing eigenvectors.
-        root_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
-        eigenvectors = jax.jit(
-            lambda a: a[:n_eig].reshape(n_eig, 1, nc_pad, nv_pad, nk),
-            out_shardings=root_sharding,
-        )(eigenvectors)
-        # ``davidson`` returns eigenvalues as a HOST numpy array (it needs them
-        # on the host for its own convergence test), where Lanczos returns a
-        # replicated device array.  ``replicate_to_mesh`` declares the identical
-        # per-rank copy as the replica with NO collective; its precondition —
-        # bit-identical on every rank — holds because every rank ran the same
-        # deterministic reduction to get it.
-        eigenvalues = replicate_to_mesh(np.asarray(eigenvalues)[:n_eig], mesh_xy)
-        # The iterations the while_loop actually ran: Davidson stops on its
-        # residual test, so this is a measured count, not the budget.
-        return eigenvalues, eigenvectors, jnp.int32(int(_DAV_HIST["iter"][0]))
-
-
-    from distrib_la import plan_subspace
-    lanczos_vector_shape = (nc_pad, nv_pad, nk)
-    # The Krylov space lives on the physical transitions, as in
-    # exciton_bands: the start block has no support on the mesh pad, which
-    # the operator keeps at exactly zero, so the recurrence and its
-    # α-Hermiticity scale are the same numbers at every P.  The depth
-    # counts physical transitions.
-    lanczos_support = (int(data["n_cond"]), int(data["n_val"]), nk)
+    # Margin roots (DAVIDSON_MARGIN_ROOTS): solve n_solve, stop on and report
+    # the lowest n_eig.  Fewer when the physical space cannot hold a
+    # 2 x n_solve basis.
     n_phys = int(data["n_cond"]) * int(data["n_val"]) * nk
-    lanczos_depth = max(1, min(int(max_iter), n_phys // bs))
-    lanczos_plan = plan_subspace(
-        capacity=(lanczos_depth + 1) * bs, n_eig=n_eig,
-        max_block_size=max(bs, n_eig),
-        vector_sharding=NamedSharding(mesh_xy, P(None, "x", "y", None)))
-    rep_eig = NamedSharding(mesh_xy, P())  # eigenvalues / eigenvectors come back replicated.
-    # The static half of the α-Hermiticity reports the Krylov solve collects
-    # (solver name + α form).  Filled at TRACE time by ``_full_run`` below and
-    # read back on the host after the call; the numbers themselves come back
-    # as ``_full_run``'s fourth output.  See ``solvers.lanczos``'s header for
-    # why the report may not be a ``jax.debug.callback`` here: a host callback
-    # makes this module — the single program holding the whole Krylov loop —
-    # unpersistable in JAX's compilation cache, so the 2.1 s XLA compile was
-    # paid on every warm run.
-    _alpha_labels: list = []
+    n_solve = n_eig + max(0, min(int(davidson_margin), n_phys // 2 - n_eig))
+    if occupation_weights is not None:
+        from .bse_davidson_helpers import occupation_start_block
+        X0 = occupation_start_block(
+            eps_c, eps_v, occupation_weights, n_rows=n_solve, n_cond=int(data["n_cond"]),
+            n_val=int(data["n_val"]), mesh=mesh_xy, sharding=bse_sharding)
+    else:
+        X0 = init_bse_subspace(
+            eps_c, eps_v, n_eig=n_solve,
+            n_cond=int(data["n_cond"]), n_val=int(data["n_val"]),
+            n_random=davidson_n_random_init,
+            mesh=mesh_xy, sharding=bse_sharding)
 
-    # End-to-end jit with explicit in/out shardings + donate the bulky
-    # buffers we won't need post-Lanczos.
-    @partial(
-        jax.jit,
-        in_shardings=(
-            sh.psi_x, None, None, sh.psi_y,          # coupling legs: unread (TDA)
-            sh.eps, sh.eps, sh.W, sh.V, sh.M,
-        ),
-        # Fourth entry covers the α-Hermiticity payload: a pytree prefix, so
-        # ``rep_eig`` applies to each of its (replicated, scalar) leaves.
-        out_shardings=(rep_eig, sh.X, rep_eig, rep_eig),
-        # NB: arg 6 is now W_R (already ifft'd, DONATED at its own top-level
-        # boundary above) rather than W_q.  Donating it HERE is still declined
-        # — there is no aliasable same-shape output of a Lanczos solve — which
-        # is the original audit-P5 observation; the fix was to move the
-        # transform out, not to donate the eigensolve's inputs.
+
+    # One fixed-capacity solve replaces the former shape warmup ladder.
+    from solvers.davidson import DEFAULT_M_MAX_FACTOR
+    m_max_warm = max(int(davidson_m_max) if davidson_m_max
+                     else DEFAULT_M_MAX_FACTOR * n_eig, 2 * n_solve)
+    m_max_warm = min(m_max_warm, int(np.prod(X0.shape[1:])))
+    log.info(f"Davidson: {n_eig} roots + {n_solve - n_eig} margin"
+             + ("" if davidson_margin_tol_Ry is None else
+                f" (locked at {float(davidson_margin_tol_Ry) * RY_TO_MEV:g} meV)") + ", "
+             f"m_max={m_max_warm}, storing 2*m_max = {2 * m_max_warm} trial vectors")
+    _price_davidson_basis(m_max_warm, X0, mesh_xy)
+    eigenvalues, eigenvectors = davidson(
+        apply_H, n_eig=n_solve, n_converge=n_eig, precond_fn=apply_precond, X0=X0,
+        # A caller that solves many same-shape payloads (exciton_bands, one per
+        # Q) names the run; the key adds everything the two programs close over.
+        plan_key=(None if davidson_plan_key is None else (
+            davidson_plan_key, mesh_xy, bool(include_W), head_tensor is not None,
+            occupation_weights is not None,
+            data.get("exchange_channel", "singlet"),
+            davidson_precond, bool(davidson_olsen), float(davidson_eps_shift_Ry),
+            tuple((tuple(a.shape), str(a.dtype)) for a in operator_data))),
+        data=solver_data,
+        m_max=m_max_warm,
+        max_iter=max_iter, tol=float(davidson_tol_Ry),
+        verbose=True,
+        # Soft locking: a root under the tolerance adds no correction, so H
+        # is applied only to the open roots' directions.  Si 8^3 lowest 40
+        # at 0.01 meV (dense CPU count): 265 H applications, 800 without.
+        lock_converged=True,
+        margin_lock=(1.0 if davidson_margin_tol_Ry is None else
+                     max(1.0, float(davidson_margin_tol_Ry) / float(davidson_tol_Ry))),
     )
-    def _full_run(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M):
-        with alpha_herm_sink() as _sink:
-            evs, evecs, n_it = _krylov(
-                psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                W_R, V_q0, M,
-            )
-        labels, payload = split_alpha_sink(_sink)
-        _alpha_labels[:] = labels
-        return evs, evecs, n_it, payload
 
-    def _krylov(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M):
-        if bs == 1:
-            # Single-vector matvec — accept (n_flat,) and reshape to (1, c, v, k).
-            def matvec(v_flat):
-                X = v_flat.reshape(shape)
-                X = jax.lax.with_sharding_constraint(X, sh.X)
-                HX = matvec_ring(
-                    X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                    eps_c, eps_v, W_R, V_q0, M,
-                )
-                return HX[0]
-            # The block kernel at block_size=1 is the single-vector Lanczos.
-            def matvec_block(V_block):
-                return matvec(V_block[0])[None]
-            if rtol > 0.0:
-                # Convergence-driven path: the block while_loop, early exit.
-                return block_lanczos_eig_jit_converged(
-                    matvec_block, n_flat, n_eig=n_eig,
-                    block_size=1, max_iter=max_iter,
-                    rtol=rtol, atol=atol, check_every=check_every,
-                    n_reorth=n_reorth,
-                    subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
-                    structured_vectors=True, support_shape=lanczos_support,
-                )
-            evs, evecs = block_lanczos_eig_jit(
-                matvec_block, n_flat, n_eig=n_eig,
-                block_size=1, max_iter=max_iter, n_reorth=n_reorth,
-                subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
-                structured_vectors=True, support_shape=lanczos_support,
-            )
-            return evs, evecs, jnp.int32(N_ITER_NOT_MEASURED)
-        else:
-            # Block matvec — accept (block_size, n_flat) and reshape to
-            # (block_size, c, v, k). Each call processes ``block_size``
-            # vectors at once → ``block_size``-larger GEMMs (better GPU
-            # occupancy) and ``block_size``-fewer host dispatches.
-            def matvec_block(V_block):
-                X = V_block.reshape(shape)
-                X = jax.lax.with_sharding_constraint(X, sh.X)
-                HX = matvec_ring(
-                    X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                    eps_c, eps_v, W_R, V_q0, M,
-                )
-                return HX
-            if rtol > 0.0:
-                # Convergence-driven: ``lax.while_loop`` exits when the
-                # n_eig lowest Ritz values stabilise within ``rtol``.
-                return block_lanczos_eig_jit_converged(
-                    matvec_block, n_flat, n_eig=n_eig,
-                    block_size=bs, max_iter=max_iter,
-                    rtol=rtol, atol=atol, check_every=check_every,
-                    n_reorth=n_reorth,
-                    subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
-                    structured_vectors=True, support_shape=lanczos_support,
-                )
-            else:
-                evs, evecs = block_lanczos_eig_jit(
-                    matvec_block, n_flat, n_eig=n_eig,
-                    block_size=bs, max_iter=max_iter, n_reorth=n_reorth,
-                    subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
-                    structured_vectors=True, support_shape=lanczos_support,
-                )
-                return evs, evecs, jnp.int32(N_ITER_NOT_MEASURED)
+    from solvers.davidson import (
+        LAST_RUN as _DAV_HIST, instrumentation_summary as _dav_summary)
+    log.debug(_dav_summary())
 
-    # ONE program: trace + XLA compile + the entire Krylov loop's execution.
-    # Split compile from execution by lowering/compiling first, so the two
-    # costs the campaign A/Bs are separately visible instead of fused into
-    # ``bse.eigensolve``.  Value-identical: the same jit, the same operands.
-    _args = (
-        data["psi_c_X"], data["psi_c_Y"],
-        data["psi_v_X"], data["psi_v_Y"],
-        head_shifted_eps_c(data["eps_c"], data), data["eps_v"],
-        W_R, data["V_q0"],
-        data["M"],
-    )
-    with timing.section("bse.solve.krylov_compile"):
-        _full_run_c = _full_run.lower(*_args).compile()
-    with timing.section("bse.solve.krylov_run") as _sec_kr:
-        eigenvalues, eigenvectors, n_iter_done, _alpha = _full_run_c(*_args)
-        _sec_kr.watch(eigenvalues)
-        _sec_kr.watch(eigenvectors)
-    # The α-Hermiticity gate, run on the host on the scalars the jit just
-    # returned.  Identical check to the in-jit callback it replaces; it is
-    # OUT here so that ``jit__full_run`` carries no host callback and JAX will
-    # persist it (a cached module is ~2.1 s of XLA compile per warm run).
-    report_alpha_herm(_alpha_labels, _alpha)
-    eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
-    return eigenvalues, eigenvectors, n_iter_done
+    # Keep the physical (c, v) axes distributed across all processors.
+    # The writer gathers explicitly when serializing eigenvectors.
+    root_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
+    eigenvectors = jax.jit(
+        lambda a: a[:n_eig].reshape(n_eig, 1, nc_pad, nv_pad, nk),
+        out_shardings=root_sharding,
+    )(eigenvectors)
+    # ``davidson`` returns eigenvalues as a HOST numpy array (it needs them
+    # on the host for its own convergence test).  ``replicate_to_mesh`` declares the identical
+    # per-rank copy as the replica with NO collective; its precondition —
+    # bit-identical on every rank — holds because every rank ran the same
+    # deterministic reduction to get it.
+    eigenvalues = replicate_to_mesh(np.asarray(eigenvalues)[:n_eig], mesh_xy)
+    # The iterations the while_loop actually ran: Davidson stops on its
+    # residual test, so this is a measured count, not the budget.
+    return eigenvalues, eigenvectors, jnp.int32(int(_DAV_HIST["iter"][0]))

@@ -460,7 +460,6 @@ per rank. The fused kernel runs at 2.27× the flop floor.
 | route | driver flags | module | use |
 |---|---|---|---|
 | Davidson (default) | `full_bse = false` (no route flag; `the eigensolve` is an alias) | `solvers.davidson.davidson` with `lock_converged`, the exact diagonal preconditioner and start subspace from `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots, stopped when every residual is below `davidson_tol_mev` (0.01 meV) |
-| Lanczos, block Lanczos | `full_bse = false solver = block_lanczos` | `bse_lanczos.solve_bse_sharded` | spectrum shape; fixed Krylov dimension, CGS2 reorthogonalization, full window by default |
 | full BSE, dense (default) | no route flag, `full_bse = true` (`bse.exciton_bands`: input key `full_bse_solver = dense`, the default) | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve of the assembled $A$ and $B$, N ≤ 4096; at a finite pair momentum, of the four assembled blocks of $\mathcal K$ |
 | full BSE, Davidson | `full_bse = true full_bse_solver = davidson` | `solvers.bse_sp_davidson` through `bse.bse_nontda`, with the exact diagonal ($[D; -D]$, or $[D; -D']$ at finite $Q$) and the start subspace of `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots with their $(X, Y)$, no assembly and no size limit, stopped when every residual is below `davidson_tol_mev` (0.01 meV); reports $\lambda_{\min}(\mathcal K)$; at finite $Q$ the unpaired form |
 | density of states | `--kpm-dos`; `--tda` or not | `bse.bse_kpm` | KPM Chebyshev moments |
@@ -473,10 +472,12 @@ Both full routes serve a finite pair momentum through `bse.exciton_bands`
 With `full_bse = true` the dense solve (`full_bse_solver = dense`, the default)
 reads `number_eigenvalues` and the
 kernel only (`bse_lanczos.solve_bse_sharded` returns to `bse_nontda` before it reads any
-solver option). `bse_jax` refuses a `davidson_*` or `lanczos_*` key set away from its
-default. `solver` other than `davidson` and `block_size` other than 1 refuse under either
-`full_bse_solver` (neither route reads them), and under `dense` so do `davidson_tol_mev` and
-`solver_max_iter`; the refusal names `full_bse_solver` or the key to drop. The dense solve reduces
+solver option). `bse_jax` refuses a `davidson_*` key set away from its
+default. Under `dense` so do `davidson_tol_mev` and `solver_max_iter`; the refusal names
+`full_bse_solver` or the key to drop. The keys of the retired Lanczos routes (`block_size`,
+`lanczos_rtol`, `lanczos_check_every`, `lanczos_n_reorth`, `trlan_m_max`, `trlan_n_keep`) and the
+values `solver = block_lanczos` and `solver = trlan` refuse on every route
+(`GATE bse_retired_key`, retired 2026-11-27). The dense solve reduces
 $\mathcal K z = \Omega\,\Sigma z$, $\mathcal K = \begin{pmatrix} A & B \\ B^* & A^* \end{pmatrix}$,
 $\Sigma = \mathrm{diag}(1, -1)$, by a Cholesky factor $\mathcal K = LL^\dagger$ and the Hermitian
 $L^{-1}\Sigma L^{-\dagger}$ (Shao et al., Linear Algebra Appl. 488 (2016) 148, Algorithm 1). It
@@ -600,8 +601,9 @@ logs the smallest margin and writes it into the `.dat` header, whose title says 
 solved. $W$'s $q \leftrightarrow -q$ reciprocity is measured once, before `W_q` is donated. The
 driver's refusals are in the table below.
 
-Block Lanczos seeds name physical support by its logical band/k extents,
-not a host transition mask or index list. The existing subspace layout
+Random seeds name physical support by its logical band/k extents,
+not a host transition mask or index list
+(`solvers.lanczos._supported_start_block`). The existing subspace layout
 constrains the logical-shaped Gaussian draw before zero-padding; physical
 draw order and the supported-space exhaustion count are unchanged. KPM and
 spectral-bound seeds retain their padded-shape draws and restrict them by
@@ -611,8 +613,7 @@ Davidson selects its lowest-energy unit starts on the distributed band
 tiles. Only bounded score/index candidates are gathered; neither the full
 transition-energy array nor the dense seed bank is built on host. Equal
 transition energies are ordered by global transition index. Its normalized
-random tail now uses the same physical-shaped JAX Gaussian owner as block
-Lanczos, replacing NumPy draws while keeping the public seed reproducible
+random tail uses the same physical-shaped JAX Gaussian owner, replacing NumPy draws while keeping the public seed reproducible
 and padding exactly zero. This changes the initial random vectors and may
 change iteration counts; the residual tests and stored science references
 are unchanged. A full physical-manifold request uses its complete unit basis.
@@ -1175,7 +1176,7 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 | `GATE nontda_davidson_block` | `bse_nontda._solve_nontda_davidson` | `full_bse_instability = continue` with fewer margin roots than unstable or non-positive roots found |
 | `GATE nontda_route_option` | `bse_nontda.solve_bse_nontda_sharded`, `bse_lanczos.solve_bse_sharded` | an unknown solver or option name, or an option another full-BSE route reads (`davidson_*` or `on_indefinite` on the dense solve; `solver='matrixfree'`, retired 2026-11-27, is an unknown solver); `bse_jax` refuses the matching deck keys at parse time |
 | `GATE nontda_lower_row` | `bse_nontda.solve_nontda_definite_pencil` | the dense solve at a finite pair momentum: $A_{\rm low}$ not Hermitian, or $B_{\rm low} \ne B^\dagger$, to $10^{-6}$ (relative); the two rows are built from the payload's and the partner's orbitals with one kernel, and disagree when $W$ is not conjugate-reciprocal, $V(Q)$ is not Hermitian or the partner orbitals are not the payload's bands at the other momentum |
-| `GATE exb_full_bse_key` | `bse.exciton_bands._check_full_bse_keys` | `full_bse_solver` or `full_bse_instability` without `full_bse = true`; `solver = block_lanczos` with it; `full_bse_instability`, `davidson_tol_mev` or `solver_max_iter` with `full_bse_solver = dense` |
+| `GATE exb_full_bse_key` | `bse.exciton_bands._check_full_bse_keys` | `full_bse_solver` or `full_bse_instability` without `full_bse = true`; `full_bse_instability`, `davidson_tol_mev` or `solver_max_iter` with `full_bse_solver = dense` |
 | `GATE exb_unserved_key` | `bse.exciton_bands.deck_settings` | `qp_rotations_file` or `highest_occupied_band` named (and not false) in an exciton-bands input file: `bse.bse_jax` keys that change the Hamiltonian and that this driver does not read |
 | `GATE exb_full_bse_valence_window` | `bse.exciton_bands._htransform_window` | `full_bse = true` with `nval` below `number_val_bands_fine`: the htransform must fit the BSE valence bands for the antiresonant pair's hole state |
 | `GATE bse_w_block_operand` | `bse_stack_matvec.plan_w_blocks` | an 8 × 8 (μ, ν) W-term block whose outer-load handler call still has an operand of $2^{31}$ elements or more (a k grid near $8\cdot 10^6$ points at $n_s$ = 2) |
@@ -1221,7 +1222,7 @@ a frozen-kernel approximation, not that self-consistent ladder map.
   (`_DENSE_N_MAX` in `bse/bse_nontda.py`); `full_bse_solver = davidson` has no size limit in the solve (the eigenvector writer gathers one state at a time). The
   Davidson has run on GPU at 4 and 16 ranks on NiO up to 589,824 transitions (measured above) and
   on the CPU test payloads; no suite reruns the GPU cases. The finite-$Q$ full BSE exists in `bse.exciton_bands` only (`bse.bse_jax` solves $Q = 0$);
-  there `solver = block_lanczos` cannot solve it, `qp_rotations_file` and `highest_occupied_band`
+  there `qp_rotations_file` and `highest_occupied_band`
   refuse, and the dense solve stops at 4096 transitions per $Q$. The head tensor under the full BSE
   with an off-grid $Q$ has not been examined: it uses the Tamm–Dancoff path's $Q$-independent dipole
   operand. The finite-$Q$ route has CPU measurements only; the hsuite's full-BSE rows cover the H₂⁻

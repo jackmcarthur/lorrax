@@ -92,7 +92,7 @@ The rest of this docstring describes both:
     the physical nonanalytic exchange branch, so E(Q→0) need not equal
     E(Γ) on the longitudinal states.  Both facts are written into the .dat
     header.
-  * **THE SCAN** — the per-Q solve (hoisted pair amplitudes + block-Lanczos
+  * **THE SCAN** — the per-Q solve (hoisted pair amplitudes + Davidson
     over the stack matvec) is one jitted function ``lax.scan``-ned over the
     whole Q list: ONE compile serves every Q (verified by the
     JAX_LOG_COMPILES census; per-q-recompile lesson, PHASE2_LOG).
@@ -146,9 +146,6 @@ import jax.numpy as jnp
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from solvers.lanczos import (ALPHA_HERM_RTOL, alpha_herm_sink,
-                             block_lanczos_eig_jit,
-                             report_alpha_herm, split_alpha_sink)
 from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY, MODES
 from common.log import get_logger, message, record
 from common.fft_helpers import make_kfft_kminor
@@ -279,8 +276,8 @@ def _gather_host(x):
     of them onto ``tiled=False``, which raises on exactly the arrays their
     callers feed them.
 
-    WHAT THIS DRIVER FEEDS IT, NOW.  Only ``evs_dev`` — the block-Lanczos
-    Ritz values, ``P()``-sharded.  The driver's own log line records that such
+    WHAT THIS DRIVER FEEDS IT, NOW.  Only ``evs_dev`` — the per-Q Davidson
+    roots, replicated.  The driver's own log line records that such
     an array reports ``fully_addressable=False`` at P=64 (job 7882507), so it
     takes the service's ``is_fully_replicated`` arm: a LOCAL buffer read, no
     collective.  The one caller that used to hand this function a μ-sharded,
@@ -294,129 +291,14 @@ def _gather_host(x):
     return gather_to_host(x)
 
 
-# ===========================================================================
-# the single-compile path solver: scan(per-Q block-Lanczos) over the Q list
-# ===========================================================================
-def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
-                      nc_pad: int, nv_pad: int, n_cond: int, n_val: int,
-                      *, n_eig: int,
-                      block_size: int, max_iter: int, n_reorth: int | None = None,
-                      head_tensor: bool = False, exchange_channel: str = "singlet"):
-    """One jitted ``solve_path`` for a whole Q list.
-
-        solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
-                   psi_v_X, psi_v_Y, eps_v, W_R)              (default)
-        solve_path(..., W_R, D_head, M_Q)                     (head_tensor)
-            -> (evs (nQ, n_eig), alpha (per-Q α-Hermiticity scalars))
-
-    ``head_tensor`` adds the cell-averaged nonanalytic exchange head as a
-    rank-three-over-transitions term (``bse_stack_matvec``'s ``head_tensor``).
-    ``D_head`` is ``conj(d)`` on the BSE window, ``(nk, nc_pad, nv_pad, 3)``,
-    Q-INDEPENDENT — it is the q→0 coefficient of the pair amplitude, a
-    property of the k-point transition — while ``M_Q`` is the per-Q cell
-    moment ``(nQ, 3, 3)`` and therefore rides the scan xs beside ``V_Q``.
-    Default False traces the pre-existing program unchanged.
-
-    The second output is the α-Hermiticity report as DATA: it is what keeps
-    this program free of host callbacks and therefore persistable in JAX's
-    compilation cache.  Feed it to :func:`_report_alpha_over_path` together
-    with ``solve_path.alpha_labels`` (filled at trace time) to run the gate on
-    the host.  Nothing about the invariant changes — only where it is emitted.
-
-    The scan body per Q: hoist the exchange pair amplitude M from
-    the Q-shifted conduction ψ (audit-P3 contract — matvec args, computed
-    once per solve, reused across all Lanczos iterations), then run the
-    fixed-iteration block Lanczos with the ONE production stack matvec.
-    Everything Q-dependent arrives as scan xs; Q-independent operands
-    (valence ψ/ε, W_R) are loop constants.  ONE XLA compile serves every
-    Q — and every later call with the same nQ (compile census deliverable).
-    """
-    sh = make_bse_shardings(mesh_xy)
-    nk = nkx * nky * nkz
-    n_flat = nc_pad * nv_pad * nk
-    if n_reorth is None:
-        # FULL reorthogonalisation by default: exciton windows are small
-        # (n_flat = nc·nv·nk ~ 10²-10⁴), the Krylov space often saturates
-        # (solvers.lanczos clamps at floor(n/bs)), and partial reorth at
-        # saturation breeds ghost duplicates.  Full reorth costs
-        # O(M·n·bs²) — negligible next to the matvec at every BSE size.
-        n_reorth = max_iter
-    matvec = build_bse_stack_matvec(mesh_xy, nkx, nky, nkz, kernel="bse",
-                                    head_tensor=head_tensor, exchange_channel=exchange_channel)
-    from distrib_la import plan_subspace
-    # The Krylov space lives on the physical transitions: the start block
-    # has no support on the mesh pad, which the operator keeps at exactly
-    # zero, so the recurrence and its α-Hermiticity scale are the same
-    # numbers at every P (the pad's PAD_EPS_GUARD_RY diagonal used to set
-    # the scale on a padded mesh).  The depth counts physical transitions.
-    support_shape = (int(n_cond), int(n_val), nk)
-    n_phys = int(n_cond) * int(n_val) * nk
-    lanczos_depth = max(1, min(int(max_iter), n_phys // int(block_size)))
-    lanczos_plan = plan_subspace(
-        capacity=(lanczos_depth + 1) * int(block_size), n_eig=n_eig,
-        max_block_size=max(int(block_size), n_eig),
-        vector_sharding=NamedSharding(mesh_xy, P(None, "x", "y", None)))
-    # Filled at TRACE time by the sink below (see the module note on the
-    # persistable-scan fix); the static half of the α-Hermiticity report.
-    alpha_labels: list = []
-
-    @jax.jit
-    def solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
-                   psi_v_X, psi_v_Y, eps_v, W_R, D_head=None, M_Q=None):
-        def body(carry, xs):
-            if head_tensor:
-                psi_c_X, psi_c_Y, eps_c, V, M_head = xs
-            else:
-                psi_c_X, psi_c_Y, eps_c, V = xs
-                M_head = None
-            psi_c_X = lax.with_sharding_constraint(psi_c_X, sh.psi_x)
-            psi_c_Y = lax.with_sharding_constraint(psi_c_Y, sh.psi_y)
-            V = lax.with_sharding_constraint(V, sh.V)
-            M = lax.with_sharding_constraint(
-                compute_pair_amplitude(psi_c_X, psi_v_X), sh.M)
-
-            def matvec_block(Vb):
-                X = Vb.reshape(block_size, nc_pad, nv_pad, nk)
-                X = lax.with_sharding_constraint(X, sh.X)
-                extra = (D_head, M_head) if head_tensor else ()
-                HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                            eps_c, eps_v, W_R, V, M, *extra)
-                return HX
-
-            # The α-Hermiticity report leaves the trace as DATA, not as a host
-            # callback.  jax._src.compiler._cache_write refuses to persist any
-            # module carrying a host callback, and this jit wraps a lax.scan
-            # over the whole Q path — the single most expensive compile in the
-            # driver.  Un-sunk, it was rebuilt on every warm run.  The sink is
-            # opened INSIDE the scan body because that is the trace the solver
-            # is traced in; the three scalars per Q ride out as scan ys.
-            with alpha_herm_sink() as _sink:
-                evs, _ = block_lanczos_eig_jit(
-                    matvec_block, n_flat, n_eig=n_eig, block_size=block_size,
-                    max_iter=max_iter, n_reorth=n_reorth,
-                    subspace_plan=lanczos_plan,
-                    vector_shape=(nc_pad, nv_pad, nk), structured_vectors=True,
-                    support_shape=support_shape)
-            _labels, _payload = split_alpha_sink(_sink)
-            alpha_labels[:] = _labels
-            return carry, (evs[:n_eig].real, _payload)
-
-        xs = ((psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q, M_Q) if head_tensor
-              else (psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q))
-        _, (evs_all, alpha_all) = lax.scan(body, None, xs)
-        return evs_all, alpha_all
-
-    solve_path.alpha_labels = alpha_labels
-    return solve_path
-
-
 def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                                nc_pad: int, nv_pad: int, n_cond: int, n_val: int,
                                *, n_eig: int, max_iter: int, tol_mev: float, W_q0,
                                cert_rows=(), cert_tol_mev=None, exchange_channel="singlet",
                                full=None, davidson=None):
-    """The ``solver = davidson`` (default) counterpart of :func:`build_path_solver`:
-    the same call signature and outputs, the per-Q lowest ``n_eig`` from
+    """The per-Q solver of the band scan, ``solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
+    psi_v_X, psi_v_Y, eps_v, W_R[, D_head, M_Q])`` -> ``(evs (nQ, n_eig), ())``: the
+    per-Q lowest ``n_eig`` from
     ``bse_lanczos.solve_bse_sharded``'s Davidson (exact diagonal
     E_c(k+Q) - E_v(k) + (V_x(Q) - W_d)/nk, soft locking, margin roots, the
     ``tol_mev`` residual stop).  One planned solver serves every Q
@@ -527,7 +409,7 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                     del stability[-1]
                     continue
                 ev, _, _ = solve_bse_sharded(
-                    payload, mesh_xy, n_eig=n_eig, max_iter=max_iter, solver_kind="davidson",
+                    payload, mesh_xy, n_eig=n_eig, max_iter=max_iter,
                     davidson_tol_Ry=row_tol / RY_TO_MEV,
                     davidson_plan_key="exciton_bands", **tuning)
                 davidson_stop_line(n_eig=n_eig, tol_mev=row_tol, budget=max_iter,
@@ -552,27 +434,12 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
             rows.append(np.asarray(_gather_host(ev)).real)
         return replicate_to_mesh(np.stack(rows), mesh_xy), ()
 
-    solve_path.alpha_labels = []
     solve_path.stability = stability
     return solve_path
 
 
 def check_solver_flags(ap, args) -> None:
-    """A deck key only the other ``solver`` reads refuses (the default is davidson)."""
-    if args.solver == "davidson" and args.block_size != ap.get_default("block_size"):
-        ap.error("block_size is read by solver = block_lanczos only (the default solver "
-                 "is davidson since 2026-10-21); drop it or set solver = block_lanczos")
-    if args.solver == "lanczos":
-        named = [key for key, dest in (
-            ("davidson_tol_mev", "davidson_tol_mev"), ("davidson_precond", "davidson_precond"),
-            ("davidson_olsen", "davidson_olsen"), ("davidson_eps_shift", "davidson_eps_shift"),
-            ("davidson_margin", "davidson_margin"),
-            ("davidson_margin_tol_mev", "davidson_margin_tol_mev"),
-            ("davidson_m_max", "davidson_m_max"))
-                 if getattr(args, dest) != ap.get_default(dest)]
-        if named:
-            ap.error(f"{', '.join(named)} {'is' if len(named) == 1 else 'are'} read by "
-                     "solver = davidson only")
+    """A Davidson tuning key the dense full-BSE solve does not read refuses."""
     if getattr(args, "full_bse", False) and args.full_solver == "dense":
         named = [key for key in ("davidson_precond", "davidson_olsen", "davidson_eps_shift",
                                  "davidson_margin", "davidson_margin_tol_mev", "davidson_m_max")
@@ -593,7 +460,7 @@ def _precond_w_q0(args, data, log=None):
     if getattr(args, "full_bse", False) and data.get("W_q") is not None:
         from .bse_nontda import check_restart_reciprocity
         check_restart_reciprocity(data["W_q"], log=log, input_file=args.input)
-    if args.solver != "davidson" or data.get("W_q") is None:
+    if data.get("W_q") is None:
         return None
     return data["W_q"][:, :, 0, 0, 0]
 
@@ -674,17 +541,10 @@ def _log_stability(solver, nQ, log):
             f"non-positive roots)")
 
 
-def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, head_mbz, W_q0,
+def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, W_q0,
                  *, cert_rows=()):
-    """The per-Q lowest-``n_eig`` solver of the band scan: Davidson (default, cap
-    ``max(30, min(200, n_phys // 2))`` iterations) or ``solver = block_lanczos``'s fixed
-    block-Lanczos scan (40 block iterations)."""
-    if args.solver == "lanczos":
-        return build_path_solver(
-            mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, n_eig=args.n_eig,
-            block_size=args.block_size,
-            max_iter=40 if args.max_iter is None else args.max_iter, head_tensor=head_mbz,
-            exchange_channel=getattr(args, "exchange_channel", "singlet"))
+    """The per-Q lowest-``n_eig`` solver of the band scan: the Davidson (cap
+    ``max(30, min(200, n_phys // 2))`` iterations)."""
     n_phys = int(n_cond) * int(n_val) * nkx * nky * nkz
     if cert_rows:
         log.info(f"  [refit-cert] Davidson residual for both comparison rows: "
@@ -717,41 +577,6 @@ def _davidson_tuning(args) -> dict:
         davidson_margin=int(getattr(args, "davidson_margin", DAVIDSON_MARGIN_ROOTS)),
         davidson_margin_tol_Ry=None if margin_tol is None else float(margin_tol) / RY_TO_MEV,
         davidson_m_max=getattr(args, "davidson_m_max", None))
-
-
-def _report_alpha_over_path(labels, alpha_all, log=log.debug):
-    """Run the α-Hermiticity gate on the per-Q scalars the scan returned.
-
-    ``alpha_all`` is the scan-stacked payload: one ``(dev, scale, worst)``
-    triple per label, each of shape ``(nQ,)``.  The gate's verdict is a
-    per-solve ratio ``dev/scale`` against ``ALPHA_HERM_RTOL``, so reporting the
-    Q that MAXIMISES that ratio reports the worst violator on the whole path —
-    a stricter statement than any single Q, in one line instead of nQ lines.
-    The Q index is named so a failure is locatable.
-
-    Returns ``(ok, worst)``: ``ok`` is True only if the worst Q on every
-    label passes (and therefore, the ratio being maximised, only if every Q
-    passes); ``worst`` is the largest ``dev/scale`` over labels and Q, the
-    number the report's verdict line prints.
-    """
-    if not labels:
-        return True, 0.0
-    ok, worst_rel = True, 0.0
-    for (name, form), (dev, scale, worst) in zip(labels, alpha_all):
-        dev = np.asarray(dev)
-        scale = np.asarray(scale)
-        worst = np.asarray(worst)
-        rel = dev / np.maximum(scale, np.finfo(dev.dtype).tiny)
-        iq = int(np.argmax(rel))
-        worst_rel = max(worst_rel, float(rel[iq]))
-        log(f"[alpha-herm] worst of {dev.size} Q is Q#{iq} "
-            f"(dev/scale = {rel[iq]:.3e})")
-        # ``form`` is a LOOKUP KEY into solvers.lanczos._ALPHA_FORMS, not free
-        # text; the per-path context goes in ``name``, which is.
-        ok = report_alpha_herm(
-            ((f"{name} (worst of {dev.size} Q, at Q#{iq})", form),),
-            ((dev[iq], scale[iq], worst[iq]),)) and ok
-    return ok, worst_rel
 
 
 # ===========================================================================
@@ -945,7 +770,7 @@ def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
     delivers: at a Q that lies ON the coarse exchange-tile grid, the producer
     wrote an exact tile, so the BSE at that Q can be solved twice — once with
     the refit's tile and once with the producer's — with every other operand
-    (ψ_c(k+Q), ε_c(k+Q), W_R, the solver, the Lanczos block) literally the
+    (ψ_c(k+Q), ε_c(k+Q), W_R, the solver) literally the
     same array. The eigenvalue difference is then attributable to the exchange
     and to nothing else, and it is measured in the units the curve is
     published in.
@@ -1572,15 +1397,12 @@ def settings_rows(args, *, source) -> tuple:
                 else "none", source("--w-coarse-grid"),
                 "W on a coarse grid, trigonometric densification" if args.w_coarse_grid
                 else "W on the native BSE k grid"),
-        Setting("solver", "block_lanczos" if args.solver == "lanczos" else str(args.solver),
+        Setting("solver", str(args.solver),
                 source("solver"),
                 f"Davidson per Q, exact diagonal, residual below "
-                f"{float(args.davidson_tol_mev):g} meV" if args.solver == "davidson"
-                else f"block Lanczos per Q, block size {int(args.block_size)}"),
+                f"{float(args.davidson_tol_mev):g} meV"),
         Setting("solver_max_iter", "auto" if args.max_iter is None else str(int(args.max_iter)),
-                source("solver_max_iter"),
-                "iteration cap" if args.solver == "davidson"
-                else "block iterations (Krylov = block x iter)"),
+                source("solver_max_iter"), "iteration cap"),
         Setting("eqp_corrections", os.path.basename(str(args.eqp)) if args.eqp else "none",
                 source("eqp_corrections", "eqp_co_corrections"),
                 "quasiparticle corrections from this file" if args.eqp
@@ -1643,10 +1465,8 @@ EXB_KEYS = {
     "degeneracy_check_override": Key("degeneracy_check_override", "bool"),
     "degeneracy_tol_ry": Key("degeneracy_tol_ry", "float"),
     "number_eigenvalues": Key("n_eig", "int"),
-    "solver": Key("solver", choices=("davidson", "block_lanczos"),
-                  convert=lambda name: "lanczos" if name == "block_lanczos" else name),
+    "solver": Key("solver", choices=("davidson",)),
     "davidson_tol_mev": Key("davidson_tol_mev", "float"),
-    "block_size": Key("block_size", "int"),
     "solver_max_iter": Key("max_iter", "int"),
     "dipole_file": Key("dipole", "path"),
     # The Davidson's tuning keys, as bse.bse_jax reads them (both Davidsons).
@@ -1697,19 +1517,15 @@ def _settings_defaults():
                          f"between-pair boundary gap measured on the Si "
                          f"12x12 SOC deck was 5.9 meV)")
     ap.add_argument("--n-eig", type=int, default=6)
-    ap.add_argument("--solver", choices=("davidson", "lanczos"), default="davidson",
-                    help="per-Q lowest --n-eig solver: davidson (default; "
-                         "bse_lanczos' exact-diagonal Davidson, stopped on the "
-                         "--davidson-tol-mev residual) or lanczos (fixed block "
-                         "Lanczos, --block-size x --max-iter)")
+    ap.add_argument("--solver", choices=("davidson",), default="davidson",
+                    help="per-Q lowest --n-eig solver: davidson, bse_lanczos' "
+                         "exact-diagonal Davidson, stopped on the --davidson-tol-mev "
+                         "residual (the only one since 2026-11-27)")
     ap.add_argument("--davidson-tol-mev", type=float, default=0.01,
-                    help="--solver davidson: every root's residual below this (meV)")
-    ap.add_argument("--block-size", type=int, default=8,
-                    help="--solver lanczos only: block size")
+                    help="every root's residual below this (meV)")
     ap.add_argument("--max-iter", type=int, default=None,
                     help="iteration cap: Davidson iterations (default "
-                         "max(30, min(200, n_phys // 2))) or block-Lanczos "
-                         "iterations (default 40, Krylov = block x iter)")
+                         "max(30, min(200, n_phys // 2)))")
     ap.add_argument("--eqp", type=str, default=None,
                     help="BGW-format eqp1.dat (the one LORRAX's GW writes): "
                          "run the whole BSE on QUASIPARTICLE energies instead "
@@ -1761,12 +1577,6 @@ def _check_full_bse_keys(settings, named) -> None:
                             "would run without it.")
     if not settings.full_bse:
         return
-    if settings.solver != "davidson":
-        raise DeckError("GATE exb_full_bse_key: `solver = block_lanczos` cannot solve the full "
-                        "BSE (got: full_bse = true with solver = block_lanczos; want: the "
-                        "default solver).  Why: the block-Lanczos scan is a Hermitian "
-                        "eigensolver.  Fix: drop `solver`, and pick full_bse_solver = dense "
-                        "or davidson.")
     if settings.full_solver == "dense":
         for key in ("full_bse_instability", "davidson_tol_mev", "solver_max_iter"):
             if key in named:
@@ -2587,7 +2397,7 @@ def main(argv=None):
             # refit's only consumer is that contraction, the twins ride the same
             # single-compile scan, and they reuse the path's own conduction
             # caches, so the gate costs no cache and no compile — only |cert|
-            # extra Lanczos solves.
+            # extra Davidson solves.
             frac = Qpath[:nQ_path] * kgrid_vq[None, :]
             on_grid = (np.max(np.abs(frac - np.round(frac)), axis=1) < 1e-6)
             finite = (np.linalg.norm(Qpath[:nQ_path]
@@ -2799,35 +2609,30 @@ def main(argv=None):
             head_args = (jnp.asarray(D_head),
                          jnp.asarray(M_stack, dtype=jnp.float64))
         solver = _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad,
-                              n_cond, n_val, head_mbz, W_q0,
+                              n_cond, n_val, W_q0,
                               cert_rows=tuple(cert_idx) + tuple(range(nQ, nQ + n_cert)))
         tick("w_r_and_build", t0)
         stages.result(f"W_R on {nkx} x {nky} x {nkz}; "
                       + (f"full BSE, {args.full_solver} solver, " if partner is not None else
-                         f"{'block Lanczos' if args.solver == 'lanczos' else 'Davidson'} solver, ")
+                         "Davidson solver, ")
                       + f"{int(args.n_eig)} levels per Q")
         stages.begin(5, "Q-path eigensolve", name="exb.solve")
         t_c0 = time.time()
         # Exact q=0 direct head: <c k+Q|c' k+Q><v k|v' k> = δδ, so it is the
         # transition-diagonal constant on every Q (bse_head.head_shifted_eps_c).
         eps_cQ = head_shifted_eps_c(eps_cQ, data)
-        evs_dev, alpha_dev = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
+        evs_dev, _ = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                                     data["psi_v_X"], data["psi_v_Y"],
                                     data["eps_v"], W_R, *head_args,
                                     **({} if partner is None else {"partner": partner}))
         _log_stability(solver, nQ, log)
         # THE ONLY HOST FETCH LEFT IN THIS DRIVER, and it issues no collective:
-        # ``evs_dev`` is the block-Lanczos Ritz table out of a small replicated
-        # eigh(T), ``P()``-sharded, so it takes the service's replicated arm (a
-        # local buffer read).  See ``_gather_host``.  Logged so the run proves it.
+        # ``evs_dev`` is the per-Q Davidson roots table, replicated across the
+        # mesh, so it takes the service's replicated arm (a local buffer read).
+        # See ``_gather_host``.  Logged so the run proves it.
         log(f"[dist] evs sharding={evs_dev.sharding}, "
             f"fully_addressable={evs_dev.is_fully_addressable}")
         evs_all = _gather_host(evs_dev)                   # (n_solve, n_eig) Ry
-        # The α-Hermiticity invariant, replayed on the host from scalars the scan
-        # returned.  Same tolerance, same message, same LORRAX_SANITY=strict raise
-        # as the in-jit callback it replaces — see _report_alpha_over_path.
-        alpha_ok, alpha_rel = _report_alpha_over_path(
-            solver.alpha_labels, jax.device_get(alpha_dev), log=log)
         t_first = time.time() - t_c0
         tick("solve_scan_cold", t_c0)
         if rerun_check_enabled(args):
@@ -2857,20 +2662,7 @@ def main(argv=None):
             log(f"solve_path: cold {t_first:.2f}s (incl. ONE compile) over "
                 f"{n_solve} Q; warm re-run check SKIPPED (the default since "
                 f"2026-08-08 — pass --rerun-check to run it)")
-        t0 = time.time()
-        if args.solver == "lanczos":    # the Davidson route is priced in bse_lanczos
-            mem = solver.lower(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
-                               data["psi_v_X"], data["psi_v_Y"], data["eps_v"],
-                               W_R, *head_args).compile().memory_analysis()
-            log(f"solve_path memory_analysis: temp={mem.temp_size_in_bytes/2**20:.1f} MiB "
-                f"args={mem.argument_size_in_bytes/2**20:.1f} MiB "
-                f"out={mem.output_size_in_bytes/2**20:.1f} MiB")
-        # TIMED: this is an AOT ``lower().compile()`` of the SAME program that was
-        # just executed, for a memory report.  Whether it hits XLA's in-process
-        # executable cache or recompiles from scratch is an XLA implementation
-        # detail, and the difference is the whole compile (~157 s at P=64, 91 Q).
-        # A diagnostic that can silently cost a compile gets its own row.
-        tick("mem_analysis", t0)
+        # (The Davidson route is priced in bse_lanczos.)
         t_out0 = time.time()
 
         evs_path = evs_all[:nQ]
@@ -3059,10 +2851,7 @@ def main(argv=None):
         report.emit_lines(exciton_band_results_lines(
             _path_ev, Qpath[:nQ_path], node_idx, node_labels,
             n_extra=int(nQ - nQ_path),
-            hermiticity=(("PASS" if alpha_ok else "FAILED")
-                         + f" (worst relative {alpha_rel:.2e}, tol {ALPHA_HERM_RTOL:.0e})"
-                         if args.solver == "lanczos" else
-                         f"not tested (Davidson; every Q's residual below "
+            hermiticity=(f"not tested (Davidson; every Q's residual below "
                          f"{float(args.davidson_tol_mev):g} meV)"),
             certificate=_cert_text,
             files=f"{os.path.basename(args.out_prefix)}.dat (all levels), "

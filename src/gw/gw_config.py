@@ -1996,12 +1996,12 @@ BSE_DECK_KEYS = (
     "spin_singlet", "spin_triplet", "local_fields", "spinor",
     "number_eigenvalues",
     "write_eigenvectors", "helicity_table", "solver", "solver_max_iter",
-    "block_size", "lanczos_rtol", "lanczos_check_every", "lanczos_n_reorth",
     "davidson_precond", "davidson_tol_mev", "davidson_margin",
     "davidson_margin_tol_mev", "davidson_olsen", "davidson_eps_shift",
     "davidson_m_max",
     # retired BSE keys, kept recognised so bse_deck.refuse_retired_keys names them
     "trlan_m_max", "trlan_n_keep",
+    "block_size", "lanczos_rtol", "lanczos_check_every", "lanczos_n_reorth",
     # spectrum (Haydock)
     "haydock", "number_iterations", "energy_resolution", "omega_min_ev",
     "omega_max_ev", "delta_frequency", "no_eps1", "polarization", "lorentzian_broadening",

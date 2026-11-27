@@ -14,8 +14,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from bse.bse_kpm import make_bse_random_vector
 from bse.bse_window import pad_zone_mask, restrict_to_physical_transitions
 from distrib_la.subspace import DistributedSubspacePlan
-from solvers.lanczos import (_supported_start_block, block_lanczos_eig_jit,
-                             block_lanczos_eig_jit_converged)
+from solvers.lanczos import _supported_start_block
 
 jax.config.update('jax_enable_x64', True)
 ROOT = Path(__file__).parents[1]
@@ -87,27 +86,11 @@ def test_large_abstract_support_has_only_local_rng_and_no_host_support(monkeypat
     assert compiled.memory_analysis().output_size_in_bytes <= 16*local + 32
 
 
-def test_lanczos_rectangular_support_preserves_physical_spectrum_and_exhaustion():
+def test_supported_start_block_refuses_malformed_support():
     logical, carrier, bs = (2, 3, 2), (3, 4, 2), 2
-    n, nphys = int(np.prod(carrier)), int(np.prod(logical))
+    n = int(np.prod(carrier))
     mask = np.zeros(carrier, dtype=bool)
     mask[:2, :3, :] = True
-    diagonal = np.full(carrier, 1000.)
-    diagonal[mask] = np.arange(1, nphys+1)
-    matvec = lambda x: x*jnp.asarray(diagonal.reshape(-1))
-    common = dict(n=n, n_eig=3, block_size=bs, max_iter=99,
-                  subspace_plan=False, vector_shape=carrier)
-    fixed = jax.jit(lambda: block_lanczos_eig_jit(
-        matvec, **common, support_shape=logical))
-    ev, vectors = fixed()
-    np.testing.assert_allclose(ev, (1., 2., 3.), atol=3e-12)
-    assert np.max(np.abs(np.asarray(vectors)[:, ~mask.reshape(-1)])) == 0.
-    old = jax.jit(lambda: block_lanczos_eig_jit(matvec, **common, support=mask))()
-    np.testing.assert_allclose(ev, old[0], atol=3e-12)
-    converged = jax.jit(lambda: block_lanczos_eig_jit_converged(
-        matvec, **common, support_shape=logical, check_every=1, min_iter=99))()
-    assert int(converged[2]) == nphys//bs
-    np.testing.assert_allclose(converged[0], ev, atol=3e-12)
     for shape in ((0, 3, 2), (2, 5, 2), (2.0, 3, 2), (2, 3)):
         with pytest.raises(ValueError, match='support_shape'):
             _supported_start_block(n, bs, 42, None, vector_shape=carrier, support_shape=shape)

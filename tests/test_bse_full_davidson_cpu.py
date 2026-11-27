@@ -283,7 +283,7 @@ def test_tamm_dancoff_default_route_is_untouched(ops):
     # the default arguments still dispatch the Tamm-Dancoff Davidson, and the full default is dense
     import inspect
     sig = inspect.signature(bse_lanczos.solve_bse_sharded).parameters
-    assert sig["tda"].default is True and sig["solver_kind"].default == "davidson"
+    assert sig["tda"].default is True and "solver_kind" not in sig
     assert sig["full_solver"].default == "dense" and sig["full_on_indefinite"].default == "refuse"
 
 
@@ -522,7 +522,6 @@ def test_input_keys_and_what_they_refuse(capsys):
     assert args.davidson_olsen is True                  # read by the full Davidson since 2026-11-27
     refused = [
         (["full_bse = true", "davidson_olsen = true"], "set full_bse_solver = davidson for the full-BSE Davidson"),
-        (full + ["lanczos_rtol = 1e-6"], "`lanczos_rtol` is not read by full_bse_solver = davidson"),
         (["full_bse = true", "full_bse_instability = continue"],
          "`full_bse_instability` is read by full_bse_solver = davidson only"),
         (["full_bse = true", "davidson_margin = 4"], "set full_bse_solver = davidson for the full-BSE Davidson"),
@@ -649,15 +648,16 @@ def test_driver_writes_both_halves_and_says_what_runs(ops, monkeypatch, tmp_path
     assert "full-BSE Davidson converged: 8/8 roots with residual < 0.01 meV" in text
     assert "pair calls" in text and "dense structure-preserving solve" not in text
     assert "Full BSE: dense structure-preserving solve of the 128-state window" in text_dense
-    assert "Davidson" not in text_dense.replace("the Davidson and Lanczos settings are not read", "")
+    assert "Davidson" not in text_dense.replace("the Davidson settings are not read", "")
     line, rows = bse_jax._full_davidson_report()
     assert line.startswith("full-BSE Davidson converged") and rows[0][0] == "stability"
     assert "positive definite" in rows[0][1] and "NOT" not in rows[0][1] and len(rows) == 1
 
 
-def test_eps_shift_zero_and_block_size_reach_the_solver_as_written(ops, monkeypatch, tmp_path):
+def test_eps_shift_zero_and_the_iteration_cap_reach_the_solver_as_written(ops, monkeypatch, tmp_path):
     """Two settings the driver used to change without a word: ``davidson_eps_shift = 0`` became
-    1e-3 Ry, and ``block_size`` divided the iteration cap of solvers that have no Lanczos block."""
+    1e-3 Ry, and ``block_size`` divided the iteration cap of solvers that have no Lanczos block
+    (retired 2026-11-27 with the block Lanczos)."""
     mesh = _mesh(1)
     seen = {}
 
@@ -677,13 +677,11 @@ def test_eps_shift_zero_and_block_size_reach_the_solver_as_written(ops, monkeypa
     with pytest.raises(Stop):
         _drive(str(tmp_path), mesh, ops, monkeypatch, ["full_bse_solver = davidson"])
     assert seen["davidson_eps_shift_Ry"] == 1e-3                       # the default, when not named
-    # the Tamm-Dancoff Davidson keeps its whole cap under block_size; the block Lanczos divides
+    # the Tamm-Dancoff Davidson gets its whole cap
     args = _parse([])
-    for solver, want in (("davidson", 40), ("lanczos", 10)):
-        with pytest.raises(Stop):
-            bse_jax._preview_lanczos(args.input, NV, NC, n_eig=N_EIG, tda=True, solver_kind=solver,
-                                     block_size=4, max_lanczos_iter=40)
-        assert seen["max_iter"] == want, solver
+    with pytest.raises(Stop):
+        bse_jax._preview_lanczos(args.input, NV, NC, n_eig=N_EIG, tda=True, max_lanczos_iter=40)
+    assert seen["max_iter"] == 40
 
 
 def test_capped_driver_run_refuses_before_writing(ops, monkeypatch, tmp_path):

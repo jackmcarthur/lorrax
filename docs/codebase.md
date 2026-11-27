@@ -38,7 +38,7 @@ else.
 | `tdagw` | L1 | real-time TD-aGW in TDGW's conventions: the equation of motion, the injected ΔΣ[ρ] models (TDGW kernel, low-rank, the ISDF COHSEX model of a GW restart), the jitted k-sharded propagator, TDGW's file formats | `python -m tdagw.tdgw_jax`, `tdagw.kernel_export`, `tdagw.tdgw_bridge` | nothing |
 | `file_io` | L1 readers and writers; L3 transport | SlabIO (the sharded HDF5 transport) and every format: the restart bundle, Σ outputs, model stores, `dipole.h5`, `kin_ion.h5`, WFN | library | `gw`, `bse`, `psp`, `bandstructure`, `centroid` |
 | `common` | mixed: L1 physics helpers, L2 `rank_criterion`, `spectral_closure`, `pivoted_cholesky`, L3 collectives and glue | shared helpers: collectives, sharding and FFT glue, timing, units, WFN transforms, parallel-transport kernels | library | every package |
-| `solvers` | L2 | iterative eigensolvers and spectral methods with no physics: Davidson, Lanczos, KPM, pseudobands, Sternheimer CG | library | `bse`, `psp` |
+| `solvers` | L2 | iterative eigensolvers and spectral methods with no physics: Davidson, simple Lanczos, KPM, pseudobands, Sternheimer CG | library | `bse`, `psp` |
 | `mixing` | L2 | fixed-point acceleration: Anderson | library | `gw.sc_iteration` (the SC loop) |
 | `runtime` | L3, except two modules (below the table) | process bootstrap, the driver session and report stream, padding receipts, compiled-memory checks, environment grammar, source closure, the fixed streaming tile | library; every driver calls `runtime.initialize_communicator_stack()` first | every driver |
 | `ffi` | L3 | the bridge to native libraries: loading and attestation, capability gates, FFT and k-convolution router, GEMM, parallel HDF5, the contour accumulator; the C++ sources | library; `ffi/cpp/stage/seal_bundle.py` seals a native bundle | `gw`, `bse`, `common`, `file_io`, `psp`, `bandstructure` |
@@ -269,7 +269,7 @@ The BSE contract is [BSE](architecture/bse.md); this table only says where each 
 | `bse_io.py` | Compatibility facade: re-exports names from `bse_window`, `bse_head`, `bse_densify`, `bse_loading` and the window names of `common.band_degeneracy`. |
 | `bse_jax.py` | The BSE driver: `python -m bse.bse_jax`. |
 | `bse_kpm.py` | KPM Chebyshev density of states of the BSE Hamiltonian. |
-| `bse_lanczos.py` | `solve_bse_sharded`: TDA Lanczos and Davidson; non-TDA hands off to `bse_nontda` (dense, or the Davidson with `full_solver='davidson'`). |
+| `bse_lanczos.py` | `solve_bse_sharded`: the TDA Davidson; non-TDA hands off to `bse_nontda` (dense, or the Davidson with `full_solver='davidson'`). |
 | `bse_loading.py` | Reads a GW restart into a BSE bundle: window, padding and q = 0 head; builds a missing static W(0) through `gw.static_screening` when the restart has none. |
 | `bse_nontda.py` | Structure-preserving full (non-TDA) eigensolver: the dense build (default) and the Davidson route (`full_bse_solver = davidson`). At a finite pair momentum (`data['partner']`) it builds the two operand sets of $\mathcal K$ (`operand_sets`), measures all four dense blocks and runs the Davidson's unpaired form. |
 | `bse_preconditioner.py` | Transition energies, the exchange pair amplitude and the exchange spin weight. |
@@ -349,7 +349,7 @@ Level L2: none of these modules knows what a band or a k point is.
 | `__init__.py` | Exposes the KPM and Chebyshev helpers. |
 | `davidson.py` | Host API of the one planned Davidson implementation. |
 | `davidson_fixed.py` | Planned block Davidson with local or distributed vector storage. |
-| `lanczos.py` | Lanczos eigensolvers. |
+| `lanczos.py` | `simple_lanczos_eig` (spectral bounds) and the physical-support start block. |
 | `bse_sp_davidson.py` | Structure-preserving block Davidson for the full BSE problem over a pair applier: paired eigenvectors, stability margin, unstable roots; `paired=False` is the form for $\mathcal K z = \Omega\Sigma z$ at a finite pair momentum, and the preconditioner can apply the Olsen correction. |
 | `subspace_numerics.py` | Scale-relative rank discovery shared by the eigensolvers. |
 | `chebyshev.py` | Chebyshev expansion and KPM utilities. |
