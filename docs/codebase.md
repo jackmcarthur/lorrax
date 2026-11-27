@@ -269,9 +269,9 @@ The BSE contract is [BSE](architecture/bse.md); this table only says where each 
 | `bse_io.py` | Compatibility facade: re-exports names from `bse_window`, `bse_head`, `bse_densify`, `bse_loading` and the window names of `common.band_degeneracy`. |
 | `bse_jax.py` | The BSE driver: `python -m bse.bse_jax`. |
 | `bse_kpm.py` | KPM Chebyshev density of states of the BSE Hamiltonian. |
-| `bse_lanczos.py` | `solve_bse_sharded`: TDA Lanczos, Davidson and thick-restart Lanczos; non-TDA hands off to `bse_nontda`. |
+| `bse_lanczos.py` | `solve_bse_sharded`: TDA Lanczos, Davidson and thick-restart Lanczos; non-TDA hands off to `bse_nontda` (dense, or the Davidson with `full_solver='davidson'`). |
 | `bse_loading.py` | Reads a GW restart into a BSE bundle: window, padding and q = 0 head; builds a missing static W(0) through `gw.static_screening` when the restart has none. |
-| `bse_nontda.py` | Structure-preserving full (non-TDA) eigensolver: dense build, and an opt-in matrix-free solver. |
+| `bse_nontda.py` | Structure-preserving full (non-TDA) eigensolver: the dense build (default), the Davidson route (`full_bse_solver = davidson`) and an opt-in matrix-free Lanczos. |
 | `bse_preconditioner.py` | Transition energies, the exchange pair amplitude and the exchange spin weight. |
 | `bse_ring_comm.py` | The BSE mesh, shardings, folded RPA control, and physical R/A density-response matvec with one shared direct-rung field for both bra decodes. |
 | `bse_stack_matvec.py` | The trial-stack TDA matvec, the non-TDA pair applier, and the full-BSE matvec built on it. |
@@ -352,6 +352,7 @@ Level L2: none of these modules knows what a band or a k point is.
 | `lanczos.py` | Lanczos eigensolvers. |
 | `thick_restart_lanczos.py` | Thick-restart Lanczos, fixed shape. |
 | `bse_sp_lanczos.py` | Structure-preserving thick-restart Lanczos for the definite BSE eigenproblem. |
+| `bse_sp_davidson.py` | Structure-preserving block Davidson for the full BSE problem over a pair applier: paired eigenvectors, stability margin, unstable roots. |
 | `subspace_numerics.py` | Scale-relative rank discovery shared by the eigensolvers. |
 | `chebyshev.py` | Chebyshev expansion and KPM utilities. |
 | `dos.py` | Matrix-free density of states by KPM. |

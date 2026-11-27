@@ -5,6 +5,77 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-27 — Full BSE: a structure-preserving Davidson (`full_bse_solver = davidson`), unstable roots reported, dense reference in Cholesky form
+
+`full_bse = true` runs what it ran: the dense structure-preserving solve,
+N ≤ 4096. The new input key `full_bse_solver = davidson` selects a
+structure-preserving block Davidson for the full problem instead
+(`solvers.bse_sp_davidson` through `bse_nontda`): no assembly of $A$ and $B$,
+no size limit, the lowest `number_eigenvalues` roots with their $(X, Y)$,
+$X^\dagger X - Y^\dagger Y = 1$. It applies the pair operator
+$AX + B\bar X$ to paired trial vectors, two pair calls per open root per
+iteration, with what the Tamm–Dancoff Davidson has: the exact diagonal as
+preconditioner (the diagonal of the full operator is $[D; -D]$ with $D$ the
+diagonal of $A$), the start block on the physical transitions, margin roots,
+soft locking, restarts under a priced basis, a residual stop.
+
+- **Input keys.** `full_bse_solver = dense | davidson` (default `dense`) and
+  `full_bse_instability = refuse | continue` (default `refuse`), both read
+  with `full_bse = true` only. With `davidson` the run reads
+  `solver_max_iter`, `davidson_tol_mev` (0.01 meV on
+  $\lVert Hz - \Omega z\rVert/\lVert z\rVert$), `davidson_margin`,
+  `davidson_margin_tol_mev`, `davidson_precond`, `davidson_eps_shift` and
+  `davidson_m_max`. `davidson_m_max` counts real-form basis vectors there and
+  defaults to 20·n_eig, the depth of the Tamm–Dancoff default; the basis and
+  its images are twice that many trial vectors, twice the Tamm–Dancoff
+  Davidson's, priced as `bse.davidson_basis`.
+- **Unstable reference state.** The solve measures
+  $\lambda_{\min}$ of $\mathcal K = [[A, B], [B^*, A^*]]$ on its subspace every
+  iteration (the stop line and RESULTS print it). If it is not positive,
+  `full_bse_instability = refuse` stops with the measured value (`GATE
+  sp_davidson_definite`); `continue` solves on, logs each unstable root
+  (imaginary or complex $\Omega$, or a real root at $\Omega \le 0$) in meV and
+  in RESULTS, and writes the positive roots above them. Unstable roots are
+  not written to `eigenvalues*.dat` or `eigenvectors.h5`; their vectors stay
+  in `bse_nontda.LAST_DAVIDSON` for a Python caller. The dense solve still
+  refuses an indefinite $\mathcal K$ and has no `continue`.
+- **Results move (dense full solve).** `solve_nontda_definite_pencil` now
+  reduces through a Cholesky factor of $\mathcal K$ instead of
+  $\mathcal K^{-1/2}$. On a well-conditioned window the roots move at
+  round-off ($7.8\times10^{-16}$ Ry on the 128-transition test payload). Near a
+  zero mode they move by the error the old form had on every root above the
+  soft one: $4.3\times10^{-10}$ Ry at $\lambda_{\min}(\mathcal K) = 10^{-8}$ Ry
+  and $5.0\times10^{-9}$ Ry at $10^{-9}$ Ry on a 40-transition pencil, now
+  $4.3\times10^{-13}$ and $2.3\times10^{-12}$ Ry. Its definiteness gate is
+  unchanged. Tamm–Dancoff results do not move: same roots, iterations, matvecs
+  and restarts as before on the test payloads.
+- **What refuses.** A Davidson stop that is not converged, before anything is
+  written (`GATE nontda_davidson_converged`); an operator with $A \ne A^\dagger$
+  or $B \ne B^{\mathsf T}$, on the start block (`GATE sp_davidson_operator`);
+  `full_bse_instability = continue` without room in the margin for the
+  unstable roots (`GATE nontda_davidson_block`); under
+  `full_bse_solver = davidson`, `davidson_olsen` and every `lanczos_*` and
+  `trlan_*` key; `full_bse_instability` with the dense solver; either new key
+  without `full_bse = true`. The dense size refusal (`GATE nontda_dense_size`)
+  now names `full_bse_solver = davidson`.
+- **Python callers.** `bse_nontda.solve_bse_nontda_sharded` takes each
+  route's options only: `mf_*` with `solver='dense'` used to be accepted and
+  ignored and now refuses (`GATE nontda_route_option`).
+  `bse_lanczos.solve_bse_sharded` gains `full_solver` and
+  `full_on_indefinite`, read only with `tda=False`.
+- **Report.** With `full_bse = true` the ENVIRONMENT line "Eigensolve path"
+  printed the Tamm–Dancoff solver's name; it now says dense or Davidson.
+- **Measured, and open.** CPU only: the 128-transition spinor test payload on
+  one device and on an emulated 2×2 mesh, 8 roots and 8 margin roots: 15
+  iterations, 436 pair calls (54.5 per root), $2.5\times10^{-12}$ Ry from the
+  dense route. The Tamm–Dancoff Davidson takes 207 applications of $A$ there
+  (25.9 per root); the matrix-free Lanczos (`solver='matrixfree'`, still
+  without an input key) 22.2 to 35.2 pair calls per root. Not yet run: a GPU,
+  more than one process, a material. The hsuite has no full-BSE row.
+
+Nothing to change in input files. Tests: `tests/test_bse_sp_davidson_cpu.py`,
+`tests/test_bse_full_davidson_cpu.py`, `tests/test_bse_full_oracle_cpu.py`.
+
 ## 2026-11-22 — epsmat export/projection and finite-q dipoles read per run, not per q; `--iq-list` default
 
 No number changes: every output below is bitwise identical to the per-q

@@ -348,7 +348,9 @@ solver's own keys) refuses.
 |---|---|---|
 | `number_val_bands_fine` / `number_cond_bands_fine` | required | the BSE window, counted from the occupied boundary (BerkeleyGW's names) |
 | `highest_occupied_band` | the WFN's `ifmax` | occupied-band count |
-| `full_bse` | false | the full BSE (dense `bse_nontda` solver); off = TDA |
+| `full_bse` | false | the full BSE (`bse_nontda`; dense solver unless `full_bse_solver` says otherwise); off = TDA |
+| `full_bse_solver` | `dense` | read with `full_bse = true` only. `dense`: $A$ and $B$ assembled, host eigensolve, N ≤ 4096 (`GATE nontda_dense_size`). `davidson`: the structure-preserving Davidson over the pair applier ([BSE](architecture/bse.md#solvers)), no size limit, residual stop `davidson_tol_mev` (`GATE nontda_davidson_converged`); it reads `solver_max_iter`, `davidson_tol_mev`, `davidson_margin`, `davidson_margin_tol_mev`, `davidson_precond`, `davidson_eps_shift` and `davidson_m_max` (here the basis capacity in real-form vectors, default 20·n_eig, storage twice that), and refuses `davidson_olsen` and every `lanczos_*` / `trlan_*` key |
+| `full_bse_instability` | `refuse` | read with `full_bse_solver = davidson` only: what to do when $\mathcal K = [[A, B], [B^*, A^*]]$ is found not positive definite (an unstable reference state). `refuse` stops with the measured $\lambda_{\min}$ (`GATE sp_davidson_definite`). `continue` solves on, reports the unstable roots (imaginary, complex or not positive) in the log and RESULTS and writes the positive roots above them |
 | `spin_singlet` / `spin_triplet` | singlet | non-spinor WFN only: $D + 2V - W$ or $D - W$; refuse on a spinor WFN, whose kernel is $D + V - W$. Only the scalar exchange weight changes |
 | `local_fields` / `spinor` | false / the WFN's | RPA with local fields ($D + wV$), never the default / an assertion on the WFN |
 | `band_degeneracy` / `degeneracy_check_override` / `degeneracy_tol_ry` | `strict` / false / 1 meV | a window edge inside a multiplet: `strict` refuses and names working counts, `snap` widens outward, `off` proceeds (`degeneracy_check_override` = `off`) |

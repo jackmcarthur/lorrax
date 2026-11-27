@@ -217,3 +217,7 @@ and single-vector Lanczos (`solvers.lanczos`) and thick-restart Lanczos
 (`solvers.thick_restart_lanczos`), used by `bse.bse_lanczos` and
 `bse.exciton_bands`, all take their plan from `plan_subspace`
 ([Iterative eigensolvers](../../architecture/iterative_eigensolvers.md)).
+The structure-preserving Davidson of the full BSE (`solvers.bse_sp_davidson`)
+takes two plans (capacity, and one block) and calls `store`, `gram` and
+`reconstruct` from a host loop, one compiled program per step; it takes the
+real part of each Gram matrix and never calls `orthogonalize` or `eigh`.

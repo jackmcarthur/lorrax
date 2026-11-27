@@ -39,6 +39,8 @@ A new test needs no bootstrap import of its own. Run the unit layer with
 | `test_bse_helicity_cpu.py` | σ± helicity labels on a C3 toy, with the flipped conventions failing |
 | `test_bsemat_split_cpu.py` | the ISDF bsemat split equals the plane-wave head, wings and body |
 | `test_bse_q0_head_exact_overlap.py` | the q = 0 head content is exact |
+| `test_bse_sp_davidson_cpu.py` | the structure-preserving Davidson against the dense oracle on synthetic full-BSE pencils (definite, soft, degenerate, clustered, unstable), its refusals, its accounting and its kernels' collectives, one device and 2x2 |
+| `test_bse_full_davidson_cpu.py` | `full_bse_solver = davidson` on the 128-transition payload against the dense route (roots, X and Y, dipoles), its gates with red twins, the driver keys and `eigenvectors.h5`; the Tamm-Dancoff default route's roots and counts are unchanged |
 | `test_eqp_fullzone_cpu.py` | the eqp reader: wedge, unfold and full-zone blocks agree |
 | `test_bgw_epsmat_cpu.py` | the BerkeleyGW ε⁻¹ block equals the dense RPA inverse |
 | `test_bgw_w_import_cpu.py` | BerkeleyGW W import: a symmetry-image q projects to the dense Z_cᴴ(ε⁻¹_c − 1)vZ_c (phase and TR conjugation each fail in a red twin); q coverage and frequency rules; the GW reader refuses another W source, frequency or missing probe |

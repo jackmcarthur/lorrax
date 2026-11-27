@@ -354,8 +354,9 @@ trials $z = X + \bar Y$ ($s = +1$) and $w = X - \bar Y$ ($s = -1$):
 $F + G = 2(AX + BY)$ and $\overline{G - F} = 2Y_{out}$, exact. It is the
 operator of FEAST and KPM with `full_bse = true`; `bse_nontda` builds the dense
 $(A, B)$ (N ≤ 4096) from pair calls on real identity columns,
-$A = (F + G)/2$, $B = (F - G)/2$, 256 columns a call, and its matrix-free
-route runs on the same applier. Its live set, like the TDA matvec's, is one
+$A = (F + G)/2$, $B = (F - G)/2$, 256 columns a call, and its Davidson and
+matrix-free routes run on the same applier (the Davidson with $s = +1$ only:
+$\mathrm{pair}(x, -1) = -i\,\mathrm{pair}(ix, +1)$). Its live set, like the TDA matvec's, is one
 T-family per rank whatever the trial width. Against the ring matvec it
 replaced (CPU, one device, $N_k = 4^3$, 8c × 4v, $N_\mu$ = 192, $n_s$ = 2): 552
 against 1063 ms for one $[X; Y]$ trial and 375 against 1195 ms a trial at four,
@@ -379,16 +380,68 @@ per rank. The fused kernel runs at 2.27× the flop floor.
 | Davidson (default) | `full_bse = false` (no route flag; `the eigensolve` is an alias) | `solvers.davidson.davidson` with `lock_converged`, the exact diagonal preconditioner and start subspace from `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots, stopped when every residual is below `davidson_tol_mev` (0.01 meV) |
 | Lanczos, block Lanczos | `full_bse = false solver = block_lanczos` | `bse_lanczos.solve_bse_sharded` | spectrum shape; fixed Krylov dimension, CGS2 reorthogonalization, full window by default |
 | thick-restart Lanczos | `full_bse = false solver = trlan` | `solvers.thick_restart_lanczos` | Krylov memory capped at `trlan_m_max` |
-| full BSE | no route flag, `full_bse = true` | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve, N ≤ 4096 |
+| full BSE, dense (default) | no route flag, `full_bse = true` | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve of the assembled $A$ and $B$, N ≤ 4096 |
+| full BSE, Davidson | `full_bse = true full_bse_solver = davidson` | `solvers.bse_sp_davidson` through `bse.bse_nontda`, with the paired exact diagonal and the start subspace of `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots with their $(X, Y)$, no assembly and no size limit, stopped when every residual is below `davidson_tol_mev` (0.01 meV); reports $\lambda_{\min}(\mathcal K)$ |
 | FEAST | `feast = true` with `full_bse = true` (the TDA refuses it, `GATE feast_tda_complex`) | `bse.bse_feast` | contour eigensolve in KPM-sized windows; refuses unless every in-window Ritz residual is below `--feast-tol-mev` (0.01 meV, `GATE feast_converged`) |
 | density of states | `--kpm-dos`; `--tda` or not | `bse.bse_kpm` | KPM Chebyshev moments |
 | absorption | `python -m bse.absorption_haydock`, or `haydock = true` with `number_iterations` after the eigensolve | `bse.absorption_haydock` | ε₂(ω) by continued fraction on the TDA BSE (D + V − W), no eigenvectors |
 
-With `full_bse = true` the dense solve reads `number_eigenvalues` and the
+With `full_bse = true` the dense solve (`full_bse_solver = dense`, the default)
+reads `number_eigenvalues` and the
 kernel only (`bse_lanczos.solve_bse_sharded` returns to `bse_nontda` before it reads any
 solver option). `bse_jax` refuses a `davidson_*`, `trlan_*` or `lanczos_*` key set away from its
 default; `solver`, `block_size`, `davidson_tol_mev` and the iteration cap are deck keys
-other BSE drivers share and are left alone, unread.
+other BSE drivers share and are left alone, unread. The dense solve reduces
+$\mathcal K z = \Omega\,\Sigma z$, $\mathcal K = \begin{pmatrix} A & B \\ B^* & A^* \end{pmatrix}$,
+$\Sigma = \mathrm{diag}(1, -1)$, by a Cholesky factor $\mathcal K = LL^\dagger$ and the Hermitian
+$L^{-1}\Sigma L^{-\dagger}$ (Shao et al., Linear Algebra Appl. 488 (2016) 148, Algorithm 1). It
+replaced the $\mathcal K^{-1/2}$ form on 2026-11-27, which lost digits on every root near a zero
+mode: at $\lambda_{\min}(\mathcal K) = 10^{-8}$ Ry on a 40-transition pencil the roots above the
+soft one were wrong by $4.3\times10^{-10}$ Ry and are now right to $4.3\times10^{-13}$ Ry. It
+refuses a $\mathcal K$ whose smallest eigenvalue is below $10^{-10}$ of its largest.
+
+**Full BSE, Davidson** (`full_bse_solver = davidson`). `bse_nontda._solve_nontda_davidson` runs the
+[structure-preserving Davidson](iterative_eigensolvers.md#structure-preserving-davidson) over the
+pair applier, with the pieces the Tamm–Dancoff Davidson uses:
+
+- **Preconditioner.** The diagonal of $H = \begin{pmatrix} A & B \\ -B^* & -A^* \end{pmatrix}$ is
+  $[D; -D]$: $A$ is Hermitian, so its diagonal $D$ is real, the lower block's is $-D$, and $B$ sits
+  off the diagonal of $H$. $D$ is the Tamm–Dancoff operator's diagonal,
+  $D_{cvk} = \Delta E_{cvk} + (w_x V^x_{cvk} - W^d_{cvk})/N_k$ from
+  `bse_davidson_helpers.build_bse_exact_diagonal` (the $q = 0$ slice of $W_q$ is taken before the
+  transform consumes it, `w_q0_for_precond`), or the bare $\Delta E$ under `davidson_precond = bare`.
+  The correction is $t_X = R_X/(D - \Omega + \epsilon)$, $t_Y = -R_Y/(D + \Omega + \epsilon)$
+  (`bse_pair_diagonal_precond`); it equals the diagonal of the assembled $A$ to $10^{-12}$ on the
+  test payload.
+- **Start block, margin, locking.** `init_bse_subspace` on the physical transitions (the mesh padding
+  stays exactly zero through the solve), `davidson_margin` roots above `number_eigenvalues`, soft
+  locking, `davidson_margin_tol_mev`.
+- **Basis.** At most `davidson_m_max` real-form vectors (default $20\,n_{eig}$, at least six blocks);
+  the basis and its images, twice that many trial vectors, are priced and admitted as
+  `bse.davidson_basis`. Every vector stays on `P(None, 'x', 'y', None)`; only coefficient matrices
+  cross the mesh.
+- **Stop.** Every root's residual $\lVert Hz - \Omega z\rVert/\lVert z\rVert$ below
+  `davidson_tol_mev`, within `solver_max_iter` iterations; any other stop refuses before anything is
+  written (`GATE nontda_davidson_converged`). The stop line gives the pair calls, also per root, and
+  $\lambda_{\min}$.
+- **Output.** The pairs $(X, Y)$ with $X^\dagger X - Y^\dagger Y = 1$ on
+  `P(None, None, 'x', 'y', None)`, the dense route's layout, with no host gather: the eigenvector
+  writer and the dipole contraction read them unchanged.
+- **Stability.** $\lambda_{\min}(M_r) \ge \lambda_{\min}(\mathcal K)$ is measured every iteration. If
+  it is not positive the reference state is unstable. `full_bse_instability = refuse` (the default)
+  stops with the measured value (`GATE sp_davidson_definite`). `continue` solves on: the unstable
+  roots (imaginary or complex $\Omega$, or a real root of positive norm at $\Omega \le 0$) are logged
+  and listed in RESULTS, kept with their vectors in `bse_nontda.LAST_DAVIDSON`, and are not written to
+  the eigenvalue or eigenvector files, which hold the `number_eigenvalues` positive roots above them.
+  The margin must have room for them (`GATE nontda_davidson_block`).
+- **Not read.** `davidson_olsen` (the paired preconditioner has no Olsen projection), the Lanczos and
+  TRLan keys, a `head_tensor` payload and `keep_W_R` refuse.
+
+Measured on the 128-transition spinor test payload (CPU, 1×1 and an emulated 2×2 mesh, 8 roots and 8
+margin roots, 0.01 meV): 15 iterations and 436 pair calls, 54.5 per root, $2.5\times10^{-12}$ Ry from
+the dense route; the Tamm–Dancoff Davidson takes 207 applications of $A$ there (25.9 per root) and
+the matrix-free Lanczos 22.2 to 35.2 pair calls per root, its Krylov space being close to the whole
+window at that size. No GPU run, no multi-process run and no material run exist yet.
 
 Block Lanczos seeds name physical support by its logical band/k extents,
 not a host transition mask or index list. The existing subspace layout
@@ -954,7 +1007,13 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 | band-window degeneracy | `common.band_degeneracy.resolve_band_window` | a window edge inside a multiplet under `band_degeneracy = strict` |
 | route-ignored flag | `bse_jax.parse_args` | a flag set on a route that does not read it; a retired flag |
 | non-TDA reciprocity preflight | `bse_nontda.check_restart_reciprocity` | `the eigensolve` without `full_bse = false`, with W on: a restart whose W fails the q ↔ −q reciprocity check, before the dense build |
-| non-TDA dense size | `bse_nontda` (`_DENSE_N_MAX`) | `the eigensolve` without `full_bse = false` at N = n_c,pad · n_v,pad · N_k > 4096 |
+| non-TDA dense size | `bse_nontda` (`_DENSE_N_MAX`) | `the eigensolve` without `full_bse = false` at N = n_c,pad · n_v,pad · N_k > 4096 on the dense solve; the message names `full_bse_solver = davidson`, which has no size limit |
+| `GATE nontda_davidson_converged` | `bse_nontda.refuse_unconverged_davidson` | `full_bse_solver = davidson`: any stop but CONVERGED at `davidson_tol_mev` (the cap `solver_max_iter`, a stall, no new directions), or a pair normalisation $\lvert X_i^\dagger X_j - Y_i^\dagger Y_j - \delta_{ij}\rvert$ above $10^{-8}$; before anything is written |
+| `GATE sp_davidson_definite` | `solvers.bse_sp_davidson.sp_davidson` | `full_bse_solver = davidson` with `full_bse_instability = refuse` (the default): the projected stability matrix is not positive definite, so $\mathcal K$ is not; the message gives the measured $\lambda_{\min}$ in Ry and names `full_bse_instability = continue` |
+| `GATE sp_davidson_operator` | the same | $\mathrm{Re}(P^\dagger M P)$ of a block asymmetric beyond $10^{-8}$: $A$ is not Hermitian or $B$ not symmetric (the dense route's `GATE nontda_coupling_symmetric`, measured on the applied operator) |
+| `GATE nontda_davidson_block` | `bse_nontda._solve_nontda_davidson` | `full_bse_instability = continue` with fewer margin roots than unstable or non-positive roots found |
+| `GATE nontda_route_option` | `bse_nontda.solve_bse_nontda_sharded`, `bse_lanczos.solve_bse_sharded` | an option another full-BSE route reads (`mf_*` on the Davidson, `davidson_*` or `on_indefinite` on the dense solve), `davidson_olsen` or `keep_W_R` with the Davidson; `bse_jax` refuses the matching deck keys at parse time |
+| `GATE nontda_head_tensor` | `bse_nontda._solve_nontda_davidson` | a payload with `head_tensor`: the pair applier has no head-tensor term |
 | `GATE bse_w_block_operand` | `bse_stack_matvec.plan_w_blocks` | an 8 × 8 (μ, ν) W-term block whose outer-load handler call still has an operand of $2^{31}$ elements or more (a k grid near $8\cdot 10^6$ points at $n_s$ = 2) |
 | Haydock device count | `absorption_haydock.run_haydock` | fewer than two devices |
 
@@ -980,8 +1039,11 @@ a frozen-kernel approximation, not that self-consistent ladder map.
   the QP states. A `WFN_qp.h5` written before 2026-09-30 from a WFN that stores both
   k and −k has broken rows; regenerate it
   ([self-consistency §8](../self_consistency.md#8-seeding-restart-and-outputs)).
-- Full BSE through `the eigensolve` is dense and stops at N = 4096
-  (`_DENSE_N_MAX` in `bse/bse_nontda.py`); the matrix-free solver is not reachable from the
-  CLI.
+- Full BSE through `the eigensolve` is dense by default and stops at N = 4096
+  (`_DENSE_N_MAX` in `bse/bse_nontda.py`); `full_bse_solver = davidson` has no size limit. The
+  Davidson has run on CPU only (the 128-transition test payload, one device and an emulated 2×2
+  mesh): no GPU run, no run with more than one process, no material. The matrix-free Lanczos
+  (`solver='matrixfree'`) is not reachable from the CLI. No full-BSE route has a finite-$Q$ form
+  or the mini-BZ head tensor, and the hsuite has no full-BSE row.
 - `compute_mode = mpa` with `screening_diagrams = w_bse` refuses at setup
   (`GATE parent_screening_diagrams`, `file_io/restart_bundle.py`).
