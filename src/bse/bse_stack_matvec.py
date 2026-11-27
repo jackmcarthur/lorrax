@@ -770,10 +770,13 @@ def _make_v_term(mesh_xy, pair: bool):
     """The exchange (V) term on the transition layout, one shard_map.
 
     ``pair=False``: ``f(X, M, V_q0, enc, dec) = dec · M (V_q0 (enc · M† X))``.
-    ``pair=True``:  ``f(X, Xb, sc, M, V_q0, enc, dec)`` adds the coupling
-    block's bare-vertex encode ``sc · M^T Xb`` before the ONE V_q0 solve.
-    X, Xb and M are all (c on x, v on y), so both encodes and the decode are
-    rank-local; ``enc``/``dec`` are the scalar normalisations.
+    ``pair=True``:  ``f(X, Yc, sc, M, Mb, V_q0, enc, dec)`` adds the coupling
+    block's encode ``sc · Mb^T Yc`` before the ONE V_q0 solve.  ``Mb`` is the
+    antiresonant pair density ``sum_s psi_v(k+Q) conj(psi_c(k))`` in M's
+    layout; at Q = 0 it is ``M`` itself (the bare vertex) and ``Yc`` is
+    ``conj(X)``.  X, Yc, M and Mb are all (c on x, v on y), so both encodes
+    and the decode are rank-local; ``enc``/``dec`` are the scalar
+    normalisations.
     """
     xspec = P(None, "x", "y", None)
 
@@ -781,14 +784,14 @@ def _make_v_term(mesh_xy, pair: bool):
         S = exchange_encode(X, M) * enc                            # (b, μ) partial
         return exchange_decode(M, _exchange_U(S, V_q0)) * dec
 
-    def _pair(X, Xb, sc, M, V_q0, enc, dec):
+    def _pair(X, Yc, sc, M, Mb, V_q0, enc, dec):
         S = (exchange_encode(X, M)
-             + sc[:, None] * jnp.einsum("kcvN,bcvk->bN", M, Xb)) * enc
+             + sc[:, None] * jnp.einsum("kcvN,bcvk->bN", Mb, Yc)) * enc
         return exchange_decode(M, _exchange_U(S, V_q0)) * dec
 
     if pair:
         return _shard_map_fn(_pair, mesh=mesh_xy,
-                             in_specs=(xspec, xspec, P(), xspec, P("x", "y"), P(), P()),
+                             in_specs=(xspec, xspec, P(), xspec, xspec, P("x", "y"), P(), P()),
                              out_specs=xspec, check_vma=False)
     return _shard_map_fn(_tda, mesh=mesh_xy,
                          in_specs=(xspec, xspec, P("x", "y"), P(), P()),
@@ -998,8 +1001,11 @@ def build_bse_stack_pair_matvec(
     kernel: str = "bse",
     fuse: bool = True,
     exchange_channel: str = "singlet",
+    head_tensor: bool = False,
+    partner: bool = False,
 ):
-    """Build the real-linear pair applier ``pair(X, s, …) = A·X + s·B·conj(X)``.
+    """Build the real-linear pair applier ``pair(X, s, …) = A·X + s·B·conj(X)``,
+    or, with ``partner``, the coupled applier ``couple(X, Yc, s, …) = A·X + s·B·Yc``.
 
     ``s = +1`` is Shao-da Jornada-Yang's ``F(x) = Ax + Bx̄``; ``s = -1`` is their
     ``G(v) = Av − Bv̄`` (Algorithm 4, arXiv:1611.02348).  ``s`` is a TRACED
@@ -1023,6 +1029,40 @@ def build_bse_stack_pair_matvec(
         It is value-identical to 1e-12 and ~1.83x more expensive, and it exists
         so the fusion identity can be gated and priced against something rather
         than asserted.  Do not ship ``fuse=False``.
+    head_tensor : bool
+        Add the cell-averaged exchange head to both blocks, with two more
+        runtime operands ``(D_head, M_head)`` (the Tamm-Dancoff matvec's,
+        :func:`build_bse_stack_matvec`).  The head is the ``G = 0`` term of the
+        exchange, so it follows the exchange term's conjugations: the
+        resonant encode carries ``d = conj(D_head)`` and the antiresonant
+        encode ``conj(d) = D_head`` (the pair density ``psi_v conj(psi_c)`` is
+        the conjugate of ``psi_c conj(psi_v)`` to the order the head keeps),
+
+            A^head = (w_x / N_k) conj(d) M d^T,     B^head = (w_x / N_k) conj(d) M conj(d)^T,
+
+        Hermitian and complex symmetric for a real symmetric ``M_head``.  The
+        screened head has no such term: its overlaps ``<c k|v' k>`` vanish
+        (``bse_head``), so the diagonal shift stays on ``A`` alone.
+    partner : bool
+        The antiresonant amplitude is an INDEPENDENT input ``Yc`` (where the
+        default takes ``conj(X)``) and its exchange vertex a separate operand
+        ``Mb`` after ``M``: the form a finite pair momentum ``Q`` needs.  There
+        the resonant pair is ``(c at k+Q, v at k)`` and the antiresonant pair
+        ``(v at k+Q, c at k)``, both labelled by ``k``, and the four psi operands
+        are read as
+
+            psi_c_X = psi_c(k+Q) on x,   psi_c_Y = psi_c(k)   on y,
+            psi_v_X = psi_v(k+Q) on x,   psi_v_Y = psi_v(k)   on y,
+
+        with ``eps_c = eps_c(k+Q)``, ``eps_v = eps_v(k)``, ``V_q0 = V(Q)``,
+        ``M = sum_s conj(psi_c(k+Q)) psi_v(k)`` and
+        ``Mb = sum_s conj(psi_c(k)) psi_v(k+Q)``.  The call returns the upper
+        row ``A(Q) X + s B(Q) Yc`` of ``K = [[A, B], [B^H, A']]``.  The lower
+        row is the same program on the partner operands
+        (``bse_nontda.operand_sets``): ``conj(B^H X + A' Y) =
+        couple(conj(Y), conj(X), 1, ...partner...)``, which holds for
+        ``W_{mu nu}(q) = conj(W_{nu mu}(q))``.  At ``Q = 0`` the two orbital
+        sets coincide, ``Mb = M``, and ``couple(X, conj(X), s) = pair(X, s)``.
     """
     if kernel not in ("rpa", "bse"):
         raise ValueError(f"kernel must be 'rpa' or 'bse', got {kernel!r}")
@@ -1037,17 +1077,20 @@ def build_bse_stack_pair_matvec(
     # ── W term: one shard_map over ('x','y') — the SAME single region the TDA
     #    stack matvec opens.  No new shard_map is created by the coupling port:
     #    the B encode is an einsum pair plus one all_gather INSIDE this body.
-    def _w_pair(X, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R):
+    def _w_pair(X, Yc, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R):
         # Local shards: X (n_trials, c_loc, v_loc, nk); psi_*_X (…, μ_loc);
-        # psi_*_Y (…, ν_loc); W_R (μ_loc, ν_loc, kx, ky, kz).
+        # psi_*_Y (…, ν_loc); W_R (μ_loc, ν_loc, kx, ky, kz).  ``Yc`` is None
+        # without ``partner``.
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
         # ONE block-level gather, hoisted OUT of the scan: both encodes take
         # the whole trial block, and Xb = conj(X) is formed locally from it
         # (conj commutes with the gather exactly, so this is the same array
         # a second gather of Xb would deliver).  No collective runs per trial.
+        # With ``partner`` the antiresonant block is its own input: a second
+        # gather of an X-class block.
         X_full = _gather_trial_block(X)                     # (b, c, v, nk)
-        Xb_full = jnp.conj(X_full)
+        Xb_full = jnp.conj(X_full) if Yc is None else _gather_trial_block(Yc)
 
         # THE FUSION.  T^A and T^B have identical shape AND identical sharding
         # (the B encode swaps legs, not layouts), so their sum needs no collective
@@ -1079,24 +1122,25 @@ def build_bse_stack_pair_matvec(
                          None, (X_full, Xb_full, sc), unroll=1)
         return _scatter_trial_block(WX, mesh_xy)
 
-    w_pair = _shard_map_fn(
-        _w_pair,
-        mesh=mesh_xy,
-        in_specs=(P(None, "x", "y", None), P(),
-                  P(None, None, None, "x"), P(None, None, None, "y"),
-                  P(None, None, None, "x"), P(None, None, None, "y"),
-                  P("x", "y", None, None, None)),
-        out_specs=P(None, "x", "y", None),
-    )
+    psi_specs = (P(None, None, None, "x"), P(None, None, None, "y"),
+                 P(None, None, None, "x"), P(None, None, None, "y"),
+                 P("x", "y", None, None, None))
+    xspec = P(None, "x", "y", None)
+    if partner:
+        w_pair = _shard_map_fn(_w_pair, mesh=mesh_xy, in_specs=(xspec, xspec, P()) + psi_specs,
+                               out_specs=xspec)
+    else:
+        w_pair = _shard_map_fn(lambda X, sc, *legs: _w_pair(X, None, sc, *legs), mesh=mesh_xy,
+                               in_specs=(xspec, P()) + psi_specs, out_specs=xspec)
 
     v_pair = _make_v_term(mesh_xy, pair=True)
 
-    def _pair(X, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
-              V_q0, M):
+    def _couple(X, Yc, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
+                V_q0, M, Mb, D_head=None, M_head=None):
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
         # One sign per trial: a scalar (SDY's F or G) broadcasts.
         sc = jnp.broadcast_to(jnp.asarray(s).astype(X.dtype), X.shape[:1])
-        Xb = jnp.conj(X)
+        Xb = jnp.conj(X) if Yc is None else Yc
 
         # ── D term — the A block ONLY.  B carries no diagonal, so an SDY step
         #    applies D twice per step (once in F, once in G), not four times.
@@ -1113,21 +1157,39 @@ def build_bse_stack_pair_matvec(
         #    conjugation is settled and re-litigating it is a known failure.
         #    Both encodes and the decode are local on the transition layout
         #    (``_make_v_term``); one V_q0 solve serves both blocks.
-        VX = v_pair(X, Xb, sc, M, V_q0,
-                    exchange_spin_weight(psi_c_X.shape[2], exchange_channel) / sqrt_nk, 1.0 / sqrt_nk)
+        w_x = exchange_spin_weight(psi_c_X.shape[2], exchange_channel)
+        VX = v_pair(X, Xb, sc, M, Mb, V_q0, w_x / sqrt_nk, 1.0 / sqrt_nk)
+
+        if head_tensor:
+            # The exchange term with (D_head, M_head) in place of (M, V_q0):
+            # the resonant encode reads d = conj(D_head), the antiresonant
+            # encode conj(d) = D_head, the decode D_head (docstring).
+            Sh = (jnp.einsum("kcva,bcvk->ba", jnp.conj(D_head), X)
+                  + sc[:, None] * jnp.einsum("kcva,bcvk->ba", D_head, Xb)) / sqrt_nk * w_x
+            Uh = Sh @ M_head.astype(Sh.dtype).T                   # U_a = M_ab S_b
+            HX = jnp.einsum("kcva,ba->bcvk", D_head, Uh)
+            VX = VX + lax.with_sharding_constraint(HX, sh.X) / sqrt_nk
 
         if not include_W:
             return D_term + VX
 
-        WX = w_pair(X, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R)
+        WX = (w_pair(X, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R) if Yc is None else
+              w_pair(X, Yc, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R))
         return D_term + VX - WX
 
-    return jax.jit(
-        _pair,
-        in_shardings=(sh.X, rep, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-                      sh.eps, sh.eps, sh.W, sh.V, sh.M),
-        out_shardings=sh.X,
-    )
+    operands = (sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y, sh.eps, sh.eps, sh.W, sh.V, sh.M)
+    # D_head / M_head are small and replicated (the Tamm-Dancoff matvec's).
+    head = (None, None) if head_tensor else ()
+    if partner:
+        return jax.jit(_couple, in_shardings=(sh.X, sh.X, rep) + operands + (sh.M,) + head,
+                       out_shardings=sh.X)
+
+    def _pair(X, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M,
+              D_head=None, M_head=None):
+        return _couple(X, None, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
+                       V_q0, M, M, D_head, M_head)
+
+    return jax.jit(_pair, in_shardings=(sh.X, rep) + operands + head, out_shardings=sh.X)
 
 
 # ===========================================================================
