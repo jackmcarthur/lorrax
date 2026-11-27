@@ -273,8 +273,9 @@ JAX has no device kernel for the last and `distrib_la` no per-leg route for
 the others, so one `while_loop` would need a host callback every iteration or
 a second, host-side copy of the iteration for the unstable case. The solve is
 one per run, a few tens of iterations of $2n_{open}$ pair calls each. The loop
-is therefore on the host: four to six program dispatches and one small host
-solve per iteration. Shapes stay fixed all the same. $W$, $MW$ and every block
+is therefore on the host: per iteration three kernel dispatches (four at a
+restart), the applier's power-of-two pieces and one small host solve. Shapes
+stay fixed all the same. $W$, $MW$ and every block
 have a fixed capacity, the kernels are the plan's `store`, `gram` and
 `reconstruct` with traced counts, so nothing recompiles as the basis grows,
 and `plan_key` reuses the kernel set across solves. Every process runs the

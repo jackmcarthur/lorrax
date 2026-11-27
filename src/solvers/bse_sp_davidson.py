@@ -77,8 +77,10 @@ k-point.  The same three questions give the other answer here:
   iteration (what the planned Davidson removed) or a second, host-side loop
   for the unstable case (two copies of the iteration);
 * the full BSE is one solve per run of a few tens of iterations, each
-  dominated by ``2 n_open`` pair calls; the loop below adds four to six small
-  program dispatches and one host solve of at most ``capacity^2`` reals;
+  dominated by ``2 n_open`` pair calls; the loop below adds, per iteration,
+  three kernel dispatches (four at a restart), the applier's power-of-two
+  pieces, ten small coefficient reductions and one host solve of at most
+  ``capacity^2`` reals;
 * fixed shapes are kept all the same.  The basis ``W``, its images ``M W`` and
   every block have a fixed capacity, the kernels are the plan's active-window
   operations (``store``, ``gram``, ``reconstruct``) with traced counts, so

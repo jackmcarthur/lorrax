@@ -377,6 +377,25 @@ def test_unconverged_stops_are_returned_not_raised(pencils):
     assert info["iterations"] < 400                                     # the stall exit, not the cap
 
 
+def test_whole_space_block_converges_or_reports_no_directions():
+    """A block as large as the space: the first basis ``[X0, i X0]`` is the whole real form, so the
+    Ritz values are the spectrum; a tolerance below rounding then ends ``NO_DIRECTIONS`` (no room,
+    no independent correction), never ``CONVERGED``."""
+    p = orc.dominant_pencil(n=16)
+    ref = orc.reference_roots(p["A"], p["B"])
+    rng = np.random.default_rng(2)
+    X0 = jnp.asarray((rng.standard_normal((16, 16)) + 1j * rng.standard_normal((16, 16))).reshape(16, 4, 4, 1))
+    data = (jnp.asarray(p["A"]), jnp.asarray(p["B"]))
+    omega, X, Y, info = spd.sp_davidson(_pair, X0, data=data, tol=1e-10, verbose=False)
+    assert info["status"] == spd.CONVERGED and info["iterations"] == 1
+    assert info["capacity"] == 32 == info["active_size"] and info["pair_calls"] == 32
+    assert np.max(np.abs(omega - ref["omega"])) * RY_EV <= ROOT_TOL_EV      # all 16 roots
+    assert abs(info["lam_min"] - p["k_min"]) <= 1e-12                         # the whole K: lam_min exactly
+    omega, X, Y, info = spd.sp_davidson(_pair, X0, data=data, tol=1e-19, verbose=False)
+    assert info["status"] == spd.NO_DIRECTIONS and info["status_name"] == "NO_DIRECTIONS"
+    assert np.max(np.abs(omega - ref["omega"])) * RY_EV <= ROOT_TOL_EV      # the roots are there all the same
+
+
 def test_bad_inputs_refuse(pencils):
     p = pencils["dominant"]
     mesh = _mesh(1)
@@ -529,6 +548,30 @@ def test_projected_solves():
     assert np.max(np.abs(Qm @ (Qm.T @ C[:80]) - C[:80])) <= 1e-9          # Eq. (7): the Ritz block survives
     refused = spd._projected_step(0.5 * (Mr + Mr.T), 0.5 * (S - S.T), 8, 100, solve_indefinite=False)
     assert not refused[2].any() and refused[4][0] == 0 and refused[5][0] == reals[0]
+
+
+def test_general_solve_is_the_fallback_when_the_complement_is_not_definite(monkeypatch):
+    """If the Cholesky route fails on the complement of the unstable sector, the stable roots come
+    from the general solve (flagged ``general``); they are the same roots."""
+    pen = orc.indefinite_pencil(n=40, delta=1e-2)
+    ref = orc.reference_roots(pen["A"], pen["B"])
+    Wf = np.concatenate([np.eye(40), 1j * np.eye(40)]).astype(complex)
+    Mr = np.real(Wf.conj() @ (Wf @ pen["A"].T + Wf.conj() @ pen["B"].T).T)
+    S = np.imag(Wf.conj() @ Wf.T)
+    Mr, S = 0.5 * (Mr + Mr.T), 0.5 * (S - S.T)
+
+    def fails(*a, **k):
+        raise np.linalg.LinAlgError("forced")
+
+    monkeypatch.setattr(spd, "solve_projected_definite", fails)
+    sol = spd._solve_projected(Mr, S, 8, 1.0, definite=False)
+    assert sol["general"] is True and (sol["n_unstable"], sol["n_negative"]) == (1, 0)
+    assert abs(sol["omega"][0] - 1j * ref["imag"][0]) <= 1e-10
+    assert np.max(np.abs(sol["omega"][1:].real - ref["omega"][:7])) <= 1e-9
+    C = sol["C"][:, 1:]
+    assert np.max(np.abs(np.diag(C.conj().T @ (2j * S) @ C) - 1.0)) <= 1e-10    # each root normalised
+    step = spd._projected_step(Mr, S, 8, 100, solve_indefinite=True)
+    assert list(step[4]) == [0, 1, 1, 16, 1]                                     # ... and counted
 
 
 def test_host_results_are_rank_zeros_on_every_rank(monkeypatch):
