@@ -463,6 +463,17 @@ def main(argv=None):
         if not kernel["include_w"]:
             raise DeckError("bse.absorption_haydock runs the screened TDA recursion "
                             "(D + w V - W): drop local_fields")
+        from .bse_deck import _FALSE
+        for key, why in (("full_bse", "the recursion is on the Tamm-Dancoff operator"),
+                         ("qp_rotations_file", "the loaded states are not rotated into the "
+                                               "QP basis here (bse.bse_jax refuses haydock "
+                                               "with it for the same reason)")):
+            if key in named and str(params.get(key, "") or "").strip().lower() not in _FALSE:
+                raise DeckError(
+                    f"GATE haydock_unserved_key: bse.absorption_haydock cannot honour `{key}` "
+                    f"(got: `{key} = {params[key]}`; want: the key absent).  Why: {why}, so "
+                    f"the spectrum would be that of another Hamiltonian than the input file "
+                    f"states.  Fix: remove `{key}` for this driver.")
     except DeckError as exc:
         p.error(str(exc))
     if args.gaussian_broadening:

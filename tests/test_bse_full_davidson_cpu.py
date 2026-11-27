@@ -668,6 +668,37 @@ def test_driver_writes_both_halves_and_says_what_runs(ops, monkeypatch, tmp_path
     assert "positive definite" in rows[0][1] and "NOT" not in rows[0][1] and len(rows) == 1
 
 
+def test_eps_shift_zero_and_block_size_reach_the_solver_as_written(ops, monkeypatch, tmp_path):
+    """Two settings the driver used to change without a word: ``davidson_eps_shift = 0`` became
+    1e-3 Ry, and ``block_size`` divided the iteration cap of solvers that have no Lanczos block."""
+    mesh = _mesh(1)
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def capture(data, mesh_xy, **kw):
+        seen.clear()
+        seen.update(kw)
+        raise Stop()
+
+    monkeypatch.setattr(bse_lanczos, "solve_bse_sharded", capture)
+    with pytest.raises(Stop):
+        _drive(str(tmp_path), mesh, ops, monkeypatch, ["full_bse_solver = davidson"],
+               davidson_eps_shift=0.0)
+    assert seen["davidson_eps_shift_Ry"] == 0.0
+    with pytest.raises(Stop):
+        _drive(str(tmp_path), mesh, ops, monkeypatch, ["full_bse_solver = davidson"])
+    assert seen["davidson_eps_shift_Ry"] == 1e-3                       # the default, when not named
+    # the Tamm-Dancoff Davidson and TRLan keep their whole cap under block_size; the block Lanczos divides
+    args = _parse([])
+    for solver, want in (("davidson", 40), ("trlan", 40), ("lanczos", 10)):
+        with pytest.raises(Stop):
+            bse_jax._preview_lanczos(args.input, NV, NC, n_eig=N_EIG, tda=True, solver_kind=solver,
+                                     block_size=4, max_lanczos_iter=40)
+        assert seen["max_iter"] == want, solver
+
+
 def test_capped_driver_run_refuses_before_writing(ops, monkeypatch, tmp_path):
     mesh = _mesh(2)
     with pytest.raises(RuntimeError, match="GATE nontda_davidson_converged"):

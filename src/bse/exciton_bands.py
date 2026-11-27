@@ -413,7 +413,7 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                                nc_pad: int, nv_pad: int, n_cond: int, n_val: int,
                                *, n_eig: int, max_iter: int, tol_mev: float, W_q0,
                                cert_rows=(), cert_tol_mev=None, exchange_channel="singlet",
-                               full=None):
+                               full=None, davidson=None):
     """The ``solver = davidson`` (default) counterpart of :func:`build_path_solver`:
     the same call signature and outputs, the per-Q lowest ``n_eig`` from
     ``bse_lanczos.solve_bse_sharded``'s Davidson (exact diagonal
@@ -425,6 +425,12 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     Certification rows use the tighter ``cert_tol_mev`` residual, so a loose
     plotting tolerance cannot dominate the exchange comparison. Both members
     of each comparison must be included in ``cert_rows``.
+
+    ``davidson`` holds the tuning options both Davidsons read, by
+    ``solve_bse_sharded``'s argument names (``davidson_precond``,
+    ``davidson_olsen``, ``davidson_eps_shift_Ry``, ``davidson_margin``,
+    ``davidson_margin_tol_Ry``, ``davidson_m_max``); None is that function's
+    defaults (the exact diagonal, shift 1e-3 Ry, 8 margin roots).
 
     ``full = dict(solver=, on_indefinite=)`` (``full_bse = true``) solves the
     full BSE at every Q instead: ``solve_path`` then takes ``partner``, the
@@ -445,6 +451,7 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     sh = make_bse_shardings(mesh_xy)
     rows_of = {}
     stability = []
+    tuning = {"davidson_precond": "exact", **(davidson or {})}
 
     def _row(a, i, sharding):
         if sharding not in rows_of:
@@ -470,8 +477,8 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
             ev, _, _ = solve_bse_sharded(
                 payload, mesh_xy, n_eig=n_eig, max_iter=max_iter, tda=False,
                 full_solver="davidson", full_on_indefinite=full["on_indefinite"],
-                davidson_precond="exact", davidson_tol_Ry=row_tol / RY_TO_MEV,
-                davidson_plan_key="exciton_bands_full")
+                davidson_tol_Ry=row_tol / RY_TO_MEV,
+                davidson_plan_key="exciton_bands_full", **tuning)
         except (RuntimeError, ValueError) as exc:
             raise type(exc)(f"{exc}  (exciton_bands: full BSE at Q row {iQ}; no exciton band "
                             "file was written.)") from exc
@@ -520,8 +527,8 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                     continue
                 ev, _, _ = solve_bse_sharded(
                     payload, mesh_xy, n_eig=n_eig, max_iter=max_iter, solver_kind="davidson",
-                    davidson_precond="exact", davidson_tol_Ry=row_tol / RY_TO_MEV,
-                    davidson_plan_key="exciton_bands")
+                    davidson_tol_Ry=row_tol / RY_TO_MEV,
+                    davidson_plan_key="exciton_bands", **tuning)
                 davidson_stop_line(n_eig=n_eig, tol_mev=row_tol, budget=max_iter,
                                    cap="the cap is solver_max_iter", where=f" at Q row {iQ}",
                                    refused="No exciton band file was written.",
@@ -554,8 +561,25 @@ def check_solver_flags(ap, args) -> None:
     if args.solver == "davidson" and args.block_size != ap.get_default("block_size"):
         ap.error("block_size is read by solver = block_lanczos only (the default solver "
                  "is davidson since 2026-10-21); drop it or set solver = block_lanczos")
-    if args.solver == "lanczos" and args.davidson_tol_mev != ap.get_default("davidson_tol_mev"):
-        ap.error("davidson_tol_mev is read by solver = davidson only")
+    if args.solver == "lanczos":
+        named = [key for key, dest in (
+            ("davidson_tol_mev", "davidson_tol_mev"), ("davidson_precond", "davidson_precond"),
+            ("davidson_olsen", "davidson_olsen"), ("davidson_eps_shift", "davidson_eps_shift"),
+            ("davidson_margin", "davidson_margin"),
+            ("davidson_margin_tol_mev", "davidson_margin_tol_mev"),
+            ("davidson_m_max", "davidson_m_max"))
+                 if getattr(args, dest) != ap.get_default(dest)]
+        if named:
+            ap.error(f"{', '.join(named)} {'is' if len(named) == 1 else 'are'} read by "
+                     "solver = davidson only")
+    if getattr(args, "full_bse", False) and args.full_solver == "dense":
+        named = [key for key in ("davidson_precond", "davidson_olsen", "davidson_eps_shift",
+                                 "davidson_margin", "davidson_margin_tol_mev", "davidson_m_max")
+                 if getattr(args, key) != ap.get_default(key)]
+        if named:
+            ap.error(f"{', '.join(named)} {'is' if len(named) == 1 else 'are'} not read by the "
+                     "dense full-BSE solve; set full_bse_solver = davidson or drop "
+                     f"{'it' if len(named) == 1 else 'them'}")
 
 
 def _precond_w_q0(args, data, log=None):
@@ -673,7 +697,25 @@ def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, he
         exchange_channel=getattr(args, "exchange_channel", "singlet"),
         cert_tol_mev=0.1 * CERT_TOL_BY_GRADE[args.cert_grade] if cert_rows else None,
         full=(dict(solver=args.full_solver, on_indefinite=args.full_instability)
-              if getattr(args, "full_bse", False) else None))
+              if getattr(args, "full_bse", False) else None),
+        davidson=_davidson_tuning(args))
+
+
+def _davidson_tuning(args) -> dict:
+    """The Davidson tuning keys of the input file as ``solve_bse_sharded`` arguments
+    (``davidson_precond``, ``davidson_olsen``, ``davidson_eps_shift``,
+    ``davidson_margin``, ``davidson_margin_tol_mev``, ``davidson_m_max``; the
+    defaults are that function's)."""
+    from .bse_lanczos import DAVIDSON_MARGIN_ROOTS, RY_TO_MEV
+    shift = getattr(args, "davidson_eps_shift", None)
+    margin_tol = getattr(args, "davidson_margin_tol_mev", None)
+    return dict(
+        davidson_precond=getattr(args, "davidson_precond", "exact"),
+        davidson_olsen=bool(getattr(args, "davidson_olsen", False)),
+        davidson_eps_shift_Ry=1e-3 if shift is None else float(shift),
+        davidson_margin=int(getattr(args, "davidson_margin", DAVIDSON_MARGIN_ROOTS)),
+        davidson_margin_tol_Ry=None if margin_tol is None else float(margin_tol) / RY_TO_MEV,
+        davidson_m_max=getattr(args, "davidson_m_max", None))
 
 
 def _report_alpha_over_path(labels, alpha_all, log=log.debug):
@@ -1606,6 +1648,13 @@ EXB_KEYS = {
     "block_size": Key("block_size", "int"),
     "solver_max_iter": Key("max_iter", "int"),
     "dipole_file": Key("dipole", "path"),
+    # The Davidson's tuning keys, as bse.bse_jax reads them (both Davidsons).
+    "davidson_precond": Key("davidson_precond", choices=("exact", "bare", "auto")),
+    "davidson_olsen": Key("davidson_olsen", "bool"),
+    "davidson_eps_shift": Key("davidson_eps_shift", "float"),
+    "davidson_margin": Key("davidson_margin", "int"),
+    "davidson_margin_tol_mev": Key("davidson_margin_tol_mev", "float"),
+    "davidson_m_max": Key("davidson_m_max", "int"),
     # The full (non-Tamm-Dancoff) BSE at every Q, bse.bse_jax's three keys.
     "full_bse": Key("full_bse", "bool"),
     "full_bse_solver": Key("full_solver", choices=("dense", "davidson")),
@@ -1675,6 +1724,18 @@ def _settings_defaults():
                          "q-linear coefficient IS this dipole, which is why "
                          "the cell-averaged head needs no d(zeta)/dq.")
     ap.add_argument("--degeneracy-check-override", action="store_true")
+    ap.add_argument("--davidson-precond", choices=("exact", "bare", "auto"), default="exact",
+                    help="Davidson preconditioner diagonal (as bse.bse_jax)")
+    ap.add_argument("--davidson-olsen", action="store_true",
+                    help="Olsen correction in the Davidson preconditioner")
+    ap.add_argument("--davidson-eps-shift", type=float, default=None,
+                    help="Ry added to the preconditioner's denominators (default 1e-3)")
+    ap.add_argument("--davidson-margin", type=int, default=8,
+                    help="margin roots solved above number_eigenvalues")
+    ap.add_argument("--davidson-margin-tol-mev", type=float, default=None,
+                    help="residual at which a margin root locks (default: the tolerance)")
+    ap.add_argument("--davidson-m-max", type=int, default=None,
+                    help="Davidson basis capacity (default: the solver's)")
     ap.add_argument("--full-bse", action="store_true", dest="full_bse",
                     help="the full (non-Tamm-Dancoff) BSE at every Q: K z = omega Sigma z "
                          "with K = [[A(Q), B(Q)], [B(Q)^H, conj A(-Q)]]")

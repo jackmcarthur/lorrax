@@ -16,7 +16,10 @@ NumPy assembly of ``K = [[A, B], [B^H, A']]`` from the pair-function definition
    the valence pad at ``-PAD_EPS_GUARD_RY``.
 4. The deck keys: ``full_bse`` parses; ``full_bse_solver`` without it, ``solver = block_lanczos``
    with it, and the ``bse.bse_jax`` keys this driver cannot honour (``qp_rotations_file``,
-   ``highest_occupied_band``) refuse.
+   ``highest_occupied_band``) refuse.  The Davidson's tuning keys (``davidson_olsen``,
+   ``davidson_margin``, ``davidson_eps_shift``, ``davidson_precond``, ``davidson_m_max``,
+   ``davidson_margin_tol_mev``) are read and reach the solve (same roots, a block of n_eig + 4);
+   they refuse under ``solver = block_lanczos`` and under the dense full solve.
 
 A script on a 1x1 mesh: ``JAX_PLATFORMS=cpu python -m tests.test_exciton_bands_full_bse``.  It skips
 under pytest (importing the driver starts the runtime).
@@ -138,16 +141,35 @@ def run_cases(mesh):
     # 4. the deck keys
     p = exb.build_parser()
 
-    def refuses(lines):
+    def refuses(lines, check=False):
         try:
-            _deck_args(p, lines)
+            _deck_args(p, lines, check=check)
             return False
         except SystemExit:
             return True
-    a = _deck_args(p, ["full_bse = true", "full_bse_solver = davidson", "full_bse_instability = continue"])
+    a = _deck_args(p, ["full_bse = true", "full_bse_solver = davidson", "full_bse_instability = continue",
+                       "davidson_olsen = true", "davidson_margin = 4", "davidson_eps_shift = 0",
+                       "davidson_precond = bare", "davidson_m_max = 120", "davidson_margin_tol_mev = 1"])
     a0 = _deck_args(p, [])
+    tuned = exb._davidson_tuning(a)
+    # the tuning keys reach the solve: the same roots with Olsen, a bare diagonal and 4 margin roots
+    tuned_solver = exb.build_path_solver_davidson(*geom, n_eig=N_EIG, max_iter=200, tol_mev=0.01, W_q0=W_q0,
+                                                  full=dict(solver="davidson", on_indefinite="refuse"),
+                                                  davidson=tuned)
+    ev_t = np.asarray(exb._gather_host(tuned_solver(*path, partner=partner)[0])).real
+    out["tuned_vs_eig_mev"] = float(np.max(np.abs(ev_t - want)) * RY_MEV)
+    from bse import bse_nontda
+    out["tuned_block"] = int(bse_nontda.LAST_DAVIDSON["info"]["n_block"])
     out["deck"] = bool(
         a.full_bse and a.full_solver == "davidson" and a.full_instability == "continue"
+        and tuned == dict(davidson_precond="bare", davidson_olsen=True, davidson_eps_shift_Ry=0.0,
+                          davidson_margin=4, davidson_margin_tol_Ry=1.0 / RY_MEV, davidson_m_max=120)
+        and exb._davidson_tuning(a0) == dict(davidson_precond="exact", davidson_olsen=False,
+                                             davidson_eps_shift_Ry=1e-3, davidson_margin=8,
+                                             davidson_margin_tol_Ry=None, davidson_m_max=None)
+        and out["tuned_vs_eig_mev"] <= 0.01 and out["tuned_block"] == N_EIG + 4
+        and refuses(["solver = block_lanczos", "davidson_olsen = true"], check=True)
+        and refuses(["full_bse = true", "davidson_margin = 4"], check=True)       # dense reads none
         and not a0.full_bse and a0.full_solver == "dense"
         and refuses(["full_bse_solver = davidson"])
         and refuses(["full_bse = true", "solver = block_lanczos"])
@@ -157,7 +179,7 @@ def run_cases(mesh):
     return out
 
 
-def _deck_args(p, lines):
+def _deck_args(p, lines, check=False):
     import tempfile
     from bse import exciton_bands as exb
     fd = tempfile.NamedTemporaryFile("w", suffix=".in", delete=False)
@@ -166,7 +188,9 @@ def _deck_args(p, lines):
              + "".join(f"{line}\n" for line in lines))
     fd.close()
     args = p.parse_args(["-i", fd.name])
-    exb.deck_settings(p, args)
+    settings_ap = exb.deck_settings(p, args)
+    if check:
+        exb.check_solver_flags(settings_ap, args)
     return args
 
 

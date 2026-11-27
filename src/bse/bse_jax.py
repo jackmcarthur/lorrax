@@ -235,9 +235,11 @@ def _preview_lanczos(
     if max_lanczos_iter is None:
         max_lanczos_iter = max(30, min(200, bse_dim // 2))
     # ``max_lanczos_iter`` is the *total* Krylov dimension upper
-    # bound; block path divides by block_size.
-    # The full-BSE routes have no Lanczos block: ``block_size`` never divides their cap.
-    block_max_iter = max(1, max_lanczos_iter // (max(1, block_size) if tda else 1))
+    # bound; the block Lanczos divides it by block_size.  No other solver has
+    # a Lanczos block: ``block_size`` never divides the Davidson's or the
+    # TRLan's cap, nor the full-BSE routes'.
+    block_max_iter = max(1, max_lanczos_iter // (
+        max(1, block_size) if (tda and solver_kind == "lanczos") else 1))
     mode = (f"convergence-driven (rtol={rtol:.1e}, every {check_every} iters)"
             if rtol > 0 else "fixed")
     if full_davidson:
@@ -282,8 +284,8 @@ def _preview_lanczos(
             rtol=rtol, check_every=check_every, n_reorth=n_reorth_eff,
             solver_kind=solver_kind, tda=tda,
             davidson_m_max=davidson_m_max,
-            davidson_eps_shift_Ry=(davidson_eps_shift
-                if davidson_eps_shift else 1e-3),
+            davidson_eps_shift_Ry=(1e-3 if davidson_eps_shift is None
+                                   else davidson_eps_shift),
             davidson_precond=davidson_precond,
             davidson_olsen=davidson_olsen,
             davidson_tol_Ry=float(davidson_tol_mev) / (RYD_TO_EV * 1.0e3),
