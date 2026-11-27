@@ -5,6 +5,56 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-27 — Full BSE at finite Q in `bse.exciton_bands`, head tensor and Olsen on the full route
+
+`bse.exciton_bands` now solves the full BSE at every $Q$ of its path when the input file says
+`full_bse = true`. Before, the driver read none of the full-BSE keys, so such an input file ran a
+Tamm–Dancoff solve without a word. The problem is
+$\mathcal K z = \Omega\,\Sigma z$ with
+$\mathcal K = [[A(Q), B(Q)], [B(Q)^\dagger, A'(Q)]]$, $A'(Q) = \overline{A(-Q)}$ in the driver's
+labelling (resonant pair $(c\,k{+}Q, v\,k)$, antiresonant pair $(v\,k{+}Q, c\,k)$): at a general
+$Q$ there is no $B = B^{\mathsf T}$ and no $\pm\Omega$ pairing, so the Davidson runs in a new
+unpaired form of `solvers.bse_sp_davidson` and the dense solve measures all four blocks. The
+physics and the equations are in [the BSE page](docs/architecture/bse.md#the-full-bse-at-a-finite-pair-momentum)
+and [the eigensolver page](docs/architecture/iterative_eigensolvers.md#the-unpaired-form).
+
+- **Input keys, `bse.exciton_bands`.** `full_bse`, `full_bse_solver = dense | davidson`
+  (default `dense`, at most 4096 transitions per $Q$) and `full_bse_instability = refuse | continue`
+  (default `refuse`, read under `davidson`). The `.dat` title says which problem was solved, the run
+  logs the smallest stability margin $\lambda_{\min}$ over the path, and the header carries it.
+  The htransform now returns the BSE valence bands as well as the conduction bands at every
+  $k + Q$ under `full_bse`; `nval` must cover `number_val_bands_fine`.
+- **The full Davidson reads `davidson_olsen`.** It refused it; it now applies the Olsen correction
+  in the metric $\Sigma$, $t - \epsilon u$ with $z^\dagger\Sigma(t - \epsilon u) = 0$. The roots do
+  not change. The dense solve still refuses the key. `keep_W_R` is honoured by both full routes
+  (the payload keeps its transformed $W$).
+- **The head tensor on the full routes.** The pair applier carries the exchange head tensor in both
+  the resonant and the coupling block, and both full solves honour a payload that has one. The
+  Davidson used to refuse such a payload (`GATE nontda_head_tensor`, removed) and the dense solve
+  dropped it silently. `bse.bse_jax` at $Q = 0$ builds no such payload; the head tensor reaches a
+  full solve through `bse.exciton_bands` with `head_minibz_average`. Its use with an off-grid $Q$
+  under the full BSE has not been examined.
+- **Input files that ran before and now stop (`bse.exciton_bands`).** `qp_rotations_file` or
+  `highest_occupied_band` named in the input file (`GATE exb_unserved_key`): both are
+  `bse.bse_jax` keys that change the Hamiltonian, the driver never read them, and they were ignored
+  silently. Remove the key from the input file. `full_bse_solver` or `full_bse_instability` without `full_bse = true`, `solver = block_lanczos`
+  with it, and `full_bse_instability`, `davidson_tol_mev` or `solver_max_iter` under
+  `full_bse_solver = dense` (`GATE exb_full_bse_key`); `nval` below `number_val_bands_fine` under
+  `full_bse` (`GATE exb_full_bse_valence_window`). The dense finite-$Q$ solve refuses a lower row
+  that does not close the Hermitian pencil (`GATE nontda_lower_row`); the matrix-free Lanczos, which
+  has no input key, refuses a partner or a head tensor (`GATE nontda_route_option`, no longer for
+  `davidson_olsen` or `keep_W_R`).
+- **Results that move.** None for an existing run that did not name `full_bse` in an exciton-band
+  input file, and the default results of `bse.bse_jax` are unchanged (Tamm–Dancoff, and the
+  $Q = 0$ full BSE: the paired Davidson and the dense solve take the code path they took). An
+  exciton-band input file that did name `full_bse = true` now gets the full BSE where it got the
+  Tamm–Dancoff roots.
+- **Measured, CPU only.** The unpaired Davidson's roots equal the dense ones within
+  $4\times10^{-14}$ eV on synthetic pencils of 240 transitions. On the 128-transition test payload
+  at $Q = 0$ with the partner set equal to the payload's own orbitals, it takes 328 pair calls where
+  the paired form takes 376, same roots. Olsen leaves the roots as they were: 436 pair calls without
+  it, 438 with it at the default shift. No GPU number is reported for the finite-$Q$ route.
+
 ## 2026-11-27 — Full BSE: a structure-preserving Davidson (`full_bse_solver = davidson`), unstable roots reported, dense reference in Cholesky form
 
 `full_bse = true` runs the dense structure-preserving solve it ran before,
