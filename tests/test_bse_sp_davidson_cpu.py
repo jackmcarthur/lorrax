@@ -408,18 +408,18 @@ def test_bad_inputs_refuse(pencils):
     mesh = _mesh(1)
     X0 = _start(N_EIG + MARGIN)
     X0[1] = X0[0]                                                       # a dependent start block
-    with pytest.raises(ValueError, match="rank deficient"):
+    with pytest.raises(ValueError, match="GATE sp_davidson_start"):
         _solve(p["A"], p["B"], mesh, X0=X0)
     nan_pair = lambda data, X, s: _pair(data, X, s) * jnp.nan          # noqa: E731
-    with pytest.raises(FloatingPointError, match="non-finite"):
+    with pytest.raises(FloatingPointError, match="GATE sp_davidson_finite"):
         _solve(p["A"], p["B"], mesh, pair=nan_pair)
     for bad in (dict(tol=0.0), dict(tol=float("nan")), dict(max_iter=0), dict(margin_lock=0.5),
                 dict(on_indefinite="ignore")):
-        with pytest.raises(ValueError, match="sp_davidson"):
+        with pytest.raises(ValueError, match="GATE sp_davidson_argument"):
             _solve(p["A"], p["B"], mesh, **bad)
-    with pytest.raises(ValueError, match="n_converge"):
+    with pytest.raises(ValueError, match="GATE sp_davidson_argument"):
         spd.sp_davidson(_pair, jnp.asarray(_start(4).reshape((4,) + WINDOW)), n_converge=5)
-    with pytest.raises(TypeError, match="complex128"):
+    with pytest.raises(TypeError, match="GATE sp_davidson_argument"):
         spd.sp_davidson(_pair, jnp.zeros((4,) + WINDOW))
 
 

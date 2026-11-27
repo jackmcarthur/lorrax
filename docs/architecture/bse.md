@@ -1009,12 +1009,17 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 | route-ignored flag | `bse_jax.parse_args` | a flag set on a route that does not read it; a retired flag |
 | non-TDA reciprocity preflight | `bse_nontda.check_restart_reciprocity` | `the eigensolve` without `full_bse = false`, with W on: a restart whose W fails the q ↔ −q reciprocity check, before the dense build |
 | non-TDA dense size | `bse_nontda` (`_DENSE_N_MAX`) | `the eigensolve` without `full_bse = false` at N = n_c,pad · n_v,pad · N_k > 4096 on the dense solve; the message names `full_bse_solver = davidson`, which has no size limit |
-| `GATE nontda_coupling_symmetric` | `bse_nontda.refuse_asymmetric_coupling`, on both dense solves | the coupling block $B$ is not complex symmetric: $\lVert B - B^{\mathsf T}Vert / \lVert BVert$ above $10^{-6}$ (a structural check, not a convergence tolerance); the message names `check_restart_reciprocity` |
+| `GATE nontda_coupling_symmetric` | `bse_nontda.refuse_asymmetric_coupling`, on both dense solves | the coupling block $B$ is not complex symmetric: $\lVert B - B^{\mathsf T}
+Vert / \lVert B
+Vert$ above $10^{-6}$ (a structural check, not a convergence tolerance); the message names `check_restart_reciprocity` |
 | `GATE nontda_davidson_converged` | `bse_nontda.refuse_unconverged_davidson` | `full_bse_solver = davidson`: any stop but CONVERGED at `davidson_tol_mev` (the cap `solver_max_iter`, a stall, no new directions), or a pair normalisation $\lvert X_i^\dagger X_j - Y_i^\dagger Y_j - \delta_{ij}\rvert$ above $10^{-8}$; before anything is written |
 | `GATE sp_davidson_definite` | `solvers.bse_sp_davidson.sp_davidson` | `full_bse_solver = davidson` with `full_bse_instability = refuse` (the default): the projected stability matrix is not positive definite, so $\mathcal K$ is not; the message gives the measured $\lambda_{\min}$ in Ry and names `full_bse_instability = continue` |
 | `GATE sp_davidson_operator` | the same | $\mathrm{Re}(P^\dagger M P)$ of a block asymmetric beyond $10^{-8}$: $A$ is not Hermitian or $B$ not symmetric (the dense route's `GATE nontda_coupling_symmetric`, measured on the applied operator) |
+| `GATE sp_davidson_start` | `solvers.bse_sp_davidson.sp_davidson` | a start block $[X_0, iX_0]$ that is rank deficient over the reals; the message gives the rank |
+| `GATE sp_davidson_finite` | the same | an operator or preconditioner output with NaN or Inf |
+| `GATE sp_davidson_argument` | the same | `on_indefinite`, `tol`, `margin_lock`, `max_iter`, `n_converge`, the start block's dtype or its row count out of range; the message gives the value and the range |
 | `GATE nontda_davidson_block` | `bse_nontda._solve_nontda_davidson` | `full_bse_instability = continue` with fewer margin roots than unstable or non-positive roots found |
-| `GATE nontda_route_option` | `bse_nontda.solve_bse_nontda_sharded`, `bse_lanczos.solve_bse_sharded` | an option another full-BSE route reads (`mf_*` on the Davidson, `davidson_*` or `on_indefinite` on the dense solve), `davidson_olsen` or `keep_W_R` with the Davidson; `bse_jax` refuses the matching deck keys at parse time |
+| `GATE nontda_route_option` | `bse_nontda.solve_bse_nontda_sharded`, `bse_lanczos.solve_bse_sharded` | an unknown solver or option name, or an option another full-BSE route reads (`mf_*` on the Davidson, `davidson_*` or `on_indefinite` on the dense solve), `davidson_olsen` or `keep_W_R` with the Davidson; `bse_jax` refuses the matching deck keys at parse time |
 | `GATE nontda_head_tensor` | `bse_nontda._solve_nontda_davidson` | a payload with `head_tensor`: the pair applier has no head-tensor term |
 | `GATE bse_w_block_operand` | `bse_stack_matvec.plan_w_blocks` | an 8 × 8 (μ, ν) W-term block whose outer-load handler call still has an operand of $2^{31}$ elements or more (a k grid near $8\cdot 10^6$ points at $n_s$ = 2) |
 | Haydock device count | `absorption_haydock.run_haydock` | fewer than two devices |

@@ -451,10 +451,10 @@ def test_options_the_route_cannot_honour_refuse(ops):
         with pytest.raises(ValueError, match="GATE nontda_route_option") as exc:
             solve_bse_nontda_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, solver=solver, **kw)
         assert want in str(exc.value) and f"solver={solver!r}" in str(exc.value)
-    with pytest.raises(ValueError, match="unknown option") as exc:
+    with pytest.raises(ValueError, match="GATE nontda_route_option") as exc:
         solve_bse_nontda_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, solver="davidson", davidson_tolmev=1.0)
     assert "davidson_tolmev" in str(exc.value) and "davidson_tol_mev" in str(exc.value)
-    with pytest.raises(ValueError, match="solver must be one of"):
+    with pytest.raises(ValueError, match="GATE nontda_route_option"):
         solve_bse_nontda_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, solver="lanczos")
     with pytest.raises(ValueError, match="GATE nontda_head_tensor"):
         solve_bse_nontda_sharded(dict(_payload(mesh, ops), head_tensor=(None, None)), mesh, n_eig=N_EIG,

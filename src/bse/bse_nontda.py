@@ -825,13 +825,14 @@ def _route_options(solver, options):
     option another route reads."""
     if solver not in _ROUTE_OPTIONS:
         raise ValueError(
-            f"solve_bse_nontda_sharded: solver must be one of "
-            f"{', '.join(repr(s) for s in _ROUTE_OPTIONS)}, got {solver!r}")
+            f"GATE nontda_route_option: solver is not a full-BSE route (got: {solver!r}; want: one "
+            f"of {', '.join(repr(s) for s in _ROUTE_OPTIONS)}).  Why: the solver picks the route "
+            f"that reads the options.  Fix: pass one of the named solvers.")
     owner = {key: route for route, opts in _ROUTE_OPTIONS.items() for key in opts}
     unknown = sorted(key for key in options if key not in owner)
     if unknown:
         raise ValueError(
-            f"solve_bse_nontda_sharded: unknown option(s) {unknown} (got: "
+            f"GATE nontda_route_option: unknown option(s) {unknown} (got: "
             f"{unknown}; want: one of n_eig, include_W, recip_tol, solver, "
             f"{', '.join(sorted(owner))}).  Why: an option this "
             f"route does not read would be dropped silently and the solve would run "

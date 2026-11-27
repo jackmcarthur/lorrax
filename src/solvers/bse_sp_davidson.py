@@ -689,24 +689,43 @@ def sp_davidson(
     certifies the lowest ``n_tested`` roots.
     """
     if on_indefinite not in ("refuse", "continue"):
-        raise ValueError(f"sp_davidson: on_indefinite must be 'refuse' or 'continue', got {on_indefinite!r}")
+        raise ValueError(
+            f"GATE sp_davidson_argument: on_indefinite is not a known policy (got: {on_indefinite!r}; "
+            f"want: 'refuse' or 'continue').  Why: the policy decides what an unstable reference state "
+            f"does to the solve.  Fix: pass 'refuse' or 'continue'.")
     if not (np.isfinite(tol) and tol > 0):
-        raise ValueError(f"sp_davidson: tol must be finite and positive, got {tol!r}")
+        raise ValueError(
+            f"GATE sp_davidson_argument: tol is not a residual stop (got: {tol!r}; want: finite and "
+            f"> 0).  Why: the stop compares every residual with it.  Fix: pass a positive finite tol.")
     if not float(margin_lock) >= 1.0:
-        raise ValueError("sp_davidson: margin_lock must be >= 1 (a multiple of tol)")
+        raise ValueError(
+            f"GATE sp_davidson_argument: margin_lock is not a multiple of tol (got: {margin_lock!r}; "
+            f"want: >= 1).  Why: margin roots lock at margin_lock * tol, never tighter than the stop.  "
+            f"Fix: pass margin_lock >= 1.")
     if int(max_iter) < 1:
-        raise ValueError("sp_davidson: max_iter must be >= 1")
+        raise ValueError(
+            f"GATE sp_davidson_argument: max_iter allows no iteration (got: {max_iter!r}; want: "
+            f">= 1).  Why: a solve with no iteration returns the start block.  Fix: pass max_iter >= 1.")
     started = time.perf_counter()
     X0 = jnp.asarray(X0)
     if X0.dtype != jnp.complex128:
-        raise TypeError("sp_davidson: X0 must be complex128")
+        raise TypeError(
+            f"GATE sp_davidson_argument: X0 has the wrong dtype (got: {X0.dtype}; want: complex128).  "
+            f"Why: the paired form [X, conj(X)] and the projected solve are complex128 throughout.  "
+            f"Fix: pass X0 as complex128.")
     nb, vs = int(X0.shape[0]), tuple(int(n) for n in X0.shape[1:])
     nb2, dim = 2 * nb, int(np.prod(vs))
     n_test = nb if n_converge is None else int(n_converge)
     if not 1 <= n_test <= nb:
-        raise ValueError(f"sp_davidson: require 1 <= n_converge ({n_test}) <= rows of X0 ({nb})")
+        raise ValueError(
+            f"GATE sp_davidson_argument: n_converge is outside the start block (got: {n_test}; want: "
+            f"1 <= n_converge <= {nb}, the rows of X0).  Why: the stop tests that many lowest roots "
+            f"of the rows it was given.  Fix: pass n_converge in range, or more start rows.")
     if nb > dim:
-        raise ValueError(f"sp_davidson: {nb} start vectors in a space of dimension {dim}")
+        raise ValueError(
+            f"GATE sp_davidson_argument: more start vectors than the space holds (got: {nb} rows of "
+            f"X0 in dimension {dim}; want: at most {dim}).  Why: the start block [X0, i X0] must "
+            f"span {2 * nb} real directions.  Fix: pass fewer start vectors.")
     cap = basis_capacity(capacity, nb, n_test, dim)
     sharding = X0.sharding if isinstance(X0.sharding, NamedSharding) else None
     mesh = None if sharding is None else sharding.mesh
@@ -889,10 +908,18 @@ def sp_davidson(
     notes = refusal_notes or {}
     note = {gate: (f"  {notes[gate]}" if notes.get(gate) else "") for gate in ("definite", "operator")}
     if status == BAD_INITIAL:
-        raise ValueError(f"sp_davidson: the start block [X0, i X0] is rank deficient "
-                         f"(rank {rank} of {nb2})")
+        raise ValueError(
+            f"GATE sp_davidson_start: the start block [X0, i X0] is rank deficient (got: rank "
+            f"{rank} of {nb2}; want: full rank).  Why: the first basis is its orthonormalisation, "
+            f"and a dependent start vector would leave a direction the solve never sees.  Fix: pass "
+            f"linearly independent start vectors (over the reals, X0 and i X0 together).")
     if status == NONFINITE:
-        raise FloatingPointError("sp_davidson: non-finite operator or preconditioner output")
+        raise FloatingPointError(
+            "GATE sp_davidson_finite: the operator or the preconditioner returned a non-finite value "
+            "(got: NaN or Inf in the applied block; want: finite output).  Why: every later "
+            "projection, Ritz value and residual would be meaningless.  Fix: check the operator "
+            "inputs (the kernel and the orbitals) and the preconditioner diagonal for zeros, NaN or "
+            "Inf.")
     if status == INDEFINITE:
         raise ValueError(
             f"GATE sp_davidson_definite: the projected stability matrix M_r = Re(W^H M W) is not "
