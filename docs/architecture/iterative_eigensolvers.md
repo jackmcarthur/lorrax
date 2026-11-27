@@ -167,7 +167,7 @@ slots stay allocated but excluded until they are overwritten.
 `solvers.bse_sp_davidson.sp_davidson(apply_pair, X0, *, precondition=None,
 data=(), n_converge=None, capacity=None, max_iter=100, tol=1e-8,
 stall_patience=20, lock_converged=True, margin_lock=1.0,
-on_indefinite="refuse", metric_tol=1e-8, refusal_notes=None, plan_key=None)`
+on_indefinite="refuse", metric_tol=1e-8, refusal_notes=None, plan_key=None, verbose=True)`
 finds the lowest roots of the full (non-Tamm–Dancoff) Bethe–Salpeter problem
 
 $$H\begin{pmatrix}X\\Y\end{pmatrix}=\omega\begin{pmatrix}X\\Y\end{pmatrix},\qquad
@@ -244,7 +244,7 @@ the stability margin, free every iteration; it equals
 $\lambda_{\min}(\mathcal K)$ once the softest mode is among the roots.
 $\mathrm{Re}(P^\dagger MP)$ of each new block is symmetric exactly when
 $A=A^\dagger$ and $B=B^{\mathsf T}$: its relative asymmetry above `metric_tol`
-refuses (`GATE sp_davidson_operator`), on the start block already.
+refuses (`GATE sp_davidson_operator`); the check runs on every block, the start block first.
 
 **When $\mathcal K$ is not positive definite.** A projected $M_r$ with
 $\lambda_{\min}\le10^{-13}\max_i|(M_r)_{ii}|$ is a certificate that

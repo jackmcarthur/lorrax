@@ -648,7 +648,8 @@ def sp_davidson(
         must fix the two programs; shapes, sharding, block and capacity are
         added here.
     verbose : bool
-        One summary line at INFO; restarts and the instability at INFO too.
+        One summary line at INFO, and one line at INFO when ``on_indefinite='continue'`` meets an
+        unstable reference state; each restart is logged at DEBUG.
 
     Returns
     -------

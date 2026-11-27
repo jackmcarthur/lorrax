@@ -51,7 +51,7 @@ soft locking, restarts under a priced basis, a residual stop.
   and restarts as before on the test payloads.
 - **What refuses.** A Davidson stop that is not converged, before anything is
   written (`GATE nontda_davidson_converged`); an operator with $A \ne A^\dagger$
-  or $B \ne B^{\mathsf T}$, on the start block (`GATE sp_davidson_operator`);
+  or $B \ne B^{\mathsf T}$, measured on every block from the start block on (`GATE sp_davidson_operator`);
   `full_bse_instability = continue` without room in the margin for the
   unstable roots (`GATE nontda_davidson_block`); under
   `full_bse_solver = davidson`, `davidson_olsen` and every `lanczos_*` and
