@@ -837,7 +837,7 @@ def _solve_nontda_davidson(pair, args, data, mesh_xy, sh, n_eig, *, include_W, w
                            davidson_tol_mev, davidson_max_iter, davidson_m_max,
                            davidson_margin, davidson_margin_tol_mev, davidson_precond,
                            davidson_eps_shift_Ry, davidson_n_random_init, on_indefinite,
-                           davidson_plan_key, low=None):
+                           davidson_plan_key, davidson_olsen=False, low=None):
     """Lowest ``n_eig`` (omega, X, Y) by the structure-preserving Davidson.
 
     ``pair`` and ``args`` are the fused pair applier and its operands
@@ -885,9 +885,11 @@ def _solve_nontda_davidson(pair, args, data, mesh_xy, sh, n_eig, *, include_W, w
         f"exact diagonal of A, dE + (V_x{' - W_d' if include_W else ''})/nk" if route == "exact"
         else "bare dE") + (", paired as [D; -D]" if paired else
                            ", with the partner's diagonal as [D; -D_low] (finite pair momentum)"))
+    if davidson_olsen:
+        log.info("full-BSE Davidson preconditioner: Olsen correction ON (Sigma metric)")
     pre = bse_pair_diagonal_precond(
         eps_c, eps_v, epsilon_shift=float(davidson_eps_shift_Ry), sharding=diag_sh, diag_H=diag,
-        low=None if paired else (low[4], low[5], diag_low))
+        low=None if paired else (low[4], low[5], diag_low), olsen=bool(davidson_olsen))
 
     # Margin roots and the start block on the physical transitions, as the
     # Tamm-Dancoff route builds them.
@@ -913,8 +915,9 @@ def _solve_nontda_davidson(pair, args, data, mesh_xy, sh, n_eig, *, include_W, w
         apply = lambda payload, Z: apply_K(payload[0], Z)                     # noqa: E731
         operands = (args, low)
     omega, X, Y, info = sp_davidson(
-        apply, X0, paired=paired,
-        precondition=lambda payload, RX, RY, om: pre.apply(payload[1], RX, RY, om),
+        apply, X0, paired=paired, precondition_vectors=bool(davidson_olsen),
+        precondition=lambda payload, RX, RY, om, X=None, Y=None: pre.apply(
+            payload[1], RX, RY, om, X, Y),
         data=(operands, pre.data), n_converge=n_eig, capacity=cap, max_iter=int(davidson_max_iter),
         tol=tol_ry, lock_converged=True,
         margin_lock=(1.0 if davidson_margin_tol_mev is None else
@@ -929,7 +932,8 @@ def _solve_nontda_davidson(pair, args, data, mesh_xy, sh, n_eig, *, include_W, w
                         "stale restart and assembles A and B to compare with A = A^H, B = B^T."},
         plan_key=(None if davidson_plan_key is None else (
             davidson_plan_key, mesh_xy, bool(include_W), channel, route,
-            float(davidson_eps_shift_Ry), paired, data.get("head_tensor") is not None,
+            float(davidson_eps_shift_Ry), bool(davidson_olsen), paired,
+            data.get("head_tensor") is not None,
             tuple((tuple(a.shape), str(a.dtype)) for a in args))))
 
     line = refuse_unconverged_davidson(info, n_eig=n_eig, tol_mev=float(davidson_tol_mev),
@@ -975,6 +979,7 @@ _ROUTE_OPTIONS = {
                      davidson_m_max=None, davidson_margin=DAVIDSON_MARGIN_ROOTS,
                      davidson_margin_tol_mev=None,
                      davidson_precond="exact", davidson_eps_shift_Ry=1e-3,
+                     davidson_olsen=False,
                      davidson_n_random_init=5, on_indefinite="refuse",
                      davidson_plan_key=None),
 }
@@ -1064,7 +1069,8 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
         ``20 n_eig``, storage twice that), ``davidson_margin`` (8 roots solved
         above ``n_eig`` and not returned), ``davidson_margin_tol_mev`` (their
         lock; default the tolerance), ``davidson_precond`` (``exact``, ``bare``,
-        ``auto``), ``davidson_eps_shift_Ry`` (1e-3), ``davidson_n_random_init``
+        ``auto``), ``davidson_eps_shift_Ry`` (1e-3), ``davidson_olsen`` (False;
+        the Olsen correction in the metric ``Sigma``), ``davidson_n_random_init``
         (5), ``davidson_plan_key`` (reuse the compiled kernels across
         same-shape payloads) and ``on_indefinite``: ``'refuse'`` (default)
         raises GATE sp_davidson_definite with the measured ``lam_min`` when

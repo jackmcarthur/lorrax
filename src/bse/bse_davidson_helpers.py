@@ -622,9 +622,14 @@ def bse_pair_diagonal_precond(
     sharding: Optional[NamedSharding] = None,
     diag_H=None,
     low=None,
+    olsen: bool = False,
 ):
     """The full-BSE counterpart of :func:`bse_diagonal_precond`: the paired
     correction ``[t_X; t_Y] = (H_D - omega)^-1 [R_X; R_Y]``.
+
+    ``olsen`` adds the Olsen correction in the metric ``Sigma``
+    (``solvers.bse_sp_davidson.sp_diagonal_precond``); ``apply`` then takes
+    the Ritz pair too, ``apply(data, RX, RY, omega, X, Y)``.
 
     ``low = (eps_c_low, eps_v_low, diag_low)`` is the finite-momentum form:
     the lower-right block of ``H`` is ``-A'`` with its own diagonal ``D_low``
@@ -668,17 +673,17 @@ def bse_pair_diagonal_precond(
     """
     from solvers.bse_sp_davidson import sp_diagonal_precond
     from .bse_preconditioner import energy_diff_cv_k
-    divide = sp_diagonal_precond(epsilon_shift=epsilon_shift)
+    divide = sp_diagonal_precond(epsilon_shift=epsilon_shift, olsen=olsen)
 
     def _diagonal(eps_c_in, eps_v_in, diag_in):
         D = energy_diff_cv_k(eps_c_in, eps_v_in) if diag_in is None else diag_in
         return D if sharding is None else jax.lax.with_sharding_constraint(D, sharding)
 
-    def _apply(data, RX, RY, omega):
+    def _apply(data, RX, RY, omega, X=None, Y=None):
         D = _diagonal(*data[:3])
         if len(data) == 3:
-            return divide(D, RX, RY, omega)
-        return divide((D, _diagonal(*data[3:])), RX, RY, omega)
+            return divide(D, RX, RY, omega, X, Y)
+        return divide((D, _diagonal(*data[3:])), RX, RY, omega, X, Y)
 
     return BSEDiagonalPreconditioner(
         (eps_c, eps_v, diag_H) + (() if low is None else tuple(low)), _apply)

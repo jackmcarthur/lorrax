@@ -256,6 +256,21 @@ def test_finite_q_routes_match_eig(side, head_tensor):
           f"(lam_min(K) = {ref['k_min']:.4f})")
 
 
+def test_finite_q_olsen_correction_gives_the_same_roots():
+    ops = _operands()
+    mesh = _mesh(2)
+    ref = orc.solve_general_pencil(reference_K(ops))
+    n_eig = 6
+    for kw in (dict(davidson_olsen=True), dict(davidson_olsen=True, davidson_eps_shift_Ry=1e-6)):
+        om, _, _ = bse_nontda.solve_bse_nontda_sharded(_payload(mesh, ops), mesh, n_eig=n_eig,
+                                                       solver="davidson", **kw)
+        info = bse_nontda.LAST_DAVIDSON["info"]
+        assert info["paired"] is False
+        assert np.max(np.abs(np.asarray(om) - ref["omega"][:n_eig])) <= 1e-9, kw
+        print(f"\nMEASURED finite-Q Olsen {kw}: {info['iterations']} iterations, "
+              f"{info['pair_calls']} pair calls")
+
+
 # ---------------------------------------------------------------------------
 # 3. Q = 0
 # ---------------------------------------------------------------------------

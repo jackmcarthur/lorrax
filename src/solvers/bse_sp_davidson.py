@@ -699,7 +699,7 @@ def _algebra(n_block, capacity, vector_shape, sharding, paired=True):
 
 
 def _operator_kernels(alg, apply_pair, precondition, n_block, vector_shape, sharding, *,
-                      paired=True, x_sharding=None):
+                      paired=True, x_sharding=None, vectors=False):
     """The two kernels that hold the caller's programs.
 
     ``ritz``: Ritz vectors, residual norms and the paired corrections of every
@@ -711,7 +711,14 @@ def _operator_kernels(alg, apply_pair, precondition, n_block, vector_shape, shar
     Unpaired: ``vector_shape`` and ``sharding`` are the pair vectors'
     ``(2, *vs)``; ``x_sharding`` is the layout of one half, in which ``X`` and
     ``Y`` are returned; ``apply_pair(data, Z)`` is ``K`` on pair rows.
+    ``vectors``: the preconditioner also takes the Ritz pair, ``precondition(data,
+    RX, RY, omega, X, Y)`` (an Olsen projection needs it).
     """
+    def correct(data, RX, RY, omega, X, Y):
+        if vectors:
+            return precondition(data, RX, RY, omega, X, Y)
+        return precondition(data, RX, RY, omega)
+
     nb = n_block
     basis, blockp = alg.basis, alg.blockp
     half_shape = vector_shape if paired else vector_shape[1:]
@@ -731,7 +738,7 @@ def _operator_kernels(alg, apply_pair, precondition, n_block, vector_shape, shar
         r2 = jnp.sum(jnp.abs(RX) ** 2, axis=axes) + jnp.sum(jnp.abs(RY) ** 2, axis=axes)
         z2 = jnp.sum(jnp.abs(X) ** 2, axis=axes) + jnp.sum(jnp.abs(Y) ** 2, axis=axes)
         resid = jnp.where(z2 > 0, jnp.sqrt(r2 / jnp.where(z2 > 0, z2, 1.0)), jnp.inf)
-        tX, tY = precondition(data, RX, RY, omega)
+        tX, tY = correct(data, RX, RY, omega, X, Y)
         n2 = jnp.sum(jnp.abs(tX) ** 2, axis=axes) + jnp.sum(jnp.abs(tY) ** 2, axis=axes)
         scale = (1.0 / jnp.sqrt(jnp.maximum(n2, 1e-300))).reshape((nb,) + tail)
         t = jnp.stack([tX * scale, tY * scale], axis=1)
@@ -748,7 +755,7 @@ def _operator_kernels(alg, apply_pair, precondition, n_block, vector_shape, shar
         r2 = jnp.sum(jnp.abs(RX) ** 2, axis=axes) + jnp.sum(jnp.abs(RY) ** 2, axis=axes)
         z2 = jnp.sum(jnp.abs(X) ** 2, axis=axes) + jnp.sum(jnp.abs(Y) ** 2, axis=axes)
         resid = jnp.where(z2 > 0, jnp.sqrt(r2 / jnp.where(z2 > 0, z2, 1.0)), jnp.inf)
-        tX, tY = precondition(data, RX, RY, omega)
+        tX, tY = correct(data, RX, RY, omega, X, Y)
         # Eq. (6): the two real-form components of [t_X; t_Y].  One real scale
         # per root: the relative size of t_X and t_Y is information.
         a = tX + jnp.conj(tY)
@@ -787,7 +794,7 @@ def sigma_gradient(data, RX, RY, omega):
     return RX, -RY
 
 
-def sp_diagonal_precond(*, epsilon_shift=1e-3):
+def sp_diagonal_precond(*, epsilon_shift=1e-3, olsen=False):
     """Paired diagonal preconditioner ``(H_D - omega)^-1`` with
     ``H_D = diag(D, -D)``, Eq. (6):
 
@@ -802,15 +809,35 @@ def sp_diagonal_precond(*, epsilon_shift=1e-3):
     pass ``D`` as the solver's ``data`` (or a function of it).  ``D`` may be a
     pair ``(D, D_low)``: the unpaired form, ``H_D = diag(D, -D_low)`` with
     ``D_low`` the diagonal of the lower-right block ``A'`` of ``K``, Eq. (8).
+
+    ``olsen``: the Olsen correction in the metric of the problem.  With
+    ``t = (H_D - omega)^-1 r`` and ``u = (H_D - omega)^-1 z`` the correction
+    is ``t - eps u``, ``eps = (z^H Sigma t) / (z^H Sigma u)``, so that
+    ``z^H Sigma (t - eps u) = 0``: the component along the Ritz pair in the
+    metric ``Sigma`` is removed (``(Sigma z)^H`` is the left eigenvector of
+    ``H = Sigma K``).  With ``Y = 0`` it is the Tamm-Dancoff Olsen correction
+    (``bse_davidson_helpers.bse_diagonal_precond``).  It makes a small
+    ``epsilon_shift`` safe.  The returned function then takes the Ritz pair
+    as well, ``precondition(D, RX, RY, omega, X, Y)``: pass
+    ``precondition_vectors=True`` to :func:`sp_davidson`.  Two batched inner
+    products per call.
     """
-    def precondition(D, RX, RY, omega):
+    def precondition(D, RX, RY, omega, X=None, Y=None):
         D, D_low = D if isinstance(D, (tuple, list)) else (D, D)
         om = omega.reshape((RX.shape[0],) + (1,) * (RX.ndim - 1))
         eps = jnp.asarray(epsilon_shift, dtype=D.dtype)
         dx, dy = D[None] - om + eps, D_low[None] + om + eps
         dx = jnp.where(jnp.abs(dx) < 1e-12, 1e-12, dx)
         dy = jnp.where(jnp.abs(dy) < 1e-12, 1e-12, dy)
-        return RX / dx, -RY / dy
+        tX, tY = RX / dx, -RY / dy
+        if olsen and X is not None:
+            uX, uY = X / dx, -Y / dy
+            axes = tuple(range(1, RX.ndim))
+            num = jnp.sum(jnp.conj(X) * tX, axis=axes) - jnp.sum(jnp.conj(Y) * tY, axis=axes)
+            den = jnp.sum(jnp.conj(X) * uX, axis=axes) - jnp.sum(jnp.conj(Y) * uY, axis=axes)
+            coeff = (num / jnp.where(jnp.abs(den) < 1e-30, 1e-30, den)).reshape(om.shape)
+            tX, tY = tX - coeff * uX, tY - coeff * uY
+        return tX, tY
     return precondition
 
 
@@ -881,6 +908,7 @@ def sp_davidson(
     plan_key=None,
     verbose: bool = True,
     paired: bool = True,
+    precondition_vectors: bool = False,
 ):
     """Lowest roots of the full BSE with paired eigenvectors, structure preserving.
 
@@ -908,7 +936,9 @@ def sp_davidson(
         ``[X0, i X0]``: ``2 n_block`` pair calls.
     precondition : (data, RX, RY (n_block, *vs), omega (n_block,) complex128) -> (tX, tY)
         The paired correction of Eq. (6), e.g. :func:`sp_diagonal_precond`.
-        Default: :func:`sigma_gradient`.
+        Default: :func:`sigma_gradient`.  With ``precondition_vectors`` it is
+        called as ``precondition(data, RX, RY, omega, X, Y)`` with the Ritz
+        pair (:func:`sp_diagonal_precond`'s ``olsen``).
     data : pytree
         The operator's and the preconditioner's device arrays.  Pass them
         here, not through a closure: a distributed array cannot be captured as
@@ -1050,11 +1080,13 @@ def sp_davidson(
     first_rank, per_root, call_weight = (nb2, 2, 1) if paired else (nb, 1, 2)
 
     alg = _algebra(nb, cap, row_shape, row_sharding, paired)
-    full_key = None if plan_key is None else (plan_key, nb, cap, vs, sharding, paired)
+    full_key = None if plan_key is None else (plan_key, nb, cap, vs, sharding, paired,
+                                              bool(precondition_vectors))
     ops = _KERNELS.get(full_key) if full_key is not None else None
     if ops is None:
         ops = _operator_kernels(alg, apply_pair, precondition, nb, row_shape, row_sharding,
-                                paired=paired, x_sharding=sharding)
+                                paired=paired, x_sharding=sharding,
+                                vectors=bool(precondition_vectors))
         if full_key is not None:
             if len(_KERNELS) >= _KERNELS_MAX:
                 _KERNELS.pop(next(iter(_KERNELS)))

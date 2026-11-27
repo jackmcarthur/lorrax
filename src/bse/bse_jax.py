@@ -1065,11 +1065,10 @@ _SOLVER_DESTS = {
 }
 
 #: The Davidson settings ``full_bse_solver = davidson`` reads (with the shared
-#: ``davidson_tol_mev`` and ``solver_max_iter``).  ``davidson_olsen`` is not
-#: among them: the paired preconditioner has no Olsen projection.
+#: ``davidson_tol_mev`` and ``solver_max_iter``).
 _FULL_DAVIDSON_DESTS = frozenset({
-    "davidson_precond", "davidson_eps_shift", "davidson_m_max", "davidson_tol_mev",
-    "davidson_margin", "davidson_margin_tol_mev"})
+    "davidson_precond", "davidson_olsen", "davidson_eps_shift", "davidson_m_max",
+    "davidson_tol_mev", "davidson_margin", "davidson_margin_tol_mev"})
 
 
 def _deck_settings(input_file, parser):
@@ -1187,8 +1186,8 @@ def parse_args(argv=None):
                 f"{', '.join(unread)} {'is' if len(unread) == 1 else 'are'} not "
                 f"read by full_bse_solver = davidson (the structure-preserving Davidson "
                 f"reads solver_max_iter, davidson_tol_mev, davidson_margin, "
-                f"davidson_margin_tol_mev, davidson_m_max, davidson_precond and "
-                f"davidson_eps_shift; it has no Olsen correction and no Lanczos or TRLan "
+                f"davidson_margin_tol_mev, davidson_m_max, davidson_precond, "
+                f"davidson_olsen and davidson_eps_shift; it has no Lanczos or TRLan "
                 f"setting) and would be ignored; drop "
                 f"{'it' if len(unread) == 1 else 'them'}")
         if unread:

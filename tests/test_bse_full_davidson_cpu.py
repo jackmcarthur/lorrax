@@ -453,15 +453,51 @@ def test_options_the_route_cannot_honour_refuse(ops):
     with pytest.raises(ValueError, match="GATE nontda_route_option"):
         solve_bse_nontda_sharded(dict(_payload(mesh, ops), head_tensor=(None, None)), mesh, n_eig=N_EIG,
                                  solver="matrixfree")
-    # through solve_bse_sharded: what the Tamm-Dancoff Davidson has and this route has not
-    for kw, want in ((dict(davidson_olsen=True), "davidson_olsen"), (dict(keep_W_R=True), "keep_W_R"),
-                     (dict(full_solver="trlan"), "full_solver='trlan'")):
-        kw = {"full_solver": "davidson", **kw}
-        with pytest.raises(ValueError, match="GATE nontda_route_option"):
-            bse_lanczos.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, tda=False, **kw)
+    # through solve_bse_sharded: a solver name that is neither full route refuses.  (The Olsen
+    # correction and a kept W_R, refused until 2026-11-27, are honoured: test_olsen_* below.)
+    with pytest.raises(ValueError, match="GATE nontda_route_option"):
+        bse_lanczos.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, tda=False,
+                                      full_solver="trlan")
     with pytest.raises(ValueError, match="GATE nontda_route_option"):
         bse_lanczos.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, tda=False,
                                       full_on_indefinite="continue")
+
+
+def test_olsen_correction_gives_the_same_roots(ops, dense):
+    """``davidson_olsen``: the correction ``t - eps u`` with ``z^H Sigma (t - eps u) = 0``.  The roots
+    are the dense route's with it, at the default shift and at a shift a thousand times smaller
+    (where the plain diagonal correction collapses onto the Ritz pair); a kept ``W_R`` is honoured."""
+    mesh = _mesh(2)
+    want = dense[2]["omega"]
+    base = _davidson(mesh, ops)
+    rows = [("no Olsen, eps 1e-3", base)]
+    for label, kw in (("Olsen, eps 1e-3", dict(davidson_olsen=True)),
+                      ("Olsen, eps 1e-6", dict(davidson_olsen=True, davidson_eps_shift_Ry=1e-6)),
+                      ("no Olsen, eps 1e-6", dict(davidson_eps_shift_Ry=1e-6))):
+        rows.append((label, _davidson(mesh, ops, **kw)))
+    for label, (omega, _, _, last) in rows:
+        assert np.max(np.abs(omega - want)) <= 1e-8, label
+        print(f"\nMEASURED {label}: {last['info']['iterations']} iterations, "
+              f"{last['info']['pair_calls']} pair calls")
+    # the Olsen direction has no Sigma-component along the Ritz pair (the kernel's own algebra)
+    from solvers.bse_sp_davidson import sp_diagonal_precond
+    rng = np.random.default_rng(3)
+    shape = (3, 4, 5)
+    cplx = lambda: jax.numpy.asarray(rng.standard_normal(shape) + 1j * rng.standard_normal(shape))  # noqa: E731
+    X, Y, RX, RY = cplx(), cplx(), cplx(), cplx()
+    D = jax.numpy.asarray(0.5 + rng.random(shape[1:]))
+    om = jax.numpy.asarray([0.1, 0.2, 0.3], dtype=complex)
+    tX, tY = sp_diagonal_precond(epsilon_shift=1e-3, olsen=True)(D, RX, RY, om, X, Y)
+    sigma = np.sum(np.conj(X) * tX, axis=(1, 2)) - np.sum(np.conj(Y) * tY, axis=(1, 2))
+    assert np.max(np.abs(np.asarray(sigma))) <= 1e-12
+    pX, pY = sp_diagonal_precond(epsilon_shift=1e-3)(D, RX, RY, om)
+    plain = np.sum(np.conj(X) * pX, axis=(1, 2)) - np.sum(np.conj(Y) * pY, axis=(1, 2))
+    assert np.min(np.abs(np.asarray(plain))) > 1e-3                         # red twin
+    # keep_W_R: both full routes leave W_R on the payload
+    payload = _payload(mesh, ops)
+    bse_lanczos.solve_bse_sharded(payload, mesh, n_eig=N_EIG, tda=False, full_solver="davidson",
+                                  keep_W_R=True, davidson_olsen=True)
+    assert payload.get("W_R") is not None and payload.get("W_q") is None
 
 
 # ---------------------------------------------------------------------------
@@ -491,12 +527,13 @@ def _parse(lines):
 def test_input_keys_and_what_they_refuse(capsys):
     full = ["full_bse = true", "full_bse_solver = davidson"]
     args = _parse(full + ["full_bse_instability = continue", "davidson_margin = 4", "davidson_m_max = 200",
-                          "davidson_precond = bare", "davidson_eps_shift = 1e-4",
+                          "davidson_precond = bare", "davidson_eps_shift = 1e-4", "davidson_olsen = true",
                           "davidson_margin_tol_mev = 1", "davidson_tol_mev = 0.005", "solver_max_iter = 50"])
     assert (args.tda, args.full_bse_solver, args.full_bse_instability) == (False, "davidson", "continue")
     assert (args.davidson_margin, args.davidson_m_max, args.davidson_precond) == (4, 200, "bare")
+    assert args.davidson_olsen is True                  # read by the full Davidson since 2026-11-27
     refused = [
-        (full + ["davidson_olsen = true"], "`davidson_olsen` is not read by full_bse_solver = davidson"),
+        (["full_bse = true", "davidson_olsen = true"], "set full_bse_solver = davidson for the full-BSE Davidson"),
         (full + ["trlan_m_max = 40"], "`trlan_m_max` is not read by full_bse_solver = davidson"),
         (full + ["lanczos_rtol = 1e-6"], "`lanczos_rtol` is not read by full_bse_solver = davidson"),
         (["full_bse = true", "full_bse_instability = continue"],

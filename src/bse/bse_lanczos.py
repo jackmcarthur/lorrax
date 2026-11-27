@@ -202,10 +202,12 @@ def solve_bse_sharded(
     (basis capacity in real-form vectors, default ``20 n_eig``),
     ``davidson_margin``, ``davidson_margin_tol_Ry``, ``davidson_precond``,
     ``davidson_eps_shift_Ry``, ``davidson_n_random_init``,
-    ``davidson_plan_key`` and ``full_on_indefinite`` (``'refuse'`` or
-    ``'continue'``: what to do when the stability matrix is not positive
-    definite, ``bse_nontda.solve_bse_nontda_sharded``); it refuses
-    ``davidson_olsen`` and ``keep_W_R``, which it cannot honour.
+    ``davidson_olsen``, ``davidson_plan_key`` and ``full_on_indefinite``
+    (``'refuse'`` or ``'continue'``: what to do when the stability matrix is
+    not positive definite, ``bse_nontda.solve_bse_nontda_sharded``).  Both
+    full routes leave ``data["W_R"]`` on the payload, so ``keep_W_R`` needs
+    nothing more.  A payload may carry ``head_tensor`` and, for a finite pair
+    momentum, ``partner`` (``bse_nontda.operand_sets``).
 
     ``davidson_tol_Ry`` is the Davidson stopping rule: every root's residual
     norm ``||H x - θ x||`` below it (times ``max(1, |θ|)``).  For a Hermitian H
@@ -238,18 +240,12 @@ def solve_bse_sharded(
                     "full_solver='davidson' (bse_jax: full_bse_solver = davidson).")
             return solve_bse_nontda_sharded(
                 data, mesh_xy, n_eig=n_eig, include_W=include_W)
-        unsupported = [name for name, on in (("davidson_olsen", davidson_olsen),
-                                             ("keep_W_R", keep_W_R)) if on]
-        if full_solver != "davidson" or unsupported:
+        if full_solver != "davidson":
             raise ValueError(
-                "GATE nontda_route_option: the full-BSE route cannot honour "
-                + (f"full_solver={full_solver!r}" if full_solver != "davidson" else
-                   " and ".join(unsupported))
-                + " (want: full_solver 'dense' or 'davidson'; with 'davidson', no Olsen "
-                  "correction and no kept W_R).  Why: the paired preconditioner has no Olsen "
-                  "projection and the full solve consumes W_q without leaving W_R on the "
-                  "payload; the solve would run without what you asked for.  Fix: drop the "
-                  "option.")
+                f"GATE nontda_route_option: the full-BSE route cannot honour "
+                f"full_solver={full_solver!r} (want: full_solver 'dense' or 'davidson').  "
+                f"Why: these are the two full-BSE eigensolvers; any other name would run "
+                f"neither.  Fix: full_solver='davidson' or 'dense'.")
         return solve_bse_nontda_sharded(
             data, mesh_xy, n_eig=n_eig, include_W=include_W, solver="davidson",
             davidson_tol_mev=float(davidson_tol_Ry) * RY_TO_MEV,
@@ -259,6 +255,7 @@ def solve_bse_sharded(
                                      float(davidson_margin_tol_Ry) * RY_TO_MEV),
             davidson_precond=davidson_precond,
             davidson_eps_shift_Ry=float(davidson_eps_shift_Ry),
+            davidson_olsen=bool(davidson_olsen),
             davidson_n_random_init=int(davidson_n_random_init),
             on_indefinite=full_on_indefinite, davidson_plan_key=davidson_plan_key)
 
