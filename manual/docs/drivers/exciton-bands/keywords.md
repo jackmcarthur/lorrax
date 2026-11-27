@@ -12,7 +12,7 @@ page: keywords
 
 The driver takes command-line flags and reads input keys, written `key = value` one per line, from the input file passed with `-i`; the input file also carries the `K_POINTS` path block. Defaults are read from the driver's argparse parser (`src/bse/exciton_bands.py`, `build_parser`) and the keyword schema (`src/gw/gw_config.py`). An unknown flag refuses; a prefix of a flag is not accepted.
 
-The BSE keys it shares with [`bse`](../bse/keywords.md) are input keys under BerkeleyGW's names (`number_val_bands_fine`, `number_cond_bands_fine`, `number_eigenvalues`, `solver`, `davidson_tol_mev`, `block_size`, `solver_max_iter`, `eqp_corrections`, `band_degeneracy`, `degeneracy_tol_ry`, `dipole_file`, and the spin keys); an old flag refuses with its key. `kgrid_fine_shift` refuses: the $\bk+\bQ$ list is Γ-centred. The exciton-band flags below stay on the command line.
+The BSE keys it shares with [`bse`](../bse/keywords.md) are input keys under BerkeleyGW's names (`number_val_bands_fine`, `number_cond_bands_fine`, `number_eigenvalues`, `solver`, `davidson_tol_mev`, `block_size`, `solver_max_iter`, `eqp_corrections`, `band_degeneracy`, `degeneracy_tol_ry`, `dipole_file`, the Davidson internals, the three `full_bse` keys, and the spin keys); an old flag refuses with its key. `kgrid_fine_shift` refuses: the $\bk+\bQ$ list is Γ-centred. `qp_rotations_file` and `highest_occupied_band` refuse (`GATE exb_unserved_key`): the states at $\bk+\bQ$ are not rotated into the QP basis, and the band split is the WFN's electron count. The exciton-band flags below stay on the command line.
 
 Required
 {: .kw-group }
@@ -33,7 +33,7 @@ On a downfolded bundle the parent table recorded in the bundle is used first.
 ### `number_val_bands_fine` {: .kw data-type="int" data-default="required" }
 Valence bands in the BSE window, counted down from the highest occupied band. Shared with [`bse`](../bse/keywords.md).
 
-Clamped to the occupied count, which is the WFN's `ifmax`; this driver has no `highest_occupied_band`.
+Clamped to the occupied count, which is the WFN's `ifmax`; `highest_occupied_band` refuses in this driver. Under `full_bse` it must not exceed `nval`.
 {: .kw-details }
 
 ### `number_cond_bands_fine` {: .kw data-type="int" data-default="required" }
@@ -182,14 +182,59 @@ A BSE window edge inside a degenerate multiplet. Shared with [`bse`](../bse/keyw
 ### `number_eigenvalues` {: .kw data-type="int" data-default="6" }
 Exciton levels per $\bQ$. Shared with [`bse`](../bse/keywords.md), where the default is 5.
 
-### `block_size` {: .kw data-type="int" data-default="8" }
-Block width of the per-$\bQ$ block Lanczos. Shared with [`bse`](../bse/keywords.md), where the default is 1.
+### `solver` {: .kw data-type="enum" data-default="davidson" }
+Per-$\bQ$ eigensolver of the Tamm–Dancoff problem. `davidson`: block Davidson with the exact diagonal preconditioner, stopped on `davidson_tol_mev`. `block_lanczos`: fixed block Lanczos, `block_size` × `solver_max_iter`. Shared with [`bse`](../bse/keywords.md); `trlan` is not offered here.
 
-### `solver_max_iter` {: .kw data-type="int" data-default="40" }
-Block-Lanczos iterations; the Krylov dimension is block × iterations, capped at the physical transition count.
-
-Reorthogonalization is always full.
+A key that only the other solver reads refuses. The full BSE (`full_bse`) does not read it: its solver is `full_bse_solver`, and `block_lanczos` refuses there.
 {: .kw-details }
+
+`davidson` `block_lanczos`
+{: .kw-values }
+
+### `davidson_tol_mev` {: .kw data-type="float" data-default="0.01" }
+Davidson stopping rule in meV: every root's residual below it. A $\bQ$ that reaches `solver_max_iter` first refuses before anything is written (`GATE davidson_converged`). Shared with [`bse`](../bse/keywords.md).
+
+### `davidson_precond`, `davidson_olsen`, `davidson_eps_shift`, `davidson_margin`, `davidson_margin_tol_mev`, `davidson_m_max` {: .kw data-type="mixed" data-default="exact, false, 1e-3, 8, davidson_tol_mev, the solver's" }
+Davidson internals, with the meanings they have in [`bse`](../bse/keywords.md): the preconditioner diagonal, the Olsen correction, the regularization in Ry, the margin roots and the residual at which they lock, the subspace size.
+
+Read by the Tamm–Dancoff Davidson and by `full_bse_solver = davidson`. A named one refuses with `solver = block_lanczos` and with `full_bse_solver = dense`.
+{: .kw-details }
+
+### `block_size` {: .kw data-type="int" data-default="8" }
+`solver = block_lanczos` only: block width of the per-$\bQ$ block Lanczos. Shared with [`bse`](../bse/keywords.md), where the default is 1.
+
+With the default solver a value other than 8 refuses.
+{: .kw-details }
+
+### `solver_max_iter` {: .kw data-type="int" data-default="max(30, min(200, N/2)), or 40" }
+Iteration cap. Davidson: block iterations, by default $\max(30, \min(200, N/2))$ with $N$ the physical transition count. Block Lanczos: iterations, 40 by default; the Krylov dimension is block × iterations, capped at $N$.
+
+The block Lanczos always reorthogonalizes fully.
+{: .kw-details }
+
+### `full_bse` {: .kw data-type="bool" data-default="false" }
+Solve the full BSE at every $\bQ$ of the path, with the coupling block between excitations at $\bQ$ and de-excitations at $-\bQ$ ([Theory](theory.md#full)). Off: the Tamm–Dancoff block $A(\bQ)$. Shared with [`bse`](../bse/keywords.md).
+
+The H-transform then also returns the valence states at $\bk+\bQ$, so `nval` must be at least `number_val_bands_fine` (`GATE exb_full_bse_valence_window`).
+{: .kw-details }
+
+### `full_bse_solver` {: .kw data-type="enum" data-default="dense" }
+Eigensolver of the full BSE; read with `full_bse = true` only. `dense` assembles the blocks and solves on the host, at most 4096 transitions per $\bQ$. `davidson` is the structure-preserving block Davidson, with no size limit.
+
+`dense` has no iteration: `davidson_tol_mev`, `solver_max_iter`, `full_bse_instability` and the Davidson internals refuse with it.
+{: .kw-details }
+
+`dense` `davidson`
+{: .kw-values }
+
+### `full_bse_instability` {: .kw data-type="enum" data-default="refuse" }
+What `full_bse_solver = davidson` does at a $\bQ$ whose stability matrix is not positive definite. `refuse` stops with the measured lowest eigenvalue; `continue` reports the unstable or non-positive roots and writes the positive roots above them. The dense solve always refuses.
+
+The report and the `.dat` header carry the smallest stability margin on the path. The check covers the space the solver built: an instability that belongs to the $-\bQ$ problem (a root of negative type at positive energy) is not detected at $\bQ$ unless inversion or time reversal maps $\bQ$ to $-\bQ$.
+{: .kw-details }
+
+`refuse` `continue`
+{: .kw-values }
 
 **Files**
 

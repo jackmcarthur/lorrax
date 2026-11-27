@@ -63,7 +63,7 @@ Plain text. Header lines start with `#`; then one row per path point, then one p
  ...
 ```
 
-The values shown are a format sample, not reference numbers. The `refit`, `refit-fh-window` and `refit-cert` lines appear only on the routes that produce them; a `visualization` grade adds a `refit-cert-grade` line saying the levels are not reference numbers.
+The values shown are a format sample, not reference numbers. The `refit`, `refit-fh-window` and `refit-cert` lines appear only on the routes that produce them; a `visualization` grade adds a `refit-cert-grade` line saying the levels are not reference numbers. Under `full_bse = true` the first line names the full BSE and its solver in place of `TDA`, and after a Davidson solve a `# stability:` line gives the smallest stability margin on the path and the number of $\bQ$ with unstable or non-positive roots.
 
 | Column | Content |
 |---|---|

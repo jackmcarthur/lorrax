@@ -5,7 +5,7 @@ page: overview
 
 # exciton-bands driver
 
-`bse.exciton_bands` Exciton dispersion $\Omega_S(\bQ)$ of the finite-momentum Tamm–Dancoff BSE along a path of $\bQ$.
+`bse.exciton_bands` Exciton dispersion $\Omega_S(\bQ)$ of the finite-momentum BSE along a path of $\bQ$, Tamm–Dancoff or full.
 {: .page-summary }
 
 <div class="workflow-map" data-driver="exciton-bands" data-page="overview"></div>
@@ -44,7 +44,7 @@ Exchange at $\bQ$
 3. **Kernels at Q**
    The exchange $V_\bQ(\mu,\nu)$ comes from the route `--vq-mode` selects. The direct $W_\bq(\mu,\nu;0)$ is the restart's, unchanged, because every momentum transfer $\bk-\bk'$ stays on the grid.
 4. **Solve along the path**
-   Block Lanczos over the production BSE matvec, one `lax.scan` over the whole $\bQ$ list, eigenvalues only. Rank 0 writes the table and the plot.
+   The Davidson (default) or block Lanczos over the production BSE matvec at every $\bQ$, eigenvalues only. With `full_bse = true` the full BSE is solved at every $\bQ$ instead ([Theory](theory.md#full)). Rank 0 writes the table and the plot.
 
 </div>
 
@@ -142,4 +142,7 @@ K_POINTS crystal_b
     - `eqp_corrections` on a QP wavefunction, or together with `kgrid_fine` densification. Remove `eqp_corrections`.
     - A `--w-coarse-grid` that does not divide the BSE grid, or on a downfolded bundle (`GATE srlr_downfold`). A restart without `W0_lr` under `--w-coarse-grid` or `kgrid_fine` (`GATE srlr_restart_channels`). `w_head_densify = c1` or `legacy`, and `--w-head-gamma-cell`.
     - `--q-per-segment` below 1.
+    - `qp_rotations_file` or `highest_occupied_band` in the input file (`GATE exb_unserved_key`). Remove the key for this driver.
+    - `full_bse_solver` or `full_bse_instability` without `full_bse = true`; `full_bse = true` with `solver = block_lanczos`, or with `nval` below `number_val_bands_fine` (`GATE exb_full_bse_valence_window`).
+    - Under `full_bse = true`: a stability matrix that is not positive definite at some $\bQ$, on the dense solve always and on the Davidson unless `full_bse_instability = continue`; more than 4096 transitions per $\bQ$ on the dense solve.
 

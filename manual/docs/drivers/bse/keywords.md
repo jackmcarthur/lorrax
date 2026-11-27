@@ -51,7 +51,7 @@ Optional
 Solve the full $\begin{pmatrix}A&B\\-B^*&-A^*\end{pmatrix}$ problem. Off: the Tamm–Dancoff resonant block $A$, as in BerkeleyGW. With `dipole_file` the per-state dipoles take both halves of the paired eigenvector ([Theory](theory.md#abs-ds)) and the spectra are written as under the TDA; the Haydock recursion needs the TDA.
 
 ### `full_bse_solver` {: .kw data-type="enum" data-default="dense" }
-Eigensolver of the full BSE; read with `full_bse = true` only. `dense` assembles $A$ and $B$ and solves on the host (up to 4096 transitions). `davidson` is a structure-preserving block Davidson with no size limit; it reads `solver_max_iter`, `davidson_tol_mev`, `davidson_margin`, `davidson_margin_tol_mev`, `davidson_m_max`, `davidson_precond` and `davidson_eps_shift`. Under `full_bse = true`, `solver` other than `davidson` and `block_size` other than 1 refuse.
+Eigensolver of the full BSE; read with `full_bse = true` only. `dense` assembles $A$ and $B$ and solves on the host (up to 4096 transitions). `davidson` is a structure-preserving block Davidson with no size limit; it reads `solver_max_iter`, `davidson_tol_mev`, `davidson_margin`, `davidson_margin_tol_mev`, `davidson_m_max`, `davidson_precond`, `davidson_olsen` and `davidson_eps_shift`. Under `full_bse = true`, `solver` other than `davidson` and `block_size` other than 1 refuse. [Exciton bands](../exciton-bands/keywords.md#full_bse) reads `full_bse` and the two keys below at finite $\bQ$.
 
 `dense` `davidson`
 {: .kw-values }
@@ -89,7 +89,7 @@ A bare key reads BerkeleyGW's file name beside the input file (`eqp.dat`, `eqp_c
 {: .kw-details }
 
 ### `qp_rotations_file` {: .kw data-type="path" data-default="—" }
-The GW run's `qp_wfn_rotations.h5`: solve in the eigenbasis of its $H_{QP}$; the window counts QP states. Exclusive with the eqp keys. Under `kgrid_fine` the band interpolation is built from $f(H_{QP}) = U f(E_{QP}) U^\dagger$ on the coarse grid, so the fine states and energies are quasiparticle while $W$, $V$ and the ISDF tensors stay the GW run's own; the QP block must lie inside the interpolated band window (raise `number_cond_bands_coarse`), and the full-window velocity of TD-aGW refuses (`GATE bse_qp_rotations_k_grid`). Set `dipole_position_fix = true` there: the fine QP states mix DFT bands.
+The GW run's `qp_wfn_rotations.h5`: solve in the eigenbasis of its $H_{QP}$; the window counts QP states. Exclusive with the eqp keys. Under `kgrid_fine` the band interpolation is built from $f(H_{QP}) = U f(E_{QP}) U^\dagger$ on the coarse grid, so the fine states and energies are quasiparticle while $W$, $V$ and the ISDF tensors stay the GW run's own; the QP block must lie inside the interpolated band window (raise `number_cond_bands_coarse`), and the full-window velocity of TD-aGW refuses (`GATE bse_qp_rotations_k_grid`). Set `dipole_position_fix = true` there: the fine QP states mix DFT bands. [Exciton bands](../exciton-bands/keywords.md) and `bse.absorption_haydock` refuse the key.
 
 ### `wfn_file` {: .kw data-type="path" data-default="WFN.h5" }
 WFN for the occupied count, the cell volume, the spinor count, bundle authentication and the band interpolation; relative to the input file.
@@ -178,10 +178,10 @@ Iteration budget of every solver, with $N$ the transition count: Davidson's cap 
 Davidson stopping rule in meV: every root's residual $\lVert Hx - \Omega x\rVert$ below it. A solve that reaches `solver_max_iter` first refuses (`GATE davidson_converged`).
 
 ### `davidson_precond`, `davidson_margin`, `davidson_margin_tol_mev`, `davidson_m_max`, `davidson_olsen`, `davidson_eps_shift` {: .kw data-type="mixed" data-default="exact, 8, davidson_tol_mev, 10·n_eig, false, 1e-3" }
-Davidson internals: the preconditioner diagonal (`exact`, `bare`, `auto`), extra unreported roots and the residual at which they lock, the subspace size, the Olsen correction, the regularization in Ry. `davidson_m_max` counts basis vectors: 10·n_eig by default on the Tamm–Dancoff route, 20·n_eig real-form vectors on the full route (`full_bse_solver = davidson`). `davidson_olsen` is not read on the full route.
+Davidson internals: the preconditioner diagonal (`exact`, `bare`, `auto`), extra unreported roots and the residual at which they lock, the subspace size, the Olsen correction, the regularization in Ry. `davidson_m_max` counts basis vectors: 10·n_eig by default on the Tamm–Dancoff route, 20·n_eig real-form vectors on the full route (`full_bse_solver = davidson`), which reads all six. `davidson_eps_shift = 0` is used as written.
 
 ### `block_size`, `lanczos_rtol`, `lanczos_check_every`, `lanczos_n_reorth` {: .kw data-type="mixed" data-default="1, 0, 4, −1" }
-`block_lanczos` internals: block width, convergence threshold (0 = fixed dimension) and its cadence, reorthogonalization window (−1 = full; keep it for spinor spectra).
+`block_lanczos` internals: block width, convergence threshold (0 = fixed dimension) and its cadence, reorthogonalization window (−1 = full; keep it for spinor spectra). The block width divides `solver_max_iter` into block iterations under `block_lanczos` only; the Davidson and TRLan budgets do not depend on it.
 
 ### `trlan_m_max`, `trlan_n_keep` {: .kw data-type="int" data-default="max(3 n_eig, 60), n_eig + 10" }
 `trlan` internals: basis slots and Ritz vectors kept across a restart.
@@ -242,7 +242,7 @@ Prefix of the absorption files from the eigensolve (`absorption_haydock` for the
 
 ## Absorption (`bse.absorption_haydock`)
 
-A separate entry point: the TDA screened recursion ($D + w V - W$), at least two devices, band degeneracy `strict`. It reads `number_val_bands_fine`, `number_cond_bands_fine`, `highest_occupied_band`, the eqp keys, `dipole_file` (default `dipole.h5` beside the input file), `dipole_position_fix`, `use_momentum`/`use_velocity`, the spin keys, `number_iterations`, `energy_resolution`, `delta_frequency`, `omega_min_ev`, `omega_max_ev`, `no_eps1`, `polarization` and the fine-grid keys, as above. The cell volume and the spinor count are read from the WFN. The command line is `-i` and `--out-prefix` (default `absorption_haydock`). `gaussian_broadening` and `local_fields` refuse.
+A separate entry point: the TDA screened recursion ($D + w V - W$), at least two devices, band degeneracy `strict`. It reads `number_val_bands_fine`, `number_cond_bands_fine`, `highest_occupied_band`, the eqp keys, `dipole_file` (default `dipole.h5` beside the input file), `dipole_position_fix`, `use_momentum`/`use_velocity`, the spin keys, `number_iterations`, `energy_resolution`, `delta_frequency`, `omega_min_ev`, `omega_max_ev`, `no_eps1`, `polarization` and the fine-grid keys, as above. The cell volume and the spinor count are read from the WFN. The command line is `-i` and `--out-prefix` (default `absorption_haydock`). `gaussian_broadening` and `local_fields` refuse. `full_bse = true` and `qp_rotations_file` refuse too (`GATE haydock_unserved_key`): the recursion runs on the Tamm–Dancoff operator, and this entry point does not rotate the states into the QP basis.
 
 ## Renamed and retired
 

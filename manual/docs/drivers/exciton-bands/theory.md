@@ -41,7 +41,7 @@ $$
 \langle cv\bk|H_\bQ|c'v'\bk'\rangle = \big(E^{\mathrm{QP}}_{c\,\bk+\bQ}-E^{\mathrm{QP}}_{v\bk}\big)\,\delta_{cc'}\delta_{vv'}\delta_{\bk\bk'} + \langle cv\bk|V_\bQ - W|c'v'\bk'\rangle, \qquad H_\bQ A^{S\bQ} = \Omega_S(\bQ)\,A^{S\bQ} \tag{1.2}
 $$
 
-$v$ runs over the `number_val_bands_fine` highest occupied bands and $c$ over the `number_cond_bands_fine` lowest empty ones, on the $N_k$ points of the restart's $\bk$ grid. At $\bQ = 0$ this is the optical TDA Hamiltonian of the [`bse`](../bse/theory.md) driver. There is no non-TDA route.
+$v$ runs over the `number_val_bands_fine` highest occupied bands and $c$ over the `number_cond_bands_fine` lowest empty ones, on the $N_k$ points of the restart's $\bk$ grid. At $\bQ = 0$ this is the optical TDA Hamiltonian of the [`bse`](../bse/theory.md) driver. With `full_bse = true` the driver solves the full problem of §1.4 instead.
 
 ### <span class="n">1.3</span> Exchange and direct kernels at Q {: #kernels }
 
@@ -55,6 +55,21 @@ $$
 $$
 
 The electron pair carries momentum $(\bk+\bQ)-(\bk'+\bQ) = \bk-\bk'$, the same as the hole pair. So $W$ is needed only at grid momenta, exactly as at $\bQ=0$, while the exchange needs $V_\bQ$ at the off-grid $\bQ$ (§3). $w_x = 2$ for a spin-restricted scalar run (singlet) and $1$ for spinors.
+
+### <span class="n">1.4</span> The full BSE at Q {: #full }
+
+`bse_nontda.solve_bse_nontda_sharded`
+{: .in-code }
+
+With `full_bse = true` an excitation of momentum $\bQ$ couples to the de-excitations of momentum $-\bQ$, whose pair state holds the electron at $\bk$ and the hole at $\bk+\bQ$:
+
+$$
+\begin{pmatrix} A(\bQ) & B(\bQ) \\ -B(\bQ)^\dagger & -\overline{A(-\bQ)} \end{pmatrix}\begin{pmatrix} X^S \\ Y^S \end{pmatrix} = \Omega_S(\bQ) \begin{pmatrix} X^S \\ Y^S \end{pmatrix} \tag{1.4}
+$$
+
+$A(\bQ)$ is $H_\bQ$ of Eq. (1.2), and $B(\bQ)$ is the same exchange and direct kernel between an excitation and a de-excitation. At $\bQ = 0$ this is Eq. (2.3) of the [`bse`](../bse/theory.md) driver. At finite $\bQ$, $B \ne B^T$ and the roots do not come in $\pm\Omega$ pairs: the spectrum is $\{\Omega_S(\bQ)\} \cup \{-\Omega_S(-\bQ)\}$, and the driver returns the lowest roots of the first set. The solve needs the stability matrix, the same blocks without the two minus signs, to be positive definite (`full_bse_instability`).
+
+The lower-right block needs the valence states at $\bk+\bQ$. The H-transform of §2 returns them with the conduction states, so its window must hold the BSE valence bands. `full_bse_solver = dense` assembles the four blocks; `davidson` is a structure-preserving block Davidson on pair vectors $(X, Y)$, in which one application of the stability matrix is two calls of the compiled product of §5.1.
 
 ## <span class="n">2</span> Conduction states at k + Q {: #bands }
 
@@ -278,7 +293,7 @@ The exchange tiles stay on the coarse restart grid, so `ongrid` and the refit ce
 
 ## <span class="n">5</span> Solver and output {: #solver }
 
-Every path point is one Tamm–Dancoff eigenproblem. The driver solves all of them in one compiled program and writes eigenvalues only.
+Every path point is one eigenproblem, Tamm–Dancoff by default. The driver solves all of them with one compiled solver and writes eigenvalues only.
 {: .intro }
 
 ### <span class="n">5.1</span> The matrix-free product {: #solve-matvec }
@@ -294,18 +309,20 @@ $$
 
 The exchange goes through the transition density $\rho(\br_\mu)$ and $V_\bQ$; the direct term is a $\bk$-convolution, $\mathrm{IFFT}_{\bk\to\bR}$, a pointwise product with $W_\bR(\mu,\nu)$ and $\mathrm{FFT}_{\bR\to\bk}$, with a $1/\sqrt{N_k}$ on each transform.
 
-### <span class="n">5.2</span> Block Lanczos over the path {: #solve-lanczos }
+### <span class="n">5.2</span> Solvers over the path {: #solve-lanczos }
 
-`build_path_solver`
+`build_path_solver_davidson`, `build_path_solver`
 {: .in-code }
 
-For each $\bQ$ the pair amplitude $\psi^*_{c\,\bk+\bQ}(\br_\mu)\psi_{v\bk}(\br_\mu)$ is formed once, then a fixed-depth block Lanczos with full reorthogonalization returns the lowest `number_eigenvalues` Ritz values:
+The default solver is the block Davidson of the [`bse`](../bse/theory.md) driver with the exact diagonal preconditioner. It is planned once and applied at every $\bQ$ with that point's operands, and stops when every root's residual is below `davidson_tol_mev`. With `full_bse = true` the dense solve or the structure-preserving Davidson of §1.4 takes its place.
+
+Under `solver = block_lanczos`, for each $\bQ$ the pair amplitude $\psi^*_{c\,\bk+\bQ}(\br_\mu)\psi_{v\bk}(\br_\mu)$ is formed once, then a fixed-depth block Lanczos with full reorthogonalization returns the lowest `number_eigenvalues` Ritz values:
 
 $$
 H_\bQ A^{S\bQ} = \Omega_S(\bQ)\,A^{S\bQ}, \qquad S = 1,\dots,n_\mathrm{eig}, \qquad \dim\mathcal K = b\cdot\min\!\big(n_\mathrm{iter},\ \lfloor n_v n_c N_k / b\rfloor\big) \tag{5.2}
 $$
 
-$b$ is `block_size` and $n_\mathrm{iter}$ is `solver_max_iter`. The start block has no weight on mesh pad slots. The whole $\bQ$ list, with certification and spot-check rows, is one `lax.scan`: one compile serves every point, and extra points cost one scan row each.
+$b$ is `block_size` and $n_\mathrm{iter}$ is `solver_max_iter`. The start block has no weight on mesh pad slots. On this route the whole $\bQ$ list, with certification and spot-check rows, is one `lax.scan`: one compile serves every point, and extra points cost one scan row each.
 
 ### <span class="n">5.3</span> Output {: #solve-out }
 
