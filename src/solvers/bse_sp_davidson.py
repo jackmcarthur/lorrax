@@ -152,6 +152,12 @@ METRIC_TOL = 1e-8
 #: ``|omega|`` plus ``IMAG_ATOL`` times the scale of ``M_r``.
 IMAG_RTOL = 1e-9
 IMAG_ATOL = 1e-12
+#: A projected root near zero is known only to about ``eps * scale^2 / |omega|``
+#: (``omega^2 = lam_- lam_+`` is what the pencil fixes to ``eps * scale^2``).
+#: The real part of a non-real root counts as zero below ``ROOT_NOISE`` times
+#: that: an imaginary root whose real part is rounding-negative is still the
+#: representative of its pair.
+ROOT_NOISE = 100.0
 
 #: Kernel sets kept by the caller's ``plan_key`` (as ``solvers.davidson._PLANS``).
 _KERNELS: dict = {}
@@ -205,6 +211,27 @@ def solve_projected_definite(Mr, S, n_roots):
     return 1.0 / mu, C
 
 
+def _sigma_orthonormal(V, S):
+    """Columns of positive type made Sigma-orthonormal: ``V R^-1`` with
+    ``V^H (2 i S) V = R^H R``, so that ``c_i^H (2 i S) c_j = delta_ij``.
+
+    Eigenvectors of distinct roots of the pencil are Sigma-orthogonal already;
+    inside a multiplet a general solve returns any basis, and scaling each
+    column alone leaves ``X_i^H X_j - Y_i^H Y_j`` off the identity there.
+    Falls back to the per-column scale when the Gram matrix is not positive
+    definite to rounding.
+    """
+    if V.shape[1] == 0:
+        return V
+    G = V.conj().T @ ((2j * S) @ V)
+    G = 0.5 * (G + G.conj().T)
+    try:
+        R = np.linalg.cholesky(G).conj().T
+    except np.linalg.LinAlgError:
+        return V / np.sqrt(np.abs(np.real(np.diag(G))))[None, :]
+    return sla.solve_triangular(R, V.T, trans="T", lower=False).T
+
+
 def _solve_projected(Mr, S, n_roots, scale, *, definite):
     """Roots of ``M_r c = omega (i S) c`` in the solver's order.
 
@@ -236,24 +263,51 @@ def _solve_projected(Mr, S, n_roots, scale, *, definite):
     w, V = w[ok], V[:, ok]
     sig = np.real(np.einsum("ij,ij->j", V.conj(), (1j * S) @ V))
     real = np.abs(w.imag) <= IMAG_RTOL * np.abs(w) + IMAG_ATOL * scale
-    iu = np.where(~real & (w.imag > 0) & (w.real >= -IMAG_ATOL * scale))[0]
+    # The representative has Im omega > 0 and Re omega >= 0.  An imaginary root
+    # has Re omega = 0 only to the accuracy of a root near zero (ROOT_NOISE):
+    # a rounding-negative real part must not drop it.  The two members of a
+    # quadruplet whose real parts are below that are both kept: they are two
+    # imaginary roots to working precision.
+    re_zero = np.maximum(IMAG_RTOL * np.abs(w) + IMAG_ATOL * scale,
+                         ROOT_NOISE * np.finfo(float).eps * scale ** 2
+                         / np.maximum(np.abs(w), np.finfo(float).tiny))
+    iu = np.where(~real & (w.imag > 0) & (w.real >= -re_zero))[0]
     iu = iu[np.argsort(-w.imag[iu])]
     ineg = np.where(real & (sig > 0) & (w.real <= 0))[0]
     ineg = ineg[np.argsort(w.real[ineg])]
     # The partners: conj(omega) for a complex root (its eigenvector is a second
-    # one), conj(c) for a real root (the same real plane).
-    mirror = [int(np.argmin(np.abs(w - np.conj(w[j])))) for j in iu]
+    # one), conj(c) for a real root (the same real plane).  One partner per
+    # representative: degenerate roots must not share one.
+    below = [int(j) for j in np.where(~real & (w.imag < 0))[0]]
+    mirror = []
+    for j in iu:
+        if not below:
+            break
+        k = min(below, key=lambda i: abs(w[i] - np.conj(w[j])))
+        mirror.append(k)
+        below.remove(k)
     special = np.concatenate([V[:, iu], V[:, mirror], V[:, ineg]], axis=1)
     keep = _real_range(np.concatenate([special.real, special.imag], axis=1))
     om_u, C_u = w[iu].astype(complex), V[:, iu].astype(complex)
     C_u = C_u / (np.sqrt(2.0) * np.linalg.norm(C_u, axis=0))[None, :]
-    om_n, C_n = w[ineg].real.astype(complex), V[:, ineg].astype(complex)
-    C_n = C_n / np.sqrt(2.0 * sig[ineg])[None, :]
+    om_n, C_n = w[ineg].real.astype(complex), _sigma_orthonormal(V[:, ineg].astype(complex), S)
     n_stable = max(0, n_roots - len(iu) - len(ineg))
     general = False
     try:
-        # N: real orthonormal basis of {d : keep^T M_r d = 0}.
-        Qc, _ = np.linalg.qr(Mr @ keep, mode="complete")
+        # N: real orthonormal basis of the complement of the special sector,
+        # {d : keep^T S d = 0} = {d : keep^T M_r d = 0}.  The two descriptions
+        # are the same space; the better conditioned one is used.  M_r keep
+        # loses eps / |lam| digits in a soft direction of the sector (its
+        # column there is a difference of O(scale) terms of size |lam|), and
+        # the stable roots then stall at that level; S keep does not.
+        cands = [G for G in (S @ keep, Mr @ keep / max(scale, np.finfo(float).tiny))
+                 if G.shape[1]]
+        if cands:
+            spread = [np.linalg.svd(G, compute_uv=False) for G in cands]
+            pick = int(np.argmax([s[-1] / max(s[0], np.finfo(float).tiny) for s in spread]))
+            Qc, _ = np.linalg.qr(cands[pick], mode="complete")
+        else:
+            Qc = np.eye(m)
         Nc = Qc[:, keep.shape[1]:]
         om_s, C_s = solve_projected_definite(Nc.T @ Mr @ Nc, Nc.T @ S @ Nc, n_stable)
         C_s = Nc @ C_s
@@ -261,7 +315,7 @@ def _solve_projected(Mr, S, n_roots, scale, *, definite):
         general = True
         ist = np.where(real & (sig > 0) & (w.real > 0))[0]
         ist = ist[np.argsort(w.real[ist])][:n_stable]
-        om_s, C_s = w[ist].real, V[:, ist] / np.sqrt(2.0 * sig[ist])[None, :]
+        om_s, C_s = w[ist].real, _sigma_orthonormal(V[:, ist].astype(complex), S)
     omega = np.concatenate([om_u, om_n, om_s.astype(complex)])[:n_roots]
     C = np.concatenate([C_u, C_n, C_s], axis=1)[:, :n_roots]
     return dict(omega=omega, C=C, n_unstable=min(len(iu), n_roots),
@@ -662,7 +716,11 @@ def sp_davidson(
         root has ``X^H X - Y^H Y = 0`` and is scaled to ``X^H X + Y^H Y = 1``.
     info : dict
         ``status`` (``STATUS_NAMES``), ``iterations``, ``restarts``,
-        ``active_size``, ``capacity``, ``n_block``, ``n_converge``, ``n_tested``;
+        ``active_size``, ``capacity``, ``n_block``, ``n_converge``, ``n_tested``,
+        ``n_stable_tested`` (the unstable and non-positive roots take block
+        rows: ``n_tested = min(n_block, n_special + n_converge)``, so fewer than
+        ``n_converge`` positive roots are certified when the block has fewer
+        margin rows than special roots; the caller checks this number);
         ``pair_calls`` (total, the start block's ``pair_calls_start``
         included), ``pair_calls_per_root`` (total over ``n_converge``),
         ``root_corrections`` (n_block,) (iterations in which each root asked
@@ -899,7 +957,8 @@ def sp_davidson(
     info = dict(
         status=int(status), status_name=STATUS_NAMES[int(status)], iterations=it,
         restarts=restarts, active_size=m, capacity=cap, n_block=nb, n_converge=n_test,
-        n_tested=int(n_tested), pair_calls=int(calls), pair_calls_start=int(calls_start),
+        n_tested=int(n_tested), n_stable_tested=int(n_tested) - int(n_un) - int(n_neg),
+        pair_calls=int(calls), pair_calls_start=int(calls_start),
         pair_calls_per_root=float(calls) / n_test, root_corrections=corrections,
         residuals=resid, converged=passes, lam_min=float(lam_min_seen), pd_floor=float(pd_floor),
         indefinite_at=indefinite_at, n_unstable=int(n_un), n_negative=int(n_neg),
@@ -925,8 +984,9 @@ def sp_davidson(
         raise ValueError(
             f"GATE sp_davidson_definite: the projected stability matrix M_r = Re(W^H M W) is not "
             f"positive definite (got: lam_min = {lam_min_seen:.6e} at iteration {indefinite_at}, "
-            f"in the operator's energy units; want: > {pd_floor:.3e} = {PD_RTOL:g} x its largest "
-            f"diagonal entry).  Why: lam_min(K) <= lam_min(M_r) for K = [[A, B], [B*, A*]], so K "
+            f"in the operator's energy units, an upper bound of lam_min(K) taken when the sign "
+            f"first showed and not a converged value; want: > {pd_floor:.3e} = {PD_RTOL:g} x its "
+            f"largest diagonal entry).  Why: lam_min(K) <= lam_min(M_r) for K = [[A, B], [B*, A*]], so K "
             f"is not positive definite: the reference state is unstable (or marginal to "
             f"rounding), the lowest root is imaginary or not positive, and a definite solve "
             f"would return roots this pencil does not have.  Fix: on_indefinite='continue' "

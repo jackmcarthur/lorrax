@@ -311,6 +311,58 @@ def test_unstable_sectors_beyond_one_imaginary_pair(case):
         assert np.min(np.abs(got - abs(special[0]))) > 1e-3
 
 
+def _special_modes_pencil(lam, mu, seed=3):
+    """Real ``M = A - B`` and ``P = A + B`` sharing ``k`` decoupled modes with eigenvalues
+    ``(lam_i, mu_i)``, the rest dense and positive definite, rotated by a random unitary.  A mode
+    has ``omega^2 = lam mu``: an imaginary root for ``lam mu < 0``, a real root of negative norm
+    (listed at ``-sqrt(lam mu)``) when both are negative.  Returns ``A, B, imag, neg``."""
+    lam, mu = np.asarray(lam, float), np.asarray(mu, float)
+    k, n = lam.size, N - lam.size
+    rng = np.random.default_rng(seed)
+    q1, _ = np.linalg.qr(rng.standard_normal((n, n)))
+    q2, _ = np.linalg.qr(rng.standard_normal((n, n)))
+    Mm, Pp = np.zeros((N, N)), np.zeros((N, N))
+    Mm[:k, :k], Pp[:k, :k] = np.diag(lam), np.diag(mu)
+    Mm[k:, k:] = (q1 * (0.3 + 0.7 * rng.random(n))) @ q1.T
+    Pp[k:, k:] = (q2 * (0.5 + rng.random(n))) @ q2.T
+    A, B = orc.rotate_unitary(0.5 * (Pp + Mm), 0.5 * (Pp - Mm), orc.random_unitary(N, rng))
+    prod = lam * mu
+    return A, B, np.sort(np.sqrt(-prod[prod < 0]))[::-1], np.sort(-np.sqrt(prod[(lam < 0) & (mu < 0)]))
+
+
+@pytest.mark.parametrize("name, lam, mu", [
+    ("barely_unstable", [-1e-9], [1.0]),
+    ("degenerate_imaginary", [-1e-3, -1e-3], [1.0, 1.0]),
+    ("degenerate_negative_real", [-0.2, -0.2], [-0.5, -0.5]),
+    ("degenerate_imaginary_and_negative", [-1e-3, -1e-3, -0.2, -0.2], [1.0, 1.0, -0.5, -0.5]),
+])
+def test_special_roots_in_multiplets_and_at_the_margin(name, lam, mu):
+    """Two defects of the first version (stress review, 2026-11-27).  An imaginary root whose
+    computed real part was rounding-negative was dropped from the unstable sector and the solve
+    reported a stable state.  Real roots of negative norm in a multiplet came back with
+    ``X_i^H X_j - Y_i^H Y_j`` up to 0.7 off the identity (each column scaled alone)."""
+    A, B, imag, neg = _special_modes_pencil(lam, mu)
+    orc.assert_bse_structure(A, B, tol=1e-13)
+    omega, X, Y, info = _solve(A, B, _mesh(2), margin=8, precond=True, capacity=N,
+                               on_indefinite="continue")
+    assert info["status"] == spd.CONVERGED, info["status_name"]
+    n_un, n_neg = info["n_unstable"], info["n_negative"]
+    assert (n_un, n_neg) == (imag.size, neg.size), (name, n_un, n_neg, np.asarray(omega)[:4])
+    om = np.asarray(omega)
+    err_imag = np.max(np.abs(np.sort(om[:n_un].imag)[::-1] - imag)) if n_un else 0.0
+    err_real = np.max(np.abs(om[:n_un].real)) if n_un else 0.0
+    err_neg = np.max(np.abs(np.sort(om[n_un:n_un + n_neg].real) - neg)) if n_neg else 0.0
+    Xs, Ys = X[:, n_un:n_un + n_neg + N_EIG], Y[:, n_un:n_un + n_neg + N_EIG]
+    gram = np.max(np.abs(orc.sigma_gram(Xs, Ys) - np.eye(Xs.shape[1])))
+    print(f"MEASURED {name}: imaginary roots within {err_imag:.1e} Ry (real part {err_real:.1e}), "
+          f"negative roots within {err_neg:.1e} Ry, |X^H X - Y^H Y - 1| {gram:.1e} "
+          f"(solver: {info['sigma_err']:.1e}), lam_min {info['lam_min']:.4e}", flush=True)
+    # a root near zero is fixed only to eps * scale^2 / |omega|: 7e-12 Ry at |omega| = 3.2e-5
+    assert max(err_imag, err_real, err_neg) <= 1e-9
+    assert gram <= 1e-10 and info["sigma_err"] <= 1e-10
+    assert info["n_stable_tested"] == N_EIG
+
+
 # ---------------------------------------------------------------------------
 # 4. operator integrity
 # ---------------------------------------------------------------------------
