@@ -191,6 +191,9 @@ def solve_bse_sharded(
     dispatches to the structure-preserving full-BSE eigensolver
     ``bse_nontda.solve_bse_nontda_sharded`` — the ONE non-TDA seam, no parallel
     solver stack — which returns paired (X, Y) eigenvectors (X^H X - Y^H Y = +1).
+    The full route reads ``n_eig`` and ``include_W`` only: it is the dense
+    structure-preserving solve, so every Davidson, Lanczos and TRLan argument
+    below is unread there (``bse_jax`` refuses such deck keys under ``full_bse``).
 
     ``davidson_tol_Ry`` is the Davidson stopping rule: every root's residual
     norm ``||H x - θ x||`` below it (times ``max(1, |θ|)``).  For a Hermitian H

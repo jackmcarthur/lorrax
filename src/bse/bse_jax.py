@@ -236,7 +236,11 @@ def _preview_lanczos(
     block_max_iter = max(1, max_lanczos_iter // max(1, block_size))
     mode = (f"convergence-driven (rtol={rtol:.1e}, every {check_every} iters)"
             if rtol > 0 else "fixed")
-    if block_size > 1:
+    if not tda:
+        log.info(f"Full BSE: dense structure-preserving solve of the {bse_dim}-state "
+                 f"window (A and B assembled, host eigh of K z = omega Sigma z); "
+                 f"the Davidson, Lanczos and TRLan settings are not read")
+    elif block_size > 1:
         log.info(f"Block Lanczos [{mode}]: ≤ {block_max_iter} block iter × "
                  f"block_size={block_size} = ≤ {block_max_iter * block_size} Krylov dim")
     else:
@@ -249,10 +253,14 @@ def _preview_lanczos(
     # block_max_iter x block_size times and must NOT be timed per call).
     with manual_stage(2, n_stages, "BSE eigensolve",
                       name="bse.eigensolve") as _sec:
-        stage_row("solver", f"{solver_kind}, {int(n_eig)} roots, block size "
-                            f"{int(block_size)}, at most {block_max_iter} iterations"
-                            + (f", stops at relative change {rtol:.1e}" if rtol > 0
-                               else ""))
+        if tda:
+            stage_row("solver", f"{solver_kind}, {int(n_eig)} roots, block size "
+                                f"{int(block_size)}, at most {block_max_iter} iterations"
+                                + (f", stops at relative change {rtol:.1e}" if rtol > 0
+                                   else ""))
+        else:
+            stage_row("solver", f"dense structure-preserving full BSE, "
+                                f"{int(n_eig)} of {int(bse_dim)} roots")
         eigenvalues, eigenvectors, n_iter_done = solve_bse_sharded(
             data, mesh_xy, n_eig=n_eig, max_iter=block_max_iter,
             include_W=include_W, block_size=block_size,
@@ -1079,7 +1087,24 @@ def parse_args(argv=None):
                      "of the QP state: the first relabels DFT bands with diagonal "
                      "QP energies, the second rotates them into the eigenbasis of "
                      "H_QP; choose one")
-    if route == "lanczos":
+    if route == "lanczos" and not args.tda:
+        # full_bse = true takes the dense structure-preserving solve
+        # (bse_lanczos.solve_bse_sharded -> bse_nontda), which reads n_eig and
+        # the kernel only: the same unread-key rule as above.
+        unread = sorted(
+            f"`{name(dest)}`"
+            for dest in {"solver", "max_lanczos_iter"}.union(*_SOLVER_DESTS.values())
+            if name(dest) not in _SHARED_KEYS
+            and getattr(args, dest) != schema.get_default(dest))
+        if unread:
+            parser.error(
+                f"{', '.join(unread)} {'is' if len(unread) == 1 else 'are'} not "
+                f"read by full_bse = true (the dense structure-preserving solve "
+                f"returns the lowest n_eig roots with no Davidson, Lanczos or "
+                f"TRLan iteration) and would be ignored; drop "
+                f"{'it' if len(unread) == 1 else 'them'}, or set full_bse = false "
+                f"for the eigensolve that reads {'it' if len(unread) == 1 else 'them'}")
+    if route == "lanczos" and args.tda:
         wrong = sorted(
             f"`{name(dest)}`"
             for solver, dests in _SOLVER_DESTS.items() if solver != args.solver
@@ -1130,22 +1155,27 @@ def settings_rows(args, *, source) -> tuple:
     use_tda = args.tda
     include_w = not (args.rpa or not args.bse)
     basis_file = args.qp_rotations or args.eqp
-    return (
+    rows = (
         Setting("full_bse", "off" if use_tda else "on", source("full_bse"),
                 "Tamm-Dancoff Hermitian BSE" if use_tda else
                 "full resonant-antiresonant BSE"),
         Setting("kernel", getattr(args, "kernel_name", "singlet") if include_w else "local_fields",
                 source("spin_singlet", "spin_triplet", "local_fields", "spinor"),
                 getattr(args, "kernel_label", "")),
-        Setting("solver", "block_lanczos" if args.solver == "lanczos" else str(args.solver),
-                source("solver"),
-                (f"block of {int(args.n_eig)} roots + up to {int(args.davidson_margin)} "
+        Setting("solver", "dense" if not use_tda else
+                "block_lanczos" if args.solver == "lanczos" else str(args.solver),
+                "derived" if not use_tda else source("solver"),
+                ("dense structure-preserving solve of the assembled A and B (host eigh); "
+                 "no iteration, so no Davidson, Lanczos or TRLan setting is read"
+                 if not use_tda else
+                 f"block of {int(args.n_eig)} roots + up to {int(args.davidson_margin)} "
                  f"margin, {args.davidson_precond} "
                  f"diagonal preconditioner; trial-stack matvec"
                  if args.solver == "davidson" else
                  f"block size {int(args.block_size)}, {int(args.n_eig)} roots; "
                  "trial-stack matvec")),
-        (Setting("davidson_tol_mev", f"{float(args.davidson_tol_mev):g}",
+        (None if not use_tda else      # the dense full solve has no stopping rule to show
+         Setting("davidson_tol_mev", f"{float(args.davidson_tol_mev):g}",
                  source("davidson_tol_mev"),
                  "stop when every root's residual is below this (meV)")
          if args.solver == "davidson" else
@@ -1168,6 +1198,7 @@ def settings_rows(args, *, source) -> tuple:
                   f"on the eigensolve's payload, "
                   f"eta {float(args.haydock_eta_ev):g} eV"),)
          if getattr(args, "haydock_iter", 0) else ())
+    return tuple(row for row in rows if row is not None)
 
 
 def _haydock_settings(args) -> dict | None:
