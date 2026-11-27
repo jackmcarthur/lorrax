@@ -345,8 +345,8 @@ defaults to $20\,n_{converge}$ (the depth in iterations of the planned
 Davidson's $10\,n_{eig}$, twice its vectors), at least six blocks. The host
 holds $M_r$ and $S$, $2M^2$ reals.
 
-**Measured, and where** (CPU, JAX 0.12, 2026-11-27; no GPU, no multi-process
-run, no material). On the synthetic pencils of `tests/bse_full_oracle.py` at
+**Measured, and where** (CPU, JAX 0.12, 2026-11-27; the GPU runs at 4 and 16
+ranks on NiO are reported with the route in [bse.md](bse.md)). On the synthetic pencils of `tests/bse_full_oracle.py` at
 240 transitions, on one device and on four emulated devices, the roots are
 within $4\times10^{-14}$ eV of the dense oracle for a positive definite
 $\mathcal K$; within $10^{-11}$ eV, the soft root included, with a soft mode

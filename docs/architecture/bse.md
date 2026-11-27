@@ -444,7 +444,21 @@ Measured on the 128-transition spinor test payload (CPU, 1×1 and an emulated 2�
 margin roots, 0.01 meV): 15 iterations and 436 pair calls, 54.5 per root, $2.5\times10^{-12}$ Ry from
 the dense route; the Tamm–Dancoff Davidson takes 207 applications of $A$ there (25.9 per root) and
 the matrix-free Lanczos 22.2 to 35.2 pair calls per root, its Krylov space being close to the whole
-window at that size. No GPU run, no multi-process run and no material run exist yet.
+window at that size.
+
+Measured on GPU (Perlmutter, one rank per device, NiO $4^3$ spinor, 3150 centroids, 8 roots and 8
+margin roots, 0.01 meV, 2026-11-27, commit 7144c8cb8). At four ranks and 4,096 transitions the
+eight roots equal the dense route's to the $10^{-8}$ eV printed, in 12.8 s against 16 min 51 s. At
+16 ranks, 57,344 to 589,824 transitions take 22 to 27 iterations, 658 to 781 pair calls and 24 to
+47 s: 2.1 times the Tamm–Dancoff Davidson's applications of $A$ on the same windows (340 and 359).
+With a warm compile cache the wall time is 1.9 times the Tamm–Dancoff solve's at four ranks and 2.6
+times at 16 ranks and 57,344 transitions. A reference state unstable by $-72$ meV, with a doubly
+degenerate root at $103\,\mathrm i$ meV, is refused at iteration 5 by default and solved under
+`full_bse_instability = continue`; a state with both stability eigenvalues negative returns its two
+roots of negative norm at $-33$ meV. The reported $\lambda_{\min}$ agrees within 0.9 meV, and the
+mean of the six lowest d–d roots within 0.1 meV, with a perturbative calculation of the coupling
+block on the same kernels (five windows, kept outside the tree). The eigenvector file with $X$ and $Y$ was written at
+four ranks. The hsuite has no full-BSE row, so none of this is rerun by a suite.
 
 Block Lanczos seeds name physical support by its logical band/k extents,
 not a host transition mask or index list. The existing subspace layout
@@ -1048,8 +1062,8 @@ a frozen-kernel approximation, not that self-consistent ladder map.
   ([self-consistency §8](../self_consistency.md#8-seeding-restart-and-outputs)).
 - Full BSE through `the eigensolve` is dense by default and stops at N = 4096
   (`_DENSE_N_MAX` in `bse/bse_nontda.py`); `full_bse_solver = davidson` has no size limit in the solve (the eigenvector writer gathers one state at a time). The
-  Davidson has run on CPU only (the 128-transition test payload, one device and an emulated 2×2
-  mesh): no GPU run, no run with more than one process, no material. The matrix-free Lanczos
+  Davidson has run on GPU at 4 and 16 ranks on NiO up to 589,824 transitions (measured above) and
+  on the CPU test payloads; no suite reruns the GPU cases. The matrix-free Lanczos
   (`solver='matrixfree'`) is not reachable from the CLI. No full-BSE route has a finite-$Q$ form
   or the mini-BZ head tensor, and the hsuite has no full-BSE row.
 - `compute_mode = mpa` with `screening_diagrams = w_bse` refuses at setup
