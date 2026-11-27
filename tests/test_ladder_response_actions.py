@@ -127,7 +127,7 @@ def test_compiled_shared_gmres_actions_against_dense_reference():
     namespace = {"jax": jax, "jnp": jnp, "_BLOCK_GMRES_CACHE": {},
                  "lstsq_hessenberg_local": lstsq_hessenberg_local}
     selections = {
-        "src/bse/bse_feast.py": {"_apply_shifted_matvec", "_gmres_solve_core"},
+        "src/bse/bse_gmres.py": {"_apply_shifted_matvec", "_gmres_solve_core"},
         "src/bse/bse_w_exact.py": {"_resolvent_response_actions", "_moment_response_actions",
                                    "_get_block_gmres_solver", "_get_block_moment_actions",
                                    "_bind_tol"},

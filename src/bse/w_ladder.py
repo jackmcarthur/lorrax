@@ -30,7 +30,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from .bse_feast import (ensure_W_R, build_preconditioner_diagonal_sharded,
+from .bse_gmres import (ensure_W_R, build_preconditioner_diagonal_sharded,
                         ladder_matvec_operands, matvec_operands,
                         _get_deflation_arnoldi)
 from .bse_io import load_bse_data_from_restart_sharded
@@ -816,7 +816,7 @@ def _deflation_for(matvec, diag_h, z, operands, rhs, *, rank: int):
     matvecs, once per ``(q, z)``; the solve reuses the result for every probe
     chunk.
     """
-    from .bse_feast import harvest_spectral_deflation
+    from .bse_gmres import harvest_spectral_deflation
     seed = jnp.sum(rhs, axis=1, keepdims=True)
     defl, _ritz = harvest_spectral_deflation(
         matvec, diag_h, z, operands, seed,

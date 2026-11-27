@@ -389,7 +389,7 @@ def write_eigenvectors_stream(
     # Lanczos routes but NOT on ``solver = davidson``, which returns ``X`` on
     # the solve sharding ``P(None,"x","y",None)``; a bare ``device_get`` died
     # there on every rank at P>1 with "Fetching value for `jax.Array` that
-    # spans non-addressable (non process local) devices".  ``bse_lanczos``
+    # spans non-addressable (non process local) devices".  ``bse_solve``
     # now pins Davidson to the replicated convention too, but any future
     # solver — or any caller handing this function a solve-sharded array —
     # would resurrect the crash.  ``common.collectives.gather_to_host`` asks

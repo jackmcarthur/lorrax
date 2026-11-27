@@ -98,7 +98,7 @@ from .bse_head import head_shifted_eps_c
 # The Davidson route's residual stop (meV), margin roots and basis admission
 # are the Tamm-Dancoff Davidson's.
 from .bse_davidson_helpers import payload_w_r
-from .bse_lanczos import DAVIDSON_MARGIN_ROOTS, DAVIDSON_TOL_MEV, _price_davidson_basis
+from .bse_solve import DAVIDSON_MARGIN_ROOTS, DAVIDSON_TOL_MEV, _price_davidson_basis
 from common.log import get_logger, message
 
 log = get_logger(__name__)
@@ -953,7 +953,7 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
 def _on_mesh(evecs, mesh_xy):
     """The host ``(n_eig, 2, nc, nv, nk)`` pairs on the solve mesh's transition
     axes, ``P(None, None, 'x', 'y', None)``: the layout Davidson returns its
-    roots on (``bse_lanczos``), so the dipole contraction
+    roots on (``bse_solve``), so the dipole contraction
     (``absorption_common.exciton_dipoles_distributed``, which shards the dipole
     block like the eigenvectors and contracts each rank's own tile) and the
     eigenvector writer read both routes through one path.  Every process holds

@@ -5,7 +5,7 @@ On a synthetic spinor payload (k grid 2x2x2, 4v x 4c, N_mu 24: transition dimens
 the loader's shardings, the screened kernel real in R space (so H is Hermitian):
 
 1. ``bse_jax``'s deck defaults (``solver = davidson``, ``davidson_precond = exact``,
-   ``davidson_tol_mev = 0.01``) through ``bse_lanczos.solve_bse_sharded`` solve 8 + 8 margin
+   ``davidson_tol_mev = 0.01``) through ``bse_solve.solve_bse_sharded`` solve 8 + 8 margin
    roots, stop CONVERGED on the lowest 8 and return those 8, within 0.01 meV of ``eigvalsh`` of
    the operator assembled from the same matvec.
 2. ``GATE davidson_converged``: the driver (``bse_jax._preview_lanczos``, loader stubbed)
@@ -93,7 +93,7 @@ def _dense(mesh, ops):
 def run_cases(mesh):
     import numpy as np
     from bse import bse_jax
-    from bse.bse_lanczos import solve_bse_sharded
+    from bse.bse_solve import solve_bse_sharded
     from bse.absorption_haydock import haydock_coefficients
     from solvers.davidson import LAST_RUN
     from solvers.davidson_fixed import CONVERGED
@@ -149,7 +149,7 @@ def _driver_cases(mesh, ops):
     from types import SimpleNamespace
     import jax
     import numpy as np
-    from bse import bse_io, bse_jax, bse_lanczos
+    from bse import bse_io, bse_jax, bse_solve
     _, args = bse_jax.parse_args(["-i", _toy_deck(
         ["write_eigenvectors = -1",
          "dipole_file = /toy/toy_dipole.h5", "dipole_position_fix = true"])])
@@ -186,7 +186,7 @@ def _driver_cases(mesh, ops):
     def threads_gate(n):
         os.sched_getaffinity = lambda pid: set(range(n))
         try:
-            bse_lanczos._refuse_cpu_davidson_threads(fake)
+            bse_solve._refuse_cpu_davidson_threads(fake)
             return ""
         except RuntimeError as exc:
             return str(exc)

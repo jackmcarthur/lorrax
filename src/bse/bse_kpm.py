@@ -32,7 +32,7 @@ from solvers.chebyshev import (
 )
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
 from .bse_stack_matvec import build_bse_stack_matvec, build_bse_stack_matvec_full
-from .bse_feast import estimate_spectral_bounds_sharded, ensure_W_R
+from .bse_gmres import estimate_spectral_bounds_sharded, ensure_W_R
 from .bse_head import head_shifted_eps_c
 from .bse_io import load_bse_data_from_restart_sharded
 from .bse_window import restrict_to_physical_transitions

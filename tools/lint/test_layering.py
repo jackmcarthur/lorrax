@@ -623,7 +623,7 @@ _DRIVER_PLUMBING_BUDGET = {
     # carried — ``--px/--py`` defaulting to 1, so on 16 devices with no flags
     # they ran a 1x1 mesh with no warning — is fixed (2026-08-27) and is now
     # gated in section 5b, not described here.
-    "bse.bse_feast": 1,
+    "bse.bse_gmres": 1,
     "bse.bse_w_exact": 1,
     "bse.bse_kpm": 1,
 }
@@ -1374,7 +1374,7 @@ def test_the_mesh_scan_can_fail():
 # The second rule below is the one this bundle exists for, and rule 4 cannot
 # see it: a driver does not need to say ``Mesh(`` to end up on the wrong mesh.
 # Until 2026-08-27 the bse-family drivers declared ``--px``/``--py`` with
-# ``default=1`` — ``bse_jax``, ``bse_feast``, ``bse_kpm``, ``bse_w_exact``,
+# ``default=1`` — ``bse_jax``, ``bse_gmres``, ``bse_kpm``, ``bse_w_exact``,
 # ``exciton_bands`` and a since-deleted pseudopole driver, two each —
 # so a run with no flags asked the (correct, shared) factory for
 # a 1x1 — the whole BSE on one device of a four-GPU node, while the startup

@@ -115,7 +115,7 @@ def test_kpm_and_spectral_bound_seeds_preserve_samples_without_host_masks():
             assert not any(isinstance(c.cell_contents, (np.ndarray, jax.Array))
                            for c in (fn.__closure__ or ()))
     # Compile the actual nested spectral-bounds seed, rather than duplicating its math.
-    tree = ast.parse((ROOT/'src/bse/bse_feast.py').read_text())
+    tree = ast.parse((ROOT/'src/bse/bse_gmres.py').read_text())
     outer = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                  and n.name == 'estimate_spectral_bounds_sharded')
     node = next(n for n in outer.body if isinstance(n, ast.FunctionDef)
@@ -133,7 +133,7 @@ def test_kpm_and_spectral_bound_seeds_preserve_samples_without_host_masks():
            + 1j*jax.random.normal(b, mask.shape, dtype=jnp.float64))*mask
     old = old/jnp.linalg.norm(old)
     np.testing.assert_allclose(namespace['_make_random_vector'](key), old, rtol=3e-15, atol=3e-15)
-    for name in ('bse_kpm.py', 'bse_feast.py', 'bse_lanczos.py', 'exciton_bands.py'):
+    for name in ('bse_kpm.py', 'bse_gmres.py', 'bse_solve.py', 'exciton_bands.py'):
         assert 'pad_zone_mask_np' not in (ROOT/'src/bse'/name).read_text()
 
 

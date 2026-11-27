@@ -532,7 +532,7 @@ def screened_update(W0_q, dchi, mesh_xy: Mesh, n_rmu: int):
 
 
 def _w_R(Wq, kern: DynsigKernels):
-    """(nq, mu, nu) -> W_R (mu, nu, kx, ky, kz), ortho inverse k-FFT (``bse_feast.ensure_W_R``'s convention)."""
+    """(nq, mu, nu) -> W_R (mu, nu, kx, ky, kz), ortho inverse k-FFT (``bse_gmres.ensure_W_R``'s convention)."""
     R = kern.c_ifft(Wq)
     R = jnp.moveaxis(R, 0, -1).reshape(R.shape[1], R.shape[2], *kern.kgrid)
     return lax.with_sharding_constraint(R, NamedSharding(kern.mesh, WR_SPEC))

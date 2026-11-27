@@ -6,7 +6,7 @@ from jax.sharding import Mesh
 
 def check_kernel_residency(mesh, n_mu=8, grid=(3,3,1)):
     import jax.numpy as jnp
-    from bse.bse_feast import ensure_W_R
+    from bse.bse_gmres import ensure_W_R
     from bse.bse_ring_comm import make_bse_shardings
     from bse.head_resolvent import zero_kernel_payload
     from common.collectives import device_put_process_local

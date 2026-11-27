@@ -1,4 +1,4 @@
-"""``exciton_bands``' default per-Q solver is ``bse_lanczos``' Davidson: four invariants the
+"""``exciton_bands``' default per-Q solver is ``bse_solve``' Davidson: four invariants the
 hsuite cannot reach.
 
 On a synthetic spinor Q path (3 Q, k grid 2x2x1, 3v x 3c, N_mu 16: transition dimension 36 per

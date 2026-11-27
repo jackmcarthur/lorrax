@@ -207,7 +207,7 @@ Where each mode is used, by owner module:
 | 6 | route G (`isdf.zeta_mubatch`); the unwired real-space pair convolution `gw.mixed_basis_pair_convolution` |
 | 2, 3 | Σ and COHSEX through `make_kconv_klead` (`gw.cohsex_sigma`, `gw.ppm_tau_kernel`); the BSE W term through `make_local_kconv_klead` (`bse.bse_stack_matvec`); the flat-k transform (`gw.w_isdf` for χ₀(R) → χ₀(q), `gw.qsgw_head`, `gw.wavefunction_bundle`, `bandstructure.fh_interp`, `bandstructure.orbital`) |
 | 4 | the BSE ring matvec (`bse.bse_ring_comm`) |
-| 5 | the kernel prep of the BSE matvecs (`bse.absorption_haydock`, `bse.bse_densify`, `bse.bse_nontda`, `bse.bse_stack_matvec`, `bse.exciton_bands`; `bse.bse_lanczos` through `common.fft_helpers.get_donated_kfft_kminor`, which donates its input) |
+| 5 | the kernel prep of the BSE matvecs (`bse.absorption_haydock`, `bse.bse_densify`, `bse.bse_nontda`, `bse.bse_stack_matvec`, `bse.exciton_bands`; `bse.bse_solve` through `common.fft_helpers.get_donated_kfft_kminor`, which donates its input) |
 | 7 | the Σ τ kernel (`gw.ppm_tau_kernel`) |
 | 8 | the four-current sector Σ (`gw.mpa.sector_sigma`) |
 | 9 | `gw.ppm_tau_kernel`, `gw.cohsex_sigma`, `gw.screening` |

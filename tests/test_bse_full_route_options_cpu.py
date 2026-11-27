@@ -1,6 +1,6 @@
 """What ``full_bse = true`` says it runs, and which eigensolver options it refuses.
 
-``bse_lanczos.solve_bse_sharded(tda=False)`` returns before it reads any Davidson
+``bse_solve.solve_bse_sharded(tda=False)`` returns before it reads any Davidson
 option: the full route is the dense structure-preserving solve, not an iteration.  The deck layer
 (``bse_jax``) must therefore (1) print that route in the SETTINGS table, not "davidson ... exact
 diagonal preconditioner", and (2) refuse an eigensolver key set away from its default, the unread-key

@@ -213,7 +213,7 @@ the memory contract.
 ## Consumers
 
 Planned Davidson (`solvers.davidson_fixed`, used by `psp.run_nscf`), block
-and single-vector Lanczos (`solvers.lanczos`), used by `bse.bse_lanczos` and
+and single-vector Lanczos (`solvers.lanczos`), used by `bse.bse_solve` and
 `bse.exciton_bands`, all take their plan from `plan_subspace`
 ([Iterative eigensolvers](../../architecture/iterative_eigensolvers.md)).
 The structure-preserving Davidson of the full BSE (`solvers.bse_sp_davidson`)

@@ -89,7 +89,7 @@ k-point.  The same three questions give the other answer here:
 
 Measured on four emulated CPU devices: the planned operations run as separate
 programs on 1 to 6 host threads, where the ``while_loop`` Davidson is refused
-below 16 (``bse_lanczos`` GATE cpu_davidson_threads).
+below 16 (``bse_solve`` GATE cpu_davidson_threads).
 
 Every process runs this loop on the same replicated small arrays (``M_r``,
 ``S``, residuals, ranks come out of all-reduces and are bit-identical on every

@@ -53,7 +53,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from .bse_feast import (
+from .bse_gmres import (
     RY_TO_EV_DEFAULT, ensure_W_R, build_preconditioner_diagonal_sharded,
     _apply_shifted_matvec, _gmres_solve_core, matvec_operands,
 )
@@ -328,7 +328,7 @@ def build_finite_q_data(data, q, mesh_xy, *, physical_branches=False):
     # the conjugated ones was value-invisible at q=0 and a 3.6e-4 break of
     # W(-q) = conj(W(q)) at finite q (claim 0215).  The rung therefore gets
     # its own four operand slots (bse_ring_comm ladder_rung_slots /
-    # bse_feast.ladder_matvec_operands): psi_c rolled un-conjugated, psi_v
+    # bse_gmres.ladder_matvec_operands): psi_c rolled un-conjugated, psi_v
     # the original arrays VERBATIM (aliases — zero copies).  A conj-wrap
     # compensation inside the rung appliers was tried first and refuted by
     # block-level measurement (probe_block_compare, 2026-08-16).
@@ -860,7 +860,7 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
     (it appears only in the ``while_loop`` predicate), so a tolerance sweep
     reuses one executable.  ``resid_relative_to`` IS in the key because it is
     a different stopping rule and so a different program; see
-    :func:`bse_feast._gmres_solve_core` for what the two mean.
+    :func:`bse_gmres._gmres_solve_core` for what the two mean.
 
     ``with_slope`` adds exact even-s derivative and reflected-value actions.
     Their solves share the same operator and GMRES owner. Residual/iteration
@@ -876,7 +876,7 @@ def _get_block_gmres_solver(matvec, sh, max_iter, tol, dtype,
         # rhs: (2, nu, c, v, k) — scan the per-column GMRES over the probe axis nu.
         # ``deflation`` is a runtime pytree: None traces the historical
         # diagonal-preconditioned program, a ``(U, C)`` pair the spectral one
-        # (bse_feast.apply_spectral_deflation); jit keeps one executable each.
+        # (bse_gmres.apply_spectral_deflation); jit keeps one executable each.
         rhs_scan = jnp.moveaxis(rhs, 1, 0)  # (nu, 2, c, v, k)
 
         def _solve_col(carry, rhs_col):
@@ -1220,7 +1220,7 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
     # ``W - v = v T (I - T)^{-1}`` Dyson.  The SEED keeps the physical ``v``
     # either way, so ``rhs``, the residual denominator and the iteration
     # counts mean the same thing on both routes.
-    # ``deflation`` — ``(U, C)`` from ``bse_feast.harvest_spectral_deflation``
+    # ``deflation`` — ``(U, C)`` from ``bse_gmres.harvest_spectral_deflation``
     # for THIS (q, z) operator, or None (diagonal preconditioner only).  It
     # changes the Krylov iterates, not the system: the answer moves at the
     # solver tolerance, and the true-residual gate below is unchanged.

@@ -419,7 +419,7 @@ the refit and with the stored tile, and the eigenvalues must agree within
 path with no point on the coarse grid refuses under `bse`. The grade and the
 worst difference are written into the output header.
 
-**The per-$Q$ solver.** By default each $Q$ is solved by `bse_lanczos`'
+**The per-$Q$ solver.** By default each $Q$ is solved by `bse_solve`'
 Davidson, the `bse_jax` default: the exact diagonal
 $\varepsilon_c(k+Q) - \varepsilon_{vk}$ plus the kernel diagonal as
 preconditioner, soft locking, 8 margin roots above `number_eigenvalues`, and a stop when

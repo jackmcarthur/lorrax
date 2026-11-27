@@ -16,7 +16,7 @@ def backend_namespace():
               _PSI_KEYS=("psi_c_X", "psi_c_Y", "psi_v_X", "psi_v_Y"),
               LADDER_DEFLATION_ARNOLDI=6)
     selected = {
-        "bse_feast.py": {"_apply_shifted_matvec", "_gmres_solve_core",
+        "bse_gmres.py": {"_apply_shifted_matvec", "_gmres_solve_core",
                          "apply_spectral_deflation", "_get_deflation_arnoldi",
                          "harvest_spectral_deflation"},
         "bse_w_exact.py": {"_resolvent_response_actions", "_get_block_gmres_solver",

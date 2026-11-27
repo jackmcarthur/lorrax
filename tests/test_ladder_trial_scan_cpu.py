@@ -14,7 +14,7 @@ from jax.sharding import Mesh
 
 from bse.bse_ring_comm import build_bse_ring_matvec_full, make_bse_shardings
 from bse.bse_w_exact import build_finite_q_data
-from bse.bse_feast import ladder_matvec_operands
+from bse.bse_gmres import ladder_matvec_operands
 from ffi.fft import xla_reference
 
 jax.config.update('jax_enable_x64', True)

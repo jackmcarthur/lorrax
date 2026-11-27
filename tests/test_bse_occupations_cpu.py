@@ -30,7 +30,7 @@ jax = pytest.importorskip("jax")
 jax.config.update("jax_enable_x64", True)
 from jax.sharding import NamedSharding, PartitionSpec as P  # noqa: E402
 
-from bse import bse_lanczos, bse_nontda  # noqa: E402
+from bse import bse_solve, bse_nontda  # noqa: E402
 from bse.bse_preconditioner import MASKED_PAIR_RY, occupation_weight_cv_k  # noqa: E402
 from bse.bse_ring_comm import make_bse_shardings  # noqa: E402
 from bse.bse_window import PAD_EPS_GUARD_RY  # noqa: E402
@@ -194,7 +194,7 @@ def test_weighted_tamm_dancoff_davidson_matches_eigvalsh():
     K, _ = _reference(ops, w, w)
     exact = np.linalg.eigvalsh(K[:N, :N])
     n_eig = 6
-    om, ev, _ = bse_lanczos.solve_bse_sharded(_payload(mesh, ops, w, w, partner=False), mesh, n_eig=n_eig)
+    om, ev, _ = bse_solve.solve_bse_sharded(_payload(mesh, ops, w, w, partner=False), mesh, n_eig=n_eig)
     err = float(np.max(np.abs(np.asarray(om) - exact[:n_eig])))
     assert err <= 1e-9, err
     X = np.asarray(ev).reshape(n_eig, N).T

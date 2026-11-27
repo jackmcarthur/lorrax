@@ -121,7 +121,7 @@ def _preview_lanczos(
     # Sharded ring matvec — parallelises (μ,ν) and avoids per-iter
     # 3D-FFT of W_q (precomputes W_R once outside the Lanczos loop).
     from .bse_io import load_bse_data_from_restart_sharded
-    from .bse_lanczos import solve_bse_sharded
+    from .bse_solve import solve_bse_sharded
     mesh_xy = create_mesh_2d()
     # n_occ-aware band split: load_bse_data_from_restart_sharded
     # auto-detects valence by ``mean_enk < fermi_energy``; user-given
@@ -460,8 +460,8 @@ def _preview_lanczos(
 def _davidson_report(*, n_eig, tol_mev, budget, dim):
     """The Davidson stop as one log line and the RESULTS ``eigensolve`` row;
     any stop but CONVERGED refuses (``GATE davidson_converged``,
-    ``bse_lanczos.davidson_stop_line``) before the driver writes anything."""
-    from .bse_lanczos import davidson_stop_line
+    ``bse_solve.davidson_stop_line``) before the driver writes anything."""
+    from .bse_solve import davidson_stop_line
     return davidson_stop_line(
         n_eig=n_eig, tol_mev=tol_mev, budget=budget,
         cap=(f"the cap is solver_max_iter, default max(30, min(200, dim // 2)) = "
@@ -980,7 +980,7 @@ def parse_args(argv=None):
                 f"`solver`) and would be ignored; set full_bse = true or drop "
                 f"{'it' if len(full_only) == 1 else 'them'}")
     if route == "lanczos" and not args.tda:
-        # full_bse = true takes bse_lanczos.solve_bse_sharded -> bse_nontda.  Its
+        # full_bse = true takes bse_solve.solve_bse_sharded -> bse_nontda.  Its
         # dense solve (full_bse_solver = dense, the default) reads n_eig and the
         # kernel only; full_bse_solver = davidson reads _FULL_DAVIDSON_DESTS too.
         # The same unread-key rule as above.

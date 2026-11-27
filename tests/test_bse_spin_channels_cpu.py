@@ -71,7 +71,7 @@ def _check(p):
     from bse.bse_ring_comm import build_bse_ring_matvec_full
     from bse.bse_stack_matvec import build_bse_stack_matvec,build_bse_stack_matvec_full
     from bse.bse_davidson_helpers import build_bse_exact_diagonal
-    from bse.bse_feast import matvec_operands
+    from bse.bse_gmres import matvec_operands
     from bse.head_resolvent import build_head_operator
     from bse.w_ladder import build_ladder_resolvent
     jax.config.update('jax_enable_x64',True)

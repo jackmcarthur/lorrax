@@ -13,10 +13,10 @@ What the BSE drivers (``bse_kpm``, ``bse_w_exact``, ``w_ladder``,
 * :func:`estimate_spectral_bounds_sharded`: ``E_min`` and ``E_max`` of the
   operator from a short adaptive Lanczos run.
 
-The FEAST contour eigensolver (``feast = true``: GMRES solves at quadrature
-nodes plus Rayleigh-Ritz) and its ``python -m bse.bse_feast`` entry point were
-retired 2026-11-27; ``full_bse = true`` with ``full_bse_solver = davidson``
-solves the full BSE.  The file name is historical.
+The module was ``bse_feast`` until 2026-11-27: the FEAST contour eigensolver
+(``feast = true``: GMRES solves at quadrature nodes plus Rayleigh-Ritz) and
+its ``python -m bse.bse_feast`` entry point were retired then; ``full_bse =
+true`` with ``full_bse_solver = davidson`` solves the full BSE.
 """
 from __future__ import annotations
 

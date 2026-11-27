@@ -66,8 +66,8 @@ The W term alone is :func:`make_w_term`; the TD-aGW interaction model
 whole TD band window, and reuses :func:`exchange_encode` /
 :func:`exchange_decode` for its G-space Hartree term.
 
-Consumers: ``bse_lanczos.solve_bse_sharded`` (block Lanczos and Davidson),
-``bse_feast`` (the spectral bounds), ``bse_kpm`` and the pseudopole and Haydock paths.  The full (non-TDA)
+Consumers: ``bse_solve.solve_bse_sharded`` (the Davidson), ``bse_gmres`` (the
+spectral bounds), ``bse_kpm`` and the Haydock recursion.  The full (non-TDA)
 BSE runs on the same kernels: :func:`build_bse_stack_pair_matvec` is the coupling
 block's applier, and :func:`build_bse_stack_matvec_full` is ``H [X; Y]`` as two
 of its applications in one call (KPM without TDA, ``bse_nontda``'s dense
@@ -269,7 +269,7 @@ def _xla_conv(kconv, T_b, W_Rk):
     (``make_local_kconv_klead``: nvidia-mathdx mode 2 on CUDA, the pass Σ's τ
     kernel runs; the plan route on cpu).  Both norm factors are one folded
     constant inside it; ``W_Rk`` is ``W_R`` already in R space
-    (``bse_feast.ensure_W_R``), read k-leading (``_w_r_klead``).
+    (``bse_gmres.ensure_W_R``), read k-leading (``_w_r_klead``).
 
     THIS IS AN FFT AND IT STAYS AN FFT.  A dense (nk x nk) DFT contraction gives
     the same numbers and measured 2.3x faster on this deck, and it was REMOVED
@@ -1060,7 +1060,7 @@ def make_w_term(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
     ``(WX)[b,c,v,k] = (1/N_k) Σ_{μνts} ψ*_c[k,t,μ] ψ_v[k,s,ν] Σ_k' W_μν(k-k') T_b[k',t,μ,s,ν]``,
     ``T_b[k',t,μ,s,ν] = Σ_{c'v'} ψ_c'[k',t,μ] ψ*_v'[k',s,ν] X[b,c',v',k']``
     (``docs/architecture/bse.md#hamiltonian``), the k' sum a k-grid
-    convolution through ``W_R`` (``bse_feast.ensure_W_R``).
+    convolution through ``W_R`` (``bse_gmres.ensure_W_R``).
 
     Shapes and shardings: ``X`` (b, n_c, n_v, nk) at ``P(None,'x','y',None)``;
     ``psi_c_X`` (nk, n_c, ns, μ) at ``P(None,None,None,'x')``; ``psi_v_Y``

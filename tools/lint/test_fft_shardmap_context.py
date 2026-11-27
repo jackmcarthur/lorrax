@@ -53,9 +53,9 @@ KERNELS = {"local_ifftn3", "local_fftn3"}
 _SANCTIONED_EAGER = {
     # (The single-device reference matvec bse_serial and the ring smoke /
     # correctness diagnostics that used it were deleted with C10, 2026-09-24.)
-    # (The former KNOWN-DEBT block — bse_feast.ensure_W_R, bse_kpm.run_kpm_dos,
+    # (The former KNOWN-DEBT block — bse_gmres.ensure_W_R, bse_kpm.run_kpm_dos,
     # bse_pseudopoles._feast_filter/run_pseudopoles — was closed 2026-08-01:
-    # every solver W_q→W_R now routes through bse_feast.ensure_W_R →
+    # every solver W_q→W_R now routes through bse_gmres.ensure_W_R →
     # bse_io.make_w_densifier.)
     # NOT eager -- a limitation of the syntactic proxy.  The SC density
     # scan's ``_density_scan_body`` returns ``body``, which the caller

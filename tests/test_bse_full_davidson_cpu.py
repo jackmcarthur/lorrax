@@ -44,7 +44,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp  # noqa: E402
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
-from bse import bse_io, bse_jax, bse_lanczos, bse_nontda, bse_stack_matvec, bse_window  # noqa: E402
+from bse import bse_io, bse_jax, bse_solve, bse_nontda, bse_stack_matvec, bse_window  # noqa: E402
 from bse.absorption_common import (build_dipole_vector_bse, exciton_dipole_projections,  # noqa: E402
                                    exciton_dipoles_distributed)
 from bse.bse_nontda import (_full_matvec_and_args, _materialize_A_B, refuse_unconverged_davidson,  # noqa: E402
@@ -267,7 +267,7 @@ def _tda(ops):
     """The Tamm-Dancoff default route on a 1x1 mesh: roots and ``solvers.davidson.LAST_RUN`` counts."""
     from solvers.davidson import LAST_RUN
     mesh = _mesh(1)
-    ev, vec, n_iter = bse_lanczos.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, max_iter=64)
+    ev, vec, n_iter = bse_solve.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, max_iter=64)
     return np.asarray(ev), {"iterations": int(n_iter), "matvecs": int(LAST_RUN["mv"][0]),
                             "restarts": int(LAST_RUN["restarts"])}, vec
 
@@ -282,7 +282,7 @@ def test_tamm_dancoff_default_route_is_untouched(ops):
     assert vec.shape == (N_EIG, 1, NC, NV, NK)                                # X only, as before
     # the default arguments still dispatch the Tamm-Dancoff Davidson, and the full default is dense
     import inspect
-    sig = inspect.signature(bse_lanczos.solve_bse_sharded).parameters
+    sig = inspect.signature(bse_solve.solve_bse_sharded).parameters
     assert sig["tda"].default is True and "solver_kind" not in sig
     assert sig["full_solver"].default == "dense" and sig["full_on_indefinite"].default == "refuse"
 
@@ -444,10 +444,10 @@ def test_options_the_route_cannot_honour_refuse(ops):
     # through solve_bse_sharded: a solver name that is neither full route refuses.  (The Olsen
     # correction and a kept W_R, refused until 2026-11-27, are honoured: test_olsen_* below.)
     with pytest.raises(ValueError, match="GATE nontda_route_option"):
-        bse_lanczos.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, tda=False,
+        bse_solve.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, tda=False,
                                       full_solver="lanczos")
     with pytest.raises(ValueError, match="GATE nontda_route_option"):
-        bse_lanczos.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, tda=False,
+        bse_solve.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, tda=False,
                                       full_on_indefinite="continue")
 
 
@@ -483,7 +483,7 @@ def test_olsen_correction_gives_the_same_roots(ops, dense):
     assert np.min(np.abs(np.asarray(plain))) > 1e-3                         # red twin
     # keep_W_R: both full routes leave W_R on the payload
     payload = _payload(mesh, ops)
-    bse_lanczos.solve_bse_sharded(payload, mesh, n_eig=N_EIG, tda=False, full_solver="davidson",
+    bse_solve.solve_bse_sharded(payload, mesh, n_eig=N_EIG, tda=False, full_solver="davidson",
                                   keep_W_R=True, davidson_olsen=True)
     assert payload.get("W_R") is not None and payload.get("W_q") is None
 
@@ -495,14 +495,14 @@ def test_olsen_correction_gives_the_same_roots(ops, dense):
 def test_full_bse_default_is_still_the_dense_solve(ops, dense):
     mesh = _mesh(2)
     bse_nontda.LAST_DAVIDSON.clear()
-    ev, vec, n_iter = bse_lanczos.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, tda=False)
+    ev, vec, n_iter = bse_solve.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, tda=False)
     assert np.array_equal(np.asarray(ev), dense[2]["omega"]) and int(n_iter) == 0
     assert np.array_equal(np.asarray(vec), dense[2]["evecs"])
     assert not bse_nontda.LAST_DAVIDSON                                      # no Davidson ran
     _, args = bse_jax.parse_args(["-i", _toy_deck(["full_bse = true"])])
     assert args.full_bse_solver == "dense" and args.full_bse_instability == "refuse"
     # through solve_bse_sharded the new route gives the route's own result
-    ev_d, vec_d, n_it = bse_lanczos.solve_bse_sharded(
+    ev_d, vec_d, n_it = bse_solve.solve_bse_sharded(
         _payload(mesh, ops), mesh, n_eig=N_EIG, tda=False, full_solver="davidson", max_iter=64)
     assert np.max(np.abs(np.asarray(ev_d) - dense[2]["omega"])) <= ROOT_TOL and int(n_it) > 0
     assert bse_nontda.LAST_DAVIDSON["info"]["iterations"] == int(n_it)
@@ -669,7 +669,7 @@ def test_eps_shift_zero_and_the_iteration_cap_reach_the_solver_as_written(ops, m
         seen.update(kw)
         raise Stop()
 
-    monkeypatch.setattr(bse_lanczos, "solve_bse_sharded", capture)
+    monkeypatch.setattr(bse_solve, "solve_bse_sharded", capture)
     with pytest.raises(Stop):
         _drive(str(tmp_path), mesh, ops, monkeypatch, ["full_bse_solver = davidson"],
                davidson_eps_shift=0.0)

@@ -28,7 +28,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
-from .bse_feast import ladder_matvec_operands, matvec_operands
+from .bse_gmres import ladder_matvec_operands, matvec_operands
 from .bse_w_exact import _get_block_gmres_solver, _get_block_moment_actions
 from .w_ladder import build_ladder_resolvent
 from common.collectives import device_put_process_local, gather_to_host

@@ -136,7 +136,7 @@ def _production_payload(f, mesh):
     import jax.numpy as jnp
     from bse.bse_ring_comm import make_bse_shardings
     from bse.bse_preconditioner import compute_pair_amplitude
-    from bse.bse_feast import ensure_W_R
+    from bse.bse_gmres import ensure_W_R
     sh = make_bse_shardings(mesh)
     p = int(mesh.shape['x'])
     nc, nv, mu = [((n+p-1)//p)*p for n in (f['nc'], f['nv'], f['nmu'])]
@@ -165,7 +165,7 @@ def _materialize_physical(f, data, sh, mesh, q, include_w, apply=None):
     import jax.numpy as jnp
     from bse.bse_w_exact import build_finite_q_data
     from bse.bse_ring_comm import build_bse_ring_matvec_full
-    from bse.bse_feast import ladder_matvec_operands
+    from bse.bse_gmres import ladder_matvec_operands
     nc, nv = int(data['n_cond_pad']), int(data['n_val_pad'])
     n = f['nc']*f['nv']*f['nk']
     trial = np.zeros((2, 2*n, nc, nv, f['nk']), complex)
@@ -271,7 +271,7 @@ def _check_compiled_actions_and_head():
     from unittest.mock import patch
     from bse.bse_ring_comm import (build_bse_ring_matvec_full,
         build_realspace_random_transition_generator, build_density_snapshot_operator)
-    from bse.bse_feast import ladder_matvec_operands, build_preconditioner_diagonal_sharded
+    from bse.bse_gmres import ladder_matvec_operands, build_preconditioner_diagonal_sharded
     from bse.bse_w_exact import (apply_screening_resolvent_block, build_probe_rhs,
         _get_block_moment_actions, _project_screening_actions, build_finite_q_data)
     from bse.head_resolvent import (build_head_operator, build_head_dipole,
@@ -363,7 +363,7 @@ def _check_internal_screened_head(ns, p):
     from jax.sharding import Mesh
     from unittest.mock import patch
     from bse.bse_ring_comm import build_bse_ring_matvec_full
-    from bse.bse_feast import build_preconditioner_diagonal_sharded
+    from bse.bse_gmres import build_preconditioner_diagonal_sharded
     from bse.bse_head import q0_head_diagonal
     from bse.head_resolvent import zero_kernel_payload
     from ffi.fft import xla_reference

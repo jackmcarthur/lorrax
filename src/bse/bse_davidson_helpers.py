@@ -252,7 +252,7 @@ def resolve_precond_route(route: str, bse_dim: int) -> str:
 # before either change (np.array_equal on the record deck, measured when the
 # jit moved; no test of it is in the tree).
 # TWO STATIC KNOBS, AND WHY EACH EXISTS.  This kernel is now the ONE
-# ``diag(H_BSE)`` in the tree: ``bse_feast.build_preconditioner_diagonal_sharded``
+# ``diag(H_BSE)`` in the tree: ``bse_gmres.build_preconditioner_diagonal_sharded``
 # used to assemble the same object independently, and the two differed in exactly
 # two ways that are behaviour, not style (PRECOND_BUILD_FREE.md §7.1).  Both are
 # static, so each route traces its own program and neither can perturb the other.
@@ -265,7 +265,7 @@ def resolve_precond_route(route: str, bse_dim: int) -> str:
 # size, but it is the solve's to keep or drop, not this function's, so the flag
 # carries it rather than deciding it.
 #
-# ``W_q0=None``.  The RPA density-response and pseudopole routes solve with
+# ``W_q0=None``.  The RPA density-response route solves with
 # ``include_W=False``, where the direct term is absent rather than zero-valued.
 # Passing ``None`` drops the term at TRACE time, so those routes compile a program
 # with no W contraction in it at all instead of multiplying by a zero tile.
@@ -452,7 +452,7 @@ def build_bse_exact_diagonal(
         driver's donated ifft consumes ``W_q``; reading it from ``W_R``
         instead would make the answer depend on that ifft's norm convention.
         ``None`` means ``include_W=False``: the screened-direct term is not
-        emitted at all (RPA density-response and pseudopole routes).
+        emitted at all (the RPA density-response route).
     complex_out : keep the assembled diagonal COMPLEX instead of taking
         ``real()``.  The shifted GMRES solves want it (they divide by
         ``z − diag`` at a complex shift); Davidson does not.  See
@@ -634,7 +634,7 @@ def w_q0_for_precond(data):
     (:func:`build_bse_exact_diagonal`).  It must be taken before the solve's
     donated transform consumes ``W_q``, and one stashed object makes the
     diagonal's identity memo hit on a second solve of the same payload (the
-    two reasons ``bse_lanczos.solve_bse_sharded`` records at its own stash,
+    two reasons ``bse_solve.solve_bse_sharded`` records at its own stash,
     which uses the same key).  ``(n_mu, n_nu)`` at ``P('x', 'y')``, Ry.
     """
     if data.get("_W_q0_for_precond") is None:
@@ -662,7 +662,7 @@ def payload_w_r(data, mesh_xy, sh, *, include_W=True):
     ``include_W`` the W term is never built and the tile is a placeholder
     operand.  Take :func:`w_q0_for_precond` first when the exact diagonal is
     wanted.  Callers that must keep ``W_q`` (the resolvent and ladder code)
-    use ``bse_feast.ensure_W_R`` instead, which borrows it."""
+    use ``bse_gmres.ensure_W_R`` instead, which borrows it."""
     if not include_W:
         return data["W_q"] if data.get("W_q") is not None else data.get("W_R")
     if data.get("W_R") is None:

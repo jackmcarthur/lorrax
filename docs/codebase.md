@@ -264,12 +264,12 @@ The BSE contract is [BSE](architecture/bse.md); this table only says where each 
 | `absorption_haydock.py` | ε₂(ω) by the Haydock continued fraction on the TDA BSE; `python -m bse.absorption_haydock`. |
 | `bse_davidson_helpers.py` | Start subspace and diagonal preconditioners for `solvers.davidson.davidson` on the BSE vector layout. |
 | `bse_densify.py` | Coarse-to-fine densification of the BSE bundle under `kgrid_fine`, its window dipoles included. |
-| `bse_feast.py` | Shared matvec operands, the GMRES resolvent solve with the spectral deflation the W_BSE ladder reuses, the diagonal preconditioner and the spectral bounds. The FEAST eigensolver was retired 2026-11-27; the file name is historical. |
+| `bse_gmres.py` | Shared matvec operands, the GMRES resolvent solve with the spectral deflation the W_BSE ladder reuses, the diagonal preconditioner and the spectral bounds. The FEAST eigensolver was retired 2026-11-27; the file name is historical. |
 | `bse_head.py` | The q = 0 Coulomb head: its scalars and their rank-one injection. |
 | `bse_io.py` | Compatibility facade: re-exports names from `bse_window`, `bse_head`, `bse_densify`, `bse_loading` and the window names of `common.band_degeneracy`. |
 | `bse_jax.py` | The BSE driver: `python -m bse.bse_jax`. |
 | `bse_kpm.py` | KPM Chebyshev density of states of the BSE Hamiltonian. |
-| `bse_lanczos.py` | `solve_bse_sharded`: the TDA Davidson; non-TDA hands off to `bse_nontda` (dense, or the Davidson with `full_solver='davidson'`). |
+| `bse_solve.py` | `solve_bse_sharded`: the TDA Davidson; non-TDA hands off to `bse_nontda` (dense, or the Davidson with `full_solver='davidson'`). |
 | `bse_loading.py` | Reads a GW restart into a BSE bundle: window, padding and q = 0 head; builds a missing static W(0) through `gw.static_screening` when the restart has none. |
 | `bse_nontda.py` | Structure-preserving full (non-TDA) eigensolver: the dense build (default) and the Davidson route (`full_bse_solver = davidson`). At a finite pair momentum (`data['partner']`) it builds the two operand sets of $\mathcal K$ (`operand_sets`), measures all four dense blocks and runs the Davidson's unpaired form. |
 | `bse_preconditioner.py` | Transition energies, the exchange pair amplitude and the exchange spin weight. |

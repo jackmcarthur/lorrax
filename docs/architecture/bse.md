@@ -471,7 +471,7 @@ Both full routes serve a finite pair momentum through `bse.exciton_bands`
 
 With `full_bse = true` the dense solve (`full_bse_solver = dense`, the default)
 reads `number_eigenvalues` and the
-kernel only (`bse_lanczos.solve_bse_sharded` returns to `bse_nontda` before it reads any
+kernel only (`bse_solve.solve_bse_sharded` returns to `bse_nontda` before it reads any
 solver option). `bse_jax` refuses a `davidson_*` key set away from its
 default. Under `dense` so do `davidson_tol_mev` and `solver_max_iter`; the refusal names
 `full_bse_solver` or the key to drop. The keys of the retired Lanczos routes (`block_size`,
@@ -595,7 +595,7 @@ returns the joint window, the BSE valence bands then the conduction bands, at ev
 the valence stacks $\psi_v(k+Q)$, $\varepsilon_v(k+Q)$ (pad bands at $-$`PAD_EPS_GUARD_RY`). The
 partner's conduction leg is the grid's stored $\psi_c(k)$ with the head-shifted diagonal.
 `build_path_solver_davidson(full=dict(solver=, on_indefinite=))` hands each $Q$'s payload, with
-`data['partner']`, to `bse_lanczos.solve_bse_sharded(tda=False, ...)`; one planned kernel set serves
+`data['partner']`, to `bse_solve.solve_bse_sharded(tda=False, ...)`; one planned kernel set serves
 the path. `solve_path.stability` holds $(\lambda_{\min}, \text{special roots})$ per $Q$; the run
 logs the smallest margin and writes it into the `.dat` header, whose title says which problem was
 solved. $W$'s $q \leftrightarrow -q$ reciprocity is measured once, before `W_q` is donated. The
@@ -843,7 +843,7 @@ same field ([TD-aGW end to end](../how-to/td-agw-workflow.md#circular-drives)).
 $W^c(z)=C(z-H)^{-1}B$, with density vertices at both ends and a static
 direct rung in $H$ (`gw.screening_bse`, `bse.w_ladder`). The stage persists the RPA W(0), then
 solves the resolvent one z at a time with ψ held 2-D at 1/P, by GMRES with a
-recycled spectral deflation per (q, z) (`bse_feast.harvest_spectral_deflation`).
+recycled spectral deflation per (q, z) (`bse_gmres.harvest_spectral_deflation`).
 Keys, supported modes and refusals: [input reference](../input_reference.md).
 This changes the screening in $\Sigma=iGW$; it does not add a matching
 self-energy vertex or close the self-consistent Hedin equations.
@@ -1174,7 +1174,7 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 | `GATE sp_davidson_finite` | the same | an operator or preconditioner output with NaN or Inf |
 | `GATE sp_davidson_argument` | the same | `on_indefinite`, `tol`, `margin_lock`, `max_iter`, `n_converge`, the start block's dtype or its row count out of range; the message gives the value and the range |
 | `GATE nontda_davidson_block` | `bse_nontda._solve_nontda_davidson` | `full_bse_instability = continue` with fewer margin roots than unstable or non-positive roots found |
-| `GATE nontda_route_option` | `bse_nontda.solve_bse_nontda_sharded`, `bse_lanczos.solve_bse_sharded` | an unknown solver or option name, or an option another full-BSE route reads (`davidson_*` or `on_indefinite` on the dense solve; `solver='matrixfree'`, retired 2026-11-27, is an unknown solver); `bse_jax` refuses the matching deck keys at parse time |
+| `GATE nontda_route_option` | `bse_nontda.solve_bse_nontda_sharded`, `bse_solve.solve_bse_sharded` | an unknown solver or option name, or an option another full-BSE route reads (`davidson_*` or `on_indefinite` on the dense solve; `solver='matrixfree'`, retired 2026-11-27, is an unknown solver); `bse_jax` refuses the matching deck keys at parse time |
 | `GATE nontda_lower_row` | `bse_nontda.solve_nontda_definite_pencil` | the dense solve at a finite pair momentum: $A_{\rm low}$ not Hermitian, or $B_{\rm low} \ne B^\dagger$, to $10^{-6}$ (relative); the two rows are built from the payload's and the partner's orbitals with one kernel, and disagree when $W$ is not conjugate-reciprocal, $V(Q)$ is not Hermitian or the partner orbitals are not the payload's bands at the other momentum |
 | `GATE exb_full_bse_key` | `bse.exciton_bands._check_full_bse_keys` | `full_bse_solver` or `full_bse_instability` without `full_bse = true`; `full_bse_instability`, `davidson_tol_mev` or `solver_max_iter` with `full_bse_solver = dense` |
 | `GATE exb_unserved_key` | `bse.exciton_bands.deck_settings` | `qp_rotations_file` or `highest_occupied_band` named (and not false) in an exciton-bands input file: `bse.bse_jax` keys that change the Hamiltonian and that this driver does not read |

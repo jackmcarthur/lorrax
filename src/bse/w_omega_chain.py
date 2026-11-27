@@ -61,7 +61,7 @@ For ``j = 0 .. m-1`` (all blocks ``p x (c,v,k)``, inner product Euclidean over
 giving the block-tridiagonal ``T`` (diag ``alpha_j``, sub ``beta_j``, super
 ``beta_j^dag``).  Full reorthogonalization is mandatory — the head-injected /
 stiff tiles lose orthogonality catastrophically under a bare 3-term recurrence
-(same lesson as the GMRES DGKS pass, bse_feast).
+(same lesson as the GMRES DGKS pass, bse_gmres).
 
 Evaluator (per omega, tiny).  ``z = (omega + i eta)/Ry``; with ``E = [R_0;0;..;0]``
 (``mp x p``, since ``Q^dag B0`` is nonzero only in the first block):

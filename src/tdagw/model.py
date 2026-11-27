@@ -21,7 +21,7 @@ bundle, a synthetic test).  ``assemble_td_model`` is its one constructor.
            M_{k,nm}(μ) = Σ_s ψ*_{nk,s}(μ) ψ_{mk,s}(μ).
 ``W_R``    (nmu_pad, nmu_pad, nkx, nky, nkz) c128, ``P('x','y',None,None,None)``
            — static W(q) with its q = 0 head, inverse-FFT'd to R
-           (``bse_feast.ensure_W_R``), Ry.
+           (``bse_gmres.ensure_W_R``), Ry.
 ``zeta_G`` (nmu_pad, nG_pad) c128, ``P(None,('x','y'))`` — ζ̃_{0μ}(G).
 ``v_G``    (nG_pad,) f64, ``P(('x','y'))`` — v(G) at q = 0, Ry, zero at G = 0
            and on pad slots.
@@ -519,7 +519,7 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
         head) and ``g0_X`` (the head vector), all (nmu_pad, …) on the mesh;
         ``window`` with ``keep_window``.
     """
-    from bse.bse_feast import ensure_W_R
+    from bse.bse_gmres import ensure_W_R
     from bse.bse_loading import load_bse_data_from_restart_sharded
     from bse.bse_window import resolve_n_occ
     from common.band_degeneracy import DEFAULT_MODE

@@ -299,7 +299,7 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     """The per-Q solver of the band scan, ``solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
     psi_v_X, psi_v_Y, eps_v, W_R[, D_head, M_Q])`` -> ``(evs (nQ, n_eig), ())``: the
     per-Q lowest ``n_eig`` from
-    ``bse_lanczos.solve_bse_sharded``'s Davidson (exact diagonal
+    ``bse_solve.solve_bse_sharded``'s Davidson (exact diagonal
     E_c(k+Q) - E_v(k) + (V_x(Q) - W_d)/nk, soft locking, margin roots, the
     ``tol_mev`` residual stop).  One planned solver serves every Q
     (``davidson_plan_key``); each Q's operands are arguments.  A Q that does not
@@ -329,7 +329,7 @@ def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     (NaN on the dense route, which refuses an indefinite ``K``) and the count
     of unstable or non-positive roots found under ``on_indefinite='continue'``."""
     from common.collectives import replicate_to_mesh
-    from .bse_lanczos import RY_TO_MEV, davidson_stop_line, solve_bse_sharded
+    from .bse_solve import RY_TO_MEV, davidson_stop_line, solve_bse_sharded
     from solvers.davidson import LAST_RUN
     sh = make_bse_shardings(mesh_xy)
     rows_of = {}
@@ -567,7 +567,7 @@ def _davidson_tuning(args) -> dict:
     (``davidson_precond``, ``davidson_olsen``, ``davidson_eps_shift``,
     ``davidson_margin``, ``davidson_margin_tol_mev``, ``davidson_m_max``; the
     defaults are that function's)."""
-    from .bse_lanczos import DAVIDSON_MARGIN_ROOTS, RY_TO_MEV
+    from .bse_solve import DAVIDSON_MARGIN_ROOTS, RY_TO_MEV
     shift = getattr(args, "davidson_eps_shift", None)
     margin_tol = getattr(args, "davidson_margin_tol_mev", None)
     return dict(
@@ -1518,7 +1518,7 @@ def _settings_defaults():
                          f"12x12 SOC deck was 5.9 meV)")
     ap.add_argument("--n-eig", type=int, default=6)
     ap.add_argument("--solver", choices=("davidson",), default="davidson",
-                    help="per-Q lowest --n-eig solver: davidson, bse_lanczos' "
+                    help="per-Q lowest --n-eig solver: davidson, bse_solve's "
                          "exact-diagonal Davidson, stopped on the --davidson-tol-mev "
                          "residual (the only one since 2026-11-27)")
     ap.add_argument("--davidson-tol-mev", type=float, default=0.01,
@@ -2657,7 +2657,7 @@ def main(argv=None):
             log(f"solve_path: cold {t_first:.2f}s (incl. ONE compile) over "
                 f"{n_solve} Q; warm re-run check SKIPPED (the default since "
                 f"2026-08-08 — pass --rerun-check to run it)")
-        # (The Davidson route is priced in bse_lanczos.)
+        # (The Davidson route is priced in bse_solve.)
         t_out0 = time.time()
 
         evs_path = evs_all[:nQ]

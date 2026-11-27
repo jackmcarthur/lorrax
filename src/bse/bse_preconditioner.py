@@ -1,7 +1,7 @@
 """The two elementwise BSE-basis helpers every solver shares.
 
 ``energy_diff_cv_k`` -- the single-particle energy differences E_c(k) - E_v(k)
-that form the D-term diagonal of H_BSE (bse_feast's diagonal preconditioner);
+that form the D-term diagonal of H_BSE (bse_gmres's diagonal preconditioner);
 ``compute_pair_amplitude`` -- the exchange vertex M(k,c,v,μ) the loaders hoist
 into every matvec.  Both lived in the deleted single-device ``bse_serial``
 module until 2026-09-24 (C10).

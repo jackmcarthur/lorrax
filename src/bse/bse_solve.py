@@ -1,12 +1,12 @@
-"""The Tamm-Dancoff BSE eigensolve: the Davidson on the trial-stack matvec.
+"""The one BSE eigensolve: ``solve_bse_sharded``.
 
-(The module keeps the name of the Lanczos solvers it used to hold; they were
-retired 2026-11-27.)  ``solve_bse_sharded`` is the one BSE solve, on any mesh
-(1x1 included): the Davidson of ``solvers.davidson`` with the exact diagonal
-preconditioner on the trial-stack matvec, or, with ``tda=False``, a hand-off to
-``bse_nontda`` (the dense structure-preserving solve or the full-BSE Davidson).
-It also holds the Davidson's stop line, basis pricing and thread gate that the
-BSE drivers share.
+On any mesh (1x1 included) it is the Davidson of ``solvers.davidson`` with the
+exact diagonal preconditioner on the trial-stack matvec (Tamm-Dancoff), or,
+with ``tda=False``, a hand-off to ``bse_nontda`` (the dense
+structure-preserving solve or the full-BSE Davidson).  The module also holds
+the Davidson's stop line, basis pricing and thread gate that the BSE drivers
+share.  It was ``bse_lanczos`` until 2026-11-27, when the Lanczos eigensolvers
+it once held were retired.
 """
 from __future__ import annotations
 

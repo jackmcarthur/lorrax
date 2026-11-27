@@ -391,7 +391,7 @@ at `epsilon_shift` $10^{-3}$ Ry and 452 at $10^{-6}$ Ry; at finite $Q$ it takes 
 
 | solver | caller | operator |
 |---|---|---|
-| planned Davidson | `psp.run_nscf` ([NSCF Hamiltonian](nscf_hamiltonian.md)); `bse.bse_lanczos` (`solver = davidson`, the default; also `bse.exciton_bands` per $Q$) | $H_k$ on the G sphere; the BSE Hamiltonian |
+| planned Davidson | `psp.run_nscf` ([NSCF Hamiltonian](nscf_hamiltonian.md)); `bse.bse_solve` (`solver = davidson`, the default; also `bse.exciton_bands` per $Q$) | $H_k$ on the G sphere; the BSE Hamiltonian |
 | structure-preserving Davidson | `bse.bse_nontda` (`full_bse = true` with `full_bse_solver = davidson`; `bse.exciton_bands` per $Q$) | the full BSE pair applier $AX+B\bar X$; at a finite pair momentum the Hermitian $\mathcal K$ on pair rows, unpaired form |
 
 Which BSE solver each CLI flag selects is [BSE](bse.md).
