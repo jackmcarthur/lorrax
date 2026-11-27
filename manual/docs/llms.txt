@@ -47,6 +47,7 @@
 - [For BerkeleyGW users](https://jackmcarthur.github.io/lorrax/using/berkeleygw-users/): manual/docs/using/berkeleygw-users.md
 - [Running on clusters](https://jackmcarthur.github.io/lorrax/using/clusters/): manual/docs/using/clusters.md
 - [Environment variables](https://jackmcarthur.github.io/lorrax/using/environment/): manual/docs/using/environment.md
+- [HSE06 references with Quantum ESPRESSO](https://jackmcarthur.github.io/lorrax/using/hse06-reference/): manual/docs/using/hse06-reference.md
 - [Required DFT inputs](https://jackmcarthur.github.io/lorrax/using/inputs-from-dft/): manual/docs/using/inputs-from-dft.md
 - [Installation](https://jackmcarthur.github.io/lorrax/using/installation/): manual/docs/using/installation.md
 - [Quickstart](https://jackmcarthur.github.io/lorrax/using/quickstart/): manual/docs/using/quickstart.md

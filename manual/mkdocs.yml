@@ -80,6 +80,7 @@ nav:
       - Installation: using/installation.md
       - Running on clusters: using/clusters.md
       - Required DFT inputs: using/inputs-from-dft.md
+      - HSE06 references (patched QE): using/hse06-reference.md
       - Environment variables: using/environment.md
       - For BerkeleyGW users: using/berkeleygw-users.md
   - Tutorials:

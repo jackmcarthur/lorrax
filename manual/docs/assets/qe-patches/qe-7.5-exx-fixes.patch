@@ -1,0 +1,156 @@
+Exact-exchange (EXX) run-time fixes for Quantum ESPRESSO 7.5
+=============================================================
+
+Applies to the qe-7.5 release source. Files changed:
+
+    Modules/mp_exx.f90   sha256 before 012fd545051608820db79caa0a57b978e605eb8bd8183e16f9845f961e5ac51a
+                         sha256 after  1f18defbf35cd85cab1503c6560ee3dc840c58153d0a6a1ea0d966e9f32d669d
+    PW/src/exx.f90       sha256 before 9ce3e0fa836a11f6e3d8dda36ab92c1f39082fbf0587fc56a36fcc3f88b57bdf
+                         sha256 after  bb818073569bebf28f1f24af1265d9b9b52522e862cd3f7888dc6a961c103894
+
+Apply from the top of the source tree, before configure:
+
+    patch -p1 < qe-7.5-exx-fixes.patch
+
+Three changes. Each removes run time only; none changes a computed result.
+
+1. Occupied-only exchange (exxinit, init_index_over_band). The exchange
+   buffer and the partner-band loop stop at the highest occupied band.
+   Stock code runs both over all nbnd bands and multiplies the empty
+   partners by an occupation of zero after the FFT.
+   This change adds two restrictions: fixed occupations only (smearing and
+   tetrahedra stop with an error) and one band group (-nb 1).
+2. exxinit, noncollinear GPU branch. The device-to-host copy of the whole
+   exchange buffer moves from inside the band and k+q loops to once after
+   the k loop.
+3. vexx_k_gpu. The first and last partner band of each band are tabulated
+   once per call. Stock code rescans all nbnd*m pair entries for every band
+   inside the q and band-block loops. The CPU routine vexx_k contains the
+   same scan and is NOT changed by this patch.
+
+Status: not part of Quantum ESPRESSO; not submitted to or reviewed by its
+developers. Tested on noncollinear spin-orbit HSE06 insulators. Tests and
+timings are on the LORRAX manual page "HSE06 references with Quantum
+ESPRESSO".
+
+Quantum ESPRESSO is distributed under the GNU General Public License (the
+file License in its source tree). This patch modifies that code and is
+distributed under the same terms.
+
+--- a/Modules/mp_exx.f90
++++ b/Modules/mp_exx.f90
+@@ -57,6 +57,7 @@
+   INTEGER, ALLOCATABLE :: ibands(:,:)
+   !! bands for which the bgroup has a pair
+   INTEGER :: iexx_start = 0
++  INTEGER :: nbuf_cap = 0   ! HYBRID_START occupied-only EXX buffer (0 = stock behaviour)
+   !! starting band index used in bgrp parallelization
+   INTEGER :: iexx_end = 0
+   !! ending band index used in bgrp parallelization
+@@ -349,6 +350,10 @@
+        END DO       
+     END DO
+     !
++    IF (nbuf_cap > 0 .AND. negrp == 1) THEN   ! HYBRID_START
++       all_end(1) = MIN(all_end(1), nbuf_cap)
++       iexx_end = MIN(iexx_end, nbuf_cap)
++    END IF
+   END SUBROUTINE init_index_over_band
+   !
+ END MODULE mp_exx
+--- a/PW/src/exx.f90
++++ b/PW/src/exx.f90
+@@ -350,8 +350,9 @@
+     USE mp_exx,               ONLY : me_egrp, negrp, init_index_over_band,  &
+                                      my_egrp_id, inter_egrp_comm,           &
+                                      intra_egrp_comm, iexx_start, iexx_end, &
+-                                     all_start, all_end
++                                     all_start, all_end, nbuf_cap   ! HYBRID_START
+     USE mp,                   ONLY : mp_sum, mp_bcast
++    USE klist,                ONLY : lgauss, ltetra   ! HYBRID_START
+     USE xc_lib,               ONLY : xclib_get_exx_fraction, start_exx,          &
+                                      get_screening_parameter, get_gau_parameter, &
+                                      exx_is_active
+@@ -506,6 +507,9 @@
+ !
+     !
+     CALL divide( inter_egrp_comm, x_nbnd_occ, ibnd_start, ibnd_end )
++    IF (negrp > 1) CALL errore("exxinit", "HYBRID_START occupied-only EXX patch: run with -nb 1", 1)
++    IF (lgauss .OR. ltetra) CALL errore("exxinit", "HYBRID_START occupied-only EXX patch: insulators only", 1)
++    nbuf_cap = x_nbnd_occ   ! HYBRID_START
+     CALL init_index_over_band( inter_egrp_comm, nbnd, nbnd )
+     !
+     ! ... this will cause exxbuff to be calculated for every band
+@@ -790,7 +794,7 @@
+                    ENDIF
+ #if defined(__CUDA)
+                 IF (use_gpu) CALL dev_buf%release_buffer(psic_nc_d, ierr)
+-                IF (use_gpu) exxbuff = exxbuff_d
++                ! EXXINIT_GPU_FIX: whole-buffer D2H copy moved after KPOINTS_LOOP
+ #endif
+                 ELSE ! noncolinear
+ #if defined(__MPI)
+@@ -830,6 +834,9 @@
+        IF_GAMMA_ONLY
+     ENDDO&
+     KPOINTS_LOOP
++#if defined(__CUDA)
++    IF (use_gpu .AND. noncolin .AND. .NOT. gamma_only) exxbuff = exxbuff_d   ! EXXINIT_GPU_FIX: once, not per band and k+q
++#endif
+     !
+     DEALLOCATE( psic_exx )
+     IF (noncolin) THEN
+@@ -2263,6 +2270,7 @@
+ #endif
+     INTEGER :: ir_out, ipair, jbnd
+     INTEGER :: ii, jstart, jend, jcount, jind, jcurr
++    INTEGER, ALLOCATABLE :: pr_js(:), pr_je(:)   ! PAIRFIX: j-range per band, built once
+     INTEGER :: ialloc, ending_im
+     INTEGER :: ijt, njt, jblock_start, jblock_end
+     INTEGER :: iegrp, wegrp
+@@ -2276,6 +2284,21 @@
+     dfftt__nl=>dfftt%nl_d
+     !
+     CALL start_clock( 'vexx_k_setup' )
++    ! PAIRFIX: stock code scans all max_pairs (= nbnd*m) entries of egrp_pairs for every band ii,
++    ! inside the q and j-block loops (O(m^3) per k); build the same first/last j once here.
++    ALLOCATE( pr_js(MAX(1,MAXVAL(egrp_pairs(1,:,my_egrp_id+1)))), pr_je(MAX(1,MAXVAL(egrp_pairs(1,:,my_egrp_id+1)))) )
++    pr_js = 0
++    pr_je = 0
++    DO ipair = 1, max_pairs
++       ibnd = egrp_pairs(1,ipair,my_egrp_id+1)
++       IF (ibnd < 1) CYCLE
++       IF (pr_js(ibnd) == 0) THEN
++          pr_js(ibnd) = egrp_pairs(2,ipair,my_egrp_id+1)
++          pr_je(ibnd) = pr_js(ibnd)
++       ELSE
++          pr_je(ibnd) = egrp_pairs(2,ipair,my_egrp_id+1)
++       END IF
++    END DO
+ 
+     ialloc = nibands(my_egrp_id+1)
+     !
+@@ -2404,18 +2427,12 @@
+                 IF (ibnd.eq.0.or.ibnd.gt.m) CYCLE
+                 !
+                 !determine which j-bands to calculate
+-                jstart = 0
++                jstart = 0   ! PAIRFIX
+                 jend = 0
+-                DO ipair=1, max_pairs
+-                   IF(egrp_pairs(1,ipair,my_egrp_id+1).eq.ibnd)THEN
+-                      IF(jstart.eq.0)THEN
+-                         jstart = egrp_pairs(2,ipair,my_egrp_id+1)
+-                         jend = jstart
+-                      ELSE
+-                         jend = egrp_pairs(2,ipair,my_egrp_id+1)
+-                      END IF
+-                   END IF
+-                END DO
++                IF (ibnd <= SIZE(pr_js)) THEN
++                   jstart = pr_js(ibnd)
++                   jend = pr_je(ibnd)
++                END IF
+                 !
+                 jstart = max(jstart,jblock_start)
+                 jend = min(jend,jblock_end)
