@@ -117,8 +117,14 @@ def _nodes(c):
 
 def _densify(mesh, c, e, v, *, fh_energies=None, e_file=None, q_perm=None,
              gate_energies=None, band_offset=0, **kw):
-    """``compute_wfns_fi`` + ``densified_dipoles`` on the toy, XLA backend."""
+    """``compute_wfns_fi`` + ``densified_dipoles`` on the toy, XLA backend.
+
+    The rank axis is zero-padded to the mesh (the Galerkin carrier), as in
+    :func:`_densify_qp`: ``compute_wfns_fi(return_coeffs=True)`` refuses a rank
+    that does not divide over the mesh ranks, and the toy has ten orbitals.
+    """
     kc = _grid(KC)
+    c = np.pad(c, ((0, 0), (0, 0), (0, (-c.shape[2]) % int(mesh.size))))
     e_fh = e if fh_energies is None else fh_energies
     metadata_e = e if e_file is None else e_file
     if band_offset:
@@ -151,7 +157,9 @@ def _exact_rotated(h, fine):
     lo, hi = B_MIN, B_MAX
     de = ee[:, lo + N_VAL:hi, None] - ee[:, None, lo:lo + N_VAL]
     dx = ve[:, :, lo + N_VAL:hi, lo:lo + N_VAL] / de[:, None]
-    w = np.einsum("qna,qam->qnm", ce[:, lo:hi].conj(), np.asarray(fine.coeffs_fi))
+    # The carrier's padded rank rows hold no orbital: keep the toy's own.
+    w = np.einsum("qna,qam->qnm", ce[:, lo:hi].conj(),
+                  np.asarray(fine.coeffs_fi)[:, :ce.shape[2]])
     return np.einsum("qcd,qxce,qef->xqdf", w[:, N_VAL:, N_VAL:].conj(), dx,
                      w[:, :N_VAL, :N_VAL]), dx
 
