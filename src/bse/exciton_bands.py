@@ -547,11 +547,77 @@ def check_solver_flags(ap, args) -> None:
         ap.error("davidson_tol_mev is read by solver = davidson only")
 
 
-def _precond_w_q0(args, data):
-    """The q = 0 slice of W_q for the Davidson exact diagonal, taken before W_q is donated."""
+def _precond_w_q0(args, data, log=None):
+    """The q = 0 slice of W_q for the Davidson exact diagonal, taken before W_q is donated.
+
+    Under ``full_bse`` it first measures W's q <-> -q reciprocity, here because
+    W_q is about to be donated and the per-Q payloads carry only W_R:
+    ``K = [[A, B], [B^H, A']]`` is Hermitian only for ``W(q) = conj(W(-q))``
+    (``bse_nontda.check_restart_reciprocity``, which refuses a stale restart)."""
+    if getattr(args, "full_bse", False) and data.get("W_q") is not None:
+        from .bse_nontda import check_restart_reciprocity
+        check_restart_reciprocity(data["W_q"], log=log, input_file=args.input)
     if args.solver != "davidson" or data.get("W_q") is None:
         return None
     return data["W_q"][:, :, 0, 0, 0]
+
+
+def _htransform_window(args, nval_in, n_val, b_min, b_max):
+    """The band window the path htransform returns: the BSE conduction bands
+    ``[b_min, b_max)``, or under ``full_bse`` the joint window ``[nval_in -
+    n_val, b_max)``, the BSE valence bands followed by the conduction bands.
+    The antiresonant pair (v at k+Q, c at k) needs the valence states at k + Q,
+    and one htransform returns both."""
+    if not getattr(args, "full_bse", False):
+        return b_min, b_max
+    if nval_in < n_val:
+        raise ValueError(
+            f"GATE exb_full_bse_valence_window: the htransform fits {nval_in} valence "
+            f"band(s) and the full BSE needs the {n_val} BSE valence bands at k + Q "
+            f"(got: nval = {nval_in} < number_val_bands_fine = {n_val}; want: nval >= "
+            f"{n_val}).  Why: the antiresonant pair's hole state is interpolated like "
+            f"the conduction states.  Fix: raise nval in {args.input}.")
+    return nval_in - n_val, b_max
+
+
+def _path_stacks(args, bundle, data, nQ, nk, n_rmu, mesh_xy):
+    """``(psi_cQ_X, psi_cQ_Y, eps_cQ, partner)`` from the path htransform's
+    bundle.  ``partner`` is None for the Tamm-Dancoff scan; under ``full_bse``
+    it is the antiresonant pair's operands for ``build_path_solver_davidson``:
+    the valence stacks at k + Q (:func:`build_pair_stacks`) and the grid's
+    conduction states with the head-shifted diagonal."""
+    n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
+    nv_pad, nc_pad, n_rmu_pad = (int(data[k]) for k in ("n_val_pad", "n_cond_pad", "n_rmu_pad"))
+    if not getattr(args, "full_bse", False):
+        return build_conduction_stacks(bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad,
+                                       mesh_xy) + (None,)
+    cX, cY, ec, vX, vY, ev = build_pair_stacks(
+        bundle, nQ, nk, n_val, n_cond, nv_pad, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
+    return cX, cY, ec, dict(psi_vQ_X=vX, psi_vQ_Y=vY, eps_vQ=ev,
+                            psi_c_X=data["psi_c_X"], psi_c_Y=data["psi_c_Y"],
+                            eps_c=head_shifted_eps_c(data["eps_c"], data))
+
+
+def _take_rows(rows, psi_cQ_X, psi_cQ_Y, eps_cQ, partner):
+    """The scan's rows ``rows`` of the conduction stacks (certification twins
+    and refit rows reuse their Q's caches), and of the partner's valence
+    stacks in place."""
+    sel = jnp.asarray(rows)
+    if partner is not None:
+        partner.update({key: partner[key][sel] for key in ("psi_vQ_X", "psi_vQ_Y", "eps_vQ")})
+    return psi_cQ_X[sel], psi_cQ_Y[sel], eps_cQ[sel]
+
+
+def _log_stability(solver, nQ, log):
+    """One line on the full solve's stability margins over the path: the
+    smallest ``lam_min`` (``lam_min(K)`` is at or below it) and the Q with
+    unstable or non-positive roots.  Nothing on the Tamm-Dancoff scan."""
+    stab = np.asarray(getattr(solver, "stability", ()), dtype=float).reshape(-1, 2)[:nQ]
+    if stab.size and np.all(np.isfinite(stab[:, 0])):
+        iq = int(np.argmin(stab[:, 0]))
+        log(f"full BSE: smallest stability margin lam_min = {stab[iq, 0] * RY2EV * 1e3:.4f} "
+            f"meV at Q row {iq} ({int(np.sum(stab[:, 1] > 0))} Q with unstable or "
+            f"non-positive roots)")
 
 
 def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, head_mbz, W_q0,
@@ -2159,21 +2225,10 @@ def main(argv=None):
         # No-op when kgrid_fine is unset (data grid == meta grid).
         kgrid_co_ct = (int(meta.nkx), int(meta.nky), int(meta.nkz))
         _path_quality_records = []
-        # full_bse: the antiresonant pair (v at k+Q, c at k) needs the BSE
-        # valence bands at k + Q as well, so the SAME htransform returns the
-        # joint window [VBM - n_val + 1, b_max): valence then conduction.
-        full_bse = bool(getattr(args, "full_bse", False))
-        v_min = nval_in - n_val
-        if full_bse and v_min < 0:
-            raise ValueError(
-                f"GATE exb_full_bse_valence_window: the htransform fits {nval_in} valence "
-                f"band(s) and the full BSE needs the {n_val} BSE valence bands at k + Q "
-                f"(got: nval = {nval_in} < number_val_bands_fine = {n_val}; want: nval >= "
-                f"{n_val}).  Why: the antiresonant pair's hole state is interpolated like "
-                f"the conduction states.  Fix: raise nval in {args.input}.")
         bundle = compute_wfns_fi(
             ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
-            kgrid_co=kgrid_co_ct, band_window_fi=((v_min if full_bse else b_min), b_max),
+            kgrid_co=kgrid_co_ct,
+            band_window_fi=_htransform_window(args, nval_in, n_val, b_min, b_max),
             mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
             batch_size=int(params.get("wfn_fi_q_chunk", 0)),
             use_low_mem_eigh=_use_low_mem_eigh, log_fn=log,
@@ -2186,18 +2241,8 @@ def main(argv=None):
                 "expected one")
         _record_htransform_receipts("exciton_bands.path_htransform",
                                     quality_records=_path_quality_records)
-        partner = None
-        if full_bse:
-            (psi_cQ_X, psi_cQ_Y, eps_cQ, psi_vQ_X, psi_vQ_Y, eps_vQ) = build_pair_stacks(
-                bundle, nQ, nk, n_val, n_cond, nv_pad, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
-            # The antiresonant pair (v at k+Q, c at k): the grid's conduction
-            # states with the head-shifted diagonal, the valence stacks at k+Q.
-            partner = dict(psi_vQ_X=psi_vQ_X, psi_vQ_Y=psi_vQ_Y, eps_vQ=eps_vQ,
-                           psi_c_X=data["psi_c_X"], psi_c_Y=data["psi_c_Y"],
-                           eps_c=head_shifted_eps_c(data["eps_c"], data))
-        else:
-            psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
-                bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
+        psi_cQ_X, psi_cQ_Y, eps_cQ, partner = _path_stacks(
+            args, bundle, data, nQ, nk, n_rmu, mesh_xy)
         continuum_ry = _continuum_threshold_ry(
             eps_cQ, data["eps_v"], n_val=n_val, n_cond=n_cond)
         # The htransform's buffers have now moved into the conduction
@@ -2567,13 +2612,8 @@ def main(argv=None):
         # exchange-only comparison — the ψ_c(k+Q), ε_c(k+Q) operands are literally
         # the same rows, not a recomputation of them.
         if cert_idx or refit_idx:
-            sel = jnp.asarray(list(range(nQ)) + list(cert_idx) + refit_idx)
-            psi_cQ_X = psi_cQ_X[sel]
-            psi_cQ_Y = psi_cQ_Y[sel]
-            eps_cQ = eps_cQ[sel]
-            if partner is not None:
-                partner.update(psi_vQ_X=partner["psi_vQ_X"][sel],
-                               psi_vQ_Y=partner["psi_vQ_Y"][sel], eps_vQ=partner["eps_vQ"][sel])
+            psi_cQ_X, psi_cQ_Y, eps_cQ = _take_rows(
+                list(range(nQ)) + list(cert_idx) + refit_idx, psi_cQ_X, psi_cQ_Y, eps_cQ, partner)
 
         # ── W_R once (the k-convolution router's k-minor factory), then the single-compile scan ──
         stages.begin(4, "Direct kernel W_R and the Q-scan solver",
@@ -2598,12 +2638,7 @@ def main(argv=None):
         # is a different array of a different shape and donation is declined
         # anyway.  It also still needs ``data["W_q"]`` to build that sub-grid,
         # which is why the reference is dropped per-branch and not once up here.
-        if full_bse:
-            # K = [[A, B], [B^H, A']] is Hermitian only for W(q) = conj(W(-q));
-            # measured here, before W_q is donated (the per-Q payloads carry W_R).
-            from .bse_nontda import check_restart_reciprocity
-            check_restart_reciprocity(data["W_q"], log=log, input_file=args.input)
-        W_q0 = _precond_w_q0(args, data)
+        W_q0 = _precond_w_q0(args, data, log=log)
         _ifftn_donated = jax.jit(_ifftn, donate_argnums=(0,))
         if args.w_coarse_grid is None:
             W_R = _ifftn_donated(data["W_q"])         # fast path: native fine W (byte-identical)
@@ -2674,9 +2709,8 @@ def main(argv=None):
                               n_cond, n_val, head_mbz, W_q0,
                               cert_rows=tuple(cert_idx) + tuple(range(nQ, nQ + n_cert)))
         tick("w_r_and_build", t0)
-        solve_kw = {} if partner is None else {"partner": partner}
         stages.result(f"W_R on {nkx} x {nky} x {nkz}; "
-                      + (f"full BSE, {args.full_solver} solver, " if full_bse else
+                      + (f"full BSE, {args.full_solver} solver, " if partner is not None else
                          f"{'block Lanczos' if args.solver == 'lanczos' else 'Davidson'} solver, ")
                       + f"{int(args.n_eig)} levels per Q")
         stages.begin(5, "Q-path eigensolve", name="exb.solve")
@@ -2686,16 +2720,9 @@ def main(argv=None):
         eps_cQ = head_shifted_eps_c(eps_cQ, data)
         evs_dev, alpha_dev = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                                     data["psi_v_X"], data["psi_v_Y"],
-                                    data["eps_v"], W_R, *head_args, **solve_kw)
-        if full_bse:
-            # The stability margin the full solve measured at each Q
-            # (lam_min(K) is at or below it) and the special roots found.
-            stab = np.asarray(solver.stability, dtype=float).reshape(-1, 2)[:nQ]
-            if np.all(np.isfinite(stab[:, 0])):
-                iq = int(np.argmin(stab[:, 0]))
-                log(f"full BSE: smallest stability margin lam_min = "
-                    f"{stab[iq, 0] * RY2EV * 1e3:.4f} meV at Q row {iq} "
-                    f"({int(np.sum(stab[:, 1] > 0))} Q with unstable or non-positive roots)")
+                                    data["eps_v"], W_R, *head_args,
+                                    **({} if partner is None else {"partner": partner}))
+        _log_stability(solver, nQ, log)
         # THE ONLY HOST FETCH LEFT IN THIS DRIVER, and it issues no collective:
         # ``evs_dev`` is the block-Lanczos Ritz table out of a small replicated
         # eigh(T), ``P()``-sharded, so it takes the service's replicated arm (a
@@ -2722,7 +2749,7 @@ def main(argv=None):
             evs2 = _gather_host(
                 solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                        data["psi_v_X"], data["psi_v_Y"], data["eps_v"], W_R,
-                       *head_args, **solve_kw)[0])
+                       *head_args, **({} if partner is None else {"partner": partner}))[0])
             t_warm = time.time() - t_w0
             tick("solve_scan_warm", t_w0)
             assert np.allclose(evs2, evs_all, atol=1e-10), \
