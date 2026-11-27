@@ -5,6 +5,45 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-27 — BSE: superseded eigensolver routes retired; two modules renamed
+
+The BSE has two iterative eigensolvers left, both Davidsons: the Tamm–Dancoff one
+(`solvers.davidson`, the default since 2026-10-21) and the structure-preserving one for the full BSE
+(`solvers.bse_sp_davidson`, `full_bse_solver = davidson`). The dense full solve stays as the
+reference, and the Haydock recursion and the KPM density of states stay as they are. Four routes
+that these superseded are gone, about 3,800 source lines net:
+
+- **Block Lanczos** (`solver = block_lanczos` in `bse.bse_jax` and `bse.exciton_bands`, with
+  `block_size`, `lanczos_rtol`, `lanczos_check_every`, `lanczos_n_reorth`).
+- **Thick-restart Lanczos** (`solver = trlan`, `trlan_m_max`, `trlan_n_keep`;
+  `solvers/thick_restart_lanczos.py`).
+- **FEAST** (`feast = true`, every `feast_*` and `gmres_*` key, `python -m bse.bse_feast`). It was
+  marked deprecated and experimental and ran only with `full_bse = true`.
+- **The matrix-free Lanczos of the full BSE** (`solvers/bse_sp_lanczos.py`), which no input key
+  reached.
+
+What a user must change:
+
+- **Remove retired keys from input files.** A retired key, or `solver = block_lanczos` /
+  `solver = trlan`, stops the run at parse with `GATE bse_retired_key` and the replacement in the
+  message; it is never ignored. `solver = davidson` is still accepted. For the full BSE use
+  `full_bse = true` with `full_bse_solver = davidson`.
+- **Python callers.** `bse_lanczos` is now `bse.bse_solve` (`solve_bse_sharded` no longer takes
+  `solver_kind`, `block_size`, `n_reorth`, `rtol`, `atol`, `check_every`), and `bse_feast` is now
+  `bse.bse_gmres` (the shared matvec operands, the shifted GMRES solve with its deflation and the
+  spectral bounds that the ladder, exact-$W$ and KPM code import). `solvers.lanczos` keeps
+  `simple_lanczos_eig`; `block_lanczos_eig_jit` and the quadrature module are gone.
+  `bse_jax` no longer re-exports matvec and solver names.
+- **One transform of $W$.** $W_R = \mathrm{ifft}_q W_q$ is built once per payload so the matvec
+  applies the screened term as a product in $R$. Every eigensolve and the Haydock recursion now
+  take it from `bse_davidson_helpers.payload_w_r`; `absorption_haydock.ensure_W_R` is gone. The
+  resolvent and ladder callers keep `bse_gmres.ensure_W_R`, which borrows $W_q$.
+
+**Results that move.** None. The default Tamm–Dancoff Davidson and both full-BSE routes run the
+programs they ran; on the test payload the Davidson takes 18 iterations and 255 matvecs before and
+after, and on NiO $4^3$ at four GPU ranks 14 iterations and 212 matvecs (full BSE: 15 iterations,
+440 pair calls), as before.
+
 ## 2026-11-27 — Full BSE at finite Q in `bse.exciton_bands`, head tensor and Olsen on the full route
 
 `bse.exciton_bands` now solves the full BSE at every $Q$ of its path when the input file says
