@@ -1,8 +1,19 @@
-"""Exciton bandstructure E_S(Q) along a high-symmetry Q path (TDA).
+"""Exciton bandstructure E_S(Q) along a high-symmetry Q path (TDA, or the full BSE).
 
 Finite-momentum TDA BSE ``H_Q = D_Q + V_Q − W`` in the pair basis
 ``|v k, c k+Q⟩`` (LORRAX convention: electron leg shifted by +Q), solved at
-every Q of a user-supplied high-symmetry path with ONE compiled engine:
+every Q of a user-supplied high-symmetry path with ONE compiled engine.
+
+``full_bse = true`` solves the full problem at every Q instead,
+``K z = omega Sigma z`` with ``K = [[A(Q), B(Q)], [B(Q)^H, conj A(-Q)]]``:
+the antiresonant pair is ``(v at k+Q, c at k)``, so the htransform also
+returns the BSE valence bands at k + Q (``build_pair_stacks``) and each Q's
+payload carries them to ``bse_nontda`` as ``data['partner']``
+(``bse_nontda.operand_sets`` has the derivation).  There is no ``B = B^T``
+and no ``+-`` pairing of roots at a general Q, so the solver is the
+structure-preserving Davidson's unpaired form (``full_bse_solver =
+davidson``) or the dense reference (``dense``, at most 4096 transitions).
+The rest of this docstring describes both:
 
   * **Q path** — read from the SAME ``K_POINTS crystal_b`` block (QE-style,
     labels via ``#``) that the htransform bandstructure driver consumes;
@@ -606,6 +617,24 @@ def _take_rows(rows, psi_cQ_X, psi_cQ_Y, eps_cQ, partner):
     if partner is not None:
         partner.update({key: partner[key][sel] for key in ("psi_vQ_X", "psi_vQ_Y", "eps_vQ")})
     return psi_cQ_X[sel], psi_cQ_Y[sel], eps_cQ[sel]
+
+
+def _dat_title(args, solver, nQ) -> str:
+    """The first header line(s) of the ``.dat``: which problem was solved, and
+    for the full BSE the path's stability margins (:func:`_log_stability`'s
+    numbers; the dense solve refuses an indefinite ``K`` and reports none)."""
+    if not getattr(args, "full_bse", False):
+        return "# Exciton bandstructure E_S(Q), TDA, LORRAX\n"
+    title = ("# Exciton bandstructure E_S(Q), full BSE (K z = omega Sigma z, "
+             f"K = [[A(Q), B(Q)], [B(Q)^H, conj A(-Q)]]; {args.full_solver} solve), LORRAX\n")
+    stab = np.asarray(getattr(solver, "stability", ()), dtype=float).reshape(-1, 2)[:nQ]
+    if stab.size and np.all(np.isfinite(stab[:, 0])):
+        iq = int(np.argmin(stab[:, 0]))
+        title += (f"# stability: smallest lam_min = {stab[iq, 0] * RY2EV * 1e3:.4f} meV at Q row "
+                  f"{iq} (lam_min(K) is at or below it); {int(np.sum(stab[:, 1] > 0))} Q with "
+                  f"unstable or non-positive roots (full_bse_instability = "
+                  f"{args.full_instability}); the rows hold the positive roots above them\n")
+    return title
 
 
 def _log_stability(solver, nQ, log):
@@ -2825,7 +2854,7 @@ def main(argv=None):
             labels = [(lbl or "") for lbl in node_labels]
             dat = args.out_prefix + ".dat"
             with open(dat, "w", encoding="utf8") as fh:
-                fh.write("# Exciton bandstructure E_S(Q), TDA, LORRAX\n")
+                fh.write(_dat_title(args, solver, nQ))
                 fh.write(provenance_header())
                 fh.write(f"# input: {os.path.abspath(args.input)}\n")
                 fh.write(f"# window: n_val={n_val} n_cond={n_cond}; n_eig={args.n_eig}; "
@@ -2929,7 +2958,8 @@ def main(argv=None):
             ax.set_xticks(ticks, labels)
             ax.set_xlim(x_path[0], x_path[-1])
             ax.set_ylabel("$E_S(Q)$ (eV)")
-            ax.set_title("Exciton bandstructure (TDA)")
+            ax.set_title("Exciton bandstructure (full BSE)" if getattr(args, "full_bse", False)
+                         else "Exciton bandstructure (TDA)")
             ax.legend(loc="best", fontsize="small")
             fig.tight_layout()
             if cert_worst is not None:
