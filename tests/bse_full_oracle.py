@@ -46,6 +46,8 @@ __all__ = [
     "sigma_projector_distance", "rotate_unitary", "random_unitary",
     "dominant_pencil", "near_singular_pencil", "indefinite_pencil", "degenerate_pencil",
     "clustered_pencil", "standard_pencils",
+    "general_K", "general_apply", "solve_general_pencil", "general_residuals", "mode_roots",
+    "general_mode_pencil", "dominant_general_pencil",
 ]
 
 
@@ -449,6 +451,120 @@ def clustered_pencil(n_clusters=6, size=4, seed=4, *, spread=1e-7):
     b = np.repeat(0.03 * (rng.standard_normal(n_clusters) + 1j * rng.standard_normal(n_clusters)),
                   size)
     return _diag_pencil(a, b, seed, "clustered", f"{n_clusters} clusters x {size}, spread {spread:g} Ry")
+
+
+# ---------------------------------------------------------------------------
+# The general pencil: no conjugation symmetry (a finite pair momentum Q)
+# ---------------------------------------------------------------------------
+#
+#     K z = omega Sigma z,   K = [[A, B], [B^H, A_low]] = K^H,   Sigma = diag(1, -1).
+#
+# At Q = 0, A_low = conj(A) and B = B^T and this is the pencil above.  In general the roots are
+# omega_i(Q) > 0 with z^H Sigma z > 0 and -omega_i(-Q) < 0 with z^H Sigma z < 0: no +- pairs.
+
+def general_K(A, B, A_low):
+    """``K = [[A, B], [B^H, A_low]]`` (2N x 2N); Hermitian when ``A`` and ``A_low`` are."""
+    A, B, A_low = np.asarray(A), np.asarray(B), np.asarray(A_low)
+    return np.block([[A, B], [B.conj().T, A_low]])
+
+
+def general_apply(K):
+    """The applier ``Z (b, 2, *window) -> K Z`` of a dense ``K`` (rows are pairs ``[X; Y]``)."""
+    K = np.asarray(K)
+
+    def apply(Z):
+        Z = np.asarray(Z)
+        return (Z.reshape(Z.shape[0], -1) @ K.T).reshape(Z.shape)
+
+    return apply
+
+
+def solve_general_pencil(K, *, real_rtol=1e-9, group_rtol=1e-9):
+    """``numpy.linalg.eig`` of ``Sigma K``, every root classified by type and sign.
+
+    A root is real when ``|Im| <= real_rtol * max|lambda|``; its type is the sign of
+    ``z^H Sigma z``.  Returns a dict:
+
+    ``omega`` (n,) ascending, ``X``, ``Y`` (N, n): the physical roots, real, positive, of positive
+        type, Sigma-orthonormalised inside each degenerate group (``z_i^H Sigma z_j = delta_ij``);
+    ``complex`` : roots with ``Im > 0``, descending ``Im`` (each has a conjugate partner);
+    ``negative`` : real roots of positive type at ``omega <= 0``, ascending;
+    ``mirror`` : real roots of negative type at ``omega >= 0``, ascending (non-positive roots of
+        the ``-Q`` problem);
+    ``k_min`` : the smallest eigenvalue of ``K``; ``definite`` : ``k_min > 0`` to 1e-10 relative.
+    """
+    K = np.asarray(K, dtype=np.complex128)
+    N = K.shape[0] // 2
+    sig = np.concatenate([np.ones(N), -np.ones(N)])
+    kw = np.linalg.eigvalsh(0.5 * (K + K.conj().T))
+    lam, V = np.linalg.eig(sig[:, None] * K)
+    scale = float(np.max(np.abs(lam)))
+    is_real = np.abs(lam.imag) <= real_rtol * scale
+    typ = np.real(np.einsum("ij,ij->j", V.conj(), sig[:, None] * V))
+    pos = np.where(is_real & (typ > 0) & (lam.real > 0))[0]
+    order = pos[np.argsort(lam.real[pos])]
+    omega, Z = lam.real[order], V[:, order]
+    if omega.size:
+        for g in degenerate_groups(omega, group_rtol):
+            Zg = Z[:, g]
+            G = Zg.conj().T @ (sig[:, None] * Zg)
+            w, U = np.linalg.eigh(0.5 * (G + G.conj().T))
+            if w[0] <= 0:
+                raise ValueError(f"a positive-type group has a non-positive Sigma norm: min {w[0]:.3e}")
+            Z[:, g] = Zg @ ((U / np.sqrt(w)[None, :]) @ U.conj().T)
+    cplx = lam[(~is_real) & (lam.imag > 0)]
+    return {"omega": omega, "X": Z[:N], "Y": Z[N:],
+            "complex": cplx[np.argsort(-cplx.imag)],
+            "negative": np.sort(lam.real[is_real & (typ > 0) & (lam.real <= 0)]),
+            "mirror": np.sort(lam.real[is_real & (typ < 0) & (lam.real >= 0)]),
+            "k_min": float(kw[0]), "definite": bool(kw[0] > 1e-10 * kw[-1])}
+
+
+def general_residuals(K, omega, X, Y):
+    """``|Sigma K z - omega z| / (|z| |K|_2)`` per column of ``z = [X; Y]``."""
+    K = np.asarray(K)
+    N = K.shape[0] // 2
+    sig = np.concatenate([np.ones(N), -np.ones(N)])
+    Z = np.concatenate([np.asarray(X), np.asarray(Y)], axis=0)
+    R = sig[:, None] * (K @ Z) - Z * np.asarray(omega)[None, :]
+    return np.linalg.norm(R, axis=0) / (np.linalg.norm(Z, axis=0) * np.linalg.norm(K, 2))
+
+
+def mode_roots(a, a_low, b):
+    """The two roots of each 2 x 2 pencil ``[[a, b], [conj b, a_low]] z = omega sigma_z z``:
+    ``omega = (a - a_low)/2 +- sqrt(((a + a_low)/2)^2 - |b|^2)``.  Returns ``(plus, minus)``
+    complex arrays; for real roots ``plus`` is the one of positive type."""
+    a, a_low, b = (np.asarray(v) for v in (a, a_low, b))
+    root = np.sqrt((0.25 * (a + a_low) ** 2 - np.abs(b) ** 2).astype(complex))
+    return 0.5 * (a - a_low) + root, 0.5 * (a - a_low) - root
+
+
+def general_mode_pencil(a, a_low, b, seed=0):
+    """A direct sum of 2 x 2 pencils rotated by ``diag(U1, U2)`` with random unitaries (a rotation
+    that commutes with Sigma): dense, complex, no symmetry between the blocks, roots known exactly
+    (:func:`mode_roots`).  Returns ``(A, B, A_low)`` with ``A = U1 diag(a) U1^H``,
+    ``B = U1 diag(b) U2^H``, ``A_low = U2 diag(a_low) U2^H``."""
+    rng = np.random.default_rng(seed)
+    a, a_low, b = (np.asarray(v) for v in (a, a_low, b))
+    U1, U2 = random_unitary(a.size, rng), random_unitary(a.size, rng)
+    return ((U1 * a[None, :]) @ U1.conj().T, (U1 * b[None, :]) @ U2.conj().T,
+            (U2 * a_low[None, :]) @ U2.conj().T)
+
+
+def dominant_general_pencil(n=48, seed=0, *, gap=0.4, window=0.6, coupling=0.02, low_shift=0.05):
+    """Diagonally dominant blocks with a gap and a small coupling without symmetry: the regime of
+    a finite-Q exciton solve.  ``A = diag(e) + c (C + C^H)/(2 sqrt n)``, ``A_low = diag(e') + c
+    (C' + C'^H)/(2 sqrt n)`` with independent energies ``e'`` in ``[gap + low_shift, ...]``, and
+    ``B = c S / sqrt(n)`` a general complex matrix.  Returns ``(A, B, A_low)``; positive definite
+    by construction (``|B|_2 << gap``)."""
+    rng = np.random.default_rng(seed)
+    cplx = lambda: rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))  # noqa: E731
+    e = gap + window * np.sort(rng.random(n))
+    e_low = gap + low_shift + window * np.sort(rng.random(n))
+    C, C_low, S = cplx(), cplx(), cplx()
+    A = np.diag(e) + coupling * (C + C.conj().T) / (2 * np.sqrt(n))
+    A_low = np.diag(e_low) + coupling * (C_low + C_low.conj().T) / (2 * np.sqrt(n))
+    return A, coupling * S / (2 * np.sqrt(n)), A_low
 
 
 def standard_pencils(seed=0):

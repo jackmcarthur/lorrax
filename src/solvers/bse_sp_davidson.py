@@ -96,6 +96,34 @@ Every process runs this loop on the same replicated small arrays (``M_r``,
 rank).  The host solves are rank 0's on every rank (``_from_rank0``), so the
 control flow cannot diverge on a host LAPACK that rounds differently.
 
+THE UNPAIRED FORM (``paired=False``): NO CONJUGATION SYMMETRY
+-------------------------------------------------------------
+Everything above rests on ``H J = -J H`` with ``J [X; Y] = [conj(Y); conj(X)]``:
+the lower-right block of ``H`` is ``-conj(A)``.  At a pair momentum ``Q != 0``
+it is ``-conj(A(-Q))`` and the lower-left one ``-B(Q)^H``, so the symmetry
+holds only where a symmetry of the crystal links ``Q`` and ``-Q`` and the two
+orbital sets are in matching gauges.  What always holds is
+
+    K z = omega Sigma z,   K = [[A, B], [B^H, A']] = K^H,   Sigma = diag(1, -1),   (8)
+
+whose roots are the excitations ``omega_i(Q) > 0`` (``z^H Sigma z > 0``) and
+``-omega_i(-Q) < 0`` (``z^H Sigma z < 0``): no ``+-`` pairs.  ``paired=False``
+solves (8) with the same loop.  The basis rows are whole pairs ``v_j = [x_j;
+y_j]``, orthonormal in the complex inner product, with images ``K v_j`` from
+an applier that is complex-linear, so every coefficient may be complex.  The
+projected matrices are ``G = V^H K V`` (Hermitian, the compression of ``K``)
+and ``St = V^H Sigma V`` (Hermitian), the Ritz problem is ``G c = omega St c``
+(the Cholesky form again, on complex matrices), ``z = sum_j c_j v_j`` with
+``c_i^H St c_j = delta_ij``, and each open root adds ONE row, its
+preconditioned residual ``[t_X; t_Y]``.  One row costs one application of
+``K``, which is two pair calls in the BSE, so the calls per open root and
+iteration are those of the paired form; what is lost is the partner
+direction ``J v_j``, which the paired form gets for nothing.  The certificate
+is unchanged: ``lam_min(G) >= lam_min(K)``.  An indefinite ``K`` is handled as
+above, with one more class of special root kept in the basis and not
+returned: real roots of negative type at ``omega >= 0``, which are the
+``-Q`` problem's non-positive ones.
+
 WHAT IS NOT HERE
 ----------------
 No physics, no input keys, no energy units.  The BSE layer
@@ -211,11 +239,34 @@ def solve_projected_definite(Mr, S, n_roots):
     return 1.0 / mu, C
 
 
-def _sigma_orthonormal(V, S):
-    """Columns of positive type made Sigma-orthonormal: ``V R^-1`` with
-    ``V^H (2 i S) V = R^H R``, so that ``c_i^H (2 i S) c_j = delta_ij``.
+def solve_pencil_definite(G, St, n_roots):
+    """Lowest positive roots of ``G c = omega St c``, Eq. (8) projected, for a
+    Hermitian positive definite ``G`` and a Hermitian ``St``.
 
-    Eigenvectors of distinct roots of the pencil are Sigma-orthogonal already;
+    ``G = L L^H``; the Hermitian ``L^-1 St L^-H`` has the eigenvalues
+    ``1/omega``, positive for the roots of positive type (the complex form of
+    :func:`solve_projected_definite`; no ``+-`` pairing is assumed).
+
+    Returns ``omega`` (k,) ascending, ``k <= n_roots`` (the positive roots the
+    pencil holds), and ``C`` (m, k) complex with ``c_i^H St c_j = delta_ij``.
+    Raises ``numpy.linalg.LinAlgError`` when ``G`` is not positive definite.
+    """
+    L = np.linalg.cholesky(G)
+    T = sla.solve_triangular(L, St, lower=True)
+    Sh = sla.solve_triangular(L, T.conj().T, lower=True).conj().T
+    mu, Yv = np.linalg.eigh(0.5 * (Sh + Sh.conj().T))
+    mu, Yv = mu[::-1], Yv[:, ::-1]
+    keep = int(min(n_roots, np.sum(mu > 1e-14 * max(mu[0], 0.0))))
+    mu, Yv = mu[:keep], Yv[:, :keep]
+    C = sla.solve_triangular(L.conj().T, Yv, lower=False) / np.sqrt(mu)[None, :]
+    return 1.0 / mu, C
+
+
+def _metric_orthonormal(V, St):
+    """Columns of positive type made orthonormal in the Hermitian metric
+    ``St``: ``V R^-1`` with ``V^H St V = R^H R``.
+
+    Eigenvectors of distinct roots of the pencil are metric-orthogonal already;
     inside a multiplet a general solve returns any basis, and scaling each
     column alone leaves ``X_i^H X_j - Y_i^H Y_j`` off the identity there.
     Falls back to the per-column scale when the Gram matrix is not positive
@@ -223,13 +274,120 @@ def _sigma_orthonormal(V, S):
     """
     if V.shape[1] == 0:
         return V
-    G = V.conj().T @ ((2j * S) @ V)
+    G = V.conj().T @ (St @ V)
     G = 0.5 * (G + G.conj().T)
     try:
         R = np.linalg.cholesky(G).conj().T
     except np.linalg.LinAlgError:
         return V / np.sqrt(np.abs(np.real(np.diag(G))))[None, :]
     return sla.solve_triangular(R, V.T, trans="T", lower=False).T
+
+
+def _sigma_orthonormal(V, S):
+    """:func:`_metric_orthonormal` in the paired form's metric ``2 i S``, so
+    that ``c_i^H (2 i S) c_j = delta_ij``."""
+    return _metric_orthonormal(V, 2j * S)
+
+
+def _complex_range(columns, rtol=_RANK_DROP_RTOL):
+    """Orthonormal basis of the range of complex ``columns`` (m, k): left
+    singular vectors above ``rtol`` of the largest singular value."""
+    if columns.shape[1] == 0:
+        return np.zeros((columns.shape[0], 0), complex)
+    U, s, _ = np.linalg.svd(columns, full_matrices=False)
+    return U[:, s > rtol * max(s[0], 1e-300)]
+
+
+def _mirror_partners(w, iu, real):
+    """For each complex root ``w[j]``, ``j`` in ``iu``, the index of its
+    conjugate partner among the roots with ``Im < 0``: one partner per
+    representative, so degenerate roots do not share one."""
+    below = [int(j) for j in np.where(~real & (w.imag < 0))[0]]
+    mirror = []
+    for j in iu:
+        if not below:
+            break
+        k = min(below, key=lambda i: abs(w[i] - np.conj(w[j])))
+        mirror.append(k)
+        below.remove(k)
+    return mirror
+
+
+def _solve_pencil(G, St, n_roots, scale, *, definite):
+    """Roots of ``G c = omega St c`` in the solver's order: the unpaired
+    counterpart of :func:`_solve_projected`, on complex Hermitian matrices.
+
+    ``definite``: Cholesky route (:func:`solve_pencil_definite`).  Otherwise a
+    general (QZ) solve separates the special sector: (a) complex roots, which
+    come in conjugate pairs, the member with ``Im omega > 0`` returned; (b)
+    real roots of positive type (``c^H St c > 0``) with ``omega <= 0``,
+    returned; (c) real roots of negative type with ``omega >= 0``, which are
+    the ``-Q`` problem's non-positive roots: kept in the basis so that ``G``
+    is positive definite on the rest, not returned.  On the ``St``-orthogonal
+    complement of that sector the pencil has only roots with ``omega c^H St
+    c > 0`` and ``G`` is positive definite: the Cholesky route gives the
+    positive ones.
+
+    Returns the dict of :func:`_solve_projected`; ``keep`` is complex.
+    """
+    m = G.shape[0]
+    if definite:
+        om, C = solve_pencil_definite(G, St, n_roots)
+        return dict(omega=om.astype(complex), C=C, n_unstable=0, n_negative=0,
+                    keep=np.zeros((m, 0), complex), general=False)
+    w, V = sla.eig(G, St)
+    ok = np.isfinite(w)
+    w, V = w[ok], V[:, ok]
+    sig = np.real(np.einsum("ij,ij->j", V.conj(), St @ V))
+    real = np.abs(w.imag) <= IMAG_RTOL * np.abs(w) + IMAG_ATOL * scale
+    iu = np.where(~real & (w.imag > 0))[0]
+    iu = iu[np.argsort(-w.imag[iu])]
+    mirror = _mirror_partners(w, iu, real)
+    ineg = np.where(real & (sig > 0) & (w.real <= 0))[0]
+    ineg = ineg[np.argsort(w.real[ineg])]
+    ipos = np.where(real & (sig < 0) & (w.real >= 0))[0]
+    keep = _complex_range(np.concatenate([V[:, iu], V[:, mirror], V[:, ineg], V[:, ipos]],
+                                         axis=1).astype(complex))
+    om_u, C_u = w[iu].astype(complex), V[:, iu].astype(complex)
+    C_u = C_u / np.linalg.norm(C_u, axis=0)[None, :]
+    om_n, C_n = w[ineg].real.astype(complex), _metric_orthonormal(V[:, ineg].astype(complex), St)
+    n_stable = max(0, n_roots - len(iu) - len(ineg))
+    general = False
+    try:
+        # The complement {d : keep^H St d = 0} = {d : keep^H G d = 0}; the
+        # better conditioned description is used (:func:`_solve_projected`).
+        cands = [Gk for Gk in (St @ keep, G @ keep / max(scale, np.finfo(float).tiny))
+                 if Gk.shape[1]]
+        if cands:
+            spread = [np.linalg.svd(Gk, compute_uv=False) for Gk in cands]
+            pick = int(np.argmax([s[-1] / max(s[0], np.finfo(float).tiny) for s in spread]))
+            Qc, _ = np.linalg.qr(cands[pick], mode="complete")
+        else:
+            Qc = np.eye(m, dtype=complex)
+        Nc = Qc[:, keep.shape[1]:]
+        om_s, C_s = solve_pencil_definite(Nc.conj().T @ G @ Nc, Nc.conj().T @ St @ Nc, n_stable)
+        C_s = Nc @ C_s
+    except np.linalg.LinAlgError:
+        general = True
+        ist = np.where(real & (sig > 0) & (w.real > 0))[0]
+        ist = ist[np.argsort(w.real[ist])][:n_stable]
+        om_s, C_s = w[ist].real, _metric_orthonormal(V[:, ist].astype(complex), St)
+    omega = np.concatenate([om_u, om_n, om_s.astype(complex)])[:n_roots]
+    C = np.concatenate([C_u, C_n, C_s], axis=1)[:, :n_roots]
+    return dict(omega=omega, C=C, n_unstable=min(len(iu), n_roots),
+                n_negative=min(len(ineg), max(0, n_roots - len(iu))), keep=keep, general=general)
+
+
+def _restart_rotation_pencil(keep, C_stable, width):
+    """Orthonormal complex ``Q`` (m, r <= width) spanning ``keep`` and as many
+    leading stable Ritz vectors as fit: the unpaired restart, ``Q^T`` rows of
+    the basis.  The applier is complex-linear there, so the images follow."""
+    k = C_stable.shape[1]
+    while True:
+        Q = _complex_range(np.concatenate([keep, C_stable[:, :k]], axis=1))
+        if Q.shape[1] <= width or k == 0:
+            return Q[:, :width]
+        k -= 1
 
 
 def _solve_projected(Mr, S, n_roots, scale, *, definite):
@@ -335,7 +493,7 @@ def _restart_rotation(keep, C_stable, width):
         k -= 1
 
 
-def _projected_step(Mr, S, n_block, capacity, *, solve_indefinite):
+def _projected_step(Mr, S, n_block, capacity, *, solve_indefinite, paired=True):
     """One iteration's host work on the active projected matrices, returned as
     arrays whose shapes depend on the plan only, so that every rank can take
     rank 0's through one fixed-shape all-reduce (``_from_rank0``).
@@ -343,10 +501,14 @@ def _projected_step(Mr, S, n_block, capacity, *, solve_indefinite):
     Parameters
     ----------
     Mr, S : (m, m) real symmetric / antisymmetric
-        The active blocks of ``M_r`` and ``S``.
+        The active blocks of ``M_r`` and ``S``.  Unpaired: ``G`` and ``St``,
+        complex Hermitian, and ``Q`` below is complex.
     solve_indefinite : bool
         Solve also when ``M_r`` is not positive definite; otherwise only the
         measurement is returned for that case.
+    paired : bool
+        The real paired form (:func:`_solve_projected`) or the unpaired pencil
+        (:func:`_solve_pencil`).
 
     Returns
     -------
@@ -366,22 +528,24 @@ def _projected_step(Mr, S, n_block, capacity, *, solve_indefinite):
     lam_min = float(sla.eigh(Mr, eigvals_only=True, subset_by_index=[0, 0])[0])
     floor = PD_RTOL * scale
     definite = lam_min > floor
+    solve = _solve_projected if paired else _solve_pencil
+    rotation = _restart_rotation if paired else _restart_rotation_pencil
     sol = None
     if definite:
         try:
-            sol = _solve_projected(Mr, S, nb, scale, definite=True)
+            sol = solve(Mr, S, nb, scale, definite=True)
         except np.linalg.LinAlgError:
             definite = False
     if sol is None and solve_indefinite:
-        sol = _solve_projected(Mr, S, nb, scale, definite=False)
+        sol = solve(Mr, S, nb, scale, definite=False)
     om, C = np.zeros(nb, complex), np.zeros((capacity, nb), complex)
-    Q = np.zeros((capacity, 2 * nb))
+    Q = np.zeros((capacity, 2 * nb), float if paired else complex)
     n_special = n_un = r = general = k = 0
     if sol is not None:
         k = sol["omega"].shape[0]
         om[:k], C[:m, :k] = sol["omega"], sol["C"]
         n_un, n_special = sol["n_unstable"], sol["n_unstable"] + sol["n_negative"]
-        rot = _restart_rotation(sol["keep"], sol["C"][:, n_special:], 2 * nb)
+        rot = rotation(sol["keep"], sol["C"][:, n_special:], 2 * nb)
         r, general = rot.shape[1], int(sol["general"])
         Q[:m, :r] = rot
     return [om, C, np.arange(nb) < k, Q,
@@ -398,26 +562,37 @@ def _projected_step(Mr, S, n_block, capacity, *, solve_indefinite):
 #  axis (no collective).  No vector is gathered and no vector-sized array is
 #  replicated.
 
-def _real_cgs2(basis, W, Pb, m):
+def _real_cgs2(basis, W, Pb, m, *, real=True):
     """Two classical Gram-Schmidt passes of the block ``Pb`` against the first
     ``m`` rows of ``W`` with REAL coefficients ``Re(W^H p)``: the plan's
     ``gram``, its real part, ``reconstruct``, a subtraction.  ``W`` is
     orthonormal in the real inner product only, and its images follow real
-    combinations only (module docstring)."""
+    combinations only (module docstring).  ``real=False`` (the unpaired form)
+    keeps the complex coefficients ``W^H p``."""
     for _ in range(2):
-        c = jnp.real(basis.gram(W, Pb, m)).astype(jnp.complex128)
+        c = basis.gram(W, Pb, m)
+        if real:
+            c = jnp.real(c).astype(jnp.complex128)
         x, _ = basis.reconstruct(W, W, c, m, Pb, compute_image=False)
         Pb = basis.constrain(Pb - x)
     return Pb
 
 
-def _real_whiten(blockp, Pb, room):
+def _real_whiten(blockp, Pb, room, *, real=True):
     """Orthonormalise the rows of ``Pb`` in the real inner product and drop
     dependent ones: the rank rule of ``solvers.subspace_numerics`` on the REAL
     Gram matrix ``Re(Pb Pb^H)``.  Returns the block (rows past the rank zero)
-    and the rank, at most ``room``."""
+    and the rank, at most ``room``.  ``real=False``: the complex inner product
+    and the Hermitian Gram matrix."""
     n = Pb.shape[0]
-    T, rank = _rank_whitener(jnp.real(blockp.gram(Pb, Pb, n)))
+    gram = blockp.gram(Pb, Pb, n)
+    if real:
+        gram = jnp.real(gram)
+    else:
+        # G_ij = <p_i, p_j>; rows q_m = sum_i T_im p_i have <q_m, q_n> =
+        # (T^H G T)_mn, so T holds eigenvectors of G itself.
+        gram = 0.5 * (gram + jnp.conj(gram.T))
+    T, rank = _rank_whitener(gram)
     rank = jnp.minimum(rank.astype(jnp.int32), room)
     out, _ = blockp.reconstruct(Pb, Pb, T.astype(jnp.complex128), n, Pb,
                                 columns=rank, compute_image=False)
@@ -425,13 +600,16 @@ def _real_whiten(blockp, Pb, room):
 
 
 @lru_cache(maxsize=_KERNELS_MAX)
-def _algebra(n_block, capacity, vector_shape, sharding):
+def _algebra(n_block, capacity, vector_shape, sharding, paired=True):
     """The operator-free kernels of one geometry, compiled once per process.
 
     ``sharding`` is the vectors' ``NamedSharding`` (row axis unsharded) or
     None for one device.  Vector outputs keep it; coefficient outputs are
     replicated.  ``extend`` and ``restart`` donate the two capacity buffers,
-    which they update in place.
+    which they update in place.  Unpaired: ``vector_shape`` and ``sharding``
+    are the pair vectors' ``(2, *vs)``, coefficients are complex, a block
+    still has ``2 n_block`` rows (corrections fill the first ``n_block``; the
+    restart may fill all of them).
     """
     nb, nb2 = n_block, 2 * n_block
     basis = plan_subspace(capacity=capacity, n_eig=nb2, vector_sharding=sharding,
@@ -450,33 +628,47 @@ def _algebra(n_block, capacity, vector_shape, sharding):
         return basis.constrain(zero), basis.constrain(zero)
 
     def first(X0, room):
-        """``[X0; i X0]`` orthonormalised in the real inner product."""
-        Pb = blockp.constrain(jnp.concatenate([X0, 1j * X0], axis=0))
-        Pb, _ = _real_whiten(blockp, Pb, room)
-        return _real_whiten(blockp, Pb, room)
+        """``[X0; i X0]`` orthonormalised in the real inner product.  Unpaired:
+        the pairs ``[X0; 0]`` in the first ``n_block`` rows, orthonormalised in
+        the complex one."""
+        if paired:
+            Pb = jnp.concatenate([X0, 1j * X0], axis=0)
+        else:
+            Z0 = jnp.stack([X0, jnp.zeros_like(X0)], axis=1)
+            Pb = jnp.concatenate([Z0, jnp.zeros_like(Z0)], axis=0)
+        Pb = blockp.constrain(Pb)
+        Pb, _ = _real_whiten(blockp, Pb, room, real=paired)
+        return _real_whiten(blockp, Pb, room, real=paired)
 
     def ortho(W, Pc, mask, m, room):
         """The correction block made orthonormal to ``W[:m]`` and to itself.
 
         ``mask`` (2 n_block,) zeroes the rows of locked roots first.  Real
         CGS2, whitening with the rank rule, and both once more (the second
-        pass removes what the whitening's rescaling brought back)."""
+        pass removes what the whitening's rescaling brought back).  Unpaired:
+        the same with complex coefficients."""
         m, room = jnp.asarray(m, jnp.int32), jnp.asarray(room, jnp.int32)
         Pb = jnp.where(mask.reshape((nb2,) + (1,) * len(vector_shape)), Pc, 0)
         Pb = blockp.constrain(Pb)
         rank = jnp.int32(0)
         for _ in range(2):
-            Pb = _real_cgs2(basis, W, Pb, m)
-            Pb, rank = _real_whiten(blockp, Pb, room)
+            Pb = _real_cgs2(basis, W, Pb, m, real=paired)
+            Pb, rank = _real_whiten(blockp, Pb, room, real=paired)
         return Pb, rank
 
+    sign = None if paired else jnp.asarray([1.0, -1.0]).reshape((1, 2) + (1,) * (len(vector_shape) - 1))
+
     def extend(W, MW, Pb, MPb, m, rank):
-        """Store ``rank`` new rows at ``m`` and return the two new panels
-        ``W[:m+rank]^H MP`` and ``W[:m+rank]^H P`` (capacity, 2 n_block)."""
+        """Store ``rank`` new rows at ``m`` and return the new panels
+        ``W[:m+rank]^H MP``, ``W[:m+rank]^H P`` (capacity, 2 n_block) and, a
+        third time, the second.  Unpaired: ``W^H K P``, ``W^H Sigma P`` and
+        ``W^H P``."""
         m, rank = jnp.asarray(m, jnp.int32), jnp.asarray(rank, jnp.int32)
         W, MW = basis.store(W, MW, Pb, MPb, m, rank)
         W, MW = basis.constrain(W), basis.constrain(MW)
-        return W, MW, basis.gram(W, MPb, m + rank), basis.gram(W, Pb, m + rank)
+        overlap = basis.gram(W, Pb, m + rank)
+        metric = overlap if paired else basis.gram(W, blockp.constrain(Pb * sign), m + rank)
+        return W, MW, basis.gram(W, MPb, m + rank), metric, overlap
 
     def restart(W, MW, Qc, m, r, template):
         """Rows ``[0, r)`` of the buffers become ``Q^T W`` and ``Q^T M W``, Eq. (7)."""
@@ -487,6 +679,10 @@ def _algebra(n_block, capacity, vector_shape, sharding):
 
     def sigma_gram(X, Y):
         """``X_i^H X_j - Y_i^H Y_j`` (n_block, n_block): the metric of Eq. (4)."""
+        if not paired:
+            Z = jnp.stack([X, Y], axis=1)
+            Z = blockp.constrain(jnp.concatenate([Z, jnp.zeros_like(Z)], axis=0))
+            return blockp.gram(Z, blockp.constrain(Z * sign), nb2)[:nb, :nb]
         G = blockp.gram(blockp.constrain(jnp.concatenate([X, Y], axis=0)),
                         blockp.constrain(jnp.concatenate([X, Y], axis=0)), nb2)
         return G[:nb, :nb] - G[nb:, nb:]
@@ -496,13 +692,14 @@ def _algebra(n_block, capacity, vector_shape, sharding):
         buffers=jit(buffers, (sharding, sharding)),
         first=jit(first, (sharding, rep)),
         ortho=jit(ortho, (sharding, rep)),
-        extend=jit(extend, (sharding, sharding, rep, rep), donate=(0, 1)),
+        extend=jit(extend, (sharding, sharding, rep, rep, rep), donate=(0, 1)),
         restart=jit(restart, (sharding, sharding), donate=(0, 1)),
         sigma_gram=jit(sigma_gram, rep),
         jit=jit)
 
 
-def _operator_kernels(alg, apply_pair, precondition, n_block, vector_shape, sharding):
+def _operator_kernels(alg, apply_pair, precondition, n_block, vector_shape, sharding, *,
+                      paired=True, x_sharding=None):
     """The two kernels that hold the caller's programs.
 
     ``ritz``: Ritz vectors, residual norms and the paired corrections of every
@@ -510,11 +707,36 @@ def _operator_kernels(alg, apply_pair, precondition, n_block, vector_shape, shar
     written back into the image block; widths are powers of two, so the
     applier compiles for at most ``log2`` widths and no padded row is ever
     multiplied (the rule of ``davidson_fixed._active_blocks``).
+
+    Unpaired: ``vector_shape`` and ``sharding`` are the pair vectors'
+    ``(2, *vs)``; ``x_sharding`` is the layout of one half, in which ``X`` and
+    ``Y`` are returned; ``apply_pair(data, Z)`` is ``K`` on pair rows.
     """
     nb = n_block
     basis, blockp = alg.basis, alg.blockp
-    axes = tuple(range(1, 1 + len(vector_shape)))
-    tail = (1,) * len(vector_shape)
+    half_shape = vector_shape if paired else vector_shape[1:]
+    axes = tuple(range(1, 1 + len(half_shape)))
+    tail = (1,) * len(half_shape)
+    x_sharding = sharding if paired else x_sharding
+
+    def ritz_pencil(data, W, KW, Cc, omega, m, template):
+        """Eq. (8): ``z = sum_j c_j v_j``, ``H z = Sigma K z``, the residual
+        and ONE correction row per root, the pair ``[t_X; t_Y]``."""
+        m = jnp.asarray(m, jnp.int32)
+        comb, kcomb = basis.reconstruct(W, KW, Cc, m, template)
+        X, Y = comb[:nb, 0], comb[:nb, 1]
+        HX, HY = kcomb[:nb, 0], -kcomb[:nb, 1]
+        om = omega.reshape((nb,) + tail)
+        RX, RY = HX - om * X, HY - om * Y
+        r2 = jnp.sum(jnp.abs(RX) ** 2, axis=axes) + jnp.sum(jnp.abs(RY) ** 2, axis=axes)
+        z2 = jnp.sum(jnp.abs(X) ** 2, axis=axes) + jnp.sum(jnp.abs(Y) ** 2, axis=axes)
+        resid = jnp.where(z2 > 0, jnp.sqrt(r2 / jnp.where(z2 > 0, z2, 1.0)), jnp.inf)
+        tX, tY = precondition(data, RX, RY, omega)
+        n2 = jnp.sum(jnp.abs(tX) ** 2, axis=axes) + jnp.sum(jnp.abs(tY) ** 2, axis=axes)
+        scale = (1.0 / jnp.sqrt(jnp.maximum(n2, 1e-300))).reshape((nb,) + tail)
+        t = jnp.stack([tX * scale, tY * scale], axis=1)
+        Pc = blockp.constrain(jnp.concatenate([t, jnp.zeros_like(t)], axis=0))
+        return X, Y, Pc, resid
 
     def ritz(data, W, MW, Cc, omega, m, template):
         m = jnp.asarray(m, jnp.int32)
@@ -544,7 +766,8 @@ def _operator_kernels(alg, apply_pair, precondition, n_block, vector_shape, shar
                 piece = jax.lax.dynamic_slice_in_dim(Pb, start, width)
                 if sharding is not None:
                     piece = jax.lax.with_sharding_constraint(piece, sharding)
-                out = apply_pair(data, piece, jnp.ones((width,), jnp.float64))
+                out = (apply_pair(data, piece, jnp.ones((width,), jnp.float64)) if paired
+                       else apply_pair(data, piece))
                 return blockp.constrain(jax.lax.dynamic_update_slice_in_dim(
                     MPb, out.astype(MPb.dtype), start, axis=0))
             applies[width] = alg.jit(run, sharding)
@@ -553,7 +776,8 @@ def _operator_kernels(alg, apply_pair, precondition, n_block, vector_shape, shar
     def zero_block():
         return blockp.constrain(jnp.zeros((2 * nb,) + vector_shape, jnp.complex128))
 
-    return SimpleNamespace(ritz=alg.jit(ritz, (sharding, sharding, sharding, alg.rep)),
+    return SimpleNamespace(ritz=alg.jit(ritz if paired else ritz_pencil,
+                                        (x_sharding, x_sharding, sharding, alg.rep)),
                            apply=apply, zero_block=alg.jit(zero_block, sharding))
 
 
@@ -575,12 +799,15 @@ def sp_diagonal_precond(*, epsilon_shift=1e-3):
     normalise ``t_X`` and ``t_Y`` separately; they are one direction.
 
     Returns ``precondition(D, RX, RY, omega) -> (tX, tY)`` on (n, *vs) blocks;
-    pass ``D`` as the solver's ``data`` (or a function of it).
+    pass ``D`` as the solver's ``data`` (or a function of it).  ``D`` may be a
+    pair ``(D, D_low)``: the unpaired form, ``H_D = diag(D, -D_low)`` with
+    ``D_low`` the diagonal of the lower-right block ``A'`` of ``K``, Eq. (8).
     """
     def precondition(D, RX, RY, omega):
+        D, D_low = D if isinstance(D, (tuple, list)) else (D, D)
         om = omega.reshape((RX.shape[0],) + (1,) * (RX.ndim - 1))
         eps = jnp.asarray(epsilon_shift, dtype=D.dtype)
-        dx, dy = D[None] - om + eps, D[None] + om + eps
+        dx, dy = D[None] - om + eps, D_low[None] + om + eps
         dx = jnp.where(jnp.abs(dx) < 1e-12, 1e-12, dx)
         dy = jnp.where(jnp.abs(dy) < 1e-12, 1e-12, dy)
         return RX / dx, -RY / dy
@@ -616,13 +843,22 @@ def _from_rank0(arrays, mesh):
     return out
 
 
-def basis_capacity(requested, n_block, n_converge, dimension):
+def basis_capacity(requested, n_block, n_converge, dimension, *, paired=True):
     """Real-form basis capacity the solver runs with: the request (default
     ``DEFAULT_CAPACITY_FACTOR * n_converge``), at least ``MIN_CAPACITY_BLOCKS``
     blocks of ``n_block`` rows, at most the real dimension ``2 * dimension``
     of the vector space (padding included).  A caller prices ``2 * capacity``
-    vectors with it before the solve."""
+    vectors with it before the solve.
+
+    Unpaired: the capacity counts pair vectors ``[x; y]``, each two vectors of
+    storage, so the request (in real-form vectors, the unit of the input key)
+    is halved: the same memory and the same depth in iterations.  At least
+    ``MIN_CAPACITY_BLOCKS`` blocks of ``n_block`` pair rows (the restart may
+    hold two), at most the complex dimension ``2 * dimension``.  A caller
+    prices ``4 * capacity`` vectors."""
     want = int(requested) if requested is not None else DEFAULT_CAPACITY_FACTOR * n_converge
+    if not paired:
+        want = want // 2
     return min(2 * dimension, max(want, MIN_CAPACITY_BLOCKS * n_block))
 
 
@@ -644,6 +880,7 @@ def sp_davidson(
     refusal_notes: dict | None = None,
     plan_key=None,
     verbose: bool = True,
+    paired: bool = True,
 ):
     """Lowest roots of the full BSE with paired eigenvectors, structure preserving.
 
@@ -652,6 +889,16 @@ def sp_davidson(
     apply_pair : (data, X (b, *vs) complex128, s (b,) float64) -> (b, *vs)
         ``A X + s B conj(X)`` per row, real-linear, JAX-traceable.  Called
         with ``s = +1`` and power-of-two ``b`` only.  One row is one pair call.
+        With ``paired=False``: ``(data, Z (b, 2, *vs)) -> (b, 2, *vs)``, the
+        Hermitian ``K`` of Eq. (8) on pair rows ``[X; Y]``, complex-linear;
+        one row counts as two pair calls.
+    paired : bool
+        True (default): the operator has the conjugation symmetry
+        (``H = [[A, B], [-conj B, -conj A]]``), the real paired form above.
+        False: the general pencil of Eq. (8) (module docstring, THE UNPAIRED
+        FORM): a finite pair momentum.  The start block is ``[X0; 0]``, the
+        capacity counts pair vectors, ``precondition`` is called the same
+        way, and ``X``, ``Y``, ``omega`` and ``info`` mean the same.
     X0 : (n_block, *vs) complex128
         Start block, linearly independent; its sharding (a ``NamedSharding``
         with an unsharded row axis, or one device) is the vectors' layout for
@@ -785,16 +1032,29 @@ def sp_davidson(
             f"GATE sp_davidson_argument: more start vectors than the space holds (got: {nb} rows of "
             f"X0 in dimension {dim}; want: at most {dim}).  Why: the start block [X0, i X0] must "
             f"span {2 * nb} real directions.  Fix: pass fewer start vectors.")
-    cap = basis_capacity(capacity, nb, n_test, dim)
+    paired = bool(paired)
+    cap = basis_capacity(capacity, nb, n_test, dim, paired=paired)
     sharding = X0.sharding if isinstance(X0.sharding, NamedSharding) else None
     mesh = None if sharding is None else sharding.mesh
     precondition = sigma_gradient if precondition is None else precondition
+    # The basis rows: the vectors themselves, or (unpaired) pairs [x; y] with
+    # the pair axis unsharded after the row axis.
+    row_shape, row_sharding = vs, sharding
+    if not paired:
+        row_shape = (2,) + vs
+        if sharding is not None:
+            spec = tuple(sharding.spec) + (None,) * (1 + len(vs) - len(tuple(sharding.spec)))
+            row_sharding = NamedSharding(mesh, P(spec[0], None, *spec[1:]))
+    # Rows a new block must have at the start, rows one open root adds, and
+    # pair calls per applied row.
+    first_rank, per_root, call_weight = (nb2, 2, 1) if paired else (nb, 1, 2)
 
-    alg = _algebra(nb, cap, vs, sharding)
-    full_key = None if plan_key is None else (plan_key, nb, cap, vs, sharding)
+    alg = _algebra(nb, cap, row_shape, row_sharding, paired)
+    full_key = None if plan_key is None else (plan_key, nb, cap, vs, sharding, paired)
     ops = _KERNELS.get(full_key) if full_key is not None else None
     if ops is None:
-        ops = _operator_kernels(alg, apply_pair, precondition, nb, vs, sharding)
+        ops = _operator_kernels(alg, apply_pair, precondition, nb, row_shape, row_sharding,
+                                paired=paired, x_sharding=sharding)
         if full_key is not None:
             if len(_KERNELS) >= _KERNELS_MAX:
                 _KERNELS.pop(next(iter(_KERNELS)))
@@ -817,23 +1077,33 @@ def sp_davidson(
                 start += width
         return MPb
 
-    Mr, S = np.zeros((cap, cap)), np.zeros((cap, cap))
+    kind = float if paired else complex
+    Mr, S = np.zeros((cap, cap), kind), np.zeros((cap, cap), kind)
     track = dict(metric_asym=0.0, orth_err=0.0)
 
-    def add_panels(pm, ps, m, rank):
-        """The new rows and columns of ``M_r = Re(W^H M W)`` and ``S = Im(W^H W)``;
-        returns False on a non-finite panel."""
-        pm, ps = host(pm)[:m + rank, :rank], host(ps)[:m + rank, :rank]
+    def add_panels(pm, ps, po, m, rank):
+        """The new rows and columns of ``M_r = Re(W^H M W)`` and ``S = Im(W^H W)``
+        (unpaired: of ``G = V^H K V`` and ``St = V^H Sigma V``); returns False
+        on a non-finite panel."""
+        pm, ps, po = (host(a)[:m + rank, :rank] for a in (pm, ps, po))
         if not (np.all(np.isfinite(pm)) and np.all(np.isfinite(ps))):
             return False
-        Mr[:m + rank, m:m + rank] = pm.real
-        Mr[m:m + rank, :m] = pm.real[:m].T
-        S[:m + rank, m:m + rank] = ps.imag
-        S[m:m + rank, :m] = -ps.imag[:m].T
-        blk = pm.real[m:]                         # Re(P^H M P): symmetric iff A = A^H, B = B^T
+        if paired:
+            Mr[:m + rank, m:m + rank] = pm.real
+            Mr[m:m + rank, :m] = pm.real[:m].T
+            S[:m + rank, m:m + rank] = ps.imag
+            S[m:m + rank, :m] = -ps.imag[:m].T
+            blk = pm.real[m:]                     # Re(P^H M P): symmetric iff A = A^H, B = B^T
+            gram = po.real.copy()                 # Re(W^H P) = [0; I]
+        else:
+            Mr[:m + rank, m:m + rank] = pm
+            Mr[m:m + rank, :m] = pm[:m].conj().T
+            S[:m + rank, m:m + rank] = ps
+            S[m:m + rank, :m] = ps[:m].conj().T
+            blk = pm[m:]                          # P^H K P: Hermitian iff K = K^H
+            gram = po.copy()                      # W^H P = [0; I]
         track["metric_asym"] = max(track["metric_asym"], float(
-            np.max(np.abs(blk - blk.T)) / max(np.max(np.abs(blk)), 1e-300)))
-        gram = ps.real.copy()                     # Re(W^H P) = [0; I]
+            np.max(np.abs(blk - blk.conj().T)) / max(np.max(np.abs(blk)), 1e-300)))
         gram[m:] -= np.eye(rank)
         track["orth_err"] = max(track["orth_err"], float(np.max(np.abs(gram))))
         return True
@@ -845,13 +1115,13 @@ def sp_davidson(
     Pb, rank = alg.first(X0, np.int32(min(nb2, cap)))
     rank = int(host(rank))
     MPb = ops.zero_block()
-    if rank != nb2:
+    if rank != first_rank:
         status = BAD_INITIAL
     else:
         MPb = apply_rows(Pb, MPb, rank)
-        calls = calls_start = rank
-        W, MW, pm, ps = alg.extend(W, MW, Pb, MPb, np.int32(0), np.int32(rank))
-        if add_panels(pm, ps, 0, rank):
+        calls = calls_start = call_weight * rank
+        W, MW, pm, ps, po = alg.extend(W, MW, Pb, MPb, np.int32(0), np.int32(rank))
+        if add_panels(pm, ps, po, 0, rank):
             m = rank
         else:
             status = NONFINITE
@@ -871,10 +1141,11 @@ def sp_davidson(
             break
         it += 1
         # ── the projected problem on the active block, Eq. (3) ───────────
-        A_ = 0.5 * (Mr[:m, :m] + Mr[:m, :m].T)
-        S_ = 0.5 * (S[:m, :m] - S[:m, :m].T)
+        A_ = 0.5 * (Mr[:m, :m] + Mr[:m, :m].conj().T)
+        S_ = (0.5 * (S[:m, :m] - S[:m, :m].T) if paired else
+              0.5 * (S[:m, :m] + S[:m, :m].conj().T))
         om, C, present, Qp, counts, reals = _from_rank0(_projected_step(
-            A_, S_, nb, cap, solve_indefinite=(on_indefinite == "continue")), mesh)
+            A_, S_, nb, cap, solve_indefinite=(on_indefinite == "continue"), paired=paired), mesh)
         definite, n_special, n_un, r, general = (int(n) for n in counts)
         lam_min, pd_floor = (float(x) for x in reals)
         lam_min_seen = min(lam_min_seen, lam_min)
@@ -893,7 +1164,9 @@ def sp_davidson(
         n_tested = min(nb, n_special + n_test)
 
         # ── Ritz vectors, residuals, the gate, Eqs. (4)-(5) ──────────────
-        Cc = np.concatenate([C, np.conj(C)], axis=1)       # (capacity, 2 n_block)
+        # (capacity, 2 n_block): [C, conj C] combine the paired form's rows;
+        # the unpaired Ritz pairs are the first n_block combinations.
+        Cc = np.concatenate([C, np.conj(C) if paired else np.zeros_like(C)], axis=1)
         X, Y, Pc, res = ops.ritz(data, W, MW, device(Cc), device(om), np.int32(m), Pb)
         resid = host(res)
         omega = np.where(present, om, np.inf)
@@ -922,28 +1195,30 @@ def sp_davidson(
         if lock_converged and float(margin_lock) != 1.0:
             open_ &= ~((resid < float(margin_lock) * gate) & (np.arange(nb) >= n_tested))
         corrections += open_
-        if m + 2 * int(np.sum(open_)) > cap:
-            # Restart on the real form of the Ritz block, Eq. (7).
+        if m + per_root * int(np.sum(open_)) > cap:
+            # Restart on the real form of the Ritz block, Eq. (7) (unpaired:
+            # on the Ritz pairs themselves, a unitary rotation).
             W, MW = alg.restart(W, MW, device(Qp.astype(complex)), np.int32(m), np.int32(r), Pb)
             Qm = Qp[:m, :r]
             Mr_new, S_new = np.zeros_like(Mr), np.zeros_like(S)
-            Mr_new[:r, :r] = Qm.T @ A_ @ Qm
-            S_new[:r, :r] = Qm.T @ S_ @ Qm
+            Mr_new[:r, :r] = Qm.conj().T @ A_ @ Qm
+            S_new[:r, :r] = Qm.conj().T @ S_ @ Qm
             Mr, S, m = Mr_new, S_new, r
             restarts += 1
             if verbose:
                 log.debug(f"full-BSE Davidson: restart {restarts} at iteration {it}, "
-                          f"basis {r} real-form vectors", extra=block("sp_davidson"))
-        Pb, rank = alg.ortho(W, Pc, device(np.concatenate([open_, open_])), np.int32(m),
-                             np.int32(cap - m))
+                          f"basis {r} {'real-form' if paired else 'pair'} vectors",
+                          extra=block("sp_davidson"))
+        Pb, rank = alg.ortho(W, Pc, device(np.concatenate(
+            [open_, open_ if paired else np.zeros_like(open_)])), np.int32(m), np.int32(cap - m))
         rank = int(host(rank))
         if rank == 0:
             status = NO_DIRECTIONS
             break
         MPb = apply_rows(Pb, MPb, rank)
-        calls += rank
-        W, MW, pm, ps = alg.extend(W, MW, Pb, MPb, np.int32(m), np.int32(rank))
-        if not add_panels(pm, ps, m, rank):
+        calls += call_weight * rank
+        W, MW, pm, ps, po = alg.extend(W, MW, Pb, MPb, np.int32(m), np.int32(rank))
+        if not add_panels(pm, ps, po, m, rank):
             status = NONFINITE
             break
         m += rank
@@ -955,7 +1230,7 @@ def sp_davidson(
         if sel.size:
             sigma_err = float(np.max(np.abs(G[np.ix_(sel, sel)] - np.eye(sel.size))))
     info = dict(
-        status=int(status), status_name=STATUS_NAMES[int(status)], iterations=it,
+        status=int(status), status_name=STATUS_NAMES[int(status)], iterations=it, paired=paired,
         restarts=restarts, active_size=m, capacity=cap, n_block=nb, n_converge=n_test,
         n_tested=int(n_tested), n_stable_tested=int(n_tested) - int(n_un) - int(n_neg),
         pair_calls=int(calls), pair_calls_start=int(calls_start),
@@ -970,7 +1245,7 @@ def sp_davidson(
     if status == BAD_INITIAL:
         raise ValueError(
             f"GATE sp_davidson_start: the start block [X0, i X0] is rank deficient (got: rank "
-            f"{rank} of {nb2}; want: full rank).  Why: the first basis is its orthonormalisation, "
+            f"{rank} of {first_rank}; want: full rank).  Why: the first basis is its orthonormalisation, "
             f"and a dependent start vector would leave a direction the solve never sees.  Fix: pass "
             f"linearly independent start vectors (over the reals, X0 and i X0 together).")
     if status == NONFINITE:
