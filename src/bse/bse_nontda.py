@@ -107,7 +107,6 @@ from scipy.linalg import solve_triangular
 import jax
 import jax.numpy as jnp
 
-from common.fft_helpers import make_kfft_kminor
 from .bse_ring_comm import make_bse_shardings
 from .bse_head import head_shifted_eps_c
 # The Davidson route's residual stop (meV), margin roots and basis admission
@@ -243,42 +242,131 @@ def check_restart_reciprocity(W_q, *, tol=_NONTDA_RECIP_TOL, log=None,
     return rel
 
 
-def _full_matvec_and_args(data, mesh_xy, sh, *, include_W):
-    """The fused pair applier of the optical non-TDA operator and its 9 operands.
+def payload_w_r(data, mesh_xy, sh, *, include_W):
+    """The payload's screened tile in R space, transformed once and left on it.
 
-    ``pair(X, s, *args) = A X + s B conj(X)`` (``bse_stack_matvec.
-    build_bse_stack_pair_matvec``); the dense build and the matrix-free route
-    both read the operator through it."""
+    ``data["W_R"] = ifftn_ortho(W_q)`` with ``W_q`` DONATED to the memoised
+    transform ``bse_lanczos.solve_bse_sharded`` and ``absorption_haydock`` run
+    (``fft_helpers.get_donated_kfft_kminor``), and the caller-side reference
+    dropped: one (mu, nu, k) tile per rank for the whole solve.  A payload that
+    already carries ``W_R`` (a second solve, ``exciton_bands``' per-Q payloads)
+    is used as it is.  Without ``include_W`` the W term is never built and the
+    tile is a placeholder operand."""
+    if not include_W:
+        return data["W_q"] if data.get("W_q") is not None else data.get("W_R")
+    if data.get("W_R") is None:
+        from common.fft_helpers import get_donated_kfft_kminor
+        ifft = get_donated_kfft_kminor(
+            mesh_xy, tuple(int(n) for n in data["W_q"].shape[-3:]), sh.W.spec,
+            kind="ifftn", norm="ortho")
+        data["W_R"] = ifft(data["W_q"])
+        data["W_q"] = None      # release the caller-side reference
+    return data["W_R"]
+
+
+def operand_sets(data, mesh_xy, sh, W_R):
+    """The pair applier's operands for the two rows of ``K = [[A, B], [B^H, A']]``.
+
+    Returns ``(up, low)``.  ``up`` are the operands of
+    ``bse_stack_matvec.build_bse_stack_pair_matvec``'s applier after ``(X, s)``
+    (after ``(X, Yc, s)`` with a partner).  ``low`` is None at ``Q = 0``, where
+    the lower row is the conjugate of the upper one.
+
+    A FINITE PAIR MOMENTUM.  The payload's own orbitals are the resonant pair
+    ``(c at k+Q, v at k)``: ``psi_c_*``, ``eps_c`` at ``k+Q``, ``psi_v_*``,
+    ``eps_v`` at ``k``, ``V_q0 = V(Q)``, ``M``.  ``data["partner"]`` holds the
+    antiresonant pair ``(v at k+Q, c at k)`` under the same keys: ``psi_c_X``,
+    ``psi_c_Y``, ``eps_c`` at ``k`` and ``psi_v_X``, ``psi_v_Y``, ``eps_v`` at
+    ``k+Q`` (``M`` is built here when absent).  Both are labelled by ``k``, so
+    the antiresonant pair function ``psi_v(k+Q, r) conj(psi_c(k, r'))`` has
+    the resonant one's Bloch structure and the two encodes add before ONE
+    convolution.  With the orbital sets ``D`` (the payload) and ``P`` (the
+    partner),
+
+        up  = (D.c on x, P.c on y, P.v on x, D.v on y, D.eps_c, D.eps_v, W_R, V,       D.M, P.M)
+        low = (P.c on x, D.c on y, D.v on x, P.v on y, P.eps_c, P.eps_v, W_R, conj(V), P.M, D.M)
+
+        (K z)_upper       = couple(X, Y, 1, *up)
+        conj((K z)_lower) = couple(conj(Y), conj(X), 1, *low)
+
+    The second line is the projection of the same kernel onto the antiresonant
+    pair functions, conjugated; it needs ``W_{mu nu}(q) = conj(W_{nu mu}(q))``
+    and nothing else.  ``K`` is Hermitian when also ``W(q) = conj(W(-q))``
+    (:func:`check_restart_reciprocity`) and ``V(Q)`` is Hermitian.  The lower
+    right block is ``A' = conj(A(-Q))`` in this labelling and the lower left
+    ``B^H``: there is no ``B = B^T`` and no ``+-`` pairing of roots unless a
+    symmetry links ``Q`` and ``-Q``.
+
+    Both conduction diagonals take the exact ``q = 0`` screened head
+    (``head_shifted_eps_c``); the coupling block has none, its overlaps
+    ``<c k+Q|v' k+Q>`` and ``<c' k|v k>`` vanish.  A ``head_tensor`` payload
+    adds ``(D_head, M_head)`` to both sets (the same operands: the head's
+    antiresonant vertex is ``conj(d)`` in both rows).
+    """
+    head = tuple(data.get("head_tensor") or ())
+    partner = data.get("partner")
+    eps_c = head_shifted_eps_c(data["eps_c"], data)
+    if partner is None:
+        return (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
+                eps_c, data["eps_v"], W_R, data["V_q0"], data["M"]) + head, None
+    from .bse_preconditioner import compute_pair_amplitude
+    if partner.get("M") is None:
+        partner["M"] = jax.jit(compute_pair_amplitude, out_shardings=sh.M)(
+            partner["psi_c_X"], partner["psi_v_X"])
+    if partner.get("V_conj") is None:
+        partner["V_conj"] = jax.jit(jnp.conj, out_shardings=sh.V)(data["V_q0"])
+    eps_c_low = head_shifted_eps_c(partner["eps_c"], data)
+    up = (data["psi_c_X"], partner["psi_c_Y"], partner["psi_v_X"], data["psi_v_Y"],
+          eps_c, data["eps_v"], W_R, data["V_q0"], data["M"], partner["M"]) + head
+    low = (partner["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], partner["psi_v_Y"],
+           eps_c_low, partner["eps_v"], W_R, partner["V_conj"], partner["M"], data["M"]) + head
+    return up, low
+
+
+def _operator(data, mesh_xy, sh, *, include_W):
+    """``(pair, up, low)``: the fused pair applier of the payload's operator
+    and its operand sets (:func:`operand_sets`).  With a partner the applier
+    is the coupled one, ``couple(X, Yc, s, *up)``."""
     from .bse_stack_matvec import build_bse_stack_pair_matvec
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     pair = build_bse_stack_pair_matvec(
         mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
-        exchange_channel=data.get("exchange_channel", "singlet"))
-    if include_W:
-        W_ifft = make_kfft_kminor(
-            mesh_xy, (nkx, nky, nkz), sh.W.spec, kind="ifftn", norm="ortho")
-        # W_q is DONATED and the caller-side reference dropped, copied from
-        # ``bse_lanczos``'s W_R build.  Same shape in and out at a real
-        # top-level boundary, so XLA grants the alias and W_R becomes W_q's
-        # buffer instead of a second live tile for the whole non-TDA solve
-        # (56.25 MiB/rank on the Si 4x4x4 deck; 404 MB/rank at mu=10015 /
-        # P=64).  In-jit peak is unchanged — the win is entirely caller-side
-        # (FFT_DONATION_AUDIT.md 2.3).  Value-identical.
-        #
-        # NOTE FOR CALLERS: this CONSUMES ``data["W_q"]``.  That is safe for
-        # every caller today — ``_full_matvec_and_args`` is called exactly
-        # once per solve, and ``bse_lanczos``'s non-TDA dispatch returns
-        # immediately afterwards — but a caller that wants W_q back must pass
-        # its own copy.
-        W_R = jax.jit(W_ifft, donate_argnums=(0,))(data["W_q"])
-        data["W_q"] = None      # release the caller-side reference
-    else:
-        W_R = data["W_q"]
-    # A block takes the exact q=0 head on its diagonal; the coupling block has
-    # none (<c k|v' k> = 0), which is what a head-free W_q gives it.
-    args = (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
-            head_shifted_eps_c(data["eps_c"], data), data["eps_v"], W_R,
-            data["V_q0"], data["M"])
+        exchange_channel=data.get("exchange_channel", "singlet"),
+        head_tensor=data.get("head_tensor") is not None,
+        partner=data.get("partner") is not None)
+    up, low = operand_sets(data, mesh_xy, sh, payload_w_r(data, mesh_xy, sh, include_W=include_W))
+    return pair, up, low
+
+
+def kernel_matvec(couple):
+    """``apply_K(sets, Z)``: the Hermitian ``K`` on pair rows at a finite pair
+    momentum, two calls of the coupled applier (:func:`operand_sets`).
+
+    ``Z`` (b, 2, n_c, n_v, nk) at ``P(None, None, 'x', 'y', None)`` holds
+    ``[X; Y]`` per row; ``sets = (up, low)``.  Returns ``K Z`` in the same
+    layout.  Complex-linear in ``Z``."""
+    def apply_K(sets, Z):
+        up, low = sets
+        X, Y = Z[:, 0], Z[:, 1]
+        one = jnp.ones((Z.shape[0],), jnp.float64)
+        top = couple(X, Y, one, *up)
+        bottom = jnp.conj(couple(jnp.conj(Y), jnp.conj(X), one, *low))
+        return jnp.stack([top, bottom], axis=1)
+    return apply_K
+
+
+def _full_matvec_and_args(data, mesh_xy, sh, *, include_W):
+    """The fused pair applier of the optical non-TDA operator at ``Q = 0`` and
+    its operands.
+
+    ``pair(X, s, *args) = A X + s B conj(X)`` (``bse_stack_matvec.
+    build_bse_stack_pair_matvec``); the dense build and the matrix-free route
+    both read the operator through it.  CONSUMES ``data["W_q"]`` and leaves
+    ``data["W_R"]`` (:func:`payload_w_r`)."""
+    if data.get("partner") is not None:
+        raise ValueError("_full_matvec_and_args serves Q = 0; a payload with a partner "
+                         "(finite Q) goes through _operator")
+    pair, args, _ = _operator(data, mesh_xy, sh, include_W=include_W)
     return pair, args
 
 
@@ -328,6 +416,38 @@ def _materialize_A_B(pair, args, sh, nc, nv, nk, *, col_chunk=_DENSE_COL_CHUNK):
     return A_out, B_out
 
 
+def _materialize_K(couple, up, low, sh, nc, nv, nk, *, col_chunk=_DENSE_COL_CHUNK):
+    """The dense blocks ``(A, B, B_low, A_low)`` of ``K = [[A, B], [B_low, A_low]]``
+    at a finite pair momentum, from the coupled applier on identity columns.
+
+    One chunk ``E`` of real identity columns gives all four blocks' columns in
+    two calls (:func:`operand_sets`): ``couple([E; 0], [0; E], 1, *up) =
+    [A E; B E]`` and ``conj(couple([0; E], [E; 0], 1, *low)) = [B_low E;
+    A_low E]``.  ``B_low`` is MEASURED, not set to ``B^H``: the two rows come
+    from different operand sets, and :func:`solve_nontda_definite_pencil`
+    refuses when they disagree."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from lxkit import device_put_process_local
+    N = nc * nv * nk
+    if N > _DENSE_N_MAX:
+        raise ValueError(_dense_refusal(N))
+    to_host = jax.jit(lambda a: a, out_shardings=NamedSharding(sh.X.mesh, P()))
+    eye = np.eye(N, dtype=np.complex128).reshape(N, nc, nv, nk)
+    blocks = [np.empty((N, N), dtype=np.complex128) for _ in range(4)]
+    for c0 in range(0, N, int(col_chunk)):
+        blk = eye[c0:c0 + int(col_chunk)]
+        b = blk.shape[0]
+        E0 = device_put_process_local(np.concatenate([blk, np.zeros_like(blk)], axis=0), sh.X)
+        Z0 = device_put_process_local(np.concatenate([np.zeros_like(blk), blk], axis=0), sh.X)
+        one = jnp.ones((2 * b,))
+        top = np.asarray(to_host(couple(E0, Z0, one, *up)).addressable_data(0)).reshape(2 * b, N)
+        bot = np.conj(np.asarray(to_host(couple(Z0, E0, one, *low)).addressable_data(0))
+                      ).reshape(2 * b, N)
+        blocks[0][:, c0:c0 + b], blocks[1][:, c0:c0 + b] = top[:b].T, top[b:].T
+        blocks[2][:, c0:c0 + b], blocks[3][:, c0:c0 + b] = bot[:b].T, bot[b:].T
+    return tuple(blocks)
+
+
 def _recover_xy(Z, N, n_eig):
     """Sigma-normalise Z=[X;Y] so X^H X - Y^H Y = +1; return (n_eig, 2, ...)-ready."""
     Xh, Yh = Z[:N], Z[N:]
@@ -364,13 +484,19 @@ def refuse_asymmetric_coupling(B, *, tol=_B_SYM_TOL) -> float:
     return b_sym
 
 
-def solve_nontda_definite_pencil(A, B, n_eig, *, pd_rtol=1e-10):
+def solve_nontda_definite_pencil(A, B, n_eig, *, pd_rtol=1e-10, lower=None):
     """Dense structure-preserving solve of K z = omega Sigma z (host numpy).
 
     K = [[A,B],[B*,A*]] Hermitian; assert PD (else triplet/charge instability —
     (A-B) not positive definite => imaginary excitations; detected, not hidden).
     Refuses an A that is not Hermitian and a B that is not complex symmetric
     (:func:`refuse_asymmetric_coupling`) before it symmetrises K.
+
+    ``lower = (B_low, A_low)``: the general pencil of a finite pair momentum,
+    ``K = [[A, B], [B_low, A_low]]`` with the lower blocks as measured
+    (:func:`_materialize_K`).  ``A`` and ``A_low`` must be Hermitian and
+    ``B_low = B^H`` (``GATE nontda_lower_row``); ``B`` has no symmetry there
+    and the roots returned are those of positive type, ``z^H Sigma z > 0``.
 
     The reduction is the Cholesky form of Shao, da Jornada, Yang, Deslippe and
     Louie, Linear Algebra Appl. 488 (2016) 148, Algorithm 1, on the complex
@@ -411,8 +537,26 @@ def solve_nontda_definite_pencil(A, B, n_eig, *, pd_rtol=1e-10):
             f"regenerate the restart with `python3 -u -m gw.gw_jax -i <deck>.in`. "
             f"The threshold is NOT the thing to move: it is a structural "
             f"property of the operator, not a convergence tolerance.")
-    refuse_asymmetric_coupling(B)
-    K = np.block([[A, B], [B.conj(), A.conj()]])
+    if lower is None:
+        refuse_asymmetric_coupling(B)
+        K = np.block([[A, B], [B.conj(), A.conj()]])
+    else:
+        B_low, A_low = (np.asarray(x) for x in lower)
+        scale = max(np.linalg.norm(A), 1e-300)
+        low_herm = np.linalg.norm(A_low - A_low.conj().T) / max(np.linalg.norm(A_low), 1e-300)
+        adjoint = np.linalg.norm(B_low - B.conj().T) / scale
+        if low_herm > 1e-6 or adjoint > 1e-6:
+            raise ValueError(
+                f"GATE nontda_lower_row: the lower row of K = [[A, B], [B_low, A_low]] at a finite "
+                f"pair momentum does not close the Hermitian pencil (got: ||A_low - A_low^H|| / "
+                f"||A_low|| = {low_herm:.2e}, ||B_low - B^H|| / ||A|| = {adjoint:.2e}; want: both "
+                f"<= 1e-6).  Why: the two rows are built from the payload's and the partner's "
+                f"orbitals with one kernel; they disagree when W is not conjugate-reciprocal "
+                f"(check_restart_reciprocity), V(Q) is not Hermitian, or the partner orbitals are "
+                f"not the payload's bands at the other momentum.  Fix: check data['partner'] "
+                f"(bse_nontda.operand_sets) and the restart's W.  The threshold is structural, "
+                f"not a convergence tolerance.")
+        K = np.block([[A, B], [B_low, A_low]])
     K = 0.5 * (K + K.conj().T)                       # round-off cleanup, after the gates
     w = np.linalg.eigvalsh(K)                        # the definiteness gate's measurement
     if w.min() <= pd_rtol * max(w.max(), 1e-300):
@@ -693,13 +837,19 @@ def _solve_nontda_davidson(pair, args, data, mesh_xy, sh, n_eig, *, include_W, w
                            davidson_tol_mev, davidson_max_iter, davidson_m_max,
                            davidson_margin, davidson_margin_tol_mev, davidson_precond,
                            davidson_eps_shift_Ry, davidson_n_random_init, on_indefinite,
-                           davidson_plan_key):
+                           davidson_plan_key, low=None):
     """Lowest ``n_eig`` (omega, X, Y) by the structure-preserving Davidson.
 
-    ``pair`` and ``args`` are the fused pair applier and its 9 operands
-    (:func:`_full_matvec_and_args`, the caller's ``include_W``); ``w_q0`` is
+    ``pair`` and ``args`` are the fused pair applier and its operands
+    (:func:`_operator`, the caller's ``include_W``); ``w_q0`` is
     the ``q = 0`` slice of ``W_q`` for the exact diagonal (None without W or
     with the bare diagonal).  The options are ``solve_bse_nontda_sharded``'s.
+
+    ``low`` (the partner's operand set, :func:`operand_sets`) selects the
+    finite-momentum solve: ``pair`` is then the coupled applier, the operator
+    is ``K`` on pair rows (:func:`kernel_matvec`) and the solver runs its
+    unpaired form.  The diagonal of ``H`` is ``[D; -D_low]`` there, ``D_low``
+    the diagonal of ``A'``, the Tamm-Dancoff diagonal of the partner's set.
 
     Returns ``(omega_Ry (n_eig,) host, pairs (n_eig, 2, nc, nv, nk) on
     P(None, None, 'x', 'y', None), info)``; the snapshot is :data:`LAST_DAVIDSON`.
@@ -716,26 +866,28 @@ def _solve_nontda_davidson(pair, args, data, mesh_xy, sh, n_eig, *, include_W, w
     nc, nv = int(data["n_cond_pad"]), int(data["n_val_pad"])
     n_cond, n_val = int(data["n_cond"]), int(data["n_val"])
     channel = data.get("exchange_channel", "singlet")
-    if data.get("head_tensor") is not None:
-        raise ValueError(
-            "GATE nontda_head_tensor: the full-BSE pair applier has no head-tensor term "
-            "(got: a payload with head_tensor; want: none).  Why: the head would be dropped "
-            "from A and B without a word.  Fix: solve this payload with the Tamm-Dancoff "
-            "Davidson (full_bse = false).")
+    paired = low is None
 
     # The diagonal of H = [[A, B], [-B*, -A*]] is [D; -D], D the diagonal of A
     # (bse_davidson_helpers.bse_pair_diagonal_precond): the Tamm-Dancoff one.
+    # At a finite pair momentum it is [D; -D_low].
     route = resolve_precond_route(davidson_precond, nc * nv * nk)
     diag_sh = NamedSharding(mesh_xy, P("x", "y", None))
-    diag = None
+    diag = diag_low = None
     if route == "exact":
         diag = build_bse_exact_diagonal(eps_c, eps_v, psi_c_X, psi_v_Y, w_q0, M, V_q0, nk,
                                         sharding=diag_sh, exchange_channel=channel)
+        if not paired:
+            diag_low = build_bse_exact_diagonal(
+                low[4], low[5], low[0], low[3], w_q0, low[8], low[7], nk, sharding=diag_sh,
+                exchange_channel=channel, memo=False)
     log.info("full-BSE Davidson preconditioner: " + (
         f"exact diagonal of A, dE + (V_x{' - W_d' if include_W else ''})/nk" if route == "exact"
-        else "bare dE") + ", paired as [D; -D]")
-    pre = bse_pair_diagonal_precond(eps_c, eps_v, epsilon_shift=float(davidson_eps_shift_Ry),
-                                    sharding=diag_sh, diag_H=diag)
+        else "bare dE") + (", paired as [D; -D]" if paired else
+                           ", with the partner's diagonal as [D; -D_low] (finite pair momentum)"))
+    pre = bse_pair_diagonal_precond(
+        eps_c, eps_v, epsilon_shift=float(davidson_eps_shift_Ry), sharding=diag_sh, diag_H=diag,
+        low=None if paired else (low[4], low[5], diag_low))
 
     # Margin roots and the start block on the physical transitions, as the
     # Tamm-Dancoff route builds them.
@@ -743,18 +895,27 @@ def _solve_nontda_davidson(pair, args, data, mesh_xy, sh, n_eig, *, include_W, w
     n_solve = n_eig + max(0, min(int(davidson_margin), n_phys // 2 - n_eig))
     X0 = init_bse_subspace(eps_c, eps_v, n_eig=n_solve, n_cond=n_cond, n_val=n_val,
                            n_random=int(davidson_n_random_init), mesh=mesh_xy, sharding=sh.X)
-    cap = basis_capacity(davidson_m_max, n_solve, n_eig, nc * nv * nk)
+    cap = basis_capacity(davidson_m_max, n_solve, n_eig, nc * nv * nk, paired=paired)
+    stored = (2 if paired else 4) * cap
     log.info(f"full-BSE Davidson: {n_eig} roots + {n_solve - n_eig} margin"
              + ("" if davidson_margin_tol_mev is None else
                 f" (locked at {float(davidson_margin_tol_mev):g} meV)")
-             + f", basis capacity {cap} real-form vectors, storing {2 * cap} trial vectors "
-               f"(basis and images); instability: {on_indefinite}")
-    _price_davidson_basis(cap, X0, mesh_xy)
+             + f", basis capacity {cap} {'real-form' if paired else 'pair'} vectors, storing "
+               f"{stored} trial vectors (basis and images); instability: {on_indefinite}"
+             + ("" if paired else "; finite pair momentum: the unpaired form, K on [X; Y]"))
+    _price_davidson_basis(stored // 2, X0, mesh_xy)
     tol_ry = float(davidson_tol_mev) / ry_mev
+    if paired:
+        apply = lambda payload, Z, s: pair(Z, s, *payload[0])                 # noqa: E731
+        operands = args
+    else:
+        apply_K = kernel_matvec(pair)
+        apply = lambda payload, Z: apply_K(payload[0], Z)                     # noqa: E731
+        operands = (args, low)
     omega, X, Y, info = sp_davidson(
-        lambda payload, Z, s: pair(Z, s, *payload[0]), X0,
+        apply, X0, paired=paired,
         precondition=lambda payload, RX, RY, om: pre.apply(payload[1], RX, RY, om),
-        data=(args, pre.data), n_converge=n_eig, capacity=cap, max_iter=int(davidson_max_iter),
+        data=(operands, pre.data), n_converge=n_eig, capacity=cap, max_iter=int(davidson_max_iter),
         tol=tol_ry, lock_converged=True,
         margin_lock=(1.0 if davidson_margin_tol_mev is None else
                      max(1.0, float(davidson_margin_tol_mev) / float(davidson_tol_mev))),
@@ -768,7 +929,7 @@ def _solve_nontda_davidson(pair, args, data, mesh_xy, sh, n_eig, *, include_W, w
                         "stale restart and assembles A and B to compare with A = A^H, B = B^T."},
         plan_key=(None if davidson_plan_key is None else (
             davidson_plan_key, mesh_xy, bool(include_W), channel, route,
-            float(davidson_eps_shift_Ry),
+            float(davidson_eps_shift_Ry), paired, data.get("head_tensor") is not None,
             tuple((tuple(a.shape), str(a.dtype)) for a in args))))
 
     line = refuse_unconverged_davidson(info, n_eig=n_eig, tol_mev=float(davidson_tol_mev),
@@ -928,19 +1089,32 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
         # Before the transform below consumes W_q: the exact diagonal's slice.
         from .bse_davidson_helpers import w_q0_for_precond
         w_q0 = w_q0_for_precond(data)
-    pair, args = _full_matvec_and_args(data, mesh_xy, sh, include_W=include_W)
+    pair, args, low = _operator(data, mesh_xy, sh, include_W=include_W)
     N = nc * nv * nk
     if solver == "davidson":
         from common.collectives import replicate_to_mesh
         omega, pairs, info = _solve_nontda_davidson(
-            pair, args, data, mesh_xy, sh, n_eig, include_W=include_W, w_q0=w_q0, **opts)
+            pair, args, data, mesh_xy, sh, n_eig, include_W=include_W, w_q0=w_q0, low=low, **opts)
         return (replicate_to_mesh(np.asarray(omega), mesh_xy), pairs,
                 jnp.int32(int(info["iterations"])))
     if solver == "matrixfree":
+        if low is not None or data.get("head_tensor") is not None:
+            raise ValueError(
+                "GATE nontda_route_option: the matrix-free Lanczos cannot honour a finite pair "
+                "momentum or a head tensor (got: a payload with "
+                + ("a partner" if low is not None else "head_tensor")
+                + "; want: neither).  Why: its recurrence is built on F(x) = A x + B conj(x) "
+                  "with nine operands.  Fix: solver='davidson' or solver='dense'.")
         omega, Z = _solve_nontda_matrix_free(
             pair, mesh_xy, sh, args, nc, nv, nk, n_eig,
             m_max=opts["mf_m_max"], n_keep=opts["mf_n_keep"],
             n_restarts=opts["mf_n_restarts"], tol_mev=opts["mf_tol_mev"], log=_log0)
+        evecs = np.stack([Z[:N, :].T.reshape(n_eig, nc, nv, nk),
+                          Z[N:, :].T.reshape(n_eig, nc, nv, nk)], axis=1)
+        return jnp.asarray(omega), _on_mesh(evecs, mesh_xy), jnp.int32(0)
+    if low is not None:
+        A, B, B_low, A_low = _materialize_K(pair, args, low, sh, nc, nv, nk)
+        omega, Z = solve_nontda_definite_pencil(A, B, n_eig, lower=(B_low, A_low))
         evecs = np.stack([Z[:N, :].T.reshape(n_eig, nc, nv, nk),
                           Z[N:, :].T.reshape(n_eig, nc, nv, nk)], axis=1)
         return jnp.asarray(omega), _on_mesh(evecs, mesh_xy), jnp.int32(0)

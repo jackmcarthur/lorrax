@@ -621,9 +621,16 @@ def bse_pair_diagonal_precond(
     epsilon_shift: float = 1e-3,
     sharding: Optional[NamedSharding] = None,
     diag_H=None,
+    low=None,
 ):
     """The full-BSE counterpart of :func:`bse_diagonal_precond`: the paired
     correction ``[t_X; t_Y] = (H_D - omega)^-1 [R_X; R_Y]``.
+
+    ``low = (eps_c_low, eps_v_low, diag_low)`` is the finite-momentum form:
+    the lower-right block of ``H`` is ``-A'`` with its own diagonal ``D_low``
+    (the antiresonant pair's energies, ``bse_nontda.operand_sets``), so
+    ``H_D = diag(D, -D_low)`` and ``t_Y = -R_Y / (D_low + omega + eps)``.
+    ``diag_low`` is that set's exact diagonal or None for its bare ``dE``.
 
     ``H_D = diag(D, -D)`` is the diagonal of the full operator
     ``H = [[A, B], [-B*, -A*]]``: ``A`` is Hermitian, so its diagonal ``D`` is
@@ -663,14 +670,18 @@ def bse_pair_diagonal_precond(
     from .bse_preconditioner import energy_diff_cv_k
     divide = sp_diagonal_precond(epsilon_shift=epsilon_shift)
 
-    def _apply(data, RX, RY, omega):
-        eps_c_in, eps_v_in, diag_in = data
+    def _diagonal(eps_c_in, eps_v_in, diag_in):
         D = energy_diff_cv_k(eps_c_in, eps_v_in) if diag_in is None else diag_in
-        if sharding is not None:
-            D = jax.lax.with_sharding_constraint(D, sharding)
-        return divide(D, RX, RY, omega)
+        return D if sharding is None else jax.lax.with_sharding_constraint(D, sharding)
 
-    return BSEDiagonalPreconditioner((eps_c, eps_v, diag_H), _apply)
+    def _apply(data, RX, RY, omega):
+        D = _diagonal(*data[:3])
+        if len(data) == 3:
+            return divide(D, RX, RY, omega)
+        return divide((D, _diagonal(*data[3:])), RX, RY, omega)
+
+    return BSEDiagonalPreconditioner(
+        (eps_c, eps_v, diag_H) + (() if low is None else tuple(low)), _apply)
 
 
 __all__ = ["init_bse_subspace", "bse_diagonal_precond", "BSEDiagonalPreconditioner",

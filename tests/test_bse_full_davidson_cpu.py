@@ -447,9 +447,12 @@ def test_options_the_route_cannot_honour_refuse(ops):
         solve_bse_nontda_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, solver="davidson", davidson_tolmev=1.0)
     with pytest.raises(ValueError, match="GATE nontda_route_option"):
         solve_bse_nontda_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, solver="lanczos")
-    with pytest.raises(ValueError, match="GATE nontda_head_tensor"):
+    # A head_tensor payload is solved by the dense and Davidson routes
+    # (tests/test_bse_full_finite_q_cpu.py); the matrix-free Lanczos, which has
+    # no head term, refuses it.
+    with pytest.raises(ValueError, match="GATE nontda_route_option"):
         solve_bse_nontda_sharded(dict(_payload(mesh, ops), head_tensor=(None, None)), mesh, n_eig=N_EIG,
-                                 solver="davidson")
+                                 solver="matrixfree")
     # through solve_bse_sharded: what the Tamm-Dancoff Davidson has and this route has not
     for kw, want in ((dict(davidson_olsen=True), "davidson_olsen"), (dict(keep_W_R=True), "keep_W_R"),
                      (dict(full_solver="trlan"), "full_solver='trlan'")):
