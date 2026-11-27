@@ -12,8 +12,8 @@ positive definite ``K = [[A, B], [B*, A*]]``, ``numpy.linalg.eig`` of ``H`` othe
    pairs are Sigma-orthonormal (``X_i^H X_j - Y_i^H Y_j = delta_ij``), solve ``H z = omega z``, span the
    oracle's eigenspace in every multiplet, and ``lam_min`` is at or above ``lam_min(K)``.  An unsharded
    start block takes the one-device plan and gives the same roots.
-2. Soft modes (``lam_min(K)`` = 1e-6, 1e-9, 1e-11 Ry): the soft root and the roots above it, and the
-   stability margin the solve reports.
+2. Soft modes (``lam_min(K)`` = 1e-6, 1e-9, 1e-11 Ry): the soft root and the roots above it within
+   1e-10 eV of the oracle's solve of the same matrices, and the stability margin the solve reports.
 3. ``K`` not positive definite.  The default refuses (``GATE sp_davidson_definite``) with the measured
    ``lam_min`` and the option that continues; ``on_indefinite='continue'`` returns the imaginary root of
    the oracle's indefinite pencil and the real roots above it.  The same for a real root of positive type
@@ -186,14 +186,21 @@ def test_soft_mode_and_stability_margin(k_min):
     p = orc.near_singular_pencil(n=N, eps=k_min)
     omega, X, Y, info = _solve(p["A"], p["B"], _mesh(2), capacity=N)
     assert info["status"] == spd.CONVERGED
-    err = np.abs(omega[:N_EIG] - p["omega_exact"][:N_EIG])
+    # The reference is the oracle's Cholesky solve of the SAME matrices.  The generator's analytic
+    # value is printed beside it: omega^2 is what the matrix entries determine, so the soft root of
+    # the stored matrices sits within eps |A| / (2 omega_1) of it (5e-10 eV at lam_min = 1e-9 Ry),
+    # for the dense oracle exactly as for this solver.
+    ref = orc.reference_roots(p["A"], p["B"], pd_rtol=1e-14)
+    err = np.abs(omega[:N_EIG] - ref["omega"][:N_EIG]) * RY_EV
+    gen = np.abs(omega[0] - p["omega_exact"][0]) * RY_EV
+    ora = np.abs(ref["omega"][0] - p["omega_exact"][0]) * RY_EV
     y2 = float(np.sum(np.abs(Y[:, 0]) ** 2))
-    print(f"MEASURED soft mode lam_min(K) = {k_min:g} Ry: omega_1 = {omega[0]:.6e} Ry, error {err[0]:.2e} Ry, "
-          f"roots above {err[1:].max():.2e} Ry, |Y_1|^2 = {y2:.3e}, reported lam_min {info['lam_min']:.6e} Ry, "
-          f"Sigma error {info['sigma_err']:.1e}", flush=True)
-    assert np.max(err[1:]) * RY_EV <= ROOT_TOL_EV
-    # the soft root itself: its absolute accuracy degrades like 1/omega_1 (omega^2 is what is conditioned)
-    assert err[0] <= 1e-9
+    print(f"MEASURED soft mode lam_min(K) = {k_min:g} Ry: omega_1 = {omega[0]:.6e} Ry, |Y_1|^2 = {y2:.3e}; "
+          f"against the dense oracle: soft root {err[0]:.2e} eV, roots above {err[1:].max():.2e} eV; against the "
+          f"generator's analytic soft root: {gen:.2e} eV (the dense oracle: {ora:.2e} eV); reported lam_min "
+          f"{info['lam_min']:.6e} Ry, Sigma error {info['sigma_err']:.1e}", flush=True)
+    assert np.max(err) <= ROOT_TOL_EV, err
+    assert gen <= 10 * ora + ROOT_TOL_EV                                # no worse than the oracle itself
     assert abs(info["lam_min"] - k_min) <= 1e-4 * k_min + 1e-15       # the margin, with no extra pair call
     assert info["lam_min"] > info["pd_floor"] and info["indefinite_at"] is None
     assert info["sigma_err"] <= 1e-9 and y2 > 10.0

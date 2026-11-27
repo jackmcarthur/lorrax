@@ -318,11 +318,16 @@ holds $M_r$ and $S$, $2M^2$ reals.
 
 **Measured, and where** (CPU, JAX 0.12, 2026-11-27; no GPU, no multi-process
 run, no material). On the synthetic pencils of `tests/bse_full_oracle.py` at
-240 transitions the roots are within $5\times10^{-14}$ eV of the dense oracle
-on one device and on four emulated devices, for a positive definite
-$\mathcal K$, soft modes down to $\lambda_{\min}=10^{-11}$ Ry, one or two
-imaginary pairs, a complex quadruplet and a negative real root
-(`tests/test_bse_sp_davidson_cpu.py`). On the 128-transition spinor payload
+240 transitions, on one device and on four emulated devices, the roots are
+within $4\times10^{-14}$ eV of the dense oracle for a positive definite
+$\mathcal K$; within $10^{-11}$ eV, the soft root included, with a soft mode
+down to $\lambda_{\min}=10^{-11}$ Ry; and the unstable roots (one or two
+imaginary pairs, a complex quadruplet, a negative real root) within
+$5\times10^{-12}$ eV (`tests/test_bse_sp_davidson_cpu.py`). The soft root of
+a stored matrix is itself defined only to
+$\varepsilon\lVert A\rVert/2\omega_1$ ($5\times10^{-10}$ eV at
+$\lambda_{\min}=10^{-9}$ Ry): the dense oracle and this solver sit that far
+from the analytic value, together. On the 128-transition spinor payload
 (8 roots and 8 margin roots, 0.01 meV) it takes 15 iterations and 436 pair
 calls, 54.5 per root, against 207 applications of $A$, 25.9 per root, for the
 planned Davidson on the Tamm–Dancoff problem (a factor 2.1), and 22.2 to 35.2
