@@ -320,14 +320,11 @@ def solve_bse_sharded(
     # It costs 1/64 of one W_q and is dropped with the payload.
     _need_W_q0 = (include_W and solver_kind == "davidson"
                   and davidson_precond == "exact")
-    if _need_W_q0 and data.get("_W_q0_for_precond") is None:
-        if data.get("W_q") is None:
-            raise ValueError(
-                "davidson_precond exact needs the q=0 slice of W_q, but "
-                "this payload's W_q has already been consumed by the donated "
-                "ifft and no slice was stashed.  Reload the payload.")
-        data["_W_q0_for_precond"] = data["W_q"][:, :, 0, 0, 0]
-    _W_q0 = data.get("_W_q0_for_precond") if _need_W_q0 else None
+    if _need_W_q0:
+        from .bse_davidson_helpers import w_q0_for_precond
+        _W_q0 = w_q0_for_precond(data)
+    else:
+        _W_q0 = None
 
     # ── W_R = ifft_q(W_q) at a REAL top-level dispatch boundary, W_q DONATED ──
     # This used to run INSIDE ``_full_run`` (and inside the Davidson block).
