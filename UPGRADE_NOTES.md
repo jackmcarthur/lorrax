@@ -7,8 +7,8 @@ The binding rulings behind breaking changes are in
 
 ## 2026-11-27 — Full BSE: a structure-preserving Davidson (`full_bse_solver = davidson`), unstable roots reported, dense reference in Cholesky form
 
-`full_bse = true` runs what it ran: the dense structure-preserving solve,
-N ≤ 4096. The new input key `full_bse_solver = davidson` selects a
+`full_bse = true` runs the dense structure-preserving solve it ran before,
+N ≤ 4096, with two new refusals (below). The new input key `full_bse_solver = davidson` selects a
 structure-preserving block Davidson for the full problem instead
 (`solvers.bse_sp_davidson` through `bse_nontda`): no assembly of $A$ and $B$,
 no size limit, the lowest `number_eigenvalues` roots with their $(X, Y)$,
@@ -58,6 +58,20 @@ soft locking, restarts under a priced basis, a residual stop.
   `trlan_*` key; `full_bse_instability` with the dense solver; either new key
   without `full_bse = true`. The dense size refusal (`GATE nontda_dense_size`)
   now names `full_bse_solver = davidson`.
+- **Input files that ran before and now stop at parse (`full_bse = true`,
+  dense route).** The dense solve reads `number_eigenvalues` and the kernel
+  only. An input file that sets `davidson_margin`, `davidson_margin_tol_mev`,
+  `davidson_m_max`, `davidson_precond`, `davidson_eps_shift`, `davidson_olsen`,
+  `lanczos_rtol`, `lanczos_check_every`, `lanczos_n_reorth`, `trlan_m_max` or
+  `trlan_n_keep` away from its default used to run with the key ignored; it now
+  stops with the key named. Drop the key, or set
+  `full_bse_solver = davidson` (which reads the `davidson_*` keys above except
+  `davidson_olsen`), or set `full_bse = false`.
+- **A new refusal on the dense solves.** `GATE nontda_coupling_symmetric`: both
+  `solve_nontda_definite_pencil` and `solve_nontda_product` stop when the
+  coupling block has $\lVert B - B^{\mathsf T}Vert / \lVert BVert$ above
+  $10^{-6}$. They used to symmetrise $\mathcal K$ (or $A \pm B$) as round-off
+  clean-up and return the roots of $(B + B^{\mathsf T})/2$ without saying so.
 - **Python callers.** `bse_nontda.solve_bse_nontda_sharded` takes each
   route's options only: `mf_*` with `solver='dense'` used to be accepted and
   ignored and now refuses (`GATE nontda_route_option`).
@@ -73,7 +87,7 @@ soft locking, restarts under a priced basis, a residual stop.
   without an input key) 22.2 to 35.2 pair calls per root. Not yet run: a GPU,
   more than one process, a material. The hsuite has no full-BSE row.
 
-Nothing to change in input files. Tests: `tests/test_bse_sp_davidson_cpu.py`,
+Input files: only the ones named under "stop at parse" need a change. Tests: `tests/test_bse_sp_davidson_cpu.py`,
 `tests/test_bse_full_davidson_cpu.py`, `tests/test_bse_full_oracle_cpu.py`.
 
 ## 2026-11-22 — epsmat export/projection and finite-q dipoles read per run, not per q; `--iq-list` default
@@ -101,7 +115,7 @@ files). The file layouts do not change.
   full-zone k count and raised `IndexError` on a symmetry-reduced WFN. An
   index past the stored q refuses (`GATE dipole_finite_q_iq_list`).
 
-Nothing to change in input files. Tests: `tests/test_epsmat_batched_io.py`
+Input files: only the ones named under "stop at parse" need a change. Tests: `tests/test_epsmat_batched_io.py`
 and `tests/test_finite_q_k_tiles.py` (P4 scripts),
 `tests/test_dipole_iq_list_cpu.py`.
 
@@ -135,7 +149,7 @@ and `tests/test_finite_q_k_tiles.py` (P4 scripts),
   opened it with `"w"` before); a failed write raises on every rank at once
   (`GATE io_global_commit`).
 
-Nothing to change in input files. Tests: `tests/test_io_hazards.py` (P4
+Input files: only the ones named under "stop at parse" need a change. Tests: `tests/test_io_hazards.py` (P4
 script), `tests/test_tdgw_checkpoint_interrupt_cpu.py`,
 `tests/test_tdgw_checkpoint_crash_cpu.py` (file size, SIGKILL),
 `tests/tdagw/test_checkpoint_restart_cpu.py` (restart from both formats).
