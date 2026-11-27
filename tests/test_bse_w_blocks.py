@@ -13,8 +13,11 @@ the fused one), and requires ``max|a - b| <= 1e-12 * max|b|`` against
   ``T[k,t,μ,s,ν] = Σ_cv ψ_c[k,c,t,μ] conj(ψ_v[k,v,s,ν]) X[c,v,k]``, sharing no code with either.
 
 Usages: the TDA matvec (``build_bse_stack_matvec``), the TD-aGW model's application of the same
-W term to a density matrix (both legs the whole window, one trial), and the non-TDA pair
-applier fused and unfused (``build_bse_stack_pair_matvec``); spinor counts 1 and 2; block widths
+W term to a density matrix (both legs the whole window, one trial), the non-TDA pair
+applier (``build_bse_stack_pair_matvec``) and its coupled form of a finite pair momentum
+(``partner=True``: an independent antiresonant block and four independent orbital sets, c(k+Q) on
+μ and v(k) on ν for the resonant encode, v(k+Q) on μ and c(k) on ν for the antiresonant one);
+spinor counts 1 and 2; block widths
 with remainders (29 = 8 + 8 + 8 + 5 rows per rank, the last block clamped onto its neighbour).
 Red twins: a plan with one μ block dropped, and one whose W_R block start is off by one row; the
 same check must report both.  The over-budget case lowers the device budget below the W term's
@@ -79,19 +82,26 @@ def _w_reference_B(Xb, pcX, pvX, pcY, pvY, W_R, kgrid):
     return np.einsum("kctM,kvsN,bktMsN->bcvk", np.conj(pcX), pvY, U.reshape(shape)) / np.sqrt(nk)
 
 
-def _operands(rng, n_c, n_v, ns, n_trials, td_model=False):
-    """Host operands: X, ψ_c, ψ_v, W_R.  ``td_model``: one ψ set on both legs (the TD window)."""
+def _operands(rng, n_c, n_v, ns, n_trials, td_model=False, partner=False):
+    """Host operands: X, ψ_c, ψ_v, W_R.  ``td_model``: one ψ set on both legs (the TD window).
+    ``partner``: the coupling encode's legs (ψ_c on ν, ψ_v on μ) are orbital sets of their own and
+    the antiresonant block ``Yc`` is independent of X (a finite pair momentum)."""
     import numpy as np
     nk = int(np.prod(KGRID))
     cplx = lambda *s: rng.standard_normal(s) + 1j * rng.standard_normal(s)
     pc = cplx(nk, n_c, ns, N_MU)
     pv = pc.copy() if td_model else cplx(nk, n_v, ns, N_MU)
-    return dict(X=cplx(n_trials, n_c, n_v, nk), pc=pc, pv=pv, pcY=pc.copy(), pvX=pv.copy(),
+    X = cplx(n_trials, n_c, n_v, nk)
+    return dict(X=X, pc=pc, pv=pv,
+                pcY=cplx(nk, n_c, ns, N_MU) if partner else pc.copy(),
+                pvX=cplx(nk, n_v, ns, N_MU) if partner else pv.copy(),
+                Yc=cplx(n_trials, n_c, n_v, nk) if partner else np.conj(X),
                 W_R=cplx(N_MU, N_MU, *KGRID))
 
 
 def _apply(mesh, ops, *, pair=None):
-    """``-W X`` (pair: ``-(W_A X + s W_B conj X)``) from the matvec on ``mesh``, gathered to host."""
+    """``-W X`` (pair ``(partner, s)``: ``-(W_A X + s W_B Yc)``, ``Yc = conj X`` without a partner)
+    from the matvec on ``mesh``, gathered to host."""
     import jax
     import numpy as np
     from jax.experimental import multihost_utils
@@ -109,9 +119,14 @@ def _apply(mesh, ops, *, pair=None):
     if pair is None:
         out = B.build_bse_stack_matvec(mesh, *KGRID, kernel="bse")(X, *args)
     else:
-        fuse, s = pair
-        out = B.build_bse_stack_pair_matvec(mesh, *KGRID, kernel="bse", fuse=fuse)(
-            X, put(np.asarray(s, complex), P()), *args)
+        partner, s = pair
+        if partner:
+            out = B.build_bse_stack_pair_matvec(mesh, *KGRID, kernel="bse", partner=True)(
+                X, put(ops["Yc"], P(None, "x", "y", None)), put(np.asarray(s, complex), P()),
+                *args, args[-1])
+        else:
+            out = B.build_bse_stack_pair_matvec(mesh, *KGRID, kernel="bse")(
+                X, put(np.asarray(s, complex), P()), *args)
     return np.asarray(multihost_utils.process_allgather(out, tiled=True))
 
 
@@ -176,14 +191,16 @@ def run_cases(mesh, *, xla_reference=False):
     rng = np.random.default_rng(20261016)
     out = {}
     usages = {"tda": dict(n_c=4, n_v=6, n_trials=3), "td_model": dict(n_c=6, n_v=6, n_trials=1, td_model=True),
-              "pair_fused": dict(n_c=4, n_v=6, n_trials=2), "pair_unfused": dict(n_c=4, n_v=6, n_trials=2)}
+              "pair_fused": dict(n_c=4, n_v=6, n_trials=2),
+              "pair_partner": dict(n_c=4, n_v=6, n_trials=2, partner=True)}
     for usage, shape in usages.items():
-        pair = {"pair_fused": (True, -1.0), "pair_unfused": (False, -1.0)}.get(usage)
+        pair = {"pair_fused": (False, -1.0), "pair_partner": (True, -1.0)}.get(usage)
         for ns in (1, 2):
-            ops = _operands(rng, shape["n_c"], shape["n_v"], ns, shape["n_trials"], shape.get("td_model", False))
+            ops = _operands(rng, shape["n_c"], shape["n_v"], ns, shape["n_trials"], shape.get("td_model", False),
+                            shape.get("partner", False))
             ref = -_w_reference(ops["X"], ops["pc"], ops["pv"], ops["W_R"], KGRID)
             if pair is not None:
-                ref = ref - pair[1] * _w_reference_B(np.conj(ops["X"]), ops["pc"], ops["pvX"], ops["pcY"],
+                ref = ref - pair[1] * _w_reference_B(ops["Yc"], ops["pc"], ops["pvX"], ops["pcY"],
                                                      ops["pv"], ops["W_R"], KGRID)
             for route in ("fused", "outer", "xla"):
                 whole = None

@@ -426,7 +426,7 @@ def _fused_decode(fused, L, R, W, pc, pc_t, conj_r):
 
 
 def _pair_blocks(name, conv, fused, kconv, pc_t):
-    """``(block_AB, block_A, block_B)``: the W term on one (μ, ν) block, decoded through (t, μ).
+    """``(block_AB, block_A)``: the W term on one (μ, ν) block, decoded through (t, μ).
 
     ``xs = (X_b, Xb_b, s_b)``: the whole trial, the antiresonant block and its sign; ``mu = (ψ^X_c, ψ^X_v)`` and
     ``nu = (ψ^Y_v, ψ^Y_c)``: the block's slices of the legs (the B encode's leg swap reads ψ^X_v on μ and
@@ -434,8 +434,7 @@ def _pair_blocks(name, conv, fused, kconv, pc_t):
     route's layout (:func:`_w_layout`).  ``block_A`` is the resonant block alone, the
     Tamm-Dancoff W term: it reads ``xs[0]``, ``mu[0]`` and ``nu[0]`` only, so the Tamm-Dancoff
     matvec calls it with ``xs = (X_b,)``, ``mu = (ψ^X_c,)``, ``nu = (ψ^Y_v,)``.  ``block_AB`` is the
-    fused applier's ONE chain of ``T_A + s·T_B`` (legs concatenated along K on the outer load);
-    ``block_B`` is the coupling block alone (the unfused twin runs ``block_A`` and ``block_B``).
+    fused applier's ONE chain of ``T_A + s·T_B`` (legs concatenated along K on the outer load).
     Each returns A (nk, c_full, ns, ν_b) for :func:`_blocked_w_term`.  Route ``xla``: T by
     :func:`_encode_T_A` / :func:`_encode_T_B`, :func:`_xla_conv`; ``outer``: T on the load from
     :func:`_outer_legs`, U stored; ``fused``: :func:`_fused_decode`.
@@ -450,8 +449,7 @@ def _pair_blocks(name, conv, fused, kconv, pc_t):
         def T_B(xs, mu, nu):
             return _encode_T_B(xs[1], nu[1], mu[1])
         return (lambda xs, mu, nu, W: chain(T_A(xs, mu, nu) + xs[2] * T_B(xs, mu, nu), mu, W),
-                lambda xs, mu, nu, W: chain(T_A(xs, mu, nu), mu, W),
-                lambda xs, mu, nu, W: chain(T_B(xs, mu, nu), mu, W))
+                lambda xs, mu, nu, W: chain(T_A(xs, mu, nu), mu, W))
 
     def decode(L, R, cj, mu, W):
         if name == "outer":
@@ -469,9 +467,7 @@ def _pair_blocks(name, conv, fused, kconv, pc_t):
         L_A, R_A, cA = _outer_legs(xs[0], mu[0], nu[0])
         return decode(L_A, R_A, cA, mu, W)
 
-    def block_B(xs, mu, nu, W):
-        return decode(*_outer_legs_B(xs[1], nu[1], mu[1]), False, mu, W)
-    return block_AB, block_A, block_B
+    return block_AB, block_A
 
 
 # ===========================================================================
@@ -785,7 +781,7 @@ def _make_v_term(mesh_xy, pair: bool):
 
 
 def _make_w(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, coupling: bool = False,
-            partner: bool = False, fuse: bool = True):
+            partner: bool = False):
     """The screened direct term as ONE ``shard_map`` over ('x', 'y'): the body of
     the Tamm-Dancoff matvec's W term and of the pair applier's.
 
@@ -793,7 +789,6 @@ def _make_w(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, coupling: bool = Fal
     block alone (:func:`make_w_term`).  ``coupling=True``: ``w(X, sc, psi_c_X,
     psi_c_Y, psi_v_X, psi_v_Y, W_R) -> W_A X + sc W_B conj(X)``, the fused pair;
     with ``partner`` the antiresonant block is an input, ``w(X, Yc, sc, ...)``.
-    ``fuse=False`` is the pair's unfused twin.
 
     The two differ in ONE place, the block the trial scan calls
     (:func:`_pair_blocks`): ``block_A`` on ``(X_b,)`` or ``block_AB`` on
@@ -808,7 +803,7 @@ def _make_w(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, coupling: bool = Fal
     outer_route = _make_outer_router(mesh_xy, (nkx, nky, nkz))
 
     def _blocks(X, k_rank, mu, nu, W_R, operand_dtypes):
-        """Route, block plan and the three block callables of one trace."""
+        """Route, block plan and the two block callables of one trace."""
         psi_c_X = mu[0]
         name, conv, fused = _w_route(outer_route, k_rank, mesh_xy, (nkx, nky, nkz), psi_c_X.shape[1],
             operand_dtypes=operand_dtypes)
@@ -834,7 +829,7 @@ def _make_w(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, coupling: bool = Fal
         # both decided at trace time from the shapes and announced once.
         rank = min(psi_c_X.shape[1], psi_v_Y.shape[1])
         mu, nu = (psi_c_X,), (psi_v_Y,)
-        wterm, (_, block, _) = _blocks(
+        wterm, (_, block) = _blocks(
             X, rank, mu, nu, W_R, (X.dtype, psi_c_X.dtype, psi_v_Y.dtype, W_R.dtype))
 
         def _body(carry, X_b):                       # X_b: (c_full, v_full, nk)
@@ -867,25 +862,18 @@ def _make_w(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, coupling: bool = Fal
         # and no reshard; conv and decode are linear, so one chain serves both
         # blocks.  On the outer-product load (BSEMAX) the fused chain concatenates
         # the two blocks' legs along K, so ONE convolution call forms T_A + s T_B in
-        # shared memory.  The twin runs two chains, summed at the end.
+        # shared memory.
         rank = min(psi_c_X.shape[1], psi_v_Y.shape[1])
-        k_rank = 2 * rank if fuse else rank
         mu, nu = (psi_c_X, psi_v_X), (psi_v_Y, psi_c_Y)
-        wterm, (block_AB, block_A, block_B) = _blocks(
-            X, k_rank, mu, nu, W_R,
+        wterm, (block_AB, _) = _blocks(
+            X, 2 * rank, mu, nu, W_R,
             (X.dtype, psi_c_X.dtype, psi_c_Y.dtype, psi_v_X.dtype, psi_v_Y.dtype, W_R.dtype))
 
         def _body_fused(carry, xs):
             return carry, wterm(mu, nu, partial(block_AB, xs), sqrt_nk)
 
-        def _body_unfused(carry, xs):
-            # THE TWIN.  Two full chains.  Kept only to price the fusion.
-            return carry, (wterm(mu, nu, partial(block_A, xs), sqrt_nk)
-                           + xs[2] * wterm(mu, nu, partial(block_B, xs), sqrt_nk))
-
         # The sign rides the scan with its trial: one call may mix s = +1 and -1.
-        _, WX = lax.scan(_body_fused if fuse else _body_unfused,
-                         None, (X_full, Xb_full, sc), unroll=1)
+        _, WX = lax.scan(_body_fused, None, (X_full, Xb_full, sc), unroll=1)
         return _scatter_trial_block(WX, mesh_xy)
 
     xspec = P(None, "x", "y", None)
@@ -903,7 +891,7 @@ def _make_w(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, coupling: bool = Fal
 
 def _build_applier(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, kernel: str,
                    exchange_channel: str, head_tensor: bool, coupling: bool,
-                   partner: bool = False, fuse: bool = True):
+                   partner: bool = False):
     """The ONE assembly of the BSE operator on a trial stack: ``D``, the exchange
     ``V``, the head tensor and the screened direct term ``W``, for
 
@@ -926,7 +914,7 @@ def _build_applier(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, kernel: str,
     rep = NamedSharding(mesh_xy, P())
     nk = nkx * nky * nkz
     # The screened direct term: one shard_map, a scan over trials.
-    w_term = _make_w(mesh_xy, nkx, nky, nkz, coupling=coupling, partner=partner, fuse=fuse)
+    w_term = _make_w(mesh_xy, nkx, nky, nkz, coupling=coupling, partner=partner)
     v_term = _make_v_term(mesh_xy, pair=coupling)
 
     def _apply(X, Yc, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M, Mb,
@@ -1116,7 +1104,6 @@ def build_bse_stack_pair_matvec(
     nkz: int,
     *,
     kernel: str = "bse",
-    fuse: bool = True,
     exchange_channel: str = "singlet",
     head_tensor: bool = False,
     partner: bool = False,
@@ -1139,13 +1126,6 @@ def build_bse_stack_pair_matvec(
     kernel : {'bse', 'rpa'}
         ``'bse'`` returns ``D + V − W`` on the A block and ``V − W`` on the
         coupling block; ``'rpa'`` drops the screened-direct term from both.
-    fuse : bool
-        ``True`` (the default, and the point of this builder) sums the two
-        encodes before ONE convolution and ONE decode.  ``False`` is the
-        UNFUSED TWIN: two independent conv+decode chains, summed at the end.
-        It is value-identical to 1e-12 and ~1.83x more expensive, and it exists
-        so the fusion identity can be gated and priced against something rather
-        than asserted.  Do not ship ``fuse=False``.
     head_tensor : bool
         Add the cell-averaged exchange head to both blocks, with two more
         runtime operands ``(D_head, M_head)`` (the Tamm-Dancoff matvec's,
@@ -1183,7 +1163,7 @@ def build_bse_stack_pair_matvec(
     """
     return _build_applier(mesh_xy, nkx, nky, nkz, kernel=kernel,
                           exchange_channel=exchange_channel, head_tensor=head_tensor,
-                          coupling=True, partner=partner, fuse=fuse)
+                          coupling=True, partner=partner)
 
 
 # ===========================================================================
