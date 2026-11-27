@@ -47,3 +47,31 @@ def test_full_bse_refuses_unread_eigensolver_keys(line, key, capsys):
     assert f"`{key}`" in err and "not read by full_bse = true" in err
     if key.startswith("davidson"):
         bse_jax.parse_args(["-i", _toy_deck([line])])             # the default route reads it
+
+
+@pytest.mark.parametrize("route", ("full_bse = true", "full_bse = true\nfull_bse_solver = davidson"))
+@pytest.mark.parametrize("line, key, instead", [
+    ("solver = block_lanczos", "solver", "full_bse_solver"), ("solver = trlan", "solver", "full_bse_solver"),
+    ("block_size = 4", "block_size", "Lanczos block")])
+def test_full_bse_refuses_the_shared_keys_no_full_route_reads(route, line, key, instead, capsys):
+    """``solver`` and ``block_size`` are shared with the other BSE drivers, which the unread-key rule
+    leaves alone; neither full-BSE route reads them (``block_size`` used to divide the Davidson iteration
+    cap).  The refusal names what to set instead, and the Tamm-Dancoff run still reads both."""
+    with pytest.raises(SystemExit):
+        bse_jax.parse_args(["-i", _toy_deck(route.split("\n") + [line])])
+    err = capsys.readouterr().err
+    assert f"`{key}`" in err and "not read by full_bse = true" in err and instead in err
+    bse_jax.parse_args(["-i", _toy_deck([line])])
+
+
+@pytest.mark.parametrize("line, key", [("solver_max_iter = 50", "solver_max_iter"),
+                                       ("davidson_tol_mev = 0.1", "davidson_tol_mev")])
+def test_dense_full_bse_refuses_the_unread_stop_keys(line, key, capsys):
+    """The dense solve has no iteration: ``solver_max_iter`` and ``davidson_tol_mev`` set by the input
+    file refuse, and ``full_bse_solver = davidson`` (which reads both) takes them."""
+    with pytest.raises(SystemExit):
+        bse_jax.parse_args(["-i", _toy_deck(["full_bse = true", line])])
+    err = capsys.readouterr().err
+    assert f"`{key}`" in err and "dense solve has no iteration" in err and "full_bse_solver = davidson" in err
+    bse_jax.parse_args(["-i", _toy_deck(["full_bse = true", "full_bse_solver = davidson", line])])
+    bse_jax.parse_args(["-i", _toy_deck([line])])                       # and the Tamm-Dancoff run

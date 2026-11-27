@@ -390,8 +390,9 @@ With `full_bse = true` the dense solve (`full_bse_solver = dense`, the default)
 reads `number_eigenvalues` and the
 kernel only (`bse_lanczos.solve_bse_sharded` returns to `bse_nontda` before it reads any
 solver option). `bse_jax` refuses a `davidson_*`, `trlan_*` or `lanczos_*` key set away from its
-default; `solver`, `block_size`, `davidson_tol_mev` and the iteration cap are deck keys
-other BSE drivers share and are left alone, unread. The dense solve reduces
+default. `solver` other than `davidson` and `block_size` other than 1 refuse under either
+`full_bse_solver` (neither route reads them), and under `dense` so do `davidson_tol_mev` and
+`solver_max_iter`; the refusal names `full_bse_solver` or the key to drop. The dense solve reduces
 $\mathcal K z = \Omega\,\Sigma z$, $\mathcal K = \begin{pmatrix} A & B \\ B^* & A^* \end{pmatrix}$,
 $\Sigma = \mathrm{diag}(1, -1)$, by a Cholesky factor $\mathcal K = LL^\dagger$ and the Hermitian
 $L^{-1}\Sigma L^{-\dagger}$ (Shao et al., Linear Algebra Appl. 488 (2016) 148, Algorithm 1). It

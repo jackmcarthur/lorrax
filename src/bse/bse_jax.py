@@ -236,7 +236,8 @@ def _preview_lanczos(
         max_lanczos_iter = max(30, min(200, bse_dim // 2))
     # ``max_lanczos_iter`` is the *total* Krylov dimension upper
     # bound; block path divides by block_size.
-    block_max_iter = max(1, max_lanczos_iter // max(1, block_size))
+    # The full-BSE routes have no Lanczos block: ``block_size`` never divides their cap.
+    block_max_iter = max(1, max_lanczos_iter // (max(1, block_size) if tda else 1))
     mode = (f"convergence-driven (rtol={rtol:.1e}, every {check_every} iters)"
             if rtol > 0 else "fixed")
     if full_davidson:
@@ -1199,6 +1200,33 @@ def parse_args(argv=None):
                 f"{'it' if len(unread) == 1 else 'them'}, set full_bse_solver = davidson "
                 f"for the full-BSE Davidson, or set full_bse = false "
                 f"for the eigensolve that reads {'it' if len(unread) == 1 else 'them'}")
+        # The keys other BSE drivers share are left alone by the rule above.  Under
+        # full_bse = true neither route reads ``solver`` or ``block_size`` (the full
+        # route is not a Krylov solve, and its Davidson sizes its own block), and the
+        # dense solve reads neither the iteration cap nor ``davidson_tol_mev``.
+        shared_unread = []
+        if args.solver != schema.get_default("solver"):
+            shared_unread.append((
+                "solver", "full_bse = true picks its eigensolver with full_bse_solver "
+                          "(dense or davidson); set that and drop `solver`"))
+        if args.block_size != schema.get_default("block_size"):
+            shared_unread.append((
+                "block_size", "the full-BSE routes have no Lanczos block (the full-BSE "
+                              "Davidson sizes its own block from number_eigenvalues and "
+                              "davidson_margin); drop it"))
+        if not full_davidson:
+            for dest in ("max_lanczos_iter", "davidson_tol_mev"):
+                if getattr(args, dest) != schema.get_default(dest):
+                    shared_unread.append((
+                        name(dest), "the dense solve has no iteration; set "
+                                    "full_bse_solver = davidson to read it, or drop it"))
+        if shared_unread:
+            parser.error(
+                ", ".join(f"`{key}`" for key, _ in shared_unread)
+                + f" {'is' if len(shared_unread) == 1 else 'are'} not read by full_bse = true"
+                + ("" if full_davidson else " with full_bse_solver = dense")
+                + " and would be ignored: "
+                + "; ".join(f"`{key}`: {why}" for key, why in shared_unread))
         if not full_davidson and args.full_bse_instability != "refuse":
             parser.error(
                 "`full_bse_instability` is read by full_bse_solver = davidson only: the "

@@ -66,7 +66,11 @@ soft locking, restarts under a priced basis, a residual stop.
   `trlan_n_keep` away from its default used to run with the key ignored; it now
   stops with the key named. Drop the key, or set
   `full_bse_solver = davidson` (which reads the `davidson_*` keys above except
-  `davidson_olsen`), or set `full_bse = false`.
+  `davidson_olsen`), or set `full_bse = false`. Likewise under either
+  `full_bse_solver`: `solver = block_lanczos` or `trlan` and `block_size` other
+  than 1 (neither route reads them; `block_size` used to divide the Davidson
+  iteration cap), and on the dense solve `solver_max_iter` and
+  `davidson_tol_mev`. The refusal names `full_bse_solver` or the key to drop.
 - **A new refusal on the dense solves.** `GATE nontda_coupling_symmetric`: both
   `solve_nontda_definite_pencil` and `solve_nontda_product` stop when the
   coupling block has $\lVert B - B^{\mathsf T}Vert / \lVert BVert$ above
