@@ -881,6 +881,90 @@ def weighted_kmeans_jax(
 # Host-side helpers for the CLI
 # ─────────────────────────────────────────────────────────────────────────
 
+def require_grid_invariant_operations(Rinv, tau, fft_grid) -> None:
+    """Refuse a symmetric selection on an FFT grid its operations leave.
+
+    The selection closes its points under ``r' = Rinv·r + τ`` on the FFT
+    grid, which is an action on the grid only for operations that map the
+    grid onto itself (:func:`symmetry_maps.fft_grid_invariance`: every
+    ``N_a Rinv[a, b] / N_b`` and every ``N_a τ_a`` integer).  For any other
+    operation the image of a grid point is rounded to a neighbouring one:
+    the weight symmetrisation, the grid orbits and the unfolded pool then
+    disagree, the pool holds repeated points, and the set is not closed.
+
+    The decorated-atom space group can be larger than the group the DFT code
+    chose its FFT grid for (rock salt in short lattice vectors on QE's
+    48 x 48 x 80: 24 operations, 2026-11-27), so the WFN's own grid is not
+    evidence that the test passes.
+    """
+    grid = tuple(int(n) for n in np.asarray(fft_grid).reshape(3))
+    rotation_fits, translation_fits = _sym.fft_grid_invariance(Rinv, tau, grid)
+    fits = rotation_fits & translation_fits
+    if np.all(fits):
+        return
+    n_op = int(fits.size)
+    worst = int(np.flatnonzero(~fits)[0])
+    forward = np.rint(np.asarray(Rinv)[worst]).astype(np.int64)
+    if not rotation_fits[worst]:
+        a, b = (int(v) for v in np.argwhere(
+            (np.asarray(grid)[:, None] * forward) % np.asarray(grid)[None, :])[0])
+        example = (
+            f"operation {worst}, Rinv = {forward.tolist()}: N_{a + 1} "
+            f"Rinv[{a + 1},{b + 1}] / N_{b + 1} = {grid[a]} x "
+            f"({int(forward[a, b])}) / {grid[b]}")
+    else:
+        shift = np.asarray(tau, dtype=np.float64)[worst]
+        example = (
+            f"operation {worst}, tau = {shift.tolist()}: tau x N = "
+            f"{(shift * np.asarray(grid)).tolist()}")
+    remedies = []
+    if not np.all(rotation_fits):
+        remedies.append(
+            "write the WFN on an N x N x N dense grid (nr1 = nr2 = nr3 in the "
+            "QE &system namelist), which every rotation of the lattice maps "
+            "onto itself")
+    if not np.all(translation_fits):
+        remedies.append(
+            "choose grid extents that are multiples of the translations' "
+            "denominators (N_a tau_a integer)")
+    raise ValueError(
+        "GATE centroid_fft_grid_invariance: got: FFT grid "
+        f"{grid[0]} x {grid[1]} x {grid[2]}, which {int(np.count_nonzero(~fits))} "
+        f"of the {n_op} spatial operations of the decorated-atom space group "
+        "do not map onto itself "
+        f"({int(np.count_nonzero(~rotation_fits))} by rotation, "
+        f"{int(np.count_nonzero(~translation_fits))} by fractional "
+        f"translation; first: {example}); want: every operation the points "
+        "are closed under maps the FFT grid onto itself (N_a Rinv[a,b] / N_b "
+        "and N_a tau_a integer); why: the image of a grid point is otherwise "
+        "rounded to a neighbouring point, which gives repeated centroids and "
+        "a set that is not closed under the operations; fix: "
+        + "; ".join(remedies)
+        + "; or pass --no-symmetries for literal points.")
+
+
+def require_distinct_grid_points(indices, fft_grid, what: str) -> int:
+    """The number of rows of ``indices``, which must be distinct grid points.
+
+    The centroid table's "unique points" count and every consumer's
+    permutation tables assume one row per grid point.  ``what`` names the
+    rows in the refusal (the candidate pool, the selection).
+    """
+    rows = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
+    grid = tuple(int(n) for n in np.asarray(fft_grid).reshape(3))
+    flat = np.ravel_multi_index(rows.T, grid)
+    n_distinct = int(np.unique(flat).size)
+    if n_distinct != flat.size:
+        raise RuntimeError(
+            f"GATE centroid_duplicate_rows: got: {what} with {flat.size} rows "
+            f"on {n_distinct} distinct FFT-grid points; want: one row per "
+            "grid point; why: the table's count and the symmetry "
+            "permutations of every consumer assume distinct rows; fix: none "
+            "from the command line, this is a defect of the selection "
+            "(report it with the WFN's FFT grid and the symmetry settings).")
+    return n_distinct
+
+
 def snap_centroids_to_grid(
     centroids_frac: np.ndarray,
     fft_grid: tuple[int, int, int],

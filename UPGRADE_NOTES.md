@@ -5,6 +5,26 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-27 — Centroids: a symmetric selection refuses an FFT grid its operations leave
+
+`python -m centroid.kmeans_cli` closes its points under the space group of the decorated atoms,
+which can be larger than the group the DFT code chose its FFT grid for. An operation maps the grid
+onto itself only when every $N_a R_{ab} / N_b$ and every $N_a \tau_a$ is an integer ($R$ the
+rotation in crystal coordinates, $N$ the grid extents). Until now a grid that failed this was
+accepted: on rock salt in short lattice vectors with QE's 48 x 48 x 80 grid, 16 of the 24
+operations leave the grid, the candidate pool came out 2.6 times too large, the written file held
+36 repeated rows under a header that counted them as unique, and `gw.gw_jax` refused the file with
+a message about fractional translations.
+
+- **The selection now refuses first**, with `GATE centroid_fft_grid_invariance`, the grid and the
+  first operation that leaves it. The remedy is an $N \times N \times N$ dense grid
+  (`nr1 = nr2 = nr3` in QE's `&system`), which every rotation of the lattice maps onto itself, or
+  `--no-symmetries`. Grids that pass select the same points as before.
+- **A centroid file never holds a repeated row** (`GATE centroid_duplicate_rows`), and its
+  "unique points" header is the measured number of distinct grid points.
+- **A centroid file with repeated rows** from an older run is refused by `gw.gw_jax` with
+  "duplicate centroid rows"; regenerate it. `symmetry_maps.fft_grid_invariance` is the test.
+
 ## 2026-11-27 — BSE: superseded eigensolver routes retired; two modules renamed
 
 The BSE has two iterative eigensolvers left, both Davidsons: the Tamm–Dancoff one

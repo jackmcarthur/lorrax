@@ -36,6 +36,7 @@ A new test needs no bootstrap import of its own. Run the unit layer with
 | `test_polar_device_cut_cpu.py` | the device spectral cut equals the host sequence |
 | `test_nodal_htransform_cpu.py` | the nodal htransform (the hsuite path now has off-grid points, but no oracle): WS kernel exact on the grid, star covariant, better than its controls; metric, Loewdin and its refusal; zero-weight drop and face-versus-q-batched routes; a non-orbit-closed node set is refused |
 | `test_bse_kgrid_dipoles_cpu.py` | densified dipoles equal the exact ones on and off the grid |
+| `test_centroid_grid_invariance_cpu.py` | the FFT-grid test of a symmetric centroid selection equals exact enumeration of every grid image (rock salt in short lattice vectors, a glide) and its refusal fires; repeated centroid rows refuse by name in the selection and in the centroid source map |
 | `test_bse_helicity_cpu.py` | σ± helicity labels on a C3 toy, with the flipped conventions failing |
 | `test_bsemat_split_cpu.py` | the ISDF bsemat split equals the plane-wave head, wings and body |
 | `test_bse_q0_head_exact_overlap.py` | the q = 0 head content is exact |

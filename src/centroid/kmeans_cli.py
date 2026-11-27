@@ -130,6 +130,8 @@ from .kmeans_isdf import (
     weighted_kmeans_jax,
     snap_centroids_to_grid,
     ensure_unique_centroids,
+    require_distinct_grid_points,
+    require_grid_invariant_operations,
     _restore_orbit_pool,
 )
 from .production_output import (
@@ -298,6 +300,10 @@ def _resolve_symmetry(args, wfn):
     points, so their sampling set closes under every spatial Seitz operation
     preserving the lattice and mapping each atom to the same species.
 
+    Every operation returned maps the WFN's FFT grid onto itself, or the
+    selection refuses here, before any weight is built
+    (:func:`centroid.kmeans_isdf.require_grid_invariant_operations`).
+
     Returns ``(R, Rinv, tau, n_sym, orbit_aware)``.
     """
     if args.no_symmetries:
@@ -316,6 +322,7 @@ def _resolve_symmetry(args, wfn):
         f"operations ({n_improper} improper, {n_nonsymmorphic} with "
         "fractional translation); electronic/TR data not consulted")
     if n_sym > 1:
+        require_grid_invariant_operations(Rinv, tau, wfn.fft_grid)
         return R, Rinv, tau, n_sym, True
     return None, None, None, 1, False
 
@@ -407,9 +414,12 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
                 snapped, np.asarray(Rinv), np.asarray(tau))
             indices, snapped, _ = snap_centroids_to_grid(
                 unfolded, fft_grid, deduplicate=False)
+        n_unique = require_distinct_grid_points(
+            indices, fft_grid, "the orbit-unfolded candidate pool")
+        if n_unique > before:
             log.info(f"Restored snapped candidate pool: {before} → "
-                     f"{len(indices)} unique points in complete spatial orbits")
-        return indices, snapped, indices.shape[0], orbit_id
+                     f"{n_unique} unique points in complete spatial orbits")
+        return indices, snapped, n_unique, orbit_id
 
     log.debug(f"\nSnapping {M_cand} centroids to FFT grid {fft_grid}...")
     indices, snapped, n_dups = snap_centroids_to_grid(
@@ -616,7 +626,7 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
     centroids_frac = np.asarray(centroids)
 
     with timing.section("snap_unfold"):
-        centroid_indices, centroids_snapped, n_unique, orbit_id_arr = \
+        centroid_indices, _, n_unique, orbit_id_arr = \
             _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
                              Rinv, tau, n_sym, M_cand)
 
@@ -642,7 +652,6 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
             args, wfn, sym, mesh, centroid_indices, orbit_id_arr,
             n_unique, N_c)
         n_unique = int(centroid_indices.shape[0])
-        centroids_snapped = centroid_indices.astype(float) / np.asarray(fft_grid)
         pruned = True
         prune_rank = int(rank)
 
@@ -653,9 +662,15 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
     elif stages.total == 3:
         row("pruning", f"not needed: the pool holds {n_pool} <= {N_c} points")
 
+    # The table is written from these rows: its "unique points" count is the
+    # measured number of distinct grid points, and a repeated row refuses.
+    centroid_indices = np.asarray(centroid_indices, dtype=np.int64)
+    n_unique = require_distinct_grid_points(
+        centroid_indices, fft_grid, "the selection")
     return SimpleNamespace(
-        wfn=wfn, indices=np.asarray(centroid_indices, dtype=np.int64),
-        snapped=centroids_snapped, n_unique=int(n_unique), pool=int(n_pool),
+        wfn=wfn, indices=centroid_indices,
+        snapped=centroid_indices.astype(float) / np.asarray(fft_grid),
+        n_unique=int(n_unique), pool=int(n_pool),
         pruned=pruned, prune_rank=prune_rank, unpicked=unpicked,
         weight=weight, weight_label=weight_label,
         weight_band_ranges=weight_band_ranges, M_cand=M_cand,

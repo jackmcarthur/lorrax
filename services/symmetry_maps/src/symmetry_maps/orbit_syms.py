@@ -369,6 +369,64 @@ def recover_atomic_space_group(
     R_table = np.rint(np.linalg.inv(Rinv_table)).astype(np.int32)
     return R_table, Rinv_table, tau_table
 
+def fft_grid_invariance(Rinv, tau, fft_grid, *, tol: float = 1.0e-8):
+    """Which spatial operations map the FFT grid onto itself.
+
+    A grid point is ``r_b = n_b / N_b``.  Under the forward action
+    ``r' = Rinv·r + τ`` its image has grid coordinate
+
+    ``N_a r'_a = Σ_b (N_a Rinv[a, b] / N_b) n_b + N_a τ_a``
+
+    on axis ``a``, so the operation maps the grid onto itself exactly when
+    every coefficient ``N_a Rinv[a, b] / N_b`` is an integer (an integer test,
+    no tolerance) and every shift ``N_a τ_a`` is an integer (within ``tol``).
+    An integer coefficient matrix of determinant ±1 has an integer inverse, so
+    "into" is "onto", and the operations that pass form a group.
+
+    An ``N x N x N`` grid passes the rotation test for every operation of the
+    lattice (the coefficients are ``Rinv`` itself).  A grid whose extents
+    differ passes only for rotations that do not mix the unequal axes.
+
+    WHY A SEPARATE TEST AND NOT ``fft_grid_pullback_perm(validate=True)``: for
+    a rotation that fails this test the rounded images can still be a
+    bijection of the grid (a shear ``n_1 + 0.6 n_3`` rounds to a permutation
+    of ``n_1`` at fixed ``n_3``), so the permutation check passes on a table
+    that is not the operation's action.  Seen 2026-11-27 on a 48 x 48 x 80
+    grid under the cubic operations of rock salt in short lattice vectors.
+
+    Parameters
+    ----------
+    Rinv : (n_op, 3, 3) int
+        Forward direct-space rotations in crystal coordinates.
+    tau : (n_op, 3) float
+        Fractional translations in units of the lattice vectors.
+    fft_grid : (3,) int
+        FFT grid extents ``N``.
+
+    Returns
+    -------
+    rotation_fits, translation_fits : (n_op,) bool
+        Per operation.  The operation maps the grid onto itself when both hold.
+    """
+    grid = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+    rotations = np.asarray(Rinv)
+    if rotations.ndim != 3 or rotations.shape[1:] != (3, 3):
+        raise ValueError(f"Rinv must be (n_op, 3, 3); got {rotations.shape}")
+    integer_rotations = np.rint(rotations).astype(np.int64)
+    if not np.array_equal(integer_rotations, rotations):
+        raise ValueError("Rinv must hold integer crystal-coordinate rotations")
+    shifts = np.asarray(tau, dtype=np.float64).reshape(-1, 3)
+    if shifts.shape[0] != rotations.shape[0]:
+        raise ValueError(
+            "tau must have one row per operation; got "
+            f"{shifts.shape[0]} for {rotations.shape[0]} operations")
+    numerator = grid[None, :, None] * integer_rotations
+    rotation_fits = ~np.any(numerator % grid[None, None, :], axis=(1, 2))
+    on_grid = shifts * grid[None, :]
+    translation_fits = np.all(np.abs(on_grid - np.rint(on_grid)) <= tol, axis=1)
+    return rotation_fits, translation_fits
+
+
 def grid_point_image_perm(fft_grid, M) -> np.ndarray:
     """FFT-grid permutation of a SYMMORPHIC INTEGER point-group operation.
 
@@ -899,10 +957,15 @@ def centroid_source_map_and_wrap(
     Raises
     ------
     RuntimeError
+        If the table repeats a row ("duplicate centroid rows": no action,
+        the identity included, permutes such a table).
         If orbit closure fails: i.e. for some (s, μ) the image of r_μ
         under {S_s | τ_s} doesn't land on any other centroid in the
         table.  Caller should regenerate the centroid set with
         ``kmeans_cli`` in orbit-aware mode, or pass identity-only sym.
+        If a required row is not a permutation although the rows are
+        distinct: the operation does not map the FFT grid onto itself
+        (:func:`fft_grid_invariance` names which part).
     """
     fft_grid_np = np.asarray(fft_grid, dtype=np.int64).reshape(3)
     idx = np.asarray(r_mu_fft_idx, dtype=np.int64)
@@ -967,6 +1030,24 @@ def centroid_source_map_and_wrap(
         required = np.unique(rows % n_sym)
 
     if validate or required_rows is not None:
+        # A repeated row is a defect of the TABLE: every action, the identity
+        # included, then sends two rows to one image.  Name it before any
+        # operation is blamed.
+        order = np.argsort(cent_flat, kind="stable")
+        repeated = np.flatnonzero(np.diff(cent_flat[order]) == 0)
+        if repeated.size:
+            first, second = (int(order[repeated[0]]),
+                             int(order[repeated[0] + 1]))
+            raise RuntimeError(
+                "centroid_source_map_and_wrap: duplicate centroid rows.  The "
+                f"centroid table has {n_rmu} rows on "
+                f"{n_rmu - int(repeated.size)} distinct FFT-grid points; "
+                f"rows {first} and {second} are both fft_idx "
+                f"{idx[first].tolist()}.  No symmetry action, the identity "
+                "included, is a permutation of a table with repeated rows.  "
+                "Regenerate the centroid file with ``centroid.kmeans_cli``, "
+                "which refuses an FFT grid its operations do not map onto "
+                "itself and never writes a repeated row.")
         bad = (sym_perm < 0)
         bad[np.setdiff1d(np.arange(n_sym), required)] = False
         if bad.any():
@@ -986,13 +1067,32 @@ def centroid_source_map_and_wrap(
         # not a hash-unique (the full FFT grid passes through here).
         for s in required:
             if np.bincount(sym_perm[s], minlength=n_rmu).max(initial=0) > 1:
+                # The rows are distinct (checked above), and an operation that
+                # maps the grid onto itself is injective on them: the rounded
+                # images can collide only when the operation leaves the grid.
+                forward = np.rint(np.linalg.inv(S[s])).astype(np.int64)
+                rotation_fits, translation_fits = fft_grid_invariance(
+                    forward[None], tau_frac[s][None], fft_grid_np)
+                causes = []
+                if not rotation_fits[0]:
+                    causes.append(
+                        "its rotation does not map the FFT grid "
+                        f"{fft_grid_np.tolist()} onto itself (N_a Rinv[a,b] / "
+                        f"N_b is not integer for Rinv = {forward.tolist()})")
+                if not translation_fits[0]:
+                    causes.append(
+                        "its fractional translation is off the FFT grid "
+                        f"(tau x fft_grid = "
+                        f"{(tau_frac[s] * fft_grid_np).tolist()})")
                 raise RuntimeError(
                     f"centroid_source_map_and_wrap: sym_perm[{s}] is not a "
-                    f"permutation — two distinct centroids map to the "
-                    f"same image under sym {s}.  Likely cause: τ × "
-                    f"fft_grid is not integer, so the rounded image "
-                    f"collides with a different centroid.  Check "
-                    f"``validate_atomic_symmetries`` on the WFN.")
+                    f"permutation: two distinct centroids map to the same "
+                    f"rounded image under sym {s}, because "
+                    + (" and ".join(causes) if causes else
+                       "of a rounding collision this check cannot attribute")
+                    + ".  An operation closes a centroid set only on an FFT "
+                    "grid it maps onto itself; an N x N x N grid is mapped "
+                    "onto itself by every rotation of the lattice.")
 
     if required_rows is not None:
         available = np.all(np.sort(sym_perm, axis=1) == np.arange(n_rmu), axis=1)
