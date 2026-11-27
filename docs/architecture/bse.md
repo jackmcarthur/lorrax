@@ -443,9 +443,12 @@ $\overline{V(Q)}$ and the two vertices exchanged):
 $\overline{(\mathcal K z)_{\rm lower}} = \mathrm{couple}(\bar Y, \bar X, 1, \text{partner operands})$,
 which needs only
 $W_{\mu\nu}(q) = \overline{W_{\nu\mu}(q)}$. `bse_nontda.kernel_matvec` applies $\mathcal K$ to pair
-rows $(b, 2, n_c, n_v, N_k)$ with two such calls per row block. `bse_nontda.payload_w_r` transforms
-$W_q$ once per payload through the memoised donating program and leaves $W_R$ on the payload, so a
-payload is solved twice without a second transform and `keep_W_R` is honoured by both full routes.
+rows $(b, 2, n_c, n_v, N_k)$ with two such calls per row block. `bse_davidson_helpers.payload_w_r`
+transforms $W_q$ once per payload through the memoised donating program and leaves $W_R$ on the
+payload, so a payload is solved twice without a second transform and `keep_W_R` is honoured by both
+full routes. It is the one transform of every eigensolve and of the Haydock recursion: each
+application of the screened-direct term is then a pointwise product in $R$, with no transform of $W$
+inside the matvec.
 
 Measured (claim 2874): CrI3
 8×8×1 SOC, 8v × 14c, P4 A100-40GB. One Haydock step (D + V − W on three

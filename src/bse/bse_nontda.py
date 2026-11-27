@@ -97,6 +97,7 @@ from .bse_ring_comm import make_bse_shardings
 from .bse_head import head_shifted_eps_c
 # The Davidson route's residual stop (meV), margin roots and basis admission
 # are the Tamm-Dancoff Davidson's.
+from .bse_davidson_helpers import payload_w_r
 from .bse_lanczos import DAVIDSON_MARGIN_ROOTS, DAVIDSON_TOL_MEV, _price_davidson_basis
 from common.log import get_logger, message
 
@@ -225,28 +226,6 @@ def check_restart_reciprocity(W_q, *, tol=_NONTDA_RECIP_TOL, log=None,
             f"and re-run this solve against the rewritten restart.\n"
             f"To proceed without the check, pass recip_tol=None.")
     return rel
-
-
-def payload_w_r(data, mesh_xy, sh, *, include_W):
-    """The payload's screened tile in R space, transformed once and left on it.
-
-    ``data["W_R"] = ifftn_ortho(W_q)`` with ``W_q`` DONATED to the memoised
-    transform ``bse_lanczos.solve_bse_sharded`` and ``absorption_haydock`` run
-    (``fft_helpers.get_donated_kfft_kminor``), and the caller-side reference
-    dropped: one (mu, nu, k) tile per rank for the whole solve.  A payload that
-    already carries ``W_R`` (a second solve, ``exciton_bands``' per-Q payloads)
-    is used as it is.  Without ``include_W`` the W term is never built and the
-    tile is a placeholder operand."""
-    if not include_W:
-        return data["W_q"] if data.get("W_q") is not None else data.get("W_R")
-    if data.get("W_R") is None:
-        from common.fft_helpers import get_donated_kfft_kminor
-        ifft = get_donated_kfft_kminor(
-            mesh_xy, tuple(int(n) for n in data["W_q"].shape[-3:]), sh.W.spec,
-            kind="ifftn", norm="ortho")
-        data["W_R"] = ifft(data["W_q"])
-        data["W_q"] = None      # release the caller-side reference
-    return data["W_R"]
 
 
 def operand_sets(data, mesh_xy, sh, W_R):

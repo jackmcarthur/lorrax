@@ -78,10 +78,11 @@ def _dense(mesh, ops):
     from jax.experimental import multihost_utils
     from jax.sharding import NamedSharding, PartitionSpec as P
     from lxkit import device_put_process_local
-    from bse.absorption_haydock import ensure_W_R
+    from bse.bse_davidson_helpers import payload_w_r
+    from bse.bse_ring_comm import make_bse_shardings
     from bse.bse_stack_matvec import build_bse_stack_matvec
     data = _payload(mesh, ops)
-    W_R = ensure_W_R(data, mesh)
+    W_R = payload_w_r(data, mesh, make_bse_shardings(mesh))
     nk = int(np.prod(KGRID))
     n = NC * NV * nk
     eye = np.eye(n, dtype=complex).reshape(n, NC, NV, nk)

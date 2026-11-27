@@ -646,6 +646,34 @@ def w_q0_for_precond(data):
     return data["_W_q0_for_precond"]
 
 
+def payload_w_r(data, mesh_xy, sh, *, include_W=True):
+    """The payload's screened tile in R space, transformed once and left on it.
+
+    THE transform of an eigensolver's or a Haydock recursion's payload:
+    ``data["W_R"] = ifftn_ortho(W_q)`` over the k axes, so every application of
+    the screened-direct term is a pointwise product in R with no transform of W
+    in it.  ``W_q`` is DONATED to the memoised transform
+    (``fft_helpers.get_donated_kfft_kminor``) and the caller-side reference
+    dropped: one (mu, nu, k) tile per rank for the whole solve, where a
+    transform inside the solve's own jit kept both alive.  A payload that
+    already carries ``W_R`` (a second solve, the Haydock run after the
+    eigensolve, ``exciton_bands``' per-Q payloads) is used as it is.  Without
+    ``include_W`` the W term is never built and the tile is a placeholder
+    operand.  Take :func:`w_q0_for_precond` first when the exact diagonal is
+    wanted.  Callers that must keep ``W_q`` (the resolvent and ladder code)
+    use ``bse_feast.ensure_W_R`` instead, which borrows it."""
+    if not include_W:
+        return data["W_q"] if data.get("W_q") is not None else data.get("W_R")
+    if data.get("W_R") is None:
+        from common.fft_helpers import get_donated_kfft_kminor
+        ifft = get_donated_kfft_kminor(
+            mesh_xy, tuple(int(n) for n in data["W_q"].shape[-3:]), sh.W.spec,
+            kind="ifftn", norm="ortho")
+        data["W_R"] = ifft(data["W_q"])
+        data["W_q"] = None      # release the caller-side reference
+    return data["W_R"]
+
+
 def bse_pair_diagonal_precond(
     eps_c,
     eps_v,

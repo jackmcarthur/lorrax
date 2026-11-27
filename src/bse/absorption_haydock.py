@@ -53,11 +53,11 @@ import numpy as np
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.fft_helpers import get_donated_kfft_kminor
 
 from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, polarization_directions, project_dipoles, window_dipoles, write_absorption_dat, write_absorption_h5)
 from .bse_deck import (DeckError, Key, check_dipole_operator, check_fine_grid_keys, deck_params, eqp_file,
                        omega_count, read_settings, spin_kernel)
+from .bse_davidson_helpers import payload_w_r
 from .bse_head import head_shifted_eps_c
 from .bse_window import _parse_wfn_path
 from .bse_io import (load_bse_data_from_restart_sharded)
@@ -116,25 +116,6 @@ def haydock_recursion_block(matvec_block, d_block, n_iter, constrain=lambda x: x
     return alphas_T.T, betas_T.T, norms
 
 
-def ensure_W_R(data, mesh_xy):
-    """``data["W_R"] = ifftn_ortho(W_q)`` once per payload, with ``W_q`` DONATED.
-
-    The same memoised donating transform ``bse_lanczos.solve_bse_sharded`` runs
-    (``fft_helpers.get_donated_kfft_kminor``), so a payload the eigensolve has
-    already transformed (``keep_W_R=True``) is reused as is, and a fresh one
-    holds ONE (μ, ν, k) tile per rank instead of W_q and W_R together.
-    """
-    if data.get("W_R") is not None:
-        return data["W_R"]
-    sh = make_bse_shardings(mesh_xy)
-    ifft = get_donated_kfft_kminor(
-        mesh_xy, tuple(int(n) for n in data["W_q"].shape[-3:]), sh.W.spec,
-        kind="ifftn", norm="ortho")
-    data["W_R"] = ifft(data["W_q"])
-    data["W_q"] = None
-    return data["W_R"]
-
-
 def haydock_program(mesh_xy, kgrid, n_iter, exchange_channel="singlet"):
     """The jitted recursion ``(d_seed, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c,
     eps_v, W_R, V_q0, M) -> (alphas, betas, norms)``: every device array an
@@ -173,11 +154,11 @@ def haydock_coefficients(data, mesh_xy, d_block_np, n_iter):
     placed straight onto the trial layout ``sh.X`` (no whole copy on one
     device), and every device array enters :func:`haydock_program` as an
     argument.  ``data["W_R"]`` is used when present (the eigensolve's), else
-    built once by :func:`ensure_W_R`.
+    built once by ``bse_davidson_helpers.payload_w_r``.
     """
     sh = make_bse_shardings(mesh_xy)
     kgrid = (int(data["nkx"]), int(data["nky"]), int(data["nkz"]))
-    W_R = ensure_W_R(data, mesh_xy)
+    W_R = payload_w_r(data, mesh_xy, sh)
     from common.collectives import device_put_process_local
     d_seed = device_put_process_local(d_block_np, sh.X)
     alphas, betas, norms = haydock_program(
