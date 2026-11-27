@@ -12,7 +12,6 @@ from solvers.chebyshev import (
 from solvers.dos import compute_dos, estimate_spectrum, dos_weighted_windows, geometric_windows, compute_window_partition, DOSResult, WindowPartition
 from solvers.pseudobands import ritz_pseudobands, PseudobandsResult
 from solvers.pseudobands_v2 import ritz_pseudobands_v2
-from solvers.quadrature import feast_ellipse_quadrature
 
 __all__ = [
     "DavidsonPlan", "DavidsonInfo", "plan_local_davidson",
@@ -33,5 +32,4 @@ __all__ = [
     "ritz_pseudobands",
     "ritz_pseudobands_v2",
     "PseudobandsResult",
-    "feast_ellipse_quadrature",
 ]

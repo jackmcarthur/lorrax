@@ -29,7 +29,7 @@ else.
 | package | level | owns | entry points | imported by |
 |---|---|---|---|---|
 | `gw` | L1 | the GW and QSGW driver: ζ orchestration, $V_q$, screening (tangential, MPA, plasmon pole, ladder), Σ, the $q\to0$ heads, SC maps, downfolding | `python -m gw.gw_jax`, `gw.kin_ion_io`, `gw.downfold_cli`, `gw.epsmat_cli`, `gw.eqp_bgw`, `gw.plane_wave_pipeline` (opt-in) | `bse`, `bandstructure`, `file_io`, `psp`, `centroid`, `isdf`, `lxkit.deck_doctor` |
-| `bse` | L1 | the Bethe–Salpeter equation: kernels, TDA and full solvers, absorption, exciton bands, the $W_\mathrm{BSE}$ ladder | `python -m bse.bse_jax`, `bse.exciton_bands`, `bse.absorption_haydock`, `bse.bse_feast`, `bse.bse_kpm`, `bse.bse_w_exact` | `gw.screening_bse`, `file_io.restart_bundle` (both lazily) |
+| `bse` | L1 | the Bethe–Salpeter equation: kernels, TDA and full solvers, absorption, exciton bands, the $W_\mathrm{BSE}$ ladder | `python -m bse.bse_jax`, `bse.exciton_bands`, `bse.absorption_haydock`, `bse.bse_kpm`, `bse.bse_w_exact` | `gw.screening_bse`, `file_io.restart_bundle` (both lazily) |
 | `bandstructure` | L1 | band interpolation (htransform), fine-k wavefunctions for the BSE, band operators | `python -m bandstructure.htransform` | `bse` |
 | `centroid` | L1 (`kmeans_isdf` L2, `distribution` L3) | ISDF centroid selection: weighted k-means, sketched QRCP pruning, the sampling metric | `python -m centroid.kmeans_cli` | `gw`, `bandstructure` (htransform nodes) |
 | `isdf` | L1 | ζ-fit primitives (pair Grams, $C_q$ conditioning, the μ-batch route) and the nodal htransform basis | library | `gw`, `bandstructure`, `bse`, `centroid` |
@@ -38,7 +38,7 @@ else.
 | `tdagw` | L1 | real-time TD-aGW in TDGW's conventions: the equation of motion, the injected ΔΣ[ρ] models (TDGW kernel, low-rank, the ISDF COHSEX model of a GW restart), the jitted k-sharded propagator, TDGW's file formats | `python -m tdagw.tdgw_jax`, `tdagw.kernel_export`, `tdagw.tdgw_bridge` | nothing |
 | `file_io` | L1 readers and writers; L3 transport | SlabIO (the sharded HDF5 transport) and every format: the restart bundle, Σ outputs, model stores, `dipole.h5`, `kin_ion.h5`, WFN | library | `gw`, `bse`, `psp`, `bandstructure`, `centroid` |
 | `common` | mixed: L1 physics helpers, L2 `rank_criterion`, `spectral_closure`, `pivoted_cholesky`, L3 collectives and glue | shared helpers: collectives, sharding and FFT glue, timing, units, WFN transforms, parallel-transport kernels | library | every package |
-| `solvers` | L2 | iterative eigensolvers and spectral methods with no physics: Davidson, Lanczos, KPM, contour quadrature, pseudobands, Sternheimer CG | library | `bse`, `psp` |
+| `solvers` | L2 | iterative eigensolvers and spectral methods with no physics: Davidson, Lanczos, KPM, pseudobands, Sternheimer CG | library | `bse`, `psp` |
 | `mixing` | L2 | fixed-point acceleration: Anderson | library | `gw.sc_iteration` (the SC loop) |
 | `runtime` | L3, except two modules (below the table) | process bootstrap, the driver session and report stream, padding receipts, compiled-memory checks, environment grammar, source closure, the fixed streaming tile | library; every driver calls `runtime.initialize_communicator_stack()` first | every driver |
 | `ffi` | L3 | the bridge to native libraries: loading and attestation, capability gates, FFT and k-convolution router, GEMM, parallel HDF5, the contour accumulator; the C++ sources | library; `ffi/cpp/stage/seal_bundle.py` seals a native bundle | `gw`, `bse`, `common`, `file_io`, `psp`, `bandstructure` |
@@ -264,7 +264,7 @@ The BSE contract is [BSE](architecture/bse.md); this table only says where each 
 | `absorption_haydock.py` | ε₂(ω) by the Haydock continued fraction on the TDA BSE; `python -m bse.absorption_haydock`. |
 | `bse_davidson_helpers.py` | Start subspace and diagonal preconditioners for `solvers.davidson.davidson` on the BSE vector layout. |
 | `bse_densify.py` | Coarse-to-fine densification of the BSE bundle under `kgrid_fine`, its window dipoles included. |
-| `bse_feast.py` | FEAST contour eigensolver, its GMRES solves and the spectral deflation the W_BSE ladder reuses. |
+| `bse_feast.py` | Shared matvec operands, the GMRES resolvent solve with the spectral deflation the W_BSE ladder reuses, the diagonal preconditioner and the spectral bounds. The FEAST eigensolver was retired 2026-11-27; the file name is historical. |
 | `bse_head.py` | The q = 0 Coulomb head: its scalars and their rank-one injection. |
 | `bse_io.py` | Compatibility facade: re-exports names from `bse_window`, `bse_head`, `bse_densify`, `bse_loading` and the window names of `common.band_degeneracy`. |
 | `bse_jax.py` | The BSE driver: `python -m bse.bse_jax`. |
@@ -354,7 +354,6 @@ Level L2: none of these modules knows what a band or a k point is.
 | `subspace_numerics.py` | Scale-relative rank discovery shared by the eigensolvers. |
 | `chebyshev.py` | Chebyshev expansion and KPM utilities. |
 | `dos.py` | Matrix-free density of states by KPM. |
-| `quadrature.py` | Contour-integration quadrature for spectral methods (FEAST). |
 | `pseudobands.py`, `pseudobands_v2.py` | Pseudobands: stochastic plus Ritz, and Galerkin–Ritz with Gauss-quadrature energies. |
 | `projectors.py` | Jitted subspace projectors for the Sternheimer solve. |
 | `sternheimer_precond.py` | Teter–Payne–Allan preconditioner. |

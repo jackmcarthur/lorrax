@@ -118,8 +118,7 @@ def _dense_refusal(N: int) -> str:
             "assembles A and B, O(N^2).  Alternatives: full_bse_solver = davidson (the "
             "structure-preserving Davidson for the full BSE: no assembly, no size limit, "
             "paired (X, Y) eigenvectors), full_bse = false (the TDA Davidson, the "
-            "default eigensolve), feast = true (FEAST windows, refused unless converged to "
-            "feast_tol_mev), or a smaller number_val_bands_fine / number_cond_bands_fine.")
+            "default eigensolve), or a smaller number_val_bands_fine / number_cond_bands_fine.")
 
 
 def refuse_dense_window(n_cond: int, n_val: int, nk: int, mesh_xy) -> int:

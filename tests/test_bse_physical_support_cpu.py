@@ -131,7 +131,7 @@ def test_kpm_and_spectral_bound_seeds_preserve_samples_without_host_masks():
             np.testing.assert_array_equal(jax.jit(fn)(key), expected)
             assert not any(isinstance(c.cell_contents, (np.ndarray, jax.Array))
                            for c in (fn.__closure__ or ()))
-    # Compile the actual nested FEAST seed, rather than duplicating its math.
+    # Compile the actual nested spectral-bounds seed, rather than duplicating its math.
     tree = ast.parse((ROOT/'src/bse/bse_feast.py').read_text())
     outer = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                  and n.name == 'estimate_spectral_bounds_sharded')
@@ -144,7 +144,7 @@ def test_kpm_and_spectral_bound_seeds_preserve_samples_without_host_masks():
     # An absent constraint is the one-device form of the same physical seed.
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ('x', 'y'))
     namespace['sh'].X = NamedSharding(mesh, P(None, 'x', 'y', None))
-    exec(compile(ast.Module(body=[node], type_ignores=[]), '<actual FEAST seed>', 'exec'), namespace)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), '<actual spectral-bounds seed>', 'exec'), namespace)
     a, b = jax.random.split(key)
     old = (jax.random.normal(a, mask.shape, dtype=jnp.float64)
            + 1j*jax.random.normal(b, mask.shape, dtype=jnp.float64))*mask

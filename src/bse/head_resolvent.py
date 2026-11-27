@@ -43,8 +43,8 @@ jax.config.update("jax_enable_x64", True)
 #: project has already paid for:
 #:
 #: 1. ``bse_w_exact._get_block_gmres_solver`` keys its compiled engine on
-#:    ``id(matvec)`` (``bse_feast.py:49-56`` says the same of the FEAST/GMRES
-#:    caches).  A fresh ``build_ladder_resolvent`` per call therefore costs one
+#:    ``id(matvec)`` (as does every GMRES cache keyed on a
+#:    matvec).  A fresh ``build_ladder_resolvent`` per call therefore costs one
 #:    full XLA compile and one permanent cache entry per call — the
 #:    ``_operator_key`` measurement in ``common.mtxel_sweep`` (2.394 s vs
 #:    2.167 s per iteration, one live executable leaked each time).  Caching on
@@ -74,7 +74,7 @@ jax.config.update("jax_enable_x64", True)
 #: (it prepares the payload and builds that payload's ``diag_h``) and keeps the
 #: cached ``matvec`` object in place of the freshly built one.  The value pins
 #: the matvec's ``id()`` for the life of the process — the same lifetime trick
-#: ``_GMRES_SOLVER_CACHE`` uses, and what makes the id-collision check below a
+#: ``_BLOCK_GMRES_CACHE`` uses, and what makes the id-collision check below a
 #: real check rather than a coincidence.
 _HEAD_MATVEC_CACHE: dict[tuple, Callable] = {}
 #: ``id(matvec) -> structural key``, so a collision is a raise, not a surprise.

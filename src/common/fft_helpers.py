@@ -129,7 +129,7 @@ def make_sharded_ifftn_3d(
 # tree build sharded transforms through the factory, and several close the
 # returned callable into larger objects.  Memoising the factory itself would
 # change the OBJECT IDENTITY those call sites see, and identity is load-bearing
-# in this tree (``bse_feast._GMRES_SOLVER_CACHE`` keys on ``id(matvec)``).  A
+# in this tree (``bse_w_exact._BLOCK_GMRES_CACHE`` keys on ``id(matvec)``).  A
 # new accessor changes nothing for anyone who does not call it.
 _DONATED_KFFT_KMINOR: dict[tuple, Callable] = {}
 

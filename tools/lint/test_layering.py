@@ -713,7 +713,7 @@ def test_the_plumbing_scan_does_not_cry_wolf():
 
 _DRIVER_MAIN_STATEMENTS = {
     "gw.gw_jax": (("main", "_run_gw_stages"), 57),
-    "bse.bse_jax": (("main",), 27),
+    "bse.bse_jax": (("main",), 20),
     "bse.exciton_bands": (("main",), 387),
     "bandstructure.htransform": (("main",), 117),
     "gw.kin_ion_io": (("main",), 119),
@@ -1467,12 +1467,13 @@ def test_no_bse_driver_defaults_its_mesh_shape(sources):
     # Exact, not a floor.  At ``>= 8`` two declarations could vanish with the
     # gate still green — a driver losing its --px/--py silently reverts to
     # whatever its main() does with the missing attribute, which is the class
-    # of defect this section exists for.  Five drivers x two flags = 10; if a
-    # sixth driver is added, edit this literal deliberately (rule: prefer
+    # of defect this section exists for.  Four drivers x two flags = 8 (the FEAST
+    # driver, ``bse_feast``'s ``__main__``, was retired 2026-11-27); if another
+    # driver is added, edit this literal deliberately (rule: prefer
     # the sufficient check over the merely necessary one).
-    assert len(seen) == 10, (
-        f"{len(seen)} --px/--py declarations found in src/bse/, expected 10 "
-        f"(five drivers x two flags): {seen}.  Either a driver stopped "
+    assert len(seen) == 8, (
+        f"{len(seen)} --px/--py declarations found in src/bse/, expected 8 "
+        f"(four drivers x two flags): {seen}.  Either a driver stopped "
         f"declaring its mesh flags, or one was added and this literal is "
         f"stale — both need a human, neither is a pass")
     assert not bad, (

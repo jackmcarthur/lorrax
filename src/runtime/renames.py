@@ -90,6 +90,10 @@ CLI_FLAGS: dict[tuple[str, str], str | Rename] = {}
 
 _BSE_SOLVERS = ("bse.bse_jax", "bse.absorption_haydock", "bse.exciton_bands")
 
+#: The flags of the FEAST route (``--feast``, ``--feast-*``, ``--gmres-*``).
+_FEAST_RETIRED = Rename("", "the FEAST route was retired 2026-11-27; full_bse = true with "
+                            "full_bse_solver = davidson solves the full BSE")
+
 
 def _bse_flags(programs, rows: dict[str, str | Rename]) -> None:
     for prog in programs:
@@ -122,7 +126,7 @@ _bse_flags(("bse.bse_jax",), {
                         "spinor WFN, spin_singlet (or spin_triplet) on a non-spinor one"),
     "--rpa": Rename("local_fields", "local_fields = true drops W"),
     "--lanczos": Rename("", "it changed nothing; the eigensolve is the default route"),
-    "--feast": "feast",
+    "--feast": _FEAST_RETIRED,
     "--kpm-dos": "kpm_dos",
     "--solver": Rename("solver", "values davidson, block_lanczos"),
     "--write-eigs": Rename("write_eigenvectors", "BerkeleyGW's sign convention: < 0 writes "
@@ -161,20 +165,20 @@ _bse_flags(("bse.bse_jax",), {
     "--kpm-emin-ev": "kpm_emin_ev",
     "--kpm-emax-ev": "kpm_emax_ev",
     "--kpm-plot-file": "kpm_plot_file",
-    "--feast-n-lanczos": "feast_n_lanczos",
-    "--feast-buffer": "feast_buffer",
-    "--feast-n-quad1": "feast_n_quad1",
-    "--feast-n-quad2": "feast_n_quad2",
-    "--feast-quadrature": "feast_quadrature",
-    "--feast-ritz-count": "feast_ritz_count",
-    "--feast-tol-mev": "feast_tol_mev",
-    "--feast-iter": "feast_iter",
-    "--feast-window1": "feast_window1",
-    "--feast-window2": "feast_window2",
-    "--gmres-max-iter": "gmres_max_iter",
-    "--gmres-tol": "gmres_tol",
-    "--gmres-seed": "gmres_seed",
-    "--gmres-fp32": "gmres_fp32",
+    "--feast-n-lanczos": _FEAST_RETIRED,
+    "--feast-buffer": _FEAST_RETIRED,
+    "--feast-n-quad1": _FEAST_RETIRED,
+    "--feast-n-quad2": _FEAST_RETIRED,
+    "--feast-quadrature": _FEAST_RETIRED,
+    "--feast-ritz-count": _FEAST_RETIRED,
+    "--feast-tol-mev": _FEAST_RETIRED,
+    "--feast-iter": _FEAST_RETIRED,
+    "--feast-window1": _FEAST_RETIRED,
+    "--feast-window2": _FEAST_RETIRED,
+    "--gmres-max-iter": _FEAST_RETIRED,
+    "--gmres-tol": _FEAST_RETIRED,
+    "--gmres-seed": _FEAST_RETIRED,
+    "--gmres-fp32": _FEAST_RETIRED,
     "--ring-timing": Rename("", "time the matvec with common.timing"),
 })
 _bse_flags(("bse.absorption_haydock",), {

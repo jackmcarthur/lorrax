@@ -341,8 +341,10 @@ setting is a deck key in `gw.in`, under BerkeleyGW's absorption.x name where
 the meaning matches; BerkeleyGW's `key value` and bare-flag lines are
 accepted. The command line keeps `-i`, `--px`/`--py` (square, every device),
 `--report-file` and `--out-prefix`; an old flag refuses with its deck key.
-A key that only another route reads (`feast = true`, `kpm_dos = true`, or a
-solver's own keys) refuses.
+A key that only another route reads (`kpm_dos = true`, or a
+solver's own keys) refuses. The keys of the FEAST route, retired 2026-11-27
+(`feast`, `feast_*`, `gmres_*`), refuse too, with `GATE bse_retired_key`;
+`full_bse = true` with `full_bse_solver = davidson` solves the full BSE.
 
 | deck key | default | meaning |
 |---|---|---|
@@ -368,7 +370,7 @@ solver's own keys) refuses.
 | `write_eigenvectors` | 0 | `eigenvectors.h5`: 0 none, N > 0 the lowest N, < 0 every computed state |
 | `helicity_table` | false | with `dipole_file`: in-plane circular strengths $I_\pm = \lvert D_x \mp i D_y\rvert^2/(2N_k)$ in `bse.out` ([helicity](architecture/bse.md#dipoles-and-absorption)) |
 | `haydock` / `number_iterations` | false / 200 | after the eigensolve, Haydock steps on the same payload; writes `absorption_haydock.h5` and `absorption_haydock*_eh.dat` |
-| `feast` / `kpm_dos` | false | the FEAST window route (`feast_*`, `gmres_*`; refuses unless converged, `GATE feast_converged`) / the KPM density of states (`kpm_*`) |
+| `kpm_dos` | false | the KPM density of states (`kpm_*`) |
 
 `python -m bse.dump_window_dipoles -i deck.in --n-val NV --n-cond NC [--n-occ N] --dipole FILE [--eqp EQP] [--dipole-position-fix] [--full-window] --out d.h5 [--check-eigenvectors eigenvectors.h5 --check-key d_alpha_rq]`
 writes the window dipoles in the run's gauge for re-contracting a saved

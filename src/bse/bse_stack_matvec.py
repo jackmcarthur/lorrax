@@ -67,11 +67,10 @@ whole TD band window, and reuses :func:`exchange_encode` /
 :func:`exchange_decode` for its G-space Hartree term.
 
 Consumers: ``bse_lanczos.solve_bse_sharded`` (block Lanczos and Davidson),
-``bse_feast`` (TDA GMRES contour solves, ``_rayleigh_ritz``, the spectral
-bounds), ``bse_kpm`` and the pseudopole and Haydock paths.  The full (non-TDA)
+``bse_feast`` (the spectral bounds), ``bse_kpm`` and the pseudopole and Haydock paths.  The full (non-TDA)
 BSE runs on the same kernels: :func:`build_bse_stack_pair_matvec` is the coupling
 block's applier, and :func:`build_bse_stack_matvec_full` is ``H [X; Y]`` as two
-of its applications in one call (FEAST and KPM without TDA, ``bse_nontda``'s dense
+of its applications in one call (KPM without TDA, ``bse_nontda``'s dense
 build).  ``bse_ring_comm.build_bse_ring_matvec_full`` is the
 screening operator only (``w_ladder``, ``bse_w_exact``).
 ``bse_preconditioner.exchange_spin_weight`` owns the exchange weight for all.
@@ -822,7 +821,7 @@ def _make_w(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, coupling: bool = Fal
         # would halve the 655 MB T-tensor and every one of its ~4 HBM round-trips
         # (the audit's measured ~2× bandwidth lever, JOINT_FINDINGS §4). It is
         # DELIBERATELY left at complex128 (no c64 here) per owner decision
-        # (2026-07-16); the fp32-GMRES path casts upstream in bse_feast, not here.
+        # (2026-07-16).
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
         # The route (outer load fused / stored U, or XLA T), then its (μ, ν) block plan:

@@ -463,7 +463,7 @@ the LORRAX loader also reaches the handler.
 
 `svd_local` and `lstsq_local` own device-local SVD driver selection. ROCm
 uses JAX's explicit QR-SVD (`hipsolver_gesvd`) for the padded complex
-Hessenberg solve shared by FEAST and the ladder response. Frontier's default
+Hessenberg solve of the shared GMRES (the ladder response, `bse_w_exact`). Frontier's default
 small-matrix Jacobi SVD stalled in actual GMRES execution; this selects a
 stable SVD driver, without forming normal equations or changing tolerance.
 CPU and CUDA retain their existing JAX calls. The least-squares result uses

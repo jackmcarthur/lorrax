@@ -808,8 +808,8 @@ build log lines by its §7.
 
 ## 15. Numerical contract {#numerical-contract}
 
-- **Dtype.** Modes 2–5 take all-complex128 or all-complex64 operands (the
-  complex64 image serves the fp32-GMRES BSE arm) and never cast; every other
+- **Dtype.** Modes 2–5 take all-complex128 or all-complex64 operands and
+  never cast; every other
   mode is complex128 only. The host plan handlers are complex128 only, so a
   complex64 operand refuses at trace time on a cpu mesh; the XLA backend takes
   either precision.

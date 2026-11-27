@@ -292,7 +292,7 @@ $\mathcal K z = \Omega\,\Sigma z$ as it stands: the dense solve, and the
 
 `bse_stack_matvec.build_bse_stack_matvec` is the TDA matvec: Lanczos,
 Davidson and KPM under `full_bse = false`, the
-spectral-bound Lanczos of FEAST and KPM on either route, Haydock, and
+spectral-bound Lanczos of KPM on either route, Haydock, and
 `bse.exciton_bands` (its `full_bse = true` scan takes the pair applier below).
 It and the pair applier are two entries of one assembly
 (`bse_stack_matvec._build_applier` for $D$, the exchange, the head tensor and
@@ -416,7 +416,7 @@ goes through one convolution and one decode, and the sign rides each trial.
 `build_bse_stack_matvec_full` is $H[X; Y]$ from one pair call on the $2b$
 trials $z = X + \bar Y$ ($s = +1$) and $w = X - \bar Y$ ($s = -1$):
 $F + G = 2(AX + BY)$ and $\overline{G - F} = 2Y_{out}$, exact. It is the
-operator of FEAST and KPM with `full_bse = true`; `bse_nontda` builds the dense
+operator of KPM with `full_bse = true`; `bse_nontda` builds the dense
 $(A, B)$ (N ≤ 4096) from pair calls on real identity columns,
 $A = (F + G)/2$, $B = (F - G)/2$, 256 columns a call, and its Davidson
 route runs on the same applier (with $s = +1$ only:
@@ -463,7 +463,6 @@ per rank. The fused kernel runs at 2.27× the flop floor.
 | Lanczos, block Lanczos | `full_bse = false solver = block_lanczos` | `bse_lanczos.solve_bse_sharded` | spectrum shape; fixed Krylov dimension, CGS2 reorthogonalization, full window by default |
 | full BSE, dense (default) | no route flag, `full_bse = true` (`bse.exciton_bands`: input key `full_bse_solver = dense`, the default) | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve of the assembled $A$ and $B$, N ≤ 4096; at a finite pair momentum, of the four assembled blocks of $\mathcal K$ |
 | full BSE, Davidson | `full_bse = true full_bse_solver = davidson` | `solvers.bse_sp_davidson` through `bse.bse_nontda`, with the exact diagonal ($[D; -D]$, or $[D; -D']$ at finite $Q$) and the start subspace of `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots with their $(X, Y)$, no assembly and no size limit, stopped when every residual is below `davidson_tol_mev` (0.01 meV); reports $\lambda_{\min}(\mathcal K)$; at finite $Q$ the unpaired form |
-| FEAST | `feast = true` with `full_bse = true` (the TDA refuses it, `GATE feast_tda_complex`) | `bse.bse_feast` | contour eigensolve in KPM-sized windows; refuses unless every in-window Ritz residual is below `--feast-tol-mev` (0.01 meV, `GATE feast_converged`) |
 | density of states | `--kpm-dos`; `--tda` or not | `bse.bse_kpm` | KPM Chebyshev moments |
 | absorption | `python -m bse.absorption_haydock`, or `haydock = true` with `number_iterations` after the eigensolve | `bse.absorption_haydock` | ε₂(ω) by continued fraction on the TDA BSE (D + V − W), no eigenvectors |
 
@@ -813,7 +812,7 @@ same field ([TD-aGW end to end](../how-to/td-agw-workflow.md#circular-drives)).
 ## Outputs
 
 - `bse.out`: the run report of the `the eigensolve` route (`--report-file`;
-  FEAST and KPM refuse that flag).
+  KPM refuses that flag).
 - `eigenvectors.h5` (`write_eigenvectors`), rank 0, BerkeleyGW layout
   (`src/bse/eigenvectors.h5.spec`) through `bse_window.write_eigenvectors_stream`:
   `exciton_data/eigenvalues` in eV; `exciton_data/eigenvectors`

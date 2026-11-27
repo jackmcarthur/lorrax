@@ -19,7 +19,7 @@ ANNOUNCERS = ("W0 provenance:", "require_w0_series(", "require_rpa_rung(",
 #: (file under src/, function, the consumer it serves)
 READERS = (
     ("file_io/restart_bundle.py", "read_bse_payload",
-     "BSE loader: bse_jax, feast, kpm, Haydock, exciton bands, TD-aGW, the fine-grid model"),
+     "BSE loader: bse_jax, kpm, Haydock, exciton bands, TD-aGW, the fine-grid model"),
     ("file_io/restart_bundle.py", "read_downfold_geometry", "downfold (cRPA U)"),
     ("file_io/restart_bundle.py", "require_w0_series", "the shared refusing announcer"),
     ("bse/w_ladder.py", "require_rpa_rung", "the ladder's direct rung"),

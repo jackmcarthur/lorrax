@@ -530,7 +530,7 @@ def test_input_keys_and_what_they_refuse(capsys):
         (["full_bse_instability = continue"], "`full_bse_instability` is read with full_bse = true only"),
         (["full_bse = true", "full_bse_solver = lanczos"], "takes one of dense, davidson"),
         (["feast = true", "full_bse = true", "full_bse_solver = davidson"],
-         "`full_bse_solver` is not read by the feast route"),
+         "GATE bse_retired_key: `feast` selected"),
         (full + ["haydock", "dipole_file = dipole.h5"], "it needs the TDA"),
     ]
     for lines, want in refused:

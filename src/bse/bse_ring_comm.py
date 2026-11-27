@@ -270,9 +270,9 @@ def create_mesh_xy_from_flags(px: Optional[int],
     """Resolve ``--px/--py`` for every BSE driver's ``main()``.
 
     Omitted means the run's mesh.  ``px is None and py is None`` — the
-    argparse default in all five bse-family drivers since 2026-08-27
-    (``bse_jax``, ``bse_feast``, ``bse_kpm``, ``bse_w_exact``,
-    ``exciton_bands``: 10 declarations, gated by
+    argparse default in all four bse-family drivers since 2026-08-27
+    (``bse_jax``, ``bse_kpm``, ``bse_w_exact``,
+    ``exciton_bands``: 8 declarations, gated by
     ``tools/lint/test_layering.py::test_no_bse_driver_defaults_its_mesh_shape``) —
     is a request for the job's canonical square mesh, i.e. exactly what
     ``runtime.initialize_communicator_stack`` already built and announced in
@@ -296,7 +296,7 @@ def create_mesh_xy_from_flags(px: Optional[int],
     embedded in each ``NamedSharding``.
 
     The ``None`` arm goes through :func:`create_mesh_2d`, not through a bare
-    ``resolve_mesh()``, because ``bse_feast`` / ``bse_w_exact`` / ``bse_kpm``
+    ``resolve_mesh()``, because ``bse_w_exact`` / ``bse_kpm``
     call only ``runtime.bootstrap()`` and hold no
     ``RuntimeStack``: for them a bare resolve would hand back an unwarmed
     mesh and drop both :func:`common.collectives.prepare_mesh`'s cliques and

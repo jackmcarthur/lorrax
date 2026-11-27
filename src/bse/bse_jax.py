@@ -650,25 +650,6 @@ def _settings_parser():
                         default=DEGENERACY_TOL_RY, dest="degeneracy_tol_ry",
                         help="'same multiplet' tolerance in Ry (default 1 meV)")
     parser.add_argument("--n-eig", type=int, default=5)
-    parser.add_argument("--feast-n-lanczos", type=int, default=10, help="Lanczos steps for FEAST bounds.")
-    parser.add_argument("--feast-buffer", type=float, default=0.05, help="Emax buffer fraction for FEAST windows.")
-    parser.add_argument("--feast-n-quad1", type=int, default=4, help="Quadrature points for FEAST iteration 1.")
-    parser.add_argument("--feast-n-quad2", type=int, default=8, help="Quadrature points for FEAST iteration 2+.")
-    parser.add_argument("--feast-quadrature", type=str, default="ellipse",
-                        choices=["zolotarev", "ellipse"],
-                        help="Quadrature type for FEAST filter (default: ellipse).")
-    parser.add_argument(
-        "--feast-units-ev-per-ry",
-        type=float,
-        default=13.6056980659,
-        help="Energy conversion Ry -> eV for FEAST report.",
-    )
-    parser.add_argument("--feast-ritz-count", type=int, default=4, help="Ritz values per window.")
-    parser.add_argument("--gmres-max-iter", type=int, default=10, help="GMRES iterations per shift.")
-    parser.add_argument("--gmres-tol", type=float, default=1e-2, help="GMRES relative tolerance.")
-    parser.add_argument("--gmres-seed", type=int, default=0, help="GMRES random seed.")
-    parser.add_argument("--gmres-fp32", action="store_true",
-                        help="Use FP32 data/GMRES for shifted solves.")
     parser.add_argument("--tda", action="store_true",
                         help="Use Tamm-Dancoff approximation (TDA). Default is full non-TDA.")
     parser.add_argument("--rpa", action="store_true",
@@ -676,28 +657,7 @@ def _settings_parser():
     parser.add_argument("--bse", action="store_true",
                         help="Use full BSE kernel (D+V-W). Overrides default RPA.")
     parser.add_argument("--kpm-window-count", type=int, default=4,
-                        help="Number of KPM-derived windows for FEAST.")
-    parser.add_argument("--feast", action="store_true",
-                        help="FEAST window solver (the default route until 2026-10-21; "
-                             "now explicit).  Refuses unless every in-window Ritz pair "
-                             "is below --feast-tol-mev (GATE feast_converged)")
-    parser.add_argument("--feast-tol-mev", type=float, default=0.01,
-                        help="--feast: every in-window Ritz pair's residual "
-                             "||H x - E x|| below this (meV), the Davidson default")
-    parser.add_argument("--feast-iter", type=int, default=2,
-                        help="--feast: FEAST subspace iterations (bse_feast's default)")
-    parser.add_argument(
-        "--feast-window1",
-        nargs=2,
-        metavar=("A", "B"),
-        help="Override FEAST window 1 bounds in eV (use 'auto' for B).",
-    )
-    parser.add_argument(
-        "--feast-window2",
-        nargs=2,
-        metavar=("A", "B"),
-        help="Override FEAST window 2 bounds in eV (use 'auto' for B).",
-    )
+                        help="Number of DOS-weighted windows the KPM route reports.")
     parser.add_argument(
         "--write-eigs",
         nargs="?",
@@ -972,21 +932,6 @@ BSE_KEYS = {
     "kpm_emin_ev": Key("kpm_emin_ev", "float"),
     "kpm_emax_ev": Key("kpm_emax_ev", "float"),
     "kpm_plot_file": Key("kpm_plot_file", "str"),
-    "feast": Key("feast", "bool"),
-    "feast_n_lanczos": Key("feast_n_lanczos", "int"),
-    "feast_buffer": Key("feast_buffer", "float"),
-    "feast_n_quad1": Key("feast_n_quad1", "int"),
-    "feast_n_quad2": Key("feast_n_quad2", "int"),
-    "feast_quadrature": Key("feast_quadrature", choices=("zolotarev", "ellipse")),
-    "feast_ritz_count": Key("feast_ritz_count", "int"),
-    "feast_tol_mev": Key("feast_tol_mev", "float"),
-    "feast_iter": Key("feast_iter", "int"),
-    "feast_window1": Key("feast_window1", "str", convert=str.split),
-    "feast_window2": Key("feast_window2", "str", convert=str.split),
-    "gmres_max_iter": Key("gmres_max_iter", "int"),
-    "gmres_tol": Key("gmres_tol", "float"),
-    "gmres_seed": Key("gmres_seed", "int"),
-    "gmres_fp32": Key("gmres_fp32", "bool"),
 }
 
 #: Deck keys the other BSE drivers also read (bse.absorption_haydock,
@@ -1002,18 +947,12 @@ _SHARED_KEYS = frozenset({
 })
 
 #: The settings each route reads, beyond the ones every route reads.  A key
-#: the deck sets on a route that does not read it refuses by name: the FEAST
-#: route used to drop the QP energies, the root count, the occupations and
-#: the solver settings silently, so a QP run came back on DFT energies.
+#: the deck sets on a route that does not read it refuses by name: a route
+#: that drops the QP energies, the root count, the occupations or the solver
+#: settings silently would come back on DFT energies.
 _COMMON_DESTS = {"input", "n_val", "n_cond", "px", "py", "rpa", "bse", "tda",
-                 "feast", "kpm_dos"}
+                 "kpm_dos"}
 _ROUTE_DESTS = {
-    "feast": {
-        "feast_n_lanczos", "feast_buffer", "feast_n_quad1", "feast_n_quad2",
-        "feast_quadrature", "feast_units_ev_per_ry", "feast_ritz_count",
-        "gmres_max_iter", "gmres_tol", "gmres_seed", "gmres_fp32",
-        "kpm_window_count", "kpm_n_moments", "kpm_n_random", "kpm_n_lanczos",
-        "feast_window1", "feast_window2", "feast_tol_mev", "feast_iter"},
     "kpm": {
         "kpm_n_moments", "kpm_n_random", "kpm_n_lanczos", "kpm_window_count",
         "kpm_plot_file", "kpm_emin_ev", "kpm_emax_ev"},
@@ -1034,7 +973,7 @@ _ROUTE_DESTS = {
 }
 
 #: The route names the refusals print ("lanczos" is the eigensolve).
-_ROUTE_NAMES = {"lanczos": "eigensolve", "feast": "feast", "kpm": "kpm_dos"}
+_ROUTE_NAMES = {"lanczos": "eigensolve", "kpm": "kpm_dos"}
 
 #: On the eigensolve route, the settings only one ``solver`` reads.  One set
 #: away from its default under another solver refuses: the default solver
@@ -1121,10 +1060,7 @@ def parse_args(argv=None):
     by_key = key_of(BSE_KEYS)
     name = lambda dest: "eqp_corrections" if dest == "eqp" else by_key(dest)  # noqa: E731
     schema_dests = set(vars(schema.parse_args([])))
-    if args.kpm_dos and args.feast:
-        parser.error("deck keys `kpm_dos` and `feast` each select a route (the "
-                     "eigensolve is the default); give one")
-    route = "kpm" if args.kpm_dos else "feast" if args.feast else "lanczos"
+    route = "kpm" if args.kpm_dos else "lanczos"
     ignored = sorted(
         f"`{name(dest)}`" for dest, value in vars(args).items()
         if dest not in _COMMON_DESTS | _ROUTE_DESTS[route]
@@ -1137,8 +1073,8 @@ def parse_args(argv=None):
             f"read by the {_ROUTE_NAMES[route]} route and would be ignored; drop "
             f"{'it' if len(ignored) == 1 else 'them'} or choose the route "
             f"that reads {'it' if len(ignored) == 1 else 'them'} (the default, "
-            f"the eigensolve with QP energies and eigenvectors; feast = true for "
-            f"FEAST windows; kpm_dos = true for the density of states)")
+            f"the eigensolve with QP energies and eigenvectors; kpm_dos = true for "
+            f"the density of states)")
     if args.eqp is not None and args.qp_rotations is not None:
         parser.error("eqp_corrections and qp_rotations_file are two descriptions "
                      "of the QP state: the first relabels DFT bands with diagonal "
@@ -1401,8 +1337,8 @@ def main(argv=None) -> int:
     route, args = parse_args(argv)
 
     # Omitted --px/--py = the run's canonical square mesh, not 1x1.  A shape
-    # that is not the job's refuses here, above every route, and the FEAST
-    # and KPM routes are handed the resolved shape.
+    # that is not the job's refuses here, above every route, and the KPM
+    # route is handed the resolved shape.
     mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
     args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
     use_tda = args.tda
@@ -1417,40 +1353,6 @@ def main(argv=None) -> int:
             n_windows=args.kpm_window_count, plot_file=args.kpm_plot_file,
             rpa=use_rpa, tda=use_tda, emin_ev=args.kpm_emin_ev,
             emax_ev=args.kpm_emax_ev))
-        return 0
-
-    if route == "feast":
-        if use_tda:
-            # GATE feast_tda_complex: the TDA contour sums 2 Re over the upper
-            # half-plane from real starts into real Ritz vectors, exact only
-            # for a real symmetric A; LORRAX's A is complex Hermitian.
-            raise SystemExit(
-                "lorrax: GATE feast_tda_complex: feast = true with the TDA cannot "
-                "converge on a complex A (real Ritz vectors); use the default "
-                "Davidson eigensolve (drop feast = true), or full_bse = true.")
-        log.warning("NOTE: feast = true is deprecated and experimental; the "
-                    "default Davidson eigensolve is the supported route.",
-                    extra={"lorrax": {"id": "feast_deprecated", "kind": "NOTE"}})
-        from . import bse_feast
-        bse_feast.run(bse_feast.settings(
-            args.input, n_val=args.n_val, n_cond=args.n_cond, px=args.px,
-            py=args.py, n_lanczos=args.feast_n_lanczos,
-            buffer=args.feast_buffer, n_quad1=args.feast_n_quad1,
-            n_quad2=args.feast_n_quad2, quadrature=args.feast_quadrature,
-            units_ev_per_ry=args.feast_units_ev_per_ry, feast_ritz=True,
-            feast_ritz_count=args.feast_ritz_count,
-            gmres_max_iter=args.gmres_max_iter, gmres_tol=args.gmres_tol,
-            gmres_seed=args.gmres_seed, gmres_fp32=args.gmres_fp32,
-            # KPM-weighted windows unless the deck names its own: bse_feast
-            # reads feast_window1/2 only when windows_kpm is off.
-            rpa=use_rpa, tda=use_tda,
-            windows_kpm=args.feast_window1 is None and args.feast_window2 is None,
-            windows_kpm_count=args.kpm_window_count,
-            kpm_n_moments=args.kpm_n_moments,
-            kpm_n_random=args.kpm_n_random, kpm_seed=args.gmres_seed,
-            kpm_n_energy_pts=2000, kpm_n_lanczos=args.kpm_n_lanczos,
-            window1=args.feast_window1, window2=args.feast_window2,
-            feast_iter=args.feast_iter, feast_tol_mev=args.feast_tol_mev))
         return 0
 
     # Non-TDA (full BSE) now flows through the same preview via the

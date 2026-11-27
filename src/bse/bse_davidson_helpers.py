@@ -258,10 +258,11 @@ def resolve_precond_route(route: str, bse_dim: int) -> str:
 # static, so each route traces its own program and neither can perturb the other.
 #
 # ``complex_out``.  Davidson divides a real residual by ``diag − lambda`` and takes
-# ``real()``; FEAST divides by ``z − diag`` at a COMPLEX quadrature node and wants
-# the operator's antihermitian residue kept.  On the record deck that residue is
+# ``real()``; the shifted GMRES solves (the former FEAST route among them) divide
+# by ``z − diag`` at a COMPLEX shift and want the operator's antihermitian residue
+# kept.  On the record deck that residue is
 # ``max|Im| = 1.13e-14 Ry = 1.5e-13 eV`` against a 0.62 Ry signal — negligible in
-# size, but it is FEAST's to keep or drop, not this function's, so the flag
+# size, but it is the solve's to keep or drop, not this function's, so the flag
 # carries it rather than deciding it.
 #
 # ``W_q0=None``.  The RPA density-response and pseudopole routes solve with
@@ -453,8 +454,8 @@ def build_bse_exact_diagonal(
         ``None`` means ``include_W=False``: the screened-direct term is not
         emitted at all (RPA density-response and pseudopole routes).
     complex_out : keep the assembled diagonal COMPLEX instead of taking
-        ``real()``.  FEAST's shifted solves want it (they divide by
-        ``z − diag`` at a complex quadrature node); Davidson does not.  See
+        ``real()``.  The shifted GMRES solves want it (they divide by
+        ``z − diag`` at a complex shift); Davidson does not.  See
         the note over :func:`_exact_diagonal_kernel`.
 
     Returns
@@ -471,7 +472,7 @@ def build_bse_exact_diagonal(
         memo = False
     # ``complex_out`` is part of the memo key, not just the program key: the two
     # routes return DIFFERENT objects for the same operands, and a memo that
-    # ignored the flag would hand FEAST Davidson's real diagonal.
+    # ignored the flag would hand a shifted solve Davidson's real diagonal.
     meta = (int(nk), sharding, bool(complex_out), exchange_channel)
     if memo:
         hit = _DIAG_MEMO.get(meta, operands)

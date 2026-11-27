@@ -95,10 +95,28 @@ def deck_params(deck_path: str) -> dict:
     return params, set(params.get(_DECK_NAMED_KEYS, ()))
 
 
+_FEAST_FIX = ("remove the key; `full_bse = true` with `full_bse_solver = davidson` "
+              "solves the full BSE")
+
 #: Input keys of retired BSE routes.  Named in an input file they refuse:
 #: an unknown key is otherwise left alone, and the run would silently be another one.
 RETIRED_KEYS = {
     # key: (what it selected, what to do instead)
+    "feast": ("the FEAST contour eigensolver route", _FEAST_FIX),
+    "feast_n_lanczos": ("the Lanczos steps of the FEAST spectral bounds", _FEAST_FIX),
+    "feast_buffer": ("the E_max buffer of the FEAST windows", _FEAST_FIX),
+    "feast_n_quad1": ("the quadrature points of the first FEAST iteration", _FEAST_FIX),
+    "feast_n_quad2": ("the quadrature points of later FEAST iterations", _FEAST_FIX),
+    "feast_quadrature": ("the FEAST quadrature type", _FEAST_FIX),
+    "feast_ritz_count": ("the Ritz values per FEAST window", _FEAST_FIX),
+    "feast_tol_mev": ("the FEAST convergence gate", _FEAST_FIX),
+    "feast_iter": ("the FEAST subspace iterations", _FEAST_FIX),
+    "feast_window1": ("the first FEAST window", _FEAST_FIX),
+    "feast_window2": ("the second FEAST window", _FEAST_FIX),
+    "gmres_max_iter": ("the GMRES iterations per FEAST quadrature node", _FEAST_FIX),
+    "gmres_tol": ("the GMRES tolerance of the FEAST quadrature solves", _FEAST_FIX),
+    "gmres_seed": ("the random seed of the FEAST starting vectors", _FEAST_FIX),
+    "gmres_fp32": ("single-precision GMRES in the FEAST quadrature solves", _FEAST_FIX),
     "trlan_m_max": ("the basis size of the thick-restart Lanczos eigensolver",
                     "drop the key; the Tamm-Dancoff eigensolver is the Davidson (`davidson_m_max` "
                     "sets its basis capacity)"),

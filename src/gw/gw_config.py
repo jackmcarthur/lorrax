@@ -1618,7 +1618,7 @@ _DEFAULTS = {
     # (``bse_io.load_bse_data_from_restart_sharded``) interpolates the ENTIRE
     # BSE problem — ψ, QP ε (htransform fH), V_Q exchange (vq_interp), and the
     # W direct term (per-pair WS embedding in R) — from the coarse grid onto this fine grid
-    # BEFORE any solve, so EVERY BSE solver (exciton_bands / feast / nontda /
+    # BEFORE any solve, so EVERY BSE solver (exciton_bands / nontda /
     # kpm / resolvent) transparently runs on the fine grid.  Each fine length
     # must be at least the matching coarse length; integer nesting is not
     # required (8x8x1→12x12x1 evaluates the same coarse Fourier polynomial).
@@ -2006,7 +2006,9 @@ BSE_DECK_KEYS = (
     "haydock", "number_iterations", "energy_resolution", "omega_min_ev",
     "omega_max_ev", "delta_frequency", "no_eps1", "polarization", "lorentzian_broadening",
     "gaussian_broadening",
-    # KPM density of states and FEAST windows
+    # KPM density of states; the FEAST keys (feast*, gmres_*) are retired and
+    # stay readable only so the BSE drivers refuse them by name
+    # (``bse.bse_deck.RETIRED_KEYS``)
     "kpm_dos", "kpm_window_count", "kpm_n_moments", "kpm_n_random",
     "kpm_n_lanczos", "kpm_emin_ev", "kpm_emax_ev", "kpm_plot_file",
     "feast", "feast_n_lanczos", "feast_buffer", "feast_n_quad1", "feast_n_quad2",
