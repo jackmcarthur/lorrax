@@ -27,9 +27,7 @@ on REAL identity columns ``E`` (``conj(E) = E``):
     pair(E, +1) = (A + B) E,   pair(E, -1) = (A - B) E,
     A = (pair(E, +1) + pair(E, -1)) / 2,   B = (pair(E, +1) - pair(E, -1)) / 2,
 
-one pair call per column chunk with the signs riding the trials.  (A +- B) on a
-complex block composes from the full matvec (``make_ab_appliers``):
-``H[U; sU] = [A U + s B U ; -B* U - s A* U]`` and the X-block is the top row.
+one pair call per column chunk with the signs riding the trials.
 
 Structure-preserving reduction, dispatched on B's symmetry:
 
@@ -47,8 +45,7 @@ Structure-preserving reduction, dispatched on B's symmetry:
   (``BSE_NTDA_SOLVER_SSEIG``).
 
 * B Hermitian (real BSE / RPA density response): (A +- B) are Hermitian PD, so
-  ``omega^2 = eig((A-B)(A+B))`` (Shao et al. LAA 488; BSEPACK product form) — the
-  clean matrix-free (A+B)-metric Lanczos over the ``make_ab_appliers`` actions.
+  ``omega^2 = eig((A-B)(A+B))`` (Shao et al. LAA 488; BSEPACK product form).
   Solved densely here for parity; used by the real-symmetric gate.
 
 Eigenvectors: normalised (X, Y) pairs with the standard ``X^H X - Y^H Y = +1``
@@ -370,20 +367,6 @@ def _full_matvec_and_args(data, mesh_xy, sh, *, include_W):
     return pair, args
 
 
-def make_ab_appliers(matvec_full, args, sh):
-    """Return (apply_ApB, apply_AmB): matrix-free (A+-B) from the full matvec.
-
-    ``U`` is a pair-basis block ``(b, nc, nv, nk)`` (``sh.X``); ``(A+-B)U`` is the
-    X-block of the full matvec applied to ``[U; +-U]`` (module docstring).
-    Reuses the production kernel verbatim; the design's matrix-free reduction
-    (real BSE) and any future FEAST-on-K build on these two closures."""
-    def _apply(U, sign):
-        UU = jax.lax.with_sharding_constraint(
-            jnp.stack([U, sign * U], axis=0).astype(jnp.complex128), sh.X_full)
-        return jax.lax.with_sharding_constraint(matvec_full(UU, *args)[0], sh.X)
-    return (lambda U: _apply(U, 1.0)), (lambda U: _apply(U, -1.0))
-
-
 def _materialize_A_B(pair, args, sh, nc, nv, nk, *, col_chunk=_DENSE_COL_CHUNK):
     """Dense A, B (N x N, N = nc*nv*nk) from the pair applier, one chunk of
     identity columns per call.
@@ -583,8 +566,7 @@ def solve_nontda_product(A, B, n_eig):
     """Real-BSE product reduction (dense): omega^2 from (A-B)(A+B); recover X, Y.
 
     Correct when H is real (A and B real symmetric, so (A +- B) are real
-    symmetric PD: the RPA / real-orbital case).  Reference for the
-    matrix-free (A+B)-metric Lanczos over ``make_ab_appliers`` (follow-on).
+    symmetric PD: the RPA / real-orbital case).
 
     The product is solved in its symmetric form,
     ``S (A-B) S t = omega^2 t`` with ``S = (A+B)^{1/2}``, by ``eigh``: the
