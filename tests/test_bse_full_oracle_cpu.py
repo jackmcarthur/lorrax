@@ -203,3 +203,30 @@ def test_production_dense_pencil_solve_agrees_with_the_oracle(pencils):
     p = pencils["indefinite"]
     with pytest.raises(ValueError, match="NOT positive definite"):
         solve_nontda_definite_pencil(p["A"], p["B"], 5)
+
+
+@pytest.mark.parametrize("k_min", (1e-8, 1e-9))
+def test_production_dense_solve_keeps_its_digits_near_a_zero_mode(k_min):
+    """A soft mode (``lambda_min(K) = k_min`` Ry) must not cost the other roots their digits.
+
+    The roots are compared with the generator's independent values
+    (``eigvalsh(P^(1/2) M P^(1/2))``).  The Cholesky form ``L^-1 Sigma L^-H`` holds every root to
+    1e-10 Ry and the eigenpair residual to 1e-10; the ``K^(-1/2)`` form it replaced lost them on
+    all 39 other roots (4.3e-10 Ry at ``k_min = 1e-8``, 5.0e-9 Ry at 1e-9; residual 1.4e-9 and
+    1.3e-8), which is the red twin of this test.
+    """
+    pytest.importorskip("jax")
+    from bse.bse_nontda import solve_nontda_definite_pencil
+    p = orc.near_singular_pencil(eps=k_min)
+    A, B, n = p["A"], p["B"], p["n"]
+    assert abs(p["k_min"] - k_min) <= 1e-3 * k_min and p["omega_exact"][0] < 1e-3
+    omega, Z = solve_nontda_definite_pencil(A, B, n)
+    X, Y = Z[:n], Z[n:]
+    err = np.abs(omega - p["omega_exact"])
+    resid = orc.eigpair_residuals(A, B, omega, X, Y)
+    print(f"MEASURED dense reference, k_min = {k_min:g} Ry: soft root error {err[0]:.2e} Ry, "
+          f"other roots {err[1:].max():.2e} Ry, residual {resid.max():.2e}", flush=True)
+    assert err.max() <= 1e-10, err.max()
+    assert resid.max() <= 1e-10, resid.max()
+    assert np.max(np.abs(orc.sigma_norms(X, Y) - 1.0)) <= 1e-12
+    assert np.max(np.abs(orc.sigma_gram(X, Y) - np.eye(n))) <= NORM_TOL

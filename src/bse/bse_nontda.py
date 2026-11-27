@@ -40,8 +40,9 @@ Structure-preserving reduction, dispatched on B's symmetry:
       K z = omega Sigma z,  K = [[A, B],[B*, A*]] (Hermitian),  Sigma = diag(I,-I)
 
   with ``K`` positive definite for a stable (real) spectrum.  Lowest positive
-  omega are the extreme eigenvalues of the Hermitian ``Shat = K^{-1/2} Sigma
-  K^{-1/2}`` (eigenvalue ``1/omega``).  Solved densely for small windows — the
+  omega are the extreme eigenvalues of the Hermitian ``Shat = L^-1 Sigma
+  L^-H`` with ``K = L L^H`` (eigenvalue ``1/omega``; Shao et al., LAA 488,
+  Algorithm 1).  Solved densely for small windows — the
   BGW-parity regime, where BGW itself uses dense ScaLAPACK
   (``BSE_NTDA_SOLVER_SSEIG``).
 
@@ -87,6 +88,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+from scipy.linalg import solve_triangular
 import jax
 import jax.numpy as jnp
 
@@ -349,7 +351,35 @@ def solve_nontda_definite_pencil(A, B, n_eig, *, pd_rtol=1e-10):
     (A-B) not positive definite => imaginary excitations; detected, not hidden).
     Refuses an A that is not Hermitian and a B that is not complex symmetric
     (:func:`refuse_asymmetric_coupling`) before it symmetrises K.
-    Returns (omega[:n_eig] ascending, Z (2N, n_eig)) with X^H X - Y^H Y = +1."""
+
+    The reduction is the Cholesky form of Shao, da Jornada, Yang, Deslippe and
+    Louie, Linear Algebra Appl. 488 (2016) 148, Algorithm 1, on the complex
+    pencil: ``K = L L^H``, and the Hermitian ``L^-1 Sigma L^-H`` has the
+    eigenvalues ``+-1/omega`` with ``z = L^-H y / sqrt(1/omega)``.  It replaced
+    the ``K^(-1/2) Sigma K^(-1/2)`` form (2026-11-27), which lost digits on
+    every root once ``K`` had a small eigenvalue: on a 40-transition pencil with
+    ``lambda_min(K) = 1e-8`` (``1e-9``) Ry the 39 roots above the soft one were
+    wrong by 4.3e-10 (5.0e-9) Ry and are now right to 4.3e-13 (2.3e-12) Ry
+    (``tests/test_bse_full_oracle_cpu.py``).  The definiteness gate is unchanged.
+
+    Parameters
+    ----------
+    A, B : (N, N) complex, Ry
+        Resonant block (Hermitian) and coupling block (complex symmetric),
+        flat transition index, host arrays.
+    n_eig : int
+        Lowest positive roots returned.
+    pd_rtol : float
+        ``K`` counts as positive definite above ``pd_rtol`` times its largest
+        eigenvalue.
+
+    Returns
+    -------
+    omega : (n_eig,) float, Ry, ascending.
+    Z : (2N, n_eig) complex
+        ``[X; Y]`` columns with ``X^H X - Y^H Y = +1``, Sigma-orthonormal
+        inside a degenerate multiplet too.
+    """
     A = np.asarray(A); B = np.asarray(B); N = A.shape[0]
     a_herm = np.linalg.norm(A - A.conj().T) / max(np.linalg.norm(A), 1e-300)
     if a_herm > 1e-6:
@@ -364,22 +394,23 @@ def solve_nontda_definite_pencil(A, B, n_eig, *, pd_rtol=1e-10):
     refuse_asymmetric_coupling(B)
     K = np.block([[A, B], [B.conj(), A.conj()]])
     K = 0.5 * (K + K.conj().T)                       # round-off cleanup, after the gates
-    w, U = np.linalg.eigh(K)
+    w = np.linalg.eigvalsh(K)                        # the definiteness gate's measurement
     if w.min() <= pd_rtol * max(w.max(), 1e-300):
         raise ValueError(
             f"non-TDA pencil K=[[A,B],[B*,A*]] is NOT positive definite "
             f"(min eig {w.min():.3e}). Triplet/charge instability: (A-B) is not "
             "positive definite, so BSE excitation energies are imaginary. This is "
             "physical — fix the screening/window; not hidden.")
-    Kmh = (U * (1.0 / np.sqrt(w))) @ U.conj().T                # K^{-1/2}
+    L = np.linalg.cholesky(K)                                  # K = L L^H
     sig = np.concatenate([np.ones(N), -np.ones(N)])
-    Shat = Kmh @ (sig[:, None] * Kmh)
+    T = solve_triangular(L, np.diag(sig).astype(K.dtype), lower=True)     # L^-1 Sigma
+    Shat = solve_triangular(L, T.conj().T, lower=True).conj().T           # L^-1 Sigma L^-H
     Shat = 0.5 * (Shat + Shat.conj().T)
     mu, Y = np.linalg.eigh(Shat)                               # mu = 1/omega, +/- pairs
     idx = np.where(mu > 0)[0]
     idx = idx[np.argsort(-mu[idx])][:n_eig]                    # largest 1/omega = lowest omega
     omega = 1.0 / mu[idx]
-    Z = _recover_xy(Kmh @ Y[:, idx], N, n_eig)
+    Z = _recover_xy(solve_triangular(L.conj().T, Y[:, idx], lower=False), N, n_eig)
     order = np.argsort(omega)
     return omega[order], Z[:, order]
 
