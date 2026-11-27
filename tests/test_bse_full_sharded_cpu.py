@@ -168,6 +168,23 @@ def test_no_docstring_claims_a_mesh_refusal():
         assert stale not in flat, f"stale mesh-refusal claim in bse_nontda: {stale!r}"
 
 
+def test_matrixfree_follows_include_w_and_refuses_unknown_options(mesh, ops, dense_ref):
+    """``include_W = False`` reaches the matrix-free applier (roots equal the dense route's, not the W ones);
+    a misspelled option refuses instead of being swallowed."""
+    kw = dict(MF_SETTINGS["restarted"], include_W=False)
+    omega_mf, _ = _solve(mesh, ops, "matrixfree", **kw)
+    omega_dn, _ = _solve(mesh, ops, "dense", include_W=False)
+    err = float(np.max(np.abs(omega_mf - omega_dn)))
+    shift = float(np.max(np.abs(omega_dn - dense_ref["omega"])))
+    print(f"MEASURED include_W=False 2x2: max|mf - dense| = {err:.3e} Ry; W shifts the roots by {shift:.3e} Ry",
+          flush=True)
+    assert shift > 1e-4, "the W term must matter here, or this test checks nothing"
+    assert err <= ROOT_TOL
+    with pytest.raises(ValueError, match="unknown option") as exc:
+        _solve(mesh, ops, "matrixfree", mf_m_maxx=56)
+    assert "mf_m_maxx" in str(exc.value)
+
+
 def test_oracle_assembles_the_sharded_pair_applier(mesh, ops, dense_ref):
     """Identity columns through the 2x2 fused pair applier give ``A = A^H``, ``B = B^T``, the dense roots."""
     sh = make_bse_shardings(mesh)

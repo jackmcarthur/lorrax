@@ -475,10 +475,14 @@ def refuse_unconverged_sdy(dg, *, n_eig, tol_mev, n_restarts) -> str:
     return line
 
 
-def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
+def _solve_nontda_matrix_free(pair, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
                               m_max=140, n_keep=40, n_restarts=50,
                               tol_mev=MF_TOL_MEV, metric_tol=_MF_METRIC_TOL, log=None):
     """Lowest ``n_eig`` (omega, X, Y) with no dense assembly.
+
+    ``pair`` and ``args`` are the fused pair applier and its 9 operands from
+    :func:`_full_matvec_and_args`, built for the caller's ``include_W``: the
+    route applies exactly the operator whose operands it was given.
 
     Returns ``(omega_Ry, Z (2N, n_eig))`` in the same convention
     ``solve_nontda_definite_pencil`` returns, so the caller cannot tell the two
@@ -487,14 +491,10 @@ def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
     """
     from functools import partial
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from .bse_stack_matvec import build_bse_stack_pair_matvec
     from solvers.bse_sp_lanczos import (sdy_lanczos_eig, sdy_pair_applications,
                                         sdy_steps)
     from common.units import RYD_TO_EV
 
-    nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
-    pair = build_bse_stack_pair_matvec(mesh_xy, nkx, nky, nkz,
-                                     exchange_channel=data.get("exchange_channel", "singlet"))
     rep = NamedSharding(mesh_xy, P())
     UV_sh = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
     in_sh = (sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y, sh.eps, sh.eps,
@@ -574,7 +574,7 @@ def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
 def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
                              recip_tol=_NONTDA_RECIP_TOL, solver="dense",
                              mf_m_max=140, mf_n_keep=40, mf_n_restarts=50,
-                             mf_tol_mev=MF_TOL_MEV, **_ignored):
+                             mf_tol_mev=MF_TOL_MEV, **unknown):
     """Non-TDA (full BSE) lowest-eigenvalue solve — one entry, dispatched on B.
 
     Returns ``(eigenvalues_Ry (n_eig,), eigenvectors (n_eig, 2, nc, nv, nk),
@@ -606,6 +606,14 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
         Restart cycles stop when every root's ω residual is below
         ``mf_tol_mev`` (cap ``mf_n_restarts``); a capped stop refuses
         (GATE nontda_converged)."""
+    if unknown:
+        raise ValueError(
+            f"solve_bse_nontda_sharded: unknown option(s) {sorted(unknown)} (got: "
+            f"{sorted(unknown)}; want: one of n_eig, include_W, recip_tol, solver, "
+            f"mf_m_max, mf_n_keep, mf_n_restarts, mf_tol_mev).  Why: an option this "
+            f"route does not read would be dropped silently and the solve would run "
+            f"with a setting you did not ask for.  Fix: correct the spelling, or "
+            f"drop the option.")
     if solver not in ("dense", "matrixfree"):
         raise ValueError(
             f"solve_bse_nontda_sharded: solver must be 'dense' or "
@@ -625,7 +633,7 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
     N = nc * nv * nk
     if solver == "matrixfree":
         omega, Z = _solve_nontda_matrix_free(
-            data, mesh_xy, sh, args, nc, nv, nk, n_eig,
+            pair, mesh_xy, sh, args, nc, nv, nk, n_eig,
             m_max=mf_m_max, n_keep=mf_n_keep, n_restarts=mf_n_restarts,
             tol_mev=mf_tol_mev, log=_log0)
         evecs = np.stack([Z[:N, :].T.reshape(n_eig, nc, nv, nk),
