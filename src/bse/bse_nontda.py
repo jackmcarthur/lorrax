@@ -89,8 +89,8 @@ preconditioner, the start block on the physical transitions, soft locking,
 margin roots, restarts under a priced basis capacity and a residual stop in
 meV that refuses when not met (:func:`_solve_nontda_davidson`).  No assembly,
 no size limit, every vector on the mesh's transition axes.  It is reached from
-``bse_jax`` by ``full_bse_solver = davidson``; the dense route is still what
-``full_bse = true`` runs by default.  A ``K`` that is not positive definite
+``bse_jax`` by ``full_bse_solver = davidson``, the default of ``full_bse = true``
+(the dense route is ``full_bse_solver = dense``).  A ``K`` that is not positive definite
 refuses with the measured ``lam_min``, or, under ``on_indefinite='continue'``
 (``full_bse_instability = continue``), is solved on with the unstable roots
 reported and kept in :data:`LAST_DAVIDSON`.
@@ -126,7 +126,7 @@ def _dense_refusal(N: int) -> str:
     return (f"non-TDA dense window N={N} (n_cond x n_val x nk, mesh-padded) exceeds "
             f"_DENSE_N_MAX={_DENSE_N_MAX}: the dense structure-preserving solve "
             "assembles A and B, O(N^2).  Alternatives: full_bse_solver = davidson (the "
-            "structure-preserving Davidson for the full BSE: no assembly, no size limit, "
+            "default: drop full_bse_solver = dense; the structure-preserving Davidson for the full BSE: no assembly, no size limit, "
             "paired (X, Y) eigenvectors), full_bse = false (the TDA Davidson, the "
             "default eigensolve), feast = true (FEAST windows, refused unless converged to "
             "feast_tol_mev), or a smaller number_val_bands_fine / number_cond_bands_fine.  The matrix-free SDY "
@@ -778,7 +778,7 @@ def _solve_nontda_matrix_free(pair, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
 # physical transitions, the exact diagonal, soft locking, margin roots, the
 # basis admission.  It keeps every vector on the mesh's transition axes; only
 # coefficient matrices cross it.  Reached from ``bse_jax`` by
-# ``full_bse_solver = davidson``; the dense route stays the default.
+# ``full_bse_solver = davidson``, the default; the dense route is ``full_bse_solver = dense``.
 
 #: Largest ``|X_i^H X_j - Y_i^H Y_j - delta_ij|`` accepted on the returned roots.
 #: The solver's normalisation is exact to rounding (1e-12 with ``|Y|^2`` of 1e4),

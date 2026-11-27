@@ -221,7 +221,8 @@ def _driver_cases(mesh, ops):
     real_load = bse_io.load_bse_data_from_restart_sharded
     try:
         bse_io.load_bse_data_from_restart_sharded = lambda *a, **k: loads.append(1)
-        bse_jax._preview_lanczos("toy.in", NV, NC, n_eig=N_EIG, tda=False, kgrid=(16, 16, 2))
+        bse_jax._preview_lanczos("toy.in", NV, NC, n_eig=N_EIG, tda=False, kgrid=(16, 16, 2),
+                                 full_bse_solver="dense")
         dense_gate = "no refusal"
     except ValueError as exc:
         dense_gate = str(exc)

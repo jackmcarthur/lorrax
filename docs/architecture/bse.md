@@ -461,8 +461,8 @@ per rank. The fused kernel runs at 2.27× the flop floor.
 | Davidson (default) | `full_bse = false` (no route flag; `the eigensolve` is an alias) | `solvers.davidson.davidson` with `lock_converged`, the exact diagonal preconditioner and start subspace from `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots, stopped when every residual is below `davidson_tol_mev` (0.01 meV) |
 | Lanczos, block Lanczos | `full_bse = false solver = block_lanczos` | `bse_lanczos.solve_bse_sharded` | spectrum shape; fixed Krylov dimension, CGS2 reorthogonalization, full window by default |
 | thick-restart Lanczos | `full_bse = false solver = trlan` | `solvers.thick_restart_lanczos` | Krylov memory capped at `trlan_m_max` |
-| full BSE, dense (default) | no route flag, `full_bse = true` (`bse.exciton_bands`: input key `full_bse_solver = dense`, the default) | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve of the assembled $A$ and $B$, N ≤ 4096; at a finite pair momentum, of the four assembled blocks of $\mathcal K$ |
-| full BSE, Davidson | `full_bse = true full_bse_solver = davidson` | `solvers.bse_sp_davidson` through `bse.bse_nontda`, with the exact diagonal ($[D; -D]$, or $[D; -D']$ at finite $Q$) and the start subspace of `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots with their $(X, Y)$, no assembly and no size limit, stopped when every residual is below `davidson_tol_mev` (0.01 meV); reports $\lambda_{\min}(\mathcal K)$; at finite $Q$ the unpaired form |
+| full BSE, dense (reference) | `full_bse = true full_bse_solver = dense` (also `bse.exciton_bands`' input key) | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve of the assembled $A$ and $B$, N ≤ 4096; at a finite pair momentum, of the four assembled blocks of $\mathcal K$ |
+| full BSE, Davidson (default) | `full_bse = true` (`full_bse_solver = davidson`, the default; also `bse.exciton_bands`' input key) | `solvers.bse_sp_davidson` through `bse.bse_nontda`, with the exact diagonal ($[D; -D]$, or $[D; -D']$ at finite $Q$) and the start subspace of `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots with their $(X, Y)$, no assembly and no size limit, stopped when every residual is below `davidson_tol_mev` (0.01 meV); reports $\lambda_{\min}(\mathcal K)$; at finite $Q$ the unpaired form |
 | FEAST | `feast = true` with `full_bse = true` (the TDA refuses it, `GATE feast_tda_complex`) | `bse.bse_feast` | contour eigensolve in KPM-sized windows; refuses unless every in-window Ritz residual is below `--feast-tol-mev` (0.01 meV, `GATE feast_converged`) |
 | density of states | `--kpm-dos`; `--tda` or not | `bse.bse_kpm` | KPM Chebyshev moments |
 | absorption | `python -m bse.absorption_haydock`, or `haydock = true` with `number_iterations` after the eigensolve | `bse.absorption_haydock` | ε₂(ω) by continued fraction on the TDA BSE (D + V − W), no eigenvectors |
@@ -471,7 +471,7 @@ Both full routes serve a finite pair momentum through `bse.exciton_bands`
 ([the form](#the-full-bse-at-a-finite-pair-momentum); the driver's keys are under *Exciton bands with
 `full_bse`* below); `bse.bse_jax` solves $Q = 0$.
 
-With `full_bse = true` the dense solve (`full_bse_solver = dense`, the default)
+With `full_bse = true` the dense solve (`full_bse_solver = dense`, the reference; the default is the Davidson)
 reads `number_eigenvalues` and the
 kernel only (`bse_lanczos.solve_bse_sharded` returns to `bse_nontda` before it reads any
 solver option). `bse_jax` refuses a `davidson_*`, `trlan_*` or `lanczos_*` key set away from its
@@ -590,7 +590,7 @@ iterations, 218 matvecs and roots. The driver itself at four ranks is the hsuite
 `exciton_bands_full` stage; no material has been run through the finite-$Q$ full BSE.
 
 **Exciton bands with `full_bse`.** `bse.exciton_bands` reads three input keys of `bse.bse_jax` for
-this problem: `full_bse`, `full_bse_solver = dense | davidson` (default `dense`; the dense solve is
+this problem: `full_bse`, `full_bse_solver = davidson | dense` (default `davidson`; the dense reference is
 limited to 4096 transitions per $Q$) and `full_bse_instability = refuse | continue`. One htransform
 returns the joint window, the BSE valence bands then the conduction bands, at every $k + Q$
 (`exciton_bands._htransform_window`); `build_pair_stacks` slices it into the conduction stacks and
@@ -1220,8 +1220,8 @@ a frozen-kernel approximation, not that self-consistent ladder map.
   the QP states. A `WFN_qp.h5` written before 2026-09-30 from a WFN that stores both
   k and −k has broken rows; regenerate it
   ([self-consistency §8](../self_consistency.md#8-seeding-restart-and-outputs)).
-- Full BSE through `the eigensolve` is dense by default and stops at N = 4096
-  (`_DENSE_N_MAX` in `bse/bse_nontda.py`); `full_bse_solver = davidson` has no size limit in the solve (the eigenvector writer gathers one state at a time). The
+- Full BSE through `the eigensolve` runs the Davidson by default, with no size limit in the solve (the eigenvector writer gathers one state at a time); `full_bse_solver = dense` stops at N = 4096
+  (`_DENSE_N_MAX` in `bse/bse_nontda.py`). The
   Davidson has run on GPU at 4 and 16 ranks on NiO up to 589,824 transitions (measured above) and
   on the CPU test payloads; no suite reruns the GPU cases. The matrix-free Lanczos
   (`solver='matrixfree'`) is not reachable from the CLI, and refuses a finite pair momentum and a head

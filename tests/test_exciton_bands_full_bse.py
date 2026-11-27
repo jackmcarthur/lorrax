@@ -169,11 +169,15 @@ def run_cases(mesh):
                                              davidson_margin_tol_Ry=None, davidson_m_max=None)
         and out["tuned_vs_eig_mev"] <= 0.01 and out["tuned_block"] == N_EIG + 4
         and refuses(["solver = block_lanczos", "davidson_olsen = true"], check=True)
-        and refuses(["full_bse = true", "davidson_margin = 4"], check=True)       # dense reads none
-        and not a0.full_bse and a0.full_solver == "dense"
+        and refuses(["full_bse = true", "full_bse_solver = dense", "davidson_margin = 4"],
+                    check=True)                                                  # dense reads none
+        and not refuses(["full_bse = true", "davidson_margin = 4"], check=True)  # the default reads it
+        and not a0.full_bse and a0.full_solver == "davidson"
         and refuses(["full_bse_solver = davidson"])
         and refuses(["full_bse = true", "solver = block_lanczos"])
-        and refuses(["full_bse = true", "full_bse_instability = continue"])      # dense has no such option
+        and refuses(["full_bse = true", "full_bse_solver = dense",
+                     "full_bse_instability = continue"])                         # dense has no such option
+        and not refuses(["full_bse = true", "full_bse_instability = continue"])
         and refuses(["qp_rotations_file = rot.h5"]) and refuses(["highest_occupied_band = 4"])
         and not refuses(["full_bse = true"]) and not refuses(["haydock = true"]))
     return out

@@ -125,7 +125,7 @@ def _preview_lanczos(
     cell_volume: float | None = None,
     kgrid: tuple | None = None,
     report=None,
-    full_bse_solver: str = "dense",
+    full_bse_solver: str = "davidson",
     full_bse_instability: str = "refuse",
 ) -> dict:
     full_davidson = not tda and full_bse_solver == "davidson"
@@ -843,13 +843,14 @@ def _settings_parser():
              "because Davidson stores V and HV.",
     )
     parser.add_argument(
-        "--full-bse-solver", choices=("dense", "davidson"), default="dense",
-        help="Eigensolver of the full BSE (full_bse = true).  ``dense`` (the "
-             "default): A and B assembled, host eigensolve, N <= 4096.  "
-             "``davidson``: the structure-preserving block Davidson over the pair "
+        "--full-bse-solver", choices=("dense", "davidson"), default="davidson",
+        help="Eigensolver of the full BSE (full_bse = true).  ``davidson`` (the "
+             "default): the structure-preserving block Davidson over the pair "
              "applier A X + B conj(X) (solvers.bse_sp_davidson), no assembly and no "
              "size limit, stopped when every root's residual is below "
-             "--davidson-tol-mev.  It reads solver_max_iter, davidson_tol_mev, "
+             "--davidson-tol-mev.  ``dense``: the reference, A and B assembled, "
+             "host eigensolve, N <= 4096; it reads neither the iteration cap nor "
+             "the Davidson settings.  The Davidson reads solver_max_iter, davidson_tol_mev, "
              "davidson_margin, davidson_margin_tol_mev, davidson_m_max (basis "
              "capacity in real-form vectors, default 20 n_eig; storage twice that), "
              "davidson_precond and davidson_eps_shift.",
@@ -1147,7 +1148,8 @@ def parse_args(argv=None):
         if dest not in _COMMON_DESTS | _ROUTE_DESTS[route]
         and name(dest) not in _SHARED_KEYS
         and dest in schema_dests
-        and value != schema.get_default(dest))
+        and (value != schema.get_default(dest)
+             or (dest == "full_bse_solver" and "full_bse_solver" in named)))
     if ignored:
         parser.error(
             f"{', '.join(ignored)} {'is' if len(ignored) == 1 else 'are'} not "
@@ -1164,7 +1166,8 @@ def parse_args(argv=None):
     if route == "lanczos" and args.tda:
         full_only = sorted(
             f"`{dest}`" for dest in ("full_bse_solver", "full_bse_instability")
-            if getattr(args, dest) != schema.get_default(dest))
+            if getattr(args, dest) != schema.get_default(dest)
+            or (dest == "full_bse_solver" and "full_bse_solver" in named))
         if full_only:
             parser.error(
                 f"{', '.join(full_only)} {'is' if len(full_only) == 1 else 'are'} read "
@@ -1173,8 +1176,9 @@ def parse_args(argv=None):
                 f"{'it' if len(full_only) == 1 else 'them'}")
     if route == "lanczos" and not args.tda:
         # full_bse = true takes bse_lanczos.solve_bse_sharded -> bse_nontda.  Its
-        # dense solve (full_bse_solver = dense, the default) reads n_eig and the
-        # kernel only; full_bse_solver = davidson reads _FULL_DAVIDSON_DESTS too.
+        # dense solve (full_bse_solver = dense, the reference) reads n_eig and the
+        # kernel only; full_bse_solver = davidson (the default) reads
+        # _FULL_DAVIDSON_DESTS too.
         # The same unread-key rule as above.
         full_davidson = args.full_bse_solver == "davidson"
         read = _FULL_DAVIDSON_DESTS if full_davidson else frozenset()
@@ -1195,7 +1199,7 @@ def parse_args(argv=None):
         if unread:
             parser.error(
                 f"{', '.join(unread)} {'is' if len(unread) == 1 else 'are'} not "
-                f"read by full_bse = true (the dense structure-preserving solve "
+                f"read by full_bse_solver = dense (the dense structure-preserving solve "
                 f"returns the lowest n_eig roots with no Davidson, Lanczos or "
                 f"TRLan iteration) and would be ignored; drop "
                 f"{'it' if len(unread) == 1 else 'them'}, set full_bse_solver = davidson "

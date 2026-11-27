@@ -1,7 +1,8 @@
 """What ``full_bse = true`` says it runs, and which eigensolver options it refuses.
 
-``bse_lanczos.solve_bse_sharded(tda=False)`` returns before it reads any Davidson, Lanczos or TRLan
-option: the full route is the dense structure-preserving solve, not an iteration.  The deck layer
+``bse_lanczos.solve_bse_sharded(tda=False)`` (its own default, and ``full_bse_solver = dense`` in an
+input file) returns before it reads any Davidson, Lanczos or TRLan
+option: that route is the dense structure-preserving solve, not an iteration.  The deck layer
 (``bse_jax``) must therefore (1) print that route in the SETTINGS table, not "davidson ... exact
 diagonal preconditioner", and (2) refuse an eigensolver key set away from its default, the unread-key
 rule of the eigensolve route.  The TDA default is unchanged.
@@ -23,7 +24,7 @@ def _rows(lines):
 
 
 def test_full_bse_settings_name_the_dense_route():
-    full = _rows(["full_bse = true"])
+    full = _rows(["full_bse = true", "full_bse_solver = dense"])
     assert full["solver"].value == "dense" and full["solver"].source == "derived"
     text = " ".join(f"{row.value} {row.effect}" for row in full.values())
     assert "preconditioner" not in text and "Krylov" not in text
@@ -42,14 +43,16 @@ def test_full_bse_refuses_unread_eigensolver_keys(line, key, capsys):
     (``solver``, ``block_size``, ``davidson_tol_mev`` and the iteration cap are deck keys other BSE drivers
     share, which the existing unread-key rule leaves alone on every route)."""
     with pytest.raises(SystemExit):
-        bse_jax.parse_args(["-i", _toy_deck(["full_bse = true", line])])
+        bse_jax.parse_args(["-i", _toy_deck(["full_bse = true", "full_bse_solver = dense", line])])
     err = capsys.readouterr().err
-    assert f"`{key}`" in err and "not read by full_bse = true" in err
+    assert f"`{key}`" in err and "not read by full_bse_solver = dense" in err
     if key.startswith("davidson"):
         bse_jax.parse_args(["-i", _toy_deck([line])])             # the default route reads it
+        bse_jax.parse_args(["-i", _toy_deck(["full_bse = true", line])])   # and so does the default full solver
 
 
-@pytest.mark.parametrize("route", ("full_bse = true", "full_bse = true\nfull_bse_solver = davidson"))
+@pytest.mark.parametrize("route", ("full_bse = true\nfull_bse_solver = dense", "full_bse = true",
+                                   "full_bse = true\nfull_bse_solver = davidson"))
 @pytest.mark.parametrize("line, key, instead", [
     ("solver = block_lanczos", "solver", "full_bse_solver"), ("solver = trlan", "solver", "full_bse_solver"),
     ("block_size = 4", "block_size", "Lanczos block")])
@@ -70,8 +73,9 @@ def test_dense_full_bse_refuses_the_unread_stop_keys(line, key, capsys):
     """The dense solve has no iteration: ``solver_max_iter`` and ``davidson_tol_mev`` set by the input
     file refuse, and ``full_bse_solver = davidson`` (which reads both) takes them."""
     with pytest.raises(SystemExit):
-        bse_jax.parse_args(["-i", _toy_deck(["full_bse = true", line])])
+        bse_jax.parse_args(["-i", _toy_deck(["full_bse = true", "full_bse_solver = dense", line])])
     err = capsys.readouterr().err
     assert f"`{key}`" in err and "dense solve has no iteration" in err and "full_bse_solver = davidson" in err
     bse_jax.parse_args(["-i", _toy_deck(["full_bse = true", "full_bse_solver = davidson", line])])
+    bse_jax.parse_args(["-i", _toy_deck(["full_bse = true", line])])    # the default full solver reads both
     bse_jax.parse_args(["-i", _toy_deck([line])])                       # and the Tamm-Dancoff run

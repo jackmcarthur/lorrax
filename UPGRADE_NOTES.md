@@ -5,6 +5,26 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-11-27 — `full_bse = true` runs the structure-preserving Davidson by default (owner decision pending)
+
+The default of the input key `full_bse_solver` moves from `dense` to `davidson`, in `bse.bse_jax` and
+in `bse.exciton_bands`. An input file with `full_bse = true` and no `full_bse_solver` now runs the
+Davidson. What moves:
+
+- **Roots.** They agree with the dense solve within the residual stop (`davidson_tol_mev`, 0.01 meV
+  by default), not to round-off.
+- **Size.** The 4096-transition limit of the dense solve is gone.
+- **Unstable reference state.** A $\mathcal K = [[A, B], [B^*, A^*]]$ that is not positive definite
+  is refused with the measured $\lambda_{\min}$ under the default `full_bse_instability = refuse`
+  (`GATE sp_davidson_definite`); the dense solve refused it on its own definiteness gate.
+- **Keys.** `solver_max_iter`, `davidson_tol_mev` and the `davidson_*` tuning keys are read under
+  `full_bse = true` now; under `full_bse_solver = dense` they still refuse. `full_bse_solver = davidson`
+  without `full_bse = true` still refuses.
+- **Old behaviour.** Set `full_bse_solver = dense` (the reference, at most 4096 transitions).
+
+The library functions keep their own defaults (`bse_lanczos.solve_bse_sharded(full_solver="dense")`,
+`bse_nontda.solve_bse_nontda_sharded(solver="dense")`); only the drivers' input-key default changes.
+
 ## 2026-11-27 — Full BSE at finite Q in `bse.exciton_bands`, head tensor and Olsen on the full route
 
 `bse.exciton_bands` now solves the full BSE at every $Q$ of its path when the input file says

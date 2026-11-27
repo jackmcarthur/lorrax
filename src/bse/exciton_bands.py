@@ -1739,10 +1739,11 @@ def _settings_defaults():
     ap.add_argument("--full-bse", action="store_true", dest="full_bse",
                     help="the full (non-Tamm-Dancoff) BSE at every Q: K z = omega Sigma z "
                          "with K = [[A(Q), B(Q)], [B(Q)^H, conj A(-Q)]]")
-    ap.add_argument("--full-solver", choices=("dense", "davidson"), default="dense",
+    ap.add_argument("--full-solver", choices=("dense", "davidson"), default="davidson",
                     dest="full_solver",
-                    help="full_bse only: dense (assembled, at most 4096 transitions per Q) "
-                         "or davidson (structure-preserving Davidson, unpaired form)")
+                    help="full_bse only: davidson (the default; structure-preserving Davidson, "
+                         "unpaired form) or dense (the reference: assembled, at most 4096 "
+                         "transitions per Q)")
     ap.add_argument("--full-instability", choices=("refuse", "continue"), default="refuse",
                     dest="full_instability",
                     help="full_bse_solver = davidson only: what a K that is not positive "

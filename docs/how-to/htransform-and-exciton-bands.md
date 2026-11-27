@@ -449,9 +449,9 @@ $B = B^{\mathsf T}$ and no $\pm\Omega$ pairing at a general $Q$ (the equations a
 [the BSE page](../architecture/bse.md#the-full-bse-at-a-finite-pair-momentum)). The htransform
 therefore returns the BSE valence bands as well as the conduction bands at every $k+Q$, so `nval`
 must be at least `number_val_bands_fine` (`GATE exb_full_bse_valence_window`). The input keys are
-`full_bse`, `full_bse_solver = dense | davidson` (default `dense`, at most 4096 transitions per $Q$;
-`davidson` is the unpaired structure-preserving Davidson, no size limit, residual stop
-`davidson_tol_mev`) and `full_bse_instability = refuse | continue` (read under `davidson`: a $Q$
+`full_bse`, `full_bse_solver = davidson | dense` (default `davidson`, the unpaired structure-preserving
+Davidson, no size limit, residual stop `davidson_tol_mev`; `dense` is the reference, at most 4096
+transitions per $Q$) and `full_bse_instability = refuse | continue` (read under `davidson`: a $Q$
 whose $\mathcal K$ is not positive definite refuses, or its unstable roots are logged and the positive
 roots above them written). `solver = block_lanczos` cannot solve the full BSE, and the keys of a
 solver the route does not read refuse (`GATE exb_full_bse_key`). The run logs the smallest stability

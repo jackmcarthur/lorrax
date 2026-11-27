@@ -280,7 +280,8 @@ def test_tamm_dancoff_default_route_is_untouched(ops):
     for key in ("iterations", "matvecs", "restarts"):
         assert counts[key] <= 1.5 * TDA_BASELINE[key], (key, counts)
     assert vec.shape == (N_EIG, 1, NC, NV, NK)                                # X only, as before
-    # the default arguments still dispatch the Tamm-Dancoff Davidson, and the full default is dense
+    # the default arguments still dispatch the Tamm-Dancoff Davidson, and the library's full default
+    # is dense (the drivers' input-key default is davidson)
     import inspect
     sig = inspect.signature(bse_lanczos.solve_bse_sharded).parameters
     assert sig["tda"].default is True and sig["solver_kind"].default == "davidson"
@@ -504,7 +505,7 @@ def test_olsen_correction_gives_the_same_roots(ops, dense):
 # 5. the driver
 # ---------------------------------------------------------------------------
 
-def test_full_bse_default_is_still_the_dense_solve(ops, dense):
+def test_full_bse_driver_default_is_the_davidson_library_default_is_dense(ops, dense):
     mesh = _mesh(2)
     bse_nontda.LAST_DAVIDSON.clear()
     ev, vec, n_iter = bse_lanczos.solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, tda=False)
@@ -512,7 +513,8 @@ def test_full_bse_default_is_still_the_dense_solve(ops, dense):
     assert np.array_equal(np.asarray(vec), dense[2]["evecs"])
     assert not bse_nontda.LAST_DAVIDSON                                      # no Davidson ran
     _, args = bse_jax.parse_args(["-i", _toy_deck(["full_bse = true"])])
-    assert args.full_bse_solver == "dense" and args.full_bse_instability == "refuse"
+    assert args.full_bse_solver == "davidson" and args.full_bse_instability == "refuse"
+    assert _parse(["full_bse = true", "full_bse_solver = dense"]).full_bse_solver == "dense"
     # through solve_bse_sharded the new route gives the route's own result
     ev_d, vec_d, n_it = bse_lanczos.solve_bse_sharded(
         _payload(mesh, ops), mesh, n_eig=N_EIG, tda=False, full_solver="davidson", max_iter=64)
@@ -526,6 +528,11 @@ def _parse(lines):
 
 def test_input_keys_and_what_they_refuse(capsys):
     full = ["full_bse = true", "full_bse_solver = davidson"]
+    dense = ["full_bse = true", "full_bse_solver = dense"]
+    # the Davidson is the default: the keys it reads are accepted without naming it
+    dflt = _parse(["full_bse = true", "davidson_olsen = true", "davidson_margin = 4",
+                   "solver_max_iter = 50", "full_bse_instability = continue"])
+    assert (dflt.full_bse_solver, dflt.davidson_margin, dflt.max_lanczos_iter) == ("davidson", 4, 50)
     args = _parse(full + ["full_bse_instability = continue", "davidson_margin = 4", "davidson_m_max = 200",
                           "davidson_precond = bare", "davidson_eps_shift = 1e-4", "davidson_olsen = true",
                           "davidson_margin_tol_mev = 1", "davidson_tol_mev = 0.005", "solver_max_iter = 50"])
@@ -533,12 +540,13 @@ def test_input_keys_and_what_they_refuse(capsys):
     assert (args.davidson_margin, args.davidson_m_max, args.davidson_precond) == (4, 200, "bare")
     assert args.davidson_olsen is True                  # read by the full Davidson since 2026-11-27
     refused = [
-        (["full_bse = true", "davidson_olsen = true"], "set full_bse_solver = davidson for the full-BSE Davidson"),
+        (dense + ["davidson_olsen = true"], "set full_bse_solver = davidson for the full-BSE Davidson"),
+        (dense + ["solver_max_iter = 50"], "the dense solve has no iteration"),
         (full + ["trlan_m_max = 40"], "`trlan_m_max` is not read by full_bse_solver = davidson"),
         (full + ["lanczos_rtol = 1e-6"], "`lanczos_rtol` is not read by full_bse_solver = davidson"),
-        (["full_bse = true", "full_bse_instability = continue"],
+        (dense + ["full_bse_instability = continue"],
          "`full_bse_instability` is read by full_bse_solver = davidson only"),
-        (["full_bse = true", "davidson_margin = 4"], "set full_bse_solver = davidson for the full-BSE Davidson"),
+        (dense + ["davidson_margin = 4"], "set full_bse_solver = davidson for the full-BSE Davidson"),
         (["full_bse_solver = davidson"], "`full_bse_solver` is read with full_bse = true only"),
         (["full_bse_instability = continue"], "`full_bse_instability` is read with full_bse = true only"),
         (["full_bse = true", "full_bse_solver = lanczos"], "takes one of dense, davidson"),
@@ -567,7 +575,8 @@ def test_settings_rows_and_size_refusal_name_the_solver_that_runs():
     assert dav["full_bse_instability"].value == "refuse" and "refuses" in dav["full_bse_instability"].effect
     cont = rows(["full_bse = true", "full_bse_solver = davidson", "full_bse_instability = continue"])
     assert "continues" in cont["full_bse_instability"].effect
-    dense_rows = rows(["full_bse = true"])                                   # unchanged
+    assert rows(["full_bse = true"])["full_bse_solver"].value == "davidson"  # the default
+    dense_rows = rows(["full_bse = true", "full_bse_solver = dense"])        # unchanged
     assert dense_rows["solver"].value == "dense" and "full_bse_solver" not in dense_rows
     assert "davidson_tol_mev" not in dense_rows and "full_bse_instability" not in dense_rows
     tda = rows([])                                                           # unchanged
@@ -588,8 +597,9 @@ def test_settings_rows_and_size_refusal_name_the_solver_that_runs():
     bse_jax._find_restart_file = lambda path: path
     try:
         with pytest.raises(ValueError, match="_DENSE_N_MAX"):
-            bse_jax._preview_lanczos("toy.in", NV, NC, n_eig=N_EIG, tda=False, kgrid=(16, 16, 2))
-        assert loads == []                                                   # the dense gate fires before it
+            bse_jax._preview_lanczos("toy.in", NV, NC, n_eig=N_EIG, tda=False, kgrid=(16, 16, 2),
+                                     full_bse_solver="dense")
+        assert loads == []                                                 # the dense gate fires before it
         with pytest.raises(KeyError, match="the stubbed loader was reached"):
             bse_jax._preview_lanczos("toy.in", NV, NC, n_eig=N_EIG, tda=False, kgrid=(16, 16, 2),
                                      full_bse_solver="davidson")
