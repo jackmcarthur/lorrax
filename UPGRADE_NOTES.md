@@ -61,9 +61,7 @@ and [the eigensolver page](docs/architecture/iterative_eigensolvers.md#the-unpai
   with it, and `full_bse_instability`, `davidson_tol_mev` or `solver_max_iter` under
   `full_bse_solver = dense` (`GATE exb_full_bse_key`); `nval` below `number_val_bands_fine` under
   `full_bse` (`GATE exb_full_bse_valence_window`). The dense finite-$Q$ solve refuses a lower row
-  that does not close the Hermitian pencil (`GATE nontda_lower_row`); the matrix-free Lanczos, which
-  has no input key, refuses a partner or a head tensor (`GATE nontda_route_option`, no longer for
-  `davidson_olsen` or `keep_W_R`).
+  that does not close the Hermitian pencil (`GATE nontda_lower_row`).
 - **Settings that were changed or ignored without a word.** `bse.exciton_bands` now reads the
   Davidson's tuning keys (`davidson_precond`, `davidson_olsen`, `davidson_eps_shift`,
   `davidson_margin`, `davidson_margin_tol_mev`, `davidson_m_max`); it used to run the defaults
@@ -103,6 +101,12 @@ and [the eigensolver page](docs/architecture/iterative_eigensolvers.md#the-unpai
   stability margin does not see an instability that is a negative-type root at $\Omega > 0$
   (in a crystal with inversion or time reversal the same instability is its lowest root, and is
   found). Both are in [the eigensolver page](docs/architecture/iterative_eigensolvers.md#structure-preserving-davidson).
+- **The matrix-free Lanczos of the full BSE is retired (owner decision pending).** No input key
+  reached it. `solvers/bse_sp_lanczos.py` (`sdy_lanczos_eig`) and `bse_nontda`'s route
+  (`solver='matrixfree'`, `mf_*` options, `refuse_unconverged_sdy`) are removed, with
+  `tests/test_bse_nontda_matrix_free.py`; `solve_bse_nontda_sharded(solver='matrixfree')` now refuses as
+  an unknown solver (`GATE nontda_route_option`). On synthetic wide spectra it needed 34 to 375 times the
+  Davidson's pair calls. Older entries below that mention it describe what it was.
 
 ## 2026-11-27 — Full BSE: a structure-preserving Davidson (`full_bse_solver = davidson`), unstable roots reported, dense reference in Cholesky form
 

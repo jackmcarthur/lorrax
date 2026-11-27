@@ -12,7 +12,7 @@ payload and the oracle on the blocks it assembles.
    equal the dense route's to 1e-8, and the per-state dipoles follow.
 2. The preconditioner's diagonal is the diagonal of the assembled ``A`` (1e-12), and the diagonal of
    ``H`` is ``[D; -D]``.
-3. Pair calls per root of this route, of the matrix-free Lanczos and A applications per root of the
+3. Pair calls per root of this route and A applications per root of the
    Tamm-Dancoff Davidson (``MEASURED`` lines).  The Tamm-Dancoff default route returns the roots and
    takes the iterations, matvecs and restarts recorded at the base commit of this branch (b66181c).
 4. Gates, each with a red twin: an iteration cap refuses (``GATE nontda_davidson_converged``) and so
@@ -289,7 +289,7 @@ def test_tamm_dancoff_default_route_is_untouched(ops):
 
 
 def test_pair_calls_per_root_table(ops, dense, caplog):
-    """Pair calls per root: this route, the matrix-free Lanczos, and the Tamm-Dancoff Davidson."""
+    """Pair calls per root: this route and the Tamm-Dancoff Davidson."""
     caplog.set_level(logging.INFO)
     rows = []
     for side in (1, 2):
@@ -297,14 +297,6 @@ def test_pair_calls_per_root_table(ops, dense, caplog):
         _, _, _, run = _davidson(mesh, ops)
         rows.append((f"SP Davidson {side}x{side}, defaults", run["info"]["pair_calls"],
                      f"{run['info']['iterations']} iterations, {run['info']['restarts']} restarts"))
-        for label, kw in (("defaults (m_max 140 > N: the whole window)", {}),
-                          ("m_max 56, n_keep 24", dict(mf_m_max=56, mf_n_keep=24))):
-            caplog.clear()
-            om, _, _ = solve_bse_nontda_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, solver="matrixfree", **kw)
-            text = " ".join(r.getMessage() for r in caplog.records)
-            m = re.search(r"(\d+) fused pair\s+applications .*?(\d+)/(\d+) restart cycles", text)
-            assert np.max(np.abs(np.asarray(om) - dense[side]["omega"])) <= ROOT_TOL
-            rows.append((f"SP Lanczos {side}x{side}, {label}", int(m.group(1)), f"{m.group(2)} restart cycles"))
     ev, counts, _ = _tda(ops)
     rows.append(("TD Davidson 1x1, defaults (A applications)", counts["matvecs"],
                  f"{counts['iterations']} iterations, {counts['restarts']} restarts"))
@@ -438,9 +430,8 @@ def test_options_the_route_cannot_honour_refuse(ops):
     mesh = _mesh(1)
     cases = [("dense", dict(davidson_tol_mev=0.02), "davidson_tol_mev (read by solver='davidson')"),
              ("dense", dict(on_indefinite="continue"), "on_indefinite (read by solver='davidson')"),
-             ("dense", dict(mf_m_max=56), "mf_m_max (read by solver='matrixfree')"),
-             ("davidson", dict(mf_n_keep=24), "mf_n_keep (read by solver='matrixfree')"),
-             ("matrixfree", dict(davidson_margin=2), "davidson_margin (read by solver='davidson')")]
+             ("dense", dict(davidson_margin=2), "davidson_margin (read by solver='davidson')"),
+             ("davidson", dict(mf_n_keep=24), "mf_n_keep (an option of the retired matrix-free route)")]
     for solver, kw, want in cases:
         with pytest.raises(ValueError, match="GATE nontda_route_option"):
             solve_bse_nontda_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, solver=solver, **kw)
@@ -448,12 +439,9 @@ def test_options_the_route_cannot_honour_refuse(ops):
         solve_bse_nontda_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, solver="davidson", davidson_tolmev=1.0)
     with pytest.raises(ValueError, match="GATE nontda_route_option"):
         solve_bse_nontda_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, solver="lanczos")
-    # A head_tensor payload is solved by the dense and Davidson routes
-    # (tests/test_bse_full_finite_q_cpu.py); the matrix-free Lanczos, which has
-    # no head term, refuses it.
-    with pytest.raises(ValueError, match="GATE nontda_route_option"):
-        solve_bse_nontda_sharded(dict(_payload(mesh, ops), head_tensor=(None, None)), mesh, n_eig=N_EIG,
-                                 solver="matrixfree")
+    # The matrix-free Lanczos was retired (2026-11-27): its name is an unknown solver now.
+    with pytest.raises(ValueError, match="GATE nontda_route_option: solver is not a full-BSE route"):
+        solve_bse_nontda_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG, solver="matrixfree")
     # through solve_bse_sharded: a solver name that is neither full route refuses.  (The Olsen
     # correction and a kept W_R, refused until 2026-11-27, are honoured: test_olsen_* below.)
     with pytest.raises(ValueError, match="GATE nontda_route_option"):

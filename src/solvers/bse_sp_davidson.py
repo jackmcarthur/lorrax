@@ -173,8 +173,7 @@ MIN_CAPACITY_BLOCKS = 6
 #: diagonal entry.  Below it the sign of ``lam_min`` is rounding.
 PD_RTOL = 1e-13
 #: Largest relative asymmetry of ``Re(P^H M P)`` accepted on a new block.  A
-#: correct operator gives round-off; ``bse_nontda``'s matrix-free route uses the
-#: same number for the same property (``_MF_METRIC_TOL``).
+#: correct operator gives round-off.
 METRIC_TOL = 1e-8
 #: A projected root is real when ``|Im omega|`` is below this fraction of
 #: ``|omega|`` plus ``IMAG_ATOL`` times the scale of ``M_r``.

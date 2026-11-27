@@ -68,17 +68,6 @@ WHAT CHANGED 2026-08-08 (this header used to describe only the dense route)
   names the regeneration command rather than reporting a number.  This replaced
   a projection: a preflight tells you the artifact is stale, a projection
   quietly makes a stale artifact look well-formed.
-* THE MATRIX-FREE ROUTE IS NO LONGER A PROTOTYPE.  ``solver='matrixfree'``
-  runs SDY Algorithm 4 (:mod:`solvers.bse_sp_lanczos`) over the fused pair
-  applier ``bse_stack_matvec.build_bse_stack_pair_matvec``, at ``O(k N)`` memory
-  and a cost set by the spectrum rather than by ``N``.  It is OPT-IN and it
-  runs on a sharded mesh (tested 2x2 on CPU against the dense route, to round-off);
-  its only refusals are run-time gates on the operator it applied (see
-  ``_solve_nontda_matrix_free``).
-  ``'dense'`` remains the default AND the oracle: it is what the matrix-free
-  route is gated against, and the only route returning the complete spectrum.
-  Flipping that default is an owner decision with its own A/B; nothing here
-  moved it.
 
 THE DAVIDSON ROUTE (2026-11-27)
 -------------------------------
@@ -129,8 +118,7 @@ def _dense_refusal(N: int) -> str:
             "default: drop full_bse_solver = dense; the structure-preserving Davidson for the full BSE: no assembly, no size limit, "
             "paired (X, Y) eigenvectors), full_bse = false (the TDA Davidson, the "
             "default eigensolve), feast = true (FEAST windows, refused unless converged to "
-            "feast_tol_mev), or a smaller number_val_bands_fine / number_cond_bands_fine.  The matrix-free SDY "
-            "route (bse_nontda solver='matrixfree') has no bse_jax flag.")
+            "feast_tol_mev), or a smaller number_val_bands_fine / number_cond_bands_fine.")
 
 
 def refuse_dense_window(n_cond: int, n_val: int, nk: int, mesh_xy) -> int:
@@ -379,7 +367,7 @@ def _full_matvec_and_args(data, mesh_xy, sh, *, include_W):
     its operands.
 
     ``pair(X, s, *args) = A X + s B conj(X)`` (``bse_stack_matvec.
-    build_bse_stack_pair_matvec``); the dense build and the matrix-free route
+    build_bse_stack_pair_matvec``); the dense build and the Davidson route
     both read the operator through it.  CONSUMES ``data["W_q"]`` and leaves
     ``data["W_R"]`` (:func:`payload_w_r`)."""
     if data.get("partner") is not None:
@@ -483,8 +471,7 @@ def refuse_asymmetric_coupling(B, *, tol=_B_SYM_TOL) -> float:
             f"for B = B^T, and the dense solve would silently replace B by "
             f"(B + B^T)/2 and return roots of a different operator.  Fix: check "
             f"the restart's W with bse_nontda.check_restart_reciprocity(data['W_q']) "
-            f"and the pair applier's B (the matrix-free route's kappa-metric gate "
-            f"measures the same property).  The threshold is a structural property "
+            f"and the pair applier's B.  The threshold is a structural property "
             f"of the operator, not a convergence tolerance.")
     return b_sym
 
@@ -629,145 +616,6 @@ def _h_is_real(A, B, *, tol=1e-6) -> bool:
     scale = max(np.linalg.norm(A), 1e-300)
     return (np.linalg.norm(np.imag(A)) / scale < tol
             and np.linalg.norm(np.imag(B)) / scale < tol)
-
-
-# ---------------------------------------------------------------------------
-# The matrix-free route — SDY Algorithm 4 over the fused pair applier
-# ---------------------------------------------------------------------------
-# The dense route above costs 2N half-applications and O(N^2) memory, with
-# ``_DENSE_N_MAX = 4096`` a hard wall.  The matrix-free route costs a number of
-# applications set by the SPECTRUM rather than by N, and O(k N) memory.  On the
-# record deck (N = 1024) that is a ~2x win; at N = 1e5 the dense route does not
-# exist at all, so this is the difference between having a non-TDA capability at
-# production grid and not having one.
-#
-# It is OPT-IN (no deck flag reaches it) and the owner decides when that
-# changes.  It is NOT refused on a sharded mesh: nothing here reads px*py.  The
-# ring-era defect in the coupling block's screened-direct term ``K^d_B`` (wrong
-# when the ζ axis is sharded; silent at px·py = 1) was fixed in the pair applier
-# (``bse_stack_matvec``, trial-vector gather on 'x' and 'y'), and the route is
-# tested on a 2x2 CPU mesh against the dense route
-# (``tests/test_bse_full_sharded_cpu.py``).  What stays is a run-time detector
-# of the operator's integrity, the symmetry of the kappa metric below: it
-# measures the operator the solve ran, whatever the mesh.
-_MF_METRIC_TOL = 1e-8
-
-#: The matrix-free route's stop: every root's ω residual below this (meV), the
-#: TDA Davidson's default; cycles are capped by ``mf_n_restarts``.
-MF_TOL_MEV = 0.01
-
-
-def refuse_unconverged_sdy(dg, *, n_eig, tol_mev, n_restarts) -> str:
-    """``GATE nontda_converged``: the SDY solve's stop as one line; any of the
-    lowest ``n_eig`` with ``resid / 2ω`` at or above ``tol_mev`` refuses before the
-    caller returns eigenpairs."""
-    from common.units import RYD_TO_EV
-    res = np.asarray(dg["resid_omega"])[:int(n_eig)] * RYD_TO_EV * 1.0e3
-    n_conv, cyc, worst = int(np.sum(res < tol_mev)), int(dg["cycles"]), float(np.max(res))
-    line = (f"non-TDA matrix-free {'converged' if n_conv == int(n_eig) else 'NOT converged'}: "
-            f"{n_conv}/{int(n_eig)} roots with omega residual < {tol_mev:g} meV after "
-            f"{cyc}/{int(n_restarts)} restart cycles; max {worst:.3e} meV")
-    if n_conv < int(n_eig):
-        raise RuntimeError(
-            f"GATE nontda_converged: {line}.  No eigenpairs were returned.  Fix: "
-            "raise mf_n_restarts or mf_m_max, or use the dense route (solver='dense').")
-    return line
-
-
-def _solve_nontda_matrix_free(pair, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
-                              m_max=140, n_keep=40, n_restarts=50,
-                              tol_mev=MF_TOL_MEV, metric_tol=_MF_METRIC_TOL, log=None):
-    """Lowest ``n_eig`` (omega, X, Y) with no dense assembly.
-
-    ``pair`` and ``args`` are the fused pair applier and its 9 operands from
-    :func:`_full_matvec_and_args`, built for the caller's ``include_W``: the
-    route applies exactly the operator whose operands it was given.
-
-    Returns ``(omega_Ry, Z (2N, n_eig))`` in the same convention
-    ``solve_nontda_definite_pencil`` returns, so the caller cannot tell the two
-    apart from their outputs -- which is the point of the gate that compares
-    them.
-    """
-    from functools import partial
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    from solvers.bse_sp_lanczos import (sdy_lanczos_eig, sdy_pair_applications,
-                                        sdy_steps)
-    from common.units import RYD_TO_EV
-
-    rep = NamedSharding(mesh_xy, P())
-    UV_sh = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
-    in_sh = (sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y, sh.eps, sh.eps,
-             sh.W, sh.V, sh.M)
-    _l = log if log is not None else (lambda *_a, **_k: None)
-
-    @partial(jax.jit, in_shardings=in_sh)
-    def _go(*T):
-        sp = jnp.asarray(1.0)
-        sm = jnp.asarray(-1.0)
-        om, X, Y, dg = sdy_lanczos_eig(
-            lambda Z: pair(Z, sp, *T), lambda Z: pair(Z, sm, *T),
-            (nc, nv, nk), n_eig=n_eig, m_max=m_max, n_keep=n_keep,
-            n_restarts=n_restarts, tol=tol_mev / (RYD_TO_EV * 1.0e3),
-            sharding=UV_sh, announce=_l)
-        return (jax.lax.with_sharding_constraint(om, rep),
-                jax.lax.with_sharding_constraint(X, rep),
-                jax.lax.with_sharding_constraint(Y, rep),
-                {k: jax.lax.with_sharding_constraint(v, rep)
-                 for k, v in dg.items()})
-
-    omega, X, Y, dg = _go(*args)
-    omega = np.asarray(jax.device_get(omega))
-    X = np.asarray(jax.device_get(X)).reshape(n_eig, -1)
-    Y = np.asarray(jax.device_get(Y)).reshape(n_eig, -1)
-    dg = {k: np.asarray(jax.device_get(v)) for k, v in dg.items()}
-
-    cycles = int(dg["cycles"])
-    _l(f"  [nontda] matrix-free: {sdy_steps(m_max, n_keep, cycles)} SDY "
-       f"steps, {sdy_pair_applications(m_max, n_keep, cycles)} fused pair "
-       f"applications (m_max={m_max} n_keep={n_keep} "
-       f"{cycles}/{n_restarts} restart cycles)")
-    _l(f"  [nontda] matrix-free invariants: metric_sym {float(dg['metric_sym_err']):.3e} "
-       f"orth {float(dg['orth_err']):.3e} im_uu {float(dg['im_uu']):.3e} "
-       f"im_vv {float(dg['im_vv']):.3e} drift {float(dg['imag_drift']):.3e}")
-
-    # --- the guards, in the order the derivation puts them ------------------
-    # (1) definiteness.  Re(x^H F(x)) <= 0 is a CERTIFICATE that K is not
-    #     positive definite: triplet/charge instability, imaginary excitation
-    #     energies.  Refuse, do not clamp -- the same reading and the same
-    #     refusal the dense pencil route already gives.
-    if float(dg["kappa_start"]) <= 0 or float(dg["beta_sq_min"]) <= 0:
-        raise ValueError(
-            f"non-TDA matrix-free: the kappa metric is not positive definite "
-            f"(kappa_start {float(dg['kappa_start']):.3e}, beta^2 min "
-            f"{float(dg['beta_sq_min']):.3e}).  K = [[A,B],[B*,A*]] is not "
-            "positive definite: triplet/charge instability, so BSE excitation "
-            "energies are imaginary.  This is physical — fix the "
-            "screening/window; not hidden.")
-    # (2) operator integrity.  The method needs A Hermitian AND B complex
-    #     SYMMETRIC, which together are exactly the statement that the kappa
-    #     metric Re(x^H F(x')) is symmetric.  One number covers both, and it is
-    #     measured on the operator the solve actually ran, for the price of one
-    #     pair application.
-    if float(dg["metric_sym_err"]) > metric_tol:
-        raise ValueError(
-            f"non-TDA matrix-free: the kappa metric is asymmetric at "
-            f"{float(dg['metric_sym_err']):.3e} (tol {metric_tol:g}).  The "
-            "method requires A = A^H and B = B^T; the metric's symmetry is "
-            "exactly that pair of conditions, so this number is the operator's "
-            "integrity, not the solver's convergence.  The "
-            "operator this solve applied is not A Hermitian with B complex "
-            "symmetric: the payload (check_restart_reciprocity on W_q) or the "
-            "pair applier is at fault, whatever the mesh.  Fix: run "
-            "solver='dense', whose preflight names a stale restart, and compare "
-            "the A and B it assembles with A = A^H, B = B^T.")
-
-    # (3) convergence: restarts stop on the ω residual; a capped stop refuses.
-    _l("  [nontda] " + refuse_unconverged_sdy(
-        dg, n_eig=n_eig, tol_mev=tol_mev, n_restarts=n_restarts))
-
-    Z = np.concatenate([X.T, Y.T], axis=0)          # (2N, n_eig)
-    order = np.argsort(omega)
-    return omega[order], Z[:, order]
 
 
 # ---------------------------------------------------------------------------
@@ -991,7 +839,6 @@ def _solve_nontda_davidson(pair, args, data, mesh_xy, sh, n_eig, *, include_W, w
 #: defaults.  An option set on a route that does not read it refuses.
 _ROUTE_OPTIONS = {
     "dense": {},
-    "matrixfree": dict(mf_m_max=140, mf_n_keep=40, mf_n_restarts=50, mf_tol_mev=MF_TOL_MEV),
     "davidson": dict(davidson_tol_mev=DAVIDSON_TOL_MEV, davidson_max_iter=200,
                      davidson_m_max=None, davidson_margin=DAVIDSON_MARGIN_ROOTS,
                      davidson_margin_tol_mev=None,
@@ -1061,17 +908,6 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
         that returns the complete spectrum or individual matrix elements.
         No options.
 
-    ``'matrixfree'``
-        SDY Algorithm 4 (:mod:`solvers.bse_sp_lanczos`) over the fused pair
-        applier.  Cost set by the spectrum, not by ``N``; ``O(k N)`` memory.
-        OPT-IN (no deck flag).  It runs on a sharded mesh; its refusals are
-        run-time gates on the operator it applied (kappa-metric symmetry,
-        definiteness; see ``_solve_nontda_matrix_free``).
-        Restart cycles stop when every root's ω residual is below
-        ``mf_tol_mev`` (cap ``mf_n_restarts``); a capped stop refuses
-        (GATE nontda_converged).  Options ``mf_m_max``, ``mf_n_keep``,
-        ``mf_n_restarts``, ``mf_tol_mev``.
-
     ``'davidson'``
         The structure-preserving block Davidson (:mod:`solvers.bse_sp_davidson`)
         over the same applier, preconditioned by the paired exact diagonal
@@ -1120,23 +956,6 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
             pair, args, data, mesh_xy, sh, n_eig, include_W=include_W, w_q0=w_q0, low=low, **opts)
         return (replicate_to_mesh(np.asarray(omega), mesh_xy), pairs,
                 jnp.int32(int(info["iterations"])))
-    if solver == "matrixfree":
-        if (low is not None or data.get("head_tensor") is not None
-                or data.get("occupation_weights") is not None):
-            raise ValueError(
-                "GATE nontda_route_option: the matrix-free Lanczos cannot honour a finite pair "
-                "momentum, a head tensor or occupation weights (got: a payload with "
-                + ("a partner" if low is not None else
-                   "head_tensor" if data.get("head_tensor") is not None else "occupation_weights")
-                + "; want: neither).  Why: its recurrence is built on F(x) = A x + B conj(x) "
-                  "with nine operands.  Fix: solver='davidson' or solver='dense'.")
-        omega, Z = _solve_nontda_matrix_free(
-            pair, mesh_xy, sh, args, nc, nv, nk, n_eig,
-            m_max=opts["mf_m_max"], n_keep=opts["mf_n_keep"],
-            n_restarts=opts["mf_n_restarts"], tol_mev=opts["mf_tol_mev"], log=_log0)
-        evecs = np.stack([Z[:N, :].T.reshape(n_eig, nc, nv, nk),
-                          Z[N:, :].T.reshape(n_eig, nc, nv, nk)], axis=1)
-        return jnp.asarray(omega), _on_mesh(evecs, mesh_xy), jnp.int32(0)
     if low is not None:
         A, B, B_low, A_low = _materialize_K(pair, args, low, sh, nc, nv, nk)
         omega, Z = solve_nontda_definite_pencil(A, B, n_eig, lower=(B_low, A_low))
