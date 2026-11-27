@@ -155,6 +155,7 @@ from common.provenance import lorrax_version, provenance_header
 from common.report_blocks import Setting
 from common.scientific_output import abs_path, band_range, policy
 from runtime.run_session import RunSession
+from .bse_davidson_helpers import payload_w_r
 from .bse_head import head_shifted_eps_c
 from .bse_deck import (DeckError, Key, check_fine_grid_keys, deck_params, deck_source,
                        eqp_file, read_settings, refuse_retired_keys,
@@ -167,7 +168,6 @@ from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
 log = get_logger(__name__)
 _LOGGER = log     # the module logger, where a ``log`` parameter or local shadows it
 from .bse_preconditioner import compute_pair_amplitude
-from .bse_stack_matvec import build_bse_stack_matvec
 from .exchange_path import exchange_tiles, exchange_tile_momentum
 from .bse_window import (apply_eqp_to_bse_window,
                          require_valence_pad_guard)
@@ -2527,32 +2527,26 @@ def main(argv=None):
             f"native {nkx} x {nky} x {nkz} grid"))
         t0 = time.time()
         sh = make_bse_shardings(mesh_xy)
-        _ifftn = make_kfft_kminor(mesh_xy, (nkx, nky, nkz), sh.W.spec,
-                                  kind="ifftn", norm="ortho")
-        # W_q is DONATED on the two SAME-SHAPE paths, and the caller-side
-        # reference dropped, copied from ``bse_lanczos``'s W_R build.  XLA grants
-        # the alias only when the output shape matches the input, so W_R becomes
-        # W_q's buffer rather than a second live tile for the whole band scan:
-        # 56.25 MiB/rank on the Si 4x4x4 deck, 404 MB/rank at mu=10015 / P=64,
-        # 4.1 GB/rank at mu=32k.  In-jit peak is unchanged; the win is entirely
-        # caller-side (FFT_DONATION_AUDIT.md 2.3).  Value-identical.
+        # On the two SAME-SHAPE paths this is ``bse_davidson_helpers.payload_w_r``,
+        # the one transform of every BSE eigensolve: W_q is DONATED and the
+        # caller-side reference dropped, so W_R takes W_q's buffer and no second
+        # tile lives through the band scan (56.25 MiB/rank on the Si 4x4x4 deck,
+        # 404 MB/rank at mu=10015 / P=64, 4.1 GB/rank at mu=32k;
+        # FFT_DONATION_AUDIT.md 2.3).
         # The ``--w-coarse-grid`` path below is DELIBERATELY not donated: it
         # sub-samples W_q to a coarse sub-grid first, so the densifier's operand
         # is a different array of a different shape and donation is declined
         # anyway.  It also still needs ``data["W_q"]`` to build that sub-grid,
         # which is why the reference is dropped per-branch and not once up here.
         W_q0 = _precond_w_q0(args, data, log=log)
-        _ifftn_donated = jax.jit(_ifftn, donate_argnums=(0,))
         if args.w_coarse_grid is None:
-            W_R = _ifftn_donated(data["W_q"])         # fast path: native fine W (byte-identical)
-            data["W_q"] = None                        # release the caller-side reference
+            W_R = payload_w_r(data, mesh_xy, sh)      # native fine W
         else:
             cg = tuple(int(s) for s in args.w_coarse_grid.split(","))
             if len(cg) != 3:
                 raise ValueError("--w-coarse-grid expects NX,NY,NZ")
             if cg == (nkx, nky, nkz):
-                W_R = _ifftn_donated(data["W_q"])     # equal grids → no-op, byte-identical
-                data["W_q"] = None                    # release the caller-side reference
+                W_R = payload_w_r(data, mesh_xy, sh)  # equal grids: the native transform
             else:
                 # Coarse-W → fine direct term.  Sub-sample the fine W_q onto the
                 # coarse BZ sub-grid (same ISDF μ-basis; q=0 head-tile preserved),
@@ -2592,7 +2586,8 @@ def main(argv=None):
                         mesh_xy, sh.W.spec, (nkx, nky, nkz), output="k",
                         embedding=w_pair_embedding(
                             cg, wfn, r_mu, int(W_q.shape[0]), meta.sys_dim)))
-                W_R = _ifftn(_add_rank_lr(W_q, A_f, D_f, mesh_xy, 1.0))
+                W_R = make_kfft_kminor(mesh_xy, (nkx, nky, nkz), sh.W.spec, kind="ifftn",
+                                       norm="ortho")(_add_rank_lr(W_q, A_f, D_f, mesh_xy, 1.0))
                 # Queued reads own their inputs; the Q sweep needs only W_R.
                 del W_q, A_c, D_c, A_f, D_f
                 log(f"[coarse-W] W sampled on {cg[0]}x{cg[1]}x{cg[2]} sub-grid of "

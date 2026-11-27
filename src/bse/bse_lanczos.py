@@ -20,9 +20,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import replicate_to_mesh
-from common.fft_helpers import get_donated_kfft_kminor
 
-from solvers.lanczos import simple_lanczos_eig  # noqa: F401  (re-exported by bse_jax)
 from common.log import get_logger
 
 log = get_logger(__name__)
@@ -276,51 +274,23 @@ def solve_bse_sharded(
     else:
         _W_q0 = None
 
-    # ── W_R = ifft_q(W_q) at a REAL top-level dispatch boundary, W_q DONATED ──
-    # This used to run INSIDE ``_full_run`` (and inside the Davidson block).
-    # There it can never free W_q: W_q is a jit PARAMETER, so its buffer is
-    # owned by the caller for the whole call and XLA has no same-shape OUTPUT
-    # to alias it to ("donation was always declined").  The result was BOTH
-    # W_q and W_R resident for the entire solve: 2 x (μ_pad/p_x) x
-    # (ν_pad/p_y) x nk x 16 bytes per rank (2 x 404 MB at μ=10015 / P=64;
-    # ∝ μ²/P, so 2 x 4.1 GB at μ=32k).  Hoisting the transform into its own
-    # donated jit lets XLA alias W_R onto W_q's buffer and lets the caller
-    # drop the Python reference, so only ONE copy survives into the solve.
-    # Value-identical: same helper, same axes, same norm, same operand.
-    if include_W and data.get("W_R") is not None:
-        W_R = data["W_R"]               # a previous solve's transform (keep_W_R)
-    elif include_W:
+    # ── W_R = ifft_q(W_q), once, at a top-level dispatch boundary, W_q DONATED ──
+    # ``bse_davidson_helpers.payload_w_r`` (the one transform of every BSE
+    # eigensolve and of the Haydock recursion).  It cannot run inside the
+    # solve's own jit: there W_q is a jit PARAMETER, owned by the caller for the
+    # whole call, so both tiles stayed resident, 2 x (μ_pad/p_x) x (ν_pad/p_y)
+    # x nk x 16 bytes per rank (2 x 404 MB at μ=10015 / P=64; ∝ μ²/P).  The
+    # donated transform leaves ONE.  A payload that already carries ``W_R`` (a
+    # previous solve's, ``keep_W_R``) is solved on it.
+    from .bse_davidson_helpers import payload_w_r
+    if include_W and data.get("W_R") is None:
         with timing.section("bse.solve.W_ifft") as _sec_wifft:
-            # The sharded helper, not ``jnp.fft.ifftn``: a plain ifftn on a
-            # sharded tensor inserts a 337-MiB all-gather around the FFT under
-            # current JAX even when the transformed axes are unsharded.  The
-            # helper hides the transform in an opaque per-device primitive, so
-            # XLA only ever sees a local FFT (axes (2,3,4) of W_q are
-            # replicated; μ, ν stay on x, y), 3-D in one shot rather than three
-            # sequential rank-1 custom_partitioning calls.
-            #
-            # The transform and its donating jit come from the MEMOISED accessor,
-            # not from a fresh ``make_sharded_ifftn_3d`` + ``jax.jit`` pair built
-            # here.  Built here, the wrapper object was new on every call, so jax's
-            # dispatch cache started empty and a byte-identical program was
-            # re-traced, re-lowered and re-probed against the persistent compile
-            # cache every time this function ran — ~20-23 ms against ~1.0 ms of
-            # execution on the record deck at P=4, and flat across calls, which is
-            # the construction signature (FIX_construction_defects.md §1; the same
-            # defect PRECOND_BUILD_FREE.md §3.1 fixed for the exact-diagonal build
-            # and named at §7.2).  Donation is unchanged: the accessor sets
-            # ``donate_argnums=(0,)`` and the alias was
-            # checked when the accessor was introduced; no test of it is in the tree.
-            _W_ifft_donated = get_donated_kfft_kminor(
-                mesh_xy, tuple(int(n) for n in data["W_q"].shape[-3:]), sh.W.spec,
-                kind="ifftn", norm='ortho')
-            W_R = _W_ifft_donated(data["W_q"])
-            data["W_q"] = None          # release the caller-side reference
+            W_R = payload_w_r(data, mesh_xy, sh)
             _sec_wifft.watch(W_R)
-        if keep_W_R:
-            data["W_R"] = W_R
+        if not keep_W_R:
+            data.pop("W_R")             # the solve's own tile; the payload keeps it only when asked
     else:
-        W_R = data["W_q"]
+        W_R = payload_w_r(data, mesh_xy, sh, include_W=include_W)
 
     # ── Davidson path: pass resident operator/preconditioner arrays as
     # explicit operands of the fixed-capacity solve.  Returns

@@ -31,29 +31,13 @@ from .bse_deck import (DeckError, Key, check_dipole_operator, check_fine_grid_ke
                        read_settings, refuse_retired_keys, refuse_retired_solver,
                        spin_kernel)
 from .bse_preconditioner import bgw_spin_kernel
-from .bse_ring_comm import (
-    create_mesh_2d,
-    create_mesh_xy_from_flags,
-    make_bse_shardings,
-)
-from .bse_stack_matvec import build_bse_stack_matvec_full
-from .bse_preconditioner import compute_pair_amplitude
+from .bse_ring_comm import create_mesh_2d, create_mesh_xy_from_flags
 from file_io.restart_bundle import (_find_restart_file)
-from .bse_lanczos import simple_lanczos_eig
 from .bse_io import write_eigenvectors_stream
 from .report_lines import (bse_results_lines, galerkin_rows, locality_rows,
                            window_direct_gap)
 
 log = get_logger(__name__)
-
-__all__ = [
-    "build_bse_stack_matvec_full",
-    "compute_pair_amplitude",
-    "create_mesh_2d",
-    "make_bse_shardings",
-    "simple_lanczos_eig",
-]
-
 
 #: The report's major-stage table: ``(label, timing sections...)``.
 _STAGES = (
