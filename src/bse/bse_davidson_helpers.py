@@ -590,6 +590,38 @@ def bse_diagonal_precond(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Occupation weights: the diagonal and the start block of a weighted window
+# ═══════════════════════════════════════════════════════════════════════
+
+def occupation_diagonal(diag_H, eps_c, eps_v, weights, *, sharding=None):
+    """The diagonal of ``A = dE + w K w`` from the unweighted one: ``dE + w^2
+    (diag_H - dE)`` on the pairs with ``w > 0`` and
+    ``bse_preconditioner.MASKED_PAIR_RY`` on the masked ones.  ``diag_H`` None
+    is the bare ``dE``.  ``(n_c, n_v, nk)``, real, on ``sharding``."""
+    from .bse_preconditioner import MASKED_PAIR_RY, energy_diff_cv_k
+
+    @jax.jit
+    def _diag(diag, ec, ev, w):
+        dE = energy_diff_cv_k(ec, ev)
+        out = dE if diag is None else dE + w * w * (diag - dE)
+        out = jnp.where(w > 0, out, MASKED_PAIR_RY)
+        return out if sharding is None else jax.lax.with_sharding_constraint(out, sharding)
+    return _diag(diag_H, eps_c, eps_v, weights)
+
+
+def occupation_start_block(eps_c, eps_v, weights, *, n_rows, n_cond, n_val, mesh, sharding):
+    """A start block for a window with occupation weights: ``n_rows`` Gaussian
+    vectors on the physical transitions (:func:`init_bse_subspace` with no
+    unit rows: its lowest-``dE`` unit vectors would sit on masked pairs, whose
+    ``dE`` may be zero or negative), zeroed on the masked pairs.  Every later
+    vector of a Davidson is a combination of images and preconditioned
+    residuals, which the operator keeps at zero there."""
+    X0 = init_bse_subspace(eps_c, eps_v, n_eig=n_rows, n_cond=n_cond, n_val=n_val,
+                           n_random=n_rows, mesh=mesh, sharding=sharding)
+    return jax.jit(lambda x, w: jnp.where(w[None] > 0, x, 0), out_shardings=sharding)(X0, weights)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  Full BSE: the paired diagonal preconditioner and its q = 0 slice of W
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -692,4 +724,5 @@ def bse_pair_diagonal_precond(
 __all__ = ["init_bse_subspace", "bse_diagonal_precond", "BSEDiagonalPreconditioner",
            "build_bse_exact_diagonal", "clear_exact_diagonal_memo",
            "exact_diagonal_memo_stats", "resolve_precond_route",
-           "EXACT_PRECOND_AUTO_MIN_DIM", "bse_pair_diagonal_precond", "w_q0_for_precond"]
+           "EXACT_PRECOND_AUTO_MIN_DIM", "bse_pair_diagonal_precond", "w_q0_for_precond",
+           "occupation_diagonal", "occupation_start_block"]

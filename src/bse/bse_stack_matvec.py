@@ -132,7 +132,7 @@ from common.fft_helpers import (kconv_backend, klead_outer_decode_refusal, klead
                                 make_local_kconv_klead_outer_decode)
 from common.gpu_utils import device_budget_bytes
 from runtime import tiles
-from .bse_preconditioner import exchange_spin_weight
+from .bse_preconditioner import MASKED_PAIR_RY, exchange_spin_weight
 from .bse_ring_comm import make_bse_shardings
 
 
@@ -891,7 +891,7 @@ def _make_w(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, coupling: bool = Fal
 
 def _build_applier(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, kernel: str,
                    exchange_channel: str, head_tensor: bool, coupling: bool,
-                   partner: bool = False):
+                   partner: bool = False, occupations: bool = False):
     """The ONE assembly of the BSE operator on a trial stack: ``D``, the exchange
     ``V``, the head tensor and the screened direct term ``W``, for
 
@@ -905,6 +905,20 @@ def _build_applier(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, kernel: str,
     the same ``D`` term, the same exchange decode, the same W chain
     (:func:`_make_w`), with the antiresonant terms absent from the trace (not
     multiplied by zero).  Returns the jitted callable of the public builder.
+
+    ``occupations`` adds the occupation weights as trailing operands (after
+    the head operands): ``w`` (n_c, n_v, nk) real at ``P('x', 'y', None)``,
+    ``sqrt(f_v - f_c)`` of the transitions of ``X``
+    (``bse_preconditioner.occupation_weight_cv_k``), and with ``partner`` a
+    second one, ``wb``, for the transitions of ``Yc``.  The kernel is scaled on
+    both sides and the diagonal is not:
+
+        A X + s B Yc  ->  D X + w * ( K_A (w * X) + s K_B (wb * Yc) ),
+
+    so ``A = dE + sqrt(df) K sqrt(df)`` and ``B`` likewise.  A pair with
+    ``w = 0`` is masked: its row and column of the kernel vanish and its
+    diagonal is ``MASKED_PAIR_RY``, so it is no root of the window.  Without
+    the flag the trace has no weight in it.
     """
     if kernel not in ("rpa", "bse"):
         raise ValueError(f"kernel must be 'rpa' or 'bse', got {kernel!r}")
@@ -918,11 +932,17 @@ def _build_applier(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, kernel: str,
     v_term = _make_v_term(mesh_xy, pair=coupling)
 
     def _apply(X, Yc, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M, Mb,
-               D_head, M_head):
+               D_head, M_head, w=None, wb=None):
         # M (transition layout, sh.M): the hoisted exchange pair amplitude,
         # precomputed once per solve (audit P3).  Without a coupling, psi_c_Y /
         # psi_v_X are unread (the coupling block's legs).
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
+        X_in = X                                  # the diagonal acts on the unweighted trial
+        if occupations:
+            # sqrt(df) on the kernel's input side; the output side is below.
+            X = lax.with_sharding_constraint(w[None].astype(X.real.dtype) * X, sh.X)
+            if Yc is not None:
+                Yc = lax.with_sharding_constraint(wb[None].astype(Yc.real.dtype) * Yc, sh.X)
         if coupling:
             # One sign per trial: a scalar (SDY's F or G) broadcasts.
             sc = jnp.broadcast_to(jnp.asarray(s).astype(X.dtype), X.shape[:1])
@@ -932,7 +952,9 @@ def _build_applier(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, kernel: str,
         #    carries no diagonal, so an SDY step applies D twice per step (once in
         #    F, once in G), not four times.
         delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]
-        D_term = lax.with_sharding_constraint(delta_E * X, sh.X)
+        if occupations:
+            delta_E = jnp.where(w[None] > 0, delta_E, MASKED_PAIR_RY)
+        D_term = lax.with_sharding_constraint(delta_E * X_in, sh.X)
 
         # ── V term: B1 dense exchange, k-summed encode + broadcast decode ──────
         # A: K^x = M V M†: conjugated vertex on the encode leg, bare vertex on the
@@ -972,6 +994,8 @@ def _build_applier(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, kernel: str,
             VX = VX + lax.with_sharding_constraint(HX, sh.X) / sqrt_nk
 
         if not include_W:
+            if occupations:
+                return D_term + w[None].astype(VX.real.dtype) * VX
             return D_term + VX
 
         if not coupling:
@@ -980,39 +1004,53 @@ def _build_applier(mesh_xy: Mesh, nkx: int, nky: int, nkz: int, *, kernel: str,
             WX = w_term(X, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R)
         else:
             WX = w_term(X, Yc, sc, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R)
+        if occupations:
+            # sqrt(df) on the kernel's output side.
+            return D_term + w[None].astype(VX.real.dtype) * (VX - WX)
         return D_term + VX - WX
 
     # D_head / M_head are small and replicated: three Cartesian channels over
     # (k, c, v) and a 3x3.  No mesh axis to tile them on.
     head = (None, None) if head_tensor else ()
+    n_head = len(head)
+    # The occupation weights: transition-tiled like the diagonal.
+    wsh = NamedSharding(mesh_xy, P("x", "y", None))
+    occ = ((wsh, wsh) if partner else (wsh,)) if occupations else ()
+
+    def _tail(extra):
+        """``(D_head, M_head, w, wb)`` from the trailing operands."""
+        if len(extra) != n_head + len(occ):
+            raise TypeError(f"the applier takes {n_head} head and {len(occ)} occupation "
+                            f"operand(s) after M, got {len(extra)}")
+        weights = tuple(extra[n_head:]) + (None,) * (2 - len(occ))
+        return (tuple(extra[:n_head]) if head_tensor else (None, None)) + weights
+
     if not coupling:
-        def _matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
-                    M, D_head=None, M_head=None):
+        def _matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M, *extra):
             return _apply(X, None, None, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
-                          V_q0, M, None, D_head, M_head)
+                          V_q0, M, None, *_tail(extra))
 
         # psi_c_Y / psi_v_X are not read (the coupling block's legs): unconstrained,
         # so a TDA payload may pass None for them (the loader's coupling_legs=False).
         return jax.jit(_matvec, in_shardings=(sh.X, sh.psi_x, None, None, sh.psi_y,
-                                              sh.eps, sh.eps, sh.W, sh.V, sh.M) + head,
+                                              sh.eps, sh.eps, sh.W, sh.V, sh.M) + head + occ,
                        out_shardings=sh.X)
 
     operands = (sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y, sh.eps, sh.eps, sh.W, sh.V, sh.M)
     if partner:
         def _couple(X, Yc, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
-                    V_q0, M, Mb, D_head=None, M_head=None):
+                    V_q0, M, Mb, *extra):
             return _apply(X, Yc, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
-                          V_q0, M, Mb, D_head, M_head)
+                          V_q0, M, Mb, *_tail(extra))
 
-        return jax.jit(_couple, in_shardings=(sh.X, sh.X, rep) + operands + (sh.M,) + head,
+        return jax.jit(_couple, in_shardings=(sh.X, sh.X, rep) + operands + (sh.M,) + head + occ,
                        out_shardings=sh.X)
 
-    def _pair(X, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M,
-              D_head=None, M_head=None):
+    def _pair(X, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M, *extra):
         return _apply(X, None, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
-                      V_q0, M, M, D_head, M_head)
+                      V_q0, M, M, *_tail(extra))
 
-    return jax.jit(_pair, in_shardings=(sh.X, rep) + operands + head, out_shardings=sh.X)
+    return jax.jit(_pair, in_shardings=(sh.X, rep) + operands + head + occ, out_shardings=sh.X)
 
 
 def make_w_term(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
@@ -1050,8 +1088,13 @@ def build_bse_stack_matvec(
     kernel: str = "bse",
     head_tensor: bool = False,
     exchange_channel: str = "singlet",
+    occupations: bool = False,
 ):
     """Build the trial-stack BSE matvec.
+
+    ``occupations`` adds one trailing operand, the occupation weights
+    ``w = sqrt(f_v - f_c)`` of the transitions: ``A = dE + w K w`` with
+    zero-weight pairs masked (:func:`_build_applier`).
 
     Parameters
     ----------
@@ -1090,7 +1133,7 @@ def build_bse_stack_matvec(
     """
     return _build_applier(mesh_xy, nkx, nky, nkz, kernel=kernel,
                           exchange_channel=exchange_channel, head_tensor=head_tensor,
-                          coupling=False)
+                          coupling=False, occupations=occupations)
 
 
 # ===========================================================================
@@ -1107,6 +1150,7 @@ def build_bse_stack_pair_matvec(
     exchange_channel: str = "singlet",
     head_tensor: bool = False,
     partner: bool = False,
+    occupations: bool = False,
 ):
     """Build the real-linear pair applier ``pair(X, s, …) = A·X + s·B·conj(X)``,
     or, with ``partner``, the coupled applier ``couple(X, Yc, s, …) = A·X + s·B·Yc``.
@@ -1160,10 +1204,15 @@ def build_bse_stack_pair_matvec(
         couple(conj(Y), conj(X), 1, ...partner...)``, which holds for
         ``W_{mu nu}(q) = conj(W_{nu mu}(q))``.  At ``Q = 0`` the two orbital
         sets coincide, ``Mb = M``, and ``couple(X, conj(X), s) = pair(X, s)``.
+    occupations : bool
+        Trailing operands ``w`` (and ``wb`` with ``partner``): the occupation
+        weights ``sqrt(f_v - f_c)`` of the transitions of ``X`` (of ``Yc``).
+        ``A = dE + w K_A w``, ``B = w K_B wb``; zero-weight pairs are masked
+        (:func:`_build_applier`).  The partner's row takes them exchanged.
     """
     return _build_applier(mesh_xy, nkx, nky, nkz, kernel=kernel,
                           exchange_channel=exchange_channel, head_tensor=head_tensor,
-                          coupling=True, partner=partner)
+                          coupling=True, partner=partner, occupations=occupations)
 
 
 # ===========================================================================

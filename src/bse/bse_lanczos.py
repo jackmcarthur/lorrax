@@ -285,11 +285,21 @@ def solve_bse_sharded(
     if head_tensor is not None and solver_kind != "davidson":
         raise ValueError("solve_bse_sharded: a head_tensor payload is solved by "
                          "solver_kind='davidson' only")
+    # ``occupation_weights`` (n_c, n_v, nk): sqrt(f_v - f_c) of the transitions,
+    # the applier's last operand; A = dE + w K w with zero-weight pairs masked.
+    occupation_weights = data.get("occupation_weights")
+    if occupation_weights is not None and solver_kind != "davidson":
+        raise ValueError(
+            "GATE bse_occupation_weights: a payload with occupation_weights is solved by "
+            f"solver_kind='davidson' only (got: {solver_kind!r}; want: 'davidson').  Why: the "
+            "Lanczos start vectors are not kept off the masked pairs, whose transitions would "
+            "appear as roots.  Fix: solver = davidson.")
     with timing.section("bse.solve.matvec_build"):
         matvec_ring = build_bse_stack_matvec(
             mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
             exchange_channel=data.get("exchange_channel", "singlet"),
             **({"head_tensor": True} if head_tensor is not None else {}),
+            **({"occupations": True} if occupation_weights is not None else {}),
         )
 
     # ``auto`` is resolved to one of the two real routes HERE, before anything
@@ -387,7 +397,8 @@ def solve_bse_sharded(
         # W_R already built above (donated top-level ifft).
 
         operator_data = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                         eps_c, eps_v, W_R, V_q0, M, *(head_tensor or ()))
+                         eps_c, eps_v, W_R, V_q0, M, *(head_tensor or ()),
+                         *(() if occupation_weights is None else (occupation_weights,)))
 
         def apply_H(solver_data, V):
             V = jax.lax.with_sharding_constraint(V, sh.X)
@@ -423,6 +434,11 @@ def solve_bse_sharded(
             log.info("Davidson preconditioner: bare dE")
         if davidson_olsen:
             log.info("Davidson preconditioner: Olsen correction ON")
+        if occupation_weights is not None:
+            # The diagonal of A = dE + w K w; masked pairs parked far above the roots.
+            from .bse_davidson_helpers import occupation_diagonal
+            _diag_H = occupation_diagonal(_diag_H, eps_c, eps_v, occupation_weights,
+                                          sharding=NamedSharding(mesh_xy, P("x", "y", None)))
 
         precond_fn = bse_diagonal_precond(
             eps_c, eps_v, sharding=NamedSharding(mesh_xy, P("x", "y", None)),
@@ -439,11 +455,17 @@ def solve_bse_sharded(
         # 2 x n_solve basis.
         n_phys = int(data["n_cond"]) * int(data["n_val"]) * nk
         n_solve = n_eig + max(0, min(int(davidson_margin), n_phys // 2 - n_eig))
-        X0 = init_bse_subspace(
-            eps_c, eps_v, n_eig=n_solve,
-            n_cond=int(data["n_cond"]), n_val=int(data["n_val"]),
-            n_random=davidson_n_random_init,
-            mesh=mesh_xy, sharding=bse_sharding)
+        if occupation_weights is not None:
+            from .bse_davidson_helpers import occupation_start_block
+            X0 = occupation_start_block(
+                eps_c, eps_v, occupation_weights, n_rows=n_solve, n_cond=int(data["n_cond"]),
+                n_val=int(data["n_val"]), mesh=mesh_xy, sharding=bse_sharding)
+        else:
+            X0 = init_bse_subspace(
+                eps_c, eps_v, n_eig=n_solve,
+                n_cond=int(data["n_cond"]), n_val=int(data["n_val"]),
+                n_random=davidson_n_random_init,
+                mesh=mesh_xy, sharding=bse_sharding)
 
 
         # One fixed-capacity solve replaces the former shape warmup ladder.
@@ -462,6 +484,7 @@ def solve_bse_sharded(
             # Q) names the run; the key adds everything the two programs close over.
             plan_key=(None if davidson_plan_key is None else (
                 davidson_plan_key, mesh_xy, bool(include_W), head_tensor is not None,
+                occupation_weights is not None,
                 data.get("exchange_channel", "singlet"),
                 davidson_precond, bool(davidson_olsen), float(davidson_eps_shift_Ry),
                 tuple((tuple(a.shape), str(a.dtype)) for a in operator_data))),

@@ -299,13 +299,34 @@ def operand_sets(data, mesh_xy, sh, W_R):
     ``<c k+Q|v' k+Q>`` and ``<c' k|v k>`` vanish.  A ``head_tensor`` payload
     adds ``(D_head, M_head)`` to both sets (the same operands: the head's
     antiresonant vertex is ``conj(d)`` in both rows).
+
+    OCCUPATION WEIGHTS.  ``data["occupation_weights"]`` (n_c, n_v, nk),
+    ``sqrt(f_v - f_c)`` of the payload's transitions
+    (``bse_preconditioner.occupation_weight_cv_k``), and with a partner
+    ``data["partner"]["occupation_weights"]`` for the antiresonant pairs, are
+    the last operands: ``(w,)`` at ``Q = 0`` (one transition set), ``(w, wb)``
+    in ``up`` and ``(wb, w)`` in ``low``.  ``A = dE + w K w``, ``B = w K_B wb``,
+    ``A' = dE' + wb K' wb``; zero-weight pairs are masked.
     """
     head = tuple(data.get("head_tensor") or ())
     partner = data.get("partner")
     eps_c = head_shifted_eps_c(data["eps_c"], data)
+    w = data.get("occupation_weights")
     if partner is None:
         return (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
-                eps_c, data["eps_v"], W_R, data["V_q0"], data["M"]) + head, None
+                eps_c, data["eps_v"], W_R, data["V_q0"], data["M"]) + head + (
+                    () if w is None else (w,)), None
+    wb = partner.get("occupation_weights")
+    if (w is None) != (wb is None):
+        raise ValueError(
+            "GATE nontda_occupation_weights: the payload and its partner must both carry "
+            "occupation_weights or neither (got: "
+            f"payload {'with' if w is not None else 'without'}, partner "
+            f"{'with' if wb is not None else 'without'}; want: both).  Why: the coupling block "
+            "is sqrt(df) K_B sqrt(df') with the resonant pairs' weights on one side and the "
+            "antiresonant pairs' on the other.  Fix: set data['partner']['occupation_weights'] "
+            "from the occupations at (v at k+Q, c at k).")
+    occ_up, occ_low = (() if w is None else (w, wb)), (() if w is None else (wb, w))
     from .bse_preconditioner import compute_pair_amplitude
     if partner.get("M") is None:
         partner["M"] = jax.jit(compute_pair_amplitude, out_shardings=sh.M)(
@@ -314,9 +335,9 @@ def operand_sets(data, mesh_xy, sh, W_R):
         partner["V_conj"] = jax.jit(jnp.conj, out_shardings=sh.V)(data["V_q0"])
     eps_c_low = head_shifted_eps_c(partner["eps_c"], data)
     up = (data["psi_c_X"], partner["psi_c_Y"], partner["psi_v_X"], data["psi_v_Y"],
-          eps_c, data["eps_v"], W_R, data["V_q0"], data["M"], partner["M"]) + head
+          eps_c, data["eps_v"], W_R, data["V_q0"], data["M"], partner["M"]) + head + occ_up
     low = (partner["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], partner["psi_v_Y"],
-           eps_c_low, partner["eps_v"], W_R, partner["V_conj"], partner["M"], data["M"]) + head
+           eps_c_low, partner["eps_v"], W_R, partner["V_conj"], partner["M"], data["M"]) + head + occ_low
     return up, low
 
 
@@ -330,7 +351,8 @@ def _operator(data, mesh_xy, sh, *, include_W):
         mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
         exchange_channel=data.get("exchange_channel", "singlet"),
         head_tensor=data.get("head_tensor") is not None,
-        partner=data.get("partner") is not None)
+        partner=data.get("partner") is not None,
+        occupations=data.get("occupation_weights") is not None)
     up, low = operand_sets(data, mesh_xy, sh, payload_w_r(data, mesh_xy, sh, include_W=include_W))
     return pair, up, low
 
@@ -869,16 +891,29 @@ def _solve_nontda_davidson(pair, args, data, mesh_xy, sh, n_eig, *, include_W, w
                            ", with the partner's diagonal as [D; -D_low] (finite pair momentum)"))
     if davidson_olsen:
         log.info("full-BSE Davidson preconditioner: Olsen correction ON (Sigma metric)")
+    # Occupation weights: the diagonals of A = dE + w K w (and A'), masked pairs parked.
+    weights = data.get("occupation_weights")
+    if weights is not None:
+        from .bse_davidson_helpers import occupation_diagonal, occupation_start_block
+        diag = occupation_diagonal(diag, eps_c, eps_v, weights, sharding=diag_sh)
+        if not paired:
+            diag_low = occupation_diagonal(diag_low, low[4], low[5],
+                                           data["partner"]["occupation_weights"], sharding=diag_sh)
     pre = bse_pair_diagonal_precond(
         eps_c, eps_v, epsilon_shift=float(davidson_eps_shift_Ry), sharding=diag_sh, diag_H=diag,
         low=None if paired else (low[4], low[5], diag_low), olsen=bool(davidson_olsen))
 
     # Margin roots and the start block on the physical transitions, as the
-    # Tamm-Dancoff route builds them.
+    # Tamm-Dancoff route builds them (Gaussian rows off the masked pairs when
+    # the window carries occupation weights).
     n_phys = n_cond * n_val * nk
     n_solve = n_eig + max(0, min(int(davidson_margin), n_phys // 2 - n_eig))
-    X0 = init_bse_subspace(eps_c, eps_v, n_eig=n_solve, n_cond=n_cond, n_val=n_val,
-                           n_random=int(davidson_n_random_init), mesh=mesh_xy, sharding=sh.X)
+    if weights is not None:
+        X0 = occupation_start_block(eps_c, eps_v, weights, n_rows=n_solve, n_cond=n_cond,
+                                    n_val=n_val, mesh=mesh_xy, sharding=sh.X)
+    else:
+        X0 = init_bse_subspace(eps_c, eps_v, n_eig=n_solve, n_cond=n_cond, n_val=n_val,
+                               n_random=int(davidson_n_random_init), mesh=mesh_xy, sharding=sh.X)
     cap = basis_capacity(davidson_m_max, n_solve, n_eig, nc * nv * nk, paired=paired)
     stored = (2 if paired else 4) * cap
     log.info(f"full-BSE Davidson: {n_eig} roots + {n_solve - n_eig} margin"
@@ -915,7 +950,7 @@ def _solve_nontda_davidson(pair, args, data, mesh_xy, sh, n_eig, *, include_W, w
         plan_key=(None if davidson_plan_key is None else (
             davidson_plan_key, mesh_xy, bool(include_W), channel, route,
             float(davidson_eps_shift_Ry), bool(davidson_olsen), paired,
-            data.get("head_tensor") is not None,
+            data.get("head_tensor") is not None, weights is not None,
             tuple((tuple(a.shape), str(a.dtype)) for a in args))))
 
     line = refuse_unconverged_davidson(info, n_eig=n_eig, tol_mev=float(davidson_tol_mev),
@@ -1086,11 +1121,13 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
         return (replicate_to_mesh(np.asarray(omega), mesh_xy), pairs,
                 jnp.int32(int(info["iterations"])))
     if solver == "matrixfree":
-        if low is not None or data.get("head_tensor") is not None:
+        if (low is not None or data.get("head_tensor") is not None
+                or data.get("occupation_weights") is not None):
             raise ValueError(
                 "GATE nontda_route_option: the matrix-free Lanczos cannot honour a finite pair "
-                "momentum or a head tensor (got: a payload with "
-                + ("a partner" if low is not None else "head_tensor")
+                "momentum, a head tensor or occupation weights (got: a payload with "
+                + ("a partner" if low is not None else
+                   "head_tensor" if data.get("head_tensor") is not None else "occupation_weights")
                 + "; want: neither).  Why: its recurrence is built on F(x) = A x + B conj(x) "
                   "with nine operands.  Fix: solver='davidson' or solver='dense'.")
         omega, Z = _solve_nontda_matrix_free(

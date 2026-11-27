@@ -60,6 +60,31 @@ def exchange_spin_weight(nspinor: int, channel: str = "singlet") -> float:
     return 0.0 if channel == "triplet" else 2.0
 
 
+#: Diagonal (Ry) of a transition pair whose occupation weight is zero: the pair
+#: is decoupled from the kernel and parked far above every root, as the mesh
+#: padding's transitions are (``bse_window.PAD_EPS_GUARD_RY``, the same number).
+MASKED_PAIR_RY = 1.0e3
+
+
+def occupation_weight_cv_k(f_c: jax.Array, f_v: jax.Array) -> jax.Array:
+    """``w[c, v, k] = sqrt(max(f_v(k) - f_c(k), 0))``: the weight of the pair
+    ``v -> c`` in a BSE with occupations.
+
+    With occupations ``f`` per spin-orbital (0..1), the pairs are those with
+    ``f_v > f_c`` and the blocks are ``A = dE + sqrt(df) K sqrt(df)`` and
+    ``B = sqrt(df) K_B sqrt(df)``: the kernel is scaled on both sides and the
+    transition energies are not.  A pair with ``f_v <= f_c`` has weight zero
+    and is masked (``MASKED_PAIR_RY`` on its diagonal).  The band sets may
+    overlap (a partially filled band is in both).
+
+    ``f_c`` (nk, n_c) and ``f_v`` (nk, n_v) are the occupations of the two legs
+    of the pair AS LABELLED BY k: for the resonant pair at a pair momentum Q,
+    ``f_c`` at k+Q and ``f_v`` at k; for the antiresonant pair, ``f_c`` at k
+    and ``f_v`` at k+Q.  Returns ``(n_c, n_v, nk)``, real.
+    """
+    return jnp.sqrt(jnp.maximum(f_v.T[None, :, :] - f_c.T[:, None, :], 0.0))
+
+
 def energy_diff_cv_k(eps_c: jax.Array, eps_v: jax.Array) -> jax.Array:
     """Compute energy differences delta_E(c,v,k) = eps_c(k) - eps_v(k).
 
