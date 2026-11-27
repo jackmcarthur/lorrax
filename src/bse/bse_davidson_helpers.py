@@ -249,8 +249,8 @@ def resolve_precond_route(route: str, bse_dim: int) -> str:
 # the cost either.  The body below was character-identical to the old one when
 # the jit moved; the FEAST consolidation then restructured it to carry two static
 # routes, and the REAL route's output is still bit-identical to what shipped
-# before either change (np.array_equal on the record deck, gated in
-# tests/test_bse_exact_diagonal.py).
+# before either change (np.array_equal on the record deck, measured when the
+# jit moved; no test of it is in the tree).
 # TWO STATIC KNOBS, AND WHY EACH EXISTS.  This kernel is now the ONE
 # ``diag(H_BSE)`` in the tree: ``bse_feast.build_preconditioner_diagonal_sharded``
 # used to assemble the same object independently, and the two differed in exactly
@@ -295,8 +295,8 @@ def _exact_diagonal_kernel(eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M,
     else:
         # Character-identical to the pre-consolidation real form — ``real()`` is
         # applied to each contraction before the subtraction, exactly as before —
-        # so the Davidson route's HLO and its output are bit-identical (gated in
-        # tests/test_bse_exact_diagonal.py).
+        # so the Davidson route's HLO and its output are bit-identical (measured on
+        # the record deck when the jit moved; no test of it is in the tree).
         V_x = jnp.real(V_x_c)
         out = (dE + V_x / nk if W_d_c is None
                else dE + (V_x - jnp.real(W_d_c)) / nk)

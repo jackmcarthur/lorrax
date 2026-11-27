@@ -233,7 +233,7 @@ htransform as ψ ([dipoles](#dipoles-and-absorption)).
 ## The matvec
 
 `bse_stack_matvec.build_bse_stack_matvec` is the TDA matvec: Lanczos,
-Davidson and thick-restart Lanczos, FEAST and KPM under `full_bse = false`, the
+Davidson and thick-restart Lanczos and KPM under `full_bse = false`, the
 spectral-bound Lanczos of FEAST and KPM on either route, Haydock, and
 `bse.exciton_bands`. Per trial block:
 
@@ -379,13 +379,16 @@ per rank. The fused kernel runs at 2.27× the flop floor.
 | Davidson (default) | `full_bse = false` (no route flag; `the eigensolve` is an alias) | `solvers.davidson.davidson` with `lock_converged`, the exact diagonal preconditioner and start subspace from `bse.bse_davidson_helpers` | lowest `number_eigenvalues` roots, stopped when every residual is below `davidson_tol_mev` (0.01 meV) |
 | Lanczos, block Lanczos | `full_bse = false solver = block_lanczos` | `bse_lanczos.solve_bse_sharded` | spectrum shape; fixed Krylov dimension, CGS2 reorthogonalization, full window by default |
 | thick-restart Lanczos | `full_bse = false solver = trlan` | `solvers.thick_restart_lanczos` | Krylov memory capped at `trlan_m_max` |
-| full BSE | no route flag, without `full_bse = false` | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve, N ≤ 4096 |
-| FEAST | `--feast`; `--tda` or not | `bse.bse_feast` | contour eigensolve in KPM-sized windows; refuses unless every in-window Ritz residual is below `--feast-tol-mev` (0.01 meV, `GATE feast_converged`) |
+| full BSE | no route flag, `full_bse = true` | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve, N ≤ 4096 |
+| FEAST | `feast = true` with `full_bse = true` (the TDA refuses it, `GATE feast_tda_complex`) | `bse.bse_feast` | contour eigensolve in KPM-sized windows; refuses unless every in-window Ritz residual is below `--feast-tol-mev` (0.01 meV, `GATE feast_converged`) |
 | density of states | `--kpm-dos`; `--tda` or not | `bse.bse_kpm` | KPM Chebyshev moments |
 | absorption | `python -m bse.absorption_haydock`, or `haydock = true` with `number_iterations` after the eigensolve | `bse.absorption_haydock` | ε₂(ω) by continued fraction on the TDA BSE (D + V − W), no eigenvectors |
 
-Without `full_bse = false`, `the eigensolve` ignores `solver`, `block_size` and
-`lanczos_n_reorth` without a message (`bse/bse_lanczos.py:118-121`).
+With `full_bse = true` the dense solve reads `number_eigenvalues` and the
+kernel only (`bse_lanczos.solve_bse_sharded` returns to `bse_nontda` before it reads any
+solver option). `bse_jax` refuses a `davidson_*`, `trlan_*` or `lanczos_*` key set away from its
+default; `solver`, `block_size`, `davidson_tol_mev` and the iteration cap are deck keys
+other BSE drivers share and are left alone, unread.
 
 Block Lanczos seeds name physical support by its logical band/k extents,
 not a host transition mask or index list. The existing subspace layout
@@ -958,7 +961,7 @@ a frozen-kernel approximation, not that self-consistent ladder map.
 ## Limits
 
 - A four-current bundle is read only with a stored W0: the BSE direct term has
-  no packed CC/CT/TC/TT handoff (`gw/static_screening.py:86`). The stored W0
+  no packed CC/CT/TC/TT handoff (`gw.static_screening.build_static_w_from_restart`). The stored W0
   is the charge sector: the direct term screens with $W_{CC}(0)$ and the
   exchange term uses the charge V; the CT/TC/TT blocks, screened or bare,
   never enter the BSE kernel. On `bispinor_gw = bare_transverse` it is
@@ -968,7 +971,7 @@ a frozen-kernel approximation, not that self-consistent ladder map.
   W_∞ − V is zero because the Ward contact is TT-only). An SC run keeps its
   resident CC model past Σ until the final-map persist.
 - The BSE reads ψ from the restart, which holds the deck WFN's states. `eqp_corrections`
-  replaces energies only (`bse/bse_window.py:569`); `qp_rotations_file` rotates ψ
+  replaces energies only (`bse_window.apply_eqp_to_bse_window`); `qp_rotations_file` rotates ψ
   into the QP basis on the native grid; under `kgrid_fine` it rotates the
   htransform's compact states instead (`fh_interp.resolve_qp_hamiltonian_state`,
   f(H_QP) in the nodal basis), keeping the restart's W, V and ISDF tensors, and
@@ -978,7 +981,7 @@ a frozen-kernel approximation, not that self-consistent ladder map.
   k and −k has broken rows; regenerate it
   ([self-consistency §8](../self_consistency.md#8-seeding-restart-and-outputs)).
 - Full BSE through `the eigensolve` is dense and stops at N = 4096
-  (`bse/bse_nontda.py:95`); the matrix-free solver is not reachable from the
+  (`_DENSE_N_MAX` in `bse/bse_nontda.py`); the matrix-free solver is not reachable from the
   CLI.
 - `compute_mode = mpa` with `screening_diagrams = w_bse` refuses at setup
-  (`GATE parent_screening_diagrams`, `file_io/restart_bundle.py:4369`).
+  (`GATE parent_screening_diagrams`, `file_io/restart_bundle.py`).

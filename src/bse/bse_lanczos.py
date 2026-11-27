@@ -319,8 +319,8 @@ def solve_bse_sharded(
             # the construction signature (FIX_construction_defects.md §1; the same
             # defect PRECOND_BUILD_FREE.md §3.1 fixed for the exact-diagonal build
             # and named at §7.2).  Donation is unchanged: the accessor sets
-            # ``donate_argnums=(0,)`` and the alias is gated in
-            # tests/test_bse_w_ifft_hoist.py.
+            # ``donate_argnums=(0,)`` and the alias was
+            # checked when the accessor was introduced; no test of it is in the tree.
             _W_ifft_donated = get_donated_kfft_kminor(
                 mesh_xy, tuple(int(n) for n in data["W_q"].shape[-3:]), sh.W.spec,
                 kind="ifftn", norm='ortho')

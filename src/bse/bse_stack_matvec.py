@@ -189,8 +189,8 @@ def _scatter_trial_block(WX, mesh_xy):
 # The three stages of the W term, factored so the A block and the coupling
 # block share them.  These are the SAME einsums, in the same order, that
 # ``_w_stack``'s body used inline before the port -- pure code motion, so the
-# shipped TDA path is bit-identical (gated: test_bse_sp_lanczos.py::
-# test_stack_matvec_tda_bit_identical_after_port).
+# shipped TDA path is bit-identical (measured at the port; no test of it is in
+# the tree).
 # ===========================================================================
 
 def _encode_T_A(X_b, psi_c_X, psi_v_Y):

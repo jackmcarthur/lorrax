@@ -4,9 +4,11 @@ Beyond setup utilities (spectral-bound estimation via a short Lanczos run,
 window definition in eV, and FEAST ellipse-trapezoid quadrature nodes/weights),
 this module implements the full FEAST solve: shifted GMRES linear solves at each
 quadrature node plus Rayleigh-Ritz eigenpair extraction (``run_feast_ritz``).
-FEAST is the DEFAULT solve route for the ``bse_jax`` CLI entry point (bse_jax.py
-runs ``bse_feast.run(bse_feast.settings(...))`` on the deck's ``feast = true``). Output is printed to
-stdout in a physics-style report.
+FEAST is an opt-in route of the ``bse_jax`` CLI entry point (bse_jax.py runs
+``bse_feast.run(bse_feast.settings(...))`` on the deck's ``feast = true``, with
+``full_bse = true``: the TDA refuses it, ``GATE feast_tda_complex``).  The default
+route is the Davidson eigensolve.  Output is printed to stdout in a physics-style
+report.
 """
 from __future__ import annotations
 
