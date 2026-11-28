@@ -100,7 +100,8 @@ The surface
 ``real_space_action_tables`` / ``orbit_images`` / ``canonicalize_orbit`` /
 ``unfold_orbit_unique_with_id`` / ``centroid_source_map_and_wrap`` /
 ``fft_grid_pullback_perm`` / ``recover_atomic_space_group`` /
-``recover_symmorphic_density_point_group`` / ``fft_grid_invariance``
+``recover_symmorphic_density_point_group`` / ``fft_grid_invariance`` /
+``fft_grid_rotation_condition``
     Real space: the FFT-grid permutation tables the ISDF centroids and
     the ρ symmetrisation ride on, the holohedry recovery for decks
     whose header symmetry list is a subset of the true point group, and
@@ -286,6 +287,7 @@ from symmetry_maps.orbit_syms import (
     centroid_source_map_and_wrap,
     fft_grid_invariance,
     fft_grid_pullback_perm,
+    fft_grid_rotation_condition,
     project_polar_fft_field,
     grid_point_image_perm,
     orbit_images,
@@ -371,6 +373,7 @@ __all__ = [
     "unfold_orbit_unique_with_id", "centroid_source_map_and_wrap",
     "permutation_orbit_labels",
     "fft_grid_pullback_perm", "grid_point_image_perm", "fft_grid_invariance",
+    "fft_grid_rotation_condition",
     "PolarFFTFieldProjection", "project_polar_fft_field",
     "r_action_forward", "r_action_forward_one",
     "snap_to_grid_and_split_wrap",

@@ -18,6 +18,7 @@ from centroid.kmeans_isdf import (
 from symmetry_maps import (
     centroid_source_map_and_wrap,
     fft_grid_invariance,
+    fft_grid_rotation_condition,
     recover_atomic_space_group,
 )
 
@@ -79,7 +80,11 @@ def test_grid_test_equals_exact_enumeration_and_the_selection_refuses():
             with pytest.raises(ValueError, match="GATE centroid_fft_grid_invariance") as refusal:
                 require_grid_invariant_operations(Rinv, tau, grid)
             text = str(refusal.value)
-            assert " x ".join(map(str, grid)) in text and "nr1 = nr2 = nr3" in text
+            # The refusal states this cell's own condition on the extents and
+            # prescribes no particular grid.
+            assert " x ".join(map(str, grid)) in text
+            assert "this cell is N_1 = N_2 and N_3 divides N_1;" in text
+            assert "nr1" not in text and "N x N x N" not in text
 
     # A glide (x, y, z) -> (x + 1/2, -y, z): the rotation maps every grid, the
     # translation only an even first extent.
@@ -93,7 +98,44 @@ def test_grid_test_equals_exact_enumeration_and_the_selection_refuses():
         assert _maps_grid_onto_itself(glide_R[1], glide_tau[1], grid) is closes
     with pytest.raises(ValueError, match="GATE centroid_fft_grid_invariance") as refusal:
         require_grid_invariant_operations(glide_R, glide_tau, (5, 4, 2))
-    assert "multiples of the translations' denominators" in str(refusal.value)
+    assert "multiple of the translations' denominators" in str(refusal.value)
+
+
+def _shear(a, b, k):
+    """Unimodular matrix with ``Rinv[a, b] = k``: ``N_b`` divides ``k N_a``."""
+    matrix = np.eye(3, dtype=np.int64)
+    matrix[a, b] = k
+    return matrix
+
+
+def test_rotation_condition_equals_the_integer_test():
+    avec, atoms, species = _rock_salt_short_cell()
+    _, rock_salt, _ = recover_atomic_space_group(avec, atoms, species)
+    cases = (
+        (rock_salt, "N_1 = N_2 and N_3 divides N_1"),
+        ([[[0, 1, 0], [0, 0, 1], [1, 0, 0]]], "N_1 = N_2 = N_3"),
+        ([[[0, 1, 0], [-1, 0, 0], [0, 0, 1]]], "N_1 = N_2"),
+        ([np.eye(3, dtype=np.int64)], ""),
+        ([_shear(0, 1, 2)], "N_2 divides 2 N_1"),
+        ([_shear(0, 1, 2), _shear(0, 1, 3)], "N_2 divides N_1"),
+        ([_shear(0, 1, 1), _shear(1, 2, 1), _shear(0, 2, 1)],
+         "N_2 divides N_1 and N_3 divides N_2"),
+        ([_shear(0, 1, 1), _shear(1, 0, 1), _shear(0, 2, 2), _shear(1, 2, 3)],
+         "N_1 = N_2 and N_3 divides N_1"),
+        ([_shear(0, 1, 1), _shear(1, 0, 1), _shear(2, 0, 4), _shear(2, 1, 6)],
+         "N_1 = N_2 and N_1 divides 2 N_3"),
+    )
+    for rotations, words in cases:
+        rotations = np.asarray(rotations, dtype=np.int64)
+        equal, divides, text = fft_grid_rotation_condition(rotations)
+        assert text == words
+        zero = np.zeros((len(rotations), 3))
+        for grid in np.ndindex(12, 12, 12):
+            n = np.asarray(grid) + 1
+            stated = (all(len({int(n[i]) for i in axes}) == 1 for axes in equal)
+                      and all((k * n[a]) % n[b] == 0 for b, k, a in divides))
+            assert stated == bool(
+                fft_grid_invariance(rotations, zero, n)[0].all()), (words, n)
 
 
 def test_repeated_centroid_rows_refuse_by_name():
@@ -139,3 +181,4 @@ def test_repeated_centroid_rows_refuse_by_name():
     text = str(refusal.value)
     assert "duplicate centroid rows" not in text
     assert "rotation does not map the FFT grid" in text
+    assert "it needs N_1 = N_2)" in text and "N x N x N" not in text

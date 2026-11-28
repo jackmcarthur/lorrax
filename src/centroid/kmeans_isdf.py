@@ -892,10 +892,16 @@ def require_grid_invariant_operations(Rinv, tau, fft_grid) -> None:
     the weight symmetrisation, the grid orbits and the unfolded pool then
     disagree, the pool holds repeated points, and the set is not closed.
 
-    The decorated-atom space group can be larger than the group the DFT code
-    chose its FFT grid for (rock salt in short lattice vectors on QE's
-    48 x 48 x 80: 24 operations, 2026-11-27), so the WFN's own grid is not
-    evidence that the test passes.
+    The WFN's own grid is not evidence that the test passes.  The test
+    constrains only the axes a rotation mixes (``N_b`` divides
+    ``N_a |Rinv[a, b]|``), so a grid sized by the lengths of the lattice
+    vectors fails it only when the vectors are chosen so that a rotation
+    mixes vectors of different length.  Rock salt in short lattice vectors
+    (2026-11-27) needs ``N_1 = N_2`` with ``N_3`` dividing them: on QE's
+    48 x 48 x 80, 8 of the 24 decorated-atom operations pass, and 4 of the
+    12 that keep the two metal sublattices distinct; 60 x 60 x 60 and
+    96 x 96 x 48 pass.  The refusal prints the condition for the cell at
+    hand (:func:`symmetry_maps.fft_grid_rotation_condition`).
     """
     grid = tuple(int(n) for n in np.asarray(fft_grid).reshape(3))
     rotation_fits, translation_fits = _sym.fft_grid_invariance(Rinv, tau, grid)
@@ -917,16 +923,23 @@ def require_grid_invariant_operations(Rinv, tau, fft_grid) -> None:
         example = (
             f"operation {worst}, tau = {shift.tolist()}: tau x N = "
             f"{(shift * np.asarray(grid)).tolist()}")
-    remedies = []
+    want, why, remedies, extents = "", "", [], []
     if not np.all(rotation_fits):
+        condition = _sym.fft_grid_rotation_condition(Rinv)[2]
+        want = f", which for the rotations of this cell is {condition}"
+        why = (
+            "; a grid sized by the lengths of the lattice vectors fails this "
+            "only when the vectors are chosen so that a rotation mixes "
+            "vectors of different length")
         remedies.append(
-            "write the WFN on an N x N x N dense grid (nr1 = nr2 = nr3 in the "
-            "QE &system namelist), which every rotation of the lattice maps "
-            "onto itself")
+            "describe the crystal in lattice vectors such that no rotation "
+            "mixes vectors of different length (a grid sized by vector "
+            "length then passes the rotation test)")
+        extents.append(condition)
     if not np.all(translation_fits):
-        remedies.append(
-            "choose grid extents that are multiples of the translations' "
-            "denominators (N_a tau_a integer)")
+        extents.append("every N_a is a multiple of the translations' "
+                       "denominators (N_a tau_a integer)")
+    remedies.append("choose grid extents such that " + " and ".join(extents))
     raise ValueError(
         "GATE centroid_fft_grid_invariance: got: FFT grid "
         f"{grid[0]} x {grid[1]} x {grid[2]}, which {int(np.count_nonzero(~fits))} "
@@ -936,11 +949,11 @@ def require_grid_invariant_operations(Rinv, tau, fft_grid) -> None:
         f"{int(np.count_nonzero(~translation_fits))} by fractional "
         f"translation; first: {example}); want: every operation the points "
         "are closed under maps the FFT grid onto itself (N_a Rinv[a,b] / N_b "
-        "and N_a tau_a integer); why: the image of a grid point is otherwise "
-        "rounded to a neighbouring point, which gives repeated centroids and "
-        "a set that is not closed under the operations; fix: "
-        + "; ".join(remedies)
-        + "; or pass --no-symmetries for literal points.")
+        f"and N_a tau_a integer){want}; why: the image of a grid point is "
+        "otherwise rounded to a neighbouring point, which gives repeated "
+        f"centroids and a set that is not closed under the operations{why}; "
+        "fix: " + ", or ".join(remedies)
+        + ", or pass --no-symmetries for literal points.")
 
 
 def require_distinct_grid_points(indices, fft_grid, what: str) -> int:

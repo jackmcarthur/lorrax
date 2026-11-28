@@ -383,9 +383,13 @@ def fft_grid_invariance(Rinv, tau, fft_grid, *, tol: float = 1.0e-8):
     An integer coefficient matrix of determinant ±1 has an integer inverse, so
     "into" is "onto", and the operations that pass form a group.
 
-    An ``N x N x N`` grid passes the rotation test for every operation of the
-    lattice (the coefficients are ``Rinv`` itself).  A grid whose extents
-    differ passes only for rotations that do not mix the unequal axes.
+    The rotation test is ``N_b`` divides ``N_a |Rinv[a, b]|`` for every
+    nonzero off-diagonal entry, so it constrains only the axes a rotation
+    mixes: equal extents along them always pass, unequal ones pass when the
+    divisibility holds (:func:`fft_grid_rotation_condition` states it for a
+    set of operations).  A grid sized by the lengths of the lattice vectors
+    can fail only when the vectors are chosen so that a rotation mixes
+    vectors of different length.
 
     WHY A SEPARATE TEST AND NOT ``fft_grid_pullback_perm(validate=True)``: for
     a rotation that fails this test the rounded images can still be a
@@ -425,6 +429,77 @@ def fft_grid_invariance(Rinv, tau, fft_grid, *, tol: float = 1.0e-8):
     on_grid = shifts * grid[None, :]
     translation_fits = np.all(np.abs(on_grid - np.rint(on_grid)) <= tol, axis=1)
     return rotation_fits, translation_fits
+
+
+def fft_grid_rotation_condition(Rinv):
+    """The FFT-grid extents that a set of rotations maps onto itself.
+
+    The rotation test of :func:`fft_grid_invariance` over every operation is
+    ``N_b`` divides ``g_ab N_a`` for each off-diagonal pair, ``g_ab`` the
+    greatest common divisor of the ``|Rinv[a, b]|`` over the operations (no
+    condition where every entry is zero).  Here it is reduced: axes that
+    must divide each other are one class of equal extents, and a relation
+    that follows from two others is dropped.
+
+    Parameters
+    ----------
+    Rinv : (n_op, 3, 3) or (3, 3) int
+        Forward direct-space rotations in crystal coordinates.
+
+    Returns
+    -------
+    equal : list of tuple of int
+        Classes of two or more axes (0-based) whose extents must be equal.
+    divides : list of (int, int, int)
+        ``(b, k, a)``: ``N_b`` must divide ``k N_a``.  Axes are the lowest
+        of their class.
+    text : str
+        Both in words with 1-based axes, ``"N_1 = N_2 and N_3 divides N_1"``;
+        empty when the rotations do not mix the axes (every grid passes).
+    """
+    rotations = np.asarray(Rinv)
+    integer_rotations = np.rint(rotations).astype(np.int64).reshape(-1, 3, 3)
+    if not np.array_equal(integer_rotations.reshape(rotations.shape), rotations):
+        raise ValueError("Rinv must hold integer crystal-coordinate rotations")
+    factor = np.gcd.reduce(np.abs(integer_rotations), axis=0)
+    np.fill_diagonal(factor, 0)
+    while True:
+        # reach[a, b]: N_b divides N_a, from the pairs with g_ab = 1.
+        reach = (factor == 1) | np.eye(3, dtype=bool)
+        for _ in range(2):
+            reach |= (reach.astype(np.int64) @ reach.astype(np.int64)) > 0
+        lowest = np.argmax(reach & reach.T, axis=1)
+        # Within a class the extents are equal: one factor per class pair.
+        merged = factor.copy()
+        for a in range(3):
+            for b in range(3):
+                if lowest[a] != lowest[b]:
+                    merged[a, b] = np.gcd.reduce(
+                        factor[np.ix_(lowest == lowest[a], lowest == lowest[b])],
+                        axis=None)
+        if np.array_equal(merged, factor):
+            break
+        factor = merged
+    equal = [tuple(int(i) for i in np.flatnonzero(lowest == c))
+             for c in np.unique(lowest) if np.count_nonzero(lowest == c) > 1]
+    relations = set()
+    for a in range(3):
+        for b in range(3):
+            p, q = int(lowest[b]), int(lowest[a])
+            if p == q or factor[a, b] == 0:
+                continue
+            if factor[a, b] > 1:
+                relations.add((p, int(factor[a, b]), q))
+            elif not any(reach[a, r] and reach[r, b] and lowest[r] not in (p, q)
+                         for r in range(3)):
+                relations.add((p, 1, q))
+    divides = sorted(relations)
+    parts = [" = ".join(f"N_{i + 1}" for i in axes) for axes in equal]
+    parts += [f"N_{p + 1} divides " + (f"{k} " if k > 1 else "") + f"N_{q + 1}"
+              for p, k, q in divides]
+    text = ", ".join(parts[:-1]) + (" and " if len(parts) > 1 else "") + (
+        parts[-1] if parts else "")
+    return equal, divides, text
 
 
 def grid_point_image_perm(fft_grid, M) -> np.ndarray:
@@ -1078,7 +1153,9 @@ def centroid_source_map_and_wrap(
                     causes.append(
                         "its rotation does not map the FFT grid "
                         f"{fft_grid_np.tolist()} onto itself (N_a Rinv[a,b] / "
-                        f"N_b is not integer for Rinv = {forward.tolist()})")
+                        f"N_b is not integer for Rinv = {forward.tolist()}; "
+                        "it needs "
+                        f"{fft_grid_rotation_condition(forward)[2]})")
                 if not translation_fits[0]:
                     causes.append(
                         "its fractional translation is off the FFT grid "
@@ -1091,8 +1168,9 @@ def centroid_source_map_and_wrap(
                     + (" and ".join(causes) if causes else
                        "of a rounding collision this check cannot attribute")
                     + ".  An operation closes a centroid set only on an FFT "
-                    "grid it maps onto itself; an N x N x N grid is mapped "
-                    "onto itself by every rotation of the lattice.")
+                    "grid it maps onto itself; ``centroid.kmeans_cli`` tests "
+                    "every operation before selecting and states the "
+                    "condition on the grid extents.")
 
     if required_rows is not None:
         available = np.all(np.sort(sym_perm, axis=1) == np.arange(n_rmu), axis=1)

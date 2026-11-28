@@ -84,7 +84,7 @@ refused before loading if they do not fit.
 | `-i` / `--input` | unset | GW deck; left window = occupied + its `ncond`, right window = every WFN band; without `-i` the left window widens to every band and says so |
 | `--fit-window L0:L1,R0:R1` | unset | explicit left/right windows for candidates and pruning, in place of the deck's |
 | `--density-mode` | `scalar` | `scalar` charge Gram; `current` transverse three-current Gram (needs the symmetries; suffix `_current`) |
-| `--no-symmetries` | off | literal points; by default the set is closed under the atom group whenever it has more than one operation, and the run refuses (`GATE centroid_fft_grid_invariance`) when one of them does not map the WFN's FFT grid onto itself ($N_a R_{ab}/N_b$ and $N_a\tau_a$ integer; an $N\times N\times N$ grid passes for every rotation) |
+| `--no-symmetries` | off | literal points; by default the set is closed under the atom group whenever it has more than one operation, and the run refuses (`GATE centroid_fft_grid_invariance`) when one of them does not map the WFN's FFT grid onto itself ($N_a R_{ab}/N_b$ and $N_a\tau_a$ integer; the refusal states the condition on the grid extents for the cell) |
 | `--weight-power P` | 5/6 | k-means mass $= (\operatorname{diag} K_{q=0})^P$ |
 | `--sketch-rows` | 0 (auto) | sketch rows $r' \ge N_\mu$; auto $N_\mu + \max(64, \lceil 0.1 N_\mu\rceil)$ |
 | `--sketch-block` | 0 (auto) | orbits per select block; auto $\max(1, \lfloor m_b / \lvert O\rvert_{\max}\rfloor)$, $m_b \le 1024$ columns and one fixed tile of $r'$ rows |
